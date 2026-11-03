@@ -952,16 +952,29 @@ def test_program_args_are_the_registry_logical_names() -> None:
         jit.select_record("kcp_transfer_walk", transfer_walk="bf16x3")
 
 
-def test_fwdh_form_rule_follows_the_l8a_decision() -> None:
-    """#2 runs the vh = 64 form when ``n_walk * HV <= sm_count``, else vh = 128; the test knob
-    ``fwdh_vh`` forces a form (both forms are bitwise twins)."""
+def test_fwdh_form_rule_follows_the_chain_clause() -> None:
+    """#2 runs the vh = 64 form when ``n_walk * HV <= sm_count`` or when the launch's two-CTA grid finishes within
+    its longest chain (``walk_vh64_fits``: LPT of ``2 * HV`` CTAs per segment over ``2 * sm_count`` slots), else
+    vh = 128; the test knob ``fwdh_vh`` forces a form (both forms are bitwise twins)."""
     kcp = _mod("cake_kcp")
     assert kcp.FWDH_PROGRAMS == ("kcp_fwdh_offset", "kcp_fwdh_tape")
     assert kcp.fwdh_vh(3, 48, 152) == 64  # 144 head-CTAs <= 152 SMs (GB300)
-    assert kcp.fwdh_vh(4, 48, 152) == 128  # 192 > 152
+    assert kcp.fwdh_vh(4, 48, 152) == 128  # 192 > 152, no chain clause
+    assert kcp.fwdh_vh(4, 48, 152, fits=True) == 64
     assert kcp.fwdh_vh(1, 48, 148) == 64
     assert kcp.fwdh_vh(6, 48, 152, forced=64) == 64
-    assert kcp.fwdh_vh(1, 48, 152, forced=128) == 128
+    assert kcp.fwdh_vh(1, 48, 152, forced=128, fits=True) == 128
+    # four segments of 1536 / 1024 / 896 / 640 chunks at HV 48 (the K3E CP1 rank): 384 two-CTA items on 296 slots
+    # (148 SMs) end at 1536 = the longest chain; on 128 slots they do not; one balanced segment kind fits only
+    # while its items fill one round
+    k3e = ((1536, 1), (1024, 1), (896, 1), (640, 1))
+    assert kcp.walk_vh64_fits(k3e, 48, 148)
+    assert not kcp.walk_vh64_fits(k3e, 48, 64)
+    assert kcp.walk_vh64_fits(((100, 3),), 48, 148)  # 288 items <= 296 slots
+    # 384 items: a second round of 100
+    assert not kcp.walk_vh64_fits(((100, 4),), 48, 148)
+    assert not kcp.walk_vh64_fits((), 48, 148)
+    assert not kcp.walk_vh64_fits(k3e, 48, 0)
     assert kcp.VH64_SUFFIX == "_vh64"
     try:
         jit = _mod("cake_jit")
@@ -975,6 +988,251 @@ def test_fwdh_form_rule_follows_the_l8a_decision() -> None:
             assert jit.launch_grid(
                 prog + kcp.VH64_SUFFIX, n_walk=3, num_heads=48, ctas_per_head=2
             ) == (288, 1, 1)
+            for fits, vh in ((False, 128), (True, 64)):
+                args = {
+                    "_grid_args": {"n_walk": 4, "num_heads": 48},
+                    "_sm_count": 152,
+                    "_fwdh_vh": None,
+                    "_vh64_fits": fits,
+                    "_grid": 4 * 48,
+                }
+                record, _, grid, _ = kcp.resolve_launch(prog, dict(args))
+                assert record == (prog + kcp.VH64_SUFFIX if vh == 64 else prog)
+                assert grid == (4 * 48 * (2 if vh == 64 else 1), 1, 1)
+
+
+# A pinned subset of the walk-width test vectors (schema r7c-walk-width-test-vectors-v1, sha256 08954080...: every
+# walk list of the plan census with the decisions of the rule): per SM count (148 sm_100a, 152 sm_103a, 208 / 212 /
+# 216 sm_107a) two lists of every class (one wave or not, chain clause fits or not, form changed by the rule or
+# not).  Columns: vector id, SM count, architecture, HV, n_walk, chains (``chunks:count``), fits, #2 vh, #7 offset vh,
+# #7 tape vh.
+WALK_WIDTH_VECTORS = (
+    "0 148 sm_100a 3 1 1:1 0 64 64 64",
+    "1 148 sm_100a 3 1 2:1 0 64 64 64",
+    "3774 148 sm_100a 24 8 244:4,113:4 1 64 64 64",
+    "3896 148 sm_100a 24 18 158:1,157:2,42:4,41:2,29:3,19:3,14:3 1 64 64 64",
+    "4466 148 sm_100a 48 4 89:4 0 128 64 64",
+    "4470 148 sm_100a 48 4 96:4 0 128 64 64",
+    "4475 148 sm_100a 48 4 118:2,28:2 1 64 64 64",
+    "4681 148 sm_100a 48 7 286:1,140:1,119:1,98:1,78:1,57:1,23:1 1 64 64 64",
+    "4723 148 sm_100a 48 8 188:8 0 128 64 64",
+    "4726 148 sm_100a 48 8 210:8 0 128 64 64",
+    "4857 152 sm_103a 3 1 1:1 0 64 64 64",
+    "4858 152 sm_103a 3 1 2:1 0 64 64 64",
+    "8638 152 sm_103a 24 8 244:4,113:4 1 64 64 64",
+    "8756 152 sm_103a 24 18 158:1,157:2,42:4,41:2,29:3,19:3,14:3 1 64 64 64",
+    "9334 152 sm_103a 48 4 89:4 0 128 64 64",
+    "9342 152 sm_103a 48 4 118:2,28:2 1 64 64 64",
+    "9347 152 sm_103a 48 4 128:4 0 128 64 64",
+    "9541 152 sm_103a 48 7 286:1,140:1,119:1,98:1,78:1,57:1,23:1 1 64 64 64",
+    "9599 152 sm_103a 48 8 256:8 0 128 64 64",
+    "9615 152 sm_103a 48 10 90:10 0 128 64 64",
+    "9730 208 sm_107a 3 1 1:1 0 64 64 64",
+    "9731 208 sm_107a 3 1 2:1 0 64 64 64",
+    "14480 208 sm_107a 48 6 128:3,43:2,42:1 1 64 64 64",
+    "14506 208 sm_107a 48 6 176:6 0 128 64 64",
+    "14517 208 sm_107a 48 6 249:6 0 128 64 64",
+    "14518 208 sm_107a 48 6 253:3,6:2,5:1 1 64 64 64",
+    "14647 208 sm_107a 48 12 2:9,1:3 0 128 64 128",
+    "14652 208 sm_107a 48 12 40:4,39:8 0 128 64 128",
+    "14656 208 sm_107a 48 12 63:1,58:1,18:2,17:2,12:2,8:2,6:2 1 64 64 128",
+    "14657 208 sm_107a 48 12 63:1,61:1,17:1,16:3,12:2,8:2,6:2 1 64 64 128",
+    "14768 212 sm_107a 3 1 1:1 0 64 64 64",
+    "14769 212 sm_107a 3 1 2:1 0 64 64 64",
+    "19515 212 sm_107a 48 6 128:3,43:2,42:1 1 64 64 64",
+    "19538 212 sm_107a 48 6 176:6 0 128 64 64",
+    "19549 212 sm_107a 48 6 256:2,160:2,96:2 1 64 64 64",
+    "19598 212 sm_107a 48 8 64:8 0 128 64 64",
+    "19681 212 sm_107a 48 10 90:10 0 128 64 128",
+    "19683 212 sm_107a 48 10 92:10 0 128 64 128",
+    "19707 212 sm_107a 48 12 63:1,58:1,18:2,17:2,12:2,8:2,6:2 1 64 64 128",
+    "19708 212 sm_107a 48 12 63:1,61:1,17:1,16:3,12:2,8:2,6:2 1 64 64 128",
+    "19826 216 sm_107a 3 1 1:1 0 64 64 64",
+    "19827 216 sm_107a 3 1 2:1 0 64 64 64",
+    "24527 216 sm_107a 48 5 149:5 0 128 64 64",
+    "24549 216 sm_107a 48 6 64:6 0 128 64 64",
+    "24578 216 sm_107a 48 6 128:3,43:2,42:1 1 64 64 64",
+    "24615 216 sm_107a 48 6 236:3,87:1,86:2 1 64 64 64",
+    "24790 216 sm_107a 48 12 63:1,58:1,18:2,17:2,12:2,8:2,6:2 1 64 64 128",
+    "24791 216 sm_107a 48 12 63:1,61:1,17:1,16:3,12:2,8:2,6:2 1 64 64 128",
+    "24839 216 sm_107a 48 16 55:2,54:14 0 128 64 128",
+    "24840 216 sm_107a 48 16 56:4,55:12 0 128 64 128",
+)
+
+
+def _walk_width_rows():
+    for line in WALK_WIDTH_VECTORS:
+        vid, sm, arch, hv, n_walk, chains, fits, fwdh, off, tape = line.split()
+        yield (
+            int(vid),
+            int(sm),
+            arch,
+            int(hv),
+            int(n_walk),
+            tuple(tuple(int(x) for x in c.split(":")) for c in chains.split(",")),
+            fits == "1",
+            int(fwdh),
+            int(off),
+            int(tape),
+        )
+
+
+def test_walk_width_rules_follow_the_pinned_vectors() -> None:
+    """The #2 / #7 width decisions of the pinned vector lists: ``fits`` = ``n_walk * HV > SM`` and
+    :func:`walk_vh64_fits` of the chains (as ``CallDetKcp.walk`` evaluates it), ``fwdh_vh`` with that clause and
+    ``dhu_vh`` of the offset and tape walks under the list's architecture; ``_Tables.walk_fits`` of a plan whose
+    segments carry the same chains agrees."""
+    kcp = _mod("cake_kcp")
+    rows = list(_walk_width_rows())
+    assert len(rows) == len(WALK_WIDTH_VECTORS) >= 40
+    assert {r[2] for r in rows} == {"sm_100a", "sm_103a", "sm_107a"}
+    for vid, sm, arch, hv, n_walk, chains, fits, fwdh, off, tape in rows:
+        assert sum(n for _, n in chains) == n_walk, vid
+        got_fits = n_walk * hv > sm and kcp.walk_vh64_fits(chains, hv, sm)
+        assert got_fits is fits, vid
+        assert kcp.fwdh_vh(n_walk, hv, sm, None, got_fits) == fwdh, vid
+        assert kcp.dhu_vh(n_walk, hv, sm, tape=False, arch=arch) == off, vid
+        assert kcp.dhu_vh(n_walk, hv, sm, tape=True, arch=arch) == tape, vid
+        seg = [0]
+        for c, n in chains:
+            for _ in range(n):
+                seg.append(seg[-1] + c)
+        tb = types.SimpleNamespace(
+            memo={}, hp=types.SimpleNamespace(seg_chunk_start=tuple(seg)), H=hv
+        )
+        tb._memo_put = types.MethodType(kcp._Tables._memo_put, tb)
+        want = kcp.walk_vh64_fits(chains, hv, sm)
+        assert kcp._Tables.walk_fits(tb, list(range(n_walk)), sm) is want, vid
+
+
+def _walk_form_ops(cu, H_qk: int, HV: int) -> dict[str, torch.Tensor]:
+    """Seeded CPU operands (q / k BF16 L2-normalised rows, v / dout BF16, g FP32 log-gates, beta FP32)."""
+    gen = torch.Generator(device="cpu").manual_seed(20261103)
+    T = cu[-1]
+
+    def l2(x):
+        return (x * torch.rsqrt((x * x).sum(-1, keepdim=True) + 1e-6)).to(
+            torch.bfloat16
+        )
+
+    return {
+        "q": l2(torch.randn(T, H_qk, 128, generator=gen)),
+        "k": l2(torch.randn(T, H_qk, 128, generator=gen)),
+        "v": torch.randn(T, HV, 128, generator=gen).to(torch.bfloat16),
+        "g": (-torch.nn.functional.softplus(torch.randn(T, HV, generator=gen)))
+        .float()
+        .contiguous(),
+        "beta": torch.sigmoid(torch.randn(T, HV, generator=gen)).float().contiguous(),
+        "dout": torch.randn(T, HV, 128, generator=gen).to(torch.bfloat16),
+    }
+
+
+def test_forward_walk_form_follows_the_plan_chains() -> None:
+    """Plan test of the #2 chain clause: one contiguous rank of four documents of 24 / 16 / 14 / 10 chunks at HV 6,
+    one segment per document.  ``n_walk * HV = 24`` exceeds both SM counts below, so the one-wave clause alone takes
+    vh = 128; at 20 SMs the 48 two-CTA items on 40 slots end at the longest chain (LPT makespan 24), so the forward's
+    tape walk launches the ``_vh64`` record; at 12 SMs (makespan 34) it stays vh = 128.  The fake backend runs the
+    forward the plan launches (the record list of ``LAST_CALL``)."""
+    kcp, plan = _mod("cake_kcp"), _mod("cake_kcp_plan")
+    cu = _cu((24 * 64, 16 * 64, 14 * 64, 10 * 64))
+    ops = _walk_form_ops(cu, 2, 6)
+    args = [ops[n] for n in ("q", "k", "v", "g", "beta")]
+    for sm, want in ((20, True), (12, False)):
+        ctx = plan.build_context_det_kcp(
+            plan.partition_det_kcp(cu, 1, "contiguous"), None, 0, "cpu", sm_count=sm
+        )
+        tb = kcp._Tables(ctx, 6, P=1)
+        assert len(tb.walk_live) == 4 and tb.walk_fits(tb.walk_live, sm) is want
+        assert kcp.fwdh_vh(4, 6, sm) == 128
+        kcp.chunk_gdn_det_fwd_kcp(*args, ctx, backend="fake", segments=1)
+        walks = [
+            r
+            for r, _ in kcp.LAST_CALL["fwd"]["records"]
+            if r.startswith("kcp_fwdh_tape")
+        ]
+        assert walks and all(r.endswith(kcp.VH64_SUFFIX) is want for r in walks), (
+            sm,
+            walks,
+        )
+
+
+@pytest.mark.parametrize(("sm", "want"), [(20, True), (12, False)])
+def test_walk_forms_agree_across_forward_recompute_and_handle(
+    monkeypatch, sm, want
+) -> None:
+    """The width rules read host plan integers only, so the forward, torch's checkpoint recompute and the recompute
+    from a :class:`RecomputeHandleDetKcp` launch the same form of every #2 and #7 walk program.  The rank of
+    :func:`test_forward_walk_form_follows_the_plan_chains` (HV 6, one segment per document): at 20 SMs the chain
+    clause takes the ``_vh64`` record of the forward walks, at 12 SMs vh = 128; the fake backend has no
+    architecture, so #7 takes vh = 64.  Each path logs the records of every recorded call (``_record``)."""
+    kcp, plan = _mod("cake_kcp"), _mod("cake_kcp_plan")
+    cu = _cu((24 * 64, 16 * 64, 14 * 64, 10 * 64))
+    ops = _walk_form_ops(cu, 2, 6)
+    ctx = plan.build_context_det_kcp(
+        plan.partition_det_kcp(cu, 1, "contiguous"), None, 0, "cpu", sm_count=sm
+    )
+    log: list = []
+    record = kcp._record
+
+    def recording(kind, call):
+        record(kind, call)
+        log.append((kind, [r for r, _ in kcp.LAST_CALL[kind]["records"]]))
+
+    monkeypatch.setattr(kcp, "_record", recording)
+
+    def run(ckpt: bool, handle: bool) -> dict:
+        del log[:]
+        leaves = [
+            ops[n].detach().clone().requires_grad_(True)
+            for n in ("q", "k", "v", "g", "beta")
+        ]
+        hd = kcp.RecomputeHandleDetKcp() if handle else None
+
+        def fn(q, k, v, g, beta, h):
+            return kcp.chunk_gdn_det_kcp(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                ctx,
+                recompute_handle=h,
+                backend="fake",
+                segments=1,
+            )
+
+        if ckpt:
+            from torch.utils.checkpoint import checkpoint
+
+            out = checkpoint(fn, *leaves, hd, use_reentrant=False)
+        else:
+            out = fn(*leaves, hd)
+        out.backward(ops["dout"])
+        forms: dict = {}
+        for _kind, records in log:
+            for r in records:
+                base = r.removesuffix(kcp.VH64_SUFFIX)
+                if base in kcp.FWDH_PROGRAMS + kcp.DHU_PROGRAMS:
+                    forms.setdefault(base, set()).add(r.endswith(kcp.VH64_SUFFIX))
+        return {"kinds": [k for k, _ in log], "forms": forms}
+
+    paths = {
+        "forward": run(False, False),
+        "recompute": run(True, False),
+        "handle": run(True, True),
+    }
+    for name in ("recompute", "handle"):
+        # a checkpointed path records the forward and torch's recompute of it
+        assert paths[name]["kinds"].count("fwd") == 2, (name, paths[name]["kinds"])
+    for name, p in paths.items():
+        forms = p["forms"]
+        fwdh = [b for b in forms if b in kcp.FWDH_PROGRAMS]
+        dhu = [b for b in forms if b in kcp.DHU_PROGRAMS]
+        assert fwdh and dhu, (name, forms)
+        assert all(forms[b] == {want} for b in fwdh), (name, sm, forms)
+        assert all(forms[b] == {True} for b in dhu), (name, forms)
+    assert paths["recompute"]["forms"] == paths["forward"]["forms"]
+    assert paths["handle"]["forms"] == paths["forward"]["forms"]
 
 
 def test_tape_shapes_follow_the_frozen_set() -> None:
@@ -1346,23 +1604,29 @@ def test_graph_entry_key_ignores_the_arena_and_the_capture_pins_its_signature() 
     assert kcp.graph_cache_clear() == 3
 
 
-def test_dhu_form_rule_follows_the_two_wave_recommendation() -> None:
-    """#7 runs the vh = 64 two-CTA form when its grid ``n_walk * HV * 2`` fits two waves at two CTAs per SM
-    (``<= 4 * sm_count``), else vh = 128; the test knob ``dhu_vh`` forces a form (both forms are bitwise twins).
-    ``resolve_launch`` names the record the registry provides: the ``_vh64`` record where the registry ships it,
-    the full-head record with the grid ``n_walk * HV`` where it does not (no error either way)."""
+def test_dhu_form_rule_follows_the_architecture_recommendation() -> None:
+    """#7 runs the vh = 64 two-CTA form for the offset walk always and for the tape walk on ``sm_100a`` / ``sm_103a``
+    always (``arch`` ``None``, the fake backend, counts as one of them); on ``sm_107a`` the tape walk runs vh = 64 when
+    its grid ``n_walk * HV * 2`` fits two waves at two CTAs per SM (``<= 4 * sm_count``), else vh = 128; the test
+    knob ``dhu_vh`` forces a form (both forms are bitwise twins).  ``resolve_launch`` names the record the registry
+    provides: the ``_vh64`` record where the registry ships it, the full-head record with the grid ``n_walk * HV``
+    where it does not (no error either way)."""
     kcp = _mod("cake_kcp")
     assert kcp.DHU_PROGRAMS == ("kcp_dhu_offset", "kcp_dhu_tape")
+    assert kcp.DHU_TAPE_VH64_ARCHES == ("sm_100a", "sm_103a")
+    for arch in (None, "sm_100a", "sm_103a"):
+        assert kcp.dhu_vh(96, 48, 152, arch=arch) == 64
+        assert kcp.dhu_vh(96, 48, 152, tape=False, arch=arch) == 64
+    r = "sm_107a"
+    # the offset walk: vh 64 everywhere
+    assert kcp.dhu_vh(96, 48, 212, tape=False, arch=r) == 64
     assert (
-        kcp.dhu_vh(8, 38, 152) == 64
+        kcp.dhu_vh(8, 38, 152, arch=r) == 64
     )  # 8 * 38 * 2 = 608 == 4 * 152: the boundary is vh 64
-    assert kcp.dhu_vh(8, 38, 151) == 128  # 608 > 604
-    assert (
-        kcp.dhu_vh(6, 48, 152) == 64
-    )  # 576 CTAs: two waves at two CTAs per SM (GB300)
-    assert kcp.dhu_vh(7, 48, 152) == 128  # 672 > 608
-    assert kcp.dhu_vh(1, 48, 148) == 64
-    assert kcp.dhu_vh(9, 48, 152, forced=64) == 64
+    assert kcp.dhu_vh(8, 38, 151, arch=r) == 128  # 608 > 604
+    assert kcp.dhu_vh(8, 48, 212, arch=r) == 64  # 768 <= 848
+    assert kcp.dhu_vh(9, 48, 212, arch=r) == 128  # 864 > 848
+    assert kcp.dhu_vh(9, 48, 212, forced=64, arch=r) == 64
     assert kcp.dhu_vh(1, 48, 152, forced=128) == 128
     try:
         jit = _mod("cake_jit")
@@ -1373,16 +1637,28 @@ def test_dhu_form_rule_follows_the_two_wave_recommendation() -> None:
         assert (
             jit.select_record(prog) == prog
         )  # the default selection stays the full-head record
-        for forced, n_walk in ((None, 3), (64, 9), (128, 3), (None, 7)):
+        for forced, n_walk, arch in (
+            (None, 3, None),
+            (64, 9, "sm_107a"),
+            (128, 3, None),
+            (None, 7, None),
+            (None, 7, "sm_107a"),
+        ):
             args = {
                 "_grid_args": {"n_walk": n_walk, "num_heads": 48},
                 "_sm_count": 152,
                 "_dhu_vh": forced,
+                "_arch": arch,
                 "_grid": n_walk * 48,
             }
             record, values, grid, is_test = kcp.resolve_launch(prog, dict(args))
             assert values == {} and not is_test
-            if kcp.dhu_vh(n_walk, 48, 152, forced) == 64 and ships_vh64:
+            vh = kcp.dhu_vh(
+                n_walk, 48, 152, forced, tape=prog == "kcp_dhu_tape", arch=arch
+            )
+            if (prog, n_walk, arch) == ("kcp_dhu_tape", 7, "sm_107a"):
+                assert vh == 128  # 672 > 608: the sm_107a two-wave rule
+            if vh == 64 and ships_vh64:
                 assert record == prog + kcp.VH64_SUFFIX, (prog, forced, n_walk)
                 assert grid == (n_walk * 48 * 2, 1, 1)
                 assert jit.launch_grid(record, n_walk=n_walk, num_heads=48) == grid
