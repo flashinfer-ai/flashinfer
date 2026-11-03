@@ -106,8 +106,13 @@ main() {
                 fi
             else
                 pytest_status=$?
-                echo "FAILED: $test_file"
-                record_failed_test "$test_file"
+                if [ -f "$junit_file" ]; then
+                    echo "FAILED: $test_file"
+                    record_failed_test "$test_file"
+                else
+                    echo "NO RESULT: $test_file (missing JUnit XML: $junit_file)"
+                    record_no_result_test "$test_file"
+                fi
             fi
             test_status_finish "${receipt}" "${pytest_status}"
         fi
