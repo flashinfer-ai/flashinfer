@@ -216,9 +216,9 @@ another summation order).
 | `sm_100a` hidden 4096 `"simt_n128m64s2"` | 1 to 256 | 64, 128, 192, 256 | GB200, 152 SMs (three parts in two nodes) | x0.291-0.725 | x0.381-0.860 / x0.741-0.978 |
 | `sm_100a` hidden 5120 `"simt_n64m64s2"` | 1 to 256 | 64, 128, 192, 256 | GB200, 152 SMs (three parts in two nodes) | x0.324-0.872 | x0.639-0.943 / x0.800-0.993 |
 | `sm_100a` hidden 6144 `"simt_n64m64s2"` | 1 to 256 | 64, 128, 192, 256 | GB200, 152 SMs (three parts in two nodes) | x0.287-0.836 | x0.524-0.911 / x0.797-0.985 |
-| `sm_107a` (`ROUTER_RULES_BY_SM`, 212 SMs) hidden 4096 `"simt_n128m64s2"` | 1 to 256 | 64, 128, 192, 256 | R200, 212 SMs (two parts in one node) | x0.311-0.797 | x0.609-0.894 / x0.872-0.989 |
-| `sm_107a` (`ROUTER_RULES_BY_SM`, 212 SMs) hidden 5120 `"simt_n128m64s2"` | 1 to 256 | 64, 128, 192, 256 | R200, 212 SMs (two parts in one node) | x0.278-0.684 | x0.554-0.814 / x0.853-0.954 |
-| `sm_107a` (`ROUTER_RULES_BY_SM`, 212 SMs) hidden 6144 `"simt_n128m64s2"` | 1 to 256 | 64, 128, 192, 256 | R200, 212 SMs (two parts in one node) | x0.270-0.661 | x0.542-0.812 / x0.855-0.961 |
+| `sm_107a` (`ROUTER_RULES_BY_SM`, 212 SMs) hidden 4096 `"simt_n128m64s2"` | 1 to 256 | 64, 128, 192, 256 | R200, 212 SMs (three parts in two nodes) | x0.308-0.797 | x0.609-0.910 / x0.872-0.989 |
+| `sm_107a` (`ROUTER_RULES_BY_SM`, 212 SMs) hidden 5120 `"simt_n128m64s2"` | 1 to 256 | 64, 128, 192, 256 | R200, 212 SMs (three parts in two nodes) | x0.278-0.738 | x0.554-0.832 / x0.853-0.971 |
+| `sm_107a` (`ROUTER_RULES_BY_SM`, 212 SMs) hidden 6144 `"simt_n128m64s2"` | 1 to 256 | 64, 128, 192, 256 | R200, 212 SMs (three parts in two nodes) | x0.270-0.707 | x0.542-0.821 / x0.855-0.973 |
 
 *Table: the SIMT windows (eager launches and CUDA graph replays, one long-lived process and a fresh process per token
 count; the backward pass is the input gradient and the weight gradient, the checkpointed step two forward passes and the
