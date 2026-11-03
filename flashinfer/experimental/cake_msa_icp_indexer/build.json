@@ -55,11 +55,30 @@
     }
   },
   "generator": {
-    "cake_revision": "4bd07d183b02c47fce10badbcb4e726d092f242f",
+    "cake_revision": "f4723f63a509fa3300c6d277e52b5e41f55ac9ea",
     "cuda": "13.4.92",
-    "rendered_at": "2026-11-03T00:00:00Z"
+    "rendered_at": "2026-11-03T05:20:44Z"
   },
   "libraries": [
+    {
+      "arch": "sm_107a",
+      "closure_sha256": "f55558f20bfc8672e11da8b49dae84c24ccf0fa7ba7c19c1fb300eed8de75d36",
+      "entry": "run",
+      "gencode": "-gencode=arch=compute_107a,code=sm_107a",
+      "min_cuda": "13.4",
+      "name": "cake_msa_icp_indexer_0318b414468ea1641518_sm_107a",
+      "nvcc_flags": [],
+      "nvcc_flags_if": [],
+      "path": "aot/cake_msa_icp_indexer_0318b414468ea1641518_sm_107a.so",
+      "sha256": {
+        "csrc/cake_msa_icp_indexer_0318b414468ea1641518_binding.cu": "89bf93f861a0dbfef59c593dd7514a27102b3d3af7472737dd5679f74e4f87cb",
+        "csrc/cake_msa_icp_indexer_0318b414468ea1641518_kernel.cu": "fb5c804e17989708806874ddebce6a5e82ee39e67cfc69d76adad08fccffb55b"
+      },
+      "sources": [
+        "csrc/cake_msa_icp_indexer_0318b414468ea1641518_kernel.cu",
+        "csrc/cake_msa_icp_indexer_0318b414468ea1641518_binding.cu"
+      ]
+    },
     {
       "arch": "sm_100a",
       "closure_sha256": "5405e1be8abfff52f197f43f07e0bc70013b57c78cc9cb2dbae8675718c23360",
@@ -305,25 +324,6 @@
       "sources": [
         "csrc/cake_msa_icp_indexer_2e98af744f6a0568d51d_kernel.cu",
         "csrc/cake_msa_icp_indexer_2e98af744f6a0568d51d_binding.cu"
-      ]
-    },
-    {
-      "arch": "sm_107a",
-      "closure_sha256": "b7b178db0ad09d3d03117c2019ad8e906041ed73c56d011c9f895b38fa468659",
-      "entry": "run",
-      "gencode": "-gencode=arch=compute_107a,code=sm_107a",
-      "min_cuda": "13.4",
-      "name": "cake_msa_icp_indexer_3dde5cfa8d05f044f598_sm_107a",
-      "nvcc_flags": [],
-      "nvcc_flags_if": [],
-      "path": "aot/cake_msa_icp_indexer_3dde5cfa8d05f044f598_sm_107a.so",
-      "sha256": {
-        "csrc/cake_msa_icp_indexer_3dde5cfa8d05f044f598_binding.cu": "bda5c45caa2433bb18caf3483e0ee913138683ca6420f6df5b5a00e9585a7a7f",
-        "csrc/cake_msa_icp_indexer_3dde5cfa8d05f044f598_kernel.cu": "870ad178b16c9835cef02cd015520d4fdd3de837e3f3fdfe51a3fca08f5c7751"
-      },
-      "sources": [
-        "csrc/cake_msa_icp_indexer_3dde5cfa8d05f044f598_kernel.cu",
-        "csrc/cake_msa_icp_indexer_3dde5cfa8d05f044f598_binding.cu"
       ]
     },
     {
