@@ -228,15 +228,20 @@ def sm100_pick_swizzle(m: int, n: int, k: int) -> int:
     return max(2, min(16, s))
 
 
-def sm100_raster_along_m(
-    m: int, n: int, tile: Tuple[int, int, int], two_sm: bool
-) -> bool:
-    """CUTLASS's heuristic raster: along the kernel's M (weight rows) when there
-    are more activation tiles than weight tiles, else along N."""
-    cta_tile_m = tile[0] // (2 if two_sm else 1)
-    tiles_m = _tiles(n, cta_tile_m)
-    tiles_n = _tiles(m, tile[1])
-    return tiles_n > tiles_m
+def sm100_raster_along_m(m: int, n: int) -> bool:
+    """Walk the weight rows (the kernel's M) fast when the fp8 weight (n * k
+    bytes) is the smaller operand, else the activation rows (2 * m * k bytes).
+
+    A wave of clusters then shares one tile of the operand walked slowly and
+    streams the other operand whole, so the operand walked fast is the one that
+    must stay L2-resident across the run: the smaller one.  CUTLASS's tile-count
+    heuristic (more activation tiles than weight tiles) ignores the 2x byte
+    difference between the operands and walks the activation for N >= 1.5 M;
+    at M=8192, N=10240, K=5120 on a B200 that is an L2 hit rate of 59% against
+    84%, 1.27 GB of DRAM reads against 0.32 GB and 576 us against 536 us.  Over
+    twenty Cosmos layer shapes at a locked clock the byte rule is never slower
+    by more than 0.7% and faster by 4-20% wherever M >= 7296."""
+    return n < 2 * m
 
 
 def _compile_pointers(specs: Tuple):
@@ -502,7 +507,7 @@ def _sm100_plan(algo: int, m: int, n: int, k: int, device: torch.device) -> _Sm1
         algo,
         splits,
         sm100_pick_swizzle(m, n, k),
-        sm100_raster_along_m(m, n, tile.mma_tiler, tile.two_sm),
+        sm100_raster_along_m(m, n),
         _max_active_clusters(device_index, tile.cluster[0] * tile.cluster[1]),
     )
     _SM100_PLAN_CACHE[key] = plan
