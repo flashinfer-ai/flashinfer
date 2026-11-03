@@ -532,8 +532,8 @@ def dcp_balanced_program(
         # overflows the grid, so the planner's fold clauses never fire and the
         # program without the idle-CTA fold body has the same plan and fold order.
         split = variants["static_one_wave_regime"]
-        split_tickets = int(split["min_chunks"]) - 1 + int(
-            split["reduce_tickets_per_tile"]
+        split_tickets = (
+            int(split["min_chunks"]) - 1 + int(split["reduce_tickets_per_tile"])
         )
         if int(num_kv_heads) * (int(batch_size) + split_tickets) > int(sm_count):
             return int(variants["at_or_above_grid"])
