@@ -226,6 +226,48 @@ def test_invalid_tuning_scalar_identifies_argument(field):
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("variant", ["inference", "genphase"])
+@pytest.mark.parametrize("allow_nondeterministic", [False, True])
+def test_sm107_schedule_base_respects_nondeterminism(
+    monkeypatch, tmp_path, variant, allow_nondeterministic
+):
+    from flashinfer.moe_ep.backends.mega.kernel.sm107.tuning import _candidates
+    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim import (
+        knob_cache,
+    )
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", str(tmp_path / "knobs.json"))
+    args = tune._parse_args(
+        [
+            *_GEOMETRY,
+            "--arch",
+            "sm107",
+            "--kernel-variant",
+            variant,
+            "--sweep",
+            "schedule",
+            *(["--allow-nondeterministic"] if allow_nondeterministic else []),
+        ]
+    )
+    knob_cache.record_knobs(
+        {"reduce_topk_in_kernel": True},
+        dtype="nvfp4",
+        kernel_variant=variant,
+        world_size=1,
+        hidden=args.hidden,
+        intermediate=args.intermediate,
+        num_experts=args.num_experts,
+        topk=args.topk,
+        max_tokens=64,
+        allow_nondeterministic=True,
+    )
+    choices = _candidates(args, 0, 1, 64, "nvfp4", variant)
+    assert choices
+    assert all(k["reduce_topk_in_kernel"] == allow_nondeterministic for k in choices)
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("arch", ["sm90", "sm100"])
 def test_mxfp4_tuner_rejects_unwired_architecture(arch, capsys):
     assert tune.main([*_GEOMETRY, "--arch", arch, "--dtype", "mxfp4_mxfp8"]) == 2

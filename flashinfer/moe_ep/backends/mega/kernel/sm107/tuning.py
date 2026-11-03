@@ -116,6 +116,7 @@ def _dummy_inputs(args, rank, live_tokens: int):
 
 
 def _candidates(args, rank, world_size, max_tokens, quant_kind, variant):
+    """Build the default grid or expand the explicit or cached schedule base."""
     import json
 
     from .....kernel_src.sm107.next_cutedsl_megamoe import (
@@ -139,6 +140,7 @@ def _candidates(args, rank, world_size, max_tokens, quant_kind, variant):
                 num_experts=args.num_experts,
                 topk=args.topk,
                 max_tokens=max_tokens,
+                allow_nondeterministic=args.allow_nondeterministic,
                 activation=args.activation,
                 situ_beta=args.situ_beta,
                 situ_linear_beta=args.situ_linear_beta,
@@ -161,6 +163,7 @@ def _candidates(args, rank, world_size, max_tokens, quant_kind, variant):
 def tune_one(
     args, rank: int, world_size: int, max_tokens: int, quant_kind: str
 ) -> dict:
+    """Generate one CLI workload and tune its fixed or automatic variants."""
     import torch
 
     live_tokens = args.live_tokens if args.live_tokens is not None else max_tokens
@@ -245,13 +248,13 @@ def tune_one(
                 world_size,
                 max_tokens,
                 quant_kind,
-                backend,
+                cast("RubinVariantBackend", backend),
                 symm_buffer,
                 transformed,
                 output,
             )
         execution = ForwardExecution(
-            backend, tensors, quantize_input=True, output=output
+            cast("RubinBackend", backend), tensors, quantize_input=True, output=output
         )
 
         def tune_forward(y, l1, l2, workspace, **kwargs):

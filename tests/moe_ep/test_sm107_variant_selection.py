@@ -3,7 +3,7 @@
 import dataclasses
 import hashlib
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import DEFAULT, Mock
 
 import pytest
 import torch
@@ -318,6 +318,30 @@ def test_collective_cache_hits_reconcile_different_winners(protocol, monkeypatch
     assert selected["variant"] == "genphase"
     assert selected["knobs"]["cluster_shape_mn"] == (4, 1)
     assert gather.call_count == 5
+
+
+@pytest.mark.parametrize(
+    "index,value",
+    [
+        pytest.param(6, {"inference": [{}]}, id="candidates"),
+        pytest.param(8, 11, id="timed_iters"),
+    ],
+)
+def test_collective_variant_controls_must_agree(protocol, monkeypatch, index, value):
+    protocol, _ = protocol
+
+    def gather(controls):
+        peer = list(controls)
+        peer[index] = value
+        return [controls, tuple(peer)]
+
+    monkeypatch.setattr(protocol.backend, "_gather", gather)
+    with (
+        autotune_v2(persistent_cache=False),
+        pytest.raises(ValueError, match="EP ranks disagree on variant tuning controls"),
+    ):
+        AutoTuner.get().choose_with_protocol(selection.NAMESPACE, protocol)
+    protocol._install.assert_not_called()
 
 
 @pytest.mark.parametrize("phase", ["selection", "settled", "capture"])
@@ -651,8 +675,9 @@ def test_full_forward_sweep_selects_across_all_knobs(
         assert not any(buffer.destroyed for buffer in buffers)
 
 
+@pytest.mark.parametrize("skew", [None, 2.0])
 def test_offline_variants_search_afresh_and_publish_without_installing(
-    forward_sweep, monkeypatch
+    forward_sweep, monkeypatch, skew
 ):
     from flashinfer.moe_ep import tune
     from flashinfer.moe_ep.backends.mega.kernel.sm107 import tuning
@@ -690,6 +715,7 @@ def test_offline_variants_search_afresh_and_publish_without_installing(
             "1",
             "--timed-iters",
             "2",
+            *(["--skew", str(skew)] if skew is not None else []),
         ]
     )
     monkeypatch.setattr(package, "sm107_candidates", native.sm107_candidates)
@@ -708,6 +734,27 @@ def test_offline_variants_search_afresh_and_publish_without_installing(
         protocol.owner._tuning_state = AutoTuningState()
         sweep = Mock(wraps=native._sweep_sm107_block_scaled_mega_moe)
         monkeypatch.setattr(native, "_sweep_sm107_block_scaled_mega_moe", sweep)
+
+        def restage(workspace, live, topk, experts, ratio, seed):
+            assert (live, topk, experts, ratio, seed) == (4, 3, 8, skew, args.seed)
+            workspace.topk_idx[:live].fill_(2)
+            workspace.topk_weights[:live].fill_(0.25)
+
+        restage = Mock(side_effect=restage)
+        monkeypatch.setattr(tuning, "restage_skewed_routing", restage)
+        if skew is not None:
+            protocol.owner.workspace = protocol.owner.kernel._allocate_workspace(
+                protocol.owner.fleet
+            )
+
+        def check_routing(*args, **kwargs):
+            if skew is not None:
+                restage.assert_called_once()
+                assert torch.all(protocol.tensors.topk_ids == 2)
+                assert torch.all(protocol.tensors.topk_weights == 0.25)
+            return DEFAULT
+
+        sweep.side_effect = check_routing
         winner = tuning._tune_variants(
             args,
             0,
@@ -727,6 +774,7 @@ def test_offline_variants_search_afresh_and_publish_without_installing(
         )
         assert protocol.owner._tuning_state.winner is None
         install.assert_not_called()
+        assert restage.call_count == (skew is not None)
         records = AutoTuner.get().protocol_context(tuning_protocol.NAMESPACE).records()
         assert len(records) == 2
         assert all(
