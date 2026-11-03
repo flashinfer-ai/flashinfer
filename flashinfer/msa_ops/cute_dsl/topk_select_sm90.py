@@ -11,12 +11,16 @@ The compile cache keys on the occupancy-derived CTA geometry, a bounded
 discrete set, so shapes never force a recompile.
 """
 
+import functools
+
 import torch
 import cutlass
 import cutlass.cute as cute
 import cutlass.utils as cutlass_utils
 from cutlass import Int32, Float32
 from cutlass.cute.runtime import from_dlpack
+
+from ...jit.cute_dsl_core import build_and_load_cute_dsl_kernel
 
 # ---------------------------------------------------------------------------
 # MSA stage-2 block selection.
@@ -901,19 +905,46 @@ def _topk_kernel(
     # 1-D view of this thread's own column: index math is one multiply-add
     gcol = mS[(h, None, colr)]
 
+    nvp_c = T
+    fb_c = Int32(0)
+    hi_c = T
+    if cutlass.const_expr(MASK):
+        nvp_c = min(max(mNVP[colr], Int32(0)), T)
+        fb_c = min(FB, nvp_c)
+        fe_c = min(FE, nvp_c - fb_c)
+        hi_c = nvp_c - fe_c
+    # Tiles at or past nvp_c load as NEG_BIG, which the epilogue decodes to
+    # -1 just like an empty slot, so the walk stops there. Under a CUDA graph
+    # the score width is max_model_len's tile count while a token's extent is
+    # its own: reading the -inf tail cost 3-4x the kernel at 8k context.
+    Te = nvp_c
+    if cutlass.const_expr(FILTER and MASK):
+        # The compactor votes once per group, so its trip count n must be
+        # warp-uniform, or the vote deadlocks.  A warp is 32 adjacent tokens
+        # of one tile group, and a prefix that is not page-aligned puts a page
+        # boundary between them.  The warp's widest extent is still exact:
+        # tiles past a lane's own nvp_c load as NEG_BIG.
+        for _d in cutlass.range_constexpr(5):
+            Te = max(Te, cute.arch.shuffle_sync_bfly(Te, offset=16 >> _d, mask=FULL))
+
     # Tile group w owns t = t00 + j*step, j = 0 .. n-1.
     if cutlass.const_expr(DENSE):
         step = W
-        n = (max(T - w, Int32(0)) + Int32(W - 1)) >> LW
+        n = (max(Te - w, Int32(0)) + Int32(W - 1)) >> LW
         t00 = w
     else:
         step = 1
-        A = (T + Int32(W - 1)) >> LW
+        # Blocks are sized from this column's own extent so that every tile
+        # group shares it; sized from T, a short column fell to group 0 alone.
+        A = (Te + Int32(W - 1)) >> LW
         A = (A + Int32(TL - 1)) & Int32(-TL)
-        n = min(max(T - w * A, Int32(0)), A)
+        n = min(max(Te - w * A, Int32(0)), A)
         t00 = w * A
 
-    Tm1 = T - Int32(1)
+    # Lanes past a group's last tile still issue their register tile's loads;
+    # clamping them to the column's own extent keeps those reads on lines this
+    # column already touches instead of spreading them over the whole width.
+    Tm1 = max(Te - Int32(1), Int32(0))
 
     # The first tile lands straight in the accumulator: against an empty
     # top-16 the fold degenerates to sorting the tile, so its 16 maxima and
@@ -929,14 +960,6 @@ def _topk_kernel(
     # Forced blocks and per-token validity are folded in here rather than
     # biasing max_score in a separate pass: the scores are already in flight,
     # so this costs a few predicated selects and no extra memory traffic.
-    nvp_c = T
-    fb_c = Int32(0)
-    hi_c = T
-    if cutlass.const_expr(MASK):
-        nvp_c = min(max(mNVP[colr], Int32(0)), T)
-        fb_c = min(FB, nvp_c)
-        fe_c = min(FE, nvp_c - fb_c)
-        hi_c = nvp_c - fe_c
     for u in cutlass.range_constexpr(TL):
         ok = Int32(u) < n
         t_u = min(t00 + step * u, Tm1)
@@ -1402,6 +1425,9 @@ def _launch(
     )
 
 
+# Pure in its three ints and the hardware constants, and 40-270 us of Python
+# per evaluation: resolve each geometry once.
+@functools.lru_cache(maxsize=4096)
 def _plan(Hq, T, Nq):
     """Pick the CTA geometry (C columns x W tile groups), the tile walk order
     and the register-tile width TL from hardware costs alone.
@@ -1647,7 +1673,95 @@ def _kf_stream():
 
 
 _cache: dict = {}
-_compiled_fill = None
+
+# A decode batch under a CUDA graph sees a score width of max_model_len's tile
+# count (8192 at 1M tokens) whatever its real extents, which only the per-token
+# num_valid_pages knows.  Planned for that width the kernel pays a 256-group
+# merge tree on every replay; planned for 2048 tiles it is 0.6-1.5 us faster on
+# H100 at 64-2048 real tiles (q4 decode, 1-64 requests).  At 8192 real tiles it
+# is 1.0-1.7 us slower up to 24 requests and faster at 48 and 64.  Batches of
+# more than 256 columns gain nothing from it, and an eager batch's width is its
+# real extent, so both keep the plan for their width.
+_DECODE_PLAN_T = 2048
+_DECODE_PLAN_COLS = 256
+
+
+def _select_plan(Hq, T, Nq, per_token):
+    """_plan for the score width, or for _DECODE_PLAN_T when a decode-sized
+    batch's per-token extents make the width an upper bound only."""
+    if per_token and T > _DECODE_PLAN_T and Hq * Nq <= _DECODE_PLAN_COLS:
+        plan = _plan(Hq, _DECODE_PLAN_T, Nq)
+        # A register tile narrower than TOPK is only valid when one tile covers
+        # a tile group's whole extent, and the extent here can reach T.
+        if plan[2] >= TOPK or -(-T >> plan[0]) <= plan[2]:
+            return plan
+    return _plan(Hq, T, Nq)
+
+
+def _dyn(t, ld):
+    return from_dlpack(
+        t, enable_tvm_ffi=True, use_32bit_stride=True
+    ).mark_layout_dynamic(leading_dim=ld)
+
+
+def _compile(key, max_score, topk_idx, nvp):
+    """The kernel of ``key``: ``("fill", mask, dtype)`` for a width of at most
+    TOPK tiles, else the plan's five constants followed by ``(mask, dtype)``.
+    Compiled against the given tensors' kinds, not their shapes."""
+    if key[0] == "fill":
+        args = (_launch_fill, _kf_stream(), _dyn(max_score, 2), _dyn(topk_idx, 2))
+        args += (_dyn(nvp, 0), key[1])
+        name = f"fill_mask{int(key[1])}_{key[2]}"
+    else:
+        args = (_launch, _kf_stream(), _dyn(max_score, 2), _dyn(topk_idx, 2))
+        args += (_dyn(nvp, 0), Int32(0), Int32(0)) + key[:6]
+        lw, dense, tl, filt, c, mask, dtype = key
+        name = f"lw{lw}_dense{int(dense)}_tl{tl}_filt{int(filt)}_c{c}"
+        name += f"_mask{int(mask)}_{dtype}"
+    return build_and_load_cute_dsl_kernel(
+        "msa_topk_select_sm90",
+        name,
+        lambda: cute.compile(*args, options="--enable-tvm-ffi"),
+        (__file__,),
+    )
+
+
+def _geometric(lo, hi, ratio):
+    """Integers from lo to hi, consecutive ones spaced by at most ``ratio``."""
+    out = [lo]
+    while out[-1] < hi:
+        out.append(min(hi, max(out[-1] + 1, int(out[-1] * ratio))))
+    return out
+
+
+def preload(device=None, num_heads=(1, 2, 4)) -> int:
+    """Build or load, now, the masked kernels the planner picks over a grid of
+    serving geometries: ``num_heads`` index heads, score widths up to 16384
+    tiles and up to 65536 query tokens.  The compile key is the plan alone, a
+    bounded set, so this covers the plans an eager step's widths and token
+    counts lead to, which otherwise compile mid-serving.  A geometry between
+    the grid's points can still pick a plan outside it; that one compiles once
+    per node at its first use, through the disk cache.  Returns the number of
+    kernels."""
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("top-k preload must not run under CUDA graph capture")
+    device = torch.device("cuda") if device is None else torch.device(device)
+    widths = _geometric(TOPK + 1, 16384, 1.1) + [_DECODE_PLAN_T]
+    tokens = list(range(1, 33)) + _geometric(33, 65536, 1.15)
+    plan = _plan.__wrapped__  # keep the sweep out of the serving cache
+    keys = {("fill", True, torch.float32)}
+    for hq in num_heads:
+        for T in widths:
+            for nq in tokens:
+                keys.add(plan(hq, T, nq) + (True, torch.float32))
+    with torch.cuda.device(device):
+        scores = torch.empty(1, 64, 64, dtype=torch.float32, device=device)
+        idx = torch.empty(64, 1, TOPK, dtype=torch.int32, device=device)
+        nvp = torch.empty(64, dtype=torch.int32, device=device)
+        for key in keys:
+            if key not in _cache:
+                _cache[key] = _compile(key, scores, idx.permute(1, 0, 2), nvp)
+    return len(keys)
 
 
 @torch.no_grad()
@@ -1667,57 +1781,26 @@ def run(
     window. All three are applied at the score load inside the kernel, so the
     unmasked path is unchanged and costs nothing.
     """
-    global _compiled_fill
     Hq, T, Nq = max_score.shape
     mask = num_valid_pages is not None or bool(force_begin) or bool(force_end)
     nvp = num_valid_pages
     if nvp is None:
         nvp = torch.empty(0, dtype=torch.int32, device=max_score.device)
 
-    def _dyn(t, ld):
-        return from_dlpack(
-            t, enable_tvm_ffi=True, use_32bit_stride=True
-        ).mark_layout_dynamic(leading_dim=ld)
-
     if T <= TOPK:
-        key = ("fill", mask)
+        key = ("fill", mask, max_score.dtype)
         fn = _cache.get(key)
         if fn is None:
-            fn = cute.compile(
-                _launch_fill,
-                _kf_stream(),
-                _dyn(max_score, 2),
-                _dyn(topk_idx, 2),
-                _dyn(nvp, 0),
-                mask,
-                options="--enable-tvm-ffi",
-            )
-            _cache[key] = fn
+            fn = _cache[key] = _compile(key, max_score, topk_idx, nvp)
         fn(_kf_stream(), max_score, topk_idx, nvp)
         return
 
-    plan = _plan(int(Hq), int(T), int(Nq))
+    plan = _select_plan(int(Hq), int(T), int(Nq), num_valid_pages is not None)
     # C is the CTA's occupancy-derived column tile, not a workload threshold.
     # Keying it makes the block extent and all row/group address arithmetic
     # compile-time constants while preserving the same algorithm for every C.
-    key = plan + (mask,)
+    key = plan + (mask, max_score.dtype)
     fn = _cache.get(key)
     if fn is None:
-        fn = cute.compile(
-            _launch,
-            _kf_stream(),
-            _dyn(max_score, 2),
-            _dyn(topk_idx, 2),
-            _dyn(nvp, 0),
-            Int32(force_begin),
-            Int32(force_end),
-            plan[0],
-            plan[1],
-            plan[2],
-            plan[3],
-            plan[4],
-            mask,
-            options="--enable-tvm-ffi",
-        )
-        _cache[key] = fn
+        fn = _cache[key] = _compile(key, max_score, topk_idx, nvp)
     fn(_kf_stream(), max_score, topk_idx, nvp, force_begin, force_end)
