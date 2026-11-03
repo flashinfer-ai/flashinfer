@@ -24,9 +24,15 @@ from flashinfer.utils import get_compute_capability
 
 @pytest.fixture(autouse=True)
 def _needs_hopper_or_blackwell():
-    """The op has Hopper (sm_90a) and Blackwell (sm_100a / sm_103a) kernels only."""
-    if get_compute_capability(torch.device("cuda"))[0] not in (9, 10):
-        pytest.skip("w8a16_fp8_gemm needs Hopper or Blackwell")
+    """The op has Hopper (sm_90a) and Blackwell (sm_100a / sm_103a) kernels only.
+
+    Ask the op itself rather than testing the major version: Rubin (compute
+    capability 10.7) shares Blackwell's major and is not supported."""
+    major, minor = get_compute_capability(torch.device("cuda"))
+    if not w8a16_fp8_gemm.is_compute_capability_supported(major * 10 + minor):
+        pytest.skip(
+            "w8a16_fp8_gemm needs Hopper or Blackwell (sm_90a, sm_100a, sm_103a)"
+        )
 
 
 def _major() -> int:
