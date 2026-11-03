@@ -445,6 +445,22 @@ def test_nvfp4_gin_public_graph_replay(quantize_input, partial, monkeypatch, tmp
                 assert torch.equal(actual, expected), (bootstrap.rank, iteration)
             dist.barrier()
 
+        snapshots = [torch.empty_like(expected) for _ in range(12)]
+        torch.cuda.synchronize()
+        calls = len(streams)
+        with monkeypatch.context() as context:
+            context.setattr(layer._workspace._frontend, "_gin_agree", no_host_agreement)
+            for iteration, snapshot in enumerate(snapshots):
+                index = iteration % len(graphs)
+                layer._workspace.output_activation.fill_(float("nan"))
+                outputs[index].fill_(float("nan"))
+                graphs[index].replay()
+                snapshot.copy_(outputs[index])
+            # No host sync, control collective or allocation between replays.
+            torch.cuda.synchronize()
+        assert len(streams) == calls
+        assert all(torch.equal(snapshot, expected) for snapshot in snapshots)
+
         with torch.profiler.profile(
             activities=[
                 torch.profiler.ProfilerActivity.CPU,
@@ -465,7 +481,7 @@ def test_nvfp4_gin_public_graph_replay(quantize_input, partial, monkeypatch, tmp
         assert torch.equal(outputs[0], expected)
         print(
             f"[rank {bootstrap.rank}] GIN_GRAPH_PASS packed={not quantize_input} "
-            f"tokens={n} graphs=3 replays=36 mega=1 reduce=1",
+            f"tokens={n} graphs=3 replays=48 queued=12 mega=1 reduce=1",
             flush=True,
         )
     except BaseException:
