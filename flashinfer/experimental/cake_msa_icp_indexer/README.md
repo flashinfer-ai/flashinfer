@@ -107,6 +107,14 @@ one key over steps of different lengths, build every window plan with
 `max_seq_len` the model limit and size the score scratch with
 `prefill_scratch_shape()`; with the fused path the pool needs no change.
 
+*Device token count.*  The backend's `topk_select_prefill`,
+`topk_select_publish`, `decode_score_publish` (its publisher) and
+`merge_candidates` take an optional `token_count`, an int32 `[1]` device
+tensor.  With it the call launches the `_dc` record of its role over the
+grid of the passed tensors and only the rows below `token_count[0]` are
+selected, published or merged; the rows past it are not written.  One
+captured launch then serves every count up to its grid.
+
 The package is a vendorable Cake package: `build.json` lists every
 `<program>_<arch>` library with its sources and flags, `cake_build.py` builds
 or loads them, and `cake_jit.py` is the registry that routes each call by

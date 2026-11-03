@@ -68,7 +68,10 @@ PREFIX = "cake_msa_icp_indexer"
 # from launch metadata only.  The fused prefill path replaces ``score`` and
 # ``select_prefill`` with ``score_topk16`` (each (CTA, item) cell's sorted
 # Top16 lists in a caller pool) and ``prefill_list_carrier`` (the lists of a
-# row merged into the same carrier rows).
+# row merged into the same carrier rows).  The ``_dc`` roles are the same
+# selectors, publishers and merges reading the token count from the device
+# word ``token_count[0]`` instead of a launch scalar: rows of the grid past it
+# do nothing, so one captured launch serves every count up to its grid.
 ROLES = (
     "plan",
     "score",
@@ -82,6 +85,12 @@ ROLES = (
     "merge_legacy",
     "merge_prefill",
     "prefill_list_carrier",
+    "select_prefill_dc",
+    "select_publish_dc",
+    "topk16_publish_dc",
+    "merge_dc",
+    "merge_legacy_dc",
+    "merge_prefill_dc",
 )
 # Grid rules of the records (evaluated by :func:`launch_grid`): one CTA, one
 # CTA per streaming multiprocessor (the persistent prefill scorer, whose plan
@@ -114,7 +123,8 @@ LAUNCH_ARGUMENT = "enable_pdl"
 # ``[world]`` peer receive-slot addresses, ``errors`` int32 ``[1]`` timeout
 # counter, ``generations`` int32 ``[3, H, capacity]`` publish counters,
 # ``recv`` the owner's receive rows of one slot set, ``expected`` int32
-# ``[hpr, capacity]`` merge counters, ``output`` int32 ``[T, hpr, 16]``.
+# ``[hpr, capacity]`` merge counters, ``output`` int32 ``[T, hpr, 16]``,
+# ``token_count`` int32 ``[1]`` the token count of a ``_dc`` record.
 LOGICAL_TENSORS = (
     "q",
     "k",
@@ -138,6 +148,7 @@ LOGICAL_TENSORS = (
     "recv",
     "expected",
     "output",
+    "token_count",
 )
 # Scalars: sizes (``batch``, ``num_tokens``, ``num_heads``, ``heads_per_rank``,
 # ``total_q``, ``num_ctas``, ``columns`` the B128 column bound of a prefill

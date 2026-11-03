@@ -774,28 +774,39 @@ def topk_select_prefill(
     force_end_blocks: int = 0,
     index_scale: int = 1,
     index_offset: int = 0,
+    token_count: Optional[torch.Tensor] = None,
 ) -> None:
+    """Top16 carrier rows of the score rows ``scores[:T]``.  With
+    ``token_count`` (int32 ``[1]``) only the rows below ``token_count[0]``
+    (read on the device, at most ``T``) are selected; the grid covers ``T``."""
     if scores.ndim != 3:
         raise ValueError("scores must be float32 [T, H, K]")
     t, h = scores.shape[0], scores.shape[1]
     _heads(h)
+    dc = _token_count(token_count)
     k_cols = _score_rows("scores", scores, t, h, 1, MAX_SELECT_COLUMNS)
     _vector("num_valid_pages", num_valid_pages, torch.int32, t)
     _carrier(carrier, h, t)
     _forced(force_begin_blocks, force_end_blocks)
     _index_map(index_scale, index_offset)
     dev = _device_index(scores)
-    _same_device(scores.device, num_valid_pages=num_valid_pages, carrier=carrier)
+    _same_device(
+        scores.device,
+        num_valid_pages=num_valid_pages,
+        carrier=carrier,
+        token_count=token_count,
+    )
     if t == 0:
         return
     arch = cake_jit.device_arch(dev)
-    name = cake_jit.route("select_prefill", None, arch)
+    name = cake_jit.route("select_prefill" + dc, None, arch)
     cake_jit.run_module(
         name,
         {
             "scores": scores,
             "num_valid_pages": num_valid_pages,
             "carrier": carrier,
+            "token_count": token_count,
             "num_tokens": t,
             "total_q": t,
             "num_heads": h,
@@ -813,6 +824,21 @@ def topk_select_prefill(
         arch=arch,
         device_index=dev,
     )
+
+
+def _token_count(token_count: Optional[torch.Tensor]) -> str:
+    """The role suffix of a call: ``"_dc"`` with a device token count (int32
+    ``[1]``: the rows of the call's grid at or past ``token_count[0]`` do
+    nothing), ``""`` without one."""
+    if token_count is None:
+        return ""
+    if (
+        token_count.dtype != torch.int32
+        or tuple(token_count.shape) != (1,)
+        or not token_count.is_cuda
+    ):
+        raise ValueError("token_count must be a CUDA int32 tensor of shape [1]")
+    return "_dc"
 
 
 def _carrier(carrier: torch.Tensor, h: int, t: int) -> None:
@@ -1109,14 +1135,18 @@ def topk_select_publish(
     generations: Optional[torch.Tensor] = None,
     index_scale: int = 1,
     index_offset: int = 0,
+    token_count: Optional[torch.Tensor] = None,
     _trusted: bool = False,
 ) -> None:
     # ``_trusted``: receive bases, errors and generations come from a comm the
     # caller's ``check_comm`` validated, the scalars from its validated plan
     # and ``slot`` is in range; the per-call tensors are still checked.
+    # ``token_count`` (int32 [1]): only the rows below token_count[0] (read on
+    # the device, at most T) are selected and published.
     if scores.ndim != 3:
         raise ValueError("scores must be float32 [T, H, K]")
     t, h = scores.shape[0], scores.shape[1]
+    dc = _token_count(token_count)
     k_cols = _score_rows("scores", scores, t, h, 1, MAX_SELECT_COLUMNS)
     dev = _device_index(scores)
     if _trusted:
@@ -1153,10 +1183,11 @@ def topk_select_publish(
             errors=errors,
             generations=generations,
         )
+    _same_device(scores.device, token_count=token_count)
     if t == 0:
         return
     arch = cake_jit.device_arch(dev)
-    name = cake_jit.route("select_publish", None, arch)
+    name = cake_jit.route("select_publish" + dc, None, arch)
     cake_jit.run_module(
         name,
         {
@@ -1166,6 +1197,7 @@ def topk_select_publish(
             "errors": errors,
             # The legacy kernel never touches it; any int32 pointer serves.
             "generations": errors if generations is None else generations,
+            "token_count": token_count,
             "num_tokens": t,
             "total_q": t,
             "num_heads": h,
@@ -1212,7 +1244,11 @@ def decode_score_publish(
     spin_limit: int = DEFAULT_SPIN_LIMIT,
     generations: Optional[torch.Tensor] = None,
     enable_pdl: bool = True,
+    token_count: Optional[torch.Tensor] = None,
 ) -> None:
+    # ``token_count`` (int32 [1]): the publisher publishes only the rows below
+    # token_count[0] (read on the device); the scorer scores every request.
+    dc = _token_count(token_count)
     _world(world_size, rank)
     if page_size not in SUPPORTED_PAGE_SIZES:
         raise ValueError("page_size must be 128 or 256")
@@ -1269,12 +1305,13 @@ def decode_score_publish(
         recv_bases=recv_bases,
         errors=errors,
         generations=generations,
+        token_count=token_count,
     )
     if batch == 0:
         return
     arch = cake_jit.device_arch(dev)
     scorer = cake_jit.route("decode_topk", rows, arch)
-    publisher = cake_jit.route("topk16_publish", None, arch)
+    publisher = cake_jit.route("topk16_publish" + dc, None, arch)
     splits = decode_splits(scorer, batch, dev, cap=cake_jit.TOPK16_SPLIT_CAP[arch])
     values = {
         "q": index_q.view(torch.uint8),
@@ -1289,6 +1326,7 @@ def decode_score_publish(
         "recv_bases": recv_bases,
         "errors": errors,
         "generations": errors if generations is None else generations,
+        "token_count": token_count,
         "batch": batch,
         "num_tokens": t,
         "total_q": t,
@@ -1355,12 +1393,16 @@ def merge_candidates(
     enable_pdl: bool = False,
     expected_generations: Optional[torch.Tensor] = None,
     prefill: bool = False,
+    token_count: Optional[torch.Tensor] = None,
     _trusted: bool = False,
 ) -> None:
     # ``_trusted``: the caller (MSAIcpIndexerPlan.decode) passes one slot of
     # receive rows and counters its ``check_comm`` validated, and its own
     # validated scalars; only the per-call tensors are checked here.
+    # ``token_count`` (int32 [1]): only the rows below token_count[0] (read on
+    # the device, at most T) are merged; the record follows T, as without it.
     tagged = expected_generations is not None
+    dc = _token_count(token_count)
     if not _trusted:
         if prefill and (tagged or enable_pdl):
             raise ValueError(
@@ -1420,11 +1462,12 @@ def merge_candidates(
             errors=errors,
             expected_generations=expected_generations,
         )
+    _same_device(recv_slot.device, token_count=token_count)
     if t == 0:
         return
     arch = cake_jit.device_arch(dev)
     role = merge_role(prefill=prefill, tagged=tagged, num_tokens=t)
-    name = cake_jit.route(role, None, arch)
+    name = cake_jit.route(role + dc, None, arch)
     # One program reads both row forms through int32 words: a tagged row is
     # its 32 int64 words viewed as 64 int32 words (strides in int32 elements).
     words = recv_slot.view(torch.int32) if tagged else recv_slot
@@ -1439,6 +1482,7 @@ def merge_candidates(
             "expected": num_valid_pages
             if expected_generations is None
             else expected_generations,
+            "token_count": token_count,
             "num_tokens": t,
             "heads_per_rank": hpr,
             "world": world,
