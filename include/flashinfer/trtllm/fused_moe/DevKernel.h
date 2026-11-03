@@ -221,9 +221,10 @@ struct Data {
   int32_t tileTokensDim{0};
 
   // Row-parallel DeepSeek FP8 activation (activationDeepSeekKernelV2): the permuted row -> token
-  // map (-1 for the padding rows inside an expert's last tile) and the row count of the permuted
-  // buffers (the allocation bound; the live count is *totalNumPaddedTokens, on the device). When
-  // the pointer is null or the count is 0 the pair-parallel activationDeepSeekKernel runs instead.
+  // map (-1 for the padding rows inside an expert's last tile; totalMaxPaddedTokens + 1 entries)
+  // and the upper bound on the padded row count (the permuted buffers hold at least this many
+  // rows; the live count is *totalNumPaddedTokens, on the device). When the pointer is null or
+  // the bound is 0 the pair-parallel activationDeepSeekKernel runs instead.
   int32_t const* permutedIdxToTokenIdx = nullptr;
   int32_t totalMaxPaddedTokens{0};
 };

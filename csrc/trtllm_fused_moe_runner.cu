@@ -521,7 +521,7 @@ void Runner::setOpsData(MoERunnerArgs const& args, MoEWorkspace const& workspace
   activationData.ctaIdxXyToBatchIdx = workspace.cta_idx_xy_to_batch_idx;
   activationData.tileTokensDim = workspace.ProjUpTileN;
   // The row-parallel activation walks the permuted rows (local pairs plus tile padding) instead of
-  // every (token, top-k) pair; it needs the row -> token map and the row count of the buffers.
+  // every (token, top-k) pair; it needs the row -> token map and the padded-row-count bound.
   activationData.permutedIdxToTokenIdx = workspace.permuted_idx_to_token_idx;
   activationData.totalMaxPaddedTokens = workspace.total_max_padded_tokens;
 
