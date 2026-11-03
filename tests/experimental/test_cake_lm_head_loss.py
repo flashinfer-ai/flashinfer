@@ -7357,8 +7357,8 @@ def test_device_zero_dlogp_short_last_chunk_cast_bits_without_zero_rows(
     ignored row makes the call compacted (the skip needs the forward's row index).  A last chunk of 650 or 1792 valid
     rows (``dw_cast_tma_rule`` holds on an architecture of ``DW_CAST_TMA_MAX_ROWS``) casts through the TMA cast's
     counted form ``gemm_dw_cast_bf16_tma_dcnt``; 1793 rows (one row above the rule's bound, the negative control) and
-    every last chunk on an architecture without the rule (``sm_107a``) take the counted per-thread cast, as the plan
-    without the skip takes the per-thread cast."""
+    every last chunk on an architecture without the rule take the counted per-thread cast, as the plan without the
+    skip takes the per-thread cast."""
     _require_zero_dlogp_skip()
     module_name, record = cake_backend.record_for(CUDA)
     rows = cake_backend.DEFAULT_CHUNK_SIZE + last
