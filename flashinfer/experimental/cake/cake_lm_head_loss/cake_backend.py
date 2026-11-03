@@ -514,8 +514,12 @@ DW_CAST_STAGES = ("gemm_dw_cast_bf16", "gemm_dw_cast_f32")
 # BF16 tile is stored as TMA sub-tiles.  It runs the cast of the LAST chunk of a call of >= 2 chunks whose last
 # chunk has 1 .. DW_CAST_TMA_MAX_ROWS[arch] rows (:func:`dw_cast_tma_rule`); the per-element (old + acc) * g
 # and its round-to-nearest order are the shipped form's, so dW is bitwise the same.  A one-chunk call has no old
-# sum to read and keeps the shipped form.
-DW_CAST_TMA_MAX_ROWS: dict[str, int] = {"sm_100a": 1792, "sm_103a": 1792}
+# sum to read and keeps the shipped form.  sm_107a runs the sm_103a programs (the same 1792-row bound).
+DW_CAST_TMA_MAX_ROWS: dict[str, int] = {
+    "sm_100a": 1792,
+    "sm_103a": 1792,
+    "sm_107a": 1792,
+}
 
 
 # Its form under the zero-gradient row skip (:data:`DCNT_BASES`): the same TMA cast with the K steps bounded by the

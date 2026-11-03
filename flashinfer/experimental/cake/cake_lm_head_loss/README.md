@@ -476,10 +476,13 @@ import is the JIT fallback of `cake_build.py`.
   reduction forms pass this package's support tests on GB300.
 * `sm_107a`: the `sm_107a` record registers every stage of the `sm_103a`
   record, each program built for `sm_107a` (the deterministic family's
-  `sm_107a` programs under this package's prefix and the `sm_103a` reduction
-  forms).  No per-architecture rule table lists `sm_107a`, so its rules reach
-  the device-count logits forms and the 256-wide dX tiles of the structural
-  forms, as on the deterministic package.
+  `sm_107a` programs under this package's prefix, the `sm_103a` reduction
+  forms and the zero-gradient row skip's counted forms and partition kernel).
+  The other per-architecture rule tables do not list `sm_107a`, so its
+  rules reach the device-count logits forms and the 256-wide dX tiles of the
+  structural forms, as on the deterministic package. `dw_cast_tma_rule`
+  bounds `sm_107a` as `sm_103a` (1792 rows): a short last chunk takes the
+  TMA-epilogue bf16 cast, counted under the zero-gradient row skip.
 * Temperature of the log-probability entry
   (https://github.com/flashinfer-ai/flashinfer/issues/7637): the
   deterministic package's four temperature forms per architecture (the row

@@ -72,7 +72,7 @@ kernel_cake_lm_head_loss_c4e7e9ccc838c461277a(long long* __restrict__ labels, fl
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     int* sc_live = reinterpret_cast<int*>(smem_raw + 0);
     const int _sc_live_addr = smem + 0;
     int* sc_head = reinterpret_cast<int*>(smem_raw + 128);
