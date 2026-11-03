@@ -2536,6 +2536,15 @@ def interleave_cute_dsl_moe_weights(
     Returns tensors with the same shapes and dtypes. This only permutes rows;
     it does not requantize weights or change global/input scales. It applies to
     gated FC1 in W4A4, W4A8, W4A16 and MXFP8 modes, not FC2 or non-gated FC1.
+
+    Parameters
+    ----------
+    weight : torch.Tensor
+        Expert weights with contiguous ``[up, gate]`` halves.
+    block_scales : torch.Tensor
+        Corresponding row-major block scales on the same device as ``weight``.
+    swap_ab : bool
+        Use the 16-row swap-AB layout instead of the original 64-row layout.
     """
     if weight.ndim != 3 or block_scales.ndim != 3:
         raise ValueError("Expected 3D expert weights and row-major block scales")
