@@ -72,7 +72,11 @@ with `#error` / `static_assert`, and every derived integer is range-checked, so 
 instantiation does not compile.
 
 **Return codec capacity.** Expert results return as 64-value BF16 blocks coded to 96 bytes
-(lossless delta code) or kept raw (128 bytes) in an overflow area behind each return chunk.
+(lossless delta code: sign, 4-bit exponent delta from the block maximum, 7-bit mantissa) or kept
+raw (128 bytes) in an overflow area behind each return chunk.  A block stays coded when its nonzero
+exponents span at most 14 binades; delta 15 codes an exponent field of 0 (+-0 and BF16 subnormals),
+so exact zeros in an expert result (zeroed weight channels, very sparse intermediates) do not force a
+block raw.
 The area holds `rows x MOE_CODEC_OVF_BLOCKS` raw blocks; a chunk that needs more sets the
 kernel's `protocol_error` flag; that call's output is then not valid.  The flag is per call (the next
 launch clears it) and the backend's forward path does not read it: a caller that needs the check reads
