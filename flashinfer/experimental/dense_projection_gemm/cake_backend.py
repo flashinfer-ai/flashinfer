@@ -917,15 +917,19 @@ ROUTER_RULES: dict[
     # then the head/tail program with one head unit per CTA pair over half of the steps and three tail units per pair
     # ("H0.5x3", 76 head and 228 tail units on 152 SMs; windows measured at 10240 and 12288 (sm_100a), 16172, 16231,
     # 16384 and 32768 tokens; more than 3 % slower next to a resident kernel at 8192 tokens on sm_100a, at 10240 and
-    # 12288 on sm_103a).
+    # 12288 on sm_103a; a later sm_103a measurement passed at 10240 on two parts, between misses at 8192 and 12288, so
+    # 10240 was not added).
     # Hidden 4096 on sm_100a: 44 head units, one per CTA pair left next to a kernel holding 32 SMs, each a pair's
     # whole share of the steps, then five tail units per pair ("H1x5p44"; measured at 10240, 12288, 16172, 16231 and
     # 16384 tokens; more than 3 % slower next to a resident kernel at 8192 tokens and, launched before it, at 32768).
-    # Hidden 4096 on sm_103a keeps the deterministic plan: "H1x4p44" (four tail units) was up to 7.6 % slower than
-    # that plan at 16172 to 16384 tokens when launched before a kernel holding SMs on another stream.  Hidden 6144
-    # keeps the deterministic plan (on sm_100a above the SIMT window): on sm_100a no partition was faster in every
-    # run in CUDA graphs; on sm_103a the closest one ("H1x5p44", x0.973-0.983 alone) left the backward pass (input
-    # and weight gradient) no faster.
+    # Hidden 4096 on sm_103a: "H1x4p44" (44 head units, then four tail units per CTA pair) from 20480 to 49152 tokens
+    # (measured at 20480, 24576, 32768 and 49152 tokens, each on four or five parts); up to 7 % slower than the
+    # deterministic plan next to a resident kernel at 8192 to 16384 tokens, and at 65536 the checkpointed step (two
+    # forwards and the backward pass) was up to 1.4 % slower.  Hidden 6144 on sm_103a: "H1x5p44" from 16172 to 20480
+    # tokens (measured at 16172, 16231, 16384 and 20480 tokens, each on four parts); up to 7.8 % slower next to a
+    # resident kernel at 8192 to 12288 tokens, the backward pass (input and weight gradient) no faster at 24576 and up
+    # to 2.3 % slower at 32768.  Hidden 6144 on sm_100a keeps the deterministic plan above its SIMT window: no
+    # partition was faster in every run in CUDA graphs.
     # sm_107a: hidden 5120 "H0.5x4" (four tail units, 108 head and 432 tail units on 216 SMs; measured on two parts at
     # 16172, 16231 and 16384 tokens); hidden 4096 and 6144 keep the deterministic plan: at 4096 "H0.5x4" was up to
     # 7 % slower than that plan when a kernel holding 16 SMs on another stream started during it (the kernel takes SMs
@@ -933,9 +937,9 @@ ROUTER_RULES: dict[
     ("sm_100a", "nn_t", 4096, 256): ((1, 256, "simt_n128m64s2"), (10240, 16384, "H1x5p44")),
     ("sm_100a", "nn_t", 5120, 256): ((1, 256, "simt_n64m64s2"), (1, 128, "waves"), (10240, 32768, "H0.5x3")),
     ("sm_100a", "nn_t", 6144, 256): ((1, 256, "simt_n64m64s2"),),
-    ("sm_103a", "nn_t", 4096, 256): None,
+    ("sm_103a", "nn_t", 4096, 256): ((20480, 49152, "H1x4p44"),),
     ("sm_103a", "nn_t", 5120, 256): ((1, 192, "waves"), (16172, 32768, "H0.5x3")),
-    ("sm_103a", "nn_t", 6144, 256): None,
+    ("sm_103a", "nn_t", 6144, 256): ((16172, 20480, "H1x5p44"),),
     ("sm_107a", "nn_t", 4096, 256): None,
     ("sm_107a", "nn_t", 5120, 256): ((16172, 16384, "H0.5x4"),),
     ("sm_107a", "nn_t", 6144, 256): None,
@@ -984,7 +988,7 @@ ROUTER_HEAD_TAIL_SUFFIX = "_ht_c3_nreg"
 #: ``router_fp32_gemm_atomic_nn_t`` + :data:`ROUTER_HEAD_TAIL_SUFFIX`: on ``sm_103a``, the head/tail program with the
 #: BF16 parts of ``A`` in tensor memory (the same products, accumulators, partition and part segments; two TMEM chunk
 #: buffers, six slots of raw ``A`` tiles and six of ``B`` parts in shared memory).  ``sm_103a`` takes a head/tail
-#: partition only in the hidden 5120 window of :data:`ROUTER_RULES` on 152 SMs, where it was measured.
+#: partition only in the windows of :data:`ROUTER_RULES` on 152 SMs, where it was measured.
 ROUTER_HEAD_TAIL_TEMPLATES: dict[str, str] = {
     "sm_103a": "router_fp32_gemm_ts_r6p6_atomic_nn_t_ht_c2_nreg",
 }

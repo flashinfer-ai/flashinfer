@@ -42,7 +42,6 @@ from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 import torch
 from cutlass import Float32, Int32, Int64, Uint8
 
-from ...api_logging import flashinfer_api
 from ...jit.cute_dsl_core import build_and_load_cute_dsl_kernel
 from ...cute_dsl.fp4_common import (
     block_reduce,
@@ -2541,7 +2540,6 @@ def _nvfp4_outputs(
     return fp4_out, flat[:scale_output_size]
 
 
-@flashinfer_api
 def nvfp4_quantize_cute_dsl(
     input: torch.Tensor,
     global_scale: float | torch.Tensor,
@@ -3130,7 +3128,6 @@ def silu_and_mul_nvfp4_quantize_cute_dsl(
     return fp4_output, scale_output
 
 
-@flashinfer_api
 def nvfp4_quantize_per_token_cute_dsl(
     input: torch.Tensor,
     global_scale_inv: torch.Tensor,
