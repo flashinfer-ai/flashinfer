@@ -6506,8 +6506,7 @@ def mm_fp8(
             b_descale,
             a_descale,
             out.T,
-            # Fixed length: the tuner keys on input sizes, and the cached
-            # buffer's length depends on earlier calls on this stream.
+            # Fixed length keeps the tuner cache key stable.
             workspace[sum(scale_sizes) : sum(scale_sizes) + DEFAULT_WORKSPACE_SIZE],
             (n, m, k, 1),
             alpha,
