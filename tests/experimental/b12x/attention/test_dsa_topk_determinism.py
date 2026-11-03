@@ -4,6 +4,11 @@ The 32K canary flake (~27% degenerate repetition) is hypothesized to come from
 nondeterministic top-k selection over tied attention scores: identical prompt,
 varying read plan. These tests probe whether the selection kernels are stable
 across repeated calls on input with ties at the top-k boundary.
+
+Contract: the selected index SET is deterministic across repeated calls on
+identical input. The output ORDER is not: pivot-equal ties are emitted in
+index order, but winners above the pivot keep arrival order. Consumers that
+need bitwise-stable output order must sort the selected indices themselves.
 """
 
 import torch
