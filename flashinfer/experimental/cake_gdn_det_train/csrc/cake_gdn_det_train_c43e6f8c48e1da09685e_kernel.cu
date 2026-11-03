@@ -158,7 +158,7 @@ kernel_cake_gdn_det_train_c43e6f8c48e1da09685e(__nv_bfloat16* __restrict__ kn, _
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     __nv_bfloat16* s_kn = reinterpret_cast<__nv_bfloat16*>(smem_raw + 0);
     const int s_kn_addr = smem + 0;
     __nv_bfloat16* s_v = reinterpret_cast<__nv_bfloat16*>(smem_raw + 16384);
@@ -198,8 +198,7 @@ kernel_cake_gdn_det_train_c43e6f8c48e1da09685e(__nv_bfloat16* __restrict__ kn, _
     float* s_dgp = reinterpret_cast<float*>(smem_raw + 49664);
     const int s_dgp_addr = smem + 49664;
 
-    // Mbarrier init (10 pipeline groups, 0 ordered-sequence groups, 10 barriers)
-    // Mbarriers at smem_raw[75520..75600)
+    // Mbarrier init (10 barriers at smem_raw[75520..75600))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -242,10 +241,8 @@ kernel_cake_gdn_det_train_c43e6f8c48e1da09685e(__nv_bfloat16* __restrict__ kn, _
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
-
-    // Kernel post-init ops
-    const int tmem_acc_cols = taddr;
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_acc_cols = taddr;
 
     // === Task calls (declaration order) ===
     int chunk = blockIdx.x;
@@ -713,7 +710,7 @@ kernel_cake_gdn_det_train_c43e6f8c48e1da09685e(__nv_bfloat16* __restrict__ kn, _
             unsigned int _packed_1[1];
             #pragma unroll
             for (int _lp = 0; _lp < 1; _lp++) {
-                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((acc + nb6 * 4 + 2)[_lp*2 + 0], (acc + nb6 * 4 + 2)[_lp*2+1 + 0]));
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((acc + (nb6 * 4 + 2))[_lp*2 + 0], (acc + (nb6 * 4 + 2))[_lp*2+1 + 0]));
                 _packed_1[_lp] = *(uint32_t*)&_bf2;
             }
             reinterpret_cast<unsigned*>(dv_out + (out_b + (long long)(nb6 * 8)))[0] = reinterpret_cast<unsigned*>(_packed_1)[0];
@@ -951,13 +948,13 @@ kernel_cake_gdn_det_train_c43e6f8c48e1da09685e(__nv_bfloat16* __restrict__ kn, _
                 : "=r"(*reinterpret_cast<uint32_t*>(&gq[0])), "=r"(*reinterpret_cast<uint32_t*>(&gq[(0) + 1]))
                 : "r"(s_g_addr + (unsigned int)(col0_1 * 4)));
             float _exp2_23 = approx_exp2(g_a - gq[0]);
-            float va0 = (-acc_s[(2 * p_2 + q_1) * 4]) * _exp2_23;
+            float va0 = -acc_s[(2 * p_2 + q_1) * 4] * _exp2_23;
             float _exp2_24 = approx_exp2(g_a - gq[1]);
-            float va1 = (-acc_s[(2 * p_2 + q_1) * 4 + 1]) * _exp2_24;
+            float va1 = -acc_s[(2 * p_2 + q_1) * 4 + 1] * _exp2_24;
             float _exp2_25 = approx_exp2(g_b - gq[0]);
-            float vb0 = (-acc_s[(2 * p_2 + q_1) * 4 + 2]) * _exp2_25;
+            float vb0 = -acc_s[(2 * p_2 + q_1) * 4 + 2] * _exp2_25;
             float _exp2_26 = approx_exp2(g_b - gq[1]);
-            float vb1 = (-acc_s[(2 * p_2 + q_1) * 4 + 3]) * _exp2_26;
+            float vb1 = -acc_s[(2 * p_2 + q_1) * 4 + 3] * _exp2_26;
             float val_a0_1 = 0.0f;
             float val_a1_1 = 0.0f;
             float val_b0_1 = 0.0f;
@@ -1181,7 +1178,7 @@ kernel_cake_gdn_det_train_c43e6f8c48e1da09685e(__nv_bfloat16* __restrict__ kn, _
             unsigned int _packed_3[1];
             #pragma unroll
             for (int _lp = 0; _lp < 1; _lp++) {
-                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((acc + nb18 * 4 + 2)[_lp*2 + 0], (acc + nb18 * 4 + 2)[_lp*2+1 + 0]));
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((acc + (nb18 * 4 + 2))[_lp*2 + 0], (acc + (nb18 * 4 + 2))[_lp*2+1 + 0]));
                 _packed_3[_lp] = *(uint32_t*)&_bf2;
             }
             reinterpret_cast<unsigned*>(dk2_out + (out_b + (long long)(nb18 * 8)))[0] = reinterpret_cast<unsigned*>(_packed_3)[0];
@@ -1236,7 +1233,7 @@ kernel_cake_gdn_det_train_c43e6f8c48e1da09685e(__nv_bfloat16* __restrict__ kn, _
             unsigned int _packed_5[1];
             #pragma unroll
             for (int _lp = 0; _lp < 1; _lp++) {
-                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((acc + (nb18_1 - 4) * 4 + 2)[_lp*2 + 0], (acc + (nb18_1 - 4) * 4 + 2)[_lp*2+1 + 0]));
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((acc + ((nb18_1 - 4) * 4 + 2))[_lp*2 + 0], (acc + ((nb18_1 - 4) * 4 + 2))[_lp*2+1 + 0]));
                 _packed_5[_lp] = *(uint32_t*)&_bf2;
             }
             reinterpret_cast<unsigned*>(dk2_out + (out_b + (long long)(nb18_1 * 8)))[0] = reinterpret_cast<unsigned*>(_packed_5)[0];

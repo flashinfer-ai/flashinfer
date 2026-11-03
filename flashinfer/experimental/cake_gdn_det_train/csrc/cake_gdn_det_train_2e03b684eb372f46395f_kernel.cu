@@ -220,7 +220,7 @@ kernel_cake_gdn_det_train_2e03b684eb372f46395f(__nv_bfloat16* __restrict__ qn, _
     int cta_rank;
     asm volatile("mov.b32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
 
-    // Kernel setup ops
+    // Prologue
     __nv_bfloat16* s_do = reinterpret_cast<__nv_bfloat16*>(smem_raw + 0);
     const int s_do_addr = smem + 0;
     __nv_bfloat16* s_v = reinterpret_cast<__nv_bfloat16*>(smem_raw + 0);
@@ -302,8 +302,7 @@ kernel_cake_gdn_det_train_2e03b684eb372f46395f(__nv_bfloat16* __restrict__ qn, _
     float* s_red = reinterpret_cast<float*>(smem_raw + 107776);
     const int s_red_addr = smem + 107776;
 
-    // Mbarrier init (23 pipeline groups, 0 ordered-sequence groups, 23 barriers)
-    // Mbarriers at smem_raw[107904..108088)
+    // Mbarrier init (23 barriers at smem_raw[107904..108088))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -375,10 +374,8 @@ kernel_cake_gdn_det_train_2e03b684eb372f46395f(__nv_bfloat16* __restrict__ qn, _
     asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
-
-    // Kernel post-init ops
-    const int tmem_acc_cols = taddr;
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_acc_cols = taddr;
 
     // === Task calls (declaration order) ===
     int lane_0 = lane;
@@ -1731,7 +1728,7 @@ kernel_cake_gdn_det_train_2e03b684eb372f46395f(__nv_bfloat16* __restrict__ qn, _
             unsigned int _packed_1[1];
             #pragma unroll
             for (int _lp = 0; _lp < 1; _lp++) {
-                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((acc + nb6 * 4 + 2)[_lp*2 + 0], (acc + nb6 * 4 + 2)[_lp*2+1 + 0]));
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((acc + (nb6 * 4 + 2))[_lp*2 + 0], (acc + (nb6 * 4 + 2))[_lp*2+1 + 0]));
                 _packed_1[_lp] = *(uint32_t*)&_bf2;
             }
             reinterpret_cast<unsigned*>(dv_out + (out_b + (long long)(nb6 * 8)))[0] = reinterpret_cast<unsigned*>(_packed_1)[0];
@@ -1895,13 +1892,13 @@ kernel_cake_gdn_det_train_2e03b684eb372f46395f(__nv_bfloat16* __restrict__ qn, _
                 : "=r"(*reinterpret_cast<uint32_t*>(&gq[0])), "=r"(*reinterpret_cast<uint32_t*>(&gq[(0) + 1]))
                 : "r"(s_g_addr + (unsigned int)(col0_1 * 4)));
             float _exp2_69 = approx_exp2(g_a - gq[0]);
-            float va0 = (-acc_s[(2 * p_3 + q_2) * 4]) * _exp2_69;
+            float va0 = -acc_s[(2 * p_3 + q_2) * 4] * _exp2_69;
             float _exp2_70 = approx_exp2(g_a - gq[1]);
-            float va1 = (-acc_s[(2 * p_3 + q_2) * 4 + 1]) * _exp2_70;
+            float va1 = -acc_s[(2 * p_3 + q_2) * 4 + 1] * _exp2_70;
             float _exp2_71 = approx_exp2(g_b - gq[0]);
-            float vb0 = (-acc_s[(2 * p_3 + q_2) * 4 + 2]) * _exp2_71;
+            float vb0 = -acc_s[(2 * p_3 + q_2) * 4 + 2] * _exp2_71;
             float _exp2_72 = approx_exp2(g_b - gq[1]);
-            float vb1 = (-acc_s[(2 * p_3 + q_2) * 4 + 3]) * _exp2_72;
+            float vb1 = -acc_s[(2 * p_3 + q_2) * 4 + 3] * _exp2_72;
             float val_a0_1 = 0.0f;
             float val_a1_1 = 0.0f;
             float val_b0_1 = 0.0f;
@@ -2188,7 +2185,7 @@ kernel_cake_gdn_det_train_2e03b684eb372f46395f(__nv_bfloat16* __restrict__ qn, _
         unsigned int _packed_3_0[1];
         #pragma unroll
         for (int _lp = 0; _lp < 1; _lp++) {
-            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((acc + nb18_0 * 4 + 2)[_lp*2 + 0], (acc + nb18_0 * 4 + 2)[_lp*2+1 + 0]));
+            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((acc + (nb18_0 * 4 + 2))[_lp*2 + 0], (acc + (nb18_0 * 4 + 2))[_lp*2+1 + 0]));
             _packed_3_0[_lp] = *(uint32_t*)&_bf2;
         }
         if (own_a == rank) {
@@ -2278,7 +2275,7 @@ kernel_cake_gdn_det_train_2e03b684eb372f46395f(__nv_bfloat16* __restrict__ qn, _
         unsigned int _packed_3_1[1];
         #pragma unroll
         for (int _lp = 0; _lp < 1; _lp++) {
-            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((acc + nb18_1 * 4 + 2)[_lp*2 + 0], (acc + nb18_1 * 4 + 2)[_lp*2+1 + 0]));
+            __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((acc + (nb18_1 * 4 + 2))[_lp*2 + 0], (acc + (nb18_1 * 4 + 2))[_lp*2+1 + 0]));
             _packed_3_1[_lp] = *(uint32_t*)&_bf2;
         }
         if (own_a == rank) {

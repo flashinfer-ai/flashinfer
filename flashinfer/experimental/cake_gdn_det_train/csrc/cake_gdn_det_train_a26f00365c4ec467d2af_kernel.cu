@@ -80,7 +80,7 @@ kernel_cake_gdn_det_train_a26f00365c4ec467d2af(__nv_bfloat16* __restrict__ qn, _
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     __nv_bfloat16* s_qn = reinterpret_cast<__nv_bfloat16*>(smem_raw + 0);
     const int s_qn_addr = smem + 0;
     __nv_bfloat16* s_kn = reinterpret_cast<__nv_bfloat16*>(smem_raw + 16384);
@@ -184,8 +184,8 @@ kernel_cake_gdn_det_train_a26f00365c4ec467d2af(__nv_bfloat16* __restrict__ qn, _
                 : "=f"((acc_s + nb * 8)[0]), "=f"((acc_s + nb * 8)[1]), "=f"((acc_s + nb * 8)[2]), "=f"((acc_s + nb * 8)[3])
                 : "r"(a_frag[0]), "r"(a_frag[1]), "r"(a_frag[2]), "r"(a_frag[3]), "r"(b_frag_k[0]), "r"(b_frag_k[1]), "f"(((kb == 0) ? 0.0f : (acc_s + nb * 8)[0])), "f"(((kb == 0) ? 0.0f : (acc_s + nb * 8)[1])), "f"(((kb == 0) ? 0.0f : (acc_s + nb * 8)[2])), "f"(((kb == 0) ? 0.0f : (acc_s + nb * 8)[3])));
             asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};\n"
-                : "=f"((acc_s + nb * 8 + 4)[0]), "=f"((acc_s + nb * 8 + 4)[1]), "=f"((acc_s + nb * 8 + 4)[2]), "=f"((acc_s + nb * 8 + 4)[3])
-                : "r"(a_frag[0]), "r"(a_frag[1]), "r"(a_frag[2]), "r"(a_frag[3]), "r"(b_frag_k[2]), "r"(b_frag_k[(2) + 1]), "f"(((kb == 0) ? 0.0f : (acc_s + nb * 8 + 4)[0])), "f"(((kb == 0) ? 0.0f : (acc_s + nb * 8 + 4)[1])), "f"(((kb == 0) ? 0.0f : (acc_s + nb * 8 + 4)[2])), "f"(((kb == 0) ? 0.0f : (acc_s + nb * 8 + 4)[3])));
+                : "=f"((acc_s + (nb * 8 + 4))[0]), "=f"((acc_s + (nb * 8 + 4))[1]), "=f"((acc_s + (nb * 8 + 4))[2]), "=f"((acc_s + (nb * 8 + 4))[3])
+                : "r"(a_frag[0]), "r"(a_frag[1]), "r"(a_frag[2]), "r"(a_frag[3]), "r"(b_frag_k[2]), "r"(b_frag_k[(2) + 1]), "f"(((kb == 0) ? 0.0f : (acc_s + (nb * 8 + 4))[0])), "f"(((kb == 0) ? 0.0f : (acc_s + (nb * 8 + 4))[1])), "f"(((kb == 0) ? 0.0f : (acc_s + (nb * 8 + 4))[2])), "f"(((kb == 0) ? 0.0f : (acc_s + (nb * 8 + 4))[3])));
         }
     }
     __syncthreads();
@@ -242,8 +242,8 @@ kernel_cake_gdn_det_train_a26f00365c4ec467d2af(__nv_bfloat16* __restrict__ qn, _
                 : "=f"((acc + nb3 * 8)[0]), "=f"((acc + nb3 * 8)[1]), "=f"((acc + nb3 * 8)[2]), "=f"((acc + nb3 * 8)[3])
                 : "r"(a_frag[0]), "r"(a_frag[1]), "r"(a_frag[2]), "r"(a_frag[3]), "r"(b_frag_mn[0]), "r"(b_frag_mn[1]), "f"(((kb2 == 0) ? 0.0f : (acc + nb3 * 8)[0])), "f"(((kb2 == 0) ? 0.0f : (acc + nb3 * 8)[1])), "f"(((kb2 == 0) ? 0.0f : (acc + nb3 * 8)[2])), "f"(((kb2 == 0) ? 0.0f : (acc + nb3 * 8)[3])));
             asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%10, %11, %12, %13};\n"
-                : "=f"((acc + nb3 * 8 + 4)[0]), "=f"((acc + nb3 * 8 + 4)[1]), "=f"((acc + nb3 * 8 + 4)[2]), "=f"((acc + nb3 * 8 + 4)[3])
-                : "r"(a_frag[0]), "r"(a_frag[1]), "r"(a_frag[2]), "r"(a_frag[3]), "r"(b_frag_mn[2]), "r"(b_frag_mn[(2) + 1]), "f"(((kb2 == 0) ? 0.0f : (acc + nb3 * 8 + 4)[0])), "f"(((kb2 == 0) ? 0.0f : (acc + nb3 * 8 + 4)[1])), "f"(((kb2 == 0) ? 0.0f : (acc + nb3 * 8 + 4)[2])), "f"(((kb2 == 0) ? 0.0f : (acc + nb3 * 8 + 4)[3])));
+                : "=f"((acc + (nb3 * 8 + 4))[0]), "=f"((acc + (nb3 * 8 + 4))[1]), "=f"((acc + (nb3 * 8 + 4))[2]), "=f"((acc + (nb3 * 8 + 4))[3])
+                : "r"(a_frag[0]), "r"(a_frag[1]), "r"(a_frag[2]), "r"(a_frag[3]), "r"(b_frag_mn[2]), "r"(b_frag_mn[(2) + 1]), "f"(((kb2 == 0) ? 0.0f : (acc + (nb3 * 8 + 4))[0])), "f"(((kb2 == 0) ? 0.0f : (acc + (nb3 * 8 + 4))[1])), "f"(((kb2 == 0) ? 0.0f : (acc + (nb3 * 8 + 4))[2])), "f"(((kb2 == 0) ? 0.0f : (acc + (nb3 * 8 + 4))[3])));
         }
     }
     long long out_a = ((long long)(tok0 + row_a) * (long long)num_v_heads + (long long)hv) * 128 + (long long)col_q;
@@ -263,7 +263,7 @@ kernel_cake_gdn_det_train_a26f00365c4ec467d2af(__nv_bfloat16* __restrict__ qn, _
             unsigned int _packed_1[1];
             #pragma unroll
             for (int _lp = 0; _lp < 1; _lp++) {
-                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((acc + nb4 * 4 + 2)[_lp*2 + 0], (acc + nb4 * 4 + 2)[_lp*2+1 + 0]));
+                __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2((acc + (nb4 * 4 + 2))[_lp*2 + 0], (acc + (nb4 * 4 + 2))[_lp*2+1 + 0]));
                 _packed_1[_lp] = *(uint32_t*)&_bf2;
             }
             reinterpret_cast<unsigned*>(dv_local + (out_b + (long long)(nb4 * 8)))[0] = reinterpret_cast<unsigned*>(_packed_1)[0];

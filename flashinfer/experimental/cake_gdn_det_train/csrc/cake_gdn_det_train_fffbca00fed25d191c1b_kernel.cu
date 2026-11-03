@@ -154,7 +154,7 @@ kernel_cake_gdn_det_train_fffbca00fed25d191c1b(__nv_bfloat16* __restrict__ kn, _
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     __nv_bfloat16* s_kn = reinterpret_cast<__nv_bfloat16*>(smem_raw + 0);
     const int s_kn_addr = smem + 0;
     __nv_bfloat16* s_knT = reinterpret_cast<__nv_bfloat16*>(smem_raw + 0);
@@ -178,8 +178,7 @@ kernel_cake_gdn_det_train_fffbca00fed25d191c1b(__nv_bfloat16* __restrict__ kn, _
     float* s_b = reinterpret_cast<float*>(smem_raw + 53248);
     const int s_b_addr = smem + 53248;
 
-    // Mbarrier init (6 pipeline groups, 0 ordered-sequence groups, 6 barriers)
-    // Mbarriers at smem_raw[53504..53552)
+    // Mbarrier init (6 barriers at smem_raw[53504..53552))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -214,10 +213,8 @@ kernel_cake_gdn_det_train_fffbca00fed25d191c1b(__nv_bfloat16* __restrict__ kn, _
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
-
-    // Kernel post-init ops
-    const int tmem_acc_cols = taddr;
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_acc_cols = taddr;
 
     // === Task calls (declaration order) ===
     int lane_0 = lane;
