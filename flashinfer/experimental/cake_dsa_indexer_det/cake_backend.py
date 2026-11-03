@@ -713,6 +713,18 @@ def bind_program(
 
 
 _FFI_DEVICES: dict[int, Any] = {}
+_EMPTY_REGIONS: dict[int, Any] = {}
+
+
+def _empty_region(index: int) -> Any:
+    """The scan's empty ``zero_region`` on device ``index`` (its binding zeroes nothing): one ``tvm_ffi.Tensor``
+    per device, made on first use, so a call that zeroes no tail neither makes a view nor converts one per call."""
+    region = _EMPTY_REGIONS.get(index)
+    if region is None:
+        region = _EMPTY_REGIONS[index] = tvm_ffi.from_dlpack(
+            torch.empty(0, dtype=torch.uint8, device=f"cuda:{index}")
+        )
+    return region
 
 
 def _ffi_stream_context(index: int):
@@ -1049,9 +1061,11 @@ def prepare_dsa_indexer_det_topk(
     launches: list[_Launch] = []
     stages: list[str] = []
     # the ticket tail the scan binding zeroes right before every scan launch (``zero_region``): a caller-owned tail
-    # the call draws tickets from; any other call passes an empty view (nothing zeroed)
+    # the call draws tickets from; any other call passes the device's empty region (nothing zeroed, no per-call view)
     shared_tail = caller_owned_workspace and tail_at >= 0 and not tail_static
-    zero_region = flat[tail_at:workspace_bytes] if shared_tail else flat[:0]
+    zero_region = (
+        flat[tail_at:workspace_bytes] if shared_tail else _empty_region(device_index)
+    )
     if num_queries > 0 and num_keys > 0:
         values: dict[str, Any] = dict(t)
         values.update(scalars)

@@ -3380,7 +3380,8 @@ def test_prepared_runner_ticket_tail_is_zero_at_prepare_after_runs_and_after_a_f
         pytest.skip("no ticket tail for this program (static_scan_kinds)")
     assert not runner._tail_shared  # backend-owned: nothing else writes the tail
     assert not runner._tail_static  # the call draws tickets
-    assert _scan_zero_region(runner).numel() == 0  # the scan binding zeroes nothing
+    # the scan binding zeroes nothing: the device's one empty region, no per-call view
+    assert _scan_zero_region(runner) is cake_backend._empty_region(runner.device_index)
     torch.cuda.synchronize()
     _assert_ticket_tail_zero(runner)  # zeroed once, at prepare
     expected = runner()
@@ -3435,7 +3436,7 @@ def _caller_owned_runner(inputs: ref.IndexerInputs, workspace: torch.Tensor):
     # the scan binding zeroes the tail right before every scan launch; nothing on a static call
     zero_region = _scan_zero_region(runner)
     if runner._tail_static:
-        assert zero_region.numel() == 0
+        assert zero_region is cake_backend._empty_region(runner.device_index)
     else:
         assert (zero_region.data_ptr(), zero_region.numel()) == (
             runner.ticket_tail.data_ptr(),
