@@ -6223,7 +6223,7 @@ def trtllm_fp8_block_scale_moe(
         (E8M0 ``127``, i.e. ``2**0``, for MXFP8; ``1.0`` for the ``float32``
         DeepSeek scales), pass the padded size as ``intermediate_size`` and
         the real one here.  The kernel reads the ``[valid, roundUp(valid, 128))``
-        stretch of the padding and masks the rest, so it must hold zeros and
+        stretch of the padding and never reads the rest, so it must hold zeros and
         finite scales.  ``hidden_size`` follows the same rule through
         ``valid_hidden_size``.
     gemm1_bias : Optional[torch.Tensor]
@@ -6831,7 +6831,7 @@ def trtllm_fp4_block_scale_moe(
         (E8M0 ``127``, i.e. ``2**0``, for MXFP4; E4M3 ``1.0`` for NVFP4),
         pass the padded size as ``intermediate_size`` and the real one here.
         The kernel reads the ``[valid, roundUp(valid, 128))``
-        stretch of the padding and masks the rest, so it must hold zeros and
+        stretch of the padding and never reads the rest, so it must hold zeros and
         finite scales.  ``hidden_size`` follows the same rule through
         ``valid_hidden_size``.
     workspace_buffer : Optional[torch.Tensor]

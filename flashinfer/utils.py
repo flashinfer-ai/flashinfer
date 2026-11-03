@@ -1115,10 +1115,10 @@ def get_shuffle_block_size(epilogue_tile_m: int) -> int:
 
 def _unaligned_rows_message(M: int, alignment: int) -> str:
     return (
-        f"input_tensor.shape[0]={M} must be a multiple of {alignment}. For trtllm "
-        "MoE weights, zero-pad the unaligned dimension (intermediate_size for FC1, "
-        "hidden_size for FC2) to a multiple of 128 and pass valid_intermediate_size "
-        "/ valid_hidden_size to the MoE op."
+        f"input_tensor.shape[0]={M} must be a multiple of {alignment}. For the trtllm "
+        "block-scale MoE ops (FP8, FP4, MXINT4), zero-pad the unaligned dimension "
+        "(intermediate_size for FC1, hidden_size for FC2) to a multiple of 128 and "
+        "pass valid_intermediate_size / valid_hidden_size."
     )
 
 
