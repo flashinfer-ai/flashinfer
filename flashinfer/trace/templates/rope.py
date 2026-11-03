@@ -670,6 +670,22 @@ apply_rope_with_cos_sin_cache_inplace_trace = TraceTemplate(
 # ── RoPE + FP8 quantize (split-rotary + non-rotary) ──────────────────────────
 
 
+def _fp8_saturation_bounds(quantize_dtype: torch.dtype) -> Tuple[float, float]:
+    """Saturation bounds of the FP8 quantization target.
+
+    Mirrors the kernel-side ``cvt.rn.satfinite`` intrinsics in
+    ``vec_dtypes.cuh``, which saturate to the max of the target format, and
+    the dtype dispatch in ``triton/kernels/quant.py``.
+    """
+    if quantize_dtype == torch.float8_e5m2:
+        return -57344.0, 57344.0
+    if quantize_dtype == torch.float8_e4m3fn:
+        return -448.0, 448.0
+    raise ValueError(
+        f"quantize_dtype must be float8_e4m3fn or float8_e5m2, got {quantize_dtype}"
+    )
+
+
 @torch.no_grad()
 def _rope_quantize_fp8_reference(
     q_rope: torch.Tensor,
@@ -682,6 +698,10 @@ def _rope_quantize_fp8_reference(
     quantize_dtype=None,
     quant_scale_q: float = 1.0,
     quant_scale_kv: float = 1.0,
+    q_rope_out: Optional[torch.Tensor] = None,
+    k_rope_out: Optional[torch.Tensor] = None,
+    q_nope_out: Optional[torch.Tensor] = None,
+    k_nope_out: Optional[torch.Tensor] = None,
     **_unused,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Reference RoPE + FP8 quantize.
@@ -692,7 +712,15 @@ def _rope_quantize_fp8_reference(
     quantization scale. Matches ``flashinfer.rope_quantize_fp8`` and its
     MLA wrapper ``mla_rope_quantize_fp8``.
     """
-    quantize_dtype = quantize_dtype or torch.float8_e4m3fn
+    # Infer quantize_dtype from the output tensors the same way the API
+    # does, defaulting to float8_e4m3fn.
+    if quantize_dtype is None:
+        for out in (q_rope_out, k_rope_out, q_nope_out, k_nope_out):
+            if out is not None:
+                quantize_dtype = out.dtype
+                break
+        else:
+            quantize_dtype = torch.float8_e4m3fn
     rotary_dim = cos_sin_cache.shape[-1]
     cos_cache = cos_sin_cache[:, : rotary_dim // 2]
     sin_cache = cos_sin_cache[:, rotary_dim // 2 :]
@@ -722,8 +750,11 @@ def _rope_quantize_fp8_reference(
         k_nope = torch.empty(shape, dtype=k_rope.dtype, device=k_rope.device)
 
     def _q(t, scale):
+        clamp_min, clamp_max = _fp8_saturation_bounds(quantize_dtype)
         return (
-            (t.to(torch.float32) * float(scale)).clamp(-448.0, 448.0).to(quantize_dtype)
+            (t.to(torch.float32) * float(scale))
+            .clamp(clamp_min, clamp_max)
+            .to(quantize_dtype)
         )
 
     return (
@@ -985,6 +1016,8 @@ def _rope_quantize_fp8_append_paged_kv_cache_reference(
     quant_scale_kv: float = 1.0,
     page_size: int = 16,
     kv_layout: str = "NHD",
+    q_rope_out: Optional[torch.Tensor] = None,
+    q_nope_out: Optional[torch.Tensor] = None,
     **_unused,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Reference for rope_quantize_fp8_append_paged_kv_cache.
@@ -1001,7 +1034,15 @@ def _rope_quantize_fp8_append_paged_kv_cache_reference(
     append side for the GQA/MHA case — the MLA stack is covered by
     ``append_paged_mla_kv_cache_trace`` on the storage side.
     """
-    quantize_dtype = quantize_dtype or torch.float8_e4m3fn
+    # Infer quantize_dtype from the output tensors the same way the API
+    # does, then from the paged cache, defaulting to float8_e4m3fn.
+    if quantize_dtype is None:
+        if q_rope_out is not None:
+            quantize_dtype = q_rope_out.dtype
+        elif q_nope_out is not None:
+            quantize_dtype = q_nope_out.dtype
+        else:
+            quantize_dtype = paged_kv_cache[0].dtype
     # Step 1+2: RoPE then FP8 quantize.
     q_rope_q, k_rope_q, q_nope_q, k_nope_q = _rope_quantize_fp8_reference(
         q_rope,
@@ -1019,9 +1060,10 @@ def _rope_quantize_fp8_append_paged_kv_cache_reference(
     # K (as [K_nope ‖ K_rope]) and V into (k_cache, v_cache).
     is_mla = k_rope.dim() == 2
     if not is_mla and v is not None:
+        clamp_min, clamp_max = _fp8_saturation_bounds(quantize_dtype)
         v_q = (
             (v.to(torch.float32) * float(quant_scale_kv))
-            .clamp(-448.0, 448.0)
+            .clamp(clamp_min, clamp_max)
             .to(quantize_dtype)
         )
         # Reassemble K from k_nope_q + k_rope_q along head_dim.

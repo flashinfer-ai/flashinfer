@@ -24,7 +24,6 @@ from cutlass.cute.nvgpu import tcgen05
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import T, dsl_user_op
 
-
 #: Per-CTA SMEM capacity reported by CuTeDSL on SM100/SM103.
 _SMEM_CAPACITY_BYTES = utils.get_smem_capacity_in_bytes("sm_100")
 
@@ -39,6 +38,9 @@ _SUPPORTED_MMA_N = (8, 16, 32)
 
 #: Physical cluster-K sizes; split 1 compiles out the DSMEM path.
 _SUPPORTED_SPLIT_K = (1, 2, 3, 4)
+
+#: Additional cluster-K sizes autotuned on SM107, where they were measured.
+_SM107_SPLIT_K = (8,)
 
 #: Largest public M this low-M policy serves.
 _MAX_M = 32
@@ -64,7 +66,7 @@ _AB_BUFFER_ALIGN_BYTES = 1024
 #: A/B pipeline stage bounds. One stage is useful only for a single K tile.
 _MIN_AB_STAGES = 1
 _DEFAULT_MIN_AB_STAGES = 2
-_MAX_AB_STAGES = 12
+_MAX_AB_STAGES = 18
 
 
 @dataclasses.dataclass(frozen=True)
@@ -113,6 +115,17 @@ def _smem_bytes(
     )
 
 
+def _arch(device_index: int) -> str:
+    """CuTeDSL arch whose per-CTA SMEM capacity the device provides."""
+    if _torch.cuda.get_device_capability(device_index) == (10, 7):
+        return "sm_107"
+    return "sm_100"
+
+
+def _smem_capacity_bytes(device_index: int) -> int:
+    return utils.get_smem_capacity_in_bytes(_arch(device_index))
+
+
 def _max_ab_stages_for(
     tactic: SplitKTactic,
     smem_capacity: int,
@@ -133,14 +146,19 @@ def validate_tactic(
     n: int,
     k: int,
     *,
-    smem_capacity: int = _SMEM_CAPACITY_BYTES,
+    smem_capacity: int | None = None,
 ) -> None:
-    """Reject a tactic that cannot serve ``(m, n, k)``."""
+    """Reject a tactic that cannot serve ``(m, n, k)``.
+
+    ``smem_capacity`` defaults to the current device's per-CTA capacity.
+    """
+    if smem_capacity is None:
+        smem_capacity = _smem_capacity_bytes(_torch.cuda.current_device())
     if tactic.mma_m not in _SUPPORTED_MMA_M:
         raise ValueError(f"unsupported mma_m={tactic.mma_m}")
     if tactic.mma_n not in _SUPPORTED_MMA_N:
         raise ValueError(f"unsupported mma_n={tactic.mma_n}")
-    if tactic.split_k not in _SUPPORTED_SPLIT_K:
+    if tactic.split_k not in _SUPPORTED_SPLIT_K + _SM107_SPLIT_K:
         raise ValueError(f"unsupported split_k={tactic.split_k}")
     if not _MIN_AB_STAGES <= tactic.ab_stages <= _MAX_AB_STAGES:
         raise ValueError(
@@ -170,13 +188,22 @@ def autotune_tactics(
     n: int,
     k: int,
     *,
-    smem_capacity: int = _SMEM_CAPACITY_BYTES,
+    smem_capacity: int | None = None,
 ) -> list[SplitKTactic]:
-    """Return valid tactics in the shape-specific stage window."""
+    """Return valid tactics in the shape-specific stage window.
+
+    ``smem_capacity`` defaults to the current device's per-CTA capacity.
+    """
+    device = _torch.cuda.current_device()
+    if smem_capacity is None:
+        smem_capacity = _smem_capacity_bytes(device)
+    split_ks: tuple[int, ...] = _SUPPORTED_SPLIT_K
+    if _arch(device) == "sm_107":
+        split_ks += _SM107_SPLIT_K
     tactics: list[SplitKTactic] = []
     for mma_m in _SUPPORTED_MMA_M:
         for mma_n in _SUPPORTED_MMA_N:
-            for split_k in _SUPPORTED_SPLIT_K:
+            for split_k in split_ks:
                 min_stages = _MIN_AB_STAGES if k == _CTA_K else _DEFAULT_MIN_AB_STAGES
                 base = SplitKTactic(mma_m, mma_n, split_k, min_stages)
                 try:
@@ -184,19 +211,123 @@ def autotune_tactics(
                 except ValueError:
                     continue
                 max_stages = _max_ab_stages_for(base, smem_capacity)
-                # Short K favors shallow pipelines; long K stays near the cap.
+                # Short K favors shallow pipelines; for long K the in-flight
+                # floor in _keep_autotune_tactic prunes the shallow stages.
+                if k <= 4 * _CTA_K:
+                    max_stages = min(max_stages, 6)
+                # Retain a non-wrapping power-of-two ring for cheap stage indexing.
+                stage_limit = 1 << (k // _CTA_K // split_k).bit_length()
                 tactics.extend(
                     dataclasses.replace(base, ab_stages=ab_stages)
-                    for ab_stages in (
-                        range(min_stages, min(max_stages, 6) + 1)
-                        if k <= 4 * _CTA_K
-                        else range(
-                            min(max(5, max_stages - 2), max_stages),
-                            max_stages + 1,
-                        )
+                    for ab_stages in range(
+                        min(min_stages, stage_limit),
+                        min(max_stages, stage_limit) + 1,
                     )
                 )
-    return tactics
+    if not tactics:
+        return tactics
+    default = default_tactic(m, n, k)
+    sm_count = _torch.cuda.get_device_properties(device).multi_processor_count
+    return [
+        t
+        for t in tactics
+        if t == default
+        or _keep_autotune_tactic(t, default, tactics, m, n, k, device, sm_count)
+    ]
+
+
+@functools.cache
+def _max_active_clusters(device_index: int, split_k: int) -> int:
+    # HardwareInfo reads attributes of device_id (default 0) and loads its probe
+    # kernel in the current context, so both must name the same device.
+    with _torch.cuda.device(device_index):
+        return utils.HardwareInfo(device_id=device_index).get_max_active_clusters(
+            split_k
+        )
+
+
+# Weight bytes the ring should keep in flight per CTA (9 stages of a 64-row
+# tile): with M <= 32 the weight stream is what the pipeline has to cover.
+_WEIGHT_BYTES_IN_FLIGHT = 9 * 64 * _CTA_K * 2
+
+
+def _keep_autotune_tactic(t, default, tactics, m, n, k, device, sm_count) -> bool:
+    """Keep the tactics that can beat the default; see the rules below.
+
+    The rules are the same on every GPU; SM count and cluster capacity are
+    queried from the device.  Winners fill one co-resident wave (clusters must
+    fit their GPC) and keep at least ~144 KB of weights in flight; GPUs with
+    more bandwidth per SM want deeper rings, so every stage from that target up
+    is kept.  A cold-L2 CUPTI sweep of every tactic (B200 and B300, M=1..32,
+    N=128..8192, K=768..40960) kept the best tactic within 2.1% with only the
+    target stage per config; the deeper stages only add tactics.
+    """
+
+    def tiles(x):
+        return (m + x.mma_n - 1) // x.mma_n
+
+    def grid(x):
+        return (n + x.mma_m - 1) // x.mma_m * tiles(x) * x.split_k
+
+    def fits(x):
+        capacity = (
+            sm_count if x.split_k == 1 else _max_active_clusters(device, x.split_k)
+        )
+        return grid(x) // x.split_k <= capacity
+
+    def unpadded(x):
+        # A narrower mma_n covering M with as many token tiles is pure padding.
+        return not any(
+            w < x.mma_n and (m + w - 1) // w == tiles(x) for w in _SUPPORTED_MMA_N
+        )
+
+    if not unpadded(t):
+        return False
+    cands = [x for x in tactics if unpadded(x)]
+    # mma_m=128 halves the CTAs; it only won on long, wide shapes where the
+    # 64-row tile at the same (mma_n, split_k) cannot fit one wave.
+    if t.mma_m == 128 and (
+        n < 2048
+        or k < 2048
+        or any(
+            x.mma_m == 64 and (x.mma_n, x.split_k) == (t.mma_n, t.split_k) and fits(x)
+            for x in cands
+        )
+    ):
+        return False
+
+    def fullest(mma_n):
+        return max((grid(x) for x in cands if x.mma_n == mma_n and fits(x)), default=0)
+
+    # A coarser mma_n saves a weight pass but halves the CTAs; keep it only
+    # when its fullest one-wave grid still occupies >= 40% of the SMs.
+    if t.mma_n > min(x.mma_n for x in cands) and fullest(t.mma_n) < 0.4 * sm_count:
+        return False
+    # Grid fill per mma_n: one-wave grids within 0.75x of the fullest; split 1
+    # (no DSMEM reduction) down to 0.5x, and any split when the fullest grid
+    # leaves each CTA <= 2 K blocks.  Without a one-wave grid keep the smallest.
+    same_n = [x for x in cands if x.mma_n == t.mma_n]
+    fitting = [x for x in same_n if fits(x)]
+    if not fitting:
+        if grid(t) != min(grid(x) for x in same_n):
+            return False
+    else:
+        best = max(grid(x) for x in fitting)
+        split = min(x.split_k for x in fitting if grid(x) == best)
+        alpha = 0.5 if k // _CTA_K // split <= 2 else 0.75
+        if not fits(t) or not (
+            grid(t) >= alpha * best or (t.split_k == 1 and 2 * grid(t) >= best)
+        ):
+            return False
+    # ab_stages: the shallowest window stage reaching the in-flight target and
+    # every deeper one, else the deepest stage the window allows.
+    window = sorted(
+        x.ab_stages
+        for x in tactics
+        if x.mma_m == t.mma_m and (x.mma_n, x.split_k) == (t.mma_n, t.split_k)
+    )
+    deep = [s for s in window if t.mma_m * _CTA_K * 2 * s >= _WEIGHT_BYTES_IN_FLIGHT]
+    return t.ab_stages >= (deep[0] if deep else window[-1])
 
 
 def default_tactic(m: int, n: int, k: int) -> SplitKTactic:
@@ -312,6 +443,55 @@ def _store_shared_remote_v4(
     )
 
 
+@dsl_user_op
+def _mbarrier_wait_acquire_cluster(
+    mbar_ptr: "cute.Pointer",
+    phase: "Int32",
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    """``cute.arch.mbarrier_wait`` with ``.acquire.cluster`` semantics.
+
+    The peers' ``st.async`` complete-tx operations release at cluster scope; the
+    default ``.acquire.cta`` wait does not synchronize with other CTAs' threads.
+    """
+    llvm.inline_asm(
+        None,
+        [
+            mbar_ptr.toint(loc=loc, ip=ip).ir_value(),
+            phase.ir_value(loc=loc, ip=ip),
+        ],
+        "{\n\t.reg .pred P1;\n\tLAB_WAIT:\n\t"
+        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 "
+        "P1, [$0], $1, 10000000;\n\t"
+        "@P1 bra DONE;\n\tbra LAB_WAIT;\n\tDONE:\n\t}",
+        "r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _tcgen05_fence(*, before: bool, loc=None, ip=None) -> None:
+    """``tcgen05.fence::{before,after}_thread_sync`` around an mbarrier hand-off of
+    tcgen05 work (PTX ISA canonical tcgen05 synchronization patterns)."""
+    llvm.inline_asm(
+        None,
+        [],
+        f"tcgen05.fence::{'before' if before else 'after'}_thread_sync;",
+        "",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
 #: Rank that gathers partials and stores the output.
 OWNER_RANK = 0
 
@@ -325,8 +505,11 @@ class SplitKDenseGemmKernel:
         tactic: SplitKTactic,
         use_pdl: bool,
         has_bias: bool,
+        arch: str = "sm_100",
     ) -> None:
         self.acc_dtype = cutlass.Float32
+        # Dynamic SMEM requested at launch: the capacity of ``arch``.
+        self.arch = arch
         self.cta_m = tactic.mma_m
         self.cta_n = tactic.mma_n
         self.cta_k = _CTA_K
@@ -372,7 +555,7 @@ class SplitKDenseGemmKernel:
             ),
             block=(self.threads_per_cta, 1, 1),
             cluster=self.cluster_shape,
-            smem=cute.Int64(utils.get_smem_capacity_in_bytes("sm_100")),
+            smem=cute.Int64(utils.get_smem_capacity_in_bytes(self.arch)),
             stream=stream,
             use_pdl=self.use_pdl,
         )
@@ -640,6 +823,7 @@ class SplitKDenseGemmKernel:
     ):
         num_tmem_cols = 256
         cute.arch.alloc_tmem(num_tmem_cols, tmem_base_ptr, is_two_cta=False)
+        _tcgen05_fence(before=True)
         cute.arch.mbarrier_arrive(bar_tmem_alloc)
         cute.arch.relinquish_tmem_alloc_permit(is_two_cta=False)
 
@@ -650,6 +834,7 @@ class SplitKDenseGemmKernel:
         for k_tile in cutlass.range(k_tile_count, unroll=1):
             stage = k_tile % self.num_ab_stage
             cute.arch.mbarrier_wait(bar_full + stage, full_phase)
+            _tcgen05_fence(before=False)
             for k_block in range(mma_inst_tile_k):
                 if k_block == 0:
                     mma_atom.set(tcgen05.Field.ACCUMULATE, k_tile != 0)
@@ -668,8 +853,13 @@ class SplitKDenseGemmKernel:
 
         with cute.arch.elect_one():
             tcgen05.commit(bar_mma_epilog, None, self.cta_group)
+        # The release arrival must land in phase 1. Made while phase 0 is still
+        # open, it counts toward phase 0, and the parity-1 wait can then pass
+        # before the epilogue has read TMEM.
+        cute.arch.mbarrier_wait(bar_tmem_alloc, 0)
         cute.arch.mbarrier_arrive(bar_tmem_alloc)
         cute.arch.mbarrier_wait(bar_tmem_alloc, 1)
+        _tcgen05_fence(before=False)
         cute.arch.dealloc_tmem(tmem_ptr, num_tmem_cols, is_two_cta=False)
 
     @cute.experimental.jit
@@ -692,6 +882,7 @@ class SplitKDenseGemmKernel:
         # Wait until MMA publishes the TMEM base pointer.
         cute.arch.mbarrier_arrive(bar_tmem_alloc)
         cute.arch.mbarrier_wait(bar_tmem_alloc, 0)
+        _tcgen05_fence(before=False)
 
         acc_view = cute.make_tensor(
             cute.arch.retrieve_tmem_ptr(self.acc_dtype, 16, tmem_base_ptr),
@@ -755,9 +946,11 @@ class SplitKDenseGemmKernel:
                 rBiasAcc.store(rBias.load().to(self.acc_dtype))
 
         cute.arch.mbarrier_wait(bar_mma_epilog, 0)
+        _tcgen05_fence(before=False)
         cute_ext.partition_and_copy(thr_t2r, acc_view, rAcc)
         # Make tcgen05.ld visible before TMEM release and RMEM use.
         cute.arch.fence_view_async_tmem_load()
+        _tcgen05_fence(before=True)
         cute.arch.mbarrier_arrive(bar_tmem_alloc)
 
         # Peers publish FP32 partials; only rank 0 reduces and stores.
@@ -788,7 +981,7 @@ class SplitKDenseGemmKernel:
                     cute.arch.mbarrier_arrive_and_expect_tx(
                         bar_reduce, self.expected_transaction_bytes
                     )
-                cute.arch.mbarrier_wait(bar_reduce, 0)
+                _mbarrier_wait_acquire_cluster(bar_reduce, Int32(0))
                 for peer in cutlass.range_constexpr(self.split_k - 1):
                     for value_idx in cutlass.range_constexpr(values_per_thread):
                         rAcc[value_idx] = (
@@ -853,9 +1046,9 @@ def _bmm_bias(
 
 
 def _from_dlpack_dynamic(tensor, leading_dim: int, assumed_align: int = 32):
-    return from_dlpack(tensor, assumed_align=assumed_align).mark_layout_dynamic(
-        leading_dim=leading_dim
-    )
+    return from_dlpack(
+        tensor.detach(), assumed_align=assumed_align
+    ).mark_layout_dynamic(leading_dim=leading_dim)
 
 
 def _detect_leading_dim(tensor: _torch.Tensor) -> int:
@@ -910,35 +1103,29 @@ def _make_compile_repr_tensors(
 
 
 def _to_cute_swap(a, b, out, bias):
-    a_swap = b.unsqueeze(0).transpose(-2, -1)
-    b_swap = a.unsqueeze(0).transpose(-2, -1)
-    c_swap = out.unsqueeze(0).transpose(-2, -1)
-    leading_dims = tuple(
-        _detect_leading_dim(tensor) for tensor in (a_swap, b_swap, c_swap)
+    tensors = (
+        b.unsqueeze(0).transpose(-2, -1),
+        a.unsqueeze(0).transpose(-2, -1),
+        out.unsqueeze(0).transpose(-2, -1),
     )
-    cute_tensors = tuple(
-        _from_dlpack_dynamic(tensor, leading_dim)
-        for tensor, leading_dim in zip(
-            (a_swap, b_swap, c_swap), leading_dims, strict=True
-        )
-    )
-    if bias is None:
-        return (*cute_tensors, None, leading_dims)
+    leading_dims = tuple(_detect_leading_dim(tensor) for tensor in tensors)
     return (
-        *cute_tensors,
-        _from_dlpack_dynamic(
-            bias.as_strided(
-                size=(1, c_swap.shape[1], c_swap.shape[2]), stride=(0, 1, 0)
-            ),
-            1,
-            2,
+        *(
+            _from_dlpack_dynamic(tensor, leading_dim)
+            for tensor, leading_dim in zip(tensors, leading_dims, strict=True)
         ),
+        _from_dlpack_dynamic(
+            bias.as_strided(size=tensors[2].shape, stride=(0, 1, 0)), 1, 2
+        )
+        if bias is not None
+        else None,
         leading_dims,
     )
 
 
 @functools.cache
 def _get_compiled_splitk_kernel(
+    device_index: int,
     dtype,
     tactic: SplitKTactic,
     use_pdl: bool,
@@ -950,18 +1137,19 @@ def _get_compiled_splitk_kernel(
             f"split-K dense GEMM supports {_SUPPORTED_TORCH_DTYPES}; got {dtype}"
         )
 
-    kernel = SplitKDenseGemmKernel(
-        tactic=tactic,
-        use_pdl=use_pdl,
-        has_bias=has_bias,
-    )
-    compile_tensors = _make_compile_repr_tensors(dtype, has_bias, *leading_dims)
-    stream = _cuda.CUstream(_torch.cuda.current_stream().cuda_stream)
-    if has_bias:
-        compiled = cute_ext.compile(_bmm_bias, kernel, *compile_tensors, stream)
-    else:
-        compiled = cute_ext.compile(_bmm_no_bias, kernel, *compile_tensors[:3], stream)
-    return compiled
+    with _torch.cuda.device(device_index):
+        compile_tensors = _make_compile_repr_tensors(dtype, has_bias, *leading_dims)
+        return cute_ext.compile(
+            _bmm_bias if has_bias else _bmm_no_bias,
+            SplitKDenseGemmKernel(
+                tactic=tactic,
+                use_pdl=use_pdl,
+                has_bias=has_bias,
+                arch=_arch(device_index),
+            ),
+            *(compile_tensors if has_bias else compile_tensors[:3]),
+            _cuda.CUstream(_torch.cuda.current_stream().cuda_stream),
+        )
 
 
 def _validate_runtime_tensors(a, b, bias, out) -> tuple[int, int, int]:
@@ -1014,19 +1202,24 @@ def run_splitk_dense(
     tactic: SplitKTactic,
 ):
     """Run ``A[M,K] @ B[K,N]`` with the ``mm_bf16`` layouts."""
-    validate_tactic(tactic, *_validate_runtime_tensors(a, b, bias, out))
-    has_bias = bias is not None
-    cute_tensors = _to_cute_swap(a, b, out, bias)
-    compiled = _get_compiled_splitk_kernel(
-        dtype=a.dtype,
-        tactic=tactic,
-        use_pdl=pdl,
-        has_bias=has_bias,
-        leading_dims=cute_tensors[4],
+    validate_tactic(
+        tactic,
+        *_validate_runtime_tensors(a, b, bias, out),
+        smem_capacity=_smem_capacity_bytes(a.get_device()),
     )
-    stream = _cuda.CUstream(_torch.cuda.current_stream(a.device).cuda_stream)
-    if has_bias:
-        compiled(*cute_tensors[:4], stream)
-    else:
-        compiled(*cute_tensors[:3], stream)
+    has_bias = bias is not None
+    with _torch.cuda.device(a.device):
+        tensors = _to_cute_swap(a, b, out, bias)
+        compiled = _get_compiled_splitk_kernel(
+            device_index=a.get_device(),
+            dtype=a.dtype,
+            tactic=tactic,
+            use_pdl=pdl,
+            has_bias=has_bias,
+            leading_dims=tensors[4],
+        )
+        compiled(
+            *(tensors[:4] if has_bias else tensors[:3]),
+            _cuda.CUstream(_torch.cuda.current_stream(a.device).cuda_stream),
+        )
     return out

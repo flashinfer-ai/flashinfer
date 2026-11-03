@@ -1,0 +1,163 @@
+{
+  "entry": "run",
+  "arg_plan": [
+    [
+      "buffer",
+      "q"
+    ],
+    [
+      "tma_buffer",
+      "q_tma"
+    ],
+    [
+      "buffer",
+      "k"
+    ],
+    [
+      "tma_buffer",
+      "k_tma"
+    ],
+    [
+      "buffer",
+      "v"
+    ],
+    [
+      "tma_buffer",
+      "v_tma"
+    ],
+    [
+      "buffer",
+      "g"
+    ],
+    [
+      "tma_buffer",
+      "g_tma"
+    ],
+    [
+      "buffer",
+      "beta"
+    ],
+    [
+      "tma_buffer",
+      "beta_tma"
+    ],
+    [
+      "buffer",
+      "A_log"
+    ],
+    [
+      "buffer",
+      "dt_bias"
+    ],
+    [
+      "buffer",
+      "piece_table"
+    ],
+    [
+      "buffer",
+      "cta_table"
+    ],
+    [
+      "buffer",
+      "initial_state"
+    ],
+    [
+      "buffer",
+      "out"
+    ],
+    [
+      "tma_buffer",
+      "out_tma"
+    ],
+    [
+      "buffer",
+      "final_state"
+    ],
+    [
+      "parameter",
+      "num_heads"
+    ],
+    [
+      "parameter",
+      "scale"
+    ],
+    [
+      "parameter",
+      "lower_bound"
+    ],
+    [
+      "parameter",
+      "failure_addr"
+    ],
+    [
+      "parameter",
+      "generation"
+    ],
+    [
+      "parameter",
+      "detect_threshold_log2"
+    ],
+    [
+      "parameter",
+      "handoff_flags_addr"
+    ],
+    [
+      "tma_table",
+      "tma_table"
+    ],
+    [
+      "parameter",
+      "tma_upload"
+    ],
+    [
+      "grid",
+      "grid_x"
+    ],
+    [
+      "grid",
+      "grid_y"
+    ],
+    [
+      "grid",
+      "grid_z"
+    ]
+  ],
+  "programs": {
+    "fixed_h64": {
+      "kernel": "kernel_kda_fwd_stream_m64",
+      "module_ident": "kda_fwd_stream_m64_3ee1b22374",
+      "dynamic_smem_bytes": 221696,
+      "v_box_rows": 32,
+      "out_box_depth": 1,
+      "handoff_flags": false,
+      "cluster_x": 1
+    },
+    "fixed_h96": {
+      "kernel": "kernel_kda_fwd_stream_m128",
+      "module_ident": "kda_fwd_stream_m128_84e701abc9",
+      "dynamic_smem_bytes": 232448,
+      "v_box_rows": 16,
+      "out_box_depth": 2,
+      "handoff_flags": true,
+      "cluster_x": 1
+    },
+    "varlen_uniform_h64": {
+      "kernel": "kernel_kda_fwd_stream_m128",
+      "module_ident": "kda_fwd_stream_m128_3d67d8bd6d",
+      "dynamic_smem_bytes": 232448,
+      "v_box_rows": 16,
+      "out_box_depth": 2,
+      "handoff_flags": true,
+      "cluster_x": 1
+    },
+    "varlen_mixed_h64": {
+      "kernel": "kernel_kda_fwd_stream_m128_cluster2",
+      "module_ident": "kda_fwd_stream_m128_cluster2_4860bf549c",
+      "dynamic_smem_bytes": 232448,
+      "v_box_rows": 16,
+      "out_box_depth": 2,
+      "handoff_flags": true,
+      "cluster_x": 2
+    }
+  }
+}

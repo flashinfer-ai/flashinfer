@@ -262,7 +262,10 @@ class GroupedQueryAttentionDecodePaged:
         # Calculate stage counts
         ##############################
         # Fixed stage counts
-        self.pt_stages = pt_stages = 4  # smem page table buffer
+        # smem page table buffer. The TMA K warp prefetches tile s+1 into the ring
+        # before waiting on the TMA V warp, which may still be reading tiles
+        # s-prefetch_iters-1 .. s, so the ring needs prefetch_iters + 3 slots.
+        self.pt_stages = pt_stages = 5
         self.sp_stages = sp_stages = 4  # smem skip predicates
         self.p_stages = p_stages = 4  # smem P (BMM2 B)
         self.o_stages = o_stages = 2  # tmem O (BMM2 C)
@@ -563,6 +566,14 @@ class GroupedQueryAttentionDecodePaged:
         scale_o: Float32,
         log2_threshold_scale_factor: Optional[Float32],
     ):
+        """Warp-specialized GQA decode over a paged KV cache.
+
+        Same pipeline as the contiguous kernel, with K and V tiles gathered through
+        the request's page table: the TMA K warp prefetches each tile's page indices
+        one tile ahead into a ring of ``pt_stages`` shared-memory slots, which the
+        TMA V warp reads ``prefetch_iters`` tiles later. Optional BLASST tile
+        skipping is enabled by ``log2_threshold_scale_factor``.
+        """
         ##############################
         # Static variables
         ##############################
@@ -956,17 +967,33 @@ class GroupedQueryAttentionDecodePaged:
         # Runtime control flow
         if cutlass.const_expr(is_varlen):
             seqlen = seqlen_smem[0]
-            page_count = cute.ceil_div(seqlen, page_size)
             table_offset = table_offset_smem[0]
         else:
             seqlen = seqlens_iter
-            page_count = cute.ceil_div(seqlen, page_size)
-            table_offset = coord_b * page_count
+            full_page_count = cute.ceil_div(seqlen, page_size)
+            table_offset = coord_b * full_page_count
+
+        # Drop only complete pages that precede every query's left-window
+        # bound.  Keeping the leading partial page lets the existing mask
+        # handle the boundary, while rebasing both KV indices and seqlen keeps
+        # causal/window coordinates unchanged for multi-token decode.
+        full_seqlen = seqlen
+        if cutlass.const_expr(isinstance(mask_config, SlidingWindowMask)):
+            sliding_window = cast(SlidingWindowMask, mask_config)
+            window_left = sliding_window.window_left
+            if cutlass.const_expr(window_left is not None):
+                assert window_left is not None
+                first_active_token = cutlass.max(0, seqlen - prediction - window_left)
+                skipped_pages = first_active_token // page_size
+                table_offset += skipped_pages
+                seqlen -= skipped_pages * page_size
+
+        page_count = cute.ceil_div(seqlen, page_size)
         tiles_s = cute.ceil_div(seqlen, blk_tile_s)
         iters_s = cute.ceil_div(tiles_s - kv_split_idx, kv_splits)
         exit_early = kv_split_idx >= tiles_s
         prefetch_iters = min(2, s_stages - 1)  # MMA KQ iters to hide first softmax
-        assert pt_stages > prefetch_iters + 1
+        assert pt_stages >= prefetch_iters + 3
 
         ##############################
         # Tmem tensor allocation
@@ -1476,7 +1503,7 @@ class GroupedQueryAttentionDecodePaged:
                 # Per-batch BLASST threshold, matching trtllm:
                 # effective threshold_p = scale_factor / seqlen
                 log2_threshold_p = log2_threshold_scale_factor - cute.math.log2(
-                    Float32(seqlen)
+                    Float32(full_seqlen)
                 )
 
             # Masking phase loop over all sequence tiles
@@ -1860,17 +1887,17 @@ class GroupedQueryAttentionDecodePaged:
                     scale_o,
                 )
             elif cutlass.const_expr(do_none_red):
-                gL = None
-                if cutlass.const_expr(store_lse):
-                    gL = cute.local_tile(mL, (blk_tile_hp,), (coord_hp, coord_hb))
                 GqaDecode.reduction_none(
+                    blk_tile_hp,
+                    coord_hp,
+                    coord_hb,
                     lane_store_max,
                     lane_idx,
                     sM_final_nbar,
                     sL_final_nbar,
                     sM,
                     sL,
-                    gL,
+                    mL,
                     sSink,
                     scale_o,
                 )

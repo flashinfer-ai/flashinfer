@@ -5,12 +5,19 @@ Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 """
 
-from dataclasses import dataclass, field
-from typing import Literal, Optional
+from contextlib import contextmanager
+from dataclasses import dataclass, field, fields, replace
+from functools import wraps
+import math
+from typing import Any, Callable, Iterator, Literal, Optional, TypeVar, cast
 
 import torch
 
 from ._contracts import MLAPlanMetadata, MLAStructuralInputKind
+from ._backends._capabilities import _BackendPlanUnsupportedError
+
+
+_PlanResultT = TypeVar("_PlanResultT")
 
 
 @dataclass(frozen=True)
@@ -485,17 +492,48 @@ class _MLAPlanMetadataResolver:
             return csr
         return self._derive_csr(self._validate_dense(None))
 
+    def _csr_for_dense(self) -> _CSRPlanMetadata:
+        csr = self._validate_csr()
+        # Historical flat CSR accepts independent batch-array sizes for FA.
+        # Such metadata cannot describe one dense row per request.
+        if (
+            csr.qo_indptr.numel() != csr.kv_indptr.numel()
+            or csr.kv_len_arr.numel() + 1 != csr.qo_indptr.numel()
+        ):
+            raise _BackendPlanUnsupportedError(
+                "Dense MLA backends require matching query/KV batch dimensions."
+            )
+        return csr
+
     def resolve_dense(self, *, table_width_alignment: int) -> _DensePlanMetadata:
         self._check_forms()
         _check_table_width_alignment(table_width_alignment)
         if self._has_dense:
-            dense = self._validate_dense(table_width_alignment)
+            dense = self._validate_dense(None)
             self._ensure_dual_forms_equivalent(dense=dense)
-            return dense
+            width = dense.block_tables.shape[1]
+            if width > 0 and width % table_width_alignment == 0:
+                return dense
+            if table_width_alignment not in self._derived_dense_by_alignment:
+                padded_width = max(
+                    table_width_alignment,
+                    ((width + table_width_alignment - 1) // table_width_alignment)
+                    * table_width_alignment,
+                )
+                table = torch.zeros(
+                    (dense.block_tables.shape[0], padded_width),
+                    dtype=dense.block_tables.dtype,
+                    device=dense.block_tables.device,
+                )
+                table[:, :width].copy_(dense.block_tables)
+                self._derived_dense_by_alignment[table_width_alignment] = replace(
+                    dense, block_tables=table
+                )
+            return self._derived_dense_by_alignment[table_width_alignment]
         if table_width_alignment not in self._derived_dense_by_alignment:
             self._derived_dense_by_alignment[table_width_alignment] = (
                 _derive_dense_from_csr(
-                    self._validate_csr(),
+                    self._csr_for_dense(),
                     table_width_alignment=table_width_alignment,
                 )
             )
@@ -537,7 +575,7 @@ class _MLAPlanMetadataResolver:
             return dense
         if self._derived_native_dense is None:
             self._derived_native_dense = _derive_dense_from_csr(
-                self._validate_csr(),
+                self._csr_for_dense(),
                 table_width_alignment=None,
             )
         return self._derived_native_dense
@@ -571,8 +609,12 @@ class _MLAPlanArguments:
     )
     output_dtype: torch.dtype = torch.float16
     output_scale: Literal["none", "per-tensor"] = "none"
-    scale_mode: Literal["default", "kv-per-tensor"] = "default"
+    scale_mode: Literal["default", "kv-per-tensor", "bmm-scalar", "bmm-tensor"] = (
+        "default"
+    )
     skip_softmax: bool = False
+    enable_pdl: Optional[bool] = None
+    use_sinks: bool = False
     use_profiler: bool = False
     legacy_flat_csr: bool = False
     _float_workspace_buffer: torch.Tensor = field(repr=False, compare=False)
@@ -584,13 +626,64 @@ class _MLAPlanArguments:
     _graph_plan_int_workspace_buffer: Optional[torch.Tensor] = field(
         default=None, repr=False, compare=False
     )
+    # Selector context; eager replans may choose a different concrete backend.
+    _previous_backend_name: Optional[str] = field(
+        default=None, repr=False, compare=False
+    )
     _metadata_resolver: _MLAPlanMetadataResolver = field(
         init=False, repr=False, compare=False
     )
+    _native_device_dense: Optional[_DensePlanMetadata] = field(
+        init=False, default=None, repr=False, compare=False
+    )
+    _audited_public_arguments: Optional[frozenset[str]] = field(
+        init=False, default=None, repr=False, compare=False
+    )
+    _accessed_public_arguments: Optional[set[str]] = field(
+        init=False, default=None, repr=False, compare=False
+    )
+
+    def __getattribute__(self, name: str):
+        value = object.__getattribute__(self, name)
+        audited_arguments = object.__getattribute__(self, "_audited_public_arguments")
+        if audited_arguments is not None and name in audited_arguments:
+            accessed_arguments = object.__getattribute__(
+                self, "_accessed_public_arguments"
+            )
+            assert accessed_arguments is not None
+            accessed_arguments.add(name)
+        return value
 
     def __post_init__(self) -> None:
         if not isinstance(self.metadata, MLAPlanMetadata):
             raise TypeError("metadata must be an MLAPlanMetadata instance.")
+        if (
+            not isinstance(self.page_size, int)
+            or isinstance(self.page_size, bool)
+            or self.page_size <= 0
+        ):
+            raise ValueError(
+                f"page_size must be a positive int, got {self.page_size!r}."
+            )
+        for name in ("num_heads", "head_dim_ckv", "head_dim_kpe"):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise TypeError(f"{name} must be an integer, got {value!r}.")
+        if self.num_heads <= 0 or self.page_size <= 0:
+            raise ValueError("num_heads and page_size must be positive.")
+        if not isinstance(self.causal, bool) or not isinstance(self.use_profiler, bool):
+            raise TypeError("causal and use_profiler must be bools.")
+        if not isinstance(self.sm_scale, (int, float)) or isinstance(
+            self.sm_scale, bool
+        ):
+            raise TypeError("sm_scale must be a finite number.")
+        if not math.isfinite(self.sm_scale):
+            raise ValueError("sm_scale must be finite.")
+        object.__setattr__(self, "sm_scale", float(self.sm_scale))
+        if not isinstance(self.q_data_type, torch.dtype) or not isinstance(
+            self.kv_data_type, torch.dtype
+        ):
+            raise TypeError("q_data_type and kv_data_type must be torch.dtype values.")
         if self.head_dim_ckv <= 0:
             raise ValueError(f"head_dim_ckv must be > 0, got {self.head_dim_ckv}.")
         if self.head_dim_kpe < 0:
@@ -603,12 +696,21 @@ class _MLAPlanArguments:
             raise ValueError(f"unsupported lse_mode {self.lse_mode!r}.")
         if self.output_scale not in ("none", "per-tensor"):
             raise ValueError(f"unsupported output_scale {self.output_scale!r}.")
-        if self.scale_mode not in ("default", "kv-per-tensor"):
+        if self.scale_mode not in (
+            "default",
+            "kv-per-tensor",
+            "bmm-scalar",
+            "bmm-tensor",
+        ):
             raise ValueError(f"unsupported scale_mode {self.scale_mode!r}.")
         if not isinstance(self.output_dtype, torch.dtype):
             raise TypeError("output_dtype must be a torch.dtype.")
         if not isinstance(self.skip_softmax, bool):
             raise TypeError("skip_softmax must be a bool.")
+        if self.enable_pdl is not None and not isinstance(self.enable_pdl, bool):
+            raise TypeError("enable_pdl must be a bool or None.")
+        if not isinstance(self.use_sinks, bool):
+            raise TypeError("use_sinks must be a bool.")
         object.__setattr__(
             self,
             "_metadata_resolver",
@@ -620,13 +722,116 @@ class _MLAPlanArguments:
             ),
         )
 
+    @contextmanager
+    def audit_public_argument_access(self, backend_name: str) -> Iterator[None]:
+        """Assert that a successful backend planner acknowledges every public input."""
+
+        if self._audited_public_arguments is not None:
+            raise RuntimeError("nested MLA plan-argument access audits are unsupported")
+
+        audited_arguments = frozenset(
+            plan_field.name
+            for plan_field in fields(self)
+            if not plan_field.name.startswith("_")
+        )
+        accessed_arguments: set[str] = set()
+        object.__setattr__(self, "_audited_public_arguments", audited_arguments)
+        object.__setattr__(self, "_accessed_public_arguments", accessed_arguments)
+        try:
+            yield
+        except BaseException:
+            raise
+        else:
+            unconsumed_arguments = audited_arguments - accessed_arguments
+            if unconsumed_arguments:
+                raise AssertionError(
+                    f"{backend_name} plan_from_wrapper did not consume public "
+                    "arguments: "
+                    f"{', '.join(sorted(unconsumed_arguments))}"
+                )
+        finally:
+            object.__setattr__(self, "_audited_public_arguments", None)
+            object.__setattr__(self, "_accessed_public_arguments", None)
+
+    def _record_metadata_argument_access(self) -> None:
+        accessed_arguments = self._accessed_public_arguments
+        if accessed_arguments is not None:
+            accessed_arguments.update(("metadata", "legacy_flat_csr"))
+
     def csr(self) -> _CSRPlanMetadata:
+        self._record_metadata_argument_access()
         return self._metadata_resolver.resolve_csr()
 
     def dense(self, *, table_width_alignment: int) -> _DensePlanMetadata:
+        self._record_metadata_argument_access()
+        self._check_dense_alignment_for_graph(table_width_alignment)
         return self._metadata_resolver.resolve_dense(
             table_width_alignment=table_width_alignment
         )
 
+    def _check_dense_alignment_for_graph(self, alignment: int) -> None:
+        if self._use_cuda_graph and self.metadata.block_tables is not None:
+            dense = self._metadata_resolver.resolve_native_dense()
+            width = dense.block_tables.shape[1]
+            if width == 0 or width % alignment:
+                raise _BackendPlanUnsupportedError(
+                    f"CUDA graph dense metadata requires table width aligned to {alignment}; "
+                    "padding would stop observing caller-owned table updates."
+                )
+
+    def require_cuda_graph_dense_metadata(self, backend_name: str) -> None:
+        """Keep graph launch metadata in caller-owned device storage."""
+        if not self._use_cuda_graph:
+            return
+        device = self._float_workspace_buffer.device
+        if any(
+            not isinstance(tensor, torch.Tensor) or tensor.device != device
+            for tensor in (
+                self.metadata.cum_seq_lens_q,
+                self.metadata.block_tables,
+                self.metadata.seq_lens,
+            )
+        ):
+            raise _BackendPlanUnsupportedError(
+                f"{backend_name} CUDA graph plans require supplied dense metadata "
+                f"on the wrapper device {device}; CPU metadata and CSR-only "
+                "metadata would be copied rather than observe in-place updates."
+            )
+
+    def device_dense(self, *, table_width_alignment: int) -> _DensePlanMetadata:
+        self._record_metadata_argument_access()
+        self._check_dense_alignment_for_graph(table_width_alignment)
+        return self._metadata_resolver.resolve_device_dense(
+            table_width_alignment=table_width_alignment
+        )
+
     def native_dense(self) -> _DensePlanMetadata:
+        self._record_metadata_argument_access()
         return self._metadata_resolver.resolve_native_dense()
+
+    def native_device_dense(self) -> _DensePlanMetadata:
+        self._record_metadata_argument_access()
+        if self._native_device_dense is None:
+            object.__setattr__(
+                self,
+                "_native_device_dense",
+                self._metadata_resolver.resolve_native_device_dense(),
+            )
+        assert self._native_device_dense is not None
+        return self._native_device_dense
+
+
+def _audit_plan_from_wrapper_arguments(
+    plan_from_wrapper: Callable[..., _PlanResultT],
+) -> Callable[..., _PlanResultT]:
+    """Audit successful concrete backend planners without affecting test doubles."""
+
+    @wraps(plan_from_wrapper)
+    def audited_plan_from_wrapper(
+        cls: type[object], args: _MLAPlanArguments
+    ) -> _PlanResultT:
+        with args.audit_public_argument_access(cls.__name__):
+            return plan_from_wrapper(cls, args)
+
+    cast(Any, audited_plan_from_wrapper)._audits_public_plan_arguments = True
+    return audited_plan_from_wrapper

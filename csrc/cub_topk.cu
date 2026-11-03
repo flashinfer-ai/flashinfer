@@ -392,17 +392,22 @@ cudaError_t CUBBatchedTopKVarLenTransform(const DType* input, int64_t row_stride
   // synthesized by a counting iterator; d_values_out then receives the top-k source indices.
   auto d_values_in = cuda::make_constant_iterator(cuda::make_counting_iterator(int32_t{0}));
 
+  // Bound only CUB's selection K by the physical width. The caller's output
+  // iterators retain the requested top_k stride, and the existing tail fill pads
+  // to top_k. CUB still reads each logical length on device on every graph replay.
+  const int64_t selection_k = top_k < max_len ? top_k : max_len;
+
   if (row_starts != nullptr) {
     auto d_keys_in =
         cuda::make_transform_iterator(cuda::make_counting_iterator(int64_t{0}),
                                       CUBMakeRowIn<DType>{input, row_stride, row_starts});
     return CUBBatchedTopKDispatch(d_keys_in, d_keys_out, d_values_in, d_values_out, lengths,
-                                  maybe_workspace_buffer, num_rows, max_len, top_k, tie_break,
+                                  maybe_workspace_buffer, num_rows, max_len, selection_k, tie_break,
                                   query_bytes_out, stream);
   }
   auto d_keys_in = cuda::make_strided_iterator(cuda::make_counting_iterator(input), row_stride);
   return CUBBatchedTopKDispatch(d_keys_in, d_keys_out, d_values_in, d_values_out, lengths,
-                                maybe_workspace_buffer, num_rows, max_len, top_k, tie_break,
+                                maybe_workspace_buffer, num_rows, max_len, selection_k, tie_break,
                                 query_bytes_out, stream);
 }
 
@@ -439,7 +444,8 @@ cudaError_t CUBBatchedTopK(const DType* input, int64_t row_stride, DType* output
 }
 
 // Input-side validation shared by every CUB entry and workspace-size query.
-void CheckCUBTopKInput(const TensorView& input, int64_t top_k, int64_t tie_break) {
+void CheckCUBTopKInput(const TensorView& input, int64_t top_k, int64_t tie_break,
+                       bool allow_oversized_k = false) {
   // Rows only need to be individually contiguous: the row pitch is threaded through as
   // input.stride(0), so strided views (e.g. scores[:, :cur_len] of a wider buffer) work
   // without a .contiguous() copy.
@@ -451,16 +457,19 @@ void CheckCUBTopKInput(const TensorView& input, int64_t top_k, int64_t tie_break
       << ", expected 0 (none), 1 (prefer small indices), or 2 (prefer large indices)";
 
   const int64_t max_len = input.size(1);
-  TVM_FFI_ICHECK(top_k > 0 && top_k <= max_len)
-      << "cub_topk requires 0 < top_k <= d, got top_k=" << top_k << ", d=" << max_len;
-  TVM_FFI_ICHECK(max_len <= CUB_TOPK_MAX_LEN)
-      << "cub_topk supports d <= " << CUB_TOPK_MAX_LEN << ", got d=" << max_len;
+  TVM_FFI_ICHECK(top_k > 0) << "cub_topk requires top_k > 0, got top_k=" << top_k;
+  if (!allow_oversized_k) {
+    TVM_FFI_ICHECK(top_k <= max_len)
+        << "cub_topk requires top_k <= d, got top_k=" << top_k << ", d=" << max_len;
+  }
+  TVM_FFI_ICHECK(max_len > 0 && max_len <= CUB_TOPK_MAX_LEN)
+      << "cub_topk supports 0 < d <= " << CUB_TOPK_MAX_LEN << ", got d=" << max_len;
 }
 
 // Validation shared by the transform entries and their workspace-size queries.
 void CheckCUBTopKArgs(const TensorView& input, const TensorView& lengths, int64_t top_k,
                       int64_t tie_break) {
-  CheckCUBTopKInput(input, top_k, tie_break);
+  CheckCUBTopKInput(input, top_k, tie_break, /*allow_oversized_k=*/true);
   CHECK_INPUT(lengths);
   CHECK_DIM(1, lengths);  // lengths: (batch_size,)
   CHECK_INPUT_TYPE(lengths, dl_int32);
@@ -491,13 +500,7 @@ void cub_topk_page_table_transform(
                               maybe_output_raw_indices, top_k, page_size);
   // CUB-specific constraints; everything shared with the radix launcher lives in
   // CheckPageTableTransformArgs.
-  TVM_FFI_ICHECK(tie_break >= 0 && tie_break <= 2)
-      << "Invalid tie_break mode " << tie_break
-      << ", expected 0 (none), 1 (prefer small indices), or 2 (prefer large indices)";
-  TVM_FFI_ICHECK(top_k <= input.size(1))
-      << "cub_topk requires top_k <= d, got top_k=" << top_k << ", d=" << input.size(1);
-  TVM_FFI_ICHECK(input.size(1) <= CUB_TOPK_MAX_LEN)
-      << "cub_topk supports d <= " << CUB_TOPK_MAX_LEN << ", got d=" << input.size(1);
+  CheckCUBTopKInput(input, top_k, tie_break, /*allow_oversized_k=*/true);
 
   const auto* lengths_ptr = static_cast<const int32_t*>(lengths.data_ptr());
   const auto* row_to_batch_ptr =

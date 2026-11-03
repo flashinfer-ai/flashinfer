@@ -213,6 +213,7 @@ class BlackwellFusedMultiHeadBlockScaledAttentionForward:
         enable_ex2_emulation: bool,
         enable_skip_correction: bool,
         qk_sf_vec_size: int,
+        rescale_threshold: float = 8.0,
         use_tma_store: bool = True,
     ):
         """Initializes the configuration for a Blackwell Fused Multi-Head Attention (FMHA) kernel.
@@ -290,6 +291,7 @@ class BlackwellFusedMultiHeadBlockScaledAttentionForward:
         self.is_persistent = is_persistent
         self.mask_type = mask_type
         self.enable_skip_correction = enable_skip_correction
+        self.rescale_threshold = rescale_threshold if enable_skip_correction else 0.0
         self.enable_ex2_emulation = enable_ex2_emulation
         self.qk_sf_vec_size = qk_sf_vec_size
         self.qk_mma_inst_bits_k = 256
@@ -449,7 +451,6 @@ class BlackwellFusedMultiHeadBlockScaledAttentionForward:
         self.epi_stage = 2
 
         # Tunable parameters
-        self.rescale_threshold = 8.0 if self.enable_skip_correction else 0.0
         # FP8 P pre-scale: offset added to exp2 exponent so that P*2^offset fills
         # more of E4M3's [0, 448] range, improving quantization precision.
         # Derived from rescale_threshold to guarantee P*2^offset <= 448.

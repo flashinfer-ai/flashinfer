@@ -38,15 +38,17 @@ _HAS_QUACK = importlib.util.find_spec("quack") is not None
 
 
 def _is_vsa_sm100_or_sm103_supported(device: torch.device) -> bool:
-    return get_compute_capability(device) in ((10, 0), (10, 3)) and is_sm100a_supported(
-        device
-    )
+    return get_compute_capability(device) in (
+        (10, 0),
+        (10, 3),
+        (10, 7),
+    ) and is_sm100a_supported(device)
 
 
 _requires_sm100_or_sm103 = pytest.mark.skipif(
     not torch.cuda.is_available()
     or not _is_vsa_sm100_or_sm103_supported(torch.device("cuda")),
-    reason="vsa_sm100_blk64 requires SM100 or SM103",
+    reason="vsa_sm100_blk64 requires SM100, SM103 or SM107",
 )
 
 from flashinfer.cute_dsl.utils import is_cute_dsl_arch_supported
@@ -55,7 +57,7 @@ pytestmark = [
     pytest.mark.skipif(
         not torch.cuda.is_available()
         or not _is_vsa_sm100_or_sm103_supported(torch.device("cuda")),
-        reason="VSA blk128 backend requires SM100 or SM103",
+        reason="VSA blk128 backend requires SM100, SM103 or SM107",
     ),
     pytest.mark.skipif(
         not _HAS_QUACK,

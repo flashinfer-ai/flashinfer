@@ -37,6 +37,8 @@ def _uses_trace_decorator(node: ast.AST) -> bool:
             "id",
             getattr(decorator.func, "attr", None),
         )
+        # Literal match on purpose: @flashinfer_experimental_api(trace=...) is
+        # excluded so experimental APIs never enter the stable inventory.
         if name == "flashinfer_api" and any(
             keyword.arg == "trace" for keyword in decorator.keywords
         ):
@@ -47,7 +49,10 @@ def _uses_trace_decorator(node: ast.AST) -> bool:
 def _registration_modules_from_source() -> set[str]:
     package_root = Path(__file__).parents[2] / "flashinfer"
     modules: set[str] = set()
+    experimental_root = package_root / "experimental"
     for path in package_root.rglob("*.py"):
+        if experimental_root in path.parents:
+            continue
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         if not any(_uses_trace_decorator(node) for node in ast.walk(tree)):
             continue
@@ -81,20 +86,28 @@ def test_formerly_order_dependent_templates_are_discovered():
     labels = {label for _, _, label in collect_registered_trace_templates()}
     assert "concat_mla_k" in labels
 
+    # Modules whose import may legitimately fail on a host (missing CUDA
+    # runtime pieces, optional dependencies); their templates are required
+    # only where the module imports.
     optional_labels = {
-        "flashinfer.comm.allreduce": "allreduce_fusion",
-        "flashinfer.comm.dcp_alltoall": "decode_cp_a2a_alltoall",
-        "flashinfer.cute_dsl.attention.wrappers.batch_mla": ("cute_dsl_batch_mla_run"),
+        "flashinfer.comm.allreduce": ("allreduce_fusion",),
+        "flashinfer.comm.dcp_alltoall": ("decode_cp_a2a_alltoall",),
+        "flashinfer.comm.ulysses": (
+            "ulysses_scatter_heads",
+            "ulysses_gather_heads",
+            "ulysses_exchange_chunks",
+        ),
+        "flashinfer.cute_dsl.attention.wrappers.batch_mla": ("cute_dsl_batch_mla_run",),
         "flashinfer.cute_dsl.attention.wrappers.batch_prefill": (
-            "cute_dsl_batch_prefill_run"
+            "cute_dsl_batch_prefill_run",
         ),
     }
-    for module_name, label in optional_labels.items():
+    for module_name, module_labels in optional_labels.items():
         try:
             importlib.import_module(module_name)
         except ImportError:
             continue
-        assert label in labels
+        assert set(module_labels) <= labels, module_name
 
 
 def _collect_parametrized_nodeids(

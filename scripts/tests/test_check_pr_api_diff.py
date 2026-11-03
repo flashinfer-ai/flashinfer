@@ -140,6 +140,36 @@ class SignatureCompatibilityTest(unittest.TestCase):
                 "def api(value: Tensor) -> None",
                 "def api(value: Tensor | None = None) -> None",
             ),
+            (
+                "Literal gains a member",
+                "def api(backend: Literal['a', 'b'] = 'a') -> None",
+                "def api(backend: Literal['a', 'b', 'c'] = 'a') -> None",
+            ),
+            (
+                "Literal gains a member, reordered and qualified",
+                "def api(backend: Literal['a', 'b'] = 'a') -> None",
+                "def api(backend: typing.Literal['c', 'b', 'a'] = 'a') -> None",
+            ),
+            (
+                "single-member Literal widens",
+                "def api(backend: Literal['a'] = 'a') -> None",
+                "def api(backend: Literal['a', 'b'] = 'a') -> None",
+            ),
+            (
+                "general union widening",
+                "def api(value: int) -> None",
+                "def api(value: int | str) -> None",
+            ),
+            (
+                "keyword-only insertion after varargs",
+                "def api(value: int, *args: object, last: int = 2) -> None",
+                "def api(value: int, *args: object, added: str = 'x', last: int = 2) -> None",
+            ),
+            (
+                "variadic tuple input widens",
+                "def api(value: tuple[int, ...]) -> None",
+                "def api(value: tuple[int | str, ...]) -> None",
+            ),
         )
 
         for name, before, after in cases:
@@ -174,6 +204,26 @@ class SignatureCompatibilityTest(unittest.TestCase):
                 "def api(second: str, first: int) -> None",
             ),
             (
+                "Literal loses a member",
+                "def api(backend: Literal['a', 'b', 'c'] = 'a') -> None",
+                "def api(backend: Literal['a', 'b'] = 'a') -> None",
+            ),
+            (
+                "Literal member replaced",
+                "def api(backend: Literal['a', 'b'] = 'a') -> None",
+                "def api(backend: Literal['a', 'c'] = 'a') -> None",
+            ),
+            (
+                "Literal default changes",
+                "def api(backend: Literal['a', 'b'] = 'a') -> None",
+                "def api(backend: Literal['a', 'b', 'c'] = 'c') -> None",
+            ),
+            (
+                "Literal replaced by str",
+                "def api(backend: Literal['a', 'b'] = 'a') -> None",
+                "def api(backend: str = 'a') -> None",
+            ),
+            (
                 "positional parameter inserted",
                 "def api(first: int, second: str) -> None",
                 "def api(first: int, inserted: bool = False, second: str = 'x') -> None",
@@ -187,11 +237,6 @@ class SignatureCompatibilityTest(unittest.TestCase):
                 "annotation narrowed",
                 "def api(value: Optional[int] = None) -> None",
                 "def api(value: int = 0) -> None",
-            ),
-            (
-                "general union widening",
-                "def api(value: int) -> None",
-                "def api(value: int | str) -> None",
             ),
             (
                 "unrelated Optional attribute",
@@ -214,9 +259,39 @@ class SignatureCompatibilityTest(unittest.TestCase):
                 "def api(value: int, added: str = 'x', **kwargs: object) -> None",
             ),
             (
+                "new keyword-only parameter before kwargs",
+                "def api(value: int, **kwargs: object) -> None",
+                "def api(value: int, *, added: str = 'x', **kwargs: object) -> None",
+            ),
+            (
                 "return annotation changed",
                 "def api(value: int) -> int",
                 "def api(value: int) -> str",
+            ),
+            (
+                "return union narrowed",
+                "def api(value: int) -> int | str",
+                "def api(value: int) -> int",
+            ),
+            (
+                "return union widened without an opt-in input",
+                "def api(value: int) -> int",
+                "def api(value: int) -> int | str",
+            ),
+            (
+                "return union widened with an opt-in input",
+                "def api(value: int) -> tuple[int, int]",
+                "def api(value: int, details: bool = False) -> tuple[int, int] | tuple[int, int, int]",
+            ),
+            (
+                "return tuple member widens",
+                "def api(value: int) -> tuple[int, str]",
+                "def api(value: int, alternate: bool = False) -> tuple[int, Optional[str]]",
+            ),
+            (
+                "fixed return tuple widens to variadic",
+                "def api(value: int) -> tuple[int, int]",
+                "def api(value: int, extra: bool = False) -> tuple[int, ...]",
             ),
             (
                 "function became async",
@@ -233,6 +308,88 @@ class SignatureCompatibilityTest(unittest.TestCase):
                         api_function(after),
                     )
                 )
+
+
+class TypeAliasCompatibilityTest(unittest.TestCase):
+    def test_module_local_alias_can_preserve_or_widen_an_annotation(self) -> None:
+        base = {
+            "flashinfer/example.py": textwrap.dedent(
+                """
+                @flashinfer_api
+                def api(
+                    backend: Literal["first", "second"] = "first",
+                ) -> OldPlan:
+                    pass
+                """
+            )
+        }
+        head = {
+            "flashinfer/example.py": textwrap.dedent(
+                """
+                Backend = Literal["first", "second", "third"]
+
+                @flashinfer_api
+                def api(backend: Backend = "first") -> OldPlan:
+                    pass
+                """
+            )
+        }
+
+        self.assertEqual(compare_snapshots(base, head), [])
+
+    def test_module_local_alias_cannot_hide_narrowing(self) -> None:
+        base = {
+            "flashinfer/example.py": textwrap.dedent(
+                """
+                @flashinfer_api
+                def api(backend: Literal["first", "second"] = "first") -> None:
+                    pass
+                """
+            )
+        }
+        head = {
+            "flashinfer/example.py": textwrap.dedent(
+                """
+                Backend = Literal["first"]
+
+                @flashinfer_api
+                def api(backend: Backend = "first") -> None:
+                    pass
+                """
+            )
+        }
+
+        self.assertEqual(
+            tuple(finding.check for finding in compare_snapshots(base, head)),
+            ("public_api_signature_changed",),
+        )
+
+    def test_module_local_alias_cannot_hide_return_widening(self) -> None:
+        base = {
+            "flashinfer/example.py": textwrap.dedent(
+                """
+                @flashinfer_api
+                def api(value: int) -> OldPlan:
+                    pass
+                """
+            )
+        }
+        head = {
+            "flashinfer/example.py": textwrap.dedent(
+                """
+                Plan = Union[OldPlan, NewPlan]
+
+                @flashinfer_api
+                def api(value: int, fallback: bool = False) -> Plan:
+                    pass
+                """
+            )
+        }
+
+        self.assertEqual(
+            tuple(finding.check for finding in compare_snapshots(base, head)),
+            ("public_api_signature_changed",),
+        )
 
 
 class ClassReexportIntegrationTest(unittest.TestCase):
@@ -375,6 +532,159 @@ class ClassReexportIntegrationTest(unittest.TestCase):
         }
 
         self.assertEqual(compare_snapshots(base, head), [])
+
+
+class ExperimentalTrackExclusionTest(unittest.TestCase):
+    """The experimental track carries no compatibility guarantees, so it must
+    stay out of the public-API diff (flashinfer/experimental/README.md)."""
+
+    stable = textwrap.dedent(
+        """
+        @flashinfer_api
+        def api(value: int) -> None:
+            pass
+        """
+    )
+    breaking = textwrap.dedent(
+        """
+        @flashinfer_api
+        def api(renamed: int) -> None:
+            pass
+        """
+    )
+
+    def test_breaking_change_inside_experimental_is_ignored(self) -> None:
+        base = {"flashinfer/experimental/feature/backend.py": self.stable}
+        head = {"flashinfer/experimental/feature/backend.py": self.breaking}
+        self.assertEqual(compare_snapshots(base, head), [])
+
+    def test_experimental_module_deletion_is_ignored(self) -> None:
+        # "flashinfer/core.py" is the unchanged anchor: a snapshot cannot be
+        # empty, since git refuses a commit with nothing in it.
+        base = {
+            "flashinfer/core.py": self.stable,
+            "flashinfer/experimental/feature/backend.py": self.stable,
+        }
+        head = {"flashinfer/core.py": self.stable}
+        self.assertEqual(compare_snapshots(base, head), [])
+
+    def test_new_experimental_api_is_ignored(self) -> None:
+        base = {"flashinfer/core.py": self.stable}
+        head = {
+            "flashinfer/core.py": self.stable,
+            "flashinfer/experimental/feature/backend.py": self.stable,
+        }
+        self.assertEqual(compare_snapshots(base, head), [])
+
+    def test_experimental_decorator_in_core_is_ignored(self) -> None:
+        # @flashinfer_experimental_api is not @flashinfer_api: experimental APIs
+        # live in core modules but are not part of the versioned surface.
+        experimental_api = textwrap.dedent(
+            """
+            @flashinfer_experimental_api
+            def api(value: int) -> None:
+                pass
+            """
+        )
+        renamed = textwrap.dedent(
+            """
+            @flashinfer_experimental_api
+            def api(renamed: int) -> None:
+                pass
+            """
+        )
+        self.assertEqual(
+            compare_snapshots(
+                {"flashinfer/core.py": experimental_api},
+                {"flashinfer/core.py": renamed},
+            ),
+            [],
+        )
+
+    def test_move_from_core_into_experimental_is_a_removal(self) -> None:
+        # Demoting a stable API to the experimental track drops it from the
+        # public surface, so both the API and its module must still be reported.
+        findings = compare_snapshots(
+            {"flashinfer/core.py": self.stable},
+            {"flashinfer/experimental/feature/backend.py": self.stable},
+        )
+        self.assertEqual(
+            tuple(finding.check for finding in findings),
+            ("public_api_removed", "public_module_moved"),
+        )
+
+    def test_reexport_from_experimental_is_a_removal(self) -> None:
+        findings = compare_snapshots(
+            {"flashinfer/core.py": self.stable},
+            {
+                "flashinfer/core.py": "from flashinfer.experimental.feature import api\n",
+                "flashinfer/experimental/feature.py": self.stable,
+            },
+        )
+        self.assertEqual(
+            tuple(finding.check for finding in findings), ("public_api_removed",)
+        )
+
+    def test_graduation_out_of_experimental_reports_nothing(self) -> None:
+        self.assertEqual(
+            compare_snapshots(
+                {"flashinfer/experimental/feature/backend.py": self.stable},
+                {"flashinfer/core.py": self.stable},
+            ),
+            [],
+        )
+
+
+class ListApisExperimentalExclusionTest(unittest.TestCase):
+    """scripts/list_apis.sh feeds the release API diff and applies the same rule."""
+
+    script = SCRIPTS_DIR / "list_apis.sh"
+
+    @unittest.skipUnless(shutil.which("rg"), "list_apis.sh requires ripgrep")
+    def test_experimental_track_excluded_unless_requested(self) -> None:
+        sources = {
+            "flashinfer/core.py": textwrap.dedent(
+                """
+                @flashinfer_api
+                def stable_api(value: int) -> None:
+                    pass
+
+
+                @flashinfer_experimental_api
+                def experimental_api(value: int) -> None:
+                    pass
+                """
+            ),
+            "flashinfer/experimental/feature/backend.py": textwrap.dedent(
+                """
+                @flashinfer_api
+                def backend_entry(value: int) -> None:
+                    pass
+                """
+            ),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for relative_path, source in sources.items():
+                path = root / relative_path
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(source, encoding="utf-8")
+
+            def run(*flags: str) -> str:
+                return subprocess.check_output(
+                    ["bash", str(self.script), "-d", "-p", *flags, "flashinfer/"],
+                    cwd=root,
+                    text=True,
+                )
+
+            default = run()
+            self.assertIn("def stable_api(", default)
+            self.assertNotIn("def experimental_api(", default)
+            self.assertNotIn("def backend_entry(", default)
+
+            included = run("-x")
+            for name in ("stable_api", "experimental_api", "backend_entry"):
+                self.assertIn(f"def {name}(", included)
 
 
 if __name__ == "__main__":

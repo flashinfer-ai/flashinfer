@@ -44,36 +44,28 @@ def test_cudnn_prefill_deepseek(
     q_indptr = torch.cat(
         [
             torch.tensor([0], device=device),
-            torch.cumsum(actual_seq_lens_q.view(-1), dim=0)
-            * head_dim_qk
-            * num_qo_heads,
+            torch.cumsum(actual_seq_lens_q.view(-1), dim=0),
         ]
     ).int()
 
     k_indptr = torch.cat(
         [
             torch.tensor([0], device=device),
-            torch.cumsum(actual_seq_lens_kv.view(-1), dim=0)
-            * head_dim_qk
-            * num_kv_heads,
+            torch.cumsum(actual_seq_lens_kv.view(-1), dim=0),
         ]
     ).int()
 
     v_indptr = torch.cat(
         [
             torch.tensor([0], device=device),
-            torch.cumsum(actual_seq_lens_kv.view(-1), dim=0)
-            * head_dim_vo
-            * num_kv_heads,
+            torch.cumsum(actual_seq_lens_kv.view(-1), dim=0),
         ]
     ).int()
 
     o_indptr = torch.cat(
         [
             torch.tensor([0], device=device),
-            torch.cumsum(actual_seq_lens_q.view(-1), dim=0)
-            * head_dim_vo
-            * num_qo_heads,
+            torch.cumsum(actual_seq_lens_q.view(-1), dim=0),
         ]
     ).int()
 

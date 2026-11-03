@@ -97,7 +97,9 @@ __global__ void RMSNormKernel(T* __restrict__ input, T* __restrict__ weight, T* 
     sum_sq += math::shfl_xor_sync(sum_sq, offset);
   }
 
-  smem[ty] = sum_sq;
+  if (tx == 0) {
+    smem[ty] = sum_sq;
+  }
   __syncthreads();
   // then, cross warp reduce sum using only the first warp
   if (ty == 0) {
@@ -106,7 +108,9 @@ __global__ void RMSNormKernel(T* __restrict__ input, T* __restrict__ weight, T* 
     for (uint32_t offset = warp_size / 2; offset > 0; offset /= 2) {
       sum_sq += math::shfl_xor_sync(sum_sq, offset);
     }
-    smem[0] = sum_sq;
+    if (tx == 0) {
+      smem[0] = sum_sq;
+    }
   }
   __syncthreads();
 
@@ -184,14 +188,14 @@ __global__ void RMSNormQuantKernel(T* __restrict__ input, T* __restrict__ weight
   const uint32_t thread_id = tx + ty * warp_size;
   const uint32_t num_threads = num_warps * warp_size;
   const uint32_t rounds = ceil_div(d, VEC_SIZE * num_threads);
-  const float scale_inv = 1.0f / scale[0];
   extern __shared__ float smem[];
 
   float sum_sq = 0.f;
 
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.wait;");
+  asm volatile("griddepcontrol.wait;" ::: "memory");
 #endif
+  const float scale_val = scale[0];
 
   for (uint32_t i = 0; i < rounds; i++) {
     vec_t<T, VEC_SIZE> input_vec;
@@ -211,7 +215,9 @@ __global__ void RMSNormQuantKernel(T* __restrict__ input, T* __restrict__ weight
     sum_sq += math::shfl_xor_sync(sum_sq, offset);
   }
 
-  smem[ty] = sum_sq;
+  if (tx == 0) {
+    smem[ty] = sum_sq;
+  }
   __syncthreads();
   // then, cross warp reduce sum using only the first warp
   if (ty == 0) {
@@ -220,11 +226,15 @@ __global__ void RMSNormQuantKernel(T* __restrict__ input, T* __restrict__ weight
     for (uint32_t offset = warp_size / 2; offset > 0; offset /= 2) {
       sum_sq += math::shfl_xor_sync(sum_sq, offset);
     }
-    smem[0] = sum_sq;
+    if (tx == 0) {
+      smem[0] = sum_sq;
+    }
   }
   __syncthreads();
 
   float rms_rcp = math::rsqrt(smem[0] / float(d) + eps);
+  // Not at the load: a reciprocal there would stall the input loads on the scale.
+  const float scale_inv = 1.0f / scale_val;
   constexpr float max_val = QuantTypeStaticVals<O>::MAX_VAL;
 
   for (uint32_t i = 0; i < rounds; i++) {
@@ -463,7 +473,9 @@ __global__ void FusedAddRMSNormKernel(T* __restrict__ input, T* __restrict__ res
     sum_sq += math::shfl_xor_sync(sum_sq, offset);
   }
 
-  smem[ty] = sum_sq;
+  if (tx == 0) {
+    smem[ty] = sum_sq;
+  }
   __syncthreads();
   // then, cross warp reduce sum using only the first warp
   if (ty == 0) {
@@ -472,7 +484,9 @@ __global__ void FusedAddRMSNormKernel(T* __restrict__ input, T* __restrict__ res
     for (uint32_t offset = warp_size / 2; offset > 0; offset /= 2) {
       sum_sq += math::shfl_xor_sync(sum_sq, offset);
     }
-    smem[0] = sum_sq;
+    if (tx == 0) {
+      smem[0] = sum_sq;
+    }
   }
   __syncthreads();
 
@@ -554,14 +568,14 @@ __global__ void FusedAddRMSNormQuantKernel(T* __restrict__ input, T* __restrict_
   const uint32_t thread_id = tx + ty * warp_size;
   const uint32_t num_threads = num_warps * warp_size;
   const uint32_t rounds = ceil_div(d, VEC_SIZE * num_threads);
-  const float scale_inv = 1.0f / scale[0];
   extern __shared__ float smem[];
   float* smem_x = smem + ceil_div(num_warps, 4) * 4;
 
   float sum_sq = 0.f;
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-  asm volatile("griddepcontrol.wait;");
+  asm volatile("griddepcontrol.wait;" ::: "memory");
 #endif
+  const float scale_val = scale[0];
 
   for (uint32_t i = 0; i < rounds; i++) {
     vec_t<T, VEC_SIZE> input_vec;
@@ -596,7 +610,9 @@ __global__ void FusedAddRMSNormQuantKernel(T* __restrict__ input, T* __restrict_
     sum_sq += math::shfl_xor_sync(sum_sq, offset);
   }
 
-  smem[ty] = sum_sq;
+  if (tx == 0) {
+    smem[ty] = sum_sq;
+  }
   __syncthreads();
   // then, cross warp reduce sum using only the first warp
   if (ty == 0) {
@@ -605,11 +621,15 @@ __global__ void FusedAddRMSNormQuantKernel(T* __restrict__ input, T* __restrict_
     for (uint32_t offset = warp_size / 2; offset > 0; offset /= 2) {
       sum_sq += math::shfl_xor_sync(sum_sq, offset);
     }
-    smem[0] = sum_sq;
+    if (tx == 0) {
+      smem[0] = sum_sq;
+    }
   }
   __syncthreads();
 
   float rms_rcp = math::rsqrt(smem[0] / float(d) + eps);
+  // Not at the load: a reciprocal there would stall the input loads on the scale.
+  const float scale_inv = 1.0f / scale_val;
   constexpr float max_val = QuantTypeStaticVals<O>::MAX_VAL;
 
   for (uint32_t i = 0; i < rounds; i++) {
@@ -724,14 +744,18 @@ __global__ void FusedAddRMSNormFP8BlockQuantKernel(
 #pragma unroll
   for (uint32_t offset = warp_size / 2; offset > 0; offset /= 2)
     sum_sq += math::shfl_xor_sync(sum_sq, offset);
-  smem[ty] = sum_sq;
+  if (tx == 0) {
+    smem[ty] = sum_sq;
+  }
   __syncthreads();
   if (ty == 0) {
     float s = (tx < num_warps) ? smem[tx] : 0.f;
 #pragma unroll
     for (uint32_t offset = warp_size / 2; offset > 0; offset /= 2)
       s += math::shfl_xor_sync(s, offset);
-    smem[0] = s;
+    if (tx == 0) {
+      smem[0] = s;
+    }
   }
   __syncthreads();
   const float rms_rcp = math::rsqrt(smem[0] / float(d) + eps);

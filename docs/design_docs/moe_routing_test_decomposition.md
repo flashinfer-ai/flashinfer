@@ -54,6 +54,14 @@ cross-product this decomposition removed; prefer the standalone file.
 
 - `tile_tokens_dim` is an explicit argument: the permutation and padding
   outputs depend on the token-tile size the downstream grouped GEMM would use.
+- Routing writes -1 to unused `permuted_idx_to_token_idx` entries within active
+  tiles to suppress TMA gathers; allocation slack beyond the actual padded count
+  stays undefined. `test_routing_tile_padding` poisons the map before eager calls
+  and graph replays, changes routing on fixed buffers, and checks live mappings,
+  tile padding, and canaries across the block, cluster, cooperative and offsets
+  paths, including expert-parallel shards.
+  Dual-tile routing fills the chosen layout through its base-tile list, so even
+  fully padded base tiles have disjoint writers and are initialized only once.
 - Routing weights are always `bfloat16` — `Routing::Runner` hard-codes
   `mDtypeOutput = Bfloat16` for every method, regardless of the logits dtype.
 - The kernels emit **no** expert ids in from-logits mode: `mPtrTopKIds` is
@@ -123,7 +131,8 @@ Executed-volume cut on the shards: 1,398 → 201 (−86%).
 
 ## Follow-ups
 
-- `num_fused_shared_experts > 0` and routing-replay output are not yet covered
-  in the standalone routing test.
+- `num_fused_shared_experts > 0` with routing replay is covered in the
+  fused-MoE tests, not here: the standalone harness would first need to build
+  fused-shared weight rows.
 - The from-logits grids could thin further once an fp8-per-tensor routed entry
   point exists; it currently has no pre-routed counterpart.

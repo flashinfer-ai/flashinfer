@@ -18,7 +18,8 @@ from benchmarks.bench_trtllm_moe_da import (
 )
 from flashinfer.autotuner import autotune
 from flashinfer.fused_moe import (
-    QuantVariant,
+    QuantConfig,
+    QuantFormat,
     TrtllmBf16Config,
     TrtllmFp4Config,
     TrtllmFp8PerTensorConfig,
@@ -567,12 +568,13 @@ def test_fp32_unpacked_routing_weights_remain_live_during_da_replay() -> None:
     assert metadata.expert_weights.data_ptr() == routing_weights.data_ptr()
     assert metadata.expert_weights.dtype == torch.float32
     hidden_quantized, hidden_scale = TrtllmFp4Config.prepare_activations(
-        hidden, variant=QuantVariant.NVFP4
+        hidden,
+        quant=QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
     )
     view = TrtllmFp4Config.prepare_weights(
         w1,
         w2,
-        variant=QuantVariant.NVFP4,
+        quant=QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
         num_local_experts=shape.local_num_experts,
         hidden_size=shape.hidden_size,
         intermediate_size=shape.intermediate_size,

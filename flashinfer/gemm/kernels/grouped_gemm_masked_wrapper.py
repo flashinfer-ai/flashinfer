@@ -165,8 +165,8 @@ def grouped_gemm_nt_masked(
 
     * ``l`` is the batch size, ``m``/``n`` are the row/column counts, and
       ``k`` is the contraction dimension.
-    * ``m/n32``, ``m/n4``, ``k4`` are the constants ``32``, ``4``, ``4``
-      respectively.
+    * ``m32`` and ``n32`` are the constants ``32``; ``m4`` and ``n4`` are the
+      constants ``4``; and ``k4`` is the constant ``4``.
     * ``m32 * m4 * rm`` equals ``M``, where ``M`` is ``m`` padded up to the
       nearest multiple of 128.
     * ``n32 * n4 * rn`` equals ``N``, where ``N`` is ``n`` padded up to the

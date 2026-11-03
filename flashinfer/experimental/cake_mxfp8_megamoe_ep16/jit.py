@@ -1,0 +1,268 @@
+"""
+Copyright (c) 2026 by FlashInfer team.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+"""
+
+# JIT loader for the generated Cake MXFP8 MegaMoE EP16 route.
+#
+# The generated sources are one architecture-neutral closure (tcgen05/TMEM
+# code, no __CUDA_ARCH__ dependence) compiled as one exact-architecture module
+# per admitted target; the sm_107a module defines its fused-grid size
+# (CAKE_MEGAMOE_GRID_CLUSTERS, _GRID_CLUSTERS below). Targets follow
+# FlashInfer's compilation context (FLASHINFER_CUDA_ARCH_LIST or the visible
+# devices), restricted to the capabilities the kernels are built for. The
+# sm_107a target needs CUDA 13.4 or newer.
+
+from __future__ import annotations
+
+import functools
+import json
+from pathlib import Path
+from typing import Any
+
+from ...compilation_context import CompilationContext
+from ...jit import env as jit_env
+from ...jit.core import (
+    JitSpec,
+    gen_jit_spec,
+    logger,
+    sm100a_nvcc_flags,
+    sm103a_nvcc_flags,
+    sm107a_nvcc_flags,
+)
+from ...jit.cpp_ext import is_cuda_version_at_least
+
+_OPERATOR_DIR = "cake_mxfp8_megamoe_ep16"
+_MANIFEST = "cake_mxfp8_megamoe_ep16_manifest.json"
+_SCHEMA = "flashinfer.experimental.source_closure.v2"
+_ARCH_FLAGS: dict[tuple[int, int], tuple[str, list[str]]] = {
+    (10, 0): ("sm_100a", sm100a_nvcc_flags),
+    (10, 3): ("sm_103a", sm103a_nvcc_flags),
+    (10, 7): ("sm_107a", sm107a_nvcc_flags),
+}
+# Capabilities whose target needs a newer CUDA toolkit than FlashInfer's minimum.
+_MIN_CUDA: dict[tuple[int, int], str] = {(10, 7): "13.4"}
+# Two-CTA clusters of the fused kernel's static grid (CAKE_MEGAMOE_GRID_CLUSTERS of the generated body and binding):
+# 72 (144 CTAs, the GB300 schedule) unless listed. R200 (212 or 216 SMs) runs the 104-cluster schedule.
+_DEFAULT_GRID_CLUSTERS = 72
+_GRID_CLUSTERS: dict[tuple[int, int], int] = {(10, 7): 104}
+SUPPORTED_CAPABILITIES = tuple(sorted(_ARCH_FLAGS))
+# The CuTe-DSL backend has one generated program per admitted architecture.
+CUTE_DSL_CAPABILITIES = SUPPORTED_CAPABILITIES
+_CUTE_DSL_ROLES = ("fused", "fused_return_all_cta", "topk_reduce")
+
+
+def _get_csrc_root() -> Path:
+    package_sources = Path(__file__).resolve().parent / "csrc"
+    if (package_sources / _OPERATOR_DIR / _MANIFEST).is_file():
+        return package_sources
+
+    raise FileNotFoundError(
+        "Cake MXFP8 MegaMoE sources were not found in the installed package or source checkout"
+    )
+
+
+def _get_flashinfer_header_dirs() -> list[Path]:
+    installed = [jit_env.FLASHINFER_CSRC_DIR, jit_env.FLASHINFER_INCLUDE_DIR]
+    if (installed[0] / "tvm_ffi_utils.h").is_file() and (
+        installed[1] / "flashinfer" / "layout.cuh"
+    ).is_file():
+        return installed
+
+    checkout = Path(__file__).resolve().parents[3]
+    source = [checkout / "csrc", checkout / "include"]
+    if (source[0] / "tvm_ffi_utils.h").is_file() and (
+        source[1] / "flashinfer" / "layout.cuh"
+    ).is_file():
+        return source
+
+    raise FileNotFoundError("FlashInfer JIT headers were not found")
+
+
+@functools.cache
+def _read_manifest() -> tuple[Path, dict[str, Any]]:
+    csrc_root = _get_csrc_root()
+    manifest = json.loads((csrc_root / _OPERATOR_DIR / _MANIFEST).read_text())
+    if manifest.get("schema") != _SCHEMA:
+        raise RuntimeError("Cake MXFP8 MegaMoE manifest has an unexpected schema")
+    sequences = manifest.get("sequences")
+    if not isinstance(sequences, list) or len(sequences) != 1:
+        raise RuntimeError("Cake MXFP8 MegaMoE manifest must contain one sequence")
+    sequence = sequences[0]
+    expected_archs = [
+        arch for _capability, (arch, _flags) in sorted(_ARCH_FLAGS.items())
+    ]
+    if (
+        sequence.get("archs") != expected_archs
+        or sequence.get("ffi_entry") != "run"
+        or sequence.get("setup_ffi_entry") != "setup_tma"
+    ):
+        raise RuntimeError("Cake MXFP8 MegaMoE manifest has an unexpected ABI")
+    units = sequence.get("translation_units")
+    if (
+        not isinstance(units, dict)
+        or not isinstance(units.get("devices"), list)
+        or not isinstance(units.get("headers"), list)
+        or not isinstance(units.get("binding"), str)
+    ):
+        raise RuntimeError("Cake MXFP8 MegaMoE manifest has invalid translation units")
+    for relative in (*units["devices"], *units["headers"], units["binding"]):
+        if not (csrc_root / Path(*Path(relative).parts[1:])).is_file():
+            raise FileNotFoundError(f"generated source not found: {relative}")
+    return csrc_root, manifest
+
+
+def supported_capabilities() -> tuple[tuple[int, int], ...]:
+    """Admitted capabilities that are also FlashInfer build targets."""
+
+    targets = CompilationContext().TARGET_CUDA_ARCHS
+    return tuple(
+        capability
+        for capability in SUPPORTED_CAPABILITIES
+        if (capability[0], f"{capability[1]}a") in targets and _has_min_cuda(capability)
+    )
+
+
+def _has_min_cuda(capability: tuple[int, int]) -> bool:
+    minimum = _MIN_CUDA.get(capability)
+    return minimum is None or is_cuda_version_at_least(minimum)
+
+
+def require_supported_capability(capability: tuple[int, int]) -> tuple[int, int]:
+    """Return ``capability`` when the route is built for it, else raise naming the fix."""
+
+    capability = (int(capability[0]), int(capability[1]))
+    if capability not in _ARCH_FLAGS:
+        supported = " or ".join(
+            f"{major}.{minor}" for major, minor in SUPPORTED_CAPABILITIES
+        )
+        raise RuntimeError(
+            f"Cake MXFP8 MegaMoE EP16 requires compute capability {supported}, got {capability[0]}.{capability[1]}"
+        )
+    if not _has_min_cuda(capability):
+        raise RuntimeError(
+            f"Cake MXFP8 MegaMoE EP16 on compute capability {capability[0]}.{capability[1]} "
+            f"requires CUDA {_MIN_CUDA[capability]} or newer"
+        )
+    if capability not in supported_capabilities():
+        raise RuntimeError(
+            f"Cake MXFP8 MegaMoE EP16 is not a build target for compute capability "
+            f"{capability[0]}.{capability[1]}; include {capability[0]}.{capability[1]}a in FLASHINFER_CUDA_ARCH_LIST"
+        )
+    return capability
+
+
+def require_cute_dsl_capability(capability: tuple[int, int]) -> tuple[int, int]:
+    """Return ``capability`` when the CuTe-DSL backend is built for it, else raise."""
+
+    capability = require_supported_capability(capability)
+    if capability not in CUTE_DSL_CAPABILITIES:
+        supported = " or ".join(
+            f"{major}.{minor}" for major, minor in CUTE_DSL_CAPABILITIES
+        )
+        raise RuntimeError(
+            f"Cake MXFP8 MegaMoE EP16 backend='cute_dsl' requires compute capability "
+            f"{supported}, got {capability[0]}.{capability[1]}; use backend='cuda'"
+        )
+    return capability
+
+
+def fused_grid_ctas(capability: tuple[int, int]) -> int:
+    """CTAs of the fused kernel's cooperative grid on an admitted capability; all must be co-resident."""
+
+    capability = (int(capability[0]), int(capability[1]))
+    return 2 * _GRID_CLUSTERS.get(capability, _DEFAULT_GRID_CLUSTERS)
+
+
+def device_arch(capability: tuple[int, int]) -> str:
+    """The exact CUDA architecture name (``sm_100a`` / ``sm_103a`` / ``sm_107a``) of an admitted capability."""
+
+    return _ARCH_FLAGS[require_supported_capability(capability)][0]
+
+
+@functools.cache
+def gen_cake_mxfp8_megamoe_ep16_module(capability: tuple[int, int]) -> JitSpec:
+    """Create the exact-architecture JIT specification for one admitted capability."""
+
+    capability = require_supported_capability(capability)
+    arch, flags = _ARCH_FLAGS[capability]
+    grid = (
+        [f"-DCAKE_MEGAMOE_GRID_CLUSTERS={_GRID_CLUSTERS[capability]}"]
+        if capability in _GRID_CLUSTERS
+        else []
+    )
+    csrc_root, manifest = _read_manifest()
+    units = manifest["sequences"][0]["translation_units"]
+    sources = [
+        csrc_root / Path(*Path(relative).parts[1:])
+        for relative in (*units["devices"], units["binding"])
+    ]
+    operator_dir = csrc_root / _OPERATOR_DIR
+    spec = gen_jit_spec(
+        name=f"{_OPERATOR_DIR}_{arch}",
+        sources=sources,
+        extra_cuda_cflags=[*flags, "--use_fast_math", *grid],
+        extra_ldflags=["-lcuda"],
+        extra_include_paths=[csrc_root, operator_dir, *_get_flashinfer_header_dirs()],
+    )
+    logger.info(f"Generated Cake MXFP8 MegaMoE JIT spec: {spec.name}")
+    return spec
+
+
+@functools.cache
+def _build_and_load(capability: tuple[int, int]) -> Any:
+    module = gen_cake_mxfp8_megamoe_ep16_module(capability).build_and_load()
+    logger.info(f"Loaded Cake MXFP8 MegaMoE EP16 module for capability {capability}")
+    return module
+
+
+def load_cake_mxfp8_megamoe_ep16_module(*, device: Any = None) -> Any:
+    """Build or load the generated module for the device's exact architecture."""
+
+    import torch
+
+    from ...utils import get_compute_capability
+
+    resolved = torch.device("cuda") if device is None else torch.device(device)
+    return _build_and_load(
+        require_supported_capability(get_compute_capability(resolved))
+    )
+
+
+def cute_dsl_source(role: str, arch: str) -> Path:
+    """Path of the generated CuTe DSL program of ``role`` for ``arch``.
+
+    ``role`` is ``fused`` (CTA-0 return), ``fused_return_all_cta`` (all-CTA
+    return) or ``topk_reduce``; ``arch`` is ``sm_100a``, ``sm_103a`` or ``sm_107a``.
+    """
+
+    if role not in _CUTE_DSL_ROLES:
+        raise ValueError(f"unknown CuTe DSL program role {role!r}")
+    csrc_root, manifest = _read_manifest()
+    relative = manifest["sequences"][0]["cute_dsl"][role][arch]
+    return csrc_root / Path(*Path(relative).parts[1:])
+
+
+__all__ = [
+    "CUTE_DSL_CAPABILITIES",
+    "SUPPORTED_CAPABILITIES",
+    "cute_dsl_source",
+    "device_arch",
+    "fused_grid_ctas",
+    "gen_cake_mxfp8_megamoe_ep16_module",
+    "load_cake_mxfp8_megamoe_ep16_module",
+    "require_cute_dsl_capability",
+    "require_supported_capability",
+    "supported_capabilities",
+]

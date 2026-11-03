@@ -9,11 +9,11 @@ from .algo_knobs import AlgoKnob
 from .config import BootstrapConfig, FleetParams
 from .core.kernel.registry import is_mega_kernel_config, is_split_kernel_config
 from .modes.config import MegaConfig, SplitConfig
-from .modes.mega_layer import MoEEpMegaLayer
+from .modes.mega_layer import MoEEpMegaLayer, MoEEpMegaWorkspace
 from .modes.split_layer import MoEEpSplitLayer
 from .weights import MoEWeightPack
 
-__all__ = ["MoEEpLayer", "MoEEpMegaLayer", "MoEEpSplitLayer"]
+__all__ = ["MoEEpLayer", "MoEEpMegaLayer", "MoEEpMegaWorkspace", "MoEEpSplitLayer"]
 
 
 def MoEEpLayer(

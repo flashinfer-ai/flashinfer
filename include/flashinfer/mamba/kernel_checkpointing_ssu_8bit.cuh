@@ -257,11 +257,12 @@ __forceinline__ __device__ auto convert_layout_acc_Aregs_sm80(Layout acc_layout)
 // The caller's single __syncthreads between all replay passes and
 // compute_output_8bit provides smem.CB_scaled / smem.x / smem.z visibility.
 template <typename input_t, typename state_t, int DIM, int D_PER_CTA, int DSTATE, typename SmemT,
-          typename FragYDxT>
+          typename FragYDxT, bool SEPARATE_SCALE_INPUT = false>
 __device__ __forceinline__ void replay_state_mma_8bit_chain(
     SmemT& smem, CheckpointingSsuParams const& params, int warp, int lane, int prev_k, int d_tile,
     int64_t cache_slot, int head, bool must_checkpoint, FragYDxT& frag_y_DxT,
-    float (&encode_scale_per_row_out)[2], float (&total_scale_out)[2]) {
+    float (&encode_scale_per_row_out)[2], float (&total_scale_out)[2],
+    float const* separate_state_scale_input = nullptr, int64_t separate_state_scale_base = 0) {
   using namespace cute;
   static_assert(sizeof(input_t) == 2, "replay_state_mma_8bit_chain requires 2-byte input_t");
   static_assert(sizeof(state_t) == 1,
@@ -311,12 +312,20 @@ __device__ __forceinline__ void replay_state_mma_8bit_chain(
   int const warp_d_base = warp * M_PER_WARP;
 
   // ── Per-row decode_scale for state init.
-  auto const* __restrict__ state_scale_ptr = reinterpret_cast<float const*>(params.state_scale);
+  auto const* __restrict__ state_scale_ptr = [&] {
+    if constexpr (SEPARATE_SCALE_INPUT) {
+      return separate_state_scale_input;
+    } else {
+      return reinterpret_cast<float const*>(params.state_scale);
+    }
+  }();
   int64_t const state_scale_base = cache_slot * params.state_scale_stride_seq +
                                    (int64_t)head * DIM + (int64_t)d_tile * D_PER_CTA;
+  int64_t const state_scale_read_base =
+      SEPARATE_SCALE_INPUT ? separate_state_scale_base : state_scale_base;
   float decode_scale_in[D_ROWS_PER_THREAD];
-  decode_scale_in[0] = state_scale_ptr[state_scale_base + warp_d_base + lane_d];
-  decode_scale_in[1] = state_scale_ptr[state_scale_base + warp_d_base + lane_d + 8];
+  decode_scale_in[0] = state_scale_ptr[state_scale_read_base + warp_d_base + lane_d];
+  decode_scale_in[1] = state_scale_ptr[state_scale_read_base + warp_d_base + lane_d + 8];
   float total_scale[D_ROWS_PER_THREAD];
   total_scale[0] = decode_scale_in[0] * total_decay;
   total_scale[1] = decode_scale_in[1] * total_decay;

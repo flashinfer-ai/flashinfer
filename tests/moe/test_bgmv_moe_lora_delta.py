@@ -37,8 +37,9 @@ from flashinfer.fused_moe import (
     fill_w_ptr,
 )
 
-# BGMV MoE kernels are validated on SM90 (H100) and SM100/103 (Blackwell).
-_SUPPORTED_SM = {90, 100, 103}
+# BGMV MoE kernels are validated on SM90 (H100) and SM100/103/107
+# (datacenter Blackwell and Rubin).
+_SUPPORTED_SM = {90, 100, 103, 107}
 
 
 def _skip_if_unsupported_sm():

@@ -22,7 +22,7 @@ import pytest
 # cutedsl_megamoe shim public API (including the torch reference it re-exports);
 # it never imports the src/ kernel packages directly, so a new src/ drop can't
 # silently break it.
-pytest.importorskip("flashinfer.moe_ep.kernel_src.cutedsl_megamoe")
+pytest.importorskip("flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe")
 
 
 def _require_cuda():
@@ -135,45 +135,11 @@ def _plain_mxfp8_from_bf16(problem: dict):
     )
 
 
-def _assert_mega_oracle_term_band_close(y_kernel, combine_ref, *, ikr, label=""):
-    """Kernel-vs-torch-oracle compare with a per-cell TERM-magnitude band.
-
-    The kernel rounds each per-topk fc2 term to bf16 before the combine, so
-    where large terms nearly cancel (terms ~±2000 summing to ~100) the
-    achievable agreement is bounded by the bf16 round-off of the TERMS
-    (2^-8 x sum_k |term_k| per cell), not of the final value — a flat atol
-    calibrated on one arch's rounding trips on another's (1-cell |d|=16 vs
-    atol=8 seen on B200 with a GB200-calibrated flat band). ``combine_ref``
-    is the oracle's pre-reduce (tokens, topk, hidden) term stack, so the band
-    is exact per cell. Coefficient: non-ikr terms take one bf16 round-trip
-    (<=1 ULP each, safety 2); the ikr REDG reduce additionally accumulates
-    the K terms in nondeterministic bf16 order (safety 8, mirroring
-    ``_assert_ikr_close``). Sum_k |term_k| already carries the K factor.
-    """
-    import torch
-
-    yk = y_kernel.to(torch.float32)
-    terms = combine_ref.to(torch.float32)
-    y_ref = terms.sum(dim=1)
-    diff = (yk - y_ref).abs()
-    term_band = terms.abs().sum(dim=1)
-    coeff = 8.0 if ikr else 2.0
-    tol = 1.0 + 0.05 * y_ref.abs() + coeff * 2.0**-8 * term_band
-    overshoot = diff - tol
-    worst = overshoot.max().item()
-    flat = overshoot.argmax().item()
-    t, h = divmod(flat, overshoot.shape[1])
-    print(
-        f"[mega oracle term-band{' ' + label if label else ''} ikr={ikr}] "
-        f"worst margin {-worst:.4g} at cell ({t},{h}): "
-        f"|d|={diff[t, h].item():.4g} tol={tol[t, h].item():.4g} "
-        f"sum|terms|={term_band[t, h].item():.4g} ref={y_ref[t, h].item():.4g}"
-    )
-    assert worst <= 0.0, (
-        f"oracle output outside the bf16 term-magnitude band "
-        f"(worst overshoot {worst:.4f} at cell ({t},{h}): |d|={diff[t, h].item():.4f} "
-        f"tol={tol[t, h].item():.4f} sum|terms|={term_band[t, h].item():.4f})"
-    )
+# Shared with the sm120 twin (the kernel trees are process-exclusive, so the
+# band helper lives in an arch-free module both suites can import).
+from .mega_oracle_compare import (  # noqa: E402
+    _assert_mega_oracle_term_band_close,
+)
 
 
 @pytest.mark.arch_blackwell
@@ -231,7 +197,7 @@ def test_mxfp8_preprocess_accepts_sglang_canonical_prequantized_weights():
     # Verify only against the cutedsl_megamoe shim boundary: pull constants and
     # reference tensor-makers from the package public API, never from the src/
     # kernel packages directly (so a new src/ drop can't silently break tests).
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
         Mxfp8BlockSize,
         Mxfp8ScaleDtype,
         _make_e8m0_scale_tensor,
@@ -329,7 +295,7 @@ def test_mxfp8_preprocess_and_kernel_match_mega_reference(monkeypatch):
             f"mxfp8_mega_moe requires sm_100a or sm_103a; got sm_{cap[0]}{cap[1]}"
         )
 
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
         get_symm_buffer_for_mxfp8_mega_moe,
         mxfp8_mega_moe,
     )
@@ -343,7 +309,7 @@ def test_mxfp8_preprocess_and_kernel_match_mega_reference(monkeypatch):
 
     # The MXFP8 torch reference is consumed via the shim boundary, not the src/
     # package directly, so tests verify against a stable public surface.
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
         compute_megamoe_reference_mxfp8,
     )
 
@@ -403,8 +369,8 @@ def test_mxfp8_preprocess_and_kernel_match_mega_reference(monkeypatch):
         topk_idx = symm_buffer.topk_idx[:num_tokens]
         topk_weights = symm_buffer.topk_weights[:num_tokens]
 
-        # The kernel folds the per-token topk weight into fc1 (apply_topk_in_fc1
-        # defaults to True) *before* the MXFP8 fc1-out round-trip; post-hoc
+        # The kernel folds the routing weight in before the MXFP8 FC1-output
+        # round-trip; post-hoc
         # weighting would NOT match, because the quant step changes the effective
         # magnitude. Apply it in the reference the same way and reduce with a
         # plain sum over topk (the weight is already folded in).
@@ -419,7 +385,7 @@ def test_mxfp8_preprocess_and_kernel_match_mega_reference(monkeypatch):
             fc2_weight_sf=fc2_plain_sf.unsqueeze(0),
             ab_dtype=data_dtype,
             gate_up_clamp=problem["gate_up_clamp"],
-            apply_topk_in_fc1=True,
+            apply_routing_weights_before_fc2=True,
         )
         y_kernel = torch.empty(
             num_tokens, problem["hidden"], dtype=torch.bfloat16, device="cuda"

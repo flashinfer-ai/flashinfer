@@ -1,0 +1,15 @@
+{
+  "repository": "https://github.com/NVlabs/kda",
+  "revision": "ea37ebaff74c88a2545751dcb8ea8ef6c6251b67",
+  "source_directory": "ptx/kda_ptx/shims",
+  "upstream_kernel_revision": "82a6a79",
+  "target": "sm_103a",
+  "ptx_version": "9.2",
+  "sha256": {
+    "fixed_h64.ptx": "d2f53ca43e4df55efb83957efedbfe010029eb91ef16968467e49fcaf025bb6f",
+    "fixed_h96.ptx": "3f089e6801e0162121969ca53bb2128d5ca20aeea793d2ee7db88ee137407010",
+    "varlen_mixed_h64.ptx": "46e000e9808298bd731d0d74d4e18f75249d0d6506075a54e81afe43e3073f83",
+    "varlen_uniform_h64.ptx": "4f6d8dd1e4c3bb9f92271bfb9b37e5081639ab38b8dbabcd27919d6f1f8fda5a"
+  },
+  "host_shim": "shim.cc and programs.json are FlashInfer-authored, derived from the imported per-program shims"
+}

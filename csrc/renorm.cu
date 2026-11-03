@@ -60,7 +60,7 @@ void top_p_renorm_probs(TensorView probs, TensorView renorm_probs,
 
 void top_k_renorm_probs(TensorView probs, TensorView renorm_probs,
                         Optional<TensorView> maybe_top_k_arr, int64_t top_k_val,
-                        TensorView row_states_buffer) {
+                        bool is_deterministic, TensorView row_states_buffer) {
   CHECK_INPUT(probs);
   CHECK_INPUT(row_states_buffer);
   CHECK_DIM(2, probs);  // probs: (batch_size, vocab_size)
@@ -81,7 +81,7 @@ void top_k_renorm_probs(TensorView probs, TensorView renorm_probs,
         static_cast<c_type*>(probs.data_ptr()), static_cast<c_type*>(renorm_probs.data_ptr()),
         has_top_k_arr ? static_cast<int*>(maybe_top_k_arr.value().data_ptr()) : nullptr, batch_size,
         top_k_val, vocab_size, static_cast<sampling::RadixRowState*>(row_states_buffer.data_ptr()),
-        stream);
+        is_deterministic, stream);
     return true;
   });
 

@@ -627,9 +627,33 @@ class MoEDynamicKernel:
         )
         sfa_tensor = cute.make_tensor(sfa_ptr, sfa_layout)
 
-        # SF tensor for w13 (gated: gate+up concatenated; relu2: single W1)
+        # w13 packs [up, gate] rows of fc1_branch_rows each (gated), or one
+        # branch (relu2). Each branch gets its own weight view and TMA
+        # descriptor bounded by its own rows, so a partial last N tile reads
+        # zeros rather than the next branch: the intermediate size need not be
+        # a multiple of the N tile. The branch scale factors each start on a
+        # 128-row block (see moe_dispatch._prepare_weight_views).
+        fc1_branch_rows = b_w13.shape[0] // 2 if self.is_gated else b_w13.shape[0]
+        sfb_branch_rows = (fc1_branch_rows + 127) // 128 * 128
+        self.sfb_gate_tile_offset = sfb_branch_rows // self.tile_shape_mnk[1]
+        branch_layout = cute.make_layout(
+            (fc1_branch_rows, b_w13.shape[1], b_w13.shape[2]), stride=b_w13.stride
+        )
+        b_w13_up = cute.make_tensor(b_w13.iterator, branch_layout)
+        b_w13_gate = (
+            cute.make_tensor(
+                b_w13.iterator + fc1_branch_rows * b_w13.stride[0], branch_layout
+            )
+            if self.is_gated
+            else b_w13_up
+        )
         sfb_w13_layout = blockscaled_utils.tile_atom_to_shape_SF(
-            b_w13.shape, self.sf_vec_size
+            (
+                (2 if self.is_gated else 1) * sfb_branch_rows,
+                b_w13.shape[1],
+                b_w13.shape[2],
+            ),
+            self.sf_vec_size,
         )
         sfb_w13_tensor = cute.make_tensor(sfb_w13_ptr, sfb_w13_layout)
 
@@ -647,10 +671,16 @@ class MoEDynamicKernel:
             1,
             internal_type=cutlass.Int16,
         )
-        # Single TMA descriptor over w13. Gated: [2*I_tp, K, E]; relu2: [I_tp, K, E].
-        # Up tiles at N=0..I_tp/tile_N-1, gate tiles at N=I_tp/tile_N..2*I_tp/tile_N-1.
+        # One TMA descriptor per w13 branch: gate (or the single relu2
+        # branch) and up.
         tma_b_w13, gB_w13 = self._dense_cls._make_tma_atoms_and_tensors(
-            b_w13,
+            b_w13_gate,
+            self.b_smem_layout_staged,
+            (self.tile_shape_mnk[1], self.tile_shape_mnk[2]),
+            1,
+        )
+        tma_b_w13_up, gB_w13_up = self._dense_cls._make_tma_atoms_and_tensors(
+            b_w13_up,
             self.b_smem_layout_staged,
             (self.tile_shape_mnk[1], self.tile_shape_mnk[2]),
             1,
@@ -664,7 +694,8 @@ class MoEDynamicKernel:
         )
         # B_down TMA
         sfb_down_layout = blockscaled_utils.tile_atom_to_shape_SF(
-            b_down.shape, self.sf_vec_size
+            (b_down.shape[0], (b_down.shape[1] + 127) // 128 * 128, b_down.shape[2]),
+            self.sf_vec_size,
         )
         sfb_down_tensor = cute.make_tensor(sfb_down_ptr, sfb_down_layout)
         tma_b_down, gB_down = self._dense_cls._make_tma_atoms_and_tensors(
@@ -681,9 +712,9 @@ class MoEDynamicKernel:
             internal_type=cutlass.Int16,
         )
 
-        gate_tile_cnt = Int32(b_w13.shape[0]) // Int32(self.tile_shape_mnk[1])
-        if self.is_gated:
-            gate_tile_cnt = gate_tile_cnt // Int32(2)
+        gate_tile_cnt = Int32(
+            (fc1_branch_rows + self.tile_shape_mnk[1] - 1) // self.tile_shape_mnk[1]
+        )
         launch_params = DynamicLaunchParams(row_counts, gate_tile_cnt)
         grid = (*self.cluster_shape_mn, max_active_clusters)
         self.kernel(
@@ -705,6 +736,8 @@ class MoEDynamicKernel:
             gSFA,
             tma_b_w13,
             gB_w13,
+            tma_b_w13_up,
+            gB_w13_up,
             tma_sfb_w13,
             gSFB_w13,
             tma_b_down,
@@ -760,6 +793,8 @@ class MoEDynamicKernel:
         mSFA: cute.Tensor,
         tma_b_w13: cute.CopyAtom,
         mB_w13: cute.Tensor,
+        tma_b_w13_up: cute.CopyAtom,
+        mB_w13_up: cute.Tensor,
         tma_sfb_w13: cute.CopyAtom,
         mSFB_w13: cute.Tensor,
         tma_b_down: cute.CopyAtom,
@@ -799,6 +834,8 @@ class MoEDynamicKernel:
             cpasync.prefetch_descriptor(tma_a)
             cpasync.prefetch_descriptor(tma_sfa)
             cpasync.prefetch_descriptor(tma_b_w13)
+            if cutlass.const_expr(self.is_gated):
+                cpasync.prefetch_descriptor(tma_b_w13_up)
             cpasync.prefetch_descriptor(tma_sfb_w13)
             cpasync.prefetch_descriptor(tma_b_down)
             cpasync.prefetch_descriptor(tma_sfb_down)
@@ -1054,7 +1091,9 @@ class MoEDynamicKernel:
         hist_idx = flat_tid
         while hist_idx < total_pairs:
             expert_id = topk_ids[hist_idx].to(Int32)
-            atomic_add_global_i32(get_ptr_as_int64(row_counts, expert_id), Int32(1))
+            # A negative id marks an unrouted pair; it takes no row.
+            if expert_id >= Int32(0):
+                atomic_add_global_i32(get_ptr_as_int64(row_counts, expert_id), Int32(1))
             hist_idx += flat_stride
 
         self._resident_grid_barrier(
@@ -1134,23 +1173,29 @@ class MoEDynamicKernel:
                             while topk_slot < num_topk:
                                 pair_idx = token_idx * num_topk + topk_slot
                                 expert_id = topk_ids[pair_idx].to(Int32)
-                                weight = topk_weights[pair_idx].to(cutlass.Float32)
-                                row = atomic_add_global_i32(
-                                    get_ptr_as_int64(expert_write_rows, expert_id),
-                                    Int32(1),
-                                )
-                                phys_tile = expert_tile_base[expert_id] + row // Int32(
-                                    self.tile_shape_mnk[0]
-                                )
-                                phys_row = phys_tile * Int32(
-                                    self.tile_shape_mnk[0]
-                                ) + row % Int32(self.tile_shape_mnk[0])
-                                st_global_i32(
-                                    get_ptr_as_int64(token_map, phys_row), token_idx
-                                )
-                                st_global_f32(
-                                    get_ptr_as_int64(token_weights, phys_row), weight
-                                )
+                                # Unrouted slots keep phys_row -1 and are
+                                # skipped by the packing stores below.
+                                phys_row = Int32(-1)
+                                if expert_id >= Int32(0):
+                                    weight = topk_weights[pair_idx].to(cutlass.Float32)
+                                    row = atomic_add_global_i32(
+                                        get_ptr_as_int64(expert_write_rows, expert_id),
+                                        Int32(1),
+                                    )
+                                    phys_tile = expert_tile_base[
+                                        expert_id
+                                    ] + row // Int32(self.tile_shape_mnk[0])
+                                    phys_row = phys_tile * Int32(
+                                        self.tile_shape_mnk[0]
+                                    ) + row % Int32(self.tile_shape_mnk[0])
+                                    st_global_i32(
+                                        get_ptr_as_int64(token_map, phys_row),
+                                        token_idx,
+                                    )
+                                    st_global_f32(
+                                        get_ptr_as_int64(token_weights, phys_row),
+                                        weight,
+                                    )
                                 slot = route_slot_base + topk_slot
                                 _st_shared_i32(
                                     route_phys_rows_addr + slot * Int32(4), phys_row
@@ -1222,26 +1267,27 @@ class MoEDynamicKernel:
                                     sf_idx % Int32(4)
                                 )
                                 for cache_slot in cutlass.range_constexpr(8):
-                                    output_offset = route_output_base[
-                                        cache_slot
-                                    ] + sf_idx * Int32(self.sf_vec_size // 2)
-                                    st_global_u64(
-                                        get_ptr_as_int64(
-                                            packed_a_storage, output_offset
-                                        ),
-                                        packed_lo,
-                                    )
-                                    if cutlass.const_expr(self.sf_vec_size == 32):
+                                    if route_output_base[cache_slot] >= Int32(0):
+                                        output_offset = route_output_base[
+                                            cache_slot
+                                        ] + sf_idx * Int32(self.sf_vec_size // 2)
                                         st_global_u64(
                                             get_ptr_as_int64(
-                                                packed_a_storage,
-                                                output_offset + Int32(8),
+                                                packed_a_storage, output_offset
                                             ),
-                                            packed_hi,
+                                            packed_lo,
                                         )
-                                    scale_storage[
-                                        route_scale_base[cache_slot] + scale_k_base
-                                    ] = scale_byte
+                                        if cutlass.const_expr(self.sf_vec_size == 32):
+                                            st_global_u64(
+                                                get_ptr_as_int64(
+                                                    packed_a_storage,
+                                                    output_offset + Int32(8),
+                                                ),
+                                                packed_hi,
+                                            )
+                                        scale_storage[
+                                            route_scale_base[cache_slot] + scale_k_base
+                                        ] = scale_byte
                                 sf_idx += Int32(32)
                         else:
                             sf_idx = lane_id
@@ -1284,9 +1330,136 @@ class MoEDynamicKernel:
                                     phys_row = _ld_shared_i32(
                                         route_phys_rows_addr + slot * Int32(4)
                                     )
+                                    if phys_row >= Int32(0):
+                                        output_offset = (
+                                            phys_row * output_bytes_per_row
+                                            + sf_idx * Int32(self.sf_vec_size // 2)
+                                        )
+                                        st_global_u64(
+                                            get_ptr_as_int64(
+                                                packed_a_storage, output_offset
+                                            ),
+                                            packed_lo,
+                                        )
+                                        if cutlass.const_expr(self.sf_vec_size == 32):
+                                            st_global_u64(
+                                                get_ptr_as_int64(
+                                                    packed_a_storage,
+                                                    output_offset + Int32(8),
+                                                ),
+                                                packed_hi,
+                                            )
+                                        # Scale storage is tiled in 128-row SF
+                                        # atoms, not MMA tiles.
+                                        k_tile_idx = sf_idx // Int32(4)
+                                        sf_atom = phys_row >> Int32(7)
+                                        sf_row = phys_row & Int32(127)
+                                        outer_m_idx = sf_row % Int32(32)
+                                        inner_m_idx = sf_row // Int32(32)
+                                        inner_k_idx = sf_idx % Int32(4)
+                                        scale_offset = (
+                                            sf_atom * num_k_tiles * Int32(32 * 4 * 4)
+                                            + k_tile_idx * Int32(32 * 4 * 4)
+                                            + outer_m_idx * Int32(4 * 4)
+                                            + inner_m_idx * Int32(4)
+                                            + inner_k_idx
+                                        )
+                                        scale_storage[scale_offset] = scale_byte
+                                    topk_slot += Int32(1)
+                                sf_idx += Int32(32)
+
+                else:
+                    warp_item = Int32(0)
+                    while warp_item < Int32(_PRODUCER_PAIRS_PER_WARP):
+                        pair_idx = batch_base + warp_idx + warp_item * num_cta_warps
+                        expert_id = Int32(0)
+                        token_idx = Int32(0)
+                        weight = cutlass.Float32(0.0)
+                        row = Int32(0)
+                        phys_tile = Int32(0)
+                        if pair_idx < total_pairs:
+                            expert_id = topk_ids[pair_idx].to(Int32)
+                            # A negative id marks an unrouted pair.
+                            if expert_id >= Int32(0):
+                                token_idx = pair_idx // num_topk
+                                weight = topk_weights[pair_idx].to(cutlass.Float32)
+
+                                if lane_id == Int32(0):
+                                    row = atomic_add_global_i32(
+                                        get_ptr_as_int64(expert_write_rows, expert_id),
+                                        Int32(1),
+                                    )
+                                    phys_tile = expert_tile_base[
+                                        expert_id
+                                    ] + row // Int32(self.tile_shape_mnk[0])
+                                    phys_row = phys_tile * Int32(
+                                        self.tile_shape_mnk[0]
+                                    ) + row % Int32(self.tile_shape_mnk[0])
+                                    st_global_i32(
+                                        get_ptr_as_int64(token_map, phys_row), token_idx
+                                    )
+                                    st_global_f32(
+                                        get_ptr_as_int64(token_weights, phys_row),
+                                        weight,
+                                    )
+
+                                row = cute.arch.shuffle_sync(row, Int32(0))
+                                phys_tile = cute.arch.shuffle_sync(phys_tile, Int32(0))
+                                expert_id = cute.arch.shuffle_sync(expert_id, Int32(0))
+                                token_idx = cute.arch.shuffle_sync(token_idx, Int32(0))
+
+                                gs_value = input_global_scale[expert_id].to(
+                                    cutlass.Float32
+                                )
+                                if (
+                                    self.input_scales_are_reciprocal
+                                    and gs_value != cutlass.Float32(0.0)
+                                ):
+                                    if self.fast_math:
+                                        gs_value = rcp_approx_ftz(gs_value)
+                                    else:
+                                        gs_value = cutlass.Float32(1.0) / gs_value
+                                sf_idx = lane_id
+                                while sf_idx < sf_blocks_per_row:
+                                    block_start = sf_idx * Int32(self.sf_vec_size)
+                                    values = cute.make_rmem_tensor(
+                                        (self.sf_vec_size,), cutlass.Float32
+                                    )
+                                    block_max = cutlass.Float32(0.0)
+                                    for elem_idx in cutlass.range_constexpr(
+                                        self.sf_vec_size
+                                    ):
+                                        value = cutlass.Float32(
+                                            a_input[
+                                                token_idx, block_start + Int32(elem_idx)
+                                            ]
+                                        )
+                                        values[elem_idx] = value
+                                        block_max = fmax_f32(block_max, fabs_f32(value))
+                                    scale_byte = Uint8(0)
+                                    if cutlass.const_expr(self.sf_vec_size == 32):
+                                        packed_lo, packed_hi, scale_byte = (
+                                            quantize_block_mxfp4(values, block_max)
+                                        )
+                                    else:
+                                        packed_lo = Uint64(0)
+                                        packed_hi = Uint64(0)
+                                        if self.fast_math:
+                                            packed_lo, scale_byte = (
+                                                quantize_block_fp4_fast(
+                                                    values, block_max, gs_value
+                                                )
+                                            )
+                                        else:
+                                            packed_lo, scale_byte = quantize_block_fp4(
+                                                values, block_max, gs_value
+                                            )
+
                                     output_offset = (
-                                        phys_row * output_bytes_per_row
-                                        + sf_idx * Int32(self.sf_vec_size // 2)
+                                        phys_tile * Int32(self.tile_shape_mnk[0])
+                                        + row % Int32(self.tile_shape_mnk[0])
+                                    ) * output_bytes_per_row + sf_idx * Int32(
+                                        self.sf_vec_size // 2
                                     )
                                     st_global_u64(
                                         get_ptr_as_int64(
@@ -1302,142 +1475,25 @@ class MoEDynamicKernel:
                                             ),
                                             packed_hi,
                                         )
-                                    # Scale storage is tiled in 128-row SF
-                                    # atoms, not MMA tiles.
+
+                                    # Scale storage is tiled in 128-row SF atoms,
+                                    # not MMA tiles.
                                     k_tile_idx = sf_idx // Int32(4)
+                                    inner_k_idx = sf_idx % Int32(4)
+                                    phys_row = phys_tile * Int32(
+                                        self.tile_shape_mnk[0]
+                                    ) + row % Int32(self.tile_shape_mnk[0])
                                     sf_atom = phys_row >> Int32(7)
                                     sf_row = phys_row & Int32(127)
-                                    outer_m_idx = sf_row % Int32(32)
-                                    inner_m_idx = sf_row // Int32(32)
-                                    inner_k_idx = sf_idx % Int32(4)
                                     scale_offset = (
                                         sf_atom * num_k_tiles * Int32(32 * 4 * 4)
                                         + k_tile_idx * Int32(32 * 4 * 4)
-                                        + outer_m_idx * Int32(4 * 4)
-                                        + inner_m_idx * Int32(4)
+                                        + (sf_row % Int32(32)) * Int32(4 * 4)
+                                        + (sf_row // Int32(32)) * Int32(4)
                                         + inner_k_idx
                                     )
                                     scale_storage[scale_offset] = scale_byte
-                                    topk_slot += Int32(1)
-                                sf_idx += Int32(32)
-
-                else:
-                    warp_item = Int32(0)
-                    while warp_item < Int32(_PRODUCER_PAIRS_PER_WARP):
-                        pair_idx = batch_base + warp_idx + warp_item * num_cta_warps
-                        expert_id = Int32(0)
-                        token_idx = Int32(0)
-                        weight = cutlass.Float32(0.0)
-                        row = Int32(0)
-                        phys_tile = Int32(0)
-                        if pair_idx < total_pairs:
-                            expert_id = topk_ids[pair_idx].to(Int32)
-                            token_idx = pair_idx // num_topk
-                            weight = topk_weights[pair_idx].to(cutlass.Float32)
-
-                            if lane_id == Int32(0):
-                                row = atomic_add_global_i32(
-                                    get_ptr_as_int64(expert_write_rows, expert_id),
-                                    Int32(1),
-                                )
-                                phys_tile = expert_tile_base[expert_id] + row // Int32(
-                                    self.tile_shape_mnk[0]
-                                )
-                                phys_row = phys_tile * Int32(
-                                    self.tile_shape_mnk[0]
-                                ) + row % Int32(self.tile_shape_mnk[0])
-                                st_global_i32(
-                                    get_ptr_as_int64(token_map, phys_row), token_idx
-                                )
-                                st_global_f32(
-                                    get_ptr_as_int64(token_weights, phys_row), weight
-                                )
-
-                            row = cute.arch.shuffle_sync(row, Int32(0))
-                            phys_tile = cute.arch.shuffle_sync(phys_tile, Int32(0))
-                            expert_id = cute.arch.shuffle_sync(expert_id, Int32(0))
-                            token_idx = cute.arch.shuffle_sync(token_idx, Int32(0))
-
-                            gs_value = input_global_scale[expert_id].to(cutlass.Float32)
-                            if (
-                                self.input_scales_are_reciprocal
-                                and gs_value != cutlass.Float32(0.0)
-                            ):
-                                if self.fast_math:
-                                    gs_value = rcp_approx_ftz(gs_value)
-                                else:
-                                    gs_value = cutlass.Float32(1.0) / gs_value
-                            sf_idx = lane_id
-                            while sf_idx < sf_blocks_per_row:
-                                block_start = sf_idx * Int32(self.sf_vec_size)
-                                values = cute.make_rmem_tensor(
-                                    (self.sf_vec_size,), cutlass.Float32
-                                )
-                                block_max = cutlass.Float32(0.0)
-                                for elem_idx in cutlass.range_constexpr(
-                                    self.sf_vec_size
-                                ):
-                                    value = cutlass.Float32(
-                                        a_input[
-                                            token_idx, block_start + Int32(elem_idx)
-                                        ]
-                                    )
-                                    values[elem_idx] = value
-                                    block_max = fmax_f32(block_max, fabs_f32(value))
-                                scale_byte = Uint8(0)
-                                if cutlass.const_expr(self.sf_vec_size == 32):
-                                    packed_lo, packed_hi, scale_byte = (
-                                        quantize_block_mxfp4(values, block_max)
-                                    )
-                                else:
-                                    packed_lo = Uint64(0)
-                                    packed_hi = Uint64(0)
-                                    if self.fast_math:
-                                        packed_lo, scale_byte = quantize_block_fp4_fast(
-                                            values, block_max, gs_value
-                                        )
-                                    else:
-                                        packed_lo, scale_byte = quantize_block_fp4(
-                                            values, block_max, gs_value
-                                        )
-
-                                output_offset = (
-                                    phys_tile * Int32(self.tile_shape_mnk[0])
-                                    + row % Int32(self.tile_shape_mnk[0])
-                                ) * output_bytes_per_row + sf_idx * Int32(
-                                    self.sf_vec_size // 2
-                                )
-                                st_global_u64(
-                                    get_ptr_as_int64(packed_a_storage, output_offset),
-                                    packed_lo,
-                                )
-                                if cutlass.const_expr(self.sf_vec_size == 32):
-                                    st_global_u64(
-                                        get_ptr_as_int64(
-                                            packed_a_storage,
-                                            output_offset + Int32(8),
-                                        ),
-                                        packed_hi,
-                                    )
-
-                                # Scale storage is tiled in 128-row SF atoms,
-                                # not MMA tiles.
-                                k_tile_idx = sf_idx // Int32(4)
-                                inner_k_idx = sf_idx % Int32(4)
-                                phys_row = phys_tile * Int32(
-                                    self.tile_shape_mnk[0]
-                                ) + row % Int32(self.tile_shape_mnk[0])
-                                sf_atom = phys_row >> Int32(7)
-                                sf_row = phys_row & Int32(127)
-                                scale_offset = (
-                                    sf_atom * num_k_tiles * Int32(32 * 4 * 4)
-                                    + k_tile_idx * Int32(32 * 4 * 4)
-                                    + (sf_row % Int32(32)) * Int32(4 * 4)
-                                    + (sf_row // Int32(32)) * Int32(4)
-                                    + inner_k_idx
-                                )
-                                scale_storage[scale_offset] = scale_byte
-                                sf_idx += Int32(32)
+                                    sf_idx += Int32(32)
 
                         warp_item += Int32(1)
 
@@ -1493,13 +1549,16 @@ class MoEDynamicKernel:
         )
 
         gA = cute.local_tile(mA, self.sa_tile_shape_mk, (None, None, None))
-        # Tiled view over w13.
-        # Gated: [2*I_tp, K, E] packed as [up, gate] across N.
-        #   Up tiles: N-indices 0..gate_tile_cnt-1
-        #   Gate tiles: N-indices gate_tile_cnt..2*gate_tile_cnt-1
-        # ReLU2: [I_tp, K, E] single FC1 pass, gate_tile_cnt == intermediate_tile_cnt.
+        # One tiled view per w13 branch (relu2 has only the first); both share
+        # N-tile indices 0..gate_tile_cnt-1. Scale factors keep one [up, gate]
+        # view whose gate branch starts sfb_gate_tile_offset N tiles in.
         gB_w13_tiled = cute.local_tile(
             mB_w13,
+            cute.slice_(self.tile_shape_mnk, (0, None, None)),
+            (None, None, None),
+        )
+        gB_w13_up_tiled = cute.local_tile(
+            mB_w13_up,
             cute.slice_(self.tile_shape_mnk, (0, None, None)),
             (None, None, None),
         )
@@ -1533,7 +1592,8 @@ class MoEDynamicKernel:
         tAsSFA = cute.filter_zeros(tAsSFA)
         tAgSFA = cute.filter_zeros(tAgSFA)
 
-        # w13 TMA partition (gated: gate+up concatenated; relu2: single W1)
+        # w13 TMA partitions: gate (or the single relu2 branch) into sB, up
+        # into sB_up.
         tBsB_w13, tBgB_w13 = cpasync.tma_partition(
             tma_b_w13,
             b_cta_crd,
@@ -1541,12 +1601,12 @@ class MoEDynamicKernel:
             cute.group_modes(sB, 0, 2),
             cute.group_modes(gB_w13_tiled, 0, 2),
         )
-        tBsB_w13_up, _ = cpasync.tma_partition(
-            tma_b_w13,
+        tBsB_w13_up, tBgB_w13_up = cpasync.tma_partition(
+            tma_b_w13_up,
             b_cta_crd,
             b_cta_layout,
             cute.group_modes(sB_up, 0, 2),
-            cute.group_modes(gB_w13_tiled, 0, 2),
+            cute.group_modes(gB_w13_up_tiled, 0, 2),
         )
         tBsSFB_w13, tBgSFB_w13 = cpasync.tma_partition(
             tma_sfb_w13,
@@ -1644,14 +1704,6 @@ class MoEDynamicKernel:
 
         k_tile_cnt = cute.size(gA, mode=[3])
         fc1_k_tile_cnt = k_tile_cnt
-        # Gated: w13 has 2*I_tp/tile_N N-tiles. Gate = second half, up = first half.
-        # ReLU2: w13 has I_tp/tile_N N-tiles. Single FC1 pass, no split.
-        intermediate_tile_cnt = cute.size(gB_w13_tiled, mode=[2])
-        gate_tile_cnt = (
-            intermediate_tile_cnt // Int32(2)
-            if self.is_gated
-            else intermediate_tile_cnt
-        )
         output_tile_cnt = cute.size(gB_down, mode=[2])
 
         prod_state = pipeline.make_pipeline_state(
@@ -2592,22 +2644,22 @@ class MoEDynamicKernel:
 
                     # FC1 producer slice. Gated activation packs [up, gate]
                     # across N; relu2 uses a single FC1 pass.
-                    tBgB_w13_up_nk = tBgB_w13[
+                    tBgB_w13_up_nk = tBgB_w13_up[
                         (None, intermediate_slice, None, task_expert_idx)
                     ]
                     tBgSFB_w13_up_nk = tBgSFB_w13[
                         (None, intermediate_slice, None, task_expert_idx)
                     ]
-                    gate_slice_idx = (
-                        intermediate_slice + gate_tile_cnt
+                    tBgB_w13_gate_nk = tBgB_w13[
+                        (None, intermediate_slice, None, task_expert_idx)
+                    ]
+                    sfb_gate_slice_idx = (
+                        intermediate_slice + Int32(self.sfb_gate_tile_offset)
                         if self.is_gated
                         else intermediate_slice
                     )
-                    tBgB_w13_gate_nk = tBgB_w13[
-                        (None, gate_slice_idx, None, task_expert_idx)
-                    ]
                     tBgSFB_w13_gate_nk = tBgSFB_w13[
-                        (None, gate_slice_idx, None, task_expert_idx)
+                        (None, sfb_gate_slice_idx, None, task_expert_idx)
                     ]
 
                     # ---- FC1 gate/only pass ----
@@ -2659,7 +2711,7 @@ class MoEDynamicKernel:
                                 ),
                             )
                             cute.copy(
-                                tma_b_w13,
+                                tma_b_w13_up,
                                 tBgB_w13_up_nk[(None, k_tile)],
                                 tBsB_w13_up[(None, up_prod_state.index)],
                                 tma_bar_ptr=up_pipeline.producer_get_barrier(

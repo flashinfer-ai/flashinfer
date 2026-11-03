@@ -115,6 +115,17 @@ def test_bmm_fp8(b, m, n, k, input_dtype, mat2_dtype, res_dtype, backend, auto_t
             pytest.skip(
                 "bmm_fp8 with cute-dsl backend is only supported on SM107 GPUs."
             )
+        # Imported here, not at module scope: on this branch the device is
+        # SM107 and the cute-dsl backend was explicitly requested, so the DSL is
+        # expected present. cute_dsl.utils imports cutlass at module scope and
+        # re-exports this probe both before and after #4753.
+        from flashinfer.cute_dsl.utils import is_rubin_cute_dsl_available
+
+        if not is_rubin_cute_dsl_available():
+            pytest.skip(
+                "bmm_fp8 with cute-dsl backend requires CuTe DSL >= 4.8 "
+                "(cutlass.utils.rubin_helpers)."
+            )
         if m % 16 != 0 or n % 16 != 0 or k % 16 != 0:
             pytest.skip(
                 "bmm_fp8 with cute-dsl backend requires m, n, k to be multiples of 16."

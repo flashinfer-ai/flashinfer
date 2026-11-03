@@ -14,18 +14,14 @@
 
 """Paged-KV helpers for the task-scheduled FMHA *context* kernel.
 
-Mirrors the decode-side helpers in
-``../fmha_decode/fmha_decode_resources/helpers_kv_tile_idx.py`` but is stripped
-down to what context needs: context has no multi-CTA-KV split, folds any
-sliding-window prefix into ``kv_tile_start``, and uses one
-``kv_tile_start + loop_offset`` expression for the current K/V tile index.
+Context has no multi-CTA-KV split, folds any sliding-window prefix into
+``kv_tile_start``, and uses one ``kv_tile_start + loop_offset`` expression for
+the current K/V tile index. Page IDs come from fixed row-strided block tables.
 """
 
 import cutlass
 import cutlass.cute as cute
 from cutlass import Int32
-
-from cutlass.experimental.task_scheduling.resources import StageInfo
 
 from .fmha_resources import FmhaConfig
 
@@ -51,13 +47,13 @@ def _runtime_last_valid_page_idx(cfg: FmhaConfig, seq_len_kv: Int32) -> Int32:
 
 
 @cute.jit
-def _resolve_kv_tile_idx_context(
-    stage_info: StageInfo,
-    kv_tile_start: Int32,
-    tile_offset: cutlass.Constexpr[int] = 0,
-) -> Int32:
-    # Context's current K/V tile index is kv_tile_start + loop_offset, with an
-    # optional compile-time shift for the staged D>128 schedule's previous V.
-    # No multi-CTA-KV transform; sliding-window prefix skipping is already
-    # folded into kv_tile_start by GmemQKVResource.
-    return kv_tile_start + Int32(stage_info.loop_offset) + Int32(tile_offset)
+def _load_block_table_row_bounds(
+    block_table_row_stride: Int32,
+    cfg: FmhaConfig,
+    seq_len_kv: Int32,
+    batch_coord: Int32,
+) -> tuple[Int32, Int32]:
+    """Return one fixed-table row base and runtime-valid inclusive page bound."""
+
+    row_begin = batch_coord * block_table_row_stride
+    return row_begin, _runtime_last_valid_page_idx(cfg, seq_len_kv)

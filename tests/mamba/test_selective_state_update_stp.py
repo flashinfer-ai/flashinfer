@@ -18,6 +18,18 @@ def _get_algorithms():
     return algos
 
 
+def _skip_unsupported_dim(algorithm, dim):
+    """Skip head dims that the horizontal and vertical kernels do not support."""
+    if algorithm == "horizontal" and (dim % 64 != 0 or dim > 256):
+        pytest.skip(
+            f"horizontal kernel requires dim divisible by 64 and at most 256, got {dim}"
+        )
+    if algorithm == "vertical" and (dim % 16 != 0 or dim < 48):
+        pytest.skip(
+            f"vertical kernel requires dim divisible by 16 and >= 48, got {dim}"
+        )
+
+
 # Base combination: batch=64, nheads=64, dim=64, dstate=128, state_dtype=bf16,
 #                   weight_dtype=f32, use_out_tensor=True
 # Each additional row varies exactly one parameter from the base.
@@ -29,6 +41,11 @@ _BASE_PARAMS = [
     (   1,    64,     64,  128,     torch.bfloat16,     torch.float32,     True ),  # batch=1
     (  64,     8,     64,  128,     torch.bfloat16,     torch.float32,     True ),  # nheads=8
     (  64,    64,    128,  128,     torch.bfloat16,     torch.float32,     True ),  # dim=128
+    (  64,    64,     80,  128,     torch.bfloat16,     torch.float32,     True ),  # dim=80
+    (  64,    64,     96,  128,     torch.bfloat16,     torch.float32,     True ),  # dim=96
+    (  64,    64,     32,  128,     torch.bfloat16,     torch.float32,     True ),  # dim=32
+    (  64,    64,    160,  128,     torch.bfloat16,     torch.float32,     True ),  # dim=160
+    (  64,    64,    320,  128,     torch.bfloat16,     torch.float32,     True ),  # dim=320
     (  64,    64,     64,   64,     torch.bfloat16,     torch.float32,     True ),  # dstate=64
     (  64,    64,     64,   96,     torch.bfloat16,     torch.float32,     True ),  # dstate=96
     (  64,    64,     64,  256,     torch.bfloat16,     torch.float32,     True ),  # dstate=256
@@ -183,12 +200,19 @@ class TestSelectiveStateUpdate:
         algorithm,
     ):
         """Test that kernel output matches reference within tolerance."""
+        _skip_unsupported_dim(algorithm, dim)
         inputs = self.make_inputs(batch, nheads, dim, dstate, state_dtype, weight_dtype)
         y_ref, state_ref = self.make_reference_output(inputs)
 
         # Prepare output tensor if requested
         if use_out_tensor:
-            out = torch.empty(batch, nheads, dim, dtype=self.INPUT_DTYPE, device="cuda")
+            # Start from NaN, so an element that the kernel does not write fails the check.
+            out = torch.full(
+                (batch, nheads, dim),
+                float("nan"),
+                dtype=self.INPUT_DTYPE,
+                device="cuda",
+            )
         else:
             out = None
 
@@ -646,7 +670,9 @@ class TestSelectiveStateUpdateStochasticRounding(TestSelectiveStateUpdate):
     ATOL = 0.001
     RTOL = 0.01
 
-    RAND_SEED = torch.tensor(42, dtype=torch.int64, device="cuda")
+    @pytest.fixture(autouse=True)
+    def _rand_seed(self):
+        self.rand_seed = torch.tensor(42, dtype=torch.int64, device="cuda")
 
     def make_inputs(self, batch, nheads, dim, dstate, _state_dtype, weight_dtype):
         """Create test inputs with fp16 state."""
@@ -671,7 +697,7 @@ class TestSelectiveStateUpdateStochasticRounding(TestSelectiveStateUpdate):
         # on unsupported GPUs the Triton reference falls back to regular
         # rounding while the CUDA kernel still exercises its software
         # stochastic rounding path.
-        rand_seed = self.RAND_SEED if is_cvt_rs_supported() else None
+        rand_seed = self.rand_seed if is_cvt_rs_supported() else None
         y_ref = selective_state_update_triton(
             state_ref,
             inputs["x"],
@@ -706,7 +732,7 @@ class TestSelectiveStateUpdateStochasticRounding(TestSelectiveStateUpdate):
             pad_slot_id=-1,
             out=out,
             algorithm=algorithm,
-            rand_seed=self.RAND_SEED,
+            rand_seed=self.rand_seed,
         )
 
     def assert_states_match(
@@ -884,3 +910,33 @@ class TestSelectiveStateUpdateVariousNgroups(TestSelectiveStateUpdate):
             inputs["slot_idx"],
             msg_prefix=f"[{algorithm}] ",
         )
+
+
+def test_dim_not_divisible_by_16():
+    """Auto uses the simple kernel at any batch size when the head dim is not divisible
+    by 16, and the multi-token path raises an error instead of leaving the output unwritten."""
+    test = TestSelectiveStateUpdate()
+    # batch * nheads is large enough that auto would otherwise pick a producer-consumer kernel
+    inputs = test.make_inputs(64, 64, 72, 128, torch.bfloat16, torch.float32)
+    y_ref, state_ref = test.make_reference_output(inputs)
+    y_test = test.run_kernel(inputs, algorithm="auto")
+    test.assert_outputs_match(y_ref, y_test)
+    test.assert_states_match(state_ref, inputs["state_cache"], inputs["slot_idx"])
+
+    mtp_inputs = create_test_inputs(
+        64,
+        64,
+        72,
+        128,
+        test.NGROUPS,
+        test.INPUT_DTYPE,
+        weight_dtype=torch.float32,
+        matrixA_dtype=test.MATRIX_A_DTYPE,
+        state_dtype=torch.bfloat16,
+        cache_steps=4,
+        seed=0,
+    )
+    with pytest.raises(
+        RuntimeError, match="Simple MTP kernel requires DIM divisible by"
+    ):
+        test.run_kernel(mtp_inputs)

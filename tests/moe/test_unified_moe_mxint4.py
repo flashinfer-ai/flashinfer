@@ -19,7 +19,7 @@ from flashinfer.fused_moe import (
     MoELayer,
     MoEWeightPack,
     QuantConfig,
-    QuantVariant,
+    QuantFormat,
     RoutingConfig,
     RoutingInputMode,
     TrtllmMxInt4Config,
@@ -33,6 +33,7 @@ from flashinfer.fused_moe.core import (
 from flashinfer.fused_moe.prepare import _mxint4_quantize
 from flashinfer.tllm_enums import RoutingMethodType
 from flashinfer.utils import get_compute_capability
+from tests.moe.utils import assert_trtllm_packed_call_contract
 
 
 def _build_mxint4_runner(config):
@@ -203,7 +204,7 @@ def _make_case(
             topk_group=topk_group,
             routed_scaling_factor=routed_scaling_factor,
         ),
-        quant=QuantConfig(variant=QuantVariant.MxInt4),
+        quant=QuantConfig(weight=QuantFormat.MXINT4, activation=QuantFormat.BF16),
         experts=ExpertConfig(
             intermediate_size=intermediate_size,
             local_expert_offset=local_expert_offset,
@@ -236,6 +237,7 @@ def _assert_mxint4_close(actual: torch.Tensor, expected: torch.Tensor) -> None:
 
 
 @pytest.mark.parametrize("bad_dtype", [torch.float16, torch.float32])
+@mxint4_required
 def test_mxint4_prepare_rejects_non_bf16(bad_dtype):
     w1 = torch.empty(2, 512, 256, dtype=bad_dtype)
     w2 = torch.empty(2, 256, 256, dtype=bad_dtype)
@@ -249,6 +251,7 @@ def test_mxint4_prepare_rejects_non_bf16(bad_dtype):
         )
 
 
+@mxint4_required
 def test_mxint4_prepare_rejects_unaligned_geometry():
     w1 = torch.empty(2, 768, 256, dtype=torch.bfloat16)
     w2 = torch.empty(2, 256, 384, dtype=torch.bfloat16)
@@ -262,6 +265,7 @@ def test_mxint4_prepare_rejects_unaligned_geometry():
         )
 
 
+@mxint4_required
 def test_mxint4_prepare_uses_non_gated_permutation_for_non_gated_activation():
     """GEMM1 permutation must follow activation.is_gated, not just row count.
 
@@ -320,7 +324,7 @@ def test_mxint4_runner_arch_support(monkeypatch, compute_capability, supported):
 
     config = MoEConfig(
         routing=RoutingConfig(num_experts=8, top_k=2),
-        quant=QuantConfig(variant=QuantVariant.MxInt4),
+        quant=QuantConfig(weight=QuantFormat.MXINT4, activation=QuantFormat.BF16),
         experts=ExpertConfig(intermediate_size=256),
         backend=BackendOptions((TrtllmMxInt4Config(),)),
     )
@@ -368,6 +372,7 @@ def test_mxint4_prepare_matches_flat_test_layout():
     assert torch.equal(actual["gemm2_weights_scale"], expected["gemm2_scales"])
 
 
+@mxint4_required
 def test_w2_permute_cache_key_includes_epilogue_tile_m():
     weight = torch.empty(128, 64, dtype=torch.uint8)
     cache = {}
@@ -379,6 +384,7 @@ def test_w2_permute_cache_key_includes_epilogue_tile_m():
     assert torch.equal(actual_tile_128, expected_tile_128)
 
 
+@mxint4_required
 def test_w3_w1_permute_cache_key_includes_gated_activation_mode():
     weight = torch.empty(256, 64, dtype=torch.uint8)
     cache = {}
@@ -449,6 +455,7 @@ def test_mxint4_from_logits_supports_fp32():
     act.routing_logits = act.routing_logits.float()
     runner = _build_mxint4_runner(config)
     inputs = runner.pack_inputs(act, weights)
+    assert_trtllm_packed_call_contract(runner, inputs)
     packed = MoeRunnerInputs.from_list(inputs)
     assert packed.topk_ids.numel() == 0
     assert packed.expert_weights.numel() == 0

@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import ctypes
+import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -40,6 +41,36 @@ class Function:
     argtypes: List[Any]
 
 
+def _is_library_filename(maps_line: str, lib_name: str) -> bool:
+    """Whether a /proc/self/maps line maps ``lib_name`` itself, not a differently-named library.
+
+    ``lib_name in line`` alone matches any path that merely contains the name, so a library such
+    as ``libcudart_stub.so`` is indistinguishable from ``libcudart.so``. Binding the wrong object
+    is silent until the first symbol lookup, which then fails with an opaque
+    ``undefined symbol: cudaDeviceReset``.
+
+    The whole filename is validated, not a prefix: the name must be ``lib_name``, optionally
+    followed by a ``-<hash>`` build suffix of hexadecimal characters, then ``.so`` and zero or more
+    numeric version components. Checking only the part before ``.so`` is not enough, because ``.so``
+    also occurs inside names like ``libcudart.something``, and a trailing ``.backup`` would
+    otherwise be ignored. The suffix is restricted to hex rather than any text, so a hyphenated
+    stub such as ``libcudart-stub.so`` is rejected alongside ``libcudart_stub.so``.
+
+    Accepts the forms the loader produces -- ``libcudart.so``, ``libcudart.so.12``,
+    ``libcudart.so.11.0`` and the wheel-mangled ``libcudart-d0da41ae.so.11.0``. Rejects everything
+    else, including paths where the name appears only in a directory component.
+    """
+    if "/" not in maps_line:
+        return False
+    filename = maps_line.strip().rsplit("/", 1)[-1]
+    return (
+        re.fullmatch(
+            rf"{re.escape(lib_name)}(?:-[0-9a-fA-F]+)?\.so(?:\.\d+)*", filename
+        )
+        is not None
+    )
+
+
 def find_loaded_library(lib_name) -> Optional[str]:
     """
     According to according to https://man7.org/linux/man-pages/man5/proc_pid_maps.5.html,
@@ -50,7 +81,7 @@ def find_loaded_library(lib_name) -> Optional[str]:
     found = False
     with open("/proc/self/maps") as f:
         for line in f:
-            if lib_name in line:
+            if lib_name in line and _is_library_filename(line, lib_name):
                 found = True
                 break
     if not found:

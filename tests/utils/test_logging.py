@@ -25,6 +25,83 @@ import pytest
 import torch
 
 
+@pytest.mark.parametrize(
+    "modules",
+    [
+        (),
+        ("flashinfer",),
+        (
+            "flashinfer.decode",
+            "flashinfer.api_logging",
+            "flashinfer.mla._batch_mla._auto_policy",
+        ),
+    ],
+)
+@pytest.mark.parametrize("category", [UserWarning, DeprecationWarning])
+def test_warn_from_external_caller_skips_internal_frames(modules, category):
+    import functools
+    import inspect
+    import warnings
+
+    from flashinfer.api_logging import _warn_from_external_caller
+
+    call = functools.partial(
+        _warn_from_external_caller, "caller-attributed warning", category
+    )
+    for module in modules:
+        namespace = {"__name__": module, "callback": call}
+        exec(
+            compile("def invoke():\n    callback()\n", f"<{module}>", "exec"), namespace
+        )
+        call = namespace["invoke"]
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        for _ in range(2):
+            expected_line = inspect.currentframe().f_lineno + 1
+            call()
+    assert len(caught) == 2, "The helper must leave deduplication to its callers"
+    for warning in caught:
+        assert str(warning.message) == "caller-attributed warning"
+        assert warning.category is category
+        assert warning.filename == __file__
+        assert warning.lineno == expected_line
+
+
+def test_warn_from_external_caller_preserves_similarly_named_external_module():
+    import functools
+    import warnings
+
+    from flashinfer.api_logging import _warn_from_external_caller
+
+    namespace = {
+        "__name__": "flashinfer_extensions.user",
+        "callback": functools.partial(
+            _warn_from_external_caller, "external caller", UserWarning
+        ),
+    }
+    exec(
+        compile("def invoke():\n    callback()\n", "<external caller>", "exec"),
+        namespace,
+    )
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        namespace["invoke"]()
+    assert len(caught) == 1
+    assert caught[0].filename == "<external caller>"
+    assert caught[0].lineno == 2
+
+
+def test_warn_from_external_caller_respects_warning_errors():
+    import warnings
+
+    from flashinfer.api_logging import _warn_from_external_caller
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)
+        with pytest.raises(UserWarning, match="warning promoted to error"):
+            _warn_from_external_caller("warning promoted to error", UserWarning)
+
+
 # Test enum classes
 class TestEnum(Enum):
     """Test enum with integer values."""
@@ -311,6 +388,49 @@ class TestAPILogging:
 
             # Should log class name for Wrapper classes
             assert "TestWrapper.run" in log_contents
+        finally:
+            Path(log_file).unlink(missing_ok=True)
+
+    def test_class_method_logging_explicit_allowlist(self):
+        """Classes on the explicit allow-list are prefixed even without "Wrapper".
+
+        ``test_class_method_logging`` above only covers the ``"Wrapper" in
+        class_name`` branch, which passes by name matching. The decorator has a
+        second branch -- an explicit allow-list -- for stateful entry points
+        whose class name does not contain "Wrapper". ``MoELayer`` is the reason
+        that branch matters in practice: its entry point is ``__call__``, so
+        without the prefix every unified-MoE call logs as a bare ``__call__``,
+        which is unreadable and useless as a ``FLASHINFER_DUMP_INCLUDE`` /
+        ``FLASHINFER_DUMP_EXCLUDE`` pattern (it would match any other decorated
+        ``__call__``).
+        """
+        with tempfile.NamedTemporaryFile(mode="w+", delete=False, suffix=".txt") as f:
+            log_file = f.name
+
+        try:
+            decorator = self.setup_logging(level=1, dest=log_file)
+
+            # Name deliberately does NOT contain "Wrapper", so a pass here can
+            # only come from the allow-list branch.
+            class MoELayer:
+                @decorator
+                def __call__(self, x):
+                    return x * 3
+
+            # Negative control: same shape, name absent from the allow-list.
+            class NotOnTheAllowList:
+                @decorator
+                def __call__(self, x):
+                    return x * 3
+
+            assert MoELayer()(5) == 15
+            assert NotOnTheAllowList()(5) == 15
+
+            with open(log_file, "r") as f:
+                log_contents = f.read()
+
+            assert "MoELayer.__call__" in log_contents
+            assert "NotOnTheAllowList.__call__" not in log_contents
         finally:
             Path(log_file).unlink(missing_ok=True)
 

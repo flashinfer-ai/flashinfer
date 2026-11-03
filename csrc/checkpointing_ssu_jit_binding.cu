@@ -41,14 +41,16 @@ void checkpointing_ssu(
     bool dt_softplus,
     Optional<TensorView> state_batch_indices,  // (batch,) int32
     int64_t pad_slot_id,
-    Optional<TensorView> state_scale,   // (cache, nheads, dim) f32
-    Optional<TensorView> rand_seed,     // single int64
-    int64_t d_split,                    // v12 §59: per-head DIM split factor (1, 2, or 4)
-    Optional<TensorView> cu_seqlens,    // (batch+1,) int32 — varlen mode
-    Optional<TensorView> cb_scaled,     // two-kernel scratch: bf16 (batch, nheads, 32, 8)
-    Optional<TensorView> cumAdt_vec,    // two-kernel scratch: f32 (batch, nheads, T_pad)
-    Optional<TensorView> cb_old,        // two-kernel scratch: bf16 (batch, nheads, 32, K_old/2)
-    int64_t precompute_heads_per_cta);  // two-kernel PRECOMPUTE: heads per CTA (0 = heuristic)
+    Optional<TensorView> state_scale,  // (cache, nheads, dim) f32
+    Optional<TensorView> rand_seed,    // single int64
+    int64_t d_split,                   // v12 §59: per-head DIM split factor (1, 2, or 4)
+    Optional<TensorView> cu_seqlens,   // (batch+1,) int32 — varlen mode
+    Optional<TensorView> cb_scaled,    // two-kernel scratch: bf16 (batch, nheads, 32, 8)
+    Optional<TensorView> cumAdt_vec,   // two-kernel scratch: f32 (batch, nheads, T_pad)
+    Optional<TensorView> cb_old,       // two-kernel scratch: bf16 (batch, nheads, 32, K_old/2)
+    int64_t precompute_heads_per_cta,  // two-kernel PRECOMPUTE: heads per CTA (0 = heuristic)
+    int64_t main_pipeline_stages,      // two-kernel MAIN: pipeline depth (0 = heuristic)
+    int64_t main_ctas_per_sm);         // two-kernel MAIN: grid cap (0 = heuristic)
 
 }  // namespace flashinfer::mamba::checkpointing
 

@@ -10,7 +10,7 @@ softmax-normalized topk_weights, the output approximates the input within
 bf16 tolerance.
 
 Requires ``nccl.ep``, which is available by default: it ships in the
-``nccl4py`` wheel, a base dependency of flashinfer-python (a plain
+``nccl-extensions`` wheel, a base dependency of flashinfer-python (a plain
 ``pip install -e .`` is enough).
 """
 

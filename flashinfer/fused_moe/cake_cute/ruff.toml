@@ -1,0 +1,7 @@
+# The plan module of this package is generated (its decision table is rendered
+# verbatim from the pinned Cake revision named in the package manifest; see the
+# module docstring).  Generated sources are kept out of lint and format like the
+# other generated Cake sources listed in pyproject.toml; the hand-authored loader
+# and __init__ stay under the repository rules.
+extend = "../../../pyproject.toml"
+extend-exclude = ["cake_mxfp4_situ_moe_plan.py"]

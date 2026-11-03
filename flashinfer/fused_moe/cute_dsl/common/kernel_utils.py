@@ -44,20 +44,21 @@
 # This file is copied and modified from cutlass https://github.com/NVIDIA/cutlass/blob/main/python/CuTeDSL/cutlass/cute/core.py
 
 """
-Shared CuTeDSL kernel utilities for Blackwell and Rubin MoE kernels.
+Shared CuTeDSL kernel utilities for the Hopper, Blackwell and Rubin MoE kernels.
 
 Contains arch-independent helpers: pointer management, math ops, atomic ops,
 and grid dependency control.
 """
 
 import ctypes
+import functools
 from typing import Union
 
 import cutlass
 import cutlass._mlir.dialects.cute as _cute_ir
 import cutlass.cute as cute
 from cutlass._mlir import ir
-from cutlass._mlir.dialects import llvm
+from cutlass._mlir.dialects import llvm, nvvm
 from cutlass.cute.typing import AddressSpace, Numeric, Pointer, Type
 from cutlass.cutlass_dsl import T, dsl_user_op
 
@@ -172,6 +173,90 @@ def silu_f32(
     a: Union[float, cutlass.Float32], fastmath: bool = False
 ) -> Union[float, cutlass.Float32]:
     return a * sigmoid_f32(a, fastmath=fastmath)
+
+
+@functools.lru_cache(maxsize=None)
+def _nvvm_fmin_needs_res():
+    import inspect
+
+    return "res" in inspect.signature(nvvm.fmin).parameters
+
+
+@dsl_user_op
+def fmin(
+    a: Union[float, cutlass.Float32],
+    b: Union[float, cutlass.Float32],
+    *,
+    nan=False,
+    loc=None,
+    ip=None,
+) -> cutlass.Float32:
+    a_val = cutlass.Float32(a).ir_value(loc=loc, ip=ip)
+    b_val = cutlass.Float32(b).ir_value(loc=loc, ip=ip)
+    if _nvvm_fmin_needs_res():
+        # CUDA 12: nvvm.fmin(res, a, b, ...)
+        result = nvvm.fmin(T.f32(), a_val, b_val, nan=nan, loc=loc, ip=ip)
+    else:
+        # CUDA 13: nvvm.fmin(a, b, ...)
+        result = nvvm.fmin(a_val, b_val, nan=nan, loc=loc, ip=ip)
+    return cutlass.Float32(result)
+
+
+def tanh_f32(
+    a: Union[float, cutlass.Float32], fastmath: bool = False
+) -> Union[float, cutlass.Float32]:
+    """Compute tanh from the existing sigmoid primitive."""
+    return cutlass.Float32(2.0) * sigmoid_f32(
+        cutlass.Float32(2.0) * a, fastmath=fastmath
+    ) - cutlass.Float32(1.0)
+
+
+def f32_reciprocal(value: float) -> float:
+    """Return ``1 / fp32(value)``, rounded to fp32.
+
+    The reciprocal must come from the same fp32 value the kernel multiplies back
+    in.  Taking it from the unrounded Python float instead can differ by 1 ulp for
+    betas that are not fp32-exact.  (f64 carries at least 2p+2 bits for p=24, so
+    computing the quotient in f64 and rounding once to fp32 is correctly rounded.)
+    """
+    beta_f32 = ctypes.c_float(float(value)).value
+    return ctypes.c_float(1.0 / beta_f32).value
+
+
+def situ_f32(
+    a: Union[float, cutlass.Float32],
+    beta: Union[float, cutlass.Float32],
+    fastmath: bool = False,
+) -> Union[float, cutlass.Float32]:
+    """Compute SiTU: beta * tanh(x / beta) * sigmoid(x)."""
+    x = cutlass.Float32(a)
+    beta_f32 = cutlass.Float32(beta)
+    # Multiply by the reciprocal: `x / beta` is a per-element div.rn.f32 the backend
+    # cannot strength-reduce (1/25.0 is inexact) nor hoist (varying numerator).
+    if isinstance(beta, (float, int)):
+        inv_beta = cutlass.Float32(f32_reciprocal(beta))
+    else:
+        inv_beta = cutlass.Float32(1.0) / beta_f32
+    return (
+        beta_f32
+        * tanh_f32(x * inv_beta, fastmath=fastmath)
+        * sigmoid_f32(x, fastmath=fastmath)
+    )
+
+
+def gelu_tanh_f32(
+    a: Union[float, cutlass.Float32], fastmath: bool = False
+) -> Union[float, cutlass.Float32]:
+    """Compute GELU using the tanh approximation."""
+    x = cutlass.Float32(a)
+    inner = cutlass.Float32(0.7978845608028654) * (
+        x + cutlass.Float32(0.044715) * x * x * x
+    )
+    return (
+        cutlass.Float32(0.5)
+        * x
+        * (cutlass.Float32(1.0) + tanh_f32(inner, fastmath=fastmath))
+    )
 
 
 @dsl_user_op

@@ -444,8 +444,8 @@ struct Gmem_tile_q_k_v {
     // The row offset in the batched GEMM, including the sequence offset.
     int64_t row_offset =
         (int64_t)(row + cta_row_offset + seq_offset) * params_q_k_v_stride_in_bytes_;
-    // Add the head index.
-    int64_t idx = binfo.bidh;
+    // Grouped query heads share one K/V head; Q retains its own head index.
+    int64_t idx = qkv_offset == 0 ? binfo.bidh : binfo.bidh / params.h_q_per_kv;
 
     // Assemble the final pointer.
     q_k_v_ptr_ += row_offset + idx * VALID_BYTES_PER_ROW + col_in_bytes_;

@@ -6,6 +6,7 @@ set -x
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 # Source test environment setup (handles package overrides like TVM-FFI)
+# shellcheck source=scripts/setup_test_env.sh
 source "${SCRIPT_DIR}/setup_test_env.sh"
 # shellcheck source=scripts/jit_cache_build_common.sh
 source "${SCRIPT_DIR}/jit_cache_build_common.sh"
@@ -123,7 +124,7 @@ echo "========================================"
 echo "Starting flashinfer-jit-cache test script"
 echo "========================================"
 
-: ${CUDA_VISIBLE_DEVICES:=""}
+: "${CUDA_VISIBLE_DEVICES:=}"
 echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES}"
 
 # Clean Python bytecode cache to avoid stale imports (e.g., after module refactoring)
@@ -133,44 +134,31 @@ find . -type f -name '*.pyc' -delete 2>/dev/null || true
 echo "Cache cleaned."
 
 echo ""
-echo "Detecting CUDA architecture list..."
-export FLASHINFER_CUDA_ARCH_LIST=$(python3 -c '
-import os
-import platform
-
-import torch
-cuda_ver = torch.version.cuda
-arches = ["7.5", "8.0", "8.9", "9.0a"]
-if cuda_ver is not None:
-    try:
-        major, minor = map(int, cuda_ver.split(".")[:2])
-        if (major, minor) >= (13, 0):
-            arches.append("10.0a")
-            arches.append("10.3a")
-            machine = (os.environ.get("ARCH") or platform.machine()).lower()
-            if machine in ("aarch64", "arm64"):
-                arches.append("11.0a")
-            arches.append("12.0f")
-        elif (major, minor) >= (12, 9):
-            arches.append("10.0a")
-            arches.append("10.3a")
-            arches.append("12.0f")
-        elif (major, minor) >= (12, 8):
-            arches.append("10.0a")
-            arches.append("12.0a")
-    except Exception:
-        pass
-print(" ".join(arches))
-')
-echo "FLASHINFER_CUDA_ARCH_LIST: ${FLASHINFER_CUDA_ARCH_LIST}"
-
-echo ""
 echo "Current PyTorch version:"
 python -c "import torch; print(torch.__version__)"
 
 # Detect CUDA version from the container
 CUDA_VERSION=$(python3 -c 'import torch; print(torch.version.cuda)' | cut -d'.' -f1,2 | tr -d '.')
-echo "Detected CUDA version: cu${CUDA_VERSION}"
+CUDA_LABEL="cu${CUDA_VERSION}"
+CPU_ARCHITECTURE=$(uname -m)
+if [ "${CPU_ARCHITECTURE}" = "arm64" ]; then
+    CPU_ARCHITECTURE=aarch64
+fi
+PROVIDER_ARCHITECTURES=$(python3 - "${CUDA_LABEL}" "${CPU_ARCHITECTURE}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+cuda_label, cpu_architecture = sys.argv[1:]
+config = json.loads(Path("ci/cuda-versions.json").read_text())
+entry = next(item for item in config["jit_cache"] if item["label"] == cuda_label)
+print(" ".join(entry[f"{cpu_architecture}_provider_architectures"]))
+PY
+)
+read -ra PROVIDER_ARCHITECTURE_LIST <<< "${PROVIDER_ARCHITECTURES}"
+echo "Detected CUDA version: ${CUDA_LABEL}"
+echo "CPU architecture: ${CPU_ARCHITECTURE}"
+echo "Provider architectures: ${PROVIDER_ARCHITECTURES}"
 
 compute_jit_cache_parallelism
 
@@ -213,36 +201,58 @@ setup_sccache "cuda${CUDA_VERSION}-$(uname -m)" "$(pwd -P)"
 
 echo ""
 echo "========================================"
-echo "Building flashinfer-jit-cache wheel"
+echo "Building flashinfer-jit-cache provider wheels"
 echo "========================================"
-cd flashinfer-jit-cache
-rm -rf dist build *.egg-info
 # The image satisfies this package's build requires except wheel, until the
 # images carrying it are rolled out.
 python -c "import wheel" 2>/dev/null || pip install --no-deps wheel
 # --no-isolation keeps build from re-downloading torch, but it then verifies the
 # build requires transitively, and the image's torch declares an nvidia-cudnn
 # wheel the image does not install. Testing what the image ships is the point.
-run_with_aot_memory_monitor "build_flashinfer_jit_cache_wheel" \
-    python -m build --wheel --no-isolation --skip-dependency-check
+WHEELHOUSE=$(pwd)/dist-jit-cache-provider-test
+rm -rf "${WHEELHOUSE}"
+mkdir -p "${WHEELHOUSE}"
+for provider_architecture in "${PROVIDER_ARCHITECTURE_LIST[@]}"; do
+    rm -rf flashinfer-jit-cache-provider/dist \
+        flashinfer-jit-cache-provider/build \
+        flashinfer-jit-cache-provider/*.egg-info \
+        flashinfer-jit-cache-provider/flashinfer_jit_cache_provider/jit_cache
+    rm -f flashinfer-jit-cache-provider/flashinfer_jit_cache_provider/manifest.json \
+        flashinfer-jit-cache-provider/flashinfer_jit_cache_provider/_build_meta.py
+    run_with_aot_memory_monitor "build_jit_cache_provider_${provider_architecture}" \
+        env FLASHINFER_JIT_CACHE_PROVIDER_ARCH="${provider_architecture}" \
+        FLASHINFER_LOCAL_VERSION="${CUDA_LABEL}" \
+        python -m build --wheel --no-isolation --skip-dependency-check \
+        flashinfer-jit-cache-provider
+    cp flashinfer-jit-cache-provider/dist/*.whl "${WHEELHOUSE}/"
+done
 
-# Get the built wheel file
-WHEEL_FILE=$(ls -t dist/*.whl | head -n 1)
-echo ""
-echo "Built wheel: $WHEEL_FILE"
-echo ""
+rm -rf flashinfer-jit-cache/dist flashinfer-jit-cache/build \
+    flashinfer-jit-cache/*.egg-info
+rm -f flashinfer-jit-cache/flashinfer_jit_cache/_build_meta.py \
+    flashinfer-jit-cache/flashinfer_jit_cache/_provider_requirements.txt
+run_with_aot_memory_monitor "build_flashinfer_jit_cache_shim" \
+    env FLASHINFER_JIT_CACHE_PROVIDER_ARCHS="${PROVIDER_ARCHITECTURES}" \
+    FLASHINFER_LOCAL_VERSION="${CUDA_LABEL}" \
+    python -m build --wheel --no-isolation --skip-dependency-check \
+    flashinfer-jit-cache
+cp flashinfer-jit-cache/dist/*.whl "${WHEELHOUSE}/"
+
+echo "Built provider wheelhouse:"
+ls -lh "${WHEELHOUSE}"
 
 echo ""
 echo "========================================"
 echo "Installing flashinfer-jit-cache wheel"
 echo "========================================"
-echo "Wheel file: $WHEEL_FILE"
-run_with_aot_memory_monitor "pip_install_flashinfer_jit_cache_wheel" pip install "$WHEEL_FILE" || {
+PACKAGE_VERSION=$(tr -d '[:space:]' < version.txt)+${CUDA_LABEL}
+run_with_aot_memory_monitor "pip_install_flashinfer_jit_cache_wheel" \
+    pip install --no-index --find-links "${WHEELHOUSE}" \
+    "flashinfer-jit-cache==${PACKAGE_VERSION}" || {
     echo "ERROR: Failed to install flashinfer-jit-cache wheel"
     exit 1
 }
 echo "✓ Flashinfer-jit-cache wheel installed successfully"
-cd ..
 
 # Verify installation
 echo ""
@@ -258,14 +268,18 @@ run_with_aot_memory_monitor "flashinfer_show_config" python -m flashinfer show-c
 }
 echo "✓ show-config completed successfully"
 
-# Verify all modules are compiled
+# Verify each provider's module inventory
 echo ""
-echo "[STEP 2/2] Verifying all modules are compiled..."
-run_with_aot_memory_monitor "verify_all_modules_compiled" python scripts/verify_all_modules_compiled.py || {
-    echo "ERROR: Not all modules are compiled!"
-    exit 1
-}
-echo "✓ All modules verified successfully"
+echo "[STEP 2/2] Verifying each provider module inventory..."
+for provider_architecture in "${PROVIDER_ARCHITECTURE_LIST[@]}"; do
+    run_with_aot_memory_monitor "verify_provider_${provider_architecture}" \
+        env FLASHINFER_CUDA_ARCH_LIST="${provider_architecture}" \
+        python scripts/verify_all_modules_compiled.py || {
+        echo "ERROR: Provider ${provider_architecture} is missing compiled modules!"
+        exit 1
+    }
+done
+echo "✓ All provider modules verified successfully"
 
 echo ""
 echo "========================================"

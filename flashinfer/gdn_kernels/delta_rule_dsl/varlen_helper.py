@@ -29,6 +29,89 @@ def is_integer_dtype(dtype: torch.dtype) -> bool:
     return dtype in _INTEGER_DTYPES
 
 
+def check_slot_args(
+    num_seqs: int,
+    num_sab_heads: int,
+    D: int,
+    device: torch.device,
+    use_state_indices: bool,
+    needs_checkpointing: bool,
+    beta: torch.Tensor | None,
+    state_checkpoints: torch.Tensor | None,
+    output_state_indices: torch.Tensor | None,
+    checkpoint_state_indices: torch.Tensor | None,
+    prefix_lens: torch.Tensor | None,
+) -> None:
+    """Validate the slot-addressing arguments of the non-CP prefill kernels."""
+    for name, tensor, shape in (
+        ("output_state_indices", output_state_indices, (num_seqs,)),
+        ("checkpoint_state_indices", checkpoint_state_indices, None),
+        ("prefix_lens", prefix_lens, (num_seqs,)),
+    ):
+        if tensor is None:
+            continue
+        if not is_integer_dtype(tensor.dtype):
+            raise RuntimeError(f"{name} must have an integer dtype, got {tensor.dtype}")
+        if tensor.ndim != 1 or (shape is not None and tuple(tensor.shape) != shape):
+            raise RuntimeError(
+                f"{name} must be 1D{'' if shape is None else f' of shape {shape}'}, "
+                f"got {tuple(tensor.shape)}"
+            )
+        if tensor.device != device:
+            raise RuntimeError(f"{name} must be on {device}, got {tensor.device}")
+        if not tensor.is_contiguous():
+            raise RuntimeError(f"{name} must be contiguous")
+    if output_state_indices is not None and not use_state_indices:
+        raise RuntimeError("output_state_indices requires state_indices")
+    if (
+        checkpoint_state_indices is not None or prefix_lens is not None
+    ) and not needs_checkpointing:
+        raise RuntimeError(
+            "checkpoint_state_indices and prefix_lens require "
+            "checkpoint_every_n_tokens > 0"
+        )
+    if prefix_lens is not None and beta is None:
+        # Padding rows before an unaligned prefix are identity rows built from
+        # a zero beta; pass ones for an ungated beta.
+        raise RuntimeError("prefix_lens requires beta")
+    if checkpoint_state_indices is not None and (
+        state_checkpoints.ndim != 4
+        or tuple(state_checkpoints.shape[1:]) != (num_sab_heads, D, D)
+        or state_checkpoints.stride()[1:] != (D * D, D, 1)
+        or state_checkpoints.stride(0) < num_sab_heads * D * D
+    ):
+        raise RuntimeError(
+            "state_checkpoints must be a pool [C, H, D, D] of dense [H, D, D] "
+            f"rows with checkpoint_state_indices, got shape "
+            f"{tuple(state_checkpoints.shape)} stride {state_checkpoints.stride()}"
+        )
+
+
+def checkpoint_row_align(state_checkpoints: torch.Tensor) -> int:
+    """Alignment, in elements, of every row of a checkpoint pool: the largest
+    power of two up to 16 bytes that divides both the base address and the
+    row stride. Part of the compile key, so the row stores can be vectorized
+    for any pool without assuming more than the pool guarantees."""
+    size = state_checkpoints.element_size()
+    return math.gcd(
+        16 // size, state_checkpoints.stride(0), state_checkpoints.data_ptr() // size
+    )
+
+
+def check_checkpoint_key_range(
+    num_entries: int, every_n_tokens: int, num_tokens: int
+) -> None:
+    """The slot checkpoint paths find a checkpoint's entry through the 32-bit
+    key ``(first entry - 1) * N + offset`` plus the block end (see
+    ``checkpoint_entry_key`` in the kernels); keep it in range."""
+    if (num_entries + 2) * every_n_tokens + num_tokens >= 2**31:
+        raise RuntimeError(
+            "checkpoint indexing exceeds 32 bits: "
+            f"({num_entries} entries + 2) * checkpoint_every_n_tokens "
+            f"{every_n_tokens} + {num_tokens} tokens >= 2**31"
+        )
+
+
 def integer_dtype_to_cutlass(dtype: torch.dtype) -> type[cutlass.Numeric]:
     try:
         return {
@@ -126,6 +209,51 @@ def should_use_cp_host(
     return num_parallel_work * threshold_den < num_sms * threshold_num
 
 
+#: SM80 auto-CP: exact longest sequence at least this, parallel work at most this.
+CP_SM80_MIN_MAX_SEQ_LEN = 8192
+CP_SM80_MAX_PARALLEL_WORK = 16
+
+
+def should_use_cp_sm80_host(
+    max_seq_len: int | None,
+    num_parallel_work: int,
+    device_capability: tuple[int, int],
+) -> bool:
+    """Whether SM80 `use_cp="auto"` takes CP; an unknown longest sequence means no."""
+    # Measured on compute capability 8.0 only.
+    if device_capability != (8, 0) or max_seq_len is None:
+        return False
+    return (
+        max_seq_len >= CP_SM80_MIN_MAX_SEQ_LEN
+        and num_parallel_work <= CP_SM80_MAX_PARALLEL_WORK
+    )
+
+
+#: The one shape the V32 fused specialization was measured on.
+V32_SM80_MAX_SEQ_LEN = 8192
+V32_SM80_NUM_SEQS = 1
+V32_SM80_NUM_Q_HEADS = 4
+V32_SM80_NUM_V_HEADS = 16
+
+
+def should_use_v32_sm80_host(
+    max_seq_len: int | None,
+    num_seqs: int,
+    num_q_heads: int,
+    num_v_heads: int,
+    device_capability: tuple[int, int],
+) -> bool:
+    """Whether auto takes the V32 fused specialization (exactly its measured shape)."""
+    if device_capability != (8, 0) or max_seq_len is None:
+        return False
+    return (
+        max_seq_len == V32_SM80_MAX_SEQ_LEN
+        and num_seqs == V32_SM80_NUM_SEQS
+        and num_q_heads == V32_SM80_NUM_Q_HEADS
+        and num_v_heads == V32_SM80_NUM_V_HEADS
+    )
+
+
 def choose_cp_chunk_len_host(
     max_seqlen: int,
     num_heads: int,
@@ -190,9 +318,7 @@ def choose_cp_chunk_len_host(
 
 
 @cute.jit
-def chunk_bound(
-    seq_idx: cutlass.Int32, total, chunk_size: cutlass.Int32
-) -> cutlass.Int32:
+def chunk_bound(seq_idx: cutlass.Int32, total, chunk_size) -> cutlass.Int32:
     m = seq_idx
     if total < m:
         m = cutlass.Int32(total)
@@ -200,8 +326,11 @@ def chunk_bound(
 
 
 @cute.jit
-def chunks_for_len(seq_len: cutlass.Int32, chunk_size: cutlass.Int32) -> cutlass.Int32:
-    return (seq_len + chunk_size - cutlass.Int32(1)) // chunk_size
+def chunks_for_len(seq_len: cutlass.Int32, chunk_size) -> cutlass.Int32:
+    chunk_size_value = chunk_size
+    if cutlass.const_expr(isinstance(chunk_size, cute.FastDivmodDivisorV2)):
+        chunk_size_value = chunk_size.divisor
+    return (seq_len + chunk_size_value - cutlass.Int32(1)) // chunk_size
 
 
 @cute.jit
@@ -233,7 +362,7 @@ def varlen_chunk_idx(
     seq_idx: cutlass.Int32,
     tok_idx_start,
     chunk_idx_in_seq: cutlass.Int32,
-    chunk_size: cutlass.Int32,
+    chunk_size,
 ) -> cutlass.Int32:
     return chunk_bound(seq_idx, tok_idx_start, chunk_size) + chunk_idx_in_seq
 

@@ -250,7 +250,7 @@ def test_validate_compute_consistency_requires_do_finalize():
         MoEConfig,
         MoEFinalizeConfig,
         QuantConfig,
-        QuantVariant,
+        QuantFormat,
         RoutingConfig,
         TrtllmBf16Config,
     )
@@ -262,7 +262,7 @@ def test_validate_compute_consistency_requires_do_finalize():
     fleet = _split(num_experts=8, world_size=4)
     moe_config = MoEConfig(
         routing=RoutingConfig(num_experts=8, top_k=4),
-        quant=QuantConfig(variant=QuantVariant.BF16),
+        quant=QuantConfig(weight=QuantFormat.BF16, activation=QuantFormat.BF16),
         experts=ExpertConfig(
             intermediate_size=2048,
             local_expert_offset=0,
@@ -390,6 +390,18 @@ def test_bootstrap_device_resolution_env_then_rank(monkeypatch):
 
     monkeypatch.delenv("LOCAL_RANK")
     assert _resolve_local_device(BootstrapConfig(world_size=8, rank=3)) == 3
+
+
+def test_bootstrap_device_folds_only_under_rank_sharing(monkeypatch):
+    """MEGA_SINGLE_GPU_GLOO=1 folds LOCAL_RANK onto the physical GPUs."""
+    import torch
+
+    from flashinfer.moe_ep.core.runtime.bootstrap import _resolve_local_device
+
+    monkeypatch.setenv("MEGA_SINGLE_GPU_GLOO", "1")
+    monkeypatch.setenv("LOCAL_RANK", "5")
+    monkeypatch.setattr(torch.cuda, "device_count", lambda: 2)
+    assert _resolve_local_device(BootstrapConfig(world_size=8, rank=3)) == 1
 
 
 def test_bootstrap_rejects_negative_device():

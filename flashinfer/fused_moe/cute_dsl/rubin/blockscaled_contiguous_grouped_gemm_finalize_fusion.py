@@ -36,10 +36,15 @@ Key features:
 - Rubin-specific MMA features (B-reuse pattern, CollectorOp, etc.)
 - Tile scheduling logic for contiguous grouped GEMM
 - Fused finalize operation with atomic add for MoE scatter-add
+- Unfused (deterministic) mode that writes each permuted row to its expanded
+  slot for a separate reduction kernel
 
 The finalize fusion performs:
 1. GEMM: C_permuted = alpha * A * SFA * B * SFB
 2. Scatter-add: c[token_idx] += token_scale * C_permuted[permuted_row]
+
+With use_fused_finalize=False step 2 becomes a plain store:
+   c[expanded_idx] = C_permuted[permuted_row]
 
 
 """
@@ -67,6 +72,24 @@ from cutlass.utils.gemm.sm100 import (
 # ============================================================================
 # Inline utility functions
 # ============================================================================
+
+
+@dsl_user_op
+def blk_copy(dst_gemm, src_smem, size, loc=None, ip=None):
+    """Block copy using cp.async.bulk (plain store, no reduction)."""
+    llvm.inline_asm(
+        None,
+        [
+            dst_gemm.iterator.llvm_ptr,
+            src_smem.iterator.llvm_ptr,
+            size.ir_value(),
+        ],
+        "cp.async.bulk.global.shared::cta.bulk_group [$0], [$1], $2;",
+        "l,l,r",
+        has_side_effects=True,
+        loc=loc,
+        ip=ip,
+    )
 
 
 @dsl_user_op
@@ -149,6 +172,11 @@ class Sm107BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
     :param mma_tiler: Shape of MMA tiler (M, N, K)
     :param cluster_shape_mn: Cluster dimensions (M, N)
     :param raster_along_m: If True, raster tiles along M dimension first
+    :param topK: Number of experts selected per token
+    :param use_fused_finalize: If True, scale each row by its router weight
+        and atomically scatter-add it into the token's output row. If False,
+        store the unscaled row to its expanded slot (num_tokens * topK rows)
+        for a separate deterministic reduction.
     """
 
     def __init__(
@@ -160,6 +188,7 @@ class Sm107BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         raster_along_m: bool = False,
         topK: int = 1,
         enable_pdl: Optional[bool] = None,
+        use_fused_finalize: bool = True,
     ):
         # flashinfer dispatcher compatibility: the pre-sync kernel took
         # `enable_pdl`; the TRT-LLM version has no PDL path, so the value is
@@ -172,6 +201,7 @@ class Sm107BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         self.cluster_shape_mn = cluster_shape_mn
         self.raster_along_m = raster_along_m
         self.topK = topK
+        self.use_fused_finalize = use_fused_finalize
 
         self.use_2cta_instrs = mma_inst_shape[0] == 256
         self.cta_group = tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
@@ -469,9 +499,6 @@ class Sm107BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         else:
             self.element_offset = 1
             self.epi_loop_size = self.epi_tile_n
-
-        # copy_size is in bytes for cp.reduce.async.bulk instruction
-        self.copy_size = self.cta_tile_shape_mnk[1] * (self.c_dtype.width // 8)
 
     def _is_interleaved_utccp(self) -> bool:
         """Enable interleaving UTCCP for Bkeep-Breuse case for 4xFP4 kernel."""
@@ -1125,11 +1152,11 @@ class Sm107BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                     cur_tile_coord = work_tile.tile_idx
                     mma_tile_coord_m = cur_tile_coord[0] // cute.size(tiled_mma.thr_id.shape)
 
-                    expert_idx = tile_idx_to_group_idx[mma_tile_coord_m]
                     tile_idx = mma_tile_coord_m
 
                     if tile_idx < num_valid_tiles:
-                        mn_limit = tile_idx_to_mn_limit[mma_tile_coord_m]
+                        expert_idx = tile_idx_to_group_idx[tile_idx]
+                        mn_limit = tile_idx_to_mn_limit[tile_idx]
 
                         tile_info_pipeline.producer_acquire(tile_info_producer_state)
                         with cute.arch.elect_one():
@@ -1154,11 +1181,11 @@ class Sm107BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                     cur_tile_coord = work_tile.tile_idx
                     mma_tile_coord_m = cur_tile_coord[0] // cute.size(tiled_mma.thr_id.shape)
 
-                    expert_idx = tile_idx_to_group_idx[mma_tile_coord_m]
                     tile_idx = mma_tile_coord_m
 
                     if tile_idx < num_valid_tiles:
-                        mn_limit = tile_idx_to_mn_limit[mma_tile_coord_m]
+                        expert_idx = tile_idx_to_group_idx[tile_idx]
+                        mn_limit = tile_idx_to_mn_limit[tile_idx]
                         tile_info_pipeline.producer_acquire(tile_info_producer_state)
                         with cute.arch.elect_one():
                             sInfo[(0, tile_info_producer_state.index)] = cur_tile_coord[0]
@@ -1580,11 +1607,12 @@ class Sm107BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                     # Compute token info and scaled alpha for this row
                     token_idx = cutlass.Int32(0)
                     alpha_val_iter = alpha_val
-                    if is_valid_row:
-                        token_idx = expanded_idx // self.topK
-                        topk_idx = expanded_idx % self.topK
-                        token_scale = token_final_scales[(token_idx, topk_idx)]
-                        alpha_val_iter = alpha_val * token_scale
+                    if cutlass.const_expr(self.use_fused_finalize):
+                        if is_valid_row:
+                            token_idx = expanded_idx // self.topK
+                            topk_idx = expanded_idx % self.topK
+                            token_scale = token_final_scales[(token_idx, topk_idx)]
+                            alpha_val_iter = alpha_val * token_scale
 
                     for n_iter_idx in cutlass.range(n_subtile_cnt):
                         # Load accumulator from tensor memory buffer to register
@@ -1622,31 +1650,53 @@ class Sm107BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
 
                     if is_valid_row:
                         expanded_idx = permuted_idx_to_expanded_idx[permuted_row]
-                        token_idx = expanded_idx // self.topK
+                        # Fused: accumulate into the token's row. Unfused: each
+                        # expanded slot is written by exactly one permuted row.
+                        output_idx = expanded_idx
+                        if cutlass.const_expr(self.use_fused_finalize):
+                            output_idx = expanded_idx // self.topK
                         coord_n = mma_tile_coord_mnl[1] * self.cta_tile_shape_mnk[1]
-                        scatter_out_offset = cute.domain_offset((token_idx, coord_n, 0), c)
-
-                        # sC row index: m_iter_idx * 128 + epi_tidx
-                        sC_row = m_iter_idx * 128 + epi_tidx
-
-                        if cutlass.const_expr(self.c_dtype == cutlass.BFloat16):
-                            blk_reduce_bf16(
-                                scatter_out_offset,
-                                sC[sC_row, None, 0],
-                                cutlass.Int32(self.copy_size),
+                        valid_columns = cutlass.min(
+                            cutlass.Int64(c.shape[1]) - coord_n,
+                            cutlass.Int64(self.cta_tile_shape_mnk[1]),
+                        )
+                        if valid_columns > 0:
+                            scatter_out_offset = cute.domain_offset(
+                                (output_idx, coord_n, 0), c
                             )
-                        elif cutlass.const_expr(self.c_dtype == cutlass.Float32):
-                            blk_reduce_fp32(
-                                scatter_out_offset,
-                                sC[sC_row, None, 0],
-                                cutlass.Int32(self.copy_size),
+                            sC_row = m_iter_idx * 128 + epi_tidx
+                            # Bound the transfer to this shard, as in Blackwell.
+                            valid_copy_size = cutlass.Int32(
+                                valid_columns * (self.c_dtype.width // 8)
                             )
-                        elif cutlass.const_expr(self.c_dtype == cutlass.Float16):
-                            blk_reduce_fp16(
-                                scatter_out_offset,
-                                sC[sC_row, None, 0],
-                                cutlass.Int32(self.copy_size),
-                            )
+                            if cutlass.const_expr(not self.use_fused_finalize):
+                                blk_copy(
+                                    scatter_out_offset,
+                                    sC[sC_row, None, 0],
+                                    valid_copy_size,
+                                )
+                            elif cutlass.const_expr(self.c_dtype == cutlass.BFloat16):
+                                blk_reduce_bf16(
+                                    scatter_out_offset,
+                                    sC[sC_row, None, 0],
+                                    valid_copy_size,
+                                )
+                            elif cutlass.const_expr(self.c_dtype == cutlass.Float32):
+                                blk_reduce_fp32(
+                                    scatter_out_offset,
+                                    sC[sC_row, None, 0],
+                                    valid_copy_size,
+                                )
+                            elif cutlass.const_expr(self.c_dtype == cutlass.Float16):
+                                blk_reduce_fp16(
+                                    scatter_out_offset,
+                                    sC[sC_row, None, 0],
+                                    valid_copy_size,
+                                )
+                # The next tile reuses sC. Finish the async reductions' reads
+                # before any epilogue thread overwrites its shared rows.
+                cute.arch.cp_async_bulk_commit_group()
+                cute.arch.cp_async_bulk_wait_group(0, read=True)
                 self.epilog_sync_barrier.arrive_and_wait()
                 # ============================================================
                 # END OF NEW CODE
@@ -1880,11 +1930,14 @@ class Sm107BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             ),
         )
         actual_c_stride_row = n if c_stride_row == 0 else c_stride_row
+        output_rows = num_tokens
+        if cutlass.const_expr(not self.use_fused_finalize):
+            output_rows = num_tokens * top_k
         c = cute.make_tensor(
             c_ptr,
             layout=cute.make_layout(
-                (num_tokens, n, 1),
-                stride=(actual_c_stride_row, 1, num_tokens * actual_c_stride_row),
+                (output_rows, n, 1),
+                stride=(actual_c_stride_row, 1, output_rows * actual_c_stride_row),
             ),
         )
         alpha = cute.make_tensor(alpha_ptr, layout=cute.make_layout((l,)))

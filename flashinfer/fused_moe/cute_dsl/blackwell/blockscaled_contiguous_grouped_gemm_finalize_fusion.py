@@ -1393,9 +1393,20 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         tCgC = thr_mma.partition_C(gC_mnl)
 
         #
+        # Grid dependency wait before the first read of the routing outputs
+        # (num_non_exiting_tiles and the tile lists). Under programmatic
+        # dependent launch this grid may start while the kernel two launches
+        # back (the routing kernel) is still writing them: the dense GEMM1
+        # triggers its dependents at entry, before its own wait. Reading the
+        # lists earlier picked up a stale group index and faulted in the
+        # scheduler warp (about 1 in 30 graph replays in CI).
+        #
+        griddepcontrol_wait()
+
+        #
         # Persistent tile scheduler state. Emit the first tile before the
-        # cluster/grid dependency wait so consumers can start as soon as the
-        # wait completes; the main scheduler loop resumes from the next tile.
+        # cluster wait so consumers can start as soon as it completes; the
+        # main scheduler loop resumes from the next tile.
         #
         tile_sched = utils.StaticPersistentTileScheduler.create(
             tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
@@ -1415,11 +1426,11 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                 mma_tile_coord_m = cur_tile_coord[0] // cute.size(
                     tiled_mma.thr_id.shape
                 )
-                expert_idx = tile_idx_to_expert_idx[mma_tile_coord_m]
                 tile_idx = mma_tile_coord_m
 
                 if tile_idx < num_valid_tiles:
                     tile_info_pipeline.producer_acquire(tile_info_producer_state)
+                    expert_idx = tile_idx_to_expert_idx[tile_idx]
                     mn_limit = tile_idx_to_mn_limit[tile_idx]
                     with cute.arch.elect_one():
                         sInfo[(0, tile_info_producer_state.index)] = cur_tile_coord[0]
@@ -1451,7 +1462,12 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         else:
             self.cta_sync_barrier.arrive_and_wait()
 
-        griddepcontrol_wait()
+        # The standalone finalizer can prepare its independent state while
+        # FC2 runs. Its dependency wait still protects every FC2 output load.
+        if cutlass.const_expr(self.enable_pdl and not self.use_fused_finalize):
+            if warp_idx == self.mma_warp_id:
+                with cute.arch.elect_one():
+                    griddepcontrol_launch_dependents()
 
         #
         # Specialized Schedule warp
@@ -1467,10 +1483,10 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                     mma_tile_coord_m = cur_tile_coord[0] // cute.size(
                         tiled_mma.thr_id.shape
                     )
-                    expert_idx = tile_idx_to_expert_idx[mma_tile_coord_m]
                     tile_idx = mma_tile_coord_m
                     if tile_idx < num_valid_tiles:
                         tile_info_pipeline.producer_acquire(tile_info_producer_state)
+                        expert_idx = tile_idx_to_expert_idx[tile_idx]
                         mn_limit = tile_idx_to_mn_limit[tile_idx]
                         with cute.arch.elect_one():
                             sInfo[(0, tile_info_producer_state.index)] = cur_tile_coord[
@@ -1502,10 +1518,10 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                     mma_tile_coord_m = cur_tile_coord[0] // cute.size(
                         tiled_mma.thr_id.shape
                     )
-                    expert_idx = tile_idx_to_expert_idx[mma_tile_coord_m]
                     tile_idx = mma_tile_coord_m
                     if tile_idx < num_valid_tiles:
                         tile_info_pipeline.producer_acquire(tile_info_producer_state)
+                        expert_idx = tile_idx_to_expert_idx[tile_idx]
                         mn_limit = tile_idx_to_mn_limit[tile_idx]
                         with cute.arch.elect_one():
                             sInfo[(0, tile_info_producer_state.index)] = cur_tile_coord[

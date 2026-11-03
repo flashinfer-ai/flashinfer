@@ -65,6 +65,22 @@ try:
 except (ImportError, RuntimeError):
     gated_delta_rule_mtp_ucache_flush = None  # type: ignore
 
+# UMMA (tcgen05 / TMEM) backend of the flush kernel for SM100 (fp16-state arm); reached
+# through gated_delta_rule_mtp_ucache_flush(backend="auto") or called directly.
+try:
+    from .gdn_replay_mtp_umma import (
+        flush_first_row_order,
+        gated_delta_rule_mtp_ucache_flush_umma,
+    )
+except (ImportError, RuntimeError):
+    gated_delta_rule_mtp_ucache_flush_umma = None  # type: ignore
+    flush_first_row_order = None  # type: ignore
+
+try:
+    from .gdn_prefix_materialize import gdn_prefix_materialize
+except (ImportError, RuntimeError):
+    gdn_prefix_materialize = None  # type: ignore
+
 try:
     from .gdn_decode_pretranspose import run_pretranspose_decode
 except (ImportError, RuntimeError):
@@ -89,21 +105,30 @@ except (ImportError, RuntimeError):
     get_mtp_config = None  # type: ignore
 
 try:
-    from .blackwell import chunk_gated_delta_rule_sm100, cp_delta_rule_dsl_sm100
+    from .blackwell import (
+        _chunk_gated_delta_rule_gdn_cp_sm100,
+        chunk_gated_delta_rule_sm100,
+        cp_delta_rule_dsl_sm100,
+    )
 except (ImportError, RuntimeError):
+    _chunk_gated_delta_rule_gdn_cp_sm100 = None  # type: ignore
     chunk_gated_delta_rule_sm100 = None  # type: ignore
     cp_delta_rule_dsl_sm100 = None  # type: ignore
 
 try:
     from .delta_rule_dsl import (
+        chunk_gated_delta_rule_sm80,
         chunk_gated_delta_rule_sm90,
         chunk_gated_delta_rule_sm120,
+        cp_delta_rule_dsl_sm80,
         cp_delta_rule_dsl_sm90,
         cp_delta_rule_dsl_sm120,
     )
 except (ImportError, RuntimeError):
+    chunk_gated_delta_rule_sm80 = None  # type: ignore
     chunk_gated_delta_rule_sm90 = None  # type: ignore
     chunk_gated_delta_rule_sm120 = None  # type: ignore
+    cp_delta_rule_dsl_sm80 = None  # type: ignore
     cp_delta_rule_dsl_sm90 = None  # type: ignore
     cp_delta_rule_dsl_sm120 = None  # type: ignore
 
@@ -112,6 +137,9 @@ __all__ = [
     "gated_delta_rule_mtp",
     "gated_delta_rule_mtp_ucache",
     "gated_delta_rule_mtp_ucache_flush",
+    "gated_delta_rule_mtp_ucache_flush_umma",
+    "flush_first_row_order",
+    "gdn_prefix_materialize",
     "gated_delta_rule_mtp_wy_output_only",
     "gated_delta_rule_bf16state_cooprow",
     "gated_delta_rule_bf16state_cooprow_mtp",
@@ -121,9 +149,11 @@ __all__ = [
     "get_tile_v_mtp",
     "get_vec_size_mtp",
     "get_mtp_config",
+    "chunk_gated_delta_rule_sm80",
     "chunk_gated_delta_rule_sm90",
     "chunk_gated_delta_rule_sm100",
     "chunk_gated_delta_rule_sm120",
+    "cp_delta_rule_dsl_sm80",
     "cp_delta_rule_dsl_sm90",
     "cp_delta_rule_dsl_sm100",
     "cp_delta_rule_dsl_sm120",

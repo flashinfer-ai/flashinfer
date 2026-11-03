@@ -355,6 +355,26 @@ class CPDeltaRuleFixupHmmaSm100(CPDeltaRuleFixupHmmaSm120):
     """SM100 specialization of the HMMA fixup fallback."""
 
 
+def _utcmma_fixup_supports_output_state(output_state: torch.Tensor | None) -> bool:
+    """Whether the UTCMMA fixups can store final states into this pool.
+
+    ``store_acc`` copies each thread's state fragment to the pool with a
+    vectorized store along K that assumes a 16-byte-aligned fragment start, so
+    K must be the unit-stride dimension and every other stride and the base must
+    be 16-byte aligned. Other layouts (e.g. a ``[N, H, K, V]`` buffer passed as
+    its ``[N, H, V, K]`` transpose) go through the SIMT fixup, whose stores make
+    no alignment assumption. Initial-state pools are read without it as well.
+    """
+    if output_state is None:
+        return True
+    element_size = output_state.element_size()
+    return (
+        output_state.stride(-1) == 1
+        and all(s * element_size % 16 == 0 for s in output_state.stride()[:-1])
+        and output_state.data_ptr() % 16 == 0
+    )
+
+
 @functools.cache
 def _get_fixup_kernel(
     needs_initial_state,
@@ -570,6 +590,17 @@ def cp_delta_rule_fixup_dsl_sm100(
             _kernel_kind = "utcmma64"
         else:
             _kernel_kind = "utcmma128"
+        if _kernel_kind.startswith(
+            "utcmma"
+        ) and not _utcmma_fixup_supports_output_state(output_state):
+            _kernel_kind = "simt_row4"
+    elif _kernel_kind.startswith("utcmma") and not _utcmma_fixup_supports_output_state(
+        output_state
+    ):
+        raise ValueError(
+            f"fixup kernel {_kernel_kind!r} requires a K-contiguous, 16-byte-aligned "
+            "output state pool"
+        )
     kernel = _get_fixup_kernel(
         needs_initial_state,
         store_final_state,

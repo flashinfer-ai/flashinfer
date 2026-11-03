@@ -67,8 +67,8 @@ struct DataBase {
   int32_t* mPtrPermutedIdxToExpandedIdx{nullptr};
   // optional: if `nullptr`, it is not filled
   // dim: [mTileTokensDim * mTopK + (mNumExperts × mTileTokensDim) - mNumExperts]
-  // Note: this array (mPtrPermutedIdxToTokenIdx) is uninitialized
-  // Any out-of-bounds values are undefined.
+  // Unused rows within active expert tiles are set to -1 to suppress TMA gathers.
+  // Entries beyond the actual padded count remain undefined.
   int32_t* mPtrPermutedIdxToTokenIdx{nullptr};
 
   // optional: if `nullptr`, it is not filled

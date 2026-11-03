@@ -1,17 +1,19 @@
 # kernel_src — vendored kernel snapshots
 
-Every directory here is one snapshot of one upstream kernel repo (see each
-drop's `VENDOR.md` for provenance, `SKILL.md` for the drop-update workflow).
-Layout is by **provenance**, not taxonomy: the user-facing
-`sm<arch>/<dtype-style>` organization lives in `backends/mega/kernel/`, which
-wraps these drops.
+Each snapshot lives under `sm<arch>/<tree_name>/`, such as
+`sm100/cutedsl_megamoe` or `sm107/next_cutedsl_megamoe`. Its `VENDOR.md`
+records the upstream revision; `SKILL.md` describes how to update it.
+Backends under `backends/mega/kernel/sm<arch>/<dtype-style>/` wrap these kernels.
 
 ## The one rule: `src/` is verbatim
 
-The `src/` tree of every drop is a byte-for-byte copy of its upstream commit.
+The `src/` tree of every drop is a byte-for-byte copy of its upstream source
+or pinned upstream exporter output, as specified in that drop's `VENDOR.md`.
+For exported drops, record the exporter revision, selected entry points and
+transformations, and compare against a regenerated export.
 **Do not edit it — not for bugs, and not for style.** That explicitly includes
 docstrings, comments, formatting, lint appeasement, type annotations, and
-import sorting. `diff -r` against the upstream drop must come back clean;
+import sorting. `diff -r` against the declared upstream drop/export must be clean;
 every local byte of drift makes the next re-sync harder and hides real
 divergence.
 
@@ -24,7 +26,7 @@ style findings inside `src/` are not actionable.
 
 Access flows one direction only (full rules in the ``flashinfer.moe_ep``
 package docstring): a drop's `shim/` is the only code that imports its `src/`;
-backends are the only consumers of a drop, and only via the drop's package
+backends and maintained kernels consume drops only via the drop's package
 `__init__` (never shim submodules); the layer/modes/core tiers use backend
 APIs only. Sole exception: kernel-oracle tests may import a drop's package
 `__init__` to validate it below the backend.

@@ -46,14 +46,14 @@ def _build_bf16_moe_config(*, offset, local_num_experts, max_tokens):
         ExpertConfig,
         MoEConfig,
         QuantConfig,
-        QuantVariant,
+        QuantFormat,
         RoutingConfig,
         TrtllmBf16Config,
     )
 
     return MoEConfig(
         routing=RoutingConfig(num_experts=NUM_EXPERTS, top_k=TOP_K),
-        quant=QuantConfig(variant=QuantVariant.BF16),
+        quant=QuantConfig(weight=QuantFormat.BF16, activation=QuantFormat.BF16),
         experts=ExpertConfig(
             intermediate_size=INTERMEDIATE,
             local_expert_offset=offset,
@@ -358,7 +358,9 @@ def _run_w4a8_dispatch(layout_str, *, mxfp8_dispatch):
         max_tokens *= local_num_experts
     moe = fm.MoEConfig(
         routing=fm.RoutingConfig(num_experts=W4A8_NUM_EXPERTS, top_k=W4A8_TOP_K),
-        quant=fm.QuantConfig(variant=fm.QuantVariant.MXFP4),
+        quant=fm.QuantConfig(
+            weight=fm.QuantFormat.MXFP4, activation=fm.QuantFormat.MXFP8
+        ),
         experts=fm.ExpertConfig(
             intermediate_size=W4A8_INTERMEDIATE,
             local_expert_offset=offset,

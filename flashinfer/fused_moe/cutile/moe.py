@@ -34,17 +34,26 @@ import cuda.tile as ct
 import torch
 
 from ...cutile.cutile_common import cached_replace_hints
-from ...tllm_enums import ActivationType
 from ...utils import next_positive_power_of_2
-from .activation import _apply_activation, _validate_activation, launch_activation
+from ..api import ActivationConfig
+from ..utils import (
+    _CUTILE_PERMUTE_SMALL_MAX_ASSIGNMENTS as _PERMUTE_SMALL_MAX_ASSIGNMENTS,
+    _CUTILE_PERMUTE_TILE_CAP as _PERMUTE_TILE_CAP,
+    _cutile_max_permuted_rows as _max_permuted_rows,
+    _cutile_permute_shape as _permute_shape,
+)
+from .activation import (
+    _activation_kernel_args,
+    _apply_ungated_activation,
+    _validate_activation,
+    launch_activation,
+)
 from .indexing import needs_int64_indexing
 
+ConstFloat: TypeAlias = ct.Constant[float]
 ConstInt: TypeAlias = ct.Constant[int]
 ConstBool: TypeAlias = ct.Constant[bool]
 
-_PERMUTE_TILE_CAP = 16384
-# A single-CTA histogram avoids multi-stage routing overhead at decode sizes.
-_PERMUTE_SMALL_MAX_ASSIGNMENTS = 24
 _NO_ACTIVATION = -1
 
 
@@ -72,25 +81,6 @@ class Workspace:
     gemm1_out: torch.Tensor
     activation_out: torch.Tensor
     gemm2_out: torch.Tensor
-
-
-def _permute_shape(num_assignments: int, num_experts: int) -> tuple[int, int, int]:
-    epow2 = next_positive_power_of_2(num_experts)
-    max_chunk = max(8, _PERMUTE_TILE_CAP // epow2)
-    target_chunks = max(8, _PERMUTE_TILE_CAP // (4 * epow2))
-    chunk = min(
-        max(8, max_chunk // 2),
-        max(8, next_positive_power_of_2(num_assignments) // target_chunks),
-    )
-    if 32 * max_chunk <= num_assignments < 128 * max_chunk:
-        # Bound the histogram count after the initial parallelism ramp.
-        chunk = max_chunk
-    elif num_assignments >= 128 * max_chunk:
-        # Reintroduce chunks to expose enough CTAs for large routing batches.
-        chunk = min(32, max(8, max_chunk // 2))
-    num_chunks = max(1, (num_assignments + chunk - 1) // chunk)
-    ncp = next_positive_power_of_2(num_chunks)
-    return epow2, chunk, ncp
 
 
 def _permute_workspace_shape(
@@ -140,22 +130,30 @@ def allocate_workspace(
     allocate_activation_output: bool = True,
     allocate_gemm1_output: bool | None = None,
     gemm1_output_rows: int | None = None,
+    sorted_io: bool = False,
 ) -> Workspace:
-    """Allocate graph-stable buffers for one exact token shape and tactic set."""
+    """Allocate graph-stable buffers for one exact token shape and tactic set.
+
+    With ``sorted_io`` the GEMM1 output and activation buffers are sized for the
+    padded, expert-sorted row space so ``run_moe(sorted_io=True)`` can write
+    GEMM1 tiles contiguously and feed GEMM2 through TMA loads.
+    """
     if not block_sizes or any(block_size <= 0 for block_size in block_sizes):
         raise ValueError("block_sizes must contain positive integers.")
     num_assignments = num_tokens * top_k
+    max_em = max(
+        _max_permuted_rows(num_assignments, num_experts, block_size)
+        for block_size in block_sizes
+    )
     if allocate_gemm1_output is None:
         allocate_gemm1_output = is_gated
     if gemm1_output_rows is None:
-        gemm1_output_rows = num_assignments
+        gemm1_output_rows = max_em if sorted_io else num_assignments
     if allocate_gemm1_output and gemm1_output_rows < num_assignments:
         raise ValueError("gemm1_output_rows must cover every routed assignment.")
-    max_em = max(
-        num_assignments + num_experts * (block_size - 1) for block_size in block_sizes
-    )
+    activation_output_rows = max_em if sorted_io else num_assignments
     max_blocks = max(
-        (num_assignments + num_experts * (block_size - 1) + block_size - 1)
+        (_max_permuted_rows(num_assignments, num_experts, block_size) + block_size - 1)
         // block_size
         for block_size in block_sizes
     )
@@ -186,7 +184,11 @@ def allocate_workspace(
             device=device,
         ),
         activation_out=torch.empty(
-            ((num_assignments, intermediate_size) if allocate_activation_output else 0),
+            (
+                (activation_output_rows, intermediate_size)
+                if allocate_activation_output
+                else 0
+            ),
             dtype=bf16,
             device=device,
         ),
@@ -486,6 +488,7 @@ def _permute_small(
 @ct.function
 def _grouped_gemm_bf16_impl(
     X,
+    X_SORTED,
     W,
     SORTED_SLOTS,
     BLOCK_EXPERT,
@@ -498,6 +501,11 @@ def _grouped_gemm_bf16_impl(
     TILE_N: ConstInt,
     TILE_K: ConstInt,
     ACTIVATION_TYPE: ConstInt,
+    ACTIVATION_PARAM1: ConstFloat,
+    ACTIVATION_PARAM2: ConstFloat,
+    ACTIVATION_PARAM3: ConstFloat,
+    INPUT_SORTED: ConstBool,
+    OUTPUT_SORTED: ConstBool,
     USE_INT64: ConstBool,
 ):
     initial_m_block = ct.bid(0)
@@ -525,17 +533,29 @@ def _grouped_gemm_bf16_impl(
                 rows = ct.astype(rows, ct.int64)
             accumulator = ct.zeros((TILE_M, TILE_N), dtype=ct.float32)
             for k_tile in range(num_k_tiles):
-                a_indices = ct.reshape(rows, (TILE_M, 1)) * K_IN + ct.reshape(
-                    k_tile * TILE_K + k_offsets, (1, TILE_K)
-                )
-                # Padded routing slots carry a one-past-the-end row sentinel.
-                a = ct.gather(
-                    X,
-                    (a_indices,),
-                    padding_value=0,
-                    check_bounds=True,
-                    latency=3,
-                )
+                if INPUT_SORTED:
+                    # Rows of the padded sorted space map 1:1 onto this block,
+                    # so the A tile is a plain contiguous load.
+                    a = ct.load(
+                        X_SORTED,
+                        index=(m_block, k_tile),
+                        shape=(TILE_M, TILE_K),
+                        allow_tma=True,
+                        latency=3,
+                        padding_mode=ct.PaddingMode.ZERO,
+                    )
+                else:
+                    a_indices = ct.reshape(rows, (TILE_M, 1)) * K_IN + ct.reshape(
+                        k_tile * TILE_K + k_offsets, (1, TILE_K)
+                    )
+                    # Padded routing slots carry a one-past-the-end row sentinel.
+                    a = ct.gather(
+                        X,
+                        (a_indices,),
+                        padding_value=0,
+                        check_bounds=True,
+                        latency=3,
+                    )
                 b = ct.reshape(
                     ct.load(
                         W,
@@ -553,13 +573,21 @@ def _grouped_gemm_bf16_impl(
             # fused and unfused paths have the same precision boundary.
             values = ct.astype(accumulator, OUT.dtype)
             if ACTIVATION_TYPE != _NO_ACTIVATION:
-                values = _apply_activation(
-                    ct.astype(values, ct.float32), ACTIVATION_TYPE
+                values = _apply_ungated_activation(
+                    ct.astype(values, ct.float32),
+                    ACTIVATION_TYPE,
+                    ACTIVATION_PARAM1,
+                    ACTIVATION_PARAM2,
+                    ACTIVATION_PARAM3,
                 )
+            # A TMA ``ct.store`` of the sorted tile measured 13-18% slower than
+            # this scatter on SM120, so the sorted layout keeps the scatter and
+            # only swaps the row indices.
+            output_rows = m_offsets if OUTPUT_SORTED else slots
             ct.scatter(
                 OUT,
                 (
-                    ct.reshape(slots, (TILE_M, 1)),
+                    ct.reshape(output_rows, (TILE_M, 1)),
                     ct.reshape(n_offsets, (1, TILE_N)),
                 ),
                 ct.astype(values, OUT.dtype),
@@ -570,6 +598,7 @@ def _grouped_gemm_bf16_impl(
 @ct.kernel
 def _grouped_gemm_bf16(
     X,
+    X_SORTED,
     W,
     SORTED_SLOTS,
     BLOCK_EXPERT,
@@ -582,9 +611,15 @@ def _grouped_gemm_bf16(
     TILE_N: ConstInt,
     TILE_K: ConstInt,
     ACTIVATION_TYPE: ConstInt,
+    ACTIVATION_PARAM1: ConstFloat,
+    ACTIVATION_PARAM2: ConstFloat,
+    ACTIVATION_PARAM3: ConstFloat,
+    INPUT_SORTED: ConstBool,
+    OUTPUT_SORTED: ConstBool,
 ):
     _grouped_gemm_bf16_impl(
         X,
+        X_SORTED,
         W,
         SORTED_SLOTS,
         BLOCK_EXPERT,
@@ -597,6 +632,11 @@ def _grouped_gemm_bf16(
         TILE_N,
         TILE_K,
         ACTIVATION_TYPE,
+        ACTIVATION_PARAM1,
+        ACTIVATION_PARAM2,
+        ACTIVATION_PARAM3,
+        INPUT_SORTED,
+        OUTPUT_SORTED,
         False,
     )
 
@@ -604,6 +644,7 @@ def _grouped_gemm_bf16(
 @ct.kernel
 def _grouped_gemm_bf16_i64(
     X: ct.IndexedWithInt64,
+    X_SORTED: ct.IndexedWithInt64,
     W: ct.IndexedWithInt64,
     SORTED_SLOTS,
     BLOCK_EXPERT,
@@ -616,9 +657,15 @@ def _grouped_gemm_bf16_i64(
     TILE_N: ConstInt,
     TILE_K: ConstInt,
     ACTIVATION_TYPE: ConstInt,
+    ACTIVATION_PARAM1: ConstFloat,
+    ACTIVATION_PARAM2: ConstFloat,
+    ACTIVATION_PARAM3: ConstFloat,
+    INPUT_SORTED: ConstBool,
+    OUTPUT_SORTED: ConstBool,
 ):
     _grouped_gemm_bf16_impl(
         X,
+        X_SORTED,
         W,
         SORTED_SLOTS,
         BLOCK_EXPERT,
@@ -631,6 +678,11 @@ def _grouped_gemm_bf16_i64(
         TILE_N,
         TILE_K,
         ACTIVATION_TYPE,
+        ACTIVATION_PARAM1,
+        ACTIVATION_PARAM2,
+        ACTIVATION_PARAM3,
+        INPUT_SORTED,
+        OUTPUT_SORTED,
         True,
     )
 
@@ -717,7 +769,7 @@ def _permute(
     workspace: Workspace,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     num_assignments = topk_ids.numel()
-    em = num_assignments + num_experts * (block_size - 1)
+    em = _max_permuted_rows(num_assignments, num_experts, block_size)
     num_blocks = (em + block_size - 1) // block_size
     sorted_slots = workspace.sorted_slots[:em]
     block_expert = workspace.block_expert[:num_blocks]
@@ -852,14 +904,27 @@ def _grouped_gemm(
     top_k: int,
     block_size: int,
     config: GemmConfig,
-    activation_type: ActivationType | None = None,
+    activation: ActivationConfig | None = None,
+    num_assignments: int | None = None,
+    input_sorted: bool = False,
+    output_sorted: bool = False,
 ) -> None:
-    if activation_type is not None:
-        activation_type = _validate_activation(activation_type)
-    num_assignment_rows = output.shape[0]
+    if activation is not None:
+        activation = _validate_activation(activation)
+    if num_assignments is None:
+        num_assignments = output.shape[0]
     n = output.shape[1]
     m_blocks = (sorted_slots.shape[0] + block_size - 1) // block_size
-    grid_m = max(1, min(m_blocks, num_assignment_rows))
+    # Live blocks never reach past num_post_pad <= len(sorted_slots), so the
+    # sorted buffers only need to cover the padded routing space itself.
+    padded_rows = sorted_slots.shape[0]
+    if (input_sorted and x.shape[0] < padded_rows) or (
+        output_sorted and output.shape[0] < padded_rows
+    ):
+        raise ValueError(
+            "sorted grouped GEMM buffers must cover the padded routing space."
+        )
+    grid_m = max(1, min(m_blocks, num_assignments))
     base_kernel = (
         _grouped_gemm_bf16_i64
         if needs_int64_indexing(x, weights, output)
@@ -872,6 +937,7 @@ def _grouped_gemm(
         kernel,
         (
             x.reshape(-1),
+            x,
             weights,
             sorted_slots,
             block_expert,
@@ -883,11 +949,13 @@ def _grouped_gemm(
             block_size,
             config.tile_n,
             config.tile_k,
-            (
-                _NO_ACTIVATION
-                if activation_type is None
-                else int(ActivationType(activation_type))
+            *(
+                (_NO_ACTIVATION, 0.0, 0.0, 0.0)
+                if activation is None
+                else _activation_kernel_args(activation)
             ),
+            input_sorted,
+            output_sorted,
         ),
     )
 
@@ -901,12 +969,20 @@ def run_moe(
     output: torch.Tensor,
     workspace: Workspace,
     *,
-    activation_type: ActivationType,
+    activation: ActivationConfig,
     block_size: int,
     gemm1_config: GemmConfig,
     gemm2_config: GemmConfig,
+    sorted_io: bool = False,
 ) -> torch.Tensor:
-    """Run the complete pre-routed BF16 MoE pipeline."""
+    """Run the complete pre-routed BF16 MoE pipeline.
+
+    With ``sorted_io`` GEMM1 stores its tiles in the padded expert-sorted row
+    space instead of scattering them back to assignment order, so the
+    activation runs on contiguous rows and GEMM2 loads its A operand with TMA
+    instead of a per-row gather. Padded rows only ever feed rows that the
+    GEMM2 epilogue drops, so their contents are irrelevant.
+    """
     num_tokens, hidden_size = hidden_states.shape
     top_k = topk_ids.shape[1]
     num_assignments = num_tokens * top_k
@@ -915,9 +991,21 @@ def run_moe(
     sorted_slots, block_expert, num_post_pad = _permute(
         topk_ids, w1.shape[0], block_size, workspace
     )
-    activation_out = workspace.activation_out[:num_assignments]
-    if activation_type.is_gated:
-        gemm1_out = workspace.gemm1_out[:num_assignments]
+    stage_rows = sorted_slots.shape[0] if sorted_io else num_assignments
+    if workspace.activation_out.shape[0] < stage_rows:
+        raise ValueError(
+            "workspace.activation_out is too small for this launch; allocate it "
+            "with sorted_io=True to run the sorted pipeline."
+        )
+    activation_out = workspace.activation_out[:stage_rows]
+    activation = _validate_activation(activation)
+    if activation.is_gated:
+        if workspace.gemm1_out.shape[0] < stage_rows:
+            raise ValueError(
+                "workspace.gemm1_out is too small for this launch; allocate it "
+                "with sorted_io=True to run the sorted pipeline."
+            )
+        gemm1_out = workspace.gemm1_out[:stage_rows]
         _grouped_gemm(
             hidden_states,
             w1,
@@ -928,8 +1016,10 @@ def run_moe(
             top_k=top_k,
             block_size=block_size,
             config=gemm1_config,
+            num_assignments=num_assignments,
+            output_sorted=sorted_io,
         )
-        launch_activation(gemm1_out, activation_out, activation_type)
+        launch_activation(gemm1_out, activation_out, activation)
     else:
         _grouped_gemm(
             hidden_states,
@@ -941,7 +1031,9 @@ def run_moe(
             top_k=top_k,
             block_size=block_size,
             config=gemm1_config,
-            activation_type=activation_type,
+            activation=activation,
+            num_assignments=num_assignments,
+            output_sorted=sorted_io,
         )
     gemm2_out = workspace.gemm2_out[:num_assignments]
     _grouped_gemm(
@@ -954,6 +1046,8 @@ def run_moe(
         top_k=1,
         block_size=block_size,
         config=gemm2_config,
+        num_assignments=num_assignments,
+        input_sorted=sorted_io,
     )
     tile_h = _combine_tile_h(num_tokens, hidden_size)
     ct.launch(

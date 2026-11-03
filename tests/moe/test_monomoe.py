@@ -18,6 +18,7 @@ from flashinfer.fused_moe import alloc_scratchpad, has_monomoe, mono_moe
 from flashinfer.utils import is_sm90a_supported
 
 BLOCK = 128
+_MONOMOE_GRID_SIZE = 128
 
 
 # ── Block-FP8 quantization / reference helpers (inlined) ─────────────────────
@@ -160,6 +161,12 @@ def _run_and_compare(x, logits, weights, N, K, top_k, scratchpad=None):
 def _require_monomoe(dev):
     if not is_sm90a_supported(dev):
         pytest.skip("monomoe requires SM90a (Hopper)")
+    sm_count = torch.cuda.get_device_properties(dev).multi_processor_count
+    if sm_count < _MONOMOE_GRID_SIZE:
+        pytest.skip(
+            "monomoe requires at least "
+            f"{_MONOMOE_GRID_SIZE} SMs for co-residency; got {sm_count}"
+        )
     if not has_monomoe():
         pytest.skip("monomoe unavailable for the E=256/N=512/K=2048 shape")
 

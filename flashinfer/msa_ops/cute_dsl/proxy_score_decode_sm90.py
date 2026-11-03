@@ -1,0 +1,453 @@
+"""MSA proxy-score fp8 decode schedule for SM90 (Hopper).
+
+Ported from the Kernel-Factory winner (2.70x geomean over the shipped Triton
+decode on held-out shapes). WGMMA with descriptor prefetch; index-K is consumed
+as fp8 e4m3 natively.
+
+The compile cache keys on (Hq, sq, batch_fast) -- head count, query tokens per
+sequence (1 / 2 / 4 for no-MTP / MTP1 / MTP3) and one schedule flag. No raw
+shapes, so one compile serves every batch and context length.
+"""
+
+import cutlass
+import cutlass.cute as cute
+import cutlass.utils as utils
+import cutlass.utils.hopper_helpers as sm90_utils
+from cutlass.cute.nvgpu import cpasync, warpgroup
+from cutlass.cute.runtime import from_dlpack
+
+from ...jit.cute_dsl_core import build_and_load_cute_dsl_kernel
+
+PAGE = 128
+HALF = 64
+DIM = 128
+NTHREADS = 128
+FP8 = cutlass.Float8E4M3FN
+
+
+@cute.kernel
+def _msa_kernel(
+    tma_atom_k: cute.CopyAtom,
+    mK: cute.Tensor,
+    mQ: cute.Tensor,
+    mPage: cute.Tensor,
+    mSeq: cute.Tensor,
+    mOut: cute.Tensor,
+    sK_layout: cute.ComposedLayout,
+    sQ_layout: cute.ComposedLayout,
+    tiled_mma: cute.TiledMma,
+    nbatch: cutlass.Int32,
+    nsplit: cutlass.Int32,
+    nq: cutlass.Constexpr,
+    Hq: cutlass.Constexpr,
+    sq: cutlass.Constexpr,
+    log2_hq: cutlass.Constexpr,
+    TN: cutlass.Constexpr,
+    batch_fast: cutlass.Constexpr,
+    NSTAGE: cutlass.Constexpr,
+):
+    """Score one decode sequence's pages against the fp8 index cache."""
+    NG = cutlass.const_expr(TN // 8)
+    NJ = cutlass.const_expr(1 if nq == 1 else 2)
+    NV = cutlass.const_expr(NG * NJ)
+    ACTIVE_GROUPS = cutlass.const_expr(4 if TN == 16 else (nq + 1) // 2)
+    QT = cutlass.const_expr(TN * 8)
+
+    warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+    if warp_idx == 0:
+        cpasync.prefetch_descriptor(tma_atom_k)
+
+    tidx, _, _ = cute.arch.thread_idx()
+    bx, by, _ = cute.arch.block_idx()
+    if cutlass.const_expr(batch_fast):
+        b, t0 = bx, by
+    else:
+        t0, b = bx, by
+
+    lane = tidx % 32
+    warp = tidx // 32
+    qrow = tidx // 8
+    neg = -cutlass.Float32.inf
+
+    smem = utils.SmemAllocator()
+    sK = smem.allocate_tensor(
+        FP8, sK_layout.outer, byte_alignment=1024, swizzle=sK_layout.inner
+    )
+    sQ = smem.allocate_tensor(
+        FP8, sQ_layout.outer, byte_alignment=1024, swizzle=sQ_layout.inner
+    )
+    sRed = smem.allocate_tensor(
+        cutlass.Float32, cute.make_layout((4, TN), stride=(TN, 1)), byte_alignment=16
+    )
+    # NSTAGE K buffers of two half-pages each: stage 2 * buf + h.
+    mbar = smem.allocate_array(element_type=cutlass.Int64, num_elems=2 * NSTAGE)
+
+    sk = mSeq[b]
+    ncols = cute.size(mPage, mode=[1])
+    nb = cutlass.min((sk + 127) // 128, ncols)
+
+    # This CTA scores tiles t0, t0 + nsplit, ... below nb. The grid has nsplit
+    # CTAs per sequence, sized from the SM count rather than from the score
+    # width: under a CUDA graph the width is max_model_len's tile count, so one
+    # CTA per column launched ~100x more CTAs than real tiles at 8k context.
+    if warp == 0:
+        with cute.arch.elect_one():
+            for st in cutlass.range_constexpr(2 * NSTAGE):
+                cute.arch.mbarrier_init(mbar + st, 1)
+    cute.arch.mbarrier_init_fence()
+
+    tKsK, tKgK = cpasync.tma_partition(
+        tma_atom_k,
+        0,
+        cute.make_layout(1),
+        cute.group_modes(sK, 0, 2),
+        cute.group_modes(mK, 0, 2),
+    )
+
+    # Prologue: the first NSTAGE - 1 tiles' K land while Q is staged.
+    if warp == 0:
+        for ps in cutlass.range_constexpr(NSTAGE - 1):
+            tp = t0 + ps * nsplit
+            if tp < nb:
+                pagep = mPage[b, tp]
+                for h in cutlass.range_constexpr(2):
+                    with cute.arch.elect_one():
+                        cute.arch.mbarrier_arrive_and_expect_tx(
+                            mbar + 2 * ps + h, HALF * DIM
+                        )
+                    cute.copy(
+                        tma_atom_k,
+                        tKgK[(None, 2 * pagep + h)],
+                        tKsK[(None, 2 * ps + h)],
+                        tma_bar_ptr=mbar + 2 * ps + h,
+                    )
+    if t0 < nb:
+        cp_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), FP8)
+        tv_cp = cute.make_tiled_copy_tv(
+            cp_atom,
+            cute.make_layout((TN, 8), stride=(8, 1)),
+            cute.make_layout((1, 16), stride=(0, 1)),
+        )
+        thr_cp = tv_cp.get_slice(tidx)
+        gQall = cute.make_tensor(
+            mQ.iterator,
+            cute.make_layout((TN, DIM, nbatch), stride=(DIM, 1, nq * DIM)),
+        )
+        if tidx < QT and qrow < nq:
+            tQs = thr_cp.partition_S(gQall[(None, None, b)])
+            frg = cute.make_fragment_like(tQs)
+            cute.copy(cp_atom, tQs, frg)
+            cute.copy(cp_atom, frg, thr_cp.partition_D(sQ[(None, None, 0)]))
+
+    cute.arch.fence_view_async_shared()
+    cute.arch.sync_threads()
+
+    thr_mma = tiled_mma.get_slice(0)
+    tCrA = tiled_mma.make_fragment_A(thr_mma.partition_A(sK))
+    tCrB = tiled_mma.make_fragment_B(thr_mma.partition_B(sQ))
+    rB = tCrB[(None, None, None, 0)]
+    row_base = warp * 16 + lane // 4
+    col_base = 2 * (lane % 4)
+
+    it = cutlass.Int32(0)
+    for t in cutlass.range(t0, nb, nsplit, unroll=1):
+        buf = it % NSTAGE
+        phase = (it // NSTAGE) & 1
+        # Prefetch NSTAGE - 1 tiles ahead into the buffer the previous
+        # iteration released at its closing barrier.
+        tn = t + (NSTAGE - 1) * nsplit
+        if warp == 0 and tn < nb:
+            pagen = mPage[b, tn]
+            nbuf = (it + NSTAGE - 1) % NSTAGE
+            for h in cutlass.range_constexpr(2):
+                st = 2 * nbuf + h
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_arrive_and_expect_tx(mbar + st, HALF * DIM)
+                cute.copy(
+                    tma_atom_k,
+                    tKgK[(None, 2 * pagen + h)],
+                    tKsK[(None, st)],
+                    tma_bar_ptr=mbar + st,
+                )
+
+        acc0 = thr_mma.make_fragment_C(thr_mma.partition_shape_C((HALF, TN)))
+        acc1 = thr_mma.make_fragment_C(thr_mma.partition_shape_C((HALF, TN)))
+        vals = [neg] * NV
+        for h in cutlass.range_constexpr(2):
+            cute.arch.mbarrier_wait(mbar + 2 * buf + h, phase)
+            rA = tCrA[(None, None, None, 2 * buf + h)]
+            acc = acc0 if cutlass.const_expr(h == 0) else acc1
+            warpgroup.fence()
+            for kb in cutlass.range_constexpr(cute.size(rA, mode=[2])):
+                tiled_mma.set(warpgroup.Field.ACCUMULATE, kb != 0)
+                cute.gemm(tiled_mma, acc, rA[None, None, kb], rB[None, None, kb], acc)
+            warpgroup.commit_group()
+        warpgroup.wait_group(1)
+
+        for h in cutlass.range_constexpr(2):
+            if cutlass.const_expr(h == 1):
+                warpgroup.wait_group(0)
+            acc = acc0 if cutlass.const_expr(h == 0) else acc1
+            # Tiles holding a query position are causally masked. With MTP the
+            # queries can straddle a tile boundary (sk % 128 < sq), so that is
+            # not only the last tile.
+            if t * 128 + 127 > sk - sq:
+                lim = sk - sq - 128 * t
+                for gg in cutlass.range_constexpr(NG):
+                    for j in cutlass.range_constexpr(NJ):
+                        climit = lim + ((col_base + 8 * gg + j) >> log2_hq)
+                        v = vals[NJ * gg + j]
+                        if lane % 4 < ACTIVE_GROUPS:
+                            for i in cutlass.range_constexpr(2):
+                                r = row_base + 64 * h + 8 * i
+                                if cutlass.const_expr(NG == 1):
+                                    a = acc[((j, i), 0, 0)]
+                                else:
+                                    a = acc[((j, i, gg), 0, 0)]
+                                v = cutlass.max(v, a if r <= climit else neg)
+                        vals[NJ * gg + j] = v
+            else:
+                for gg in cutlass.range_constexpr(NG):
+                    for j in cutlass.range_constexpr(NJ):
+                        v = vals[NJ * gg + j]
+                        if lane % 4 < ACTIVE_GROUPS:
+                            for i in cutlass.range_constexpr(2):
+                                if cutlass.const_expr(NG == 1):
+                                    a = acc[((j, i), 0, 0)]
+                                else:
+                                    a = acc[((j, i, gg), 0, 0)]
+                                v = cutlass.max(v, a)
+                        vals[NJ * gg + j] = v
+
+        for off in cutlass.range_constexpr(3):
+            sh = 4 << off
+            for kk in cutlass.range_constexpr(NV):
+                vals[kk] = cutlass.max(
+                    vals[kk], cute.arch.shuffle_sync_bfly(vals[kk], sh)
+                )
+
+        if lane < ACTIVE_GROUPS:
+            for gg in cutlass.range_constexpr(NG):
+                for j in cutlass.range_constexpr(NJ):
+                    sRed[warp, 8 * gg + 2 * lane + j] = vals[NJ * gg + j]
+        cute.arch.sync_threads()
+
+        if tidx < nq:
+            o = cutlass.max(
+                cutlass.max(sRed[0, tidx], sRed[1, tidx]),
+                cutlass.max(sRed[2, tidx], sRed[3, tidx]),
+            )
+            mOut[tidx % Hq, t, b * sq + tidx // Hq] = o
+        # sRed is rewritten by the next tile and this K buffer by a prefetch.
+        cute.arch.sync_threads()
+        it = it + 1
+
+    # Columns past each sequence's last tile are -inf.  At max_model_len's
+    # width (a CUDA graph) that is most of the buffer, and filling it per
+    # sequence after the scoring walk put up to 15 us of stores on the tail of
+    # the longest CTAs (48 x q4 at 128k on H100).  Instead every CTA takes an
+    # even share of the (h, column, sequence) segments, sq scores each, with
+    # consecutive threads on consecutive sequences of one (h, column) row.
+    gid = b * nsplit + t0
+    for e in cutlass.range(
+        gid * NTHREADS + tidx,
+        Hq * ncols * nbatch,
+        nbatch * nsplit * NTHREADS,
+        unroll=1,
+    ):
+        bb = e % nbatch
+        r = e // nbatch
+        h = 0
+        c = r
+        if cutlass.const_expr(Hq > 1):
+            h = r // ncols
+            c = r - h * ncols
+        if c >= cutlass.min((mSeq[bb] + 127) // 128, ncols):
+            for j in cutlass.range_constexpr(sq):
+                mOut[h, c, bb * sq + j] = neg
+
+
+@cute.jit
+def _msa_host(
+    stream,
+    mK: cute.Tensor,
+    mQ: cute.Tensor,
+    mPage: cute.Tensor,
+    mSeq: cute.Tensor,
+    mOut: cute.Tensor,
+    nsplit: cutlass.Int32,
+    nq: cutlass.Constexpr,
+    Hq: cutlass.Constexpr,
+    sq: cutlass.Constexpr,
+    log2_hq: cutlass.Constexpr,
+    TN: cutlass.Constexpr,
+    batch_fast: cutlass.Constexpr,
+    NSTAGE: cutlass.Constexpr,
+):
+    """Build the tiled MMA and launch the decode scoring grid."""
+    tiled_mma = sm90_utils.make_trivial_tiled_mma(
+        FP8,
+        FP8,
+        cute.nvgpu.OperandMajorMode.K,
+        cute.nvgpu.OperandMajorMode.K,
+        cutlass.Float32,
+        (1, 1, 1),
+        (64, TN),
+    )
+    tile_mnk = (HALF, TN, DIM)
+    sK_layout = sm90_utils.make_smem_layout_a(
+        utils.LayoutEnum.ROW_MAJOR, tile_mnk, FP8, 2 * NSTAGE
+    )
+    sQ_layout = sm90_utils.make_smem_layout_b(
+        utils.LayoutEnum.ROW_MAJOR, tile_mnk, FP8, 1
+    )
+    one_stage_k = cute.slice_(sK_layout, (None, None, 0))
+
+    npages = cute.size(mK, mode=[0])
+    mK3 = cute.make_tensor(
+        mK.iterator,
+        cute.make_layout((HALF, DIM, 2 * npages), stride=(DIM, 1, HALF * DIM)),
+    )
+    tma_atom_k, mK_tma = cpasync.make_tiled_tma_atom(
+        cpasync.CopyBulkTensorTileG2SOp(),
+        mK3,
+        one_stage_k,
+        (HALF, DIM),
+    )
+
+    nbatch = cute.size(mPage, mode=[0])
+    kernel = _msa_kernel(
+        tma_atom_k,
+        mK_tma,
+        mQ,
+        mPage,
+        mSeq,
+        mOut,
+        sK_layout,
+        sQ_layout,
+        tiled_mma,
+        nbatch,
+        nsplit,
+        nq,
+        Hq,
+        sq,
+        log2_hq,
+        TN,
+        batch_fast,
+        NSTAGE,
+    )
+    if cutlass.const_expr(batch_fast):
+        kernel.launch(
+            grid=[nbatch, nsplit, 1],
+            block=[NTHREADS, 1, 1],
+            stream=stream,
+        )
+    else:
+        kernel.launch(
+            grid=[nsplit, nbatch, 1],
+            block=[NTHREADS, 1, 1],
+            stream=stream,
+        )
+
+
+# --- CUDA-graph stream plumbing -------------------------------------------
+# Without an explicit stream these launches go to the CuTe default stream, so
+# torch.cuda.graph records NOTHING: the kernel runs eagerly during capture and
+# replay is a no-op (verified: output written at capture, all-NaN after replay).
+# vLLM captures decode graphs, so the launch must honour the current stream.
+# Same pattern the sparse kernels already use.
+import torch
+import cuda.bindings.driver as _kf_cuda
+
+_KF_STREAMS: dict = {}
+
+
+def _kf_stream():
+    """CUstream for the current torch stream, cached per handle."""
+    h = torch.cuda.current_stream().cuda_stream
+    s = _KF_STREAMS.get(h)
+    if s is None:
+        s = _kf_cuda.CUstream(h)
+        _KF_STREAMS[h] = s
+    return s
+
+
+_CACHE: dict = {}
+_SMS: dict = {}
+# CTAs per SM the grid aims for, spread over the batch. Each CTA walks its
+# sequence's tiles with a stride of nsplit, so work tracks seqused_k and not the
+# score width (a CUDA graph freezes that width at max_model_len). Several waves
+# of short-lived CTAs keep more K loads in flight than a resident-sized grid of
+# long walks: on H100, 64 per SM matches the one-CTA-per-tile grid within ~1% at
+# 128k-1M context, where 8 per SM was 3-5% slower whatever the pipeline depth.
+_CTAS_PER_SM = 64
+# At most this many CTAs per sequence: a short batch otherwise gets one CTA per
+# column again, and with a max_model_len-wide buffer most of them are empty.
+_MAX_NSPLIT = 256
+# K buffers per CTA (the next tile's TMA overlaps this tile's WGMMA).
+_NSTAGE = 2
+
+
+def _nsplit(batch, ncols, device):
+    sms = _SMS.get(device.index)
+    if sms is None:
+        sms = torch.cuda.get_device_properties(device).multi_processor_count
+        _SMS[device.index] = sms
+    return max(1, min(ncols, _MAX_NSPLIT, -(-_CTAS_PER_SM * sms // max(1, batch))))
+
+
+def run(q, k, cu_seqlens_q, page_table, seqused_k, max_score):
+    """Compute MSA proxy scores for a decode batch. Writes ``max_score``."""
+    total_q, Hq, D = q.shape
+    num_pages = k.shape[0]
+    # The caller's score buffer is (hq, max_k_tiles, total_q) where max_k_tiles
+    # comes from the longest sequence in the batch. page_table is a persistent
+    # allocation sized to max_model_len, so it is WIDER: 2048 slots against
+    # ~1555 real tiles for a 200k-token request. Deriving the tile count from
+    # the page table therefore walks ~493 tiles past the end of max_score.
+    # Bound it by the output; the extra page-table columns are padding.
+    nkt = int(max_score.shape[1])
+    if page_table.shape[1] < nkt:
+        raise ValueError(
+            f"page_table has {page_table.shape[1]} tile columns but max_score "
+            f"expects {nkt}"
+        )
+    page_table = page_table[:, :nkt]
+    B, max_k_tiles = page_table.shape
+    sq = total_q // B
+    nq = Hq * sq
+    log2_hq = {1: 0, 2: 1, 4: 2}[Hq]
+    TN = 8 if nq <= 8 else 16
+    batch_fast = num_pages * 20 >= B * max_k_tiles * 17
+
+    nsplit = _nsplit(B, max_k_tiles, max_score.device)
+
+    key = (Hq, sq, batch_fast, _NSTAGE, k.dtype, q.dtype, max_score.dtype)
+    fn = _CACHE.get(key)
+    if fn is None:
+        mK = from_dlpack(k, assumed_align=16, enable_tvm_ffi=True).mark_layout_dynamic(
+            leading_dim=3
+        )
+        mQ = from_dlpack(q, assumed_align=16, enable_tvm_ffi=True).mark_layout_dynamic(
+            leading_dim=2
+        )
+        mPage = from_dlpack(
+            page_table, assumed_align=4, enable_tvm_ffi=True
+        ).mark_layout_dynamic(leading_dim=1)
+        mSeq = from_dlpack(
+            seqused_k, assumed_align=4, enable_tvm_ffi=True
+        ).mark_layout_dynamic(leading_dim=0)
+        mOut = from_dlpack(
+            max_score, assumed_align=16, enable_tvm_ffi=True
+        ).mark_layout_dynamic(leading_dim=2)
+        args = (_msa_host, _kf_stream(), mK, mQ, mPage, mSeq, mOut, nsplit)
+        args += (nq, Hq, sq, log2_hq, TN, batch_fast, _NSTAGE)
+        fn = build_and_load_cute_dsl_kernel(
+            "msa_proxy_score_decode_sm90",
+            f"hq{Hq}_sq{sq}_bf{int(batch_fast)}_ns{_NSTAGE}"
+            f"_{k.dtype}_{q.dtype}_{max_score.dtype}",
+            lambda: cute.compile(*args, options="--enable-tvm-ffi"),
+            (__file__,),
+        )
+        _CACHE[key] = fn
+    fn(_kf_stream(), k, q, page_table, seqused_k, max_score, nsplit)

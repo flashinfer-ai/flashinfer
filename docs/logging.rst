@@ -18,6 +18,15 @@ Enable logging using two environment variables:
     # Set log destination (default is stdout)
     export FLASHINFER_LOGDEST=stdout  # or stderr, or a file path like "flashinfer.log"
 
+JIT Build Progress
+------------------
+
+FlashInfer reports one message at ``INFO`` level when a runtime JIT module has
+no compiled artifact. Set ``FLASHINFER_LOGGING_LEVEL=WARNING`` or higher to
+suppress these progress messages. This setting is independent of the API
+logging variables described below. Prebuilt and local JIT cache hits remain
+silent.
+
 Logging Levels
 --------------
 
@@ -148,7 +157,7 @@ For faster, pickle-free serialization, you can enable safetensors format:
      - ``.pt``
      - ``.safetensors``
    * - Dependency
-     - `torch``
+     - ``torch``
      - Requires ``pip install safetensors``
 
 **Replay is format-agnostic**: The replay command automatically detects the format based on file extension.

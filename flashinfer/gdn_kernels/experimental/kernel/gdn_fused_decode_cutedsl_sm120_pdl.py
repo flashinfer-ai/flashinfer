@@ -48,6 +48,7 @@ import cuda.bindings.driver as cuda_driver
 from cutlass.cute.runtime import from_dlpack
 
 from ....cuda_utils import checkCudaErrors
+from ...device_target import gdn_compile_options
 from ._stream_order import order_after_previous_stream
 
 # The layer geometry (HIDDEN, N_BA, QKV_DIM, H_Q, HV, D) is a compile-time
@@ -536,7 +537,7 @@ def fused_launch(
 # conv-state stride mode -- and, for the workspace, by (geometry, batch size,
 # device).  The compiled-kernel value is whatever ``cute.compile`` returns,
 # which has no public static type.
-_compiled: dict[tuple[tuple, int, float, int], Any] = {}
+_compiled: dict[tuple[tuple, int, float, int, str], Any] = {}
 _workspace_cache: dict[tuple[tuple, int, str], tuple[torch.Tensor, torch.Tensor]] = {}
 _launch_count = 0
 
@@ -579,7 +580,13 @@ def _cache_has(
     AND the per-(geometry, B, device) workspace exists — i.e. a call is
     capture-safe (kernel launches plus one stream memset, no compilation or
     allocation)."""
-    return (geometry, int(B), float(scale), int(conv_leading_dim)) in _compiled and (
+    return (
+        geometry,
+        int(B),
+        float(scale),
+        int(conv_leading_dim),
+        str(device),
+    ) in _compiled and (
         geometry,
         int(B),
         str(device),
@@ -685,7 +692,7 @@ def execute(
     # static stride-1 mode differs).
     cs_ld = conv_state_leading_dim(conv_state)
 
-    key = (geometry, B, scale_f, cs_ld)
+    key = (geometry, B, scale_f, cs_ld, str(dev))
     fn = _compiled.get(key)
     if fn is None:
         # The DLPack markers exist only to describe the argument layouts to
@@ -708,7 +715,7 @@ def execute(
         m_out = from_dlpack(output, enable_tvm_ffi=True).mark_layout_dynamic()
         m_qa = from_dlpack(qkv_act, enable_tvm_ffi=True).mark_layout_dynamic()
         m_part = from_dlpack(part, enable_tvm_ffi=True).mark_layout_dynamic()
-        fn = cute.compile(
+        fn = cute.compile[gdn_compile_options(dev, cute.EnableTVMFFI(True))](
             fused_launch,
             m_hidden,
             m_wba,
@@ -732,7 +739,6 @@ def execute(
             H_Q,
             HV,
             D,
-            options="--enable-tvm-ffi",
         )
         _compiled[key] = fn
     fn(
@@ -769,7 +775,7 @@ def compiled_variant_keys() -> list:
     """Compiled-kernel descriptors resident in this process."""
     return [
         f"{_geometry_tag(geometry)}_b{B}_scale{scale}_ld{leading_dim}"
-        for (geometry, B, scale, leading_dim) in sorted(_compiled)
+        for (geometry, B, scale, leading_dim, _device) in sorted(_compiled)
     ]
 
 

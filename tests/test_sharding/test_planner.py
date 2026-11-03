@@ -25,13 +25,13 @@ def _node(
     order: int,
     *,
     shard_group: str | None = None,
-    solo: bool = False,
+    node_exclusive: bool = False,
 ) -> CollectedNode:
     return CollectedNode.from_nodeid(
         nodeid,
         order=order,
         shard_group=shard_group,
-        solo=solo,
+        node_exclusive=node_exclusive,
     )
 
 
@@ -116,10 +116,10 @@ def test_shard_group_is_atomic_even_when_it_exceeds_checkpoint() -> None:
     assert grouped_batches[0].oversized is True
 
 
-def test_solo_source_is_one_batch_and_one_logical_unit() -> None:
+def test_node_exclusive_source_is_one_batch_and_one_logical_unit() -> None:
     nodes = [
-        _node("tests/test_solo.py::test_case[0]", 0, solo=True),
-        _node("tests/test_solo.py::test_case[1]", 1, solo=True),
+        _node("tests/test_node_exclusive.py::test_case[0]", 0, node_exclusive=True),
+        _node("tests/test_node_exclusive.py::test_case[1]", 1, node_exclusive=True),
         _node("tests/test_regular.py::test_case", 2),
     ]
     plan = build_plan(
@@ -134,23 +134,26 @@ def test_solo_source_is_one_batch_and_one_logical_unit() -> None:
         ),
     )
 
-    solo_units = [
+    node_exclusive_units = [
         unit
         for unit in plan.units
-        if any(batch.source_file == "tests/test_solo.py" for batch in unit.batches)
+        if any(
+            batch.source_file == "tests/test_node_exclusive.py"
+            for batch in unit.batches
+        )
     ]
-    assert len(solo_units) == 1
-    assert len(solo_units[0].batches) == 1
-    assert solo_units[0].batches[0].nodeids == (
-        "tests/test_solo.py::test_case[0]",
-        "tests/test_solo.py::test_case[1]",
+    assert len(node_exclusive_units) == 1
+    assert len(node_exclusive_units[0].batches) == 1
+    assert node_exclusive_units[0].batches[0].nodeids == (
+        "tests/test_node_exclusive.py::test_case[0]",
+        "tests/test_node_exclusive.py::test_case[1]",
     )
     assert Plan.from_dict(plan.to_dict()) == plan
 
 
-def test_capacity_metrics_account_for_solo_exclusivity() -> None:
+def test_capacity_metrics_account_for_node_exclusive_exclusivity() -> None:
     nodes = [
-        _node("tests/test_solo.py::test_case", 0, solo=True),
+        _node("tests/test_node_exclusive.py::test_case", 0, node_exclusive=True),
         _node("tests/test_regular_a.py::test_case", 1),
         _node("tests/test_regular_b.py::test_case", 2),
     ]
@@ -579,8 +582,18 @@ def test_soft_target_search_does_not_retry_every_intermediate_bin_count(
 
 def test_plan_serialization_stores_each_nodeid_once() -> None:
     nodes = [
-        _node("tests/test_x.py::test_known[a-very-long-parameter]", 0),
-        _node("tests/test_x.py::test_new[another-very-long-parameter]", 1),
+        CollectedNode.from_nodeid(
+            "tests/test_x.py::test_known[a-very-long-parameter]",
+            0,
+            gpu_exclusive=True,
+            host_memory_heavy=True,
+        ),
+        CollectedNode.from_nodeid(
+            "tests/test_x.py::test_new[another-very-long-parameter]",
+            1,
+            gpu_exclusive=True,
+            host_memory_heavy=True,
+        ),
     ]
     book = EstimateBook([DurationEstimate("profile", nodes[0].nodeid, 1.0, 1)])
     plan = build_plan(
@@ -598,7 +611,9 @@ def test_plan_serialization_stores_each_nodeid_once() -> None:
     encoded = json.dumps(serialized, sort_keys=True, separators=(",", ":"))
 
     assert Plan.from_dict(serialized) == plan
-    assert serialized["schema_version"] == 4
+    assert serialized["schema_version"] == 5
+    assert serialized["gpu_exclusive_sources"] == ["tests/test_x.py"]
+    assert serialized["host_memory_heavy_sources"] == ["tests/test_x.py"]
     assert serialized["nodeids"] == [node.nodeid for node in nodes]
     assert "nodes" not in serialized
     assert "batch_ids" not in encoded
@@ -623,3 +638,60 @@ def test_plan_reader_accepts_schema_one_manifests() -> None:
     }
 
     assert Plan.from_dict(legacy) == plan
+
+
+@pytest.mark.parametrize("schema", [1, 4])
+def test_legacy_plan_reader_preserves_node_isolation(
+    schema: int,
+) -> None:
+    nodes = [
+        _node("tests/test_exclusive.py::test_case", 0, node_exclusive=True),
+        _node("tests/test_regular.py::test_case", 1),
+    ]
+    plan = build_plan(nodes, EstimateBook([]), _planning())
+    if schema == 1:
+        legacy = {
+            "schema_version": schema,
+            "options": plan.options.to_dict(),
+            "nodes": [node.to_dict() for node in nodes],
+            "units": [unit.to_dict() for unit in plan.units],
+            "fallback_counts": plan.fallback_counts,
+            "fallback_sources": plan.fallback_sources,
+        }
+        for node in legacy["nodes"]:
+            node["solo"] = node.pop("node_exclusive")
+    else:
+        legacy = plan.to_dict()
+        legacy["schema_version"] = schema
+        legacy["solo_sources"] = legacy.pop("node_exclusive_sources")
+        legacy.pop("gpu_exclusive_sources")
+        legacy.pop("host_memory_heavy_sources")
+
+    restored = Plan.from_dict(legacy)
+    assert restored == plan
+
+
+def test_capacity_metrics_account_for_host_heavy_serial_floor() -> None:
+    nodes = [
+        CollectedNode.from_nodeid(
+            "tests/test_heavy_a.py::test_case", 0, host_memory_heavy=True
+        ),
+        CollectedNode.from_nodeid(
+            "tests/test_heavy_b.py::test_case", 1, host_memory_heavy=True
+        ),
+        CollectedNode.from_nodeid(
+            "tests/test_node.py::test_case", 2, node_exclusive=True
+        ),
+    ]
+    plan = build_plan(
+        nodes,
+        EstimateBook(
+            [DurationEstimate("profile", node.nodeid, 10.0, 1) for node in nodes]
+        ),
+        _planning(),
+    )
+    metrics = capacity_metrics(plan, {0: 2}, deadline_seconds=25)
+    # The two host-heavy files cannot overlap, and node-exclusive work follows.
+    assert metrics["estimated_makespan_ms"] == 30_000
+    assert metrics["required_workers_by_shard"] == {"0": None}
+    assert metrics["required_total_worker_slots"] is None

@@ -11,12 +11,12 @@ stacks that overlap a chunked prefill with ongoing decode requests.
 
 .. autoclass:: PODWithPagedKVCacheWrapper
     :members:
-    :exclude-members: begin_forward, end_forward, forward, forward_return_lse
+    :exclude-members: begin_forward, forward, forward_return_lse
 
     .. automethod:: __init__
 
 .. autoclass:: BatchPODWithPagedKVCacheWrapper
     :members:
-    :exclude-members: begin_forward, end_forward, forward, forward_return_lse
+    :exclude-members: begin_forward, forward, forward_return_lse
 
     .. automethod:: __init__
