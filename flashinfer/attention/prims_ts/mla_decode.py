@@ -2401,8 +2401,15 @@ def _resolve_sparse_mla_plan(
     num_output_groups=None,
     tuning=None,
     kv_lora_rank=512,
+    softmax_scale: GlobalScale | None = None,
+    output_scale: GlobalScale = 1.0,
+    kv_cache_scale: GlobalScale = 1.0,
 ):
-    """Resolve sparse geometry and scratch sizing without allocation/compilation."""
+    """Resolve sparse geometry and scratch sizing without allocation/compilation.
+
+    Scale operands are accepted for plan() argument compatibility; they do not
+    affect geometry or workspace sizing.
+    """
     import cutlass
     from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_latency_1cta.config import (
         MlaProfile,
@@ -3484,8 +3491,6 @@ def get_prims_ts_sparse_mla_decode_workspace_size(*plan_args, **plan_kwargs):
     compiling a kernel. Bind the resulting byte buffer to the wrapper constructor
     and call plan() before graph capture; run() is the prepared standalone launch.
     """
-    for name in ("softmax_scale", "output_scale", "kv_cache_scale"):
-        plan_kwargs.pop(name, None)
     _, _, _, _, size_bytes, _, _ = _resolve_sparse_mla_plan(*plan_args, **plan_kwargs)
     return size_bytes
 
