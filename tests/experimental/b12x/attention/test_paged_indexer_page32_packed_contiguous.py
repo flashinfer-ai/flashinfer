@@ -11,15 +11,13 @@ AGENTS.md for the triton supertile gather.
 import pytest
 import torch
 
-from b12x.attention.nsa_indexer import (
+from b12x.attention.dsa_indexer.paged import (
     PAGED_INDEX_PAGE_SIZES,
     index_topk_fp8,
-)
-from b12x.attention.nsa_indexer.paged import (
     pack_paged_index_k_cache_reference,
     paged_index_logits_reference,
 )
-from b12x.attention.nsa_indexer.scratch import (
+from b12x.attention.dsa_indexer.scratch import (
     B12XIndexerPagedScratchCaps,
     plan_indexer_paged_scratch,
 )
@@ -142,7 +140,6 @@ def _assert_topk_parity(
         assert got_set == ref_allowed, f"row {row}: index sets disagree"
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_page32_packed_contiguous_matches_reference(monkeypatch) -> None:
     monkeypatch.setenv("B12X_PAGED_INDEX_SUPERTILE_K", "2048")
     device = torch.device("cuda")
@@ -206,7 +203,6 @@ def test_page32_packed_contiguous_matches_reference(monkeypatch) -> None:
     )
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_page32_sharded_local_topk_merge_matches_global_reference(
     monkeypatch,
 ) -> None:
@@ -326,7 +322,6 @@ def test_page32_sharded_local_topk_merge_matches_global_reference(
     )
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_page32_big_page_id_gather_survives_2gib_offsets(monkeypatch) -> None:
     """AGENTS.md 64-bit rule: live pages parked past 2**31 / stride bytes.
 
@@ -406,7 +401,6 @@ def test_page32_big_page_id_gather_survives_2gib_offsets(monkeypatch) -> None:
     )
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_page32_rejected_on_64only_routes(monkeypatch) -> None:
     """Page-32 support is scoped to the packed-contiguous prefill route."""
     monkeypatch.setenv("B12X_PAGED_INDEX_SUPERTILE_K", "512")
@@ -436,7 +430,7 @@ def test_page32_rejected_on_64only_routes(monkeypatch) -> None:
         supertile_k=512,
         shared_page_table=False,
     )
-    with pytest.raises(RuntimeError, match="only supports page_size=64"):
+    with pytest.raises(ValueError, match="only supports page_size=64"):
         index_topk_fp8(
             q_fp8=q_fp8,
             weights=weights,

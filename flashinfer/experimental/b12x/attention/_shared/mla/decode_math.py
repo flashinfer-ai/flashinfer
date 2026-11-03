@@ -1871,7 +1871,10 @@ def _kvarn_code_u32(
     value = word >> shift
     if cutlass.const_expr(bits > 1):
         nxt = ld_shared_u32(word_addr + Int32(4))
-        value = value | (nxt << (Uint32(32) - shift))
+        # shift == 0 (first element of an aligned plane): the next word
+        # contributes no bits, and nxt << 32 is LLVM poison. Skip the merge.
+        if shift != Uint32(0):
+            value = value | (nxt << (Uint32(32) - shift))
     return (value & Uint32((1 << bits) - 1)).to(Int32)
 
 

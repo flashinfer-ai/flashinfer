@@ -55,7 +55,6 @@ _PAGED_INDEX_SUPERTILE_K_ENV = "B12X_PAGED_INDEX_SUPERTILE_K"
 _PAGED_INDEX_SUPERTILE_K_DEFAULT = 32768
 _PAGED_INDEX_TILE_BLOCK_Q = 32
 _PAGED_INDEX_TILE_BLOCK_K = 512
-_PAGED_INDEX_CACHE_DATA_BYTES = PAGED_INDEX_PAGE_SIZE * INDEX_HEAD_DIM
 
 
 @dataclass(frozen=True)
@@ -646,7 +645,9 @@ def _prepare_shared_paged_supertile(
         page_rows,
         INDEX_HEAD_DIM,
         int(index_k_cache.stride(0)),
-        _PAGED_INDEX_CACHE_DATA_BYTES,
+        # Scale bytes start after the page's data rows: page_rows * HEAD_DIM
+        # (4096 for 32-row pages), not the 64-row constant.
+        page_rows * INDEX_HEAD_DIM,
     )
     if launcher is not None:
         launcher[(grid[0], 1, 1)](*args)

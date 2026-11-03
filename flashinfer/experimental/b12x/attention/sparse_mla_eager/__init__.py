@@ -10,17 +10,20 @@ Planned lifecycle: ``plan(Caps(...))`` -> ``bind`` (views only) ->
 ``run_decode`` / ``run_extend`` (capture safe).
 
 Example:
-    from b12x.attention import sparse_mla
+    from b12x.attention import sparse_mla_eager
 
-    plan    = sparse_mla.plan(sparse_mla.Caps(device="cuda", num_q_heads=16,
-                                              max_q_rows=64, max_width=2048))
+    plan    = sparse_mla_eager.plan(sparse_mla_eager.Caps(device="cuda",
+                                                          num_q_heads=16,
+                                                          max_q_rows=64,
+                                                          max_width=2048))
     spec    = plan.scratch_specs()[0]
     scratch = torch.empty(spec.shape, dtype=spec.dtype, device=spec.device)
-    binding = sparse_mla.bind(plan, scratch=scratch, q=q,
-                              selected_indices=topk_idx,
-                              cache_seqlens_int32=lens,
-                              nsa_cache_seqlens_int32=active)
-    out = sparse_mla.run_decode(binding=binding, kv_cache=kv, sm_scale=scale)
+    binding = sparse_mla_eager.bind(plan, scratch=scratch, q=q,
+                                    selected_indices=topk_idx,
+                                    cache_seqlens_int32=lens,
+                                    nsa_cache_seqlens_int32=active)
+    out = sparse_mla_eager.run_decode(binding=binding, kv_cache=kv,
+                                      sm_scale=scale)
 """
 
 from __future__ import annotations
@@ -58,7 +61,7 @@ META = OpMeta(
             "b12x/attention/mla/",
         ),
     ),
-    test_path="tests/attention/test_sparse_mla.py",
+    test_path="tests/experimental/b12x/attention/test_sparse_mla_eager.py",
     since="0.7.0",
 )
 

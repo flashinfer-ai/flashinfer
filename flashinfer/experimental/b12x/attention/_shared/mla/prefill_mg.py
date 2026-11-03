@@ -2466,7 +2466,14 @@ class UnifiedPrefillMGKernel:
         # Q-rope registerized (aliased onto W_FP8). DSV4 is the scale_format==0 /
         # has_extra arm and is byte-identical.
         is_glm = cutlass.const_expr(
-            t.model_type in (ModelType.GLM_NSA, ModelType.GLM_NEXT, ModelType.DSV41)
+            t.model_type
+            in (
+                ModelType.GLM_NSA,
+                ModelType.GLM_NEXT,
+                ModelType.DSV41,
+                # KVARN_TAIL_FP8: GLM fp8 math over a 536B-stride kvarn pool.
+                ModelType.KVARN_TAIL_FP8,
+            )
             or t.scale_format == ScaleFormat.KVARN_DUAL
         )
         is_dsv41 = cutlass.const_expr(t.model_type == ModelType.DSV41)
@@ -4569,6 +4576,7 @@ def run_unified_prefill_mg(
         ModelType.GLM_NEXT: _GLM_NEXT_HEAD_DIM,
         ModelType.DSV41: 512,
         ModelType.KVARN_MLA: 512,
+        ModelType.KVARN_TAIL_FP8: 512,
     }.get(model_type)
     if expected_qdim is None:
         raise ValueError(f"unsupported sparse MLA model_type={model_type}")

@@ -1959,20 +1959,27 @@ def _structural_cache_key(value: Any, visited: set[int] | None = None) -> Any:
         if fake_tensor_key is not None:
             return fake_tensor_key
 
-    cache_key_attr = getattr(value, "__cache_key__", None)
-    if cache_key_attr is not None:
-        # __cache_key__ may be a method (called for the key) or a plain value.
-        key_value = cache_key_attr() if callable(cache_key_attr) else cache_key_attr
-        return (
-            "cache_key",
-            type_module,
-            type_name,
-            _structural_cache_key(key_value, visited),
-        )
-
     object_id = id(value)
     if object_id in visited:
         return ("cycle", type_module, type_name)
+
+    cache_key_attr = getattr(value, "__cache_key__", None)
+    if cache_key_attr is not None:
+        # __cache_key__ may be a method (called for the key) or a plain value.
+        # Track the owner before evaluating/normalizing the key: a key that
+        # returns its owning object (or a container holding it) must hit the
+        # cycle check above instead of recursing into the owner re-entrantly.
+        visited.add(object_id)
+        try:
+            key_value = cache_key_attr() if callable(cache_key_attr) else cache_key_attr
+            return (
+                "cache_key",
+                type_module,
+                type_name,
+                _structural_cache_key(key_value, visited),
+            )
+        finally:
+            visited.remove(object_id)
 
     if hasattr(value, "__dict__"):
         visited.add(object_id)

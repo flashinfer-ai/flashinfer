@@ -647,7 +647,7 @@ def resolve_unplanned_traits(
     if model_type in (ModelType.KVARN_MLA, ModelType.KVARN_TAIL_FP8):
         # Derive the dual-rate geometry from the concrete record width when the
         # caller did not spell it out (536->k4v4, 648->k5v5, 600->k5v4,
-        # 400->k4v2, 272->k4 single-plane; the mod-33 padded widths match
+        # 400->k4v2, 264->k4 single-plane; the mod-33 padded widths match
         # KvarnMlaLayout / _kvarn_writer). The tail arm stores fp8 content in
         # the SAME pool slots, so its slot width follows the same map. v_bits=0
         # is a legitimate KVARN_MLA spelling (single-plane), so only k_bits==0
@@ -674,7 +674,7 @@ def resolve_unplanned_traits(
             else:
                 raise ValueError(
                     f"KVARN_MLA record width {int(record_bytes)} matches no "
-                    "launched variant (536/648/600/400/272)"
+                    "launched variant (536/648/600/400/264)"
                 )
         if int(group) == 0:
             group = 256

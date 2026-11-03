@@ -525,6 +525,11 @@ class UnifiedDecodeKernel:
         self.tail_fp8_mode = bool(
             int(traits.model_type) == int(ModelType.KVARN_TAIL_FP8)
         )
+        # The tail arm's pool slot width follows the variant (traits.kv_gmem_stride:
+        # 536 for k4v4, 600 for k5v4); io.py advances gmem rows by this stride.
+        self.tail_fp8_stride = (
+            int(traits.kv_gmem_stride) if self.tail_fp8_mode else 536
+        )
         # First-chunk copies may be issued before the per-token length is
         # known only when the first active chunk is fixed (no extra section).
         self.speculative_first_chunk = self.packed_io and not bool(has_extra)
@@ -1308,6 +1313,7 @@ class UnifiedDecodeKernel:
                     kvarn_group=self.kvarn_group,
                     kvarn_tile_stride=self.kvarn_tile_stride,
                     tail_fp8=self.tail_fp8_mode,
+                    tail_fp8_stride=self.tail_fp8_stride,
                 )
                 packed_kw = dict(
                     kv_smem_stride=staged_kv_stride,
@@ -2171,6 +2177,21 @@ def _cache_block_stride_bytes(
         expected = int(page_size) * rec
     else:
         expected = int(page_size) * COMPRESSED_SPARSE_MLA_BYTES_PER_TOKEN
+    if (
+        model_type in (ModelType.KVARN_MLA, ModelType.KVARN_TAIL_FP8)
+        and record_bytes is not None
+        and cache.ndim >= 2
+    ):
+        # KVarN decode reads rows at the compiled record width (io.py _IOS).
+        # The traits resolver checks the shape width; a view whose width
+        # matches but whose row stride is padded (e.g. 602) would still drift
+        # every row, so check the physical row stride too.
+        row_stride = int(cache.stride(cache.ndim - 2)) * int(cache.element_size())
+        if row_stride != rec:
+            raise ValueError(
+                f"KVarN decode cache row stride {row_stride} bytes does not "
+                f"match the record width {rec} bytes"
+            )
     if is_glm_model_type(model_type) and cache.is_contiguous():
         return expected
     # Use the tensor's physical page stride for padded views.

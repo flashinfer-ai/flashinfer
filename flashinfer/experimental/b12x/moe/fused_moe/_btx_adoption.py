@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import torch
 
-from b12x.moe._shared.execution import (
+from .._shared.execution import (
     MoEWeightPreparationPlan,
     PreparedWeightLayout,
 )
-from b12x.moe._shared.kernels.activations import is_gated_moe_activation
-from b12x.moe._shared.kernels.w4a16.prepare import PreparedW4A16MoeWeights
+from .._shared.kernels.activations import is_gated_moe_activation
+from .._shared.kernels.w4a16.prepare import PreparedW4A16MoeWeights
 
 from ._impl import (
     B12XFP4ExpertWeights,

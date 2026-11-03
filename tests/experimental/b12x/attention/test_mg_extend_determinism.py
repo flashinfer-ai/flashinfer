@@ -17,6 +17,8 @@ output drifts from the torch codec reference beyond codec noise.
 import os
 import sys
 
+import pytest
+
 REPO = os.environ.get("B12X_REPO", os.path.expanduser("~/.cache/b12x-kvarn-wt"))
 VLLM = os.environ.get("VLLM_REPO", os.path.expanduser("~/lil/vllm"))
 for p in (REPO, VLLM):
@@ -26,11 +28,15 @@ for p in (REPO, VLLM):
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
 
+if not torch.cuda.is_available():
+    pytest.skip("MG extend determinism test needs CUDA", allow_module_level=True)
+
 from b12x.attention.sparse_mla import ModelType, plan  # noqa: E402
-from vllm.v1.attention.ops.kvarn_mla import (  # noqa: E402
-    kvarn_mla_layout_from_dtype,
-    unpack_kvarn_mla_records,
-)
+
+# Fork-only reference codec: skip collection cleanly when unavailable.
+kvarn_mla = pytest.importorskip("vllm.v1.attention.ops.kvarn_mla")
+kvarn_mla_layout_from_dtype = kvarn_mla.kvarn_mla_layout_from_dtype
+unpack_kvarn_mla_records = kvarn_mla.unpack_kvarn_mla_records
 
 DEV = torch.device("cuda", 0)
 GROUP = 256
@@ -153,14 +159,3 @@ def test_mg_extend_bit_exact_and_correct(n_tokens=258, used_rows=512):
         )
         worst = max(worst, rel)
     assert worst < 0.01, f"MG extend drifted from codec reference: rel {worst:.4f}"
-    return worst
-
-
-def main() -> int:
-    worst = test_mg_extend_bit_exact_and_correct()
-    print(f"MG extend: bit-exact over {REPS} reps, worst rel {worst:.4f}  OK")
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())

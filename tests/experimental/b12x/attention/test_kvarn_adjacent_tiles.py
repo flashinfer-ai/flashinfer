@@ -15,6 +15,8 @@ per-token inline scales) bit-faithfully.
 import os
 import sys
 
+import pytest
+
 REPO = os.environ.get("B12X_REPO", os.path.expanduser("~/.cache/b12x-kvarn-wt"))
 VLLM = os.environ.get("VLLM_REPO", os.path.expanduser("~/lil/vllm"))
 for p in (REPO, VLLM):
@@ -23,6 +25,9 @@ for p in (REPO, VLLM):
 
 import torch  # noqa: E402
 
+if not torch.cuda.is_available():
+    pytest.skip("kvarn adjacent-tile test needs CUDA", allow_module_level=True)
+
 from b12x.attention.sparse_mla import Caps  # noqa: E402
 from b12x.attention.sparse_mla._preparation import (  # noqa: E402
     compile_sparse_mla,
@@ -30,14 +35,12 @@ from b12x.attention.sparse_mla._preparation import (  # noqa: E402
     writer_state,
 )
 from b12x.attention._shared.mla.kernel import run_prepared_unified_decode  # noqa: E402
-from b12x.attention._shared.mla._kvarn_writer import (  # noqa: E402
-    kvarn_tile_stride_bytes,
-)
-from vllm.v1.attention.ops.kvarn_mla import (  # noqa: E402
-    KvarnMlaLayout,
-    pack_kvarn_mla_records,
-    unpack_kvarn_mla_records,
-)
+
+# Fork-only reference codec: skip collection cleanly when unavailable.
+kvarn_mla = pytest.importorskip("vllm.v1.attention.ops.kvarn_mla")
+KvarnMlaLayout = kvarn_mla.KvarnMlaLayout
+pack_kvarn_mla_records = kvarn_mla.pack_kvarn_mla_records
+unpack_kvarn_mla_records = kvarn_mla.unpack_kvarn_mla_records
 
 DEV_ORD = 0
 GROUP = 256
@@ -64,22 +67,23 @@ def _write_two_adjacent_tiles(device):
 
 
 def _extract_records(cache, base0, n):
-    """Tile-strided extraction of n records starting at record base0."""
-    tile_stride = kvarn_tile_stride_bytes(record_bytes=RECORD)
+    """Dense contiguous-cache extraction of n records starting at base0.
+
+    The ``(4, 4352, 536)`` cache is written with dense row stride
+    (stride(1) * group), not the gathered-arena tile stride.
+    """
     flat = cache.view(-1)
     recs = torch.empty((n, RECORD), dtype=torch.uint8, device=cache.device)
     for i in range(n):
         slot = base0 + i
         block = slot // PAGE
         local = slot % PAGE
-        tile = local // GROUP
-        row = local % GROUP
-        off = block * (PAGE // GROUP) * tile_stride + tile * tile_stride + row * RECORD
+        off = block * cache.stride(0) + local * RECORD
         recs[i] = flat[off : off + RECORD]
     return recs
 
 
-def main() -> None:
+def test_main() -> None:
     torch.manual_seed(7)
     device = torch.device("cuda", DEV_ORD)
     cache, latents, base0 = _write_two_adjacent_tiles(device)
@@ -178,7 +182,7 @@ def main() -> None:
     assert ok, "decode kernel mismatch on adjacent tiles"
 
 
-def single_slot_probe():
+def test_single_slot_probe():
     """q=0 + one selected candidate -> out == that record's v_hat."""
     torch.manual_seed(7)
     device = torch.device("cuda", DEV_ORD)
@@ -252,10 +256,3 @@ def single_slot_probe():
         f" -> {'OK' if rel < 0.05 and finite else 'MISMATCH'}"
     )
     assert rel < 0.05 and finite, f"single-slot probe rel={rel}"
-
-
-if __name__ == "__main__":
-    main()
-    print("--- single-slot probe ---")
-    single_slot_probe()
-    print("ADJACENT TILES ALL OK")

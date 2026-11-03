@@ -391,8 +391,14 @@ def clear_kvarn_mla_kv_cache_kernel_cache() -> None:
 
 
 def _kvarn_writer_signature(latent, kv_cache, slot_mapping, k_bits, v_bits, group):
+    # page_block_size is baked into the compiled kernel as a compile-time
+    # constant (block_idx = slot // block_size64); key the in-memory cache on
+    # it (and on the cache rank) so two layouts cannot reuse the wrong binary.
+    page_block_size = int(kv_cache.shape[1]) if kv_cache.ndim >= 2 else int(group)
     return (
         int(latent.device.index),
+        page_block_size,
+        int(kv_cache.ndim) >= 2,
         int(k_bits),
         int(v_bits),
         int(group),

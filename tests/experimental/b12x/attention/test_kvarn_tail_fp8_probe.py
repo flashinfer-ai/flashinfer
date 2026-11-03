@@ -15,11 +15,16 @@ raw; no Hadamard -- the kvarn folds live in vLLM weights, not in this probe).
 import os
 import sys
 
+import pytest
+
 REPO = os.environ.get("B12X_REPO", os.path.expanduser("~/.cache/b12x-kvarn-wt"))
 if REPO not in sys.path:
     sys.path.insert(0, REPO)
 
 import torch  # noqa: E402
+
+if not torch.cuda.is_available():
+    pytest.skip("kvarn tail-fp8 probe needs CUDA", allow_module_level=True)
 
 from b12x.attention.sparse_mla import Caps  # noqa: E402
 from b12x.attention.sparse_mla._preparation import compile_sparse_mla  # noqa: E402
@@ -33,6 +38,11 @@ from b12x.attention._shared.mla.kv_cache import (  # noqa: E402
     _glm_next_cache_writer_launch,
 )
 from b12x.attention._shared.mla.prefill import run_unified_prefill  # noqa: E402
+from b12x.attention._shared.mla.traits import (  # noqa: E402
+    ComputeMode,
+    ScaleFormat,
+    make_unified_traits,
+)
 from b12x._lib.compiler import run_compiled  # noqa: E402
 
 DEV_ORD = 0  # first device visible under CUDA_VISIBLE_DEVICES
@@ -117,7 +127,7 @@ def _run_tail_decode(
     )
 
 
-def main() -> None:
+def test_main() -> None:
     torch.manual_seed(7)
     device = torch.device("cuda", DEV_ORD)
     print(f"device={device} ({torch.cuda.get_device_name(DEV_ORD)})")
@@ -197,14 +207,10 @@ def main() -> None:
     )
     ok = worst_rel < 0.01 and worst_abs < 0.05
     print("TAIL FP8 PROBE:", "OK" if ok else "MISMATCH")
-    sys.exit(0 if ok else 1)
+    assert ok, f"TAIL FP8 PROBE mismatch: rel={worst_rel:.5f} abs={worst_abs:.6f}"
 
 
-if __name__ == "__main__":
-    main()
-
-
-def extend_probe() -> None:
+def test_extend_probe() -> None:
     """EXTEND mode: fp8 arm via run_unified_prefill vs torch reference."""
     torch.manual_seed(11)
     device = torch.device("cuda", DEV_ORD)
@@ -218,15 +224,29 @@ def extend_probe() -> None:
     rows = 8
     q = torch.empty((rows, HEADS, L), dtype=torch.bfloat16, device=device)
     q.normal_()
-    # causal windows: row r attends records [0, s_r), s_r = 64*(r+1)
+    # Prefill (MG) gate requires topk in {512, 1024, 2048} for GLM-family;
+    # size the selection to topk=512. Causal windows: row r attends records
+    # [0, s_r), s_r = 64*(r+1) (<= 512).
+    topk = 512
     s_per_row = torch.tensor(
         [64 * (r + 1) for r in range(rows)], dtype=torch.int32, device=device
     )
     selected = (
-        torch.arange(POOL_SLOTS, dtype=torch.int32, device=device)
+        torch.arange(topk, dtype=torch.int32, device=device)
         .unsqueeze(0)
-        .expand(rows, POOL_SLOTS)
+        .expand(rows, topk)
         .contiguous()
+    )
+    # KVARN_TAIL_FP8 traits require explicit variant bits (the gmem row
+    # stride is the pool slot width, not derivable from the record content),
+    # so spell them out via traits_override.
+    traits = make_unified_traits(
+        5,
+        ComputeMode.FP8,
+        ScaleFormat.ARBITRARY_FP32,
+        k_bits=4,
+        v_bits=4,
+        group=256,
     )
     out = run_unified_prefill(
         q=q,
@@ -237,11 +257,9 @@ def extend_probe() -> None:
         topk_length=s_per_row,
         scale_format=1,
         model_type=5,
-        kvarn_k_bits=4,
-        kvarn_v_bits=4,
-        kvarn_group=256,
         fp8_rope=False,
         latent_scale_per_token=False,
+        traits_override=traits,
     )
     torch.cuda.synchronize()
     out = out[0] if isinstance(out, tuple) else out
@@ -255,8 +273,4 @@ def extend_probe() -> None:
         f"EXTEND FP8 PROBE: worst|err|={worst:.6f} -> "
         f"{'OK' if worst < 5e-2 else 'MISMATCH'}"
     )
-
-
-if __name__ == "__main__":
-    main()
-    extend_probe()
+    assert worst < 5e-2, f"EXTEND FP8 PROBE mismatch: worst|err|={worst:.6f}"

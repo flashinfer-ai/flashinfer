@@ -97,7 +97,21 @@ def register_b12x_fp6() -> None:
     if _registered:
         return
 
-    from vllm.utils import b12x as vllm_b12x
+    try:
+        from vllm.utils import b12x as vllm_b12x
+    except ImportError:
+        # vllm.utils.b12x ships only with the jovian-merge vllm lineage. A
+        # bare entry-point import must not crash every vLLM process on builds
+        # without it: fail closed only when FP6 is actually enabled.
+        if is_b12x_fp6_enabled():
+            raise RuntimeError(
+                "b12x FP6 plugin requires vllm.utils.b12x, which is absent"
+            ) from None
+        try:
+            logger.debug("b12x_fp6: vllm.utils.b12x absent; fp6 lane not registered")
+        except Exception:
+            pass
+        return
 
     preparation_hooks = (
         "set_b12x_preparation_provider",
@@ -143,25 +157,13 @@ def register_b12x_fp6() -> None:
         PerTensorScaleParameter,
     )
 
-    try:
-        from vllm.utils.b12x import (
-            set_b12x_preparation_provider,
-            B12xPreparationUnit,
-            b12x_layer,
-            b12x_layer_prefix,
-            register_b12x_layer,
-        )
-    except ImportError:
-        # vllm.utils.b12x ships only with the jovian-merge vllm lineage
-        # (kvarn/jovian-merged-backup), which is canary-FAIL and undone.
-        # Fail closed: the b12x_fp6 quantization lane is unusable without
-        # it — skip registration so every other serving lane (exl3, kvarn
-        # MLA, GDN hybrids) boots against any vllm.
-        try:
-            logger.debug("b12x_fp6: vllm.utils.b12x absent; fp6 lane not registered")
-        except Exception:
-            pass
-        return
+    from vllm.utils.b12x import (
+        set_b12x_preparation_provider,
+        B12xPreparationUnit,
+        b12x_layer,
+        b12x_layer_prefix,
+        register_b12x_layer,
+    )
     from vllm.utils.torch_utils import (
         LayerNameType,
         _encode_layer_name,
@@ -251,26 +253,27 @@ def register_b12x_fp6() -> None:
 
             target = self.layer
             weight = target.b12x_fp6_gemm_weight
-            if not self.plans:
-                storage = (
-                    "packed"
-                    if weight.shape[1] * 4 == target.b12x_fp6_in_features * 3
-                    else "expanded"
+            storage = (
+                "packed"
+                if weight.shape[1] * 4 == target.b12x_fp6_in_features * 3
+                else "expanded"
+            )
+            # Merge every workload's token counts: a later workload may carry
+            # counts the first one did not, and plan_for must find them all.
+            needed = {int(m) for m in workload.token_counts} - set(self.plans)
+            for m in sorted(needed):
+                query = Mxfp6DenseQuery(
+                    max_tokens=m,
+                    in_features=target.b12x_fp6_in_features,
+                    out_features=target.b12x_fp6_out_features,
+                    weight_format=target.b12x_fp6_fmt,
+                    activation_format=target.b12x_fp6_act_fmt,
+                    weight_storage=storage,
+                    global_scale_kind="multiplier",
+                    output_mode="functional",
+                    per_row_global_scale=_DENSE_PER_ROW_GS,
                 )
-                for m in workload.token_counts:
-                    m = int(m)
-                    query = Mxfp6DenseQuery(
-                        max_tokens=m,
-                        in_features=target.b12x_fp6_in_features,
-                        out_features=target.b12x_fp6_out_features,
-                        weight_format=target.b12x_fp6_fmt,
-                        activation_format=target.b12x_fp6_act_fmt,
-                        weight_storage=storage,
-                        global_scale_kind="multiplier",
-                        output_mode="functional",
-                        per_row_global_scale=_DENSE_PER_ROW_GS,
-                    )
-                    self.plans[m] = plan_query(query)
+                self.plans[m] = plan_query(query)
             requests = []
             for m, declaration in self.plans.items():
                 name = f"fp6-dense:{self.prefix}:m{m}:lane{workload.lane}"
@@ -341,22 +344,27 @@ def register_b12x_fp6() -> None:
             from b12x.gemm.bf16_gemv import GemvQuery, plan as plan_query
             from b12x.preparation import PreparedCall
 
-            if not self.plans:
-                for m in sorted({int(count) for count in workload.token_counts}):
-                    if not 1 <= m <= SMALL_M_MAX:
-                        continue
-                    query = GemvQuery(
-                        source_dtype="bfloat16",
-                        weight_dtype="bfloat16",
-                        max_rows=m,
-                        in_features=int(self.weight.shape[1]),
-                        out_features=int(self.weight.shape[0]),
-                        source_contiguous=True,
-                        source_aligned=True,
-                        weight_contiguous=True,
-                        weight_aligned=True,
-                    )
-                    self.plans[m] = plan_query(query)
+            # Merge every workload's token counts: a later workload may carry
+            # counts the first one did not, and plan_for must find them all.
+            needed = (
+                {int(count) for count in workload.token_counts}
+                - set(self.plans)
+            )
+            for m in sorted(needed):
+                if not 1 <= m <= SMALL_M_MAX:
+                    continue
+                query = GemvQuery(
+                    source_dtype="bfloat16",
+                    weight_dtype="bfloat16",
+                    max_rows=m,
+                    in_features=int(self.weight.shape[1]),
+                    out_features=int(self.weight.shape[0]),
+                    source_contiguous=True,
+                    source_aligned=True,
+                    weight_contiguous=True,
+                    weight_aligned=True,
+                )
+                self.plans[m] = plan_query(query)
             if not self.plans:
                 return ()
             requests = []
@@ -533,6 +541,12 @@ def register_b12x_fp6() -> None:
             self, layer: Any, x: torch.Tensor, bias: Optional[torch.Tensor] = None
         ) -> torch.Tensor:
             x2d = x.reshape(-1, x.shape[-1]) if x.dim() > 2 else x
+            provider = getattr(layer, "b12x_fp6_provider", None)
+            # Never dispatch through plan_for without a prepared plan: an
+            # unprepared count (e.g. preparation suppressed) falls back to the
+            # base method instead of raising deep inside the custom op.
+            if provider is None or int(x2d.shape[0]) not in provider.plans:
+                return super().apply(layer, x, bias)
             y = torch.ops.vllm.b12x_fp6_linear(
                 x2d.to(torch.bfloat16),
                 layer.b12x_fp6_out_features,
@@ -593,6 +607,9 @@ def register_b12x_fp6() -> None:
                 rows = int(x2d.shape[0])
                 if (
                     1 <= rows <= SMALL_M_MAX
+                    # Only dispatch counts that were prepared: plan_for raises
+                    # otherwise, so unprepared counts fall back to super().apply.
+                    and rows in provider.plans
                     and x2d.is_contiguous()
                     and x2d.data_ptr() % 16 == 0
                 ):

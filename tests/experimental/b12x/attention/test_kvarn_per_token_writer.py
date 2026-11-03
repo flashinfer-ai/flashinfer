@@ -7,7 +7,18 @@ Run: CUDA_VISIBLE_DEVICES=2 ~/.cache/b12x-kvarn-wt/../lil/vllm/.venv/bin/python 
 import os
 import sys
 
-REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import pytest
+
+# tests/experimental/b12x/attention/<this file> -> five levels up is the root.
+REPO = os.path.dirname(
+    os.path.dirname(
+        os.path.dirname(
+            os.path.dirname(
+                os.path.dirname(os.path.abspath(__file__))
+            )
+        )
+    )
+)
 VLLM = os.environ.get("VLLM_REPO", os.path.expanduser("~/lil/vllm"))
 for p in (REPO, VLLM):
     if p not in sys.path:
@@ -15,18 +26,22 @@ for p in (REPO, VLLM):
 
 import torch  # noqa: E402
 
+if not torch.cuda.is_available():
+    pytest.skip("kvarn per-token writer test needs CUDA", allow_module_level=True)
+
 from b12x.attention._shared.mla._kvarn_writer import (  # noqa: E402
     concat_and_cache_glm_next_mla_kvarn,
     dequant_kvarn_mla_records,
     kvarn_record_bytes,
     kvarn_tile_stride_bytes,
 )
-from vllm.v1.attention.ops.kvarn_mla import (  # noqa: E402
-    hadamard_matrix,
-    kvarn_mla_layout_from_dtype,
-    pack_kvarn_mla_records,
-    unpack_kvarn_mla_records,
-)
+
+# Fork-only reference codec: skip collection cleanly when unavailable.
+kvarn_mla = pytest.importorskip("vllm.v1.attention.ops.kvarn_mla")
+hadamard_matrix = kvarn_mla.hadamard_matrix
+kvarn_mla_layout_from_dtype = kvarn_mla.kvarn_mla_layout_from_dtype
+pack_kvarn_mla_records = kvarn_mla.pack_kvarn_mla_records
+unpack_kvarn_mla_records = kvarn_mla.unpack_kvarn_mla_records
 
 DEVICE = "cuda"
 GROUP = 256
@@ -70,10 +85,11 @@ def _run_variant(k_bits, v_bits, seed=0):
 
     valid = slots >= 0
     s = slots.clamp_min(0).long()
+    # Writer's 3-D rule: dense row stride within a page (stride(1) =
+    # record_bytes), page stride block_stride — not the arena tile stride.
     offs = (
         (s // page_block_size) * block_stride
-        + ((s % page_block_size) // GROUP) * tile_stride
-        + (s % GROUP) * record_bytes
+        + (s % page_block_size) * record_bytes
     )
     rec_bytes = cache[offs.unsqueeze(1) + torch.arange(record_bytes, device=DEVICE)]
 
@@ -106,7 +122,6 @@ def _run_variant(k_bits, v_bits, seed=0):
     print(f"k{k_bits}v{v_bits}: OK")
 
 
-if __name__ == "__main__":
+def test_variants():
     for kb, vb in ((4, 4), (5, 5), (5, 4), (4, 2)):
         _run_variant(kb, vb)
-    print("ALL OK")

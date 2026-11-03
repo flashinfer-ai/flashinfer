@@ -234,6 +234,7 @@ def io_issue_gather(
     kvarn_group: cutlass.Constexpr = 0,
     kvarn_tile_stride: cutlass.Constexpr = 0,
     tail_fp8: cutlass.Constexpr = False,
+    tail_fp8_stride: cutlass.Constexpr = 536,
     split_mbar_arrival: cutlass.Constexpr = False,
     overlap_footer_gather: cutlass.Constexpr = False,
     per_token_latent_scale: cutlass.Constexpr = False,
@@ -327,10 +328,12 @@ def io_issue_gather(
         _ROPE_SRC = Int64(kvarn_record_bytes)
     if cutlass.const_expr(tail_fp8):
         # Precision-tail arm: GLM fp8 record content (512 E4M3 + 16B inline
-        # fp32 scales = 528B) living in a 536B-stride kvarn pool. Copy the
-        # 528B content [0,528); the 8B pad [528,536) is never read. The 536B
-        # row stride is not 16B-aligned, so this arm scalar-stages (no bulk).
-        _IOS = Int64(536)
+        # fp32 scales = 528B) living in a kvarn pool whose slot width follows
+        # the variant (536B for k4v4, 600B for k5v4). Copy the 528B content
+        # [0,528); the trailing pad is never read. The row stride is not
+        # 16B-aligned, so this arm scalar-stages (no bulk); a 600B stride is
+        # 8-aligned so the scalar u32 copy stays legal.
+        _IOS = Int64(tail_fp8_stride)
         _NOPE = Int32(528)
         _ROPE = Int32(0)
         _ROPE_SRC = Int64(528)

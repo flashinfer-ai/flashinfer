@@ -12,6 +12,8 @@ dequantizes the same cache bytes with ``unpack_kvarn_mla_records``.
 import os
 import sys
 
+import pytest
+
 REPO = os.environ.get("B12X_REPO", os.path.expanduser("~/.cache/b12x-kvarn-wt"))
 VLLM = os.environ.get("VLLM_REPO", os.path.expanduser("~/lil/vllm"))
 for p in (REPO, VLLM):
@@ -20,6 +22,9 @@ for p in (REPO, VLLM):
 
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
+
+if not torch.cuda.is_available():
+    pytest.skip("kvarn MG prefill test needs CUDA", allow_module_level=True)
 
 from b12x.attention.sparse_mla._preparation import (  # noqa: E402
     plan_cache_writer,
@@ -31,10 +36,11 @@ from b12x.attention._shared.mla.traits import (  # noqa: E402
     ModelType,
     ScaleFormat,
 )
-from vllm.v1.attention.ops.kvarn_mla import (  # noqa: E402
-    kvarn_mla_layout_from_dtype,
-    unpack_kvarn_mla_records,
-)
+
+# Fork-only reference codec: skip collection cleanly when unavailable.
+kvarn_mla = pytest.importorskip("vllm.v1.attention.ops.kvarn_mla")
+kvarn_mla_layout_from_dtype = kvarn_mla.kvarn_mla_layout_from_dtype
+unpack_kvarn_mla_records = kvarn_mla.unpack_kvarn_mla_records
 
 DEV_ORD = 0
 GROUP = 256
@@ -69,11 +75,13 @@ def _records_at(cache: torch.Tensor, slots: torch.Tensor):
     return k_hat.to(cache.device), v_hat.to(cache.device)
 
 
-def main() -> None:
+def test_main() -> None:
     torch.manual_seed(7)
     device = torch.device("cuda", DEV_ORD)
-    cache_full = torch.zeros((34, PAGE, 602), dtype=torch.uint8, device=device)
-    cache = cache_full[..., :RECORD]
+    # Contiguous 536B rows: a 602B physical row stride is not supported by the
+    # prefill gather (it advances rows by the compiled 536B record width).
+    cache_full = torch.zeros((34, PAGE, RECORD), dtype=torch.uint8, device=device)
+    cache = cache_full
 
     # Two tiles in different blocks: block 1 tile 1, block 3 tile 5.
     tile_bases = [1 * PAGE + 1 * GROUP, 3 * PAGE + 5 * GROUP]
@@ -137,8 +145,4 @@ def main() -> None:
         rel = float(err.mean() / ref.abs().mean().clamp_min(1e-6))
         max_rel = max(max_rel, rel)
         print(f"row {r}: mean|ref|={ref.abs().mean():.4f} rel={rel:.4f}")
-    print("MG KVARN PREFILL:", "OK" if max_rel < 0.05 else "MISMATCH")
-
-
-if __name__ == "__main__":
-    main()
+    assert max_rel < 0.05, f"MG KVARN PREFILL mismatch: max_rel {max_rel:.4f}"

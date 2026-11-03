@@ -19,7 +19,23 @@ from typing import Callable, ContextManager
 import torch
 import torch.distributed as dist
 
-from .pcie_oneshot import PCIeOneshotAllReducePool, PlainAllReduceRoutePolicy
+from ._oneshot_preparation import _prepare_plain_call
+from ._preparation import plan as _pcie_plan, query_from_runtime
+from ...preparation import CollectiveRequirement, PreparationSession
+from .pcie_oneshot import PCIeOneshotAllReducePool
+
+
+@dataclass(frozen=True)
+class PlainAllReduceRoutePolicy:
+    """Selected plain-allreduce route per measured row shape."""
+
+    world_size: int
+    hidden_size: int
+    dtype: str
+    rows: tuple[int, ...]
+    custom_rows: frozenset[int]
+    min_absolute_margin_us: float
+    min_relative_margin: float
 
 
 @dataclass(frozen=True)
@@ -34,6 +50,9 @@ class CalibrationPoint:
     correct: bool = True
     custom_trials_us: tuple[float, ...] = ()
     nccl_trials_us: tuple[float, ...] = ()
+    # Execution order of the per-trial measurements ("custom"/"nccl"),
+    # recorded so the serialized JSON stays auditable.
+    trial_order: tuple[str, ...] = ()
 
 
 def select_plain_allreduce_policy(
@@ -148,11 +167,13 @@ def _measure_graph(
     repeat: int,
     ops_per_sample: int,
     device: torch.device,
+    capture_guard: Callable[[], ContextManager[object]] | None = None,
 ) -> tuple[float, float]:
     stream = torch.cuda.Stream(device=device)
     stream.wait_stream(torch.cuda.current_stream(device))
     graph = torch.cuda.CUDAGraph()
-    with capture_context(stream), torch.cuda.graph(graph, stream=stream):
+    guard = capture_guard() if capture_guard is not None else nullcontext()
+    with guard, capture_context(stream), torch.cuda.graph(graph, stream=stream):
         for _ in range(ops_per_sample):
             op()
     torch.cuda.current_stream(device).wait_stream(stream)
@@ -178,34 +199,38 @@ def _measure_graph(
     return result
 
 
-def _measure_graph_trials(
-    op: Callable[[], None],
+def _prepare_row_plan(
+    pool: PCIeOneshotAllReducePool,
+    inp: torch.Tensor,
+    out: torch.Tensor,
     *,
-    capture_context: Callable[[torch.cuda.Stream], ContextManager[object]],
-    warmup: int,
-    repeat: int,
-    ops_per_sample: int,
-    trials: int,
     device: torch.device,
-) -> tuple[float, float, tuple[float, ...]]:
-    runs = tuple(
-        _measure_graph(
-            op,
-            capture_context=capture_context,
-            warmup=warmup,
-            repeat=repeat,
-            ops_per_sample=ops_per_sample,
-            device=device,
-        )
-        for _ in range(trials)
+    world_size: int,
+):
+    """Create and prepare a comm.pcie plan for one all-reduce input shape."""
+    channel = pool.for_stream()
+    query = query_from_runtime(
+        channel, surface="OneshotAllReduce.all_reduce", call={"inp": inp}
     )
-    medians = tuple(run[0] for run in runs)
-    p95s = tuple(run[1] for run in runs)
-    return (
-        sorted(medians)[len(medians) // 2],
-        sorted(p95s)[len(p95s) // 2],
-        medians,
+    declaration = _pcie_plan(query, runtime=channel)
+    collective = CollectiveRequirement(
+        key=f"plain_allreduce_rows{int(inp.shape[0])}",
+        ranks=tuple(range(world_size)),
     )
+    request = declaration.request(
+        name="plain_allreduce",
+        collective=collective,
+        prepare_call=lambda state: _prepare_plain_call(state, inp=inp, out=out),
+    )
+    session = PreparationSession(device=device, autotune=False)
+    session.__enter__()
+    session.prepare(
+        (request,),
+        coordinator=lambda progress: (
+            collective.key if progress.ready_collectives else None
+        ),
+    )
+    return declaration, session
 
 
 def _stabilize_transports(
@@ -217,31 +242,42 @@ def _stabilize_transports(
     replays: int,
     ops_per_replay: int,
     device: torch.device,
+    world_size: int,
 ) -> None:
     """Raise both transports to an active link and clock state symmetrically."""
 
     # CUDA graph capture must not trigger JIT compilation or communicator
     # initialization. Prime both transports once, then replay an equal number
     # of B12X and NCCL operations from one graph.
-    pool.prepare_graph_all_reduce(custom_input)
-    pool.all_reduce(custom_input, out=custom_output)
-    dist.all_reduce(nccl_input)
-    nccl_input.zero_()
-    torch.cuda.synchronize(device)
-    dist.barrier()
-
-    def combined_op() -> None:
-        pool.all_reduce(custom_input, out=custom_output)
-        dist.all_reduce(nccl_input)
-
-    _measure_graph(
-        combined_op,
-        capture_context=lambda stream: pool.capture(stream),
-        warmup=replays,
-        repeat=1,
-        ops_per_sample=ops_per_replay,
+    declaration, session = _prepare_row_plan(
+        pool,
+        custom_input,
+        custom_output,
         device=device,
+        world_size=world_size,
     )
+    try:
+        pool.all_reduce(custom_input, out=custom_output, plan=declaration)
+        dist.all_reduce(nccl_input)
+        nccl_input.zero_()
+        torch.cuda.synchronize(device)
+        dist.barrier()
+
+        def combined_op() -> None:
+            pool.all_reduce(custom_input, out=custom_output, plan=declaration)
+            dist.all_reduce(nccl_input)
+
+        _measure_graph(
+            combined_op,
+            capture_context=lambda stream: pool.capture(stream),
+            warmup=replays,
+            repeat=1,
+            ops_per_sample=ops_per_replay,
+            device=device,
+            capture_guard=session.capture,
+        )
+    finally:
+        session.close()
 
 
 def _measure_row(
@@ -262,54 +298,80 @@ def _measure_row(
     custom_input = torch.full((rows, hidden_size), rank + 1, dtype=dtype, device=device)
     custom_output = torch.empty_like(custom_input)
 
-    pool.all_reduce(custom_input, out=custom_output)
-    torch.cuda.synchronize(device)
-    custom_correct = _all_ranks(
-        bool(torch.all(custom_output == expected).item()), device
-    )
-
-    def custom_op() -> None:
-        pool.all_reduce(custom_input, out=custom_output)
-
-    pool.prepare_graph_all_reduce(custom_input)
-    custom_median, custom_p95, custom_trials = _measure_graph_trials(
-        custom_op,
-        capture_context=lambda stream: pool.capture(stream),
-        warmup=warmup,
-        repeat=repeat,
-        ops_per_sample=ops_per_sample,
-        trials=trials,
+    declaration, session = _prepare_row_plan(
+        pool,
+        custom_input,
+        custom_output,
         device=device,
+        world_size=world_size,
     )
+    try:
+        pool.all_reduce(custom_input, out=custom_output, plan=declaration)
+        torch.cuda.synchronize(device)
+        custom_correct = _all_ranks(
+            bool(torch.all(custom_output == expected).item()), device
+        )
 
-    nccl_input = torch.full((rows, hidden_size), rank + 1, dtype=dtype, device=device)
-    dist.all_reduce(nccl_input)
-    torch.cuda.synchronize(device)
-    nccl_correct = _all_ranks(bool(torch.all(nccl_input == expected).item()), device)
-    nccl_input.fill_(rank + 1)
-
-    def nccl_op() -> None:
+        nccl_input = torch.full(
+            (rows, hidden_size), rank + 1, dtype=dtype, device=device
+        )
         dist.all_reduce(nccl_input)
+        torch.cuda.synchronize(device)
+        nccl_correct = _all_ranks(
+            bool(torch.all(nccl_input == expected).item()), device
+        )
+        nccl_input.fill_(rank + 1)
 
-    nccl_median, nccl_p95, nccl_trials = _measure_graph_trials(
-        nccl_op,
-        capture_context=lambda _stream: nullcontext(),
-        warmup=warmup,
-        repeat=repeat,
-        ops_per_sample=ops_per_sample,
-        trials=trials,
-        device=device,
-    )
-    return CalibrationPoint(
-        rows=rows,
-        custom_median_us=custom_median,
-        custom_p95_us=custom_p95,
-        nccl_median_us=nccl_median,
-        nccl_p95_us=nccl_p95,
-        correct=custom_correct and nccl_correct,
-        custom_trials_us=custom_trials,
-        nccl_trials_us=nccl_trials,
-    )
+        def custom_op() -> None:
+            pool.all_reduce(custom_input, out=custom_output, plan=declaration)
+
+        def nccl_op() -> None:
+            dist.all_reduce(nccl_input)
+
+        # Interleave the transports: each trial measures both, alternating
+        # which runs first, so clock/thermal/PCIe drift cannot systematically
+        # favor one transport. Pair custom/nccl trials by index for the
+        # majority-win check; record the executed order for auditability.
+        custom_runs: list[tuple[float, float]] = []
+        nccl_runs: list[tuple[float, float]] = []
+        trial_order: list[str] = []
+        for trial in range(trials):
+            order = (
+                ("custom", custom_op, lambda stream: pool.capture(stream)),
+                ("nccl", nccl_op, lambda _stream: nullcontext()),
+            )
+            if trial % 2:
+                order = order[::-1]
+            for name, op, ctx in order:
+                trial_order.append(name)
+                run = _measure_graph(
+                    op,
+                    capture_context=ctx,
+                    warmup=warmup,
+                    repeat=repeat,
+                    ops_per_sample=ops_per_sample,
+                    device=device,
+                    capture_guard=session.capture,
+                )
+                (custom_runs if name == "custom" else nccl_runs).append(run)
+
+        custom_medians = tuple(run[0] for run in custom_runs)
+        custom_p95s = tuple(run[1] for run in custom_runs)
+        nccl_medians = tuple(run[0] for run in nccl_runs)
+        nccl_p95s = tuple(run[1] for run in nccl_runs)
+        return CalibrationPoint(
+            rows=rows,
+            custom_median_us=sorted(custom_medians)[len(custom_medians) // 2],
+            custom_p95_us=sorted(custom_p95s)[len(custom_p95s) // 2],
+            nccl_median_us=sorted(nccl_medians)[len(nccl_medians) // 2],
+            nccl_p95_us=sorted(nccl_p95s)[len(nccl_p95s) // 2],
+            correct=custom_correct and nccl_correct,
+            custom_trials_us=custom_medians,
+            nccl_trials_us=nccl_medians,
+            trial_order=tuple(trial_order),
+        )
+    finally:
+        session.close()
 
 
 def main() -> None:
@@ -368,6 +430,7 @@ def main() -> None:
             replays=args.stabilization_replays,
             ops_per_replay=args.ops_per_sample,
             device=device,
+            world_size=world_size,
         )
         points = [
             _measure_row(

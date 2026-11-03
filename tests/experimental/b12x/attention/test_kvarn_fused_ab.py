@@ -13,6 +13,8 @@ import math
 import os
 import sys
 
+import pytest
+
 REPO = os.environ.get("B12X_REPO", os.path.expanduser("~/.cache/b12x-kvarn-wt"))
 VLLM = os.environ.get("VLLM_REPO", os.path.expanduser("~/lil/vllm"))
 for p in (REPO, VLLM):
@@ -21,6 +23,9 @@ for p in (REPO, VLLM):
 
 import torch  # noqa: E402
 
+if not torch.cuda.is_available():
+    pytest.skip("kvarn fused A/B test needs CUDA", allow_module_level=True)
+
 from b12x.attention.sparse_mla import Caps  # noqa: E402
 from b12x.attention.sparse_mla._preparation import (  # noqa: E402
     compile_sparse_mla,
@@ -28,7 +33,11 @@ from b12x.attention.sparse_mla._preparation import (  # noqa: E402
     writer_state,
 )
 from b12x.attention._shared.mla.kernel import run_prepared_unified_decode  # noqa: E402
-from vllm.v1.attention.ops.kvarn_mla import unpack_kvarn_mla_records  # noqa: E402
+
+# Fork-only reference codec: skip collection cleanly when unavailable.
+kvarn_mla = pytest.importorskip("vllm.v1.attention.ops.kvarn_mla")
+unpack_kvarn_mla_records = kvarn_mla.unpack_kvarn_mla_records
+kvarn_mla_layout_from_dtype = kvarn_mla.kvarn_mla_layout_from_dtype
 
 DEV_ORD = 0
 GROUP = 256
@@ -40,7 +49,7 @@ TOPK = 2051
 L = 512
 
 
-def main() -> None:
+def test_main() -> None:
     torch.manual_seed(11)
     device = torch.device("cuda", DEV_ORD)
     layout = (34, PAGE, RECORD)
@@ -133,16 +142,13 @@ def main() -> None:
     max_err = 0.0
     for r in range(ROWS):
         base, _ = tile_specs[r % len(tile_specs)]
-        # Per-token records at tile-strided flat byte offsets (the
-        # [PAGE, RECORD] view cannot express them). Block stride = the
-        # cache view's stride(0) -- the same value the writer and the
-        # decode kernel's io addressing use.
-        tile_stride = GROUP * RECORD + 6400
+        # Dense contiguous cache: block stride = cache.stride(0), rows are
+        # packed at RECORD within the page (the writer and decode io use the
+        # same dense addressing, not the gathered-arena tile stride).
         blk = base // PAGE
-        tile = (base % PAGE) // GROUP
-        row = base % GROUP
+        local = base % PAGE
         flat = cache.view(-1)
-        rec_off = blk * cache.stride(0) + tile * tile_stride + row * RECORD
+        rec_off = blk * cache.stride(0) + local * RECORD
         recs = torch.stack(
             [
                 flat[rec_off + i * RECORD : rec_off + (i + 1) * RECORD]
@@ -162,14 +168,8 @@ def main() -> None:
             f"row {r}: mean|ref|={ref.abs().mean():.4f} "
             f"mean|err|={err.mean():.6f} rel={float(rel):.4f}"
         )
-    print("FUSED AB:", "OK" if max_err < 0.05 else "MISMATCH")
+    assert max_err < 0.05, f"FUSED AB mismatch: max_err {max_err:.4f}"
 
 
 def _caps_layout():
-    from vllm.v1.attention.ops.kvarn_mla import kvarn_mla_layout_from_dtype
-
     return kvarn_mla_layout_from_dtype("kvarn_mla_k4v4_g256")
-
-
-if __name__ == "__main__":
-    main()

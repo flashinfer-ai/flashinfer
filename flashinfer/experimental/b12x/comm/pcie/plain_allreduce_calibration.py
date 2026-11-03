@@ -277,7 +277,7 @@ def build_fingerprint_payload(args: argparse.Namespace) -> dict[str, Any]:
         "software": {
             "python": sys.version,
             "torch": _package_version("torch"),
-            "b12x": _package_version("b12x"),
+            "flashinfer": _package_version("flashinfer-python"),
             "source_sha256": _source_digest(),
             "nccl": _file_identity(
                 os.getenv("VLLM_NCCL_SO_PATH")
