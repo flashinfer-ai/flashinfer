@@ -254,27 +254,28 @@ def _check_fixed_cta_tile_q_backend(
             )
 
 
-def _freeze_fixed_cta_tile_q(wrapper, fixed_cta_tile_q: int) -> None:
+def _check_fixed_cta_tile_q_frozen(wrapper, fixed_cta_tile_q: int) -> None:
     """Keep the validated query tile constant across CUDA-graph plans.
 
     A captured run() replays the kernel instantiated for the tile of the plan it
     was captured with, so a replan with another tile would pair that kernel with
-    metadata tiled for a different CTA_TILE_Q.
+    metadata tiled for a different CTA_TILE_Q. Only a plan that completes
+    records its tile (``wrapper._planned_fixed_cta_tile_q``), so a plan rejected
+    later, e.g. by the native shared-memory check, does not freeze the wrapper.
     """
     if not wrapper.is_cuda_graph_enabled:
         return
-    frozen = getattr(wrapper, "_frozen_fixed_cta_tile_q", None)
-    if frozen is not None and frozen != fixed_cta_tile_q:
+    planned = getattr(wrapper, "_planned_fixed_cta_tile_q", None)
+    if planned is not None and planned != fixed_cta_tile_q:
 
         def show(tile: int) -> str:
             return "None" if tile == -1 else str(tile)
 
         raise ValueError(
             "fixed_cta_tile_q is part of the frozen cudagraph shape: this wrapper "
-            f"was planned with {show(frozen)}, got {show(fixed_cta_tile_q)}. "
+            f"was planned with {show(planned)}, got {show(fixed_cta_tile_q)}. "
             "Use a separate wrapper per fixed_cta_tile_q."
         )
-    wrapper._frozen_fixed_cta_tile_q = fixed_cta_tile_q
 
 
 def is_float8(x: torch.Tensor) -> bool:

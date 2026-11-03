@@ -94,7 +94,7 @@ from .utils import (
     _check_block_tables_shape,
     _check_cached_qkv_data_type,
     _check_fixed_cta_tile_q_backend,
-    _freeze_fixed_cta_tile_q,
+    _check_fixed_cta_tile_q_frozen,
     _validate_fixed_cta_tile_q,
     _check_kv_layout,
     _check_pos_encoding_mode,
@@ -3730,7 +3730,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             QK >= 512 with VO < 512 supports only ``16``.
             Requires the ``fa2`` backend (and ``use_tensor_cores=True`` for decode);
             ``backend="auto"`` selects FA2 when this is set. Tile ``16`` is rejected
-            at plan time when its smallest KV step does not fit shared memory.
+            at plan time when it does not fit the GPU's shared memory.
             Under CUDA graphs, every plan of a wrapper must pass the same value.
             For batch invariance, also use ``disable_split_kv=True`` or a fixed split size.
         Note
@@ -3839,7 +3839,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         fixed_cta_tile_q = _validate_fixed_cta_tile_q(
             fixed_cta_tile_q, head_dim_vo, head_dim_qk
         )
-        _freeze_fixed_cta_tile_q(self, fixed_cta_tile_q)
+        _check_fixed_cta_tile_q_frozen(self, fixed_cta_tile_q)
 
         batch_size = len(qo_indptr) - 1
         self._batch_size = batch_size
@@ -4508,6 +4508,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     self._cudnn_plan = _CudnnPrefillPlan.prepare(
                         metadata, q_data_type, self.device, previous_cudnn_plan
                     )
+        self._planned_fixed_cta_tile_q = fixed_cta_tile_q
 
     @flashinfer_api
     def prewarm_paged_kv_stride_variant(self, variant: str = "independent") -> None:
@@ -5886,7 +5887,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             QK >= 512 with VO < 512 supports only ``16``.
             Requires the ``fa2`` backend (and ``use_tensor_cores=True`` for decode);
             ``backend="auto"`` selects FA2 when this is set. Tile ``16`` is rejected
-            at plan time when its smallest KV step does not fit shared memory.
+            at plan time when it does not fit the GPU's shared memory.
             Under CUDA graphs, every plan of a wrapper must pass the same value.
             For batch invariance, also use ``disable_split_kv=True`` or a fixed split size.
         seq_lens: Optional[torch.Tensor]
@@ -5949,7 +5950,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         fixed_cta_tile_q = _validate_fixed_cta_tile_q(
             fixed_cta_tile_q, head_dim_vo, head_dim_qk
         )
-        _freeze_fixed_cta_tile_q(self, fixed_cta_tile_q)
+        _check_fixed_cta_tile_q_frozen(self, fixed_cta_tile_q)
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
         self._head_dim_qk = head_dim_qk
@@ -6705,6 +6706,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._sm_scale = sm_scale
         self._rope_scale = rope_scale
         self._rope_theta = rope_theta
+        self._planned_fixed_cta_tile_q = fixed_cta_tile_q
 
     begin_forward = plan
 

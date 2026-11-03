@@ -74,7 +74,7 @@ from .utils import (
     _check_block_tables_shape,
     _check_cached_qkv_data_type,
     _check_fixed_cta_tile_q_backend,
-    _freeze_fixed_cta_tile_q,
+    _check_fixed_cta_tile_q_frozen,
     _validate_fixed_cta_tile_q,
     _check_kv_layout,
     _check_pos_encoding_mode,
@@ -2263,7 +2263,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             QK >= 512 with VO < 512 supports only ``16``.
             Requires the ``fa2`` backend (and ``use_tensor_cores=True`` for decode);
             ``backend="auto"`` selects FA2 when this is set. Tile ``16`` is rejected
-            at plan time when its smallest KV step does not fit shared memory.
+            at plan time when it does not fit the GPU's shared memory.
             Under CUDA graphs, every plan of a wrapper must pass the same value.
             For batch invariance, also use ``disable_split_kv=True`` or a fixed split size.
         Note
@@ -2439,7 +2439,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 "fixed_cta_tile_q is only supported by tensor core decode for now."
             )
         fixed_cta_tile_q = _validate_fixed_cta_tile_q(fixed_cta_tile_q, head_dim)
-        _freeze_fixed_cta_tile_q(self, fixed_cta_tile_q)
+        _check_fixed_cta_tile_q_frozen(self, fixed_cta_tile_q)
 
         # backend="auto" may resolve to cudnn; decided per plan() so that the
         # q_len_per_req / buffer checks below already know the path.
@@ -2728,6 +2728,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             self._sm_scale = sm_scale
             self._rope_scale = rope_scale
             self._rope_theta = rope_theta
+            self._planned_fixed_cta_tile_q = fixed_cta_tile_q
             return
         if self._uses_cudnn:
             self._plan_cudnn(
@@ -2755,6 +2756,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             self._rope_theta = rope_theta
             self._q_len_per_req = q_len_per_req
             self._is_causal = is_causal
+            self._planned_fixed_cta_tile_q = fixed_cta_tile_q
             return
         if self._backend == "cute-dsl":
             if logits_soft_cap is not None and logits_soft_cap > 0:
@@ -2976,6 +2978,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         self._rope_theta = rope_theta
         self._q_len_per_req = q_len_per_req
         self._is_causal = is_causal
+        self._planned_fixed_cta_tile_q = fixed_cta_tile_q
 
     def _plan_cudnn(
         self,
@@ -5768,6 +5771,11 @@ def fast_decode_plan(
         raise ValueError(
             "fixed_cta_tile_q is only supported by tensor core decode for now."
         )
+    fixed_cta_tile_q = _validate_fixed_cta_tile_q(fixed_cta_tile_q, head_dim)
+    # The cached module comes from the previous plan(), whose resolved backend
+    # cannot be switched here.
+    _check_fixed_cta_tile_q_backend(fixed_cta_tile_q, self._backend)
+    _check_fixed_cta_tile_q_frozen(self, fixed_cta_tile_q)
     if self.use_tensor_cores:
         qo_indptr_host = _get_range_buf(batch_size + 1, "cpu")
         if q_len_per_req > 1:
@@ -5775,11 +5783,6 @@ def fast_decode_plan(
         # Here we set fixed_split_size to -1 to avoid the assertion error in flashinfer's plan function
         if fixed_split_size is None:
             fixed_split_size = -1
-        fixed_cta_tile_q = _validate_fixed_cta_tile_q(fixed_cta_tile_q, head_dim)
-        # The cached module comes from the previous plan(), whose resolved backend
-        # cannot be switched here.
-        _check_fixed_cta_tile_q_backend(fixed_cta_tile_q, self._backend)
-        _freeze_fixed_cta_tile_q(self, fixed_cta_tile_q)
 
     if self.is_cuda_graph_enabled:
         if batch_size != self._fixed_batch_size:
@@ -5905,3 +5908,4 @@ def fast_decode_plan(
     self._sm_scale = sm_scale
     self._rope_scale = rope_scale
     self._rope_theta = rope_theta
+    self._planned_fixed_cta_tile_q = fixed_cta_tile_q

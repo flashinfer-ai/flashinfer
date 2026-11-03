@@ -205,20 +205,27 @@ def test_fixed_tile_pins_auto_to_fa2(wrapper_kind):
     assert wrapper._plan_info[3] == tile
 
 
-def test_fixed_tile_16_rejected_when_smem_too_small():
-    """Tile 16 that cannot fit one KV step must fail at plan, not at run."""
-    head_dim_qk, head_dim_vo = 448, 256
-    # Mirrors FA2CtaTileQ16FitsSmem with a 2-byte Q and KV.
-    needed = 16 * head_dim_qk * 2 + (head_dim_qk + head_dim_vo) * 16 * 4 * 2
+@pytest.mark.parametrize("head_dim_qk,head_dim_vo", [(448, 256), (128, 256)])
+def test_fixed_tile_16_rejected_when_smem_too_small(head_dim_qk, head_dim_vo):
+    """Tile 16 whose shared memory does not fit must fail at plan, not at run."""
+    # Mirrors FA2CtaTileQ16FitsSmem with a 2-byte Q and KV: Q tile plus one KV
+    # step, or the cross-warp merge buffers that share the same union.
+    qkv = 16 * head_dim_qk * 2 + (head_dim_qk + head_dim_vo) * 16 * 4 * 2
+    merge = 4 * 16 * head_dim_vo * 4 + 4 * 16 * 8
+    needed = max(qkv, merge)
     optin = torch.cuda.get_device_properties(0).shared_memory_per_block_optin
     if needed <= optin:
         pytest.skip(f"tile 16 fits this GPU ({needed} <= {optin} bytes)")
-    wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
-        torch.empty(32 * 1024 * 1024, device="cuda", dtype=torch.uint8), backend="fa2"
-    )
     indptr = torch.tensor([0, 16], dtype=torch.int32)
-    # FLASHINFER_ERROR from the native planner surfaces as RuntimeError.
-    with pytest.raises(RuntimeError, match="does not fit this GPU.s shared memory"):
+    wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+        torch.empty(32 * 1024 * 1024, device="cuda", dtype=torch.uint8),
+        use_cuda_graph=True,
+        qo_indptr_buf=indptr.cuda(),
+        kv_indptr_buf=indptr.cuda(),
+        backend="fa2",
+    )
+
+    def plan(tile):
         wrapper.plan(
             indptr,
             indptr,
@@ -227,8 +234,16 @@ def test_fixed_tile_16_rejected_when_smem_too_small():
             head_dim_qk,
             head_dim_vo=head_dim_vo,
             q_data_type=torch.float16,
-            fixed_cta_tile_q=16,
+            fixed_cta_tile_q=tile,
         )
+
+    # FLASHINFER_ERROR from the native planner surfaces as RuntimeError.
+    with pytest.raises(RuntimeError, match="does not fit this GPU.s shared memory"):
+        plan(16)
+    # The rejected plan must not freeze the CUDA-graph tile: the suggested
+    # retry with 64 has to plan.
+    plan(64)
+    assert wrapper._plan_info[3] == 64
 
 
 @pytest.mark.parametrize(

@@ -620,9 +620,9 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
               << " is not supported with head_dim=" << head_dim << " and head_dim_qk=" << qk;
       FLASHINFER_ERROR(err_msg.str());
     }
-    // The automatic heuristic falls back to 64 when the 1x4 layout's smallest
-    // KV step does not fit shared memory; a fixed 16 would otherwise only fail
-    // at run time in the kernel dispatcher.
+    // The automatic heuristic falls back to 64 when the 1x4 layout (its smallest
+    // KV step or its cross-warp merge buffers) does not fit shared memory; a
+    // fixed 16 would otherwise only fail at run time when the kernel launches.
     if (fixed_cta_tile_q == 16 && head_dim < 512 && qk < 512 &&
         !FA2CtaTileQ16FitsSmem(qk, head_dim, kv_dtype_bytes)) {
       std::ostringstream err_msg;

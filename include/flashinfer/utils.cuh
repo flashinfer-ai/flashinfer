@@ -21,6 +21,7 @@
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <iostream>
@@ -409,9 +410,15 @@ inline void DebugPrintCUDAArray(T* device_ptr, size_t size, std::string prefix =
 }
 
 // Whether the 1x4 warp layout (cta_tile_q=16) of a non-split head (QK, VO < 512)
-// fits this GPU: one Q tile (assumed 2-byte Q) plus a single NUM_MMA_KV step of
-// K+V (16 rows x 4 KV warps x kv_dtype_bytes) against
-// cudaDevAttrMaxSharedMemoryPerBlockOptin. See FA2DetermineCtaTileQ.
+// fits this GPU's cudaDevAttrMaxSharedMemoryPerBlockOptin. SharedStorageQKVO
+// overlays two layouts in one union, so the larger of them must fit:
+//   - one Q tile (assumed 2-byte Q) plus a single NUM_MMA_KV step of K+V
+//     (16 rows x 4 KV warps x kv_dtype_bytes);
+//   - the cross-warp merge buffers the 4 KV warps combine their partial
+//     outputs through (cta_sync_o_smem: 4 x 16 rows x VO floats, and
+//     cta_sync_md_smem: 4 x 16 float2), e.g. 66048 bytes at VO=256, which
+//     exceeds Turing's 64KB even where Q/K/V fit.
+// See FA2DetermineCtaTileQ.
 inline bool FA2CtaTileQ16FitsSmem(uint32_t head_dim_qk, uint32_t head_dim_vo,
                                   uint32_t kv_dtype_bytes) {
   int dev_id = 0, max_smem_per_block_optin = 0;
@@ -420,7 +427,9 @@ inline bool FA2CtaTileQ16FitsSmem(uint32_t head_dim_qk, uint32_t head_dim_vo,
                          dev_id);
   const uint32_t q_tile_smem = 16 * head_dim_qk * 2;
   const uint32_t kv_step_smem_1x4 = (head_dim_qk + head_dim_vo) * 16 * 4 * kv_dtype_bytes;
-  return q_tile_smem + kv_step_smem_1x4 <= (uint32_t)max_smem_per_block_optin;
+  const uint32_t merge_smem_1x4 = 4 * 16 * head_dim_vo * sizeof(float) + 4 * 16 * sizeof(float2);
+  return std::max(q_tile_smem + kv_step_smem_1x4, merge_smem_1x4) <=
+         (uint32_t)max_smem_per_block_optin;
 }
 
 inline uint32_t FA2DetermineCtaTileQ(int64_t avg_packed_qo_len, uint32_t head_dim,
@@ -463,7 +472,9 @@ inline uint32_t FA2DetermineCtaTileQ(int64_t avg_packed_qo_len, uint32_t head_di
         // dispatcher's "even the smallest KV tile exceeds shared memory" guard
         // bounds max_smem_per_threadblock with. It is an approximation: FP4
         // scale-factor bytes and FP8 repack staging are not counted (both are
-        // zero or small at CTA_TILE_Q=16).
+        // zero or small at CTA_TILE_Q=16). FA2CtaTileQ16FitsSmem also counts the
+        // cross-warp merge buffers that share Q/K/V's union; at VO <= 256 they
+        // stay within every Ampere-or-newer opt-in limit.
         // This fallback is reachable today: neither plan() nor the JIT path
         // validates head dims, so within this branch (vo <= 256 -- vo in
         // (256, 512) fails the NUM_MMA_D_VO tiling static_assert and vo >= 512
