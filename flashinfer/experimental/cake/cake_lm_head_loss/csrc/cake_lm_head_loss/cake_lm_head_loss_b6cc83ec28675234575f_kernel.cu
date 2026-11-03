@@ -191,7 +191,7 @@ kernel_cake_lm_head_loss_b6cc83ec28675234575f(const __grid_constant__ CUtensorMa
     int cta_rank;
     asm volatile("mov.b32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
 
-    // Kernel setup ops
+    // Prologue
     __nv_bfloat16* ring_k = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
     const int ring_k_addr = smem + 1024;
     __nv_bfloat16* ring_mn = reinterpret_cast<__nv_bfloat16*>(smem_raw + 17408);
@@ -203,8 +203,7 @@ kernel_cake_lm_head_loss_b6cc83ec28675234575f(const __grid_constant__ CUtensorMa
     unsigned int* clc_resp = reinterpret_cast<unsigned int*>(smem_raw + 181248);
     const int clc_resp_addr = smem + 181248;
 
-    // Mbarrier init (8 pipeline groups, 0 ordered-sequence groups, 16 barriers)
-    // Mbarriers at smem_raw[0..128)
+    // Mbarrier init (16 barriers at smem_raw[0..128))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -257,10 +256,8 @@ kernel_cake_lm_head_loss_b6cc83ec28675234575f(const __grid_constant__ CUtensorMa
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
-
-    // Kernel post-init ops
-    const int tmem_accum = taddr;
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_accum = taddr;
 
     // ---- Role: load ----
     if (warp == 0) {

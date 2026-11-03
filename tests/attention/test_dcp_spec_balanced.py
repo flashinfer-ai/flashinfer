@@ -1124,6 +1124,24 @@ _Q_BOX_TOKENS = {
     "dcp_spec_bf16_fp8_d256_balanced": lambda program: 2,
 }
 
+# Families that ship one generated source per (program, packed-row) instance: the program
+# and the packed-row tile are fixed in each text, which serves both architectures.
+_PER_INSTANCE_FAMILIES = ("dcp_spec_bf16_fp8_d256_balanced",)
+
+
+def _member_program(variants, member) -> int | None:
+    return None if variants is None else int(member["selector"][variants["key"]])
+
+
+def _member_source(family: str, variants, programs, member) -> str:
+    program = _member_program(variants, member)
+    if family in _PER_INSTANCE_FAMILIES:
+        n_rows = member["selector"]["n_rows"]
+        return (
+            f"cuda/dcp_spec/{family}/cake_fmha_{family}_program{program}_n{n_rows}.cu"
+        )
+    return programs[program]
+
 
 def test_balanced_families_ship_one_program_per_selector_with_both_packed_instances() -> (
     None
@@ -1160,22 +1178,37 @@ def test_balanced_families_ship_one_program_per_selector_with_both_packed_instan
             dict(sorted(member["selector"].items()))
             for member in entry["source_family"]
         ] == expected_selectors, family
+        per_instance = family in _PER_INSTANCE_FAMILIES
+        sources = sorted(
+            {
+                _member_source(family, variants, programs, member)
+                for member in entry["source_family"]
+            }
+        )
         assert sorted(
             path.name for path in (csrc_dir / "cuda" / "dcp_spec" / family).iterdir()
-        ) == sorted({Path(program).name for program in programs.values()})
+        ) == sorted(Path(source).name for source in sources)
         texts = {}
-        for value, program in programs.items():
-            assert (csrc_dir / program).is_file(), program
-            program_text = (csrc_dir / program).read_text()
-            assert (
-                program_text.count("#ifndef N_ROWS\n#define N_ROWS 64\n#endif\n") == 1
-            )
+        for source in sources:
+            assert (csrc_dir / source).is_file(), source
+            program_text = (csrc_dir / source).read_text()
+            if per_instance:
+                # the instance's packed-row tile and program are fixed in its text
+                assert "N_ROWS" not in program_text
+                assert (
+                    f"CAKE_FMHA_DCP_{str(variants['key']).upper()}" not in program_text
+                )
+            else:
+                assert (
+                    program_text.count("#ifndef N_ROWS\n#define N_ROWS 64\n#endif\n")
+                    == 1
+                )
             # one text for both architectures: codegen's device-pass guard selects the sm_100a lowering
             assert "#if __CUDA_ARCH__ == 1000" in program_text
             assert "const __grid_constant__ CUtensorMap" in program_text
             assert "TensorMap const*" not in program_text
-            texts[value] = program_text
-        if variants is not None:
+            texts[source] = program_text
+        if variants is not None and not per_instance:
             knob = f"CAKE_FMHA_DCP_{str(variants['key']).upper()}"
             # one folded source for every program of the family
             assert len(set(texts.values())) == 1
@@ -1186,16 +1219,13 @@ def test_balanced_families_ship_one_program_per_selector_with_both_packed_instan
             closes = re.findall(rf"^#endif  // {knob}(?: |$)", text, re.MULTILINE)
             assert len(opens) == len(closes) > 0
         for member in entry["source_family"]:
-            program = programs[
-                None if variants is None else int(member["selector"][variants["key"]])
-            ]
-            assert member["sources"] == {"sm_100a": program, "sm_103a": program}
-            program_value = (
-                None if variants is None else int(member["selector"][variants["key"]])
-            )
+            source = _member_source(family, variants, programs, member)
+            assert member["sources"] == {"sm_100a": source, "sm_103a": source}
             assert member["defines"] == {
                 "N_ROWS": member["selector"]["n_rows"],
-                "Q_BOX_TOKENS": _Q_BOX_TOKENS[family](program_value),
+                "Q_BOX_TOKENS": _Q_BOX_TOKENS[family](
+                    _member_program(variants, member)
+                ),
             }
         assert entry["binding_source"] == f"bindings/cake_fmha_{family}_binding.cu"
         assert (csrc_dir / entry["binding_source"]).is_file()
@@ -1297,6 +1327,7 @@ def test_balanced_jit_selects_the_packed_instance_and_launch_binding(
         for family in DCP_BALANCED_FAMILIES:
             variants = jit_dcp.dcp_balanced_program_variants(family)
             programs = [None] if variants is None else list(variants["values"])
+            members = get_dcp_spec_registry()["families"][family]["source_family"]
             for n_rows in DCP_BALANCED_N_ROWS:
                 for program in programs:
                     spec = jit_dcp.gen_dcp_spec_balanced_module(
@@ -1312,7 +1343,15 @@ def test_balanced_jit_selects_the_packed_instance_and_launch_binding(
                     body, launch_binding, api_binding = (
                         Path(source) for source in spec.sources
                     )
-                    assert body.name == "kernel.cu" and body.parent.name == family
+                    selector = {"n_rows": n_rows}
+                    if variants is not None:
+                        selector[str(variants["key"])] = int(program)
+                    (member,) = [m for m in members if m["selector"] == selector]
+                    # the body the registry member names for this instance
+                    assert body.name in {
+                        Path(s).name for s in member["sources"].values()
+                    }
+                    assert body.parent.name == family
                     if variants is not None:
                         knob = f"CAKE_FMHA_DCP_{str(variants['key']).upper()}"
                         assert f"-D{knob}={program}" in spec.extra_cuda_cflags

@@ -1084,6 +1084,86 @@ def test_blackwell_cached_cluster_balanced_chunk_per_arch(
 
 
 @pytest.mark.parametrize(
+    "rows,vocab_size",
+    [
+        (32, 151936),  # on B200 a full wave of 16-CTA clusters and one more
+        (16, 151936),
+        (48, 151936),
+        (64, 151936),
+        (32, 128000),
+        (32, 152064),
+        (1024, 151936),  # past two waves of shared-tile clusters
+        (62, 70000),  # 8-CTA shared-tile kernel within two waves
+        (128, 68000),
+    ],
+)
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_blackwell_softmax_unit_temperature_relative_error(rows, vocab_size, seed):
+    # A scalar temperature of 1 and no temperature run the same kernel and give
+    # identical outputs, each within 1e-6 relative error of float64 softmax.
+    _skip_unless_b200_or_gb300()
+    torch.manual_seed(seed)
+    logits = torch.randn(rows, vocab_size, device="cuda")
+    expected = torch.softmax(logits.double(), dim=-1)
+    unit = flashinfer.sampling.softmax(logits, temperature=1.0)
+    none = flashinfer.sampling.softmax(logits, temperature=None)
+
+    assert torch.equal(unit, none)
+    rel = (unit.double() - expected).abs() / expected
+    assert rel.max().item() <= 1e-6
+
+
+@pytest.mark.parametrize(
+    "rows,prefix_rows,vocab_size",
+    [
+        # 16-CTA shared-tile kernel: five waves of resident clusters on B200
+        # (the last with the balanced chunk for a per-row temperature), and a
+        # prefix within two waves that takes the low-latency kernel.
+        (155, 32, 151936),
+        (155, 62, 151936),
+        # 8-CTA shared-tile kernel.
+        (355, 62, 66000),
+    ],
+)
+@pytest.mark.parametrize("temperature_kind", ["none", "scalar", "per_row"])
+def test_blackwell_softmax_shared_tile_kernels_match_across_waves(
+    rows, prefix_rows, vocab_size, temperature_kind
+):
+    # Rows give the same bits whether the batch launches the shared-tile kernel
+    # for more than two waves or the low-latency kernel for at most two waves.
+    _skip_unless_b200_or_gb300()
+    torch.manual_seed(11)
+    logits = torch.randn(rows, vocab_size, device="cuda")
+    if temperature_kind == "per_row":
+        temperature = torch.rand(rows, device="cuda") * 0.9 + 0.1
+        prefix_temperature = temperature[:prefix_rows].contiguous()
+    else:
+        temperature = None if temperature_kind == "none" else 0.7
+        prefix_temperature = temperature
+    prefix = logits[:prefix_rows].contiguous()
+    shared_tiles = (
+        flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_CACHED_CLUSTER_SHARED_TILES
+    )
+    for x, t in ((logits, temperature), (prefix, prefix_temperature)):
+        route = flashinfer.sampling._blackwell_softmax_route_for_testing(
+            x, temperature=t
+        )
+        assert route == shared_tiles
+    full_kernel = flashinfer.sampling._blackwell_softmax_cached_kernel_for_testing(
+        logits, temperature=temperature
+    )
+    prefix_kernel = flashinfer.sampling._blackwell_softmax_cached_kernel_for_testing(
+        prefix, temperature=prefix_temperature
+    )
+    # Same cluster size and chunk, so the same per-row arithmetic.
+    assert full_kernel[0] == prefix_kernel[0]
+    assert full_kernel[5] == prefix_kernel[5]
+    full = flashinfer.sampling.softmax(logits, temperature=temperature)
+    part = flashinfer.sampling.softmax(prefix, temperature=prefix_temperature)
+    assert torch.equal(full[:prefix_rows], part)
+
+
+@pytest.mark.parametrize(
     "rows,vocab_size,cluster_ctas,sm100_chunk,sm103_chunk",
     [
         # 16-CTA shared-tile kernel: up to 9 waves and from 9 up to 13 waves

@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
+import flashinfer.autotuner.autotuner as autotuner_module
 import flashinfer.fused_moe.core as core_mod
 from flashinfer import autotune
 from flashinfer.autotuner.initializers import autotuner_initializer_randn
@@ -20,6 +21,7 @@ from flashinfer.fused_moe.shared.tuning import (
 from flashinfer.fused_moe.utils import (
     get_hybrid_num_tokens_buckets,
     make_hybrid_bucket_mapper,
+    map_to_hybrid_bucket_uncapped,
 )
 from flashinfer.mla._batch_mla._backends.cute_dsl_modular_backend import (
     _BatchMLAPagedAttentionCuteDslModularBackend,
@@ -48,7 +50,7 @@ from flashinfer.autotuner import (
 )
 from flashinfer.fused_moe.shared.tuning import make_repeating_tensor_initializer
 
-from flashinfer.utils import last_positive_power_of_2
+from flashinfer.utils import last_positive_power_of_2, next_positive_power_of_2
 
 from .utils import reset_autotuner
 
@@ -1915,6 +1917,240 @@ def test_choose_one_with_custom_buckets_selects_best_tactic(monkeypatch):
         assert tactic == expected_tactic, (
             f"n={actual_n}: expected tactic {expected_tactic}, got {tactic}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Tests for lookups above the largest tuned bucket
+# ---------------------------------------------------------------------------
+
+
+def _pow2_bucket_config():
+    return TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                input_idx=(0,),
+                dim_idx=(0,),
+                gen_tuning_buckets=(128, 512),
+                map_to_tuning_buckets=next_positive_power_of_2,
+            ),
+        ),
+    )
+
+
+def test_choose_one_above_overridden_top_bucket_uses_largest_tuned_profile(
+    monkeypatch,
+):
+    """Tuning under autotune(tuning_buckets=hybrid(N), round_up=True) stores
+    the top bucket N under N, while the op's own mapper sends runtime sizes
+    above the previous bucket to the next power of two.  Those lookups (and
+    sizes above N) must use the profile tuned at N, not the fallback."""
+    tuner = reset_autotuner()
+    runner = DummyRunner(valid_tactics=(0, 1, 2))
+    config = TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                input_idx=(0,),
+                dim_idx=(0,),
+                gen_tuning_buckets=get_hybrid_num_tokens_buckets,
+                map_to_tuning_buckets=map_to_hybrid_bucket_uncapped,
+            ),
+        ),
+    )
+    max_tokens = 6144
+    buckets = get_hybrid_num_tokens_buckets(max_tokens)
+    assert buckets[-2:] == (4096, max_tokens)
+
+    def fake_profile(self, runner_obj, prof_inputs, tactic, tuning_config=None, **kw):
+        best = 2 if prof_inputs[0].shape[0] == max_tokens else 1
+        return 1.0 if tactic == best else 5.0
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
+    with autotune(tune_mode=True, tuning_buckets=buckets, round_up=True):
+        tuner.choose_one(
+            "top_bucket_test", [runner], config, [torch.empty((max_tokens, 16))]
+        )
+
+    messages = []
+    monkeypatch.setattr(
+        autotuner_module.logger, "info", lambda msg, *a, **k: messages.append(msg)
+    )
+    # 3000 -> 3072 (tuned); 5000 and 6144 -> 8192 and 20000 -> 32768, all
+    # above the top tuned bucket 6144.
+    for num_tokens, expected_tactic in ((3000, 1), (5000, 2), (6144, 2), (20000, 2)):
+        _, tactic = tuner.choose_one(
+            "top_bucket_test", [runner], config, [torch.empty((num_tokens, 16))]
+        )
+        assert tactic == expected_tactic, f"num_tokens={num_tokens}: got {tactic}"
+    # Logged once per requested profile: 8192 and 32768.
+    assert len([m for m in messages if "above the largest tuned bucket" in m]) == 2
+
+
+def test_search_cache_top_bucket_fallback_only_above_tuned_range():
+    """Only buckets above every tuned bucket with matching static dims resolve
+    to the largest tuned profile, and never in tuning mode."""
+    tuner = reset_autotuner()
+    runner = DummyRunner()
+    config = _pow2_bucket_config()
+    for bucket, tactic in ((128, 0), (512, 1)):
+        key = AutoTuner._get_cache_key("top_bucket", runner, ((bucket, 16),), config)
+        tuner.profiling_cache[key] = (tactic, None)
+
+    def lookup(m, n=16):
+        return tuner.search_cache("top_bucket", [runner], ((m, n),), config)
+
+    miss = (False, 0, -1, None)
+    assert lookup(1000) == (True, 0, 1, None)  # bucket 1024 > 512
+    assert lookup(100) == (True, 0, 0, None)  # exact bucket 128
+    assert lookup(64) == miss  # below the smallest tuned bucket
+    assert lookup(200) == miss  # bucket 256 lies between tuned buckets
+    assert lookup(1000, n=32) == miss  # static dim never tuned
+
+    # In tuning mode a miss must reach profiling instead.
+    tuner.is_tuning_mode = True
+    try:
+        assert lookup(1000) == miss
+    finally:
+        tuner.is_tuning_mode = False
+
+
+def test_search_cache_top_bucket_fallback_with_negative_dim_idx():
+    """A spec may address its dynamic dim from the end (dim_idx=(-2,) is M of
+    an (M, K) operand); that dim must still count as dynamic, not static."""
+    tuner = reset_autotuner()
+    runner = DummyRunner()
+    config = TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                input_idx=(0,),
+                dim_idx=(-2,),
+                gen_tuning_buckets=(128, 512),
+                map_to_tuning_buckets=next_positive_power_of_2,
+            ),
+        ),
+    )
+    for bucket, tactic in ((128, 0), (512, 1)):
+        key = AutoTuner._get_cache_key(
+            "top_bucket_neg", runner, ((bucket, 16),), config
+        )
+        tuner.profiling_cache[key] = (tactic, None)
+
+    def lookup(m, n=16):
+        return tuner.search_cache("top_bucket_neg", [runner], ((m, n),), config)
+
+    miss = (False, 0, -1, None)
+    assert lookup(1000) == (True, 0, 1, None)  # bucket 1024 > 512
+    assert lookup(200) == miss  # bucket 256 lies between tuned buckets
+    assert lookup(1000, n=32) == miss  # the other dim is still static
+
+
+def test_search_cache_top_bucket_fallback_with_linked_dims():
+    """One spec can tie the dynamic dim of several inputs (as the MoE runners
+    do); the clamped profile moves all of them together."""
+    tuner = reset_autotuner()
+    runner = DummyRunner()
+    config = TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                input_idx=(0, 1),
+                dim_idx=(0, 0),
+                gen_tuning_buckets=(128, 512),
+                map_to_tuning_buckets=next_positive_power_of_2,
+            ),
+        ),
+    )
+    for bucket, tactic in ((128, 0), (512, 1)):
+        key = AutoTuner._get_cache_key(
+            "top_bucket_linked", runner, ((bucket, 16), (bucket, 8)), config
+        )
+        tuner.profiling_cache[key] = (tactic, None)
+
+    def lookup(m, n=8):
+        return tuner.search_cache(
+            "top_bucket_linked", [runner], ((m, 16), (m, n)), config
+        )
+
+    miss = (False, 0, -1, None)
+    assert lookup(1000) == (True, 0, 1, None)  # both inputs clamp to 512
+    assert lookup(200) == miss  # bucket 256 lies between tuned buckets
+    assert lookup(1000, n=4) == miss  # static dim of the second input
+
+
+def test_search_cache_top_bucket_from_file_configs_matches_extras():
+    """Loaded file configs count toward the top bucket only when their
+    cache-key extras match the lookup's."""
+
+    class DtypeExtrasRunner(DummyRunner):
+        def get_cache_key_extras(self, inputs):
+            return (inputs[0].dtype,)
+
+    tuner = reset_autotuner()
+    runner = DtypeExtrasRunner()
+    config = _pow2_bucket_config()
+
+    def file_key(bucket, dtype):
+        return AutoTuner._get_cache_key(
+            "top_bucket_file", runner, ((bucket, 16),), config, (dtype,)
+        ).file_key
+
+    tuner._file_configs[file_key(256, torch.float16)] = ("DtypeExtrasRunner", 3)
+    # A larger bucket tuned for another dtype must not raise the top bucket.
+    tuner._file_configs[file_key(2048, torch.bfloat16)] = ("DtypeExtrasRunner", 4)
+
+    inputs = [torch.empty((1000, 16), dtype=torch.float16)]
+    hit = tuner.search_cache(
+        "top_bucket_file", [runner], ((1000, 16),), config, inputs=inputs
+    )
+    assert hit == (True, 0, 3, None)
+
+
+def test_search_cache_top_bucket_fallback_is_off_during_replay():
+    """Replay reports exact coverage, so a lookup above the tuned range is
+    reported as a miss instead of being served from the top bucket."""
+    from flashinfer import ReplayCoverage
+
+    tuner = reset_autotuner()
+    runner = DummyRunner()
+    config = _pow2_bucket_config()
+    key = AutoTuner._get_cache_key("top_bucket_replay", runner, ((512, 16),), config)
+    tuner.profiling_cache[key] = (1, None)
+
+    report = ReplayCoverage()
+    tuner._v2_local.replay_report = report
+    try:
+        miss = tuner.search_cache("top_bucket_replay", [runner], ((1000, 16),), config)
+    finally:
+        tuner._v2_local.replay_report = None
+    assert miss == (False, 0, -1, None)
+    assert (report.hits, report.misses) == (0, 1)
+    hit = tuner.search_cache("top_bucket_replay", [runner], ((1000, 16),), config)
+    assert hit == (True, 0, 1, None)
+
+
+def test_search_cache_top_bucket_ignores_unservable_file_configs(monkeypatch):
+    """File configs that search_cache itself skips (an isolated context scope,
+    or keys excluded from the winner partition) must not set the top bucket."""
+    tuner = reset_autotuner()
+    runner = DummyRunner()
+    config = _pow2_bucket_config()
+
+    def file_key(bucket):
+        return AutoTuner._get_cache_key(
+            "top_bucket_skip", runner, ((bucket, 16),), config
+        ).file_key
+
+    tuner._file_configs[file_key(256)] = ("DummyRunner", 3)
+    tuner._file_configs[file_key(2048)] = ("DummyRunner", 4)
+
+    def lookup():
+        return tuner.search_cache("top_bucket_skip", [runner], ((1000, 16),), config)
+
+    assert lookup() == (False, 0, -1, None)  # bucket 1024 lies below 2048
+
+    tuner._excluded_file_keys[None] = {file_key(2048)}
+    assert lookup() == (True, 0, 3, None)  # falls back to 256
+
+    monkeypatch.setattr(AutoTuner, "_isolate_legacy_configs", property(lambda s: True))
+    assert lookup() == (False, 0, -1, None)  # no file config is served
 
 
 # ---------------------------------------------------------------------------

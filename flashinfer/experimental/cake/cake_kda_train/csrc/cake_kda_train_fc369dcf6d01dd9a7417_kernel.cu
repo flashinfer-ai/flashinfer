@@ -224,7 +224,7 @@ kernel_cake_kda_train_fc369dcf6d01dd9a7417(const __grid_constant__ CUtensorMap q
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     float* gk_p = reinterpret_cast<float*>(smem_raw + 0);
     const int gk_p_addr = smem + 0;
     __nv_bfloat16* k_p = reinterpret_cast<__nv_bfloat16*>(smem_raw + 32768);
@@ -261,6 +261,8 @@ kernel_cake_kda_train_fc369dcf6d01dd9a7417(const __grid_constant__ CUtensorMap q
     const int rem_t_addr = smem + 3184;
     int* cs_t = reinterpret_cast<int*>(smem_raw + 4224);
     const int cs_t_addr = smem + 4224;
+
+    // Kernel setup ops
     int chunk_s = blockIdx.x;
     int lane_s = lane;
     int seq0 = lane_s * 8;
@@ -901,8 +903,7 @@ kernel_cake_kda_train_fc369dcf6d01dd9a7417(const __grid_constant__ CUtensorMap q
     }
     if (__syncthreads_and(clen_s == 0)) return;
 
-    // Mbarrier init (8 pipeline groups, 0 ordered-sequence groups, 14 barriers)
-    // Mbarriers at smem_raw[76032..76144)
+    // Mbarrier init (14 barriers at smem_raw[76032..76144))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -951,10 +952,8 @@ kernel_cake_kda_train_fc369dcf6d01dd9a7417(const __grid_constant__ CUtensorMap q
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
-
-    // Kernel post-init ops
-    const int tmem_acc = taddr;
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_acc = taddr;
 
     // === Task calls (declaration order) ===
     int chunk = blockIdx.x;
@@ -3548,7 +3547,7 @@ kernel_cake_kda_train_fc369dcf6d01dd9a7417(const __grid_constant__ CUtensorMap q
             "mov.b64 db, {blo, dhi};\n\t"
             "tcgen05.mma.cta_group::1.kind::tf32 [%0], [ta], db, id, p1;\n\t"
             "}\n"
-            :: "r"((tmem_acc + (64))), "r"(_smem_desc_lo_98), "r"(tmem_acc), "r"(0) : "memory");
+            :: "r"((tmem_acc + (64))), "r"(_smem_desc_lo_98), "r"(tmem_acc + 0), "r"(0) : "memory");
             tcgen05_commit(hop_addr);
             mbarrier_wait(hop_addr, _phase_hop_0);
             _phase_hop_0 ^= 1;
@@ -3617,7 +3616,7 @@ kernel_cake_kda_train_fc369dcf6d01dd9a7417(const __grid_constant__ CUtensorMap q
             "mov.b64 db, {blo, dhi};\n\t"
             "tcgen05.mma.cta_group::1.kind::tf32 [%0], [ta], db, id, p1;\n\t"
             "}\n"
-            :: "r"((tmem_acc + (80))), "r"(_smem_desc_lo_100), "r"(tmem_acc), "r"(0) : "memory");
+            :: "r"((tmem_acc + (80))), "r"(_smem_desc_lo_100), "r"(tmem_acc + 0), "r"(0) : "memory");
             tcgen05_commit(hop_addr);
             mbarrier_wait(hop_addr, _phase_hop_0);
             _phase_hop_0 ^= 1;
@@ -3694,7 +3693,7 @@ kernel_cake_kda_train_fc369dcf6d01dd9a7417(const __grid_constant__ CUtensorMap q
             "mov.b64 db, {blo, dhi};\n\t"
             "tcgen05.mma.cta_group::1.kind::tf32 [%0], [ta], db, id, p1;\n\t"
             "}\n"
-            :: "r"((tmem_acc + (96))), "r"(_smem_desc_lo_102), "r"(tmem_acc), "r"(0) : "memory");
+            :: "r"((tmem_acc + (96))), "r"(_smem_desc_lo_102), "r"(tmem_acc + 0), "r"(0) : "memory");
             tcgen05_commit(hop_addr);
             mbarrier_wait(hop_addr, _phase_hop_0);
             _phase_hop_0 ^= 1;

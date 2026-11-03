@@ -76,9 +76,11 @@
 #include <cstdint>
 #include <cstdio>
 
-// The kernels are built for compute capability 10.0 and 10.3, where the transport is validated.
-// Other architectures get kernels that trap, and moe_a2a_lamport_kernels_available() is false.
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030)
+// The kernels are built for compute capability 10.0, 10.3 and 10.7, where the transport is
+// validated. Other architectures get kernels that trap, and moe_a2a_lamport_kernels_available()
+// is false.
+#if defined(__CUDA_ARCH__) && \
+    (__CUDA_ARCH__ == 1000 || __CUDA_ARCH__ == 1030 || __CUDA_ARCH__ == 1070)
 #define MOE_A2A_LAMPORT_COMPILE 1
 #else
 #define MOE_A2A_LAMPORT_COMPILE 0
