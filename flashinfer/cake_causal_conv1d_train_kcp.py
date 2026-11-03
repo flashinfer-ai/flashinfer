@@ -198,6 +198,50 @@ def cake_causal_conv1d_kcp(
         partial.
     """
 
+    if cooperative is not None or bwd_reserve_sms is not None:
+        return _kcp_with_keywords(
+            x_local,
+            weight,
+            ctx,
+            recompute_handle=recompute_handle,
+            cooperative=cooperative,
+            deterministic=deterministic,
+            bwd_reserve_sms=bwd_reserve_sms,
+        )
+    if _deterministic(deterministic, "cake_causal_conv1d_kcp"):
+        from .cake_causal_conv1d_det_train_kcp import (  # noqa: PLC0415
+            cake_causal_conv1d_det_kcp,
+        )
+
+        return cake_causal_conv1d_det_kcp(
+            x_local, weight, ctx, recompute_handle=recompute_handle
+        )
+    from .experimental.cake.cake_causal_conv1d_train_backend import (  # noqa: PLC0415
+        kcp as _kcp,
+    )
+
+    return _kcp.cake_causal_conv1d_kcp(
+        x_local,
+        weight,
+        ctx,
+        recompute_handle=recompute_handle,
+        deterministic=False,
+    )
+
+
+def _kcp_with_keywords(
+    x_local: torch.Tensor,
+    weight: torch.Tensor,
+    ctx: Any,
+    *,
+    recompute_handle: Optional[Any],
+    cooperative: Optional[bool],
+    deterministic: bool,
+    bwd_reserve_sms: Optional[int],
+) -> torch.Tensor:
+    """:func:`cake_causal_conv1d_kcp` with ``cooperative`` or ``bwd_reserve_sms`` given: validated, then forwarded
+    to the selected entry point (each keyword only when given)."""
+
     reserve = _bwd_reserve_sms(bwd_reserve_sms, deterministic, "cake_causal_conv1d_kcp")
     if _deterministic(deterministic, "cake_causal_conv1d_kcp"):
         from .cake_causal_conv1d_det_train_kcp import (  # noqa: PLC0415
@@ -268,6 +312,50 @@ def cake_causal_conv1d_multi_kcp(
     tuple of torch.Tensor
         The ``n`` BF16 outputs, each of its input's shape.
     """
+
+    if cooperative is not None or bwd_reserve_sms is not None:
+        return _multi_kcp_with_keywords(
+            xs,
+            weights,
+            ctx,
+            recompute_handle=recompute_handle,
+            cooperative=cooperative,
+            deterministic=deterministic,
+            bwd_reserve_sms=bwd_reserve_sms,
+        )
+    if _deterministic(deterministic, "cake_causal_conv1d_multi_kcp"):
+        from .cake_causal_conv1d_det_train_kcp import (  # noqa: PLC0415
+            cake_causal_conv1d_det_multi_kcp,
+        )
+
+        return cake_causal_conv1d_det_multi_kcp(
+            xs, weights, ctx, recompute_handle=recompute_handle
+        )
+    from .experimental.cake.cake_causal_conv1d_train_backend import (  # noqa: PLC0415
+        kcp as _kcp,
+    )
+
+    return _kcp.cake_causal_conv1d_multi_kcp(
+        xs,
+        weights,
+        ctx,
+        recompute_handle=recompute_handle,
+        deterministic=False,
+    )
+
+
+def _multi_kcp_with_keywords(
+    xs: Sequence[torch.Tensor],
+    weights: Sequence[torch.Tensor],
+    ctx: Any,
+    *,
+    recompute_handle: Optional[Any],
+    cooperative: Optional[bool],
+    deterministic: bool,
+    bwd_reserve_sms: Optional[int],
+) -> tuple[torch.Tensor, ...]:
+    """:func:`cake_causal_conv1d_multi_kcp` with ``cooperative`` or ``bwd_reserve_sms`` given: validated, then
+    forwarded to the selected entry point (each keyword only when given)."""
 
     reserve = _bwd_reserve_sms(
         bwd_reserve_sms, deterministic, "cake_causal_conv1d_multi_kcp"
