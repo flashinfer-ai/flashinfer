@@ -6,7 +6,7 @@ os.environ["PYTORCH_NO_CUDA_MEMORY_CACHING"] = "1"
 
 import pytest
 import torch
-from tests.test_helpers.utils_fp4 import cast_from_fp4, ref_fp4_quant
+from tests.test_helpers.utils_fp4 import pack_fp4_values, ref_fp4_quant
 
 from flashinfer import fp4_quantize
 from flashinfer.utils import (
@@ -69,12 +69,16 @@ def test_fp4_quantize_unaligned_m_non_swizzled(
     backend: str,
     seed: int,
     device: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Regression test: fp4_quantize with M not a multiple of 16 for linear SF."""
     if not _is_fp4_supported(torch.device(device)):
         pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
     if backend == "cute-dsl" and not _is_cute_dsl_available():
         pytest.skip("CuTe-DSL not available")
+    monkeypatch.setenv("FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH", "0")
+    monkeypatch.setenv("TRTLLM_DISABLE_FP4_QUANT_FAST_MATH", "0")
+    monkeypatch.setenv("FLASHINFER_NVFP4_4OVER6", "0")
     torch.set_default_device(device)
     torch.manual_seed(seed)
 
@@ -99,8 +103,7 @@ def test_fp4_quantize_unaligned_m_non_swizzled(
     )
 
     out_ref, scale_ref = ref_fp4_quant(x, global_scale, sf_vec_size)
-    out_ans = cast_from_fp4(out_val).reshape(m, n)
-    out_scale = out_sf.view(torch.float8_e4m3fn).to(torch.float32)
-    # atol=0.5 accounts for FP4 E2M1 rounding at the 0/0.5 boundary
-    torch.testing.assert_close(out_ans, out_ref, rtol=1e0, atol=5e-1)
-    torch.testing.assert_close(out_scale, scale_ref, rtol=1e-1, atol=1e-1)
+    torch.testing.assert_close(out_val, pack_fp4_values(out_ref), rtol=0, atol=0)
+    torch.testing.assert_close(
+        out_sf, scale_ref.to(torch.float8_e4m3fn).view(torch.uint8), rtol=0, atol=0
+    )

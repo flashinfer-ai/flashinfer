@@ -37,6 +37,11 @@
 #define CAKE_STRINGIZE_(x) #x
 #define CAKE_STRINGIZE(x) CAKE_STRINGIZE_(x)
 #define CAKE_CHECK_EXPANDED(cond, kind) TVM_FFI_CHECK(cond, kind)
+// CAKE_U spells an unsigned literal from a plain -D integer (CAKE_U(CAKE_DYN_SMEM) -> 220160u): the
+// launch constants of a shared launcher are passed without a suffix and pasted where the exported text
+// carried one.
+#define CAKE_U_(x) x##u
+#define CAKE_U(x) CAKE_U_(x)
 
 namespace cake_host_shim_common {
 
@@ -60,6 +65,26 @@ inline bool CakeSetMaxDynamicSmem(const void* symbol, int smem_bytes) {
   }
   TVM_FFI_CHECK(configured > 0, RuntimeError)
       << "no CUDA device accepts " << smem_bytes << " B of dynamic shared memory";
+  return true;
+}
+
+// Allow the linked kernel a non-portable cluster size once for every device that accepts it (the
+// cluster-14 programs); same once-per-process shape as CakeSetMaxDynamicSmem.
+inline bool CakeAllowNonPortableCluster(const void* symbol) {
+  cudaKernel_t kernel = nullptr;
+  TVM_FFI_CHECK_CUDA_ERROR(cudaGetKernel(&kernel, symbol));
+  int device_count = 0;
+  TVM_FFI_CHECK_CUDA_ERROR(cudaGetDeviceCount(&device_count));
+  int configured = 0;
+  for (int device = 0; device < device_count; ++device) {
+    if (cudaKernelSetAttributeForDevice(kernel, cudaFuncAttributeNonPortableClusterSizeAllowed, 1, device) ==
+        cudaSuccess) {
+      ++configured;
+    } else {
+      (void)cudaGetLastError();
+    }
+  }
+  TVM_FFI_CHECK(configured > 0, RuntimeError) << "no CUDA device accepts a non-portable cluster size";
   return true;
 }
 

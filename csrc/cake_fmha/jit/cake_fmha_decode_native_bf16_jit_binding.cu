@@ -321,10 +321,24 @@ void cake_paged_attention_decode(
   int64_t source_pages = block_tables.size(1);
   int64_t prefix_offset = 0;
   int64_t cursor = AlignUp(batch_size * static_cast<int64_t>(sizeof(int)), 16);
-  bool needs_page_padding = source_pages < required_pages;
+  // The kernels read the table with 16-byte loads: a row stride of a multiple of four pages on
+  // a 16-byte-aligned base, else (or when narrower than they read) a padded copy.
+  bool table_aligned =
+      source_pages % 4 == 0 && reinterpret_cast<uintptr_t>(block_tables.data_ptr()) % 16 == 0;
+  int64_t padded_pages = std::max<int64_t>(required_pages, (source_pages + 3) / 4 * 4);
+  bool needs_page_padding = source_pages < required_pages || !table_aligned;
+#ifdef CAKE_FMHA_SINK_PEER_CLC_DYNAMIC_SMEM_BYTES
+  // The exact B256 sink member's page producer always publishes the page groups of 32 KV blocks
+  // and reads 256 page-table entries per row: it finishes only when max_seq_len evens to 30 or
+  // 32 blocks and the table holds 256 pages per row.
+  TVM_FFI_ICHECK(max_kv_len >= 3585 && max_kv_len <= 4096 && source_pages >= 256)
+      << "Cake FMHA decode-native BF16 exact sink member needs 3585 <= max_seq_len <= 4096 and "
+         "256 pages per row, got max_seq_len "
+      << max_kv_len << " and " << source_pages << " pages per row";
+#endif
   int64_t page_offset = cursor;
   if (needs_page_padding) {
-    cursor += batch_size * required_pages * static_cast<int64_t>(sizeof(int));
+    cursor += batch_size * padded_pages * static_cast<int64_t>(sizeof(int));
     cursor = AlignUp(cursor, 16);
   }
   int64_t lse_offset = cursor;
@@ -340,20 +354,20 @@ void cake_paged_attention_decode(
   auto* padded_page_table =
       needs_page_padding ? reinterpret_cast<int*>(workspace + page_offset) : nullptr;
   int64_t metadata_items =
-      std::max<int64_t>(batch_size, needs_page_padding ? batch_size * required_pages : 0);
+      std::max<int64_t>(batch_size, needs_page_padding ? batch_size * padded_pages : 0);
   int const threads = 256;
   int const blocks = static_cast<int>((metadata_items + threads - 1) / threads);
   PrepareDecodeMetadata<<<blocks, threads, 0, stream>>>(
       static_cast<const int*>(seq_lens.data_ptr()), causal_prefix,
       static_cast<const int*>(block_tables.data_ptr()), padded_page_table,
       static_cast<int>(batch_size), static_cast<int>(source_pages),
-      static_cast<int>(required_pages));
+      static_cast<int>(padded_pages));
   TVM_FFI_ICHECK_EQ(cudaGetLastError(), cudaSuccess)
       << "failed to prepare Cake FMHA decode metadata";
 
   int* page_table =
       needs_page_padding ? padded_page_table : static_cast<int*>(block_tables.data_ptr());
-  int max_pages_per_seq = static_cast<int>(needs_page_padding ? required_pages : source_pages);
+  int max_pages_per_seq = static_cast<int>(needs_page_padding ? padded_pages : source_pages);
   float* lse_ptr = nullptr;
   if (lse.has_value()) {
     auto const& lse_tensor = lse.value();
@@ -398,9 +412,12 @@ void cake_paged_attention_decode(
   unsigned int grid_z = 1;
   // The exact sink kernel maps one CTA per (query, KV head, batch) tile.
   // The exact B4 CGA kernel maps one two-CTA cluster per logical tile.
-  // Other native-BF16 members use their existing persistent 1-D launch.
+  // Other native-BF16 members use their existing persistent 1-D launch: the
+  // retained-KV sink member at the exact sink shape strides its tiles over
+  // blockIdx.x, and the 3-D grid would run every tile in each of its CTAs.
 #if BATCH_SIZE == 256 && Q_LEN == 1 && NUM_Q_HEADS == 32 && NUM_KV_HEADS == 4 && \
-    CAKE_FMHA_HAS_SINK == 1 && CAKE_FMHA_HAS_WINDOW == 0 && CAKE_FMHA_USE_SCALE_PTR == 0
+    CAKE_FMHA_HAS_SINK == 1 && CAKE_FMHA_HAS_WINDOW == 0 && CAKE_FMHA_USE_SCALE_PTR == 0 && \
+    CAKE_FMHA_RETAIN_KV_L2 == 0
   grid_x = Q_LEN;
   grid_y = NUM_KV_HEADS;
   grid_z = BATCH_SIZE;
@@ -408,6 +425,11 @@ void cake_paged_attention_decode(
     CAKE_FMHA_HAS_SINK == 0 && CAKE_FMHA_HAS_WINDOW == 0 && CAKE_FMHA_USE_SCALE_PTR == 0 && \
     CAKE_FMHA_RETAIN_KV_L2 == 1
   unsigned int total_tiles = BATCH_SIZE * Q_LEN * NUM_KV_HEADS;
+  // Each cluster owns one tile and arms its reduction barrier once: a cluster
+  // given a second tile (fewer SMs than tiles) would never finish.
+  TVM_FFI_ICHECK_GE(sm_count, static_cast<int64_t>(total_tiles))
+      << "Cake FMHA decode-native BF16 B4 member needs one cluster per tile: " << sm_count
+      << " SMs < " << total_tiles << " tiles";
   unsigned int logical_grid_x =
       std::min<unsigned int>(static_cast<unsigned int>(sm_count), total_tiles);
   grid_x = 2 * logical_grid_x;

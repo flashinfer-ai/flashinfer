@@ -525,8 +525,8 @@ kernel_cake_nvfp4_svdquant_gemm_db7820791092b67f10cd(const __grid_constant__ CUt
                 #pragma unroll
                 for (int j = 0; j < 16; j++) {
                     if (has_bias != 0) {
-                        unsigned int _shfl_0 = __shfl_sync(0xFFFFFFFF, bias_pair_lane, j);
-                        bias_pair = _shfl_0;
+                        unsigned int _shfl_sync_1 = __shfl_sync(0xFFFFFFFF, bias_pair_lane, j);
+                        bias_pair = _shfl_sync_1;
                         bias_lo_bits = bias_pair << 16;
                         bias_lo = reinterpret_cast<float*>(&bias_lo_bits)[0];
                         bias_hi_bits = bias_pair & 4294901760u;

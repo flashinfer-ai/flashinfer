@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from typing import List, Optional, Union
+from typing import List, Optional, Sequence, Union
 
 import torch
 
@@ -31,10 +31,22 @@ from flashinfer.fused_moe.shared.inputs import (
 from flashinfer.fused_moe.shared.validation import (
     validate_bf16_gemm1_activation_params as _validate_bf16_gemm1_activation_params,
 )
-from flashinfer.prims_ts.moe.runner import PrimsTsBf16MoERunner
+from flashinfer.prims_ts.moe.partition import (
+    MoePartitionResources,
+    PartitionStrategy,
+    prepared_block_major_k_bytes,
+    prepared_weight_layouts,
+    require_partition_pair,
+    validate_partition_arch,
+)
+from flashinfer.prims_ts.moe.runner import (
+    PrimsTsBf16MoERunner,
+    PrimsTsPartitionedBf16MoERunner,
+)
 from flashinfer.prims_ts.moe.support import is_prims_ts_bf16_supported
 from flashinfer.tllm_enums import ActivationType, WeightLayout
 from flashinfer.trace.templates.moe import (
+    prims_ts_bf16_moe_partitioned_trace_dispatch,
     trtllm_bf16_moe_trace,
     trtllm_bf16_routed_moe_trace,
 )
@@ -62,8 +74,8 @@ def prims_ts_bf16_moe_op(
     topk_ids: Optional[torch.Tensor],
     expert_weights: Optional[torch.Tensor],
     hidden_states: torch.Tensor,
-    gemm1_weights: torch.Tensor,
-    gemm2_weights: torch.Tensor,
+    gemm1_weights: Union[torch.Tensor, Sequence[torch.Tensor]],
+    gemm2_weights: Union[torch.Tensor, Sequence[torch.Tensor]],
     gemm1_lora_delta: Optional[torch.Tensor],
     num_experts: int,
     top_k: int,
@@ -86,12 +98,16 @@ def prims_ts_bf16_moe_op(
     gemm1_beta: Optional[torch.Tensor] = None,
     gemm1_clamp_limit: Optional[torch.Tensor] = None,
     output: Optional[torch.Tensor] = None,
+    partition_resources: Optional[MoePartitionResources] = None,
+    partition_strategy: Optional[PartitionStrategy] = None,
 ) -> List[torch.Tensor]:
     assert routing_logits is not None or topk_ids is not None, (
         "either routing_logits or topk_ids must be provided"
     )
     if gemm1_lora_delta is not None:
         raise NotImplementedError("Prims-TS BF16 MoE does not support gemm1_lora_delta")
+    if partition_resources is None and partition_strategy is not None:
+        raise ValueError("partition_resources is required with partition_strategy")
 
     _validate_bf16_gemm1_activation_params(
         activation_type,
@@ -145,8 +161,46 @@ def prims_ts_bf16_moe_op(
         )
     )
 
+    runner_cls = PrimsTsBf16MoERunner
+    partition_kwargs = {}
+    partition_call_kwargs = {}
+    if partition_resources is not None:
+        if partition_strategy is None:
+            raise ValueError("partition_strategy is required with partition_resources")
+        if not isinstance(gemm1_weights, Sequence) or not isinstance(
+            gemm2_weights, Sequence
+        ):
+            raise TypeError("partitioned BF16 MoE requires weight shard sequences")
+        require_partition_pair("gemm1_weights", gemm1_weights)
+        require_partition_pair("gemm2_weights", gemm2_weights)
+        validate_partition_arch(gemm1_weights[0])
+        fc1_layout, fc2_layout = prepared_weight_layouts(
+            weight_dtype=torch.bfloat16,
+            weight_layout=weight_layout,
+            use_shuffled_weight=use_shuffled_weight,
+            fc1_block_major_k_bytes=prepared_block_major_k_bytes(
+                gemm1_weights[0], weight_layout
+            ),
+            fc2_block_major_k_bytes=prepared_block_major_k_bytes(
+                gemm2_weights[0], weight_layout
+            ),
+        )
+        runner_cls = PrimsTsPartitionedBf16MoERunner
+        partition_kwargs = dict(
+            partition_strategy=partition_strategy,
+            partition_fc1_layout=fc1_layout,
+            partition_fc2_layout=fc2_layout,
+            partition_resources=partition_resources,
+        )
+        partition_call_kwargs = dict(
+            partition_resources=partition_resources,
+            partition_fc1_weights=gemm1_weights,
+            partition_fc2_weights=gemm2_weights,
+            partition_fc1_scales=None,
+            partition_fc2_scales=None,
+        )
     moe_op = _get_moe_op()
-    moe_runner = PrimsTsBf16MoERunner(
+    moe_runner = runner_cls(
         moe_op,
         top_k=top_k,
         num_local_experts=local_num_experts,
@@ -156,6 +210,7 @@ def prims_ts_bf16_moe_op(
         use_shuffled_weight=use_shuffled_weight,
         weight_layout=weight_layout,
         num_experts=num_experts,
+        **partition_kwargs,
     )
     moe_inputs = MoeRunnerInputs(
         output=output,
@@ -172,13 +227,17 @@ def prims_ts_bf16_moe_op(
         tune_max_num_tokens=tune_max_num_tokens,
         routing_input_mode=routing_input_mode,
         use_cuda_graph=True,
-        use_cold_l2_cache=True,
+        use_cold_l2_cache=partition_resources is None,
     )
 
     common_kwargs = dict(
         routing_bias=routing_bias,
-        gemm1_weights=gemm1_weights,
-        gemm2_weights=gemm2_weights,
+        gemm1_weights=(
+            gemm1_weights[0] if partition_resources is not None else gemm1_weights
+        ),
+        gemm2_weights=(
+            gemm2_weights[0] if partition_resources is not None else gemm2_weights
+        ),
         gemm1_alpha=gemm1_alpha,
         gemm1_beta=gemm1_beta,
         gemm1_clamp_limit=gemm1_clamp_limit,
@@ -196,6 +255,7 @@ def prims_ts_bf16_moe_op(
         activation_type=activation_type,
         norm_topk_prob=norm_topk_prob,
         routing_replay_out=routing_replay_out,
+        **partition_call_kwargs,
     )
     moe_runner.set_cache_key_static_extras(**common_kwargs)
     ok, reason = is_prims_ts_bf16_supported(
@@ -208,21 +268,16 @@ def prims_ts_bf16_moe_op(
         raise RuntimeError(f"Config not supported by Prims-TS BF16 kernel ({reason})")
 
     _, tactic = AutoTuner.get().choose_one(
-        "flashinfer::prims_ts_bf16_moe",
+        (
+            "flashinfer::prims_ts_bf16_moe_partitioned"
+            if partition_resources is not None
+            else "flashinfer::prims_ts_bf16_moe"
+        ),
         [moe_runner],
         tuning_config,
         moe_inputs.to_list(),
         **common_kwargs,
     )
-
-    ok, reason = is_prims_ts_bf16_supported(
-        moe_runner,
-        moe_inputs,
-        [-1, -1] if tactic == -1 else tactic,
-        **common_kwargs,
-    )
-    if not ok:
-        raise RuntimeError(f"Config not supported by Prims-TS BF16 kernel ({reason})")
 
     intermediate_output = moe_runner.forward(
         moe_inputs.to_list(),
@@ -263,6 +318,8 @@ def _fake_prims_ts_bf16_moe(
     gemm1_beta: Optional[torch.Tensor] = None,
     gemm1_clamp_limit: Optional[torch.Tensor] = None,
     output: Optional[torch.Tensor] = None,
+    partition_resources: Optional[MoePartitionResources] = None,
+    partition_strategy: Optional[PartitionStrategy] = None,
 ) -> List[torch.Tensor]:
     del (
         routing_bias,
@@ -290,6 +347,8 @@ def _fake_prims_ts_bf16_moe(
         gemm1_alpha,
         gemm1_beta,
         gemm1_clamp_limit,
+        partition_resources,
+        partition_strategy,
     )
     seq_len = hidden_states.shape[0]
     hidden_size = hidden_states.shape[1]
@@ -299,6 +358,157 @@ def _fake_prims_ts_bf16_moe(
         else hidden_states.new_empty(seq_len, hidden_size, dtype=torch.bfloat16)
     )
     return [out] if do_finalize else [out, hidden_states.new_empty(0)]
+
+
+@flashinfer_api(trace=prims_ts_bf16_moe_partitioned_trace_dispatch)
+def prims_ts_bf16_moe_partitioned(
+    routing_logits: Optional[torch.Tensor],
+    routing_bias: Optional[torch.Tensor],
+    topk_ids: Optional[torch.Tensor],
+    expert_weights: Optional[torch.Tensor],
+    hidden_states: torch.Tensor,
+    gemm1_weights: Sequence[torch.Tensor],
+    gemm2_weights: Sequence[torch.Tensor],
+    num_experts: int,
+    top_k: int,
+    n_group: Optional[int],
+    topk_group: Optional[int],
+    intermediate_size: int,
+    local_expert_offset: int,
+    local_num_experts: int,
+    partition_resources: MoePartitionResources,
+    partition_strategy: PartitionStrategy,
+    routed_scaling_factor: Optional[float] = None,
+    routing_method_type: int = 0,
+    use_shuffled_weight: bool = True,
+    weight_layout: int = WeightLayout.MajorK,
+    do_finalize: bool = True,
+    enable_pdl: Optional[bool] = None,
+    tune_max_num_tokens: int = 8192,
+    activation_type: int = ActivationType.Swiglu.value,
+    norm_topk_prob: bool = True,
+    routing_replay_out: Optional[torch.Tensor] = None,
+    output: Optional[torch.Tensor] = None,
+    gemm1_alpha: Optional[torch.Tensor] = None,
+    gemm1_beta: Optional[torch.Tensor] = None,
+    gemm1_clamp_limit: Optional[torch.Tensor] = None,
+) -> Union[List[torch.Tensor], torch.Tensor]:
+    r"""Run two-way BF16 Prims-TS MoE with caller-owned shards and streams.
+
+    Same computation as :func:`~flashinfer.fused_moe.prims_ts_bf16_moe`,     split
+    across two green-context partitions on SM107 (Rubin) only.
+
+    Parameters
+    ----------
+    routing_logits : Optional[torch.Tensor]
+        ``[seq_len, num_experts]`` routing logits, or ``None`` when using
+        precomputed routing.
+    routing_bias : Optional[torch.Tensor]
+        Optional ``[num_experts]`` routing bias.
+    topk_ids : Optional[torch.Tensor]
+        ``int32`` precomputed routing when ``routing_logits`` is ``None``:
+        packed ``(expert_id, weight)`` values when ``expert_weights`` is
+        ``None``, otherwise unpacked expert indices.
+    expert_weights : Optional[torch.Tensor]
+        Precomputed routing weights for unpacked ``topk_ids``.
+    hidden_states : torch.Tensor
+        ``[seq_len, hidden_size]`` BF16 activations.
+    gemm1_weights : Sequence[torch.Tensor]
+        Two prepared FC1 shards, one per partition, sharded with
+        ``flashinfer.prims_ts.moe.shard_prepared_moe_weights``.
+    gemm2_weights : Sequence[torch.Tensor]
+        Two prepared FC2 shards, one per partition.
+    num_experts : int
+        Total number of experts.
+    top_k : int
+        Experts selected per token.
+    n_group : Optional[int]
+        Number of expert groups (DeepSeek-style routing).
+    topk_group : Optional[int]
+        Groups considered for top-k routing.
+    intermediate_size : int
+        Unsharded intermediate (FFN) width.
+    local_expert_offset : int
+        Global offset of the first local expert.
+    local_num_experts : int
+        Number of experts resident on this device.
+    partition_resources : MoePartitionResources
+        Caller-owned green-context streams and reusable fork/join events.
+        Construct before CUDA graph capture and keep alive for every launch
+        or replay that uses it.
+    partition_strategy : PartitionStrategy
+        ``"tp_n_tp_n"`` splits FC2 output rows; ``"tp_n_tp_k"`` splits FC2
+        K. FC1 rows are split in both. Must match the weight sharding.
+    routed_scaling_factor : Optional[float]
+        Optional routing scale.
+    routing_method_type : int
+        Routing method selector (default ``0``).
+    use_shuffled_weight : bool
+        Whether weights use the shuffled MajorK layout (default ``True``).
+    weight_layout : int
+        Weight layout enum value (default ``MajorK``).
+    do_finalize : bool
+        If ``True``, return the finalized MoE output.
+    enable_pdl : Optional[bool]
+        Enable Programmatic Dependent Launch when supported.
+    tune_max_num_tokens : int
+        Autotune token-bucket upper bound (default ``8192``).
+    activation_type : int
+        Activation enum value (default Swiglu).
+    norm_topk_prob : bool
+        Normalize top-k routing probabilities.
+    routing_replay_out : Optional[torch.Tensor]
+        Optional buffer that captures selected expert IDs.
+    output : Optional[torch.Tensor]
+        Optional in-place ``[seq_len, hidden_size]`` output.
+    gemm1_alpha : Optional[torch.Tensor]
+        Optional per-expert SwiGLU alpha.
+    gemm1_beta : Optional[torch.Tensor]
+        Optional per-expert SwiGLU beta.
+    gemm1_clamp_limit : Optional[torch.Tensor]
+        Optional per-expert clamp limit.
+
+    Returns
+    -------
+    torch.Tensor or List[torch.Tensor]
+        Same return contract as
+        :func:`~flashinfer.fused_moe.prims_ts_bf16_moe`.
+    """
+
+    result = prims_ts_bf16_moe_op(
+        routing_logits=routing_logits,
+        routing_bias=routing_bias,
+        topk_ids=topk_ids,
+        expert_weights=expert_weights,
+        hidden_states=hidden_states,
+        gemm1_weights=gemm1_weights,
+        gemm2_weights=gemm2_weights,
+        gemm1_lora_delta=None,
+        num_experts=num_experts,
+        top_k=top_k,
+        n_group=n_group,
+        topk_group=topk_group,
+        intermediate_size=intermediate_size,
+        local_expert_offset=local_expert_offset,
+        local_num_experts=local_num_experts,
+        routed_scaling_factor=routed_scaling_factor,
+        routing_method_type=routing_method_type,
+        use_shuffled_weight=use_shuffled_weight,
+        weight_layout=weight_layout,
+        do_finalize=do_finalize,
+        enable_pdl=enable_pdl,
+        tune_max_num_tokens=tune_max_num_tokens,
+        activation_type=activation_type,
+        gemm1_alpha=gemm1_alpha,
+        gemm1_beta=gemm1_beta,
+        gemm1_clamp_limit=gemm1_clamp_limit,
+        norm_topk_prob=norm_topk_prob,
+        routing_replay_out=routing_replay_out,
+        output=output,
+        partition_resources=partition_resources,
+        partition_strategy=partition_strategy,
+    )
+    return result[0] if do_finalize and len(result) == 1 else result
 
 
 @flashinfer_api(trace=trtllm_bf16_moe_trace)
@@ -330,7 +540,7 @@ def prims_ts_bf16_moe(
     gemm1_clamp_limit: Optional[torch.Tensor] = None,
     output: Optional[torch.Tensor] = None,
 ) -> Union[List[torch.Tensor], torch.Tensor]:
-    r"""BF16 MoE using the Prims-TS batched GEMM backend on SM100.
+    r"""BF16 MoE using the Prims-TS batched GEMM backend on SM100/SM103/SM107.
 
     Same arguments and return value as :func:`~flashinfer.fused_moe.trtllm_bf16_moe`.
 

@@ -89,6 +89,10 @@ void Run(TensorView a_src_latent, TensorView a_src_rope, TensorView a_dst_latent
   check_same_device(a_dst_packed, a_src_latent, "dst_packed", "src_latent");
   check_contiguous(a_dst_map, "dst_map");
   check_same_device(a_dst_map, a_src_latent, "dst_map", "src_latent");
+  TVM_FFI_CHECK(((a_accumulate == 0) || (a_dst_row_stride >= 512)), ValueError)
+      << KERNEL_NAME << ": requires ((accumulate == 0) || (dst_row_stride >= 512))";
+  TVM_FFI_CHECK(((a_accumulate == 0) || ((a_rope_groups == 0) || (a_dst_row_stride >= 576))), ValueError)
+      << KERNEL_NAME << ": requires ((accumulate == 0) || ((rope_groups == 0) || (dst_row_stride >= 576)))";
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
       << KERNEL_NAME << ": the grid (" << grid_x << ", " << grid_y << ", " << grid_z << ") must be positive";
   TVM_FFI_CHECK(grid_x <= 2147483647 && grid_y <= 65535 && grid_z <= 65535, ValueError)

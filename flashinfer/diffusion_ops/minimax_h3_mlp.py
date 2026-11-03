@@ -33,6 +33,7 @@ from .minimax_h3_fc1_swiglu import (
     MINIMAX_H3_HIDDEN,
     MXFP8_BLOCK,
     MXFP8_FC1_SCALE_TILE_BYTES,
+    MXFP8_FC1_SWIGLU_SCALE_TILE_BYTES,
     NVFP4_BLOCK,
     NVFP4_FC1_SCALE_TILE_BYTES,
     NVFP4_PACKED_COLS,
@@ -56,11 +57,27 @@ MINIMAX_H3_GATE_ROWS = MINIMAX_H3_ADALN_ROWS
 # operator consumes the local ``[M, 5376]`` rows of one rank and needs no receive layout.
 MINIMAX_H3_SEQUENCE_PARALLEL_DEGREES = (1, 2, 4, 8)
 
-# GEMM tiling facts the host-side workspace sizing depends on.
+# GEMM tiling facts the host-side workspace sizing and the launch grids depend on.
 _BLOCK_M = 128
 _CTA_GROUP = 2
 _FC2_BLOCK_N = 256  # output columns per CTA pair of the FC2 GEMM
 _FC2_N_TILES = MINIMAX_H3_HIDDEN // _FC2_BLOCK_N  # 21
+_NORM_ROWS_PER_CTA = 4  # the BF16 and MXFP8 norm kernels run one warp per row
+# The NVFP4 norm kernel is persistent: one CTA per SM, each streaming a contiguous run of rows
+# with this many rows in flight; fewer CTAs when M does not give every one of them a row.
+_NVFP4_NORM_ROW_GROUPS = 8
+# FC1 output tiles per row-tile pair: 256x256 pair tiles (128 y columns each) or 256x448 pair
+# tiles (224 y columns each).  The MXFP8 FC1 GEMM is chosen by the weight scale layout: 128-row
+# tiles (prepare_minimax_h3_fc1_weight_mxfp8) run 256x256, 112-row sub-tiles
+# (prepare_minimax_h3_fc1_swiglu_weight_mxfp8) run 256x448.
+_FC1_BF16_N_TILES = 112
+_FC1_MXFP8_N_TILES = 112
+_FC1_MXFP8_W448_N_TILES = 64
+_FC1_NVFP4_N_TILES = 64
+# FC2 tail split-K (BF16 only): a launch of at most this many waves whose final partial wave
+# leaves at least as many clusters idle as it uses computes every tail tile as two K halves on
+# two clusters.
+_FC2_TAIL_SPLIT_MAX_WAVES = 12
 
 # FlashInfer 128x4 swizzled scale-factor tiles: 512 bytes = 128 rows x 4 K-blocks, byte offset
 # (row % 32) * 16 + (row // 32) * 4 + kblock inside the tile; tiles ordered (row block, K set).
@@ -102,6 +119,59 @@ def _m_tiles(rows: int) -> int:
     return tiles + tiles % _CTA_GROUP
 
 
+@functools.cache
+def _sm_count(index: int) -> int:
+    return torch.cuda.get_device_properties(index).multi_processor_count
+
+
+def _device_index(device: torch.device) -> int:
+    return device.index if device.index is not None else torch.cuda.current_device()
+
+
+def _launch_grids(
+    rows: int,
+    device: torch.device,
+    fc1_n_tiles: int,
+    fc2_tail_split: bool,
+    norm_row_groups: int = 0,
+) -> Tuple[int, int, int, int, int, int]:
+    """``(norm_grid, fc1_grid, fc2_grid, fc2_tail_base, fc2_split_count, fc2_clusters)``.
+
+    The norm kernel runs one warp per row; with ``norm_row_groups`` it is persistent instead and
+    launches ``min(SMs, ceil(M / norm_row_groups))`` CTAs.  Each GEMM launches one cluster (CTA
+    pair) per output tile pair; the hardware runs as many clusters as fit and running clusters
+    claim the remaining tiles in order through cluster launch control.  With the tail split, the
+    FC2 launch adds one cluster per tile of its final partial wave, which computes that tile's
+    second K half."""
+    pairs = _m_tiles(rows) // _CTA_GROUP
+    sm_count = _sm_count(_device_index(device))
+    clusters = sm_count // _CTA_GROUP
+    fc2_tiles = pairs * _FC2_N_TILES
+    tail = fc2_tiles % clusters
+    split = 0
+    if (
+        fc2_tail_split
+        and tail > 0
+        and 2 * tail <= clusters
+        and fc2_tiles <= _FC2_TAIL_SPLIT_MAX_WAVES * clusters
+    ):
+        split = tail
+    if norm_row_groups:
+        norm_grid = max(
+            1, min(sm_count, (rows + norm_row_groups - 1) // norm_row_groups)
+        )
+    else:
+        norm_grid = (rows + _NORM_ROWS_PER_CTA - 1) // _NORM_ROWS_PER_CTA
+    return (
+        norm_grid,
+        pairs * fc1_n_tiles * _CTA_GROUP,
+        (fc2_tiles + split) * _CTA_GROUP,
+        (fc2_tiles - tail) * _CTA_GROUP,
+        split,
+        clusters,
+    )
+
+
 def mxfp8_a_scale_workspace_bytes(rows: int) -> int:
     """Bytes of the swizzled MXFP8 scale workspace of the modulated activation ``a`` (K = 5376)
     for ``rows`` activation rows (128-row tiles padded to the even tile count the paired GEMM
@@ -136,12 +206,10 @@ def _fc2_tail_workspace(device: torch.device) -> Tuple[torch.Tensor, torch.Tenso
     """Per-device FP32 partial-sum buffer and hand-off counters of the FC2 tail split-K, shared
     by the three variants.  The counters start at zero and every launch that uses them re-arms
     them to zero (CUDA-graph replay safe); FC2 launches of one device must not run concurrently."""
-    index = device.index if device.index is not None else torch.cuda.current_device()
+    index = _device_index(device)
     workspace = _FC2_TAIL_WORKSPACE.get(index)
     if workspace is None:
-        clusters = (
-            torch.cuda.get_device_properties(index).multi_processor_count // _CTA_GROUP
-        )
+        clusters = _sm_count(index) // _CTA_GROUP
         slots = clusters // 2 + 1
         where = torch.device("cuda", index)
         partial = torch.empty(
@@ -257,10 +325,12 @@ def prepare_minimax_h3_fc2_weight_mxfp8(
     ``[256 t, 256 (t + 1))``; each 4-column K set of that block is two 512-byte 128x4 tiles, rows
     0-127 then 128-255; see :func:`flashinfer.diffusion_ops.minimax_h3_out_proj._weight_scale_tiles`).
     The FC1 weight is prepared by
-    :func:`~flashinfer.diffusion_ops.minimax_h3_fc1_swiglu.prepare_minimax_h3_fc1_weight_mxfp8`
-    (128-row gate/up weight scale tiles, ``112 * 42 * 1024`` bytes; the standalone FC1 operator's
     :func:`~flashinfer.diffusion_ops.minimax_h3_fc1_swiglu.prepare_minimax_h3_fc1_swiglu_weight_mxfp8`
-    tiles are rejected by :func:`minimax_h3_mlp_mxfp8`).
+    (112-row gate/up weight scale sub-tiles, ``128 * 42 * 1024`` bytes, for the 256x448 FC1 GEMM
+    tile) or by
+    :func:`~flashinfer.diffusion_ops.minimax_h3_fc1_swiglu.prepare_minimax_h3_fc1_weight_mxfp8`
+    (128-row tiles, ``112 * 42 * 1024`` bytes, for the 256x256 tile); see
+    :func:`minimax_h3_mlp_mxfp8`.
     """
     from ..quantization.fp8_quantization import mxfp8_quantize
 
@@ -358,6 +428,7 @@ def _minimax_h3_mlp_impl(
         fc2_partial,
         fc2_flags,
         eps,
+        *_launch_grids(x.shape[0], x.device, _FC1_BF16_N_TILES, True),
     )
 
 
@@ -415,7 +486,14 @@ def _minimax_h3_mlp_mxfp8_impl(
     fc2_flags: torch.Tensor,
     eps: float,
 ) -> None:
-    _module_for(x.device).minimax_h3_mlp_mxfp8(
+    # Route by the FC1 weight scale layout: the FC1 + SwiGLU operator's 112-row sub-tiles run the
+    # 256 x 448 FC1 GEMM, the 128-row tiles the 256 x 256 one.
+    module = _module_for(x.device)
+    if fc1_scale_tiles.numel() == MXFP8_FC1_SWIGLU_SCALE_TILE_BYTES:
+        launch, fc1_n_tiles = module.minimax_h3_mlp_mxfp8_w448, _FC1_MXFP8_W448_N_TILES
+    else:
+        launch, fc1_n_tiles = module.minimax_h3_mlp_mxfp8, _FC1_MXFP8_N_TILES
+    launch(
         x,
         x_norm_weight,
         adaln_scale,
@@ -435,6 +513,7 @@ def _minimax_h3_mlp_mxfp8_impl(
         fc2_partial,
         fc2_flags,
         eps,
+        *_launch_grids(x.shape[0], x.device, fc1_n_tiles, False),
     )
 
 
@@ -524,6 +603,9 @@ def _minimax_h3_mlp_nvfp4_impl(
         fc2_partial,
         fc2_flags,
         eps,
+        *_launch_grids(
+            x.shape[0], x.device, _FC1_NVFP4_N_TILES, False, _NVFP4_NORM_ROW_GROUPS
+        ),
     )
 
 
@@ -720,15 +802,17 @@ def minimax_h3_mlp_mxfp8(
     x, x_norm_weight, adaln_scale, adaln_shift, adaln_index, gate, residual, out, eps
         As in :func:`minimax_h3_mlp`.
     fc1_weight_q : torch.Tensor
-        ``float8_e4m3fn`` ``[28672, 5376]`` weights from
-        :func:`~flashinfer.diffusion_ops.minimax_h3_fc1_swiglu.prepare_minimax_h3_fc1_weight_mxfp8`
-        (gate rows then up rows).
-    fc1_scale_tiles : torch.Tensor
-        Flat ``uint8`` ``[112 * 42 * 1024]`` FC1 weight scale tiles from the same call (128-row
-        gate/up tiles of this operator's 256x256 FC1 GEMM tile).  The standalone FC1 operator's
-        tiles from
+        ``float8_e4m3fn`` ``[28672, 5376]`` weights (gate rows then up rows) from
         :func:`~flashinfer.diffusion_ops.minimax_h3_fc1_swiglu.prepare_minimax_h3_fc1_swiglu_weight_mxfp8`
-        (``128 * 42 * 1024`` bytes) are rejected.
+        or :func:`~flashinfer.diffusion_ops.minimax_h3_fc1_swiglu.prepare_minimax_h3_fc1_weight_mxfp8`
+        (both return the same codes).
+    fc1_scale_tiles : torch.Tensor
+        Flat ``uint8`` FC1 weight scale tiles from the same call; their size selects the FC1 GEMM.
+        The ``128 * 42 * 1024``-byte 112-row gate/up sub-tiles of
+        :func:`~flashinfer.diffusion_ops.minimax_h3_fc1_swiglu.prepare_minimax_h3_fc1_swiglu_weight_mxfp8`
+        run the 256x448 GEMM tile (the faster one); the ``112 * 42 * 1024``-byte 128-row tiles of
+        :func:`~flashinfer.diffusion_ops.minimax_h3_fc1_swiglu.prepare_minimax_h3_fc1_weight_mxfp8`
+        run the 256x256 tile.  Both give the same ``a`` and ``y`` workspaces and the same output.
     fc2_weight_q : torch.Tensor
         ``float8_e4m3fn`` ``[5376, 14336]`` weights from :func:`prepare_minimax_h3_fc2_weight_mxfp8`.
     fc2_scale_tiles : torch.Tensor
@@ -761,12 +845,23 @@ def minimax_h3_mlp_mxfp8(
         torch.float8_e4m3fn,
         device,
     )
-    fc1_scale_tiles = _scale_tiles(
-        fc1_scale_tiles,
-        "fc1_scale_tiles",
+    if (
+        not isinstance(fc1_scale_tiles, torch.Tensor)
+        or fc1_scale_tiles.dtype != torch.uint8
+    ):
+        raise ValueError("fc1_scale_tiles must be a uint8 tensor")
+    if fc1_scale_tiles.numel() not in (
+        MXFP8_FC1_SWIGLU_SCALE_TILE_BYTES,
         MXFP8_FC1_SCALE_TILE_BYTES,
-        device,
-        prepare="prepare_minimax_h3_fc1_weight_mxfp8",
+    ):
+        raise ValueError(
+            f"fc1_scale_tiles must hold exactly {MXFP8_FC1_SWIGLU_SCALE_TILE_BYTES} bytes (the "
+            "layout prepare_minimax_h3_fc1_swiglu_weight_mxfp8 produces) or "
+            f"{MXFP8_FC1_SCALE_TILE_BYTES} bytes (the layout "
+            f"prepare_minimax_h3_fc1_weight_mxfp8 produces), got {fc1_scale_tiles.numel()}"
+        )
+    fc1_scale_tiles = _scale_tiles(
+        fc1_scale_tiles, "fc1_scale_tiles", fc1_scale_tiles.numel(), device
     )
     _check_tensor(
         fc2_weight_q,

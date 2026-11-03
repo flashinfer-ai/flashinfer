@@ -326,8 +326,8 @@ class _X4TBaseDecodeLaunch:
         value: Uint32,
     ) -> None:
         if cutlass.const_expr(self.clamp_e8m0_bf16):
-            if value > Uint32(247):
-                value = Uint32(247)
+            if value > Uint32(183):
+                value = Uint32(183)
         if cutlass.const_expr(self.packed_w4a16):
             packed_row = self._packed_row(row)
             offset = (expert * Int32(self.columns) + column) * Int32(
@@ -475,8 +475,8 @@ class _X4TExceptionScatterLaunch:
                     position = entry & Uint32(X4T_POSITION_MASK)
                     value = entry >> Uint32(24)
                     if cutlass.const_expr(self.clamp_e8m0_bf16):
-                        if value > Uint32(247):
-                            value = Uint32(247)
+                        if value > Uint32(183):
+                            value = Uint32(183)
                     row = Int32(position // Uint32(self.columns))
                     column = Int32(position - Uint32(row * Int32(self.columns)))
                     if cutlass.const_expr(self.packed_w4a16):
@@ -638,8 +638,8 @@ class _X4TTP12W4A16DecodeLaunch:
     @cute.jit
     def _clamp_scale(self, value: Uint32) -> Uint32:
         result = value
-        if value > Uint32(247):
-            result = Uint32(247)
+        if value > Uint32(183):
+            result = Uint32(183)
         return result
 
     @cute.jit

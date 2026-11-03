@@ -5,7 +5,7 @@ Example on a B300::
 
     python benchmarks/bench_swiglu_stepfun.py --output-dir /tmp/swiglu_stepfun
 
-The default shape is H=4096, I=1536, E=64, top-k=8, with 8/64/512/2048
+The default shape is H=4096, I=1536, E=64, top-k=8, with 8/64/512/1024/2048
 tokens. Each precision uses identical native weights and prepared activations
 for OA (alpha=1.702, beta=1, limit=7) and Step limits 7 and 16. Preparation,
 quantization and independent tactic tuning precede timing. Timed GPU work
@@ -29,6 +29,13 @@ package is recorded in ``metadata.json``. ``--no-cuda-graph`` times eager
 launches instead of a graph replay (the default and the protocol fields are
 unchanged). A Step limit of ``inf`` is accepted and runs as ``FLT_MAX`` (the
 kernels' "no clamp" value).
+
+``--precisions nvfp4_bf16tok`` is the per-token NVFP4 mode: the activations are
+quantized per token (``token_scale = amax_t / (448 * 6)``, codes of
+``hidden / token_scale`` with the unit global scale) and the pack carries
+``per_token_scale``; both arms run with ``QuantConfig(per_token_scale=True)``
+(the native per-token NVFP4 route and the Cake ``nvfp4_bf16tok`` family). It is
+not in the default precision set.
 """
 
 from __future__ import annotations
@@ -95,8 +102,14 @@ MODES = {
         TrtllmFp8PerTensorRunner,
         QuantFormat.FP8PerTensor,
     ),
+    # Per-token NVFP4: the NVFP4 pair with ``QuantConfig(per_token_scale=True)`` on both
+    # arms (the Cake ``nvfp4_bf16tok`` family and the native per-token route).
+    "nvfp4_bf16tok": (TrtllmFp4Config, TrtllmFp4RoutedRunner, QuantFormat.NVFP4),
 }
-# The per-tensor FP8 mode is opt-in; the default precision set is unchanged.
+PER_TOKEN_PRECISIONS = frozenset({"nvfp4_bf16tok"})
+# token_scale = amax_t / (448 * 6): the per-token scale the NVFP4 per-token kernels apply.
+PER_TOKEN_GLOBAL_SCALE_INV = 1.0 / (448.0 * 6.0)
+# The per-tensor FP8 and per-token NVFP4 modes are opt-in; the default precision set is unchanged.
 DEFAULT_PRECISIONS = ("bf16", "mxfp8", "nvfp4")
 # Alternative backends measured next to the native trtllm-gen kernels on the
 # same weights, activations and autotune policy. Cake serves every precision.
@@ -157,7 +170,9 @@ def parse_args():
             "StepFun kernel are emitted. For kernel artifacts shipping StepFun kernels only."
         ),
     )
-    parser.add_argument("--tokens", nargs="+", type=int, default=[8, 64, 512, 2048])
+    parser.add_argument(
+        "--tokens", nargs="+", type=int, default=[8, 64, 512, 1024, 2048]
+    )
     parser.add_argument("--hidden", type=int, default=4096)
     parser.add_argument("--intermediate", type=int, default=1536)
     parser.add_argument("--experts", type=int, default=64)
@@ -299,12 +314,24 @@ def make_activations(args, tokens, backend, quant, hidden_states_scale_global=No
     )
     weights = torch.rand(tokens, args.top_k, device="cuda", dtype=torch.float32)
     weights /= weights.sum(-1, keepdim=True)
+    per_token_scale = None
     if quant.weight is QuantFormat.BF16:
         prepared, scales = hidden, None
     elif quant.weight is QuantFormat.FP8PerTensor:
         prepared, scales = backend.prepare_activations(
             hidden, hidden_states_scale_global=hidden_states_scale_global
         )
+    elif quant.per_token_scale:
+        # Per-token NVFP4: token_scale = amax_t / (448 * 6); the codes quantize
+        # hidden / token_scale with the unit global scale and the kernels multiply
+        # the accumulators by token_scale (``MoEActivationPack.per_token_scale``).
+        per_token_scale = (
+            (hidden.float().abs().amax(dim=1) * PER_TOKEN_GLOBAL_SCALE_INV)
+            .clamp_min(torch.finfo(torch.float32).tiny)
+            .contiguous()
+        )
+        scaled = (hidden.float() / per_token_scale[:, None]).to(torch.bfloat16)
+        prepared, scales = backend.prepare_activations(scaled, quant=quant)
     else:
         prepared, scales = backend.prepare_activations(hidden, quant=quant)
     pack = MoEActivationPack(
@@ -313,12 +340,15 @@ def make_activations(args, tokens, backend, quant, hidden_states_scale_global=No
         topk_ids=ids,
         topk_weights=weights,
         routing_input_mode=RoutingInputMode.UnpackedPrecomputed,
+        per_token_scale=per_token_scale,
     )
     hashes = {
         "canonical_activations": tensor_digest(hidden),
         "expert_ids": tensor_digest(ids),
         "expert_weights": tensor_digest(weights),
     }
+    if per_token_scale is not None:
+        hashes["per_token_scale"] = tensor_digest(per_token_scale)
     return pack, hashes
 
 
@@ -525,6 +555,7 @@ def main():
         "cold_l2_cache": args.cache_policy == "cold",
         "autotune": "independent per activation, precision, backend, token count",
         "backends": list(args.backends),
+        "per_token_precisions": sorted(PER_TOKEN_PRECISIONS & set(args.precisions)),
         "full_path": args.full_path,
         "cake_stepfun_moe": cake_package_identity()
         if "cake" in args.backends
@@ -616,7 +647,11 @@ def main():
     with (args.output_dir / "samples.jsonl").open("w") as raw:
         for precision in args.precisions:
             backend, runner_cls, fmt = MODES[precision]
-            quant = QuantConfig(weight=fmt, activation=fmt)
+            quant = QuantConfig(
+                weight=fmt,
+                activation=fmt,
+                per_token_scale=precision in PER_TOKEN_PRECISIONS,
+            )
             baseline = baseline_variant(precision)
             variants = {
                 **(

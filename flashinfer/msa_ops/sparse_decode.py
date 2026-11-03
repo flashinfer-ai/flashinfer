@@ -142,6 +142,7 @@ def _combine_partials(
 def _dummy_tensors(device_index: int):
     # Signature fillers for paths that never read them; cached so repeat decode
     # calls do not launch fill kernels.
+    """Dummy inputs used to warm the autotuner on a device."""
     dev = torch.device("cuda", device_index)
     return (
         torch.zeros((1, 1), dtype=torch.int32, device=dev),
@@ -302,9 +303,10 @@ def msa_sparse_decode_attention(
         this parameter exists to remove.
 
         Supported by the packed-NVFP4 paged-KV route on compute capability
-        10.0/10.3/10.7. Every other route raises ``NotImplementedError`` when it is
-        passed -- deliberately, so that a caller cannot be handed the copy back
-        without being told.
+        10.0/10.3/10.7 and by the compute capability 9.0 route. Every other
+        route raises ``NotImplementedError`` when it is passed -- before any
+        device query, so a host tensor gets the same answer -- deliberately, so
+        that a caller cannot be handed the copy back without being told.
 
     Returns
     -------
@@ -346,6 +348,14 @@ def msa_sparse_decode_attention(
     from ._sm90_dispatch import is_sm90a_device as is_sm90a_supported
 
     sm90 = is_sm90a_supported(q.device)
+    # Before the device check: a route that allocates its own output refuses
+    # out= on any device, host tensors included (the test reaches this on CPU).
+    if out is not None and not sm90:
+        raise NotImplementedError(
+            "out= is implemented by the compute capability 10.0/10.3/10.7 "
+            "packed-NVFP4 paged-KV decode route and on SM90; the SM120/SM121 "
+            "backend allocates its own output"
+        )
     if not (sm90 or is_sm12x_supported(q.device)):
         raise RuntimeError(
             "msa_sparse_decode_attention requires SM90, SM120 or SM121 and CUDA >= 12.8"
@@ -434,6 +444,11 @@ def msa_sparse_decode_attention(
             raise ValueError("page_table must be int32 of shape (batch, max_pages)")
         if page_table.shape[0] != batch_size:
             raise ValueError("page_table batch dimension must match q batch_size")
+        if q2k_indices.shape[-1] != 16:
+            raise NotImplementedError(
+                f"SM90 msa_sparse_decode_attention supports topk=16 only, got "
+                f"{q2k_indices.shape[-1]}"
+            )
         from ._sm90_dispatch import sparse_decode_sm90
 
         if out is None:
@@ -467,12 +482,6 @@ def msa_sparse_decode_attention(
     from .cute_dsl.sparse_decode_sm12x import SparseDecodeForwardSm12x
     from ._common import _q_offset_explicit
 
-    if out is not None:
-        raise NotImplementedError(
-            "out= is implemented by the compute capability 10.0/10.3/10.7 "
-            "packed-NVFP4 paged-KV decode route and on SM90; the SM120/SM121 "
-            "backend allocates its own output"
-        )
     topk = q2k_indices.shape[2]
     if topk <= 0:
         raise ValueError("q2k_indices topk dimension must be positive")

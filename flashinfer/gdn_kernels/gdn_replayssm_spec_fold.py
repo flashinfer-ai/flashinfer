@@ -93,7 +93,8 @@ def _gdn_replayssm_fold_kernel(
     safe_slot = requested_slot
     if not is_live:
         safe_slot = cutlass.Int32(0)
-    flat_slot = i_layer * slots_per_layer + safe_slot
+    # Int64: layers * slots * HV * V * K passes 2^31 elements on large pools.
+    flat_slot = cutlass.Int64(i_layer) * slots_per_layer + safe_slot
 
     copy_f32x4 = cute.make_copy_atom(
         cute.nvgpu.CopyUniversalOp(), _F32, num_bits_per_copy=128
@@ -119,7 +120,7 @@ def _gdn_replayssm_fold_kernel(
             safe_track_slot = requested_track_slot
             if not track_live:
                 safe_track_slot = cutlass.Int32(0)
-            flat_track_slot = i_layer * slots_per_layer + safe_track_slot
+            flat_track_slot = cutlass.Int64(i_layer) * slots_per_layer + safe_track_slot
 
         for t in cutlass.range(n_commit, unroll=1):
             cute.copy(

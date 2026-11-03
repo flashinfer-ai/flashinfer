@@ -51,6 +51,8 @@ class MLAReducer:
     Runtime split counts must not exceed ``max_splits``. Partial output uses
     modes (M, split, D512, query_tile, batch), with contiguous D; partial LSE
     uses (M, split, query_tile, batch) and stores base-2 logarithms.
+    ``max_prefetch_splits`` bounds register use independently of workspace
+    capacity. ``empty_lse_negative_inf`` selects the MTP empty-row convention.
     """
 
     def __init__(
@@ -67,6 +69,8 @@ class MLAReducer:
         is_var_split_kv: bool = False,
         enable_dcp: bool = False,
         enable_pdl: bool = False,
+        empty_lse_negative_inf: bool = False,
+        max_prefetch_splits: Optional[int] = None,
     ):
         if not 1 <= max_splits <= MAX_SPLITS:
             raise ValueError(
@@ -93,6 +97,8 @@ class MLAReducer:
         self.is_var_split_kv = is_var_split_kv
         self.enable_dcp = enable_dcp
         self.enable_pdl = enable_pdl
+        # MTP uses the logsumexp identity for requests with no visible keys.
+        self.empty_lse_negative_inf = empty_lse_negative_inf
         # Each reducer thread owns ``vec`` adjacent columns of its band
         # and keeps a batch of splits' partials in registers (<= 128 floats).
         self.vec = self.d_tile // self.num_threads
@@ -101,6 +107,15 @@ class MLAReducer:
             ceil_div(max_splits, self.accumulate_group) * self.accumulate_group
         )
         self.batch_splits = min(reducer_padded_splits, 64, 128 // self.vec)
+        if max_prefetch_splits is not None:
+            if (
+                isinstance(max_prefetch_splits, bool)
+                or not isinstance(max_prefetch_splits, int)
+                or max_prefetch_splits < 4
+                or max_prefetch_splits % 4
+            ):
+                raise ValueError("max_prefetch_splits must be a positive multiple of 4")
+            self.batch_splits = min(self.batch_splits, max_prefetch_splits)
         self.num_sets = ceil_div(reducer_padded_splits, self.batch_splits)
         self.scale_slots = (
             ceil_div(max_splits, self.threads_per_warp) * self.threads_per_warp
@@ -222,6 +237,8 @@ class MLAReducer:
                 )
             else:
                 k_tile_per_cta = cute.ceil_div(k_tile_total, local_split_kv)
+                if cutlass.const_expr(self.empty_lse_negative_inf):
+                    k_tile_per_cta = max(1, k_tile_per_cta)
                 local_split_kv = cute.ceil_div(k_tile_total, k_tile_per_cta)
 
             # Issue the first set of partial loads before the LSE phase so
@@ -288,7 +305,11 @@ class MLAReducer:
                     global_lse = (
                         lse_max + cute.math.log2(sum_lse, fastmath=True)
                         if sum_lse != self.lse_dtype(0.0) or sum_lse != sum_lse
-                        else self.lse_dtype.inf
+                        else (
+                            -self.lse_dtype.inf
+                            if self.empty_lse_negative_inf
+                            else self.lse_dtype.inf
+                        )
                     )
                 if d_tile_idx == 0:
                     if tidx == 0:
@@ -304,6 +325,12 @@ class MLAReducer:
                         smem_lse_scale[split_kv_idx] = (
                             cute.math.exp2(local_lse[i] - global_lse, fastmath=True)
                             if has_valid_lse
+                            else self.acc_dtype(0.0)
+                        )
+                    elif cutlass.const_expr(self.empty_lse_negative_inf):
+                        smem_lse_scale[split_kv_idx] = (
+                            cute.math.exp2(local_lse[i] - global_lse, fastmath=True)
+                            if local_lse[i] != -self.lse_dtype.inf
                             else self.acc_dtype(0.0)
                         )
                     else:

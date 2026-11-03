@@ -881,13 +881,22 @@ of a complete tactic does not isolate the speedup of any one field.
 
 ### Bounded candidates and cache replay
 
-The normal MXFP4 list starts from 17 deduplicated base tactics drawn from the
-block-permutation and published-exact manifests and two H20-derived anchors.
-For H7168/I3072/E384/EP4, optional N8/readiness choices expand these to 23;
+The normal MXFP4 list starts from 22 deduplicated base tactics drawn from the
+block-permutation and published-exact manifests, two H20-derived anchors,
+and five K128 candidates for intermediate widths such as 640. The folded
+M256/N64/K128 CGA1x1x1 group-330 candidate was measured on H100 and H200.
+An H200 sweep at H2560/I640/E512/EP2 adds an unfolded M256/N16/K128
+CGA1x1x1 group-330 candidate with two dispatch warps and FC1 store offload,
+folded N64 CGA1x1x1 candidates with groups 264 and 132, and a folded N64
+CGA1x2x1 group-132 tail-pair candidate. All five use one scheduler stage;
+the folded candidates use one dispatch warp, early FC1 publication and
+direct FC1 stores. For this shape, the complete eligible union grows from
+three to eight candidates without changing the heuristic defaults.
+For H7168/I3072/E384/EP4, optional N8/readiness choices expand these to 28;
 three large-token configurations and 12 distinct tail-pair neighbors bring
-the total to 38. Every model considers the same bounded extension catalog,
+the total to 43. Every model considers the same bounded extension catalog,
 then filters candidates through tile alignment and strategy eligibility.
-Other shapes can therefore have fewer than 38 candidates. Token capacity
+Other shapes can therefore have fewer than 43 candidates. Token capacity
 changes ordering, not the union; the untuned heuristic buckets are unchanged.
 
 Online `knobs="auto"` and offline `flashinfer.moe_ep.tune` use the same
@@ -1084,3 +1093,12 @@ tactics. Do not treat one cache-or-heuristic run as that full campaign.
 For controlled comparisons, hold shape, routing, data, timed regions and
 complete tactics fixed, then run the six formal processes independently of
 selection. Record source identity and actual clocks with the samples.
+
+
+## NVFP4
+
+The K16/E4M3 NVFP4 specialization lives under `shim/`, with a
+separate backend and compilation identity. Its implementation, numerical
+contract and validation commands are documented in
+[moe_ep_sm90_nvfp4.md](../../../../../docs/design_docs/moe_ep_sm90_nvfp4.md).
+Current MXFP4 measurements in this document are not NVFP4 measurements.

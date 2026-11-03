@@ -129,8 +129,14 @@ struct KernelParams {
   // The variable sparseMla topK lengths with shape of [numTokensQ].
   int32_t const* ptrSparseMlaTopKLens;
 
-  // The attention window size for sliding window attention.
-  int32_t mAttentionWindowSize;
+  // Sliding-window reaches excluding the current token. -1 means unbounded.
+  // setKernelParams() zeroes this struct and then assigns all four fields explicitly; do not rely
+  // on default member initializers here.
+  int32_t mLeftSlidingWindow;
+  int32_t mRightSlidingWindow;
+  // Inclusive VariableWindow bounds, one pair per packed Q token.
+  int32_t const* ptrVariableWindowTokenStarts;
+  int32_t const* ptrVariableWindowTokenEnds;
   // The batch size
   int32_t mBatchSize;
   // The chunked attention size in log2.
@@ -755,11 +761,19 @@ struct KernelParams {
 
     // If sparse MLA is enabled, the shape and stride for K need to be updated for 2D layout
     // (numTokensKvInPagedKv, headDimQk).
+    // Token-sparse MQA (not MLA) flattens V the same way with its own base pointer. Its pages
+    // hold one token, so the page strides are the row strides: K and V may be views of one row.
     if (options.isSparseMla()) {
       shapeK = std::vector<uint64_t>{static_cast<uint64_t>(options.mHeadDimQk),
                                      static_cast<uint64_t>(INT_MAX)};
-      strideK = std::vector<uint64_t>{1, static_cast<uint64_t>(options.mHeadDimQk)};
+      strideK = std::vector<uint64_t>{
+          1, static_cast<uint64_t>(options.isMla() ? options.mHeadDimQk : options.kStrideBatch)};
       tileShapeKv[1] = 1;
+    }
+    if (options.isSparseMqa()) {
+      shapeV = std::vector<uint64_t>{static_cast<uint64_t>(options.mHeadDimV),
+                                     static_cast<uint64_t>(INT_MAX)};
+      strideV = std::vector<uint64_t>{1, static_cast<uint64_t>(options.vStrideBatch)};
     }
     // K and V might use different tileShapes.
     std::vector<uint32_t> tileShapeK(tileShapeKv);
@@ -854,6 +868,8 @@ struct KernelParams {
     // The sequence lengths for Kv.
     params.ptrSeqLensKv = options.seqLensKvPtr;
     params.ptrSparseMlaTopKLens = options.sparseMlaTopKLensPtr;
+    params.ptrVariableWindowTokenStarts = options.variableWindowTokenStartsPtr;
+    params.ptrVariableWindowTokenEnds = options.variableWindowTokenEndsPtr;
 
     // Attention sink
     params.ptrAttentionSinks = options.ptrAttentionSinks;
@@ -874,10 +890,11 @@ struct KernelParams {
     params.ptrScaleSfO = options.oSfScalePtr;
     params.mScaleSfO = options.mScaleSfO;
 
-    params.mAttentionWindowSize = options.mAttentionWindowSize;
+    params.mLeftSlidingWindow = options.mLeftSlidingWindow;
+    params.mRightSlidingWindow = options.mRightSlidingWindow;
     if (isSlidingOrChunkedCausalMask(
             static_cast<TrtllmGenAttentionMaskType>(kernelMeta.mMaskType)) &&
-        options.mChunkedAttentionSize != INT_MAX) {
+        options.mChunkedAttentionSize > 0) {
       FLASHINFER_CHECK((options.mChunkedAttentionSize & (options.mChunkedAttentionSize - 1)) == 0,
                        "Chunked attention size must be a power of 2");
       params.mChunkedAttentionSizeLog2 = std::log2(options.mChunkedAttentionSize);
@@ -904,7 +921,6 @@ struct KernelParams {
     params.mSumOfSeqLensQ = options.mSumOfSeqLensQ;
     params.mSumOfSeqLensKv = options.mSumOfSeqLensKv;
     params.mBatchSize = options.mBatchSize;
-    params.mChunkedAttentionSizeLog2 = 0;
     params.mNumHeadsQ = options.mNumHeadsQ;
     params.mNumHeadsKv = options.mNumHeadsKv;
     params.mNumHeadsQPerKv = options.mNumHeadsQPerKv;

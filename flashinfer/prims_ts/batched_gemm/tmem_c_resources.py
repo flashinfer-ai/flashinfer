@@ -30,6 +30,7 @@ indices after the matching pipeline release/commit.
 
 Public hooks:
   - producer_work: mma, mma_fused_sf, mma_separate_sf, mma_cast_a.
+  - auxiliary producer_work: copy_fused_sf.
   - consumer_work: consumer_work.
   - ts_*_work(work_attrs=WorkAttr.AUXILIARY): overlap window setup and preloaded T2R fragments.
 """
@@ -55,21 +56,63 @@ from .batched_gemm_config import (
     BatchedGemmConfig,
     MX_MMA_FORMAT_E2M1,
     MX_MMA_FORMAT_E4M3,
-    SfLayout,
+    sfb_r128c4_utccp_offsets,
     TMEM_SF_UTCCP_COLS_PER_COPY,
     TMEM_SF_PACK_SIZE_BYTES,
+    WARPS_PER_WARPGROUP,
+    WARP_SIZE,
 )
 from .gmem_ab_resources import nonnegative_div, nonnegative_mod
 from cutlass.experimental import primitives as prims
 
+from .batched_gemm_cga import has_multiple_umma_atoms
+from .mixed_cga_ts import override_umma_atom_pipeline
+from .smem_descriptor import build_tcgen05_smem_desc
+
 Constexpr = cutlass.Constexpr
 
 
-def _sfb_s2t_desc_increment(smem_layout: int, copy_idx: int) -> int:
-    """Return the generated SFB SMEM-descriptor increment for one S2T copy."""
-    if smem_layout == int(SfLayout.R128c4):
-        return 32 * copy_idx
-    return 32 * (copy_idx // 2) + 128 * (copy_idx % 2)
+def _mma_smem_desc_increment(
+    kblock_idx: int,
+    *,
+    mma_k: int,
+    smem_bits: int,
+    tile_k: int,
+    stage_bytes: Optional[int] = None,
+) -> int:
+    """Return one operand's swizzled MMA-descriptor K increment.
+
+    Descriptor increments are measured in 16-byte units. A 128-byte swizzle
+    row contains ``1024 // smem_bits`` K elements; within that row, one MMA
+    advances by ``mma_k * smem_bits // 128`` descriptor units. Operand A uses
+    the fixed 1024-unit next-row stride. Operand B supplies its per-CTA stage
+    size so the next-row stride also reflects N tiling and CTA splitting.
+    """
+    bits_per_mma = mma_k * smem_bits
+    if bits_per_mma % 128 != 0:
+        raise ValueError(
+            "MMA K slice must occupy whole 16-byte descriptor units, got "
+            f"mma_k={mma_k}, smem_bits={smem_bits}"
+        )
+    if 1024 % bits_per_mma != 0:
+        raise ValueError(
+            "MMA K slice must divide one 128-byte swizzle row, got "
+            f"mma_k={mma_k}, smem_bits={smem_bits}"
+        )
+    if tile_k <= 0:
+        raise ValueError(f"tile_k must be positive, got {tile_k}")
+
+    kblocks_per_group = 1024 // bits_per_mma
+    desc_units_per_mma = bits_per_mma // 128
+    k_minor = kblock_idx % kblocks_per_group
+    k_major = kblock_idx // kblocks_per_group
+    group_stride = 1024
+    if stage_bytes is not None:
+        if stage_bytes <= 0:
+            raise ValueError(f"stage_bytes must be positive, got {stage_bytes}")
+        k_group_elems = 1024 // smem_bits
+        group_stride = max(64, (k_group_elems * stage_bytes // tile_k) >> 4)
+    return k_major * group_stride + k_minor * desc_units_per_mma
 
 
 def _mx_dtype_from_format(format_id: int) -> type:
@@ -85,6 +128,72 @@ def _mx_dtype_from_format(format_id: int) -> type:
     if format_id == MX_MMA_FORMAT_E2M1:
         return cutlass.Float4E2M1FN
     raise ValueError(f"Unsupported MX MMA dtype format: {format_id}")
+
+
+def _build_fp8_instr_desc(*, n_dim: int, m_dim: int, mma_k: int):
+    """Build a plain FP8 descriptor, including Rubin's K64 mode bit."""
+    if mma_k not in (32, 64):
+        raise ValueError(f"FP8 instruction descriptor requires K32/K64, got {mma_k}")
+    return prims.Tcgen05InstrDesc.build(
+        a_dtype=cutlass.Float8E4M3FN,
+        b_dtype=cutlass.Float8E4M3FN,
+        c_dtype=cutlass.Float32,
+        n_dim=n_dim,
+        m_dim=m_dim,
+        k_dim=1 if mma_k == 64 else 0,
+    )
+
+
+def _build_mx_instr_desc(
+    *,
+    a_format: int,
+    b_format: int,
+    n_dim: int,
+    m_dim: int,
+    mma_k: int,
+):
+    """Build an MX descriptor, including Rubin's K64 mode bit."""
+    if mma_k not in (32, 64):
+        raise ValueError(f"MX instruction descriptor requires K32/K64, got {mma_k}")
+    return prims.Tcgen05MxInstrDesc.build(
+        a_dtype=_mx_dtype_from_format(a_format),
+        b_dtype=_mx_dtype_from_format(b_format),
+        scale_format=1,  # UE8M0
+        n_dim=n_dim,
+        m_dim=m_dim,
+        k_dim=1 if mma_k == 64 else 0,
+    )
+
+
+def _build_nvfp4_instr_desc(
+    *, n_dim: int, m_dim: int, mma_k: int = 64, is_rubin: bool = False
+):
+    """Build the architecture-specific ``kind::mxf4nvf4`` descriptor.
+
+    Rubin's OMMA uses E2M1 format encoding 1 and a split K mode of 0 for K64
+    or 2 for K128. Blackwell uses the legacy MX descriptor's E2M1 encoding 5.
+    """
+    if mma_k not in (64, 128):
+        raise ValueError(f"NVFP4 instruction descriptor requires K64/K128, got {mma_k}")
+    if not is_rubin:
+        if mma_k != 64:
+            raise ValueError("NVFP4 mma_k=128 requires a Rubin OMMA descriptor")
+        return prims.Tcgen05MxInstrDesc.build(
+            a_dtype=cutlass.Float4E2M1FN,
+            b_dtype=cutlass.Float4E2M1FN,
+            scale_format=0,
+            n_dim=n_dim,
+            m_dim=m_dim,
+        )
+    return prims.Tcgen05MxOmmaInstrDesc.build(
+        a_dtype=cutlass.Float4E2M1FN,
+        b_dtype=cutlass.Float4E2M1FN,
+        scale_format=0,  # UE4M3
+        n_dim=n_dim,
+        m_dim=m_dim,
+        k_dim=0 if mma_k == 64 else 2,
+        sparsity_version=0,
+    )
 
 
 @dataclass(kw_only=True)
@@ -120,18 +229,17 @@ class TmemCResource(MemoryResource):
         TaskLocalVariable.uninitialized()
     )
 
+    def create_pipeline(self, pipeline_config):
+        result = super().create_pipeline(pipeline_config)
+        if has_multiple_umma_atoms(self.cfg):
+            return override_umma_atom_pipeline(result)
+        return result
+
     def __post_init__(self):
         if self._alloc_c is None:
-            if self.cfg.use_tile256_tmem_overlap and self.cfg.num_epilogue_warps == 4:
-                cols_per_stage = 2 * self.cfg.tile_n - self.cfg.tmem_overlap_chunk_cols
-            else:
-                cols_per_stage = self.cfg.tmem_c_cols_per_stage
+            cols_per_stage = self.cfg.tmem_overlap_window_cols
             total_cols = cols_per_stage * self.cfg.num_stages_tmem_acc
-            if (
-                self.cfg.has_scale_factors
-                and not self.cfg.uses_unfused_tmem_sf_copy
-                and not self.cfg.use_tile256_tmem_overlap
-            ):
+            if self.cfg.has_input_block_scaling and self.cfg.fuse_sf_copy_to_mma:
                 # Fused S2T writes scale factors immediately after the
                 # accumulator. Reserve those columns as part of this resource;
                 # no standalone TmemSf resources participate in the task graph
@@ -173,13 +281,21 @@ class TmemCResource(MemoryResource):
     @cute.jit
     def _t2r_default_values(self):
         if cutlass.const_expr(self.cfg.is_swap_ab):
-            swap_t2r_repx = max(1, self.cfg.epi_tile_n // 8)
-            t2r_init = cutlass.vector.full([swap_t2r_repx * 4], 0.0, cutlass.Float32)
-            t2r_1_init = cutlass.vector.full([swap_t2r_repx * 4], 0.0, cutlass.Float32)
+            swap_t2r_regs = max(1, self.cfg.epi_tile_n // 2)
+            t2r_init = cutlass.vector.full([swap_t2r_regs], 0.0, cutlass.Float32)
+            t2r_1_init = cutlass.vector.full([swap_t2r_regs], 0.0, cutlass.Float32)
         else:
-            epi_t2r_repx = self.cfg.epi_tile_n // 4
+            epi_t2r_repx = self.cfg.non_swap_tmem_load_num_regs
             t2r_init = cutlass.vector.full([max(1, epi_t2r_repx)], 0.0, cutlass.Float32)
-            t2r_1_init = cutlass.vector.full([1], 0.0, cutlass.Float32)
+            needs_secondary_fragment = (
+                self.cfg.has_gated_epilogue
+                and self.cfg.non_swap_epilogue_fragments_per_group == 2
+            ) or (
+                self.cfg.uses_tmem_overlap_window
+                and self.cfg.non_swap_tmem_overlap_loads == 2
+            )
+            secondary_repx = epi_t2r_repx if needs_secondary_fragment else 1
+            t2r_1_init = cutlass.vector.full([secondary_repx], 0.0, cutlass.Float32)
         return t2r_init, t2r_1_init
 
     @cute.jit
@@ -191,13 +307,11 @@ class TmemCResource(MemoryResource):
         )
         self.scale_d = cutlass.Boolean(False)
         # Initialise mutable per-iteration state as instance attributes
-        if cutlass.const_expr(
-            self.cfg.use_tile256_tmem_overlap and self.cfg.num_epilogue_warps == 4
-        ):
+        if cutlass.const_expr(self.cfg.uses_tmem_overlap_window):
             self._mma_local_idx = Int32(0)
             self._epi_local_idx = Int32(0)
         # Compute SFA/SFB TMEM base addresses for fused S2T+MMA
-        if cutlass.const_expr(self.cfg.has_scale_factors):
+        if cutlass.const_expr(self.cfg.has_input_block_scaling):
             base_col = self.tmem_raw_addr & 0xFFFF
             base_row = self.tmem_raw_addr >> 16
             # TMEM allocator order: C first (at offset 0), then SFA, SFB
@@ -205,26 +319,19 @@ class TmemCResource(MemoryResource):
             # The fused SF reservation is included in _alloc_c, but SFA starts
             # after the accumulator region rather than after the whole
             # allocation.
-            c_total_cols = self._tmem_c_cols_per_stage() * self.cfg.num_stages_tmem_acc
+            c_total_cols = (
+                self.cfg.tmem_overlap_window_cols * self.cfg.num_stages_tmem_acc
+            )
             sf_stage_mult = (
                 self.cfg.num_stages_tmem_sfa
-                if self.cfg.uses_unfused_tmem_sf_copy
+                if (
+                    self.cfg.has_input_block_scaling
+                    and not self.cfg.fuse_sf_copy_to_mma
+                )
                 else 1
             )
-            if cutlass.const_expr(self.cfg.use_tile256_tmem_overlap):
-                # Generated Tile256 fused-UTCCP kernels reserve the final
-                # 64-column TMEM window for scale factors: SFA at 448 and
-                # SFB at 464 when the allocation is 512 columns.  MXFP8/MXFP4
-                # tile256 only needs 4 SFA columns, but SFB still has to keep
-                # the generated 16-column boundary; placing it at 452 feeds
-                # malformed B scales to tcgen05_mma_block_scale.
-                sfa_col = base_col + self.cfg.tmem_total_cols - 64
-            else:
-                sfa_col = base_col + c_total_cols
-            sfb_col_stride = self.cfg.tmem_sfa_cols * sf_stage_mult
-            if cutlass.const_expr(self.cfg.use_tile256_tmem_overlap):
-                sfb_col_stride = max(16, sfb_col_stride)
-            sfb_col = sfa_col + sfb_col_stride
+            sfa_col = base_col + c_total_cols
+            sfb_col = sfa_col + self.cfg.tmem_sfa_cols * sf_stage_mult
             self.sfa_tmem_addr_base = (base_row << 16) | sfa_col
             self.sfb_tmem_addr_base = (base_row << 16) | sfb_col
         # Build MMA instruction descriptor
@@ -240,31 +347,28 @@ class TmemCResource(MemoryResource):
         elif cutlass.const_expr(self.cfg.is_fp8_mma):
             # Plain FP8 per-tensor GEMM: tcgen05_mma F8F6F4 with E4M3 inputs
             # and FP32 accumulators.
-            self.idesc = prims.Tcgen05InstrDesc.build(
-                a_dtype=cutlass.Float8E4M3FN,
-                b_dtype=cutlass.Float8E4M3FN,
-                c_dtype=cutlass.Float32,
+            self.idesc = _build_fp8_instr_desc(
                 n_dim=self.cfg.mma_n,
                 m_dim=self.cfg.mma_m,
+                mma_k=self.cfg.mma_k,
             )
         elif cutlass.const_expr(self.cfg.is_mx_mma):
-            self.idesc = prims.Tcgen05MxInstrDesc.build(
-                a_dtype=_mx_dtype_from_format(self.cfg.mx_a_format),
-                b_dtype=_mx_dtype_from_format(self.cfg.mx_b_format),
-                scale_format=1,  # UE8M0
+            self.idesc = _build_mx_instr_desc(
+                a_format=self.cfg.mx_a_format,
+                b_format=self.cfg.mx_b_format,
                 n_dim=self.cfg.mma_n,
                 m_dim=self.cfg.mma_m,
+                mma_k=self.cfg.mma_k,
             )
         else:
             # FP4 NVF4: block-scaled MMA descriptor (tcgen05_mma_block_scale
             # MXF4NVF4). NVF4 uses E4M3 scale factors (scale_format=0, UE4M3);
             # MXF4 (OCP MX) would use E8M0 (scale_format=1).
-            self.idesc = prims.Tcgen05MxInstrDesc.build(
-                a_dtype=cutlass.Float4E2M1FN,
-                b_dtype=cutlass.Float4E2M1FN,
-                scale_format=0,  # UE4M3
+            self.idesc = _build_nvfp4_instr_desc(
                 n_dim=self.cfg.mma_n,
                 m_dim=self.cfg.mma_m,
+                mma_k=self.cfg.mma_k,
+                is_rubin=self.cfg.is_rubin,
             )
 
     @producer_work(work_attrs=WorkAttr.AUXILIARY)
@@ -277,11 +381,6 @@ class TmemCResource(MemoryResource):
     def init_epilogue_state(self, stage_info: StageInfo) -> None:
         self._init_tmem_state(stage_info)
 
-    def _tmem_c_cols_per_stage(self) -> int:
-        if self.cfg.use_tile256_tmem_overlap and self.cfg.num_epilogue_warps == 4:
-            return 2 * self.cfg.tile_n - self.cfg.tmem_overlap_chunk_cols
-        return self.cfg.tmem_c_cols_per_stage
-
     @cute.jit
     def _deepseek_second_mma_desc_a(self, smem_a_stage_ptr):
         offset_bytes = Int64(
@@ -293,7 +392,8 @@ class TmemCResource(MemoryResource):
             shape=(self.cfg.num_bytes_a_per_stage,),
             addrspace=3,
         )
-        return prims.Tcgen05SmemDesc.build(
+        return build_tcgen05_smem_desc(
+            self.cfg,
             stage_base,
             leading_byte_offset=16384,
             stride_byte_offset=1024,
@@ -310,12 +410,14 @@ class TmemCResource(MemoryResource):
         smem_a_stage_ptr: Int64,
         desc_b_mma_base: prims.Tcgen05SmemDesc,
         smem_b_stage_ptr: Int64,
+        first_k_tile: Constexpr[Optional[bool]] = None,
     ) -> None:
         self._mma_impl(
             stage_info,
             desc_a_mma_base,
             desc_b_mma_base,
             smem_a_stage_ptr=smem_a_stage_ptr,
+            first_k_tile=first_k_tile,
         )
 
     @producer_work
@@ -328,18 +430,84 @@ class TmemCResource(MemoryResource):
         smem_a_stage_ptr: Int64,
         desc_b_mma_base: prims.Tcgen05SmemDesc,
         smem_b_stage_ptr: Int64,
-        desc_a_s2t_base: prims.Tcgen05SmemDesc,
-        smem_sfa_stage_ptr: Int64,
-        desc_b_s2t_base: prims.Tcgen05SmemDesc,
+        first_k_tile: Constexpr[Optional[bool]] = None,
     ) -> None:
         self._mma_impl(
             stage_info,
             desc_a_mma_base,
             desc_b_mma_base,
             smem_a_stage_ptr=smem_a_stage_ptr,
-            desc_a_s2t_base=desc_a_s2t_base,
-            desc_b_s2t_base=desc_b_s2t_base,
+            first_k_tile=first_k_tile,
         )
+
+    @producer_work(work_attrs=WorkAttr.AUXILIARY)
+    @cute.jit
+    def copy_fused_sf(
+        self,
+        stage_info: StageInfo,
+        *,
+        desc_a_s2t_base: prims.Tcgen05SmemDesc,
+        smem_sfa_stage_ptr: Int64,
+        desc_b_s2t_base: prims.Tcgen05SmemDesc,
+        smem_sfb_stage_ptr: Int64,
+    ) -> None:
+        """Copy fused scale factors to TMEM before acquiring the C stage."""
+        # The stage pointers are routed here to preserve scheduler dependencies;
+        # the descriptors already encode the addresses used by UTCCP.
+        del stage_info, smem_sfa_stage_ptr, smem_sfb_stage_ptr
+        s2t_shape, s2t_multicast = prims.S2TCopyMode.S2T_32x128b_WARPX4
+        num_sfa_iters = self.cfg.tmem_sfa_cols // TMEM_SF_UTCCP_COLS_PER_COPY
+        num_sfb_iters = self.cfg.tmem_sfb_cols // TMEM_SF_UTCCP_COLS_PER_COPY
+
+        # PTX same-address ordering associates each MMA scale-factor read with
+        # its base TMEM address. Issue higher-address copies first so the copy
+        # at the first address consumed by MMA is the final ordering point.
+        for copy_idx in cutlass.range_constexpr(num_sfa_iters):
+            s2t_idx = num_sfa_iters - 1 - copy_idx
+            sfa_tmem_addr = (
+                self.sfa_tmem_addr_base + s2t_idx * TMEM_SF_UTCCP_COLS_PER_COPY
+            )
+            sfa_tmem_ptr = prims.make_tmem_ptr(sfa_tmem_addr, cutlass.Int32)
+            desc_s2t = desc_a_s2t_base + 32 * s2t_idx
+            if prims.elect_sync():
+                prims.tcgen05_cp(
+                    s2t_shape,
+                    sfa_tmem_ptr,
+                    desc_s2t,
+                    group=self.cfg.cta_group,
+                    multicast=s2t_multicast,
+                )
+
+        for copy_idx in cutlass.range_constexpr(num_sfb_iters):
+            s2t_idx = num_sfb_iters - 1 - copy_idx
+            if cutlass.const_expr(self.cfg.uses_n_major_r128c4_sfb_utccp):
+                num_utccp_k = (
+                    self.cfg.tile_k
+                    // self.cfg.input_sf_block_size_b
+                    // TMEM_SF_PACK_SIZE_BYTES
+                )
+                assert num_sfb_iters == (self.cfg.tile_n // 128) * num_utccp_k, (
+                    "R128c4 SFB UTCCP copies must cover every (N block, K group)"
+                )
+                increment_s2t, sfb_tmem_delta = sfb_r128c4_utccp_offsets(
+                    self.cfg, s2t_idx
+                )
+            else:
+                sfb_tmem_delta = s2t_idx * TMEM_SF_UTCCP_COLS_PER_COPY
+                increment_s2t = 32 * (s2t_idx // 2) + 128 * (s2t_idx % 2)
+            sfb_tmem_addr = self.sfb_tmem_addr_base + sfb_tmem_delta
+            sfb_tmem_ptr = prims.make_tmem_ptr(sfb_tmem_addr, cutlass.Int32)
+            desc_s2t = desc_b_s2t_base + increment_s2t
+            if prims.elect_sync():
+                prims.tcgen05_cp(
+                    s2t_shape,
+                    sfb_tmem_ptr,
+                    desc_s2t,
+                    group=self.cfg.cta_group,
+                    multicast=s2t_multicast,
+                )
+        prims.tcgen05_wait(kind=prims.Tcgen05Wait.STORE)
+        cute.arch.fence_view_async_tmem_store()
 
     @producer_work
     @cute.jit
@@ -353,6 +521,7 @@ class TmemCResource(MemoryResource):
         smem_b_stage_ptr: Int64,
         sfa_stage_col_offset: cutlass.Int32,
         sfb_stage_col_offset: cutlass.Int32,
+        first_k_tile: Constexpr[Optional[bool]] = None,
     ) -> None:
         self._mma_impl(
             stage_info,
@@ -361,6 +530,7 @@ class TmemCResource(MemoryResource):
             smem_a_stage_ptr=smem_a_stage_ptr,
             sfa_stage_col_offset=sfa_stage_col_offset,
             sfb_stage_col_offset=sfb_stage_col_offset,
+            first_k_tile=first_k_tile,
         )
 
     @producer_work
@@ -372,9 +542,14 @@ class TmemCResource(MemoryResource):
         desc_b_mma_base: prims.Tcgen05SmemDesc,
         smem_b_stage_ptr: Int64,
         tmem_cast_a_addr: Int32,
+        first_k_tile: Constexpr[Optional[bool]] = None,
     ) -> None:
         self._mma_impl(
-            stage_info, Int64(0), desc_b_mma_base, tmem_cast_a_addr=tmem_cast_a_addr
+            stage_info,
+            Int64(0),
+            desc_b_mma_base,
+            tmem_cast_a_addr=tmem_cast_a_addr,
+            first_k_tile=first_k_tile,
         )
 
     @cute.jit
@@ -385,21 +560,18 @@ class TmemCResource(MemoryResource):
         desc_b_mma_base,
         *,
         smem_a_stage_ptr=None,
-        desc_a_s2t_base=None,
-        desc_b_s2t_base=None,
         sfa_stage_col_offset=None,
         sfb_stage_col_offset=None,
         tmem_cast_a_addr=None,
+        first_k_tile: Constexpr[Optional[bool]] = None,
     ) -> None:
         """Execute MMA (accumulates across K-tiles). Branches on BF16 vs FP4."""
         desc_a_mma = desc_a_mma_base
         desc_b_mma = desc_b_mma_base
-        stage_col_offset = stage_info.stage_idx * self._tmem_c_cols_per_stage()
-        if cutlass.const_expr(
-            self.cfg.use_tile256_tmem_overlap and self.cfg.num_epilogue_warps == 4
-        ):
+        stage_col_offset = stage_info.stage_idx * self.cfg.tmem_overlap_window_cols
+        if cutlass.const_expr(self.cfg.uses_tmem_overlap_window):
             stage_col_offset += self._mma_local_idx * Int32(
-                self.cfg.tile_n - self.cfg.tmem_overlap_chunk_cols
+                self.cfg.tile_n - self.cfg.epi_tile_n
             )
         acc_tmem_ptr = prims.make_tmem_ptr(
             self.tmem_raw_addr + self._alloc_c.offset + stage_col_offset,
@@ -408,6 +580,8 @@ class TmemCResource(MemoryResource):
 
         num_kblocks = self.cfg.tile_k // self.cfg.mma_k
         is_first_ktile = stage_info.loop_offset == Int32(0)
+        if cutlass.const_expr(first_k_tile is not None):
+            is_first_ktile = cutlass.Boolean(first_k_tile)
 
         if cutlass.const_expr(self.cfg.uses_plain_mma):
             # BF16 and plain FP8 paths: standard tcgen05_mma, no block scales.
@@ -416,34 +590,22 @@ class TmemCResource(MemoryResource):
             else:
                 mma_kind = prims.Tcgen05MMAKind.F16
             for kblock_idx in cutlass.range_constexpr(num_kblocks):
-                if cutlass.const_expr(
-                    (self.cfg.is_fp8_mma and self.cfg.tile_k > 128)
-                    or (not self.cfg.is_fp8_mma and self.cfg.tile_k > 64)
-                ):
-                    # SM100 swizzled MMA descriptors are linear inside one
-                    # generated K-box group: BF16 uses 64-wide TMA boxes and
-                    # FP8 uses 128-wide TMA boxes. The next group starts at
-                    # the next swizzled TMA box in SMEM.
-                    k_minor = kblock_idx % 4
-                    k_major = kblock_idx // 4
-                    desc_a_increment = k_major * 1024 + k_minor * 2
-                    if cutlass.const_expr(self.cfg.is_fp8_mma):
-                        b_kbox = 128
-                    else:
-                        b_kbox = 64
-                    b_group_stride = max(
-                        64,
-                        (
-                            b_kbox
-                            * self.cfg.num_bytes_b_smem_per_stage
-                            // self.cfg.tile_k
-                        )
-                        >> 4,
-                    )
-                    desc_b_increment = k_major * b_group_stride + k_minor * 2
+                if cutlass.const_expr(self.cfg.has_cast_a):
+                    desc_a_increment = 0
                 else:
-                    desc_a_increment = 2 * kblock_idx
-                    desc_b_increment = 2 * kblock_idx
+                    desc_a_increment = _mma_smem_desc_increment(
+                        kblock_idx,
+                        mma_k=self.cfg.mma_k,
+                        smem_bits=self.cfg.dtype_a_smem_bits,
+                        tile_k=self.cfg.tile_k,
+                    )
+                desc_b_increment = _mma_smem_desc_increment(
+                    kblock_idx,
+                    mma_k=self.cfg.mma_k,
+                    smem_bits=self.cfg.dtype_b_smem_bits,
+                    tile_k=self.cfg.tile_k,
+                    stage_bytes=self.cfg.num_bytes_b_smem_per_stage,
+                )
                 desc_b = desc_b_mma + desc_b_increment
                 if cutlass.const_expr(self.cfg.has_cast_a):
                     desc_a = prims.make_tmem_ptr(
@@ -453,7 +615,7 @@ class TmemCResource(MemoryResource):
                     desc_a = desc_a_mma + desc_a_increment
 
                 if cutlass.const_expr(kblock_idx == 0):
-                    if cutlass.const_expr(self.cfg.has_deepseek_fp8):
+                    if cutlass.const_expr(self.cfg.use_deepseek_fp8):
                         accumulate = cutlass.Boolean(False)
                     else:
                         accumulate = ~is_first_ktile
@@ -481,23 +643,19 @@ class TmemCResource(MemoryResource):
                     cutlass.Float32,
                 )
                 for kblock_idx in cutlass.range_constexpr(num_kblocks):
-                    if cutlass.const_expr(self.cfg.tile_k > 128):
-                        k_minor = kblock_idx % 4
-                        k_major = kblock_idx // 4
-                        desc_a_increment = k_major * 1024 + k_minor * 2
-                        b_group_stride = max(
-                            64,
-                            (
-                                128
-                                * self.cfg.num_bytes_b_smem_per_stage
-                                // self.cfg.tile_k
-                            )
-                            >> 4,
-                        )
-                        desc_b_increment = k_major * b_group_stride + k_minor * 2
-                    else:
-                        desc_a_increment = 2 * kblock_idx
-                        desc_b_increment = 2 * kblock_idx
+                    desc_a_increment = _mma_smem_desc_increment(
+                        kblock_idx,
+                        mma_k=self.cfg.mma_k,
+                        smem_bits=self.cfg.dtype_a_smem_bits,
+                        tile_k=self.cfg.tile_k,
+                    )
+                    desc_b_increment = _mma_smem_desc_increment(
+                        kblock_idx,
+                        mma_k=self.cfg.mma_k,
+                        smem_bits=self.cfg.dtype_b_smem_bits,
+                        tile_k=self.cfg.tile_k,
+                        stage_bytes=self.cfg.num_bytes_b_smem_per_stage,
+                    )
                     desc_a = desc_a_mma_1 + desc_a_increment
                     desc_b = desc_b_mma + desc_b_increment
 
@@ -518,69 +676,18 @@ class TmemCResource(MemoryResource):
                         )
 
         else:
-            # FP4 path: block-scaled MMA
-            if cutlass.const_expr(not self.cfg.uses_unfused_tmem_sf_copy):
-                # Fused S2T+MMA: do S2T copy here, then MMA.
-                s2t_shape, s2t_multicast = prims.S2TCopyMode.S2T_32x128b_WARPX4
-                num_sfa_iters = self.cfg.tmem_sfa_cols // TMEM_SF_UTCCP_COLS_PER_COPY
-                num_sfb_iters = self.cfg.tmem_sfb_cols // TMEM_SF_UTCCP_COLS_PER_COPY
-
-                for s2t_idx in cutlass.range_constexpr(num_sfa_iters):
-                    sfa_tmem_addr = (
-                        self.sfa_tmem_addr_base + s2t_idx * TMEM_SF_UTCCP_COLS_PER_COPY
-                    )
-                    sfa_tmem_ptr = prims.make_tmem_ptr(sfa_tmem_addr, cutlass.Int32)
-                    desc_s2t = desc_a_s2t_base + 32 * s2t_idx
-                    if prims.elect_sync():
-                        prims.tcgen05_cp(
-                            s2t_shape,
-                            sfa_tmem_ptr,
-                            desc_s2t,
-                            group=self.cfg.cta_group,
-                            multicast=s2t_multicast,
-                        )
-
-                for s2t_idx in cutlass.range_constexpr(num_sfb_iters):
-                    if cutlass.const_expr(self.cfg.use_tile256_tmem_overlap):
-                        sfb_col_stride = self.cfg.tmem_sf_col_stride("b")
-                        sfb_k_groups = self.cfg.tmem_sfb_cols // sfb_col_stride
-                        # Tile256 SFB descriptors are chunk-major; TMEM is
-                        # grouped by four SF K-vectors.
-                        sfb_tmem_delta = (s2t_idx % sfb_k_groups) * sfb_col_stride + (
-                            s2t_idx // sfb_k_groups
-                        ) * TMEM_SF_UTCCP_COLS_PER_COPY
-                        increment_s2t = 32 * s2t_idx
-                    else:
-                        sfb_tmem_delta = s2t_idx * TMEM_SF_UTCCP_COLS_PER_COPY
-                        increment_s2t = _sfb_s2t_desc_increment(
-                            self.cfg.smem_sfb_layout, s2t_idx
-                        )
-                    sfb_tmem_addr = self.sfb_tmem_addr_base + sfb_tmem_delta
-                    sfb_tmem_ptr = prims.make_tmem_ptr(sfb_tmem_addr, cutlass.Int32)
-                    desc_s2t = desc_b_s2t_base + increment_s2t
-                    if prims.elect_sync():
-                        prims.tcgen05_cp(
-                            s2t_shape,
-                            sfb_tmem_ptr,
-                            desc_s2t,
-                            group=self.cfg.cta_group,
-                            multicast=s2t_multicast,
-                        )
-                prims.tcgen05_wait(kind=prims.Tcgen05Wait.STORE)
-                cute.arch.fence_view_async_tmem_store()
-            else:
-                # Separate CopySf: SF already in TMEM from CopySf tasks.
-                # Read stage offsets from TmemSfRoute consumer variables.
-                pass
-
             # Block-scaled MMA with scale factors in TMEM
-            if cutlass.const_expr(self.cfg.uses_unfused_tmem_sf_copy):
+            if cutlass.const_expr(
+                (self.cfg.has_input_block_scaling and not self.cfg.fuse_sf_copy_to_mma)
+            ):
                 # SF stage offsets from separate CopySf pipeline
                 sfa_offset = sfa_stage_col_offset
                 sfb_offset = sfb_stage_col_offset
             else:
                 sfa_offset = Int32(0)
                 sfb_offset = Int32(0)
+
+            b_stage_bytes = self.cfg.num_bytes_b_smem_per_stage
 
             for kblock_idx in cutlass.range_constexpr(num_kblocks):
                 sfa_sf_vec_idx = (
@@ -589,8 +696,14 @@ class TmemCResource(MemoryResource):
                 sfb_sf_vec_idx = (
                     kblock_idx * self.cfg.mma_k
                 ) // self.cfg.input_sf_block_size_b
-                sfa_sf_group_idx = sfa_sf_vec_idx // TMEM_SF_PACK_SIZE_BYTES
-                sfb_sf_group_idx = sfb_sf_vec_idx // TMEM_SF_PACK_SIZE_BYTES
+                sfa_sf_group_size = (
+                    TMEM_SF_PACK_SIZE_BYTES * self.cfg.tmem_sf_vec4_groups_per_mma("a")
+                )
+                sfb_sf_group_size = (
+                    TMEM_SF_PACK_SIZE_BYTES * self.cfg.tmem_sf_vec4_groups_per_mma("b")
+                )
+                sfa_sf_group_idx = sfa_sf_vec_idx // sfa_sf_group_size
+                sfb_sf_group_idx = sfb_sf_vec_idx // sfb_sf_group_size
                 sfa_sf_id = sfa_sf_vec_idx % TMEM_SF_PACK_SIZE_BYTES
                 sfb_sf_id = sfb_sf_vec_idx % TMEM_SF_PACK_SIZE_BYTES
                 sfa_tmem_addr = (
@@ -606,49 +719,19 @@ class TmemCResource(MemoryResource):
                 sfa_tmem_ptr = prims.make_tmem_ptr(sfa_tmem_addr, cutlass.Int32)
                 sfb_tmem_ptr = prims.make_tmem_ptr(sfb_tmem_addr, cutlass.Int32)
 
-                if cutlass.const_expr(self.cfg.is_mx_mma and self.cfg.tile_k > 128):
-                    # MX descriptors are linear inside one 128-wide K slice:
-                    # four mmaK=32 instructions share one set of SF IDs.
-                    k_minor = kblock_idx % 4
-                    k_major = kblock_idx // 4
-                    desc_a_increment = k_major * 1024 + k_minor * 2
-                    b_stage_bytes = self.cfg.num_bytes_b_smem_per_stage
-                    if cutlass.const_expr(
-                        self.cfg.has_cluster
-                        and self.cfg.is_swap_ab
-                        and self.cfg.has_tma_route
-                        and not self.cfg.split_b_across_ctas
-                    ):
-                        b_stage_bytes //= self.cfg.cluster_m
-                    desc_b_group_stride = max(
-                        64,
-                        (128 * b_stage_bytes // self.cfg.tile_k) >> 4,
-                    )
-                    desc_b_increment = k_major * desc_b_group_stride + k_minor * 2
-                elif cutlass.const_expr(self.cfg.tile_k > 256):
-                    # SM100 swizzled FP4 MMA descriptors are linear only
-                    # within a 256-wide K group. At kblock 4, generated
-                    # kernels jump to the next swizzle group instead of using
-                    # desc += 8.
-                    k_minor = kblock_idx % 4
-                    k_major = kblock_idx // 4
-                    desc_a_increment = k_major * 1024 + k_minor * 2
-                    b_stage_bytes = self.cfg.num_bytes_b_smem_per_stage
-                    if cutlass.const_expr(
-                        self.cfg.has_cluster
-                        and self.cfg.is_swap_ab
-                        and self.cfg.has_tma_route
-                        and not self.cfg.split_b_across_ctas
-                    ):
-                        b_stage_bytes //= self.cfg.cluster_m
-                    desc_b_group_stride = max(
-                        64,
-                        (256 * b_stage_bytes // self.cfg.tile_k) >> 4,
-                    )
-                    desc_b_increment = k_major * desc_b_group_stride + k_minor * 2
-                else:
-                    desc_a_increment = 2 * kblock_idx
-                    desc_b_increment = 2 * kblock_idx
+                desc_a_increment = _mma_smem_desc_increment(
+                    kblock_idx,
+                    mma_k=self.cfg.mma_k,
+                    smem_bits=self.cfg.dtype_a_smem_bits,
+                    tile_k=self.cfg.tile_k,
+                )
+                desc_b_increment = _mma_smem_desc_increment(
+                    kblock_idx,
+                    mma_k=self.cfg.mma_k,
+                    smem_bits=self.cfg.dtype_b_smem_bits,
+                    tile_k=self.cfg.tile_k,
+                    stage_bytes=b_stage_bytes,
+                )
                 desc_a = desc_a_mma + desc_a_increment
                 desc_b = desc_b_mma + desc_b_increment
 
@@ -681,7 +764,10 @@ class TmemCResource(MemoryResource):
                             acc_tmem_ptr,
                             desc_a,
                             desc_b,
-                            self.idesc,
+                            self.idesc.set_sf_ids(
+                                a_sf_id=sfa_sf_id,
+                                b_sf_id=sfb_sf_id,
+                            ),
                             enable_input_d=accumulate,
                             scale_a=sfa_tmem_ptr,
                             scale_b=sfb_tmem_ptr,
@@ -696,9 +782,7 @@ class TmemCResource(MemoryResource):
     @cute.jit
     def advance_mma_overlap_window(self, stage_info: StageInfo) -> None:
         """Flip the local D-window index after publishing C."""
-        if cutlass.const_expr(
-            self.cfg.use_tile256_tmem_overlap and self.cfg.num_epilogue_warps == 4
-        ):
+        if cutlass.const_expr(self.cfg.uses_tmem_overlap_window):
             self._mma_local_idx = self._mma_local_idx ^ Int32(1)
 
     @consumer_work_decorator(returns=(t2r_rmem, t2r_rmem_1, t2r_output_call_idx))
@@ -719,20 +803,80 @@ class TmemCResource(MemoryResource):
         work_attrs=WorkAttr.AUXILIARY,
     )
     @cute.jit
+    def preload_non_swap_overlap(
+        self,
+        stage_info: StageInfo,
+    ) -> tuple[cutlass.Float32, cutlass.Float32, Int32]:
+        """Copy the complete shared TMEM region before releasing its stage.
+
+        Adjacent accumulator windows are separated by ``tile_n - epi_tile_n``;
+        the shared region is therefore exactly one ``epi_tile_n`` chunk.
+        """
+        if cutlass.const_expr(not self.cfg.has_gated_epilogue):
+            epi_t2r_repx = self.cfg.non_swap_tmem_load_num_regs
+            num_calls = self.cfg.tile_n // epi_t2r_repx
+            overlap_loads = self.cfg.non_swap_tmem_overlap_loads
+            first_output_call = (Int32(1) - self._epi_local_idx) * Int32(
+                num_calls - overlap_loads
+            )
+            t2r_rmem, _, t2r_output_call_idx = self._consumer_work_impl(
+                stage_info, first_output_call
+            )
+            if cutlass.const_expr(overlap_loads == 2):
+                t2r_rmem_1, _, _ = self._consumer_work_impl(
+                    stage_info, first_output_call + Int32(1)
+                )
+            else:
+                _, t2r_rmem_1 = self._t2r_default_values()
+            return t2r_rmem, t2r_rmem_1, t2r_output_call_idx
+
+        # TRTLLM-gen rotates pass zero onto the shared tail chunk while local
+        # set zero is active. Each FC1 warpgroup loads the complete epi_tile_n.
+        t2r_rmem, t2r_rmem_1, t2r_output_call_idx = self._consumer_work_impl(
+            stage_info, Int32(0)
+        )
+        return t2r_rmem, t2r_rmem_1, t2r_output_call_idx
+
+    @consumer_work_decorator(
+        returns=(t2r_rmem, t2r_rmem_1, t2r_output_call_idx),
+        work_attrs=WorkAttr.AUXILIARY,
+    )
+    @cute.jit
     def load_overlap_subtile(
         self,
         stage_info: StageInfo,
         *,
         subtile_idx: cutlass.Constexpr[int],
     ) -> tuple[cutlass.Float32, cutlass.Float32, Int32]:
-        if cutlass.const_expr(
-            self.cfg.use_tile256_tmem_overlap and self.cfg.num_epilogue_warps == 4
-        ):
+        if cutlass.const_expr(self.cfg.uses_tmem_overlap_window):
+            if cutlass.const_expr(not self.cfg.is_swap_ab):
+                if cutlass.const_expr(not self.cfg.has_gated_epilogue):
+                    epi_t2r_repx = self.cfg.non_swap_tmem_load_num_regs
+                    num_calls = self.cfg.tile_n // epi_t2r_repx
+                    overlap_loads = self.cfg.non_swap_tmem_overlap_loads
+                    logical_call_idx = Int32(subtile_idx) + self._epi_local_idx * Int32(
+                        overlap_loads
+                    )
+                    t2r_rmem, t2r_rmem_1, t2r_output_call_idx = (
+                        self._consumer_work_impl(stage_info, logical_call_idx)
+                    )
+                    if cutlass.const_expr(subtile_idx == num_calls - overlap_loads - 1):
+                        self._epi_local_idx = self._epi_local_idx ^ Int32(1)
+                    return t2r_rmem, t2r_rmem_1, t2r_output_call_idx
+
+                num_calls = self.cfg.non_swap_epilogue_subtile_cnt
+                logical_call_idx = Int32(subtile_idx) + Int32(1)
+                t2r_rmem, t2r_rmem_1, t2r_output_call_idx = self._consumer_work_impl(
+                    stage_info, logical_call_idx
+                )
+                if cutlass.const_expr(subtile_idx == num_calls - 2):
+                    self._epi_local_idx = self._epi_local_idx ^ Int32(1)
+                return t2r_rmem, t2r_rmem_1, t2r_output_call_idx
             t2r_rmem, t2r_rmem_1, t2r_output_call_idx = self._consumer_work_impl(
                 stage_info, subtile_idx + Int32(1)
             )
             if cutlass.const_expr(
-                subtile_idx == self.cfg.tile_n // self.cfg.tmem_overlap_chunk_cols - 2
+                subtile_idx == self.cfg.tile_n // self.cfg.epi_tile_n - 2
             ):
                 self._epi_local_idx = self._epi_local_idx ^ Int32(1)
             return t2r_rmem, t2r_rmem_1, t2r_output_call_idx
@@ -743,41 +887,40 @@ class TmemCResource(MemoryResource):
     def _consumer_work_impl(self, stage_info: StageInfo, logical_call_idx):
         """T2R: load TMEM accumulator sub-tile into registers.
 
-        non-swapAB: 32x32b, 1 reg per TMEM column, epi_t2r_repx cols per call.
+        non-swapAB: 32x32b, 1 reg per TMEM column, capped by
+        tmem_ldst_max_num_regs.
         swapAB: 16x256b, 4 regs per 8 columns, two 16-row loads.
         """
         base_col = self.tmem_raw_addr & 0xFFFF
         base_row = self.tmem_raw_addr >> 16
-        stage_col_offset = stage_info.stage_idx * self._tmem_c_cols_per_stage()
+        stage_col_offset = stage_info.stage_idx * self.cfg.tmem_overlap_window_cols
 
         warp_idx = cute.arch.warp_idx()
-        warp_in_group = warp_idx % self.cfg.num_epilogue_warps
+        warp_in_group = warp_idx % self.cfg.warp_layout.num_epilogue_warps
         warp_in_group = cute.arch.make_warp_uniform(warp_in_group)
 
         if cutlass.const_expr(self.cfg.is_swap_ab):
             # 16x256b: each 4-warp epilogue subgroup handles one epilogueTileN
             # column chunk.  Tile256 generated kernels use two 4-warp groups,
             # so one schedule call covers 128 columns without over-unrolling.
-            warpgroup_count = max(1, self.cfg.num_epilogue_warps // 4)
+            warpgroup_count = max(1, self.cfg.warp_layout.num_epilogue_warps // 4)
             warpgroup_idx = nonnegative_div(warp_in_group, 4)
             cols_per_call = self.cfg.epi_tile_n * warpgroup_count
             if cutlass.const_expr(self.cfg.has_deepseek_fp8_two_epilogue):
                 cols_per_call = self.cfg.epi_tile_n
             call_idx_for_tmem = Int32(logical_call_idx)
             call_idx_for_output = Int32(logical_call_idx)
-            if cutlass.const_expr(
-                self.cfg.use_tile256_tmem_overlap and self.cfg.num_epilogue_warps == 4
-            ):
+            if cutlass.const_expr(self.cfg.uses_tmem_overlap_window):
                 num_epilogue_tiles_n = self.cfg.tile_n // self.cfg.epi_tile_n
                 actual_idx_n = logical_call_idx + warpgroup_idx
                 # The tile256 max-overlap path ping-pongs two logical C tiles
-                # through a 448-column physical window:
-                #   local set 0 -> physical chunks 0,1,2,3
-                #   local set 1 -> physical chunks 3,4,5,6
-                # Chunk 3 is shared.  We read that shared chunk before release,
+                # through a shared physical window. For n epilogue chunks:
+                #   local set 0 -> physical chunks 0..n-1
+                #   local set 1 -> physical chunks n-1..2n-2
+                # Chunk n-1 is shared. We read it before release,
                 # then read the remaining chunks after release while MMA can
                 # write the next set.  Wrapping local set 1 back to chunks
-                # 0,1,2,3 corrupts multi-N FC1 shapes because epilogue stores
+                # 0..n-1 corrupts multi-N FC1 shapes because epilogue stores
                 # stale C data for output tiles 1..3.
                 offset_idx_n = actual_idx_n + Int32(num_epilogue_tiles_n - 1)
                 wrapped_idx_n = nonnegative_mod(offset_idx_n, num_epilogue_tiles_n)
@@ -805,55 +948,129 @@ class TmemCResource(MemoryResource):
             addr = (base_row << 16) | col_id
 
             shape = "16x256b"
+            swap_t2r_repx = self.cfg.swap_tmem_load_reps
+            swap_t2r_regs = self.cfg.swap_tmem_load_num_regs
+            swap_t2r_loads = self.cfg.swap_tmem_overlap_loads
+            slice0_vals = []
+            slice1_vals = []
             if cutlass.const_expr(self.cfg.has_deepseek_fp8_two_epilogue):
                 addr = addr + warpgroup_idx * Int32(0x100000)
-                tmem = prims.make_tmem_ptr(addr, cutlass.Float32)
-                swap_t2r_repx = max(1, self.cfg.epi_tile_n // 8)
-                slice0 = prims.tcgen05_ld(shape, tmem, num=swap_t2r_repx)
-                slice1 = cutlass.vector.full([swap_t2r_repx * 4], 0.0, cutlass.Float32)
+                for load_idx in cutlass.range_constexpr(swap_t2r_loads):
+                    load_addr = addr + Int32(load_idx * self.cfg.swap_tmem_load_cols)
+                    tmem = prims.make_tmem_ptr(load_addr, cutlass.Float32)
+                    load_slice0 = prims.tcgen05_ld(shape, tmem, num=swap_t2r_repx)
+                    for reg_idx in cutlass.range_constexpr(swap_t2r_regs):
+                        slice0_vals.append(load_slice0[reg_idx])
                 prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
                 cute.arch.fence_view_async_tmem_load()
+                slice0 = cutlass.Vector.from_elements(
+                    tuple(slice0_vals), dtype=cutlass.Float32
+                )
+                slice1 = cutlass.vector.full(
+                    [self.cfg.epi_tile_n // 2], 0.0, cutlass.Float32
+                )
                 return (slice0, slice1, call_idx_for_output)
-            tmem0 = prims.make_tmem_ptr(addr, cutlass.Float32)
-            tmem1 = prims.make_tmem_ptr(addr + 0x100000, cutlass.Float32)
-            swap_t2r_repx = max(1, self.cfg.epi_tile_n // 8)
-            slice0 = prims.tcgen05_ld(shape, tmem0, num=swap_t2r_repx)  # 4 * repx FP32
-            slice1 = prims.tcgen05_ld(shape, tmem1, num=swap_t2r_repx)  # 4 * repx FP32
+            for load_idx in cutlass.range_constexpr(swap_t2r_loads):
+                load_addr = addr + Int32(load_idx * self.cfg.swap_tmem_load_cols)
+                tmem0 = prims.make_tmem_ptr(load_addr, cutlass.Float32)
+                tmem1 = prims.make_tmem_ptr(load_addr + 0x100000, cutlass.Float32)
+                load_slice0 = prims.tcgen05_ld(shape, tmem0, num=swap_t2r_repx)
+                load_slice1 = prims.tcgen05_ld(shape, tmem1, num=swap_t2r_repx)
+                for reg_idx in cutlass.range_constexpr(swap_t2r_regs):
+                    slice0_vals.append(load_slice0[reg_idx])
+                    slice1_vals.append(load_slice1[reg_idx])
             prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
             cute.arch.fence_view_async_tmem_load()
+            slice0 = cutlass.Vector.from_elements(
+                tuple(slice0_vals), dtype=cutlass.Float32
+            )
+            slice1 = cutlass.Vector.from_elements(
+                tuple(slice1_vals), dtype=cutlass.Float32
+            )
             return (slice0, slice1, call_idx_for_output)
         else:
             # 32x32b: 1 reg per column
-            epi_t2r_repx = self.cfg.epi_tile_n // 4
-            row_offset = warp_in_group * 32
-            call_idx_for_tmem = Int32(logical_call_idx)
-            call_idx_for_output = Int32(logical_call_idx)
-            if cutlass.const_expr(self.cfg.use_tile256_tmem_overlap):
-                num_chunks = self.cfg.tile_n // epi_t2r_repx
-                offset_idx = logical_call_idx + Int32(num_chunks - 1)
-                wrapped_idx = nonnegative_mod(offset_idx, num_chunks)
-                first_window = self._epi_local_idx == Int32(0)
-                call_idx_for_tmem = prims.inline_ptx_hl(
+            epi_t2r_repx = self.cfg.non_swap_tmem_load_num_regs
+            warpgroup_idx = warp_in_group // Int32(WARPS_PER_WARPGROUP)
+            warp_in_epi4 = warp_in_group % Int32(WARPS_PER_WARPGROUP)
+            warpgroup_idx = cute.arch.make_warp_uniform(warpgroup_idx)
+            warp_in_epi4 = cute.arch.make_warp_uniform(warp_in_epi4)
+            row_offset = warp_in_epi4 * WARP_SIZE
+            if cutlass.const_expr(self.cfg.has_gated_epilogue):
+                steps_per_epi_tile = self.cfg.non_swap_gated_steps_per_epi_tile
+                step_idx = logical_call_idx % Int32(steps_per_epi_tile)
+                epi_tile_call_idx = logical_call_idx // Int32(steps_per_epi_tile)
+                output_group_idx = (
+                    epi_tile_call_idx
+                    * Int32(self.cfg.non_swap_epilogue_warpgroup_count)
+                    + warpgroup_idx
+                )
+                tmem_group_idx = output_group_idx
+            else:
+                output_group_idx = Int32(logical_call_idx)
+                col_offset = logical_call_idx * Int32(epi_t2r_repx)
+
+            if cutlass.const_expr(
+                self.cfg.uses_tmem_overlap_window and self.cfg.has_gated_epilogue
+            ):
+                # Match TRTLLM-gen's four-chunk rotation exactly.  The two MMA
+                # windows occupy chunks [0, 3] and [3, 6], sharing chunk 3.
+                # Pass zero reads the shared chunk before release:
+                #   local 0: physical/output (wg + 3) % 4
+                #   local 1: physical wg + 3, output wg
+                # Pass one applies the same mapping to logical chunks 2 and 3.
+                num_output_groups = self.cfg.tile_n // self.cfg.epi_tile_n
+                offset_group_idx = output_group_idx + Int32(num_output_groups - 1)
+                wrapped_group_idx = offset_group_idx % Int32(num_output_groups)
+                local_set_is_zero = self._epi_local_idx == Int32(0)
+                tmem_group_idx = prims.inline_ptx_hl(
                     "selp.s32 {$w0}, {$r0}, {$r1}, {$r2};",
                     write_only_types=[Int32],
-                    read_only_args=[wrapped_idx, offset_idx, first_window],
+                    read_only_args=[
+                        wrapped_group_idx,
+                        offset_group_idx,
+                        local_set_is_zero,
+                    ],
                 )
-                call_idx_for_output = prims.inline_ptx_hl(
+                output_group_idx = prims.inline_ptx_hl(
                     "selp.s32 {$w0}, {$r0}, {$r1}, {$r2};",
                     write_only_types=[Int32],
-                    read_only_args=[wrapped_idx, Int32(logical_call_idx), first_window],
+                    read_only_args=[
+                        wrapped_group_idx,
+                        output_group_idx,
+                        local_set_is_zero,
+                    ],
                 )
-            col_offset = call_idx_for_tmem * epi_t2r_repx
+            if cutlass.const_expr(self.cfg.has_gated_epilogue):
+                col_offset = tmem_group_idx * Int32(
+                    self.cfg.epi_tile_n
+                ) + step_idx * Int32(self.cfg.non_swap_gated_accumulator_cols_per_step)
+                # Keep the output index group-major; GmemC converts each step
+                # to its first TMEM fragment index.
+                output_group_idx = (
+                    output_group_idx * Int32(steps_per_epi_tile) + step_idx
+                )
+            elif cutlass.const_expr(self.cfg.uses_tmem_overlap_window):
+                col_offset += self._epi_local_idx * Int32(
+                    self.cfg.tile_n - self.cfg.epi_tile_n
+                )
             col_id = base_col + self._alloc_c.offset + stage_col_offset + col_offset
             current_addr = ((base_row + row_offset) << 16) | col_id
 
             shape = "32x32b"
             tmem = prims.make_tmem_ptr(current_addr, cutlass.Float32)
             c_rmem = prims.tcgen05_ld(shape, tmem, num=max(1, epi_t2r_repx))
+            if cutlass.const_expr(self.cfg.non_swap_epilogue_fragments_per_group == 2):
+                tmem_1 = prims.make_tmem_ptr(
+                    current_addr + Int32(epi_t2r_repx), cutlass.Float32
+                )
+                t2r_rmem_1 = prims.tcgen05_ld(shape, tmem_1, num=max(1, epi_t2r_repx))
+            else:
+                _, t2r_rmem_1 = self._t2r_default_values()
             prims.tcgen05_wait(kind=prims.Tcgen05Wait.LOAD)
             cute.arch.fence_view_async_tmem_load()
             return (
                 c_rmem,
-                cutlass.vector.full([1], 0.0, cutlass.Float32),
-                call_idx_for_output,
+                t2r_rmem_1,
+                output_group_idx,
             )

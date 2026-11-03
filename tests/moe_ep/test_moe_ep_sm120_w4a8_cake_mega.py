@@ -28,8 +28,9 @@ The device source is parametric (EP world size, experts, top-k, hidden, intermed
 row capacity, shared expert), so the cases cover the DeepSeek-V4-Flash routed layer
 the kernel was tuned on (E=256, H=4096, I=2048, top-k 6) and the routed-expert
 geometries of DeepSeek-V3 (E=256, H=7168, I=2048, top-k 8), Qwen3-235B-A22B
-(E=128, H=4096, I=1536, top-k 8) and Qwen3-30B-A3B (E=128, H=2048, I=768, top-k 8),
-each JIT compiled for the launched world size, plus a ``local3`` case with three
+(E=128, H=4096, I=1536, top-k 8), Qwen3-30B-A3B (E=128, H=2048, I=768, top-k 8) and
+DeepSeek-V4.1-Flash (E=384, H=5120, I=2304, top-k 6), each JIT compiled for the launched
+world size, plus a ``local3`` case with three
 experts per rank (a local expert count that is not a multiple of 4).  The weights are random MXFP4 (FP8
 e4m3 for the shared expert), the activations Gaussian, quantized to FP8 e4m3 with
 UE8M0 block-32 scales.  The SwiGLU clamp is a compile-time parameter
@@ -105,6 +106,7 @@ SHAPES = {
     "dsv3": Shape("dsv3", 7168, 2048, 256, 8),
     "qwen3_235b": Shape("qwen3_235b", 4096, 1536, 128, 8),
     "qwen3_30b": Shape("qwen3_30b", 2048, 768, 128, 8),
+    "v41flash": Shape("v41flash", 5120, 2304, 384, 6),
     "local3": Shape("local3", 4096, 2048, 0, 6, experts_per_rank=3),
 }
 V4FLASH = SHAPES["v4flash"]
@@ -113,7 +115,7 @@ DEFAULT_CASES = (
     "v4flash:noshared,v4flash:fp8shared,dsv3:fp8shared,"
     "qwen3_235b:noshared,qwen3_30b:noshared,"
     "dsv3:noshared:l0,qwen3_235b:fp8shared:l0,qwen3_30b:fp8shared:l0,"
-    "local3:fp8shared"
+    "v41flash:noshared,v41flash:fp8shared,local3:fp8shared"
 )
 # Weight scales 2^-9 .. 2^-6 keep the random-weight W1 outputs O(1), so the
 # SwiGLU clamps stay mostly inactive and the test discriminates the math.

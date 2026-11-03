@@ -143,7 +143,11 @@ main() {
         cuda_major=$(python -c \
             'import torch; v=torch.version.cuda; print(v.split(".")[0] if v else "0")' \
             2>/dev/null || echo 0)
-        if [[ "${TEST_PATH:-}" == *moe_ep* ]] && [ "${cuda_major}" -ge 13 ]; then
+        # Match tests/moe_ep as whole path components: file names such as
+        # tests/experimental/test_cake_mxfp8_megamoe_ep16.py contain "moe_ep"
+        # but do not use this stack.
+        if [[ " ${TEST_PATH:-} " == *[[:space:]/]tests/moe_ep[[:space:]/]* ]] \
+            && [ "${cuda_major}" -ge 13 ]; then
             FI_SRC="$(pwd)" bash docker/install/build_flashinfer_ep_pytorch.sh
             # The installer's exports do not reach this shell. Non-root jobs
             # need the wheel's NCCL library ahead of the image's system copy.

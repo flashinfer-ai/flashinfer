@@ -399,104 +399,102 @@ def test_cake_concat_mla_k_is_cuda_graph_safe(num_tokens: int, dtype: torch.dtyp
         )
 
 
-def test_cake_concat_mla_k_selects_sm100f_on_cc100(monkeypatch):
-    from flashinfer.jit import cake_concat_mla_k
-
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: (10, 0))
-    monkeypatch.setattr(
-        "flashinfer.jit.cpp_ext.is_cuda_version_at_least",
-        lambda version: version == "12.9",
-    )
-
-    assert cake_concat_mla_k.cake_concat_mla_k_target(torch.device("cuda")) == (
-        "sm100f"
-    )
-
-
 @pytest.mark.parametrize(
-    ("target", "target_arch", "expected_compute", "forbidden_compute"),
-    [
-        ("sm100f", (10, "0f"), "compute_100f", "compute_103a"),
-        ("sm103a", (10, "3a"), "compute_103a", "compute_100f"),
-        ("sm107a", (10, "7a"), "compute_107a", "compute_103a"),
-    ],
+    ("capability", "target"),
+    [((10, 0), "sm_100a"), ((10, 3), "sm_103a"), ((10, 7), "sm_107a")],
 )
-def test_cake_concat_mla_k_jit_target_isolated(
-    monkeypatch,
-    target,
-    target_arch,
-    expected_compute,
-    forbidden_compute,
-):
-    from flashinfer.jit import cake_concat_mla_k
-    from flashinfer.jit import core as jit_core
+def test_cake_concat_mla_k_selects_the_exact_target(monkeypatch, capability, target):
+    from flashinfer import concat_ops
 
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: capability)
     monkeypatch.setattr(
-        jit_core.current_compilation_context,
-        "TARGET_CUDA_ARCHS",
-        {target_arch},
+        "flashinfer.jit.cpp_ext.is_cuda_version_at_least", lambda version: True
     )
-    cake_concat_mla_k.gen_cake_concat_mla_k_module.cache_clear()
 
-    spec = cake_concat_mla_k.gen_cake_concat_mla_k_module(target)
+    assert concat_ops.cake_concat_mla_k_target(torch.device("cuda")) == target
 
-    assert f"_{target}_" in spec.name
-    assert any(expected_compute in flag for flag in spec.extra_cuda_cflags)
-    assert not any(forbidden_compute in flag for flag in spec.extra_cuda_cflags)
+
+def test_cake_concat_mla_k_sm_107a_needs_cuda_13(monkeypatch):
+    from flashinfer import concat_ops
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device: (10, 7))
+    monkeypatch.setattr(
+        "flashinfer.jit.cpp_ext.is_cuda_version_at_least", lambda version: False
+    )
+    with pytest.raises(RuntimeError, match="CUDA 13.0"):
+        concat_ops.cake_concat_mla_k_target(torch.device("cuda"))
+
+
+def test_cake_concat_mla_k_programs_ship_their_targets():
+    from flashinfer.jit import cake_program
+    from flashinfer.jit.cake_concat_mla_k import ONE_CTA, PROGRAMS, SPLIT
+
+    assert PROGRAMS == (ONE_CTA, SPLIT)
+    assert ONE_CTA.targets == ("sm_100a", "sm_103a", "sm_107a")
+    assert SPLIT.targets == ("sm_107a",)
+    for program in PROGRAMS:
+        for target in program.targets:
+            flags = program.spec(target).extra_cuda_cflags
+            assert all(flag in flags for flag in cake_program.TARGET_FLAGS[target])
+    kernel_sources = {
+        program: next(
+            path for path in program.source_paths() if path.name.endswith("_kernel.cu")
+        )
+        for program in PROGRAMS
+    }
+    assert "gridDim.y" in kernel_sources[SPLIT].read_text()
+    assert "gridDim.y" not in kernel_sources[ONE_CTA].read_text()
 
 
 @pytest.mark.parametrize(
     ("tokens", "element_bytes", "target", "expected"),
     [
-        (1, 2, "sm107a", 2),
-        (2, 1, "sm107a", 2),
-        (2, 2, "sm107a", 6),
-        (70, 2, "sm107a", 6),
-        (71, 2, "sm107a", 3),
-        (141, 2, "sm107a", 3),
-        (142, 2, "sm107a", 2),
-        (213, 2, "sm107a", 1),
-        (4096, 2, "sm107a", 1),
-        (2, 2, "sm103a", 1),
-        (2, 2, "sm100f", 1),
+        (1, 2, "sm_107a", 2),
+        (2, 1, "sm_107a", 2),
+        (2, 2, "sm_107a", 6),
+        (70, 2, "sm_107a", 6),
+        (71, 2, "sm_107a", 3),
+        (141, 2, "sm_107a", 3),
+        (142, 2, "sm_107a", 2),
+        (213, 2, "sm_107a", 1),
+        (4096, 2, "sm_107a", 1),
+        (0, 2, "sm_107a", 1),
+        (2, 2, "sm_103a", 1),
+        (2, 2, "sm_100a", 1),
     ],
 )
 def test_cake_concat_mla_k_split_rule(tokens, element_bytes, target, expected):
-    from flashinfer.jit import cake_concat_mla_k
+    from flashinfer import concat_ops
 
     assert (
-        cake_concat_mla_k.cake_concat_mla_k_split_ctas(tokens, element_bytes, target)
+        concat_ops.cake_concat_mla_k_split_ctas(tokens, element_bytes, target)
         == expected
     )
+    if tokens:
+        window = concat_ops.cake_concat_mla_k_tokens_per_cta(element_bytes)
+        assert concat_ops.cake_concat_mla_k_grid(tokens, element_bytes, target) == (
+            (tokens + window - 1) // window,
+            expected,
+            1,
+        )
 
 
-def test_cake_concat_mla_k_modules_are_selected_per_target():
-    from flashinfer.jit import cake_concat_mla_k
+def test_cake_concat_mla_k_programs_are_selected_per_target():
+    from flashinfer import concat_ops
+    from flashinfer.jit.cake_concat_mla_k import ONE_CTA, SPLIT
 
-    spec = cake_concat_mla_k.get_cake_concat_mla_k_module_spec()
-    assert set(spec.modules) == {"sm_103a", "sm_107a"}
-    shared = spec.module_for("sm103a")
-    assert spec.module_for("sm100f") is shared
-    assert spec.module_for("sm103a", 6) is shared
-    # The split module serves only launches with grid_y > 1 on the split arch.
-    assert spec.module_for("sm107a") is shared
-    assert spec.module_for("sm107a", 1) is shared
-    split = spec.module_for("sm107a", 2)
-    assert spec.module_for("sm107a", 6) is split
-    assert split is not shared and split.module_ident != shared.module_ident
-    assert split.device_path != shared.device_path
-    assert "gridDim.y" in split.device_path.read_text()
-    assert "gridDim.y" not in shared.device_path.read_text()
-    assert cake_concat_mla_k.get_cake_concat_mla_k_uri("sm103a").startswith(
-        shared.module_ident
-    )
-    assert cake_concat_mla_k.get_cake_concat_mla_k_uri("sm107a").startswith(
-        shared.module_ident
-    )
-    assert cake_concat_mla_k.get_cake_concat_mla_k_uri("sm107a", split=True).startswith(
-        split.module_ident
-    )
-    assert spec.split_rule["module"].startswith("split module when split_ctas > 1")
+    assert concat_ops.cake_concat_mla_k_tokens_per_cta(1) == 2
+    assert concat_ops.cake_concat_mla_k_tokens_per_cta(2) == 1
+    with pytest.raises(ValueError):
+        concat_ops.cake_concat_mla_k_tokens_per_cta(4)
+    with pytest.raises(ValueError):
+        concat_ops.cake_concat_mla_k_split_ctas(2, 2, "sm100f")
+    assert concat_ops._cake_program("sm_100a", 1) is ONE_CTA
+    assert concat_ops._cake_program("sm_103a", 1) is ONE_CTA
+    # The split program serves only launches with grid_y > 1 on the split target.
+    assert concat_ops._cake_program("sm_107a", 1) is ONE_CTA
+    assert concat_ops._cake_program("sm_107a", 2) is SPLIT
+    assert concat_ops._cake_program("sm_107a", 6) is SPLIT
 
 
 def test_cake_concat_mla_k_rejects_unsupported_arch(monkeypatch):

@@ -35,12 +35,25 @@ from .batched_gemm_config import (
     BatchedGemmConfig,
     SfLayout,
     SfSmemToTmemCopy,
+    sfb_r128c4_utccp_offsets,
     TMEM_SF_UTCCP_COLS_PER_COPY,
     TMEM_SF_PACK_SIZE_BYTES,
 )
 from cutlass.experimental import primitives as prims
 
+from .batched_gemm_cga import has_multiple_umma_atoms
+from .mixed_cga_ts import override_umma_atom_pipeline
+
 Constexpr = cutlass.Constexpr
+
+
+@cute.jit
+def _is_umma_atom_leader(cfg: Constexpr[BatchedGemmConfig]):
+    """Select the leader of each runtime 2-CTA UMMA atom."""
+    cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+    if cutlass.const_expr(has_multiple_umma_atoms(cfg)):
+        return (cta_rank & Int32(1)) == Int32(0)
+    return cta_rank == Int32(0)
 
 
 @dataclass(kw_only=True)
@@ -55,11 +68,20 @@ class TmemSfAResource(MemoryResource):
         TaskLocalVariable.uninitialized()
     )
 
+    def create_pipeline(self, pipeline_config):
+        result = super().create_pipeline(pipeline_config)
+        if has_multiple_umma_atoms(self.cfg):
+            return override_umma_atom_pipeline(result)
+        return result
+
     def __post_init__(self):
         if self._alloc_sfa is None:
             stage_mult = (
                 self.cfg.num_stages_tmem_sfa
-                if self.cfg.uses_unfused_tmem_sf_copy
+                if (
+                    self.cfg.has_input_block_scaling
+                    and not self.cfg.fuse_sf_copy_to_mma
+                )
                 else 1
             )
             self._alloc_sfa = TmemAllocation(
@@ -103,14 +125,15 @@ class TmemSfAResource(MemoryResource):
         smem_sfa_stage_ptr: Int64,
     ) -> None:
         """S2T copy SFA from SMEM to TMEM via tcgen05_cp."""
+        del smem_sfa_stage_ptr
         desc_s2t_base = desc_a_s2t_base
         sf_stage_col_offset = stage_info.stage_idx * self.cfg.tmem_sfa_cols
         s2t_shape, s2t_multicast = prims.S2TCopyMode.S2T_32x128b_WARPX4
         num_s2t_iters = self.cfg.tmem_sfa_cols // TMEM_SF_UTCCP_COLS_PER_COPY
 
         do_copy = cutlass.Boolean(True)
-        if cutlass.const_expr(self.cfg.has_routed_sfs and self.cfg.has_cluster):
-            do_copy = self.cta_rank == Int32(0)
+        if cutlass.const_expr(self.cfg.has_routed_sfs and self.cfg.uses_two_cta_mma):
+            do_copy = _is_umma_atom_leader(self.cfg)
         if do_copy:
             for s2t_idx in cutlass.range_constexpr(num_s2t_iters):
                 tmem_addr = (
@@ -148,11 +171,20 @@ class TmemSfBResource(MemoryResource):
         TaskLocalVariable.uninitialized()
     )
 
+    def create_pipeline(self, pipeline_config):
+        result = super().create_pipeline(pipeline_config)
+        if has_multiple_umma_atoms(self.cfg):
+            return override_umma_atom_pipeline(result)
+        return result
+
     def __post_init__(self):
         if self._alloc_sfb is None:
             stage_mult = (
                 self.cfg.num_stages_tmem_sfb
-                if self.cfg.uses_unfused_tmem_sf_copy
+                if (
+                    self.cfg.has_input_block_scaling
+                    and not self.cfg.fuse_sf_copy_to_mma
+                )
                 else 1
             )
             self._alloc_sfb = TmemAllocation(
@@ -192,34 +224,46 @@ class TmemSfBResource(MemoryResource):
         stage_info: StageInfo,
         *,
         desc_b_s2t_base: prims.Tcgen05SmemDesc,
+        smem_sfb_stage_ptr: Int64,
     ) -> None:
         """S2T copy SFB from SMEM to TMEM via tcgen05_cp."""
+        del smem_sfb_stage_ptr
         desc_s2t_base = desc_b_s2t_base
         sf_stage_col_offset = stage_info.stage_idx * self.cfg.tmem_sfb_cols
         s2t_shape, s2t_multicast = prims.S2TCopyMode.S2T_32x128b_WARPX4
         num_s2t_iters = self.cfg.tmem_sfb_cols // TMEM_SF_UTCCP_COLS_PER_COPY
 
         do_copy = cutlass.Boolean(True)
-        if cutlass.const_expr(self.cfg.has_routed_sfs and self.cfg.has_cluster):
-            cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
-            do_copy = cta_rank == Int32(0)
+        if cutlass.const_expr(self.cfg.has_routed_sfs and self.cfg.uses_two_cta_mma):
+            do_copy = _is_umma_atom_leader(self.cfg)
         if do_copy:
             for s2t_idx in cutlass.range_constexpr(num_s2t_iters):
-                tmem_addr = (
-                    self.sfb_tmem_addr_base
-                    + sf_stage_col_offset
-                    + s2t_idx * TMEM_SF_UTCCP_COLS_PER_COPY
-                )
+                if cutlass.const_expr(self.cfg.uses_n_major_r128c4_sfb_utccp):
+                    num_utccp_k = (
+                        self.cfg.tile_k
+                        // self.cfg.input_sf_block_size_b
+                        // TMEM_SF_PACK_SIZE_BYTES
+                    )
+                    assert num_s2t_iters == (self.cfg.tile_n // 128) * num_utccp_k, (
+                        "R128c4 SFB UTCCP copies must cover every (N block, K group)"
+                    )
+                    increment, tmem_delta = sfb_r128c4_utccp_offsets(self.cfg, s2t_idx)
+                else:
+                    tmem_delta = s2t_idx * TMEM_SF_UTCCP_COLS_PER_COPY
+                    # R128c4 stores each 128-row block's K groups contiguously,
+                    # whereas TMEM interleaves row blocks within each K group.
+                    # Descriptor address units are 16 bytes; one copy is 512 B.
+                    row_blocks = (self.cfg.tile_n + 127) // 128
+                    k_groups = (
+                        self.cfg.tile_k
+                        // self.cfg.input_sf_block_size_b
+                        // TMEM_SF_PACK_SIZE_BYTES
+                    )
+                    increment = 32 * (
+                        s2t_idx // row_blocks + k_groups * (s2t_idx % row_blocks)
+                    )
+                tmem_addr = self.sfb_tmem_addr_base + sf_stage_col_offset + tmem_delta
                 tmem_ptr = prims.make_tmem_ptr(tmem_addr, cutlass.Int32)
-                # SFB increment pattern differs from SFA (interleaved)
-                # R128c4 stores each 128-row block's K groups contiguously,
-                # whereas TMEM interleaves row blocks within each K group.
-                # Descriptor address units are 16 bytes; one copy is 512 B.
-                row_blocks = (self.cfg.tile_n + 127) // 128
-                k_groups = self.cfg.tile_k // self.cfg.input_sf_block_size_b // 4
-                increment = 32 * (
-                    s2t_idx // row_blocks + k_groups * (s2t_idx % row_blocks)
-                )
                 desc_s2t = desc_s2t_base + increment
                 if prims.elect_sync():
                     prims.tcgen05_cp(
@@ -251,6 +295,12 @@ class TmemSfABResource(MemoryResource):
     sfb_stage_col_offset: Constexpr[TaskLocalVariable] = (
         TaskLocalVariable.uninitialized()
     )
+
+    def create_pipeline(self, pipeline_config):
+        result = super().create_pipeline(pipeline_config)
+        if has_multiple_umma_atoms(self.cfg):
+            return override_umma_atom_pipeline(result)
+        return result
 
     def __post_init__(self):
         if self._alloc_sfab is None:
@@ -300,15 +350,16 @@ class TmemSfABResource(MemoryResource):
         desc_a_s2t_base: prims.Tcgen05SmemDesc,
         smem_sfa_stage_ptr: Int64,
         desc_b_s2t_base: prims.Tcgen05SmemDesc,
+        smem_sfb_stage_ptr: Int64,
     ) -> None:
         """Copy both SFA and SFB stages through one generated-style pipeline."""
+        del smem_sfa_stage_ptr, smem_sfb_stage_ptr
         sfa_stage_col_offset = stage_info.stage_idx * self.cfg.tmem_sfa_cols
         sfb_stage_col_offset = stage_info.stage_idx * self.cfg.tmem_sfb_cols
         sfb_base_col = self.cfg.tmem_sfa_cols * self.cfg.num_stages_tmem_sfa
         s2t_shape, s2t_multicast = prims.S2TCopyMode.S2T_32x128b_WARPX4
 
-        cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
-        if cta_rank == Int32(0):
+        if _is_umma_atom_leader(self.cfg):
             for s2t_idx in cutlass.range_constexpr(
                 self.cfg.tmem_sfa_cols // TMEM_SF_UTCCP_COLS_PER_COPY
             ):
@@ -331,14 +382,30 @@ class TmemSfABResource(MemoryResource):
             for s2t_idx in cutlass.range_constexpr(
                 self.cfg.tmem_sfb_cols // TMEM_SF_UTCCP_COLS_PER_COPY
             ):
+                if cutlass.const_expr(self.cfg.uses_n_major_r128c4_sfb_utccp):
+                    num_sfb_iters = (
+                        self.cfg.tmem_sfb_cols // TMEM_SF_UTCCP_COLS_PER_COPY
+                    )
+                    num_utccp_k = (
+                        self.cfg.tile_k
+                        // self.cfg.input_sf_block_size_b
+                        // TMEM_SF_PACK_SIZE_BYTES
+                    )
+                    assert num_sfb_iters == (self.cfg.tile_n // 128) * num_utccp_k, (
+                        "R128c4 SFB UTCCP copies must cover every (N block, K group)"
+                    )
+                    increment, tmem_delta = sfb_r128c4_utccp_offsets(self.cfg, s2t_idx)
+                else:
+                    increment = 32 * s2t_idx
+                    tmem_delta = s2t_idx * TMEM_SF_UTCCP_COLS_PER_COPY
                 tmem_addr = (
                     self.sfab_tmem_addr_base
                     + sfb_base_col
                     + sfb_stage_col_offset
-                    + s2t_idx * TMEM_SF_UTCCP_COLS_PER_COPY
+                    + tmem_delta
                 )
                 tmem_ptr = prims.make_tmem_ptr(tmem_addr, cutlass.Int32)
-                desc_s2t = desc_b_s2t_base + 32 * s2t_idx
+                desc_s2t = desc_b_s2t_base + increment
                 if prims.elect_sync():
                     prims.tcgen05_cp(
                         s2t_shape,
@@ -384,6 +451,12 @@ class TmemSfRouteResource(MemoryResource):
         TaskLocalVariable.uninitialized()
     )
 
+    def create_pipeline(self, pipeline_config):
+        result = super().create_pipeline(pipeline_config)
+        if has_multiple_umma_atoms(self.cfg):
+            return override_umma_atom_pipeline(result)
+        return result
+
     def __post_init__(self):
         if self._alloc_sf is None:
             is_b = self._operand == "b"
@@ -426,7 +499,9 @@ class TmemSfRouteResource(MemoryResource):
         self._setup_common(stage_info.context)
 
     @cute.jit
-    def _producer_work_impl(self, stage_info: StageInfo, desc_s2t_base) -> None:
+    def _producer_work_impl(
+        self, stage_info: StageInfo, desc_s2t_base, smem_stage_ptr: Int64
+    ) -> None:
         """Copy SF from SMEM to TMEM with the generated layout."""
         is_b = cutlass.const_expr(self._operand == "b")
         smem_layout = self.cfg.smem_sfb_layout if is_b else self.cfg.smem_sfa_layout
@@ -440,15 +515,8 @@ class TmemSfRouteResource(MemoryResource):
         if cutlass.const_expr(use_sttm):
             # Uses LDS+STTM for non-R128c4 SF SMEM layouts.
             # LINEAR uses the uint128 gather4 layout; R8c4 uses the compact
-            # uint32 8-row-block layout.
-            bytes_per_stage = (
-                self.cfg.num_bytes_sfb_per_stage
-                if is_b
-                else self.cfg.num_bytes_sfa_per_stage
-            )
-            stage_base = self.smem_sf_resource.smem_buf.subview(
-                bytes_per_stage * stage_info.stage_idx
-            )
+            # uint32 8-row-block layout. The SMEM stage pointer comes from the
+            # SMEM ring; stage_info belongs to the independently sized TMEM ring.
             sf_block_size = (
                 self.cfg.input_sf_block_size_b
                 if is_b
@@ -459,6 +527,8 @@ class TmemSfRouteResource(MemoryResource):
             source_slices = (tile_rows + 31) // 32
             sf_operand = "b" if is_b else "a"
             col_stride = self.cfg.tmem_sf_col_stride(sf_operand)
+            vec4_groups_per_mma = self.cfg.tmem_sf_vec4_groups_per_mma(sf_operand)
+            inner_group_stride = 8 if self.cfg.tile_n > 128 else 4
             tidx, _, _ = cute.arch.thread_idx()
             lane_id = tidx % Int32(32)
             if cutlass.const_expr(smem_layout == int(SfLayout.R8c4)):
@@ -474,20 +544,23 @@ class TmemSfRouteResource(MemoryResource):
                         smem_word_offset = (
                             sf_tile_idx * Int32(8) + local_vec_idx
                         ) * Int32(TMEM_SF_PACK_SIZE_BYTES)
-                        smem_word = cutlass.Array(
-                            stage_base.data_ptr() + smem_word_offset,
-                            dtype=cutlass.Int32,
-                            shape=(1,),
-                            addrspace=3,
+                        smem_word = cutlass.inttoptr(
+                            smem_stage_ptr + Int64(smem_word_offset),
+                            3,
+                            cutlass.Int32,
                         )
                         sf_val = Int32(0)
                         if source_lane < Int32(tile_rows):
                             sf_val = smem_word.load()
                         src_vals.append(sf_val)
+                    group_idx = sttm_idx // vec4_groups_per_mma
+                    vec4_in_group = sttm_idx % vec4_groups_per_mma
                     tmem_addr = (
                         self.sf_tmem_addr_base
                         + sf_stage_col_offset
-                        + Int32(sttm_idx * col_stride)
+                        + Int32(
+                            group_idx * col_stride + vec4_in_group * inner_group_stride
+                        )
                     )
                     tmem_ptr = prims.make_tmem_ptr(tmem_addr, cutlass.Int32)
                     if cutlass.const_expr(source_slices == 6):
@@ -543,11 +616,10 @@ class TmemSfRouteResource(MemoryResource):
                             + lane_id * Int32(16)
                             + Int32(quadrant * 4)
                         )
-                        smem_word = cutlass.Array(
-                            stage_base.data_ptr() + smem_word_offset,
-                            dtype=cutlass.Int32,
-                            shape=(1,),
-                            addrspace=3,
+                        smem_word = cutlass.inttoptr(
+                            smem_stage_ptr + Int64(smem_word_offset),
+                            3,
+                            cutlass.Int32,
                         )
                         src_vals.append(smem_word.load())
                     tmem_addr = (
@@ -574,60 +646,70 @@ class TmemSfRouteResource(MemoryResource):
                         ),
                     )
             elif cutlass.const_expr(smem_layout == int(SfLayout.LINEAR)):
-                num_vec4 = sf_k // TMEM_SF_PACK_SIZE_BYTES
-                num_groups_per_16sf = 16 // TMEM_SF_PACK_SIZE_BYTES
-                vec16_per_row = num_vec4 // num_groups_per_16sf
+                num_groups_per_16sf = 4 // vec4_groups_per_mma
+                # One uint128 holds 16 SFs (4 vec4 words) regardless of how
+                # many vec4 words share an MMA scale base.
+                vec16_per_row = sf_k // 16
                 for vec16_idx in cutlass.range_constexpr(vec16_per_row):
                     for group_in_vec16 in cutlass.range_constexpr(num_groups_per_16sf):
-                        word_idx = group_in_vec16
-                        src_vals = []
-                        for source_slice in cutlass.range_constexpr(source_slices):
-                            source_lane = lane_id + Int32(32 * source_slice)
-                            raw_vec_idx = source_lane * Int32(vec16_per_row) + Int32(
-                                vec16_idx
+                        for vec4_in_group in cutlass.range_constexpr(
+                            vec4_groups_per_mma
+                        ):
+                            word_idx = (
+                                group_in_vec16 * vec4_groups_per_mma + vec4_in_group
                             )
-                            if cutlass.const_expr(vec16_per_row > 1):
-                                rows_per_swizzle = 8 // vec16_per_row
-                                smem_row_idx = source_lane // Int32(rows_per_swizzle)
-                                xor_mask = smem_row_idx % Int32(vec16_per_row)
-                                vec_idx = raw_vec_idx ^ xor_mask
-                            else:
-                                vec_idx = source_lane // Int32(
-                                    TMEM_SF_PACK_SIZE_BYTES
-                                ) * Int32(8) + source_lane % Int32(
-                                    TMEM_SF_PACK_SIZE_BYTES
+                            src_vals = []
+                            for source_slice in cutlass.range_constexpr(source_slices):
+                                source_lane = lane_id + Int32(32 * source_slice)
+                                raw_vec_idx = source_lane * Int32(
+                                    vec16_per_row
+                                ) + Int32(vec16_idx)
+                                if cutlass.const_expr(vec16_per_row > 1):
+                                    rows_per_swizzle = 8 // vec16_per_row
+                                    smem_row_idx = source_lane // Int32(
+                                        rows_per_swizzle
+                                    )
+                                    xor_mask = smem_row_idx % Int32(vec16_per_row)
+                                    vec_idx = raw_vec_idx ^ xor_mask
+                                else:
+                                    vec_idx = source_lane // Int32(
+                                        TMEM_SF_PACK_SIZE_BYTES
+                                    ) * Int32(8) + source_lane % Int32(
+                                        TMEM_SF_PACK_SIZE_BYTES
+                                    )
+                                smem_word_offset = vec_idx * Int32(16) + Int32(
+                                    word_idx * TMEM_SF_PACK_SIZE_BYTES
                                 )
-                            smem_word_offset = vec_idx * Int32(16) + Int32(
-                                word_idx * TMEM_SF_PACK_SIZE_BYTES
+                                smem_word = cutlass.inttoptr(
+                                    smem_stage_ptr + Int64(smem_word_offset),
+                                    3,
+                                    cutlass.Int32,
+                                )
+                                sf_val = Int32(0)
+                                if source_lane < Int32(tile_rows):
+                                    sf_val = smem_word.load()
+                                src_vals.append(sf_val)
+                            group_idx = vec16_idx * num_groups_per_16sf + group_in_vec16
+                            tmem_addr = (
+                                self.sf_tmem_addr_base
+                                + sf_stage_col_offset
+                                + Int32(
+                                    group_idx * col_stride
+                                    + vec4_in_group * inner_group_stride
+                                )
                             )
-                            smem_word = cutlass.Array(
-                                stage_base.data_ptr() + smem_word_offset,
-                                dtype=cutlass.Int32,
-                                shape=(1,),
-                                addrspace=3,
+                            tmem_ptr = prims.make_tmem_ptr(tmem_addr, cutlass.Int32)
+                            if cutlass.const_expr(source_slices == 1):
+                                src = src_vals[0]
+                            else:
+                                src = cutlass.Vector.from_elements(
+                                    tuple(src_vals), dtype=cutlass.Int32
+                                )
+                            prims.tcgen05_st(
+                                "32x32b",
+                                tmem_ptr,
+                                src,
                             )
-                            sf_val = Int32(0)
-                            if source_lane < Int32(tile_rows):
-                                sf_val = smem_word.load()
-                            src_vals.append(sf_val)
-                        group_idx = vec16_idx * num_groups_per_16sf + group_in_vec16
-                        tmem_addr = (
-                            self.sf_tmem_addr_base
-                            + sf_stage_col_offset
-                            + Int32(col_stride * group_idx)
-                        )
-                        tmem_ptr = prims.make_tmem_ptr(tmem_addr, cutlass.Int32)
-                        if cutlass.const_expr(source_slices == 1):
-                            src = src_vals[0]
-                        else:
-                            src = cutlass.Vector.from_elements(
-                                tuple(src_vals), dtype=cutlass.Int32
-                            )
-                        prims.tcgen05_st(
-                            "32x32b",
-                            tmem_ptr,
-                            src,
-                        )
             else:
                 raise AssertionError(
                     f"Unsupported LDS+STTM SMEM SF layout: {smem_layout}"
@@ -638,8 +720,7 @@ class TmemSfRouteResource(MemoryResource):
         else:
             s2t_shape, s2t_multicast = prims.S2TCopyMode.S2T_32x128b_WARPX4
             num_s2t_iters = cols_per_stage // TMEM_SF_UTCCP_COLS_PER_COPY
-            cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
-            if cta_rank == Int32(0):
+            if _is_umma_atom_leader(self.cfg):
                 for s2t_idx in cutlass.range_constexpr(num_s2t_iters):
                     tmem_addr = (
                         self.sf_tmem_addr_base
@@ -683,7 +764,7 @@ class TmemSfRouteAResource(TmemSfRouteResource):
         desc_a_s2t_base: prims.Tcgen05SmemDesc,
         smem_sfa_stage_ptr: Int64,
     ) -> None:
-        self._producer_work_impl(stage_info, desc_a_s2t_base)
+        self._producer_work_impl(stage_info, desc_a_s2t_base, smem_sfa_stage_ptr)
 
     @consumer_work(returns=TmemSfRouteResource.sfa_stage_col_offset)
     @cute.jit
@@ -704,8 +785,9 @@ class TmemSfRouteBResource(TmemSfRouteResource):
         stage_info: StageInfo,
         *,
         desc_b_s2t_base: prims.Tcgen05SmemDesc,
+        smem_sfb_stage_ptr: Int64,
     ) -> None:
-        self._producer_work_impl(stage_info, desc_b_s2t_base)
+        self._producer_work_impl(stage_info, desc_b_s2t_base, smem_sfb_stage_ptr)
 
     @consumer_work(returns=TmemSfRouteResource.sfb_stage_col_offset)
     @cute.jit
@@ -726,6 +808,12 @@ class TmemCastAResource(MemoryResource):
     cast_a_tmem_addr_base: Any = None
     _alloc_cast_a: Constexpr[Optional[TmemAllocation]] = None
     tmem_cast_a_addr: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
+
+    def create_pipeline(self, pipeline_config):
+        result = super().create_pipeline(pipeline_config)
+        if has_multiple_umma_atoms(self.cfg):
+            return override_umma_atom_pipeline(result)
+        return result
 
     def __post_init__(self):
         if self._alloc_cast_a is None:
@@ -878,7 +966,7 @@ class TmemCastAResource(MemoryResource):
         smem_a_ptr = smem_a_stage_ptr
         smem_sfa_ptr = smem_sfa_stage_ptr
         tidx, _, _ = cute.arch.thread_idx()
-        local_thread = tidx % Int32(self.cfg.num_cast_a_warps * 32)
+        local_thread = tidx % Int32(self.cfg.warp_layout.num_cast_a_warps * 32)
         stage_col_offset = stage_info.stage_idx * self.cfg.tmem_cast_a_cols
         sf_word0 = self._load_cast_sfa_word(smem_sfa_ptr, local_thread, 0)
         sf_word1 = self._load_cast_sfa_word(smem_sfa_ptr, local_thread, 1)

@@ -53,7 +53,11 @@ Enable Cake CP explicitly with
 ``chunk_gated_delta_rule(..., backend="cake_gdn", use_cp=True)``.
 ``backend="auto"`` and ``backend="flashinfer"`` keep the existing FlashInfer
 CP routing. With ``backend="cake_gdn"``, ``use_cp=False`` or ``"auto"``
-continues to select the non-CP Cake backend.
+continues to select the non-CP Cake backend.  On SM107a, ``"auto"`` with BF16
+inputs and FP32 initial and final state raises ``CakeGDNUnsupportedError``
+when the longest sequence has at least 8192 tokens and ``num_seqs * num_heads``
+is at most 32, or at least 4096 tokens and at most 8: the default backend is
+faster there.
 
 The Cake GDN CP backend covers the complete legal public context-parallel input
 domain on SM100a/SM103a/SM107a.  It preserves ``T precompute -> MN

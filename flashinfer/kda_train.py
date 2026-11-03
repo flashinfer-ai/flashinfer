@@ -13,260 +13,123 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Packed KDA (Kimi Delta Attention) chunked training forward and backward
-(SM100 / SM103 / SM107), the Cake backend.
+Packed KDA (Kimi Delta Attention) chunked training (SM100 / SM103 / SM107), the Cake backend: the
+context-parallel (KCP) entry points, and the single-rank entry points under their previous names.
 
-Thin experimental entry points.  The contract, the host plan, the workspace,
-the launch sequences, the autograd Function and the generated kernels live in
-``flashinfer.experimental.cake_kda_train``; this module validates nothing
-itself and forwards every keyword.  Every switch is a keyword argument; no
-environment variable is read.
+The single-rank entry points live in ``flashinfer.cake_kda_det_train`` (``chunk_kda_det_fwd``,
+``chunk_kda_det_bwd``, ``chunk_kda_det``, ``kda_det_train_arena``, ``kda_det_train_workspace``,
+``kda_det_train_workspace_bytes``, ``kda_det_train_saved_bytes``, ``is_kda_det_train_supported``,
+``DEFAULT_SCALE``).  This module binds their previous names (``chunk_kda_fwd``, ``chunk_kda_bwd``,
+``chunk_kda``, ``kda_train_arena``, ``kda_train_workspace``, ``kda_train_workspace_bytes``,
+``kda_train_saved_bytes``, ``is_kda_train_supported``) to the same objects.  The host plan, the
+workspace, the launch sequences, the autograd Functions and the generated kernels live in
+``flashinfer.experimental.cake_kda_det_train``.
 
-Operands (one packed batch of documents): ``q, k, v`` BF16 ``[1, S, H, 128]``
-(``q`` / ``k`` L2-normalized by the caller), ``g`` FP32 ``[1, S, H, 128]`` (the
-natural-log decay gate, preactivated), ``beta`` BF16 ``[1, S, H]`` (through
-the sigmoid), ``cu_seqlens`` int32 ``[num_docs + 1]`` on the device.  The
-batch axis of 1 is optional; outputs take the rank of the inputs.  Gradients:
-``dq, dk, dv, dbeta`` BF16, ``dg`` FP32.  Per-document zero initial state, no
-final state, ``scale = 128 ** -0.5`` by default, ``H`` in ``1..64``.
+Context-parallel training (KCP) lives in ``flashinfer.cake_kda_det_train_kcp``.  This module binds
+the names the KCP entry points and types had before to the same objects:
 
-Usage::
-
-    from flashinfer.kda_train import chunk_kda, chunk_kda_fwd, chunk_kda_bwd
-
-    out = chunk_kda(q, k, v, g, beta, cu_seqlens)                  # autograd
-    out, saved = chunk_kda_fwd(q, k, v, g, beta, cu_seqlens, save_for_backward=True)
-    dq, dk, dv, dbeta, dg = chunk_kda_bwd(q, k, v, g, beta, cu_seqlens, dout, saved=saved)
-    dq, dk, dv, dbeta, dg = chunk_kda_bwd(q, k, v, g, beta, cu_seqlens, dout)  # checkpoint replay
-
-    ws = kda_train_workspace(S, num_docs, H, device)               # caller-owned, reused
-    out, saved = chunk_kda_fwd(q, k, v, g, beta, cu_seqlens, workspace=ws)
-    ws = kda_train_workspace(S, num_docs, H, device, save_mode="tape")   # saved set v2: the backward
-    out, saved = chunk_kda_fwd(q, k, v, g, beta, cu_seqlens, workspace=ws)  # skips its recurrence recompute
+======================================  =======================================
+previous name                           det name
+======================================  =======================================
+``kcp_partition``                       ``partition_det_kcp``
+``build_kcp_context``                   ``build_context_det_kcp``
+``chunk_kda_kcp``                       ``chunk_kda_det_kcp``
+``chunk_kda_kcp_fwd``                   ``chunk_kda_det_fwd_kcp``
+``chunk_kda_kcp_bwd``                   ``chunk_kda_det_bwd_kcp``
+``kcp_workspace_bytes``                 ``kda_det_workspace_bytes_kcp``
+``kcp_saved_bytes``                     ``kda_det_saved_bytes_kcp``
+``kcp_comm_bytes``                      ``kda_det_comm_bytes_kcp``
+``kcp_reduce_gate_param_grads``         ``reduce_gate_param_grads_det_kcp``
+``KcpContext``                          ``ContextDetKcp``
+``KcpOptions``                          ``OptionsDetKcp``
+``KcpPartition``                        ``PartitionDetKcp``
+``KcpRecomputeHandle``                  ``RecomputeHandleDetKcp``
+``KcpSaved``                            ``SavedDetKcp``
+``KcpWorkspace``                        ``WorkspaceDetKcp``
+======================================  =======================================
 """
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any
 
-import torch
+from . import cake_kda_det_train_kcp as _kcp
+from .cake_kda_det_train import (
+    DEFAULT_SCALE,
+    chunk_kda_det,
+    chunk_kda_det_bwd,
+    chunk_kda_det_fwd,
+    is_kda_det_train_supported,
+    kda_det_train_arena,
+    kda_det_train_saved_bytes,
+    kda_det_train_workspace,
+    kda_det_train_workspace_bytes,
+)
 
-from .api_logging import flashinfer_experimental_api
-
-_FEATURE = "Cake packed KDA chunked training (SM100/SM103/SM107)"
-
-# The default scale of the GLM contract: ``head_dim ** -0.5`` with head dimension 128.
-DEFAULT_SCALE = 128**-0.5
-
-
-@flashinfer_experimental_api(feature=_FEATURE)
-def chunk_kda_fwd(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
-    cu_seqlens: torch.Tensor,
-    *,
-    scale: Optional[float] = None,
-    save_for_backward: bool = True,
-    workspace: Optional[Any] = None,
-    save_mode: Optional[str] = None,
-) -> tuple[torch.Tensor, Optional[Any]]:
-    r"""Packed KDA chunked training forward.
-
-    Parameters
-    ----------
-    q, k, v : torch.Tensor
-        BF16 ``[1, S, H, 128]`` (or ``[S, H, 128]``), contiguous.
-    g : torch.Tensor
-        FP32 ``[1, S, H, 128]`` natural-log decay gate.
-    beta : torch.Tensor
-        BF16 ``[1, S, H]`` delta-rule gate after the sigmoid.
-    cu_seqlens : torch.Tensor
-        int32 ``[num_docs + 1]`` document offsets on the device (first 0, last ``S``).
-    scale : float, optional
-        Output scale; ``128 ** -0.5`` when ``None``.
-    save_for_backward : bool
-        Write the saved set (``Aqk`` / ``Akk`` on the token rows plus the device chunk tables).
-    workspace : KdaWorkspace, optional
-        A reused workspace from :func:`kda_train_workspace`; without one this call allocates its own.
-    save_mode : str, optional
-        ``"light"`` (saved set version 1: ``Aqk`` / ``Akk`` and the tables, 256 B per token-head) or ``"tape"``
-        (version 2: also the forward's state tape and ``v_new``, 768 B more per token-head, so the backward skips
-        its recurrence recompute); ``None`` takes the workspace's default (``"light"`` without one).
-
-    Returns
-    -------
-    ``(out, saved)``: ``out`` BF16 like ``v``; ``saved`` a ``KdaChunkSaved`` (versioned) or ``None``.
-    """
-    from .experimental.cake_kda_train import cake_backend
-
-    return cake_backend.chunk_kda_fwd(
-        q,
-        k,
-        v,
-        g,
-        beta,
-        cu_seqlens,
-        scale=DEFAULT_SCALE if scale is None else scale,
-        save_for_backward=save_for_backward,
-        workspace=workspace,
-        save_mode=save_mode,
-    )
+# The single-rank entry points under their previous names: the same objects as the det names.
+chunk_kda_fwd = chunk_kda_det_fwd
+chunk_kda_bwd = chunk_kda_det_bwd
+chunk_kda = chunk_kda_det
+kda_train_arena = kda_det_train_arena
+kda_train_workspace = kda_det_train_workspace
+kda_train_workspace_bytes = kda_det_train_workspace_bytes
+kda_train_saved_bytes = kda_det_train_saved_bytes
+is_kda_train_supported = is_kda_det_train_supported
 
 
-@flashinfer_experimental_api(feature=_FEATURE)
-def chunk_kda_bwd(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
-    cu_seqlens: torch.Tensor,
-    dout: torch.Tensor,
-    *,
-    saved: Optional[Any] = None,
-    scale: Optional[float] = None,
-    workspace: Optional[Any] = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    r"""Packed KDA chunked training backward.
+# --------------------------------------------------------------------------- context-parallel training (KCP)
+#
+# The KCP entry points under their previous names: the same objects as those of ``flashinfer.cake_kda_det_train_kcp``.
+kcp_partition = _kcp.partition_det_kcp
+build_kcp_context = _kcp.build_context_det_kcp
+chunk_kda_kcp_fwd = _kcp.chunk_kda_det_fwd_kcp
+chunk_kda_kcp_bwd = _kcp.chunk_kda_det_bwd_kcp
+chunk_kda_kcp = _kcp.chunk_kda_det_kcp
+kcp_workspace_bytes = _kcp.kda_det_workspace_bytes_kcp
+kcp_saved_bytes = _kcp.kda_det_saved_bytes_kcp
+kcp_comm_bytes = _kcp.kda_det_comm_bytes_kcp
+# the raw gate mode's bitwise reproducible sum of the rank-local parameter gradients (previous-style name)
+kcp_reduce_gate_param_grads = _kcp.reduce_gate_param_grads_det_kcp
 
-    Parameters
-    ----------
-    q, k, v, g, beta, cu_seqlens
-        The forward's operands.
-    dout : torch.Tensor
-        BF16 gradient of ``out``, laid out like ``v``.
-    saved : KdaChunkSaved, optional
-        The forward's saved set (version 1 or 2); ``None`` recomputes it from the inputs (checkpoint replay).
-    scale : float, optional
-        The forward's scale; ``128 ** -0.5`` when ``None``.
-    workspace : KdaWorkspace, optional
-        A reused workspace with backward buffers; without one this call allocates its own.
-
-    Returns
-    -------
-    ``(dq, dk, dv, dbeta, dg)``: BF16 gradients of ``q, k, v, beta`` and the FP32 gradient of ``g``, ranked
-    like the inputs.  Bitwise reproducible for the same inputs.
-    """
-    from .experimental.cake_kda_train import cake_backend
-
-    return cake_backend.chunk_kda_bwd(
-        q,
-        k,
-        v,
-        g,
-        beta,
-        cu_seqlens,
-        dout,
-        saved=saved,
-        scale=DEFAULT_SCALE if scale is None else scale,
-        workspace=workspace,
-    )
+# The KCP types under their previous names, resolved on first access through ``flashinfer.cake_kda_det_train_kcp``
+# (which imports the KCP host module lazily): previous name -> det name.
+_LAZY_KCP_TYPES = {
+    "KcpContext": "ContextDetKcp",
+    "KcpOptions": "OptionsDetKcp",
+    "KcpPartition": "PartitionDetKcp",
+    "KcpRecomputeHandle": "RecomputeHandleDetKcp",
+    "KcpSaved": "SavedDetKcp",
+    "KcpWorkspace": "WorkspaceDetKcp",
+}
 
 
-@flashinfer_experimental_api(feature=_FEATURE)
-def chunk_kda(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
-    cu_seqlens: torch.Tensor,
-    *,
-    scale: Optional[float] = None,
-    workspace: Optional[Any] = None,
-    save_mode: Optional[str] = None,
-) -> torch.Tensor:
-    r"""Packed KDA chunked training as an autograd node (``torch.utils.checkpoint`` compatible).
-
-    Returns ``out`` BF16 like ``v`` with gradients to ``q, k, v, g, beta``; see :func:`chunk_kda_fwd` for the
-    operands and ``save_mode`` and :func:`chunk_kda_bwd` for the gradients.
-    """
-    from .experimental.cake_kda_train import cake_backend
-
-    return cake_backend.chunk_kda(
-        q,
-        k,
-        v,
-        g,
-        beta,
-        cu_seqlens,
-        scale=DEFAULT_SCALE if scale is None else scale,
-        workspace=workspace,
-        save_mode=save_mode,
-    )
+def __getattr__(name: str) -> Any:
+    if name in _LAZY_KCP_TYPES:
+        return getattr(_kcp, _LAZY_KCP_TYPES[name])
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
-def kda_train_workspace(
-    S: int,
-    num_docs: int,
-    H: int,
-    device: torch.device | str,
-    *,
-    backward: bool = True,
-    save_mode: str = "light",
-) -> Any:
-    """A caller-owned ``KdaWorkspace`` (one arena of internal intermediates) for ``S`` tokens in ``num_docs``
-    documents with ``H`` heads on ``device``, reused by every call that receives it: the forward layout only with
-    ``backward=False``; ``save_mode`` is the default of the calls on it and sizes the arena for that mode."""
-    from .experimental.cake_kda_train import cake_backend
-
-    return cake_backend.KdaWorkspace.for_problem(
-        S, num_docs, H, device, backward=backward, save_mode=save_mode
-    )
-
-
-def kda_train_workspace_bytes(
-    S: int,
-    num_docs: int,
-    H: int,
-    *,
-    backward: bool = True,
-    save_mode: str = "light",
-    sm_count: Optional[int] = None,
-) -> int:
-    """Bytes :func:`kda_train_workspace` allocates for the problem (``sm_count``: the device's SM count, the
-    current CUDA device's when ``None``; it sets the segment count of the segmented recurrences)."""
-    from .experimental.cake_kda_train import cake_backend
-
-    return cake_backend.workspace_bytes(
-        S, num_docs, H, backward=backward, save_mode=save_mode, sm_count=sm_count
-    )
-
-
-def kda_train_saved_bytes(
-    S: int,
-    H: int,
-    num_docs: Optional[int] = None,
-    *,
-    save_mode: str = "light",
-    sm_count: Optional[int] = None,
-) -> int:
-    """Bytes of the saved set: ``Aqk`` and ``Akk`` (``256 * S * H``), plus the device tables when ``num_docs`` is
-    given, plus the state tape, ``v_new`` and the segment transfers with ``save_mode="tape"``."""
-    from .experimental.cake_kda_train import cake_backend
-
-    return cake_backend.saved_bytes(
-        S, H, num_docs, save_mode=save_mode, sm_count=sm_count
-    )
-
-
-def is_kda_train_supported(device: torch.device | str | int | None = None) -> bool:
-    """Whether ``device`` (the current CUDA device by default) is a target of the Cake kernels
-    (compute capability 10.0, 10.3 or 10.7)."""
-    from .experimental.cake_kda_train import cake_backend
-
-    return cake_backend.is_supported(device)
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(_LAZY_KCP_TYPES))
 
 
 __all__ = [
     "DEFAULT_SCALE",
+    "KcpRecomputeHandle",  # noqa: F822 - resolved by __getattr__
+    "build_kcp_context",
     "chunk_kda",
     "chunk_kda_bwd",
     "chunk_kda_fwd",
+    "chunk_kda_kcp",
+    "chunk_kda_kcp_bwd",
+    "chunk_kda_kcp_fwd",
     "is_kda_train_supported",
+    "kcp_comm_bytes",
+    "kcp_partition",
+    "kcp_reduce_gate_param_grads",
+    "kcp_saved_bytes",
+    "kcp_workspace_bytes",
+    "kda_train_arena",
     "kda_train_saved_bytes",
     "kda_train_workspace",
     "kda_train_workspace_bytes",

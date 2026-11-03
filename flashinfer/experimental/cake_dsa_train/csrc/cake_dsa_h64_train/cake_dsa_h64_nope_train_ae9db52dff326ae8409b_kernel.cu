@@ -14,45 +14,9 @@
  * limitations under the License.
  */
 
-typedef signed char        int8_t;
-typedef unsigned char      uint8_t;
-typedef unsigned short     uint16_t;
-typedef unsigned int       uint32_t;
-#if defined(__CUDACC_RTC__)
-typedef unsigned long long uint64_t;
-#else
-typedef unsigned long      uint64_t;
-#endif
-static_assert(sizeof(uint64_t) == 8, "Cake requires an LP64 CUDA host ABI");
-typedef signed int         int32_t;
-typedef short int          int16_t;
-struct __align__(64) CakeTensorMap64 { uint64_t opaque[16]; };
-static_assert(sizeof(CakeTensorMap64) == 128, "64-aligned tensor-map ABI size");
-static_assert(alignof(CakeTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
+#include "cake_dsa_h64_train_device.cuh"
 
-#if defined(__CUDACC_RTC__)
-typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
-#else
-#include <cuda.h>
-#endif
-
-static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 bytes");
-#include <cuda_bf16.h>
-#include <cuda_fp8.h>
-
-__device__ __forceinline__ int make_warp_uniform(int x) {
-    int result;
-    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1F, 0xFFFFFFFF;"
-                 : "=r"(result) : "r"(x));
-    return result;
-}
-
-#define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
-#define THREADS 256
 #define LAUNCH_MIN_BLOCKS 1
-
-#include <math_constants.h>
 
 extern "C" {
 
@@ -64,12 +28,7 @@ kernel_cake_dsa_h64_nope_train_ae9db52dff326ae8409b(__nv_bfloat16* __restrict__ 
     const int lane = tid % 32;
 
 
-    const int bid = blockIdx.x;
-    const int num_bids = gridDim.x;
-
-    const int cta_rank = 0;
-
-    // === Task calls (dependency order) ===
+    // === Task calls (declaration order) ===
     int row = blockIdx.x * 8 + warp;
     if (row < num_rows) {
         long long base = (long long)row * 512 + (long long)(lane * 16);
@@ -122,22 +81,14 @@ kernel_cake_dsa_h64_nope_train_ae9db52dff326ae8409b(__nv_bfloat16* __restrict__ 
                 }
             }
         }
-        float _fma_0 = __fmaf_rn(_vec_load_0[0], _vec_load_1[0] + _vec_load_2[0], acc);
-        acc = _fma_0;
-        float _fma_1 = __fmaf_rn(_vec_load_0[1], _vec_load_1[1] + _vec_load_2[1], acc);
-        acc = _fma_1;
-        float _fma_2 = __fmaf_rn(_vec_load_0[2], _vec_load_1[2] + _vec_load_2[2], acc);
-        acc = _fma_2;
-        float _fma_3 = __fmaf_rn(_vec_load_0[3], _vec_load_1[3] + _vec_load_2[3], acc);
-        acc = _fma_3;
-        float _fma_4 = __fmaf_rn(_vec_load_0[4], _vec_load_1[4] + _vec_load_2[4], acc);
-        acc = _fma_4;
-        float _fma_5 = __fmaf_rn(_vec_load_0[5], _vec_load_1[5] + _vec_load_2[5], acc);
-        acc = _fma_5;
-        float _fma_6 = __fmaf_rn(_vec_load_0[6], _vec_load_1[6] + _vec_load_2[6], acc);
-        acc = _fma_6;
-        float _fma_7 = __fmaf_rn(_vec_load_0[7], _vec_load_1[7] + _vec_load_2[7], acc);
-        acc = _fma_7;
+        acc = __fmaf_rn(_vec_load_0[0], _vec_load_1[0] + _vec_load_2[0], acc);
+        acc = __fmaf_rn(_vec_load_0[1], _vec_load_1[1] + _vec_load_2[1], acc);
+        acc = __fmaf_rn(_vec_load_0[2], _vec_load_1[2] + _vec_load_2[2], acc);
+        acc = __fmaf_rn(_vec_load_0[3], _vec_load_1[3] + _vec_load_2[3], acc);
+        acc = __fmaf_rn(_vec_load_0[4], _vec_load_1[4] + _vec_load_2[4], acc);
+        acc = __fmaf_rn(_vec_load_0[5], _vec_load_1[5] + _vec_load_2[5], acc);
+        acc = __fmaf_rn(_vec_load_0[6], _vec_load_1[6] + _vec_load_2[6], acc);
+        acc = __fmaf_rn(_vec_load_0[7], _vec_load_1[7] + _vec_load_2[7], acc);
         float _vec_load_3[8];
         {
             const uint4* _vptr_3 = reinterpret_cast<const uint4*>(dout + (gbase + 8) + 0);
@@ -183,27 +134,18 @@ kernel_cake_dsa_h64_nope_train_ae9db52dff326ae8409b(__nv_bfloat16* __restrict__ 
                 }
             }
         }
-        float _fma_8 = __fmaf_rn(_vec_load_3[0], _vec_load_4[0] + _vec_load_5[0], acc);
-        acc = _fma_8;
-        float _fma_9 = __fmaf_rn(_vec_load_3[1], _vec_load_4[1] + _vec_load_5[1], acc);
-        acc = _fma_9;
-        float _fma_10 = __fmaf_rn(_vec_load_3[2], _vec_load_4[2] + _vec_load_5[2], acc);
-        acc = _fma_10;
-        float _fma_11 = __fmaf_rn(_vec_load_3[3], _vec_load_4[3] + _vec_load_5[3], acc);
-        acc = _fma_11;
-        float _fma_12 = __fmaf_rn(_vec_load_3[4], _vec_load_4[4] + _vec_load_5[4], acc);
-        acc = _fma_12;
-        float _fma_13 = __fmaf_rn(_vec_load_3[5], _vec_load_4[5] + _vec_load_5[5], acc);
-        acc = _fma_13;
-        float _fma_14 = __fmaf_rn(_vec_load_3[6], _vec_load_4[6] + _vec_load_5[6], acc);
-        acc = _fma_14;
-        float _fma_15 = __fmaf_rn(_vec_load_3[7], _vec_load_4[7] + _vec_load_5[7], acc);
-        acc = _fma_15;
-        float _warp_reduce_0 = acc;
+        acc = __fmaf_rn(_vec_load_3[0], _vec_load_4[0] + _vec_load_5[0], acc);
+        acc = __fmaf_rn(_vec_load_3[1], _vec_load_4[1] + _vec_load_5[1], acc);
+        acc = __fmaf_rn(_vec_load_3[2], _vec_load_4[2] + _vec_load_5[2], acc);
+        acc = __fmaf_rn(_vec_load_3[3], _vec_load_4[3] + _vec_load_5[3], acc);
+        acc = __fmaf_rn(_vec_load_3[4], _vec_load_4[4] + _vec_load_5[4], acc);
+        acc = __fmaf_rn(_vec_load_3[5], _vec_load_4[5] + _vec_load_5[5], acc);
+        acc = __fmaf_rn(_vec_load_3[6], _vec_load_4[6] + _vec_load_5[6], acc);
+        acc = __fmaf_rn(_vec_load_3[7], _vec_load_4[7] + _vec_load_5[7], acc);
+        float total = acc;
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1)
-            _warp_reduce_0 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_0, offset);
-        float total = _warp_reduce_0;
+            total += __shfl_xor_sync(0xFFFFFFFF, total, offset);
         if (lane == 0) {
             delta[row] = total;
         }
@@ -211,4 +153,3 @@ kernel_cake_dsa_h64_nope_train_ae9db52dff326ae8409b(__nv_bfloat16* __restrict__ 
 }
 
 } // extern "C"
-

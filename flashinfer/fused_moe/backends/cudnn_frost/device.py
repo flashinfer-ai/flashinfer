@@ -127,7 +127,9 @@ def _sm120_block_scale_stages(value, smem_bytes, swap_ab):
     template's 2 KB reserve come off the budget first; GATHER adds 32 B of
     linear-scale scratch per routed token row (the token is B after swap-AB).
     Multi-GEMM (gated) kernels then drop stages until the aligned buffer
-    layout fits.
+    layout, budgeted at each operand's own SMEM row (the packed e2m1 side of a
+    mixed pair holds the fp8 K-tile in 64 B; its padded ``.b4x16_p64`` form and
+    every other operand in 128 B), fits.
     """
     m, n, _ = value("cta_tile_mnk")
     na, nb = value("num_a_operands"), value("num_b_operands")
@@ -161,14 +163,16 @@ def _sm120_block_scale_stages(value, smem_bytes, swap_ab):
     available = smem_bytes - 2048 - staging
     stages = min(available // per_stage, 16) if available >= per_stage else 0
     if gemms > 1:
-        kb = max(value("a_packed_per_row"), value("b_packed_per_row"))
+        # Each operand's own SMEM row: 128 B, or 64 B for the packed e2m1 side of
+        # a mixed pair (its padded .b4x16_p64 form holds one byte per value).
+        a_kb, b_kb = value("a_packed_per_row"), value("b_packed_per_row")
 
         def up(offset, align):
             return -(-offset // align) * align
 
         def footprint(count):
             offset = 1024
-            for operands, tile in ((na, m * kb), (nb, n * kb)):
+            for operands, tile in ((na, m * a_kb), (nb, n * b_kb)):
                 for _ in range(operands):
                     offset = up(offset, 1024) + count * tile
             for operands, tile in ((na, sfa), (nb, sfb)):

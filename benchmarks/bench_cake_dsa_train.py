@@ -101,6 +101,8 @@ Usage::
 """
 
 import argparse
+import dataclasses
+import inspect
 import json
 import statistics
 import sys
@@ -134,6 +136,7 @@ from tests.test_helpers.cake_dsa_train_reference import (  # noqa: E402
     NUM_HEADS,
     calibrate_beta,
     calibrate_beta_nope,
+    compacted_twin,
     make_inputs,
     make_nope_inputs,
     nope_pools,
@@ -178,6 +181,12 @@ ROWS["tail_2123x67923"] = ([2123], [67923])  # the short-query / long-key tail s
 ROWS["doc_16231"] = ([16231], [16231])  # one document at the recorded token count
 ROWS["doc_4095"] = ([4095], [4095])  # tile / chunk boundary
 ROWS["doc_4097"] = ([4097], [4097])
+# the same rows with ``dout`` in the recorded trainer layout (head-major: strides ``[512, Tq * 512, 1]``, the view an
+# output projection hands back); the contiguous rows above are their controls.  Issue #7041 ask 2: the rope backward
+# reads this view in place (its delta stage carries the strides); a package that copies it pays the copy here.
+ROWS["packed_glm_a_hm"] = GLM_A
+ROWS["doc_16231_hm"] = ([16231], [16231])
+ROW_DOUT_LAYOUT = {"packed_glm_a_hm": "head_major", "doc_16231_hm": "head_major"}
 
 
 # GB200 trainer-trace rows (round 2 of issue #5675): the recorded dK/dV destination buffers have FEWER rows than the
@@ -302,6 +311,10 @@ NOPE_CHUNK = 4096  # the trainer's backward query-chunk policy
 NOPE_DOUT_LAYOUTS = ("head_major", "contiguous")
 
 
+NOPE_TWINS = (None, "stable")
+NOPE_HOLE_PATTERNS = (None, "every_other")
+
+
 def _nope_row(
     seq_q,
     seq_k,
@@ -309,18 +322,33 @@ def _nope_row(
     index="pooled",
     pools=None,
     dout_layout="head_major",
+    twin=None,
+    holes=None,
 ):
     """One NoPE row: document lengths, the physical slot width, the index structure
     (``pooled``: P four-token pools plus the causal tail of the open pool; ``iid``: random
-    causal top-k), the pool capacity (default: the width's recorded capacity) and the
-    ``dout`` layout (default ``head_major``, the recorded trainer strides
-    ``[512, Tq * 512, 1]``; ``--nope-dout-layout`` overrides it for every row)."""
-    if pools is None and index == "pooled":
+    causal top-k; the hole layouts of issue #7041 -- ``pooled_fixed_tail``: the pooled draw
+    with the open pool's tail at the fixed column ``4 P`` and ``-1`` between the last filled
+    pool and that column, ``repro_gap``: the issue's rows, 1024 front keys, a gap to column
+    2048, four tail keys, ``repro_compact_issue``: their descending-sorted twin), the pool
+    capacity (default: the width's recorded capacity), the ``dout`` layout (default
+    ``head_major``, the recorded trainer strides ``[512, Tq * 512, 1]``;
+    ``--nope-dout-layout`` overrides it for every row), ``holes="every_other"``: every odd
+    slot of the draw is invalidated after it is drawn (:func:`_plant_holes`; a hole row at
+    any slot width, below the one-launch route's slot limit included), and ``twin="stable"``:
+    the row's indices are the stable compaction of the draw (valid keys first in ascending
+    slot order, the same keys per row: the baseline-side control of a hole row,
+    ``compacted_twin``; applied after the planted holes)."""
+    if pools is None and index in ("pooled", "pooled_fixed_tail"):
         pools = nope_pools(k_slots)
     if dout_layout not in NOPE_DOUT_LAYOUTS:
         raise ValueError(
             f"dout_layout must be one of {NOPE_DOUT_LAYOUTS}, got {dout_layout!r}"
         )
+    if twin not in NOPE_TWINS:
+        raise ValueError(f"twin must be one of {NOPE_TWINS}, got {twin!r}")
+    if holes not in NOPE_HOLE_PATTERNS:
+        raise ValueError(f"holes must be one of {NOPE_HOLE_PATTERNS}, got {holes!r}")
     return dict(
         seq_q=[int(x) for x in seq_q],
         seq_k=[int(x) for x in seq_k],
@@ -328,6 +356,28 @@ def _nope_row(
         index=index,
         pools=pools,
         dout_layout=dout_layout,
+        twin=twin,
+        holes=holes,
+    )
+
+
+def _plant_holes(inp, pattern):
+    """``inp`` with holes planted in every row after the draw.  ``"every_other"`` invalidates the odd slots of
+    the per-document and the global rows alike: the valid keys of the even slots stay where they are, so a
+    position-preserving kernel scans each row to its last valid slot (about twice the valid count) while a
+    compacting one scans the valid count.  The lengths become the new valid counts and the index kind gains the
+    suffix ``+every_other``; ``compacted_twin`` of the result is the row's baseline-side control."""
+    if pattern != "every_other":
+        raise ValueError(f"unknown hole pattern {pattern!r}")
+    local, glob = inp.idx_local.clone(), inp.idx_global.clone()
+    local[:, 1::2] = -1
+    glob[:, 1::2] = -1
+    return dataclasses.replace(
+        inp,
+        idx_local=local,
+        idx_global=glob,
+        topk_length=(local >= 0).sum(-1).to(torch.int32).contiguous(),
+        index=inp.index + "+every_other",
     )
 
 
@@ -345,12 +395,66 @@ NOPE_ROWS: dict[str, dict] = {
     "nope_tail_1024x16384_k512": _nope_row([1024], [16384], k_slots=512),
     "nope_short_1024_k128": _nope_row([1024], [1024], k_slots=128),
     "nope_short_4096_k512": _nope_row([4096], [4096], k_slots=512),
+    # the two tables straddling the one-launch route's slot limit (524,288 and 1,048,576 slots; the tiny rows
+    # above are 131,072 and 524,288)
+    "nope_short_2048_k256": _nope_row([2048], [2048], k_slots=256),
+    "nope_short_4096_k256": _nope_row([4096], [4096], k_slots=256),
     "nope_glm53_a_p256": _nope_row(*GLM53_A, k_slots=1152, pools=256),
 }
 for _n in (4096, 16384, 65536):
     NOPE_ROWS[f"nope_doc_{_n}"] = _nope_row([_n], [_n])
 for _k in (128, 256, 512, 1024):
     NOPE_ROWS[f"nope_doc_16384_k{_k}"] = _nope_row([16384], [16384], k_slots=_k)
+# Hole rows of issue #7041 (the rows above are valid-first: the no-regression set).  Every hole row has its stable
+# twin (``_compact_stable`` / ``_compact``: the same keys per row, valid-first) as the baseline-side control: the
+# gate is t_cand(row) / t_base(twin).  Selector assumptions: ``pooled_fixed_tail`` writes the ascending four-token
+# pools from column 0 (512 pools x 4 tokens in columns 0..2047 at K_slots 2176), ``-1`` where a document has fewer
+# pools, and the open pool's causal tail at column 2048 only when the position is not the last token of its pool
+# (``pos % 4 != 3``); ``repro_gap`` is the issue's construction (position ``pos = seq_k - seq_q + i``: keys
+# ``pos - 4 - j`` for j < 1024 in columns 0..1023, keys ``pos - j`` for j < 4 at columns 2048..2051, ``-1`` elsewhere).
+# R1: the issue's 16k document.  R2: a 4-document 262k pack as context-parallel rank 0 sees it (each document a
+# 2048-token head segment and a 2048-token tail of its 65536-token prefix).  R2': the recorded GLM-5.3 batch with the
+# fixed-column tail.  R3: 264 documents of 992 tokens (528 segments of 31 queries: the pooled selector fills at most
+# 248 pools per document, so three quarters of the slots are the gap to column 2048).
+NOPE_ROWS["nope_repro_16k_gap"] = _nope_row([16384], [16384], index="repro_gap")
+NOPE_ROWS["nope_repro_16k_compact_stable"] = _nope_row(
+    [16384], [16384], index="repro_gap", twin="stable"
+)
+NOPE_ROWS["nope_repro_16k_compact_issue"] = _nope_row(
+    [16384], [16384], index="repro_compact_issue"
+)
+NOPE_ROWS["nope_pack4_262k_rank0_fixedtail"] = _nope_row(
+    [2048, 2048] * 4, [2048, 65536] * 4, index="pooled_fixed_tail"
+)
+NOPE_ROWS["nope_pack4_262k_rank0_fixedtail_compact"] = _nope_row(
+    [2048, 2048] * 4, [2048, 65536] * 4, index="pooled_fixed_tail", twin="stable"
+)
+NOPE_ROWS["nope_glm53_a_fixedtail"] = _nope_row(*GLM53_A, index="pooled_fixed_tail")
+NOPE_ROWS["nope_glm53_a_fixedtail_compact"] = _nope_row(
+    *GLM53_A, index="pooled_fixed_tail", twin="stable"
+)
+NOPE_ROWS["nope_docs264x992_rank0_fixedtail"] = _nope_row(
+    [31, 31] * 264, [31, 992] * 264, index="pooled_fixed_tail"
+)
+NOPE_ROWS["nope_docs264x992_rank0_fixedtail_compact"] = _nope_row(
+    [31, 31] * 264, [31, 992] * 264, index="pooled_fixed_tail", twin="stable"
+)
+# A small hole row (131,072 slots: below the slot limit, the one-launch position-preserving route) and its stable
+# twin: every odd slot of the pooled draw is -1, so the row scans about twice its valid keys position-preserving
+# while the twin scans its valid count.  Graded against the previous version's own time (``--parity-rows``), not
+# against the twin.
+NOPE_ROWS["nope_short_1024_k128_holes"] = _nope_row(
+    [1024], [1024], k_slots=128, holes="every_other"
+)
+NOPE_ROWS["nope_short_1024_k128_holes_compact_stable"] = _nope_row(
+    [1024], [1024], k_slots=128, holes="every_other", twin="stable"
+)
+NOPE_HOLE_ROWS = tuple(
+    name
+    for name, spec in NOPE_ROWS.items()
+    if (spec["index"] in ("pooled_fixed_tail", "repro_gap") or spec.get("holes"))
+    and spec["twin"] is None
+)
 NOPE_ARMS_DEFAULT = (
     "cake_nope,cake_rope_bridge,fa4_nope,fa4_nope_a2,flashmla_cudnn_nope"
 )
@@ -388,6 +492,8 @@ ROW_LAYOUTS = {
     "chunk_4096x268757": {**TRAINER_LAYOUT, "dkv_dst_map": "glm_a"},
     "chunk_3943x268757": {**TRAINER_LAYOUT, "dkv_dst_map": "glm_a"},
     "chunk_3884x267520": {**TRAINER_LAYOUT, "dkv_dst_map": "glm_b"},
+    "packed_glm_a_hm": TRAINER_LAYOUT,
+    "doc_16231_hm": TRAINER_LAYOUT,
 }
 # --preset: one GLM-5.2 row in the trainer layout
 PRESETS = {
@@ -954,6 +1060,28 @@ ARMS = {
 # ---------------------------------------------------------------------------
 
 
+def _glue_compacts():
+    """Whether this package's torch glue can compact (``offset_gather_kv_indices(..., compact=True)``, issue #7041);
+    an older package keeps the position-preserving rows (its own behaviour, what the baseline arm measures)."""
+    return (
+        "compact" in inspect.signature(cake_backend.offset_gather_kv_indices).parameters
+    )
+
+
+def _globalize(local, cu_q, cu_k):
+    """Global rows and lengths of per-document rows through the torch glue, in the form the package's entries
+    produce on device for a table of this size: the stable compaction with the valid counts where they run the
+    compacting stage, else the position-preserving rows with the last valid slot + 1."""
+    mode = getattr(cake_backend, "nope_varlen_index_mode", None)
+    compact = _glue_compacts() and (
+        mode is None or mode(int(local.shape[0]), int(local.shape[1])) == "index_prep"
+    )
+    kw = dict(compact=True) if compact else {}
+    return cake_backend.offset_gather_kv_indices(
+        local, cu_q, cu_k, causal=True, return_topk_length=True, **kw
+    )
+
+
 def _chunk_bounds(inp, chunk):
     """Query sub-ranges ``(q0, q1, cu_seqlens_q, cu_seqlens_k, num_segments)`` of the
     backward chunk policy (``bwd_chunk`` over the full key row), as device tensors."""
@@ -1112,39 +1240,52 @@ class ArmCakeNope:
         )
         return dict(dq=dq, dkv=st["dkv_acc"])
 
+    def issue_step(self):
+        """The issue's step (#7041): forward + ``autograd.grad`` to ``q`` and ``kv`` with a fresh ``dkv``."""
+        kv = self._kv_leaf()
+        out, _ = self._call(self.q, kv, None)
+        return torch.autograd.grad(out, (self.q, kv), self.inp.dout)
+
+    def issue_forward(self):
+        with torch.no_grad():
+            return self._call(self.inp.q, self.inp.kv, None)
+
+    def _kv_leaf(self):
+        leaf = getattr(self, "_kv_leaf_cache", None)
+        if leaf is None:
+            leaf = self._kv_leaf_cache = self.inp.kv.detach().requires_grad_()
+        return leaf
+
     def key_passes(self):
         return _planner_key_passes(self.inp, self.chunk, program=self.program)
 
     def backward_chunks(self, st):
         """Eager backward over the query chunks into one accumulate buffer (``None`` when the
-        eager NoPE entries are not available)."""
+        eager NoPE entries are not available).  The eager forward and the per-chunk global
+        rows and lengths are prepared once, on the first call: the timed region is the
+        chunked backward alone, so that a package whose torch glue does more per call (the
+        compacting glue of #7041) is compared on its kernels; the glue's own cost is the
+        index-glue table."""
         fwd = getattr(cake_backend, "forward_nope", None)
         bwd = getattr(cake_backend, "backward_nope", None)
         if fwd is None or bwd is None:
             return None
         inp = self.inp
         if self.eager is None:
-            idx, length = cake_backend.offset_gather_kv_indices(
-                inp.idx_local,
-                inp.cu_seqlens_q,
-                inp.cu_seqlens_k,
-                causal=True,
-                return_topk_length=True,
-            )
+            idx, length = _globalize(inp.idx_local, inp.cu_seqlens_q, inp.cu_seqlens_k)
             out, lse, o_lo = fwd(
                 inp.q, inp.kv, idx, topk_length=length, softmax_scale=DEFAULT_NOPE_SCALE
             )
-            self.eager = dict(
-                out=out, lse=lse, o_lo=o_lo, bounds=_chunk_bounds(inp, self.chunk)
-            )
+            chunks = []
+            for q0, q1, cu_q, cu_k, segments in _chunk_bounds(inp, self.chunk):
+                idx_c, len_c = _globalize(inp.idx_local[q0:q1], cu_q, cu_k)
+                chunks.append((q0, q1, idx_c, len_c, segments))
+            self.eager = dict(out=out, lse=lse, o_lo=o_lo, chunks=chunks)
         e = self.eager
         dkv_acc = torch.zeros(
             inp.total_k, D_LATENT, dtype=torch.float32, device=inp.q.device
         )
-        for q0, q1, cu_q, cu_k, segments in e["bounds"]:
-            idx_c, len_c = cake_backend.offset_gather_kv_indices(
-                inp.idx_local[q0:q1], cu_q, cu_k, causal=True, return_topk_length=True
-            )
+        for q0, q1, idx_c, len_c, segments in e["chunks"]:
             bwd(
                 inp.q[q0:q1],
                 inp.kv,
@@ -1522,6 +1663,10 @@ class ArmFlashMLACudnnNope:
         import flash_mla
         from cudnn import DSA
 
+        if getattr(inp, "has_holes", False):
+            raise RuntimeError(
+                "skipped: hole rows (cuDNN DSA takes dense top-k rows; -1 slots before valid keys are undefined)"
+            )
         self.inp = inp
         self.flash_mla, self.DSA = flash_mla, DSA
         device = inp.q.device
@@ -1628,13 +1773,36 @@ def measure_perf(arm, steps):
     )
 
 
-def measure_perf_nope(arm, inp, steps):
+def issue_median_ms(fn, reps=10):
+    """The timing protocol of issue #7041: ``reps`` timed calls, each after a synchronize and a 20M-cycle
+    ``torch.cuda._sleep``, CUDA events around the call, ``sorted()[reps // 2]``."""
+    start, end = (
+        torch.cuda.Event(enable_timing=True),
+        torch.cuda.Event(enable_timing=True),
+    )
+    times = []
+    for _ in range(reps):
+        torch.cuda.synchronize()
+        torch.cuda._sleep(20_000_000)
+        start.record()
+        fn()
+        end.record()
+        torch.cuda.synchronize()
+        times.append(start.elapsed_time(end))
+    times.sort()
+    return float(times[len(times) // 2])
+
+
+def measure_perf_nope(arm, inp, steps, *, issue_protocol=False):
     """Median milliseconds of a NoPE arm: the training forward, the no-grad forward (detached
     inputs), the whole-row backward, the chunked backward (the 4096-query policy into one
     accumulate buffer; ``None`` where the arm chunks internally), the step (forward +
     backward) and the recompute step (two forwards + backward, activation checkpointing),
     plus the peak memory above the inputs, the workspace, the planner's ``key_passes``
     (Cake arms: the whole row and each chunk) and the row's geometry columns.
+    ``issue_protocol`` adds the issue's own measurement (#7041: forward + ``autograd.grad``
+    to ``q`` and ``kv`` with a fresh ``dkv``, and the no-grad forward, under
+    :func:`issue_median_ms`) for the arms that expose ``issue_step``.
     """
     st = arm.forward()
     torch.cuda.synchronize()
@@ -1664,6 +1832,10 @@ def measure_perf_nope(arm, inp, steps):
 
     perf["step_ms"] = median_ms(step, steps)
     perf["recompute_step_ms"] = median_ms(recompute_step, steps)
+    if issue_protocol and hasattr(arm, "issue_step"):
+        arm.issue_step()  # the kv-leaf graph: plans before the timing
+        perf["issue_fwd_bwd_ms"] = issue_median_ms(arm.issue_step)
+        perf["issue_fwd_ms"] = issue_median_ms(arm.issue_forward)
     perf["workspace_bytes"] = arm.workspace()
     perf["key_passes"] = arm.key_passes() if hasattr(arm, "key_passes") else None
     torch.cuda.synchronize()
@@ -1700,6 +1872,10 @@ def run_perf_nope_row(row, args, results):
         dout_layout=args.nope_dout_layout or spec["dout_layout"],
         device=args.device,
     )
+    if spec.get("holes"):
+        inp = _plant_holes(inp, spec["holes"])
+    if spec.get("twin") == "stable":
+        inp = compacted_twin(inp)
     entry = dict(
         row=row,
         total_q=inp.total_q,
@@ -1711,10 +1887,21 @@ def run_perf_nope_row(row, args, results):
         index=inp.index,
         pools=inp.pools,
         valid_keys=inp.valid_keys,
+        twin=spec.get("twin"),
+        holes=spec.get("holes"),
         dout_layout=inp.dout_layout,
         dout_strides=list(inp.dout.stride()),
         inputs_gib=gib(inp.bytes_inputs()),
         arms={},
+    )
+    # the hole geometry: valid keys, the sum of last-valid + 1 (what a position-preserving kernel scans), the sum
+    # of the valid counts (what a compacting kernel scans), the rows with a hole before a valid slot
+    entry.update(inp.hole_stats())
+    print(
+        f"{row:26s} geometry T {inp.total_q} S {inp.total_k} K {inp.topk} index {inp.index} "
+        f"valid {entry['valid_keys']} scan(pos) {entry['sum_last_valid_plus_one']} scan(compact) {entry['sum_counts']} "
+        f"hole rows {entry['rows_with_holes_frac']:.3f}",
+        flush=True,
     )
     steps = max(
         args.min_steps,
@@ -1728,7 +1915,9 @@ def run_perf_nope_row(row, args, results):
             print(f"{row:26s} {name:19s} unavailable: {error}", flush=True)
             continue
         try:
-            perf = measure_perf_nope(arm, inp, steps)
+            perf = measure_perf_nope(
+                arm, inp, steps, issue_protocol=args.issue_protocol
+            )
             perf["versions"] = arm.versions()
         except Exception as exc:
             perf = dict(
@@ -1746,10 +1935,15 @@ def run_perf_nope_row(row, args, results):
                 if isinstance(kp, dict) and "whole_row" in kp
                 else ""
             )
+            issue_text = (
+                f"  issue fwd+bwd {fmt(perf['issue_fwd_bwd_ms'])} ms fwd {fmt(perf['issue_fwd_ms'])} ms"
+                if "issue_fwd_bwd_ms" in perf
+                else ""
+            )
             print(
                 f"{row:26s} {name:19s} fwd {fmt(perf['fwd_ms'])} ms  bwd {fmt(perf['bwd_ms'])} ms  "
                 f"step {fmt(perf['step_ms'])} ms  recompute {fmt(perf['recompute_step_ms'])} ms  "
-                f"peak {perf['peak_above_inputs_gib']:.2f} GiB{kp_text}",
+                f"peak {perf['peak_above_inputs_gib']:.2f} GiB{kp_text}{issue_text}",
                 flush=True,
             )
         del arm
@@ -1890,8 +2084,14 @@ def run_perf(args, results):
             run_perf_nope_row(row, args, results)
             continue
         seq_q, seq_k = ROWS[row]
+        dout_layout = args.dout_layout or ROW_DOUT_LAYOUT.get(row, "contiguous")
         inp = make_inputs(
-            seq_q, seq_k, seed=SEED, topk=DEFAULT_TOPK, device=args.device
+            seq_q,
+            seq_k,
+            seed=SEED,
+            topk=DEFAULT_TOPK,
+            dout_layout=dout_layout,
+            device=args.device,
         )
         layout = Layout(inp, **resolve_layout(row, args))
         entry = dict(
@@ -1902,6 +2102,8 @@ def run_perf(args, results):
             cu_seqlens_q=inp.cu_seqlens_q.tolist(),
             cu_seqlens_k=inp.cu_seqlens_k.tolist(),
             inputs_gib=gib(inp.bytes_inputs()),
+            dout_layout=dout_layout,
+            dout_strides=list(inp.dout.stride()),
             layout=layout.describe(),
             arms={},
         )
@@ -2240,6 +2442,108 @@ def measure_host_path(inp, *, calls, rounds, kernel_steps):
     )
 
 
+INDEX_GLUE_ROWS = ("packed_glm_a", "doc_16231", "tail_2123x67923")
+
+
+def _kernel_table(fn):
+    """Per-kernel launch table of one call of ``fn`` (torch profiler, CUDA activities; memcpy / memset excluded):
+    ``[{name, calls, total_us}]`` sorted by time."""
+    from torch.profiler import ProfilerActivity, profile
+
+    torch.cuda.synchronize()
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        fn()
+        torch.cuda.synchronize()
+    table = {}
+    for e in prof.events():
+        if e.device_type != torch.autograd.DeviceType.CUDA or e.name.startswith(
+            ("Memcpy", "Memset")
+        ):
+            continue
+        t = table.setdefault(e.name, dict(name=e.name, calls=0, total_us=0.0))
+        t["calls"] += 1
+        t["total_us"] += (
+            float(e.device_time) if hasattr(e, "device_time") else float(e.cuda_time)
+        )
+    return sorted(table.values(), key=lambda t: -t["total_us"])
+
+
+def run_index_glue(args, results):
+    """Index preparation alone on the rope rows (issue #7041 ask 3): the torch glue
+    (``offset_gather_kv_indices(..., return_topk_length=True)``, the path the rope varlen entry
+    replaces), the compacting twin (``compact=True``) and the on-device stage
+    (``nope_globalize_indices(..., compact=True)``) -- CUPTI kernel-only medians, host
+    microseconds per call and the per-launch kernel table of each; the stage must agree
+    bitwise with the twin."""
+    rows = [r for r in (args.index_glue_rows or INDEX_GLUE_ROWS) if r in ROWS]
+    compacts = _glue_compacts()
+    globalize = getattr(cake_backend, "nope_globalize_indices", None)
+    stage_ok = (
+        globalize is not None
+        and compacts
+        and cake_backend.nope_index_prep_available(torch.device(args.device))
+    )
+    for row in rows:
+        seq_q, seq_k = ROWS[row]
+        inp = make_inputs(
+            seq_q, seq_k, seed=SEED, topk=DEFAULT_TOPK, device=args.device
+        )
+        local, cu_q, cu_k = inp.idx_local, inp.cu_seqlens_q, inp.cu_seqlens_k
+        variants = {
+            "glue": lambda: cake_backend.offset_gather_kv_indices(
+                local, cu_q, cu_k, causal=True, return_topk_length=True
+            )
+        }
+        if compacts:
+            variants["glue_compact"] = lambda: cake_backend.offset_gather_kv_indices(
+                local, cu_q, cu_k, causal=True, return_topk_length=True, compact=True
+            )
+        if stage_ok:
+            variants["stage_compact"] = lambda: globalize(
+                local, cu_q, cu_k, causal=True, compact=True
+            )
+        entry = dict(
+            row=row,
+            total_q=inp.total_q,
+            total_k=inp.total_k,
+            K_slots=inp.topk,
+            variants={},
+        )
+        outputs = {}
+        for name, fn in variants.items():
+            outputs[name] = fn()
+            torch.cuda.synchronize()
+            rec = dict(
+                median_ms=median_ms(fn, args.steps),
+                host_us_per_call=statistics.median(
+                    _host_us_per_call(fn, args.host_calls)
+                    for _ in range(args.host_rounds)
+                ),
+                kernels=_kernel_table(fn),
+            )
+            rec["launches"] = sum(k["calls"] for k in rec["kernels"])
+            entry["variants"][name] = rec
+            print(
+                f"{row:22s} {name:14s} {rec['median_ms']:8.3f} ms  host {rec['host_us_per_call']:8.1f} us/call  "
+                f"launches {rec['launches']}",
+                flush=True,
+            )
+            for k in rec["kernels"][:12]:
+                print(
+                    f"{'':22s}   {k['calls']:4d} x {k['total_us']:9.1f} us  {k['name'][:90]}",
+                    flush=True,
+                )
+        if "stage_compact" in outputs and "glue_compact" in outputs:
+            a, b = outputs["stage_compact"], outputs["glue_compact"]
+            entry["stage_equals_twin"] = bool(
+                torch.equal(a[0], b[0]) and torch.equal(a[1], b[1])
+            )
+            print(f"{row:22s} stage == twin: {entry['stage_equals_twin']}", flush=True)
+        results["index_glue"].append(entry)
+        del inp, outputs
+        torch.cuda.empty_cache()
+
+
 def run_host_path(args, results):
     for row in args.rows:
         seq_q, seq_k = ROWS[row]
@@ -2353,6 +2657,31 @@ def main():
         "trainer strides [512, Tq*512, 1]) or contiguous (the control)",
     )
     parser.add_argument(
+        "--dout-layout",
+        choices=NOPE_DOUT_LAYOUTS,
+        default=None,
+        help="dout layout of every RoPE row (default: contiguous, or head_major for the *_hm rows)",
+    )
+    parser.add_argument(
+        "--issue-protocol",
+        action="store_true",
+        help="NoPE rows: add the measurement of issue #7041 (forward + autograd.grad to q and kv, "
+        "10 reps after a 20M-cycle _sleep, sorted()[5]) beside the CUPTI medians",
+    )
+    parser.add_argument(
+        "--index-glue",
+        action="store_true",
+        help="index preparation alone on the rope rows: the torch glue vs its compacting twin vs the "
+        "on-device stage (CUPTI medians, host us/call, per-launch kernel table)",
+    )
+    parser.add_argument(
+        "--index-glue-rows",
+        nargs="*",
+        default=None,
+        choices=list(ROWS),
+        help=f"rows for --index-glue (default {', '.join(INDEX_GLUE_ROWS)})",
+    )
+    parser.add_argument(
         "--check-nope-arms",
         action="store_true",
         help="before the perf rows, instantiate every requested NoPE arm on a small row and "
@@ -2428,6 +2757,7 @@ def main():
         accuracy=[],
         accuracy_nope=[],
         host_path=[],
+        index_glue=[],
     )
     if args.check_nope_arms:
         run_check_nope_arms(args, results)
@@ -2439,6 +2769,8 @@ def main():
         run_accuracy_nope(args, results)
     if args.host_us:
         run_host_path(args, results)
+    if args.index_glue:
+        run_index_glue(args, results)
     if args.json:
         args.json.parent.mkdir(parents=True, exist_ok=True)
         args.json.write_text(json.dumps(results, indent=2, default=str) + "\n")

@@ -3,6 +3,7 @@
 
 
 from cutlass.experimental import primitives as nvvm
+from cutlass._mlir.dialects import arith
 import cutlass
 import cutlass.cute as cute
 
@@ -391,6 +392,25 @@ def cp_async_wait(num_remaining: cutlass.Constexpr[int] = 0):
 
 
 @cute.jit
+def cp_async_gather_row16(smem_dst, gmem_src, live):
+    """ONE 16-byte ``cp.async.cg.shared.global`` of a GATHERED row chunk with a per-copy ZERO-FILL predicate.
+
+    ``live`` (a ``cutlass.Boolean``) selects ``src-size = 16`` (the 16 bytes at ``gmem_src`` land in ``smem_dst``) or ``src-size = 0``
+    (nothing is read; the 16 destination bytes are ZERO-FILLED -- PTX fills the bytes past ``src-size`` with zeros).  ``gmem_src`` must
+    be a VALID address on either arm (a dead row passes the operand's base pointer), ``smem_dst`` the 16-B-aligned destination (an
+    ``Array`` subview or a ``Pointer``).  The copy joins the calling thread's CURRENT ``cp.async`` group: the caller commits
+    (:func:`cp_async_commit`) and waits (:func:`cp_async_wait`) -- every lane commits, a lane with nothing live included (an empty
+    group completes at once), so a group ledger stays uniform across the CTA.
+
+    Why a helper and not :func:`load_tile_2d`: that loader's ``valid_rows`` / ``valid_cols`` predicate is a DENSE tile's bounds (row
+    index below a count); an index-list gather decides per ROW whether the row exists (a -1 block id, a block past the sequence's
+    length, a dead item, a -1 page) -- a different predicate with the same zero-fill mechanics.  The SM107 lean block-sparse decode
+    tile (``sm107/sparse_lean_d256_f16.py``) is its first caller (K + V, dense and paged pools, one spelling)."""
+    size = cutlass.Int32(arith.select(live.ir_value(), cutlass.Int32(16).ir_value(), cutlass.Int32(0).ir_value()))
+    nvvm.cp_async_shared_global(smem_dst, gmem_src, 16, nvvm.LoadCacheModifier.CG, cp_size=size)
+
+
+@cute.jit
 def load_tile(
     smem_dst,
     gmem_src,
@@ -761,6 +781,41 @@ def tma_gather4(desc, dst_smem, mbar, col, r0, r1, r2, r3, *, cta_group: int = 1
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
     )
+
+
+_PREFETCH_TEMPLATES = {
+    2: "cp.async.bulk.prefetch.tensor.2d.L2.global.tile [$0, {$1, $2}];",
+    3: "cp.async.bulk.prefetch.tensor.3d.L2.global.tile [$0, {$1, $2, $3}];",
+    4: "cp.async.bulk.prefetch.tensor.4d.L2.global.tile [$0, {$1, $2, $3, $4}];",
+    5: "cp.async.bulk.prefetch.tensor.5d.L2.global.tile [$0, {$1, $2, $3, $4, $5}];",
+}
+
+
+@cute.jit
+def tma_prefetch_boxes(gmem_slice, num_iters: int, granu_elems: int):
+    """Prefetch into L2 the ``num_iters`` TMA boxes a tiled load of ``gmem_slice`` issues (innermost coordinate stepped
+    by ``granu_elems``).  One elected lane issues; nothing lands in SMEM and no mbarrier is involved."""
+    from cutlass._mlir.dialects import llvm
+
+    if cutlass.const_expr(gmem_slice.desc_ptr is not None):
+        desc = _desc_addr_i64(gmem_slice.desc_ptr)
+    else:
+        desc = _desc_addr_i64(gmem_slice.tma_desc)
+    rank = len(gmem_slice.coords)
+    outer = [cutlass.Int32(c) for c in gmem_slice.coords[1:]]
+    coord_d = cutlass.Int32(gmem_slice.coord_d)
+    if nvvm.elect_sync():
+        for i in cutlass.range_constexpr(num_iters):
+            d = coord_d + cutlass.Int32(i * granu_elems)
+            llvm.inline_asm(
+                None,
+                [desc.ir_value(), d.ir_value()] + [c.ir_value() for c in outer],
+                _PREFETCH_TEMPLATES[rank],
+                "l" + ",r" * rank,
+                has_side_effects=True,
+                is_align_stack=False,
+                asm_dialect=llvm.AsmDialect.AD_ATT,
+            )
 
 
 def ldg_int32x4(addr):

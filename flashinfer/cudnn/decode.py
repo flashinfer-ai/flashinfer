@@ -26,8 +26,8 @@ except ImportError:
     CUDNN_AVAILABLE = False
 
 
-def _create_cudnn_handle(stream: torch.cuda.Stream):
-    return get_cudnn_attention_handle(cudnn, stream)
+def _create_cudnn_handle(stream=None, *, device=None):
+    return get_cudnn_attention_handle(cudnn, stream, device=device)
 
 
 # Tensor ids
@@ -229,6 +229,7 @@ if CUDNN_AVAILABLE:
             cudnn_k_cache.set_uid(UIDs.K_UID.value)
             cudnn_v_cache.set_uid(UIDs.V_UID.value)
 
+            cudnn_k_block_tables = cudnn_v_block_tables = None
             if block_tables is not None:
                 nd_block_tables = block_tables.reshape(
                     block_tables.shape[0], 1, block_tables.shape[1], 1
@@ -288,7 +289,9 @@ if CUDNN_AVAILABLE:
                 attn_scale=scale,
                 paged_attention_k_table=cudnn_k_block_tables,
                 paged_attention_v_table=cudnn_v_block_tables,
-                paged_attention_max_seq_len_kv=max_sequence_kv,
+                paged_attention_max_seq_len_kv=(
+                    max_sequence_kv if block_tables is not None else None
+                ),
                 compute_data_type=cudnn.data_type.FLOAT,
                 **mask_kwargs,
                 **({"stats_use_log2": True} if stats_use_log2 else {}),
@@ -523,17 +526,23 @@ def _execute_decode(
     stats_use_log2=False,
 ):
     """Bind call-local pointers and apply the public base-2 LSE contract."""
-    device = q.device
-    handle_ = _create_cudnn_handle(
-        torch.cuda.current_stream(device.index if device.type == "cuda" else device)
-    )
+    handle_ = _create_cudnn_handle(device=q.device)
+
+    # Dense attention observes the descriptor's (B, H, S) stats
+    # layout. Expose that view while retaining the public token-major storage.
+    lse_binding = lse
+    if return_lse and block_tables is None:
+        if q.dim() == 4:
+            lse_binding = lse.view(q.shape[0], q.shape[2], q.shape[1]).transpose(1, 2)
+        else:
+            lse_binding = lse.unsqueeze(-1)
 
     if execution_bindings is not None:
         # UIDs are fixed by preparation; tensor observation remains FE's job.
         # Each call owns its sequence, including during capture and rebind.
         buffers = [q, k_cache, v_cache, out]
         if return_lse:
-            buffers.append(lse)
+            buffers.append(lse_binding)
         if sinks is not None:
             buffers.append(sinks)
         buffers.extend(
@@ -553,7 +562,7 @@ def _execute_decode(
             UIDs.O_UID.value: out,
         }
         if return_lse:
-            var_map[UIDs.STATS_UID.value] = lse
+            var_map[UIDs.STATS_UID.value] = lse_binding
         if sinks is not None:
             var_map[UIDs.SINK_UID.value] = sinks
         if actual_seq_lens_q is not None:

@@ -84,7 +84,7 @@ class Sm120_Mxfp4_Mxfp8_Bf16_Cake_MegaMoeConfig:
     ``num_experts % world_size == 0``
     with at most 128 experts per rank and 1024 in total, ``hidden_size`` a multiple of
     512 up to 7680, ``intermediate_size`` a multiple of 128, ``top_k`` from 1 to 9; the
-    kernel's row capacity is ``max_tokens_per_rank`` rounded up to 128 (at most 65408).
+    kernel's row capacity is ``max_tokens_per_rank`` rounded up to 128 (at most 32640).
     Above 16 EP ranks ``validate_init`` also compiles the device instances and rejects
     parameter sets whose build spills registers.
 

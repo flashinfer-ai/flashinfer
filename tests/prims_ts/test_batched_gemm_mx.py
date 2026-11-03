@@ -32,7 +32,10 @@ import torch
 
 from flashinfer.utils import is_sm100a_supported
 
+from tests.prims_ts.dsl_version import requires_dsl_4_8_for_c_partition_offset
+
 from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
+    ActKind,
     uniform_pipeline_stage_overrides,
 )
 
@@ -44,11 +47,6 @@ pytestmark = [
         reason="FP4 cvt (cvt.e2m1x2.f32) requires Blackwell sm_100+",
     ),
 ]
-
-_requires_non_sm107_prims_ts = pytest.mark.skipif(
-    torch.cuda.is_available() and torch.cuda.get_device_capability() == (10, 7),
-    reason="Prims-TS BatchedGemm supports SM100 and SM103, not SM107",
-)
 
 
 def _finalize_tmem(cfg):
@@ -81,16 +79,11 @@ def _mx_fc1_base(*, dtype_a):
         route_act=int(RouteImpl.TMA),
         route_sfs_act=int(RouteImpl.LDGSTS),
         act_kind=int(ActKind.SWIGLU),
-        tile_m=128,
         mma_m=128,
         mma_k=32,
         dtype_a=int(dtype_a),
         dtype_b=int(DType.MXE4M3),
         dtype_c=int(DType.MXE4M3),
-        sf_bits=8,
-        sf_block_size_a=32,
-        sf_block_size_b=32,
-        sf_block_size_c=32,
         sf_layout_a=int(SfLayout.R128c4),
         sf_layout_b=int(SfLayout.LINEAR),
         sf_layout_c=int(SfLayout.R8c4),
@@ -107,7 +100,6 @@ def _mx_fc1_base(*, dtype_a):
         copy_sf_regs=48,
         workid_regs=48,
         padding_regs=48,
-        gather_regs=48,
     )
 
 
@@ -123,17 +115,13 @@ def _mx_fc2_base(*, dtype_a, dtype_b):
         batch_mode=int(BatchMode.BATCH_N),
         transpose_mma_output=1,
         route_act=0,
-        route_sfs_act=0,
+        route_sfs_act=-1,
         act_kind=0,
-        tile_m=128,
         mma_m=128,
         mma_k=32,
         dtype_a=int(dtype_a),
         dtype_b=int(dtype_b),
         dtype_c=int(DType.BF16),
-        sf_bits=8,
-        sf_block_size_a=32,
-        sf_block_size_b=32,
         sf_layout_a=int(SfLayout.R128c4),
         sf_layout_b=int(SfLayout.R8c4),
         epilogue_regs=128,
@@ -165,11 +153,10 @@ def _mxfp4_bf16_base(*, has_activation_epilogue):
         route_act=(
             int(RouteImpl.LDGSTS) if has_activation_epilogue else int(RouteImpl.NONE)
         ),
-        route_sfs_act=int(RouteImpl.NONE),
+        route_sfs_act=int(RouteImpl.AUTO),
         act_kind=(
             int(ActKind.SWIGLU) if has_activation_epilogue else int(ActKind.NONE)
         ),
-        tile_m=128,
         tile_n=16,
         tile_k=256,
         epi_tile_n=16,
@@ -179,8 +166,6 @@ def _mxfp4_bf16_base(*, has_activation_epilogue):
         dtype_a=int(DType.MXE2M1),
         dtype_b=int(DType.BF16),
         dtype_c=int(DType.BF16),
-        sf_bits=8,
-        sf_block_size_a=32,
         sf_layout_a=int(SfLayout.R128c4),
         sf_layout_b=int(SfLayout.R8c4),
         **uniform_pipeline_stage_overrides(3),
@@ -198,11 +183,21 @@ def _mxfp4_bf16_base(*, has_activation_epilogue):
         copy_sf_regs=48,
         workid_regs=48,
         padding_regs=48,
-        gather_regs=48,
     )
 
 
-def _run_mx_fc1(cfg, *, num_tokens=128, problem_n=128, problem_k=None):
+def _run_mx_fc1(
+    cfg,
+    *,
+    num_tokens=128,
+    problem_n=128,
+    problem_k=None,
+    require_mixed_cga_runtime=False,
+    scale_c_value=None,
+    scale_gate_value=1.0,
+    c_row_stride=None,
+    c_partition_offset=0,
+):
     from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
         reference_check,
     )
@@ -215,12 +210,24 @@ def _run_mx_fc1(cfg, *, num_tokens=128, problem_n=128, problem_k=None):
         problem_n=problem_n,
         problem_k=problem_k or cfg["tile_k"],
         seed=123,
+        require_mixed_cga_runtime=require_mixed_cga_runtime,
+        scale_c_value=scale_c_value,
+        scale_gate_value=scale_gate_value,
+        c_row_stride=c_row_stride,
+        c_partition_offset=c_partition_offset,
         **cfg,
     )
     assert result
 
 
-def _run_mx_fc2(cfg, *, num_tokens=128, problem_n=None):
+def _run_mx_fc2(
+    cfg,
+    *,
+    num_tokens=128,
+    problem_n=None,
+    problem_k=None,
+    require_mixed_cga_runtime=False,
+):
     from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
         reference_check,
     )
@@ -231,13 +238,21 @@ def _run_mx_fc2(cfg, *, num_tokens=128, problem_n=None):
         num_tokens=num_tokens,
         top_k=1,
         problem_n=problem_n,
-        problem_k=cfg["tile_k"],
+        problem_k=cfg["tile_k"] if problem_k is None else problem_k,
+        require_mixed_cga_runtime=require_mixed_cga_runtime,
         **cfg,
     )
     assert result
 
 
-def _run_mxfp4_bf16(cfg, *, num_tokens=128, problem_n=128, problem_k=256):
+def _run_mxfp4_bf16(
+    cfg,
+    *,
+    num_tokens=128,
+    problem_n=128,
+    problem_k=256,
+    require_mixed_cga_runtime=False,
+):
     from flashinfer.prims_ts.batched_gemm.batched_gemm_run import (
         reference_check,
     )
@@ -250,6 +265,7 @@ def _run_mxfp4_bf16(cfg, *, num_tokens=128, problem_n=128, problem_k=256):
         problem_n=problem_n,
         problem_k=problem_k,
         seed=123,
+        require_mixed_cga_runtime=require_mixed_cga_runtime,
         **cfg,
     )
     assert result
@@ -296,7 +312,7 @@ def _mx_generated_json_rows():
                             "tile_n": shape[2],
                             "epi_tile_n": shape[3],
                             "tile_k": shape[4],
-                            "cluster_m": shape[5],
+                            "umma_cta_count": shape[5],
                             "stages": shape[6],
                             "num_stages_tmem_acc": 2,
                         },
@@ -323,7 +339,7 @@ def _mx_generated_json_rows():
                             "tile_n": tile_n,
                             "epi_tile_n": epi_n,
                             "tile_k": tile_k,
-                            "cluster_m": 2,
+                            "umma_cta_count": 2,
                             "stages": stages,
                             "num_stages_tmem_acc": 2,
                             "num_load_b_warps": 8 if tile_n == 128 else 1,
@@ -342,13 +358,14 @@ def _mx_generated_json_rows():
                         "sf_layout_b": SfLayout.LINEAR,
                         "sf_layout_c": SfLayout.R128c4,
                         "use_unroll": 0,
+                        "fuse_sf_copy_to_mma": 1,
                         "use_max_tmem_overlap": 1,
                         "mma_m": 256,
                         "mma_n": 256,
                         "tile_n": 256,
                         "epi_tile_n": 64,
                         "tile_k": tile_k,
-                        "cluster_m": 2,
+                        "umma_cta_count": 2,
                         "stages": stages,
                         "num_stages_tmem_acc": 1,
                         "num_load_b_warps": 8,
@@ -374,7 +391,7 @@ def _mx_generated_json_rows():
                         "tile_n": shape[2],
                         "epi_tile_n": shape[3],
                         "tile_k": shape[4],
-                        "cluster_m": shape[5],
+                        "umma_cta_count": shape[5],
                         "stages": shape[6],
                         "num_stages_tmem_acc": 2,
                     },
@@ -399,7 +416,7 @@ def _mx_generated_json_rows():
                         "tile_n": tile_n,
                         "epi_tile_n": 64,
                         "tile_k": tile_k,
-                        "cluster_m": 2,
+                        "umma_cta_count": 2,
                         "stages": stages,
                         "num_stages_tmem_acc": 2,
                         "epilogue_regs": 168,
@@ -414,13 +431,14 @@ def _mx_generated_json_rows():
                     "dtype_a": dtype_a,
                     "sf_layout_b": SfLayout.R128c4,
                     "use_unroll": 0,
+                    "fuse_sf_copy_to_mma": 1,
                     "use_max_tmem_overlap": 1,
                     "mma_m": 256,
                     "mma_n": 256,
                     "tile_n": 256,
                     "epi_tile_n": 64,
                     "tile_k": 128,
-                    "cluster_m": 2,
+                    "umma_cta_count": 2,
                     "stages": 5,
                     "num_stages_tmem_acc": 1,
                     "epilogue_regs": 144,
@@ -458,7 +476,7 @@ def _mxfp4_bf16_generated_json_rows():
         (64, 64, 64, 256, 2, 0),
         (128, 128, 128, 256, 2, 0),
     ]
-    for tile_n, mma_n, epi_n, mma_m, cluster_m, use_unroll in fc2_shapes:
+    for tile_n, mma_n, epi_n, mma_m, umma_cta_count, use_unroll in fc2_shapes:
         rows.append(
             (
                 "MxFp4xBf16_FC2",
@@ -468,7 +486,7 @@ def _mxfp4_bf16_generated_json_rows():
                     "mma_n": mma_n,
                     "epi_tile_n": epi_n,
                     "mma_m": mma_m,
-                    "cluster_m": cluster_m,
+                    "umma_cta_count": umma_cta_count,
                     "use_unroll": use_unroll,
                     "tile_scheduler": int(
                         TileScheduler.STATIC
@@ -478,7 +496,7 @@ def _mxfp4_bf16_generated_json_rows():
                 },
             )
         )
-    for tile_n, mma_n, epi_n, mma_m, cluster_m, use_unroll in fc1_shapes:
+    for tile_n, mma_n, epi_n, mma_m, umma_cta_count, use_unroll in fc1_shapes:
         rows.append(
             (
                 "MxFp4xBf16_FC1_SwiGLU",
@@ -488,7 +506,7 @@ def _mxfp4_bf16_generated_json_rows():
                     "mma_n": mma_n,
                     "epi_tile_n": epi_n,
                     "mma_m": mma_m,
-                    "cluster_m": cluster_m,
+                    "umma_cta_count": umma_cta_count,
                     "use_unroll": use_unroll,
                     "tile_scheduler": int(TileScheduler.PERSISTENT),
                 },
@@ -504,7 +522,7 @@ def _mxfp4_bf16_json_row_to_cfg(row):
         mma_n=row["mma_n"],
         epi_tile_n=row["epi_tile_n"],
         mma_m=row["mma_m"],
-        cluster_m=row["cluster_m"],
+        umma_cta_count=row["umma_cta_count"],
         # Generated MX rows may request the unroll-2x MMA path. TS parses that
         # option but rejects it in kernel validation until a matching MMA task
         # exists, so generated-row construction tests use the same boundary
@@ -542,7 +560,7 @@ def _mx_json_row_to_cfg(comment, row):
             copy_sf_regs=non_epilogue_regs,
             workid_regs=non_epilogue_regs,
             padding_regs=non_epilogue_regs,
-            gather_regs=non_epilogue_regs,
+            load_b_regs=non_epilogue_regs,
         )
     cfg.update(
         tile_n=row["tile_n"],
@@ -552,7 +570,7 @@ def _mx_json_row_to_cfg(comment, row):
         **uniform_pipeline_stage_overrides(row["stages"]),
         num_stages_tmem_acc=row["num_stages_tmem_acc"],
         mma_m=row["mma_m"],
-        cluster_m=row["cluster_m"],
+        umma_cta_count=row["umma_cta_count"],
         sf_layout_b=int(row["sf_layout_b"]),
         # Generated MX rows may request the unroll-2x MMA path. TS parses that
         # option but rejects it in kernel validation until a matching MMA task
@@ -560,6 +578,7 @@ def _mx_json_row_to_cfg(comment, row):
         # mapping as the benchmark driver.
         use_unroll_loop_2x_for_mma=0,
         use_max_tmem_overlap=row["use_max_tmem_overlap"],
+        fuse_sf_copy_to_mma=row["use_max_tmem_overlap"],
         use_tma_store=1,
         tile_scheduler=int(TileScheduler.PERSISTENT),
     )
@@ -629,7 +648,7 @@ class TestMxFp4Bf16Fc2:
             "mma_n": 8,
             "epi_tile_n": 8,
             "mma_m": 128,
-            "cluster_m": 1,
+            "umma_cta_count": 1,
         }
         _run_mxfp4_bf16(cfg, num_tokens=128, problem_n=128)
 
@@ -640,9 +659,30 @@ class TestMxFp4Bf16Fc2:
             "mma_n": 16,
             "epi_tile_n": 16,
             "mma_m": 256,
-            "cluster_m": 2,
+            "umma_cta_count": 2,
         }
         _run_mxfp4_bf16(cfg, num_tokens=128, problem_n=128)
+
+    def test_tile16_cluster2_mixed_cga(self):
+        """CastA FC2 under multiwave preferred and fallback CGAs."""
+        cfg = {
+            **_mxfp4_bf16_base(has_activation_epilogue=False),
+            "tile_n": 16,
+            "mma_n": 16,
+            "epi_tile_n": 16,
+            "mma_m": 256,
+            "umma_cta_count": 2,
+            "cluster_dim_x": 4,
+            "cluster_dim_y": 2,
+            "fallback_cluster_dim_x": 2,
+            "fallback_cluster_dim_y": 1,
+        }
+        _run_mxfp4_bf16(
+            cfg,
+            num_tokens=256,
+            problem_n=4096,
+            require_mixed_cga_runtime=True,
+        )
 
     def test_tile128_static_correctness(self):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
@@ -655,7 +695,7 @@ class TestMxFp4Bf16Fc2:
             "mma_n": 128,
             "epi_tile_n": 128,
             "mma_m": 256,
-            "cluster_m": 2,
+            "umma_cta_count": 2,
             "tile_scheduler": int(TileScheduler.STATIC),
             "num_stages_tmem_acc": 1,
         }
@@ -677,7 +717,7 @@ class TestMxFp4Bf16Fc1:
             "mma_n": 8,
             "epi_tile_n": 8,
             "mma_m": 128,
-            "cluster_m": 1,
+            "umma_cta_count": 1,
         }
         _run_mxfp4_bf16(cfg, num_tokens=128, problem_n=256)
 
@@ -693,11 +733,10 @@ class TestMxFp4Bf16Fc1:
             "mma_n": 8,
             "epi_tile_n": 8,
             "mma_m": 128,
-            "cluster_m": 1,
+            "umma_cta_count": 1,
         }
         _run_mxfp4_bf16(cfg, num_tokens=128, problem_n=256)
 
-    @_requires_non_sm107_prims_ts
     def test_tile16_cluster2_swiglu_persistent_correctness(self):
         cfg = {
             **_mxfp4_bf16_base(has_activation_epilogue=True),
@@ -705,9 +744,30 @@ class TestMxFp4Bf16Fc1:
             "mma_n": 16,
             "epi_tile_n": 16,
             "mma_m": 256,
-            "cluster_m": 2,
+            "umma_cta_count": 2,
         }
         _run_mxfp4_bf16(cfg, num_tokens=128, problem_n=256)
+
+    def test_tile16_cluster2_swiglu_mixed_cga(self):
+        """CastA plus LDGSTS gather under multiwave mixed CGAs."""
+        cfg = {
+            **_mxfp4_bf16_base(has_activation_epilogue=True),
+            "tile_n": 16,
+            "mma_n": 16,
+            "epi_tile_n": 16,
+            "mma_m": 256,
+            "umma_cta_count": 2,
+            "cluster_dim_x": 4,
+            "cluster_dim_y": 2,
+            "fallback_cluster_dim_x": 2,
+            "fallback_cluster_dim_y": 1,
+        }
+        _run_mxfp4_bf16(
+            cfg,
+            num_tokens=256,
+            problem_n=4096,
+            require_mixed_cga_runtime=True,
+        )
 
 
 class TestMxFc2LowLatency:
@@ -788,12 +848,67 @@ class TestMxFc2LowLatency:
             "epi_tile_n": 16,
             "tile_k": 256,
             "mma_m": 256,
-            "cluster_m": 2,
+            "umma_cta_count": 2,
             **uniform_pipeline_stage_overrides(6),
             "tile_scheduler": int(TileScheduler.PERSISTENT),
             "num_stages_tmem_acc": 2,
         }
         _run_mx_fc2(cfg, num_tokens=256)
+
+    @pytest.mark.arch_rubin
+    def test_mxfp4_mxfp8_tile16_k128_multistage_sfb_alignment(self):
+        from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
+            DType,
+            RouteImpl,
+            TileScheduler,
+        )
+
+        cfg = {
+            **_mx_fc2_base(
+                dtype_a=DType.MXE2M1,
+                dtype_b=DType.MXE4M3,
+            ),
+            "sm_arch": 107,
+            "route_sfs_act": int(RouteImpl.NONE),
+            "tile_n": 16,
+            "mma_n": 16,
+            "epi_tile_n": 16,
+            "tile_k": 128,
+            "mma_k": 64,
+            "num_stages_a": 8,
+            "num_stages_b": 16,
+            "num_stages_smem_sfa": 7,
+            "num_stages_smem_sfb": 9,
+            "num_stages_tmem_acc": 2,
+            "num_stages_tmem_sfa": 2,
+            "num_stages_tmem_sfb": 2,
+            "num_stages_c_smem": 0,
+            "num_load_a_warps": 1,
+            "num_load_b_warps": 1,
+            "num_load_sfa_warps": 1,
+            "num_load_sfb_warps": 1,
+            "epilogue_regs": 144,
+            "mma_regs": 56,
+            "load_a_regs": 56,
+            "load_b_regs": 56,
+            "load_sfa_regs": 56,
+            "load_sfb_regs": 56,
+            "copy_sf_regs": 56,
+            "workid_regs": 56,
+            "padding_regs": 56,
+            "tile_scheduler": int(TileScheduler.PERSISTENT),
+            "cluster_dim_x": 1,
+            "use_clc_fast_drain": 1,
+            "use_early_exit": 1,
+            "use_global_scales": 0,
+            "use_shuffled_matrix": 1,
+        }
+        _run_mx_fc2(
+            cfg,
+            num_tokens=1,
+            problem_n=3072,
+            problem_k=3072,
+        )
 
     def test_mxfp8_mxfp8_tile32_cluster_persistent(self):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
@@ -811,12 +926,44 @@ class TestMxFc2LowLatency:
             "epi_tile_n": 32,
             "tile_k": 256,
             "mma_m": 256,
-            "cluster_m": 2,
+            "umma_cta_count": 2,
             **uniform_pipeline_stage_overrides(5),
             "tile_scheduler": int(TileScheduler.PERSISTENT),
             "num_stages_tmem_acc": 2,
         }
         _run_mx_fc2(cfg, num_tokens=256)
+
+    def test_mxfp8_mxfp8_tile32_mixed_cga(self):
+        from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
+            DType,
+            TileScheduler,
+        )
+
+        cfg = {
+            **_mx_fc2_base(
+                dtype_a=DType.MXE4M3,
+                dtype_b=DType.MXE4M3,
+            ),
+            "tile_n": 32,
+            "mma_n": 32,
+            "epi_tile_n": 32,
+            "tile_k": 256,
+            "mma_m": 256,
+            "umma_cta_count": 2,
+            "cluster_dim_x": 4,
+            "cluster_dim_y": 2,
+            "fallback_cluster_dim_x": 2,
+            "fallback_cluster_dim_y": 1,
+            **uniform_pipeline_stage_overrides(5),
+            "tile_scheduler": int(TileScheduler.PERSISTENT),
+            "num_stages_tmem_acc": 2,
+        }
+        _run_mx_fc2(
+            cfg,
+            num_tokens=256,
+            problem_n=4096,
+            require_mixed_cga_runtime=True,
+        )
 
 
 class TestMxFc2HighThroughput:
@@ -837,7 +984,7 @@ class TestMxFc2HighThroughput:
             "epi_tile_n": 64,
             "tile_k": 128,
             "mma_m": 256,
-            "cluster_m": 2,
+            "umma_cta_count": 2,
             "sf_layout_b": int(SfLayout.R8c4),
             **uniform_pipeline_stage_overrides(7),
             "tile_scheduler": int(TileScheduler.PERSISTENT),
@@ -849,7 +996,7 @@ class TestMxFc2HighThroughput:
             "copy_sf_regs": 96,
             "workid_regs": 96,
             "padding_regs": 96,
-            "gather_regs": 96,
+            "load_b_regs": 96,
         }
         _run_mx_fc2(cfg, num_tokens=256)
 
@@ -871,13 +1018,64 @@ class TestMxFc2HighThroughput:
             "epi_tile_n": 64,
             "tile_k": 256,
             "mma_m": 256,
-            "cluster_m": 2,
+            "umma_cta_count": 2,
             "sf_layout_b": int(SfLayout.R128c4),
             **uniform_pipeline_stage_overrides(3),
             "tile_scheduler": int(TileScheduler.PERSISTENT),
             "num_stages_tmem_acc": 2,
         }
         _run_mx_fc2(cfg, num_tokens=128, problem_n=128)
+
+    @pytest.mark.parametrize("tile_k", (128, 256))
+    @pytest.mark.parametrize("copy_path", ("fused", "combined", "separate"))
+    @pytest.mark.timeout(240)
+    def test_mxfp4_mxfp8_tile256_r128c4_sfb_utccp(self, tile_k, copy_path):
+        """Exercise every R128c4 SFB UTCCP task with two N blocks and multi-K."""
+        from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
+            DType,
+            SfLayout,
+            TileScheduler,
+        )
+
+        fused = copy_path == "fused"
+        persistent = copy_path != "separate"
+        # Persistent scheduling cannot alias the C scratch with A/B, so three
+        # tile_k=256 stages exceed the 227 KiB SM100/SM103 SMEM budget.
+        small_smem = torch.cuda.get_device_capability() != (10, 7)
+        load_stages = 2 if persistent and tile_k == 256 and small_smem else 3
+        cfg = {
+            **_mx_fc2_base(
+                dtype_a=DType.MXE2M1,
+                dtype_b=DType.MXE4M3,
+            ),
+            "tile_n": 256,
+            "mma_n": 256,
+            "epi_tile_n": 64,
+            "tile_k": tile_k,
+            "mma_m": 256,
+            "umma_cta_count": 2,
+            "sf_layout_b": int(SfLayout.R128c4),
+            **uniform_pipeline_stage_overrides(load_stages, tmem_acc_stages=1),
+            "tile_scheduler": int(
+                TileScheduler.PERSISTENT if persistent else TileScheduler.STATIC
+            ),
+            "fuse_sf_copy_to_mma": int(fused),
+            "use_max_tmem_overlap": 0,
+            "epilogue_regs": 144,
+            "mma_regs": 96,
+            "load_regs": 96,
+            "load_sf_regs": 96,
+            "copy_sf_regs": 96,
+            "workid_regs": 96,
+            "padding_regs": 96,
+            "load_b_regs": 96,
+        }
+        _run_mx_fc2(
+            cfg,
+            num_tokens=512,
+            problem_n=512,
+            problem_k=4 * tile_k,
+        )
 
     def test_mxfp8_mxfp8_tile256_k128_tmem_overlap(self):
         from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
@@ -896,11 +1094,12 @@ class TestMxFc2HighThroughput:
             "epi_tile_n": 64,
             "tile_k": 128,
             "mma_m": 256,
-            "cluster_m": 2,
+            "umma_cta_count": 2,
             "sf_layout_b": int(SfLayout.R128c4),
             **uniform_pipeline_stage_overrides(5),
             "tile_scheduler": int(TileScheduler.PERSISTENT),
             "num_stages_tmem_acc": 1,
+            "fuse_sf_copy_to_mma": 1,
             "use_max_tmem_overlap": 1,
             "epilogue_regs": 144,
             "mma_regs": 96,
@@ -909,9 +1108,53 @@ class TestMxFc2HighThroughput:
             "copy_sf_regs": 96,
             "workid_regs": 96,
             "padding_regs": 96,
-            "gather_regs": 96,
+            "load_b_regs": 96,
         }
         _run_mx_fc2(cfg, num_tokens=128, problem_n=128)
+
+    @pytest.mark.parametrize("epi_tile_n", (64, 32))
+    @pytest.mark.timeout(240)
+    def test_mxfp4_mxfp8_tile256_tmem_overlap_window(self, epi_tile_n):
+        """Keep fused scale factors outside both tile-256 accumulator sets."""
+        from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
+            DType,
+            SfLayout,
+            TileScheduler,
+        )
+
+        tile_k = 128
+        cfg = {
+            **_mx_fc2_base(
+                dtype_a=DType.MXE2M1,
+                dtype_b=DType.MXE4M3,
+            ),
+            "tile_n": 256,
+            "mma_n": 256,
+            "epi_tile_n": epi_tile_n,
+            "tile_k": tile_k,
+            "mma_m": 256,
+            "umma_cta_count": 2,
+            "sf_layout_b": int(SfLayout.R128c4),
+            **uniform_pipeline_stage_overrides(5),
+            "tile_scheduler": int(TileScheduler.PERSISTENT),
+            "num_stages_tmem_acc": 1,
+            "fuse_sf_copy_to_mma": 1,
+            "use_max_tmem_overlap": 1,
+            "epilogue_regs": 144,
+            "mma_regs": 96,
+            "load_regs": 96,
+            "load_sf_regs": 96,
+            "copy_sf_regs": 96,
+            "workid_regs": 96,
+            "padding_regs": 96,
+            "load_b_regs": 96,
+        }
+        _run_mx_fc2(
+            cfg,
+            num_tokens=2048,
+            problem_n=4096,
+            problem_k=tile_k,
+        )
 
 
 class TestMxFc1LowLatency:
@@ -928,7 +1171,7 @@ class TestMxFc1LowLatency:
             "tile_k": 512,
             **uniform_pipeline_stage_overrides(3),
             "mma_m": 128,
-            "cluster_m": 1,
+            "umma_cta_count": 1,
         }
         _run_mx_fc1(cfg, problem_k=512)
 
@@ -946,7 +1189,7 @@ class TestMxFc1LowLatency:
             "tile_k": 512,
             **uniform_pipeline_stage_overrides(3),
             "mma_m": 128,
-            "cluster_m": 1,
+            "umma_cta_count": 1,
         }
         _run_mx_fc1(cfg, problem_k=512)
 
@@ -963,7 +1206,7 @@ class TestMxFc1LowLatency:
             "tile_k": 256,
             **uniform_pipeline_stage_overrides(5),
             "mma_m": 256,
-            "cluster_m": 2,
+            "umma_cta_count": 2,
         }
         _run_mx_fc1(cfg, num_tokens=256)
 
@@ -980,9 +1223,33 @@ class TestMxFc1LowLatency:
             "tile_k": 256,
             **uniform_pipeline_stage_overrides(5),
             "mma_m": 256,
-            "cluster_m": 2,
+            "umma_cta_count": 2,
         }
         _run_mx_fc1(cfg, num_tokens=256)
+
+    def test_mxfp8_mxfp8_tile32_mixed_cga(self):
+        from flashinfer.prims_ts.batched_gemm.batched_gemm_config import DType
+
+        cfg = {
+            **_mx_fc1_base(dtype_a=DType.MXE4M3),
+            "tile_n": 32,
+            "mma_n": 32,
+            "epi_tile_n": 32,
+            "tile_k": 256,
+            **uniform_pipeline_stage_overrides(5),
+            "mma_m": 256,
+            "umma_cta_count": 2,
+            "cluster_dim_x": 4,
+            "cluster_dim_y": 2,
+            "fallback_cluster_dim_x": 2,
+            "fallback_cluster_dim_y": 1,
+        }
+        _run_mx_fc1(
+            cfg,
+            num_tokens=256,
+            problem_n=4096,
+            require_mixed_cga_runtime=True,
+        )
 
 
 class TestMxFc1HighThroughput:
@@ -1007,11 +1274,12 @@ class TestMxFc1HighThroughput:
             "tile_k": tile_k,
             **uniform_pipeline_stage_overrides(stages),
             "mma_m": 256,
-            "cluster_m": 2,
+            "umma_cta_count": 2,
             "sf_layout_c": int(SfLayout.R128c4),
             "num_load_b_warps": 8,
             "num_load_sfb_warps": 4,
             "num_stages_tmem_acc": 1,
+            "fuse_sf_copy_to_mma": 1,
             "use_max_tmem_overlap": 1,
             "use_tma_store": 1,
             "epilogue_regs": 112,
@@ -1023,7 +1291,6 @@ class TestMxFc1HighThroughput:
             "copy_sf_regs": 88,
             "workid_regs": 88,
             "padding_regs": 88,
-            "gather_regs": 88,
         }
         _run_mx_fc1(
             cfg,
@@ -1046,7 +1313,7 @@ class TestMxFc1HighThroughput:
             "tile_k": 128,
             **uniform_pipeline_stage_overrides(7),
             "mma_m": 256,
-            "cluster_m": 2,
+            "umma_cta_count": 2,
             "sf_layout_c": int(SfLayout.R8c4),
             "epilogue_regs": 168,
         }
@@ -1066,7 +1333,7 @@ class TestMxFc1HighThroughput:
             "tile_k": 128,
             **uniform_pipeline_stage_overrides(7),
             "mma_m": 256,
-            "cluster_m": 2,
+            "umma_cta_count": 2,
             "sf_layout_c": int(SfLayout.R128c4),
             "num_load_b_warps": 8,
             "num_load_sfb_warps": 4,
@@ -1089,7 +1356,7 @@ class TestMxFc1HighThroughput:
             "tile_k": 256,
             **uniform_pipeline_stage_overrides(3),
             "mma_m": 256,
-            "cluster_m": 2,
+            "umma_cta_count": 2,
             "sf_layout_c": int(SfLayout.R128c4),
             "num_load_b_warps": 8,
             "num_load_sfb_warps": 4,
@@ -1162,7 +1429,6 @@ class TestMxFc1QuantizedEpilogue:
                 route_act=int(RouteImpl.TMA),
                 route_sfs_act=int(RouteImpl.LDGSTS),
                 act_kind=int(ActKind.SWIGLU),
-                tile_m=128,
                 tile_n=8,
                 tile_k=256,
                 epi_tile_n=8,
@@ -1172,10 +1438,6 @@ class TestMxFc1QuantizedEpilogue:
                 dtype_a=int(DType.MXE2M1),
                 dtype_b=int(DType.MXE4M3),
                 dtype_c=int(DType.MXE4M3),
-                sf_bits=8,
-                sf_block_size_a=32,
-                sf_block_size_b=32,
-                sf_block_size_c=32,
                 sf_layout_a=int(SfLayout.R128c4),
                 sf_layout_b=int(SfLayout.LINEAR),
                 sf_layout_c=int(SfLayout.R8c4),
@@ -1190,7 +1452,6 @@ class TestMxFc1QuantizedEpilogue:
                 copy_sf_regs=48,
                 workid_regs=48,
                 padding_regs=48,
-                gather_regs=48,
             )
         )
         result = reference_check(
@@ -1203,3 +1464,67 @@ class TestMxFc1QuantizedEpilogue:
             **cfg,
         )
         assert result
+
+    @requires_dsl_4_8_for_c_partition_offset
+    @pytest.mark.parametrize(
+        "dtype_a,use_tma_store,tile_n,epi_tile_n,umma_cta_count,mma_m,sf_layout_c",
+        (
+            ("mxfp4", 1, 8, 8, 1, 128, "r8c4"),
+            ("mxfp4", 0, 8, 8, 1, 128, "r8c4"),
+            ("mxfp4", 0, 32, 32, 1, 128, "r8c4"),
+            ("mxfp4", 1, 64, 32, 1, 128, "r8c4"),
+            ("mxfp8", 1, 32, 32, 2, 256, "r128c4"),
+        ),
+    )
+    @pytest.mark.parametrize(
+        "act_kind",
+        (ActKind.RELU2, ActKind.SILU),
+        ids=("relu2", "silu"),
+    )
+    def test_eltwise_to_mxfp8(
+        self,
+        dtype_a,
+        use_tma_store,
+        tile_n,
+        epi_tile_n,
+        umma_cta_count,
+        mma_m,
+        sf_layout_c,
+        act_kind,
+    ):
+        from flashinfer.prims_ts.batched_gemm.batched_gemm_config import (
+            DType,
+            SfLayout,
+        )
+
+        input_dtype = DType.MXE2M1 if dtype_a == "mxfp4" else DType.MXE4M3
+        output_sf_layout = SfLayout.R8c4 if sf_layout_c == "r8c4" else SfLayout.R128c4
+        load_stages = 4 if tile_n > epi_tile_n else 5
+        cfg = {
+            **_mx_fc1_base(dtype_a=input_dtype),
+            "act_kind": int(act_kind),
+            "has_gemm1_clamp_limit": 0,
+            "dtype_c": int(DType.MXE4M3),
+            "tile_n": tile_n,
+            "mma_n": tile_n,
+            "epi_tile_n": epi_tile_n,
+            "tile_k": 256,
+            **uniform_pipeline_stage_overrides(load_stages),
+            "mma_m": mma_m,
+            "umma_cta_count": umma_cta_count,
+            "sf_layout_c": int(output_sf_layout),
+            "use_tma_store": use_tma_store,
+            "use_shuffled_matrix": 1,
+            "tile_scheduler": int(umma_cta_count == 2),
+            "num_stages_tmem_acc": 2 if umma_cta_count == 2 else 1,
+        }
+        _run_mx_fc1(
+            cfg,
+            num_tokens=130,
+            problem_n=128,
+            problem_k=256,
+            scale_c_value=0.5,
+            scale_gate_value=0.25,
+            c_row_stride=192,
+            c_partition_offset=32,
+        )

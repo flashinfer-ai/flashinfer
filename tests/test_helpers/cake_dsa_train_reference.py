@@ -168,6 +168,92 @@ def globalize_gather_indices_loop(
     )
 
 
+DOUT_LAYOUTS = ("contiguous", "head_major")
+
+
+def _randn_dout(total_q: int, layout: str, gen, device) -> torch.Tensor:
+    """``dout [T, 64, 512]`` BF16: contiguous, or the ``[T, 64, 512]`` view of a ``[64, T, 512]`` buffer
+    (strides ``[512, T * 512, 1]``, the layout an output projection hands back)."""
+    if layout not in DOUT_LAYOUTS:
+        raise ValueError(f"dout_layout must be one of {DOUT_LAYOUTS}, got {layout!r}")
+    if layout == "head_major":
+        return _randn_bf16((NUM_HEADS, total_q, D_LATENT), gen, device).permute(1, 0, 2)
+    return _randn_bf16((total_q, NUM_HEADS, D_LATENT), gen, device)
+
+
+def last_valid_plus_one(
+    indices: torch.Tensor, num_kv: int, topk_length: Optional[torch.Tensor] = None
+) -> torch.Tensor:
+    """``[T]`` int32: position of the last valid slot + 1 per row (0 for a row without one) -- the
+    position-preserving length rule of the shipped package (``derive_topk_length``) under the flat validity rule
+    ``0 <= idx < num_kv`` and, when given, ``slot < topk_length[t]``.  On a valid-first row it equals the valid
+    count; the difference ``last_valid_plus_one - count`` is the number of hole slots the kernels used to process."""
+    valid = (indices >= 0) & (indices < int(num_kv))
+    pos = torch.arange(
+        1, indices.shape[1] + 1, device=indices.device, dtype=torch.int32
+    )
+    if topk_length is not None:
+        valid &= pos[None, :] <= topk_length[:, None]
+    return torch.where(valid, pos, 0).amax(dim=-1)
+
+
+derive_topk_length = last_valid_plus_one  # the package's test-only length rule
+
+
+def compact_rows(
+    indices: torch.Tensor, num_kv: int, topk_length: Optional[torch.Tensor] = None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Stable compaction of index rows: ``(rows, counts)``.
+
+    A slot is valid iff ``0 <= idx < num_kv`` and, with ``topk_length``, its position is below
+    ``topk_length[t]`` (the caller's length is a position cut applied before the compaction).  Row ``t`` of
+    ``rows`` holds its valid slots first, in ascending original slot order, then ``-1``; ``counts[t]`` is the
+    valid count.  This is the torch twin of the compacting index-preparation stage (and of
+    ``nope_compact_indices`` / ``offset_gather_kv_indices(..., compact=True)`` on already globalized rows): a
+    stable argsort of the invalidity flags, a gather, a ``-1`` fill.  Valid-first rows are a fixed point (same
+    bytes, ``count == last valid slot + 1``).
+
+    The order matters: the exact FP64 forward and gradients are permutation-invariant over a row's valid set,
+    but the emulated bf16 floors (:func:`_out_emu_lazy_rescale` walks the row in 64-slot tiles in slot order)
+    are not -- moving a key across a tile boundary changes the tile maxima, the rescale points and the bf16
+    roundings of P.  The floor of a hole row must therefore be evaluated on the order the kernel processes:
+    the compacted order for the compacting entries (``reference_fp64_nope(..., compact=True)``), the raw order
+    for the eager kernel-level entries, which keep raw-row semantics.
+    """
+    valid = (indices >= 0) & (indices < int(num_kv))
+    if topk_length is not None:
+        slot = torch.arange(indices.shape[1], device=indices.device)
+        valid &= slot[None, :] < topk_length[:, None].long()
+    order = (~valid).to(torch.int8).argsort(dim=-1, stable=True)
+    rows = torch.where(valid, indices, indices.new_full((), -1)).gather(-1, order)
+    return rows.contiguous(), valid.sum(-1, dtype=torch.int32)
+
+
+def compact_rows_loop(rows: list[list[int]], num_kv: int) -> list[list[int]]:
+    """Plain-Python stable compaction of host rows (the second oracle next to :func:`compact_rows`)."""
+    width = len(rows[0]) if rows else 0
+    out = []
+    for row in rows:
+        kept = [int(v) for v in row if 0 <= int(v) < int(num_kv)]
+        out.append(kept + [-1] * (width - len(kept)))
+    return out
+
+
+def hole_stats(indices: torch.Tensor, num_kv: int) -> dict:
+    """Geometry of a hole row set: the valid count, the slots the position-preserving rule processes
+    (``sum(last valid + 1)``), the fraction of rows with at least one hole before their last valid slot."""
+    counts = compact_rows(indices, num_kv)[1].long()
+    last = last_valid_plus_one(indices, num_kv).long()
+    rows = max(int(indices.shape[0]), 1)
+    return dict(
+        valid_keys=int(counts.sum()),
+        sum_last_valid_plus_one=int(last.sum()),
+        sum_counts=int(counts.sum()),
+        rows_with_holes=int((last > counts).sum()),
+        rows_with_holes_frac=float((last > counts).sum()) / rows,
+    )
+
+
 def make_inputs(
     seq_q,
     seq_k,
@@ -176,6 +262,7 @@ def make_inputs(
     topk: int = DEFAULT_TOPK,
     self_including: bool = False,
     beta: float = 0.0,
+    dout_layout: str = "contiguous",
     device="cuda",
 ) -> Inputs:
     """Seeded BF16 inputs for documents of lengths ``seq_q`` / ``seq_k``.
@@ -183,6 +270,8 @@ def make_inputs(
     ``beta > 0`` adds ``beta * (own key)`` to every query so its own key
     dominates the softmax (peaked attention); the query's own key must be in
     the selection (``self_including``) for that to be meaningful.
+    ``dout_layout="head_major"`` stores ``dout`` as ``[64, T, 512]`` and returns the
+    ``[T, 64, 512]`` view with strides ``[512, T * 512, 1]`` (the recorded trainer layout).
     """
     seq_q, seq_k = [int(x) for x in seq_q], [int(x) for x in seq_k]
     if len(seq_q) != len(seq_k) or any(
@@ -199,7 +288,7 @@ def make_inputs(
     q_rope = _randn_bf16((total_q, NUM_HEADS, D_ROPE), gen, device)
     kv_latent = _randn_bf16((total_k, D_LATENT), gen, device)
     k_rope = _randn_bf16((total_k, D_ROPE), gen, device)
-    dout = _randn_bf16((total_q, NUM_HEADS, D_LATENT), gen, device)
+    dout = _randn_dout(total_q, dout_layout, gen, device)
     cu_q = [0] + torch.tensor(seq_q).cumsum(0).tolist()
     cu_k = [0] + torch.tensor(seq_k).cumsum(0).tolist()
     locals_, globals_, own = [], [], []
@@ -248,6 +337,7 @@ def reference_fp64(
     own_key: Optional[torch.Tensor] = None,
     chunk_rows: int = 256,
     consume: Optional[Callable[[int, int, dict], None]] = None,
+    compact: bool = False,
 ) -> dict:
     """Chunked FP64 reference from the BF16 inputs.
 
@@ -260,7 +350,11 @@ def reference_fp64(
     ``dk_rope [S, 64]`` plus their ``*_emu`` BF16-P/dS numerics floors (P and dS
     rounded to BF16 at the MMA inputs, BF16 outputs); with ``own_key`` also the mean softmax mass on the
     query's own key (``self_weight``).  Slots that are ``-1``, ``>= S`` or
-    ``>= topk_length[t]`` are invalid.
+    ``>= topk_length[t]`` are invalid.  ``compact=True`` evaluates the row as a
+    compacting entry processes it (:func:`compact_rows` after the ``topk_length``
+    cut, lengths = counts); every quantity here is permutation-invariant over the
+    valid set (the exact-max emulation included), so only the slot order of the
+    inputs the kernels see changes, not the numbers.
 
     With ``consume`` the per-query results are streamed instead of kept: after
     every ``chunk_rows`` query rows ``consume(r0, r1, chunk)`` receives the
@@ -272,6 +366,8 @@ def reference_fp64(
     """
     device = q_latent.device
     total_q, total_k = int(q_latent.shape[0]), int(kv_latent.shape[0])
+    if compact:
+        indices, topk_length = compact_rows(indices, total_k, topk_length)
     kf, vf = k_rope.double(), kv_latent.double()
     want_grad = dout is not None
     stream = consume is not None
@@ -507,6 +603,7 @@ def pooled_topk_local(
     pools: int,
     self_including: bool = False,
     chunk_rows: int = 1024,
+    tail_col: Optional[int] = None,
 ) -> torch.Tensor:
     """Document-relative pooled selection for one document (the GLM-5.3 index structure).
 
@@ -518,11 +615,27 @@ def pooled_topk_local(
     complete candidate), then ``-1`` padding.  Valid slots come first and every valid key
     satisfies ``key <= pos``.  ``self_including`` forces the query's own pool when the own
     key is not already in the tail.  Needs ``4 * pools + 3 <= topk``.
+
+    ``tail_col`` (the fixed-column selector of the hole rows): the tail is written at
+    columns ``tail_col .. tail_col + 2`` instead of right after the pool keys, and the
+    slots between ``4 * n_sel`` and ``tail_col`` stay ``-1``.  A row then has holes iff it
+    holds fewer than ``pools`` complete pools (``pos < 4 * pools - 1``) and a tail exists
+    (``pos % 4 != 3``): 3/4 of the rows of a short document, 36-38 % of a CP rank that
+    holds document starts -- the fractions the issue reports (37 % / 76 %), which is the
+    evidence for this layout; the trainer's real slot layout is not public.  Needs
+    ``4 * pools <= tail_col`` and ``tail_col + 3 <= topk``.
     """
     pools = int(pools)
     if POOL_TOKENS * pools + TAIL_SLOTS > topk:
         raise ValueError(
             f"pooled selection needs 4 * pools + 3 <= topk, got pools={pools}, topk={topk}"
+        )
+    if tail_col is not None and not (
+        POOL_TOKENS * pools <= int(tail_col) and int(tail_col) + TAIL_SLOTS <= topk
+    ):
+        raise ValueError(
+            f"the fixed tail column needs 4 * pools <= tail_col <= topk - 3, got tail_col={tail_col}, "
+            f"pools={pools}, topk={topk}"
         )
     out = torch.full((seq_q, topk), -1, dtype=torch.int32, device=device)
     big = torch.iinfo(torch.int32).max
@@ -555,7 +668,10 @@ def pooled_topk_local(
         tail_n = torch.where(
             pos % POOL_TOKENS == POOL_TOKENS - 1, 0, pos % POOL_TOKENS + 1
         )
-        base = POOL_TOKENS * n_sel  # first free slot after the pool keys
+        if tail_col is None:
+            base = POOL_TOKENS * n_sel  # first free slot after the pool keys
+        else:
+            base = torch.full_like(n_sel, int(tail_col))
         first_tail = POOL_TOKENS * (pos // POOL_TOKENS)
         for j in range(TAIL_SLOTS):
             rows = torch.nonzero(tail_n > j, as_tuple=True)[0]
@@ -564,10 +680,55 @@ def pooled_topk_local(
         assert bool((block[valid] <= pos[:, None].expand_as(block)[valid]).all()), (
             "pooled key after its query"
         )
-        assert bool(((block >= 0).int().diff(dim=1) <= 0).all()), (
-            "pooled row is not valid-first"
-        )
+        if tail_col is None:
+            assert bool(((block >= 0).int().diff(dim=1) <= 0).all()), (
+                "pooled row is not valid-first"
+            )
     return out
+
+
+def repro_gap_local(
+    seq_q: int,
+    seq_k: int,
+    topk: int,
+    device,
+    *,
+    front: int = 1024,
+    tail: int = 4,
+    tail_col: int = 2048,
+    twin: Optional[str] = None,
+) -> torch.Tensor:
+    """The index rows of the issue's repro (FlashInfer #7041, ask 1) for one document, generalised to a query
+    segment that is the tail of its key prefix (``pos = seq_k - seq_q + i``; the issue has ``seq_q == seq_k``).
+
+    Row ``i``: the ``front`` keys ``pos - tail - j`` (``j < front``, ``-1`` where negative) in columns
+    ``0:front`` -- descending key ids --, ``-1`` in ``front:tail_col``, the ``tail`` newest keys ``pos - j`` at
+    columns ``tail_col:tail_col + tail``, ``-1`` after; valid count ``min(pos + 1, front + tail)``.  Rows with
+    ``pos >= front + tail - 1`` have a hole gap of exactly ``tail_col - front`` slots (16 tiles of 64 at the
+    issue's 1024 .. 2047).  ``twin="issue"`` returns the issue's own compacted twin instead: the same keys sorted
+    in descending order into columns ``0:front + tail`` -- NOT the stable compaction of the hole row
+    (``[front..., tail...]``, :func:`compact_rows`), which reorders nothing within the two runs.
+    """
+    if not (front <= tail_col and tail_col + tail <= topk):
+        raise ValueError(
+            f"repro rows need front <= tail_col and tail_col + tail <= topk, got {front}, {tail_col}, {tail}, {topk}"
+        )
+    if twin not in (None, "issue"):
+        raise ValueError(f"twin must be None or 'issue', got {twin!r}")
+    pos = torch.arange(seq_q, device=device, dtype=torch.int32)[:, None] + (
+        int(seq_k) - int(seq_q)
+    )
+    fr = pos - tail - torch.arange(front, device=device, dtype=torch.int32)
+    tl = pos - torch.arange(tail, device=device, dtype=torch.int32)
+    fr, tl = torch.where(fr >= 0, fr, -1), torch.where(tl >= 0, tl, -1)
+    rows = torch.full((seq_q, topk), -1, device=device, dtype=torch.int32)
+    if twin == "issue":
+        both = torch.cat([tl, fr], dim=1)
+        rows[:, : front + tail] = both.sort(dim=1, descending=True).values
+        return rows
+    rows[:, :front] = fr
+    rows[:, tail_col : tail_col + tail] = tl
+    return rows
 
 
 @dataclass
@@ -584,17 +745,33 @@ class NopeInputs:
     )  # [T, 64, 512] BF16, contiguous or the head-major view [512, T * 512, 1]
     cu_seqlens_q: torch.Tensor
     cu_seqlens_k: torch.Tensor
-    idx_local: torch.Tensor  # document-relative, -1 padded (valid first)
+    idx_local: (
+        torch.Tensor
+    )  # document-relative, -1 padded (valid first unless the index kind has holes)
     idx_global: torch.Tensor  # global key rows, -1 padded
-    topk_length: torch.Tensor
+    topk_length: (
+        torch.Tensor
+    )  # the valid count per row (== last valid + 1 on valid-first rows)
     own_key: torch.Tensor  # global key row of each query's own token
-    index: str  # "pooled" | "iid"
+    index: str  # one of NOPE_INDEX_KINDS, "+stable" appended by compacted_twin
     pools: Optional[int]
     dout_layout: str  # "contiguous" | "head_major"
 
     @property
     def total_q(self) -> int:
         return int(self.q.shape[0])
+
+    @property
+    def has_holes(self) -> bool:
+        """Whether some row has an invalid slot before its last valid one."""
+        return bool(
+            (
+                last_valid_plus_one(self.idx_global, self.total_k) > self.topk_length
+            ).any()
+        )
+
+    def hole_stats(self) -> dict:
+        return hole_stats(self.idx_global, self.total_k)
 
     @property
     def total_k(self) -> int:
@@ -623,6 +800,20 @@ class NopeInputs:
         )
 
 
+# Index structures of ``make_nope_inputs``: the two valid-first draws and the three hole layouts of FlashInfer
+# #7041 (``pooled_fixed_tail``: the pool keys in ascending order, the open pool's causal tail at the fixed column
+# ``4 * pools``; ``repro_gap``: the issue's repro rows; ``repro_compact_issue``: the issue's descending-sorted
+# twin of those rows, valid-first).
+NOPE_INDEX_KINDS = (
+    "pooled",
+    "iid",
+    "pooled_fixed_tail",
+    "repro_gap",
+    "repro_compact_issue",
+)
+REPRO_FRONT, REPRO_TAIL, REPRO_TAIL_COL = 1024, 4, 2048
+
+
 def make_nope_inputs(
     seq_q,
     seq_k,
@@ -640,7 +831,15 @@ def make_nope_inputs(
 
     ``index="pooled"`` draws the GLM-5.3 pool structure with capacity ``pools`` (default
     ``nope_pools(topk)``, the largest the width holds); ``"iid"`` draws
-    :func:`causal_topk_local` (``min(pos + 1, topk)`` distinct keys).  ``beta > 0`` adds
+    :func:`causal_topk_local` (``min(pos + 1, topk)`` distinct keys); both are valid-first.
+    The hole layouts (:data:`NOPE_INDEX_KINDS`): ``"pooled_fixed_tail"`` is the pooled draw
+    with the open pool's tail at the fixed column ``4 * pools`` (:func:`pooled_topk_local`
+    with ``tail_col``), ``"repro_gap"`` the issue's repro rows (:func:`repro_gap_local`:
+    1024 front keys, a gap to column 2048, 4 tail keys; ``topk >= 2052``) and
+    ``"repro_compact_issue"`` their descending-sorted twin.  ``topk_length`` is the valid
+    count of every row (what a compacting entry produces; on valid-first rows also the
+    position-preserving last valid + 1); :func:`compacted_twin` gives the stable
+    compaction of a hole draw sharing every other tensor.  ``beta > 0`` adds
     ``beta * (own key)`` to every query (peaked attention; pair with ``self_including``).
     ``dout_layout="head_major"`` stores ``dout`` as ``[64, T, 512]`` and returns the
     ``[T, 64, 512]`` view with strides ``[512, T * 512, 1]`` (the recorded trainer layout).
@@ -652,31 +851,47 @@ def make_nope_inputs(
         raise ValueError(
             "documents need seq_q <= seq_k, one key length per query length"
         )
-    if index not in ("pooled", "iid"):
-        raise ValueError(f"index must be 'pooled' or 'iid', got {index!r}")
-    if dout_layout not in ("contiguous", "head_major"):
+    if index not in NOPE_INDEX_KINDS:
+        raise ValueError(f"index must be one of {NOPE_INDEX_KINDS}, got {index!r}")
+    if dout_layout not in DOUT_LAYOUTS:
         raise ValueError(
             f"dout_layout must be 'contiguous' or 'head_major', got {dout_layout!r}"
         )
+    pooled = index in ("pooled", "pooled_fixed_tail")
     if pools is None:
-        pools = nope_pools(topk) if index == "pooled" else None
+        pools = nope_pools(topk) if pooled else None
     device = torch.device(device)
     gen = torch.Generator(device=device)
     gen.manual_seed(seed)
     total_q, total_k = sum(seq_q), sum(seq_k)
     q = _randn_bf16((total_q, NUM_HEADS, D_LATENT), gen, device)
     kv = _randn_bf16((total_k, D_LATENT), gen, device)
-    if dout_layout == "head_major":
-        dout = _randn_bf16((NUM_HEADS, total_q, D_LATENT), gen, device).permute(1, 0, 2)
-    else:
-        dout = _randn_bf16((total_q, NUM_HEADS, D_LATENT), gen, device)
+    dout = _randn_dout(total_q, dout_layout, gen, device)
     cu_q = [0] + torch.tensor(seq_q).cumsum(0).tolist()
     cu_k = [0] + torch.tensor(seq_k).cumsum(0).tolist()
     locals_, globals_, own = [], [], []
     for d, (lq, lk) in enumerate(zip(seq_q, seq_k, strict=True)):
-        if index == "pooled":
+        if pooled:
             loc = pooled_topk_local(
-                lq, lk, topk, gen, device, pools=pools, self_including=self_including
+                lq,
+                lk,
+                topk,
+                gen,
+                device,
+                pools=pools,
+                self_including=self_including,
+                tail_col=POOL_TOKENS * pools if index == "pooled_fixed_tail" else None,
+            )
+        elif index in ("repro_gap", "repro_compact_issue"):
+            loc = repro_gap_local(
+                lq,
+                lk,
+                topk,
+                device,
+                front=REPRO_FRONT,
+                tail=REPRO_TAIL,
+                tail_col=REPRO_TAIL_COL,
+                twin="issue" if index == "repro_compact_issue" else None,
             )
         else:
             loc = causal_topk_local(
@@ -706,6 +921,34 @@ def make_nope_inputs(
         index=index,
         pools=pools,
         dout_layout=dout_layout,
+    )
+
+
+def compacted_twin(inp: NopeInputs) -> NopeInputs:
+    """The stable compaction of a NoPE draw: the same ``q`` / ``kv`` / ``dout`` tensors (shared, not copied)
+    with ``idx_local`` / ``idx_global`` replaced by :func:`compact_rows` of each (the generator's keys are
+    all inside their document, so the local and the global compaction select the same slots) and the same
+    counts.  Hole rows and their twin thus hold identical key sets per row; a valid-first draw is returned
+    unchanged in content."""
+    local, counts = compact_rows(inp.idx_local, torch.iinfo(torch.int32).max)
+    glob, counts_g = compact_rows(inp.idx_global, inp.total_k)
+    assert torch.equal(counts, counts_g) and torch.equal(counts, inp.topk_length)
+    return NopeInputs(
+        seq_q=inp.seq_q,
+        seq_k=inp.seq_k,
+        topk=inp.topk,
+        q=inp.q,
+        kv=inp.kv,
+        dout=inp.dout,
+        cu_seqlens_q=inp.cu_seqlens_q,
+        cu_seqlens_k=inp.cu_seqlens_k,
+        idx_local=local,
+        idx_global=glob,
+        topk_length=counts,
+        own_key=inp.own_key,
+        index=inp.index + "+stable",
+        pools=inp.pools,
+        dout_layout=inp.dout_layout,
     )
 
 
@@ -838,6 +1081,7 @@ def reference_fp64_nope(
     chunk_rows: int = 256,
     consume: Optional[Callable[[int, int, dict], None]] = None,
     out_emu_model: str = "lazy_rescale",
+    compact: bool = False,
 ) -> dict:
     """Chunked FP64 reference of the NoPE problem from the BF16 inputs (the oracle of
     GOAL §5 for the zero-RoPE family; ``indices`` are global key rows).
@@ -846,6 +1090,16 @@ def reference_fp64_nope(
     the forward kernel places it (running row maximum with the threshold-6 lazy rescale
     over 64-slot tiles, see :func:`_out_emu_lazy_rescale`); ``"exact_max"`` rounds P
     relative to the exact row maximum (the earlier, optimistic model).
+
+    ``compact``: the slot order the floors are emulated on.  The exact ``out`` / ``lse`` /
+    ``dq`` / ``dkv`` are permutation-invariant over a row's valid set, the lazy-rescale
+    emulation is not (it walks the row in 64-slot tiles in slot order; an all-invalid tile
+    contributes exact zeros, a key moved across a tile boundary changes the tile maxima,
+    the rescale points and the bf16 roundings of P).  ``compact=False`` (default) emulates
+    the raw row -- the order the eager kernel-level entries process; ``compact=True``
+    first applies :func:`compact_rows` (after the ``topk_length`` cut, lengths = counts) --
+    the order the compacting entries (the packed NoPE entry, the flat autograd entry
+    without caller lengths) process.  On valid-first rows both orders coincide.
 
     The emulated gradients ``dq_emu`` / ``dkv_emu`` take the softmax row sum ``delta`` the
     way the backward kernel reads it: ``dout . (hi + lo)`` of the emulated forward output
@@ -879,6 +1133,8 @@ def reference_fp64_nope(
     )
     device = q.device
     total_q, total_k = int(q.shape[0]), int(kv.shape[0])
+    if compact:
+        indices, topk_length = compact_rows(indices, total_k, topk_length)
     vf = kv.double()
     want_grad = dout is not None
     stream = consume is not None

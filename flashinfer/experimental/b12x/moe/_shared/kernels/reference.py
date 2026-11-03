@@ -52,7 +52,10 @@ class MoERouteTrace:
     routed_out_accum: torch.Tensor
 
 
-_E8M0_K32_BF16_MAX_SCALE_BYTE = 247
+# Largest E8M0 byte the BF16 W4A16 dequant represents without overflow:
+# exponent field e + 71 must stay <= 254 (see intrinsics
+# packed_dequant_e8m0x4_to_bfloat2x2).  Real checkpoints sit at ~100-130.
+_E8M0_K32_BF16_MAX_SCALE_BYTE = 183
 
 
 def compare_to_reference(

@@ -419,6 +419,17 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
             stride=(1, self.wgmma_warpgroup_count),
         )
 
+    def _weight_sf_stage_count(self) -> int:
+        return self.num_ab_stage
+
+    @cute.jit
+    def _allocate_weight_aux_smem(self, smem, layout, tidx):
+        return smem.allocate_tensor(
+            element_type=self._weight_aux_smem_dtype(),
+            layout=layout,
+            byte_alignment=16,
+        )
+
     def _bind_static_fc1_weight(
         self,
         fc1_weight: cute.Tensor,
@@ -1804,6 +1815,7 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
             sched_params, ext, num_drain_warps=0
         )
 
+        weight_sf_stages = self._weight_sf_stage_count()
         if cutlass.const_expr(self.pingpong):
             @cute.struct
             class SharedStorage:
@@ -1811,7 +1823,7 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
                     cutlass.Int64, self.num_ab_stage * 2
                 ]
                 weight_sf_mbar_ptr: cute.struct.MemRange[
-                    cutlass.Int64, self.num_ab_stage * 2
+                    cutlass.Int64, weight_sf_stages * 2
                 ]
                 math_wg_order_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
                 epi_wg_order_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
@@ -1823,7 +1835,7 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
                     cutlass.Int64, self.num_ab_stage * 2
                 ]
                 weight_sf_mbar_ptr: cute.struct.MemRange[
-                    cutlass.Int64, self.num_ab_stage * 2
+                    cutlass.Int64, weight_sf_stages * 2
                 ]
                 fc1_offload_full_mbar_ptr: cute.struct.MemRange[
                     cutlass.Int64, self.num_c_stage
@@ -1878,7 +1890,7 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
         if cutlass.const_expr(self._uses_weight_aux_pipeline()):
             weight_sf_pipeline = pipeline.PipelineCpAsync.create(
                 barrier_storage=storage.weight_sf_mbar_ptr.data_ptr(),
-                num_stages=self.num_ab_stage,
+                num_stages=weight_sf_stages,
                 producer_group=pipeline.CooperativeGroup(
                     pipeline.Agent.Thread, 32
                 ),
@@ -2004,10 +2016,8 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
             weight_sf_smem_layout_staged = (
                 self._weight_aux_smem_layout_staged()
             )
-            sWeightSf = smem.allocate_tensor(
-                element_type=self._weight_aux_smem_dtype(),
-                layout=weight_sf_smem_layout_staged,
-                byte_alignment=16,
+            sWeightSf = self._allocate_weight_aux_smem(
+                smem, weight_sf_smem_layout_staged, tidx
             )
         else:
             sWeightSf = sB

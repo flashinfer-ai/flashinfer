@@ -185,6 +185,8 @@ def test_mega_layer_graph_capture_replay_matches_eager(
     from flashinfer.moe_ep import MoEEpTensors
 
     _require_blackwell()
+    if backend_name == "mxfp8" and hidden % 128:
+        pytest.skip("mxfp8 requires hidden % 128 == 0")
 
     monkeypatch.setenv("MEGA_NO_DIST", "1")
     if backend_name == "w4a16":

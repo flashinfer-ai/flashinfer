@@ -10,7 +10,7 @@ two-entry-point mega contract:
   FC2 + combine compute entry, with SwiGLU or SiTU
 
 The kernel is generic over the drop's ``QuantKind``; this shim wires up the
-``nvfp4``, ``mxfp8_e4m3``, ``mxfp8_e5m2``, and ``mxfp4_mxfp8`` kinds.
+``nvfp4``, ``mxfp4``, ``mxfp8_e4m3``, ``mxfp8_e5m2``, and ``mxfp4_mxfp8`` kinds.
 The mixed kind uses packed FP4 weights and E4M3 activations, both with
 E8M0 scales per 32 values.
 
@@ -27,15 +27,21 @@ from __future__ import annotations
 
 import dataclasses
 import math
-from typing import Any, Literal, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Literal, Optional, Tuple
 
 import torch
+
+from flashinfer.moe_ep._compat import deprecated_aliases
 
 from . import comm
 from .dependencies import require_sm107_dsl
 from .kernel_helpers import Mxfp8BlockSize, Nvfp4BlockSize, swizzled_flat_sf_size
+from .tuning_state import AutoTuningState
 
-Sm107QuantKind = Literal["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8"]
+if TYPE_CHECKING:
+    from flashinfer.moe_ep.tensors import MoEEpTensors
+
+Sm107QuantKind = Literal["nvfp4", "mxfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8"]
 Sm107TokenBackMode = Literal["epi_warps", "standalone_warps", "reuse_dispatch_warps"]
 Sm107WorkIdMode = Literal["grid_stride", "atomic_counter"]
 Sm107ScheduleMode = Literal["grouped", "phase_interleave"]
@@ -45,6 +51,7 @@ Sm107ScheduleMode = Literal["grouped", "phase_interleave"]
 # kinds have 64 (128 in 2x mode) — see quant_def.QuantKind.instruction_k.
 _KIND_TABLE: dict = {
     "nvfp4": (None, torch.float8_e4m3fn, Nvfp4BlockSize, 128),
+    "mxfp4": (None, torch.float8_e8m0fnu, Mxfp8BlockSize, 128),
     "mxfp8_e4m3": (torch.float8_e4m3fn, torch.float8_e8m0fnu, Mxfp8BlockSize, 64),
     "mxfp8_e5m2": (torch.float8_e5m2, torch.float8_e8m0fnu, Mxfp8BlockSize, 64),
     "mxfp4_mxfp8": (torch.float8_e4m3fn, torch.float8_e8m0fnu, Mxfp8BlockSize, 64),
@@ -117,6 +124,7 @@ def _max_active_clusters(cluster_size: int) -> int:
     return cached
 
 
+@deprecated_aliases(apply_topk_at_fc1="apply_routing_weights_before_fc2")
 @dataclasses.dataclass(frozen=True)
 class Sm107BlockScaledMoeConfig:
     """Validated construction parameters for Rubin inference and GenPhase."""
@@ -147,7 +155,7 @@ class Sm107BlockScaledMoeConfig:
     gate_up_clamp: Optional[float] = None
     reduce_topk_in_kernel: bool = False
     token_back_mode: Sm107TokenBackMode = "epi_warps"
-    apply_topk_at_fc1: bool = True
+    apply_routing_weights_before_fc2: bool = True
     max_sm_count: Optional[int] = None
     activation: Literal["swiglu", "situ"] = "swiglu"
     situ_beta: Optional[float] = None
@@ -201,7 +209,11 @@ class Sm107BlockScaledMoeConfig:
                 raise ValueError(f"{name} must be a positive Python integer.")
         if type(self.rank) is not int or not (0 <= self.rank < self.world_size):
             raise ValueError(f"invalid rank/world_size {self.rank}/{self.world_size}.")
-        for name in ("fc2_use_bulk", "reduce_topk_in_kernel", "apply_topk_at_fc1"):
+        for name in (
+            "fc2_use_bulk",
+            "reduce_topk_in_kernel",
+            "apply_routing_weights_before_fc2",
+        ):
             if type(getattr(self, name)) is not bool:
                 raise ValueError(f"{name} must be a Python bool.")
         if self.num_total_experts > 16384:
@@ -227,8 +239,10 @@ class Sm107BlockScaledMoeConfig:
                 f"{max(2 * vec, 32)} (gate/up interleave + SF blocks) for "
                 f"{self.quant_kind}."
             )
-        if self.quant_kind == "mxfp4_mxfp8" and self.intermediate % 128:
-            raise ValueError("mxfp4_mxfp8 intermediate must be a multiple of 128.")
+        if self.quant_kind in ("mxfp4", "mxfp4_mxfp8") and self.intermediate % 128:
+            raise ValueError(
+                f"{self.quant_kind} intermediate must be a multiple of 128."
+            )
         tiler = self.resolved_mma_tiler_mnk
         instruction_k = self.instruction_k
         if len(tiler) != 3:
@@ -357,10 +371,11 @@ class Sm107BlockScaledMoeConfig:
                 f"fc2_tma_stages must be in [1, {tiler[1] // 64}] for tiler N "
                 f"{tiler[1]}."
             )
-        if self.reduce_topk_in_kernel and not self.apply_topk_at_fc1:
+        if self.reduce_topk_in_kernel and not self.apply_routing_weights_before_fc2:
             raise ValueError(
-                "reduce_topk_in_kernel requires apply_topk_at_fc1=True (the "
-                "in-kernel reduce red-adds already-weighted terms)."
+                "reduce_topk_in_kernel requires "
+                "apply_routing_weights_before_fc2=True (the in-kernel reduce "
+                "red-adds already-weighted terms)."
             )
 
         if self.kernel_variant == "genphase":
@@ -443,7 +458,7 @@ class Sm107BlockScaledMoeConfig:
 
     @property
     def torch_weight_data_dtype(self) -> torch.dtype:
-        if self.quant_kind in ("nvfp4", "mxfp4_mxfp8"):
+        if self.quant_kind in ("nvfp4", "mxfp4", "mxfp4_mxfp8"):
             return _fp4_storage_dtype()
         return self.torch_act_data_dtype
 
@@ -461,6 +476,7 @@ class Sm107BlockScaledSymmBuffer:
     """
 
     def __init__(self, config: Sm107BlockScaledMoeConfig) -> None:
+        """Allocate session buffers, including independent NVFP4 default scalars."""
         comm.ensure_not_capturing("SM107 mega workspace allocation")
         _require_sm107()
         _configure_dsl_arch()
@@ -476,7 +492,7 @@ class Sm107BlockScaledSymmBuffer:
         # Staging tensors. Activation / SF / scores are pulled by peer dispatch
         # warps, so they live on the symmetric heap; the routing indices are a
         # local (16B-aligned) int32 tensor read by this rank's router only.
-        if cfg.quant_kind == "nvfp4":
+        if cfg.quant_kind in ("nvfp4", "mxfp4"):
             self.x = comm.sym_zeros((tokens, cfg.hidden // 2), cfg.torch_act_data_dtype)
         else:
             self.x = comm.sym_zeros((tokens, cfg.hidden), cfg.torch_act_data_dtype)
@@ -491,8 +507,9 @@ class Sm107BlockScaledSymmBuffer:
             (tokens, cfg.num_topk), -1, dtype=torch.int32, device="cuda"
         )
         # Stable local-expert pointers allow per-call scaling updates in graphs.
-        # Per-call tensors are bound as launch arguments (bind_scalars); other
-        # values and defaults are copied in by the backend staging call.
+        # Mutable tensors serve explicit low-level calls and layout fallbacks.
+        # Backend defaults bind a separate read-only ones tensor, which cannot
+        # be overwritten by another layer or graph using these mutable tensors.
         for name in _SCALAR_NAMES:
             setattr(
                 self,
@@ -503,9 +520,31 @@ class Sm107BlockScaledSymmBuffer:
                 if cfg.quant_kind == "nvfp4"
                 else None,
             )
+        self._default_scalar = (
+            torch.ones(cfg.experts_per_rank, dtype=torch.float32, device=self.device)
+            if cfg.quant_kind == "nvfp4"
+            else None
+        )
         if self.topk_idx.data_ptr() % 16 != 0:
             raise RuntimeError("routing index tensor must be 16-byte aligned.")
 
+        self._allocate_execution_state()
+        self._staged_tokens: Optional[int] = None
+        self._destroyed = False
+        self._tuning_state = AutoTuningState()
+        self._tuning_inputs: tuple[MoEEpTensors, bool] | None = None
+        self._routing_checks: dict[tuple, Any] = {}
+        # Missing scalar bindings use the workspace's own tensors.
+        self._bound_scalars: dict = {}
+
+    def _allocate_execution_state(self) -> None:
+        """Allocate reduction buffers and scratch, then reset cached bindings.
+
+        Peer-written buffers use symmetric allocations; separate-reduce output
+        stays local and may be replaced by a caller output at launch time.
+        """
+        cfg, kernel = self.config, self.kernel
+        tokens = cfg.padded_tokens_per_rank
         # In-kernel reduce: the combine peer-writes (red.add) each topk term
         # straight into the output, so it must live on the SYMMETRIC heap and
         # start zeroed; the separate-reduce path only sees local stores.
@@ -566,18 +605,12 @@ class Sm107BlockScaledSymmBuffer:
         self._launch_weights: Optional[
             Tuple[TransformedBlockScaledWeights, TransformedBlockScaledWeights]
         ] = None
-        self._routing_checks: dict[tuple, Any] = {}
-        self._staged_tokens: Optional[int] = None
-        self._destroyed = False
-        # Per-call NVFP4 epilogue scalars bound straight into the launch (no copy
-        # into the workspace tensors); a missing name = the workspace's own tensor.
-        self._bound_scalars: dict = {}
+        self._launch_output: Optional[torch.Tensor] = None
 
     @staticmethod
     def _build_kernel(cfg: Sm107BlockScaledMoeConfig):
         import cutlass
         from cutlass.cute.nvgpu import OperandMajorMode
-
         from sources import RubinInferenceGenphaseMegaMoE, RubinInferenceMegaMoE
         from sources.api import ImplDesc, ProblemDesc
         from sources.quant_def import CombineFormat
@@ -644,7 +677,7 @@ class Sm107BlockScaledSymmBuffer:
                 "topk": cfg.num_topk,
                 "topk_index_dtype": cutlass.Int32,
                 "max_tokens_per_rank": cfg.padded_tokens_per_rank,
-                "apply_topk_at_fc1": cfg.apply_topk_at_fc1,
+                "apply_topk_at_fc1": cfg.apply_routing_weights_before_fc2,
             }
         )
         impl_fields = {
@@ -719,8 +752,21 @@ class Sm107BlockScaledSymmBuffer:
         self,
         transformed_l1: TransformedBlockScaledWeights,
         transformed_l2: TransformedBlockScaledWeights,
+        output: Optional[torch.Tensor] = None,
     ) -> dict:
+        """Bind weights, workspaces, scalars, and output on the current stream.
+
+        Output defaults to the workspace buffer. Its dynamic row extent lets
+        one compiled kernel serve caller outputs with different live lengths.
+        """
         stream = torch.cuda.current_stream()
+        if output is None:
+            output = self.output_activation
+        # Separate reduction can write only the live rows, directly into the
+        # caller's output. Keep the row extent dynamic so warmed kernels also
+        # accept another batch size during CUDA graph capture.
+        output_cute = _to_cute(output, dynamic_leading=False)
+        output_cute.mark_compact_shape_dynamic(mode=0, stride_order=(0, 1))
         return {
             "activation": _to_cute(self.x),
             "activation_sf": _to_cute(self.x_sf),
@@ -730,7 +776,7 @@ class Sm107BlockScaledSymmBuffer:
             "fc1_weight_sf": _to_cute(transformed_l1[1]),
             "fc2_weight": _to_cute(transformed_l2[0]),
             "fc2_weight_sf": _to_cute(transformed_l2[1]),
-            "output_activation": _to_cute(self.output_activation),
+            "output_activation": output_cute,
             "local_workspace": _to_cute_ptr(self.local_workspace),
             "shared_workspace": _to_cute_ptr(self.shared_workspace),
             "peer_rank_ptr_mapper_host": self._peer_mapper(),
@@ -742,16 +788,32 @@ class Sm107BlockScaledSymmBuffer:
             },
         }
 
-    def launch(
+    def prepare(
         self,
         transformed_l1: TransformedBlockScaledWeights,
         transformed_l2: TransformedBlockScaledWeights,
+        *,
+        output: Optional[torch.Tensor] = None,
     ) -> None:
-        """Compile on first use, then launch the fused mega kernel."""
+        """Compile and bind the selected kernel without launching it."""
         import cutlass.cute as cute
 
         if self._destroyed:
             raise RuntimeError("cannot launch a destroyed SM107 workspace.")
+        if output is not None and (
+            self.config.reduce_topk_in_kernel
+            or output.ndim != 2
+            or not (0 < output.shape[0] <= self.config.max_tokens_per_rank)
+            or output.shape[1] != self.config.hidden
+            or output.dtype != torch.bfloat16
+            or output.device != self.device
+            or not output.is_contiguous()
+            or output.data_ptr() % 16
+        ):
+            raise ValueError(
+                "Direct output requires separate reduction and an aligned, "
+                "contiguous BF16 matrix with live rows on the workspace device."
+            )
         if (
             self.device.type == "cuda"
             and self.device.index != torch.cuda.current_device()
@@ -771,6 +833,9 @@ class Sm107BlockScaledSymmBuffer:
                 for name in _SCALAR_NAMES
                 if self.config.quant_kind == "nvfp4"
             ),
+            None
+            if output is None
+            else (output.data_ptr(), output.shape, output.stride()),
             torch.cuda.current_stream().cuda_stream,
         )
         if self._compiled is None or self._launch_key != key:
@@ -778,13 +843,30 @@ class Sm107BlockScaledSymmBuffer:
                 comm.ensure_not_capturing("SM107 mega kernel compile")
             # DLPack metadata binding and stream conversion are host-only.
             # A warmed workspace may bind another layer or stream in capture.
-            kwargs = self._runtime_kwargs(transformed_l1, transformed_l2)
+            kwargs = (
+                self._runtime_kwargs(transformed_l1, transformed_l2)
+                if output is None
+                else self._runtime_kwargs(transformed_l1, transformed_l2, output)
+            )
             if self._compiled is None:
                 self._compiled = cute.compile(self.kernel, **kwargs)
             self._launch_key = key
             self._launch_kwargs = kwargs
             # Keep pointers alive until the cached bindings are replaced.
             self._launch_weights = (transformed_l1, transformed_l2)
+            self._launch_output = output
+
+    def launch(
+        self,
+        transformed_l1: TransformedBlockScaledWeights,
+        transformed_l2: TransformedBlockScaledWeights,
+        *,
+        output: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Compile on first use, then launch the fused mega kernel."""
+        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+            self._tuning_state.graph_captured = True
+        self.prepare(transformed_l1, transformed_l2, output=output)
         if self.config.reduce_topk_in_kernel:
             # red.add accumulation base: zero the output every launch.
             self.output_activation.zero_()
@@ -803,37 +885,75 @@ class Sm107BlockScaledSymmBuffer:
                 )
         self._compiled(**self._launch_kwargs)
 
-    def destroy(self) -> None:
-        if self._destroyed:
-            return
-        comm.ensure_not_capturing("SM107 mega workspace free")
-        # nvshmem free is collective and does not wait for in-flight work;
-        # drain this rank's device before releasing symmetric memory that a
-        # still-running launch (ours or a peer's dispatch pull) may touch.
-        torch.cuda.synchronize()
+    def _release_execution_state(self) -> None:
+        """Drop cached tensor references and free owned symmetric buffers."""
         self._compiled = None
         self._launch_kwargs = None
         self._launch_weights = None
-        self._routing_checks.clear()
+        self._launch_output = None
+        self._launch_key = None
         self._pre_reduced_activation = None
         self._pre_reduced_activation_sf = None
-        self._bound_scalars = {}
-        for name in ("x", "x_sf", "topk_weights", "shared_workspace"):
-            comm.free_sym_tensor(getattr(self, name, None))
-            setattr(self, name, None)
+        comm.free_sym_tensor(getattr(self, "shared_workspace", None))
         if self.config.reduce_topk_in_kernel:
             comm.free_sym_tensor(self.output_activation)
         self.output_activation = None
+        self.shared_workspace = None
         self.local_workspace = None
+
+    def install_tuned_knobs(
+        self,
+        knobs: dict[str, Any],
+        transformed_l1: TransformedBlockScaledWeights,
+        transformed_l2: TransformedBlockScaledWeights,
+    ) -> None:
+        """Replace output and scratch before capture, retaining staged inputs."""
+        import dataclasses
+
+        comm.ensure_not_capturing("SM107 tuning winner installation")
+        if self._destroyed or self._tuning_state.graph_captured:
+            raise RuntimeError("cannot tune a destroyed or captured SM107 workspace")
+        config = dataclasses.replace(self.config, **knobs)
+        if config != self.config:
+            kernel = self._build_kernel(config)
+            sf_cols = int(
+                kernel.token_comm.plain_activation_sf_row_elements
+                if config.kernel_variant == "genphase"
+                else kernel.token_comm.activation_sf_hidden_padded
+            )
+            if sf_cols != self.sf_cols:
+                raise ValueError("tuning cannot change the staged scale layout")
+            torch.cuda.synchronize()
+            self._release_execution_state()
+            self.config, self.kernel = config, kernel
+            self._allocate_execution_state()
+        self.prepare(transformed_l1, transformed_l2)
+
+    def destroy(self) -> None:
+        """Drain outstanding work and collectively release the session buffers."""
+        if self._destroyed:
+            return
+        comm.ensure_not_capturing("SM107 mega workspace free")
+        # Symmetric free is collective and does not wait for in-flight kernels.
+        torch.cuda.synchronize()
+        self._release_execution_state()
+        self._routing_checks.clear()
+        self._tuning_inputs = None
+        self._bound_scalars = {}
+        for name in ("x", "x_sf", "topk_weights"):
+            comm.free_sym_tensor(getattr(self, name, None))
+            setattr(self, name, None)
         if self.config.quant_kind == "nvfp4":
             from ....sm100.cutedsl_megamoe.shim.quant_stage import forget_staged_tokens
 
             forget_staged_tokens(self.topk_idx)
         self.topk_idx = None
         self.fc1_alpha = self.fc2_alpha = self.fc1_norm_const = None
+        self._default_scalar = None
         self._destroyed = True
 
 
+@deprecated_aliases(apply_topk_at_fc1="apply_routing_weights_before_fc2")
 def get_symm_buffer_for_sm107_block_scaled_mega_moe(
     num_total_experts: int,
     num_max_tokens: int,
@@ -860,7 +980,7 @@ def get_symm_buffer_for_sm107_block_scaled_mega_moe(
     gate_up_clamp: Optional[float] = None,
     reduce_topk_in_kernel: bool = False,
     token_back_mode: Sm107TokenBackMode = "epi_warps",
-    apply_topk_at_fc1: bool = True,
+    apply_routing_weights_before_fc2: bool = True,
     max_sm_count: Optional[int] = None,
     activation: Literal["swiglu", "situ"] = "swiglu",
     situ_beta: Optional[float] = None,
@@ -897,7 +1017,7 @@ def get_symm_buffer_for_sm107_block_scaled_mega_moe(
         gate_up_clamp=gate_up_clamp,
         reduce_topk_in_kernel=reduce_topk_in_kernel,
         token_back_mode=token_back_mode,
-        apply_topk_at_fc1=apply_topk_at_fc1,
+        apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
         max_sm_count=max_sm_count,
         activation=activation,
         situ_beta=situ_beta,
@@ -913,7 +1033,7 @@ def _expected_weight_shapes(
     experts = cfg.experts_per_rank
     fc1_out = 2 * cfg.intermediate
     vec = cfg.sf_vec_size
-    if cfg.quant_kind in ("nvfp4", "mxfp4_mxfp8"):
+    if cfg.quant_kind in ("nvfp4", "mxfp4", "mxfp4_mxfp8"):
         fc1_shape = (experts, cfg.hidden // 2, fc1_out)
         fc2_shape = (experts, cfg.intermediate // 2, cfg.hidden)
     else:
@@ -1018,6 +1138,20 @@ def sm107_block_scaled_mega_moe(
     _validate_weight_leg(
         "fc2", transformed_l2, fc2_shape, fc2_sf, cfg, symm_buffer.device
     )
+
+    if (
+        y is not None
+        and num_tokens > 0
+        and not cfg.reduce_topk_in_kernel
+        and y.is_contiguous()
+        and y.data_ptr() % 16 == 0
+    ):
+        # TopkReduce runs locally and needs no symmetric output allocation.
+        # REDG still uses the workspace's registered symmetric destination.
+        symm_buffer.launch(transformed_l1, transformed_l2, output=y[:num_tokens])
+        if sync:
+            torch.cuda.synchronize()
+        return None
 
     symm_buffer.launch(transformed_l1, transformed_l2)
     out = symm_buffer.output_activation[:num_tokens]

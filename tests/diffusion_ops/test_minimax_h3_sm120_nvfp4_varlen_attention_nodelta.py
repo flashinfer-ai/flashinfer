@@ -19,7 +19,8 @@ block-mean term ``qm K^T`` back to the scores.  It trades a measurably larger FP
 about 0.209 vs 0.191 on Gaussian inputs) for a faster attention launch.  These tests pin that
 trade-off: the FP4 tolerance ``atol = 1.0, rtol = 0.1`` holds on every element, the relative L2 stays
 within ``1.15x`` the default route's on the same inputs, the output is deterministic, and the routes
-share their validation.  Every test needs an SM120 GPU.
+share their validation. Numerical tests need exact compute capability 12.0; input validation
+and unsupported-device rejection are also exercised on other CUDA GPUs.
 """
 
 import importlib.util
@@ -35,6 +36,8 @@ from flashinfer.diffusion_ops import (
 from flashinfer.diffusion_ops.cake_minimax_h3_sm120_quant_varlen_attention import (
     MINIMAX_H3_NUM_HEADS,
 )
+
+from flashinfer.utils import get_compute_capability
 
 # tests/diffusion_ops is not a package and the CI collects with an import mode that does not put this
 # directory on sys.path, so the default route's fixtures are loaded from the sibling file by path.
@@ -155,7 +158,22 @@ def test_minimax_h3_sm120_varlen_attention_nvfp4_nodelta_preallocated_output_and
     ).shape == (0, 5, q.shape[-1])
 
 
-@requires_sm120
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_minimax_h3_sm120_varlen_attention_nvfp4_nodelta_rejects_unsupported_device() -> (
+    None
+):
+    device = torch.device("cuda:0")
+    if get_compute_capability(device) == (12, 0):
+        pytest.skip("SM120 is supported; numerical tests cover this device")
+    q, k, v = synthetic_inputs(1, 1, seed=0, device=device)
+    cu = torch.tensor([0, 1], dtype=torch.int32, device=device)
+    with pytest.raises(RuntimeError, match=r"requires exact compute capability 12\.0"):
+        minimax_h3_sm120_varlen_attention_nvfp4_nodelta(
+            q, k, v, cu, cu_seqlens_host=(0, 1)
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_minimax_h3_sm120_varlen_attention_nvfp4_nodelta_rejects_bad_inputs() -> None:
     """The variant validates its inputs exactly like the default route."""
     device = torch.device("cuda:0")

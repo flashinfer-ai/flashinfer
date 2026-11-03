@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2026 by FlashInfer team.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,10 +15,11 @@
  */
 // Rendered by the Cake source exporter — do not edit.
 // One-call host sequence of the Cake all-gather matmul route
-// 'float16_ws2_n_major_sm_100a': NVLink barrier, bridge event, per-peer push copies with a
-// per-chunk readiness epoch (or, for small padded M, the SM push kernel
-// chained to the barrier and the main kernel through programmatic dependent
-// launch), tcgen05 main kernel. The main kernel computes 256-wide output
+// 'float16_ws2_n_major_sm_100a' and, through the CAKE_SEQ_SHIM compile definition, of
+// 'float16_ws2_n_major_sm_103a': NVLink barrier, bridge event, per-peer push copies with a
+// per-chunk readiness epoch (the SM push kernel that serves world sizes 4
+// and 8 is not part of this sequence: no two-rank call takes that route),
+// tcgen05 main kernel. The main kernel computes 256-wide output
 // tiles; a class that ships the 128-wide twin (kHasMainN128) runs the twin
 // when the adapter's table-driven rule selects block_n = 128 for the call; a
 // class that ships the CTA-pair twin (kHasMainCg2: tcgen05.mma.cta_group::2
@@ -42,6 +43,9 @@
 #include <unordered_map>
 
 #include "cake_all_gather_matmul_host_common.cuh"
+#ifndef CAKE_SEQ_SHIM
+#define CAKE_SEQ_SHIM cake_host_shim_seq_27805efd7b8d63d1
+#endif
 
 #ifndef CAKE_PEER_POINTER_TABLE_DECLARED
 #define CAKE_PEER_POINTER_TABLE_DECLARED
@@ -54,14 +58,6 @@ extern "C" __global__ void kernel_cake_all_gather_matmul_bdfeeb2b9ea3cd522fb9(
     int32_t pg_world, int32_t pg_rank, CakePeerPointerTable<unsigned int> pg_flags);
 extern "C" __global__ void kernel_cake_all_gather_matmul_8dea171063652cd775f8(
     int32_t pg_world, int32_t pg_rank, CakePeerPointerTable<unsigned int> pg_flags);
-extern "C" __global__ void kernel_cake_all_gather_matmul_40242e9c64d6e66af6f5(
-    unsigned int* __restrict__ inp, long long* __restrict__ payload_peers,
-    long long* __restrict__ signal_peers, unsigned int* __restrict__ counters,
-    unsigned int ready_target, int rank, int rows, int chunk_rows, int num_chunks);
-extern "C" __global__ void kernel_cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3(
-    unsigned int* __restrict__ inp, long long* __restrict__ payload_peers,
-    long long* __restrict__ signal_peers, unsigned int* __restrict__ counters,
-    unsigned int ready_target, int rank, int rows, int chunk_rows, int num_chunks);
 extern "C" __global__ void kernel_cake_all_gather_matmul_61c61aabb5967bd8e9d9(
     const __grid_constant__ CUtensorMap A_local, const __grid_constant__ CUtensorMap A_scratch,
     const __grid_constant__ CUtensorMap B, __half* __restrict__ C,
@@ -69,7 +65,7 @@ extern "C" __global__ void kernel_cake_all_gather_matmul_61c61aabb5967bd8e9d9(
     unsigned int ready_target, int rank, int M, int scratch_pitch, int signal_rows, int n_tiles,
     int remote_order);
 
-namespace cake_host_shim_seq_27805efd7b8d63d1 {
+namespace CAKE_SEQ_SHIM {
 
 using namespace cake_host_shim_common;
 using tvm::ffi::TensorView;
@@ -332,7 +328,7 @@ constexpr unsigned kMainCg2ClusterZ = 1u;
 constexpr bool kMainCg2Spread = false;
 static_assert(!kHasMainCg2 || (kMainCg2ClusterX == 2u && kMainCg2ClusterY == 1u && kMainCg2ClusterZ == 1u),
               "the CTA-pair main launches clusters of two CTAs along x");
-// The positional form code of Run / RunPush (the loader's main_form_code): 0 = the one-CTA main of the
+// The positional form code of Run (the loader's main_form_code): 0 = the one-CTA main of the
 // call's width, 1 = the CTA-pair twin, 2 / 3 = its spill-wave N-split pair twins. A spill twin ships only
 // with the CTA-pair twin whose cluster launch (dimensions and scheduling policy) it shares.
 constexpr int64_t kMainFormCg1 = 0;
@@ -344,37 +340,9 @@ constexpr bool kHasMainCg2s2 = false;
 static_assert(!(kHasMainCg2s1 || kHasMainCg2s2) || kHasMainCg2,
               "a spill-wave N-split pair main ships with the CTA-pair main whose cluster launch it shares");
 // The main program is the arrival-ordered persistent schedule (one CTA per SM,
-// grid chosen by the API); both push transports land a peer's chunks in order,
+// grid chosen by the API); copy-engine pushes land a peer's chunks in order,
 // so the remote tile order is peer-major (0).
 constexpr int32_t kRemoteOrder = 0;
-// Padded local rows up to which the SM push kernel replaces the copy-engine pushes,
-// and the widest N it serves at a padded row count (the GEMM waits behind the SM
-// push; a wider GEMM overlaps the copy-engine pushes instead).
-constexpr int64_t kSmPushMaxRows = 512;
-constexpr int64_t kSmPushColsIntercept = 12288;
-constexpr int64_t kSmPushColsPerRow = 16;
-constexpr int64_t sm_push_max_cols(int64_t padded_rows) {
-  return kSmPushColsIntercept - kSmPushColsPerRow * padded_rows;
-}
-// Per-architecture SM push bands of this sequence's world size (the exported route
-// table): a call of exactly kSmPushBandRows[i] padded rows with N <= kSmPushBandCols[i]
-// also takes the SM push route (a trailing 0 entry keeps an empty table well-formed).
-constexpr int kSmPushBandCount = 0;
-constexpr int64_t kSmPushBandRows[kSmPushBandCount + 1] = {0};
-constexpr int64_t kSmPushBandCols[kSmPushBandCount + 1] = {0};
-constexpr bool sm_push_band(int64_t padded_rows, int64_t cols) {
-  for (int i = 0; i < kSmPushBandCount; ++i) {
-    if (kSmPushBandRows[i] == padded_rows && cols <= kSmPushBandCols[i]) return true;
-  }
-  return false;
-}
-// The SM push route rule of this sequence (world size >= 4 is this module's kWorldSize):
-// the base rule or one of the bands; the Python backend selects the entry by the same rule
-// and RunPush refuses a call outside it.
-constexpr bool uses_sm_push(int64_t padded_rows, int64_t cols) {
-  return (padded_rows <= kSmPushMaxRows && cols <= sm_push_max_cols(padded_rows)) ||
-         sm_push_band(padded_rows, cols);
-}
 constexpr int64_t kWorldSize = 2;
 constexpr bool kMainBeforePushes = true;
 constexpr unsigned kBarrierThreads = 32u;
@@ -812,171 +780,6 @@ void Run(TensorView inp, TensorView scratch, TensorView weight, TensorView out, 
   TVM_FFI_CHECK_CUDA_ERROR(cudaStreamWaitEvent(call.main_stream, events.to_main, 0));
 }
 
-constexpr unsigned kPushThreads = 128u;
-// The SM push launch is chosen per call: this sequence's launch rows first (below), else from the
-// per-peer payload of the padded local shard (padded rows x K x element bytes). Below
-// kPushPayloadThresholdBytes a call takes the 32-CTA launch: kPushCtasPerPeer CTAs per remote peer
-// of the push program that keeps one 16-byte vector in flight per lane. At or above it a call
-// takes the wide launch: kPushWideCtasPerPeer CTAs per peer of the push program that keeps eight
-// vectors in flight per lane (fewer CTAs leave most SMs to the main grid, which then starts at the
-// barrier, while the deeper memory-level parallelism keeps the NVLink egress; measured faster only
-// on the large payloads). Both programs write the same 16-byte vectors to the same addresses and
-// the readiness ticket chain counts gridDim.x CTAs at runtime, so the outputs are identical
-// whichever launch a call takes.
-constexpr unsigned kPushCtasPerPeer = 32u;
-constexpr unsigned kPushWideCtasPerPeer = 8u;
-constexpr int64_t kPushPayloadThresholdBytes = 4194304;
-// The SM push launch rows of this sequence's world size and architecture (the exported
-// per-architecture table): a call of exactly kPushLaunchRowRows[i] padded rows launches
-// kPushLaunchRowCtas[i] CTAs per peer of the wide program (kPushLaunchRowWide[i]) or of the
-// one-vector program, whatever its payload (a trailing 0 entry keeps an empty table well-formed).
-constexpr int kPushLaunchRowCount = 0;
-constexpr int64_t kPushLaunchRowRows[kPushLaunchRowCount + 1] = {0};
-constexpr unsigned kPushLaunchRowCtas[kPushLaunchRowCount + 1] = {0u};
-constexpr bool kPushLaunchRowWide[kPushLaunchRowCount + 1] = {false};
-constexpr int push_launch_row(int64_t padded_rows) {
-  for (int i = 0; i < kPushLaunchRowCount; ++i) {
-    if (kPushLaunchRowRows[i] == padded_rows) return i;
-  }
-  return -1;
-}
-// Preferred shared-memory carveout of both push kernels (cudaFuncAttributePreferredSharedMemoryCarveout;
-// -1 = driver default). The push kernels use no shared memory, but their CTAs land on the SMs before
-// the main grid dispatches (programmatic dependent launch) and an SM's L1/shared split is fixed while
-// any CTA is resident: with the driver default a 192 KiB main CTA cannot land on an SM hosting a push
-// CTA until it drains. The maximum-shared preference lets the main CTAs co-reside with the push CTAs.
-constexpr int kPushCarveout = -1;
+}  // namespace CAKE_SEQ_SHIM
 
-// Set one push kernel's carveout once for every device that accepts it: a function attribute is
-// per device and one process may serve several devices through RunPush, so this mirrors the
-// per-device form CakeSetMaxDynamicSmem uses for the main kernel (cudaGetKernel +
-// cudaKernelSetAttributeForDevice over cudaGetDeviceCount) instead of a current-device-only
-// attribute call. The attribute calls are not stream operations, so the static-once form of the
-// caller is graph-capture safe.
-inline void set_push_carveout_for(const void* function, const char* label) {
-  cudaKernel_t kernel = nullptr;
-  cudaError_t status = cudaGetKernel(&kernel, function);
-  TVM_FFI_CHECK(status == cudaSuccess, RuntimeError)
-      << "cudaGetKernel for the " << label << " failed: " << cudaGetErrorString(status);
-  int device_count = 0;
-  status = cudaGetDeviceCount(&device_count);
-  TVM_FFI_CHECK(status == cudaSuccess, RuntimeError)
-      << "cudaGetDeviceCount for the " << label << " carveout failed: " << cudaGetErrorString(status);
-  int configured = 0;
-  for (int device = 0; device < device_count; ++device) {
-    if (cudaKernelSetAttributeForDevice(kernel, cudaFuncAttributePreferredSharedMemoryCarveout, kPushCarveout, device) == cudaSuccess) {
-      ++configured;
-    } else {
-      (void)cudaGetLastError();
-    }
-  }
-  TVM_FFI_CHECK(configured > 0, RuntimeError)
-      << "no CUDA device accepts PreferredSharedMemoryCarveout=" << kPushCarveout << " for the "
-      << label;
-}
-
-// Both push kernels carry the same carveout; function-local static initialization in RunPush
-// serializes the first call.
-inline bool set_push_carveout() {
-  if constexpr (kPushCarveout < 0) {
-    return true;
-  }
-  set_push_carveout_for(reinterpret_cast<const void*>(kernel_cake_all_gather_matmul_40242e9c64d6e66af6f5), "peer push");
-  set_push_carveout_for(reinterpret_cast<const void*>(kernel_cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3), "wide peer push");
-  return true;
-}
-
-// SM push route (uses_sm_push(padded M, N): padded M <= kSmPushMaxRows with
-// N <= sm_push_max_cols(padded M), or one of this sequence's SM push bands):
-// barrier(phase); the push kernel
-// (launched with the programmatic-dependent-launch attribute: its grid is
-// dispatched while the barrier rendezvous is in flight and waits in hardware
-// for the barrier's completion) copies every chunk of the local shard into
-// every peer's scratch with system-scope 16-byte stores and publishes each
-// chunk's epoch (one launch for all peers, no communication stream); the main
-// kernel follows on the same stream with the same attribute (the push grid
-// triggers its dispatch once every push CTA is resident; the GEMM gates each
-// remote chunk on its epoch, so no second barrier is needed). The main kernel
-// is the one of the call's block_n and main_form, as on the copy-engine route.
-void RunPush(TensorView inp, TensorView scratch, TensorView weight, TensorView out,
-             TensorView ready, tvm::ffi::Shape flag_peers, TensorView payload_peers,
-             TensorView signal_peers, TensorView counters, int64_t rank, int64_t rows,
-             int64_t pitch, int64_t phase, int64_t ready_target, int64_t grid_x, int64_t grid_y,
-             int64_t grid_z, int64_t block_n, int64_t main_form, int64_t main_stream,
-             int64_t comm_stream) {
-  tvm::ffi::CUDADeviceGuard device_guard(inp.device().device_id);
-  Call call = resolve_call(inp, scratch, weight, out, ready, flag_peers, rank, rows, pitch, phase,
-                           ready_target, grid_x, grid_y, grid_z, block_n, main_form, main_stream,
-                           comm_stream);
-  check_cuda_tensor(payload_peers, "payload_peers");
-  check_dtype(payload_peers, DLDataType{kDLInt, 64, 1}, "payload_peers");
-  check_contiguous(payload_peers, "payload_peers");
-  check_cuda_tensor(signal_peers, "signal_peers");
-  check_dtype(signal_peers, DLDataType{kDLInt, 64, 1}, "signal_peers");
-  check_contiguous(signal_peers, "signal_peers");
-  check_cuda_tensor(counters, "counters");
-  check_dtype(counters, DLDataType{kDLUInt, 32, 1}, "counters");
-  check_contiguous(counters, "counters");
-  check_same_device(payload_peers, inp, "payload_peers", "A_local");
-  check_same_device(signal_peers, inp, "signal_peers", "A_local");
-  check_same_device(counters, inp, "counters", "A_local");
-  TVM_FFI_CHECK(payload_peers.numel() == kWorldSize - 1 && signal_peers.numel() == kWorldSize - 1,
-                ValueError)
-      << "push tables need exactly " << (kWorldSize - 1) << " entries";
-  TVM_FFI_CHECK(counters.numel() >= (kWorldSize - 1) * call.num_chunks, ValueError)
-      << "push counters need at least " << ((kWorldSize - 1) * call.num_chunks) << " words";
-  TVM_FFI_CHECK(uses_sm_push(call.padded_rows, call.cols), ValueError)
-      << "the SM push route serves at most " << kSmPushMaxRows << " padded rows with N <= "
-      << sm_push_max_cols(call.padded_rows) << " at " << call.padded_rows
-      << " padded rows, or one of its " << kSmPushBandCount << " SM push bands; got "
-      << call.padded_rows << " padded rows, N=" << call.cols;
-
-  launch_barrier(phase, static_cast<int32_t>(kWorldSize), call.rank, call.flags, call.main_stream);
-  {
-    unsigned int* p_inp = static_cast<unsigned int*>(inp.data_ptr());
-    long long* p_payload = static_cast<long long*>(payload_peers.data_ptr());
-    long long* p_signal = static_cast<long long*>(signal_peers.data_ptr());
-    unsigned int* p_counters = static_cast<unsigned int*>(counters.data_ptr());
-    unsigned int v_ready_target = call.ready_target;
-    int32_t v_rank = call.rank;
-    int32_t v_rows = call.rows;
-    int32_t v_chunk_rows = static_cast<int32_t>(call.chunk_rows);
-    int32_t v_num_chunks = static_cast<int32_t>(call.num_chunks);
-    void* kargs[] = {&p_inp,  &p_payload, &p_signal,     &p_counters,  &v_ready_target,
-                     &v_rank, &v_rows,    &v_chunk_rows, &v_num_chunks};
-    static const bool carveout_ready = set_push_carveout();
-    (void)carveout_ready;
-    // The launch of this call: this sequence's launch row of exactly the call's padded rows when
-    // it lists one, else the per-peer payload of the padded shard; the row or the payload selects
-    // the grid and the push program (both take the same arguments).
-    const int64_t push_payload_bytes =
-        call.padded_rows * kK * static_cast<int64_t>(inp.dtype().bits / 8);
-    const int launch_row = push_launch_row(call.padded_rows);
-    const bool wide_push = launch_row >= 0 ? kPushLaunchRowWide[launch_row]
-                                           : push_payload_bytes >= kPushPayloadThresholdBytes;
-    const unsigned push_ctas_per_peer =
-        launch_row >= 0 ? kPushLaunchRowCtas[launch_row]
-                        : (wide_push ? kPushWideCtasPerPeer : kPushCtasPerPeer);
-    const void* push_kernel = wide_push ? reinterpret_cast<const void*>(kernel_cake_all_gather_matmul_f6b8a82f4b6bbe6b34f3)
-                                        : reinterpret_cast<const void*>(kernel_cake_all_gather_matmul_40242e9c64d6e66af6f5);
-    cudaLaunchConfig_t config{};
-    config.gridDim = dim3(push_ctas_per_peer, static_cast<uint32_t>(kWorldSize - 1), 1u);
-    config.blockDim = dim3(kPushThreads, 1u, 1u);
-    config.dynamicSmemBytes = 0u;
-    config.stream = call.main_stream;
-    cudaLaunchAttribute attribute{};
-    attribute.id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attribute.val.programmaticStreamSerializationAllowed = 1;
-    config.attrs = &attribute;
-    config.numAttrs = 1u;
-    cudaError_t status = cudaLaunchKernelExC(&config, push_kernel, kargs);
-    TVM_FFI_CHECK(status == cudaSuccess, RuntimeError)
-        << "cudaLaunchKernelExC for the peer push failed: " << cudaGetErrorString(status);
-  }
-  launch_main_for(call, inp, scratch, weight, out, ready, /*programmatic_launch=*/true);
-}
-
-}  // namespace cake_host_shim_seq_27805efd7b8d63d1
-
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, cake_host_shim_seq_27805efd7b8d63d1::Run);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(run_push, cake_host_shim_seq_27805efd7b8d63d1::RunPush);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, CAKE_SEQ_SHIM::Run);

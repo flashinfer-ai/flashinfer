@@ -201,6 +201,8 @@ kernel_h3_fc1_swiglu_gemm(const __grid_constant__ CUtensorMap A, const __grid_co
                 for (int _prologue = 0; _prologue < 3; _prologue++) {
                     if (bid + (int)(load_g / 84) * num_bids < total_tiles) {
                         mbarrier_wait(ab_empty_addr + (load_stage) * 8, _phase_ab_empty);
+                        // The MMA warps read this stage with ldmatrix / ld.shared (generic proxy); order those reads before the TMA's async-proxy write.
+                        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                         mbarrier_arrive_expect_tx(ab_full_addr + (load_stage) * 8, 24576);
                         asm volatile(
                             "cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes"
@@ -355,6 +357,8 @@ kernel_h3_fc1_swiglu_gemm(const __grid_constant__ CUtensorMap A, const __grid_co
                     if (lane == 0) {
                         if (bid + (int)(load_g / 84) * num_bids < total_tiles) {
                             mbarrier_wait(ab_empty_addr + (load_stage) * 8, _phase_ab_empty);
+                            // The MMA warps read this stage with ldmatrix / ld.shared (generic proxy); order those reads before the TMA's async-proxy write.
+                            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                             mbarrier_arrive_expect_tx(ab_full_addr + (load_stage) * 8, 24576);
                             asm volatile(
                                 "cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes"
@@ -3012,6 +3016,8 @@ kernel_h3_fc1_swiglu_gemm(const __grid_constant__ CUtensorMap A, const __grid_co
                 for (int _prologue = 0; _prologue < 3; _prologue++) {
                     if (bid + (int)(load_g / 84) * num_bids < total_tiles) {
                         mbarrier_wait(ab_empty_addr + (load_stage) * 8, _phase_ab_empty);
+                        // The MMA warps read this stage with ldmatrix / ld.shared (generic proxy); order those reads before the TMA's async-proxy write.
+                        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                         mbarrier_arrive_expect_tx(ab_full_addr + (load_stage) * 8, 24576);
                         asm volatile(
                             "cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes"
@@ -3166,6 +3172,8 @@ kernel_h3_fc1_swiglu_gemm(const __grid_constant__ CUtensorMap A, const __grid_co
                     if (lane == 0) {
                         if (bid + (int)(load_g / 84) * num_bids < total_tiles) {
                             mbarrier_wait(ab_empty_addr + (load_stage) * 8, _phase_ab_empty);
+                            // The MMA warps read this stage with ldmatrix / ld.shared (generic proxy); order those reads before the TMA's async-proxy write.
+                            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                             mbarrier_arrive_expect_tx(ab_full_addr + (load_stage) * 8, 24576);
                             asm volatile(
                                 "cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes"

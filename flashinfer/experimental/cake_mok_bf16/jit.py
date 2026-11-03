@@ -37,10 +37,11 @@ class _Kernel:
     def __init__(self, module, arguments):
         self._run = module.run
         self._arguments = tuple(arguments)
+        self._argument_set = frozenset(self._arguments)
 
     def launch(self, *, grid, **arguments):
         arguments.update(zip(("grid_x", "grid_y", "grid_z"), grid, strict=True))
-        if set(arguments) != set(self._arguments):
+        if arguments.keys() != self._argument_set:
             raise ValueError("Kernel arguments do not match the exported ABI")
         return self._run(*(arguments[name] for name in self._arguments))
 

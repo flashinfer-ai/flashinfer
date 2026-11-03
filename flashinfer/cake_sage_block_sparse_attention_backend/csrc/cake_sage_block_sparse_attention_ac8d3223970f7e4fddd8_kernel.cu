@@ -177,19 +177,14 @@ kernel_cake_sage_block_sparse_attention_ac8d3223970f7e4fddd8(__nv_bfloat16* __re
                 packed = _bf16x2_max_0;
             }
             float2 _cvt_f32_0 = __bfloat1622float2(__as_bf16x2(packed));
-            float _fmax_0 = fmaxf(_cvt_f32_0.x, _cvt_f32_0.y);
-            float amax = _fmax_0;
-            float _shfl_xor_0 = __shfl_xor_sync(0xFFFFFFFF, amax, 4);
-            float _fmax_1 = fmaxf(amax, _shfl_xor_0);
-            amax = _fmax_1;
-            float _shfl_xor_1 = __shfl_xor_sync(0xFFFFFFFF, amax, 2);
-            float _fmax_2 = fmaxf(amax, _shfl_xor_1);
-            amax = _fmax_2;
-            float _shfl_xor_2 = __shfl_xor_sync(0xFFFFFFFF, amax, 1);
-            float _fmax_3 = fmaxf(amax, _shfl_xor_2);
-            amax = _fmax_3;
-            float _fmax_4 = fmaxf(amax, 1e-06f);
-            amax = _fmax_4;
+            float amax = fmaxf(_cvt_f32_0.x, _cvt_f32_0.y);
+            float _shfl_xor_sync_3 = __shfl_xor_sync(0xFFFFFFFF, amax, 4);
+            amax = fmaxf(amax, _shfl_xor_sync_3);
+            float _shfl_xor_sync_4 = __shfl_xor_sync(0xFFFFFFFF, amax, 2);
+            amax = fmaxf(amax, _shfl_xor_sync_4);
+            float _shfl_xor_sync_5 = __shfl_xor_sync(0xFFFFFFFF, amax, 1);
+            amax = fmaxf(amax, _shfl_xor_sync_5);
+            amax = fmaxf(amax, 1e-06f);
             float values[16];
             #pragma unroll
             for (int j_1 = 0; j_1 < 8; j_1++) {
@@ -198,10 +193,10 @@ kernel_cake_sage_block_sparse_attention_ac8d3223970f7e4fddd8(__nv_bfloat16* __re
                 values[2 * j_1 + 1] = _cvt_f32_1.y;
             }
             #if __CUDA_ARCH__ >= 1000
-            const float2 _scale2_3 = {448.0f / amax, 448.0f / amax};
+            const float2 _scale2_6 = {448.0f / amax, 448.0f / amax};
             #pragma unroll
             for (int _ls = 0; _ls < 8; _ls++)
-                mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(values)[_ls], _scale2_3);
+                mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(values)[_ls], _scale2_6);
             #else
             #pragma unroll
             for (int _ls = 0; _ls < 16; _ls++) {
@@ -284,25 +279,18 @@ kernel_cake_sage_block_sparse_attention_ac8d3223970f7e4fddd8(__nv_bfloat16* __re
             }
         }
         float2 _cvt_f32_2 = __bfloat1622float2(__as_bf16x2(kmax));
-        float _fmax_5 = fmaxf(_cvt_f32_2.x, _cvt_f32_2.y);
-        float group_max = _fmax_5;
-        float _shfl_xor_3 = __shfl_xor_sync(0xFFFFFFFF, group_max, 16);
-        float _fmax_6 = fmaxf(group_max, _shfl_xor_3);
-        group_max = _fmax_6;
-        float _shfl_xor_4 = __shfl_xor_sync(0xFFFFFFFF, group_max, 8);
-        float _fmax_7 = fmaxf(group_max, _shfl_xor_4);
-        group_max = _fmax_7;
-        float _shfl_xor_5 = __shfl_xor_sync(0xFFFFFFFF, group_max, 4);
-        float _fmax_8 = fmaxf(group_max, _shfl_xor_5);
-        group_max = _fmax_8;
-        float _shfl_xor_6 = __shfl_xor_sync(0xFFFFFFFF, group_max, 2);
-        float _fmax_9 = fmaxf(group_max, _shfl_xor_6);
-        group_max = _fmax_9;
-        float _shfl_xor_7 = __shfl_xor_sync(0xFFFFFFFF, group_max, 1);
-        float _fmax_10 = fmaxf(group_max, _shfl_xor_7);
-        group_max = _fmax_10;
-        float _fmax_11 = fmaxf(group_max, 1e-06f);
-        group_max = _fmax_11;
+        float group_max = fmaxf(_cvt_f32_2.x, _cvt_f32_2.y);
+        float _shfl_xor_sync_7 = __shfl_xor_sync(0xFFFFFFFF, group_max, 16);
+        group_max = fmaxf(group_max, _shfl_xor_sync_7);
+        float _shfl_xor_sync_8 = __shfl_xor_sync(0xFFFFFFFF, group_max, 8);
+        group_max = fmaxf(group_max, _shfl_xor_sync_8);
+        float _shfl_xor_sync_9 = __shfl_xor_sync(0xFFFFFFFF, group_max, 4);
+        group_max = fmaxf(group_max, _shfl_xor_sync_9);
+        float _shfl_xor_sync_10 = __shfl_xor_sync(0xFFFFFFFF, group_max, 2);
+        group_max = fmaxf(group_max, _shfl_xor_sync_10);
+        float _shfl_xor_sync_11 = __shfl_xor_sync(0xFFFFFFFF, group_max, 1);
+        group_max = fmaxf(group_max, _shfl_xor_sync_11);
+        group_max = fmaxf(group_max, 1e-06f);
         #pragma unroll
         for (int p_4 = 0; p_4 < 4; p_4++) {
             float values_1[16];
@@ -313,10 +301,10 @@ kernel_cake_sage_block_sparse_attention_ac8d3223970f7e4fddd8(__nv_bfloat16* __re
                 values_1[2 * j_5 + 1] = _cvt_f32_3.y;
             }
             #if __CUDA_ARCH__ >= 1000
-            const float2 _scale2_4 = {448.0f / group_max, 448.0f / group_max};
+            const float2 _scale2_12 = {448.0f / group_max, 448.0f / group_max};
             #pragma unroll
             for (int _ls = 0; _ls < 8; _ls++)
-                mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(values_1)[_ls], _scale2_4);
+                mul_f32x2_noftz_inplace(&reinterpret_cast<float2*>(values_1)[_ls], _scale2_12);
             #else
             #pragma unroll
             for (int _ls = 0; _ls < 16; _ls++) {
@@ -363,16 +351,16 @@ kernel_cake_sage_block_sparse_attention_ac8d3223970f7e4fddd8(__nv_bfloat16* __re
         }
         #pragma unroll
         for (int j_6 = 0; j_6 < 8; j_6++) {
-            unsigned int _shfl_xor_8 = __shfl_xor_sync(0xFFFFFFFF, vmax[j_6], 8);
+            unsigned int _shfl_xor_sync_13 = __shfl_xor_sync(0xFFFFFFFF, vmax[j_6], 8);
             uint32_t _bf16x2_max_4;
-            asm("max.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_max_4) : "r"(vmax[j_6]), "r"(_shfl_xor_8));
+            asm("max.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_max_4) : "r"(vmax[j_6]), "r"(_shfl_xor_sync_13));
             vmax[j_6] = _bf16x2_max_4;
         }
         #pragma unroll
         for (int j_7 = 0; j_7 < 8; j_7++) {
-            unsigned int _shfl_xor_9 = __shfl_xor_sync(0xFFFFFFFF, vmax[j_7], 16);
+            unsigned int _shfl_xor_sync_14 = __shfl_xor_sync(0xFFFFFFFF, vmax[j_7], 16);
             uint32_t _bf16x2_max_5;
-            asm("max.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_max_5) : "r"(vmax[j_7]), "r"(_shfl_xor_9));
+            asm("max.bf16x2 %0, %1, %2;" : "=r"(_bf16x2_max_5) : "r"(vmax[j_7]), "r"(_shfl_xor_sync_14));
             vmax[j_7] = _bf16x2_max_5;
         }
         if (half == 0) {
@@ -388,12 +376,11 @@ kernel_cake_sage_block_sparse_attention_ac8d3223970f7e4fddd8(__nv_bfloat16* __re
             float cta_max = vmax_smem[tid];
             #pragma unroll
             for (int other = 1; other < 4; other++) {
-                float _fmax_12 = fmaxf(cta_max, vmax_smem[other * 128 + tid]);
-                cta_max = _fmax_12;
+                cta_max = fmaxf(cta_max, vmax_smem[other * 128 + tid]);
             }
             {
-                int _amx_f32_bits_5 = __float_as_int(cta_max);
-                atomicMax(reinterpret_cast<int*>(&v_amax[kv_bh * 128 + tid]), _amx_f32_bits_5);
+                int _amx_f32_bits_15 = __float_as_int(cta_max);
+                atomicMax(reinterpret_cast<int*>(&v_amax[kv_bh * 128 + tid]), _amx_f32_bits_15);
             }
         }
     }

@@ -705,6 +705,15 @@ _gdn_prefill_gates_trace.inputs.update(
 
 
 def gdn_prefill_trace(**kwargs):
+    # The slot arguments (output_state_indices, checkpoint_state_indices,
+    # prefix_lens) have no template here: such a call is not traced, and Apply
+    # keeps the original call. The paged APIs (gdn_prefill_paged_trace) carry
+    # their own definitions.
+    if any(
+        kwargs.get(name) is not None
+        for name in ("output_state_indices", "checkpoint_state_indices", "prefix_lens")
+    ):
+        return None
     if (
         kwargs.get("gate_domain", "linear") != "linear"
         or kwargs.get("use_gate_in_kernel", False)
@@ -1456,4 +1465,548 @@ gdn_replayssm_commit_trace = TraceTemplate(
     tags=["stage:commit"],
     reference=_gdn_replayssm_commit_reference,
     init=_gdn_replayssm_commit_init,
+)
+
+# ── GDN on a paged recurrent-state pool ───────────────────────────────────────
+
+
+@torch.no_grad()
+def _gdn_prefill_paged_reference(
+    q,
+    k,
+    v,
+    g=None,
+    beta=None,
+    scale=None,
+    *,
+    cu_seqlens,
+    state_pool,
+    page_indices,
+    page_indptr,
+    page_size,
+    last_page_len,
+    use_qk_l2norm_in_kernel=False,
+    gate_domain="linear",
+    use_gate_in_kernel=False,
+    A_log=None,
+    dt_bias=None,
+    beta_is_logit=False,
+):
+    """Token recurrence of ``chunk_gated_delta_rule_paged`` on a paged pool.
+
+    Sequence ``b`` owns pages ``page_indices[page_indptr[b]:page_indptr[b+1]]``
+    and holds ``total = (num_pages_b - 1) * page_size + last_page_len[b]``
+    tokens after the call. Its new tokens are the last ``seq_len`` of them,
+    so ``prefix = total - seq_len``. Page ``j`` holds the state after token
+    ``(j + 1) * page_size`` (the last page: after the last token).
+
+    - The initial state is the page holding token ``prefix - 1``, or zero
+      when ``prefix == 0``.
+    - After each new token whose absolute position ``prefix + n``
+      (``1 <= n <= seq_len``) is a multiple of ``page_size``, the state is
+      written to the page that ends there.
+    - The final state is written to the last page, unless ``seq_len == 0``
+      (the pool is unchanged) or ``total % page_size == 0`` (the boundary
+      write already stored it there).
+
+    Pages that end at or before the prefix are only read. The gates and
+    the optional Q/K L2 norm follow ``chunk_gated_delta_rule``: ``g`` is the
+    linear decay (``None``: no decay), or its natural log with
+    ``gate_domain="log"``, or the raw input of
+    ``exp(-exp(A_log) * softplus(g + dt_bias))`` with ``use_gate_in_kernel``;
+    ``beta`` is the update gate (``None``: one), or its logit with
+    ``beta_is_logit`` (sigmoid rounded to beta's dtype). The recurrent state
+    stays in FP32 between tokens; ``state_pool`` is updated in place and
+    returned with the output.
+    """
+    heads, dim = max(q.shape[1], v.shape[1]), q.shape[-1]
+    if scale is None or scale == 0.0:
+        scale = dim**-0.5
+    if use_qk_l2norm_in_kernel:
+        # FP32 L2 norm with eps 1e-6, rounded back to the input dtype.
+        qf, kf = q.float(), k.float()
+        q = (qf * torch.rsqrt(qf.square().sum(-1, keepdim=True) + 1e-6)).to(q.dtype)
+        k = (kf * torch.rsqrt(kf.square().sum(-1, keepdim=True) + 1e-6)).to(k.dtype)
+    qf = q.float().repeat_interleave(heads // q.shape[1], dim=1)
+    kf = k.float().repeat_interleave(heads // k.shape[1], dim=1)
+    vf = v.float().repeat_interleave(heads // v.shape[1], dim=1)
+    if use_gate_in_kernel:
+        alpha = torch.exp(
+            -torch.exp(A_log.float()) * F.softplus(g.float() + dt_bias.float())
+        )
+    elif g is None:
+        alpha = torch.ones(q.shape[0], heads, device=q.device)
+    elif gate_domain == "log":
+        alpha = g.float().exp()
+    else:
+        alpha = g.float()
+    if beta is None:
+        beta_f = torch.ones(q.shape[0], heads, device=q.device)
+    elif beta_is_logit:
+        beta_f = beta.float().sigmoid().to(beta.dtype).float()
+    else:
+        beta_f = beta.float()
+
+    output = torch.zeros(q.shape[0], heads, v.shape[-1], dtype=q.dtype, device=q.device)
+    for seq in range(cu_seqlens.numel() - 1):
+        start, end = int(cu_seqlens[seq]), int(cu_seqlens[seq + 1])
+        pages = page_indices[int(page_indptr[seq]) : int(page_indptr[seq + 1])]
+        pages = [int(page) for page in pages]
+        total = (len(pages) - 1) * page_size + int(last_page_len[seq])
+        prefix = total - (end - start)
+        if prefix > 0:
+            hidden = state_pool[pages[(prefix - 1) // page_size]].float().clone()
+        else:
+            hidden = torch.zeros(heads, v.shape[-1], dim, device=q.device)
+        for token in range(start, end):
+            hidden *= alpha[token, :, None, None]
+            delta = beta_f[token, :, None] * (
+                vf[token] - torch.einsum("hvk,hk->hv", hidden, kf[token])
+            )
+            hidden += delta[:, :, None] * kf[token, :, None, :]
+            output[token] = (scale * torch.einsum("hvk,hk->hv", hidden, qf[token])).to(
+                q.dtype
+            )
+            position = prefix + token - start + 1
+            if position % page_size == 0:
+                state_pool[pages[position // page_size - 1]] = hidden
+        if end > start and total % page_size != 0:
+            state_pool[pages[-1]] = hidden
+    return output, state_pool
+
+
+def _gdn_prefill_paged_init(
+    *,
+    total_seq_len: int,
+    num_seqs: int = 4,
+    len_cu_seqlens: int = 0,  # derived: num_seqs + 1
+    num_pages: int = 0,  # minimum pool rows; grown to the pages used + 3
+    num_page_indices: int = 0,  # derived from the page table
+    num_q_heads: int = 4,
+    num_v_heads: int = 8,
+    head_size: int = 128,
+    page_size: int = 64,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build a paged batch for ``flashinfer.gdn_paged.chunk_gated_delta_rule_paged``.
+
+    The ``total_seq_len`` new tokens are split raggedly over ``num_seqs``
+    sequences (sequence 0 gets at least one; others may get none). The
+    prefixes cycle through no prefix, ``page_size + 37`` tokens (inside a
+    page, not 64-aligned), two full pages and 5 tokens, plus ``seq // 4``
+    pages. Each sequence owns ``ceil((prefix + seq_len) / page_size)`` page
+    ids, drawn without replacement from a shuffled pool with spare rows.
+    Page tables and lengths are int32. Keys use the query heads (GVA) or
+    the value heads (GQA): ``num_k_heads = min(num_q_heads, num_v_heads)``.
+    Q/K/V follow ``_gdn_prefill_init``; the gates are linear, ``g`` in
+    (0.9, 1) and ``beta`` in (0, 1); pool rows are ``0.1 * randn`` FP32.
+    """
+    del len_cu_seqlens, num_page_indices
+    if total_seq_len < 1:
+        raise ValueError("total_seq_len must be at least 1")
+    inputs = _gdn_prefill_init(
+        total_seq_len=total_seq_len,
+        num_seqs=num_seqs,
+        num_q_heads=num_q_heads,
+        num_k_heads=min(num_q_heads, num_v_heads),
+        num_v_heads=num_v_heads,
+        head_size=head_size,
+        device=device,
+        seed=seed,
+    )
+    heads = max(num_q_heads, num_v_heads)
+    weights = [1 + (3 * seq + 1) % 5 for seq in range(num_seqs)]
+    weight_sum = sum(weights)
+    seq_lens = [total_seq_len * w // weight_sum for w in weights]
+    seq_lens[0] += total_seq_len - sum(seq_lens)
+    prefix_cycle = [0, page_size + 37, 2 * page_size, 5]
+    prefixes = [
+        prefix_cycle[seq % 4] + (seq // 4) * page_size for seq in range(num_seqs)
+    ]
+    totals = [p + n for p, n in zip(prefixes, seq_lens, strict=True)]
+    pages_per_seq = [-(-total // page_size) for total in totals]
+    used = sum(pages_per_seq)
+    rows = max(num_pages, used + 3)
+    gen = torch.Generator().manual_seed(seed)
+    page_ids = torch.randperm(rows, generator=gen)[:used]
+
+    def _int32(values):
+        return torch.tensor(values, dtype=torch.int32, device=device)
+
+    cu_seqlens = [0]
+    page_indptr = [0]
+    for n, pages in zip(seq_lens, pages_per_seq, strict=True):
+        cu_seqlens.append(cu_seqlens[-1] + n)
+        page_indptr.append(page_indptr[-1] + pages)
+    inputs.update(
+        g=0.9 + 0.1 * torch.rand(total_seq_len, heads, device=device),
+        beta=torch.rand(total_seq_len, heads, device=device),
+        cu_seqlens=_int32(cu_seqlens),
+        state_pool=0.1 * torch.randn(rows, heads, head_size, head_size, device=device),
+        page_indices=page_ids.to(torch.int32).to(device),
+        page_indptr=_int32(page_indptr),
+        page_size=page_size,
+        last_page_len=_int32(
+            [
+                total - (pages - 1) * page_size
+                for total, pages in zip(totals, pages_per_seq, strict=True)
+            ]
+        ),
+    )
+    return inputs
+
+
+_gdn_prefill_paged_init._trace_init_dependencies = (_gdn_prefill_init,)  # type: ignore[attr-defined]
+
+gdn_prefill_paged_trace = TraceTemplate(
+    op_type="gdn",
+    name_prefix="gdn_prefill_paged",
+    description=(
+        "Chunked GDN prefill on a paged recurrent-state pool [num_pages, H, V, K]. "
+        "Each sequence owns a CSR list of page ids; page j holds the state after "
+        "token (j + 1) * page_size. The call reads the page holding the last "
+        "prefix token (zero state without a prefix), writes the state at every "
+        "page boundary its new tokens cross and the final state to the last "
+        "page. Pages that end at or before the prefix are only read."
+    ),
+    axes={
+        "total_seq_len": Var(description="Total new tokens across all sequences."),
+        "num_seqs": Var(description="Number of sequences in the batch."),
+        "len_cu_seqlens": Var(
+            description="num_seqs + 1 (length of cu_seqlens and page_indptr)."
+        ),
+        "num_q_heads": Const(description="Number of query heads.", abbrev="q"),
+        "num_k_heads": Const(description="Number of key heads.", abbrev="k"),
+        "num_v_heads": Const(description="Number of value heads.", abbrev="v"),
+        "num_o_heads": Const(
+            description="max(num_q_heads, num_v_heads): output and state heads.",
+            abbrev="",
+        ),
+        "head_size": Const(
+            description="Head dimension (K in query/key space, V in value space).",
+            abbrev="d",
+        ),
+        "page_size": Const(
+            description="Tokens per page, a positive multiple of 64.", abbrev="ps"
+        ),
+        "num_pages": Var(description="Rows of the recurrent-state pool."),
+        "num_page_indices": Var(description="Length of page_indices."),
+    },
+    inputs={
+        "q": Tensor(["total_seq_len", "num_q_heads", "head_size"]),
+        "k": Tensor(["total_seq_len", "num_k_heads", "head_size"]),
+        "v": Tensor(["total_seq_len", "num_v_heads", "head_size"]),
+        "g": Tensor(
+            ["total_seq_len", "num_o_heads"],
+            optional=True,
+            description=(
+                "Decay gate: linear alpha (default), log alpha with "
+                "gate_domain='log', or raw input with use_gate_in_kernel. "
+                "None means no decay."
+            ),
+        ),
+        "beta": Tensor(
+            ["total_seq_len", "num_o_heads"],
+            optional=True,
+            description="Update gate, or its logit with beta_is_logit. None means one.",
+        ),
+        "scale": Scalar(
+            "float32",
+            optional=True,
+            description="Query scale. Default is 1/sqrt(head_size).",
+        ),
+        "cu_seqlens": Tensor(
+            ["len_cu_seqlens"],
+            description="Offsets of each sequence's new tokens in q/k/v.",
+        ),
+        "state_pool": Tensor(
+            ["num_pages", "num_o_heads", "head_size", "head_size"],
+            description="Recurrent-state pool in k-last layout [num_pages, H, V, K].",
+        ),
+        "page_indices": Tensor(
+            ["num_page_indices"],
+            description="Page ids of all sequences, in any order (CSR values).",
+        ),
+        "page_indptr": Tensor(
+            ["len_cu_seqlens"],
+            description="CSR offsets: sequence b owns page_indices[page_indptr[b]:page_indptr[b + 1]].",
+        ),
+        "page_size": Scalar("int32", description="Tokens per page."),
+        "last_page_len": Tensor(
+            ["num_seqs"],
+            description="Tokens in each sequence's last page after the call, in [1, page_size].",
+        ),
+        "use_qk_l2norm_in_kernel": Scalar(
+            "bool", optional=True, description="L2-normalize q and k (eps 1e-6)."
+        ),
+        "gate_domain": Scalar(
+            "str", optional=True, description="'linear' (default) or 'log'."
+        ),
+        "use_gate_in_kernel": Scalar(
+            "bool",
+            optional=True,
+            description="g is raw: alpha = exp(-exp(A_log) * softplus(g + dt_bias)).",
+        ),
+        "A_log": Tensor(
+            ["num_o_heads"],
+            optional=True,
+            description="Per-head log decay parameter for raw gates.",
+        ),
+        "dt_bias": Tensor(
+            ["num_o_heads"], optional=True, description="Per-head bias for raw gates."
+        ),
+        "beta_is_logit": Scalar(
+            "bool", optional=True, description="beta = sigmoid(beta)."
+        ),
+    },
+    outputs={
+        "output": Tensor(
+            ["total_seq_len", "num_o_heads", "head_size"],
+            param="output",
+            dtype_from="q",
+            description="Attention output of the new tokens.",
+        ),
+        "state_pool": Tensor(
+            ["num_pages", "num_o_heads", "head_size", "head_size"],
+            param="state_pool",
+            dtype_from="state_pool",
+            description="The state pool, updated in place.",
+        ),
+    },
+    constraints=[
+        "num_o_heads == max(num_q_heads, num_v_heads)",
+        "num_o_heads % num_q_heads == 0",
+        "num_o_heads % num_v_heads == 0",
+        "num_k_heads in (num_q_heads, num_v_heads)",
+        "len_cu_seqlens == num_seqs + 1",
+        "total_seq_len == cu_seqlens[-1].item()",
+        "num_page_indices == page_indptr[-1].item()",
+        "page_size % 64 == 0",
+    ],
+    tags=["stage:prefill", "status:verified"],
+    reference=_gdn_prefill_paged_reference,
+    init=_gdn_prefill_paged_init,
+)
+
+
+@torch.no_grad()
+def _gdn_decode_paged_reference(
+    q,
+    k,
+    v,
+    A_log,
+    a,
+    dt_bias,
+    b,
+    scale=None,
+    *,
+    use_qk_l2norm=True,
+    state_pool,
+    page_indices,
+    page_indptr,
+    last_page_len,
+):
+    """One-token GDN decode of ``gated_delta_rule_decode_paged`` on a paged pool.
+
+    The decoded token of sequence ``b`` is the last of its tokens, at
+    position ``last_page_len[b]`` of its last page. When it opens that page
+    (``last_page_len[b] == 1``) the state is read from the previous page,
+    which stays unchanged; otherwise from the last page. The updated state
+    is written to the last page.
+
+    Gates: ``g = exp(-exp(A_log) * softplus(a + dt_bias))``,
+    ``beta = sigmoid(b)``. With ``use_qk_l2norm``, q and k are scaled by
+    ``rsqrt(sum(x^2) + 1e-6)`` in FP32. ``state_pool`` is updated in place
+    and returned with the output ``[B, 1, HV, V]``.
+    """
+    batch, _, num_q_heads, dim = q.shape
+    heads = v.shape[2]
+    if scale is None:
+        scale = dim**-0.5
+    qf, kf, vf = q[:, 0].float(), k[:, 0].float(), v[:, 0].float()
+    if use_qk_l2norm:
+        qf = qf * torch.rsqrt(qf.square().sum(-1, keepdim=True) + 1e-6)
+        kf = kf * torch.rsqrt(kf.square().sum(-1, keepdim=True) + 1e-6)
+    qf = qf.repeat_interleave(heads // num_q_heads, dim=1)
+    kf = kf.repeat_interleave(heads // k.shape[2], dim=1)
+    alpha = torch.exp(
+        -torch.exp(A_log.float()) * F.softplus(a[:, 0].float() + dt_bias.float())
+    )
+    beta = torch.sigmoid(b[:, 0].float())
+
+    output = torch.zeros(batch, 1, heads, v.shape[-1], dtype=q.dtype, device=q.device)
+    for seq in range(batch):
+        last = int(page_indptr[seq + 1]) - 1
+        read = last - 1 if int(last_page_len[seq]) == 1 else last
+        hidden = state_pool[int(page_indices[read])].float().clone()
+        hidden *= alpha[seq, :, None, None]
+        delta = beta[seq, :, None] * (
+            vf[seq] - torch.einsum("hvk,hk->hv", hidden, kf[seq])
+        )
+        hidden += delta[:, :, None] * kf[seq, :, None, :]
+        output[seq, 0] = (scale * torch.einsum("hvk,hk->hv", hidden, qf[seq])).to(
+            q.dtype
+        )
+        state_pool[int(page_indices[last])] = hidden
+    return output, state_pool
+
+
+def _gdn_decode_paged_init(
+    *,
+    batch_size: int,
+    batch_size_plus_1: int = 0,  # derived
+    num_pages: int = 0,  # minimum pool rows; grown to the pages used + 3
+    num_page_indices: int = 0,  # derived from the page table
+    num_q_heads: int = 4,
+    num_v_heads: int = 8,
+    head_size: int = 128,
+    page_size: int = 64,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build a paged batch for ``flashinfer.gdn_paged.gated_delta_rule_decode_paged``.
+
+    Sequences cycle through four (pages owned, last_page_len) cases, plus
+    ``seq // 4`` pages: a token that opens the second page (reads page 0),
+    the 17th token of a single page, the last token of a third full page,
+    and a token that opens the third page. Page ids are drawn without
+    replacement from a shuffled pool with spare rows; page tables and
+    lengths are int32. ``num_k_heads == num_q_heads`` as the decode kernel
+    requires. Q/K/V and the gate inputs follow ``_gdn_decode_init``; pool
+    rows are ``randn`` FP32.
+    """
+    del batch_size_plus_1, num_page_indices
+    inputs = _gdn_decode_init(
+        batch_size=batch_size,
+        num_q_heads=num_q_heads,
+        num_k_heads=num_q_heads,
+        num_v_heads=num_v_heads,
+        head_size=head_size,
+        device=device,
+        seed=seed,
+    )
+    del inputs["state"]
+    cases = [(2, 1), (1, 17), (3, page_size), (3, 1)]
+    pages_per_seq = [cases[seq % 4][0] + seq // 4 for seq in range(batch_size)]
+    used = sum(pages_per_seq)
+    rows = max(num_pages, used + 3)
+    gen = torch.Generator().manual_seed(seed)
+    page_ids = torch.randperm(rows, generator=gen)[:used]
+    page_indptr = [0]
+    for pages in pages_per_seq:
+        page_indptr.append(page_indptr[-1] + pages)
+    inputs.update(
+        state_pool=torch.randn(
+            rows, num_v_heads, head_size, head_size, dtype=torch.float32, device=device
+        ),
+        page_indices=page_ids.to(torch.int32).to(device),
+        page_indptr=torch.tensor(page_indptr, dtype=torch.int32, device=device),
+        last_page_len=torch.tensor(
+            [cases[seq % 4][1] for seq in range(batch_size)],
+            dtype=torch.int32,
+            device=device,
+        ),
+    )
+    return inputs
+
+
+_gdn_decode_paged_init._trace_init_dependencies = (_gdn_decode_init,)  # type: ignore[attr-defined]
+
+gdn_decode_paged_trace = TraceTemplate(
+    op_type="gdn",
+    name_prefix="gdn_decode_paged",
+    description=(
+        "Single-token GDN decode on a paged recurrent-state pool [num_pages, HV, V, K] "
+        "with GVA heads. The decoded token is the last token of its sequence: when "
+        "it opens a new page (last_page_len == 1) the state is read from the "
+        "previous page, else from the last page; the updated state is written "
+        "to the last page."
+    ),
+    axes={
+        "batch_size": Var(description="Number of sequences, one token each."),
+        "batch_size_plus_1": Var(description="batch_size + 1 (length of page_indptr)."),
+        "seq_len": Const(
+            description="Tokens per sequence (always 1).", abbrev="", value=1
+        ),
+        "num_q_heads": Const(
+            description="Number of query heads (same as key heads).", abbrev="qk"
+        ),
+        "num_k_heads": Const(description="Number of key heads.", abbrev=""),
+        "num_v_heads": Const(description="Number of value heads.", abbrev="v"),
+        "head_size": Const(
+            description="Head dimension (K in query/key space, V in value space).",
+            abbrev="d",
+        ),
+        "num_pages": Var(description="Rows of the recurrent-state pool."),
+        "num_page_indices": Var(description="Length of page_indices."),
+    },
+    inputs={
+        "q": Tensor(["batch_size", "seq_len", "num_q_heads", "head_size"]),
+        "k": Tensor(["batch_size", "seq_len", "num_k_heads", "head_size"]),
+        "v": Tensor(["batch_size", "seq_len", "num_v_heads", "head_size"]),
+        "A_log": Tensor(
+            ["num_v_heads"],
+            description="Log decay: g = exp(-exp(A_log) * softplus(a + dt_bias)).",
+        ),
+        "a": Tensor(
+            ["batch_size", "seq_len", "num_v_heads"],
+            description="Input-dependent decay.",
+        ),
+        "dt_bias": Tensor(["num_v_heads"], description="Decay bias."),
+        "b": Tensor(
+            ["batch_size", "seq_len", "num_v_heads"],
+            description="Update gate input: beta = sigmoid(b).",
+        ),
+        "scale": Scalar(
+            "float32",
+            optional=True,
+            description="Query scale. Default is 1/sqrt(head_size).",
+        ),
+        "use_qk_l2norm": Scalar(
+            "bool",
+            optional=True,
+            description="L2-normalize q and k (eps 1e-6). Default true.",
+        ),
+        "state_pool": Tensor(
+            ["num_pages", "num_v_heads", "head_size", "head_size"],
+            description="Recurrent-state pool in k-last layout [num_pages, HV, V, K].",
+        ),
+        "page_indices": Tensor(
+            ["num_page_indices"],
+            description="Page ids of all sequences, in any order (CSR values).",
+        ),
+        "page_indptr": Tensor(
+            ["batch_size_plus_1"],
+            description="CSR offsets: sequence b owns page_indices[page_indptr[b]:page_indptr[b + 1]].",
+        ),
+        "last_page_len": Tensor(
+            ["batch_size"],
+            description="Tokens in the last page including the decoded token, in [1, page_size].",
+        ),
+    },
+    outputs={
+        "output": Tensor(
+            ["batch_size", "seq_len", "num_v_heads", "head_size"],
+            param="output",
+            dtype_from="q",
+            description="Attention output of the decoded token.",
+        ),
+        "state_pool": Tensor(
+            ["num_pages", "num_v_heads", "head_size", "head_size"],
+            param="state_pool",
+            dtype_from="state_pool",
+            description="The state pool, updated in place.",
+        ),
+    },
+    constraints=[
+        "num_v_heads >= num_q_heads",
+        "num_v_heads % num_q_heads == 0",
+        "num_k_heads == num_q_heads",
+        "batch_size_plus_1 == batch_size + 1",
+        "num_page_indices == page_indptr[-1].item()",
+    ],
+    tags=["stage:decode", "status:verified"],
+    reference=_gdn_decode_paged_reference,
+    init=_gdn_decode_paged_init,
 )

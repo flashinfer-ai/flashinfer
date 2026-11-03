@@ -14,43 +14,32 @@
  * limitations under the License.
  */
 
-typedef signed char int8_t;
-typedef unsigned char uint8_t;
-typedef unsigned short uint16_t;
-typedef unsigned int uint32_t;
-#if defined(__CUDACC_RTC__)
-typedef unsigned long long uint64_t;
-#else
-typedef unsigned long uint64_t;
+#define CAKE_WARP_UNIFORM_INT 1
+#include "cake_hopper_msa_device.h"
+
+// Shared by every record that names this translation unit in its sources: the record's
+// compile_flags set the knob values below (a knob without a -D flag is a compile error) and name
+// the kernel symbol (-DCAKE_PROGRAM_KERNEL=<its own symbol>; every JIT library of the family
+// exports a distinct kernel).
+//   CAKE_INDEX_BITS        index bits l = bit_length(tiles - 1) of the route
+//   CAKE_INDEX_LOW_MASK    (1 << l) - 1
+//   CAKE_INDEX_HIGH_MASK   ~((1 << l) - 1) as a 32-bit unsigned literal
+//   CAKE_INDEX_SCORE_MASK  0x7F7FFFFF & ~((1 << l) - 1)
+#ifndef CAKE_INDEX_BITS
+#error "CAKE_INDEX_BITS must come from the record's compile_flags"
 #endif
-static_assert(sizeof(uint64_t) == 8, "Cake requires an LP64 CUDA host ABI");
-typedef signed int int32_t;
-typedef short int int16_t;
-struct __align__(64) CakeTensorMap64 {
-  uint64_t opaque[16];
-};
-static_assert(sizeof(CakeTensorMap64) == 128, "64-aligned tensor-map ABI size");
-static_assert(alignof(CakeTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
-
-#if defined(__CUDACC_RTC__)
-typedef struct __align__(128) {
-  uint64_t opaque[16];
-} CUtensorMap;
-#else
-#include <cuda.h>
+#ifndef CAKE_INDEX_LOW_MASK
+#error "CAKE_INDEX_LOW_MASK must come from the record's compile_flags"
 #endif
-
-static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 bytes");
-#include <cuda_bf16.h>
-#include <cuda_fp8.h>
-
-__device__ __forceinline__ int make_warp_uniform(int x) {
-  int result;
-  asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1F, 0xFFFFFFFF;" : "=r"(result) : "r"(x));
-  return result;
-}
-
-#define CAKE_INF CUDART_INF_F
+#ifndef CAKE_INDEX_HIGH_MASK
+#error "CAKE_INDEX_HIGH_MASK must come from the record's compile_flags"
+#endif
+#ifndef CAKE_INDEX_SCORE_MASK
+#error "CAKE_INDEX_SCORE_MASK must come from the record's compile_flags"
+#endif
+#ifndef CAKE_PROGRAM_KERNEL
+#error "CAKE_PROGRAM_KERNEL (the program's kernel symbol) must come from the record's compile_flags"
+#endif
 #define NUM_MAIN_STAGES 1
 #define SMEM_TREE_OFF 0
 #define SMEM_TREE_STAGE_BYTES 17408
@@ -64,28 +53,13 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_TOTAL 18560
 #define THREADS 256
 
-#include <math_constants.h>
-
-__device__ __forceinline__ unsigned int __as_u32(float v) {
-  unsigned int u;
-  asm("mov.b32 %0, %1;" : "=r"(u) : "f"(v));
-  return u;
-}
-__device__ __forceinline__ unsigned int __as_u32(__nv_bfloat162 v) {
-  return *reinterpret_cast<const unsigned int*>(&v);
-}
-__device__ __forceinline__ unsigned int __as_u32(unsigned int v) { return v; }
-__device__ __forceinline__ unsigned int __as_u32(int v) {
-  unsigned int u;
-  asm("mov.b32 %0, %1;" : "=r"(u) : "r"(v));
-  return u;
-}
-
 extern "C" {
 
-__global__ __launch_bounds__(256) void kernel_cake_hopper_msa_b8a663af850de1edb0d9(
-    unsigned int* __restrict__ S, int* __restrict__ nvp, int* __restrict__ out, int tiles,
-    int total_q, int num_heads, int num_chunks, int fb, int fe) {
+__global__ __launch_bounds__(256) void CAKE_PROGRAM_KERNEL(unsigned int* __restrict__ S,
+                                                           int* __restrict__ nvp,
+                                                           int* __restrict__ out, int tiles,
+                                                           int total_q, int num_heads,
+                                                           int num_chunks, int fb, int fe) {
   const int tid = threadIdx.x;
   const int warp = make_warp_uniform(tid / 32);
   const int lane = tid % 32;
@@ -345,82 +319,82 @@ __global__ __launch_bounds__(256) void kernel_cake_hopper_msa_b8a663af850de1edb0
     float sc = __uint_as_float(cb[0]);
     sc = fmaxf(sc, -1.7014118346046923e+38f);
     sc = fminf(sc, 1.7014118346046923e+38f);
-    unsigned int key = __as_u32(sc) & 4294967294u | (unsigned int)t0_3;
+    unsigned int key = __as_u32(sc) & CAKE_INDEX_HIGH_MASK | (unsigned int)t0_3;
     kb[0] = __uint_as_float(key);
     float sc_4 = __uint_as_float(cb[1]);
     sc_4 = fmaxf(sc_4, -1.7014118346046923e+38f);
     sc_4 = fminf(sc_4, 1.7014118346046923e+38f);
-    unsigned int key_5 = __as_u32(sc_4) & 4294967294u | (unsigned int)(t0_3 + 1);
+    unsigned int key_5 = __as_u32(sc_4) & CAKE_INDEX_HIGH_MASK | (unsigned int)(t0_3 + 1);
     kb[1] = __uint_as_float(key_5);
     float sc_6 = __uint_as_float(cb[2]);
     sc_6 = fmaxf(sc_6, -1.7014118346046923e+38f);
     sc_6 = fminf(sc_6, 1.7014118346046923e+38f);
-    unsigned int key_7 = __as_u32(sc_6) & 4294967294u | (unsigned int)(t0_3 + 2);
+    unsigned int key_7 = __as_u32(sc_6) & CAKE_INDEX_HIGH_MASK | (unsigned int)(t0_3 + 2);
     kb[2] = __uint_as_float(key_7);
     float sc_8 = __uint_as_float(cb[3]);
     sc_8 = fmaxf(sc_8, -1.7014118346046923e+38f);
     sc_8 = fminf(sc_8, 1.7014118346046923e+38f);
-    unsigned int key_9 = __as_u32(sc_8) & 4294967294u | (unsigned int)(t0_3 + 3);
+    unsigned int key_9 = __as_u32(sc_8) & CAKE_INDEX_HIGH_MASK | (unsigned int)(t0_3 + 3);
     kb[3] = __uint_as_float(key_9);
     float sc_10 = __uint_as_float(cb[4]);
     sc_10 = fmaxf(sc_10, -1.7014118346046923e+38f);
     sc_10 = fminf(sc_10, 1.7014118346046923e+38f);
-    unsigned int key_11 = __as_u32(sc_10) & 4294967294u | (unsigned int)(t0_3 + 4);
+    unsigned int key_11 = __as_u32(sc_10) & CAKE_INDEX_HIGH_MASK | (unsigned int)(t0_3 + 4);
     kb[4] = __uint_as_float(key_11);
     float sc_12 = __uint_as_float(cb[5]);
     sc_12 = fmaxf(sc_12, -1.7014118346046923e+38f);
     sc_12 = fminf(sc_12, 1.7014118346046923e+38f);
-    unsigned int key_13 = __as_u32(sc_12) & 4294967294u | (unsigned int)(t0_3 + 5);
+    unsigned int key_13 = __as_u32(sc_12) & CAKE_INDEX_HIGH_MASK | (unsigned int)(t0_3 + 5);
     kb[5] = __uint_as_float(key_13);
     float sc_14 = __uint_as_float(cb[6]);
     sc_14 = fmaxf(sc_14, -1.7014118346046923e+38f);
     sc_14 = fminf(sc_14, 1.7014118346046923e+38f);
-    unsigned int key_15 = __as_u32(sc_14) & 4294967294u | (unsigned int)(t0_3 + 6);
+    unsigned int key_15 = __as_u32(sc_14) & CAKE_INDEX_HIGH_MASK | (unsigned int)(t0_3 + 6);
     kb[6] = __uint_as_float(key_15);
     float sc_16 = __uint_as_float(cb[7]);
     sc_16 = fmaxf(sc_16, -1.7014118346046923e+38f);
     sc_16 = fminf(sc_16, 1.7014118346046923e+38f);
-    unsigned int key_17 = __as_u32(sc_16) & 4294967294u | (unsigned int)(t0_3 + 7);
+    unsigned int key_17 = __as_u32(sc_16) & CAKE_INDEX_HIGH_MASK | (unsigned int)(t0_3 + 7);
     kb[7] = __uint_as_float(key_17);
     float sc_18 = __uint_as_float(cb[8]);
     sc_18 = fmaxf(sc_18, -1.7014118346046923e+38f);
     sc_18 = fminf(sc_18, 1.7014118346046923e+38f);
-    unsigned int key_19 = __as_u32(sc_18) & 4294967294u | (unsigned int)(t0_3 + 8);
+    unsigned int key_19 = __as_u32(sc_18) & CAKE_INDEX_HIGH_MASK | (unsigned int)(t0_3 + 8);
     kb[8] = __uint_as_float(key_19);
     float sc_20 = __uint_as_float(cb[9]);
     sc_20 = fmaxf(sc_20, -1.7014118346046923e+38f);
     sc_20 = fminf(sc_20, 1.7014118346046923e+38f);
-    unsigned int key_21 = __as_u32(sc_20) & 4294967294u | (unsigned int)(t0_3 + 9);
+    unsigned int key_21 = __as_u32(sc_20) & CAKE_INDEX_HIGH_MASK | (unsigned int)(t0_3 + 9);
     kb[9] = __uint_as_float(key_21);
     float sc_22 = __uint_as_float(cb[10]);
     sc_22 = fmaxf(sc_22, -1.7014118346046923e+38f);
     sc_22 = fminf(sc_22, 1.7014118346046923e+38f);
-    unsigned int key_23 = __as_u32(sc_22) & 4294967294u | (unsigned int)(t0_3 + 10);
+    unsigned int key_23 = __as_u32(sc_22) & CAKE_INDEX_HIGH_MASK | (unsigned int)(t0_3 + 10);
     kb[10] = __uint_as_float(key_23);
     float sc_24 = __uint_as_float(cb[11]);
     sc_24 = fmaxf(sc_24, -1.7014118346046923e+38f);
     sc_24 = fminf(sc_24, 1.7014118346046923e+38f);
-    unsigned int key_25 = __as_u32(sc_24) & 4294967294u | (unsigned int)(t0_3 + 11);
+    unsigned int key_25 = __as_u32(sc_24) & CAKE_INDEX_HIGH_MASK | (unsigned int)(t0_3 + 11);
     kb[11] = __uint_as_float(key_25);
     float sc_26 = __uint_as_float(cb[12]);
     sc_26 = fmaxf(sc_26, -1.7014118346046923e+38f);
     sc_26 = fminf(sc_26, 1.7014118346046923e+38f);
-    unsigned int key_27 = __as_u32(sc_26) & 4294967294u | (unsigned int)(t0_3 + 12);
+    unsigned int key_27 = __as_u32(sc_26) & CAKE_INDEX_HIGH_MASK | (unsigned int)(t0_3 + 12);
     kb[12] = __uint_as_float(key_27);
     float sc_28 = __uint_as_float(cb[13]);
     sc_28 = fmaxf(sc_28, -1.7014118346046923e+38f);
     sc_28 = fminf(sc_28, 1.7014118346046923e+38f);
-    unsigned int key_29 = __as_u32(sc_28) & 4294967294u | (unsigned int)(t0_3 + 13);
+    unsigned int key_29 = __as_u32(sc_28) & CAKE_INDEX_HIGH_MASK | (unsigned int)(t0_3 + 13);
     kb[13] = __uint_as_float(key_29);
     float sc_30 = __uint_as_float(cb[14]);
     sc_30 = fmaxf(sc_30, -1.7014118346046923e+38f);
     sc_30 = fminf(sc_30, 1.7014118346046923e+38f);
-    unsigned int key_31 = __as_u32(sc_30) & 4294967294u | (unsigned int)(t0_3 + 14);
+    unsigned int key_31 = __as_u32(sc_30) & CAKE_INDEX_HIGH_MASK | (unsigned int)(t0_3 + 14);
     kb[14] = __uint_as_float(key_31);
     float sc_32 = __uint_as_float(cb[15]);
     sc_32 = fmaxf(sc_32, -1.7014118346046923e+38f);
     sc_32 = fminf(sc_32, 1.7014118346046923e+38f);
-    unsigned int key_33 = __as_u32(sc_32) & 4294967294u | (unsigned int)(t0_3 + 15);
+    unsigned int key_33 = __as_u32(sc_32) & CAKE_INDEX_HIGH_MASK | (unsigned int)(t0_3 + 15);
     kb[15] = __uint_as_float(key_33);
     int f = 0;
     if ((t0_3 < fb || t0_3 + 16 > lim - fe) && t0_3 < lim) {
@@ -432,112 +406,112 @@ __global__ __launch_bounds__(256) void kernel_cake_hopper_msa_b8a663af850de1edb0
         f_0 = 1;
       }
       if (f_0 != 0) {
-        kb[0] = __uint_as_float(2139095038 | (unsigned int)t0_3);
+        kb[0] = __uint_as_float(CAKE_INDEX_SCORE_MASK | (unsigned int)t0_3);
       }
       int f_1 = 0;
       if ((t0_3 + 1 < fb || t0_3 + 1 >= lim - fe) && lim > t0_3 + 1) {
         f_1 = 1;
       }
       if (f_1 != 0) {
-        kb[1] = __uint_as_float(2139095038 | (unsigned int)(t0_3 + 1));
+        kb[1] = __uint_as_float(CAKE_INDEX_SCORE_MASK | (unsigned int)(t0_3 + 1));
       }
       int f_2 = 0;
       if ((t0_3 + 2 < fb || t0_3 + 2 >= lim - fe) && lim > t0_3 + 2) {
         f_2 = 1;
       }
       if (f_2 != 0) {
-        kb[2] = __uint_as_float(2139095038 | (unsigned int)(t0_3 + 2));
+        kb[2] = __uint_as_float(CAKE_INDEX_SCORE_MASK | (unsigned int)(t0_3 + 2));
       }
       int f_3 = 0;
       if ((t0_3 + 3 < fb || t0_3 + 3 >= lim - fe) && lim > t0_3 + 3) {
         f_3 = 1;
       }
       if (f_3 != 0) {
-        kb[3] = __uint_as_float(2139095038 | (unsigned int)(t0_3 + 3));
+        kb[3] = __uint_as_float(CAKE_INDEX_SCORE_MASK | (unsigned int)(t0_3 + 3));
       }
       int f_4 = 0;
       if ((t0_3 + 4 < fb || t0_3 + 4 >= lim - fe) && lim > t0_3 + 4) {
         f_4 = 1;
       }
       if (f_4 != 0) {
-        kb[4] = __uint_as_float(2139095038 | (unsigned int)(t0_3 + 4));
+        kb[4] = __uint_as_float(CAKE_INDEX_SCORE_MASK | (unsigned int)(t0_3 + 4));
       }
       int f_5 = 0;
       if ((t0_3 + 5 < fb || t0_3 + 5 >= lim - fe) && lim > t0_3 + 5) {
         f_5 = 1;
       }
       if (f_5 != 0) {
-        kb[5] = __uint_as_float(2139095038 | (unsigned int)(t0_3 + 5));
+        kb[5] = __uint_as_float(CAKE_INDEX_SCORE_MASK | (unsigned int)(t0_3 + 5));
       }
       int f_6 = 0;
       if ((t0_3 + 6 < fb || t0_3 + 6 >= lim - fe) && lim > t0_3 + 6) {
         f_6 = 1;
       }
       if (f_6 != 0) {
-        kb[6] = __uint_as_float(2139095038 | (unsigned int)(t0_3 + 6));
+        kb[6] = __uint_as_float(CAKE_INDEX_SCORE_MASK | (unsigned int)(t0_3 + 6));
       }
       int f_7 = 0;
       if ((t0_3 + 7 < fb || t0_3 + 7 >= lim - fe) && lim > t0_3 + 7) {
         f_7 = 1;
       }
       if (f_7 != 0) {
-        kb[7] = __uint_as_float(2139095038 | (unsigned int)(t0_3 + 7));
+        kb[7] = __uint_as_float(CAKE_INDEX_SCORE_MASK | (unsigned int)(t0_3 + 7));
       }
       int f_8 = 0;
       if ((t0_3 + 8 < fb || t0_3 + 8 >= lim - fe) && lim > t0_3 + 8) {
         f_8 = 1;
       }
       if (f_8 != 0) {
-        kb[8] = __uint_as_float(2139095038 | (unsigned int)(t0_3 + 8));
+        kb[8] = __uint_as_float(CAKE_INDEX_SCORE_MASK | (unsigned int)(t0_3 + 8));
       }
       int f_9 = 0;
       if ((t0_3 + 9 < fb || t0_3 + 9 >= lim - fe) && lim > t0_3 + 9) {
         f_9 = 1;
       }
       if (f_9 != 0) {
-        kb[9] = __uint_as_float(2139095038 | (unsigned int)(t0_3 + 9));
+        kb[9] = __uint_as_float(CAKE_INDEX_SCORE_MASK | (unsigned int)(t0_3 + 9));
       }
       int f_10 = 0;
       if ((t0_3 + 10 < fb || t0_3 + 10 >= lim - fe) && lim > t0_3 + 10) {
         f_10 = 1;
       }
       if (f_10 != 0) {
-        kb[10] = __uint_as_float(2139095038 | (unsigned int)(t0_3 + 10));
+        kb[10] = __uint_as_float(CAKE_INDEX_SCORE_MASK | (unsigned int)(t0_3 + 10));
       }
       int f_11 = 0;
       if ((t0_3 + 11 < fb || t0_3 + 11 >= lim - fe) && lim > t0_3 + 11) {
         f_11 = 1;
       }
       if (f_11 != 0) {
-        kb[11] = __uint_as_float(2139095038 | (unsigned int)(t0_3 + 11));
+        kb[11] = __uint_as_float(CAKE_INDEX_SCORE_MASK | (unsigned int)(t0_3 + 11));
       }
       int f_12 = 0;
       if ((t0_3 + 12 < fb || t0_3 + 12 >= lim - fe) && lim > t0_3 + 12) {
         f_12 = 1;
       }
       if (f_12 != 0) {
-        kb[12] = __uint_as_float(2139095038 | (unsigned int)(t0_3 + 12));
+        kb[12] = __uint_as_float(CAKE_INDEX_SCORE_MASK | (unsigned int)(t0_3 + 12));
       }
       int f_13 = 0;
       if ((t0_3 + 13 < fb || t0_3 + 13 >= lim - fe) && lim > t0_3 + 13) {
         f_13 = 1;
       }
       if (f_13 != 0) {
-        kb[13] = __uint_as_float(2139095038 | (unsigned int)(t0_3 + 13));
+        kb[13] = __uint_as_float(CAKE_INDEX_SCORE_MASK | (unsigned int)(t0_3 + 13));
       }
       int f_14 = 0;
       if ((t0_3 + 14 < fb || t0_3 + 14 >= lim - fe) && lim > t0_3 + 14) {
         f_14 = 1;
       }
       if (f_14 != 0) {
-        kb[14] = __uint_as_float(2139095038 | (unsigned int)(t0_3 + 14));
+        kb[14] = __uint_as_float(CAKE_INDEX_SCORE_MASK | (unsigned int)(t0_3 + 14));
       }
       int f_15 = 0;
       if ((t0_3 + 15 < fb || t0_3 + 15 >= lim - fe) && lim > t0_3 + 15) {
         f_15 = 1;
       }
       if (f_15 != 0) {
-        kb[15] = __uint_as_float(2139095038 | (unsigned int)(t0_3 + 15));
+        kb[15] = __uint_as_float(CAKE_INDEX_SCORE_MASK | (unsigned int)(t0_3 + 15));
       }
     }
     float hi = fmaxf(kb[0], kb[13]);
@@ -993,10 +967,10 @@ __global__ __launch_bounds__(256) void kernel_cake_hopper_msa_b8a663af850de1edb0
   }
   if (w == 0) {
     unsigned int u16 = __as_u32(a[15]);
-    unsigned int c16 = u16 & 4294967294u;
-    unsigned int cr = __as_u32(rej) & 4294967294u;
+    unsigned int c16 = u16 & CAKE_INDEX_HIGH_MASK;
+    unsigned int cr = __as_u32(rej) & CAKE_INDEX_HIGH_MASK;
     unsigned int q = 4294967295u;
-    if (c16 == cr && u16 < 4278190080u && c16 != 2139095038 && col < total_q) {
+    if (c16 == cr && u16 < 4278190080u && c16 != CAKE_INDEX_SCORE_MASK && col < total_q) {
       q = c16;
       flagw[0] = 1;
     }
@@ -1178,336 +1152,352 @@ __global__ __launch_bounds__(256) void kernel_cake_hopper_msa_b8a663af850de1edb0
         sc_1 = fmaxf(sc_1, -1.7014118346046923e+38f);
         sc_1 = fminf(sc_1, 1.7014118346046923e+38f);
         unsigned int u = __as_u32(sc_1);
-        unsigned int cls = u & 4294967294u;
+        unsigned int cls = u & CAKE_INDEX_HIGH_MASK;
         int f_16 = 0;
         if ((t0_4 < fb || t0_4 >= lim - fe) && lim > t0_4) {
           f_16 = 1;
         }
         if (f_16 != 0) {
-          cls = 2139095038;
+          cls = CAKE_INDEX_SCORE_MASK;
         }
         unsigned int key_1 = 0;
         if (qf < __uint_as_float(cls) && cls < 4278190080u) {
           key_1 = 1073741824 | (unsigned int)t0_4;
         }
         if (cls == qc) {
-          unsigned int lowb = (u ^ (unsigned int)((int)u >> 31) & 1) & 1;
-          key_1 = 536870912 | lowb << 1 | (unsigned int)t0_4;
+          unsigned int lowb =
+              (u ^ (unsigned int)((int)u >> 31) & CAKE_INDEX_LOW_MASK) & CAKE_INDEX_LOW_MASK;
+          key_1 = 536870912 | lowb << CAKE_INDEX_BITS | (unsigned int)t0_4;
         }
         kb2[0] = __uint_as_float(key_1);
         float sc_5 = __uint_as_float(cb2[1]);
         sc_5 = fmaxf(sc_5, -1.7014118346046923e+38f);
         sc_5 = fminf(sc_5, 1.7014118346046923e+38f);
         unsigned int u_6 = __as_u32(sc_5);
-        unsigned int cls_7 = u_6 & 4294967294u;
+        unsigned int cls_7 = u_6 & CAKE_INDEX_HIGH_MASK;
         int f_8_1 = 0;
         if ((t0_4 + 1 < fb || t0_4 + 1 >= lim - fe) && lim > t0_4 + 1) {
           f_8_1 = 1;
         }
         if (f_8_1 != 0) {
-          cls_7 = 2139095038;
+          cls_7 = CAKE_INDEX_SCORE_MASK;
         }
         unsigned int key_9_1 = 0;
         if (qf < __uint_as_float(cls_7) && cls_7 < 4278190080u) {
           key_9_1 = 1073741824 | (unsigned int)(t0_4 + 1);
         }
         if (cls_7 == qc) {
-          unsigned int lowb_1 = (u_6 ^ (unsigned int)((int)u_6 >> 31) & 1) & 1;
-          key_9_1 = 536870912 | lowb_1 << 1 | (unsigned int)(t0_4 + 1);
+          unsigned int lowb_1 =
+              (u_6 ^ (unsigned int)((int)u_6 >> 31) & CAKE_INDEX_LOW_MASK) & CAKE_INDEX_LOW_MASK;
+          key_9_1 = 536870912 | lowb_1 << CAKE_INDEX_BITS | (unsigned int)(t0_4 + 1);
         }
         kb2[1] = __uint_as_float(key_9_1);
         float sc_10_1 = __uint_as_float(cb2[2]);
         sc_10_1 = fmaxf(sc_10_1, -1.7014118346046923e+38f);
         sc_10_1 = fminf(sc_10_1, 1.7014118346046923e+38f);
         unsigned int u_11 = __as_u32(sc_10_1);
-        unsigned int cls_12 = u_11 & 4294967294u;
+        unsigned int cls_12 = u_11 & CAKE_INDEX_HIGH_MASK;
         int f_13_1 = 0;
         if ((t0_4 + 2 < fb || t0_4 + 2 >= lim - fe) && lim > t0_4 + 2) {
           f_13_1 = 1;
         }
         if (f_13_1 != 0) {
-          cls_12 = 2139095038;
+          cls_12 = CAKE_INDEX_SCORE_MASK;
         }
         unsigned int key_14 = 0;
         if (qf < __uint_as_float(cls_12) && cls_12 < 4278190080u) {
           key_14 = 1073741824 | (unsigned int)(t0_4 + 2);
         }
         if (cls_12 == qc) {
-          unsigned int lowb_2 = (u_11 ^ (unsigned int)((int)u_11 >> 31) & 1) & 1;
-          key_14 = 536870912 | lowb_2 << 1 | (unsigned int)(t0_4 + 2);
+          unsigned int lowb_2 =
+              (u_11 ^ (unsigned int)((int)u_11 >> 31) & CAKE_INDEX_LOW_MASK) & CAKE_INDEX_LOW_MASK;
+          key_14 = 536870912 | lowb_2 << CAKE_INDEX_BITS | (unsigned int)(t0_4 + 2);
         }
         kb2[2] = __uint_as_float(key_14);
         float sc_15 = __uint_as_float(cb2[3]);
         sc_15 = fmaxf(sc_15, -1.7014118346046923e+38f);
         sc_15 = fminf(sc_15, 1.7014118346046923e+38f);
         unsigned int u_16 = __as_u32(sc_15);
-        unsigned int cls_17 = u_16 & 4294967294u;
+        unsigned int cls_17 = u_16 & CAKE_INDEX_HIGH_MASK;
         int f_18 = 0;
         if ((t0_4 + 3 < fb || t0_4 + 3 >= lim - fe) && lim > t0_4 + 3) {
           f_18 = 1;
         }
         if (f_18 != 0) {
-          cls_17 = 2139095038;
+          cls_17 = CAKE_INDEX_SCORE_MASK;
         }
         unsigned int key_19_1 = 0;
         if (qf < __uint_as_float(cls_17) && cls_17 < 4278190080u) {
           key_19_1 = 1073741824 | (unsigned int)(t0_4 + 3);
         }
         if (cls_17 == qc) {
-          unsigned int lowb_3 = (u_16 ^ (unsigned int)((int)u_16 >> 31) & 1) & 1;
-          key_19_1 = 536870912 | lowb_3 << 1 | (unsigned int)(t0_4 + 3);
+          unsigned int lowb_3 =
+              (u_16 ^ (unsigned int)((int)u_16 >> 31) & CAKE_INDEX_LOW_MASK) & CAKE_INDEX_LOW_MASK;
+          key_19_1 = 536870912 | lowb_3 << CAKE_INDEX_BITS | (unsigned int)(t0_4 + 3);
         }
         kb2[3] = __uint_as_float(key_19_1);
         float sc_20_1 = __uint_as_float(cb2[4]);
         sc_20_1 = fmaxf(sc_20_1, -1.7014118346046923e+38f);
         sc_20_1 = fminf(sc_20_1, 1.7014118346046923e+38f);
         unsigned int u_21 = __as_u32(sc_20_1);
-        unsigned int cls_22 = u_21 & 4294967294u;
+        unsigned int cls_22 = u_21 & CAKE_INDEX_HIGH_MASK;
         int f_23 = 0;
         if ((t0_4 + 4 < fb || t0_4 + 4 >= lim - fe) && lim > t0_4 + 4) {
           f_23 = 1;
         }
         if (f_23 != 0) {
-          cls_22 = 2139095038;
+          cls_22 = CAKE_INDEX_SCORE_MASK;
         }
         unsigned int key_24 = 0;
         if (qf < __uint_as_float(cls_22) && cls_22 < 4278190080u) {
           key_24 = 1073741824 | (unsigned int)(t0_4 + 4);
         }
         if (cls_22 == qc) {
-          unsigned int lowb_4 = (u_21 ^ (unsigned int)((int)u_21 >> 31) & 1) & 1;
-          key_24 = 536870912 | lowb_4 << 1 | (unsigned int)(t0_4 + 4);
+          unsigned int lowb_4 =
+              (u_21 ^ (unsigned int)((int)u_21 >> 31) & CAKE_INDEX_LOW_MASK) & CAKE_INDEX_LOW_MASK;
+          key_24 = 536870912 | lowb_4 << CAKE_INDEX_BITS | (unsigned int)(t0_4 + 4);
         }
         kb2[4] = __uint_as_float(key_24);
         float sc_25 = __uint_as_float(cb2[5]);
         sc_25 = fmaxf(sc_25, -1.7014118346046923e+38f);
         sc_25 = fminf(sc_25, 1.7014118346046923e+38f);
         unsigned int u_26 = __as_u32(sc_25);
-        unsigned int cls_27 = u_26 & 4294967294u;
+        unsigned int cls_27 = u_26 & CAKE_INDEX_HIGH_MASK;
         int f_28 = 0;
         if ((t0_4 + 5 < fb || t0_4 + 5 >= lim - fe) && lim > t0_4 + 5) {
           f_28 = 1;
         }
         if (f_28 != 0) {
-          cls_27 = 2139095038;
+          cls_27 = CAKE_INDEX_SCORE_MASK;
         }
         unsigned int key_29_1 = 0;
         if (qf < __uint_as_float(cls_27) && cls_27 < 4278190080u) {
           key_29_1 = 1073741824 | (unsigned int)(t0_4 + 5);
         }
         if (cls_27 == qc) {
-          unsigned int lowb_5 = (u_26 ^ (unsigned int)((int)u_26 >> 31) & 1) & 1;
-          key_29_1 = 536870912 | lowb_5 << 1 | (unsigned int)(t0_4 + 5);
+          unsigned int lowb_5 =
+              (u_26 ^ (unsigned int)((int)u_26 >> 31) & CAKE_INDEX_LOW_MASK) & CAKE_INDEX_LOW_MASK;
+          key_29_1 = 536870912 | lowb_5 << CAKE_INDEX_BITS | (unsigned int)(t0_4 + 5);
         }
         kb2[5] = __uint_as_float(key_29_1);
         float sc_30_1 = __uint_as_float(cb2[6]);
         sc_30_1 = fmaxf(sc_30_1, -1.7014118346046923e+38f);
         sc_30_1 = fminf(sc_30_1, 1.7014118346046923e+38f);
         unsigned int u_31 = __as_u32(sc_30_1);
-        unsigned int cls_32 = u_31 & 4294967294u;
+        unsigned int cls_32 = u_31 & CAKE_INDEX_HIGH_MASK;
         int f_33 = 0;
         if ((t0_4 + 6 < fb || t0_4 + 6 >= lim - fe) && lim > t0_4 + 6) {
           f_33 = 1;
         }
         if (f_33 != 0) {
-          cls_32 = 2139095038;
+          cls_32 = CAKE_INDEX_SCORE_MASK;
         }
         unsigned int key_34 = 0;
         if (qf < __uint_as_float(cls_32) && cls_32 < 4278190080u) {
           key_34 = 1073741824 | (unsigned int)(t0_4 + 6);
         }
         if (cls_32 == qc) {
-          unsigned int lowb_6 = (u_31 ^ (unsigned int)((int)u_31 >> 31) & 1) & 1;
-          key_34 = 536870912 | lowb_6 << 1 | (unsigned int)(t0_4 + 6);
+          unsigned int lowb_6 =
+              (u_31 ^ (unsigned int)((int)u_31 >> 31) & CAKE_INDEX_LOW_MASK) & CAKE_INDEX_LOW_MASK;
+          key_34 = 536870912 | lowb_6 << CAKE_INDEX_BITS | (unsigned int)(t0_4 + 6);
         }
         kb2[6] = __uint_as_float(key_34);
         float sc_35 = __uint_as_float(cb2[7]);
         sc_35 = fmaxf(sc_35, -1.7014118346046923e+38f);
         sc_35 = fminf(sc_35, 1.7014118346046923e+38f);
         unsigned int u_36 = __as_u32(sc_35);
-        unsigned int cls_37 = u_36 & 4294967294u;
+        unsigned int cls_37 = u_36 & CAKE_INDEX_HIGH_MASK;
         int f_38 = 0;
         if ((t0_4 + 7 < fb || t0_4 + 7 >= lim - fe) && lim > t0_4 + 7) {
           f_38 = 1;
         }
         if (f_38 != 0) {
-          cls_37 = 2139095038;
+          cls_37 = CAKE_INDEX_SCORE_MASK;
         }
         unsigned int key_39 = 0;
         if (qf < __uint_as_float(cls_37) && cls_37 < 4278190080u) {
           key_39 = 1073741824 | (unsigned int)(t0_4 + 7);
         }
         if (cls_37 == qc) {
-          unsigned int lowb_7 = (u_36 ^ (unsigned int)((int)u_36 >> 31) & 1) & 1;
-          key_39 = 536870912 | lowb_7 << 1 | (unsigned int)(t0_4 + 7);
+          unsigned int lowb_7 =
+              (u_36 ^ (unsigned int)((int)u_36 >> 31) & CAKE_INDEX_LOW_MASK) & CAKE_INDEX_LOW_MASK;
+          key_39 = 536870912 | lowb_7 << CAKE_INDEX_BITS | (unsigned int)(t0_4 + 7);
         }
         kb2[7] = __uint_as_float(key_39);
         float sc_40 = __uint_as_float(cb2[8]);
         sc_40 = fmaxf(sc_40, -1.7014118346046923e+38f);
         sc_40 = fminf(sc_40, 1.7014118346046923e+38f);
         unsigned int u_41 = __as_u32(sc_40);
-        unsigned int cls_42 = u_41 & 4294967294u;
+        unsigned int cls_42 = u_41 & CAKE_INDEX_HIGH_MASK;
         int f_43 = 0;
         if ((t0_4 + 8 < fb || t0_4 + 8 >= lim - fe) && lim > t0_4 + 8) {
           f_43 = 1;
         }
         if (f_43 != 0) {
-          cls_42 = 2139095038;
+          cls_42 = CAKE_INDEX_SCORE_MASK;
         }
         unsigned int key_44 = 0;
         if (qf < __uint_as_float(cls_42) && cls_42 < 4278190080u) {
           key_44 = 1073741824 | (unsigned int)(t0_4 + 8);
         }
         if (cls_42 == qc) {
-          unsigned int lowb_8 = (u_41 ^ (unsigned int)((int)u_41 >> 31) & 1) & 1;
-          key_44 = 536870912 | lowb_8 << 1 | (unsigned int)(t0_4 + 8);
+          unsigned int lowb_8 =
+              (u_41 ^ (unsigned int)((int)u_41 >> 31) & CAKE_INDEX_LOW_MASK) & CAKE_INDEX_LOW_MASK;
+          key_44 = 536870912 | lowb_8 << CAKE_INDEX_BITS | (unsigned int)(t0_4 + 8);
         }
         kb2[8] = __uint_as_float(key_44);
         float sc_45 = __uint_as_float(cb2[9]);
         sc_45 = fmaxf(sc_45, -1.7014118346046923e+38f);
         sc_45 = fminf(sc_45, 1.7014118346046923e+38f);
         unsigned int u_46 = __as_u32(sc_45);
-        unsigned int cls_47 = u_46 & 4294967294u;
+        unsigned int cls_47 = u_46 & CAKE_INDEX_HIGH_MASK;
         int f_48 = 0;
         if ((t0_4 + 9 < fb || t0_4 + 9 >= lim - fe) && lim > t0_4 + 9) {
           f_48 = 1;
         }
         if (f_48 != 0) {
-          cls_47 = 2139095038;
+          cls_47 = CAKE_INDEX_SCORE_MASK;
         }
         unsigned int key_49 = 0;
         if (qf < __uint_as_float(cls_47) && cls_47 < 4278190080u) {
           key_49 = 1073741824 | (unsigned int)(t0_4 + 9);
         }
         if (cls_47 == qc) {
-          unsigned int lowb_9 = (u_46 ^ (unsigned int)((int)u_46 >> 31) & 1) & 1;
-          key_49 = 536870912 | lowb_9 << 1 | (unsigned int)(t0_4 + 9);
+          unsigned int lowb_9 =
+              (u_46 ^ (unsigned int)((int)u_46 >> 31) & CAKE_INDEX_LOW_MASK) & CAKE_INDEX_LOW_MASK;
+          key_49 = 536870912 | lowb_9 << CAKE_INDEX_BITS | (unsigned int)(t0_4 + 9);
         }
         kb2[9] = __uint_as_float(key_49);
         float sc_50 = __uint_as_float(cb2[10]);
         sc_50 = fmaxf(sc_50, -1.7014118346046923e+38f);
         sc_50 = fminf(sc_50, 1.7014118346046923e+38f);
         unsigned int u_51 = __as_u32(sc_50);
-        unsigned int cls_52 = u_51 & 4294967294u;
+        unsigned int cls_52 = u_51 & CAKE_INDEX_HIGH_MASK;
         int f_53 = 0;
         if ((t0_4 + 10 < fb || t0_4 + 10 >= lim - fe) && lim > t0_4 + 10) {
           f_53 = 1;
         }
         if (f_53 != 0) {
-          cls_52 = 2139095038;
+          cls_52 = CAKE_INDEX_SCORE_MASK;
         }
         unsigned int key_54 = 0;
         if (qf < __uint_as_float(cls_52) && cls_52 < 4278190080u) {
           key_54 = 1073741824 | (unsigned int)(t0_4 + 10);
         }
         if (cls_52 == qc) {
-          unsigned int lowb_10 = (u_51 ^ (unsigned int)((int)u_51 >> 31) & 1) & 1;
-          key_54 = 536870912 | lowb_10 << 1 | (unsigned int)(t0_4 + 10);
+          unsigned int lowb_10 =
+              (u_51 ^ (unsigned int)((int)u_51 >> 31) & CAKE_INDEX_LOW_MASK) & CAKE_INDEX_LOW_MASK;
+          key_54 = 536870912 | lowb_10 << CAKE_INDEX_BITS | (unsigned int)(t0_4 + 10);
         }
         kb2[10] = __uint_as_float(key_54);
         float sc_55 = __uint_as_float(cb2[11]);
         sc_55 = fmaxf(sc_55, -1.7014118346046923e+38f);
         sc_55 = fminf(sc_55, 1.7014118346046923e+38f);
         unsigned int u_56 = __as_u32(sc_55);
-        unsigned int cls_57 = u_56 & 4294967294u;
+        unsigned int cls_57 = u_56 & CAKE_INDEX_HIGH_MASK;
         int f_58 = 0;
         if ((t0_4 + 11 < fb || t0_4 + 11 >= lim - fe) && lim > t0_4 + 11) {
           f_58 = 1;
         }
         if (f_58 != 0) {
-          cls_57 = 2139095038;
+          cls_57 = CAKE_INDEX_SCORE_MASK;
         }
         unsigned int key_59 = 0;
         if (qf < __uint_as_float(cls_57) && cls_57 < 4278190080u) {
           key_59 = 1073741824 | (unsigned int)(t0_4 + 11);
         }
         if (cls_57 == qc) {
-          unsigned int lowb_11 = (u_56 ^ (unsigned int)((int)u_56 >> 31) & 1) & 1;
-          key_59 = 536870912 | lowb_11 << 1 | (unsigned int)(t0_4 + 11);
+          unsigned int lowb_11 =
+              (u_56 ^ (unsigned int)((int)u_56 >> 31) & CAKE_INDEX_LOW_MASK) & CAKE_INDEX_LOW_MASK;
+          key_59 = 536870912 | lowb_11 << CAKE_INDEX_BITS | (unsigned int)(t0_4 + 11);
         }
         kb2[11] = __uint_as_float(key_59);
         float sc_60 = __uint_as_float(cb2[12]);
         sc_60 = fmaxf(sc_60, -1.7014118346046923e+38f);
         sc_60 = fminf(sc_60, 1.7014118346046923e+38f);
         unsigned int u_61 = __as_u32(sc_60);
-        unsigned int cls_62 = u_61 & 4294967294u;
+        unsigned int cls_62 = u_61 & CAKE_INDEX_HIGH_MASK;
         int f_63 = 0;
         if ((t0_4 + 12 < fb || t0_4 + 12 >= lim - fe) && lim > t0_4 + 12) {
           f_63 = 1;
         }
         if (f_63 != 0) {
-          cls_62 = 2139095038;
+          cls_62 = CAKE_INDEX_SCORE_MASK;
         }
         unsigned int key_64 = 0;
         if (qf < __uint_as_float(cls_62) && cls_62 < 4278190080u) {
           key_64 = 1073741824 | (unsigned int)(t0_4 + 12);
         }
         if (cls_62 == qc) {
-          unsigned int lowb_12 = (u_61 ^ (unsigned int)((int)u_61 >> 31) & 1) & 1;
-          key_64 = 536870912 | lowb_12 << 1 | (unsigned int)(t0_4 + 12);
+          unsigned int lowb_12 =
+              (u_61 ^ (unsigned int)((int)u_61 >> 31) & CAKE_INDEX_LOW_MASK) & CAKE_INDEX_LOW_MASK;
+          key_64 = 536870912 | lowb_12 << CAKE_INDEX_BITS | (unsigned int)(t0_4 + 12);
         }
         kb2[12] = __uint_as_float(key_64);
         float sc_65 = __uint_as_float(cb2[13]);
         sc_65 = fmaxf(sc_65, -1.7014118346046923e+38f);
         sc_65 = fminf(sc_65, 1.7014118346046923e+38f);
         unsigned int u_66 = __as_u32(sc_65);
-        unsigned int cls_67 = u_66 & 4294967294u;
+        unsigned int cls_67 = u_66 & CAKE_INDEX_HIGH_MASK;
         int f_68 = 0;
         if ((t0_4 + 13 < fb || t0_4 + 13 >= lim - fe) && lim > t0_4 + 13) {
           f_68 = 1;
         }
         if (f_68 != 0) {
-          cls_67 = 2139095038;
+          cls_67 = CAKE_INDEX_SCORE_MASK;
         }
         unsigned int key_69 = 0;
         if (qf < __uint_as_float(cls_67) && cls_67 < 4278190080u) {
           key_69 = 1073741824 | (unsigned int)(t0_4 + 13);
         }
         if (cls_67 == qc) {
-          unsigned int lowb_13 = (u_66 ^ (unsigned int)((int)u_66 >> 31) & 1) & 1;
-          key_69 = 536870912 | lowb_13 << 1 | (unsigned int)(t0_4 + 13);
+          unsigned int lowb_13 =
+              (u_66 ^ (unsigned int)((int)u_66 >> 31) & CAKE_INDEX_LOW_MASK) & CAKE_INDEX_LOW_MASK;
+          key_69 = 536870912 | lowb_13 << CAKE_INDEX_BITS | (unsigned int)(t0_4 + 13);
         }
         kb2[13] = __uint_as_float(key_69);
         float sc_70 = __uint_as_float(cb2[14]);
         sc_70 = fmaxf(sc_70, -1.7014118346046923e+38f);
         sc_70 = fminf(sc_70, 1.7014118346046923e+38f);
         unsigned int u_71 = __as_u32(sc_70);
-        unsigned int cls_72 = u_71 & 4294967294u;
+        unsigned int cls_72 = u_71 & CAKE_INDEX_HIGH_MASK;
         int f_73 = 0;
         if ((t0_4 + 14 < fb || t0_4 + 14 >= lim - fe) && lim > t0_4 + 14) {
           f_73 = 1;
         }
         if (f_73 != 0) {
-          cls_72 = 2139095038;
+          cls_72 = CAKE_INDEX_SCORE_MASK;
         }
         unsigned int key_74 = 0;
         if (qf < __uint_as_float(cls_72) && cls_72 < 4278190080u) {
           key_74 = 1073741824 | (unsigned int)(t0_4 + 14);
         }
         if (cls_72 == qc) {
-          unsigned int lowb_14 = (u_71 ^ (unsigned int)((int)u_71 >> 31) & 1) & 1;
-          key_74 = 536870912 | lowb_14 << 1 | (unsigned int)(t0_4 + 14);
+          unsigned int lowb_14 =
+              (u_71 ^ (unsigned int)((int)u_71 >> 31) & CAKE_INDEX_LOW_MASK) & CAKE_INDEX_LOW_MASK;
+          key_74 = 536870912 | lowb_14 << CAKE_INDEX_BITS | (unsigned int)(t0_4 + 14);
         }
         kb2[14] = __uint_as_float(key_74);
         float sc_75 = __uint_as_float(cb2[15]);
         sc_75 = fmaxf(sc_75, -1.7014118346046923e+38f);
         sc_75 = fminf(sc_75, 1.7014118346046923e+38f);
         unsigned int u_76 = __as_u32(sc_75);
-        unsigned int cls_77 = u_76 & 4294967294u;
+        unsigned int cls_77 = u_76 & CAKE_INDEX_HIGH_MASK;
         int f_78 = 0;
         if ((t0_4 + 15 < fb || t0_4 + 15 >= lim - fe) && lim > t0_4 + 15) {
           f_78 = 1;
         }
         if (f_78 != 0) {
-          cls_77 = 2139095038;
+          cls_77 = CAKE_INDEX_SCORE_MASK;
         }
         unsigned int key_79 = 0;
         if (qf < __uint_as_float(cls_77) && cls_77 < 4278190080u) {
           key_79 = 1073741824 | (unsigned int)(t0_4 + 15);
         }
         if (cls_77 == qc) {
-          unsigned int lowb_15 = (u_76 ^ (unsigned int)((int)u_76 >> 31) & 1) & 1;
-          key_79 = 536870912 | lowb_15 << 1 | (unsigned int)(t0_4 + 15);
+          unsigned int lowb_15 =
+              (u_76 ^ (unsigned int)((int)u_76 >> 31) & CAKE_INDEX_LOW_MASK) & CAKE_INDEX_LOW_MASK;
+          key_79 = 536870912 | lowb_15 << CAKE_INDEX_BITS | (unsigned int)(t0_4 + 15);
         }
         kb2[15] = __uint_as_float(key_79);
         unsigned int nzc = 0;
@@ -1954,208 +1944,208 @@ __global__ __launch_bounds__(256) void kernel_cake_hopper_msa_b8a663af850de1edb0
     unsigned int k1 = __as_u32(a[0]);
     unsigned int idx = 4294967295u;
     if (k1 < 4278190080u) {
-      idx = k1 & 1;
+      idx = k1 & CAKE_INDEX_LOW_MASK;
     }
     if (flagged != 0) {
       unsigned int k2 = __as_u32(a2[0]);
       idx = 4294967295u;
       if (k2 != 0) {
-        idx = k2 & 1;
+        idx = k2 & CAKE_INDEX_LOW_MASK;
       }
     }
     o[0] = idx;
     unsigned int k1_0 = __as_u32(a[1]);
     unsigned int idx_1 = 4294967295u;
     if (k1_0 < 4278190080u) {
-      idx_1 = k1_0 & 1;
+      idx_1 = k1_0 & CAKE_INDEX_LOW_MASK;
     }
     if (flagged != 0) {
       unsigned int k2_1 = __as_u32(a2[1]);
       idx_1 = 4294967295u;
       if (k2_1 != 0) {
-        idx_1 = k2_1 & 1;
+        idx_1 = k2_1 & CAKE_INDEX_LOW_MASK;
       }
     }
     o[1] = idx_1;
     unsigned int k1_2 = __as_u32(a[2]);
     unsigned int idx_3 = 4294967295u;
     if (k1_2 < 4278190080u) {
-      idx_3 = k1_2 & 1;
+      idx_3 = k1_2 & CAKE_INDEX_LOW_MASK;
     }
     if (flagged != 0) {
       unsigned int k2_2 = __as_u32(a2[2]);
       idx_3 = 4294967295u;
       if (k2_2 != 0) {
-        idx_3 = k2_2 & 1;
+        idx_3 = k2_2 & CAKE_INDEX_LOW_MASK;
       }
     }
     o[2] = idx_3;
     unsigned int k1_4 = __as_u32(a[3]);
     unsigned int idx_5 = 4294967295u;
     if (k1_4 < 4278190080u) {
-      idx_5 = k1_4 & 1;
+      idx_5 = k1_4 & CAKE_INDEX_LOW_MASK;
     }
     if (flagged != 0) {
       unsigned int k2_3 = __as_u32(a2[3]);
       idx_5 = 4294967295u;
       if (k2_3 != 0) {
-        idx_5 = k2_3 & 1;
+        idx_5 = k2_3 & CAKE_INDEX_LOW_MASK;
       }
     }
     o[3] = idx_5;
     unsigned int k1_6 = __as_u32(a[4]);
     unsigned int idx_7 = 4294967295u;
     if (k1_6 < 4278190080u) {
-      idx_7 = k1_6 & 1;
+      idx_7 = k1_6 & CAKE_INDEX_LOW_MASK;
     }
     if (flagged != 0) {
       unsigned int k2_4 = __as_u32(a2[4]);
       idx_7 = 4294967295u;
       if (k2_4 != 0) {
-        idx_7 = k2_4 & 1;
+        idx_7 = k2_4 & CAKE_INDEX_LOW_MASK;
       }
     }
     o[4] = idx_7;
     unsigned int k1_8 = __as_u32(a[5]);
     unsigned int idx_9 = 4294967295u;
     if (k1_8 < 4278190080u) {
-      idx_9 = k1_8 & 1;
+      idx_9 = k1_8 & CAKE_INDEX_LOW_MASK;
     }
     if (flagged != 0) {
       unsigned int k2_5 = __as_u32(a2[5]);
       idx_9 = 4294967295u;
       if (k2_5 != 0) {
-        idx_9 = k2_5 & 1;
+        idx_9 = k2_5 & CAKE_INDEX_LOW_MASK;
       }
     }
     o[5] = idx_9;
     unsigned int k1_10 = __as_u32(a[6]);
     unsigned int idx_11 = 4294967295u;
     if (k1_10 < 4278190080u) {
-      idx_11 = k1_10 & 1;
+      idx_11 = k1_10 & CAKE_INDEX_LOW_MASK;
     }
     if (flagged != 0) {
       unsigned int k2_6 = __as_u32(a2[6]);
       idx_11 = 4294967295u;
       if (k2_6 != 0) {
-        idx_11 = k2_6 & 1;
+        idx_11 = k2_6 & CAKE_INDEX_LOW_MASK;
       }
     }
     o[6] = idx_11;
     unsigned int k1_12 = __as_u32(a[7]);
     unsigned int idx_13 = 4294967295u;
     if (k1_12 < 4278190080u) {
-      idx_13 = k1_12 & 1;
+      idx_13 = k1_12 & CAKE_INDEX_LOW_MASK;
     }
     if (flagged != 0) {
       unsigned int k2_7 = __as_u32(a2[7]);
       idx_13 = 4294967295u;
       if (k2_7 != 0) {
-        idx_13 = k2_7 & 1;
+        idx_13 = k2_7 & CAKE_INDEX_LOW_MASK;
       }
     }
     o[7] = idx_13;
     unsigned int k1_14 = __as_u32(a[8]);
     unsigned int idx_15 = 4294967295u;
     if (k1_14 < 4278190080u) {
-      idx_15 = k1_14 & 1;
+      idx_15 = k1_14 & CAKE_INDEX_LOW_MASK;
     }
     if (flagged != 0) {
       unsigned int k2_8 = __as_u32(a2[8]);
       idx_15 = 4294967295u;
       if (k2_8 != 0) {
-        idx_15 = k2_8 & 1;
+        idx_15 = k2_8 & CAKE_INDEX_LOW_MASK;
       }
     }
     o[8] = idx_15;
     unsigned int k1_16 = __as_u32(a[9]);
     unsigned int idx_17 = 4294967295u;
     if (k1_16 < 4278190080u) {
-      idx_17 = k1_16 & 1;
+      idx_17 = k1_16 & CAKE_INDEX_LOW_MASK;
     }
     if (flagged != 0) {
       unsigned int k2_9 = __as_u32(a2[9]);
       idx_17 = 4294967295u;
       if (k2_9 != 0) {
-        idx_17 = k2_9 & 1;
+        idx_17 = k2_9 & CAKE_INDEX_LOW_MASK;
       }
     }
     o[9] = idx_17;
     unsigned int k1_18 = __as_u32(a[10]);
     unsigned int idx_19 = 4294967295u;
     if (k1_18 < 4278190080u) {
-      idx_19 = k1_18 & 1;
+      idx_19 = k1_18 & CAKE_INDEX_LOW_MASK;
     }
     if (flagged != 0) {
       unsigned int k2_10 = __as_u32(a2[10]);
       idx_19 = 4294967295u;
       if (k2_10 != 0) {
-        idx_19 = k2_10 & 1;
+        idx_19 = k2_10 & CAKE_INDEX_LOW_MASK;
       }
     }
     o[10] = idx_19;
     unsigned int k1_20 = __as_u32(a[11]);
     unsigned int idx_21 = 4294967295u;
     if (k1_20 < 4278190080u) {
-      idx_21 = k1_20 & 1;
+      idx_21 = k1_20 & CAKE_INDEX_LOW_MASK;
     }
     if (flagged != 0) {
       unsigned int k2_11 = __as_u32(a2[11]);
       idx_21 = 4294967295u;
       if (k2_11 != 0) {
-        idx_21 = k2_11 & 1;
+        idx_21 = k2_11 & CAKE_INDEX_LOW_MASK;
       }
     }
     o[11] = idx_21;
     unsigned int k1_22 = __as_u32(a[12]);
     unsigned int idx_23 = 4294967295u;
     if (k1_22 < 4278190080u) {
-      idx_23 = k1_22 & 1;
+      idx_23 = k1_22 & CAKE_INDEX_LOW_MASK;
     }
     if (flagged != 0) {
       unsigned int k2_12 = __as_u32(a2[12]);
       idx_23 = 4294967295u;
       if (k2_12 != 0) {
-        idx_23 = k2_12 & 1;
+        idx_23 = k2_12 & CAKE_INDEX_LOW_MASK;
       }
     }
     o[12] = idx_23;
     unsigned int k1_24 = __as_u32(a[13]);
     unsigned int idx_25 = 4294967295u;
     if (k1_24 < 4278190080u) {
-      idx_25 = k1_24 & 1;
+      idx_25 = k1_24 & CAKE_INDEX_LOW_MASK;
     }
     if (flagged != 0) {
       unsigned int k2_13 = __as_u32(a2[13]);
       idx_25 = 4294967295u;
       if (k2_13 != 0) {
-        idx_25 = k2_13 & 1;
+        idx_25 = k2_13 & CAKE_INDEX_LOW_MASK;
       }
     }
     o[13] = idx_25;
     unsigned int k1_26 = __as_u32(a[14]);
     unsigned int idx_27 = 4294967295u;
     if (k1_26 < 4278190080u) {
-      idx_27 = k1_26 & 1;
+      idx_27 = k1_26 & CAKE_INDEX_LOW_MASK;
     }
     if (flagged != 0) {
       unsigned int k2_14 = __as_u32(a2[14]);
       idx_27 = 4294967295u;
       if (k2_14 != 0) {
-        idx_27 = k2_14 & 1;
+        idx_27 = k2_14 & CAKE_INDEX_LOW_MASK;
       }
     }
     o[14] = idx_27;
     unsigned int k1_28 = __as_u32(a[15]);
     unsigned int idx_29 = 4294967295u;
     if (k1_28 < 4278190080u) {
-      idx_29 = k1_28 & 1;
+      idx_29 = k1_28 & CAKE_INDEX_LOW_MASK;
     }
     if (flagged != 0) {
       unsigned int k2_15 = __as_u32(a2[15]);
       idx_29 = 4294967295u;
       if (k2_15 != 0) {
-        idx_29 = k2_15 & 1;
+        idx_29 = k2_15 & CAKE_INDEX_LOW_MASK;
       }
     }
     o[15] = idx_29;

@@ -151,7 +151,7 @@ kernel_cake_mok_gather(int* __restrict__ local_routes, unsigned long long multic
 
     __syncthreads();
 
-    // === Task calls (dependency order) ===
+    // === Task calls (declaration order) ===
     int offset = bid * 512;
     mbarrier_arrive_expect_tx(arrived_addr, 2048);
     cp_async_bulk_gmem2smem(payload_addr, reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(local_routes) + ((unsigned long long)offset * (unsigned long long)4)), 2048, arrived_addr);

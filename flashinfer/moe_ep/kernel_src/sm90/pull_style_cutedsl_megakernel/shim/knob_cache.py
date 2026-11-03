@@ -40,7 +40,6 @@ import tempfile
 import warnings
 from typing import Any, Dict, List, Optional, Tuple
 
-_CACHE_VERSION = 1
 _MXFP4_DTYPE_PREFIX = "sm90_w_mxfp4_"
 _MXFP4_HARDWARE_KEY_FIELDS = ("compute_capability", "sm_count")
 _MXFP4_PROVENANCE_KEY_FIELD = "tuning_provenance_sha256"
@@ -123,6 +122,18 @@ def _is_mxfp4_dtype(dtype: Any) -> bool:
     return isinstance(dtype, str) and dtype.startswith(_MXFP4_DTYPE_PREFIX)
 
 
+def _format_label(dtype: str) -> str:
+    return "NVFP4" if dtype.startswith("sm90_w_nvfp4_") else "MXFP4"
+
+
+def _requires_hardware_provenance(dtype: Any) -> bool:
+    # NV uses the same strict hardware axes, with its own format/domain hash.
+    # Existing MX keys and matching behavior remain unchanged.
+    return _is_mxfp4_dtype(dtype) or (
+        isinstance(dtype, str) and dtype.startswith("sm90_w_nvfp4_")
+    )
+
+
 def _is_valid_tuning_provenance_sha256(value: Any) -> bool:
     return (
         isinstance(value, str)
@@ -133,6 +144,8 @@ def _is_valid_tuning_provenance_sha256(value: Any) -> bool:
 
 
 def _load_entries(path: str) -> List[Dict[str, Any]]:
+    from flashinfer.moe_ep.core.tuning import KNOB_CACHE_VERSION
+
     try:
         with open(path) as f:
             data = json.load(f)
@@ -146,7 +159,7 @@ def _load_entries(path: str) -> List[Dict[str, Any]]:
             stacklevel=3,
         )
         return []
-    if not isinstance(data, dict) or data.get("version") != _CACHE_VERSION:
+    if not isinstance(data, dict) or data.get("version") != KNOB_CACHE_VERSION:
         warnings.warn(
             f"[moe_ep-knob-cache] {path!r} has unsupported version "
             f"{data.get('version') if isinstance(data, dict) else '?'}; ignoring.",
@@ -186,11 +199,11 @@ def _entry_matches_key(
 
     if not all(entry.get(field) == key[field] for field in _KEY_FIELDS):
         return False
-    if _is_mxfp4_dtype(key["dtype"]) and not all(
+    if _requires_hardware_provenance(key["dtype"]) and not all(
         entry.get(field) == key.get(field) for field in _MXFP4_HARDWARE_KEY_FIELDS
     ):
         return False
-    if _is_mxfp4_dtype(key["dtype"]) and entry.get(
+    if _requires_hardware_provenance(key["dtype"]) and entry.get(
         _MXFP4_PROVENANCE_KEY_FIELD
     ) != key.get(_MXFP4_PROVENANCE_KEY_FIELD):
         return False
@@ -221,10 +234,10 @@ def _matching_entries(
     if path is None:
         return []
     capability = resolved_sms = None
-    if _is_mxfp4_dtype(dtype):
+    if _requires_hardware_provenance(dtype):
         if not _is_valid_tuning_provenance_sha256(tuning_provenance_sha256):
             warnings.warn(
-                "[moe_ep-knob-cache] ignoring MXFP4 cache lookup without a "
+                f"[moe_ep-knob-cache] ignoring {_format_label(dtype)} cache lookup without a "
                 "valid tuning-provenance SHA-256.",
                 RuntimeWarning,
                 stacklevel=2,
@@ -247,7 +260,7 @@ def _matching_entries(
         topk=topk,
         gate_up_clamp=gate_up_clamp,
     )
-    if _is_mxfp4_dtype(dtype):
+    if _requires_hardware_provenance(dtype):
         key.update(
             compute_capability=capability,
             sm_count=resolved_sms,
@@ -350,10 +363,10 @@ def record_knobs(
     if path is None:
         return None
     capability = resolved_sms = None
-    if _is_mxfp4_dtype(dtype):
+    if _requires_hardware_provenance(dtype):
         if not _is_valid_tuning_provenance_sha256(tuning_provenance_sha256):
             warnings.warn(
-                "[moe_ep-knob-cache] refusing to record MXFP4 knobs without a "
+                f"[moe_ep-knob-cache] refusing to record {_format_label(dtype)} knobs without a "
                 "valid tuning-provenance SHA-256.",
                 RuntimeWarning,
                 stacklevel=2,
@@ -365,7 +378,7 @@ def record_knobs(
         )
         if capability is None or resolved_sms is None:
             warnings.warn(
-                "[moe_ep-knob-cache] refusing to record MXFP4 knobs without "
+                f"[moe_ep-knob-cache] refusing to record {_format_label(dtype)} knobs without "
                 "compute-capability and SM-count identity.",
                 RuntimeWarning,
                 stacklevel=2,
@@ -388,7 +401,7 @@ def record_knobs(
         source=source,
         tuned_at=datetime.datetime.now().isoformat(timespec="seconds"),
     )
-    if _is_mxfp4_dtype(dtype):
+    if _requires_hardware_provenance(dtype):
         entry.update(
             compute_capability=capability,
             sm_count=resolved_sms,
@@ -419,10 +432,14 @@ def record_knobs(
                 ]
                 entries.append(entry)
                 fd, tmp = tempfile.mkstemp(dir=directory, prefix=".moe_ep_knob_cache.")
+                from flashinfer.moe_ep.core.tuning import KNOB_CACHE_VERSION
+
                 try:
                     with os.fdopen(fd, "w") as f:
                         json.dump(
-                            {"version": _CACHE_VERSION, "entries": entries}, f, indent=1
+                            {"version": KNOB_CACHE_VERSION, "entries": entries},
+                            f,
+                            indent=1,
                         )
                         f.flush()
                         os.fsync(f.fileno())

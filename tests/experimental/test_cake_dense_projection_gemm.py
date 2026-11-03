@@ -14,5657 +14,4201 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+# The dense projection GEMM package with an explicit numerical mode: the dispatch of every entry point
+# (``deterministic=True`` -> the deterministic package's canonical object, ``deterministic=False`` -> the routes of
+# ``cake_backend.ROUTES``), PyTorch's deterministic-algorithms rule, the names of the former import path, the K1 and
+# K2 planners (the per-architecture planners, the rule tables, the token-count guard, the stream-K partition), the
+# registry and file names of this package's programs and its workspace kinds.  The CPU tests launch nothing.  The GPU
+# tests (``test_gpu_*``) need a device the deterministic package registers programs for; the ones of this package's
+# programs force the split count (they do not depend on what the planner takes on the device), assert by kernel
+# name that the program ran, and skip only on a checkout that registers no program of this package for the device.
+
 import ast
-import dataclasses
+import contextlib
+import inspect
+import json
 import re
-from collections import OrderedDict
+import sys
+import threading
+import warnings
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType
 
 import pytest
 import torch
 
 from tests.test_helpers.cake_package import cake_package
 
-# Backend suite: the package is named once, through ``cake_package``; nothing else
-# of flashinfer is imported here.
+# Backend suite: the packages are named through ``cake_package``; nothing else of flashinfer is imported here.
+package = cake_package("dense_projection_gemm")
 cake_backend = cake_package("dense_projection_gemm", "cake_backend")
-cake_build = cake_package("dense_projection_gemm", "cake_build")
 cake_jit = cake_package("dense_projection_gemm", "cake_jit")
-ARCH_RULE_DEFAULTS = cake_backend.ARCH_RULE_DEFAULTS
-BLOCK_K = cake_backend.BLOCK_K
-BLOCK_N_CHOICES = cake_backend.BLOCK_N_CHOICES
-CONVENIENCE_CACHE_SIZE = cake_backend.CONVENIENCE_CACHE_SIZE
-CTA_GROUP = cake_backend.CTA_GROUP
-CTA_ROWS_CHOICES = cake_backend.CTA_ROWS_CHOICES
-EPI_WARPS = cake_backend.EPI_WARPS
-ROUTER_SPLITS = cake_backend.ROUTER_SPLITS
-ROW_RULES = cake_backend.ROW_RULES
-SK_DUMMY_BASE = cake_backend.SK_DUMMY_BASE
-SK_MIN_ITERS = cake_backend.SK_MIN_ITERS
-SMEM_OPT_IN = cake_backend.SMEM_OPT_IN
-arch_for = cake_backend.arch_for
-bind_launch = cake_backend.bind_launch
-convenience_key = cake_backend.convenience_key
-default_block_n = cake_backend.default_block_n
-default_group_m = cake_backend.default_group_m
-default_hints = cake_backend.default_hints
-default_hints_cgrp = cake_backend.default_hints_cgrp
-b_stage_bytes = cake_backend.b_stage_bytes
-box_rows_of = cake_backend.box_rows_of
-default_stages = cake_backend.default_stages
-device_l2_bytes = cake_backend.device_l2_bytes
-epi_cols = cake_backend.epi_cols
-epi_mode = cake_backend.epi_mode
-epi_slots = cake_backend.epi_slots
-generated_program_available = cake_backend.generated_program_available
-instance_key = cake_backend.instance_key
-instance_symbol = cake_backend.instance_symbol
-sk_exact_plan = cake_backend.sk_exact_plan
-sk_sync_plan = cake_backend.sk_sync_plan
-check_stream_k_plan = cake_backend.check_stream_k_plan
-operand_view = cake_backend.operand_view
-plan_dense_projection_gemm = cake_backend.plan_dense_projection_gemm
-plan_router_fp32_gemm = cake_backend.plan_router_fp32_gemm
-prepare_dense_projection_gemm = cake_backend.prepare_dense_projection_gemm
-prepare_projection_wgrad = cake_backend.prepare_projection_wgrad
-prepare_router_fp32_gemm = cake_backend.prepare_router_fp32_gemm
-router_layout_class = cake_backend.router_layout_class
-row_rule = cake_backend.row_rule
-sk_parts_plan = cake_backend.sk_parts_plan
-smem_limit_for = cake_backend.smem_limit_for
-split_fp32_to_bf16x3_ = cake_backend.split_fp32_to_bf16x3_
-stream_k_plan = cake_backend.stream_k_plan
-swap_small_m = cake_backend.swap_small_m
-wave_working_set = cake_backend.wave_working_set
-wave_working_set_cgrp = cake_backend.wave_working_set_cgrp
-wgrad_swapped = cake_backend.wgrad_swapped
-wgrad_views = cake_backend.wgrad_views
+det_backend = cake_package("dense_projection_det_gemm", "cake_backend")
+det_jit = cake_package("dense_projection_det_gemm", "cake_jit")
+# A vendored run imports both packages under other names: bind the deterministic package explicitly (in a
+# FlashInfer tree this names the sibling the package resolves by itself).
+cake_backend.use_deterministic_backend(det_backend)
 
-# Accuracy gates against the FP64 reference of the exact BF16 operands.
-# BF16 output: elementwise |out - ref| <= atol + rtol * |ref|, zero violations.
+# Accuracy gates (the deterministic package's, unchanged by the numerical mode).
 BF16_ATOL = BF16_RTOL = 1e-2
-# FP32 output of K1: the tensor-core accumulation error scales with the reference, so both
-# bounds are scale-relative (never an absolute atol).
 F32_REL_FRO_MAX = 5e-5
 F32_MAX_ABS_OVER_REF_ABSMAX = 1e-3
-# K2 (FP32 router through split-BF16x3 emulation): FP32-class, bit-exact reruns.
 ROUTER_REL_FRO_MAX = 2e-6
+RERUNS = 20
+SEED = 20261031
 
-SEED = 20260930
-
-# GLM-5.2 projection rows: label -> (K = in features, N = out features).
-PROJECTION_ROWS = {
-    "o_proj": (16384, 6144),
-    "q_a": (6144, 2048),
-    "q_b": (2048, 16384),
-    "kv_a": (6144, 576),
-    "shared_gate_up": (6144, 2048),
-    "shared_down": (2048, 6144),
-    "dense_gate_up": (6144, 12288),
-    "dense_down": (12288, 6144),
-    "indexer_q": (2048, 4096),
-    "indexer_k": (6144, 128),
-    "indexer_hw": (6144, 32),
-}
-# The bounded GPU subset: one row per instance class, at small T.
-GPU_ROWS = [
-    (
-        "kv_a",
-        "fwd",
-        "bf16",
-        257,
-    ),  # kk, K = 6144 > 1024 -> register epilogue: dense_proj_gemm_kk_n256
-    (
-        "indexer_k",
-        "fwd",
-        "bf16",
-        1001,
-    ),  # N = 128 -> the 128-column instance (dense_proj_gemm_kk_n128*)
-    (
-        "indexer_hw",
-        "fwd",
-        "bf16",
-        129,
-    ),  # N = 32: masked columns of the 128-column instance
-    ("q_a", "dgrad", "bf16", 257),  # kn, K = N_feat = 2048 > 1024 -> register epilogue
-    (
-        "kv_a",
-        "dgrad",
-        "bf16",
-        1001,
-    ),  # kn, K = N_feat = 576 <= 1024 -> TMA-store epilogue
-    ("q_a", "dgrad", "f32", 257),  # kn, fp32 output: dense_proj_gemm_kn_n256_f32_tma1
-    (
-        "shared_down",
-        "wgrad",
-        "bf16",
-        1001,
-    ),  # nn, K = T = 1001 <= 1024 -> dense_proj_gemm_nn_n256_tma1
-    ("kv_a", "wgrad", "f32", 257),  # nn, fp32 output: dense_proj_gemm_nn_n256_f32_tma1
-    (
-        "indexer_hw",
-        "wgrad",
-        "bf16",
-        1001,
-    ),  # swapped X.T @ G, transposed store, stream-K "auto" split (dense_proj_gemm_nn_n128*_t)
-    (
-        "indexer_k",
-        "wgrad",
-        "f32",
-        257,
-    ),  # swapped, transposed fp32 store (dense_proj_gemm_nn_n128*_f32_t)
-]
-MLA_ROWS = {
-    "qabs": dict(
-        H=64, D_in=192, D_out=512, act_stride_head=256, weight_layout="in_out"
-    ),
-    "vproj": dict(
-        H=64, D_in=512, D_out=256, act_stride_head=512, weight_layout="out_in"
-    ),
-}
-# CPU planner inputs: the two device facts the plan depends on are the SM count (stream-K split)
-# and the L2 size (TMA eviction-hint working-set gate); B200 SXM (148 SMs) and Rubin R200 (212 SMs)
-# both report a 126 MiB L2.
-SM_COUNTS = (148, 212)
-# The instance every GLM-5.2 row resolves to on those devices, and the set the export registers.
-# GENERATED from the Cake kernel host (adapter _plan_k1 with the mirrored sm_100a rule table) by the Cake
-# workspace tool stage/r2/gen_fi_test_tables.py; the exported set is cake_jit.KERNELS of the delivered tree. Do not hand-edit.
-# Table values are a template, or {(T, sm_count): template} when the plan depends on T / the device.
-# fmt: off
-# --- BEGIN GENERATED TABLES ---
-L2_BYTES = 132120576
-EXPECTED_TEMPLATES = {
-    ('o_proj', 'fwd', 'bf16'): {
-        (1001, 148): 'dense_proj_gemm_kk_n256_m256_ov_pro7',
-        (1001, 212): 'dense_proj_gemm_kk_n256_m256_ht_cg_or_pro7',
-        (2049, 148): 'dense_proj_gemm_kk_n256_m256_ov_pro7',
-        (2049, 212): 'dense_proj_gemm_kk_n256_m256_ht_cg_or_pro7',
-    },
-    ('o_proj', 'dgrad', 'bf16'): {
-        (1001, 148): 'dense_proj_gemm_kn_n256_pro7',
-        (1001, 212): 'dense_proj_gemm_kn_n256_m256_ov_ht_pro15',
-        (2049, 148): 'dense_proj_gemm_kn_n256_pro7',
-        (2049, 212): 'dense_proj_gemm_kn_n256_m256_ov_ht_pro15',
-    },
-    ('o_proj', 'dgrad', 'f32'): {
-        (1001, 148): 'dense_proj_gemm_kn_n256_f32_v8_pro7',
-        (1001, 212): 'dense_proj_gemm_kn_n256_m256_f32_tma1_pro7',
-        (2049, 148): 'dense_proj_gemm_kn_n256_f32_v8_pro7',
-        (2049, 212): 'dense_proj_gemm_kn_n256_m256_f32_tma1_pro7',
-    },
-    ('o_proj', 'wgrad', 'bf16'): {
-        (1001, 148): 'dense_proj_gemm_nn_n256_m256_ht_tma1_pro7',
-        (1001, 212): 'dense_proj_gemm_nn_n256_m256_tma1_pro7',
-        (2049, 148): 'dense_proj_gemm_nn_n256_m256_ht_pro7',
-        (2049, 212): 'dense_proj_gemm_nn_n256_m256_pro7',
-    },
-    ('o_proj', 'wgrad', 'f32'): {
-        (1001, 148): 'dense_proj_gemm_nn_n256_m256_f32_ht_tma1_pro7',
-        (1001, 212): 'dense_proj_gemm_nn_n256_m256_f32_tma1_pro7',
-        (2049, 148): 'dense_proj_gemm_nn_n256_m256_f32_ht_tma1_pro7',
-        (2049, 212): 'dense_proj_gemm_nn_n256_m256_f32_tma1_pro7',
-    },
-    ('q_a', 'fwd', 'bf16'): {
-        (1001, 148): 'dense_proj_gemm_kk_n256_cg_pro7',
-        (1001, 212): 'dense_proj_gemm_kk_n256_cg_pro15',
-        (2049, 148): 'dense_proj_gemm_kk_n256_cg_pro7',
-        (2049, 212): 'dense_proj_gemm_kk_n256_cg_pro15',
-    },
-    ('q_a', 'dgrad', 'bf16'): {
-        (1001, 148): 'dense_proj_gemm_kn_n256_pro7',
-        (1001, 212): 'dense_proj_gemm_kn_n256_pro15',
-        (2049, 148): 'dense_proj_gemm_kn_n256_pro7',
-        (2049, 212): 'dense_proj_gemm_kn_n256_ht_pro15',
-    },
-    ('q_a', 'dgrad', 'f32'): {
-        (1001, 148): 'dense_proj_gemm_kn_n256_f32_v8_ef_pro7',
-        (1001, 212): 'dense_proj_gemm_kn_n256_f32_v8_pro7',
-        (2049, 148): 'dense_proj_gemm_kn_n256_f32_v8_ef_pro7',
-        (2049, 212): 'dense_proj_gemm_kn_n256_f32_v8_ht_pro7',
-    },
-    ('q_a', 'wgrad', 'bf16'): {
-        (1001, 148): 'dense_proj_gemm_nn_n256_tma1_pro7',
-        (1001, 212): 'dense_proj_gemm_nn_n256_tma1_pro7',
-        (2049, 148): 'dense_proj_gemm_nn_n256_pro7',
-        (2049, 212): 'dense_proj_gemm_nn_n256_pro7',
-    },
-    ('q_a', 'wgrad', 'f32'): 'dense_proj_gemm_nn_n256_f32_v8_ef_pro7',
-    ('q_b', 'fwd', 'bf16'): {
-        (1001, 148): 'dense_proj_gemm_kk_n256_pro7',
-        (1001, 212): 'dense_proj_gemm_kk_n256_pro15',
-        (2049, 148): 'dense_proj_gemm_kk_n256_pro7',
-        (2049, 212): 'dense_proj_gemm_kk_n256_pro15',
-    },
-    ('q_b', 'dgrad', 'bf16'): {
-        (1001, 148): 'dense_proj_gemm_kn_n256_m256_ov_ht_pro7',
-        (1001, 212): 'dense_proj_gemm_kn_n256_cg_pro7',
-        (2049, 148): 'dense_proj_gemm_kn_n256_m256_ov_pro7',
-        (2049, 212): 'dense_proj_gemm_kn_n256_cg_pro7',
-    },
-    ('q_b', 'dgrad', 'f32'): {
-        (1001, 148): 'dense_proj_gemm_kn_n256_m256_f32_v8_ef_ov_ht_pro7',
-        (1001, 212): 'dense_proj_gemm_kn_n256_f32_v8_pro7',
-        (2049, 148): 'dense_proj_gemm_kn_n256_m256_f32_v8_ef_ov_pro7',
-        (2049, 212): 'dense_proj_gemm_kn_n256_f32_v8_pro7',
-    },
-    ('q_b', 'wgrad', 'bf16'): {
-        (1001, 148): 'dense_proj_gemm_nn_n256_m256_ov_ht_tma1_pro7',
-        (1001, 212): 'dense_proj_gemm_nn_n256_tma1_pro15',
-        (2049, 148): 'dense_proj_gemm_nn_n256_m256_ov_ht_pro7',
-        (2049, 212): 'dense_proj_gemm_nn_n256_pro15',
-    },
-    ('q_b', 'wgrad', 'f32'): {
-        (1001, 148): 'dense_proj_gemm_nn_n256_f32_v8_pro7',
-        (1001, 212): 'dense_proj_gemm_nn_n256_f32_v8_pro15',
-        (2049, 148): 'dense_proj_gemm_nn_n256_f32_v8_pro7',
-        (2049, 212): 'dense_proj_gemm_nn_n256_f32_v8_pro15',
-    },
-    ('kv_a', 'fwd', 'bf16'): {
-        (1001, 148): 'dense_proj_gemm_kk_n192_hee_s8_pro15',
-        (1001, 212): 'dense_proj_gemm_kk_n192_m256_hen_s5_pro15',
-        (2049, 148): 'dense_proj_gemm_kk_n192_hee_s8_pro15',
-        (2049, 212): 'dense_proj_gemm_kk_n192_m256_hen_s5_pro15',
-    },
-    ('kv_a', 'dgrad', 'bf16'): {
-        (1001, 148): 'dense_proj_gemm_kn_n256_tma1_pd2_pro15',
-        (1001, 212): 'dense_proj_gemm_kn_n256_q_pd1_pro7',
-        (2049, 148): 'dense_proj_gemm_kn_n256_tma1_pd2_pro15',
-        (2049, 212): 'dense_proj_gemm_kn_n256_q_pd1_pro7',
-    },
-    ('kv_a', 'dgrad', 'f32'): {
-        (1001, 148): 'dense_proj_gemm_kn_n256_f32_tma1_pro7',
-        (1001, 212): 'dense_proj_gemm_kn_n256_f32_tma1_pro15',
-        (2049, 148): 'dense_proj_gemm_kn_n256_f32_tma1_pro7',
-        (2049, 212): 'dense_proj_gemm_kn_n256_f32_tma1_pro15',
-    },
-    ('kv_a', 'wgrad', 'bf16'): {
-        (1001, 148): 'dense_proj_gemm_nn_n192_hee_t_tma1_pro7',
-        (1001, 212): 'dense_proj_gemm_nn_n192_bz64_hee_t_stt_pro15',
-        (2049, 148): 'dense_proj_gemm_nn_n192_hee_t_tma1_pro7',
-        (2049, 212): 'dense_proj_gemm_nn_n192_bz64_hee_t_stt_pro15',
-    },
-    ('kv_a', 'wgrad', 'f32'): {
-        (1001, 148): 'dense_proj_gemm_nn_n192_hee_f32_t_tma1_pro7',
-        (1001, 212): 'dense_proj_gemm_nn_n192_bz64_hee_f32_t_pro7',
-        (2049, 148): 'dense_proj_gemm_nn_n192_hee_f32_t_tma1_pro7',
-        (2049, 212): 'dense_proj_gemm_nn_n192_bz64_hee_f32_t_pro7',
-    },
-    ('shared_gate_up', 'fwd', 'bf16'): {
-        (1001, 148): 'dense_proj_gemm_kk_n256_cg_pro7',
-        (1001, 212): 'dense_proj_gemm_kk_n256_cg_pro15',
-        (2049, 148): 'dense_proj_gemm_kk_n256_cg_pro7',
-        (2049, 212): 'dense_proj_gemm_kk_n256_cg_pro15',
-    },
-    ('shared_gate_up', 'dgrad', 'bf16'): {
-        (1001, 148): 'dense_proj_gemm_kn_n256_pro7',
-        (1001, 212): 'dense_proj_gemm_kn_n256_pro15',
-        (2049, 148): 'dense_proj_gemm_kn_n256_pro7',
-        (2049, 212): 'dense_proj_gemm_kn_n256_ht_pro15',
-    },
-    ('shared_gate_up', 'dgrad', 'f32'): {
-        (1001, 148): 'dense_proj_gemm_kn_n256_f32_v8_ef_pro7',
-        (1001, 212): 'dense_proj_gemm_kn_n256_f32_v8_pro7',
-        (2049, 148): 'dense_proj_gemm_kn_n256_f32_v8_ef_pro7',
-        (2049, 212): 'dense_proj_gemm_kn_n256_f32_v8_ht_pro7',
-    },
-    ('shared_gate_up', 'wgrad', 'bf16'): {
-        (1001, 148): 'dense_proj_gemm_nn_n256_tma1_pro7',
-        (1001, 212): 'dense_proj_gemm_nn_n256_tma1_pro7',
-        (2049, 148): 'dense_proj_gemm_nn_n256_pro7',
-        (2049, 212): 'dense_proj_gemm_nn_n256_pro7',
-    },
-    ('shared_gate_up', 'wgrad', 'f32'): 'dense_proj_gemm_nn_n256_f32_v8_ef_pro7',
-    ('shared_down', 'fwd', 'bf16'): {
-        (1001, 148): 'dense_proj_gemm_kk_n256_pro7',
-        (1001, 212): 'dense_proj_gemm_kk_n256_pro15',
-        (2049, 148): 'dense_proj_gemm_kk_n256_pro7',
-        (2049, 212): 'dense_proj_gemm_kk_n256_ht_pro15',
-    },
-    ('shared_down', 'dgrad', 'bf16'): {
-        (1001, 148): 'dense_proj_gemm_kn_n256',
-        (1001, 212): 'dense_proj_gemm_kn_n256_pro7',
-        (2049, 148): 'dense_proj_gemm_kn_n256',
-        (2049, 212): 'dense_proj_gemm_kn_n256_pro7',
-    },
-    ('shared_down', 'dgrad', 'f32'): {
-        (1001, 148): 'dense_proj_gemm_kn_n256_f32_v8_ef_pro7',
-        (1001, 212): 'dense_proj_gemm_kn_n256_f32_v8_pro7',
-        (2049, 148): 'dense_proj_gemm_kn_n256_f32_v8_ef_pro7',
-        (2049, 212): 'dense_proj_gemm_kn_n256_f32_v8_pro7',
-    },
-    ('shared_down', 'wgrad', 'bf16'): {
-        (1001, 148): 'dense_proj_gemm_nn_n256_tma1_pro7',
-        (1001, 212): 'dense_proj_gemm_nn_n256_tma1_pro7',
-        (2049, 148): 'dense_proj_gemm_nn_n256_pro7',
-        (2049, 212): 'dense_proj_gemm_nn_n256_pro7',
-    },
-    ('shared_down', 'wgrad', 'f32'): 'dense_proj_gemm_nn_n256_f32_v8_ef_pro7',
-    ('dense_gate_up', 'fwd', 'bf16'): {
-        (1001, 148): 'dense_proj_gemm_kk_n256_pro7',
-        (1001, 212): 'dense_proj_gemm_kk_n256_m256_cg_or_pro7',
-        (2049, 148): 'dense_proj_gemm_kk_n256_pro7',
-        (2049, 212): 'dense_proj_gemm_kk_n256_m256_ht_cg_or_pro7',
-    },
-    ('dense_gate_up', 'dgrad', 'bf16'): {
-        (1001, 148): 'dense_proj_gemm_kn_n256_m256_ov_pro7',
-        (1001, 212): 'dense_proj_gemm_kn_n256_m256_cg_or_pro7',
-        (2049, 148): 'dense_proj_gemm_kn_n256_m256_ov_pro7',
-        (2049, 212): 'dense_proj_gemm_kn_n256_m256_cg_or_pro7',
-    },
-    ('dense_gate_up', 'dgrad', 'f32'): {
-        (1001, 148): 'dense_proj_gemm_kn_n256_m256_f32_v8_ef_ov_pro7',
-        (1001, 212): 'dense_proj_gemm_kn_n256_m256_f32_tma1_pro7',
-        (2049, 148): 'dense_proj_gemm_kn_n256_m256_f32_v8_ef_ov_pro7',
-        (2049, 212): 'dense_proj_gemm_kn_n256_m256_f32_tma1_pro7',
-    },
-    ('dense_gate_up', 'wgrad', 'bf16'): {
-        (1001, 148): 'dense_proj_gemm_nn_n256_m256_tma1_pro7',
-        (1001, 212): 'dense_proj_gemm_nn_n256_m256_tma1_pro7',
-        (2049, 148): 'dense_proj_gemm_nn_n256_m256_pro7',
-        (2049, 212): 'dense_proj_gemm_nn_n256_m256_pro7',
-    },
-    ('dense_gate_up', 'wgrad', 'f32'): {
-        (1001, 148): 'dense_proj_gemm_nn_n256_m256_f32_tma1_pro7',
-        (1001, 212): 'dense_proj_gemm_nn_n256_m256_f32_ht_tma1_pro7',
-        (2049, 148): 'dense_proj_gemm_nn_n256_m256_f32_tma1_pro7',
-        (2049, 212): 'dense_proj_gemm_nn_n256_m256_f32_ht_tma1_pro7',
-    },
-    ('dense_down', 'fwd', 'bf16'): {
-        (1001, 148): 'dense_proj_gemm_kk_n256_m256_ov_pro7',
-        (1001, 212): 'dense_proj_gemm_kk_n256_m256_cg_or_pro7',
-        (2049, 148): 'dense_proj_gemm_kk_n256_m256_ov_pro7',
-        (2049, 212): 'dense_proj_gemm_kk_n256_m256_cg_or_pro7',
-    },
-    ('dense_down', 'dgrad', 'bf16'): {
-        (1001, 148): 'dense_proj_gemm_kn_n256_pro7',
-        (1001, 212): 'dense_proj_gemm_kn_n256_hne_pro7',
-        (2049, 148): 'dense_proj_gemm_kn_n256_pro7',
-        (2049, 212): 'dense_proj_gemm_kn_n256_hne_pro7',
-    },
-    ('dense_down', 'dgrad', 'f32'): {
-        (1001, 148): 'dense_proj_gemm_kn_n256_f32_v8_ef_pro7',
-        (1001, 212): 'dense_proj_gemm_kn_n256_m256_f32_tma1_pro7',
-        (2049, 148): 'dense_proj_gemm_kn_n256_f32_v8_ef_pro7',
-        (2049, 212): 'dense_proj_gemm_kn_n256_m256_f32_tma1_pro7',
-    },
-    ('dense_down', 'wgrad', 'bf16'): {
-        (1001, 148): 'dense_proj_gemm_nn_n256_m256_tma1_pro7',
-        (1001, 212): 'dense_proj_gemm_nn_n256_m256_ht_tma1_pro7',
-        (2049, 148): 'dense_proj_gemm_nn_n256_m256_pro7',
-        (2049, 212): 'dense_proj_gemm_nn_n256_m256_ht_pro7',
-    },
-    ('dense_down', 'wgrad', 'f32'): {
-        (1001, 148): 'dense_proj_gemm_nn_n256_m256_f32_tma1_pro7',
-        (1001, 212): 'dense_proj_gemm_nn_n256_m256_f32_v8_ef_ht_pro7',
-        (2049, 148): 'dense_proj_gemm_nn_n256_m256_f32_tma1_pro7',
-        (2049, 212): 'dense_proj_gemm_nn_n256_m256_f32_v8_ef_ht_pro7',
-    },
-    ('indexer_q', 'fwd', 'bf16'): 'dense_proj_gemm_kk_n256_pro15',
-    ('indexer_q', 'dgrad', 'bf16'): 'dense_proj_gemm_kn_n256_pro15',
-    ('indexer_q', 'dgrad', 'f32'): {
-        (1001, 148): 'dense_proj_gemm_kn_n256_f32_v8_ef_pro7',
-        (1001, 212): 'dense_proj_gemm_kn_n256_f32_v8_ef_s9_pro15',
-        (2049, 148): 'dense_proj_gemm_kn_n256_f32_v8_ef_pro7',
-        (2049, 212): 'dense_proj_gemm_kn_n256_f32_v8_ef_s9_pro15',
-    },
-    ('indexer_q', 'wgrad', 'bf16'): {
-        (1001, 148): 'dense_proj_gemm_nn_n256_m256_tma1_pro7',
-        (1001, 212): 'dense_proj_gemm_nn_n160_m256_bz64_pro15',
-        (2049, 148): 'dense_proj_gemm_nn_n256_m256_pro7',
-        (2049, 212): 'dense_proj_gemm_nn_n160_m256_bz64_pro15',
-    },
-    ('indexer_q', 'wgrad', 'f32'): {
-        (1001, 148): 'dense_proj_gemm_nn_n256_m256_f32_tma1_pro7',
-        (1001, 212): 'dense_proj_gemm_nn_n160_m256_bz64_f32_v8_ef_pro15',
-        (2049, 148): 'dense_proj_gemm_nn_n256_m256_f32_tma1_pro7',
-        (2049, 212): 'dense_proj_gemm_nn_n160_m256_bz64_f32_v8_ef_pro15',
-    },
-    ('indexer_k', 'fwd', 'bf16'): {
-        (1001, 148): 'dense_proj_gemm_kk_n128_c1',
-        (1001, 212): 'dense_proj_gemm_kk_n128_pro15',
-        (2049, 148): 'dense_proj_gemm_kk_n128_c1',
-        (2049, 212): 'dense_proj_gemm_kk_n128_pro15',
-    },
-    ('indexer_k', 'dgrad', 'bf16'): 'dense_proj_gemm_kn_n256_tma2_pd2_pro15',
-    ('indexer_k', 'dgrad', 'f32'): {
-        (1001, 148): 'dense_proj_gemm_kn_n128_f32_tma1_pro7',
-        (1001, 212): 'dense_proj_gemm_kn_n128_f32_tma1_pd2_c1',
-        (2049, 148): 'dense_proj_gemm_kn_n128_f32_tma1_pro7',
-        (2049, 212): 'dense_proj_gemm_kn_n128_f32_tma1_pd2_c1',
-    },
-    ('indexer_k', 'wgrad', 'bf16'): {
-        (1001, 148): 'dense_proj_gemm_nn_n128_m64_t_pro7',
-        (1001, 212): 'dense_proj_gemm_nn_n128_m64_t_skx_pro15',
-        (2049, 148): 'dense_proj_gemm_nn_n128_m64_t_pro7',
-        (2049, 212): 'dense_proj_gemm_nn_n128_m64_t_skx_pro15',
-    },
-    ('indexer_k', 'wgrad', 'f32'): {
-        (1001, 148): 'dense_proj_gemm_nn_n128_m64_f32_t_pro7',
-        (1001, 212): 'dense_proj_gemm_nn_n128_m64_f32_t_skx_pro15',
-        (2049, 148): 'dense_proj_gemm_nn_n128_m64_f32_t_pro7',
-        (2049, 212): 'dense_proj_gemm_nn_n128_m64_f32_t_skx_pro15',
-    },
-    ('indexer_hw', 'fwd', 'bf16'): {
-        (1001, 148): 'dense_proj_gemm_kk_n128_c1',
-        (1001, 212): 'dense_proj_gemm_kk_n128_pro7',
-        (2049, 148): 'dense_proj_gemm_kk_n128_c1',
-        (2049, 212): 'dense_proj_gemm_kk_n128_pro7',
-    },
-    ('indexer_hw', 'dgrad', 'bf16'): {
-        (1001, 148): 'dense_proj_gemm_kn_n256_tma2_pd2_pro7',
-        (1001, 212): 'dense_proj_gemm_kn_n256_tma2_pd3_c1',
-        (2049, 148): 'dense_proj_gemm_kn_n256_tma2_pd2_pro7',
-        (2049, 212): 'dense_proj_gemm_kn_n256_tma2_pd3_c1',
-    },
-    ('indexer_hw', 'dgrad', 'f32'): {
-        (1001, 148): 'dense_proj_gemm_kn_n128_f32_tma2_s4_c1',
-        (1001, 212): 'dense_proj_gemm_kn_n128_f32_tma1_c1',
-        (2049, 148): 'dense_proj_gemm_kn_n128_f32_tma2_s4_c1',
-        (2049, 212): 'dense_proj_gemm_kn_n128_f32_tma1_c1',
-    },
-    ('indexer_hw', 'wgrad', 'bf16'): {
-        (1001, 148): 'dense_proj_gemm_nn_n128_m64_t_pro7',
-        (1001, 212): 'dense_proj_gemm_nn_n128_t_pro7',
-        (2049, 148): 'dense_proj_gemm_nn_n128_m64_t_pro7',
-        (2049, 212): 'dense_proj_gemm_nn_n128_t_skx_pro7',
-    },
-    ('indexer_hw', 'wgrad', 'f32'): {
-        (1001, 148): 'dense_proj_gemm_nn_n128_m64_f32_t_pro7',
-        (1001, 212): 'dense_proj_gemm_nn_n128_f32_t_pro7',
-        (2049, 148): 'dense_proj_gemm_nn_n128_m64_f32_t_pro7',
-        (2049, 212): 'dense_proj_gemm_nn_n128_f32_t_skx_pro7',
-    },
-}
-MLA_TEMPLATES = {
-    ('qabs', 'fwd'): {
-        (33, 148): 'dense_proj_gemm_nk_n128_t_pro7',
-        (33, 212): 'dense_proj_gemm_nk_n128_t_pro7',
-        (1001, 148): 'dense_proj_gemm_kn_n256_tma1_pro7',
-        (1001, 212): 'dense_proj_gemm_kn_n256_tma1_bg8_sol_pro7',
-        (2049, 148): 'dense_proj_gemm_kn_n256_tma1_pro7',
-        (2049, 212): 'dense_proj_gemm_kn_n256_tma1_bg8_sol_pro7',
-    },
-    ('qabs', 'dgrad'): {
-        (33, 148): 'dense_proj_gemm_kk_n128_t_pro7',
-        (33, 212): 'dense_proj_gemm_kk_n128_t_pro7',
-        (1001, 148): 'dense_proj_gemm_kk_n192_pro7',
-        (1001, 212): 'dense_proj_gemm_kk_n192_pro7',
-        (2049, 148): 'dense_proj_gemm_kk_n192_pro7',
-        (2049, 212): 'dense_proj_gemm_kk_n192_pro7',
-    },
-    ('qabs', 'wgrad'): {
-        (33, 148): 'dense_proj_gemm_nn_n192_m256_t_tma1_pro7',
-        (33, 212): 'dense_proj_gemm_nn_n192_m256_bz64_hee_t_tma1_s6_pro7',
-        (1001, 148): 'dense_proj_gemm_nn_n192_m256_t_tma1_pro7',
-        (1001, 212): 'dense_proj_gemm_nn_n192_m256_bz64_hee_t_tma1_s6_pro7',
-        (2049, 148): 'dense_proj_gemm_nn_n192_m256_t_tma1_pro7',
-        (2049, 212): 'dense_proj_gemm_nn_n192_m256_bz64_hee_t_tma1_s6_pro7',
-    },
-    ('vproj', 'fwd'): {
-        (33, 148): 'dense_proj_gemm_kk_n128_t_pro7',
-        (33, 212): 'dense_proj_gemm_kk_n128_t_pro7',
-        (1001, 148): 'dense_proj_gemm_kk_n256_q_pro7',
-        (1001, 212): 'dense_proj_gemm_kk_n256_q_pro7',
-        (2049, 148): 'dense_proj_gemm_kk_n256_q_pro7',
-        (2049, 212): 'dense_proj_gemm_kk_n256_q_pro7',
-    },
-    ('vproj', 'dgrad'): {
-        (33, 148): 'dense_proj_gemm_nk_n128_t_pro7',
-        (33, 212): 'dense_proj_gemm_nk_n128_t_pro7',
-        (1001, 148): 'dense_proj_gemm_kn_n256_m256_tma1_bg4_pro7',
-        (1001, 212): 'dense_proj_gemm_kn_n256_tma1_bg8_pro7',
-        (2049, 148): 'dense_proj_gemm_kn_n256_m256_tma1_bg4_pro7',
-        (2049, 212): 'dense_proj_gemm_kn_n256_tma1_bg8_pro7',
-    },
-    ('vproj', 'wgrad'): {
-        (33, 148): 'dense_proj_gemm_nn_n256_m256_t_tma1_pro7',
-        (33, 212): 'dense_proj_gemm_nn_n256_m256_hee_t_tma1_s6_pro7',
-        (1001, 148): 'dense_proj_gemm_nn_n256_m256_t_tma1_pro7',
-        (1001, 212): 'dense_proj_gemm_nn_n256_m256_hee_t_tma1_s6_pro7',
-        (2049, 148): 'dense_proj_gemm_nn_n256_m256_t_tma1_pro7',
-        (2049, 212): 'dense_proj_gemm_nn_n256_m256_hee_t_tma1_s6_pro7',
-    },
-}
-EXPORTED_TEMPLATES = frozenset(
-    {
-        'dense_proj_gemm_kk_n128_c1',
-        'dense_proj_gemm_kk_n128_hen_c1',
-        'dense_proj_gemm_kk_n128_hen_pro15',
-        'dense_proj_gemm_kk_n128_hen_pro7',
-        'dense_proj_gemm_kk_n128_pro7',
-        'dense_proj_gemm_kk_n192_hee_s8_pro15',
-        'dense_proj_gemm_kk_n192_m256_hen_s5_pro15',
-        'dense_proj_gemm_kk_n192_pro7',
-        'dense_proj_gemm_kk_n256_cg_pro15',
-        'dense_proj_gemm_kk_n256_cg_pro7',
-        'dense_proj_gemm_kk_n256_ht_pro15',
-        'dense_proj_gemm_kk_n256_m256_cg_or_pro7',
-        'dense_proj_gemm_kk_n256_m256_ht_cg_or_pro7',
-        'dense_proj_gemm_kk_n256_m256_ov_ht_pro7',
-        'dense_proj_gemm_kk_n256_pro15',
-        'dense_proj_gemm_kk_n256_pro7',
-        'dense_proj_gemm_kk_n256_q_pro7',
-        'dense_proj_gemm_kn_n128_f32_tma1_c1',
-        'dense_proj_gemm_kn_n128_f32_tma1_pd2_c1',
-        'dense_proj_gemm_kn_n128_f32_tma1_pro7',
-        'dense_proj_gemm_kn_n128_f32_tma2_s4_c1',
-        'dense_proj_gemm_kn_n256',
-        'dense_proj_gemm_kn_n256_cg_pro7',
-        'dense_proj_gemm_kn_n256_f32_tma1_pro15',
-        'dense_proj_gemm_kn_n256_f32_tma1_pro7',
-        'dense_proj_gemm_kn_n256_f32_v8_ef_pro7',
-        'dense_proj_gemm_kn_n256_f32_v8_ef_s9_pro15',
-        'dense_proj_gemm_kn_n256_f32_v8_ht_pro7',
-        'dense_proj_gemm_kn_n256_f32_v8_pro7',
-        'dense_proj_gemm_kn_n256_hne_pro7',
-        'dense_proj_gemm_kn_n256_ht_pro15',
-        'dense_proj_gemm_kn_n256_m256_cg_or_pro7',
-        'dense_proj_gemm_kn_n256_m256_f32_tma1_pro7',
-        'dense_proj_gemm_kn_n256_m256_f32_v8_ef_ov_ht_pro7',
-        'dense_proj_gemm_kn_n256_m256_ov_ht_pro15',
-        'dense_proj_gemm_kn_n256_m256_ov_ht_pro7',
-        'dense_proj_gemm_kn_n256_m256_tma1_bg4_pro7',
-        'dense_proj_gemm_kn_n256_pro15',
-        'dense_proj_gemm_kn_n256_pro7',
-        'dense_proj_gemm_kn_n256_q_pd1_pro7',
-        'dense_proj_gemm_kn_n256_tma1_bg8_pro7',
-        'dense_proj_gemm_kn_n256_tma1_bg8_sol_pro7',
-        'dense_proj_gemm_kn_n256_tma1_pd2_pro15',
-        'dense_proj_gemm_kn_n256_tma1_pro7',
-        'dense_proj_gemm_kn_n256_tma2_pd2_pro15',
-        'dense_proj_gemm_kn_n256_tma2_pd2_pro7',
-        'dense_proj_gemm_kn_n256_tma2_pd3_c1',
-        'dense_proj_gemm_nk_n256_t_pro7',
-        'dense_proj_gemm_nn_n128_f32_t_pro7',
-        'dense_proj_gemm_nn_n128_hen_f32_t_skx_pro7',
-        'dense_proj_gemm_nn_n128_hen_t_skx_pro7',
-        'dense_proj_gemm_nn_n128_m64_f32_t_pro7',
-        'dense_proj_gemm_nn_n128_m64_hen_f32_t_pro7',
-        'dense_proj_gemm_nn_n128_m64_hen_f32_t_skx_pro15',
-        'dense_proj_gemm_nn_n128_m64_hen_t_pro7',
-        'dense_proj_gemm_nn_n128_m64_hen_t_skx_pro15',
-        'dense_proj_gemm_nn_n128_m64_t_pro7',
-        'dense_proj_gemm_nn_n128_t_pro7',
-        'dense_proj_gemm_nn_n160_m256_bz64_f32_v8_ef_pro15',
-        'dense_proj_gemm_nn_n160_m256_bz64_pro15',
-        'dense_proj_gemm_nn_n192_bz64_hee_f32_t_pro7',
-        'dense_proj_gemm_nn_n192_bz64_hee_f32_t_sks_sb2_pro7',
-        'dense_proj_gemm_nn_n192_bz64_hee_t_sks_stt_pro15',
-        'dense_proj_gemm_nn_n192_hee_f32_t_tma1_pro7',
-        'dense_proj_gemm_nn_n192_hee_t_tma1_pro7',
-        'dense_proj_gemm_nn_n192_m256_bz64_hee_t_tma1_s6_pro7',
-        'dense_proj_gemm_nn_n192_m256_t_tma1_pro7',
-        'dense_proj_gemm_nn_n256_f32_v8_ef_sks_sb2_pro7',
-        'dense_proj_gemm_nn_n256_f32_v8_pro15',
-        'dense_proj_gemm_nn_n256_f32_v8_pro7',
-        'dense_proj_gemm_nn_n256_m256_f32_ht_tma1_pro7',
-        'dense_proj_gemm_nn_n256_m256_f32_tma1_pro7',
-        'dense_proj_gemm_nn_n256_m256_f32_tma1_sks_sb3_pro7',
-        'dense_proj_gemm_nn_n256_m256_f32_v8_ef_ht_pro7',
-        'dense_proj_gemm_nn_n256_m256_hee_t_tma1_s6_pro7',
-        'dense_proj_gemm_nn_n256_m256_ht_pro7',
-        'dense_proj_gemm_nn_n256_m256_ht_tma1_pro7',
-        'dense_proj_gemm_nn_n256_m256_ov_ht_pro7',
-        'dense_proj_gemm_nn_n256_m256_pro7',
-        'dense_proj_gemm_nn_n256_m256_sks_sb2_pro7',
-        'dense_proj_gemm_nn_n256_m256_t_tma1_pro7',
-        'dense_proj_gemm_nn_n256_m256_tma1_pro7',
-        'dense_proj_gemm_nn_n256_pro15',
-        'dense_proj_gemm_nn_n256_sks_sb2_pro7',
-    }
+# The names of ``cake_backend`` before #8046 that are entry points: each takes ``deterministic`` here.
+ENTRY_POINTS = (
+    "dense_projection_gemm",
+    "instance_symbol",
+    "plan_dense_projection_gemm",
+    "plan_router_fp32_gemm",
+    "prepare_dense_projection_gemm",
+    "prepare_projection_wgrad",
+    "prepare_router_fp32_gemm",
+    "projection_dgrad",
+    "projection_forward",
+    "projection_wgrad",
+    "router_dgrad",
+    "router_forward",
+    "router_fp32_gemm",
+    "router_symbol",
+    "router_wgrad",
+    "split_fp32_to_bf16x3_",
 )
-# --- END GENERATED TABLES ---
+# former name -> the deterministic package's canonical name (its alias block, kept by #8046)
+FORMER_TO_DET = {
+    "GemmPlan": "DetGemmPlan",
+    "PreparedGemm": "PreparedDetGemm",
+    "PreparedRouterGemm": "PreparedRouterDetGemm",
+    "RouterPlan": "RouterDetPlan",
+    "dense_projection_gemm": "dense_projection_det_gemm",
+    "plan_dense_projection_gemm": "plan_dense_projection_det_gemm",
+    "plan_router_fp32_gemm": "plan_router_fp32_det_gemm",
+    "prepare_dense_projection_gemm": "prepare_dense_projection_det_gemm",
+    "prepare_projection_wgrad": "prepare_projection_det_wgrad",
+    "prepare_router_fp32_gemm": "prepare_router_fp32_det_gemm",
+    "projection_dgrad": "projection_det_dgrad",
+    "projection_forward": "projection_det_forward",
+    "projection_wgrad": "projection_det_wgrad",
+    "router_dgrad": "router_det_dgrad",
+    "router_forward": "router_det_forward",
+    "router_fp32_gemm": "router_fp32_det_gemm",
+    "router_wgrad": "router_det_wgrad",
+    "split_fp32_to_bf16x3_": "split_fp32_to_bf16x3_det_",
+}
+# Every public name ``cake_backend`` defined before #8046 (FlashInfer c472a430, functions, classes and constants).
+# fmt: off
+FORMER_MODULE_NAMES = (
+    "ARCH_RULE_DEFAULTS", "BLOCK_K", "BLOCK_M", "BLOCK_N_CHOICES", "B_SWZ_CHOICES", "CH_T_COLS",
+    "CONVENIENCE_CACHE_SIZE", "CTA_GROUP", "CTA_ROWS_CHOICES", "DeviceFacts", "EPI_MODES", "EPI_WARPS",
+    "EXACT_WAVE_BLOCK_N", "GROUP_M", "GemmPlan", "K_TMA_BF16", "K_TWO_SLOTS", "L2_HINTS", "L2_PROMOS",
+    "PANEL_BYTES", "PD_CHOICES", "PreparedGemm", "PreparedRouterGemm", "ROUTER_BLOCK_K", "ROUTER_BLOCK_M",
+    "ROUTER_BLOCK_N", "ROUTER_SPLITS", "ROW_RULES", "RULE_PARENT", "RouterPlan", "SK_COUNTERS_MIN",
+    "SK_DUMMY_BASE", "SK_MIN_ITERS", "SK_SLAB_CHOICES", "SLOT_BYTES", "SMEM_OPT_IN", "SMEM_OVERSIZED",
+    "SPLIT_BLOCK_ELEMS", "SPLIT_TEMPLATE", "SUPPORTED_COMPUTE_CAPABILITIES", "W8_FORMS", "WORK_STAGES",
+    "a_halves_of", "arch_for", "as_batched", "b_stage_bytes", "bind_launch", "box_rows_of", "check_stream_k_plan",
+    "clear_convenience_caches", "convenience_key", "default_block_n", "default_cta_rows", "default_group_m",
+    "default_hints", "default_hints_cgrp", "default_pf", "default_promo", "default_stages",
+    "dense_projection_gemm", "device_facts", "device_l2_bytes", "device_sm_count", "epi_cols", "epi_mode",
+    "epi_slots", "exact_waves", "flat_alias", "fused_split_module", "generated_program_available", "instance_key",
+    "instance_symbol", "operand_view", "plan_dense_projection_gemm", "plan_router_fp32_gemm",
+    "prepare_dense_projection_gemm", "prepare_projection_wgrad", "prepare_router_fp32_gemm", "projection_dgrad",
+    "projection_forward", "projection_wgrad", "require_arch", "router_dgrad", "router_forward",
+    "router_fp32_gemm", "router_layout_class", "router_symbol", "router_wgrad", "row_rule", "sk_exact_plan",
+    "sk_parts_plan", "sk_sync_plan", "sm_pairs", "sm_units", "smem_limit_for", "split_fp32_to_bf16x3_",
+    "staging_bytes", "stream_k_plan", "stt_bytes", "swap_small_m", "wave_working_set", "wave_working_set_cgrp",
+    "wgrad_swapped", "wgrad_views",
+)
+# fmt: on
+DET_TOKEN = re.compile(r"(?:^|[^a-z])det(?:[^a-z]|$)", re.IGNORECASE)
+# the mode is named by deterministic=
+NEGATED_TOKEN = re.compile(r"non_?" + "det", re.IGNORECASE)
+
+
+class Recorder:
+    """A stand-in entry point: records its calls and returns a sentinel."""
+
+    def __init__(self):
+        self.calls = []
+        self.result = object()
+
+    def __call__(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
+        return self.result
+
+
+@contextlib.contextmanager
+def _no_warnings():
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        yield
+
+
+@pytest.fixture
+def torch_determinism():
+    """Restore PyTorch's deterministic-algorithms setting after the test."""
+    enabled = torch.are_deterministic_algorithms_enabled()
+    warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    yield
+    torch.use_deterministic_algorithms(enabled, warn_only=warn_only)
+
+
+def _patch_det(monkeypatch, former: str) -> Recorder:
+    recorder = Recorder()
+    monkeypatch.setattr(det_backend, FORMER_TO_DET[former], recorder)
+    return recorder
+
+
+def _k1_views(layout: str):
+    """CPU views ``(A, B, out)`` of one K1 layout class (``kk``, ``kn``, ``nn``): ``A[M, K]``, ``B[K, N]``."""
+    M, N, K = 8, 16, 32
+    A = torch.zeros(M, K) if layout[0] == "k" else torch.zeros(K, M).t()
+    B = torch.zeros(N, K).t() if layout[1] == "k" else torch.zeros(K, N)
+    return A, B, torch.zeros(M, N)
+
+
+# ---------------------------------------------------------------------------
+# Package and module surface (CPU)
+# ---------------------------------------------------------------------------
+
+
+def test_package_init_imports_nothing():
+    init = Path(package.__file__)
+    tree = ast.parse(init.read_text())
+    assert not [n for n in tree.body if isinstance(n, (ast.Import, ast.ImportFrom))]
+    assert package.__all__ == ["cake_backend", "cake_build", "cake_jit"]
+    assert package.cake_backend is cake_backend and package.cake_jit is cake_jit
+    with pytest.raises(AttributeError):
+        _ = package.no_such_module
+
+
+def test_the_package_never_imports_flashinfer_by_name():
+    """The package's own modules reach the deterministic package as a sibling; only the pinned loader's JIT fallback
+    (``cake_build.py``, shared by every Cake package) imports ``flashinfer.jit``."""
+    root = Path(cake_jit.__file__).parent
+    for path in sorted(p for p in root.glob("*.py") if p.name != "cake_build.py"):
+        for node in ast.walk(ast.parse(path.read_text())):
+            if isinstance(node, ast.Import):
+                assert not [
+                    a for a in node.names if a.name.split(".")[0] == "flashinfer"
+                ], path.name
+            elif isinstance(node, ast.ImportFrom) and node.level == 0:
+                assert (node.module or "").split(".")[0] != "flashinfer", path.name
+
+
+def test_cake_build_is_the_pinned_loader():
+    ours = Path(cake_jit.__file__).parent / "cake_build.py"
+    theirs = Path(det_jit.__file__).parent / "cake_build.py"
+    assert ours.read_bytes() == theirs.read_bytes()
+
+
+@pytest.mark.parametrize("name", ENTRY_POINTS)
+def test_entry_points_take_keyword_only_deterministic_true(name):
+    parameter = inspect.signature(getattr(cake_backend, name)).parameters[
+        "deterministic"
+    ]
+    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameter.default is True
+
+
+def test_the_deterministic_names_map():
+    assert {
+        k: v for k, v in cake_backend.DETERMINISTIC_NAMES.items() if k in FORMER_TO_DET
+    } == FORMER_TO_DET
+    for former, canonical in FORMER_TO_DET.items():
+        assert getattr(det_backend, former) is getattr(det_backend, canonical)
+    for name in ENTRY_POINTS:
+        assert getattr(cake_backend, name).__module__ == cake_backend.__name__
+
+
+@pytest.mark.parametrize("name", FORMER_MODULE_NAMES)
+def test_every_former_module_name_resolves(name):
+    obj = getattr(cake_backend, name)
+    if name in ENTRY_POINTS or name in ("bind_launch", "clear_convenience_caches"):
+        assert obj.__module__ == cake_backend.__name__
+    else:
+        assert obj is getattr(
+            det_backend, cake_backend.DETERMINISTIC_NAMES.get(name, name)
+        )
+
+
+def test_former_types_are_the_deterministic_classes():
+    assert cake_backend.GemmPlan is det_backend.DetGemmPlan
+    assert cake_backend.PreparedGemm is det_backend.PreparedDetGemm
+    assert cake_backend.RouterPlan is det_backend.RouterDetPlan
+    assert cake_backend.PreparedRouterGemm is det_backend.PreparedRouterDetGemm
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "projection_det_forward",
+        "DetGemmPlan",
+        "router_fp32_det_gemm",
+        "__wrapped__",
+        "no_such_name",
+    ],
+)
+def test_deterministic_spellings_are_not_read_through(name):
+    with pytest.raises(AttributeError):
+        getattr(cake_backend, name)
+
+
+def test_the_deterministic_package_resolves_as_a_sibling(monkeypatch):
+    """In a FlashInfer tree and in a copy vendored with the deterministic package beside it (the vendored gate's
+    layout) the deterministic package resolves as this package's sibling."""
+    if not cake_jit.__name__.rpartition(".")[0].rpartition(".")[0]:
+        pytest.skip("a top-level copy has no parent package to hold a sibling")
+    monkeypatch.setattr(cake_jit, "_det_package", None)
+    assert cake_backend.deterministic_backend() is det_backend
+    assert cake_jit.deterministic_module("cake_jit") is det_jit
+
+
+def test_use_deterministic_backend_binds_a_vendored_copy(monkeypatch):
+    monkeypatch.setattr(cake_jit, "_det_package", None)
+    fake_pkg, fake = (
+        ModuleType("vendored_det_pkg"),
+        ModuleType("vendored_det_pkg.cake_backend"),
+    )
+    for name in cake_backend.DETERMINISTIC_NAMES.values():
+        setattr(fake, name, Recorder())
+    monkeypatch.setitem(sys.modules, "vendored_det_pkg", fake_pkg)
+    monkeypatch.setitem(sys.modules, "vendored_det_pkg.cake_backend", fake)
+    cake_backend.use_deterministic_backend(fake)
+    assert cake_backend.deterministic_backend() is fake
+    assert (
+        cake_backend.projection_forward("X", "W") is fake.projection_det_forward.result
+    )
+    assert fake.projection_det_forward.calls == [(("X", "W", None), {})]
+    with pytest.raises(TypeError, match="lacks"):
+        cake_backend.use_deterministic_backend(ModuleType("not_a_backend.cake_backend"))
+
+
+# ---------------------------------------------------------------------------
+# Dispatch (CPU)
+# ---------------------------------------------------------------------------
+
+# entry point -> (positional arguments, keyword arguments, the call the deterministic object receives)
+# fmt: off
+DEFAULT_CALLS = {
+    "dense_projection_gemm": (
+        ("A", "B", "out"),
+        {"transposed_out": True, "enable_pdl": True},
+        (("A", "B", "out"), {"transposed_out": True, "enable_pdl": True}),
+    ),
+    "plan_dense_projection_gemm": (
+        ("A", "B", "out"),
+        {"sm_count": 148, "l2_bytes": 1 << 20, "transposed_out": True, "block_n": 128},
+        (("A", "B", "out"), {"sm_count": 148, "l2_bytes": 1 << 20, "transposed_out": True, "block_n": 128}),
+    ),
+    "prepare_dense_projection_gemm": (("A", "B", "out"), {"sk": False}, (("A", "B", "out"), {"sk": False})),
+    "projection_forward": (("X", "W"), {}, (("X", "W", None), {})),
+    "projection_dgrad": (("G", "W", "out"), {"out_dtype": "f32"}, (("G", "W", "out"), {"out_dtype": "f32"})),
+    "projection_wgrad": (
+        ("G", "X"),
+        {"out_dtype": "f32", "sk": True, "cta_rows": 64},
+        (("G", "X", None), {"out_dtype": "f32", "sk": True, "cta_rows": 64}),
+    ),
+    "prepare_projection_wgrad": (
+        ("G", "X", "out"),
+        {"cta_rows": 128},
+        (("G", "X", "out"), {"sk": "auto", "cta_rows": 128}),
+    ),
+    "plan_router_fp32_gemm": (("A", "B", "out"), {"splits": 3}, (("A", "B", "out"), {"splits": 3})),
+    "prepare_router_fp32_gemm": (("A", "B", "out"), {}, (("A", "B", "out"), {"splits": None})),
+    "router_fp32_gemm": (("A", "B", "out"), {"splits": 2}, (("A", "B", "out"), {"splits": 2})),
+    "router_forward": (("X", "W"), {}, (("X", "W", None), {})),
+    "router_dgrad": (("G", "W", "out"), {}, (("G", "W", "out"), {})),
+    "router_wgrad": (("G", "X"), {"splits": 9}, (("G", "X", None), {"splits": 9})),
+    "split_fp32_to_bf16x3_": (("src", "parts", "resid"), {}, (("src", "parts", "resid"), {})),
+}
 # fmt: on
 
 
-def _expected(table, key, T, sm_count):
-    value = table[key]
-    return value if isinstance(value, str) else value[(T, sm_count)]
-
-
-ARCH_OF_SM = {148: "sm_100a", 212: "sm_107a"}
-
-
-_TRANSPOSED_STEM = re.compile(
-    r"_t(?:_tma[12])?(?:_s\d+)?(?:_box\d+)?(?:_skx)?(?:_sks)?(?:_sb[123])?(?:_b(?:f|g\d+))?(?:_so[flnd])?(?:_pd\d+)?(?:_sh\d+)?(?:_c1)?(?:_cg)?(?:_or)?(?:_pro\d+)?$"
-)
-
-
-def _transposed_template(template: str) -> bool:
-    """``_t`` (transposed register epilogue) or ``_t_tma1`` / ``_t_tma2`` (round-14 transposed TMA-store epilogue),
-    followed by the knob suffixes ``instance_symbol`` emits after the epilogue term (``_s<stages>``, ``_box<rows>``,
-    ``_skx``, ``_sks`` / ``_sb<n>`` (rounds 18 / 19), ``_bf`` / ``_bg<n>``, ``_so<x>``, ``_pd<n>``, ``_sh<n>``, ``_c1``
-    (round 19), ``_cg`` (round 21), ``_or`` (round 24), ``_pro<n>`` (round 33)) - e.g. the round-16 six-stage swapped MLA weight-gradient templates ``..._hee_t_tma1_s6``."""
-    return _TRANSPOSED_STEM.search(template) is not None
-
-
-def _nopro(template: str) -> str:
-    """``template`` without the round-33 pair prologue / cleanup sync suffix (``_pro<n>``, the LAST knob suffix of every
-    planned pair program since round 33): the hand-written tests of rounds 15..27 assert their own round's program modulo that
-    suffix; the round-33 tests assert the suffix itself."""
-    return re.sub(r"_pro\d+$", "", template)
-
-
-def _rule_of(plan, sm_count):
-    """The measured per-row rule the planner applied to ``plan`` (empty when the row has none or the
-    registry fallback dropped it)."""
-    if plan.rule_fallback:
-        return {}
-    return row_rule(
-        ARCH_OF_SM[sm_count],
-        plan.a_mn,
-        plan.b_mn,
-        plan.out_f32,
-        plan.transposed_out,
-        plan.L > 1,
-        plan.N,
-        plan.K,
-        plan.M,
-    )
-
-
-def _registered(arch):
-    """The K1 templates that are generated programs of ``arch`` in this tree (the export registers per architecture)."""
-    return frozenset(
-        t for t in cake_jit.KERNELS.get(arch, {}) if t.startswith("dense_proj_gemm_")
-    )
-
-
-def _assert_mirrors_cake(plan, cake_template, where, arch):
-    """The plan is the Cake launcher's plan when that instance is a generated program of ``arch``; otherwise (the
-    batched small-M swap on a tiny T outside the export contract, a measured rule whose template exists only for
-    the contract's T, or a default tail-T instance no contract row of this architecture produced -- all of which
-    the Cake host JIT-compiles) the FlashInfer planner must have fallen back onto a generated program."""
-    registered = _registered(arch)
-    assert registered <= EXPORTED_TEMPLATES, (
-        arch,
-        sorted(registered - EXPORTED_TEMPLATES),
-    )
-    if cake_template in registered:
-        assert plan.template == cake_template, (*where, plan.template)
-        assert not (plan.swap_fallback or plan.rule_fallback or plan.knob_fallback), (
-            where
-        )
-    else:
-        assert plan.swap_fallback or plan.rule_fallback or plan.knob_fallback, (
-            *where,
-            cake_template,
-            plan.template,
-        )
-        assert plan.template in registered, (*where, cake_template, plan.template)
-
-
-def _device_supported() -> bool:
-    """A device this checkout registers generated programs for (``build.json`` ships
-    ``sm_100a`` and ``sm_107a`` builds: compute capability 10.0 or 10.7; see README)."""
-    return torch.cuda.is_available() and generated_program_available(
-        torch.device("cuda")
-    )
-
-
-def _require_program(template: str):
-    if not _device_supported():
-        pytest.skip(
-            "requires a device with a registered generated instance "
-            "(compute capability 10.0 or 10.7)"
-        )
-    if not generated_program_available(torch.device("cuda"), template):
-        pytest.skip(f"generated instance {template!r} not registered for this device")
-
-
-def _registered_knobs(v, *candidates):
-    """The first planner knob set (in order) whose planned instance the export registered for this device.
-    The per-arch export only ships the instances its measured rules route to, so a test that pins a tile
-    family takes whichever family's instance this device has; skips when none is registered."""
-    if not _device_supported():
-        pytest.skip(
-            "requires a device with a registered generated instance "
-            "(compute capability 10.0 or 10.7)"
-        )
-    templates = [_plan_template(v, **knobs) for knobs in candidates]
-    for knobs, template in zip(candidates, templates, strict=True):
-        if generated_program_available(torch.device("cuda"), template):
-            return knobs
-    pytest.skip(
-        f"none of the generated instances {templates!r} is registered for this device"
-    )
-
-
-def _sm_count() -> int:
-    return int(torch.cuda.get_device_properties(0).multi_processor_count)
-
-
-def _l2_bytes() -> int:
-    return device_l2_bytes(torch.device("cuda", 0))
-
-
-# ---------------------------------------------------------------------------
-# Host layer (CPU)
-# ---------------------------------------------------------------------------
-
-
-ARG_KINDS = {"buffer", "tma_buffer", "workspace", "parameter", "grid"}
-
-
-def test_registry_records_are_well_formed():
-    # schema v2: the distinct argument plans are stored once, keyed by the digest of their compact JSON
-    assert cake_jit.ARG_PLANS
-    for key, plan in cake_jit.ARG_PLANS.items():
-        assert re.fullmatch(r"[0-9a-f]{12}", key) and key == cake_jit.arg_plan_key(plan)
-        items = [list(item) for item in plan]
-        assert items and all(
-            len(item) == 2 and all(isinstance(s, str) for s in item) for item in items
-        )
-        names = [name for _, name in items]
-        assert len(set(names)) == len(names)
-        assert {kind for kind, _ in items} <= ARG_KINDS
-        assert ["workspace", "tma_descriptor_workspace"] not in items
-        assert {name for kind, name in items if kind == "grid"} == {
-            "grid_x",
-            "grid_y",
-            "grid_z",
-        }
-    # every plan is referenced and every module references exactly one plan by key
-    assert {record["arg_plan"] for record in cake_jit.MODULES.values()} == set(
-        cake_jit.ARG_PLANS
-    )
-    # build.json (``cake_build``) is the only record of what to compile; the registry names its
-    # entries ``<library>_<arch>``
-    manifest = cake_build.manifest()
-    libraries = {entry["name"]: entry for entry in manifest["libraries"]}
-    assert len(libraries) == len(manifest["libraries"])  # names unique
-    assert set(cake_jit.KERNELS) == set(cake_jit.ARCHES) == set(manifest["arch_flags"])
-    for arch, table in cake_jit.KERNELS.items():
-        for template, name in table.items():
-            record = cake_jit.MODULES[name]
-            assert arch in record["arches"] and record["template"] == template
-            assert cake_jit.select_module(arch, template) == name
-    for name, record in cake_jit.MODULES.items():
-        # architecture-neutral programs: one source pair, built for every arch it serves
-        assert record["arches"] and record["arches"] == sorted(record["arches"])
-        assert record["library"] == name
-        for arch in record["arches"]:
-            assert arch in cake_jit.ARCHES
-            assert cake_jit.KERNELS[arch][record["template"]] == name
-            entry = libraries[cake_jit.library_name(name, arch)]
-            assert entry["arch"] == arch and entry["entry"] == record["ffi_entry"]
-            assert len(entry["sources"]) == 2
-            assert all(
-                s.startswith("csrc/cake_dense_projection_gemm/") and "/sm_" not in s
-                for s in entry["sources"]
+@pytest.mark.parametrize("name", sorted(DEFAULT_CALLS))
+def test_the_default_calls_the_deterministic_object(
+    monkeypatch, torch_determinism, name
+):
+    """The default path is the deterministic package's object with the same arguments (so the same bits), with and
+    without PyTorch's deterministic mode, and never warns."""
+    args, kwargs, expected = DEFAULT_CALLS[name]
+    recorder = _patch_det(monkeypatch, name)
+    for enabled in (False, True):
+        torch.use_deterministic_algorithms(enabled)
+        with _no_warnings():
+            assert getattr(cake_backend, name)(*args, **kwargs) is recorder.result
+            assert (
+                getattr(cake_backend, name)(*args, deterministic=True, **kwargs)
+                is recorder.result
             )
-            assert all(
-                (Path(cake_jit.__file__).parent / s).is_file() for s in entry["sources"]
-            )
-            assert len(entry["closure_sha256"]) == 64
-        assert (
-            "tma_workspace_bytes" not in record
-        )  # by-value TMA ABI: no descriptor workspace
-        assert isinstance(record["arg_plan"], str)
-        plan_items = [list(item) for item in cake_jit.arg_plan_of(record)]
-        assert plan_items == [
-            list(item) for item in cake_jit.ARG_PLANS[record["arg_plan"]]
+    assert recorder.calls == [expected] * 4
+
+
+def test_the_default_router_forward_and_wgrad_keep_the_production_splits(monkeypatch):
+    forward, wgrad = (
+        _patch_det(monkeypatch, "router_forward"),
+        _patch_det(monkeypatch, "router_wgrad"),
+    )
+    cake_backend.router_forward("X", "W", "out")
+    cake_backend.router_wgrad("G", "X", "out", splits=6)
+    assert forward.calls == [
+        (("X", "W", "out"), {})
+    ]  # the deterministic default (4 splits) applies
+    assert wgrad.calls == [(("G", "X", "out"), {"splits": 6})]
+
+
+def test_instance_and_router_symbols():
+    key = det_backend.instance_key(a_mn=True, b_mn=True)
+    assert cake_backend.instance_symbol(
+        key, deterministic=False
+    ) == det_backend.instance_symbol(key)
+    for a_mn, b_mn, out_t in (
+        (False, False, False),
+        (False, True, False),
+        (True, True, True),
+    ):
+        assert cake_backend.router_symbol(
+            a_mn, b_mn, out_t
+        ) == det_backend.router_symbol(a_mn, b_mn, out_t)
+    assert (
+        cake_backend.router_symbol(False, False, False, deterministic=False)
+        == "router_fp32_gemm_atomic_kk"
+    )
+    assert (
+        cake_backend.router_symbol(True, True, True, deterministic=False)
+        == "router_fp32_gemm_atomic_nn_t"
+    )
+    assert cake_backend.router_symbol(
+        False, True, False, deterministic=False
+    ) == det_backend.router_symbol(False, True, False)
+
+
+@pytest.mark.parametrize("layout", ["kk", "kn", "nn"])
+def test_k1_routes(monkeypatch, layout):
+    """``deterministic=False``: the weight-gradient layout reaches this package's split-K path; the forward and
+    input-gradient layouts run the deterministic program."""
+    det = _patch_det(monkeypatch, "dense_projection_gemm")
+    atomic = Recorder()
+    monkeypatch.setattr(cake_backend, "_atomic_k1", atomic)
+    A, B, out = _k1_views(layout)
+    result = cake_backend.dense_projection_gemm(A, B, out, deterministic=False)
+    if layout == "nn":
+        assert result is atomic.result and not det.calls
+        ((args, kwargs),) = atomic.calls
+        assert args[0] == "launch" and args[1] is A and args[2] is B and args[3] is out
+        assert kwargs["transposed_out"] is False and kwargs["own"] == {}
+        assert kwargs["det_call"]() is det.result  # a row the planner does not take
+        assert det.calls == [
+            ((A, B, out), {"transposed_out": False, "enable_pdl": None})
         ]
-        if record["template"].startswith("dense_proj_gemm_"):
-            # the raster group width is a launch parameter since round 11; the stream-K slabs and the
-            # slice counters are host-owned buffers
-            assert ["parameter", "group_m"] in plan_items
-            assert ["buffer", "ws"] in plan_items and [
-                "buffer",
-                "counters",
-            ] in plan_items
-        else:
-            assert ["parameter", "k_iters_split"] in plan_items
-        launch = record["launch"]
-        # round 19 (Cake W3): the single-CTA form (``_c1`` templates) has no cluster; every other program is a
-        # two-CTA cluster (the exporter's registry check)
-        want_cluster = (
-            [1, 1, 1] if record["template"].endswith("_c1") else [CTA_GROUP, 1, 1]
+    else:
+        assert result is det.result and not atomic.calls
+        assert det.calls == [
+            ((A, B, out), {"transposed_out": False, "enable_pdl": None})
+        ]
+
+
+def test_k1_operation_routes(monkeypatch):
+    forward, dgrad = (
+        _patch_det(monkeypatch, "projection_forward"),
+        _patch_det(monkeypatch, "projection_dgrad"),
+    )
+    atomic = Recorder()
+    monkeypatch.setattr(cake_backend, "_atomic_k1", atomic)
+    X, W, G = torch.zeros(64, 32), torch.zeros(16, 32), torch.zeros(64, 16)
+    assert cake_backend.projection_forward(X, W, deterministic=False) is forward.result
+    assert cake_backend.projection_dgrad(G, W, deterministic=False) is dgrad.result
+    assert not atomic.calls
+    out = torch.zeros(16, 32, dtype=torch.bfloat16)
+    assert (
+        cake_backend.projection_wgrad(G, X, out, deterministic=False) is atomic.result
+    )
+    assert (
+        cake_backend.prepare_projection_wgrad(G, X, out, deterministic=False)
+        is atomic.result
+    )
+    (launch_args, launch_kwargs), (prepare_args, prepare_kwargs) = atomic.calls
+    # the transposed-store launch X.T @ G whatever the deterministic orientation
+    assert launch_args[0] == "launch" and prepare_args[0] == "prepare"
+    for args, kwargs in ((launch_args, launch_kwargs), (prepare_args, prepare_kwargs)):
+        assert args[1].equal(X.t()) and args[2] is G and args[3] is out
+        assert kwargs["transposed_out"] is True and kwargs["own"] == {}
+    # a row the planner does not take runs the deterministic weight-gradient entry point with its knobs
+    wgrad, prepare = (
+        _patch_det(monkeypatch, "projection_wgrad"),
+        _patch_det(monkeypatch, "prepare_projection_wgrad"),
+    )
+    assert launch_kwargs["det_call"]() is wgrad.result
+    assert prepare_kwargs["det_call"]() is prepare.result
+    assert wgrad.calls == [
+        ((G, X, out), {"out_dtype": None, "sk": "auto", "cta_rows": None})
+    ]
+    assert prepare.calls == [((G, X, out), {"sk": "auto", "cta_rows": None})]
+
+
+def _same_entry_views(views, a_view, split_src, flags) -> None:
+    """``views`` (an entry point's own launch views) are ``(a_view, split_src)`` with the plan flags ``flags``."""
+    assert _geometry(views[0]) == _geometry(a_view)
+    assert views[0].data_ptr() == a_view.data_ptr() and views[1] is split_src
+    assert views[2] == flags
+
+
+def test_k2_routes(monkeypatch):
+    """``deterministic=False``: the router weight gradient reaches this package's stream-K path, and so does the
+    forward with a split count or while some router table gives the forward a verdict; without either the forward
+    runs the deterministic program through this package's binding (the plan the planner keeps for a row without a
+    verdict).  The input gradient runs the deterministic program (one split) through that binding too, the split stage
+    the deterministic package's.  Each entry point passes its own tensors as the launch views."""
+    dgrad, split = (
+        _patch_det(monkeypatch, "router_dgrad"),
+        _patch_det(monkeypatch, "split_fp32_to_bf16x3_"),
+    )
+    gemm = _patch_det(monkeypatch, "router_fp32_gemm")
+    atomic, splitk = Recorder(), Recorder()
+    monkeypatch.setattr(cake_backend, "_atomic_k2", atomic)
+    monkeypatch.setattr(cake_backend, "_splitk_k2", splitk)
+    T, K, N = 64, 32, 16
+    X, W, G = torch.zeros(T, K), torch.zeros(N, K), torch.zeros(T, N)
+    assert cake_backend.router_forward(X, W, deterministic=False) is splitk.result
+    ((args, kwargs),) = splitk.calls
+    assert args[0] is X and args[1].equal(W.t()) and args[3] is None and not kwargs
+    assert args[5] is None  # enable_pdl: the device's default
+    assert tuple(args[2].shape) == (T, N) and args[2].dtype == torch.float32
+    _same_entry_views(args[4], X.unsqueeze(0), W, cake_backend._FORWARD_VIEWS)
+    assert (
+        cake_backend.router_forward(X, W, deterministic=False, splits=2)
+        is atomic.result
+    )
+    monkeypatch.setitem(cake_backend.ROUTER_RULES, ("sm_103a", "kk", K, N), "S2")
+    assert cake_backend.router_forward(X, W, deterministic=False) is atomic.result
+    assert (
+        cake_backend.router_wgrad(G, X, deterministic=False, splits=5) is atomic.result
+    )
+    assert cake_backend.router_dgrad(G, W, deterministic=False) is splitk.result
+    assert not dgrad.calls
+    dg_args, dg_kwargs = splitk.calls[1]
+    assert dg_args[0] is G and dg_args[1] is W and dg_args[3] == 1 and not dg_kwargs
+    assert dg_args[5] is None
+    assert tuple(dg_args[2].shape) == (T, K) and dg_args[2].dtype == torch.float32
+    _same_entry_views(dg_args[4], G.unsqueeze(0), W, cake_backend._DGRAD_VIEWS)
+    assert (
+        cake_backend.split_fp32_to_bf16x3_("s", "p", "r", deterministic=False)
+        is split.result
+    )
+    calls = atomic.calls
+    (fwd2_args, fwd2_kwargs), (fwd_args, fwd_kwargs), (wg_args, wg_kwargs) = calls
+    assert fwd2_args[1] is X and fwd2_args[2].equal(W.t())
+    assert fwd2_kwargs["splits"] == 2
+    assert (
+        fwd_args[0] == "launch"
+        and fwd_args[1] is X
+        and fwd_args[2].equal(W.t())
+        and fwd_kwargs["splits"] is None
+    )
+    for kw in (fwd2_kwargs, fwd_kwargs, wg_kwargs):
+        assert set(kw) == {"splits", "enable_pdl", "views"} and kw["enable_pdl"] is None
+    for kw in (fwd2_kwargs, fwd_kwargs):
+        _same_entry_views(kw["views"], X.unsqueeze(0), W, cake_backend._FORWARD_VIEWS)
+    assert tuple(fwd_args[3].shape) == (T, N) and fwd_args[3].dtype == torch.float32
+    assert wg_args[1].equal(G.t()) and wg_args[2] is X and wg_kwargs["splits"] == 5
+    _same_entry_views(wg_kwargs["views"], X.unsqueeze(0), G, cake_backend._WGRAD_VIEWS)
+    assert tuple(wg_args[3].shape) == (N, K)
+    # the generic entry: the kn class runs the deterministic program (this package's binding), kk / nn_t this
+    # package's path, without entry-point views
+    assert (
+        cake_backend.router_fp32_gemm(
+            G, W, torch.zeros(T, K), deterministic=False, splits=1
         )
-        assert list(launch["cluster"]) == want_cluster, (name, launch)
-        assert len(launch["block"]) == 3 and all(int(b) >= 1 for b in launch["block"])
-        assert int(launch["block"][0]) % 32 == 0  # whole warps
-    with pytest.raises(NotImplementedError, match="not registered"):
-        cake_jit.select_module("sm_100a", "dense_proj_gemm_not_a_template")
-    # every manifest entry belongs to a registered (program, arch) pair
-    assert set(libraries) == {
-        cake_jit.library_name(name, arch)
-        for name, record in cake_jit.MODULES.items()
-        for arch in record["arches"]
-    }
-
-
-def test_registry_literals_follow_the_export_contract():
-    """The three registry literals are the text the Cake export replaces: each wrapped in ``# fmt: off`` /
-    ``# fmt: on`` behind its exact head line, one record per line, in the order ARG_PLANS, MODULES, KERNELS,
-    and each evaluates to the object this module imports."""
-    text = Path(cake_jit.__file__).read_text()
-    heads = (
-        ("ARG_PLANS: dict[str, list[list[str]]] = {", cake_jit.ARG_PLANS),
-        ("MODULES: dict[str, dict[str, Any]] = {", cake_jit.MODULES),
-        ("KERNELS: dict[str, dict[str, str]] = {", cake_jit.KERNELS),
+        is splitk.result
     )
-    positions = []
-    for head, value in heads:
-        assert text.count("\n" + head + "\n") == 1, head
-        start = text.index("\n" + head + "\n") + 1
-        assert text[:start].endswith("# fmt: off\n"), head
-        end = text.index("\n}\n# fmt: on\n", start)
-        body = text[start + len(head) + 1 : end]
-        lines = body.split("\n")
-        assert lines and all(
-            re.fullmatch(r'    "[^"]+": \S.*,', line) for line in lines
-        ), head
-        assert ast.literal_eval("{\n" + body + "\n}") == value, head
-        positions.append(start)
-    assert positions == sorted(positions)
-    assert cake_jit.arg_plan_key([("grid", "grid_x")]) == cake_jit.arg_plan_key(
-        [["grid", "grid_x"]]
+    assert splitk.calls[2][0][3] == 1 and splitk.calls[2][0][4] is None
+    assert splitk.calls[2][0][5] is None
+    assert (
+        cake_backend.router_fp32_gemm(X, W.t(), torch.zeros(T, N), deterministic=False)
+        is atomic.result
+    )
+    assert (
+        cake_backend.router_fp32_gemm(G.t(), X, torch.zeros(N, K), deterministic=False)
+        is atomic.result
+    )
+    assert all(kw["views"] is None for _, kw in atomic.calls[3:])
+    assert not gemm.calls and len(splitk.calls) == 3 and len(atomic.calls) == 5
+
+
+@pytest.mark.parametrize("pdl", [True, False])
+def test_k2_routes_pass_enable_pdl(monkeypatch, pdl):
+    """``enable_pdl`` reaches every K2 route of ``deterministic=False``: this package's binding of the deterministic
+    program (the forward without a verdict, the input gradient, the generic ``kn`` call) and this package's stream-K
+    path (the forward with a split count, the weight gradient)."""
+    atomic, splitk = Recorder(), Recorder()
+    monkeypatch.setattr(cake_backend, "_atomic_k2", atomic)
+    monkeypatch.setattr(cake_backend, "_splitk_k2", splitk)
+    T, K, N = 64, 32, 16
+    X, W, G = torch.zeros(T, K), torch.zeros(N, K), torch.zeros(T, N)
+    kw = dict(deterministic=False, enable_pdl=pdl)
+    cake_backend.router_forward(X, W, **kw)
+    cake_backend.router_dgrad(G, W, **kw)
+    cake_backend.router_fp32_gemm(G, W, torch.zeros(T, K), splits=1, **kw)
+    cake_backend.router_forward(X, W, splits=2, **kw)
+    cake_backend.router_wgrad(G, X, splits=5, **kw)
+    assert [args[5] for args, _ in splitk.calls] == [pdl] * 3
+    assert [kwargs["enable_pdl"] for _, kwargs in atomic.calls] == [pdl] * 2
+
+
+def _register(monkeypatch, arch: str, *templates: str) -> None:
+    """Pretend this checkout registers ``templates`` on ``arch`` (CPU planner tests: nothing is loaded)."""
+    table = dict(cake_jit.KERNELS.get(arch, {}))
+    for template in templates:
+        table[template] = "cake_dense_projection_gemm_" + "0" * 20
+    monkeypatch.setitem(cake_jit.KERNELS, arch, table)
+
+
+def _register_k1(monkeypatch, arch: str) -> None:
+    _register(
+        monkeypatch,
+        arch,
+        *(
+            cake_backend.atomic_k1_template(bn, f32)
+            for bn in cake_backend.K1_BLOCK_N_CHOICES
+            for f32 in (False, True)
+        ),
     )
 
 
-def test_epilogue_rules():
-    assert epi_mode(False, True) == "reg"
-    assert epi_mode(True, True) == "reg"
-    assert (
-        epi_mode(True, False) == "tma"
-    )  # row-major fp32: TMA-store epilogue by default
-    assert epi_mode(True, False, K=64) == "tma"
-    assert (
-        epi_mode(True, False, epi="reg") == "reg"
-    )  # the float4 register path is an opt-in
-    assert epi_mode(False, False, K=1024) == "tma"
-    assert epi_mode(False, False, K=1025) == "reg"
-    assert epi_mode(False, False) == "reg"
-    # round 14: the transposed TMA-store epilogue is an opt-in whose warp slice must be whole CH_T_COLS-column chunks
-    assert epi_mode(False, True, epi="tma", block_n=192, cta_rows=256) == "tma"
-    assert epi_mode(False, True, epi="tma", block_n=256, cta_rows=256) == "tma"
-    with pytest.raises(ValueError, match="transposed"):
-        epi_mode(False, True, epi="tma", block_n=160, cta_rows=256)
-    with pytest.raises(ValueError, match="epi must be"):
-        epi_mode(False, False, epi="bad")
-    assert epi_slots("reg", False, 256) == 0
-    assert epi_slots("tma", False, 256, K=6144) == 1
-    assert epi_slots("tma", True, 256, K=6144) == 1
-    assert (
-        epi_slots("tma", True, 128) == 2
-    )  # K unknown: two slots when the chunk count allows
-    assert (
-        epi_slots("tma", True, 128, K=64) == 1
-    )  # any K above K_TWO_SLOTS = 0: one slot
-    with pytest.raises(ValueError, match="slots"):
-        epi_slots("tma", False, 128, slots=3)
-    # round 9: the warp slice is BLOCK_N / 2 columns, BLOCK_N / 4 on the 64-row Layout-B family
-    assert BLOCK_N_CHOICES == (128, 160, 192, 224, 256) and CTA_ROWS_CHOICES == (
-        64,
-        128,
-        256,
-    )
-    assert [epi_cols(n) for n in BLOCK_N_CHOICES] == [64, 80, 96, 112, 128]
-    assert [epi_cols(n, 64) for n in BLOCK_N_CHOICES] == [32, 40, 48, 56, 64]
-    assert epi_cols(256, 256) == 128
-    # fp32: TMA stores only for whole 32-column slices (160 / 224 and the 64-row 192 fall back to registers)
-    assert epi_mode(True, False, block_n=192) == "tma"
-    assert epi_mode(True, False, block_n=160) == "reg"
-    assert epi_mode(True, False, block_n=224) == "reg"
-    assert epi_mode(True, False, block_n=192, cta_rows=64) == "reg"
-    assert epi_mode(True, False, block_n=128, cta_rows=64) == "tma"
-    # bf16: whole 64-column slices only (192 / 160 / 224 and the 64-row 128 have none)
-    assert epi_mode(False, False, K=1024, block_n=192) == "reg"
-    assert epi_mode(False, False, K=1024, block_n=160) == "reg"
-    assert epi_mode(False, False, K=1024, block_n=256, cta_rows=64) == "tma"
-    assert epi_mode(False, False, K=1024, block_n=128, cta_rows=64) == "reg"
-    assert epi_mode(False, False, K=1024, block_n=128, cta_rows=256) == "tma"
-    assert (
-        epi_slots("tma", False, 256, K=64, cta_rows=64) == 1
-    )  # one 64-column chunk per 64-row slice
-    assert (
-        epi_slots("tma", True, 128, cta_rows=64) == 1
-    )  # one 32-column chunk: the two-slot default falls back to one
-    with pytest.raises(ValueError, match="slots"):
-        epi_slots("tma", False, 256, slots=2, cta_rows=64)
+# ---------------------------------------------------------------------------
+# K1 planner (CPU)
+# ---------------------------------------------------------------------------
+
+# The weight-gradient rows of the deterministic package's benchmark and of the #7043 follow-ups: (d_in, d_out) of
+# ``dW[d_out, d_in] = G[T, d_out].T @ X[T, d_in]``, each in BF16 and FP32 at two token counts (120 rows; the four MLA
+# head rows, batched, make 124).
+# fmt: off
+WGRAD_SHAPES = (
+    (2048, 4096), (2048, 6144), (2048, 16384), (4096, 32), (4096, 48), (4096, 64), (4096, 128), (4096, 512),
+    (4096, 1024), (4096, 4096), (4096, 12288), (5120, 32), (5120, 48), (5120, 64), (5120, 128), (5120, 512),
+    (5120, 1024), (5120, 5120), (5120, 17408), (6144, 32), (6144, 128), (6144, 576), (6144, 2048), (6144, 2048),
+    (6144, 12288), (8192, 128), (12288, 4096), (12288, 6144), (16384, 6144), (17408, 5120),
+)
+# fmt: on
+SM_COUNTS = {"sm_100a": 148, "sm_103a": 152, "sm_107a": 216}
 
 
 @pytest.mark.parametrize(
-    "kwargs, symbol",
+    "arch, sm_count, rows",
     [
-        (dict(a_mn=False, b_mn=False), "dense_proj_gemm_kk_n256"),
-        (dict(a_mn=False, b_mn=False, block_n=128), "dense_proj_gemm_kk_n128"),
-        # the launcher resolves the slot count from K (1 for every K > K_TWO_SLOTS = 0) and passes it
-        (
-            dict(a_mn=False, b_mn=False, epi="tma", slots=1),
-            "dense_proj_gemm_kk_n256_tma1",
-        ),
-        (dict(a_mn=False, b_mn=False, epi="tma"), "dense_proj_gemm_kk_n256_tma2"),
-        (
-            dict(a_mn=False, b_mn=True, out_f32=True, slots=1),
-            "dense_proj_gemm_kn_n256_f32_tma1",
-        ),
-        (
-            dict(a_mn=False, b_mn=True, out_f32=True, epi="reg"),
-            "dense_proj_gemm_kn_n256_f32",
-        ),
-        (dict(a_mn=True, b_mn=True), "dense_proj_gemm_nn_n256"),
-        (
-            dict(a_mn=True, b_mn=True, epi="tma", slots=1),
-            "dense_proj_gemm_nn_n256_tma1",
-        ),
-        (
-            dict(a_mn=True, b_mn=True, out_f32=True, slots=1),
-            "dense_proj_gemm_nn_n256_f32_tma1",
-        ),
-        (
-            dict(a_mn=True, b_mn=True, out_t=True, block_n=128),
-            "dense_proj_gemm_nn_n128_t",
-        ),
-        (
-            dict(a_mn=True, b_mn=True, out_t=True, out_f32=True, block_n=128),
-            "dense_proj_gemm_nn_n128_f32_t",
-        ),
-        (dict(a_mn=False, b_mn=False, cta_rows=256), "dense_proj_gemm_kk_n256_m256"),
-        (dict(a_mn=False, b_mn=False, stages=5), "dense_proj_gemm_kk_n256_s5"),
-        # BLOCK_N = 128 defaults to 9 stages (8 with one staging slot): 9 carries no suffix, 7 does
-        (
-            dict(a_mn=False, b_mn=False, block_n=128, stages=9),
-            "dense_proj_gemm_kk_n128",
-        ),
-        (
-            dict(a_mn=False, b_mn=False, block_n=128, stages=7),
-            "dense_proj_gemm_kk_n128_s7",
-        ),
-        (
-            dict(a_mn=False, b_mn=False, block_n=128, epi="tma", slots=1, stages=8),
-            "dense_proj_gemm_kk_n128_tma1",
-        ),
-        # TMA L2 eviction hints (A, B): first letters after ``_h``; L2 promotion and prefetch distance
-        (
-            dict(a_mn=False, b_mn=False, block_n=128, hints=("evict_first", "none")),
-            "dense_proj_gemm_kk_n128_hen",
-        ),
-        # first letters only, as the Cake host writes them: evict_first / evict_last -> ``_hee``
-        (
-            dict(a_mn=False, b_mn=False, hints=("evict_first", "evict_last")),
-            "dense_proj_gemm_kk_n256_hee",
-        ),
-        (
-            dict(a_mn=False, b_mn=False, hints=("none", "evict_normal")),
-            "dense_proj_gemm_kk_n256_hne",
-        ),
-        # the TMA L2 promotion is a launch parameter since round 11: no symbol suffix, not a key field
-        (dict(a_mn=False, b_mn=False, pf=4), "dense_proj_gemm_kk_n256_pf4"),
-        # the raster group width is a launch parameter since round 11: no symbol suffix, not a key field
-        (
-            dict(
-                a_mn=True,
-                b_mn=True,
-                out_f32=True,
-                slots=1,
-                hints=("evict_first", "none"),
-            ),
-            "dense_proj_gemm_nn_n256_hen_f32_tma1",
-        ),
-        (
-            dict(
-                a_mn=False,
-                b_mn=False,
-                pf=2,
-                hints=("evict_first", "none"),
-                epi="tma",
-                slots=1,
-            ),
-            "dense_proj_gemm_kk_n256_pf2_hen_tma1",
-        ),
-        (
-            dict(
-                a_mn=False,
-                b_mn=False,
-                epi="tma",
-                slots=1,
-                hints=("evict_first", "none"),
-            ),
-            "dense_proj_gemm_kk_n256_hen_tma1",
-        ),
-        (
-            dict(
-                a_mn=True,
-                b_mn=True,
-                out_t=True,
-                block_n=128,
-                hints=("evict_first", "none"),
-            ),
-            "dense_proj_gemm_nn_n128_hen_t",
-        ),
-        (
-            dict(
-                a_mn=True,
-                b_mn=True,
-                out_t=True,
-                out_f32=True,
-                block_n=128,
-                hints=("evict_first", "none"),
-            ),
-            "dense_proj_gemm_nn_n128_hen_f32_t",
-        ),
-        # round 7: the quad-transposed bf16 register epilogue (``_q``); the pinned stage count keeps its suffix
-        (
-            dict(a_mn=False, b_mn=True, epi="reg", quad_store=True),
-            "dense_proj_gemm_kn_n256_q",
-        ),
-        (
-            dict(a_mn=False, b_mn=True, stages=6, epi="reg", quad_store=True),
-            "dense_proj_gemm_kn_n256_q_s6",
-        ),
-        # round 9: the 64-row Layout-B family (``_m64``); its default is the deepest pipeline that fits
-        # (9 at BLOCK_N = 256): 9 carries no suffix, 6 does
-        (dict(a_mn=False, b_mn=False, cta_rows=64), "dense_proj_gemm_kk_n256_m64"),
-        (dict(a_mn=False, b_mn=True, cta_rows=64), "dense_proj_gemm_kn_n256_m64"),
-        (
-            dict(a_mn=False, b_mn=False, cta_rows=64, stages=9),
-            "dense_proj_gemm_kk_n256_m64",
-        ),
-        (
-            dict(a_mn=False, b_mn=False, cta_rows=64, stages=6),
-            "dense_proj_gemm_kk_n256_m64_s6",
-        ),
-        (
-            dict(a_mn=False, b_mn=False, cta_rows=64, epi="tma", slots=1),
-            "dense_proj_gemm_kk_n256_m64_tma1",
-        ),
-        (
-            dict(a_mn=False, b_mn=False, block_n=128, cta_rows=64, out_f32=True),
-            "dense_proj_gemm_kk_n128_m64_f32_tma1",
-        ),
-        # BLOCK_N = 160 / 224 and the 64-row BLOCK_N = 192: register epilogues (no whole 32 / 64-column chunks)
-        (dict(a_mn=False, b_mn=False, block_n=160), "dense_proj_gemm_kk_n160"),
-        (
-            dict(a_mn=False, b_mn=True, block_n=224, out_f32=True),
-            "dense_proj_gemm_kn_n224_f32",
-        ),
-        (
-            dict(a_mn=False, b_mn=True, block_n=192, cta_rows=64, out_f32=True),
-            "dense_proj_gemm_kn_n192_m64_f32",
-        ),
-        # round 13: the tall family's overlapped single-TMEM-buffer epilogue (``_ov``), the deterministic
-        # half-height tail wave (``_ht``) and the parked epilogue (``_pk``); suffix order after ``_q``
-        (
-            dict(a_mn=False, b_mn=False, cta_rows=256, ovl=True),
-            "dense_proj_gemm_kk_n256_m256_ov",
-        ),
-        (
-            dict(a_mn=False, b_mn=True, cta_rows=256, ovl=True, htail=True),
-            "dense_proj_gemm_kn_n256_m256_ov_ht",
-        ),
-        (
-            dict(a_mn=False, b_mn=False, cta_rows=256, htail=True),
-            "dense_proj_gemm_kk_n256_m256_ht",
-        ),
-        (
-            dict(a_mn=False, b_mn=False, cta_rows=256, park=True),
-            "dense_proj_gemm_kk_n256_m256_pk",
-        ),
-        # round 13 (W3): narrow MN-major B panels (``_bz64`` right after the tile family) and the exact p-way
-        # stream-K split (trailing ``_skx``); K-major B instances always keep the 128-byte panel (no suffix)
-        (
-            dict(a_mn=True, b_mn=True, block_n=160, cta_rows=256, b_swz=64),
-            "dense_proj_gemm_nn_n160_m256_bz64",
-        ),
-        (
-            dict(
-                a_mn=True,
-                b_mn=True,
-                block_n=192,
-                out_t=True,
-                b_swz=64,
-                hints=("evict_first", "evict_first"),
-            ),
-            "dense_proj_gemm_nn_n192_bz64_hee_t",
-        ),
-        (
-            dict(
-                a_mn=True,
-                b_mn=True,
-                block_n=128,
-                out_t=True,
-                hints=("evict_first", "none"),
-                sk_exact=True,
-            ),
-            "dense_proj_gemm_nn_n128_hen_t_skx",
-        ),
-        (
-            dict(
-                a_mn=True,
-                b_mn=True,
-                block_n=128,
-                cta_rows=64,
-                out_t=True,
-                out_f32=True,
-                hints=("evict_first", "none"),
-                sk_exact=True,
-            ),
-            "dense_proj_gemm_nn_n128_m64_hen_f32_t_skx",
-        ),
-        (
-            dict(a_mn=False, b_mn=False, block_n=256, b_swz=64),
-            "dense_proj_gemm_kk_n256",
-        ),
-        # round 13 (W3, L38b): the batch-entry raster of the batched MLA rows (trailing ``_bg{G}`` / ``_bf``)
-        (
-            dict(a_mn=False, b_mn=True, epi="tma", slots=1, batch_group=8),
-            "dense_proj_gemm_kn_n256_tma1_bg8",
-        ),
-        (
-            dict(
-                a_mn=False, b_mn=True, cta_rows=256, epi="tma", slots=1, batch_group=4
-            ),
-            "dense_proj_gemm_kn_n256_m256_tma1_bg4",
-        ),
-        (
-            dict(a_mn=False, b_mn=True, epi="tma", slots=1, batch_group=1),
-            "dense_proj_gemm_kn_n256_tma1_bf",
-        ),
-        # round 13 (W4): the fp32 v8 register stores with L1::no_allocate.L2::evict_first (``_ef`` right after ``_v8``)
-        (
-            dict(
-                a_mn=False,
-                b_mn=True,
-                out_f32=True,
-                epi="reg",
-                f32_v8=True,
-                store_ef=True,
-            ),
-            "dense_proj_gemm_kn_n256_f32_v8_ef",
-        ),
-        (
-            dict(
-                a_mn=False,
-                b_mn=True,
-                out_f32=True,
-                epi="reg",
-                f32_v8=True,
-                store_ef=True,
-                stages=9,
-            ),
-            "dense_proj_gemm_kn_n256_f32_v8_ef_s9",
-        ),
-        # round 14 (W3): the transposed TMA-store epilogue of the swapped MLA weight gradients (``_t_tma1``)
-        (
-            dict(
-                a_mn=True,
-                b_mn=True,
-                out_t=True,
-                block_n=192,
-                cta_rows=256,
-                epi="tma",
-                slots=1,
-            ),
-            "dense_proj_gemm_nn_n192_m256_t_tma1",
-        ),
-        (
-            dict(
-                a_mn=True,
-                b_mn=True,
-                out_t=True,
-                block_n=256,
-                cta_rows=256,
-                epi="tma",
-                slots=1,
-            ),
-            "dense_proj_gemm_nn_n256_m256_t_tma1",
-        ),
-        (
-            dict(
-                a_mn=True,
-                b_mn=True,
-                out_t=True,
-                block_n=192,
-                cta_rows=256,
-                b_swz=64,
-                hints=("evict_first", "evict_first"),
-                epi="tma",
-                slots=1,
-            ),
-            "dense_proj_gemm_nn_n192_m256_bz64_hee_t_tma1",
-        ),
-        (
-            dict(
-                a_mn=False,
-                b_mn=True,
-                epi="tma",
-                slots=1,
-                batch_group=8,
-                store_hint="evict_last",
-            ),
-            "dense_proj_gemm_kn_n256_tma1_bg8_sol",
-        ),
-        (
-            dict(a_mn=False, b_mn=True, epi="tma", slots=2, pd=2),
-            "dense_proj_gemm_kn_n256_tma2_pd2",
-        ),
-        (
-            dict(a_mn=False, b_mn=True, epi="reg", quad_store=True, pd=1),
-            "dense_proj_gemm_kn_n256_q_pd1",
-        ),
-        # round 19 (Cake W2): the slab path of the synchronised stream-K fixup (``_sb<n>`` right after ``_sks``)
-        (
-            dict(a_mn=True, b_mn=True, cta_rows=256, sk_sync=True, sk_slab=2),
-            "dense_proj_gemm_nn_n256_m256_sks_sb2",
-        ),
-        (
-            dict(
-                a_mn=True,
-                b_mn=True,
-                cta_rows=256,
-                out_f32=True,
-                slots=1,
-                sk_sync=True,
-                sk_slab=3,
-            ),
-            "dense_proj_gemm_nn_n256_m256_f32_tma1_sks_sb3",
-        ),
-        (
-            dict(
-                a_mn=True,
-                b_mn=True,
-                out_t=True,
-                block_n=192,
-                b_swz=64,
-                sk_sync=True,
-                sk_slab=2,
-            ),
-            "dense_proj_gemm_nn_n192_bz64_t_sks_sb2",
-        ),
-        # round 19 (Cake W3): the single-CTA form (trailing ``_c1``; ``_s<n>`` relative to its own stage default)
-        (
-            dict(a_mn=False, b_mn=False, block_n=128, cta1=True),
-            "dense_proj_gemm_kk_n128_c1",
-        ),
-        (
-            dict(
-                a_mn=False,
-                b_mn=True,
-                out_f32=True,
-                block_n=128,
-                slots=2,
-                stages=4,
-                cta1=True,
-            ),
-            "dense_proj_gemm_kn_n128_f32_tma2_s4_c1",
-        ),
+        ("sm_100a", 148, 28),
+        ("sm_103a", 152, 32),
+        ("sm_103a", 148, 28),
+        ("sm_107a", 216, 29),
+        ("sm_107a", 212, 19),
+        ("sm_107a", 208, 14),
+        ("sm_107a", 210, 0),
     ],
 )
-def test_instance_symbols(kwargs, symbol):
-    assert instance_symbol(instance_key(**kwargs)) == symbol
-
-
-def test_round14_transposed_tma_store_instances():
-    """Round 14 (W3): a transposed box stages CH_T_COLS output rows per chunk, so the swapped MLA weight-gradient tiles
-    (BLOCK_N 192 / 256 x 256 rows) take ``epi="tma"`` while the row-major bf16 192-column tile has no whole 64-column
-    chunk path (the round-14 export run died on this mirror check).  [Cake ``instance_key`` L1259-L1261]"""
-    key = instance_key(
-        a_mn=True, b_mn=True, out_t=True, block_n=192, cta_rows=256, epi="tma", slots=1
-    )
-    assert key[3] is True and key[7] == "tma" and key[8] == 1
-    assert instance_symbol(key) == "dense_proj_gemm_nn_n192_m256_t_tma1"
-    with pytest.raises(ValueError, match="128-byte column chunks"):
-        instance_key(
-            a_mn=True, b_mn=True, block_n=192, cta_rows=256, epi="tma", slots=1
-        )
-    with pytest.raises(ValueError, match="transposed TMA-store"):
-        instance_key(
-            a_mn=True,
-            b_mn=True,
-            out_t=True,
-            block_n=160,
-            cta_rows=256,
-            epi="tma",
-            slots=1,
-        )
-
-
-def test_round13_w3_knobs():
-    # fields 18 / 19 of the 20-field key: b_swz (128 for K-major B whatever the caller asks), sk_exact; the narrow panel
-    # shrinks the B stage (160 columns: 3 x 32-column panels = 12 KiB instead of 2 x 64-column = 16 KiB) and the
-    # default stage count follows the deepest fit; ovl needs the 128-byte panel; htail and sk_exact exclude each other
-    key = instance_key(a_mn=True, b_mn=True, block_n=160, cta_rows=256, b_swz=64)
-    assert (
-        len(key) == 32
-        and key[18] == 64
-        and key[19] is False
-        and key[20] == 0
-        and key[21] is False
-    )
-    assert instance_key(a_mn=False, b_mn=False, b_swz=64)[18] == 128
-    assert (
-        b_stage_bytes(True, 160, 64) == 3 * 64 * 64
-        and b_stage_bytes(True, 160, 128) == 2 * 64 * 128
-    )
-    assert default_stages(0, 256, 160, True, 64) >= default_stages(
-        0, 256, 160, True, 128
-    )
-    assert (
-        instance_key(a_mn=True, b_mn=True, block_n=128, out_t=True, sk_exact=True)[19]
-        is True
-    )
-    with pytest.raises(ValueError):
-        instance_key(a_mn=True, b_mn=True, block_n=160, cta_rows=256, b_swz=48)
-    with pytest.raises(ValueError):
-        instance_key(a_mn=False, b_mn=True, cta_rows=256, ovl=True, b_swz=64)
-    with pytest.raises(ValueError):
-        instance_key(a_mn=False, b_mn=False, cta_rows=256, htail=True, sk_exact=True)
-
-
-def test_round13_batch_group_knob():
-    # field 20 of the 21-field key: the batch-entry raster (0 off, 1 every entry, G > 1 groups); negative values raise
-    assert instance_key(a_mn=False, b_mn=True, batch_group=8)[20] == 8
-    assert instance_key(a_mn=False, b_mn=True)[20] == 0
-    with pytest.raises(ValueError, match="batch_group"):
-        instance_key(a_mn=False, b_mn=True, batch_group=-1)
-
-
-def test_round13_store_ef_knob():
-    # field 21 of the 22-field key: the hint exists only on the fp32 v8 register store form
-    assert (
-        instance_key(
-            a_mn=False, b_mn=True, out_f32=True, epi="reg", f32_v8=True, store_ef=True
-        )[21]
-        is True
-    )
-    assert (
-        instance_key(a_mn=False, b_mn=True, out_f32=True, epi="reg", store_ef=True)[21]
-        is False
-    )
-    assert (
-        instance_key(a_mn=False, b_mn=True, out_f32=True, f32_v8=True, store_ef=True)[
-            21
-        ]
-        is False
-    )  # TMA-store fp32 epilogue: no v8 stores
-    assert instance_key(a_mn=False, b_mn=True, store_ef=True)[21] is False
-
-
-def test_round15_store_hint_knob():
-    # field 22 of the 25-field key (round 15, Cake W3): the L2 eviction policy of the TMA-store epilogue's bulk
-    # tensor stores (symbol ``_so<f|l|n>``); the register epilogues carry no operand, so the field is forced to
-    # "none" there (one key per register-epilogue instance) and an unknown policy raises
-    key = instance_key(
-        a_mn=False, b_mn=True, epi="tma", slots=1, store_hint="evict_last"
-    )
-    assert len(key) == 32 and key[22] == "evict_last"
-    assert instance_symbol(key) == "dense_proj_gemm_kn_n256_tma1_sol"
-    assert (
-        instance_key(a_mn=False, b_mn=True, epi="reg", store_hint="evict_last")[22]
-        == "none"
-    )
-    assert instance_key(a_mn=False, b_mn=True)[22] == "none"
-    with pytest.raises(ValueError, match="store_hint"):
-        instance_key(
-            a_mn=False, b_mn=True, epi="tma", slots=1, store_hint="evict_sometimes"
-        )
-    # the round-15 sm_107a rule: the batched MLA qabs forward (N = 512, K = 192) plans the 8-head interleave with
-    # evict_last stores; sm_100a keeps the round-13 plan without the operand
-    v = _views("mla", "qabs", "fwd", "bf16", 1001)
-    r200, *_ = plan_dense_projection_gemm(
-        v["A"],
-        v["B"],
-        v["out"],
-        sm_count=212,
-        l2_bytes=L2_BYTES,
-        arch="sm_107a",
-        _fallback=False,
-    )
-    assert r200.store_hint == "evict_last" and r200.batch_group == 8
-    assert _nopro(r200.template) == "dense_proj_gemm_kn_n256_tma1_bg8_sol"
-    b200, *_ = plan_dense_projection_gemm(
-        v["A"],
-        v["B"],
-        v["out"],
-        sm_count=148,
-        l2_bytes=L2_BYTES,
-        arch="sm_100a",
-        _fallback=False,
-    )
-    assert b200.store_hint == "none" and "_so" not in _nopro(b200.template)
-
-
-def test_round15_pd_sh_knobs():
-    # fields 23 / 24 of the 26-field key (round 15, Cake W1): the pipelined TMEM drain form of the 128-row single-pass
-    # family (1 = in-tile chunk pipelining, 2 = cross-tile prefetch, 3 = both chunks in flight; ``_pd<n>``) and the
-    # suspend-time hint of the free-running waits in ns (``_sh<n>``); both 0 when off, validated like the Cake kernel
-    key = instance_key(a_mn=False, b_mn=True, epi="tma", slots=2, pd=2)
-    assert len(key) == 32 and key[23] == 2 and key[24] == 0
-    assert instance_symbol(key) == "dense_proj_gemm_kn_n256_tma2_pd2"
-    assert (
-        instance_key(a_mn=False, b_mn=True)[23:]
-        == (
-            0,
-            0,
-            False,
-            0,
-            False,
-            False,
-            False,
-            False,
-            0,
-        )
-    )  # ... followed by the round-18 sk_sync flag, the round-19 sk_slab / cta1 fields, the round-21 cgrp flag, the round-24 ovr flag, the round-27 stt flag and the round-33 pro knob (0 = off)
-    assert (
-        instance_symbol(
-            instance_key(a_mn=False, b_mn=True, epi="tma", slots=2, pd=2, sh=1000)
-        )
-        == "dense_proj_gemm_kn_n256_tma2_pd2_sh1000"
-    )
-    with pytest.raises(ValueError, match="pd must be one of"):
-        instance_key(a_mn=False, b_mn=True, pd=4)
-    with pytest.raises(ValueError, match="pd needs cta_rows=128"):
-        instance_key(a_mn=False, b_mn=True, cta_rows=256, pd=2)
-    with pytest.raises(ValueError, match="one chunk per slice"):
-        instance_key(a_mn=False, b_mn=True, block_n=128, pd=1)
-    with pytest.raises(ValueError, match="suspendTimeHint"):
-        instance_key(a_mn=False, b_mn=True, sh=-1)
-    # the round-15 rules: the sm_107a indexer_k bf16 input gradient (N = 6144, K = 128) plans the 128-row two-slot
-    # TMA-store family with the cross-tile pipelined drain; a caller-forced tall tile drops the family knob
-    v = _views("proj", "indexer_k", "dgrad", "bf16", 1001)
-    r200, *_ = plan_dense_projection_gemm(
-        v["A"],
-        v["B"],
-        v["out"],
-        sm_count=212,
-        l2_bytes=L2_BYTES,
-        arch="sm_107a",
-        _fallback=False,
-    )
-    assert r200.pd == 2 and r200.slots == 2 and r200.cta_rows == 128
-    assert _nopro(r200.template) == "dense_proj_gemm_kn_n256_tma2_pd2"
-    tall, *_ = plan_dense_projection_gemm(
-        v["A"],
-        v["B"],
-        v["out"],
-        sm_count=212,
-        l2_bytes=L2_BYTES,
-        arch="sm_107a",
-        _fallback=False,
-        cta_rows=256,
-    )
-    assert tall.pd == 0 and "_pd" not in _nopro(tall.template)
-
-
-def test_sk_exact_plan_mirrors_cake():
-    # 24 tail tiles on 106 pairs, 96 K blocks: 3 parts of 32 steps -> 72 units, one segment each; a 2-part split of 3 K
-    # blocks is refused (part under SK_MIN_ITERS), as is a split whose last part would be empty
-    assert sk_exact_plan(24, 96, 106, 3) == (0, 24, 72, 32)
-    assert sk_exact_plan(130, 96, 106, 2) == (106, 24, 48, 48)
-    assert sk_exact_plan(24, 96, 106, 1) is None  # fewer than two parts
-    assert sk_exact_plan(212, 96, 106, 3) is None  # no tail
-    assert (
-        sk_exact_plan(24, SK_MIN_ITERS, 106, 2) is None
-    )  # a part under SK_MIN_ITERS steps
-    assert (
-        sk_exact_plan(24, 72, 106, 10) is None
-    )  # ceil(72 / 10) = 8 steps x 9 parts already cover K: empty last part
-    assert sk_exact_plan(24, 73, 106, 10) == (
-        0,
-        24,
-        240,
-        8,
-    )  # ... one more K block and the tenth part is non-empty
-
-
-def test_sk_sync_plan_mirrors_cake():
-    # round 18 (Cake W2): the synchronised stream-K plan (num_full, tail, tail + collectors, s, collectors) with the
-    # balanced main length s = ceil(q K / (q + 1)) and the rule's margin m: s = ceil((q K + m) / (q + 1)).  kv_a weight
-    # gradient on 106 pairs: 72 tail tiles, 34 collectors of up to q = 3 leftovers over K = 254 steps -> s 191 balanced,
-    # 200 with the rule's m = 38; the 1.81-wave 6144 x 2048 rows: 192 tiles -> 86 tails, 20 collectors (q = 5), s 212 /
-    # 216 (m = 26); the tall 64-tile B200 indexer_q row on 74 pairs: 10 collectors of 7 leftovers, s 223
-    assert sk_sync_plan(72, 254, 106) == (0, 72, 106, 191, 34)
-    assert sk_sync_plan(72, 254, 106, None, 38) == (0, 72, 106, 200, 34)
-    assert sk_sync_plan(192, 254, 106) == (106, 86, 106, 212, 20)
-    assert sk_sync_plan(192, 254, 106, None, 26) == (106, 86, 106, 216, 20)
-    assert sk_sync_plan(64, 254, 74) == (0, 64, 74, 223, 10)
-    assert sk_sync_plan(72, 254, 106, 173) == (
-        0,
-        72,
-        106,
-        173,
-        34,
-    )  # an explicit s (sweeps only)
-    assert sk_sync_plan(212, 254, 106) is None  # no tail
-    assert sk_sync_plan(106, 254, 106) is None  # a full wave: no collector
-    assert (
-        sk_sync_plan(72, 254, 74) is None
-    )  # 2 collectors x 36 leftovers: K - s = 6 < SK_MIN_ITERS
-    # the short-K rows admit the plan arithmetically (W3's q_a fwd observation: 1536 tiles on 106 pairs, 52 tails,
-    # q = 1, s = 16) - the rules never ask for it there (the fixup costs more than the 16-step unit)
-    assert sk_sync_plan(1536, 32, 106) == (1484, 52, 104, 16, 52)
-    assert sk_sync_plan(52, 32, 74) == (0, 52, 74, 24, 22)
-    assert (
-        sk_sync_plan(52, 30, 74) is None
-    )  # q = 3: s = 23 leaves 7 steps < SK_MIN_ITERS
-    with_margin = sk_sync_plan(72, 254, 106, None, 400)
-    assert (
-        with_margin is None
-    )  # a margin that leaves the collectors under SK_MIN_ITERS steps is refused
-
-
-def test_round13_knob_normalisation():
-    # the 20-field key carries park / ovl / htail at fields 15 / 16 / 17; ovl is a 256-row x 256-column tall-tile
-    # knob (narrower or shorter tiles raise), htail needs the 256-row family or (round 16, Cake W2) the 128-row standard
-    # family with the 256-column row-major tile and the plain drain, park only the bf16 row-major tall store
-    key = instance_key(a_mn=False, b_mn=False, cta_rows=256, ovl=True, htail=True)
-    assert len(key) == 32 and key[15] is False and key[16] is True and key[17] is True
-    assert (
-        instance_key(a_mn=False, b_mn=False, cta_rows=256, out_f32=True, park=True)[15]
-        is False
-    )
-    with pytest.raises(ValueError):
-        instance_key(a_mn=False, b_mn=False, cta_rows=256, block_n=192, ovl=True)
-    key128 = instance_key(a_mn=False, b_mn=True, cta_rows=128, htail=True)
-    assert key128[17] is True and instance_symbol(key128).endswith("_ht")
-    with pytest.raises(ValueError):
-        instance_key(a_mn=False, b_mn=True, cta_rows=128, block_n=192, htail=True)
-    with pytest.raises(ValueError):
-        instance_key(a_mn=False, b_mn=True, cta_rows=128, htail=True, pd=1)
-    with pytest.raises(ValueError):
-        instance_key(a_mn=True, b_mn=True, out_t=True, cta_rows=128, htail=True)
-    with pytest.raises(ValueError):
-        instance_key(a_mn=False, b_mn=False, cta_rows=64, htail=True)
-    with pytest.raises(ValueError):
-        instance_key(a_mn=False, b_mn=False, cta_rows=256, park=True, ovl=True)
-
-
-def test_quad_store_knob_normalisation():
-    # only the row-major bf16 register epilogue carries the quad-store knob: fp32 output, the TMA-store
-    # epilogue and the transposed store drop it from the key (and the symbol); field 14 of the 20-field key
-    assert instance_key(a_mn=False, b_mn=True, epi="reg", quad_store=True)[14] is True
-    assert (
-        instance_key(a_mn=False, b_mn=True, out_f32=True, epi="reg", quad_store=True)[
-            14
-        ]
-        is False
-    )
-    assert (
-        instance_key(a_mn=False, b_mn=True, epi="tma", slots=1, quad_store=True)[14]
-        is False
-    )
-    assert (
-        instance_key(a_mn=True, b_mn=True, out_t=True, epi="reg", quad_store=True)[14]
-        is False
-    )
-    assert (
-        instance_key(a_mn=False, b_mn=True, block_n=128, epi="reg", quad_store=True)[14]
-        is True
-    )
-    # whole 64-column groups per warp slice: not at BLOCK_N = 160 / 192 / 224 (80 / 96 / 112 columns) nor on
-    # 64-row tiles below BLOCK_N = 256
-    for block_n in (160, 192, 224):
-        assert (
-            instance_key(
-                a_mn=False, b_mn=True, block_n=block_n, epi="reg", quad_store=True
-            )[14]
-            is False
-        )
-    assert (
-        instance_key(a_mn=False, b_mn=True, cta_rows=64, epi="reg", quad_store=True)[14]
-        is True
-    )
-    assert (
-        instance_key(
-            a_mn=False, b_mn=True, block_n=128, cta_rows=64, epi="reg", quad_store=True
-        )[14]
-        is False
-    )
-    assert (
-        instance_symbol(
-            instance_key(
-                a_mn=False, b_mn=True, out_f32=True, epi="reg", quad_store=True
-            )
-        )
-        == "dense_proj_gemm_kn_n256_f32"
-    )
-
-
-def test_default_stages_by_tile_shape():
-    # 32 KiB stages at BLOCK_N = 256, 24 KiB stages at BLOCK_N = 128 (deeper pipeline for the
-    # streaming-bound small-N rows), 48 KiB stages for tall 256-row tiles; one fewer per staging slot
-    assert [default_stages(s, 128, 256) for s in (0, 1, 2)] == [7, 6, 5]
-    assert [default_stages(s, 128, 128) for s in (0, 1, 2)] == [9, 8, 6]
-    assert [default_stages(s, 256, 256) for s in (0, 1, 2)] == [4, 4, 3]
-    assert [default_stages(s, 256, 128) for s in (0, 1, 2)] == [4, 4, 3]
-    assert default_stages(0) == 7 and default_stages(1) == 6
-    assert default_stages(0, 128, 160) == 7 and default_stages(1, 128, 224) == 6
-    # 64-row Layout-B tiles (round 9): the deepest pipeline that fits the 227 KiB opt-in beside the staging
-    # (32 KiB per slot), at most 12: 24 KiB stages at BLOCK_N = 256, 16 KiB at 128, 20 KiB at K-major 192
-    # (MN-major B streams two whole 64-column panels there: 24 KiB)
-    assert [default_stages(s, 64, 256) for s in (0, 1, 2)] == [9, 8, 6]
-    assert [default_stages(s, 64, 128) for s in (0, 1, 2)] == [12, 12, 10]
-    assert [default_stages(s, 64, 192) for s in (0, 1, 2)] == [11, 9, 8]
-    assert [default_stages(s, 64, 192, b_mn=True) for s in (0, 1, 2)] == [9, 8, 6]
-    assert [default_stages(s, 64, 256, b_mn=True) for s in (0, 1, 2)] == [9, 8, 6]
-    # the default stage count carries no symbol suffix; anything else does
-    assert instance_key(a_mn=False, b_mn=False, block_n=128)[5] == 9
-    assert instance_key(a_mn=False, b_mn=False, block_n=128, epi="tma", slots=1)[5] == 8
-    assert instance_key(a_mn=False, b_mn=False, cta_rows=256)[5] == 4
-    assert instance_key(a_mn=False, b_mn=False, cta_rows=64)[5] == 9
-    assert instance_key(a_mn=False, b_mn=False, block_n=128, cta_rows=64)[5] == 12
-    assert instance_key(a_mn=False, b_mn=True, block_n=192, cta_rows=64)[5] == 9
-
-
-def test_sk_sync_rule_yields_to_caller_forced_forms():
-    # round 18 (Cake launcher parity): the sm_107a 6144 x 2048 weight-gradient rule (q_a / shared_gate_up) plans the
-    # synchronised stream-K tail of the 128-row family (192 pair tiles on 106 pairs -> 86 tails, 20 collectors, s = 216
-    # with the rule's margin 26).  The plan is admitted per family and needs the single-pass / serialised tall epilogue,
-    # so a caller-forced tall tile or epilogue form on the row gets that form with the plain plan (the Cake e2e
-    # registrations of the ``_m256`` / ``_ov`` programs), while a caller-forced ``sk_sync`` keeps raising on the conflict
-    v = _views("proj", "q_a", "wgrad", "bf16", 16231)
-    kw = dict(sm_count=212, l2_bytes=L2_BYTES, arch="sm_107a", _fallback=False)
-    rule, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], **kw)
-    assert (
-        rule.sk_sync and rule.cta_rows == 128 and "_sks" in _nopro(rule.template)
-    )  # round 25: the row's rule adds the slab path (`_sks_sb2`)
-    assert (rule.num_full, rule.tail_tiles, rule.sk_units, rule.iters_per_unit) == (
-        106,
-        86,
-        106,
-        216,
-    )
-    assert rule.sk_iters == 86 and rule.sk_collectors == 20
-    tall, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], cta_rows=256, **kw)
-    assert (
-        not tall.sk_sync
-        and tall.cta_rows == 256
-        and "_sks" not in _nopro(tall.template)
-    )
-    assert tall.sk_iters == tall.tail_tiles and tall.sk_collectors == 0
-    ov, *_ = plan_dense_projection_gemm(
-        v["A"], v["B"], v["out"], cta_rows=256, ovl=True, **kw
-    )
-    assert not ov.sk_sync and ov.ovl and "_ov" in _nopro(ov.template)
-    with pytest.raises(ValueError, match="sk_sync needs the single-pass"):
-        plan_dense_projection_gemm(
-            v["A"], v["B"], v["out"], cta_rows=256, ovl=True, sk_sync=True, **kw
-        )
-
-
-def test_round19_sk_slab_knob():
-    # field 27 of the 30-field key (round 19, Cake W2): the slab path of the synchronised stream-K fixup (symbol
-    # ``_sb<n>``: 1 = early arrival, 2 = + the bulk slab read through the dead mainloop stages, 3 = + the fp32 output as
-    # the slab).  It exists only on the ``_sks`` programs (forced to 0 without ``sk_sync``, so every other instance keeps
-    # one key); 3 needs an fp32 output through the TMA-store or the transposed register epilogue; 2 needs the eight warp
-    # slabs (EPI_WARPS x epi_cols x 128 B) to fit the mainloop stage ring
-    key = instance_key(a_mn=True, b_mn=True, cta_rows=256, sk_sync=True, sk_slab=2)
-    assert len(key) == 32 and key[25] is True and key[26] == 2 and key[27] is False
-    assert instance_symbol(key) == "dense_proj_gemm_nn_n256_m256_sks_sb2"
-    assert instance_key(a_mn=True, b_mn=True, cta_rows=256, sk_slab=2)[26] == 0
-    assert instance_key(a_mn=True, b_mn=True, cta_rows=256, sk_slab=2) == instance_key(
-        a_mn=True, b_mn=True, cta_rows=256
-    )
-    f32 = instance_key(
-        a_mn=True,
-        b_mn=True,
-        cta_rows=256,
-        out_f32=True,
-        slots=1,
-        sk_sync=True,
-        sk_slab=3,
-    )
-    assert f32[7] == "tma" and f32[26] == 3
-    assert instance_symbol(f32) == "dense_proj_gemm_nn_n256_m256_f32_tma1_sks_sb3"
-    # the transposed register path of an fp32 output carries the output-as-slab form too (red.global.add.f32)
-    assert (
-        instance_key(
-            a_mn=True,
-            b_mn=True,
-            out_f32=True,
-            out_t=True,
-            block_n=192,
-            b_swz=64,
-            sk_sync=True,
-            sk_slab=3,
-        )[26]
-        == 3
-    )
-    assert (
-        instance_symbol(
-            instance_key(
-                a_mn=True,
-                b_mn=True,
-                out_t=True,
-                block_n=192,
-                b_swz=64,
-                sk_sync=True,
-                sk_slab=1,
-            )
-        )
-        == "dense_proj_gemm_nn_n192_bz64_t_sks_sb1"
-    )
-    with pytest.raises(ValueError, match="sk_slab must be one of"):
-        instance_key(a_mn=True, b_mn=True, sk_sync=True, sk_slab=4)
-    with pytest.raises(ValueError, match="sk_slab=3"):
-        instance_key(
-            a_mn=True, b_mn=True, cta_rows=256, sk_sync=True, sk_slab=3
-        )  # bf16 output
-    with pytest.raises(ValueError, match="sk_slab=3"):
-        # the row-major fp32 register epilogue has no reduce-add store path
-        instance_key(
-            a_mn=True, b_mn=True, out_f32=True, epi="reg", sk_sync=True, sk_slab=3
-        )
-    with pytest.raises(ValueError, match="too small"):
-        # 8 x 128 x 128 B of warp slabs do not fit two 32 KiB stages
-        instance_key(a_mn=True, b_mn=True, sk_sync=True, sk_slab=2, stages=2)
-    # without ``sk_sync`` the knob is inert, so the sk_slab=3 / stage-ring conflicts above do not raise either
-    assert instance_key(a_mn=True, b_mn=True, cta_rows=256, sk_slab=3)[26] == 0
-    assert instance_key(a_mn=True, b_mn=True, sk_slab=2, stages=2)[26] == 0
-
-
-def test_round19_cta1_knob():
-    # field 28 of the 30-field key (LAST until round 21's ``cgrp``; round 19, Cake W3): the single-CTA form of the 128-row single-pass family
-    # (symbol ``_c1``, cluster dims 1, cta_group::1 MMA into private TMEM, CLC per CTA).  Its B stage streams the whole
-    # BLOCK_N columns per CTA (32 KiB stages at BLOCK_N 128, 48 KiB at 256), so the default stage count is the deepest
-    # single-CTA fit and ``_s<n>`` is relative to it; it excludes the tall / 64-row families, the pair-level tail
-    # policies / probes and the batched raster knob
-    key = instance_key(a_mn=False, b_mn=False, block_n=128, cta1=True)
-    assert len(key) == 32 and key[27] is True and key[26] == 0 and key[5] == 7
-    assert instance_symbol(key) == "dense_proj_gemm_kk_n128_c1"
-    assert b_stage_bytes(False, 128, 128, 1) == 2 * b_stage_bytes(False, 128) == 16384
-    assert b_stage_bytes(True, 256, 128, 1) == 2 * b_stage_bytes(True, 256) == 32768
-    assert [default_stages(s, 128, 128, False, 128, 1) for s in (0, 1, 2)] == [7, 6, 5]
-    assert [default_stages(s, 128, 256, False, 128, 1) for s in (0, 1, 2)] == [4, 4, 3]
-    assert box_rows_of(False, False, 128, None, 128, 1) == (128, 128)
-    assert box_rows_of(False, False, 128, None, 128) == (128, 64)
-    f32 = instance_key(
-        a_mn=False, b_mn=True, out_f32=True, block_n=128, slots=2, stages=4, cta1=True
-    )
-    assert f32[5] == 4 and f32[7] == "tma" and f32[8] == 2 and f32[27] is True
-    assert instance_symbol(f32) == "dense_proj_gemm_kn_n128_f32_tma2_s4_c1"
-    assert (
-        instance_symbol(
-            instance_key(
-                a_mn=False, b_mn=True, out_f32=True, block_n=128, slots=2, cta1=True
-            )
-        )
-        == "dense_proj_gemm_kn_n128_f32_tma2_c1"
-    )  # five stages = the single-CTA default (six on the pair form)
-    assert (
-        instance_key(a_mn=False, b_mn=True, out_f32=True, block_n=128, slots=2)[5] == 6
-    )
-    for bad in (
-        dict(cta_rows=256),
-        dict(cta_rows=64),
-        dict(sk_sync=True),
-        dict(htail=True),
-        dict(sk_exact=True),
-        dict(batch_group=8),
-    ):
-        with pytest.raises(ValueError, match="cta1 needs cta_rows=128"):
-            instance_key(a_mn=False, b_mn=True, cta1=True, **bad)
-    with pytest.raises(ValueError, match="cta1 needs cta_rows=128"):
-        instance_key(a_mn=False, b_mn=False, cta_rows=256, ovl=True, cta1=True)
-    with pytest.raises(ValueError, match="cta1 needs cta_rows=128"):
-        instance_key(a_mn=False, b_mn=False, cta_rows=256, park=True, cta1=True)
-    # a 48 KiB single-CTA stage at BLOCK_N 256: eight of them exceed every SMEM limit
-    with pytest.raises(ValueError, match="SMEM"):
-        instance_key(a_mn=False, b_mn=False, stages=8, cta1=True)
-
-
-@pytest.mark.parametrize("T", [16231, 16172])
-def test_round19_cta1_plans_one_cta_per_tile(T):
-    # the single-CTA form through the planner (caller-forced here; the sm_100a indexer forward rules select it): the
-    # tile count is not rounded to pairs, the work items are CTA tiles, the concurrent units are the SMs (the hint
-    # working-set gate takes them as the Cake launcher's ``_sm_units``), the grid is one CTA per tile with no tail
-    # policy, and the raster group may be any count >= 1  [Cake launcher]
-    v = _views("proj", "indexer_hw", "fwd", "bf16", T)
-    kw = dict(sm_count=148, l2_bytes=L2_BYTES, arch="sm_100a", _fallback=False)
-    plan, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], cta1=True, **kw)
-    assert plan.cta1 and _nopro(plan.template) == "dense_proj_gemm_kk_n128_hen_c1"
-    assert (plan.m_tiles, plan.n_tiles, plan.pair_tiles, plan.sm_pairs) == (
-        127,
-        1,
-        127,
-        148,
-    )
-    assert (plan.num_full, plan.tail_tiles, plan.sk_units) == (127, 0, 0)
-    assert plan.grid == (plan.m_tiles * plan.n_tiles, 1, 1) == (127, 1, 1)
-    assert plan.stages == 7 and plan.ws_f32_elems == 0 and plan.sk_slab == 0
-    assert plan.wave_working_set_bytes == wave_working_set(127, 1, 6144, 16, 148)
-    pair, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], cta1=False, **kw)
-    assert not pair.cta1 and _nopro(pair.template) == "dense_proj_gemm_kk_n128_hen"
-    assert (pair.m_tiles, pair.pair_tiles, pair.sm_pairs, pair.stages) == (
-        128,
-        64,
-        74,
-        9,
-    )
-    assert pair.grid == (128, 1, 1)
-    # a raster group of one is admitted under cta1 only
-    one, *_ = plan_dense_projection_gemm(
-        v["A"], v["B"], v["out"], cta1=True, group_m=1, **kw
-    )
-    assert one.group_m == 1 and _nopro(one.template) == _nopro(plan.template)
-    with pytest.raises(ValueError, match="group_m must be an even number"):
-        plan_dense_projection_gemm(
-            v["A"], v["B"], v["out"], cta1=False, group_m=1, **kw
-        )
-    # the form carries no tail policy: a caller combining it with one asked for two incompatible forms
-    for bad in (
-        dict(sk=True),
-        dict(sk_sync=True),
-        dict(htail=True),
-        dict(sk_exact=3),
-        dict(sk_parts=2),
-        dict(sk_max_units=48),
-    ):
-        with pytest.raises(ValueError, match="cta1 excludes"):
-            plan_dense_projection_gemm(v["A"], v["B"], v["out"], cta1=True, **bad, **kw)
-    # a small T: one wave's panels fit the L2, so the form keeps the hint-free program
-    small = _views("proj", "indexer_hw", "fwd", "bf16", 2049)
-    short, *_ = plan_dense_projection_gemm(
-        small["A"], small["B"], small["out"], cta1=True, **kw
-    )
-    assert _nopro(short.template) == "dense_proj_gemm_kk_n128_c1" and short.grid == (
-        17,
-        1,
-        1,
-    )
-
-
-@pytest.mark.parametrize("T", [16231, 16172])
-def test_round19_rules_plan_like_the_cake_launcher(T):
-    # the round-19 sm_100a rules (Cake 97c4ca33270): the indexer_hw / indexer_k forwards and the fp32 indexer_hw
-    # input gradient take the single-CTA form (Cake W3, lever D), the indexer_q weight gradients the synchronised
-    # stream-K tail with the slab path (Cake W2: main-unit margin 62, the bulk slab read for bf16, the fp32 output as
-    # the slab for fp32); sm_107a keeps its round-18 rules
-    for key in (
-        ("sm_100a", False, False, False, False, False, 32, 6144, None),
-        ("sm_100a", False, False, False, False, False, 128, 6144, None),
-    ):
-        assert ROW_RULES[key] == {"cta1": True}
-    assert ROW_RULES[("sm_100a", False, True, True, False, False, 6144, 32, None)] == {
-        "block_n": 128,
-        "slots": 2,
-        "stages": 4,
-        "cta1": True,
-    }
-    assert ROW_RULES[
-        ("sm_100a", True, True, False, False, False, 2048, None, 4096)
-    ] == {
-        "cta_rows": 256,
-        "sk_sync": True,
-        "sk_sync_m": 62,
-        "sk_slab": 2,
-    }
-    assert ROW_RULES[("sm_100a", True, True, True, False, False, 2048, None, 4096)] == {
-        "cta_rows": 256,
-        "sk_sync": True,
-        "sk_sync_m": 62,
-        "sk_slab": 3,
-    }
-    # the table size is asserted by the newest round's test (round 20: 98 = 49 + 49); round 19 shipped 97 = 48 + 49
-    kw = dict(sm_count=148, l2_bytes=L2_BYTES, arch="sm_100a", _fallback=False)
-    # the 32- / 128-column indexer forwards: one 128 x 128 tile per CTA, 127 tiles on 148 SMs, whole tiles, the
-    # streaming A operand evict_first (one column tile, the wave's panels exceed the L2)
-    for row in ("indexer_hw", "indexer_k"):
-        v = _views("proj", row, "fwd", "bf16", T)
-        plan, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], **kw)
-        assert (
-            plan.cta1 and _nopro(plan.template) == "dense_proj_gemm_kk_n128_hen_c1"
-        ), row
-        assert (plan.m_tiles, plan.n_tiles, plan.sm_pairs) == (127, 1, 148)
-        assert plan.grid == (plan.m_tiles * plan.n_tiles, 1, 1) == (127, 1, 1)
-        assert (plan.num_full, plan.sk_units, plan.sk_slab, plan.stages) == (
-            127,
-            0,
-            0,
-            7,
-        )
-    # the fp32 indexer_hw input gradient: the two-slot BLOCK_N 128 TMA-store staging with four 32 KiB single-CTA
-    # stages (``_s4``: the single-CTA default is five), 127 x 48 tiles; a caller forcing the pair form drops the
-    # rule's stage count (the pair default of that family is six)
-    v = _views("proj", "indexer_hw", "dgrad", "f32", T)
-    plan, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], **kw)
-    assert (
-        plan.cta1 and _nopro(plan.template) == "dense_proj_gemm_kn_n128_f32_tma2_s4_c1"
-    )
-    assert (plan.m_tiles, plan.n_tiles, plan.stages, plan.sm_pairs) == (127, 48, 4, 148)
-    assert plan.grid == (127 * 48, 1, 1) and plan.sk_units == 0
-    pair, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], cta1=False, **kw)
-    assert not pair.cta1 and _nopro(pair.template) == "dense_proj_gemm_kn_n128_f32_tma2"
-    assert (pair.m_tiles, pair.stages, pair.sm_pairs) == (128, 6, 74)
-    # the indexer_q weight gradients (G.T @ X, both MN-major, K = T): 64 tall tiles on 74 pairs -> 64 main units of
-    # s = ceil((7 x kb + 62) / 8) = 230 K steps (kb = 253 / 254 K blocks at T 16172 / 16231) + 10 collectors, one slab
-    # per tail tile; bf16 reads the slab back
-    # through the dead mainloop stages (sb2), fp32 reduce-adds into the output through the TMA-store path (sb3)
-    v = _views("proj", "indexer_q", "wgrad", "bf16", T)
-    assert not v["transposed"]
-    bf16, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], **kw)
-    assert bf16.sk_sync and bf16.sk_slab == 2
-    assert _nopro(bf16.template) == "dense_proj_gemm_nn_n256_m256_sks_sb2"
-    assert (bf16.pair_tiles, bf16.k_blocks, bf16.sm_pairs) == (64, -(-T // BLOCK_K), 74)
-    assert (
-        bf16.num_full,
-        bf16.tail_tiles,
-        bf16.sk_units,
-        bf16.iters_per_unit,
-        bf16.sk_collectors,
-    ) == (0, 64, 74, 230, 10)
-    assert bf16.grid == (148, 1, 1) and bf16.sk_iters == 64
-    assert bf16.ws_f32_elems == 64 * 2 * 256 * 256
-    vf = _views("proj", "indexer_q", "wgrad", "f32", T)
-    f32, *_ = plan_dense_projection_gemm(vf["A"], vf["B"], vf["out"], **kw)
-    assert f32.sk_sync and f32.sk_slab == 3 and f32.epi == "tma"
-    assert _nopro(f32.template) == "dense_proj_gemm_nn_n256_m256_f32_tma1_sks_sb3"
-    assert (f32.num_full, f32.tail_tiles, f32.sk_units, f32.iters_per_unit) == (
-        0,
-        64,
-        74,
-        230,
-    )
-    # the launcher's yield rules for the rule's slab path: the row-major fp32 register epilogue has no reduce-add
-    # store, so a caller forcing it keeps the synchronised plan with the bulk slab read; a caller-forced two-stage
-    # pipeline cannot stage the eight 16 KiB warp slabs, so the row keeps the plain synchronised program; a
-    # caller-forced ``sk_slab`` keeps raising on such a conflict, and a caller-forced tile family drops the rule's
-    # synchronised plan with its slab path
-    reg, *_ = plan_dense_projection_gemm(vf["A"], vf["B"], vf["out"], epi="reg", **kw)
-    assert reg.sk_sync and reg.sk_slab == 2
-    assert _nopro(reg.template) == "dense_proj_gemm_nn_n256_m256_f32_sks_sb2"
-    narrow, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], stages=2, **kw)
-    assert narrow.sk_sync and narrow.sk_slab == 0
-    assert _nopro(narrow.template) == "dense_proj_gemm_nn_n256_m256_s2_sks"
-    with pytest.raises(ValueError, match="sk_slab=3"):
-        plan_dense_projection_gemm(v["A"], v["B"], v["out"], sk_slab=3, **kw)
-    with pytest.raises(ValueError, match="too small"):
-        plan_dense_projection_gemm(v["A"], v["B"], v["out"], stages=2, sk_slab=2, **kw)
-    std, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], cta_rows=128, **kw)
-    assert not std.sk_sync and std.sk_slab == 0 and "_sks" not in _nopro(std.template)
-    off, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], sk=False, **kw)
-    assert not off.sk_sync and _nopro(off.template) == "dense_proj_gemm_nn_n256_m256"
-    # at the test tables' T the synchronised plan is not admitted (a part under SK_MIN_ITERS): the plain tall plan
-    for short_T in (2049, 1001):
-        vs = _views("proj", "indexer_q", "wgrad", "bf16", short_T)
-        short, *_ = plan_dense_projection_gemm(vs["A"], vs["B"], vs["out"], **kw)
-        assert (
-            not short.sk_sync
-            and short.sk_slab == 0
-            and "_sb" not in _nopro(short.template)
-        )
-
-
-@pytest.mark.parametrize("T", [16172, 16231])
-def test_round20_rules_plan_like_the_cake_launcher(T):
-    # the round-20 sm_100a rule (Cake e7494f02f70): the shared_down input gradient bf16 (G @ W, 2048 x 6144 x T)
-    # takes the raster group 8 like the fp32 shared_down input gradient and the q_a / shared_gate_up input gradients
-    # (kn, 6144 x 2048) - a launch parameter of the unchanged ``kn_n256`` program (16 is the row's former default);
-    # sm_107a keeps its round-19 rules
-    key = ("sm_100a", False, True, False, False, False, 2048, 6144, None)
-    assert ROW_RULES[key] == {"group_m": 8, "pro": 0}
-    assert ROW_RULES[
-        ("sm_100a", False, True, False, False, False, 6144, 2048, None)
-    ] == {"group_m": 8}
-    # the table size is asserted by the newest round's test (round 21: 98 = 49 + 49); round 20 shipped 98 = 49 + 49
-    kw = dict(sm_count=148, l2_bytes=L2_BYTES, arch="sm_100a", _fallback=False)
-    v = _views("proj", "shared_down", "dgrad", "bf16", T)
-    plan, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], **kw)
-    assert _nopro(plan.template) == "dense_proj_gemm_kn_n256" and not plan.cta1
-    assert plan.group_m == 8
-    assert (
-        default_group_m(False, True, plan.m_tiles, plan.pair_tiles, plan.sm_pairs) == 16
-    )
-    # a caller-forced raster group overrides the rule on the same program
-    forced, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], group_m=16, **kw)
-    assert _nopro(forced.template) == _nopro(plan.template) and forced.group_m == 16
-    # the shared_down forward (X @ W^T, 6144 x 2048) has no rule and keeps the 16-row default on ``kk_n256``
-    f = _views("proj", "shared_down", "fwd", "bf16", T)
-    fwd, *_ = plan_dense_projection_gemm(f["A"], f["B"], f["out"], **kw)
-    assert fwd.group_m == 16 and _nopro(fwd.template) == "dense_proj_gemm_kk_n256"
-
-
-@pytest.mark.parametrize("T", [16172, 16231])
-def test_round21_rules_plan_like_the_cake_launcher(T):
-    # the round-21 sm_100a rule (Cake e3e42a19d84; W2, lever A): the kv_a input gradient bf16 (G @ W, 6144 x 576 x T) leaves the
-    # six-stage 128-row quad register epilogue (``kn_n256_q_s6``: epi reg, stages 6, quad_store) for the one-slot TMA-store epilogue
-    # with the two-chunk cross-tile pipelined TMEM drain (``kn_n256_tma1_pd2``); the raster group 8 is kept.  A zero-code instance
-    # change: no instance-key field is added; sm_107a keeps its round-20 rules (the kv_a row there stays on the quad stores + pd 1)
-    key = ("sm_100a", False, True, False, False, False, 6144, 576, None)
-    assert ROW_RULES[key] == {
-        "group_m": 8,
-        "slots": 1,
-        "epi": "tma",
-        "pd": 2,
-        "pro": 15,
-    }
-    assert ROW_RULES[
-        ("sm_107a", False, True, False, False, False, 6144, 576, None)
-    ] == {
-        "group_m": 8,
-        "epi": "reg",
-        "quad_store": True,
-        "pd": 1,
-    }
-    assert ROW_RULES[("sm_100a", False, True, True, False, False, 6144, 576, None)] == {
-        "group_m": 8,
-        "promo": "l2_256b",
-    }
-    # the table size is asserted by the newest round's test (round 26: 103 = 49 + 54); round 25 shipped 100 = 49 + 51; round 24 shipped 100 = 49 + 51; round 21 shipped 98 = 49 + 49
-    kw = dict(sm_count=148, l2_bytes=L2_BYTES, arch="sm_100a", _fallback=False)
-    v = _views("proj", "kv_a", "dgrad", "bf16", T)
-    plan, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], **kw)
-    assert _nopro(plan.template) == "dense_proj_gemm_kn_n256_tma1_pd2" and not plan.cta1
-    assert (
-        plan.epi,
-        plan.slots,
-        plan.pd,
-        plan.group_m,
-        plan.cta_rows,
-        plan.block_n,
-    ) == ("tma", 1, 2, 8, 128, 256)
-    # a caller forcing the former form still plans the round-20 program of the row; the rule's ``pd`` carries over
-    # into a forced form unless the caller sets it (``pd=0``), exactly as in the Cake launcher
-    old, *_ = plan_dense_projection_gemm(
-        v["A"], v["B"], v["out"], epi="reg", quad_store=True, stages=6, pd=0, **kw
-    )
-    assert (
-        _nopro(old.template) == "dense_proj_gemm_kn_n256_q_s6"
-        and old.pd == 0
-        and old.group_m == 8
-    )
-    # the sibling rows keep their programs: the sm_107a kv_a bf16 input gradient (quad stores + in-tile drain), the fp32 kv_a input
-    # gradient (one-slot TMA store, no drain) and the indexer_hw bf16 input gradient (two-slot TMA store + the cross-tile drain)
-    kw107 = dict(sm_count=212, l2_bytes=L2_BYTES, arch="sm_107a", _fallback=False)
-    p107, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], **kw107)
-    assert (
-        _nopro(p107.template) == "dense_proj_gemm_kn_n256_q_pd1" and p107.group_m == 8
-    )
-    f = _views("proj", "kv_a", "dgrad", "f32", T)
-    pf, *_ = plan_dense_projection_gemm(f["A"], f["B"], f["out"], **kw)
-    assert _nopro(pf.template) == "dense_proj_gemm_kn_n256_f32_tma1" and pf.pd == 0
-    h = _views("proj", "indexer_hw", "dgrad", "bf16", T)
-    ph, *_ = plan_dense_projection_gemm(h["A"], h["B"], h["out"], **kw)
-    assert _nopro(ph.template) == "dense_proj_gemm_kn_n256_tma2_pd2"
-    # round 21 (W3, lever B): the sm_100a shared_gate_up forward bf16 (X @ W^T, 2048 x 6144 x T) keeps its raster group 8
-    # and takes the column-grouped raster form (``kk_n256_cg``, instance-key field 29: the group counts column tiles);
-    # the q_a forward shares the row key (6144 -> 2048) and therefore the rule; sm_107a had no rule on the key in round 21
-    # and kept the row-grouped ``kk_n256`` - since round 24 it carries the same rule (test_round24_rules_plan_like_the_cake_launcher
-    # row (d)), so the round-21 form is planned here with the caller-forced ``cgrp=False``
-    assert ROW_RULES[
-        ("sm_100a", False, False, False, False, False, 2048, 6144, None)
-    ] == {
-        "group_m": 8,
-        "cgrp": True,
-    }
-    g = _views("proj", "shared_gate_up", "fwd", "bf16", T)
-    pg, *_ = plan_dense_projection_gemm(g["A"], g["B"], g["out"], **kw)
-    assert (
-        pg.cgrp
-        and _nopro(pg.template) == "dense_proj_gemm_kk_n256_cg"
-        and pg.group_m == 8
-    )
-    pg107, *_ = plan_dense_projection_gemm(
-        g["A"], g["B"], g["out"], cgrp=False, **kw107
-    )
-    assert not pg107.cgrp and _nopro(pg107.template) == "dense_proj_gemm_kk_n256"
-    q = _views("proj", "q_a", "fwd", "bf16", T)
-    pq, *_ = plan_dense_projection_gemm(q["A"], q["B"], q["out"], **kw)
-    assert (
-        pq.cgrp
-        and _nopro(pq.template) == "dense_proj_gemm_kk_n256_cg"
-        and pq.group_m == 8
-    )
-
-
-@pytest.mark.parametrize("T", [16172, 16231])
-def test_round24_rules_plan_like_the_cake_launcher(T):
-    # the round-24 rule changes (Cake 02c04ba1831): six sm_107a rules - the indexer_hw input gradient bf16 takes the single-CTA
-    # form with the pd 3 drain (cta1, slots 2, group_m 2), the indexer_hw input gradient fp32 takes the single-CTA form with one
-    # staging slot at BLOCK_N 128 (cta1, group_m 2), the NEW shared_down weight gradient bf16 key takes the synchronised stream-K
-    # tail with the bulk-slab fixup (sk_sync, sk_sync_m 38, sk_slab 2), the NEW q_a / shared_gate_up forward bf16 key takes the
-    # column-grouped raster (group_m 8, cgrp), the dense_down forward bf16 adds the row-half release and the column-grouped raster
-    # (ovr, cgrp, group_m 12) to its cta_rows 256 / sk_parts 3 rule, and the o_proj forward bf16 replaces ovl by ovr and adds the
-    # column-grouped raster (cgrp, group_m 8) to its cta_rows 256 / htail rule; no sm_100a rule changes
-    # the table size is asserted by the newest round's test (round 26: 103 = 49 + 54); round 25 shipped 100 = 49 + 51; round 24 shipped 100 = 49 + 51
-    kw = dict(sm_count=148, l2_bytes=L2_BYTES, arch="sm_100a", _fallback=False)
-    kw107 = dict(sm_count=212, l2_bytes=L2_BYTES, arch="sm_107a", _fallback=False)
-    # ---- (a) indexer_hw input gradient bf16 (G @ W, 6144 x 32 x T): the single-CTA form with the pd 3 drain replaces the
-    #      pair form's pd 2 drain (lock 6f98f5dd: dense_proj_gemm_kn_n256_tma2_pd2); raster group 2 and the two staging slots are kept ----
-    hkey = ("sm_107a", False, True, False, False, False, 6144, 32, None)
-    assert ROW_RULES[hkey] == {
-        "cta_rows": 128,
-        "slots": 2,
-        "pd": 3,
-        "group_m": 2,
-        "cta1": True,
-    }
-    h = _views("proj", "indexer_hw", "dgrad", "bf16", T)
-    ph, *_ = plan_dense_projection_gemm(h["A"], h["B"], h["out"], **kw107)
-    # TEMPLATES_REACHED_NEW (the kernel's rule comment names kn_n256_tma2_pd3_c1: K = 32 <= K_TMA_BF16 keeps the row's two-slot
-    # TMA-store epilogue; the K-less by-kwargs identity render kn_n256_pd3_c1 is the register-epilogue sibling, not this plan)
-    assert _nopro(ph.template) == "dense_proj_gemm_kn_n256_tma2_pd3_c1" and ph.cta1
-    assert (ph.epi, ph.slots, ph.pd, ph.group_m, ph.cta_rows, ph.block_n) == (
-        "tma",
-        2,
-        3,
-        2,
-        128,
-        256,
-    )
-    # a caller forcing the former form still plans the round-21 program of the row (pd passed explicitly)
-    old_h, *_ = plan_dense_projection_gemm(
-        h["A"], h["B"], h["out"], cta1=False, pd=2, **kw107
-    )
-    assert (
-        _nopro(old_h.template) == "dense_proj_gemm_kn_n256_tma2_pd2" and not old_h.cta1
-    )
-    # the control row indexer_k (K 128 is another key) and the sm_100a sibling keep their round-21 programs
-    k_ = _views("proj", "indexer_k", "dgrad", "bf16", T)
-    pk, *_ = plan_dense_projection_gemm(k_["A"], k_["B"], k_["out"], **kw107)
-    assert _nopro(pk.template) == "dense_proj_gemm_kn_n256_tma2_pd2" and not pk.cta1
-    ph100, *_ = plan_dense_projection_gemm(h["A"], h["B"], h["out"], **kw)
-    assert (
-        _nopro(ph100.template) == "dense_proj_gemm_kn_n256_tma2_pd2" and not ph100.cta1
-    )
-    # ---- (b) indexer_hw input gradient fp32 (6144 x 32 x T): the single-CTA form with ONE staging slot replaces the pair
-    #      form's two-slot TMA store (lock 6f98f5dd: dense_proj_gemm_kn_n128_f32_tma2); BLOCK_N 128 and raster group 2 are kept ----
-    fkey = ("sm_107a", False, True, True, False, False, 6144, 32, None)
-    assert ROW_RULES[fkey] == {"block_n": 128, "slots": 1, "group_m": 2, "cta1": True}
-    f = _views("proj", "indexer_hw", "dgrad", "f32", T)
-    pf, *_ = plan_dense_projection_gemm(f["A"], f["B"], f["out"], **kw107)
-    assert (
-        _nopro(pf.template) == "dense_proj_gemm_kn_n128_f32_tma1_c1" and pf.cta1
-    )  # TEMPLATES_REACHED_NEW (the kernel's rule comment names kn_n128_f32_tma1_c1)
-    assert (pf.epi, pf.slots, pf.group_m, pf.cta_rows, pf.block_n) == (
-        "tma",
-        1,
-        2,
-        128,
-        128,
-    )
-    old_f, *_ = plan_dense_projection_gemm(
-        f["A"], f["B"], f["out"], cta1=False, slots=2, **kw107
-    )
-    assert (
-        _nopro(old_f.template) == "dense_proj_gemm_kn_n128_f32_tma2" and not old_f.cta1
-    )
-    # ---- (c) NEW key: shared_down weight gradient bf16 (nn, 2048 x 6144 over T): the synchronised stream-K tail with the
-    #      bulk-slab fixup (main-unit margin 38 K steps) replaces the plain pair program (lock 6f98f5dd: dense_proj_gemm_nn_n256) ----
-    wkey = ("sm_107a", True, True, False, False, False, 2048, None, 6144)
-    assert ROW_RULES[wkey] == {"sk_sync": True, "sk_sync_m": 38, "sk_slab": 2}
-    w = _views("proj", "shared_down", "wgrad", "bf16", T)
-    pw, *_ = plan_dense_projection_gemm(w["A"], w["B"], w["out"], **kw107)
-    assert (
-        _nopro(pw.template) == "dense_proj_gemm_nn_n256_sks_sb2"
-        and pw.sk_sync
-        and pw.sk_slab == 2
-    )  # TEMPLATES_REACHED_NEW (by-kwargs identity: nn_n256_sks_sb2)
-    old_w, *_ = plan_dense_projection_gemm(
-        w["A"], w["B"], w["out"], sk_sync=False, **kw107
-    )
-    assert (
-        _nopro(old_w.template) == "dense_proj_gemm_nn_n256"
-        and not old_w.sk_sync
-        and old_w.sk_slab == 0
-    )
-    # round 25 re-rules the sm_100a shared_down weight gradient onto the synchronised tail as well ({"group_m": 4, "sk_sync": True,
-    # "sk_sync_m": 26, "sk_slab": 2}) - asserted by test_round25_rules_plan_like_the_cake_launcher; in round 24 it kept {"group_m": 4, "sk_exact": 3}
-    # ---- (d) NEW key: q_a / shared_gate_up forward bf16 (X @ W^T, 2048 x 6144 x T, shared key; the sm_107a twin of the round-21
-    #      sm_100a lever B rule): the column-grouped raster with 8 column tiles per group; both sibling rows ----
-    gkey = ("sm_107a", False, False, False, False, False, 2048, 6144, None)
-    assert ROW_RULES[gkey] == {"group_m": 8, "cgrp": True, "pro": 15}
-    assert ROW_RULES[
-        ("sm_100a", False, False, False, False, False, 2048, 6144, None)
-    ] == {"group_m": 8, "cgrp": True}  # unchanged since round 21
-    for row in ("q_a", "shared_gate_up"):
-        g = _views("proj", row, "fwd", "bf16", T)
-        pg, *_ = plan_dense_projection_gemm(g["A"], g["B"], g["out"], **kw107)
-        # TEMPLATES_REACHED_NEW / the figen tables (dense_proj_gemm_kk_n256_cg = the round-21 sm_100a program; the cgrp hint gate stays
-        # ('none', 'none') at 106 pairs - wave_working_set_cgrp(128, 8, 6144, 8, 106) = 22 x 256 x 6144 x 2 B = 69 206 016 B <= L2_BYTES)
-        assert (
-            pg.cgrp
-            and _nopro(pg.template) == "dense_proj_gemm_kk_n256_cg"
-            and pg.group_m == 8
-        ), row
-        old_g, *_ = plan_dense_projection_gemm(
-            g["A"], g["B"], g["out"], cgrp=False, **kw107
-        )
-        assert not old_g.cgrp and _nopro(old_g.template) == "dense_proj_gemm_kk_n256", (
-            row
-        )  # lock 6f98f5dd: the row-grouped kk_n256
-    # ---- (e) dense_down forward bf16 (X @ W^T, 6144 x 12288 x T): the tall family released by row half (ovr, instance-key field 30) with the
-    #      column-grouped raster of 12 column tiles per group, on top of the row's sk_parts 3 tail (lock 6f98f5dd: dense_proj_gemm_kk_n256_m256) ----
-    dkey = ("sm_107a", False, False, False, False, False, 6144, 12288, None)
-    assert ROW_RULES[dkey] == {
-        "cta_rows": 256,
-        "sk_parts": 3,
-        "ovr": True,
-        "cgrp": True,
-        "group_m": 12,
-    }
-    d = _views("proj", "dense_down", "fwd", "bf16", T)
-    pd_, *_ = plan_dense_projection_gemm(d["A"], d["B"], d["out"], **kw107)
-    # TEMPLATES_REACHED_NEW: the `_cg_or` tall program WITHOUT `_ht` (sk_parts is the row's tail policy; by-kwargs identity: kk_n256_m256_cg_or)
-    assert (
-        _nopro(pd_.template) == "dense_proj_gemm_kk_n256_m256_cg_or"
-        and pd_.ovr
-        and pd_.cgrp
-        and not pd_.ovl
-        and not pd_.htail
-    )
-    assert (pd_.cta_rows, pd_.block_n, pd_.group_m) == (256, 256, 12)
-    old_d, *_ = plan_dense_projection_gemm(
-        d["A"], d["B"], d["out"], ovr=False, cgrp=False, **kw107
-    )
-    assert (
-        _nopro(old_d.template) == "dense_proj_gemm_kk_n256_m256"
-        and not old_d.ovr
-        and not old_d.cgrp
-    )  # the round-21 program (pair form, row raster)
-    # ---- (f) o_proj forward bf16 (6144 x 16384 x T): ovr REPLACES ovl on the row (the rule drops ovl) and the column-grouped raster takes 8 column
-    #      tiles per group; the half-height tail wave is kept (lock 6f98f5dd: dense_proj_gemm_kk_n256_m256_ov_ht) ----
-    okey = ("sm_107a", False, False, False, False, False, 6144, 16384, None)
-    assert ROW_RULES[okey] == {
-        "cta_rows": 256,
-        "htail": True,
-        "ovr": True,
-        "cgrp": True,
-        "group_m": 8,
-    }
-    o = _views("proj", "o_proj", "fwd", "bf16", T)
-    po, *_ = plan_dense_projection_gemm(o["A"], o["B"], o["out"], **kw107)
-    # TEMPLATES_REACHED_NEW (the kernel registers dense_projection_gemm_kk_m256_ht_or_cg -> symbol ..._m256_ht_cg_or)
-    assert (
-        _nopro(po.template) == "dense_proj_gemm_kk_n256_m256_ht_cg_or"
-        and po.ovr
-        and po.cgrp
-        and po.htail
-        and not po.ovl
-    )
-    assert (po.cta_rows, po.block_n, po.group_m) == (256, 256, 8)
-    old_o, *_ = plan_dense_projection_gemm(
-        o["A"], o["B"], o["out"], ovr=False, ovl=True, cgrp=False, **kw107
-    )
-    assert (
-        _nopro(old_o.template) == "dense_proj_gemm_kk_n256_m256_ov_ht"
-        and old_o.ovl
-        and not old_o.ovr
-    )
-    # the sm_100a dense_down / o_proj forwards carry no ovr rule and keep their round-21 programs
-    pd100, *_ = plan_dense_projection_gemm(d["A"], d["B"], d["out"], **kw)
-    assert (
-        _nopro(pd100.template) == "dense_proj_gemm_kk_n256_m256_ov_ht"
-        and not pd100.ovr
-        and not pd100.cgrp
-    )
-    po100, *_ = plan_dense_projection_gemm(o["A"], o["B"], o["out"], **kw)
-    assert (
-        _nopro(po100.template) == "dense_proj_gemm_kk_n256_m256_ov_ht"
-        and not po100.ovr
-        and not po100.cgrp
-        and po100.group_m == 8
-    )
-
-
-@pytest.mark.parametrize("T", [16172, 16231])
-def test_round25_rules_plan_like_the_cake_launcher(T):
-    # the round-25 rule changes (Cake f397cd4da99): seven weight-gradient rules move to the synchronised stream-K tail with the two-slab
-    # fixup - on sm_107a the fp32 shared_down (margin 38) and q_a / shared_gate_up (margin 26) weight gradients leave the round-2 tall tile
-    # for the 128-row tail with the register epilogue (f32_v8 + store_ef), the bf16 q_a / shared_gate_up weight gradient adds the slab path
-    # to its round-18 synchronised tail; on sm_100a the bf16 and fp32 weight gradients of shared_down / q_a / shared_gate_up replace the
-    # round-16 exact 3-way tail split (sk_exact 3) by the synchronised tail with margin 26 and the slab path, keeping their raster groups and
-    # fp32 register epilogue.  No key is added or removed and no instance-key field changes.
-    # the table size is asserted by the newest round's test (round 26: 103 = 49 + 54); round 25 shipped 100 = 49 + 51
-    kw = dict(sm_count=148, l2_bytes=L2_BYTES, arch="sm_100a", _fallback=False)
-    kw107 = dict(sm_count=212, l2_bytes=L2_BYTES, arch="sm_107a", _fallback=False)
-    # ---- (a) sm_107a shared_down weight gradient fp32 (nn, 2048 x 6144 over T): the 128-row synchronised stream-K tail (main-unit margin
-    #      38 K steps, two-slab fixup) with the fp32 v8 evict-first register epilogue replaces the round-2 tall tile (lock e9d8042b:
-    #      dense_proj_gemm_nn_n256_m256_f32_tma1 through the rule {"cta_rows": 256}) ----
-    sdf_key = ("sm_107a", True, True, True, False, False, 2048, None, 6144)
-    assert ROW_RULES[sdf_key] == {
-        "sk_sync": True,
-        "sk_sync_m": 38,
-        "sk_slab": 2,
-        "epi": "reg",
-        "f32_v8": True,
-        "store_ef": True,
-    }
-    sdf = _views("proj", "shared_down", "wgrad", "f32", T)
-    p_sdf, *_ = plan_dense_projection_gemm(sdf["A"], sdf["B"], sdf["out"], **kw107)
-    assert (
-        _nopro(p_sdf.template) == "dense_proj_gemm_nn_n256_f32_v8_ef_sks_sb2"
-    )  # ROUTE_TEMPLATE_NEW of the round-25 templates step = TEMPLATES_REACHED_NEW (nn_n256_f32_v8_ef_sks_sb2, the round-25 sweep symbol)
-    assert (
-        p_sdf.sk_sync
-        and p_sdf.sk_slab == 2
-        and p_sdf.sk_exact == 0
-        and p_sdf.epi == "reg"
-        and p_sdf.store_ef
-    )
-    assert (p_sdf.cta_rows, p_sdf.block_n) == (128, 256) and not p_sdf.htail
-    # a caller forcing the former tall form plans the lock-e9d8042b program of the row (the forced cta_rows leaves the rule's 128-row family,
-    # so the planner drops the rule's epilogue / tail knobs; sk_sync and the TMA-store epilogue are passed explicitly all the same)
-    old_sdf, *_ = plan_dense_projection_gemm(
-        sdf["A"], sdf["B"], sdf["out"], cta_rows=256, sk_sync=False, epi="tma", **kw107
-    )
-    assert (
-        _nopro(old_sdf.template) == "dense_proj_gemm_nn_n256_m256_f32_tma1"
-        and not old_sdf.sk_sync
-        and old_sdf.cta_rows == 256
-    )
-    # ---- (b) sm_107a q_a / shared_gate_up weight gradient fp32 (nn, 6144 x 2048 over T; one shared key): the same lever with the bf16
-    #      sibling's margin 26 (lock e9d8042b: dense_proj_gemm_nn_n256_m256_f32_tma1 through {"cta_rows": 256}); both sibling rows ----
-    qaf_key = ("sm_107a", True, True, True, False, False, 6144, None, 2048)
-    assert ROW_RULES[qaf_key] == {
-        "sk_sync": True,
-        "sk_sync_m": 26,
-        "sk_slab": 2,
-        "epi": "reg",
-        "f32_v8": True,
-        "store_ef": True,
-    }
-    for row in ("q_a", "shared_gate_up"):
-        v = _views("proj", row, "wgrad", "f32", T)
-        p, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], **kw107)
-        assert _nopro(p.template) == "dense_proj_gemm_nn_n256_f32_v8_ef_sks_sb2", (
-            row
-        )  # ROUTE_TEMPLATE_NEW of the round-25 templates step = TEMPLATES_REACHED_NEW (nn_n256_f32_v8_ef_sks_sb2)
-        assert (
-            p.sk_sync
-            and p.sk_slab == 2
-            and p.sk_exact == 0
-            and p.epi == "reg"
-            and p.store_ef
-            and p.cta_rows == 128
-        ), row
-        old, *_ = plan_dense_projection_gemm(
-            v["A"], v["B"], v["out"], cta_rows=256, sk_sync=False, epi="tma", **kw107
-        )
-        assert (
-            _nopro(old.template) == "dense_proj_gemm_nn_n256_m256_f32_tma1"
-            and not old.sk_sync
-        ), row
-    # ---- (c) sm_107a q_a / shared_gate_up weight gradient bf16 (nn, 6144 x 2048 over T; one shared key): the two-slab fixup joins the
-    #      round-18 synchronised tail (lock e9d8042b: dense_proj_gemm_nn_n256_sks through {"sk_sync": True, "sk_sync_m": 26}); the plan
-    #      arithmetic of the synchronised tail is unchanged by the slab path (192 pair tiles on 106 pairs: 86 tails, 20 collectors, s = 216,
-    #      asserted by test_sk_sync_rule_yields_to_caller_forced_forms) ----
-    qab_key = ("sm_107a", True, True, False, False, False, 6144, None, 2048)
-    assert ROW_RULES[qab_key] == {"sk_sync": True, "sk_sync_m": 26, "sk_slab": 2}
-    for row in ("q_a", "shared_gate_up"):
-        v = _views("proj", row, "wgrad", "bf16", T)
-        p, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], **kw107)
-        assert _nopro(p.template) == "dense_proj_gemm_nn_n256_sks_sb2", (
-            row
-        )  # ROUTE_TEMPLATE_NEW of the round-25 templates step (nn_n256_sks_sb2 = the round-24 sm_107a shared_down wgrad bf16 program, no new template)
-        assert p.sk_sync and p.sk_slab == 2 and p.cta_rows == 128, row
-        old, *_ = plan_dense_projection_gemm(
-            v["A"], v["B"], v["out"], sk_slab=0, **kw107
-        )
-        assert (
-            _nopro(old.template) == "dense_proj_gemm_nn_n256_sks"
-            and old.sk_sync
-            and old.sk_slab == 0
-        ), row  # lock e9d8042b
-    # the sm_107a shared_down weight gradient bf16 keeps its round-20 rule ({"sk_sync": True, "sk_sync_m": 38, "sk_slab": 2}) and program
-    assert ROW_RULES[
-        ("sm_107a", True, True, False, False, False, 2048, None, 6144)
-    ] == {"sk_sync": True, "sk_sync_m": 38, "sk_slab": 2}
-    sdb107 = _views("proj", "shared_down", "wgrad", "bf16", T)
-    p_ctl, *_ = plan_dense_projection_gemm(
-        sdb107["A"], sdb107["B"], sdb107["out"], **kw107
-    )
-    assert (
-        _nopro(p_ctl.template) == "dense_proj_gemm_nn_n256_sks_sb2"
-        and p_ctl.sk_sync
-        and p_ctl.sk_slab == 2
-    )
-    # ---- (d) sm_100a shared_down weight gradient bf16 (nn, 2048 x 6144 over T): the synchronised tail (margin 26) with the two-slab fixup
-    #      replaces the round-16 exact 3-way split of the 44-tile tail wave; the raster group 4 is kept (lock e9d8042b: dense_proj_gemm_nn_n256_skx
-    #      through {"group_m": 4, "sk_exact": 3}) ----
-    sdb_key = ("sm_100a", True, True, False, False, False, 2048, None, 6144)
-    assert ROW_RULES[sdb_key] == {
-        "group_m": 4,
-        "sk_sync": True,
-        "sk_sync_m": 26,
-        "sk_slab": 2,
-    }
-    p_sdb, *_ = plan_dense_projection_gemm(
-        sdb107["A"], sdb107["B"], sdb107["out"], **kw
-    )
-    assert (
-        _nopro(p_sdb.template) == "dense_proj_gemm_nn_n256_sks_sb2"
-    )  # ROUTE_TEMPLATE_NEW of the templates step (predicted nn_n256_sks_sb2 - the same program as the sm_107a shared_down row; confirm per route)
-    assert (
-        p_sdb.sk_sync
-        and p_sdb.sk_slab == 2
-        and p_sdb.sk_exact == 0
-        and p_sdb.group_m == 4
-        and p_sdb.cta_rows == 128
-    )
-    old_sdb, *_ = plan_dense_projection_gemm(
-        sdb107["A"], sdb107["B"], sdb107["out"], sk_sync=False, sk_exact=3, **kw
-    )
-    assert (
-        _nopro(old_sdb.template) == "dense_proj_gemm_nn_n256_skx"
-        and not old_sdb.sk_sync
-        and old_sdb.sk_exact == 3
-    )  # lock e9d8042b
-    # ---- (e) sm_100a q_a / shared_gate_up weight gradient bf16 (nn, 6144 x 2048 over T; one shared key): the same lever (lock e9d8042b:
-    #      dense_proj_gemm_nn_n256_skx through {"sk_exact": 3}); both sibling rows ----
-    qab100_key = ("sm_100a", True, True, False, False, False, 6144, None, 2048)
-    assert ROW_RULES[qab100_key] == {"sk_sync": True, "sk_sync_m": 26, "sk_slab": 2}
-    for row in ("q_a", "shared_gate_up"):
-        v = _views("proj", row, "wgrad", "bf16", T)
-        p, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], **kw)
-        assert _nopro(p.template) == "dense_proj_gemm_nn_n256_sks_sb2", row
-        assert p.sk_sync and p.sk_slab == 2 and p.sk_exact == 0 and p.cta_rows == 128, (
-            row
-        )
-        old, *_ = plan_dense_projection_gemm(
-            v["A"], v["B"], v["out"], sk_sync=False, sk_exact=3, **kw
-        )
-        assert (
-            _nopro(old.template) == "dense_proj_gemm_nn_n256_skx" and old.sk_exact == 3
-        ), row  # lock e9d8042b
-    # ---- (f) sm_100a shared_down weight gradient fp32 (nn, 2048 x 6144 over T): the synchronised tail (margin 26, two-slab fixup) replaces
-    #      the exact 3-way split under the unchanged fp32 v8 evict-first register epilogue and raster group 8 (lock e9d8042b:
-    #      dense_proj_gemm_nn_n256_f32_v8_ef_skx through {"group_m": 8, "epi": 'reg', "f32_v8": True, "store_ef": True, "sk_exact": 3}) ----
-    sdf100_key = ("sm_100a", True, True, True, False, False, 2048, None, 6144)
-    assert ROW_RULES[sdf100_key] == {
-        "group_m": 8,
-        "epi": "reg",
-        "f32_v8": True,
-        "store_ef": True,
-        "sk_sync": True,
-        "sk_sync_m": 26,
-        "sk_slab": 2,
-    }
-    p_sdf100, *_ = plan_dense_projection_gemm(sdf["A"], sdf["B"], sdf["out"], **kw)
-    assert (
-        _nopro(p_sdf100.template) == "dense_proj_gemm_nn_n256_f32_v8_ef_sks_sb2"
-    )  # ROUTE_TEMPLATE_NEW of the templates step = TEMPLATES_REACHED_NEW (predicted nn_n256_f32_v8_ef_sks_sb2 - the same new program as the sm_107a fp32 rows; confirm per route)
-    assert (
-        p_sdf100.sk_sync
-        and p_sdf100.sk_slab == 2
-        and p_sdf100.sk_exact == 0
-        and p_sdf100.epi == "reg"
-        and p_sdf100.store_ef
-        and p_sdf100.group_m == 8
-    )
-    old_sdf100, *_ = plan_dense_projection_gemm(
-        sdf["A"], sdf["B"], sdf["out"], sk_sync=False, sk_exact=3, **kw
-    )
-    assert (
-        _nopro(old_sdf100.template) == "dense_proj_gemm_nn_n256_f32_v8_ef_skx"
-        and old_sdf100.sk_exact == 3
-        and old_sdf100.epi == "reg"
-    )  # lock e9d8042b
-    # ---- (g) sm_100a q_a / shared_gate_up weight gradient fp32 (nn, 6144 x 2048 over T; one shared key): the same lever under raster group 32
-    #      (lock e9d8042b: dense_proj_gemm_nn_n256_f32_v8_ef_skx through {"group_m": 32, "epi": 'reg', "f32_v8": True, "store_ef": True,
-    #      "sk_exact": 3}); both sibling rows ----
-    qaf100_key = ("sm_100a", True, True, True, False, False, 6144, None, 2048)
-    assert ROW_RULES[qaf100_key] == {
-        "group_m": 32,
-        "epi": "reg",
-        "f32_v8": True,
-        "store_ef": True,
-        "sk_sync": True,
-        "sk_sync_m": 26,
-        "sk_slab": 2,
-    }
-    for row in ("q_a", "shared_gate_up"):
-        v = _views("proj", row, "wgrad", "f32", T)
-        p, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], **kw)
-        assert _nopro(p.template) == "dense_proj_gemm_nn_n256_f32_v8_ef_sks_sb2", row
-        assert (
-            p.sk_sync
-            and p.sk_slab == 2
-            and p.sk_exact == 0
-            and p.epi == "reg"
-            and p.store_ef
-            and p.group_m == 32
-        ), row
-        old, *_ = plan_dense_projection_gemm(
-            v["A"], v["B"], v["out"], sk_sync=False, sk_exact=3, **kw
-        )
-        assert (
-            _nopro(old.template) == "dense_proj_gemm_nn_n256_f32_v8_ef_skx"
-            and old.sk_exact == 3
-        ), row  # lock e9d8042b
-    # the exact-split programs of the seven keys have no other route in lock e9d8042b, so the templates step is expected to RETIRE them
-    # (predicted: nn_n256_skx, nn_n256_f32_v8_ef_skx, nn_n256_sks; nn_n256_m256_f32_tma1 stays - dense_down / dense_gate_up wgrad f32 on
-    # sm_100a and o_proj wgrad f32 on sm_107a keep it); the EXPORTED_TEMPLATES table of this file is regenerated by the figen step - not asserted here
-
-
-@pytest.mark.parametrize("T", [16172, 16231])
-def test_round26_rules_plan_like_the_cake_launcher(T):
-    # the round-26 rule changes (Cake 2f44e6e19f6): six sm_107a rules, no sm_100a change - the dense_gate_up forward bf16 (new key) takes the
-    # tall tile with the half-height tail wave, the row-half release and the column-grouped raster of 12 column tiles per group; the dense_down
-    # weight gradient fp32-out (new key) takes the tall tile with the half-height tail and the fp32 v8 evict-first register epilogue; the
-    # dense_down weight gradient bf16 leaves its 3-way split of the tail wave (refused by the host at the production token counts, so the shipped
-    # program was the plain 128-row form) for the tall tile with the half-height tail; the dense_gate_up input gradient bf16 leaves its 2-way
-    # split for the tall tile with a 3-way split, the row-half release and the column-grouped raster (12 per group); the q_b input gradient bf16
-    # (new key) takes the column-grouped raster with 8 column tiles per group; the dense_gate_up weight gradient fp32-out leaves the register
-    # epilogue with the fp32 v8 stores for the tall tile with the half-height tail through the TMA-store epilogue.  No instance-key field changes.
-    # the table size is asserted by the newest round's test (round 27: 103 = 49 + 54); round 26 shipped 103 = 49 + 54
-    kw = dict(sm_count=148, l2_bytes=L2_BYTES, arch="sm_100a", _fallback=False)
-    kw107 = dict(sm_count=212, l2_bytes=L2_BYTES, arch="sm_107a", _fallback=False)
-    # ---- (a) dense_gate_up forward bf16 (X @ W^T, 12288 x 6144 x T; new key): the tall family with the half-height tail wave, released by row
-    #      half, with the column-grouped raster of 12 column tiles per group (the o_proj forward's form with the dense_down forward's raster
-    #      group); the previous lock planned the row-grouped pair form dense_proj_gemm_kk_n256 (no rule) ----
-    gkey = ("sm_107a", False, False, False, False, False, 12288, 6144, None)
-    assert ROW_RULES[gkey] == {
-        "cta_rows": 256,
-        "htail": True,
-        "ovr": True,
-        "cgrp": True,
-        "group_m": 12,
-    }
-    g = _views("proj", "dense_gate_up", "fwd", "bf16", T)
-    pg, *_ = plan_dense_projection_gemm(g["A"], g["B"], g["out"], **kw107)
-    assert (
-        _nopro(pg.template) == "dense_proj_gemm_kk_n256_m256_ht_cg_or"
-        and pg.ovr
-        and pg.cgrp
-        and pg.htail
-        and not pg.ovl
-    )  # ROUTE_TEMPLATE_NEW of the templates step (predicted kk_n256_m256_ht_cg_or - the sweep symbol)
-    assert (pg.cta_rows, pg.block_n, pg.group_m) == (256, 256, 12)
-    old_g, *_ = plan_dense_projection_gemm(
-        g["A"],
-        g["B"],
-        g["out"],
-        cta_rows=128,
-        htail=False,
-        ovr=False,
-        cgrp=False,
-        **kw107,
-    )
-    assert (
-        _nopro(old_g.template) == "dense_proj_gemm_kk_n256"
-        and not old_g.ovr
-        and not old_g.cgrp
-        and not old_g.htail
-    )  # the previous lock's program
-    # ---- (b) dense_down weight gradient fp32-out (G.T @ X, 12288 x 6144 over T; new key): the tall tile with the half-height tail wave and the
-    #      fp32 v8 evict-first register epilogue; the previous lock planned the 128-row TMA-store form dense_proj_gemm_nn_n256_f32_tma1 (no rule) ----
-    wfkey = ("sm_107a", True, True, True, False, False, 12288, None, 6144)
-    assert ROW_RULES[wfkey] == {
-        "cta_rows": 256,
-        "htail": True,
-        "epi": "reg",
-        "f32_v8": True,
-        "store_ef": True,
-    }
-    wf = _views("proj", "dense_down", "wgrad", "f32", T)
-    pwf, *_ = plan_dense_projection_gemm(wf["A"], wf["B"], wf["out"], **kw107)
-    assert (
-        _nopro(pwf.template) == "dense_proj_gemm_nn_n256_m256_f32_v8_ef_ht"
-        and pwf.htail
-        and pwf.epi == "reg"
-        and pwf.store_ef
-    )  # ROUTE_TEMPLATE_NEW of the templates step (predicted nn_n256_m256_f32_v8_ef_ht)
-    assert (
-        (pwf.cta_rows, pwf.block_n) == (256, 256)
-        and not pwf.sk_sync
-        and not pwf.sk_exact
-    )
-    old_wf, *_ = plan_dense_projection_gemm(
-        wf["A"], wf["B"], wf["out"], cta_rows=128, htail=False, epi="tma", **kw107
-    )
-    assert (
-        _nopro(old_wf.template) == "dense_proj_gemm_nn_n256_f32_tma1"
-        and old_wf.epi == "tma"
-        and not old_wf.htail
-    )  # the previous lock's program
-    # ---- (c) dense_down weight gradient bf16 (same shape): the tall tile with the half-height tail wave replaces the 3-way split rule whose split
-    #      the host refuses at these token counts (the previous lock's program is the plain dense_proj_gemm_nn_n256) ----
-    wbkey = ("sm_107a", True, True, False, False, False, 12288, None, 6144)
-    assert ROW_RULES[wbkey] == {"cta_rows": 256, "htail": True}
-    wb = _views("proj", "dense_down", "wgrad", "bf16", T)
-    pwb, *_ = plan_dense_projection_gemm(wb["A"], wb["B"], wb["out"], **kw107)
-    assert (
-        _nopro(pwb.template) == "dense_proj_gemm_nn_n256_m256_ht"
-        and pwb.htail
-        and not pwb.sk_sync
-    )  # ROUTE_TEMPLATE_NEW of the templates step (predicted nn_n256_m256_ht - a template the previous lock already declares)
-    assert (pwb.cta_rows, pwb.block_n) == (256, 256)
-    old_wb, *_ = plan_dense_projection_gemm(
-        wb["A"], wb["B"], wb["out"], cta_rows=128, htail=False, **kw107
-    )
-    assert (
-        _nopro(old_wb.template) == "dense_proj_gemm_nn_n256"
-        and not old_wb.htail
-        and old_wb.cta_rows == 128
-    )  # the previous lock's program
-    # ---- (d) dense_gate_up input gradient bf16 (G @ W, 6144 x 12288 x T): the tall family released by row half with the column-grouped raster of
-    #      12 and a 3-way split of the tail wave replaces the 2-way split rule (sk_parts is the row's tail policy, not a symbol term; the previous
-    #      lock's program is dense_proj_gemm_kn_n256) ----
-    dkey = ("sm_107a", False, True, False, False, False, 6144, 12288, None)
-    assert ROW_RULES[dkey] == {
-        "cta_rows": 256,
-        "sk_parts": 3,
-        "ovr": True,
-        "cgrp": True,
-        "group_m": 12,
-    }
-    dg = _views("proj", "dense_gate_up", "dgrad", "bf16", T)
-    pdg, *_ = plan_dense_projection_gemm(dg["A"], dg["B"], dg["out"], **kw107)
-    assert (
-        _nopro(pdg.template) == "dense_proj_gemm_kn_n256_m256_cg_or"
-        and pdg.ovr
-        and pdg.cgrp
-        and not pdg.ovl
-        and not pdg.htail
-    )  # ROUTE_TEMPLATE_NEW of the templates step (predicted kn_n256_m256_cg_or)
-    assert (pdg.cta_rows, pdg.block_n, pdg.group_m) == (256, 256, 12)
-    old_dg, *_ = plan_dense_projection_gemm(
-        dg["A"], dg["B"], dg["out"], cta_rows=128, ovr=False, cgrp=False, **kw107
-    )
-    assert (
-        _nopro(old_dg.template) == "dense_proj_gemm_kn_n256"
-        and not old_dg.ovr
-        and not old_dg.cgrp
-    )  # the previous lock's program
-    # ---- (e) q_b input gradient bf16 (G @ W, 2048 x 16384 x T; new key): the column-grouped raster with 8 column tiles per group on the standard
-    #      128-row family (the previous lock's program is dense_proj_gemm_kn_n256, no rule) ----
-    qkey = ("sm_107a", False, True, False, False, False, 2048, 16384, None)
-    assert ROW_RULES[qkey] == {"cgrp": True, "group_m": 8}
-    q = _views("proj", "q_b", "dgrad", "bf16", T)
-    pq, *_ = plan_dense_projection_gemm(q["A"], q["B"], q["out"], **kw107)
-    assert (
-        _nopro(pq.template) == "dense_proj_gemm_kn_n256_cg"
-        and pq.cgrp
-        and not pq.ovr
-        and not pq.htail
-    )  # ROUTE_TEMPLATE_NEW of the templates step (predicted kn_n256_cg)
-    assert (pq.cta_rows, pq.block_n, pq.group_m) == (128, 256, 8)
-    old_q, *_ = plan_dense_projection_gemm(
-        q["A"], q["B"], q["out"], cgrp=False, **kw107
-    )
-    assert (
-        _nopro(old_q.template) == "dense_proj_gemm_kn_n256" and not old_q.cgrp
-    )  # the previous lock's program
-    # ---- (f) dense_gate_up weight gradient fp32-out (G.T @ X, 6144 x 12288 over T): the tall tile with the half-height tail wave through the
-    #      TMA-store epilogue replaces the register-epilogue rule {epi reg, f32_v8} (the previous lock's program is dense_proj_gemm_nn_n256_f32_v8) ----
-    gwkey = ("sm_107a", True, True, True, False, False, 6144, None, 12288)
-    assert ROW_RULES[gwkey] == {"cta_rows": 256, "htail": True}
-    gw = _views("proj", "dense_gate_up", "wgrad", "f32", T)
-    pgw, *_ = plan_dense_projection_gemm(gw["A"], gw["B"], gw["out"], **kw107)
-    assert (
-        _nopro(pgw.template) == "dense_proj_gemm_nn_n256_m256_f32_ht_tma1"
-        and pgw.htail
-        and pgw.epi == "tma"
-    )  # ROUTE_TEMPLATE_NEW of the templates step (predicted nn_n256_m256_f32_ht_tma1 - a template the previous lock already declares; the rule names no epi, so the fp32-out tile takes the planner's default TMA-store epilogue like the sm_100a twin's nn_n256_m256_f32_tma1)
-    assert (pgw.cta_rows, pgw.block_n) == (256, 256) and not pgw.sk_sync
-    old_gw, *_ = plan_dense_projection_gemm(
-        gw["A"],
-        gw["B"],
-        gw["out"],
-        cta_rows=128,
-        htail=False,
-        epi="reg",
-        f32_v8=True,
-        **kw107,
-    )
-    assert (
-        _nopro(old_gw.template) == "dense_proj_gemm_nn_n256_f32_v8"
-        and old_gw.epi == "reg"
-        and not old_gw.htail
-    )  # the previous lock's program
-    # the sm_100a rows of the six keys carry no round-26 change and keep the previous lock's programs (controls)
-    for row, op, dt, tmpl in (
-        ("dense_gate_up", "fwd", "bf16", "dense_proj_gemm_kk_n256"),
-        ("dense_down", "wgrad", "f32", "dense_proj_gemm_nn_n256_m256_f32_tma1"),
-        ("dense_down", "wgrad", "bf16", "dense_proj_gemm_nn_n256_m256"),
-        ("dense_gate_up", "dgrad", "bf16", "dense_proj_gemm_kn_n256_m256_ov_ht"),
-        ("q_b", "dgrad", "bf16", "dense_proj_gemm_kn_n256_m256_ov_ht"),
-        ("dense_gate_up", "wgrad", "f32", "dense_proj_gemm_nn_n256_m256_f32_tma1"),
-    ):
-        v = _views("proj", row, op, dt, T)
-        p100, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], **kw)
-        assert _nopro(p100.template) == tmpl and not p100.cgrp and not p100.ovr, (
-            row,
-            op,
-            dt,
-        )
-    # whether the six programs enter the declared template set as new templates or reuse declared ones is the templates step's outcome; the
-    # EXPORTED_TEMPLATES table of this file is regenerated by the figen step - not asserted here
-
-
-@pytest.mark.parametrize("T", [16172, 16231])
-def test_round27_rules_plan_like_the_cake_launcher(T):
-    # the round-27 rule changes (Cake 20da8851d46): three existing keys re-valued, none inserted or removed - the indexer_k input gradient
-    # fp32-out takes the raster group 2 on sm_100a (same program) and, on sm_107a, the single-CTA form with the raster group 2 and the pd 2
-    # cross-tile drain; the sm_107a kv_a weight gradient bf16 (the ragged-K rule of the 576-wide latent projection) keeps its synchronised
-    # stream-K program and adds the transposed stmatrix / TMA-store staging of its last work item's slices (``stt``, instance-key field 31).
-    # the table size is asserted by the newest round's test (round 33: 109 = 51 + 58); round 27 shipped 103 = 49 + 54
-    kw = dict(sm_count=148, l2_bytes=L2_BYTES, arch="sm_100a", _fallback=False)
-    kw107 = dict(sm_count=212, l2_bytes=L2_BYTES, arch="sm_107a", _fallback=False)
-    # ---- (a) indexer_k input gradient fp32-out on sm_100a (G @ W, 6144 x 128 x T): the raster group 2 on the unchanged 128-column TMA-store
-    #      program (the previous lock's program; only the launch plan's group_m changes) ----
-    akey = ("sm_100a", False, True, True, False, False, 6144, 128, None)
-    assert ROW_RULES[akey] == {"block_n": 128, "group_m": 2}
-    a = _views("proj", "indexer_k", "dgrad", "f32", T)
-    pa, *_ = plan_dense_projection_gemm(a["A"], a["B"], a["out"], **kw)
-    assert (
-        _nopro(pa.template) == "dense_proj_gemm_kn_n128_f32_tma1"
-        and pa.group_m == 2
-        and pa.block_n == 128
-        and not pa.cta1
-        and pa.pd == 0
-        and not pa.stt
-    )
-    # ---- (b) indexer_k input gradient fp32-out on sm_107a (same shape): the single-CTA form with the raster group 2 and the pd 2 cross-tile
-    #      drain; the previous lock planned the pair form dense_proj_gemm_kn_n128_f32_tma1 ----
-    bkey = ("sm_107a", False, True, True, False, False, 6144, 128, None)
-    assert ROW_RULES[bkey] == {"block_n": 128, "cta1": True, "group_m": 2, "pd": 2}
-    pb, *_ = plan_dense_projection_gemm(a["A"], a["B"], a["out"], **kw107)
-    assert (
-        _nopro(pb.template) == "dense_proj_gemm_kn_n128_f32_tma1_pd2_c1"
-        and pb.cta1
-        and pb.pd == 2
-        and pb.group_m == 2
-        and pb.block_n == 128
-    )  # ROUTE_TEMPLATE_NEW of the templates step (predicted kn_n128_f32_tma1_pd2_c1)
-    old_b, *_ = plan_dense_projection_gemm(
-        a["A"], a["B"], a["out"], cta1=False, pd=0, **kw107
-    )
-    assert (
-        _nopro(old_b.template) == "dense_proj_gemm_kn_n128_f32_tma1"
-        and not old_b.cta1
-        and old_b.pd == 0
-    )  # the previous lock's program
-    # ---- (c) kv_a weight gradient bf16 on sm_107a (the swapped orientation: a 576-row transposed output over T, ragged K): the synchronised
-    #      stream-K program with the 64-byte B panels and evict-first hints gains the transposed stmatrix / TMA-store staging of the last work
-    #      item's slices (``_stt`` directly after ``_sks``); the previous lock's program is dense_proj_gemm_nn_n192_bz64_hee_t_sks ----
-    ckey = ("sm_107a", True, True, False, True, False, 576, None, 6144)
-    assert ROW_RULES[ckey] == {
-        "group_m": 8,
-        "hints": ("evict_first", "evict_first"),
-        "b_swz": 64,
-        "sk_sync": True,
-        "sk_sync_m": 38,
-        "stt": True,
-        "pro": 15,
-    }
-    c = _views("proj", "kv_a", "wgrad", "bf16", T)
-    pc, *_ = plan_dense_projection_gemm(
-        c["A"], c["B"], c["out"], transposed_out=c["transposed"], **kw107
-    )
-    assert (
-        _nopro(pc.template) == "dense_proj_gemm_nn_n192_bz64_hee_t_sks_stt"
-        and pc.stt
-        and pc.sk_sync
-        and pc.tma_out
-        and pc.transposed_out
-    )  # ROUTE_TEMPLATE_NEW of the templates step (predicted nn_n192_bz64_hee_t_sks_stt)
-    assert (pc.block_n, pc.b_swz, pc.cta_rows, pc.group_m) == (
-        192,
-        64,
-        128,
-        8,
-    ) and pc.hints == ("evict_first", "evict_first")
-    old_c, *_ = plan_dense_projection_gemm(
-        c["A"], c["B"], c["out"], transposed_out=c["transposed"], stt=False, **kw107
-    )
-    assert (
-        _nopro(old_c.template) == "dense_proj_gemm_nn_n192_bz64_hee_t_sks"
-        and not old_c.stt
-        and not old_c.tma_out
-        and old_c.sk_sync
-    )  # the previous lock's program
-    assert old_c.grid == pc.grid and (
-        old_c.num_full,
-        old_c.tail_tiles,
-        old_c.sk_units,
-    ) == (
-        pc.num_full,
-        pc.tail_tiles,
-        pc.sk_units,
-    )  # the plan arithmetic is the pair form's
-    # controls: the sm_100a kv_a weight gradient bf16 keeps its TMA-store epilogue program (no stt rule on sm_100a), and the fp32-out twins of the
-    # kv_a weight gradient carry no stt on either architecture (stmatrix is .b16)
-    p100, *_ = plan_dense_projection_gemm(
-        c["A"], c["B"], c["out"], transposed_out=c["transposed"], **kw
-    )
-    assert (
-        _nopro(p100.template) == "dense_proj_gemm_nn_n192_hee_t_tma1"
-        and not p100.stt
-        and p100.tma_out
-    )
-    f = _views("proj", "kv_a", "wgrad", "f32", T)
-    for kwx in (kw, kw107):
-        pf, *_ = plan_dense_projection_gemm(
-            f["A"], f["B"], f["out"], transposed_out=f["transposed"], **kwx
-        )
-        assert not pf.stt and pf.out_f32
-    # whether the two new programs enter the declared template set is the templates step's outcome; the EXPORTED_TEMPLATES table of this file is
-    # regenerated by the figen step - not asserted here
-
-
-@pytest.mark.parametrize("T", [16172, 16231])
-def test_round27_stt_knob(T):
-    # field 31 of the key - the LAST field through round 32, 32 fields since round 33 (round 27, Cake lane 7 / W-3 variant A1): the transposed stmatrix / TMA-store staging of the bf16
-    # transposed register epilogue (symbol ``_stt`` directly after ``_sks``): each epilogue warp writes its 32 x EPI_COLS slice of the CTA's LAST
-    # work item with stmatrix.trans into a 64 B-swizzled slot of the dead mainloop stage ring and stores it with one bulk tensor store through
-    # OUT16 (the real output view); every other slice keeps the register stores.  bf16 transposed outputs through the single-pass register
-    # epilogue of the 128-row pair family only; every other field is unchanged: the OFF form's key is the round-24 key plus a trailing False and
-    # its symbol is the round-24 symbol
-    on = instance_key(
-        a_mn=True,
-        b_mn=True,
-        out_t=True,
-        block_n=192,
-        b_swz=64,
-        hints=("evict_first", "evict_first"),
-        sk_sync=True,
-        stt=True,
-    )
-    assert len(on) == 32 and on[30] is True and on[25] is True and on[29] is False
-    assert instance_symbol(on) == "dense_proj_gemm_nn_n192_bz64_hee_t_sks_stt"
-    off = instance_key(
-        a_mn=True,
-        b_mn=True,
-        out_t=True,
-        block_n=192,
-        b_swz=64,
-        hints=("evict_first", "evict_first"),
-        sk_sync=True,
-    )
-    assert len(off) == 32 and off[30] is False and off[:30] == on[:30]
-    assert (
-        instance_symbol(off) == "dense_proj_gemm_nn_n192_bz64_hee_t_sks"
-    )  # the round-18 symbol, byte-identical
-    plain = instance_key(a_mn=True, b_mn=True, out_t=True, stt=True)
-    assert (
-        len(plain) == 32
-        and plain[30] is True
-        and plain[5] == off[5] == on[5]
-        or plain[30] is True
-    )  # the stage count is the row's default (stt trades no stage)
-    assert instance_symbol(plain) == "dense_proj_gemm_nn_n256_t_stt"
-    default = instance_key(a_mn=False, b_mn=False)
-    assert (
-        len(default) == 32
-        and default[30] is False
-        and instance_symbol(default) == "dense_proj_gemm_kk_n256"
-    )
-    # validation mirrors the kernel's instance_key: a bf16 TRANSPOSED output through the REGISTER epilogue only - the fp32 twin (stmatrix is .b16),
-    # the row-major bf16 output and the TMA-store epilogue of the same transposed row are all valid without stt and refused with it
-    for bad in (
-        dict(a_mn=True, b_mn=True, out_t=True, out_f32=True),
-        dict(a_mn=True, b_mn=True, out_t=False),
-        dict(a_mn=True, b_mn=True, out_t=True, epi="tma"),
-    ):
-        instance_key(**bad)  # valid without stt
-        with pytest.raises(ValueError):
-            instance_key(stt=True, **bad)
-    # through the planner: the sm_107a kv_a weight gradient bf16 rule carries stt (the plan hands the real output view to OUT16 next to the
-    # register-store alias: tma_out), a caller-forced stt=False plans the previous program with the same arithmetic, and a caller-forced stt on
-    # a row whose output is fp32 raises like the Cake launcher
-    kw107 = dict(sm_count=212, l2_bytes=L2_BYTES, arch="sm_107a", _fallback=False)
-    v = _views("proj", "kv_a", "wgrad", "bf16", T)
-    p, *_ = plan_dense_projection_gemm(
-        v["A"], v["B"], v["out"], transposed_out=v["transposed"], **kw107
-    )
-    assert (
-        p.stt
-        and p.tma_out
-        and p.epi == "reg"
-        and _nopro(p.template).endswith("_t_sks_stt")
-    )
-    q, *_ = plan_dense_projection_gemm(
-        v["A"], v["B"], v["out"], transposed_out=v["transposed"], stt=False, **kw107
-    )
-    assert (
-        not q.stt
-        and not q.tma_out
-        and _nopro(q.template) == _nopro(p.template)[: -len("_stt")]
-        and q.grid == p.grid
-    )
-    f = _views("proj", "kv_a", "wgrad", "f32", T)
-    with pytest.raises(ValueError):
-        plan_dense_projection_gemm(
-            f["A"], f["B"], f["out"], transposed_out=f["transposed"], stt=True, **kw107
-        )
-    # a caller-forced form outside the staging's admission on the stt row keeps that form WITHOUT the staging (the rule's stt does not carry
-    # over, like the rule's sk_sync / sk_slab: the e2e registrations of the _t_tma1 and _sks_sb2 programs at this row), while a caller-forced
-    # stt on such a form raises
-    # pd (the pipelined TMEM drain) is not a caller form of this row at all: it needs a row-major output and a 128 / 256-column
-    # tile, so the planner rejects it here with or without stt, like the Cake launcher
-    with pytest.raises(ValueError, match="pd needs"):
-        plan_dense_projection_gemm(
-            v["A"], v["B"], v["out"], transposed_out=v["transposed"], pd=2, **kw107
-        )
-    for forced in (
-        dict(epi="tma"),
-        dict(sk_sync=True, sk_slab=2),
-        dict(cta_rows=256),
-    ):
-        r, *_ = plan_dense_projection_gemm(
-            v["A"], v["B"], v["out"], transposed_out=v["transposed"], **forced, **kw107
-        )
-        assert (
-            not r.stt
-            and not _nopro(r.template).endswith("_stt")
-            and r.tma_out == (r.epi == "tma")
-        ), forced
-        with pytest.raises(ValueError):
-            plan_dense_projection_gemm(
-                v["A"],
-                v["B"],
-                v["out"],
-                transposed_out=v["transposed"],
-                stt=True,
-                **forced,
-                **kw107,
-            )
-
-
-@pytest.mark.parametrize("T", [16172, 16231])
-def test_round33_rules_plan_like_the_cake_launcher(T):
-    # the round-33 rule changes (Cake 8b34a0b1725): an architecture-wide default under every rule (ARCH_RULE_DEFAULTS: the pair prologue /
-    # cleanup sync form ``pro`` 7 on sm_100a and sm_107a - instance-key field 32, symbol ``_pro{n}``), six keys inserted (pro 15 rows: the
-    # indexer_q forward / input gradient bf16 on both architectures, the sm_107a indexer_k forward bf16 and q_b weight gradient bf16),
-    # 18 existing rules re-valued with pro 15 (24 rules at pro 15 with the six inserted), the sm_100a shared_down input gradient bf16 pinned to pro 0 and the sm_107a kv_a weight
-    # gradient fp32-out moved to the cheaper slab path of its synchronised stream-K fixup (sk_slab 2); no key removed
-    assert (
-        len(ROW_RULES) == 109
-    )  # 109 expected (six keys inserted, none removed) - the templates step's RULES print
-    assert (
-        sum(k[0] == "sm_100a" for k in ROW_RULES) == 51
-    )  # 51 expected - the RULES_100 print
-    assert (
-        sum(k[0] == "sm_107a" for k in ROW_RULES) == 58
-    )  # 58 expected - the RULES_107 print
-    assert ARCH_RULE_DEFAULTS == {"sm_107a": {"pro": 7}, "sm_100a": {"pro": 7}}
-    kw = dict(sm_count=148, l2_bytes=L2_BYTES, arch="sm_100a", _fallback=False)
-    kw107 = dict(sm_count=212, l2_bytes=L2_BYTES, arch="sm_107a", _fallback=False)
-    # ---- (a) the six inserted keys: pro 15 (the full pair sync form + the CTA-local exit), no other knob ----
-    n1 = (
-        "sm_100a",
-        False,
-        False,
-        False,
-        False,
-        False,
-        4096,
-        2048,
-        None,
-    )  # indexer_q forward bf16 (X @ W.T, 4096 x 2048 x T)
-    n2 = (
-        "sm_100a",
-        False,
-        True,
-        False,
-        False,
-        False,
-        2048,
-        4096,
-        None,
-    )  # indexer_q input gradient bf16 (G @ W, 2048 x 4096 x T)
-    n3 = (
-        "sm_107a",
-        False,
-        False,
-        False,
-        False,
-        False,
-        128,
-        6144,
-        None,
-    )  # indexer_k forward bf16 (128 x 6144 x T)
-    n4 = (
-        "sm_107a",
-        False,
-        False,
-        False,
-        False,
-        False,
-        4096,
-        2048,
-        None,
-    )  # indexer_q forward bf16
-    n5 = (
-        "sm_107a",
-        False,
-        True,
-        False,
-        False,
-        False,
-        2048,
-        4096,
-        None,
-    )  # indexer_q input gradient bf16
-    n6 = (
-        "sm_107a",
-        True,
-        True,
-        False,
-        False,
-        False,
-        2048,
-        None,
-        16384,
-    )  # q_b weight gradient bf16 (G.T @ X, 2048 x 16384 over T)
-    assert ROW_RULES[n1] == {"pro": 15}
-    assert ROW_RULES[n2] == {"pro": 15}
-    assert ROW_RULES[n3] == {"pro": 15}
-    assert ROW_RULES[n4] == {"pro": 15}
-    assert ROW_RULES[n5] == {"pro": 15}
-    assert ROW_RULES[n6] == {"pro": 15}
-    # ---- (b) re-valued keys (a sample) and an unchanged single-CTA row ----
-    sdb = (
-        "sm_100a",
-        False,
-        True,
-        False,
-        False,
-        False,
-        2048,
-        6144,
-        None,
-    )  # shared_down input gradient bf16: the one row pinned to pro 0
-    assert ROW_RULES[sdb] == {"group_m": 8, "pro": 0}
-    kvf = (
-        "sm_107a",
-        True,
-        True,
-        True,
-        True,
-        False,
-        576,
-        None,
-        6144,
-    )  # kv_a weight gradient fp32-out (swapped, ragged K): sk_slab 2, pro from the default
-    assert ROW_RULES[kvf] == {
-        "group_m": 8,
-        "hints": ("evict_first", "evict_first"),
-        "b_swz": 64,
-        "sk_sync": True,
-        "sk_sync_m": 38,
-        "sk_slab": 2,
-    }
-    qbw = (
-        "sm_107a",
-        True,
-        True,
-        True,
-        False,
-        False,
-        2048,
-        None,
-        16384,
-    )  # q_b weight gradient fp32-out: pro 15 on the round-27 knobs
-    assert ROW_RULES[qbw] == {"group_m": 8, "epi": "reg", "f32_v8": True, "pro": 15}
-    kvb = (
-        "sm_107a",
-        True,
-        True,
-        False,
-        True,
-        False,
-        576,
-        None,
-        6144,
-    )  # kv_a weight gradient bf16 (the round-27 stt row): + pro 15
-    assert ROW_RULES[kvb] == {
-        "group_m": 8,
-        "hints": ("evict_first", "evict_first"),
-        "b_swz": 64,
-        "sk_sync": True,
-        "sk_sync_m": 38,
-        "stt": True,
-        "pro": 15,
-    }
-    hw = (
-        "sm_107a",
-        False,
-        True,
-        True,
-        False,
-        False,
-        6144,
-        32,
-        None,
-    )  # indexer_hw input gradient fp32-out: a single-CTA row, no pro
-    assert ROW_RULES[hw] == {"block_n": 128, "group_m": 2, "slots": 1, "cta1": True}
-    # ---- (c) the ARCH_RULE_DEFAULTS merge of row_rule: a key without a rule takes the architecture default (pro 7) on both architectures and
-    #      nothing on an architecture without defaults; a row rule overrides it (pro 0 / 15); a cta1 row carries the default in the merged rule
-    #      and the planner zeroes it on the single-CTA program (below) ----
-    assert row_rule("sm_100a", False, False, False, False, False, 12288, 6144, T) == {
-        "pro": 7
-    }  # dense_gate_up forward bf16: no sm_100a rule
-    assert row_rule("sm_107a", False, False, False, False, False, 8, 8, 8) == {"pro": 7}
-    assert row_rule("sm_103a", False, False, False, False, False, 8, 8, 8) == {}
-    assert row_rule("sm_100a", False, True, False, False, False, 2048, 6144, T) == {
-        "group_m": 8,
-        "pro": 0,
-    }
-    assert row_rule("sm_100a", False, False, False, False, False, 4096, 2048, T) == {
-        "pro": 15
-    }
-    assert row_rule("sm_107a", False, True, True, False, False, 6144, 32, T) == {
-        "block_n": 128,
-        "group_m": 2,
-        "slots": 1,
-        "cta1": True,
-        "pro": 7,
-    }
-    # ---- (d) through the planner: the inserted indexer_q forward bf16 keys plan the round-27 program with the pro-15 suffix on both
-    #      architectures; a caller-forced pro 0 is the previous lock's program with the same plan arithmetic ----
-    q = _views("proj", "indexer_q", "fwd", "bf16", T)
-    for kwx in (kw, kw107):
-        p, *_ = plan_dense_projection_gemm(q["A"], q["B"], q["out"], **kwx)
-        assert p.pro == 15 and p.template.endswith("_pro15") and not p.cta1, kwx["arch"]
-        old, *_ = plan_dense_projection_gemm(q["A"], q["B"], q["out"], pro=0, **kwx)
-        assert (
-            old.pro == 0
-            and old.template == p.template[: -len("_pro15")]
-            and old.grid == p.grid
-            and old.stages == p.stages
-        ), kwx["arch"]
-    p107, *_ = plan_dense_projection_gemm(q["A"], q["B"], q["out"], **kw107)
-    assert (
-        p107.template == "dense_proj_gemm_kk_n256_pro15"
-    )  # ROUTE_TEMPLATE_NEW of the templates step (predicted kk_n256_pro15)
-    # the shared_down input gradient bf16: sm_100a pins pro 0 (the round-27 program, no suffix), sm_107a has no rule (the default pro 7)
-    s = _views("proj", "shared_down", "dgrad", "bf16", T)
-    ps, *_ = plan_dense_projection_gemm(s["A"], s["B"], s["out"], **kw)
-    assert (
-        ps.pro == 0 and not re.search(r"_pro\d+$", ps.template) and ps.group_m == 8
-    )  # NOT `"_pro" not in`: `dense_proj` contains it
-    ps107, *_ = plan_dense_projection_gemm(s["A"], s["B"], s["out"], **kw107)
-    assert ps107.pro == 7 and ps107.template.endswith("_pro7")
-    # the q_b weight gradient fp32-out on sm_107a: pro 15 on the register epilogue with the 256-bit stores (the round-27 knobs)
-    w = _views("proj", "q_b", "wgrad", "f32", T)
-    pw, *_ = plan_dense_projection_gemm(
-        w["A"], w["B"], w["out"], transposed_out=w["transposed"], **kw107
-    )
-    assert (
-        pw.pro == 15
-        and pw.template.endswith("_pro15")
-        and pw.epi == "reg"
-        and "_f32_v8" in pw.template
-        and pw.group_m == 8
-    )
-    assert (
-        pw.template == "dense_proj_gemm_nn_n256_f32_v8_pro15"
-    )  # ROUTE_TEMPLATE_NEW of the templates step (predicted nn_n256_f32_v8_pro15)
-    # a caller-forced tile family drops the rule's pro with the rule's other family-bound knobs (the launcher's filter): pro 0, no suffix
-    tall_w, *_ = plan_dense_projection_gemm(
-        w["A"], w["B"], w["out"], transposed_out=w["transposed"], cta_rows=256, **kw107
-    )
-    assert (
-        tall_w.cta_rows == 256
-        and tall_w.pro == 0
-        and not re.search(r"_pro\d+$", tall_w.template)
-    )
-    # the kv_a weight gradient fp32-out on sm_107a: the synchronised stream-K program takes the bulk slab read (sk_slab 2) and the default
-    # pro 7; a caller-forced sk_slab 0 / pro 0 is the previous lock's program with the same plan arithmetic
-    f = _views("proj", "kv_a", "wgrad", "f32", T)
-    pf, *_ = plan_dense_projection_gemm(
-        f["A"], f["B"], f["out"], transposed_out=f["transposed"], **kw107
-    )
-    assert (
-        pf.pro == 7
-        and pf.sk_sync
-        and pf.sk_slab == 2
-        and "_sb2" in pf.template
-        and pf.template.endswith("_pro7")
-    )
-    assert (
-        pf.template == "dense_proj_gemm_nn_n192_bz64_hee_f32_t_sks_sb2_pro7"
-    )  # ROUTE_TEMPLATE_NEW of the templates step (predicted nn_n192_bz64_hee_f32_t_sks_sb2_pro7)
-    old_f, *_ = plan_dense_projection_gemm(
-        f["A"],
-        f["B"],
-        f["out"],
-        transposed_out=f["transposed"],
-        sk_slab=0,
-        pro=0,
-        **kw107,
-    )
-    assert (
-        old_f.template == "dense_proj_gemm_nn_n192_bz64_hee_f32_t_sks"
-        and old_f.grid == pf.grid
-    )  # the previous lock's program
-    # a single-CTA row: the indexer_hw input gradient fp32-out on sm_107a keeps its round-19 program (no pro; the merged rule's default is
-    # zeroed), a caller-forced pro raises like the Cake launcher, and a caller-forced pair form takes the architecture default
-    h = _views("proj", "indexer_hw", "dgrad", "f32", T)
-    ph, *_ = plan_dense_projection_gemm(h["A"], h["B"], h["out"], **kw107)
-    assert (
-        ph.cta1 and ph.pro == 0 and ph.template == "dense_proj_gemm_kn_n128_f32_tma1_c1"
-    )
-    with pytest.raises(ValueError, match="needs the cluster pair"):
-        plan_dense_projection_gemm(h["A"], h["B"], h["out"], pro=7, **kw107)
-    pair_h, *_ = plan_dense_projection_gemm(
-        h["A"], h["B"], h["out"], cta1=False, **kw107
-    )
-    assert not pair_h.cta1 and pair_h.pro == 7 and pair_h.template.endswith("_pro7")
-    # whether the new programs enter the declared template set is the templates step's outcome; the EXPORTED_TEMPLATES table of this file is
-    # regenerated by the figen step - not asserted here
-
-
-@pytest.mark.parametrize("T", [16172, 16231])
-def test_round33_pro_knob(T):
-    # field 32 (LAST) of the 32-field key (round 33, Cake unit 2d / 2e): the pair program's prologue / cleanup sync form - a bitmask (1 = no
-    # peer-startup cluster rendezvous before the collective tcgen05.alloc, 2 = relaxed arrive on the post-init cluster sync, 4 = the MMA warp
-    # allocates TMEM, 8 = CTA-local exit without the cleanup barrier.cluster), symbol ``_pro{n}`` after every other knob suffix (``_or``);
-    # pair programs only (the single-CTA form refuses it); every other field is unchanged: the OFF form's key is the round-27 key plus a
-    # trailing 0 and its symbol is the round-27 symbol
-    on = instance_key(a_mn=False, b_mn=True, pro=7)
-    assert len(on) == 32 and on[31] == 7 and on[30] is False and on[27] is False
-    assert instance_symbol(on) == "dense_proj_gemm_kn_n256_pro7"
-    off = instance_key(a_mn=False, b_mn=True)
-    assert len(off) == 32 and off[31] == 0 and off[:31] == on[:31]
-    assert (
-        instance_symbol(off) == "dense_proj_gemm_kn_n256"
-    )  # the round-2 symbol, byte-identical
-    full = instance_key(
-        a_mn=True, b_mn=True, out_f32=True, epi="reg", f32_v8=True, pro=15
-    )
-    assert (
-        full[31] == 15
-        and instance_symbol(full) == "dense_proj_gemm_nn_n256_f32_v8_pro15"
-    )
-    # the suffix follows the last knob suffixes of the tall, the stt and the slab forms
-    tall = instance_key(
-        a_mn=False, b_mn=False, cta_rows=256, htail=True, ovr=True, cgrp=True, pro=7
-    )
-    assert instance_symbol(tall) == "dense_proj_gemm_kk_n256_m256_ht_cg_or_pro7"
-    stt = instance_key(
-        a_mn=True,
-        b_mn=True,
-        out_t=True,
-        block_n=192,
-        b_swz=64,
-        hints=("evict_first", "evict_first"),
-        sk_sync=True,
-        stt=True,
-        pro=15,
-    )
-    assert instance_symbol(stt) == "dense_proj_gemm_nn_n192_bz64_hee_t_sks_stt_pro15"
-    slab = instance_key(
-        a_mn=True,
-        b_mn=True,
-        out_f32=True,
-        out_t=True,
-        block_n=192,
-        b_swz=64,
-        hints=("evict_first", "evict_first"),
-        sk_sync=True,
-        sk_slab=2,
-        pro=7,
-    )
-    assert (
-        instance_symbol(slab) == "dense_proj_gemm_nn_n192_bz64_hee_f32_t_sks_sb2_pro7"
-    )
-    default = instance_key(a_mn=False, b_mn=False)
-    assert (
-        len(default) == 32
-        and default[31] == 0
-        and instance_symbol(default) == "dense_proj_gemm_kk_n256"
-    )
-    # validation mirrors the kernel's instance_key: a bitmask in 0..15 on the cluster pair only
-    for bad in (16, -1, 32):
-        with pytest.raises(ValueError, match="pro must be a bitmask"):
-            instance_key(a_mn=False, b_mn=True, pro=bad)
-    instance_key(
-        a_mn=False, b_mn=True, block_n=128, out_f32=True, cta1=True
-    )  # valid without pro
-    with pytest.raises(ValueError, match="needs the cluster pair"):
-        instance_key(a_mn=False, b_mn=True, block_n=128, out_f32=True, cta1=True, pro=7)
-    # through the planner (kw107 = the sm_107a device facts): a pair row without a rule plans the architecture default (pro 7), a cta1 rule
-    # zeroes it, a caller-forced value is admitted or refused by instance_key, and the FlashInfer-only registry fallback that drops a row's
-    # measured rule keeps the architecture default (a rule-less plan of a pair row is a ``_pro7`` program; the rule's pro 15 goes with the rule)
-    kw = dict(sm_count=148, l2_bytes=L2_BYTES, arch="sm_100a", _fallback=False)
-    kw107 = dict(sm_count=212, l2_bytes=L2_BYTES, arch="sm_107a", _fallback=False)
-    g = _views("proj", "dense_gate_up", "fwd", "bf16", T)
-    pg, *_ = plan_dense_projection_gemm(g["A"], g["B"], g["out"], **kw)
-    assert (
-        pg.pro == 7 and pg.template.endswith("_pro7") and not pg.rule_fallback
-    )  # no sm_100a rule: the default alone
-    w = _views("proj", "q_b", "wgrad", "f32", T)
-    pw, *_ = plan_dense_projection_gemm(
-        w["A"], w["B"], w["out"], transposed_out=w["transposed"], **kw107
-    )
-    assert pw.pro == 15 and pw.template.endswith("_pro15")
-    for forced in (0, 7, 8, 15):
-        pfx, *_ = plan_dense_projection_gemm(
-            w["A"],
-            w["B"],
-            w["out"],
-            transposed_out=w["transposed"],
-            pro=forced,
-            **kw107,
-        )
-        assert pfx.pro == forced and pfx.template == pw.template[: -len("_pro15")] + (
-            f"_pro{forced}" if forced else ""
-        ), forced
-        assert pfx.grid == pw.grid and pfx.stages == pw.stages, (
-            forced
-        )  # the program changes, the plan arithmetic does not
-    nr, *_ = plan_dense_projection_gemm(
-        w["A"],
-        w["B"],
-        w["out"],
-        transposed_out=w["transposed"],
-        _use_rules=False,
-        **kw107,
-    )
-    assert (
-        nr.rule_fallback
-        and nr.pro == 7
-        and nr.template.endswith("_pro7")
-        and "_f32_v8" not in nr.template
-    )
-    h = _views("proj", "indexer_hw", "dgrad", "f32", T)
-    ph, *_ = plan_dense_projection_gemm(h["A"], h["B"], h["out"], **kw107)
-    assert (
-        ph.cta1 and ph.pro == 0 and ph.template == "dense_proj_gemm_kn_n128_f32_tma1_c1"
-    )
-    with pytest.raises(ValueError, match="needs the cluster pair"):
-        plan_dense_projection_gemm(h["A"], h["B"], h["out"], pro=15, **kw107)
-
-
-@pytest.mark.parametrize("T", [16172, 16231])
-def test_round21_cgrp_knob(T):
-    # field 29 of the 30-field key (LAST until round 24's ``ovr``; round 21, Cake W3): the column-grouped raster (symbol ``_cg``, after
-    # ``_c1``): the ``group_m`` launch parameter counts COLUMN tiles per raster group (any count >= 1; the pair
-    # invariant - consecutive CTAs are the two row tiles of one column tile - is unchanged) and consecutive pairs sweep
-    # a group's columns of one pair row before the next pair row, so a group's B panels stay L2-resident while A
-    # streams once per column group.  Every other field is unchanged: the OFF form's key is the round-20 key plus a
-    # trailing False and its symbol is the round-20 symbol
-    key = instance_key(
-        a_mn=False, b_mn=False, cta_rows=256, ovl=True, htail=True, cgrp=True
-    )
-    assert len(key) == 32 and key[28] is True and key[27] is False
-    assert instance_symbol(key) == "dense_proj_gemm_kk_n256_m256_ov_ht_cg"
-    off = instance_key(a_mn=False, b_mn=False, cta_rows=256, ovl=True, htail=True)
-    assert len(off) == 32 and off[:28] == key[:28] and off[28] is False
-    assert instance_symbol(off) == "dense_proj_gemm_kk_n256_m256_ov_ht"
-    assert (
-        instance_symbol(instance_key(a_mn=False, b_mn=False, cgrp=True))
-        == "dense_proj_gemm_kk_n256_cg"
-    )
-    default = instance_key(a_mn=False, b_mn=False)
-    assert (
-        default[28] is False and instance_symbol(default) == "dense_proj_gemm_kk_n256"
-    )
-    # ``_cg`` is the last knob term, after ``_c1`` (the symbol grammar only: no rule or registered program combines
-    # the single-CTA form with the column raster)
-    both = instance_key(a_mn=False, b_mn=False, block_n=128, cta1=True, cgrp=True)
-    assert both[27] is True and both[28] is True
-    assert instance_symbol(both) == "dense_proj_gemm_kk_n128_c1_cg"
-    # the hint gate over the column raster's wave working set (Cake ``wave_working_set_cgrp`` / ``default_hints_cgrp``):
-    # a group of g column panels is swept by consecutive pairs of one pair row, so a wave covers g column panels and
-    # ceil(pairs / g) pair rows while the group's band (g x pair rows) holds the wave, else every pair row and
-    # ceil(pairs / band) groups of columns
-    assert wave_working_set_cgrp(64, 24, 12288, 12, 74) == (7 + 12) * 256 * 12288 * 2
-    assert wave_working_set_cgrp(10, 24, 12288, 12, 74) == (5 + 24) * 256 * 12288 * 2
-    assert wave_working_set_cgrp(128, 1, 6144, 16, 74) == (64 + 1) * 256 * 6144 * 2
-    assert (
-        wave_working_set_cgrp(128, 24, 16384, 16, 74, elt_bytes=1)
-        == (5 + 16) * 256 * 16384
-    )
-    assert default_hints_cgrp(False, False, 128, 24, 16384, 16, 74, L2_BYTES) == (
-        "none",
-        "none",
-    )  # o_proj fwd: no hint on a multi-column row
-    assert default_hints_cgrp(False, False, 128, 1, 6144, 16, 74, L2_BYTES) == (
-        "evict_first",
-        "none",
-    )  # a single-use A (one column tile) streams
-    assert default_hints_cgrp(False, False, 128, 1, 6144, 16, 74, 1 << 40) == (
-        "none",
-        "none",
-    )  # fits a huge L2
-    # the two rasters' waves differ, so the gates differ: 100 pair rows x one column tile at K = 3200 - the row
-    # raster's wave spans 10 groups of 8 pair rows (81 panels, over the L2), the column raster's 74 pair rows (75
-    # panels, under it)
-    assert wave_working_set(200, 1, 3200, 16, 74) == 81 * 256 * 3200 * 2 > L2_BYTES
-    assert (
-        wave_working_set_cgrp(200, 1, 3200, 16, 74) == 75 * 256 * 3200 * 2 <= L2_BYTES
-    )
-    assert default_hints(False, False, 200, 1, 3200, 16, 74, L2_BYTES) == (
-        "evict_first",
-        "none",
-    )
-    assert default_hints_cgrp(False, False, 200, 1, 3200, 16, 74, L2_BYTES) == (
-        "none",
-        "none",
-    )
-    # through the planner on the dense_down forward (X @ W^T: 6144 x 12288, the round-21 W3 candidate row; the knob is
-    # caller-forced here - a ``cgrp`` rule arrives through the rule sync): the ``_cg`` program of the row's tall
-    # overlapped half-height-tail family with 12 column tiles per raster group; the plan arithmetic (64 x 24 tiles, 768
-    # pair tiles on 74 pairs, the half-height tail wave) is the pair form's - only the program and the raster differ
-    kw = dict(sm_count=148, l2_bytes=L2_BYTES, arch="sm_100a", _fallback=False)
-    v = _views("proj", "dense_down", "fwd", "bf16", T)
-    plan, *_ = plan_dense_projection_gemm(
-        v["A"], v["B"], v["out"], cgrp=True, group_m=12, **kw
-    )
-    assert (
-        plan.cgrp and _nopro(plan.template) == "dense_proj_gemm_kk_n256_m256_ov_ht_cg"
-    )
-    assert (plan.group_m, plan.cta_rows, plan.block_n) == (12, 256, 256)
-    assert plan.ovl and plan.htail and not plan.cta1
-    assert (plan.m_tiles, plan.n_tiles, plan.pair_tiles, plan.sm_pairs) == (
-        64,
-        24,
-        768,
-        74,
-    )
-    assert (plan.num_full, plan.tail_tiles, plan.sk_units) == (740, 28, 56)
-    assert plan.hints == ("none", "none")
-    assert (
-        plan.wave_working_set_bytes
-        == wave_working_set_cgrp(64, 24, 12288, 12, 74)
-        == 19 * 256 * 12288 * 2
-    )
-    base, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], group_m=12, **kw)
-    assert (
-        not base.cgrp and _nopro(base.template) == "dense_proj_gemm_kk_n256_m256_ov_ht"
-    )
-    for f in (
-        "m_tiles",
-        "n_tiles",
-        "pair_tiles",
-        "sm_pairs",
-        "num_full",
-        "tail_tiles",
-        "sk_units",
-        "iters_per_unit",
-        "stages",
-        "epi",
-        "slots",
-        "hints",
-        "grid",
-        "ws_f32_elems",
-    ):
-        assert getattr(plan, f) == getattr(base, f), f
-    # the raster width defaults to the row default (16, ``default_group_m``) under cgrp as well, now as column tiles
-    cg16, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], cgrp=True, **kw)
-    assert cg16.group_m == 16 and _nopro(cg16.template) == _nopro(plan.template)
-    # the pair invariant holds whatever the column count, so the count has no parity constraint under cgrp: 3 (or 1)
-    # column tiles per group are admitted where the row raster rejects an odd count (CTA pairs are adjacent row
-    # tiles); a count < 1 is rejected on both
-    odd, *_ = plan_dense_projection_gemm(
-        v["A"], v["B"], v["out"], cgrp=True, group_m=3, **kw
-    )
-    assert odd.group_m == 3 and _nopro(odd.template) == _nopro(plan.template)
-    one, *_ = plan_dense_projection_gemm(
-        v["A"], v["B"], v["out"], cgrp=True, group_m=1, **kw
-    )
-    assert one.group_m == 1 and _nopro(one.template) == _nopro(plan.template)
-    with pytest.raises(ValueError, match="group_m must be an even number"):
-        plan_dense_projection_gemm(v["A"], v["B"], v["out"], group_m=3, **kw)
-    with pytest.raises(ValueError, match="group_m must be an even number"):
-        plan_dense_projection_gemm(
-            v["A"], v["B"], v["out"], cgrp=False, group_m=1, **kw
-        )
-    with pytest.raises(ValueError, match="group_m must be an even number"):
-        plan_dense_projection_gemm(v["A"], v["B"], v["out"], cgrp=True, group_m=0, **kw)
-    # the planner selects the gate by the raster: one 256-column tile over 25600 rows at K = 3200 (no rule) streams A
-    # evict_first on the row raster (``_hen``) and keeps the hint-free program on the column raster
-    A = torch.empty(25600, 3200, dtype=torch.bfloat16)
-    Bt = torch.empty(256, 3200, dtype=torch.bfloat16).t()
-    out = torch.empty(25600, 256, dtype=torch.bfloat16)
-    row, *_ = plan_dense_projection_gemm(A, Bt, out, **kw)
-    col, *_ = plan_dense_projection_gemm(A, Bt, out, cgrp=True, **kw)
-    assert (row.m_tiles, row.n_tiles, row.group_m, row.sm_pairs) == (200, 1, 16, 74)
-    assert _nopro(row.template) == "dense_proj_gemm_kk_n256_hen" and row.hints == (
-        "evict_first",
-        "none",
-    )
-    assert _nopro(col.template) == "dense_proj_gemm_kk_n256_cg" and col.hints == (
-        "none",
-        "none",
-    )
-    assert row.wave_working_set_bytes > L2_BYTES >= col.wave_working_set_bytes
-    assert (col.m_tiles, col.n_tiles, col.group_m, col.grid) == (200, 1, 16, row.grid)
-
-
-@pytest.mark.parametrize("T", [16172, 16231])
-def test_round24_ovr_knob(T):
-    # field 30 of the key - the LAST field through round 26, 31 fields since round 27 (round 24; the round-20 W3 knob ported in round 23 by W4, Cake 8d837b1ac8): the overlapped tall
-    # epilogue released by ROW HALF (symbol ``_or``, after ``_cg``): the eight epilogue warps drain TMEM buffer 0 and release it to the next
-    # tile's half-0 MMAs while buffer 1 drains; the B stage keeps the plain tall layout (one N = 256 MMA per row half per K step).  Tall
-    # 256-column tiles only; it excludes ovl / park / pf / box_rows / a_mcast, sk_sync and cta1 exclude it, a caller-forced ovr replaces a
-    # rule-derived ovl and a caller-forced ovl drops a rule-provided ovr, exactly as the Cake launcher does (62a0f1fb + 95da40d6e8).  Every
-    # other field is unchanged: the OFF form's key is the round-21 key plus a
-    # trailing False and its symbol is the round-21 symbol
-    key = instance_key(
-        a_mn=False, b_mn=False, cta_rows=256, htail=True, cgrp=True, ovr=True
-    )
-    assert len(key) == 32 and key[29] is True and key[28] is True and key[16] is False
-    assert instance_symbol(key) == "dense_proj_gemm_kk_n256_m256_ht_cg_or"
-    solo = instance_key(a_mn=False, b_mn=False, cta_rows=256, htail=True, ovr=True)
-    assert len(solo) == 32 and solo[29] is True and solo[28] is False
-    assert instance_symbol(solo) == "dense_proj_gemm_kk_n256_m256_ht_or"
-    off = instance_key(a_mn=False, b_mn=False, cta_rows=256, ovl=True, htail=True)
-    assert len(off) == 32 and off[29] is False and off[16] is True
-    assert (
-        instance_symbol(off) == "dense_proj_gemm_kk_n256_m256_ov_ht"
-    )  # the round-21 symbol, byte-identical
-    cg = instance_key(
-        a_mn=False, b_mn=False, cta_rows=256, ovl=True, htail=True, cgrp=True
-    )
-    assert len(cg) == 32 and cg[:28] == off[:28] and cg[28] is True and cg[29] is False
-    assert (
-        instance_symbol(cg) == "dense_proj_gemm_kk_n256_m256_ov_ht_cg"
-    )  # test_round21_cgrp_knob's symbol, now on a 30-field key
-    default = instance_key(a_mn=False, b_mn=False)
-    assert (
-        len(default) == 32
-        and default[29] is False
-        and instance_symbol(default) == "dense_proj_gemm_kk_n256"
-    )
-    # validation mirrors the kernel's instance_key: the tall 256-column tile only, no ovl / park / pf / box_rows; sk_sync and cta1 exclude ovr
-    for bad in (
-        dict(cta_rows=128),
-        dict(cta_rows=256, block_n=128),
-        dict(cta_rows=256, ovl=True),
-        dict(cta_rows=256, park=True),
-        dict(cta_rows=256, pf=2),
-        dict(cta_rows=256, box_rows=64),
-        dict(cta_rows=256, sk_sync=True),
-        dict(cta_rows=128, cta1=True),
-    ):
-        with pytest.raises(ValueError):
-            instance_key(a_mn=False, b_mn=False, ovr=True, **bad)
-    # through the planner, both directions of the Cake launcher: (1) a caller-forced ovr on the sm_100a o_proj forward (rule {cta_rows 256,
-    # group_m 8, ovl, htail}) REPLACES the rule's ovl (62a0f1fb L2740-L2748: a rule-derived ovl yields to a forced ovr; forcing both raises in
-    # instance_key) and keeps the plan arithmetic; (2) a caller-forced ovl on a row whose RULE carries ovr DROPS the rule's ovr (the Cake
-    # launcher's round-24 precedence rule, asserted below on the sm_107a o_proj / dense_down forwards)
-    kw = dict(sm_count=148, l2_bytes=L2_BYTES, arch="sm_100a", _fallback=False)
-    v = _views("proj", "o_proj", "fwd", "bf16", T)
-    base, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], **kw)
-    assert (
-        base.ovl
-        and base.htail
-        and not base.ovr
-        and _nopro(base.template) == "dense_proj_gemm_kk_n256_m256_ov_ht"
-    )
-    forced, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], ovr=True, **kw)
-    assert (
-        forced.ovr
-        and not forced.ovl
-        and forced.htail
-        and _nopro(forced.template) == "dense_proj_gemm_kk_n256_m256_ht_or"
-    )
-    for f in (
-        "m_tiles",
-        "n_tiles",
-        "pair_tiles",
-        "sm_pairs",
-        "num_full",
-        "tail_tiles",
-        "sk_units",
-        "iters_per_unit",
-        "stages",
-        "epi",
-        "slots",
-        "hints",
-        "group_m",
-        "grid",
-        "ws_f32_elems",
-    ):
-        assert getattr(forced, f) == getattr(base, f), f
-    with pytest.raises(ValueError):
-        plan_dense_projection_gemm(v["A"], v["B"], v["out"], ovr=True, ovl=True, **kw)
-    # (2) the reverse direction (Cake 95da40d6e8 L2745-L2746, `if ovr and ovl and not rule_ovl: ovr = False` inside the rule read of ovr): a
-    # caller-forced ovl=True on the sm_107a o_proj fwd row (rule {cta_rows 256, htail, ovr, cgrp, group_m 8}) drops the rule's ovr - the
-    # rule's cgrp / htail / group_m stay and the plan is the `_ov_ht_cg` program of test_round21_cgrp_knob, not a ValueError (ovl + ovr);
-    # without this mirror every forced-ovl planner call on these rows raises in FlashInfer while the Cake launcher plans the `_ov` program
-    kw107 = dict(sm_count=212, l2_bytes=L2_BYTES, arch="sm_107a", _fallback=False)
-    o107 = _views("proj", "o_proj", "fwd", "bf16", T)
-    forced_ovl, *_ = plan_dense_projection_gemm(
-        o107["A"], o107["B"], o107["out"], ovl=True, **kw107
-    )
-    assert (
-        forced_ovl.ovl
-        and not forced_ovl.ovr
-        and forced_ovl.cgrp
-        and forced_ovl.htail
-        and forced_ovl.group_m == 8
-    )
-    assert _nopro(forced_ovl.template) == "dense_proj_gemm_kk_n256_m256_ov_ht_cg"
-    # the same on the dense_down fwd row (rule {cta_rows 256, sk_parts 3, ovr, cgrp, group_m 12}: no htail) -> the `_ov_cg` tall program
-    d107 = _views("proj", "dense_down", "fwd", "bf16", T)
-    forced_ovl_d, *_ = plan_dense_projection_gemm(
-        d107["A"], d107["B"], d107["out"], ovl=True, **kw107
-    )
-    assert (
-        forced_ovl_d.ovl
-        and not forced_ovl_d.ovr
-        and forced_ovl_d.cgrp
-        and not forced_ovl_d.htail
-        and forced_ovl_d.group_m == 12
-    )
-    assert _nopro(forced_ovl_d.template) == "dense_proj_gemm_kk_n256_m256_ov_cg"
-    with pytest.raises(ValueError):
-        plan_dense_projection_gemm(
-            v["A"], v["B"], v["out"], ovr=True, cta_rows=128, **kw
-        )
-
-
-def test_wave_working_set_and_hint_rule():
-    # o_proj forward at T = 16231 (m_tiles = 128, n_tiles = 24, K = 16384) on 74 pairs: a raster band of
-    # 8 pair rows x 24 column tiles exceeds the wave, so the wave covers 8 pair-row panels and
-    # ceil(74 / 8) = 10 column panels -> 18 x 256 x 16384 x 2 B
-    assert wave_working_set(128, 24, 16384, 16, 74) == 18 * 256 * 16384 * 2
-    # a narrow band (8 x 1 < 74 pairs) spans ceil(74 / 8) groups of 8 pair rows, capped by the rows there are
-    assert wave_working_set(8, 1, 6144, 16, 74) == (4 + 1) * 256 * 6144 * 2
-    assert wave_working_set(1024, 1, 6144, 16, 74) == (80 + 1) * 256 * 6144 * 2
-    assert wave_working_set(128, 24, 16384, 16, 74, elt_bytes=1) == 18 * 256 * 16384
-    # hints only when the wave does not fit the L2 ...
-    assert wave_working_set(128, 24, 16384, 16, 74) > L2_BYTES
-    assert default_hints(False, False, 128, 24, 16384, 16, 74, 1 << 40) == (
-        "none",
-        "none",
-    )  # fits a huge L2
-    assert default_hints(False, False, 8, 1, 6144, 16, 74, L2_BYTES) == (
-        "none",
-        "none",
-    )  # 15.7 MB working set fits
-    # ... then a single-use A (one column tile) streams evict_first on every layout class
-    assert default_hints(False, False, 128, 1, 6144, 16, 74, L2_BYTES) == (
-        "evict_first",
-        "none",
-    )  # indexer_k fwd
-    assert default_hints(True, True, 48, 1, 16231, 16, 74, L2_BYTES) == (
-        "evict_first",
-        "none",
-    )  # swapped small-N wgrad
-    assert default_hints(False, False, 8, 1, 6144, 16, 74, 1 << 20) == (
-        "evict_first",
-        "none",
-    )  # tiny L2
-    # ... K-major forward / input-gradient rows get no other hint
-    assert default_hints(False, False, 128, 24, 16384, 16, 74, L2_BYTES) == (
-        "none",
-        "none",
-    )  # o_proj fwd
-    assert default_hints(False, True, 128, 64, 16384, 16, 74, L2_BYTES) == (
-        "none",
-        "none",
-    )  # o_proj dgrad
-    assert default_hints(False, True, 2, 3, 6144, 16, 74, 1 << 20) == ("none", "none")
-    # ... and neither does the weight-gradient class (both MN-major): the reuse-ratio hints are not applied
-    assert default_hints(True, True, 16, 24, 16231, 16, 74, L2_BYTES) == (
-        "none",
-        "none",
-    )  # q_a wgrad
-    assert default_hints(True, True, 48, 8, 16231, 16, 74, L2_BYTES) == (
-        "none",
-        "none",
-    )  # shared_down wgrad
-    assert default_hints(True, True, 32, 24, 16231, 16, 74, L2_BYTES) == (
-        "none",
-        "none",
-    )
-    assert default_hints(True, True, 2, 3, 6144, 16, 74, 1 << 20) == ("none", "none")
-
-
-def test_default_group_m_rule():
-    # 16 row tiles per raster group on every row: the one-to-two-wave wgrad small-group rule is not applied
-    for a_mn, b_mn, m_tiles, pair_tiles, pairs in (
-        (True, True, 16, 192, 106),  # q_a wgrad on 212 SMs (one to two waves)
-        (True, True, 16, 192, 74),
-        (True, True, 32, 192, 106),  # indexer_q wgrad
-        (True, True, 6, 148, 74),
-        (True, True, 16, 148, 74),
-        (True, True, 4, 148, 74),
-        (True, True, 2, 128, 74),  # the MLA weight gradients (64 heads x 2 tiles)
-        (True, True, 16, 74, 74),  # exactly one wave
-        (False, True, 16, 100, 74),  # not the wgrad class
-        (False, False, 16, 100, 74),
-    ):
-        assert default_group_m(a_mn, b_mn, m_tiles, pair_tiles, pairs) == 16
-
-
-def test_instance_key_rejects_bad_configurations():
-    with pytest.raises(ValueError, match="BLOCK_N"):
-        instance_key(a_mn=False, b_mn=False, block_n=64)
-    with pytest.raises(ValueError, match="cta_rows"):
-        instance_key(a_mn=False, b_mn=False, cta_rows=32)
-    # a warp slice must be whole 16-column chunks: BLOCK_N = 160 / 224 have none on 64-row tiles (40 / 56 columns)
-    with pytest.raises(ValueError, match="16-column"):
-        instance_key(a_mn=False, b_mn=False, block_n=160, cta_rows=64)
-    with pytest.raises(ValueError, match="16-column"):
-        instance_key(a_mn=False, b_mn=False, block_n=224, cta_rows=64)
-    # a forced TMA-store epilogue needs whole 128-byte chunks per warp (64 bf16 / 32 fp32 columns)
-    with pytest.raises(ValueError, match="epi='reg'"):
-        instance_key(a_mn=False, b_mn=False, block_n=192, cta_rows=64, epi="tma")
-    with pytest.raises(ValueError, match="epi='reg'"):
-        instance_key(a_mn=False, b_mn=False, block_n=160, out_f32=True, epi="tma")
-    # the stage bound defaults to the largest architecture limit (sm_107a's 334336 B oversized mode): eight
-    # 32 KiB stages fit there, eleven do not; the planner passes its architecture's limit (the 227 KiB opt-in on
-    # sm_100a / sm_103a), where eight do not.  The limit is not part of the key.
-    assert smem_limit_for(None) == smem_limit_for("sm_107a") == 334848 - 512
-    assert (
-        smem_limit_for("sm_100a") == smem_limit_for("sm_103a") == SMEM_OPT_IN == 232448
-    )
-    assert instance_key(a_mn=False, b_mn=False, stages=8)[5] == 8
-    assert instance_key(a_mn=False, b_mn=False, stages=8) == instance_key(
-        a_mn=False, b_mn=False, stages=8, smem_limit=smem_limit_for("sm_107a")
-    )
-    with pytest.raises(ValueError, match="SMEM"):
-        instance_key(a_mn=False, b_mn=False, stages=11)
-    with pytest.raises(ValueError, match="SMEM"):
-        instance_key(
-            a_mn=False, b_mn=False, stages=8, smem_limit=smem_limit_for("sm_100a")
-        )
-    with pytest.raises(ValueError, match="SMEM"):
-        instance_key(
-            a_mn=False, b_mn=False, block_n=128, stages=10, smem_limit=SMEM_OPT_IN
-        )  # 9 is the deepest 24 KiB pipeline in the opt-in
-    with pytest.raises(ValueError, match="SMEM"):
-        instance_key(a_mn=False, b_mn=False, cta_rows=64, stages=14)
-    with pytest.raises(ValueError, match="diagnostic"):
-        instance_key(a_mn=False, b_mn=False, diag=("no_mma",))
-    with pytest.raises(ValueError, match="hints"):
-        instance_key(a_mn=False, b_mn=False, hints=("evict_first", "keep"))
-    with pytest.raises(ValueError, match="prefetch"):
-        instance_key(a_mn=False, b_mn=False, pf=17)
-    key = instance_key(a_mn=False, b_mn=False)
-    # 20 fields since round 13 (the raster group width and the TMA L2 promotion left the key for the launch
-    # arguments in round 11): pf, hints, f32_v8, quad_store, park, ovl, htail, b_swz, sk_exact, batch_group, store_ef,
-    # store_hint, pd, sh, sk_sync (26 fields since round 18), sk_slab, cta1 (28 fields since round 19), cgrp (29 fields
-    # since round 21), ovr (30 fields since round 24)
-    assert len(key) == 32 and key[11:] == (
-        0,
-        ("none", "none"),
-        False,
-        False,
-        False,
-        False,
-        False,
-        128,
-        False,
-        0,
-        False,
-        "none",
-        0,
-        0,
-        False,
-        0,
-        False,
-        False,
-        False,
-        False,  # stt (31 fields since round 27)
-        0,  # pro (32 fields since round 33)
-    )
-    # the promotion is validated where it is resolved, by the planner
-    v = _views("proj", "o_proj", "fwd", "bf16", 257)
-    with pytest.raises(ValueError, match="promo"):
-        plan_dense_projection_gemm(
-            v["A"],
-            v["B"],
-            v["out"],
-            sm_count=148,
-            l2_bytes=L2_BYTES,
-            _fallback=False,
-            promo="l2_512b",
-        )
-
-
-@pytest.mark.parametrize("pairs", [74, 106])  # 148 SMs (B200) / 212 SMs (R200)
-def test_stream_k_plan_rules(pairs):
-    # --- sk="auto" (the launcher default): a two-way split of a single partial wave ---
-    # on an even K every tile has exactly two parts (unit u = tile u // 2, K half u % 2), so tiles that share an
-    # A / B panel stay K-synchronised and the fixup reads one slab
-    assert stream_k_plan(24, 96, pairs, sk="auto") == (0, 24, 48, 48)
-    assert stream_k_plan(pairs // 2, 96, pairs, sk="auto") == (
-        0,
-        pairs // 2,
-        2 * (pairs // 2),
-        48,
-    )
-    # odd K steps: units of ceil(k / 2) over the linearised 10 x 17 steps; 2 x 10 units would leave the last one
-    # starting at step 19 x 9 = 171 of 170, so the plan has the 19 that hold a K step
-    assert stream_k_plan(10, 17, pairs, sk="auto") == (0, 10, 19, 9)
-    assert stream_k_plan(16, 17, pairs, sk="auto") == (0, 16, 31, 9)
-    # 15 x 9 < 8 x 17: still two units per tile
-    assert stream_k_plan(8, 17, pairs, sk="auto") == (0, 8, 16, 9)
-    assert stream_k_plan(10, 2 * SK_MIN_ITERS, pairs, sk="auto") == (
-        0,
-        10,
-        20,
-        SK_MIN_ITERS,
-    )
-    # the halves must fit the pairs, K needs 2 * SK_MIN_ITERS steps, and multi-wave problems keep a
-    # data-parallel tail: otherwise every work item is a whole tile
-    assert stream_k_plan(pairs // 2 + 1, 96, pairs, sk="auto") == (
-        pairs // 2 + 1,
-        0,
-        0,
-        96,
-    )
-    assert stream_k_plan(10, 2 * SK_MIN_ITERS - 1, pairs, sk="auto") == (
-        10,
-        0,
-        0,
-        2 * SK_MIN_ITERS - 1,
-    )
-    assert stream_k_plan(pairs + 1, 256, pairs, sk="auto") == (pairs + 1, 0, 0, 256)
-    assert stream_k_plan(pairs + 10, 256, pairs, sk="auto") == (pairs + 10, 0, 0, 256)
-    assert stream_k_plan(pairs, 256, pairs, sk="auto") == (
-        pairs,
-        0,
-        0,
-        256,
-    )  # exactly one full wave
-    assert stream_k_plan(pairs * 3, 96, pairs, sk="auto") == (pairs * 3, 0, 0, 96)
-    assert stream_k_plan(0, 96, pairs, sk="auto") == (0, 0, 0, 96)
-    # --- sk=False: every tile is a work item ---
-    assert stream_k_plan(100, 96, pairs, sk=False) == (100, 0, 0, 96)
-    assert stream_k_plan(24, 96, pairs, sk=False) == (24, 0, 0, 96)
-    # --- sk=True: the tail tiles linearised over their K steps into up to `pairs` (`max_units`) units ---
-    # a whole number of waves: no tail, no stream-K
-    assert stream_k_plan(pairs * 3, 96, pairs, sk=True) == (pairs * 3, 0, 0, 96)
-    # fewer tiles than pairs: every tile is a tail tile shared by up to `pairs` units of >= SK_MIN_ITERS steps
-    num_full, tail, units, iters = stream_k_plan(24, 96, pairs, sk=True)
-    assert (num_full, tail) == (0, 24) and tail < units <= pairs
-    assert (
-        iters >= SK_MIN_ITERS
-        and units * iters >= tail * 96
-        and (units - 1) * iters < tail * 96
-    )
-    num_full, tail, units, iters = stream_k_plan(24, 96, pairs, sk=True, max_units=30)
-    assert (
-        (num_full, tail) == (0, 24)
-        and tail < units <= 30
-        and iters == -(-24 * 96 // 30)
-    )
-    assert stream_k_plan(24, 96, pairs, sk=True, max_units=24) == (
-        24,
-        0,
-        0,
-        96,
-    )  # no more units than tiles
-    # a partial last wave
-    num_full, tail, units, iters = stream_k_plan(pairs + 10, 256, pairs, sk=True)
-    assert (num_full, tail) == (pairs, 10) and units > tail
-    # short K: the tail cannot be split into more units than tiles -> whole tiles only
-    assert stream_k_plan(pairs + 10, 1, pairs, sk=True) == (pairs + 10, 0, 0, 1)
-    # --- sk="tiles": the diagnostic whole-tile unit path ---
-    assert stream_k_plan(pairs + 10, 256, pairs, sk="tiles") == (pairs, 10, 10, 256)
-    assert stream_k_plan(0, 96, pairs, sk=True) == (0, 0, 0, 96)
-
-
-@pytest.mark.parametrize("pairs", [74, 76, 106])  # 148 / 152 / 212 SMs
-def test_stream_k_plans_give_every_unit_a_k_step(pairs):
-    # a unit without a K step never finishes in the pd 2 / sk_slab 2 / stt programs (the work handoff runs in an
-    # item's last segment): every linearised policy plans the units that hold one, and nothing more
-    for tiles in range(1, 2 * pairs + 3):
-        for k_blocks in range(1, 80):
-            for sk in ("auto", True):
-                num_full, tail, units, ipu = stream_k_plan(tiles, k_blocks, pairs, sk)
-                if units:
-                    assert (
-                        ipu >= 1 and (units - 1) * ipu < tail * k_blocks <= units * ipu
-                    )
-
-
-def test_check_stream_k_plan_refuses_a_plan_outside_the_launch_contract():
-    # the dgrad of T = 1024, N = 1032, K = 1000 on 76 CTA pairs: 16 tail tiles of 17 K steps, one partial wave
-    E = lambda *shape: torch.empty(*shape, dtype=torch.bfloat16)  # noqa: E731
-    kw = dict(sm_count=152, l2_bytes=L2_BYTES, _fallback=False)
-    plan, *_ = plan_dense_projection_gemm(
-        E(1024, 1032), E(1032, 1000), E(1024, 1000), pd=2, slots=2, epi="tma", **kw
-    )
-    assert plan.pd == 2 and (plan.tail_tiles, plan.k_blocks) == (16, 17)
-    assert (plan.sk_units, plan.iters_per_unit, plan.sk_iters) == (31, 9, 272)
-    check_stream_k_plan(plan)
-    # the 2 x tail units of the earlier plan: unit 31 starts at K step 279 of 272
-    with pytest.raises(ValueError, match="every stream-K unit to hold a K step"):
-        check_stream_k_plan(dataclasses.replace(plan, sk_units=32))
-    with pytest.raises(ValueError, match="every stream-K unit to hold a K step"):
-        check_stream_k_plan(dataclasses.replace(plan, iters_per_unit=0))
-    # the same empty unit is legal on a program that hands off at the bottom of the item loop
-    check_stream_k_plan(dataclasses.replace(plan, pd=0, sk_units=32))
-    # synchronised plans: a collector for every program, at most one per tail tile for the sk_slab 2 / stt ones
-    sync = dataclasses.replace(
-        plan, pd=0, sk_sync=True, sk_slab=2, sk_units=32, iters_per_unit=9
-    )
-    check_stream_k_plan(sync)
-    with pytest.raises(ValueError, match="collectors <= tail_tiles"):
-        check_stream_k_plan(dataclasses.replace(sync, sk_units=33))
-    check_stream_k_plan(dataclasses.replace(sync, sk_slab=0, sk_units=33))
-    for slab in (0, 2):
-        with pytest.raises(ValueError, match="1 <= collectors"):
-            check_stream_k_plan(dataclasses.replace(sync, sk_slab=slab, sk_units=16))
-
-
-def test_planner_defaults_to_auto_stream_k_and_guards_the_slice_counters():
-    # pure planner mirror (_fallback=False): synthetic shapes may name instances the export never generated
-    # the 24-tile swapped weight gradient (indexer_hw, T = 1001): one partial wave, K = 16 steps -> split.  The
-    # round-9 sm_100a rule plans this row's 64-row family (48 pair tiles, which 74 pairs cannot split two ways), so
-    # the 128-row family is forced here to keep the split under test
-    v = _views("proj", "indexer_hw", "wgrad", "bf16", 1001)
-    plan, *_ = plan_dense_projection_gemm(
-        v["A"],
-        v["B"],
-        v["out"],
-        sm_count=148,
-        l2_bytes=L2_BYTES,
-        _fallback=False,
-        transposed_out=v["transposed"],
-        cta_rows=128,
-    )
-    assert (plan.pair_tiles, plan.k_blocks) == (24, 16)
-    assert (plan.num_full, plan.tail_tiles, plan.sk_units, plan.iters_per_unit) == (
-        0,
-        24,
-        48,
-        8,
-    )
-    assert plan.grid == (96, 1, 1) and plan.sk_iters == 24 * 16
-    assert plan.ws_f32_elems == (48 + 24) * 2 * 128 * 128
-    assert plan.counters_u32 == 24 * 16 and plan.counters_alloc_u32 == 8192
-    off, *_ = plan_dense_projection_gemm(
-        v["A"],
-        v["B"],
-        v["out"],
-        sm_count=148,
-        l2_bytes=L2_BYTES,
-        _fallback=False,
-        transposed_out=v["transposed"],
-        cta_rows=128,
-        sk=False,
-    )
-    assert (off.num_full, off.tail_tiles, off.sk_units, off.iters_per_unit) == (
-        24,
-        0,
-        0,
-        16,
-    )
-    assert (
-        off.ws_f32_elems == 0
-        and off.counters_alloc_u32 == 8192
-        and _nopro(off.template) == _nopro(plan.template)
-    )
-    # stride-0 rows keep these planner-only views tiny: 300 tiles of 256 x 256 on a 1000-SM device (500 pairs)
-    # with the linearised policy put 300 tail tiles in flight -> 4800 slice counters exceed SK_DUMMY_BASE
-    A = torch.empty(1024, dtype=torch.bfloat16).as_strided((300 * 256, 1024), (0, 1))
-    W = torch.empty(1024, dtype=torch.bfloat16).as_strided((256, 1024), (0, 1))
-    out = torch.empty(256, dtype=torch.bfloat16).as_strided((300 * 256, 256), (0, 1))
-    assert SK_DUMMY_BASE == 4096
-    with pytest.raises(ValueError, match="slice-counter budget"):
-        plan_dense_projection_gemm(
-            A, W.t(), out, sm_count=1000, l2_bytes=L2_BYTES, _fallback=False, sk=True
-        )
-    plan, *_ = plan_dense_projection_gemm(
-        A, W.t(), out, sm_count=1000, l2_bytes=L2_BYTES, _fallback=False
-    )  # auto: 2 * 300 > 500 pairs -> whole tiles
-    assert (plan.num_full, plan.tail_tiles, plan.sk_units) == (300, 0, 0)
-
-
-def _views(family, row, op, out_dtype, T, device="cpu"):
-    """The training views of one row (empty tensors are enough for the planner)."""
-    dt = {"bf16": torch.bfloat16, "f32": torch.float32}[out_dtype]
-    if family == "proj":
-        K, N = PROJECTION_ROWS[row]
-        X = torch.empty(T, K, dtype=torch.bfloat16, device=device)
-        W = torch.empty(N, K, dtype=torch.bfloat16, device=device)
-        G = torch.empty(T, N, dtype=torch.bfloat16, device=device)
-        if op == "fwd":
-            return dict(
-                A=X,
-                B=W.t(),
-                out=torch.empty(T, N, dtype=dt, device=device),
-                X=X,
-                W=W,
-                G=G,
-            )
-        if op == "dgrad":
-            return dict(
-                A=G, B=W, out=torch.empty(T, K, dtype=dt, device=device), X=X, W=W, G=G
-            )
-        A, B, transposed = wgrad_views(G, X)
-        return dict(
-            A=A,
-            B=B,
-            out=torch.empty(N, K, dtype=dt, device=device),
-            transposed=transposed,
-            X=X,
-            W=W,
-            G=G,
-        )
-    spec = MLA_ROWS[row]
-    H, Din, Dout, slot = spec["H"], spec["D_in"], spec["D_out"], spec["act_stride_head"]
-    act = torch.empty(T, H, slot, dtype=torch.bfloat16, device=device)[..., :Din]
-    if spec["weight_layout"] == "in_out":
-        weight = torch.empty(H, Din, Dout, dtype=torch.bfloat16, device=device)
-        w_in_out = weight
-    else:
-        weight = torch.empty(H, Dout, Din, dtype=torch.bfloat16, device=device)
-        w_in_out = weight.transpose(1, 2)
-    d_out = torch.empty(T, H, Dout, dtype=torch.bfloat16, device=device)
-    if op == "fwd":
-        out = torch.empty(T, H, Dout, dtype=dt, device=device).permute(1, 0, 2)
-        return dict(
-            A=act.permute(1, 0, 2),
-            B=w_in_out,
-            out=out,
-            act=act,
-            weight=weight,
-            d_out=d_out,
-        )
-    if op == "dgrad":
-        buf = torch.empty(T, H, slot, dtype=dt, device=device)
-        return dict(
-            A=d_out.permute(1, 0, 2),
-            B=w_in_out.transpose(1, 2),
-            out=buf[..., :Din].permute(1, 0, 2),
-            buf=buf,
-            act=act,
-            weight=weight,
-            d_out=d_out,
-        )
-    if spec["weight_layout"] == "in_out":
-        A, B = act.permute(1, 2, 0), d_out.permute(1, 0, 2)
-    else:
-        A, B = d_out.permute(1, 2, 0), act.permute(1, 0, 2)
-    return dict(
-        A=A,
-        B=B,
-        out=torch.empty_like(weight, dtype=dt),
-        act=act,
-        weight=weight,
-        d_out=d_out,
-    )
-
-
-@pytest.mark.parametrize("sm_count", SM_COUNTS)
-@pytest.mark.parametrize(
-    "T", [2049, 1001]
-)  # K = T above / at or below the TMA-store epilogue bound
-def test_projection_rows_plan_like_the_cake_launcher(sm_count, T):
-    for row, (K, N) in PROJECTION_ROWS.items():
-        for op in ("fwd", "dgrad", "wgrad"):
-            for out_dtype in ("bf16", "f32") if op != "fwd" else ("bf16",):
-                v = _views("proj", row, op, out_dtype, T)
-                plan, a_desc, b_desc, out3 = plan_dense_projection_gemm(
-                    v["A"],
-                    v["B"],
-                    v["out"],
+def test_k1_planners_take_the_measured_rows(arch, sm_count, rows):
+    """The verdicts of the three architectures take 28 / 32 / 29 of the 124 weight-gradient rows (the MLA head rows,
+    ``L = 64``, run the deterministic program), at 16172 and 16231 tokens; on 148 SMs sm_103a leaves ``4096 -> 48`` to
+    the deterministic program (28 rows).  On sm_107a the token counts of :data:`K1_SPLIT_RULE_EXCLUDED_TOKENS` run the
+    deterministic program (five FP32 rows at 16231 tokens on 216 SMs).  The per-SM-count sm_107a tables take 19 rows on
+    212 SMs and 14 on 208 SMs; an SM count below 216 without a table takes none."""
+    taken = 0
+    for d_in, d_out in WGRAD_SHAPES:
+        for out_f32 in (False, True):
+            for T in (16231, 16172):
+                choice = cake_backend.k1_plan(
+                    arch=arch,
+                    L=1,
+                    M=d_in,
+                    N=d_out,
+                    K=T,
+                    out_f32=out_f32,
                     sm_count=sm_count,
-                    l2_bytes=L2_BYTES,
-                    transposed_out=v.get("transposed", False),
-                    arch=ARCH_OF_SM[sm_count],
                 )
-                rule = _rule_of(plan, sm_count)
-                _assert_mirrors_cake(
-                    plan,
-                    _expected(EXPECTED_TEMPLATES, (row, op, out_dtype), T, sm_count),
-                    (row, op, out_dtype, T, sm_count),
-                    ARCH_OF_SM[sm_count],
-                )
-                # round 19 (Cake W3): under the single-CTA form of a ``cta1`` rule the work items are CTA tiles, the
-                # concurrent units are the SMs and the grid is one CTA per work item (cluster dims 1)
-                cg = 1 if plan.cta1 else CTA_GROUP
-                assert plan.sm_pairs == sm_count // cg
-                assert plan.grid == ((plan.num_full + plan.sk_units) * cg, 1, 1)
-                assert plan.m_tiles % cg == 0
-                assert plan.k_blocks == -(-plan.K // BLOCK_K)
-                assert plan.pair_tiles == plan.L * (plan.m_tiles // cg) * plan.n_tiles
-                assert a_desc.stride(2) == 1 and b_desc.stride(2) == 1
-                # the knob defaults of the launcher (stage depth by tile shape, raster group, working-set-gated
-                # hints) unless the row's measured rule (ROW_RULES, round 2) pins a knob; a plan that landed on the
-                # nearest generated knob variant (knob_fallback) carries that variant's knobs instead
-                mirrored = not plan.knob_fallback
-                assert not mirrored or plan.cta_rows == rule.get("cta_rows", 128)
-                assert not mirrored or plan.cta1 == bool(rule.get("cta1", False))
-                assert _nopro(plan.template).endswith("_c1") == plan.cta1
-                # round 21 (Cake W3): the column-grouped raster of a ``cgrp`` rule (``_cg`` templates; the plan
-                # arithmetic is the pair form's, the hint gate takes the column raster's wave working set)
-                assert not mirrored or plan.cgrp == bool(rule.get("cgrp", False))
-                assert _nopro(plan.template).endswith(("_cg", "_cg_or")) == plan.cgrp
-                # round 24 (the round-20 Cake W3 knob, ported in round 23): the row-half release of an ``ovr`` rule (trailing
-                # ``_or`` templates, after ``_cg``; tall 256-column tiles only, the plan arithmetic is unchanged)
-                assert not mirrored or plan.ovr == bool(rule.get("ovr", False))
-                assert _nopro(plan.template).endswith("_or") == plan.ovr
-                assert not plan.cta1 or plan.cta_rows == 128
-                assert not mirrored or (
-                    plan.pf == rule.get("pf", 0)
-                    and plan.promo == rule.get("promo", "none")
-                )
-                assert not mirrored or plan.group_m == rule.get(
-                    "group_m",
-                    default_group_m(
-                        plan.a_mn,
-                        plan.b_mn,
-                        plan.m_tiles,
-                        plan.pair_tiles,
-                        plan.sm_pairs,
-                    ),
-                )
-                # the raster group width is a launch parameter since round 11: never a template suffix
-                # ("_gemm" is not one)
-                assert re.search(r"_g\d+", _nopro(plan.template)) is None
-                # round 13: the narrow MN-major B panels (``b_swz`` 64 / 32) have smaller stages and take the deepest
-                # pipeline that fits the opt-in, like the 64-row family
-                assert not mirrored or plan.b_swz == (
-                    rule.get("b_swz", 128) if plan.b_mn else 128
-                )
-                assert plan.stages == rule.get(
-                    "stages",
-                    default_stages(
-                        plan.slots,
-                        plan.cta_rows,
-                        plan.block_n,
-                        plan.b_mn,
-                        plan.b_swz,
-                        cg,
-                    ),
-                )
-                if (
-                    "stages" not in rule
-                    and plan.cta_rows == 128
-                    and plan.b_swz == 128
-                    and not plan.cta1
-                ):
-                    assert (
-                        plan.stages
-                        == {
-                            (256, 0): 7,
-                            (256, 1): 6,
-                            (256, 2): 5,
-                            (192, 0): 7,
-                            (192, 1): 6,
-                            (192, 2): 5,
-                            (128, 0): 9,
-                            (128, 1): 8,
-                            (128, 2): 6,
-                        }[(plan.block_n, plan.slots)]
-                    )
-                assert plan.l2_bytes == L2_BYTES
-                assert plan.wave_working_set_bytes == (
-                    wave_working_set_cgrp if plan.cgrp else wave_working_set
-                )(plan.m_tiles, plan.n_tiles, plan.K, plan.group_m, plan.sm_pairs)
-                assert not mirrored or plan.hints == tuple(
-                    rule.get(
-                        "hints",
-                        (default_hints_cgrp if plan.cgrp else default_hints)(
-                            plan.a_mn,
-                            plan.b_mn,
-                            plan.m_tiles,
-                            plan.n_tiles,
-                            plan.K,
-                            plan.group_m,
-                            plan.sm_pairs,
-                            L2_BYTES,
-                        ),
-                    )
-                )
-                if mirrored and "hints" not in rule:
-                    if plan.wave_working_set_bytes <= L2_BYTES:
-                        assert plan.hints == ("none", "none")
-                    if not (plan.a_mn and plan.b_mn) and plan.n_tiles > 1:
-                        assert plan.hints == ("none", "none")
-                assert (plan.n_tiles == 1) == (plan.N <= 256)
-                # stream-K tail policies in the Cake launcher's order (round 13): an exact ``sk_exact`` p-way split
-                # of every tail tile (one unit per part, identical K ranges on every tile) pre-empts the deterministic
-                # half-height tail wave (``htail``: the tail tiles become 2 x tail whole-K items, no partial slabs),
-                # which pre-empts a measured ``sk_parts`` rule (round 4, L20: every tail tile split p ways when the
-                # p * tail units fit the CTA pairs with SK_MIN_ITERS K steps each); otherwise "auto" = a two-part
-                # K-aligned split of a single partial wave, else whole tiles
-                tail = (
-                    plan.pair_tiles % plan.sm_pairs
-                    if plan.pair_tiles > plan.sm_pairs
-                    else plan.pair_tiles
-                )
-                exact = int(rule.get("sk_exact") or 0)
-                exact_plan = (
-                    sk_exact_plan(plan.pair_tiles, plan.k_blocks, plan.sm_pairs, exact)
-                    if exact
-                    else None
-                )
-                # round 18 (Cake W2): the synchronised stream-K plan of an ``sk_sync`` rule (main units + collectors, the
-                # rule's margin ``sk_sync_m``) yields to ``sk_exact`` and pre-empts ``htail`` / ``sk_parts``
-                sync_plan = (
-                    sk_sync_plan(
-                        plan.pair_tiles,
-                        plan.k_blocks,
-                        plan.sm_pairs,
-                        None,
-                        int(rule.get("sk_sync_m", 0)),
-                    )
-                    if rule.get("sk_sync") and exact_plan is None
-                    else None
-                )
-                htail = (
-                    bool(rule.get("htail"))
-                    and (
-                        plan.cta_rows == 256
-                        or (
-                            plan.cta_rows == 128
-                            and plan.block_n == 256
-                            and not plan.transposed_out
-                            and int(rule.get("pd", 0)) == 0
-                            and not int(rule.get("pf", 0))
-                        )
-                    )
-                    and exact_plan is None
-                    and sync_plan is None
-                    and 0 < 2 * tail <= plan.sm_pairs
-                )
-                parts = rule.get("sk_parts") if sync_plan is None else None
-                sk_rule = (
-                    sk_parts_plan(plan.pair_tiles, plan.k_blocks, plan.sm_pairs, parts)
-                    if parts and exact_plan is None
-                    else ("auto", None)
-                )
-                assert plan.sk_exact == (exact if exact_plan is not None else 0)
-                assert plan.htail == htail
-                assert plan.sk_sync == (sync_plan is not None)
-                assert ("_sks" in _nopro(plan.template)) == plan.sk_sync
-                # round 19 (Cake W2): the slab path of a rule's synchronised plan, with the launcher's yield rules for
-                # a rule-derived value (3 needs the fp32 TMA-store / transposed register epilogue, 2 needs the eight
-                # warp slabs to fit the mainloop stage ring); 0 on every other plan
-                sk_slab = int(rule.get("sk_slab", 0)) if sync_plan is not None else 0
-                if sk_slab == 3 and (
-                    not plan.out_f32 or (plan.epi == "reg" and not plan.transposed_out)
-                ):
-                    sk_slab = 2
-                if sk_slab == 2 and EPI_WARPS * epi_cols(
-                    plan.block_n, plan.cta_rows
-                ) * 128 > plan.stages * (
-                    plan.cta_rows * BLOCK_K * 2
-                    + b_stage_bytes(plan.b_mn, plan.block_n, plan.b_swz)
-                ):
-                    sk_slab = 0
-                assert plan.sk_slab == sk_slab
-                assert (f"_sb{sk_slab}" in _nopro(plan.template)) == bool(sk_slab)
-                if exact_plan is not None:
-                    assert (
-                        plan.num_full,
-                        plan.tail_tiles,
-                        plan.sk_units,
-                        plan.iters_per_unit,
-                    ) == exact_plan
-                    # exactly p units of ceil(k_blocks / p) K steps per tail tile, a non-empty last part, no drift;
-                    # the unit count may exceed the pairs (the persistent CTAs take several units)
-                    assert (plan.num_full, plan.tail_tiles, plan.sk_units) == (
-                        plan.pair_tiles - tail,
-                        tail,
-                        exact * tail,
-                    )
-                    assert (
-                        plan.iters_per_unit
-                        == -(-plan.k_blocks // exact)
-                        >= SK_MIN_ITERS
-                    )
-                    assert (exact - 1) * plan.iters_per_unit < plan.k_blocks
-                    assert plan.sk_iters == exact
-                elif sync_plan is not None:
-                    # n_t main units over [0, s) + C = min(pairs - n_t, n_t) collectors over the leftovers [s, K): one
-                    # wave of n_t + C units after the whole tiles, both parts at least SK_MIN_ITERS steps, one slab per
-                    # tail tile, s in iters_per_unit and n_t in sk_iters
-                    assert (
-                        plan.num_full,
-                        plan.tail_tiles,
-                        plan.sk_units,
-                        plan.iters_per_unit,
-                        plan.sk_collectors,
-                    ) == sync_plan
-                    assert (plan.num_full, plan.tail_tiles) == (
-                        plan.pair_tiles - tail,
-                        tail,
-                    )
-                    assert plan.sk_collectors == min(plan.sm_pairs - tail, tail) >= 1
-                    assert plan.sk_units == tail + plan.sk_collectors <= plan.sm_pairs
-                    q = -(-tail // plan.sk_collectors)
-                    assert plan.iters_per_unit == -(
-                        -(q * plan.k_blocks + int(rule.get("sk_sync_m", 0))) // (q + 1)
-                    )
-                    assert (
-                        SK_MIN_ITERS
-                        <= plan.iters_per_unit
-                        <= plan.k_blocks - SK_MIN_ITERS
-                    )
-                    assert plan.sk_iters == tail
-                    assert plan.ws_f32_elems == tail * 2 * plan.cta_rows * plan.block_n
-                elif htail:
-                    # 2 x tail half-height items of whole K: no partial slabs, no fixup, no counters in use beyond
-                    # the tail tiles; the tall tile may exceed one wave of pairs
-                    assert (
-                        plan.num_full,
-                        plan.tail_tiles,
-                        plan.sk_units,
-                        plan.iters_per_unit,
-                    ) == (plan.pair_tiles - tail, tail, 2 * tail, plan.k_blocks)
-                    assert plan.sk_iters == plan.sk_units * plan.k_blocks
-                    assert plan.ws_f32_elems == 0
-                elif sk_rule[0] is True:
-                    assert 0 < parts * tail <= plan.sm_pairs
-                    assert plan.k_blocks >= parts * SK_MIN_ITERS
-                    assert (
-                        plan.num_full,
-                        plan.tail_tiles,
-                        plan.sk_units,
-                        plan.iters_per_unit,
-                    ) == stream_k_plan(
-                        plan.pair_tiles, plan.k_blocks, plan.sm_pairs, *sk_rule
-                    )
-                    # p * tail linearised units of ceil(k_blocks / p) K steps; when p does not divide k_blocks
-                    # the unit count is re-derived from that step count and lands below p * tail (the kernel's
-                    # two-segment units absorb the drift)
-                    assert (plan.num_full, plan.tail_tiles) == (
-                        plan.pair_tiles - tail,
-                        tail,
-                    )
-                    assert plan.iters_per_unit == -(-plan.k_blocks // parts)
-                    assert tail < plan.sk_units <= parts * tail
-                    assert plan.sk_units == -(
-                        -(tail * plan.k_blocks) // plan.iters_per_unit
-                    )
-                elif plan.sk_units:
-                    assert (
-                        plan.pair_tiles <= plan.sm_pairs
-                        and 2 * plan.tail_tiles <= plan.sm_pairs
-                    )
-                    assert plan.k_blocks >= 2 * SK_MIN_ITERS
-                    # the units of ceil(k_blocks / 2) K steps that hold one: 2 x tail on an even k_blocks
-                    assert plan.iters_per_unit == -(-plan.k_blocks // 2)
-                    assert (plan.num_full, plan.tail_tiles, plan.sk_units) == (
-                        0,
-                        plan.pair_tiles,
-                        -(-(plan.pair_tiles * plan.k_blocks) // plan.iters_per_unit),
-                    )
-                if plan.sk_units and not htail and sync_plan is None:
-                    assert (
-                        plan.ws_f32_elems
-                        == (plan.sk_units + plan.tail_tiles)
-                        * 2
-                        * plan.cta_rows
-                        * plan.block_n
-                    )
-                    if exact_plan is None:
-                        assert plan.sk_iters == plan.tail_tiles * plan.k_blocks
-                elif not plan.sk_units:
-                    assert (plan.num_full, plan.tail_tiles, plan.iters_per_unit) == (
-                        plan.pair_tiles,
-                        0,
-                        plan.k_blocks,
-                    )
-                    # (the single-CTA form carries no tail policy: whole tiles whatever the wave count)
-                    assert (
-                        plan.cta1
-                        or plan.pair_tiles > plan.sm_pairs
-                        or 2 * plan.pair_tiles > plan.sm_pairs
-                        or plan.k_blocks < 2 * SK_MIN_ITERS
-                    )
-                    assert plan.ws_f32_elems == 0
-                assert plan.tail_tiles * 16 <= SK_DUMMY_BASE
-                assert (
-                    plan.counters_alloc_u32
-                    == max(8192, plan.tail_tiles * 16)
-                    >= SK_DUMMY_BASE + 16 * 32
-                )
-                if op == "fwd":
-                    assert (
-                        (plan.M, plan.N, plan.K) == (T, N, K)
-                        and not plan.a_mn
-                        and not plan.b_mn
-                    )
-                elif op == "dgrad":
-                    assert (
-                        (plan.M, plan.N, plan.K) == (T, K, N)
-                        and not plan.a_mn
-                        and plan.b_mn
-                    )
-                elif wgrad_swapped(
-                    N, K
-                ):  # work-minimising swap (round 3): X.T @ G with the transposed store
-                    assert (plan.M, plan.N, plan.K) == (K, N, T) and plan.transposed_out
-                else:
-                    assert (
-                        (plan.M, plan.N, plan.K) == (N, K, T)
-                        and plan.a_mn
-                        and plan.b_mn
-                    )
-                assert not mirrored or plan.block_n == rule.get(
-                    "block_n", default_block_n(plan.N, plan.b_mn)
-                )
-
-
-# MLA rows: in_out weights are MN-major as B of the forward and K-major as B of the input gradient
-# (out_in the other way round); the weight gradient contracts over T with both operands MN-major.
-MLA_T = (2049, 1001, 33)
-
-
-@pytest.mark.parametrize("sm_count", SM_COUNTS)
-@pytest.mark.parametrize("T", MLA_T)
-def test_mla_rows_plan_as_batched_views(T, sm_count):
-    for row in MLA_ROWS:
-        for op in ("fwd", "dgrad", "wgrad"):
-            v = _views("mla", row, op, "bf16", T)
-            plan, a_desc, b_desc, out3 = plan_dense_projection_gemm(
-                v["A"],
-                v["B"],
-                v["out"],
+                if choice is not None:
+                    block_n, splits = choice
+                    assert block_n in cake_backend.K1_BLOCK_N_CHOICES and splits >= 1
+                    taken += 1
+    for d_in, d_out in ((192, 512), (512, 256)):
+        assert (
+            cake_backend.k1_plan(
+                arch=arch,
+                L=64,
+                M=d_in,
+                N=d_out,
+                K=16231,
+                out_f32=False,
                 sm_count=sm_count,
-                l2_bytes=L2_BYTES,
-                arch=ARCH_OF_SM[sm_count],
             )
-            assert plan.L == 64 and out3.shape[0] == 64
-            _assert_mirrors_cake(
-                plan,
-                _expected(MLA_TEMPLATES, (row, op), T, sm_count),
-                (row, op, T, sm_count),
-                ARCH_OF_SM[sm_count],
-            )
-            # the swapped plans (weight gradients; the tiny-T forward / input gradient) store transposed: the register
-            # epilogue's ``_t`` templates or, since round 14, the transposed TMA-store epilogue's ``_t_tma<slots>`` ones
-            assert plan.transposed_out == _transposed_template(_nopro(plan.template))
-            rule = _rule_of(plan, sm_count)
-            mirrored = not plan.knob_fallback
-            assert not mirrored or plan.hints == tuple(
-                rule.get(
-                    "hints",
-                    default_hints(
-                        plan.a_mn,
-                        plan.b_mn,
-                        plan.m_tiles,
-                        plan.n_tiles,
-                        plan.K,
-                        plan.group_m,
-                        plan.sm_pairs,
-                        L2_BYTES,
-                    ),
-                )
-            )
-            assert not mirrored or plan.group_m == rule.get(
-                "group_m",
-                default_group_m(
-                    plan.a_mn, plan.b_mn, plan.m_tiles, plan.pair_tiles, plan.sm_pairs
-                ),
-            )
-    # qabs dgrad writes the first 192 columns of a 256-wide slot of a token-major [T, H, 256] buffer:
-    # the [H, T, D] output view has batch stride 256 (heads) and row stride 64 * 256 (tokens)
-    v = _views("mla", "qabs", "dgrad", "bf16", 33)
-    plan, _, _, out3 = plan_dense_projection_gemm(
-        v["A"], v["B"], v["out"], sm_count=148, l2_bytes=L2_BYTES
+            is None
+        )
+    assert taken == rows
+
+
+def test_k1_planner_choices():
+    kw = dict(L=1, K=16231, out_f32=False)
+    # sm_103a: 64-wide tiles, 128-wide for d_out = 128 from d_in 5120 up; a row without a verdict runs det
+    assert cake_backend.k1_plan(arch="sm_103a", M=4096, N=32, sm_count=148, **kw) == (
+        64,
+        2,
     )
-    assert (out3.stride(0), out3.stride(1), out3.stride(2)) == (256, 64 * 256, 1)
-    # A = d_out [H, T, 512] K-major, B = the in_out weight transposed ([H, 512, 192], k contiguous) K-major;
-    # N = 192: BLOCK_N = 192 (one exact tile); the 96-column CTA halves cannot use the 64-column TMA-store chunks,
-    # so the row runs the register epilogue (round 3; K = 512 <= 1024 would otherwise pick the TMA-store epilogue)
-    _assert_mirrors_cake(
-        plan,
-        _expected(MLA_TEMPLATES, ("qabs", "dgrad"), 33, 148),
-        ("qabs", "dgrad", 33, 148),
-        "sm_100a",
-    )
-    assert plan.block_n == default_block_n(192, False) == 192
-    assert _nopro(plan.template).startswith("dense_proj_gemm_kk_n192") and not _nopro(
-        plan.template
-    ).endswith("_tma1")
-
-
-def test_operand_view_classification_and_rejections():
-    A = torch.empty(4, 16, 64, dtype=torch.bfloat16)
-    mn, desc = operand_view(A, "A", k_axis=2)
-    assert not mn and desc.shape == A.shape
-    # the transposed view keeps K contiguous: with K on axis 1 it is still K-major, with the
-    # contraction on axis 2 (stride 64) and M unit-strided it is MN-major and desc = [L, M, K]
-    mn, desc = operand_view(A.transpose(1, 2), "A", k_axis=1)
-    assert not mn and tuple(desc.shape) == (4, 16, 64)
-    mn, desc = operand_view(A.transpose(1, 2), "A", k_axis=2)
-    assert mn and tuple(desc.shape) == (4, 16, 64)
-    with pytest.raises(ValueError, match="unit stride"):
-        operand_view(
-            torch.empty(4, 16, 64, dtype=torch.bfloat16)[:, :, ::2], "A", k_axis=2
-        )
-    with pytest.raises(ValueError, match="multiples of 8"):
-        operand_view(
-            torch.empty(1, 16, 68, dtype=torch.bfloat16)[:, :, :64], "A", k_axis=2
-        )
-    with pytest.raises(ValueError, match="16-byte aligned"):
-        operand_view(
-            torch.empty(1, 16, 72, dtype=torch.bfloat16)[:, :, 4:68], "A", k_axis=2
-        )
-    A2 = torch.empty(16, 64, dtype=torch.bfloat16)
-    B2 = torch.empty(64, 24, dtype=torch.bfloat16)
-    with pytest.raises(ValueError, match="bf16"):
-        plan_dense_projection_gemm(
-            A2.float(), B2, torch.empty(16, 24), sm_count=148, l2_bytes=L2_BYTES
-        )
-    with pytest.raises(ValueError, match="bf16 or fp32"):
-        plan_dense_projection_gemm(
-            A2,
-            B2,
-            torch.empty(16, 24, dtype=torch.float16),
-            sm_count=148,
-            l2_bytes=L2_BYTES,
-        )
-    with pytest.raises(ValueError, match=r"B must be \[L=1, K=64, N\]"):
-        plan_dense_projection_gemm(
-            A2,
-            torch.empty(32, 24, dtype=torch.bfloat16),
-            torch.empty(16, 24),
-            sm_count=148,
-            l2_bytes=L2_BYTES,
-        )
-    with pytest.raises(ValueError, match="out must be"):
-        plan_dense_projection_gemm(
-            A2, B2, torch.empty(24, 16), sm_count=148, l2_bytes=L2_BYTES
-        )
-    with pytest.raises(ValueError, match="multiple of 8"):
-        plan_dense_projection_gemm(
-            A2,
-            torch.empty(64, 20, dtype=torch.bfloat16),
-            torch.empty(16, 20),
-            sm_count=148,
-            l2_bytes=L2_BYTES,
-        )
-    with pytest.raises(ValueError, match="unit inner stride"):
-        plan_dense_projection_gemm(
-            A2, B2, torch.empty(24, 16).t(), sm_count=148, l2_bytes=L2_BYTES
-        )
-    # transposed output: [N, M] with unit stride on m
-    plan, *_ = plan_dense_projection_gemm(
-        A2,
-        B2,
-        torch.empty(24, 16),
-        sm_count=148,
-        l2_bytes=L2_BYTES,
-        transposed_out=True,
-    )
-    assert (
-        plan.transposed_out
-        and plan.epi == "reg"
-        and _nopro(plan.template).endswith("_t")
-    )
-
-
-def test_wgrad_swap_rule():
-    # work-minimising orientation (round 3): the swapped GEMM X.T @ G with the transposed store runs when its padded
-    # tile work is smaller - the small-N rows (N = 32, K = 6144) and the 576-wide kv_a row; equal work keeps G.T @ X
-    X = torch.empty(100, 6144, dtype=torch.bfloat16)
-    G = torch.empty(100, 32, dtype=torch.bfloat16)
-    assert wgrad_swapped(32, 6144)
-    A, B, transposed = wgrad_views(G, X)
-    assert transposed and A.shape == (6144, 100) and B is G
-    G = torch.empty(100, 576, dtype=torch.bfloat16)
-    assert wgrad_swapped(576, 6144)  # 3 x 192 columns over K instead of 256 + 256 + 64
-    A, B, transposed = wgrad_views(G, X)
-    assert transposed and A.shape == (6144, 100) and B is G
-    G = torch.empty(100, 256, dtype=torch.bfloat16)
-    assert not wgrad_swapped(256, 6144)  # a tie keeps the direct route
-    A, B, transposed = wgrad_views(G, X)
-    assert not transposed and A.shape == (256, 100) and B is X
-    assert not wgrad_swapped(6144, 2048) and not wgrad_swapped(
-        32, 64
-    )  # large N; a 32 x 64 tie
-
-
-def test_batched_small_m_swap_and_row_rules():
-    # pure planner mirror (_fallback=False): synthetic rules may name instances the export never generated
-    # MLA weight gradient dW[h] = A_h^T B_h with M = 192, N = 512 (K = T = 1001): the planner runs the transposed GEMM
-    # (A' = B^T [H, 512, T], B' = A^T [H, T, 192], transposed store into the caller's [H, 192, 512] view)
-    H, T, M, N = 4, 1001, 192, 512
-    Q = torch.empty(T, H, M, dtype=torch.bfloat16)
-    dL = torch.empty(T, H, N, dtype=torch.bfloat16)
-    out = torch.empty(H, M, N, dtype=torch.bfloat16)
-    assert swap_small_m(H, M, N, False) and not swap_small_m(1, M, N, False)
-    assert not swap_small_m(H, 512, 192, False) and not swap_small_m(H, M, N, True)
-    plan, a_desc, b_desc, out3 = plan_dense_projection_gemm(
-        Q.permute(1, 2, 0),
-        dL.permute(1, 0, 2),
-        out,
-        sm_count=148,
-        l2_bytes=L2_BYTES,
-        _fallback=False,
-    )
-    assert (plan.L, plan.M, plan.N, plan.K) == (H, N, M, T)
-    assert (
-        plan.a_mn and plan.b_mn and plan.transposed_out and plan.block_n == 192
-    )  # N' = 192: one exact tile
-    assert _nopro(plan.template).startswith(
-        "dense_proj_gemm_nn_n192"
-    ) and _transposed_template(_nopro(plan.template))
-    # round 14: the sm_100a qabs weight-gradient rule puts the swapped tile on the tall transposed TMA-store family
-    assert _nopro(plan.template) == "dense_proj_gemm_nn_n192_m256_t_tma1"
-    assert plan.epi == "tma" and plan.cta_rows == 256 and plan.slots == 1
-    assert tuple(out3.shape) == (H, M, N)
-    # the rule table: exact (N, K, M) first, then the ragged-M (N, K, None) key, then the ragged-K (N, None, M) key
-    ident = ("sm_100a", True, True, False, True, True)
-    saved = dict(ROW_RULES)
-    try:
-        ROW_RULES.clear()
-        ROW_RULES[ident + (M, None, N)] = {"cta_rows": 256}
-        assert row_rule("sm_100a", True, True, False, True, True, M, T, N) == {
-            "pro": 7,
-            "cta_rows": 256,
-        }
-        assert row_rule("sm_107a", True, True, False, True, True, M, T, N) == {"pro": 7}
-        ROW_RULES[ident + (M, T, None)] = {"group_m": 8}
-        assert row_rule("sm_100a", True, True, False, True, True, M, T, N) == {
-            "pro": 7,
-            "group_m": 8,
-        }
-        ROW_RULES[ident + (M, T, N)] = {"group_m": 4}
-        assert row_rule("sm_100a", True, True, False, True, True, M, T, N) == {
-            "pro": 7,
-            "group_m": 4,
-        }
-        # a rule fills only the knobs the caller left unset
-        ROW_RULES.clear()
-        ROW_RULES[ident + (M, None, N)] = {"cta_rows": 256, "group_m": 8}
-        ruled, *_ = plan_dense_projection_gemm(
-            Q.permute(1, 2, 0),
-            dL.permute(1, 0, 2),
-            out,
-            sm_count=148,
-            l2_bytes=L2_BYTES,
-            _fallback=False,
-            arch="sm_100a",
-        )
-        # group_m is a launch parameter (round 11): it is planned from the rule but is not a template axis
+    # d_out 48 at d_in 4096: from 152 SMs only (K1_RULE_MIN_SM_COUNT)
+    for out_f32 in (False, True):
+        k48 = dict(arch="sm_103a", L=1, M=4096, N=48, K=16231, out_f32=out_f32)
+        assert cake_backend.k1_plan(sm_count=152, **k48) == (64, 2)
+        assert cake_backend.k1_plan(sm_count=148, **k48) is None
+        # d_out 64 at d_in 4096 was measured and missed
+        key = ("sm_103a", 1, 4096, 64, "f32" if out_f32 else "bf16")
+        assert key in cake_backend.K1_SPLIT_RULES
+        assert cake_backend.K1_SPLIT_RULES[key] is None
         assert (
-            ruled.cta_rows == 256
-            and ruled.group_m == 8
-            and "_m256" in _nopro(ruled.template)
-            and re.search(r"_g\d+", _nopro(ruled.template)) is None
-        )
-        pinned, *_ = plan_dense_projection_gemm(
-            Q.permute(1, 2, 0),
-            dL.permute(1, 0, 2),
-            out,
-            sm_count=148,
-            l2_bytes=L2_BYTES,
-            _fallback=False,
-            arch="sm_100a",
-            cta_rows=128,
-        )
-        assert pinned.cta_rows == 128 and pinned.group_m == 8
-        # a caller-forced tile family (round 9) keeps the rule's other knobs but drops the family-bound ones
-        # (stages, slots, epi); the 64-row Layout-B family plans like any other
-        ROW_RULES.clear()
-        ROW_RULES[ident + (M, None, N)] = {
-            "cta_rows": 256,
-            "group_m": 8,
-            "stages": 3,
-            "epi": "reg",
-        }
-        ruled, *_ = plan_dense_projection_gemm(
-            Q.permute(1, 2, 0),
-            dL.permute(1, 0, 2),
-            out,
-            sm_count=148,
-            l2_bytes=L2_BYTES,
-            _fallback=False,
-            arch="sm_100a",
-        )
-        assert (ruled.cta_rows, ruled.stages, ruled.group_m) == (256, 3, 8)
-        assert _nopro(ruled.template) == "dense_proj_gemm_nn_n192_m256_t_s3"
-        for rows, template in (
-            (128, "dense_proj_gemm_nn_n192_t"),
-            (64, "dense_proj_gemm_nn_n192_m64_t"),
-        ):
-            forced, *_ = plan_dense_projection_gemm(
-                Q.permute(1, 2, 0),
-                dL.permute(1, 0, 2),
-                out,
-                sm_count=148,
-                l2_bytes=L2_BYTES,
-                _fallback=False,
-                arch="sm_100a",
-                cta_rows=rows,
+            cake_backend.k1_plan(
+                arch="sm_103a",
+                M=4096,
+                N=64,
+                sm_count=152,
+                L=1,
+                K=16231,
+                out_f32=out_f32,
             )
-            assert (forced.cta_rows, forced.group_m, forced.epi) == (rows, 8, "reg")
-            assert forced.stages == default_stages(
-                forced.slots, rows, forced.block_n, forced.b_mn
-            )
-            assert _nopro(forced.template) == template
-    finally:
-        ROW_RULES.clear()
-        ROW_RULES.update(saved)
-
-
-@pytest.mark.parametrize("pairs", [74, 106])  # 148 SMs (B200) / 212 SMs (R200)
-def test_sk_parts_rule(pairs):
-    # Cake round 4 (L20): a measured ``sk_parts = p`` row rule splits every tail tile p ways when the units
-    # fit the CTA pairs and keep SK_MIN_ITERS K steps each; otherwise the row keeps the ``auto`` policy.
-    assert sk_parts_plan(24, 254, pairs, 3) == (True, 72)
-    assert sk_parts_plan(24, 254, pairs, 2) == (True, 48)
-    assert stream_k_plan(24, 254, pairs, *sk_parts_plan(24, 254, pairs, 3)) == (
-        0,
-        24,
-        72,
-        85,
+            is None
+        )
+    assert cake_backend.k1_plan(arch="sm_103a", M=6144, N=128, sm_count=152, **kw) == (
+        128,
+        2,
     )
-    assert sk_parts_plan(72, 254, pairs, 2) == (
-        "auto",
-        None,
-    )  # 2 * 72 units do not fit either pair count
-    assert sk_parts_plan(24, 3 * SK_MIN_ITERS - 1, pairs, 3) == (
-        "auto",
-        None,
-    )  # too few K steps per unit
-    assert sk_parts_plan(24, 254, pairs, 1) == ("auto", None)
-    assert sk_parts_plan(pairs, 254, pairs, 2) == (
-        "auto",
-        None,
-    )  # a full wave has no tail
-    if pairs == 106:
-        # indexer_q wgrad on R200: 128-wide tiles -> 256 pair tiles (tail 44, p = 2 -> 88 units);
-        # 256-wide tiles -> 128 pair tiles (tail 22, p = 3 -> 66 units)
-        assert sk_parts_plan(256, 254, pairs, 2) == (True, 88)
-        assert stream_k_plan(256, 254, pairs, True, 88) == (212, 44, 88, 127)
-        assert sk_parts_plan(128, 254, pairs, 3) == (True, 66)
-        assert stream_k_plan(128, 254, pairs, True, 66) == (106, 22, 66, 85)
-    else:
-        # on B200 the 128-tile row's tail of 54 admits no split: the rule falls back to auto (whole tiles)
-        assert sk_parts_plan(128, 254, pairs, 3) == ("auto", None)
-    # the sm_107a rules adopted in round 4 (round 8 adds the 4-tile raster group to the bf16 indexer_q wgrad rule) ...
-    # (round 9 moves the indexer_q weight gradients onto 256 x 160 tiles and the N = 128 swapped weight gradient
-    # onto the 64-row family; round 13 adds the 64-byte MN-major B panels (b_swz 64) to the indexer_q weight gradients
-    # and replaces the sk_parts split of the indexer_k / indexer_hw weight gradients by the exact p-way split (sk_exact))
-    assert ROW_RULES[
-        ("sm_107a", True, True, False, False, False, 2048, None, 4096)
-    ] == {
-        "block_n": 160,
-        "cta_rows": 256,
-        "group_m": 4,
-        "sk_parts": 2,
-        "b_swz": 64,
-        "pro": 15,
-    }
-    # round 17 (L61): the fp32 weight gradient leaves through the evict-first 8-wide register stores
-    assert ROW_RULES[("sm_107a", True, True, True, False, False, 2048, None, 4096)] == {
-        "block_n": 160,
-        "cta_rows": 256,
-        "sk_parts": 3,
-        "b_swz": 64,
-        "epi": "reg",
-        "f32_v8": True,
-        "store_ef": True,
-        "pro": 15,
-    }
-    for f32 in (False, True):
-        assert ROW_RULES[("sm_107a", True, True, f32, True, False, 32, None, 6144)] == {
-            "block_n": 128,
-            "sk_exact": 3,
-        }
-        assert ROW_RULES[
-            ("sm_107a", True, True, f32, True, False, 128, None, 6144)
-        ] == {"block_n": 128, "cta_rows": 64, "sk_exact": 2, "pro": 15}
-    # ... and their plans through the planner (CPU views; the launch grid is num_full + sk_units pairs)
-    if pairs == 106:
-        T = 16231
-        # round 9: the indexer_q weight gradients plan 256 x 160 tiles (104 pair tiles = one wave on 106 pairs, so
-        # the sk_parts split does not fit and the row keeps whole tiles) and the N = 128 swapped weight gradient
-        # plans the 64-row family (48 pair tiles; 3 x 48 units do not fit -> the auto two-way split)
-        for row, dt, want in (
-            ("indexer_q", "f32", (160, 104, 0, 0, 254)),
-            ("indexer_q", "bf16", (160, 104, 0, 0, 254)),
-            ("indexer_hw", "bf16", (128, 0, 24, 72, 85)),
-            ("indexer_k", "f32", (128, 0, 48, 96, 127)),
-        ):
-            v = _views("proj", row, "wgrad", dt, T)
-            plan = plan_dense_projection_gemm(
-                v["A"],
-                v["B"],
-                v["out"],
-                sm_count=212,
-                l2_bytes=L2_BYTES,
-                transposed_out=v.get("transposed", False),
+    assert (
+        cake_backend.k1_plan(arch="sm_103a", M=8192, N=128, sm_count=152, **kw) is None
+    )
+    # a thin row that was never measured runs the deterministic program
+    assert (
+        cake_backend.k1_plan(arch="sm_103a", M=2048, N=32, sm_count=152, **kw) is None
+    )
+    # sm_100a: (64, 2), on 148 SMs as on 152
+    assert cake_backend.k1_plan(arch="sm_100a", M=5120, N=64, sm_count=148, **kw) == (
+        64,
+        2,
+    )
+    assert (
+        cake_backend.k1_plan(arch="sm_100a", M=5120, N=128, sm_count=148, **kw) is None
+    )
+    # below the SM-count floor every row runs the deterministic program
+    assert (
+        cake_backend.k1_plan(arch="sm_100a", M=4096, N=64, sm_count=120, **kw) is None
+    )
+    # d_out = 128 at d_in 4096 was measured and missed on every architecture
+    for arch, sms in SM_COUNTS.items():
+        assert (
+            cake_backend.k1_plan(arch=arch, M=4096, N=128, sm_count=sms, **kw) is None
+        )
+    # sm_107a: the 216-SM verdicts from 216 SMs; below, the table of the part's own SM count (208, 212) or none
+    assert cake_backend.k1_plan(arch="sm_107a", M=4096, N=32, sm_count=216, **kw) == (
+        64,
+        4,
+    )
+    for sms in (208, 212):
+        assert (
+            cake_backend.k1_plan(arch="sm_107a", M=4096, N=32, sm_count=sms, **kw)
+            is None
+        )
+    assert (
+        cake_backend.k1_plan(arch="sm_107a", M=4096, N=32, sm_count=210, **kw) is None
+    )
+
+    def p107(M, N, sms, out_f32=False):
+        return cake_backend.k1_plan(
+            arch="sm_107a", L=1, M=M, N=N, K=16231, out_f32=out_f32, sm_count=sms
+        )
+
+    for sms in (208, 212):
+        assert p107(4096, 32, sms, out_f32=True) == (64, 3)
+        # 4096 -> 512 BF16 was measured and missed on every SM count
+        assert p107(4096, 512, sms) is None
+        # 4096 -> 32, 4096 -> 64, 5120 -> 32 BF16 and 6144 -> 32: no verdict (their deterministic program did not
+        # complete)
+        for M, N in ((4096, 32), (4096, 64), (5120, 32), (6144, 32)):
+            assert p107(M, N, sms) is None
+    # 4096 -> 4096 FP32: the deterministic program on 208, 212 and 216 SMs
+    assert p107(4096, 4096, 212, out_f32=True) is None
+    assert p107(4096, 4096, 208, out_f32=True) is None
+    assert p107(4096, 4096, 216, out_f32=True) is None
+    # 6144 -> 32 FP32: three splits on 216 SMs, the deterministic program on 208 and 212
+    assert p107(6144, 32, 212, out_f32=True) is None
+    assert p107(6144, 32, 216, out_f32=True) == (64, 3)
+    assert p107(6144, 32, 208, out_f32=True) is None
+    assert p107(8192, 128, 212) == (128, 2)
+    assert p107(8192, 128, 208) is None
+    # 5120 -> 1024 BF16: one split of 256-wide tiles on 216 SMs; on 208 it misses, on 212 it runs the deterministic
+    # program as well
+    assert p107(5120, 1024, 212) is None
+    assert p107(5120, 1024, 216) == (256, 1)
+    assert p107(5120, 1024, 208) is None
+    assert (
+        cake_backend.k1_plan(arch="sm_107a", M=4096, N=48, sm_count=216, **kw) is None
+    )
+    assert cake_backend.k1_plan(
+        arch="sm_107a", M=4096, N=512, sm_count=216, L=1, K=16172, out_f32=True
+    ) == (128, 1)
+    # ... and the deterministic program at the token counts of K1_SPLIT_RULE_EXCLUDED_TOKENS
+    assert (
+        cake_backend.k1_plan(
+            arch="sm_107a", M=4096, N=512, sm_count=216, L=1, K=16231, out_f32=True
+        )
+        is None
+    )
+    # measured and missed on sm_107a: 4096 -> 64 BF16, 4096 -> 512 BF16, 4096 -> 4096 FP32
+    for N, out_f32 in ((64, False), (512, False), (4096, True)):
+        key = ("sm_107a", 1, 4096, N, "f32" if out_f32 else "bf16")
+        assert key in cake_backend.K1_SPLIT_RULES
+        assert cake_backend.K1_SPLIT_RULES[key] is None
+        assert (
+            cake_backend.k1_plan(
                 arch="sm_107a",
-                _fallback=False,
-            )[0]
-            assert (
-                plan.block_n,
-                plan.num_full,
-                plan.tail_tiles,
-                plan.sk_units,
-                plan.iters_per_unit,
-            ) == want, (row, dt)
-            assert plan.num_cluster_tiles == want[1] + want[3]
-        # an explicit caller split wins over the rule, and sm_100a keeps its own (ruleless) plan
-        v = _views("proj", "indexer_hw", "wgrad", "bf16", T)
-        pinned = plan_dense_projection_gemm(
-            v["A"],
-            v["B"],
-            v["out"],
-            sm_count=212,
-            l2_bytes=L2_BYTES,
-            transposed_out=v["transposed"],
-            arch="sm_107a",
-            _fallback=False,
-            sk=True,
-            sk_max_units=48,
-        )[0]
-        assert (pinned.tail_tiles, pinned.sk_units, pinned.iters_per_unit) == (
-            24,
-            48,
-            127,
-        )
-        # (sm_100a has no sk_parts rule; its round-9 rule plans the 64-row family for this row, so the 128-row
-        # family is forced to keep the auto two-way split of the 24 tiles under test)
-        other = plan_dense_projection_gemm(
-            v["A"],
-            v["B"],
-            v["out"],
-            sm_count=148,
-            l2_bytes=L2_BYTES,
-            transposed_out=v["transposed"],
-            arch="sm_100a",
-            _fallback=False,
-            cta_rows=128,
-        )[0]
-        assert (
-            (other.pair_tiles, other.tail_tiles, other.sk_units)
-            == (
-                24,
-                24,
-                48,
+                M=4096,
+                N=N,
+                sm_count=216,
+                L=1,
+                K=16231,
+                out_f32=out_f32,
             )
-        )  # sm_100a has no sk_parts rule: its 128-wide tiles keep the auto two-way split
-        forced = plan_dense_projection_gemm(
-            v["A"],
-            v["B"],
-            v["out"],
-            sm_count=148,
-            l2_bytes=L2_BYTES,
-            transposed_out=v["transposed"],
-            arch="sm_100a",
-            _fallback=False,
-            cta_rows=128,
-            sk_parts=3,
-        )[0]
+            is None
+        )
+    for out_f32 in (False, True):
+        key = ("sm_107a", 1, 4096, 128, "f32" if out_f32 else "bf16")
+        assert cake_backend.K1_SPLIT_RULES[key] is None  # measured, missed
         assert (
-            forced.pair_tiles,
-            forced.tail_tiles,
-            forced.sk_units,
-            forced.iters_per_unit,
-        ) == (24, 24, 72, 85)  # ... unless the caller passes ``sk_parts`` (round 9)
-
-
-def test_f32_v8_symbol_only_on_the_fp32_register_epilogue():
-    assert (
-        instance_symbol(
-            instance_key(a_mn=False, b_mn=True, out_f32=True, epi="reg", f32_v8=True)
+            cake_backend.k1_plan(
+                arch="sm_107a",
+                M=4096,
+                N=128,
+                sm_count=216,
+                L=1,
+                K=16231,
+                out_f32=out_f32,
+            )
+            is None
         )
-        == "dense_proj_gemm_kn_n256_f32_v8"
-    )
-    # the knob is inert on the TMA-store, bf16 and transposed epilogues (same key and symbol as without it)
-    assert instance_key(
-        a_mn=False, b_mn=True, out_f32=True, f32_v8=True
-    ) == instance_key(a_mn=False, b_mn=True, out_f32=True)
-    assert instance_key(a_mn=False, b_mn=True, f32_v8=True) == instance_key(
-        a_mn=False, b_mn=True
-    )
-    assert instance_key(
-        a_mn=True, b_mn=True, out_f32=True, out_t=True, f32_v8=True
-    ) == instance_key(a_mn=True, b_mn=True, out_f32=True, out_t=True)
+    assert cake_backend.k1_plan(arch="sm_90a", M=4096, N=32, sm_count=132, **kw) is None
 
 
-def test_router_layout_classification_and_swap():
-    T, K, N = 100, 6144, 256
-    X = torch.empty(T, K)
-    W = torch.empty(N, K)
-    G = torch.empty(T, N)
-    plan, A_eff, B_eff = plan_router_fp32_gemm(X, W.t(), torch.empty(T, N))
-    assert (plan.layout, plan.template, plan.splits) == (
-        "kk",
-        "router_fp32_gemm_kk",
-        ROUTER_SPLITS["kk"],
-    )
-    assert not plan.swapped and (plan.M, plan.N, plan.K) == (T, N, K)
-    plan, A_eff, B_eff = plan_router_fp32_gemm(G, W, torch.empty(T, K))
-    assert (plan.layout, plan.template, plan.splits) == ("kn", "router_fp32_gemm_kn", 1)
-    assert (plan.M, plan.N, plan.K) == (T, K, N) and plan.b_mn
-    plan, A_eff, B_eff = plan_router_fp32_gemm(G.t(), X, torch.empty(N, K))
-    assert (plan.layout, plan.template, plan.splits) == (
-        "nn_t",
-        "router_fp32_gemm_nn_t",
-        11,
-    )
+def test_k1_verdicts_name_registered_programs_and_fit_one_wave():
+    """Every K1 verdict names a registered template of its architecture and a split count its token counts allow;
+    the sm_100a / sm_103a verdicts fit one wave of the 74 CTA pairs of the SM-count floor (148 SMs)."""
+    for (arch, L, M, N, dt), choice in cake_backend.K1_SPLIT_RULES.items():
+        assert arch in cake_backend.K1_MIN_SM_COUNT and dt in ("bf16", "f32") and L == 1
+        if choice is None:
+            continue
+        block_n, splits = choice
+        assert block_n in cake_backend.K1_BLOCK_N_CHOICES and splits >= 1
+        template = cake_backend.atomic_k1_template(block_n, dt == "f32")
+        assert template in cake_jit.KERNELS.get(arch, {}), (arch, template)
+        if arch in ("sm_100a", "sm_103a"):
+            assert splits == 2
+            tiles = -(-M // cake_backend.K1_PAIR_ROWS) * -(-N // block_n)
+            assert tiles * splits <= cake_backend.K1_MIN_SM_COUNT[arch] // 2
+    # a row's own SM-count floor names a row with a verdict and lies above its architecture's floor
+    for key, floor in cake_backend.K1_RULE_MIN_SM_COUNT.items():
+        assert cake_backend.K1_SPLIT_RULES.get(key) is not None, key
+        assert floor > cake_backend.K1_MIN_SM_COUNT[key[0]], key
+    # a per-SM-count table acts only below the SM-count floor of each of its rows (it never replaces a verdict of
+    # K1_SPLIT_RULES on the parts that table was measured on) and names registered templates
+    for (arch, sm_count), table in cake_backend.K1_SPLIT_RULES_BY_SM.items():
+        for key, choice in table.items():
+            key_arch, L, M, N, dt = key
+            assert key_arch == arch and dt in ("bf16", "f32") and L == 1
+            floor = max(
+                cake_backend.K1_MIN_SM_COUNT[arch],
+                cake_backend.K1_RULE_MIN_SM_COUNT.get(key, 0),
+            )
+            assert sm_count < floor, (arch, sm_count, key)
+            if choice is None:
+                continue
+            block_n, splits = choice
+            assert block_n in cake_backend.K1_BLOCK_N_CHOICES and splits >= 1
+            template = cake_backend.atomic_k1_template(block_n, dt == "f32")
+            assert template in cake_jit.KERNELS.get(arch, {}), (
+                arch,
+                sm_count,
+                template,
+            )
+
+
+def test_k1_small_token_counts_run_the_deterministic_program():
+    """``num_splits * 64 <= T + 63``: a token count too short for the split count runs the deterministic program."""
+    kw = dict(arch="sm_107a", L=1, M=4096, N=32, out_f32=False, sm_count=216)
+    assert cake_backend.k1_plan(K=193, **kw) == (64, 4)
+    assert cake_backend.k1_plan(K=192, **kw) is None
+    kw = dict(arch="sm_103a", L=1, M=4096, N=32, out_f32=False, sm_count=152)
+    assert cake_backend.k1_plan(K=65, **kw) == (64, 2)
+    assert cake_backend.k1_plan(K=64, **kw) is None
+    assert cake_backend.k1_splits_fit(1, 1) and not cake_backend.k1_splits_fit(0, 64)
+
+
+def test_k1_excluded_token_counts():
+    """A row of :data:`K1_SPLIT_RULES` or of a table of :data:`K1_SPLIT_RULES_BY_SM` runs the deterministic program at
+    the token counts of its :data:`K1_SPLIT_RULE_EXCLUDED_TOKENS` entries: from the entry's SM count up where that
+    count is at or above the row's SM-count floor, on exactly that SM count below it.  Every entry belongs to a row
+    with a verdict on its part; per SM count its ranges are closed, disjoint and not adjacent, start at a measured
+    token count (512 to 65536) and end at one or have no upper bound; the row runs the deterministic program at both
+    ends and keeps its verdict one token outside a range (inside the token window of a per-SM-count table), on a part
+    with fewer SMs than an entry at or above the floor, on the floor's part for an entry below it, and above 65536
+    tokens unless a range has no upper bound."""
+    table = cake_backend.K1_SPLIT_RULE_EXCLUDED_TOKENS
+    by_sm = cake_backend.K1_SPLIT_RULES_BY_SM
+    routed = {k for k, v in cake_backend.K1_SPLIT_RULES.items() if v is not None}
+    for rows in by_sm.values():
+        routed |= {k for k, v in rows.items() if v is not None}
+    assert table and set(table) <= routed
+    lo_t, hi_t = cake_backend.K1_SPLIT_RULES_BY_SM_TOKENS
+    for key, entries in table.items():
+        arch, L, M, N, dt = key
+        floor = max(
+            cake_backend.K1_MIN_SM_COUNT[arch],
+            cake_backend.K1_RULE_MIN_SM_COUNT.get(key, 0),
+        )
+        kw = dict(arch=arch, L=L, M=M, N=N, out_f32=dt == "f32")
+        assert entries, key
+        spans_of = {}
+        for sms, a, b in entries:
+            spans_of.setdefault(sms, []).append((a, b))
+        for spans in spans_of.values():
+            spans.sort()
+            for (_lo, b), (c, _hi) in zip(spans, spans[1:], strict=False):
+                assert b is not None and b + 1 < c, key
+
+        def cut(sm_count, T, key=key, floor=floor):
+            for sms, a, b in table[key]:
+                on_part = sm_count >= sms if sms >= floor else sm_count == sms
+                if on_part and a <= T and (b is None or b >= T):
+                    return True
+            return False
+
+        for sms, a, b in entries:
+            assert 512 <= a <= 65536, key
+            assert b is None or a <= b <= 65536, key
+            if sms >= floor:
+                verdict = cake_backend.K1_SPLIT_RULES[key]
+                parts = (sms, sms + 64)
+            else:
+                verdict = by_sm[(arch, sms)][key]
+                parts = (sms,)
+            assert verdict is not None, (key, sms)
+            want = tuple(verdict)
+            ends = (a,) if b is None else (a, b)
+            for sm_count in parts:
+                for T in ends + ((65537, 131072) if b is None else ()):
+                    got = cake_backend.k1_plan(K=T, sm_count=sm_count, **kw)
+                    assert got is None, (key, sm_count, T)
+                for T in (a - 1,) + (() if b is None else (b + 1,)):
+                    if cut(sm_count, T) or (sms < floor and not lo_t <= T <= hi_t):
+                        continue
+                    got = cake_backend.k1_plan(K=T, sm_count=sm_count, **kw)
+                    assert got == want, (key, sm_count, T)
+            if sms >= floor and sms - 1 >= floor:
+                for T in ends:
+                    got = cake_backend.k1_plan(K=T, sm_count=sms - 1, **kw)
+                    assert got == want, (key, T)
+            if sms < floor and cake_backend.K1_SPLIT_RULES.get(key) is not None:
+                for T in ends:
+                    if not cut(floor, T):
+                        got = cake_backend.k1_plan(K=T, sm_count=floor, **kw)
+                        assert got == tuple(cake_backend.K1_SPLIT_RULES[key]), (key, T)
+        top = max(floor, *(e[0] for e in entries))
+        verdict = cake_backend.K1_SPLIT_RULES.get(key)
+        if verdict is not None and not any(e[2] is None for e in entries):
+            got = cake_backend.k1_plan(K=65537, sm_count=top, **kw)
+            assert got == tuple(verdict), key
+    kw = dict(arch="sm_100a", L=1, M=4096, N=32, out_f32=False)
+    assert cake_backend.k1_plan(K=512, sm_count=152, **kw) is None
+    assert cake_backend.k1_plan(K=511, sm_count=152, **kw) == (64, 2)
+    assert cake_backend.k1_plan(K=512, sm_count=151, **kw) == (64, 2)
+    assert cake_backend.k1_plan(K=131072, sm_count=152, **kw) == (64, 2)
+    kw = dict(arch="sm_103a", L=1, M=4096, N=32, out_f32=False)
+    assert cake_backend.k1_plan(K=512, sm_count=152, **kw) is None
+    assert cake_backend.k1_plan(K=511, sm_count=152, **kw) == (64, 2)
+    assert cake_backend.k1_plan(K=512, sm_count=151, **kw) == (64, 2)
+    assert cake_backend.k1_plan(K=131072, sm_count=152, **kw) == (64, 2)
+    kw = dict(arch="sm_103a", L=1, M=5120, N=32, out_f32=False)
+    assert cake_backend.k1_plan(K=512, sm_count=152, **kw) is None
+    assert cake_backend.k1_plan(K=511, sm_count=152, **kw) == (64, 2)
+    assert cake_backend.k1_plan(K=512, sm_count=151, **kw) == (64, 2)
+    assert cake_backend.k1_plan(K=32768, sm_count=152, **kw) is None
+    assert cake_backend.k1_plan(K=131072, sm_count=152, **kw) is None
+    assert cake_backend.k1_plan(K=131072, sm_count=148, **kw) == (64, 2)
+    # a row without an entry keeps its verdict at every token count its split count fits
+    kw = dict(arch="sm_100a", L=1, M=4096, N=32, out_f32=True, sm_count=152)
+    assert ("sm_100a", 1, 4096, 32, "f32") not in table
+    for T in (65, 512, 16231, 65536, 131072):
+        assert cake_backend.k1_plan(K=T, **kw) == (64, 2), T
+
+
+def test_k1_rule_table_entries_decide_the_row(monkeypatch):
+    kw = dict(L=1, M=4096, N=32, K=16231, out_f32=True)
+    key = ("sm_103a", 1, 4096, 32, "f32")
+    assert cake_backend.k1_plan(arch="sm_103a", sm_count=152, **kw) == (64, 2)
+    monkeypatch.setitem(cake_backend.K1_SPLIT_RULES, key, None)
+    assert cake_backend.k1_plan(arch="sm_103a", sm_count=152, **kw) is None
+    monkeypatch.setitem(cake_backend.K1_SPLIT_RULES, key, (128, 3))
+    assert cake_backend.k1_plan(arch="sm_103a", sm_count=152, **kw) == (128, 3)
+    # the T guard applies to a verdict too
     assert (
-        plan.swapped and plan.transposed_out and (plan.M, plan.N, plan.K) == (K, N, T)
+        cake_backend.k1_plan(
+            arch="sm_103a", sm_count=152, L=1, M=4096, N=32, K=128, out_f32=True
+        )
+        is None
     )
-    assert A_eff.data_ptr() == X.data_ptr() and B_eff.data_ptr() == G.data_ptr()
-    assert plan.a_mn and plan.b_mn
-    assert plan.grid == (
-        plan.splits * (plan.m_tiles // CTA_GROUP) * plan.n_tiles * CTA_GROUP,
-        1,
-        1,
+    # a row's own minimum SM count applies on top of the architecture's
+    monkeypatch.setitem(cake_backend.K1_RULE_MIN_SM_COUNT, key, 160)
+    assert cake_backend.k1_plan(arch="sm_103a", sm_count=152, **kw) is None
+    assert cake_backend.k1_plan(arch="sm_103a", sm_count=160, **kw) == (128, 3)
+    # a verdict of an architecture with a minimum SM count applies from that count only
+    key107 = ("sm_107a", 1, 4096, 32, "f32")
+    monkeypatch.setitem(cake_backend.K1_SPLIT_RULES, key107, (64, 2))
+    assert cake_backend.k1_plan(arch="sm_107a", sm_count=216, **kw) == (64, 2)
+    assert cake_backend.k1_plan(arch="sm_107a", sm_count=210, **kw) is None
+    # below that count the part's own table decides (K1_SPLIT_RULES_BY_SM), not the 216-SM verdict
+    assert cake_backend.k1_plan(arch="sm_107a", sm_count=212, **kw) == (64, 3)
+    monkeypatch.setitem(cake_backend.K1_MIN_SM_COUNT, "sm_107a", 0)
+    assert cake_backend.k1_plan(arch="sm_107a", sm_count=212, **kw) == (64, 2)
+
+
+def test_k1_per_sm_count_tables_decide_only_their_own_sm_count(monkeypatch):
+    """Below the architecture's SM-count floor a part takes the table of :data:`K1_SPLIT_RULES_BY_SM` for its exact
+    SM count; another SM count below the floor runs the deterministic program, and from the floor up the verdicts of
+    :data:`K1_SPLIT_RULES` decide as before (a per-SM-count table never changes the 216-SM routing)."""
+    kw = dict(L=1, M=4096, N=32, K=16231, out_f32=True)
+    key = ("sm_107a", 1, 4096, 32, "f32")
+    tables = dict(cake_backend.K1_SPLIT_RULES_BY_SM)
+    tables[("sm_107a", 210)] = {key: (64, 2)}
+    monkeypatch.setattr(cake_backend, "K1_SPLIT_RULES_BY_SM", tables)
+    assert cake_backend.k1_plan(arch="sm_107a", sm_count=210, **kw) == (64, 2)
+    assert cake_backend.k1_plan(arch="sm_107a", sm_count=211, **kw) is None
+    assert cake_backend.k1_plan(arch="sm_107a", sm_count=209, **kw) is None
+    assert (
+        cake_backend.k1_plan(arch="sm_107a", sm_count=216, **kw)
+        == cake_backend.K1_SPLIT_RULES[key]
     )
-    plan, *_ = plan_router_fp32_gemm(X, W.t(), torch.empty(T, N), splits=2)
-    assert plan.splits == 2 and plan.k_iters_split == -(-plan.k_blocks // 2)
-    with pytest.raises(NotImplementedError, match="MN-major A"):
-        router_layout_class(True, False)
-    with pytest.raises(ValueError, match="fp32"):
-        plan_router_fp32_gemm(X.to(torch.bfloat16), W.t(), torch.empty(T, N))
-    with pytest.raises(ValueError, match="K must agree"):
-        plan_router_fp32_gemm(X, torch.empty(K + 32, N), torch.empty(T, N))
+    # a None entry of the table keeps the row on the deterministic program; the T guard applies to its verdicts too
+    tables[("sm_107a", 210)] = {key: None}
+    assert cake_backend.k1_plan(arch="sm_107a", sm_count=210, **kw) is None
+    tables[("sm_107a", 210)] = {key: (64, 4)}
+    short = dict(kw, K=192)
+    assert cake_backend.k1_plan(arch="sm_107a", sm_count=210, **short) is None
+    # a row below its own K1_RULE_MIN_SM_COUNT (above the architecture's floor) also reads the part's table
+    k48 = ("sm_103a", 1, 4096, 48, "f32")
+    kw48 = dict(kw, N=48)
+    assert cake_backend.k1_plan(arch="sm_103a", sm_count=148, **kw48) is None
+    tables[("sm_103a", 148)] = {k48: (64, 2)}
+    assert cake_backend.k1_plan(arch="sm_103a", sm_count=148, **kw48) == (64, 2)
+
+
+@pytest.mark.parametrize("sm_count", [208, 212])
+def test_k1_per_sm_count_tables_hold_only_at_their_token_counts(sm_count):
+    """The tables of :data:`K1_SPLIT_RULES_BY_SM` were measured at 16172 to 16384 tokens and hold only there
+    (:data:`K1_SPLIT_RULES_BY_SM_TOKENS`): every row of the 208-SM and 212-SM tables takes its verdict at the first
+    and the last token count of that window (except a token count of :data:`K1_SPLIT_RULE_EXCLUDED_TOKENS` for the
+    part) and runs the deterministic program one token outside it."""
+    assert cake_backend.K1_SPLIT_RULES_BY_SM_TOKENS == (16172, 16384)
+    table = cake_backend.K1_SPLIT_RULES_BY_SM[("sm_107a", sm_count)]
+    excluded = cake_backend.K1_SPLIT_RULE_EXCLUDED_TOKENS
+    routed = 0
+    for key, choice in sorted(table.items()):
+        arch, L, M, N, dt = key
+        kw = dict(arch=arch, L=L, M=M, N=N, out_f32=dt == "f32", sm_count=sm_count)
+        want = None if choice is None else tuple(choice)
+        cut = {
+            T
+            for sms, lo, hi in excluded.get(key, ())
+            for T in (16172, 16384)
+            if sms == sm_count and lo <= T and (hi is None or hi >= T)
+        }
+        for T in (16172, 16384):
+            got = cake_backend.k1_plan(K=T, **kw)
+            assert got == (None if T in cut else want), (M, N, dt, T)
+        for T in (16171, 16385):
+            assert cake_backend.k1_plan(K=T, **kw) is None, (M, N, dt, T)
+        routed += want is not None
+    assert routed > 0
+    if sm_count == 212:
+        # 4096 -> 32 BF16 has no verdict on 212 SMs (its deterministic program did not complete next to a resident
+        # kernel in long-lived processes): the deterministic program at every token count
+        kw = dict(arch="sm_107a", L=1, M=4096, N=32, out_f32=False, sm_count=212)
+        assert table[("sm_107a", 1, 4096, 32, "bf16")] is None
+        for T in (16171, 16172, 16231, 16384, 16385):
+            assert cake_backend.k1_plan(K=T, **kw) is None, T
+
+
+def test_k1_216_sm_routing_is_the_record_table():
+    """On 216-SM sm_107a parts every row decides by :data:`K1_SPLIT_RULES` (the record verdicts), except at the
+    216-SM token counts of :data:`K1_SPLIT_RULE_EXCLUDED_TOKENS`, which run the deterministic program."""
+    excluded = cake_backend.K1_SPLIT_RULE_EXCLUDED_TOKENS
+    for key, choice in cake_backend.K1_SPLIT_RULES.items():
+        arch, L, M, N, dt = key
+        if arch != "sm_107a":
+            continue
+        for T in (16172, 16231, 16384):
+            cut = any(
+                sms == 216 and lo <= T and (hi is None or hi >= T)
+                for sms, lo, hi in excluded.get(key, ())
+            )
+            got = cake_backend.k1_plan(
+                arch=arch, L=L, M=M, N=N, K=T, out_f32=dt == "f32", sm_count=216
+            )
+            want = None if choice is None or cut else tuple(choice)
+            assert got == want, (M, N, dt, T)
+
+
+def test_k1_sm107a_token_counts_of_the_deterministic_rules():
+    """The sm_107a entries of :data:`K1_SPLIT_RULE_EXCLUDED_TOKENS` are the single token counts 16231 and 16384 per
+    SM count: an entry of 208 or 212 SMs holds on exactly that SM count (not on the other table's part, nor from 216
+    SMs up), an entry of 216 SMs from 216 SMs up; the neighbouring token counts keep the row's verdict."""
+
+    def p(M, N, sms, T):
+        return cake_backend.k1_plan(
+            arch="sm_107a", L=1, M=M, N=N, K=T, out_f32=True, sm_count=sms
+        )
+
+    # 4096 -> 512: the deterministic program at 16231 and 16384 tokens on 208, 212 and 216 SMs
+    for sms in (208, 212, 216):
+        assert p(4096, 512, sms, 16231) is None and p(4096, 512, sms, 16384) is None
+        for T in (16172, 16230, 16232, 16383):
+            assert p(4096, 512, sms, T) == (128, 1), (sms, T)
+    # 4096 -> 1024: at 16231 tokens only; 212 SMs keep the 192-wide row-major program at 16384
+    assert p(4096, 1024, 212, 16231) is None
+    assert p(4096, 1024, 212, 16384) == (192, 1)
+    for sms in (208, 216):
+        assert p(4096, 1024, sms, 16231) is None
+        assert p(4096, 1024, sms, 16384) == (256, 1)
+    # 4096 -> 48: entries on 208 and 216 SMs, none on 212
+    assert p(4096, 48, 212, 16231) == (64, 3) and p(4096, 48, 212, 16384) == (64, 3)
+    for sms in (208, 216):
+        assert p(4096, 48, sms, 16231) is None and p(4096, 48, sms, 16384) is None
+    # 4096 -> 64: 208 SMs only
+    assert p(4096, 64, 208, 16231) is None and p(4096, 64, 208, 16384) is None
+    for sms in (212, 216):
+        assert p(4096, 64, sms, 16231) == (64, 3) and p(4096, 64, sms, 16384) == (64, 3)
+    # 5120 -> 48 and 5120 -> 64: 16231 tokens on 208, 212 and 216 SMs; 5120 -> 48 also 16384 on 208 SMs
+    for N in (48, 64):
+        for sms in (208, 212, 216):
+            assert p(5120, N, sms, 16231) is None, (N, sms)
+    assert p(5120, 48, 208, 16384) is None
+    assert p(5120, 48, 212, 16384) == (64, 3) and p(5120, 48, 216, 16384) == (64, 3)
+    for sms in (208, 212, 216):
+        assert p(5120, 64, sms, 16384) == (64, 3), sms
+    # 5120 -> 512: 212 SMs only
+    assert p(5120, 512, 212, 16231) is None and p(5120, 512, 212, 16384) is None
+    for sms in (208, 216):
+        assert p(5120, 512, sms, 16231) == (128, 1), sms
+    # 5120 -> 1024: no entry; every part keeps the 256-wide one-split program at both token counts
+    for sms in (208, 212, 216):
+        for T in (16231, 16384):
+            assert p(5120, 1024, sms, T) == (256, 1), (sms, T)
+    # 4096 -> 32 and 5120 -> 32 keep their verdicts at both token counts
+    for sms in (208, 212, 216):
+        for T in (16231, 16384):
+            assert p(4096, 32, sms, T) == (64, 3) and p(5120, 32, sms, T) == (64, 3)
+    # 4096 -> 4096: the deterministic program on 208, 212 and 216 SMs
+    for sms in (208, 212, 216):
+        assert p(4096, 4096, sms, 16172) is None
+
+
+def test_k1_plan_is_the_transposed_store_launch(monkeypatch):
+    """The thin weight gradient ``out[32, 4096] = G.T @ X``: either orientation of the caller's views gives the same
+    launch -- ``A = X`` ``[L, T, d_in]``, ``B = G`` ``[L, T, d_out]``, ``M = d_in``, ``N = d_out`` -- the planner's
+    tile and split count, the workspace sizes, the grid; an unregistered template keeps the row on the deterministic
+    program."""
+    arch, T, N, K = "sm_103a", 16231, 32, 4096
+    G, X = (
+        torch.zeros(T, N, dtype=torch.bfloat16),
+        torch.zeros(T, K, dtype=torch.bfloat16),
+    )
+    out = torch.zeros(N, K, dtype=torch.bfloat16)
+    kw = dict(arch=arch, sm_count=152)
+    monkeypatch.setitem(cake_jit.KERNELS, arch, {})  # whatever this checkout registers
+    plan, *_, reason = cake_backend.plan_atomic_gemm(
+        X.t(), G, out, transposed_out=True, **kw
+    )
+    assert plan is None and "not registered" in reason
+    _register_k1(monkeypatch, arch)
+    swapped = cake_backend.plan_atomic_gemm(G.t(), X, out, transposed_out=False, **kw)
+    for plan, a_desc, b_desc, out3, reason in (
+        cake_backend.plan_atomic_gemm(X.t(), G, out, transposed_out=True, **kw),
+        swapped,
+    ):
+        assert isinstance(plan, cake_backend.AtomicGemmPlan) and reason == ""
+        assert (plan.L, plan.M, plan.N, plan.K, plan.block_n, plan.splits) == (
+            1,
+            K,
+            N,
+            T,
+            64,
+            2,
+        )
+        assert (plan.m_tiles, plan.n_tiles, plan.tiles) == (16, 1, 16)
+        assert plan.grid == (2 * 32, 1, 1)
+        assert plan.template == "dense_proj_gemm_atomic_nn_n64_t"
+        assert plan.ws_f32_elems == 16 * 2 * 256 * 64
+        assert plan.counters_u32 == 16 * 512
+        assert tuple(a_desc.shape) == (1, T, K) and a_desc.stride(-1) == 1
+        assert tuple(b_desc.shape) == (1, T, N) and b_desc.stride(-1) == 1
+        assert a_desc.data_ptr() == X.data_ptr() and b_desc.data_ptr() == G.data_ptr()
+        assert tuple(out3.shape) == (1, N, K)
+    assert swapped[0].swapped and not swapped[0].transposed_out
+
+
+def test_k1_explicit_choices(monkeypatch):
+    arch, T, N, K = "sm_103a", 1000, 128, 6144
+    _register_k1(monkeypatch, arch)
+    G = torch.zeros(T, N, dtype=torch.bfloat16)
+    X = torch.zeros(T, K, dtype=torch.bfloat16)
+    out = torch.zeros(N, K, dtype=torch.float32)
+    kw = dict(transposed_out=True, arch=arch, sm_count=152)
+    plan = cake_backend.plan_atomic_gemm(X.t(), G, out, splits=1, **kw)[0]
+    assert (plan.splits, plan.block_n) == (1, 128)  # the planner's tile width
+    assert plan.ws_f32_elems == 0 and plan.counters_u32 == 0
+    assert plan.template == "dense_proj_gemm_atomic_nn_n128_f32_t"
+    plan = cake_backend.plan_atomic_gemm(X.t(), G, out, splits=16, block_n=256, **kw)[0]
+    assert (plan.splits, plan.block_n, plan.n_tiles, plan.items) == (16, 256, 1, 384)
+    assert plan.grid == (2 * 76, 1, 1)
+    with pytest.raises(ValueError, match="splits must be in"):
+        cake_backend.plan_atomic_gemm(X.t(), G, out, splits=17, **kw)
+    with pytest.raises(ValueError, match="block_n"):
+        cake_backend.plan_atomic_gemm(X.t(), G, out, block_n=96, **kw)
+    # a row the planner does not take still runs an explicit choice
+    G2 = torch.zeros(T, 1024, dtype=torch.bfloat16)
+    out2 = torch.zeros(1024, K, dtype=torch.bfloat16)
+    assert cake_backend.plan_atomic_gemm(X.t(), G2, out2, **kw)[0] is None
+    plan = cake_backend.plan_atomic_gemm(X.t(), G2, out2, splits=3, **kw)[0]
+    assert (plan.splits, plan.block_n) == (3, cake_backend.k1_block_n(1024))
+
+
+def test_k1_planner_keeps_rows_it_cannot_serve_on_the_deterministic_program(
+    monkeypatch,
+):
+    arch, T = "sm_103a", 1000
+    _register_k1(monkeypatch, arch)
+    kw = dict(transposed_out=False, arch=arch, sm_count=152, splits=2)
+
+    def reason(A, B, out):
+        plan, *_, why = cake_backend.plan_atomic_gemm(A, B, out, **kw)
+        assert plan is None
+        return why
+
+    G = torch.zeros(T, 64, dtype=torch.bfloat16)
+    X = torch.zeros(T, 512, dtype=torch.bfloat16)
+    out = torch.zeros(64, 512, dtype=torch.bfloat16)
+    assert cake_backend.plan_atomic_gemm(G.t(), X, out, **kw)[0] is not None
+    assert "K-major" in reason(torch.zeros(64, T, dtype=torch.bfloat16), X, out)
+    assert "bf16" in reason(G.t().float(), X, out)
+    odd = torch.zeros(T, 64, dtype=torch.bfloat16)[:, :60]
+    assert "M or N not a multiple of 8" in reason(
+        odd.t(), X, torch.zeros(60, 512, dtype=torch.bfloat16)
+    )
+    unaligned = torch.zeros(T, 60, dtype=torch.bfloat16)
+    assert "multiples of 8" in reason(
+        unaligned.t(), X, torch.zeros(60, 512, dtype=torch.bfloat16)
+    )
+    shifted = torch.zeros(64 * 512 + 4, dtype=torch.bfloat16)[4:].view(64, 512)
+    assert "output view" in reason(G.t(), X, shifted)
     with pytest.raises(ValueError, match="out must be"):
-        plan_router_fp32_gemm(X, W.t(), torch.empty(N, T))
-    with pytest.raises(ValueError, match="multiple of 8"):
-        plan_router_fp32_gemm(
-            X, torch.empty(K, 20).t().contiguous().t(), torch.empty(T, 20)
+        cake_backend.plan_atomic_gemm(G.t(), X, out.t(), **kw)
+    assert [cake_backend.k1_block_n(n) for n in (32, 48, 64, 128, 576, 1024, 4096)] == [
+        64,
+        64,
+        64,
+        128,
+        64,
+        256,
+        256,
+    ]
+
+
+def test_k1_row_major_verdict_runs_the_row_major_program(monkeypatch):
+    """A 192-wide verdict (:data:`K1_ROW_MAJOR_BLOCK_N`) runs the row-major-store program with the operands of the
+    transposed-store launch exchanged: ``A = G`` ``[L, T, d_out]``, ``B = X`` ``[L, T, d_in]``, ``M = d_out``,
+    ``N = d_in``, tiles of 256 ``d_out`` rows by 192 ``d_in`` columns, the caller's ``out[d_out, d_in]`` stored row by
+    row; either orientation of the caller's views gives that launch.  An explicit ``block_n=192`` takes the same
+    program; :func:`k1_block_n` never picks it."""
+    arch, T, d_in, d_out = "sm_107a", 16231, 4096, 1024
+    G = torch.zeros(T, d_out, dtype=torch.bfloat16)
+    X = torch.zeros(T, d_in, dtype=torch.bfloat16)
+    out = torch.zeros(d_out, d_in, dtype=torch.float32)
+    key = (arch, 1, d_in, d_out, "f32")
+    tables = {k: dict(v) for k, v in cake_backend.K1_SPLIT_RULES_BY_SM.items()}
+    tables[(arch, 212)][key] = (192, 1)
+    monkeypatch.setattr(cake_backend, "K1_SPLIT_RULES_BY_SM", tables)
+    monkeypatch.delitem(cake_backend.K1_SPLIT_RULE_EXCLUDED_TOKENS, key, raising=False)
+    _register_k1(monkeypatch, arch)
+    kw = dict(arch=arch, sm_count=212)
+    assert cake_backend.k1_plan(L=1, M=d_in, N=d_out, K=T, out_f32=True, **kw) == (
+        192,
+        1,
+    )
+    for A, B, transposed_out in ((X.t(), G, True), (G.t(), X, False)):
+        plan, a_desc, b_desc, out3, reason = cake_backend.plan_atomic_gemm(
+            A, B, out, transposed_out=transposed_out, **kw
         )
-    with pytest.raises(ValueError, match="unit stride"):
-        plan_router_fp32_gemm(torch.empty(T, 2 * K)[:, ::2], W.t(), torch.empty(T, N))
-    # a ragged batch with T = 0: M = 0 for the forward / input gradient, K = 0 for the
-    # weight gradient -- rejected before a zero-sized grid or TMA extent is planned
-    with pytest.raises(ValueError, match="must be >= 1"):
-        plan_router_fp32_gemm(torch.empty(0, K), W.t(), torch.empty(0, N))
-    with pytest.raises(ValueError, match="must be >= 1"):
-        plan_router_fp32_gemm(torch.empty(N, 0), torch.empty(0, K), torch.empty(N, K))
-
-
-def test_split_fp32_to_bf16x3_is_exact_and_allocation_free_in_place():
-    g = torch.Generator().manual_seed(SEED)
-    src = torch.randn(64, 96, generator=g) * torch.logspace(-3, 3, 96)
-    parts = torch.empty(3, 64, 96, dtype=torch.bfloat16)
-    resid = torch.empty(64, 96)
-    split_fp32_to_bf16x3_(src, parts, resid)
-    total = parts[0].double() + parts[1].double() + parts[2].double()
-    assert torch.equal(
-        total, src.double()
-    )  # 3 x 8 significant bits cover the 24 of an fp32
-    assert torch.equal(parts[0], src.to(torch.bfloat16))
-    # the split of a transposed source view (K-major parts come from B.T): same values, transposed
-    parts_t = torch.empty(3, 96, 64, dtype=torch.bfloat16)
-    resid_t = torch.empty(96, 64)
-    split_fp32_to_bf16x3_(src.t(), parts_t, resid_t)
-    assert torch.equal(parts_t, parts.transpose(1, 2))
-
-
-def test_bind_launch_fails_closed_and_checks_the_cluster(monkeypatch):
-    record = {
-        "arches": ["sm_100a"],
-        "template": "dense_proj_gemm_kk_n256",
-        "kernel": "kernel_fake",
-        "library": "cake_dense_projection_gemm_fake",
-        "ffi_entry": "run",
-        "arg_plan": [
-            ["tma_buffer", "A"],
-            ["parameter", "M"],
-            ["grid", "grid_x"],
-            ["grid", "grid_y"],
-            ["grid", "grid_z"],
-        ],
-        "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
-    }
-    monkeypatch.setitem(cake_jit.MODULES, "cake_dense_projection_gemm_fake", record)
+        assert isinstance(plan, cake_backend.AtomicGemmPlan) and reason == ""
+        assert plan.template == "dense_proj_gemm_atomic_nn_n192_f32"
+        assert not plan.out_t
+        assert (plan.L, plan.M, plan.N, plan.K, plan.block_n, plan.splits) == (
+            1,
+            d_out,
+            d_in,
+            T,
+            192,
+            1,
+        )
+        assert (plan.m_tiles, plan.n_tiles, plan.tiles) == (4, 22, 88)
+        assert plan.grid == (176, 1, 1)
+        assert plan.ws_f32_elems == 0 and plan.counters_u32 == 0
+        assert plan.swapped == transposed_out
+        assert a_desc.data_ptr() == G.data_ptr() and tuple(a_desc.shape) == (
+            1,
+            T,
+            d_out,
+        )
+        assert b_desc.data_ptr() == X.data_ptr() and tuple(b_desc.shape) == (1, T, d_in)
+        assert a_desc.stride(-1) == 1 and b_desc.stride(-1) == 1
+        assert tuple(out3.shape) == (1, d_out, d_in) and out3.stride(1) == d_in
+        views = cake_backend._k1_launch_views(A, B, out, plan)
+        assert (
+            views[0].data_ptr() == G.data_ptr() and views[1].data_ptr() == X.data_ptr()
+        )
+    # an explicit 192-wide choice is the same program, at any split count; the planner's other rows are untouched
+    kwt = dict(transposed_out=True, **kw)
+    plan = cake_backend.plan_atomic_gemm(X.t(), G, out, block_n=192, splits=2, **kwt)[0]
+    assert (plan.template, plan.out_t, plan.splits, plan.items) == (
+        "dense_proj_gemm_atomic_nn_n192_f32",
+        False,
+        2,
+        176,
+    )
+    assert plan.ws_f32_elems == 176 * 256 * 192 and plan.counters_u32 == 88 * 512
+    assert cake_backend.k1_block_n(192) == 64 and cake_backend.k1_block_n(384) == 128
+    # a part that does not register the row-major program keeps the row on the deterministic program
     monkeypatch.setitem(
         cake_jit.KERNELS,
-        "sm_100a",
-        {"dense_proj_gemm_kk_n256": "cake_dense_projection_gemm_fake"},
+        arch,
+        {
+            t: n
+            for t, n in cake_jit.KERNELS[arch].items()
+            if t != "dense_proj_gemm_atomic_nn_n192_f32"
+        },
     )
+    plan, *_, reason = cake_backend.plan_atomic_gemm(X.t(), G, out, **kwt)
+    assert plan is None and "not registered" in reason
+    assert (
+        cake_backend.atomic_k1_template(192, False) == "dense_proj_gemm_atomic_nn_n192"
+    )
+
+
+# ---------------------------------------------------------------------------
+# K2 planner (CPU)
+# ---------------------------------------------------------------------------
+
+
+def _span_first(span, steps, spans, head_spans=0, head_steps=0):
+    """The program's first step of span ``span``: the head spans share the first ``head_steps`` steps evenly, the
+    others the rest (every span alike when ``head_spans`` is 0)."""
+    if span < head_spans:
+        return span * head_steps // head_spans
+    return head_steps + (span - head_spans) * (steps - head_steps) // (
+        spans - head_spans
+    )
+
+
+def _segments(m_pairs, n_tiles, k_iters, units, head_spans=0, head_steps=0):
+    """Each tile's segments ``(k_first, k_end)`` in K blocks, in K order, tile ``pair * n_tiles + column``: span
+    ``s`` runs the (row-tile pair, K block) steps ``[first(s), first(s + 1))`` (:func:`_span_first`), pair-major."""
+    steps, spans = m_pairs * k_iters, units // n_tiles
+    per_tile = [[] for _ in range(m_pairs * n_tiles)]
+    for span in range(spans):
+        first = _span_first(span, steps, spans, head_spans, head_steps)
+        last = _span_first(span + 1, steps, spans, head_spans, head_steps)
+        step = first
+        while step < last:
+            pair, k_first = divmod(step, k_iters)
+            k_end = min(k_iters, k_first + last - step)
+            for column in range(n_tiles):
+                per_tile[pair * n_tiles + column].append((k_first, k_end))
+            step += k_end - k_first
+    return per_tile
+
+
+@pytest.mark.parametrize(
+    "m_pairs, n_tiles, k_iters",
+    [(24, 2, 508), (64, 2, 192), (17, 2, 129), (1, 1, 3), (5, 3, 7)],
+)
+def test_router_partition_helpers_match_the_segments(m_pairs, n_tiles, k_iters):
+    tiles = m_pairs * n_tiles
+    for spec in ("tiles", "pairs", "forward", "S2", "S3", 6, 1000000):
+        for sm_count in (148, 152, 216):
+            units = cake_backend.router_units_of(
+                spec, m_pairs, n_tiles, k_iters, sm_count
+            )
+            assert units % n_tiles == 0 and n_tiles <= units <= tiles * k_iters
+            per_tile = _segments(m_pairs, n_tiles, k_iters, units)
+            assert all(
+                sum(e - f for f, e in segs) == k_iters for segs in per_tile
+            )  # every tile covered once
+            part = any(len(segs) > 1 for segs in per_tile)
+            assert (
+                cake_backend.router_has_part_tiles(m_pairs, n_tiles, k_iters, units)
+                == part
+            )
+            if cake_backend.router_at_most_two_partials(m_pairs, n_tiles, units):
+                assert max(len(segs) for segs in per_tile) <= 2
+    for spec in (
+        "H0.5x3",
+        "H0.5x4",
+        "H0.47x3",
+        "H0.9x2",
+        "H0.1x1",
+        "H1x4p44",
+        "H1x6p44",
+        "H0.75x4p3",
+    ):
+        for sm_count in (148, 152, 216):
+            units, head_spans, head_steps = cake_backend.router_partition_of(
+                spec, m_pairs, n_tiles, k_iters, sm_count
+            )
+            assert units % n_tiles == 0 and 0 < head_spans < units // n_tiles
+            assert (
+                cake_backend.router_units_of(spec, m_pairs, n_tiles, k_iters, sm_count)
+                == units
+            )
+            if not cake_backend.router_partition_fits(
+                m_pairs, n_tiles, k_iters, units, head_spans, head_steps
+            ):
+                continue
+            per_tile = _segments(
+                m_pairs, n_tiles, k_iters, units, head_spans, head_steps
+            )
+            assert all(sum(e - f for f, e in segs) == k_iters for segs in per_tile)
+            part = any(len(segs) > 1 for segs in per_tile)
+            assert (
+                cake_backend.router_has_part_tiles(
+                    m_pairs, n_tiles, k_iters, units, head_spans, head_steps
+                )
+                == part
+            )
+
+
+def test_router_head_tail_partition():
+    """``"H<f>x<k>"``: one head unit per CTA pair over about the fraction ``f`` of the (row-tile pair, K block)
+    steps, then ``k`` tail units per CTA pair over the rest; each count a multiple of the column tile count."""
+    # hidden 5120 (20 row-tile pairs x 2 column tiles), T = 16231 (508 K blocks): 10160 steps
+    assert cake_backend.router_partition_of("H0.5x4", 20, 2, 508, 216) == (
+        540,
+        54,
+        5080,
+    )
+    assert cake_backend.router_partition_of("H0.5x3", 20, 2, 508, 216) == (
+        432,
+        54,
+        5080,
+    )
+    assert cake_backend.router_partition_of("H0.5x4", 20, 2, 508, 152) == (
+        380,
+        38,
+        5080,
+    )
+    assert cake_backend.router_partition_of("H0.5x3", 20, 2, 508, 152) == (
+        304,
+        38,
+        5080,
+    )
+    # hidden 4096 / 6144 at T = 16172 (506 K blocks)
+    assert cake_backend.router_partition_of("H0.5x4", 16, 2, 506, 216) == (
+        540,
+        54,
+        4048,
+    )
+    assert cake_backend.router_partition_of("H0.5x4", 24, 2, 506, 216) == (
+        540,
+        54,
+        6072,
+    )
+    # the head share stays at least one step per head span and leaves one per tail span
+    assert cake_backend.router_partition_of("H0.001x1", 20, 2, 508, 216) == (
+        216,
+        54,
+        54,
+    )
+    assert cake_backend.router_partition_of("H0.999x1", 20, 2, 508, 216) == (
+        216,
+        54,
+        10106,
+    )
+    assert cake_backend.router_head_tail("H0.5x4") == (0.5, 4)
+    assert [
+        cake_backend.router_head_tail(s) for s in ("waves", "S2", 6, "H0.5", "Hx4")
+    ] == [None] * 5
+    # "H<f>x<k>p<h>": h head units, each about f of a pair's even share of the steps; hidden 4096 (16 row-tile
+    # pairs), T = 16172 (506 K blocks): 8096 steps, 44 of the 76 CTA pairs at 152 SMs -> 1 * 8096 * 44 / 76 = 4687
+    # head steps, then 4 tail units per CTA pair
+    assert cake_backend.router_partition_of("H1x4p44", 16, 2, 506, 152) == (
+        348,
+        22,
+        4687,
+    )
+    # hidden 6144 (24 row-tile pairs): 12144 steps -> 7031 head steps; 6 tail units per CTA pair
+    assert cake_backend.router_partition_of("H1x6p44", 24, 2, 506, 152) == (
+        500,
+        22,
+        7031,
+    )
+    # one head unit per CTA pair (or more requested): the "H<f>x<k>" partition
+    for h in (76, 77, 500):
+        assert cake_backend.router_partition_of(
+            f"H0.5x3p{h}", 20, 2, 508, 152
+        ) == cake_backend.router_partition_of("H0.5x3", 20, 2, 508, 152)
+    assert cake_backend.router_head_tail("H1x4p44") == (1.0, 4)
+    assert cake_backend.router_head_pairs("H1x4p44") == 44
+    assert [
+        cake_backend.router_head_pairs(s) for s in ("H0.5x4", "waves", 6, "H1x4p")
+    ] == [None] * 4
+    # a token count too short for the partition: at most one unit per (tile, K block) step
+    units, head_spans, head_steps = cake_backend.router_partition_of(
+        "H0.5x4", 20, 2, 4, 216
+    )
+    assert not cake_backend.router_partition_fits(
+        20, 2, 4, units, head_spans, head_steps
+    )
+    assert cake_backend.router_partition_fits(20, 2, 508, 540, 54, 5080)
+
+
+def test_router_waves_partition():
+    """``"waves"``: ``c`` whole waves of the CTA pairs, ``c = max(2, round(tiles * k_iters / (68 * pairs))) + 1``,
+    only where the deterministic plan (6 splits per tile) fills its last wave below 0.8; the deterministic split
+    count is the deterministic package's."""
+    assert det_backend.ROUTER_SPLITS["nn_t"] == cake_backend.ROUTER_DET_WGRAD_SPLITS
+    # hidden 5120 (20 row-tile pairs x 2 column tiles), T = 16231 (508 K blocks)
+    assert cake_backend.router_waves(20, 2, 508, 152) == 5 * 76
+    assert cake_backend.router_waves(20, 2, 508, 216) == 4 * 108
+    assert cake_backend.router_waves(20, 2, 506, 152) == 5 * 76  # T = 16172
+    # 148 SMs: 240 / 74 = 3.24 split waves, the last 81 % full -> deterministic
+    assert cake_backend.router_waves(20, 2, 508, 148) is None
+    # hidden 4096 / 6144: fuller deterministic waves (0.84 / 0.95 on 76 pairs, 0.89 / 0.89 on 108)
+    for m_pairs in (16, 24):
+        for sms in (152, 216):
+            assert cake_backend.router_waves(m_pairs, 2, 508, sms) is None
+    # few tiles: at least two waves, plus one
+    assert cake_backend.router_waves(8, 2, 508, 152) == 3 * 76
+    assert cake_backend.router_waves(20, 2, 129, 152) == 3 * 76
+
+
+def test_router_units_policy(monkeypatch):
+    fwd = dict(M=16231, N=256, K=6144)
+    wgrad = dict(M=6144, N=256, K=16231)
+    wgrad5120 = dict(M=5120, N=256, K=16231)
+    for arch, sms in SM_COUNTS.items():
+        # forward: the deterministic plan on every measured row; the input gradient always
+        for hidden in (4096, 5120, 6144):
+            assert (
+                cake_backend.router_units(
+                    "kk", arch=arch, sm_count=sms, M=16231, N=256, K=hidden
+                )
+                is None
+            )
+        assert cake_backend.router_units("kn", arch=arch, sm_count=sms, **fwd) is None
+    # weight gradient at T = 16231 (508 K blocks), inside the token windows (test_router_wgrad_token_windows):
+    # sm_100a hidden 4096 "H1x5p44" (44 head units, then 5 tail units per CTA pair), hidden 5120 "H0.5x3" on sm_100a /
+    # sm_103a (76 head + 228 tail units) and "H0.5x4" on sm_107a (108 head + 432 tail units on 216 SMs; 106 + 424 on
+    # 212 and 104 + 416 on 208, ROUTER_RULES_BY_SM); hidden 6144, sm_103a hidden 4096 and sm_107a hidden 4096: the
+    # deterministic plan
+    for arch in ("sm_100a", "sm_103a"):
+        assert cake_backend.ROUTER_RULES[(arch, "nn_t", 6144, 256)] is None
+        assert (
+            cake_backend.router_units(
+                "nn_t", arch=arch, sm_count=152, M=6144, N=256, K=16231
+            )
+            is None
+        )
+    assert cake_backend.ROUTER_RULES[("sm_100a", "nn_t", 4096, 256)] == (
+        (10240, 16384, "H1x5p44"),
+    )
+    assert cake_backend.router_partition(
+        "nn_t", arch="sm_100a", sm_count=152, M=4096, N=256, K=16231
+    ) == (44 + 5 * 76, 22, round(16 * 508 * 44 / 76))
+    assert cake_backend.ROUTER_RULES[("sm_103a", "nn_t", 4096, 256)] is None
+    assert (
+        cake_backend.router_partition(
+            "nn_t", arch="sm_103a", sm_count=152, M=4096, N=256, K=16231
+        )
+        is None
+    )
+    for arch in ("sm_100a", "sm_103a"):
+        assert cake_backend.router_partition(
+            "nn_t", arch=arch, sm_count=152, **wgrad5120
+        ) == (304, 38, 20 * 508 // 2)
+    assert cake_backend.router_partition(
+        "nn_t", arch="sm_107a", sm_count=216, **wgrad5120
+    ) == (540, 54, 20 * 508 // 2)
+    for sms, pairs in ((212, 106), (208, 104)):
+        assert cake_backend.router_partition(
+            "nn_t", arch="sm_107a", sm_count=sms, **wgrad5120
+        ) == (5 * pairs, pairs // 2, 20 * 508 // 2)
+    for hidden in (4096, 6144):
+        assert cake_backend.ROUTER_RULES[("sm_107a", "nn_t", hidden, 256)] is None
+        for sms in (208, 212, 216):
+            assert (
+                cake_backend.router_partition(
+                    "nn_t", arch="sm_107a", sm_count=sms, M=hidden, N=256, K=16231
+                )
+                is None
+            )
+    # the forward of the parts with a table of their own: the deterministic plan
+    for sms in (208, 212):
+        for hidden in (4096, 5120, 6144):
+            assert (
+                cake_backend.router_units(
+                    "kk", arch="sm_107a", sm_count=sms, M=16231, N=256, K=hidden
+                )
+                is None
+            )
+    # another SM count than the verdicts were measured on, without a table of its own: the deterministic program
+    assert cake_backend.ROUTER_SM_COUNT == {
+        "sm_100a": 152,
+        "sm_103a": 152,
+        "sm_107a": 216,
+    }
+    assert set(cake_backend.ROUTER_RULES_BY_SM) == ROUTER_BY_SM_PARTS
+    for sms in (207, 209, 211, 213, 215, 217):
+        assert (
+            cake_backend.router_units("nn_t", arch="sm_107a", sm_count=sms, **wgrad5120)
+            is None
+        )
+    for arch in ("sm_100a", "sm_103a"):
+        for sms in (148, 153):
+            assert (
+                cake_backend.router_units("nn_t", arch=arch, sm_count=sms, **wgrad5120)
+                is None
+            )
+    # few tokens at hidden 5120: the "waves" partition (100 tokens, 4 K blocks: three waves of the 76 CTA pairs, at
+    # most one unit per (tile, K block) step -> 160 units)
+    for arch in ("sm_100a", "sm_103a"):
+        assert cake_backend.router_partition(
+            "nn_t", arch=arch, sm_count=152, M=5120, N=256, K=100
+        ) == (160, 0, 0)
+    # a row without a verdict (another hidden size or expert count) runs the deterministic program
+    assert (
+        cake_backend.router_units(
+            "nn_t", arch="sm_103a", sm_count=152, M=2048, N=256, K=16231
+        )
+        is None
+    )
+    assert (
+        cake_backend.router_units(
+            "nn_t", arch="sm_103a", sm_count=152, M=5120, N=384, K=16231
+        )
+        is None
+    )
+    # explicit splits: S units per tile; the forward takes at most two
+    assert (
+        cake_backend.router_units("kk", arch="sm_100a", sm_count=148, splits=2, **fwd)
+        == 2 * 128
+    )
+    assert (
+        cake_backend.router_units("kk", arch="sm_100a", sm_count=148, splits=1, **fwd)
+        == 128
+    )
+    with pytest.raises(ValueError, match="at most 2"):
+        cake_backend.router_units("kk", arch="sm_100a", sm_count=148, splits=3, **fwd)
+    with pytest.raises(ValueError, match="splits must be in"):
+        cake_backend.router_units(
+            "nn_t", arch="sm_100a", sm_count=148, splits=0, **wgrad
+        )
+    assert (
+        cake_backend.router_units(
+            "nn_t", arch="sm_100a", sm_count=148, splits=11, **wgrad
+        )
+        == 11 * 48
+    )
+    # explicit splits do not depend on the SM count floor
+    assert (
+        cake_backend.router_units(
+            "nn_t", arch="sm_107a", sm_count=212, splits=3, **wgrad
+        )
+        == 3 * 48
+    )
+    # verdicts: per (arch, layout, hidden, experts); a forward verdict must keep two partials at most and cannot be
+    # a head/tail partition
+    monkeypatch.setitem(
+        cake_backend.ROUTER_RULES, ("sm_100a", "nn_t", 6144, 256), "pairs"
+    )
+    assert (
+        cake_backend.router_units("nn_t", arch="sm_100a", sm_count=152, **wgrad) == 76
+    )
+    monkeypatch.setitem(
+        cake_backend.ROUTER_RULES, ("sm_100a", "nn_t", 6144, 256), "H0.5x3"
+    )
+    assert cake_backend.router_partition(
+        "nn_t", arch="sm_100a", sm_count=152, **wgrad
+    ) == (304, 38, 24 * 508 // 2)
+    monkeypatch.setitem(
+        cake_backend.ROUTER_RULES, ("sm_103a", "kk", 6144, 256), "H0.5x4"
+    )
+    with pytest.raises(ValueError, match="weight gradient"):
+        cake_backend.router_units("kk", arch="sm_103a", sm_count=152, **fwd)
+    monkeypatch.setitem(
+        cake_backend.ROUTER_RULES, ("sm_103a", "kk", 6144, 256), "forward"
+    )
+    # one unit per CTA pair, at most one per tile (128 tiles here): every tile at most two partials
+    assert cake_backend.router_units("kk", arch="sm_103a", sm_count=152, **fwd) == 76
+    monkeypatch.setitem(cake_backend.ROUTER_RULES, ("sm_103a", "kk", 6144, 256), "S3")
+    with pytest.raises(ValueError, match="more than two partials"):
+        cake_backend.router_units("kk", arch="sm_103a", sm_count=152, **fwd)
+
+
+# the token windows of the router weight gradient (256 experts), (arch, hidden) -> ((first, last, spec), ...); every
+# other token count runs the deterministic program
+ROUTER_WGRAD_WINDOWS = {
+    ("sm_100a", 4096): ((10240, 16384, "H1x5p44"),),
+    ("sm_100a", 5120): ((1, 128, "waves"), (10240, 32768, "H0.5x3")),
+    ("sm_103a", 5120): ((1, 192, "waves"), (16172, 32768, "H0.5x3")),
+    ("sm_107a", 5120): ((16172, 16384, "H0.5x4"),),
+}
+# the parts with a router table of their own (ROUTER_RULES_BY_SM) and their weight-gradient windows,
+# (arch, sm_count, hidden) -> ((first, last, spec), ...)
+ROUTER_BY_SM_PARTS = {("sm_107a", 208), ("sm_107a", 212)}
+ROUTER_WGRAD_WINDOWS_BY_SM = {
+    ("sm_107a", 208, 5120): ((16172, 16384, "H0.5x4"),),
+    ("sm_107a", 212, 5120): ((16172, 16384, "H0.5x4"),),
+}
+
+
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
+def test_router_wgrad_token_windows(arch):
+    """The weight gradient runs a partition only inside its token windows: at the first and the last token count of a
+    window, not one token outside it, not above 32768 tokens, and around the few-token "waves" windows; a head/tail
+    window only on the SM count of its table (:data:`ROUTER_SM_COUNT` for :data:`ROUTER_RULES`, the part's own for
+    :data:`ROUTER_RULES_BY_SM`; not one SM more or fewer), a "waves" window on every SM count where
+    :func:`router_waves` gives a partition.  The deterministic program at every other token count and SM count and
+    on every hidden size without a window."""
+    measured = cake_backend.ROUTER_SM_COUNT[arch]
+    own = {sms for a, sms in ROUTER_BY_SM_PARTS if a == arch}
+    assert {sms for a, sms in cake_backend.ROUTER_RULES_BY_SM if a == arch} == own
+    sm_counts = {148, 208, 212, 216, measured - 1, measured, measured + 1}
+    for sms in own:
+        sm_counts |= {sms - 1, sms, sms + 1}
+    for hidden in (4096, 5120, 6144):
+        main = ROUTER_WGRAD_WINDOWS.get((arch, hidden), ())
+        assert cake_backend.ROUTER_RULES[(arch, "nn_t", hidden, 256)] == (main or None)
+        tokens = {64, 128, 129, 192, 193, 224, 1024, 8192, 32768, 32769, 65536}
+        for first, last, _ in main + sum(
+            (ROUTER_WGRAD_WINDOWS_BY_SM.get((arch, sms, hidden), ()) for sms in own),
+            (),
+        ):
+            tokens |= {first - 1, first, last, last + 1}
+        m_pairs = hidden // 256
+        for sms in sorted(sm_counts):
+            if sms in own:
+                windows = ROUTER_WGRAD_WINDOWS_BY_SM.get((arch, sms, hidden), ())
+                table = cake_backend.ROUTER_RULES_BY_SM[(arch, sms)]
+                assert table[(arch, "nn_t", hidden, 256)] == (windows or None)
+                assert cake_backend.router_rules(arch, sms) == (table, True)
+                holds = True
+            else:
+                windows, holds = main, sms == measured
+                assert cake_backend.router_rules(arch, sms) == (
+                    cake_backend.ROUTER_RULES,
+                    holds,
+                )
+            for T in sorted(t for t in tokens if t > 0):
+                spec = next((s for a, b, s in windows if a <= T <= b), None)
+                k_iters = -(-T // 32)
+                got = cake_backend.router_partition(
+                    "nn_t", arch=arch, sm_count=sms, M=hidden, N=256, K=T
+                )
+                if spec == "waves":
+                    units = cake_backend.router_waves(m_pairs, 2, k_iters, sms)
+                    if units is not None:
+                        units = cake_backend.router_units_of(
+                            units, m_pairs, 2, k_iters, sms
+                        )
+                    want = None if units is None else (units, 0, 0)
+                elif spec is None or not holds:
+                    want = None
+                else:
+                    want = cake_backend.router_partition_of(
+                        spec, m_pairs, 2, k_iters, sms
+                    )
+                assert got == want, (hidden, T, sms)
+    if arch == "sm_100a":
+        # the first token count of the hidden 4096 window (320 K blocks) and the smallest measured "waves" count
+        assert cake_backend.router_partition(
+            "nn_t", arch=arch, sm_count=152, M=4096, N=256, K=10240
+        ) == (44 + 5 * 76, 22, round(16 * 320 * 44 / 76))
+        assert cake_backend.router_partition(
+            "nn_t", arch=arch, sm_count=152, M=5120, N=256, K=64
+        ) == (80, 0, 0)
+
+
+def test_router_per_sm_count_tables_decide_only_their_own_sm_count(monkeypatch):
+    """A part whose SM count has a table in :data:`ROUTER_RULES_BY_SM` takes that table only (every row of
+    :data:`ROUTER_RULES` of its architecture has an entry there, no ``"waves"`` window, closed windows); one SM more or
+    fewer runs the deterministic program, and the measured SM count of :data:`ROUTER_RULES` decides as before."""
+    for (arch, sms), table in cake_backend.ROUTER_RULES_BY_SM.items():
+        assert sms != cake_backend.ROUTER_SM_COUNT[arch]
+        assert set(table) == {k for k in cake_backend.ROUTER_RULES if k[0] == arch}
+        for (key_arch, layout, _hidden, _experts), rule in table.items():
+            assert key_arch == arch
+            if rule is None:
+                continue
+            assert layout == "nn_t" and isinstance(rule, tuple)
+            for first, last, spec in rule:
+                assert 1 <= first <= last <= 32768
+                assert cake_backend.router_head_tail(spec) is not None
+    wgrad = dict(M=6144, N=256, K=16231)
+    key = ("sm_107a", "nn_t", 6144, 256)
+    tables = dict(cake_backend.ROUTER_RULES_BY_SM)
+    tables[("sm_107a", 210)] = {key: ((16172, 16384, "H0.5x3"),)}
+    monkeypatch.setattr(cake_backend, "ROUTER_RULES_BY_SM", tables)
+    # 105 CTA pairs: 104 head units (a multiple of the two column tiles), 3 * 105 tail units rounded down to 314
+    assert cake_backend.router_partition(
+        "nn_t", arch="sm_107a", sm_count=210, **wgrad
+    ) == (104 + 314, 52, 24 * 508 // 2)
+    for sms in (209, 211, 216):
+        assert (
+            cake_backend.router_partition("nn_t", arch="sm_107a", sm_count=sms, **wgrad)
+            is None
+        )
+    # a row without an entry in the part's table runs the deterministic program, whatever ROUTER_RULES says
+    monkeypatch.setitem(cake_backend.ROUTER_RULES, key, "H0.5x4")
+    tables[("sm_107a", 210)] = {}
+    assert (
+        cake_backend.router_partition("nn_t", arch="sm_107a", sm_count=210, **wgrad)
+        is None
+    )
+    assert cake_backend.router_partition(
+        "nn_t", arch="sm_107a", sm_count=216, **wgrad
+    ) == (540, 54, 24 * 508 // 2)
+
+
+def test_k2_planner_plans_the_stream_k_router(monkeypatch):
+    arch, T, K, N = "sm_103a", 4099, 6144, 256
+    X, W, G = torch.zeros(T, K), torch.zeros(N, K), torch.zeros(T, N)
+    fwd = (X, W.t(), torch.zeros(T, N))
+    wgrad = (G.t(), X, torch.zeros(N, K))
+    kw = dict(arch=arch, sm_count=152)
+    monkeypatch.setitem(cake_jit.KERNELS, arch, {})  # whatever this checkout registers
+    plan, reason = cake_backend.plan_atomic_router(*fwd, **kw)
+    assert plan is None and "not registered" in reason
+    _register(
+        monkeypatch, arch, "router_fp32_gemm_atomic_kk", "router_fp32_gemm_atomic_nn_t"
+    )
+    # the forward: no verdict ships (the deterministic plan); an explicit split count runs this package's program
+    plan, reason = cake_backend.plan_atomic_router(*fwd, **kw)
+    assert plan is None and "planner" in reason
+    plan, _ = cake_backend.plan_atomic_router(*fwd, splits=1, **kw)
+    assert (plan.layout, plan.template, plan.swapped) == (
+        "kk",
+        "router_fp32_gemm_atomic_kk",
+        False,
+    )
+    assert (plan.m_tiles, plan.n_tiles, plan.k_iters, plan.tiles) == (34, 2, 192, 34)
+    # one unit per tile: stored whole
+    assert plan.units == 34 and plan.grid == (68, 1, 1)
+    assert not plan.part_tiles and plan.reproducible
+    plan, _ = cake_backend.plan_atomic_router(*fwd, splits=2, **kw)
+    assert plan.units == 68 and plan.part_tiles and plan.reproducible
+    # the weight gradient of hidden 6144: the deterministic plan
+    assert cake_backend.plan_atomic_router(*wgrad, **kw)[0] is None
+    # a "waves" verdict at hidden 5120 (40 tiles, 129 K blocks: 3 waves of the 76 pairs)
+    monkeypatch.setitem(
+        cake_backend.ROUTER_RULES, ("sm_103a", "nn_t", 5120, 256), "waves"
+    )
+    X5 = torch.zeros(T, 5120)
+    plan, _ = cake_backend.plan_atomic_router(G.t(), X5, torch.zeros(N, 5120), **kw)
+    assert (plan.layout, plan.template, plan.swapped) == (
+        "nn_t",
+        "router_fp32_gemm_atomic_nn_t",
+        True,
+    )
+    assert (plan.M, plan.N, plan.K, plan.k_iters) == (5120, N, T, 129)
+    assert plan.units == 3 * 76 and plan.part_tiles and not plan.reproducible
+    dgrad = (G, W, torch.zeros(T, K))
+    assert cake_backend.plan_atomic_router(*dgrad, **kw)[0] is None
+    assert plan.head_spans == 0 and plan.head_steps == 0
+
+
+def test_k2_planner_plans_the_head_tail_router(monkeypatch):
+    """A head/tail verdict (``"H0.5x4"`` on sm_107a, set here for hidden 4096, 5120 and 6144; sm_100a / sm_103a at
+    hidden 5120) runs the head/tail program: ``router_fp32_gemm_atomic_nn_t_ht_c3_nreg`` with
+    the partition's ``head_spans`` / ``head_steps``, which the launch passes to the program; without that template
+    registered the row runs the deterministic program."""
+    arch, T, N = "sm_107a", 16231, 256
+    kw = dict(arch=arch, sm_count=216)
+    for hidden in (4096, 5120, 6144):
+        monkeypatch.setitem(
+            cake_backend.ROUTER_RULES, (arch, "nn_t", hidden, 256), "H0.5x4"
+        )
+    G = torch.zeros(T, N)
+    monkeypatch.setitem(cake_jit.KERNELS, arch, {})  # whatever this checkout registers
+    _register(
+        monkeypatch, arch, "router_fp32_gemm_atomic_kk", "router_fp32_gemm_atomic_nn_t"
+    )
+    X5 = torch.zeros(T, 5120)
+    plan, reason = cake_backend.plan_atomic_router(
+        G.t(), X5, torch.zeros(N, 5120), **kw
+    )
+    assert plan is None and reason == (
+        "router_fp32_gemm_atomic_nn_t_ht_c3_nreg is not registered for sm_107a"
+    )
+    _register(monkeypatch, arch, "router_fp32_gemm_atomic_nn_t_ht_c3_nreg")
+    for hidden, m_pairs in ((4096, 16), (5120, 20), (6144, 24)):
+        X = torch.zeros(T, hidden)
+        out = torch.zeros(N, hidden)
+        plan, _ = cake_backend.plan_atomic_router(G.t(), X, out, **kw)
+        assert (plan.layout, plan.template, plan.swapped) == (
+            "nn_t",
+            "router_fp32_gemm_atomic_nn_t_ht_c3_nreg",
+            True,
+        )
+        assert (plan.M, plan.N, plan.K, plan.m_tiles, plan.n_tiles, plan.k_iters) == (
+            hidden,
+            N,
+            T,
+            2 * m_pairs,
+            2,
+            508,
+        )
+        assert (plan.units, plan.head_spans, plan.head_steps) == (
+            540,
+            54,
+            m_pairs * 254,
+        )
+        assert plan.grid == (1080, 1, 1) and plan.part_tiles and not plan.reproducible
+        values = cake_backend._k2_values(plan, A="a", parts="b", out=out)
+        assert (values["units"], values["head_spans"], values["head_steps"]) == (
+            540,
+            54,
+            m_pairs * 254,
+        )
+    # an explicit split count runs the stream-K program with spans alike
+    plan, _ = cake_backend.plan_atomic_router(
+        G.t(), X5, torch.zeros(N, 5120), splits=3, **kw
+    )
+    assert plan.template == "router_fp32_gemm_atomic_nn_t" and plan.head_spans == 0
+    # fewer SMs without a table of their own: the deterministic program
+    plan, reason = cake_backend.plan_atomic_router(
+        G.t(), X5, torch.zeros(N, 5120), arch=arch, sm_count=214
+    )
+    assert plan is None and "planner" in reason
+    # 212 and 208 SMs: the tables of their own (ROUTER_RULES_BY_SM), hidden 5120 "H0.5x4" on 106 / 104 CTA pairs
+    for sms, pairs in ((212, 106), (208, 104)):
+        plan, _ = cake_backend.plan_atomic_router(
+            G.t(), X5, torch.zeros(N, 5120), arch=arch, sm_count=sms
+        )
+        assert plan.template == "router_fp32_gemm_atomic_nn_t_ht_c3_nreg"
+        assert (plan.units, plan.head_spans, plan.head_steps) == (
+            5 * pairs,
+            pairs // 2,
+            20 * 254,
+        )
+        assert plan.grid == (10 * pairs, 1, 1)
+        X4 = torch.zeros(T, 4096)
+        plan, reason = cake_backend.plan_atomic_router(
+            G.t(), X4, torch.zeros(N, 4096), arch=arch, sm_count=sms
+        )
+        assert plan is None and "planner" in reason
+    # sm_100a / sm_103a, hidden 5120: three tail units per pair (76 head + 228 tail units on 152 SMs)
+    for gb in ("sm_100a", "sm_103a"):
+        monkeypatch.setitem(cake_jit.KERNELS, gb, {})
+        _register(
+            monkeypatch,
+            gb,
+            "router_fp32_gemm_atomic_kk",
+            "router_fp32_gemm_atomic_nn_t",
+            "router_fp32_gemm_atomic_nn_t_ht_c3_nreg",
+        )
+        plan, _ = cake_backend.plan_atomic_router(
+            G.t(), X5, torch.zeros(N, 5120), arch=gb, sm_count=152
+        )
+        assert (plan.template, plan.units, plan.head_spans, plan.head_steps) == (
+            "router_fp32_gemm_atomic_nn_t_ht_c3_nreg",
+            304,
+            38,
+            20 * 254,
+        )
+        assert plan.grid == (608, 1, 1) and plan.part_tiles
+
+
+def test_k2_values_feed_every_registered_router_program():
+    """The keyword arguments of a K2 launch name every argument of every registered router program's argument plan
+    (the head/tail program's ``head_spans`` / ``head_steps`` included)."""
+    out = torch.zeros(256, 5120)
+    plan = cake_backend.AtomicRouterPlan(
+        M=5120, N=256, K=16231, a_mn=True, b_mn=True, swapped=True, layout="nn_t", m_tiles=40,
+        n_tiles=2, k_iters=508, units=540, template="router_fp32_gemm_atomic_nn_t_ht_c3_nreg",
+        head_spans=54, head_steps=5080,
+    )  # fmt: skip
+    values = cake_backend._k2_values(plan, A="a", parts="b", out=out)
+    names = [
+        n for n, r in cake_jit.MODULES.items() if r["template"].startswith("router_")
+    ]
+    for name in names:
+        plan_args = cake_jit.arg_plan_of(cake_jit.MODULES[name])
+        arguments = cake_backend._order_atomic_arguments(
+            name, plan_args, values, plan.grid
+        )
+        assert len(arguments) == len(plan_args), name
+        if cake_jit.MODULES[name]["template"].endswith(
+            cake_backend.ROUTER_HEAD_TAIL_SUFFIX
+        ):
+            assert [a for _, a in plan_args][-6:] == [
+                "head_spans",
+                "head_steps",
+                "enable_pdl",
+                "grid_x",
+                "grid_y",
+                "grid_z",
+            ]
+
+
+def test_k2_out_fill_is_one_driver_memset_with_a_zero_fallback(monkeypatch):
+    """The fill of a K2 ``out`` with part tiles: one ``cuMemsetD32Async`` over contiguous rows, one
+    ``cuMemsetD2D32Async`` (pitch in bytes) over padded rows, on the stream it is given; ``out.zero_()`` when torch's
+    current device is another device, when the driver refuses the call, or without ``cuda.bindings``."""
     calls = []
-    fake = SimpleNamespace(run=lambda *args: calls.append(args))
+
+    class Driver:
+        class CUresult:
+            CUDA_SUCCESS = 0
+
+        status = 0
+
+        def cuMemsetD32Async(self, ptr, value, count, stream):
+            calls.append(("1d", ptr, value, count, stream))
+            return (self.status,)
+
+        def cuMemsetD2D32Async(self, ptr, pitch, value, width, height, stream):
+            calls.append(("2d", ptr, pitch, value, width, height, stream))
+            return (self.status,)
+
+    driver = Driver()
+    monkeypatch.setattr(cake_backend, "_CU_DRIVER", driver)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 1)
+    dense = torch.full((6, 8), 7.0)
+    padded = torch.full((6, 12), 7.0)[:, :8]
+    cake_backend._out_fill(dense, 1)(1234)
+    cake_backend._out_fill(padded, 1)(99)
+    assert calls == [
+        ("1d", dense.data_ptr(), 0, 48, 1234),
+        ("2d", padded.data_ptr(), 48, 0, 8, 6, 99),
+    ]
+    assert bool((dense == 7).all()) and bool((padded == 7).all())
+    calls.clear()
+    cake_backend._out_fill(dense, 0)(1234)  # another current device
+    assert calls == [] and bool((dense == 0).all())
+    driver.status = 1  # the driver refuses the memset
+    cake_backend._out_fill(padded, 1)(99)
+    assert len(calls) == 1 and bool((padded == 0).all())
+    base = torch.full((6, 12), 7.0)
+    monkeypatch.setattr(cake_backend, "_CU_DRIVER", False)  # no cuda.bindings
+    cake_backend._out_fill(base[:, :8], 1)(99)
+    assert len(calls) == 1 and bool((base[:, :8] == 0).all())
+    assert bool((base[:, 8:] == 7).all())
+
+
+def _geometry(t: torch.Tensor) -> tuple:
+    return (tuple(t.shape), t.stride(), t.storage_offset(), t.data_ptr(), t.dtype)
+
+
+@pytest.mark.parametrize("swapped", [False, True])
+@pytest.mark.parametrize("a_mn", [False, True])
+@pytest.mark.parametrize("b_mn", [False, True])
+def test_k2_views_are_the_views_of_the_swapped_operands(swapped, a_mn, b_mn):
+    """``_k2_views`` takes the streamed operand's span and the split's source in at most two view operations of the
+    caller's tensors: the same sizes, strides, storage offset and data pointer as the views of the swapped operands
+    ``A_eff = B.t()``, ``B_eff = A.t()`` (so the launch binds the same arguments)."""
+    plan = type("Plan", (), dict(swapped=swapped, a_mn=a_mn, b_mn=b_mn))()
+    for A, B in (
+        (torch.empty(64, 96), torch.empty(96, 32)),
+        (torch.empty(96, 64).t(), torch.empty(32, 96).t()),
+        (torch.empty(64, 100)[:, 4:], torch.empty(40, 104).t()[8:]),
+    ):
+        A_eff, B_eff = (B.t(), A.t()) if swapped else (A, B)
+        want_src = B_eff if b_mn else B_eff.t()
+        want_a = A_eff.t().unsqueeze(0) if a_mn else A_eff.unsqueeze(0)
+        a_view, split_src = cake_backend._k2_views(A, B, plan)
+        assert _geometry(a_view) == _geometry(want_a)
+        assert _geometry(split_src) == _geometry(want_src)
+
+
+# The router entry points' own tensors as launch views: (A, B) of the K2 GEMM and the views the entry point passes
+# fmt: off
+ENTRY_POINT_VIEWS = {
+    "fwd": lambda X, W, G: ((X, W.t()), (X.unsqueeze(0), W, cake_backend._FORWARD_VIEWS)),
+    "dgrad": lambda X, W, G: ((G, W), (G.unsqueeze(0), W, cake_backend._DGRAD_VIEWS)),
+    "wgrad": lambda X, W, G: ((G.t(), X), (X.unsqueeze(0), G, cake_backend._WGRAD_VIEWS)),
+}
+# fmt: on
+
+
+@pytest.mark.parametrize("op", sorted(ENTRY_POINT_VIEWS))
+def test_entry_point_views_are_the_launch_views(monkeypatch, op):
+    """An entry point's own tensors are the launch views of the deterministic package's plan (its fail-closed views)
+    and of this package's plan whenever the plan has the entry point's flags, so the launch binds the same
+    arguments; contiguous operands always have them, other layouts fall back to ``_k2_views``."""
+    arch, sm_count, T, H = "sm_103a", 152, 64, 5120
+    _register(
+        monkeypatch, arch, "router_fp32_gemm_atomic_kk", "router_fp32_gemm_atomic_nn_t"
+    )
+    # fmt: off
+    layouts = (
+        (torch.empty(T, H), torch.empty(256, H), torch.empty(T, 256), True),
+        (torch.empty(T, H + 64)[:, :H], torch.empty(256, H), torch.empty(T, 272)[:, :256], True),
+        (torch.empty(H, T).t(), torch.empty(H, 256).t(), torch.empty(256, T).t(), False),
+    )
+    # fmt: on
+    used = 0
+    for X, W, G, canonical in layouts:
+        (A, B), views = ENTRY_POINT_VIEWS[op](X, W, G)
+        out = torch.empty(A.shape[0], B.shape[1])
+        plans = []
+        try:
+            plan, A_eff, B_eff = det_backend.plan_router_fp32_det_gemm(A, B, out)
+        except (ValueError, NotImplementedError):
+            assert not canonical
+        else:
+            want = det_backend._k2_checked_views(A, B, A_eff, B_eff, plan)
+            plans.append((plan, want))
+        if op != "dgrad":
+            plan, _ = cake_backend.plan_atomic_router(
+                A, B, out, arch=arch, sm_count=sm_count, splits=2
+            )
+            if plan is not None:
+                plans.append((plan, cake_backend._k2_views(A, B, plan)))
+        assert plans or not canonical
+        for plan, (want_a, want_src) in plans:
+            flags = (plan.swapped, plan.a_mn, plan.b_mn)
+            assert flags == views[2] or not canonical, (op, flags)
+            used += flags == views[2]
+            a_view, split_src = cake_backend._launch_views(A, B, plan, views)
+            assert _geometry(a_view) == _geometry(want_a), (op, flags)
+            assert _geometry(split_src) == _geometry(want_src), (op, flags)
+    assert used
+
+
+class _FakeModule:
+    """A loaded module stand-in: every entry is one recorder (CPU binding tests: nothing is loaded)."""
+
+    def __init__(self):
+        self.entry = Recorder()
+
+    def __getattr__(self, name):
+        return self.entry
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "wgrad",
+        "fwd",
+        "dgrad",
+        "dgrad_padded_out",
+        "wgrad_padded_out",
+        "torch_chain",
+    ],
+)
+@pytest.mark.parametrize("pdl", [0, 1])
+def test_splitk_binding_is_the_deterministic_launch(monkeypatch, case, pdl):
+    """The binding of the deterministic program on this package's convenience path (``_plan_splitk_k2``) orders the
+    deterministic package's arguments once: with a call's views in place its kernel and fused-split argument lists are
+    the lists the deterministic package's convenience path resolves (``_k2_values`` / ``_split_values`` in its
+    argument plans) -- the stack, the partials ``[splits, rows, cols]`` of several splits or ``out`` itself (its flat
+    alias when padded) for one split -- carved from this package's arena, and carved again after the arena grows; the
+    PDL flag is bound into both lists."""
+    monkeypatch.setattr(cake_backend.tvm_ffi, "from_dlpack", lambda t, **_: t)
+    arch, T, H = "sm_103a", 64, 6144
+    monkeypatch.setattr(det_backend, "require_arch", lambda device: arch)
     monkeypatch.setattr(
-        cake_backend, "load_cake_dense_projection_gemm_module", lambda name, arch: fake
+        det_backend,
+        "load_cake_dense_projection_det_gemm_module",
+        lambda name, arch: _FakeModule(),
     )
-    A = torch.zeros(1, 8, 64, dtype=torch.bfloat16)
-    launch = bind_launch(
-        "cake_dense_projection_gemm_fake",
-        dict(A=A, M=8),
-        (4, 1, 1),
-        "sm_100a",
+    monkeypatch.setattr(cake_backend, "_ATOMIC_ARENAS", {})
+    X, W = torch.empty(T, H), torch.empty(256, H)
+    G = torch.empty(T, 272)[:, :256] if case == "torch_chain" else torch.empty(T, 256)
+    op = case.split("_")[0] if case != "torch_chain" else "wgrad"
+    (A, B), views = ENTRY_POINT_VIEWS[op](X, W, G)
+    rows, cols = A.shape[0], B.shape[1]
+    out = (
+        torch.empty(rows, cols + 64)[:, :cols]
+        if case.endswith("padded_out")
+        else torch.empty(rows, cols)
     )
-    assert launch.arguments == (A, 8, 4, 1, 1)
-    launch()
-    assert calls == [(A, 8, 4, 1, 1)]
-    with pytest.raises(KeyError, match="'M'"):
-        bind_launch(
-            "cake_dense_projection_gemm_fake",
-            dict(A=A),
-            (4, 1, 1),
-            "sm_100a",
+    splits = 1 if op == "dgrad" else None
+    entry = cake_backend._plan_splitk_k2(A, B, out, splits, 0, 0, pdl)
+    plan, bound, arena = entry.plan, entry.k2, entry.arena
+    assert bound is not None and arena is not None and entry.entry is not None
+    assert plan == det_backend.plan_router_fp32_det_gemm(A, B, out, splits=splits)[0]
+    assert plan.splits == {"fwd": 4, "dgrad": 1, "wgrad": 6}[op]
+    a_view, split_src = cake_backend._launch_views(A, B, plan, views)
+    split_module = det_backend._fused_split_for(arch, split_src)
+    assert (split_module is None) == (case == "torch_chain")
+    assert (entry.split_entry is None) == (split_module is None)
+    n = split_src.numel()
+    for grow in (1, 4):
+        if grow > 1:
+            arena.require("k2_stack", 3 * n * grow)
+        assert bound.version != arena.version
+        bound.carve(arena, split_module is None)
+        assert bound.version == arena.version
+        parts = arena.buffers["k2_stack"][: 3 * n].view(3, *split_src.shape)
+        assert _geometry(bound.parts) == _geometry(parts)
+        assert (bound.resid is None) == (split_module is not None)
+        if plan.splits > 1:
+            dims = (plan.N, plan.M) if plan.transposed_out else (plan.M, plan.N)
+            shape = (plan.splits, *dims)
+            assert bound.partials_shape == shape
+            buf = arena.buffers["k2_splitk_partials"]
+            workspace = buf[: plan.splits * dims[0] * dims[1]].view(shape)
+            assert _geometry(bound.workspace) == _geometry(workspace)
+            out32, ldo, out_l = workspace, dims[1], dims[0] * dims[1]
+            call_out = None
+        else:
+            assert bound.partials_shape is None and bound.workspace is None
+            out32 = det_backend._k2_out32(out)
+            assert bound.out_contiguous == (not case.endswith("padded_out"))
+            ldo, out_l, call_out = int(out.stride(0)), 0, out32
+        src = None if split_module is None else split_src
+        kernel_args, split_args = bound.arguments((a_view, call_out, None, src))
+        module_name = det_backend.select_module(arch, plan.template)
+        _same_arguments(
+            kernel_args,
+            det_backend._order_arguments(
+                module_name,
+                det_backend.arg_plan_of(det_backend.MODULES[module_name]),
+                det_backend._k2_values(
+                    plan,
+                    A=a_view,
+                    parts=parts,
+                    out32=out32,
+                    ldo=ldo,
+                    out_l=out_l,
+                    enable_pdl=pdl,
+                ),
+                plan.grid,
+            ),
         )
-    with pytest.raises(ValueError, match="cluster"):
-        bind_launch(
-            "cake_dense_projection_gemm_fake",
-            dict(A=A, M=8),
-            (3, 1, 1),
-            "sm_100a",
-        )
-    assert (
-        cake_jit.select_module("sm_100a", "dense_proj_gemm_kk_n256")
-        == "cake_dense_projection_gemm_fake"
+        if split_module is None:
+            assert split_args is None
+        else:
+            _same_arguments(
+                split_args,
+                det_backend._order_arguments(
+                    split_module,
+                    det_backend.arg_plan_of(det_backend.MODULES[split_module]),
+                    det_backend._split_values(split_src, parts, n, pdl),
+                    det_backend._split_grid(n),
+                ),
+            )
+
+
+def _router_spec_tokens(rule) -> set:
+    tokens = {1, 63, 64, 65, 127, 128, 129, 191, 192, 193, 224}
+    tokens |= {4096, 8192, 32768, 32769}
+    if isinstance(rule, tuple):
+        for lo, hi, _ in rule:
+            tokens |= {lo - 1, lo, lo + 1, hi - 1, hi, hi + 1}
+    return {t for t in tokens if t >= 1}
+
+
+def test_router_rule_spec_is_the_planners_verdict():
+    """Where ``_router_rule_spec`` gives no spec on an SM count, ``router_partition`` without a split count runs the
+    deterministic program there (the convenience path's pre-check then skips the planner exactly where the planner
+    would keep the row); a spec it gives is the planner's (a head/tail or unit-count spec is the partition on an SM
+    count whose router table holds, ``router_rules``)."""
+    rows = dict(cake_backend.ROUTER_RULES)
+    for arch in cake_backend.ROUTER_SM_COUNT:
+        for layout in ("kk", "nn_t"):
+            rows.setdefault((arch, layout, 2048, 256), None)  # rows without an entry
+            rows.setdefault((arch, layout, 5120, 512), None)
+    checked = 0
+    for (arch, layout, hidden, experts), rule in rows.items():
+        for T in _router_spec_tokens(rule):
+            if layout == "kk":
+                M, N, K = T, experts, hidden
+            else:
+                M, N, K = hidden, experts, T
+            for sm_count in (148, 152, 208, 212, 216):
+                spec = cake_backend._router_rule_spec(
+                    layout, arch=arch, sm_count=sm_count, M=M, N=N, K=K
+                )
+                part = cake_backend.router_partition(
+                    layout, arch=arch, M=M, N=N, K=K, sm_count=sm_count
+                )
+                if spec is None:
+                    assert part is None, (arch, layout, hidden, experts, T, sm_count)
+                elif spec != "waves" and part is not None:
+                    m_tiles, n_tiles, k_iters = cake_backend._router_grid(M, N, K)
+                    assert part == cake_backend.router_partition_of(
+                        spec, m_tiles // 2, n_tiles, k_iters, sm_count
+                    )
+                checked += 1
+    assert checked > 1000
+
+
+def test_k2_rows_without_a_verdict_skip_the_planner(monkeypatch):
+    """``_k2_row_without_verdict`` is true exactly for the valid ``kk`` / ``nn_t`` bindings the planner (no split count)
+    keeps on the deterministic program for want of a verdict, and false for every binding the planner refuses, plans
+    or keeps for another reason (left to the planner); a verdict added at run time is seen."""
+    arch, sm_count = "sm_103a", 152
+    _register(
+        monkeypatch,
+        arch,
+        "router_fp32_gemm_atomic_kk",
+        "router_fp32_gemm_atomic_nn_t",
+        "router_fp32_gemm_atomic_nn_t" + cake_backend.ROUTER_HEAD_TAIL_SUFFIX,
     )
-    # schema v2: a record names its plan by key and the key resolves through ARG_PLANS; an inline plan
-    # (the record above) is still accepted; an unknown key fails closed
-    plan = record["arg_plan"]
-    key = cake_jit.arg_plan_key(plan)
-    assert re.fullmatch(r"[0-9a-f]{12}", key) and key not in cake_jit.ARG_PLANS
-    monkeypatch.setitem(cake_jit.ARG_PLANS, key, plan)
+    kept = planned = 0
+    for hidden in (2048, 4096, 5120, 6144):
+        for T in (64, 128, 192, 193, 224, 1024):
+            X, W, G = (
+                torch.empty(T, hidden),
+                torch.empty(256, hidden),
+                torch.empty(T, 256),
+            )
+            for A, B, out in (
+                (X, W.t(), torch.empty(T, 256)),
+                (G.t(), X, torch.empty(256, hidden)),
+            ):
+                keeps = cake_backend._k2_row_without_verdict(A, B, out, arch, sm_count)
+                plan, reason = cake_backend.plan_atomic_router(
+                    A, B, out, arch=arch, sm_count=sm_count
+                )
+                want = plan is None and reason == (
+                    "the planner keeps the row on the deterministic program"
+                )
+                if keeps:
+                    assert want, (hidden, T, A.shape)
+                    kept += 1
+                else:
+                    layout = "kk" if A.stride(1) == 1 else "nn_t"
+                    M, N = (T, 256) if layout == "kk" else (hidden, 256)
+                    K = hidden if layout == "kk" else T
+                    assert (
+                        cake_backend._router_rule_spec(
+                            layout, arch=arch, sm_count=sm_count, M=M, N=N, K=K
+                        )
+                        is not None
+                    ), (hidden, T, layout)
+                    planned += plan is not None
+    assert kept and planned
+    X, W = torch.empty(64, 5120), torch.empty(256, 5120)
+    out = torch.empty(64, 256)
+    without_verdict = cake_backend._k2_row_without_verdict
+    assert without_verdict(X, W.t(), out, arch, sm_count)
+    # bindings the planner refuses or classifies otherwise stay with it
+    assert not without_verdict(X.bfloat16(), W.t(), out, arch, sm_count)
+    assert not without_verdict(X, W.t(), out.double(), arch, sm_count)
+    assert not without_verdict(X[None], W.t(), out, arch, sm_count)
+    assert not without_verdict(X, W.t(), out[:, :128], arch, sm_count)
+    assert not without_verdict(X[:0], W.t(), out[:0], arch, sm_count)
+    assert not without_verdict(X, W.t()[:4096], out, arch, sm_count)
+    assert not without_verdict(
+        torch.empty(64, 256), torch.empty(256, 5120), torch.empty(64, 5120), arch, 152
+    )  # the kn class (the input gradient)
+    assert not without_verdict(
+        torch.zeros(1).expand(64, 5120), W.t(), out, arch, sm_count
+    )  # no unit stride
+    monkeypatch.setitem(cake_backend.ROUTER_RULES, (arch, "kk", 5120, 256), "S2")
+    assert not without_verdict(X, W.t(), out, arch, sm_count)
+
+
+def test_router_tables_count_their_changes():
+    """``ROUTER_RULES``, ``ROUTER_RULES_BY_SM`` and each table it holds count their changes: every way of changing
+    a table moves the generation the convenience path's memo is kept for; a copy is a plain ``dict`` with the same
+    items."""
+    tables = (
+        cake_backend.ROUTER_RULES,
+        cake_backend.ROUTER_RULES_BY_SM,
+        *cake_backend.ROUTER_RULES_BY_SM.values(),
+    )
+    assert all(type(t) is cake_backend._VerdictTable for t in tables)
+    for t in tables:
+        assert type(dict(t)) is dict and dict(t) == t
+    key = ("sm_103a", "kk", 2048, 256)
+    table = cake_backend._VerdictTable({("sm_103a", "nn_t", 2048, 256): None})
+    changes = (
+        lambda: table.__setitem__(key, "S2"),
+        lambda: table.__delitem__(key),
+        lambda: table.update({key: None}),
+        lambda: table.pop(key),
+        lambda: table.setdefault(key, "S2"),
+        lambda: table.__ior__({key: None}),
+        lambda: table.popitem(),
+        lambda: table.clear(),
+    )
+    for change in changes:
+        before = cake_backend._VERDICT_GENERATION
+        change()
+        assert before < cake_backend._VERDICT_GENERATION
+    assert table == {}
+
+
+def test_router_memo_follows_the_router_tables(monkeypatch):
+    """The memo of the router tables (``_router_memo``) is kept while no table changes and derived again after any
+    change: no forward verdict ships; a forward verdict set in any table, and its removal, are seen at the next call;
+    a table rebound in place of one is seen, and one that does not count its changes (a plain ``dict``) is read on
+    every call; ``clear_convenience_caches`` drops the memo."""
+    cake_backend.clear_convenience_caches()
+    memo = cake_backend._router_memo()
+    assert memo.tracked and not memo.forward_verdicts and not memo.without_verdict
+    assert cake_backend._router_memo() is memo
+    own = cake_backend.ROUTER_RULES_BY_SM[("sm_107a", 212)]
+    key = ("sm_107a", "kk", 5120, 256)
+    monkeypatch.setitem(own, key, "S2")
+    assert cake_backend._router_memo().forward_verdicts
+    own[key] = None
+    assert not cake_backend._router_memo().forward_verdicts
+    # a change of a weight-gradient row renews the memo too (its conclusions may differ)
+    memo = cake_backend._router_memo()
     monkeypatch.setitem(
-        cake_jit.MODULES,
-        "cake_dense_projection_gemm_fake_v2",
-        dict(record, arg_plan=key),
+        cake_backend.ROUTER_RULES, ("sm_100a", "nn_t", 4096, 256), "pairs"
+    )
+    renewed = cake_backend._router_memo()
+    assert renewed is not memo and renewed.tracked and not renewed.forward_verdicts
+    # a plain table bound in place of one: read on every call, so a change of it is seen without a generation
+    plain = dict(cake_backend.ROUTER_RULES_BY_SM)
+    monkeypatch.setattr(cake_backend, "ROUTER_RULES_BY_SM", plain)
+    assert not cake_backend._router_memo().tracked
+    assert not cake_backend._router_memo().forward_verdicts
+    plain[("sm_107a", 200)] = {key: "S2"}
+    assert cake_backend._router_memo().forward_verdicts
+    del plain[("sm_107a", 200)]
+    assert not cake_backend._router_memo().forward_verdicts
+    # a counting table bound in place of one: kept again, and its changes are seen
+    rules = cake_backend._VerdictTable(cake_backend.ROUTER_RULES)
+    monkeypatch.setattr(cake_backend, "ROUTER_RULES", rules)
+    monkeypatch.setattr(
+        cake_backend,
+        "ROUTER_RULES_BY_SM",
+        cake_backend._VerdictTable(
+            {k: cake_backend._VerdictTable(v) for k, v in plain.items()}
+        ),
+    )
+    memo = cake_backend._router_memo()
+    assert memo.tracked and memo.rules is rules and cake_backend._router_memo() is memo
+    rules[("sm_100a", "kk", 4096, 256)] = "forward"
+    assert cake_backend._router_memo().forward_verdicts
+    cake_backend.clear_convenience_caches()
+    assert cake_backend._router_memo() is not memo
+
+
+def _fake_device_facts(monkeypatch, parts):
+    """``deterministic_backend().device_facts(index)`` of fake CUDA devices ``index -> (arch, sm_count)`` (CPU
+    tests of the convenience path's memo, which keys its conclusions by device index)."""
+    facts = {
+        i: det_backend.DeviceFacts(index=i, arch=a, sm_count=n, l2_bytes=1 << 27)
+        for i, (a, n) in parts.items()
+    }
+    monkeypatch.setattr(det_backend, "device_facts", lambda device=None: facts[device])
+
+
+def test_k2_memo_is_the_planners_check(monkeypatch):
+    """``_k2_runs_without_verdict`` (the convenience path's check of a call without a split count, kept per device
+    index and view geometry) is ``_k2_row_without_verdict`` on that device's architecture and SM count for every
+    binding -- each device its own -- and follows the router tables: a verdict set at run time in the table of a
+    device's SM count is seen at the next call (the row is planned), and so is its removal, without clearing any
+    cache; the memo starts over when full and still answers the same."""
+    parts = {0: ("sm_103a", 152), 1: ("sm_107a", 212), 2: ("sm_107a", 216)}
+    _fake_device_facts(monkeypatch, parts)
+    cake_backend.clear_convenience_caches()
+    runs = cake_backend._k2_runs_without_verdict
+    cases = []
+    for hidden in (2048, 4096, 5120, 6144):
+        for T in (64, 128, 192, 193, 224, 1024, 16231):
+            X, W, G = (
+                torch.empty(T, hidden),
+                torch.empty(256, hidden),
+                torch.empty(T, 256),
+            )
+            cases += [
+                (X, W.t(), torch.empty(T, 256)),
+                (G.t(), X, torch.empty(256, hidden)),
+                (G, W, torch.empty(T, hidden)),  # the kn class: left to the planner
+                (X.bfloat16(), W.t(), torch.empty(T, 256)),  # refused by the planner
+            ]
+
+    def check():
+        n = 0
+        for index, (arch, sm_count) in parts.items():
+            for A, B, out in cases:
+                want = cake_backend._k2_row_without_verdict(A, B, out, arch, sm_count)
+                got = runs(cake_backend._k2_geometry(A, B, out), index)
+                assert got == want, (index, tuple(A.shape), A.stride(), A.dtype)
+                n += want
+        return n
+
+    kept = check()
+    assert kept and check() == kept  # the second pass reads the memo
+    memo = cake_backend._router_memo()
+    assert len(memo.without_verdict) == len(parts) * len(cases)
+    # a verdict set at run time in the table of the 212-SM part's SM count: seen at the next call
+    G, X = torch.empty(64, 256), torch.empty(64, 6144)
+    geometry = cake_backend._k2_geometry(G.t(), X, torch.empty(256, 6144))
+    assert runs(geometry, 1) and runs(geometry, 0)
+    own = cake_backend.ROUTER_RULES_BY_SM[("sm_107a", 212)]
+    monkeypatch.setitem(own, ("sm_107a", "nn_t", 6144, 256), ((1, 64, "pairs"),))
+    assert not runs(geometry, 1) and runs(geometry, 0) and runs(geometry, 2)
+    own[("sm_107a", "nn_t", 6144, 256)] = None
+    assert runs(geometry, 1)
+    assert check() == kept
+    # a full memo starts over (from an empty memo: every check is a miss)
+    monkeypatch.setattr(cake_backend, "_ROUTER_MEMO_SIZE", 5)
+    cake_backend.clear_convenience_caches()
+    assert check() == kept
+    assert 0 < len(cake_backend._router_memo().without_verdict) <= 5
+
+
+def test_k2_memo_under_concurrent_table_changes(monkeypatch):
+    """Threads checking router calls while another thread sets and removes a verdict: no call fails, and once the
+    tables stop changing every conclusion is the planner's for the final tables (a conclusion drawn while a table
+    changed is not kept past that change)."""
+    _fake_device_facts(monkeypatch, {0: ("sm_103a", 152)})
+    cake_backend.clear_convenience_caches()
+    geometries = []
+    for T in (64, 128, 192, 224, 1024):
+        G, X = torch.empty(T, 256), torch.empty(T, 4096)
+        geometries.append(
+            (cake_backend._k2_geometry(G.t(), X, torch.empty(256, 4096)), T)
+        )
+    key = ("sm_103a", "nn_t", 4096, 256)
+    monkeypatch.setitem(cake_backend.ROUTER_RULES, key, None)
+    stop, errors = threading.Event(), []
+
+    def reader():
+        try:
+            while not stop.is_set():
+                for geometry, _ in geometries:
+                    cake_backend._k2_runs_without_verdict(geometry, 0)
+        except Exception as exc:  # noqa: BLE001 - reported below
+            errors.append(exc)
+
+    threads = [threading.Thread(target=reader) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for i in range(200):
+        cake_backend.ROUTER_RULES[key] = ((1, 128, "pairs"),) if i % 2 else None
+    cake_backend.ROUTER_RULES[key] = ((1, 128, "pairs"),)
+    stop.set()
+    for t in threads:
+        t.join()
+    assert not errors
+    for geometry, T in geometries:
+        assert cake_backend._k2_runs_without_verdict(geometry, 0) == (T > 128), T
+
+
+# (arch, SM count) of the measured router tables: ROUTER_RULES on 152-SM GB200 / GB300 and 216-SM R200 parts,
+# ROUTER_RULES_BY_SM on 208-SM and 212-SM R200 parts
+ROUTER_TABLE_PARTS = (
+    ("sm_100a", 152),
+    ("sm_103a", 152),
+    ("sm_107a", 208),
+    ("sm_107a", 212),
+    ("sm_107a", 216),
+)
+
+
+def test_router_rule_spec_reads_the_table_of_the_sm_count(monkeypatch):
+    """The convenience path's no-verdict check reads the router table of the device's SM count (``router_rules``):
+    ``ROUTER_RULES`` on 152 SMs (sm_100a, sm_103a) and 216 SMs (sm_107a), the part's own table of
+    ``ROUTER_RULES_BY_SM`` on 208 and 212 SMs (sm_107a).  At every row of that table and the edges of its windows the
+    spec is the table's, ``None`` exactly where the device's planner keeps the row on the deterministic program for
+    want of a verdict; a verdict in only one table is seen on exactly its SM count."""
+    _register(
+        monkeypatch,
+        "sm_107a",
+        "router_fp32_gemm_atomic_kk",
+        "router_fp32_gemm_atomic_nn_t",
+        "router_fp32_gemm_atomic_nn_t" + cake_backend.ROUTER_HEAD_TAIL_SUFFIX,
+    )
+    checked = 0
+    for arch, sms in ROUTER_TABLE_PARTS:
+        table, holds = cake_backend.router_rules(arch, sms)
+        own = cake_backend.ROUTER_RULES_BY_SM.get((arch, sms))
+        assert holds and table is (cake_backend.ROUTER_RULES if own is None else own)
+        assert (own is None) == (sms == cake_backend.ROUTER_SM_COUNT[arch])
+        for (key_arch, layout, hidden, experts), rule in table.items():
+            if key_arch != arch:
+                continue
+            for T in sorted(_router_spec_tokens(rule)):
+                M, N, K = (
+                    (T, experts, hidden) if layout == "kk" else (hidden, experts, T)
+                )
+                want = rule
+                if isinstance(rule, tuple):
+                    want = next((s for lo, hi, s in rule if lo <= T <= hi), None)
+                spec = cake_backend._router_rule_spec(
+                    layout, arch=arch, sm_count=sms, M=M, N=N, K=K
+                )
+                assert spec == want, (arch, sms, layout, hidden, T)
+                part = cake_backend.router_partition(
+                    layout, arch=arch, M=M, N=N, K=K, sm_count=sms
+                )
+                if spec is None:
+                    assert part is None, (arch, sms, layout, hidden, T)
+                checked += 1
+    assert checked > 300
+    # the sm_107a hidden-5120 weight gradient: "H0.5x4" at 16172 to 16384 tokens on 208, 212 and 216 SMs
+    for sms in (208, 212, 216):
+        for T, want in ((16171, None), (16172, "H0.5x4"), (16384, "H0.5x4")):
+            assert (
+                cake_backend._router_rule_spec(
+                    "nn_t", arch="sm_107a", sm_count=sms, M=5120, N=256, K=T
+                )
+                == want
+            )
+    # a verdict in the 212-SM table only, then in ROUTER_RULES only (216 SMs): the no-verdict check of a binding of
+    # the row follows the table of each SM count
+    key = ("sm_107a", "nn_t", 6144, 256)
+    tables = {
+        part: dict(rows) for part, rows in cake_backend.ROUTER_RULES_BY_SM.items()
+    }
+    tables[("sm_107a", 212)][key] = ((16172, 16384, "H0.5x4"),)
+    monkeypatch.setattr(cake_backend, "ROUTER_RULES_BY_SM", tables)
+    G, X = torch.empty(16231, 256), torch.empty(16231, 6144)
+    out = torch.empty(256, 6144)
+    keeps = {
+        sms: cake_backend._k2_row_without_verdict(G.t(), X, out, "sm_107a", sms)
+        for sms in (208, 212, 216)
+    }
+    assert keeps == {208: True, 212: False, 216: True}
+    plan, _ = cake_backend.plan_atomic_router(
+        G.t(), X, out, arch="sm_107a", sm_count=212
+    )
+    assert plan is not None and plan.head_spans > 0
+    monkeypatch.setitem(cake_backend.ROUTER_RULES, key, ((16172, 16384, "H0.5x4"),))
+    tables[("sm_107a", 212)][key] = None
+    keeps = {
+        sms: cake_backend._k2_row_without_verdict(G.t(), X, out, "sm_107a", sms)
+        for sms in (208, 212, 216)
+    }
+    assert keeps == {208: True, 212: True, 216: False}
+
+
+@pytest.mark.parametrize("splits", [None, 2])
+def test_k2_key_is_the_convenience_key(splits):
+    """The cached K2 launch reads the call's geometry once (``_k2_geometry``) for its checks and its key; the key is
+    the deterministic package's ``convenience_key`` of ``("k2", splits)`` and the three views."""
+    base = torch.empty(4096 + 8)
+    for A, B, out in (
+        (torch.empty(64, 512), torch.empty(256, 512).t(), torch.empty(64, 256)),
+        (
+            torch.empty(64, 256).t(),
+            torch.empty(64, 512),
+            torch.empty(256, 520)[:, :512],
+        ),
+        (
+            base[1:4097].view(64, 64),
+            base[8:4104].view(64, 64),
+            torch.empty(64, 64, dtype=torch.bfloat16),
+        ),
+        (torch.empty(2, 8, 8), torch.empty(8, 8), torch.empty(8)),
+    ):
+        geometry = cake_backend._k2_geometry(A, B, out)
+        assert cake_backend._k2_key(
+            3, 77, splits, A, B, out, geometry, out.data_ptr()
+        ) == det_backend.convenience_key(3, 77, ("k2", splits), A, B, out)
+
+
+def _same_arguments(got: list, want: list) -> None:
+    assert len(got) == len(want)
+    for i, (g, w) in enumerate(zip(got, want, strict=True)):
+        if isinstance(w, torch.Tensor):
+            assert isinstance(g, torch.Tensor) and _geometry(g) == _geometry(w), i
+        else:
+            assert type(g) is type(w) and g == w, (i, g, w)
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["wgrad_waves", "wgrad_head_tail", "fwd_two_splits", "padded_out", "torch_chain"],
+)
+def test_k2_bound_arguments_are_the_ordered_arguments(monkeypatch, case):
+    """A cached K2 launch orders its arguments once (``_k2_binding``) and binds the arena's BF16x3 stack once per arena
+    growth: with a call's views in place its kernel and fused-split argument lists are the lists the launch orders
+    per call from ``_k2_values`` / ``_split_values`` (the same tensors' geometry, the same values in the same
+    positions), ``out`` stands for both of its arguments, and the fill geometry is ``_out_fill``'s.  A grown arena is
+    carved again."""
+    monkeypatch.setattr(cake_backend.tvm_ffi, "from_dlpack", lambda t, **_: t)
+    monkeypatch.setattr(cake_backend, "_CU_DRIVER", False)
+    arch, sm_count, T, H, splits = "sm_103a", 152, 64, 5120, None
+    if case == "wgrad_head_tail":
+        T = 16172
+    elif case == "fwd_two_splits":
+        splits = 2
+    X, W = torch.empty(T, H), torch.empty(256, H)
+    G = (
+        torch.empty(T, 256 + 16)[:, :256]
+        if case == "torch_chain"
+        else torch.empty(T, 256)
+    )
+    if case == "fwd_two_splits":
+        A, B, out = X, W.t(), torch.empty(T, 256)
+    else:
+        out = (
+            torch.empty(256, H + 64)[:, :H]
+            if case == "padded_out"
+            else torch.empty(256, H)
+        )
+        A, B = G.t(), X
+    plan, reason = cake_backend.plan_atomic_router(
+        A, B, out, arch=arch, sm_count=sm_count, splits=splits
+    )
+    assert plan is not None, reason
+    assert (plan.head_spans > 0) == (case == "wgrad_head_tail")
+    module_name = cake_jit.select_module(arch, plan.template)
+    arg_plan = cake_jit.arg_plan_of(cake_jit.MODULES[module_name])
+    a_view, split_src = cake_backend._k2_views(A, B, plan)
+    split_module = det_backend._fused_split_for(arch, split_src)
+    assert (split_module is None) == (case == "torch_chain")
+    split_arg_plan = (
+        None
+        if split_module is None
+        else det_backend.arg_plan_of(det_backend.MODULES[split_module])
+    )
+    bound = cake_backend._k2_binding(
+        plan, out, split_src, module_name, arg_plan, split_module, split_arg_plan, 0
+    )
+    n = split_src.numel()
+    arena = cake_backend._AtomicArena(torch.device("cpu"), (0, 0))
+    for grow in (1, 4):
+        arena.require("k2_stack", 3 * n * grow)
+        if split_module is None:
+            arena.require("k2_split_scratch", n * grow)
+        assert bound.version != arena.version
+        bound.carve(arena, split_module is None)
+        assert bound.version == arena.version
+        parts = arena.buffers["k2_stack"][: 3 * n].view(3, *split_src.shape)
+        assert _geometry(bound.parts) == _geometry(parts)
+        if split_module is None:
+            resid = arena.buffers["k2_split_scratch"][:n].view(split_src.shape)
+            assert _geometry(bound.resid) == _geometry(resid)
+        else:
+            assert bound.resid is None
+        out32 = out if bound.out_contiguous else det_backend.flat_alias(out)
+        assert bound.out_contiguous == (case != "padded_out")
+        kernel_args, split_args = bound.arguments((a_view, out32, out, split_src))
+        _same_arguments(
+            kernel_args,
+            cake_backend._order_atomic_arguments(
+                module_name,
+                arg_plan,
+                cake_backend._k2_values(plan, A=a_view, parts=parts, out=out),
+                plan.grid,
+            ),
+        )
+        if split_module is None:
+            assert split_args is None
+        else:
+            _same_arguments(
+                split_args,
+                cake_backend._order_atomic_arguments(
+                    split_module,
+                    split_arg_plan,
+                    det_backend._split_values(split_src, parts, n),
+                    det_backend._split_grid(n),
+                ),
+            )
+    if plan.part_tiles:
+        fill = cake_backend._out_fill(out, 0)
+        assert bound.fill == (fill.rows, fill.cols, fill.pitch)
+    else:
+        assert bound.fill is None
+
+
+def test_deterministic_backend_follows_the_binding_and_sys_modules(monkeypatch):
+    """``deterministic_backend`` returns the module an import of the bound package's ``cake_backend`` returns: a
+    rebinding and a replaced ``sys.modules`` entry are seen on the next call."""
+    assert cake_backend.deterministic_backend() is det_backend
+    fake_pkg, fake = (
+        ModuleType("vendored_det_pkg2"),
+        ModuleType("vendored_det_pkg2.cake_backend"),
+    )
+    for name in cake_backend.DETERMINISTIC_NAMES.values():
+        setattr(fake, name, Recorder())
+    monkeypatch.setitem(sys.modules, "vendored_det_pkg2", fake_pkg)
+    monkeypatch.setitem(sys.modules, "vendored_det_pkg2.cake_backend", fake)
+    monkeypatch.setattr(cake_jit, "_det_package", cake_jit._det_package)
+    cake_backend.use_deterministic_backend(fake)
+    assert cake_backend.deterministic_backend() is fake
+    replaced = ModuleType("vendored_det_pkg2.cake_backend")
+    monkeypatch.setitem(sys.modules, "vendored_det_pkg2.cake_backend", replaced)
+    assert cake_backend.deterministic_backend() is replaced
+    cake_backend.use_deterministic_backend(det_backend)
+    assert cake_backend.deterministic_backend() is det_backend
+
+
+@pytest.mark.parametrize("shift_elems, ldo", [(1, 256), (2, 256), (0, 258)])
+def test_k2_misaligned_out_takes_the_deterministic_path(monkeypatch, shift_elems, ldo):
+    """An ``out`` the reduce-add map cannot address (off a 16-byte boundary, or rows not a multiple of 4 elements)
+    is not planned here: the call takes the deterministic path, which serves or refuses it as that package does."""
+    arch, T, K, N = "sm_103a", 4099, 6144, 256
+    _register(
+        monkeypatch, arch, "router_fp32_gemm_atomic_kk", "router_fp32_gemm_atomic_nn_t"
+    )
+    X, W = torch.zeros(T, K), torch.zeros(N, K)
+    storage = torch.zeros(T * ldo + 16)
+    out = storage[shift_elems : shift_elems + T * ldo].view(T, ldo)[:, :N]
+    plan, reason = cake_backend.plan_atomic_router(
+        X, W.t(), out, arch=arch, sm_count=152
+    )
+    assert plan is None and "16-byte" in reason
+    det = _patch_det(monkeypatch, "plan_router_fp32_gemm")
+    monkeypatch.setattr(
+        cake_backend,
+        "_device_and_arch",
+        lambda A, B, o: (torch.device("cpu"), arch, 152),
     )
     assert (
-        cake_jit.arg_plan_of(cake_jit.MODULES["cake_dense_projection_gemm_fake_v2"])
-        == plan
+        cake_backend.plan_router_fp32_gemm(X, W.t(), out, deterministic=False)
+        is det.result
     )
-    assert cake_jit.arg_plan_of(record) == plan
-    launch_v2 = bind_launch(
-        "cake_dense_projection_gemm_fake_v2", dict(A=A, M=8), (4, 1, 1), "sm_100a"
-    )
-    assert launch_v2.arguments == (A, 8, 4, 1, 1)
-    monkeypatch.setitem(
-        cake_jit.MODULES,
-        "cake_dense_projection_gemm_fake_v2",
-        dict(record, arg_plan="f" * 12),
-    )
-    with pytest.raises(KeyError, match="ARG_PLANS"):
-        bind_launch(
-            "cake_dense_projection_gemm_fake_v2", dict(A=A, M=8), (4, 1, 1), "sm_100a"
-        )
+    ((args, kwargs),) = det.calls
+    assert args[0] is X and args[1].data_ptr() == W.data_ptr() and args[2] is out
+    assert kwargs == {"splits": None}
 
 
 # ---------------------------------------------------------------------------
-# Convenience path (CPU): cache key, cache bound, per-call view rebuild, device facts
+# PyTorch's deterministic-algorithms mode (CPU)
+# ---------------------------------------------------------------------------
+
+# fmt: off
+ATOMIC_MODE_CALLS = {
+    "dense_projection_gemm": lambda: cake_backend.dense_projection_gemm(*_k1_views("nn"), deterministic=False),
+    "projection_forward": lambda: cake_backend.projection_forward("X", "W", deterministic=False),
+    "projection_wgrad": lambda: cake_backend.projection_wgrad("G", "X", "out", deterministic=False),
+    "router_forward": lambda: cake_backend.router_forward("X", "W", deterministic=False),
+    "router_dgrad": lambda: cake_backend.router_dgrad("G", "W", deterministic=False),
+    "router_wgrad": lambda: cake_backend.router_wgrad("G", "X", deterministic=False),
+    "split_fp32_to_bf16x3_": lambda: cake_backend.split_fp32_to_bf16x3_("s", "p", "r", deterministic=False),
+}
+# fmt: on
+
+
+@pytest.mark.parametrize("name", sorted(ATOMIC_MODE_CALLS))
+def test_explicit_false_under_torch_deterministic_mode_raises(
+    monkeypatch, torch_determinism, name
+):
+    recorder = _patch_det(monkeypatch, name)
+    monkeypatch.setattr(cake_backend, "_atomic_k1", Recorder())
+    monkeypatch.setattr(cake_backend, "_atomic_k2", Recorder())
+    torch.use_deterministic_algorithms(True)
+    with pytest.raises(RuntimeError, match="deterministic=True"):
+        ATOMIC_MODE_CALLS[name]()
+    assert not recorder.calls
+
+
+@pytest.mark.parametrize("name", sorted(ATOMIC_MODE_CALLS))
+def test_explicit_false_under_warn_only_warns_and_runs_the_deterministic_path(
+    monkeypatch, torch_determinism, name
+):
+    recorder = _patch_det(monkeypatch, name)
+    atomic1, atomic2 = Recorder(), Recorder()
+    monkeypatch.setattr(cake_backend, "_atomic_k1", atomic1)
+    monkeypatch.setattr(cake_backend, "_atomic_k2", atomic2)
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    with pytest.warns(UserWarning, match="running the deterministic path"):
+        assert ATOMIC_MODE_CALLS[name]() is recorder.result
+    assert len(recorder.calls) == 1 and not atomic1.calls and not atomic2.calls
+
+
+def test_routes_table():
+    assert cake_backend.ROUTES == {
+        "k1_kk": "det",
+        "k1_kn": "det",
+        "k1_nk": "det",
+        "k1_nn": "atomic",
+        "k2_kk": "atomic",
+        "k2_kn": "det",
+        "k2_nn_t": "atomic",
+        "split": "det",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Registry, names and workspace (CPU)
 # ---------------------------------------------------------------------------
 
 
-def test_convenience_key_follows_the_view_geometry_not_the_address():
-    A = torch.empty(64, 128, dtype=torch.bfloat16)
-    A_again = torch.empty(64, 128, dtype=torch.bfloat16)
-    B = torch.empty(32, 128, dtype=torch.bfloat16).t()
-    buf = torch.empty(2, 64, 32, dtype=torch.bfloat16)
-    out, out_same, out_offset = (
-        torch.empty(64, 32, dtype=torch.bfloat16),
-        buf[0],
-        buf[1],
-    )
-    key = convenience_key(0, 7, (False,), A, B, out)
-    # a new tensor of the same geometry hits (the address is not part of the key)
-    assert key == convenience_key(0, 7, (False,), A_again, B, out_same)
-    assert hash(key) == hash(convenience_key(0, 7, (False,), A_again, B, out_same))
-    others = [
-        convenience_key(1, 7, (False,), A, B, out),  # device index
-        convenience_key(0, 8, (False,), A, B, out),  # stream
-        convenience_key(0, 7, (True,), A, B, out),  # flags (transposed_out)
-        convenience_key(0, 7, (False,), A[:32], B, out[:32]),  # shape
-        convenience_key(0, 7, (False,), A.t().contiguous().t(), B, out),  # strides
-        convenience_key(0, 7, (False,), A, B, out.float()),  # dtype
-        convenience_key(0, 7, (False,), A, B, out_offset),  # storage offset
-        convenience_key(
-            0, 7, (False,), torch.empty(64, 129, dtype=torch.bfloat16)[:, 1:], B, out
-        ),  # alignment
-    ]
-    assert len({key, *others}) == len(others) + 1
-    # the entry points put their knobs into the flags (sorted items): a knob change is a new key
-    assert convenience_key(
-        0, 7, (True, ("cta_rows", 64), ("sk", "auto")), A, B, out
-    ) != convenience_key(0, 7, (True, ("cta_rows", None), ("sk", "auto")), A, B, out)
-
-
-def test_convenience_cache_is_bounded_and_evicts_the_least_recently_used_entry():
-    cache: OrderedDict = OrderedDict()
-    for i in range(5):
-        cake_backend._cache_put(cache, ("k", i), i, bound=4)
-    assert list(cache) == [("k", 1), ("k", 2), ("k", 3), ("k", 4)]
-    assert cake_backend._cache_get(cache, ("k", 1)) == 1  # a hit refreshes the entry
-    assert list(cache)[-1] == ("k", 1)
-    assert cake_backend._cache_get(cache, ("k", 0)) is None
-    cake_backend._cache_put(cache, ("k", 5), 5, bound=4)
-    assert list(cache) == [("k", 3), ("k", 4), ("k", 1), ("k", 5)]
-    assert CONVENIENCE_CACHE_SIZE >= 1
-    assert isinstance(cake_backend._K1_CACHE, OrderedDict) and isinstance(
-        cake_backend._K2_CACHE, OrderedDict
-    )
-    # the argument template keeps constants and fills the per-call slots in plan order
-    template = (cake_backend._Slot("A"), 7, cake_backend._Slot("out3"), 2, 1, 1)
-    assert cake_backend._resolve_arguments(template, dict(A="a", out3="o")) == [
-        "a",
-        7,
-        "o",
-        2,
-        1,
-        1,
-    ]
-
-
-def test_convenience_cache_bound_is_read_at_call_time(monkeypatch):
-    """``CONVENIENCE_CACHE_SIZE`` is a module knob: ``_cache_put`` reads it on every insertion, so a value set
-    after the import bounds the caches; an explicit ``bound=`` still overrides it."""
-    monkeypatch.setattr(cake_backend, "CONVENIENCE_CACHE_SIZE", 2)
-    cache: OrderedDict = OrderedDict()
-    for i in range(3):
-        cake_backend._cache_put(cache, ("k", i), i)
-    assert list(cache) == [("k", 1), ("k", 2)]
-    monkeypatch.setattr(cake_backend, "CONVENIENCE_CACHE_SIZE", 3)
-    cake_backend._cache_put(cache, ("k", 3), 3)
-    assert list(cache) == [("k", 1), ("k", 2), ("k", 3)]
-    cake_backend._cache_put(cache, ("k", 4), 4, bound=1)
-    assert list(cache) == [("k", 4)]
-
-
-def test_convenience_cache_hit_evicted_before_its_refresh_is_a_miss():
-    """A hit whose entry another thread evicts between the lookup and the recency refresh is a miss -- the
-    caller plans the key again (at worst a key is planned twice) -- not a ``KeyError`` out of the launch."""
-
-    class _EvictedBetween(OrderedDict):
-        def get(self, key, default=None):
-            entry = super().get(key, default)
-            if entry is not None:
-                # the other thread's eviction lands between the lookup and the refresh
-                del self[key]
-            return entry
-
-    cache = _EvictedBetween()
-    cake_backend._cache_put(cache, ("k", 0), "first", bound=4)
-    assert cake_backend._cache_get(cache, ("k", 0)) is None
-    assert ("k", 0) not in cache
-    assert cake_backend._cache_put(cache, ("k", 0), "second", bound=4) == "second"
-    assert cache[("k", 0)] == "second" and list(cache) == [("k", 0)]
-    assert cake_backend._cache_get(OrderedDict(), ("k", 0)) is None
-
-
-@pytest.mark.parametrize("sm_count", SM_COUNTS)
-def test_convenience_views_match_the_planner_views(sm_count):
-    """The per-call view rebuild of the convenience path (``_k1_views`` under ``_k1_swapped``) returns the
-    planner's operand views for the GPU rows and the MLA rows (swapped, swap-fallback and direct plans) --
-    CPU views, the planner needs no device."""
-    arch = ARCH_OF_SM[sm_count]
-    cases = [("proj", row, op, dt, T) for row, op, dt, T in GPU_ROWS] + [
-        ("mla", row, op, "bf16", T)
-        for row in MLA_ROWS
-        for op in ("fwd", "dgrad", "wgrad")
-        for T in MLA_T
-    ]
-    seen = set()
-    # the registry plan (what the convenience path caches) and the pure mirror (``_fallback=False``: the
-    # batched small-M swap is always taken, whether or not the swapped instance is registered)
-    for fallback in (True, False):
-        for family, row, op, dt, T in cases:
-            v = _views(family, row, op, dt, T)
-            transposed = v.get("transposed", False)
-            plan, a_desc, b_desc, out3 = plan_dense_projection_gemm(
-                v["A"],
-                v["B"],
-                v["out"],
-                sm_count=sm_count,
-                l2_bytes=L2_BYTES,
-                transposed_out=transposed,
-                arch=arch,
-                _fallback=fallback,
+def test_registry_is_disjoint_from_the_deterministic_package():
+    """This package's programs and templates never equal a deterministic one, nor a template the deterministic
+    package registered before its rename (its ``*_det_*`` templates with ``det`` removed)."""
+    assert sorted(cake_jit.KERNELS) == sorted(cake_jit.ARCHES)
+    det_hex = {name.rsplit("_", 1)[1] for name in det_jit.MODULES}
+    det_templates = {t for table in det_jit.KERNELS.values() for t in table}
+    former_templates = {t.replace("_det_", "_") for t in det_templates} | {
+        "split_fp32_bf16x3"
+    }
+    for name, record in cake_jit.MODULES.items():
+        assert re.fullmatch(r"cake_dense_projection_gemm_[0-9a-f]{20}", name), name
+        assert record["library"] == name and record["kernel"] == f"kernel_{name}"
+        assert name.rsplit("_", 1)[1] not in det_hex, name
+        assert record["template"].startswith(cake_jit.TEMPLATE_PREFIXES), name
+        for arch in record["arches"]:
+            assert cake_jit.KERNELS[arch][record["template"]] == name
+    templates = {t for table in cake_jit.KERNELS.values() for t in table}
+    assert not templates & (det_templates | former_templates)
+    for arch, table in cake_jit.KERNELS.items():
+        for template, name in table.items():
+            assert (
+                arch in cake_jit.MODULES[name]["arches"]
+                and cake_jit.MODULES[name]["template"] == template
             )
-            swapped = cake_backend._k1_swapped(
-                plan, v["A"], v["B"], transposed_out=transposed
-            )
-            rebuilt = cake_backend._k1_views(v["A"], v["B"], v["out"], swapped=swapped)
-            for got, want in zip(rebuilt, (a_desc, b_desc, out3), strict=True):
-                assert cake_backend._same_view(got, want), (family, row, op, dt, T)
-            if swapped:
-                assert plan.transposed_out and not plan.swap_fallback
-            seen.add((swapped, plan.swap_fallback))
-            ldo, out_l = cake_backend._out_strides(out3)
-            assert ldo == out3.stride(1) and out_l == (
-                out3.stride(0) if out3.shape[0] > 1 else 0
-            )
-    # a swapped plan and a direct plan were both exercised
-    assert (True, False) in seen and (False, False) in seen
 
 
-def test_router_convenience_views_match_the_planner():
-    for op, T in (("fwd", 257), ("dgrad", 257), ("wgrad", 1001)):
-        v = _router_inputs(op, T, seed=SEED + 5, device="cpu")
-        plan, A_eff, B_eff = plan_router_fp32_gemm(v["A"], v["B"], v["out"])
-        a_view, split_src = cake_backend._k2_views(v["A"], v["B"], plan)
-        want_split = B_eff if plan.b_mn else B_eff.t()
-        want_a = A_eff.t().unsqueeze(0) if plan.a_mn else A_eff.unsqueeze(0)
-        assert cake_backend._same_view(a_view, want_a), op
-        assert cake_backend._same_view(split_src, want_split), op
-        assert tuple(a_view.shape[1:]) == (
-            (plan.K, plan.M) if plan.a_mn else (plan.M, plan.K)
+def test_registered_templates_are_the_ones_the_planners_name():
+    """Every template this checkout registers is one the host plans: the K1 programs of each tile width
+    (``dense_proj_gemm_atomic_nn_n<64|128|256>[_f32]_t`` and the row-major ``dense_proj_gemm_atomic_nn_n192[_f32]``),
+    the two router classes and the weight gradient's head/tail program."""
+    wanted = {
+        cake_backend.atomic_k1_template(bn, f32)
+        for bn in cake_backend.K1_BLOCK_N_CHOICES
+        for f32 in (False, True)
+    } | {
+        "router_fp32_gemm_atomic_kk",
+        "router_fp32_gemm_atomic_nn_t",
+        "router_fp32_gemm_atomic_nn_t" + cake_backend.ROUTER_HEAD_TAIL_SUFFIX,
+    }
+    for table in cake_jit.KERNELS.values():
+        assert set(table) <= wanted, sorted(set(table) - wanted)
+
+
+def test_no_det_token_in_generated_names_and_no_negated_token_in_the_package():
+    root = Path(cake_jit.__file__).parent
+    files = [
+        p
+        for p in sorted(root.rglob("*"))
+        if p.is_file() and "__pycache__" not in p.parts and "aot" not in p.parts
+    ]
+    for path in files:
+        rel = path.relative_to(root).as_posix()
+        assert not DET_TOKEN.search(path.name), rel
+        assert not NEGATED_TOKEN.search(path.read_text(errors="replace")), rel
+    generated = [*cake_jit.MODULES, *(r["kernel"] for r in cake_jit.MODULES.values())]
+    generated += [t for table in cake_jit.KERNELS.values() for t in table]
+    assert not [n for n in generated if DET_TOKEN.search(n)]
+    manifest = root / "build.json"
+    if manifest.exists():
+        document = json.loads(manifest.read_text())
+        # the in-tree import path: a vendored copy keeps its manifest
+        assert document["package"] == "flashinfer.experimental.dense_projection_gemm"
+        for entry in document["libraries"]:
+            assert not DET_TOKEN.search(entry["name"])
+            assert all(
+                s.startswith("csrc/cake_dense_projection_gemm/")
+                or s == "csrc/cake_ffi_checks.h"
+                or s.startswith("csrc/cake_device_helpers/")
+                for s in entry["sources"]
+            )
+    for name in ENTRY_POINTS:
+        assert not DET_TOKEN.search(name)
+
+
+def test_select_module_and_the_loader_forward_deterministic_names(monkeypatch):
+    for arch, table in det_jit.KERNELS.items():
+        template = sorted(table)[0]
+        assert cake_jit.select_module(arch, template) == det_jit.select_module(
+            arch, template
         )
-        assert (plan.swapped, plan.splits) == (
-            (op == "wgrad"),
-            ROUTER_SPLITS[plan.layout],
-        )
-        # the fail-closed check of the convenience prepare: the planner's operands pass and yield the
-        # per-call views; a rebuild that is not the planner's view (another buffer) refuses to cache
-        checked = cake_backend._k2_checked_views(v["A"], v["B"], A_eff, B_eff, plan)
-        assert all(
-            cake_backend._same_view(got, want)
-            for got, want in zip(checked, (a_view, split_src), strict=True)
-        ), op
-        for wrong_a, wrong_b in ((A_eff.clone(), B_eff), (A_eff, B_eff.clone())):
-            with pytest.raises(RuntimeError, match="differ from the planner's"):
-                cake_backend._k2_checked_views(v["A"], v["B"], wrong_a, wrong_b, plan)
-    workspace = torch.empty(4, 6, 8)
-    assert cake_backend._k2_workspace_strides(workspace) == (8, 48)
-    out = torch.empty(6, 16)[:, :8]
-    assert cake_backend._k2_out32(out).data_ptr() == out.data_ptr()
+    with pytest.raises(NotImplementedError, match="not registered"):
+        cake_jit.select_module("sm_100a", "dense_proj_gemm_atomic_nn_unregistered")
+    loader = Recorder()
+    monkeypatch.setattr(det_jit, "load_cake_dense_projection_det_gemm_module", loader)
+    name = sorted(det_jit.MODULES)[0]
     assert (
-        cake_backend._k2_out32(out).dim() == 1
-        and cake_backend._k2_out32(torch.empty(6, 8)).dim() == 2
+        cake_jit.load_cake_dense_projection_gemm_module(name, "sm_100a")
+        is loader.result
     )
+    assert loader.calls == [((name, "sm_100a"), {})]
+    bind = Recorder()
+    monkeypatch.setattr(det_backend, "bind_launch", bind)
+    assert cake_backend.bind_launch(name, {"M": 1}, (2, 1, 1), "sm_100a") is bind.result
+    assert bind.calls == [((name, {"M": 1}, (2, 1, 1), "sm_100a"), {})]
 
 
-def test_device_facts_are_keyed_by_the_device_index():
-    assert cake_backend._cuda_index(torch.device("cuda", 1)) == 1
-    assert cake_backend._cuda_index("cuda:2") == 2 and cake_backend._cuda_index(3) == 3
-    with pytest.raises(ValueError, match="CUDA"):
-        cake_backend._cuda_index(torch.device("cpu"))
-    assert arch_for(torch.device("cpu")) is None
-    facts = cake_backend.DeviceFacts(
-        index=0, arch="sm_100a", sm_count=148, l2_bytes=L2_BYTES
+def test_clear_convenience_caches_clears_both_packages():
+    key = ("dense-projection-gemm-test", object())
+    det_backend._K2_CACHE[key] = None
+    cake_backend._K1_ATOMIC_CACHE[key] = None
+    cake_backend._K2_SPLITK_CACHE[key] = None
+    cake_backend._ATOMIC_ARENAS[(99, 99)] = cake_backend._AtomicArena(
+        torch.device("cpu"), (99, 99)
     )
-    assert (facts.arch, facts.sm_count, facts.l2_bytes) == ("sm_100a", 148, L2_BYTES)
-    assert isinstance(cake_backend._DEVICE_FACTS, dict)
+    try:
+        cake_backend.clear_convenience_caches()
+        assert (
+            key not in det_backend._K2_CACHE
+            and key not in cake_backend._K1_ATOMIC_CACHE
+            and key not in cake_backend._K2_SPLITK_CACHE
+        )
+        assert (99, 99) not in cake_backend._ATOMIC_ARENAS
+    finally:
+        det_backend._K2_CACHE.pop(key, None)
+        cake_backend._K1_ATOMIC_CACHE.pop(key, None)
+        cake_backend._K2_SPLITK_CACHE.pop(key, None)
+        cake_backend._ATOMIC_ARENAS.pop((99, 99), None)
+
+
+def test_the_split_k_workspace_kinds():
+    """The K1 tickets and the K1 slots are zeroed when allocated or grown (the last split of a partial tile reads
+    slot columns no split writes); the kinds are not the deterministic package's."""
+    kinds = cake_backend._ATOMIC_ARENA_KINDS
+    assert kinds["k1_tickets"] == (torch.uint32, True)
+    assert kinds["k1_slots"] == (torch.float32, True)
+    # the deterministic K2 program's partials: written by the program before the reduction reads them
+    assert kinds["k2_splitk_partials"] == (torch.float32, False)
+    assert not set(kinds) & set(det_backend._ARENA_KINDS)
+    arena = cake_backend._AtomicArena(torch.device("cpu"), (0, 0))
+    tickets = arena.require("k1_tickets", 100)
+    assert tickets.dtype == torch.uint32 and tickets.numel() == 100
+    assert not tickets.to(torch.int64).any()
+    assert arena.require("k1_tickets", 50) is tickets and arena.version == 1
+    grown = arena.require("k1_tickets", 1000)
+    assert grown.numel() == 1000 and not grown.to(torch.int64).any()
+    assert arena.version == 2
+    slots = arena.require("k1_slots", 3)
+    assert slots.dtype == torch.float32 and slots.numel() == 16 and not slots.any()
+    grown = arena.require("k1_slots", 300)
+    assert grown.numel() == 300 and not grown.any()
 
 
 # ---------------------------------------------------------------------------
-# GPU correctness (skips without a registered instance)
+# GPU
 # ---------------------------------------------------------------------------
 
 
-def _make_inputs(family, row, op, out_dtype, T, seed, device="cuda"):
-    """Deterministic operands for one row (same distributions as the Cake eval harness)."""
-    g = torch.Generator(device=device).manual_seed(seed)
-    v = _views(family, row, op, out_dtype, T, device=device)
-
-    def fill(t, scale=1.0):
-        t.copy_(
-            (torch.randn(t.shape, device=device, generator=g) * scale).to(
-                torch.bfloat16
-            )
+def _det_device_or_skip() -> torch.device:
+    if not torch.cuda.is_available() or not det_backend.generated_program_available(
+        torch.device("cuda")
+    ):
+        pytest.skip(
+            "requires a device the deterministic package registers programs for"
         )
-
-    if family == "proj":
-        K, N = PROJECTION_ROWS[row]
-        fill(v["X"])
-        fill(v["W"], K**-0.5)
-        fill(v["G"])
-    else:
-        spec = MLA_ROWS[row]
-        fill(v["act"])
-        fill(v["weight"], spec["D_in"] ** -0.5)
-        fill(v["d_out"])
-    if "buf" in v:
-        v["buf"].fill_(float("nan"))  # the rope part of the slot must keep its sentinel
-        v["untouched"] = v["buf"][..., MLA_ROWS[row]["D_in"] :]
-    return v
+    return torch.device("cuda")
 
 
-def _check(actual, expected_f64, *, untouched=None):
-    diff = (actual.double() - expected_f64).abs()
-    assert bool(torch.isfinite(actual).all())
-    if actual.dtype == torch.bfloat16:
-        violations = int((diff > BF16_ATOL + BF16_RTOL * expected_f64.abs()).sum())
-        assert violations == 0, (
-            f"{violations} bf16 elements outside atol=rtol=1e-2 (max abs {float(diff.max()):.4g})"
-        )
-    else:
-        tiny = torch.finfo(torch.float64).tiny
-        rel_fro = float(diff.norm() / max(float(expected_f64.norm()), tiny))
-        max_abs_ratio = float(diff.max()) / max(float(expected_f64.abs().max()), tiny)
-        assert rel_fro <= F32_REL_FRO_MAX, rel_fro
-        assert max_abs_ratio <= F32_MAX_ABS_OVER_REF_ABSMAX, max_abs_ratio
-    if untouched is not None:
-        assert bool(torch.isnan(untouched.float()).all())
+def _atomic_device_or_skip() -> tuple[torch.device, str]:
+    """A device this checkout registers programs of this package for.  A checkout without any (before the generated
+    sources are added) skips; one that registers some but not a template a test names fails in
+    :func:`_require_template`."""
+    device = _det_device_or_skip()
+    arch = det_backend.arch_for(device)
+    if not cake_jit.KERNELS.get(arch):
+        pytest.skip(f"this checkout registers no program of this package for {arch}")
+    return device, arch
 
 
-def _plan_template(v, **knobs):
-    plan, *_ = plan_dense_projection_gemm(
-        v["A"],
-        v["B"],
-        v["out"],
-        sm_count=_sm_count(),
-        l2_bytes=_l2_bytes(),
-        transposed_out=v.get("transposed", False),
-        **knobs,
+def _require_template(arch: str, template: str) -> None:
+    assert template in cake_jit.KERNELS[arch], (
+        f"{template} is not registered for {arch}"
     )
-    return plan.template
 
 
-@pytest.mark.parametrize("row, op, out_dtype, T", GPU_ROWS)
-def test_projection_rows_match_fp64_reference(row, op, out_dtype, T):
-    if not _device_supported():
-        pytest.skip(
-            "requires a device with a registered generated instance "
-            "(compute capability 10.0 or 10.7)"
-        )
-    v = _make_inputs("proj", row, op, out_dtype, T, seed=SEED)
-    _require_program(_plan_template(v))
-    if op == "wgrad":
-        prepared = prepare_projection_wgrad(v["G"], v["X"], v["out"])
-        assert prepared.plan.transposed_out == v["transposed"]
-    else:
-        prepared = prepare_dense_projection_gemm(v["A"], v["B"], v["out"])
-    out = prepared.launch()
-    torch.cuda.synchronize()
-    assert out is v["out"]
-    expected = torch.matmul(v["A"].double(), v["B"].double())
-    _check(v["out"] if not v.get("transposed") else v["out"].t(), expected)
-
-
-@pytest.mark.parametrize("row", list(MLA_ROWS))
-@pytest.mark.parametrize("op", ["fwd", "dgrad", "wgrad"])
-def test_mla_batched_rows_match_fp64_reference(row, op):
-    if not _device_supported():
-        pytest.skip(
-            "requires a device with a registered generated instance "
-            "(compute capability 10.0 or 10.7)"
-        )
-    v = _make_inputs("mla", row, op, "bf16", 257, seed=SEED + 1)
-    _require_program(_plan_template(v))
-    prepared = prepare_dense_projection_gemm(v["A"], v["B"], v["out"])
-    out = prepared.launch()
-    torch.cuda.synchronize()
-    assert out is v["out"] and prepared.plan.L == 64
-    expected = torch.matmul(v["A"].double(), v["B"].double())
-    _check(v["out"], expected, untouched=v.get("untouched"))
-
-
-def test_strided_views_and_storage_offsets_match_fp64_reference():
-    if not _device_supported():
-        pytest.skip(
-            "requires a device with a registered generated instance "
-            "(compute capability 10.0 or 10.7)"
-        )
-    device = torch.device("cuda")
-    g = torch.Generator(device=device).manual_seed(SEED + 2)
-    T, K, N = 301, 704, 264
-    # A: a column slice inside a wider buffer starting at a 16-byte aligned offset; B: a row slice of a taller
-    # weight; out: a slice inside a larger buffer with a padded row stride
-    a_buf = (torch.randn(T, K + 64, device=device, generator=g)).to(torch.bfloat16)
-    A = a_buf[:, 8 : 8 + K]
-    w_buf = (torch.randn(N + 16, K, device=device, generator=g) * K**-0.5).to(
+def _bf16(shape, device, generator, scale=1.0):
+    return (torch.randn(shape, device=device, generator=generator) * scale).to(
         torch.bfloat16
     )
-    W = w_buf[16:]
-    out_buf = torch.full(
-        (T + 3, N + 24), float("nan"), device=device, dtype=torch.bfloat16
-    )
-    out = out_buf[3:, 8 : 8 + N]
-    _require_program(_plan_template(dict(A=A, B=W.t(), out=out)))
-    prepared = prepare_dense_projection_gemm(A, W.t(), out)
-    prepared.launch()
-    torch.cuda.synchronize()
-    _check(out, torch.matmul(A.double(), W.double().t()))
-    assert bool(torch.isnan(out_buf[:3].float()).all()) and bool(
-        torch.isnan(out_buf[3:, :8].float()).all()
-    )
-    assert bool(torch.isnan(out_buf[3:, 8 + N :].float()).all())
-    # the swapped small-N weight gradient X.T @ G (both operands MN-major) with the transposed fp32
-    # store into a [N, K] output that sits inside a wider buffer (padded row stride)
-    Nf = 96
-    Gs = torch.randn(T, Nf, device=device, generator=g).to(torch.bfloat16)
-    out_t_buf = torch.full(
-        (Nf, K + 8), float("nan"), device=device, dtype=torch.float32
-    )
-    out_t = out_t_buf[:, :K]
-    # (the 128-row fp32 transposed instance on sm_107a, the 64-row one on sm_100a: round 9 routes the sm_100a
-    # small-N weight gradients to the 64-row family, so only that family's instance is exported there)
-    v_t = dict(A=A.t(), B=Gs, out=out_t, transposed=True)
-    knobs_t = _registered_knobs(v_t, {}, dict(cta_rows=64))
-    prepared = prepare_projection_wgrad(Gs, A, out_t, **knobs_t)
-    assert prepared.plan.transposed_out and prepared.template == _plan_template(
-        v_t, **knobs_t
-    )
-    assert _nopro(prepared.template).startswith("dense_proj_gemm_nn_n128") and _nopro(
-        prepared.template
-    ).endswith("_f32_t")
-    assert (
-        prepared.plan.l2_bytes == _l2_bytes()
-        and prepared.plan.sm_pairs == _sm_count() // 2
-    )
-    prepared.launch()
-    torch.cuda.synchronize()
-    _check(out_t, torch.matmul(Gs.double().t(), A.double()))
-    assert bool(torch.isnan(out_t_buf[:, K:]).all())
 
 
-def test_prepared_gemm_launches_without_allocation_and_is_deterministic():
-    if not _device_supported():
-        pytest.skip(
-            "requires a device with a registered generated instance "
-            "(compute capability 10.0 or 10.7)"
-        )
-    # a swapped weight gradient on a half-width synthetic row (N = 32, K = 3072, T = 1001): stream-K "auto"
-    # two-part split of a single partial wave with the deterministic in-kernel fixup.  The round-9 rules route
-    # the GLM small-N weight gradients to whole tiles on sm_100a (64-row family: 48 tiles, which 74 pairs cannot
-    # split), so the split is pinned on this row with whichever of the 64-row / 128-row instances this device's
-    # export registered: the 64-row instance plans 24 pair tiles of 128 rows (sm_100a), the 128-row instance 12
-    # pair tiles of 256 rows (sm_107a); the expectation follows the registered instance's tile height.
-    device = torch.device("cuda")
-    g = torch.Generator(device=device).manual_seed(SEED + 3)
-    T, K, N = 1001, 3072, 32
-    X = torch.randn(T, K, device=device, generator=g).to(torch.bfloat16)
-    G = torch.randn(T, N, device=device, generator=g).to(torch.bfloat16)
-    out = torch.empty(N, K, device=device, dtype=torch.bfloat16)
-    v = dict(A=X.t(), B=G, out=out, transposed=True)
-    knobs = _registered_knobs(v, dict(cta_rows=64), dict(cta_rows=128))
-    prepared = prepare_projection_wgrad(G, X, out, **knobs)
-    pair_tiles = prepared.plan.M // (
-        2 * prepared.plan.cta_rows
-    )  # 24 (64-row instance) or 12 (128-row instance)
-    assert prepared.plan.transposed_out and pair_tiles in (12, 24)
-    assert prepared.plan.pair_tiles == pair_tiles
-    if (
-        prepared.plan.sm_pairs >= 2 * pair_tiles
-    ):  # one partial wave whose halves fit the pairs: every tile in two parts
-        assert (prepared.plan.tail_tiles, prepared.plan.sk_units) == (
-            pair_tiles,
-            2 * pair_tiles,
-        )
-    first = prepared.launch().clone()
-    torch.cuda.synchronize()
-    _check(out.t(), torch.matmul(X.t().double(), G.double()))
-    before = torch.cuda.memory_stats()
-    prepared.launch()
-    torch.cuda.synchronize()
-    after = torch.cuda.memory_stats()
-    assert after["allocation.all.allocated"] == before["allocation.all.allocated"]
-    assert torch.equal(first, out)
-
-
-def test_convenience_path_reuses_its_planned_launch_without_allocation():
-    if not _device_supported():
-        pytest.skip(
-            "requires a device with a registered generated instance "
-            "(compute capability 10.0 or 10.7)"
-        )
-    device = torch.device("cuda")
-    g = torch.Generator(device=device).manual_seed(SEED + 6)
-    T, K, N = (
-        257,
-        6144,
-        576,
-    )  # the kv_a forward row (register epilogue, K-major operands)
-    X = torch.randn(T, K, device=device, generator=g).to(torch.bfloat16)
-    W = (torch.randn(N, K, device=device, generator=g) * K**-0.5).to(torch.bfloat16)
-    out = torch.empty(T, N, device=device, dtype=torch.bfloat16)
-    _require_program(_plan_template(dict(A=X, B=W.t(), out=out)))
-    facts = cake_backend.device_facts(device)
-    assert facts is cake_backend.device_facts(torch.device("cuda", facts.index))
-    assert (facts.sm_count, facts.l2_bytes) == (_sm_count(), _l2_bytes())
-    cake_backend.clear_convenience_caches()
-    first = cake_backend.projection_forward(X, W, out).clone()
-    torch.cuda.synchronize()
-    _check(out, torch.matmul(X.double(), W.double().t()))
-    assert len(cake_backend._K1_CACHE) == 1
-    # new tensors of the same geometry hit the cached plan: no planning, no allocation (``out`` is given)
-    X2 = torch.randn(T, K, device=device, generator=g).to(torch.bfloat16)
-    out2 = torch.empty_like(out)
-    before = torch.cuda.memory_stats()
-    cake_backend.projection_forward(X2, W, out2)
-    torch.cuda.synchronize()
-    after = torch.cuda.memory_stats()
-    assert after["allocation.all.allocated"] == before["allocation.all.allocated"]
-    assert len(cake_backend._K1_CACHE) == 1
-    _check(out2, torch.matmul(X2.double(), W.double().t()))
-    assert torch.equal(cake_backend.projection_forward(X, W, out), first)
-    # another stream never shares an entry (nor its workspace)
-    with torch.cuda.stream(torch.cuda.Stream(device=device)):
-        cake_backend.projection_forward(X, W, out2)
-    torch.cuda.synchronize()
-    assert len(cake_backend._K1_CACHE) == 2 and torch.equal(out2, first)
-    # the prepared path of the same binding gives the same bits
-    prepared = prepare_dense_projection_gemm(X, W.t(), out2)
-    assert (
-        prepared.template == next(iter(cake_backend._K1_CACHE.values())).plan.template
+def test_gpu_default_path_is_bitwise_the_deterministic_path():
+    """The former names with the default give the deterministic package's bits (K1 forward / input gradient /
+    weight gradient, K2 forward / input gradient / weight gradient)."""
+    device = _det_device_or_skip()
+    g = torch.Generator(device=device).manual_seed(SEED)
+    T, K, N = 1001, 6144, 576
+    X, W, G = (
+        _bf16((T, K), device, g),
+        _bf16((N, K), device, g, 0.02),
+        _bf16((T, N), device, g),
     )
-    assert torch.equal(prepared.launch(), first)
+    cases = [
+        (cake_backend.projection_forward, det_backend.projection_det_forward, (X, W)),
+        (cake_backend.projection_dgrad, det_backend.projection_det_dgrad, (G, W)),
+        (cake_backend.projection_wgrad, det_backend.projection_det_wgrad, (G, X)),
+    ]
+    T2, K2, N2 = 1001, 6144, 256
+    Xf = torch.randn(T2, K2, device=device, generator=g)
+    Wf = torch.randn(N2, K2, device=device, generator=g) * 0.02
+    Gf = torch.randn(T2, N2, device=device, generator=g)
+    cases += [
+        (cake_backend.router_forward, det_backend.router_det_forward, (Xf, Wf)),
+        (cake_backend.router_dgrad, det_backend.router_det_dgrad, (Gf, Wf)),
+        (cake_backend.router_wgrad, det_backend.router_det_wgrad, (Gf, Xf)),
+    ]
+    for ours, theirs, args in cases:
+        try:
+            expected = theirs(*args)
+        except NotImplementedError as exc:
+            pytest.skip(f"{theirs.__name__}: {exc}")
+        got = ours(*args)
+        assert got.dtype == expected.dtype and torch.equal(got, expected), ours.__name__
 
 
-def test_convenience_path_replays_a_stream_k_row_bit_exact():
-    """The cached entry owns the stream-K workspace and the slice counters: the second call of the same
-    geometry reuses them without a memset (the kernel resets every counter it uses), stays allocation-free
-    and reproduces the first result bit for bit."""
-    if not _device_supported():
-        pytest.skip(
-            "requires a device with a registered generated instance "
-            "(compute capability 10.0 or 10.7)"
-        )
-    device = torch.device("cuda")
-    g = torch.Generator(device=device).manual_seed(SEED + 7)
-    T, K, N = (
-        1001,
-        3072,
-        32,
-    )  # the swapped small-N weight gradient of the prepared-launch test
-    X = torch.randn(T, K, device=device, generator=g).to(torch.bfloat16)
-    G = torch.randn(T, N, device=device, generator=g).to(torch.bfloat16)
-    v = dict(
-        A=X.t(),
-        B=G,
-        out=torch.empty(N, K, device=device, dtype=torch.bfloat16),
-        transposed=True,
-    )
-    knobs = _registered_knobs(v, dict(cta_rows=64), dict(cta_rows=128))
-    cake_backend.clear_convenience_caches()
-    out1 = cake_backend.projection_wgrad(G, X, **knobs)  # ``out`` allocated here
+def _rel_fro(out: torch.Tensor, ref: torch.Tensor) -> float:
+    return float((out.double() - ref).norm() / ref.norm())
+
+
+def _profile_kernel_names(fn):
+    from torch.profiler import ProfilerActivity, profile
+
     torch.cuda.synchronize()
-    _check(out1.t(), torch.matmul(X.t().double(), G.double()))
-    assert len(cake_backend._K1_CACHE) == 1
-    entry = next(iter(cake_backend._K1_CACHE.values()))
-    # the weight-gradient swap is the caller's (``wgrad_views`` -> ``transposed_out``); the batched small-M
-    # swap of the planner (``entry.swapped``) does not apply to a 2-D row
-    assert entry.plan.transposed_out and not entry.swapped
-    out2 = torch.empty_like(out1)
-    before = torch.cuda.memory_stats()
-    cake_backend.projection_wgrad(G, X, out2, **knobs)
-    torch.cuda.synchronize()
-    after = torch.cuda.memory_stats()
-    assert after["allocation.all.allocated"] == before["allocation.all.allocated"]
-    assert len(cake_backend._K1_CACHE) == 1 and torch.equal(out1, out2)
-    if entry.plan.sk_units:
-        # the counters the launch used are back at zero when it completes
-        used = entry.counters[: entry.plan.counters_u32].view(
-            torch.int32
-        )  # bitcast: int32 reductions
-        assert int(torch.count_nonzero(used)) == 0
-    # a different knob set is a different entry (``_registered_knobs`` picked the registered family)
-    assert cake_backend.convenience_key(
-        0, 0, (True, ("cta_rows", 64), ("sk", "auto")), G, X, out1
-    ) != cake_backend.convenience_key(
-        0, 0, (True, ("cta_rows", 128), ("sk", "auto")), G, X, out1
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
+        fn()
+        torch.cuda.synchronize()
+    return [e.name for e in prof.events() if str(e.device_type).endswith("CUDA")]
+
+
+# The router's BF16x3 split stage is the deterministic package's program by design (both modes run it); every
+# other program of that package is a K1 / K2 GEMM.
+_DET_SHARED_KERNELS = frozenset(
+    module["kernel"]
+    for module in det_jit.MODULES.values()
+    if module["template"].startswith("split_fp32_det_bf16x3")
+)
+
+
+def _det_kernel(name: str) -> bool:
+    """A K1 / K2 GEMM kernel of the deterministic package (its programs' symbols and its template bodies'
+    namespace); the shared BF16x3 split stage is not one."""
+    return "dense_projection_det_gemm" in name and not any(
+        kernel in name for kernel in _DET_SHARED_KERNELS
     )
 
 
-# longer than a cold-cache JIT build; the hang this test guards against never returns
-@pytest.mark.timeout(300)
-def test_pd2_stream_k_on_an_odd_k_completes():
-    """The dgrad of T = 1024, N = 1032, K = 1000 is one partial wave of 16 tiles of 17 K steps.  Two units per tile
-    would leave the last one without a K step, and the pd 2 program waits for that unit's accumulator forever; the
-    planner plans the 31 units that hold one."""
-    if not _device_supported():
-        pytest.skip(
-            "requires a device with a registered generated instance "
-            "(compute capability 10.0 or 10.7)"
-        )
-    device = torch.device("cuda")
-    g = torch.Generator(device=device).manual_seed(SEED + 11)
-    T, N, K = 1024, 1032, 1000
-    G = torch.randn(T, N, device=device, generator=g).to(torch.bfloat16)
-    W = (torch.randn(N, K, device=device, generator=g) * N**-0.5).to(torch.bfloat16)
-    v = dict(
-        A=G,
-        B=W,
-        out=torch.full((T, K), float("nan"), device=device, dtype=torch.bfloat16),
-    )
-    knobs = _registered_knobs(
-        v,
-        dict(pd=2, slots=2, epi="tma"),
-        dict(pd=2, slots=2, epi="tma", pro=15),
-        dict(pd=2, slots=1, epi="tma", pro=15),
-    )
-    prepared = prepare_dense_projection_gemm(v["A"], v["B"], v["out"], **knobs)
-    plan = prepared.plan
-    assert plan.pd == 2 and plan.k_blocks == 17 and plan.tail_tiles * 2 <= plan.sm_pairs
-    assert (
-        (plan.sk_units - 1) * plan.iters_per_unit
-        < plan.sk_iters
-        < 2 * plan.tail_tiles * plan.iters_per_unit
-    )
-    prepared.launch()
-    torch.cuda.synchronize()
-    _check(v["out"], G.double() @ W.double())
+def _assert_ran(fn, module_name: str) -> None:
+    """``fn`` launches this package's program ``module_name`` and no K1 / K2 program of the deterministic
+    package."""
+    names = _profile_kernel_names(fn)
+    kernel = cake_jit.MODULES[module_name]["kernel"]
+    assert any(kernel in name for name in names), (kernel, names)
+    assert not any(_det_kernel(name) for name in names), names
 
 
-def _router_inputs(op, T, seed, K=6144, N=256, device="cuda"):
+# ---------------------------------------------------------------------------
+# GPU: this package's K1 program.  The tests force the split count (an explicit ``splits`` / ``block_n``, or a
+# verdict in ``K1_SPLIT_RULES`` with the SM-count floor lifted), so they exercise the split-K program on every device
+# whatever the planner keeps on the deterministic program there, and assert by kernel name that it ran.
+# ---------------------------------------------------------------------------
+
+# K1 weight-gradient rows ``out[N, K] = G[T, N].T @ X[T, K]``: label -> (N, K); the thin rows of the GLM-5.2 table
+# (indexer heads, a 48-wide row) and two wide rows.
+K1_ROWS = {
+    "indexer_hw": (32, 6144),
+    "thin_48": (48, 5120),
+    "indexer_k": (128, 6144),
+    "kv_a": (576, 6144),
+    "wide_512": (512, 4096),
+}
+K1_RAGGED_T = (16231, 129, 4097, 16172, 777, 65)
+
+
+def _k1_wgrad_inputs(row, T, out_dtype, device, seed):
+    N, K = K1_ROWS[row]
     g = torch.Generator(device=device).manual_seed(seed)
+    G, X = _bf16((T, N), device, g), _bf16((T, K), device, g)
+    out = torch.full((N, K), float("nan"), device=device, dtype=out_dtype)
+    return G, X, out
+
+
+def _k1_check(out, ref, what=""):
+    """The deterministic package's K1 budgets against FP64."""
+    assert bool(torch.isfinite(out).all()), what
+    if out.dtype == torch.bfloat16:
+        bad = (out.double() - ref).abs() > BF16_ATOL + BF16_RTOL * ref.abs()
+        assert int(bad.sum()) == 0, (what, int(bad.sum()))
+    else:
+        assert _rel_fro(out, ref) <= F32_REL_FRO_MAX, (what, _rel_fro(out, ref))
+        assert float(
+            (out.double() - ref).abs().max()
+        ) <= F32_MAX_ABS_OVER_REF_ABSMAX * float(ref.abs().max()), what
+
+
+def _k1_prepare(G, X, out, arch, splits, block_n=None):
+    """This package's prepared weight gradient at an explicit split count (the transposed-store launch)."""
+    block_n = block_n or cake_backend.k1_block_n(int(G.shape[1]))
+    _require_template(
+        arch, cake_backend.atomic_k1_template(block_n, out.dtype == torch.float32)
+    )
+    prepared = cake_backend.prepare_dense_projection_gemm(
+        X.t(),
+        G,
+        out,
+        transposed_out=True,
+        deterministic=False,
+        splits=splits,
+        block_n=block_n,
+    )
+    assert isinstance(prepared, cake_backend.PreparedAtomicGemm)
+    assert (prepared.splits, prepared.plan.block_n) == (splits, block_n)
+    return prepared
+
+
+@pytest.fixture
+def k1_rule(monkeypatch):
+    """``k1_rule(G, X, out, splits)``: a verdict for the row (and no SM-count floor or excluded token counts), so the
+    convenience path runs this package's program at that split count; returns the template."""
+
+    def force(G, X, out, splits, block_n=None):
+        arch = det_backend.arch_for(out.device)
+        N, K = int(G.shape[1]), int(X.shape[1])
+        block_n = block_n or cake_backend.k1_block_n(N)
+        f32 = out.dtype == torch.float32
+        _require_template(arch, cake_backend.atomic_k1_template(block_n, f32))
+        key = (arch, 1, K, N, "f32" if f32 else "bf16")
+        monkeypatch.setitem(cake_backend.K1_MIN_SM_COUNT, arch, 0)
+        monkeypatch.delitem(cake_backend.K1_RULE_MIN_SM_COUNT, key, raising=False)
+        monkeypatch.delitem(
+            cake_backend.K1_SPLIT_RULE_EXCLUDED_TOKENS, key, raising=False
+        )
+        monkeypatch.setitem(cake_backend.K1_SPLIT_RULES, key, (block_n, splits))
+        cake_backend.clear_convenience_caches()
+        return cake_backend.atomic_k1_template(block_n, f32)
+
+    yield force
+    cake_backend.clear_convenience_caches()
+
+
+def _arena_tickets_zero():
+    for arena in cake_backend._ATOMIC_ARENAS.values():
+        buf = arena.buffers.get("k1_tickets")
+        if buf is not None and buf.to(torch.int64).any():
+            return False
+    return True
+
+
+@pytest.mark.parametrize("splits", [2, 3])
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("row", sorted(K1_ROWS))
+def test_gpu_k1_budgets_over_reruns(row, out_dtype, splits, k1_rule):
+    """The split-K weight gradient meets the deterministic budgets against FP64 on every one of ``RERUNS`` prepared
+    launches and convenience calls, each into a NaN-poisoned ``out``; its distance to the deterministic result stays
+    within the same budget; two splits repeat bit for bit; the tickets are zero after every launch; the profiler
+    shows this package's program and no deterministic K1 program."""
+    device, arch = _atomic_device_or_skip()
+    G, X, out = _k1_wgrad_inputs(row, 16231, out_dtype, device, SEED)
+    ref = G.double().t() @ X.double()
+    det_out = cake_backend.projection_wgrad(G, X, torch.empty_like(out))
+    prepared = _k1_prepare(G, X, out, arch, splits)
+    _assert_ran(prepared.launch, prepared.module_name)
+    k1_rule(G, X, out, splits)
+    first = None
+    for i in range(RERUNS):
+        out.fill_(float("nan"))
+        prepared.launch()
+        torch.cuda.synchronize()
+        _k1_check(out, ref, f"prepared rerun {i}")
+        _k1_check(out, det_out.double(), f"vs det rerun {i}")
+        assert prepared.counters_are_zero(), i
+        if splits == 2:
+            first = out.clone() if first is None else first
+            assert torch.equal(out, first), i
+        out.fill_(float("nan"))
+        cake_backend.projection_wgrad(G, X, out, deterministic=False)
+        torch.cuda.synchronize()
+        _k1_check(out, ref, f"convenience rerun {i}")
+    assert _arena_tickets_zero()
+    _assert_ran(
+        lambda: cake_backend.projection_wgrad(G, X, out, deterministic=False),
+        prepared.module_name,
+    )
+
+
+@pytest.mark.parametrize("splits", [1, 2, 3, 4, 8])
+def test_gpu_k1_explicit_split_counts(splits):
+    """Every explicit split count (``1``: this package's program storing whole tiles) gives the budgeted result and
+    leaves the tickets zero."""
+    device, arch = _atomic_device_or_skip()
+    G, X, out = _k1_wgrad_inputs("indexer_k", 16231, torch.bfloat16, device, SEED + 1)
+    prepared = _k1_prepare(G, X, out, arch, splits)
+    for _ in range(3):
+        out.fill_(float("nan"))
+        prepared.launch()
+        torch.cuda.synchronize()
+        _k1_check(out, G.double().t() @ X.double())
+        assert prepared.counters_are_zero()
+
+
+# The 192-wide row-major program (sm_107a): ``(d_out, d_in, T, splits)``, the 4096 -> 1024 row it serves (22 column
+# tiles of ``d_in``, the last 64 columns wide: its first CTA's third 32-column B box and its second CTA lie past ``N``)
+# and a ragged one (``d_in`` 4104 cuts a B box, ``d_out`` 1032 a pair tile; two splits).
+K1_ROW_MAJOR_ROWS = ((1024, 4096, 16231, 1), (1032, 4104, 1001, 2))
+
+
+@pytest.mark.parametrize("transposed_out", [True, False])
+@pytest.mark.parametrize(
+    "shape", K1_ROW_MAJOR_ROWS, ids=lambda s: "x".join(map(str, s))
+)
+def test_gpu_k1_row_major_program(shape, transposed_out, k1_rule):
+    """The row-major-store program (operands exchanged) meets the FP32 budget against FP64 for either orientation of
+    the caller's views, prepared and through the convenience path, each launch into a NaN-poisoned ``out``; one split
+    repeats bit for bit and stores what the deterministic budget allows; the tickets are zero after every launch; the
+    profiler shows this package's program."""
+    device, arch = _atomic_device_or_skip()
+    if arch != "sm_107a":
+        pytest.skip("the 192-wide row-major program ships on sm_107a only")
+    template = cake_backend.atomic_k1_template(192, True)
+    _require_template(arch, template)
+    d_out, d_in, T, splits = shape
+    g = torch.Generator(device=device).manual_seed(SEED + 7)
+    G, X = _bf16((T, d_out), device, g), _bf16((T, d_in), device, g)
+    out = torch.full((d_out, d_in), float("nan"), device=device, dtype=torch.float32)
+    ref = G.double().t() @ X.double()
+    A, B = (X.t(), G) if transposed_out else (G.t(), X)
+    prepared = cake_backend.prepare_dense_projection_gemm(
+        A,
+        B,
+        out,
+        transposed_out=transposed_out,
+        deterministic=False,
+        splits=splits,
+        block_n=192,
+    )
+    assert isinstance(prepared, cake_backend.PreparedAtomicGemm)
+    assert prepared.template == template and not prepared.plan.out_t
+    assert prepared.plan.swapped == transposed_out
+    _assert_ran(prepared.launch, prepared.module_name)
+    first = None
+    for i in range(3):
+        out.fill_(float("nan"))
+        prepared.launch()
+        torch.cuda.synchronize()
+        _k1_check(out, ref, f"prepared rerun {i}")
+        assert prepared.counters_are_zero(), i
+        if splits == 1:
+            first = out.clone() if first is None else first
+            assert torch.equal(out, first), i
+    if transposed_out:
+        assert k1_rule(G, X, out, splits, block_n=192) == template
+        for i in range(2):
+            out.fill_(float("nan"))
+            cake_backend.projection_wgrad(G, X, out, deterministic=False)
+            torch.cuda.synchronize()
+            _k1_check(out, ref, f"convenience rerun {i}")
+        assert _arena_tickets_zero()
+
+
+def test_gpu_k1_batched_mla_head_views():
+    """The batched MLA weight gradient (64 heads, strided head views of ``[T, H, slot]`` activations): this
+    package's split-K program at an explicit split count (one slot per head tile and split)."""
+    device, arch = _atomic_device_or_skip()
+    _require_template(arch, cake_backend.atomic_k1_template(256, False))
+    g = torch.Generator(device=device).manual_seed(SEED + 2)
+    T, H, slot, D_in, D_out = 2048, 64, 256, 192, 512
+    act = _bf16((T, H, slot), device, g)[..., :D_in]
+    d_out = _bf16((T, H, D_out), device, g)
+    A, B = (
+        act.permute(1, 2, 0),
+        d_out.permute(1, 0, 2),
+    )  # [H, D_in, T] (unit stride on m), [H, T, D_out]
+    out = torch.full(
+        (H, D_in, D_out), float("nan"), device=device, dtype=torch.bfloat16
+    )
+    ref = A.double() @ B.double()
+    prepared = cake_backend.prepare_dense_projection_gemm(
+        A, B, out, deterministic=False, splits=2, block_n=256
+    )
+    assert isinstance(prepared, cake_backend.PreparedAtomicGemm)
+    assert (prepared.plan.L, prepared.splits, prepared.plan.swapped) == (H, 2, True)
+    for _ in range(3):
+        out.fill_(float("nan"))
+        prepared.launch()
+        torch.cuda.synchronize()
+        _k1_check(out, ref)
+        assert prepared.counters_are_zero()
+    # the planner keeps the batched rows on the deterministic program: the default convenience path matches it
+    out2 = torch.empty_like(out)
+    cake_backend.dense_projection_gemm(A, B, out2, deterministic=False)
+    torch.cuda.synchronize()
+    _k1_check(out2, ref)
+
+
+def test_gpu_k1_ragged_token_counts_reuse_poisoned_scratch(k1_rule):
+    """Changing ``T`` up and down on one stream with a verdict for the row: the convenience path reuses its arena
+    (grown, never shrunk); the split slots are poisoned with NaN before each call (a stale value never reaches
+    ``out``: the padding columns the last split reads are discarded), every output -- poisoned too -- meets the
+    budget, and the tickets are zero throughout.  The shortest token count (65) is below the split count's 129 rows,
+    so that call runs the deterministic program (its bits)."""
+    device, arch = _atomic_device_or_skip()
+    k1_rule(*_k1_wgrad_inputs("thin_48", 128, torch.bfloat16, device, SEED), 3)
+    for i, T in enumerate(K1_RAGGED_T):
+        G, X, out = _k1_wgrad_inputs(
+            "thin_48", T, torch.bfloat16, device, SEED + 10 + i
+        )
+        for arena in cake_backend._ATOMIC_ARENAS.values():
+            if "k1_slots" in arena.buffers:
+                arena.buffers["k1_slots"].fill_(float("nan"))
+        cake_backend.projection_wgrad(G, X, out, deterministic=False)
+        torch.cuda.synchronize()
+        _k1_check(out, G.double().t() @ X.double(), f"T={T}")
+        assert _arena_tickets_zero(), T
+        if not cake_backend.k1_splits_fit(3, T):
+            assert torch.equal(out, cake_backend.projection_wgrad(G, X))
+    assert len(cake_backend._ATOMIC_ARENAS) == 1
+    (arena,) = cake_backend._ATOMIC_ARENAS.values()
+    assert arena.version >= 2  # created, then grown or reused; never shrunk
+
+
+def test_gpu_k1_small_token_counts_guard():
+    """An explicit split count needs ``splits * 64 <= T + 63``: below, ``ValueError`` (the program would read an
+    empty K range); the planner's rows fall back to the deterministic program instead (CPU test)."""
+    device, arch = _atomic_device_or_skip()
+    G, X, out = _k1_wgrad_inputs("indexer_hw", 64, torch.bfloat16, device, SEED + 3)
+    _k1_prepare(G, X, out, arch, 1)
+    with pytest.raises(ValueError, match="splits must be in"):
+        _k1_prepare(G, X, out, arch, 2)
+
+
+def test_gpu_torch_deterministic_mode_rule(torch_determinism):
+    """Under ``torch.use_deterministic_algorithms(True)`` an explicit ``deterministic=False`` raises before any
+    launch; with ``warn_only=True`` it warns and returns the deterministic bits."""
+    device = _det_device_or_skip()
+    G, X, out = _k1_wgrad_inputs("indexer_hw", 4097, torch.bfloat16, device, SEED + 40)
+    expected = cake_backend.projection_wgrad(G, X, torch.empty_like(out))
+    torch.use_deterministic_algorithms(True)
+    with pytest.raises(RuntimeError, match="deterministic=True"):
+        cake_backend.projection_wgrad(G, X, out, deterministic=False)
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    with pytest.warns(UserWarning, match="running the deterministic path"):
+        got = cake_backend.projection_wgrad(G, X, out, deterministic=False)
+    assert torch.equal(got, expected)
+
+
+def test_gpu_det_then_atomic_share_a_stream_not_a_workspace(k1_rule):
+    """A deterministic call and a call of this package of one geometry on one stream: each package keeps its own
+    arena (the deterministic package's slabs never reach this package's tickets)."""
+    device, arch = _atomic_device_or_skip()
+    G, X, out = _k1_wgrad_inputs("indexer_k", 16231, torch.bfloat16, device, SEED + 50)
+    k1_rule(G, X, out, 2)
+    ref = G.double().t() @ X.double()
+    for _ in range(3):
+        det = cake_backend.projection_wgrad(G, X, torch.empty_like(out))
+        atomic = cake_backend.projection_wgrad(G, X, out, deterministic=False)
+        torch.cuda.synchronize()
+        _k1_check(det, ref)
+        _k1_check(atomic, ref)
+    ours = {
+        id(b) for a in cake_backend._ATOMIC_ARENAS.values() for b in a.buffers.values()
+    }
+    theirs = {id(b) for a in det_backend._ARENAS.values() for b in a.buffers.values()}
+    assert ours and not ours & theirs
+    assert _arena_tickets_zero()
+
+
+@pytest.mark.parametrize("splits", [1, 2])
+def test_gpu_k1_pdl_waits_for_an_early_producer(splits, k1_rule):
+    """This package's weight gradient as a programmatic dependent launch: the deterministic forward before it
+    (K = 8192) triggers its dependents at entry and writes ``G``; the weight gradient starts while it runs and must
+    still read every row it wrote, and its tickets end zero for the next launch on the stream."""
+    device, arch = _atomic_device_or_skip()
+    N, K = K1_ROWS["indexer_k"]
+    T = 4096
+    g = torch.Generator(device=device).manual_seed(SEED + 60)
+    H = _bf16((T, 8192), device, g)
+    Wg = (torch.randn(N, 8192, device=device, generator=g) * 8192**-0.5).to(
+        torch.bfloat16
+    )
+    X = _bf16((T, K), device, g)
+    G = torch.empty(T, N, device=device, dtype=torch.bfloat16)
+    out = torch.empty(N, K, device=device, dtype=torch.bfloat16)
+    k1_rule(G, X, out, splits)
+    for _ in range(3):
+        G.fill_(float("nan"))
+        out.fill_(float("nan"))
+        cake_backend.projection_forward(H, Wg, G, enable_pdl=True)
+        cake_backend.projection_wgrad(G, X, out, deterministic=False, enable_pdl=True)
+        torch.cuda.synchronize()
+        _k1_check(out, G.double().t() @ X.double())
+    assert _arena_tickets_zero()
+
+
+# ---------------------------------------------------------------------------
+# GPU: this package's K2 program
+# ---------------------------------------------------------------------------
+
+ROUTER_T = 4099
+
+
+def _router_inputs(T, device, seed, K=6144):
+    g = torch.Generator(device=device).manual_seed(seed)
+    N = 256
     X = torch.randn(T, K, device=device, generator=g)
     W = torch.randn(N, K, device=device, generator=g) * 0.02
     G = torch.randn(T, N, device=device, generator=g) * 1e-3
+    return X, W, G
+
+
+def _router_case(op, X, W, G):
+    """``(A, B, out)`` of the router GEMM of ``op`` (``fwd``: ``X @ W.T``, ``wgrad``: ``G.T @ X``)."""
     if op == "fwd":
-        return dict(A=X, B=W.t(), out=torch.empty(T, N, device=device), X=X, W=W, G=G)
-    if op == "dgrad":
-        return dict(A=G, B=W, out=torch.empty(T, K, device=device), X=X, W=W, G=G)
-    return dict(A=G.t(), B=X, out=torch.empty(N, K, device=device), X=X, W=W, G=G)
+        return (
+            X,
+            W.t(),
+            torch.full((X.shape[0], W.shape[0]), float("nan"), device=X.device),
+        )
+    return G.t(), X, torch.full((G.shape[1], X.shape[1]), float("nan"), device=X.device)
+
+
+@pytest.fixture
+def router_rule(monkeypatch):
+    """``router_rule(A, B, spec)``: a verdict for the router row of ``(A, B)``, so the default plan runs this
+    package's program with the partition ``spec`` (or the deterministic program with ``None``)."""
+
+    def force(op, A, B, spec):
+        arch = det_backend.arch_for(A.device)
+        if op == "fwd":
+            key = (arch, "kk", int(A.shape[1]), int(B.shape[1]))
+        else:
+            key = (arch, "nn_t", int(B.shape[1]), int(A.shape[0]))
+        monkeypatch.setitem(cake_backend.ROUTER_RULES, key, spec)
+        # a forced verdict applies on this device whatever its SM count (also on a part with a table of its own)
+        sm_count = det_backend.device_facts(A.device).sm_count
+        monkeypatch.setitem(cake_backend.ROUTER_SM_COUNT, arch, sm_count)
+        tables = dict(cake_backend.ROUTER_RULES_BY_SM)
+        tables.pop((arch, sm_count), None)
+        monkeypatch.setattr(cake_backend, "ROUTER_RULES_BY_SM", tables)
+        cake_backend.clear_convenience_caches()
+
+    yield force
+    cake_backend.clear_convenience_caches()
+
+
+def _router_prepare(A, B, out, splits, arch, spec=None):
+    _require_template(
+        arch,
+        "router_fp32_gemm_atomic_"
+        + ("nn_t" if A.stride(0) == 1 else "kk")
+        + (
+            cake_backend.ROUTER_HEAD_TAIL_SUFFIX
+            if cake_backend.router_head_tail(spec)
+            else ""
+        ),
+    )
+    prepared = cake_backend.prepare_router_fp32_gemm(
+        A, B, out, splits=splits, deterministic=False
+    )
+    assert isinstance(prepared, cake_backend.PreparedAtomicRouterGemm)
+    return prepared
+
+
+def _router_segment_reference(A, B, plan):
+    """``(expected, bound)`` of a launch of ``plan``: each tile's segments' partials -- the deterministic program's
+    one-split store of the segment's K range, which this package's program reproduces bit for bit -- summed in K
+    order, and the bound of a reordering of that sum (``0`` for at most two partials: either order rounds alike)."""
+    K = int(A.shape[1])
+    partials = {}
+    per_tile = _segments(
+        plan.m_pairs,
+        plan.n_tiles,
+        plan.k_iters,
+        plan.units,
+        plan.head_spans,
+        plan.head_steps,
+    )
+    for k0, k1 in sorted({seg for segs in per_tile for seg in segs}):
+        lo, hi = (
+            k0 * cake_backend.ROUTER_BLOCK_K,
+            min(K, k1 * cake_backend.ROUTER_BLOCK_K),
+        )
+        part = torch.empty(int(A.shape[0]), int(B.shape[1]), device=A.device)
+        det_backend.router_fp32_det_gemm(A[:, lo:hi], B[lo:hi, :], part, splits=1)
+        partials[(k0, k1)] = part.t() if plan.swapped else part  # the launch's [M, N]
+    expected = torch.empty(plan.M, plan.N, device=A.device)
+    bound = torch.zeros(plan.M, plan.N, device=A.device, dtype=torch.float64)
+    bm, bn = 2 * cake_backend.ROUTER_BLOCK_M, cake_backend.ROUTER_BLOCK_N
+    for t, segs in enumerate(per_tile):
+        pair, col = divmod(t, plan.n_tiles)
+        rows = slice(pair * bm, min(plan.M, (pair + 1) * bm))
+        cols = slice(col * bn, min(plan.N, (col + 1) * bn))
+        if rows.start >= plan.M:
+            continue
+        tile = [partials[s][rows, cols] for s in segs]
+        acc = tile[0].clone()
+        for p in tile[1:]:
+            acc = acc + p
+        expected[rows, cols] = acc
+        if len(tile) > 2:
+            mag = sum(p.double().abs() for p in tile)
+            bound[rows, cols] = (len(tile) - 1) * 2.0**-23 * mag
+    return expected, bound
 
 
 @pytest.mark.parametrize(
-    "op, T", [("fwd", 257), ("dgrad", 257), ("wgrad", 1001), ("fwd", 129)]
+    "op, splits, spec",
+    [
+        ("fwd", None, "forward"),
+        ("fwd", 1, None),
+        ("fwd", 2, None),
+        ("wgrad", None, "pairs"),
+        ("wgrad", None, "H0.5x3"),
+        ("wgrad", None, "H0.5x4"),
+        ("wgrad", None, "H1x4p44"),
+        ("wgrad", None, "H1x6p44"),
+        ("wgrad", 1, None),
+        ("wgrad", 4, None),
+        ("wgrad", 11, None),
+    ],
 )
-def test_router_rows_match_fp64_reference_and_rerun_bit_exact(op, T):
-    if not _device_supported():
-        pytest.skip(
-            "requires a device with a registered generated instance "
-            "(compute capability 10.0 or 10.7)"
-        )
-    v = _router_inputs(op, T, seed=SEED + 4)
-    plan, *_ = plan_router_fp32_gemm(v["A"], v["B"], v["out"])
-    _require_program(plan.template)
-    prepared = prepare_router_fp32_gemm(v["A"], v["B"], v["out"])
-    assert prepared.splits == ROUTER_SPLITS[plan.layout]
-    first = prepared.launch().clone()
-    torch.cuda.synchronize()
-    before = torch.cuda.memory_stats()
-    prepared.launch()  # bit-exact rerun, no allocation (the split, the launch and the reduction included)
-    torch.cuda.synchronize()
-    after = torch.cuda.memory_stats()
-    assert after["allocation.all.allocated"] == before["allocation.all.allocated"]
-    assert torch.equal(first, v["out"])
-    expected = torch.matmul(v["A"].double(), v["B"].double())
-    diff = (v["out"].double() - expected).abs()
-    rel_fro = float(diff.norm() / expected.norm())
-    assert bool(torch.isfinite(v["out"]).all()) and rel_fro <= ROUTER_REL_FRO_MAX, (
-        rel_fro
+def test_gpu_router_d11_gate(op, splits, spec, router_rule):
+    """The router's accuracy gate, the deterministic package's shipped budget: ``rel_fro <= 2e-6`` against FP64 of
+    the exact fp32 operands, finite, worst over ``RERUNS`` launches into a NaN-poisoned ``out``; the forward's top-8
+    agrees with FP64 on every row and repeats bit for bit.  Against the deterministic program's one-split partials
+    of each segment: a whole tile is their bits, two partials their sum (either order rounds alike), more within the
+    reordering bound of their K-order sum.  One unit per tile (``splits=1``) is the deterministic program's
+    one-split result.  The profiler shows this package's program."""
+    _router_gate(op, splits, spec, router_rule, ROUTER_T, 6144, SEED + 20)
+
+
+@pytest.mark.parametrize("T", [1000, 16172, 16231, 16384])
+@pytest.mark.parametrize("spec", ["H1x4p44", "H1x5p44", "H1x4p80"])
+def test_gpu_router_head_units_at_hidden_4096(spec, T, router_rule):
+    """The head/tail partitions with fewer head units than CTA pairs (``"H<f>x<k>p<h>"``: the hidden 4096 verdicts of
+    ``sm_103a`` and ``sm_100a``; 80 head units are more than a 152-SM part's CTA pairs, so there the partition is
+    ``"H1x4"``'s) at hidden 4096, 256 experts, the measured token counts and a short one: the gate of
+    :func:`test_gpu_router_d11_gate`, on the partition :func:`cake_backend.router_partition_of` gives the device."""
+    plan = _router_gate("wgrad", None, spec, router_rule, T, 4096, SEED + 24)
+    sm_count = det_backend.device_facts(torch.device("cuda")).sm_count
+    m_pairs = plan.m_tiles // 2
+    partition = cake_backend.router_partition_of(
+        spec, m_pairs, plan.n_tiles, plan.k_iters, sm_count
     )
-    if (
-        op == "fwd"
-    ):  # top-8 routing agreement with the FP64 reference on the forward rows
-        ref_top = torch.topk(expected, 8, dim=1).indices.sort(dim=1).values
-        top = torch.topk(v["out"].double(), 8, dim=1).indices.sort(dim=1).values
-        assert int((top != ref_top).any(dim=1).sum()) == 0
-    # the eager entry point of the row gives the same bits
-    eager_fn = dict(
-        fwd=lambda: cake_backend.router_forward(v["X"], v["W"]),
-        dgrad=lambda: cake_backend.router_dgrad(v["G"], v["W"]),
-        wgrad=lambda: cake_backend.router_wgrad(v["G"], v["X"]),
-    )[op]
+    assert (plan.units, plan.head_spans, plan.head_steps) == partition
+    if cake_backend.router_head_pairs(spec) >= sm_count // 2:
+        assert partition == cake_backend.router_partition_of(
+            spec.split("p")[0], m_pairs, plan.n_tiles, plan.k_iters, sm_count
+        )
+    else:
+        assert plan.head_spans == cake_backend.router_head_pairs(spec) // plan.n_tiles
+
+
+def _router_gate(op, splits, spec, router_rule, T, hidden, seed):
+    """:func:`test_gpu_router_d11_gate` on ``T`` tokens of hidden size ``hidden``; returns the launch's plan."""
+    device, arch = _atomic_device_or_skip()
+    X, W, G = _router_inputs(T, device, seed, K=hidden)
+    A, B, out = _router_case(op, X, W, G)
+    if spec is not None:
+        router_rule(op, A, B, spec)
+    prepared = _router_prepare(A, B, out, splits, arch, spec)
+    plan = prepared.plan
+    assert bool(plan.head_spans) == bool(cake_backend.router_head_tail(spec))
+    if op == "fwd":
+        assert plan.reproducible
+    ref = A.double() @ B.double()
+    expected, bound = _router_segment_reference(A, B, plan)
+    if plan.swapped:
+        expected, bound = expected.t(), bound.t()
+    _assert_ran(prepared.launch, prepared.module_name)
+    first, worst = None, 0.0
+    for i in range(RERUNS):
+        out.fill_(float("nan"))
+        prepared.launch()
+        torch.cuda.synchronize()
+        assert bool(torch.isfinite(out).all()), i
+        worst = max(worst, _rel_fro(out, ref))
+        assert bool(((out.double() - expected.double()).abs() <= bound).all()), i
+        if plan.reproducible:
+            first = out.clone() if first is None else first
+            assert torch.equal(out, first), i
+        if op == "fwd" and i == 0:
+            ref_top = torch.topk(ref, 8, dim=1).indices.sort(dim=1).values
+            top = torch.topk(out.double(), 8, dim=1).indices.sort(dim=1).values
+            assert int((top != ref_top).any(dim=1).sum()) == 0
+    assert worst <= ROUTER_REL_FRO_MAX, worst
+    if splits == 1:
+        det_out = torch.empty_like(out)
+        cake_backend.router_fp32_gemm(A, B, det_out, splits=1)
+        assert torch.equal(out, det_out)
+    return plan
+
+
+def _top8_rows_differ(out, ref, tie_ulps=16):
+    """``(differing, ties)``: the rows whose top-8 index set differs from FP64's, outside the near ties -- rows whose
+    FP64 8th and 9th values lie within ``tie_ulps`` FP32 ulps of the 8th, where any order of the FP32 sum may pick
+    either -- and the count of those near ties."""
+    top = torch.topk(ref, 9, dim=1).values
+    gap = top[:, 7] - top[:, 8]
+    tie = gap <= tie_ulps * torch.finfo(torch.float32).eps * top[:, 7].abs()
+    ref_top = torch.topk(ref, 8, dim=1).indices.sort(dim=1).values
+    got_top = torch.topk(out.double(), 8, dim=1).indices.sort(dim=1).values
+    differ = (got_top != ref_top).any(dim=1) & ~tie
+    return int(differ.sum()), int(tie.sum())
+
+
+def test_gpu_router_entry_points_reach_the_stream_k_program(router_rule):
+    """``router_forward`` / ``router_wgrad`` with ``deterministic=False`` and a verdict for each row (no forward
+    verdict ships; the weight gradient of this hidden size runs the deterministic plan): the forward repeats bit
+    for bit, and its top-8, like the deterministic forward's, is FP64's on every row but the near ties (the 8th and
+    9th logits within 16 FP32 ulps); both meet the gate."""
+    device, arch = _atomic_device_or_skip()
+    X, W, G = _router_inputs(ROUTER_T, device, SEED + 21)
+    router_rule("fwd", X, W.t(), "forward")
+    router_rule("wgrad", G.t(), X, "pairs")
+    first = cake_backend.router_forward(X, W, deterministic=False)
+    det_fwd = cake_backend.router_forward(X, W)
+    ref_fwd, ref_wgrad = X.double() @ W.double().t(), G.double().t() @ X.double()
+    for name, out in (("atomic", first), ("det", det_fwd)):
+        differ, ties = _top8_rows_differ(out, ref_fwd)
+        print(
+            f"ROUTER_TOP8 {arch} {name}: {differ} rows differ, {ties} near ties excluded"
+        )
+        assert differ == 0 and ties <= ROUTER_T // 100, (differ, ties)
+    for _ in range(RERUNS):
+        out = cake_backend.router_forward(X, W, deterministic=False)
+        assert torch.equal(out, first) and _rel_fro(out, ref_fwd) <= ROUTER_REL_FRO_MAX
+        wgrad = cake_backend.router_wgrad(G, X, deterministic=False)
+        assert _rel_fro(wgrad, ref_wgrad) <= ROUTER_REL_FRO_MAX
+    plan = cake_backend.plan_router_fp32_gemm(X, W.t(), first, deterministic=False)
+    assert isinstance(plan, cake_backend.AtomicRouterPlan)
+    _assert_ran(
+        lambda: cake_backend.router_forward(X, W, first, deterministic=False),
+        cake_jit.select_module(arch, plan.template),
+    )
+
+
+def test_gpu_planned_rows_run_the_programs_of_their_verdicts():
+    """Unforced (``deterministic=False``, no split count): every K1 weight-gradient row with a verdict for this
+    architecture and every measured router row prepares the program its verdict names on this device (by kernel
+    name, at ``T = 16231``), and a row whose verdict is ``None`` -- or that this device's SM count leaves to the
+    deterministic program -- prepares the deterministic launch."""
+    device, arch = _atomic_device_or_skip()
+    sm_count = det_backend.device_facts(device).sm_count
+    g = torch.Generator(device=device).manual_seed(SEED + 90)
+    T = 16231
+    ran = 0
+    keys = set(cake_backend.K1_SPLIT_RULES) | set(
+        cake_backend.K1_SPLIT_RULES_BY_SM.get((arch, sm_count), {})
+    )
+    for rule_arch, L, M, N, dt in sorted(keys):
+        if rule_arch != arch:
+            continue
+        G, X = _bf16((T, N), device, g), _bf16((T, M), device, g)
+        out_dtype = torch.float32 if dt == "f32" else torch.bfloat16
+        out = torch.empty(N, M, device=device, dtype=out_dtype)
+        prepared = cake_backend.prepare_projection_wgrad(G, X, out, deterministic=False)
+        want = cake_backend.k1_plan(
+            arch=arch, L=L, M=M, N=N, K=T, out_f32=dt == "f32", sm_count=sm_count
+        )
+        if want is None:
+            assert not isinstance(prepared, cake_backend.PreparedAtomicGemm), (M, N, dt)
+            continue
+        assert isinstance(prepared, cake_backend.PreparedAtomicGemm), (M, N, dt)
+        assert (prepared.plan.block_n, prepared.plan.splits) == want
+        _assert_ran(prepared.launch, prepared.module_name)
+        torch.cuda.synchronize()
+        _k1_check(out, G.double().t() @ X.double(), f"{M} {N} {dt}")
+        ran += 1
+    rules, _ = cake_backend.router_rules(arch, sm_count)
+    for (rule_arch, layout, hidden, _experts), spec in sorted(
+        rules.items(), key=lambda kv: kv[0]
+    ):
+        if rule_arch != arch:
+            continue
+        X, W, G = _router_inputs(T, device, SEED + 91, K=hidden)
+        A, B, out = _router_case("fwd" if layout == "kk" else "wgrad", X, W, G)
+        prepared = cake_backend.prepare_router_fp32_gemm(A, B, out, deterministic=False)
+        plan, _ = cake_backend.plan_atomic_router(
+            A, B, out, arch=arch, sm_count=sm_count
+        )
+        if plan is None:
+            assert not isinstance(prepared, cake_backend.PreparedAtomicRouterGemm)
+            continue
+        assert spec is not None
+        assert isinstance(prepared, cake_backend.PreparedAtomicRouterGemm)
+        assert (prepared.plan.template, prepared.plan.units) == (
+            plan.template,
+            plan.units,
+        )
+        assert (prepared.plan.head_spans, prepared.plan.head_steps) == (
+            plan.head_spans,
+            plan.head_steps,
+        )
+        _assert_ran(prepared.launch, prepared.module_name)
+        torch.cuda.synchronize()
+        assert _rel_fro(out, A.double() @ B.double()) <= ROUTER_REL_FRO_MAX
+        ran += 1
+    print(
+        f"PLANNED_ROWS {arch} sm_count={sm_count}: {ran} rows ran this package's programs"
+    )
+    if not ran:
+        pytest.skip(f"no verdict of {arch} applies on {sm_count} SMs")
+
+
+def test_gpu_router_token_windows_run_at_their_edges():
+    """Unforced (``deterministic=False``, no split count): at the first and the last token count of every token window
+    of a router weight-gradient row of this architecture (the smallest measured count, 64, for a window that starts
+    at one token) the prepared launch runs the partition the planner gives -- a head/tail window on the measured SM
+    count, a "waves" window where :func:`cake_backend.router_waves` gives a partition -- and meets the gate; one
+    token outside the window, or on another SM count, it runs the deterministic launch."""
+    device, arch = _atomic_device_or_skip()
+    sm_count = det_backend.device_facts(device).sm_count
+    rules, measured = cake_backend.router_rules(arch, sm_count)
+    atomic = cake_backend.PreparedAtomicRouterGemm
+    ran = 0
+    for (rule_arch, layout, hidden, _experts), rule in sorted(
+        rules.items(), key=lambda kv: kv[0]
+    ):
+        if rule_arch != arch or layout != "nn_t" or not isinstance(rule, tuple):
+            continue
+        for first, last, spec in rule:
+            for T, inside in (
+                (first - 1, False),
+                (max(first, 64), True),
+                (last, True),
+                (last + 1, False),
+            ):
+                if T < 1:
+                    continue
+                X, W, G = _router_inputs(T, device, SEED + 92, K=hidden)
+                A, B, out = _router_case("wgrad", X, W, G)
+                part = cake_backend.router_partition(
+                    "nn_t", arch=arch, sm_count=sm_count, M=hidden, N=256, K=T
+                )
+                prepared = cake_backend.prepare_router_fp32_gemm(
+                    A, B, out, deterministic=False
+                )
+                if not inside:
+                    assert part is None, (hidden, T)
+                elif spec != "waves" and measured:
+                    assert part is not None, (hidden, T)
+                if part is None:
+                    assert not isinstance(prepared, atomic), (hidden, T)
+                    continue
+                assert isinstance(prepared, atomic), (hidden, T)
+                plan = prepared.plan
+                got = (plan.units, plan.head_spans, plan.head_steps)
+                assert got == part, (hidden, T)
+                _assert_ran(prepared.launch, prepared.module_name)
+                torch.cuda.synchronize()
+                assert _rel_fro(out, A.double() @ B.double()) <= ROUTER_REL_FRO_MAX
+                ran += 1
+    print(f"ROUTER_WINDOW_EDGES {arch} sm_count={sm_count}: {ran} launches ran")
+    if not ran:
+        pytest.skip(f"no router token window of {arch} applies on {sm_count} SMs")
+
+
+def test_gpu_router_rows_without_a_verdict_run_the_deterministic_program_unplanned():
+    """``deterministic=False`` without a split count on a router row without a verdict (the forward; the weight
+    gradient at a token count outside every window): the deterministic program's bits (its production split counts),
+    through this package's binding of it (``_K2_SPLITK_CACHE``); this package plans nothing for the call."""
+    device, arch = _atomic_device_or_skip()
+    for hidden in (4096, 5120, 6144):
+        X, W, G = _router_inputs(8000, device, SEED + 23, K=hidden)
+        cake_backend.clear_convenience_caches()
+        fwd = cake_backend.router_forward(X, W, deterministic=False)
+        wgrad = cake_backend.router_wgrad(G, X, deterministic=False)
+        assert not cake_backend._K2_ATOMIC_CACHE
+        assert len(cake_backend._K2_SPLITK_CACHE) == 2
+        assert torch.equal(fwd, cake_backend.router_forward(X, W))
+        assert torch.equal(wgrad, cake_backend.router_wgrad(G, X))
+        A, B, out = _router_case("fwd", X, W, G)
+        assert cake_backend.router_fp32_gemm(A, B, out, deterministic=False) is out
+        assert torch.equal(out, fwd) and not cake_backend._K2_ATOMIC_CACHE
+
+
+def test_gpu_router_verdicts_set_at_run_time_are_seen(monkeypatch):
+    """The convenience path keeps whether a router row has a verdict (per device and view geometry) and whether any
+    router table gives the forward one until a router table changes: on a row without a verdict the forward and the
+    weight gradient give the deterministic program's bits (unplanned, also on the second call, from the memo); a
+    verdict set at run time in the table of the device's SM count runs this package's program at the next call,
+    without clearing a cache, and its removal the deterministic program again."""
+    device, arch = _atomic_device_or_skip()
+    sm_count = det_backend.device_facts(device).sm_count
+    table, _ = cake_backend.router_rules(arch, sm_count)
+    if table is cake_backend.ROUTER_RULES:
+        # a verdict of ROUTER_RULES applies on this device whatever its SM count
+        monkeypatch.setitem(cake_backend.ROUTER_SM_COUNT, arch, sm_count)
+    hidden, T = 6144, 1000  # no verdict on any architecture
+    X, W, G = _router_inputs(T, device, SEED + 26, K=hidden)
+    keys = {"fwd": (arch, "kk", hidden, 256), "wgrad": (arch, "nn_t", hidden, 256)}
+    assert all(table.get(k) is None for k in keys.values())
     cake_backend.clear_convenience_caches()
-    eager = eager_fn()
+    want_fwd = det_backend.router_fp32_det_gemm(
+        X, W.t(), torch.empty(T, 256, device=device)
+    )
+    want_wgrad = det_backend.router_fp32_det_gemm(
+        G.t(), X, torch.empty(256, hidden, device=device)
+    )
+
+    def unplanned():
+        for _ in range(2):
+            fwd = cake_backend.router_forward(X, W, deterministic=False)
+            wgrad = cake_backend.router_wgrad(G, X, deterministic=False)
+            assert torch.equal(fwd, want_fwd) and torch.equal(wgrad, want_wgrad)
+        assert not cake_backend._K2_ATOMIC_CACHE
+
+    unplanned()
+    monkeypatch.setitem(table, keys["fwd"], "forward")
+    monkeypatch.setitem(table, keys["wgrad"], "pairs")
+    ref_fwd, ref_wgrad = X.double() @ W.double().t(), G.double().t() @ X.double()
+
+    def fwd():
+        return cake_backend.router_forward(X, W, deterministic=False)
+
+    def wgrad():
+        return cake_backend.router_wgrad(G, X, deterministic=False)
+
+    for op, A, B, ref, call in (
+        ("fwd", X, W.t(), ref_fwd, fwd),
+        ("wgrad", G.t(), X, ref_wgrad, wgrad),
+    ):
+        out = torch.empty(A.shape[0], B.shape[1], device=device)
+        plan = cake_backend.plan_router_fp32_gemm(A, B, out, deterministic=False)
+        assert isinstance(plan, cake_backend.AtomicRouterPlan), op
+        _assert_ran(call, cake_jit.select_module(arch, plan.template))
+        assert _rel_fro(call(), ref) <= ROUTER_REL_FRO_MAX, op
+    first = fwd()
+    assert torch.equal(fwd(), first)
+    assert len(cake_backend._K2_ATOMIC_CACHE) == 2
+    table[keys["fwd"]] = None
+    table[keys["wgrad"]] = None
+    for _ in range(2):
+        assert torch.equal(fwd(), want_fwd) and torch.equal(wgrad(), want_wgrad)
+
+
+def test_gpu_router_deterministic_program_through_the_binding():
+    """``deterministic=False`` calls that run the deterministic program -- the forward and the input gradient, the
+    weight gradient of a row without a verdict, the generic ``kn`` call -- go through this package's binding
+    (``_K2_SPLITK_CACHE``; nothing in ``_K2_ATOMIC_CACHE``) and give the deterministic package's bits: dense and
+    padded outputs (one split stores into a padded ``out`` through its flat alias, several splits reduce into it), a
+    split source with padded rows (the torch chain), repeated calls; a larger row grows the arena and the smaller
+    rows' launches are carved again with the same bits; another stream binds an arena of its own; a binding the
+    deterministic package refuses raises its error."""
+    device, arch = _atomic_device_or_skip()
+    hidden = 6144  # no router verdict on any architecture
+    cake_backend.clear_convenience_caches()
+
+    def check(T, seed, pad_out=False, pad_g=False):
+        X, W, G = _router_inputs(T, device, seed, K=hidden)
+        if pad_g:
+            G = torch.cat([G, torch.zeros(T, 16, device=device)], 1)[:, :256]
+        shapes = {"fwd": (T, 256), "dgrad": (T, hidden), "wgrad": (256, hidden)}
+        # fmt: off
+        calls = {
+            "fwd": lambda out, d: cake_backend.router_forward(X, W, out, deterministic=d),
+            "dgrad": lambda out, d: cake_backend.router_dgrad(G, W, out, deterministic=d),
+            "wgrad": lambda out, d: cake_backend.router_wgrad(G, X, out, deterministic=d),
+        }
+        # fmt: on
+        for op, call in calls.items():
+            rows, cols = shapes[op]
+            if pad_out:
+                storage = torch.full((rows, cols + 64), 7.0, device=device)
+                out = storage[:, :cols]
+            else:
+                out = torch.empty(rows, cols, device=device)
+            want = call(out, True).clone()
+            for _ in range(2):
+                out.fill_(float("nan"))
+                assert call(out, False) is out
+                assert torch.equal(out, want), (op, T, pad_out, pad_g)
+            if pad_out:
+                assert bool((storage[:, cols:] == 7.0).all()), op
+        out = torch.empty(T, hidden, device=device)
+        want = det_backend.router_fp32_det_gemm(G, W, out.clone())
+        assert cake_backend.router_fp32_gemm(G, W, out, deterministic=False) is out
+        assert torch.equal(out, want)
+
+    variants = ((64, False, False), (1000, True, False), (1000, False, True))
+    for T, pad_out, pad_g in variants:
+        check(T, SEED + 70 + T, pad_out, pad_g)
+    assert cake_backend._K2_SPLITK_CACHE and not cake_backend._K2_ATOMIC_CACHE
+    entries = list(cake_backend._K2_SPLITK_CACHE.values())
+    assert all(e.k2 is not None for e in entries)
+    assert any(e.k2.partials_shape is not None for e in entries)
+    assert any(e.k2.partials_shape is None for e in entries)
+    assert any(e.split_entry is None for e in entries)  # the padded split source
+    versions = {id(e): e.k2.version for e in entries}
+    check(8000, SEED + 71)  # a larger row: the arena grows
+    check(64, SEED + 70 + 64)
+    assert any(e.k2.version != versions[id(e)] for e in entries)
+    stream = torch.cuda.Stream(device)
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        check(1000, SEED + 72)
     torch.cuda.synchronize()
-    assert torch.equal(eager, v["out"])
-    assert len(cake_backend._K2_CACHE) == 1
-    # the second eager call hits the cached plan: only ``out`` is allocated, the same bits come back
-    before = torch.cuda.memory_stats()
-    again = eager_fn()
+    assert stream.cuda_stream in {key[1] for key in cake_backend._ATOMIC_ARENAS}
+    # a binding the deterministic package refuses: its error
+    X, W, G = _router_inputs(1001, device, SEED + 73, K=hidden)
+    storage = torch.empty(1001 * hidden + 4, device=device)
+    out = storage[1 : 1 + 1001 * hidden].view(1001, hidden)
+    with pytest.raises(ValueError, match="16-byte aligned") as refused:
+        cake_backend.router_dgrad(G, W, out)
+    with pytest.raises(ValueError, match=re.escape(str(refused.value))):
+        cake_backend.router_dgrad(G, W, out, deterministic=False)
+
+
+def test_gpu_router_binding_pdl_waits_for_an_early_producer():
+    """The deterministic router program through this package's binding as programmatic dependent launches: the
+    forward writes ``Y``, the input gradient reads it and writes ``dX``, the weight gradient (a row without a verdict)
+    reads both; each starts while its predecessor runs and must still read every value it wrote.  The flag is bound
+    into the cached argument lists (a key per flag), and every launch gives the deterministic package's bits."""
+    device, arch = _atomic_device_or_skip()
+    hidden, T = 6144, 4096  # no router verdict on any architecture
+    X, W, _ = _router_inputs(T, device, SEED + 80, K=hidden)
+    cake_backend.clear_convenience_caches()
+    want_y = det_backend.router_det_forward(X, W, enable_pdl=False)
+    want_dx = det_backend.router_det_dgrad(want_y, W, enable_pdl=False)
+    want_dw = det_backend.router_det_wgrad(want_y, want_dx, enable_pdl=False)
+    Y = torch.empty(T, 256, device=device)
+    dX = torch.empty(T, hidden, device=device)
+    dW = torch.empty(256, hidden, device=device)
+    for pdl in (True, False, None):
+        for _ in range(3):
+            for t in (Y, dX, dW):
+                t.fill_(float("nan"))
+            kw = dict(deterministic=False, enable_pdl=pdl)
+            cake_backend.router_forward(X, W, Y, **kw)
+            cake_backend.router_dgrad(Y, W, dX, **kw)
+            cake_backend.router_wgrad(Y, dX, dW, **kw)
+            torch.cuda.synchronize()
+            assert torch.equal(Y, want_y) and torch.equal(dX, want_dx), pdl
+            assert torch.equal(dW, want_dw), pdl
+    assert not cake_backend._K2_ATOMIC_CACHE
+    flags = {key[2][1][1] for key in cake_backend._K2_SPLITK_CACHE}
+    assert flags == {0, 1}
+    assert len(cake_backend._K2_SPLITK_CACHE) == 6
+
+
+def test_gpu_cached_router_launch_is_the_prepared_launch():
+    """The convenience path's bound launch (arguments ordered once, the stack converted once per arena growth) runs
+    the prepared launch's program on the same arguments: a reproducible plan gives its bits, every plan meets the
+    gate; after the arena of the stream grows (a larger row) the launch is bound again and still gives them."""
+    device, arch = _atomic_device_or_skip()
+    cases = []
+    for T, splits in ((64, None), (128, None), (192, None), (1024, 3), (300, 2)):
+        X, W, G = _router_inputs(T, device, SEED + 24, K=5120)
+        cases.append((_router_case("fwd" if splits == 2 else "wgrad", X, W, G), splits))
+    ran = 0
+    for grown in (False, True):
+        if grown:
+            X, W, G = _router_inputs(4096, device, SEED + 25, K=5120)
+            A, B, out = _router_case("wgrad", X, W, G)
+            cake_backend.router_fp32_gemm(A, B, out, splits=4, deterministic=False)
+        for (A, B, out), splits in cases:
+            plan = cake_backend.plan_router_fp32_gemm(
+                A, B, out, splits=splits, deterministic=False
+            )
+            if not isinstance(plan, cake_backend.AtomicRouterPlan):
+                continue
+            prepared = cake_backend.prepare_router_fp32_gemm(
+                A, B, out.clone(), splits=splits, deterministic=False
+            )
+            want = prepared.launch().clone()
+            got = cake_backend.router_fp32_gemm(
+                A, B, out, splits=splits, deterministic=False
+            )
+            torch.cuda.synchronize()
+            ref = A.double() @ B.double()
+            assert _rel_fro(got, ref) <= ROUTER_REL_FRO_MAX
+            if plan.reproducible:
+                assert torch.equal(got, want), (tuple(A.shape), splits)
+            ran += 1
+    print(f"ROUTER_BOUND_LAUNCH {arch}: {ran} launches")
+    assert ran
+
+
+def test_gpu_cached_router_launch_runs_the_head_tail_windows_at_their_edges():
+    """Unforced (``deterministic=False``, no split count): at the first and the last token count of every head/tail
+    window of this device's router table (``router_rules`` of its architecture and SM count), the convenience path's
+    cached launch (its bound arguments, ``_K2Binding``) runs the prepared launch's plan and program, meets the gate
+    and, for a reproducible plan, gives the prepared launch's bits; the second call of the key reuses the binding."""
+    device, arch = _atomic_device_or_skip()
+    sm_count = det_backend.device_facts(device).sm_count
+    rules, holds = cake_backend.router_rules(arch, sm_count)
+    edges = []
+    for (rule_arch, layout, hidden, _experts), rule in sorted(
+        rules.items(), key=lambda kv: kv[0]
+    ):
+        if rule_arch != arch or layout != "nn_t" or not isinstance(rule, tuple):
+            continue
+        for first, last, spec in rule:
+            if holds and cake_backend.router_head_tail(spec) is not None:
+                edges += [(hidden, first), (hidden, last)]
+    ran = 0
+    for hidden, T in edges:
+        X, W, G = _router_inputs(T, device, SEED + 26, K=hidden)
+        A, B, out = _router_case("wgrad", X, W, G)
+        prepared = cake_backend.prepare_router_fp32_gemm(
+            A, B, out.clone(), deterministic=False
+        )
+        assert isinstance(prepared, cake_backend.PreparedAtomicRouterGemm), (hidden, T)
+        assert prepared.plan.head_spans > 0, (hidden, T)
+        want = prepared.launch().clone()
+        cake_backend.clear_convenience_caches()
+        _assert_ran(
+            lambda A=A, B=B, out=out: cake_backend.router_fp32_gemm(
+                A, B, out, deterministic=False
+            ),
+            prepared.module_name,
+        )
+        torch.cuda.synchronize()
+        (entry,) = cake_backend._K2_ATOMIC_CACHE.values()
+        assert entry.plan == prepared.plan, (hidden, T)
+        assert entry.module_name == prepared.module_name, (hidden, T)
+        bound = entry.k2
+        assert bound is not None and bound.version == entry.arena.version
+        ref = A.double() @ B.double()
+        assert _rel_fro(out, ref) <= ROUTER_REL_FRO_MAX, (hidden, T)
+        assert _rel_fro(want, ref) <= ROUTER_REL_FRO_MAX, (hidden, T)
+        if prepared.plan.reproducible:
+            assert torch.equal(out, want), (hidden, T)
+        out.fill_(float("nan"))
+        assert cake_backend.router_fp32_gemm(A, B, out, deterministic=False) is out
+        torch.cuda.synchronize()
+        (again,) = cake_backend._K2_ATOMIC_CACHE.values()
+        assert again is entry and again.k2 is bound, (hidden, T)
+        assert _rel_fro(out, ref) <= ROUTER_REL_FRO_MAX, (hidden, T)
+        if prepared.plan.reproducible:
+            assert torch.equal(out, want), (hidden, T)
+        ran += 1
+    print(f"ROUTER_BOUND_HEAD_TAIL_EDGES {arch} sm_count={sm_count}: {ran} launches")
+    if not ran:
+        pytest.skip(f"no router head/tail window of {arch} applies on {sm_count} SMs")
+
+
+@pytest.mark.parametrize("op, splits", [("fwd", 2), ("wgrad", 4)])
+def test_gpu_router_padded_out_rows(op, splits):
+    """An ``out`` whose rows are padded (row stride above the row length): the prepared launch and the
+    convenience path fill and write only ``out``'s elements -- the padding keeps its values -- and meet the gate."""
+    device, arch = _atomic_device_or_skip()
+    X, W, G = _router_inputs(ROUTER_T, device, SEED + 23)
+    A, B, dense = _router_case(op, X, W, G)
+    rows, cols = dense.shape
+    storage = torch.full((rows, cols + 64), 7.0, device=device)
+    out = storage[:, :cols]
+    prepared = _router_prepare(A, B, out, splits, arch)
+    assert prepared.plan.part_tiles
+    ref = A.double() @ B.double()
+    for launch in (
+        prepared.launch,
+        lambda: cake_backend.router_fp32_gemm(
+            A, B, out, splits=splits, deterministic=False
+        ),
+    ):
+        for _ in range(3):
+            out.fill_(float("nan"))
+            launch()
+            torch.cuda.synchronize()
+            assert bool(torch.isfinite(out).all())
+            assert _rel_fro(out, ref) <= ROUTER_REL_FRO_MAX
+            assert bool((storage[:, cols:] == 7.0).all())
+
+
+def test_gpu_router_misaligned_out_takes_the_deterministic_path():
+    """An ``out`` 4 bytes off a 16-byte boundary: the call of this package runs the deterministic path, so it
+    refuses the single-split row-major forward exactly as the deterministic package does."""
+    device, arch = _atomic_device_or_skip()
+    X, W, _ = _router_inputs(1001, device, SEED + 22)
+    storage = torch.empty(1001 * 256 + 4, device=device)
+    out = storage[1 : 1 + 1001 * 256].view(1001, 256)
+    with pytest.raises(ValueError, match="16-byte aligned") as refused:
+        det_backend.plan_router_fp32_det_gemm(X, W.t(), out, splits=1)
+    message = re.escape(str(refused.value))
+    with pytest.raises(ValueError, match=message):
+        cake_backend.plan_router_fp32_gemm(X, W.t(), out, splits=1, deterministic=False)
+    with pytest.raises(ValueError, match=message):
+        cake_backend.prepare_router_fp32_gemm(
+            X, W.t(), out, splits=1, deterministic=False
+        )
+    with pytest.raises(ValueError, match=message):
+        cake_backend.router_fp32_gemm(X, W.t(), out, splits=1, deterministic=False)
+
+
+# ---------------------------------------------------------------------------
+# GPU: streams, graphs, allocation-free prepared launches
+# ---------------------------------------------------------------------------
+
+
+def test_gpu_concurrent_streams_keep_their_own_workspaces(k1_rule, router_rule):
+    """Two streams issuing K1 and K2 calls of this package of different geometries concurrently: one arena per
+    (device, stream), every result within budget, the tickets zero."""
+    device, arch = _atomic_device_or_skip()
+    cake_backend.clear_convenience_caches()
+    streams = [torch.cuda.Stream(device) for _ in range(2)]
+    cases = []
+    for i, (row, T) in enumerate((("indexer_k", 16231), ("thin_48", 4097))):
+        G, X, out = _k1_wgrad_inputs(row, T, torch.bfloat16, device, SEED + 60 + i)
+        cases.append((G, X, out))
+    k1_rule(*cases[0], 2)
+    k1_rule(*cases[1], 3)
+    Xf, Wf, Gf = _router_inputs(ROUTER_T, device, SEED + 62)
+    router_rule("wgrad", Gf.t(), Xf, "pairs")
+    router_outs = [
+        torch.empty(Gf.shape[1], Xf.shape[1], device=device) for _ in streams
+    ]
     torch.cuda.synchronize()
-    after = torch.cuda.memory_stats()
-    assert after["allocation.all.allocated"] - before["allocation.all.allocated"] == 1
-    assert len(cake_backend._K2_CACHE) == 1 and torch.equal(again, v["out"])
+    for _ in range(5):
+        for stream, (G, X, out), rout in zip(streams, cases, router_outs, strict=True):
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                cake_backend.projection_wgrad(G, X, out, deterministic=False)
+                cake_backend.router_wgrad(Gf, Xf, rout, deterministic=False)
+    torch.cuda.synchronize()
+    for G, X, out in cases:
+        _k1_check(out, G.double().t() @ X.double())
+    ref = Gf.double().t() @ Xf.double()
+    for rout in router_outs:
+        assert _rel_fro(rout, ref) <= ROUTER_REL_FRO_MAX
+    keys = {key[1] for key in cake_backend._ATOMIC_ARENAS}
+    assert {s.cuda_stream for s in streams} <= keys
+    assert _arena_tickets_zero()
+
+
+def test_gpu_prepared_launches_allocate_nothing_and_capture_into_a_graph():
+    """The prepared K1 and K2 launches allocate nothing on the device, capture into one CUDA graph (K2: the split,
+    the memset of ``out`` and the kernel) and replay with fresh operand values copied in place: the replay meets the
+    budgets, and the K1 tickets are zero after the replays."""
+    device, arch = _atomic_device_or_skip()
+    G, X, out = _k1_wgrad_inputs("indexer_k", 16231, torch.bfloat16, device, SEED + 70)
+    k1 = _k1_prepare(G, X, out, arch, 3)
+    Xf, Wf, Gf = _router_inputs(ROUTER_T, device, SEED + 71)
+    A2, B2, out2 = _router_case("wgrad", Xf, Wf, Gf)
+    k2 = _router_prepare(A2, B2, out2, 4, arch)
+    assert k2.plan.part_tiles
+    k1.launch(), k2.launch()
+    torch.cuda.synchronize()
+    before = torch.cuda.memory_stats()["allocation.all.allocated"]
+    for _ in range(5):
+        k1.launch(), k2.launch()
+    torch.cuda.synchronize()
+    assert torch.cuda.memory_stats()["allocation.all.allocated"] == before
+    side = torch.cuda.Stream(device)
+    side.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(side), torch.cuda.graph(graph, stream=side):
+        k1.launch()
+        k2.launch()
+    torch.cuda.current_stream().wait_stream(side)
+    g = torch.Generator(device=device).manual_seed(SEED + 72)
+    for _ in range(3):
+        G.copy_(_bf16(G.shape, device, g))
+        X.copy_(_bf16(X.shape, device, g))
+        Xf.copy_(torch.randn(Xf.shape, device=device, generator=g))
+        Gf.copy_(torch.randn(Gf.shape, device=device, generator=g) * 1e-3)
+        out.fill_(float("nan"))
+        out2.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        _k1_check(out, G.double().t() @ X.double(), "graph replay")
+        assert _rel_fro(out2, A2.double() @ B2.double()) <= ROUTER_REL_FRO_MAX
+        assert k1.counters_are_zero()
+
+
+def test_gpu_prepared_k1_reset_counters():
+    """``reset_counters`` zeroes the tickets (the recovery after a launch that did not complete)."""
+    device, arch = _atomic_device_or_skip()
+    G, X, out = _k1_wgrad_inputs("indexer_hw", 4097, torch.bfloat16, device, SEED + 80)
+    prepared = _k1_prepare(G, X, out, arch, 2)
+    prepared.tensors["counters"].view(torch.int32).fill_(1)
+    assert not prepared.counters_are_zero()
+    prepared.reset_counters()
+    prepared.launch()
+    torch.cuda.synchronize()
+    _k1_check(out, G.double().t() @ X.double())
+    assert prepared.counters_are_zero()

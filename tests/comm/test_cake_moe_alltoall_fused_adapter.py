@@ -68,13 +68,13 @@ def test_each_target_loads_its_own_module(monkeypatch):
         (
             "sm100a",
             "cake_alltoall_sm100a",
-            "cake_moe_alltoall_sm100.cu",
+            "cake_moe_alltoall_kernels.cu",
             "compute_100a,code=sm_100a",
         ),
         (
             "sm103a",
             "cake_alltoall_sm103a",
-            "cake_moe_alltoall_sm103.cu",
+            "cake_moe_alltoall_kernels.cu",
             "compute_103a,code=sm_103a",
         ),
     ],
@@ -286,10 +286,7 @@ def test_bf16_vector_routes_and_stage_grid_keep_exact_boundaries():
     )
 
     generated_root = Path(__file__).resolve().parents[2] / "csrc/generated/moe_alltoall"
-    for generated_name in (
-        "cake_moe_alltoall_sm100.cu",
-        "cake_moe_alltoall_sm103.cu",
-    ):
+    for generated_name in ("cake_moe_alltoall_kernels.cu",):
         generated_source = (generated_root / generated_name).read_text()
         normalized_generated_source = " ".join(generated_source.split())
         assert (
@@ -484,10 +481,7 @@ def test_fused_quantized_combine_routes_mirror_the_cake_host_rule():
     )
 
     generated_root = repo_root / "csrc/generated/moe_alltoall"
-    for generated_name in (
-        "cake_moe_alltoall_sm100.cu",
-        "cake_moe_alltoall_sm103.cu",
-    ):
+    for generated_name in ("cake_moe_alltoall_kernels.cu",):
         generated = " ".join((generated_root / generated_name).read_text().split())
         for top_k in _FUSED_QUANTIZED_COMBINE_TOP_K:
             symbol = f"{_FUSED_QUANTIZED_COMBINE_SYMBOL}{top_k}("

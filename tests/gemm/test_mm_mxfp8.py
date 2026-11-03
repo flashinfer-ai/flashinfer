@@ -500,7 +500,8 @@ def test_mm_mxfp8_cute_dsl_waits_for_pdl_producer(m, n, k, auto_tuning):
 @pytest.mark.parametrize(
     "m,n,k",
     [
-        (1, 1536, 1024),
+        (1, 1536, 1024),  # M <= 16: a small-M runner is the untuned default
+        (24, 6144, 4096),  # M > 16: the SM107 kernel is the untuned default
         (100, 4096, 1024),  # M % 8 != 0
         (256, 1536, 6144),
         (4096, 6144, 1536),
@@ -509,7 +510,7 @@ def test_mm_mxfp8_cute_dsl_waits_for_pdl_producer(m, n, k, auto_tuning):
     ],
 )
 def test_mm_mxfp8_cute_dsl_sm107(m, n, k, auto_tuning, monkeypatch):
-    """On SM107, mm_mxfp8(backend="cute-dsl") runs the SM107 kernel and is correct."""
+    """On SM107, mm_mxfp8(backend="cute-dsl") picks the SM107 kernel above M=16, a small-M runner below, and is correct."""
     _skip_if_unsupported("cute-dsl")
     from flashinfer.cute_dsl.utils import is_rubin_cute_dsl_available
 
@@ -537,6 +538,9 @@ def test_mm_mxfp8_cute_dsl_sm107(m, n, k, auto_tuning, monkeypatch):
     monkeypatch.setattr(
         gemm_base, "_cute_dsl_gemm_mxfp8_sm107_runner", recording_sm107_runner
     )
+    if not auto_tuning:
+        # A cached winner (autotuning covers every M bucket) would replace the untuned default.
+        AutoTuner.get().clear_cache()
     _run_mm_mxfp8(
         m,
         n,
@@ -548,12 +552,16 @@ def test_mm_mxfp8_cute_dsl_sm107(m, n, k, auto_tuning, monkeypatch):
         provide_out=True,
     )
 
-    assert sm107_tactics_run, "mm_mxfp8 did not use the SM107 kernel"
     if auto_tuning:
-        # The last launch is the run with the tuned SM107 tactic.
+        # Autotuning profiles the SM107 kernel at every M; the last launch is a tuned tactic.
+        assert sm107_tactics_run, "mm_mxfp8 did not profile the SM107 kernel"
         assert isinstance(sm107_tactics_run[-1], tuple), sm107_tactics_run[-1]
         return
-    assert sm107_tactics_run == [-1], sm107_tactics_run
+    if m <= 16:
+        # A small-M runner is the untuned default; the SM107 kernel does not launch.
+        assert sm107_tactics_run == [], sm107_tactics_run
+    else:
+        assert sm107_tactics_run == [-1], sm107_tactics_run
 
     # Autotuning launches every tactic but only checks the one it picks, so also
     # run every SM107 tactic for this shape against the reference.
@@ -581,6 +589,89 @@ def test_mm_mxfp8_cute_dsl_sm107(m, n, k, auto_tuning, monkeypatch):
         out.zero_()
         runner(inputs, tactic=tactic)
         _assert_cosine_similarity(reference, out)
+
+
+@pytest.mark.parametrize(
+    "m,n,k", [(4, 6144, 1024), (129, 256, 4096), (2048, 256, 4096)]
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_mm_mxfp8_cute_dsl_quantize_pdl_cuda_graph(m, n, k, dtype):
+    """A PDL GEMM must consume this replay's quantized values and scales."""
+    _skip_if_unsupported("cute-dsl")
+
+    generator = torch.Generator(device="cuda").manual_seed(0)
+    x = torch.randn((m, k), device="cuda", dtype=dtype, generator=generator)
+    weight = torch.randn((n, k), device="cuda", dtype=dtype, generator=generator)
+    out = torch.empty((m, n), device="cuda", dtype=dtype)
+    reference = torch.empty_like(out)
+    torch.cuda.synchronize()
+    weight_q, weight_sf = mxfp8_quantize(
+        weight,
+        backend="cute-dsl",
+        enable_pdl=False,
+        sf_swizzle_layout=SfLayout.layout_128x4,
+    )
+    torch.cuda.synchronize()
+
+    def quantize(enable_pdl):
+        return mxfp8_quantize(
+            x,
+            backend="cute-dsl",
+            enable_pdl=enable_pdl,
+            sf_swizzle_layout=SfLayout.layout_128x4,
+        )
+
+    def gemm(x_q, x_sf, destination):
+        return mm_mxfp8(
+            x_q,
+            weight_q.T,
+            x_sf,
+            weight_sf,
+            out=destination,
+            out_dtype=dtype,
+            backend="cute-dsl",
+        )
+
+    # Use the same tactic for both paths, independent of earlier autotuning.
+    with autotune(False, skip_ops={"mxfp8_gemm"}):
+        warmup_q, warmup_sf = quantize(enable_pdl=True)
+        gemm(warmup_q, warmup_sf, out)
+        torch.cuda.synchronize()
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            graph_q, graph_sf = quantize(enable_pdl=True)
+            gemm(graph_q, graph_sf, out)
+
+        for magnitude in (0.125, 1.0, 8.0, 0.5) * 2:
+            x.normal_(generator=generator).mul_(magnitude)
+            # Isolate the quantizer-to-GEMM dependency from input preparation.
+            torch.cuda.synchronize()
+            reference_q, reference_sf = quantize(enable_pdl=False)
+            torch.cuda.synchronize()
+            gemm(reference_q, reference_sf, reference)
+            torch.cuda.synchronize()
+
+            # Unwritten buffers must not retain a valid result from a prior replay.
+            graph_q.view(torch.uint8).zero_()
+            graph_sf.zero_()
+            out.fill_(float("nan"))
+            torch.cuda.synchronize()
+            graph.replay()
+            torch.cuda.synchronize()
+
+            assert torch.isfinite(out).all(), "Output contains NaN/Inf values"
+            for actual, expected in (
+                (graph_q, reference_q),
+                (graph_sf, reference_sf),
+                (out, reference),
+            ):
+                torch.testing.assert_close(
+                    actual.view(torch.uint8),
+                    expected.view(torch.uint8),
+                    rtol=0,
+                    atol=0,
+                )
 
 
 def test_mm_mxfp8_cute_dsl_stale_split_k_tactic_falls_back():

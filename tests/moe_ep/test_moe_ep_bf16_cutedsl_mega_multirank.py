@@ -395,7 +395,7 @@ def _run_mega_torch_oracle(rank, world_size, *, in_kernel_fc2_reduce: bool = Fal
                 fc2_weight=_all_gather_stack(transformed_l2[0]),
                 ref_compute_graph="deepgemm",
                 gate_up_clamp=problem["gate_up_clamp"],
-                apply_topk_in_fc1=True,
+                apply_routing_weights_before_fc2=True,
             )
             yk = y_kernel.to(torch.float32)
             y_ref = combine_ref[rank].to(torch.float32).sum(dim=1)

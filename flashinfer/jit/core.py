@@ -1,15 +1,18 @@
 import abc
 import dataclasses
 import functools
+import json
 import logging
 import os
 import threading
+import time
 from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
 from typing import (
     Any,
     Callable,
+    ClassVar,
     Dict,
     Hashable,
     List,
@@ -103,6 +106,36 @@ class FlashInferJITLogger(logging.Logger):
 
 
 logger = FlashInferJITLogger("flashinfer.jit")
+
+
+def _record_jit_build(toolchain: str, name: str, seconds: float) -> None:
+    """Append one build's wall time to ``FLASHINFER_JIT_BUILD_LOG`` as JSONL.
+
+    Lets CI attribute compile time to each toolchain. A single ``O_APPEND``
+    write of one short line keeps concurrent test processes from
+    interleaving records. Builds that find everything up to date (ninja
+    no-ops) are recorded too; their near-zero times show up as such.
+    """
+    log_path = os.environ.get("FLASHINFER_JIT_BUILD_LOG")
+    if not log_path:
+        return
+    line = json.dumps(
+        {
+            "toolchain": toolchain,
+            "name": name,
+            "seconds": round(seconds, 3),
+            "pid": os.getpid(),
+            "time": round(time.time(), 3),
+        }
+    )
+    try:
+        fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        try:
+            os.write(fd, (line + "\n").encode())
+        finally:
+            os.close(fd)
+    except OSError as e:
+        logger.warning_once("Cannot write JIT build log %s: %s", log_path, str(e))
 
 
 def refresh_current_compilation_context() -> CompilationContext:
@@ -282,6 +315,8 @@ class JitSpec(abc.ABC):
     """
 
     name: str
+    # Label for build timing records (FLASHINFER_JIT_BUILD_LOG).
+    toolchain: ClassVar[str] = "unknown"
 
     @property
     @abc.abstractmethod
@@ -354,8 +389,13 @@ class JitSpec(abc.ABC):
                     spec=self,
                 )
 
-            self.build()
+            self._timed_build()
             return self.load()
+
+    def _timed_build(self) -> None:
+        started = time.perf_counter()
+        self.build()
+        _record_jit_build(self.toolchain, self.name, time.perf_counter() - started)
 
 
 class _HeterogeneousAOTModule:
@@ -443,6 +483,7 @@ class _HeterogeneousAOTModule:
 
 @dataclasses.dataclass
 class JitSpecNvcc(JitSpec):
+    toolchain: ClassVar[str] = "nvcc"
     name: str
     sources: List[Path]
     extra_cflags: Optional[List[str]]
@@ -571,7 +612,7 @@ class JitSpecNvcc(JitSpec):
 
     def _build_and_load_jit_fallback(self) -> Any:
         with FileLock(self.lock_path, thread_local=False):
-            self.build()
+            self._timed_build()
             return self.load()
 
     def build(self, verbose: Optional[bool] = None, need_lock: bool = False) -> None:
@@ -843,6 +884,7 @@ def build_jit_specs(
     if not lines:
         return
 
+    num_modules = len(lines)
     lines = ["ninja_required_version = 1.3"] + lines + [""]
 
     tmpdir = get_tmpdir()
@@ -850,6 +892,7 @@ def build_jit_specs(
         ninja_path = tmpdir / "flashinfer_jit.ninja"
         write_if_different(ninja_path, "\n".join(lines))
         prebuild_max_jobs = os.environ.get("FLASHINFER_JIT_PREBUILD_MAX_JOBS")
+        started = time.perf_counter()
         run_ninja(
             jit_env.FLASHINFER_JIT_DIR,
             ninja_path,
@@ -859,4 +902,9 @@ def build_jit_specs(
                 if prebuild_max_jobs is not None and prebuild_max_jobs.isdigit()
                 else None
             ),
+        )
+        _record_jit_build(
+            JitSpecNvcc.toolchain,
+            f"prebuild[{num_modules} modules]",
+            time.perf_counter() - started,
         )

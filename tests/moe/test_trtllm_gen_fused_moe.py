@@ -24,6 +24,7 @@ import pytest
 import torch
 
 from flashinfer.utils import get_compute_capability, is_sm100a_supported
+from flashinfer.quantization.nvfp4_quantization_utils import NVFP44Over6Config
 from flashinfer.fused_moe import (
     prims_ts_fp4_block_scale_moe,
     prims_ts_fp4_block_scale_routed_moe,
@@ -54,17 +55,12 @@ from tests.moe.trtllm_gen_fused_moe_utils import (
     trtllm_fp8_block_scale_routed_moe,
 )
 
-pytestmark = pytest.mark.long_running
+pytestmark = [pytest.mark.long_running, pytest.mark.host_memory_heavy]
 
 
 @pytest.fixture(scope="module")
 def cache_permute_indices():
     return {}
-
-
-def _skip_prims_ts_on_sm107() -> None:
-    if get_compute_capability(torch.device("cuda")) == (10, 7):
-        pytest.skip("Prims-TS MoE kernels support SM100 and SM103, not SM107")
 
 
 # Test: Sigmoid routing (Sigmoid -> TopK) and TopKSigmoid routing (TopK -> Sigmoid),
@@ -799,7 +795,6 @@ def test_mxfp4_moe_gemm_bias(
 )
 def test_fp4_moe_gemm_bias_prims_ts(bias, moe_impl, cache_permute_indices):
     """Test FP4-family Prims-TS MoE with FC1 and FC2 GEMM bias."""
-    _skip_prims_ts_on_sm107()
     num_tokens = 32
     hidden_size = 1024
     intermediate_size = 512
@@ -904,8 +899,8 @@ def test_fp4_prims_ts_routed_modes_match_logits(cache_permute_indices):
     from flashinfer.utils import device_support_pdl
 
     compute_capability = get_compute_capability(torch.device(device="cuda"))
-    if compute_capability[0] not in ((10, 0), (10, 3), (10, 7)):
-        pytest.skip("These tests require TRTLLM FP8 MoE on SM100, SM103, or SM107.")
+    if compute_capability not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("These tests require Prims-TS FP4 MoE on SM100, SM103, or SM107.")
     if not is_prims_ts_available():
         pytest.skip("Prims-TS dependencies are unavailable")
 
@@ -1044,7 +1039,6 @@ def test_fp4_prims_ts_routed_modes_match_logits(cache_permute_indices):
 
 def test_bf16_prims_ts_identity_activation(cache_permute_indices):
     """Smoke-test non-gated Identity activation through the Prims-TS MoE path."""
-    _skip_prims_ts_on_sm107()
     num_tokens = 32
     hidden_size = 1024
     intermediate_size = 512
@@ -1545,7 +1539,6 @@ def test_fp8_per_tensor_autotune_valid_configs_nonefp8(
 )
 def test_prims_ts_block_major_k_all_dtypes(moe_impl, cache_permute_indices):
     """Prims-TS accepts BlockMajorK weights for every supported MoE dtype."""
-    _skip_prims_ts_on_sm107()
     hidden_size = 1024
     intermediate_size = 512
     run_moe_test(
@@ -1583,6 +1576,56 @@ def test_prims_ts_block_major_k_all_dtypes(moe_impl, cache_permute_indices):
             "compatible_gemm_backends": [MoeGemmBackend.PRIMS_TS],
         },
         activation_type=ActivationType.Swiglu,
+        cache_permute_indices=cache_permute_indices,
+        routing_logits_dtype=torch.bfloat16,
+        moe_gemm_backend=MoeGemmBackend.PRIMS_TS,
+    )
+
+
+@pytest.mark.parametrize(
+    "moe_impl",
+    [
+        pytest.param(
+            FP4Moe(quant_mode=QuantMode.FP4_NVFP4_NVFP4),
+            id="NvFP4xNvFP4",
+        ),
+        pytest.param(
+            FP4Moe(quant_mode=QuantMode.FP4_MXFP4_MXFP8),
+            id="MxFP4xMxFP8",
+        ),
+    ],
+)
+def test_prims_ts_nemotron_ultra_relu2_block_scaled_fc1(
+    moe_impl, cache_permute_indices
+):
+    """Nemotron-Ultra-v3 ReLU² shape with a block-scaled FC1 output."""
+    intermediate_size = 1280
+    run_moe_test(
+        num_tokens=64,
+        hidden_size=2048,
+        intermediate_size=intermediate_size,
+        moe_impl=moe_impl,
+        routing_config={
+            "num_experts": 512,
+            "top_k": 22,
+            "padding": 8,
+            "n_groups": 1,
+            "top_k_groups": 1,
+            "routed_scaling": 2.5,
+            "has_routing_bias": True,
+            "routing_method_type": RoutingMethodType.DeepSeekV3,
+            "compatible_moe_impls": [FP4Moe],
+            "compatible_intermediate_size": [intermediate_size],
+            "compatible_activation_types": [ActivationType.Relu2],
+            "enable_autotune": False,
+        },
+        weight_processing={
+            "use_shuffled_weight": True,
+            "layout": WeightLayout.BlockMajorK,
+            "compatible_moe_impls": [FP4Moe],
+            "compatible_gemm_backends": [MoeGemmBackend.PRIMS_TS],
+        },
+        activation_type=ActivationType.Relu2,
         cache_permute_indices=cache_permute_indices,
         routing_logits_dtype=torch.bfloat16,
         moe_gemm_backend=MoeGemmBackend.PRIMS_TS,
@@ -3228,6 +3271,57 @@ def test_prims_ts_fp4_block_scale_moe_fused_shared_experts_reject_ep():
         prims_ts_fp4_block_scale_moe(
             **base_kwargs, local_expert_offset=0, local_num_experts=num_experts // 2
         )
+
+
+def test_fp4_block_scale_moe_pinned_4over6_requires_per_token_nvfp4():
+    """A pinned recipe off the per-token NVFP4 path is refused, not dropped.
+
+    Only the per-token NVFP4 kernel requantizes the GEMM2 input with a 4over6
+    variant: the standard path's GEMM1 epilogue emits NVFP4 directly, and the
+    MXFP8 per-token path requantizes to FP8. Host-side check, no GPU.
+    """
+    num_experts = 4
+    kwargs = {
+        "routing_logits": torch.empty((1, num_experts), dtype=torch.bfloat16),
+        "routing_bias": None,
+        "hidden_states": torch.empty((1, 2), dtype=torch.uint8),
+        "hidden_states_scale": torch.empty((1, 1), dtype=torch.float8_e4m3fn),
+        "gemm1_weights": torch.empty((num_experts, 2, 1), dtype=torch.uint8),
+        "gemm1_weights_scale": torch.empty(
+            (num_experts, 1, 1), dtype=torch.float8_e4m3fn
+        ),
+        "gemm1_bias": None,
+        "gemm1_alpha": None,
+        "gemm1_beta": None,
+        "gemm1_clamp_limit": None,
+        "gemm2_weights": torch.empty((num_experts, 1, 1), dtype=torch.uint8),
+        "gemm2_weights_scale": torch.empty(
+            (num_experts, 1, 1), dtype=torch.float8_e4m3fn
+        ),
+        "gemm2_bias": None,
+        "output1_scale_scalar": None,
+        "output1_scale_gate_scalar": None,
+        "output2_scale_scalar": None,
+        "num_experts": num_experts,
+        "top_k": 1,
+        "n_group": None,
+        "topk_group": None,
+        "intermediate_size": 1,
+        "local_expert_offset": 0,
+        "local_num_experts": num_experts,
+        "routed_scaling_factor": None,
+        "routing_method_type": RoutingMethodType.Renormalize.value,
+        "per_token_scale": None,
+    }
+    with pytest.raises(ValueError, match="per_token_scale"):
+        trtllm_fp4_block_scale_moe(**kwargs, nvfp4_4over6=NVFP44Over6Config())
+
+    # MXFP8 activations with per-token scales take the FP8 requantization,
+    # which never reads the recipe.
+    kwargs["hidden_states"] = torch.empty((1, 2), dtype=torch.float8_e4m3fn)
+    kwargs["per_token_scale"] = torch.ones((1,), dtype=torch.float32)
+    with pytest.raises(ValueError, match="uint8"):
+        trtllm_fp4_block_scale_moe(**kwargs, nvfp4_4over6=NVFP44Over6Config())
 
 
 def test_fused_shared_experts_reject_non_deepseek_routing():

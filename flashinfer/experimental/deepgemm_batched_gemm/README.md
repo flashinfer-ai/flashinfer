@@ -36,11 +36,27 @@ and without allocation. Tensor maps travel by value with every launch.
 Operand values may change in place between runs. Prepare a new plan if input
 scales change. Do not concurrently reuse one plan's output.
 
-Generated CUDA and bindings live in `csrc/experimental/deepgemm_batched_gemm/generated`
-(one `*_kernel.cu` / `*_binding.cu` pair per program; `PROGRAMS` and `ROUTES`
-in `batched_gemm.py` are the registry). The public API is
-`flashinfer/fp8_batched_gemm.py`; see `examples/experimental/fp8_batched_gemm.py`.
-Build/install FlashInfer with its supported CUDA toolchain before running:
+## Package layout
+
+The backend is a self-contained package. `cake_jit.py` is the registry of the
+generated programs: one `MODULES` record per program carrying the host plan
+(the architectures it is delivered for, its launch record, the argument plan of
+its `run` entry, the grid rule a launch follows and the kernel-parameter to
+logical-argument map), the `ROUTES` table from schedule key to program, and
+the loader glue (`launch_grid`, `launch_args`, `load`). What to compile is
+recorded once in `build.json`: the generated CUDA sources under `csrc/`, their
+digests and nvcc flags, one entry per (program, architecture). `cake_build.py`
+loads a prebuilt library from `aot/` when a builder compiled one and otherwise
+JIT-builds the manifest entry through FlashInfer from the same sources and
+flags. `scripts/check_cake_build_manifests.py` checks the manifest against the
+registry and the sources without importing the package. `DEEPGEMM_NOTICE.txt`
+at the package root carries the MIT notice of the DeepGEMM portions the
+generated kernels derive from.
+
+`batched_gemm.py` keeps the dispatcher (`route_config`, `schedule_key`) and the
+prepared plan; the public API is `flashinfer/fp8_batched_gemm.py`; see
+`examples/experimental/fp8_batched_gemm.py`. Build/install FlashInfer with its
+supported CUDA toolchain before running:
 
 ```bash
 python examples/experimental/fp8_batched_gemm.py
@@ -49,5 +65,6 @@ pytest tests/experimental/test_fp8_batched_gemm_generated.py -q
 
 The test covers the ten original routes and non-listed token counts of every
 exported schedule: FP8 output and scale bytes, BF16 values, runtime alpha,
-changed input values, graph replay, a non-default stream, and the
-`NotImplementedError` of an unexported schedule.
+changed input values, graph replay, a non-default stream, the
+`NotImplementedError` of an unexported schedule, the host plan of every
+registry record and the `build.json` contract.

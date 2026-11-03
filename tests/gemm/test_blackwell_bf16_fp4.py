@@ -8,7 +8,11 @@ import pytest
 import torch
 
 from flashinfer import mm_bf16_fp4, prepare_bf16_fp4_weights
-from flashinfer.gemm.gemm_bf16_fp4_blackwell import _cell_key, _select_route
+from flashinfer.gemm.gemm_bf16_fp4_blackwell import (
+    _cell_key,
+    _route_plan,
+    _select_route,
+)
 from flashinfer.jit.blackwell_bf16_fp4 import MODULES, ROUTES
 
 # Smallest M whose 16-row activation-tile count exceeds the CUDA Y grid limit.
@@ -432,7 +436,8 @@ def test_blackwell_bf16_fp4_planes_workspace_eviction(blackwell_device):
     """More distinct split-K planes workspaces than the host keeps cached (16) must evict cleanly and stay exact.
 
     M = 16, K = 4096 tiled rows take the eight-plane split cell, M = 17, K = 3072 rows the six-plane cell; every
-    (M, N, S) is a distinct workspace key, so 22 keys exercise the least-recently-used eviction path once.
+    (M, N, S) is a distinct workspace key, so 22 keys exercise the least-recently-used eviction path once.  The
+    calls run without PDL: the eight-plane cell's PDL programs reduce through a cluster and take no workspace.
     """
 
     backend = "blackwell-tiled"
@@ -454,7 +459,7 @@ def test_blackwell_bf16_fp4_planes_workspace_eviction(blackwell_device):
             )
             * 0.125
         )
-        actual = mm_bf16_fp4(a, *prepared, backend=backend)
+        actual = mm_bf16_fp4(a, *prepared, backend=backend, enable_pdl=False)
         torch.testing.assert_close(
             actual,
             _reference(a, reference_weights, None, torch.bfloat16),
@@ -462,7 +467,7 @@ def test_blackwell_bf16_fp4_planes_workspace_eviction(blackwell_device):
             rtol=1e-2,
         )
         # a second call with the same key must reuse the cached workspace and stay bitwise
-        again = mm_bf16_fp4(a, *prepared, backend=backend)
+        again = mm_bf16_fp4(a, *prepared, backend=backend, enable_pdl=False)
         torch.cuda.synchronize()
         assert torch.equal(actual, again)
 
@@ -476,7 +481,8 @@ def test_blackwell_bf16_fp4_planes_workspace_eviction(blackwell_device):
         pytest.param("blackwell-native", (768, 2112, 2048), id="native-m768"),
         pytest.param("blackwell-tiled", (7, 4160, 192), id="tiled-smk-m7"),
         pytest.param("blackwell-tiled", (13, 11008, 128), id="tiled-smk-m13"),
-        # smk split-K planes cells: the workspace (planes + zeroed counters) is captured with the launch.
+        # smk split-K cells: the eight-plane PDL program reduces through a (1, 1, 8) cluster; the six-plane
+        # program's workspace (planes + zeroed counters) is captured with the launch.
         pytest.param("blackwell-tiled", (1, 4096, 4096), id="tiled-smk-split-k4096"),
         pytest.param(
             "blackwell-tiled", (17, 3072, 3072), id="tiled-smk-split-m17-k3072"
@@ -786,3 +792,29 @@ def test_blackwell_bf16_fp4_route_table():
     """Every route names a registered program and every program is routed."""
 
     assert set(ROUTES.values()) == set(MODULES)
+
+
+def test_blackwell_bf16_fp4_split_workspace_follows_the_program():
+    """The split-K planes workspace is bound per routed program, from its ``MODULES`` record.
+
+    The eight-plane cell's PDL programs reduce through a (1, 1, 8) cluster and take no workspace; its non-PDL
+    programs keep the FP32 planes and the u32 completion counters.
+    """
+
+    for enable_pdl, cluster, workspace in (
+        (True, (1, 1, 8), None),
+        (False, (1, 1, 1), (8, 4096, "completion_u32", torch.uint32)),
+    ):
+        (spec,) = _route_plan(
+            16,
+            4096,
+            4096,
+            tiled=True,
+            output_bf16=True,
+            has_alpha=False,
+            enable_pdl=enable_pdl,
+            sm_count=ROUTE_SM_COUNT,
+        )
+        assert spec.cell == f"cute_smk_s2_p2_n2_m16_z8_bf16:alpha0:pdl{int(enable_pdl)}"
+        assert tuple(spec.cluster_dims) == cluster
+        assert spec.workspace == workspace

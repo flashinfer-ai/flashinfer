@@ -89,13 +89,6 @@ __device__ __forceinline__ float approx_rcp(float x) {
     return y;
 }
 
-
-__device__ __forceinline__ float max_noftz(float a, float b) {
-    float c;
-    asm("max.f32 %0, %1, %2;" : "=f"(c) : "f"(a), "f"(b));
-    return c;
-}
-
 extern "C" {
 
 __global__ __launch_bounds__(256) void
@@ -126,7 +119,7 @@ kernel_cake_kimi_k3_attn_res_65fea76173756111a940(__nv_bfloat16* __restrict__ ou
     float* output_norm_scalar = reinterpret_cast<float*>(smem_raw + 160);
     const int output_norm_scalar_addr = smem + 160;
 
-    // === Task calls (dependency order) ===
+    // === Task calls (declaration order) ===
     asm volatile("griddepcontrol.wait;" ::: "memory");
     unsigned long long row = (unsigned long long)bid;
     unsigned long long out_base = row * out_stride;
@@ -137,11 +130,8 @@ kernel_cake_kimi_k3_attn_res_65fea76173756111a940(__nv_bfloat16* __restrict__ ou
     for (int item = 0; item < 28; item++) {
         unsigned long long elem = (unsigned long long)tid + (unsigned long long)(item * 256);
         float updated = (float)prefix[prefix_base + elem];
-        __nv_bfloat16 _cvt_bf16_0 = (__nv_bfloat16)(updated + (float)delta[delta_base + elem]);
-        float _cvt_f32_0 = (float)_cvt_bf16_0;
-        updated = _cvt_f32_0;
-        __nv_bfloat16 _cvt_bf16_1 = (__nv_bfloat16)updated;
-        prefix[prefix_base + elem] = _cvt_bf16_1;
+        updated = (float)(__nv_bfloat16)(updated + (float)delta[delta_base + elem]);
+        prefix[prefix_base + elem] = (__nv_bfloat16)updated;
     }
     float mixed[28];
     #pragma unroll
@@ -200,8 +190,7 @@ kernel_cake_kimi_k3_attn_res_65fea76173756111a940(__nv_bfloat16* __restrict__ ou
         block_dot = _warp_reduce_3;
         if (warp == 0) {
             if (elect_sync()) {
-                float _rsqrt_0 = rsqrtf(block_sum_sq / 7168.0f + eps);
-                float inv_rms = _rsqrt_0;
+                float inv_rms = rsqrtf(block_sum_sq / 7168.0f + eps);
                 source_scores[source] = block_dot * inv_rms;
             }
         }
@@ -211,19 +200,16 @@ kernel_cake_kimi_k3_attn_res_65fea76173756111a940(__nv_bfloat16* __restrict__ ou
         float row_max = source_scores[0];
         #pragma unroll
         for (int source_1 = 1; source_1 < 9; source_1++) {
-            float _max_0 = max_noftz(row_max, source_scores[source_1]);
-            row_max = _max_0;
+            row_max = fmaxf(row_max, source_scores[source_1]);
         }
         float denominator = 0.0f;
         #pragma unroll
         for (int source_2 = 0; source_2 < 9; source_2++) {
-            float _exp_0 = expf(source_scores[source_2] - row_max);
-            float probability = _exp_0;
+            float probability = expf(source_scores[source_2] - row_max);
             source_probabilities[source_2] = probability;
             denominator += probability;
         }
-        float _rcp_0 = approx_rcp(denominator);
-        float denominator_rcp = _rcp_0;
+        float denominator_rcp = approx_rcp(denominator);
         #pragma unroll
         for (int source_3 = 0; source_3 < 9; source_3++) {
             source_probabilities[source_3] = source_probabilities[source_3] * denominator_rcp;
@@ -250,8 +236,7 @@ kernel_cake_kimi_k3_attn_res_65fea76173756111a940(__nv_bfloat16* __restrict__ ou
     #pragma unroll
     for (int item_5 = 0; item_5 < 28; item_5++) {
         unsigned long long elem_4 = (unsigned long long)tid + (unsigned long long)(item_5 * 256);
-        __nv_bfloat16 _cvt_bf16_2 = (__nv_bfloat16)mixed[item_5];
-        out[out_base + elem_4] = _cvt_bf16_2;
+        out[out_base + elem_4] = (__nv_bfloat16)mixed[item_5];
     }
 }
 

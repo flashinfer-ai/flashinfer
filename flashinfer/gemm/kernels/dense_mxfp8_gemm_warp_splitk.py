@@ -386,12 +386,16 @@ def validate_inputs(
     return m, n, k
 
 
+def _current_device_sm_count() -> int:
+    from ...utils import get_device_sm_count
+
+    return get_device_sm_count(_torch.device("cuda", _torch.cuda.current_device()))
+
+
 def default_tactic(m: int, n: int, k: int) -> MxFp8WarpSplitKTactic:
     k_tile = 256 if k <= 1024 or k % 512 else 512
     k_tile_count = k // k_tile
-    sm_count = _torch.cuda.get_device_properties(
-        _torch.cuda.current_device()
-    ).multi_processor_count
+    sm_count = _current_device_sm_count()
     output_tiles = tuple(tile for tile in _SUPPORTED_OUTPUT_TILES if n % tile == 0)
     if not output_tiles:
         raise ValueError(f"N={n} must be divisible by a supported output tile")

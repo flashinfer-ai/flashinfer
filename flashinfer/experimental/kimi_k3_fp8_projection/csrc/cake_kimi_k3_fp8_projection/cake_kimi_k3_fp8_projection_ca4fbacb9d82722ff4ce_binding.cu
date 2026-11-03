@@ -38,6 +38,11 @@
 #ifndef CAKE_PROGRAM_SHIM
 #define CAKE_PROGRAM_SHIM cake_host_shim_34c77ba8580a197e
 #endif
+// A program stating a preferred shared-memory carveout (percent) builds this file with
+// -DCAKE_SMEM_CARVEOUT=<percent>; every launch then carries it as a launch attribute.
+#ifndef CAKE_SMEM_CARVEOUT
+#define CAKE_SMEM_CARVEOUT -1
+#endif
 
 extern "C" __global__ void CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ x, uint8_t* __restrict__ a_q, uint8_t* __restrict__ a_sf, int M, int K, int units_per_row, int sf_k_sets, int sf_rows);
 
@@ -96,11 +101,16 @@ void Run(TensorView arg_x, TensorView arg_a_q, TensorView arg_a_sf, int64_t arg_
   dim3 block(128u, 1u, 1u);
 
   // Extended direct-source launch for a linked CUDA kernel symbol.
-  cudaLaunchAttribute attrs[1]{};
+  cudaLaunchAttribute attrs[2]{};
   int n = 0;
   attrs[n].id = cudaLaunchAttributeProgrammaticStreamSerialization;
   attrs[n].val.programmaticStreamSerializationAllowed = 1;
   ++n;
+  if (CAKE_SMEM_CARVEOUT >= 0) {
+    attrs[n].id = cudaLaunchAttributePreferredSharedMemoryCarveout;
+    attrs[n].val.sharedMemCarveout = CAKE_SMEM_CARVEOUT;
+    ++n;
+  }
   cudaLaunchConfig_t config{};
   config.gridDim = grid;
   config.blockDim = block;
@@ -173,11 +183,16 @@ inline void IssueReceipt(const LaunchReceipt* header, void** kargs, cudaStream_t
   dim3 block(128u, 1u, 1u);
 
   // Extended direct-source launch for a linked CUDA kernel symbol.
-  cudaLaunchAttribute attrs[1]{};
+  cudaLaunchAttribute attrs[2]{};
   int n = 0;
   attrs[n].id = cudaLaunchAttributeProgrammaticStreamSerialization;
   attrs[n].val.programmaticStreamSerializationAllowed = 1;
   ++n;
+  if (CAKE_SMEM_CARVEOUT >= 0) {
+    attrs[n].id = cudaLaunchAttributePreferredSharedMemoryCarveout;
+    attrs[n].val.sharedMemCarveout = CAKE_SMEM_CARVEOUT;
+    ++n;
+  }
   cudaLaunchConfig_t config{};
   config.gridDim = grid;
   config.blockDim = block;
