@@ -152,3 +152,11 @@ The recorded N2R2 passes execute every selected case and are not skip results.
 The default-off migration is complete within the fixed supported case.
 Broader topologies, precision/mode additions and performance promotion are
 separate work. No push, merge or publication was performed.
+
+## Subsequent Blackwell performance request
+
+The user subsequently requested Blackwell performance verification. That
+request supersedes the earlier local-performance waiver for this experiment.
+The predeclared matrix/protocol and live measurement record are in
+[performance-blackwell.md](performance-blackwell.md). Correctness results
+above are unchanged; they are not timing measurements.
