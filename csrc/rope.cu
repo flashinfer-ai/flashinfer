@@ -428,17 +428,18 @@ namespace {
 // per FP16/BF16 input vector, one per FP8 output vector), so every row it touches must start
 // on a 16-byte boundary; otherwise the launch fails with a sticky cudaErrorMisalignedAddress.
 // Padded rows are fine as long as their strides stay multiples of 16 bytes.
-void check_append_rows_16b_aligned(const TensorView& t, const char* name) {
+void check_append_rows_16b_aligned(const TensorView& t, const char* name,
+                                   const char* op = "rope_quantize_fp8_append_paged_kv_cache") {
   if (t.numel() == 0) {
     return;
   }
   const int64_t elem_size = get_element_size(t);
   TVM_FFI_CHECK(reinterpret_cast<uintptr_t>(t.data_ptr()) % 16 == 0, ValueError)
-      << "rope_quantize_fp8_append_paged_kv_cache: " << name << " must start on a 16-byte boundary";
+      << op << ": " << name << " must start on a 16-byte boundary";
   for (int i = 0; i + 1 < t.ndim(); ++i) {
     TVM_FFI_CHECK(t.size(i) <= 1 || (t.stride(i) * elem_size) % 16 == 0, ValueError)
-        << "rope_quantize_fp8_append_paged_kv_cache: " << name << ".stride(" << i << ") is "
-        << t.stride(i) * elem_size << " bytes, which is not a multiple of 16";
+        << op << ": " << name << ".stride(" << i << ") is " << t.stride(i) * elem_size
+        << " bytes, which is not a multiple of 16";
   }
 }
 
@@ -687,16 +688,19 @@ void rope_set_launch_override(int64_t two_heads, int64_t split) {
 }
 
 /*!
- * TVM FFI binding for fused RoPE + paged KV cache append kernel (GQA/MHA only).
+ * TVM FFI binding for fused RoPE + paged KV cache append without Q quantization (GQA/MHA).
+ *
+ * Q outputs keep the input dtype. The cache is either the input dtype or FP8; for an FP8
+ * cache K/V are stored as x * kv_scale, otherwise kv_scale is ignored. Dispatches to the
+ * same RopeQuantizeAppendPagedKVCache kernel as rope_quantize_append_paged_kv_cache.
  */
 void rope_append_paged_kv_cache(TensorView q_rope_in, TensorView k_rope_in, TensorView q_nope_in,
                                 TensorView k_nope_in, TensorView v_in, TensorView q_rope_out,
                                 TensorView q_nope_out, TensorView cos_sin_cache, TensorView pos_ids,
                                 TensorView k_cache, TensorView v_cache, TensorView kv_indices,
-                                TensorView kv_indptr, TensorView kv_last_page_len,
-                                TensorView batch_indices, TensorView positions,
-                                int64_t kv_layout_code, int64_t page_size, double kv_scale,
-                                bool interleave, bool enable_pdl) {
+                                TensorView kv_indptr, TensorView batch_indices,
+                                TensorView positions, int64_t kv_layout_code, int64_t page_size,
+                                double kv_scale, bool interleave, bool enable_pdl) {
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(q_rope_in);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(k_rope_in);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(q_nope_in);
@@ -706,13 +710,19 @@ void rope_append_paged_kv_cache(TensorView q_rope_in, TensorView k_rope_in, Tens
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(q_nope_out);
   CHECK_INPUT(cos_sin_cache);
   CHECK_INPUT(pos_ids);
-  CHECK_CUDA(k_cache);
-  CHECK_CUDA(v_cache);
+  // NOTE: paged caches don't have to be contiguous, only their last dim.
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(k_cache);
+  CHECK_LAST_DIM_CONTIGUOUS_INPUT(v_cache);
   CHECK_INPUT(kv_indices);
   CHECK_INPUT(kv_indptr);
-  CHECK_INPUT(kv_last_page_len);
   CHECK_INPUT(batch_indices);
   CHECK_INPUT(positions);
+  CHECK_DEVICE(k_cache, q_rope_in);
+  CHECK_DEVICE(v_cache, q_rope_in);
+  CHECK_DEVICE(kv_indices, q_rope_in);
+  CHECK_DEVICE(kv_indptr, q_rope_in);
+  CHECK_DEVICE(batch_indices, q_rope_in);
+  CHECK_DEVICE(positions, q_rope_in);
 
   CHECK_DIM(3, q_rope_in);
   CHECK_DIM(3, k_rope_in);
@@ -721,9 +731,14 @@ void rope_append_paged_kv_cache(TensorView q_rope_in, TensorView k_rope_in, Tens
   CHECK_DIM(3, v_in);
   CHECK_DIM(3, q_rope_out);
   CHECK_DIM(3, q_nope_out);
+  CHECK_DIM(2, cos_sin_cache);
+  CHECK_DIM(1, pos_ids);
   CHECK_DIM(4, k_cache);
   CHECK_DIM(4, v_cache);
-  CHECK_DIM(1, kv_last_page_len);
+  CHECK_DIM(1, kv_indices);
+  CHECK_DIM(1, kv_indptr);
+  CHECK_DIM(1, batch_indices);
+  CHECK_DIM(1, positions);
 
   uint32_t rope_dim = q_rope_in.size(-1);
   uint32_t no_rope_dim = q_nope_in.size(-1);
@@ -734,9 +749,14 @@ void rope_append_paged_kv_cache(TensorView q_rope_in, TensorView k_rope_in, Tens
   uint32_t batch_size = kv_indptr.size(0) - 1;
   QKVLayout kv_layout = QKVLayout(kv_layout_code);
 
+  // Q/K/V inputs and Q outputs
+  TVM_FFI_ICHECK_EQ(q_nope_in.size(0), nnz);
+  TVM_FFI_ICHECK_EQ(q_nope_in.size(1), num_qo_heads);
+  TVM_FFI_ICHECK_EQ(k_rope_in.size(0), nnz);
   TVM_FFI_ICHECK_EQ(k_rope_in.size(-1), rope_dim);
-  TVM_FFI_ICHECK_EQ(k_nope_in.size(-1), no_rope_dim);
+  TVM_FFI_ICHECK_EQ(k_nope_in.size(0), nnz);
   TVM_FFI_ICHECK_EQ(k_nope_in.size(1), num_kv_heads);
+  TVM_FFI_ICHECK_EQ(k_nope_in.size(-1), no_rope_dim);
   TVM_FFI_ICHECK_EQ(v_in.size(0), nnz);
   TVM_FFI_ICHECK_EQ(v_in.size(1), num_kv_heads);
   TVM_FFI_ICHECK_EQ(v_in.size(2), head_dim);
@@ -746,11 +766,31 @@ void rope_append_paged_kv_cache(TensorView q_rope_in, TensorView k_rope_in, Tens
   TVM_FFI_ICHECK_EQ(q_nope_out.size(0), nnz);
   TVM_FFI_ICHECK_EQ(q_nope_out.size(1), num_qo_heads);
   TVM_FFI_ICHECK_EQ(q_nope_out.size(2), no_rope_dim);
-  TVM_FFI_ICHECK_EQ(k_cache.size(0), v_cache.size(0));
-  TVM_FFI_ICHECK_EQ(k_cache.size(1), v_cache.size(1));
-  TVM_FFI_ICHECK_EQ(k_cache.size(2), v_cache.size(2));
-  TVM_FFI_ICHECK_EQ(k_cache.size(3), v_cache.size(3));
-  TVM_FFI_ICHECK_EQ(kv_last_page_len.size(0), batch_size);
+  TVM_FFI_ICHECK_EQ(cos_sin_cache.size(1), rope_dim)
+      << "cos_sin_cache last dim must equal rope_dim";
+
+  // Per-token metadata
+  TVM_FFI_ICHECK_EQ(pos_ids.size(0), nnz);
+  TVM_FFI_ICHECK_EQ(batch_indices.size(0), nnz);
+  TVM_FFI_ICHECK_EQ(positions.size(0), nnz);
+
+  // Paged cache: NHD is (num_pages, page_size, num_kv_heads, head_dim),
+  // HND is (num_pages, num_kv_heads, page_size, head_dim).
+  // K and V share page size, head count and head dim; their number of pages and strides may
+  // differ, as in rope_quantize_append_paged_kv_cache.
+  const int head_axis = kv_layout == QKVLayout::kHND ? 1 : 2;
+  const int page_axis = kv_layout == QKVLayout::kHND ? 2 : 1;
+  for (int i = 1; i < 4; ++i) {
+    TVM_FFI_ICHECK_EQ(v_cache.size(i), k_cache.size(i))
+        << "v_cache and k_cache must have the same shape except for dim 0 (num_pages); dim " << i
+        << " differs";
+  }
+  TVM_FFI_ICHECK_EQ(k_cache.size(head_axis), num_kv_heads)
+      << "k_cache head count does not match k_rope";
+  TVM_FFI_ICHECK_EQ(k_cache.size(page_axis), page_size)
+      << "k_cache page dimension does not match page_size";
+  TVM_FFI_ICHECK_EQ(k_cache.size(3), head_dim)
+      << "k_cache head_dim does not match rope_dim + no_rope_dim";
 
   TVM_FFI_ICHECK(q_rope_in.dtype() == dl_float16 || q_rope_in.dtype() == dl_bfloat16)
       << "Input dtype must be float16 or bfloat16";
@@ -761,9 +801,25 @@ void rope_append_paged_kv_cache(TensorView q_rope_in, TensorView k_rope_in, Tens
   TVM_FFI_ICHECK_EQ(q_rope_in.dtype(), q_rope_out.dtype());
   TVM_FFI_ICHECK_EQ(q_rope_in.dtype(), q_nope_out.dtype());
   TVM_FFI_ICHECK_EQ(k_cache.dtype(), v_cache.dtype());
-  TVM_FFI_ICHECK(k_cache.dtype() == dl_float16 || k_cache.dtype() == dl_bfloat16 ||
-                 k_cache.dtype() == dl_float8_e4m3fn || k_cache.dtype() == dl_float8_e5m2)
-      << "Cache dtype must be float16, bfloat16, float8_e4m3fn, or float8_e5m2";
+  const bool fp8_cache = k_cache.dtype() == dl_float8_e4m3fn || k_cache.dtype() == dl_float8_e5m2;
+  TVM_FFI_ICHECK(fp8_cache || k_cache.dtype() == q_rope_in.dtype())
+      << "Cache dtype must match the input dtype, or be float8_e4m3fn / float8_e5m2";
+
+  // Same 16-element vector constraints as rope_quantize_append_paged_kv_cache (shared kernel).
+  TVM_FFI_CHECK(rope_dim > 0 && rope_dim % 16 == 0 && no_rope_dim % 16 == 0, ValueError)
+      << "rope_append_paged_kv_cache requires rope_dim and no_rope_dim to be multiples of 16 "
+         "(and rope_dim > 0), got rope_dim="
+      << rope_dim << ", no_rope_dim=" << no_rope_dim;
+  constexpr const char* kOp = "rope_append_paged_kv_cache";
+  check_append_rows_16b_aligned(q_rope_in, "q_rope", kOp);
+  check_append_rows_16b_aligned(k_rope_in, "k_rope", kOp);
+  check_append_rows_16b_aligned(q_nope_in, "q_nope", kOp);
+  check_append_rows_16b_aligned(k_nope_in, "k_nope", kOp);
+  check_append_rows_16b_aligned(v_in, "v", kOp);
+  check_append_rows_16b_aligned(q_rope_out, "q_rope_out", kOp);
+  check_append_rows_16b_aligned(q_nope_out, "q_nope_out", kOp);
+  check_append_rows_16b_aligned(k_cache, "k_cache", kOp);
+  check_append_rows_16b_aligned(v_cache, "v_cache", kOp);
 
   const uint32_t q_rope_in_stride_n = q_rope_in.stride(0);
   const uint32_t q_rope_in_stride_h = q_rope_in.stride(1);
@@ -785,17 +841,20 @@ void rope_append_paged_kv_cache(TensorView q_rope_in, TensorView k_rope_in, Tens
 
   DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(q_rope_in.dtype(), c_type, [&] {
     return DISPATCH_DLPACK_IDTYPE_TO_CTYPE(pos_ids.dtype(), c_idtype, [&] {
-      auto launch = [&](auto cache_dtype_tag) -> bool {
+      auto launch = [&](auto cache_dtype_tag, float cache_scale) -> bool {
         using c_cache_type = decltype(cache_dtype_tag);
         auto k_strides = k_cache.strides();
+        auto v_strides = v_cache.strides();
         paged_kv_t<c_cache_type, int32_t> paged_kv(
             num_kv_heads, page_size, head_dim, batch_size, kv_layout,
             static_cast<c_cache_type*>(k_cache.data_ptr()),
-            static_cast<c_cache_type*>(v_cache.data_ptr()), k_strides.data(),
+            static_cast<c_cache_type*>(v_cache.data_ptr()), k_strides.data(), v_strides.data(),
             static_cast<int32_t*>(kv_indices.data_ptr()),
             static_cast<int32_t*>(kv_indptr.data_ptr()),
-            static_cast<int32_t*>(kv_last_page_len.data_ptr()));
-        cudaError_t status = RopeAppendPagedKVCache(
+            nullptr  // last_page_len not needed for this kernel
+        );
+        // Q is not quantized: write it in the input dtype with a unit scale.
+        cudaError_t status = RopeQuantizeAppendPagedKVCache(
             static_cast<c_type*>(q_rope_in.data_ptr()), static_cast<c_type*>(k_rope_in.data_ptr()),
             static_cast<c_type*>(q_nope_in.data_ptr()), static_cast<c_type*>(k_nope_in.data_ptr()),
             static_cast<c_type*>(v_in.data_ptr()), static_cast<c_type*>(q_rope_out.data_ptr()),
@@ -807,19 +866,21 @@ void rope_append_paged_kv_cache(TensorView q_rope_in, TensorView k_rope_in, Tens
             no_rope_dim, q_rope_in_stride_n, q_rope_in_stride_h, q_nope_in_stride_n,
             q_nope_in_stride_h, q_rope_out_stride_n, q_rope_out_stride_h, q_nope_out_stride_n,
             q_nope_out_stride_h, k_rope_in_stride, k_rope_in_stride_h, k_nope_in_stride,
-            k_nope_in_stride_h, v_in_stride, v_in_stride_h, kv_scale, interleave, enable_pdl,
-            stream);
+            k_nope_in_stride_h, v_in_stride, v_in_stride_h, /*quant_scale_q=*/1.f, cache_scale,
+            interleave, enable_pdl, stream);
         TVM_FFI_ICHECK(status == cudaSuccess)
-            << "RopeAppendPagedKVCache failed with error code " << cudaGetErrorString(status);
+            << "RopeQuantizeAppendPagedKVCache failed with error code "
+            << cudaGetErrorString(status);
         return true;
       };
 
-      if (k_cache.dtype() == dl_float16 || k_cache.dtype() == dl_bfloat16) {
-        return DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP16(k_cache.dtype(), c_cache_type,
-                                                   [&] { return launch(c_cache_type{}); });
+      if (!fp8_cache) {
+        // kv_scale only applies to FP8 caches.
+        return launch(c_type{}, 1.f);
       }
-      return DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP8(k_cache.dtype(), c_cache_type,
-                                                [&] { return launch(c_cache_type{}); });
+      return DISPATCH_DLPACK_DTYPE_TO_CTYPE_FP8(k_cache.dtype(), c_cache_type, [&] {
+        return launch(c_cache_type{}, static_cast<float>(kv_scale));
+      });
     });
   });
 }

@@ -1293,3 +1293,198 @@ rope_quantize_fp8_append_paged_kv_cache_trace = TraceTemplate(
     reference=_rope_quantize_fp8_append_paged_kv_cache_reference,
     init=_rope_quantize_fp8_append_paged_kv_cache_init,
 )
+
+
+# ── RoPE + append paged KV cache (no Q quantization) ─────────────────────────
+
+
+@torch.no_grad()
+def _rope_append_paged_kv_cache_reference(
+    q_rope,
+    k_rope,
+    q_nope,
+    k_nope,
+    v,
+    cos_sin_cache,
+    pos_ids,
+    paged_kv_cache,
+    kv_indices,
+    kv_indptr,
+    batch_indices,
+    positions,
+    is_neox: bool = True,
+    kv_scale: float = 1.0,
+    page_size: int = 16,
+    kv_layout: str = "NHD",
+    **_unused,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Reference for rope_append_paged_kv_cache (GQA/MHA).
+
+    Applies RoPE to the rotary halves in float32 and returns Q in the input
+    dtype. Writes K = [rotated k_rope ‖ k_nope] and V into
+    ``paged_kv_cache = (k_cache, v_cache)`` in place. An FP8 cache stores
+    ``x * kv_scale`` (saturating); other caches ignore ``kv_scale``. Tokens
+    with ``batch_indices < 0`` (CUDA graph padding) are skipped.
+    """
+    rotary_dim = cos_sin_cache.shape[-1]
+    idx = pos_ids.to(torch.long)
+    cos = cos_sin_cache[idx, : rotary_dim // 2].unsqueeze(1)
+    sin = cos_sin_cache[idx, rotary_dim // 2 :].unsqueeze(1)
+    interleave = not is_neox
+    q_rope_rot = _rotate(q_rope.to(torch.float32), cos, sin, interleave)
+    k_rope_rot = _rotate(k_rope.to(torch.float32), cos, sin, interleave)
+
+    nnz, num_q_heads = q_rope.shape[:2]
+    if q_nope is None:
+        q_nope = q_rope.new_empty(nnz, num_q_heads, 0)
+    if k_nope is None:
+        k_nope = k_rope.new_empty(nnz, k_rope.shape[1], 0)
+
+    k_cache, v_cache = paged_kv_cache
+    k_full = torch.cat([k_rope_rot, k_nope.to(torch.float32)], dim=-1)
+    v_full = v.to(torch.float32)
+    if k_cache.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+        bound = torch.finfo(k_cache.dtype).max
+        k_full = (k_full * float(kv_scale)).clamp(-bound, bound)
+        v_full = (v_full * float(kv_scale)).clamp(-bound, bound)
+    k_full = k_full.to(k_cache.dtype)
+    v_full = v_full.to(v_cache.dtype)
+    for i in range(batch_indices.shape[0]):
+        b = int(batch_indices[i].item())
+        if b < 0:
+            continue
+        pos = int(positions[i].item())
+        page_id = int(kv_indices[int(kv_indptr[b].item()) + pos // page_size].item())
+        entry = pos % page_size
+        if kv_layout == "NHD":
+            k_cache[page_id, entry] = k_full[i]
+            v_cache[page_id, entry] = v_full[i]
+        else:  # HND
+            k_cache[page_id, :, entry] = k_full[i]
+            v_cache[page_id, :, entry] = v_full[i]
+    return q_rope_rot.to(q_rope.dtype), q_nope.clone()
+
+
+_rope_append_paged_kv_cache_reference._trace_reference_dependencies = (  # type: ignore[attr-defined]
+    _rotate,
+)
+
+
+def _rope_append_paged_kv_cache_init(
+    *,
+    nnz: int,
+    num_q_heads: int = 8,
+    num_k_heads: int = 2,
+    rope_dim: int = 64,
+    no_rope_dim: int = 64,
+    head_dim: int = 0,  # derived: rope_dim + no_rope_dim
+    max_seq_len: int = 4096,
+    rotary_dim: int = 64,
+    num_pages: int = 4,
+    page_size: int = 16,
+    batch_size: int = 2,
+    batch_size_plus_1: int = 0,  # derived
+    num_kv_indices: int = 0,  # derived
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build inputs for ``rope_append_paged_kv_cache``.
+
+    Same GQA bundle as ``rope_quantize_fp8_append_paged_kv_cache``, with a
+    bf16 (input-dtype) paged cache instead of an FP8 one.
+    """
+    inputs = _rope_quantize_fp8_append_paged_kv_cache_init(
+        nnz=nnz,
+        num_q_heads=num_q_heads,
+        num_k_heads=num_k_heads,
+        rope_dim=rope_dim,
+        no_rope_dim=no_rope_dim,
+        head_dim=head_dim,
+        max_seq_len=max_seq_len,
+        rotary_dim=rotary_dim,
+        num_pages=num_pages,
+        page_size=page_size,
+        batch_size=batch_size,
+        batch_size_plus_1=batch_size_plus_1,
+        num_kv_indices=num_kv_indices,
+        device=device,
+        seed=seed,
+    )
+    k_cache, v_cache = inputs["paged_kv_cache"]
+    inputs["paged_kv_cache"] = (
+        torch.zeros_like(k_cache, dtype=torch.bfloat16),
+        torch.zeros_like(v_cache, dtype=torch.bfloat16),
+    )
+    return inputs
+
+
+_rope_append_paged_kv_cache_init._trace_init_dependencies = (  # type: ignore[attr-defined]
+    _rope_quantize_fp8_append_paged_kv_cache_init,
+)
+
+
+rope_append_paged_kv_cache_trace = TraceTemplate(
+    op_type="rope",
+    name_prefix="rope_append_paged_kv_cache",
+    description=(
+        "Fused RoPE + append-K/V-to-paged-KV-cache without Q quantization "
+        "(GQA/MHA). Returns rotated Q in the input dtype and writes K "
+        "(rotary part first) and V into the provided paged cache, which is "
+        "either the input dtype or FP8; an FP8 cache stores x * kv_scale."
+    ),
+    axes={
+        "nnz": Var(description="Total number of tokens across the batch."),
+        "num_q_heads": Const(abbrev="h"),
+        "num_k_heads": Const(abbrev="kv"),
+        "rope_dim": Const(abbrev="rope"),
+        "no_rope_dim": Var(),
+        "head_dim": Var(description="Full KV head_dim (rope + nope)."),
+        "max_seq_len": Var(),
+        "rotary_dim": Const(abbrev=""),
+        "num_pages": Var(),
+        "page_size": Const(abbrev="ps"),
+        "batch_size": Var(),
+        "batch_size_plus_1": Var(),
+        "num_kv_indices": Var(),
+    },
+    inputs={
+        "q_rope": Tensor(["nnz", "num_q_heads", "rope_dim"]),
+        "k_rope": Tensor(["nnz", "num_k_heads", "rope_dim"]),
+        "q_nope": Tensor(["nnz", "num_q_heads", "no_rope_dim"], optional=True),
+        "k_nope": Tensor(["nnz", "num_k_heads", "no_rope_dim"], optional=True),
+        "v": Tensor(["nnz", "num_k_heads", "head_dim"]),
+        "cos_sin_cache": Tensor(["max_seq_len", "rotary_dim"], dtype="float32"),
+        "pos_ids": Tensor(["nnz"], dtype="int32"),
+        "k_cache": Tensor(
+            ["num_pages", "page_size", "num_k_heads", "head_dim"],
+            param="paged_kv_cache",
+            tuple_idx=0,
+            description="Paged K cache from the paged_kv_cache tuple.",
+        ),
+        "v_cache": Tensor(
+            ["num_pages", "page_size", "num_k_heads", "head_dim"],
+            param="paged_kv_cache",
+            tuple_idx=1,
+            description="Paged V cache from the paged_kv_cache tuple.",
+        ),
+        "kv_indices": Tensor(["num_kv_indices"], dtype="int32"),
+        "kv_indptr": Tensor(["batch_size_plus_1"], dtype="int32"),
+        "batch_indices": Tensor(["nnz"], dtype="int32"),
+        "positions": Tensor(["nnz"], dtype="int32"),
+        "is_neox": Scalar("int32", optional=True),
+        "kv_scale": Scalar(
+            "float32",
+            optional=True,
+            description="FP8 cache only: stored value is x * kv_scale.",
+        ),
+    },
+    outputs={
+        "q_rope_out": Tensor(["nnz", "num_q_heads", "rope_dim"], dtype_from="q_rope"),
+        "q_nope_out": Tensor(
+            ["nnz", "num_q_heads", "no_rope_dim"], dtype_from="q_rope"
+        ),
+    },
+    tags=["status:verified", "fused"],
+    reference=_rope_append_paged_kv_cache_reference,
+    init=_rope_append_paged_kv_cache_init,
+)
