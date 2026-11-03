@@ -267,8 +267,8 @@ def chunk_gdn_fwd_kcp(
         Keyword-only options (``save_mode`` ``"light"`` | ``"full"``, ``boundary_mode`` ``"saved"`` | ``"replay"``,
         ``exchange`` ``"a2a"`` | ``"ring"``, ``save_transfer``, ``offset_class`` ``"fla"`` | ``"fp32"``, ``layout`` ``"tma"`` |
         ``"copy"``, ``group_reduce`` ``"fused"`` | ``"host"``, ``graph`` ``"off"`` | ``"replay"``,
-        ``reuse_recompute_tapes`` ``"auto"`` (default) | ``True`` | ``False`` (``False`` with ``graph="replay"``; see
-        :func:`chunk_gdn_kcp`),
+        ``reuse_recompute_tapes`` ``"auto"`` (default) | ``True`` | ``False`` (the deterministic route: ``False`` with
+        ``graph="replay"``; see :func:`chunk_gdn_kcp`),
         ``recompute_output`` ``"auto"`` | ``"always"`` (an autograd-node switch; this forward-only entry never skips a
         launch), ...).
 
@@ -425,8 +425,10 @@ def chunk_gdn_kcp(
     ``recompute_output``) and takes the replay form otherwise -- a region this node closes keeps today's speed and
     memory; ``True`` always keeps them, ``False`` never (the replay form).  One kept set is
     live at a time: in a checkpoint segment holding several GDN layers only the last layer skips the replay (the
-    earlier layers replay as before).  Not available with ``graph="replay"``: there the default resolves to
-    ``False`` and an explicit ``True`` / ``"auto"`` is refused.
+    earlier layers replay as before).  On the deterministic route it is not available with ``graph="replay"`` (the
+    default resolves to ``False`` and an explicit ``True`` / ``"auto"`` is refused); on the non-deterministic route a
+    caller-held workspace keeps its own tapes under ``graph="replay"`` and the backward binds them only while the
+    workspace made no other call in between (else the replay form).
 
     ``recompute_output`` (keyword-only, ``"auto"`` default | ``"always"``): torch's recompute of a checkpointed
     forward returns nothing, so when this node is the last operation of the checkpointed region that saves a tensor,
