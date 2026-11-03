@@ -1119,7 +1119,7 @@ class MSAIcpLayerGraphs:
         self._staging: dict[tuple, torch.Tensor] = {}
         self._pool: Any = None
         self._stream: Optional[torch.cuda.Stream] = None
-        self.stats = collections.Counter()
+        self.stats: collections.Counter[str] = collections.Counter()
 
     def begin_step(
         self,
