@@ -63,10 +63,26 @@ def test_inference_grid_covers_uniform_phase_launches(kind):
         == 32
     )
     depth = 256 if kind in ("nvfp4", "mxfp4") else 128
-    assert {c["mma_tiler_mnk"] for c in candidates[:16]} == {
-        (256, 128, depth),
-        (256, 256, depth),
-    }
+    expected_prefix = [
+        (tile, cluster, epi, bulk)
+        for tile in ((256, 128, depth), (256, 256, depth))
+        for cluster, epi in (
+            ((2, 1), (1, 4)),
+            ((2, 1), (2, 4)),
+            ((4, 1), (1, 4)),
+            ((4, 1), (2, 4)),
+        )
+        for bulk in (False, True)
+    ]
+    assert [
+        (
+            c["mma_tiler_mnk"],
+            c["cluster_shape_mn"],
+            c["epi_flag_batches"],
+            c["fc2_use_bulk"],
+        )
+        for c in candidates[:16]
+    ] == expected_prefix
     added = candidates[16:]
     assert {c["mma_tiler_mnk"] for c in added} == {
         (256, 64, depth),
