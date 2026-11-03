@@ -10,9 +10,11 @@ DeepInfer calls it for DeepSeek-V4.1-Flash) against the unfused two-kernel path
 used on SM12x today: a cuBLAS BF16 GEMM with FP32 logits followed by b12x's
 Triton ``route_topk`` (sqrt-softplus, bias, renormalized top-k; it has no
 physical map, which only favors the baseline). The cuBLAS GEMM alone is
-reported as well. Timing uses a cold L2 between iterations (every layer has its
-own gate weight), with CUPTI under ``--cupti`` (cupti-python >= 13) and CUDA
-events otherwise.
+reported as well. The unfused time is the sum of its two kernels' times, as they
+run back to back in a CUDA graph: timing the pair as one call would also count
+the CPU launch gap before the Triton kernel. Timing uses a cold L2 between
+iterations (every layer has its own gate weight), with CUPTI under ``--cupti``
+(cupti-python >= 13) and CUDA events otherwise.
 
 Usage::
 
@@ -72,18 +74,6 @@ def load_triton_route_topk():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module.route_topk
-
-
-def unfused_gate(x, weight, bias, route_topk, buffers, scale):
-    """cuBLAS GEMM with FP32 logits, then the Triton sqrt-softplus top-k router."""
-    route_topk(
-        fp32_logits(x, weight),
-        *buffers,
-        renormalize=True,
-        score_func="sqrtsoftplus",
-        correction_bias=bias,
-        routed_scaling_factor=scale,
-    )
 
 
 def median_us(fn, use_cupti):
@@ -164,10 +154,19 @@ def main():
                 ),
                 torch.empty((num_tokens, args.num_topk), device="cuda"),
             )
-            unfused = median_us(
-                lambda: unfused_gate(x, weight, bias, route_topk, buffers, args.scale),
+            logits = fp32_logits(x, weight)
+            top_k = median_us(
+                lambda: route_topk(
+                    logits,
+                    *buffers,
+                    renormalize=True,
+                    score_func="sqrtsoftplus",
+                    correction_bias=bias,
+                    routed_scaling_factor=args.scale,
+                ),
                 args.cupti,
             )
+            unfused = gemm + top_k
             row += f" {gemm:>9.2f} {unfused:>10.2f} {unfused / fused:>7.2f}x"
         print(row)
 
