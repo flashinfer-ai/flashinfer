@@ -433,6 +433,12 @@ def test_batch_decode_tensor_cores_batch_composition(
     assert torch.equal(lse_batched[:1], lse_alone)
 
 
+_TILE_RULE_XFAIL = pytest.mark.xfail(
+    reason="FA2 picks cta_tile_q from the batch-average query length (#2424)",
+    strict=True,
+)
+
+
 @pytest.mark.parametrize("qo_len", [37])
 @pytest.mark.parametrize("kv_len", [3000])
 @pytest.mark.parametrize(
@@ -442,10 +448,7 @@ def test_batch_decode_tensor_cores_batch_composition(
             [1] * 16,
             [500] * 16,
             id="decode_mates",
-            marks=pytest.mark.xfail(
-                reason="FA2 picks cta_tile_q from the batch-average query length (#2424)",
-                strict=True,
-            ),
+            marks=_TILE_RULE_XFAIL,
         ),
         pytest.param([64] * 8, [800] * 8, id="mid_mates"),
         pytest.param([1500] * 3, [1500] * 3, id="long_prefill_mates"),
@@ -484,10 +487,6 @@ def test_batch_prefill_tensor_cores_batch_composition(
     assert torch.equal(lse_batched[:qo_len], lse_alone)
 
 
-_TILE_RULE_XFAIL = pytest.mark.xfail(
-    reason="FA2 picks cta_tile_q from the batch-average query length (#2424)",
-    strict=True,
-)
 _UNALIGNED_PREFIX_XFAIL = pytest.mark.xfail(
     reason="isolated rows differ by one ulp on SM100 when the cached prefix length is not a multiple of 128",
     strict=False,
