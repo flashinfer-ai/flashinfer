@@ -1769,7 +1769,12 @@ def _simt_values(
     """The keyword arguments of a launch of the SIMT program (ordered by the program's argument plan): ``A`` the
     activations (the streamed operand's span, ``[1, K, M]``), ``B`` the output gradient ``[K, N]`` (the split source
     of the stream-K programs) and ``out`` the transposed product ``[N, M]``, read in place through their row strides
-    ``lda`` / ``ldb`` / ``ldo``; ``enable_pdl`` is the launch's PDL flag (0 or 1)."""
+    ``lda`` / ``ldb`` / ``ldo``.  The program never launches as a programmatic dependent launch, whatever the call's
+    PDL flag (``enable_pdl`` is accepted and ignored): its CTAs, launched early next to a running predecessor, would be
+    placed only on the SMs that predecessor leaves free, several per SM, and finish later than spread over every SM
+    once it ends (on 152-SM GB200 parts the backward pass, input and weight gradient, at hidden 5120 and 6144 and 192
+    and 256 tokens was 12 to 16 % slower in CUDA graphs than with the program launched after its predecessor)."""
+    del enable_pdl
     return dict(
         A=A,
         B=B,
@@ -1780,7 +1785,7 @@ def _simt_values(
         lda=plan.lda,
         ldb=plan.ldb,
         ldo=int(ldo),
-        enable_pdl=enable_pdl,
+        enable_pdl=0,
     )
 
 

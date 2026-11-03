@@ -2456,7 +2456,7 @@ def test_k2_values_feed_every_registered_router_program():
     """The keyword arguments of a K2 launch name every argument of every registered stream-K router program's
     argument plan (the head/tail program's ``head_spans`` / ``head_steps`` included); those of a SIMT launch every
     argument of every registered SIMT program's plan, the operands' row strides and the launch flag before the
-    grid."""
+    grid, 0 whatever the call's PDL flag (the SIMT program never launches as a programmatic dependent launch)."""
     out = torch.zeros(256, 5120)
     plan = cake_backend.AtomicRouterPlan(
         M=5120, N=256, K=16231, a_mn=True, b_mn=True, swapped=True, layout="nn_t", m_tiles=40,
@@ -2481,6 +2481,9 @@ def test_k2_values_feed_every_registered_router_program():
     simt_values = cake_backend._simt_values(
         simt_plan, A="x", B="g", out="o", ldo=5120, enable_pdl=1
     )
+    assert simt_values == cake_backend._simt_values(
+        simt_plan, A="x", B="g", out="o", ldo=5120, enable_pdl=0
+    )
     for name, record in cake_jit.MODULES.items():
         if not record["template"].startswith(simt_prefix):
             continue
@@ -2502,7 +2505,7 @@ def test_k2_values_feed_every_registered_router_program():
             5120,
             256,
             5120,
-            1,
+            0,
             80,
             4,
             1,
@@ -5327,9 +5330,9 @@ def test_gpu_router_simt_program_replays_in_a_cuda_graph(router_rule, tile):
 
 
 def test_gpu_router_simt_program_waits_for_an_early_producer(router_rule):
-    """The SIMT program as a programmatic dependent launch: the forward writes ``Y``, the input gradient reads it and
-    writes ``dX``, the weight gradient in a SIMT window reads both; it starts while its predecessor runs and must
-    still read every value it wrote, with every PDL flag and the same bits."""
+    """The SIMT program behind programmatic dependent launches: the forward writes ``Y``, the input gradient reads it
+    and writes ``dX`` (both launched early under PDL), the weight gradient in a SIMT window reads both; launched after
+    its predecessor whatever the PDL flag, it reads every value they wrote, with every PDL flag and the same bits."""
     device, arch = _atomic_device_or_skip()
     tile = next(
         (
