@@ -23,8 +23,9 @@ rank-order sum of the quantised partials and bitwise identical on every rank.
 World size 2 runs a one-shot exchange; world size 4 a two-shot exchange whose
 owner ranks (``row % 4``) reduce, re-encode and all-gather, in one of three
 phase-B schedules chosen per call from the rows each CTA owns.  The
-``rmsnorm`` family (world size 2) fuses the one-shot exchange with the
-residual add and a Gemma RMSNorm: ``z = sum + residual`` in float32,
+``rmsnorm`` family fuses the exchange (world size 2: the one-shot; world
+size 4: the two-shot, bfloat16 input and output) with the residual add and an
+RMSNorm (Gemma's with ``weight_bias = 1``): ``z = sum + residual`` in float32,
 ``residual_out = bf16(z)``, ``rinv = rsqrt(mean(z^2) + eps)`` from the float32
 sum of squares, ``y = bf16(z) * rinv * (weight_bias + weight)`` written as
 bfloat16 or quantised to NVFP4 / MXFP8 in the layouts of ``fp4_quantize`` /
@@ -42,11 +43,11 @@ Usage protocol::
     # 3. Destroy collectively after the last launch completed
     workspace.destroy()
 
-Requirements: two or four ranks (two for ``rmsnorm``) on one node with CUDA
+Requirements: two or four ranks on one node with CUDA
 IPC peer access, SM100 (B200), SM103 (B300) or SM107 devices with the same SM count
 that are build targets of this process (``FLASHINFER_CUDA_ARCH_LIST`` when
 set, else the visible devices), hidden size 6144, contiguous tensors on the
-workspace device and ``rows <= capacity`` (a multiple of 4 for world size 4).
+workspace device and ``1 <= rows <= capacity`` (any row count).
 A call allocates nothing when every output buffer is given and performs no
 host synchronisation, so it can be captured into a CUDA graph.
 """
@@ -237,10 +238,6 @@ def _check_capacity(capacity: int, family: str, world_size: int) -> int:
     return capacity
 
 
-def _row_multiple(world_size: int) -> int:
-    return int(LIMITS["tp4_row_multiple"]) if int(world_size) == 4 else 1
-
-
 def _as_int32(word: int) -> int:
     return word - (1 << 32) if word >= (1 << 31) else word
 
@@ -262,9 +259,9 @@ class CakeFp4AllReduceWorkspace:
 
     Every rank of ``group`` constructs one instance with the same ``family``,
     ``input_format`` and ``capacity``.  ``family`` is ``"allreduce"`` (world
-    size 2 or 4; the sum of the partials) or ``"rmsnorm"`` (world size 2; the
-    sum fused with the residual add and the RMSNorm, any output format per
-    call); ``input_format`` is ``"bf16"`` (activations) or ``"nvfp4"``
+    size 2 or 4; the sum of the partials) or ``"rmsnorm"`` (the sum fused with
+    the residual add and the RMSNorm: world size 2 with any output format per
+    call, world size 4 with bfloat16 input and output); ``input_format`` is ``"bf16"`` (activations) or ``"nvfp4"``
     (pre-quantised records).  ``capacity`` is the largest row count a call may
     carry (at most 103000 for world size 4).  The receive windows are shared
     through CUDA IPC, armed with their Lamport sentinels and published in the
@@ -299,7 +296,6 @@ class CakeFp4AllReduceWorkspace:
         self.family = family
         self.input_format = input_format
         self.capacity = _check_capacity(capacity, family, self.world_size)
-        self.row_multiple = _row_multiple(self.world_size)
         device = torch.device(torch.cuda.current_device() if device is None else device)
         if device.type != "cuda":
             raise ValueError(f"the workspace needs a CUDA device, got {device}")
@@ -432,11 +428,6 @@ def _check_workspace(
 def _check_rows(rows: int, workspace: CakeFp4AllReduceWorkspace) -> None:
     if rows < 1 or rows > workspace.capacity:
         raise ValueError(f"rows must be in [1, {workspace.capacity}], got {rows}")
-    if rows % workspace.row_multiple:
-        raise ValueError(
-            f"world size {workspace.world_size} needs rows to be a multiple of "
-            f"{workspace.row_multiple}, got {rows}"
-        )
 
 
 def _check_activation(
@@ -567,8 +558,7 @@ def cake_fp4_allreduce(
     ----------
     x : torch.Tensor
         Contiguous bfloat16 ``[rows, 6144]`` partial of this rank; ``rows`` is
-        at most ``workspace.capacity``, a multiple of 4 for world size 4, and
-        the same on every rank of the call.
+        at most ``workspace.capacity`` and the same on every rank of the call.
     workspace : CakeFp4AllReduceWorkspace
         The collective workspace of the group (family ``"allreduce"``, input
         format ``"bf16"``).

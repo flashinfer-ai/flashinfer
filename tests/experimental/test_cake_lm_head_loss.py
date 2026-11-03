@@ -1394,60 +1394,77 @@ def test_hidden_count_state_is_per_thread():
 def test_hidden_count_arange_records_each_stream_once(monkeypatch):
     """The count constant is recorded once per stream it is used on, again on a new stream, and afresh after it grew
     (a fresh thread on its own stream: its own constant); ``record_stream`` runs once per recorded stream, and the
-    grown constant keeps its values."""
+    grown constant keeps its values.  The counter keeps only the test thread's ``record_stream`` calls, and a mutant
+    that records the constant on every call (each call sees a new raw stream handle) fails the first check."""
     if not torch.cuda.is_available():
         pytest.skip("the count constant needs a CUDA device")
-    records: list[int] = []
+    records: list[tuple[int, int]] = []
     record_stream = torch.Tensor.record_stream
 
     def counting(self, stream):
-        records.append(stream.cuda_stream)
+        records.append((threading.get_ident(), stream.cuda_stream))
         return record_stream(self, stream)
 
     monkeypatch.setattr(torch.Tensor, "record_stream", counting)
     index = torch.cuda.current_device()
-    got = {}
-    errors: list[BaseException] = []
 
-    def run():
-        try:
-            with (
-                torch.cuda.device(index),
-                torch.cuda.stream(torch.cuda.Stream(index)),
-            ):
-                main = torch.cuda.current_stream(index).cuda_stream
-                recorded = cake_backend._thread_state("arange_streams")
-                ar = cake_backend._hidden_count_arange(index, 8)
-                cake_backend._hidden_count_arange(index, 8)
-                got["one"] = (len(recorded[index]), list(records))
-                side = torch.cuda.Stream(index)
-                with torch.cuda.stream(side):
-                    assert cake_backend._hidden_count_arange(index, 8) is ar
+    def scenario():
+        got = {}
+        errors: list[BaseException] = []
+        records.clear()  # a finished thread's identifier can be reused
+
+        def run():
+            me = threading.get_ident()
+
+            def mine():
+                return [stream for ident, stream in records if ident == me]
+
+            try:
+                with (
+                    torch.cuda.device(index),
+                    torch.cuda.stream(torch.cuda.Stream(index)),
+                ):
+                    main = torch.cuda.current_stream(index).cuda_stream
+                    recorded = cake_backend._thread_state("arange_streams")
+                    ar = cake_backend._hidden_count_arange(index, 8)
                     cake_backend._hidden_count_arange(index, 8)
-                assert cake_backend._hidden_count_arange(index, 8) is ar
-                got["two"] = (len(recorded[index]), list(records))
-                grown = cake_backend._hidden_count_arange(index, 2 * ar.numel() + 1)
-                got["grown"] = (grown is not ar, len(recorded[index]), list(records))
-                got["values"] = torch.equal(
-                    grown.cpu(),
-                    torch.arange(1, grown.numel() + 1, dtype=torch.int32),
-                )
-                got["streams"] = (main, side.cuda_stream)
-        except BaseException as exc:  # noqa: BLE001 -- re-raised by the main thread
-            errors.append(exc)
+                    got["one"] = (len(recorded[index]), mine())
+                    side = torch.cuda.Stream(index)
+                    with torch.cuda.stream(side):
+                        assert cake_backend._hidden_count_arange(index, 8) is ar
+                        cake_backend._hidden_count_arange(index, 8)
+                    assert cake_backend._hidden_count_arange(index, 8) is ar
+                    got["two"] = (len(recorded[index]), mine())
+                    grown = cake_backend._hidden_count_arange(index, 2 * ar.numel() + 1)
+                    got["grown"] = (grown is not ar, len(recorded[index]), mine())
+                    got["values"] = torch.equal(
+                        grown.cpu(),
+                        torch.arange(1, grown.numel() + 1, dtype=torch.int32),
+                    )
+                    got["streams"] = (main, side.cuda_stream)
+            except BaseException as exc:  # noqa: BLE001 -- re-raised by the main thread
+                errors.append(exc)
 
-    thread = threading.Thread(target=run)
-    thread.start()
-    thread.join(120)
-    assert not thread.is_alive(), "the thread did not finish"
-    torch.cuda.synchronize()
-    if errors:
-        raise errors[0]
+        thread = threading.Thread(target=run)
+        thread.start()
+        thread.join(120)
+        assert not thread.is_alive(), "the thread did not finish"
+        torch.cuda.synchronize()
+        if errors:
+            raise errors[0]
+        return got
+
+    got = scenario()
     main, side = got["streams"]
     assert got["one"] == (1, [main])
     assert got["two"] == (2, [main, side])
     assert got["grown"] == (True, 1, [main, side, main])
     assert got["values"]
+    # the mutant: every call sees a new raw stream handle, so the constant is recorded on every call
+    monkeypatch.setattr(cake_backend, "_current_raw_stream", lambda index: object())
+    mutant = scenario()
+    assert mutant["one"] != (1, [mutant["streams"][0]])
+    assert mutant["one"][1] == [mutant["streams"][0]] * 2
 
 
 @pytest.mark.parametrize("module", ["backend", "opt_in"])
@@ -6531,7 +6548,7 @@ def test_device_zero_dlogp_partition_kernel_is_the_reference(T, chunk, kind):
     ``zero_dlogp_partition_reference``'s outputs bit for bit -- the order, the reordered ``lse``, the ``[T]`` scan and the
     per-chunk counts (at least one in the first chunk) -- over random, 512-row group, all-zero, single-live,
     last-chunk-live and no-zero gradients, with signed zeros, NaN gradients (live on a valid row, ignored rows
-    included) and NaN statistics among them."""
+    included) and NaN statistics among them; the first call binds the launch, the second runs the remembered one."""
     _require_zero_dlogp_skip()
     module_name, _record = cake_backend.record_for(CUDA)
     assert cake_backend.ZERO_DLOGP_PARTITION_STAGE in cake_jit.registered_stages(
@@ -6558,21 +6575,187 @@ def test_device_zero_dlogp_partition_kernel_is_the_reference(T, chunk, kind):
         launched.append(stage)
         return original(record, module_name, stage, *args, **kwargs)
 
+    cake_backend.BINDING_CACHE.clear()
     cake_backend._eager_launch = recording
     try:
-        got = cake_backend.zero_dlogp_partition(labels, dlogp, index, lse, chunk)
+        runs = [
+            cake_backend.zero_dlogp_partition(labels, dlogp, index, lse, chunk)
+            for _ in range(2)
+        ]
     finally:
         cake_backend._eager_launch = original
     assert launched == [cake_backend.ZERO_DLOGP_PARTITION_STAGE]
     want = cake_backend.zero_dlogp_partition_reference(labels, dlogp, index, lse, chunk)
     torch.cuda.synchronize()
+    for got in runs:
+        _assert_partition_is(got, want)
+        assert int(got[3][0]) >= 1
+
+
+def _assert_partition_is(got, want):
+    """``got`` (the partition's four outputs) equals ``want`` (the reference's) bit for bit, dtype, shape and device."""
     for name, g, w in zip(
         ("row_index", "lse", "scan", "counts"), got, want, strict=True
     ):
         assert g.dtype == w.dtype and g.shape == w.shape and g.device == w.device, name
         same = _same_bits(g, w) if g.is_floating_point() else torch.equal(g, w)
         assert same, name
-    assert int(got[3][0]) >= 1
+
+
+def _partition_inputs(T, seed, zero_frac=0.3):
+    """Partition inputs of ``T`` rows on the device: ``(labels, dlogp, row_index, lse)`` with about 10 % ignored rows
+    and ``zero_frac`` of the rows of a zero ``dlogp``."""
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(seed)
+    labels = torch.randint(0, 1000, (T,), generator=gen)
+    labels[torch.rand(T, generator=gen) < 0.1] = -100
+    dlogp = torch.randn(T, generator=gen)
+    dlogp[torch.rand(T, generator=gen) < zero_frac] = 0.0
+    labels, dlogp = labels.to(CUDA), dlogp.to(CUDA)
+    index = (labels >= 0).nonzero().squeeze(1)
+    lse = torch.randn(int(index.numel()), generator=gen).to(CUDA)
+    return labels, dlogp, index, lse
+
+
+def test_device_zero_dlogp_partition_remembers_its_launch(monkeypatch):
+    """The partition resolves the device's record once (no ``record_for`` per call), binds its launch once per
+    ``(device, T, chunk)`` form while ``BINDING_CACHE`` is enabled (a later call of the form slots its tensors into the
+    remembered launch: no binding, the same bits), binds again for another form and on every call with the cache
+    disabled, and returns its four outputs as disjoint, aligned views of one allocation."""
+    _require_zero_dlogp_skip()
+    stage = cake_backend.ZERO_DLOGP_PARTITION_STAGE
+    binds, resolved = [], []
+    eager_launch, record_for = cake_backend._eager_launch, cake_backend.record_for
+
+    def recording(record, module_name, name, *args, **kwargs):
+        binds.append(name)
+        return eager_launch(record, module_name, name, *args, **kwargs)
+
+    def counting(*args, **kwargs):
+        resolved.append(args)
+        return record_for(*args, **kwargs)
+
+    monkeypatch.setattr(cake_backend, "_eager_launch", recording)
+    monkeypatch.setattr(cake_backend, "record_for", counting)
+    monkeypatch.setattr(cake_backend, "_SKIP_RECORDS", {})
+    cake_backend.BINDING_CACHE.clear()
+    a, b = _partition_inputs(9001, SEED + 1), _partition_inputs(12289, SEED + 2)
+
+    def check(args, chunk):
+        got = cake_backend.zero_dlogp_partition(*args, chunk)
+        _assert_partition_is(
+            got, cake_backend.zero_dlogp_partition_reference(*args, chunk)
+        )
+        return got
+
+    got = check(a, 4096)
+    assert binds == [stage] and len(resolved) == 1
+    spans = sorted(
+        (t.data_ptr(), t.data_ptr() + t.numel() * t.element_size()) for t in got
+    )
+    assert len({t.untyped_storage().data_ptr() for t in got}) == 1
+    assert all(t.data_ptr() % cake_backend.WORKSPACE_ALIGN == 0 for t in got)
+    assert all(e <= s for (_, e), (s, _) in zip(spans, spans[1:], strict=False))
+    for _ in range(3):
+        check(a, 4096)
+    assert binds == [stage]
+    check(b, 4096)
+    check(a, 1024)
+    check(a, 4096)
+    check(b, 4096)
+    assert binds == [stage] * 3
+    cake_backend.BINDING_CACHE.configure(enabled=False)
+    try:
+        check(a, 4096)
+        check(a, 4096)
+    finally:
+        cake_backend.BINDING_CACHE.configure(enabled=True)
+    assert binds == [stage] * 5 and len(resolved) == 1
+    torch.cuda.synchronize()
+
+
+def test_device_zero_dlogp_partition_concurrent_threads(monkeypatch):
+    """Threads that run the partition at once, each on its own stream -- resolving the device's record and binding the
+    launch together, on the same and on different forms, while another thread clears the binding cache between their
+    calls -- all get the reference's bits."""
+    _require_zero_dlogp_skip()
+    monkeypatch.setattr(cake_backend, "_SKIP_RECORDS", {})
+    cake_backend.BINDING_CACHE.clear()
+    index = torch.cuda.current_device()
+    cases = [
+        _partition_inputs(T, SEED + i) for i, T in enumerate((4097, 9001, 9001, 12289))
+    ]
+    torch.cuda.synchronize()
+    errors: list[BaseException] = []
+    done = threading.Event()
+    start = threading.Barrier(len(cases) + 1)
+
+    def worker(args):
+        try:
+            with (
+                torch.cuda.device(index),
+                torch.cuda.stream(torch.cuda.Stream(index)),
+            ):
+                start.wait(60)
+                runs = [
+                    cake_backend.zero_dlogp_partition(*args, 4096) for _ in range(16)
+                ]
+                want = cake_backend.zero_dlogp_partition_reference(*args, 4096)
+                torch.cuda.current_stream(index).synchronize()
+                for got in runs:
+                    _assert_partition_is(got, want)
+        except BaseException as exc:  # noqa: BLE001 -- re-raised by the main thread
+            errors.append(exc)
+
+    def clearer():
+        start.wait(60)
+        while not done.is_set():
+            cake_backend.BINDING_CACHE.clear()
+            time.sleep(0.0005)
+
+    threads = [threading.Thread(target=worker, args=(c,)) for c in cases]
+    other = threading.Thread(target=clearer)
+    for t in threads + [other]:
+        t.start()
+    for t in threads:
+        t.join(120)
+    done.set()
+    other.join(60)
+    assert not any(t.is_alive() for t in threads + [other]), "a thread did not finish"
+    torch.cuda.synchronize()
+    if errors:
+        raise errors[0]
+
+
+@pytest.mark.parametrize("remembered", (False, True), ids=("binds", "remembered"))
+def test_device_zero_dlogp_partition_cuda_graph(remembered, monkeypatch):
+    """The partition captured in a CUDA graph -- binding its launch and resolving the device's record inside the capture
+    (both forgotten after an eager warm-up that loaded the program) or slotting its tensors into the remembered launch
+    -- replays with other ``dlogp`` values written into the captured input (random, every and no row zero) and gives the
+    reference's bits for them."""
+    _require_zero_dlogp_skip()
+    labels, dlogp, index, lse = _partition_inputs(12289, SEED + 3)
+    cake_backend.zero_dlogp_partition(labels, dlogp, index, lse, 4096)
+    torch.cuda.synchronize()
+    if not remembered:
+        cake_backend.BINDING_CACHE.clear()
+        monkeypatch.setattr(cake_backend, "_SKIP_RECORDS", {})
+    static = dlogp.clone()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        got = cake_backend.zero_dlogp_partition(labels, static, index, lse, 4096)
+    gen = torch.Generator(device="cpu")
+    gen.manual_seed(SEED + 4)
+    for frac in (0.166, 1.0, 0.0):
+        new = torch.randn(static.numel(), generator=gen)
+        new[torch.rand(static.numel(), generator=gen) < frac] = 0.0
+        static.copy_(new.to(CUDA))
+        graph.replay()
+        want = cake_backend.zero_dlogp_partition_reference(
+            labels, static, index, lse, 4096
+        )
+        torch.cuda.synchronize()
+        _assert_partition_is(got, want)
 
 
 def test_zero_dlogp_floor_switch():
@@ -6594,7 +6777,7 @@ def test_zero_dlogp_floor_switch():
 
 def test_dcnt_stage_names_round_trip():
     """The ``_dcnt`` forms: the dz arm, the K-sliced dX reduction (not its swapped tile; the one-slice plain store has
-    none), the weight-gradient accumulate (plain and blocked) and the bf16 fused cast (not its TMA store); every
+    none), the weight-gradient accumulate (plain and blocked) and the bf16 fused cast (its TMA store too); every
     registered ``_dcnt`` name parses back to its base and knobs."""
     sv = cake_backend.stage_variant
     assert sv("gemm_logits_dz", dcnt=True) == cake_backend.LOGPROB_DZ_DCNT_STAGE
@@ -6605,9 +6788,13 @@ def test_dcnt_stage_names_round_trip():
     )
     assert sv("gemm_dw_acc", blocked=True, dcnt=True) == "gemm_dw_acc_gn_dcnt"
     assert sv("gemm_dw_cast_bf16", dcnt=True) == "gemm_dw_cast_bf16_dcnt"
+    assert (
+        sv("gemm_dw_cast_bf16", epi_store="tma", dcnt=True)
+        == cake_backend.DW_CAST_TMA_DCNT_STAGE
+        == "gemm_dw_cast_bf16_tma_dcnt"
+    )
     for base, kw in (
         ("gemm_dx_red", dict(swab=True)),
-        ("gemm_dw_cast_bf16", dict(epi_store="tma")),
         ("gemm_dw_acc", dict(epi_store="tma")),
         ("gemm_dx", {}),
         ("gemm_logits", {}),
@@ -6617,7 +6804,7 @@ def test_dcnt_stage_names_round_trip():
     assert cake_backend.dx_stage(1, dcnt=True) == "gemm_dx"
     assert cake_backend.dx_stage(3, dcnt=True) == "gemm_dx_red_dcnt"
     counted = [stage for stage in cake_jit.STAGES if stage.endswith("_dcnt")]
-    assert len(counted) == 9
+    assert len(counted) == 10
     for stage in counted:
         base, knobs = cake_backend.parse_stage(stage)
         assert base in cake_backend.DCNT_BASES and knobs["dcnt"]
@@ -6652,8 +6839,7 @@ def test_plan_runs_the_counted_forms():
         plain = cake_backend.make_plan(problem, valid_rows=12000, **kw)
         plan = cake_backend.make_plan(problem, valid_rows=12000, dcnt=True, **kw)
         if any(
-            v.dx_swab or v.dw_epi_store not in (None, "redsm") or v.dw_cast_tma
-            for v in plan.variants
+            v.dx_swab or v.dw_epi_store not in (None, "redsm") for v in plan.variants
         ):
             assert not plan.dcnt and plan.stages == plain.stages
             continue
@@ -6694,10 +6880,11 @@ def test_plan_runs_the_counted_forms():
 
 def test_plan_counts_the_short_last_chunk_of_a_long_call():
     """A log-probability call whose last chunk takes the TMA-epilogue bf16 cast in the shipped plan (61779 valid rows:
-    fifteen chunks of 4096 and one of 339, the T = 65031 timing row) keeps the counted forms: its counted plan casts
-    the last chunk through the counted shipped cast, every other chunk's forms unchanged, and no chunk takes the
-    swapped dX tile (the swap rule serves the cross-entropy loss only).  An explicitly pinned weight-gradient TMA
-    epilogue, or swapped dX tile, keeps the shipped plan."""
+    fifteen chunks of 4096 and one of 339, the T = 65031 timing row) keeps the counted forms: its counted plan runs the
+    shipped plan's chunk forms, the last chunk's cast through the TMA cast's counted form, and no chunk takes the
+    swapped dX tile (the swap rule serves the cross-entropy loss only); with ``counted_tma_cast`` off (a record without
+    that form) it casts the last chunk through the counted shipped cast, every other chunk's forms unchanged.  An
+    explicitly pinned weight-gradient TMA epilogue, or swapped dX tile, keeps the shipped plan."""
     g = cake_backend.Geometry.from_record(
         {"geometry": {"hidden": 6144, "vocab": 154880}}
     )
@@ -6718,28 +6905,40 @@ def test_plan_counts_the_short_last_chunk_of_a_long_call():
         kw = dict(common, arch=arch)
         plain = cake_backend.make_plan(problem, valid_rows=rows, **kw)
         plan = cake_backend.make_plan(problem, valid_rows=rows, dcnt=True, **kw)
+        old = cake_backend.make_plan(
+            problem, valid_rows=rows, dcnt=True, counted_tma_cast=False, **kw
+        )
         assert plain.num_chunks == 16 and plain.chunks[-1] == (15 * 4096, 339)
         assert not plain.dcnt and plain.variants[-1].dw_cast_tma
         assert plain.dw_cast_stage == "gemm_dw_cast_bf16_tma"
-        assert plan.dcnt, arch
-        assert plan.chunks == plain.chunks and plan.dx_slices == plain.dx_slices
+        assert plan.dcnt and old.dcnt, arch
         assert not any(v.dx_swab or v.dw_cast_tma for v in plain.variants[:-1])
-        assert not any(v.dx_swab or v.dw_cast_tma for v in plan.variants)
-        assert plan.variants[:-1] == plain.variants[:-1]
+        assert not any(v.dx_swab for v in plan.variants)
+        assert plan.variants == plain.variants
+        assert plan.dw_cast_stage == cake_backend.DW_CAST_TMA_DCNT_STAGE
+        assert {s.removesuffix("_dcnt") for s in plan.stages} == set(plain.stages)
+        assert old.variants[:-1] == plain.variants[:-1]
         assert (
-            dataclasses.replace(plan.variants[-1], dw_cast_tma=True)
+            dataclasses.replace(old.variants[-1], dw_cast_tma=True)
             == plain.variants[-1]
         )
-        assert plan.dw_cast_stage == "gemm_dw_cast_bf16_dcnt"
-        for i in range(plan.num_chunks):
-            assert plan.recompute_stage(i) == "gemm_logits_dz_dcnt"
-            assert plan.dx_stage_of(i).endswith("_dcnt") == (
-                plan.dx_slices_of(i) > 1
-            ), plan.dx_stage_of(i)
-        assert all(s.endswith("_dcnt") for s in plan.stages if s.startswith("gemm_dw"))
-        assert {s.removesuffix("_dcnt") for s in plan.stages} == (
+        assert old.dw_cast_stage == "gemm_dw_cast_bf16_dcnt"
+        assert {s.removesuffix("_dcnt") for s in old.stages} == (
             set(plain.stages) - {"gemm_dw_cast_bf16_tma"}
         ) | {"gemm_dw_cast_bf16"}
+        for counted_plan in (plan, old):
+            assert counted_plan.chunks == plain.chunks
+            assert counted_plan.dx_slices == plain.dx_slices
+            for i in range(counted_plan.num_chunks):
+                assert counted_plan.recompute_stage(i) == "gemm_logits_dz_dcnt"
+                assert counted_plan.dx_stage_of(i).endswith("_dcnt") == (
+                    counted_plan.dx_slices_of(i) > 1
+                ), counted_plan.dx_stage_of(i)
+            assert all(
+                s.endswith("_dcnt")
+                for s in counted_plan.stages
+                if s.startswith("gemm_dw")
+            )
         pins = [{"dw": {"epi_store": "tma"}}]
         if arch in cake_backend.DX_SWAB_ARCHES:
             pins.append({"dx": {"swap_ab": True, "tile_n": 512}})
@@ -6950,8 +7149,8 @@ def test_device_zero_dlogp_short_last_chunk_keeps_the_counted_cast(
 ):
     """A backward whose last chunk the shipped plan casts through the TMA-epilogue bf16 cast (two chunks, the second of
     about 650 rows) keeps the skip: the partition runs (binding and remembered binding), the remembered plan casts the
-    last chunk through the counted shipped cast, and the results pass the skip suite's checks against the backward
-    without the skip and the FP64 oracle."""
+    last chunk through the TMA cast's counted form where the record registers it (else the counted shipped cast), and
+    the results pass the skip suite's checks against the backward without the skip and the FP64 oracle."""
     _require_zero_dlogp_skip()
     _module_name, record = cake_backend.record_for(CUDA)
     base = _device_inputs(5000, "ce", W=glm_weight)
@@ -6981,7 +7180,12 @@ def test_device_zero_dlogp_short_last_chunk_keeps_the_counted_cast(
     assert shipped.dw_cast_stage == (
         "gemm_dw_cast_bf16_tma" if tma else "gemm_dw_cast_bf16"
     )
-    assert skip_plan.dw_cast_stage == "gemm_dw_cast_bf16_dcnt"
+    stages = cake_jit.registered_stages(_module_name)
+    assert skip_plan.dw_cast_stage == (
+        cake_backend.DW_CAST_TMA_DCNT_STAGE
+        if tma and cake_backend.DW_CAST_TMA_DCNT_STAGE in stages
+        else "gemm_dw_cast_bf16_dcnt"
+    )
     live = valid & ~zero
     assert _same_bits(nd["logp"], plain["logp"])
     scale = float(plain["dX"][live].float().abs().max())
@@ -6992,6 +7196,72 @@ def test_device_zero_dlogp_short_last_chunk_keeps_the_counted_cast(
         )
         assert dx_diff <= scale * 2**-7, (dx_diff, scale)
         _check_against_references(run, inp, entry="logprob", ceiling=True)
+
+
+@pytest.mark.parametrize("last", [650, 1792, 1793])
+def test_device_zero_dlogp_short_last_chunk_cast_bits_without_zero_rows(
+    glm_weight, monkeypatch, last
+):
+    """Without zero-gradient rows (z = 0) a two-chunk backward under the skip gives the bits of the backward without
+    it: the partition runs, every row stays live, and ``dW`` and ``logp`` are bitwise those of the skip-off run.  One
+    ignored row makes the call compacted (the skip needs the forward's row index).  A last chunk of 650 or 1792 valid
+    rows (``dw_cast_tma_rule`` holds) casts through the TMA cast's counted form ``gemm_dw_cast_bf16_tma_dcnt``; 1793
+    rows (one row above the rule's bound, the negative control) takes the counted per-thread cast, as the plan without
+    the skip takes the per-thread cast."""
+    _require_zero_dlogp_skip()
+    module_name, record = cake_backend.record_for(CUDA)
+    rows = cake_backend.DEFAULT_CHUNK_SIZE + last
+    inp = _device_inputs(rows + 1, "ce", W=glm_weight, ignore_frac=0.0)
+    labels = inp.labels.clone()
+    # one ignored row: a compacted call of ``rows`` valid rows
+    labels[rows // 2] = -100
+    dlogp = inp.dlogp
+    inp = dataclasses.replace(
+        inp,
+        labels=labels,
+        dlogp=torch.where(dlogp == 0, torch.ones_like(dlogp), dlogp).contiguous(),
+    )
+    valid = inp.labels >= 0
+    assert int(valid.sum()) == rows and bool((inp.dlogp[valid] != 0).all())
+    partition = cake_backend.zero_dlogp_partition
+    calls = []
+
+    def counted(*args, **kwargs):
+        calls.append(int(args[2].numel()))
+        return partition(*args, **kwargs)
+
+    cake_backend.BINDING_CACHE.clear()
+    monkeypatch.setattr(cake_backend, "zero_dlogp_partition", counted)
+    with _zero_dlogp_floor(0):
+        nd = _logprob_call(inp)
+    with _zero_dlogp_floor(None):
+        plain = _logprob_call(inp)
+    assert calls == [rows]
+    (skip_plan, _), (shipped, _) = _logprob_bwd_plans()
+    assert skip_plan.dcnt and not shipped.dcnt
+    assert skip_plan.num_chunks == 2 and skip_plan.chunks[-1][1] == last
+    tma = cake_backend.dw_cast_tma_rule(2, last, record["arch"])
+    assert tma == (last <= cake_backend.DW_CAST_TMA_MAX_ROWS[record["arch"]])
+    assert shipped.dw_cast_stage == (
+        "gemm_dw_cast_bf16_tma" if tma else "gemm_dw_cast_bf16"
+    )
+    if tma:
+        stages = cake_jit.registered_stages(module_name)
+        assert cake_backend.DW_CAST_TMA_DCNT_STAGE in stages
+        assert skip_plan.dw_cast_stage == cake_backend.DW_CAST_TMA_DCNT_STAGE
+    else:
+        assert skip_plan.dw_cast_stage == "gemm_dw_cast_bf16_dcnt"
+    for key in ("logp", "dW"):
+        assert _same_bits(nd[key], plain[key]), key
+    assert not bool(_bits(nd["dX"][~valid]).any())
+    scale = float(plain["dX"].float().abs().max())
+    dx_diff = float((nd["dX"].float() - plain["dX"].float()).abs().max())
+    assert dx_diff <= scale * 2**-7, (dx_diff, scale)
+    print(
+        f"\nzero-dlogp skip on {record['arch']}, z = 0, last chunk {last} rows: "
+        f"cast {skip_plan.dw_cast_stage} (skip off: {shipped.dw_cast_stage}); "
+        f"dW and logp bitwise equal, max |dX - skip off| {dx_diff:.3g}"
+    )
 
 
 def test_device_zero_dlogp_default_floor_is_one_row_above_a_chunk(

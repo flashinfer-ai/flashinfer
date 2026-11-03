@@ -47,9 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define THREADS 256
-
 #include <math_constants.h>
 
 __device__ __forceinline__ float max_noftz(float a, float b) {
