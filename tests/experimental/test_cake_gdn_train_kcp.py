@@ -1451,7 +1451,7 @@ def _saved_formula(ctx, H_qk, HV, save_mode, boundary_mode, save_transfer, C) ->
         if save_transfer:
             total += ctx.N_out * 2 * hp.Hg_pad_by_rank[ctx.rank] * gp.STATE_TILE_BYTES
         if (save_transfer or save_mode == "full") and hp.P > 1:
-            total += (hp.P - 1) * ctx.n_frag * s
+            total += hp.P * ctx.n_frag * s
     if (
         save_mode == "full"
     ):  # every forward tape: h, v_new / w / u, Aqk / Akk, gamma, gcum / rowscale / qscale
@@ -2838,18 +2838,18 @@ def test_full_backward_without_save_transfer_reads_no_unwritten_plane(
     )
     assert saved is not None and saved.P == 2 and saved.c1_recv is None
     assert saved.M_seg is not None and torch.isfinite(saved.M_seg).all()
-    assert (
-        gb.gdn_saved_layout_kcp(
-            ctx,
-            H_qk=H_qk,
-            HV=HV,
-            save_mode="full",
-            save_transfer=False,
-            P=2,
-            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-        )["M_seg"]
-        == (2 - 1) * ctx.n_frag * HV * gp.STATE_TILE_BYTES
-    )
+    m_seg_bytes = gb.gdn_saved_layout_kcp(
+        ctx,
+        H_qk=H_qk,
+        HV=HV,
+        save_mode="full",
+        save_transfer=False,
+        P=2,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+    )["M_seg"]
+    # the query counts the saved plane itself: NSEG = n_frag P states
+    assert m_seg_bytes == 2 * ctx.n_frag * HV * gp.STATE_TILE_BYTES
+    assert m_seg_bytes == saved.M_seg.numel() * saved.M_seg.element_size()
     # an older full saved set without M_seg would read an unwritten plane: refused
     with pytest.raises(ValueError, match="needs M_seg"):
         kcp.chunk_gdn_bwd_kcp(
