@@ -1005,6 +1005,61 @@ def test_layernorm(batch_size, hidden_size, dtype):
     torch.testing.assert_close(out, out_ref, rtol=1e-2, atol=1e-2)
 
 
+@pytest.mark.parametrize(
+    "hidden_size,row_padding,input_offset,weight_offset,broadcast",
+    [
+        pytest.param(128, 0, 0, 0, False, id="dense"),
+        pytest.param(128, 128, 0, 0, False, id="padded"),
+        pytest.param(128, 136, 8, 0, False, id="padded_offset"),
+        pytest.param(128, 1, 0, 0, False, id="odd_stride"),
+        pytest.param(128, 1, 1, 0, False, id="unaligned_input"),
+        pytest.param(128, 16, 0, 1, False, id="unaligned_weights"),
+        pytest.param(129, 129, 0, 0, False, id="odd_hidden"),
+        pytest.param(128, 0, 0, 0, True, id="broadcast"),
+        pytest.param(24576, 16, 0, 0, False, id="large_shared"),
+        pytest.param(None, 2, 0, 0, False, id="no_shared_memory"),
+    ],
+)
+def test_layernorm_cuda_row_stride(
+    hidden_size, row_padding, input_offset, weight_offset, broadcast, monkeypatch
+):
+    monkeypatch.setattr(flashinfer.norm, "_USE_CUDA_NORM", True)
+    if hidden_size is None:
+        # Exceed even the opt-in limit so the kernel must reread global input.
+        max_smem = torch.cuda.get_device_properties(0).shared_memory_per_block_optin
+        hidden_size = 2 * (max_smem // 4 + 1)
+
+    torch.manual_seed(0)
+    batch_size, eps = 3, 1e-6
+    storage = torch.full(
+        (batch_size, hidden_size + row_padding + input_offset),
+        7.0,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    rows = storage[:, input_offset : input_offset + hidden_size]
+    rows.copy_(torch.randn_like(rows))
+    # Retain storage for all rows even in the broadcast case: a broken dense
+    # read then stays inside the allocation and fails the numerical comparison.
+    x = rows[:1].expand(batch_size, -1) if broadcast else rows
+    storage_before = storage.clone()
+    gamma = torch.randn(hidden_size + weight_offset, device="cuda")[weight_offset:]
+    beta = torch.randn(hidden_size + weight_offset, device="cuda")[weight_offset:]
+
+    x64 = x.double()
+    centered = x64 - x64.mean(dim=-1, keepdim=True)
+    out_ref = (
+        centered
+        * torch.rsqrt(centered.square().mean(dim=-1, keepdim=True) + eps)
+        * gamma.double()
+        + beta.double()
+    ).to(x.dtype)
+    out = flashinfer.layernorm(x, gamma, beta, eps)
+
+    torch.testing.assert_close(out, out_ref, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(storage, storage_before, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
 @pytest.mark.parametrize("hidden_size", [111, 500, 1024, 3072, 4096, 8192, 16384])
 @pytest.mark.parametrize("quant_scale", [0.01, 1.0, 10.0])
