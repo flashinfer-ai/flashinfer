@@ -39,6 +39,7 @@ _TRACE_REGISTRATION_MODULES = (
     "flashinfer.attn_scores.attn_scores",
     "flashinfer.cake_vsa",
     "flashinfer.cascade",
+    "flashinfer.comm._ulysses_lowp",
     "flashinfer.comm.allreduce",
     "flashinfer.comm.dcp_alltoall",
     "flashinfer.comm.dcp_lse_reduce",

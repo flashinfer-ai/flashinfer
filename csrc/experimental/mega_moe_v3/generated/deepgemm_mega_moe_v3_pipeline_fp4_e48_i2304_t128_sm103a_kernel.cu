@@ -34,52 +34,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 72
-#define TMEM_ACCUM_OFFSET 0
-#define TMEM_SCALE_A_OFFSET 64
-#define TMEM_SCALE_B_OFFSET 68
-#define NUM_PIPE_STAGES 11
-#define NUM_ACCUM_PIPE_STAGES 2
-#define NUM_TASK_PIPE_STAGES 4
-#define SMEM_COMBINE_SMEM_OFF 0
-#define SMEM_COMBINE_SMEM_STAGE_BYTES 143360
-#define SMEM_COMBINE_SMEM_STRIDE 143360
-#define SMEM_SMEM_HIST_OFF 0
-#define SMEM_SMEM_HIST_STAGE_BYTES 192
-#define SMEM_SMEM_HIST_STRIDE 192
-#define SMEM_SMEM_DST_ROW_OFF 1024
-#define SMEM_SMEM_DST_ROW_STAGE_BYTES 16
-#define SMEM_SMEM_DST_ROW_STRIDE 16
-#define SMEM_SMEM_ERO_OFF 1040
-#define SMEM_SMEM_ERO_STAGE_BYTES 192
-#define SMEM_SMEM_ERO_STRIDE 192
-#define SMEM_SLOT_PARK_OFF 1024
-#define SMEM_SLOT_PARK_STAGE_BYTES 1024
-#define SMEM_SLOT_PARK_STRIDE 1024
-#define SMEM_SMEM_OUTPUT_OFF 2048
-#define SMEM_SMEM_OUTPUT_STAGE_BYTES 8192
-#define SMEM_SMEM_OUTPUT_STRIDE 8192
-#define SMEM_SMEM_A_OFF 10240
-#define SMEM_SMEM_A_STAGE_BYTES 2048
-#define SMEM_SMEM_A_STRIDE 2048
-#define SMEM_SMEM_B_OFF 32768
-#define SMEM_SMEM_B_STAGE_BYTES 16384
-#define SMEM_SMEM_B_STRIDE 16384
-#define SMEM_SMEM_SFA_OFF 212992
-#define SMEM_SMEM_SFA_STAGE_BYTES 512
-#define SMEM_SMEM_SFA_STRIDE 512
-#define SMEM_SMEM_SFB_OFF 218624
-#define SMEM_SMEM_SFB_STAGE_BYTES 512
-#define SMEM_SMEM_SFB_STRIDE 512
-#define SMEM_AMAX_REDUCTION_OFF 224256
-#define SMEM_AMAX_REDUCTION_STAGE_BYTES 512
-#define SMEM_AMAX_REDUCTION_STRIDE 512
-#define SMEM_TASK_INFOS_OFF 224768
-#define SMEM_TASK_INFOS_STAGE_BYTES 128
-#define SMEM_TASK_INFOS_STRIDE 128
-#define SMEM_TOTAL 225664
-#define THREADS 512
 #define NUM_CTAS 152
 #define LAUNCH_MIN_BLOCKS 1
 
@@ -527,12 +481,54 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t128_sm103a(int* __restrict__
                 smem_hist[i] = 0;
             }
             asm volatile("barrier.sync 10, 128;" ::: "memory");
-            #pragma unroll 1
-            for (int idx = disp_tid; idx < total_pairs; idx += 128) {
-                int e_h = topk_idx_i32[idx * 2] - local_expert_offset;
-                if ((unsigned int)e_h < 48) {
-                    atomicAdd(&smem_hist[e_h], 1);
-                }
+            int l5h_routes[6];
+            int pair_h_0 = disp_tid;
+            l5h_routes[0] = -1;
+            if (pair_h_0 < total_pairs) {
+                l5h_routes[0] = topk_idx_i32[pair_h_0 * 2] - local_expert_offset;
+            }
+            int pair_h_1 = disp_tid + 128;
+            l5h_routes[1] = -1;
+            if (pair_h_1 < total_pairs) {
+                l5h_routes[1] = topk_idx_i32[pair_h_1 * 2] - local_expert_offset;
+            }
+            int pair_h_2 = disp_tid + 256;
+            l5h_routes[2] = -1;
+            if (pair_h_2 < total_pairs) {
+                l5h_routes[2] = topk_idx_i32[pair_h_2 * 2] - local_expert_offset;
+            }
+            int pair_h_3 = disp_tid + 384;
+            l5h_routes[3] = -1;
+            if (pair_h_3 < total_pairs) {
+                l5h_routes[3] = topk_idx_i32[pair_h_3 * 2] - local_expert_offset;
+            }
+            int pair_h_4 = disp_tid + 512;
+            l5h_routes[4] = -1;
+            if (pair_h_4 < total_pairs) {
+                l5h_routes[4] = topk_idx_i32[pair_h_4 * 2] - local_expert_offset;
+            }
+            int pair_h_5 = disp_tid + 640;
+            l5h_routes[5] = -1;
+            if (pair_h_5 < total_pairs) {
+                l5h_routes[5] = topk_idx_i32[pair_h_5 * 2] - local_expert_offset;
+            }
+            if ((unsigned int)l5h_routes[0] < 48) {
+                atomicAdd(&smem_hist[l5h_routes[0]], 1);
+            }
+            if ((unsigned int)l5h_routes[1] < 48) {
+                atomicAdd(&smem_hist[l5h_routes[1]], 1);
+            }
+            if ((unsigned int)l5h_routes[2] < 48) {
+                atomicAdd(&smem_hist[l5h_routes[2]], 1);
+            }
+            if ((unsigned int)l5h_routes[3] < 48) {
+                atomicAdd(&smem_hist[l5h_routes[3]], 1);
+            }
+            if ((unsigned int)l5h_routes[4] < 48) {
+                atomicAdd(&smem_hist[l5h_routes[4]], 1);
+            }
+            if ((unsigned int)l5h_routes[5] < 48) {
+                atomicAdd(&smem_hist[l5h_routes[5]], 1);
             }
             asm volatile("barrier.sync 10, 128;" ::: "memory");
             if (bid == 0) {

@@ -1025,9 +1025,9 @@ def test_decode_resolver_routes_the_fp32_t1_pretranspose_body_per_state_head_ban
 @pytest.mark.cpu_only
 def test_nontranspose_fp32_t1_body_rule_follows_the_batch_band() -> None:
     # One table (sm_107a only): the `mid4_rc_kq128` twin in the small band (B < 32), the
-    # `tilev32_x2` twin in the large band's wave-fit range (32 <= B < 37), the `hqsplit`
-    # twin from B >= 37, the shipped small / large bodies everywhere
-    # else; B200 / B300 keep the shipped bodies.
+    # TMA-state `hqsplit_tma3` twin in the whole large band (B >= 32, wave-fit range
+    # 32 <= B < 37 included), the shipped small / large bodies everywhere else; B200 / B300
+    # keep the shipped bodies.
     assert cake_gdn.CAKE_GDN_NONTRANSPOSE_FP32_T1_SMALL_BATCH_THRESHOLD == 32
     assert cake_gdn.CAKE_GDN_NONTRANSPOSE_FP32_T1_LARGE_WAVEFIT_BATCH_LIMIT == 37
     assert cake_gdn.CAKE_GDN_NONTRANSPOSE_FP32_T1_BASE_SCHEDULES == {
@@ -1041,8 +1041,8 @@ def test_nontranspose_fp32_t1_body_rule_follows_the_batch_band() -> None:
     }
     assert cake_gdn.CAKE_GDN_NONTRANSPOSE_FP32_T1_ARCH_BODIES == {
         ("sm_107a", "small"): "gdn_decode_nontranspose_fp32_t1_mid4_rc_kq128",
-        ("sm_107a", "large_wavefit"): "gdn_decode_nontranspose_fp32_t1_tilev32_x2",
-        ("sm_107a", "large"): "gdn_decode_nontranspose_fp32_t1_hqsplit",
+        ("sm_107a", "large_wavefit"): "gdn_decode_nontranspose_fp32_t1_hqsplit_tma3",
+        ("sm_107a", "large"): "gdn_decode_nontranspose_fp32_t1_hqsplit_tma3",
     }
     assert cake_gdn.CAKE_GDN_NONTRANSPOSE_FP32_T1_CTAS_PER_STATE == {
         "gdn_decode_nontranspose_fp32_t1_small": 8,
@@ -1051,7 +1051,11 @@ def test_nontranspose_fp32_t1_body_rule_follows_the_batch_band() -> None:
         "gdn_decode_nontranspose_fp32_t1_mid4_rc_kq128": 4,
         "gdn_decode_nontranspose_fp32_t1_tilev32_x2": 2,
         "gdn_decode_nontranspose_fp32_t1_hqsplit": 1,
+        "gdn_decode_nontranspose_fp32_t1_hqsplit_tma3": 1,
     }
+    assert {"gdn_decode_nontranspose_fp32_t1_hqsplit_tma3"} == (
+        cake_gdn.CAKE_GDN_DECODE_TMA_STATE_SCHEDULES
+    )
     rule_band = cake_gdn.cake_gdn_nontranspose_fp32_t1_rule_band
     for batch_size, expected in (
         (1, "small"),
@@ -1076,13 +1080,9 @@ def test_nontranspose_fp32_t1_body_rule_follows_the_batch_band() -> None:
         "gdn_decode_nontranspose_fp32_t1_mid4_rc_kq128",
         "flashinfer.gdn_decode.direct_fp32_t1_nontranspose_small_mid4_rc_kq128",
     )
-    x2 = (
-        "gdn_decode_nontranspose_fp32_t1_tilev32_x2",
-        "flashinfer.gdn_decode.direct_fp32_t1_nontranspose_large_tilev32_x2",
-    )
-    hqsplit = (
-        "gdn_decode_nontranspose_fp32_t1_hqsplit",
-        "flashinfer.gdn_decode.direct_fp32_t1_nontranspose_large_hqsplit",
+    tma3 = (
+        "gdn_decode_nontranspose_fp32_t1_hqsplit_tma3",
+        "flashinfer.gdn_decode.direct_fp32_t1_nontranspose_large_hqsplit_tma3",
     )
     for arch in ("sm_100a", "sm_103a"):
         for batch_size in (1, 4, 8, 16, 31):
@@ -1090,13 +1090,11 @@ def test_nontranspose_fp32_t1_body_rule_follows_the_batch_band() -> None:
         for batch_size in (32, 33, 34, 35, 36, 37, 64, 128, 512):
             assert rule(batch_size, arch) == large
     # the public nontranspose rows (HV=32) on sm_107a: b1 .. b31 take mid4_rc_kq128, the wave-fit
-    # range b32 .. b36 takes tilev32_x2, b37 .. b512 take hqsplit
+    # b32 .. take hqsplit_tma3 (the wave-fit range b32 .. b36 included)
     for batch_size in (1, 4, 8, 16, 31):
         assert rule(batch_size, "sm_107a") == mid4
-    for batch_size in (32, 33, 34, 35, 36):
-        assert rule(batch_size, "sm_107a") == x2
-    for batch_size in (37, 38, 64, 128, 512):
-        assert rule(batch_size, "sm_107a") == hqsplit
+    for batch_size in (32, 33, 34, 35, 36, 37, 38, 63, 64, 65, 128, 512, 4096):
+        assert rule(batch_size, "sm_107a") == tma3
 
 
 @pytest.mark.cpu_only
@@ -1105,26 +1103,17 @@ def test_decode_resolver_routes_the_fp32_nontranspose_t1_body_per_batch_band(
     arch,
 ) -> None:
     # The K-major fp32-state T=1 rows run the `mid4_rc_kq128` twin on Rubin (sm_107a) below 32
-    # batch rows (four CTAs per state head instead of eight) and the `tilev32_x2` twin
-    # in the wave-fit range 32 <= B < 37 (two CTAs per state head instead of one) and the
-    # `hqsplit` twin from B >= 37 (one CTA per state head): same
-    # kernel contract, bitwise-identical output and state.  The route id names the twin
-    # and the host takes the grid from the resolved record, not from a fixed eight / one.
-    for batch_size in (1, 4, 8, 16, 31, 32, 33, 34, 35, 36, 37, 38, 64, 128):
+    # batch rows (four CTAs per state head instead of eight) and the TMA-state
+    # `hqsplit_tma3` twin from 32 on (one CTA per state head): bitwise-identical output
+    # and state; the TMA-state twin takes the state as a tensor map (its record's tma_abi
+    # is grid_constant).  The route id names the twin and the host takes the grid from the
+    # resolved record, not from a fixed eight / one.
+    for batch_size in (1, 4, 8, 16, 31, 32, 33, 34, 35, 36, 37, 38, 63, 64, 128, 512):
         route = _decode(arch=arch, layout="nontranspose", batch_size=batch_size)
         band = "small" if batch_size < 32 else "large"
         mid4 = arch == "sm_107a" and batch_size < 32
-        x2 = arch == "sm_107a" and 32 <= batch_size < 37
-        hqsplit = arch == "sm_107a" and batch_size >= 37
-        suffix = (
-            "_mid4_rc_kq128"
-            if mid4
-            else "_tilev32_x2"
-            if x2
-            else "_hqsplit"
-            if hqsplit
-            else ""
-        )
+        tma3 = arch == "sm_107a" and batch_size >= 32
+        suffix = "_mid4_rc_kq128" if mid4 else "_hqsplit_tma3" if tma3 else ""
         assert (
             route.route_id
             == f"flashinfer.gdn_decode.direct_fp32_t1_nontranspose_{band}{suffix}"
@@ -1132,10 +1121,8 @@ def test_decode_resolver_routes_the_fp32_nontranspose_t1_body_per_batch_band(
         schedule = (
             "nontranspose_fp32_t1_mid4_rc_kq128"
             if mid4
-            else "nontranspose_fp32_t1_tilev32_x2"
-            if x2
-            else "nontranspose_fp32_t1_hqsplit"
-            if hqsplit
+            else "nontranspose_fp32_t1_hqsplit_tma3"
+            if tma3
             else "nontranspose_fp32_t1_small"
             if band == "small"
             else "nontranspose_fp32_t1"
@@ -1151,9 +1138,14 @@ def test_decode_resolver_routes_the_fp32_nontranspose_t1_body_per_batch_band(
         assert arch in record["architectures"]
         assert record["specializations"]["H"] == 16
         assert record["specializations"]["HV"] == 32
+        assert record["tma_abi"] == ("grid_constant" if tma3 else "pointer")
+        assert (
+            record["host_binding"]["template"]
+            == "host/templates/decode_fp32_t1_tma_state.cc.in"
+        ) == tma3
         assert cake_gdn.cake_gdn_nontranspose_fp32_t1_ctas_per_state(
             route.variant_name
-        ) == (4 if mid4 else 2 if x2 else 8 if band == "small" else 1)
+        ) == (4 if mid4 else 8 if band == "small" else 1)
     # the H4 / HV8 trace geometry ships a small record of its own and follows the rule
     trace = _decode(
         arch=arch,
@@ -1169,6 +1161,62 @@ def test_decode_resolver_routes_the_fp32_nontranspose_t1_body_per_batch_band(
         cake_gdn.CakeGDNUnsupportedError, match="not an fp32-state T=1 nontranspose"
     ):
         cake_gdn.cake_gdn_nontranspose_fp32_t1_ctas_per_state(pretranspose.variant_name)
+
+
+@pytest.mark.cpu_only
+def test_tma_state_decode_records_spell_their_abi_and_encode_the_state_map() -> None:
+    # The TMA-state decode records (sm_107a only) spell tma_abi grid_constant and launch
+    # through the TMA-state host template, which encodes the state's 4D tensor map on
+    # every call and opts in to the kernel's dynamic shared memory; every other decode
+    # record derives the pointer ABI.
+    variants = cake_gdn._manifest()["variants"]
+    tma = [
+        record
+        for record in variants
+        if record["domain"] == "decode" and record["tma_abi"] == "grid_constant"
+    ]
+    assert len(tma) == 2
+    for record in tma:
+        schedule = record["source_schedule"].rsplit(":", 1)[-1]
+        assert schedule in cake_gdn.CAKE_GDN_DECODE_TMA_STATE_SCHEDULES
+        assert record["architectures"] == ["sm_107a"]
+        host = record["host_binding"]
+        assert host["template"] == "host/templates/decode_fp32_t1_tma_state.cc.in"
+        assert host["params"]["DYNAMIC_SMEM_BYTES"] == 51328
+        text = cake_gdn.render_cake_gdn_host_shim(record)
+        assert "cuTensorMapEncodeTiled(" in text
+        assert "CU_TENSOR_MAP_SWIZZLE_128B" in text
+        assert "&p_state_tma," in text and "p_state =" not in text
+        assert "CakeGDNSetMaxDynamicSmem(kernel, (int)dev.device_id, 51328," in text
+        assert "kernel.Launch(kargs, grid, block, stream, 51328u)" in text
+    assert {record["specializations"]["SCALE"] for record in tma} == {128**-0.5, 1.0}
+    for record in variants:
+        if record["domain"] == "decode" and record not in tma:
+            assert record["tma_abi"] == "pointer", record["name"]
+    # The record's spelled ABI must be one its domain takes and must match its template.
+    base = next(
+        record
+        for record in variants
+        if record["name"].startswith("decode_gdn_decode_nontranspose_fp32_t1_hqsplit_")
+        and record["tma_abi"] == "pointer"
+    )
+    for field, value, message in (
+        ("tma_abi", "grid_constant", "does not match its host template"),
+        ("tma_abi", "grid_constant_64", "a decode record takes"),
+    ):
+        spelled = json.loads(json.dumps(base))
+        spelled[field] = value
+        with pytest.raises(RuntimeError, match=message):
+            cake_gdn._derive_record_fields(spelled)
+    pointer = json.loads(json.dumps(tma[0]))
+    pointer["tma_abi"] = "pointer"
+    with pytest.raises(RuntimeError, match="does not match its host template"):
+        cake_gdn._derive_record_fields(pointer)
+    prefill = next(record for record in variants if record["domain"] == "prefill")
+    prefill = json.loads(json.dumps(prefill))
+    prefill["tma_abi"] = "pointer"
+    with pytest.raises(RuntimeError, match="a prefill record takes"):
+        cake_gdn._derive_record_fields(prefill)
 
 
 @pytest.mark.cpu_only
