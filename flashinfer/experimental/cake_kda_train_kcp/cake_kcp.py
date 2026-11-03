@@ -230,6 +230,34 @@ no c1 / c2 (no ring hop), no wait, no owner merge, no summary walk at ``P = 1``
 The backward is unchanged (``checkpoint_keep="states"``, the default, runs it
 with ``save_transfer=False``: bitwise the default form).
 
+Raw gate mode (FlashInfer issue #7816; ``use_gate_in_kernel=True`` with
+``A_log`` / ``dt_bias`` / ``lower_bound`` on the three entry points, the
+single-rank keywords): ``g`` is this rank's raw BF16 gate (a strided view under
+the single-rank rule, never copied) and the local stages run the plan's raw
+records (``cake_backend.plan(..., gate="raw")``: the intra and prep programs
+activate the gate ``lower_bound * sigmoid(exp(A_log) * (g + dt_bias))`` in
+their prefix passes, the raw GLM intra program writes the BF16 gradient of the
+raw gate and per-chunk ``(hi, lo)`` partials of the parameter gradients, one
+``param_finalize`` launch reduces them, no gate epilogue runs).  The ``gk`` rows
+the K1 / K2 / K3 walks read are the explicit path's bits for the same activated
+gate, so every KCP program, collective and its byte count is unchanged; no
+full-size FP32 gate or gate gradient exists on the route.  ``dA_log`` /
+``ddt_bias`` of a rank are its partial sums (the gradients through its own
+tokens, reduced on the rank in the fixed order of its local chunks): the
+training framework sums them over ``ctx.group`` like the gradients of any
+parameter replicated across the context-parallel ranks, or calls
+:func:`reduce_gate_param_grads_kcp` (an all-gather, then an FP32 sum in rank
+order) when that sum must be bitwise reproducible -- an NCCL all-reduce does not
+fix its summation order.  The workspace (:attr:`WorkspaceKcp.gate`), the
+saved set and a recompute handle's fingerprint record the mode (and the lower
+bound); a call in another mode is refused.  A raw-mode workspace runs the replay
+local arena (``local_arena="lean"`` is refused in this mode).  The raw records of
+the single-rank package are copies of the deterministic package's raw programs
+and its raw plan selects no ``S1`` pair, so every output, the raw gate's
+gradient and the per-rank partial sums are bitwise those of the deterministic
+package's raw KCP route.  The checkpoint hand-off does not engage in raw mode
+(:func:`chunk_kda_kcp`).
+
 
 P > 1 staging: the K1 ``_offset`` / K2 ``_offset`` / K3 passes of the segmented rank write two
 dense planes ``stage_b`` / ``stage_m`` ([NSEG, H, 128, 128] FP32 each, ``tile_stride`` 1); K4 reads them element-wise through
@@ -412,6 +440,7 @@ LOCAL_STAGES_BWD = (
     "dqkg",
     "glm_intra",
     "gate_epilogue",  # no launch where the plan's GLM intra program fuses it (sm_103a, sm_107a)
+    "param_finalize",  # raw gate mode only: dA_log / ddt_bias from the GLM intra program's per-chunk partials
 )
 # The paths of the existing backend's plan the local stages take their records from (the forward without a saved
 # set, the checkpoint replay for both backward modes: :mod:`.cake_kcp_plan`) and the arena layouts they run on.
@@ -508,9 +537,14 @@ def _check(
         raise ValueError(f"{name}: on {x.device}, expected {device}")
 
 
-def _operands(q, k, v, g, beta, ctx, *, dtypes: dict[str, torch.dtype]):
+def _operands(
+    q, k, v, g, beta, ctx, *, dtypes: dict[str, torch.dtype], gate: str = "g"
+):
     """The operands without their optional batch axis, ``(T_r, H)`` and whether the inputs carried a batch axis.
-    ``T_r`` must equal the context's local token count; ``H`` is the operands' head count (``1..64``)."""
+    ``T_r`` must equal the context's local token count; ``H`` is the operands' head count (``1..64``).  ``gate="raw"``
+    (``use_gate_in_kernel=True``): ``g`` is the raw gate, BF16 ``[T_r, H, 128]``, any view the single-rank rule
+    accepts (``cake_backend._check_raw``: unit innermost stride, 16-byte outer strides and address, no overlap; the
+    only full check, as the strided-pointer bindings check no layout; never copied)."""
     v = _squeeze_batch(v, "v", 3)
     T, H = int(v.shape[0]), int(v.shape[1])
     device = torch.device(ctx.device)
@@ -526,7 +560,10 @@ def _operands(q, k, v, g, beta, ctx, *, dtypes: dict[str, torch.dtype]):
     _check(q, "q", (T, H, D), dtypes["q"], device)
     _check(k, "k", (T, H, D), dtypes["k"], device)
     _check(v, "v", (T, H, D), dtypes["v"], device)
-    _check(g, "g", (T, H, D), dtypes["g"], device)
+    if gate == "raw":
+        g = cake_backend._check_raw(g, T, H, device)
+    else:
+        _check(g, "g", (T, H, D), dtypes["g"], device)
     _check(beta, "beta", (T, H), dtypes["beta"], device)
     return q, k, v, g, beta, T, H, batched
 
@@ -555,6 +592,13 @@ CONTRACT_DTYPES: dict[str, torch.dtype] = {
     "dbeta": torch.bfloat16,
     "dg": torch.float32,
     "state": torch.float32,  # the FP32 states, summaries and adjoints of every pool and collective
+    # raw gate mode (use_gate_in_kernel=True): the raw gate and its gradient, the gate parameters and theirs
+    "g_raw": torch.bfloat16,
+    "dg_raw": torch.bfloat16,
+    "A_log": torch.float32,
+    "dt_bias": torch.float32,
+    "dA_log": torch.float32,
+    "ddt_bias": torch.float32,
 }
 
 
@@ -3327,7 +3371,13 @@ class WorkspaceKcp:
     dropped workspace, goes back to the caching allocator only after the queued work of every stream that used it;
     calls on one stream do neither.  ``allocate=False`` with a context allocates nothing until the first call
     and keeps ``backward`` as a sizing floor, so a first forward allocates the backward workspace at once instead
-    of a forward-only one that its first backward would replace."""
+    of a forward-only one that its first backward would replace.
+
+    ``use_gate_in_kernel`` fixes the gate mode of the calls the workspace serves (:attr:`gate`: ``"g"`` the activated
+    FP32 gate, ``"raw"`` the raw BF16 gate of ``use_gate_in_kernel=True``) for its lifetime: the local arena is
+    planned in that mode (``cake_backend.plan(..., gate=)``: the raw records, and on every architecture a backward
+    layout without the gate epilogue's ``dg_int`` / ``db_int``); the KCP pools do not depend on it.  A call in the
+    other mode is refused with ``ValueError``."""
 
     def __init__(
         self,
@@ -3342,6 +3392,7 @@ class WorkspaceKcp:
         allocate: bool = True,
         local_arena: str | None = None,
         lean_passes: int | None = None,
+        use_gate_in_kernel: bool = False,
     ) -> None:
         if save_mode not in SAVE_MODES:
             raise ValueError(
@@ -3356,6 +3407,13 @@ class WorkspaceKcp:
             raise ValueError(
                 'WorkspaceKcp: lean_passes needs local_arena="lean", got '
                 f"{self.local_arena!r}"
+            )
+        # the gate mode of every call on this workspace (and of its local arena's plan)
+        self.gate = cake_backend._gate_mode(use_gate_in_kernel)
+        if self.gate == "raw" and self.local_arena == "lean":
+            raise NotImplementedError(
+                'WorkspaceKcp: use_gate_in_kernel=True runs on the replay local arena; local_arena="lean" '
+                "is not supported in the raw gate mode"
             )
         self.state_dtype = state_dtype
         self.with_local = bool(local)
@@ -3643,7 +3701,9 @@ class WorkspaceKcp:
         index = (
             device.index if device.index is not None else torch.cuda.current_device()
         )
-        return cake_backend.plan(*key, cake_jit.sm_count(index), _arch_of(index))
+        return cake_backend.plan(
+            *key, cake_jit.sm_count(index), _arch_of(index), gate=self.gate
+        )
 
     def _bind_local(
         self, ctx: Any, H: int, device: torch.device, backward: bool
@@ -3714,6 +3774,7 @@ class WorkspaceKcp:
                 backward=kind,
                 save_mode=self.save_mode,
                 fwd_layout=cake_kcp_plan.local_fwd_layout(kind, self.save_mode),
+                gate=self.gate,
                 deterministic=False,
             )
             return self.local
@@ -3886,7 +3947,10 @@ class SavedKcp:
     recomputes the internal rows it reads in both modes (version 2; version 1 held them).  A forward under the
     checkpoint hand-off (:func:`chunk_kda_kcp` ``checkpoint_handoff``) also keeps its tape set (``h``, ``v_new``,
     ``w``, ``aqk_int``, ``akk_int``; :attr:`tape`) and no carry plane: its backward reads the set and runs no intra
-    program, WY program or K1 tape walk; ``flags()`` then carries one more flag."""
+    program, WY program or K1 tape walk; ``flags()`` then carries one more flag.  ``gate`` (``"g"`` or ``"raw"``)
+    and ``lower_bound`` (the raw mode's FP32 lower bound as a host float, ``None`` in ``"g"`` mode) are the gate
+    mode of the forward that wrote the set: its tensors and version are the same in both modes, and a backward in
+    the other mode or with another lower bound is refused."""
 
     version: int
     S_in: torch.Tensor
@@ -3915,6 +3979,9 @@ class SavedKcp:
     w: torch.Tensor | None = None
     aqk_int: torch.Tensor | None = None
     akk_int: torch.Tensor | None = None
+    gate: str = "g"  # the forward's gate mode ("raw": use_gate_in_kernel=True)
+    # the raw mode's FP32 lower bound (None in "g" mode)
+    lower_bound: float | None = None
 
     _OPTIONAL = ("c1_recv", "M_seg", "carry")
     _TAPE = cake_kcp_plan.KCP_HANDOFF_BUFFERS
@@ -3958,6 +4025,8 @@ class SavedKcp:
             "exchange": self.exchange,
             "precision_mode": self.precision_mode,
             "transfer_walk": self.transfer_walk,
+            "gate": self.gate,
+            "lower_bound": self.lower_bound,
         }
 
     @classmethod
@@ -4112,31 +4181,20 @@ _OPTION_KEYS = (
 # other options builds its own, _handle_options through dataclasses.replace)
 _DEFAULT_OPTIONS: dict[Any, OptionsKcp] = {}
 
-# The deterministic package's keywords of modes this package does not run, at the value each takes when the mode
-# is off: the raw gate (``use_gate_in_kernel`` with ``A_log`` / ``dt_bias`` / ``lower_bound``, FlashInfer #7816) and
-# the in-kernel q / k L2 norm (``use_qk_l2norm_in_kernel``, #7817).
+# The deterministic package's keyword of a mode this package does not run, at the value it takes when the mode is
+# off: the in-kernel q / k L2 norm (``use_qk_l2norm_in_kernel``, #7817).  The raw gate keywords (``use_gate_in_kernel``
+# with ``A_log`` / ``dt_bias`` / ``lower_bound``, FlashInfer #7816) are the entry points' own.
 _MODE_OFF = {
-    "use_gate_in_kernel": False,
-    "A_log": None,
-    "dt_bias": None,
-    "lower_bound": None,
     "use_qk_l2norm_in_kernel": False,
 }
 
 
 def _refuse_modes(kwargs: dict[str, Any]) -> None:
-    """Pop the :data:`_MODE_OFF` keywords from ``kwargs``.  The off value (``False`` / ``None``, by identity) is this
-    package's mode, so a call that spells it out runs unchanged; any other value raises ``ValueError``: this package
-    runs the explicit FP32 gate without the in-kernel norm, and a call never changes mode silently."""
+    """Pop the :data:`_MODE_OFF` keywords from ``kwargs``.  The off value (``False``, by identity) is this package's
+    mode, so a call that spells it out runs unchanged; any other value raises ``ValueError``: this package runs
+    without the in-kernel norm, and a call never changes mode silently."""
     given = {key: kwargs.pop(key) for key in _MODE_OFF if key in kwargs}
     on = [key for key, value in given.items() if value is not _MODE_OFF[key]]
-    gate = [key for key in on if key != "use_qk_l2norm_in_kernel"]
-    if gate:
-        raise ValueError(
-            f"{', '.join(f'{key}={given[key]!r}' for key in gate)}: the raw gate mode (use_gate_in_kernel=True with "
-            "A_log, dt_bias and lower_bound) runs on the deterministic package only; pass deterministic=True "
-            "(flashinfer.cake_kda_train_kcp) or call flashinfer.experimental.cake_kda_det_train_kcp"
-        )
     if on:
         raise ValueError(
             f"use_qk_l2norm_in_kernel={given['use_qk_l2norm_in_kernel']!r}: the in-kernel q / k L2 norm runs on the "
@@ -4313,6 +4371,9 @@ class CallKcp:
         self.local_values: dict[str, Any] | None = None
         self.out: torch.Tensor | None = None
         self.grads: dict[str, torch.Tensor] | None = None
+        # the gate mode ("raw": use_gate_in_kernel=True) and the raw mode's checked parameters (set by _prepare)
+        self.gate = "g"
+        self.gate_params: Any = None
         self.exchange = _exchange_scheme(tb, opts)
         self.precision_mode = int(opts.precision_mode)
         self.transfer_walk = str(opts.transfer_walk)
@@ -4527,6 +4588,7 @@ def _record(kind: str, call: CallKcp) -> None:
         "sequence": list(call.sequence),
         "exchange": call.exchange,
         "backend": call.backend.name,
+        "gate": call.gate,  # "g" / "raw" (use_gate_in_kernel=True)
         "P": call.tb.P,
         "NSEG": call.tb.NSEG,
         "Hg": call.tb.Hg,
@@ -5392,13 +5454,19 @@ def _backward(call: CallKcp, saved: SavedKcp | None) -> None:
             )  # with fused_walks also the dS_out copies into the extra carry slots
     _adj_tapes(call, dcarry=dcarry, wait_first=wait_first)
     tail = (call.local_values or {}).get("_kcp_tail") if call.T_r else None
+    # raw gate mode: the raw GLM intra program writes d raw and the per-chunk (hi, lo) partials of dA_log / ddt_bias
+    # and no gate epilogue runs; one param_finalize launch then reduces this rank's partials in the order of its
+    # local chunks (a raw-mode workspace has no lean arena, so its tail runs in one pass)
+    tail_stages = ("dqkg", "glm_intra") if call.gate == "raw" else TAIL_STAGES
     if not tail:
-        for name in TAIL_STAGES:
+        for name in tail_stages:
             call.stage(name)
     else:  # the lean layout: the tail stages once per chunk range, on that range's per-pass buffers
         for i in range(len(tail)):
-            for name in TAIL_STAGES:
+            for name in tail_stages:
                 call.stage(name, tail_pass=i)
+    if call.gate == "raw":
+        call.stage("param_finalize", seg_cap=call.scratch.get("seg_cap"))
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -5659,8 +5727,56 @@ def _graph_release(pinned: Any) -> int:
 # Entry points (the KCP contract §3.2 / the design note §10.1)
 
 
+def _gate_args(
+    use_gate_in_kernel: bool,
+    A_log: torch.Tensor | None,
+    dt_bias: torch.Tensor | None,
+    lower_bound: float | None,
+) -> dict[str, Any]:
+    """The entry points' gate keywords as one dict (passed through to :func:`_prepare`)."""
+    return {
+        "use_gate_in_kernel": use_gate_in_kernel,
+        "A_log": A_log,
+        "dt_bias": dt_bias,
+        "lower_bound": lower_bound,
+    }
+
+
+def _gate_key_tensors(gate_args: dict[str, Any]) -> tuple[Any, ...]:
+    """The raw mode's parameter tensors in a graph validity key (their pointers, shapes, strides and dtypes; nothing
+    in ``"g"`` mode, whose key is unchanged)."""
+    if gate_args["use_gate_in_kernel"] is not True:
+        return ()
+    return (gate_args["A_log"], gate_args["dt_bias"])
+
+
+def _gate_key_flags(gate_args: dict[str, Any]) -> tuple[Any, ...]:
+    """The raw mode's host scalars in a graph validity key: the mode and the lower bound (a captured call binds the
+    lower bound as a launch argument; nothing in ``"g"`` mode)."""
+    if gate_args["use_gate_in_kernel"] is not True:
+        return ()
+    lb = gate_args["lower_bound"]
+    return ("raw", lb if isinstance(lb, (int, float)) else repr(lb))
+
+
 def _prepare(
-    q, k, v, g, beta, ctx, *, scale, save_mode, workspace, options, backward, dout=None
+    q,
+    k,
+    v,
+    g,
+    beta,
+    ctx,
+    *,
+    scale,
+    save_mode,
+    workspace,
+    options,
+    backward,
+    dout=None,
+    use_gate_in_kernel: bool = False,
+    A_log: torch.Tensor | None = None,
+    dt_bias: torch.Tensor | None = None,
+    lower_bound: float | None = None,
 ):
     backend = get_backend()
     opts = options if isinstance(options, OptionsKcp) else _options(options)
@@ -5670,10 +5786,18 @@ def _prepare(
         raise NotImplementedError(
             "save_mode='tape' is not supported on the KCP route (light only)"
         )
+    gate = cake_backend._gate_mode(use_gate_in_kernel)
+    if gate == "raw" and not (
+        backend.local_stages and backend.dtypes.get("g_raw") == torch.bfloat16
+    ):
+        raise NotImplementedError(
+            f"use_gate_in_kernel=True needs a backend with the local kernel stages (backend {backend.name!r})"
+        )
     q, k, v, g, beta, T, H, batched = _operands(
-        q, k, v, g, beta, ctx, dtypes=backend.dtypes
+        q, k, v, g, beta, ctx, dtypes=backend.dtypes, gate=gate
     )
     device = q.device
+    gp = cake_backend._gate_params(gate, A_log, dt_bias, lower_bound, H, device)
     if dout is not None:
         dout = _squeeze_batch(dout, "dout", 3)
         _check(dout, "dout", (T, H, D), backend.dtypes["dout"], device)
@@ -5682,10 +5806,18 @@ def _prepare(
             state_dtype=backend.dtypes["state"],
             local=backend.local_stages,
             save_mode=save_mode,
+            use_gate_in_kernel=gate == "raw",
         )
         workspace._shared_eye = True  # this call's own: the shared identity tile
     elif not isinstance(workspace, WorkspaceKcp):
         raise TypeError("workspace must be a WorkspaceKcp")
+    elif workspace.gate != gate:
+        raise ValueError(
+            f"workspace: allocated for gate mode {workspace.gate!r} "
+            f"(use_gate_in_kernel={workspace.gate == 'raw'}), the call runs gate mode {gate!r} "
+            f"(use_gate_in_kernel={gate == 'raw'}); allocate the WorkspaceKcp with "
+            f"use_gate_in_kernel={gate == 'raw'}"
+        )
     if workspace.state_dtype != backend.dtypes["state"]:
         raise ValueError(
             f"workspace state dtype {workspace.state_dtype} differs from the backend's {backend.dtypes['state']}"
@@ -5703,7 +5835,10 @@ def _prepare(
         walk_geometry=opts.walk_geometry,
         host_trim=bool(opts.host_trim),
     )
-    ops = {"q": q, "k": k, "v": v, "g": g, "beta": beta}
+    if gp is None:
+        ops = {"q": q, "k": k, "v": v, "g": g, "beta": beta}
+    else:  # the raw records' operands: the raw view, its element strides, A_log, dt_bias [H * 128], lower_bound
+        ops = {"q": q, "k": k, "v": v, "beta": beta, **cake_backend._raw_values(g, gp)}
     if dout is not None:
         ops["dout"] = dout
     call = CallKcp(
@@ -5717,6 +5852,7 @@ def _prepare(
         ops=ops,
         backward=backward,
     )
+    call.gate, call.gate_params = gate, gp
     backend.begin_call(call)
     return call, batched
 
@@ -5748,6 +5884,10 @@ def chunk_kda_fwd_kcp(
     save_mode: str = "light",
     boundary_mode: str = "saved",
     workspace: WorkspaceKcp | None = None,
+    use_gate_in_kernel: bool = False,
+    A_log: torch.Tensor | None = None,
+    dt_bias: torch.Tensor | None = None,
+    lower_bound: float | None = None,
     deterministic: bool = True,
     **options: Any,
 ) -> tuple[torch.Tensor, SavedKcp | None]:
@@ -5756,17 +5896,32 @@ def chunk_kda_fwd_kcp(
     ``ContextKcp``; the token operands are its ``T_r`` local tokens in fragment order; ``**options`` are the
     keywords of :class:`OptionsKcp` (+ ``_kcp_test_knobs``), among them ``graph="replay"`` (keyed CUDA-graph
     capture / replay of this call; module docstring and :func:`graph_cache_clear`).  ``deterministic`` must be
-    ``False`` (:func:`_require_deterministic_false`)."""
+    ``False`` (:func:`_require_deterministic_false`).
+
+    ``use_gate_in_kernel=True`` (raw gate mode, the single-rank keywords of ``cake_backend.chunk_kda_fwd``):
+    ``g`` is this rank's raw gate BF16 ``[T_r, H, 128]`` (a strided view under the single-rank rule, never copied)
+    with ``A_log`` FP32 ``[H]``, ``dt_bias`` FP32 ``[H * 128]`` or ``[H, 128]`` and ``lower_bound`` (``-5 <=
+    lower_bound < 0``, required); the local intra program activates the gate in its prefix pass, every other launch
+    and collective is the explicit path's.  The workspace must be of the same mode (:attr:`WorkspaceKcp.gate`)
+    and the saved set records the mode and the lower bound.  With ``use_gate_in_kernel=False`` the three parameters
+    must be ``None``."""
     _require_deterministic_false(deterministic, "chunk_kda_fwd_kcp")
     if boundary_mode not in BOUNDARY_MODES:
         raise ValueError(
             f"boundary_mode must be one of {BOUNDARY_MODES}, got {boundary_mode!r}"
         )
     opts = _options(options)
+    gate_args = _gate_args(use_gate_in_kernel, A_log, dt_bias, lower_bound)
     save = bool(save_for_backward) and boundary_mode == "saved"
     entry = (
         _graph_entry(
-            "fwd", ctx, workspace, opts, scale, (q, k, v, g, beta), (save, save_mode)
+            "fwd",
+            ctx,
+            workspace,
+            opts,
+            scale,
+            (q, k, v, g, beta, *_gate_key_tensors(gate_args)),
+            (save, save_mode, *_gate_key_flags(gate_args)),
         )
         if opts.graph != "off"
         else None
@@ -5787,6 +5942,7 @@ def chunk_kda_fwd_kcp(
         workspace=workspace,
         options=opts,
         backward=False,
+        **gate_args,
     )
     if entry is not None and entry.seen > 0 and entry.disabled is None:
         res = _graph_capture(
@@ -5810,6 +5966,7 @@ def chunk_kda_fwd_kcp(
             workspace=workspace,
             options=opts,
             backward=False,
+            **gate_args,
         )
     out, saved = _fwd_body(call, save=save, save_mode=save_mode, ctx=ctx)
     _record("fwd", call)
@@ -5866,6 +6023,10 @@ def _fwd_body(
             precision_mode=call.precision_mode,
             ctx=ctx,
             transfer_walk=call.transfer_walk,
+            gate=call.gate,
+            lower_bound=None
+            if call.gate_params is None
+            else call.gate_params.lower_bound,
         )
         call.scratch["saved_bytes"] = saved.bytes
     return call.out, saved
@@ -5890,6 +6051,8 @@ def _check_saved(saved: SavedKcp, call: CallKcp) -> None:
         raise ValueError(
             f"saved: scale {saved.scale} differs from the call's {call.scale}"
         )
+    # the gate mode and the FP32 bits of the raw mode's lower bound (the single-rank rule)
+    cake_backend._check_saved_gate(saved, call.gate_params)
     if (
         saved.save_transfer != opts.save_transfer
         or saved.exchange != call.exchange
@@ -5961,12 +6124,29 @@ def chunk_kda_bwd_kcp(
     scale: float | None = None,
     save_mode: str = "light",
     workspace: WorkspaceKcp | None = None,
+    use_gate_in_kernel: bool = False,
+    A_log: torch.Tensor | None = None,
+    dt_bias: torch.Tensor | None = None,
+    lower_bound: float | None = None,
     deterministic: bool = True,
     **options: Any,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, ...]:
     """The KCP backward (the KCP contract §3.2): ``(dq, dk, dv, dbeta, dg)``, fresh.  ``saved=None`` replays the forward.
     ``deterministic`` must be ``False`` (:func:`_require_deterministic_false`); ``saved`` must come from this
-    package's forward (a saved set of the deterministic package raises ``ValueError``)."""
+    package's forward (a saved set of the deterministic package raises ``ValueError``).
+
+    Raw gate mode (``use_gate_in_kernel=True`` with the forward's ``A_log`` / ``dt_bias`` / ``lower_bound``):
+    ``(dq, dk, dv, dbeta, dg, dA_log, ddt_bias)``, ``dg`` the BF16 gradient of the raw gate (contiguous, ranked like
+    ``g``), ``dA_log`` FP32 ``[H]`` and ``ddt_bias`` FP32 shaped like ``dt_bias``.  The two parameter gradients are
+    this rank's partial sums: the gradients through this rank's own tokens, reduced on the rank in an order fixed by
+    its local chunks alone (bitwise repeatable per rank, the same under every schedule and exchange).  The full
+    gradient is their sum over the ranks of ``ctx.group``; a training framework sums them as it sums the gradients
+    of any parameter replicated across the context-parallel ranks, or calls :func:`reduce_gate_param_grads_kcp` for
+    a sum that is bitwise reproducible (an NCCL all-reduce does not fix its summation order).  No gate epilogue runs
+    and no full-size FP32 gate or gate gradient exists on the route.  A saved set of the other mode, or with another
+    ``lower_bound`` (its FP32 value), is refused with ``ValueError``, as is a workspace of the other mode.  The raw
+    mode runs the deterministic package's raw records: every output, the raw gate's gradient and the parameter
+    partial sums are bitwise those of ``chunk_kda_det_bwd_kcp`` on the same rank."""
     _require_deterministic_false(deterministic, "chunk_kda_bwd_kcp")
     if saved is not None and not isinstance(saved, SavedKcp):
         # the deterministic package's saved set (SavedDetKcp) has the same members; its backward reads it, this one
@@ -5977,6 +6157,7 @@ def chunk_kda_bwd_kcp(
             "by that package's backward"
         )
     opts = _options(options)
+    gate_args = _gate_args(use_gate_in_kernel, A_log, dt_bias, lower_bound)
     entry = None
     if opts.graph != "off":
         kept = (
@@ -5996,13 +6177,13 @@ def chunk_kda_bwd_kcp(
             workspace,
             opts,
             scale,
-            (q, k, v, g, beta, dout, *kept),
-            (save_mode, saved is not None),
+            (q, k, v, g, beta, dout, *kept, *_gate_key_tensors(gate_args)),
+            (save_mode, saved is not None, *_gate_key_flags(gate_args)),
         )
     if entry is not None and entry.graph is not None:
         _graph_replay("bwd", entry)
         grads, batched = entry.result
-        return tuple(_ranked(t.detach(), batched) for t in grads)
+        return _shaped_grads(grads, batched, g, gate_args)
     call, batched = _prepare(
         q,
         k,
@@ -6016,6 +6197,7 @@ def chunk_kda_bwd_kcp(
         options=opts,
         backward=True,
         dout=dout,
+        **gate_args,
     )
     if saved is not None:
         _check_saved(saved, call)
@@ -6035,7 +6217,7 @@ def chunk_kda_bwd_kcp(
         res = _graph_capture("bwd", entry, call, lambda: _bwd_body(call, saved))
         if res is not None:
             entry.result = (res, batched)
-            return tuple(_ranked(t.detach(), batched) for t in res)
+            return _shaped_grads(res, batched, g, gate_args)
         call, batched = _prepare(
             q,
             k,
@@ -6049,6 +6231,7 @@ def chunk_kda_bwd_kcp(
             options=opts,
             backward=True,
             dout=dout,
+            **gate_args,
         )
         if saved is not None:
             _check_saved(saved, call)
@@ -6057,20 +6240,75 @@ def chunk_kda_bwd_kcp(
     if opts.graph != "off":
         _graph_eager("bwd", entry)
     call.backend.end_call(call)
-    return tuple(_ranked(t, batched) for t in grads)
+    return _shaped_grads(grads, batched, g, gate_args, detach=False)
+
+
+def _shaped_grads(
+    grads: Sequence[torch.Tensor],
+    batched: bool,
+    g: torch.Tensor,
+    gate_args: dict[str, Any],
+    *,
+    detach: bool = True,
+) -> tuple[torch.Tensor, ...]:
+    """The backward's results as the caller receives them: the token gradients ranked like the inputs (the raw
+    gate's like ``g``), ``dA_log`` as is and ``ddt_bias`` in ``dt_bias``'s shape (``detach``: a graph's static
+    tensors, handed out as fresh objects)."""
+
+    def out(t: torch.Tensor) -> torch.Tensor:
+        return t.detach() if detach else t
+
+    if len(grads) == 5:
+        return tuple(_ranked(out(t), batched) for t in grads)
+    dq, dk, dv, dbeta, d_raw, dA_log, ddt_bias = grads
+    return (
+        *(_ranked(out(t), batched) for t in (dq, dk, dv, dbeta)),
+        _ranked(out(d_raw), g.dim() == 4),
+        out(dA_log),
+        out(ddt_bias).view(tuple(gate_args["dt_bias"].shape)),
+    )
+
+
+_RAW_GRADS = ("dq", "dk", "dv", "dbeta", "dg_raw", "dA_log", "ddt_bias")
 
 
 def _bwd_body(call: CallKcp, saved: SavedKcp | None) -> tuple[torch.Tensor, ...]:
-    """The backward's allocations and launches (eagerly or inside a capture): ``(dq, dk, dv, dbeta, dg)``."""
+    """The backward's allocations and launches (eagerly or inside a capture): ``(dq, dk, dv, dbeta, dg)``; in raw
+    gate mode ``(dq, dk, dv, dbeta, dg_raw, dA_log, ddt_bias)`` with ``dg_raw`` the BF16 gradient of the raw gate
+    (contiguous ``[T_r, H, 128]``), ``dA_log`` FP32 ``[H]`` and ``ddt_bias`` FP32 ``[H * 128]``: this rank's partial
+    sums (the parameter gradients of its own tokens).  The raw GLM intra program writes the per-chunk ``(hi, lo)``
+    partials ``dA_part`` / ``db_part`` (FP32 ``[NC_pad, H, 128, 2]`` each, per call, outside the arena; the real
+    chunks only) and ``param_finalize`` reduces them in the fixed order of the local chunks, with its per-call
+    scratch ``part2`` / ``ticket`` and ``seg_cap`` from ``cake_backend._raw_finalize_scratch``; a rank without tokens
+    launches nothing and returns zero parameter gradients."""
     dt = call.backend.dtypes
     T, H = call.T_r, call.H
     call.grads = {
         "dq": _alloc((T, H, D), dt["dq"], call.device),
         "dk": _alloc((T, H, D), dt["dk"], call.device),
         "dv": _alloc((T, H, D), dt["dv"], call.device),
-        "dg": _alloc((T, H, D), dt["dg"], call.device),
-        "dbeta": _alloc((T, H), dt["dbeta"], call.device),
     }
+    if call.gate == "raw":
+        call.grads["dg_raw"] = _alloc((T, H, D), dt["dg_raw"], call.device)
+        call.grads["dbeta"] = _alloc((T, H), dt["dbeta"], call.device)
+        if call.local is not None and T > 0:
+            nc_pad = int(call.local.plan.NC_pad)
+            for name in ("dA_part", "db_part"):
+                call.grads[name] = _alloc((nc_pad, H, D, 2), dt["dA_log"], call.device)
+            # param_finalize's per-call scratch: the second-stage partials and the per-head ticket
+            fin = cake_backend._raw_finalize_scratch(nc_pad, H, call.device)
+            call.grads["part2"] = fin["part2"]
+            call.grads["ticket"] = fin["ticket"]
+            call.scratch["seg_cap"] = int(fin["seg_cap"])
+            call.grads["dA_log"] = _alloc((H,), dt["dA_log"], call.device)
+            call.grads["ddt_bias"] = _alloc((H * D,), dt["ddt_bias"], call.device)
+        else:  # no local stage runs on this rank: its tokens contribute nothing
+            call.grads["dA_log"] = _zeros((H,), dt["dA_log"], call.device)
+            call.grads["ddt_bias"] = _zeros((H * D,), dt["ddt_bias"], call.device)
+        _backward(call, saved)
+        return tuple(call.grads[n] for n in _RAW_GRADS)
+    call.grads["dg"] = _alloc((T, H, D), dt["dg"], call.device)
+    call.grads["dbeta"] = _alloc((T, H), dt["dbeta"], call.device)
     _backward(call, saved)
     return tuple(call.grads[n] for n in ("dq", "dk", "dv", "dbeta", "dg"))
 
@@ -6265,7 +6503,13 @@ def _handle_fingerprint(
         ("keep", keep),
         (
             "operands",
-            tuple((n, tuple(t.shape), t.dtype) for n, t in call.ops.items()),
+            tuple(
+                (n, tuple(t.shape), t.dtype)
+                for n, t in call.ops.items()
+                # tensors only: the raw mode's lower bound goes under "modes" (with the mode); its stride
+                # ints are host scalars of the layout only
+                if isinstance(t, torch.Tensor)
+            ),
         ),
         ("options", tuple(sorted(dataclasses.asdict(call.opts).items()))),
         ("modes", tuple(sorted(modes.items()))),
@@ -6314,12 +6558,35 @@ def _handle_bind(
     return bound
 
 
+def _gate_modes(call: CallKcp) -> dict[str, Any]:
+    """The gate keywords of a call in a recompute handle's fingerprint: the mode and the raw mode's FP32 lower bound
+    (a recompute binds the stored states only under the same gate; ``A_log`` / ``dt_bias`` are operands)."""
+    gp = call.gate_params
+    return {
+        "use_gate_in_kernel": call.gate == "raw",
+        "lower_bound": None if gp is None else gp.lower_bound,
+    }
+
+
 def _fwd_handle(
-    q, k, v, g, beta, ctx, *, scale, save_mode, workspace, opts, handle, tape=False
+    q,
+    k,
+    v,
+    g,
+    beta,
+    ctx,
+    *,
+    scale,
+    save_mode,
+    workspace,
+    opts,
+    handle,
+    tape=False,
+    gate_args: dict[str, Any] | None = None,
 ) -> tuple[torch.Tensor, SavedKcp]:
     """The forward of a call with a handle (eager, saved mode): the original forward exchanges and stores the
     handle's entry; the recompute binds it (:func:`_forward`).  ``tape``: the checkpoint hand-off keeps the tape set
-    too (:func:`_fwd_body`)."""
+    too (:func:`_fwd_body`).  ``gate_args``: the entry point's gate keywords."""
     keep = "transfer" if opts.save_transfer else "states"
     entry = _handle_lookup(handle)
     call, batched = _prepare(
@@ -6334,8 +6601,11 @@ def _fwd_handle(
         workspace=workspace,
         options=opts,
         backward=False,
+        **(gate_args or {}),
     )
-    fingerprint = _handle_fingerprint(call, save_mode=save_mode, keep=keep)
+    fingerprint = _handle_fingerprint(
+        call, save_mode=save_mode, keep=keep, **_gate_modes(call)
+    )
     bound = None if entry is None else _handle_bind(entry, call, fingerprint, keep)
     out, saved = _fwd_body(
         call, save=True, save_mode=save_mode, ctx=ctx, bound=bound, tape=tape
@@ -6755,7 +7025,10 @@ class ChunkKDAFunctionKcp(torch.autograd.Function):
     handle is refused with graph replay, inside a CUDA-graph capture, with ``debug_sequence``, ``spec3_probe`` and
     ``boundary_mode="replay"``.  The node records the mode of its forward (``deterministic=False``, the only mode of
     this package) and its backward runs that mode.  ``handoff``: :func:`chunk_kda_kcp`'s checkpoint hand-off decision
-    (:func:`_handoff_decide`); ``True``: the forward keeps its tape set and the backward reads it."""
+    (:func:`_handoff_decide`); ``True``: the forward keeps its tape set and the backward reads it.  Raw gate mode
+    (``use_gate_in_kernel``): the node saves the raw gate (the caller's view) and ``A_log`` / ``dt_bias`` beside the
+    KCP saved set, which records the mode and ``lower_bound``, and returns the gradients of the raw gate, ``A_log``
+    and ``dt_bias`` (the parameter gradients: this rank's partial sums, :func:`chunk_kda_bwd_kcp`)."""
 
     @staticmethod
     def forward(
@@ -6773,7 +7046,12 @@ class ChunkKDAFunctionKcp(torch.autograd.Function):
         options,
         handle=None,
         handoff=False,
+        use_gate_in_kernel=False,
+        A_log=None,
+        dt_bias=None,
+        lower_bound=None,
     ):
+        gate_args = _gate_args(use_gate_in_kernel, A_log, dt_bias, lower_bound)
         # the checkpoint hand-off: chunk_kda_kcp's decision, made once per checkpointed call (both passes alike)
         tape = bool(handoff)
         if handle is None and tape:
@@ -6803,6 +7081,7 @@ class ChunkKDAFunctionKcp(torch.autograd.Function):
                 boundary_mode=boundary_mode,
                 workspace=workspace,
                 deterministic=False,
+                **gate_args,
                 **options,
             )
         else:
@@ -6821,9 +7100,12 @@ class ChunkKDAFunctionKcp(torch.autograd.Function):
                 opts=opts,
                 handle=handle,
                 tape=tape,
+                gate_args=gate_args,
             )
+        raw = use_gate_in_kernel is True
+        params = (A_log, dt_bias) if raw else ()
         tensors = saved.tensors() if saved is not None else ()
-        fctx.save_for_backward(q, k, v, g, beta, *tensors)
+        fctx.save_for_backward(q, k, v, g, beta, *params, *tensors)
         # the forward's mode; the backward runs it (and reads the saved set it wrote)
         fctx.deterministic = False
         fctx.kcp = (
@@ -6833,13 +7115,17 @@ class ChunkKDAFunctionKcp(torch.autograd.Function):
             workspace,
             dict(options),
             None if saved is None else (saved.flags(), saved.meta()),
+            (raw, lower_bound),
         )
         return out
 
     @staticmethod
     def backward(fctx, dout):
         q, k, v, g, beta, *tensors = fctx.saved_tensors
-        ctx, scale, save_mode, workspace, options, meta = fctx.kcp
+        ctx, scale, save_mode, workspace, options, meta, (raw, lower_bound) = fctx.kcp
+        A_log = dt_bias = None
+        if raw:
+            A_log, dt_bias, *tensors = tensors
         saved = (
             None
             if meta is None
@@ -6847,7 +7133,7 @@ class ChunkKDAFunctionKcp(torch.autograd.Function):
         )
         if not dout.is_contiguous():
             dout = dout.contiguous()
-        dq, dk, dv, dbeta, dg = chunk_kda_bwd_kcp(
+        grads = chunk_kda_bwd_kcp(
             q,
             k,
             v,
@@ -6860,9 +7146,24 @@ class ChunkKDAFunctionKcp(torch.autograd.Function):
             save_mode=save_mode,
             workspace=workspace,
             deterministic=fctx.deterministic,
+            **_gate_args(raw, A_log, dt_bias, lower_bound),
             **options,
         )
-        return dq, dk, dv, dg, dbeta, None, None, None, None, None, None, None, None
+        dq, dk, dv, dbeta, dg = grads[:5]
+        dA_log, ddt_bias = grads[5:] if raw else (None, None)
+        return (
+            dq,
+            dk,
+            dv,
+            dg,
+            dbeta,
+            # ctx, scale, save_mode, boundary_mode, workspace, options, handle, handoff
+            *(None,) * 8,
+            None,  # use_gate_in_kernel
+            dA_log,
+            ddt_bias,
+            None,  # lower_bound
+        )
 
 
 def chunk_kda_kcp(
@@ -6880,10 +7181,23 @@ def chunk_kda_kcp(
     recompute_handle: Any = None,
     checkpoint_keep: str | None = None,
     checkpoint_handoff: str = KCP_HANDOFF_DEFAULT,
+    use_gate_in_kernel: bool = False,
+    A_log: torch.Tensor | None = None,
+    dt_bias: torch.Tensor | None = None,
+    lower_bound: float | None = None,
     deterministic: bool = True,
     **options: Any,
 ) -> torch.Tensor:
     """The differentiable KCP forward (the KCP contract §3.2 signature): ``out`` like ``v``; gradients for ``q, k, v, g, beta``.
+
+    ``use_gate_in_kernel=True`` (raw gate mode; keyword-only with ``A_log`` / ``dt_bias`` / ``lower_bound``, as
+    :func:`chunk_kda_fwd_kcp`): ``g`` is the raw gate and the gradients are those of ``q, k, v``, the raw gate
+    (BF16), ``beta``, ``A_log`` and ``dt_bias`` (FP32).  The parameter gradients of a rank are its partial sums
+    (the gradients through its own tokens); sum them over ``ctx.group`` as for any parameter replicated across the
+    context-parallel ranks, or with :func:`reduce_gate_param_grads_kcp` for a bitwise reproducible sum.  A recompute
+    handle's entry records the gate mode and ``lower_bound``: a recompute in another mode never binds it.  The
+    checkpoint hand-off below does not engage in raw gate mode (its tape set is verified on the explicit gate only):
+    the call keeps the light set under every ``checkpoint_handoff`` value, records no decision and counts nothing.
 
     ``checkpoint_handoff`` (keyword-only; ``"auto"`` default, ``"on"``, ``"off"``): under ``torch.utils.checkpoint``
     the forward keeps its tape set (``h``, ``v_new``, ``w`` and the internal ``Aqk`` / ``Akk`` rows,
@@ -6927,9 +7241,11 @@ def chunk_kda_kcp(
             f"boundary_mode must be one of {BOUNDARY_MODES}, got {boundary_mode!r}"
         )
     # the checkpoint hand-off, decided in the caller's frame once per checkpointed call (the recompute replays the
-    # original forward's decision)
-    handoff = _handoff_decide(
-        _handoff_mode(checkpoint_handoff), opts, boundary_mode, ctx, q, k, v, g, beta
+    # original forward's decision); a raw gate call keeps the light set in both passes alike (its own keyword decides
+    # that: no frame record, no recompute cursor)
+    mode = _handoff_mode(checkpoint_handoff)
+    handoff = use_gate_in_kernel is not True and _handoff_decide(
+        mode, opts, boundary_mode, ctx, q, k, v, g, beta
     )
     if recompute_handle is None:
         if checkpoint_keep is not None:
@@ -6952,6 +7268,10 @@ def chunk_kda_kcp(
             dict(options),
             None,
             handoff,
+            use_gate_in_kernel,
+            A_log,
+            dt_bias,
+            lower_bound,
         )
     opts = _handle_options(opts, checkpoint_keep, options.get("save_transfer"))
     _handle_refusals(opts, boundary_mode, recompute_handle)
@@ -6969,7 +7289,62 @@ def chunk_kda_kcp(
         {"_kcp_options": opts},
         recompute_handle,
         handoff,
+        use_gate_in_kernel,
+        A_log,
+        dt_bias,
+        lower_bound,
     )
+
+
+def reduce_gate_param_grads_kcp(
+    ctx: Any, dA_log: torch.Tensor, ddt_bias: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The raw gate mode's full parameter gradients from every rank's partial sums, bitwise reproducible.
+
+    ``dA_log`` (FP32 ``[H]``) and ``ddt_bias`` (FP32 ``[H * 128]`` or ``[H, 128]``) are this rank's partial sums
+    from :func:`chunk_kda_bwd_kcp` / :func:`chunk_kda_kcp` with ``use_gate_in_kernel=True`` (the gradients through
+    the rank's own tokens).  Every rank of ``ctx.group`` must call this with the same shapes: one
+    ``all_gather_into_tensor`` of the ``H + H * 128`` FP32 values on ``ctx.group`` brings every rank's partials in
+    group-rank order, then each rank adds them in FP32 in rank order ``0, 1, ..., W - 1`` (no summation in the
+    collective).  So every rank gets the same bits, and the result depends only on the per-rank partials, which
+    depend only on the rank's tokens and the partition (not on the exchange, schedule, graph replay or recompute).
+    The deterministic package's ``reduce_gate_param_grads_det_kcp`` is the same algorithm: from the same partials
+    the two give the same bits.  An NCCL all-reduce of the partials gives the same sum up to FP32 rounding but does
+    not fix its summation order (it varies with the algorithm, the topology and the message size): use this helper
+    when the parameter gradients must be bitwise reproducible.  Returns fresh ``(dA_log, ddt_bias)`` of the inputs'
+    shapes; with ``world_size == 1`` copies of the inputs.  With ``world_size > 1`` the ``torch.distributed``
+    process group must be initialized: without one the inputs are only this rank's partial sums, so the call raises
+    ``RuntimeError`` instead of returning them.  Asynchronous on the current stream, no host synchronization."""
+    if dA_log.dtype != torch.float32 or ddt_bias.dtype != torch.float32:
+        raise ValueError(
+            f"dA_log / ddt_bias: expected torch.float32, got {dA_log.dtype} / {ddt_bias.dtype}"
+        )
+    H = int(dA_log.numel())
+    if dA_log.dim() != 1 or int(ddt_bias.numel()) != H * D:
+        raise ValueError(
+            f"dA_log [H] and ddt_bias [H * {D}] (or [H, {D}]) expected, got {tuple(dA_log.shape)} / "
+            f"{tuple(ddt_bias.shape)}"
+        )
+    if dA_log.device != ddt_bias.device:
+        raise ValueError(
+            f"dA_log on {dA_log.device}, ddt_bias on {ddt_bias.device}: one device expected"
+        )
+    W = int(ctx.world_size)
+    if W == 1:
+        return dA_log.clone(), ddt_bias.clone()
+    if not (dist.is_available() and dist.is_initialized()):
+        raise RuntimeError(
+            f"reduce_gate_param_grads_kcp: world_size {W} needs an initialized torch.distributed process "
+            "group; without one only this rank's partial sums are available"
+        )
+    n = H + H * D
+    mine = torch.cat((dA_log.reshape(-1), ddt_bias.reshape(-1)))
+    every = _alloc((W, n), torch.float32, mine.device)
+    dist.all_gather_into_tensor(every, mine, group=ctx.group)
+    total = every[0].clone()
+    for r in range(1, W):  # FP32, in rank order
+        total.add_(every[r])
+    return total[:H].clone(), total[H:].view(tuple(ddt_bias.shape)).clone()
 
 
 # the plan module's byte queries, re-exported for the KCP contract §3.2 literal forms
@@ -7040,6 +7415,7 @@ __all__ = [
     "KCP_HANDOFF_VERIFIED",
     "kcp_handoff_stats",
     "kda_handoff_bytes_kcp",
+    "reduce_gate_param_grads_kcp",
     "set_backend",
     "tile_index",
 ]
