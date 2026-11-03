@@ -90,6 +90,23 @@ metadata, swap those two tensors and launch.  The host time per layer drops;
 the device work is unchanged.  `debug=True` runs the full per-call checks on
 every layer and raises if a launch differs from the prepared one.
 
+*Layer graphs.*  `MSAIcpIndexerPlan.layer_graphs(capture_after=1, max_keys=4)`
+captures each layer of a step in its own CUDA Graph and replays it in later
+steps whose launches are the same.  Per step,
+`begin_step(prefill=, decode=, exchange=, exchange_key=, decode_tokens=)`
+takes the step objects and the caller's exchange (one call per layer, from the
+prefill `send` into `received`); `run(layer, index_q, index_k, slot=)` runs
+one layer (decode rows first in `index_q`).  The key of a step is every launch
+argument except the query and K (tensor address and metadata, scalar value),
+the K shard of each layer, the query metadata and `exchange_key`.  A key's
+first `capture_after` steps run eagerly, the next one captures and replays,
+later ones only copy the query into a staging buffer and replay.  The
+exchange is captured inside each layer's graph, once per layer.  Device data
+(plans, block tables, lengths, K pages) may change between steps.  To keep
+one key over steps of different lengths, build every window plan with
+`max_seq_len` the model limit and size the score scratch with
+`prefill_scratch_shape()`; with the fused path the pool needs no change.
+
 The package is a vendorable Cake package: `build.json` lists every
 `<program>_<arch>` library with its sources and flags, `cake_build.py` builds
 or loads them, and `cake_jit.py` is the registry that routes each call by

@@ -36,7 +36,8 @@ launch can stall behind a peer's spinning merge).
 
 from __future__ import annotations
 
-from typing import Any, Optional, Sequence
+import collections
+from typing import Any, Callable, Hashable, Optional, Sequence
 
 import torch
 
@@ -704,6 +705,14 @@ class MSAIcpIndexerPlan:
             debug=debug,
         )
 
+    def layer_graphs(
+        self, *, capture_after: int = 1, max_keys: int = 4
+    ) -> "MSAIcpLayerGraphs":
+        """A cache of per-layer CUDA graphs of prepared steps, replayed across
+        steps whose launches are the same (see :class:`MSAIcpLayerGraphs`).
+        One per rank, kept for the life of the caller's buffers."""
+        return MSAIcpLayerGraphs(self, capture_after=capture_after, max_keys=max_keys)
+
 
 # --------------------------------------------------------------------------- step prepare
 
@@ -929,6 +938,24 @@ class MSAIcpPrefillStep(_StepBase):
                 _check_same_launches(calls, got, "prefill step merge")
         cj.launch_recorded(calls, self.device_index)
 
+    def record(
+        self, index_q: torch.Tensor, index_k: torch.Tensor
+    ) -> list[cj.RecordedLaunch]:
+        """Prepare the step without launching (the first layer's host checks)
+        and return its launches: every window's, then the merge's."""
+        if self._local is None:
+            self._prepare_local(index_q, index_k)
+        else:
+            self._check_layer(self._sig, index_q, index_k)
+        if self._merge is None:
+            self._merge = self._record(
+                self.indexer.prefill_merge,
+                self.received,
+                self.num_valid_pages,
+                self.output,
+            )
+        return [p.call for p in self._local] + list(self._merge)
+
 
 class MSAIcpDecodeStep(_StepBase):
     """The decode side of one step (:meth:`MSAIcpIndexerPlan.prepare_decode_step`).
@@ -994,3 +1021,283 @@ class MSAIcpDecodeStep(_StepBase):
                 calls, self._per_call(index_q, index_k, slot), "decode step"
             )
         cj.launch_recorded(calls, self.device_index)
+
+    def record(
+        self, index_q: torch.Tensor, index_k: torch.Tensor, *, slot: int
+    ) -> list[cj.RecordedLaunch]:
+        """Prepare slot ``slot`` without launching (the facade's host checks
+        on its first use) and return its launches."""
+        prepared = self._slots.get(slot)
+        if prepared is None:
+            calls = self._per_call(index_q, index_k, slot)
+            if not self._sig:
+                self._sig = (_signature(index_q), _signature(index_k))
+            else:
+                self._check_layer(self._sig, index_q, index_k)
+            prepared = self._slots[slot] = [_PreparedLaunch(c, None) for c in calls]
+        else:
+            self._check_layer(self._sig, index_q, index_k)
+        return [p.call for p in prepared]
+
+
+# --------------------------------------------------------------------------- layer graphs
+
+# Step keys whose run count MSAIcpLayerGraphs remembers (most recent first out).
+_SEEN_KEYS = 64
+
+
+def _arg_key(a: Any) -> Any:
+    """What a recorded launch depends on in argument ``a``: a tensor's address
+    and metadata, a scalar's value."""
+    if isinstance(a, torch.Tensor):
+        return (a.data_ptr(), tuple(a.shape), tuple(a.stride()), a.dtype)
+    return (type(a).__name__, a)
+
+
+def _launch_key(calls: Sequence[cj.RecordedLaunch]) -> tuple:
+    """The launches ``calls`` as a hashable key, except their ``q`` and ``k``
+    arguments (a layer's own, bound at capture)."""
+    out = []
+    for c in calls:
+        skip = {c.position("q"), c.position("k")}
+        out.append(
+            (
+                c.name,
+                c.device,
+                tuple(_arg_key(a) for i, a in enumerate(c.args) if i not in skip),
+            )
+        )
+    return tuple(out)
+
+
+class MSAIcpLayerGraphs:
+    """Per-layer CUDA graphs of prepared steps, replayed across steps
+    (:meth:`MSAIcpIndexerPlan.layer_graphs`).
+
+    A step's layer runs the decode chain of a :class:`MSAIcpDecodeStep`, the
+    windows of a :class:`MSAIcpPrefillStep`, the caller's exchange and the
+    prefill merge (each part optional).  Its graph key is every argument of
+    every launch of that layer (tensor address, shape, strides and dtype;
+    scalar value) except the query, plus the layer's K shard, its slot, the
+    query's shape and strides and the caller's ``exchange_key``.  The first
+    ``capture_after`` steps of a key run eagerly; the next one captures each
+    layer into its own graph (the exchange inside: still one per layer) and
+    replays it; every later step of the key only replays.  A replay copies the
+    layer's query into the key's staging buffer, then launches the graph:
+    about 10 microseconds of host time per layer.
+
+    Device data (plans, valid-page counts, block tables, sequence lengths, K
+    contents, receive rows and their counters) may change between steps:
+    the graphs read it where the launches do.  The caller's buffers must keep
+    their address, shape and strides while a key's graphs live (persistent
+    buffers do); a buffer that moves gives a new key.  A window plan's
+    ``max_seq_len`` and the score scratch pitch are launch arguments: build
+    the plans with the model limit and the scratch with
+    :meth:`MSAIcpIndexerPlan.prefill_scratch_shape` to keep one key over
+    steps of different lengths.  At most
+    ``max_keys`` keys keep graphs, least recently used first out.  Each rank
+    decides alone; every path makes the same launches and one exchange per
+    layer, so ranks never disagree on the communication.
+    """
+
+    def __init__(
+        self, indexer: MSAIcpIndexerPlan, *, capture_after: int, max_keys: int
+    ) -> None:
+        if capture_after < 0 or max_keys < 1:
+            raise ValueError("need capture_after >= 0 and max_keys >= 1")
+        self.indexer = indexer
+        self.capture_after = int(capture_after)
+        self.max_keys = int(max_keys)
+        self.device_index = indexer.device.index
+        # step key -> {layer key -> graph}; LRU order; how often each step key ran.
+        self._graphs: collections.OrderedDict[tuple, dict[tuple, Any]] = (
+            collections.OrderedDict()
+        )
+        # How often each recent step key ran (the last _SEEN_KEYS keys).
+        self._seen: collections.OrderedDict[tuple, int] = collections.OrderedDict()
+        # query (shape, strides, dtype) -> staging buffer the graphs read.
+        self._staging: dict[tuple, torch.Tensor] = {}
+        self._pool: Any = None
+        self._stream: Optional[torch.cuda.Stream] = None
+        self.stats = collections.Counter()
+
+    def begin_step(
+        self,
+        *,
+        prefill: Optional[MSAIcpPrefillStep] = None,
+        decode: Optional[MSAIcpDecodeStep] = None,
+        exchange: Optional[Callable[[], None]] = None,
+        exchange_key: Hashable = None,
+        decode_tokens: int = 0,
+    ) -> "MSAIcpGraphStep":
+        """One step: ``prefill`` / ``decode`` the step objects of this step
+        (from this indexer), ``exchange`` the caller's one exchange per layer
+        (``send -> received`` of ``prefill``; required with ``prefill``) and
+        ``exchange_key`` what identifies it across steps (its group, say).
+        A layer's query holds the ``decode_tokens`` decode rows first, then
+        the prefill rows."""
+        if prefill is None and decode is None:
+            raise ValueError("a graph step needs a prefill or a decode step")
+        for st in (prefill, decode):
+            if st is not None and st.indexer is not self.indexer:
+                raise ValueError("the step objects must come from this indexer")
+        if (prefill is None) != (exchange is None):
+            raise ValueError("exchange goes with a prefill step, and only with one")
+        if decode is None and decode_tokens:
+            raise ValueError("decode_tokens needs a decode step")
+        return MSAIcpGraphStep(
+            self, prefill, decode, exchange, exchange_key, int(decode_tokens)
+        )
+
+    def clear(self) -> None:
+        """Drop every graph and staging buffer (after the caller's buffers move
+        for good, or to free the graphs)."""
+        self._graphs.clear()
+        self._seen.clear()
+        self._staging.clear()
+
+    def _staging_for(self, index_q: torch.Tensor) -> torch.Tensor:
+        key = (tuple(index_q.shape), tuple(index_q.stride()), index_q.dtype)
+        buf = self._staging.get(key)
+        if buf is None:
+            buf = torch.empty_strided(
+                index_q.shape,
+                index_q.stride(),
+                dtype=index_q.dtype,
+                device=index_q.device,
+            )
+            self._staging[key] = buf
+        return buf
+
+    def _capture(self, body: Callable[[], None]) -> Any:
+        """``body``'s launches captured on a side stream into a new graph."""
+        if self._stream is None:
+            self._stream = torch.cuda.Stream(device=self.device_index)
+            self._pool = torch.cuda.graph_pool_handle()
+        graph = torch.cuda.CUDAGraph()
+        current = torch.cuda.current_stream(self.device_index)
+        self._stream.wait_stream(current)
+        with torch.cuda.stream(self._stream):
+            graph.capture_begin(pool=self._pool, capture_error_mode="thread_local")
+            try:
+                body()
+            finally:
+                graph.capture_end()
+        current.wait_stream(self._stream)
+        return graph
+
+    def _graphs_of(self, step_key: tuple) -> Optional[dict[tuple, Any]]:
+        graphs = self._graphs.get(step_key)
+        if graphs is not None:
+            self._graphs.move_to_end(step_key)
+        return graphs
+
+    def _new_key(self, step_key: tuple) -> dict[tuple, Any]:
+        while len(self._graphs) >= self.max_keys:
+            self._graphs.popitem(last=False)
+            self.stats["evicted_keys"] += 1
+        graphs = self._graphs[step_key] = {}
+        return graphs
+
+
+class MSAIcpGraphStep:
+    """One step of :class:`MSAIcpLayerGraphs`
+    (:meth:`MSAIcpLayerGraphs.begin_step`)."""
+
+    def __init__(
+        self,
+        cache: MSAIcpLayerGraphs,
+        prefill: Optional[MSAIcpPrefillStep],
+        decode: Optional[MSAIcpDecodeStep],
+        exchange: Optional[Callable[[], None]],
+        exchange_key: Hashable,
+        decode_tokens: int,
+    ) -> None:
+        self.cache = cache
+        self.prefill = prefill
+        self.decode = decode
+        self.exchange = exchange
+        self.exchange_key = exchange_key
+        self.decode_tokens = decode_tokens
+        self._step_key: Optional[tuple] = None
+        self._mode: Optional[str] = None  # "eager", "capture" or "replay"
+
+    def _parts(self, index_q: torch.Tensor):
+        nd = self.decode_tokens
+        q_d = index_q[:nd] if self.decode is not None else None
+        q_p = index_q[nd:] if self.prefill is not None else None
+        return q_d, q_p
+
+    def _layer_body(
+        self, index_q: torch.Tensor, index_k: torch.Tensor, slot: int
+    ) -> None:
+        q_d, q_p = self._parts(index_q)
+        if self.decode is not None:
+            self.decode.run(q_d, index_k, slot=slot)
+        if self.prefill is not None:
+            self.prefill.local(q_p, index_k)
+            self.exchange()
+            self.prefill.merge()
+
+    def run(
+        self, layer: int, index_q: torch.Tensor, index_k: torch.Tensor, *, slot: int = 0
+    ) -> None:
+        """Layer ``layer`` of the step: ``index_q`` ``[T, H, 128]`` (the decode
+        rows, then the prefill rows), ``index_k`` the layer's K shard,
+        ``slot`` its decode receive slot set."""
+        cache = self.cache
+        if self._step_key is None:
+            # The step's launches, recorded once (no launch): the prefill
+            # windows and merge, and the decode chain of every slot set.
+            q_d, q_p = self._parts(index_q)
+            prefill_key = (
+                _launch_key(self.prefill.record(q_p, index_k))
+                if self.prefill is not None
+                else None
+            )
+            decode_key = (
+                tuple(
+                    _launch_key(self.decode.record(q_d, index_k, slot=s))
+                    for s in _SLOTS
+                )
+                if self.decode is not None
+                else None
+            )
+            self._step_key = (
+                prefill_key,
+                decode_key,
+                self.exchange_key,
+                self.decode_tokens,
+                (tuple(index_q.shape), tuple(index_q.stride()), index_q.dtype),
+            )
+            graphs = cache._graphs_of(self._step_key)
+            seen = cache._seen.pop(self._step_key, 0)
+            cache._seen[self._step_key] = seen + 1
+            while len(cache._seen) > _SEEN_KEYS:
+                cache._seen.popitem(last=False)
+            if graphs is not None:
+                self._mode = "replay"
+            elif seen >= cache.capture_after:
+                cache._new_key(self._step_key)
+                self._mode = "capture"
+            else:
+                self._mode = "eager"
+        if self._mode == "eager":
+            self._layer_body(index_q, index_k, slot)
+            cache.stats["eager_layers"] += 1
+            return
+        layer_key = (layer, slot, _arg_key(index_k))
+        graphs = cache._graphs.get(self._step_key)
+        if graphs is None:
+            # The key was evicted within the step (more keys than max_keys in flight).
+            graphs = cache._new_key(self._step_key)
+        staging = cache._staging_for(index_q)
+        staging.copy_(index_q)
+        graph = graphs.get(layer_key)
+        if graph is None:
+            graph = cache._capture(lambda: self._layer_body(staging, index_k, slot))
+            graphs[layer_key] = graph
+            cache.stats["captured_layers"] += 1
+        else:
+            cache.stats["replayed_layers"] += 1
+        graph.replay()
