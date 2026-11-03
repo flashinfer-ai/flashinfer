@@ -2914,6 +2914,42 @@ def test_transpose_tiles_scratch_is_bitwise_the_temporary_form() -> None:
     assert "scratch" in kcp.CallKcp.transpose_tiles.__kwdefaults__
 
 
+def _held_pools(kcp, ctx, ops, *, pools=("stage_b", "stage_m", "carry"), **opts):
+    """The explicit forward and backward entries (per-call workspaces) under a recording fake backend: the most bytes
+    each pool of ``pools`` holds at a launch of the forward and of the backward (a pool the call does not size is
+    absent), and the saved set."""
+    held: dict[str, dict[str, int]] = {"fwd": {}, "bwd": {}}
+    phase = ["fwd"]
+
+    class Recording(kcp.FakeBackend):
+        def run(self, name, args):
+            sizes = args["_call"].ws.pool_bytes
+            got = held[phase[0]]
+            for pool in pools:
+                if pool in sizes:
+                    got[pool] = max(got.get(pool, 0), sizes[pool])
+            super().run(name, args)
+
+    args = (ops["q"], ops["k"], ops["v"], ops["g"], ops["beta"], ctx)
+    previous = kcp.set_backend("fake", Recording())
+    try:
+        _, saved = kcp.chunk_gdn_fwd_kcp(
+            *args, backend="fake", deterministic=False, **opts
+        )
+        phase[0] = "bwd"
+        kcp.chunk_gdn_bwd_kcp(
+            *args,
+            ops["dout"],
+            saved=saved,
+            backend="fake",
+            deterministic=False,
+            **opts,
+        )
+    finally:
+        kcp.set_backend("fake", previous)
+    return held, saved
+
+
 def test_workspace_layout_counts_one_staging_plane_under_save_transfer() -> None:
     """R2-L1 1a: ``gdn_workspace_layout_kcp`` counts the ``stage_m`` plane only when the call sizes it (replay
     boundary or ``save_transfer=False``); under the shipped saved + ``save_transfer`` form the saved ``M_seg^T``
@@ -2955,6 +2991,57 @@ def test_workspace_layout_counts_one_staging_plane_under_save_transfer() -> None
             gb.gdn_workspace_layout_kcp(ctx, H_qk=H_qk, HV=HV, P=1)["fwd.staging"] == 0
         )
     assert seen_segmented  # the row has a segmented rank: the plane term was exercised
+
+
+@pytest.mark.parametrize(
+    "opts,planes",
+    [
+        ({}, 1),  # the shipped light saved form with save_transfer: stage_b alone
+        ({"save_transfer": False}, 2),
+        ({"save_mode": "full", "save_transfer": False}, 1),
+        ({"save_mode": "full"}, 1),
+        ({"boundary_mode": "replay"}, 2),
+    ],
+)
+def test_workspace_layout_follows_the_segments_override(opts, planes) -> None:
+    """``gdn_workspace_layout_kcp(P=...)`` reports the planes of a call at that ``segments`` override: on the
+    checkpoint pack (one rank, five fragments, the plan's own ``P = 1``) a call with ``segments=2`` holds staging
+    planes of ``NSEG = 2 n_frag`` states and a carry plane of ``n_frag`` states in both lifetimes, and the layout at
+    ``P = 2`` counts the same bytes in every save form (it read the staging plane from the plan's ``NSEG``, half the
+    call's here).  An override outside the range the call accepts is refused by both byte queries, as by
+    ``ContextKcp.heads``."""
+    kcp, ctx, ops = _ckpt_setup()
+    H_qk, HV = CKPT_HEADS
+    assert ctx.heads(HV).P == 1 and ctx.n_frag == 5
+    s = HV * gp.STATE_TILE_BYTES
+    plane = 2 * ctx.n_frag * s
+    assert plane == 3_932_160
+    held, _ = _held_pools(kcp, ctx, ops, segments=2, **opts)
+    assert kcp.LAST_CALL["fwd"]["P"] == kcp.LAST_CALL["bwd"]["P"] == 2
+    layout = gb.gdn_workspace_layout_kcp(ctx, H_qk=H_qk, HV=HV, P=2, **opts)
+    for phase in ("fwd", "bwd"):
+        staging = held[phase].get("stage_b", 0) + held[phase].get("stage_m", 0)
+        assert staging == planes * plane == layout[f"{phase}.staging"], (
+            phase,
+            held,
+            layout[f"{phase}.staging"],
+        )
+        assert held[phase]["carry"] == ctx.n_frag * s == layout[f"{phase}.carry"], (
+            phase,
+            held,
+            layout[f"{phase}.carry"],
+        )
+    rule = gb.gdn_workspace_layout_kcp(ctx, H_qk=H_qk, HV=HV, **opts)
+    assert rule["fwd.staging"] == rule["fwd.carry"] == 0  # the plan's P = 1
+    # the range the call accepts: [1, min(MAX_SEGMENTS, chunks of the longest fragment)] = [1, 16] (1000 tokens)
+    for P in (0, 17):
+        for query in (gb.gdn_workspace_layout_kcp, gb.gdn_saved_layout_kcp):
+            with pytest.raises(ValueError, match=r"override must be in \[1, 16\]"):
+                query(ctx, H_qk=H_qk, HV=HV, P=P, **opts)
+        with pytest.raises(ValueError, match=r"override must be in \[1, 16\]"):
+            ctx.heads(HV, P=P)
+    top = gb.gdn_workspace_layout_kcp(ctx, H_qk=H_qk, HV=HV, P=16, **opts)
+    assert top["fwd.staging"] == planes * 16 * ctx.n_frag * s
 
 
 def test_backward_allocates_the_gradients_right_before_dqkg() -> None:

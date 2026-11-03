@@ -105,7 +105,9 @@ from __future__ import annotations
 
 from . import cake_jit
 from .cake_kcp_plan import (
+    CHUNK,
     HEAD_DIM,
+    MAX_SEGMENTS,
     SAVE_TRANSFER_DEFAULT,
     STATE_TILE_BYTES,
     ContextKcp,
@@ -198,6 +200,22 @@ def _mode(value: str, allowed: tuple[str, ...], name: str) -> str:
 def state_bytes(HV: int) -> int:
     """``s``: one FP32 ``[HV, 128, 128]`` state."""
     return int(HV) * STATE_TILE_BYTES
+
+
+def _segments(ctx: ContextKcp, plan_P: int, P: int | None) -> int:
+    """``P`` segments per fragment of a byte query: the plan's (``plan_P``) when ``P`` is ``None``, else the caller's
+    override (the ``segments`` option of the call) in the range the call accepts, ``[1, min(MAX_SEGMENTS, chunks of
+    the longest fragment of this rank)]`` (:meth:`ContextKcp.heads`); read from the fragments, no plan is built."""
+    if P is None:
+        return plan_P
+    P = int(P)
+    nc_max_frag = max((-(-f.length // CHUNK) for f in ctx.fragments), default=0)
+    p_max = min(MAX_SEGMENTS, max(1, nc_max_frag))
+    if not 1 <= P <= p_max:
+        raise ValueError(
+            f"P={P} override must be in [1, {p_max}] (MAX_SEGMENTS, chunks of the longest fragment)"
+        )
+    return P
 
 
 def gdn_comm_bytes_kcp(
@@ -327,17 +345,15 @@ def gdn_saved_layout_kcp(
     use_qk_l2norm_in_kernel: bool = False,
 ) -> dict[str, int]:
     """The saved set of one layer on this rank, term by term in bytes (design table 4.1; module docstring).
-    ``P`` overrides the plan's segment count (the ``walk_seg`` override knob) for the ``M_seg`` term;
-    ``use_qk_l2norm_in_kernel``: the ``qk_rstd`` term (``8 T_r H_qk``)."""
+    ``P`` overrides the plan's segment count (the call's ``segments`` option; the range the call accepts) for the
+    ``M_seg`` term; ``use_qk_l2norm_in_kernel``: the ``qk_rstd`` term (``8 T_r H_qk``)."""
     H_qk, HV = _check(H_qk, HV)
     l2n = _flag(use_qk_l2norm_in_kernel, "use_qk_l2norm_in_kernel")
     C = _channels(H_qk, HV, C)
     _mode(save_mode, SAVE_MODES, "save_mode")
     _mode(boundary_mode, BOUNDARY_MODES, "boundary_mode")
     hp = ctx.heads(HV)
-    P = hp.P if P is None else int(P)
-    if P < 1:
-        raise ValueError(f"P={P} must be >= 1")
+    P = _segments(ctx, hp.P, P)
     s = state_bytes(HV)
     s_pad = hp.n_owners * hp.Hg * STATE_TILE_BYTES  # = s without padding
     saved = boundary_mode == "saved"
@@ -440,7 +456,9 @@ def gdn_workspace_layout_kcp(
 ) -> dict[str, int]:
     """The caller-held workspace of one rank, term by term (``fwd.*`` / ``bwd.*`` in bytes), with the lifetime
     maxima ``forward`` / ``backward`` and their maximum ``workspace`` (module docstring).  Saved-set tensors are
-    counted by :func:`gdn_saved_layout_kcp`, never here.
+    counted by :func:`gdn_saved_layout_kcp`, never here.  ``P`` overrides the plan's segment count as the call's
+    ``segments`` option does (the range the call accepts): the staging planes (``n_frag P`` states each) and the
+    carry plane (``n_frag (P - 1)`` states) follow it; the split terms do not depend on ``P``.
 
     The terms follow the arena's lifetimes (the host drops a buffer at its last reader, so a lifetime's figure is
     the most the workspace binds in it, not the sum of everything it ever binds):
@@ -482,10 +500,9 @@ def gdn_workspace_layout_kcp(
     _mode(boundary_mode, BOUNDARY_MODES, "boundary_mode")
     _mode(group_reduce, GROUP_REDUCE, "group_reduce")
     kept_form = _kept_form(reuse_recompute_tapes)
+    # the plan's split tables (they do not depend on P) and its segment count
     hp = ctx.heads(HV)
-    P = hp.P if P is None else int(P)
-    if P < 1:
-        raise ValueError(f"P={P} must be >= 1")
+    P = _segments(ctx, hp.P, P)
     n, halo = hp.numel, ctx.halo
     R, NC_pad, T_r = ctx.R, ctx.NC_pad, ctx.T_r
     s = state_bytes(HV)
@@ -497,8 +514,9 @@ def gdn_workspace_layout_kcp(
     # staging planes at P > 1: stage_b always; stage_m only when the call does not bind the saved M_seg^T for it
     # (save_transfer or save_mode="full" under boundary_mode="saved" saves M_seg: the pool of that name is not sized,
     # cake_kcp SAVE_TRANSFER_FRESH_POOLS / _FULL_FRESH_POOLS); the ring pools are sized only under exchange="ring" and
-    # are not workspace here
-    plane = (hp.NSEG * HV * STATE_TILE_BYTES) if P > 1 else 0
+    # are not workspace here.  One plane is NSEG = n_frag P states at the segment count of the call (the override P
+    # too: the call sizes its pools from the overridden plan; equal to the plan's NSEG when P is None)
+    plane = (ctx.n_frag * P * HV * STATE_TILE_BYTES) if P > 1 else 0
     staging = plane + (
         0 if (boundary_mode == "saved" and (save_transfer or full)) else plane
     )
