@@ -2010,17 +2010,18 @@ def test_nvfp4_quantize_fp8_backend_parity(
     )
 
 
-# Input takes the TMA kernel only with m >= 1024, at least 32 MiB of input, and
-# n a multiple of its column chunk (512 for half/bf16, 1024 for FP8); the other
-# shapes guard that routing.
+# Input takes the TMA kernel only with m >= 1024, at least 32 MiB of input, n a
+# multiple of its column chunk (512 for half/bf16, 1024 for FP8) and at least as
+# many b x row tiles as SMs, which 4096 rows give on every supported GPU; the
+# other shapes guard that routing.
 NVFP4_TMA_SHAPES = [
     (1024, 1024),  # below the size threshold
-    (1024, 32768),
+    (1024, 32768),  # 64 half/bf16 row tiles, fewer than SMs
     (4096, 8192),
     (4096, 8704),  # odd multiple of 512
-    (1100, 32768),  # m not a multiple of 128
-    (1025, 32768),  # last row tile holds a single row
-    (1024, 33792),  # odd number of FP8 column chunks
+    (4100, 8192),  # m not a multiple of 128
+    (4097, 8192),  # last row tile holds a single row
+    (4096, 9216),  # odd number of FP8 column chunks
 ]
 NVFP4_TMA_DTYPES = [torch.float8_e4m3fn, *DTYPES]
 NON_TMA_ROWS = 512
@@ -2094,7 +2095,7 @@ def test_nvfp4_quantize_4over6_tma_matches_non_tma(
     torch.set_default_device(device)
     torch.manual_seed(42)
 
-    x = torch.randn((1024, 16384), dtype=torch.bfloat16)
+    x = torch.randn((4096, 4096), dtype=torch.bfloat16)
     _assert_nvfp4_tma_matches_non_tma(x, sf_layout, NVFP44Over6Config())
 
 
@@ -2218,7 +2219,7 @@ def test_nvfp4_quantize_tma_backend_parity(
 # The CUDA TMA kernel walks rows in tiles of 16 for half/bf16, while 8x4 scale
 # factors are allocated for rows padded only to 8; m % 16 in [1, 8] leaves a
 # partial tile past that allocation. Each shape is large enough to take TMA.
-NVFP4_TMA_PARTIAL_ROW_TILE_SHAPES = [(1025, 16384), (1032, 16384), (1032, 32768)]
+NVFP4_TMA_PARTIAL_ROW_TILE_SHAPES = [(4097, 4096), (4104, 4096), (4104, 8192)]
 
 
 @pytest.mark.parametrize("dtype", DTYPES)

@@ -517,11 +517,15 @@ template void invokeNvfp4QuantAndPerTokenScale<__nv_bfloat16>(
 // FP4/MXFP8 Quantization
 
 // Filling and draining the TMA pipeline costs ~2 us more than the vectorized kernel's launch, which
-// its higher bandwidth repays only on large inputs: ~32 MiB on B200 and RTX 5080 (cold L2).
+// its higher bandwidth repays only on large inputs: ~32 MiB on B200 and RTX 5080 (cold L2). Its
+// grid spans b x row tiles, which must also give every SM one.
 template <typename T>
-bool useTmaQuantization(int b, int m, int n) {
+bool useTmaQuantization(int b, int m, int n, int multiProcessorCount) {
+  using Traits = TmaKernelTraits<T>;
   constexpr int64_t kMinTmaInputBytes = 32ll << 20;
-  return m >= 1024 && n % TmaKernelTraits<T>::TMA_COL_CHUNK == 0 &&
+  int64_t workTiles =
+      static_cast<int64_t>(b) * ((m + Traits::TMA_ROW_TILE - 1) / Traits::TMA_ROW_TILE);
+  return m >= 1024 && workTiles >= multiProcessorCount && n % Traits::TMA_COL_CHUNK == 0 &&
          static_cast<int64_t>(b) * m * n * sizeof(T) >= kMinTmaInputBytes;
 }
 
@@ -623,7 +627,7 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
   if constexpr (std::is_same_v<T, __nv_fp8_e4m3>) {
     // Use TMA kernel for large inputs (high throughput mode)
     if constexpr (SF_VEC_SIZE == 16) {
-      if (useTmaQuantization<T>(b, m, n)) {
+      if (useTmaQuantization<T>(b, m, n, multiProcessorCount)) {
         launchFP4QuantizationTma<BlockScaleQuantizationType::FP8_TO_FP4, T, SF_VEC_SIZE>(
             b, m, n, input, SFScale, output, SFOutput, useUE8M0, layout, multiProcessorCount,
             enable_pdl, use_row_wise_scale, false, inverse_scale, false, NVFP44Over6ErrMode::MAE,
@@ -659,7 +663,7 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
   {
     // Use TMA kernel for large inputs (high throughput mode)
     if constexpr (SF_VEC_SIZE == 16) {
-      if (useTmaQuantization<T>(b, m, n)) {
+      if (useTmaQuantization<T>(b, m, n, multiProcessorCount)) {
         launchFP4QuantizationTma<BlockScaleQuantizationType::FP16_TO_FP4, T, SF_VEC_SIZE>(
             b, m, n, input, SFScale, output, SFOutput, useUE8M0, layout, multiProcessorCount,
             enable_pdl, use_row_wise_scale, recipe.use4Over6, inverse_scale,
