@@ -40,75 +40,6 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
-#define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 512
-#define TMEM_TMEM_SCRATCH_OFFSET 0
-#define NUM_K_PIPE_STAGES 2
-#define NUM_V_PIPE_STAGES 2
-#define NUM_KV_PIPE_STAGES 1
-#define NUM_INDEX_PIPE_STAGES 6
-#define SMEM_SMEM_Q_OFF 1024
-#define SMEM_SMEM_Q_STAGE_BYTES 8192
-#define SMEM_SMEM_Q_STRIDE 8192
-#define SMEM_SMEM_KV_OFF 33792
-#define SMEM_SMEM_KV_STAGE_BYTES 16384
-#define SMEM_SMEM_KV_STRIDE 16384
-#define SMEM_SMEM_V_OFF 33792
-#define SMEM_SMEM_V_STAGE_BYTES 16384
-#define SMEM_SMEM_V_STRIDE 16384
-#define SMEM_SMEM_Q_FULL_OFF 1024
-#define SMEM_SMEM_Q_FULL_STAGE_BYTES 32768
-#define SMEM_SMEM_Q_FULL_STRIDE 32768
-#define SMEM_SMEM_K_FULL_OFF 33792
-#define SMEM_SMEM_K_FULL_STAGE_BYTES 65536
-#define SMEM_SMEM_K_FULL_STRIDE 65536
-#define SMEM_SMEM_V_FULL_OFF 33792
-#define SMEM_SMEM_V_FULL_STAGE_BYTES 65536
-#define SMEM_SMEM_V_FULL_STRIDE 65536
-#define SMEM_SMEM_STATS_MAX_OFF 164864
-#define SMEM_SMEM_STATS_MAX_STAGE_BYTES 1024
-#define SMEM_SMEM_STATS_MAX_STRIDE 1024
-#define SMEM_SMEM_STATS_SUM_OFF 165888
-#define SMEM_SMEM_STATS_SUM_STAGE_BYTES 512
-#define SMEM_SMEM_STATS_SUM_STRIDE 512
-#define SMEM_SMEM_STATS_FINAL_MAX_OFF 166400
-#define SMEM_SMEM_STATS_FINAL_MAX_STAGE_BYTES 512
-#define SMEM_SMEM_STATS_FINAL_MAX_STRIDE 512
-#define SMEM_SMEM_SOFTMAX_WARP_PAIR_EXCHANGE_OFF 166912
-#define SMEM_SMEM_SOFTMAX_WARP_PAIR_EXCHANGE_STAGE_BYTES 1024
-#define SMEM_SMEM_SOFTMAX_WARP_PAIR_EXCHANGE_STRIDE 1024
-#define SMEM_SMEM_CORR_WARP_PAIR_EXCHANGE_OFF 167936
-#define SMEM_SMEM_CORR_WARP_PAIR_EXCHANGE_STAGE_BYTES 512
-#define SMEM_SMEM_CORR_WARP_PAIR_EXCHANGE_STRIDE 512
-#define SMEM_SMEM_SPARSE_INDICES_OFF 168448
-#define SMEM_SMEM_SPARSE_INDICES_STAGE_BYTES 1024
-#define SMEM_SMEM_SPARSE_INDICES_STRIDE 1024
-#define SMEM_SMEM_P_FP8_OFF 175104
-#define SMEM_SMEM_P_FP8_STAGE_BYTES 8192
-#define SMEM_SMEM_P_FP8_STRIDE 8192
-#define SMEM_SMEM_BF16_SCORE_EXCHANGE_OFF 1024
-#define SMEM_SMEM_BF16_SCORE_EXCHANGE_STAGE_BYTES 8192
-#define SMEM_SMEM_BF16_SCORE_EXCHANGE_STRIDE 8192
-#define SMEM_SMEM_MERGE_RECV_OFF 33792
-#define SMEM_SMEM_MERGE_RECV_STAGE_BYTES 65536
-#define SMEM_SMEM_MERGE_RECV_STRIDE 65536
-#define SMEM_SMEM_MERGE_SEND_OFF 99328
-#define SMEM_SMEM_MERGE_SEND_STAGE_BYTES 65536
-#define SMEM_SMEM_MERGE_SEND_STRIDE 65536
-#define SMEM_SMEM_MERGE_STATS_RECV_OFF 175104
-#define SMEM_SMEM_MERGE_STATS_RECV_STAGE_BYTES 512
-#define SMEM_SMEM_MERGE_STATS_RECV_STRIDE 512
-#define SMEM_SMEM_MERGE_STATS_SEND_OFF 183296
-#define SMEM_SMEM_MERGE_STATS_SEND_STAGE_BYTES 512
-#define SMEM_SMEM_MERGE_STATS_SEND_STRIDE 512
-#define SMEM_SMEM_K_HALF_OFF 33792
-#define SMEM_SMEM_K_HALF_STAGE_BYTES 65536
-#define SMEM_SMEM_K_HALF_STRIDE 65536
-#define SMEM_SMEM_V_HALF_BLOCKS_OFF 33792
-#define SMEM_SMEM_V_HALF_BLOCKS_STAGE_BYTES 16384
-#define SMEM_SMEM_V_HALF_BLOCKS_STRIDE 16384
-#define SMEM_TOTAL 191488
-#define THREADS 512
 #define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
@@ -364,7 +295,7 @@ __device__ __forceinline__ void tma_gather4_gmem2smem(
 
 __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
     uint32_t result;
-    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xffffffff;"
+    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xFFFFFFFF;"
         : "=r"(result) : "r"(val));
     return result;
 }
@@ -421,7 +352,7 @@ kernel_cake_dsv4_cbf3168c696847fd3f69(const __grid_constant__ CUtensorMap tmap_q
     int cta_rank;
     asm volatile("mov.b32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
 
-    // Kernel setup ops
+    // Prologue
     uint8_t* smem_q = reinterpret_cast<uint8_t*>(smem_raw + 1024);
     const int smem_q_addr = smem + 1024;
     uint8_t* smem_kv = reinterpret_cast<uint8_t*>(smem_raw + 33792);
@@ -463,8 +394,7 @@ kernel_cake_dsv4_cbf3168c696847fd3f69(const __grid_constant__ CUtensorMap tmap_q
     uint8_t* smem_v_half_blocks = reinterpret_cast<uint8_t*>(smem_raw + 33792);
     const int smem_v_half_blocks_addr = smem + 33792;
 
-    // Mbarrier init (23 pipeline groups, 0 ordered-sequence groups, 45 barriers)
-    // Mbarriers at smem_raw[0..360)
+    // Mbarrier init (45 barriers at smem_raw[0..360))
 
     if (warp == 12) {
         uint32_t leader = elect_sync();
@@ -599,10 +529,12 @@ kernel_cake_dsv4_cbf3168c696847fd3f69(const __grid_constant__ CUtensorMap tmap_q
     asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_tmem_scratch = taddr;
 
     // Kernel post-init ops
-    const int tmem_tmem_scratch = taddr;
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     if (warp >= 8 && warp <= 11) {
         asm volatile("setmaxnreg.inc.sync.aligned.u32 136;");
     }
@@ -630,13 +562,13 @@ kernel_cake_dsv4_cbf3168c696847fd3f69(const __grid_constant__ CUtensorMap tmap_q
                     for (int index_half = 0; index_half < 2; index_half++) {
                         int index_offset = index_half * 128 + lane * 4;
                         int tile_col_base = first_tile * 128 + stage_row_base + index_half * 128;
-                        int* row_tile_ptr = ((tile_col_base < 128) ? (swa_indices + (query_idx * swa_index_stride)) : (compressed_indices + (query_idx * compressed_index_stride + (tile_col_base - 128))));
+                        int* row_tile_ptr = ((tile_col_base < 128) ? (swa_indices + query_idx * swa_index_stride) : (compressed_indices + (query_idx * compressed_index_stride + (tile_col_base - 128))));
                         int lane_col = tile_col_base + lane * 4;
                         int row_stride = ((tile_col_base < 128) ? swa_index_stride : compressed_index_stride);
                         int row_vec_misaligned = query_idx * row_stride & 3;
                         if (lane_col + 4 <= sparse_topk && row_vec_misaligned == 0) {
                             asm volatile("cp.async.cg.shared::cta.global.L2::128B [%0], [%1], 16;"
-                                :: "r"(index_stage_base + index_offset * 4), "l"(row_tile_ptr + (lane * 4)));
+                                :: "r"(index_stage_base + index_offset * 4), "l"(row_tile_ptr + lane * 4));
                         } else {
                             int tail_rows[4];
                             #pragma unroll
@@ -1125,7 +1057,7 @@ kernel_cake_dsv4_cbf3168c696847fd3f69(const __grid_constant__ CUtensorMap tmap_q
                             _tmem_load_1[w_1 * 32 + 31] = (((mask_word >> 31 & 1) != 0) ? -CUDART_INF_F : _tmem_load_1[w_1 * 32 + 31]);
                         }
                     }
-                    float2 _reg_reduce_max2_7 = {-CAKE_INF, -CAKE_INF};
+                    float2 _reg_reduce_max2_7 = {-CUDART_INF_F, -CUDART_INF_F};
                     row_max_x32_accum(&_tmem_load_1[0], _reg_reduce_max2_7);
                     row_max_x32_accum(&_tmem_load_1[32], _reg_reduce_max2_7);
                     float _reg_array_reduce_6 = row_max_reduce(_reg_reduce_max2_7);
@@ -1134,7 +1066,7 @@ kernel_cake_dsv4_cbf3168c696847fd3f69(const __grid_constant__ CUtensorMap tmap_q
                     asm volatile("tcgen05.fence::before_thread_sync;");
                     asm volatile("barrier.sync %0, 64;" :: "r"(2 + warp % 2) : "memory");
                     new_max = max_noftz(new_max, smem_softmax_warp_pair_exchange[phase * 128 + (stats_row ^ 64)]);
-                    float delta = __fmaf_rn(row_max_val, softmax_scale_log2, (-new_max) * softmax_scale_log2);
+                    float delta = __fmaf_rn(row_max_val, softmax_scale_log2, -new_max * softmax_scale_log2);
                     float exp_delta = approx_exp2(delta);
                     float acc_scale = ((row_max_val > -CUDART_INF_F) ? exp_delta : 1.0f);
                     smem_stats_max[phase * 128 + stats_row] = acc_scale;
@@ -1526,7 +1458,7 @@ kernel_cake_dsv4_cbf3168c696847fd3f69(const __grid_constant__ CUtensorMap tmap_q
                             _tmem_load_2[30] = (((q_invalid_cols >> 30 & 1) != 0) ? -CUDART_INF_F : _tmem_load_2[30]);
                             _tmem_load_2[31] = (((q_invalid_cols >> 31 & 1) != 0) ? -CUDART_INF_F : _tmem_load_2[31]);
                         }
-                        float2 _reg_reduce_max2_15 = {-CAKE_INF, -CAKE_INF};
+                        float2 _reg_reduce_max2_15 = {-CUDART_INF_F, -CUDART_INF_F};
                         _reg_reduce_max2_15.x = max_noftz(_reg_reduce_max2_15.x, max_noftz(_tmem_load_2[0], _tmem_load_2[1]));
                         _reg_reduce_max2_15.y = max_noftz(_reg_reduce_max2_15.y, max_noftz(_tmem_load_2[2], _tmem_load_2[3]));
                         _reg_reduce_max2_15.x = max_noftz(_reg_reduce_max2_15.x, max_noftz(_tmem_load_2[4], _tmem_load_2[5]));
@@ -1549,7 +1481,7 @@ kernel_cake_dsv4_cbf3168c696847fd3f69(const __grid_constant__ CUtensorMap tmap_q
                         asm volatile("tcgen05.fence::before_thread_sync;");
                         asm volatile("barrier.sync %0, 64;" :: "r"(2 + warp % 2) : "memory");
                         q_new_max = max_noftz(q_new_max, smem_softmax_warp_pair_exchange[q_phase * 128 + (stats_row ^ 64)]);
-                        float q_delta = __fmaf_rn(row_max_val, softmax_scale_log2, (-q_new_max) * softmax_scale_log2);
+                        float q_delta = __fmaf_rn(row_max_val, softmax_scale_log2, -q_new_max * softmax_scale_log2);
                         float q_exp_delta = approx_exp2(q_delta);
                         float q_acc_scale = ((row_max_val > -CUDART_INF_F) ? q_exp_delta : 1.0f);
                         smem_stats_max[q_phase * 128 + stats_row] = q_acc_scale;

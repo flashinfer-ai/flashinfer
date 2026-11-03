@@ -968,6 +968,29 @@ def _fp8_h64_m64_program(sparse_topk: int) -> str:
     return "fp8_h64_prefill_source_persistent_m64_multi_tile"
 
 
+# Architectures that build the H64 cluster body (``fp8_lowhead_h64``); SM107
+# registers no program for it.
+_FP8_LOWHEAD_H64_ARCHES = frozenset({"sm_100a", "sm_103a"})
+
+
+def _fp8_h64_uses_cluster_body(
+    sparse_topk: int, num_query_tokens: int, arch: Optional[str]
+) -> bool:
+    """FP8/H64 decode rows of at most 12 tokens with two complete sparse tiles
+    and a partial third (widths 260-380), which the persistent body leaves (it
+    needs three complete tiles at <= 12 tokens): the H64 cluster body (two CTAs
+    per token, one wave) beats the M64 body there (1-12 tokens, widths
+    260-380, both cache layouts: B200 9.5-10.3 us vs 10.0-11.1 us, GB300
+    9.1-10.0 us vs 9.4-10.7 us).  Width 256 (no partial tile: B200 8.8-9.4 us
+    vs 7.6-8.9 us, GB300 8.5-9.2 us vs 7.2-8.3 us) and rows with one complete
+    tile keep the M64 body; so does ``arch=None`` (unknown device)."""
+    return (
+        arch in _FP8_LOWHEAD_H64_ARCHES
+        and num_query_tokens <= 12
+        and 2 * _TILE_KV < sparse_topk < 3 * _TILE_KV
+    )
+
+
 def canonical_arg_name(kind: str, name: str) -> str:
     """Map a registration ``arg_plan`` entry onto the host value vocabulary."""
     if kind == "tma_buffer":
@@ -1123,9 +1146,11 @@ def _route(
     compressed_page_size: int,
     num_query_tokens: int,
     sm_count: int,
+    arch: Optional[str] = None,
 ) -> str:
     """The variant one call runs; ``sm_count`` is the device's SM count (the
-    FP8/H64 decode rows pick their body by the waves of its grid)."""
+    FP8/H64 decode rows pick their body by the waves of its grid) and ``arch``
+    its ``sm_XYa`` target (``None``: routes that every architecture builds)."""
     if max_q_len <= 0:
         raise ValueError("max_q_len must be positive")
     is_swa = sparse_topk == 128
@@ -1190,9 +1215,11 @@ def _route(
                 return _fp8_persistent_program(num_query_tokens)
             if is_swa:
                 return "fp8_lowhead_prefill"
-            # Rows with fewer complete tiles: the M64 body beats the H64 cluster
-            # body at every token count (GB300, topk128x widths 204-252,
-            # 1-72 tokens: 7.9-8.5 us vs 8.8-10.4 us).
+            if _fp8_h64_uses_cluster_body(sparse_topk, num_query_tokens, arch):
+                return "fp8_lowhead_h64"
+            # Rows with one complete tile (and width 256): the M64 body beats
+            # the H64 cluster body at every token count (GB300, topk128x widths
+            # 204-252, 1-72 tokens: 7.9-8.5 us vs 8.8-10.4 us).
             return _fp8_h64_m64_program(sparse_topk)
         if is_swa:
             return "fp8_lowhead_prefill"
@@ -1474,6 +1501,7 @@ def cake_dsv4_workspace_requirement(
     batch_size: int,
     ragged: bool,
     sm_count: Optional[int] = None,
+    arch: Optional[str] = None,
 ) -> WorkspaceRequirement:
     """Route and exact workspace requirement of one call.
 
@@ -1484,11 +1512,16 @@ def cake_dsv4_workspace_requirement(
     length or the ragged maximum, ``batch_size`` = ``seq_lens.numel()``,
     ``ragged`` = ``cum_seq_lens_q is not None``, ``sm_count`` = the SM count
     of the device the call runs on (``None``: the current CUDA device's; the
-    workspace numbers do not depend on it, the route name may). Raises
-    ``ValueError`` for a shape ``backend="cake"`` has no kernel for.
+    workspace numbers do not depend on it, the route name may), ``arch`` = its
+    ``sm_XYa`` target (``None``: the current CUDA device's whenever CUDA is
+    available, else the route every architecture builds; the workspace numbers
+    do not depend on it either). Raises ``ValueError`` for a shape
+    ``backend="cake"`` has no kernel for.
     """
     if sm_count is None:
         sm_count = _device_sm_count(torch.device("cuda", torch.cuda.current_device()))
+    if arch is None and torch.cuda.is_available():
+        arch = _target_arch(torch.device("cuda", torch.cuda.current_device()))
     tokens = _positive_int(num_query_tokens, "num_query_tokens")
     heads = _positive_int(num_heads, "num_heads")
     batch = _positive_int(batch_size, "batch_size")
@@ -1503,6 +1536,7 @@ def cake_dsv4_workspace_requirement(
         compressed_page_size=int(compressed_page_size),
         num_query_tokens=tokens,
         sm_count=_positive_int(sm_count, "sm_count"),
+        arch=arch,
     )
     plan = _route_plan(
         route, num_query_tokens=tokens, num_heads=heads, sparse_topk=topk
@@ -1595,6 +1629,7 @@ _OUT_ALIGN_BY_ROUTE: dict[str, int] = {
     "fp8_h64_prefill_source_persistent_m64_multi_tile": 32,
     "fp8_h64_source_exact": 32,
     "fp8_h8_h16_source_exact": 16,
+    "fp8_lowhead_h64": 32,
     "fp8_lowhead_one_partition": 32,
     "fp8_lowhead_prefill": 32,
 }
@@ -1819,7 +1854,7 @@ def run_cake_dsv4(
     """Launch the CAKE DSv4 route for flattened ``query [rows, num_heads, 512]``.
 
     ``enable_pdl`` launches the programs that support it (the FP8 persistent,
-    M64 and low-head prefill bodies) as programmatic dependents of the previous kernel on the
+    M64, low-head prefill and H64 cluster bodies) as programmatic dependents of the previous kernel on the
     stream; they wait for it before their first global read.  The other
     programs launch without the attribute.
 
@@ -1925,6 +1960,7 @@ def run_cake_dsv4(
         compressed_page_size=compressed_kv_cache.shape[-2],
         num_query_tokens=meta.num_query_tokens,
         sm_count=_device_sm_count(device),
+        arch=arch,
     )
 
     if out is None:
