@@ -481,9 +481,9 @@ def _fused_default_table(
 
 
 # Token-tile widths for the folded M256 N64 defaults. One N72/N80 task holds an
-# expert's 65-72/65-80 rows where N64 needs a second, nearly empty tile (4-38%
-# faster on H200); at equal tile counts the wider tiles measured 3-15% slower,
-# so ties keep N64.
+# expert's 65-72/65-80 rows where N64 needs a second, nearly empty tile (H200
+# measurements in TUNING.md); at equal tile counts the wider tiles measured 3-15%
+# slower, so ties keep N64.
 _ROW_TILE_WIDTHS = (64, 72, 80)
 
 

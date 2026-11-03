@@ -1866,8 +1866,7 @@ class TokenInPullTokenBackPush:
         num_global_warps: cutlass.Constexpr[int] = num_sms * self.active_dispatch_warps
         # Rotated assignment as in the serial loop.  Here the R modulos are
         # resolved in phase A ahead of the loads, off the round-trip chain; an
-        # incremental form measured ~3% slower in an earlier FP8 prototype
-        # (R=3, T=8192).
+        # incremental form measured ~3% slower (R=3, T=8192).
         global_warp = sm_idx * Int32(self.active_dispatch_warps) + warp_idx
         pull_pass = Int32(0)
         sf_passes: cutlass.Constexpr[int] = (self.sf_uint32_per_token + 31) // 32

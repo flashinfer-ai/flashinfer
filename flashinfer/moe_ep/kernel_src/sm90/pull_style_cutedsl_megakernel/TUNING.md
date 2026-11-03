@@ -930,9 +930,10 @@ default then takes the token-tile width of 64, 72 or 80 that needs the
 fewest tiles for the balanced rows per expert,
 `max_tokens * top_k * EP / experts`; ties keep N64. One N72 or N80 task holds
 an expert's 65-72 or 65-80 rows where N64 needs a second, nearly empty tile.
-On H200 that measured 4-38% faster, while equal tile counts measured 3-15%
-slower. For example, H2560/I640/E512/top-10/EP2 at 2048 tokens (80 rows per
-expert) runs N80 at 0.85x the N64 time, and at 1792 tokens N72 at 0.79x.
+On H200, H2560/I640/E512/top-10/EP2 at 2048 tokens (80 rows per expert) runs
+N80 at 0.85x the N64 time and at 1792 tokens N72 at 0.79x. Fewer tiles do not
+always win: at 8192 tokens (320 rows per expert) N80 measured 1.006x. Equal
+tile counts measured 3-15% slower.
 Routing that spreads rows across a tile boundary can favor N72 even at equal
 balanced tile counts (H7168/I3072/E384/top-6/EP4 at 1024 and 2048 tokens:
 0.88x and 0.93x), so the N72 and N80 tilings of the capacity's bucket default

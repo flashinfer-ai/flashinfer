@@ -227,8 +227,10 @@ not picked them up):
   the MX frontend pads the SF pool accordingly, and every existing N keeps
   128. `fused_comm_policy.py` enables paired BF16 stores for
   M256 x N64/N72/N80. One N80 task holds an expert's 65-80 rows, where N64
-  needs a second, nearly empty tile; the 224-register consumers do not
-  spill in the main loops. Not in the drop tree; when re-syncing, re-add
+  needs a second, nearly empty tile. At H2560/I640/E512/EP2 the N80 K128
+  kernel uses a 72-byte stack (96 bytes with a 3-row pull batch, whose extra
+  local accesses sit in the pull's token selection, not in the GMMA loop).
+  Not in the drop tree; when re-syncing, re-add
   the tile list and its helper, use it in the kernel and epilogue N checks,
   keep the two kernel checks and the N64/N72/N80 store condition.
 

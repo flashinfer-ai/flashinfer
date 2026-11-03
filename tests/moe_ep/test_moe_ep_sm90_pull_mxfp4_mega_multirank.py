@@ -919,16 +919,20 @@ def test_moe_ep_sm90_pull_mxfp4_offset_m_boundary(
 @pytest.mark.gpu_4
 @pytest.mark.arch_hopper
 @pytest.mark.parametrize(
-    "hidden,tile,dedup,tail,routing_pattern",
+    "hidden,tile,dedup,tail,routing_pattern,tokens,pairs",
     [
-        (256, (128, 32, 256), False, False, "cross_rank"),
-        (256, (256, 64, 256), True, False, "sparse_owner"),
-        (7168, (256, 64, 256), False, False, "cross_rank"),
-        (7168, (256, 64, 256), False, True, "cross_rank"),
+        (256, (128, 32, 256), False, False, "cross_rank", 8, False),
+        (256, (256, 64, 256), True, False, "sparse_owner", 8, False),
+        (7168, (256, 64, 256), False, False, "cross_rank", 8, False),
+        (7168, (256, 64, 256), False, True, "cross_rank", 8, False),
+        # K256 N72/N80 token tiles: 100 rows per expert fill one tile and part of
+        # a second; N80 also runs tail-split pairs on a (1, 2, 1) cluster.
+        (7168, (256, 72, 256), False, False, "cross_rank", 100, False),
+        (7168, (256, 80, 256), False, False, "cross_rank", 100, True),
     ],
 )
 def test_moe_ep_sm90_pull_mxfp4_local_optimizations_independent_oracle(
-    monkeypatch, hidden, tile, dedup, tail, routing_pattern
+    monkeypatch, hidden, tile, dedup, tail, routing_pattern, tokens, pairs
 ):
     """Small expert/I fixture, independent raw math; never a perf substitute."""
     import sys
@@ -936,6 +940,8 @@ def test_moe_ep_sm90_pull_mxfp4_local_optimizations_independent_oracle(
     module = sys.modules[__name__]
     monkeypatch.setattr(module, "HIDDEN", hidden)
     monkeypatch.setattr(module, "INTERMEDIATE", 256)
+    # cross_rank routes TOKENS_PER_RANK rows to each expert at EP4.
+    monkeypatch.setattr(module, "TOKENS_PER_RANK", tokens)
     tactic = dict(
         _fused_tactic(),
         mma_tiler_mnk=tile,
@@ -943,6 +949,8 @@ def test_moe_ep_sm90_pull_mxfp4_local_optimizations_independent_oracle(
         fc2_tail_n8=tail,
         fc1_ready_mode="tile",
     )
+    if pairs:
+        tactic.update(cluster_shape_mnk=(1, 2, 1), tail_split_pairs=True)
     _run_raw_oracle(
         routing_pattern,
         tactic=tactic,
