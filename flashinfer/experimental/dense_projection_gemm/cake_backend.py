@@ -894,7 +894,9 @@ class _VerdictTable(dict):
 #: (64 tokens) unmeasured.  A token count outside the windows was not measured or missed, a ``None`` entry is a
 #: measured row that missed, a row without an entry was not measured: all of them run the deterministic program, and
 #: so does every window but a ``"waves"`` one on a device whose SM count is not the measured one,
-#: :data:`ROUTER_SM_COUNT`, unless :data:`ROUTER_RULES_BY_SM` has a table for that SM count.
+#: :data:`ROUTER_SM_COUNT`, unless :data:`ROUTER_RULES_BY_SM` has a table for that SM count.  A SIMT window comes first
+#: and may overlap the windows after it: on a device where the table's windows do not hold, the token count takes the
+#: next window that holds it (the ``"waves"`` window of hidden 5120 below 129 tokens, as before the SIMT windows).
 # fmt: off
 ROUTER_RULES: dict[
     tuple[str, str, int, int], Optional[Union[str, int, tuple[tuple[int, int, Union[str, int]], ...]]]
@@ -905,8 +907,13 @@ ROUTER_RULES: dict[
     ("sm_103a", "kk", 4096, 256): None, ("sm_103a", "kk", 5120, 256): None, ("sm_103a", "kk", 6144, 256): None,
     ("sm_107a", "kk", 4096, 256): None, ("sm_107a", "kk", 5120, 256): None, ("sm_107a", "kk", 6144, 256): None,
     # the weight gradient, measured on 152-SM GB200 (sm_100a) / GB300 (sm_103a) and 216-SM R200 (sm_107a) parts.
+    # Few tokens on sm_100a: the SIMT program from 1 to 256 tokens (measured at 64, 128, 192 and 256 tokens, alone, in
+    # the backward pass and in the checkpointed step), the 128 x 64 tile at hidden 4096 (128 CTAs of 256 threads, one
+    # wave on 152 SMs), the 64 x 64 tile at hidden 5120 and 6144 (320 and 384 CTAs of 128 threads; the 128 x 64 tile
+    # gives 160 and 192 CTAs there, more than one per SM, and was 20 to 26 % slower alone).
     # Hidden 5120: "waves" at few tokens (faster than the deterministic plan at 64 and 128 tokens, and on sm_103a at
-    # 192; more than 3 % slower than it next to a resident kernel at every measured count from 224 to 10240 tokens),
+    # 192; more than 3 % slower than it next to a resident kernel at every measured count from 224 to 10240 tokens;
+    # on 152-SM sm_100a parts the SIMT window before it takes these token counts),
     # then the head/tail program with one head unit per CTA pair over half of the steps and three tail units per pair
     # ("H0.5x3", 76 head and 228 tail units on 152 SMs; windows measured at 10240 and 12288 (sm_100a), 16172, 16231,
     # 16384 and 32768 tokens; more than 3 % slower next to a resident kernel at 8192 tokens on sm_100a, at 10240 and
@@ -916,15 +923,16 @@ ROUTER_RULES: dict[
     # 16384 tokens; more than 3 % slower next to a resident kernel at 8192 tokens and, launched before it, at 32768).
     # Hidden 4096 on sm_103a keeps the deterministic plan: "H1x4p44" (four tail units) was up to 7.6 % slower than
     # that plan at 16172 to 16384 tokens when launched before a kernel holding SMs on another stream.  Hidden 6144
-    # keeps the deterministic plan: on sm_100a no partition was faster in every run in CUDA graphs; on sm_103a the
-    # closest one ("H1x5p44", x0.973-0.983 alone) left the backward pass (input and weight gradient) no faster.
+    # keeps the deterministic plan (on sm_100a above the SIMT window): on sm_100a no partition was faster in every
+    # run in CUDA graphs; on sm_103a the closest one ("H1x5p44", x0.973-0.983 alone) left the backward pass (input
+    # and weight gradient) no faster.
     # sm_107a: hidden 5120 "H0.5x4" (four tail units, 108 head and 432 tail units on 216 SMs; measured on two parts at
     # 16172, 16231 and 16384 tokens); hidden 4096 and 6144 keep the deterministic plan: at 4096 "H0.5x4" was up to
     # 7 % slower than that plan when a kernel holding 16 SMs on another stream started during it (the kernel takes SMs
     # the head spans wait for), at 6144 it left the backward pass no faster
-    ("sm_100a", "nn_t", 4096, 256): ((10240, 16384, "H1x5p44"),),
-    ("sm_100a", "nn_t", 5120, 256): ((1, 128, "waves"), (10240, 32768, "H0.5x3")),
-    ("sm_100a", "nn_t", 6144, 256): None,
+    ("sm_100a", "nn_t", 4096, 256): ((1, 256, "simt_n128m64s2"), (10240, 16384, "H1x5p44")),
+    ("sm_100a", "nn_t", 5120, 256): ((1, 256, "simt_n64m64s2"), (1, 128, "waves"), (10240, 32768, "H0.5x3")),
+    ("sm_100a", "nn_t", 6144, 256): ((1, 256, "simt_n64m64s2"),),
     ("sm_103a", "nn_t", 4096, 256): None,
     ("sm_103a", "nn_t", 5120, 256): ((1, 192, "waves"), (16172, 32768, "H0.5x3")),
     ("sm_103a", "nn_t", 6144, 256): None,
@@ -948,7 +956,8 @@ ROUTER_SM_COUNT: dict[str, int] = {"sm_100a": 152, "sm_103a": 152, "sm_107a": 21
 #: ``router_fp32_gemm_atomic_nn_t_ht_c3_nreg`` it was up to 9.2 % slower than the deterministic plan next to a resident
 #: kernel).  Hidden 4096 keeps the deterministic plan on both SM counts (on 212 SMs "H0.5x4" with the tensor-memory
 #: program was up to 6.2 % slower next to a resident kernel), as do hidden 6144 on 208 SMs and the forward, as on
-#: 216 SMs.
+#: 216 SMs.  On 212 SMs every hidden size takes the SIMT program with the 128 x 64 tile from 1 to 256 tokens
+#: (measured at 64, 128, 192 and 256 tokens on 212-SM R200 parts; 128, 160 and 192 CTAs of 256 threads, one wave).
 # fmt: off
 ROUTER_RULES_BY_SM: dict[
     tuple[str, int],
@@ -962,9 +971,9 @@ ROUTER_RULES_BY_SM: dict[
     }),
     ("sm_107a", 212): _VerdictTable({
         ("sm_107a", "kk", 4096, 256): None, ("sm_107a", "kk", 5120, 256): None, ("sm_107a", "kk", 6144, 256): None,
-        ("sm_107a", "nn_t", 4096, 256): None,
-        ("sm_107a", "nn_t", 5120, 256): ((16172, 16384, "H0.5x4"),),
-        ("sm_107a", "nn_t", 6144, 256): ((16172, 16384, "H0.5x4"),),
+        ("sm_107a", "nn_t", 4096, 256): ((1, 256, "simt_n128m64s2"),),
+        ("sm_107a", "nn_t", 5120, 256): ((1, 256, "simt_n128m64s2"), (16172, 16384, "H0.5x4")),
+        ("sm_107a", "nn_t", 6144, 256): ((1, 256, "simt_n128m64s2"), (16172, 16384, "H0.5x4")),
     }),
 })
 # fmt: on
@@ -1216,12 +1225,22 @@ def _router_rule_spec(
     """The verdict for the launched GEMM ``[M, N] = [M, K] @ [K, N]`` of the layout class ``layout`` (``kk`` /
     ``nn_t``) in the router table of a device of ``arch`` with ``sm_count`` SMs (:func:`router_rules`: the table of
     its own in :data:`ROUTER_RULES_BY_SM`, else :data:`ROUTER_RULES`): the row's spec, or the spec of its token window
-    that holds the token count (``K`` of the weight gradient, ``M`` of the forward).  ``None``: no verdict -- a launch
-    without a caller's split count runs the deterministic program (:func:`router_partition`)."""
+    that holds the token count (``K`` of the weight gradient, ``M`` of the forward; a SIMT window only on a device where
+    the table's windows hold, else the next window that holds it).  ``None``: no verdict -- a launch without a caller's
+    split count runs the deterministic program (:func:`router_partition`)."""
     hidden, tokens = (K, M) if layout == "kk" else (M, K)
-    rule = router_rules(arch, sm_count)[0].get((arch, layout, int(hidden), int(N)))
+    rules, holds = router_rules(arch, sm_count)
+    rule = rules.get((arch, layout, int(hidden), int(N)))
     if isinstance(rule, tuple):  # token windows (min_tokens, max_tokens, spec)
-        return next((s for lo, hi, s in rule if lo <= int(tokens) <= hi), None)
+        # a SIMT window only where the table's windows hold; elsewhere the next window that holds the token count
+        return next(
+            (
+                s
+                for lo, hi, s in rule
+                if lo <= int(tokens) <= hi and (holds or router_simt_tile(s) is None)
+            ),
+            None,
+        )
     return rule
 
 
