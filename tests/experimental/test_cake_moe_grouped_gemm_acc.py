@@ -2071,7 +2071,7 @@ def _sanitize():
     fails when such a build is missing or cannot load."""
     device = torch.device("cuda", 0)
     arch = base._arch(device)
-    ran = 0
+    ran, missing = 0, []
     for out_dtype in FUSED_DTYPES:
         for form in TWIN_FORMS:
             if not _promised(arch, form, out_dtype):
@@ -2085,7 +2085,9 @@ def _sanitize():
                 with pytest.MonkeyPatch.context() as mp:
                     if not base._force_form(mp, form, arch):
                         continue
-                    sizes = [300, 0, 1, 700]
+                    # The small groups never split a tail; the split case takes
+                    # the groups the split-tail tests use.
+                    sizes = list(ACC_SIZES) if split else [300, 0, 1, 700]
                     shape = _shape_with_splits(
                         device, sizes, base._form_ks(form), split
                     )
@@ -2093,6 +2095,7 @@ def _sanitize():
                         print(
                             f"SANITIZE skip {form} {out_dtype} split={split}: no shape"
                         )
+                        missing.append((form, out_dtype, split))
                         continue
                     n, k = shape
                     x, _w, g, offs = base._inputs(sizes, n, k, device, seed=57)
@@ -2110,8 +2113,8 @@ def _sanitize():
                         f"SANITIZE {arch} {form}{ACC} {out_dtype} n={n} k={k} "
                         f"splits={launch.plan['tail_splits']} ok"
                     )
-    print(f"SANITIZE cases={ran}")
-    return 0 if ran else 1
+    print(f"SANITIZE cases={ran} missing={len(missing)}")
+    return 0 if ran and not missing else 1
 
 
 if __name__ == "__main__":
