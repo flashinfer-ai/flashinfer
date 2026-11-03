@@ -786,18 +786,26 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t4096_sm103a(int* __restrict_
                 }
             }
             unsigned int epi_warp = warp + 8;
+            unsigned int walk_first = (epi_warp + 68) * (unsigned int)NUM_CTAS + (unsigned int)bid;
+            unsigned int walk_end = (unsigned int)(num_tokens * 4);
+            unsigned int walk_step = (unsigned int)(NUM_CTAS * 4);
             unsigned int values[4];
             float reduced[40];
             unsigned int store_values[4];
             unsigned int buffers = epi_warp * 6;
+            int next_row = -1;
+            if (lane < 6 && walk_first < walk_end) {
+                next_row = token_to_permuted[walk_first / 4 * 6 + (unsigned int)lane];
+            }
             unsigned int _phase_combine_barriers = 0;
             #pragma unroll 1
-            for (unsigned int token_chunk = epi_warp * (unsigned int)NUM_CTAS + (unsigned int)bid; token_chunk < num_tokens * 4; token_chunk += NUM_CTAS * 12) {
+            for (unsigned int token_chunk = walk_first; token_chunk < walk_end; token_chunk += walk_step) {
                 unsigned int token = token_chunk / 4;
                 unsigned int chunk = token_chunk % 4;
-                int stored_row = -1;
-                if (lane < 6) {
-                    stored_row = token_to_permuted[token * 6 + (unsigned int)lane];
+                int stored_row = next_row;
+                next_row = -1;
+                if (lane < 6 && token_chunk + walk_step < walk_end) {
+                    next_row = token_to_permuted[(token_chunk + walk_step) / 4 * 6 + (unsigned int)lane];
                 }
                 unsigned int routed = __ballot_sync(0xFFFFFFFF, stored_row >= 0);
                 #pragma unroll 1
@@ -1806,18 +1814,26 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e48_i2304_t4096_sm103a(int* __restrict_
             asm volatile("barrier.sync 15, 256;" ::: "memory");
             asm volatile("barrier.sync 1, 384;" ::: "memory");
             unsigned int epi_warp_3 = warp - 8;
+            unsigned int walk_first_1 = epi_warp_3 * (unsigned int)NUM_CTAS + (unsigned int)bid;
+            unsigned int walk_end_1 = (((unsigned int)(num_tokens * 4)) < ((unsigned int)(76 * NUM_CTAS) + (unsigned int)bid) ? ((unsigned int)(num_tokens * 4)) : ((unsigned int)(76 * NUM_CTAS) + (unsigned int)bid));
+            unsigned int walk_step_1 = (unsigned int)(NUM_CTAS * 8);
             unsigned int values_1[4];
             float reduced_1[40];
             unsigned int store_values_1[4];
             unsigned int buffers_1 = epi_warp_3 * 6;
+            int next_row_1 = -1;
+            if (lane < 6 && walk_first_1 < walk_end_1) {
+                next_row_1 = token_to_permuted[walk_first_1 / 4 * 6 + (unsigned int)lane];
+            }
             unsigned int _phase_combine_barriers_1 = 0;
             #pragma unroll 1
-            for (unsigned int token_chunk_1 = epi_warp_3 * (unsigned int)NUM_CTAS + (unsigned int)bid; token_chunk_1 < num_tokens * 4; token_chunk_1 += NUM_CTAS * 12) {
+            for (unsigned int token_chunk_1 = walk_first_1; token_chunk_1 < walk_end_1; token_chunk_1 += walk_step_1) {
                 unsigned int token_1 = token_chunk_1 / 4;
                 unsigned int chunk_1 = token_chunk_1 % 4;
-                int stored_row_1 = -1;
-                if (lane < 6) {
-                    stored_row_1 = token_to_permuted[token_1 * 6 + (unsigned int)lane];
+                int stored_row_1 = next_row_1;
+                next_row_1 = -1;
+                if (lane < 6 && token_chunk_1 + walk_step_1 < walk_end_1) {
+                    next_row_1 = token_to_permuted[(token_chunk_1 + walk_step_1) / 4 * 6 + (unsigned int)lane];
                 }
                 unsigned int routed_1 = __ballot_sync(0xFFFFFFFF, stored_row_1 >= 0);
                 #pragma unroll 1
