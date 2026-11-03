@@ -40,23 +40,6 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
-#define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 512
-#define TMEM_ACC_OFFSET 0
-#define NUM_K_PIPE_STAGES 12
-#define NUM_ACC_PIPE_STAGES 4
-#define SMEM_SMEM_Q_OFF 1024
-#define SMEM_SMEM_Q_STAGE_BYTES 16384
-#define SMEM_SMEM_Q_STRIDE 16384
-#define SMEM_SMEM_K_OFF 17408
-#define SMEM_SMEM_K_STAGE_BYTES 16384
-#define SMEM_SMEM_K_STRIDE 16384
-#define SMEM_LISTS_OFF 1024
-#define SMEM_LISTS_STAGE_BYTES 16384
-#define SMEM_LISTS_STRIDE 16384
-#define SMEM_TOTAL 214016
-#define THREADS 192
-
 #include <math_constants.h>
 
 __device__ __forceinline__ uint32_t elect_sync() {
@@ -471,7 +454,7 @@ kernel_cake_msa_icp_indexer_da9ddd51e184d8fdd2ea(const __grid_constant__ CUtenso
                             if (!(_thresh_mask_2 & (1u << 30))) acc[62] = -CUDART_INF_F;
                             if (!(_thresh_mask_2 & (1u << 31))) acc[63] = -CUDART_INF_F;
                         }
-                        float2 _reg_reduce_max2_5 = {-CAKE_INF, -CAKE_INF};
+                        float2 _reg_reduce_max2_5 = {-CUDART_INF_F, -CUDART_INF_F};
                         row_max_x32_accum(&acc[0], _reg_reduce_max2_5);
                         row_max_x32_accum(&acc[32], _reg_reduce_max2_5);
                         float _reg_array_reduce_4 = row_max_reduce(_reg_reduce_max2_5);
@@ -595,7 +578,7 @@ kernel_cake_msa_icp_indexer_da9ddd51e184d8fdd2ea(const __grid_constant__ CUtenso
                             if (!(_thresh_mask_8 & (1u << 30))) acc[62] = -CUDART_INF_F;
                             if (!(_thresh_mask_8 & (1u << 31))) acc[63] = -CUDART_INF_F;
                         }
-                        float2 _reg_reduce_max2_11 = {-CAKE_INF, -CAKE_INF};
+                        float2 _reg_reduce_max2_11 = {-CUDART_INF_F, -CUDART_INF_F};
                         row_max_x32_accum(&acc[0], _reg_reduce_max2_11);
                         row_max_x32_accum(&acc[32], _reg_reduce_max2_11);
                         float _reg_array_reduce_10 = row_max_reduce(_reg_reduce_max2_11);

@@ -34,9 +34,11 @@ import torch
 import tvm_ffi
 
 from ...jit.cake_gdn_cp_backend import (
+    MODULES,
     GDNCPArch,
     has_gdn_cp_kernel,
     load_gdn_cp_kernel,
+    program_for,
 )
 
 _BLOCK = 64
@@ -46,6 +48,40 @@ _TENSOR_MAP_BYTES = 128
 _PREFILL_TENSOR_MAPS = 5
 _STATE_IO_THREADS = 256
 _STATE_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
+
+
+_PREFILL_PARAMETERS = (
+    "cp_chunk_len",
+    "source_cp_chunk_len",
+    "num_q_heads",
+    "num_k_heads",
+    "num_v_heads",
+    "num_sab_heads",
+)
+# A stage-4 program may take fast divisors of the chunk length and of the
+# state-head count after ``num_sab_heads``; each is passed as its plain value
+# (the binding builds the divisor constants).
+_PREFILL_DIVISORS = ("cp_chunk_len_fdd", "num_sab_heads_fdd")
+
+
+def _prefill_divisors(kernel: str, arch: GDNCPArch) -> tuple[str, ...]:
+    """The fast-divisor parameters the stage-4 program of ``kernel`` takes, in order."""
+
+    program = program_for(kernel, arch)
+    params = [
+        name for role, name in MODULES[program]["arg_plan"] if role == "parameter"
+    ]
+    head = len(_PREFILL_PARAMETERS)
+    divisors = tuple(params[head:-1])
+    if (
+        tuple(params[:head]) != _PREFILL_PARAMETERS
+        or params[-1:] != ["scale"]
+        or not set(divisors) <= set(_PREFILL_DIVISORS)
+    ):
+        raise ValueError(
+            f"{program} ({kernel} on {arch}): unexpected stage-4 parameters {params}"
+        )
+    return divisors
 
 
 def _ceil_div(value: int, divisor: int) -> int:
@@ -441,9 +477,10 @@ def _head_mapping_is_legal(hq: int, hk: int, hv: int) -> bool:
 
 # Architectures whose BF16 CP kernels are native: output and final state pass
 # the FP32 recurrence oracle at 1e-2 without a token-serial repair (measured at
-# <= 5.4e-4 state error on B200 and GB300).  Every other architecture keeps the
-# BF16 state repair recurrences.
-_NATIVE_BF16_ARCHES = ("sm_100a", "sm_103a")
+# <= 5.4e-4 state error on B200 and GB300; the sm_107a programs pass the same
+# oracle on R200).  Any other architecture keeps the BF16 state repair
+# recurrences.
+_NATIVE_BF16_ARCHES = ("sm_100a", "sm_103a", "sm_107a")
 
 
 def _recurrence_requirements(
@@ -459,11 +496,11 @@ def _recurrence_requirements(
     A recurrence runs where the chunked kernels do not produce the requested
     value: the normalized final state when Q/K are normalized in the kernel,
     and both the output and the final state when alpha is absent.  On compute
-    capability 10.0 and 10.3 (``_NATIVE_BF16_ARCHES``) the BF16 kernels are
-    native, so ``io_dtype`` selects no recurrence there.  Every other
-    architecture (sm_107a) keeps the BF16 state repair: the final-state
-    recurrence for BF16 I/O, and the block-64 output recurrence when alpha is
-    present and Q/K are not normalized in the kernel.
+    capability 10.0, 10.3 and 10.7 (``_NATIVE_BF16_ARCHES``) the BF16 kernels
+    are native, so ``io_dtype`` selects no recurrence there.  Any other
+    architecture keeps the BF16 state repair: the final-state recurrence for
+    BF16 I/O, and the block-64 output recurrence when alpha is present and Q/K
+    are not normalized in the kernel.
     """
 
     bf16_repair = io_dtype == torch.bfloat16 and arch not in _NATIVE_BF16_ARCHES
@@ -857,6 +894,7 @@ class GDNCPPrefill:
         self._mn = load_gdn_cp_kernel(plan.mn_kernel, plan.arch)
         self._fixup = load_gdn_cp_kernel(plan.fixup_kernel, plan.arch)
         self._prefill = load_gdn_cp_kernel(plan.prefill_kernel, plan.arch)
+        self._prefill_divisors = _prefill_divisors(plan.prefill_kernel, plan.arch)
         self._gather = None
         self._gather_source = None
         self._scatter = None
@@ -1236,6 +1274,10 @@ class GDNCPPrefill:
                 p.num_k_heads,
                 p.num_v_heads,
                 p.num_sab_heads,
+                *(
+                    getattr(p, name.removesuffix("_fdd"))
+                    for name in self._prefill_divisors
+                ),
                 self.scale,
                 *p.cp_grid,
             )

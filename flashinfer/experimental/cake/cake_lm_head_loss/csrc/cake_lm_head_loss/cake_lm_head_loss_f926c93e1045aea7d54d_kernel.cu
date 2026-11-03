@@ -47,38 +47,11 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 256
-#define TMEM_ACC_OFFSET 0
-#define NUM_RING_STAGES 6
-#define NUM_ACC_RING_STAGES 2
-#define NUM_META_RING_STAGES 4
-#define SMEM_SMEM_A_OFF 1024
-#define SMEM_SMEM_A_STAGE_BYTES 16384
-#define SMEM_SMEM_A_STRIDE 32768
-#define SMEM_SMEM_B_OFF 17408
-#define SMEM_SMEM_B_STAGE_BYTES 16384
-#define SMEM_SMEM_B_STRIDE 32768
-#define SMEM_META_IDS_OFF 197632
-#define SMEM_META_IDS_STAGE_BYTES 2048
-#define SMEM_META_IDS_STRIDE 2048
-#define SMEM_META_TOK_OFF 199680
-#define SMEM_META_TOK_STAGE_BYTES 2048
-#define SMEM_META_TOK_STRIDE 2048
-#define SMEM_META_COL_OFF 201728
-#define SMEM_META_COL_STAGE_BYTES 2048
-#define SMEM_META_COL_STRIDE 2048
-#define SMEM_META_N_OFF 203776
-#define SMEM_META_N_STAGE_BYTES 16
-#define SMEM_META_N_STRIDE 16
-#define SMEM_TOTAL 203904
-#define THREADS 320
 #if defined(__CUDACC_VER_MAJOR__) && (__CUDA_ARCH__ == 1000) && ((__CUDACC_VER_MAJOR__ == 12 && __CUDACC_VER_MINOR__ == 9) || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ == 0))
 #define CAKE_ARRIVE_FIRST 1
 #else
 #define CAKE_ARRIVE_FIRST 0
 #endif
-
 #include <math_constants.h>
 
 __device__ __forceinline__ uint32_t elect_sync() {

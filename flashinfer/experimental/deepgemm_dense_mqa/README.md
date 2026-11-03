@@ -111,9 +111,11 @@ plan_t.schedule_meta_used                                                       
 `fp8_mqa_logits` takes E4M3 `q [Q, H, 128]` with `H` in the catalog's `policy["heads"]`, `kv` as the
 pair `(E4M3 [K, 128], FP32 scales [K])`, FP32 `weights [Q, H]` and int32 `ks` / `ke [Q]`
 (`0 <= ks <= ke <= K`); it returns the `[Q, K]` view of a `[align(Q, 128 / H), logits_stride(K)]` FP32
-buffer it allocates (row stride a multiple of 8 elements). Every cell of that buffer is written
-(`-inf` outside each row's window), so `clean_logits` changes nothing and is accepted for signature
-parity only; `max_seqlen_k` must be 0. Rows below the query block (`Q < 128 / H`) are padded by the
+buffer it allocates (row stride a multiple of 8 elements). With `clean_logits=True` every cell of that
+buffer is written (`-inf` outside each row's window); with `clean_logits=False` (DeepGEMM's default) only each
+row's window is defined: a route whose record catalogues a `"raw"` variant launches its raw-store programs, which
+write the window cells with the same bits and skip the cleanup of every other cell (`DenseMqaPlan(...,
+clean_logits=False)` does the same; `plan.variant` names it); `max_seqlen_k` must be 0. Rows below the query block (`Q < 128 / H`) are padded by the
 entry. Which `(H, Q, K)` points have programs is a catalog property: `dense_route_available(H, Q, K)`
 answers it on the host (32 heads: `K >= kv_min` and a multiple of the served route record's `kv_alignment` for the
 device's architecture -- 256 for FP4, 256 or 1 per FP8 route and architecture as the catalog publishes it; pass
@@ -164,7 +166,7 @@ without allocating (CUDA Graph replay with changed contents is supported, on the
 Tests: `tests/experimental/test_dense_mqa_generated.py` (dense, including the one-shot entry) and
 `tests/experimental/test_paged_mqa_generated.py` (paged; skips while the catalog has no paged routes).
 
-## Catalog schema `dense_mqa.v13` (route records)
+## Catalog schema `dense_mqa.v14` (route records)
 
 `dense_mqa_catalog.json` carries `policy`, `programs`, the dense `routes` and the paged
 `paged_routes`. Policy keys: `heads` (exported head counts), `block_q` (`{"32": 4, "64": 2}`),
@@ -199,7 +201,7 @@ the schema version carries them together), -- v13 -- `h32_text_options` (per arc
 32-head routes whose delivered logits program is built with an adopted cache-hint / ordering option -- `scan_window_l2_prefetch`,
 `pre_issue`, `source_consumer_release`; the same logits and schedule words as the knob-off program; informational: the route
 record already binds the option program, per architecture where only one adopted it -- `fp8:qle128:short` on sm_100a,
-`fp8:full:le128` / `fp8:full:le2048` on sm_103a), and
+`fp8:full:le128` / `fp8:full:le2048` / `fp8:qle2048:short` on sm_103a), and
 `paged` (`heads` -- the paged head counts, independent of the dense `heads`; `block_kv`, `split_kv`,
 `next_n_atoms` -- 1 for every exported `next_n`, the logits programs iterate the atoms in-kernel;
 `max_batch`, `metadata_program`, `admission` -- per architecture and route the ordered boxes a call must lie in to be served:
@@ -291,7 +293,14 @@ and on a `:kvsplit` route of the `partial` kind or a `:short` route a program of
 (`arg_plan`, `compile_flags`, `ffi_entry`, `kind`, `role`, `standalone`). The route name, its admission, its K rule
 (`kv_min`, `kv_alignment`) and its metadata buffer are the record's; no fallback of `served_route` lands on a
 `:kvsplit` route. `route_stages(record, arch, K, queries)` applies the rule; `program_names(route, arch)` lists the record's
-programs, then the bucket programs.
+programs, then the bucket programs, then the variant programs.
+-- v14 -- A route record may carry `variants` (`{variant: [[stage, program], ...]}`): the stages a call asking for
+that variant launches in place of the record's `stages` and its `stage_buckets` (`route_stages(record, arch, K,
+queries, variant)`), the record's stage names in order, each program spelled as a stage's (one name or `{arch:
+program}`), per architecture the record's own program or a program of the variant's own with the record's host call. The
+32-head FP8 routes carry `"raw"`: the raw-store twin of each logits program -- the same text without the cleaner, so each
+row's window cells are the cleaned program's bits and every cell outside the windows of its query block is left
+unwritten -- which a `clean_logits=False` call launches; the metadata stage keeps its program.
 Routes: 32 heads `fp8:q1:short`, `fp8:q1`, `fp8:q128:short`, `fp8:{full,partial}:le32:short` (the
 `stage_buckets` of `fp8:q128:short` for `K <= 4096` on sm_100a and sm_103a and of `fp8:full:le32:short` for
 `K <= 32768` on sm_100a launch the warp-scan text with a four-stage TMEM accumulator ring), `fp8:{full,partial}:le768:short`,
@@ -300,8 +309,9 @@ Routes: 32 heads `fp8:q1:short`, `fp8:q1`, `fp8:q128:short`, `fp8:{full,partial}
 `1 < Q <= 128`, `K <= fused_qle128_max_kv`; catalogued where the `le128` tier's precedence reaches it -- under the
 published order on both architectures),
 `fp8:qle2048:short` (one `logits` stage, the program `fp8_fused_qle2048` writing the tiered `le2048` schedule in-kernel for
-`128 < Q <= 2048`; on sm_103a its `stage_buckets` launch the fused text with a four-stage TMEM accumulator ring for
-`Q <= 136` and `K <= 8448`), `fp8:{full,partial}:<tier>`, `fp4:q1:short`, `fp4:q1`, `fp4:le32:short` (one `logits` stage whose
+`128 < Q <= 2048`; bound per architecture: the `source_consumer_release` text on sm_103a; on sm_103a its `stage_buckets`
+launch that text with a four-stage TMEM accumulator ring for `Q <= 136` and `K <= 8448`), `fp8:{full,partial}:<tier>`,
+`fp4:q1:short`, `fp4:q1`, `fp4:le32:short` (one `logits` stage whose
 program is bound per architecture: the warp-scan text with the first-tile L2 prefetch where
 `fp4.first_tile_prefetch_forms[arch]` lists `le32` -- sm_103a -- and without it elsewhere -- sm_100a, whose
 `stage_buckets` launch the prefetch text for `K <= 4096`, and for `K <= 32768` when `Q <= 36`), `fp4:qle1024:short` (one

@@ -1645,6 +1645,23 @@ ROUTES: list[dict[str, Any]] = [
         "program": "cake_mega_mhc_9823742e18a9ffa6515b",
         "defines": {},
     },
+    # The same deterministic launches that the same program serves on the
+    # devices whose SM count "num_sms" lists, alone: those at the token counts
+    # of its "tokens" (inclusive ranges).
+    {
+        "hidden": 4096,
+        "num_splits": "runtime",
+        "regime": "bf16",
+        "shifted": False,
+        "shared_sf": False,
+        "sf_layout": "fp8_group128",
+        "fp8_sf_ue8m0": True,
+        "deterministic": True,
+        "num_sms": [216],
+        "tokens": [[3329, 3456]],
+        "program": "cake_mega_mhc_9823742e18a9ffa6515b",
+        "defines": {},
+    },
     # The launches of this regime outside the deterministic mode that the FP8
     # group-128 UE8M0 program's chain-packing form (the one-wave schedule's
     # fifth-round coefficient-chain tokens packed four per CTA) serves on
@@ -1766,6 +1783,20 @@ ROUTES: list[dict[str, Any]] = [
         "program": "cake_mega_mhc_92ff09be7d50b8019d50",
         "defines": {},
     },
+    {
+        "hidden": 4096,
+        "num_splits": "runtime",
+        "regime": "bf16",
+        "shifted": False,
+        "shared_sf": False,
+        "sf_layout": "fp8_group128",
+        "fp8_sf_ue8m0": False,
+        "deterministic": False,
+        "num_sms": [216],
+        "tokens": [[1057, 1104]],
+        "program": "cake_mega_mhc_92ff09be7d50b8019d50",
+        "defines": {},
+    },
     # The raw scale mode's deterministic launches of the plain FP8 group-128
     # program's regime that the FP8 group-128 tailpipe program serves on sm_107a
     # (the same 16 splits and launch, so the same outputs): those at the token
@@ -1854,6 +1885,24 @@ ROUTES: list[dict[str, Any]] = [
         "shared_sf": False,
         "sf_layout": "fp8_group128",
         "program": "cake_mega_mhc_a940c94296afad2b2497",
+        "defines": {},
+    },
+    # The deterministic launches of this regime that the NVFP4 weight-staging
+    # tail form serves on sm_107a, at the plain program's 16 splits and grid (so
+    # the same outputs; its launch stages the RMSNorm weight in shared memory):
+    # those at the token counts of its "tokens" (inclusive ranges) on the
+    # devices whose SM count "num_sms" lists, alone.
+    {
+        "hidden": 4096,
+        "num_splits": "runtime",
+        "regime": "bf16",
+        "shifted": False,
+        "shared_sf": False,
+        "sf_layout": "nvfp4",
+        "deterministic": True,
+        "num_sms": [208],
+        "tokens": [[2048, 2048]],
+        "program": "cake_mega_mhc_12e5bcc41e7940e7d511",
         "defines": {},
     },
     {

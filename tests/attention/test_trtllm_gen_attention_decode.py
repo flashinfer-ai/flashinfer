@@ -1195,6 +1195,36 @@ def test_trtllm_batch_decode_same_dtype_gqa_grouping(q_len_per_req: int):
     )
 
 
+@pytest.mark.parametrize("head_dim", [128, 256])
+@pytest.mark.parametrize("enable_pdl", [False, True])
+@pytest.mark.parametrize(
+    ("q_len_per_req", "head_grp_size"),
+    [(1, 5), (2, 5), (5, 8), (2, 16), (16, 8)],
+)
+def test_trtllm_batch_decode_nvfp4_gqa(
+    q_len_per_req: int, head_grp_size: int, enable_pdl: bool, head_dim: int
+):
+    # Cover single-token decode and grouped Swaps/Keeps selection so the pinned
+    # artifact must provide the requested NVFP4 kernels.
+    _test_trtllm_batch_decode(
+        backend="trtllm-gen",
+        kv_layout="HND",
+        batch_size=4,
+        q_len_per_req=q_len_per_req,
+        page_size=64,
+        num_kv_heads=2,
+        head_grp_size=head_grp_size,
+        window_left=-1,
+        q_dtype="fp8",
+        o_dtype="fp8",
+        kv_dtype="nvfp4",
+        enable_pdl=enable_pdl,
+        enable_sink=True,
+        max_in_kv_len=110,
+        head_dim=head_dim,
+    )
+
+
 # Cross both head dimensions with every sampled configuration; keep a normal
 # softmax case so mixed-dtype configurations survive the softmax-mode skip.
 @pytest.mark.parametrize("head_dim", [128, 256])
