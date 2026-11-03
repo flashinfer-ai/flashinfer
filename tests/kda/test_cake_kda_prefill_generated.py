@@ -1119,6 +1119,17 @@ def unrouted(monkeypatch):
     return clear
 
 
+@pytest.fixture
+def stock_m64_route():
+    """Hold the mixed-length M64 split off (no architecture in
+    ``MIXLEN_ARCHES``): launches that mix long and short sequences keep the
+    stock M64 value-split program.  The patch has its own context, so a test's
+    ``monkeypatch.undo()`` keeps it."""
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(runtime, "MIXLEN_ARCHES", frozenset())
+        yield
+
+
 @requires_blackwell
 @pytest.mark.parametrize("lengths,heads,lower_bound", ROWS)
 def test_serving_rows_match_the_fp32_reference(
@@ -2281,6 +2292,7 @@ GRAPH_ROWS = [
 
 
 @requires_blackwell
+@pytest.mark.usefixtures("stock_m64_route")
 @pytest.mark.parametrize("lengths,heads,lower_bound,route,turnover", GRAPH_ROWS)
 def test_routed_launch_replays_from_a_cuda_graph(
     lengths, heads, lower_bound, route, turnover
@@ -2311,6 +2323,7 @@ def test_routed_launch_replays_from_a_cuda_graph(
 
 
 @requires_blackwell
+@pytest.mark.usefixtures("stock_m64_route")
 @pytest.mark.parametrize("lengths,heads,lower_bound,route,turnover", GRAPH_ROWS)
 def test_plan_cache_hit_matches_a_fresh_preparation(
     lengths, heads, lower_bound, route, turnover
@@ -2540,6 +2553,7 @@ def _own_pool(d):
 
 
 @requires_blackwell
+@pytest.mark.usefixtures("stock_m64_route")
 @pytest.mark.parametrize("lengths,heads,state", _pair_share_cases())
 def test_pair_share_is_bitwise_the_routed_m64_program(
     lengths, heads, state, monkeypatch
@@ -2706,6 +2720,7 @@ def _m64_owner_helper_programs():
 
 
 @requires_blackwell
+@pytest.mark.usefixtures("stock_m64_route")
 @pytest.mark.parametrize("helpers", [2, 3])
 @pytest.mark.parametrize("state", M64_OWNER_HELPER_STATES)
 @pytest.mark.parametrize("lengths,heads", M64_OWNER_HELPER_ROWS)
@@ -3084,3 +3099,218 @@ def test_pair_cluster_capacity_probe_caches_only_an_answer(monkeypatch):
     capacity = runtime._m64_pair_cluster_capacity(device)
     assert capacity > 0
     assert runtime._M64_PAIR_CLUSTER_CAPACITY[device] == capacity
+
+
+# ------------------------------------------------- mixed-length M64 split
+# A launch whose stock plan is the M64 value split and whose sequences mix long
+# (>= MIXLEN_LONG_MIN tokens) and short ones runs as parts: the long sequences
+# as owner/helper parts with MIXLEN_HELPERS helpers per task, the short ones as
+# plain M64 parts.  "rng": one owner/helper part over the first..last long
+# sequence and the short parts after it, all on the caller stream; "cc": one
+# side-stream owner/helper part per run of long sequences.
+MIXLEN_ROWS = [
+    pytest.param(
+        [8192, 17], 12, "rng", dict(indexed=False), id="8192+17-h12-dense-state"
+    ),
+    pytest.param(
+        [8192, 17],
+        12,
+        "rng",
+        dict(indexed=False, initial=False),
+        id="8192+17-h12-zero-initial-state",
+    ),
+    pytest.param(
+        [8192, 17],
+        12,
+        "rng",
+        dict(indexed=False, rows=False),
+        id="8192+17-h12-dense-state-no-rows",
+    ),
+    pytest.param([8128, 64] * 2, 16, "cc", dict(), id="2x(8128+64)-h16-indexed-pool"),
+]
+MIXLEN_PART = re.compile(
+    r"(?P<schedule>[a-z0-9_]+)@(?P<i0>\d+)-(?P<i1>\d+)(?:/s(?P<side>\d+))?"
+)
+
+
+def _mixlen_parts(schedule, mode):
+    """The (schedule, first, last, side) parts of a mixed-length split plan."""
+    prefix = f"mixlen_{mode}["
+    assert schedule.startswith(prefix) and schedule.endswith("]"), schedule
+    parts = []
+    for text in schedule[len(prefix) : -1].split("+"):
+        match = MIXLEN_PART.fullmatch(text)
+        assert match, (text, schedule)
+        parts.append(
+            (
+                match["schedule"],
+                int(match["i0"]),
+                int(match["i1"]),
+                int(match["side"] or 0),
+            )
+        )
+    return parts
+
+
+def _assert_mixlen_route(prepared, lengths, mode):
+    """The split plan of ``prepared``: every sequence in one part, long parts
+    on the owner/helper build (side streams under "cc"), short parts on the M64
+    value split."""
+    arch = registry.device_arch()
+    parts = _mixlen_parts(str(prepared.schedule), mode)
+    covered = sorted(i for _, i0, i1, _ in parts for i in range(i0, i1 + 1))
+    assert covered == list(range(len(lengths))), parts
+    helpers = f"_owner{runtime.MIXLEN_HELPERS}helper"
+    for schedule, i0, i1, side in parts:
+        assert schedule.startswith("fused_m64_independent_dvsplit_fp32_state"), parts
+        if schedule.endswith(helpers):
+            assert any(n >= runtime.MIXLEN_LONG_MIN for n in lengths[i0 : i1 + 1])
+            assert bool(side) == (mode == "cc"), parts
+        else:
+            assert all(n < runtime.MIXLEN_LONG_MIN for n in lengths[i0 : i1 + 1])
+            assert not side, parts
+    assert any(schedule.endswith(helpers) for schedule, *_ in parts), parts
+    owner_helper = set(registry._RENDERED_M64_OWNER_HELPER_ROUTES[arch].values())
+    assert _modules(prepared) & owner_helper
+
+
+def _mixlen_capacity_or_skip(lengths, heads, mode):
+    device = torch.device("cuda", torch.cuda.current_device())
+    capacity = runtime._m64_cooperative_capacity(device)
+    longs = [n >= runtime.MIXLEN_LONG_MIN for n in lengths]
+    first = longs.index(True)
+    last = len(longs) - 1 - longs[::-1].index(True)
+    span = last - first + 1 if mode == "rng" else sum(longs)
+    need = span * heads * (2 + runtime.MIXLEN_HELPERS)
+    if (
+        mode == "cc"
+        and (last - first + 1) * heads * (2 + runtime.MIXLEN_HELPERS) <= capacity
+    ):
+        pytest.skip(f"{capacity} resident CTAs take the rng plan")
+    if need > capacity:
+        pytest.skip(f"{capacity} resident CTAs for the {mode} plan's {need}")
+
+
+def _stock_call(d, lower_bound, **state):
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(runtime, "MIXLEN_ARCHES", frozenset())
+        call = _Call(d, lower_bound, **state)
+    schedule = str(call.prepared.schedule)
+    assert schedule.startswith("fused_m64_independent_dvsplit_fp32_state"), schedule
+    return call
+
+
+@requires_blackwell
+@pytest.mark.parametrize("lengths,heads,mode,state", MIXLEN_ROWS)
+def test_mixlen_split_is_bitwise_the_stock_m64_program(lengths, heads, mode, state):
+    """A mixed-length launch takes the split the capacity rule picks and
+    equals, bit for bit, the stock M64 value-split program (the split held
+    off): output, final states and checkpoint rows, launch after launch; with
+    initial states it matches the FP32 reference."""
+    _mixlen_capacity_or_skip(lengths, heads, mode)
+    d = _inputs(lengths, heads)
+    split = _Call(_own_pool(d), -5.0, **state)
+    _assert_mixlen_route(split.prepared, lengths, mode)
+    result = split.run()
+    _assert_bitwise(split.run(), result, "split repeat")
+    stock = _stock_call(_own_pool(d), -5.0, **state)
+    _assert_bitwise(result, stock.run(), "split vs stock M64")
+    if state.get("initial", True):
+        want = _reference(d, -5.0)
+        if state.get("rows", True):
+            _assert_close(result, want, "split vs reference")
+        else:
+            _assert_close(result[:2] + (want[2],), want, "split vs reference")
+
+
+MIXLEN_GRAPH_LENGTHS, MIXLEN_GRAPH_HEADS = [8128, 64] * 2, 16
+
+
+@requires_blackwell
+def test_mixlen_split_plan_cache_hit_matches_a_fresh_preparation():
+    """A plan-cache hit of a mixed-length launch keeps the split and rebinds
+    its parts to the new tensors: bit for bit a fresh preparation and the
+    stock M64 program."""
+    lengths, heads = MIXLEN_GRAPH_LENGTHS, MIXLEN_GRAPH_HEADS
+    _mixlen_capacity_or_skip(lengths, heads, "cc")
+    cache = KDAPrefillPlanCache(8)
+    first = _inputs(lengths, heads, seed=1)
+    second = _inputs(lengths, heads, seed=2)
+    miss = _Call(first, -5.0, plan_cache=cache)
+    _assert_mixlen_route(miss.prepared, lengths, "cc")
+    miss.run()
+    hit = _Call(second, -5.0, plan_cache=cache)
+    assert (cache.misses, cache.hits) == (1, 1)
+    _assert_mixlen_route(hit.prepared, lengths, "cc")
+    got = hit.run()
+    fresh = _Call(second, -5.0)
+    _assert_bitwise(got, fresh.run(), "plan-cache hit")
+    _assert_bitwise(got, _stock_call(second, -5.0).run(), "plan-cache hit vs stock")
+
+
+@requires_blackwell
+def test_mixlen_split_replays_from_a_cuda_graph():
+    """The split's fork / join of its side-stream parts is captured: a graph
+    replay matches the eager launch bit for bit."""
+    lengths, heads = MIXLEN_GRAPH_LENGTHS, MIXLEN_GRAPH_HEADS
+    _mixlen_capacity_or_skip(lengths, heads, "cc")
+    d = _inputs(lengths, heads)
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        call = _Call(d, -5.0)
+        _assert_mixlen_route(call.prepared, lengths, "cc")
+        eager = call.run()
+    torch.cuda.current_stream().wait_stream(side)
+    call.poison()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=side):
+        call.prepared.launch()
+    for _ in range(2):
+        call.poison()
+        graph.replay()
+        torch.cuda.synchronize()
+        _assert_bitwise(call.snapshot(), eager, "graph replay")
+
+
+@pytest.mark.parametrize("arch", sorted(runtime.MIXLEN_ARCHES))
+def test_mixlen_split_keeps_the_stock_plan_for_meta_tensors(arch, monkeypatch):
+    """A launch planned on meta tensors (route-only planning, no device) keeps
+    the stock plan and makes no CUDA call."""
+
+    def no_cuda(*args, **kwargs):
+        raise AssertionError("the split made a CUDA call")
+
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", no_cuda)
+    monkeypatch.setattr(runtime, "_m64_cooperative_capacity", no_cuda)
+    stock = object.__new__(runtime.FlashKDABlackwellFP32FusedM128Launch)
+    stock.gpu_arch = arch
+    stock.schedule = "fused_m64_independent_dvsplit_fp32_state_pair_share"
+    stock.m64_owner_helpers = 0
+    lengths, heads = (8192, 17), 12
+    tokens = sum(lengths)
+    meta = partial(torch.empty, device="meta")
+    q, k, v, g, out = (
+        meta((1, tokens, heads, HEAD_DIM), dtype=torch.bfloat16) for _ in range(5)
+    )
+    args = (
+        q,
+        k,
+        v,
+        g,
+        meta((1, tokens, heads), dtype=torch.bfloat16),
+        None,
+        out,
+        meta((heads,)),
+        meta((heads, HEAD_DIM)),
+        -5.0,
+    )
+    state = meta((len(lengths), heads, HEAD_DIM, HEAD_DIM))
+    kwargs = dict(
+        initial_state=state,
+        final_state=state,
+        cu_seqlens=meta((len(lengths) + 1,), dtype=torch.int64),
+        sequence_lengths=lengths,
+    )
+    assert runtime._mixlen_split(stock, args, kwargs) is None
