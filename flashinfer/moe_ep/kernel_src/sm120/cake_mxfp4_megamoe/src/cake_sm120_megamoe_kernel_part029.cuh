@@ -1357,8 +1357,8 @@
                                         unsigned int ce_e_7f6da9 = ce_vbits_32dd0b >> 23 & 255;
                                         unsigned int _max_d84ccb = ((ce_emax_2fecf4) > (ce_e_7f6da9) ? (ce_emax_2fecf4) : (ce_e_7f6da9));
                                         ce_emax_2fecf4 = _max_d84ccb;
-                                        unsigned int _min_595202 = ((ce_emin_1b41e9) < (ce_e_7f6da9) ? (ce_emin_1b41e9) : (ce_e_7f6da9));
-                                        ce_emin_1b41e9 = _min_595202;
+                                        unsigned int _min_02a650 = ((ce_emin_1b41e9) < (ce_e_7f6da9 - 1) ? (ce_emin_1b41e9) : (ce_e_7f6da9 - 1));
+                                        ce_emin_1b41e9 = _min_02a650;
                                     }
                                     unsigned int _shfl_xor_f9524a = __shfl_xor_sync(0xFFFFFFFF, ce_emax_2fecf4, 1);
                                     unsigned int _max_2801ee = ((ce_emax_2fecf4) > (_shfl_xor_f9524a) ? (ce_emax_2fecf4) : (_shfl_xor_f9524a));
@@ -1372,7 +1372,7 @@
                                     unsigned int _shfl_xor_09f283 = __shfl_xor_sync(0xFFFFFFFF, ce_emin_1b41e9, 2);
                                     unsigned int _min_6bd0c0_1 = ((ce_emin_1b41e9) < (_shfl_xor_09f283) ? (ce_emin_1b41e9) : (_shfl_xor_09f283));
                                     ce_emin_1b41e9 = _min_6bd0c0_1;
-                                    int ce_raw_683c89 = (int)(ce_emax_2fecf4 - ce_emin_1b41e9 > 15);
+                                    int ce_raw_039f5f = (int)(ce_emax_2fecf4 > ce_emin_1b41e9 + 15);
                                     int ce_valid_0c00b3 = e2_valid_fe6505 * (1 - ce_r_4def4a) + e2_valid_fe6505_1 * ce_r_4def4a;
                                     int ce_src_27abd8 = e2_src_ce7aaf * (1 - ce_r_4def4a) + e2_src_ce7aaf_1 * ce_r_4def4a;
                                     int ce_rowi_c6bf26 = e2_row_88c0a4 + ce_r_4def4a * 8;
@@ -1406,7 +1406,7 @@
                                             int _min_c76d6f = ((64) < (ce_rc_a55e97 - ce_start_ff2c0d) ? (64) : (ce_rc_a55e97 - ce_start_ff2c0d));
                                             ce_rows_7b4d63 = _min_c76d6f;
                                         }
-                                        if (ce_raw_683c89 != 0 && epi_tid == 0) {
+                                        if (ce_raw_039f5f != 0 && epi_tid == 0) {
                                             int _atomic_old_6a12e6 = atomicAdd(&result_ovf_cursor[ce_src_27abd8 * MOE_X_caa68debd6 + ce_chunk_c0819f], 1);
                                             ce_k_c904d8 = _atomic_old_6a12e6;
 #elif MOE_SW_RETURN_INT8 == 0 // moe-select
@@ -1421,8 +1421,8 @@
                                         unsigned int ce_e_7f6da9 = ce_vbits_32dd0b >> 23 & 255;
                                         unsigned int _max_d84ccb = ((ce_emax_2fecf4) > (ce_e_7f6da9) ? (ce_emax_2fecf4) : (ce_e_7f6da9));
                                         ce_emax_2fecf4 = _max_d84ccb;
-                                        unsigned int _min_595202 = ((ce_emin_1b41e9) < (ce_e_7f6da9) ? (ce_emin_1b41e9) : (ce_e_7f6da9));
-                                        ce_emin_1b41e9 = _min_595202;
+                                        unsigned int _min_02a650 = ((ce_emin_1b41e9) < (ce_e_7f6da9 - 1) ? (ce_emin_1b41e9) : (ce_e_7f6da9 - 1));
+                                        ce_emin_1b41e9 = _min_02a650;
                                     }
                                     unsigned int _shfl_xor_f9524a = __shfl_xor_sync(0xFFFFFFFF, ce_emax_2fecf4, 1);
                                     unsigned int _max_2801ee = ((ce_emax_2fecf4) > (_shfl_xor_f9524a) ? (ce_emax_2fecf4) : (_shfl_xor_f9524a));
@@ -1436,7 +1436,7 @@
                                     unsigned int _shfl_xor_09f283 = __shfl_xor_sync(0xFFFFFFFF, ce_emin_1b41e9, 2);
                                     unsigned int _min_6bd0c0_1 = ((ce_emin_1b41e9) < (_shfl_xor_09f283) ? (ce_emin_1b41e9) : (_shfl_xor_09f283));
                                     ce_emin_1b41e9 = _min_6bd0c0_1;
-                                    int ce_raw_683c89 = (int)(ce_emax_2fecf4 - ce_emin_1b41e9 > 15);
+                                    int ce_raw_039f5f = (int)(ce_emax_2fecf4 > ce_emin_1b41e9 + 15);
                                     int ce_valid_0c00b3 = e2_valid_fe6505 * (1 - ce_r_4def4a) + e2_valid_fe6505_1 * ce_r_4def4a;
                                     int ce_src_27abd8 = e2_src_ce7aaf * (1 - ce_r_4def4a) + e2_src_ce7aaf_1 * ce_r_4def4a;
                                     int ce_rowi_c6bf26 = e2_row_88c0a4 + ce_r_4def4a * 8;
@@ -1470,7 +1470,7 @@
                                             int _min_c76d6f = ((64) < (ce_rc_a55e97 - ce_start_ff2c0d) ? (64) : (ce_rc_a55e97 - ce_start_ff2c0d));
                                             ce_rows_7b4d63 = _min_c76d6f;
                                         }
-                                        if (ce_raw_683c89 != 0 && epi_tid == 0) {
+                                        if (ce_raw_039f5f != 0 && epi_tid == 0) {
                                             int _atomic_old_6a12e6 = atomicAdd(&result_ovf_cursor[ce_src_27abd8 * MOE_X_caa68debd6 + ce_chunk_c0819f], 1);
                                             ce_k_c904d8 = _atomic_old_6a12e6;
 #else // moe-select
@@ -1491,7 +1491,7 @@
 #if MOE_SW_RETURN_INT8 == 0 // moe-select
                                     int _shfl_1be816 = __shfl_sync(0xFFFFFFFF, ce_k_c904d8, epi_gid * 4);
                                     ce_k_c904d8 = _shfl_1be816;
-                                    if (ce_valid_0c00b3 != 0 && ce_raw_683c89 != 0 && ce_k_c904d8 >= ce_rows_7b4d63 * MOE_CODEC_OVF_BLOCKS) {
+                                    if (ce_valid_0c00b3 != 0 && ce_raw_039f5f != 0 && ce_k_c904d8 >= ce_rows_7b4d63 * MOE_CODEC_OVF_BLOCKS) {
 #else // moe-select
                                     float _shfl_xor_102395 = __shfl_xor_sync(0xFFFFFFFF, q1_amax_6d5135, 1);
                                     float _max_5eed43 = max_noftz(q1_amax_6d5135, _shfl_xor_102395);
@@ -1547,7 +1547,7 @@
                                         int* pr_i32_439e02 = reinterpret_cast<int*>(result_out);
                                         uint8_t* pr_u8_d52e93 = reinterpret_cast<uint8_t*>(result_out);
                                         __nv_bfloat16* pr_bf16_bb651a = reinterpret_cast<__nv_bfloat16*>(result_out);
-                                        if (ce_raw_683c89 != 0) {
+                                        if (ce_raw_039f5f != 0) {
                                             float ce_raw_vals_44ed7b[16];
                                             #pragma unroll
                                             for (int ce_kk1 = 0; ce_kk1 < 16; ce_kk1++) {
@@ -1578,6 +1578,12 @@
                                                 *(reinterpret_cast<unsigned char*>(pr_u8_d52e93 + (ce_hdr_byte_r_886bfb + 1)) + (0)) = (unsigned char)(ce_hdr_hi_r_2d47e1);
                                             }
                                         } else {
+                                            unsigned int _max_017554 = ((ce_emax_2fecf4) > (15) ? (ce_emax_2fecf4) : (15));
+                                            unsigned int ce_zexp_ee8a48 = _max_017554 - 15 << 7;
+                                            #pragma unroll
+                                            for (int ce_zi_380ada = 0; ce_zi_380ada < 16; ce_zi_380ada++) {
+                                                ce_bits_a2dfeb[ce_zi_380ada] = ce_bits_a2dfeb[ce_zi_380ada] | (unsigned int)((ce_bits_a2dfeb[ce_zi_380ada] & 32640) == 0) * ce_zexp_ee8a48;
+                                            }
                                             unsigned int ce_cp_dc7805[8];
                                             unsigned int ce_emax_pair_fb6013 = ce_emax_2fecf4 << 7 | ce_emax_2fecf4 << 23;
                                             #pragma unroll

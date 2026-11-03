@@ -1208,3 +1208,48 @@ def test_cuda_graph_capture_needs_bucket(ep_layer) -> None:
     torch.cuda.synchronize()
     assert tuple(out.shape) == (64, shape.hidden)
     _protocol_clean(layer)
+
+
+@pytest.mark.arch_sm120
+@pytest.mark.gpu_4
+def test_exact_zero_outputs_stay_in_codec_capacity(ep_layer) -> None:
+    """Exact zeros inside a returned 64-value block (zeroed W2 output channels, very sparse
+    intermediates) must stay coded by the BF16 return codec instead of filling the bounded
+    raw-overflow area: W2 output channels 0, 21 and 42 of every 64 are zeroed, so every
+    returned block mixes exact zeros with O(1) values; single-row and small chunks must
+    match the oracle with no protocol error.  Builds its own layer on the same workspace
+    key, so it runs last in the module."""
+
+    import torch.distributed as dist
+
+    rank, world_size, _, oracle, shape = ep_layer
+    shared = oracle.shared is not None
+    weights = local_weights(rank, world_size, seed=20260914, shared=shared, shape=shape)
+    cols = torch.arange(0, shape.hidden, 64, device="cuda")
+    cols = torch.cat((cols, cols + 21, cols + 42))
+    weights.w2[:, cols, :] = 0
+    zoracle = Oracle(
+        weights, shared, oracle.swiglu_limit, oracle.activation, oracle.return_codec
+    )
+    layer = make_layer(
+        rank,
+        world_size,
+        weights,
+        variant="fp8shared" if shared else "noshared",
+        table=table_spec(),
+        shape=shape,
+        swiglu_limit=oracle.swiglu_limit,
+        return_codec=oracle.return_codec,
+    )
+    try:
+        for step, rows in enumerate((1, 1, 3, 64, 1)):
+            tensors = make_inputs(rows, seed=1900 + 10 * step + rank, shape=shape)
+            out = layer(tensors)
+            torch.cuda.synchronize()
+            if not shared:
+                assert (out[:, cols] == 0).all()
+            check_close(out, zoracle(tensors))
+            assert layer._kernel.protocol_error(layer._workspace) == 0
+    finally:
+        layer.destroy()
+        dist.barrier()

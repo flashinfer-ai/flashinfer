@@ -1664,6 +1664,9 @@
                 for (int cd_pi = 0; cd_pi < 8; cd_pi++) {
                     unsigned int cd_cpair = cd_c[cd_pi * 2] | cd_c[cd_pi * 2 + 1] << 16;
                     unsigned int cd_bpair = (cd_cpair & 134219776) << 4 | cd_emax_pair - (cd_cpair & 125831040) | cd_cpair & 8323199;
+                    unsigned int cd_d15 = cd_cpair & 125831040;
+                    unsigned int cd_m15 = cd_d15 & cd_d15 >> 1 & cd_d15 >> 2 & cd_d15 >> 3 & 8388736;
+                    cd_bpair = cd_bpair - (cd_bpair & cd_m15 * 255);
                     unsigned int cd_low = cd_bpair << 16;
                     unsigned int cd_high = cd_bpair & 4294901760;
                     float cd_low_float = 0.0f;
@@ -1738,6 +1741,9 @@
                 for (int cd_pi = 0; cd_pi < 8; cd_pi++) {
                     unsigned int cd_cpair = cd_c[cd_pi * 2] | cd_c[cd_pi * 2 + 1] << 16;
                     unsigned int cd_bpair = (cd_cpair & 134219776) << 4 | cd_emax_pair - (cd_cpair & 125831040) | cd_cpair & 8323199;
+                    unsigned int cd_d15 = cd_cpair & 125831040;
+                    unsigned int cd_m15 = cd_d15 & cd_d15 >> 1 & cd_d15 >> 2 & cd_d15 >> 3 & 8388736;
+                    cd_bpair = cd_bpair - (cd_bpair & cd_m15 * 255);
                     unsigned int cd_low = cd_bpair << 16;
                     unsigned int cd_high = cd_bpair & 4294901760;
                     float cd_low_float = 0.0f;

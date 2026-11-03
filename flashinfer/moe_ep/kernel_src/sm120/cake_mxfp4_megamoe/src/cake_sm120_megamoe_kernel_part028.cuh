@@ -5711,8 +5711,8 @@
                                     unsigned int ce_e = ce_vbits >> 23 & 255;
                                     unsigned int _max_67c932 = ((ce_emax) > (ce_e) ? (ce_emax) : (ce_e));
                                     ce_emax = _max_67c932;
-                                    unsigned int _min_b61dc9 = ((ce_emin) < (ce_e) ? (ce_emin) : (ce_e));
-                                    ce_emin = _min_b61dc9;
+                                    unsigned int _min_b48e45 = ((ce_emin) < (ce_e - 1) ? (ce_emin) : (ce_e - 1));
+                                    ce_emin = _min_b48e45;
 #elif (MOE_INSTANCE == 1 || MOE_INSTANCE == 3) // moe-select
                                     float q1_v = w1_accum[(w2_mt_30048f_1 * 8 + ce_nt) * 4 + ce_r * 2 + ce_pair];
                                     q1_vals[ce_nt * 2 + ce_pair] = q1_v;
@@ -5727,8 +5727,8 @@
                                     unsigned int ce_e = ce_vbits >> 23 & 255;
                                     unsigned int _max_67c932 = ((ce_emax) > (ce_e) ? (ce_emax) : (ce_e));
                                     ce_emax = _max_67c932;
-                                    unsigned int _min_b61dc9 = ((ce_emin) < (ce_e) ? (ce_emin) : (ce_e));
-                                    ce_emin = _min_b61dc9;
+                                    unsigned int _min_b48e45 = ((ce_emin) < (ce_e - 1) ? (ce_emin) : (ce_e - 1));
+                                    ce_emin = _min_b48e45;
 #else // moe-select
                                     float q1_v = w1_accum[(w2_mt_632cc0_1 * 8 + ce_nt) * 4 + ce_r * 2 + ce_pair];
                                     q1_vals[ce_nt * 2 + ce_pair] = q1_v;
@@ -5751,7 +5751,7 @@
                             unsigned int _shfl_xor_a335a4 = __shfl_xor_sync(0xFFFFFFFF, ce_emin, 2);
                             unsigned int _min_11201c_1 = ((ce_emin) < (_shfl_xor_a335a4) ? (ce_emin) : (_shfl_xor_a335a4));
                             ce_emin = _min_11201c_1;
-                            int ce_raw = (int)(ce_emax - ce_emin > 15);
+                            int ce_raw = (int)(ce_emax > ce_emin + 15);
                             int ce_valid = w2_ret_valid_03befb * (1 - ce_r) + w2_ret_valid_03befb_1 * ce_r;
                             int ce_src = w2_ret_src_9ba202 * (1 - ce_r) + w2_ret_src_9ba202_1 * ce_r;
                             int ce_rowi = w2_ret_row_f06c36 + ce_r * 8;
@@ -5781,7 +5781,7 @@
                             unsigned int _shfl_xor_a335a4 = __shfl_xor_sync(0xFFFFFFFF, ce_emin, 2);
                             unsigned int _min_11201c_1 = ((ce_emin) < (_shfl_xor_a335a4) ? (ce_emin) : (_shfl_xor_a335a4));
                             ce_emin = _min_11201c_1;
-                            int ce_raw = (int)(ce_emax - ce_emin > 15);
+                            int ce_raw = (int)(ce_emax > ce_emin + 15);
                             int ce_valid = w2_ret_valid_03befb * (1 - ce_r) + w2_ret_valid_03befb_1 * ce_r;
                             int ce_src = w2_ret_src_9ba202 * (1 - ce_r) + w2_ret_src_9ba202_1 * ce_r;
                             int ce_rowi = w2_ret_row_738fb2 + ce_r * 8;
@@ -5924,6 +5924,12 @@
                                         *(reinterpret_cast<unsigned char*>(pr_u8 + (ce_hdr_byte_r + 1)) + (0)) = (unsigned char)(ce_hdr_hi_r);
                                     }
                                 } else {
+                                    unsigned int _max_922ebb = ((ce_emax) > (15) ? (ce_emax) : (15));
+                                    unsigned int ce_zexp = _max_922ebb - 15 << 7;
+                                    #pragma unroll
+                                    for (int ce_zi = 0; ce_zi < 16; ce_zi++) {
+                                        ce_bits[ce_zi] = ce_bits[ce_zi] | (unsigned int)((ce_bits[ce_zi] & 32640) == 0) * ce_zexp;
+                                    }
                                     unsigned int ce_cp[8];
                                     unsigned int ce_emax_pair = ce_emax << 7 | ce_emax << 23;
                                     #pragma unroll
@@ -6003,6 +6009,12 @@
                                         *(reinterpret_cast<unsigned char*>(pr_u8 + (ce_hdr_byte_r + 1)) + (0)) = (unsigned char)(ce_hdr_hi_r);
                                     }
                                 } else {
+                                    unsigned int _max_922ebb = ((ce_emax) > (15) ? (ce_emax) : (15));
+                                    unsigned int ce_zexp = _max_922ebb - 15 << 7;
+                                    #pragma unroll
+                                    for (int ce_zi = 0; ce_zi < 16; ce_zi++) {
+                                        ce_bits[ce_zi] = ce_bits[ce_zi] | (unsigned int)((ce_bits[ce_zi] & 32640) == 0) * ce_zexp;
+                                    }
                                     unsigned int ce_cp[8];
                                     unsigned int ce_emax_pair = ce_emax << 7 | ce_emax << 23;
                                     #pragma unroll
