@@ -95,10 +95,12 @@ def fma(a: float, b: float, c: float, fmt=F32) -> float:
 
 def div(a: float, b: float, fmt=F32) -> float:
     if not _finite(a, b) or b == 0:
-        if b == 0 and a != 0 and math.isfinite(a):
+        if (
+            b == 0
+        ):  # IEEE: x / 0 is the signed infinity of the operands' signs, NaN for 0 / 0 and NaN / 0
+            if a == 0 or math.isnan(a):
+                return NAN
             return math.copysign(INF, a) * math.copysign(1.0, b)
-        if a == 0 and b == 0:
-            return NAN
         return a / b
     fr = Fraction(a) / Fraction(b)
     return round_to_format(fr, fmt, zero_sign_neg=(_is_neg(a) != _is_neg(b)))

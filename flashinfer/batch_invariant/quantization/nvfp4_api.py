@@ -41,8 +41,9 @@ _SHUFFLE_ROWS = 32  # the row blocks FlashInfer's shuffle permutes for that tile
 
 
 def _scale_tensor(scale, ref: torch.Tensor) -> torch.Tensor:
-    """The global scale as a 1-element fp32 device tensor (``torch.full`` is a device fill, CUDA-graph capturable; a
-    host-to-device copy would not be)."""
+    """The global scale as a 1-element fp32 device tensor: a host float becomes a device fill (``torch.full``,
+    CUDA-graph capturable); a tensor on another device is copied to the input's device, as the operators' own paths
+    do (a copy is not capturable)."""
     if not isinstance(scale, torch.Tensor):
         return torch.full((1,), float(scale), dtype=torch.float32, device=ref.device)
     return scale.to(device=ref.device, dtype=torch.float32).reshape(-1)[:1].contiguous()
@@ -99,9 +100,14 @@ def nvfp4_quantize_rows(
         )
     else:
         config.validate(K, elem_bytes)
+    if x2.data_ptr() % 16:
+        # an under-aligned storage offset: the 16-byte vector loads need the base aligned (a copy is a placement)
+        x2 = x2.clone(memory_format=torch.contiguous_format)
     assert x2.stride(0) % (16 // elem_bytes) == 0 or M == 1, (
         "input row stride must be a multiple of 16 bytes"
     )
+    if fp4.data_ptr() % 16 or sf.data_ptr() % 16:
+        raise ValueError("the fp4 and sf output buffers must be 16-byte aligned")
     assert fp4.stride(0) % 8 == 0 or M == 1, (
         "fp4 row stride must be a multiple of 8 bytes"
     )

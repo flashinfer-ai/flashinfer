@@ -104,13 +104,14 @@ class ScaleRule:
     zero: str = "keep"
 
     def __post_init__(self):
-        assert (
-            self.norm in SCALE_NORMS
-            and self.round in SCALE_ROUNDS
-            and self.inv in INV_RULES
-            and self.sat in SAT_RULES
-        ), self
-        assert self.zero in ZERO_RULES, self
+        if (
+            self.norm not in SCALE_NORMS
+            or self.round not in SCALE_ROUNDS
+            or self.inv not in INV_RULES
+            or self.sat not in SAT_RULES
+            or self.zero not in ZERO_RULES
+        ):
+            raise ValueError(f"invalid scale rule {self}")
 
     @property
     def name(self) -> str:

@@ -94,6 +94,14 @@ def unpack_elems(packed: torch.Tensor, fmt: S.MXFormat) -> torch.Tensor:
     return _E2M1_MAGS.double()[codes & 7] * torch.where(codes & 8 != 0, -1.0, 1.0)
 
 
+def amax_ignoring_nan(v: torch.Tensor) -> torch.Tensor:
+    """The canonical ``max.f32`` tree over the last dimension as the device computes it: a NaN operand is ignored (the
+    other operand is returned), NaN only when every operand is NaN."""
+    nan = torch.isnan(v)
+    m = torch.where(nan, torch.full_like(v, float("-inf")), v).amax(dim=-1)
+    return torch.where(nan.all(dim=-1), torch.full_like(m, float("nan")), m)
+
+
 def quantize_mx_reference(
     x: torch.Tensor,
     fmt: S.MXFormat = S.MXFP8,
@@ -108,7 +116,7 @@ def quantize_mx_reference(
     nb = S.num_blocks(K, S.BLOCK)
     fp = TorchF32
     xf = x.to(torch.float32).view(M, nb, S.BLOCK)  # exact widening
-    amax = fp.fabs(xf).amax(dim=-1)
+    amax = amax_ignoring_nan(fp.fabs(xf))  # a NaN operand is ignored, as by max.f32
     sf_d, inv = S.scale_chain(fp, amax, fmt, rule)  # (M, nb) values
     q = S.quant_elem(fp, xf, inv.unsqueeze(-1), fmt, rule).view(M, K)
     packed = pack_elems(q, fmt)

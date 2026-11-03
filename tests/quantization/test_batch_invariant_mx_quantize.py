@@ -79,14 +79,19 @@ def _quantize(x, fmt, layout="128x4", **kw):
         q, sf = flashinfer.mxfp8_quantize(
             x, sf_swizzle_layout=FI_LAYOUTS[layout], batch_invariant=True, **kw
         )
-        assert q.dtype == torch.float8_e4m3fn
+        assert (
+            q.dtype == torch.float8_e4m3fn and sf.dim() == 1
+        )  # the operator's flat scales
     else:
         q, sf = flashinfer.mxfp4_quantize(
             x, sfLayout=FI_LAYOUTS[layout], batch_invariant=True, **kw
         )
-        assert q.dtype == torch.uint8
-    assert sf.dtype == torch.uint8 and sf.dim() == 1
-    return q.view(torch.uint8).cpu(), sf.cpu()
+        assert (
+            q.dtype == torch.uint8 and sf.dim() == 2
+        )  # the operator's (rows, columns) view
+        assert sf.shape[1] == L.padded_sf_cols(x.shape[-1], BLOCK, layout)
+    assert sf.dtype == torch.uint8
+    return q.view(torch.uint8).cpu(), sf.reshape(-1).cpu()
 
 
 def _logical(outs, M, K, layout):
@@ -202,7 +207,9 @@ def test_determinism_graph_replay_and_pdl(fmt):
         outs[1].zero_()
         g.replay()
         torch.cuda.synchronize()
-        assert same_bits((outs[0].view(torch.uint8).cpu(), outs[1].cpu()), ref)
+        assert same_bits(
+            (outs[0].view(torch.uint8).cpu(), outs[1].reshape(-1).cpu()), ref
+        )
 
 
 @needs_device
@@ -325,10 +332,9 @@ def test_zero_rows_and_unsupported_inputs(fmt):
     for shape, layout in (((0, 64), "128x4"), ((0, 5, 96), "8x4"), ((0, 64), "linear")):
         x0 = torch.empty(shape, dtype=torch.bfloat16, device="cuda")
         q, sf = api(x0, batch_invariant=True, **{lay: FI_LAYOUTS[layout]})
-        assert q.shape == (
-            *shape[:-1],
-            shape[-1] * fmt.elem_bits // 8,
-        ) and sf.shape == (0,)
+        assert q.shape == (*shape[:-1], shape[-1] * fmt.elem_bits // 8)
+        cols = L.padded_sf_cols(shape[-1], BLOCK, layout)
+        assert sf.shape == ((0,) if fmt is S.MXFP8 else (0, cols))
     x3 = adversarial_inputs(36, 64, torch.bfloat16, seed=3, block=BLOCK).view(3, 12, 64)
     c = _quantize(x3, fmt)
     d = _quantize(x3.view(36, 64), fmt)
@@ -361,6 +367,14 @@ def test_zero_rows_and_unsupported_inputs(fmt):
     if fmt is S.MXFP8:
         with pytest.raises(E, match="alignment"):
             api(x, alignment=48, batch_invariant=True)
+        with pytest.raises(
+            E, match="rows of at most"
+        ):  # the padded row is what the limit applies to
+            api(
+                torch.zeros(2, 65504, dtype=torch.bfloat16, device="cuda"),
+                alignment=3072,  # 65504 -> 67584 columns: 135168 bytes, past the 131072-byte limit
+                batch_invariant=True,
+            )
 
 
 @needs_device
@@ -381,5 +395,8 @@ def test_fp4_quantize_entry_point_runs_the_mxfp4_class():
             x, sfLayout=FI_LAYOUTS[layout], batch_invariant=True
         )
         cols = 1024 // BLOCK if layout == "linear" else -(-(1024 // BLOCK) // 4) * 4
-        assert q.shape == rq.shape and sf.shape == (rsf.numel() // cols, cols)
-        assert torch.equal(q, rq) and torch.equal(sf.reshape(-1), rsf)
+        assert q.shape == rq.shape and sf.shape == rsf.shape == (
+            rsf.numel() // cols,
+            cols,
+        )
+        assert torch.equal(q, rq) and torch.equal(sf, rsf)

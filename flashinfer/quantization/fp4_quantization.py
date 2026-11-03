@@ -1161,9 +1161,12 @@ def fp4_quantize(
         correctly rounded fp32 division) and ``mxfp4.quant`` for
         ``sf_vec_size=32, sf_use_ue8m0=True``; the same classes
         :func:`nvfp4_quantize` and :func:`mxfp4_quantize` run. Other
-        recipes, fp8 input and a 4over6 recipe raise
+        recipes, fp8 input and an NVFP4 4over6 recipe (explicit, or enabled
+        through the ``FLASHINFER_NVFP4_4OVER6`` environment) raise
         :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`
-        instead of falling back. See ``flashinfer/batch_invariant/README.md``.
+        instead of falling back; an explicit recipe with MXFP4 parameters is
+        the operator's own ``ValueError``, raised before the class is reached.
+        See ``flashinfer/batch_invariant/README.md``.
 
     Returns
     -------
@@ -1722,7 +1725,8 @@ def nvfp4_quantize(
         ``flashinfer.batch_invariant.fingerprint("nvfp4_quantize")``) and
         per-token (``nvfp4.quant.pertoken``: the row's scale is derived from
         its amax; ``fingerprint("nvfp4_quantize_per_token", K=)``), all three
-        scale-factor layouts and ``do_shuffle``. An explicit 4over6 recipe,
+        scale-factor layouts and ``do_shuffle``. A 4over6 recipe (explicit, or enabled through
+        the ``FLASHINFER_NVFP4_4OVER6`` environment when ``nvfp4_4over6`` is omitted),
         ``sf_vec_size != 16``, an fp8 input, ``expanded_idx_to_permuted_idx``
         and ``out_scale`` raise
         :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`

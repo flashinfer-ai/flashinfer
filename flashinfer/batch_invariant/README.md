@@ -63,8 +63,9 @@ no package data entry, so no `.lean` file is in the wheel.
 
 ## Quantization
 
-The quantizers have no cross-row reduction: a block's scale and codes depend on that block alone, so FlashInfer's own
-kernels are already batch invariant in the R1 / R2 sense. What `batch_invariant=True` adds is a specified, fingerprinted
+The quantizers have no cross-row reduction: a block's scale and codes depend on that block alone (per-token NVFP4: on
+its row, whose amax sets the row's global scale), so FlashInfer's own kernels are already batch invariant in the R1 / R2
+sense. What `batch_invariant=True` adds is a specified, fingerprinted
 dataflow (R3 across the enumerated configurations, R4 across the scale-factor layouts and the input dtypes that widen
 exactly), a closed-form dispatcher whose every pick is a member of one enumerated space, and the exact CPU model and Lean
 statements of the chains. The flag requires `backend="auto"` (the default, which runs the CUDA kernel without the flag) on the

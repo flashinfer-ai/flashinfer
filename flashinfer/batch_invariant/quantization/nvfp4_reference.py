@@ -168,15 +168,15 @@ class TorchF32:
 
     @staticmethod
     def fmin(a, b):
-        return torch.minimum(
-            a, torch.as_tensor(b, dtype=torch.float32, device=a.device)
-        )
+        """``fmin.f32`` as the exact model orders it: ``a`` when ``a <= b``, else ``b`` (equal values return ``a``)."""
+        bt = torch.as_tensor(b, dtype=torch.float32, device=a.device)
+        return torch.where(a <= bt, a, bt)
 
     @staticmethod
     def fmax(a, b):
-        return torch.maximum(
-            a, torch.as_tensor(b, dtype=torch.float32, device=a.device)
-        )
+        """``fmax.f32`` as the exact model orders it: ``a`` when ``a >= b``, else ``b`` (equal values return ``a``)."""
+        bt = torch.as_tensor(b, dtype=torch.float32, device=a.device)
+        return torch.where(a >= bt, a, bt)
 
     fmaxc = fmax
 
@@ -220,9 +220,10 @@ def swizzle_sf_128x4(sf: torch.Tensor, M: int, K: int) -> torch.Tensor:
         + ((rows % 128) // 32) * 4
         + (rows // 128) * (128 * pc)
     )
-    assert int(idx[0, 0]) == sf_offset_128x4(0, 0, pc) and int(
-        idx[M - 1, nb - 1]
-    ) == sf_offset_128x4(M - 1, nb - 1, pc)
+    if M > 0:  # an empty input has no cell to check
+        assert int(idx[0, 0]) == sf_offset_128x4(0, 0, pc) and int(
+            idx[M - 1, nb - 1]
+        ) == sf_offset_128x4(M - 1, nb - 1, pc)
     out[idx.flatten()] = sf.reshape(-1)
     return out.view(pr, pc)
 
@@ -249,6 +250,14 @@ def _scale_value(gs) -> torch.Tensor:
     return TorchF32.const(float(gs))
 
 
+def amax_ignoring_nan(v: torch.Tensor) -> torch.Tensor:
+    """The canonical ``max.f32`` tree over the last dimension as the device computes it: a NaN operand is ignored (the
+    other operand is returned), NaN only when every operand is NaN."""
+    nan = torch.isnan(v)
+    m = torch.where(nan, torch.full_like(v, float("-inf")), v).amax(dim=-1)
+    return torch.where(nan.all(dim=-1), torch.full_like(m, float("nan")), m)
+
+
 def quantize_reference(
     x: torch.Tensor, gs: Union[float, torch.Tensor], per_token: bool = False
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
@@ -260,11 +269,13 @@ def quantize_reference(
     nb = num_blocks(K)
     fp = TorchF32
     xf = x.to(torch.float32).view(M, nb, BLOCK)  # exact widening
-    amax = fp.fabs(xf).amax(dim=-1)  # the canonical tree's value (max of non-negatives)
+    amax = amax_ignoring_nan(
+        fp.fabs(xf)
+    )  # the canonical tree's value (max of non-negatives; a NaN operand is ignored)
     g = _scale_value(gs)
     pts = None
     if per_token:
-        ramax = amax.amax(dim=-1)
+        ramax = amax_ignoring_nan(amax)
         ges, pts = S.row_scale_chain(fp, ramax, g)
         gsb = ges.view(M, 1)
     else:

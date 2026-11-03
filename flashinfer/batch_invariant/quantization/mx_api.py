@@ -18,7 +18,7 @@ from typing import Optional, Tuple
 import torch
 
 from ..support import check_device, unsupported
-from .layout import layout_name, padded_sf_rows, sf_numel
+from .layout import layout_name, padded_sf_cols, padded_sf_rows, sf_numel
 from .mx_schedule import BLOCK, MXQuantConfig, default_config, num_blocks
 from .mx_spec import DEFAULT_RULE, FORMATS, MXFP4, MXFP8, MXFormat, ScaleRule
 
@@ -132,6 +132,11 @@ def mx_quantize(
         )
     else:
         config.validate(K, elem_bytes, swizzled)
+    if x2.data_ptr() % 16:
+        # an under-aligned storage offset: the 16-byte vector loads need the base aligned (a copy is a placement)
+        x2 = x2.clone(memory_format=torch.contiguous_format)
+    if codes.data_ptr() % 16 or sf.data_ptr() % 16:
+        raise ValueError("the codes and sf output buffers must be 16-byte aligned")
     vec = 16 // elem_bytes
     assert x2.stride(0) % vec == 0 or M == 1, (
         "input row stride must be a multiple of 16 bytes"
@@ -182,15 +187,16 @@ def mxfp8_quantize_batch_invariant(
     K = int(input.shape[-1])
     if K <= 0 or K % BLOCK:
         raise unsupported(CLASS_MXFP8, f"K = {K}", f"K a positive multiple of {BLOCK}")
-    if K * input.element_size() > MAX_ROW_BYTES:
-        raise unsupported(
-            CLASS_MXFP8,
-            f"K = {K} for {input.dtype}",
-            f"rows of at most {MAX_ROW_BYTES} bytes (K <= {MAX_ROW_BYTES // input.element_size()})",
-        )
     if alignment <= 0 or alignment % BLOCK:
         raise unsupported(
             CLASS_MXFP8, f"alignment = {alignment}", f"a positive multiple of {BLOCK}"
+        )
+    padded_k = -(-K // alignment) * alignment
+    if padded_k * input.element_size() > MAX_ROW_BYTES:
+        raise unsupported(
+            CLASS_MXFP8,
+            f"K = {K} (padded to {padded_k}) for {input.dtype}",
+            f"rows of at most {MAX_ROW_BYTES} bytes (padded K <= {MAX_ROW_BYTES // input.element_size()})",
         )
     try:
         layout = layout_of(sf_swizzle_layout)
@@ -200,7 +206,6 @@ def mxfp8_quantize_batch_invariant(
             f"the scale-factor layout {sf_swizzle_layout!r}",
             "SfLayout.layout_128x4, SfLayout.layout_8x4 or SfLayout.layout_linear",
         ) from None
-    padded_k = -(-K // alignment) * alignment
     if padded_k == K:
         try:
             x2 = _rows(input, K, "input")
@@ -254,7 +259,8 @@ def mxfp4_quantize_batch_invariant(
     """``flashinfer.mxfp4_quantize(a, ..., backend="auto", batch_invariant=True)``: the class ``mxfp4.quant``.
 
     FlashInfer's contract is reproduced: ``a_fp4`` a ``uint8`` tensor of shape ``(*a.shape[:-1], K / 2)`` (two e2m1
-    codes per byte, element ``2j`` in the low nibble), ``a_sf`` the flat ``uint8`` UE8M0 scales of ``sfLayout``
+    codes per byte, element ``2j`` in the low nibble), ``a_sf`` the ``uint8`` UE8M0 scales of ``sfLayout`` as the operator's
+    ``(rows, columns)`` view (the padded columns of the swizzled layouts, ``K / 32`` for the linear one)
     (``SfLayout.layout_128x4``: rows padded to 128 and scale columns to 4; ``layout_8x4``: rows to 8, columns to 4;
     ``layout_linear``: ``M x K / 32``). ``enable_pdl=None`` follows the device. ``config`` / ``sm_count`` force a
     configuration / another part's dispatcher pick (members of the enumerated space: the bits never depend on them).
@@ -305,12 +311,14 @@ def mxfp4_quantize_batch_invariant(
         codes = torch.empty((*a.shape[:-1], K // 2), dtype=torch.uint8, device=a.device)
         sf = torch.empty(
             sf_numel(0, K, BLOCK, layout), dtype=torch.uint8, device=a.device
-        )
+        ).view(-1, padded_sf_cols(K, BLOCK, layout))
         return codes, sf
     codes, sf = mx_quantize(
         x2, MXFP4, layout, config=config, enable_pdl=bool(enable_pdl), sm_count=sm_count
     )
-    return codes.view(*a.shape[:-1], K // 2), sf
+    return codes.view(*a.shape[:-1], K // 2), sf.view(
+        -1, padded_sf_cols(K, BLOCK, layout)
+    )
 
 
 def format_of(name: str) -> MXFormat:

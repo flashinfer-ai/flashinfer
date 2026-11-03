@@ -149,9 +149,10 @@ def swizzle_sf(sf_rows, M: int, K: int, block: int, layout="128x4"):
     )
     idx = _offsets(M, K, block, layout, sf_rows.device)
     pc = padded_sf_cols(K, block, layout)
-    assert int(idx[0, 0]) == sf_offset(layout, 0, 0, pc) and int(
-        idx[M - 1, nb - 1]
-    ) == sf_offset(layout, M - 1, nb - 1, pc)
+    if M > 0:  # an empty input has no cell to check
+        assert int(idx[0, 0]) == sf_offset(layout, 0, 0, pc) and int(
+            idx[M - 1, nb - 1]
+        ) == sf_offset(layout, M - 1, nb - 1, pc)
     out[idx.reshape(-1)] = sf_rows.reshape(-1)
     return out
 
