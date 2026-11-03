@@ -795,9 +795,9 @@ def mm_bf16(
         without and with PDL and the faster variant is cached; without a
         tuned entry they run without PDL. These entries use the op name
         ``"bf16_gemm_pdl_auto"``, while ``skip_ops={"bf16_gemm"}`` still
-        skips such calls. PDL kernels may read ``b`` and ``bias`` before
-        waiting for the preceding kernel, so pass ``pdl=False`` if a kernel
-        that may still be running writes them. Defaults to ``False`` so
+        skips such calls. PDL kernels may read ``b`` before waiting for the
+        preceding kernel, so pass ``pdl=False`` if a kernel that may still
+        be running writes it. Defaults to ``False`` so
         autotuning cannot silently enable this input-dependency assumption.
 
     out: Optional[torch.Tensor]
