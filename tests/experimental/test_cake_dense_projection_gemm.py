@@ -3221,6 +3221,43 @@ def test_deterministic_backend_follows_the_binding_and_sys_modules(monkeypatch):
     assert cake_backend.deterministic_backend() is det_backend
 
 
+def test_use_deterministic_backend_drops_the_convenience_entries(monkeypatch):
+    """A binding drops this package's convenience entries and arenas: an entry holds the plan and program of the
+    package bound before, so a call with an unchanged key would launch that package's program."""
+    fake_pkg, fake = (
+        ModuleType("vendored_det_pkg3"),
+        ModuleType("vendored_det_pkg3.cake_backend"),
+    )
+    for name in cake_backend.DETERMINISTIC_NAMES.values():
+        setattr(fake, name, Recorder())
+    monkeypatch.setitem(sys.modules, "vendored_det_pkg3", fake_pkg)
+    monkeypatch.setitem(sys.modules, "vendored_det_pkg3.cake_backend", fake)
+    monkeypatch.setattr(cake_jit, "_det_package", cake_jit._det_package)
+    caches = (
+        cake_backend._K1_ATOMIC_CACHE,
+        cake_backend._K1_DET_CACHE,
+        cake_backend._K2_ATOMIC_CACHE,
+        cake_backend._K2_SPLITK_CACHE,
+    )
+    key = ("dense-projection-gemm-test", object())
+    try:
+        for module in (fake, det_backend):
+            for cache in caches:
+                cache[key] = None
+            cake_backend._ATOMIC_ARENAS[(99, 99)] = cake_backend._AtomicArena(
+                torch.device("cpu"), (99, 99)
+            )
+            cake_backend.use_deterministic_backend(module)
+            assert cake_backend.deterministic_backend() is module
+            assert not any(key in cache for cache in caches)
+            assert (99, 99) not in cake_backend._ATOMIC_ARENAS
+    finally:
+        for cache in caches:
+            cache.pop(key, None)
+        cake_backend._ATOMIC_ARENAS.pop((99, 99), None)
+        cake_backend.use_deterministic_backend(det_backend)
+
+
 @pytest.mark.parametrize("shift_elems, ldo", [(1, 256), (2, 256), (0, 258)])
 def test_k2_misaligned_out_takes_the_deterministic_path(monkeypatch, shift_elems, ldo):
     """An ``out`` the reduce-add map cannot address (off a 16-byte boundary, or rows not a multiple of 4 elements)

@@ -137,7 +137,9 @@ def use_deterministic_backend(module: ModuleType) -> None:
     """Bind the deterministic package's ``cake_backend`` module explicitly.  In a FlashInfer tree the deterministic
     package is this package's sibling and is resolved on first use; a vendored copy of this package (imported
     under another name, without the ``flashinfer`` package around it) vendors the deterministic package too and
-    binds its ``cake_backend`` here before the first call that needs it."""
+    binds its ``cake_backend`` here before the first call that needs it.  Binding drops this package's convenience
+    caches and arenas (:func:`_drop_convenience_entries`): their entries hold the plans and programs of the package
+    bound before."""
     missing = [
         name for key, name in DETERMINISTIC_NAMES.items() if not hasattr(module, name)
     ]
@@ -147,6 +149,7 @@ def use_deterministic_backend(module: ModuleType) -> None:
             f"it lacks {missing}"
         )
     cake_jit.bind_deterministic_package(module.__name__.rpartition(".")[0])
+    _drop_convenience_entries()
 
 
 # The module :func:`deterministic_backend` last resolved: ``(bound package, module name, module)``.
@@ -3148,10 +3151,9 @@ def _splitk_k2(
     )
 
 
-def clear_convenience_caches() -> None:
-    """Drop every cached convenience-path launch, what the convenience path keeps from the router tables
-    (:func:`_router_memo`) and every workspace arena of both packages (this package's launches and the deterministic
-    package's)."""
+def _drop_convenience_entries() -> None:
+    """Drop this package's cached convenience-path launches, what the convenience path keeps from the router tables
+    (:func:`_router_memo`) and this package's workspace arenas."""
     global _ROUTER_MEMO
     with _ATOMIC_PLAN_LOCK:
         _K1_ATOMIC_CACHE.clear()
@@ -3160,6 +3162,13 @@ def clear_convenience_caches() -> None:
         _K2_SPLITK_CACHE.clear()
         _ATOMIC_ARENAS.clear()
         _ROUTER_MEMO = _RouterMemo(-1, None, None, False, True)
+
+
+def clear_convenience_caches() -> None:
+    """Drop every cached convenience-path launch, what the convenience path keeps from the router tables
+    (:func:`_router_memo`) and every workspace arena of both packages (this package's launches and the deterministic
+    package's)."""
+    _drop_convenience_entries()
     deterministic_backend().clear_convenience_caches()
 
 
