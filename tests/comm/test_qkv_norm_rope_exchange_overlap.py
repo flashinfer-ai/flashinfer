@@ -325,8 +325,9 @@ def test_shape_gate_default_table():
     per-architecture table -- one readiness word per destination for calls of at most 4096 rows and one producer
     launch per destination run for calls of at least 16384 rows on SM100 / SM103; on SM90 one readiness word per
     destination for calls of at most 4096 rows, the persistent producer grid over every SM (no reserved SMs) for
-    calls of at least 16384 rows, and the per-destination launch gate off; on SM107 every gate off -- plus the one
-    (architecture, world size) cell that differs from it: the small-row word gate on every row for 8 ranks on SM90."""
+    calls of at least 16384 rows, and the per-destination launch gate off; on SM107 no per-architecture gate -- plus
+    the three (architecture, world size) cells that differ from it: the small-row word gate on every row for 8 ranks
+    on SM90 and for 2 and 4 ranks on SM107."""
 
     assert plans.SHAPE_GATE_NAMES == (
         "words_capacity_small_m",
@@ -355,13 +356,12 @@ def test_shape_gate_default_table():
             assert row["words_capacity_small_m"] == 4096
             assert row["reserved_sms_large_m"] == (16384 if arch == "sm_90a" else 0)
             assert row["per_dest_large_m"] == (0 if arch == "sm_90a" else 16384)
-    # The (architecture, world size) cells: exactly the one new (architecture, world size) default, differing from
+    # The (architecture, world size) cells: exactly the new (architecture, world size) defaults, each differing from
     # its row.
     overrides = plans.SHAPE_GATE_DEFAULT_BY_ARCH_WORLD
-    assert set(overrides) == {("sm_90a", 8)}
-    assert overrides[("sm_90a", 8)] == {
-        "words_capacity_small_m": plans.SHAPE_GATE_ALL_ROWS
-    }
+    assert set(overrides) == {("sm_90a", 8), ("sm_107a", 2), ("sm_107a", 4)}
+    for cell in overrides.values():
+        assert cell == {"words_capacity_small_m": plans.SHAPE_GATE_ALL_ROWS}
     for (arch, world_size), cell in overrides.items():
         assert world_size in plans.SUPPORTED_WORLD_SIZES and set(cell) <= set(
             plans.SHAPE_GATE_NAMES
@@ -704,8 +704,8 @@ def test_shape_gates_resolution(monkeypatch):
             "per_dest_large_m": defaults["per_dest_large_m"],
             "pair_off_large_m": defaults["pair_off_large_m"],
         }
-        # The small-row word gate on every row (``all``) in either direction: the SM90 8-rank default, an opt-in
-        # elsewhere; the previous SM90 8-rank plan is the explicit threshold 4096.
+        # The small-row word gate on every row (``all``) in either direction: the SM90 8-rank and SM107 2- and
+        # 4-rank default, an opt-in elsewhere; the previous SM90 8-rank plan is the explicit threshold 4096.
         monkeypatch.setenv(env, "words_capacity_small_m=all")
         gates, source = backend.resolve_shape_gates(arch, world_size)
         assert (
@@ -785,7 +785,7 @@ def test_group_m_scale_default_table():
         "sm_90a": {2: 1, 4: 1, 8: 1},
         "sm_100a": {2: 2, 4: 2, 8: 1},
         "sm_103a": {2: 2, 4: 2, 8: 2},
-        # the baseline plan on SM107 (not measured there)
+        # the baseline plan on SM107 (the 2-rank doubling was not adopted)
         "sm_107a": {2: 1, 4: 1, 8: 1},
     }
     assert set(plans.GROUP_M_SCALE_DEFAULT_BY_ARCH_WORLD) == set(loader.ARCH_FLAGS)

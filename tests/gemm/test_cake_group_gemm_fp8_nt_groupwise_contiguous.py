@@ -21,6 +21,7 @@ from flashinfer.gemm.cake_grouped_fp8_gemm import (
     BS_N256_S16_ROUTE,
     BS_ROUTES,
     BS_STORE16_ROUTES,
+    BS_SWAP_BM64_ROUTE,
     BS_SWAP_C1_ROUTE,
     BS_SWAP_CARRY_ROUTE,
     BS_SWAP_CARRY_S16_ROUTE,
@@ -33,6 +34,8 @@ from flashinfer.gemm.cake_grouped_fp8_gemm import (
     BS_SWAP_S16_ROUTE,
     BS_SWAP_SM100_SMALL_ARCHS,
     BS_SWAP_SM100_SMALL_KEEP,
+    BS_SWAP_SM103_BM64_ADMIT,
+    BS_SWAP_SM103_SMALL_ADMIT,
     BS_SWAP_SMALL_ARCHS,
     DEEPK_C2_AB6_SCALE1_DIRECT_STORE_ROUTE,
     DEEPK_C2_AB6_SCALE1_ROUTE,
@@ -40,6 +43,7 @@ from flashinfer.gemm.cake_grouped_fp8_gemm import (
     DEEPK_C2_KG1_EXPERT_ALIGNED_ROUTE,
     DEEPK_C2_KG1_N64_ROUTE,
     DEEPK_C2_KG1_ROUTE,
+    DEEPK_C2_KG1_WSEG_ROUTE,
     DEEPK_C2_ROUTE,
     DEEPK_C2_SCALAR_OUTPUT_ROUTE,
     DEEPK_CG2_AB7_BSCALE_PREFETCH_ROUTE,
@@ -50,10 +54,15 @@ from flashinfer.gemm.cake_grouped_fp8_gemm import (
     EXPERT_ALIGNED_MAX_GROUPS,
     K128_ROUTE,
     K384_ROUTE,
+    WSEG_MAX_M,
+    WSEG_MAX_N,
+    WSEG_MIN_N,
     _launch_plan,
     _route,
     _tile_starts,
     _validate_indices,
+    _window_segment_launch_ok,
+    _window_segment_plan,
     bs_route_for_shape,
     bs_store16,
     bs_swap_route_for_shape,
@@ -604,17 +613,22 @@ def test_launch_rebinds_per_call_operands():
 # --- validated layout: the expert-aligned route (a speed choice only) ---------
 
 
-def _expert_aligned_registered(device):
+def _route_registered(device, route):
     arch = SUPPORTED_COMPUTE_CAPABILITIES[torch.cuda.get_device_capability(device)]
-    program = ROUTES.get(DEEPK_C2_KG1_EXPERT_ALIGNED_ROUTE)
+    program = ROUTES.get(route)
     return program is not None and arch in PROGRAMS[program]["arches"]
+
+
+def _expert_aligned_registered(device):
+    return _route_registered(device, DEEPK_C2_KG1_EXPERT_ALIGNED_ROUTE)
 
 
 def _layout(group_counts, tile_m):
     """Host reference of the validated layout: (expert runs starting at a row that
     is not a multiple of ``tile_m``, expert runs starting after row 0, 128-row
     tiles when no tile spans two experts, the largest offset of such an inner
-    start within its tile)."""
+    start within its tile, the largest number of expert runs in one 128-row
+    window)."""
     m = sum(group_counts)
     starts, row = set(), 0
     for count in group_counts[:-1]:
@@ -623,7 +637,11 @@ def _layout(group_counts, tile_m):
             starts.add(row)
     offsets = [row % tile_m for row in starts if row % tile_m]
     tiles = sum((count + 127) // 128 for count in group_counts)
-    return len(offsets), len(starts), tiles, max(offsets, default=0)
+    window_runs = [1] * ((m + 127) // 128)
+    for row in starts:
+        if row % 128:
+            window_runs[row // 128] += 1
+    return len(offsets), len(starts), tiles, max(offsets, default=0), max(window_runs)
 
 
 def _aligned(group_counts, tile_m=256):
@@ -728,8 +746,9 @@ def test_validated_layout_selects_the_expert_aligned_route(group_counts, n, k):
     """Without ``validate_indices`` the route is the shape rule's; with it, a layout in
     which at least 90% of the expert runs start inside a tile of that route, one of them
     at least half a tile in, selects the expert-aligned program (when one is
-    registered); every other layout keeps the shape rule's route and grid for its
-    256-row alignment."""
+    registered), or the window-segment program when its CTAs (128-row windows x the
+    most expert runs in one window x 64-column tiles) fit in one wave; every other
+    layout keeps the shape rule's route and grid for its 256-row alignment."""
     device = torch.device("cuda")
     a, b, a_scale, b_scale, m_indices = _make_inputs(
         group_counts, n, k, seed=4750 + len(group_counts) + n + k, device=device
@@ -745,9 +764,18 @@ def test_validated_layout_selects_the_expert_aligned_route(group_counts, n, k):
         a, b, a_scale, b_scale, m_indices, validate_indices=True
     )
     tile_m = route_geometry(route_for_shape(m, n, k))[0]
-    inner, starts, tiles, max_offset = _layout(group_counts, tile_m)
+    inner, starts, tiles, max_offset, window_runs = _layout(group_counts, tile_m)
     preferred = inner and 10 * inner >= 9 * starts and 2 * max_offset >= tile_m
-    if preferred and _expert_aligned_registered(device):
+    window_ctas = (m + 127) // 128 * window_runs * (n // 64)
+    if (
+        preferred
+        and _expert_aligned_registered(device)
+        and _route_registered(device, DEEPK_C2_KG1_WSEG_ROUTE)
+        and window_ctas <= sm_count
+    ):
+        assert validated.route == DEEPK_C2_KG1_WSEG_ROUTE
+        assert validated.grid == (window_ctas, 1, 1)
+    elif preferred and _expert_aligned_registered(device):
         assert validated.route == DEEPK_C2_KG1_EXPERT_ALIGNED_ROUTE
         assert validated.grid == (min(tiles * (n // 128), sm_count), 1, 1)
     else:
@@ -781,7 +809,9 @@ def test_validated_layout_keeps_the_shape_route_outside_the_program_contract():
     padded = prepare_group_gemm_fp8_nt_groupwise_contiguous(
         a, b, a_scale, b_scale, m_indices, validate_indices=True, fill_padding=True
     )
-    assert padded.route == route_for_shape(65, 128, 512)
+    assert (padded.route, padded.grid) == launch_plan(
+        65, 128, 512, sm_count=sm_count, scalar_output=False
+    )
     storage = torch.empty(65 * 128 + 8, dtype=torch.bfloat16, device=device)
     scalar = prepare_group_gemm_fp8_nt_groupwise_contiguous(
         a,
@@ -844,6 +874,61 @@ def test_route_choice_keeps_results_when_indices_change(k):
         assert torch.equal(replay_out, expect_other), prepared.route
 
 
+def test_window_segment_launch_keeps_results_with_more_runs_per_window():
+    """A window-segment launch is sized for the prepared layout's runs per window;
+    rebinding ``m_indices`` to a layout with more runs in a window, or rewriting it
+    before a graph replay, gives the bits of the shape rule's launch for that
+    layout (each CTA then computes several runs)."""
+    device = torch.device("cuda")
+    if not (
+        _expert_aligned_registered(device)
+        and _route_registered(device, DEEPK_C2_KG1_WSEG_ROUTE)
+    ):
+        pytest.skip("no window-segment program for this architecture")
+    if device_sm_count(torch.cuda.current_device()) < 9 * 2 * 4:
+        pytest.skip("the window-segment launch needs 72 SMs for this layout")
+    prepared_counts = [129, 128, 128, 191, 65, 128, 128, 128]
+    dense_counts = [1] * 7 + [1018]
+    a, b, a_scale, b_scale, idx_prepared = _make_inputs(
+        prepared_counts, 256, 512, seed=4780, device=device, arbitrary_scales=True
+    )
+    idx_dense = torch.repeat_interleave(
+        torch.arange(8, dtype=torch.int32, device=device),
+        torch.tensor(dense_counts, dtype=torch.int64, device=device),
+    ).contiguous()
+    expect = prepare_group_gemm_fp8_nt_groupwise_contiguous(
+        a, b, a_scale, b_scale, idx_dense
+    ).launch()
+    expect_own = prepare_group_gemm_fp8_nt_groupwise_contiguous(
+        a, b, a_scale, b_scale, idx_prepared
+    ).launch()
+    torch.cuda.synchronize()
+    _assert_close(expect, _reference(a, b, a_scale, b_scale, idx_dense))
+    prepared = prepare_group_gemm_fp8_nt_groupwise_contiguous(
+        a, b, a_scale, b_scale, idx_prepared.clone(), validate_indices=True
+    )
+    assert prepared.route == DEEPK_C2_KG1_WSEG_ROUTE
+    assert prepared.grid == (9 * 2 * 4, 1, 1)  # 9 windows, 2 runs per window, N/64
+    out = torch.full_like(expect, float("nan"))
+    prepared.launch(m_indices=idx_dense, out=out)
+    torch.cuda.synchronize()
+    assert torch.equal(out, expect)
+    indices = idx_prepared.clone()
+    replay_out = torch.full_like(expect, float("nan"))
+    prepared.launch(m_indices=indices, out=replay_out)  # warm up outside capture
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        prepared.launch(m_indices=indices, out=replay_out)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(replay_out, expect_own)
+    indices.copy_(idx_dense)
+    replay_out.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(replay_out, expect)
+
+
 def test_fill_padding_accepts_compact_layout():
     """-1 padding rows (compact MoE layout) are forward-filled onto the preceding expert."""
     device = torch.device("cuda")
@@ -891,7 +976,12 @@ BLOCK_SCALED_CASES = [
     ([5, 33, 0, 97, 32, 1, 129], 4096, 256, 128),
     ([100, 0, 3, 69, 128, 200, 1, 64], 256, 512, 64),
     ([5, 33, 0, 0, 97, 32, 1, 129], 1024, 256, 32),
+    ([200, 150, 0, 97, 32, 1, 129, 70], 1024, 512, 32),
+    ([5, 129, 0, 64, 33, 1, 70, 31], 1024, 512, 64),
+    ([40, 0, 33, 97, 1, 64, 0, 31, 50, 32, 70, 3, 0, 129, 15, 20], 256, 1536, 32),
     ([95, 97, 2, 193, 0, 100], 384, 128, 96),
+    ([100, 0, 3, 69, 64, 129, 1, 97], 1024, 1024, 64),
+    ([200, 150, 0, 97, 64, 1, 129, 300], 1024, 1024, 64),
 ]
 
 
@@ -1265,7 +1355,9 @@ def test_block_scaled_swap_c1_rule_for_odd_multiples_of_128():
     128 <= K <= 512 take it when ``ceil(m / 32) * n / 128`` CTAs fit
     ``sm_count``.  A single-run layout, a longer K, a second wave, an unknown
     ``sm_count`` and an architecture without swap-AB routes keep the
-    non-swapped routes; N a multiple of 256 keeps its own rules.  sm_100a has
+    non-swapped routes (except the layouts of ``BS_SWAP_SM103_SMALL_ADMIT``,
+    see test_block_scaled_swap_small_block_admit_on_sm_103a); N a multiple of
+    256 keeps its own rules.  sm_100a has
     its own rule (test_block_scaled_swap_small_block_rule_on_sm_100a).
     """
     rule = functools.partial(bs_swap_route_for_shape, num_groups=4)
@@ -1387,6 +1479,120 @@ def test_block_scaled_swap_small_block_rule_on_sm_100a():
         == BS_SWAP_RP32_ROUTE
     )
     assert sorted(BS_SWAP_SM100_SMALL_ARCHS) == ["sm_100a"]
+
+
+def test_block_scaled_swap_small_block_admit_on_sm_103a():
+    """The layouts of ``BS_SWAP_SM103_SMALL_ADMIT`` take the one-CTA program on sm_103a.
+
+    They take it at any wave count with a known ``sm_count``.  An unknown
+    ``sm_count``, the neighbouring layouts and sm_100a keep their own rules.
+    """
+    small = functools.partial(bs_swap_small_route, arch="sm_103a")
+    rule = functools.partial(bs_swap_route_for_shape, num_groups=8, arch="sm_103a")
+    assert sorted(BS_SWAP_SM103_SMALL_ADMIT) == [
+        (896, 1024, 512, 64),
+        (1024, 1024, 512, 32),
+        (1152, 256, 1536, 32),
+        (1664, 384, 128, 128),
+    ]
+    for m, n, k, alignment in BS_SWAP_SM103_SMALL_ADMIT:
+        for sm_count in (152, 148, 64):
+            assert small(m, n, k, alignment=alignment, sm_count=sm_count) == (
+                BS_SWAP_C1_ROUTE
+            )
+            assert rule(m, n, k, alignment=alignment, sm_count=sm_count) == (
+                BS_SWAP_C1_ROUTE
+            )
+        assert small(m, n, k, alignment=alignment, sm_count=None) is None
+        # sm_100a does not read the table: 72, 156, 224 and 256 tiles exceed 3 * 20.
+        assert (
+            bs_swap_small_route(
+                m, n, k, alignment=alignment, arch="sm_100a", sm_count=20
+            )
+            is None
+        )
+    # The single-run layout's neighbours keep the non-swapped routes.
+    for m, k in ((1536, 128), (1792, 128), (1664, 256)):
+        assert rule(m, 384, k, alignment=128, sm_count=152) is None
+    assert rule(1664, 384, 128, alignment=128) is None
+    # The other layouts' neighbours keep the 32-row-block program.
+    for m, k, alignment in (
+        (768, 512, 64),
+        (1024, 512, 64),
+        (896, 1024, 64),
+        (896, 512, 32),
+    ):
+        assert rule(m, 1024, k, alignment=alignment, sm_count=152) == (
+            BS_SWAP_RP32_ROUTE
+        )
+    for m, k, alignment in (
+        (1024, 1536, 32),
+        (1280, 1536, 32),
+        (1152, 1024, 32),
+        (1152, 1536, 64),
+    ):
+        assert rule(m, 256, k, alignment=alignment, sm_count=152) == (
+            BS_SWAP_RP32_ROUTE
+        )
+    # One CTA per 32 x 128 tile: 52 * 3 = 156 tiles on 152 SMs.
+    plan = functools.partial(
+        launch_plan, scalar_output=False, block_scaled=True, sm_count=152
+    )
+    route, grid = plan(1664, 384, 128, alignment=128, num_groups=8, arch="sm_103a")
+    assert route == BS_SWAP_C1_ROUTE and grid == (152, 1, 1)
+    # 32 * 8 = 256 tiles on 152 SMs.
+    route, grid = plan(1024, 1024, 512, alignment=32, num_groups=8, arch="sm_103a")
+    assert route == BS_SWAP_C1_ROUTE and grid == (152, 1, 1)
+    # 28 * 8 = 224 tiles on 152 SMs; 36 * 2 = 72 tiles.
+    route, grid = plan(896, 1024, 512, alignment=64, num_groups=8, arch="sm_103a")
+    assert route == BS_SWAP_C1_ROUTE and grid == (152, 1, 1)
+    route, grid = plan(1152, 256, 1536, alignment=32, num_groups=16, arch="sm_103a")
+    assert route == BS_SWAP_C1_ROUTE and grid == (72, 1, 1)
+
+
+def test_block_scaled_swap_bm64_admit_on_sm_103a():
+    """The layouts of ``BS_SWAP_SM103_BM64_ADMIT`` take the bm64 program on sm_103a.
+
+    The program has 64-row M blocks on two-CTA clusters; the layouts take it
+    with a known ``sm_count``.  An unknown ``sm_count``, the neighbouring
+    layouts and sm_100a keep their own rules.
+    """
+    small = functools.partial(bs_swap_small_route, arch="sm_103a")
+    rule = functools.partial(bs_swap_route_for_shape, num_groups=8, arch="sm_103a")
+    assert sorted(BS_SWAP_SM103_BM64_ADMIT) == [
+        (1024, 1024, 1024, 64),
+        (1536, 1024, 1024, 64),
+    ]
+    for m, n, k, alignment in BS_SWAP_SM103_BM64_ADMIT:
+        for sm_count in (152, 148, 64):
+            assert small(m, n, k, alignment=alignment, sm_count=sm_count) == (
+                BS_SWAP_BM64_ROUTE
+            )
+            assert rule(m, n, k, alignment=alignment, sm_count=sm_count) == (
+                BS_SWAP_BM64_ROUTE
+            )
+        assert small(m, n, k, alignment=alignment, sm_count=None) is None
+        assert rule(m, n, k, alignment=alignment) == BS_SWAP_RUN32_ROUTE
+        # sm_100a does not read the table: 256 and 384 one-CTA tiles fit 3 * 148.
+        assert (
+            bs_swap_small_route(
+                m, n, k, alignment=alignment, arch="sm_100a", sm_count=148
+            )
+            == BS_SWAP_C1_ROUTE
+        )
+    # The neighbouring layouts keep the 32-row-block program.
+    for m, k in ((1280, 1024), (1536, 512)):
+        assert rule(m, 1024, k, alignment=64, sm_count=152) == BS_SWAP_RP32_ROUTE
+    assert rule(1024, 1024, 1024, alignment=32, sm_count=152) == BS_SWAP_RP32_ROUTE
+    # 64 x 256 tiles on two-CTA clusters: 24 * 4 = 96 tiles on 76 clusters and
+    # 16 * 4 = 64 tiles on 64 clusters of 152 SMs.
+    plan = functools.partial(
+        launch_plan, scalar_output=False, block_scaled=True, sm_count=152
+    )
+    route, grid = plan(1536, 1024, 1024, alignment=64, num_groups=8, arch="sm_103a")
+    assert route == BS_SWAP_BM64_ROUTE and grid == (152, 1, 1)
+    route, grid = plan(1024, 1024, 1024, alignment=64, num_groups=8, arch="sm_103a")
+    assert route == BS_SWAP_BM64_ROUTE and grid == (128, 1, 1)
 
 
 def test_block_scaled_swap_rp32_dense_rule():
@@ -2264,6 +2470,126 @@ def test_kg1_n64_route_when_its_tiles_fit_in_one_wave():
         ((127, 128, 256, 148), (DEEPK_C2_KG1_N64_ROUTE, (2, 1, 1))),
     ):
         assert launch_plan(m, n, k, sm_count=sm_count, scalar_output=False) == plan
+
+
+def test_ab6_one_tile_k512_launch_takes_the_n64_program():
+    """An AB6 launch of more than 32 rows that is a single 128 x 128 tile at K = 512
+    runs the KG1 program with 128 x 64 tiles, one CTA per tile; at most 32 rows,
+    another K, or more than one 128 x 128 tile keep their programs."""
+    for sm_count in (148, 152):
+        for (m, n, k), plan in (
+            ((33, 128, 512), (DEEPK_C2_KG1_N64_ROUTE, (2, 1, 1))),
+            ((64, 128, 512), (DEEPK_C2_KG1_N64_ROUTE, (2, 1, 1))),
+            ((127, 128, 512), (DEEPK_C2_KG1_N64_ROUTE, (2, 1, 1))),
+            ((128, 128, 512), (DEEPK_C2_KG1_N64_ROUTE, (2, 1, 1))),
+            ((32, 128, 512), (DEEPK_C2_AB6_SCALE1_DIRECT_STORE_ROUTE, (1, 1, 1))),
+            ((128, 128, 1024), (DEEPK_C2_AB6_SCALE1_ROUTE, (1, 1, 1))),
+            ((128, 256, 512), (DEEPK_C2_AB6_SCALE1_ROUTE, (2, 1, 1))),
+            ((129, 128, 512), (DEEPK_C2_ROUTE, (2, 1, 1))),
+        ):
+            assert route_for_shape(m, n, k) != DEEPK_C2_KG1_N64_ROUTE
+            assert launch_plan(m, n, k, sm_count=sm_count, scalar_output=False) == plan
+    assert launch_plan(128, 128, 512, sm_count=148, scalar_output=True) == (
+        DEEPK_C2_SCALAR_OUTPUT_ROUTE,
+        (1, 1, 1),
+    )
+
+
+@pytest.mark.parametrize("m", [33, 128])
+def test_ab6_one_tile_n64_program_writes_the_ab6_bytes(m):
+    """The 128 x 64-tile program of a one-tile K=512 launch writes the bytes of the
+    AB6 program: an N=128 launch equals the first 128 columns of the N=256 launch
+    of the same rows, which keeps the AB6 program."""
+    device = torch.device("cuda")
+    a, b, a_scale, b_scale, m_indices = _make_inputs(
+        [m], 256, 512, seed=4900 + m, device=device, arbitrary_scales=True
+    )
+    narrow_b, narrow_b_scale = b[:, :128].contiguous(), b_scale[:, :1].contiguous()
+    wide = prepare_group_gemm_fp8_nt_groupwise_contiguous(
+        a, b, a_scale, b_scale, m_indices
+    )
+    narrow = prepare_group_gemm_fp8_nt_groupwise_contiguous(
+        a, narrow_b, a_scale, narrow_b_scale, m_indices
+    )
+    assert wide.route == DEEPK_C2_AB6_SCALE1_ROUTE
+    assert (narrow.route, narrow.grid) == (DEEPK_C2_KG1_N64_ROUTE, (2, 1, 1))
+    expect = wide.launch()
+    out = narrow.launch()
+    torch.cuda.synchronize()
+    assert torch.equal(out, expect[:, :128])
+    _assert_close(out, _reference(a, narrow_b, a_scale, narrow_b_scale, m_indices))
+
+
+def test_window_segment_route_keeps_the_program_launch_contract(monkeypatch):
+    """The window-segment route is taken only inside its program's launch
+    contract, 1 <= M <= 2**24 and 64 <= N <= 2**19 (the kernel's requires),
+    checked at and beyond each bound; outside it the expert-aligned program
+    stays."""
+    assert (WSEG_MAX_M, WSEG_MIN_N, WSEG_MAX_N) == (1 << 24, 64, 1 << 19)
+    ok = _window_segment_launch_ok
+    assert ok(1, 64, (1, 1, 1))
+    assert not ok(0, 64, (1, 1, 1))
+    assert ok(WSEG_MAX_M, 64, (1, 1, 1))
+    assert not ok(WSEG_MAX_M + 1, 64, (1, 1, 1))
+    assert ok(128, WSEG_MIN_N, (1, 1, 1))
+    assert not ok(128, WSEG_MIN_N - 1, (1, 1, 1))
+    assert ok(128, WSEG_MAX_N, (1, 1, 1))
+    assert not ok(128, WSEG_MAX_N + 1, (1, 1, 1))
+    assert not ok(128, 64, (0, 1, 1))
+    from flashinfer.gemm import cake_grouped_fp8_gemm as host
+
+    monkeypatch.setattr(host, "_route_registered", lambda arch, route: True)
+    big = 1 << 20
+    for (m, n, runs, sm_count), plan in (
+        ((128, 64, 1, 148), (DEEPK_C2_KG1_WSEG_ROUTE, (1, 1, 1))),
+        ((0, 64, 1, 148), None),
+        ((128, 63, 1, 148), None),
+        ((128, 64 * 149, 1, 148), None),
+        ((128, WSEG_MAX_N, 1, big), (DEEPK_C2_KG1_WSEG_ROUTE, (8192, 1, 1))),
+        ((WSEG_MAX_M, 64, 1, big), (DEEPK_C2_KG1_WSEG_ROUTE, (1 << 17, 1, 1))),
+        ((128, WSEG_MAX_N + 1, 1, big), None),
+        ((WSEG_MAX_M + 1, 64, 1, big), None),
+    ):
+        assert _window_segment_plan("sm_100a", m, n, runs, sm_count=sm_count) == plan
+
+
+def test_window_segment_route_launches_at_most_one_wave(monkeypatch):
+    """Every window-segment plan launches at most one wave, grid <= sm_count.
+
+    The program's tile loops step a signed 32-bit tile index from the CTA
+    index by the grid size, so its launch contract holds at most 2**30 CTAs;
+    the one-wave rule keeps every route launch far inside it.  A layout whose
+    CTAs exceed one wave keeps the expert-aligned program, as does a grid
+    above 2**30 that the kernel's requires admit (M = 2**24, N = 4160, 128
+    runs per window: 1090519040 CTAs).
+    """
+    from flashinfer.gemm import cake_grouped_fp8_gemm as host
+
+    monkeypatch.setattr(host, "_route_registered", lambda arch, route: True)
+    for sm_count in (1, 148, 152, 1 << 20):
+        for m in (1, 127, 128, 129, 4096, 18944, WSEG_MAX_M):
+            for n in (WSEG_MIN_N, 128, 4160, 9536, WSEG_MAX_N):
+                for runs in (1, 2, 21, 128):
+                    windows, column_tiles = -(-m // 128), -(-n // 64)
+                    ctas = windows * runs * column_tiles
+                    plan = _window_segment_plan(
+                        "sm_100a", m, n, runs, sm_count=sm_count
+                    )
+                    if ctas > sm_count:
+                        assert plan is None
+                    else:
+                        assert plan == (DEEPK_C2_KG1_WSEG_ROUTE, (ctas, 1, 1))
+                        assert ctas <= 1 << 30
+    for sm_count in (148, 152, 1 << 20):
+        plan = _window_segment_plan("sm_100a", WSEG_MAX_M, 4160, 128, sm_count=sm_count)
+        assert plan is None
+    # 2 windows x 2 runs x 37 column tiles = 148 CTAs fill one wave of 148 SMs;
+    # a third run per window needs 222 CTAs, so the expert-aligned program stays.
+    assert _window_segment_plan("sm_100a", 256, 64 * 37, 2, sm_count=148) == (
+        DEEPK_C2_KG1_WSEG_ROUTE,
+        (148, 1, 1),
+    )
+    assert _window_segment_plan("sm_100a", 256, 64 * 37, 3, sm_count=148) is None
 
 
 def test_rejects_invalid_inputs():

@@ -600,8 +600,8 @@ kernel_cake_fmha_decode_native_bf16(CakeFmhaTensorMap const* Qt, CakeFmhaTensorM
             mbarrier_init(smem + 128, 128);
             // corr_empty_1: 1 barriers, init_count=128
             mbarrier_init(smem + 136, 128);
-            // stats_empty: 1 barriers, init_count=4
-            mbarrier_init(smem + 144, 4);
+            // stats_empty: 1 barriers, init_count=128 (every correction thread arrives)
+            mbarrier_init(smem + 144, 128);
             // o_ready_0: 1 barriers, init_count=1
             mbarrier_init(smem + 152, 1);
             // o_ready_1: 1 barriers, init_count=1
@@ -1333,9 +1333,9 @@ kernel_cake_fmha_decode_native_bf16(CakeFmhaTensorMap const* Qt, CakeFmhaTensorM
                 }
                 mbarrier_arrive(o_empty_0_addr);
                 mbarrier_arrive(o_empty_1_addr);
-                if (elect_sync()) {
-                    mbarrier_arrive(stats_empty_addr);
-                }
+                // Every correction thread read smem_exch / smem_corr for this tile: each one
+                // releases stats_empty, so those reads precede the softmax warps' next-tile writes.
+                mbarrier_arrive(stats_empty_addr);
             }
             mbarrier_arrive(tmem_dealloc_addr);
         }

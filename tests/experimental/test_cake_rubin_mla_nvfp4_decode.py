@@ -779,10 +779,11 @@ def test_decode_context_parallel_ranks_merge_on_host(
 def test_split_merge_up_to_and_past_32_splits():
     device = _device_or_skip()
     # A 1-token H96 request (a half tile, 96 rows: the eight-warp merge) at KV64K: the planner's own split count,
-    # then 20 double ranges = 40 partial slots per row (the 64-slot round's upper half), a 3072-row problem at two
+    # then 20 double ranges = 40 partial slots per row (the eight-warp form's 48-slot program), a 3072-row problem at two
     # partials (the one-warp merge above 2048 rows), a 1536-row one at three (two warps: that grid is one wave
     # up to 1664 rows), 28 one-token H16 requests (448 rows) at 24 partials (the four-warp column merge of the
-    # 385-448-row box) and a 768-row problem at 24 partials (the four-warp, two-rows-per-CTA merge above it).
+    # 385-448-row box) and a 768-row problem at 24 partials (the four-warp form's 24-slot program, two rows per
+    # CTA, above it).
     case = _make_case([65536], 1, 96, seed=625030, device=device, return_lse=True)
     out, lse, runner = _run(case, dense=True)
     assert runner.plan.max_splits > 1 and runner.plan.merge_record == "merge_w8_pal"
@@ -790,7 +791,9 @@ def test_split_merge_up_to_and_past_32_splits():
     _check_out(out, ref)
     _check_lse(lse, ref_lse)
     out, lse, runner = _run(case, dense=True, split=(1, 20))
-    assert runner.plan.max_splits == 40 and runner.plan.merge_record == "merge_w8_pal"
+    assert (
+        runner.plan.max_splits == 40 and runner.plan.merge_record == "merge_w8_b48_pal"
+    )
     _check_out(out, ref)
     _check_lse(lse, ref_lse)
     wide = _make_case(
@@ -820,7 +823,7 @@ def test_split_merge_up_to_and_past_32_splits():
     _check_lse(lse, ref_lse)
     four = _make_case([65536], 8, 96, seed=625034, device=device, return_lse=True)
     out, lse, runner = _run(four, dense=True, split=24)  # 768 rows
-    assert runner.plan.max_splits == 24 and runner.plan.merge_record == "merge_w4"
+    assert runner.plan.max_splits == 24 and runner.plan.merge_record == "merge_w4_b24"
     ref, ref_lse = _reference(four)
     _check_out(out, ref)
     _check_lse(lse, ref_lse)
@@ -1172,8 +1175,10 @@ def test_registry_records_follow_the_plan_vocabulary():
     assert cake_jit.records_of_stage("merge") == (
         "merge_w1",
         "merge_w4",
+        "merge_w4_b24",
         "merge_w2_pal",
         "merge_w8_pal",
+        "merge_w8_b48_pal",
         "merge_w4_c4_col_pal",
     )
     assert cake_jit.records_of_stage("quantize") == ("quantize",)
@@ -1205,29 +1210,44 @@ def test_select_rules_and_grids():
         == "decode"
     )
     # (rows, partials per row, record, rows per merge CTA): eight warps per row up to 384 rows or over 32
-    # partials (``merge_w8_pal``); two warps up to 16 partials up to 1664 rows, and over 8 up to 2048 rows
-    # (``merge_w2_pal``); four warps over 17-32 partials (the four-warp column form up to 448 rows, ``merge_w4``
-    # above); one warp above 2048 rows or up to 8 partials above 1664 rows.
+    # partials (``merge_w8_pal``; up to 384 rows at 33-48 partials its 48-slot program, ``merge_w8_b48_pal``);
+    # two warps up to 16 partials up to 1664 rows, and over 8 up to 2048 rows
+    # (``merge_w2_pal``); four warps over 17-32 partials (the four-warp column form up to 448 rows; above,
+    # ``merge_w4_b24`` at 17-24 and ``merge_w4`` at 25-32); one warp above 2048 rows or up to 8 partials above
+    # 1664 rows.
     cases = (
         (96, 24, "merge_w8_pal", 1),
         (192, 52, "merge_w8_pal", 1),
         (384, 24, "merge_w8_pal", 1),
+        (384, 33, "merge_w8_b48_pal", 1),
+        (384, 46, "merge_w8_b48_pal", 1),
+        (384, 48, "merge_w8_b48_pal", 1),
+        (384, 49, "merge_w8_pal", 1),
+        (96, 40, "merge_w8_b48_pal", 1),
+        (385, 33, "merge_w8_pal", 1),
         (385, 16, "merge_w2_pal", 4),
         (385, 17, "merge_w4_c4_col_pal", 1),
         (385, 24, "merge_w4_c4_col_pal", 1),
         (448, 25, "merge_w4_c4_col_pal", 1),
         (448, 32, "merge_w4_c4_col_pal", 1),
         (448, 33, "merge_w8_pal", 1),
-        (449, 24, "merge_w4", 2),
+        (449, 17, "merge_w4_b24", 2),
+        (449, 24, "merge_w4_b24", 2),
+        (449, 25, "merge_w4", 2),
         (768, 12, "merge_w2_pal", 4),
         (768, 16, "merge_w2_pal", 4),
-        (768, 20, "merge_w4", 2),
+        (768, 20, "merge_w4_b24", 2),
+        (768, 24, "merge_w4_b24", 2),
+        (768, 25, "merge_w4", 2),
+        (768, 32, "merge_w4", 2),
         (768, 33, "merge_w8_pal", 1),
         (1536, 8, "merge_w2_pal", 4),
         (1664, 8, "merge_w2_pal", 4),
         (1665, 8, "merge_w1", 8),
         (1792, 6, "merge_w1", 8),
         (1792, 12, "merge_w2_pal", 4),
+        (2048, 24, "merge_w4_b24", 2),
+        (2048, 32, "merge_w4", 2),
         (2048, 33, "merge_w8_pal", 1),
         (2049, 33, "merge_w1", 8),
         (3072, 10, "merge_w1", 8),
@@ -1310,6 +1330,36 @@ def test_units_pairs_table_and_fallback():
 def _merge_warps(record):
     """Warps per row of a merge record, from its name (``merge_w<warps>...``)."""
     return int(re.match(r"merge_w(\d)", record).group(1))
+
+
+@pytest.mark.parametrize("units, pairs", [(50, 4), (49, 6)])
+@pytest.mark.parametrize("kv_len", [65536, 131072])
+def test_one_full_half_request_fills_the_wave(units, pairs, kv_len):
+    """One request whose rows make one full tile and one half tile (H96 x Q4 = 384 rows at B1) plans the pair of
+    split counts that fills the wave (``units + pairs // 2`` items: 52 on both 208-SM tables) at the half-tile
+    factor the forced plans fitted (29 full and 23 half splits at 64K keys, 29 full and 23 half splits at 128K),
+    which the half tile's grid of counts misses; the plan keeps every invariant."""
+    p = cake_backend.plan(
+        seq_lens_host=[kv_len], num_heads=96, q_len=4, units=units, pairs=pairs
+    )
+    assert (p.items, p.n_full, p.max_splits) == {
+        65536: (52, 29, 46),
+        131072: (52, 29, 46),
+    }[kv_len]
+    assert p.merge_record == "merge_w8_b48_pal" and p.grid_decode == (208, 1, 1)
+    _check_plan(p, [kv_len], [4], 96)
+    if (units, pairs) == (50, 4):
+        # Two such requests are not in the class (their wave holds both): the plan keeps the grid's counts.
+        q = cake_backend.plan(
+            seq_lens_host=[kv_len, kv_len],
+            num_heads=96,
+            q_len=4,
+            units=units,
+            pairs=pairs,
+        )
+        assert (q.items, q.n_full, q.max_splits) == (52, 32, 20)
+        assert q.merge_record == "merge_w4_b24"
+        _check_plan(q, [kv_len, kv_len], [4, 4], 96)
 
 
 def _check_plan(p, kv_lens, q_lens, heads):
@@ -1458,7 +1508,7 @@ def test_plan_invariants(sm_count):
         pairs=pairs,
         split=(1, 20),
     )
-    assert forced.max_splits == 40 and forced.merge_record == "merge_w8_pal"
+    assert forced.max_splits == 40 and forced.merge_record == "merge_w8_b48_pal"
     _check_plan(forced, [65536], [1], 96)
     with pytest.raises(ValueError, match="at most 64"):
         cake_backend.plan(

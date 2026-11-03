@@ -21,17 +21,21 @@ from cutlass import Int32, Int64
 class HeadIndexedMetadataView:
     """Read one KV head's values from interleaved [route, pattern_head] rows."""
 
+    # Bind interleaved route/head metadata and the selected KV-head index.
     def __init__(self, values, heads, head):
         self.values = (values, heads, head)
 
+    # Flatten runtime tensors and indices for the CuTe value protocol.
     def __extract_mlir_values__(self):
         return cutlass.extract_mlir_values(self.values)
 
+    # Rebind runtime metadata after a CuTe call or control-flow boundary.
     def __new_from_mlir_values__(self, values):
         return HeadIndexedMetadataView(
             *cutlass.new_from_mlir_values(self.values, values)
         )
 
+    # Read the selected head at a logical route index.
     @cute.jit
     def __getitem__(self, route):
         values, heads, head = self.values
@@ -47,6 +51,11 @@ class DirectSparseMetadataView:
     requests may each contain several routes. Split reduction can still run.
     """
 
+    # Bind block IDs, page table, request IDs and token positions without copying.
+    # model_len and fixed_query_len count tokens; page_capacity counts fragment slots.
+    # packed selects route offsets; fixed_query_layout derives request/position from
+    # uniform Q rows instead of request IDs. lengths selects scheduler lengths
+    # rather than physical fragment locators; head selects an unshared pattern.
     def __init__(
         self,
         inputs,
@@ -62,39 +71,64 @@ class DirectSparseMetadataView:
         head=0,
         count_current_block_in_topk=True,
         fixed_query_len=0,
+        fixed_query_layout=False,
     ):
-        self.values = (*inputs, qo_indptr, head)
+        self.values = (
+            *inputs[:4],
+            qo_indptr,
+            head,
+            model_len,
+            page_capacity,
+            fixed_query_len,
+        )
         self.packed = packed
-        self.model_len = model_len
         self.page_size = page_size
-        self.page_capacity = page_capacity
         self.lengths = lengths
         self.sparse_block_size = sparse_block_size
         self.count_current_block_in_topk = count_current_block_in_topk
-        self.fixed_query_len = fixed_query_len
+        self.fixed_query_layout = fixed_query_layout
         self.fragment_size = fragment_size
         self.fragments_per_block = sparse_block_size // fragment_size
 
+    # Return the runtime exclusive token-position bound.
+    @property
+    def model_len(self):
+        return self.values[6]
+
+    # Return fragment slots per route, the flattened locator row stride.
+    @property
+    def page_capacity(self):
+        return self.values[7]
+
+    # Return tokens per request for the fixed-query metadata layout.
+    @property
+    def fixed_query_len(self):
+        return self.values[8]
+
+    # Carry tensors and live bounds through the CuTe value protocol.
     def __extract_mlir_values__(self):
         return cutlass.extract_mlir_values(self.values)
 
+    # Rebind runtime values while preserving the static sparse metadata format.
     def __new_from_mlir_values__(self, values):
         new = cutlass.new_from_mlir_values(self.values, values)
         return DirectSparseMetadataView(
             new[:4],
             new[4],
             packed=self.packed,
-            model_len=self.model_len,
+            model_len=new[6],
             page_size=self.page_size,
-            page_capacity=self.page_capacity,
+            page_capacity=new[7],
             lengths=self.lengths,
             sparse_block_size=self.sparse_block_size,
             fragment_size=self.fragment_size,
             count_current_block_in_topk=self.count_current_block_in_topk,
-            fixed_query_len=self.fixed_query_len,
+            fixed_query_len=new[8],
+            fixed_query_layout=self.fixed_query_layout,
             head=new[5],
         )
 
+    # Share the metadata and live bounds while selecting another KV-head pattern.
     def with_head(self, head):
         return DirectSparseMetadataView(
             self.values[:4],
@@ -108,12 +142,15 @@ class DirectSparseMetadataView:
             fragment_size=self.fragment_size,
             count_current_block_in_topk=self.count_current_block_in_topk,
             fixed_query_len=self.fixed_query_len,
+            fixed_query_layout=self.fixed_query_layout,
             head=head,
         )
 
+    # Resolve a route to (query row, request, visible KV tokens); invalid routes have
+    # zero visibility.
     @cute.jit
     def resolve_route(self, route):
-        blocks, table, requests, positions, offsets, _ = self.values
+        blocks, table, requests, positions, offsets, _ = self.values[:6]
         row = route
         valid = (row >= Int32(0)) & (row < Int32(blocks.shape[0]))
         if cutlass.const_expr(self.packed):
@@ -127,7 +164,7 @@ class DirectSparseMetadataView:
         request = Int32(-1)
         visible = Int32(0)
         if valid:
-            if cutlass.const_expr(self.fixed_query_len > 0):
+            if cutlass.const_expr(self.fixed_query_layout):
                 request = row // Int32(self.fixed_query_len)
                 # Fixed Q ends at the per-request KV length.
                 length = Int64(positions[request])
@@ -159,6 +196,7 @@ class DirectSparseMetadataView:
             eligible = cute.math.max(visible - Int32(1), Int32(0))
         return eligible // Int32(self.sparse_block_size)
 
+    # Read a selected block ID and map one fragment slot to its physical locator.
     @cute.jit
     def load_page(self, route_state, slot):
         blocks = self.values[0]
@@ -175,9 +213,10 @@ class DirectSparseMetadataView:
                 logical = Int32(blocks[row, candidate])
         return self.map_page(route_state, slot, logical)
 
+    # Map a block ID and fragment slot through the page table; invalid slots return -1.
     @cute.jit
     def map_page(self, route_state, slot, logical):
-        blocks, table, _, _, _, _ = self.values
+        blocks, table, _, _, _, _ = self.values[:6]
         _, request, visible = route_state
         complete = cute.math.min(
             self.selected_block_bound(visible), Int32(blocks.shape[-1])
@@ -209,6 +248,7 @@ class DirectSparseMetadataView:
                     result = physical * fragments_per_page + subpage
         return result
 
+    # Expose scheduler token lengths or flattened physical fragment locators.
     @cute.jit
     def __getitem__(self, index):
         if cutlass.const_expr(self.lengths):

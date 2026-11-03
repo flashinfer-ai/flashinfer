@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
-"""Measurement policies over the native MegaMoE kernel boundary."""
+"""Measurement policies for collective MegaMoE trials."""
 
 from __future__ import annotations
 
@@ -43,7 +43,7 @@ def measurement_settings(context, *, native_graph_calls=None, native_warmups=0):
 
 
 def measure_samples(trial, weights, repeats, settings, process_group):
-    """Return matched rank-local samples in microseconds; exclude input staging."""
+    """Return matched rank-local samples in microseconds for ``trial.launch``."""
     import torch
     import torch.distributed as dist
 

@@ -35,6 +35,16 @@
 // protocol header; only `PushLayout` construction and the segment search
 // are reproduced here so this translation unit stays independent of the
 // FP8 ops file.
+//
+// Direct placement (`sm90_cake_compact_direct_bf16`, rounds dispatched by the grid
+// dispatch's direct entry): a1 is this rank's symmetric activation matrix and the
+// senders may have stored a row there already.  SlotMeta.payload_slot then reads
+//   bit 31 = 0       an inbox payload slot: copy that inbox row (as above);
+//   0b10 | row'      a carrier route the sender stored at a1 row row' == row: no copy
+//                    (row' != row traps: the placement rule was broken);
+//   0b11 | crow      a later route of the same token to this rank: copy a1 row crow
+//                    (the carrier's) to row.
+// meta, row_expert and the worklist are written exactly as above.
 
 #include <cuda_bf16.h>
 
@@ -297,13 +307,15 @@ __device__ __forceinline__ void compact_row_lookup(const int4* __restrict__ meta
   mt = __ldg(metas + (s_src[lo] + (row - s_out[lo])));
 }
 
-template <int R>
+// DIRECT: a1_src = a_bf16 (the carriers' rows; a separate pointer because a_bf16 is
+// __restrict__ and written by the same kernel: a row is either read or written, never both).
+template <int R, bool DIRECT>
 __device__ __forceinline__ void compact_rows_pipelined(
     PushLayout const& L, const int32_t* s_out, const int32_t* s_src, int nkeys, int m, int H,
     __nv_bfloat16* __restrict__ a_bf16, int32_t* __restrict__ meta_out,
     int32_t* __restrict__ row_expert, int32_t* __restrict__ grp_cnt, int32_t* __restrict__ grp_rows,
     int32_t* __restrict__ grp_list, int32_t* __restrict__ n_groups,
-    int32_t* __restrict__ groups_per_src, uint32_t tag, int build_groups) {
+    int32_t* __restrict__ groups_per_src, uint32_t tag, int build_groups, const uint8_t* a1_src) {
   constexpr int kTpr = kPipeThreads / R;  // threads per row
   constexpr int kWpr = kTpr / 32;         // warps per row
   int const nv = H >> 3;                  // 16-byte vectors per bf16 row
@@ -322,17 +334,45 @@ __device__ __forceinline__ void compact_rows_pipelined(
   for (int it = 0; row < m; row += stride, ++it) {
     const uint4* src4 =
         reinterpret_cast<const uint4*>(pool + static_cast<uint64_t>(mt_cur.w) * row_bytes);
+    int nv_row = nv;
+    if constexpr (DIRECT) {
+      uint32_t const w = static_cast<uint32_t>(mt_cur.w);
+      if (w & 0x80000000u) {
+        int const crow = static_cast<int>(w & 0x3fffffffu);
+        if (w & 0x40000000u) {  // later route of a token: copy its carrier's row
+          if (crow >= m || crow == row) {
+            printf("sm90_cake_bf16: duplicate route at row %d names carrier row %d (m %d)\n", row,
+                   crow, m);
+            publish_abort_all(L, tag);
+            asm volatile("trap;");
+          }
+          src4 = reinterpret_cast<const uint4*>(a1_src + static_cast<uint64_t>(crow) * row_bytes);
+        } else {  // carrier: already stored at this row by the sender
+          if (crow != row) {
+            printf("sm90_cake_bf16: carrier placement mismatch at row %d (sender row %d)\n", row,
+                   crow);
+            publish_abort_all(L, tag);
+            asm volatile("trap;");
+          }
+          nv_row = 0;
+        }
+      }
+    }
     uint4* out4 = reinterpret_cast<uint4*>(a_bf16 + static_cast<int64_t>(row) * H);
     int const next = row + stride;
     int e_next = 0;
     int4 mt_next = make_int4(0, 0, 0, 0);
     bool looked_up = false;
-    for (int v0 = lt; v0 < nv; v0 += kTpr * kPipeLoads) {
+    for (int v0 = lt; v0 < nv_row; v0 += kTpr * kPipeLoads) {
       uint4 buf[kPipeLoads];
 #pragma unroll
       for (int j = 0; j < kPipeLoads; ++j) {
         int const v = v0 + j * kTpr;
-        if (v < nv) buf[j] = __ldg(src4 + v);
+        if constexpr (DIRECT) {  // rows written by peers: L2 loads (no non-coherent path)
+          if (v < nv) buf[j] = __ldcg(src4 + v);
+        } else {
+          if (v < nv) buf[j] = __ldg(src4 + v);
+        }
       }
       if (!looked_up) {  // the next row's chain overlaps the loads in flight
         looked_up = true;
@@ -356,6 +396,7 @@ __device__ __forceinline__ void compact_rows_pipelined(
   }
 }
 
+template <bool DIRECT>
 __global__ void __launch_bounds__(kPipeThreads) compact_bf16_pipelined_kernel(
     PushLayout L, const int32_t* __restrict__ seg_src_base,
     const int32_t* __restrict__ seg_out_base, const int32_t* __restrict__ m_dev,
@@ -363,7 +404,7 @@ __global__ void __launch_bounds__(kPipeThreads) compact_bf16_pipelined_kernel(
     int32_t* __restrict__ row_expert, int H, int32_t* __restrict__ grp_cnt,
     int32_t* __restrict__ grp_rows, int32_t* __restrict__ grp_list, int32_t* __restrict__ n_groups,
     int32_t* __restrict__ groups_per_src, const int32_t* __restrict__ round_ctr, int build_groups,
-    int pdl_trigger) {
+    int pdl_trigger, const uint8_t* a1_src) {
   __shared__ int32_t s_out[kPipeMaxKeys + 1];
   __shared__ int32_t s_src[kPipeMaxKeys];
   pdl_wait_and_trigger(pdl_trigger);
@@ -372,19 +413,28 @@ __global__ void __launch_bounds__(kPipeThreads) compact_bf16_pipelined_kernel(
     s_out[i] = seg_out_base[i];
     if (i < nkeys) s_src[i] = seg_src_base[i];
   }
-  uint32_t const tag = build_groups ? static_cast<uint32_t>(*round_ctr) : 0u;
+  // the trap paths of the direct form publish the round's abort tag
+  uint32_t const tag = (DIRECT || build_groups) ? static_cast<uint32_t>(*round_ctr) : 0u;
   int const m = *m_dev;  // uniform across the grid for this round
   __syncthreads();
   int const grid = static_cast<int>(gridDim.x);
   if (m <= 2 * grid) {
-    compact_rows_pipelined<1>(L, s_out, s_src, nkeys, m, H, a_bf16, meta_out, row_expert, grp_cnt,
-                              grp_rows, grp_list, n_groups, groups_per_src, tag, build_groups);
+    compact_rows_pipelined<1, DIRECT>(L, s_out, s_src, nkeys, m, H, a_bf16, meta_out, row_expert,
+                                      grp_cnt, grp_rows, grp_list, n_groups, groups_per_src, tag,
+                                      build_groups, a1_src);
   } else if (m <= 6 * grid) {
-    compact_rows_pipelined<4>(L, s_out, s_src, nkeys, m, H, a_bf16, meta_out, row_expert, grp_cnt,
-                              grp_rows, grp_list, n_groups, groups_per_src, tag, build_groups);
+    compact_rows_pipelined<4, DIRECT>(L, s_out, s_src, nkeys, m, H, a_bf16, meta_out, row_expert,
+                                      grp_cnt, grp_rows, grp_list, n_groups, groups_per_src, tag,
+                                      build_groups, a1_src);
   } else {
-    compact_rows_pipelined<8>(L, s_out, s_src, nkeys, m, H, a_bf16, meta_out, row_expert, grp_cnt,
-                              grp_rows, grp_list, n_groups, groups_per_src, tag, build_groups);
+    compact_rows_pipelined<8, DIRECT>(L, s_out, s_src, nkeys, m, H, a_bf16, meta_out, row_expert,
+                                      grp_cnt, grp_rows, grp_list, n_groups, groups_per_src, tag,
+                                      build_groups, a1_src);
+  }
+  if constexpr (DIRECT) {
+    // generic -> async proxy: the a1 rows FC1 reads with TMA were written by the peers (ordered
+    // before this kernel by the count-cell acquire of the prefix) and by this kernel
+    asm volatile("fence.proxy.async.global;" ::: "memory");
   }
 }
 
@@ -399,6 +449,65 @@ int compact_grid_blocks(DLDevice device) {
   return blocks;
 }
 
+#define COMPACT_OUT_PARAMS                                                                       \
+  TensorView a_bf16, TensorView meta_out, TensorView row_expert, TensorView seg_src_base,        \
+      TensorView seg_out_base, TensorView m_dev, TensorView grp_cnt, TensorView grp_rows,        \
+      TensorView grp_list, TensorView n_groups, TensorView groups_per_src, TensorView round_ctr, \
+      int64_t build_groups
+
+#define COMPACT_OUT_ARGS                                                                        \
+  a_bf16, meta_out, row_expert, seg_src_base, seg_out_base, m_dev, grp_cnt, grp_rows, grp_list, \
+      n_groups, groups_per_src, round_ctr, build_groups
+
+void check_compact_args(const PushLayout& L, COMPACT_OUT_PARAMS) {
+  int64_t const nkeys = static_cast<int64_t>(L.num_local_experts) * L.ep_size;
+  CHECK_INPUT_AND_TYPE(a_bf16, dl_bfloat16);
+  CHECK_INPUT_AND_TYPE(meta_out, dl_int32);
+  CHECK_INPUT_AND_TYPE(row_expert, dl_int32);
+  CHECK_INPUT_AND_TYPE(seg_src_base, dl_int32);
+  CHECK_INPUT_AND_TYPE(seg_out_base, dl_int32);
+  CHECK_INPUT_AND_TYPE(m_dev, dl_int32);
+  int64_t m_capacity = a_bf16.size(0);
+  TVM_FFI_ICHECK(a_bf16.ndim() == 2 && a_bf16.size(1) == L.hidden)
+      << "compact_bf16: a_bf16 must be (Mcap, H)";
+  TVM_FFI_ICHECK(m_capacity >= L.meta_rows)
+      << "compact_bf16: a_bf16 rows " << m_capacity << " below meta_rows " << L.meta_rows;
+  TVM_FFI_ICHECK(meta_out.numel() >= m_capacity * 4) << "compact_bf16: meta_out too small";
+  TVM_FFI_ICHECK(row_expert.numel() >= m_capacity) << "compact_bf16: row_expert too small";
+  TVM_FFI_ICHECK(seg_src_base.numel() >= nkeys && seg_out_base.numel() >= nkeys + 1)
+      << "compact_bf16: segment tables too small";
+  if (build_groups != 0) {
+    int64_t const nslots = static_cast<int64_t>(L.ep_size) * L.t_cap;
+    CHECK_INPUT_AND_TYPE(grp_cnt, dl_int32);
+    CHECK_INPUT_AND_TYPE(grp_rows, dl_int32);
+    CHECK_INPUT_AND_TYPE(grp_list, dl_int32);
+    CHECK_INPUT_AND_TYPE(n_groups, dl_int32);
+    CHECK_INPUT_AND_TYPE(groups_per_src, dl_int32);
+    CHECK_INPUT_AND_TYPE(round_ctr, dl_int32);
+    TVM_FFI_ICHECK(grp_cnt.numel() >= nslots && grp_list.numel() >= nslots &&
+                   grp_rows.numel() >= nslots * L.top_k && n_groups.numel() >= 1 &&
+                   groups_per_src.numel() >= L.ep_size && round_ctr.numel() >= 1)
+        << "compact_bf16: pre-reduced group scratch too small";
+  }
+}
+
+template <bool DIRECT>
+void launch_pipelined(const PushLayout& L, COMPACT_OUT_PARAMS, int64_t use_pdl) {
+  launch_kernel(
+      compact_bf16_pipelined_kernel<DIRECT>, dim3(compact_grid_blocks(a_bf16.device())),
+      dim3(kPipeThreads), 0, get_stream(a_bf16.device()), (use_pdl & 1) != 0, L,
+      static_cast<const int32_t*>(seg_src_base.data_ptr()),
+      static_cast<const int32_t*>(seg_out_base.data_ptr()),
+      static_cast<const int32_t*>(m_dev.data_ptr()), static_cast<__nv_bfloat16*>(a_bf16.data_ptr()),
+      static_cast<int32_t*>(meta_out.data_ptr()), static_cast<int32_t*>(row_expert.data_ptr()),
+      L.hidden, static_cast<int32_t*>(grp_cnt.data_ptr()),
+      static_cast<int32_t*>(grp_rows.data_ptr()), static_cast<int32_t*>(grp_list.data_ptr()),
+      static_cast<int32_t*>(n_groups.data_ptr()), static_cast<int32_t*>(groups_per_src.data_ptr()),
+      static_cast<const int32_t*>(round_ctr.data_ptr()), build_groups != 0 ? 1 : 0,
+      static_cast<int>((use_pdl & 2) == 0),
+      DIRECT ? static_cast<const uint8_t*>(a_bf16.data_ptr()) : nullptr);
+}
+
 }  // namespace
 
 void sm90_cake_compact_bf16(TensorView a_bf16, TensorView meta_out, TensorView row_expert,
@@ -410,54 +519,15 @@ void sm90_cake_compact_bf16(TensorView a_bf16, TensorView meta_out, TensorView r
   check_layout(LAYOUT_ARGS);
   auto L = build_layout(LAYOUT_ARGS);
   int H = L.hidden;
-  CHECK_INPUT_AND_TYPE(a_bf16, dl_bfloat16);
-  CHECK_INPUT_AND_TYPE(meta_out, dl_int32);
-  CHECK_INPUT_AND_TYPE(row_expert, dl_int32);
-  CHECK_INPUT_AND_TYPE(seg_src_base, dl_int32);
-  CHECK_INPUT_AND_TYPE(seg_out_base, dl_int32);
-  CHECK_INPUT_AND_TYPE(m_dev, dl_int32);
+  check_compact_args(L, COMPACT_OUT_ARGS);
   CHECK_INPUT_AND_TYPE(next_row, dl_int32);
-  int64_t m_capacity = a_bf16.size(0);
-  TVM_FFI_ICHECK(a_bf16.ndim() == 2 && a_bf16.size(1) == H)
-      << "compact_bf16: a_bf16 must be (Mcap, H)";
-  TVM_FFI_ICHECK(m_capacity >= meta_rows)
-      << "compact_bf16: a_bf16 rows " << m_capacity << " below meta_rows " << meta_rows;
-  TVM_FFI_ICHECK(meta_out.numel() >= m_capacity * 4) << "compact_bf16: meta_out too small";
-  TVM_FFI_ICHECK(row_expert.numel() >= m_capacity) << "compact_bf16: row_expert too small";
-  TVM_FFI_ICHECK(seg_src_base.numel() >= num_local_experts * ep_size &&
-                 seg_out_base.numel() >= num_local_experts * ep_size + 1)
-      << "compact_bf16: segment tables too small";
-  if (build_groups != 0) {
-    int64_t const nslots = static_cast<int64_t>(ep_size) * L.t_cap;
-    CHECK_INPUT_AND_TYPE(grp_cnt, dl_int32);
-    CHECK_INPUT_AND_TYPE(grp_rows, dl_int32);
-    CHECK_INPUT_AND_TYPE(grp_list, dl_int32);
-    CHECK_INPUT_AND_TYPE(n_groups, dl_int32);
-    CHECK_INPUT_AND_TYPE(groups_per_src, dl_int32);
-    CHECK_INPUT_AND_TYPE(round_ctr, dl_int32);
-    TVM_FFI_ICHECK(grp_cnt.numel() >= nslots && grp_list.numel() >= nslots &&
-                   grp_rows.numel() >= nslots * L.top_k && n_groups.numel() >= 1 &&
-                   groups_per_src.numel() >= ep_size && round_ctr.numel() >= 1)
-        << "compact_bf16: pre-reduced group scratch too small";
+  TVM_FFI_ICHECK(form == 0 || form == 1) << "compact_bf16: form must be 0 or 1, got " << form;
+  if (form == 1 && num_local_experts * ep_size <= kPipeMaxKeys) {  // latency-pipelined form
+    launch_pipelined<false>(L, COMPACT_OUT_ARGS, use_pdl);
+    return;
   }
   auto stream = get_stream(a_bf16.device());
   int blocks = compact_grid_blocks(a_bf16.device());
-  TVM_FFI_ICHECK(form == 0 || form == 1) << "compact_bf16: form must be 0 or 1, got " << form;
-  if (form == 1 && num_local_experts * ep_size <= kPipeMaxKeys) {  // latency-pipelined form
-    launch_kernel(
-        compact_bf16_pipelined_kernel, dim3(blocks), dim3(kPipeThreads), 0, stream,
-        (use_pdl & 1) != 0, L, static_cast<const int32_t*>(seg_src_base.data_ptr()),
-        static_cast<const int32_t*>(seg_out_base.data_ptr()),
-        static_cast<const int32_t*>(m_dev.data_ptr()),
-        static_cast<__nv_bfloat16*>(a_bf16.data_ptr()), static_cast<int32_t*>(meta_out.data_ptr()),
-        static_cast<int32_t*>(row_expert.data_ptr()), H, static_cast<int32_t*>(grp_cnt.data_ptr()),
-        static_cast<int32_t*>(grp_rows.data_ptr()), static_cast<int32_t*>(grp_list.data_ptr()),
-        static_cast<int32_t*>(n_groups.data_ptr()),
-        static_cast<int32_t*>(groups_per_src.data_ptr()),
-        static_cast<const int32_t*>(round_ctr.data_ptr()), build_groups != 0 ? 1 : 0,
-        static_cast<int>((use_pdl & 2) == 0));
-    return;
-  }
   launch_kernel(
       compact_bf16_persistent_kernel, dim3(blocks), dim3(256), 0, stream, (use_pdl & 1) != 0, L,
       static_cast<const int32_t*>(seg_src_base.data_ptr()),
@@ -471,4 +541,25 @@ void sm90_cake_compact_bf16(TensorView a_bf16, TensorView meta_out, TensorView r
       static_cast<int>((use_pdl & 2) == 0));
 }
 
+// Direct placement (see the file comment): the latency-pipelined form over a symmetric a1 whose
+// carrier rows the senders stored already; a_bf16 rows must fit the 30-bit row field.
+void sm90_cake_compact_direct_bf16(TensorView a_bf16, TensorView meta_out, TensorView row_expert,
+                                   LAYOUT_PARAMS, TensorView seg_src_base, TensorView seg_out_base,
+                                   TensorView m_dev, TensorView grp_cnt, TensorView grp_rows,
+                                   TensorView grp_list, TensorView n_groups,
+                                   TensorView groups_per_src, TensorView round_ctr,
+                                   int64_t build_groups, int64_t use_pdl) {
+  check_layout(LAYOUT_ARGS);
+  auto L = build_layout(LAYOUT_ARGS);
+  check_compact_args(L, COMPACT_OUT_ARGS);
+  CHECK_INPUT_AND_TYPE(round_ctr, dl_int32);
+  TVM_FFI_ICHECK(round_ctr.numel() >= 1) << "compact_direct_bf16: round counter missing";
+  TVM_FFI_ICHECK(num_local_experts * ep_size <= kPipeMaxKeys)
+      << "compact_direct_bf16: E*ep = " << num_local_experts * ep_size << " above " << kPipeMaxKeys;
+  TVM_FFI_ICHECK(a_bf16.size(0) < (int64_t{1} << 30))
+      << "compact_direct_bf16: a_bf16 rows " << a_bf16.size(0) << " exceed the 30-bit row field";
+  launch_pipelined<true>(L, COMPACT_OUT_ARGS, use_pdl);
+}
+
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(sm90_cake_compact_bf16, sm90_cake_compact_bf16);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(sm90_cake_compact_direct_bf16, sm90_cake_compact_direct_bf16);

@@ -403,6 +403,10 @@ Persistence and orchestration stay separate responsibilities.
   winner/shortlist and re-profile. Malformed persisted selections remain cache
   misses. Warm tuning still performs startup gates; serving with tuning disabled
   adds no collective. Distributed tuning must run outside CUDA Graph capture.
+- **Timer fallback**: CUPTI availability and initialization are checked across the tuning
+  group before candidate warmup or graph capture. If tracing fails on any rank, all ranks
+  fall back to CUDA events. Candidate exceptions still disqualify the tactic rather than
+  retrying it with another timer.
 - **In-session rank consistency**: coordinated tuning re-profiles divergent cached winners and
   tactic shortlists. Independent tuning without a process group can still diverge until
   `autotune_v2_reload()` runs — a finalize step (tune → barrier → reload) that drops in-process

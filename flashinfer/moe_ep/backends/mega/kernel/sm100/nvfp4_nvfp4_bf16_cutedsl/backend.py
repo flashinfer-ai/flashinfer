@@ -18,6 +18,7 @@ from ......core.kernel.base import MegaKernelBackend
 from ......core.kernel.registry import register_mega_kernel
 from ......core.runtime import nvfp4_cutedsl_runtime_requirements
 from ......core.validation.common import (
+    MoEEpConfigError,
     validate_mega_arch,
     validate_mega_fleet_params,
 )
@@ -67,7 +68,12 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
     supports_output_view = True
 
     def __init__(self, config: Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig) -> None:
+        """Initialize legacy inference state and reject next-only GenPhase."""
         super().__init__(config)
+        if config.kernel_variant != "inference":
+            raise MoEEpConfigError(
+                "NVFP4 GenPhase requires kernel_name='sm100_nvfp4_nvfp4_bf16_cutedsl_next'."
+            )
         self._kernel_config: Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig = config
         self.supports_unfinalized_output = config.finalize_mode is FinalizeMode.NONE
         self._thunk_states: dict[tuple, tuple] = {}

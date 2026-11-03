@@ -47,16 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define NUM_MAP_RING_STAGES 2
-#define SMEM_SMEM_M_OFF 1024
-#define SMEM_SMEM_M_STAGE_BYTES 32768
-#define SMEM_SMEM_M_STRIDE 32768
-#define SMEM_SMEM_CARRY_OFF 66560
-#define SMEM_SMEM_CARRY_STAGE_BYTES 8192
-#define SMEM_SMEM_CARRY_STRIDE 8192
-#define SMEM_TOTAL 74752
-#define THREADS 128
 #define LAUNCH_MIN_BLOCKS 2
 
 #include <math_constants.h>
@@ -230,62 +220,62 @@ kernel_cake_kda_prefill_197bd8bd6c94ec2ecf41(float* __restrict__ split_state, __
         if (place % 2 == 1) {
             wanted = seq_count - 1 - place / 2;
         }
-        int rank = 0;
+        int rank_0 = 0;
         if (windows[1] > windows[0]) {
-            rank = rank + 1;
+            rank_0 = rank_0 + 1;
         }
         if (windows[2] > windows[0]) {
-            rank = rank + 1;
+            rank_0 = rank_0 + 1;
         }
         if (windows[3] > windows[0]) {
-            rank = rank + 1;
+            rank_0 = rank_0 + 1;
         }
-        if (rank == wanted) {
+        if (rank_0 == wanted) {
             sequence = 0;
             part_begin = bounds[0];
             part_stop = bounds[1];
         }
-        int rank_0 = 0;
+        int rank_1 = 0;
         if (windows[0] >= windows[1]) {
-            rank_0 = rank_0 + 1;
+            rank_1 = rank_1 + 1;
         }
         if (windows[2] > windows[1]) {
-            rank_0 = rank_0 + 1;
+            rank_1 = rank_1 + 1;
         }
         if (windows[3] > windows[1]) {
-            rank_0 = rank_0 + 1;
+            rank_1 = rank_1 + 1;
         }
-        if (rank_0 == wanted) {
+        if (rank_1 == wanted) {
             sequence = 1;
             part_begin = bounds[1];
             part_stop = bounds[2];
         }
-        int rank_1 = 0;
+        int rank_2 = 0;
         if (windows[0] >= windows[2]) {
-            rank_1 = rank_1 + 1;
+            rank_2 = rank_2 + 1;
         }
         if (windows[1] >= windows[2]) {
-            rank_1 = rank_1 + 1;
+            rank_2 = rank_2 + 1;
         }
         if (windows[3] > windows[2]) {
-            rank_1 = rank_1 + 1;
+            rank_2 = rank_2 + 1;
         }
-        if (rank_1 == wanted) {
+        if (rank_2 == wanted) {
             sequence = 2;
             part_begin = bounds[2];
             part_stop = bounds[3];
         }
-        int rank_2 = 0;
+        int rank_3 = 0;
         if (windows[0] >= windows[3]) {
-            rank_2 = rank_2 + 1;
+            rank_3 = rank_3 + 1;
         }
         if (windows[1] >= windows[3]) {
-            rank_2 = rank_2 + 1;
+            rank_3 = rank_3 + 1;
         }
         if (windows[2] >= windows[3]) {
-            rank_2 = rank_2 + 1;
+            rank_3 = rank_3 + 1;
         }
-        if (rank_2 == wanted) {
+        if (rank_3 == wanted) {
             sequence = 3;
             part_begin = bounds[3];
             part_stop = bounds[4];
@@ -809,9 +799,8 @@ kernel_cake_kda_prefill_197bd8bd6c94ec2ecf41(float* __restrict__ split_state, __
                 }
                 if (warp == 0) {
                     if (elect_sync()) {
-                        unsigned int fill_slot = ((map_slot + 1 < 2) ? map_slot + 1 : (unsigned int)0);
-                        mbarrier_arrive_expect_tx(map_full_addr + (fill_slot) * 8, 32768);
-                        cp_async_bulk_gmem2smem(smem_m_addr + fill_slot * 32768, reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(map_state_bf16) + ((unsigned long long)((part * num_heads + task) * 16384) * (unsigned long long)2)), 32768, map_full_addr + (fill_slot) * 8);
+                        mbarrier_arrive_expect_tx(map_full_addr + (((map_slot + 1 < 2) ? map_slot + 1 : (unsigned int)0)) * 8, 32768);
+                        cp_async_bulk_gmem2smem(smem_m_addr + ((map_slot + 1 < 2) ? map_slot + 1 : (unsigned int)0) * 32768, reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(map_state_bf16) + ((unsigned long long)((part * num_heads + task) * 16384) * (unsigned long long)2)), 32768, map_full_addr + (((map_slot + 1 < 2) ? map_slot + 1 : (unsigned int)0)) * 8);
                     }
                 }
             }

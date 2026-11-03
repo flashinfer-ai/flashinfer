@@ -40,24 +40,6 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
-#define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 320
-#define TMEM_TMEM_M_OFFSET 0
-#define TMEM_TMEM_INP_OFFSET 128
-#define TMEM_TMEM_M_ALT_OFFSET 192
-#define NUM_R_PIPE_STAGES 3
-#define SMEM_SMEM_R_OFF 1024
-#define SMEM_SMEM_R_STAGE_BYTES 32768
-#define SMEM_SMEM_R_STRIDE 32768
-#define SMEM_SMEM_D_OFF 99328
-#define SMEM_SMEM_D_STAGE_BYTES 512
-#define SMEM_SMEM_D_STRIDE 1024
-#define SMEM_SMEM_PANEL_OFF 102400
-#define SMEM_SMEM_PANEL_STAGE_BYTES 16384
-#define SMEM_SMEM_PANEL_STRIDE 16384
-#define SMEM_TOTAL 118784
-#define THREADS 320
-
 #include <math_constants.h>
 
 __device__ __forceinline__ uint32_t elect_sync() {
@@ -245,14 +227,14 @@ kernel_cake_kda_prefill_0c19a9863fa28a7dad1a(int* __restrict__ items, int num_he
         // r_full: 3 barriers, init_count=1
         // r_free: 3 barriers, init_count=2
         // init_ready: 1 barriers, init_count=4
-        // m_ready: 2 barriers, init_count=1
+        // m_ready: 2 barriers, init_count=2
         // inp_ready: 1 barriers, init_count=4
         // snap_done: 2 barriers, init_count=4
         // tmem_dealloc_ready: 1 barriers, init_count=2
         // Warp-cooperative initialization in physical record order.
         uint32_t _mbarrier_init_count_0_0 = 2;
         asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_0) : "r"(lane), "n"(12), "r"((uint32_t)(4)));
-        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_0) : "r"(lane), "n"(9), "r"((uint32_t)(1)));
+        asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_0) : "r"(lane), "n"(9), "r"((uint32_t)(2)));
         asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_0) : "r"(lane), "n"(7), "r"((uint32_t)(4)));
         asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_0) : "r"(lane), "n"(6), "r"((uint32_t)(2)));
         asm volatile("{ .reg .pred p; setp.lt.u32 p, %1, %2; selp.u32 %0, %3, %0, p; }" : "+r"(_mbarrier_init_count_0_0) : "r"(lane), "n"(3), "r"((uint32_t)(1)));
@@ -474,15 +456,14 @@ kernel_cake_kda_prefill_0c19a9863fa28a7dad1a(int* __restrict__ items, int num_he
             int epilogue_local_warp = warp_in_wg_1;
             int m_base_1 = taddr + (unsigned int)tmem_row_base_1;
             unsigned int _phase_init_ready_0_1 = 0;
+            mbarrier_wait(init_ready_addr, _phase_init_ready_0_1);
+            _phase_init_ready_0_1 ^= 1;
+            asm volatile("tcgen05.fence::after_thread_sync;");
             #pragma unroll 1
             for (int p_1 = 0; p_1 < num_blocks_1 + 1; p_1++) {
                 int is_first_1 = ((p_1 == 0) ? 1 : 0);
                 int is_last = ((num_blocks_1 <= p_1) ? 1 : 0);
-                if (is_first_1 != 0) {
-                    mbarrier_wait(init_ready_addr, _phase_init_ready_0_1);
-                    _phase_init_ready_0_1 ^= 1;
-                    asm volatile("tcgen05.fence::after_thread_sync;");
-                } else {
+                if (is_first_1 == 0) {
                     int _stage_m_ready_1 = (int)((unsigned int)(p_1 - 1) % 2);
                     int _parity_m_ready_1 = (int)((unsigned int)(p_1 - 1) / 2 % 2);
                     mbarrier_wait(m_ready_addr + (_stage_m_ready_1) * 8, _parity_m_ready_1);
@@ -750,6 +731,10 @@ kernel_cake_kda_prefill_0c19a9863fa28a7dad1a(int* __restrict__ items, int num_he
                     mbarrier_arrive(r_free_addr + (mma_stage) * 8);
                 }
                 elect_commit(m_ready_addr + ((int)((unsigned int)p_2 % 2)) * 8);
+                if (elect_sync()) {
+                    asm volatile("tcgen05.fence::before_thread_sync;");
+                    mbarrier_arrive(m_ready_addr + ((int)((unsigned int)p_2 % 2)) * 8);
+                }
                 mma_stage += 1;
                 if (mma_stage == 3) { mma_stage = 0; _phase_r_full_1 ^= 1; }
             }

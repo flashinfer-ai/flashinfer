@@ -469,6 +469,9 @@ class TemplateParams:
     # TMEM map gains the Q slots, the MMA form and the commit site move): the template-module cache keys on this record alone.  Picked by
     # config_sm107.sm107_q_in_tmem_pick (0 until measured; the sweep seam pins 1); validated by the factory (config_sm107._validate_q_in_tmem).
     q_in_tmem: int = 0
+    # Optional native FP8 K/V storage for the half-input d128 pipeline.
+    # Appended: -1 keeps the existing uniform Q/K/V behavior.
+    dtype_kv: int = -1
 
 
 # Paged KV is wired through the K/V TMA-LDG sites of these flavors only; any
@@ -562,6 +565,22 @@ def supports_nonpaged_d128_thd_prefill(d_shape, *, device_cc, fp8, thd, paged, c
     return device_cc == (10, 7) and d_shape == (128, 128) and not fp8 and thd and not paged and cga in (None, 1, 2) and split_kv == 1
 
 
+def supports_sm100_nonpaged_d128_thd_single_cta(d_shape, *, device_cc, fp8, thd, paged, cga, split_kv, one_head_per_kv, plain_mask):
+    """SM100 single-CTA D128 half THD prefill: the two-slab 256-row body for nonpaged ragged graphs with one query head
+    per KV head, unsplit, under a plain mask (none, causal or padding: no window, band, sink, bias or kv_mask)."""
+    return (
+        tuple(device_cc or ()) in ((10, 0), (10, 3))
+        and tuple(d_shape) == (128, 128)
+        and not fp8
+        and thd
+        and not paged
+        and one_head_per_kv
+        and plain_mask
+        and cga in (None, 1, 2)
+        and split_kv == 1
+    )
+
+
 def supports_paged_d128_partial_pack_gqa(d_shape, *, device_cc, fp8, thd, paged, cga, split_kv):
     """Rubin's two-CTA D128 paged half body packs a divisor of the GQA group."""
     return device_cc == (10, 7) and d_shape == (128, 128) and not fp8 and thd and paged and cga in (None, 2) and split_kv == 1
@@ -594,6 +613,8 @@ def _validate_params(flavor: str, k: TemplateParams, *, scale_prefolded_wired: b
     if k.dtype_qkv not in (DTYPE_E4M3, DTYPE_E5M2, DTYPE_BF16, DTYPE_FP16):
         raise ValueError(f"{flavor}: DTYPE_QKV must be E4M3/E5M2/BF16/FP16 (0..3); got {k.dtype_qkv}")
     fp8 = k.dtype_qkv in (DTYPE_E4M3, DTYPE_E5M2)
+    if k.dtype_kv != -1 and not (flavor == "d128" and k.dtype_qkv in (DTYPE_BF16, DTYPE_FP16) and k.dtype_kv in (DTYPE_E4M3, DTYPE_E5M2)):
+        raise ValueError(f"{flavor}: independent FP8 KV storage is wired only on the half-input d128 pipeline")
     if fp8 and flavor not in ("d64", "d128", "d192", "d256", "d512"):
         raise ValueError(f"{flavor}: FP8/MXFP8 inputs (DTYPE_QKV 0/1) are only supported on d64, d128, d192, d256, and d512")
     if k.softmax_f16 and not fp8:
@@ -849,42 +870,23 @@ def bshd_compact(shape_bhsd: tuple, stride_bhsd: tuple) -> bool:
 
 
 def bshd_zero_copy_stride(shape_bhsd: tuple, stride_bhsd: tuple, elem_bytes: int) -> Optional[tuple]:
-    """The BSHD ``(b, s, h, d)`` stride tuple a dense prefill kernel is COMPILED
-    at for a logical BHSD operand, or None.
+    """Return declared B/S/H/D strides for an aligned covering dense layout.
 
-    None means EITHER "compact, nothing to declare" (``bshd_compact``) OR "a
-    layout the kernels cannot bind zero-copy"; a caller that must tell the two
-    apart tests ``bshd_compact`` first (the epilogue gate does -- it has no
-    copy fallback). The rules describe the kernels' TMA layout requirements,
-    checked before compilation so the engine rows
-    (``engines.mismatch`` via ``config_sm107.epilogue_gate_layout_declarable``)
-    and the standalone adapter's admission and prepared binder
-    judge a layout with ONE function (rule 8b lockstep):
-
-      * the head dim is innermost-contiguous (stride 1);
-      * the batch, seq and head strides are 16-byte multiples (TMA global-stride rule;
-        the DSL floors a misaligned stride to TMA units, so a violation would mis-address);
-      * the declaration is TOKEN-MAJOR and COVERING: head >= d, seq >= h*head,
-        batch >= s*seq.  A head-major nest (a torch-contiguous ``[B, H, S, D]``:
-        seq stride d < h*head) returns None because the kernels' TMA
-        descriptors are built in BSHD order and no other nesting has been
-        validated zero-copy; an overlapping declaration returns None because
-        it would alias distinct rows onto one address (a write race on O).
-
-    ``graph_analyzer.dense_layout_ok`` is deliberately WIDER (any B/H/S stride
-    order, any alignment): that is the contract of the copy-normalising Q/K/V/O
-    path, not of a zero-copy binding.
+    Descriptor axes describe logical coordinates; their global strides need not
+    follow the same physical nesting. B/H/S may therefore be any permutation,
+    with padding, provided every stepped outer stride is 16-byte aligned.
+    Compact BSHD returns None because it needs no explicit stride declaration;
+    callers distinguish that case with ``bshd_compact``.
     """
-    b, h, s, d = (int(x) for x in shape_bhsd)
-    bs, hs, ss, es = (int(x) for x in stride_bhsd)
+    from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.layout import dense_layout_ok
+
+    if not dense_layout_ok(shape_bhsd, stride_bhsd):
+        return None
+    _b, h, s, d = (int(x) for x in shape_bhsd)
+    bs, hs, ss, es = canonical_bhsd_strides(shape_bhsd, stride_bhsd)
+    if es != 1 or any(st * elem_bytes % 16 for st in (bs, hs, ss)):
+        return None
     if (bs, ss, hs, es) == (s * h * d, h * d, d, 1):
-        return None  # compact: nothing to declare
-    if es != 1:
-        return None
-    per16 = 16 // elem_bytes
-    if ss % per16 or hs % per16 or (b > 1 and bs % per16):  # every non-innermost TMA global stride, the batch one included
-        return None
-    if hs < d or ss < h * hs or bs < s * ss:
         return None
     return (bs, ss, hs, es)
 
@@ -911,7 +913,7 @@ def canonical_bhsd_strides(shape_bhsd: tuple, stride_bhsd: tuple) -> tuple:
 @lru_cache(maxsize=256)
 def dense_bind_strides(shape_bhsd: tuple, stride_bhsd: tuple, elem_bytes: int) -> Optional[tuple]:
     """The ``(batch, seq, head)`` element strides a dense prefill kernel binds a logical BHSD
-    operand at zero-copy, or None when the layout needs a repack: singleton axes canonicalized,
+    operand natively, or None for an unsupported layout: singleton axes canonicalized,
     then BSHD-compact or ``bshd_zero_copy_stride``. ONE predicate for the lowering's decision to
     attach the prepared launch and for the binder's per-call admission (rule 8b lockstep).
 
@@ -919,6 +921,8 @@ def dense_bind_strides(shape_bhsd: tuple, stride_bhsd: tuple, elem_bytes: int) -
     device, address alignment, observed span and compiled shape envelope. The bounded
     cache retains no buffers, pointers or per-call frames."""
     st = canonical_bhsd_strides(shape_bhsd, stride_bhsd)
+    if any(stride * elem_bytes % 16 for stride in st[:3]):
+        return None
     if not (bshd_compact(shape_bhsd, st) or bshd_zero_copy_stride(shape_bhsd, st, elem_bytes) is not None):
         return None
     bs, hs, ss, _es = st
@@ -2459,6 +2463,7 @@ class CfgD128(D128FamilySmallTileFields):
     # Paged KV cache; see TemplateParams.paged_kv.  PAGE_SIZE tokens per page.
     PAGED_KV: int = 0
     PAGE_SIZE: int = 0
+    DTYPE_KV: int = -1
 
 
 # Blackwell SM100 per-CTA dynamic SMEM cap (228 KiB physical, 227 KiB usable).
@@ -2489,7 +2494,8 @@ def _d128_smem_bytes(cfg) -> int:
     # The per-tensor FP8 kernel stages P (TILE_M x TILE_N fp8 per Q sub-tile) in SMEM so the next
     # step's QK^T can overlap the softmax; counted for every quantized row (pessimistic for MXFP8).
     p = cfg.TILES_Q * cfg.TILE_M * cfg.TILE_N * cfg.BPE if cfg.DTYPE_QKV <= 1 else 0
-    return qo + k + v + p
+    raw_kv = max(cfg.TILE_N * cfg.TILE_K, cfg.TILE_O * cfg.TILE_N) // cfg.CTA_MMA if cfg.DTYPE_KV in (DTYPE_E4M3, DTYPE_E5M2) and cfg.DTYPE_QKV > 1 else 0
+    return qo + k + v + p + raw_kv
 
 
 def _validate_cfg_d128(cfg: CfgD128) -> None:
@@ -2571,6 +2577,7 @@ def make_cfg_d128(params: TemplateParams, *, cga1_kv_stages: int = 2) -> Tuple[C
     tile_k_hw_fp8 = 32 if fp8 else tile_k_hw(params.dtype_qkv)
     cfg = CfgD128(
         DTYPE_QKV=params.dtype_qkv,
+        DTYPE_KV=params.dtype_kv,
         DTYPE_O=dtype_o,
         BPE=b,
         BPE_V=b_v,
@@ -2731,7 +2738,7 @@ def _validate_cfg_d128_decode(cfg: CfgD128Decode) -> None:
         (cfg.QO_ALIAS == 1, "d128 decode: Q and O share one SMEM slab (pays for the third KV stage)"),
         (cfg.TILES_Q == 1, "d128 decode: TILES_Q must be 1 (one 128-row Q tile per CTA)"),
         (cfg.TILE_M == 128 and cfg.TILE_N == 128 and cfg.TILE_K in (128, 192) and cfg.TILE_O == 128, "single-Q tile: QK width 128 or 192, V width 128"),
-        (cfg.STAGES_KV == (3 if cfg.TILE_K == 128 else 2), "single-Q tile: KV stages must fit the QK width"),
+        (cfg.STAGES_KV == (3 if cfg.TILE_K == 128 and cfg.DTYPE_KV == -1 else 2), "single-Q tile: KV stages must fit the QK width and storage conversion"),
         (
             _d128_smem_bytes(cfg) <= _SM100_MAX_DYN_SMEM,
             f"d128 decode: SMEM {_d128_smem_bytes(cfg) // 1024} KiB over the SM100 {_SM100_MAX_DYN_SMEM // 1024} KiB per-CTA cap",
@@ -2783,6 +2790,8 @@ def make_cfg_d128_decode(params: TemplateParams) -> Tuple[CfgD128Decode, TmaIter
     if params.dtype_qkv not in (DTYPE_BF16, DTYPE_FP16):
         raise ValueError(f"d128 decode: f16/bf16 inputs only (DTYPE_QKV 2/3); got {params.dtype_qkv}")
     d_qk = params.single_q_head_dim
+    if params.dtype_kv != -1 and d_qk != 128:
+        raise ValueError("independent FP8 KV storage requires native D128")
     if d_qk not in (128, 192):
         raise ValueError("single-Q tile: QK width must be 128 or 192")
     if d_qk == 192 and not (params.thd_varlen and not params.paged_kv and not params.pack_gqa):
@@ -2795,7 +2804,10 @@ def make_cfg_d128_decode(params: TemplateParams) -> Tuple[CfgD128Decode, TmaIter
     dtype_o = params.dtype_qkv if params.dtype_o < 0 else params.dtype_o
     cfg = CfgD128Decode(
         TILE_K=d_qk,
-        STAGES_KV=3 if d_qk == 128 else 2,
+        # A raw FP8 tile shares the local load warp between K and V. Two
+        # converted stages leave room for that16KiB slab; uniform half keeps3.
+        STAGES_KV=3 if d_qk == 128 and params.dtype_kv == -1 else 2,
+        DTYPE_KV=params.dtype_kv,
         THD_VARLEN=int(params.thd_varlen),
         DTYPE_QKV=params.dtype_qkv,
         DTYPE_O=dtype_o,

@@ -131,6 +131,7 @@ class BlockScaledMoeConfig:
     combine_dtype: Literal["bf16", "nvfp4", "mxfp8"] = "bf16"
 
     def __post_init__(self) -> None:
+        """Validate dtype, geometry, epilogue and architecture-specific constraints."""
         if self.quant_kind not in _KIND_TABLE:
             raise ValueError(f"unsupported quant_kind {self.quant_kind!r}.")
         if self.kernel_variant not in ("inference", "genphase"):
@@ -357,7 +358,7 @@ class BlockScaledMoeConfig:
                 self.cluster_shape_mn in ((2, 1), (4, 1))
                 and tiler == (256, 64, 128)
                 and (
-                    self.quant_kind == "mxfp8_e4m3"
+                    self.quant_kind in ("mxfp8_e4m3", "mxfp8_e5m2")
                     or (
                         self.quant_kind == "mxfp4_mxfp8"
                         and self.cluster_shape_mn == (4, 1)

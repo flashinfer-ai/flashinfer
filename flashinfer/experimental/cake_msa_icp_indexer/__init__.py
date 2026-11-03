@@ -14,10 +14,25 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-# Experimental Cake backend: MiniMax-M3 ICP decode indexer chain (fused FP8
-# index scorer with in-epilogue top-16 + symmetric-memory exchange merge) for
-# SM100 / SM103.  The public entry points are
-# ``flashinfer.msa_ops.prepare_msa_icp_indexer``,
-# ``create_msa_icp_indexer_workspace`` and ``destroy_msa_icp_indexer_workspace``;
-# the generated programs, their host binding, the workspace and the JIT
-# registration live in this package.
+# Experimental Cake backend of the MiniMax-M3 index-context-parallel (ICP)
+# indexer on SM100 / SM103 / SM107: the prefill device plan and chunk scorer,
+# the decode scorer, the Top16 selectors (prefill carrier rows, decode publish
+# into the owners' receive rows) and the owner-side candidate merge.  The
+# public entry points live in ``flashinfer.msa_ops`` (``msa_icp_*`` and
+# ``prepare_msa_icp_indexer``); the host checks, launch glue, registry and
+# generated sources live here.  Collective orchestration (allocation and
+# rendezvous of the receive storage, the prefill exchange) stays with the
+# caller.
+
+from .cake_backend import MSAIcpScorePlan, comm_layout, is_supported
+from .cake_indexer import MSAIcpIndexerPlan
+from .cake_jit import ARCH_BY_CAPABILITY, ARCHES
+
+__all__ = [
+    "ARCHES",
+    "ARCH_BY_CAPABILITY",
+    "MSAIcpIndexerPlan",
+    "MSAIcpScorePlan",
+    "comm_layout",
+    "is_supported",
+]

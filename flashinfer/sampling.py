@@ -23,7 +23,7 @@ import torch
 from .api_logging import flashinfer_api
 from .jit.cake_blackwell_softmax import gen_blackwell_softmax_module
 from .jit.sampling import gen_sampling_module
-from .topk import _ROW_STATES_NBYTES
+from .topk import _get_row_states_buffer
 from .trace.templates.sampling import (
     chain_speculative_sampling_trace,
     min_p_sampling_trace,
@@ -87,7 +87,7 @@ def get_blackwell_softmax_op():
         temperature_val: float,
         enable_pdl: bool,
         temperature_is_none: bool,
-        is_sm103: bool,
+        pdl_device: bool,
     ) -> torch.Tensor:
         logits = logits.float()
         probs = torch.empty_like(logits, device=logits.device)
@@ -102,7 +102,7 @@ def get_blackwell_softmax_op():
             temperature_val,
             enable_pdl,
             temperature_is_none,
-            is_sm103,
+            pdl_device,
         )
         return probs
 
@@ -114,7 +114,7 @@ def get_blackwell_softmax_op():
         temperature_val: float,
         enable_pdl: bool,
         temperature_is_none: bool,
-        is_sm103: bool,
+        pdl_device: bool,
     ) -> torch.Tensor:
         return torch.empty_like(logits, device=logits.device, dtype=torch.float32)
 
@@ -201,12 +201,12 @@ def _blackwell_softmax_capability(device_index: int) -> Tuple[int, int]:
 @functools.cache
 def _supports_blackwell_softmax(device_index: int) -> bool:
     major, minor = _blackwell_softmax_capability(device_index)
-    return major == 10 and minor in (0, 3)
+    return major == 10 and minor in (0, 3, 7)
 
 
 @functools.cache
-def _is_sm103(device_index: int) -> bool:
-    return _blackwell_softmax_capability(device_index) == (10, 3)
+def _blackwell_softmax_launches_with_pdl(device_index: int) -> bool:
+    return _blackwell_softmax_capability(device_index) in ((10, 3), (10, 7))
 
 
 @functools.cache
@@ -961,9 +961,9 @@ def softmax(
     enable_pdl : Optional[bool]
         Whether to enable Programmatic Dependent Launch (PDL) for improved performance on supported hardware.
         If None (default), PDL will be automatically enabled on devices with compute capability >= 9.0.
-        The custom Blackwell softmax routes currently apply PDL on SM103; the
+        The custom Blackwell softmax routes apply PDL on SM103 and SM107; the
         SM100 fast path remains non-PDL, while fallback routes preserve their
-        existing PDL behavior. On SM100/SM103, 32-byte aligned rows whose
+        existing PDL behavior. On SM100/SM103/SM107, 32-byte aligned rows whose
         vocabulary is a multiple of 8 and at most 262144 take the row-caching
         cluster route, which reads and writes each row exactly once.
     Returns
@@ -1014,7 +1014,7 @@ def softmax(
             temperature_val,
             enable_pdl,
             temperature_is_none,
-            _is_sm103(device_index),
+            _blackwell_softmax_launches_with_pdl(device_index),
         )
 
     return get_sampling_module().softmax(
@@ -2236,9 +2236,8 @@ def top_k_renorm_probs(
     top_p_renorm_probs
     top_k : General-purpose top-k selection (returns indices and values)
     """
-    # Per-call zeroing keeps concurrent streams disjoint; the kernel requires it.
-    row_states_buffer = torch.zeros(
-        _ROW_STATES_NBYTES, dtype=torch.uint8, device=probs.device
+    row_states_buffer = _get_row_states_buffer(
+        "top_k_renorm_probs_row_states", probs.device
     )
 
     return get_sampling_module().top_k_renorm_probs(
@@ -2307,9 +2306,8 @@ def top_k_mask_logits(
     top_k_renorm_probs
     top_k : General-purpose top-k selection (returns indices and values)
     """
-    # Per-call zeroing keeps concurrent streams disjoint; the kernel requires it.
-    row_states_buffer = torch.zeros(
-        _ROW_STATES_NBYTES, dtype=torch.uint8, device=logits.device
+    row_states_buffer = _get_row_states_buffer(
+        "top_k_mask_logits_row_states", logits.device
     )
 
     return get_sampling_module().top_k_mask_logits(

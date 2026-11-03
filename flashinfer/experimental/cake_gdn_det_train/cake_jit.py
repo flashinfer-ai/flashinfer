@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Registry of the Cake deterministic GDN chunked-training kernels (SM100 /
-SM103).  The loader glue is :mod:`.cake_backend`; the host plan and the
+SM103 / SM107).  The loader glue is :mod:`.cake_backend`; the host plan and the
 autograd chain are :mod:`.cake_chain`.
 
 Every record of ``MODULES`` is one mechanically exported program: a CUDA
@@ -28,9 +28,12 @@ chunks one pre-scan CTA covers); ``dhu_tc2`` carries the per-architecture
 constants of its selection rule (``select``: the tcgen05 scan's per-step time
 at low and full residency ``t_lat`` / ``t_full``, the register scan's time per
 planner cost unit ``t_unit`` and the ``dv_local`` time of one (chunk, value
-head) tile on one SM ``c_dvl``, in microseconds) and ``prep_tma`` the window
-of its dispatch rule (``select``: the plain prep runs for ``slots < CTAs <=
-window x slots``, ``slots = ctas_per_sm x SMs``, ``CTAs = chunks x H``).  The derived leaves
+head) tile on one SM ``c_dvl``, in microseconds; for the pass 2 of a split
+plan, the gain ``sdt_gain`` its priced time must reach against ``dv_local`` +
+the register pass 2 and the least priced saving ``sdt_min_saving`` in
+microseconds) and ``prep_tma`` the window of its dispatch rule (``select``:
+the plain prep runs for ``slots < CTAs <= window x slots``, ``slots =
+ctas_per_sm x SMs``, ``CTAs = chunks x H``).  The derived leaves
 (``library``, ``kernel_symbol``, ``launch``, ``arg_plan``) are written by the
 exporter from the rendered binding; ``library`` is the program identity
 (``cake_gdn_det_train_<20 hex>``), so a kernel swap renames it.  ``MODULES``
@@ -46,11 +49,26 @@ the q / k tiles staged by TMA, one CTA per (chunk, key head); same bits),
 route; the serial and split scans serve the backward's recompute), ``stitch``
 (the segment stitch of both directions), ``fwd_ho`` (the forward scan and the
 output in one tcgen05 kernel), ``dv_local``, the adjoint register scans
-``dhu_r<vb>k<ks>`` with their pre-scans, ``dhu_tc2`` (the serial adjoint scan
-with ``dv_local`` fused, tcgen05, TMA ring fills), ``dqkwg``,
-``wy_bwd`` / ``wy_bwd_bf16``, ``finalize`` / ``finalize_mlp``, and ``tail_g2``
-/ ``tail_g2_bf16`` (``dqkwg``, the WY pullback and the finalize of a
-value-head group of two in one tcgen05 cluster kernel).  Every launch is a
+``dhu_r<vb>k<ks>`` with their pre-scans, ``dhu_pre_dvl_r64k1`` (the ``(64, 1)``
+pre-scan with the ``dv_local`` tiles of its chunks computed in the CTA),
+``dhu_tc2`` (the serial adjoint scan with ``dv_local`` fused, tcgen05, TMA ring
+fills), ``dqkwg``, ``wy_bwd`` / ``wy_bwd_bf16``, ``finalize`` /
+``finalize_mlp``, ``tail_g2`` / ``tail_g2_bf16`` (``dqkwg``, the WY pullback
+and the finalize of a value-head group of two in one tcgen05 cluster kernel)
+and ``tail_g3`` / ``tail_g3_bf16`` (the same for a value-head group of three,
+a three-CTA cluster).  ``dhu_tc2_wavefront`` and ``tail_g2_bf16_wavefront``
+are the wavefront pair of ``dhu_tc2`` and ``tail_g2_bf16`` (the same math):
+the scan publishes a ready count per (chunk, value head) in ``ready`` after its
+``dh`` / ``dv2`` stores (one gpu fence per two chunks) and counts its CTAs in
+at entry, and the tail walks the chunks in the scan's ready order
+``tile_order`` and waits on each count before it reads them;
+``tail_g2_bf16_wavefront`` also exports ``wait_geq`` (``cuStreamWaitValue32``
+on the entry count, the record's ``wait_entry``), which the chain enqueues on
+the side stream before the tail.  ``dhu_tc2_wavefront_split`` is the scan a
+split plan pairs with the tail: on SM100 / SM103 its store warps release the
+counts in an elected form (one thread fences and adds 64 to each word, once
+per four chunks); on SM107 it is the ``dhu_tc2_wavefront`` program.
+Every other launch is a
 plain stream-ordered launch: nothing cooperative, no PDL (the chain may put
 two launches of one stage on two streams, each over its own sequences).
 """
@@ -59,8 +77,8 @@ from __future__ import annotations
 
 from typing import Any
 
-ARCHES = ("sm_100a", "sm_103a")
-ARCH_BY_CAPABILITY = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
+ARCHES = ("sm_100a", "sm_103a", "sm_107a")
+ARCH_BY_CAPABILITY = {(10, 0): "sm_100a", (10, 3): "sm_103a", (10, 7): "sm_107a"}
 CHUNK = 64
 HEAD_DIM = 128
 PACKAGE = "flashinfer.experimental.cake_gdn_det_train"
@@ -91,7 +109,10 @@ STAGES = (
     "dhu_r64k1",
     "dhu_pre_r32k2",
     "dhu_pre_r64k1",
+    "dhu_pre_dvl_r64k1",
     "dhu_tc2",
+    "dhu_tc2_wavefront",
+    "dhu_tc2_wavefront_split",
     "dqkwg",
     "wy_bwd",
     "wy_bwd_bf16",
@@ -99,11 +120,14 @@ STAGES = (
     "finalize_mlp",
     "tail_g2",
     "tail_g2_bf16",
+    "tail_g2_bf16_wavefront",
+    "tail_g3",
+    "tail_g3_bf16",
 )
 
 MODULES: dict[str, dict[str, Any]] = {
     "meta": {
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
             ["buffer", "cu_seqlens"],
             ["buffer", "chunk_start"],
@@ -127,7 +151,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "ffi_entry": "run",
-        "kernel_symbol": "kernel_cake_gdn_det_train_6cf9c841da5c51c0ad4e",
+        "kernel_symbol": "kernel_cake_gdn_det_train_cb4540bcd4f8b57b63fd",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -135,11 +159,11 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 0,
             "use_pdl": False,
         },
-        "library": "cake_gdn_det_train_6cf9c841da5c51c0ad4e",
+        "library": "cake_gdn_det_train_cb4540bcd4f8b57b63fd",
         "stage": "meta",
     },
     "prep": {
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
             ["buffer", "q"],
             ["buffer", "k"],
@@ -161,7 +185,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "ffi_entry": "run",
-        "kernel_symbol": "kernel_cake_gdn_det_train_6e052313ea657109e841",
+        "kernel_symbol": "kernel_cake_gdn_det_train_fc6bd5c0f199747dda57",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -169,11 +193,11 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 0,
             "use_pdl": False,
         },
-        "library": "cake_gdn_det_train_6e052313ea657109e841",
+        "library": "cake_gdn_det_train_fc6bd5c0f199747dda57",
         "stage": "prep",
     },
     "prep_bf16beta": {
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
             ["buffer", "q"],
             ["buffer", "k"],
@@ -195,7 +219,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "ffi_entry": "run",
-        "kernel_symbol": "kernel_cake_gdn_det_train_e5b35ce10bdf1bb1fb38",
+        "kernel_symbol": "kernel_cake_gdn_det_train_1c2a662cd6bb278c7e5f",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -203,11 +227,11 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 0,
             "use_pdl": False,
         },
-        "library": "cake_gdn_det_train_e5b35ce10bdf1bb1fb38",
+        "library": "cake_gdn_det_train_1c2a662cd6bb278c7e5f",
         "stage": "prep_bf16beta",
     },
     "prep_tma": {
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
             ["buffer", "q_tma"],
             ["buffer", "k_tma"],
@@ -229,7 +253,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "ffi_entry": "run",
-        "kernel_symbol": "kernel_cake_gdn_det_train_06472810aa13a14a4877",
+        "kernel_symbol": "kernel_cake_gdn_det_train_5d2ba03d72acd81e852f",
         "launch": {
             "block": (288, 1, 1),
             "cluster": (1, 1, 1),
@@ -237,15 +261,19 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 32896,
             "use_pdl": False,
         },
-        "library": "cake_gdn_det_train_06472810aa13a14a4877",
+        "library": "cake_gdn_det_train_5d2ba03d72acd81e852f",
         "select": {
             "sm_100a": {"ctas_per_sm": 6, "window": 2.5},
             "sm_103a": {"ctas_per_sm": 6, "window": 2.5},
+            # R200 runs 1024 threads per SM: 3 CTAs of 288 threads.  Window 1.0 = no plain-prep band: over
+            # 128-16,384 CTAs prep_tma was faster in every cell but two with BF16 beta, a tie at 10,240 CTAs
+            # and a 1.6 % loss at 12,288 CTAs (19 x slots, beyond any band).
+            "sm_107a": {"ctas_per_sm": 3, "window": 1.0},
         },
         "stage": "prep_tma",
     },
     "prep_tma_bf16beta": {
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
             ["buffer", "q_tma"],
             ["buffer", "k_tma"],
@@ -267,7 +295,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "ffi_entry": "run",
-        "kernel_symbol": "kernel_cake_gdn_det_train_8bf81f99812f2255b618",
+        "kernel_symbol": "kernel_cake_gdn_det_train_a1724f5c3da7f9f9aa2e",
         "launch": {
             "block": (288, 1, 1),
             "cluster": (1, 1, 1),
@@ -275,11 +303,11 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 32896,
             "use_pdl": False,
         },
-        "library": "cake_gdn_det_train_8bf81f99812f2255b618",
+        "library": "cake_gdn_det_train_a1724f5c3da7f9f9aa2e",
         "stage": "prep_tma_bf16beta",
     },
     "wy_tc": {
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
             ["buffer", "kn"],
             ["buffer", "v"],
@@ -298,7 +326,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "ffi_entry": "run",
-        "kernel_symbol": "kernel_cake_gdn_det_train_dabeef52c8d449bbee3f",
+        "kernel_symbol": "kernel_cake_gdn_det_train_fffbca00fed25d191c1b",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -306,11 +334,11 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 53632,
             "use_pdl": False,
         },
-        "library": "cake_gdn_det_train_dabeef52c8d449bbee3f",
+        "library": "cake_gdn_det_train_fffbca00fed25d191c1b",
         "stage": "wy_tc",
     },
     "fwd_h_r32k2": {
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
             ["buffer", "kn"],
             ["buffer", "w"],
@@ -335,7 +363,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "ffi_entry": "run",
-        "kernel_symbol": "kernel_cake_gdn_det_train_4d671acd7ac12f19a83c",
+        "kernel_symbol": "kernel_cake_gdn_det_train_59386fc8f5c0cf38d589",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -343,12 +371,12 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 107008,
             "use_pdl": False,
         },
-        "library": "cake_gdn_det_train_4d671acd7ac12f19a83c",
+        "library": "cake_gdn_det_train_59386fc8f5c0cf38d589",
         "scan": {"k_split": 2, "select_smem_bytes": 107008, "v_block": 32},
         "stage": "fwd_h_r32k2",
     },
     "fwd_h_r32k1": {
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
             ["buffer", "kn"],
             ["buffer", "w"],
@@ -373,7 +401,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "ffi_entry": "run",
-        "kernel_symbol": "kernel_cake_gdn_det_train_5f754b7e4a292c1f1db2",
+        "kernel_symbol": "kernel_cake_gdn_det_train_d185bec7ef0cb84342fc",
         "launch": {
             "block": (64, 1, 1),
             "cluster": (1, 1, 1),
@@ -381,12 +409,12 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 90752,
             "use_pdl": False,
         },
-        "library": "cake_gdn_det_train_5f754b7e4a292c1f1db2",
+        "library": "cake_gdn_det_train_d185bec7ef0cb84342fc",
         "scan": {"k_split": 1, "select_smem_bytes": 90640, "v_block": 32},
         "stage": "fwd_h_r32k1",
     },
     "fwd_h_r64k1": {
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
             ["buffer", "kn"],
             ["buffer", "w"],
@@ -411,7 +439,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "ffi_entry": "run",
-        "kernel_symbol": "kernel_cake_gdn_det_train_0beedd2dd808b9606b3c",
+        "kernel_symbol": "kernel_cake_gdn_det_train_c64489a36f817b3fd494",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -419,12 +447,12 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 98944,
             "use_pdl": False,
         },
-        "library": "cake_gdn_det_train_0beedd2dd808b9606b3c",
+        "library": "cake_gdn_det_train_c64489a36f817b3fd494",
         "scan": {"k_split": 1, "select_smem_bytes": 98848, "v_block": 64},
         "stage": "fwd_h_r64k1",
     },
     "fwd_h_pre_r32k2": {
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
             ["buffer", "kn"],
             ["buffer", "w"],
@@ -451,7 +479,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "ffi_entry": "run",
-        "kernel_symbol": "kernel_cake_gdn_det_train_7062312eca24750817a6",
+        "kernel_symbol": "kernel_cake_gdn_det_train_0378c622e8993662f832",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -459,12 +487,12 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 107008,
             "use_pdl": False,
         },
-        "library": "cake_gdn_det_train_7062312eca24750817a6",
+        "library": "cake_gdn_det_train_0378c622e8993662f832",
         "scan": {"k_split": 2, "max_segment_chunks": 128, "v_block": 32},
         "stage": "fwd_h_pre_r32k2",
     },
     "fwd_h_pre_r64k1": {
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
             ["buffer", "kn"],
             ["buffer", "w"],
@@ -491,7 +519,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "ffi_entry": "run",
-        "kernel_symbol": "kernel_cake_gdn_det_train_fe00f3cfd684a5fcef8d",
+        "kernel_symbol": "kernel_cake_gdn_det_train_c03c5cbae677e04a9b44",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -499,12 +527,12 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 98944,
             "use_pdl": False,
         },
-        "library": "cake_gdn_det_train_fe00f3cfd684a5fcef8d",
+        "library": "cake_gdn_det_train_c03c5cbae677e04a9b44",
         "scan": {"k_split": 1, "max_segment_chunks": 128, "v_block": 64},
         "stage": "fwd_h_pre_r64k1",
     },
     "fwd_h_r32k2_split": {
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
             ["buffer", "kn"],
             ["buffer", "w"],
@@ -530,7 +558,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "ffi_entry": "run",
-        "kernel_symbol": "kernel_cake_gdn_det_train_0c9f1ce3c0dca78c6c3b",
+        "kernel_symbol": "kernel_cake_gdn_det_train_48d145edd90dc94d9064",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -538,12 +566,12 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 107008,
             "use_pdl": False,
         },
-        "library": "cake_gdn_det_train_0c9f1ce3c0dca78c6c3b",
+        "library": "cake_gdn_det_train_48d145edd90dc94d9064",
         "scan": {"k_split": 2, "v_block": 32},
         "stage": "fwd_h_r32k2_split",
     },
     "fwd_h_r64k1_split": {
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
             ["buffer", "kn"],
             ["buffer", "w"],
@@ -569,7 +597,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "ffi_entry": "run",
-        "kernel_symbol": "kernel_cake_gdn_det_train_de8e119d987f2d740f62",
+        "kernel_symbol": "kernel_cake_gdn_det_train_3c24b1ada6218c8023fb",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -577,12 +605,12 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 98944,
             "use_pdl": False,
         },
-        "library": "cake_gdn_det_train_de8e119d987f2d740f62",
+        "library": "cake_gdn_det_train_3c24b1ada6218c8023fb",
         "scan": {"k_split": 1, "v_block": 64},
         "stage": "fwd_h_r64k1_split",
     },
     "stitch": {
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
             ["buffer", "seg_state"],
             ["buffer", "init_state"],
@@ -597,7 +625,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "ffi_entry": "run",
-        "kernel_symbol": "kernel_cake_gdn_det_train_6c5de747bed9e9773c92",
+        "kernel_symbol": "kernel_cake_gdn_det_train_c0999bd9faec942831d6",
         "launch": {
             "block": (256, 1, 1),
             "cluster": (1, 1, 1),
@@ -605,11 +633,11 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 131072,
             "use_pdl": False,
         },
-        "library": "cake_gdn_det_train_6c5de747bed9e9773c92",
+        "library": "cake_gdn_det_train_c0999bd9faec942831d6",
         "stage": "stitch",
     },
     "fwd_ho": {
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
             ["buffer", "qn_tma"],
             ["buffer", "kn_tma"],
@@ -641,7 +669,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "ffi_entry": "run",
-        "kernel_symbol": "kernel_cake_gdn_det_train_e1e88ec75e739f421eb3",
+        "kernel_symbol": "kernel_cake_gdn_det_train_446adf6e2aa8ec228bc5",
         "launch": {
             "block": (512, 1, 1),
             "cluster": (1, 1, 1),
@@ -649,11 +677,11 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 223488,
             "use_pdl": False,
         },
-        "library": "cake_gdn_det_train_e1e88ec75e739f421eb3",
+        "library": "cake_gdn_det_train_446adf6e2aa8ec228bc5",
         "stage": "fwd_ho",
     },
     "dv_local": {
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
             ["buffer", "qn"],
             ["buffer", "kn"],
@@ -670,7 +698,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "ffi_entry": "run",
-        "kernel_symbol": "kernel_cake_gdn_det_train_dffb9b48c3904d8d4cf2",
+        "kernel_symbol": "kernel_cake_gdn_det_train_a26f00365c4ec467d2af",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -678,11 +706,11 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 49408,
             "use_pdl": False,
         },
-        "library": "cake_gdn_det_train_dffb9b48c3904d8d4cf2",
+        "library": "cake_gdn_det_train_a26f00365c4ec467d2af",
         "stage": "dv_local",
     },
     "dhu_r32k2": {
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
             ["buffer", "qn"],
             ["buffer", "kn"],
@@ -710,7 +738,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "ffi_entry": "run",
-        "kernel_symbol": "kernel_cake_gdn_det_train_f69f9431ee7ecdc5d3f7",
+        "kernel_symbol": "kernel_cake_gdn_det_train_28c18652c2a7fb6dda9d",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -718,12 +746,12 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 156672,
             "use_pdl": False,
         },
-        "library": "cake_gdn_det_train_f69f9431ee7ecdc5d3f7",
+        "library": "cake_gdn_det_train_28c18652c2a7fb6dda9d",
         "scan": {"k_split": 2, "select_smem_bytes": 156672, "v_block": 32},
         "stage": "dhu_r32k2",
     },
     "dhu_r32k1": {
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
             ["buffer", "qn"],
             ["buffer", "kn"],
@@ -751,7 +779,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "ffi_entry": "run",
-        "kernel_symbol": "kernel_cake_gdn_det_train_0ce80d92c5bc51cd44ad",
+        "kernel_symbol": "kernel_cake_gdn_det_train_05d8a39d6b72e95544c4",
         "launch": {
             "block": (64, 1, 1),
             "cluster": (1, 1, 1),
@@ -759,12 +787,12 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 140416,
             "use_pdl": False,
         },
-        "library": "cake_gdn_det_train_0ce80d92c5bc51cd44ad",
+        "library": "cake_gdn_det_train_05d8a39d6b72e95544c4",
         "scan": {"k_split": 1, "select_smem_bytes": 140304, "v_block": 32},
         "stage": "dhu_r32k1",
     },
     "dhu_r64k1": {
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
             ["buffer", "qn"],
             ["buffer", "kn"],
@@ -792,7 +820,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "ffi_entry": "run",
-        "kernel_symbol": "kernel_cake_gdn_det_train_c85da2ee69033c00287e",
+        "kernel_symbol": "kernel_cake_gdn_det_train_1ed0ca51532756a61ffd",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -800,12 +828,12 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 148608,
             "use_pdl": False,
         },
-        "library": "cake_gdn_det_train_c85da2ee69033c00287e",
+        "library": "cake_gdn_det_train_1ed0ca51532756a61ffd",
         "scan": {"k_split": 1, "select_smem_bytes": 148512, "v_block": 64},
         "stage": "dhu_r64k1",
     },
     "dhu_pre_r32k2": {
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
             ["buffer", "qn"],
             ["buffer", "kn"],
@@ -835,7 +863,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "ffi_entry": "run",
-        "kernel_symbol": "kernel_cake_gdn_det_train_07a07ddb9333abee5de1",
+        "kernel_symbol": "kernel_cake_gdn_det_train_45995251b055d43b9a16",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -843,12 +871,12 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 156672,
             "use_pdl": False,
         },
-        "library": "cake_gdn_det_train_07a07ddb9333abee5de1",
+        "library": "cake_gdn_det_train_45995251b055d43b9a16",
         "scan": {"k_split": 2, "max_segment_chunks": 128, "v_block": 32},
         "stage": "dhu_pre_r32k2",
     },
     "dhu_pre_r64k1": {
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
             ["buffer", "qn"],
             ["buffer", "kn"],
@@ -878,7 +906,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "ffi_entry": "run",
-        "kernel_symbol": "kernel_cake_gdn_det_train_9f459af70f5bb9dcf7ba",
+        "kernel_symbol": "kernel_cake_gdn_det_train_49ac66ec5583a9801623",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -886,12 +914,54 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 148608,
             "use_pdl": False,
         },
-        "library": "cake_gdn_det_train_9f459af70f5bb9dcf7ba",
+        "library": "cake_gdn_det_train_49ac66ec5583a9801623",
         "scan": {"k_split": 1, "max_segment_chunks": 128, "v_block": 64},
         "stage": "dhu_pre_r64k1",
     },
+    "dhu_pre_dvl_r64k1": {
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+        "arg_plan": [
+            ["buffer", "qn"],
+            ["buffer", "kn"],
+            ["buffer", "w"],
+            ["buffer", "do"],
+            ["buffer", "g_cs"],
+            ["buffer", "dht"],
+            ["buffer", "dh_out"],
+            ["buffer", "dv2"],
+            ["buffer", "dh0"],
+            ["buffer", "seg_state"],
+            ["buffer", "chunk_start"],
+            ["buffer", "chunk_len"],
+            ["buffer", "seg_chunk_start"],
+            ["buffer", "seg_seq"],
+            ["buffer", "seq_chunk_start"],
+            ["parameter", "num_heads"],
+            ["parameter", "num_v_heads"],
+            ["parameter", "use_final_state_grad"],
+            ["parameter", "store_initial_state_grad"],
+            ["parameter", "scale"],
+            ["buffer", "seg_flag"],
+            ["parameter", "warmup_thresh_log2"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "kernel_symbol": "kernel_cake_gdn_det_train_b6801b520db4ab4f96e4",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 157696,
+            "use_pdl": False,
+        },
+        "library": "cake_gdn_det_train_b6801b520db4ab4f96e4",
+        "scan": {"k_split": 1, "max_segment_chunks": 128, "v_block": 64},
+        "stage": "dhu_pre_dvl_r64k1",
+    },
     "dhu_tc2": {
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
             ["buffer", "qn_tma"],
             ["buffer", "kn_tma"],
@@ -918,7 +988,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "ffi_entry": "run",
-        "kernel_symbol": "kernel_cake_gdn_det_train_6ec11e6a48a2170657e9",
+        "kernel_symbol": "kernel_cake_gdn_det_train_4986279bc281c501d983",
         "launch": {
             "block": (384, 1, 1),
             "cluster": (1, 1, 1),
@@ -926,25 +996,158 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 222976,
             "use_pdl": False,
         },
-        "library": "cake_gdn_det_train_6ec11e6a48a2170657e9",
+        "library": "cake_gdn_det_train_4986279bc281c501d983",
         "select": {
             "sm_100a": {
                 "c_dvl": 2.021,
+                "sdt_gain": 0.95,
+                # B200: on short host-bound layouts a priced saving below 40 us did not reach the wall time
+                "sdt_min_saving": 40.0,
                 "t_full": 2.683,
                 "t_lat": 2.37,
                 "t_unit": 1.726,
             },
             "sm_103a": {
                 "c_dvl": 1.85,
+                "sdt_gain": 0.95,
+                "sdt_min_saving": 0.0,
                 "t_full": 2.293,
                 "t_lat": 2.204,
                 "t_unit": 1.599,
             },
+            "sm_107a": {
+                "c_dvl": 1.696,
+                "sdt_gain": 0.95,
+                "sdt_min_saving": 0.0,
+                "t_full": 2.357,
+                "t_lat": 1.708,
+                "t_unit": 1.329,
+            },
         },
         "stage": "dhu_tc2",
     },
-    "dqkwg": {
+    "dhu_tc2_wavefront": {
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+        "arg_plan": [
+            ["buffer", "qn_tma"],
+            ["buffer", "kn_tma"],
+            ["buffer", "w_tma"],
+            ["buffer", "do_tma"],
+            ["buffer", "g_cs"],
+            ["buffer", "dht"],
+            ["buffer", "dh_out"],
+            ["buffer", "dv2"],
+            ["buffer", "dh0"],
+            ["buffer", "seg_state"],
+            ["buffer", "chunk_start"],
+            ["buffer", "chunk_len"],
+            ["buffer", "seg_chunk_start"],
+            ["buffer", "seg_seq"],
+            ["buffer", "seq_chunk_start"],
+            ["parameter", "num_heads"],
+            ["parameter", "num_v_heads"],
+            ["parameter", "use_final_state_grad"],
+            ["parameter", "store_initial_state_grad"],
+            ["parameter", "scale"],
+            ["buffer", "ready"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "kernel_symbol": "kernel_cake_gdn_det_train_77231bf6aa5083c535df",
+        "launch": {
+            "block": (384, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 222976,
+            "use_pdl": False,
+        },
+        "library": "cake_gdn_det_train_77231bf6aa5083c535df",
+        "stage": "dhu_tc2_wavefront",
+    },
+    "dhu_tc2_wavefront_split": {
         "arches": ["sm_100a", "sm_103a"],
+        "arg_plan": [
+            ["buffer", "qn_tma"],
+            ["buffer", "kn_tma"],
+            ["buffer", "w_tma"],
+            ["buffer", "do_tma"],
+            ["buffer", "g_cs"],
+            ["buffer", "dht"],
+            ["buffer", "dh_out"],
+            ["buffer", "dv2"],
+            ["buffer", "dh0"],
+            ["buffer", "seg_state"],
+            ["buffer", "chunk_start"],
+            ["buffer", "chunk_len"],
+            ["buffer", "seg_chunk_start"],
+            ["buffer", "seg_seq"],
+            ["buffer", "seq_chunk_start"],
+            ["parameter", "num_heads"],
+            ["parameter", "num_v_heads"],
+            ["parameter", "use_final_state_grad"],
+            ["parameter", "store_initial_state_grad"],
+            ["parameter", "scale"],
+            ["buffer", "ready"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "kernel_symbol": "kernel_cake_gdn_det_train_2cbd42650ff19da3a651",
+        "launch": {
+            "block": (384, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 222976,
+            "use_pdl": False,
+        },
+        "library": "cake_gdn_det_train_2cbd42650ff19da3a651",
+        "stage": "dhu_tc2_wavefront_split",
+    },
+    "dhu_tc2_wavefront_split_sm_107a": {
+        "arches": ["sm_107a"],
+        "arg_plan": [
+            ["buffer", "qn_tma"],
+            ["buffer", "kn_tma"],
+            ["buffer", "w_tma"],
+            ["buffer", "do_tma"],
+            ["buffer", "g_cs"],
+            ["buffer", "dht"],
+            ["buffer", "dh_out"],
+            ["buffer", "dv2"],
+            ["buffer", "dh0"],
+            ["buffer", "seg_state"],
+            ["buffer", "chunk_start"],
+            ["buffer", "chunk_len"],
+            ["buffer", "seg_chunk_start"],
+            ["buffer", "seg_seq"],
+            ["buffer", "seq_chunk_start"],
+            ["parameter", "num_heads"],
+            ["parameter", "num_v_heads"],
+            ["parameter", "use_final_state_grad"],
+            ["parameter", "store_initial_state_grad"],
+            ["parameter", "scale"],
+            ["buffer", "ready"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "kernel_symbol": "kernel_cake_gdn_det_train_77231bf6aa5083c535df",
+        "launch": {
+            "block": (384, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 222976,
+            "use_pdl": False,
+        },
+        "library": "cake_gdn_det_train_77231bf6aa5083c535df",
+        "stage": "dhu_tc2_wavefront_split",
+    },
+    "dqkwg": {
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
             ["buffer", "qn"],
             ["buffer", "kn"],
@@ -968,7 +1171,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "ffi_entry": "run",
-        "kernel_symbol": "kernel_cake_gdn_det_train_de992154e6d217630b99",
+        "kernel_symbol": "kernel_cake_gdn_det_train_9a8bd9a7dff471f8a342",
         "launch": {
             "block": (256, 1, 1),
             "cluster": (1, 1, 1),
@@ -976,11 +1179,11 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 108032,
             "use_pdl": False,
         },
-        "library": "cake_gdn_det_train_de992154e6d217630b99",
+        "library": "cake_gdn_det_train_9a8bd9a7dff471f8a342",
         "stage": "dqkwg",
     },
     "wy_bwd": {
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
             ["buffer", "kn"],
             ["buffer", "v"],
@@ -1002,7 +1205,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "ffi_entry": "run",
-        "kernel_symbol": "kernel_cake_gdn_det_train_d2b216d12ac18154755b",
+        "kernel_symbol": "kernel_cake_gdn_det_train_1d5927e5dc79d93aa80b",
         "launch": {
             "block": (256, 1, 1),
             "cluster": (1, 1, 1),
@@ -1010,11 +1213,11 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 75648,
             "use_pdl": False,
         },
-        "library": "cake_gdn_det_train_d2b216d12ac18154755b",
+        "library": "cake_gdn_det_train_1d5927e5dc79d93aa80b",
         "stage": "wy_bwd",
     },
     "wy_bwd_bf16": {
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
             ["buffer", "kn"],
             ["buffer", "v"],
@@ -1036,7 +1239,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "ffi_entry": "run",
-        "kernel_symbol": "kernel_cake_gdn_det_train_649970217735a66d73c0",
+        "kernel_symbol": "kernel_cake_gdn_det_train_c43e6f8c48e1da09685e",
         "launch": {
             "block": (256, 1, 1),
             "cluster": (1, 1, 1),
@@ -1044,11 +1247,11 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 75648,
             "use_pdl": False,
         },
-        "library": "cake_gdn_det_train_649970217735a66d73c0",
+        "library": "cake_gdn_det_train_c43e6f8c48e1da09685e",
         "stage": "wy_bwd_bf16",
     },
     "finalize": {
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
             ["buffer", "qn"],
             ["buffer", "kn"],
@@ -1072,7 +1275,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "ffi_entry": "run",
-        "kernel_symbol": "kernel_cake_gdn_det_train_2a8aa1070ccaadd82606",
+        "kernel_symbol": "kernel_cake_gdn_det_train_3571aa28790b84013771",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -1080,11 +1283,11 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 0,
             "use_pdl": False,
         },
-        "library": "cake_gdn_det_train_2a8aa1070ccaadd82606",
+        "library": "cake_gdn_det_train_3571aa28790b84013771",
         "stage": "finalize",
     },
     "finalize_mlp": {
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
             ["buffer", "qn"],
             ["buffer", "kn"],
@@ -1108,7 +1311,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "ffi_entry": "run",
-        "kernel_symbol": "kernel_cake_gdn_det_train_b3f461995902543695bf",
+        "kernel_symbol": "kernel_cake_gdn_det_train_fe2b7d6be2d3f66c37f6",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -1116,11 +1319,11 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 0,
             "use_pdl": False,
         },
-        "library": "cake_gdn_det_train_b3f461995902543695bf",
+        "library": "cake_gdn_det_train_fe2b7d6be2d3f66c37f6",
         "stage": "finalize_mlp",
     },
     "tail_g2": {
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
             ["buffer", "qn"],
             ["buffer", "kn"],
@@ -1151,7 +1354,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "ffi_entry": "run",
-        "kernel_symbol": "kernel_cake_gdn_det_train_6520a6ce55ffbfc30721",
+        "kernel_symbol": "kernel_cake_gdn_det_train_b0f17bcb1f51d381d453",
         "launch": {
             "block": (256, 1, 1),
             "cluster": (2, 1, 1),
@@ -1159,11 +1362,11 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 108160,
             "use_pdl": False,
         },
-        "library": "cake_gdn_det_train_6520a6ce55ffbfc30721",
+        "library": "cake_gdn_det_train_b0f17bcb1f51d381d453",
         "stage": "tail_g2",
     },
     "tail_g2_bf16": {
-        "arches": ["sm_100a", "sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
             ["buffer", "qn"],
             ["buffer", "kn"],
@@ -1194,7 +1397,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "ffi_entry": "run",
-        "kernel_symbol": "kernel_cake_gdn_det_train_34a7a0645157db9e92f4",
+        "kernel_symbol": "kernel_cake_gdn_det_train_16278f860de548514cf8",
         "launch": {
             "block": (256, 1, 1),
             "cluster": (2, 1, 1),
@@ -1202,8 +1405,140 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 108160,
             "use_pdl": False,
         },
-        "library": "cake_gdn_det_train_34a7a0645157db9e92f4",
+        "library": "cake_gdn_det_train_16278f860de548514cf8",
         "stage": "tail_g2_bf16",
+    },
+    "tail_g2_bf16_wavefront": {
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+        "arg_plan": [
+            ["buffer", "qn"],
+            ["buffer", "kn"],
+            ["buffer", "rstd_q"],
+            ["buffer", "rstd_k"],
+            ["buffer", "v_new"],
+            ["buffer", "do"],
+            ["buffer", "dv2"],
+            ["buffer", "h"],
+            ["buffer", "dh"],
+            ["buffer", "g_cs"],
+            ["buffer", "v"],
+            ["buffer", "A"],
+            ["buffer", "beta"],
+            ["buffer", "dq_out"],
+            ["buffer", "dk_out"],
+            ["buffer", "dg_out"],
+            ["buffer", "dv_out"],
+            ["buffer", "dbeta_out"],
+            ["buffer", "chunk_start"],
+            ["buffer", "chunk_len"],
+            ["parameter", "num_heads"],
+            ["parameter", "num_v_heads"],
+            ["parameter", "scale"],
+            ["parameter", "normalize_qk"],
+            ["buffer", "ready"],
+            ["buffer", "tile_order"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "kernel_symbol": "kernel_cake_gdn_det_train_0b4d86ff7e9093ca0ca9",
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (2, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 108160,
+            "use_pdl": False,
+        },
+        "library": "cake_gdn_det_train_0b4d86ff7e9093ca0ca9",
+        "stage": "tail_g2_bf16_wavefront",
+        "wait_entry": "wait_geq",
+    },
+    "tail_g3": {
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+        "arg_plan": [
+            ["buffer", "qn"],
+            ["buffer", "kn"],
+            ["buffer", "rstd_q"],
+            ["buffer", "rstd_k"],
+            ["buffer", "v_new"],
+            ["buffer", "do"],
+            ["buffer", "dv2"],
+            ["buffer", "h"],
+            ["buffer", "dh"],
+            ["buffer", "g_cs"],
+            ["buffer", "v"],
+            ["buffer", "A"],
+            ["buffer", "beta"],
+            ["buffer", "dq_out"],
+            ["buffer", "dk_out"],
+            ["buffer", "dg_out"],
+            ["buffer", "dv_out"],
+            ["buffer", "dbeta_out"],
+            ["buffer", "chunk_start"],
+            ["buffer", "chunk_len"],
+            ["parameter", "num_heads"],
+            ["parameter", "num_v_heads"],
+            ["parameter", "scale"],
+            ["parameter", "normalize_qk"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "kernel_symbol": "kernel_cake_gdn_det_train_89b37d912fd283131f44",
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (3, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 108160,
+            "use_pdl": False,
+        },
+        "library": "cake_gdn_det_train_89b37d912fd283131f44",
+        "stage": "tail_g3",
+    },
+    "tail_g3_bf16": {
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+        "arg_plan": [
+            ["buffer", "qn"],
+            ["buffer", "kn"],
+            ["buffer", "rstd_q"],
+            ["buffer", "rstd_k"],
+            ["buffer", "v_new"],
+            ["buffer", "do"],
+            ["buffer", "dv2"],
+            ["buffer", "h"],
+            ["buffer", "dh"],
+            ["buffer", "g_cs"],
+            ["buffer", "v"],
+            ["buffer", "A"],
+            ["buffer", "beta"],
+            ["buffer", "dq_out"],
+            ["buffer", "dk_out"],
+            ["buffer", "dg_out"],
+            ["buffer", "dv_out"],
+            ["buffer", "dbeta_out"],
+            ["buffer", "chunk_start"],
+            ["buffer", "chunk_len"],
+            ["parameter", "num_heads"],
+            ["parameter", "num_v_heads"],
+            ["parameter", "scale"],
+            ["parameter", "normalize_qk"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "kernel_symbol": "kernel_cake_gdn_det_train_2e03b684eb372f46395f",
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (3, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 108160,
+            "use_pdl": False,
+        },
+        "library": "cake_gdn_det_train_2e03b684eb372f46395f",
+        "stage": "tail_g3_bf16",
     },
 }
 

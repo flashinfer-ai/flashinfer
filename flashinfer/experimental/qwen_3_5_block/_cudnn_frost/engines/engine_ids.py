@@ -55,6 +55,10 @@ BACKEND_HEURISTIC_ENGINE_ID = -1
 # ``engines/heuristics._assemble``; it never reaches ``graph.plans``.
 BACKEND_BLOCK_ENGINE_ID = -2
 
+# The last-resort marker: a family's proposals after it go after EVERY requested mode's backend block (they serve only a
+# graph the backend cannot build in any mode). Expanded by ``engines/heuristics._assemble``; it never reaches ``graph.plans``.
+LAST_RESORT_ENGINE_ID = -3
+
 
 def is_python_engine(engine_id: int) -> bool:
     """True iff ``engine_id`` names a python engine (vs a backend engine)."""

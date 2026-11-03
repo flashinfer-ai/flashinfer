@@ -508,6 +508,53 @@ def create_sparse_offsets_task(
     )
 
 
+def create_load_combined_task(
+    smem_q,
+    smem_k,
+    smem_v,
+    page_offsets,
+    work_queue=None,
+    task_class=MlaTask,
+    **task_kwargs,
+):
+    """Acquire K/V together and reuse each CTA's local K values for V."""
+    loop_start, loop_end, loop_step = captured_loop_bounds(task_kwargs, 0)
+
+    @schedule
+    def combined_schedule(smem_q, smem_k, smem_v, page_offsets, work_queue=None):
+        """Acquire paired K/V stages, convert once, and publish V after peer DSMEM completion."""
+        smem_q.init_load_state()
+        smem_k.init_load_state()
+        smem_v.init_load_state()
+        smem_k.bind_sparse_request()
+        smem_q.acquire()
+        smem_q.tma_load()
+        smem_q.commit()
+        with domain_loop(loop_start, loop_end, loop_step):
+            page_offsets.wait()
+            page_stage = page_offsets.sparse_stage()
+            smem_k.acquire()
+            smem_v.acquire()
+            smem_v.combined_stage()
+            smem_k.tma_load_shared(page_offset_stage=page_stage)
+            smem_k.commit()
+            smem_v.tma_load_shared(page_offset_stage=page_stage)
+            smem_v.commit()
+            page_offsets.release()
+        work_queue_tail(work_queue, advance_label="advance_tile")
+
+    captured = combined_schedule(smem_q, smem_k, smem_v, page_offsets, work_queue)
+    return task_class(
+        src_resources=[page_offsets] + ([work_queue] if work_queue is not None else []),
+        dst_resources=[smem_q, smem_k, smem_v],
+        warp_idx=smem_k.cfg.load_k_warp_id,
+        num_warps=8,
+        schedule=captured,
+        name="LoadCombinedTask",
+        **task_kwargs,
+    )
+
+
 def create_load_k_task(
     smem_q: SmemQResource,
     smem_k: SmemKResource,

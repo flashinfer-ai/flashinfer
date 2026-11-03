@@ -238,7 +238,7 @@ class BlockScaledSwapAbMegaMoeKernel(KernelClass):
         self._device_workspace = self._build_device_workspace()
         self.token_comm._configure_tail_reset_ownership(self._device_workspace)
         self._mainloop, self._smem_workspace = self._build_mainloop_and_smem(fc12_problem_desc, resolved_impl_desc)
-        self.masks_invalid_combine_slots = not self.reduce_topk_in_kernel and not self.combine_format.is_quantized
+        self.masks_invalid_combine_slots = not self.reduce_topk_in_kernel
         self._topk_reduce = (
             None if self.reduce_topk_in_kernel else TopkReduce(self.hidden_size, self.topk, self.combine_format, num_experts=self.expert_count)
         )

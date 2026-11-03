@@ -36,14 +36,18 @@ the expert-aligned route plan consumed by grouped MoE GEMMs in **one launch**:
   token count (a single CTA for one token -- at `block_m = 16` a second
   program of that kernel which loads the bias and the logits in the read-only
   form --, otherwise one cluster of `num_tokens` CTAs -- 2, 4, 8 or 16 --
-  exchanging the selected ids through distributed shared memory; these are the
-  only kernels bound to their exact token count), one cluster of 16 CTAs of
+  exchanging the selected ids through distributed shared memory, with a second
+  program of the two-token kernel on SM100 at `block_m = 8` that ranks its
+  winners from a certified window; these are the only kernels bound to their
+  exact token count), one cluster of 16 CTAs of
   two row groups each for every other
-  count up to 32 (the 32-token cell, so 3 or 17 tokens take it; two kernels
-  serve it, one waiting for its cluster at entry and one after its row
-  selection: SM100 takes the second at `block_m = 8` and, at
-  `block_m = 16`, the second from 29 tokens and the first below; SM103 takes
-  the first at `block_m = 8` and the second at `block_m = 16`), one-join plan
+  count up to 32 (the 32-token cell, so 3 or 17 tokens take it; three kernels
+  serve it: `LCG`, which waits for its cluster at entry, `LCG_LW`, which waits
+  after its row selection, and `LCG_LW_OWN`, the `LCG_LW` kernel whose
+  candidate floor comes from the owners of the published bounds: SM100 takes
+  `LCG_LW` at `block_m = 8` and, at `block_m = 16`, `LCG_LW_OWN` from 29
+  tokens and `LCG` below; SM103 takes `LCG` at `block_m = 8` and `LCG_LW` at
+  `block_m = 16`), one-join plan
   builders for 33 to 128 tokens (the 64- and 128-token cells use a second
   kernel of the builder's family which loads the bias and the first row's
   logits into registers before its prologue barrier; the plain builder keeps
@@ -59,18 +63,22 @@ the expert-aligned route plan consumed by grouped MoE GEMMs in **one launch**:
   2048-token cell uses a second kernel of that
   family which prefetches the next row's logits into registers) and a
   warp-per-row two-join persistent kernel launched as CTA pairs from 2049
-  tokens up. The two architectures' tables differ only in four small-batch
-  cells.
+  tokens up. The kernels of the 512- and 1024-token cells keep each cluster's
+  slice byte map in their owner CTAs and serve at most 1024 tokens. The two
+  architectures' tables differ only in five small-batch cells.
 - The 4-CTA-cluster cells follow the batch against the device's capacity
   `C`, four times the co-resident clusters the driver reports for the
   next-row-prefetch kernel (568 on a 148-SM B200, 592 on a 152-SM GB300): up
   to `C` tokens keep the cell's arm (every CTA selects at most one row). Above
   `C` a CTA selects a second row, which a next-row prefetch covers: SM100 runs
-  a kernel of the family whose owner CTAs rank the route pairs in their own
-  shared memory up to 832 tokens and from 1056 tokens, and the
-  next-row-prefetch kernel between them (at `block_m` 8 up to 1024 tokens its
-  variant that skips the emit word pass such a batch leaves without a bitmap
-  word); SM103 runs the first kernel of the family with the same prefetch up
+  the first kernel of the family with the same prefetch up to 1024 tokens at
+  `block_m` 16 (then that kernel with a byte map spanning a full map row up
+  to 1136 tokens) and up to 832 tokens at `block_m` 8 (then the
+  next-row-prefetch kernel's variant that skips the emit word pass such a
+  batch leaves without a bitmap word up to 1024 tokens, and the
+  next-row-prefetch kernel up to 1055 tokens), and above those a kernel of the
+  family whose owner CTAs rank the route pairs in their own shared memory;
+  SM103 runs the first kernel of the family with the same prefetch up
   to 1024 tokens, the next-row-prefetch kernel up to 1039 tokens and the
   owner-rank kernel from 1040 tokens. From `2C + 64` up a kernel of
   the family that selects one row per warp runs (1200 tokens on a B200, 1248

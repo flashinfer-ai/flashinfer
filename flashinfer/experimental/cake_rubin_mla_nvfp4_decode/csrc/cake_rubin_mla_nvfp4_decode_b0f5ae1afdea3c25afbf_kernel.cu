@@ -129,452 +129,452 @@ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void kernel_cake_rubin_mla_nvfp4_decod
         l1 = partial_lse[stat_base_7 + lane_7 + 32];
       }
       unsigned int vec[64];
-      int _mn_0_0 = ((0) < (last_7) ? (0) : (last_7));
+      int _mn_0 = ((0) < (last_7) ? (0) : (last_7));
       {
         uint32_t _bf16x2_bits_0;
         _bf16x2_bits_0 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_0) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0) * 512 + d0_7);
         vec[0] = _bf16x2_bits_0;
       }
-      int _mn_0_1 = ((1) < (last_7) ? (1) : (last_7));
+      int _mn_1 = ((1) < (last_7) ? (1) : (last_7));
       {
         uint32_t _bf16x2_bits_1;
         _bf16x2_bits_1 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_1) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_1) * 512 + d0_7);
         vec[1] = _bf16x2_bits_1;
       }
-      int _mn_0_2 = ((2) < (last_7) ? (2) : (last_7));
+      int _mn_2 = ((2) < (last_7) ? (2) : (last_7));
       {
         uint32_t _bf16x2_bits_2;
         _bf16x2_bits_2 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_2) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_2) * 512 + d0_7);
         vec[2] = _bf16x2_bits_2;
       }
-      int _mn_0_3 = ((3) < (last_7) ? (3) : (last_7));
+      int _mn_3 = ((3) < (last_7) ? (3) : (last_7));
       {
         uint32_t _bf16x2_bits_3;
         _bf16x2_bits_3 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_3) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_3) * 512 + d0_7);
         vec[3] = _bf16x2_bits_3;
       }
-      int _mn_0_4 = ((4) < (last_7) ? (4) : (last_7));
+      int _mn_4 = ((4) < (last_7) ? (4) : (last_7));
       {
         uint32_t _bf16x2_bits_4;
         _bf16x2_bits_4 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_4) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_4) * 512 + d0_7);
         vec[4] = _bf16x2_bits_4;
       }
-      int _mn_0_5 = ((5) < (last_7) ? (5) : (last_7));
+      int _mn_5 = ((5) < (last_7) ? (5) : (last_7));
       {
         uint32_t _bf16x2_bits_5;
         _bf16x2_bits_5 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_5) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_5) * 512 + d0_7);
         vec[5] = _bf16x2_bits_5;
       }
-      int _mn_0_6 = ((6) < (last_7) ? (6) : (last_7));
+      int _mn_6 = ((6) < (last_7) ? (6) : (last_7));
       {
         uint32_t _bf16x2_bits_6;
         _bf16x2_bits_6 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_6) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_6) * 512 + d0_7);
         vec[6] = _bf16x2_bits_6;
       }
-      int _mn_0_7 = ((7) < (last_7) ? (7) : (last_7));
+      int _mn_7 = ((7) < (last_7) ? (7) : (last_7));
       {
         uint32_t _bf16x2_bits_7;
         _bf16x2_bits_7 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_7) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_7) * 512 + d0_7);
         vec[7] = _bf16x2_bits_7;
       }
-      int _mn_0_8 = ((8) < (last_7) ? (8) : (last_7));
+      int _mn_8 = ((8) < (last_7) ? (8) : (last_7));
       {
         uint32_t _bf16x2_bits_8;
         _bf16x2_bits_8 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_8) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_8) * 512 + d0_7);
         vec[8] = _bf16x2_bits_8;
       }
-      int _mn_0_9 = ((9) < (last_7) ? (9) : (last_7));
+      int _mn_9 = ((9) < (last_7) ? (9) : (last_7));
       {
         uint32_t _bf16x2_bits_9;
         _bf16x2_bits_9 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_9) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_9) * 512 + d0_7);
         vec[9] = _bf16x2_bits_9;
       }
-      int _mn_0_10 = ((10) < (last_7) ? (10) : (last_7));
+      int _mn_10 = ((10) < (last_7) ? (10) : (last_7));
       {
         uint32_t _bf16x2_bits_10;
         _bf16x2_bits_10 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_10) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_10) * 512 + d0_7);
         vec[10] = _bf16x2_bits_10;
       }
-      int _mn_0_11 = ((11) < (last_7) ? (11) : (last_7));
+      int _mn_11 = ((11) < (last_7) ? (11) : (last_7));
       {
         uint32_t _bf16x2_bits_11;
         _bf16x2_bits_11 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_11) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_11) * 512 + d0_7);
         vec[11] = _bf16x2_bits_11;
       }
-      int _mn_0_12 = ((12) < (last_7) ? (12) : (last_7));
+      int _mn_12 = ((12) < (last_7) ? (12) : (last_7));
       {
         uint32_t _bf16x2_bits_12;
         _bf16x2_bits_12 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_12) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_12) * 512 + d0_7);
         vec[12] = _bf16x2_bits_12;
       }
-      int _mn_0_13 = ((13) < (last_7) ? (13) : (last_7));
+      int _mn_13 = ((13) < (last_7) ? (13) : (last_7));
       {
         uint32_t _bf16x2_bits_13;
         _bf16x2_bits_13 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_13) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_13) * 512 + d0_7);
         vec[13] = _bf16x2_bits_13;
       }
-      int _mn_0_14 = ((14) < (last_7) ? (14) : (last_7));
+      int _mn_14 = ((14) < (last_7) ? (14) : (last_7));
       {
         uint32_t _bf16x2_bits_14;
         _bf16x2_bits_14 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_14) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_14) * 512 + d0_7);
         vec[14] = _bf16x2_bits_14;
       }
-      int _mn_0_15 = ((15) < (last_7) ? (15) : (last_7));
+      int _mn_15 = ((15) < (last_7) ? (15) : (last_7));
       {
         uint32_t _bf16x2_bits_15;
         _bf16x2_bits_15 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_15) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_15) * 512 + d0_7);
         vec[15] = _bf16x2_bits_15;
       }
-      int _mn_0_16 = ((16) < (last_7) ? (16) : (last_7));
+      int _mn_16 = ((16) < (last_7) ? (16) : (last_7));
       {
         uint32_t _bf16x2_bits_16;
         _bf16x2_bits_16 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_16) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_16) * 512 + d0_7);
         vec[16] = _bf16x2_bits_16;
       }
-      int _mn_0_17 = ((17) < (last_7) ? (17) : (last_7));
+      int _mn_17 = ((17) < (last_7) ? (17) : (last_7));
       {
         uint32_t _bf16x2_bits_17;
         _bf16x2_bits_17 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_17) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_17) * 512 + d0_7);
         vec[17] = _bf16x2_bits_17;
       }
-      int _mn_0_18 = ((18) < (last_7) ? (18) : (last_7));
+      int _mn_18 = ((18) < (last_7) ? (18) : (last_7));
       {
         uint32_t _bf16x2_bits_18;
         _bf16x2_bits_18 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_18) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_18) * 512 + d0_7);
         vec[18] = _bf16x2_bits_18;
       }
-      int _mn_0_19 = ((19) < (last_7) ? (19) : (last_7));
+      int _mn_19 = ((19) < (last_7) ? (19) : (last_7));
       {
         uint32_t _bf16x2_bits_19;
         _bf16x2_bits_19 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_19) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_19) * 512 + d0_7);
         vec[19] = _bf16x2_bits_19;
       }
-      int _mn_0_20 = ((20) < (last_7) ? (20) : (last_7));
+      int _mn_20 = ((20) < (last_7) ? (20) : (last_7));
       {
         uint32_t _bf16x2_bits_20;
         _bf16x2_bits_20 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_20) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_20) * 512 + d0_7);
         vec[20] = _bf16x2_bits_20;
       }
-      int _mn_0_21 = ((21) < (last_7) ? (21) : (last_7));
+      int _mn_21 = ((21) < (last_7) ? (21) : (last_7));
       {
         uint32_t _bf16x2_bits_21;
         _bf16x2_bits_21 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_21) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_21) * 512 + d0_7);
         vec[21] = _bf16x2_bits_21;
       }
-      int _mn_0_22 = ((22) < (last_7) ? (22) : (last_7));
+      int _mn_22 = ((22) < (last_7) ? (22) : (last_7));
       {
         uint32_t _bf16x2_bits_22;
         _bf16x2_bits_22 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_22) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_22) * 512 + d0_7);
         vec[22] = _bf16x2_bits_22;
       }
-      int _mn_0_23 = ((23) < (last_7) ? (23) : (last_7));
+      int _mn_23 = ((23) < (last_7) ? (23) : (last_7));
       {
         uint32_t _bf16x2_bits_23;
         _bf16x2_bits_23 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_23) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_23) * 512 + d0_7);
         vec[23] = _bf16x2_bits_23;
       }
-      int _mn_0_24 = ((24) < (last_7) ? (24) : (last_7));
+      int _mn_24 = ((24) < (last_7) ? (24) : (last_7));
       {
         uint32_t _bf16x2_bits_24;
         _bf16x2_bits_24 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_24) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_24) * 512 + d0_7);
         vec[24] = _bf16x2_bits_24;
       }
-      int _mn_0_25 = ((25) < (last_7) ? (25) : (last_7));
+      int _mn_25 = ((25) < (last_7) ? (25) : (last_7));
       {
         uint32_t _bf16x2_bits_25;
         _bf16x2_bits_25 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_25) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_25) * 512 + d0_7);
         vec[25] = _bf16x2_bits_25;
       }
-      int _mn_0_26 = ((26) < (last_7) ? (26) : (last_7));
+      int _mn_26 = ((26) < (last_7) ? (26) : (last_7));
       {
         uint32_t _bf16x2_bits_26;
         _bf16x2_bits_26 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_26) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_26) * 512 + d0_7);
         vec[26] = _bf16x2_bits_26;
       }
-      int _mn_0_27 = ((27) < (last_7) ? (27) : (last_7));
+      int _mn_27 = ((27) < (last_7) ? (27) : (last_7));
       {
         uint32_t _bf16x2_bits_27;
         _bf16x2_bits_27 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_27) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_27) * 512 + d0_7);
         vec[27] = _bf16x2_bits_27;
       }
-      int _mn_0_28 = ((28) < (last_7) ? (28) : (last_7));
+      int _mn_28 = ((28) < (last_7) ? (28) : (last_7));
       {
         uint32_t _bf16x2_bits_28;
         _bf16x2_bits_28 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_28) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_28) * 512 + d0_7);
         vec[28] = _bf16x2_bits_28;
       }
-      int _mn_0_29 = ((29) < (last_7) ? (29) : (last_7));
+      int _mn_29 = ((29) < (last_7) ? (29) : (last_7));
       {
         uint32_t _bf16x2_bits_29;
         _bf16x2_bits_29 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_29) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_29) * 512 + d0_7);
         vec[29] = _bf16x2_bits_29;
       }
-      int _mn_0_30 = ((30) < (last_7) ? (30) : (last_7));
+      int _mn_30 = ((30) < (last_7) ? (30) : (last_7));
       {
         uint32_t _bf16x2_bits_30;
         _bf16x2_bits_30 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_30) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_30) * 512 + d0_7);
         vec[30] = _bf16x2_bits_30;
       }
-      int _mn_0_31 = ((31) < (last_7) ? (31) : (last_7));
+      int _mn_31 = ((31) < (last_7) ? (31) : (last_7));
       {
         uint32_t _bf16x2_bits_31;
         _bf16x2_bits_31 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_31) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_31) * 512 + d0_7);
         vec[31] = _bf16x2_bits_31;
       }
-      int _mn_0_32 = ((32) < (last_7) ? (32) : (last_7));
+      int _mn_32 = ((32) < (last_7) ? (32) : (last_7));
       {
         uint32_t _bf16x2_bits_32;
         _bf16x2_bits_32 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_32) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_32) * 512 + d0_7);
         vec[32] = _bf16x2_bits_32;
       }
-      int _mn_0_33 = ((33) < (last_7) ? (33) : (last_7));
+      int _mn_33 = ((33) < (last_7) ? (33) : (last_7));
       {
         uint32_t _bf16x2_bits_33;
         _bf16x2_bits_33 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_33) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_33) * 512 + d0_7);
         vec[33] = _bf16x2_bits_33;
       }
-      int _mn_0_34 = ((34) < (last_7) ? (34) : (last_7));
+      int _mn_34 = ((34) < (last_7) ? (34) : (last_7));
       {
         uint32_t _bf16x2_bits_34;
         _bf16x2_bits_34 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_34) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_34) * 512 + d0_7);
         vec[34] = _bf16x2_bits_34;
       }
-      int _mn_0_35 = ((35) < (last_7) ? (35) : (last_7));
+      int _mn_35 = ((35) < (last_7) ? (35) : (last_7));
       {
         uint32_t _bf16x2_bits_35;
         _bf16x2_bits_35 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_35) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_35) * 512 + d0_7);
         vec[35] = _bf16x2_bits_35;
       }
-      int _mn_0_36 = ((36) < (last_7) ? (36) : (last_7));
+      int _mn_36 = ((36) < (last_7) ? (36) : (last_7));
       {
         uint32_t _bf16x2_bits_36;
         _bf16x2_bits_36 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_36) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_36) * 512 + d0_7);
         vec[36] = _bf16x2_bits_36;
       }
-      int _mn_0_37 = ((37) < (last_7) ? (37) : (last_7));
+      int _mn_37 = ((37) < (last_7) ? (37) : (last_7));
       {
         uint32_t _bf16x2_bits_37;
         _bf16x2_bits_37 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_37) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_37) * 512 + d0_7);
         vec[37] = _bf16x2_bits_37;
       }
-      int _mn_0_38 = ((38) < (last_7) ? (38) : (last_7));
+      int _mn_38 = ((38) < (last_7) ? (38) : (last_7));
       {
         uint32_t _bf16x2_bits_38;
         _bf16x2_bits_38 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_38) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_38) * 512 + d0_7);
         vec[38] = _bf16x2_bits_38;
       }
-      int _mn_0_39 = ((39) < (last_7) ? (39) : (last_7));
+      int _mn_39 = ((39) < (last_7) ? (39) : (last_7));
       {
         uint32_t _bf16x2_bits_39;
         _bf16x2_bits_39 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_39) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_39) * 512 + d0_7);
         vec[39] = _bf16x2_bits_39;
       }
-      int _mn_0_40 = ((40) < (last_7) ? (40) : (last_7));
+      int _mn_40 = ((40) < (last_7) ? (40) : (last_7));
       {
         uint32_t _bf16x2_bits_40;
         _bf16x2_bits_40 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_40) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_40) * 512 + d0_7);
         vec[40] = _bf16x2_bits_40;
       }
-      int _mn_0_41 = ((41) < (last_7) ? (41) : (last_7));
+      int _mn_41 = ((41) < (last_7) ? (41) : (last_7));
       {
         uint32_t _bf16x2_bits_41;
         _bf16x2_bits_41 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_41) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_41) * 512 + d0_7);
         vec[41] = _bf16x2_bits_41;
       }
-      int _mn_0_42 = ((42) < (last_7) ? (42) : (last_7));
+      int _mn_42 = ((42) < (last_7) ? (42) : (last_7));
       {
         uint32_t _bf16x2_bits_42;
         _bf16x2_bits_42 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_42) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_42) * 512 + d0_7);
         vec[42] = _bf16x2_bits_42;
       }
-      int _mn_0_43 = ((43) < (last_7) ? (43) : (last_7));
+      int _mn_43 = ((43) < (last_7) ? (43) : (last_7));
       {
         uint32_t _bf16x2_bits_43;
         _bf16x2_bits_43 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_43) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_43) * 512 + d0_7);
         vec[43] = _bf16x2_bits_43;
       }
-      int _mn_0_44 = ((44) < (last_7) ? (44) : (last_7));
+      int _mn_44 = ((44) < (last_7) ? (44) : (last_7));
       {
         uint32_t _bf16x2_bits_44;
         _bf16x2_bits_44 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_44) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_44) * 512 + d0_7);
         vec[44] = _bf16x2_bits_44;
       }
-      int _mn_0_45 = ((45) < (last_7) ? (45) : (last_7));
+      int _mn_45 = ((45) < (last_7) ? (45) : (last_7));
       {
         uint32_t _bf16x2_bits_45;
         _bf16x2_bits_45 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_45) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_45) * 512 + d0_7);
         vec[45] = _bf16x2_bits_45;
       }
-      int _mn_0_46 = ((46) < (last_7) ? (46) : (last_7));
+      int _mn_46 = ((46) < (last_7) ? (46) : (last_7));
       {
         uint32_t _bf16x2_bits_46;
         _bf16x2_bits_46 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_46) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_46) * 512 + d0_7);
         vec[46] = _bf16x2_bits_46;
       }
-      int _mn_0_47 = ((47) < (last_7) ? (47) : (last_7));
+      int _mn_47 = ((47) < (last_7) ? (47) : (last_7));
       {
         uint32_t _bf16x2_bits_47;
         _bf16x2_bits_47 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_47) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_47) * 512 + d0_7);
         vec[47] = _bf16x2_bits_47;
       }
-      int _mn_0_48 = ((48) < (last_7) ? (48) : (last_7));
+      int _mn_48 = ((48) < (last_7) ? (48) : (last_7));
       {
         uint32_t _bf16x2_bits_48;
         _bf16x2_bits_48 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_48) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_48) * 512 + d0_7);
         vec[48] = _bf16x2_bits_48;
       }
-      int _mn_0_49 = ((49) < (last_7) ? (49) : (last_7));
+      int _mn_49 = ((49) < (last_7) ? (49) : (last_7));
       {
         uint32_t _bf16x2_bits_49;
         _bf16x2_bits_49 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_49) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_49) * 512 + d0_7);
         vec[49] = _bf16x2_bits_49;
       }
-      int _mn_0_50 = ((50) < (last_7) ? (50) : (last_7));
+      int _mn_50 = ((50) < (last_7) ? (50) : (last_7));
       {
         uint32_t _bf16x2_bits_50;
         _bf16x2_bits_50 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_50) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_50) * 512 + d0_7);
         vec[50] = _bf16x2_bits_50;
       }
-      int _mn_0_51 = ((51) < (last_7) ? (51) : (last_7));
+      int _mn_51 = ((51) < (last_7) ? (51) : (last_7));
       {
         uint32_t _bf16x2_bits_51;
         _bf16x2_bits_51 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_51) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_51) * 512 + d0_7);
         vec[51] = _bf16x2_bits_51;
       }
-      int _mn_0_52 = ((52) < (last_7) ? (52) : (last_7));
+      int _mn_52 = ((52) < (last_7) ? (52) : (last_7));
       {
         uint32_t _bf16x2_bits_52;
         _bf16x2_bits_52 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_52) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_52) * 512 + d0_7);
         vec[52] = _bf16x2_bits_52;
       }
-      int _mn_0_53 = ((53) < (last_7) ? (53) : (last_7));
+      int _mn_53 = ((53) < (last_7) ? (53) : (last_7));
       {
         uint32_t _bf16x2_bits_53;
         _bf16x2_bits_53 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_53) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_53) * 512 + d0_7);
         vec[53] = _bf16x2_bits_53;
       }
-      int _mn_0_54 = ((54) < (last_7) ? (54) : (last_7));
+      int _mn_54 = ((54) < (last_7) ? (54) : (last_7));
       {
         uint32_t _bf16x2_bits_54;
         _bf16x2_bits_54 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_54) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_54) * 512 + d0_7);
         vec[54] = _bf16x2_bits_54;
       }
-      int _mn_0_55 = ((55) < (last_7) ? (55) : (last_7));
+      int _mn_55 = ((55) < (last_7) ? (55) : (last_7));
       {
         uint32_t _bf16x2_bits_55;
         _bf16x2_bits_55 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_55) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_55) * 512 + d0_7);
         vec[55] = _bf16x2_bits_55;
       }
-      int _mn_0_56 = ((56) < (last_7) ? (56) : (last_7));
+      int _mn_56 = ((56) < (last_7) ? (56) : (last_7));
       {
         uint32_t _bf16x2_bits_56;
         _bf16x2_bits_56 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_56) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_56) * 512 + d0_7);
         vec[56] = _bf16x2_bits_56;
       }
-      int _mn_0_57 = ((57) < (last_7) ? (57) : (last_7));
+      int _mn_57 = ((57) < (last_7) ? (57) : (last_7));
       {
         uint32_t _bf16x2_bits_57;
         _bf16x2_bits_57 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_57) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_57) * 512 + d0_7);
         vec[57] = _bf16x2_bits_57;
       }
-      int _mn_0_58 = ((58) < (last_7) ? (58) : (last_7));
+      int _mn_58 = ((58) < (last_7) ? (58) : (last_7));
       {
         uint32_t _bf16x2_bits_58;
         _bf16x2_bits_58 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_58) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_58) * 512 + d0_7);
         vec[58] = _bf16x2_bits_58;
       }
-      int _mn_0_59 = ((59) < (last_7) ? (59) : (last_7));
+      int _mn_59 = ((59) < (last_7) ? (59) : (last_7));
       {
         uint32_t _bf16x2_bits_59;
         _bf16x2_bits_59 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_59) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_59) * 512 + d0_7);
         vec[59] = _bf16x2_bits_59;
       }
-      int _mn_0_60 = ((60) < (last_7) ? (60) : (last_7));
+      int _mn_60 = ((60) < (last_7) ? (60) : (last_7));
       {
         uint32_t _bf16x2_bits_60;
         _bf16x2_bits_60 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_60) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_60) * 512 + d0_7);
         vec[60] = _bf16x2_bits_60;
       }
-      int _mn_0_61 = ((61) < (last_7) ? (61) : (last_7));
+      int _mn_61 = ((61) < (last_7) ? (61) : (last_7));
       {
         uint32_t _bf16x2_bits_61;
         _bf16x2_bits_61 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_61) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_61) * 512 + d0_7);
         vec[61] = _bf16x2_bits_61;
       }
-      int _mn_0_62 = ((62) < (last_7) ? (62) : (last_7));
+      int _mn_62 = ((62) < (last_7) ? (62) : (last_7));
       {
         uint32_t _bf16x2_bits_62;
         _bf16x2_bits_62 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_62) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_62) * 512 + d0_7);
         vec[62] = _bf16x2_bits_62;
       }
-      int _mn_0_63 = ((63) < (last_7) ? (63) : (last_7));
+      int _mn_63 = ((63) < (last_7) ? (63) : (last_7));
       {
         uint32_t _bf16x2_bits_63;
         _bf16x2_bits_63 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_63) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_63) * 512 + d0_7);
         vec[63] = _bf16x2_bits_63;
       }
       int merged = 0;
@@ -894,228 +894,228 @@ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void kernel_cake_rubin_mla_nvfp4_decod
         l1_1 = partial_lse[stat_base_7 + lane_7 + 32];
       }
       unsigned int vec_1[32];
-      int _mn_0_0_1 = ((0) < (last_7) ? (0) : (last_7));
+      int _mn_64 = ((0) < (last_7) ? (0) : (last_7));
       {
         uint32_t _bf16x2_bits_69;
         _bf16x2_bits_69 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_0_1) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_64) * 512 + d0_7);
         vec_1[0] = _bf16x2_bits_69;
       }
-      int _mn_0_1_1 = ((1) < (last_7) ? (1) : (last_7));
+      int _mn_65 = ((1) < (last_7) ? (1) : (last_7));
       {
         uint32_t _bf16x2_bits_70;
         _bf16x2_bits_70 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_1_1) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_65) * 512 + d0_7);
         vec_1[1] = _bf16x2_bits_70;
       }
-      int _mn_0_2_1 = ((2) < (last_7) ? (2) : (last_7));
+      int _mn_66 = ((2) < (last_7) ? (2) : (last_7));
       {
         uint32_t _bf16x2_bits_71;
         _bf16x2_bits_71 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_2_1) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_66) * 512 + d0_7);
         vec_1[2] = _bf16x2_bits_71;
       }
-      int _mn_0_3_1 = ((3) < (last_7) ? (3) : (last_7));
+      int _mn_67 = ((3) < (last_7) ? (3) : (last_7));
       {
         uint32_t _bf16x2_bits_72;
         _bf16x2_bits_72 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_3_1) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_67) * 512 + d0_7);
         vec_1[3] = _bf16x2_bits_72;
       }
-      int _mn_0_4_1 = ((4) < (last_7) ? (4) : (last_7));
+      int _mn_68 = ((4) < (last_7) ? (4) : (last_7));
       {
         uint32_t _bf16x2_bits_73;
         _bf16x2_bits_73 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_4_1) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_68) * 512 + d0_7);
         vec_1[4] = _bf16x2_bits_73;
       }
-      int _mn_0_5_1 = ((5) < (last_7) ? (5) : (last_7));
+      int _mn_69 = ((5) < (last_7) ? (5) : (last_7));
       {
         uint32_t _bf16x2_bits_74;
         _bf16x2_bits_74 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_5_1) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_69) * 512 + d0_7);
         vec_1[5] = _bf16x2_bits_74;
       }
-      int _mn_0_6_1 = ((6) < (last_7) ? (6) : (last_7));
+      int _mn_70 = ((6) < (last_7) ? (6) : (last_7));
       {
         uint32_t _bf16x2_bits_75;
         _bf16x2_bits_75 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_6_1) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_70) * 512 + d0_7);
         vec_1[6] = _bf16x2_bits_75;
       }
-      int _mn_0_7_1 = ((7) < (last_7) ? (7) : (last_7));
+      int _mn_71 = ((7) < (last_7) ? (7) : (last_7));
       {
         uint32_t _bf16x2_bits_76;
         _bf16x2_bits_76 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_7_1) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_71) * 512 + d0_7);
         vec_1[7] = _bf16x2_bits_76;
       }
-      int _mn_0_8_1 = ((8) < (last_7) ? (8) : (last_7));
+      int _mn_72 = ((8) < (last_7) ? (8) : (last_7));
       {
         uint32_t _bf16x2_bits_77;
         _bf16x2_bits_77 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_8_1) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_72) * 512 + d0_7);
         vec_1[8] = _bf16x2_bits_77;
       }
-      int _mn_0_9_1 = ((9) < (last_7) ? (9) : (last_7));
+      int _mn_73 = ((9) < (last_7) ? (9) : (last_7));
       {
         uint32_t _bf16x2_bits_78;
         _bf16x2_bits_78 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_9_1) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_73) * 512 + d0_7);
         vec_1[9] = _bf16x2_bits_78;
       }
-      int _mn_0_10_1 = ((10) < (last_7) ? (10) : (last_7));
+      int _mn_74 = ((10) < (last_7) ? (10) : (last_7));
       {
         uint32_t _bf16x2_bits_79;
         _bf16x2_bits_79 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_10_1) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_74) * 512 + d0_7);
         vec_1[10] = _bf16x2_bits_79;
       }
-      int _mn_0_11_1 = ((11) < (last_7) ? (11) : (last_7));
+      int _mn_75 = ((11) < (last_7) ? (11) : (last_7));
       {
         uint32_t _bf16x2_bits_80;
         _bf16x2_bits_80 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_11_1) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_75) * 512 + d0_7);
         vec_1[11] = _bf16x2_bits_80;
       }
-      int _mn_0_12_1 = ((12) < (last_7) ? (12) : (last_7));
+      int _mn_76 = ((12) < (last_7) ? (12) : (last_7));
       {
         uint32_t _bf16x2_bits_81;
         _bf16x2_bits_81 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_12_1) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_76) * 512 + d0_7);
         vec_1[12] = _bf16x2_bits_81;
       }
-      int _mn_0_13_1 = ((13) < (last_7) ? (13) : (last_7));
+      int _mn_77 = ((13) < (last_7) ? (13) : (last_7));
       {
         uint32_t _bf16x2_bits_82;
         _bf16x2_bits_82 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_13_1) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_77) * 512 + d0_7);
         vec_1[13] = _bf16x2_bits_82;
       }
-      int _mn_0_14_1 = ((14) < (last_7) ? (14) : (last_7));
+      int _mn_78 = ((14) < (last_7) ? (14) : (last_7));
       {
         uint32_t _bf16x2_bits_83;
         _bf16x2_bits_83 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_14_1) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_78) * 512 + d0_7);
         vec_1[14] = _bf16x2_bits_83;
       }
-      int _mn_0_15_1 = ((15) < (last_7) ? (15) : (last_7));
+      int _mn_79 = ((15) < (last_7) ? (15) : (last_7));
       {
         uint32_t _bf16x2_bits_84;
         _bf16x2_bits_84 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_15_1) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_79) * 512 + d0_7);
         vec_1[15] = _bf16x2_bits_84;
       }
-      int _mn_0_16_1 = ((16) < (last_7) ? (16) : (last_7));
+      int _mn_80 = ((16) < (last_7) ? (16) : (last_7));
       {
         uint32_t _bf16x2_bits_85;
         _bf16x2_bits_85 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_16_1) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_80) * 512 + d0_7);
         vec_1[16] = _bf16x2_bits_85;
       }
-      int _mn_0_17_1 = ((17) < (last_7) ? (17) : (last_7));
+      int _mn_81 = ((17) < (last_7) ? (17) : (last_7));
       {
         uint32_t _bf16x2_bits_86;
         _bf16x2_bits_86 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_17_1) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_81) * 512 + d0_7);
         vec_1[17] = _bf16x2_bits_86;
       }
-      int _mn_0_18_1 = ((18) < (last_7) ? (18) : (last_7));
+      int _mn_82 = ((18) < (last_7) ? (18) : (last_7));
       {
         uint32_t _bf16x2_bits_87;
         _bf16x2_bits_87 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_18_1) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_82) * 512 + d0_7);
         vec_1[18] = _bf16x2_bits_87;
       }
-      int _mn_0_19_1 = ((19) < (last_7) ? (19) : (last_7));
+      int _mn_83 = ((19) < (last_7) ? (19) : (last_7));
       {
         uint32_t _bf16x2_bits_88;
         _bf16x2_bits_88 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_19_1) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_83) * 512 + d0_7);
         vec_1[19] = _bf16x2_bits_88;
       }
-      int _mn_0_20_1 = ((20) < (last_7) ? (20) : (last_7));
+      int _mn_84 = ((20) < (last_7) ? (20) : (last_7));
       {
         uint32_t _bf16x2_bits_89;
         _bf16x2_bits_89 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_20_1) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_84) * 512 + d0_7);
         vec_1[20] = _bf16x2_bits_89;
       }
-      int _mn_0_21_1 = ((21) < (last_7) ? (21) : (last_7));
+      int _mn_85 = ((21) < (last_7) ? (21) : (last_7));
       {
         uint32_t _bf16x2_bits_90;
         _bf16x2_bits_90 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_21_1) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_85) * 512 + d0_7);
         vec_1[21] = _bf16x2_bits_90;
       }
-      int _mn_0_22_1 = ((22) < (last_7) ? (22) : (last_7));
+      int _mn_86 = ((22) < (last_7) ? (22) : (last_7));
       {
         uint32_t _bf16x2_bits_91;
         _bf16x2_bits_91 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_22_1) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_86) * 512 + d0_7);
         vec_1[22] = _bf16x2_bits_91;
       }
-      int _mn_0_23_1 = ((23) < (last_7) ? (23) : (last_7));
+      int _mn_87 = ((23) < (last_7) ? (23) : (last_7));
       {
         uint32_t _bf16x2_bits_92;
         _bf16x2_bits_92 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_23_1) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_87) * 512 + d0_7);
         vec_1[23] = _bf16x2_bits_92;
       }
-      int _mn_0_24_1 = ((24) < (last_7) ? (24) : (last_7));
+      int _mn_88 = ((24) < (last_7) ? (24) : (last_7));
       {
         uint32_t _bf16x2_bits_93;
         _bf16x2_bits_93 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_24_1) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_88) * 512 + d0_7);
         vec_1[24] = _bf16x2_bits_93;
       }
-      int _mn_0_25_1 = ((25) < (last_7) ? (25) : (last_7));
+      int _mn_89 = ((25) < (last_7) ? (25) : (last_7));
       {
         uint32_t _bf16x2_bits_94;
         _bf16x2_bits_94 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_25_1) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_89) * 512 + d0_7);
         vec_1[25] = _bf16x2_bits_94;
       }
-      int _mn_0_26_1 = ((26) < (last_7) ? (26) : (last_7));
+      int _mn_90 = ((26) < (last_7) ? (26) : (last_7));
       {
         uint32_t _bf16x2_bits_95;
         _bf16x2_bits_95 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_26_1) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_90) * 512 + d0_7);
         vec_1[26] = _bf16x2_bits_95;
       }
-      int _mn_0_27_1 = ((27) < (last_7) ? (27) : (last_7));
+      int _mn_91 = ((27) < (last_7) ? (27) : (last_7));
       {
         uint32_t _bf16x2_bits_96;
         _bf16x2_bits_96 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_27_1) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_91) * 512 + d0_7);
         vec_1[27] = _bf16x2_bits_96;
       }
-      int _mn_0_28_1 = ((28) < (last_7) ? (28) : (last_7));
+      int _mn_92 = ((28) < (last_7) ? (28) : (last_7));
       {
         uint32_t _bf16x2_bits_97;
         _bf16x2_bits_97 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_28_1) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_92) * 512 + d0_7);
         vec_1[28] = _bf16x2_bits_97;
       }
-      int _mn_0_29_1 = ((29) < (last_7) ? (29) : (last_7));
+      int _mn_93 = ((29) < (last_7) ? (29) : (last_7));
       {
         uint32_t _bf16x2_bits_98;
         _bf16x2_bits_98 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_29_1) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_93) * 512 + d0_7);
         vec_1[29] = _bf16x2_bits_98;
       }
-      int _mn_0_30_1 = ((30) < (last_7) ? (30) : (last_7));
+      int _mn_94 = ((30) < (last_7) ? (30) : (last_7));
       {
         uint32_t _bf16x2_bits_99;
         _bf16x2_bits_99 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_30_1) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_94) * 512 + d0_7);
         vec_1[30] = _bf16x2_bits_99;
       }
-      int _mn_0_31_1 = ((31) < (last_7) ? (31) : (last_7));
+      int _mn_95 = ((31) < (last_7) ? (31) : (last_7));
       {
         uint32_t _bf16x2_bits_100;
         _bf16x2_bits_100 =
-            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_0_31_1) * 512 + d0_7);
+            *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_95) * 512 + d0_7);
         vec_1[31] = _bf16x2_bits_100;
       }
       int merged_1 = 0;
@@ -1306,228 +1306,228 @@ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void kernel_cake_rubin_mla_nvfp4_decod
 #pragma unroll 1
       for (int bt = 1; bt < n_batches; bt++) {
         int k0 = bt * 32;
-        int _mn_1_0 = ((k0 + 0) < (last_7) ? (k0 + 0) : (last_7));
+        int _mn_96 = ((k0 + 0) < (last_7) ? (k0 + 0) : (last_7));
         {
           uint32_t _bf16x2_bits_105;
           _bf16x2_bits_105 =
-              *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_1_0) * 512 + d0_7);
+              *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_96) * 512 + d0_7);
           vec_1[0] = _bf16x2_bits_105;
         }
-        int _mn_1_1 = ((k0 + 1) < (last_7) ? (k0 + 1) : (last_7));
+        int _mn_97 = ((k0 + 1) < (last_7) ? (k0 + 1) : (last_7));
         {
           uint32_t _bf16x2_bits_106;
           _bf16x2_bits_106 =
-              *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_1_1) * 512 + d0_7);
+              *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_97) * 512 + d0_7);
           vec_1[1] = _bf16x2_bits_106;
         }
-        int _mn_1_2 = ((k0 + 2) < (last_7) ? (k0 + 2) : (last_7));
+        int _mn_98 = ((k0 + 2) < (last_7) ? (k0 + 2) : (last_7));
         {
           uint32_t _bf16x2_bits_107;
           _bf16x2_bits_107 =
-              *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_1_2) * 512 + d0_7);
+              *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_98) * 512 + d0_7);
           vec_1[2] = _bf16x2_bits_107;
         }
-        int _mn_1_3 = ((k0 + 3) < (last_7) ? (k0 + 3) : (last_7));
+        int _mn_99 = ((k0 + 3) < (last_7) ? (k0 + 3) : (last_7));
         {
           uint32_t _bf16x2_bits_108;
           _bf16x2_bits_108 =
-              *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_1_3) * 512 + d0_7);
+              *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_99) * 512 + d0_7);
           vec_1[3] = _bf16x2_bits_108;
         }
-        int _mn_1_4 = ((k0 + 4) < (last_7) ? (k0 + 4) : (last_7));
+        int _mn_100 = ((k0 + 4) < (last_7) ? (k0 + 4) : (last_7));
         {
           uint32_t _bf16x2_bits_109;
           _bf16x2_bits_109 =
-              *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_1_4) * 512 + d0_7);
+              *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_100) * 512 + d0_7);
           vec_1[4] = _bf16x2_bits_109;
         }
-        int _mn_1_5 = ((k0 + 5) < (last_7) ? (k0 + 5) : (last_7));
+        int _mn_101 = ((k0 + 5) < (last_7) ? (k0 + 5) : (last_7));
         {
           uint32_t _bf16x2_bits_110;
           _bf16x2_bits_110 =
-              *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_1_5) * 512 + d0_7);
+              *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_101) * 512 + d0_7);
           vec_1[5] = _bf16x2_bits_110;
         }
-        int _mn_1_6 = ((k0 + 6) < (last_7) ? (k0 + 6) : (last_7));
+        int _mn_102 = ((k0 + 6) < (last_7) ? (k0 + 6) : (last_7));
         {
           uint32_t _bf16x2_bits_111;
           _bf16x2_bits_111 =
-              *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_1_6) * 512 + d0_7);
+              *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_102) * 512 + d0_7);
           vec_1[6] = _bf16x2_bits_111;
         }
-        int _mn_1_7 = ((k0 + 7) < (last_7) ? (k0 + 7) : (last_7));
+        int _mn_103 = ((k0 + 7) < (last_7) ? (k0 + 7) : (last_7));
         {
           uint32_t _bf16x2_bits_112;
           _bf16x2_bits_112 =
-              *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_1_7) * 512 + d0_7);
+              *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_103) * 512 + d0_7);
           vec_1[7] = _bf16x2_bits_112;
         }
-        int _mn_1_8 = ((k0 + 8) < (last_7) ? (k0 + 8) : (last_7));
+        int _mn_104 = ((k0 + 8) < (last_7) ? (k0 + 8) : (last_7));
         {
           uint32_t _bf16x2_bits_113;
           _bf16x2_bits_113 =
-              *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_1_8) * 512 + d0_7);
+              *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_104) * 512 + d0_7);
           vec_1[8] = _bf16x2_bits_113;
         }
-        int _mn_1_9 = ((k0 + 9) < (last_7) ? (k0 + 9) : (last_7));
+        int _mn_105 = ((k0 + 9) < (last_7) ? (k0 + 9) : (last_7));
         {
           uint32_t _bf16x2_bits_114;
           _bf16x2_bits_114 =
-              *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_1_9) * 512 + d0_7);
+              *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_105) * 512 + d0_7);
           vec_1[9] = _bf16x2_bits_114;
         }
-        int _mn_1_10 = ((k0 + 10) < (last_7) ? (k0 + 10) : (last_7));
+        int _mn_106 = ((k0 + 10) < (last_7) ? (k0 + 10) : (last_7));
         {
           uint32_t _bf16x2_bits_115;
           _bf16x2_bits_115 =
-              *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_1_10) * 512 + d0_7);
+              *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_106) * 512 + d0_7);
           vec_1[10] = _bf16x2_bits_115;
         }
-        int _mn_1_11 = ((k0 + 11) < (last_7) ? (k0 + 11) : (last_7));
+        int _mn_107 = ((k0 + 11) < (last_7) ? (k0 + 11) : (last_7));
         {
           uint32_t _bf16x2_bits_116;
           _bf16x2_bits_116 =
-              *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_1_11) * 512 + d0_7);
+              *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_107) * 512 + d0_7);
           vec_1[11] = _bf16x2_bits_116;
         }
-        int _mn_1_12 = ((k0 + 12) < (last_7) ? (k0 + 12) : (last_7));
+        int _mn_108 = ((k0 + 12) < (last_7) ? (k0 + 12) : (last_7));
         {
           uint32_t _bf16x2_bits_117;
           _bf16x2_bits_117 =
-              *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_1_12) * 512 + d0_7);
+              *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_108) * 512 + d0_7);
           vec_1[12] = _bf16x2_bits_117;
         }
-        int _mn_1_13 = ((k0 + 13) < (last_7) ? (k0 + 13) : (last_7));
+        int _mn_109 = ((k0 + 13) < (last_7) ? (k0 + 13) : (last_7));
         {
           uint32_t _bf16x2_bits_118;
           _bf16x2_bits_118 =
-              *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_1_13) * 512 + d0_7);
+              *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_109) * 512 + d0_7);
           vec_1[13] = _bf16x2_bits_118;
         }
-        int _mn_1_14 = ((k0 + 14) < (last_7) ? (k0 + 14) : (last_7));
+        int _mn_110 = ((k0 + 14) < (last_7) ? (k0 + 14) : (last_7));
         {
           uint32_t _bf16x2_bits_119;
           _bf16x2_bits_119 =
-              *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_1_14) * 512 + d0_7);
+              *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_110) * 512 + d0_7);
           vec_1[14] = _bf16x2_bits_119;
         }
-        int _mn_1_15 = ((k0 + 15) < (last_7) ? (k0 + 15) : (last_7));
+        int _mn_111 = ((k0 + 15) < (last_7) ? (k0 + 15) : (last_7));
         {
           uint32_t _bf16x2_bits_120;
           _bf16x2_bits_120 =
-              *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_1_15) * 512 + d0_7);
+              *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_111) * 512 + d0_7);
           vec_1[15] = _bf16x2_bits_120;
         }
-        int _mn_1_16 = ((k0 + 16) < (last_7) ? (k0 + 16) : (last_7));
+        int _mn_112 = ((k0 + 16) < (last_7) ? (k0 + 16) : (last_7));
         {
           uint32_t _bf16x2_bits_121;
           _bf16x2_bits_121 =
-              *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_1_16) * 512 + d0_7);
+              *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_112) * 512 + d0_7);
           vec_1[16] = _bf16x2_bits_121;
         }
-        int _mn_1_17 = ((k0 + 17) < (last_7) ? (k0 + 17) : (last_7));
+        int _mn_113 = ((k0 + 17) < (last_7) ? (k0 + 17) : (last_7));
         {
           uint32_t _bf16x2_bits_122;
           _bf16x2_bits_122 =
-              *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_1_17) * 512 + d0_7);
+              *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_113) * 512 + d0_7);
           vec_1[17] = _bf16x2_bits_122;
         }
-        int _mn_1_18 = ((k0 + 18) < (last_7) ? (k0 + 18) : (last_7));
+        int _mn_114 = ((k0 + 18) < (last_7) ? (k0 + 18) : (last_7));
         {
           uint32_t _bf16x2_bits_123;
           _bf16x2_bits_123 =
-              *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_1_18) * 512 + d0_7);
+              *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_114) * 512 + d0_7);
           vec_1[18] = _bf16x2_bits_123;
         }
-        int _mn_1_19 = ((k0 + 19) < (last_7) ? (k0 + 19) : (last_7));
+        int _mn_115 = ((k0 + 19) < (last_7) ? (k0 + 19) : (last_7));
         {
           uint32_t _bf16x2_bits_124;
           _bf16x2_bits_124 =
-              *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_1_19) * 512 + d0_7);
+              *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_115) * 512 + d0_7);
           vec_1[19] = _bf16x2_bits_124;
         }
-        int _mn_1_20 = ((k0 + 20) < (last_7) ? (k0 + 20) : (last_7));
+        int _mn_116 = ((k0 + 20) < (last_7) ? (k0 + 20) : (last_7));
         {
           uint32_t _bf16x2_bits_125;
           _bf16x2_bits_125 =
-              *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_1_20) * 512 + d0_7);
+              *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_116) * 512 + d0_7);
           vec_1[20] = _bf16x2_bits_125;
         }
-        int _mn_1_21 = ((k0 + 21) < (last_7) ? (k0 + 21) : (last_7));
+        int _mn_117 = ((k0 + 21) < (last_7) ? (k0 + 21) : (last_7));
         {
           uint32_t _bf16x2_bits_126;
           _bf16x2_bits_126 =
-              *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_1_21) * 512 + d0_7);
+              *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_117) * 512 + d0_7);
           vec_1[21] = _bf16x2_bits_126;
         }
-        int _mn_1_22 = ((k0 + 22) < (last_7) ? (k0 + 22) : (last_7));
+        int _mn_118 = ((k0 + 22) < (last_7) ? (k0 + 22) : (last_7));
         {
           uint32_t _bf16x2_bits_127;
           _bf16x2_bits_127 =
-              *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_1_22) * 512 + d0_7);
+              *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_118) * 512 + d0_7);
           vec_1[22] = _bf16x2_bits_127;
         }
-        int _mn_1_23 = ((k0 + 23) < (last_7) ? (k0 + 23) : (last_7));
+        int _mn_119 = ((k0 + 23) < (last_7) ? (k0 + 23) : (last_7));
         {
           uint32_t _bf16x2_bits_128;
           _bf16x2_bits_128 =
-              *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_1_23) * 512 + d0_7);
+              *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_119) * 512 + d0_7);
           vec_1[23] = _bf16x2_bits_128;
         }
-        int _mn_1_24 = ((k0 + 24) < (last_7) ? (k0 + 24) : (last_7));
+        int _mn_120 = ((k0 + 24) < (last_7) ? (k0 + 24) : (last_7));
         {
           uint32_t _bf16x2_bits_129;
           _bf16x2_bits_129 =
-              *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_1_24) * 512 + d0_7);
+              *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_120) * 512 + d0_7);
           vec_1[24] = _bf16x2_bits_129;
         }
-        int _mn_1_25 = ((k0 + 25) < (last_7) ? (k0 + 25) : (last_7));
+        int _mn_121 = ((k0 + 25) < (last_7) ? (k0 + 25) : (last_7));
         {
           uint32_t _bf16x2_bits_130;
           _bf16x2_bits_130 =
-              *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_1_25) * 512 + d0_7);
+              *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_121) * 512 + d0_7);
           vec_1[25] = _bf16x2_bits_130;
         }
-        int _mn_1_26 = ((k0 + 26) < (last_7) ? (k0 + 26) : (last_7));
+        int _mn_122 = ((k0 + 26) < (last_7) ? (k0 + 26) : (last_7));
         {
           uint32_t _bf16x2_bits_131;
           _bf16x2_bits_131 =
-              *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_1_26) * 512 + d0_7);
+              *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_122) * 512 + d0_7);
           vec_1[26] = _bf16x2_bits_131;
         }
-        int _mn_1_27 = ((k0 + 27) < (last_7) ? (k0 + 27) : (last_7));
+        int _mn_123 = ((k0 + 27) < (last_7) ? (k0 + 27) : (last_7));
         {
           uint32_t _bf16x2_bits_132;
           _bf16x2_bits_132 =
-              *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_1_27) * 512 + d0_7);
+              *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_123) * 512 + d0_7);
           vec_1[27] = _bf16x2_bits_132;
         }
-        int _mn_1_28 = ((k0 + 28) < (last_7) ? (k0 + 28) : (last_7));
+        int _mn_124 = ((k0 + 28) < (last_7) ? (k0 + 28) : (last_7));
         {
           uint32_t _bf16x2_bits_133;
           _bf16x2_bits_133 =
-              *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_1_28) * 512 + d0_7);
+              *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_124) * 512 + d0_7);
           vec_1[28] = _bf16x2_bits_133;
         }
-        int _mn_1_29 = ((k0 + 29) < (last_7) ? (k0 + 29) : (last_7));
+        int _mn_125 = ((k0 + 29) < (last_7) ? (k0 + 29) : (last_7));
         {
           uint32_t _bf16x2_bits_134;
           _bf16x2_bits_134 =
-              *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_1_29) * 512 + d0_7);
+              *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_125) * 512 + d0_7);
           vec_1[29] = _bf16x2_bits_134;
         }
-        int _mn_1_30 = ((k0 + 30) < (last_7) ? (k0 + 30) : (last_7));
+        int _mn_126 = ((k0 + 30) < (last_7) ? (k0 + 30) : (last_7));
         {
           uint32_t _bf16x2_bits_135;
           _bf16x2_bits_135 =
-              *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_1_30) * 512 + d0_7);
+              *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_126) * 512 + d0_7);
           vec_1[30] = _bf16x2_bits_135;
         }
-        int _mn_1_31 = ((k0 + 31) < (last_7) ? (k0 + 31) : (last_7));
+        int _mn_127 = ((k0 + 31) < (last_7) ? (k0 + 31) : (last_7));
         {
           uint32_t _bf16x2_bits_136;
           _bf16x2_bits_136 =
-              *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_1_31) * 512 + d0_7);
+              *reinterpret_cast<const uint32_t*>(partial_o + (stat_base_7 + _mn_127) * 512 + d0_7);
           vec_1[31] = _bf16x2_bits_136;
         }
         wts_1[0] = smem_w[w_base_7 + (k0 + 0)];

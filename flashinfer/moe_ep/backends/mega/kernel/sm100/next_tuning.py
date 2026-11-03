@@ -38,7 +38,10 @@ def tune_one(args, rank, world_size, max_tokens):
         pkg.Sm100GenphaseMoeConfig if genphase else pkg.Sm100BlockScaledMoeConfig
     )
     options = (
-        {}
+        dict(
+            quant_kind=args.dtype,
+            apply_routing_weights_before_fc2=args.apply_routing_weights_before_fc2,
+        )
         if genphase
         else dict(
             quant_kind=args.dtype,
@@ -84,10 +87,12 @@ def tune_one(args, rank, world_size, max_tokens):
             cfg, sm_count=sms, live_tokens=live, constraints=constraints
         )
         if genphase
-        else sm100_schedule_candidates(base, cfg)
-        if args.sweep == "schedule"
-        else sm100_standard_candidates(
-            cfg, allow_nondeterministic=args.allow_nondeterministic
+        else (
+            sm100_schedule_candidates(base, cfg)
+            if args.sweep == "schedule"
+            else sm100_standard_candidates(
+                cfg, allow_nondeterministic=args.allow_nondeterministic
+            )
         )
     )
     workspace_type = (
@@ -138,7 +143,7 @@ def tune_one(args, rank, world_size, max_tokens):
         )
         weights = torch.rand(live, args.topk, device="cuda", generator=generator) + 0.5
         tensors = MoEEpTensors(hidden_states=x, topk_ids=ids, topk_weights=weights)
-        if genphase:
+        if genphase and args.dtype != "nvfp4":
             stage_genphase_inputs(tensors, workspace, quantize_input=True)
         else:
             from .nvfp4_nvfp4_bf16_cutedsl import staging as nvfp4_staging
@@ -209,12 +214,13 @@ def run_tuning(args):
     from flashinfer.autotuner import AutoTuner
 
     if args.kernel_variant == "genphase" and (
-        args.dtype != "mxfp8_e4m3"
-        or args.combine_dtype != "bf16"
+        args.combine_dtype != "bf16"
         or args.allow_nondeterministic
+        or not args.do_finalize
+        or args.activation != "swiglu"
     ):
         raise ValueError(
-            "Blackwell GenPhase requires MXFP8 E4M3, BF16 combine and deterministic reduction"
+            "Blackwell GenPhase requires SwiGLU and separate BF16 finalization"
         )
     rank, world_size = (
         int(os.environ.get("RANK", "0")),

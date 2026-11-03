@@ -265,6 +265,18 @@ __device__ __forceinline__ void tma_gather4_gmem2smem(
         :: "r"(dst), "l"(tmap_ptr), "r"(col_idx),
            "r"(row0), "r"(row1), "r"(row2), "r"(row3),
            "r"(mbar_addr) : "memory");
+#if __CUDA_ARCH__ == 1030
+#else
+}
+
+
+__device__ __forceinline__ void tma_store_4d(
+    const void *tmap, int x, int y, int z, int w, unsigned smem_addr) {
+    asm volatile(
+        "cp.async.bulk.tensor.4d.global.shared::cta.tile.bulk_group"
+        " [%0, {%1, %2, %3, %4}], [%5];"
+        :: "l"(tmap), "r"(x), "r"(y), "r"(z), "r"(w), "r"(smem_addr) : "memory");
+#endif
 }
 
 
@@ -279,7 +291,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS) void
-kernel_cake_dsv4_82ca6fee14338e07ece4(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ CUtensorMap tmap_swa_kv, const __grid_constant__ CUtensorMap tmap_compressed_kv, __nv_bfloat16* __restrict__ partial_O, float* __restrict__ partial_lse, int* __restrict__ swa_indices, int* __restrict__ compressed_indices, int* __restrict__ sparse_topk_lens, int* __restrict__ seq_lens, int* __restrict__ cum_seq_lens_q, float* __restrict__ sinks, float* __restrict__ bmm1_scale, float* __restrict__ bmm2_scale, int num_heads, int swa_index_stride, int compressed_index_stride, int sparse_topk_lens_offset, int sparse_topk, int num_splits, int has_sinks, int ragged_query, int max_q_len, int batch_size)
+kernel_cake_dsv4_82ca6fee14338e07ece4(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ CUtensorMap tmap_swa_kv, const __grid_constant__ CUtensorMap tmap_compressed_kv, __nv_bfloat16* __restrict__ partial_O, float* __restrict__ partial_lse, int* __restrict__ swa_indices, int* __restrict__ compressed_indices, int* __restrict__ sparse_topk_lens, int* __restrict__ seq_lens, int* __restrict__ cum_seq_lens_q, float* __restrict__ sinks, float* __restrict__ bmm1_scale, float* __restrict__ bmm2_scale, int num_heads, int swa_index_stride, int compressed_index_stride, int sparse_topk_lens_offset, int sparse_topk, int num_splits, int has_sinks, int ragged_query, int max_q_len, int batch_size, const __grid_constant__ CUtensorMap tmap_pO)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -661,7 +673,11 @@ kernel_cake_dsv4_82ca6fee14338e07ece4(const __grid_constant__ CUtensorMap tmap_q
             float inv_sum = ((row_sum_1 > 0.0f) ? _rcp_0 : 0.0f);
             int col_base = col_half_1 * 64;
             int output_base = ((query_idx_1 * num_heads + my_row_1) * num_splits + split_idx_1) * 512;
+#if __CUDA_ARCH__ == 1030
             const int line_swizzle = (lane & 3) << 1 | lane >> 2 & 1;
+#else
+            const int line_swizzle = lane & 7;
+#endif
             const int line_sector = lane & 3;
             unsigned int _phase_o_done_0_0 = 0;
             unsigned int _phase_o_done_1_0 = 0;
@@ -878,7 +894,12 @@ kernel_cake_dsv4_82ca6fee14338e07ece4(const __grid_constant__ CUtensorMap tmap_q
                     asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(line_stage + (unsigned int)(lane * 128 + (line_swizzle ^ 5) * 16)), "r"(_packed_0[20]), "r"(_packed_0[21]), "r"(_packed_0[22]), "r"(_packed_0[23]) : "memory");
                     asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(line_stage + (unsigned int)(lane * 128 + (line_swizzle ^ 6) * 16)), "r"(_packed_0[24]), "r"(_packed_0[25]), "r"(_packed_0[26]), "r"(_packed_0[27]) : "memory");
                     asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(line_stage + (unsigned int)(lane * 128 + (line_swizzle ^ 7) * 16)), "r"(_packed_0[28]), "r"(_packed_0[29]), "r"(_packed_0[30]), "r"(_packed_0[31]) : "memory");
+#if __CUDA_ARCH__ == 1030
+#else
+                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+#endif
                     __syncwarp();
+#if __CUDA_ARCH__ == 1030
                     #pragma unroll
                     for (int line = 0; line < 4; line++) {
                         int src_lane = lane & -4 | line;
@@ -899,12 +920,24 @@ kernel_cake_dsv4_82ca6fee14338e07ece4(const __grid_constant__ CUtensorMap tmap_q
                                     :: "l"((void*)(partial_O + (((query_idx_1 * num_heads + src_row) * num_splits + split_idx_1) * 512 + v_owner * 256 + v_half * 128 + (src_lane >> 4) * 64 + line_sector * 16))), "r"(_raw_stv8_2[0]), "r"(_raw_stv8_2[1]), "r"(_raw_stv8_2[2]), "r"(_raw_stv8_2[3]), "r"(_raw_stv8_2[4]), "r"(_raw_stv8_2[5]), "r"(_raw_stv8_2[6]), "r"(_raw_stv8_2[7]) : "memory");
                             }
                         }
+#else
+                    if (lane == 0) {
+                        tma_store_4d((&tmap_pO), v_owner * 256 + v_half * 128, split_idx_1, logical_row_origin_1, query_idx_1, line_stage + 0);
+                        tma_store_4d((&tmap_pO), v_owner * 256 + v_half * 128 + 64, split_idx_1, logical_row_origin_1, query_idx_1, line_stage + 2048);
+                        asm volatile("cp.async.bulk.commit_group;");
+#endif
                     }
                 }
             }
             if (v_owner == 0 && my_row_1 < num_heads && col_half_1 == 0) {
                 int lse_offset = (query_idx_1 * num_heads + my_row_1) * num_splits + split_idx_1;
                 partial_lse[lse_offset] = smem_lse[my_row_1];
+#if __CUDA_ARCH__ == 1030
+#else
+            }
+            if (lane == 0) {
+                asm volatile("cp.async.bulk.wait_group 0;");
+#endif
             }
         }
     }

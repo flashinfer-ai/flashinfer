@@ -323,7 +323,17 @@ def main():
                 native_value = (dw2 @ ndmid[0]).bfloat16().float()
                 expected_n[token] += native_value * scores[token, slot]
             else:
-                expected_n[token] += value * scores[token, slot]
+                # SM12x uses BF16 epilogues in both GEMMs: activation is
+                # narrowed before Q1, and FC2 narrows before route weighting.
+                # Each weighted contribution is then narrowed for BF16 atomics.
+                nmid = _activation(u, g, activation).bfloat16()
+                nq, ns = quant(nmid[None])
+                ndmid = nq.double() * ns.double().repeat_interleave(128, 1)
+                native_value = (dw2 @ ndmid[0]).bfloat16().float()
+                contribution = (native_value * scores[token, slot]).bfloat16()
+                # Use ordered FP32 accumulation for the reference; the fixed
+                # tolerance covers the kernel's nondeterministic BF16 atomics.
+                expected_n[token] += contribution.float()
     expected_f = expected_f.bfloat16()
     expected_n = expected_n.bfloat16()
 
@@ -347,7 +357,7 @@ def main():
         native_numerical_contract=(
             "CUTLASS BF16 GEMM1 output, BF16 activation output before dynamic quant, BF16 GEMM2 partial then FP32 ordered combine; quant multiplier 448/amax and reciprocal scale, zero multiplier=1"
             if arch == (9, 0)
-            else "SM120 FP32 preactivation and FP32 expert before BF16 atomic combine"
+            else "SM120 FP32 preactivation, BF16 activation before Q1 quantization, BF16 FC2 output before route weighting, BF16 weighted contribution and atomic combine; reference sums contributions in FP32 before final BF16"
         ),
         reference_boundary_delta=err(expected_f, expected_n)
         if native_available

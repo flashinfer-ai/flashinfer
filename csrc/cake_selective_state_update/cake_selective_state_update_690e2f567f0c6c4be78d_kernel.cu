@@ -355,6 +355,10 @@ kernel_cake_selective_state_update_690e2f567f0c6c4be78d(const __grid_constant__ 
                 float d_value = s_scalars[32 + head_offset];
                 int x_row = head_offset * 256 + row_in_stage;
                 int out_row = (token_base * 64 + head) * 128 + row_in_stage;
+#if __CUDA_ARCH__ == 1030
+                int ring_base = (int)((unsigned int)head_offset % 3) * 4;
+#else
+#endif
                 #pragma unroll
                 for (int stage = 0; stage < 4; stage++) {
                     int ring_stage = stage + 4 * (int)((unsigned int)head_offset % 3);
@@ -366,10 +370,18 @@ kernel_cake_selective_state_update_690e2f567f0c6c4be78d(const __grid_constant__ 
                     if (pad_tile == 0) {
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                             : "=r"(*reinterpret_cast<uint32_t*>(&state_carriers[0])), "=r"(*reinterpret_cast<uint32_t*>(&state_carriers[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&state_carriers[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&state_carriers[(0) + 3]))
+#if __CUDA_ARCH__ == 1030
+                            : "r"(s_state_addr + (unsigned int)((ring_base + stage) * 8192) + (unsigned int)(row_in_stage * 256) + (unsigned int)(member * 16)));
+#else
                             : "r"(s_state_addr + (unsigned int)(ring_stage * 8192) + (unsigned int)(row_in_stage * 256) + (unsigned int)(member * 16)));
+#endif
                         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                             : "=r"(*reinterpret_cast<uint32_t*>(&state_carriers[4])), "=r"(*reinterpret_cast<uint32_t*>(&state_carriers[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&state_carriers[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&state_carriers[(4) + 3]))
+#if __CUDA_ARCH__ == 1030
+                            : "r"(s_state_addr + (unsigned int)((ring_base + stage) * 8192) + (unsigned int)(row_in_stage * 256) + (unsigned int)(member * 16) + 128));
+#else
                             : "r"(s_state_addr + (unsigned int)(ring_stage * 8192) + (unsigned int)(row_in_stage * 256) + (unsigned int)(member * 16) + 128));
+#endif
                     } else {
                         state_carriers[0] = 0;
                         state_carriers[1] = 0;
@@ -399,12 +411,12 @@ kernel_cake_selective_state_update_690e2f567f0c6c4be78d(const __grid_constant__ 
                         (&c_values[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(c_carriers[_pair]) & 0xffff0000u);
                     }
                     float2 _f2_0 = make_float2(state_values[0], state_values[1]);
-                    float2 _f2_1 = make_float2(b_values[0], b_values[1]);
-                    float2 _f2_2 = make_float2(c_values[0], c_values[1]);
-                    float2 next_state_pair = fma_f32x2_rn_ftz(_f2_0, decay_pair, mul_f32x2(_f2_1, dtx_pair));
-                    projection_pair = fma_f32x2_rn_ftz(next_state_pair, _f2_2, projection_pair);
-                    state_values[0] = next_state_pair.x;
-                    state_values[1] = next_state_pair.y;
+                    float2 _f2_1_0 = make_float2(b_values[0], b_values[1]);
+                    float2 _f2_2_0 = make_float2(c_values[0], c_values[1]);
+                    float2 next_state_pair_0 = fma_f32x2_rn_ftz(_f2_0, decay_pair, mul_f32x2(_f2_1_0, dtx_pair));
+                    projection_pair = fma_f32x2_rn_ftz(next_state_pair_0, _f2_2_0, projection_pair);
+                    state_values[0] = next_state_pair_0.x;
+                    state_values[1] = next_state_pair_0.y;
                     #pragma unroll
                     for (int _pair = 0; _pair < 1; _pair++) {
                         (&b_values[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(b_carriers[1 + _pair]) << 16);
@@ -416,12 +428,12 @@ kernel_cake_selective_state_update_690e2f567f0c6c4be78d(const __grid_constant__ 
                         (&c_values[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(c_carriers[1 + _pair]) & 0xffff0000u);
                     }
                     float2 _f2_3 = make_float2(state_values[2], state_values[3]);
-                    float2 _f2_4 = make_float2(b_values[0], b_values[1]);
-                    float2 _f2_5 = make_float2(c_values[0], c_values[1]);
-                    float2 next_state_pair_0 = fma_f32x2_rn_ftz(_f2_3, decay_pair, mul_f32x2(_f2_4, dtx_pair));
-                    projection_pair = fma_f32x2_rn_ftz(next_state_pair_0, _f2_5, projection_pair);
-                    state_values[2] = next_state_pair_0.x;
-                    state_values[3] = next_state_pair_0.y;
+                    float2 _f2_1_1 = make_float2(b_values[0], b_values[1]);
+                    float2 _f2_2_1 = make_float2(c_values[0], c_values[1]);
+                    float2 next_state_pair_1 = fma_f32x2_rn_ftz(_f2_3, decay_pair, mul_f32x2(_f2_1_1, dtx_pair));
+                    projection_pair = fma_f32x2_rn_ftz(next_state_pair_1, _f2_2_1, projection_pair);
+                    state_values[2] = next_state_pair_1.x;
+                    state_values[3] = next_state_pair_1.y;
                     #pragma unroll
                     for (int _pair = 0; _pair < 1; _pair++) {
                         (&b_values[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(b_carriers[2 + _pair]) << 16);
@@ -432,13 +444,13 @@ kernel_cake_selective_state_update_690e2f567f0c6c4be78d(const __grid_constant__ 
                         (&c_values[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(c_carriers[2 + _pair]) << 16);
                         (&c_values[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(c_carriers[2 + _pair]) & 0xffff0000u);
                     }
-                    float2 _f2_6 = make_float2(state_values[4], state_values[5]);
-                    float2 _f2_7 = make_float2(b_values[0], b_values[1]);
-                    float2 _f2_8 = make_float2(c_values[0], c_values[1]);
-                    float2 next_state_pair_1 = fma_f32x2_rn_ftz(_f2_6, decay_pair, mul_f32x2(_f2_7, dtx_pair));
-                    projection_pair = fma_f32x2_rn_ftz(next_state_pair_1, _f2_8, projection_pair);
-                    state_values[4] = next_state_pair_1.x;
-                    state_values[5] = next_state_pair_1.y;
+                    float2 _f2_4 = make_float2(state_values[4], state_values[5]);
+                    float2 _f2_1_2 = make_float2(b_values[0], b_values[1]);
+                    float2 _f2_2_2 = make_float2(c_values[0], c_values[1]);
+                    float2 next_state_pair_2 = fma_f32x2_rn_ftz(_f2_4, decay_pair, mul_f32x2(_f2_1_2, dtx_pair));
+                    projection_pair = fma_f32x2_rn_ftz(next_state_pair_2, _f2_2_2, projection_pair);
+                    state_values[4] = next_state_pair_2.x;
+                    state_values[5] = next_state_pair_2.y;
                     #pragma unroll
                     for (int _pair = 0; _pair < 1; _pair++) {
                         (&b_values[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(b_carriers[3 + _pair]) << 16);
@@ -449,13 +461,13 @@ kernel_cake_selective_state_update_690e2f567f0c6c4be78d(const __grid_constant__ 
                         (&c_values[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(c_carriers[3 + _pair]) << 16);
                         (&c_values[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(c_carriers[3 + _pair]) & 0xffff0000u);
                     }
-                    float2 _f2_9 = make_float2(state_values[6], state_values[7]);
-                    float2 _f2_10 = make_float2(b_values[0], b_values[1]);
-                    float2 _f2_11 = make_float2(c_values[0], c_values[1]);
-                    float2 next_state_pair_2 = fma_f32x2_rn_ftz(_f2_9, decay_pair, mul_f32x2(_f2_10, dtx_pair));
-                    projection_pair = fma_f32x2_rn_ftz(next_state_pair_2, _f2_11, projection_pair);
-                    state_values[6] = next_state_pair_2.x;
-                    state_values[7] = next_state_pair_2.y;
+                    float2 _f2_5 = make_float2(state_values[6], state_values[7]);
+                    float2 _f2_1_3 = make_float2(b_values[0], b_values[1]);
+                    float2 _f2_2_3 = make_float2(c_values[0], c_values[1]);
+                    float2 next_state_pair_3 = fma_f32x2_rn_ftz(_f2_5, decay_pair, mul_f32x2(_f2_1_3, dtx_pair));
+                    projection_pair = fma_f32x2_rn_ftz(next_state_pair_3, _f2_2_3, projection_pair);
+                    state_values[6] = next_state_pair_3.x;
+                    state_values[7] = next_state_pair_3.y;
                     #pragma unroll
                     for (int _pair = 0; _pair < 1; _pair++) {
                         (&b_values[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(b_carriers[4 + _pair]) << 16);
@@ -466,13 +478,13 @@ kernel_cake_selective_state_update_690e2f567f0c6c4be78d(const __grid_constant__ 
                         (&c_values[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(c_carriers[4 + _pair]) << 16);
                         (&c_values[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(c_carriers[4 + _pair]) & 0xffff0000u);
                     }
-                    float2 _f2_12 = make_float2(state_values[8], state_values[9]);
-                    float2 _f2_13 = make_float2(b_values[0], b_values[1]);
-                    float2 _f2_14 = make_float2(c_values[0], c_values[1]);
-                    float2 next_state_pair_3 = fma_f32x2_rn_ftz(_f2_12, decay_pair, mul_f32x2(_f2_13, dtx_pair));
-                    projection_pair = fma_f32x2_rn_ftz(next_state_pair_3, _f2_14, projection_pair);
-                    state_values[8] = next_state_pair_3.x;
-                    state_values[9] = next_state_pair_3.y;
+                    float2 _f2_6 = make_float2(state_values[8], state_values[9]);
+                    float2 _f2_1_4 = make_float2(b_values[0], b_values[1]);
+                    float2 _f2_2_4 = make_float2(c_values[0], c_values[1]);
+                    float2 next_state_pair_4 = fma_f32x2_rn_ftz(_f2_6, decay_pair, mul_f32x2(_f2_1_4, dtx_pair));
+                    projection_pair = fma_f32x2_rn_ftz(next_state_pair_4, _f2_2_4, projection_pair);
+                    state_values[8] = next_state_pair_4.x;
+                    state_values[9] = next_state_pair_4.y;
                     #pragma unroll
                     for (int _pair = 0; _pair < 1; _pair++) {
                         (&b_values[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(b_carriers[5 + _pair]) << 16);
@@ -483,13 +495,13 @@ kernel_cake_selective_state_update_690e2f567f0c6c4be78d(const __grid_constant__ 
                         (&c_values[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(c_carriers[5 + _pair]) << 16);
                         (&c_values[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(c_carriers[5 + _pair]) & 0xffff0000u);
                     }
-                    float2 _f2_15 = make_float2(state_values[10], state_values[11]);
-                    float2 _f2_16 = make_float2(b_values[0], b_values[1]);
-                    float2 _f2_17 = make_float2(c_values[0], c_values[1]);
-                    float2 next_state_pair_4 = fma_f32x2_rn_ftz(_f2_15, decay_pair, mul_f32x2(_f2_16, dtx_pair));
-                    projection_pair = fma_f32x2_rn_ftz(next_state_pair_4, _f2_17, projection_pair);
-                    state_values[10] = next_state_pair_4.x;
-                    state_values[11] = next_state_pair_4.y;
+                    float2 _f2_7 = make_float2(state_values[10], state_values[11]);
+                    float2 _f2_1_5 = make_float2(b_values[0], b_values[1]);
+                    float2 _f2_2_5 = make_float2(c_values[0], c_values[1]);
+                    float2 next_state_pair_5 = fma_f32x2_rn_ftz(_f2_7, decay_pair, mul_f32x2(_f2_1_5, dtx_pair));
+                    projection_pair = fma_f32x2_rn_ftz(next_state_pair_5, _f2_2_5, projection_pair);
+                    state_values[10] = next_state_pair_5.x;
+                    state_values[11] = next_state_pair_5.y;
                     #pragma unroll
                     for (int _pair = 0; _pair < 1; _pair++) {
                         (&b_values[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(b_carriers[6 + _pair]) << 16);
@@ -500,13 +512,13 @@ kernel_cake_selective_state_update_690e2f567f0c6c4be78d(const __grid_constant__ 
                         (&c_values[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(c_carriers[6 + _pair]) << 16);
                         (&c_values[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(c_carriers[6 + _pair]) & 0xffff0000u);
                     }
-                    float2 _f2_18 = make_float2(state_values[12], state_values[13]);
-                    float2 _f2_19 = make_float2(b_values[0], b_values[1]);
-                    float2 _f2_20 = make_float2(c_values[0], c_values[1]);
-                    float2 next_state_pair_5 = fma_f32x2_rn_ftz(_f2_18, decay_pair, mul_f32x2(_f2_19, dtx_pair));
-                    projection_pair = fma_f32x2_rn_ftz(next_state_pair_5, _f2_20, projection_pair);
-                    state_values[12] = next_state_pair_5.x;
-                    state_values[13] = next_state_pair_5.y;
+                    float2 _f2_8 = make_float2(state_values[12], state_values[13]);
+                    float2 _f2_1_6 = make_float2(b_values[0], b_values[1]);
+                    float2 _f2_2_6 = make_float2(c_values[0], c_values[1]);
+                    float2 next_state_pair_6 = fma_f32x2_rn_ftz(_f2_8, decay_pair, mul_f32x2(_f2_1_6, dtx_pair));
+                    projection_pair = fma_f32x2_rn_ftz(next_state_pair_6, _f2_2_6, projection_pair);
+                    state_values[12] = next_state_pair_6.x;
+                    state_values[13] = next_state_pair_6.y;
                     #pragma unroll
                     for (int _pair = 0; _pair < 1; _pair++) {
                         (&b_values[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(b_carriers[7 + _pair]) << 16);
@@ -517,21 +529,26 @@ kernel_cake_selective_state_update_690e2f567f0c6c4be78d(const __grid_constant__ 
                         (&c_values[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(c_carriers[7 + _pair]) << 16);
                         (&c_values[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(c_carriers[7 + _pair]) & 0xffff0000u);
                     }
-                    float2 _f2_21 = make_float2(state_values[14], state_values[15]);
-                    float2 _f2_22 = make_float2(b_values[0], b_values[1]);
-                    float2 _f2_23 = make_float2(c_values[0], c_values[1]);
-                    float2 next_state_pair_6 = fma_f32x2_rn_ftz(_f2_21, decay_pair, mul_f32x2(_f2_22, dtx_pair));
-                    projection_pair = fma_f32x2_rn_ftz(next_state_pair_6, _f2_23, projection_pair);
-                    state_values[14] = next_state_pair_6.x;
-                    state_values[15] = next_state_pair_6.y;
+                    float2 _f2_9 = make_float2(state_values[14], state_values[15]);
+                    float2 _f2_1_7 = make_float2(b_values[0], b_values[1]);
+                    float2 _f2_2_7 = make_float2(c_values[0], c_values[1]);
+                    float2 next_state_pair_7 = fma_f32x2_rn_ftz(_f2_9, decay_pair, mul_f32x2(_f2_1_7, dtx_pair));
+                    projection_pair = fma_f32x2_rn_ftz(next_state_pair_7, _f2_2_7, projection_pair);
+                    state_values[14] = next_state_pair_7.x;
+                    state_values[15] = next_state_pair_7.y;
                     unsigned int state_values_bf16[8];
                     #pragma unroll
                     for (int _lp = 0; _lp < 8; _lp++) {
                         __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(state_values[_lp*2 + 0], state_values[_lp*2+1 + 0]));
                         state_values_bf16[_lp] = *(uint32_t*)&_bf2;
                     }
+#if __CUDA_ARCH__ == 1030
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(s_state_addr + (unsigned int)((ring_base + stage) * 8192) + (unsigned int)(row_in_stage * 256) + (unsigned int)(member * 16)), "r"(state_values_bf16[0]), "r"(state_values_bf16[1]), "r"(state_values_bf16[2]), "r"(state_values_bf16[3]));
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(s_state_addr + (unsigned int)((ring_base + stage) * 8192) + (unsigned int)(row_in_stage * 256) + (unsigned int)(member * 16) + 128), "r"(state_values_bf16[4]), "r"(state_values_bf16[5]), "r"(state_values_bf16[6]), "r"(state_values_bf16[7]));
+#else
                     asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(s_state_addr + (unsigned int)(ring_stage * 8192) + (unsigned int)(row_in_stage * 256) + (unsigned int)(member * 16)), "r"(state_values_bf16[0]), "r"(state_values_bf16[1]), "r"(state_values_bf16[2]), "r"(state_values_bf16[3]));
                     asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(s_state_addr + (unsigned int)(ring_stage * 8192) + (unsigned int)(row_in_stage * 256) + (unsigned int)(member * 16) + 128), "r"(state_values_bf16[4]), "r"(state_values_bf16[5]), "r"(state_values_bf16[6]), "r"(state_values_bf16[7]));
+#endif
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                     __syncwarp();
                     if (elect_sync()) {
@@ -579,22 +596,22 @@ kernel_cake_selective_state_update_690e2f567f0c6c4be78d(const __grid_constant__ 
             if (elect_sync()) {
                 if (work_heads_1 > 0) {
                     #pragma unroll
-                    for (int stage_1 = 0; stage_1 < 4; stage_1++) {
-                        int fill_stage = stage_1;
+                    for (int stage_0 = 0; stage_0 < 4; stage_0++) {
+                        int fill_stage_0 = stage_0;
                         if (live != 0) {
-                            tma_4d_gmem2smem(s_state_addr + (unsigned int)(fill_stage * 8192), (&state_tma), 0, stage_1 * 32, first_head_1, slot, state_full_addr + (fill_stage) * 8);
-                            mbarrier_arrive_expect_tx(state_full_addr + (fill_stage) * 8, 8192);
+                            tma_4d_gmem2smem(s_state_addr + (unsigned int)(fill_stage_0 * 8192), (&state_tma), 0, stage_0 * 32, first_head_1, slot, state_full_addr + (fill_stage_0) * 8);
+                            mbarrier_arrive_expect_tx(state_full_addr + (fill_stage_0) * 8, 8192);
                         } else {
-                            mbarrier_arrive(state_full_addr + (fill_stage) * 8);
+                            mbarrier_arrive(state_full_addr + (fill_stage_0) * 8);
                         }
                     }
                 }
                 if (work_heads_1 > 1) {
                     #pragma unroll
-                    for (int stage_2 = 0; stage_2 < 4; stage_2++) {
-                        int fill_stage_1 = 4 + stage_2;
+                    for (int stage_1 = 0; stage_1 < 4; stage_1++) {
+                        int fill_stage_1 = 4 + stage_1;
                         if (live != 0) {
-                            tma_4d_gmem2smem(s_state_addr + (unsigned int)(fill_stage_1 * 8192), (&state_tma), 0, stage_2 * 32, first_head_1 + 1, slot, state_full_addr + (fill_stage_1) * 8);
+                            tma_4d_gmem2smem(s_state_addr + (unsigned int)(fill_stage_1 * 8192), (&state_tma), 0, stage_1 * 32, first_head_1 + 1, slot, state_full_addr + (fill_stage_1) * 8);
                             mbarrier_arrive_expect_tx(state_full_addr + (fill_stage_1) * 8, 8192);
                         } else {
                             mbarrier_arrive(state_full_addr + (fill_stage_1) * 8);
@@ -603,10 +620,10 @@ kernel_cake_selective_state_update_690e2f567f0c6c4be78d(const __grid_constant__ 
                 }
                 if (work_heads_1 > 2) {
                     #pragma unroll
-                    for (int stage_3 = 0; stage_3 < 4; stage_3++) {
-                        int fill_stage_2 = 8 + stage_3;
+                    for (int stage_2 = 0; stage_2 < 4; stage_2++) {
+                        int fill_stage_2 = 8 + stage_2;
                         if (live != 0) {
-                            tma_4d_gmem2smem(s_state_addr + (unsigned int)(fill_stage_2 * 8192), (&state_tma), 0, stage_3 * 32, first_head_1 + 2, slot, state_full_addr + (fill_stage_2) * 8);
+                            tma_4d_gmem2smem(s_state_addr + (unsigned int)(fill_stage_2 * 8192), (&state_tma), 0, stage_2 * 32, first_head_1 + 2, slot, state_full_addr + (fill_stage_2) * 8);
                             mbarrier_arrive_expect_tx(state_full_addr + (fill_stage_2) * 8, 8192);
                         } else {
                             mbarrier_arrive(state_full_addr + (fill_stage_2) * 8);
@@ -617,20 +634,32 @@ kernel_cake_selective_state_update_690e2f567f0c6c4be78d(const __grid_constant__ 
                 for (int head_offset_1 = 0; head_offset_1 < work_heads_1; head_offset_1++) {
                     int head_1 = first_head_1 + head_offset_1;
                     int next_head_valid = ((work_heads_1 > head_offset_1 + 3) ? 1 : 0);
+#if __CUDA_ARCH__ == 1030
+                    int ring_base_1 = (int)((unsigned int)head_offset_1 % 3) * 4;
+#else
+#endif
                     #pragma unroll
-                    for (int stage_4 = 0; stage_4 < 4; stage_4++) {
-                        int ring_stage_1 = stage_4 + 4 * (int)((unsigned int)head_offset_1 % 3);
+                    for (int stage_3 = 0; stage_3 < 4; stage_3++) {
+                        int ring_stage_1 = stage_3 + 4 * (int)((unsigned int)head_offset_1 % 3);
                         int _parity_state_updated = (int)((unsigned int)head_offset_1 / 3 % 2);
                         mbarrier_wait(state_updated_addr + (ring_stage_1) * 8, _parity_state_updated);
                         if (live != 0) {
                             asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                            tma_store_4d((&state_tma), 0, stage_4 * 32, head_1, slot, s_state_addr + (unsigned int)(ring_stage_1 * 8192));
+#if __CUDA_ARCH__ == 1030
+                            tma_store_4d((&state_tma), 0, stage_3 * 32, head_1, slot, s_state_addr + (unsigned int)((ring_base_1 + stage_3) * 8192));
+#else
+                            tma_store_4d((&state_tma), 0, stage_3 * 32, head_1, slot, s_state_addr + (unsigned int)(ring_stage_1 * 8192));
+#endif
                             asm volatile("cp.async.bulk.commit_group;");
                             asm volatile("cp.async.bulk.wait_group.read 0;");
                         }
                         if (next_head_valid != 0) {
                             if (live != 0) {
-                                tma_4d_gmem2smem(s_state_addr + (unsigned int)(ring_stage_1 * 8192), (&state_tma), 0, stage_4 * 32, head_1 + 3, slot, state_full_addr + (ring_stage_1) * 8);
+#if __CUDA_ARCH__ == 1030
+                                tma_4d_gmem2smem(s_state_addr + (unsigned int)((ring_base_1 + stage_3) * 8192), (&state_tma), 0, stage_3 * 32, head_1 + 3, slot, state_full_addr + (ring_stage_1) * 8);
+#else
+                                tma_4d_gmem2smem(s_state_addr + (unsigned int)(ring_stage_1 * 8192), (&state_tma), 0, stage_3 * 32, head_1 + 3, slot, state_full_addr + (ring_stage_1) * 8);
+#endif
                                 mbarrier_arrive_expect_tx(state_full_addr + (ring_stage_1) * 8, 8192);
                             } else {
                                 mbarrier_arrive(state_full_addr + (ring_stage_1) * 8);

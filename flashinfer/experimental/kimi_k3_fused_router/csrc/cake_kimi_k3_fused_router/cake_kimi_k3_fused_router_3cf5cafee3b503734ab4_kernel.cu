@@ -945,8 +945,69 @@ kernel_cake_kimi_k3_fused_router_3cf5cafee3b503734ab4(float* __restrict__ logits
             }
         }
         __syncthreads();
+        int pass0_count = plan_counts[own_expert_base + warp];
+        int pass0_bitmap_base = warp * BITMAP_STRIDE;
+        unsigned int pass0_words[8];
+        asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&pass0_words[0])), "=r"(*reinterpret_cast<uint32_t*>(&pass0_words[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&pass0_words[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&pass0_words[(0) + 3]))
+            : "r"(own_bitmap_addr + (unsigned int)(pass0_bitmap_base * 4)));
+        asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+            : "=r"(*reinterpret_cast<uint32_t*>(&pass0_words[4])), "=r"(*reinterpret_cast<uint32_t*>(&pass0_words[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&pass0_words[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&pass0_words[(4) + 3]))
+            : "r"(own_bitmap_addr + (unsigned int)((pass0_bitmap_base + 4) * 4)));
+        unsigned int pass0_full = 0;
+        unsigned int pass0_routes = 0;
+        if (lane >> 2 < bitmap_words) {
+            pass0_full = own_bitmap[pass0_bitmap_base + (lane >> 2)];
+            pass0_routes = own_routes[warp * ROUTE_STRIDE + lane];
+        }
+        unsigned int pass0_shift = (unsigned int)((lane & 3) * 8);
+        unsigned int pass0_bits = pass0_full >> pass0_shift & (unsigned int)255;
+        int pass0_hits = (int)(unsigned int)__popc(pass0_bits);
+        unsigned int pass0_below = ((unsigned int)1 << pass0_shift) - (unsigned int)1;
+        int pass0_local = (int)(unsigned int)__popc(pass0_full & pass0_below);
+        int pass0_total = 0;
+        int pass0_word_count_0 = (int)(unsigned int)__popc(pass0_words[0]);
+        pass0_total += pass0_word_count_0;
+        if (0 < lane >> 2) {
+            pass0_local += pass0_word_count_0;
+        }
+        int pass0_word_count_1 = (int)(unsigned int)__popc(pass0_words[1]);
+        pass0_total += pass0_word_count_1;
+        if (1 < lane >> 2) {
+            pass0_local += pass0_word_count_1;
+        }
+        int pass0_word_count_2 = (int)(unsigned int)__popc(pass0_words[2]);
+        pass0_total += pass0_word_count_2;
+        if (2 < lane >> 2) {
+            pass0_local += pass0_word_count_2;
+        }
+        int pass0_word_count_3 = (int)(unsigned int)__popc(pass0_words[3]);
+        pass0_total += pass0_word_count_3;
+        if (3 < lane >> 2) {
+            pass0_local += pass0_word_count_3;
+        }
+        int pass0_word_count_4 = (int)(unsigned int)__popc(pass0_words[4]);
+        pass0_total += pass0_word_count_4;
+        if (4 < lane >> 2) {
+            pass0_local += pass0_word_count_4;
+        }
+        int pass0_word_count_5 = (int)(unsigned int)__popc(pass0_words[5]);
+        pass0_total += pass0_word_count_5;
+        if (5 < lane >> 2) {
+            pass0_local += pass0_word_count_5;
+        }
+        int pass0_word_count_6 = (int)(unsigned int)__popc(pass0_words[6]);
+        pass0_total += pass0_word_count_6;
+        if (6 < lane >> 2) {
+            pass0_local += pass0_word_count_6;
+        }
+        int pass0_word_count_7 = (int)(unsigned int)__popc(pass0_words[7]);
+        pass0_total += pass0_word_count_7;
+        if (7 < lane >> 2) {
+            pass0_local += pass0_word_count_7;
+        }
         int group_total = 0;
-        group_total += plan_counts[tid * 4 + 0] + BLOCK_MASK & ~BLOCK_MASK;
+        group_total += plan_counts[tid * 4] + BLOCK_MASK & ~BLOCK_MASK;
         group_total += plan_counts[tid * 4 + 1] + BLOCK_MASK & ~BLOCK_MASK;
         group_total += plan_counts[tid * 4 + 2] + BLOCK_MASK & ~BLOCK_MASK;
         group_total += plan_counts[tid * 4 + 3] + BLOCK_MASK & ~BLOCK_MASK;
@@ -956,9 +1017,9 @@ kernel_cake_kimi_k3_fused_router_3cf5cafee3b503734ab4(float* __restrict__ logits
         int warp_expert = own_expert_base + warp;
         int below_part = 0;
         int all_part = 0;
-        all_part += plan_offsets[lane + 0];
-        if (lane + 0 < first_group) {
-            below_part += plan_offsets[lane + 0];
+        all_part += plan_offsets[lane];
+        if (lane < first_group) {
+            below_part += plan_offsets[lane];
         }
         all_part += plan_offsets[lane + 32];
         if (lane + 32 < first_group) {
@@ -1008,90 +1069,103 @@ kernel_cake_kimi_k3_fused_router_3cf5cafee3b503734ab4(float* __restrict__ logits
             expert_offsets[warp_expert] = warp_offset;
         }
         int own_expert = own_expert_base + warp;
-        int own_count = plan_counts[own_expert];
+        int own_count = pass0_count;
         int own_base = warp_offset;
         int own_padded = own_count + BLOCK_MASK & ~BLOCK_MASK;
         int own_bitmap_base = warp * BITMAP_STRIDE;
         int own_route_base = warp * ROUTE_STRIDE;
-        int emitted = 0;
-        if (own_count > 0) {
-            #pragma unroll 1
-            for (int byte_pass = 0; byte_pass < bitmap_words + 7 >> 3; byte_pass++) {
-                int byte_word = (byte_pass << 3) + (lane >> 2);
-                unsigned int pass_words[8];
-                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                    : "=r"(*reinterpret_cast<uint32_t*>(&pass_words[0])), "=r"(*reinterpret_cast<uint32_t*>(&pass_words[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&pass_words[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&pass_words[(0) + 3]))
-                    : "r"(own_bitmap_addr + (unsigned int)((own_bitmap_base + (byte_pass << 3)) * 4)));
-                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                    : "=r"(*reinterpret_cast<uint32_t*>(&pass_words[4])), "=r"(*reinterpret_cast<uint32_t*>(&pass_words[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&pass_words[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&pass_words[(4) + 3]))
-                    : "r"(own_bitmap_addr + (unsigned int)((own_bitmap_base + (byte_pass << 3) + 4) * 4)));
-                unsigned int byte_full = 0;
-                unsigned int byte_routes = 0;
-                if (byte_word < bitmap_words) {
-                    byte_full = own_bitmap[own_bitmap_base + byte_word];
-                    byte_routes = own_routes[own_route_base + (byte_pass << 5) + lane];
-                }
-                unsigned int byte_shift = (unsigned int)((lane & 3) * 8);
-                unsigned int byte_bits = byte_full >> byte_shift & (unsigned int)255;
-                int byte_count = (int)(unsigned int)__popc(byte_bits);
-                unsigned int byte_below = ((unsigned int)1 << byte_shift) - (unsigned int)1;
-                int byte_rank = own_base + emitted + (int)(unsigned int)__popc(byte_full & byte_below);
-                int pass_total = 0;
-                int word_count_0 = (int)(unsigned int)__popc(pass_words[0]);
-                pass_total += word_count_0;
-                if (0 < lane >> 2) {
-                    byte_rank += word_count_0;
-                }
-                int word_count_1 = (int)(unsigned int)__popc(pass_words[1]);
-                pass_total += word_count_1;
-                if (1 < lane >> 2) {
-                    byte_rank += word_count_1;
-                }
-                int word_count_2 = (int)(unsigned int)__popc(pass_words[2]);
-                pass_total += word_count_2;
-                if (2 < lane >> 2) {
-                    byte_rank += word_count_2;
-                }
-                int word_count_3 = (int)(unsigned int)__popc(pass_words[3]);
-                pass_total += word_count_3;
-                if (3 < lane >> 2) {
-                    byte_rank += word_count_3;
-                }
-                int word_count_4 = (int)(unsigned int)__popc(pass_words[4]);
-                pass_total += word_count_4;
-                if (4 < lane >> 2) {
-                    byte_rank += word_count_4;
-                }
-                int word_count_5 = (int)(unsigned int)__popc(pass_words[5]);
-                pass_total += word_count_5;
-                if (5 < lane >> 2) {
-                    byte_rank += word_count_5;
-                }
-                int word_count_6 = (int)(unsigned int)__popc(pass_words[6]);
-                pass_total += word_count_6;
-                if (6 < lane >> 2) {
-                    byte_rank += word_count_6;
-                }
-                int word_count_7 = (int)(unsigned int)__popc(pass_words[7]);
-                pass_total += word_count_7;
-                if (7 < lane >> 2) {
-                    byte_rank += word_count_7;
-                }
-                int byte_token_base = (byte_pass << 8) + (lane << 3);
+        int pass0_rank = warp_offset + pass0_local;
+        int pass0_token_base = lane << 3;
+        #pragma unroll 1
+        for (int pass0_hit = 0; pass0_hit < pass0_hits; pass0_hit++) {
+            int _find_first_set_9 = __ffs(pass0_bits);
+            int pass0_offset = _find_first_set_9 - 1;
+            unsigned int pass0_route = pass0_routes >> (unsigned int)(pass0_offset * 4) & (unsigned int)15;
+            int pass0_pair = (pass0_token_base + pass0_offset) * TOP_K + (int)pass0_route;
+            sorted_token_ids[pass0_rank + pass0_hit] = pass0_pair;
+            pass0_bits = pass0_bits & pass0_bits - (unsigned int)1;
+        }
+        int emitted = pass0_total;
+        if (bitmap_words > 8) {
+            if (own_count > 0) {
                 #pragma unroll 1
-                for (int byte_hit = 0; byte_hit < byte_count; byte_hit++) {
-                    int _find_first_set_9 = __ffs(byte_bits);
-                    int byte_offset = _find_first_set_9 - 1;
-                    unsigned int byte_route = byte_routes >> (unsigned int)(byte_offset * 4) & (unsigned int)15;
-                    int byte_pair = (byte_token_base + byte_offset) * TOP_K + (int)byte_route;
-                    sorted_token_ids[byte_rank + byte_hit] = byte_pair;
-                    byte_bits = byte_bits & byte_bits - (unsigned int)1;
+                for (int byte_pass = 1; byte_pass < bitmap_words + 7 >> 3; byte_pass++) {
+                    int byte_word = (byte_pass << 3) + (lane >> 2);
+                    unsigned int pass_words[8];
+                    asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                        : "=r"(*reinterpret_cast<uint32_t*>(&pass_words[0])), "=r"(*reinterpret_cast<uint32_t*>(&pass_words[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&pass_words[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&pass_words[(0) + 3]))
+                        : "r"(own_bitmap_addr + (unsigned int)((own_bitmap_base + (byte_pass << 3)) * 4)));
+                    asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                        : "=r"(*reinterpret_cast<uint32_t*>(&pass_words[4])), "=r"(*reinterpret_cast<uint32_t*>(&pass_words[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&pass_words[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&pass_words[(4) + 3]))
+                        : "r"(own_bitmap_addr + (unsigned int)((own_bitmap_base + (byte_pass << 3) + 4) * 4)));
+                    unsigned int byte_full = 0;
+                    unsigned int byte_routes = 0;
+                    if (byte_word < bitmap_words) {
+                        byte_full = own_bitmap[own_bitmap_base + byte_word];
+                        byte_routes = own_routes[own_route_base + (byte_pass << 5) + lane];
+                    }
+                    unsigned int byte_shift = (unsigned int)((lane & 3) * 8);
+                    unsigned int byte_bits = byte_full >> byte_shift & (unsigned int)255;
+                    int byte_count = (int)(unsigned int)__popc(byte_bits);
+                    unsigned int byte_below = ((unsigned int)1 << byte_shift) - (unsigned int)1;
+                    int byte_rank = own_base + emitted + (int)(unsigned int)__popc(byte_full & byte_below);
+                    int pass_total = 0;
+                    int word_count_0 = (int)(unsigned int)__popc(pass_words[0]);
+                    pass_total += word_count_0;
+                    if (0 < lane >> 2) {
+                        byte_rank += word_count_0;
+                    }
+                    int word_count_1 = (int)(unsigned int)__popc(pass_words[1]);
+                    pass_total += word_count_1;
+                    if (1 < lane >> 2) {
+                        byte_rank += word_count_1;
+                    }
+                    int word_count_2 = (int)(unsigned int)__popc(pass_words[2]);
+                    pass_total += word_count_2;
+                    if (2 < lane >> 2) {
+                        byte_rank += word_count_2;
+                    }
+                    int word_count_3 = (int)(unsigned int)__popc(pass_words[3]);
+                    pass_total += word_count_3;
+                    if (3 < lane >> 2) {
+                        byte_rank += word_count_3;
+                    }
+                    int word_count_4 = (int)(unsigned int)__popc(pass_words[4]);
+                    pass_total += word_count_4;
+                    if (4 < lane >> 2) {
+                        byte_rank += word_count_4;
+                    }
+                    int word_count_5 = (int)(unsigned int)__popc(pass_words[5]);
+                    pass_total += word_count_5;
+                    if (5 < lane >> 2) {
+                        byte_rank += word_count_5;
+                    }
+                    int word_count_6 = (int)(unsigned int)__popc(pass_words[6]);
+                    pass_total += word_count_6;
+                    if (6 < lane >> 2) {
+                        byte_rank += word_count_6;
+                    }
+                    int word_count_7 = (int)(unsigned int)__popc(pass_words[7]);
+                    pass_total += word_count_7;
+                    if (7 < lane >> 2) {
+                        byte_rank += word_count_7;
+                    }
+                    int byte_token_base = (byte_pass << 8) + (lane << 3);
+                    #pragma unroll 1
+                    for (int byte_hit = 0; byte_hit < byte_count; byte_hit++) {
+                        int _find_first_set_10 = __ffs(byte_bits);
+                        int byte_offset = _find_first_set_10 - 1;
+                        unsigned int byte_route = byte_routes >> (unsigned int)(byte_offset * 4) & (unsigned int)15;
+                        int byte_pair = (byte_token_base + byte_offset) * TOP_K + (int)byte_route;
+                        sorted_token_ids[byte_rank + byte_hit] = byte_pair;
+                        byte_bits = byte_bits & byte_bits - (unsigned int)1;
+                    }
+                    emitted += pass_total;
                 }
-                emitted += pass_total;
             }
         }
-        #pragma unroll 1
-        for (int pad_slot = own_count + lane; pad_slot < own_padded; pad_slot += 32) {
+        int pad_slot = own_count + lane;
+        if (pad_slot < own_padded) {
             sorted_token_ids[own_base + pad_slot] = total_pairs;
         }
         #pragma unroll 1

@@ -55,9 +55,13 @@ from ...jit.core import gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
 # and the fp4 route on ``NVFP4_QUANTIZE_TP_ARCHES`` a second build of its
 # quantizer, ``quantize_tp`` (its ``pv_mode="fp4_tp"`` build, bitwise-identical
 # outputs; it takes ``block_token`` / ``block_valid`` by value, as
-# ``cake_backend.QUANTIZE_TP_MAX_PB``-entry launch parameters), and the host
-# binds one of the two per plan
-# (``cake_backend.nvfp4_quantize_stage``); the fp8 route precedes the
+# ``cake_backend.QUANTIZE_TP_MAX_PB``-entry launch parameters) -- that
+# route's ``modules`` also name ``quantize_tp_mb8``, the
+# ``pv_mode="fp4_tp_mb8"`` build of ``quantize_tp`` (bitwise-identical
+# outputs; eight resident CTAs per SM), which is no stage: the host binds it
+# in the ``quantize_tp`` slot when the quantize grid lies in
+# ``cake_backend.QUANTIZE_TP_MB8_GRID`` -- and the host binds one of them per
+# plan (``cake_backend.nvfp4_quantize_stage``); the fp8 route precedes the
 # quantizer with ``amax`` (``minimax_h3_varlen_v_amax_partial``,
 # one partial ``max|V|`` per CTA, folded by the quantizer, which is that
 # kernel's programmatic dependent launch); the NVFP4 routes carry two
@@ -84,8 +88,8 @@ from ...jit.core import gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
 # runner when a plan has no split units).  The generated-program export
 # writes the ``MODULES`` records and the ``ROUTES`` module leaves of the
 # programs it renders; the ``ROUTES`` stage lists, and the leaf of a new
-# stage (naming the program the export then supersedes there), are
-# hand-written.
+# stage (naming the program the export then supersedes there, or, as for
+# ``quantize_tp_mb8``, the program it renders there), are hand-written.
 MODULES: dict[str, dict[str, Any]] = {
     "cake_minimax_h3_varlen_attention_028f5068a74b38fa522e": {
         "arches": ["sm_100a"],
@@ -113,7 +117,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "closure_sha256": {
-            "sm_100a": "cdb07c53047e2471fc725e86cbcb441befd497c1422ab3582284b97eb7f56866",
+            "sm_100a": "38643c9b3514b4e506d9aaa0f66e540e50e62f72ca3e679d03c27a2ab9bc2be1",
         },
     },
     "cake_minimax_h3_varlen_attention_0f1da56372d7a27d3ae7": {
@@ -145,7 +149,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "closure_sha256": {
-            "sm_100a": "749c26154b6934302d6464f4b7bb582f5b9eccf1d1051b2ef8d575bd2e3d8bcf",
+            "sm_100a": "d519cd9a6dce85477dbb2e1edbc2cd62d131a2f267969f6132733938d6bf4144",
         },
     },
     "cake_minimax_h3_varlen_attention_1617b51b89eb9de58a16": {
@@ -179,8 +183,8 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "closure_sha256": {
-            "sm_100a": "3c3802902e7d8606d61803358476c114739cb54c72133b475d676fb35706f1cb",
-            "sm_103a": "023d480ad29eeae4423732e9d8a3d943c42db865594a9c7a2f849dcb0980ce51",
+            "sm_100a": "9a0a913aa33d8e6b0002a205628c4f35b71cf19ff859ff3f7e4906ded24a7be2",
+            "sm_103a": "2fc6be3e45ef754fb62361527c721eb6c1306675bb07021ea1350b48b59567a3",
         },
     },
     "cake_minimax_h3_varlen_attention_1f0285434cb51b016f42": {
@@ -215,8 +219,8 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "closure_sha256": {
-            "sm_100a": "d3488aab563beec201cce094d69e565df6a658add852df98421010f0849703a4",
-            "sm_103a": "0ff7c73cdb55adf429eede69e68988426eda73e5cc1a7c00abf2c5c757887385",
+            "sm_100a": "05045e0d630ac7f1709ec94b303498dd89167aad54420b255b5fcbe206b6a606",
+            "sm_103a": "8902346e089b6ee2d811e05862970f74b9370181f603d6475cd0ed9b83880d73",
         },
     },
     "cake_minimax_h3_varlen_attention_3f7f340abbf71c6a17d1": {
@@ -250,7 +254,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "closure_sha256": {
-            "sm_100a": "edb087ce95e504bd245050cf227392f281da26a74191431ad323eb59595122f6",
+            "sm_100a": "fb95f9c2c7942157daee2f331ff215f734ec4ac5e6515704d0968bc74734f95b",
         },
     },
     "cake_minimax_h3_varlen_attention_5d47bc81a6048253de1c": {
@@ -282,8 +286,8 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "closure_sha256": {
-            "sm_100a": "c91b73c51704ad94f99367b6f7a744f79cde3846b9a66784374deb2ad69c0a4a",
-            "sm_103a": "a2f321eadec172be99673e940ffc9fac274167cee8e8308f9a53c848760d54b0",
+            "sm_100a": "33db922ad9156f0bc277bae365abe80af5dc5540e6eebdab11eb7e017282dd64",
+            "sm_103a": "6370cadadc1fe376ae4ace77878e14dedd6c46b3b79ac0e4dcf2d77c6fb9c10d",
         },
     },
     "cake_minimax_h3_varlen_attention_5e9badc10a1a02a423c0": {
@@ -338,7 +342,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "closure_sha256": {
-            "sm_103a": "e97617db9997a977cbb941de4e522d7d7bf7082d94b3d0d44f63c18fec88456e",
+            "sm_103a": "bd1a323a9ed27f687466e740582e6dc2d377d34a666333420c685f5dc1d395ce",
         },
     },
     "cake_minimax_h3_varlen_attention_89f32e4786d93ee3b7bb": {
@@ -377,8 +381,8 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "closure_sha256": {
-            "sm_100a": "967a70e2878490ff0b7b0639053556ff68ebe9aba17ca41a40d9459817e71d68",
-            "sm_103a": "2384549d0c76b081eed3d13c097d623b88f35a5962ad55abaabf71dfd975c089",
+            "sm_100a": "a2a7f9f98be75b10b415ccd7e7da1260aa281298e675bc0065be62edf328f69b",
+            "sm_103a": "8ce9a55b5acd313a4d9049b3c15d1966608567d6551f730593eb3ed1c575ade1",
         },
     },
     "cake_minimax_h3_varlen_attention_90b49eb7762c49d34e34": {
@@ -410,8 +414,8 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "closure_sha256": {
-            "sm_100a": "84d0908e22ae259c49fa27a41dbda989e495e1d92773ac7e109b363cadcdf0b8",
-            "sm_103a": "ee2f5e87f88da2ff5cec386cadc50f6fc0d6e0bb3f16f777c9637567204c23c9",
+            "sm_100a": "c50ef448f3cd1f0ccf34e1776c12cff3e701a6958a1b93fb9028ee55f351f332",
+            "sm_103a": "52ea0e8c9ca399aa8b16810a776dbd5c827a3656f4cdd8cb224e29796c5d7558",
         },
     },
     "cake_minimax_h3_varlen_attention_90ffa4217c59f26945b8": {
@@ -451,8 +455,8 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "closure_sha256": {
-            "sm_100a": "9eb2f1b20aae639e6acb320742175a4c186f76ac5ee947244ae4fcafa5c627c4",
-            "sm_103a": "9e40de944fc17cf2ca5387c26c533f393f9436b1ba9b078d05e3eeea151b7fc5",
+            "sm_100a": "749faaaab491edde43170fa34a7e487cdc0da2de2ac1fd003143d44d17fff7ed",
+            "sm_103a": "ee0092a06b2bbc99b230fff71c428aa522a478cc7511daf5ac5ae3025647351b",
         },
     },
     "cake_minimax_h3_varlen_attention_bf109517d2bd582e5452": {
@@ -484,8 +488,40 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "closure_sha256": {
-            "sm_100a": "cff6eb2f690f7258d404b81320a1588f8fc6efc3b40af040f2fd36b0d6048bfb",
-            "sm_103a": "ddac1d9411a56c3110a8c4c7ee44890b93ba5d256465f7a1d2e87df149c3bbd8",
+            "sm_100a": "cc15aec95e62143cc09da3909ae98eba6a9985fc9e3aa612d2407dd0ffc053d0",
+            "sm_103a": "394d55adb54aee77c7294cebb23749b711f247c64294bdf90bb83e1463672159",
+        },
+    },
+    "cake_minimax_h3_varlen_attention_cb6b99d150feff074838": {
+        "arches": ["sm_100a"],
+        "role": "kernel",
+        "sources": [
+            "cake_minimax_h3_varlen_attention/cake_minimax_h3_varlen_attention_cb6b99d150feff074838_kernel.cu",
+            "cake_minimax_h3_varlen_attention/cake_minimax_h3_varlen_attention_cb6b99d150feff074838_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["buffer", "q"],
+            ["buffer", "k"],
+            ["buffer", "v"],
+            ["buffer", "q_fp4"],
+            ["buffer", "k_fp4"],
+            ["buffer", "q_scale"],
+            ["buffer", "k_scale"],
+            ["buffer", "v_fp4_t"],
+            ["buffer", "v_scale_lo"],
+            ["buffer", "v_scale_hi"],
+            ["param_array", "block_token"],
+            ["param_array", "block_valid"],
+            ["parameter", "heads"],
+            ["parameter", "PB"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "closure_sha256": {
+            "sm_100a": "86d40c8f8d41b0e071d43969328e29844fa5b00a00334467e68e9ba02d71e3d3",
         },
     },
     "cake_minimax_h3_varlen_attention_d11c1c74c7173bf8207e": {
@@ -510,8 +546,8 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "closure_sha256": {
-            "sm_100a": "48d2699eb56d68eb70b462b9d21482aa5607d6e48bf39b179a734f834175ba70",
-            "sm_103a": "3648803b9f68011ce8055f1790136a2a3da0c50b3cdb27e68bbf2ba49589f7fc",
+            "sm_100a": "d1c95e04815a65ddc379ff4139cf3fcc93c9591d2f363875c0fdbe131c513b49",
+            "sm_103a": "2866e0c60c5283d53eeac68d640988472aebdc34b22f2c420215b6b23f793447",
         },
     },
     "cake_minimax_h3_varlen_attention_d1a5a13036fdbd9c9202": {
@@ -540,7 +576,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "closure_sha256": {
-            "sm_100a": "6782ef8f73e17c6f0b0136ae312df346f94183c070cc5fe93441640efe7e649b",
+            "sm_100a": "db6ca825098937f75d114566c93561f2e75eb015dd21f2940d002010f63d6e63",
         },
     },
     "cake_minimax_h3_varlen_attention_f4b5b5cf11a77bbe1bb9": {
@@ -569,7 +605,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "closure_sha256": {
-            "sm_103a": "08918927d4694a64e3e256d4bf111bad89dc23b6a6a0d1343c472a5335ae9007",
+            "sm_103a": "f2c1717ba3e090c0568e6295a43aa1a73a79a7096a8ce2e23cfe85ca29d3c6b8",
         },
     },
     "cake_minimax_h3_varlen_attention_f79569004c670f16a764": {
@@ -598,7 +634,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "closure_sha256": {
-            "sm_100a": "3054545e8e14964e591bec43e539909ead29ac4683d6568552c92e9de5f2f012",
+            "sm_100a": "407b18ff3e772dccb76abf341c3759df7d3c9013c7cc0976543c573d40b7dcf6",
         },
     },
     "cake_minimax_h3_varlen_attention_fe186ded0289cd7dfbe4": {
@@ -668,6 +704,7 @@ ROUTES: dict[str, dict[str, Any]] = {
         "modules": {
             "quantize": "cake_minimax_h3_varlen_attention_5d47bc81a6048253de1c",
             "quantize_tp": "cake_minimax_h3_varlen_attention_0f1da56372d7a27d3ae7",
+            "quantize_tp_mb8": "cake_minimax_h3_varlen_attention_cb6b99d150feff074838",
             "attention": "cake_minimax_h3_varlen_attention_1f0285434cb51b016f42",
             "attention_split": "cake_minimax_h3_varlen_attention_90ffa4217c59f26945b8",
             "combine": "cake_minimax_h3_varlen_attention_5e9badc10a1a02a423c0",

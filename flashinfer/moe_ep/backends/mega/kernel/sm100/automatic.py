@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from typing import TYPE_CHECKING, Any, TypeAlias, cast
+from typing import TYPE_CHECKING, Any, TypeAlias
 
 if TYPE_CHECKING:
     import torch
@@ -140,11 +140,8 @@ def prepare_auto_configuration(
     state = workspace._tuning_state
     if state.initial_knobs is None:
         state.initial_knobs = {name: getattr(cfg, name) for name in knob_keys(cfg)}
-    # Only the MXFP8 backend creates GenPhase workspaces.
     constraints = (
-        cast("Mxfp8CutedslMegaKernelBackend", backend)._genphase_constraints()
-        if cfg.kernel_variant == "genphase"
-        else None
+        backend._genphase_constraints() if cfg.kernel_variant == "genphase" else None
     )
     winner = autotune_sm100_block_scaled_mega_moe(
         output,
@@ -177,7 +174,9 @@ def prepare_auto_configuration(
     state.record_selection(
         winner,
         context.cache_identity,
-        tuning_identity(context, workspace)
-        if winner is not None and context.tuning_enabled
-        else None,
+        (
+            tuning_identity(context, workspace)
+            if winner is not None and context.tuning_enabled
+            else None
+        ),
     )

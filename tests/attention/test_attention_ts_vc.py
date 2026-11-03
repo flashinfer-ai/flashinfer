@@ -47,6 +47,12 @@ from flashinfer.attention.prims_ts.vc_attention.quantization import (
 
 from tests.attention.test_attention_ts_context import _REQUIRES_CONTEXT_GPU
 
+# The SM107 plan rejects VC-Attention, so tests that need a VC plan skip there.
+_VC_PLAN_GPU = pytest.mark.skipif(
+    torch.cuda.is_available() and torch.cuda.get_device_capability() == (10, 7),
+    reason="VC-Attention is off on SM107",
+)
+
 _FP8 = torch.float8_e4m3fn
 _HEAD_DIM = 128
 
@@ -286,7 +292,7 @@ def _random_inputs(batch_size, seq_len, num_heads, *, seed=0, seq_len_q=None):
 _MEAN_CONFIG = VCAttentionConfig()
 
 
-def _pack_tile_means(mean: torch.Tensor, v_scale: torch.Tensor) -> torch.Tensor:
+def _pack_tile_means(mean: torch.Tensor, v_scale: torch.Tensor | float) -> torch.Tensor:
     """Torch reference of the packed bf16 mean operands the preparation writes.
 
     Each group of 16 tiles gives two operands in unswizzled tcgen05 K-major
@@ -294,7 +300,13 @@ def _pack_tile_means(mean: torch.Tensor, v_scale: torch.Tensor) -> torch.Tensor:
     tile 8o+i and the tiles past the sequence are zero.
     """
     b, h, t, d = mean.shape
-    vs = v_scale.reshape(b, h, 1, d)
+    if d % 8 != 0:
+        raise ValueError("head_dim must be a multiple of 8")
+    vs = (
+        v_scale.reshape(b, h, 1, d)
+        if isinstance(v_scale, torch.Tensor) and v_scale.dim() == 3
+        else v_scale
+    )
     m = (mean.float() / vs).to(torch.bfloat16)
     g = -(-t // vca.VC_MEAN_GROUP_TILES)
     tiles_per_operand = vca.VC_MEAN_MMA_K // 2
@@ -302,14 +314,14 @@ def _pack_tile_means(mean: torch.Tensor, v_scale: torch.Tensor) -> torch.Tensor:
         (b, h, g * vca.VC_MEAN_GROUP_TILES, d), dtype=torch.bfloat16, device=mean.device
     )
     rows[:, :, :t] = m
-    # Operand o of a group holds its tiles 8o to 8o+7 in K slots 2i and 2i+1.
+    # Operand o of a group holds its tiles 8o..8o+7; K slots 2i and 2i+1 hold tile i.
     rows = rows.view(
         b, h, g, vca.VC_MEAN_OPERANDS, tiles_per_operand, d // 8, 8
     ).permute(0, 1, 2, 3, 5, 6, 4)
     tile = torch.stack((rows, rows), dim=-1).reshape(
         b, h, g, vca.VC_MEAN_OPERANDS, d // 8, 8, vca.VC_MEAN_MMA_K
     )
-    # Core-matrix order of 8-row group, K core matrix, row and k.
+    # [8-row group, K core matrix, row, k] in core-matrix order.
     tile = tile.view(
         b, h, g, vca.VC_MEAN_OPERANDS, d // 8, 8, 2, vca.VC_MEAN_MMA_K // 2
     ).permute(0, 1, 2, 3, 4, 6, 5, 7)
@@ -331,7 +343,7 @@ def _plan(
     arguments = dict(
         device=torch.device("cuda"),
         batch_size=batch_size,
-        max_seq_len_q=seq_len_q or seq_len,
+        max_q_len=seq_len_q or seq_len,
         max_kv_len=seq_len,
         num_qo_heads=num_heads,
         num_kv_heads=num_heads,
@@ -340,7 +352,7 @@ def _plan(
         k_dtype=qk_dtype,
         v_dtype=_FP8,
         out_dtype=torch.bfloat16,
-        sm_scale=sm_scale,
+        softmax_scale=sm_scale,
         vc_config=vc_config,
     )
     wrapper.plan(**{**arguments, **overrides})
@@ -368,7 +380,7 @@ def _run_case(case: _VCCase):
             q_run,
             ops.k,
             ops.v,
-            sm_scale=sm_scale,
+            softmax_scale=sm_scale,
             out_dtype=torch.bfloat16,
             vc=ops.params,
             vc_config=VCAttentionConfig(
@@ -503,7 +515,9 @@ def test_vc_mean_step():
         pytest.param(
             {"mask_type": "causal"}, ValueError, "dense contiguous", id="causal"
         ),
-        pytest.param({"packed": True}, ValueError, "dense contiguous", id="packed"),
+        pytest.param(
+            {"packed_query": True}, ValueError, "dense contiguous", id="packed"
+        ),
         pytest.param(
             {"mask_type": "causal", "window_left": 256, "num_qo_heads": 2},
             ValueError,
@@ -558,6 +572,7 @@ def test_vc_kernel_config_rejects_invalid_profiles():
 
 
 @_REQUIRES_CONTEXT_GPU
+@_VC_PLAN_GPU
 def test_vc_run_rejects_mismatched_operands():
     q, k, v = _random_inputs(1, 1024, 2)
     ops = vc_quantize(k, v)
@@ -661,6 +676,57 @@ def test_vc_quantize_fp8_fused_matches_reference(batch, seq_len, heads):
 
 
 @_REQUIRES_CONTEXT_GPU
+@pytest.mark.parametrize("batch,seq_len,heads", [(1, 2000, 2), (2, 4096, 4)])
+def test_vc_quantize_repair_matches_torch_selection(batch, seq_len, heads):
+    """Whole tiles and the shifted tail hold the input (K) and its per-channel
+    E4M3 (V); the repair tiles hold the tokens of largest residual energy
+    (copied keys, then E4M3 residuals that complement the stored V codes), then
+    zero rows."""
+    _, k, v = _random_inputs(batch, seq_len, heads)
+    budget = 0.02
+    ops = vc_quantize_repair(k, v, budget=budget)
+    selected = max(1, round(budget * seq_len))
+    whole = seq_len // vca.VC_K_BLOCK_SIZE * vca.VC_K_BLOCK_SIZE
+    shift = ops.repair_tiles * vca.VC_K_BLOCK_SIZE
+    vs = (v.float().abs().amax(dim=1) / vca.E4M3_MAX).clamp_min(1e-12)
+    vs_t = vs.unsqueeze(1)
+    v8 = (v.float() / vs_t).to(_FP8)
+    energy = (
+        ((v.float() - v8.float() * vs_t) ** 2).sum(-1).permute(0, 2, 1)
+    )  # [B, H, S]
+    kth = energy.topk(selected, dim=2).values[:, :, -1]
+    torch.testing.assert_close(ops.v_scale, vs, rtol=1e-6, atol=0)
+    for rows, src in ((ops.k, k), (ops.v, v8)):
+        kept = torch.cat([rows[:, :whole], rows[:, whole + shift : seq_len + shift]], 1)
+        # E4M3 rounding ties may differ by one code between the two paths.
+        assert (kept.float() != src.float()).float().mean().item() < 2e-3
+        assert not rows[:, whole + selected : whole + shift].float().any()
+        assert not rows[:, seq_len + shift :].float().any()
+    for b in range(batch):
+        for h in range(heads):
+            # The copied keys identify the selected tokens.
+            match = (
+                k[b, :, h].unsqueeze(0)
+                == ops.k[b, whole : whole + selected, h].unsqueeze(1)
+            ).all(-1)
+            assert (match.sum(1) == 1).all()
+            toks = match.float().argmax(1)
+            assert toks.unique().numel() == selected
+            # Up to fp32 summation order, every selected token is at or above the k-th energy.
+            assert (energy[b, h, toks] >= kth[b, h] * (1 - 1e-4)).all()
+            # Stored code + residual reconstructs the value within the residual's E4M3 half-ulp.
+            x = v[b, toks, h].float() / vs[b, h]
+            stored = (
+                toks + (toks >= whole).int() * shift
+            )  # the tail sits after the repair tiles
+            back = (
+                ops.v[b, stored, h].float()
+                + ops.v[b, whole : whole + selected, h].float()
+            )
+            assert ((back - x).abs() <= 0.5 + 1e-3).all()
+
+
+@_REQUIRES_CONTEXT_GPU
 @pytest.mark.arch_blackwell
 def test_vc_preprocessor_step_schedule():
     """First 25% of steps: grouping + demeaning (refreshed every 4 steps); afterwards demeaning
@@ -675,15 +741,19 @@ def test_vc_preprocessor_step_schedule():
     ).transpose(1, 2)
     step0 = prep.prepare(k, v, denoise_step=(0, 40))
     assert step0.demean
+    perm0 = step0.perm.clone()
     out = wrapper.run(q, step0.k, step0.v, vc=step0.params)
     assert (
         _relative_error(out.float(), vca.vc_reference(q, step0, sm_scale=sm_scale))
         < 6e-2
     )
     step1 = prep.prepare(k, v, denoise_step=(1, 40))
-    assert torch.equal(step1.perm, step0.perm)  # no refresh at step 1
+    assert torch.equal(step1.perm, perm0)  # no refresh at step 1
+    perm_ptr = prep._groupings[(1, 1024, 2)]["perm"].data_ptr()
     step4 = prep.prepare(k, v.flip(1), denoise_step=(4, 40))
-    assert not torch.equal(step4.perm, step0.perm)  # refreshed at step 4
+    assert not torch.equal(step4.perm, perm0)  # refreshed at step 4
+    # The new grouping lands in the existing buffer so a captured CUDA graph reads it.
+    assert prep._groupings[(1, 1024, 2)]["perm"].data_ptr() == perm_ptr
     late = prep.prepare(k, v, denoise_step=(20, 40))  # V-Smooth off
     assert not late.demean
     assert torch.equal(late.perm, step4.perm)

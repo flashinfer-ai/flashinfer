@@ -48,8 +48,9 @@ _BLK_KV = 128
 # The campaign dispatcher keyed on TOTAL pages, which is why it routed these
 # shapes into the bad path. 800 keeps margin below the measured cliff.
 _MPG_UNION_MAX = 800
-# Per-sequence metadata (page table, prefix, seqused, cu_seqlens) is read
-# through fixed 16-entry views inside the kernels.
+# The union schedule reads per-sequence metadata (page table, prefix,
+# seqused, cu_seqlens) through fixed 16-entry views. The single-token schedule
+# sizes those views from cu_seqlens_q and takes any batch.
 _MAX_BATCH = 16
 
 
@@ -158,10 +159,24 @@ def preload_sm90_programs(kinds: Optional[Iterable[str]] = None) -> dict[str, in
     ``topk_select``, ``sparse_prefill``; about 4 s per program not yet in the
     JIT cache (89 programs in all), ~10 ms per prebuilt one.  Returns the
     programs loaded per kind.
+
+    ``topk_select`` also builds the CuTe top-k kernels its planner picks over
+    a grid of serving geometries (``"topk_select_cute"`` in the result: the
+    kernels covered).  Their compile key is the plan, so an eager step's width
+    and token count otherwise compile a new one mid-serving; each takes 1-2 s
+    the first time on a node and is then read from the CuTe-DSL disk cache.
+    Only the masked kernels on fp32 scores are covered (a call passing
+    ``num_valid_pages`` or forced blocks); an unmasked call compiles its
+    kernel at its first use.
     """
     from .cake_hopper_sm90 import preload_programs
 
-    return preload_programs(kinds)
+    loaded = preload_programs(kinds)
+    if "topk_select" in loaded:
+        from .cute_dsl.topk_select_sm90 import preload
+
+        loaded["topk_select_cute"] = preload()
+    return loaded
 
 
 def proxy_score_sm90(
@@ -258,10 +273,13 @@ def proxy_score_sm90(
                     "SM90 fp8 proxy-score decode serves a one-head index cache; "
                     f"got {k.shape[1]} index heads"
                 )
-            from .cute_dsl.proxy_score_decode_sm90 import run as _decode
+            from .cute_dsl.proxy_score_decode_sm90 import run as _decode_fp8
+
+            _decode_fp8(q, k, cu, pt, sk, per_head)
         else:
-            from .cute_dsl.proxy_score_decode_bf16_sm90 import run as _decode
-        _decode(q, k, cu, pt, sk, per_head)
+            from .cute_dsl.proxy_score_decode_bf16_sm90 import run as _decode_bf16
+
+            _decode_bf16(q, k, cu, pt, sk, per_head)
         return per_head
 
     if not kv_fp8:
@@ -277,7 +295,14 @@ def proxy_score_sm90(
     # Cake programs serve fp8 prefill scoring of a one-head index cache in
     # both accumulation precisions; the CuTe DSL kernel serves the same
     # one-head class in both precisions, so several index heads raise in both.
-    if proxy_prefill_route_available(
+    # Both launch ceil(max_seqlen_q / rows) query tiles per sequence. The CuTe
+    # kernel skips the tiles past each sequence's end; the Cake programs rescore
+    # rows 0.. in each of them. A padded batch (decodes beside a prefill chunk,
+    # or ragged chunks) therefore goes to CuTe: on H100 it takes 0.17-0.84x
+    # Cake's time there (8-32 decodes beside a 2048-token chunk: 0.18-0.31x),
+    # and 1.14-1.2x on uniform batches, which stay on Cake.
+    padded = batch_size * max_seqlen_q > total_q
+    if not padded and proxy_prefill_route_available(
         q_dtype=q.dtype, num_kv_heads=k.shape[1], use_fp32_acc=use_fp32_acc
     ):
         return hopper_msa_proxy_score_prefill(
@@ -553,15 +578,23 @@ def _cute_proxy_decode_preferred(q, k, kv_fp8) -> bool:
     return bool(kv_fp8) and int(k.shape[1]) == 1
 
 
-def _cute_prefill_preferred(q, k, v, page_table) -> bool:
-    """Whether the CuTe DSL sparse-prefill schedules can serve this call.
+# Mean query tokens per sequence from which the CuTe union schedule beats Cake.
+_CUTE_PREFILL_MIN_SQ = 8192
 
-    Measured on H100 against the Cake program at the chunk sizes serving
-    engines actually use (kernel time, outputs agreeing): 0.58x at 8192 tokens
-    over a 16k context, 0.82x at 68k, 0.92x at 256k. At 2048 tokens the two are
-    within 11% either way. Cake keeps everything these schedules cannot serve.
+
+def _cute_prefill_preferred(q, k, v, page_table) -> bool:
+    """Whether the CuTe DSL union schedule should serve this call over Cake.
+
+    Measured on H100 (kernel time at matched accuracy, ~2e-3 rel-L2 vs fp32;
+    fp8 KV, one KV head): at 8192 query tokens per sequence the union
+    schedule takes 0.73-1.0x Cake's time over 80-848 pages, for GQA groups 8
+    and 16. With 512-4096 tokens per sequence it takes 0.85-1.27x, losing on
+    most shapes, so Cake keeps those.
     """
-    if int(page_table.shape[0]) > _MAX_BATCH:
+    if int(page_table.shape[1]) > _MPG_UNION_MAX:
+        return False
+    nb = int(page_table.shape[0])
+    if nb > _MAX_BATCH or int(q.shape[0]) < _CUTE_PREFILL_MIN_SQ * nb:
         return False
     if int(q.shape[1]) // max(1, int(k.shape[1])) not in (8, 16):
         return False
@@ -604,6 +637,12 @@ def sparse_prefill_sm90(
         raise NotImplementedError(
             f"SM90 msa_sparse_attention serves bf16 q; got {q.dtype}"
         )
+    # The CuTe DSL schedules feed Q and P to fp8 WGMMAs as hi / lo pairs to
+    # match Cake's accuracy (~2e-3 rel-L2 vs fp32, against ~3e-2 with single
+    # fp8 operands). At that precision the union schedule wins only on long
+    # chunks (_cute_prefill_preferred); Cake takes the rest of its classes, and
+    # the CuTe DSL kernels serve what Cake does not: more than 4096 pages, and
+    # GQA groups 32 / 64.
     if not _cute_prefill_preferred(q, k, v, page_table) and prefill_route_available(
         num_q_heads=q.shape[1],
         num_kv_heads=k.shape[1],
@@ -637,15 +676,20 @@ def sparse_prefill_sm90(
                 f"{int(page_table.shape[1])} > {_MPG_UNION_MAX}) supports "
                 f"Hq/Hkv of 8 or 16, got {g}"
             )
-        from .cute_dsl.sparse_prefill_single_sm90 import run as _prefill
-    else:
-        from .cute_dsl.sparse_prefill_sm90 import run as _prefill
+        from .cute_dsl.sparse_prefill_single_sm90 import run as _single_prefill
 
-    if int(page_table.shape[0]) > _MAX_BATCH:
-        raise NotImplementedError(
-            f"SM90 MSA prefill indexes per-sequence metadata with a fixed extent "
-            f"of {_MAX_BATCH} sequences, got {int(page_table.shape[0])}"
-        )
+        _prefill = _single_prefill
+    else:
+        if int(page_table.shape[0]) > _MAX_BATCH:
+            raise NotImplementedError(
+                f"SM90 MSA union prefill indexes per-sequence metadata with a "
+                f"fixed extent of {_MAX_BATCH} sequences, got "
+                f"{int(page_table.shape[0])}"
+            )
+        from .cute_dsl.sparse_prefill_sm90 import run as _union_prefill
+
+        _prefill = _union_prefill
+
     kv = _as_packed_kv(k, v, q.shape[-1], require_dense=True)
     cu = cu_seqlens_q.to(torch.int32).contiguous()
     sk = seqused_k.to(torch.int32).contiguous()

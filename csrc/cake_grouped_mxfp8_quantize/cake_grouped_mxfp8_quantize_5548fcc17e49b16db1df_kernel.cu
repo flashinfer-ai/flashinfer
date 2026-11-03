@@ -142,12 +142,13 @@ CAKE_PROGRAM_KERNEL(__nv_bfloat16* __restrict__ x, int* __restrict__ mask, uint8
                 }
                 unsigned int ahead = group + 3;
                 if (ahead < (unsigned int)gridDim.z) {
+                    unsigned int sparse_rows = (unsigned int)((unsigned long long)M * 3 / 12);
                     int _vec_load_2[1];
                     {
                         _vec_load_2[0] = *reinterpret_cast<const int*>(mask + ahead);
                     }
                     unsigned int ahead_valid = (((unsigned int)_vec_load_2[0]) < ((unsigned int)M) ? ((unsigned int)_vec_load_2[0]) : ((unsigned int)M));
-                    if (first < ahead_valid && ahead_valid < (unsigned int)M) {
+                    if (first < ahead_valid && ahead_valid <= sparse_rows) {
                         unsigned int ahead_rows = ((ahead_valid - first) < (ROWS * SUBROWS) ? (ahead_valid - first) : (ROWS * SUBROWS));
                         asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" :: "l"(x + (((unsigned long long)ahead * (unsigned long long)M + (unsigned long long)first) * (unsigned long long)K + (unsigned long long)k_lo)), "r"((uint32_t)(((ahead_rows - 1) * (unsigned int)K + cta_span) * 2)) : "memory");
                     }

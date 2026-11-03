@@ -191,8 +191,57 @@ def test_communication_wrappers_report_execution_outcomes(
         assert report["tests_executed"] == 0
     else:
         assert report["infrastructure_errors"]
+        assert result.returncode == 1
         if outcome == "crash":
             assert report["complete"] is False
+
+
+@pytest.mark.parametrize(
+    "mode,outcome",
+    [("full", "crash"), ("sanity", "crash"), ("full", "timeout")],
+)
+def test_missing_results_fail_without_completion_reporting(
+    tmp_path: Path, mode: str, outcome: str
+) -> None:
+    test_file = tmp_path / "test_worker.py"
+    test_file.write_text(
+        "import os\ndef test_worker():\n    os._exit(139)\n"
+        if outcome == "crash"
+        else "import time\ndef test_worker():\n    time.sleep(30)\n"
+    )
+    env = dict(os.environ)
+    env.pop("UNIT_TEST_RUN_STATUS_DIR", None)
+    env.update(
+        PIP_CONSTRAINT=os.devnull,
+        MAX_JOBS="1",
+        MONITOR_TEST_MEMORY="false",
+        JUNIT_DIR=str(tmp_path / "junit"),
+        SAMPLE_RATE="1",
+        PYTEST_FILE_TIMEOUT_SECONDS="1" if outcome == "timeout" else "10",
+        PYTEST_FILE_TIMEOUT_KILL_AFTER_SECONDS="1",
+        PYTEST_DISABLE_PLUGIN_AUTOLOAD="1",
+        PYTEST_ADDOPTS="",
+    )
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            'set -eo pipefail; source "$1"; '
+            '"run_${3}_test_file" "$2" 1; '
+            'print_execution_summary; exit "$EXIT_CODE"',
+            "test-utils",
+            str(ROOT / "scripts/test_utils.sh"),
+            str(test_file),
+            mode,
+        ],
+        cwd=tmp_path,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=20,
+    )
+    assert "NO RESULT:" in result.stdout, result.stdout + result.stderr
+    assert result.returncode == 1, result.stdout + result.stderr
 
 
 def test_setup_failure_leaves_wrapper_report_incomplete(tmp_path: Path) -> None:

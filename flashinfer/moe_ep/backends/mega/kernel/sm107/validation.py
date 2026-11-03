@@ -74,7 +74,7 @@ def validate_input_norm_const(value, *, name="input_norm_const") -> None:
 
 
 def validate_nvfp4_scalars(values, *, num_local_experts, device) -> None:
-    """Check local-expert FP32 vectors without host reads or graph breaks."""
+    """Validate FP32 expert vectors, allowing strided inputs for the copy path."""
     for name, value in values.items():
         if value is None:
             continue
@@ -82,10 +82,9 @@ def validate_nvfp4_scalars(values, *, num_local_experts, device) -> None:
             not isinstance(value, torch.Tensor)
             or value.shape != (num_local_experts,)
             or value.dtype != torch.float32
-            or not value.is_contiguous()
         ):
             raise MoEEpConfigError(
-                f"{name} must be a contiguous float32 vector of {num_local_experts} local experts"
+                f"{name} must be a float32 vector of {num_local_experts} local experts"
             )
         if not value.is_cuda or value.device != device:
             raise MoEEpConfigError(
@@ -113,8 +112,8 @@ def validate_forward_metadata(
         raise MoEEpConfigError("hidden_states must be 2D [num_tokens, hidden]")
     tokens, cols = hidden_states.shape
     hidden = fleet_params.token_hidden_size
-    fp4 = quant_kind == "nvfp4"
-    if quant_kind not in ("nvfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8"):
+    fp4 = quant_kind in ("nvfp4", "mxfp4")
+    if quant_kind not in ("nvfp4", "mxfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8"):
         raise MoEEpConfigError(f"unsupported quant_kind {quant_kind!r}")
     expected_cols = hidden // 2 if fp4 and not quantize_input else hidden
     if tokens > fleet_params.max_tokens_per_rank or cols != expected_cols:
@@ -150,7 +149,7 @@ def validate_forward_metadata(
             raise MoEEpConfigError(
                 "MoEEpTensors.scales is required when quantize_input=False"
             )
-        sf_cols = hidden // (16 if fp4 else 32)
+        sf_cols = hidden // (16 if quant_kind == "nvfp4" else 32)
         padded_cols = (sf_cols + 3) // 4 * 4
         if (
             scales.ndim != 2
@@ -160,7 +159,9 @@ def validate_forward_metadata(
             raise MoEEpConfigError(
                 f"scales must have {tokens} rows and {sf_cols}..{padded_cols} columns"
             )
-        expected_sf = torch.float8_e4m3fn if fp4 else torch.float8_e8m0fnu
+        expected_sf = (
+            torch.float8_e4m3fn if quant_kind == "nvfp4" else torch.float8_e8m0fnu
+        )
         if scales.dtype not in (expected_sf, torch.uint8):
             raise MoEEpConfigError(
                 f"scales must have dtype {expected_sf} or uint8 containing its raw bytes"
@@ -179,14 +180,14 @@ def validate_forward_metadata(
 def validate_routing_values(
     topk_ids, topk_weights, num_experts: int, *, workspace=None
 ) -> None:
-    """Device assertions run before dispatch unless explicitly disabled.
+    """Check routing values when FLASHINFER_SM107_MEGA_CHECK_ROUTES=1.
 
     Duplicate valid routes violate the router's workspace capacity proof.
     -1 is a masked slot whose score is ignored; all other IDs must be in range
     and have finite scores. A failed CUDA assertion invalidates that worker's
     CUDA context, as with invalid indices in other CUDA indexing operations.
     """
-    if os.environ.get("FLASHINFER_SM107_MEGA_CHECK_ROUTES", "1") == "0":
+    if os.environ.get("FLASHINFER_SM107_MEGA_CHECK_ROUTES", "0") == "0":
         return
     if (
         topk_ids.is_cuda

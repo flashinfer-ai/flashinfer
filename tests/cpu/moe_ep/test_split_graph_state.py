@@ -24,6 +24,7 @@ def layer(monkeypatch):
         num_experts=2, max_tokens_per_rank=4, token_hidden_size=8
     )
     result._comm_backend = "nccl_ep"
+    result._kernel = Mock()
     result._fleet = Mock()
     result._communication = None
     monkeypatch.setattr(split_layer, "_is_capturing", lambda: False)

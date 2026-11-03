@@ -656,6 +656,9 @@ class MoEEpSplitLayer(nn.Module):
         # when that raises, or the bootstrap ref_count leaks and the layer keeps
         # serving forward() on a half-destroyed transport.
         try:
+            # Before the transport: the kernel's per-forward state may still
+            # reference its receive buffers.
+            self._kernel.destroy()
             if self._communication is not None:
                 self._communication.destroy()
                 self._communication = None
@@ -961,20 +964,16 @@ class MoEEpSplitLayer(nn.Module):
     def _communication_kernel_context(
         self, comm: MoEEpCommunication, received: MoEEpDispatchResult
     ) -> SplitKernelContext:
-        # The inner kernels take RANK_MAJOR routing as ids local to this rank,
-        # with -1 for picks this rank does not own.
-        first_local = comm.ep_rank * comm.num_local_experts
-        ids = received.topk_ids
-        is_local = (ids >= first_local) & (ids < first_local + comm.num_local_experts)
+        # The received routing goes to the inner kernel as GLOBAL ids; it
+        # evaluates only the picks in this rank's local expert range.
         return SplitKernelContext(
             expert_tensors=received.hidden_states.view(
                 comm.ep_size, received.tokens_per_rank, -1
             ),
             num_tokens=comm.ep_size * received.tokens_per_rank,
             fleet_params=self._fleet_params,
-            recv_topk_idx=torch.where(
-                is_local, ids - first_local, torch.full_like(ids, -1)
-            ),
+            recv_topk_idx=received.topk_ids,
             recv_topk_weights=received.topk_weights,
+            recv_topk_idx_global=True,
             expert_tensors_scale=received.hidden_states_scale,
         )

@@ -294,9 +294,14 @@ def write_thd_small_batch_meta(
 
 
 @cute.jit
-def write_thd_row_offsets(meta, n_batch: cutlass.Int32, gran: cutlass.Int32, cu0=None) -> None:
+def write_thd_row_offsets(meta, n_batch: cutlass.Int32, gran: cutlass.Int32, cu0=None, dst=None, dst0=None) -> None:
     """Fill ``row_off(B+1)``: where each sequence's block starts in a ragged,
     row-BLOCKED workspace, plus the total at ``row_off[B]``.
+
+    ``dst`` / ``dst0`` (default ``None`` = ``meta`` at ``THD_ROWOFF_OFF(B)``, the
+    layout above): an alternative destination array view and word offset for a
+    consumer whose metadata tensor keeps the ``4B+4`` layout and carries the
+    padded offsets in a buffer of its own (the d128 pair body's stats ring).
 
     ``row_off[b] = SUM_{i<b} ceil(s[i] / gran) * gran`` over the lengths of the
     ``(B+1,)`` prefix at ``cu0`` inside ``meta`` -- the Q prefix by default (the
@@ -336,13 +341,14 @@ def write_thd_row_offsets(meta, n_batch: cutlass.Int32, gran: cutlass.Int32, cu0
     suffices.
     """
     cuq0 = n_batch if cutlass.const_expr(cu0 is None) else cu0
-    off0 = cutlass.Int32(4) * n_batch + cutlass.Int32(4)
+    out = meta if cutlass.const_expr(dst is None) else dst
+    off0 = (cutlass.Int32(4) * n_batch + cutlass.Int32(4)) if cutlass.const_expr(dst0 is None) else dst0
     run = cutlass.Int32(0)
     for b in cutlass.range(0, n_batch, 1, unroll=1):
-        meta[off0 + b] = run
+        out[off0 + b] = run
         s_b = cutlass.Int32(meta[cuq0 + b + cutlass.Int32(1)]) - cutlass.Int32(meta[cuq0 + b])
         run = run + ((s_b + gran - cutlass.Int32(1)) // gran) * gran
-    meta[off0 + n_batch] = run
+    out[off0 + n_batch] = run
 
 
 @cute.jit

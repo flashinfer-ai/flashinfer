@@ -47,16 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define NUM_MAP_RING_STAGES 2
-#define SMEM_SMEM_M_OFF 1024
-#define SMEM_SMEM_M_STAGE_BYTES 32768
-#define SMEM_SMEM_M_STRIDE 32768
-#define SMEM_SMEM_CARRY_OFF 1024
-#define SMEM_SMEM_CARRY_STAGE_BYTES 2048
-#define SMEM_SMEM_CARRY_STRIDE 2048
-#define SMEM_TOTAL 66560
-#define THREADS 128
 #define LAUNCH_MIN_BLOCKS 3
 
 #include <math_constants.h>
@@ -321,9 +311,8 @@ kernel_cake_kda_prefill_cecd42adc9f960dab210(float* __restrict__ split_state, __
             if (scan_stop > part + 1) {
                 if (warp == 0) {
                     if (elect_sync()) {
-                        unsigned int fill_slot = ((map_slot + 1 < 2) ? map_slot + 1 : (unsigned int)0);
-                        mbarrier_arrive_expect_tx(map_full_addr + (fill_slot) * 8, 32768);
-                        cp_async_bulk_gmem2smem(smem_m_addr + fill_slot * 32768, reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(map_state_bf16) + ((unsigned long long)((part * num_heads + task) * 16384) * (unsigned long long)2)), 32768, map_full_addr + (fill_slot) * 8);
+                        mbarrier_arrive_expect_tx(map_full_addr + (((map_slot + 1 < 2) ? map_slot + 1 : (unsigned int)0)) * 8, 32768);
+                        cp_async_bulk_gmem2smem(smem_m_addr + ((map_slot + 1 < 2) ? map_slot + 1 : (unsigned int)0) * 32768, reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(map_state_bf16) + ((unsigned long long)((part * num_heads + task) * 16384) * (unsigned long long)2)), 32768, map_full_addr + (((map_slot + 1 < 2) ? map_slot + 1 : (unsigned int)0)) * 8);
                     }
                 }
             }

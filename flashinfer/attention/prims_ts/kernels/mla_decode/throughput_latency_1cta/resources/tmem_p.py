@@ -23,6 +23,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32
 from cutlass.experimental.task_scheduling.enums import WorkAttr
+from cutlass.experimental.task_scheduling.memory import SmemAllocation
 from cutlass.experimental.task_scheduling.resources import (
     StageInfo,
     TaskLocalVariable,
@@ -40,6 +41,7 @@ from ...helpers.layout import (
     decode_gen_task_cache,
     num_packed_p_regs,
     num_softmax_scale_groups,
+    smem_array,
 )
 from ...helpers.math import (
     fadd2,
@@ -86,6 +88,21 @@ class TmemPResource(MlaResource):
     p_stage_idx: cutlass.Constexpr[TaskLocalVariable] = (
         TaskLocalVariable.uninitialized()
     )
+
+    # Two ping-pong M64 x N128 E4M3 probability tiles in SMEM. WS PV reads
+    # this packed A operand rather than the usual A-from-TMEM score alias;
+    # P's pipeline protects each slot while softmax fills the next one.
+    _ws_p_alloc: cutlass.Constexpr[Optional[SmemAllocation]] = None
+
+    def get_smem_requirements(self):
+        """Reserve two FP8 probability panels when WS PV reads P from shared memory."""
+        if not self.cfg.ws_pv:
+            return []
+        if self._ws_p_alloc is None:
+            self._ws_p_alloc = SmemAllocation(
+                name=f"{self.name}_ws_p", size_bytes=2 * 64 * 128, alignment=1024
+            )
+        return [self._ws_p_alloc]
 
     @consumer_work(work_attrs=WorkAttr.AUXILIARY, returns=p_stage_idx)
     @cute.jit
@@ -322,6 +339,32 @@ class TmemPResource(MlaResource):
                 is_volatile=True,
                 alignment=4,
             )
+
+        if cutlass.const_expr(cfg.ws_pv):
+            # Materialize P in K-major SMEM for WS MMA A. Native WS QK uses
+            # Layout E; the non-WS M64 path uses Layout F and remaps its rows.
+            # These are PTX data-path layouts, not global-cache layouts:
+            # https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-data-path-layout-e
+            # https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-data-path-layout-f
+            dst = smem_array(stage_info.context, self._ws_p_alloc, Int32, 4096)
+            tid = cute.arch.thread_idx()[0]
+            row = (tid // 32) * 16 + tid % 16
+            col = (tid % 32 // 16) * 16
+            if cutlass.const_expr(cfg.ws_native_e):
+                row = tid % Int32(64)
+                col = (tid // Int32(64)) * Int32(16)
+            for part in cutlass.range_constexpr(4):
+                offset = (
+                    stage_info.stage_idx * 2048
+                    + row * 32
+                    + ((col + part * 4) ^ ((row % 8) * 4))
+                )
+                dst.data_ptr(offset).store(regs_p.load(part * 4, 4), alignment=16)
+            cute.arch.fence_view_async_shared()
+            prims.barrier_cta_sync(barrier_id=0, thread_count=128)
+            if cutlass.const_expr(cfg.ws_native_e):
+                # PV consumes shared A; no redundant F-layout TMEM P copies.
+                return
 
         p_base = self._p_base_addr(stage_info, task_cache)
         if cutlass.const_expr(cfg.is_fp8_qkv()):
