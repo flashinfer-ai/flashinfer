@@ -781,6 +781,15 @@ with the same bench and nodes.  CSVs and an HTML report:
   rounds on each of two nodes): 128 -23%, 256 -31%, 512 -28%, so
   `EP8_OVERRIDES` takes it there.  With it blockwise is faster or equal
   everywhere (-1% to -30%; 16384 +0.4%, within the runs' spread).
+* Blockwise 16384 on one node of eight ran 21.4-21.5 ms on the four-rank
+  row (cga 1x2, reuse_dispatch_warps), between 8.4 ms at 8192 and 32.7 ms
+  at 32768.  Two rounds on each of two nodes: the EP8 row (cga 2x1, tail
+  split, epi_warps) 16.2-16.4 ms (-24%), cga 2x1 with reuse 16.6-16.7, with
+  reuse and tail split 16.4-16.5, the four-rank 8192 row (plus group_hint
+  264) 16.1-16.3; `EP8_OVERRIDES` takes the EP8 row.  32768 keeps its row
+  (tail split / epi_warps within 1%).  Four ranks on H100 show the same gap
+  (22.0 -> 16.2-16.3 ms with the EP8 row, -26%), but the four-rank table
+  was tuned on H200; re-measure there before moving it.
 * EP16 rows: 32 takes the 16-token row (swap-AB M256N16 cga 1x1; the M256N8
   row ran 910 us between 715 and 761 at 16 / 64): -19.5%; 8192 / 16384 take
   the 512-4096 row: -4.2% / -39.8% (16384's row returned tokens with
@@ -819,6 +828,33 @@ Internode levers left:
 5. **group_hint at 1024 / 4096** — re-swept on dlcluster (None = one wave,
    132, 198, 264, two rounds): the one-wave group of the EP8 row stays best
    (1985-1991 / 5830-5836 µs against 1996-2121 / 5868-6170).
+
+### Top-k dedup at large tokens (2026-11-03, dlcluster, one node of H100)
+
+`dedup_dispatch` and `grouped_token_back` came back with the kernel-repo sync
+(1d22e7465); the internode (GIN) path rejects both.  Drop-parity bench
+(`benchmarks/moe_ep/backends/mega/kernel/sm90/bench_moe_ep_sm90_mega.py`,
+block-permutation routing, heuristic rows), 2048 / 4096 / 8192 / 16384 /
+32768 tokens per rank, compute (kernel + TopkReduce) max-rank median against
+the same round's heuristic run:
+
+* `dedup_dispatch` (two rounds, the second reversed): blockwise EP4 +1.2 /
+  -1.9 / -3.0 / +0.7 / +0.2%, EP8 -1.8 / -1.2 / -1.1 / -0.3 / +0.1%;
+  per_tensor EP4 +0.4 / -0.2 / -0.2 / +1.3 / +2.0%, EP8 -0.7 / +1.0 / +0.6 /
+  +1.5 / +1.8%.  It drops 45% / 26% of the remote rows at EP4 / EP8 (13.8%
+  at EP16), but the pull overlaps the GEMM.
+* `grouped_token_back` (one round): blockwise +17 to +27%, per_tensor +33 to
+  +55% (with `dedup_dispatch` the same plus ~1%).  It needs
+  reuse_dispatch_warps (+5 to +8% alone at blockwise 2048-8192), and under
+  the fold layout a single dispatch warp per CTA runs every group's FP32
+  pre-reduce.  With four active dispatch warps (fold off) it is within
+  +-1% of that layout up to 16384 and -3 / -5% at 32768 (EP4 / EP8), but the
+  no-fold layout itself costs +43 to +58% blockwise and 15-19x per_tensor
+  (swap-AB ping-pong; see the 2-WG pathology below).
+* EP16: the rail-proxy design already crosses RDMA once per token and
+  remote node (PAY) and returns one node partial per token (RET).  Rank
+  dedup would only shrink the NVLink pull, which ends at ~1.65 ms of the
+  4.72 ms kernel at 4096 tokens; not pursued.
 
 ## Next levers
 

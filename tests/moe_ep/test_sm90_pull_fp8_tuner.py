@@ -73,7 +73,9 @@ class TestDefaultKnobs:
 class TestEightRankOverrides:
     @pytest.mark.parametrize("world_size", [8, 16])
     @pytest.mark.parametrize("scale_mode", ["per_tensor", "blockwise"])
-    @pytest.mark.parametrize("tokens", [8, 128, 256, 512, 1024, 2048, 4096])
+    @pytest.mark.parametrize(
+        "tokens", [8, 128, 256, 512, 1024, 2048, 4096, 8192, 16384]
+    )
     def test_eight_rank_rows(self, world_size, scale_mode, tokens, monkeypatch):
         pkg = _pkg()
         pkg.bootstrap_paths()

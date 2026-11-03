@@ -245,7 +245,10 @@ _TUNED_NUM_TOPK = 6
 # swap-AB M256N16 / M256N32 rows, which re-read every expert's weights per
 # token tile (16 / 32 rows per expert; the M128N32 ping-pong row 256 ran
 # before the 1x128 scale sync is no longer legal and the M256 row lost 39% to
-# it), -28% against the M64N256 CGA1x1 row at 512.
+# it), -28% against the M64N256 CGA1x1 row at 512.  Blockwise 16384 (same
+# nodes, two rounds on each) takes it as well: 16.3 ms against 21.4 ms on the
+# four-rank row (cga 1x2, reuse_dispatch_warps), -24%; 32768 keeps its row
+# (epi_warps / tail split within 1% there).
 _EP8_BW_ROW = _config(swap_ab=False, pingpong=False, tile=(64, 256, 128), cga=(2, 1, 1),
                       tail_split_pairs=True)
 EP8_OVERRIDES = {
@@ -264,6 +267,7 @@ EP8_OVERRIDES = {
                       tail_split_pairs=True),
         4096: _config(swap_ab=False, pingpong=False, tile=(64, 256, 128), cga=(2, 1, 1),
                       tail_split_pairs=True),
+        16384: _EP8_BW_ROW,
     },
 }
 
