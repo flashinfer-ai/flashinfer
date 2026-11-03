@@ -24,7 +24,8 @@ a ``bool`` (``TypeError``):
   ``flashinfer.cake_kda_det_train``): the same inputs, hardware and plan give
   bitwise the same outputs and gradients.
 * ``deterministic=False`` runs the package
-  ``flashinfer.experimental.cake.cake_kda_train``.  Its backward moves the
+  ``flashinfer.experimental.cake.cake_kda_train``.  In the g mode (the
+  default; the raw gate mode is below) its backward moves the
   ``q * dq`` term of the gate gradient ``dg`` from the fused dq / dk / dg
   program into the GLM intra program, so the fused program no longer reads
   ``q``.  The schedule has a fixed order: repeated calls give bitwise the same
@@ -42,9 +43,17 @@ keywords to the package of the call's mode, ``chunk_kda_bwd`` then returns seven
 tensors (``dA_log`` / ``ddt_bias`` added), and the workspace and its byte query
 take ``use_gate_in_kernel``.  The raw mode has no ``S1`` pair: with
 ``deterministic=False`` it runs the deterministic package's raw-mode programs in
-the same order, so ``out`` and every gradient (``dg``, ``dA_log`` and
-``ddt_bias`` included) are bitwise the deterministic package's raw mode.  Both
-packages' saved sets carry the gate mode and ``lower_bound``, so either
+the same order, so ``out``, ``dq``, ``dk``, ``dv``, ``dbeta`` and ``dg`` are
+bitwise the deterministic package's raw mode, but for the reduce of ``dA_log`` /
+``ddt_bias``.  On SM107 that reduce is the deterministic package's too (bitwise
+results).  On SM100 / SM103 the backward adds the per-chunk parameter partials in
+FP64 in no fixed order and rounds the sums to FP32 once, so ``dA_log`` /
+``ddt_bias`` can differ by one FP32 ulp from run to run and from the
+deterministic package (within the same error bound against an FP64 reference);
+its workspace then also holds the FP64 accumulators (2 KiB per head; 16 KiB per
+head on SM100 from 32 heads), which the byte query counts.  Under torch's
+deterministic algorithms such a call runs the deterministic package, as above.
+Both packages' saved sets carry the gate mode and ``lower_bound``, so either
 backward reads the other's raw set.
 
 The in-kernel Q/K L2 norm (``use_qk_l2norm_in_kernel=True``: raw ``q`` / ``k``

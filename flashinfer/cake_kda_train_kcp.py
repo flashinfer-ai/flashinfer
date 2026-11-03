@@ -31,8 +31,9 @@ package's checkpoint hand-off counters) takes none:
   (``flashinfer.cake_kda_train`` with ``deterministic=False``), whose backward
   moves the ``q * dq`` term of the gate gradient ``dg`` from the fused
   dq / dk / dg program into the GLM intra program on the rows its registry
-  lists.  The schedule has a fixed order: at the same topology repeated calls
-  give bitwise the same results, ``out``, ``dq``, ``dk``, ``dv`` and ``dbeta``
+  lists.  In the g mode (the default; the raw gate mode is below) the schedule
+  has a fixed order: at the same topology repeated calls give bitwise the same
+  results, ``out``, ``dq``, ``dk``, ``dv`` and ``dbeta``
   are bitwise the deterministic package's, and ``dg`` differs from it by FP32
   rounding only (the same accuracy budget).
 * With ``torch.use_deterministic_algorithms(True)``, ``deterministic=False``
@@ -97,9 +98,19 @@ forward the keywords, ``chunk_kda_bwd_kcp`` then returns seven tensors
 :func:`reduce_gate_param_grads_kcp`), and ``kda_workspace_bytes_kcp`` /
 ``kda_saved_bytes_kcp`` take ``use_gate_in_kernel``.  With ``deterministic=False``
 the rank-local stages run the non-deterministic single-rank package's raw
-records, copies of the deterministic raw programs on every row, so every output,
-the raw gate's gradient and the parameter partial sums are bitwise those of
-``deterministic=True``; the checkpoint hand-off does not engage in this mode.
+records, copies of the deterministic raw programs on every row but for the
+parameter-gradient reduce, so every output and the raw gate's gradient are
+bitwise those of ``deterministic=True``.  On SM107 the parameter partial sums
+are bitwise too.  On SM100 / SM103 each rank adds its per-chunk parameter
+partials in FP64 in no fixed order and rounds the sums to FP32 once, so its
+partial sums can differ by one FP32 ulp from run to run and from
+``deterministic=True`` (within the same error bound against an FP64
+reference); its local arena then also holds the FP64 accumulators (2 KiB per
+head; 16 KiB per head on SM100 from 32 heads), which
+``kda_workspace_bytes_kcp`` counts.  :func:`reduce_gate_param_grads_kcp` keeps
+the fixed rank order, so every rank gets the same sums.  Under torch's
+deterministic algorithms such a call runs the deterministic package, as above.
+The checkpoint hand-off does not engage in the raw mode.
 The in-kernel q / k L2 norm (``use_qk_l2norm_in_kernel=True``, #7817) runs on
 the deterministic package only: the compute entries forward it, and
 ``kda_workspace_bytes_kcp`` / ``kda_saved_bytes_kcp`` take it.
