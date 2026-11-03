@@ -73,7 +73,8 @@ are bitwise on ``sm_107a`` and differ by FP32 rounding on the ``R1c`` rows
 FP32 values, ``param_differing_elements`` how many differ).
 
 ``--build-order`` sets which Cake arm allocates first: its workspace (with the
-accumulators of an ``R1c`` row), its saved set and its closures.  The arena
+accumulators of an ``R1c`` row), its first results comparison call (where its
+first-use buffers are made), its saved set and its closures.  The arena
 placement this decides moves a few kernels by microseconds, so a det / nd ratio
 measured in one order carries a placement bias.  ``det-first`` (the default)
 is the order of the earlier runs; ``nd-first`` swaps it; ``both`` runs every
@@ -82,6 +83,21 @@ the two orders' medians (``order_avg``), the ratios of those means
 (``ratio_det_over_nd``), each order's ratio (``ratio_det_over_nd_by_order``)
 and the boundaries where nd is slower in both orders
 (``nd_slower_both_orders``).
+
+``--l2n`` runs every row with the in-kernel Q/K L2 norm
+(``use_qk_l2norm_in_kernel=True``), in each ``--gate`` mode: ``q`` / ``k``
+are raw BF16 rows of a few magnitudes per token (drawn as the deterministic
+package's in-kernel-norm tests draw them, :func:`raw_qk`; the other operands
+are those of the row's gate mode), the Cake arms' workspaces are of that mode
+(``l2n="fused"``) and their calls take the keyword, and flash-linear-attention's
+arm runs ``chunk_kda(use_qk_l2norm_in_kernel=True, ...)`` on the same raw rows
+in its layout: every arm's norm and the norm's gradient are inside its
+boundaries.  The row compares flash-linear-attention's ``out`` with the
+non-deterministic arm's (``fla_l2n_out_vs_nd``: the relative RMS difference;
+an adapter that skips the norm shows here).  This package's in-kernel-norm mode
+runs the deterministic package's programs in the same order, so every result
+(``dg`` included) is bitwise the deterministic one and no path runs an S1
+pair.
 
 Memory: per row, arm and boundary one untimed call after the warm-up, between
 ``torch.cuda.reset_peak_memory_stats()`` and the allocator's counters, gives
@@ -114,6 +130,7 @@ Example::
     python benchmarks/bench_cake_kda_train.py --seqlen 65536 --docs 3 --heads 16 --side-stream
     python benchmarks/bench_cake_kda_train.py --seqlen 16384 65536 --docs 3 --heads 4 64 --gate g raw
     python benchmarks/bench_cake_kda_train.py --seqlen 16384 --docs 1 3 --heads 4 64 --gate raw --build-order both
+    python benchmarks/bench_cake_kda_train.py --seqlen 65536 --docs 3 --heads 4 64 --gate g raw --l2n --build-order both
 """
 
 from __future__ import annotations
@@ -142,6 +159,7 @@ from flashinfer.experimental.cake_kda_det_train import (  # noqa: E402
 )
 from flashinfer.testing import bench_gpu_time  # noqa: E402
 from tests.test_helpers.cake_kda_det_train_reference import (  # noqa: E402
+    D,
     LOWER_BOUND,
     make_inputs,
     make_raw_inputs,
@@ -156,6 +174,10 @@ GATES = ("g", "raw")
 # --build-order: which Cake arm allocates its workspace, saved set and closures first ("both": every row in each)
 ORDERS = ("det-first", "nd-first")
 BUILD_ORDERS = ORDERS + ("both",)
+# the Cake arms of one build order, the first built first
+CAKE_ARMS = {"det-first": ("det", "nd"), "nd-first": ("nd", "det")}
+# the key of a row's operands that marks the in-kernel Q/K L2 norm (raw q / k rows; see make_row_inputs)
+L2N_KEY = "use_qk_l2norm_in_kernel"
 # ``--side-stream``: a one-thread kernel resident on another stream while a Cake call runs.  It spins for at least
 # SIDE_MIN_CYCLES (about 5 ms at 2 GHz) and SIDE_CYCLES_PER_MS per ms of the call's slowest warm-up (twice the call at
 # 2 GHz); the call starts after PRE_SLEEP_CYCLES on its own stream, so the side kernel is resident first.
@@ -257,12 +279,77 @@ def _leaf_names(inputs: dict) -> tuple[str, ...]:
     return names + (("A_log", "dt_bias") if _gate_of(inputs) == "raw" else ())
 
 
+def raw_qk(S: int, H: int, seed: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
+    """Raw (not normalized) BF16 ``q`` / ``k`` ``[S, H, 128]`` on the host, of a few magnitudes per token (the
+    caller's projections), drawn as the deterministic package's in-kernel-norm tests draw them."""
+    gen = torch.Generator().manual_seed(7817 + seed + 31 * S + H)
+    mag = torch.exp(torch.randn(S, H, 1, generator=gen) * 1.5)
+    q = (torch.randn(S, H, D, generator=gen) * mag).to(torch.bfloat16)
+    k = (torch.randn(S, H, D, generator=gen) * mag.flip(0)).to(torch.bfloat16)
+    return q, k
+
+
+def make_row_inputs(
+    lengths: tuple[int, ...],
+    heads: int,
+    device: torch.device,
+    *,
+    gate: str = "g",
+    l2n: bool = False,
+) -> dict:
+    """The operands of a row: :func:`make_inputs` (``gate="g"``) or :func:`make_raw_inputs` (``"raw"``), and with
+    ``l2n`` the raw ``q`` / ``k`` rows of :func:`raw_qk` in place of the normalized ones plus the :data:`L2N_KEY`
+    mark (the in-kernel Q/K L2 norm of every arm on these operands)."""
+    inputs = {"g": make_inputs, "raw": make_raw_inputs}[gate](lengths, heads, device)
+    if l2n:
+        q, k = raw_qk(int(sum(lengths)), heads)
+        inputs["q"], inputs["k"] = q.to(device), k.to(device)
+        inputs[L2N_KEY] = True
+    return inputs
+
+
+def _l2n_of(inputs: dict) -> bool:
+    """Whether a row's operands are for the in-kernel Q/K L2 norm (raw ``q`` / ``k``; :func:`make_row_inputs`)."""
+    return bool(inputs.get(L2N_KEY, False))
+
+
+def _l2n_kw(inputs: dict) -> dict:
+    """The in-kernel Q/K L2 norm keyword of a Cake call on ``inputs``, empty without it (the call as it always
+    was)."""
+    return {L2N_KEY: True} if _l2n_of(inputs) else {}
+
+
+def cake_workspace(
+    seqlen: int,
+    docs: int,
+    heads: int,
+    device: torch.device,
+    *,
+    gate: str = "g",
+    l2n: bool = False,
+    deterministic: bool,
+):
+    """A loaded workspace of one Cake arm (the deterministic package's, or this package's with
+    ``deterministic=False``) for the row's gate mode and in-kernel Q/K L2 norm mode."""
+    mode = {"gate": gate, "l2n": "fused" if l2n else "off"}
+    if deterministic:
+        ws = det_backend.KdaDetWorkspace.for_problem(
+            seqlen, docs, heads, device, **mode
+        )
+    else:
+        ws = nd_backend.KdaWorkspace.for_problem(
+            seqlen, docs, heads, device, deterministic=False, **mode
+        )
+    ws.load()
+    return ws
+
+
 def cake_boundaries(
     inputs: dict, ws, *, deterministic: bool
 ) -> dict[str, Callable[[], object]]:
     """The boundaries of one Cake arm on its workspace: the deterministic package's entries, or this package's
-    with ``deterministic=False``, in the gate mode of ``inputs``.  Each closure returns its results (the memory
-    call holds them)."""
+    with ``deterministic=False``, in the gate mode and in-kernel Q/K L2 norm mode of ``inputs``.  Each closure
+    returns its results (the memory call holds them)."""
     q, k, v, g, beta, cu, dout = (
         inputs[n] for n in ("q", "k", "v", "g", "beta", "cu_seqlens", "dout")
     )
@@ -277,24 +364,45 @@ def cake_boundaries(
         autograd_fn = nd_backend.chunk_kda
         mode = {"deterministic": False}
     raw = _raw_kw(inputs)
+    l2n = _l2n_kw(inputs)
 
     def fwd() -> object:
         return fwd_fn(
-            q, k, v, g, beta, cu, save_for_backward=True, workspace=ws, **mode, **raw
+            q,
+            k,
+            v,
+            g,
+            beta,
+            cu,
+            save_for_backward=True,
+            workspace=ws,
+            **mode,
+            **raw,
+            **l2n,
         )
 
     _, saved = fwd_fn(
-        q, k, v, g, beta, cu, save_for_backward=True, workspace=ws, **mode, **raw
+        q,
+        k,
+        v,
+        g,
+        beta,
+        cu,
+        save_for_backward=True,
+        workspace=ws,
+        **mode,
+        **raw,
+        **l2n,
     )
 
     def bwd() -> object:
         return bwd_fn(
-            q, k, v, g, beta, cu, dout, saved=saved, workspace=ws, **mode, **raw
+            q, k, v, g, beta, cu, dout, saved=saved, workspace=ws, **mode, **raw, **l2n
         )
 
     def replay() -> object:
         return bwd_fn(
-            q, k, v, g, beta, cu, dout, saved=None, workspace=ws, **mode, **raw
+            q, k, v, g, beta, cu, dout, saved=None, workspace=ws, **mode, **raw, **l2n
         )
 
     leaves = [
@@ -304,7 +412,7 @@ def cake_boundaries(
     def step(*a):
         # the raw mode's A_log / dt_bias are leaves too (gradients to them)
         return autograd_fn(
-            *a[:5], cu, workspace=ws, **mode, **_raw_kw(inputs, a[5:] or None)
+            *a[:5], cu, workspace=ws, **mode, **_raw_kw(inputs, a[5:] or None), **l2n
         )
 
     def ckpt() -> object:
@@ -315,10 +423,11 @@ def cake_boundaries(
 
 
 def fla_boundaries(inputs: dict) -> dict[str, Callable[[], object]] | None:
-    """flash-linear-attention's ``chunk_kda`` on the same operands (no in-kernel L2 norm or beta sigmoid; the
-    preactivated gate, or in the raw gate mode its in-kernel gate with ``A_log``, ``dt_bias`` and the lower bound),
-    or ``None`` when the package is not installed.  The first call runs here: an exception from it propagates to
-    the caller (:func:`run_row` records it as ``fla_error``)."""
+    """flash-linear-attention's ``chunk_kda`` on the same operands (no beta sigmoid; the preactivated gate, or in
+    the raw gate mode its in-kernel gate with ``A_log``, ``dt_bias`` and the lower bound; its in-kernel L2 norm of
+    the raw ``q`` / ``k`` rows on the in-kernel-norm operands of :func:`make_row_inputs`, else none), or ``None``
+    when the package is not installed.  The first call runs here: an exception from it propagates to the caller
+    (:func:`run_row` records it as ``fla_error``)."""
     try:
         from fla.ops.kda import chunk_kda as fla_chunk_kda
     except Exception:
@@ -328,6 +437,7 @@ def fla_boundaries(inputs: dict) -> dict[str, Callable[[], object]] | None:
     )
 
     raw_mode = _gate_of(inputs) == "raw"
+    l2n = _l2n_of(inputs)
 
     def call(q_, k_, v_, g_, beta_, *params):
         gate = (
@@ -349,7 +459,7 @@ def fla_boundaries(inputs: dict) -> dict[str, Callable[[], object]] | None:
             scale=nd_backend.SCALE,
             initial_state=None,
             output_final_state=False,
-            use_qk_l2norm_in_kernel=False,
+            use_qk_l2norm_in_kernel=l2n,
             use_beta_sigmoid_in_kernel=False,
             safe_gate=True,
             cu_seqlens=cu,
@@ -377,15 +487,16 @@ def fla_boundaries(inputs: dict) -> dict[str, Callable[[], object]] | None:
 
 
 def _results(inputs: dict, ws, *, deterministic: bool, replay: bool) -> dict:
-    """``out`` and the gradients of one Cake arm (from the saved set, or the replay's), in the gate mode of
-    ``inputs``."""
+    """``out`` and the gradients of one Cake arm (from the saved set, or the replay's), in the gate mode and
+    in-kernel Q/K L2 norm mode of ``inputs``."""
     q, k, v, g, beta, cu, dout = (
         inputs[n] for n in ("q", "k", "v", "g", "beta", "cu_seqlens", "dout")
     )
     raw = _raw_kw(inputs)
+    l2n = _l2n_kw(inputs)
     if deterministic:
         out, saved = det_backend.chunk_kda_det_fwd(
-            q, k, v, g, beta, cu, workspace=ws, **raw
+            q, k, v, g, beta, cu, workspace=ws, **raw, **l2n
         )
         grads = det_backend.chunk_kda_det_bwd(
             q,
@@ -398,10 +509,11 @@ def _results(inputs: dict, ws, *, deterministic: bool, replay: bool) -> dict:
             saved=None if replay else saved,
             workspace=ws,
             **raw,
+            **l2n,
         )
     else:
         out, saved = nd_backend.chunk_kda_fwd(
-            q, k, v, g, beta, cu, workspace=ws, deterministic=False, **raw
+            q, k, v, g, beta, cu, workspace=ws, deterministic=False, **raw, **l2n
         )
         grads = nd_backend.chunk_kda_bwd(
             q,
@@ -415,6 +527,7 @@ def _results(inputs: dict, ws, *, deterministic: bool, replay: bool) -> dict:
             workspace=ws,
             deterministic=False,
             **raw,
+            **l2n,
         )
     order = RAW_GRAD_ORDER if raw else GRAD_ORDER
     return {
@@ -442,15 +555,25 @@ def _ulp_distance(a: torch.Tensor, b: torch.Tensor) -> tuple[int, int]:
     return int(d.max().item()), int((d > 0).sum().item())
 
 
-def _nd_vs_det(inputs: dict, det_ws, nd_ws) -> dict:
+def _nd_vs_det(inputs: dict, det_ws, nd_ws, build_order: str = "det-first") -> dict:
     """The non-deterministic results against the deterministic ones on the same inputs, from the saved set and from
     the replay: the outputs that are bitwise (in the raw gate mode every one but ``dA_log`` / ``ddt_bias`` of an
-    ``R1c`` row), ``dg``'s differing elements and largest difference, and in the raw gate mode the largest FP32 ulp
-    distance of ``dA_log`` / ``ddt_bias`` and their differing elements."""
+    ``R1c`` row; in the in-kernel Q/K L2 norm mode every one, ``dg`` included), ``dg``'s differing elements and
+    largest difference, and in the raw gate mode the largest FP32 ulp distance of ``dA_log`` / ``ddt_bias`` and
+    their differing elements.  The arms run in ``build_order`` (:data:`CAKE_ARMS`): the first call on a workspace
+    makes its first-use buffers."""
     report = {}
     for label, replay in (("saved", False), ("replay", True)):
-        det = _results(inputs, det_ws, deterministic=True, replay=replay)
-        nd = _results(inputs, nd_ws, deterministic=False, replay=replay)
+        results = {
+            arm: _results(
+                inputs,
+                det_ws if arm == "det" else nd_ws,
+                deterministic=arm == "det",
+                replay=replay,
+            )
+            for arm in CAKE_ARMS[build_order]
+        }
+        det, nd = results["det"], results["nd"]
         diff = (nd["dg"].double() - det["dg"].double()).abs()
         report[label] = {
             "bitwise": [name for name in det if _bits_equal(nd[name], det[name])],
@@ -470,10 +593,12 @@ def _nd_vs_det(inputs: dict, det_ws, nd_ws) -> dict:
     return report
 
 
-def _nd_vs_det_or_error(inputs: dict, det_ws, nd_ws) -> dict:
+def _nd_vs_det_or_error(
+    inputs: dict, det_ws, nd_ws, build_order: str = "det-first"
+) -> dict:
     """:func:`_nd_vs_det`, or its error when the two arms' results do not fit in device memory beside the inputs."""
     try:
-        return _nd_vs_det(inputs, det_ws, nd_ws)
+        return _nd_vs_det(inputs, det_ws, nd_ws, build_order)
     except torch.OutOfMemoryError as exc:
         gc.collect()
         torch.cuda.empty_cache()
@@ -578,26 +703,23 @@ def run_row(
     fla_alone: bool = False,
     arms_alone: bool = False,
     gate: str = "g",
+    l2n: bool = False,
     build_order: str = "det-first",
 ) -> dict:
     if build_order not in ORDERS:
         raise ValueError(f"build_order must be one of {ORDERS}, got {build_order!r}")
     lengths = split_docs(seqlen, docs) if lengths is None else lengths
-    make = {"g": make_inputs, "raw": make_raw_inputs}[gate]
-    inputs = make(lengths, heads, device)
+    inputs = make_row_inputs(lengths, heads, device, gate=gate, l2n=l2n)
 
     def det_workspace():
-        ws = det_backend.KdaDetWorkspace.for_problem(
-            seqlen, docs, heads, device, gate=gate
+        return cake_workspace(
+            seqlen, docs, heads, device, gate=gate, l2n=l2n, deterministic=True
         )
-        ws.load()
-        return ws
 
     def nd_workspace():
-        ws = nd_backend.KdaWorkspace.for_problem(
-            seqlen, docs, heads, device, gate=gate, deterministic=False
+        ws = cake_workspace(
+            seqlen, docs, heads, device, gate=gate, l2n=l2n, deterministic=False
         )
-        ws.load()
         _ = (
             ws.param_acc
         )  # an R1c row's accumulators, allocated with the arena (None elsewhere)
@@ -613,6 +735,7 @@ def run_row(
         "lengths": list(lengths),
         "heads": heads,
         "gate": gate,
+        "l2n": l2n,
         "build_order": build_order,
         "arch": nd_ws.arch,
         "recurrence": nd_ws.plan.recur,
@@ -626,11 +749,15 @@ def run_row(
         if gate == "raw"
         else 0,
         "saved_bytes": nd_backend.saved_bytes(
-            seqlen, heads, docs, sm_count=nd_ws.plan.sm_count
+            seqlen,
+            heads,
+            docs,
+            sm_count=nd_ws.plan.sm_count,
+            l2n="fused" if l2n else "off",
         ),
         "nd_vs_det": {"skipped": "--arms-alone"}
         if arms_alone
-        else _nd_vs_det_or_error(inputs, det_ws, nd_ws),
+        else _nd_vs_det_or_error(inputs, det_ws, nd_ws, build_order),
         "rounds": rounds,
         "arm_order": [],
         "ms_rounds": {},
@@ -666,10 +793,11 @@ def run_row(
             fla_failed(exc)
         if fla is not None:
             arms["fla"] = fla
-    if gate == "raw" and "fla" in arms:
-        # flash-linear-attention's raw form against this package's out on the same operands
+    if (gate == "raw" or l2n) and "fla" in arms:
+        # flash-linear-attention's raw or in-kernel-norm form against this package's out on the same operands
+        key = "fla_l2n_out_vs_nd" if l2n else "fla_raw_out_vs_nd"
         try:
-            row["fla_raw_out_vs_nd"] = _fla_raw_out_vs_nd(inputs, arms["fla"], nd_ws)
+            row[key] = _fla_out_vs_nd(inputs, arms["fla"], nd_ws)
         except Exception as exc:
             fla_failed(exc)
     # warm every closure once (libraries loaded, the allocator primed) before the first timed round
@@ -726,12 +854,11 @@ def run_row(
         det_ws = nd_ws = None
         gc.collect()
         torch.cuda.empty_cache()
-        builders = {
+        cake_builders = {
             "det": lambda: cake_boundaries(inputs, det_workspace(), deterministic=True),
             "nd": lambda: cake_boundaries(inputs, nd_workspace(), deterministic=False),
         }
-        if build_order == "nd-first":
-            builders = {"nd": builders["nd"], "det": builders["det"]}
+        builders = {arm: cake_builders[arm] for arm in CAKE_ARMS[build_order]}
         if baseline:
             builders["fla"] = lambda: fla_boundaries(inputs)
         for arm, build in builders.items():
@@ -841,6 +968,7 @@ def combine_orders(by_order: dict[str, dict]) -> dict:
             "lengths",
             "heads",
             "gate",
+            "l2n",
             "arch",
             "recurrence",
             "segments_per_doc",
@@ -879,9 +1007,10 @@ def combine_orders(by_order: dict[str, dict]) -> dict:
     return row
 
 
-def _fla_raw_out_vs_nd(inputs: dict, fla: dict, nd_ws) -> float:
-    """The relative RMS difference of flash-linear-attention's raw-mode ``out`` from this package's on the same
-    operands (an FLA adapter that drops a gate term differs by far more than the two kernels' roundings)."""
+def _fla_out_vs_nd(inputs: dict, fla: dict, nd_ws) -> float:
+    """The relative RMS difference of flash-linear-attention's ``out`` (its raw gate mode and / or its in-kernel
+    L2 norm, as the row's operands take) from this package's on the same operands (an FLA adapter that drops a gate
+    term or the norm differs by far more than the two kernels' roundings)."""
     out_fla = fla["fwd"]().detach().double()
     out_nd = cake_boundaries(inputs, nd_ws, deterministic=False)["fwd"]()[0].double()
     return float((out_fla - out_nd).pow(2).mean().sqrt() / out_nd.pow(2).mean().sqrt())
@@ -889,7 +1018,8 @@ def _fla_raw_out_vs_nd(inputs: dict, fla: dict, nd_ws) -> float:
 
 def _print_row(row: dict, boundaries: tuple[str, ...]) -> None:
     cells = [
-        f"S={row['seqlen']:>7} N={row['docs']} H={row['heads']:>2} gate={row['gate']} {row['arch']} "
+        f"S={row['seqlen']:>7} N={row['docs']} H={row['heads']:>2} gate={row['gate']}"
+        f"{' l2n' if row['l2n'] else ''} {row['build_order']} {row['arch']} "
         f"{row['recurrence']}{'/P' + str(row['segments_per_doc']) if row['recurrence'] == 'seg' else ''} "
         f"S1[{','.join(row['s1_paths']) or '-'}] order={row['build_order']}"
     ]
@@ -907,6 +1037,8 @@ def _print_row(row: dict, boundaries: tuple[str, ...]) -> None:
         cells.append(cell)
     if "fla_raw_out_vs_nd" in row:
         cells.append(f"fla raw out vs nd rel RMS {row['fla_raw_out_vs_nd']:.2e}")
+    if "fla_l2n_out_vs_nd" in row:
+        cells.append(f"fla l2n out vs nd rel RMS {row['fla_l2n_out_vs_nd']:.2e}")
     if "fla_error" in row:
         cells.append(f"fla error: {row['fla_error'][:120]}")
     if row.get("nd_slower_both_orders"):
@@ -954,6 +1086,7 @@ def _write_json(
                 "gates": list(args.gate),
                 "build_order": args.build_order,
                 "lower_bound": LOWER_BOUND if "raw" in args.gate else None,
+                "l2n": args.l2n,
                 "rows": rows,
             },
             f,
@@ -973,6 +1106,11 @@ def main() -> int:
         default=["g"],
         choices=GATES,
         help="the forget gate's forms per row: g (the activated FP32 gate) and / or raw (use_gate_in_kernel=True)",
+    )
+    parser.add_argument(
+        "--l2n",
+        action="store_true",
+        help="every row with the in-kernel Q/K L2 norm (use_qk_l2norm_in_kernel=True on raw q / k, every arm)",
     )
     parser.add_argument(
         "--lengths",
@@ -1069,6 +1207,7 @@ def main() -> int:
                 fla_alone=args.fla_alone,
                 arms_alone=args.arms_alone,
                 gate=gate,
+                l2n=args.l2n,
                 build_order=order,
             )
             _print_row(by_order[order], boundaries)
@@ -1100,8 +1239,8 @@ def main() -> int:
             geo = math.exp(sum(math.log(x) for x in ratios) / len(ratios))
             slower = sum(x < 1.0 for x in ratios)
             print(
-                f"# gate={gate} {name} ({args.build_order}): det / nd geomean x{geo:.4f} over {len(ratios)} "
-                f"rows; nd slower on {slower} rows"
+                f"# gate={gate}{' l2n' if args.l2n else ''} {name} ({args.build_order}): det / nd geomean "
+                f"x{geo:.4f} over {len(ratios)} rows; nd slower on {slower} rows"
             )
     if args.json:
         _write_json(

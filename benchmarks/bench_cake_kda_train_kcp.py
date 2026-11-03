@@ -49,7 +49,8 @@ Arms (``--arms``), every one the same packed batch split by the same partition
   every rank drops the arm, the report records ``fla_error`` (the first failing
   rank, the exception type and message) and the other arms go on.  FLA takes
   the operands as given (``scale=None``, no in-kernel L2 norm, gate or beta
-  sigmoid) with ``safe_gate=True``, its path for gates bounded below (they lie
+  sigmoid outside the raw gate and ``--l2n`` modes below) with
+  ``safe_gate=True``, its path for gates bounded below (they lie
   in ``(-5, 0)``; ``--no-fla-safe-gate`` runs its general path instead).
 * ``fla_cp`` (run only when ``--arms`` names it): flash-linear-attention's
   context-parallel KDA (its ``chunk_kda`` with the ``cp_context`` of
@@ -140,11 +141,26 @@ never engages in this mode (with ``nd_off`` or ``--ckpt-handoff on`` the
 ``ckpt`` comparison expects no engagement), and the workspace bytes are those
 of the raw mode (with the FP64 accumulators of an ``R1c`` rank).
 
-``--build-order det-first`` (the default) runs the agreement step's ``det``
-step before its ``nd`` step, so the deterministic package allocates its
-workspace first; ``nd-first`` swaps the two.  The arena placement this decides
-moves a few kernels by microseconds; time a det / nd comparison in both orders
-(two runs) and take the mean of the two orders' medians.
+In-kernel Q/K L2 norm (``--l2n``, in either ``--gate`` mode): ``q`` / ``k`` of
+the whole batch are raw BF16 rows of a few magnitudes per token (``raw_qk``,
+drawn as the deterministic package's single-rank in-kernel-norm tests draw
+them, from ``--seed``), sharded as the other operands, and every arm normalizes
+them inside its step: ``det``, ``nd``, ``control`` and ``nd_off`` call the KCP
+entries of their package with ``use_qk_l2norm_in_kernel=True``, ``local`` the
+single-rank package's entry, ``fla`` and ``fla_cp``
+flash-linear-attention's ``chunk_kda(use_qk_l2norm_in_kernel=True, ...)``.
+This package's in-kernel-norm mode runs the deterministic programs in the same
+order, so the agreement step requires every result to have the deterministic
+arm's bit pattern, ``dg`` included.  The checkpoint hand-off never engages in
+this mode, and the workspace and saved-set bytes are those of the mode.
+
+Build order (``--build-order``: ``det-first``, the default, or ``nd-first``): the arm
+of the two built first builds its context first, runs its first call (the
+agreement step, where its first allocations happen) first, and at every
+boundary takes its untimed call and its memory probe first; the timed
+palindrome keeps its order.  The device placement of the two arms' buffers can
+move ``det / nd`` with the same programs: time a configuration in both orders
+and read a difference as the packages' only when it holds in both.
 
 Example::
 
@@ -153,6 +169,8 @@ Example::
         --boundaries fwd bwd step ckpt --json kcp_nd.json
     torchrun --nproc_per_node 4 benchmarks/bench_cake_kda_train_kcp.py \\
         --seqlen 65536 --docs 3 --heads 16 --no-conv --gate raw --json kcp_nd_raw.json
+    torchrun --nproc_per_node 4 benchmarks/bench_cake_kda_train_kcp.py \\
+        --seqlen 65536 --docs 3 --heads 16 --no-conv --l2n --build-order nd-first --json kcp_nd_l2n.json
 """
 
 from __future__ import annotations
@@ -207,6 +225,7 @@ from flashinfer.experimental.cake_kda_train_kcp import (  # noqa: E402
     cake_kcp as nd_kcp,
 )
 from tests.test_helpers.cake_kda_det_train_reference import (  # noqa: E402
+    D,
     LOWER_BOUND,
     make_inputs,
     make_raw_inputs,
@@ -235,6 +254,10 @@ RAW_BITWISE = ("dg", "dA_log", "ddt_bias", "dA_log_sum", "ddt_bias_sum")
 R1C_PARAMS = ("dA_log", "ddt_bias", "dA_log_sum", "ddt_bias_sum")
 R1C_ARCHES = ("sm_100a", "sm_103a")
 BUILD_ORDERS = ("det-first", "nd-first")
+# the det and nd arms of one build order, the first built first (context, first call, untimed call, memory probe)
+CAKE_ARMS = {"det-first": ("det", "nd"), "nd-first": ("nd", "det")}
+# the in-kernel Q/K L2 norm mode adds dg to the bitwise results (the deterministic programs, no S1 pair)
+L2N_BITWISE = ("dg",)
 
 Step = tuple[Callable[[], Any], Callable[[Any], Any]]
 
@@ -252,6 +275,16 @@ def split_docs(seqlen: int, docs: int) -> tuple[int, ...]:
             lengths[i] += 1
             lengths[i + 1] -= 1
     return tuple(lengths)
+
+
+def raw_qk(S: int, H: int, seed: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
+    """Raw (not normalized) BF16 ``q`` / ``k`` ``[S, H, 128]`` on the host, of a few magnitudes per token (the
+    caller's projections), drawn as the deterministic package's single-rank in-kernel-norm tests draw them."""
+    gen = torch.Generator().manual_seed(7817 + seed + 31 * S + H)
+    mag = torch.exp(torch.randn(S, H, 1, generator=gen) * 1.5)
+    q = (torch.randn(S, H, D, generator=gen) * mag).to(torch.bfloat16)
+    k = (torch.randn(S, H, D, generator=gen) * mag.flip(0)).to(torch.bfloat16)
+    return q, k
 
 
 def _init() -> tuple[int, int, torch.device]:
@@ -280,11 +313,15 @@ def _fragment_key(part) -> list[list[tuple[int, int, int]]]:
 
 def make_problem(args, rank: int, world: int, device: torch.device) -> dict[str, Any]:
     """The whole batch on the CPU (every rank draws the same tensors; with the ``fla_cp`` arm its KDA operands stay
-    as ``global`` for FLA's partition), this rank's shard on the device and its fragments, and one partition and
-    context per package (the two partitions must give every rank the same fragments)."""
+    as ``global`` for FLA's partition; with ``--l2n`` raw ``q`` / ``k`` rows), this rank's shard on the device and
+    its fragments, and one partition and context per package (the two partitions must give every rank the same
+    fragments; the contexts built in ``--build-order``)."""
     lengths = split_docs(args.seqlen, args.docs)
     make = make_raw_inputs if args.gate == "raw" else make_inputs
     inputs = make(lengths, args.heads, device="cpu", seed=args.seed, with_dout=True)
+    if args.l2n:
+        # the norm is the arms' work: raw rows in place of the normalized ones
+        inputs["q"], inputs["k"] = raw_qk(args.seqlen, args.heads, args.seed)
     cu = [0]
     for length in lengths:
         cu.append(cu[-1] + length)
@@ -304,10 +341,13 @@ def make_problem(args, rank: int, world: int, device: torch.device) -> dict[str,
         raise RuntimeError(
             "the two packages' partitions of the batch differ; the arms would not time the same shards"
         )
-    ctx = {
-        "det": build_context_det_kcp(part_det, group, rank, device),
-        "nd": build_context_kcp(part_nd, group, rank, device, deterministic=False),
+    build = {
+        "det": lambda: build_context_det_kcp(part_det, group, rank, device),
+        "nd": lambda: build_context_kcp(
+            part_nd, group, rank, device, deterministic=False
+        ),
     }
+    ctx = {arm: build[arm]() for arm in CAKE_ARMS[args.build_order]}
     fragments = part_nd.fragments[rank]
     local = {
         name: _shard(inputs[name], cu, fragments).to(device)
@@ -335,6 +375,8 @@ def make_problem(args, rank: int, world: int, device: torch.device) -> dict[str,
         "fla_safe_gate": not args.no_fla_safe_gate,
         "ckpt_handoff": args.ckpt_handoff,
         "gate": args.gate,
+        "l2n": args.l2n,
+        "build_order": args.build_order,
     }
     if "fla_cp" in args.arms:
         problem["global"] = {name: inputs[name] for name in (*INPUTS, "dout")}
@@ -366,6 +408,11 @@ def _raw_kw(problem: dict[str, Any], params: tuple[torch.Tensor, ...]) -> dict:
         "dt_bias": dt_bias,
         "lower_bound": LOWER_BOUND,
     }
+
+
+def _l2n_kw(problem: dict[str, Any]) -> dict:
+    """The in-kernel Q/K L2 norm keyword of a KDA call (every arm's, FLA's included), empty without ``--l2n``."""
+    return {"use_qk_l2norm_in_kernel": True} if problem["l2n"] else {}
 
 
 def _with_reduce(fwd, problem: dict[str, Any], reduce):
@@ -534,13 +581,14 @@ def _fla_cp_arm(args, problem: dict[str, Any], conv: bool, device: torch.device)
 def _forward(arm: str, problem: dict[str, Any], conv: bool, fla_chunk_kda=None):
     """The module forward of ``arm``: ``(x, weight, q, k, v, g, beta) -> (y or None, out)``."""
     cu = problem["local"]["cu_seqlens"]
+    l2n = _l2n_kw(problem)
     if arm == "det":
         ctx = problem["ctx"]["det"]
 
         def fwd(x, w, q, k, v, g, beta, *params):
             y = cake_causal_conv1d_kcp(x, w, ctx) if conv else None
             return y, chunk_kda_det_kcp(
-                q, k, v, g, beta, ctx, **_raw_kw(problem, params)
+                q, k, v, g, beta, ctx, **_raw_kw(problem, params), **l2n
             )
 
         return _with_reduce(
@@ -565,6 +613,7 @@ def _forward(arm: str, problem: dict[str, Any], conv: bool, fla_chunk_kda=None):
                 checkpoint_handoff=mode,
                 deterministic=False,
                 **_raw_kw(problem, params),
+                **l2n,
             )
 
         return _with_reduce(
@@ -580,7 +629,15 @@ def _forward(arm: str, problem: dict[str, Any], conv: bool, fla_chunk_kda=None):
         def fwd(x, w, q, k, v, g, beta, *params):
             y = cake_causal_conv1d(x, w, cu) if conv else None
             return y, chunk_kda(
-                q, k, v, g, beta, cu, deterministic=False, **_raw_kw(problem, params)
+                q,
+                k,
+                v,
+                g,
+                beta,
+                cu,
+                deterministic=False,
+                **_raw_kw(problem, params),
+                **l2n,
             )
 
     elif arm == "fla":
@@ -594,6 +651,7 @@ def _forward(arm: str, problem: dict[str, Any], conv: bool, fla_chunk_kda=None):
                 safe_gate=safe_gate,
                 cu_seqlens=cu,
                 **_raw_kw(problem, params),
+                **l2n,
             )
             return y, out.squeeze(0)
 
@@ -611,6 +669,7 @@ def _forward(arm: str, problem: dict[str, Any], conv: bool, fla_chunk_kda=None):
                 safe_gate=safe_gate,
                 cp_context=cp_ctx,
                 **_raw_kw(problem, params),
+                **l2n,
             )
             return y, out.squeeze(0)
 
@@ -736,21 +795,20 @@ def _agreement(
     """One ``step`` of ``det`` and of ``nd`` on the same shard (in ``order``: the first allocates its package's
     workspace first): the bitwise tensors and the ``dg`` difference (in the raw gate mode every result, ``dg`` and
     the parameter partials and sums included, with the same bit pattern; on an ``R1c`` device the partials and sums
-    are measured in FP32 ulps instead, ``param_max_ulp``, and not gated)."""
+    are measured in FP32 ulps instead, ``param_max_ulp``, and not gated; in the in-kernel Q/K L2 norm mode, which
+    no ``R1c`` pair serves, every result, ``dg`` included, with the same bit pattern)."""
     results = {arm: _results(arm, problem, conv) for arm in order}
     torch.cuda.synchronize(device)
     det, nd = results["det"], results["nd"]
     raw = problem["gate"] == "raw"
+    l2n = problem["l2n"]
     arch = nd_kcp.cake_jit.arch_for_capability(
         tuple(torch.cuda.get_device_capability(device))
     )
-    r1c = raw and arch in R1C_ARCHES
-    names = [
-        n
-        for n in BITWISE + (RAW_BITWISE if raw else ())
-        if n in det and not (r1c and n in R1C_PARAMS)
-    ]
-    same = _same_bits if raw else _equal
+    r1c = raw and not l2n and arch in R1C_ARCHES
+    extra = RAW_BITWISE if raw else L2N_BITWISE if l2n else ()
+    names = [n for n in BITWISE + extra if n in det and not (r1c and n in R1C_PARAMS)]
+    same = _same_bits if raw or l2n else _equal
     equal = torch.tensor(
         [int(same(det[n], nd[n])) for n in names],
         dtype=torch.int64,
@@ -842,10 +900,11 @@ def _same_bits(a: torch.Tensor | None, b: torch.Tensor | None) -> bool:
 
 
 def _handoff_expected(problem: dict[str, Any], device: torch.device) -> bool:
-    """Whether the ``nd`` arm's mode engages the hand-off on this rank's ``ckpt`` step: never in the raw gate mode,
-    else ``"on"`` yes, ``"off"`` no, ``"auto"`` where the package's admission rule (``kcp_handoff_auto_refusal`` of
-    this device's key, the head count, the batch's total and the world size) admits it."""
-    if problem["gate"] == "raw":
+    """Whether the ``nd`` arm's mode engages the hand-off on this rank's ``ckpt`` step: never in the raw gate mode
+    or the in-kernel Q/K L2 norm mode, else ``"on"`` yes, ``"off"`` no, ``"auto"`` where the package's admission
+    rule (``kcp_handoff_auto_refusal`` of this device's key, the head count, the batch's total and the world size)
+    admits it."""
+    if problem["gate"] == "raw" or problem["l2n"]:
         return False
     mode = problem["ckpt_handoff"]
     if mode != "auto":
@@ -973,6 +1032,7 @@ def _local_records(
             mod.cake_jit.sm_count(index),
             mod.cake_jit.device_arch(index),
             gate=problem["gate"],
+            **({"l2n": "fused"} if problem["l2n"] else {}),
         )
         mine[arm] = {
             stage: p.record(stage, mod.LOCAL_PATH_BWD) for stage in RECORD_STAGES
@@ -1066,15 +1126,17 @@ def run(args, rank: int, world: int, device: torch.device) -> dict[str, Any]:
         else (None, None, None)
     )
     kda = {"fla": fla_chunk_kda, "fla_cp": fla_cp_chunk_kda}
+    # det and nd in --build-order (their forwards, untimed calls and memory probes in that order), then the others
+    built = CAKE_ARMS[args.build_order]
     arms = [
         arm
-        for arm in ARMS
+        for arm in built + tuple(a for a in ARMS if a not in built)
         if arm in args.arms and (arm not in kda or kda[arm] is not None)
     ]
     # the fla_cp arm runs on its own view of the batch (FLA's partition and context)
     problems = {arm: fla_cp_problem if arm == "fla_cp" else problem for arm in arms}
     forwards = {arm: _forward(arm, problems[arm], conv, kda.get(arm)) for arm in arms}
-    order = ("det", "nd") if args.build_order == "det-first" else ("nd", "det")
+    order = CAKE_ARMS[args.build_order]
     agreement = _agreement(problem, conv, device, order)
     agreement["fla_cp_out"] = (
         _fla_cp_agreement(problem, fla_cp_problem, forwards["fla_cp"], device)
@@ -1101,20 +1163,22 @@ def run(args, rank: int, world: int, device: torch.device) -> dict[str, Any]:
     dist.all_gather_object(hosts, socket.gethostname())
     H, C = args.heads, args.channels
     raw = args.gate == "raw"
+    # the gate and in-kernel Q/K L2 norm modes of the workspace and saved-set queries
+    modes = {"use_gate_in_kernel": raw, "use_qk_l2norm_in_kernel": args.l2n}
     ctx_det, ctx_nd = problem["ctx"]["det"], problem["ctx"]["nd"]
     nbytes = {
         "det": {
-            "workspace": kda_det_workspace_bytes_kcp(
-                ctx_det, H=H, C=C, use_gate_in_kernel=raw
-            ),
-            "saved": kda_det_saved_bytes_kcp(ctx_det, H=H, C=C),
+            "workspace": kda_det_workspace_bytes_kcp(ctx_det, H=H, C=C, **modes),
+            "saved": kda_det_saved_bytes_kcp(ctx_det, H=H, C=C, **modes),
             "comm": kda_det_comm_bytes_kcp(ctx_det, H=H, C=C),
         },
         "nd": {
             "workspace": kda_workspace_bytes_kcp(
-                ctx_nd, H=H, C=C, use_gate_in_kernel=raw, deterministic=False
+                ctx_nd, H=H, C=C, deterministic=False, **modes
             ),
-            "saved": kda_saved_bytes_kcp(ctx_nd, H=H, C=C, deterministic=False),
+            "saved": kda_saved_bytes_kcp(
+                ctx_nd, H=H, C=C, deterministic=False, **modes
+            ),
             "saved_handoff": kda_saved_bytes_kcp(
                 ctx_nd, H=H, C=C, checkpoint_handoff=True, deterministic=False
             ),
@@ -1142,6 +1206,7 @@ def run(args, rank: int, world: int, device: torch.device) -> dict[str, Any]:
             "gate": args.gate,
             "build_order": args.build_order,
             "lower_bound": LOWER_BOUND if raw else None,
+            "l2n": args.l2n,
             "layout": args.layout,
             "world_size": world,
             "arms": arms,
@@ -1179,8 +1244,8 @@ def _print(report: dict[str, Any]) -> None:
     cfg = report["config"]
     print(
         f"KCP x{cfg['world_size']}: S={cfg['seqlen']} docs={cfg['docs']} H={cfg['heads']} C={cfg['channels']} "
-        f"gate={cfg['gate']} conv={cfg['conv']} layout={cfg['layout']} groups={cfg['groups']} samples={cfg['samples']} "
-        f"({report['env']['device']}, {report['env']['arch']})"
+        f"gate={cfg['gate']} l2n={cfg['l2n']} order={cfg['build_order']} conv={cfg['conv']} layout={cfg['layout']} "
+        f"groups={cfg['groups']} samples={cfg['samples']} ({report['env']['device']}, {report['env']['arch']})"
     )
     agree = report["agreement"]
     bad = [n for n, ok in agree["bitwise"].items() if not ok]
@@ -1292,7 +1357,13 @@ def main() -> int:
         "--build-order",
         default="det-first",
         choices=BUILD_ORDERS,
-        help="which package's workspace is allocated first (the agreement step's first arm)",
+        help="which package's arm is built first: its context, its first call (the agreement step), its untimed "
+        "calls and memory probes; the timed palindrome keeps its order",
+    )
+    parser.add_argument(
+        "--l2n",
+        action="store_true",
+        help="the in-kernel Q/K L2 norm (use_qk_l2norm_in_kernel=True on raw q / k, every arm)",
     )
     parser.add_argument("--seed", type=int, default=20261021)
     parser.add_argument(
