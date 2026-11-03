@@ -285,7 +285,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS) __cluster_dims__(2,1,1) void
-kernel_cake_dsv4_7302f6fd2e2826d6826e(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ CUtensorMap tmap_swa_kv, const __grid_constant__ CUtensorMap tmap_compressed_kv, __nv_bfloat16* __restrict__ O, float* __restrict__ partial_lse, int* __restrict__ swa_indices, int* __restrict__ compressed_indices, int* __restrict__ sparse_topk_lens, float* __restrict__ sinks, float* __restrict__ bmm1_scale, float* __restrict__ bmm2_scale, int num_heads, int swa_index_stride, int compressed_index_stride, int sparse_topk_lens_offset, int num_query_tokens, int sparse_topk, int has_sinks, int total_work_items, int* __restrict__ seq_lens, int* __restrict__ cum_seq_lens_q, int ragged_query, int max_q_len, int batch_size)
+kernel_cake_dsv4_b78d35b605cb10daf20f(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ CUtensorMap tmap_swa_kv, const __grid_constant__ CUtensorMap tmap_compressed_kv, __nv_bfloat16* __restrict__ O, float* __restrict__ partial_lse, int* __restrict__ swa_indices, int* __restrict__ compressed_indices, int* __restrict__ sparse_topk_lens, float* __restrict__ sinks, float* __restrict__ bmm1_scale, float* __restrict__ bmm2_scale, int num_heads, int swa_index_stride, int compressed_index_stride, int sparse_topk_lens_offset, int num_query_tokens, int sparse_topk, int has_sinks, int total_work_items, int* __restrict__ seq_lens, int* __restrict__ cum_seq_lens_q, int ragged_query, int max_q_len, int batch_size)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -1461,13 +1461,13 @@ kernel_cake_dsv4_7302f6fd2e2826d6826e(const __grid_constant__ CUtensorMap tmap_q
                         int wt_gmem = wt_o_base + (wt_keep_block0 + wt_b_1) * 128 + n_half_1 * 64 + wt_c_1;
                         if (wt_head_idx < num_heads) {
                             #pragma unroll
-                            for (int wt_j = 0; wt_j < 32; wt_j += 8) {
-                                float _scaled_0[8];
+                            for (int wt_j = 0; wt_j < 32; wt_j += 16) {
+                                float _scaled_0[16];
                                 const float2 _scale2_7 = {wt_inv_sum * output_scale, wt_inv_sum * output_scale};
                                 #pragma unroll
-                                for (int _ls = 0; _ls < 4; _ls++)
+                                for (int _ls = 0; _ls < 8; _ls++)
                                     reinterpret_cast<float2*>(_scaled_0)[_ls] = mul_f32x2_rn_noftz(reinterpret_cast<float2*>((_tmem_load_3 + wt_j))[_ls], _scale2_7);
-                                unsigned int _packed_0[4];
+                                unsigned int _packed_0[8];
                                 #pragma unroll
                                 for (int _lp = 0; _lp < 1; _lp++) {
                                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_scaled_0[_lp*2 + 0], _scaled_0[_lp*2+1 + 0]));
@@ -1488,7 +1488,32 @@ kernel_cake_dsv4_7302f6fd2e2826d6826e(const __grid_constant__ CUtensorMap tmap_q
                                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_scaled_0[_lp*2 + 6], _scaled_0[_lp*2+1 + 6]));
                                     _packed_0[_lp + 3] = *(uint32_t*)&_bf2;
                                 }
-                                reinterpret_cast<int4*>(O + (wt_gmem + wt_j))[0] = reinterpret_cast<int4*>(_packed_0)[0];
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_scaled_0[_lp*2 + 8], _scaled_0[_lp*2+1 + 8]));
+                                    _packed_0[_lp + 4] = *(uint32_t*)&_bf2;
+                                }
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_scaled_0[_lp*2 + 10], _scaled_0[_lp*2+1 + 10]));
+                                    _packed_0[_lp + 5] = *(uint32_t*)&_bf2;
+                                }
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_scaled_0[_lp*2 + 12], _scaled_0[_lp*2+1 + 12]));
+                                    _packed_0[_lp + 6] = *(uint32_t*)&_bf2;
+                                }
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_scaled_0[_lp*2 + 14], _scaled_0[_lp*2+1 + 14]));
+                                    _packed_0[_lp + 7] = *(uint32_t*)&_bf2;
+                                }
+                                {
+                                    const unsigned* _raw_stv8_8 = reinterpret_cast<const unsigned*>(_packed_0);
+                                    asm volatile(
+                                        "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
+                                        :: "l"((void*)(O + (wt_gmem + wt_j))), "r"(_raw_stv8_8[0]), "r"(_raw_stv8_8[1]), "r"(_raw_stv8_8[2]), "r"(_raw_stv8_8[3]), "r"(_raw_stv8_8[4]), "r"(_raw_stv8_8[5]), "r"(_raw_stv8_8[6]), "r"(_raw_stv8_8[7]) : "memory");
+                                }
                             }
                         }
                     }
