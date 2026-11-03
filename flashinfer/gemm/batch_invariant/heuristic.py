@@ -130,23 +130,23 @@ def register_l2(family: str, sm_count: int, l2_bytes: float) -> None:
 
 #: Shape constants of the estimate (empirical, shared by every part and format).
 CONSTANTS: Dict[str, float] = dict(
-    rows64_eff=0.8,  # MMA efficiency of a 64-row CTA tile relative to 128 rows
+    rows64_eff=0.7,  # MMA efficiency of a 64-row CTA tile relative to 128 rows
     eff16b=0.15,  # transaction efficiency of a B box 16 bytes wide ...
     eff32b=0.2,  # ... 32 bytes ...
-    eff64b=0.5,  # ... 64 bytes (128 and wider: 1)
+    eff64b=0.6,  # ... 64 bytes (128 and wider: 1)
     mcast_pow=1.25,  # multicast divides an operand's traffic by cluster_dim ** mcast_pow
     l2_frac=1.0,  # the shared L2 fabric delivers this fraction of SMs x load bandwidth in aggregate
-    l2_resident=0.7,  # the fraction of the L2 the HBM traffic model may keep resident between a panel's uses
+    l2_resident=0.6,  # the fraction of the L2 the HBM traffic model may keep resident between a panel's uses
     refetch=1.3,  # the refetched bytes' HBM time beyond the absorbed share adds this many times over
-    absorb=0.4,  # the fraction of the body's time during which refetched bytes stream without a stall
+    absorb=0.2,  # the fraction of the body's time during which refetched bytes stream without a stall
     step_floor=32.0,  # cycles per k-step no tile can beat
     fixup_floor=8000.0,  # cycles of the workspace split's fixup launch
-    raster_pow=0.1,  # the wrong raster: (tile-count imbalance) ** raster_pow
-    raster_min=4.0,  # ... once the tile-count imbalance reaches this ratio
+    raster_pow=0.05,  # the wrong raster: (tile-count imbalance) ** raster_pow
+    raster_min=2.0,  # ... once the tile-count imbalance reaches this ratio
     overrun_pow=0.65,  # a swizzle group larger than its axis: (swizzle / tiles) ** overrun_pow
     sw_pen=1.1,  # swizzle > 1 where it cannot help
     sw_gain=1.0,  # swizzle > 1 with many tiles in flight on both axes
-    sw_partial=1.05,  # a swizzle that does not divide its axis (a partial last group)
+    sw_partial=1.1,  # a swizzle that does not divide its axis (a partial last group)
     two_cta=0.9,  # the 2-CTA pair's shared B and halved per-CTA issue
 )
 
