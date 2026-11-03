@@ -168,8 +168,17 @@ def main():
     ap.add_argument("--iters", type=int, default=500)
     ap.add_argument("--batches", type=int, nargs="+", default=[8, 32, 64, 128, 256])
     ap.add_argument("--t", type=int, default=8, choices=[4, 8])
-    ap.add_argument("--folds", type=int, nargs="+", default=[0, 13, 25, 50])
+    ap.add_argument(
+        "--folds",
+        type=int,
+        nargs="+",
+        default=[0, 13, 25, 50],
+        help="percent of rows that fold per step, each in [0, 100]",
+    )
     args = ap.parse_args()
+    bad = [p for p in args.folds if not 0 <= p <= 100]
+    if bad:
+        ap.error(f"--folds values must be in [0, 100]; got {bad}")
 
     fn = load()
     T = args.t
