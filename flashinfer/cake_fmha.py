@@ -1356,26 +1356,28 @@ def _context_queries() -> Any:
     return _CONTEXT_QUERIES
 
 
-def _context_sm_count(queries: Any, stream: int) -> int | None:
+def _context_sm_count(queries: Any, stream: int) -> tuple[int | None, bool]:
     """The SM count of ``stream``'s CUDA context (``cuStreamGetCtx``, else the
-    thread's current context), read once per context ID."""
+    thread's current context), read once per context ID, and whether it is
+    the stream's own context (``cuStreamGetCtx`` answered)."""
 
     _, stream_context, get_current, context_id, context_resource, sm_type, _ = queries
     err, context = stream_context(stream)
-    if int(err) or not int(context):
+    own = not int(err) and bool(int(context))
+    if not own:
         err, context = get_current()
         if int(err) or not int(context):
-            return None
+            return None, False
     err, key = context_id(context)
     count = None if int(err) else _CONTEXT_SM_COUNTS.get(key)
     if count is None:
         err_resource, resource = context_resource(context, sm_type)
         if int(err_resource):
-            return None
+            return None, False
         count = int(resource.sm.smCount)
         if not int(err):
             _CONTEXT_SM_COUNTS[key] = count
-    return count
+    return count, own
 
 
 def _stream_context_sm_count(index: int) -> int | None:
@@ -1401,11 +1403,13 @@ def _stream_context_sm_count(index: int) -> int | None:
         if count is not None:
             return count
         if not int(err):
-            count = _context_sm_count(queries, stream)
-            if count is not None:
+            # Cached only when the count is the stream's own context's: a
+            # failed stream query answers this call from the current context.
+            count, own = _context_sm_count(queries, stream)
+            if own:
                 _STREAM_SM_COUNTS[key] = count
             return count
-    return _context_sm_count(queries, stream)
+    return _context_sm_count(queries, stream)[0]
 
 
 # Whether this process may launch the small-M route on a stream of an SM

@@ -1285,21 +1285,30 @@ def test_cake_fmha_decode_smallm_split_count_follows_the_streams_partition(
 
 def _fake_context_queries(monkeypatch, state, calls, *, stream_ids: bool):
     """Driver queries over ``state``: the current stream's handle, its ID, its
-    context's handle, ID and SM count; ``calls`` logs each context read."""
+    context's handle, ID and SM count (``contexts`` overrides the ID and SM
+    count per context handle, ``current`` is the thread's current context,
+    ``stream_err`` fails the stream's context query); ``calls`` logs each
+    context read."""
+
+    def context_of(context):
+        return state.get("contexts", {}).get(
+            context, (state["context_id"], state["sms"])
+        )
 
     def stream_id(stream):
         return 0, state["stream_id"]
 
     def stream_context(stream):
         assert stream == state["stream"]
-        return 0, state["handle"]
+        return state.get("stream_err", 0), state["handle"]
 
     def context_id(context):
-        return 0, state["context_id"]
+        return 0, context_of(context)[0]
 
     def context_resource(context, sm_type):
-        calls.append(state["context_id"])
-        return 0, SimpleNamespace(sm=SimpleNamespace(smCount=state["sms"]))
+        key, sms = context_of(context)
+        calls.append(key)
+        return 0, SimpleNamespace(sm=SimpleNamespace(smCount=sms))
 
     monkeypatch.setattr(
         torch._C, "_cuda_getCurrentRawStream", lambda index: state["stream"]
@@ -1313,7 +1322,7 @@ def _fake_context_queries(monkeypatch, state, calls, *, stream_ids: bool):
         (
             stream_id if stream_ids else None,
             stream_context,
-            lambda: (0, state["handle"]),
+            lambda: (0, state.get("current", state["handle"])),
             context_id,
             context_resource,
             "sm",
@@ -1366,6 +1375,27 @@ def test_cake_fmha_smallm_partition_sm_count_is_cached_per_stream_id(
     assert cake_api._stream_context_sm_count(0) == 48
     assert cake_api._stream_context_sm_count(0) == 48
     assert calls == [1, 2, 3]
+
+
+def test_cake_fmha_smallm_partition_sm_count_of_a_failed_stream_query_is_not_cached(
+    monkeypatch,
+) -> None:
+    """When the stream's context query fails (say, after a recoverable launch
+    error) the launch is planned on the current context's SM count, which is
+    not cached under the stream's ID; once the query answers, the stream's own
+    context is read and cached."""
+
+    state = {"stream": 7, "stream_id": 11, "handle": 0x10, "context_id": 1}
+    state.update(sms=32, current=0x20, contexts={0x20: (5, 148)}, stream_err=1)
+    calls = []
+    _fake_context_queries(monkeypatch, state, calls, stream_ids=True)
+    assert cake_api._stream_context_sm_count(0) == 148
+    assert cake_api._STREAM_SM_COUNTS == {}
+    state["stream_err"] = 0
+    assert cake_api._stream_context_sm_count(0) == 32
+    assert cake_api._STREAM_SM_COUNTS == {11: 32}
+    assert cake_api._stream_context_sm_count(0) == 32
+    assert calls == [5, 1]
 
 
 @pytest.mark.parametrize("mutation", ("uint32_tables", "lse", "device_scales"))
@@ -1701,6 +1731,47 @@ module._smallm_partition_child(
 """
 
 
+_RECREATE_ATTEMPTS = 8
+
+
+def _recreated_green_context(sms):
+    """A ``sms``-SM torch green context and its stream, whose handle is the
+    handle of a stream of a destroyed ``2 * sms``-SM green context that the
+    module planned on, and a record of the attempt: create, plan and destroy
+    the larger context, then create the smaller one, up to
+    ``_RECREATE_ATTEMPTS`` times until the driver hands an old handle back
+    (``None`` and a ``skip`` record if it never does)."""
+
+    import gc
+
+    from torch.cuda.green_contexts import GreenContext
+
+    planned, seen, first_sms = set(), [], []
+    for attempt in range(1, _RECREATE_ATTEMPTS + 1):
+        first = GreenContext.create(num_sms=2 * sms, device_id=0)
+        with torch.cuda.stream(first.Stream()):
+            first_sms.append(cake_api._smallm_launch_sm_count(torch.device("cuda")))
+            planned.add(torch.cuda.current_stream().cuda_stream)
+        del first
+        gc.collect()
+        green = GreenContext.create(num_sms=sms, device_id=0)
+        stream = green.Stream()
+        seen.append(stream.cuda_stream)
+        if stream.cuda_stream in planned:
+            return (green, stream), {
+                "first_sms": first_sms,
+                "handle_reused": True,
+                "attempts": attempt,
+                "handles": seen,
+            }
+        del stream, green
+        gc.collect()
+    return None, {
+        "skip": f"no stream handle reused in {_RECREATE_ATTEMPTS} attempts: "
+        f"planned {sorted(planned)}, new {seen}"
+    }
+
+
 def _smallm_partition_child(sms, rows, api, green=None):
     """Run each small-M row on a stream of an ``sms``-SM green context made by
     ``api`` (FlashInfer's green-context helpers, torch's green contexts, or a
@@ -1724,34 +1795,19 @@ def _smallm_partition_child(sms, rows, api, green=None):
         else:
             if isinstance(green, Exception):
                 raise green
-            if green is None:
-                from torch.cuda.green_contexts import GreenContext
-
-                if api == "torch_recreated":
-                    # A larger partition planned first, then destroyed: its
-                    # stream handle may come back for the new partition.
-                    first = GreenContext.create(num_sms=2 * sms, device_id=0)
-                    with torch.cuda.stream(first.Stream()):
-                        first_sms = cake_api._smallm_launch_sm_count(
-                            torch.device("cuda")
-                        )
-                        first_stream = torch.cuda.current_stream().cuda_stream
-                    del first
-                    import gc
-
-                    gc.collect()
-                green = GreenContext.create(num_sms=sms, device_id=0)
-            stream, partition = green.Stream(), sms
             if api == "torch_recreated":
-                print(
-                    json.dumps(
-                        {
-                            "first_sms": first_sms,
-                            "handle_reused": stream.cuda_stream == first_stream,
-                        }
-                    ),
-                    flush=True,
-                )
+                made, record = _recreated_green_context(sms)
+                print(json.dumps(record), flush=True)
+                if made is None:
+                    return
+                green, stream = made
+            else:
+                if green is None:
+                    from torch.cuda.green_contexts import GreenContext
+
+                    green = GreenContext.create(num_sms=sms, device_id=0)
+                stream = green.Stream()
+            partition = sms
     except Exception as error:  # noqa: BLE001 - any failure means no partition
         print(json.dumps({"skip": f"no green context: {error!r}"}), flush=True)
         return
@@ -1830,7 +1886,8 @@ def test_cake_decode_smallm_in_an_sm_partition_completes(api) -> None:
     if api == "torch_recreated":
         first = records.pop(0)
         print(json.dumps(first))
-        assert first["first_sms"] == 2 * _PARTITION_SMS, first
+        assert first["handle_reused"] is True, first
+        assert set(first["first_sms"]) == {2 * _PARTITION_SMS}, first
     assert [r["row"] for r in records] == list(_PARTITION_ROWS), result.stderr[-4000:]
     device_sms = torch.cuda.get_device_properties(0).multi_processor_count
     for record in records:
