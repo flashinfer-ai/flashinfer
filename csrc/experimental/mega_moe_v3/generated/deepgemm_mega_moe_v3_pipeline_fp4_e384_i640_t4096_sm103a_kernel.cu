@@ -313,7 +313,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t4096_sm103a(int* __restrict_
     int cta_rank;
     asm volatile("mov.b32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
 
-    // Kernel setup ops
+    // Prologue
     uint8_t* combine_smem = reinterpret_cast<uint8_t*>(smem_raw + 0);
     const int combine_smem_addr = smem + 0;
     int* smem_hist = reinterpret_cast<int*>(smem_raw + 0);
@@ -340,6 +340,8 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t4096_sm103a(int* __restrict_
     const int amax_reduction_addr = smem + 225280;
     unsigned int* task_infos = reinterpret_cast<unsigned int*>(smem_raw + 226304);
     const int task_infos_addr = smem + 226304;
+
+    // Kernel setup ops
     asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     if (warp == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&A))) : "memory"); }
     if (warp == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&B1))) : "memory"); }
@@ -353,8 +355,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t4096_sm103a(int* __restrict_
     asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
     asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
 
-    // Mbarrier init (9 pipeline groups, 0 ordered-sequence groups, 107 barriers)
-    // Mbarriers at smem_raw[227968..228824)
+    // Mbarrier init (107 barriers at smem_raw[227968..228824))
 
     if (warp == 2) {
         uint32_t leader = elect_sync();
@@ -503,12 +504,10 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t4096_sm103a(int* __restrict_
     asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
-
-    // Kernel post-init ops
-    const int tmem_accum = taddr;
-    const int tmem_scale_a = taddr + 384;
-    const int tmem_scale_b = taddr + 388;
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_accum = taddr;
+    const unsigned int tmem_scale_a = taddr + 384;
+    const unsigned int tmem_scale_b = taddr + 388;
 
     // ---- Role: dispatch ----
     if (warp <= 3) {
@@ -628,7 +627,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t4096_sm103a(int* __restrict_
                 mask_pf_blocks += (mask_pf_counts[10] + 128 - 1) / 128;
                 mask_pf_blocks += (mask_pf_counts[11] + 128 - 1) / 128;
                 unsigned int _warp_redux_5;
-                asm volatile("redux.sync.add.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_5) : "r"(mask_pf_blocks));
+                asm volatile("redux.sync.add.u32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_5) : "r"(mask_pf_blocks));
                 mask_pf_total = _warp_redux_5 * 5 * 2;
             }
             if (bid == 0) {
@@ -736,7 +735,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t4096_sm103a(int* __restrict_
                 unsigned long long src_u32_off = (unsigned long long)t_s * (unsigned long long)hidden_u32;
                 unsigned long long dst_u32_off = (unsigned long long)dst_row * (unsigned long long)hidden_u32;
                 if (elect_sync()) {
-                    cp_async_bulk_gmem2smem(send_buffer_addr + (unsigned int)(disp_warp * 2560), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(x_fp8) + ((unsigned long long)src_u32_off * (unsigned long long)4)), 2560, pull_barriers_addr + (disp_warp) * 8);
+                    cp_async_bulk_gmem2smem(send_buffer_addr + (unsigned int)(disp_warp * 2560), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(x_fp8) + (unsigned long long)src_u32_off * (unsigned long long)4), 2560, pull_barriers_addr + (disp_warp) * 8);
                     mbarrier_arrive_expect_tx(pull_barriers_addr + (disp_warp) * 8, 2560);
                 }
                 __syncwarp();
@@ -1366,7 +1365,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i640_t4096_sm103a(int* __restrict_
                     num_blocks += (counts[11] + 128 - 1) / 128;
                 }
                 unsigned int total;
-                asm volatile("redux.sync.add.u32 %0, %1, 0xffffffff;" : "=r"(total) : "r"(num_blocks));
+                asm volatile("redux.sync.add.u32 %0, %1, 0xFFFFFFFF;" : "=r"(total) : "r"(num_blocks));
                 unsigned int waves = (total * 5 + (unsigned int)NUM_CTAS / 2 - 1) / ((unsigned int)NUM_CTAS / 2);
                 unsigned int interleave_waves = 2;
                 state[0] = total;
