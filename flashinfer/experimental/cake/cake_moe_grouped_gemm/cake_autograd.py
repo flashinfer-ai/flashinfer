@@ -51,6 +51,16 @@ from .cake_backend import (
 
 _MAIN_GRAD_DTYPES = (torch.float32, torch.bfloat16)
 
+# -1 outside the autograd engine; inside a backward, a forward runs only as torch's
+# checkpoint recompute, whose ``w`` may be an alias without ``w``'s Python attributes
+# (an inner region of nested non-reentrant checkpoints).  The backward of the original
+# forward reads its own ``ctx.w`` and checks ``main_grad`` there.
+_GRAPH_TASK_ID = getattr(torch._C, "_current_graph_task_id", None)
+
+
+def _in_backward() -> bool:
+    return _GRAPH_TASK_ID is not None and _GRAPH_TASK_ID() != -1
+
 
 def _fwd_op(
     x: torch.Tensor, w: torch.Tensor, offs: torch.Tensor, out: torch.Tensor
@@ -174,7 +184,7 @@ class CakeGroupedMm(torch.autograd.Function):
         _require_flag(
             fuse_wgrad_accumulation, "fuse_wgrad_accumulation", "CakeGroupedMm"
         )
-        if fuse_wgrad_accumulation and w.requires_grad:
+        if fuse_wgrad_accumulation and w.requires_grad and not _in_backward():
             _main_grad(w, "CakeGroupedMm")
         num_groups = int(w.shape[0])
         y = torch.empty(x.shape[0], w.shape[1], dtype=torch.bfloat16, device=x.device)
