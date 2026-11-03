@@ -668,13 +668,10 @@ def test_direct_recurrence_launches_forward_the_full_fixed64_abi() -> None:
 
 
 def _cu32_arches_only(name: str, arch: str) -> bool:
-    """Registry stand-in: the cu32 Stage-1 programs ship for sm_100a/sm_103a,
-    and the BF16 one for sm_107a too."""
+    """Registry stand-in: the FP16 and BF16 cu32 Stage-1 programs ship for
+    sm_100a, sm_103a and sm_107a."""
 
-    return name.endswith("_cu32") and (
-        arch in ("sm_100a", "sm_103a")
-        or (arch == "sm_107a" and name == "t_precompute_bf16_cu32")
-    )
+    return name.endswith("_cu32") and arch in ("sm_100a", "sm_103a", "sm_107a")
 
 
 @pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
@@ -737,7 +734,7 @@ def test_cu32_stand_in_is_the_shipped_registry(arch: str, name: str) -> None:
             "t_precompute_bf16",
             False,
         ),
-        # sm_107a ships the BF16 cu32 program ...
+        # sm_107a ships the BF16 and the FP16 cu32 programs.
         (
             "sm_107a",
             torch.bfloat16,
@@ -748,7 +745,6 @@ def test_cu32_stand_in_is_the_shipped_registry(arch: str, name: str) -> None:
             "t_precompute_bf16_cu32",
             False,
         ),
-        # ... and no FP16 one: the host keeps the per-launch cast.
         (
             "sm_107a",
             torch.float16,
@@ -756,8 +752,8 @@ def test_cu32_stand_in_is_the_shipped_registry(arch: str, name: str) -> None:
             (512, 512),
             512,
             torch.int32,
-            "t_precompute",
-            True,
+            "t_precompute_cu32",
+            False,
         ),
         # Stage 1 does not run for an all-empty batch: the host casts once per launch.
         (
@@ -840,6 +836,7 @@ def test_build_plan_selects_cu32_only_for_int32_where_shipped(
         ("sm_100a", "t_precompute_bf16_cu32"),
         ("sm_103a", "t_precompute_cu32"),
         ("sm_103a", "t_precompute_bf16_cu32"),
+        ("sm_107a", "t_precompute_cu32"),
         ("sm_107a", "t_precompute_bf16_cu32"),
     ],
 )

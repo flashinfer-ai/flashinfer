@@ -18,7 +18,7 @@ non-deterministic backward (``deterministic=False``) beside a kernel resident
 on another stream (the concurrent-launch contract of issues #7038 and #7548).
 
 The forward launches a plain grid of independent CTAs; on SM100 and SM103
-up to 10 rows per SM the short forward launches one 256-thread CTA per row
+up to 12 rows per SM the short forward launches one 256-thread CTA per row
 block (fewer CTAs than SMs), from 976 rows per SM on SM100 and SM103 (800 on
 SM107) the mid forward whole waves of 6 CTAs per SM that each walk at most 2
 row blocks, and from 2400 rows per SM (1740 on SM107) the long forward whole
@@ -77,7 +77,7 @@ blocks each at or above its threshold and four times that (25 and 100 on
 SM100 and SM103, from 2400 rows per SM; 19 and 76 on SM107, from 1740) and
 the mid forward's the fewest at or above its threshold and the most below the
 long forward's (11 and 24, 1056 and 2304 rows per SM, on SM100 and SM103; 9
-and 18, 864 and 1728 rows per SM, on SM107).  The short forward at 1 and 10
+and 18, 864 and 1728 rows per SM, on SM107).  The short forward at 1 and 12
 rows per SM keeps its speed
 beside the one-thread kernel, starts beside the all-SM kernel with the
 max-shared carveout, and beside a side kernel that holds ``k`` SMs (the item 1
@@ -761,10 +761,10 @@ def test_mid_forward_slows_in_proportion_to_the_sms_held(
 
 
 # The short forward: the rows per SM of its two token counts (one row and its
-# threshold of 10 rows per SM), and the side kernels of the item 1 test beside
+# threshold of 12 rows per SM), and the side kernels of the item 1 test beside
 # it, the issue's three with the default carveout and 16 CTAs of 1024 threads
 # with the max-shared carveout.
-SHORT_FORWARD_ROWS_PER_SM = (1, 10)
+SHORT_FORWARD_ROWS_PER_SM = (1, 12)
 SHORT_FORWARD_SIDES = ((1, 128, None), (16, 640, None), (32, 640, None)) + (
     (16, 1024, CARVEOUT_MAX_SHARED),
 )

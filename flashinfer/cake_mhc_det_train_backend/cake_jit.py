@@ -260,6 +260,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "arches": [
             "sm_100a",
             "sm_103a",
+            "sm_107a",
         ],
         "arg_plan": [
             ["buffer", "fn"],
@@ -7860,11 +7861,13 @@ FN_SPLIT_GRID = {"b16": 256, "tv128": 256, "tv128_t128": 512}
 # the forward). Measured on the checkpoint path (the carry against the two-launch route, CUPTI active, three
 # independent sessions per architecture): B200 1.024-1.025 at 1024, 1.021-1.022 at 2048, 1.012-1.013 at 4096; GB300
 # 1.022-1.024 at 1024, 1.015-1.017 at 2048, 1.005-1.011 at 4096. A band keeps the rows where every session reads at
-# least 1 % faster: sm_100a to 4096 tokens, sm_103a to 2048. sm_107a has no carry: its checkpoint replay keeps the
-# two-launch route.
+# least 1 % faster: sm_100a to 4096 tokens, sm_103a to 2048. sm_107a launches the same 256-thread form in place of
+# the b16 fnp split and the 128-thread tv128_t128 fnTp split; two sessions on 216-SM R200 boards read 1.026-1.027 at
+# 1024, 1.018-1.043 at 2048, 1.012-1.022 at 4096, so its band runs to 4096 tokens.
 FN_SPLIT_CARRY: dict[str, dict[str, Any]] = {
     "sm_100a": {"record": "cake_mhc_det_train_fn_split__dual", "bands": ((0, 4096),)},
     "sm_103a": {"record": "cake_mhc_det_train_fn_split__dual", "bands": ((0, 2048),)},
+    "sm_107a": {"record": "cake_mhc_det_train_fn_split__dual", "bands": ((0, 4096),)},
 }
 # FWD_MAP_BANDS: (above, at_most, program) of the mapping pass by token count (at_most None = unbounded); outside every
 # band the production form FWD_MAP_PRODUCTION ("ss_st4": a_path="ss", 4 stages). Every form below is EXACT: the

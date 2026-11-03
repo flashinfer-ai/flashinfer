@@ -47,19 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 384
-#define TMEM_ST_OFFSET 0
-#define NUM_M_PIPE_STAGES 3
-#define NUM_STEP_PIPE_STAGES 3
-#define SMEM_M_K_OFF 1024
-#define SMEM_M_K_STAGE_BYTES 65536
-#define SMEM_M_K_STRIDE 65536
-#define SMEM_M_MN_OFF 1024
-#define SMEM_M_MN_STAGE_BYTES 65536
-#define SMEM_M_MN_STRIDE 65536
-#define SMEM_TOTAL 197632
-#define THREADS 576
 #define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
@@ -172,14 +159,13 @@ kernel_cake_kda_train_184d5ccfffea932ff1d8(const __grid_constant__ CUtensorMap m
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     float* m_k = reinterpret_cast<float*>(smem_raw + 1024);
     const int m_k_addr = smem + 1024;
     float* m_mn = reinterpret_cast<float*>(smem_raw + 1024);
     const int m_mn_addr = smem + 1024;
 
-    // Mbarrier init (5 pipeline groups, 0 ordered-sequence groups, 15 barriers)
-    // Mbarriers at smem_raw[0..120)
+    // Mbarrier init (15 barriers at smem_raw[0..120))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -224,10 +210,8 @@ kernel_cake_kda_train_184d5ccfffea932ff1d8(const __grid_constant__ CUtensorMap m
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
-
-    // Kernel post-init ops
-    const int tmem_st = taddr;
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_st = taddr;
 
     // ---- Role: readout ----
     if (warp <= 7) {

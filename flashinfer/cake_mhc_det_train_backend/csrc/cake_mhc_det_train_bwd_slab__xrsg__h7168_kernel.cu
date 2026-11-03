@@ -156,7 +156,7 @@ __device__ __forceinline__ void tma_store_2d(
 
 __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
     uint32_t result;
-    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xffffffff;"
+    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xFFFFFFFF;"
         : "=r"(result) : "r"(val));
     return result;
 }
@@ -212,7 +212,7 @@ kernel_cake_mhc_det_train_bwd_slab__xrsg__h7168(const __grid_constant__ CUtensor
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     unsigned int* wtv = reinterpret_cast<unsigned int*>(smem_raw + 222208);
     const int wtv_addr = smem + 222208;
     __nv_bfloat16* x0_1_0 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
@@ -267,6 +267,8 @@ kernel_cake_mhc_det_train_bwd_slab__xrsg__h7168(const __grid_constant__ CUtensor
     const int dzn1_addr = smem + 78848;
     __nv_bfloat16* dzn2 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 82944);
     const int dzn2_addr = smem + 82944;
+
+    // Kernel setup ops
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&X))) : "memory");
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&dY))) : "memory");
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&dU))) : "memory");
@@ -274,8 +276,7 @@ kernel_cake_mhc_det_train_bwd_slab__xrsg__h7168(const __grid_constant__ CUtensor
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&fnTp))) : "memory");
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&dX))) : "memory");
 
-    // Mbarrier init (10 pipeline groups, 0 ordered-sequence groups, 18 barriers)
-    // Mbarriers at smem_raw[0..144)
+    // Mbarrier init (18 barriers at smem_raw[0..144))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -329,14 +330,14 @@ kernel_cake_mhc_det_train_bwd_slab__xrsg__h7168(const __grid_constant__ CUtensor
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_accw = taddr;
+    const unsigned int tmem_dfb0 = taddr + 256;
+    const unsigned int tmem_dfb1 = taddr + 320;
+    const unsigned int tmem_dfs0 = taddr + 384;
+    const unsigned int tmem_dfs1 = taddr + 448;
 
     // Kernel post-init ops
-    const int tmem_accw = taddr;
-    const int tmem_dfb0 = taddr + 256;
-    const int tmem_dfb1 = taddr + 320;
-    const int tmem_dfs0 = taddr + 384;
-    const int tmem_dfs1 = taddr + 448;
     if (warp >= 0 && warp <= 3) {
         asm volatile("setmaxnreg.dec.sync.aligned.u32 72;");
     }

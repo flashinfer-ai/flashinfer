@@ -72,7 +72,7 @@ kernel_cake_lm_head_loss_48134805ead9ce0f7416(float* __restrict__ term, double* 
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     double* partials = reinterpret_cast<double*>(smem_raw + 0);
     const int partials_addr = smem + 0;
 
