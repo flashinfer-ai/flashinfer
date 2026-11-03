@@ -475,7 +475,9 @@ def main():
                 },
             )
             manifest["cases"].append(case)
-            Path(str(prefix) + "-manifest.json").write_text(json.dumps(manifest, indent=2))
+            Path(str(prefix) + "-manifest.json").write_text(
+                json.dumps(manifest, indent=2)
+            )
             for cache in ("warm", "cold"):
                 for scope in ("raw_pipeline", "full_operator"):
                     launch = (
@@ -521,7 +523,8 @@ def main():
                             stream.write(json.dumps(record) + "\n")
                             stream.flush()
                     check_output(
-                        adapter["output"]() if last is None else last, expected
+                        adapter["output"]() if scope == "raw_pipeline" else last,
+                        expected,
                     )
                     print(
                         f"[perf] rank={rank} impl={args.impl} ep={world} t={tokens} round={args.round} {cache}/{scope} PASS",
@@ -534,7 +537,9 @@ def main():
             adapter["close"]()
             barrier()
             case["complete"] = True
-            Path(str(prefix) + "-manifest.json").write_text(json.dumps(manifest, indent=2))
+            Path(str(prefix) + "-manifest.json").write_text(
+                json.dumps(manifest, indent=2)
+            )
     manifest["clocks_after"] = gpu_clock()
     manifest["complete"] = True
     Path(str(prefix) + "-manifest.json").write_text(json.dumps(manifest, indent=2))
