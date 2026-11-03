@@ -43,6 +43,38 @@ needs_device = pytest.mark.skipif(
 )
 
 
+def kernel_events(prof) -> list:
+    """The kernel events of a ``torch.profiler`` trace, each with its launch grid (the chrome trace's ``args.grid``)."""
+    import json
+    import tempfile
+
+    with tempfile.NamedTemporaryFile(suffix=".json") as f:
+        prof.export_chrome_trace(f.name)
+        with open(f.name) as trace:
+            return [
+                e
+                for e in json.load(trace)["traceEvents"]
+                if e.get("cat") == "kernel" and "grid" in e.get("args", {})
+            ]
+
+
+_PROFILER: dict = {}
+
+
+def profiler_records_kernels() -> bool:
+    """Whether ``torch.profiler``'s CUDA activities record kernels on this device: kineto's CUPTI may not support the part
+    under the installed toolkit (``CUPTI_ERROR_INVALID_DEVICE`` at initialisation), in which case a trace holds no kernel
+    event although the kernels ran. Probed once per process with a trivial launch."""
+    if "kernels" not in _PROFILER:
+        from torch.profiler import ProfilerActivity, profile
+
+        x = torch.ones(1024, device="cuda")
+        with profile(activities=[ProfilerActivity.CUDA]) as prof:
+            (x * 2).sum().item()
+        _PROFILER["kernels"] = bool(kernel_events(prof))
+    return _PROFILER["kernels"]
+
+
 def bits(t: torch.Tensor) -> torch.Tensor:
     return t.view(torch.int16)
 
@@ -545,10 +577,9 @@ def test_misaligned_a_is_copied_and_keeps_the_bits():
 def test_persistent_grid_is_the_device_co_resident_cluster_count():
     """The compiled persistent grid is the launch device's co-resident cluster count for the configuration's cluster
     shape (the GPC-aware occupancy query), not SMs // cluster size: the launched grid, read from a profiler trace of a
-    many-tile GEMM, is that many clusters; the kernel's cache key carries the count; the bits are those of any other grid."""
-    import json
-    import tempfile
-
+    many-tile GEMM, is that many clusters; the kernel's cache key carries the count; the bits are those of any other grid.
+    Where the profiler records no kernels (a CUPTI that does not support the device under the installed toolkit), the
+    grid readback is skipped and the other checks still run."""
     import cutlass.utils as cutlass_utils
     from torch.profiler import ProfilerActivity, profile
 
@@ -559,6 +590,7 @@ def test_persistent_grid_is_the_device_co_resident_cluster_count():
     sms = torch.cuda.get_device_properties(dev).multi_processor_count
     a, b = rnd_bf16(4096, 1024, 161), rnd_bf16(1024, 4096, 162)
     ref = bits(bi_mm(a, b))
+    traced = profiler_records_kernels()
     for cfg in [
         Knobs((128, 128), (1, 1), False, True, "m", 1),
         Knobs((128, 128), (2, 1), False, True, "m", 1),
@@ -579,26 +611,25 @@ def test_persistent_grid_is_the_device_co_resident_cluster_count():
             a, b, config=cfg
         )  # compiled before the profiled launch
         torch.cuda.synchronize()
-        with profile(activities=[ProfilerActivity.CUDA]) as prof:
-            mm_bf16_batch_invariant(a, b, config=cfg, out=out)
-            torch.cuda.synchronize()
-        with tempfile.NamedTemporaryFile(suffix=".json") as f:
-            prof.export_chrome_trace(f.name)
-            with open(f.name) as trace:
-                events = [
-                    e
-                    for e in json.load(trace)["traceEvents"]
-                    if e.get("cat") == "kernel" and "grid" in e.get("args", {})
-                ]
-        assert events, "no kernel in the trace"
-        grid = max(events, key=lambda e: e["dur"])["args"]["grid"]
-        launched = grid[0] * grid[1] * grid[2]
-        assert launched == clusters * size, (
-            cfg.describe(),
-            grid,
-            clusters,
-        )  # 512 tiles: more than the grid
+        if traced:
+            with profile(activities=[ProfilerActivity.CUDA]) as prof:
+                mm_bf16_batch_invariant(a, b, config=cfg, out=out)
+                torch.cuda.synchronize()
+            events = kernel_events(prof)
+            assert events, "no kernel in the trace"
+            grid = max(events, key=lambda e: e["dur"])["args"]["grid"]
+            launched = grid[0] * grid[1] * grid[2]
+            assert launched == clusters * size, (
+                cfg.describe(),
+                grid,
+                clusters,
+            )  # 512 tiles: more than the grid
         assert torch.equal(bits(out), ref), cfg.describe()
+    if not traced:
+        pytest.skip(
+            "torch.profiler records no CUDA kernel on this device with the installed toolkit (CUPTI unavailable): the "
+            "launched grid was not read back; the occupancy query, the cache key and the bits were checked"
+        )
 
 
 @needs_device
