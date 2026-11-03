@@ -1563,15 +1563,40 @@ _OUT_PHASE_BY_ROUTE: dict[str, int] = {
 }
 
 
-# Routes whose program needs O aligned beyond the 2 bytes a contiguous bf16
-# view guarantees: fp8_lowhead_one_partition writes 32 bytes
-# (``st.global.v8.b32``) at O + 16-element offsets on sm_100a and sm_103a, so O must be
-# 32-byte aligned.  A caller ``out`` off that alignment (a contiguous view at
-# +2 or +16 bytes) runs into an aligned staging buffer that is then copied
-# into ``out``: the same program, the same bits.  An aligned ``out`` (every
-# allocation, every phase of ``_OUT_PHASE_BY_ROUTE``) takes no staging.
+# Alignment of O that each route's program needs beyond the 2 bytes a
+# contiguous bf16 view guarantees, the widest O store of its kernels over every
+# architecture that runs the route: 32 = ``st.global.v8.b32`` at 16-element
+# offsets, 16 = ``int4`` stores at 8-element offsets or an O tensor map (TMA
+# store; its binding rejects an address off 16 bytes).  bf16_h128_topk4x_v52
+# writes O from its split-5 reducer (``int4`` on sm_103a, ``int2`` on sm_100a);
+# bf16_h128_topk128x from the split reducer (``int2``) or, above 16 tokens, the
+# row-first owners (``st.global.v8.b32``); bf16_h64_compressed_q8_v38 from the
+# H64 reducer (``int2``) or, with one split, the producer
+# (``st.global.v8.b32``).  A caller ``out`` off that alignment (a contiguous
+# view at +2 or +16 bytes) runs into an aligned staging buffer that is then
+# copied into ``out``: the same program, the same bits.  An aligned ``out``
+# (every allocation, every phase of ``_OUT_PHASE_BY_ROUTE``) takes no staging.
 _OUT_ALIGN_BY_ROUTE: dict[str, int] = {
+    "bf16_h128_prefill_v42": 32,
+    "bf16_h128_swa128": 16,
+    "bf16_h128_topk128x": 32,
+    "bf16_h128_topk4x_v52": 16,
+    "bf16_h16_h32_swa128_v44": 16,
+    "bf16_h32_topk128x_early_v47": 16,
+    "bf16_h64_compressed_q8_v38": 32,
+    "bf16_h64_guard_q_tma_batch_r25": 16,
+    "bf16_h64_prefill": 32,
+    "bf16_h8_h16_source_exact": 16,
+    "bf16_h8_swa128_v43": 16,
+    "bf16_swa128_single_cta": 16,
+    "fp8_h128_prefill_source_persistent": 16,
+    "fp8_h128_prefill_source_persistent_uniform": 16,
+    "fp8_h64_prefill_source_persistent_m64": 32,
+    "fp8_h64_prefill_source_persistent_m64_multi_tile": 32,
+    "fp8_h64_source_exact": 32,
+    "fp8_h8_h16_source_exact": 16,
     "fp8_lowhead_one_partition": 32,
+    "fp8_lowhead_prefill": 32,
 }
 
 
