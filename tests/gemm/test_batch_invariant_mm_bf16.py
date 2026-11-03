@@ -22,6 +22,7 @@ from flashinfer.gemm.batch_invariant.api import (
     mm_bf16_batch_invariant,
 )
 from flashinfer.gemm.batch_invariant.blocks.operands import can_implement
+from flashinfer.gemm.batch_invariant.spec import spec_fingerprint
 from flashinfer.gemm.batch_invariant.heuristic import PARTS
 from flashinfer.gemm.batch_invariant.generator import (
     REFERENCE_SHAPE,
@@ -167,6 +168,10 @@ def test_fingerprint_is_a_function_of_the_weight_shape():
         bi.fingerprint("mm_bf16", N=4096, K=4096, M=16)
     # the bias is an optional dimension: a biased call is a different specification, bias=False the unbiased one
     fb = bi.fingerprint("mm_bf16", N=4096, K=4096, bias=True)
+    with pytest.raises(
+        ValueError, match="bf16 class only"
+    ):  # no biased fp8 specification exists
+        spec_fingerprint(4096, "bf16", 1, "e4m3", bias=True)
     assert fb.startswith("gemm-bf16-kfold-bias-") and fb != f
     assert bi.fingerprint("mm_bf16", N=4096, K=4096, bias=False) == f
     assert bi.fingerprint("mm_bf16", N=128, K=4096, bias=True).startswith(
@@ -691,6 +696,12 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
 @needs_device
 def test_chunk_count_must_be_positive():
     a, b = adv_bf16(16, 4096, 151).cuda(), adv_bf16(4096, 4096, 152).cuda()
+    # a caller-forced configuration the kernel cannot implement for the shape (here the in-CTA chunk fold of the unsplit
+    # class) is rejected before anything is compiled
+    forced = Knobs((128, 64), (1, 1), False, True, "m", 1, 0, True)
+    assert not can_implement(forced, 16, 4096, 4096, "n", 1)
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match="enumerated space"):
+        mm_bf16_batch_invariant(a, b, config=forced, chunks=1)
     with pytest.raises(bi.BatchInvariantUnsupportedError, match="chunks = 0"):
         mm_bf16_batch_invariant(a, b, chunks=0)
 
@@ -803,6 +814,14 @@ def test_unsupported_bias_inputs_raise():
     bias = rnd_bf16(1, N, 153)[0]
     with pytest.raises(bi.BatchInvariantUnsupportedError, match="bf16 bias"):
         mm_bf16_batch_invariant(a, b, bias=bias.float())
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match="bias of type list"):
+        mm_bf16_batch_invariant(a, b, bias=[0.0] * N)
+    # the direct store reads the bias while it writes the output: they may not overlap
+    out = torch.empty(16, N, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(
+        bi.BatchInvariantUnsupportedError, match="output overlapping the bias"
+    ):
+        bi_mm(a, b, bias=out[0], out=out)
     with pytest.raises(ValueError):  # the public API's own dtype contract comes first
         bi_mm(a, b, bias=bias.float())
     with pytest.raises(bi.BatchInvariantUnsupportedError, match=r"shape \(4096,\)"):

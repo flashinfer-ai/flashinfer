@@ -299,7 +299,8 @@ def _check_workspace(
 
 
 def _byte_span(t: torch.Tensor) -> Tuple[int, int]:
-    """The half-open byte range a tensor's elements occupy."""
+    """The half-open byte range from a tensor's first to its last element. The overlap test built on it is conservative:
+    a buffer placed in the gaps of a strided tensor counts as overlapping."""
     if t.numel() == 0:
         return 0, 0
     last = sum((n - 1) * s for n, s in zip(t.shape, t.stride(), strict=True) if n > 1)
@@ -353,8 +354,16 @@ def _run(
     bf16); ``bias`` the bf16 class's (N,) bias (the biased chain: added once after the whole fold, in the epilogue of a
     direct store or in the fixup of the workspace split, whose partials stay bias-free)."""
     from .blocks.compile import get_compiled_gemm
+    from .blocks.operands import can_implement
     from .fixup import MAX_GRID_Y, get_fixup
 
+    if not can_implement(config, M, N, K, b_major, C, in_fmt):
+        raise unsupported(
+            cls,
+            f"the configuration {config.describe()} at (M, N, K) = ({M}, {N}, {K}) with {C} chunks and a "
+            f"{'K' if b_major == 'k' else 'N'}-major weight",
+            "a configuration of the enumerated space for the shape (the dispatcher's, or the tuner's candidates)",
+        )
     scaled = is_scaled(in_fmt)
     direct = C == 1 or config.cta_chunks
     kernel = get_compiled_gemm(
@@ -376,6 +385,16 @@ def _run(
         (N, Kc, C), (b_nk.stride(0), b_nk.stride(1), Kc * b_nk.stride(1))
     )
     if direct:
+        for t, what in (
+            *((sc, "a scale") for sc in scales),
+            *(((bias, "the bias"),) if bias is not None else ()),
+        ):
+            if _overlaps(out, t):
+                raise unsupported(
+                    cls,
+                    f"the output overlapping {what}",
+                    "an output disjoint from the scales and the bias (they are read while the output is written)",
+                )
         c3 = out.as_strided((M, N, 1), (out.stride(0), 1, N))
         kernel(a3, b3, c3, *extra)  # the chain in the epilogue
         return out
@@ -399,7 +418,8 @@ def _run(
                     cls,
                     f"{what} overlapping the workspace",
                     "a workspace disjoint from the operands, the output, the scales and the bias (the partials are "
-                    "written there while the operands are read and before the fixup reads them)",
+                    "written there while the operands are read and before the fixup reads them; the test compares byte "
+                    "spans, so a workspace inside a strided tensor's gaps is rejected too)",
                 )
     ws = ws.permute(1, 2, 0)  # chunk-major storage (C, M, N) viewed as (M, N, C)
     kernel(a3, b3, ws)  # the unscaled, unbiased body: raw fp32 partials
@@ -416,6 +436,10 @@ def prepare_bias(
     :class:`BatchInvariantUnsupportedError`; never copies (a bias is an operand the kernel reads as given)."""
     if bias is None:
         return None
+    if not isinstance(bias, torch.Tensor):
+        raise unsupported(
+            CLASS, f"a bias of type {type(bias).__name__}", "a bf16 torch.Tensor bias"
+        )
     if bias.dtype != torch.bfloat16:
         raise unsupported(CLASS, f"a {bias.dtype} bias", "a bf16 bias")
     if bias.dim() != 1 or bias.shape[0] != N:
@@ -756,7 +780,15 @@ def bmm_fp8_batch_invariant(
     out_fmt = OUT_FMT_OF_DTYPE[dtype]
     if C == 1:
         from .blocks.compile import get_compiled_gemm
+        from .blocks.operands import can_implement
 
+        if not can_implement(config, M, N, K, b_major, 1, in_fmt):
+            raise unsupported(
+                cls,
+                f"the configuration {config.describe()} at (M, N, K) = ({M}, {N}, {K}) with a "
+                f"{'K' if b_major == 'k' else 'N'}-major weight",
+                "a configuration of the enumerated space for the shape (the dispatcher's, or the tuner's candidates)",
+            )
         kernel = get_compiled_gemm(
             config,
             b_major,
