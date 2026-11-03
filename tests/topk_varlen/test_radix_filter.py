@@ -530,9 +530,7 @@ def test_out_buffers_foreign_device_rejected():
 
     with (
         torch.cuda.device(in_dev),
-        pytest.raises(
-            ValueError, match=rf"out_indices must be a CUDA tensor on {in_dev}"
-        ),
+        pytest.raises(ValueError, match=r"input device"),
     ):
         flashinfer.top_k_varlen(
             logits,

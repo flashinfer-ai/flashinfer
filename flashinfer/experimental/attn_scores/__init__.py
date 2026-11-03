@@ -15,48 +15,16 @@ import threading
 
 
 @functools.cache
-def _wrapper_type():
-    """Load definitions without exposing constructor tensor owners to DSL frames.
-
-    CuTe DSL 4.7 decorators can retain their importing call stack until cyclic
-    collection. A definition-only thread has no constructor arguments; loading
-    finishes before a wrapper or its CUDA storage exists. Compilation is lazy.
-    """
-    outcome = []
-
-    def load():
-        try:
-            from .paged_delegate import FP8PagedMQATopKWrapper
-        except BaseException as error:
-            outcome.append(error)
-        else:
-            outcome.append(FP8PagedMQATopKWrapper)
-
-    thread = threading.Thread(target=load, name="flashinfer-topk-definitions")
-    thread.start()
-    thread.join()
-    result = outcome[0]
-    if isinstance(result, BaseException):
-        # Preserve the dependency's type, message and importing traceback.
-        raise result
-    return result
-
-
-@functools.cache
 def _continuous_plan_type(backend):
     outcome = []
 
     def load():
         try:
-            # Load the shared DSL definitions without retaining caller tensors.
-            from . import selective_logits  # noqa: F401
+            # Load capture helpers without retaining caller tensors.
+            from . import _capture_status  # noqa: F401
 
-            if backend == "v2":
-                from .selective_v2 import _CapacityV2TopKPlan as Plan
-            elif backend == "full":
-                from .full_contiguous import _ContinuousFullTopKPlan as Plan
-            else:
-                from .selective_contiguous import _ContinuousSelectiveTopKPlan as Plan
+            from .selective_prefill import _CapacitySelectiveTopKPlan as Plan
+
             outcome.append(Plan)
         except BaseException as error:
             outcome.append(error)

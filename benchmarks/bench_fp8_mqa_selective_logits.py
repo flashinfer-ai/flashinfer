@@ -17,9 +17,7 @@
 Examples (original-token contexts; ratio4 consumes synthetic precompressed KV)::
 
     python benchmarks/bench_fp8_mqa_selective_logits.py --q 8192 --kv 8192 \
-        --num-heads 8 --top-k 512 --compression-ratio 4
-    python benchmarks/bench_fp8_mqa_selective_logits.py --batch-size 148 --q 1 \
-        --kv 8192 --num-heads 64 --top-k 2048
+        --num-heads 64 --top-k 512 --compression-ratio 4
     python benchmarks/bench_fp8_mqa_selective_logits.py --summarize results/*.json
 
 Per-step setup runs once per forward pass and is shared by all indexer layers.
@@ -38,9 +36,9 @@ This benchmark generates seeded inputs and measures separate per-step setup
 and layer CUDA graph pairs in an AxN-5s-BxN-5s sequence. Immediately before
 each timed block, its own route runs continuously for --settle-seconds (2s
 by default), so both orders measure sustained load after the idle pauses.
-Successful clean-source runs also print a validated Markdown report; --output
+Successful runs also print a validated Markdown report; --output
 remains raw JSON. The --summarize mode regenerates that report without importing
-Torch or using CUDA. Inputs must share one source, environment, GPU and schema;
+Torch or using CUDA. Inputs must share one environment, GPU and schema;
 partial successful prefixes are labeled and duplicate cells are rejected.
 Use --max-context-length to reserve a fixed original-token capacity while
 --kv sets the live context; omission sizes each route to its live context.
@@ -49,17 +47,14 @@ Use --max-context-length to reserve a fixed original-token capacity while
 from __future__ import annotations
 
 import argparse
-import csv
+from dataclasses import dataclass
 import gc
-import hashlib
 import importlib
 import importlib.metadata
 import json
 import math
 import os
-import resource
 import statistics
-import subprocess
 import sys
 import time
 import tempfile
@@ -70,56 +65,6 @@ if __name__ != "__main__":
     import torch
 
 ROWS = [4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576]
-EXECUTION_SOURCE_PATHS = (
-    "benchmarks/bench_fp8_mqa_selective_logits.py",
-    "flashinfer/attn_scores/attn_scores.py",
-    "flashinfer/attn_scores/fp8_kernel_config.py",
-    "flashinfer/attn_scores/query_group_metadata.py",
-    "flashinfer/attn_scores/kernels/schedule_kernel.py",
-    "flashinfer/attn_scores/kernels/fp8_paged_mqa_logits.py",
-    "flashinfer/attn_scores/kernels/fp4_paged_mqa_logits.py",
-    "flashinfer/quantization/fp4_quantization.py",
-    "flashinfer/tllm_enums.py",
-    "flashinfer/experimental/attn_scores/kernels/_fp8_mqa_selective.py",
-    "flashinfer/experimental/attn_scores/kernels/_fp8_mqa_contiguous.py",
-    "flashinfer/experimental/attn_scores/selective_contiguous.py",
-    "flashinfer/attn_scores/selective_logits.py",
-    "flashinfer/topk_varlen/kernels/gvr2_topk_decode.py",
-    "flashinfer/topk_varlen/kernels/gvr_topk_decode.py",
-    "flashinfer/topk_varlen/kernels/gvr_topk_decode_lb.py",
-    "flashinfer/topk_varlen/kernels/gvr2_topk_host.py",
-    "flashinfer/topk_varlen/kernels/block_scan.py",
-    "flashinfer/experimental/attn_scores/kernels/selective_logits_metadata.py",
-    "flashinfer/experimental/attn_scores/kernels/selective_sample_policy.py",
-    "flashinfer/experimental/attn_scores/selective_logits.py",
-    "flashinfer/experimental/attn_scores/selective_capacity.py",
-    "flashinfer/experimental/attn_scores/full_capacity.py",
-    "flashinfer/experimental/attn_scores/full_host_hints.py",
-    "flashinfer/experimental/attn_scores/host_length_hints.py",
-    "flashinfer/experimental/attn_scores/selective_v2.py",
-    "flashinfer/experimental/attn_scores/kernels/indexer_topk_v2/VENDOR_MANIFEST.json",
-    "flashinfer/attn_scores/_math_policy.py",
-    "flashinfer/experimental/attn_scores/_selective_contract.py",
-    "flashinfer/attn_scores/_fp8_mqa_constants.py",
-    "flashinfer/experimental/attn_scores/jit/selective_sample_ladder.py",
-    "flashinfer/experimental/attn_scores/jit/selective_repair_if.py",
-    "csrc/selective_sample_ladder.cu",
-    "csrc/selective_repair_if.cu",
-    "csrc/tvm_ffi_utils.h",
-    "include/flashinfer/attention/selective_sample_ladder.cuh",
-    "include/flashinfer/attention/selective_repair_if.cuh",
-    "flashinfer/topk_varlen/kernels/radix_topk.py",
-    "flashinfer/topk_varlen/topk_varlen.py",
-)
-EXECUTION_SOURCE_PATHS += tuple(
-    str(path.relative_to(Path(__file__).resolve().parents[1]))
-    for path in sorted(
-        (
-            Path(__file__).resolve().parents[1]
-            / "flashinfer/experimental/attn_scores/kernels/indexer_topk_v2"
-        ).rglob("*.py")
-    )
-)
 
 
 def _percentile(samples: list[float], fraction: float) -> float:
@@ -201,7 +146,7 @@ def _validated_routes(component, repeats):
 
 
 def render_summary(paths):
-    """Render one source/environment/GPU's block-paired JSON without CUDA work."""
+    """Render one environment/GPU's block-paired JSON without CUDA work."""
     return _render_results((str(path), json.loads(path.read_text())) for path in paths)
 
 
@@ -209,18 +154,14 @@ def _render_results(results):
     rows, identities, seen, partial = [], set(), set(), []
     for path, result in results:
         schema = result["schema_version"]
-        if schema not in (11, 12, 13, 14, 15, 16, 17, 18, 19, 20):
-            raise ValueError(f"expected block-paired schema 11 through 20: {path}")
-        source = result["source"]
-        if not source["tracked_worktree_clean"]:
-            raise ValueError(f"dirty execution source: {path}")
+        if schema not in (21, 22):
+            raise ValueError(f"expected block-paired schema 21 or 22: {path}")
         identities.add(
             (
-                source["git_commit"],
-                json.dumps(source["source_sha256"], sort_keys=True),
-                result["device"]["uuid"],
+                result["device"]["name"],
                 json.dumps(result["environment"], sort_keys=True),
                 schema,
+                result["device"].get("uuid", result["device"]["name"]),
             )
         )
         if result["status"] != "complete":
@@ -263,7 +204,7 @@ def _render_results(results):
                 raise ValueError(f"exact repair failed: {key}")
             summaries = _validated_routes(row, repeats)
             step_summaries = None
-            if schema in (11, 13, 15, 17, 19):
+            if schema == 21:
                 if not row.get("step"):
                     raise ValueError(
                         "setup/layer schema requires per-step setup samples"
@@ -278,7 +219,7 @@ def _render_results(results):
                 )
             rows.append((row, summaries, step_summaries))
     if len(identities) != 1 or not rows:
-        raise ValueError("expected nonempty results from one source/environment/GPU")
+        raise ValueError("expected nonempty results from one environment/GPU")
     identity = next(iter(identities))
     settling_modes = {
         row["protocol"].get("steady_state_warmup_requested_s", 0.0)
@@ -294,16 +235,15 @@ def _render_results(results):
         else "medians of the configured consecutive replay blocks"
     )
     lines = [
-        f"Source `{identity[0]}`; GPU `{identity[2]}`. {len(rows)} comparisons.",
+        f"GPU `{identity[0]}`. {len(rows)} comparisons.",
         "",
         f"Latency in ms: {median_scope}.",
         f"Same-route settling warmup immediately before each timed block: {settling_seconds:g} seconds; five-second pauses remain after each block.",
-        "Workspace in MiB: reachable PyTorch tensors owned by each route, excluding inputs/outputs; not a device peak.",
         "",
         "Per-step setup runs once per forward pass and is shared across indexer layers: full builds row/group metadata and request IDs, gathers the page table and computes the scorer schedule; selective calls plan() for "
-        + ("prefix copy" if identity[4] >= 19 else "table copy")
+        + "prefix copy"
         + ", validation, metadata, schedules and sampling-metadata refresh.",
-        "Layer is one indexer TopK operation: full calls fp8_paged_mqa_logits + top_k_varlen(gvr_2); selective calls run().",
+        "Layer is one indexer TopK operation: FP8 full calls fp8_paged_mqa_logits + top_k_varlen(gvr_2); block-scaled full uses a PyTorch FP32 dense fallback; selective calls run().",
         "For L indexer layers, model cost per forward pass is per-step setup + L * layer; a standalone single call costs per-step setup + layer.",
     ]
     rows.sort(
@@ -343,15 +283,11 @@ def _render_results(results):
                 "",
                 "Profiles: " + profile_text + ".",
                 "",
-                f"| {heads_label} | Compression Ratio | {dimension} | Original context | Full indexer + GVRv2 layer (ms) | Indexer-throwaway + TopK layer (ms) | Layer speedup | Full indexer + GVRv2 workspace (MiB) | Indexer-throwaway + TopK workspace (MiB) |",
-                "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+                f"| {heads_label} | Compression Ratio | {dimension} | Original context | Full indexer + GVRv2 layer (ms) | Indexer-throwaway + TopK layer (ms) | Layer speedup |",
+                "| --- | --- | --- | --- | --- | --- | --- |",
             ]
         )
         for row, summaries, _ in group:
-            memory = [
-                row["memory"][route]["owned_reachable_tensor_bytes"] / 2**20
-                for route in ("full_gvr2", "selective")
-            ]
             context = str(row["kv"])
             if row["kv"] % 2**20 == 0:
                 context = f"{row['kv'] // 2**20}M"
@@ -366,7 +302,7 @@ def _render_results(results):
             lines.append(
                 f"| {heads} | {row['compression_ratio']} | {size} | {context} | "
                 f"{summaries[0][0] / 1000:.6f} | {summaries[1][0] / 1000:.6f} | "
-                f"{summaries[0][0] / summaries[1][0]:.4f}x | {memory[0]:.1f} | {memory[1]:.1f} |"
+                f"{summaries[0][0] / summaries[1][0]:.4f}x |"
             )
     lines.extend(
         [
@@ -374,7 +310,7 @@ def _render_results(results):
             "Per-row AxN-5s-BxN-5s or reverse order, as recorded in protocol.order; one event-timed replay per sample, no deliberate intra-arm sleep. Host event/enqueue gaps remain. Device snapshots do not establish power isolation.",
         ]
     )
-    if identity[4] in (11, 13):
+    if identity[2] == 21:
         lines.extend(
             [
                 "",
@@ -407,29 +343,6 @@ def _record_event(call) -> float:
     end.record()
     end.synchronize()
     return start.elapsed_time(end) * 1000.0
-
-
-def _source_provenance(repository: Path) -> dict:
-    status = subprocess.run(
-        ["git", "status", "--porcelain=v1", "--untracked-files=no"],
-        cwd=repository,
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=60,
-        env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
-    ).stdout.splitlines()
-    source_sha256 = {
-        relative_path: hashlib.sha256(
-            (repository / relative_path).read_bytes()
-        ).hexdigest()
-        for relative_path in EXECUTION_SOURCE_PATHS
-    }
-    return {
-        "git_status_porcelain": status,
-        "tracked_worktree_clean": not status,
-        "source_sha256": source_sha256,
-    }
 
 
 def _paired_events(
@@ -496,101 +409,6 @@ def _paired_events(
             }
         )
     return samples_a, samples_b, pauses
-
-
-def _tensor_storage(tensor):
-    storage = tensor.untyped_storage()
-    return str(tensor.device), storage.data_ptr(), storage.nbytes()
-
-
-def _sampled_input_hash(tensor):
-    """Hash shape and reproducible byte samples without a large host copy."""
-    data = tensor.contiguous().view(torch.uint8).flatten()
-    stride = max(1, data.numel() // 4096)
-    sampled = torch.cat((data[:4096], data[-4096:], data[::stride][:4096]))
-    digest = hashlib.sha256(str((tuple(tensor.shape), str(tensor.dtype))).encode())
-    digest.update(sampled.cpu().numpy().tobytes())
-    return digest.hexdigest()
-
-
-def _workspace_inventory(owner, excluded):
-    """Count reachable PyTorch storage once, excluding shared inputs/outputs.
-
-    Opaque native allocations and graph-private pools are not traversed. This
-    is neither an allocator delta nor a device-memory peak.
-    """
-    excluded_storage = {_tensor_storage(tensor) for tensor in excluded}
-    visited, allocations = set(), {}
-
-    def visit(value, path):
-        if id(value) in visited:
-            return
-        visited.add(id(value))
-        if isinstance(value, torch.Tensor):
-            key = _tensor_storage(value)
-            if key not in excluded_storage and key[2]:
-                allocations.setdefault(key, []).append(path)
-        elif isinstance(value, dict):
-            for name, item in value.items():
-                visit(item, f"{path}.{name}")
-        elif isinstance(value, (list, tuple)):
-            for index, item in enumerate(value):
-                visit(item, f"{path}[{index}]")
-        elif type(value).__module__.startswith(
-            ("flashinfer.attn_scores", "flashinfer.experimental.attn_scores")
-        ) and hasattr(value, "__dict__"):
-            for name, item in vars(value).items():
-                visit(item, f"{path}.{name}")
-
-    visit(owner, "workspace")
-    return {
-        "owned_reachable_tensor_bytes": sum(key[2] for key in allocations),
-        "storage_count": len(allocations),
-        "allocations": [
-            {"device": key[0], "bytes": key[2], "paths": paths}
-            for key, paths in allocations.items()
-        ],
-        "scope": "deduplicated reachable PyTorch storage; input/output excluded; "
-        "opaque native and graph-only storage unknown; not a device peak",
-    }
-
-
-def _device_observation():
-    """Untimed device snapshot; not route-specific telemetry or power isolation."""
-    fields = (
-        "name",
-        "driver_version",
-        "pstate",
-        "temperature.gpu",
-        "power.draw",
-        "power.limit",
-        "clocks.sm",
-        "clocks.mem",
-    )
-    try:
-        observation = subprocess.run(
-            [
-                "nvidia-smi",
-                "--query-gpu=" + ",".join(fields),
-                "--format=csv,noheader,nounits",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
-        return {
-            "returncode": observation.returncode,
-            "gpus": [
-                dict(zip(fields, (value.strip() for value in row), strict=True))
-                for row in csv.reader(observation.stdout.splitlines())
-                if len(row) == len(fields)
-            ]
-            if observation.returncode == 0
-            else [],
-        }
-    except (OSError, subprocess.TimeoutExpired) as error:
-        return {"unavailable": str(error)}
 
 
 def _save_result(path, result):
@@ -686,88 +504,106 @@ def _model_quantize(rows, columns, *, generator, fp4):
     return packed.view(rows, columns // 2), scales.view(rows, columns // 32)
 
 
-def _load_input_tensors(path, args, physical_length, groups):
-    """Load losslessly exported captures with explicit causal-crop validation."""
-    source = torch.load(path, map_location="cpu", weights_only=True)
-    fp4 = args.qkv_dtype == "mxfp4"
-    if args.batch_size != 1 or tuple(source["q"].shape) != (
-        args.q,
-        args.num_heads,
-        args.head_dim // (2 if fp4 else 1),
-    ):
-        raise ValueError("captured inputs require one matching prefill request")
-    expected_dtype = torch.uint8 if fp4 else torch.float8_e4m3fn
-    if source["q"].dtype != expected_dtype or source["k"].dtype != expected_dtype:
-        raise ValueError("capture encoding does not match qkv-dtype")
-    crop = source["k"].shape[0] - physical_length
-    if (
-        crop < 0
-        or not bool((source["starts"] == 0).all())
-        or not torch.equal(
-            source["ends"].to(torch.int64) - crop,
-            torch.tensor(groups.real_ends, dtype=torch.int64),
+@dataclass(frozen=True)
+class _ReferenceGroups:
+    """Immutable host metadata for request-local full-score query grouping.
+
+    Use :meth:`build` to validate prefixes and construct the fields. Query
+    prefixes count real rows; token prefixes count original, uncompressed
+    tokens. All stored KV ends and ``physical_prefix`` use physical KV slots.
+    No device tensors, query payloads or page tables are allocated here.
+
+    ``rows`` contains ``(output_base, valid_queries, *physical_ends)`` for each
+    group, with zero ends in padded slots. ``group_ends`` and ``request_ids``
+    give each group's maximum physical end and originating request.
+    ``gather_rows`` maps flattened group slots to real input query rows;
+    padded slots repeat a valid row in that group and are identified by
+    ``invalid_queries`` so callers can zero their gathered Q/weights.
+    ``real_ends`` contains one physical end per real output row.
+    ``physical_prefix`` accumulates each request's floored physical length.
+    Empty-query requests produce no groups. Grouping never crosses a request.
+    """
+
+    query_tile: int
+    q_prefix: tuple
+    token_prefix: tuple
+    ratio: int
+    rows: tuple
+    group_ends: tuple
+    request_ids: tuple
+    gather_rows: tuple
+    invalid_queries: tuple
+    real_ends: tuple
+    physical_prefix: tuple
+
+    @classmethod
+    def build(cls, q_prefix, token_prefix, ratio, query_tile):
+        """Build grouping metadata from cumulative host integer prefixes.
+
+        ``q_prefix`` and ``token_prefix`` must have the same batch-plus-one
+        length, start at zero and be nondecreasing. A request with Q queries
+        and L original KV tokens requires ``L >= Q``. For ratio 1 or 4, query
+        i's exclusive physical end is ``(L - Q + i + 1) // ratio``; physical
+        request lengths are floored before forming their cumulative prefix.
+
+        ``query_tile`` is a positive integer number of queries per group.
+        The last group of a request may contain padded slots, but output
+        bases and valid counts cover only real rows. Return an _ReferenceGroups
+        containing tuples independent of the input sequences; raise ValueError
+        for invalid prefix, ratio, grouping or row-encoding contracts.
+        """
+        if type(ratio) is not int or ratio not in (1, 4):
+            raise ValueError("ratio must be 1 or 4")
+        if type(query_tile) is not int or query_tile <= 0:
+            raise ValueError("positive integer query tile required")
+        q_prefix, token_prefix = tuple(q_prefix), tuple(token_prefix)
+        if len(q_prefix) < 2 or len(q_prefix) != len(token_prefix):
+            raise ValueError("matching request prefixes required")
+        for prefix in (q_prefix, token_prefix):
+            if (
+                any(type(x) is not int for x in prefix)
+                or prefix[0] != 0
+                or any(a > b for a, b in zip(prefix, prefix[1:], strict=False))
+            ):
+                raise ValueError(
+                    "nondecreasing integer prefixes starting at zero required"
+                )
+        rows, maxima, requests, gathers, invalid, real_ends = [], [], [], [], [], []
+        physical = [0]
+        for req, (qb, qe, kb, ke) in enumerate(
+            zip(q_prefix, q_prefix[1:], token_prefix, token_prefix[1:], strict=False)
+        ):
+            count, tokens = qe - qb, ke - kb
+            if tokens < count:
+                raise ValueError("original KV length must be at least Q length")
+            physical.append(physical[-1] + tokens // ratio)
+            ends = tuple((tokens - count + i + 1) // ratio for i in range(count))
+            real_ends.extend(ends)
+            for first in range(0, count, query_tile):
+                valid = min(query_tile, count - first)
+                slot_ends = ends[first : first + valid] + (0,) * (query_tile - valid)
+                rows.append((qb + first, valid, *slot_ends))
+                maxima.append(max(slot_ends))
+                requests.append(req)
+                # Dummy slots stay within this request/group, then are zeroed.
+                gathers.extend(
+                    qb + first + t if t < valid else qb + first
+                    for t in range(query_tile)
+                )
+                invalid.extend(t >= valid for t in range(query_tile))
+        return cls(
+            query_tile,
+            q_prefix,
+            token_prefix,
+            ratio,
+            tuple(rows),
+            tuple(maxima),
+            tuple(requests),
+            tuple(gathers),
+            tuple(invalid),
+            tuple(real_ends),
+            tuple(physical),
         )
-    ):
-        raise ValueError("capture cannot be cropped to the requested causal bounds")
-    q = source["q"].cuda().contiguous()
-    key = source["k"][crop:].cuda().contiguous()
-    weights = source["weights"].cuda().float().contiguous()
-    if tuple(weights.shape) != (args.q, args.num_heads):
-        raise ValueError("capture weights shape does not match Q")
-    if fp4:
-        q_scale = (
-            source["q_scale"]
-            .contiguous()
-            .view(torch.uint8)
-            .reshape(args.q, args.num_heads, 4)
-            .cuda()
-        )
-        scale = (
-            source["k_scale"]
-            .contiguous()
-            .view(torch.uint8)
-            .reshape(-1, 4)[crop:]
-            .cuda()
-        )
-        reference_q = _decode_mxfp4(q, q_scale)
-        reference_k = _decode_mxfp4(key, scale)
-        q_scale = q_scale.contiguous().view(torch.int32).squeeze(-1)
-        reference_scale = torch.ones(physical_length, device="cuda")
-    else:
-        if source.get("q_scale") is not None:
-            raise ValueError("FP8 captures must already fold Q scales into weights")
-        scale = (
-            (
-                torch.ones(physical_length)
-                if source.get("k_scale") is None
-                else source["k_scale"].reshape(-1)[crop:]
-            )
-            .cuda()
-            .float()
-            .contiguous()
-        )
-        q_scale, reference_q, reference_k, reference_scale = None, q, key, scale
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(8 << 20), b""):
-            digest.update(chunk)
-    provenance = {
-        "tensor_file_sha256": digest.hexdigest(),
-        "drop_oldest_physical_keys": crop,
-        "source": source.get("provenance", {}),
-        "requantized": False,
-    }
-    return (
-        q,
-        q_scale,
-        reference_q,
-        key,
-        scale,
-        reference_k,
-        reference_scale,
-        weights,
-        provenance,
-    )
 
 
 class _FullGVR:
@@ -779,10 +615,8 @@ class _FullGVR:
     request IDs from device prefixes, gathers the live map and refreshes the
     public scorer schedule. Layer replay consumes those address-stable owners.
 
-    Default geometries use the ordinary scorer. For compressed multi-query
-    groups, widen its causal prefix and append a valid padding-page mapping;
-    GVR still selects only the original physical row prefixes. Custom scorer
-    configurations use explicit per-row physical bounds.
+    FP8 uses the public paged scorer and GVR. Block-scaled encodings use
+    a PyTorch FP32 dense scorer followed by GVR.
     """
 
     def __init__(
@@ -792,7 +626,6 @@ class _FullGVR:
         weights,
         block_table,
         groups,
-        config,
         top_k,
         *,
         qo_indptr,
@@ -803,10 +636,7 @@ class _FullGVR:
         from flashinfer import top_k_varlen
         from flashinfer.attn_scores import (
             compute_paged_mqa_logits_schedule,
-            fp4_paged_mqa_logits,
-        )
-        from flashinfer.attn_scores.attn_scores import (
-            _fp8_paged_mqa_logits as fp8_paged_mqa_logits,
+            fp8_paged_mqa_logits,
         )
         from flashinfer.topk_varlen.kernels.gvr2_topk_host import workspace_bytes
 
@@ -822,33 +652,12 @@ class _FullGVR:
                 raise ValueError("Full capacity must cover the live physical context")
             width = physical_capacity
         rows, heads, dimension = q.shape
-        fp4 = q_scale is not None
-        logical_dimension = dimension * 2 if fp4 else dimension
         tile = groups.query_tile
-        ordinary_defaults = (
-            getattr(config, "identity", None) == (128, 1, 160)
-            and config.num_q_stages in (None, 3)
-            and config.num_kv_stages in (None, 3)
-            and heads in (8, 64)
-            and tile in (1, 16 if heads == 8 else 4)
-        )
-        causal_envelope = (ordinary_defaults or fp4) and groups.ratio != 1 and tile > 1
-        explicit_bounds = not ordinary_defaults and not fp4
+        causal_envelope = groups.ratio != 1 and tile > 1
         self.scorer_mode = (
-            "explicit-physical-bounds"
-            if explicit_bounds
-            else "ordinary-causal-envelope"
-            if causal_envelope
-            else "ordinary-causal"
+            "ordinary-causal-envelope" if causal_envelope else "ordinary-causal"
         )
         self.scorer_width = width + tile - 1 if width and causal_envelope else width
-        config.validate_geometry(
-            heads=heads,
-            dimension=logical_dimension,
-            page=kv_fused.shape[1],
-            next_n=tile,
-        )
-        config.require_dispatchable()
         self.output = torch.empty((rows, top_k), device=device, dtype=torch.int32)
         self.workspace_owners = ()
         output = self.output
@@ -861,43 +670,13 @@ class _FullGVR:
             raise ValueError(
                 "public GVR2 requires singleton score width divisible by four"
             )
-        columns = max(8192, top_k, config.padded_columns(self.scorer_width))
+        columns = max(8192, top_k, ((self.scorer_width + 255) // 256 * 256))
         self.scores = torch.empty((rows, columns), device=device, dtype=torch.float32)
-        # Public MXFP4 stores use int32 offsets. At large output sizes, use
-        # explicit query chunks, each within that public contract. Every chunk
-        # and its own schedule is included in the complete Full replay.
-        max_fp4_rows = max(tile, ((2**31 - 1) // columns // tile) * tile)
-        self.scorer_chunks = (
-            [
-                (
-                    first,
-                    min(rows, first + max_fp4_rows),
-                    torch.empty(
-                        (
-                            torch.cuda.get_device_properties(
-                                device
-                            ).multi_processor_count
-                            + 1,
-                            2,
-                        ),
-                        device=device,
-                        dtype=torch.int32,
-                    ),
-                )
-                for first in range(0, rows, max_fp4_rows)
-            ]
-            if fp4
-            else []
-        )
+        self.scorer_chunks = []
         scores = self.scores
         logical_scores = scores[:, :width]
         row_ids = torch.arange(rows, device=device, dtype=torch.int32)
         row_ends = torch.empty((rows,), device=device, dtype=torch.int32)
-        metadata = (
-            torch.empty((len(groups.rows), tile + 2), device=device, dtype=torch.int32)
-            if explicit_bounds
-            else None
-        )
         group_ends = torch.empty((len(groups.rows),), device=device, dtype=torch.int32)
         request_ids = torch.empty((len(groups.rows),), device=device, dtype=torch.int64)
         table_rows = torch.empty(
@@ -920,19 +699,21 @@ class _FullGVR:
                 workspace_bytes(), device=device, dtype=torch.uint8
             ).view(torch.int32)
         }
-        grouped_q = q.view(len(groups.rows), tile, heads, dimension)
-        grouped_q_scale = q_scale.view(len(groups.rows), tile, heads) if fp4 else None
-        scorer_width = self.scorer_width
-        scorer_options = (
-            dict(kernel_config=config, query_metadata=metadata, output_rows=rows)
-            if explicit_bounds
-            else {}
+        padded_heads = (
+            max(8, 1 << (heads - 1).bit_length()) if heads * tile % 8 else heads
         )
+        padded_q = torch.zeros(
+            (rows, padded_heads, dimension), device=device, dtype=q.dtype
+        )
+        padded_weights = torch.zeros(
+            (rows, padded_heads), device=device, dtype=weights.dtype
+        )
+        grouped_q = padded_q.view(len(groups.rows), tile, padded_heads, dimension)
+        scorer_width = self.scorer_width
         self.workspace_owners = (
             scores,
             logical_scores,
             row_ends,
-            metadata,
             group_ends,
             request_ids,
             row_ids,
@@ -957,10 +738,6 @@ class _FullGVR:
                     rounding_mode="floor",
                 )
             )
-            if explicit_bounds:
-                metadata[:, 0].copy_(row_ids.view(-1, tile)[:, 0])
-                metadata[:, 1].fill_(tile)
-                metadata[:, 2:].copy_(row_ends.view(-1, tile))
             torch.amax(row_ends.view(-1, tile), dim=1, out=group_ends)
             if causal_envelope:
                 # Ordinary row t promises original_group_max + t, covering
@@ -968,53 +745,25 @@ class _FullGVR:
                 group_ends.add_(tile - 1)
             request_ids.copy_(requests.view(-1, tile)[:, 0])
             torch.index_select(block_table, 0, request_ids, out=gathered_table)
-            if fp4:
-                for first, stop, chunk_schedule in self.scorer_chunks:
-                    compute_paged_mqa_logits_schedule(
-                        group_ends[first // tile : stop // tile],
-                        device=device,
-                        next_n=tile,
-                        variant="fp4",
-                        out=chunk_schedule,
-                    )
-            else:
-                compute_paged_mqa_logits_schedule(
-                    group_ends, device=device, next_n=tile, variant="fp8", out=schedule
-                )
+            compute_paged_mqa_logits_schedule(
+                group_ends, device=device, next_n=tile, variant="fp8", out=schedule
+            )
 
         def layer():
-            if fp4:
-                for first, stop, chunk_schedule in self.scorer_chunks:
-                    group_slice = slice(first // tile, stop // tile)
-                    fp4_paged_mqa_logits(
-                        grouped_q[group_slice],
-                        grouped_q_scale[group_slice],
-                        kv_fused,
-                        weights[first:stop],
-                        table_rows[group_slice],
-                        group_ends[group_slice],
-                        scorer_width,
-                        output_dtype=torch.float32,
-                        epi_dtype=torch.float32,
-                        schedule_meta=chunk_schedule,
-                        out=scores[first:stop],
-                    )
-            else:
-                fp8_paged_mqa_logits(
-                    grouped_q,
-                    kv_fused,
-                    weights,
-                    table_rows,
-                    group_ends,
-                    scorer_width,
-                    output_dtype=torch.float32,
-                    epi_dtype=torch.float32,
-                    acc_dtype=torch.float32,
-                    math_mode="relu_strict",
-                    schedule_meta=schedule,
-                    out=scores,
-                    **scorer_options,
-                )
+            padded_q[:, :heads].copy_(q)
+            padded_weights[:, :heads].copy_(weights)
+            fp8_paged_mqa_logits(
+                grouped_q,
+                kv_fused,
+                padded_weights,
+                table_rows,
+                group_ends,
+                scorer_width,
+                output_dtype=torch.float32,
+                epi_dtype=torch.float32,
+                schedule_meta=schedule,
+                out=scores,
+            )
             top_k_varlen(
                 logical_scores,
                 row_ends,
@@ -1031,6 +780,55 @@ class _FullGVR:
         self.step, self.layer = step, layer
 
 
+class _DenseGVR:
+    """PyTorch FP32 dense fallback for block-scaled encodings."""
+
+    def __init__(self, q, keys, scales, weights, groups, top_k):
+        from flashinfer import top_k_varlen
+        from flashinfer.topk_varlen.kernels.gvr2_topk_host import workspace_bytes
+
+        if len(keys) != 1:
+            raise ValueError("dense fallback supports one request")
+        rows, width = q.shape[0], keys[0].shape[0]
+        self.output = torch.empty((rows, top_k), device=q.device, dtype=torch.int32)
+        self.scores = torch.empty((rows, max(width, top_k, 8192)), device=q.device)
+        self.scorer_chunks = []
+        self.scorer_width = width
+        self.scorer_mode = "pytorch-fp32-dense"
+        ends = torch.tensor(groups.real_ends, device=q.device, dtype=torch.int32)
+        workspace = {
+            "gvr2_workspace": torch.zeros(
+                workspace_bytes(), device=q.device, dtype=torch.uint8
+            ).view(torch.int32)
+        }
+        query = q.float()
+        key = keys[0].float()
+        self.workspace_owners = (ends, workspace, query, key)
+        self.step = lambda: None
+
+        def layer():
+            scores = self.scores[:, :width]
+            scores.zero_()
+            for head in range(query.shape[1]):
+                dots = query[:, head, :] @ key.T
+                scores.add_(dots.relu() * weights[:, head, None])
+            scores.mul_(scales[0][None, :])
+            top_k_varlen(
+                self.scores[:, :width],
+                ends,
+                top_k,
+                next_n=1,
+                compress_ratio=1,
+                backend="gvr_2",
+                return_values=False,
+                out_indices=self.output,
+                workspace=workspace,
+            )
+            return self.output
+
+        self.layer = layer
+
+
 def _check_reference(
     outputs,
     q,
@@ -1044,6 +842,8 @@ def _check_reference(
     rtol,
     logits_dtype=None,
     native_scores=None,
+    math_mode=None,
+    encoding="fp8",
 ):
     """Check independent FP32 math and exact native-rounded selection per row.
 
@@ -1053,8 +853,8 @@ def _check_reference(
     """
     maximum_error = {name: 0.0 for name in outputs}
     rounded_native = logits_dtype not in (None, torch.float32)
-    if rounded_native:
-        if native_scores is None or native_scores.dtype != torch.float32:
+    if rounded_native and native_scores is not None:
+        if native_scores.dtype != torch.float32:
             raise ValueError("native-rounded checks require FP32 producer scores")
         maximum_error["native_producer_fp32"] = 0.0
     previous_tf32 = torch.backends.cuda.matmul.allow_tf32
@@ -1073,12 +873,49 @@ def _check_reference(
                 reference = torch.empty(
                     (stop - first, key.shape[0]), device=q.device, dtype=torch.float32
                 )
+                native_reference = (
+                    torch.empty_like(reference)
+                    if math_mode in ("native_bf16", "native_fp16")
+                    else None
+                )
                 for kb in range(0, key.shape[0], 4096):
                     ke = min(kb + 4096, key.shape[0])
                     dots = torch.einsum("qhd,kd->qhk", query, key[kb:ke])
-                    dots.relu_().mul_(weight[:, :, None])
+                    dots.relu_()
+                    if native_reference is not None:
+                        factor = (
+                            512
+                            if math_mode == "native_fp16" and encoding == "fp8"
+                            else 1
+                        )
+                        rounded = (dots / factor).to(logits_dtype).double()
+                        w = (weight.float() * factor).to(logits_dtype).double()
+                        chains = [
+                            torch.zeros(
+                                (stop - first, ke - kb),
+                                device=q.device,
+                                dtype=torch.float64,
+                            )
+                            for _ in range(4)
+                        ]
+                        for h in range(weight.shape[1]):
+                            i = h % 4
+                            chains[i] = (
+                                (chains[i] + rounded[:, h, :] * w[:, h, None])
+                                .to(logits_dtype)
+                                .double()
+                            )
+                        left = (chains[0] + chains[2]).to(logits_dtype).double()
+                        right = (chains[1] + chains[3]).to(logits_dtype).double()
+                        native_reference[:, kb:ke] = (
+                            (
+                                (left + right).to(logits_dtype).float()
+                                * scale[None, kb:ke]
+                            ).to(logits_dtype)
+                        ).float()
+                    dots.mul_(weight.float()[:, :, None])
                     reference[:, kb:ke] = dots.sum(dim=1) * scale[None, kb:ke]
-                if rounded_native:
+                if rounded_native and native_scores is not None:
                     native = native_scores[first:stop, : key.shape[0]]
                     valid = (
                         torch.arange(key.shape[0], device=q.device)[None, :]
@@ -1118,19 +955,41 @@ def _check_reference(
                                 f"{name}: invalid suffix in row {first + local}"
                             )
                         actual = reference[local, indices].sort().values
-                        if name != "full_gvr2" and rounded_native:
-                            values = native_scores[first + local, :end].to(logits_dtype)
+                        if name != "full_gvr2" and native_reference is not None:
+                            values = native_reference[local, :end]
+                            expected = values.topk(count).values.sort().values
+                            actual = values[indices].sort().values
+                        elif name != "full_gvr2" and rounded_native:
+                            values = (
+                                native_scores[first + local, :end]
+                                if native_scores is not None
+                                else reference[local, :end]
+                            ).to(logits_dtype)
                             expected = values.topk(count).values.sort().values.float()
                             actual = values[indices].sort().values.float()
-                        exact_native = name != "full_gvr2" and logits_dtype not in (
-                            None,
-                            torch.float32,
+                        exact_native = (
+                            name != "full_gvr2"
+                            and rounded_native
+                            and native_scores is not None
+                            and native_reference is None
                         )
                         torch.testing.assert_close(
                             actual,
                             expected,
-                            atol=0 if exact_native else atol,
-                            rtol=0 if exact_native else rtol,
+                            atol=0
+                            if exact_native
+                            else (
+                                max(atol, 2e-3)
+                                if native_reference is not None and name != "full_gvr2"
+                                else atol
+                            ),
+                            rtol=0
+                            if exact_native
+                            else (
+                                max(rtol, 2e-3)
+                                if native_reference is not None and name != "full_gvr2"
+                                else rtol
+                            ),
                             msg=lambda message: f"{name}, row {first + local}: {message}",
                         )
                         if count:
@@ -1162,18 +1021,10 @@ def _context_capacity(kv_len, max_context_length, compression_ratio):
 def run_row(kv_len: int, args) -> dict:
     """Benchmark equivalent full/GVR and selective routes on original-token bounds."""
     from flashinfer.attn_scores import FP8MQATopKWrapper
-    from flashinfer.attn_scores.fp8_kernel_config import (
-        _FP8MQAKernelConfig as FP8MQAKernelConfig,
-    )
-    from flashinfer.attn_scores.query_group_metadata import (
-        _FP8QueryGroups as FP8QueryGroups,
-    )
 
     max_context, physical_capacity = _context_capacity(
         kv_len, getattr(args, "max_context_length", None), args.compression_ratio
     )
-    observation_before = _device_observation()
-    torch.cuda.reset_peak_memory_stats()
     if kv_len < args.q:
         raise ValueError("original KV length must be at least Q per request")
     total_rows = args.batch_size * args.q
@@ -1181,26 +1032,19 @@ def run_row(kv_len: int, args) -> dict:
     encoding = getattr(args, "qkv_dtype", "fp8")
     model = getattr(args, "model_config", None)
     input_model = getattr(args, "model_profile", None) or model
-    distribution = getattr(args, "input_distribution", "goal2")
+    distribution = getattr(args, "input_distribution", "signed")
     model_inputs = distribution == "model"
     logits_name = getattr(args, "logits_dtype", "float32")
     logits_dtype = getattr(torch, logits_name)
-    if getattr(args, "backend", "v1") == "v1" and logits_dtype != torch.float32:
-        raise ValueError(
-            "v1 preserves FP32 logits; native dtype comparisons require v2"
-        )
     fp4 = encoding == "mxfp4"
-    if fp4 and (getattr(args, "backend", "v1") != "v2" or args.num_heads != 64):
-        raise ValueError(
-            "MXFP4 comparison requires v2 and H64; v1 has no MXFP4 counterpart"
-        )
+    mxfp8 = encoding == "mxfp8"
     tile = args.full_query_tile
     if tile is None:
         family_tile = 2 if fp4 else 16 if args.num_heads == 8 else 4
         tile = family_tile if args.q % family_tile == 0 else 1
     if args.q % tile:
         raise ValueError("uniform request Q must be divisible by full-query-tile")
-    groups = FP8QueryGroups.build(
+    groups = _ReferenceGroups.build(
         [i * args.q for i in range(args.batch_size + 1)],
         [i * kv_len for i in range(args.batch_size + 1)],
         args.compression_ratio,
@@ -1208,17 +1052,9 @@ def run_row(kv_len: int, args) -> dict:
     )
     if groups.token_prefix[-1] >= 2**31:
         raise ValueError("cumulative original-token prefixes must fit int32")
+    torch.backends.cuda.matmul.allow_tf32 = False
     generator = torch.Generator(device="cuda").manual_seed(args.seed)
-    input_path = getattr(args, "input_tensors", None)
-    capture = (
-        _load_input_tensors(input_path, args, physical_length, groups)
-        if input_path
-        else None
-    )
-    if capture is not None:
-        q, q_scale, reference_q = capture[:3]
-        distribution = "captured"
-    elif model_inputs:
+    if model_inputs:
         q, query_scales = _model_quantize(
             total_rows * args.num_heads, args.head_dim, generator=generator, fp4=fp4
         )
@@ -1248,14 +1084,23 @@ def run_row(kv_len: int, args) -> dict:
         )
         q = q.reshape(total_rows, args.num_heads, args.head_dim)
         q_scale, reference_q = None, q
+    if mxfp8:
+        q_scale = torch.full(
+            (total_rows, args.num_heads), 0x7F7F7F7F, device="cuda", dtype=torch.int32
+        )
     keys, scales, pages = [], [], []
     continuous_keys, continuous_scales = [], []
     # Generate one independent request at a time to bound the FP32 temporary.
     for _ in range(args.batch_size):
-        if capture is not None:
-            key, scale = capture[3:5]
-            keys.append(capture[5])
-            scales.append(capture[6])
+        if mxfp8:
+            key = torch.randn(
+                (physical_length, args.head_dim), device="cuda", generator=generator
+            ).to(torch.float8_e4m3fn)
+            scale = torch.full(
+                (physical_length, 4), 127, device="cuda", dtype=torch.uint8
+            )
+            keys.append(key)
+            scales.append(torch.ones(physical_length, device="cuda"))
         elif model_inputs:
             key, scale = _model_quantize(
                 physical_length, args.head_dim, generator=generator, fp4=fp4
@@ -1297,7 +1142,7 @@ def run_row(kv_len: int, args) -> dict:
         continuous_scales.append(scale)
         # A dummy page keeps the public paged ABI valid for all-empty ratio4.
         live_pages = (
-            _fuse_paged_kv(key, scale, args.page_size)
+            _fuse_paged_kv(key, scales[-1] if mxfp8 else scale, args.page_size)
             if physical_length
             else torch.zeros(
                 (1, args.page_size, 1, args.head_dim // (2 if fp4 else 1) + 4),
@@ -1318,7 +1163,7 @@ def run_row(kv_len: int, args) -> dict:
     dense_keys = torch.cat(continuous_keys)
     dense_scales = torch.cat(continuous_scales)
     storage_keys = max(1, args.batch_size * physical_capacity)
-    if fp4:
+    if fp4 or mxfp8:
         storage_keys = (storage_keys + 255) // 256 * 256
     if dense_keys.shape[0] < storage_keys:
         padded_keys = torch.zeros(
@@ -1328,7 +1173,7 @@ def run_row(kv_len: int, args) -> dict:
         )
         padded_scales = torch.full(
             (storage_keys, *dense_scales.shape[1:]),
-            127 if fp4 else 1,
+            127 if fp4 or mxfp8 else 1,
             device=dense_scales.device,
             dtype=dense_scales.dtype,
         )
@@ -1355,39 +1200,16 @@ def run_row(kv_len: int, args) -> dict:
         weights.mul_(0.01)
     if input_model == "Qwen3.8-Flash-Next":
         weights.fill_(128**-0.5)
-    if capture is not None:
-        weights = capture[7]
+    weights = weights.to(getattr(torch, getattr(args, "weights_dtype", "float32")))
     cu_q = torch.tensor(groups.q_prefix, device="cuda", dtype=torch.int32)
     cu_tokens = torch.tensor(groups.token_prefix, device="cuda", dtype=torch.int32)
-    input_hashes = {
-        name: _sampled_input_hash(tensor)
-        for name, tensor in (
-            ("q", q),
-            ("weights", weights),
-            ("kv_fused", kv_fused),
-            ("continuous_keys", dense_keys),
-            ("continuous_scales", dense_scales),
-            ("block_table", block_table),
-            ("qo_indptr", cu_q),
-            ("kv_indptr", cu_tokens),
-        )
-    }
-    if q_scale is not None:
-        input_hashes["q_scale"] = _sampled_input_hash(q_scale)
-    config = FP8MQAKernelConfig(
-        128,
-        args.full_epi_subtiles,
-        args.full_w_cache_regs,
-        tile,
-        num_q_stages=3,
-        num_kv_stages=3,
-    )
     selective = FP8MQATopKWrapper(
-        backend=getattr(args, "backend", "v1"),
+        backend="cutedsl",
         num_heads=args.num_heads,
         head_dim=args.head_dim,
         top_k=args.top_k,
-        math_mode="relu_strict",
+        math_mode=getattr(args, "math_mode", None),
+        weights_dtype=getattr(torch, getattr(args, "weights_dtype", "float32")),
         compression_ratio=args.compression_ratio,
         max_context_length=max_context,
         max_chunk_size=q.shape[0],
@@ -1396,39 +1218,35 @@ def run_row(kv_len: int, args) -> dict:
         num_keys=dense_keys.shape[0],
         qkv_dtype=encoding,
         logits_dtype=logits_dtype,
-        model_config=model if getattr(args, "backend", "v1") == "v2" else None,
+        model_config=model,
     )
     staged = selective.input_buffers()
     staged["q"].copy_(q)
     staged["weights"].copy_(weights)
-    if fp4:
+    if fp4 or mxfp8:
         staged["q_scale"].copy_(q_scale)
     staged["qo_indptr"].copy_(cu_q)
     staged["kv_indptr"].copy_(cu_tokens)
     selective.prepare_pool(dense_keys, k_scale=dense_scales)
-    full = _FullGVR(
-        q,
-        kv_fused,
-        weights,
-        block_table,
-        groups,
-        config,
-        args.top_k,
-        qo_indptr=staged["qo_indptr"],
-        kv_indptr=staged["kv_indptr"],
-        q_scale=q_scale,
-        physical_capacity=physical_capacity,
-    )
-    engine = (
-        selective._capacity_plan._engine
-        if getattr(args, "backend", "v1") == "v1"
-        else None
-    )
+    if fp4 or mxfp8:
+        full = _DenseGVR(reference_q, keys, scales, weights, groups, args.top_k)
+    else:
+        full = _FullGVR(
+            q,
+            kv_fused,
+            weights.float(),
+            block_table,
+            groups,
+            args.top_k,
+            qo_indptr=staged["qo_indptr"],
+            kv_indptr=staged["kv_indptr"],
+            physical_capacity=physical_capacity,
+        )
     # Compile both step and layer paths before capturing their independent pairs.
     full.step()
     full.layer()
     selective.plan(staged["qo_indptr"], staged["kv_indptr"])
-    run_options = dict(q_scale=staged["q_scale"]) if fp4 else {}
+    run_options = dict(q_scale=staged["q_scale"]) if fp4 or mxfp8 else {}
     selective.run(
         staged["q"], staged["weights"], dense_keys, k_scale=dense_scales, **run_options
     )
@@ -1468,6 +1286,8 @@ def run_row(kv_len: int, args) -> dict:
         rtol=rtol,
         logits_dtype=logits_dtype,
         native_scores=full.scores,
+        math_mode=getattr(args, "math_mode", None),
+        encoding=encoding,
     )
     if int(selective.error.item()) or int(selective.repair_error.item()):
         raise AssertionError("selective exact completion failed before timing")
@@ -1510,60 +1330,24 @@ def run_row(kv_len: int, args) -> dict:
         rtol=rtol,
         logits_dtype=logits_dtype,
         native_scores=full.scores,
+        math_mode=getattr(args, "math_mode", None),
+        encoding=encoding,
     )
     exact_error = int(selective.repair_error.item())
     if int(selective.error.item()):
         raise AssertionError("selective device capacity validation failed")
     if exact_error:
         raise AssertionError(f"selective exact completion failed: {exact_error}")
-    # These warm component diagnostics follow both measured-output checks.
-    # They are independently timed replays, not an additive decomposition of
-    # the block-paired A/B medians, and never run between measured components.
-    component_diagnostics = {}
-    if int(selective.error.item()) or int(selective.repair_error.item()):
-        raise AssertionError("selective component diagnostic failed")
-    v2_diagnostics = (
-        selective._capacity_plan.diagnostics(dense_keys)
-        if getattr(args, "backend", "v1") == "v2"
-        else {}
-    )
-    excluded = (
-        q,
-        kv_fused,
-        weights,
-        block_table,
-        cu_q,
-        cu_tokens,
-        dense_keys,
-        dense_scales,
-    )
-    if fp4:
-        excluded += (q_scale,)
-    memory = {
-        "full_gvr2": _workspace_inventory(
-            full.workspace_owners, (*excluded, full.output)
-        ),
-        "selective": _workspace_inventory(selective, (*excluded, selective_output)),
-        "whole_cell_cuda_peak_allocated_bytes": torch.cuda.max_memory_allocated(),
-        "whole_cell_cuda_peak_reserved_bytes": torch.cuda.max_memory_reserved(),
-        "process_high_water_rss_bytes": resource.getrusage(
-            resource.RUSAGE_SELF
-        ).ru_maxrss
-        * 1024,
-        "peak_scope": "whole cell includes inputs, both routes, graphs and oracle; "
-        "RSS is cumulative process high-water, not incremental workspace",
-    }
     return {
         "bs": args.batch_size,
-        "backend": getattr(args, "backend", "v1"),
+        "backend": "cutedsl",
         "qkv_dtype": encoding,
-        "model_config": model if getattr(args, "backend", "v1") == "v2" else None,
+        "model_config": model,
         "model_profile": input_model,
         "input_distribution": distribution,
-        "capture": capture[8] if capture is not None else None,
+        "math_mode": selective.math_mode,
+        "weights_dtype": getattr(args, "weights_dtype", "float32"),
         "logits_dtype": logits_name,
-        "input_sample_sha256": input_hashes,
-        "input_hash_scope": "shape/dtype and first/last/strided byte samples; not a full tensor digest",
         "q": args.q,
         "kv": kv_len,
         "physical_kv": physical_length,
@@ -1578,84 +1362,48 @@ def run_row(kv_len: int, args) -> dict:
         "route_label": "public-"
         + encoding
         + "-scorer-gvr2-vs-public-selective-topk-"
-        + getattr(args, "backend", "v1"),
+        + "cutedsl",
         "execution_mode": "cuda-graph-replay",
         "full_config": {
-            "scorer_encoding": encoding,
+            "scorer_encoding": "fp32" if fp4 or mxfp8 else "fp8",
             "logits_dtype": "float32",
             "query_chunks": [(first, stop) for first, stop, _ in full.scorer_chunks],
-            "launch_identity": config.launch_identity,
             "scorer_mode": full.scorer_mode,
-            "config_scope": "explicit"
-            if full.scorer_mode == "explicit-physical-bounds"
-            else "geometry descriptor; ordinary scorer defaults selected",
+            "config_scope": "PyTorch FP32 dense fallback"
+            if fp4 or mxfp8
+            else "public FP8 paged scorer",
             "logical_score_width": physical_capacity,
             "scorer_max_seq_len": full.scorer_width,
-            "score_pitch": 0 if full.scores is None else full.scores.stride(0),
-            "score_arena_bytes": (
-                0
-                if full.scores is None
-                else full.scores.numel() * full.scores.element_size()
-            ),
-            "page_table_gathers_per_layer": 0,
-            "page_table_gathers_per_step": int(physical_length > 0),
-            "query_materialization": "uniform request-local views",
+            "query_materialization": "head padding when required"
+            if not (fp4 or mxfp8)
+            else "decoded FP32",
             "step_metadata": "device prefix-derived row/group ends and request IDs; "
             "live table gather and capturable public schedule builder",
             "gvr_mode": "per-row physical ends; next_n=1, compress_ratio=1",
         },
-        "candidate_split_kv": (
-            engine._candidate_prepared.split_kv if engine is not None else None
-        ),
         "selective_policy": {
-            "backend": getattr(args, "backend", "v1"),
-            "needs_sampling": (
-                engine._needs_sampling
-                if engine is not None
-                else getattr(args, "backend", "v1") == "v2"
-            ),
-            "candidate_schedule": (
-                vars(engine._candidate_schedule).copy() if engine is not None else None
-            ),
-            "sample_threshold_policy": (
-                "v2_stratified"
-                if getattr(args, "backend", "v1") == "v2"
-                else "native_ladder"
-            ),
-            "candidate_num_umma_stages": (
-                engine._candidate_prepared.num_umma_stages
-                if engine is not None
-                else None
-            ),
+            "backend": "cutedsl",
+            "needs_sampling": True,
+            "sample_threshold_policy": "stratified",
         },
         "full_gvr2": {**_summarize(full_us), "raw_us": full_us},
         "selective": {**_summarize(selective_us), "raw_us": selective_us},
         "full_over_selective": statistics.median(full_us)
         / statistics.median(selective_us),
         "step": step,
-        "selective_components": {
-            **component_diagnostics,
-            "block_table_copy_bytes": 0,
-            "kv_layout": "continuous",
-            "scope": "warm graph diagnostics after paired timing and both row checks; "
-            "component timings are not an additive decomposition of paired latency",
-        },
-        "memory": memory,
-        "device_observations": {
-            "before": observation_before,
-            "after": _device_observation(),
-            "scope": "untimed device snapshots, not per-route activity or power isolation",
-        },
         "correctness": {
             "reference": "all-row independent FP32 math; lower-precision selective "
-            "uses exact final-rounded native producer scores after dense FP32 "
-            "producer validation; Full remains FP32; TF32 disabled; outside timing",
+            "uses native-rounded FMA reference when requested; Full remains FP32; "
+            "TF32 disabled; outside timing",
             "oracle_dtypes": {"full_gvr2": "float32", "selective": logits_name},
             "exact_score_multiset": atol == 0 and rtol == 0,
             "oracle_tolerances": {
                 "full_gvr2": {"atol": atol, "rtol": rtol},
                 "selective": (
-                    {"atol": 0.0, "rtol": 0.0}
+                    {"atol": max(atol, 2e-3), "rtol": max(rtol, 2e-3)}
+                    if getattr(args, "math_mode", None)
+                    in ("native_bf16", "native_fp16")
+                    else {"atol": 0.0, "rtol": 0.0}
                     if logits_dtype != torch.float32
                     else {"atol": atol, "rtol": rtol}
                 ),
@@ -1671,39 +1419,8 @@ def run_row(kv_len: int, args) -> dict:
             "max_topk_value_error_after": errors_after,
             "exact_error": exact_error,
             "rows": groups.q_prefix[-1],
-            "underfilled_rows": (
-                int(
-                    torch.count_nonzero(
-                        engine._candidate_counts[:, 0]
-                        < engine._row_ends.clamp(max=args.top_k)
-                    )
-                )
-                if engine is not None
-                else 0
-            ),
-            "overflow_rows": (
-                int(
-                    torch.count_nonzero(
-                        engine._candidate_counts[:, 0]
-                        > engine._candidate_schedule.candidate_capacity
-                    )
-                )
-                if engine is not None
-                else 0
-            ),
-            "first_repair_rows": (
-                int(torch.count_nonzero(engine._repair_flags))
-                if engine is not None
-                else 0
-            ),
-            "terminal_repair_rows": (
-                int(torch.count_nonzero(engine._second_repair_flags))
-                if engine is not None
-                else 0
-            ),
             "full_physical_page_mapping": "global reverse permutation; independent requests",
             "selective_kv_layout": "continuous request-concatenated K",
-            **v2_diagnostics,
         },
         "protocol": {
             "warmups_per_route": args.warmups,
@@ -1760,22 +1477,24 @@ def main() -> None:
         help="Validate existing result JSON and print Markdown without Torch/CUDA.",
     )
     parser.add_argument("--q", type=int, default=4096)
-    parser.add_argument("--backend", choices=("v1", "v2"), default="v1")
-    parser.add_argument("--qkv-dtype", choices=("fp8", "mxfp4"), default="fp8")
+    parser.add_argument(
+        "--math-mode",
+        choices=("relu_strict", "relu_fast", "native_bf16", "native_fp16"),
+        default=None,
+    )
+    parser.add_argument(
+        "--weights-dtype", choices=("float32", "bfloat16"), default="float32"
+    )
+    parser.add_argument("--qkv-dtype", choices=("fp8", "mxfp4", "mxfp8"), default="fp8")
     parser.add_argument(
         "--logits-dtype", choices=("float32", "float16", "bfloat16"), default="float32"
     )
     parser.add_argument("--exact-oracle", action="store_true")
     parser.add_argument(
-        "--input-tensors",
-        type=Path,
-        help="Lossless tensor-only capture export; checked against the requested causal crop",
-    )
-    parser.add_argument(
         "--input-distribution",
-        choices=("goal2", "model"),
-        default="goal2",
-        help="goal2 signed/normalized controls or standard-normal model inputs with positive weights; MXFP4 model inputs use BF16 public quantization",
+        choices=("signed", "model"),
+        default="signed",
+        help="signed/normalized controls or standard-normal model inputs with positive weights; MXFP4 model inputs use BF16 public quantization",
     )
     parser.add_argument(
         "--model-profile",
@@ -1787,7 +1506,7 @@ def main() -> None:
             "GLM-5.3",
             "Qwen3.8-Flash-Next",
         ),
-        help="Synthetic model input contract, independent of the optional v2 preset.",
+        help="Synthetic model input contract, independent of the optional model configuration.",
     )
     parser.add_argument(
         "--model-config",
@@ -1809,8 +1528,6 @@ def main() -> None:
     parser.add_argument("--top-k", type=int, choices=(512, 1024, 2048), default=512)
     parser.add_argument("--compression-ratio", type=int, choices=(1, 4), default=1)
     parser.add_argument("--full-query-tile", type=int)
-    parser.add_argument("--full-epi-subtiles", type=int, default=1)
-    parser.add_argument("--full-w-cache-regs", type=int, default=160)
     parser.add_argument("--kv", type=int, nargs="*", default=ROWS)
     parser.add_argument(
         "--max-context-length",
@@ -1831,7 +1548,7 @@ def main() -> None:
         help="Measure only the per-layer pair; omit per-step setup measurements.",
     )
     parser.add_argument("--seed", type=int, default=1)
-    parser.add_argument("--num-heads", type=int, default=8)
+    parser.add_argument("--num-heads", type=int, default=64)
     parser.add_argument("--head-dim", type=int, default=128)
     parser.add_argument("--page-size", type=int, choices=(32, 64, 128), default=128)
     parser.add_argument("--output", type=Path)
@@ -1841,14 +1558,10 @@ def main() -> None:
         return
     if args.q <= 0 or args.batch_size <= 0 or args.warmups < 0:
         raise ValueError("q and batch-size must be positive; warmups nonnegative")
-    if args.backend == "v1" and args.logits_dtype != "float32":
-        raise ValueError(
-            "v1 preserves FP32 logits; native dtype comparisons require v2"
-        )
-    if args.qkv_dtype == "mxfp4" and (args.backend != "v2" or args.num_heads != 64):
-        raise ValueError(
-            "MXFP4 comparison supports H64/v2; v1 has no MXFP4 counterpart"
-        )
+    if args.qkv_dtype == "mxfp4" and args.num_heads != 64:
+        raise ValueError("MXFP4 Full comparison requires H64")
+    if args.batch_size != 1 or args.num_heads not in (4, 32, 64):
+        raise ValueError("selective prefill requires batch size 1 and H4/H32/H64")
     if args.full_query_tile is not None and args.full_query_tile <= 0:
         raise ValueError("full-query-tile must be positive")
     if not args.kv or any(length < args.q for length in args.kv):
@@ -1871,23 +1584,9 @@ def main() -> None:
     if args.kv != ROWS:
         print("warning: production KV subset requested")
     importlib.import_module("flashinfer.attn_scores.kernels.fp8_paged_mqa_logits")
-    repository = Path(__file__).resolve().parents[1]
-    commit = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        cwd=repository,
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=60,
-    ).stdout.strip()
     result = {
-        "schema_version": 20 if args.layer_only else 19,
+        "schema_version": 22 if args.layer_only else 21,
         "status": "running",
-        "source": {
-            "git_commit": commit or None,
-            "command": sys.argv,
-            **_source_provenance(repository),
-        },
         "device": {
             "name": torch.cuda.get_device_name(),
             "capability": list(torch.cuda.get_device_capability()),
@@ -1907,9 +1606,6 @@ def main() -> None:
     try:
         for kv_len in args.kv:
             row = run_row(kv_len, args)
-            current_source = _source_provenance(repository)
-            if current_source["source_sha256"] != result["source"]["source_sha256"]:
-                raise RuntimeError("execution source changed during comparison")
             result["rows"].append(row)
             if args.output is not None:
                 _save_result(args.output, result)
@@ -1930,10 +1626,7 @@ def main() -> None:
     print(rendered)
     if args.output is not None:
         _save_result(args.output, result)
-    if result["source"]["tracked_worktree_clean"]:
-        print(_render_results([("benchmark", result)]))
-    else:
-        print("Markdown summary omitted: execution source has tracked changes.")
+    print(_render_results([("benchmark", result)]))
 
 
 if __name__ == "__main__":

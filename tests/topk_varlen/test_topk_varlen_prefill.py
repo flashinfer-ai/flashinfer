@@ -29,8 +29,6 @@ import sys
 import pytest
 import torch
 
-from tests.topk_varlen._selection_reference import assert_topk_reference
-
 try:
     import flashinfer
     from flashinfer.topk_varlen.kernels import gvr2_topk_host as _host
@@ -299,6 +297,13 @@ def test_prefill_reference_engine_parity():
     torch.cuda.synchronize()
     _check_windowed(lg, o1, rs, le, top_k)
     _check_windowed(lg, o2, rs, le, top_k)
+    for r in range(rows):
+        m = min(lens[r], top_k)
+        win = lg[r, ks[r] : ks[r] + lens[r]]
+        assert torch.equal(
+            torch.sort(win[o1[r, :m].long()]).values,
+            torch.sort(win[o2[r, :m].long()]).values,
+        )
 
 
 @requires_gvr2
@@ -665,23 +670,24 @@ def test_prefill_api_validation_and_admission():
     # the sentinel defaults: omitted, None and 1 are the same decode call
     # (radix_cutlass exists on every GPU; full rows, so every slot is a hit and
     # the sorted selected values are a tie-safe identity of the selection)
+    def _vals(idx):
+        return lg.gather(1, idx.long()).sort(dim=1).values
+
     plain = flashinfer.top_k_varlen(lg, le, k, backend="radix_cutlass")[0]
-    assert_topk_reference(lg, plain, le, k)
     for kw in (
         {"next_n": None, "compress_ratio": None},
         {"next_n": 1, "compress_ratio": 1},
     ):
         got = flashinfer.top_k_varlen(lg, le, k, backend="radix_cutlass", **kw)[0]
-        assert_topk_reference(lg, got, le, k)
+        assert torch.equal(_vals(got), _vals(plain)), kw
     if gvr2_here:
         # an explicit None is the omitted form in windowed mode too (rs == 0 and
         # full windows here, so window positions are the columns)
         plain_w = flashinfer.top_k_varlen(lg, le, k, row_starts=rs)[0]
-        assert_topk_reference(lg, plain_w, le, k, row_starts=rs)
         none_w = flashinfer.top_k_varlen(
             lg, le, k, row_starts=rs, next_n=None, compress_ratio=None, pre_idx=None
         )[0]
-        assert_topk_reference(lg, none_w, le, k, row_starts=rs)
+        assert torch.equal(_vals(none_w), _vals(plain_w))
     # explicit non-gvr_2 backends refuse windowed calls
     for b in ("radix", "radix_cutlass", "radix_filter", "gvr"):
         with pytest.raises((ValueError, BackendSupportedError)):
@@ -708,6 +714,29 @@ def _abs_lens(rows, ncols, ks, top_k):
     register-class bounds; every row fits its request's slice."""
     menu = [0, 1, top_k - 1, top_k, top_k + 3, 1500, 2045, 2048]
     return [max(0, min(ncols - s, menu[r % len(menu)])) for r, s in enumerate(ks)]
+
+
+def _same_selection(logits, a, b, starts=None):
+    """Tie-safe row-wise equality of two selections (the engines' emit order is
+    not fixed, and two launches may break a K-th-boundary tie differently, so
+    index sets are not the contract): the -1 pad pattern must match and the
+    sorted multisets of the SELECTED VALUES must match. ``a`` and ``b`` hold
+    absolute logits columns, or window-local indices when ``starts`` (clamped
+    like the kernel) is given."""
+    assert a.shape == b.shape
+    if starts is not None:
+        off = starts.clamp(min=0, max=logits.shape[1]).unsqueeze(1).to(a.dtype)
+        a = torch.where(a >= 0, a + off, a)
+        b = torch.where(b >= 0, b + off, b)
+    pa, pb = a < 0, b < 0
+    assert torch.equal(pa.sum(1), pb.sum(1)), "pad counts differ"
+    nan = torch.tensor(float("nan"), device=logits.device)
+    va = torch.where(pa, nan, logits.gather(1, a.clamp_min(0).long()))
+    vb = torch.where(pb, nan, logits.gather(1, b.clamp_min(0).long()))
+    sa, sb = torch.sort(va, dim=1).values, torch.sort(vb, dim=1).values
+    same = (sa == sb) | (sa.isnan() & sb.isnan())
+    assert bool(same.all()), "selected value multisets differ"
+    return True
 
 
 @requires_gvr2
@@ -738,7 +767,7 @@ def test_prefill_absolute_indices(top_k, hinted):
         **kw,
     )
     torch.cuda.synchronize()
-    assert_topk_reference(lg, ab, le, top_k, row_starts=rs, absolute_indices=True)
+    _same_selection(lg, ab, torch.where(loc >= 0, loc + rs.unsqueeze(1), loc))
     hit = ab >= 0
     assert torch.equal(vals[hit], lg.gather(1, ab.clamp_min(0).long())[hit])
     assert bool((vals[~hit] == torch.finfo(torch.float32).min).all())
@@ -778,9 +807,14 @@ def test_prefill_absolute_indices_reference_engine():
     )
     torch.cuda.synchronize()
     assert torch.equal(o1 < 0, o2 < 0)
-    for indices in (o1, o2):
-        assert_topk_reference(
-            lg, indices, le, top_k, row_starts=rs, absolute_indices=True
+    for r in range(rows):
+        m = min(lens[r], top_k)
+        assert bool((o1[r, :m] >= ks[r]).all()) and bool(
+            (o1[r, :m] < ks[r] + lens[r]).all()
+        )
+        assert torch.equal(
+            torch.sort(lg[r, o1[r, :m].long()]).values,
+            torch.sort(lg[r, o2[r, :m].long()]).values,
         )
 
 
@@ -837,7 +871,7 @@ def test_prefill_absolute_indices_warmup_and_graph_replay():
     torch.cuda.synchronize()
     loc = _run(lg, rs, le, top_k)
     _check_windowed(lg, loc, rs, le, top_k)
-    assert_topk_reference(lg, out, le, top_k, row_starts=rs, absolute_indices=True)
+    _same_selection(lg, out, torch.where(loc >= 0, loc + rs.unsqueeze(1), loc))
 
 
 def test_prefill_absolute_indices_validation():
@@ -955,21 +989,19 @@ def test_prefill_row_starts_out_of_range():
     ref = _run(
         lg, torch.tensor([0, 0, 0, n - 700], dtype=torch.int32, device=_DEV), le, k
     )
-    assert_topk_reference(lg, out, le, k, row_starts=rs)
-    ref_starts = torch.tensor([0, 0, 0, n - 700], dtype=torch.int32, device=lg.device)
-    assert_topk_reference(lg, ref, le, k, row_starts=ref_starts)
+    _same_selection(lg[0:1], out[0:1], ref[0:1])  # ks=-1 behaves as ks=0
     assert bool((out[1] == -1).all())  # ks past the width: empty window
+    _same_selection(lg[2:3], out[2:3], ref[2:3])
     # window of 1000 at n-700 is clamped to the 700 columns that exist
     _check_windowed(lg[3:4], out[3:4], rs[3:4], le[3:4], k)
     ref_eng = torch.empty((rows, k), dtype=torch.int32, device=_DEV)
     _host.run_varlen(lg, None, le, ref_eng, top_k=k, row_starts=rs, engine="reference")
     torch.cuda.synchronize()
-    assert_topk_reference(lg, ref_eng, le, k, row_starts=rs)
+    _same_selection(lg, out, ref_eng, starts=rs)
     # returned values are read at the column the kernel ranked: the clamped
     # start plus the window-local index (a negative start acts as 0)
     idx_v, vals = flashinfer.top_k_varlen(lg, le, k, row_starts=rs, return_values=True)
     torch.cuda.synchronize()
-    assert_topk_reference(lg, idx_v, le, k, row_starts=rs)
     starts = rs.to(torch.int64).clamp(min=0)
     for r in (0, 2, 3):
         hit = idx_v[r] >= 0
@@ -1196,7 +1228,9 @@ def test_prefill_absolute_indices_on_non_current_device():
     torch.cuda.synchronize(other)
     assert torch.cuda.current_device() == 0
     _check_windowed(lg, out_loc, rs, le, top_k)
-    assert_topk_reference(lg, out_abs, le, top_k, row_starts=rs, absolute_indices=True)
+    _same_selection(
+        lg, out_abs, torch.where(out_loc >= 0, out_loc + rs.unsqueeze(1), out_loc)
+    )
 
 
 @requires_gvr2

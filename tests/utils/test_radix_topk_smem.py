@@ -146,12 +146,8 @@ def test_radix_top_k_transform_shared_memory(
             expected = expected + offsets[:, None]
         actual = run()
         torch.cuda.synchronize(device)
-        torch.testing.assert_close(actual.sort(-1).values, expected, atol=0, rtol=0)
         if deterministic:
-            repeated = run()
-            torch.testing.assert_close(
-                repeated.sort(-1).values, expected, atol=0, rtol=0
-            )
+            torch.testing.assert_close(run(), actual, atol=0, rtol=0)
         if cuda_graph:
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):

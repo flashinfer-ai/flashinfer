@@ -3,62 +3,33 @@
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 # http://www.apache.org/licenses/LICENSE-2.0
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-"""Run the experimental full/selective lifecycle and emit its trace fixtures."""
-
-import argparse
-import json
-from pathlib import Path
+"""Run selective TopK prefill with continuous keys."""
 
 import torch
-
-from flashinfer import FP8PagedMQATopKWrapper, FP8MQATopKWrapper, fi_trace
-from flashinfer.experimental.attn_scores.trace import (
-    fp8_mqa_selective_topk_trace,
-    fp8_paged_mqa_topk_trace,
-)
+from flashinfer import FP8MQATopKWrapper
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output-dir", type=Path)
-    args = parser.parse_args()
-    for template in (
-        fp8_paged_mqa_topk_trace,
-        fp8_mqa_selective_topk_trace,
-    ):
-        inputs = template.init(
-            total_q=16,
-            batch_size=1,
-            num_heads=8,
-            head_dim=128,
-            page_size=64,
-            max_kv_len=8192,
-            top_k=512,
-            device="cuda",
-        )
-        wrapper_type = (
-            FP8PagedMQATopKWrapper
-            if template is fp8_paged_mqa_topk_trace
-            else FP8MQATopKWrapper
-        )
-        wrapper = wrapper_type(**inputs["constructor"])
-        wrapper.plan(**inputs["plan"])
-        indices = wrapper.run(**inputs["run"])
-        torch.cuda.synchronize()
-        assert wrapper.error.item() == wrapper.repair_error.item() == 0
-        assert indices.shape == (16, 512)
-        definition = fi_trace(wrapper.run, **inputs["run"])
-        print(definition["name"])
-        if args.output_dir is not None:
-            args.output_dir.mkdir(parents=True, exist_ok=True)
-            (args.output_dir / (definition["name"] + ".json")).write_text(
-                json.dumps(definition, indent=2) + "\n"
-            )
+    rows, keys, heads = 64, 1024, 64
+    q = torch.randn(rows, heads, 128, device="cuda").to(torch.float8_e4m3fn)
+    k = torch.randn(keys, 128, device="cuda").to(torch.float8_e4m3fn)
+    weights = torch.ones(rows, heads, device="cuda")
+    scale = torch.ones(keys, device="cuda")
+    qo = torch.tensor([0, rows], dtype=torch.int32, device="cuda")
+    kv = torch.tensor([0, keys], dtype=torch.int32, device="cuda")
+    wrapper = FP8MQATopKWrapper(
+        num_heads=heads,
+        max_context_length=keys,
+        max_chunk_size=rows,
+        max_batch_size=1,
+        device="cuda",
+    )
+    wrapper.plan(qo, kv, num_query_rows=rows)
+    wrapper.prepare_pool(k, k_scale=scale)
+    indices = wrapper.run(q, weights, k, k_scale=scale)
+    torch.cuda.synchronize()
+    assert not wrapper.error.item() and not wrapper.repair_error.item()
+    print(indices.shape)
 
 
 if __name__ == "__main__":

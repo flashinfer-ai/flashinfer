@@ -257,11 +257,7 @@ def test_init_kv_cache_invariants(func, template, label):
 
     # Wrapper APIs return {"plan": ..., "run": ...}; flatten for the check.
     flat: Dict[str, Any] = {}
-    if isinstance(result, dict) and set(result.keys()) <= {
-        "constructor",
-        "plan",
-        "run",
-    }:
+    if isinstance(result, dict) and set(result.keys()) <= {"plan", "run"}:
         for sub in result.values():
             if isinstance(sub, dict):
                 flat.update(sub)
@@ -304,11 +300,7 @@ def test_init_fi_trace_roundtrip(func, template, label):
         pytest.skip(f"[{label}] init unsupported on CPU")
 
     flat: Dict[str, Any] = {}
-    if isinstance(result, dict) and set(result.keys()) <= {
-        "constructor",
-        "plan",
-        "run",
-    }:
+    if isinstance(result, dict) and set(result.keys()) <= {"plan", "run"}:
         for sub in result.values():
             if isinstance(sub, dict):
                 flat.update(sub)
