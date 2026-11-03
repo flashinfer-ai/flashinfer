@@ -220,7 +220,7 @@ ROUTES = [
     (7, 144, 4032, False, "CLUSTER_S8U8_C4_NOBIAS"),
     (65, 4096, 4096, False, None),
     (64, 4097, 4096, False, None),
-    (64, 4096, 14344, False, None),
+    (64, 4096, 14344, False, "ACCUMULATORS_CN16_NOBIAS"),
     (1, 128, 720, True, "CLUSTER_S2U4_2D_C3"),
     (1, 128, 14336, True, "CLUSTER_S8U8_C4"),
     (2, 16, 256, True, "CLUSTER_S2U4_C1"),
@@ -252,7 +252,7 @@ ROUTES = [
     (7, 144, 4032, True, "PACKED_U4_IL"),
     (65, 4096, 4096, True, None),
     (64, 4097, 4096, True, None),
-    (64, 4096, 14344, True, None),
+    (64, 4096, 14344, True, "ACCUMULATORS_CN16"),
 ]
 
 
