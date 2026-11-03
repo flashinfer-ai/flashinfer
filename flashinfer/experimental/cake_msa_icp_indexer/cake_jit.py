@@ -1160,7 +1160,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "request_splits", "ctas_per_sm": 1},
-        "kernel_symbol": "kernel_cake_msa_icp_indexer_3dde5cfa8d05f044f598",
+        "kernel_symbol": "kernel_cake_msa_icp_indexer_0318b414468ea1641518",
         "launch": {
             "block": (192, 1, 1),
             "cluster": (1, 1, 1),
@@ -1168,7 +1168,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 214016,
             "use_pdl": "runtime",
         },
-        "library": "cake_msa_icp_indexer_3dde5cfa8d05f044f598",
+        "library": "cake_msa_icp_indexer_0318b414468ea1641518",
         "logical": {
             "block_table": "block_table",
             "bt_stride": "bt_stride",

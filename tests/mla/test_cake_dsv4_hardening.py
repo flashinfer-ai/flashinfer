@@ -26,6 +26,7 @@ import torch
 
 from flashinfer.mla import trtllm_batch_decode_sparse_mla_dsv4
 from flashinfer.mla.cake_dsv4 import (
+    _route,
     cake_dsv4_workspace_layout,
     cake_dsv4_workspace_requirement,
     cake_dsv4_workspace_reset,
@@ -677,6 +678,7 @@ class _Case:
         out: Optional[torch.Tensor] = None,
         backend: str = "cake",
         float_scales: bool = False,
+        enable_pdl: bool = False,
     ) -> torch.Tensor:
         result = trtllm_batch_decode_sparse_mla_dsv4(
             query=self.query,
@@ -693,7 +695,7 @@ class _Case:
             kv_layout="HND",
             cum_seq_lens_q=self.cum_seq_lens_q,
             max_q_len=self.max_q_len if self.ragged else None,
-            enable_pdl=False,
+            enable_pdl=enable_pdl,
             backend=backend,
         )
         return result.reshape(-1, self.num_heads, 512)
@@ -1421,6 +1423,45 @@ def test_sglang_swa_only_convention(h_q, form, tail):
     _assert_poison_inert(case, _workspace_128mib(), float_scales=True)
 
 
+@pytest.mark.parametrize("form", ["decode", "mtp-dense"])
+def test_enable_pdl_lowhead_prefill_matches_and_waits_for_the_query_producer(form):
+    """The SWA-only FP8/H64 rows of one wave run the low-head prefill program; as
+    a programmatic dependent it is bitwise equal to the plain launch and, inside
+    a graph, reads the query the copy right before it writes."""
+    _skip_unless_cake_gpu()
+    case = _sglang_case(64, form, compressed=False, tail="minus_one")
+    route = _route(
+        dtype=case.dtype,
+        num_heads=case.num_heads,
+        max_q_len=case.max_q_len,
+        ragged=case.ragged,
+        sparse_topk=SWA_WINDOW,
+        batch_size=case.batch_size,
+        compressed_page_size=int(case.compressed_kv_cache.shape[-2]),
+        num_query_tokens=case.rows,
+        sm_count=torch.cuda.get_device_properties(0).multi_processor_count,
+    )
+    assert route == "fp8_lowhead_prefill", route
+    workspace = _workspace_128mib()
+    plain = case.run(workspace=workspace, out=case.nan_out(), float_scales=True)
+    pdl = case.run(
+        workspace=workspace, out=case.nan_out(), float_scales=True, enable_pdl=True
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(plain, pdl)
+
+    source = case.query.clone()
+    case.query.zero_()
+    out = case.nan_out()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        case.query.copy_(source)
+        case.run(workspace=workspace, out=out, float_scales=True, enable_pdl=True)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out.reshape(plain.shape), plain)
+
+
 @pytest.mark.parametrize("h_q", _SGLANG_HEADS)
 @pytest.mark.parametrize("form", ["decode", "mtp-flat", "prefill"])
 def test_sglang_compressed_c4_convention(h_q, form):
@@ -1663,3 +1704,42 @@ def test_workspace_requirement_matches_the_launch(monkeypatch):
     assert calls == [(req.route, 1)] * 12
     with pytest.raises(ValueError, match="needs at least"):
         case.run(workspace=minimum[: req.minimum_bytes - 128], out=case.nan_out())
+
+
+# ---------------------------------------------------------- caller out off the store alignment
+@pytest.mark.parametrize("offset_bytes", [2, 16])
+@pytest.mark.parametrize(
+    "s_q,varlen", [(4, True), (4, False), (1, False)], ids=["q4-ragged", "q4", "q1"]
+)
+def test_misaligned_caller_out_matches_aligned(monkeypatch, s_q, varlen, offset_bytes):
+    """fp8_lowhead_one_partition (FP8, 32 heads) stores O with 32-byte vector stores
+    on sm_100a. A contiguous caller ``out`` 2 or 16 bytes off a 32-byte boundary gets
+    bitwise the aligned call's result through an aligned staging buffer, the bytes
+    around it stay untouched, and an aligned ``out`` allocates nothing."""
+    _skip_unless_cake_gpu()
+    calls = _count_dispatches(monkeypatch)
+    inputs = _Inputs(*_make_case(32, torch.float8_e4m3fn, s_q, varlen=varlen))
+    workspace = _workspace(inputs)
+    aligned = _out_like(inputs)
+    assert aligned.data_ptr() % 32 == 0
+    inputs.run(out=aligned, workspace=workspace)
+    torch.cuda.synchronize()
+    assert calls and {route for route, _ in calls} == {"fp8_lowhead_one_partition"}
+
+    again = _out_like(inputs)
+    after_alloc = _allocation_requests()
+    inputs.run(out=again, workspace=workspace)
+    torch.cuda.synchronize()
+    assert _allocation_requests() == after_alloc, "an aligned out must not be staged"
+    assert torch.equal(again.view(torch.int16), aligned.view(torch.int16))
+
+    numel = aligned.numel()
+    pad = offset_bytes // aligned.element_size()
+    raw = torch.full((numel + 32,), float("nan"), dtype=torch.bfloat16, device="cuda:0")
+    start = ((-raw.data_ptr()) % 32) // raw.element_size() + pad
+    view = raw[start : start + numel].view(aligned.shape)
+    assert view.is_contiguous() and view.data_ptr() % 32 == offset_bytes
+    inputs.run(out=view, workspace=workspace)
+    torch.cuda.synchronize()
+    assert torch.equal(view.view(torch.int16), aligned.view(torch.int16))
+    assert torch.isnan(raw[:start]).all() and torch.isnan(raw[start + numel :]).all()

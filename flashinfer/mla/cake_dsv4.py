@@ -1,4 +1,5 @@
-"""Source-level CAKE backend for DeepSeek V4 sparse MLA on SM100 and SM103.
+"""Source-level CAKE backend for DeepSeek V4 sparse MLA on SM100 and SM103, and
+for the FP8 decode route on SM107.
 
 Host contract (flashinfer#4671 hardening)
 -----------------------------------------
@@ -1562,6 +1563,18 @@ _OUT_PHASE_BY_ROUTE: dict[str, int] = {
 }
 
 
+# Routes whose program needs O aligned beyond the 2 bytes a contiguous bf16
+# view guarantees: fp8_lowhead_one_partition writes 32 bytes
+# (``st.global.v8.b32``) at O + 16-element offsets on sm_100a and sm_103a, so O must be
+# 32-byte aligned.  A caller ``out`` off that alignment (a contiguous view at
+# +2 or +16 bytes) runs into an aligned staging buffer that is then copied
+# into ``out``: the same program, the same bits.  An aligned ``out`` (every
+# allocation, every phase of ``_OUT_PHASE_BY_ROUTE``) takes no staging.
+_OUT_ALIGN_BY_ROUTE: dict[str, int] = {
+    "fp8_lowhead_one_partition": 32,
+}
+
+
 def cake_dsv4_out_phase(
     route: str, *, num_heads: int, sparse_topk: int
 ) -> Optional[int]:
@@ -1780,8 +1793,8 @@ def run_cake_dsv4(
 ) -> torch.Tensor:
     """Launch the CAKE DSv4 route for flattened ``query [rows, num_heads, 512]``.
 
-    ``enable_pdl`` launches the programs that support it (the FP8 persistent
-    and M64 bodies) as programmatic dependents of the previous kernel on the
+    ``enable_pdl`` launches the programs that support it (the FP8 persistent,
+    M64 and low-head prefill bodies) as programmatic dependents of the previous kernel on the
     stream; they wait for it before their first global read.  The other
     programs launch without the attribute.
 
@@ -1794,7 +1807,9 @@ def run_cake_dsv4(
     the dense per-request query length (``query.shape[1]`` of the caller's
     ``[B, Q, H, 512]``) or the ragged maximum; ``seq_lens`` has one entry per
     request and ``cum_seq_lens_q`` (ragged only) ``batch_size + 1`` offsets.
-    Apart from the ``out=None`` output no device memory is allocated here
+    Apart from the ``out=None`` output and the staging buffer of a caller
+    ``out`` off its route's store alignment (``_OUT_ALIGN_BY_ROUTE``; an
+    aligned ``out`` takes none) no device memory is allocated here
     (the dense request offsets of the ragged-only producers and of row-tiled
     dense launches are process-lifetime constants, created on first use:
     warm such shapes up eagerly before a capture); see the module docstring
@@ -1902,6 +1917,11 @@ def run_cake_dsv4(
                 f"out_shape {tuple(out.shape)} holds fewer than {num_query_tokens} rows"
             )
     out_rows = out.view(-1, num_heads, _HEAD_DIM)[:num_query_tokens]
+    staged_out: Optional[torch.Tensor] = None
+    out_align = _OUT_ALIGN_BY_ROUTE.get(route)
+    if out_align is not None and out_rows.data_ptr() % out_align:
+        staged_out = out_rows
+        out_rows = torch.empty_like(out_rows)
 
     if not ragged and batch_size * max_q_len < num_query_tokens:
         raise ValueError(
@@ -1986,6 +2006,8 @@ def run_cake_dsv4(
             rows_per_launch=rows_per_launch,
             request_offsets=request_offsets,
         )
+    if staged_out is not None:
+        staged_out.copy_(out_rows)
     return out
 
 

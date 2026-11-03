@@ -55,6 +55,7 @@ def cake_causal_conv1d_det_kcp(
     ctx: Any,
     *,
     recompute_handle: Optional[Any] = None,
+    cooperative: Optional[bool] = None,
 ) -> torch.Tensor:
     """Autograd-enabled context-parallel packed width-4 depthwise causal convolution + SiLU of this rank's fragments.
 
@@ -86,6 +87,16 @@ def cake_causal_conv1d_det_kcp(
         backward exchange and hangs or corrupts data; no check is made.  Never share one handle between two
         convolution calls (also not in nested regions), and never ``clear()`` or reuse a handle while a backward
         that needs it is pending.
+    cooperative : bool, optional
+        Keyword-only, default ``None`` (the package default,
+        ``flashinfer.cake_causal_conv1d_det_train_backend.kcp.COOPERATIVE_DEFAULT``, currently ``True``).  The launch
+        form of the backward's main kernel; the forward is the same either way.  ``True``: one cooperative launch,
+        which starts only when all its CTAs fit on the GPU at once, so it waits for any kernel of another stream
+        (for example a communication kernel) that occupies an SM.  ``False``: an ordinary launch one SM short of the
+        co-resident CTA count, then a fixed-order reduce kernel on the same stream; it starts beside a small kernel
+        of another stream.  ``dx`` is bitwise the same in both forms.  ``dweight`` is reproducible and within the
+        same FP64-oracle bound in each form, but its bits differ between the forms, so keep one form for runs whose
+        ``dweight`` bits must match.  Each rank may choose its form independently (no collective depends on it).
 
     Returns
     -------
@@ -97,7 +108,11 @@ def cake_causal_conv1d_det_kcp(
     from .cake_causal_conv1d_det_train_backend import kcp as _kcp  # noqa: PLC0415
 
     return _kcp.cake_causal_conv1d_det_kcp(
-        x_local, weight, ctx, recompute_handle=recompute_handle
+        x_local,
+        weight,
+        ctx,
+        recompute_handle=recompute_handle,
+        cooperative=cooperative,
     )
 
 
@@ -108,6 +123,7 @@ def cake_causal_conv1d_det_multi_kcp(
     ctx: Any,
     *,
     recompute_handle: Optional[Any] = None,
+    cooperative: Optional[bool] = None,
 ) -> tuple[torch.Tensor, ...]:
     """Autograd-enabled context-parallel convolutions of several tensors of one layer (for example its q, k and v)
     with one halo exchange per direction.
@@ -136,6 +152,9 @@ def cake_causal_conv1d_det_multi_kcp(
         :func:`cake_causal_conv1d_det_kcp` apply (one handle per call and micro-step, created outside the outermost
         checkpoint region; every rank passes one or none).  The same handle may carry the layer's ``"kda"`` entry;
         its ``"conv"`` entry serves one multi call or one single call, never both.
+    cooperative : bool, optional
+        As in :func:`cake_causal_conv1d_det_kcp`, one form for every tensor of the call; the result is bitwise the
+        single calls with the same ``cooperative``.
 
     Returns
     -------
@@ -146,7 +165,11 @@ def cake_causal_conv1d_det_multi_kcp(
     from .cake_causal_conv1d_det_train_backend import kcp as _kcp  # noqa: PLC0415
 
     return _kcp.cake_causal_conv1d_det_multi_kcp(
-        xs, weights, ctx, recompute_handle=recompute_handle
+        xs,
+        weights,
+        ctx,
+        recompute_handle=recompute_handle,
+        cooperative=cooperative,
     )
 
 

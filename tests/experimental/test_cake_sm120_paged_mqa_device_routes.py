@@ -62,6 +62,57 @@ SHIPPED_DIGEST = "2e661f3926a3c48f0283416bba44cfa1d0fe6891bf537eed6c22d41fbfca5b
 SHIPPED_ROUTES = 31
 ARG_KINDS = {"buffer", "tma_buffer", "parameter", "grid"}
 DEVICE_ROUTE = re.compile(r"^sm120:fp8:h(\d+):p(\d+):n(\d+):a(\d+):(\w+)$")
+# Committed device routes no table entry names: the tuned static route ``<tag>``
+# of a ``<tag>_par`` route whose entries are all ``par``, kept in the catalog and
+# never selected (exactly these; launched by
+# test_orphan_device_route_matches_the_default_route).
+ORPHANS = frozenset(
+    {
+        "sm120:fp8:h64:p64:n3:a3:bta_ha_wr_ef",
+        "sm120:fp8:h64:p64:n5:a5:atom5_mx_mpf_bta_ha_k2q_ef",
+        "sm120:fp8:h64:p64:n6:a6:atom6_mx_mpf_bta_ha_ef",
+    }
+)
+# Device routes an earlier catalog carried whose last table entry moved to
+# another route: they and their programs left the catalog.
+REMOVED = frozenset(
+    {
+        "sm120:fp8:h32:p128:n1:a1:mpf_bta_ha_k2q_ef_dynv28_p3s1",
+        "sm120:fp8:h32:p128:n2:a2:mpf_bta_ha_k2q_ef_dynv28_p3s1",
+        "sm120:fp8:h32:p128:n3:a3:mpf_bta_ha_k2q_ef_dynv28_dfit_p3s1",
+        "sm120:fp8:h32:p128:n4:a4:mpf_bta_ha_k2q_ef_dynv28_p3s1",
+        "sm120:fp8:h32:p128:n5:a2:atom2_mpf_bta_ha_k2q",
+        "sm120:fp8:h32:p128:n5:a2:atom2_mx_bta_ha_wr",
+        "sm120:fp8:h32:p128:n5:a5:mpf_bta_ha_k2q_ef_dynv28_p3s1",
+        "sm120:fp8:h32:p128:n5:a5:mx_bta_ha_wr_ef",
+        "sm120:fp8:h32:p128:n6:a2:atom2_mpf_bta_ha_k2q",
+        "sm120:fp8:h32:p128:n6:a2:atom2_mx_bta_ha_wr",
+        "sm120:fp8:h32:p128:n6:a6:bta_ha_wr_ef",
+        "sm120:fp8:h32:p128:n6:a6:bta_ha_wr_kmax_ef",
+        "sm120:fp8:h32:p128:n6:a6:mpf_bta_ha_sp_kf2q_ef_dynv28_p3s1",
+        "sm120:fp8:h32:p64:n1:a1:mpf_bta_ha_k2q_ef_dynv28_p5s1",
+        "sm120:fp8:h32:p64:n2:a2:mpf_bta_ha_k2q_ef_dynv28_p3s1",
+        "sm120:fp8:h32:p64:n3:a3:mpf_bta_ha_k2q_ef_dynv28_dfit_p3s1",
+        "sm120:fp8:h32:p64:n4:a2:atom2_mpf_bta_ha_k2q",
+        "sm120:fp8:h32:p64:n4:a2:atom2_mx_bta_ha_wr",
+        "sm120:fp8:h32:p64:n4:a4:mpf_bta_ha_k2q_ef_dynv28_p3s1",
+        "sm120:fp8:h32:p64:n5:a2:atom2_mpf_bta_ha_k2q",
+        "sm120:fp8:h32:p64:n5:a2:atom2_mx_bta_ha_wr",
+        "sm120:fp8:h32:p64:n5:a5:mpf_bta_ha_k2q_ef_dynv28_p3s1",
+        "sm120:fp8:h32:p64:n5:a5:mx_bta_ha_wr_ef",
+        "sm120:fp8:h32:p64:n6:a2:atom2_mpf_bta_ha_k2q",
+        "sm120:fp8:h32:p64:n6:a2:atom2_mx_bta_ha_wr",
+        "sm120:fp8:h32:p64:n6:a6:bta_ha_wr_ef",
+        "sm120:fp8:h64:p64:n1:a1:mpf_bta_ha_k2q_ef_dynv28_p5s1",
+        "sm120:fp8:h64:p64:n2:a2:mpf_bta_ha_k2q_ef_dynv28_p5s1",
+        "sm120:fp8:h64:p64:n3:a3:mpf_bta_ha_sp_kf2q_ef",
+        "sm120:fp8:h64:p64:n3:a3:mpf_bta_ha_sp_kf2q_ef_dynv28_p5s1",
+        "sm120:fp8:h64:p64:n4:a2:atom2_mpf_bta_ha_k2q",
+        "sm120:fp8:h64:p64:n4:a2:atom2_mx_bta_ha_wr",
+        "sm120:fp8:h64:p64:n4:a4:mpf_bta_ha_k2q_ef_dynv28_p3s1",
+        "sm120:fp8:h64:p64:n6:a2:atom2_mpf_bta_ha_k2q",
+    }
+)
 TABLE_KEY = re.compile(r"^h(\d+):p(\d+):n(\d+):(a\d+):(\w+)$")
 
 # Synthetic device routes.  The static ones reuse a shipped sequence of the
@@ -232,7 +283,7 @@ def _scheduler_kernels(catalog):
     return single["sources"][0], par
 
 
-def _check_device_routes(catalog, *, check_files):
+def _check_device_routes(catalog, *, check_files, orphans=frozenset()):
     from flashinfer.jit import env
 
     single, par = _scheduler_kernels(catalog)
@@ -282,7 +333,12 @@ def _check_device_routes(catalog, *, check_files):
                     n,
                 ), (key, route)
                 referenced.add(route)
-    assert referenced == set(device), sorted(set(device) - referenced)
+    assert referenced <= set(device), sorted(referenced - set(device))
+    assert set(device) - referenced == set(orphans), sorted(set(device) - referenced)
+    for name in orphans:
+        assert not _is_par_tag(name.rsplit(":", 1)[1]), name
+        assert f"{name}_par" in referenced, name
+        assert _runtime.route_schedule(device[name]) == {"kind": "static"}, name
     for name, record in device.items():
         assert name not in routes, name
         match = DEVICE_ROUTE.match(name)
@@ -322,7 +378,21 @@ def _check_device_routes(catalog, *, check_files):
 
 
 def test_committed_device_routes_are_well_formed():
-    _check_device_routes(_runtime._catalog(), check_files=True)
+    _check_device_routes(_runtime._catalog(), check_files=True, orphans=ORPHANS)
+
+
+def test_removed_device_routes_stay_out():
+    catalog = _runtime._catalog()
+    named = {
+        route
+        for table in catalog["policy"]["device_rule"]["tables"].values()
+        for entries in table.values()
+        for _batch, route in entries
+    }
+    assert not REMOVED & ORPHANS
+    for name in sorted(REMOVED):
+        assert DEVICE_ROUTE.match(name), name
+        assert name not in catalog["device_routes"] and name not in named, name
 
 
 def test_synthetic_device_routes_are_well_formed(monkeypatch):
@@ -1031,6 +1101,42 @@ def test_committed_device_route_matches_the_default_route(monkeypatch, case):
         assert bool((caller == -7).all())
 
 
+def _orphan_route_cases():
+    """One case per committed orphan ``X``: ``(X, sms, key, batch)`` of the first
+    table entry that names ``X_par``, the entry the launch renames to ``X``."""
+    rule = _runtime._catalog()["policy"]["device_rule"]
+    cases = []
+    for route in sorted(ORPHANS):
+        found = [
+            (route, int(sms), key, int(batch))
+            for sms, table in sorted(rule["tables"].items())
+            for key, entries in sorted(table.items())
+            for batch, named in entries
+            if named == f"{route}_par"
+        ]
+        assert found, f"{route}: no table entry names {route}_par"
+        cases.append(found[0])
+    return cases
+
+
+@pytest.mark.parametrize(
+    "case",
+    _orphan_route_cases()
+    or [pytest.param(None, marks=pytest.mark.skip(reason="no orphan device route"))],
+    ids=lambda case: case[0] if case else "none",
+)
+def test_orphan_device_route_matches_the_default_route(monkeypatch, case):
+    """An orphan, driven by its twin's entry renamed to it, scores the default bits."""
+    route, sms, key, batch = case
+    rule = copy.deepcopy(_runtime.device_rule())
+    rule["tables"][str(sms)][key] = [
+        [listed, route if int(listed) == batch else named]
+        for listed, named in rule["tables"][str(sms)][key]
+    ]
+    monkeypatch.setattr(_runtime, "device_rule", lambda: rule)
+    test_committed_device_route_matches_the_default_route(monkeypatch, case)
+
+
 def _counter_word(plan):
     """Ticket counter word of a ``dyn`` plan's private schedule (zero after a launch)."""
     return int(plan.dyn_schedule[-1, 0])
@@ -1272,9 +1378,10 @@ def test_boundary_entries_resolve_to_their_sibling():
     """An entry listed next to a par entry keeps its own route at its batch.
 
     Every par route has a sibling of the same geometry and Q atom: the tuned
-    route ``<tag>`` of ``<tag>_par`` and the default route of ``par``.  A
-    ``<tag>`` entry next to a ``<tag>_par`` entry resolves to ``<tag>``, and a
-    ``null`` entry next to a ``par`` entry to the default route.
+    route ``<tag>`` of ``<tag>_par`` (unless ``<tag>`` is in ``REMOVED``) and
+    the default route of ``par``.  A ``<tag>`` entry next to a ``<tag>_par``
+    entry resolves to ``<tag>``, and a ``null`` entry next to a ``par`` entry
+    to the default route.
     """
     catalog = _runtime._catalog()
     device, routes = catalog["device_routes"], catalog["routes"]
@@ -1294,7 +1401,13 @@ def test_boundary_entries_resolve_to_their_sibling():
         if tag == "par":
             sibling = routes[name.removesuffix(":par")]
         else:
-            sibling = device[name.removesuffix("_par")]
+            tuned = name.removesuffix("_par")
+            if tuned not in device:
+                # Only a tuned route this delivery removed (``REMOVED``: its
+                # last table entry moved to this par route) may be absent.
+                assert tuned in REMOVED, name
+                continue
+            sibling = device[tuned]
             assert _runtime.route_schedule(sibling) == {"kind": "static"}, name
         assert [record[k] for k in fields] == [sibling[k] for k in fields], name
         assert record["sequence"] != sibling["sequence"], name

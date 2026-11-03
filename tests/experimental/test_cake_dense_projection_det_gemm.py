@@ -915,7 +915,9 @@ def test_registry_records_are_well_formed():
             assert plan_items[-4] == ["launch", "enable_pdl"]
             assert list(record["launch"]["block"]) == [256, 1, 1], name
             assert record["template"] in dict(
-                (t, w) for w, t in cake_backend.SWAP_TEMPLATES
+                (t, w)
+                for w, t in cake_backend.SWAP_TEMPLATES
+                + cake_backend.SWAP_TEMPLATES_WEIGHTS_STATIC
             )
             assert record["arches"] == list(cake_jit.ARCHES), name
         else:
@@ -2154,8 +2156,9 @@ def test_round20_rules_plan_like_the_cake_launcher(T):
         v["A"], v["B"], v["out"], group_m=16, **kw
     )
     assert _nopro(forced.template) == _nopro(plan.template) and forced.group_m == 16
-    # the shared_down forward (X @ W^T, 6144 x 2048) has no rule and keeps the 16-row default on ``kk_n256``
-    f = _views("proj", "shared_down", "fwd", "bf16", T)
+    # the shared_down forward (X @ W^T, 6144 x 2048) has no ragged rule and keeps the 16-row default on ``kk_n256``
+    # (one token off the GB T-exact keys at T 16172 / 16231: test_gb_t_exact_rules_plan_their_programs)
+    f = _views("proj", "shared_down", "fwd", "bf16", T + 1)
     fwd, *_ = plan_dense_projection_det_gemm(f["A"], f["B"], f["out"], **kw)
     assert fwd.group_m == 16 and _nopro(fwd.template) == "dense_proj_det_gemm_kk_n256"
 
@@ -3140,11 +3143,12 @@ def test_round33_rules_plan_like_the_cake_launcher(T):
     # adds one sm_103a key (the kv_a input gradient, test_mg_rules_plan_the_whole_tile_programs); the N = 128 weight
     # gradients of the 4096 / 5120 / 8192 rows add six sm_107a keys (test_sm107a_n128_wgrad_rules_plan); the thin and
     # 512 / 1024 BF16 projection rows add 26 sm_107a keys; the thin FP32 input gradients, thin BF16 forwards and FP32
-    # weight gradients add 34 sm_107a keys (17 ragged, 17 T-exact weight-gradient keys at T 16231 / 16384)
-    assert len(ROW_RULES) == 109 + 79 + 86 + 1 + 6 + 26 + 34
-    assert sum(k[0] == "sm_100a" for k in ROW_RULES) == 51 + 79
+    # weight gradients add 34 sm_107a keys (17 ragged, 17 T-exact weight-gradient keys at T 16231 / 16384); the GB
+    # T-exact forward / input-gradient rules add 8 sm_100a and 8 sm_103a keys (test_gb_t_exact_rules_plan_their_programs)
+    assert len(ROW_RULES) == 109 + 79 + 86 + 1 + 6 + 26 + 34 + 16
+    assert sum(k[0] == "sm_100a" for k in ROW_RULES) == 51 + 79 + 8
     assert sum(k[0] == "sm_107a" for k in ROW_RULES) == 58 + 6 + 26 + 34
-    assert sum(k[0] == "sm_103a" for k in ROW_RULES) == 86 + 1
+    assert sum(k[0] == "sm_103a" for k in ROW_RULES) == 86 + 1 + 8
     assert ARCH_RULE_DEFAULTS == {
         "sm_107a": {"pro": 7},
         "sm_100a": {"pro": 7},
@@ -6085,7 +6089,12 @@ def test_fused_split_selection_follows_the_registry(monkeypatch):
     source is a contiguous fp32 view of at most int32 elements; otherwise the torch chain splits."""
     assert cake_backend._split_grid(1) == (1, 1, 1)
     assert cake_backend._split_grid(3 * cake_backend.SPLIT_BLOCK_ELEMS + 1) == (4, 1, 1)
-    assert cake_backend._split_values("s", "p", 5) == {"src": "s", "parts": "p", "n": 5}
+    assert cake_backend._split_values("s", "p", 5) == {
+        "src": "s",
+        "parts": "p",
+        "n": 5,
+        "enable_pdl": 0,
+    }
     W = torch.empty(256, 6144)
     _cpu_router_registry(monkeypatch, fused=False)
     assert cake_backend.fused_split_module("sm_100a") is None
@@ -6591,7 +6600,9 @@ def test_registry_fallback_decodes_the_nearest_generated_program(monkeypatch):
 # ---------------------------------------------------------------------------
 # The measured rows of the shapes tranche: (ROW_RULES key, T, SM count of the measuring device, the program the
 # measurement selected).  Generated from the measurement records of the tranche; the rule of each key (or, for a row
-# whose choice is the planner's default, the default) must plan exactly this program.
+# whose choice is the planner's default, the default) must plan exactly this program.  The (key, T) pairs the GB T-exact
+# rules re-measured (the sm_100a 4096 -> 48 input gradient and 4096 -> 512 forward, the sm_103a 4096 -> 512 and
+# 5120 -> 512 forwards, at T 16231 / 16384) name their T-exact key and its program.
 # ---------------------------------------------------------------------------
 # fmt: off
 MEASURED_SHAPE_ROWS = (
@@ -6613,8 +6624,8 @@ MEASURED_SHAPE_ROWS = (
     (('sm_100a', False, False, False, False, False, 128, 5120, None), 16384, 152, 'dense_proj_det_gemm_kk_n128_hen_c1'),
     (('sm_100a', False, False, False, False, False, 128, 8192, None), 16231, 152, 'dense_proj_det_gemm_kk_n128_hen_pro15'),
     (('sm_100a', False, False, False, False, False, 128, 8192, None), 16384, 152, 'dense_proj_det_gemm_kk_n128_hen_pro15'),
-    (('sm_100a', False, False, False, False, False, 512, 4096, None), 16231, 152, 'dense_proj_det_gemm_kk_n256_pro7'),
-    (('sm_100a', False, False, False, False, False, 512, 4096, None), 16384, 152, 'dense_proj_det_gemm_kk_n256_pro7'),
+    (('sm_100a', False, False, False, False, False, 512, 4096, 16231), 16231, 152, 'dense_proj_det_gemm_kk_n256_ht_cg_pro15'),
+    (('sm_100a', False, False, False, False, False, 512, 4096, 16384), 16384, 152, 'dense_proj_det_gemm_kk_n256_ht_cg_pro15'),
     (('sm_100a', False, False, False, False, False, 512, 5120, None), 16231, 152, 'dense_proj_det_gemm_kk_n256_pro7'),
     (('sm_100a', False, False, False, False, False, 512, 5120, None), 16384, 152, 'dense_proj_det_gemm_kk_n256_pro7'),
     (('sm_100a', False, False, False, False, False, 1024, 4096, None), 16231, 152, 'dense_proj_det_gemm_kk_n256_ht_cg_pro15'),
@@ -6641,8 +6652,8 @@ MEASURED_SHAPE_ROWS = (
     (('sm_100a', False, True, False, False, False, 2048, 4096, None), 16231, 152, 'dense_proj_det_gemm_kn_n256_cg_pro15'),
     (('sm_100a', False, True, False, False, False, 4096, 32, None), 16231, 152, 'dense_proj_det_gemm_kn_n256_ht_tma2_lw_pro15'),
     (('sm_100a', False, True, False, False, False, 4096, 32, None), 16384, 152, 'dense_proj_det_gemm_kn_n256_ht_tma2_lw_pro15'),
-    (('sm_100a', False, True, False, False, False, 4096, 48, None), 16231, 152, 'dense_proj_det_gemm_kn_n256_ht_tma2_lw_pro15'),
-    (('sm_100a', False, True, False, False, False, 4096, 48, None), 16384, 152, 'dense_proj_det_gemm_kn_n256_ht_tma2_lw_pro15'),
+    (('sm_100a', False, True, False, False, False, 4096, 48, 16231), 16231, 152, 'dense_proj_det_gemm_kn_n256_tma1_w8r'),
+    (('sm_100a', False, True, False, False, False, 4096, 48, 16384), 16384, 152, 'dense_proj_det_gemm_kn_n256_tma1_w8r'),
     (('sm_100a', False, True, False, False, False, 4096, 64, None), 16231, 152, 'dense_proj_det_gemm_kn_n256_tma1_w8r'),
     (('sm_100a', False, True, False, False, False, 4096, 64, None), 16384, 152, 'dense_proj_det_gemm_kn_n256_tma1_w8r'),
     (('sm_100a', False, True, False, False, False, 4096, 128, None), 16231, 152, 'dense_proj_det_gemm_kn_n256_tma2_pd2_lw_pro15'),
@@ -6793,10 +6804,10 @@ MEASURED_SHAPE_ROWS = (
     (('sm_103a', False, False, False, False, False, 128, 5120, None), 16384, 152, 'dense_proj_det_gemm_kk_n128_hen_c1'),
     (('sm_103a', False, False, False, False, False, 128, 8192, None), 16231, 152, 'dense_proj_det_gemm_kk_n128_hen_pro15'),
     (('sm_103a', False, False, False, False, False, 128, 8192, None), 16384, 152, 'dense_proj_det_gemm_kk_n128_hen_pro15'),
-    (('sm_103a', False, False, False, False, False, 512, 4096, None), 16231, 152, 'dense_proj_det_gemm_kk_n256_pro7'),
-    (('sm_103a', False, False, False, False, False, 512, 4096, None), 16384, 152, 'dense_proj_det_gemm_kk_n256_pro7'),
-    (('sm_103a', False, False, False, False, False, 512, 5120, None), 16231, 152, 'dense_proj_det_gemm_kk_n256_pro7'),
-    (('sm_103a', False, False, False, False, False, 512, 5120, None), 16384, 152, 'dense_proj_det_gemm_kk_n256_pro7'),
+    (('sm_103a', False, False, False, False, False, 512, 4096, 16231), 16231, 152, 'dense_proj_det_gemm_kk_n256_ht_cg_pro15'),
+    (('sm_103a', False, False, False, False, False, 512, 4096, 16384), 16384, 152, 'dense_proj_det_gemm_kk_n256_ht_cg_pro15'),
+    (('sm_103a', False, False, False, False, False, 512, 5120, 16231), 16231, 152, 'dense_proj_det_gemm_kk_n256_ht_cg_pro15'),
+    (('sm_103a', False, False, False, False, False, 512, 5120, 16384), 16384, 152, 'dense_proj_det_gemm_kk_n256_ht_cg_pro15'),
     (('sm_103a', False, False, False, False, False, 1024, 4096, None), 16231, 152, 'dense_proj_det_gemm_kk_n256_ht_cg_pro15'),
     (('sm_103a', False, False, False, False, False, 1024, 4096, None), 16384, 152, 'dense_proj_det_gemm_kk_n256_ht_cg_pro15'),
     (('sm_103a', False, False, False, False, False, 1024, 5120, None), 16231, 152, 'dense_proj_det_gemm_kk_n256_ht_cg_pro15'),
@@ -7082,11 +7093,22 @@ def test_sm103a_inherits_the_sm100a_rules_where_it_has_none():
         for key in table:
             a_mn, b_mn, out_f32, out_t, batched, N, K, M = key
             dims = (N, 16231 if K is None else K, 16231 if M is None else M)
+            # an own sm_103a rule of the row at these dims wins over the parent's: the GB T-exact keys of the 6144 x 2048
+            # rows at T 16231 over the sm_100a ragged rules, the ragged 4096 -> 48 rule over the sm_100a T-exact keys
+            src = (arch_of,) + key
+            if arch_of == "sm_100a":
+                for own_key in (
+                    ("sm_103a",) + key[:5] + (N, dims[1], dims[2]),
+                    ("sm_103a",) + key[:5] + (N, dims[1], None),
+                ):
+                    if own_key in ROW_RULES:
+                        src = own_key
+                        break
             assert (
                 cake_backend._measured_row_rule(
                     "sm_103a", a_mn, b_mn, out_f32, out_t, batched, *dims
                 )
-                == ROW_RULES[(arch_of,) + key]
+                == ROW_RULES[src]
             ), key
     sm = SM_COUNT_OF_ARCH["sm_103a"]
     registered = _registered("sm_103a")
@@ -7423,12 +7445,12 @@ def test_round2_rules_plan_their_knobs():
             template = "dense_proj_det_gemm_kn_n256_ht_tma2_lw_pro15"
             for N_layer in (32, 48):
                 v = _class_views("kn", False, False, 16384, K_layer, N_layer)
-                # the sm_103a 4096 -> 48 rule carries the eight-warp form
-                # (test_eight_warp_form_rules_plan_their_programs); forcing its previous knobs plans the row's
-                # previous program
+                # the sm_103a 4096 -> 48 rule and the sm_100a GB T-exact key at T 16384 carry the eight-warp form
+                # (test_eight_warp_form_rules_plan_their_programs, test_gb_t_exact_rules_plan_their_programs);
+                # forcing the row's previous knobs plans its previous program
                 forced_h = (
                     dict(epi="tma", slots=2, htail=True, lw=True, pro=15)
-                    if arch == "sm_103a" and (K_layer, N_layer) == (4096, 48)
+                    if (K_layer, N_layer) == (4096, 48)
                     else {}
                 )
                 plan, *_ = plan_dense_projection_det_gemm(
@@ -7843,9 +7865,11 @@ def test_sw_rules_plan_the_paced_store_programs(T):
     assert "sw" not in cake_backend._CTA1_CLEARED
 
 
-# the ROW_RULES keys that carry the eight-warp CTA form (the six sm_103a and the seven sm_100a input-gradient rows)
+# the ragged ROW_RULES keys that carry the eight-warp CTA form (the six sm_103a and the seven sm_100a input-gradient
+# rows; the two sm_100a 4096 -> 48 T-exact keys that carry it are GB_T_EXACT_ROWS)
 EIGHT_WARP_ROWS = sorted(
-    (key for key, rule in ROW_RULES.items() if rule.get("form")), key=repr
+    (key for key, rule in ROW_RULES.items() if rule.get("form") and key[8] is None),
+    key=repr,
 )
 # the eight-warp rows per architecture: (N, K) -> (template, form, group_m, promo); the raster group is the row's
 # measured launch parameter (the sm_100a programs were measured on GB200)
@@ -7952,7 +7976,9 @@ def test_eight_warp_form_rules_plan_their_programs(arch, T, monkeypatch):
             counters=dummy,
             ldo=plan.N,
             out_l=plan.M * plan.N,
+            enable_pdl=1,
         )
+        assert values["enable_pdl"] == 1
         assert values["fd_tiles_l"] == plan.m_tiles * plan.n_tiles
         assert values["fd_tiles_g"] == plan.group_m * plan.n_tiles
         assert values["fd_group"] == plan.group_m
@@ -8009,8 +8035,9 @@ def test_eight_warp_form_rules_plan_their_programs(arch, T, monkeypatch):
         # the other architectures' plans of the row: the five sm_100a rows shared with sm_103a carry the sm_103a form
         # (``w8rs`` / ``w8rs`` / ``w8r`` / ``w8r`` / ``w8rs``) and the sm_100a 4096 -> 64 and 5120 -> 64 rows none there
         # (their sm_103a rules name no form), the sm_103a rows shared with sm_100a carry sm_100a's form at its raster
-        # there, the sm_103a 4096 -> 48 row carries none on sm_100a (its sm_100a rule names no form), and sm_107a never
-        # carries one
+        # there, the sm_103a 4096 -> 48 row carries none on sm_100a (its sm_100a rule names no form) except at the T of
+        # the sm_100a GB T-exact keys (16231 / 16384: ``w8r``, test_gb_t_exact_rules_plan_their_programs), and sm_107a
+        # never carries one
         for other_arch, other_rows in EIGHT_WARP_ROW_PLANS.items():
             if other_arch == arch:
                 continue
@@ -8018,7 +8045,10 @@ def test_eight_warp_form_rules_plan_their_programs(arch, T, monkeypatch):
                 v["A"], v["B"], v["out"], **dict(mirror, arch=other_arch)
             )
             expected_other = other_rows.get((N_layer, K_layer))
-            if expected_other is None:
+            gb_exact = GB_T_EXACT_ROWS.get((other_arch, True, N_layer, K_layer))
+            if gb_exact is not None and T in gb_exact[0]:
+                assert other.template == gb_exact[1], (other_arch, N_layer, K_layer)
+            elif expected_other is None:
                 assert other.form == "" and "_w8" not in other.template, (
                     other_arch,
                     N_layer,
@@ -8131,6 +8161,191 @@ def test_eight_warp_form_rules_plan_their_programs(arch, T, monkeypatch):
             rule["form"] in cake_backend.W8_FORMS
             and key[0] in EIGHT_WARP_ARCHES_OF_FORM[rule["form"]]
         ), key
+
+
+# The GB T-exact forward / input-gradient rules: (arch, B MN-major, N, K) -> (the two T of the exact keys, the program).
+# Each key applies at its T alone and plans the per-tile K partitions of the row's plan without it (whole K per output
+# tile on both), so every output is bitwise equal to that plan's.
+GB_T_EXACT_ROWS = {
+    ("sm_100a", True, 4096, 48): (
+        (16231, 16384),
+        "dense_proj_det_gemm_kn_n256_tma1_w8r",
+    ),
+    ("sm_100a", False, 512, 4096): (
+        (16231, 16384),
+        "dense_proj_det_gemm_kk_n256_ht_cg_pro15",
+    ),
+    ("sm_100a", False, 6144, 2048): (
+        (16172, 16231),
+        "dense_proj_det_gemm_kk_n256_ht_cg_pro15",
+    ),
+    ("sm_100a", True, 6144, 2048): (
+        (16172, 16231),
+        "dense_proj_det_gemm_kn_n256_ht_cg_pro15",
+    ),
+    ("sm_103a", False, 512, 4096): (
+        (16231, 16384),
+        "dense_proj_det_gemm_kk_n256_ht_cg_pro15",
+    ),
+    ("sm_103a", False, 512, 5120): (
+        (16231, 16384),
+        "dense_proj_det_gemm_kk_n256_ht_cg_pro15",
+    ),
+    ("sm_103a", False, 6144, 2048): (
+        (16172, 16231),
+        "dense_proj_det_gemm_kk_n256_ht_cg_pro15",
+    ),
+    ("sm_103a", True, 6144, 2048): (
+        (16172, 16231),
+        "dense_proj_det_gemm_kn_n256_ht_cg_pro15",
+    ),
+}
+GB_T_EXACT_KEYS = sorted(
+    (arch, False, b_mn, False, False, False, N, K, T)
+    for (arch, b_mn, N, K), (Ts, _template) in GB_T_EXACT_ROWS.items()
+    for T in Ts
+)
+
+
+def _whole_k(plan) -> bool:
+    """Every output tile of the plan sums its whole K range in one item (no stream-K split of a tail tile)."""
+    return not plan.sk_units or bool(plan.htail_plan)
+
+
+def _gb_t_exact_keys_of(key):
+    """The key and, on sm_103a, the sm_100a key it restates (the parent lookup would find it): deleting both plans the
+    row without the GB T-exact rules."""
+    parent = ("sm_100a",) + key[1:]
+    return [key] + ([parent] if key[0] == "sm_103a" and parent in ROW_RULES else [])
+
+
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a"])
+def test_gb_t_exact_rules_plan_their_programs(arch, monkeypatch):
+    """The GB T-exact rules (sm_100a: the 4096 -> 48 input gradient with the eight-warp ``w8r`` program, the
+    4096 -> 512 forward, the 6144 x 2048 input gradient and the shared_down forward with the half-tail column-grouped
+    program; sm_103a: the 4096 -> 512 and 5120 -> 512 forwards and the same 6144 x 2048 rows, restated from sm_100a)
+    plan their program at their T on every SM count of the architecture's parts, with whole K per output tile like
+    the row's plan without the key; one token more or less plans that plan.  The sm_103a 4096 -> 48 input gradient
+    keeps its own ragged rule (an architecture's own rule wins over its parent's T-exact key)."""
+    monkeypatch.setattr(cake_backend, "_DUMMIES", {})
+    exact = sorted(
+        key
+        for key in ROW_RULES
+        if key[0] == arch
+        and not key[1]
+        and not key[3]
+        and not key[4]
+        and key[8] is not None
+    )
+    assert exact == [key for key in GB_T_EXACT_KEYS if key[0] == arch]
+    registered = _registered(arch)
+    for key in exact:
+        _arch, _a_mn, b_mn, _f32, _out_t, _batched, N, K, T = key
+        template = GB_T_EXACT_ROWS[(arch, b_mn, N, K)][1]
+        assert template in registered, (key, template)
+        for sm_count in (148, 152, 160) if arch == "sm_103a" else (148, 152):
+            kw = dict(sm_count=sm_count, l2_bytes=L2_BYTES, arch=arch, _fallback=False)
+            plans = {}
+            for t in (T - 1, T, T + 1):
+                v = _class_views("kn" if b_mn else "kk", False, False, t, N, K)
+                plans[t], *_ = plan_dense_projection_det_gemm(
+                    v["A"], v["B"], v["out"], **kw
+                )
+            plan = plans[T]
+            assert plan.template == template, (key, sm_count, plan.template)
+            assert not (
+                plan.rule_fallback or plan.knob_fallback or plan.swap_fallback
+            ), key
+            assert _whole_k(plan), (key, sm_count)
+            with monkeypatch.context() as m:
+                for k in _gb_t_exact_keys_of(key):
+                    m.delitem(ROW_RULES, k)
+                v = _class_views("kn" if b_mn else "kk", False, False, T, N, K)
+                ragged, *_ = plan_dense_projection_det_gemm(
+                    v["A"], v["B"], v["out"], **kw
+                )
+                for t in (T - 1, T + 1):
+                    v = _class_views("kn" if b_mn else "kk", False, False, t, N, K)
+                    without, *_ = plan_dense_projection_det_gemm(
+                        v["A"], v["B"], v["out"], **kw
+                    )
+                    assert _plan_signature(plans[t]) == _plan_signature(without), (
+                        key,
+                        t,
+                    )
+            assert ragged.template != template and _whole_k(ragged), (
+                key,
+                sm_count,
+                ragged.template,
+            )
+            assert (plan.k_blocks, plan.M, plan.N, plan.K) == (
+                ragged.k_blocks,
+                ragged.M,
+                ragged.N,
+                ragged.K,
+            )
+    if arch == "sm_103a":
+        own = ROW_RULES[("sm_103a", False, True, False, False, False, 4096, 48, None)]
+        for T in (16231, 16384):
+            assert (
+                cake_backend._measured_row_rule(
+                    "sm_103a", False, True, False, False, False, 4096, 48, T
+                )
+                == own
+            )
+
+
+@pytest.mark.parametrize(
+    "key",
+    GB_T_EXACT_KEYS,
+    ids=lambda key: f"{key[0]}-{'kn' if key[2] else 'kk'}-{key[6]}x{key[7]}-T{key[8]}",
+)
+def test_gb_t_exact_rows_match_fp64_and_their_plan_without_the_key(key, monkeypatch):
+    """Each GB T-exact row of the device's architecture runs its program at its T against the FP64 reference of the
+    exact BF16 operands (the package tolerance), and its output is bitwise equal to the output of the plan the row has
+    without the key (the rule changes the program, never a K sum).  A key of another architecture is skipped."""
+    if not _device_supported():
+        pytest.skip(
+            "requires a device with a registered generated instance "
+            f"(compute capability {_registered_capabilities()})"
+        )
+    arch, _a_mn, b_mn, _f32, _out_t, _batched, N, K, T = key
+    device = torch.device("cuda")
+    if arch != arch_for(device):
+        pytest.skip(f"a {arch} key; the device is {arch_for(device)}")
+    g = torch.Generator(device=device).manual_seed(SEED)
+    A = torch.randn(T, K, device=device, generator=g).to(torch.bfloat16)
+    if b_mn:
+        B = (torch.randn(K, N, device=device, generator=g) * K**-0.5).to(torch.bfloat16)
+    else:
+        B = (
+            (torch.randn(N, K, device=device, generator=g) * K**-0.5)
+            .to(torch.bfloat16)
+            .t()
+        )
+    template = GB_T_EXACT_ROWS[(arch, b_mn, N, K)][1]
+    _require_program(template)
+    out = torch.full((T, N), float("nan"), dtype=torch.bfloat16, device=device)
+    cake_backend.clear_convenience_caches()
+    prepared = prepare_dense_projection_det_gemm(A, B, out)
+    assert prepared.template == template, prepared.template
+    assert _whole_k(prepared.plan)
+    prepared.launch()
+    torch.cuda.synchronize()
+    _check(out, torch.matmul(A.double(), B.double()))
+    plain_out = torch.full_like(out, float("nan"))
+    with monkeypatch.context() as m:
+        for k in _gb_t_exact_keys_of(key):
+            m.delitem(ROW_RULES, k)
+        cake_backend.clear_convenience_caches()
+        plain = prepare_dense_projection_det_gemm(A, B, plain_out)
+    assert plain.template != template and _whole_k(plain.plan), plain.template
+    plain.launch()
+    torch.cuda.synchronize()
+    assert torch.equal(out.view(torch.int16), plain_out.view(torch.int16)), (
+        key,
+        plain.template,
+    )
 
 
 def _n224_rule_rows():
@@ -9321,6 +9536,55 @@ def test_swapped_forward_pdl_waits_for_an_early_producer(T):
         _check(O2, torch.einsum("gtd,gdr->gtr", A2.double(), B2.double()))
 
 
+@pytest.mark.parametrize("T", [16, 128])
+def test_swapped_forward_default_waits_for_an_early_producer_writing_b(T):
+    """The default (``enable_pdl`` on, ``weights_static`` off) never reads ``B`` before the preceding kernel
+    completes: a long planner GEMM on a few CTAs (K = 65536) that triggers its dependents at entry writes the weights
+    the swapped forward reads next, and the forward sees every weight it wrote.  (The ``weights_static`` programs read
+    the NaN the weights were poisoned with in this chain: that is what the keyword states cannot happen.)"""
+    _require_swap()
+    G, D, R, Kp = 2, 256, 256, 65536
+    g = torch.Generator(device="cuda").manual_seed(SEED + 8)
+    y = (torch.randn(G, R, Kp, device="cuda", generator=g) * Kp**-0.5).to(
+        torch.bfloat16
+    )
+    z = torch.randn(G, D, Kp, device="cuda", generator=g).to(torch.bfloat16)
+    o = torch.randn(T, G, D, device="cuda", generator=g).to(torch.bfloat16)
+    w = torch.empty(G, R, D, device="cuda", dtype=torch.bfloat16)
+    res = torch.empty(T, G, R, device="cuda", dtype=torch.bfloat16)
+    A, B, O = o.transpose(0, 1), w.transpose(1, 2), res.transpose(0, 1)
+    launch = _swap_launch(A, B, O)
+    assert launch is not None
+    assert not cake_jit.MODULES[launch.module_name]["template"].endswith("_we")
+    for _ in range(3):
+        w.fill_(float("nan"))
+        res.fill_(float("nan"))
+        # the producer of the weights: w[g] = y[g] @ z[g].T on the planner's program (N < 2 M: not swapped)
+        cake_backend.dense_projection_det_gemm(y, z.transpose(1, 2), w)
+        cake_backend.dense_projection_det_gemm(A, B, O)
+        torch.cuda.synchronize()
+        assert bool(torch.isfinite(w).all())
+        _check(O, torch.einsum("gtd,gdr->gtr", A.double(), B.double()))
+
+
+def test_weights_static_runs_the_weights_early_program():
+    """``weights_static=True`` with PDL routes the swapped rows to the ``_we`` programs, which give the default's
+    bits on weights no kernel in flight writes."""
+    _require_swap()
+    for template in cake_backend.SWAP_TEMPLATES_WEIGHTS_STATIC:
+        _require_program(template[1])
+    A, B, out = _swap_views(64, seed=SEED + 9)
+    early = cake_backend._swap_ab_cached(A, B, out, False, True)
+    assert early is not None
+    assert cake_jit.MODULES[early.module_name]["template"].endswith("_we")
+    cake_backend.dense_projection_det_gemm(A, B, out)
+    first = out.clone()
+    out.fill_(float("nan"))
+    cake_backend.dense_projection_det_gemm(A, B, out, weights_static=True)
+    torch.cuda.synchronize()
+    assert torch.equal(out, first)
+
+
 def test_swapped_forward_replays_in_a_cuda_graph_with_pdl():
     """The swapped launch allocates nothing: a PDL chain captured into a CUDA graph replays on new values written
     into the bound views."""
@@ -9347,3 +9611,113 @@ def test_swapped_forward_replays_in_a_cuda_graph_with_pdl():
     torch.cuda.synchronize()
     _check(out, torch.einsum("gtd,gdr->gtr", A.double(), B.double()))
     _check(out2, torch.einsum("gtd,gdr->gtr", A2.double(), B2.double()))
+
+
+# ---------------------------------------------------------------------------
+# Programmatic dependent launch of the planner's programs
+# ---------------------------------------------------------------------------
+
+
+def test_every_program_takes_enable_pdl_per_call():
+    """Every program (the planner's, the eight-warp form, the swapped forward, the router and its split kernel) takes
+    the per-call PDL flag right before the grid."""
+    for name, record in cake_jit.MODULES.items():
+        plan = [list(item) for item in cake_jit.arg_plan_of(record)]
+        assert plan[-4] == ["launch", "enable_pdl"], (name, plan[-4])
+        assert sum(kind == "launch" for kind, _ in plan) == 1, name
+
+
+def test_weights_static_selects_the_weights_early_programs():
+    """Each swapped tile ships twice on every architecture: the default program, whose weight loads wait for the
+    preceding kernel, and the ``_we`` one, whose weight loads run ahead of the wait; ``weights_static`` picks it."""
+    for arch in cake_jit.ARCHES:
+        for (w, safe), (w_we, early) in zip(
+            cake_backend.SWAP_TEMPLATES,
+            cake_backend.SWAP_TEMPLATES_WEIGHTS_STATIC,
+            strict=True,
+        ):
+            assert w == w_we and early == f"{safe}_we"
+            assert cake_jit.select_module(arch, safe) != cake_jit.select_module(
+                arch, early
+            )
+        pick = cake_backend.swap_ab_template
+        assert pick(8, 64, 1024, 152, arch) == "swap_ab_w64_t64_s12"
+        assert pick(8, 64, 1024, 152, arch, True) == "swap_ab_w64_t64_s12_we"
+        assert pick(8, 256, 1024, 152, arch, True) == "swap_ab_w128_t64_s8_we"
+
+
+def test_enable_pdl_defaults_to_device_support():
+    if not _device_supported():
+        pytest.skip("requires a device with a registered generated instance")
+    device = torch.device("cuda")
+    assert cake_backend.pdl_enabled(None, device) is True
+    assert cake_backend.pdl_enabled(False, device) is False
+    assert cake_backend.pdl_enabled(True, device) is True
+
+
+def _pdl_chain_inputs(T, D1, R1, R2, seed):
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    x = torch.randn(T, D1, device="cuda", generator=g).to(torch.bfloat16)
+    w1 = (torch.randn(R1, D1, device="cuda", generator=g) * D1**-0.5).to(torch.bfloat16)
+    w2 = (torch.randn(R2, R1, device="cuda", generator=g) * R1**-0.5).to(torch.bfloat16)
+    return x, w1, w2
+
+
+@pytest.mark.parametrize("T", [256, 4096])
+def test_planner_pdl_waits_for_an_early_producer(T):
+    """A chain of programmatic dependent launches through the planner's programs: the first projection (K = 16384)
+    triggers its dependent at entry and writes the activation the second reads.  The second starts while the first
+    runs and must still read every row the first wrote, and at 256 rows both run stream-K out of one workspace arena
+    (the slabs and slice counters of the stream), which the second may touch only after the first completes."""
+    if not _device_supported():
+        pytest.skip("requires a device with a registered generated instance")
+    x, w1, w2 = _pdl_chain_inputs(T, 16384, 2048, 1024, SEED + 6)
+    mid = torch.empty(T, 2048, device="cuda", dtype=torch.bfloat16)
+    y = torch.empty(T, 1024, device="cuda", dtype=torch.bfloat16)
+    for _ in range(3):
+        mid.fill_(float("nan"))
+        y.fill_(float("nan"))
+        cake_backend.projection_det_forward(x, w1, mid, enable_pdl=True)
+        cake_backend.projection_det_forward(mid, w2, y, enable_pdl=True)
+        torch.cuda.synchronize()
+        _check(mid, x.double() @ w1.double().t())
+        _check(y, mid.double() @ w2.double().t())
+    # the default (the device supports PDL) gives the same bits
+    first = y.clone()
+    cake_backend.projection_det_forward(x, w1, mid)
+    cake_backend.projection_det_forward(mid, w2, y)
+    torch.cuda.synchronize()
+    assert torch.equal(y, first)
+
+
+def test_prepared_pdl_chain_replays_in_a_cuda_graph():
+    """Prepared launches fix ``enable_pdl`` at prepare time: a PDL chain of two prepared projections (the second reading the
+    first's output) captured into a CUDA graph replays on new values written into the bound views."""
+    if not _device_supported():
+        pytest.skip("requires a device with a registered generated instance")
+    T = 512
+    x, w1, w2 = _pdl_chain_inputs(T, 4096, 2048, 1024, SEED + 7)
+    mid = torch.empty(T, 2048, device="cuda", dtype=torch.bfloat16)
+    y = torch.empty(T, 1024, device="cuda", dtype=torch.bfloat16)
+    first = cake_backend.prepare_dense_projection_det_gemm(
+        x, w1.t(), mid, enable_pdl=True
+    )
+    second = cake_backend.prepare_dense_projection_det_gemm(
+        mid, w2.t(), y, enable_pdl=True
+    )
+    first()
+    second()
+    torch.cuda.synchronize()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        first()
+        second()
+    x.copy_(torch.randn(x.shape, device="cuda").to(torch.bfloat16))
+    mid.fill_(float("nan"))
+    y.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    _check(mid, x.double() @ w1.double().t())
+    _check(y, mid.double() @ w2.double().t())
