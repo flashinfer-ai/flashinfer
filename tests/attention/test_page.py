@@ -849,6 +849,8 @@ def test_fp8_pth_quantize_append_paged_kv_cache_with_slot_mapping(
     kv_layout, dtype, head_dim, slot_dtype, fp8_dtype
 ):
     device = "cuda:0"
+    if dtype == torch.bfloat16 and get_compute_capability(torch.device(device))[0] < 8:
+        pytest.skip("Native BF16 input requires SM80 or newer")
     torch.manual_seed(42)
     nnz_kv = 16
     num_kv_heads = 4
