@@ -46,6 +46,19 @@ rounding on the rows whose backward runs the S1 pair).  The JSON records the
 device, architecture, SM count, torch, CUDA and flash-linear-attention versions
 (the distribution's and ``fla.__version__``).
 
+``det2`` is the deterministic arm again, the row's A/A arm (as the
+context-parallel benchmark's ``control``): the same programs and calls on the
+deterministic arm's workspace, built after the two Cake arms (its saved set is
+its own), timed after ``nd`` in every round (``det``, ``nd``, ``det2``,
+``fla``, then reversed).  Per boundary the row reports ``det2 / det``
+(``ratio_det2_over_det``), the A/A band ``[1 - w, 1 + w]`` (``aa_band``; ``w``
+is the largest ``|det2 / det - 1|`` over the rounds' medians and the row's
+medians) and whether ``det / nd`` lies outside it (``det_over_nd_beyond_aa``):
+a ``det / nd`` difference inside the band is within the protocol's own noise.
+With ``--build-order both`` the row's band covers both orders' bands and the
+``det2 / det`` of the means.  With ``--arms-alone`` the arm runs alone like the others, on a workspace of
+its own.
+
 ``--gate`` selects the forget gate's form per row: ``g`` (the default) the
 activated FP32 gate the caller passes, ``raw`` the raw gate mode
 (``use_gate_in_kernel=True``: the BF16 raw gate, FP32 ``A_log`` /
@@ -167,7 +180,9 @@ from tests.test_helpers.cake_kda_det_train_reference import (  # noqa: E402
 
 BOUNDARIES = ("fwd", "bwd", "ckpt", "replay")
 DEFAULT_BOUNDARIES = ("fwd", "bwd", "ckpt")
-ARMS = ("det", "nd", "fla")
+# the interleaved round order (reversed on every other round)
+ARMS = ("det", "nd", "det2", "fla")
+AA_ARM = "det2"  # the deterministic arm again: the A/A arm of every row
 GRAD_ORDER = ("dq", "dk", "dv", "dbeta", "dg")  # the order the backward returns
 RAW_GRAD_ORDER = GRAD_ORDER + ("dA_log", "ddt_bias")  # the raw gate mode's
 GATES = ("g", "raw")
@@ -766,6 +781,9 @@ def run_row(
         "ms_max": {},
         "ratio_det_over_nd": {},
         "ratio_fla_over_nd": {},
+        "ratio_det2_over_det": {},
+        "aa_band": {},
+        "det_over_nd_beyond_aa": {},
         "memory": {},
     }
     # the closures (and the saved sets they hold) in the build order too
@@ -775,6 +793,8 @@ def run_row(
             arms[arm] = cake_boundaries(
                 inputs, det_ws if arm == "det" else nd_ws, deterministic=arm == "det"
             )
+        # the A/A arm after the two Cake arms: the deterministic calls again on the deterministic workspace
+        arms[AA_ARM] = cake_boundaries(inputs, det_ws, deterministic=True)
     samples: dict[str, dict[str, list[float]]] = {}
 
     def fla_failed(exc: Exception) -> None:
@@ -859,6 +879,7 @@ def run_row(
             "nd": lambda: cake_boundaries(inputs, nd_workspace(), deterministic=False),
         }
         builders = {arm: cake_builders[arm] for arm in CAKE_ARMS[build_order]}
+        builders[AA_ARM] = cake_builders["det"]
         if baseline:
             builders["fla"] = lambda: fla_boundaries(inputs)
         for arm, build in builders.items():
@@ -930,6 +951,7 @@ def run_row(
             row["ratio_det_over_nd"][name] = row["ms"]["det"][name] / nd_ms
             if "fla" in row["ms"] and name in row["ms"]["fla"]:
                 row["ratio_fla_over_nd"][name] = row["ms"]["fla"][name] / nd_ms
+        _aa_band(row, name)
     if gate == "raw" and "det" in row["memory"] and "nd" in row["memory"]:
         # the per-call partials the deterministic pair allocates and an R1c backward does not
         row["peak_drop_bytes"] = {
@@ -1001,10 +1023,44 @@ def combine_orders(by_order: dict[str, dict]) -> dict:
         for name in row["ratio_det_over_nd"]
         if all(r["ratio_det_over_nd"].get(name, 1.0) < 1.0 for r in by_order.values())
     ]
+    # the A/A figures of the means: the band covers both orders' bands and the means' det2 / det
+    row["ratio_det2_over_det"], row["aa_band"], row["det_over_nd_beyond_aa"] = {}, {}, {}
+    for name, det_ms in ms.get("det", {}).items():
+        bands = [r["aa_band"].get(name) for r in by_order.values()]
+        if name not in ms.get(AA_ARM, {}) or None in bands:
+            continue
+        ratio = ms[AA_ARM][name] / det_ms
+        w = max(abs(ratio - 1.0), *(band[1] - 1.0 for band in bands))
+        row["ratio_det2_over_det"][name] = ratio
+        row["aa_band"][name] = [1.0 - w, 1.0 + w]
+        if name in row["ratio_det_over_nd"]:
+            row["det_over_nd_beyond_aa"][name] = (
+                abs(row["ratio_det_over_nd"][name] - 1.0) > w
+            )
     errors = {o: r["fla_error"] for o, r in by_order.items() if "fla_error" in r}
     if errors:
         row["fla_error"] = "; ".join(f"{o}: {e}" for o, e in errors.items())
     return row
+
+
+def _aa_band(row: dict, name: str) -> None:
+    """The A/A figures of boundary ``name`` in ``row``: ``det2 / det`` of the medians, the band
+    ``[1 - w, 1 + w]`` (``w`` the largest ``|det2 / det - 1|`` over the rounds' medians and the row's medians)
+    and whether ``det / nd`` lies outside it."""
+    det, aa = row["ms"].get("det", {}), row["ms"].get(AA_ARM, {})
+    if name not in det or name not in aa:
+        return
+    ratio = aa[name] / det[name]
+    det_rounds = row["ms_rounds"]["det"][name]
+    aa_rounds = row["ms_rounds"][AA_ARM][name]
+    per_round = [b / a for a, b in zip(det_rounds, aa_rounds, strict=True)]
+    w = max(abs(x - 1.0) for x in (ratio, *per_round))
+    row["ratio_det2_over_det"][name] = ratio
+    row["aa_band"][name] = [1.0 - w, 1.0 + w]
+    if name in row["ratio_det_over_nd"]:
+        row["det_over_nd_beyond_aa"][name] = (
+            abs(row["ratio_det_over_nd"][name] - 1.0) > w
+        )
 
 
 def _fla_out_vs_nd(inputs: dict, fla: dict, nd_ws) -> float:
@@ -1019,7 +1075,7 @@ def _fla_out_vs_nd(inputs: dict, fla: dict, nd_ws) -> float:
 def _print_row(row: dict, boundaries: tuple[str, ...]) -> None:
     cells = [
         f"S={row['seqlen']:>7} N={row['docs']} H={row['heads']:>2} gate={row['gate']}"
-        f"{' l2n' if row['l2n'] else ''} {row['build_order']} {row['arch']} "
+        f"{' l2n' if row['l2n'] else ''} {row['arch']} "
         f"{row['recurrence']}{'/P' + str(row['segments_per_doc']) if row['recurrence'] == 'seg' else ''} "
         f"S1[{','.join(row['s1_paths']) or '-'}] order={row['build_order']}"
     ]
@@ -1032,6 +1088,13 @@ def _print_row(row: dict, boundaries: tuple[str, ...]) -> None:
         cell = (
             f"{name} det {det_ms:8.3f} nd {nd_ms:8.3f} ms det/nd x{det_ms / nd_ms:6.4f}"
         )
+        if name in row["aa_band"]:
+            w = row["aa_band"][name][1] - 1.0
+            beyond = row["det_over_nd_beyond_aa"].get(name, False)
+            cell += (
+                f" det2/det x{row['ratio_det2_over_det'][name]:6.4f} A/A +-{100 * w:.2f}%"
+                f"{' (det/nd beyond)' if beyond else ''}"
+            )
         if name in row["ratio_fla_over_nd"]:
             cell += f" fla {row['ms']['fla'][name]:8.3f} fla/nd x{row['ratio_fla_over_nd'][name]:5.2f}"
         cells.append(cell)
@@ -1087,6 +1150,9 @@ def _write_json(
                 "build_order": args.build_order,
                 "lower_bound": LOWER_BOUND if "raw" in args.gate else None,
                 "l2n": args.l2n,
+                "aa_arm": f"{AA_ARM}: the deterministic arm again on its workspace; "
+                "aa_band = [1 - w, 1 + w], w the largest |det2 / det - 1| over the rounds' "
+                "medians and the row's medians",
                 "rows": rows,
             },
             f,
@@ -1143,7 +1209,7 @@ def main() -> int:
     parser.add_argument(
         "--arms-alone",
         action="store_true",
-        help="time det, nd and flash-linear-attention one after another, each released before the next",
+        help="time det, nd, det2 and flash-linear-attention one after another, each released before the next",
     )
     parser.add_argument(
         "--fla-alone",
@@ -1238,9 +1304,15 @@ def main() -> int:
         if ratios:
             geo = math.exp(sum(math.log(x) for x in ratios) / len(ratios))
             slower = sum(x < 1.0 for x in ratios)
+            beyond = sum(
+                r["ratio_det_over_nd"][name] < 1.0
+                and r["det_over_nd_beyond_aa"].get(name, False)
+                for r in rows
+                if r["gate"] == gate and name in r["ratio_det_over_nd"]
+            )
             print(
                 f"# gate={gate}{' l2n' if args.l2n else ''} {name} ({args.build_order}): det / nd geomean "
-                f"x{geo:.4f} over {len(ratios)} rows; nd slower on {slower} rows"
+                f"x{geo:.4f} over {len(ratios)} rows; nd slower on {slower} rows, beyond the A/A band on {beyond}"
             )
     if args.json:
         _write_json(
