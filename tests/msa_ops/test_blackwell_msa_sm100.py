@@ -544,10 +544,30 @@ CASES = [
         id="decode-paged-uniform-fp8-lean-s2-graph",
     ),
     # the eight-token fused program on its narrow box (32 Q heads over 4 KV
-    # heads, eight tokens per request, at least 64 requests, a page table of at
-    # most 16 pages = 2048 tokens): the 64-request row and a 128-request row
-    # whose longest context sits on the 2048 boundary -- eager calls without a
-    # workspace, the only calls that select it
+    # heads, eight tokens per request, at least 32 requests, a page table of at
+    # most 16 pages = 2048 tokens): the 32-request row at the batch floor, the
+    # 64-request row and a 128-request row whose longest context sits on the
+    # 2048 boundary -- eager calls without a workspace, the only calls that
+    # select it
+    pytest.param(
+        _attention_case(
+            "sparse_decode",
+            q_dtype=_FP8,
+            kv_dtype=_FP8,
+            kv_layout="paged",
+            batch_size=32,
+            seqlen_q=8,
+            kv_lens=[753 + (41 * i) % 495 for i in range(32)],
+            num_q_heads=32,
+            num_kv_heads=4,
+            topk=16,
+            causal=True,
+            seed=99,
+            force_fused=True,
+            use_workspace=False,
+        ),
+        id="decode-paged-uniform-fp8-fuseq8-b32",
+    ),
     pytest.param(
         _attention_case(
             "sparse_decode",
@@ -744,6 +764,28 @@ CASES = [
         ),
         id="decode-paged-bf16-q8-gqa8-l2ef-batch8",
     ),
+    # Pair-ticket paged BF16 decode: 32 Q heads over 4 KV heads, eight query
+    # tokens per request and a page table of at most 49 pages (contexts up to
+    # 6223 tokens): the pair program on compute capability 10.0 and 10.3, the
+    # one-token program elsewhere, both against the same reference.
+    pytest.param(
+        _attention_case(
+            "sparse_decode",
+            q_dtype="bfloat16",
+            kv_dtype="bfloat16",
+            kv_layout="paged",
+            batch_size=16,
+            seqlen_q=8,
+            kv_lens=[6223] + [128 + (389 * i) % 5900 for i in range(15)],
+            num_q_heads=32,
+            num_kv_heads=4,
+            topk=16,
+            causal=True,
+            seed=101,
+            force_fused=True,
+        ),
+        id="decode-paged-bf16-q8-gqa8-qpair-batch16",
+    ),
     # Persistent K-major prefill route: paged GQA-16 above 64 pages, paged
     # GQA-8 at 64 pages (captured) and flat GQA-16 above 64 KV blocks, every
     # batch with a request below the long route's 8192-query threshold.
@@ -795,6 +837,58 @@ CASES = [
             seed=75,
         ),
         id="prefill-flat-bf16-gqa16-kmaj-persistent",
+    ),
+    # Fused one-launch persistent route: the short batches (seven query
+    # tokens on both targets, thirteen on compute capability 10.3 only; the
+    # thirteen-token batch takes the two launches on 10.0), captured once.
+    pytest.param(
+        _attention_case(
+            "sparse_prefill",
+            q_dtype="bfloat16",
+            kv_dtype="bfloat16",
+            kv_layout="paged",
+            q_lens=[7],
+            kv_lens=[20487],
+            num_q_heads=64,
+            num_kv_heads=4,
+            topk=16,
+            causal=True,
+            seed=77,
+            cuda_graph=True,
+        ),
+        id="prefill-paged-bf16-gqa16-kmaj-fused-q7-graph",
+    ),
+    pytest.param(
+        _attention_case(
+            "sparse_prefill",
+            q_dtype="bfloat16",
+            kv_dtype="bfloat16",
+            kv_layout="paged",
+            q_lens=[7],
+            kv_lens=[9000],
+            num_q_heads=16,
+            num_kv_heads=2,
+            topk=16,
+            causal=True,
+            seed=79,
+        ),
+        id="prefill-paged-bf16-gqa8-kmaj-fused-q7",
+    ),
+    pytest.param(
+        _attention_case(
+            "sparse_prefill",
+            q_dtype="bfloat16",
+            kv_dtype="bfloat16",
+            kv_layout="flat_varlen",
+            q_lens=[13],
+            kv_lens=[8320],
+            num_q_heads=16,
+            num_kv_heads=1,
+            topk=16,
+            causal=True,
+            seed=81,
+        ),
+        id="prefill-flat-bf16-gqa16-kmaj-fused-q13",
     ),
 ]
 

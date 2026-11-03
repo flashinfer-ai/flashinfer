@@ -76,7 +76,7 @@ multiple of 128 tokens, so a page table of ceil(longest context / 128) pages
 resolves the tier of the longest context; a page table wider than the longest
 context can resolve a slower tier.  An eager call without a workspace on
 compute capability 10.0 or 10.3 whose launch lies in the narrow box (32 Q
-heads over 4 KV heads, eight query tokens per request, at least 64 requests,
+heads over 4 KV heads, eight query tokens per request, at least 32 requests,
 context bound at most 2048 tokens) is served by the eight-token fused program
 instead
 (``_uniform_fp8_uses_fuseq8``).  CUDA graph capture, and
@@ -150,6 +150,42 @@ _DECODE_L2EF_TARGETS = ("sm100a", "sm103a")
 _DECODE_L2EF_ITEMS_FACTOR = (2, 1)
 _DECODE_L2EF_MIN_KV_LEN = 40960
 _DECODE_L2EF_MIN_PAGES = -(-_DECODE_L2EF_MIN_KV_LEN // _BLOCK_SIZE)
+# Pair-ticket decode: the pair form of the paged BF16 M16 decode program
+# (route ``decode_m16:bfloat16:bfloat16:paged:qpair``) gives one ticket two
+# query tokens of a request (tokens 2j and 2j + 1) over one KV head.  With
+# eight Q heads per KV head the one-token tile computes eight columns it never
+# stores; the second token fills them, and the ticket walks the union of the
+# two tokens' selected blocks once, in descending block order, each token
+# masked to exact -inf on the blocks it did not select.  Each token keeps its
+# block order but not the split of its blocks between the two softmax warp
+# groups (a reduction-order change); the tickets halve.  Measured on compute
+# capability 10.0 and 10.3 with 32 Q heads over 4 KV heads and eight query
+# tokens per request, it is faster up to a 6223-token context; on longer
+# contexts the two tokens share fewer blocks.  ``_use_decode_qpair`` takes it
+# per launch, the page-table width standing in for the longest context: 49
+# pages of 128 tokens.
+_DECODE_QPAIR_TARGETS = ("sm100a", "sm103a")
+_DECODE_QPAIR_SEQLEN_Q = 8
+_DECODE_QPAIR_NUM_Q_HEADS = 32
+_DECODE_QPAIR_NUM_KV_HEADS = 4
+_DECODE_QPAIR_MAX_KV_LEN = 6223
+_DECODE_QPAIR_MAX_PAGES = -(-_DECODE_QPAIR_MAX_KV_LEN // _BLOCK_SIZE)
+# One-launch persistent K-major prefill: the fused form of the persistent
+# producer and its combine (route ``kmaj_p_fused:<layout>:gqa<g>``) runs the
+# combine in the producer's softmax warps after a grid-wide rendezvous, on a
+# co-resident grid of min(work items, SMs) CTAs launched cooperatively.  The
+# output, ``lse`` and ``temperature_lse`` are bitwise those of the two-launch
+# route on the same partials.  Measured on compute capability 10.0 and 10.3,
+# it is faster on short batches, where the gap between the two launches is
+# most of the span; on longer batches the combine's own wider grid is faster.
+# ``_use_kmaj_p_fused`` takes it per call from the plan's work-item count and
+# the query-token count, with per-target bounds; the plan decides it before it
+# orders the work list (the count does not depend on the order), and a fused
+# batch keeps the Q-resident order.  Every completed launch leaves the two
+# grid-barrier words zero; the host zeroes them once.
+_KMAJ_P_FUSED_MAX_WORK_ITEMS = {"sm100a": 324, "sm103a": 660}
+_KMAJ_P_FUSED_QUERY_TOKENS = {"sm100a": (7, 7), "sm103a": (1, 13)}
+_KMAJ_P_FUSED_BARRIER_WORDS = 2
 
 
 def _union_persistent_grid(
@@ -426,7 +462,7 @@ _FUSEQ8_TARGETS = ("sm100a", "sm103a")
 _FUSEQ8_NUM_Q_HEADS = 32
 _FUSEQ8_NUM_KV_HEADS = 4
 _FUSEQ8_SEQLEN_Q = 8
-_FUSEQ8_MIN_BATCH = 64
+_FUSEQ8_MIN_BATCH = 32
 _FUSEQ8_KV_MAX = 2048
 
 
@@ -1402,11 +1438,67 @@ def _prefill_route(
 
 
 def _decode_route(
-    *, q_dtype: torch.dtype, k_dtype: torch.dtype, paged: bool, l2ef: bool = False
+    *,
+    q_dtype: torch.dtype,
+    k_dtype: torch.dtype,
+    paged: bool,
+    l2ef: bool = False,
+    qpair: bool = False,
 ) -> str:
+    if l2ef and qpair:
+        raise ValueError("a decode launch takes the l2ef or the qpair form, not both")
     layout = "paged" if paged else "flat"
-    form = ":l2ef" if l2ef else ""
+    form = ":l2ef" if l2ef else ":qpair" if qpair else ""
     return f"decode_m16:{_DTYPE_NAMES[q_dtype]}:{_DTYPE_NAMES[k_dtype]}:{layout}{form}"
+
+
+def _use_decode_qpair(
+    *,
+    target: BlackwellMSATarget,
+    paged: bool,
+    q_dtype: torch.dtype,
+    k_dtype: torch.dtype,
+    seqlen_q: int,
+    num_q_heads: int,
+    num_kv_heads: int,
+    max_pages: int,
+) -> bool:
+    """Whether one M16 decode launch takes the pair-ticket paged program.
+
+    Every clause is a pure function of the launch: a target of
+    ``_DECODE_QPAIR_TARGETS``, the paged BF16 Q / BF16 K-V program,
+    ``_DECODE_QPAIR_SEQLEN_Q`` query tokens per request over
+    ``_DECODE_QPAIR_NUM_Q_HEADS`` Q heads and ``_DECODE_QPAIR_NUM_KV_HEADS`` KV
+    heads, and a page table of at most ``_DECODE_QPAIR_MAX_PAGES`` pages.  An
+    input the predicate cannot judge is refused.
+    """
+    if max_pages < 0:
+        raise ValueError(f"max_pages must be non-negative, got {max_pages}")
+    return (
+        target in _DECODE_QPAIR_TARGETS
+        and bool(paged)
+        and q_dtype == torch.bfloat16
+        and k_dtype == torch.bfloat16
+        and int(seqlen_q) == _DECODE_QPAIR_SEQLEN_Q
+        and int(num_q_heads) == _DECODE_QPAIR_NUM_Q_HEADS
+        and int(num_kv_heads) == _DECODE_QPAIR_NUM_KV_HEADS
+        and 0 < max_pages <= _DECODE_QPAIR_MAX_PAGES
+    )
+
+
+def _decode_qpair_grid(
+    *, total_q: int, num_kv_heads: int, num_sms: int
+) -> tuple[int, int]:
+    """``(CTAs, max_task_claims)`` of a pair launch: ``total_q / 2 *
+    num_kv_heads`` tickets on at most one CTA per SM, each CTA claiming at most
+    ``max_task_claims + 1`` tickets."""
+    if total_q <= 0 or total_q % 2:
+        raise ValueError(
+            f"a pair launch needs a positive even token count, got {total_q}"
+        )
+    tasks = total_q // 2 * num_kv_heads
+    ctas = min(tasks, num_sms)
+    return ctas, (tasks + ctas - 1) // ctas - 1
 
 
 def _use_decode_l2ef(
@@ -1454,6 +1546,28 @@ def _long_prefill_route(*, paged: bool, group_size: int) -> str:
 def _kmaj_p_route(*, paged: bool, group_size: int) -> str:
     layout = "paged" if paged else "flat"
     return f"kmaj_p:{layout}:gqa{group_size}"
+
+
+def _kmaj_p_fused_route(*, paged: bool, group_size: int) -> str:
+    layout = "paged" if paged else "flat"
+    return f"kmaj_p_fused:{layout}:gqa{group_size}"
+
+
+def _use_kmaj_p_fused(
+    *, target: BlackwellMSATarget, work_count: int, total_q: int
+) -> bool:
+    """Whether a batch the persistent K-major route serves runs as the fused
+    one-launch program: at most the target's work items, and query tokens
+    within the target's bounds (mirror of the generator's
+    ``fuse1_short_admits``)."""
+
+    if work_count <= 0 or total_q <= 0:
+        raise ValueError("work_count and total_q must be positive")
+    max_work_items = _KMAJ_P_FUSED_MAX_WORK_ITEMS.get(target)
+    if max_work_items is None:
+        return False
+    low, high = _KMAJ_P_FUSED_QUERY_TOKENS[target]
+    return work_count <= max_work_items and low <= total_q <= high
 
 
 def _fp8_q1_schedule(
@@ -2659,9 +2773,125 @@ def _kmaj_p_assign_requests(work, *, row_base):
     return out
 
 
+def _kmaj_p_snake_positions(work_count: int, grid: int) -> list[list[int]]:
+    """The work-list positions of each CTA in its processing order under the
+    producer's static snake: ``work_count // grid`` full waves, the remaining
+    items on the first CTAs after an even wave count and on the last CTAs
+    after an odd one; the ``i``-th item of CTA ``bid`` is position
+    ``i * grid + bid`` for even ``i`` and ``i * grid + grid - 1 - bid`` for odd
+    ``i``."""
+
+    grid = max(1, int(grid))
+    waves, tail = divmod(int(work_count), grid)
+    positions = []
+    for bid in range(grid):
+        extra = bid < tail if waves % 2 == 0 else grid - 1 - bid < tail
+        lanes = (bid, grid - 1 - bid)
+        count = waves + int(extra)
+        positions.append([i * grid + lanes[i % 2] for i in range(count)])
+    return positions
+
+
+def _kmaj_p_snake_group_loads(work, *, num_sms: int) -> list[int]:
+    """The group count each CTA of the producer's grid (min(work items, SMs))
+    takes under the static snake."""
+
+    count = len(work)
+    grid = max(1, min(count, int(num_sms)))
+    return [
+        sum(int(work[pos][0]) for pos in positions)
+        for positions in _kmaj_p_snake_positions(count, grid)
+    ]
+
+
+def _kmaj_p_deal_fill(work, *, grid: int, n_bulk: int, projected: bool):
+    """Deal the fill items ``work[n_bulk:]`` largest first (stable) into the
+    fill slots of the snake, each CTA's positions past the bulk prefix in its
+    processing order: to the CTA with the smallest group load, or, with
+    ``projected``, the smallest load plus the item plus the smallest undealt
+    items its other remaining slots must still take.  Returns the dealt list
+    and its largest per-CTA group load."""
+
+    count = len(work)
+    out = list(work)
+    loads = [0] * grid
+    fill_slots: list[list[int]] = []
+    for bid, positions in enumerate(_kmaj_p_snake_positions(count, grid)):
+        slots = []
+        for pos in positions:
+            if pos < n_bulk:
+                loads[bid] += int(work[pos][0])
+            else:
+                slots.append(pos)
+        fill_slots.append(slots)
+    order = sorted(range(n_bulk, count), key=lambda index: -int(work[index][0]))
+    sizes = [int(work[index][0]) for index in order]
+    tail_sums = [0] * (len(sizes) + 1)
+    for index in range(len(sizes) - 1, -1, -1):
+        tail_sums[index] = tail_sums[index + 1] + sizes[index]
+    for dealt, index in enumerate(order):
+        size = sizes[dealt]
+        remaining = len(sizes) - dealt - 1
+        best_key, best_bid = None, -1
+        for bid in range(grid):
+            slots_left = len(fill_slots[bid])
+            if slots_left == 0:
+                continue
+            if projected:
+                forced = min(slots_left - 1, remaining)
+                tail = tail_sums[len(sizes) - forced] if forced else 0
+                key = (loads[bid] + size + tail, bid)
+            else:
+                key = (loads[bid], bid)
+            if best_key is None or key < best_key:
+                best_key, best_bid = key, bid
+        if best_bid < 0:
+            raise AssertionError("the work list has more fill items than slots")
+        out[fill_slots[best_bid].pop(0)] = work[index]
+        loads[best_bid] += size
+    if any(fill_slots):
+        raise AssertionError("the fill slots and the fill items do not match")
+    return out, max(loads)
+
+
+def _kmaj_p_order_work_lpt(work, *, num_sms: int, fill_groups: int):
+    """The Q-resident work list with its fill tail re-dealt for the
+    producer's static snake.  ``work`` is a bulk prefix of items of at least
+    ``fill_groups`` groups followed by the smaller fill items.  The bulk items
+    keep their positions; the fill items are dealt largest first into the
+    CTAs' remaining slots (:func:`_kmaj_p_deal_fill`, plain and projected),
+    and the deal with the smaller largest per-CTA group load is kept when it
+    is strictly below the input's, else the input order is.  The result is a
+    permutation of ``work`` (the same CSR, items and split slots), so every
+    partial row, and the combined output, is the same as under the input
+    order."""
+
+    count = len(work)
+    if count == 0:
+        return list(work)
+    grid = max(1, min(count, int(num_sms)))
+    fill_groups = int(fill_groups)
+    sizes = [int(group_count) for group_count, _entry in work]
+    n_bulk = sum(1 for size in sizes if size >= fill_groups)
+    if any(size < fill_groups for size in sizes[:n_bulk]):
+        raise ValueError("the bulk items must be the prefix of the work list")
+    if n_bulk == count:
+        return list(work)
+    best = list(work)
+    best_load = max(_kmaj_p_snake_group_loads(work, num_sms=num_sms))
+    for projected in (False, True):
+        dealt, load = _kmaj_p_deal_fill(
+            work, grid=grid, n_bulk=n_bulk, projected=projected
+        )
+        if load < best_load:
+            best, best_load = dealt, load
+    return best
+
+
 def _build_kmaj_p_plan(
     q2k_indices: torch.Tensor,
     *,
+    target: BlackwellMSATarget,
     q_lens: tuple[int, ...],
     k_lens: tuple[int, ...],
     paged: bool,
@@ -2678,9 +2908,13 @@ def _build_kmaj_p_plan(
     the request-local query index (the producer adds ``cu_seqlens_q[batch]``),
     and ``split_counts`` is the combine's ``[total_q, num_kv_heads]`` table over
     the batch.  The long route's binary decomposition, tail split and
-    Q-resident order run unchanged over the whole-batch rows;
-    :func:`_kmaj_p_assign_requests` then fills the ``batch`` / ``kv_block``
-    fields.  For one request the plan is the long route's.  Like
+    Q-resident order run unchanged over the whole-batch rows.  Whether the
+    batch runs as the fused program (``plan["fused"]``,
+    :func:`_use_kmaj_p_fused`) is decided on that list, whose length no order
+    changes; a fused batch keeps the Q-resident order, and every other batch
+    has the fill tail of its list re-dealt for the producer's static snake
+    (:func:`_kmaj_p_order_work_lpt`).  :func:`_kmaj_p_assign_requests` then
+    fills the ``batch`` / ``kv_block`` fields.  Like
     :func:`_build_long_prefill_plan` this reads the per-row counts to the host.
     """
 
@@ -2795,12 +3029,18 @@ def _build_kmaj_p_plan(
     first_tokens = _long_prefill_first_query_tokens(
         work, row_starts_host=row_starts_host, q_indices_by_head=q_indices_by_head
     )
+    fill_groups = min(_LONG_WORK_ORDER_FILL_GROUPS, work_group_cap)
     work = _long_prefill_order_work_q_resident(
         work,
         first_tokens,
         window=_LONG_WORK_ORDER_Q_WINDOW,
-        fill_groups=min(_LONG_WORK_ORDER_FILL_GROUPS, work_group_cap),
+        fill_groups=fill_groups,
     )
+    fused = _use_kmaj_p_fused(target=target, work_count=len(work), total_q=total_q)
+    if not fused:
+        work = _kmaj_p_order_work_lpt(
+            work, num_sms=int(num_sms), fill_groups=fill_groups
+        )
     work = _kmaj_p_assign_requests(work, row_base=row_base)
     metadata = torch.tensor(
         [entry for _group, entry in work], dtype=torch.int32, device=device
@@ -2813,11 +3053,13 @@ def _build_kmaj_p_plan(
         "work_count": len(work),
         "total_rows": total_rows,
         "nnz_per_head": nnz_per_head,
+        "fused": fused,
     }
 
 
 def _kmaj_p_state(
     *,
+    target: BlackwellMSATarget,
     workspace: Optional[MSASparseAttentionWorkspace],
     q2k_indices: torch.Tensor,
     lengths: _RequestLengths,
@@ -2848,6 +3090,7 @@ def _kmaj_p_state(
         max_pages,
         num_sms,
         group_size,
+        target,
     )
     if workspace is not None:
         state = workspace._kmaj_p
@@ -2870,6 +3113,7 @@ def _kmaj_p_state(
         rows = sum(lengths.q_lens)
         state["plan"] = _build_kmaj_p_plan(
             q2k_indices[:, :rows],
+            target=target,
             q_lens=lengths.q_lens,
             k_lens=lengths.k_lens,
             paged=paged,
@@ -2920,7 +3164,9 @@ def _run_kmaj_p_prefill(
     bound unsliced except for the prefix of rows ``cu_seqlens_q`` describes;
     ``cu_seqlens_q[0]`` and ``cu_seqlens_k[0]`` must be 0.  A paged ``cu_k`` of
     ``None`` binds the all-zero carrier as on the other prefill routes.  The
-    (producer, combine) pair records one warmed-launch signature.
+    (producer, combine) pair records one warmed-launch signature.  A batch
+    :func:`_use_kmaj_p_fused` admits runs instead as one cooperative launch of
+    the fused program on the producer's grid (:func:`_launch_kmaj_p_fused`).
     """
 
     total_q, num_q_heads, _ = (int(value) for value in q.shape)
@@ -2939,6 +3185,7 @@ def _run_kmaj_p_prefill(
     num_sms = _num_sms(q.device)
     state = _kmaj_p_state(
         workspace=workspace,
+        target=target,
         q2k_indices=q2k_indices,
         lengths=lengths,
         paged=paged,
@@ -3027,6 +3274,19 @@ def _run_kmaj_p_prefill(
         "return_softmax_lse": int(return_softmax_lse or return_temperature_lse),
         "return_temperature_lse": int(return_temperature_lse),
     }
+    if plan["fused"]:
+        _launch_kmaj_p_fused(
+            target=target,
+            route=_kmaj_p_fused_route(paged=paged, group_size=group_size),
+            grid=forward_grid,
+            forward=forward,
+            combine=combine,
+            pools=pools,
+            device=q.device,
+            workspace=workspace,
+            capturing=capturing,
+        )
+        return
     signature = _launch_signature(
         route=route,
         target=target,
@@ -3041,6 +3301,59 @@ def _run_kmaj_p_prefill(
     _check_warmed_launch(workspace, signature, capturing=capturing)
     forward_program.launch(forward_grid, **forward)
     combine_program.launch(combine_grid, **combine)
+    _record_successful_launch(workspace, signature, capturing=capturing)
+
+
+def _launch_kmaj_p_fused(
+    *,
+    target: BlackwellMSATarget,
+    route: str,
+    grid: tuple[int, int, int],
+    forward: dict[str, Any],
+    combine: dict[str, Any],
+    pools: dict,
+    device: torch.device,
+    workspace: Optional[MSASparseAttentionWorkspace],
+    capturing: bool,
+) -> None:
+    """One cooperative launch of the fused program on the producer's grid.
+
+    It takes the producer's arguments, then the combine's split counts and
+    outputs, the two grid-barrier words and ``return_softmax_lse``.  The words
+    live beside the partial pools; they are zeroed when allocated, and every
+    completed launch leaves them zero.
+    """
+
+    barrier = pools.get("grid_barrier")
+    if not (isinstance(barrier, torch.Tensor) and barrier.device == device):
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "the fused persistent K-major grid barrier must be warmed "
+                "before CUDA graph capture"
+            )
+        barrier = torch.zeros(
+            (_KMAJ_P_FUSED_BARRIER_WORDS,), dtype=torch.int32, device=device
+        ).view(torch.uint32)
+        pools["grid_barrier"] = barrier
+    arguments = {
+        **forward,
+        "split_counts": combine["split_counts"],
+        "out": combine["out"],
+        "lse": combine["lse"],
+        "temperature_lse": combine["temperature_lse"],
+        "grid_barrier": barrier,
+        "return_softmax_lse": combine["return_softmax_lse"],
+    }
+    program = _program(f"{route}:main", target)
+    signature = _launch_signature(
+        route=route,
+        target=target,
+        tensors=_signature_tensors(arguments),
+        scalars=_signature_scalars(arguments),
+        grid=grid,
+    )
+    _check_warmed_launch(workspace, signature, capturing=capturing)
+    program.launch(grid, **arguments)
     _record_successful_launch(workspace, signature, capturing=capturing)
 
 
@@ -3206,7 +3519,9 @@ def _run_decode_m16(
     workspace: Optional[MSASparseAttentionWorkspace],
     capturing: bool,
 ) -> None:
-    """The direct persistent M16 decode: one wave strides over (query, KV head) tickets."""
+    """The direct persistent M16 decode: one wave strides over (query, KV head)
+    tickets, or over (query pair, KV head) tickets on the pair route
+    (``_use_decode_qpair``)."""
 
     fp8 = k.dtype == torch.float8_e4m3fn
     total_q, num_q_heads, _ = (int(value) for value in q.shape)
@@ -3248,7 +3563,23 @@ def _run_decode_m16(
     )
     total_tasks = total_q * num_kv_heads
     num_sms = _num_sms(q.device)
-    physical_ctas = min(total_tasks, num_sms)
+    qpair = _use_decode_qpair(
+        target=target,
+        paged=paged,
+        q_dtype=q.dtype,
+        k_dtype=k.dtype,
+        seqlen_q=seqlen_q,
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+        max_pages=max_pages,
+    )
+    if qpair:
+        physical_ctas, max_task_claims = _decode_qpair_grid(
+            total_q=total_q, num_kv_heads=num_kv_heads, num_sms=num_sms
+        )
+    else:
+        physical_ctas = min(total_tasks, num_sms)
+        max_task_claims = (total_tasks + physical_ctas - 1) // physical_ctas - 1
     grid = (physical_ctas, 1, 1)
     arguments = {
         "Q": q,
@@ -3288,7 +3619,7 @@ def _run_decode_m16(
         "num_kv_heads": num_kv_heads,
         "max_kv_tiles": _TOPK,
         "max_splits": 1,
-        "max_task_claims": (total_tasks + physical_ctas - 1) // physical_ctas - 1,
+        "max_task_claims": max_task_claims,
         "softmax_scale_log2": softmax_scale_log2,
         "k_global_scale": 1.0,
         "v_global_scale": 1.0,
@@ -3299,19 +3630,17 @@ def _run_decode_m16(
         "msa_max_pages": max_pages,
         "msa_split_policy": _SPLIT_ADAPTIVE,
     }
-    route = _decode_route(
+    l2ef = not qpair and _use_decode_l2ef(
+        target=target,
+        paged=paged,
         q_dtype=q.dtype,
         k_dtype=k.dtype,
-        paged=paged,
-        l2ef=_use_decode_l2ef(
-            target=target,
-            paged=paged,
-            q_dtype=q.dtype,
-            k_dtype=k.dtype,
-            items=total_tasks,
-            num_sms=num_sms,
-            max_pages=max_pages,
-        ),
+        items=total_tasks,
+        num_sms=num_sms,
+        max_pages=max_pages,
+    )
+    route = _decode_route(
+        q_dtype=q.dtype, k_dtype=k.dtype, paged=paged, l2ef=l2ef, qpair=qpair
     )
     _launch_route(
         route,
