@@ -139,9 +139,9 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
     }
 
     __syncwarp();
+
     asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
     asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
-
     // TMEM alloc (512 columns, 512 used)
     volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 144);
     if (warp == 1) {
