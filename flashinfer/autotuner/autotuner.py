@@ -939,11 +939,6 @@ def autotune(
             automatically.  Must contain **at least one** value when provided;
             pass ``None`` (or omit) to inherit the current buckets.
 
-            The buckets choose which sizes are profiled.  Cache keys are
-            still built by each op's own ``map_to_tuning_buckets``, so tuning
-            and inference map a runtime size to the same bucket even when the
-            largest bucket is not one the op's mapper produces.
-
             **Selecting buckets** -- more buckets give finer-grained profiling
             (better peak performance) at the cost of longer tuning time; fewer
             buckets make tuning faster but coarser.  When the set of possible
@@ -953,9 +948,9 @@ def autotune(
             workload: for latency-sensitive inference, add more small sizes;
             for throughput-oriented serving, cover the larger range.
 
-        round_up: Controls how runtime sizes map to profiled buckets when
-            ``tuning_buckets`` is not given.  It has no effect together with
-            ``tuning_buckets``, because the op's own mapper is used then.
+        round_up: Controls how runtime sizes map to profiled buckets.
+            Ignored when ``tuning_buckets`` is given (each op's own mapper
+            is used then).
 
             * ``None`` (default) -- inherit from enclosing ``autotune()``
               context, or ``False`` if there is none.
@@ -1004,8 +999,8 @@ def autotune(
     out during profiling (``get_valid_tactics``).  If a tactic still fails at
     runtime the error is caught, a warning is logged, and that tactic is
     skipped.  At inference time, ``map_to_tuning_buckets`` maps the runtime
-    size to its tuning bucket, so an unsupported raw size never reaches the
-    kernel directly.
+    size to the nearest profiled bucket, so an unsupported raw size never
+    reaches the kernel directly.
 
     **Round-up beyond the largest bucket** -- When ``round_up=True`` is used
     without ``tuning_buckets`` and the runtime size exceeds every bucket, the
@@ -1015,8 +1010,6 @@ def autotune(
     **Nested / sequential contexts** -- Overrides are managed on a per-thread
     stack.  A nested ``autotune()`` pushes its overrides; on exit the outer
     context's values are restored.  Sequential contexts are fully independent.
-    With ``tuning_buckets``, cache keys come from each op's own mapper, so
-    bucket lists whose sizes map to the same op bucket share one entry.
 
     **Using both parameters together** -- ``round_up`` has no effect.  Each
     op's own mapper decides which bucket a runtime size uses, and a size whose
@@ -2161,8 +2154,7 @@ class AutoTuner:
         """Return the currently effective ``map_to_tuning_buckets`` callable.
 
         Reflects any active ``autotune(tuning_buckets=..., round_up=...)``
-        overrides on the current thread.  With ``tuning_buckets`` this is the
-        op's own mapper.  When no override is active,
+        overrides on the current thread.  When no override is active,
         returns
         ``tuning_config.dynamic_tensor_specs[spec_idx].map_to_tuning_buckets``
         unchanged.
