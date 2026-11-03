@@ -328,6 +328,11 @@ def _run_internode(
     )
     try:
         for launch, n in enumerate(token_counts):
+            # The last launch changes the gate/up clamp: the session recompiles
+            # on the same GIN arena, whose flags and NVLink phase keep counting.
+            clamp = (
+                gate_up_clamp * 2 if launch == len(token_counts) - 1 else gate_up_clamp
+            )
             hs, tw, ti = _make_inputs(
                 rank + 1000 * launch,
                 world,
@@ -359,7 +364,7 @@ def _run_internode(
                 transformed_l2,
                 symm,
                 num_tokens=n,
-                gate_up_clamp=gate_up_clamp,
+                gate_up_clamp=clamp,
                 fast_math=True,
             )
             _wait_with_stamps(dbg, rank, launch)
@@ -392,8 +397,10 @@ def _run_internode(
             failure = None
             if diff != 0:
                 failure = f"rank {rank} launch {launch}: {diff} mismatching elements"
-            if launch == 0:
-                problem = dict(base_problem, topk_ids=ti, topk_weights=tw)
+            if launch == 0 or clamp != gate_up_clamp:
+                problem = dict(
+                    base_problem, topk_ids=ti, topk_weights=tw, gate_up_clamp=clamp
+                )
                 y_ref = _oracle_reference(
                     rank,
                     problem,
@@ -404,7 +411,11 @@ def _run_internode(
                 )
                 yk = y.float()
                 rel = ((yk - y_ref).norm() / y_ref.norm().clamp_min(1e-6)).item()
-                print(f"[internode rank {rank}] oracle rel_l2={rel:.4g}", flush=True)
+                print(
+                    f"[internode rank {rank} launch {launch}] oracle "
+                    f"(clamp {clamp}) rel_l2={rel:.4g}",
+                    flush=True,
+                )
                 # The fast-math FP8 scales flip a few FC1-output roundings
                 # against the oracle (2048 tokens: max |d| 0.018 on one rank,
                 # the same before the two-phase return); the band of the

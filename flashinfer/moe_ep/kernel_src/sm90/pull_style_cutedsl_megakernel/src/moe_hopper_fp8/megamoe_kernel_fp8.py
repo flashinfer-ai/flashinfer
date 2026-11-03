@@ -813,12 +813,15 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
                 (1,),
                 16,
             ),
-            # Persistent launch counter (internode payload flags compare
-            # against it); outside the reset prefix like the NVLink phase.
+            # Persistent internode counters, outside the reset prefix like the
+            # NVLink phase: [0] launches (the payload flags compare against
+            # it), [1] early-return phases run (gin_seg1_flag rounds).  The
+            # shim carries both, with the NVLink phase, across a recompile
+            # (the flags live in the session's GIN arena).
             _RegionSpec(
                 "gin_epoch",
                 cutlass.Int32,
-                (1,),
+                (2,),
                 16,
             ),
             _RegionSpec(
@@ -986,11 +989,12 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
                 # Monotonic per-launch flags: payload of slot s landed here
                 # (read by this node's owners).  Never reset.
                 _RegionSpec("gin_payload_flag", cutlass.Int32, (slots,), 16),
+                # Early return: +1 per node rank and phase whose segments are
+                # stored (monotonic, never reset).  Allocated with or without
+                # the early return so the arena layout of a session does not
+                # depend on the compiled layout.
+                _RegionSpec("gin_seg1_flag", cutlass.Int32, (1,), 16),
             ]
-            if self.token_comm.early_return:
-                # Early return: +1 per node rank whose earlier segments are
-                # stored (monotonic, never reset).
-                specs.append(_RegionSpec("gin_seg1_flag", cutlass.Int32, (1,), 16))
             specs += [
                 # Stage 1 landing planes (RDMA destination, then LSA source).
                 _RegionSpec(

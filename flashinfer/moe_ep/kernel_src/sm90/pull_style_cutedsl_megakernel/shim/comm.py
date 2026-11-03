@@ -197,6 +197,45 @@ class _CompiledMega:
     launch_exe: Optional[tuple] = None
 
 
+# Local-workspace counters that pair with persistent shared state: the NVLink
+# barrier phase (the sense-reversing signal) and, on the internode path,
+# ``gin_epoch`` (launch / early-return-phase counts the never-reset GIN flags
+# of the node peers compare against).
+_PERSISTENT_LOCAL_REGIONS = ("nvlink_barrier_counter", "gin_epoch")
+
+
+def save_persistent_local_counters(mega: _CompiledMega) -> dict:
+    """Device copies of the persistent local counters of ``mega``.
+
+    For a recompile that keeps the shared workspace (internode: the session's
+    GIN arena), whose flags and NVLink phase keep counting.  Stream-ordered
+    after the launches already queued.
+    """
+    kernel = mega.kernel
+    saved = {}
+    for name in _PERSISTENT_LOCAL_REGIONS:
+        if name in kernel._local_offsets:
+            off = int(kernel._local_offsets[name])
+            nbytes = int(kernel._local_region_by_name[name].nbytes)
+            saved[name] = mega.local_workspace[off : off + nbytes].clone()
+    return saved
+
+
+def restore_persistent_local_counters(kernel, local_workspace, saved: dict) -> None:
+    """Write counters saved by ``save_persistent_local_counters`` into a new
+    local workspace (by region name; the layout may differ)."""
+    for name, data in saved.items():
+        if name in kernel._local_offsets:
+            off = int(kernel._local_offsets[name])
+            nbytes = int(kernel._local_region_by_name[name].nbytes)
+            if nbytes != data.numel():
+                raise RuntimeError(
+                    f"persistent counter {name!r} changed size across a recompile "
+                    f"({data.numel()} -> {nbytes} bytes)."
+                )
+            local_workspace[off : off + nbytes].copy_(data)
+
+
 def _zero_local_workspace_preserving_phase(mega: _CompiledMega) -> None:
     """Zero the local workspace except the persistent cross-launch counters.
 
@@ -206,7 +245,7 @@ def _zero_local_workspace_preserving_phase(mega: _CompiledMega) -> None:
     """
     kernel = mega.kernel
     keep = []
-    for name in ("nvlink_barrier_counter", "gin_epoch"):
+    for name in _PERSISTENT_LOCAL_REGIONS:
         if name in kernel._local_offsets:
             off = int(kernel._local_offsets[name])
             keep.append((off, off + int(kernel._local_region_by_name[name].nbytes)))

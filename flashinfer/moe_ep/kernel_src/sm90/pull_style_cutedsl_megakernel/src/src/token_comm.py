@@ -1885,6 +1885,12 @@ class TokenInPullTokenBackPush:
                     stg_b32_raw(peer_addr, token_topk_word)
             cute.arch.sync_warp()
             t += grid_token_stride
+        # The next call (another proxied origin) re-zeroes the SMEM cursors:
+        # every dispatch warp is done with them first.
+        cute.arch.barrier(
+            barrier_id=self.dispatch_intra_cta_bar_id,
+            number_of_threads=self.active_dispatch_threads,
+        )
 
     # ------------------------------------------------------------------
     # Internode dispatch (rail proxy): Stage 1 puts, count exchange, barrier
@@ -4126,16 +4132,21 @@ class TokenInPullTokenBackPush:
            skips a level counts in every phase it passed), then bumps the
            ``gin_seg1_flag`` of every node rank
            (system-scope release); every CTA waits for its rank's flag to
-           reach ``ranks_per_node * (epoch * ret_phases + p + 1)``
-           (monotonic, never reset).
+           reach ``ranks_per_node * (rounds + p + 1)``, ``rounds`` being the
+           phases of all earlier early-return launches (``gin_epoch[1]``;
+           the flag is monotonic, never reset).
         2. CTAs 1.. reduce the phase's node partials chunk by chunk
            (``_gin_early_reduce``).
         3. CTA 0 posts each chunk's return put once the grid has reduced it.
         """
         args = token_comm_args
         iket_er = cta_linear_id < Int32(3)
-        epoch = Int32(
-            cute.arch.load(args.gin_epoch.iterator, Int32, sem="relaxed", scope="gpu")
+        # Early-return phases run by earlier launches (gin_epoch[1]): every
+        # node rank bumped this rank's flag once per phase of each.
+        phase_rounds = Int32(
+            cute.arch.load(
+                args.gin_epoch.iterator + 1, Int32, sem="relaxed", scope="gpu"
+            )
         )
         mbar_parity = Int32(0)
         stage = Int32(0)
@@ -4166,9 +4177,9 @@ class TokenInPullTokenBackPush:
                         red_add_release_sys_s32_raw(flag_addr, Int32(1))
                 cute.arch.sync_warp()
             if lane_idx == Int32(0):
-                flag_target = (
-                    epoch * Int32(self.ret_phases) + Int32(phase + 1)
-                ) * Int32(self.ranks_per_node)
+                flag_target = (phase_rounds + Int32(phase + 1)) * Int32(
+                    self.ranks_per_node
+                )
                 # Wrap-safe: the flag and the epoch wrap modulo 2^32.
                 while Int32(
                     cute.arch.load(
@@ -4622,3 +4633,10 @@ class TokenInPullTokenBackPush:
                             token_comm_args.gin_epoch.iterator, Int32(1),
                             sem="relaxed", scope="gpu",
                         )
+                        if cutlass.const_expr(self.early_return):
+                            # This launch's gin_seg1_flag rounds.
+                            cute.arch.atomic_add(
+                                token_comm_args.gin_epoch.iterator + 1,
+                                Int32(self.ret_phases),
+                                sem="relaxed", scope="gpu",
+                            )

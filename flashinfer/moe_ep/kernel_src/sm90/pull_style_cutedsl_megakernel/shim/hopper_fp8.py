@@ -44,6 +44,8 @@ from .comm import (
     free_sym_tensor,
     reset_compiled_mega_workspaces,
     resolve_gate_up_clamp,
+    restore_persistent_local_counters,
+    save_persistent_local_counters,
     sym_zeros,
 )
 
@@ -556,6 +558,10 @@ class MegaMoEHopperFp8Frontend:
         # slice carved from it (set by get_symm_buffer_for_hopper_fp8_mega_moe).
         self._gin_arena: Optional[Any] = None
         self._gin_shared_workspace: Optional[torch.Tensor] = None
+        # Internode: the persistent local counters of the last released
+        # compile (the arena's flags and NVLink phase keep counting across a
+        # recompile, so the next local workspace must continue from them).
+        self._gin_persistent_counters: dict = {}
 
     @property
     def config(self) -> MegaMoEHopperFp8Config:
@@ -952,6 +958,12 @@ class MegaMoEHopperFp8Frontend:
             dtype=torch.uint8,
             device="cuda",
         )
+        if c.enable_nccl_gin and self._gin_persistent_counters:
+            # A recompile on the same arena: continue the launch / phase
+            # counts its never-reset flags and the NVLink phase expect.
+            restore_persistent_local_counters(
+                kernel, local_workspace, self._gin_persistent_counters
+            )
         if c.enable_nccl_gin:
             # Internode: the shared workspace is a slice of the session's
             # registered NCCL arena (pre-sized at symm-buffer creation; the
@@ -1035,6 +1047,12 @@ class MegaMoEHopperFp8Frontend:
             # Internode: the shared workspace belongs to the GIN arena.
             if not self._config.enable_nccl_gin:
                 free_sym_tensor(self._mega.shared_workspace)
+            else:
+                # The arena outlives this compile: keep the counters its flags
+                # are compared against for the next local workspace.
+                self._gin_persistent_counters = save_persistent_local_counters(
+                    self._mega
+                )
         # The cache entry dies with the workspace: if a recompile fails after
         # the free, a stale (_mega, _mega_key) hit would launch against freed
         # symmetric memory.

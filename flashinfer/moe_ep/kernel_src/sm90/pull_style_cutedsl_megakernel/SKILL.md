@@ -222,6 +222,13 @@ not picked them up):
   `gin_seg1_done` 16-bit count per phase, phase-major return rows read by
   `InternodeTopkReduce`), plus `sched_seg0_fc1_experts` (2/3 of the experts'
   local FC1 ahead of the remote blocks).  Not in the drop tree.
+- Internode recompile (2026-11-03): the GIN arena keeps its never-reset
+  flags and the NVLink barrier phase across an in-session recompile
+  (`apply_knobs`, a `gate_up_clamp` change) while the local workspace starts
+  from zero, so the shim carries `nvlink_barrier_counter` and `gin_epoch`
+  ([0] launches, [1] early-return phases, the `gin_seg1_flag` rounds) over
+  (`shim/comm.py` `save_` / `restore_persistent_local_counters`);
+  `gin_seg1_flag` is allocated with or without the early return.
 
 ## Layout
 
