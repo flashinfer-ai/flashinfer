@@ -370,16 +370,20 @@ K1_RULE_MIN_SM_COUNT: dict[tuple[str, int, int, int, str], int] = {
 #: come from a re-measurement at 16172, 16231 and 16384 tokens against those plans (the protocol is in the sm_107a K1
 #: token table of the README): a measured token count is an entry where the row's program failed the rule above in some
 #: run, or left the backward pass or the checkpointed step more than 1.3 % slower than the deterministic program (ratio
-#: of the medians over the runs, or median of the paired ratios, in eager launches or in graph replays).  In addition,
-#: the sm_107a FP32 rows ``4096 -> 512``, ``4096 -> 1024``, ``5120 -> 512`` and ``5120 -> 1024`` run the deterministic
-#: program from 40961 tokens up on parts of 216 SMs or more: their one-split program adds the whole token reduction of
-#: an output in one chain, and its FP64 error grows about linearly with the token count until it misses the
-#: deterministic package's FP32 error budget (relative Frobenius error 5e-5).  Measured with the 216-SM rules on a
-#: 212-SM R200 part (the same program and accumulation order as on 216 SMs; the error does not depend on the SM count)
-#: against an FP64 reference, 5 seeds, at 32768, 36864, 40960, 45056, 49152, 57344, 65536 and 131072 tokens: within the
-#: budget on every seed up to 40960 tokens and above it on every seed from 45056 tokens up (7.6e-5 at 65536 tokens,
-#: where the deterministic program's is 3.8e-5).  The range has no upper bound: the error keeps growing with the token
-#: count.  The token counts between 40960 and 45056 run the deterministic program too (not measured).
+#: of the medians over the runs, or median of the paired ratios, in eager launches or in graph replays).  The open-ended
+#: sm_107a entries come from neither rule: on parts of at least 216 SMs the FP32 rows ``4096 -> 512``, ``4096 -> 1024``,
+#: ``5120 -> 512`` and ``5120 -> 1024`` run the deterministic program from 40961 tokens up because their one-split
+#: program's FP64 relative Frobenius error exceeds the deterministic package's FP32 error budget (5e-5) on every seed
+#: there.  That program adds the whole token reduction of an output in one chain, and its error grows about linearly
+#: with the token count.  Measured with the 216-SM plan on 212-SM R200 parts (the same program and accumulation order as
+#: on 216 SMs; the error does not depend on the SM count) against an FP64 reference, each row on two parts, 5 seeds, at
+#: 32768, 36864, 40960, 45056, 49152, 57344, 65536 and 131072 tokens: within the budget on every seed up to 40960 tokens
+#: and above it on every seed from 45056 tokens up (7.6e-5 at 65536 tokens, where the deterministic program's is
+#: 3.8e-5).  The range has no upper bound: the error keeps growing with the token count.  The token counts between 40960
+#: and 45056 run the deterministic program too (not measured).  The deterministic program is slower there: at 65536
+#: tokens on a 212-SM part it takes 1.81, 1.05, 1.72 and 1.02 times the one-split program's time for these rows in that
+#: order (CUDA graph replays) and leaves the backward pass or the checkpointed step up to 51.7, 4.8, 41.5 and 3.9 %
+#: slower.
 # fmt: off
 K1_SPLIT_RULE_EXCLUDED_TOKENS: dict[
     tuple[str, int, int, int, str], tuple[tuple[int, int, Optional[int]], ...]

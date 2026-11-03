@@ -191,14 +191,18 @@ the 256-wide tiles and the deterministic plan: faster than both at 16172 and 163
 the deterministic package's 16231-token plan, which that token count keeps.  The 216-SM entry of `5120 -> 1024` BF16
 (16231 tokens) is not a token count of those rules: the deterministic plan there is the row's plan at every token count,
 and the row's program left the backward pass 1.5 % slower in eager launches (ratio of the medians over the runs).
-Marked §: the FP32 error budget of the deterministic package (relative Frobenius error at most 5e-5 against an FP64
-reference).  The one-split program of these rows adds the whole token reduction of an output in one chain, and its error
-grows about linearly with the token count.  Measured with the 216-SM rules on a 212-SM R200 part (the same program and
-accumulation order as on 216 SMs; the error does not depend on the SM count), 5 seeds, at 32768, 36864, 40960, 45056,
-49152, 57344, 65536 and 131072 tokens: within the budget on every seed up to 40960 tokens, above it on every seed from
-45056 tokens up (7.6e-5 at 65536 tokens and 1.5e-4 at 131072; the deterministic program: 3.8e-5 and 7.6e-5).  The token
-counts between 40960 and 45056 run the deterministic program too (not measured), and the range has no upper bound: the
-error keeps growing with the token count.*
+Marked §: entries of their own, not from the rules above.  On parts of at least 216 SMs these FP32 rows run the
+deterministic program from 40961 tokens up because their one-split program's FP64 relative Frobenius error exceeds the
+deterministic package's FP32 error budget (5e-5) on every seed there.  That program adds the whole token reduction of an
+output in one chain, and its error grows about linearly with the token count.  Measured with the 216-SM plan on 212-SM
+R200 parts (the same program and accumulation order as on 216 SMs; the error does not depend on the SM count) against an
+FP64 reference, each row on two parts, 5 seeds, at 32768, 36864, 40960, 45056, 49152, 57344, 65536 and 131072 tokens:
+within the budget on every seed up to 40960 tokens, above it on every seed from 45056 tokens up (7.6e-5 at 65536 tokens
+and 1.5e-4 at 131072; the deterministic program: 3.8e-5 and 7.6e-5).  The token counts between 40960 and 45056 run the
+deterministic program too (not measured), and the range has no upper bound: the error keeps growing with the token
+count.  The deterministic program is slower there: at 65536 tokens on a 212-SM part it takes 1.81 (`4096 -> 512`), 1.05
+(`4096 -> 1024`), 1.72 (`5120 -> 512`) and 1.02 (`5120 -> 1024`) times the one-split program's time (CUDA graph replays)
+and leaves the backward pass or the checkpointed step up to 51.7, 4.8, 41.5 and 3.9 % slower.*
 
 `"waves"` (`router_waves`) launches whole waves of the device's CTA pairs (`pairs = sm_count // 2`): `c * pairs`
 units with `c = max(2, round(tiles * k_iters / (68 * pairs))) + 1`, and only where the deterministic plan's six
