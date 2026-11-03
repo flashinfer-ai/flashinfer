@@ -1221,8 +1221,9 @@ def swap_small_m(L: int, M: int, N: int, transposed_out: bool) -> bool:
 
 # fmt: off
 # Per-architecture, per-row knob overrides measured in Cake round 2, keyed by the static row identity
-# (arch, A MN-major, B MN-major, fp32 output, transposed output, batched, N, K, M); the ragged token
-# count never keys a rule (M = None for forward / input gradients, K = None for weight gradients).
+# (arch, A MN-major, B MN-major, fp32 output, transposed output, batched, N, K, M); a ragged rule leaves the
+# token count out (M = None for forward / input gradients, K = None for weight gradients), and an exact key names
+# one token count (the 216-SM tranche's sm_107a T-exact weight-gradient rules at K = 16231 and 16384).
 # The round-2 to round-33 rules mirror the former launcher's row table; the shapes tranche below them (sm_100a and
 # sm_103a) was measured with this package's planner and extends it per architecture (three round-33 sm_100a keys were
 # re-measured and re-valued there).  An architecture-wide default (``ARCH_RULE_DEFAULTS``, round 33) sits under every rule
@@ -1391,6 +1392,44 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_107a', False, True, False, False, False, 4096, 1024, None): {"epi": 'reg', "pro": 15},
     ('sm_107a', False, True, False, False, False, 5120, 512, None): {"epi": 'tma', "slots": 1, "pro": 15, "pd": 2, "lw": True, "promo": 'l2_256b'},
     ('sm_107a', False, True, False, False, False, 5120, 1024, None): {"epi": 'reg', "pro": 15},
+    # ---- sm_107a: the 216-SM tranche - rules measured on sm_107a (216 SMs) against the plan the row had without them, every
+    #      planned output bitwise equal to that plan's; the T-exact weight-gradient keys (K = 16231 or 16384 tokens) apply at
+    #      that token count only, and each names the orientation the row plans without it (the orientation reads the
+    #      ragged keys alone) ----
+    ('sm_107a', False, True, True, False, False, 4096, 32, None): {"block_n": 128, "cta_rows": 128, "epi": 'tma', "slots": 1, "cta1": True},
+    ('sm_107a', False, False, False, False, False, 32, 4096, None): {"block_n": 128, "cta_rows": 128, "hints": ('evict_first', 'none'), "pro": 15},
+    ('sm_107a', False, True, True, False, False, 4096, 48, None): {"block_n": 128, "cta_rows": 128, "epi": 'tma', "slots": 1, "cta1": True},
+    ('sm_107a', False, False, False, False, False, 48, 4096, None): {"block_n": 128, "cta_rows": 128, "hints": ('evict_first', 'none'), "pro": 15},
+    ('sm_107a', False, True, True, False, False, 4096, 64, None): {"block_n": 128, "cta_rows": 128, "epi": 'tma', "slots": 1, "cta1": True},
+    ('sm_107a', False, False, False, False, False, 64, 4096, None): {"block_n": 128, "cta_rows": 128, "hints": ('evict_first', 'none'), "pro": 15},
+    ('sm_107a', False, True, True, False, False, 4096, 128, None): {"block_n": 128, "cta_rows": 128, "epi": 'tma', "slots": 1, "cta1": True},
+    ('sm_107a', False, False, False, False, False, 128, 4096, None): {"block_n": 128, "cta_rows": 128, "hints": ('evict_first', 'none'), "pro": 15},
+    ('sm_107a', True, True, False, False, False, 4096, None, 4096): {"block_n": 160, "cta_rows": 256, "b_swz": 64, "pro": 15},
+    ('sm_107a', True, True, True, False, False, 4096, None, 4096): {"block_n": 160, "cta_rows": 256, "b_swz": 64, "f32_v8": True, "store_ef": True, "pro": 15},
+    ('sm_107a', False, True, True, False, False, 5120, 32, None): {"block_n": 128, "cta_rows": 128, "epi": 'tma', "slots": 1, "cta1": True},
+    ('sm_107a', False, True, True, False, False, 5120, 48, None): {"block_n": 128, "cta_rows": 128, "epi": 'tma', "slots": 1, "cta1": True},
+    ('sm_107a', False, True, True, False, False, 5120, 64, None): {"block_n": 128, "cta_rows": 128, "epi": 'tma', "slots": 1, "cta1": True},
+    ('sm_107a', False, True, True, False, False, 5120, 128, None): {"block_n": 128, "cta_rows": 128, "epi": 'tma', "slots": 1, "cta1": True},
+    ('sm_107a', False, False, False, False, False, 128, 5120, None): {"block_n": 128, "cta_rows": 128, "hints": ('evict_first', 'none'), "pro": 15},
+    ('sm_107a', True, True, True, False, False, 5120, None, 5120): {"block_n": 256, "cta_rows": 128, "f32_v8": True, "pro": 15, "hints": ('none', 'none'), "epi": 'reg', "b_swz": 128, "pd": 0, "pf": 0},
+    ('sm_107a', False, True, True, False, False, 8192, 128, None): {"block_n": 128, "cta_rows": 128, "epi": 'tma', "slots": 1, "cta1": True},
+    ('sm_107a', True, True, True, True, False, 32, 16231, 4096): {"block_n": 128, "cta_rows": 64, "hints": ('evict_first', 'none'), "pro": 15},
+    ('sm_107a', True, True, True, True, False, 48, 16231, 4096): {"block_n": 128, "cta_rows": 64, "hints": ('evict_first', 'none'), "pro": 15},
+    ('sm_107a', True, True, True, True, False, 64, 16231, 4096): {"block_n": 128, "cta_rows": 64, "hints": ('evict_first', 'none'), "pro": 15},
+    ('sm_107a', True, True, True, False, False, 4096, 16231, 512): {"block_n": 192, "cta_rows": 128, "b_swz": 64, "hints": ('none', 'evict_first'), "f32_v8": True, "store_ef": True, "sk_sync": True, "sk_slab": 2, "pro": 15, "epi": 'reg', "pd": 0, "pf": 0},
+    ('sm_107a', True, True, True, False, False, 4096, 16231, 1024): {"block_n": 160, "cta_rows": 256, "b_swz": 64, "f32_v8": True, "store_ef": True, "pro": 15},
+    ('sm_107a', True, True, True, True, False, 32, 16231, 5120): {"block_n": 128, "cta_rows": 64, "hints": ('evict_first', 'none'), "pro": 15},
+    ('sm_107a', True, True, True, True, False, 48, 16231, 5120): {"block_n": 128, "cta_rows": 64, "hints": ('evict_first', 'none'), "pro": 15},
+    ('sm_107a', True, True, True, True, False, 64, 16231, 5120): {"block_n": 128, "cta_rows": 64, "hints": ('evict_first', 'none'), "pro": 15},
+    ('sm_107a', True, True, True, False, False, 5120, 16231, 512): {"block_n": 224, "cta_rows": 128, "f32_v8": True, "store_ef": True, "pro": 15},
+    ('sm_107a', True, True, True, True, False, 32, 16384, 4096): {"block_n": 128, "cta_rows": 64, "hints": ('evict_first', 'none'), "pro": 15},
+    ('sm_107a', True, True, True, True, False, 48, 16384, 4096): {"block_n": 128, "cta_rows": 64, "hints": ('evict_first', 'none'), "pro": 15},
+    ('sm_107a', True, True, True, True, False, 64, 16384, 4096): {"block_n": 128, "cta_rows": 64, "hints": ('evict_first', 'none'), "pro": 15},
+    ('sm_107a', True, True, True, False, False, 4096, 16384, 512): {"block_n": 192, "cta_rows": 128, "b_swz": 64, "hints": ('none', 'evict_first'), "f32_v8": True, "store_ef": True, "sk_sync": True, "sk_slab": 2, "pro": 15, "epi": 'reg', "pd": 0, "pf": 0},
+    ('sm_107a', True, True, True, True, False, 32, 16384, 5120): {"block_n": 128, "cta_rows": 64, "hints": ('evict_first', 'none'), "pro": 15},
+    ('sm_107a', True, True, True, True, False, 48, 16384, 5120): {"block_n": 128, "cta_rows": 64, "hints": ('evict_first', 'none'), "pro": 15},
+    ('sm_107a', True, True, True, True, False, 64, 16384, 5120): {"block_n": 128, "cta_rows": 64, "hints": ('evict_first', 'none'), "pro": 15},
+    ('sm_107a', True, True, True, False, False, 5120, 16384, 512): {"block_n": 224, "cta_rows": 128, "f32_v8": True, "store_ef": True, "pro": 15},
     # ---- sm_100a: the shapes tranche - forward / input gradient / weight gradient rows at K 4096 - 17408 and N 32 - 17408,
     #      measured with this package's planner against cuBLAS on GB200 at T 16172 - 16384 (see the test table
     #      MEASURED_SHAPE_ROWS); a row whose measured choice equals the planner's default carries no rule ----

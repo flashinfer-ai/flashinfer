@@ -57,8 +57,12 @@ forward path.
 The JIT loader builds one module per admitted architecture that is also a
 FlashInfer build target (`FLASHINFER_CUDA_ARCH_LIST` or the visible devices):
 `sm_100a`, `sm_103a` and `sm_107a`. The `sm_107a` target needs CUDA 13.4 or
-newer. The manifest lists the sources and launch facts; it does not re-verify
-digests at import time.
+newer. The fused kernel runs a static schedule on a cooperative grid of
+two-CTA clusters, one CTA per SM: 72 clusters (144 CTAs), except on SM107,
+where the CUDA module defines `CAKE_MEGAMOE_GRID_CLUSTERS=104` and the CuTe-DSL
+programs run the same 104-cluster schedule (208 CTAs). Both backends refuse a
+device with fewer SMs than their grid has CTAs. The manifest lists the sources
+and launch facts; it does not re-verify digests at import time.
 
 ## Supported contract
 
@@ -77,12 +81,12 @@ created) leaves route terms unwritten and hangs the forward on all ranks.
 
 End-to-end EP16 correctness and performance were measured for both backends on
 16 GB300 GPUs (SM103) and on 16 R200 GPUs (SM107, four nodes of one NVL72
-domain). Both backends return bitwise-identical outputs there; the CuTe-DSL
-forward takes about 5% to 7% longer than the CUDA forward at 16 to 64 tokens per
-rank. The SM100 target is admitted from the same source: the device text has no
-architecture-dependent code and uses only instructions shared by all three
-targets; it is compile-proven on B200, and the 16-rank test has not been run
-there.
+domain). Both backends return bitwise-identical outputs there. At 16 to 64
+tokens per rank, the CuTe-DSL forward takes about 6% to 7% longer than the CUDA
+forward on SM103 and about 9% to 11% longer on SM107. The SM100 target is
+admitted from the same source: the device text has no architecture-dependent
+code and uses only instructions shared by all three targets; it is
+compile-proven on B200, and the 16-rank test has not been run there.
 
 CUDA session construction materializes eight fixed-address TMA descriptors with
 one setup kernel. The CuTe-DSL host entry encodes the tensor maps from the bound
@@ -98,8 +102,8 @@ that rank's slot on the ranks that own the row's experts, so dispatch reads rows
 and routes from local memory. Neither implementation allocates device storage in
 the forward path. CUDA Graph capture is not supported.
 Calls on one session must be serialized on a single CUDA stream. Recreate the
-session after 14,913,080 forwards, before its signed grid-counter epoch would
-overflow.
+session after 14,913,080 forwards (10,324,440 for both SM107 backends),
+before its signed grid-counter epoch would overflow.
 
 The backend does not participate in automatic routing, autotuning, trace
 apply, or AOT packaging. It provides no compatibility guarantee while it is

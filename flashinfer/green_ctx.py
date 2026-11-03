@@ -31,6 +31,7 @@ except ImportError as e:
     ) from e
 
 from .api_logging import flashinfer_api
+from .cake_fmha import enable_cake_fmha_sm_partitions
 from .cuda_utils import checkCudaErrors
 from .utils import get_compute_capability, round_up
 
@@ -107,6 +108,9 @@ def split_resource_by_sm_count(
 def create_green_ctx_streams(
     cu_dev: CUdevResource, resources: List[CUdevResource]
 ) -> List[torch.Stream]:
+    # cake_fmha's small-M decode plans its split count on the launch
+    # stream's SMs once a green context exists.
+    enable_cake_fmha_sm_partitions()
     streams = []
     for split in resources:
         desc = checkCudaErrors(driver.cuDevResourceGenerateDesc([split], 1))

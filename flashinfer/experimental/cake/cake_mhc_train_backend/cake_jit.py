@@ -184,13 +184,24 @@ column-slab pass after the backward fn split) record ``"runtime"``: their
 binding takes ``enable_pdl`` per call, and :func:`enable_pdl` leaves the
 attribute off inside the measured token-count bands of ``PDL_OFF_BANDS`` (per
 architecture, edge and call path; the deterministic package's bands of those
-edges), where the early launch would hold the dependent's CTAs resident while
-the predecessor still runs.  The column-slab pass (every form) keeps the
-deterministic ``K6->K7`` bands: the token-owner pass releases the fn split at
-once and the fn split releases the column-slab pass at once, so the column-slab
-pass's early launch overlaps the token-owner pass as in the deterministic route.
-As in the deterministic package, the bands were measured at hidden 4096 and
-apply at every hidden size.
+edges, measured at hidden 4096 and applied at every hidden size), where the
+early launch would hold the dependent's CTAs resident while the predecessor
+still runs.  The column-slab pass (every form) sits on the deterministic
+``K6->K7`` edge: the token-owner pass releases the fn split at once and the fn
+split releases the column-slab pass at once, so the column-slab pass's early
+launch overlaps the token-owner pass as in the deterministic route.
+``PDL_BAND_OVERRIDES`` holds this package's own bands, measured on its kernels
+per architecture, SM count and hidden size (the route plan passes the device's
+SM count): a cell replaces the ``PDL_OFF_BANDS`` cell of its edge and path for
+the launches its key matches, the most specific key first.  On B200 with 148
+SMs the collapse (forward) and the backward prepare (checkpointed backward) are
+off in (2944, 3456] tokens as well, where the mapping pass runs 24 to 27 token
+tiles, and the column-slab pass (checkpointed backward) has its own bands per
+hidden size; on GB200 (sm_100a with 152 SMs) the collapse and the backward
+prepare are off in (2944, 3584] tokens, 24 to 28 token tiles, and the
+column-slab pass has its own bands per hidden size; on GB300 with 152 SMs the
+column-slab pass (checkpointed backward) has its own bands per hidden size;
+every other board keeps ``PDL_OFF_BANDS``.
 """
 
 from __future__ import annotations
@@ -674,6 +685,63 @@ MODULES: dict[str, dict[str, Any]] = {
         "select_rule": {
             "kind": "program",
             "program": "tk_nsx_g2_ol2l_ct",
+            "rule": "fwd_map_program",
+        },
+        "workspace_rule": {
+            "kind": "regions",
+            "workspace": "fwd",
+        },
+    },
+    "cake_mhc_train_fwd_map__tk_nsx_g2_ol2l_ct_ef_cap": {
+        "arches": [
+            "sm_100a",
+        ],
+        "arg_plan": [
+            ["buffer", "X"],
+            ["buffer", "FNP"],
+            ["buffer", "spart"],
+            ["buffer", "qpart"],
+            ["parameter", "T"],
+            ["parameter", "m_tiles"],
+            ["parameter", "log2_pk"],
+            ["buffer", "ticket"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "ctas_per_sm": 2,
+            "kind": "units_bounded",
+            "tile_rows": 128,
+            "units_rule": "k1_units",
+        },
+        "hidden": 4096,
+        "kernel": "cake_mhc_train_fwd_map__tk_nsx_g2_ol2l_ct_ef_cap",
+        "kernel_symbol": "kernel_cake_mhc_train_fwd_map__tk_nsx_g2_ol2l_ct_ef_cap",
+        "launch": {
+            "block": (192, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 114944,
+            "persistent_ctas_per_sm": 2,
+            "use_pdl": False,
+        },
+        "library": "cake_mhc_train_fwd_map__tk_nsx_g2_ol2l_ct_ef_cap",
+        "logical": {
+            "FNP": "fnp",
+            "T": "rows",
+            "X": "x_flat",
+            "log2_pk": "log2_pk",
+            "m_tiles": "m_tiles",
+            "qpart": "qpart",
+            "spart": "spart",
+            "ticket": "ticket",
+        },
+        "role": "fwd_map",
+        "select_rule": {
+            "kind": "program",
+            "program": "tk_nsx_g2_ol2l_ct_ef_cap",
             "rule": "fwd_map_program",
         },
         "workspace_rule": {
@@ -6355,6 +6423,7 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_mhc_train_fwd_map__ns96_g2_ol2l__tk",
             "cake_mhc_train_fwd_map__nsx_g2_ol2l__a3",
             "cake_mhc_train_fwd_map__tk_nsx_g2_ol2l_ct",
+            "cake_mhc_train_fwd_map__tk_nsx_g2_ol2l_ct_ef_cap",
             "cake_mhc_train_fwd_coef__st16_w4_tree",
             "cake_mhc_train_fwd_coef__qe_mb10_tree",
             "cake_mhc_train_fwd_coef__st16_lp2_as_el_qd",
@@ -6373,6 +6442,7 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_mhc_train_fwd_map__ns96_g2_ol2l__tk",
             "cake_mhc_train_fwd_map__nsx_g2_ol2l__a3",
             "cake_mhc_train_fwd_map__tk_nsx_g2_ol2l_ct",
+            "cake_mhc_train_fwd_map__tk_nsx_g2_ol2l_ct_ef_cap",
             "cake_mhc_train_fwd_coef__st16_w4_tree",
             "cake_mhc_train_fwd_coef__qe_mb10_tree",
             "cake_mhc_train_fwd_coef__st16_lp2_as_el_qd",
@@ -6967,27 +7037,39 @@ FWD_MAP_FIT = {
     "sm_103a": ("nsx", "nsx_st5_mb1"),
     "sm_107a": ("nsx_g2_ol2l", "nsx_st5_mb1"),
 }
-# FWD_MAP_CLAIM: (program, ticket form, tail form) per architecture -- the schedule of the routed program by the K units
-# per CTA, u = units / grid of k1_units. The ticket form (schedule="ticket" with the control records at the tail of
-# the ring; bitwise the program) claims each next K unit from the self-resetting ticket word, so when a concurrent
-# kernel holds SMs the CTAs that start late take only the units left. It runs where u >= 4: unloaded 0.9937-1.0031 of
-# the program in two sessions on two nodes per board (GB300, GB200, B200), and the forward path at 1.003-1.073 x its
-# unloaded time with SMs held by a side kernel or an NCCL replica, where the program reads 1.158-1.291 x. Where
-# 3 <= u < 4 the static schedule already gives every CTA 3 or 4 units and the claim costs up to 1.8 %; where u <= 1
-# every CTA owns one unit and the claim balances nothing (1.0057-1.0102). There the program runs, or at u <= 1 its
-# tail form where one exists (the static schedule with the control records at the tail, bitwise; sm_103a T 4096:
-# 1.0011 / 0.9988 of the program, 1.11 x vs 1.29 x its unloaded time with one side CTA per SM; sm_100a
-# ns96_g2_ol2l_ct, T 4096 on 148 SMs: 1.0000 / 0.9993 of the program, the mapping pass 1.01 x vs 1.43 x its
-# unloaded time with one side CTA per SM; nsx_g2_ol2l has no tail form: no sm_100a row with u <= 1 was measured
-# on it). sm_107a has no 216-SM timing session and is not routed.
+# FWD_MAP_CLAIM: (program, ticket form, tail form, cap form) per architecture -- the schedule of the routed program by
+# the K units per CTA, u = units / grid of k1_units. The ticket form (schedule="ticket" with the control records at the
+# tail of the ring; bitwise the program) claims each next K unit from the self-resetting ticket word, so when a
+# concurrent kernel holds SMs the CTAs that start late take only the units left. It runs where u >= 4: unloaded
+# 0.9937-1.0031 of the program in two sessions on two nodes per board (GB300, GB200, B200), and the forward path at
+# 1.003-1.073 x its unloaded time with SMs held by a side kernel or an NCCL replica, where the program reads
+# 1.158-1.291 x. Where 3 <= u < 4 the static schedule already gives every CTA 3 or 4 units and the claim costs up to
+# 1.8 %; where u <= 1 every CTA owns one unit and the claim balances nothing (1.0057-1.0102). There the program runs, or
+# at u <= 1 its tail form where one exists (the static schedule with the control records at the tail, bitwise; sm_103a T
+# 4096: 1.0011 / 0.9988 of the program, 1.11 x vs 1.29 x its unloaded time with one side CTA per SM; sm_100a
+# ns96_g2_ol2l_ct, T 4096 on 148 SMs: 1.0000 / 0.9993 of the program, the mapping pass 1.01 x vs 1.43 x its unloaded
+# time with one side CTA per SM; on 152 SMs at T 3585-4864 (u <= 1) 0.9967-1.0021 of the program in four GB200 sessions
+# and within +0.0051 of it with SMs held, except one session's +0.0118 at 4864 with 16 SMs held, which two more sessions
+# at 4736-4864 with 8 repeats did not reproduce; nsx_g2_ol2l has no tail form: no sm_100a row with u <= 1 was measured
+# on it). The cap form of sm_100a nsx_g2_ol2l (the ticket form with the first draw issued at kernel entry,
+# first_draw="early", and a per-SM cap, claim="cap": while every CTA of the grid has started, an SM claims a next unit
+# only below ceil(units / SMs), the static schedule's most per SM; once a CTA has not started the cap lifts and the last
+# CTA to exit takes what is left; bitwise the program) runs where P_K = 8, 3 <= u < 4 and the cap leaves at least
+# ceil(SMs / 8) claim seats free (slack = SMs x ceil(units / SMs) - units): GB200 (152 SMs) T 14928 / 15288 / 16263
+# unloaded 0.9982 / 0.9987 / 1.0008 of the program, and forward_prepare with 16 x 640 side CTAs 1.004-1.007 x its
+# unloaded time where the program reads 1.163-1.172 x. With less slack fewer than one SM in eight can take a unit beyond
+# the static share and the claim cost buys no placement (14592 on 152 SMs, slack 0: 1.0121): the program. At P_K = 16
+# (8193-8448 on 152 SMs) the pass is about 113 us with half-size units, so the cap's fixed per-claim cost weighs twice
+# as much (8193 / 8320 / 8448: 1.0114 / 1.0064 / 1.0131): the program. sm_107a has no 216-SM timing session and is not
+# routed.
 FWD_MAP_CLAIM = {
     "sm_100a": (
-        ("ns96_g2_ol2l", "tk_ns96_g2_ol2l_ct", "ns96_g2_ol2l_ct"),
-        ("nsx_g2_ol2l", "tk_nsx_g2_ol2l_ct", None),
+        ("ns96_g2_ol2l", "tk_ns96_g2_ol2l_ct", "ns96_g2_ol2l_ct", None),
+        ("nsx_g2_ol2l", "tk_nsx_g2_ol2l_ct", None, "tk_nsx_g2_ol2l_ct_ef_cap"),
     ),
     "sm_103a": (
-        ("nsx", "tk_nsx_ct", "nsx_ct"),
-        ("nsx_g2_ol2l", "tk_nsx_g2_ol2l_ct", None),
+        ("nsx", "tk_nsx_ct", "nsx_ct", None),
+        ("nsx_g2_ol2l", "tk_nsx_g2_ol2l_ct", None, None),
     ),
     "sm_107a": (),
 }
@@ -7415,16 +7497,23 @@ def fwd_map_program(
     for above, at_most, band in _tab("FWD_MAP_BANDS", hidden)[arch]:
         if above < T and (at_most is None or at_most >= T):
             program = band
-    _, units, grid = k1_units(T, sm_count, arch, hidden)
+    pk, units, grid = k1_units(T, sm_count, arch, hidden)
     fit = _tab("FWD_MAP_FIT", hidden)[arch]
     if fit is not None and program == fit[0] and units <= sm_count:
         program = fit[1]
-    for base, ticket, tail in _tab("FWD_MAP_CLAIM", hidden)[
+    for base, ticket, tail, cap in _tab("FWD_MAP_CLAIM", hidden)[
         arch
-    ]:  # the schedule by units per CTA (u = units / grid)
+    ]:  # the schedule by u = units / grid
         if program == base:
             if ticket is not None and units >= 4 * grid:
                 program = ticket
+            elif (
+                cap is not None
+                and pk == 8
+                and units >= 3 * grid
+                and -units % sm_count >= -(-sm_count // 8)
+            ):
+                program = cap
             elif tail is not None and units <= grid:
                 program = tail
     return program
@@ -8301,13 +8390,20 @@ def selected_modules(
 # (``"forward"``: the forward prepare; ``"checkpoint"``: the backward after a
 # replayed forward prefix; ``"backward"``: the backward from saved statistics);
 # elsewhere, and on every edge without a band, the attribute is on.
+# ``PDL_BAND_OVERRIDES[(arch, sm_count, hidden)][edge][path]`` replaces that
+# cell for the launches on ``arch`` with ``sm_count`` SMs at hidden size
+# ``hidden`` (``None``: any).  The most specific key that holds the cell wins:
+# ``(arch, sm_count, hidden)``, then ``(arch, sm_count, None)``, then
+# ``(arch, None, hidden)``, then ``PDL_OFF_BANDS``.  A launch without an SM
+# count matches only the keys without one.  An override band ``(above, None)``
+# has no upper end.
 
 PDL_PATHS = ("forward", "backward", "checkpoint")
 # Library stem -> the edge its records sit on (predecessor -> dependent).  The
-# bands are the deterministic package's on the edges this package has (the
-# atomic column slab (every form), launched behind the fn split that the
-# token-owner pass releases at once, takes the deterministic column slab's
-# K6->K7 bands; there is no K7->K8 edge).
+# bands of PDL_OFF_BANDS are the deterministic package's on the edges this
+# package has (the atomic column slab (every form), launched behind the fn
+# split that the token-owner pass releases at once, takes the deterministic
+# column slab's K6->K7 bands; there is no K7->K8 edge).
 PDL_EDGES = {
     "cake_mhc_train_bwd_prepare": "K1->K5",
     "cake_mhc_train_bwd_slab_atomic": "K6->K7",
@@ -8338,6 +8434,111 @@ PDL_OFF_BANDS: dict[str, dict[str, dict[str, tuple[tuple[int, int], ...]]]] = {
     },
     "sm_107a": {},
 }
+# This package's own bands, measured on its kernels on B200 (sm_100a, 148 SMs):
+# package-level A/B of these bands against PDL_OFF_BANDS on the forward and
+# checkpointed-step CUDA graphs, 16 replay groups x 30 replays, paired, at 22
+# token counts per hidden size, with checkpointed-step sweeps at the edges of
+# the new band (2952..3000, 3464..3512).  The collapse (K1->K3, forward) and the
+# backward prepare (K1->K5, checkpoint) stall with the attribute on in
+# (2944, 3456] tokens, where the mapping pass runs ceil(T / TILE_T) = 24..27
+# token tiles (the deterministic checkpointed step shows the same step on B200,
+# none on GB200 or GB300); off there, the forward is 3.1..6.5 us and the
+# checkpointed step 13.3..27.5 us faster (16 of 16 groups at hidden 4096, 5120
+# and 7168).  The column slab (K6->K7, checkpoint) is on in (2048, 4096] at
+# hidden 4096 (the checkpointed step 0.80 us faster at 2304, 16 of 16; 0.25 us
+# at 2560, 15 of 16) and from 2048 tokens at 5120 (1.13 us at 2048 and 0.86 us
+# at 2304, 16 of 16; 3.51 us at 8192, 12 of 16), and off from 897 tokens at
+# 7168 (0.68..2.86 us faster from 913 to 1024 tokens, 15 or 16 of 16; from 705
+# to 897 tokens off gained nothing and lost up to 0.52 us); at 7168 the band
+# stops at 8192 because the gains above it did not repeat.
+# On GB300 (sm_103a, 152 SMs), the same A/B at 22 to 34 token counts per hidden
+# size: the column slab (K6->K7, checkpoint) is off from 832 tokens on at hidden
+# 7168 (the checkpointed step 0.53..6.29 us faster from 832 to 4096 tokens and
+# 2.16..42.17 us from 9216 to 65536, 13 to 16 of 16 groups), in (1087, 1920] at
+# 5120 (2.43..6.81 us, 15 or 16 of 16; at 1025 tokens off was faster in one run
+# and slower in the next) and above 24576 (0.50..12.68 us, 13 to 15 of 16), and
+# in (1151, 2112] at 4096 (0.47..2.37 us faster at 1536, 2048 and 2112 in every
+# run; from 1025 to 1151 tokens off was faster in one run and slower in
+# another); at 4096 and 5120 the deterministic (4096, 8192] band stays, and the
+# other edges keep PDL_OFF_BANDS.
+# On GB200 (sm_100a, 152 SMs), per-edge scans of the same graphs at 22 to 44
+# token counts per hidden size: the collapse (K1->K3, forward) and the backward
+# prepare (K1->K5, checkpoint) stall with the attribute on in (2944, 3584]
+# tokens, 24 to 28 token tiles (off there, the forward is 3.3..6.5 us and the
+# checkpointed step 9.6..20.5 us faster per edge, 16 of 16 groups at hidden
+# 4096, 5120 and 7168; at 2944 and from 3648 tokens off gained nothing).  The
+# column slab (K6->K7, checkpoint) is off in (1024, 2159] at hidden 4096 (on was
+# 0.66..1.50 us slower at 2113 to 2144 tokens and 0.55..0.63 us faster from
+# 2160) and on above, off in (1024, 1984] and (7168, 8192] at 5120 (on was
+# 0.67..1.39 us faster from 1985 to 2046 tokens, 16 of 16 groups, and 0.39 us
+# slower at 8192) and on between, and off from 769 tokens on at 7168.
+# B300 (sm_103a, 148 SMs) and sm_107a are not measured and keep PDL_OFF_BANDS.
+PDL_BAND_OVERRIDES: dict[
+    tuple[str, int | None, int | None],
+    dict[str, dict[str, tuple[tuple[int, int | None], ...]]],
+] = {
+    ("sm_100a", 148, None): {
+        "K1->K3": {
+            "forward": ((2944, 3456), (4096, 8192)),
+        },
+        "K1->K5": {
+            "checkpoint": ((2944, 3456), (4096, 8192)),
+        },
+    },
+    ("sm_100a", 148, 4096): {
+        "K6->K7": {
+            "checkpoint": ((1024, 2048), (4096, 8192)),
+        },
+    },
+    ("sm_100a", 148, 5120): {
+        "K6->K7": {
+            "checkpoint": ((1024, 2047),),
+        },
+    },
+    ("sm_100a", 148, 7168): {
+        "K6->K7": {
+            "checkpoint": ((896, 8192),),
+        },
+    },
+    ("sm_100a", 152, None): {
+        "K1->K3": {
+            "forward": ((2944, 3584), (4096, 8192)),
+        },
+        "K1->K5": {
+            "checkpoint": ((2944, 3584), (4096, 8192)),
+        },
+    },
+    ("sm_100a", 152, 4096): {
+        "K6->K7": {
+            "checkpoint": ((1024, 2159),),
+        },
+    },
+    ("sm_100a", 152, 5120): {
+        "K6->K7": {
+            "checkpoint": ((1024, 1984), (7168, 8192)),
+        },
+    },
+    ("sm_100a", 152, 7168): {
+        "K6->K7": {
+            "checkpoint": ((768, None),),
+        },
+    },
+    ("sm_103a", 152, 4096): {
+        "K6->K7": {
+            "checkpoint": ((1151, 2112), (4096, 8192)),
+        },
+    },
+    ("sm_103a", 152, 5120): {
+        "K6->K7": {
+            "checkpoint": ((1087, 1920), (4096, 8192), (24576, None)),
+        },
+    },
+    ("sm_103a", 152, 7168): {
+        "K6->K7": {
+            "checkpoint": ((831, None),),
+        },
+    },
+}
 
 
 def pdl_edge(library: str) -> str | None:
@@ -8346,11 +8547,17 @@ def pdl_edge(library: str) -> str | None:
     return PDL_EDGES.get(library.split("__", 1)[0])
 
 
-def enable_pdl(name: str, rows: int, arch: str, path: str) -> int:
+def enable_pdl(
+    name: str, rows: int, arch: str, path: str, sm_count: int | None = None
+) -> int:
     """The ``enable_pdl`` argument of one launch of record ``name`` for ``rows`` tokens
-    on ``arch`` along ``path``: 0 inside a band of :data:`PDL_OFF_BANDS` of the
-    record's edge, 1 elsewhere (a record whose ``use_pdl`` is not ``"runtime"``
-    takes no such argument and reads 1)."""
+    on ``arch`` with ``sm_count`` SMs (``None``: no SM count) along ``path``: 0
+    inside a band of the record's edge, 1 elsewhere (a record whose ``use_pdl`` is
+    not ``"runtime"`` takes no such argument and reads 1).  The bands are the cell
+    of :data:`PDL_BAND_OVERRIDES` under the most specific key that holds one --
+    ``(arch, sm_count, hidden)``, ``(arch, sm_count, None)``, ``(arch, None,
+    hidden)``, with the record's hidden size -- else the cell of
+    :data:`PDL_OFF_BANDS`."""
 
     if path not in PDL_PATHS:
         raise ValueError(f"unknown Cake mHC training call path: {path!r}")
@@ -8362,8 +8569,19 @@ def enable_pdl(name: str, rows: int, arch: str, path: str) -> int:
         raise ValueError(
             f"record {name!r} takes the per-call attribute but its library sits on no edge of PDL_EDGES"
         )
+    hidden = int(record["hidden"])
+    keys: list[tuple[str, int | None, int | None]] = [(arch, None, hidden)]
+    if sm_count is not None:
+        sm = int(sm_count)
+        keys = [(arch, sm, hidden), (arch, sm, None), *keys]
+    bands = PDL_OFF_BANDS.get(arch, {}).get(edge, {}).get(path, ())
+    for key in keys:
+        cell = PDL_BAND_OVERRIDES.get(key, {}).get(edge, {}).get(path)
+        if cell is not None:
+            bands = cell
+            break
     rows = int(rows)
-    for above, at_most in PDL_OFF_BANDS.get(arch, {}).get(edge, {}).get(path, ()):
+    for above, at_most in bands:
         if int(above) < rows and (at_most is None or rows <= int(at_most)):
             return 0
     return 1
@@ -8591,6 +8809,7 @@ __all__ = [
     "MAPPING_ROWS",
     "MODULES",
     "N_PAD",
+    "PDL_BAND_OVERRIDES",
     "PDL_EDGES",
     "PDL_OFF_BANDS",
     "PDL_PATHS",

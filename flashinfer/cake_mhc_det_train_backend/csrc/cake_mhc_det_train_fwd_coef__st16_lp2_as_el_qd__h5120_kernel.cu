@@ -47,16 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define SMEM_SVIEW_OFF 0
-#define SMEM_SVIEW_STAGE_BYTES 12288
-#define SMEM_SVIEW_STRIDE 12288
-#define SMEM_QVIEW_OFF 12288
-#define SMEM_QVIEW_STAGE_BYTES 512
-#define SMEM_QVIEW_STRIDE 512
-#define SMEM_TOTAL 12800
-#define THREADS 128
-
 #include <math_constants.h>
 
 extern "C" __device__ float __nv_expf(float);

@@ -852,10 +852,11 @@ def test_row_cost_rule_on_rows_of_record(path) -> None:
 @ROWS
 @pytest.mark.parametrize("path", ROW_FILES, ids=ROW_IDS)
 def test_row_cost_lpt_rule_on_rows_of_record(path) -> None:
-    """The shipped row rule (``"row_cost_lpt"``, the default of ``build_context_det_kcp``) on every step-0 row: the five
-    rows of ``ROW_COST_LPT_CHANGED`` get their recorded vector, every other row keeps the ``"row_cost"`` vector; a rank
-    the ``"row_cost"`` rule plans at ``P = 1`` keeps ``P = 1``; every rank's default context derives the same vector and
-    reports ``p_rule="row_cost_lpt"``; only the segment program differs from the ``"row_cost"`` context."""
+    """The ``"row_cost_lpt"`` row rule on every step-0 row: the five rows of ``ROW_COST_LPT_CHANGED`` get their recorded
+    vector, every other row keeps the ``"row_cost"`` vector; a rank the ``"row_cost"`` rule plans at ``P = 1`` keeps
+    ``P = 1``; every rank's ``"row_cost_lpt"`` context derives the same vector and reports ``p_rule="row_cost_lpt"``, and
+    the default context (``"small_one"``, which leaves these rows on ``"row_cost_lpt"``) plans the same ``P``; only the
+    segment program differs from the ``"row_cost"`` context."""
     with open(path) as fh:
         row = json.load(fh)
     HV = int(row["heads"][1])
@@ -875,10 +876,16 @@ def test_row_cost_lpt_rule_on_rows_of_record(path) -> None:
     )
     assert all(new.P == 1 for old, new in zip(base, plans, strict=True) if old.P == 1)
     for r in range(W):
-        ctx = gp.build_context_det_kcp(part, None, r, CPU, 4, sm_count=SM_COUNT)
+        ctx = gp.build_context_det_kcp(
+            part, None, r, CPU, 4, sm_count=SM_COUNT, p_rule="row_cost_lpt"
+        )
         hp = ctx.heads(HV)
-        assert ctx.p_rule == gp.P_RULE_DEFAULT == "row_cost_lpt" == hp.segments.p_rule
+        assert ctx.p_rule == "row_cost_lpt" == hp.segments.p_rule
         assert (got[r], plans[r].NSEG) == (hp.P, hp.segments.NSEG)
+        dflt = gp.build_context_det_kcp(part, None, r, CPU, 4, sm_count=SM_COUNT)
+        assert dflt.p_rule == gp.P_RULE_DEFAULT == "small_one"
+        dhp = dflt.heads(HV)
+        assert (dhp.P, dhp.segments.NSEG) == (hp.P, hp.segments.NSEG)
         ref = gp.build_context_det_kcp(
             part, None, r, CPU, 4, sm_count=SM_COUNT, p_rule="row_cost"
         )
@@ -914,12 +921,12 @@ def test_row_cost_lpt_rule_on_rows_of_record(path) -> None:
 
 
 def test_row_cost_rule_is_the_default_and_the_per_rank_rules_stay_selectable() -> None:
-    """``P_RULE_DEFAULT`` is the ``"row_cost_lpt"`` row rule (``"row_cost"`` stays selectable); ``kcp_plan`` refuses
-    both (they need every rank's table); the per-rank rules
+    """``P_RULE_DEFAULT`` is the ``"small_one"`` row rule on top of ``"row_cost_lpt"`` (``"row_cost_lpt"`` and
+    ``"row_cost"`` stay selectable); ``kcp_plan`` refuses both (they need every rank's table); the per-rank rules
     stay selectable through ``p_rule`` and then drive the head plan; the row rule picks the recorded vectors on three
     tables of record (two flip to ``"one"`` -- one far below any margin, one at a model ratio of 0.980 that only the
     ``"one"`` margin of 0 admits -- and one keeps the base far from any margin)."""
-    assert gp.P_RULE_DEFAULT == "row_cost_lpt" and "row_cost_lpt" in gp.P_RULES
+    assert gp.P_RULE_DEFAULT == "small_one" and "row_cost_lpt" in gp.P_RULES
     assert "row_cost" in gp.P_RULES
     assert gp.ROW_COST_BASE == "wave_fill1" and gp.ROW_COST_POLICIES == ("occ", "one")
     assert gp.ROW_COST_COMPOSE_K == 2 and gp.ROW_COST_MARGIN_PCT == {"occ": 2, "one": 0}
@@ -959,8 +966,8 @@ def test_row_cost_rule_is_the_default_and_the_per_rank_rules_stay_selectable() -
     assert 100 * c_one <= (100 - gp.ROW_COST_MARGIN_PCT["one"]) * c_base
     assert 100 * c_one > (100 - gp.ROW_COST_MARGIN_PCT["occ"]) * c_base
     assert c_occ > c_base
-    # contexts: the default rule on every rank gives the row's vector; the selectable row rule and a per-rank rule
-    # are honoured when asked for
+    # contexts: the "row_cost_lpt" rule on every rank gives the row's vector, the default ("small_one": HV = 6, fragments
+    # of <= 160 chunks) plans P = 1; the selectable row rule and a per-rank rule are honoured when asked for
     cu = torch.tensor([0, 100, 740, 817, 1817, 1946], dtype=torch.int64)
     part = gp.partition_det_kcp(cu, 2, "contiguous")
     want = tuple(
@@ -974,9 +981,14 @@ def test_row_cost_rule_is_the_default_and_the_per_rank_rules_stay_selectable() -
         for seg in gp.kcp_plan_row(gp.row_tables(part), 6, SM_COUNT, p_rule="row_cost")
     )
     for r in range(2):
-        ctx = gp.build_context_det_kcp(part, None, r, CPU, 4, sm_count=SM_COUNT)
+        ctx = gp.build_context_det_kcp(
+            part, None, r, CPU, 4, sm_count=SM_COUNT, p_rule="row_cost_lpt"
+        )
         assert ctx.p_rule == "row_cost_lpt" and want[r] == ctx.heads(6).P
         assert ctx.heads(6).segments.p_rule == "row_cost_lpt"
+        dflt = gp.build_context_det_kcp(part, None, r, CPU, 4, sm_count=SM_COUNT)
+        assert dflt.p_rule == "small_one" == dflt.heads(6).segments.p_rule
+        assert dflt.heads(6).P == 1
         old = gp.build_context_det_kcp(
             part, None, r, CPU, 4, sm_count=SM_COUNT, p_rule="row_cost"
         )
@@ -998,6 +1010,154 @@ def test_row_cost_rule_is_the_default_and_the_per_rank_rules_stay_selectable() -
     assert gp.row_cost_10ns(
         ((), ((300, True),)), HV, SM_COUNT, (1, 1)
     ) == gp.row_cost_rank_10ns(((300, True),), HV, SM_COUNT, 1)
+
+
+def test_opt_in_row_rules_only_lower_the_shipped_P() -> None:
+    """The row rules ``"fill_down"``, ``"small_one"`` (the default) and ``"fill_small"`` start from the
+    ``"row_cost_lpt"`` vector and only lower a rank's ``P``: ``"fill_down"`` takes ``min(P, wave_fill P)`` on
+    the ranks below the chain cap and keeps the others, ``"small_one"`` runs ``P = 1`` on every rank exactly when
+    ``HV <= SMALL_ONE_HV_MAX`` and no fragment of any rank exceeds ``SMALL_ONE_NC_MAX`` chunks (else the shipped
+    vector), ``"fill_small"`` is ``"small_one"`` on those rows and ``"fill_down"`` elsewhere; every plan reports its
+    rule and ``NSEG = n_frag * P``; ``kcp_plan`` refuses them (they need every rank's table)."""
+    rules = ("fill_down", "small_one", "fill_small")
+    assert gp.P_RULE_DEFAULT == "small_one" and set(rules) <= set(gp.ROW_RULES)
+    assert set(gp.ROW_RULES) <= set(gp.P_RULES)
+    assert (gp.SMALL_ONE_HV_MAX, gp.SMALL_ONE_NC_MAX) == (12, 160)
+    for rule in rules:
+        with pytest.raises(ValueError, match=rule):
+            gp.kcp_plan(2, 500, 48, SM_COUNT, p_rule=rule)
+    tables = (
+        TABLE_P1_CP4_D,
+        TABLE_P1_CP2_C,
+        TABLE_P3_CP2_C,
+        (((130, True),) * 12,) * 8,  # (4,12)-like CP8 D: 12 short fragments per rank
+        (((237, True), (237, True), (100, False)),) * 4,  # Z-like: 237-chunk fragments
+        # above the chain cap: fill_down keeps the shipped P
+        (((473, True), (473, False)),) * 4,
+        # (2,6)-like CP16 Z: two short fragments per rank
+        (((119, True), (119, True)),) * 8,
+        ((), ((150, True), (20, False))),  # a zero-token rank
+    )
+    lowered = {"fill_down": 0, "small_one": 0}
+    for sm in (SM_COUNT, 148):
+        for table in tables:
+            for HV in (6, 12, 24, 48):
+                ship = gp.kcp_plan_row(table, HV, sm, p_rule="row_cost_lpt")
+                for rule in rules:
+                    plans = gp.kcp_plan_row(table, HV, sm, p_rule=rule)
+                    assert plans == gp.kcp_plan_row(table, HV, sm, p_rule=rule)
+                    assert len(plans) == len(ship)
+                    for seg, base, t in zip(plans, ship, table, strict=True):
+                        assert seg.p_rule == rule and 1 <= seg.P <= base.P
+                        assert seg.n_frag * seg.P == seg.NSEG and seg.n_frag == len(t)
+                fill = tuple(
+                    min(
+                        base.P,
+                        gp.kcp_plan(
+                            len(t),
+                            max((nc for nc, _ in t), default=0),
+                            HV,
+                            sm,
+                            p_rule="wave_fill",
+                        ).P,
+                    )
+                    if 0 < max((nc for nc, _ in t), default=0) < gp.WAVE_MIN_NC_MAX_FRAG
+                    else base.P
+                    for base, t in zip(ship, table, strict=True)
+                )
+                assert fill == tuple(
+                    seg.P for seg in gp.kcp_plan_row(table, HV, sm, p_rule="fill_down")
+                )
+                small = HV <= gp.SMALL_ONE_HV_MAX and all(
+                    nc <= gp.SMALL_ONE_NC_MAX for t in table for nc, _ in t
+                )
+                got = tuple(
+                    seg.P for seg in gp.kcp_plan_row(table, HV, sm, p_rule="small_one")
+                )
+                assert got == (
+                    tuple(1 for _ in table) if small else tuple(seg.P for seg in ship)
+                )
+                both = tuple(
+                    seg.P for seg in gp.kcp_plan_row(table, HV, sm, p_rule="fill_small")
+                )
+                assert both == (tuple(1 for _ in table) if small else fill)
+                lowered["small_one"] += int(small and max(seg.P for seg in ship) > 1)
+                lowered["fill_down"] += int(fill != tuple(seg.P for seg in ship))
+    # each rule changes some shipped plan (else it would be a no-op)
+    assert lowered["small_one"] > 0 and lowered["fill_down"] > 0, lowered
+
+
+@pytest.mark.parametrize("rule", ["fill_down", "small_one", "fill_small"])
+def test_opt_in_row_rules_give_every_rank_the_same_plan(rule) -> None:
+    """Determinism of the row rules on top of ``"row_cost_lpt"``: the plan is a pure function of every rank's fragment table, ``HV`` and the
+    SM count, so every rank's context derives its ``P`` / ``NSEG`` from the same row vector, a second build of the
+    same topology is field-identical, and only the segment program differs from the ``"row_cost_lpt"`` context (partition,
+    fragment table, local tables and crossing lists unchanged)."""
+    cases = (
+        # (2,6) C1-like: small_one -> P = 1
+        ([0, 100, 740, 817, 1817, 1946], 2, "contiguous", 6),
+        ([0, 3000], 4, "zigzag", 12),  # (4,12) C2-Z-like
+        ([0, 3000], 4, "zigzag_per_document", 12),
+        # (8,24) two-fragment ranks below the cap
+        ([0, 30_000, 47_000], 4, "zigzag", 24),
+        # (2,6) A3-like CP4 D: fragments of <= 160 chunks, small_one -> P = 1 on every rank
+        ([0, 32_801, 65_570], 4, "zigzag_per_document", 6),
+    )
+    changed = 0
+    for cu, W, layout, HV in cases:
+        part = gp.partition_det_kcp(torch.tensor(cu, dtype=torch.int64), W, layout)
+        row = gp.kcp_plan_row(gp.row_tables(part), HV, SM_COUNT, p_rule=rule)
+        ship = gp.kcp_plan_row(gp.row_tables(part), HV, SM_COUNT, p_rule="row_cost_lpt")
+        changed += int(tuple(s.P for s in row) != tuple(s.P for s in ship))
+        for r in range(W):
+            ctx = gp.build_context_det_kcp(
+                part, None, r, CPU, 4, sm_count=SM_COUNT, p_rule=rule
+            )
+            again = gp.build_context_det_kcp(
+                part, None, r, CPU, 4, sm_count=SM_COUNT, p_rule=rule
+            )
+            hp = ctx.heads(HV)
+            assert ctx.p_rule == rule == hp.segments.p_rule
+            assert (hp.P, hp.segments.NSEG) == (row[r].P, row[r].NSEG)
+            assert _sha(_context_record(ctx, HV)) == _sha(_context_record(again, HV))
+            ref = gp.build_context_det_kcp(
+                part, None, r, CPU, 4, sm_count=SM_COUNT, p_rule="row_cost_lpt"
+            )
+            assert ref.p_rule == "row_cost_lpt"
+            assert ctx.partition.to_dict() == ref.partition.to_dict() == part.to_dict()
+            assert ctx.frag_table.tolist() == ref.frag_table.tolist()
+            assert ctx.cu_seqlens_local_cpu == ref.cu_seqlens_local_cpu
+            assert (ctx.in_slot, ctx.out_slot, ctx.chains) == (
+                ref.in_slot,
+                ref.out_slot,
+                ref.chains,
+            )
+            assert (hp.P == ref.heads(HV).P) == (row[r].P == ship[r].P)
+    assert changed > 0  # the cases exercise a changed plan
+
+
+@ROWS
+@pytest.mark.parametrize("path", ROW_FILES, ids=ROW_IDS)
+def test_opt_in_row_rules_keep_the_rows_of_record(path) -> None:
+    """The step-0 rows (CP2 / CP4) have no rank below the chain cap whose one-wave fill is lower and no row at
+    ``HV <= SMALL_ONE_HV_MAX``: the row rules on top of ``"row_cost_lpt"`` return its segment program on every one of
+    them (GB300 and B200 SM counts), so their CP2 / CP4 programs are those of ``"row_cost_lpt"``."""
+    with open(path) as fh:
+        row = json.load(fh)
+    HV = int(row["heads"][1])
+    part = gp.partition_det_kcp(**_partition_inputs(row))
+    tables = gp.row_tables(part)
+    for sm in (SM_COUNT, 148):
+        ship = gp.kcp_plan_row(tables, HV, sm, p_rule="row_cost_lpt")
+        for rule in ("fill_down", "small_one", "fill_small"):
+            got = gp.kcp_plan_row(tables, HV, sm, p_rule=rule)
+            assert [(s.P, s.NSEG) for s in got] == [(s.P, s.NSEG) for s in ship], (
+                row["row"],
+                row["cp"],
+                row["layout"],
+                sm,
+                rule,
+            )
 
 
 def test_row_cost_model_is_integer_and_crossing_aware() -> None:
@@ -2219,14 +2379,14 @@ def test_workspace_layout_counts_one_staging_plane_under_save_transfer() -> None
     part = gp.partition_det_kcp(cu, 2, "contiguous")
     H_qk, HV = 2, 6
     seen_segmented = False
-    # Under the shipped row rule this row plans P = 1 on both ranks ("row_cost" plans P = 1 there -- fragments of 2-14
+    # Under the shipped row rule ("small_one" here; "row_cost_lpt" too) this row plans P = 1 on both ranks ("row_cost" plans P = 1 there -- fragments of 2-14
     # chunks: the per-rank programs
     # segment them 7- and 13-fold to fill the SMs, and the compose chain of those segments costs more than the one-wave
     # walks they save), so the staging plane is 0; the plane term is exercised under the per-rank rule below.
     for r in range(2):
         ctx_row = gp.build_context_det_kcp(part, None, r, CPU, 4, sm_count=SM_COUNT)
         hp_row = ctx_row.heads(HV)
-        assert hp_row.segments.p_rule == "row_cost_lpt" and hp_row.P == 1
+        assert hp_row.segments.p_rule == gp.P_RULE_DEFAULT and hp_row.P == 1
         one_row = gb.gdn_det_workspace_layout_kcp(ctx_row, H_qk=H_qk, HV=HV)
         assert one_row["fwd.staging"] == one_row["bwd.staging"] == 0
     for r in range(2):

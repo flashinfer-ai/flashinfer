@@ -40,8 +40,8 @@ live in the routed package; this module forwards every keyword.  Every switch
 is a keyword argument; no environment variable is read.
 
 Operands of one rank (its ``T_r`` local tokens in fragment order): ``q, k``
-BF16 ``[1, T_r, H_qk, 128]`` (L2-normalized by the caller, or in the kernel with
-``use_qk_l2norm_in_kernel=True`` on the deterministic route), ``v`` BF16
+BF16 ``[1, T_r, H_qk, 128]`` (L2-normalized by the caller, or raw with
+``use_qk_l2norm_in_kernel=True`` on either route), ``v`` BF16
 ``[1, T_r, HV, 128]`` with ``HV % H_qk == 0`` (production ``(16, 48)``),
 ``g`` FP32 ``[1, T_r, HV]`` (the natural-log decay, preactivated, no clamp),
 ``beta`` FP32 ``[1, T_r, HV]`` (through the sigmoid).  Strided packed-QKV
@@ -129,36 +129,16 @@ def _deterministic(deterministic: bool, entry: str) -> bool:
     return False
 
 
-# A deterministic-route option the non-deterministic package does not have yet.
-_DET_ONLY_L2N = "use_qk_l2norm_in_kernel"
-
-
-def _nd_without_l2n(mapping: dict) -> dict:
-    """``mapping`` for the non-deterministic route: ``use_qk_l2norm_in_kernel`` dropped when ``False``, refused when
-    ``True`` (that route has no in-kernel Q / K L2 norm yet)."""
-    if _DET_ONLY_L2N not in mapping:
-        return mapping
-    if mapping[_DET_ONLY_L2N]:
-        raise ValueError(
-            "the non-deterministic KCP route does not support use_qk_l2norm_in_kernel yet; "
-            "pass deterministic=True for the in-kernel Q/K L2 norm"
-        )
-    return {k: v for k, v in mapping.items() if k != _DET_ONLY_L2N}
-
-
 def _options_for(det: bool, options: Any) -> Any:
     """``options`` for the routed package: an options instance of the other route becomes the mapping of its fields
-    (the routed package validates it); a mapping, ``None`` or the routed package's own instance pass through.  On the
-    non-deterministic route ``use_qk_l2norm_in_kernel`` is dropped when ``False`` and refused when ``True``."""
-    if options is None:
+    (the routed package validates it); a mapping, ``None`` or the routed package's own instance pass through.  Both
+    routes take every field, ``use_qk_l2norm_in_kernel`` included."""
+    if options is None or isinstance(options, dict):
         return options
-    if isinstance(options, dict):
-        return options if det else _nd_without_l2n(options)
     own = _det().OptionsDetKcp if det else _pkg().OptionsKcp
     if isinstance(options, own) or not dataclasses.is_dataclass(options):
         return options
-    fields = {f.name: getattr(options, f.name) for f in dataclasses.fields(options)}
-    return fields if det else _nd_without_l2n(fields)
+    return {f.name: getattr(options, f.name) for f in dataclasses.fields(options)}
 
 
 @flashinfer_experimental_api(feature=_FEATURE)
@@ -326,7 +306,7 @@ def chunk_gdn_fwd_kcp(
         workspace=workspace,
         options=_options_for(False, options),
         deterministic=False,
-        **_nd_without_l2n(knobs),
+        **knobs,
     )
 
 
@@ -403,7 +383,7 @@ def chunk_gdn_bwd_kcp(
         workspace=workspace,
         options=_options_for(False, options),
         deterministic=False,
-        **_nd_without_l2n(knobs),
+        **knobs,
     )
 
 
@@ -483,6 +463,16 @@ def chunk_gdn_kcp(
     convolution call, and this call shares one of them.  Needs ``boundary_mode="saved"`` and ``graph="off"``; implies ``save_transfer=False``.  A forward
     outside the backward that finds an entry raises (a handle reused across micro-steps).
 
+    ``q`` / ``k`` / ``v`` that are head views of one packed ``[..., T, (2 H_qk + HV) * 128]`` row (the convolution's
+    output) get the full backward speed as the views of
+    ``flashinfer.experimental.cake_gdn_train_kcp.packed_qkv_views_kcp`` or
+    ``flashinfer.cake_gdn_det_train_kcp.packed_qkv_views_det_kcp``: both packages take the packed gradient layout
+    from the operands' pointers and strides, and both helpers' split nodes pass a packed gradient row on without a
+    copy.  Plain ``split`` / ``view`` views of the row give the same results, but torch's split backward
+    concatenates ``dq`` / ``dk`` / ``dv`` into a new row: on the non-deterministic route, about 1.1-1.2 ms
+    (33-37 %) more backward per call at ``(16, 48)`` and 32,768 tokens on B200 and GB300, with the in-kernel norm
+    off or on (``flashinfer/experimental/cake_gdn_train_kcp/README.md``, "Packed Q/K/V").
+
     ``deterministic`` (default ``True``) selects the route (see the module docstring); the checkpoint recompute of a
     forward runs the forward's route as long as the torch deterministic-algorithms setting does not change in between.
     """
@@ -518,7 +508,7 @@ def chunk_gdn_kcp(
         options=_options_for(False, options),
         recompute_handle=recompute_handle,
         deterministic=False,
-        **_nd_without_l2n(knobs),
+        **knobs,
     )
 
 
@@ -531,7 +521,7 @@ def gdn_workspace_bytes_kcp(
     the per-phase terms are ``gdn_workspace_layout_kcp`` of the package) on the route ``deterministic`` selects."""
     if _deterministic(deterministic, "gdn_workspace_bytes_kcp"):
         return _det().gdn_det_workspace_bytes_kcp(ctx, H_qk=H_qk, HV=HV, **kw)
-    return _pkg().gdn_workspace_bytes_kcp(ctx, H_qk=H_qk, HV=HV, **_nd_without_l2n(kw))
+    return _pkg().gdn_workspace_bytes_kcp(ctx, H_qk=H_qk, HV=HV, **kw)
 
 
 @flashinfer_experimental_api(feature=_FEATURE)
@@ -542,7 +532,7 @@ def gdn_saved_bytes_kcp(
     crossing fragment, on the route ``deterministic`` selects."""
     if _deterministic(deterministic, "gdn_saved_bytes_kcp"):
         return _det().gdn_det_saved_bytes_kcp(ctx, H_qk=H_qk, HV=HV, **kw)
-    return _pkg().gdn_saved_bytes_kcp(ctx, H_qk=H_qk, HV=HV, **_nd_without_l2n(kw))
+    return _pkg().gdn_saved_bytes_kcp(ctx, H_qk=H_qk, HV=HV, **kw)
 
 
 @flashinfer_experimental_api(feature=_FEATURE)

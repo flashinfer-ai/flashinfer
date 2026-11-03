@@ -132,6 +132,8 @@ nn_n128_m64_hen_t_skx_pro15__f32(const __grid_constant__ CUtensorMap A, const __
         }
     }
     __syncwarp();
+    asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
+    asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
     // TMEM alloc (512 columns, 512 used)
     volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 328);
     if (warp == 1) {
@@ -141,8 +143,6 @@ nn_n128_m64_hen_t_skx_pro15__f32(const __grid_constant__ CUtensorMap A, const __
         asm volatile("tcgen05.relinquish_alloc_permit.cta_group::2.sync.aligned;");
     }
     __syncthreads();
-    asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
-    asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
     const int taddr = tmem_addr_storage[0];
     // Kernel post-init ops

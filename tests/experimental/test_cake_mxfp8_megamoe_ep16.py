@@ -19,6 +19,7 @@ limitations under the License.
 import ast
 import inspect
 import os
+import re
 import runpy
 import subprocess
 import sys
@@ -32,8 +33,8 @@ import pytest
 import torch
 import torch.distributed as dist
 from flashinfer.experimental.cake_mxfp8_megamoe_ep16.backend import (
-    _MAX_LAUNCH_EPOCH,
     _interleave_gate_up_16,
+    _max_launch_epoch,
     _pack_scale_n128_k128,
     _quantize_mxfp8_block32,
     _validate_backend,
@@ -312,7 +313,11 @@ def test_generated_source_closure() -> None:
     assert sequence["setup_ffi_entry"] == "setup_tma"
     assert sequence["launches_per_call"] == 2
     assert sequence["setup_launches"] == 1
-    assert sequence["max_launch_epoch"] == _MAX_LAUNCH_EPOCH
+    # The CUDA closure's bound: the smallest over its per-capability fused grids.
+    assert sequence["max_launch_epoch"] == min(
+        _max_launch_epoch(_jit.fused_grid_ctas(capability))
+        for capability in _jit.SUPPORTED_CAPABILITIES
+    )
     variants = sequence["fused_variants"]
     tokens = sequence["token_specializations"]
     assert tokens == {"16": variants["0"], "32": variants["1"], "64": variants["0"]}
@@ -371,14 +376,16 @@ def test_cute_dsl_backend_targets_every_supported_capability(monkeypatch) -> Non
 
 
 @pytest.mark.parametrize(
-    "capability,arch",
+    "capability,arch,grid_ctas",
     (
-        ((10, 0), "compute_100a"),
-        ((10, 3), "compute_103a"),
-        ((10, 7), "compute_107a"),
+        ((10, 0), "compute_100a", 144),
+        ((10, 3), "compute_103a", 144),
+        ((10, 7), "compute_107a", 208),
     ),
 )
-def test_jit_spec_is_exact_per_capability(monkeypatch, capability, arch) -> None:
+def test_jit_spec_is_exact_per_capability(
+    monkeypatch, capability, arch, grid_ctas
+) -> None:
     monkeypatch.setenv("FLASHINFER_CUDA_ARCH_LIST", "10.0a 10.3a 10.7a")
     monkeypatch.setattr(_jit, "is_cuda_version_at_least", lambda version: True)
     _jit.gen_cake_mxfp8_megamoe_ep16_module.cache_clear()
@@ -386,6 +393,17 @@ def test_jit_spec_is_exact_per_capability(monkeypatch, capability, arch) -> None
     assert spec.name.endswith(_jit.device_arch(capability))
     assert any(arch in flag for flag in spec.extra_cuda_cflags)
     assert len(spec.sources) == 3
+    # The fused grid: the default 72 clusters, or the module's CAKE_MEGAMOE_GRID_CLUSTERS.
+    assert _jit.fused_grid_ctas(capability) == grid_ctas
+    grid_flags = [
+        flag
+        for flag in spec.extra_cuda_cflags
+        if flag.startswith("-DCAKE_MEGAMOE_GRID_CLUSTERS=")
+    ]
+    assert grid_flags == (
+        [] if grid_ctas == 144 else [f"-DCAKE_MEGAMOE_GRID_CLUSTERS={grid_ctas // 2}"]
+    )
+    assert _max_launch_epoch(grid_ctas) == {144: 14913079, 208: 10324439}[grid_ctas]
 
 
 @pytest.mark.parametrize("arch", ("sm_100a", "sm_103a", "sm_107a"))
@@ -491,13 +509,67 @@ def test_host_calls_bridge_the_torch_stream() -> None:
         assert len(bridged_calls) == 1
 
 
-def test_launch_epoch_guard_prevents_grid_counter_overflow() -> None:
-    _validate_launch_epoch(0)
-    _validate_launch_epoch(_MAX_LAUNCH_EPOCH)
+@pytest.mark.parametrize("grid_ctas", (144, 208))
+def test_launch_epoch_guard_prevents_grid_counter_overflow(grid_ctas) -> None:
+    _validate_launch_epoch(0, grid_ctas)
+    _validate_launch_epoch(_max_launch_epoch(grid_ctas), grid_ctas)
+    assert (_max_launch_epoch(grid_ctas) + 2) * grid_ctas > 2**31 - 1
+    assert (_max_launch_epoch(grid_ctas) + 1) * grid_ctas <= 2**31 - 1
     with pytest.raises(RuntimeError, match="launch epoch is exhausted"):
-        _validate_launch_epoch(-1)
+        _validate_launch_epoch(-1, grid_ctas)
     with pytest.raises(RuntimeError, match="launch epoch is exhausted"):
-        _validate_launch_epoch(_MAX_LAUNCH_EPOCH + 1)
+        _validate_launch_epoch(_max_launch_epoch(grid_ctas) + 1, grid_ctas)
+
+
+@pytest.mark.parametrize(
+    "arch,clusters", (("sm_100a", 72), ("sm_103a", 72), ("sm_107a", 104))
+)
+def test_cute_dsl_grid_matches_each_program_schedule(arch, clusters) -> None:
+    from flashinfer.experimental.cake_mxfp8_megamoe_ep16 import cute_dsl
+
+    assert set(cute_dsl.FUSED_GRID_CTAS) == {a for a, _ in _jit._ARCH_FLAGS.values()}
+    grid_ctas = cute_dsl.FUSED_GRID_CTAS[arch]
+    assert grid_ctas == 2 * clusters
+    assert _max_launch_epoch(grid_ctas) == {144: 14913079, 208: 10324439}[grid_ctas]
+    # Each fused program fixes its static schedule: the FC work items and the
+    # weight prefetch stride by the cluster count of the grid it is launched on.
+    for role in ("fused", "fused_return_all_cta"):
+        text = _jit.cute_dsl_source(role, arch).read_text()
+        strides = re.findall(r"\(\((?:prefetch_)?item(?:_\d+)? \* (\d+)\) \+ ", text)
+        assert len(strides) == 6 and set(strides) == {str(clusters)}
+    # The CuTe-DSL grid follows its programs, not the CUDA module's define.
+    source = Path(cute_dsl.__file__).read_text()
+    assert "fused_grid_ctas" not in source
+    assert "CAKE_MEGAMOE_GRID_CLUSTERS" not in source
+
+
+@pytest.mark.parametrize("backend", ("cuda", "cute_dsl"))
+@pytest.mark.parametrize("capability,grid_ctas", (((10, 3), 144), ((10, 7), 208)))
+def test_session_refuses_a_device_with_fewer_sms_than_the_fused_grid(
+    monkeypatch, backend, capability, grid_ctas
+) -> None:
+    def all_gather_object(output, selected, *, group):
+        output[:] = [selected] * 16
+
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "get_rank", lambda group: 0)
+    monkeypatch.setattr(dist, "get_world_size", lambda group: 16)
+    monkeypatch.setattr(dist, "all_gather_object", all_gather_object)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: capability)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda device: SimpleNamespace(multi_processor_count=grid_ctas - 1),
+    )
+    monkeypatch.setattr(_jit, "is_cuda_version_at_least", lambda version: True)
+    monkeypatch.setenv("FLASHINFER_CUDA_ARCH_LIST", "10.0a 10.3a 10.7a")
+
+    # Both backends need every CTA of the cooperative grid resident, one per SM.
+    with pytest.raises(RuntimeError, match=f"needs {grid_ctas} co-resident CTAs"):
+        _CakeMxfp8MegaMoeEp16Session(
+            None, None, process_group=object(), backend=backend
+        )
 
 
 def test_interleave_gate_up_16() -> None:

@@ -21,7 +21,10 @@ CPU tests of the in-kernel Q / K L2 norm of the KCP GDN route (``use_qk_l2norm_i
   against the norm-off programs on the normalized rows;
 * the host plumbing on the fake backend: the composed chain (helper -> norm-off route on ``(q_hat, k_hat)`` ->
   helper pullback) bitwise, every saved / replay / checkpoint / handle form bitwise the direct one, ``qn`` / ``kn``
-  never retained, the saved set v2, the option and the facade keyword, the byte queries.
+  never retained, the saved set v2, the option and the facade keyword, the byte queries;
+* issue #8367 (norm off and on): plain ``split`` / ``view`` head views of a packed QKV row keep torch's autograd
+  path -- their hooks and ``retain_grad`` fire, the gradients are bitwise those of contiguous operands and of
+  ``packed_qkv_views_det_kcp`` views, and only the packed views hand the packed dQKV row on without a concatenation.
 
 The fake backend is not bitwise the device programs in #1 / #8's bodies (different accumulation orders): these tests
 prove the plumbing and the oracle, not GPU numerics (``test_cake_gdn_det_train_kcp_dist.py`` holds the GPU rows).
@@ -627,7 +630,12 @@ def test_modes_are_bitwise_with_the_norm(segments) -> None:
         if reuse is True:
             assert kcp.KEPT_STATS["take"] - stats["take"] == 1
             assert kcp.LAST_CALL["bwd"]["tapes_source"] == "kept"
-            assert kcp.LAST_CALL["bwd"]["qk_source"] == "qk_apply"
+        if kcp.LAST_CALL["bwd"]["tapes_source"] == "kept":
+            # the recompute forward's qn / kn came with the tapes: no program re-reads the raw rows to normalize
+            assert kcp.LAST_CALL["bwd"]["qk_source"] == "kept"
+            assert not {"qk_apply", "fwd_prep_l2n"} & set(
+                kcp.LAST_CALL["bwd"]["sequence"]
+            )
     _same(
         direct, _autograd(ctx, ops, ckpt=True, save_mode="full", **o), "checkpoint full"
     )
@@ -674,6 +682,114 @@ def test_modes_are_bitwise_with_the_norm(segments) -> None:
     assert not torch.equal(off["out"], ref["out"]) and not torch.equal(
         off["dq"], ref["dq"]
     )
+
+
+def _split_view_pass(ctx, ops, form: str, *, ckpt: bool, **o) -> dict:
+    """One autograd pass on q / k / v as head views of a packed ``[T, (2 H_qk + HV) * 128]`` leaf.  ``form``:
+    ``"plain"`` = ``split`` + ``view`` (torch's own split backward), ``"packed"`` = :func:`packed_qkv_views_det_kcp`,
+    ``"replace"`` = packed views with a hook on ``q`` that returns a new gradient.  A tensor hook (recording the
+    gradient) and ``retain_grad`` are set on every view (and on the split outputs) of the original forward."""
+    T, H, HV = ops["q"].shape[0], ops["q"].shape[1], ops["v"].shape[1]
+    row = torch.cat([ops[n].reshape(T, -1) for n in ("q", "k", "v")], -1)
+    row = row.contiguous().requires_grad_(True)
+    g, beta = (ops[n].detach().clone().requires_grad_(True) for n in ("g", "beta"))
+    fired: dict[str, list[torch.Tensor]] = {}
+    views: dict[str, torch.Tensor] = {}
+
+    def fn(row, g, beta):
+        if form == "plain":
+            parts = row.split((H * 128, H * 128, HV * 128), dim=-1)
+            q, k, v = (
+                p.view(T, n, 128) for p, n in zip(parts, (H, H, HV), strict=True)
+            )
+        else:
+            parts = ()
+            q, k, v = kcp.packed_qkv_views_det_kcp(row, H_qk=H, HV=HV)
+        if not views:  # the original forward (a checkpoint recompute builds a graph no backward runs)
+            views.update(q=q, k=k, v=v, **{f"part{i}": p for i, p in enumerate(parts)})
+            for name, t in views.items():
+                t.register_hook(
+                    lambda gr, name=name: fired.setdefault(name, []).append(gr.clone())
+                )
+                t.retain_grad()
+            if form == "replace":
+                q.register_hook(lambda gr: gr.clone())
+        return kcp.chunk_gdn_det_kcp(q, k, v, g, beta, ctx, backend="fake", **o)
+
+    before = dict(kcp.PACKED_SPLIT_STATS)
+    if ckpt:
+        from torch.utils.checkpoint import checkpoint
+
+        out = checkpoint(fn, row, g, beta, use_reentrant=False)
+    else:
+        out = fn(row, g, beta)
+    out.backward(ops["dout"])
+    return {
+        "out": out.detach(),
+        "row": row.grad,
+        "dg": g.grad,
+        "dbeta": beta.grad,
+        "fired": fired,
+        "views": views,
+        "grad_layout": kcp.LAST_CALL["bwd"]["grad_layout"],
+        "split": {n: kcp.PACKED_SPLIT_STATS[n] - before[n] for n in before},
+    }
+
+
+@pytest.mark.parametrize("ckpt", [False, True], ids=["direct", "checkpoint"])
+@pytest.mark.parametrize("norm", [False, True], ids=["l2n-off", "l2n-on"])
+def test_plain_split_views_keep_hooks_and_bitwise_gradients(norm, ckpt) -> None:
+    """Issue #8367: plain ``split`` / ``view`` head views of one packed QKV row take torch's own autograd path (the
+    split backward concatenates the GDN backward's packed ``dq`` / ``dk`` / ``dv`` views): tensor hooks and
+    ``retain_grad`` on ``q`` / ``k`` / ``v`` and on the split outputs fire once with the contiguous call's gradients,
+    and the row gradient, ``dg``, ``dbeta`` and ``out`` are bitwise those of contiguous operands and of
+    :func:`packed_qkv_views_det_kcp` views.  Only the packed views' split hands the packed row on; hooks on the packed
+    views fire too, and a hook that replaces a gradient makes that split concatenate (same values)."""
+    ctx, ops = _setup()
+    if not norm:
+        # unit-norm Q / K rows: valid operands with the norm off (the raw rows are the norm-on operands)
+        for n in ("q", "k"):
+            x = ops[n].float()
+            ops[n] = (x / x.norm(dim=-1, keepdim=True)).to(BF16)
+    o = {"use_qk_l2norm_in_kernel": norm}
+    ref = _autograd(ctx, ops, ckpt=ckpt, **o)
+    T = ops["q"].shape[0]
+    want = {n: ref["d" + n] for n in ("q", "k", "v")}
+    row = torch.cat([want[n].reshape(T, -1) for n in ("q", "k", "v")], -1)
+    expect_split = {
+        "plain": {"aliased": 0, "concatenated": 0},
+        "packed": {"aliased": 1, "concatenated": 0},
+        "replace": {"aliased": 0, "concatenated": 1},
+    }
+    for form, split in expect_split.items():
+        got = _split_view_pass(ctx, ops, form, ckpt=ckpt, **o)
+        assert torch.equal(got["out"], ref["out"]), form
+        assert torch.equal(got["row"], row), form
+        assert torch.equal(got["dg"], ref["dg"]) and torch.equal(
+            got["dbeta"], ref["dbeta"]
+        ), form
+        # the GDN backward writes one packed dQKV row for packed operands in every form
+        assert got["grad_layout"] == "packed", form
+        assert got["split"] == split, form
+        assert sorted(got["fired"]) == sorted(got["views"]), form
+        for i, n in enumerate(("q", "k", "v")):
+            assert len(got["fired"][n]) == 1, (form, n)
+            assert torch.equal(got["fired"][n][0], want[n]), (form, n)
+            assert torch.equal(got["views"][n].grad, want[n]), (form, n)
+            if form == "plain":
+                part = got["fired"][f"part{i}"]
+                assert len(part) == 1 and torch.equal(part[0], want[n].reshape(T, -1))
+
+
+def test_packed_views_refuse_in_place_changes() -> None:
+    """The packed views are outputs of one custom autograd node that are views of ``qkv``: autograd refuses an
+    in-place change to them while ``qkv`` requires grad (the README's packed Q/K/V note)."""
+    H, HV, T = 2, 6, 5
+    qkv = torch.zeros(T, (2 * H + HV) * 128, dtype=BF16, requires_grad=True)
+    q, k, v = kcp.packed_qkv_views_det_kcp(qkv, H_qk=H, HV=HV)
+    for t in (q, k, v):
+        with pytest.raises(RuntimeError, match="inplace"):
+            t.mul_(2)
 
 
 def test_norm_off_is_the_v1_route() -> None:
@@ -1069,9 +1185,135 @@ def test_launch_values_are_the_program_args() -> None:
     assert kcp.TART_MODULE_OF["fwd_prep_l2n"] == "gdn_chunk_det_train_fwd_prep_l2n_v1"
 
 
+class _PeakWorkspace(kcp.WorkspaceDetKcp):
+    """A workspace recording the most bytes it binds (every allocation path)."""
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.peak = 0
+
+    def _upd(self):
+        self.peak = max(self.peak, self.bytes)
+
+    def tape(self, name):
+        t = super().tape(name)
+        self._upd()
+        return t
+
+    def pool(self, name, n=None):
+        t = super().pool(name, n)
+        self._upd()
+        return t
+
+    def ensure(self, *a, **k):
+        tb = super().ensure(*a, **k)
+        self._upd()
+        return tb
+
+    def adopt_tape(self, name, t):
+        r = super().adopt_tape(name, t)
+        self._upd()
+        return r
+
+
+def test_kept_backward_binds_the_recompute_rows() -> None:
+    """A checkpoint with kept recompute tapes and the norm: the recompute forward hands its ``qn`` / ``kn`` over with
+    the tapes, the backward binds them (``qk_source`` ``"kept"``) and launches neither ``qk_apply`` nor #1_l2n; the
+    rows it reads are the forward's (``record_qk``), the gradients the direct autograd's, nothing of the norm and no
+    kept entry is left after the backward (#7039), and the arena follows the kept form of the workspace query."""
+    from torch.utils.checkpoint import checkpoint
+
+    ctx, ops = _setup()
+    H_qk, HV = ops["q"].shape[1], ops["v"].shape[1]
+    o = dict(use_qk_l2norm_in_kernel=True)
+    direct = _autograd(ctx, ops, ckpt=False, **o)
+    layout = gbytes.gdn_det_workspace_layout_kcp(
+        ctx, H_qk=H_qk, HV=HV, reuse_recompute_tapes=True, **o
+    )
+    ws = _PeakWorkspace()
+    leaves = [
+        ops[n].detach().clone().requires_grad_(True)
+        for n in ("q", "k", "v", "g", "beta")
+    ]
+
+    def fn(q, k, v, g, beta):
+        return kcp.chunk_gdn_det_kcp(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            ctx,
+            workspace=ws,
+            backend="fake",
+            reuse_recompute_tapes=True,
+            test_knobs={"record_qk": True},
+            **o,
+        )
+
+    stats = dict(kcp.KEPT_STATS)
+    out = checkpoint(fn, *leaves, use_reentrant=False)
+    assert ws.peak == layout["forward"], (ws.peak, layout["forward"])
+    ws.peak = 0
+    out.backward(ops["dout"])
+    assert ws.peak == layout["backward"], (ws.peak, layout["backward"])
+    assert ws.bytes == layout["bwd.phase.end"], (ws.bytes, layout["bwd.phase.end"])
+    rec = kcp.LAST_CALL["bwd"]
+    assert rec["tapes_source"] == "kept" and rec["qk_source"] == "kept"
+    assert rec["rstd_source"] == "saved"
+    assert not {"qk_apply", "fwd_prep_l2n"} & set(rec["sequence"]), rec["sequence"]
+    assert "bwd_dqkg_l2n" in rec["sequence"]
+    for key in ("take", "released"):
+        assert kcp.KEPT_STATS[key] - stats[key] == 1, key
+    assert kcp.kept_registry_size() == 0
+    qh, rq = l2n.qk_l2norm_ref(ops["q"])
+    kh, rk = l2n.qk_l2norm_ref(ops["k"])
+    assert torch.equal(rec["qk"]["qn"], qh) and torch.equal(rec["qk"]["kn"], kh)
+    assert torch.equal(rec["qk"]["rstd"], torch.stack([rq, rk]))
+    assert not set(ws._tapes) & {*kcp.QK_TAPES, kcp.QK_RSTD}, sorted(ws._tapes)
+    got = {
+        "out": out.detach(),
+        **{n: lf.grad for n, lf in zip(GRADS, leaves, strict=True)},
+    }
+    _same(direct, got, "kept checkpoint")
+
+
+def test_kept_rows_are_checked() -> None:
+    """A hand-off forward unbinds ``qn`` / ``kn`` from the arena and hands them over exactly when the norm is on;
+    a kept set without them (or with them while the call runs without the norm) is refused by the backward."""
+    ctx, ops = _setup()
+    for on in (True, False):
+        o = dict(backend="fake", use_qk_l2norm_in_kernel=on, reuse_recompute_tapes=True)
+        ws = kcp.WorkspaceDetKcp()
+        call, _ = kcp._prepare(
+            *_ops(ops),
+            ctx,
+            scale=None,
+            opts=kcp.make_options(**o),
+            workspace=ws,
+            backward=False,
+        )
+        _out, saved = kcp._fwd_body(call, save=True, hand_off=True)
+        assert set(saved.kept.qk) == (set(kcp.QK_TAPES) if on else set())
+        assert not set(ws._tapes) & {*kcp.QK_TAPES, kcp.QK_RSTD}, sorted(ws._tapes)
+        saved.kept.qk = (
+            {}
+            if on
+            else {
+                n: torch.zeros(ops["q"].shape, dtype=torch.bfloat16)
+                for n in kcp.QK_TAPES
+            }
+        )
+        with pytest.raises(ValueError, match="qn / kn"):
+            kcp.chunk_gdn_det_bwd_kcp(
+                *_ops(ops), ctx, ops["dout"], saved=saved, workspace=ws, **o
+            )
+
+
 def test_workspace_layout_counts_the_norm_rows() -> None:
-    """The workspace query: ``qn`` / ``kn`` in the forward and every backward phase, the arena ``r`` only where #1
-    is re-run; flag off: the v1 layout exactly; the measured arena of a light backward fits it."""
+    """The workspace query: ``qn`` / ``kn`` in the forward and every backward phase (the kept-tape form: hand-off
+    tensors, ``bwd.kept_tapes``, outside the workspace), the arena ``r`` only where #1 is re-run; flag off: the v1
+    layout exactly."""
     ctx, ops = _setup()
     H_qk, HV = ops["q"].shape[1], ops["v"].shape[1]
     T = ops["q"].shape[0]
@@ -1086,17 +1328,29 @@ def test_workspace_layout_counts_the_norm_rows() -> None:
         on = gbytes.gdn_det_workspace_layout_kcp(
             ctx, H_qk=H_qk, HV=HV, use_qk_l2norm_in_kernel=True, **kw
         )
-        assert on["fwd.qn"] == on["fwd.kn"] == on["bwd.qn"] == on["bwd.kn"] == row
+        kept = bool(kw.get("reuse_recompute_tapes"))
+        assert on["fwd.qn"] == on["fwd.kn"] == row
+        assert on["bwd.qn"] == on["bwd.kn"] == (0 if kept else row), kw
+        assert on["bwd.kept_tapes"] - off["bwd.kept_tapes"] == (2 * row if kept else 0)
         assert on["forward"] - off["forward"] == 2 * row
         replays = kw.get("boundary_mode") == "replay" or not (
-            kw.get("save_mode") == "full" or kw.get("reuse_recompute_tapes")
+            kw.get("save_mode") == "full" or kept
         )
         assert on["bwd.qk_rstd"] == (8 * T * H_qk if replays else 0), kw
         for ph in ("exchange", "walk", "end"):
             assert (
                 on[f"bwd.phase.{ph}"] - off[f"bwd.phase.{ph}"]
-                == 2 * row + on["bwd.qk_rstd"]
+                == (0 if kept else 2 * row) + on["bwd.qk_rstd"]
             ), (kw, ph)
+        if kept:
+            assert (
+                on["bwd.phase.recompute_forward"] - off["bwd.phase.recompute_forward"]
+                == 2 * row
+            )
+        assert (
+            on["backward_transient"] - off["backward_transient"]
+            == 2 * row + on["bwd.qk_rstd"]
+        ), kw
         assert not any(k.endswith((".qn", ".kn", ".qk_rstd")) for k in off)
     with pytest.raises(TypeError):
         gbytes.gdn_det_workspace_bytes_kcp(
@@ -1154,76 +1408,3 @@ def test_no_fla_import() -> None:
     ctx, ops = _setup()
     _saved_pass(ctx, ops, use_qk_l2norm_in_kernel=True)
     assert "fla" not in sys.modules
-
-
-def test_nondeterministic_route_drops_or_refuses_the_l2n_option() -> None:
-    """The ``flashinfer.cake_gdn_train_kcp`` facade's ``deterministic=False`` route: a deterministic options instance
-    or mapping with ``use_qk_l2norm_in_kernel=False`` reaches the non-deterministic package without the key (its real
-    ``make_options`` accepts the result), and ``True`` is refused with a ``ValueError`` (no fallback, no ``TypeError``)."""
-    facade = importlib.import_module("flashinfer.cake_gdn_train_kcp")
-    nd_options = importlib.import_module(
-        "flashinfer.experimental.cake_gdn_train_kcp.cake_options"
-    )
-    det_options = _mod("cake_options")
-    for off in (
-        det_options.OptionsDetKcp(),
-        det_options.OptionsDetKcp(use_qk_l2norm_in_kernel=False),
-        {"use_qk_l2norm_in_kernel": False},
-        {"save_mode": "full", "use_qk_l2norm_in_kernel": False},
-    ):
-        mapped = facade._options_for(False, off)
-        assert "use_qk_l2norm_in_kernel" not in mapped
-        assert isinstance(nd_options.make_options(mapped), nd_options.OptionsKcp)
-    assert facade._nd_without_l2n({"use_qk_l2norm_in_kernel": False}) == {}
-    for on in (
-        det_options.OptionsDetKcp(use_qk_l2norm_in_kernel=True),
-        {"use_qk_l2norm_in_kernel": True},
-    ):
-        with pytest.raises(
-            ValueError, match="does not support use_qk_l2norm_in_kernel"
-        ):
-            facade._options_for(False, on)
-    with pytest.raises(ValueError, match="does not support use_qk_l2norm_in_kernel"):
-        facade._nd_without_l2n({"use_qk_l2norm_in_kernel": True})
-    det_mapped = facade._options_for(True, {"use_qk_l2norm_in_kernel": True})
-    assert det_options.make_options(det_mapped).use_qk_l2norm_in_kernel is True
-
-
-def test_nondeterministic_byte_queries_drop_or_refuse_the_l2n_option(
-    monkeypatch,
-) -> None:
-    """The facade's byte queries on the ``deterministic=False`` route follow the compute entries:
-    ``use_qk_l2norm_in_kernel=False`` reaches the non-deterministic package without the key and ``True`` is refused
-    with a ``ValueError``; the deterministic route forwards the keyword unchanged."""
-    facade = importlib.import_module("flashinfer.cake_gdn_train_kcp")
-    seen: list = []
-
-    def recorder(tag):
-        def fn(*args, **kwargs):
-            seen.append((tag, kwargs))
-            return 0
-
-        return fn
-
-    names = {
-        "gdn_saved_bytes_kcp": "gdn_det_saved_bytes_kcp",
-        "gdn_workspace_bytes_kcp": "gdn_det_workspace_bytes_kcp",
-    }
-    for entry, det_name in names.items():
-        monkeypatch.setattr(facade._pkg(), entry, recorder(f"nondet:{entry}"))
-        monkeypatch.setattr(facade._det(), det_name, recorder(f"det:{det_name}"))
-    ctx = object()  # the recorders read nothing
-    for entry, det_name in names.items():
-        query = getattr(facade, entry)
-        query(ctx, H_qk=1, HV=3, deterministic=False, use_qk_l2norm_in_kernel=False)
-        assert seen[-1][0] == f"nondet:{entry}"
-        assert "use_qk_l2norm_in_kernel" not in seen[-1][1]
-        with pytest.raises(
-            ValueError, match="does not support use_qk_l2norm_in_kernel"
-        ):
-            query(ctx, H_qk=1, HV=3, deterministic=False, use_qk_l2norm_in_kernel=True)
-        query(ctx, H_qk=1, HV=3, use_qk_l2norm_in_kernel=True)
-        assert seen[-1] == (
-            f"det:{det_name}",
-            {"H_qk": 1, "HV": 3, "use_qk_l2norm_in_kernel": True},
-        )

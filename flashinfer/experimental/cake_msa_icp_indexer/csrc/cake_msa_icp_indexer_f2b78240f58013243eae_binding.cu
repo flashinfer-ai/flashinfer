@@ -134,7 +134,7 @@ void Run(TensorView a_recv, TensorView a_num_valid_pages, TensorView a_output, T
   cudaLaunchConfig_t config{};
   config.gridDim = dim3(static_cast<unsigned>(grid_x), static_cast<unsigned>(grid_y), static_cast<unsigned>(grid_z));
   config.blockDim = dim3(32, 1, 1);
-  config.dynamicSmemBytes = 0;
+  config.dynamicSmemBytes = 256;
   config.stream = stream;
   cudaLaunchAttribute attrs[1] = {};
   int n = 0;

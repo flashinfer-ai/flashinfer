@@ -5,8 +5,11 @@ Generated device kernels and TVM-FFI launchers for SM100 / SM103 behind
 inputs with head dimension 512 (BF16 output); `kv_cache_format="nvfp4"` selects
 the NVFP4 decode family (`run_cake_dsv4_nvfp4`; see the host module docstring).
 Select the backend explicitly; `backend="auto"` keeps the architecture-based
-selection. Programmatic dependent launch and the TRTLLM-GEN RopeQuant epilogue
-are not supported.
+selection. `enable_pdl` launches the FP8 persistent and M64 programs as
+programmatic dependents (they wait for the previous grid before their first
+global read and trigger their own dependents right after); the other BF16 / FP8
+programs launch without it, and the NVFP4 family rejects it. The TRTLLM-GEN
+RopeQuant epilogue is not supported.
 
 ```python
 from flashinfer.mla import (
