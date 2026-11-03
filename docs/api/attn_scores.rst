@@ -92,17 +92,3 @@ internal scheduling policy for that configuration, so the returned tensor
   min_block_table_width
   padded_seq_len
   precompile_paged_mqa_logits
-
-Single-head Paged MQA Logits
----------------------------
-
-For a single-head indexer with BF16 queries and keys on SM10x,
-``single_head_paged_mqa_logits`` writes plain dot-product scores into a
-caller-provided FP32 output tensor, without head weights or a ReLU.
-
-.. currentmodule:: flashinfer.attn_scores
-
-.. autosummary::
-  :toctree: ../generated
-
-  single_head_paged_mqa_logits
