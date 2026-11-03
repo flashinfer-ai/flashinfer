@@ -103,16 +103,17 @@ CONSTANTS: Dict[str, float] = dict(
     rows64_eff=0.8,  # MMA efficiency of a 64-row CTA tile relative to 128 rows
     eff16b=0.15,  # transaction efficiency of a B box 16 bytes wide ...
     eff32b=0.2,  # ... 32 bytes ...
-    eff64b=0.6,  # ... 64 bytes (128 and wider: 1)
-    mcast_pow=1.5,  # multicast divides an operand's traffic by cluster_dim ** mcast_pow
+    eff64b=0.5,  # ... 64 bytes (128 and wider: 1)
+    mcast_pow=1.25,  # multicast divides an operand's traffic by cluster_dim ** mcast_pow
     l2_frac=1.0,  # the shared L2 fabric delivers this fraction of SMs x load bandwidth in aggregate
     step_floor=32.0,  # cycles per k-step no tile can beat
     fixup_floor=8000.0,  # cycles of the workspace split's fixup launch
-    raster_pow=0.0,  # the wrong raster: (tile-count imbalance) ** raster_pow
+    raster_pow=0.1,  # the wrong raster: (tile-count imbalance) ** raster_pow
+    raster_min=4.0,  # ... once the tile-count imbalance reaches this ratio
     overrun_pow=0.65,  # a swizzle group larger than its axis: (swizzle / tiles) ** overrun_pow
     sw_pen=1.1,  # swizzle > 1 where it cannot help
     sw_gain=1.0,  # swizzle > 1 with many tiles in flight on both axes
-    sw_partial=1.0,  # a swizzle that does not divide its axis (a partial last group)
+    sw_partial=1.05,  # a swizzle that does not divide its axis (a partial last group)
     two_cta=0.9,  # the 2-CTA pair's shared B and halved per-CTA issue
 )
 
@@ -160,8 +161,8 @@ def estimate_cycles(
     eb = ELEM_BITS_OF[in_fmt] / 8.0
     kk = MMA_K_OF[in_fmt]
     rate = part.mma_flop_per_clk * (
-        16.0 / kk if kk > 16 else 1.0
-    )  # the 8-bit kind: twice the dense bf16 rate
+        kk / 16.0
+    )  # the 8-bit kind (K step 32): twice the dense bf16 rate
     m_tiles = -(-M // tm)
     n_tiles = -(-N // tn)
     if m_tiles == 0 or n_tiles == 0:
@@ -218,10 +219,11 @@ def estimate_cycles(
     # wrong choice costs more the more unbalanced the tile grid. Swizzle: groups of ``swizzle_size`` tiles along the slow
     # axis; a group larger than that axis leaves CTAs idle (the overrun), a valid group helps only when many tiles are in
     # flight on both axes.
-    if m_tiles > 1 and n_tiles > 1 and m_tiles != n_tiles:
+    imbalance = max(m_tiles, n_tiles) / min(m_tiles, n_tiles)
+    if m_tiles > 1 and n_tiles > 1 and imbalance >= p["raster_min"]:
         good_raster = (k.raster_along == "m") == (m_tiles < n_tiles)
         if not good_raster:
-            t *= (max(m_tiles, n_tiles) / min(m_tiles, n_tiles)) ** p["raster_pow"]
+            t *= imbalance ** p["raster_pow"]
     sw = k.swizzle_size
     if sw > 1:
         axis = n_tiles if k.raster_along == "m" else m_tiles

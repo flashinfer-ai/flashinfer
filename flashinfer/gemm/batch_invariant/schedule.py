@@ -73,18 +73,40 @@ def rank_topk(
     in_fmt: str = "bf16",
 ) -> List[GemmConfig]:
     """The dispatcher's ranked list (what FlashInfer's autotuner profiles under ``batch_invariant=True``): `heuristic.rank`'s
-    order (the heuristic's best first), distinct records, at most ``k``; ``default_config(...) == rank_topk(...)[0]``. Every entry
+    order (the heuristic's best first) with the raster twin of each of the best ceil(k/2) records inserted after it,
+    distinct records, at most ``k``; ``default_config(...) == rank_topk(...)[0]``. Every entry
     is a member of the class's enumerated space, so an autotuner may pick among them freely without changing a single bit.
     ``sm_count`` and ``family`` name the part (the operand device's). Empty when nothing implements the shape."""
+    import dataclasses
+
     from .heuristic import rank
 
+    ranked: List[GemmConfig] = [
+        rec
+        for rec, _t in rank(
+            M, N, K, chunks, b_major, 2, sm_count, family, in_fmt=in_fmt
+        )
+    ]  # distinct by construction (the enumerated space has no duplicates)
+    present = set(ranked)
+    seen: set = set()
     out: List[GemmConfig] = []
-    for rec, _t in rank(M, N, K, chunks, b_major, 2, sm_count, family, in_fmt=in_fmt):
+    # the best ceil(k/2) records, each followed by its raster twin when the space has it: the one knob the estimate does
+    # not price is hedged for free by the autotuner; then the rank order fills the list
+    for rec in ranked[: -(-k // 2)]:
+        twin = dataclasses.replace(
+            rec, raster_along="n" if rec.raster_along == "m" else "m"
+        )
+        for cand in (rec, twin):
+            if cand in present and cand not in seen:
+                out.append(cand)
+                seen.add(cand)
+    for rec in ranked:
         if len(out) >= k:
             break
-        if rec not in out:
+        if rec not in seen:
             out.append(rec)
-    return out
+            seen.add(rec)
+    return out[:k]
 
 
 def default_config(
