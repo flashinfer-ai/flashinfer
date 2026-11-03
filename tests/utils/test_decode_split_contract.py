@@ -92,9 +92,10 @@ def test_tensor_core_decode_preserves_disable_split_kv(
     wrapper, calls = _wrapper(monkeypatch, True, use_cuda_graph)
     _call(wrapper, entrypoint, disable_split_kv)
     assert len(calls) == 1
-    # The final FA2 arguments are fixed_split_size, disable_split_kv,
-    # num_colocated_ctas, uniform_q_len for both sizing and planning.
-    assert calls[0][1][-3] is disable_split_kv
+    # workspace_size omits the two integer workspace buffers used by planning.
+    # Index from the front so appending FA2 options does not shift the flag.
+    disable_split_kv_index = 15 if entrypoint == "workspace_size" else 17
+    assert calls[0][1][disable_split_kv_index] is disable_split_kv
 
 
 @pytest.mark.parametrize("use_cuda_graph", [False, True])

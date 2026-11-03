@@ -90,6 +90,14 @@ recapture.
 
 .. currentmodule:: flashinfer.decode
 
+.. note::
+
+   Compatibility: CUDA-core decode now raises ``ValueError`` for
+   ``disable_split_kv=True`` in ``plan()``, ``fast_decode_plan()``, and
+   ``workspace_size()``. Previously this flag was silently ignored on that
+   path. To disable split-KV, select ``backend="fa2", use_tensor_cores=True``.
+   Leave the flag at ``False`` to retain CUDA-core decode.
+
 .. autoclass:: BatchDecodeWithPagedKVCacheWrapper
     :members:
     :exclude-members: begin_forward, forward, forward_return_lse

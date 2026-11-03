@@ -1876,9 +1876,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
         fixed_split_size : Optional[int]
             The fixed split size for FA2 split-kv decode, in pages.
         disable_split_kv : bool
-            Whether to disable the split-kv for determinism in CUDA Graph. Defaults to ``False``.
-            CUDA-core decode does not support this option and raises
-            ``ValueError`` when it is ``True``.
+            Whether to disable split-KV on the ``fa2`` tensor-core path.
+            Defaults to ``False``. CUDA-core decode raises ``ValueError``
+            when this is ``True``.
         q_len_per_req : int
             The number of query tokens per request. Defaults to ``1``.
 
@@ -2214,9 +2214,10 @@ class BatchDecodeWithPagedKVCacheWrapper:
             Note that compatibility with CUDA graph is NOT guaranteed, as even when bs is fixed, kv seq len can change
             and lead to a varied number of launched CTAs.
         disable_split_kv : bool,
-            Whether to disable the split-kv for determinism in CUDA Graph, defaults to ``False``.
-            CUDA-core decode does not support this option and raises
-            ``ValueError`` when it is ``True``.
+            Whether to disable split-KV on the ``fa2`` tensor-core or
+            ``cute-dsl`` backend. Defaults to ``False``. CUDA-core decode
+            raises ``ValueError`` when this is ``True``. The ``cutile``
+            backend currently ignores this flag.
         q_len_per_req : int
             The number of query tokens per request. Defaults to ``1``. This
             must be set at :meth:`plan` time to enable the XQA MTP decode fast
