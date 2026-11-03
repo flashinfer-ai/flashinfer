@@ -2593,9 +2593,9 @@ def test_k1_convenience_calls_cache_their_bindings(monkeypatch):
         is out_f
     )
     assert next(reversed(cake_backend._K1_DET_CACHE))[2] == (("fwd",), 0, False)
-    module_name = det_backend._k1_plan(
-        X, W.t(), out_f, transposed_out=False, knobs={}
-    )[-1]
+    module_name = det_backend._k1_plan(X, W.t(), out_f, transposed_out=False, knobs={})[
+        -1
+    ]
     names = [n for _, n in det_backend.arg_plan_of(det_backend.MODULES[module_name])]
     ((args, _),) = entry_fn.calls
     assert args[names.index("enable_pdl")] == 0
