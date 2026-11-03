@@ -963,8 +963,11 @@ def _ffi_arguments_reusing(owner, site, arguments) -> tuple:
     other argument of a rebuilt record is the same tensor object at the same
     address as in the record it replaces.  Such a tensor reuses its previous
     tvm-ffi export (same data pointer, shape, strides and dtype); only the
-    tensors that moved go through :func:`_ffi_arguments` again.  ``owner``
-    keeps the last export of each record ``site`` until that site is rebuilt.
+    tensors that moved go through :func:`_ffi_arguments` again.  A moved
+    tensor bound again at the next position (``out`` / ``out_tma``, the FP32
+    final state and its tensor map) takes the export of that position.
+    ``owner`` keeps the last export of each record ``site`` until that site is
+    rebuilt.
     """
     import torch
 
@@ -972,7 +975,8 @@ def _ffi_arguments_reusing(owner, site, arguments) -> tuple:
     previous = memo.get(site, ())
     exported = list(arguments)
     kept: list = [None] * len(exported)
-    fresh = []
+    fresh: list[tuple[int, Any, int]] = []
+    repeats: list[int] = []
     for position, value in enumerate(exported):
         if not isinstance(value, torch.Tensor):
             continue
@@ -981,6 +985,8 @@ def _ffi_arguments_reusing(owner, site, arguments) -> tuple:
         if prior is not None and prior[0] is value and prior[1] == pointer:
             exported[position] = prior[2]
             kept[position] = prior
+        elif fresh and fresh[-1][0] == position - 1 and fresh[-1][1] is value:
+            repeats.append(position)
         else:
             fresh.append((position, value, pointer))
     if fresh:
@@ -988,6 +994,9 @@ def _ffi_arguments_reusing(owner, site, arguments) -> tuple:
         for (position, value, pointer), ffi_value in zip(fresh, converted, strict=True):
             exported[position] = ffi_value
             kept[position] = (value, pointer, ffi_value)
+        for position in repeats:
+            exported[position] = exported[position - 1]
+            kept[position] = kept[position - 1]
     memo[site] = tuple(kept)
     return tuple(exported)
 
