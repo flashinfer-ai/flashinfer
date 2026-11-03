@@ -204,7 +204,7 @@ kernel_cake_kda_train_fb4352670ceb4f9828c1(const __grid_constant__ CUtensorMap d
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     __nv_bfloat16* smem_v0 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
     const int smem_v0_addr = smem + 1024;
     __nv_bfloat16* smem_v0_0 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 17408);
@@ -270,8 +270,7 @@ kernel_cake_kda_train_fb4352670ceb4f9828c1(const __grid_constant__ CUtensorMap d
     float* dbp_s = reinterpret_cast<float*>(smem_raw + 222720);
     const int dbp_s_addr = smem + 222720;
 
-    // Mbarrier init (22 pipeline groups, 0 ordered-sequence groups, 28 barriers)
-    // Mbarriers at smem_raw[0..224)
+    // Mbarrier init (28 barriers at smem_raw[0..224))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -346,18 +345,16 @@ kernel_cake_kda_train_fb4352670ceb4f9828c1(const __grid_constant__ CUtensorMap d
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
-
-    // Kernel post-init ops
-    const int tmem_acc_dq = taddr;
-    const int tmem_acc_dk = taddr + 128;
-    const int tmem_acc_dw = taddr + 256;
-    const int tmem_acc_da = taddr + 384;
-    const int tmem_acc_dvb = taddr;
-    const int tmem_acc_dkgb = taddr + 128;
-    const int tmem_acc_da1 = taddr + 256;
-    const int tmem_acc_da2 = taddr + 320;
-    const int tmem_acc_daq = taddr + 448;
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_acc_dq = taddr;
+    const unsigned int tmem_acc_dk = taddr + 128;
+    const unsigned int tmem_acc_dw = taddr + 256;
+    const unsigned int tmem_acc_da = taddr + 384;
+    const unsigned int tmem_acc_dvb = taddr;
+    const unsigned int tmem_acc_dkgb = taddr + 128;
+    const unsigned int tmem_acc_da1 = taddr + 256;
+    const unsigned int tmem_acc_da2 = taddr + 320;
+    const unsigned int tmem_acc_daq = taddr + 448;
 
     // ---- Role: compute ----
     if (warp <= 7) {
@@ -426,7 +423,7 @@ kernel_cake_kda_train_fb4352670ceb4f9828c1(const __grid_constant__ CUtensorMap d
                 int bbase = (it_i & 1) * 64;
                 float beta_t = beta_s[t_row + bbase];
                 int cbos = rec_s[(it_i & 1) * 2];
-                __nv_bfloat16* dv_item = dv_out + ((long long)(cbos * num_heads + head_1) * 128);
+                __nv_bfloat16* dv_item = dv_out + (long long)(cbos * num_heads + head_1) * 128;
                 int clen = rec_s[(it_i & 1) * 2 + 1];
                 float dgk_inter = 0.0f;
                 mbarrier_wait(h_full_addr, _phase_h_full_0);
