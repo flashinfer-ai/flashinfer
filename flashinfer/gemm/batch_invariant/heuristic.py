@@ -101,6 +101,8 @@ def register_capacity(family: str, sm_count: int, size: int, clusters: int) -> N
     cap = _QUERIED_CAPACITY.setdefault(
         (family, sm_count), dict(capacity_for(family, sm_count))
     )
+    if cap.get(size) == clusters:
+        return  # nothing the ranking depends on changed: the cached rankings stay
     cap[size] = clusters
     rank.cache_clear()
 
@@ -122,6 +124,8 @@ def l2_for(family: str, sm_count: Optional[int], nominal: bool = False) -> float
 
 def register_l2(family: str, sm_count: int, l2_bytes: float) -> None:
     """Record a device's L2 size (from the API's device properties)."""
+    if _QUERIED_L2.get((family, sm_count)) == float(l2_bytes):
+        return  # unchanged: the cached rankings stay
     _QUERIED_L2[(family, sm_count)] = float(l2_bytes)
     rank.cache_clear()
 
