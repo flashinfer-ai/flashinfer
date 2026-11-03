@@ -94,14 +94,30 @@ backward into `w.main_grad` (below). Both default to off; with the defaults
 the routes, programs, plans and bits are unchanged, and `plan["accumulate"]`
 is `"off"`.
 
+The fused accumulate builds of this release add into an **fp32** `out` only:
+the 512-wide k tile's half-release forms have fp32 accumulate builds (feature
+matrix below). A **bf16** `out` always takes the composed route: the bf16
+overwrite into a scratch, then the same-dtype `out.add_`, which is
+autograd's AccumulateGrad (the same bits and the same cost as the default
+bf16 `w.grad` accumulation).
+
 The host plans an accumulating launch exactly as the overwrite of `out.dtype`
 (route, k tile, stage, grid, tail split, raster, wave mode) and records how it
 adds in `plan["accumulate"]`:
 
 | `plan["accumulate"]` | when | what runs |
 | --- | --- | --- |
-| `"fused"` | the 512-wide k tile, the route serves the selected stage's accumulate build (`stages == (stage + "_acc",)`) on the architecture, and `out` is 32-byte aligned (base, row pitch, expert pitch) | one launch whose epilogue reads C and adds the tile into it; no new workspace, nothing allocated after the first launch on a stream |
-| `"composed"` | otherwise: the 256-wide k tile, a stage without an accumulate build (the `main` / `main_wave` forms), a dtype or architecture without one, or a less aligned `out` (`plan["accumulate_reason"]`: `"tile_k"`, `"stage"`, `"alignment"`; the last warns once per process) | the overwrite into a contiguous scratch of `out.dtype`, then `out.add_(scratch)` on the same stream |
+| `"fused"` | the 512-wide k tile with its unordered split tail, the route serves the selected stage's accumulate build (`stages == (stage + "_acc",)`) on the architecture, that build's library can load (below), and `out` is 32-byte aligned (base, row pitch, expert pitch) | one launch whose epilogue reads C and adds the tile into it; no new workspace, nothing allocated after the first launch on a stream |
+| `"composed"` | otherwise; `plan["accumulate_reason"]` is the first condition that fails: `"tile_k"` (the 256-wide k tile), `"tail"` (an ordered tail), `"stage"` (no accumulate build of the stage for the dtype and architecture: every bf16 `out`, and the `main` / `main_wave` forms), `"min_cuda"` (the build cannot load) or `"alignment"`; the last two warn once per process | the overwrite into a contiguous scratch of `out.dtype`, then `out.add_(scratch)` on the same stream |
+
+The route is chosen by a static rule (nothing is compiled, loaded or
+test-built to decide it): an accumulate build is bound when its prebuilt
+library exists under `aot/`, or else when the version of FlashInfer's JIT
+toolkit reaches the build's `build.json` `min_cuda` (the loader's own rule). The fp32 accumulate builds use the PTX ISA 9.4
+`red.add.noftz.f32` form, so their `min_cuda` is 13.4 on every architecture;
+an ahead-of-time build with an older toolkit ships no library for them, and
+with a JIT toolkit below 13.4 the call composes (`"min_cuda"`) instead of
+failing.
 
 `out` is required (`out_dtype` None or `out.dtype`) and must not overlap
 itself (row stride at least `K`, expert stride at least `N` row strides: an
@@ -111,58 +127,60 @@ padding is allowed and never read or written. `launch()` and every CUDA graph
 replay add again: a prepared accumulate launch is not idempotent. A fused
 launch bumps `out._version` when it is launched or captured (the composed
 `add_` bumps it itself). `sum_m == 0` launches nothing and leaves `out`
-unchanged. The composed route keeps its scratch (`E * N * K` elements of
-`out.dtype`, the size of the weight gradient) for the life of the prepared
-launch or graph capture (inside a captured backward it comes from the graph's
-pool), so one prepared composed launch must not be in flight on two streams at
-once. As for any in-place operation, two launches into the same `out` on
-different streams must be ordered by the caller.
+unchanged. The composed route's scratch (`E * N * K` elements of `out.dtype`,
+the size of the weight gradient) is owned by the prepared launch, as its
+descriptor slots are: keep the launch alive while any CUDA graph that captured
+it may replay (the graph does not keep the scratch alive), and do not have one
+prepared composed launch in flight on two streams at once. Inside a captured
+backward, the scratch is allocated from, and returned to, the graph's pool
+within that backward. As for any in-place operation, two launches into the
+same `out` on different streams must be ordered by the caller.
 
 Numerical contract:
 
-- Fused, fp32 `out`: `out <- out + dW` with one round-to-nearest fp32 add of
-  the tile's fp32 sum; subnormals are kept (no flush). Every whole tile is
-  bitwise `out0.add_(dW32)`, where `dW32` is the fp32 weight gradient of the
-  same plan.
-- Fused, bf16 `out`: `out <- RN_bf16(out + RN_bf16(dW))`, the bits of
-  `out0.add_(dW_bf16)` with the bf16 weight gradient of the same plan, that is
-  of autograd's AccumulateGrad (NaN payloads may differ).
-- A split tail tile (512-wide k tile, `tail_splits > 1`) adds its unordered
-  fp32 sum into C once, so it varies run to run as the overwrite does; the
-  nondeterminism scope is unchanged.
+- Fused (fp32 `out`): `out <- out + dW` with one round-to-nearest fp32 add of
+  the tile's fp32 sum into C. Every whole tile is bitwise `out0.add_(dW32)`,
+  where `dW32` is the fp32 weight gradient of the same plan; that add keeps
+  subnormals (no flush to zero).
+- A split tail tile (512-wide k tile, `tail_splits > 1`) adds `C + S` once,
+  where `S` is the tile's unordered fp32 sum of its split units, so it varies
+  run to run as the overwrite does; the nondeterminism scope is unchanged.
+  `S` is the overwrite's partial sum, whose unit reductions flush subnormal
+  values to zero (above); subnormals are kept only in the `C + S` add.
+- Composed: the overwrite's `dW` in `out.dtype` added by `out.add_`. For a
+  bf16 `out` that is `RN_bf16(out + dW_bf16)`, AccumulateGrad's bits.
 - An empty group's `out[e]` is not read or written on the fused route (its
   bits, `-0.0` and NaN payloads included, stay). The composed route has the
   semantics of `out.add_`: the values are kept, but `-0.0` may become `+0.0`
   and a signaling NaN is quieted. The published contract is the composed one;
   bitwise-untouched empty groups are a property of the fused route.
-- The fp32 accumulate builds use the PTX ISA 9.4 `red.add.noftz.f32` form, so
-  their `build.json` entries need CUDA 13.4 (`min_cuda`) on every
-  architecture; with neither a prebuilt library nor a CUDA 13.4 JIT toolkit,
-  the fused fp32 launch raises the loader's `min_cuda` error when it is
-  prepared. The route is chosen statically (no toolchain probe).
 
 `cake_grouped_mm(x, w, offs, deterministic=False, fuse_wgrad_accumulation=True)`
 follows Megatron and Transformer Engine: `w.main_grad` must be an fp32 or bf16
 tensor of `w`'s shape on its device with unit stride along the last dimension
 (checked at the forward call when `w` requires grad, and again at the
 backward, which reads `w.main_grad` then, so a re-pointed buffer is honoured).
-The backward adds into it and returns for `w` a fresh `torch.empty` of `w`'s
-shape and dtype when `w` has the attribute `grad_added_to_main_grad` (it is
-set to `True`; `torch.zeros` when `w.zero_out_wgrad` is true), else `None`
-(`w.grad` stays untouched and no gradient hook of `w` fires). `x.grad` is
-unchanged, bitwise. Every backward adds: `retain_graph` twice adds twice, and a
-`torch.autograd.grad(..., inputs=...)` that excludes `w` still adds into
+The backward adds into it (fused for an fp32 `main_grad` where the route
+serves it, composed for a bf16 one) and returns for `w` a fresh `torch.empty`
+of `w`'s shape and dtype when `w` has the attribute `grad_added_to_main_grad`
+(it is set to `True`; `torch.zeros` when `w.zero_out_wgrad` is true), else
+`None` (`w.grad` stays untouched and no gradient hook of `w` fires). `x.grad`
+is unchanged, bitwise. Every backward adds: `retain_graph` twice adds twice,
+and a `torch.autograd.grad(..., inputs=...)` that excludes `w` still adds into
 `w.main_grad`, so zero-bubble (split backward-input / backward-weight)
 schedules are not supported. A `w` that does not require grad is never added
 to. The flag raises `NotImplementedError` under `torch.jit.trace`,
 `torch.compile` and in a `create_graph` backward; under a reentrant checkpoint
 `w` arrives detached without `main_grad` (`ValueError`; use
-`use_reentrant=False`). Peak memory: the fused fp32 route needs no fp32
-temporary of `4 * E * N * K` bytes (Megatron's unfused path keeps a bf16
-`w.grad` and a separate fp32 add); with `grad_added_to_main_grad` the
-placeholder still takes `2 * E * N * K` bytes, so the saving against an fp32
-gradient followed by `main_grad.add_` is `2 * E * N * K` bytes, not
-`4 * E * N * K`.
+`use_reentrant=False`).
+
+Peak memory of one weight gradient into an fp32 `main_grad` (`S = E * N * K`
+elements): against an fp32 `dW` followed by `main_grad.add_` (a `4 * S`-byte
+temporary), the fused route with `grad_added_to_main_grad` saves `2 * S` bytes
+(its bf16 placeholder of `2 * S` bytes remains; without the attribute it saves
+`4 * S`); against Megatron's unfused path (a bf16 `w.grad` of `2 * S` bytes,
+then the fp32 add) the peak is equal. The benchmark's accumulation arms report
+the measured peak.
 
 The facade `flashinfer.experimental.cake.grouped_mm` takes the same keywords:
 
@@ -306,8 +324,8 @@ only); the 512-wide k tile's routes bind the unordered-tail builds.
 | `wgrad` k512 unordered tail: `main_wave`, `main_wave_halves` (wp8) | yes | yes | - |
 | `wgrad` k512 unordered tail: `main_halves_k256t` | - | - | yes (slack tail) |
 | `wgrad` output dtypes | bf16, fp32 | bf16, fp32 | bf16, fp32 |
-| `wgrad` accumulate, fused (`_acc` builds) | `main_halves`, `main_wave_halves` (bf16, fp32) | `main_halves`, `main_wave_halves` (bf16, fp32) | `main_halves`, `main_halves_k256t` (bf16, fp32) |
-| `wgrad` accumulate, composed | k256 tile, `main` / `main_wave`, misaligned `out` | k256 tile, `main` / `main_wave`, misaligned `out` | k256 tile, `main`, misaligned `out` |
+| `wgrad` accumulate, fused (`_acc` builds, fp32 `out` only) | `main_halves`, `main_wave_halves` | `main_halves`, `main_wave_halves` | `main_halves`, `main_halves_k256t` |
+| `wgrad` accumulate, composed | bf16 `out`; k256 tile; `main` / `main_wave`; misaligned `out`; `_acc` library not loadable | bf16 `out`; k256 tile; `main` / `main_wave`; misaligned `out`; `_acc` library not loadable | bf16 `out`; k256 tile; `main`; misaligned `out`; `_acc` library not loadable |
 | CUDA toolkit floor (`min_cuda`) | 12.8 | 12.9 | 13.4 |
 | CUDA toolkit floor of the fp32 `_acc` builds | 13.4 | 13.4 | 13.4 |
 
@@ -347,13 +365,15 @@ checks that `deterministic=True` gives the deterministic package's bits, that
 run-to-run variation of the unordered weight gradient.
 `test_cake_moe_grouped_gemm_standalone.py` imports a copy with `flashinfer`
 blocked. `test_cake_moe_grouped_gemm_acc.py` covers the accumulate mode: the
-`_acc` stages against their twins, the plans, the routes and the checks on
-the CPU; the fused and composed results against the fp64 reference and the
-bitwise oracles, empty groups, padding, short groups, streams, graph replay,
-allocations and the version counter on a GPU; and the autograd flag. The
-benchmark's `acc` (checkpointed micro-step) and `wgrad_acc` (one weight
-gradient) rows time the accumulation arms (`ovw`, `acc`, `mgB`, `mgF`, `mgO`,
-`mgX`, `mgXn`, `mgX_zero`, `accX`) with peak memory. The benchmark times the deterministic and non-deterministic packages
+`_acc` stages against the shipped set and their twins, the plans, the routes
+and the checks on the CPU; the fused and composed results against the fp64
+reference and the bitwise oracles (also on every benchmark row as planned),
+empty groups, padding, short groups, streams, graph replay, allocations and
+the version counter on a GPU; and the autograd flag. The benchmark's `acc`
+(checkpointed micro-step), `bwd_acc` (its backward) and `wgrad_acc` (one
+weight gradient) rows time the accumulation arms (`ovw`, `acc`, `mgB`, `mgF`,
+`mgO`, `mgX`, `mgXn`, `mgX_zero`, `accX`, and the deterministic package's
+`det_acc` and `det_mgB`) with peak memory. The benchmark times the deterministic and non-deterministic packages
 (fwd, dgrad, wgrad and an autograd `2 x fwd + bwd` step) with peak memory,
 against `torch._grouped_mm` and a per-group cuBLAS loop.
 

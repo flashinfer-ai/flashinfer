@@ -52,32 +52,45 @@ the ``cake`` / ``cake_det`` time ratio.  Consecutive rows run the arms in
 alternating order (the JSON records it as ``arm_order``); an arm with no
 program for the device is dropped.
 
-Weight-gradient accumulation (opt-in ``--ops acc,wgrad_acc``): the rows of the
-step's distributions plus ``short16`` (E=32, 16 groups of 64-484 rows beside 16
-of 7918: the 512-wide k tile with short groups), each projection.  ``acc`` is
-one checkpointed micro-step (non-reentrant, early stop off, ``2 x fwd + bwd``)
-whose weight gradient goes to the parameter's gradient or ``main_grad``;
-``wgrad_acc`` is the weight gradient alone (prepared launches).  Arms (the
-non-deterministic package throughout): ``ovw`` (bf16 ``w.grad`` overwritten
-every micro-step), ``acc`` (AccumulateGrad: bf16 ``w.grad`` added into),
-``mgB`` (Megatron's unfused path: bf16 ``dW``, then the fp32 ``main_grad.add_``),
-``mgF`` (fp32 ``dW`` into a temporary, then ``main_grad.add_``), ``mgO`` (fp32
-``dW`` written over ``main_grad``: the lower bound of a fused add), ``mgX``
-(``fuse_wgrad_accumulation=True`` / ``accumulate=True`` into the fp32
-``main_grad``, with Megatron's ``grad_added_to_main_grad`` placeholder),
+Weight-gradient accumulation (opt-in ``--ops acc,bwd_acc,wgrad_acc``): the rows
+of the step's distributions plus ``short16`` (E=32, 16 groups of 64-484 rows
+beside 16 of 7918: the 512-wide k tile with short groups), each projection.
+``acc`` is one checkpointed micro-step (non-reentrant, early stop off,
+``2 x fwd + bwd``) whose weight gradient goes to the parameter's gradient or
+``main_grad``; ``bwd_acc`` is the backward alone (the data gradient and the
+weight gradient with its accumulation, replayed on one forward with
+``retain_graph``); ``wgrad_acc`` is the weight gradient alone (prepared
+launches).  Arms (the non-deterministic package unless named ``det_``):
+``ovw`` (bf16 ``w.grad`` overwritten every micro-step), ``acc``
+(AccumulateGrad: bf16 ``w.grad`` added into), ``mgB`` (Megatron's unfused
+path: bf16 ``dW``, then the fp32 ``main_grad.add_``), ``mgF`` (fp32 ``dW``
+into a temporary, then ``main_grad.add_``: the unfused route of this package),
+``mgO`` (fp32 ``dW`` written over ``main_grad``: the lower bound of a fused
+add), ``mgX`` (``fuse_wgrad_accumulation=True`` / ``accumulate=True`` into the
+fp32 ``main_grad``, with Megatron's ``grad_added_to_main_grad`` placeholder),
 ``mgXn`` (``mgX`` without the attribute: no placeholder), ``mgX_zero``
-(``mgX`` with ``zero_out_wgrad``) and ``accX`` (the same into a bf16
-``main_grad``).  The peak memory includes the placeholder gradient and every
+(``mgX`` with ``zero_out_wgrad``), ``accX`` (the same into a bf16
+``main_grad``: the composed route, a bf16 ``dW`` and the same-dtype add),
+``det_acc`` (the deterministic package: its fp32 ``dW`` into a temporary, then
+``main_grad.add_``, the facade's deterministic ``accumulate=True`` route; in
+the step and the backward, through a Function running the deterministic
+forward, data gradient and weight gradient) and ``det_mgB`` (the
+deterministic autograd wrapper's bf16 ``w.grad``, then the fp32
+``main_grad.add_``; the deterministic bf16 ``dW`` and the add in
+``wgrad_acc``).  The peak memory includes the placeholder gradient and every
 temporary.  A fused arm records ``plan["accumulate"]`` and, where the device
 serves an accumulate build of its dtype, fails unless the row is fused
-(``--allow-composed`` turns that into a note).  The JSON's ``acc_ratios`` holds
-``mgX/mgF``, ``mgX/mgB``, ``mgX/mgO``, ``accX/acc`` and ``mgF/mgO``.
+(``--allow-composed`` turns that into a note).  The JSON's ``acc_ratios``
+holds ``mgX/mgF``, ``mgX/mgB``, ``mgX/mgO``, ``mgX/det_acc``,
+``mgX/det_mgB``, ``accX/acc`` and ``mgF/mgO``.  The non-Cake baselines of
+the accumulation rows (Transformer Engine, ``torch._grouped_mm``, per-expert
+cuBLAS) are not arms of this benchmark.
 
 Usage::
 
     python benchmarks/bench_cake_moe_grouped_gemm.py [--ops fwd,wgrad,step] [--rows e4_m112576] [--arms cake_det,cake] [--cupti] [--json out.json]
     python benchmarks/bench_cake_moe_grouped_gemm.py --ops step,step_es,block,block_es --arms cake_det,cake,cake_inforward,torch_grouped_mm [--census]
-    python benchmarks/bench_cake_moe_grouped_gemm.py --ops acc,wgrad_acc --arms ovw,acc,mgB,mgF,mgO,mgX,mgXn,mgX_zero,accX
+    python benchmarks/bench_cake_moe_grouped_gemm.py --ops acc,bwd_acc,wgrad_acc --arms ovw,acc,mgB,mgF,mgO,mgX,mgXn,mgX_zero,accX,det_acc,det_mgB
 """
 
 import argparse
@@ -90,6 +103,7 @@ import torch.utils.checkpoint
 
 from flashinfer.experimental.cake import cake_moe_grouped_gemm as pkg
 from flashinfer.experimental.cake.cake_moe_grouped_gemm import cake_backend as cb
+import flashinfer.experimental.cake_moe_grouped_det_gemm as det_pkg
 from flashinfer.experimental.cake_moe_grouped_det_gemm import cake_backend as det_cb
 from flashinfer.experimental.cake_moe_grouped_det_gemm.cake_autograd import (
     cake_grouped_det_mm,
@@ -107,13 +121,15 @@ OPS = (
     "block",
     "block_es",
     "acc",
+    "bwd_acc",
     "wgrad_acc",
 )
 DEFAULT_OPS = OPS[:4]  # the earlier row set
 AUTOGRAD_OPS = ("step", "step_es", "block", "block_es")
 BLOCK_OPS = ("block", "block_es")
-# The weight-gradient accumulation rows: a checkpointed micro-step, and the weight gradient alone.
-ACC_OPS = ("acc", "wgrad_acc")
+# The weight-gradient accumulation rows: a checkpointed micro-step, its backward alone, and the weight
+# gradient alone.
+ACC_OPS = ("acc", "bwd_acc", "wgrad_acc")
 AUTOGRAD_NOTES = {
     "step": "checkpointed 2 x fwd + bwd",
     "step_es": "checkpointed step, early stop on (the recompute skips the GEMM only "
@@ -140,7 +156,21 @@ EXPERT_COUNT_SUM_M = 131072
 # 512-wide k tile, whose accumulate epilogue then runs tiles of short mainloops.
 ACC_SHORT_E32 = [64 + 28 * i for i in range(16)] + [7918] * 16
 ARMS = ("cake_det", "cake", "torch_grouped_mm", "per_expert_cublas", "cudnn_grouped_mm")
-ACC_ARMS = ("ovw", "acc", "mgB", "mgF", "mgO", "mgX", "mgXn", "mgX_zero", "accX")
+ACC_ARMS = (
+    "ovw",
+    "acc",
+    "mgB",
+    "mgF",
+    "mgO",
+    "mgX",
+    "mgXn",
+    "mgX_zero",
+    "accX",
+    "det_acc",
+    "det_mgB",
+)
+# The deterministic-package baselines of the accumulation rows.
+DET_ACC_ARMS = ("det_acc", "det_mgB")
 # The arms that add with the package's accumulate mode, and the dtype of their main_grad.
 FUSED_ARMS = {
     "mgX": torch.float32,
@@ -152,6 +182,8 @@ ACC_RATIOS = (
     ("mgX", "mgF"),
     ("mgX", "mgB"),
     ("mgX", "mgO"),
+    ("mgX", "det_acc"),
+    ("mgX", "det_mgB"),
     ("accX", "acc"),
     ("mgF", "mgO"),
 )
@@ -238,6 +270,8 @@ def row_flops(row):
     flops = sum(2.0 * sum_m * n * k for n, k in (PROJECTIONS[p] for p in projs))
     if row["op"] in ("step", "acc"):
         return flops * 4  # two forward passes, the data and the weight gradient
+    if row["op"] == "bwd_acc":
+        return flops * 2  # the data and the weight gradient
     if row["op"] in AUTOGRAD_OPS:
         return flops * 3
     return flops
@@ -529,14 +563,18 @@ def cudnn_grouped_mm_arm(row, t):
 
 
 class _MainGradMm(torch.autograd.Function):
-    """The caller-side Function of the ``mgF`` / ``mgO`` arms: the package's forward and data
-    gradient, and the weight gradient written by the caller into ``w.main_grad`` (``mgF``: the fp32
-    ``dW`` into a temporary, then ``main_grad.add_``; ``mgO``: the fp32 ``dW`` written over
-    ``main_grad``).  Returns no gradient for ``w``."""
+    """The caller-side Function of the ``mgF`` / ``mgO`` / ``det_acc`` arms: the forward and data
+    gradient, and the weight gradient written by the caller into ``w.main_grad`` (``mgF``: this
+    package's fp32 ``dW`` into a temporary, then ``main_grad.add_``; ``mgO``: its fp32 ``dW`` written
+    over ``main_grad``; ``det_acc``: the deterministic package's forward, data gradient and fp32
+    ``dW`` into a temporary, then ``main_grad.add_``).  Returns no gradient for ``w``."""
 
     @staticmethod
     def forward(ctx, x, w, offs, mode):
-        y = pkg.grouped_gemm_fwd(x, w, offs, deterministic=False)
+        if mode == "det_acc":
+            y = det_pkg.grouped_det_gemm_fwd(x, w, offs)
+        else:
+            y = pkg.grouped_gemm_fwd(x, w, offs, deterministic=False)
         ctx.save_for_backward(x, w, offs)
         ctx.w, ctx.mode = w, mode
         return y
@@ -547,11 +585,19 @@ class _MainGradMm(torch.autograd.Function):
         # Bind the CUDA context on the autograd thread (``cake_autograd``).
         torch.cuda.current_stream(x.device).query()
         g = grad_y.contiguous()
+        det = ctx.mode == "det_acc"
         dx = None
         if ctx.needs_input_grad[0]:
-            dx = pkg.grouped_gemm_dgrad(g, w, offs, deterministic=False)
+            if det:
+                dx = det_pkg.grouped_det_gemm_dgrad(g, w, offs)
+            else:
+                dx = pkg.grouped_gemm_dgrad(g, w, offs, deterministic=False)
         main_grad = ctx.w.main_grad
-        if ctx.mode == "mgF":
+        if det:
+            main_grad.add_(
+                det_pkg.grouped_det_gemm_wgrad(g, x, offs, out_dtype=torch.float32)
+            )
+        elif ctx.mode == "mgF":
             main_grad.add_(
                 pkg.grouped_gemm_wgrad(
                     g, x, offs, out_dtype=torch.float32, deterministic=False
@@ -583,11 +629,12 @@ def _accumulate_mode(t, main_grad):
 
 def _accumulate_note(arm, row, t):
     """The plan note of a fused arm; raises ``AccumulatePlanError`` when the row composes on a
-    device that serves the accumulate build of the arm's dtype (unless ``--allow-composed``)."""
+    device whose registry serves an accumulate build of the arm's dtype (also when that build
+    cannot load here, ``"min_cuda"``), unless ``--allow-composed``."""
     main_grad = t["main_grad32" if FUSED_ARMS[arm] == torch.float32 else "main_grad16"]
     mode, reason = _accumulate_mode(t, main_grad)
-    servable = cb.generated_program_available(
-        main_grad.device, "wgrad", main_grad.dtype, accumulate=True
+    servable = cb.acc_stage_served(
+        DTYPE_NAMES[main_grad.dtype], cb.arch_for(main_grad.device)
     )
     if REQUIRE_FUSED and mode != "fused" and servable:
         raise AccumulatePlanError(
@@ -597,14 +644,16 @@ def _accumulate_note(arm, row, t):
     return f"accumulate={mode}" + (f" ({reason})" if reason else "")
 
 
-def _acc_micro_step(arm, t):
-    """One checkpointed micro-step of ``arm`` (non-reentrant, early stop off: ``2 x fwd + bwd``)
-    returning ``(y, leaves)``; the parameter's gradient goes where the arm sends it."""
+def _acc_autograd(arm, t, op):
+    """The timed callable of ``arm`` on an autograd accumulation row, returning ``(y, leaves)``; the
+    parameter's gradient goes where the arm sends it.  ``acc``: one checkpointed micro-step
+    (non-reentrant, early stop off: ``2 x fwd + bwd``).  ``bwd_acc``: the backward alone, replayed
+    with ``retain_graph`` on one forward made here (outside the timing)."""
     x = t["x"].detach().requires_grad_(True)
     w = t["w"].detach().requires_grad_(True)
     g, offs = t["g"], t["offs"]
     main_grad = t["main_grad16" if arm == "accX" else "main_grad32"]
-    if arm in ("mgF", "mgO") or arm in FUSED_ARMS:
+    if arm in ("mgF", "mgO", "det_acc") or arm in FUSED_ARMS:
         w.main_grad = main_grad
     if arm in ("mgX", "mgX_zero", "accX"):
         w.grad_added_to_main_grad = False
@@ -614,7 +663,12 @@ def _acc_micro_step(arm, t):
         def mm(a, b, o):
             return pkg.cake_grouped_mm(a, b, o, deterministic=False)
 
-    elif arm in ("mgF", "mgO"):
+    elif arm == "det_mgB":
+
+        def mm(a, b, o):
+            return cake_grouped_det_mm(a, b, o)
+
+    elif arm in ("mgF", "mgO", "det_acc"):
 
         def mm(a, b, o):
             return _MainGradMm.apply(a, b, o, arm)
@@ -626,15 +680,23 @@ def _acc_micro_step(arm, t):
                 a, b, o, deterministic=False, fuse_wgrad_accumulation=True
             )
 
+    y_once = mm(x, w, offs) if op == "bwd_acc" else None
+
     def run():
         x.grad = None
         if arm != "acc":
             # Megatron's DDP drops the placeholder; the overwrite arms start from no gradient.
             w.grad = None
-        with torch.utils.checkpoint.set_checkpoint_early_stop(False):
-            y = torch.utils.checkpoint.checkpoint(mm, x, w, offs, use_reentrant=False)
-            y.backward(g)
-        if arm == "mgB":
+        if y_once is not None:
+            y_once.backward(g, retain_graph=True)
+            y = y_once
+        else:
+            with torch.utils.checkpoint.set_checkpoint_early_stop(False):
+                y = torch.utils.checkpoint.checkpoint(
+                    mm, x, w, offs, use_reentrant=False
+                )
+                y.backward(g)
+        if arm in ("mgB", "det_mgB"):
             main_grad.add_(w.grad)
         return y, [x, w]
 
@@ -657,6 +719,18 @@ def _acc_wgrad(arm, t):
         raise NotImplementedError(
             "the placeholder-gradient arms have autograd rows only"
         )
+    if arm in DET_ACC_ARMS:
+        # The deterministic package's dW (fp32: the facade's deterministic accumulate route; bf16:
+        # Megatron's unfused path) into a temporary, then the fp32 add into main_grad.
+        dtype = torch.float32 if arm == "det_acc" else torch.bfloat16
+        tmp = torch.empty(mg32.shape, dtype=dtype, device=mg32.device)
+        det_launch = det_cb.prepare_grouped_det_gemm_wgrad(g, x, offs, out=tmp)
+
+        def run_det():
+            det_launch.launch()
+            mg32.add_(tmp)
+
+        return run_det
     if arm == "ovw":
         return prepare(torch.empty_like(mg16)).launch
     if arm == "mgO":
@@ -683,9 +757,9 @@ def _acc_arm(arm):
         if op not in ACC_OPS:
             raise NotImplementedError("the accumulation arms run the accumulation rows")
         note = _accumulate_note(arm, row, t) if arm in FUSED_ARMS else ""
-        if op == "acc":
-            fn = _acc_micro_step(arm, t)
-            return fn, None, f"checkpointed 2 x fwd + bwd ({arm}) {note}".strip()
+        if op in ("acc", "bwd_acc"):
+            what = "checkpointed 2 x fwd + bwd" if op == "acc" else "backward"
+            return _acc_autograd(arm, t, op), None, f"{what} ({arm}) {note}".strip()
         return _acc_wgrad(arm, t), None, f"weight gradient ({arm}) {note}".strip()
 
     return build
@@ -705,6 +779,7 @@ CAKE_BACKENDS = {
     "cake": cb,
     "cake_inforward": cb,
     **dict.fromkeys(ACC_ARMS, cb),
+    **dict.fromkeys(DET_ACC_ARMS, det_cb),
 }
 
 

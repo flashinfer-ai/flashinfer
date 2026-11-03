@@ -65,30 +65,38 @@ Weight-gradient accumulation
 caller's bf16 or fp32 ``out`` (``out[e] += G[e].T @ X[e]``, Megatron's gradient-accumulation
 fusion) and ``cake_grouped_mm(..., fuse_wgrad_accumulation=True)`` adds it into
 ``w.main_grad`` in its backward.  Both default to off; with the defaults nothing changes.
-The host plans the launch exactly as the overwrite of ``out``'s dtype and records the route
-in ``plan["accumulate"]``:
+The fused accumulate builds of this release add into an fp32 ``out`` only; a bf16 ``out``
+always takes the composed route (the bf16 overwrite, then the same-dtype ``out.add_``:
+autograd's AccumulateGrad bits and cost).  The host plans the launch exactly as the
+overwrite of ``out``'s dtype and records the route in ``plan["accumulate"]``:
 
 ============== ======================================================================== =========================================================
 route          when                                                                     what runs
 ============== ======================================================================== =========================================================
-``"fused"``    512-wide k tile, the selected stage has an accumulate build on the        one launch whose epilogue adds the tile into ``out``
-               architecture, ``out`` 32-byte aligned
-``"composed"`` otherwise (``plan["accumulate_reason"]``: ``"tile_k"``, ``"stage"``,     the overwrite into a scratch of ``out``'s dtype, then
-               ``"alignment"``; the last warns once per process)                         ``out.add_``
+``"fused"``    512-wide k tile with its unordered split tail, the selected stage has an  one launch whose epilogue adds the tile into ``out``
+               accumulate build on the architecture whose library can load, ``out``
+               32-byte aligned
+``"composed"`` otherwise (``plan["accumulate_reason"]``, the first that fails:          the overwrite into a scratch of ``out``'s dtype, then
+               ``"tile_k"``, ``"tail"``, ``"stage"`` -- every bf16 ``out`` --,          ``out.add_``
+               ``"min_cuda"``, ``"alignment"``; the last two warn once per process)
 ============== ======================================================================== =========================================================
 
-``out`` must not overlap itself, ``g``, ``x`` or ``offs`` (``ValueError`` on both routes,
-before anything runs).  Every launch and every CUDA graph replay adds again.  Numerical
-contract: the fused fp32 route adds the tile's fp32 sum with one round-to-nearest add,
-subnormals kept (bitwise ``out0.add_(dW32)`` on every whole tile); the fused bf16 route
-gives the bits of ``out0.add_(dW_bf16)``, autograd's AccumulateGrad; a split tail tile adds
-its unordered sum once (the nondeterminism scope is unchanged); an empty group is not
-touched by the fused route, while the composed route has ``out.add_``'s semantics (values
-kept, ``-0.0`` may become ``+0.0``).  The fp32 accumulate builds need CUDA 13.4
-(``min_cuda``).  The composed scratch (the size of the weight gradient) lives as long as the
-prepared launch or graph capture.  The autograd flag returns a placeholder gradient for
-``w`` when ``w`` has ``grad_added_to_main_grad`` (``torch.zeros`` under
-``zero_out_wgrad``), else none; it adds at every backward, also when
+An accumulate build is bound by a static rule (nothing is compiled, loaded or test-built to
+decide it): its prebuilt library exists, or the version of FlashInfer's JIT toolkit reaches
+its ``build.json`` ``min_cuda``.  The fp32 accumulate builds need CUDA 13.4; below it the
+call composes instead of failing.  ``out`` must not overlap itself, ``g``, ``x`` or ``offs``
+(``ValueError`` on both routes, before anything runs).  Every launch and every CUDA graph
+replay adds again.  Numerical contract: the fused route adds the tile's fp32 sum into the
+fp32 ``out`` with one round-to-nearest add that keeps subnormals (bitwise
+``out0.add_(dW32)`` on every whole tile); a split tail tile adds its unordered sum ``S``
+once (``S`` is the overwrite's partial sum, whose unit reductions flush subnormals; the
+nondeterminism scope is unchanged); the composed route is ``out.add_`` of the overwrite in
+``out``'s dtype; an empty group is not touched by the fused route, while the composed
+route has ``out.add_``'s semantics (values kept, ``-0.0`` may become ``+0.0``).  The
+composed scratch (the size of the weight gradient) is owned by the prepared launch: keep
+the launch alive while a CUDA graph that captured it may replay.  The autograd flag returns
+a placeholder gradient for ``w`` when ``w`` has ``grad_added_to_main_grad``
+(``torch.zeros`` under ``zero_out_wgrad``), else none; it adds at every backward, also when
 ``torch.autograd.grad``'s ``inputs`` exclude ``w`` (split backward-weight schedules are not
 supported), and raises ``NotImplementedError`` under ``torch.jit.trace``, ``torch.compile``
 and a ``create_graph`` backward.
@@ -166,7 +174,7 @@ feature                                         sm_100a         sm_103a         
 ``wgrad`` 512 half-release builds               planned, slack  planned, slack  planned, slack
 ``wgrad`` 512 k256-tail twin                    --              --              slack tail
 ``wgrad`` output dtypes                         bf16, fp32      bf16, fp32      bf16, fp32
-``wgrad`` accumulate, fused (halves forms)      planned, wave   planned, wave   planned, k256t
+``wgrad`` accumulate, fused, fp32 ``out``       planned, wave   planned, wave   planned, k256t
 CUDA toolkit floor                              12.8            12.9            13.4
 CUDA toolkit floor, fp32 accumulate builds      13.4            13.4            13.4
 =============================================== =============== =============== ===============

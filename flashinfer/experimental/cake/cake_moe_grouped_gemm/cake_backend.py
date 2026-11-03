@@ -171,20 +171,26 @@ Accumulate mode.  ``prepare_grouped_gemm_wgrad(..., out=out, accumulate=True)``
 ``out[e] <- out[e] + G_e^T X_e``, Megatron's gradient-accumulation fusion.  The
 host selects the route, the k tile, the stage and the plan exactly as for the
 overwrite of ``out.dtype`` (the twin); ``plan["accumulate"]`` records how the
-launch adds.  ``"fused"``: the 512-wide k tile, where the route serves the
-twin's accumulate build (the stage of the twin's name with ``ACC_SUFFIX``: the
-same argument plan, launch shape and host plan, an epilogue that adds into C)
-on the device's architecture and C is 32-byte aligned (its base, row pitch and
-expert pitch); one launch, which leaves an empty group's ``out[e]`` and the
-padding untouched.  ``"composed"`` (``plan["accumulate_reason"]``: the
-256-wide k tile, a stage without an accumulate build, or the alignment, the
-last with one ``UserWarning`` per process): the twin writes into a contiguous
-scratch of ``out.dtype`` that the preparation allocates and keeps with the
-launch, and the launch adds it with ``out.add_`` on the same stream.  Both
-routes check before any launch that ``out`` cannot overlap itself (row pitch at
-least ``K``, expert pitch at least ``N`` row pitches) nor ``g``, ``x`` or
-``offs``.  ``plan["accumulate"]`` is ``"off"`` for an overwrite.  A launch
-adds once more at every ``launch()`` and every CUDA graph replay.
+launch adds.  ``"fused"``: the 512-wide k tile with its unordered split tail
+(no overwriting tail-reduce stage), where the route serves the twin's
+accumulate build (the stage of the twin's name with ``ACC_SUFFIX``: the same
+argument plan, launch shape and host plan, an epilogue that adds into C) on the
+device's architecture, that build's library can load by the loader's static
+rule (its prebuilt file under ``aot/``, else a FlashInfer JIT toolkit at its
+``build.json`` ``min_cuda``: :func:`acc_library_loadable`, nothing built or
+probed), and C is 32-byte aligned (its base, row pitch and expert pitch); one
+launch, which leaves an empty group's ``out[e]`` and the padding untouched.
+``"composed"`` (``plan["accumulate_reason"]``, checked in this order:
+``"tile_k"`` the 256-wide k tile, ``"tail"`` an ordered tail, ``"stage"`` a
+stage without an accumulate build, ``"min_cuda"`` a build that cannot load,
+``"alignment"``; the last two with one ``UserWarning`` per process each): the
+twin writes into a contiguous scratch of ``out.dtype`` that the preparation
+allocates and the launch owns, and the launch adds it with ``out.add_`` on the
+same stream.  Both routes check before any launch that ``out`` cannot overlap
+itself (row pitch at least ``K``, expert pitch at least ``N`` row pitches) nor
+``g``, ``x`` or ``offs``.  ``plan["accumulate"]`` is ``"off"`` for an
+overwrite.  A launch adds once more at every ``launch()`` and every CUDA graph
+replay.
 """
 
 from __future__ import annotations
@@ -200,10 +206,18 @@ from typing import Any, Callable, Optional
 import torch
 import tvm_ffi
 
+from .cake_build import (
+    _jit_toolchain,
+    _local_cuda_version,
+    _version,
+    libraries_by_name,
+    prebuilt_path,
+)
 from .cake_jit import (
     HOST_PLAN_CONSTANTS,
     PROGRAMS,
     ROUTES,
+    library_name,
     load_module,
     program_registered,
     record_name,
@@ -234,7 +248,8 @@ ACC_SUFFIX = "_acc"
 ACC_ALIGN = 32
 # ``plan["accumulate"]``: an overwrite, one launch that adds into C, or the overwrite into a scratch and an add.
 ACCUMULATE_MODES = ("off", "fused", "composed")
-# The once-per-process warnings of this module that were issued (the composed route taken for alignment).
+# The once-per-process warnings of this module that were issued (the composed route taken because an
+# accumulate build cannot load, or for the alignment).
 _WARNED: set[str] = set()
 
 
@@ -342,16 +357,53 @@ def _require_flag(value: object, keyword: str, entry: str) -> None:
         raise ValueError(f"{entry}: {keyword} must be a bool, got {value!r}")
 
 
-def acc_stage_served(out_dtype: str, arch: str) -> bool:
-    """True when the 512-wide k tile route of ``out_dtype`` (``"bfloat16"`` / ``"float32"``) serves an
-    accumulate stage (a stage named ``<twin>`` + ``ACC_SUFFIX``) on ``arch``."""
+def _acc_stages(out_dtype: str, arch: str) -> tuple[str, tuple[str, ...]]:
+    """``(route, stages)``: the 512-wide k tile weight-gradient route of ``out_dtype`` (``"bfloat16"`` /
+    ``"float32"``) and the accumulate stages (``<twin>`` + ``ACC_SUFFIX``) it serves on ``arch``."""
     name = record_name("wgrad", out_dtype=out_dtype, tile_k=512)
     route = ROUTES.get(name)
     if route is None or arch not in route["arches"]:
-        return False
-    return any(
-        item["name"].endswith(ACC_SUFFIX) and stage_served(name, item["name"], arch)
+        return name, ()
+    return name, tuple(
+        item["name"]
         for item in route["stages"]
+        if item["name"].endswith(ACC_SUFFIX) and stage_served(name, item["name"], arch)
+    )
+
+
+def acc_stage_served(out_dtype: str, arch: str) -> bool:
+    """True when the 512-wide k tile route of ``out_dtype`` (``"bfloat16"`` / ``"float32"``) serves an
+    accumulate stage (a stage named ``<twin>`` + ``ACC_SUFFIX``) on ``arch`` (the registry alone; whether
+    its library can load is :func:`acc_library_loadable`)."""
+    return bool(_acc_stages(out_dtype, arch)[1])
+
+
+@functools.cache
+def _jit_cuda_version() -> Optional[tuple[int, int]]:
+    """``(major, minor)`` of the toolkit FlashInfer's JIT builds with, the version ``cake_build.jit_spec``
+    holds an entry's ``min_cuda`` against; None without FlashInfer's JIT (the loader cannot build then).
+    Asked once per process."""
+    try:
+        _gen_jit_spec, get_cuda_version = _jit_toolchain("an accumulate build")
+        return _local_cuda_version(get_cuda_version)
+    except RuntimeError:
+        return None
+
+
+def acc_library_loadable(name: str, stage: str, arch: str) -> bool:
+    """Whether the library of ``stage`` of route ``name`` on ``arch`` can load, by the loader's own static rule
+    (``cake_build.load_library``): its prebuilt file under ``aot/`` exists, or FlashInfer's JIT toolkit
+    reaches the entry's ``build.json`` ``min_cuda`` (``cake_build.jit_spec`` refuses a lower one).  Nothing is
+    built, loaded or probed: an ahead-of-time build below an entry's floor ships no file for it, and a JIT
+    toolkit below it would raise at the preparation, so such an accumulate build is not bound (the composed
+    route, ``plan["accumulate_reason"] == "min_cuda"``)."""
+    binding = stage_binding(name, stage, arch)
+    library = library_name(binding["program"], arch, binding["specializations"])
+    if prebuilt_path(library).is_file():
+        return True
+    toolkit = _jit_cuda_version()
+    return toolkit is not None and toolkit >= _version(
+        libraries_by_name()[library]["min_cuda"]
     )
 
 
@@ -365,9 +417,11 @@ def generated_program_available(
     """True when this checkout registers the program of ``op`` for ``device``.
 
     With ``accumulate=True`` (weight gradient only): True when the 512-wide k tile route of
-    ``out_dtype`` (either output dtype when None) serves an accumulate stage on the device's
-    architecture, that is when some weight gradient into an ``out`` of that dtype takes the fused
-    route (``plan["accumulate"] == "fused"``); the composed route needs only the overwrite programs."""
+    ``out_dtype`` (either output dtype when None; False for a dtype the weight gradient does not
+    write) serves an accumulate stage on the device's architecture whose library can load
+    (:func:`acc_library_loadable`), that is when some weight gradient into an ``out`` of that dtype
+    can take the fused route (``plan["accumulate"] == "fused"``); the composed route needs only the
+    overwrite programs."""
     _require_flag(accumulate, "accumulate", "generated_program_available")
     if accumulate and op != "wgrad":
         raise ValueError(
@@ -379,8 +433,13 @@ def generated_program_available(
     name = _DTYPE_NAMES.get(out_dtype) if out_dtype is not None else None
     if not accumulate:
         return program_registered(op, arch, out_dtype=name)
-    dtypes = (name,) if name else ("bfloat16", "float32")
-    return any(acc_stage_served(dtype, arch) for dtype in dtypes if dtype)
+    if out_dtype is not None and name is None:
+        return False
+    for dtype in (name,) if name else ("bfloat16", "float32"):
+        route, stages = _acc_stages(dtype, arch)
+        if any(acc_library_loadable(route, stage, arch) for stage in stages):
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -906,20 +965,33 @@ def select_wgrad_stage(
 
 
 def wgrad_accumulate_mode(
-    name: str, stage: str, tile_k: int, arch: str, *, aligned: bool = True
+    name: str,
+    stage: str,
+    tile_k: int,
+    arch: str,
+    *,
+    aligned: bool = True,
+    constants: Optional[dict[str, Any]] = None,
 ) -> tuple[str, Optional[str]]:
     """``(plan["accumulate"], plan["accumulate_reason"])`` of a weight gradient that adds into its output,
     for the route ``name``, main stage ``stage`` and k tile ``tile_k`` the overwrite of the same output dtype
     selects on ``arch`` (module docstring, accumulate mode).
 
-    ``("fused", None)`` with the 512-wide k tile when the route serves ``stage + ACC_SUFFIX`` on ``arch`` and
-    the output is ``ACC_ALIGN``-byte aligned (``aligned``); else ``("composed", reason)`` with ``reason``
-    ``"tile_k"`` (the 256-wide k tile), ``"stage"`` (no accumulate build of ``stage`` on ``arch``) or
-    ``"alignment"``, checked in that order."""
+    ``("fused", None)`` when every condition holds; else ``("composed", reason)`` with the first that fails:
+    ``"tile_k"`` (not the 512-wide k tile), ``"tail"`` (the tile's split tail is not the unordered one added
+    in place, :func:`wgrad_unordered_tail`: an ordered tail-reduce stage would overwrite the split tiles of
+    C), ``"stage"`` (the route serves no ``stage + ACC_SUFFIX`` on ``arch``), ``"min_cuda"`` (that build's
+    library cannot load, :func:`acc_library_loadable`) or ``"alignment"`` (``out`` is not ``ACC_ALIGN``-byte
+    aligned, ``aligned``)."""
     if tile_k != 512:
         return "composed", "tile_k"
-    if not stage_served(name, stage + ACC_SUFFIX, arch):
+    if not wgrad_unordered_tail(tile_k, arch, constants):
+        return "composed", "tail"
+    acc_stage = stage + ACC_SUFFIX
+    if not stage_served(name, acc_stage, arch):
         return "composed", "stage"
+    if not acc_library_loadable(name, acc_stage, arch):
+        return "composed", "min_cuda"
     if not aligned:
         return "composed", "alignment"
     return "fused", None
@@ -1344,8 +1416,12 @@ class GroupedGemmLaunch:
     idempotent).  On the composed route (``plan["accumulate"] ==
     "composed"``) ``add_from`` is the scratch the bound programs write and the
     launch adds it into ``out`` with ``out.add_`` on the same stream (which
-    bumps ``out._version``); the scratch belongs to the prepared launch, so
-    one prepared composed launch must not be in flight on two streams at once.
+    bumps ``out._version``); the scratch is owned by the prepared launch (as
+    its descriptor slots are), so one prepared composed launch must not be in
+    flight on two streams at once, and the launch must be kept alive while any
+    graph that captured it may replay (a graph does not keep the scratch
+    alive).  A launch prepared inside a captured backward allocates the
+    scratch from, and returns it to, the graph's pool within that backward.
     On the fused route (``bump_version``) the kernel adds in place and the
     launch bumps ``out._version`` with
     ``torch.autograd.graph.increment_version`` (not for an inference tensor),
@@ -1938,9 +2014,23 @@ def _prepare_wgrad(
         # The route, the tile, the stage and the plan are the overwrite's (the twin's); only the
         # binding differs (module docstring, accumulate mode).
         mode, reason = wgrad_accumulate_mode(
-            name, main_stage, tile_k, arch, aligned=_accumulate_aligned(out)
+            name,
+            main_stage,
+            tile_k,
+            arch,
+            aligned=_accumulate_aligned(out),
+            constants=c,
         )
-        if reason == "alignment":
+        if reason == "min_cuda":
+            _warn_once(
+                "accumulate_min_cuda",
+                "prepare_grouped_gemm_wgrad(accumulate=True): the accumulate build of the "
+                f"{main_stage} stage on {arch} is neither prebuilt nor buildable by FlashInfer's JIT "
+                "toolkit (below its build.json min_cuda), so the weight gradient is written to a "
+                "scratch and added with out.add_ (the composed route, "
+                'plan["accumulate"] == "composed"); this warning is issued once per process',
+            )
+        elif reason == "alignment":
             _warn_once(
                 "accumulate_alignment",
                 "prepare_grouped_gemm_wgrad(accumulate=True): out is not "
@@ -2080,10 +2170,11 @@ def prepare_grouped_gemm_wgrad(
     (``sum_m == 0``) launches nothing and leaves ``out`` unchanged.
     ``plan["accumulate"]`` is ``"fused"`` (one launch of the stage's accumulate
     build, ``stages == (stage + ACC_SUFFIX,)``) or ``"composed"`` (the overwrite
-    into a scratch of ``out.dtype`` held by the launch, then ``out.add_``;
-    ``plan["accumulate_reason"]`` says why); every other plan key is the
-    overwrite's (module docstring, accumulate mode).  Each ``launch()`` and each
-    replay of a graph that captured it adds again.
+    into a scratch of ``out.dtype`` owned by the launch, then ``out.add_``;
+    ``plan["accumulate_reason"]`` says why; keep the launch alive while a graph
+    that captured it may replay); every other plan key is the overwrite's
+    (module docstring, accumulate mode).  Each ``launch()`` and each replay of a
+    graph that captured it adds again.
     """
     _require_deterministic_false(deterministic, "prepare_grouped_gemm_wgrad")
     _alert_not_deterministic("prepare_grouped_gemm_wgrad")
