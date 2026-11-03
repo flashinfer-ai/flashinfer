@@ -1544,7 +1544,14 @@ def test_backward_is_one_launch_with_zeroed_accumulators(monkeypatch) -> None:
         assert name == loader.selected_modules(arch, kind, C=C, S=S)[0]
         record = loader.MODULES[name]
         assert "reduce" not in record and record["launch"]["cooperative"] is False
-        assert grid == loader.launch_grid(record, device_index=device.index, C=C, S=S)
+        assert grid == pkg._one_sm_trim(
+            record,
+            values["n_ch_tiles"],
+            loader.launch_grid(record, device_index=device.index, C=C, S=S),
+            device_index=device.index,
+            arch=arch,
+            bwd_grid_mult=1,
+        )
         assert grid[0] >= values["n_ch_tiles"]
         layout = loader.accumulator_layout(record, C, values["n_ch_tiles"])
         acc_dtype = torch.float64 if "fp32g" in kind else torch.float32
@@ -1572,10 +1579,12 @@ def test_bwd_grid_mult_launches_that_many_times_the_untrimmed_grid(
     device = _device()
     arch = _arch()
     launched = []
+    tiles = []
     run_module = pkg.run_module
 
     def record_launch(name, values, *, device_index, grid=None):
         launched.append((name, grid))
+        tiles.append(values["n_ch_tiles"])
         return run_module(name, values, device_index=device_index, grid=grid)
 
     monkeypatch.setattr(pkg, "run_module", record_launch)
@@ -1590,13 +1599,99 @@ def test_bwd_grid_mult_launches_that_many_times_the_untrimmed_grid(
         untrimmed = loader.launch_grid(record, device_index=device.index)
         for mult in pkg.BWD_GRID_MULTS:
             launched.clear()
+            tiles.clear()
             _backward(x, w, cu, dy, b, policy, bwd_grid_mult=mult)
             expected = (
-                loader.launch_grid(record, device_index=device.index, C=C, S=S)
+                pkg._one_sm_trim(
+                    record,
+                    tiles[0],
+                    loader.launch_grid(record, device_index=device.index, C=C, S=S),
+                    device_index=device.index,
+                    arch=arch,
+                    bwd_grid_mult=1,
+                )
                 if mult == 1
                 else (untrimmed[0] * mult, 1, 1)
             )
             assert launched == [(name, expected)], (kind, S, C, mult, launched)
+
+
+@pytest.mark.parametrize("kind", tuple(ROUTE_SETTINGS))
+def test_backward_grid_gives_up_one_sm_when_the_last_rank_is_partial(
+    kind, monkeypatch
+) -> None:
+    """FlashInfer issue #8365: on the ``bwd`` and ``bwd_fp32g`` routes a default-grid backward launches ``ctas_per_sm
+    x SM count`` CTAs less ``ctas_per_sm`` when the last channel-tile rank of that grid holds at least
+    ``ctas_per_sm`` CTAs (so a kernel on another stream that keeps one SM's shared memory leaves the launch one
+    wave), else the whole grid; the other backward routes launch ``launch_grid``'s grid.  The trimmed launch's
+    ``dx`` is bitwise the whole grid's, both gradients are within budget of the reference and the workspace reads
+    back zero."""
+
+    _require_route(kind)
+    device = _device()
+    arch = _arch()
+    sms = torch.cuda.get_device_properties(device).multi_processor_count
+    S, docs = 4097, (1000, 0, 3, 3094)
+    launched = []
+    run_module = pkg.run_module
+
+    def record_launch(name, values, *, device_index, grid=None):
+        launched.append(grid)
+        return run_module(name, values, device_index=device_index, grid=grid)
+
+    monkeypatch.setattr(pkg, "run_module", record_launch)
+    rows = {}
+    for C in range(1024, 16385, 1024):
+        name = loader.selected_modules(arch, kind, C=C, S=S)[0]
+        record = loader.MODULES[name]
+        rule = record["grid_rule"]
+        k = int(rule["ctas_per_sm"])
+        full = loader.grid_mult(record, arch) * k * sms
+        n = loader.plan(
+            S,
+            C,
+            len(docs),
+            geometry=rule["geometry"],
+            role=record["role"],
+            arch=arch,
+            route=loader.record_route(record, arch),
+        )["n_ch_tiles"]
+        trims = (
+            rule["kind"] == "occupancy"
+            and loader.grid_mult(record, arch) == 1
+            and full % n >= k
+        )
+        rows.setdefault(trims, (C, full, k))
+    assert set(rows) == {True, False}, rows
+    for trims, (C, full, k) in sorted(rows.items()):
+        x, w, cu, dy, b, policy = _route_inputs(S, C, docs, kind, key=41)
+        refs = reference_backward(x, w, cu, dy, b=b, policy=policy)
+        launched.clear()
+        dx, dw, db = _backward(x, w, cu, dy, b, policy)
+        torch.cuda.synchronize(device)
+        cut = trims and kind in ("bwd", "bwd_fp32g")
+        assert launched == [(full - k if cut else full, 1, 1)], (kind, C, launched)
+        _check_grads(dx, dw, db, refs, policy=policy, label=f"{kind} C={C}")
+        held = _stream_workspace(device)
+        assert held is None or int(torch.count_nonzero(held)) == 0, (kind, C)
+        if cut:
+            with monkeypatch.context() as m:
+                m.setattr(pkg, "_one_sm_trim", lambda record, n, grid, **kw: grid)
+                pkg.plan_cache_clear()
+                launched.clear()
+                dx_full, dw_full, db_full = _backward(x, w, cu, dy, b, policy)
+                torch.cuda.synchronize(device)
+            pkg.plan_cache_clear()
+            assert launched == [(full, 1, 1)], (kind, C, launched)
+            assert torch.equal(dx, dx_full), (kind, C)
+            _check_grads(
+                dx_full,
+                dw_full,
+                db_full,
+                refs,
+                policy=policy,
+                label=f"{kind} C={C} whole grid",
+            )
 
 
 @pytest.mark.parametrize("kind", ("bwd_fp32g", "bwd_bias_fp32g"))
