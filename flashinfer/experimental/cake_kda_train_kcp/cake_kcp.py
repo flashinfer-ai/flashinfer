@@ -247,14 +247,15 @@ the K1 / K2 / K3 walks read are the explicit path's bits for the same activated
 gate, so every KCP program, collective and its byte count is unchanged; no
 full-size FP32 gate or gate gradient exists on the route.  ``dA_log`` /
 ``ddt_bias`` of a rank are its partial sums (the gradients through its own
-tokens, reduced on the rank in the fixed order of its local chunks): the
-training framework sums them over ``ctx.group`` like the gradients of any
-parameter replicated across the context-parallel ranks, or calls
-:func:`reduce_gate_param_grads_kcp` (an all-gather, then an FP32 sum in rank
-order) when that sum must be bitwise reproducible -- an NCCL all-reduce does not
-fix its summation order.  The workspace (:attr:`WorkspaceKcp.gate`), the
-saved set and a recompute handle's fingerprint record the mode (and the lower
-bound); a call in another mode is refused.  A raw-mode workspace runs the replay
+tokens, reduced on the rank: in the fixed order of its local chunks on
+``sm_107a``, by the ``R1c`` pair's unordered FP64 sum on ``sm_100a`` /
+``sm_103a``, below): the training framework sums them over ``ctx.group`` like
+the gradients of any parameter replicated across the context-parallel ranks, or
+calls :func:`reduce_gate_param_grads_kcp` (an all-gather, then an FP32 sum in
+rank order) when that sum must be bitwise reproducible from the partials -- an
+NCCL all-reduce does not fix its summation order.  The workspace
+(:attr:`WorkspaceKcp.gate`), the saved set and a recompute handle's fingerprint
+record the mode (and the lower bound); a call in another mode is refused.  A raw-mode workspace runs the replay
 local arena (``local_arena="lean"`` is refused in this mode).  The raw records of
 the single-rank package are copies of the deterministic package's raw programs
 but for the parameter-gradient reduce, and its raw plan selects no ``S1`` pair,
@@ -266,8 +267,10 @@ by one FP32 ulp from run to run (and from the deterministic route); such a
 backward raises PyTorch's non-determinism alert under
 ``torch.use_deterministic_algorithms(True)`` on every rank before any
 exchange.  :func:`reduce_gate_param_grads_kcp` still fixes the cross-rank
-order: every rank gets the same bits from the same partials.  The checkpoint
-hand-off does not engage in raw mode (:func:`chunk_kda_kcp`).
+order: every rank gets the same bits from the same partials (which then vary
+from run to run, so the sum does too, by a few FP32 ulps that grow with the
+world size: each partial by up to one ulp, each addition rounding either way).
+The checkpoint hand-off does not engage in raw mode (:func:`chunk_kda_kcp`).
 
 
 P > 1 staging: the K1 ``_offset`` / K2 ``_offset`` / K3 passes of the segmented rank write two
@@ -6201,11 +6204,12 @@ def chunk_kda_bwd_kcp(
     Raw gate mode (``use_gate_in_kernel=True`` with the forward's ``A_log`` / ``dt_bias`` / ``lower_bound``):
     ``(dq, dk, dv, dbeta, dg, dA_log, ddt_bias)``, ``dg`` the BF16 gradient of the raw gate (contiguous, ranked like
     ``g``), ``dA_log`` FP32 ``[H]`` and ``ddt_bias`` FP32 shaped like ``dt_bias``.  The two parameter gradients are
-    this rank's partial sums: the gradients through this rank's own tokens, reduced on the rank in an order fixed by
-    its local chunks alone (bitwise repeatable per rank, the same under every schedule and exchange).  The full
-    gradient is their sum over the ranks of ``ctx.group``; a training framework sums them as it sums the gradients
-    of any parameter replicated across the context-parallel ranks, or calls :func:`reduce_gate_param_grads_kcp` for
-    a sum that is bitwise reproducible (an NCCL all-reduce does not fix its summation order).  No gate epilogue runs
+    this rank's partial sums: the gradients through this rank's own tokens, reduced on the rank (on ``sm_107a`` in an
+    order fixed by its local chunks alone: bitwise repeatable per rank, the same under every schedule and exchange;
+    on ``sm_100a`` / ``sm_103a`` by the ``R1c`` pair, below).  The full gradient is their sum over the ranks of
+    ``ctx.group``; a training framework sums them as it sums the gradients of any parameter replicated across the
+    context-parallel ranks, or calls :func:`reduce_gate_param_grads_kcp` for a sum in a fixed rank order, bitwise
+    reproducible from the same partials (an NCCL all-reduce does not fix its summation order).  No gate epilogue runs
     and no full-size FP32 gate or gate gradient exists on the route.  A saved set of the other mode, or with another
     ``lower_bound`` (its FP32 value), is refused with ``ValueError``, as is a workspace of the other mode.  The raw
     mode runs the deterministic package's raw records but for the parameter-gradient reduce: every output and the
@@ -7282,8 +7286,10 @@ def chunk_kda_kcp(
     :func:`chunk_kda_fwd_kcp`): ``g`` is the raw gate and the gradients are those of ``q, k, v``, the raw gate
     (BF16), ``beta``, ``A_log`` and ``dt_bias`` (FP32).  The parameter gradients of a rank are its partial sums
     (the gradients through its own tokens); sum them over ``ctx.group`` as for any parameter replicated across the
-    context-parallel ranks, or with :func:`reduce_gate_param_grads_kcp` for a bitwise reproducible sum.  A recompute
-    handle's entry records the gate mode and ``lower_bound``: a recompute in another mode never binds it.  The
+    context-parallel ranks, or with :func:`reduce_gate_param_grads_kcp` for a sum in a fixed rank order, bitwise
+    reproducible from the same partials (on ``sm_100a`` / ``sm_103a`` the partials themselves can differ by one FP32
+    ulp from run to run: :func:`chunk_kda_bwd_kcp`).  A recompute handle's entry records the gate mode and
+    ``lower_bound``: a recompute in another mode never binds it.  The
     checkpoint hand-off below does not engage in raw gate mode (its tape set is verified on the explicit gate only):
     the call keeps the light set under every ``checkpoint_handoff`` value, records no decision and counts nothing.
 
@@ -7387,24 +7393,28 @@ def chunk_kda_kcp(
 def reduce_gate_param_grads_kcp(
     ctx: Any, dA_log: torch.Tensor, ddt_bias: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """The raw gate mode's full parameter gradients from every rank's partial sums, bitwise reproducible.
+    """The raw gate mode's full parameter gradients from every rank's partial sums, in a fixed rank order: bitwise
+    reproducible from the same partial sums.
 
     ``dA_log`` (FP32 ``[H]``) and ``ddt_bias`` (FP32 ``[H * 128]`` or ``[H, 128]``) are this rank's partial sums
     from :func:`chunk_kda_bwd_kcp` / :func:`chunk_kda_kcp` with ``use_gate_in_kernel=True`` (the gradients through
     the rank's own tokens).  Every rank of ``ctx.group`` must call this with the same shapes: one
     ``all_gather_into_tensor`` of the ``H + H * 128`` FP32 values on ``ctx.group`` brings every rank's partials in
     group-rank order, then each rank adds them in FP32 in rank order ``0, 1, ..., W - 1`` (no summation in the
-    collective).  So every rank gets the same bits, and the result depends only on the per-rank partials, which
-    depend only on the rank's tokens and the partition (not on the exchange, schedule, graph replay or recompute).
-    The deterministic package's ``reduce_gate_param_grads_det_kcp`` is the same algorithm: from the same partials
-    the two give the same bits.  On the ``R1c`` rows (``sm_100a`` / ``sm_103a``) each rank's partials can differ by
-    one FP32 ulp from run to run (their reduce on the rank is an unordered FP64 sum); the cross-rank order stays
-    fixed here, so every rank still gets the same bits from the partials of one run.  An NCCL all-reduce of the partials gives the same sum up to FP32 rounding but does
-    not fix its summation order (it varies with the algorithm, the topology and the message size): use this helper
-    when the parameter gradients must be bitwise reproducible.  Returns fresh ``(dA_log, ddt_bias)`` of the inputs'
-    shapes; with ``world_size == 1`` copies of the inputs.  With ``world_size > 1`` the ``torch.distributed``
-    process group must be initialized: without one the inputs are only this rank's partial sums, so the call raises
-    ``RuntimeError`` instead of returning them.  Asynchronous on the current stream, no host synchronization."""
+    collective).  So every rank gets the same bits, and the result depends only on the per-rank partials, which on
+    ``sm_107a`` depend only on the rank's tokens and the partition (not on the exchange, schedule, graph replay or
+    recompute).  The deterministic package's ``reduce_gate_param_grads_det_kcp`` is the same algorithm: from the
+    same partials the two give the same bits.  On the ``R1c`` rows (``sm_100a`` / ``sm_103a``) each rank's partials
+    can differ by one FP32 ulp from run to run (their reduce on the rank is an unordered FP64 sum); the cross-rank
+    order stays fixed here, so every rank still gets the same bits from the partials of one run, and the sums can
+    differ from run to run by a few FP32 ulps that grow with ``W`` (each partial by up to one ulp, each of the
+    ``W - 1`` additions rounding either way).  An NCCL all-reduce of the partials gives the same sum up to FP32
+    rounding but does not fix its summation order (it varies with the algorithm, the topology and the message
+    size): use this helper when the sum must be bitwise reproducible from the partials.  Returns fresh ``(dA_log,
+    ddt_bias)`` of the inputs' shapes; with ``world_size == 1`` copies of the inputs.  With ``world_size > 1`` the
+    ``torch.distributed`` process group must be initialized: without one the inputs are only this rank's partial
+    sums, so the call raises ``RuntimeError`` instead of returning them.  Asynchronous on the current stream, no
+    host synchronization."""
     if dA_log.dtype != torch.float32 or ddt_bias.dtype != torch.float32:
         raise ValueError(
             f"dA_log / ddt_bias: expected torch.float32, got {dA_log.dtype} / {ddt_bias.dtype}"

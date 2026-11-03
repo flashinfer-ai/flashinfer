@@ -4926,12 +4926,12 @@ def chunk_kda_bwd(
     sums) and one cast launch after the last group / range sums the replicas in ascending order, rounds once to
     ``dA_log`` / ``ddt_bias`` and zeroes the accumulators.  The FP64 additions arrive in no fixed order, so
     ``dA_log`` / ``ddt_bias`` can differ by one FP32 ulp from run to run and from the deterministic package (their
-    error against the FP64 reference stays within its bound); the other five results are bitwise the
-    deterministic package's.  That backward raises PyTorch's non-determinism alert under
-    ``torch.use_deterministic_algorithms(True)`` (``RuntimeError``; a ``UserWarning`` with ``warn_only=True``)
-    before it allocates or launches anything (:func:`_alert_nondeterministic`).  No gate epilogue runs.  A saved
-    set of the other mode, or with another ``lower_bound`` (its FP32 value), is refused with ``ValueError``, as is
-    a workspace of the other mode.
+    error against the FP64 reference stays within the deterministic package's plus the FP64 sum's own error); the
+    other five results are bitwise the deterministic package's.  That backward raises PyTorch's non-determinism
+    alert under ``torch.use_deterministic_algorithms(True)`` (``RuntimeError``; a ``UserWarning`` with
+    ``warn_only=True``) before it allocates or launches anything (:func:`_alert_nondeterministic`).  No gate
+    epilogue runs.  A saved set of the other mode, or with another ``lower_bound`` (its FP32 value), is refused with
+    ``ValueError``, as is a workspace of the other mode.
     """
     _require_deterministic_false(deterministic, "chunk_kda_bwd")
     _refuse_qk_l2norm("chunk_kda_bwd", use_qk_l2norm_in_kernel)

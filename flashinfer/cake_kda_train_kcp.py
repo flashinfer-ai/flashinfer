@@ -104,11 +104,14 @@ bitwise those of ``deterministic=True``.  On SM107 the parameter partial sums
 are bitwise too.  On SM100 / SM103 each rank adds its per-chunk parameter
 partials in FP64 in no fixed order and rounds the sums to FP32 once, so its
 partial sums can differ by one FP32 ulp from run to run and from
-``deterministic=True`` (within the same error bound against an FP64
-reference); its local arena then also holds the FP64 accumulators (2 KiB per
-head; 16 KiB per head on SM100 from 32 heads), which
-``kda_workspace_bytes_kcp`` counts.  :func:`reduce_gate_param_grads_kcp` keeps
-the fixed rank order, so every rank gets the same sums.  Under torch's
+``deterministic=True`` (their error against an FP64 reference stays within the
+deterministic package's plus the FP64 sum's own error); its local arena then
+also holds the FP64 accumulators (2 KiB per head; 16 KiB per head on SM100 from
+32 heads), which ``kda_workspace_bytes_kcp`` counts.
+:func:`reduce_gate_param_grads_kcp` keeps the fixed rank order, so every rank
+gets the same sums from the same partials; as the partials can change from run
+to run, so can those sums, by a few FP32 ulps that grow with the world size
+(each partial by up to one ulp, each of the additions rounding either way).  Under torch's
 deterministic algorithms such a call runs the deterministic package, as above.
 The checkpoint hand-off does not engage in the raw mode.
 The in-kernel q / k L2 norm (``use_qk_l2norm_in_kernel=True``, #7817) runs on
@@ -461,7 +464,10 @@ def chunk_kda_bwd_kcp(
     ``(dq, dk, dv, dbeta, dg)`` of this rank's tokens: BF16 ``dq, dk, dv, dbeta``, FP32 ``dg``.  Bitwise
     reproducible at the same topology in both modes.  In raw gate mode seven tensors,
     ``(dq, dk, dv, dbeta, dg, dA_log, ddt_bias)``, as :func:`flashinfer.cake_kda_det_train_kcp.chunk_kda_det_bwd_kcp`
-    returns them; both packages give the same bits.
+    returns them; both packages give the same bits, bitwise reproducible at the same topology, but for this rank's
+    ``dA_log`` / ``ddt_bias`` on SM100 / SM103 with ``deterministic=False``: an unordered FP64 sum rounded once to
+    FP32, they can differ by one FP32 ulp from run to run and from ``deterministic=True`` (see the module
+    docstring).
     """
     if _deterministic(deterministic, "chunk_kda_bwd_kcp"):
         return _det_kcp().chunk_kda_det_bwd_kcp(
@@ -630,8 +636,10 @@ def reduce_gate_param_grads_kcp(
     deterministic: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """The raw gate mode's full ``(dA_log, ddt_bias)`` from every rank's partial sums (the last two tensors of
-    :func:`chunk_kda_bwd_kcp`), bitwise reproducible, on the package ``deterministic`` selects (the same algorithm
-    and the same bits for both values); see
+    :func:`chunk_kda_bwd_kcp`), in a fixed rank order on the package ``deterministic`` selects (the same algorithm
+    for both values): bitwise reproducible from the same partial sums, and the same bits on every rank and for both
+    values.  The partial sums of ``deterministic=False`` on SM100 / SM103 can differ by one FP32 ulp from run to run,
+    so its sums can too, by a few FP32 ulps that grow with the world size; see
     :func:`flashinfer.cake_kda_det_train_kcp.reduce_gate_param_grads_det_kcp`.  A collective: every rank of
     ``ctx.group`` calls it."""
     if _deterministic(deterministic, "reduce_gate_param_grads_kcp"):

@@ -217,7 +217,8 @@ this package runs.
   `sm_100a` / `sm_103a` they are the `R1c` FP64 sums rounded once to FP32:
   the FP64 additions arrive in no fixed order, so they can differ by one
   FP32 ulp from run to run and from the deterministic package; their error
-  against the FP64 reference stays within the deterministic package's.
+  against the FP64 reference stays within the deterministic package's plus
+  the FP64 sum's own error.
 
 ## Checkpoint hand-off
 

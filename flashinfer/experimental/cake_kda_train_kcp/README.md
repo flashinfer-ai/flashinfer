@@ -516,24 +516,29 @@ dA_log, ddt_bias = reduce_gate_param_grads_kcp(ctx, dA_log_r, ddt_bias_r, **nd) 
   sums on `sm_107a`.  On `sm_100a` / `sm_103a` the FP64 additions arrive in no
   fixed order, so the partial sums can differ by one FP32 ulp from run to run
   and from the deterministic route (their error against the FP64 reference
-  stays within its bound).  Such a backward raises torch's
+  stays within the deterministic route's plus the FP64 sum's own error).  Such
+  a backward raises torch's
   non-determinism alert under `torch.use_deterministic_algorithms(True)`
   (`RuntimeError`; a `UserWarning` with `warn_only=True`) on every rank before
   it allocates, exchanges or launches anything: the decision reads the
   architecture and `H` alone, so a rank without tokens alerts too.
 * `dA_log` / `ddt_bias` of a rank are its partial sums: the gradients through
-  its own tokens, reduced on the rank (in an order fixed by its local chunks
-  on `sm_107a`: bitwise repeatable, the same under every exchange, schedule,
-  graph replay and recompute; within one FP32 ulp of that on the `R1c`
-  rows).  The full gradient is their sum over `ctx.group`; a
+  its own tokens, reduced on the rank.  On `sm_107a` the order is fixed by its
+  local chunks: bitwise repeatable, the same under every exchange, schedule,
+  graph replay and recompute.  On the `R1c` rows the unordered FP64 sum makes
+  each partial sum vary from run to run by up to one FP32 ulp of itself.  The
+  full gradient is their sum over `ctx.group`; a
   training framework sums them as it sums the gradients of any parameter
   replicated across the context-parallel ranks.  An NCCL all-reduce gives
   that sum to FP32 rounding but does not fix its summation order, so it is
   not bitwise reproducible; `reduce_gate_param_grads_kcp(ctx, dA_log,
-  ddt_bias)` is: one `all_gather_into_tensor` of the `H + 128 H` values, then
-  an FP32 sum in rank order on every rank (the same bits everywhere, and the
-  same bits as the deterministic package's `reduce_gate_param_grads_det_kcp`
-  from the same partials).
+  ddt_bias)` is, from the same partials: one `all_gather_into_tensor` of the
+  `H + 128 H` values, then an FP32 sum in rank order on every rank (the same
+  bits everywhere, and the same bits as the deterministic package's
+  `reduce_gate_param_grads_det_kcp` from the same partials).  On the `R1c`
+  rows the partials vary from run to run, so that sum does too: by a few FP32
+  ulps that grow with the world size `W` (each partial by up to one ulp, each
+  of the `W - 1` additions rounding either way).
 * The mode is fixed per workspace (`WorkspaceKcp(use_gate_in_kernel=True)`:
   its local arena is the replay arena planned in raw mode, whose backward
   layouts carry no gate epilogue buffers; the KCP pools do not change;

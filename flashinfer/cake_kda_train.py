@@ -49,7 +49,8 @@ bitwise the deterministic package's raw mode, but for the reduce of ``dA_log`` /
 results).  On SM100 / SM103 the backward adds the per-chunk parameter partials in
 FP64 in no fixed order and rounds the sums to FP32 once, so ``dA_log`` /
 ``ddt_bias`` can differ by one FP32 ulp from run to run and from the
-deterministic package (within the same error bound against an FP64 reference);
+deterministic package (their error against an FP64 reference stays within the
+deterministic package's plus the FP64 sum's own error);
 its workspace then also holds the FP64 accumulators (2 KiB per head; 16 KiB per
 head on SM100 from 32 heads), which the byte query counts.  Under torch's
 deterministic algorithms such a call runs the deterministic package, as above.
@@ -429,7 +430,10 @@ def chunk_kda_bwd(
     ``(dq, dk, dv, dbeta, dg)``: BF16 gradients of ``q, k, v, beta`` and the FP32 gradient of ``g``, ranked
     like the inputs.  Bitwise reproducible for the same inputs and path in both modes.  In raw gate mode
     ``(dq, dk, dv, dbeta, dg, dA_log, ddt_bias)``, as :func:`flashinfer.cake_kda_det_train.chunk_kda_det_bwd`
-    returns them, bitwise the same for both values of ``deterministic``.
+    returns them, bitwise the same for both values of ``deterministic`` and bitwise reproducible, but for
+    ``dA_log`` / ``ddt_bias`` on SM100 / SM103 with ``deterministic=False``: an unordered FP64 sum rounded once to
+    FP32, they can differ by one FP32 ulp from run to run and from ``deterministic=True`` (see the module
+    docstring).
     """
     scale = DEFAULT_SCALE if scale is None else scale
     if _deterministic(deterministic, "chunk_kda_bwd"):
