@@ -110,9 +110,12 @@ probed kernel; there the long forward's delay over its share of the held
 slots is larger than the forward's at every routed row count probed, and the
 mid forward ends after the forward at 1152 rows per SM (by up to 2.15 % in
 the worst run; in the worst kernel-launch run also at 960).  The short
-forward runs only up to the ``max_rows_per_sm`` at which its grid has fewer
-CTAs than the SMs and such a call still ends no later than the forward's
-(FlashInfer issue #7548); the short backward runs only up to the ``max_rows``
+forward runs only up to the ``max_rows_per_sm`` at which, on sm_100a and
+sm_103a, its grid has fewer CTAs than the SMs and such a call still ends no
+later than the forward's, and on sm_107a (probed with 212 SMs) its grid fits
+in one wave of 4 CTAs per SM on all SMs but 16 and such a call stayed within
+the forward stall test's bound beside that test's kernels holding part of the
+SMs (FlashInfer issue #7548); the short backward runs only up to the ``max_rows``
 at which no CTA of its cluster takes more than one row block.
 
 The workspace of the backward is ``dw_slots * 128`` FP64 accumulators and one
@@ -335,7 +338,7 @@ MODULES: dict[str, dict[str, Any]] = {
     # threads, 16 lanes per row (16-row blocks), launch bounds for 4 CTAs per
     # SM, the packed gate computed before the sum of squares (build {"lanes":
     # 16, "math": "x2_early", "min_blocks": 4, "threads": 256}), one block per
-    # CTA, up to 12 rows per SM on sm_100a and sm_103a and 10 on sm_107a.
+    # CTA, up to 12 rows per SM on sm_100a and sm_103a and 59 on sm_107a.
     "cake_rmsnorm_silu_gate_train_55ff8a9d0ba6d83285b5": {
         "arches": [
             "sm_100a",
@@ -364,7 +367,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "max_rows_per_sm": {
                 "sm_100a": 12,
                 "sm_103a": 12,
-                "sm_107a": 10,
+                "sm_107a": 59,
             },
             "rows_per_cta": 16,
         },

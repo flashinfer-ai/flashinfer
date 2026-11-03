@@ -27,7 +27,6 @@ from __future__ import annotations
 import gc
 import json
 import os
-import socket
 import tempfile
 import traceback
 from pathlib import Path
@@ -162,15 +161,13 @@ def _to_global(
     return g
 
 
-def _run_rank(rank: int, W: int, row, port: int, result_dir: str | None) -> dict:
+def _run_rank(rank: int, W: int, row, rdzv: str | None, result_dir: str | None) -> dict:
     """The body of one rank: the KCP forward / backward in every mode, gathered to rank 0 and compared there."""
     lengths, H, _w, layout = row
     device = torch.device("cuda", rank % max(torch.cuda.device_count(), 1))
     torch.cuda.set_device(device)
     if W > 1 and not dist.is_initialized():
-        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-        os.environ.setdefault("MASTER_PORT", str(port))
-        dist.init_process_group("nccl", rank=rank, world_size=W, device_id=device)
+        _init_group(rank, W, device, rdzv)
     group = dist.group.WORLD if W > 1 else None
     part, cu = _partition(lengths, W, layout)
     ctx = cake_kcp_plan.build_context_det_kcp(part, group, rank, device)
@@ -452,11 +449,11 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir: str | None) -> dict
     return report
 
 
-def _spawn_entry(rank: int, W: int, row, port: int, result_dir: str) -> None:
+def _spawn_entry(rank: int, W: int, row, rdzv: str | None, result_dir: str) -> None:
     """One spawned rank: the verdict travels through rank 0's report file (no synchronization primitive is
     pickled into the children); a failing rank raises so the parent sees its report."""
     try:
-        report = _run_rank(rank, W, row, port, result_dir)
+        report = _run_rank(rank, W, row, rdzv, result_dir)
         if not report["pass"]:
             raise AssertionError(f"rank {rank}: {report}")
     finally:
@@ -465,10 +462,26 @@ def _spawn_entry(rank: int, W: int, row, port: int, result_dir: str) -> None:
             dist.destroy_process_group()
 
 
-def _free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+def _rendezvous(tmp: str) -> str:
+    """The rendezvous of the ranks one test spawns on this host: ``file://`` of a store in a new directory under the
+    test's temporary directory ``tmp``.  A TCP port picked by binding port 0 and closing the socket can be taken by
+    another process before rank 0's store listens on it (``EADDRINUSE``)."""
+    return "file://" + os.path.join(
+        tempfile.mkdtemp(prefix="rendezvous_", dir=tmp), "store"
+    )
+
+
+def _init_group(rank: int, W: int, device: torch.device, rdzv: str | None) -> None:
+    """Join the ``W``-rank NCCL group on ``device``: through the spawning test's ``file://`` store
+    (:func:`_rendezvous`), or for ``rdzv=None`` (one process per Slurm task) from ``MASTER_ADDR`` / ``MASTER_PORT``."""
+    if rdzv is None:
+        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+        os.environ.setdefault("MASTER_PORT", "29500")
+        dist.init_process_group("nccl", rank=rank, world_size=W, device_id=device)
+    else:
+        dist.init_process_group(
+            "nccl", init_method=rdzv, rank=rank, world_size=W, device_id=device
+        )
 
 
 def _skip_unless_runnable(W: int) -> None:
@@ -478,7 +491,8 @@ def _skip_unless_runnable(W: int) -> None:
         pytest.skip(f"{W} CUDA devices required, {torch.cuda.device_count()} visible")
     if not _programs_exported():
         pytest.skip("the KCP programs are not exported in the package's build.json yet")
-    if cake_jit.device_arch(torch.cuda.current_device()) not in cake_jit.ARCHES:
+    capability = torch.cuda.get_device_capability()
+    if cake_jit.arch_for_capability(capability) not in cake_jit.ARCHES:
         pytest.skip("the current device's architecture is not covered by the package")
 
 
@@ -498,7 +512,7 @@ def test_multi_gpu_rows_match_the_exact_reference(row) -> None:
             int(os.environ["SLURM_PROCID"]),
             W,
             row,
-            int(os.environ.get("MASTER_PORT", "29500")),
+            None,
             os.environ.get("KCP_TEST_RESULT_DIR"),
         )
         assert report["pass"], report
@@ -508,7 +522,7 @@ def test_multi_gpu_rows_match_the_exact_reference(row) -> None:
         result_dir = os.environ.get("KCP_TEST_RESULT_DIR") or tmp
         mp.start_processes(
             _spawn_entry,
-            args=(W, row, _free_port(), result_dir),
+            args=(W, row, _rendezvous(tmp), result_dir),
             nprocs=W,
             join=True,
             start_method="spawn",
@@ -537,7 +551,9 @@ OLD_PATH = {"upload": "blocking", "table_cache": "workspace"}
 DIST_SLEEP_MS = 2000.0  # the queue probe of the dist census windows (the host must return within a quarter of it)
 
 
-def _run_upload_rank(rank: int, W: int, row, port: int, result_dir: str | None) -> dict:
+def _run_upload_rank(
+    rank: int, W: int, row, rdzv: str | None, result_dir: str | None
+) -> dict:
     """Host synchronization on every rank of a CP row, each window a census of ``tests/test_helpers/cake_host_sync.py``
     (upload counter, profiler copies where traced, sync-debug warnings, an event-based queue probe and a host-time
     bound): the new path is bitwise the previous one (KDA saved / replay / checkpointed passes with and without a
@@ -559,9 +575,7 @@ def _run_upload_rank(rank: int, W: int, row, port: int, result_dir: str | None) 
     device = torch.device("cuda", rank % max(torch.cuda.device_count(), 1))
     torch.cuda.set_device(device)
     if W > 1 and not dist.is_initialized():
-        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-        os.environ.setdefault("MASTER_PORT", str(port))
-        dist.init_process_group("nccl", rank=rank, world_size=W, device_id=device)
+        _init_group(rank, W, device, rdzv)
     group = dist.group.WORLD if W > 1 else None
     part, cu = _partition(lengths, W, layout)
     glob = make_inputs(lengths, H, device)
@@ -764,9 +778,11 @@ def _run_upload_rank(rank: int, W: int, row, port: int, result_dir: str | None) 
     return report
 
 
-def _spawn_upload_entry(rank: int, W: int, row, port: int, result_dir: str) -> None:
+def _spawn_upload_entry(
+    rank: int, W: int, row, rdzv: str | None, result_dir: str
+) -> None:
     try:
-        report = _run_upload_rank(rank, W, row, port, result_dir)
+        report = _run_upload_rank(rank, W, row, rdzv, result_dir)
         if not report["pass"]:
             raise AssertionError(f"rank {rank}: {report}")
     finally:
@@ -793,7 +809,7 @@ def test_multi_gpu_upload_rows_are_bitwise_and_nonblocking(row) -> None:
             int(os.environ["SLURM_PROCID"]),
             W,
             row,
-            int(os.environ.get("MASTER_PORT", "29500")),
+            None,
             os.environ.get("KCP_TEST_RESULT_DIR"),
         )
         assert report["pass"], report
@@ -803,7 +819,7 @@ def test_multi_gpu_upload_rows_are_bitwise_and_nonblocking(row) -> None:
         result_dir = os.environ.get("KCP_TEST_RESULT_DIR") or tmp
         mp.start_processes(
             _spawn_upload_entry,
-            args=(W, row, _free_port(), result_dir),
+            args=(W, row, _rendezvous(tmp), result_dir),
             nprocs=W,
             join=True,
             start_method="spawn",
@@ -1092,7 +1108,7 @@ class _Counter:
 
 
 def _run_rank_ckpt(
-    rank: int, W: int, row, port: int, result_dir: str | None, local_id: int
+    rank: int, W: int, row, rdzv: str | None, result_dir: str | None, local_id: int
 ) -> dict:
     """One rank of a checkpoint row (issue #7815):
 
@@ -1124,9 +1140,7 @@ def _run_rank_ckpt(
     device = torch.device("cuda", local_id % max(torch.cuda.device_count(), 1))
     torch.cuda.set_device(device)
     if not dist.is_initialized():
-        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-        os.environ.setdefault("MASTER_PORT", str(port))
-        dist.init_process_group("nccl", rank=rank, world_size=W, device_id=device)
+        _init_group(rank, W, device, rdzv)
     group = dist.group.WORLD
     part, cu = _partition(lengths, W, layout)
     ctx = cake_kcp_plan.build_context_det_kcp(part, group, rank, device)
@@ -1774,9 +1788,11 @@ def _run_rank_ckpt(
     return report
 
 
-def _spawn_entry_ckpt(rank: int, W: int, row, port: int, result_dir: str) -> None:
+def _spawn_entry_ckpt(
+    rank: int, W: int, row, rdzv: str | None, result_dir: str
+) -> None:
     try:
-        report = _run_rank_ckpt(rank, W, row, port, result_dir, rank)
+        report = _run_rank_ckpt(rank, W, row, rdzv, result_dir, rank)
         if not report["pass"]:
             raise AssertionError(f"rank {rank}: {report}")
     finally:
@@ -1800,7 +1816,7 @@ def test_checkpoint_recompute_rows(row) -> None:
             int(os.environ["SLURM_PROCID"]),
             W,
             row,
-            int(os.environ.get("MASTER_PORT", "29500")),
+            None,
             os.environ.get("KCP_TEST_RESULT_DIR"),
             int(os.environ.get("SLURM_LOCALID", "0")),
         )
@@ -1811,7 +1827,7 @@ def test_checkpoint_recompute_rows(row) -> None:
         result_dir = os.environ.get("KCP_TEST_RESULT_DIR") or tmp
         mp.start_processes(
             _spawn_entry_ckpt,
-            args=(W, row, _free_port(), result_dir),
+            args=(W, row, _rendezvous(tmp), result_dir),
             nprocs=W,
             join=True,
             start_method="spawn",
