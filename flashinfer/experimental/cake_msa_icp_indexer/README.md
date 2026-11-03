@@ -65,6 +65,18 @@ architecture and loads each kernel into the device's context.  Under CUDA lazy
 module loading, a kernel loaded at its first launch can stall behind a peer's
 merge that already spins on its rows, until the spin limit stops it.
 
+*Step prepare.*  Within one step, every sparse layer makes the same launches
+with the same arguments except the query and the layer's K shard.
+`MSAIcpIndexerPlan.prepare_prefill_step(windows, score_scratch,
+num_valid_pages, send, received, output)` and `prepare_decode_step(...)` (the
+arguments of `prefill_local` / `prefill_merge` / `decode`) return step objects
+whose `local(index_q, index_k)`, `merge()` and `run(index_q, index_k, slot=)`
+make exactly the facade's launches.  The first layer runs the facade's host
+checks and records the launches; later layers check only the query and K
+metadata, swap those two tensors and launch.  The host time per layer drops;
+the device work is unchanged.  `debug=True` runs the full per-call checks on
+every layer and raises if a launch differs from the prepared one.
+
 The package is a vendorable Cake package: `build.json` lists every
 `<program>_<arch>` library with its sources and flags, `cake_build.py` builds
 or loads them, and `cake_jit.py` is the registry that routes each call by

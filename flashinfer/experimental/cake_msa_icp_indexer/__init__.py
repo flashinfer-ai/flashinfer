@@ -25,13 +25,15 @@ limitations under the License.
 # caller.
 
 from .cake_backend import MSAIcpScorePlan, comm_layout, is_supported
-from .cake_indexer import MSAIcpIndexerPlan
+from .cake_indexer import MSAIcpDecodeStep, MSAIcpIndexerPlan, MSAIcpPrefillStep
 from .cake_jit import ARCH_BY_CAPABILITY, ARCHES
 
 __all__ = [
     "ARCHES",
     "ARCH_BY_CAPABILITY",
+    "MSAIcpDecodeStep",
     "MSAIcpIndexerPlan",
+    "MSAIcpPrefillStep",
     "MSAIcpScorePlan",
     "comm_layout",
     "is_supported",

@@ -34,11 +34,12 @@ launch can stall behind a peer's spinning merge).
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 import torch
 
 from . import cake_backend as cb
+from . import cake_jit as cj
 
 # Bounds of one prefill query chunk (vLLM's chunking: the score scratch holds
 # at most ``_SCRATCH_BYTES`` over five bytes per score element).
@@ -563,3 +564,368 @@ class MSAIcpIndexerPlan:
             local_blocks=self.local_blocks,
             prefill=True,
         )
+
+    # ----------------------------------------------------------------- step prepare
+
+    def prepare_prefill_step(
+        self,
+        windows: Sequence[tuple[int, int, torch.Tensor, cb.MSAIcpScorePlan]],
+        score_scratch: Optional[torch.Tensor],
+        num_valid_pages: torch.Tensor,
+        send: torch.Tensor,
+        received: torch.Tensor,
+        output: torch.Tensor,
+        *,
+        debug: bool = False,
+        **local_kwargs: Any,
+    ) -> "MSAIcpPrefillStep":
+        """The prefill side of one step, prepared once for all its layers.
+
+        ``windows`` lists ``(start, end, block_table, window_plan)`` per query
+        window of the step (``window_plan`` from :meth:`prefill_window_plan`);
+        ``num_valid_pages`` (``[T]``), ``send`` (``[H, T, 33]``),
+        ``received`` (``[W, hpr, T, 33]``) and ``output`` (``[T, hpr, 16]``)
+        cover the ``T`` prefill tokens of the step.  Per layer,
+        :meth:`MSAIcpPrefillStep.local` runs what ``prefill_local(index_q[start:end],
+        index_k, block_table, window_plan, score_scratch,
+        num_valid_pages[start:end], send[:, start:end], **local_kwargs)``
+        runs for every window, and :meth:`MSAIcpPrefillStep.merge` what
+        ``prefill_merge(received, num_valid_pages, output)`` runs: the same
+        launches with the same arguments, checked once per step.  See
+        :class:`MSAIcpPrefillStep`."""
+        return MSAIcpPrefillStep(
+            self,
+            windows,
+            score_scratch,
+            num_valid_pages,
+            send,
+            received,
+            output,
+            debug=debug,
+            local_kwargs=local_kwargs,
+        )
+
+    def prepare_decode_step(
+        self,
+        block_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+        num_valid_pages: torch.Tensor,
+        scores: torch.Tensor,
+        output: torch.Tensor,
+        *,
+        comm: Any,
+        tagged: bool,
+        decode_query_len: int,
+        enable_pdl: bool = True,
+        pool: Optional[torch.Tensor] = None,
+        debug: bool = False,
+    ) -> "MSAIcpDecodeStep":
+        """The decode side of one step, prepared once for all its layers:
+        :meth:`MSAIcpDecodeStep.run` ``(index_q, index_k, slot=slot)`` runs
+        what :meth:`decode` runs with these arguments, checked once per step
+        and slot.  See :class:`MSAIcpDecodeStep`."""
+        return MSAIcpDecodeStep(
+            self,
+            block_table,
+            seq_lens,
+            num_valid_pages,
+            scores,
+            output,
+            comm=comm,
+            tagged=tagged,
+            decode_query_len=decode_query_len,
+            enable_pdl=enable_pdl,
+            pool=pool,
+            debug=debug,
+        )
+
+
+# --------------------------------------------------------------------------- step prepare
+
+
+def _signature(t: torch.Tensor) -> tuple:
+    """The tensor metadata a prepared launch depends on, besides the address."""
+    return (t.shape, t.stride(), t.dtype, t.device)
+
+
+def _same_arg(a: Any, b: Any) -> bool:
+    if isinstance(a, torch.Tensor) or isinstance(b, torch.Tensor):
+        return (
+            isinstance(a, torch.Tensor)
+            and isinstance(b, torch.Tensor)
+            and a.data_ptr() == b.data_ptr()
+            and _signature(a) == _signature(b)
+        )
+    return type(a) is type(b) and a == b
+
+
+def _check_same_launches(
+    want: Sequence[cj.RecordedLaunch], got: Sequence[cj.RecordedLaunch], what: str
+) -> None:
+    """``got`` (the per-call path's launches) equals ``want`` (the prepared
+    launches with this layer's q / k): same programs, entries and arguments."""
+    if len(want) != len(got):
+        raise RuntimeError(
+            f"{what}: the per-call path makes {len(got)} launches, the prepared step {len(want)}"
+        )
+    for i, (w, g) in enumerate(zip(want, got, strict=True)):
+        if w.name != g.name or w.entry is not g.entry or w.device != g.device:
+            raise RuntimeError(
+                f"{what}: launch {i} is {g.name}, the prepared step has {w.name}"
+            )
+        for j, (kind_key, a, b) in enumerate(zip(w.plan, w.args, g.args, strict=True)):
+            if not _same_arg(a, b):
+                raise RuntimeError(
+                    f"{what}: launch {i} ({w.name}) argument {j} {kind_key} differs "
+                    "from the per-call path"
+                )
+
+
+class _PreparedLaunch:
+    """A recorded launch whose ``q`` / ``k`` arguments a layer replaces: ``q``
+    with rows ``rows`` (``None``: all) of the layer's uint8 query view, ``k``
+    with the layer's uint8 K view."""
+
+    __slots__ = ("call", "q_pos", "k_pos", "rows")
+
+    def __init__(self, call: cj.RecordedLaunch, rows: Optional[tuple[int, int]]):
+        self.call = call
+        self.q_pos = call.position("q")
+        self.k_pos = call.position("k")
+        self.rows = rows
+
+    def bind(self, q8: torch.Tensor, k8: torch.Tensor) -> None:
+        args = self.call.args
+        if self.q_pos >= 0:
+            args[self.q_pos] = (
+                q8 if self.rows is None else q8[self.rows[0] : self.rows[1]]
+            )
+        if self.k_pos >= 0:
+            args[self.k_pos] = k8
+
+
+class _StepBase:
+    """Shared per-layer path of a prepared step.
+
+    The first call records the launches the facade's per-call path makes (all
+    of its host checks run; nothing launches while recording) and launches
+    them.  Every later call checks that ``index_q`` / ``index_k`` have the
+    shape, strides, dtype and device of the first call's, rebinds the two
+    tensors in the recorded argument lists and launches them, with one FFI
+    stream switch per call.  Every other argument of a prepared launch is the
+    same object as in the first call: the step's buffers must stay allocated
+    and keep their address, shape and strides for the step (the caller's
+    persistent buffers do).
+
+    ``debug=True`` runs the full per-call path for every layer instead (all
+    host checks), compares its launches with the prepared ones (program,
+    entry and every argument: tensor address, shape, strides, dtype and
+    device, scalar value) and raises ``RuntimeError`` on a difference before
+    launching anything.
+    """
+
+    def __init__(self, indexer: MSAIcpIndexerPlan, debug: bool) -> None:
+        self.indexer = indexer
+        self.debug = bool(debug)
+        self.device_index = indexer.device.index
+
+    def _record(self, fn: Any, *args: Any, **kwargs: Any) -> list[cj.RecordedLaunch]:
+        with cj.record_launches() as calls:
+            fn(*args, **kwargs)
+        return calls
+
+    def _check_layer(
+        self, sig: tuple, index_q: torch.Tensor, index_k: torch.Tensor
+    ) -> None:
+        if (_signature(index_q), _signature(index_k)) != sig:
+            raise ValueError(
+                "index_q / index_k must have the shape, strides, dtype and device of "
+                "the step's first layer"
+            )
+
+    def _replay(
+        self,
+        prepared: Sequence[_PreparedLaunch],
+        index_q: torch.Tensor,
+        index_k: torch.Tensor,
+    ) -> list[cj.RecordedLaunch]:
+        q8 = index_q.view(torch.uint8)
+        k8 = index_k.view(torch.uint8)
+        for p in prepared:
+            p.bind(q8, k8)
+        return [p.call for p in prepared]
+
+
+class MSAIcpPrefillStep(_StepBase):
+    """The prefill side of one step (:meth:`MSAIcpIndexerPlan.prepare_prefill_step`).
+
+    Per layer: :meth:`local` (score and local Top16 of every window into
+    ``send``), the caller's one exchange ``send -> received``, then
+    :meth:`merge`.  The launches and their arguments are exactly those of the
+    facade's ``prefill_local`` per window and ``prefill_merge``; only the host
+    work differs (see :class:`_StepBase`).  CUDA Graph safe like the facade.
+    """
+
+    def __init__(
+        self,
+        indexer: MSAIcpIndexerPlan,
+        windows: Sequence[tuple[int, int, torch.Tensor, cb.MSAIcpScorePlan]],
+        score_scratch: Optional[torch.Tensor],
+        num_valid_pages: torch.Tensor,
+        send: torch.Tensor,
+        received: torch.Tensor,
+        output: torch.Tensor,
+        *,
+        debug: bool,
+        local_kwargs: dict,
+    ) -> None:
+        super().__init__(indexer, debug)
+        self.windows = tuple(
+            (int(start), int(end), block_table, plan)
+            for start, end, block_table, plan in windows
+        )
+        if not self.windows:
+            raise ValueError("a prefill step needs at least one window")
+        for (s0, e0, _, _), (s1, _, _, _) in zip(
+            self.windows[:-1], self.windows[1:], strict=True
+        ):
+            if not s0 < e0 <= s1:
+                raise ValueError("prefill windows must be ordered and disjoint")
+        if self.windows[0][0] < 0 or self.windows[-1][1] > send.shape[1]:
+            raise ValueError("prefill windows must lie inside the step's tokens")
+        self.score_scratch = score_scratch
+        self.num_valid_pages = num_valid_pages
+        self.send = send
+        self.received = received
+        self.output = output
+        self.local_kwargs = dict(local_kwargs)
+        self._local: Optional[list[_PreparedLaunch]] = None
+        self._sig: tuple = ()
+        self._merge: Optional[list[cj.RecordedLaunch]] = None
+
+    def _per_call_local(self, index_q: torch.Tensor, index_k: torch.Tensor):
+        """(window rows, launches) of the facade's per-window prefill_local."""
+        out = []
+        for start, end, block_table, plan in self.windows:
+            calls = self._record(
+                self.indexer.prefill_local,
+                index_q[start:end],
+                index_k,
+                block_table,
+                plan,
+                self.score_scratch,
+                self.num_valid_pages[start:end],
+                self.send[:, start:end],
+                **self.local_kwargs,
+            )
+            out.append(((start, end), calls))
+        return out
+
+    def _prepare_local(
+        self, index_q: torch.Tensor, index_k: torch.Tensor
+    ) -> list[_PreparedLaunch]:
+        full = (0, index_q.shape[0])
+        prepared = []
+        for rows, calls in self._per_call_local(index_q, index_k):
+            for call in calls:
+                prepared.append(_PreparedLaunch(call, None if rows == full else rows))
+        self._local = prepared
+        self._sig = (_signature(index_q), _signature(index_k))
+        return prepared
+
+    def local(self, index_q: torch.Tensor, index_k: torch.Tensor) -> None:
+        """Score and select every window of this layer: ``index_q`` holds the
+        step's ``T`` prefill query tokens ``[T, H, 128]``, ``index_k`` this
+        layer's K shard."""
+        if self._local is None:
+            prepared = self._prepare_local(index_q, index_k)
+            cj.launch_recorded([p.call for p in prepared], self.device_index)
+            return
+        self._check_layer(self._sig, index_q, index_k)
+        calls = self._replay(self._local, index_q, index_k)
+        if self.debug:
+            got = [c for _, cs in self._per_call_local(index_q, index_k) for c in cs]
+            _check_same_launches(calls, got, "prefill step local")
+        cj.launch_recorded(calls, self.device_index)
+
+    def merge(self) -> None:
+        """Merge the exchanged ``received`` rows of this layer into ``output``."""
+        calls = self._merge
+        if calls is None or self.debug:
+            got = self._record(
+                self.indexer.prefill_merge,
+                self.received,
+                self.num_valid_pages,
+                self.output,
+            )
+            if calls is None:
+                calls = self._merge = got
+            else:
+                _check_same_launches(calls, got, "prefill step merge")
+        cj.launch_recorded(calls, self.device_index)
+
+
+class MSAIcpDecodeStep(_StepBase):
+    """The decode side of one step (:meth:`MSAIcpIndexerPlan.prepare_decode_step`).
+
+    :meth:`run` per layer launches exactly what :meth:`MSAIcpIndexerPlan.decode`
+    launches with the step's arguments and that layer's ``index_q``,
+    ``index_k`` and ``slot``.  The first layer that uses a slot records its
+    launches (all host checks); later layers of that slot only rebind
+    ``index_q`` / ``index_k`` (see :class:`_StepBase`).  CUDA Graph safe like
+    the facade.
+    """
+
+    def __init__(
+        self,
+        indexer: MSAIcpIndexerPlan,
+        block_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+        num_valid_pages: torch.Tensor,
+        scores: torch.Tensor,
+        output: torch.Tensor,
+        *,
+        comm: Any,
+        tagged: bool,
+        decode_query_len: int,
+        enable_pdl: bool,
+        pool: Optional[torch.Tensor],
+        debug: bool,
+    ) -> None:
+        super().__init__(indexer, debug)
+        self.args = (block_table, seq_lens, num_valid_pages, scores, output)
+        self.kwargs = dict(
+            comm=comm,
+            tagged=tagged,
+            decode_query_len=decode_query_len,
+            enable_pdl=enable_pdl,
+            pool=pool,
+        )
+        self._slots: dict[int, list[_PreparedLaunch]] = {}
+        self._sig: tuple = ()
+
+    def _per_call(self, index_q: torch.Tensor, index_k: torch.Tensor, slot: int):
+        return self._record(
+            self.indexer.decode, index_q, index_k, *self.args, slot=slot, **self.kwargs
+        )
+
+    def run(self, index_q: torch.Tensor, index_k: torch.Tensor, *, slot: int) -> None:
+        """One layer's decode chain: ``index_q`` ``[T, H, 128]``, this layer's
+        K shard ``index_k`` and receive slot set ``slot``."""
+        prepared = self._slots.get(slot)
+        if prepared is None:
+            calls = self._per_call(index_q, index_k, slot)
+            if not self._sig:
+                self._sig = (_signature(index_q), _signature(index_k))
+            else:
+                self._check_layer(self._sig, index_q, index_k)
+            self._slots[slot] = [_PreparedLaunch(c, None) for c in calls]
+            cj.launch_recorded(calls, self.device_index)
+            return
+        self._check_layer(self._sig, index_q, index_k)
+        calls = self._replay(prepared, index_q, index_k)
+        if self.debug:
+            _check_same_launches(
+                calls, self._per_call(index_q, index_k, slot), "decode step"
+            )
+        cj.launch_recorded(calls, self.device_index)

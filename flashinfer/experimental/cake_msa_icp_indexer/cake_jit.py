@@ -41,8 +41,10 @@ sources and flags.
 
 from __future__ import annotations
 
+import contextlib
+import dataclasses
 import functools
-from typing import Any
+from typing import Any, Iterator, Optional, Sequence
 
 import tvm_ffi
 
@@ -2048,6 +2050,68 @@ _LAUNCHERS: dict[
 ] = {}
 
 
+@dataclasses.dataclass
+class RecordedLaunch:
+    """One launch ``run_module`` made under :func:`record_launches`: the record
+    name, the bound FFI entry, its argument plan, the complete argument list
+    (grid, launch switch and values, as the entry receives them) and the device.
+    ``entry(*args)`` on the device's current stream is that launch."""
+
+    name: str
+    entry: Any
+    plan: tuple[tuple[str, Any], ...]
+    args: list[Any]
+    device: int
+
+    def position(self, logical: str) -> int:
+        """Index in :attr:`args` of the value ``logical``, or -1."""
+        for i, (kind, key) in enumerate(self.plan):
+            if kind == "value" and key == logical:
+                return i
+        return -1
+
+
+# While a list is set (record_launches), run_module appends each launch to it
+# instead of launching it.
+_RECORDING: Optional[list[RecordedLaunch]] = None
+
+
+@contextlib.contextmanager
+def record_launches() -> Iterator[list[RecordedLaunch]]:
+    """Collect the launches ``run_module`` would make in this block, without
+    launching: every host check and argument of the calling path runs as
+    usual, only the final ``entry(*args)`` is skipped.  Not thread safe (one
+    recorder per process at a time; nested blocks restore the outer one)."""
+    global _RECORDING
+    calls: list[RecordedLaunch] = []
+    outer, _RECORDING = _RECORDING, calls
+    try:
+        yield calls
+    finally:
+        _RECORDING = outer
+
+
+def launch_recorded(calls: Sequence[RecordedLaunch], device: int) -> None:
+    """Launch recorded calls in order on torch's current (or capturing) stream
+    of ``device``, with one FFI stream switch for the whole sequence (what
+    ``run_module`` does per call)."""
+    import torch
+
+    if _set_ffi_stream is None:
+        with torch.cuda.device(device), tvm_ffi.use_torch_stream():
+            for call in calls:
+                call.entry(*call.args)
+        return
+    previous = _set_ffi_stream(
+        _DL_CUDA, device, torch._C._cuda_getCurrentRawStream(device)
+    )
+    try:
+        for call in calls:
+            call.entry(*call.args)
+    finally:
+        _set_ffi_stream(_DL_CUDA, device, previous)
+
+
 @functools.cache
 def _runtime(path: str) -> Any:
     """The CUDA runtime calls of the runtime the library at ``path`` binds to.
@@ -2322,6 +2386,9 @@ def run_module(
         grid[key] if kind == "grid" else pdl if kind == "launch" else values[key]
         for kind, key in plan
     ]
+    if _RECORDING is not None:
+        _RECORDING.append(RecordedLaunch(name, entry, plan, args, device))
+        return
     if _set_ffi_stream is None:
         with torch.cuda.device(device), tvm_ffi.use_torch_stream():
             entry(*args)
@@ -2351,13 +2418,16 @@ __all__ = [
     "MODULES",
     "PREFIX",
     "ROLES",
+    "RecordedLaunch",
     "arch_for_capability",
     "ctas_per_sm",
     "device_arch",
     "has_role",
     "launch_grid",
+    "launch_recorded",
     "library_name",
     "load",
+    "record_launches",
     "route",
     "run_module",
     "sm_count",
