@@ -1,8 +1,9 @@
 # Legacy NVFP4 GIN implementation status
 
-Updated 2026-11-02. Migration is complete for the fixed N2R2 scope, including final
+Updated 2026-11-03. Migration is complete for the fixed N2R2 scope, including final
 sparse-poison/example and retained-finalizer qualification.
-Default-off behavior is retained. No performance improvement is claimed.
+Default-off behavior is retained. Performance corrections and their limits are
+reported in [performance-fix-blackwell.md](performance-fix-blackwell.md).
 
 Receiver: branch `port/legacy-nvfp4-nccl-gin`, worktree
 `port/flashinfer-nvfp4-gin`, based on
@@ -51,7 +52,10 @@ nccl4py 0.3.1, driver 580.173.10.
 
 The user stated: “我们的这个feature不涉及rubin环境，可以不用在本地验证”.
 This waived performance measurements at the original correctness delivery.
-The user subsequently requested Blackwell measurements; they are now complete
-and recorded in [performance-blackwell.md](performance-blackwell.md). All
-accepted output checks pass, but the off performance gate did not pass overall
-and on measurements show regression. No speedup is claimed.
+The user subsequently requested Blackwell measurements; they are now complete.
+The initial results remain in [performance-blackwell.md](performance-blackwell.md).
+Subsequent corrections pass all24 off performance gates. Final source74c036287
+passes17 strong/public tests per rank plus4 off finalizer tests and1 cache/graph
+test per rank in3578176 (COMPLETED, exit0). Internode public host overhead is
+reduced; native raw comparisons remain inconclusive because baseline variation
+exceeds5%. See [the correction report](performance-fix-blackwell.md).

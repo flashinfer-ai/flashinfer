@@ -1,0 +1,3810 @@
+{
+  "job": "/lustre/fsw/coreai_devtech_all/qiangf/ncclGIN/port/migration-evidence/blackwell-fix-20261102/final-confirmation/job-3578176",
+  "implementations": [
+    "donor",
+    "port"
+  ],
+  "rows": [
+    {
+      "phase": "conditioned",
+      "cache": "cold",
+      "scope": "full_operator",
+      "impl": "donor",
+      "n": 100,
+      "median_us": 413.378,
+      "p10_us": 365.5956,
+      "p90_us": 455.1188,
+      "cv": 0.08125844870002755,
+      "rounds": {
+        "0": {
+          "n": 20,
+          "median_us": 410.0655,
+          "p10_us": 386.2443,
+          "p90_us": 455.7556,
+          "cv": 0.06255644468486093
+        },
+        "1": {
+          "n": 20,
+          "median_us": 426.946,
+          "p10_us": 412.2196,
+          "p90_us": 464.5492,
+          "cv": 0.048840138861207694
+        },
+        "2": {
+          "n": 20,
+          "median_us": 424.48199999999997,
+          "p10_us": 372.5098,
+          "p90_us": 438.3882,
+          "cv": 0.0700010295728659
+        },
+        "3": {
+          "n": 20,
+          "median_us": 369.8415,
+          "p10_us": 356.3795,
+          "p90_us": 390.8843,
+          "cv": 0.05595379894007002
+        },
+        "4": {
+          "n": 20,
+          "median_us": 429.4895,
+          "p10_us": 372.1492,
+          "p90_us": 461.7419,
+          "cv": 0.08341501359091857
+        }
+      },
+      "round_cv": 0.0602416046042776
+    },
+    {
+      "phase": "conditioned",
+      "cache": "cold",
+      "scope": "full_operator",
+      "impl": "port",
+      "n": 100,
+      "median_us": 1514.518,
+      "p10_us": 1356.8627,
+      "p90_us": 1909.2423000000001,
+      "cv": 0.1306549730912078,
+      "rounds": {
+        "0": {
+          "n": 20,
+          "median_us": 1910.7275,
+          "p10_us": 1845.528,
+          "p90_us": 1995.7497,
+          "cv": 0.04013642339670176
+        },
+        "1": {
+          "n": 20,
+          "median_us": 1519.542,
+          "p10_us": 1436.2011,
+          "p90_us": 1597.0332,
+          "cv": 0.045941263017785255
+        },
+        "2": {
+          "n": 20,
+          "median_us": 1378.5014999999999,
+          "p10_us": 1347.0162,
+          "p90_us": 1421.4621,
+          "cv": 0.0317946485367392
+        },
+        "3": {
+          "n": 20,
+          "median_us": 1442.471,
+          "p10_us": 1346.2875999999999,
+          "p90_us": 1567.2605,
+          "cv": 0.0685859882282648
+        },
+        "4": {
+          "n": 20,
+          "median_us": 1556.6464999999998,
+          "p10_us": 1413.9290999999998,
+          "p90_us": 1714.3238000000001,
+          "cv": 0.0801896374932136
+        }
+      },
+      "round_cv": 0.132559869805001
+    },
+    {
+      "phase": "conditioned",
+      "cache": "cold",
+      "scope": "raw_pipeline",
+      "impl": "donor",
+      "n": 100,
+      "median_us": 373.9039897918701,
+      "p10_us": 313.01759481430054,
+      "p90_us": 394.0191984176636,
+      "cv": 0.09472967122964641,
+      "rounds": {
+        "0": {
+          "n": 20,
+          "median_us": 335.6959968805313,
+          "p10_us": 321.74719870090485,
+          "p90_us": 368.3711975812912,
+          "cv": 0.057109617625500375
+        },
+        "1": {
+          "n": 20,
+          "median_us": 378.383994102478,
+          "p10_us": 361.4335894584656,
+          "p90_us": 395.2640026807785,
+          "cv": 0.06816696370940946
+        },
+        "2": {
+          "n": 20,
+          "median_us": 381.23200833797455,
+          "p10_us": 327.0432084798813,
+          "p90_us": 405.8688133955002,
+          "cv": 0.06832047755125217
+        },
+        "3": {
+          "n": 20,
+          "median_us": 313.34400177001953,
+          "p10_us": 298.93120527267456,
+          "p90_us": 348.4543979167938,
+          "cv": 0.060883060308533986
+        },
+        "4": {
+          "n": 20,
+          "median_us": 387.935996055603,
+          "p10_us": 377.142396569252,
+          "p90_us": 403.45599949359894,
+          "cv": 0.03878614556388776
+        }
+      },
+      "round_cv": 0.0916118581221218
+    },
+    {
+      "phase": "conditioned",
+      "cache": "cold",
+      "scope": "raw_pipeline",
+      "impl": "port",
+      "n": 100,
+      "median_us": 321.75999879837036,
+      "p10_us": 312.9055917263031,
+      "p90_us": 379.90079224109655,
+      "cv": 0.07728884298710359,
+      "rounds": {
+        "0": {
+          "n": 20,
+          "median_us": 337.9039913415909,
+          "p10_us": 321.0783898830414,
+          "p90_us": 398.3424037694931,
+          "cv": 0.09477541486632532
+        },
+        "1": {
+          "n": 20,
+          "median_us": 316.78400933742523,
+          "p10_us": 311.1168086528778,
+          "p90_us": 326.62719190120697,
+          "cv": 0.02065022464813428
+        },
+        "2": {
+          "n": 20,
+          "median_us": 318.1919902563095,
+          "p10_us": 311.3056033849716,
+          "p90_us": 327.67039835453033,
+          "cv": 0.030597655173694283
+        },
+        "3": {
+          "n": 20,
+          "median_us": 318.2239979505539,
+          "p10_us": 312.28801012039185,
+          "p90_us": 328.35841178894043,
+          "cv": 0.02691120617400893
+        },
+        "4": {
+          "n": 20,
+          "median_us": 337.3599946498871,
+          "p10_us": 318.48959028720856,
+          "p90_us": 386.0255926847458,
+          "cv": 0.07866942249846531
+        }
+      },
+      "round_cv": 0.03351667184822662
+    },
+    {
+      "phase": "conditioned",
+      "cache": "warm",
+      "scope": "full_operator",
+      "impl": "donor",
+      "n": 100,
+      "median_us": 411.6815,
+      "p10_us": 355.969,
+      "p90_us": 446.3412,
+      "cv": 0.09189398011118449,
+      "rounds": {
+        "0": {
+          "n": 20,
+          "median_us": 397.92150000000004,
+          "p10_us": 378.7114,
+          "p90_us": 440.0724,
+          "cv": 0.06131212234581765
+        },
+        "1": {
+          "n": 20,
+          "median_us": 434.866,
+          "p10_us": 386.9066,
+          "p90_us": 448.6443,
+          "cv": 0.054647917827609166
+        },
+        "2": {
+          "n": 20,
+          "median_us": 422.61,
+          "p10_us": 410.8052,
+          "p90_us": 464.1172,
+          "cv": 0.07336920138583497
+        },
+        "3": {
+          "n": 20,
+          "median_us": 362.4495,
+          "p10_us": 346.13960000000003,
+          "p90_us": 388.04580000000004,
+          "cv": 0.04639808815942083
+        },
+        "4": {
+          "n": 20,
+          "median_us": 405.6815,
+          "p10_us": 348.2378,
+          "p90_us": 445.7844,
+          "cv": 0.10056480611169981
+        }
+      },
+      "round_cv": 0.06837352842124686
+    },
+    {
+      "phase": "conditioned",
+      "cache": "warm",
+      "scope": "full_operator",
+      "impl": "port",
+      "n": 100,
+      "median_us": 1767.9915,
+      "p10_us": 1413.9218,
+      "p90_us": 1973.0168,
+      "cv": 0.12691093493803707,
+      "rounds": {
+        "0": {
+          "n": 20,
+          "median_us": 1856.1205,
+          "p10_us": 1771.1375,
+          "p90_us": 1941.5944,
+          "cv": 0.037193694952221024
+        },
+        "1": {
+          "n": 20,
+          "median_us": 1948.9045,
+          "p10_us": 1834.7229,
+          "p90_us": 2009.9151,
+          "cv": 0.03922478900686738
+        },
+        "2": {
+          "n": 20,
+          "median_us": 1758.887,
+          "p10_us": 1581.7958,
+          "p90_us": 1842.8519000000001,
+          "cv": 0.061398825644422714
+        },
+        "3": {
+          "n": 20,
+          "median_us": 1556.679,
+          "p10_us": 1364.9948,
+          "p90_us": 1752.2096,
+          "cv": 0.09505569825146544
+        },
+        "4": {
+          "n": 20,
+          "median_us": 1464.8225000000002,
+          "p10_us": 1377.2092,
+          "p90_us": 1531.8149,
+          "cv": 0.16336052311752855
+        }
+      },
+      "round_cv": 0.11799009367125228
+    },
+    {
+      "phase": "conditioned",
+      "cache": "warm",
+      "scope": "raw_pipeline",
+      "impl": "donor",
+      "n": 100,
+      "median_us": 359.43999886512756,
+      "p10_us": 305.25120198726654,
+      "p90_us": 389.93920385837555,
+      "cv": 0.10209072990368727,
+      "rounds": {
+        "0": {
+          "n": 20,
+          "median_us": 341.66400134563446,
+          "p10_us": 318.62079203128815,
+          "p90_us": 368.29760670661926,
+          "cv": 0.06287910604349149
+        },
+        "1": {
+          "n": 20,
+          "median_us": 360.23999750614166,
+          "p10_us": 323.3599901199341,
+          "p90_us": 420.1312094926834,
+          "cv": 0.10556265461590232
+        },
+        "2": {
+          "n": 20,
+          "median_us": 380.5439919233322,
+          "p10_us": 363.75040113925934,
+          "p90_us": 391.1840111017227,
+          "cv": 0.052229087727151055
+        },
+        "3": {
+          "n": 20,
+          "median_us": 370.64000964164734,
+          "p10_us": 308.9984118938446,
+          "p90_us": 391.744002699852,
+          "cv": 0.09540012001634177
+        },
+        "4": {
+          "n": 20,
+          "median_us": 304.624006152153,
+          "p10_us": 293.0016040802002,
+          "p90_us": 360.3232055902481,
+          "cv": 0.08519677426214958
+        }
+      },
+      "round_cv": 0.0851053200739741
+    },
+    {
+      "phase": "conditioned",
+      "cache": "warm",
+      "scope": "raw_pipeline",
+      "impl": "port",
+      "n": 100,
+      "median_us": 319.7920024394989,
+      "p10_us": 306.25920593738556,
+      "p90_us": 377.5519907474518,
+      "cv": 0.08455329010016187,
+      "rounds": {
+        "0": {
+          "n": 20,
+          "median_us": 313.9519989490509,
+          "p10_us": 302.1759867668152,
+          "p90_us": 354.3487995862961,
+          "cv": 0.061331717306845265
+        },
+        "1": {
+          "n": 20,
+          "median_us": 315.311998128891,
+          "p10_us": 307.61279463768005,
+          "p90_us": 377.09759175777435,
+          "cv": 0.08208578474364334
+        },
+        "2": {
+          "n": 20,
+          "median_us": 314.6880120038986,
+          "p10_us": 307.5679898262024,
+          "p90_us": 347.49440252780914,
+          "cv": 0.05806045135688546
+        },
+        "3": {
+          "n": 20,
+          "median_us": 317.9359883069992,
+          "p10_us": 305.88480830192566,
+          "p90_us": 336.4704102277756,
+          "cv": 0.03983093580840281
+        },
+        "4": {
+          "n": 20,
+          "median_us": 375.93598663806915,
+          "p10_us": 339.0911966562271,
+          "p90_us": 397.0015972852707,
+          "cv": 0.06146771959595333
+        }
+      },
+      "round_cv": 0.08267674362347542
+    },
+    {
+      "phase": "standard",
+      "cache": "cold",
+      "scope": "full_operator",
+      "impl": "donor",
+      "n": 100,
+      "median_us": 404.098,
+      "p10_us": 350.75300000000004,
+      "p90_us": 425.0411,
+      "cv": 0.07076661590870703,
+      "rounds": {
+        "0": {
+          "n": 20,
+          "median_us": 350.9775,
+          "p10_us": 342.8106,
+          "p90_us": 365.3931,
+          "cv": 0.030671136284311288
+        },
+        "1": {
+          "n": 20,
+          "median_us": 408.61,
+          "p10_us": 395.5123,
+          "p90_us": 425.2779,
+          "cv": 0.032657725507674484
+        },
+        "2": {
+          "n": 20,
+          "median_us": 417.858,
+          "p10_us": 384.3764,
+          "p90_us": 425.058,
+          "cv": 0.035799611695375065
+        },
+        "3": {
+          "n": 20,
+          "median_us": 404.178,
+          "p10_us": 374.0051,
+          "p90_us": 419.3716,
+          "cv": 0.05581719743653496
+        },
+        "4": {
+          "n": 20,
+          "median_us": 409.47400000000005,
+          "p10_us": 364.4618,
+          "p90_us": 433.2747,
+          "cv": 0.06121752206220934
+        }
+      },
+      "round_cv": 0.06747090598296018
+    },
+    {
+      "phase": "standard",
+      "cache": "cold",
+      "scope": "full_operator",
+      "impl": "port",
+      "n": 100,
+      "median_us": 1656.8555000000001,
+      "p10_us": 1438.0101000000002,
+      "p90_us": 1860.8870000000002,
+      "cv": 0.10098332265462455,
+      "rounds": {
+        "0": {
+          "n": 20,
+          "median_us": 1439.174,
+          "p10_us": 1370.213,
+          "p90_us": 1550.6323,
+          "cv": 0.05166091937753063
+        },
+        "1": {
+          "n": 20,
+          "median_us": 1717.08,
+          "p10_us": 1563.4781,
+          "p90_us": 1802.7313,
+          "cv": 0.06660656146263724
+        },
+        "2": {
+          "n": 20,
+          "median_us": 1750.9025000000001,
+          "p10_us": 1572.438,
+          "p90_us": 1983.9055,
+          "cv": 0.08896381937352868
+        },
+        "3": {
+          "n": 20,
+          "median_us": 1539.1100000000001,
+          "p10_us": 1498.4924,
+          "p90_us": 1602.3932,
+          "cv": 0.032489704681871893
+        },
+        "4": {
+          "n": 20,
+          "median_us": 1814.568,
+          "p10_us": 1764.5317,
+          "p90_us": 1870.9863,
+          "cv": 0.02722420003674922
+        }
+      },
+      "round_cv": 0.0949729165339237
+    },
+    {
+      "phase": "standard",
+      "cache": "cold",
+      "scope": "raw_pipeline",
+      "impl": "donor",
+      "n": 100,
+      "median_us": 363.98400366306305,
+      "p10_us": 311.504003405571,
+      "p90_us": 389.6607995033264,
+      "cv": 0.08222876783483153,
+      "rounds": {
+        "0": {
+          "n": 20,
+          "median_us": 317.424014210701,
+          "p10_us": 297.0783978700638,
+          "p90_us": 332.7839881181717,
+          "cv": 0.04182957326023078
+        },
+        "1": {
+          "n": 20,
+          "median_us": 341.7759984731674,
+          "p10_us": 327.4688124656677,
+          "p90_us": 399.3088126182556,
+          "cv": 0.08240132650642372
+        },
+        "2": {
+          "n": 20,
+          "median_us": 370.511993765831,
+          "p10_us": 364.63681161403656,
+          "p90_us": 380.96960484981537,
+          "cv": 0.017380791116438046
+        },
+        "3": {
+          "n": 20,
+          "median_us": 366.9919967651367,
+          "p10_us": 359.7696006298065,
+          "p90_us": 382.29440450668335,
+          "cv": 0.03825517967702842
+        },
+        "4": {
+          "n": 20,
+          "median_us": 364.52800035476685,
+          "p10_us": 311.14880442619324,
+          "p90_us": 391.583988070488,
+          "cv": 0.08660307104165077
+        }
+      },
+      "round_cv": 0.06386202015590817
+    },
+    {
+      "phase": "standard",
+      "cache": "cold",
+      "scope": "raw_pipeline",
+      "impl": "port",
+      "n": 100,
+      "median_us": 356.4320057630539,
+      "p10_us": 317.4624115228653,
+      "p90_us": 412.4735891819,
+      "cv": 0.09359283680821126,
+      "rounds": {
+        "0": {
+          "n": 20,
+          "median_us": 341.16800129413605,
+          "p10_us": 321.9872087240219,
+          "p90_us": 356.3040018081665,
+          "cv": 0.04202009964296614
+        },
+        "1": {
+          "n": 20,
+          "median_us": 334.2079967260361,
+          "p10_us": 303.24160754680634,
+          "p90_us": 366.53760373592377,
+          "cv": 0.07739562659296871
+        },
+        "2": {
+          "n": 20,
+          "median_us": 412.57598996162415,
+          "p10_us": 383.94559621810913,
+          "p90_us": 419.8143929243088,
+          "cv": 0.0379671518123011
+        },
+        "3": {
+          "n": 20,
+          "median_us": 344.04799342155457,
+          "p10_us": 315.40801227092743,
+          "p90_us": 383.8944047689438,
+          "cv": 0.08461498226741625
+        },
+        "4": {
+          "n": 20,
+          "median_us": 357.5520068407059,
+          "p10_us": 332.08000361919403,
+          "p90_us": 395.1903909444809,
+          "cv": 0.06649945574489805
+        }
+      },
+      "round_cv": 0.08860460842462582
+    },
+    {
+      "phase": "standard",
+      "cache": "warm",
+      "scope": "full_operator",
+      "impl": "donor",
+      "n": 100,
+      "median_us": 402.738,
+      "p10_us": 347.2906,
+      "p90_us": 446.3956,
+      "cv": 0.09243550879231804,
+      "rounds": {
+        "0": {
+          "n": 20,
+          "median_us": 349.313,
+          "p10_us": 341.6202,
+          "p90_us": 373.521,
+          "cv": 0.03529211807536965
+        },
+        "1": {
+          "n": 20,
+          "median_us": 400.274,
+          "p10_us": 370.91389999999996,
+          "p90_us": 418.37640000000005,
+          "cv": 0.06611540673831488
+        },
+        "2": {
+          "n": 20,
+          "median_us": 404.8655,
+          "p10_us": 400.2452,
+          "p90_us": 419.33000000000004,
+          "cv": 0.050722537875427735
+        },
+        "3": {
+          "n": 20,
+          "median_us": 440.274,
+          "p10_us": 399.8292,
+          "p90_us": 479.5541,
+          "cv": 0.06947355707453269
+        },
+        "4": {
+          "n": 20,
+          "median_us": 406.914,
+          "p10_us": 378.5907,
+          "p90_us": 426.7915,
+          "cv": 0.0742400062058779
+        }
+      },
+      "round_cv": 0.08153983732886291
+    },
+    {
+      "phase": "standard",
+      "cache": "warm",
+      "scope": "full_operator",
+      "impl": "port",
+      "n": 100,
+      "median_us": 1630.15,
+      "p10_us": 1431.5763,
+      "p90_us": 1810.9222000000002,
+      "cv": 0.08526045549305969,
+      "rounds": {
+        "0": {
+          "n": 20,
+          "median_us": 1616.935,
+          "p10_us": 1389.8673999999999,
+          "p90_us": 1796.2301,
+          "cv": 0.08981557776178067
+        },
+        "1": {
+          "n": 20,
+          "median_us": 1712.1185,
+          "p10_us": 1535.6379,
+          "p90_us": 1785.7917,
+          "cv": 0.0685276861760159
+        },
+        "2": {
+          "n": 20,
+          "median_us": 1704.246,
+          "p10_us": 1539.1547,
+          "p90_us": 1860.4454,
+          "cv": 0.07091120653587157
+        },
+        "3": {
+          "n": 20,
+          "median_us": 1539.1100000000001,
+          "p10_us": 1359.7426,
+          "p90_us": 1673.5964000000001,
+          "cv": 0.07630550268542244
+        },
+        "4": {
+          "n": 20,
+          "median_us": 1647.814,
+          "p10_us": 1499.1132,
+          "p90_us": 1794.6662000000001,
+          "cv": 0.07747501347827356
+        }
+      },
+      "round_cv": 0.04303026602221386
+    },
+    {
+      "phase": "standard",
+      "cache": "warm",
+      "scope": "raw_pipeline",
+      "impl": "donor",
+      "n": 100,
+      "median_us": 350.3679931163788,
+      "p10_us": 300.1600116491318,
+      "p90_us": 373.8240122795105,
+      "cv": 0.9385210935856872,
+      "rounds": {
+        "0": {
+          "n": 20,
+          "median_us": 311.2639933824539,
+          "p10_us": 296.0895985364914,
+          "p90_us": 333.7152063846588,
+          "cv": 0.050127121367751735
+        },
+        "1": {
+          "n": 20,
+          "median_us": 323.91999661922455,
+          "p10_us": 293.94240379333496,
+          "p90_us": 373.9552140235901,
+          "cv": 0.099074571691749
+        },
+        "2": {
+          "n": 20,
+          "median_us": 361.2159937620163,
+          "p10_us": 353.64480316638947,
+          "p90_us": 411.6415947675705,
+          "cv": 0.06687490753051784
+        },
+        "3": {
+          "n": 20,
+          "median_us": 356.1919927597046,
+          "p10_us": 328.61759662628174,
+          "p90_us": 544.5568114519144,
+          "cv": 1.3331119465538603
+        },
+        "4": {
+          "n": 20,
+          "median_us": 349.4879901409149,
+          "p10_us": 301.9872009754181,
+          "p90_us": 368.3775991201401,
+          "cv": 0.0784681471547162
+        }
+      },
+      "round_cv": 0.06378309616944096
+    },
+    {
+      "phase": "standard",
+      "cache": "warm",
+      "scope": "raw_pipeline",
+      "impl": "port",
+      "n": 100,
+      "median_us": 349.3120074272156,
+      "p10_us": 311.8528127670288,
+      "p90_us": 389.36320543289185,
+      "cv": 0.08828671840183377,
+      "rounds": {
+        "0": {
+          "n": 20,
+          "median_us": 357.05599188804626,
+          "p10_us": 334.62401032447815,
+          "p90_us": 384.0448021888733,
+          "cv": 0.06126135604589504
+        },
+        "1": {
+          "n": 20,
+          "median_us": 337.93599903583527,
+          "p10_us": 304.49601113796234,
+          "p90_us": 380.7103902101517,
+          "cv": 0.08397335736423092
+        },
+        "2": {
+          "n": 20,
+          "median_us": 361.6960048675537,
+          "p10_us": 330.6271940469742,
+          "p90_us": 388.7295871973038,
+          "cv": 0.07257058642664599
+        },
+        "3": {
+          "n": 20,
+          "median_us": 374.09599125385284,
+          "p10_us": 339.2095923423767,
+          "p90_us": 414.60158824920654,
+          "cv": 0.08390122042562483
+        },
+        "4": {
+          "n": 20,
+          "median_us": 325.6320059299469,
+          "p10_us": 312.94079422950745,
+          "p90_us": 363.72799277305603,
+          "cv": 0.08860979148555936
+        }
+      },
+      "round_cv": 0.0550950996709904
+    }
+  ],
+  "comparisons": [
+    {
+      "phase": "conditioned",
+      "cache": "cold",
+      "scope": "full_operator",
+      "impl": "port",
+      "baseline_us": 413.378,
+      "port_us": 1514.518,
+      "ratio": 3.6637605291041133,
+      "status": "different-host-wrapper-scopes",
+      "baseline_round_cv": 0.0602416046042776
+    },
+    {
+      "phase": "conditioned",
+      "cache": "cold",
+      "scope": "raw_pipeline",
+      "impl": "port",
+      "baseline_us": 373.9039897918701,
+      "port_us": 321.75999879837036,
+      "ratio": 0.8605417636155068,
+      "status": "inconclusive-baseline-dispersion",
+      "baseline_round_cv": 0.0916118581221218
+    },
+    {
+      "phase": "conditioned",
+      "cache": "warm",
+      "scope": "full_operator",
+      "impl": "port",
+      "baseline_us": 411.6815,
+      "port_us": 1767.9915,
+      "ratio": 4.294561451024639,
+      "status": "different-host-wrapper-scopes",
+      "baseline_round_cv": 0.06837352842124686
+    },
+    {
+      "phase": "conditioned",
+      "cache": "warm",
+      "scope": "raw_pipeline",
+      "impl": "port",
+      "baseline_us": 359.43999886512756,
+      "port_us": 319.7920024394989,
+      "ratio": 0.8896950908334892,
+      "status": "inconclusive-baseline-dispersion",
+      "baseline_round_cv": 0.0851053200739741
+    },
+    {
+      "phase": "standard",
+      "cache": "cold",
+      "scope": "full_operator",
+      "impl": "port",
+      "baseline_us": 404.098,
+      "port_us": 1656.8555000000001,
+      "ratio": 4.100132888556736,
+      "status": "different-host-wrapper-scopes",
+      "baseline_round_cv": 0.06747090598296018
+    },
+    {
+      "phase": "standard",
+      "cache": "cold",
+      "scope": "raw_pipeline",
+      "impl": "port",
+      "baseline_us": 363.98400366306305,
+      "port_us": 356.4320057630539,
+      "ratio": 0.9792518412237698,
+      "status": "inconclusive-baseline-dispersion",
+      "baseline_round_cv": 0.06386202015590817
+    },
+    {
+      "phase": "standard",
+      "cache": "warm",
+      "scope": "full_operator",
+      "impl": "port",
+      "baseline_us": 402.738,
+      "port_us": 1630.15,
+      "ratio": 4.047668707695823,
+      "status": "different-host-wrapper-scopes",
+      "baseline_round_cv": 0.08153983732886291
+    },
+    {
+      "phase": "standard",
+      "cache": "warm",
+      "scope": "raw_pipeline",
+      "impl": "port",
+      "baseline_us": 350.3679931163788,
+      "port_us": 349.3120074272156,
+      "ratio": 0.996986066907052,
+      "status": "inconclusive-baseline-dispersion",
+      "baseline_round_cv": 0.06378309616944096
+    }
+  ],
+  "profiles": [
+    {
+      "impl": "donor",
+      "cache": "warm",
+      "fused": {
+        "n": 5,
+        "median_us": 305.953,
+        "p10_us": 280.0974,
+        "p90_us": 341.60740000000004,
+        "cv": 0.10655752873734699
+      },
+      "reduce": {
+        "n": 5,
+        "median_us": 3.52,
+        "p10_us": 3.5008,
+        "p90_us": 3.6224000000000003,
+        "cv": 0.018018018018018035
+      },
+      "ranks": [
+        {
+          "rank": 3,
+          "mega": [
+            359.617,
+            314.593,
+            305.953,
+            269.281,
+            276.769
+          ],
+          "reduce": [
+            3.424,
+            3.52,
+            3.456,
+            3.584,
+            3.552
+          ],
+          "trace": "/lustre/fsw/coreai_devtech_all/qiangf/ncclGIN/port/migration-evidence/blackwell-fix-20261102/final-confirmation/job-3578176/donor/rank-3-trace-warm.json"
+        },
+        {
+          "rank": 2,
+          "mega": [
+            341.377,
+            272.608,
+            223.745,
+            210.881,
+            241.665
+          ],
+          "reduce": [
+            3.456,
+            3.456,
+            3.52,
+            3.456,
+            3.648
+          ],
+          "trace": "/lustre/fsw/coreai_devtech_all/qiangf/ncclGIN/port/migration-evidence/blackwell-fix-20261102/final-confirmation/job-3578176/donor/rank-2-trace-warm.json"
+        },
+        {
+          "rank": 1,
+          "mega": [
+            217.922,
+            292.802,
+            269.218,
+            259.587,
+            296.322
+          ],
+          "reduce": [
+            3.488,
+            3.296,
+            3.456,
+            3.328,
+            3.456
+          ],
+          "trace": "/lustre/fsw/coreai_devtech_all/qiangf/ncclGIN/port/migration-evidence/blackwell-fix-20261102/final-confirmation/job-3578176/donor/rank-1-trace-warm.json"
+        },
+        {
+          "rank": 0,
+          "mega": [
+            217.347,
+            206.147,
+            203.587,
+            202.307,
+            206.978
+          ],
+          "reduce": [
+            3.456,
+            3.52,
+            3.456,
+            3.456,
+            3.328
+          ],
+          "trace": "/lustre/fsw/coreai_devtech_all/qiangf/ncclGIN/port/migration-evidence/blackwell-fix-20261102/final-confirmation/job-3578176/donor/rank-0-trace-warm.json"
+        }
+      ]
+    },
+    {
+      "impl": "donor",
+      "cache": "cold",
+      "fused": {
+        "n": 5,
+        "median_us": 289.664,
+        "p10_us": 255.72480000000002,
+        "p90_us": 317.1784,
+        "cv": 0.10510086746083849
+      },
+      "reduce": {
+        "n": 5,
+        "median_us": 3.616,
+        "p10_us": 3.52,
+        "p90_us": 3.6864000000000003,
+        "cv": 0.02315880072896147
+      },
+      "ranks": [
+        {
+          "rank": 3,
+          "mega": [
+            250.976,
+            262.848,
+            299.936,
+            289.664,
+            320.416
+          ],
+          "reduce": [
+            3.648,
+            3.488,
+            3.52,
+            3.712,
+            3.584
+          ],
+          "trace": "/lustre/fsw/coreai_devtech_all/qiangf/ncclGIN/port/migration-evidence/blackwell-fix-20261102/final-confirmation/job-3578176/donor/rank-3-trace-cold.json"
+        },
+        {
+          "rank": 2,
+          "mega": [
+            220.289,
+            219.042,
+            214.722,
+            228.032,
+            214.337
+          ],
+          "reduce": [
+            3.488,
+            3.488,
+            3.456,
+            3.553,
+            3.616
+          ],
+          "trace": "/lustre/fsw/coreai_devtech_all/qiangf/ncclGIN/port/migration-evidence/blackwell-fix-20261102/final-confirmation/job-3578176/donor/rank-2-trace-cold.json"
+        },
+        {
+          "rank": 1,
+          "mega": [
+            213.185,
+            252.481,
+            312.322,
+            253.057,
+            288.256
+          ],
+          "reduce": [
+            3.296,
+            3.52,
+            3.264,
+            3.52,
+            3.552
+          ],
+          "trace": "/lustre/fsw/coreai_devtech_all/qiangf/ncclGIN/port/migration-evidence/blackwell-fix-20261102/final-confirmation/job-3578176/donor/rank-1-trace-cold.json"
+        },
+        {
+          "rank": 0,
+          "mega": [
+            217.762,
+            216.162,
+            239.33,
+            215.778,
+            259.649
+          ],
+          "reduce": [
+            3.488,
+            3.456,
+            3.36,
+            3.488,
+            3.328
+          ],
+          "trace": "/lustre/fsw/coreai_devtech_all/qiangf/ncclGIN/port/migration-evidence/blackwell-fix-20261102/final-confirmation/job-3578176/donor/rank-0-trace-cold.json"
+        }
+      ]
+    },
+    {
+      "impl": "port",
+      "cache": "warm",
+      "fused": {
+        "n": 5,
+        "median_us": 315.649,
+        "p10_us": 291.02819999999997,
+        "p90_us": 368.0142,
+        "cv": 0.12833970762550065
+      },
+      "reduce": {
+        "n": 5,
+        "median_us": 3.68,
+        "p10_us": 3.5968,
+        "p90_us": 3.7510000000000003,
+        "cv": 0.02088698556726683
+      },
+      "ranks": [
+        {
+          "rank": 3,
+          "mega": [
+            392.385,
+            289.633,
+            331.458,
+            315.649,
+            293.121
+          ],
+          "reduce": [
+            3.328,
+            3.328,
+            3.232,
+            3.52,
+            3.296
+          ],
+          "trace": "/lustre/fsw/coreai_devtech_all/qiangf/ncclGIN/port/migration-evidence/blackwell-fix-20261102/final-confirmation/job-3578176/port/rank-3-trace-warm.json"
+        },
+        {
+          "rank": 2,
+          "mega": [
+            332.417,
+            208.161,
+            204.993,
+            212.129,
+            218.465
+          ],
+          "reduce": [
+            3.52,
+            3.648,
+            3.616,
+            3.424,
+            3.584
+          ],
+          "trace": "/lustre/fsw/coreai_devtech_all/qiangf/ncclGIN/port/migration-evidence/blackwell-fix-20261102/final-confirmation/job-3578176/port/rank-2-trace-warm.json"
+        },
+        {
+          "rank": 1,
+          "mega": [
+            220.801,
+            280.448,
+            309.985,
+            284.609,
+            268.608
+          ],
+          "reduce": [
+            3.296,
+            3.2,
+            3.072,
+            3.456,
+            3.2
+          ],
+          "trace": "/lustre/fsw/coreai_devtech_all/qiangf/ncclGIN/port/migration-evidence/blackwell-fix-20261102/final-confirmation/job-3578176/port/rank-1-trace-warm.json"
+        },
+        {
+          "rank": 0,
+          "mega": [
+            220.769,
+            226.753,
+            240.225,
+            218.081,
+            206.209
+          ],
+          "reduce": [
+            3.712,
+            3.68,
+            3.552,
+            3.777,
+            3.552
+          ],
+          "trace": "/lustre/fsw/coreai_devtech_all/qiangf/ncclGIN/port/migration-evidence/blackwell-fix-20261102/final-confirmation/job-3578176/port/rank-0-trace-warm.json"
+        }
+      ]
+    },
+    {
+      "impl": "port",
+      "cache": "cold",
+      "fused": {
+        "n": 5,
+        "median_us": 315.713,
+        "p10_us": 297.37059999999997,
+        "p90_us": 333.00579999999997,
+        "cv": 0.056436637088948964
+      },
+      "reduce": {
+        "n": 5,
+        "median_us": 3.552,
+        "p10_us": 3.5328,
+        "p90_us": 3.6352,
+        "cv": 0.014697385264002681
+      },
+      "ranks": [
+        {
+          "rank": 3,
+          "mega": [
+            331.585,
+            333.953,
+            288.673,
+            291.073,
+            315.713
+          ],
+          "reduce": [
+            3.392,
+            3.2,
+            3.392,
+            3.36,
+            3.392
+          ],
+          "trace": "/lustre/fsw/coreai_devtech_all/qiangf/ncclGIN/port/migration-evidence/blackwell-fix-20261102/final-confirmation/job-3578176/port/rank-3-trace-cold.json"
+        },
+        {
+          "rank": 2,
+          "mega": [
+            234.465,
+            269.441,
+            250.465,
+            231.489,
+            249.729
+          ],
+          "reduce": [
+            3.424,
+            3.552,
+            3.52,
+            3.552,
+            3.488
+          ],
+          "trace": "/lustre/fsw/coreai_devtech_all/qiangf/ncclGIN/port/migration-evidence/blackwell-fix-20261102/final-confirmation/job-3578176/port/rank-2-trace-cold.json"
+        },
+        {
+          "rank": 1,
+          "mega": [
+            304.545,
+            298.786,
+            306.817,
+            265.665,
+            312.801
+          ],
+          "reduce": [
+            3.392,
+            3.232,
+            3.168,
+            3.136,
+            3.2
+          ],
+          "trace": "/lustre/fsw/coreai_devtech_all/qiangf/ncclGIN/port/migration-evidence/blackwell-fix-20261102/final-confirmation/job-3578176/port/rank-1-trace-cold.json"
+        },
+        {
+          "rank": 0,
+          "mega": [
+            216.835,
+            217.346,
+            219.459,
+            218.498,
+            219.682
+          ],
+          "reduce": [
+            3.552,
+            3.424,
+            3.488,
+            3.616,
+            3.648
+          ],
+          "trace": "/lustre/fsw/coreai_devtech_all/qiangf/ncclGIN/port/migration-evidence/blackwell-fix-20261102/final-confirmation/job-3578176/port/rank-0-trace-cold.json"
+        }
+      ]
+    }
+  ],
+  "runtime": [
+    {
+      "impl": "donor",
+      "rank": 3,
+      "job": "3578176",
+      "node": "theia0115.lyris.clusters.nvidia.com",
+      "gpu": "_CudaDeviceProperties(name='NVIDIA GB300', major=10, minor=3, total_memory=283261MB, multi_processor_count=152, uuid=8d69e2a9-51e8-e614-f75f-17d70d375cea, pci_bus_id=6, pci_device_id=0, pci_domain_id=9, L2_cache_size=129MB)",
+      "settings": {
+        "kernel": "megamoe_nvfp4_mmatiler_128x128x256_cluster_1x1_1_cta_sched_static_expert_shape_12x3072x7168_grouphint_536870912_padding_64x128_fc2store_stg_no_inkernel_redg_do_topk_reduce_token_back_by_reuse_dispatch_apply_topk_fc1_pre_quant_internode_relay_meta1_rpn2_fc2outBFloat16_combinebf16_sfvec16_accFloat32_clampNone_situNonexNone_epiflag1x4_ep_4_topk_4_maxtoken_32_flagbatch_4",
+        "source": "/lustre/fsw/coreai_devtech_all/qiangf/ncclGIN/port/migration-evidence/donor-f863d754/pre_unification/moe_nvfp4_swapab/mega_runner.py",
+        "backend": "pre_unification.moe_nvfp4_swapab.megamoe_kernel.Sm100MegaMoEKernel"
+      },
+      "compiler": [
+        {
+          "target_module": "pre_unification.moe_nvfp4_swapab.megamoe_kernel",
+          "max_active_clusters": 152,
+          ".ptx": {
+            "path": "/lustre/fsw/coreai_devtech_all/qiangf/ncclGIN/port/migration-evidence/blackwell-fix-20261102/final-confirmation/job-3578176/donor/rank-3.ptx",
+            "sha256": "36ac969b6393c0431486cfe05134340a1ca92c1d00af840af6c0c0ff2a0aa190"
+          },
+          ".cubin": {
+            "path": "/lustre/fsw/coreai_devtech_all/qiangf/ncclGIN/port/migration-evidence/blackwell-fix-20261102/final-confirmation/job-3578176/donor/rank-3.cubin",
+            "sha256": "59bcdf4ee09860326075b3a20849eaee2e0a999be5359e4eeaac96bf2159f7b7"
+          }
+        }
+      ],
+      "source_commit": "f863d7540614bd546a42867c21adbf51d573061a",
+      "script_sha256": "6b28aae878ec77cae4d9fcc385071010c8459a1e0aceb3f0bfc24288ee725df2",
+      "benchmark_sha256": "5fa2448a6946c4e879b4225ffd932a85c0d344f49d14596efc0b9412a6c36700",
+      "clocks_before": [
+        "0, NVIDIA GB300, GPU-0bbe1375-c1e8-bb2e-fb70-917548f589f3, 580.173.10, 2070 MHz, 3996 MHz, 30, 235.50 W",
+        "1, NVIDIA GB300, GPU-8d69e2a9-51e8-e614-f75f-17d70d375cea, 580.173.10, 2070 MHz, 3996 MHz, 30, 234.60 W",
+        "2, NVIDIA GB300, GPU-8ae9139f-984e-1682-253f-331bd3761033, 580.173.10, 120 MHz, 3996 MHz, 29, 181.67 W",
+        "3, NVIDIA GB300, GPU-c7255cdb-1190-5914-b95a-4e2f0d020d2a, 580.173.10, 120 MHz, 3996 MHz, 30, 181.47 W"
+      ],
+      "payload": {
+        "activation": {
+          "shape": [
+            32,
+            3584
+          ],
+          "stride": [
+            3584,
+            1
+          ],
+          "dtype": "torch.float4_e2m1fn_x2",
+          "sha256": "463198c4ea85416ba585ce51490e2383240d135fb4730588f2f911c97670641e"
+        },
+        "activation_sf": {
+          "shape": [
+            32,
+            448
+          ],
+          "stride": [
+            448,
+            1
+          ],
+          "dtype": "torch.float8_e4m3fn",
+          "sha256": "0967c679577679cf9c7714bdffe969339676efd064744bc251fd2f52e1261154"
+        },
+        "topk_idx": {
+          "shape": [
+            32,
+            4
+          ],
+          "stride": [
+            4,
+            1
+          ],
+          "dtype": "torch.int64",
+          "sha256": "8e30ae407dce967dc7f94942d22d89e504bde31226b01d92ebec4cc2a628f057"
+        },
+        "topk_weights": {
+          "shape": [
+            32,
+            4
+          ],
+          "stride": [
+            4,
+            1
+          ],
+          "dtype": "torch.float32",
+          "sha256": "670bdbdab5158bb36ddb89affababa87666f56e79c85763abc3ceb744b13f700"
+        },
+        "fc1_weight": {
+          "shape": [
+            12,
+            3584,
+            3072
+          ],
+          "stride": [
+            11010048,
+            1,
+            3584
+          ],
+          "dtype": "torch.float4_e2m1fn_x2",
+          "sha256": "dabb410e02c1234157e1f2f3ee79f3da2d2ba9c15e6d083e95b6a7471ccc6d7d"
+        },
+        "fc1_weight_sf": {
+          "shape": [
+            12,
+            1376256
+          ],
+          "stride": [
+            1376256,
+            1
+          ],
+          "dtype": "torch.float8_e4m3fn",
+          "sha256": "39ba063c303f2d910d2c14fa49e5ea3cbb3f1975ac2bd6562ba56ddfc27b4ace"
+        },
+        "fc2_weight": {
+          "shape": [
+            12,
+            768,
+            7168
+          ],
+          "stride": [
+            5505024,
+            1,
+            768
+          ],
+          "dtype": "torch.float4_e2m1fn_x2",
+          "sha256": "916b3e9f39510c9e0e7de69745562865058e8bc8e6b996b249f2a2014e2618a6"
+        },
+        "fc2_weight_sf": {
+          "shape": [
+            12,
+            688128
+          ],
+          "stride": [
+            688128,
+            1
+          ],
+          "dtype": "torch.float8_e4m3fn",
+          "sha256": "427bb843e74ad959b9c2d8b4fdceb66ab3fafca98e7294b2dee3dd561332f62e"
+        },
+        "fc1_alpha": {
+          "shape": [
+            12
+          ],
+          "stride": [
+            1
+          ],
+          "dtype": "torch.float32",
+          "sha256": "6ea78411bee8a810b9a18819c5a4ac7c827e71678cc4d1db9a0ab8c8d8a9b2e2"
+        },
+        "fc2_alpha": {
+          "shape": [
+            12
+          ],
+          "stride": [
+            1
+          ],
+          "dtype": "torch.float32",
+          "sha256": "6ea78411bee8a810b9a18819c5a4ac7c827e71678cc4d1db9a0ab8c8d8a9b2e2"
+        },
+        "fc1_norm_const": {
+          "shape": [
+            12
+          ],
+          "stride": [
+            1
+          ],
+          "dtype": "torch.float32",
+          "sha256": "6ea78411bee8a810b9a18819c5a4ac7c827e71678cc4d1db9a0ab8c8d8a9b2e2"
+        }
+      },
+      "protocol": "resident serialized source turns; standard5 and conditioned200 kept separate; profiles after all primary samples",
+      "backend_config": "cpu:gloo,cuda:nccl",
+      "profiles": {
+        "warm": {
+          "trace": "/lustre/fsw/coreai_devtech_all/qiangf/ncclGIN/port/migration-evidence/blackwell-fix-20261102/final-confirmation/job-3578176/donor/rank-3-trace-warm.json",
+          "events": [
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_pre_unificationmoe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812_0",
+              "duration_us": 359.617,
+              "start_us": 2836719352449.523
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_pre_unificationmoe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168_1",
+              "duration_us": 3.424,
+              "start_us": 2836719352809.652
+            },
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_pre_unificationmoe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812_0",
+              "duration_us": 314.593,
+              "start_us": 2836719353220.022
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_pre_unificationmoe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168_1",
+              "duration_us": 3.52,
+              "start_us": 2836719353535.127
+            },
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_pre_unificationmoe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812_0",
+              "duration_us": 305.953,
+              "start_us": 2836719353834.264
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_pre_unificationmoe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168_1",
+              "duration_us": 3.456,
+              "start_us": 2836719354140.761
+            },
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_pre_unificationmoe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812_0",
+              "duration_us": 269.281,
+              "start_us": 2836719354443.322
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_pre_unificationmoe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168_1",
+              "duration_us": 3.584,
+              "start_us": 2836719354713.147
+            },
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_pre_unificationmoe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812_0",
+              "duration_us": 276.769,
+              "start_us": 2836719355011.132
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_pre_unificationmoe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168_1",
+              "duration_us": 3.552,
+              "start_us": 2836719355288.477
+            }
+          ],
+          "calls": 5
+        },
+        "cold": {
+          "trace": "/lustre/fsw/coreai_devtech_all/qiangf/ncclGIN/port/migration-evidence/blackwell-fix-20261102/final-confirmation/job-3578176/donor/rank-3-trace-cold.json",
+          "events": [
+            {
+              "name": "void at::native::vectorized_elementwise_kernel<8, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul> >(int, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul>)",
+              "duration_us": 133.408,
+              "start_us": 2836719359613.615
+            },
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_pre_unificationmoe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812_0",
+              "duration_us": 250.976,
+              "start_us": 2836719360558.607
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_pre_unificationmoe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168_1",
+              "duration_us": 3.648,
+              "start_us": 2836719360810.095
+            },
+            {
+              "name": "void at::native::vectorized_elementwise_kernel<8, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul> >(int, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul>)",
+              "duration_us": 133.217,
+              "start_us": 2836719360855.183
+            },
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_pre_unificationmoe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812_0",
+              "duration_us": 262.848,
+              "start_us": 2836719361323.696
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_pre_unificationmoe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168_1",
+              "duration_us": 3.488,
+              "start_us": 2836719361587.056
+            },
+            {
+              "name": "void at::native::vectorized_elementwise_kernel<8, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul> >(int, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul>)",
+              "duration_us": 133.088,
+              "start_us": 2836719361626.064
+            },
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_pre_unificationmoe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812_0",
+              "duration_us": 299.936,
+              "start_us": 2836719362044.336
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_pre_unificationmoe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168_1",
+              "duration_us": 3.52,
+              "start_us": 2836719362344.752
+            },
+            {
+              "name": "void at::native::vectorized_elementwise_kernel<8, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul> >(int, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul>)",
+              "duration_us": 133.216,
+              "start_us": 2836719362382.384
+            },
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_pre_unificationmoe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812_0",
+              "duration_us": 289.664,
+              "start_us": 2836719362772.464
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_pre_unificationmoe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168_1",
+              "duration_us": 3.712,
+              "start_us": 2836719363062.608
+            },
+            {
+              "name": "void at::native::vectorized_elementwise_kernel<8, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul> >(int, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul>)",
+              "duration_us": 133.183,
+              "start_us": 2836719363103.537
+            },
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_pre_unificationmoe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812_0",
+              "duration_us": 320.416,
+              "start_us": 2836719363511.281
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_pre_unificationmoe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168_1",
+              "duration_us": 3.584,
+              "start_us": 2836719363832.209
+            }
+          ],
+          "calls": 5
+        }
+      },
+      "validation": "bitwise PASS",
+      "clocks_after": [
+        "0, NVIDIA GB300, GPU-0bbe1375-c1e8-bb2e-fb70-917548f589f3, 580.173.10, 2070 MHz, 3996 MHz, 30, 235.21 W",
+        "1, NVIDIA GB300, GPU-8d69e2a9-51e8-e614-f75f-17d70d375cea, 580.173.10, 2070 MHz, 3996 MHz, 30, 235.08 W",
+        "2, NVIDIA GB300, GPU-8ae9139f-984e-1682-253f-331bd3761033, 580.173.10, 120 MHz, 3996 MHz, 29, 183.85 W",
+        "3, NVIDIA GB300, GPU-c7255cdb-1190-5914-b95a-4e2f0d020d2a, 580.173.10, 120 MHz, 3996 MHz, 30, 183.97 W"
+      ],
+      "complete": true
+    },
+    {
+      "impl": "donor",
+      "rank": 2,
+      "job": "3578176",
+      "node": "theia0115.lyris.clusters.nvidia.com",
+      "gpu": "_CudaDeviceProperties(name='NVIDIA GB300', major=10, minor=3, total_memory=283261MB, multi_processor_count=152, uuid=0bbe1375-c1e8-bb2e-fb70-917548f589f3, pci_bus_id=6, pci_device_id=0, pci_domain_id=8, L2_cache_size=129MB)",
+      "settings": {
+        "kernel": "megamoe_nvfp4_mmatiler_128x128x256_cluster_1x1_1_cta_sched_static_expert_shape_12x3072x7168_grouphint_536870912_padding_64x128_fc2store_stg_no_inkernel_redg_do_topk_reduce_token_back_by_reuse_dispatch_apply_topk_fc1_pre_quant_internode_relay_meta1_rpn2_fc2outBFloat16_combinebf16_sfvec16_accFloat32_clampNone_situNonexNone_epiflag1x4_ep_4_topk_4_maxtoken_32_flagbatch_4",
+        "source": "/lustre/fsw/coreai_devtech_all/qiangf/ncclGIN/port/migration-evidence/donor-f863d754/pre_unification/moe_nvfp4_swapab/mega_runner.py",
+        "backend": "pre_unification.moe_nvfp4_swapab.megamoe_kernel.Sm100MegaMoEKernel"
+      },
+      "compiler": [
+        {
+          "target_module": "pre_unification.moe_nvfp4_swapab.megamoe_kernel",
+          "max_active_clusters": 152,
+          ".ptx": {
+            "path": "/lustre/fsw/coreai_devtech_all/qiangf/ncclGIN/port/migration-evidence/blackwell-fix-20261102/final-confirmation/job-3578176/donor/rank-2.ptx",
+            "sha256": "36ac969b6393c0431486cfe05134340a1ca92c1d00af840af6c0c0ff2a0aa190"
+          },
+          ".cubin": {
+            "path": "/lustre/fsw/coreai_devtech_all/qiangf/ncclGIN/port/migration-evidence/blackwell-fix-20261102/final-confirmation/job-3578176/donor/rank-2.cubin",
+            "sha256": "59bcdf4ee09860326075b3a20849eaee2e0a999be5359e4eeaac96bf2159f7b7"
+          }
+        }
+      ],
+      "source_commit": "f863d7540614bd546a42867c21adbf51d573061a",
+      "script_sha256": "6b28aae878ec77cae4d9fcc385071010c8459a1e0aceb3f0bfc24288ee725df2",
+      "benchmark_sha256": "5fa2448a6946c4e879b4225ffd932a85c0d344f49d14596efc0b9412a6c36700",
+      "clocks_before": [
+        "0, NVIDIA GB300, GPU-0bbe1375-c1e8-bb2e-fb70-917548f589f3, 580.173.10, 2070 MHz, 3996 MHz, 30, 235.50 W",
+        "1, NVIDIA GB300, GPU-8d69e2a9-51e8-e614-f75f-17d70d375cea, 580.173.10, 2070 MHz, 3996 MHz, 30, 234.60 W",
+        "2, NVIDIA GB300, GPU-8ae9139f-984e-1682-253f-331bd3761033, 580.173.10, 120 MHz, 3996 MHz, 29, 181.67 W",
+        "3, NVIDIA GB300, GPU-c7255cdb-1190-5914-b95a-4e2f0d020d2a, 580.173.10, 120 MHz, 3996 MHz, 30, 181.47 W"
+      ],
+      "payload": {
+        "activation": {
+          "shape": [
+            32,
+            3584
+          ],
+          "stride": [
+            3584,
+            1
+          ],
+          "dtype": "torch.float4_e2m1fn_x2",
+          "sha256": "338959bad1655f30ff5c45f2565ce646c93e7fc0f865fa1ab6602d3ad0522a5f"
+        },
+        "activation_sf": {
+          "shape": [
+            32,
+            448
+          ],
+          "stride": [
+            448,
+            1
+          ],
+          "dtype": "torch.float8_e4m3fn",
+          "sha256": "b7e746e858d55861372972bfcdcc08639a8808a0acd68071df884496cf2bdf1c"
+        },
+        "topk_idx": {
+          "shape": [
+            32,
+            4
+          ],
+          "stride": [
+            4,
+            1
+          ],
+          "dtype": "torch.int64",
+          "sha256": "dae056968d83a1a737d0d8d3d68edbe2f160af9eb667ebea4bbd4f6efb2879a1"
+        },
+        "topk_weights": {
+          "shape": [
+            32,
+            4
+          ],
+          "stride": [
+            4,
+            1
+          ],
+          "dtype": "torch.float32",
+          "sha256": "6c6686895623eb77e14f342a4da881f81fbe0b400b43935c982fcc95c35e25f2"
+        },
+        "fc1_weight": {
+          "shape": [
+            12,
+            3584,
+            3072
+          ],
+          "stride": [
+            11010048,
+            1,
+            3584
+          ],
+          "dtype": "torch.float4_e2m1fn_x2",
+          "sha256": "ee1adb9ae977a1324ec5045549178d928292b063aa0593d9f8f228209be8e3df"
+        },
+        "fc1_weight_sf": {
+          "shape": [
+            12,
+            1376256
+          ],
+          "stride": [
+            1376256,
+            1
+          ],
+          "dtype": "torch.float8_e4m3fn",
+          "sha256": "fa28fddc2857a6395f83de111a6cd419634a675ae69236112f654b4a03234ccd"
+        },
+        "fc2_weight": {
+          "shape": [
+            12,
+            768,
+            7168
+          ],
+          "stride": [
+            5505024,
+            1,
+            768
+          ],
+          "dtype": "torch.float4_e2m1fn_x2",
+          "sha256": "305d62632fec93a1864158c00fa5112e2be049cd2f588421330ffa3636bb7fcd"
+        },
+        "fc2_weight_sf": {
+          "shape": [
+            12,
+            688128
+          ],
+          "stride": [
+            688128,
+            1
+          ],
+          "dtype": "torch.float8_e4m3fn",
+          "sha256": "e55231c193a053677be9119a759d2314fe58c2981a2bc872ce197bae77a6eb89"
+        },
+        "fc1_alpha": {
+          "shape": [
+            12
+          ],
+          "stride": [
+            1
+          ],
+          "dtype": "torch.float32",
+          "sha256": "6ea78411bee8a810b9a18819c5a4ac7c827e71678cc4d1db9a0ab8c8d8a9b2e2"
+        },
+        "fc2_alpha": {
+          "shape": [
+            12
+          ],
+          "stride": [
+            1
+          ],
+          "dtype": "torch.float32",
+          "sha256": "6ea78411bee8a810b9a18819c5a4ac7c827e71678cc4d1db9a0ab8c8d8a9b2e2"
+        },
+        "fc1_norm_const": {
+          "shape": [
+            12
+          ],
+          "stride": [
+            1
+          ],
+          "dtype": "torch.float32",
+          "sha256": "6ea78411bee8a810b9a18819c5a4ac7c827e71678cc4d1db9a0ab8c8d8a9b2e2"
+        }
+      },
+      "protocol": "resident serialized source turns; standard5 and conditioned200 kept separate; profiles after all primary samples",
+      "backend_config": "cpu:gloo,cuda:nccl",
+      "profiles": {
+        "warm": {
+          "trace": "/lustre/fsw/coreai_devtech_all/qiangf/ncclGIN/port/migration-evidence/blackwell-fix-20261102/final-confirmation/job-3578176/donor/rank-2-trace-warm.json",
+          "events": [
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_pre_unificationmoe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812_0",
+              "duration_us": 341.377,
+              "start_us": 2836719352468.856
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_pre_unificationmoe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168_1",
+              "duration_us": 3.456,
+              "start_us": 2836719352810.745
+            },
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_pre_unificationmoe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812_0",
+              "duration_us": 272.608,
+              "start_us": 2836719353261.211
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_pre_unificationmoe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168_1",
+              "duration_us": 3.456,
+              "start_us": 2836719353534.331
+            },
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_pre_unificationmoe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812_0",
+              "duration_us": 223.745,
+              "start_us": 2836719353915.964
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_pre_unificationmoe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168_1",
+              "duration_us": 3.52,
+              "start_us": 2836719354140.253
+            },
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_pre_unificationmoe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812_0",
+              "duration_us": 210.881,
+              "start_us": 2836719354500.958
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_pre_unificationmoe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168_1",
+              "duration_us": 3.456,
+              "start_us": 2836719354712.383
+            },
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_pre_unificationmoe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812_0",
+              "duration_us": 241.665,
+              "start_us": 2836719355047.296
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_pre_unificationmoe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168_1",
+              "duration_us": 3.648,
+              "start_us": 2836719355289.441
+            }
+          ],
+          "calls": 5
+        },
+        "cold": {
+          "trace": "/lustre/fsw/coreai_devtech_all/qiangf/ncclGIN/port/migration-evidence/blackwell-fix-20261102/final-confirmation/job-3578176/donor/rank-2-trace-cold.json",
+          "events": [
+            {
+              "name": "void at::native::vectorized_elementwise_kernel<8, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul> >(int, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul>)",
+              "duration_us": 132.641,
+              "start_us": 2836719359436.29
+            },
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_pre_unificationmoe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812_0",
+              "duration_us": 220.289,
+              "start_us": 2836719360588.33
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_pre_unificationmoe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168_1",
+              "duration_us": 3.488,
+              "start_us": 2836719360809.131
+            },
+            {
+              "name": "void at::native::vectorized_elementwise_kernel<8, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul> >(int, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul>)",
+              "duration_us": 132.577,
+              "start_us": 2836719360854.38
+            },
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_pre_unificationmoe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812_0",
+              "duration_us": 219.042,
+              "start_us": 2836719361368.143
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_pre_unificationmoe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168_1",
+              "duration_us": 3.488,
+              "start_us": 2836719361587.921
+            },
+            {
+              "name": "void at::native::vectorized_elementwise_kernel<8, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul> >(int, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul>)",
+              "duration_us": 132.481,
+              "start_us": 2836719361629.937
+            },
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_pre_unificationmoe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812_0",
+              "duration_us": 214.722,
+              "start_us": 2836719362130.548
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_pre_unificationmoe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168_1",
+              "duration_us": 3.456,
+              "start_us": 2836719362345.814
+            },
+            {
+              "name": "void at::native::vectorized_elementwise_kernel<8, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul> >(int, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul>)",
+              "duration_us": 132.481,
+              "start_us": 2836719362386.39
+            },
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_pre_unificationmoe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812_0",
+              "duration_us": 228.032,
+              "start_us": 2836719362835.098
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_pre_unificationmoe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168_1",
+              "duration_us": 3.553,
+              "start_us": 2836719363063.642
+            },
+            {
+              "name": "void at::native::vectorized_elementwise_kernel<8, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul> >(int, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul>)",
+              "duration_us": 132.577,
+              "start_us": 2836719363108.155
+            },
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_pre_unificationmoe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812_0",
+              "duration_us": 214.337,
+              "start_us": 2836719363618.271
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_pre_unificationmoe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168_1",
+              "duration_us": 3.616,
+              "start_us": 2836719363833.12
+            }
+          ],
+          "calls": 5
+        }
+      },
+      "validation": "bitwise PASS",
+      "clocks_after": [
+        "0, NVIDIA GB300, GPU-0bbe1375-c1e8-bb2e-fb70-917548f589f3, 580.173.10, 2070 MHz, 3996 MHz, 30, 235.21 W",
+        "1, NVIDIA GB300, GPU-8d69e2a9-51e8-e614-f75f-17d70d375cea, 580.173.10, 2070 MHz, 3996 MHz, 30, 235.08 W",
+        "2, NVIDIA GB300, GPU-8ae9139f-984e-1682-253f-331bd3761033, 580.173.10, 120 MHz, 3996 MHz, 29, 183.85 W",
+        "3, NVIDIA GB300, GPU-c7255cdb-1190-5914-b95a-4e2f0d020d2a, 580.173.10, 120 MHz, 3996 MHz, 30, 183.97 W"
+      ],
+      "complete": true
+    },
+    {
+      "impl": "donor",
+      "rank": 1,
+      "job": "3578176",
+      "node": "theia0048.lyris.clusters.nvidia.com",
+      "gpu": "_CudaDeviceProperties(name='NVIDIA GB300', major=10, minor=3, total_memory=283261MB, multi_processor_count=152, uuid=54c90568-7ecf-acbd-7043-50bb74201743, pci_bus_id=6, pci_device_id=0, pci_domain_id=9, L2_cache_size=129MB)",
+      "settings": {
+        "kernel": "megamoe_nvfp4_mmatiler_128x128x256_cluster_1x1_1_cta_sched_static_expert_shape_12x3072x7168_grouphint_536870912_padding_64x128_fc2store_stg_no_inkernel_redg_do_topk_reduce_token_back_by_reuse_dispatch_apply_topk_fc1_pre_quant_internode_relay_meta1_rpn2_fc2outBFloat16_combinebf16_sfvec16_accFloat32_clampNone_situNonexNone_epiflag1x4_ep_4_topk_4_maxtoken_32_flagbatch_4",
+        "source": "/lustre/fsw/coreai_devtech_all/qiangf/ncclGIN/port/migration-evidence/donor-f863d754/pre_unification/moe_nvfp4_swapab/mega_runner.py",
+        "backend": "pre_unification.moe_nvfp4_swapab.megamoe_kernel.Sm100MegaMoEKernel"
+      },
+      "compiler": [
+        {
+          "target_module": "pre_unification.moe_nvfp4_swapab.megamoe_kernel",
+          "max_active_clusters": 152,
+          ".ptx": {
+            "path": "/lustre/fsw/coreai_devtech_all/qiangf/ncclGIN/port/migration-evidence/blackwell-fix-20261102/final-confirmation/job-3578176/donor/rank-1.ptx",
+            "sha256": "36ac969b6393c0431486cfe05134340a1ca92c1d00af840af6c0c0ff2a0aa190"
+          },
+          ".cubin": {
+            "path": "/lustre/fsw/coreai_devtech_all/qiangf/ncclGIN/port/migration-evidence/blackwell-fix-20261102/final-confirmation/job-3578176/donor/rank-1.cubin",
+            "sha256": "59bcdf4ee09860326075b3a20849eaee2e0a999be5359e4eeaac96bf2159f7b7"
+          }
+        }
+      ],
+      "source_commit": "f863d7540614bd546a42867c21adbf51d573061a",
+      "script_sha256": "6b28aae878ec77cae4d9fcc385071010c8459a1e0aceb3f0bfc24288ee725df2",
+      "benchmark_sha256": "5fa2448a6946c4e879b4225ffd932a85c0d344f49d14596efc0b9412a6c36700",
+      "clocks_before": [
+        "0, NVIDIA GB300, GPU-30ceddb5-fa41-0714-1fc2-f1870ea6004f, 580.173.10, 2070 MHz, 3996 MHz, 31, 234.55 W",
+        "1, NVIDIA GB300, GPU-54c90568-7ecf-acbd-7043-50bb74201743, 580.173.10, 2070 MHz, 3996 MHz, 31, 235.77 W",
+        "2, NVIDIA GB300, GPU-be32855b-c3b1-4cb8-9013-7f2faa263f3b, 580.173.10, 120 MHz, 3996 MHz, 29, 176.26 W",
+        "3, NVIDIA GB300, GPU-7677caca-4322-8393-dcfa-441e208a4d9d, 580.173.10, 120 MHz, 3996 MHz, 28, 180.29 W"
+      ],
+      "payload": {
+        "activation": {
+          "shape": [
+            32,
+            3584
+          ],
+          "stride": [
+            3584,
+            1
+          ],
+          "dtype": "torch.float4_e2m1fn_x2",
+          "sha256": "0d20f43f9d9bc41242783be382b88b8ad2c966a69a410c94276838c2bed17791"
+        },
+        "activation_sf": {
+          "shape": [
+            32,
+            448
+          ],
+          "stride": [
+            448,
+            1
+          ],
+          "dtype": "torch.float8_e4m3fn",
+          "sha256": "8f9d2feec6bee1223083e48e838a1bc281317c95e3e6eb9a5f0f4590b98648f9"
+        },
+        "topk_idx": {
+          "shape": [
+            32,
+            4
+          ],
+          "stride": [
+            4,
+            1
+          ],
+          "dtype": "torch.int64",
+          "sha256": "cac79cd6d04b95cd80eab975d7ba16e9caf9b4a9a187dfe9fe4375f4f349bd81"
+        },
+        "topk_weights": {
+          "shape": [
+            32,
+            4
+          ],
+          "stride": [
+            4,
+            1
+          ],
+          "dtype": "torch.float32",
+          "sha256": "1ad9cb598bf325cd7d0bba4115bf987db7ef27e18840c40257697cf3954de262"
+        },
+        "fc1_weight": {
+          "shape": [
+            12,
+            3584,
+            3072
+          ],
+          "stride": [
+            11010048,
+            1,
+            3584
+          ],
+          "dtype": "torch.float4_e2m1fn_x2",
+          "sha256": "970a5ca71ba6913b24cbff5438c28457f3cf7e5cbb6917f007c86b43abe143d3"
+        },
+        "fc1_weight_sf": {
+          "shape": [
+            12,
+            1376256
+          ],
+          "stride": [
+            1376256,
+            1
+          ],
+          "dtype": "torch.float8_e4m3fn",
+          "sha256": "7052e487ebee0f4d0d3d4d01ad2ccef69fd12fe3e7fd83d031e3c9eaaaead48f"
+        },
+        "fc2_weight": {
+          "shape": [
+            12,
+            768,
+            7168
+          ],
+          "stride": [
+            5505024,
+            1,
+            768
+          ],
+          "dtype": "torch.float4_e2m1fn_x2",
+          "sha256": "c66d36d33b578c6687e1bdf6827d145fa8c2abc5ab256433e0af121fbb957b41"
+        },
+        "fc2_weight_sf": {
+          "shape": [
+            12,
+            688128
+          ],
+          "stride": [
+            688128,
+            1
+          ],
+          "dtype": "torch.float8_e4m3fn",
+          "sha256": "101df0c2bbd6921b9d088789e8f1ac9918accea10cdf740780c937ba0abf9497"
+        },
+        "fc1_alpha": {
+          "shape": [
+            12
+          ],
+          "stride": [
+            1
+          ],
+          "dtype": "torch.float32",
+          "sha256": "6ea78411bee8a810b9a18819c5a4ac7c827e71678cc4d1db9a0ab8c8d8a9b2e2"
+        },
+        "fc2_alpha": {
+          "shape": [
+            12
+          ],
+          "stride": [
+            1
+          ],
+          "dtype": "torch.float32",
+          "sha256": "6ea78411bee8a810b9a18819c5a4ac7c827e71678cc4d1db9a0ab8c8d8a9b2e2"
+        },
+        "fc1_norm_const": {
+          "shape": [
+            12
+          ],
+          "stride": [
+            1
+          ],
+          "dtype": "torch.float32",
+          "sha256": "6ea78411bee8a810b9a18819c5a4ac7c827e71678cc4d1db9a0ab8c8d8a9b2e2"
+        }
+      },
+      "protocol": "resident serialized source turns; standard5 and conditioned200 kept separate; profiles after all primary samples",
+      "backend_config": "cpu:gloo,cuda:nccl",
+      "profiles": {
+        "warm": {
+          "trace": "/lustre/fsw/coreai_devtech_all/qiangf/ncclGIN/port/migration-evidence/blackwell-fix-20261102/final-confirmation/job-3578176/donor/rank-1-trace-warm.json",
+          "events": [
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_pre_unificationmoe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812_0",
+              "duration_us": 217.922,
+              "start_us": 2836719352600.558
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_pre_unificationmoe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168_1",
+              "duration_us": 3.488,
+              "start_us": 2836719352819.184
+            },
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_pre_unificationmoe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812_0",
+              "duration_us": 292.802,
+              "start_us": 2836719353248.627
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_pre_unificationmoe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168_1",
+              "duration_us": 3.296,
+              "start_us": 2836719353542.133
+            },
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_pre_unificationmoe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812_0",
+              "duration_us": 269.218,
+              "start_us": 2836719353879.0
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_pre_unificationmoe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168_1",
+              "duration_us": 3.456,
+              "start_us": 2836719354148.954
+            },
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_pre_unificationmoe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812_0",
+              "duration_us": 259.587,
+              "start_us": 2836719354460.732
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_pre_unificationmoe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168_1",
+              "duration_us": 3.328,
+              "start_us": 2836719354721.087
+            },
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_pre_unificationmoe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812_0",
+              "duration_us": 296.322,
+              "start_us": 2836719355002.336
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_pre_unificationmoe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168_1",
+              "duration_us": 3.456,
+              "start_us": 2836719355299.522
+            }
+          ],
+          "calls": 5
+        },
+        "cold": {
+          "trace": "/lustre/fsw/coreai_devtech_all/qiangf/ncclGIN/port/migration-evidence/blackwell-fix-20261102/final-confirmation/job-3578176/donor/rank-1-trace-cold.json",
+          "events": [
+            {
+              "name": "void at::native::vectorized_elementwise_kernel<8, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul> >(int, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul>)",
+              "duration_us": 132.768,
+              "start_us": 2836719359584.336
+            },
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_pre_unificationmoe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812_0",
+              "duration_us": 213.185,
+              "start_us": 2836719360605.333
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_pre_unificationmoe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168_1",
+              "duration_us": 3.296,
+              "start_us": 2836719360819.222
+            },
+            {
+              "name": "void at::native::vectorized_elementwise_kernel<8, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul> >(int, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul>)",
+              "duration_us": 132.767,
+              "start_us": 2836719360879.03
+            },
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_pre_unificationmoe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812_0",
+              "duration_us": 252.481,
+              "start_us": 2836719361344.696
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_pre_unificationmoe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168_1",
+              "duration_us": 3.52,
+              "start_us": 2836719361597.881
+            },
+            {
+              "name": "void at::native::vectorized_elementwise_kernel<8, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul> >(int, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul>)",
+              "duration_us": 132.641,
+              "start_us": 2836719361633.785
+            },
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_pre_unificationmoe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812_0",
+              "duration_us": 312.322,
+              "start_us": 2836719362043.227
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_pre_unificationmoe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168_1",
+              "duration_us": 3.264,
+              "start_us": 2836719362356.253
+            },
+            {
+              "name": "void at::native::vectorized_elementwise_kernel<8, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul> >(int, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul>)",
+              "duration_us": 132.672,
+              "start_us": 2836719362392.989
+            },
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_pre_unificationmoe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812_0",
+              "duration_us": 253.057,
+              "start_us": 2836719362819.615
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_pre_unificationmoe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168_1",
+              "duration_us": 3.52,
+              "start_us": 2836719363073.376
+            },
+            {
+              "name": "void at::native::vectorized_elementwise_kernel<8, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul> >(int, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul>)",
+              "duration_us": 132.769,
+              "start_us": 2836719363108.672
+            },
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_pre_unificationmoe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812_0",
+              "duration_us": 288.256,
+              "start_us": 2836719363553.218
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_pre_unificationmoe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168_1",
+              "duration_us": 3.552,
+              "start_us": 2836719363842.178
+            }
+          ],
+          "calls": 5
+        }
+      },
+      "validation": "bitwise PASS",
+      "clocks_after": [
+        "0, NVIDIA GB300, GPU-30ceddb5-fa41-0714-1fc2-f1870ea6004f, 580.173.10, 2070 MHz, 3996 MHz, 31, 237.91 W",
+        "1, NVIDIA GB300, GPU-54c90568-7ecf-acbd-7043-50bb74201743, 580.173.10, 2070 MHz, 3996 MHz, 31, 238.30 W",
+        "2, NVIDIA GB300, GPU-be32855b-c3b1-4cb8-9013-7f2faa263f3b, 580.173.10, 120 MHz, 3996 MHz, 29, 179.46 W",
+        "3, NVIDIA GB300, GPU-7677caca-4322-8393-dcfa-441e208a4d9d, 580.173.10, 120 MHz, 3996 MHz, 28, 180.67 W"
+      ],
+      "complete": true
+    },
+    {
+      "impl": "donor",
+      "rank": 0,
+      "job": "3578176",
+      "node": "theia0048.lyris.clusters.nvidia.com",
+      "gpu": "_CudaDeviceProperties(name='NVIDIA GB300', major=10, minor=3, total_memory=283261MB, multi_processor_count=152, uuid=30ceddb5-fa41-0714-1fc2-f1870ea6004f, pci_bus_id=6, pci_device_id=0, pci_domain_id=8, L2_cache_size=129MB)",
+      "settings": {
+        "kernel": "megamoe_nvfp4_mmatiler_128x128x256_cluster_1x1_1_cta_sched_static_expert_shape_12x3072x7168_grouphint_536870912_padding_64x128_fc2store_stg_no_inkernel_redg_do_topk_reduce_token_back_by_reuse_dispatch_apply_topk_fc1_pre_quant_internode_relay_meta1_rpn2_fc2outBFloat16_combinebf16_sfvec16_accFloat32_clampNone_situNonexNone_epiflag1x4_ep_4_topk_4_maxtoken_32_flagbatch_4",
+        "source": "/lustre/fsw/coreai_devtech_all/qiangf/ncclGIN/port/migration-evidence/donor-f863d754/pre_unification/moe_nvfp4_swapab/mega_runner.py",
+        "backend": "pre_unification.moe_nvfp4_swapab.megamoe_kernel.Sm100MegaMoEKernel"
+      },
+      "compiler": [
+        {
+          "target_module": "pre_unification.moe_nvfp4_swapab.megamoe_kernel",
+          "max_active_clusters": 152,
+          ".ptx": {
+            "path": "/lustre/fsw/coreai_devtech_all/qiangf/ncclGIN/port/migration-evidence/blackwell-fix-20261102/final-confirmation/job-3578176/donor/rank-0.ptx",
+            "sha256": "36ac969b6393c0431486cfe05134340a1ca92c1d00af840af6c0c0ff2a0aa190"
+          },
+          ".cubin": {
+            "path": "/lustre/fsw/coreai_devtech_all/qiangf/ncclGIN/port/migration-evidence/blackwell-fix-20261102/final-confirmation/job-3578176/donor/rank-0.cubin",
+            "sha256": "59bcdf4ee09860326075b3a20849eaee2e0a999be5359e4eeaac96bf2159f7b7"
+          }
+        }
+      ],
+      "source_commit": "f863d7540614bd546a42867c21adbf51d573061a",
+      "script_sha256": "6b28aae878ec77cae4d9fcc385071010c8459a1e0aceb3f0bfc24288ee725df2",
+      "benchmark_sha256": "5fa2448a6946c4e879b4225ffd932a85c0d344f49d14596efc0b9412a6c36700",
+      "clocks_before": [
+        "0, NVIDIA GB300, GPU-30ceddb5-fa41-0714-1fc2-f1870ea6004f, 580.173.10, 2070 MHz, 3996 MHz, 31, 234.55 W",
+        "1, NVIDIA GB300, GPU-54c90568-7ecf-acbd-7043-50bb74201743, 580.173.10, 2070 MHz, 3996 MHz, 31, 235.77 W",
+        "2, NVIDIA GB300, GPU-be32855b-c3b1-4cb8-9013-7f2faa263f3b, 580.173.10, 120 MHz, 3996 MHz, 29, 176.26 W",
+        "3, NVIDIA GB300, GPU-7677caca-4322-8393-dcfa-441e208a4d9d, 580.173.10, 120 MHz, 3996 MHz, 28, 180.29 W"
+      ],
+      "payload": {
+        "activation": {
+          "shape": [
+            32,
+            3584
+          ],
+          "stride": [
+            3584,
+            1
+          ],
+          "dtype": "torch.float4_e2m1fn_x2",
+          "sha256": "ef826af5d569ce903ff1a7d2dd92e66e00319378469a8a244df497abc1e3646e"
+        },
+        "activation_sf": {
+          "shape": [
+            32,
+            448
+          ],
+          "stride": [
+            448,
+            1
+          ],
+          "dtype": "torch.float8_e4m3fn",
+          "sha256": "2f85a191d2acd22c30ebaf91f3624ae1312eb1a62592b973c7127a1d775776ec"
+        },
+        "topk_idx": {
+          "shape": [
+            32,
+            4
+          ],
+          "stride": [
+            4,
+            1
+          ],
+          "dtype": "torch.int64",
+          "sha256": "dcc5c4aad9c2c1f37e5cffa9a8ddeaf1b5ddbdea0234f5b8bc4f86e059888169"
+        },
+        "topk_weights": {
+          "shape": [
+            32,
+            4
+          ],
+          "stride": [
+            4,
+            1
+          ],
+          "dtype": "torch.float32",
+          "sha256": "7da13b1966f03a5849ba1f5b9a48d9254b28de12461c05f0cc6837a5e12e414e"
+        },
+        "fc1_weight": {
+          "shape": [
+            12,
+            3584,
+            3072
+          ],
+          "stride": [
+            11010048,
+            1,
+            3584
+          ],
+          "dtype": "torch.float4_e2m1fn_x2",
+          "sha256": "3287f5f69a3b3031d941886520cd55a0f21c1c3317e9015f410f9bcb21131df7"
+        },
+        "fc1_weight_sf": {
+          "shape": [
+            12,
+            1376256
+          ],
+          "stride": [
+            1376256,
+            1
+          ],
+          "dtype": "torch.float8_e4m3fn",
+          "sha256": "9eea5ffe03f5b51678d984c879c415e342fc6f6863fb67c70db02fb981682714"
+        },
+        "fc2_weight": {
+          "shape": [
+            12,
+            768,
+            7168
+          ],
+          "stride": [
+            5505024,
+            1,
+            768
+          ],
+          "dtype": "torch.float4_e2m1fn_x2",
+          "sha256": "70d07c1e52c15cf57a6de960942a8588f30a3f1e4d987e8189487bfce79a3f3e"
+        },
+        "fc2_weight_sf": {
+          "shape": [
+            12,
+            688128
+          ],
+          "stride": [
+            688128,
+            1
+          ],
+          "dtype": "torch.float8_e4m3fn",
+          "sha256": "901c5dbcf71ce8ee748306e269a4f1721fbbfdb8684002ff27a102dde46c9763"
+        },
+        "fc1_alpha": {
+          "shape": [
+            12
+          ],
+          "stride": [
+            1
+          ],
+          "dtype": "torch.float32",
+          "sha256": "6ea78411bee8a810b9a18819c5a4ac7c827e71678cc4d1db9a0ab8c8d8a9b2e2"
+        },
+        "fc2_alpha": {
+          "shape": [
+            12
+          ],
+          "stride": [
+            1
+          ],
+          "dtype": "torch.float32",
+          "sha256": "6ea78411bee8a810b9a18819c5a4ac7c827e71678cc4d1db9a0ab8c8d8a9b2e2"
+        },
+        "fc1_norm_const": {
+          "shape": [
+            12
+          ],
+          "stride": [
+            1
+          ],
+          "dtype": "torch.float32",
+          "sha256": "6ea78411bee8a810b9a18819c5a4ac7c827e71678cc4d1db9a0ab8c8d8a9b2e2"
+        }
+      },
+      "protocol": "resident serialized source turns; standard5 and conditioned200 kept separate; profiles after all primary samples",
+      "backend_config": "cpu:gloo,cuda:nccl",
+      "profiles": {
+        "warm": {
+          "trace": "/lustre/fsw/coreai_devtech_all/qiangf/ncclGIN/port/migration-evidence/blackwell-fix-20261102/final-confirmation/job-3578176/donor/rank-0-trace-warm.json",
+          "events": [
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_pre_unificationmoe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812_0",
+              "duration_us": 217.347,
+              "start_us": 2836719352601.323
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_pre_unificationmoe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168_1",
+              "duration_us": 3.456,
+              "start_us": 2836719352819.182
+            },
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_pre_unificationmoe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812_0",
+              "duration_us": 206.147,
+              "start_us": 2836719353334.516
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_pre_unificationmoe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168_1",
+              "duration_us": 3.52,
+              "start_us": 2836719353541.175
+            },
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_pre_unificationmoe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812_0",
+              "duration_us": 203.587,
+              "start_us": 2836719353944.221
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_pre_unificationmoe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168_1",
+              "duration_us": 3.456,
+              "start_us": 2836719354148.352
+            },
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_pre_unificationmoe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812_0",
+              "duration_us": 202.307,
+              "start_us": 2836719354517.349
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_pre_unificationmoe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168_1",
+              "duration_us": 3.456,
+              "start_us": 2836719354720.2
+            },
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_pre_unificationmoe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812_0",
+              "duration_us": 206.978,
+              "start_us": 2836719355091.917
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_pre_unificationmoe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168_1",
+              "duration_us": 3.328,
+              "start_us": 2836719355299.407
+            }
+          ],
+          "calls": 5
+        },
+        "cold": {
+          "trace": "/lustre/fsw/coreai_devtech_all/qiangf/ncclGIN/port/migration-evidence/blackwell-fix-20261102/final-confirmation/job-3578176/donor/rank-0-trace-cold.json",
+          "events": [
+            {
+              "name": "void at::native::vectorized_elementwise_kernel<8, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul> >(int, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul>)",
+              "duration_us": 133.121,
+              "start_us": 2836719360099.715
+            },
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_pre_unificationmoe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812_0",
+              "duration_us": 217.762,
+              "start_us": 2836719360601.031
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_pre_unificationmoe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168_1",
+              "duration_us": 3.488,
+              "start_us": 2836719360819.305
+            },
+            {
+              "name": "void at::native::vectorized_elementwise_kernel<8, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul> >(int, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul>)",
+              "duration_us": 132.961,
+              "start_us": 2836719360877.577
+            },
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_pre_unificationmoe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812_0",
+              "duration_us": 216.162,
+              "start_us": 2836719361381.133
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_pre_unificationmoe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168_1",
+              "duration_us": 3.456,
+              "start_us": 2836719361597.967
+            },
+            {
+              "name": "void at::native::vectorized_elementwise_kernel<8, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul> >(int, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul>)",
+              "duration_us": 132.897,
+              "start_us": 2836719361641.423
+            },
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_pre_unificationmoe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812_0",
+              "duration_us": 239.33,
+              "start_us": 2836719362116.019
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_pre_unificationmoe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168_1",
+              "duration_us": 3.36,
+              "start_us": 2836719362355.893
+            },
+            {
+              "name": "void at::native::vectorized_elementwise_kernel<8, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul> >(int, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul>)",
+              "duration_us": 132.929,
+              "start_us": 2836719362392.565
+            },
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_pre_unificationmoe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812_0",
+              "duration_us": 215.778,
+              "start_us": 2836719362857.369
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_pre_unificationmoe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168_1",
+              "duration_us": 3.488,
+              "start_us": 2836719363073.659
+            },
+            {
+              "name": "void at::native::vectorized_elementwise_kernel<8, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul> >(int, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul>)",
+              "duration_us": 132.929,
+              "start_us": 2836719363115.387
+            },
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_pre_unificationmoe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812_0",
+              "duration_us": 259.649,
+              "start_us": 2836719363581.599
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_pre_unificationmoe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168_1",
+              "duration_us": 3.328,
+              "start_us": 2836719363841.76
+            }
+          ],
+          "calls": 5
+        }
+      },
+      "validation": "bitwise PASS",
+      "clocks_after": [
+        "0, NVIDIA GB300, GPU-30ceddb5-fa41-0714-1fc2-f1870ea6004f, 580.173.10, 2070 MHz, 3996 MHz, 31, 237.91 W",
+        "1, NVIDIA GB300, GPU-54c90568-7ecf-acbd-7043-50bb74201743, 580.173.10, 2070 MHz, 3996 MHz, 31, 238.30 W",
+        "2, NVIDIA GB300, GPU-be32855b-c3b1-4cb8-9013-7f2faa263f3b, 580.173.10, 120 MHz, 3996 MHz, 29, 179.48 W",
+        "3, NVIDIA GB300, GPU-7677caca-4322-8393-dcfa-441e208a4d9d, 580.173.10, 120 MHz, 3996 MHz, 28, 180.67 W"
+      ],
+      "complete": true
+    },
+    {
+      "impl": "port",
+      "rank": 3,
+      "job": "3578176",
+      "node": "theia0115.lyris.clusters.nvidia.com",
+      "gpu": "_CudaDeviceProperties(name='NVIDIA GB300', major=10, minor=3, total_memory=283261MB, multi_processor_count=152, uuid=8d69e2a9-51e8-e614-f75f-17d70d375cea, pci_bus_id=6, pci_device_id=0, pci_domain_id=9, L2_cache_size=129MB)",
+      "settings": {
+        "backend": "flashinfer.moe_ep.backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl.backend.Nvfp4CutedslMegaKernelBackend",
+        "config": "MegaMoENvfp4Config(rank=3, world_size=4, num_tokens_per_rank=32, num_topk=4, num_total_experts=48, hidden=7168, intermediate=3072, internode=True, ranks_per_node=2, mma_tiler_mnk=(128, 128, 256), cluster_shape_mnk=(1, 1, 1), use_2cta_instrs=False, load_balance_mode='static', group_hint=536870912, force_static_sched=True, clc_bundle_size=None, num_sched_stages=None, flag_batch=4, epi_flag_batch=(1, 4), non_ubulk_fc2_store=True, enable_in_kernel_fc2_reduce=False, in_kernel_fc2_reduce=False, use_custom_finalize=False, use_persistent_finalize_kernel=False, token_back_mode='reuse_dispatch_warps', combine_dtype='bf16', apply_routing_weights_before_fc2=True, activation='swiglu', situ_beta=None, situ_linear_beta=None, gate_up_clamp=None, enable_iket=False, swiglu_alpha=None, swiglu_beta=None, enable_fc1_activation_per_token_scale=False)",
+        "kernel": "megamoe_nvfp4_mmatiler_128x128x256_cluster_1x1_1_cta_sched_static_expert_shape_12x3072x7168_grouphint_536870912_padding_64x128_fc2store_stg_no_inkernel_redg_do_topk_reduce_static_topk_reduce_token_back_by_reuse_dispatch_apply_topk_fc1_pre_quant_internode_relay_meta1_rpn2_fc2outBFloat16_combinebf16_sfvec16_accFloat32_swigluaNone_swiglubNone_clampNone_epiflag1x4_situNone_linearNone_ep_4_topk_4_maxtoken_32_flagbatch_4",
+        "source": "/lustre/fsw/coreai_devtech_all/qiangf/ncclGIN/port/flashinfer-nvfp4-gin/flashinfer/__init__.py"
+      },
+      "compiler": [
+        {
+          "target_module": "moe_nvfp4_swapab.megamoe_kernel",
+          "max_active_clusters": 152,
+          ".ptx": {
+            "path": "/lustre/fsw/coreai_devtech_all/qiangf/ncclGIN/port/migration-evidence/blackwell-fix-20261102/final-confirmation/job-3578176/port/rank-3.ptx",
+            "sha256": "0b9546f9abb03ed4c1c8c723c18b265fac9606fdd982438e5882e9678086f7b4"
+          },
+          ".cubin": {
+            "path": "/lustre/fsw/coreai_devtech_all/qiangf/ncclGIN/port/migration-evidence/blackwell-fix-20261102/final-confirmation/job-3578176/port/rank-3.cubin",
+            "sha256": "9015977af3b6e57d9eb5ba3b160fd16724608084155ac1bf1e371f0ceb4861bb"
+          }
+        }
+      ],
+      "source_commit": "74c0362878cb6dd5d0c90c346c7b420848563f1d",
+      "script_sha256": "6b28aae878ec77cae4d9fcc385071010c8459a1e0aceb3f0bfc24288ee725df2",
+      "benchmark_sha256": "5fa2448a6946c4e879b4225ffd932a85c0d344f49d14596efc0b9412a6c36700",
+      "clocks_before": [
+        "0, NVIDIA GB300, GPU-0bbe1375-c1e8-bb2e-fb70-917548f589f3, 580.173.10, 2070 MHz, 3996 MHz, 30, 234.85 W",
+        "1, NVIDIA GB300, GPU-8d69e2a9-51e8-e614-f75f-17d70d375cea, 580.173.10, 2070 MHz, 3996 MHz, 29, 234.56 W",
+        "2, NVIDIA GB300, GPU-8ae9139f-984e-1682-253f-331bd3761033, 580.173.10, 120 MHz, 3996 MHz, 29, 183.85 W",
+        "3, NVIDIA GB300, GPU-c7255cdb-1190-5914-b95a-4e2f0d020d2a, 580.173.10, 120 MHz, 3996 MHz, 30, 183.97 W"
+      ],
+      "payload": {
+        "activation": {
+          "shape": [
+            32,
+            3584
+          ],
+          "stride": [
+            3584,
+            1
+          ],
+          "dtype": "torch.float4_e2m1fn_x2",
+          "sha256": "463198c4ea85416ba585ce51490e2383240d135fb4730588f2f911c97670641e"
+        },
+        "activation_sf": {
+          "shape": [
+            32,
+            448
+          ],
+          "stride": [
+            448,
+            1
+          ],
+          "dtype": "torch.float8_e4m3fn",
+          "sha256": "0967c679577679cf9c7714bdffe969339676efd064744bc251fd2f52e1261154"
+        },
+        "topk_idx": {
+          "shape": [
+            32,
+            4
+          ],
+          "stride": [
+            4,
+            1
+          ],
+          "dtype": "torch.int64",
+          "sha256": "8e30ae407dce967dc7f94942d22d89e504bde31226b01d92ebec4cc2a628f057"
+        },
+        "topk_weights": {
+          "shape": [
+            32,
+            4
+          ],
+          "stride": [
+            4,
+            1
+          ],
+          "dtype": "torch.float32",
+          "sha256": "670bdbdab5158bb36ddb89affababa87666f56e79c85763abc3ceb744b13f700"
+        },
+        "fc1_weight": {
+          "shape": [
+            12,
+            3584,
+            3072
+          ],
+          "stride": [
+            11010048,
+            1,
+            3584
+          ],
+          "dtype": "torch.float4_e2m1fn_x2",
+          "sha256": "dabb410e02c1234157e1f2f3ee79f3da2d2ba9c15e6d083e95b6a7471ccc6d7d"
+        },
+        "fc1_weight_sf": {
+          "shape": [
+            12,
+            1376256
+          ],
+          "stride": [
+            1376256,
+            1
+          ],
+          "dtype": "torch.float8_e4m3fn",
+          "sha256": "39ba063c303f2d910d2c14fa49e5ea3cbb3f1975ac2bd6562ba56ddfc27b4ace"
+        },
+        "fc2_weight": {
+          "shape": [
+            12,
+            768,
+            7168
+          ],
+          "stride": [
+            5505024,
+            1,
+            768
+          ],
+          "dtype": "torch.float4_e2m1fn_x2",
+          "sha256": "916b3e9f39510c9e0e7de69745562865058e8bc8e6b996b249f2a2014e2618a6"
+        },
+        "fc2_weight_sf": {
+          "shape": [
+            12,
+            688128
+          ],
+          "stride": [
+            688128,
+            1
+          ],
+          "dtype": "torch.float8_e4m3fn",
+          "sha256": "427bb843e74ad959b9c2d8b4fdceb66ab3fafca98e7294b2dee3dd561332f62e"
+        },
+        "fc1_alpha": {
+          "shape": [
+            12
+          ],
+          "stride": [
+            1
+          ],
+          "dtype": "torch.float32",
+          "sha256": "6ea78411bee8a810b9a18819c5a4ac7c827e71678cc4d1db9a0ab8c8d8a9b2e2"
+        },
+        "fc2_alpha": {
+          "shape": [
+            12
+          ],
+          "stride": [
+            1
+          ],
+          "dtype": "torch.float32",
+          "sha256": "6ea78411bee8a810b9a18819c5a4ac7c827e71678cc4d1db9a0ab8c8d8a9b2e2"
+        },
+        "fc1_norm_const": {
+          "shape": [
+            12
+          ],
+          "stride": [
+            1
+          ],
+          "dtype": "torch.float32",
+          "sha256": "6ea78411bee8a810b9a18819c5a4ac7c827e71678cc4d1db9a0ab8c8d8a9b2e2"
+        }
+      },
+      "protocol": "resident serialized source turns; standard5 and conditioned200 kept separate; profiles after all primary samples",
+      "backend_config": "cpu:gloo,cuda:nccl",
+      "source_hashes": {},
+      "profiles": {
+        "warm": {
+          "trace": "/lustre/fsw/coreai_devtech_all/qiangf/ncclGIN/port/migration-evidence/blackwell-fix-20261102/final-confirmation/job-3578176/port/rank-3-trace-warm.json",
+          "events": [
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_moe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812864_TVLayoutA11_0",
+              "duration_us": 392.385,
+              "start_us": 2836720798595.013
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_moe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168229376229376716_1",
+              "duration_us": 3.328,
+              "start_us": 2836720798987.91
+            },
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_moe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812864_TVLayoutA11_0",
+              "duration_us": 289.633,
+              "start_us": 2836720799428.232
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_moe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168229376229376716_1",
+              "duration_us": 3.328,
+              "start_us": 2836720799718.345
+            },
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_moe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812864_TVLayoutA11_0",
+              "duration_us": 331.458,
+              "start_us": 2836720800046.826
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_moe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168229376229376716_1",
+              "duration_us": 3.232,
+              "start_us": 2836720800378.764
+            },
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_moe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812864_TVLayoutA11_0",
+              "duration_us": 315.649,
+              "start_us": 2836720800673.997
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_moe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168229376229376716_1",
+              "duration_us": 3.52,
+              "start_us": 2836720800990.126
+            },
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_moe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812864_TVLayoutA11_0",
+              "duration_us": 293.121,
+              "start_us": 2836720801300.303
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_moe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168229376229376716_1",
+              "duration_us": 3.296,
+              "start_us": 2836720801593.904
+            }
+          ],
+          "calls": 5
+        },
+        "cold": {
+          "trace": "/lustre/fsw/coreai_devtech_all/qiangf/ncclGIN/port/migration-evidence/blackwell-fix-20261102/final-confirmation/job-3578176/port/rank-3-trace-cold.json",
+          "events": [
+            {
+              "name": "void at::native::vectorized_elementwise_kernel<8, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul> >(int, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul>)",
+              "duration_us": 133.409,
+              "start_us": 2836720805649.825
+            },
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_moe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812864_TVLayoutA11_0",
+              "duration_us": 331.585,
+              "start_us": 2836720806962.278
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_moe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168229376229376716_1",
+              "duration_us": 3.392,
+              "start_us": 2836720807294.343
+            },
+            {
+              "name": "void at::native::vectorized_elementwise_kernel<8, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul> >(int, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul>)",
+              "duration_us": 133.121,
+              "start_us": 2836720807341.575
+            },
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_moe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812864_TVLayoutA11_0",
+              "duration_us": 333.953,
+              "start_us": 2836720807817.033
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_moe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168229376229376716_1",
+              "duration_us": 3.2,
+              "start_us": 2836720808151.498
+            },
+            {
+              "name": "void at::native::vectorized_elementwise_kernel<8, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul> >(int, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul>)",
+              "duration_us": 133.184,
+              "start_us": 2836720808199.883
+            },
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_moe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812864_TVLayoutA11_0",
+              "duration_us": 288.673,
+              "start_us": 2836720808637.996
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_moe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168229376229376716_1",
+              "duration_us": 3.392,
+              "start_us": 2836720808927.149
+            },
+            {
+              "name": "void at::native::vectorized_elementwise_kernel<8, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul> >(int, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul>)",
+              "duration_us": 133.28,
+              "start_us": 2836720808974.766
+            },
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_moe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812864_TVLayoutA11_0",
+              "duration_us": 291.073,
+              "start_us": 2836720809414.639
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_moe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168229376229376716_1",
+              "duration_us": 3.36,
+              "start_us": 2836720809706.224
+            },
+            {
+              "name": "void at::native::vectorized_elementwise_kernel<8, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul> >(int, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul>)",
+              "duration_us": 133.088,
+              "start_us": 2836720809745.745
+            },
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_moe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812864_TVLayoutA11_0",
+              "duration_us": 315.713,
+              "start_us": 2836720810174.45
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_moe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168229376229376716_1",
+              "duration_us": 3.392,
+              "start_us": 2836720810490.643
+            }
+          ],
+          "calls": 5
+        }
+      },
+      "one_call_preflight_counts": {
+        "backend-forward": 1,
+        "launch": 1
+      },
+      "validation": "bitwise PASS",
+      "clocks_after": [
+        "0, NVIDIA GB300, GPU-0bbe1375-c1e8-bb2e-fb70-917548f589f3, 580.173.10, 2070 MHz, 3996 MHz, 30, 234.84 W",
+        "1, NVIDIA GB300, GPU-8d69e2a9-51e8-e614-f75f-17d70d375cea, 580.173.10, 2070 MHz, 3996 MHz, 29, 234.55 W",
+        "2, NVIDIA GB300, GPU-8ae9139f-984e-1682-253f-331bd3761033, 580.173.10, 120 MHz, 3996 MHz, 29, 183.85 W",
+        "3, NVIDIA GB300, GPU-c7255cdb-1190-5914-b95a-4e2f0d020d2a, 580.173.10, 120 MHz, 3996 MHz, 30, 183.97 W"
+      ],
+      "complete": true
+    },
+    {
+      "impl": "port",
+      "rank": 2,
+      "job": "3578176",
+      "node": "theia0115.lyris.clusters.nvidia.com",
+      "gpu": "_CudaDeviceProperties(name='NVIDIA GB300', major=10, minor=3, total_memory=283261MB, multi_processor_count=152, uuid=0bbe1375-c1e8-bb2e-fb70-917548f589f3, pci_bus_id=6, pci_device_id=0, pci_domain_id=8, L2_cache_size=129MB)",
+      "settings": {
+        "backend": "flashinfer.moe_ep.backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl.backend.Nvfp4CutedslMegaKernelBackend",
+        "config": "MegaMoENvfp4Config(rank=2, world_size=4, num_tokens_per_rank=32, num_topk=4, num_total_experts=48, hidden=7168, intermediate=3072, internode=True, ranks_per_node=2, mma_tiler_mnk=(128, 128, 256), cluster_shape_mnk=(1, 1, 1), use_2cta_instrs=False, load_balance_mode='static', group_hint=536870912, force_static_sched=True, clc_bundle_size=None, num_sched_stages=None, flag_batch=4, epi_flag_batch=(1, 4), non_ubulk_fc2_store=True, enable_in_kernel_fc2_reduce=False, in_kernel_fc2_reduce=False, use_custom_finalize=False, use_persistent_finalize_kernel=False, token_back_mode='reuse_dispatch_warps', combine_dtype='bf16', apply_routing_weights_before_fc2=True, activation='swiglu', situ_beta=None, situ_linear_beta=None, gate_up_clamp=None, enable_iket=False, swiglu_alpha=None, swiglu_beta=None, enable_fc1_activation_per_token_scale=False)",
+        "kernel": "megamoe_nvfp4_mmatiler_128x128x256_cluster_1x1_1_cta_sched_static_expert_shape_12x3072x7168_grouphint_536870912_padding_64x128_fc2store_stg_no_inkernel_redg_do_topk_reduce_static_topk_reduce_token_back_by_reuse_dispatch_apply_topk_fc1_pre_quant_internode_relay_meta1_rpn2_fc2outBFloat16_combinebf16_sfvec16_accFloat32_swigluaNone_swiglubNone_clampNone_epiflag1x4_situNone_linearNone_ep_4_topk_4_maxtoken_32_flagbatch_4",
+        "source": "/lustre/fsw/coreai_devtech_all/qiangf/ncclGIN/port/flashinfer-nvfp4-gin/flashinfer/__init__.py"
+      },
+      "compiler": [
+        {
+          "target_module": "moe_nvfp4_swapab.megamoe_kernel",
+          "max_active_clusters": 152,
+          ".ptx": {
+            "path": "/lustre/fsw/coreai_devtech_all/qiangf/ncclGIN/port/migration-evidence/blackwell-fix-20261102/final-confirmation/job-3578176/port/rank-2.ptx",
+            "sha256": "0b9546f9abb03ed4c1c8c723c18b265fac9606fdd982438e5882e9678086f7b4"
+          },
+          ".cubin": {
+            "path": "/lustre/fsw/coreai_devtech_all/qiangf/ncclGIN/port/migration-evidence/blackwell-fix-20261102/final-confirmation/job-3578176/port/rank-2.cubin",
+            "sha256": "9015977af3b6e57d9eb5ba3b160fd16724608084155ac1bf1e371f0ceb4861bb"
+          }
+        }
+      ],
+      "source_commit": "74c0362878cb6dd5d0c90c346c7b420848563f1d",
+      "script_sha256": "6b28aae878ec77cae4d9fcc385071010c8459a1e0aceb3f0bfc24288ee725df2",
+      "benchmark_sha256": "5fa2448a6946c4e879b4225ffd932a85c0d344f49d14596efc0b9412a6c36700",
+      "clocks_before": [
+        "0, NVIDIA GB300, GPU-0bbe1375-c1e8-bb2e-fb70-917548f589f3, 580.173.10, 2070 MHz, 3996 MHz, 30, 234.85 W",
+        "1, NVIDIA GB300, GPU-8d69e2a9-51e8-e614-f75f-17d70d375cea, 580.173.10, 2070 MHz, 3996 MHz, 29, 234.56 W",
+        "2, NVIDIA GB300, GPU-8ae9139f-984e-1682-253f-331bd3761033, 580.173.10, 120 MHz, 3996 MHz, 29, 183.85 W",
+        "3, NVIDIA GB300, GPU-c7255cdb-1190-5914-b95a-4e2f0d020d2a, 580.173.10, 120 MHz, 3996 MHz, 30, 183.97 W"
+      ],
+      "payload": {
+        "activation": {
+          "shape": [
+            32,
+            3584
+          ],
+          "stride": [
+            3584,
+            1
+          ],
+          "dtype": "torch.float4_e2m1fn_x2",
+          "sha256": "338959bad1655f30ff5c45f2565ce646c93e7fc0f865fa1ab6602d3ad0522a5f"
+        },
+        "activation_sf": {
+          "shape": [
+            32,
+            448
+          ],
+          "stride": [
+            448,
+            1
+          ],
+          "dtype": "torch.float8_e4m3fn",
+          "sha256": "b7e746e858d55861372972bfcdcc08639a8808a0acd68071df884496cf2bdf1c"
+        },
+        "topk_idx": {
+          "shape": [
+            32,
+            4
+          ],
+          "stride": [
+            4,
+            1
+          ],
+          "dtype": "torch.int64",
+          "sha256": "dae056968d83a1a737d0d8d3d68edbe2f160af9eb667ebea4bbd4f6efb2879a1"
+        },
+        "topk_weights": {
+          "shape": [
+            32,
+            4
+          ],
+          "stride": [
+            4,
+            1
+          ],
+          "dtype": "torch.float32",
+          "sha256": "6c6686895623eb77e14f342a4da881f81fbe0b400b43935c982fcc95c35e25f2"
+        },
+        "fc1_weight": {
+          "shape": [
+            12,
+            3584,
+            3072
+          ],
+          "stride": [
+            11010048,
+            1,
+            3584
+          ],
+          "dtype": "torch.float4_e2m1fn_x2",
+          "sha256": "ee1adb9ae977a1324ec5045549178d928292b063aa0593d9f8f228209be8e3df"
+        },
+        "fc1_weight_sf": {
+          "shape": [
+            12,
+            1376256
+          ],
+          "stride": [
+            1376256,
+            1
+          ],
+          "dtype": "torch.float8_e4m3fn",
+          "sha256": "fa28fddc2857a6395f83de111a6cd419634a675ae69236112f654b4a03234ccd"
+        },
+        "fc2_weight": {
+          "shape": [
+            12,
+            768,
+            7168
+          ],
+          "stride": [
+            5505024,
+            1,
+            768
+          ],
+          "dtype": "torch.float4_e2m1fn_x2",
+          "sha256": "305d62632fec93a1864158c00fa5112e2be049cd2f588421330ffa3636bb7fcd"
+        },
+        "fc2_weight_sf": {
+          "shape": [
+            12,
+            688128
+          ],
+          "stride": [
+            688128,
+            1
+          ],
+          "dtype": "torch.float8_e4m3fn",
+          "sha256": "e55231c193a053677be9119a759d2314fe58c2981a2bc872ce197bae77a6eb89"
+        },
+        "fc1_alpha": {
+          "shape": [
+            12
+          ],
+          "stride": [
+            1
+          ],
+          "dtype": "torch.float32",
+          "sha256": "6ea78411bee8a810b9a18819c5a4ac7c827e71678cc4d1db9a0ab8c8d8a9b2e2"
+        },
+        "fc2_alpha": {
+          "shape": [
+            12
+          ],
+          "stride": [
+            1
+          ],
+          "dtype": "torch.float32",
+          "sha256": "6ea78411bee8a810b9a18819c5a4ac7c827e71678cc4d1db9a0ab8c8d8a9b2e2"
+        },
+        "fc1_norm_const": {
+          "shape": [
+            12
+          ],
+          "stride": [
+            1
+          ],
+          "dtype": "torch.float32",
+          "sha256": "6ea78411bee8a810b9a18819c5a4ac7c827e71678cc4d1db9a0ab8c8d8a9b2e2"
+        }
+      },
+      "protocol": "resident serialized source turns; standard5 and conditioned200 kept separate; profiles after all primary samples",
+      "backend_config": "cpu:gloo,cuda:nccl",
+      "source_hashes": {},
+      "profiles": {
+        "warm": {
+          "trace": "/lustre/fsw/coreai_devtech_all/qiangf/ncclGIN/port/migration-evidence/blackwell-fix-20261102/final-confirmation/job-3578176/port/rank-2-trace-warm.json",
+          "events": [
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_moe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812864_TVLayoutA11_0",
+              "duration_us": 332.417,
+              "start_us": 2836720798654.967
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_moe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168229376229376716_1",
+              "duration_us": 3.52,
+              "start_us": 2836720798988.024
+            },
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_moe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812864_TVLayoutA11_0",
+              "duration_us": 208.161,
+              "start_us": 2836720799510.682
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_moe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168229376229376716_1",
+              "duration_us": 3.648,
+              "start_us": 2836720799719.323
+            },
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_moe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812864_TVLayoutA11_0",
+              "duration_us": 204.993,
+              "start_us": 2836720800173.054
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_moe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168229376229376716_1",
+              "duration_us": 3.616,
+              "start_us": 2836720800378.559
+            },
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_moe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812864_TVLayoutA11_0",
+              "duration_us": 212.129,
+              "start_us": 2836720800778.336
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_moe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168229376229376716_1",
+              "duration_us": 3.424,
+              "start_us": 2836720800990.945
+            },
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_moe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812864_TVLayoutA11_0",
+              "duration_us": 218.465,
+              "start_us": 2836720801374.466
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_moe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168229376229376716_1",
+              "duration_us": 3.584,
+              "start_us": 2836720801593.411
+            }
+          ],
+          "calls": 5
+        },
+        "cold": {
+          "trace": "/lustre/fsw/coreai_devtech_all/qiangf/ncclGIN/port/migration-evidence/blackwell-fix-20261102/final-confirmation/job-3578176/port/rank-2-trace-cold.json",
+          "events": [
+            {
+              "name": "void at::native::vectorized_elementwise_kernel<8, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul> >(int, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul>)",
+              "duration_us": 132.896,
+              "start_us": 2836720805852.065
+            },
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_moe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812864_TVLayoutA11_0",
+              "duration_us": 234.465,
+              "start_us": 2836720807059.301
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_moe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168229376229376716_1",
+              "duration_us": 3.424,
+              "start_us": 2836720807294.246
+            },
+            {
+              "name": "void at::native::vectorized_elementwise_kernel<8, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul> >(int, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul>)",
+              "duration_us": 132.449,
+              "start_us": 2836720807338.246
+            },
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_moe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812864_TVLayoutA11_0",
+              "duration_us": 269.441,
+              "start_us": 2836720807881.736
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_moe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168229376229376716_1",
+              "duration_us": 3.552,
+              "start_us": 2836720808151.657
+            },
+            {
+              "name": "void at::native::vectorized_elementwise_kernel<8, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul> >(int, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul>)",
+              "duration_us": 132.544,
+              "start_us": 2836720808192.778
+            },
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_moe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812864_TVLayoutA11_0",
+              "duration_us": 250.465,
+              "start_us": 2836720808676.043
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_moe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168229376229376716_1",
+              "duration_us": 3.52,
+              "start_us": 2836720808927.148
+            },
+            {
+              "name": "void at::native::vectorized_elementwise_kernel<8, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul> >(int, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul>)",
+              "duration_us": 132.544,
+              "start_us": 2836720808980.909
+            },
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_moe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812864_TVLayoutA11_0",
+              "duration_us": 231.489,
+              "start_us": 2836720809474.03
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_moe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168229376229376716_1",
+              "duration_us": 3.552,
+              "start_us": 2836720809706.159
+            },
+            {
+              "name": "void at::native::vectorized_elementwise_kernel<8, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul> >(int, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul>)",
+              "duration_us": 132.48,
+              "start_us": 2836720809751.024
+            },
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_moe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812864_TVLayoutA11_0",
+              "duration_us": 249.729,
+              "start_us": 2836720810240.561
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_moe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168229376229376716_1",
+              "duration_us": 3.488,
+              "start_us": 2836720810490.802
+            }
+          ],
+          "calls": 5
+        }
+      },
+      "one_call_preflight_counts": {
+        "backend-forward": 1,
+        "launch": 1
+      },
+      "validation": "bitwise PASS",
+      "clocks_after": [
+        "0, NVIDIA GB300, GPU-0bbe1375-c1e8-bb2e-fb70-917548f589f3, 580.173.10, 2070 MHz, 3996 MHz, 30, 234.84 W",
+        "1, NVIDIA GB300, GPU-8d69e2a9-51e8-e614-f75f-17d70d375cea, 580.173.10, 2070 MHz, 3996 MHz, 29, 234.55 W",
+        "2, NVIDIA GB300, GPU-8ae9139f-984e-1682-253f-331bd3761033, 580.173.10, 120 MHz, 3996 MHz, 29, 183.85 W",
+        "3, NVIDIA GB300, GPU-c7255cdb-1190-5914-b95a-4e2f0d020d2a, 580.173.10, 120 MHz, 3996 MHz, 30, 183.97 W"
+      ],
+      "complete": true
+    },
+    {
+      "impl": "port",
+      "rank": 1,
+      "job": "3578176",
+      "node": "theia0048.lyris.clusters.nvidia.com",
+      "gpu": "_CudaDeviceProperties(name='NVIDIA GB300', major=10, minor=3, total_memory=283261MB, multi_processor_count=152, uuid=54c90568-7ecf-acbd-7043-50bb74201743, pci_bus_id=6, pci_device_id=0, pci_domain_id=9, L2_cache_size=129MB)",
+      "settings": {
+        "backend": "flashinfer.moe_ep.backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl.backend.Nvfp4CutedslMegaKernelBackend",
+        "config": "MegaMoENvfp4Config(rank=1, world_size=4, num_tokens_per_rank=32, num_topk=4, num_total_experts=48, hidden=7168, intermediate=3072, internode=True, ranks_per_node=2, mma_tiler_mnk=(128, 128, 256), cluster_shape_mnk=(1, 1, 1), use_2cta_instrs=False, load_balance_mode='static', group_hint=536870912, force_static_sched=True, clc_bundle_size=None, num_sched_stages=None, flag_batch=4, epi_flag_batch=(1, 4), non_ubulk_fc2_store=True, enable_in_kernel_fc2_reduce=False, in_kernel_fc2_reduce=False, use_custom_finalize=False, use_persistent_finalize_kernel=False, token_back_mode='reuse_dispatch_warps', combine_dtype='bf16', apply_routing_weights_before_fc2=True, activation='swiglu', situ_beta=None, situ_linear_beta=None, gate_up_clamp=None, enable_iket=False, swiglu_alpha=None, swiglu_beta=None, enable_fc1_activation_per_token_scale=False)",
+        "kernel": "megamoe_nvfp4_mmatiler_128x128x256_cluster_1x1_1_cta_sched_static_expert_shape_12x3072x7168_grouphint_536870912_padding_64x128_fc2store_stg_no_inkernel_redg_do_topk_reduce_static_topk_reduce_token_back_by_reuse_dispatch_apply_topk_fc1_pre_quant_internode_relay_meta1_rpn2_fc2outBFloat16_combinebf16_sfvec16_accFloat32_swigluaNone_swiglubNone_clampNone_epiflag1x4_situNone_linearNone_ep_4_topk_4_maxtoken_32_flagbatch_4",
+        "source": "/lustre/fsw/coreai_devtech_all/qiangf/ncclGIN/port/flashinfer-nvfp4-gin/flashinfer/__init__.py"
+      },
+      "compiler": [
+        {
+          "target_module": "moe_nvfp4_swapab.megamoe_kernel",
+          "max_active_clusters": 152,
+          ".ptx": {
+            "path": "/lustre/fsw/coreai_devtech_all/qiangf/ncclGIN/port/migration-evidence/blackwell-fix-20261102/final-confirmation/job-3578176/port/rank-1.ptx",
+            "sha256": "0b9546f9abb03ed4c1c8c723c18b265fac9606fdd982438e5882e9678086f7b4"
+          },
+          ".cubin": {
+            "path": "/lustre/fsw/coreai_devtech_all/qiangf/ncclGIN/port/migration-evidence/blackwell-fix-20261102/final-confirmation/job-3578176/port/rank-1.cubin",
+            "sha256": "9015977af3b6e57d9eb5ba3b160fd16724608084155ac1bf1e371f0ceb4861bb"
+          }
+        }
+      ],
+      "source_commit": "74c0362878cb6dd5d0c90c346c7b420848563f1d",
+      "script_sha256": "6b28aae878ec77cae4d9fcc385071010c8459a1e0aceb3f0bfc24288ee725df2",
+      "benchmark_sha256": "5fa2448a6946c4e879b4225ffd932a85c0d344f49d14596efc0b9412a6c36700",
+      "clocks_before": [
+        "0, NVIDIA GB300, GPU-30ceddb5-fa41-0714-1fc2-f1870ea6004f, 580.173.10, 2070 MHz, 3996 MHz, 31, 236.62 W",
+        "1, NVIDIA GB300, GPU-54c90568-7ecf-acbd-7043-50bb74201743, 580.173.10, 2070 MHz, 3996 MHz, 31, 238.22 W",
+        "2, NVIDIA GB300, GPU-be32855b-c3b1-4cb8-9013-7f2faa263f3b, 580.173.10, 120 MHz, 3996 MHz, 29, 179.54 W",
+        "3, NVIDIA GB300, GPU-7677caca-4322-8393-dcfa-441e208a4d9d, 580.173.10, 120 MHz, 3996 MHz, 28, 180.37 W"
+      ],
+      "payload": {
+        "activation": {
+          "shape": [
+            32,
+            3584
+          ],
+          "stride": [
+            3584,
+            1
+          ],
+          "dtype": "torch.float4_e2m1fn_x2",
+          "sha256": "0d20f43f9d9bc41242783be382b88b8ad2c966a69a410c94276838c2bed17791"
+        },
+        "activation_sf": {
+          "shape": [
+            32,
+            448
+          ],
+          "stride": [
+            448,
+            1
+          ],
+          "dtype": "torch.float8_e4m3fn",
+          "sha256": "8f9d2feec6bee1223083e48e838a1bc281317c95e3e6eb9a5f0f4590b98648f9"
+        },
+        "topk_idx": {
+          "shape": [
+            32,
+            4
+          ],
+          "stride": [
+            4,
+            1
+          ],
+          "dtype": "torch.int64",
+          "sha256": "cac79cd6d04b95cd80eab975d7ba16e9caf9b4a9a187dfe9fe4375f4f349bd81"
+        },
+        "topk_weights": {
+          "shape": [
+            32,
+            4
+          ],
+          "stride": [
+            4,
+            1
+          ],
+          "dtype": "torch.float32",
+          "sha256": "1ad9cb598bf325cd7d0bba4115bf987db7ef27e18840c40257697cf3954de262"
+        },
+        "fc1_weight": {
+          "shape": [
+            12,
+            3584,
+            3072
+          ],
+          "stride": [
+            11010048,
+            1,
+            3584
+          ],
+          "dtype": "torch.float4_e2m1fn_x2",
+          "sha256": "970a5ca71ba6913b24cbff5438c28457f3cf7e5cbb6917f007c86b43abe143d3"
+        },
+        "fc1_weight_sf": {
+          "shape": [
+            12,
+            1376256
+          ],
+          "stride": [
+            1376256,
+            1
+          ],
+          "dtype": "torch.float8_e4m3fn",
+          "sha256": "7052e487ebee0f4d0d3d4d01ad2ccef69fd12fe3e7fd83d031e3c9eaaaead48f"
+        },
+        "fc2_weight": {
+          "shape": [
+            12,
+            768,
+            7168
+          ],
+          "stride": [
+            5505024,
+            1,
+            768
+          ],
+          "dtype": "torch.float4_e2m1fn_x2",
+          "sha256": "c66d36d33b578c6687e1bdf6827d145fa8c2abc5ab256433e0af121fbb957b41"
+        },
+        "fc2_weight_sf": {
+          "shape": [
+            12,
+            688128
+          ],
+          "stride": [
+            688128,
+            1
+          ],
+          "dtype": "torch.float8_e4m3fn",
+          "sha256": "101df0c2bbd6921b9d088789e8f1ac9918accea10cdf740780c937ba0abf9497"
+        },
+        "fc1_alpha": {
+          "shape": [
+            12
+          ],
+          "stride": [
+            1
+          ],
+          "dtype": "torch.float32",
+          "sha256": "6ea78411bee8a810b9a18819c5a4ac7c827e71678cc4d1db9a0ab8c8d8a9b2e2"
+        },
+        "fc2_alpha": {
+          "shape": [
+            12
+          ],
+          "stride": [
+            1
+          ],
+          "dtype": "torch.float32",
+          "sha256": "6ea78411bee8a810b9a18819c5a4ac7c827e71678cc4d1db9a0ab8c8d8a9b2e2"
+        },
+        "fc1_norm_const": {
+          "shape": [
+            12
+          ],
+          "stride": [
+            1
+          ],
+          "dtype": "torch.float32",
+          "sha256": "6ea78411bee8a810b9a18819c5a4ac7c827e71678cc4d1db9a0ab8c8d8a9b2e2"
+        }
+      },
+      "protocol": "resident serialized source turns; standard5 and conditioned200 kept separate; profiles after all primary samples",
+      "backend_config": "cpu:gloo,cuda:nccl",
+      "source_hashes": {},
+      "profiles": {
+        "warm": {
+          "trace": "/lustre/fsw/coreai_devtech_all/qiangf/ncclGIN/port/migration-evidence/blackwell-fix-20261102/final-confirmation/job-3578176/port/rank-1-trace-warm.json",
+          "events": [
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_moe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812864_TVLayoutA11_0",
+              "duration_us": 220.801,
+              "start_us": 2836720798773.057
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_moe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168229376229376716_1",
+              "duration_us": 3.296,
+              "start_us": 2836720798994.53
+            },
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_moe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812864_TVLayoutA11_0",
+              "duration_us": 280.448,
+              "start_us": 2836720799449.09
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_moe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168229376229376716_1",
+              "duration_us": 3.2,
+              "start_us": 2836720799730.21
+            },
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_moe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812864_TVLayoutA11_0",
+              "duration_us": 309.985,
+              "start_us": 2836720800078.595
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_moe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168229376229376716_1",
+              "duration_us": 3.072,
+              "start_us": 2836720800389.22
+            },
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_moe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812864_TVLayoutA11_0",
+              "duration_us": 284.609,
+              "start_us": 2836720800717.348
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_moe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168229376229376716_1",
+              "duration_us": 3.456,
+              "start_us": 2836720801002.629
+            },
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_moe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812864_TVLayoutA11_0",
+              "duration_us": 268.608,
+              "start_us": 2836720801330.726
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_moe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168229376229376716_1",
+              "duration_us": 3.2,
+              "start_us": 2836720801600.006
+            }
+          ],
+          "calls": 5
+        },
+        "cold": {
+          "trace": "/lustre/fsw/coreai_devtech_all/qiangf/ncclGIN/port/migration-evidence/blackwell-fix-20261102/final-confirmation/job-3578176/port/rank-1-trace-cold.json",
+          "events": [
+            {
+              "name": "void at::native::vectorized_elementwise_kernel<8, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul> >(int, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul>)",
+              "duration_us": 132.961,
+              "start_us": 2836720806491.425
+            },
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_moe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812864_TVLayoutA11_0",
+              "duration_us": 304.545,
+              "start_us": 2836720806995.332
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_moe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168229376229376716_1",
+              "duration_us": 3.392,
+              "start_us": 2836720807300.517
+            },
+            {
+              "name": "void at::native::vectorized_elementwise_kernel<8, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul> >(int, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul>)",
+              "duration_us": 132.673,
+              "start_us": 2836720807347.269
+            },
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_moe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812864_TVLayoutA11_0",
+              "duration_us": 298.786,
+              "start_us": 2836720807860.583
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_moe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168229376229376716_1",
+              "duration_us": 3.232,
+              "start_us": 2836720808160.105
+            },
+            {
+              "name": "void at::native::vectorized_elementwise_kernel<8, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul> >(int, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul>)",
+              "duration_us": 132.801,
+              "start_us": 2836720808203.849
+            },
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_moe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812864_TVLayoutA11_0",
+              "duration_us": 306.817,
+              "start_us": 2836720808629.387
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_moe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168229376229376716_1",
+              "duration_us": 3.168,
+              "start_us": 2836720808937.004
+            },
+            {
+              "name": "void at::native::vectorized_elementwise_kernel<8, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul> >(int, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul>)",
+              "duration_us": 132.704,
+              "start_us": 2836720808981.133
+            },
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_moe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812864_TVLayoutA11_0",
+              "duration_us": 265.665,
+              "start_us": 2836720809446.927
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_moe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168229376229376716_1",
+              "duration_us": 3.136,
+              "start_us": 2836720809713.264
+            },
+            {
+              "name": "void at::native::vectorized_elementwise_kernel<8, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul> >(int, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul>)",
+              "duration_us": 132.609,
+              "start_us": 2836720809759.184
+            },
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_moe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812864_TVLayoutA11_0",
+              "duration_us": 312.801,
+              "start_us": 2836720810186.354
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_moe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168229376229376716_1",
+              "duration_us": 3.2,
+              "start_us": 2836720810499.827
+            }
+          ],
+          "calls": 5
+        }
+      },
+      "one_call_preflight_counts": {
+        "backend-forward": 1,
+        "launch": 1
+      },
+      "validation": "bitwise PASS",
+      "clocks_after": [
+        "0, NVIDIA GB300, GPU-30ceddb5-fa41-0714-1fc2-f1870ea6004f, 580.173.10, 2070 MHz, 3996 MHz, 31, 237.46 W",
+        "1, NVIDIA GB300, GPU-54c90568-7ecf-acbd-7043-50bb74201743, 580.173.10, 2070 MHz, 3996 MHz, 31, 238.92 W",
+        "2, NVIDIA GB300, GPU-be32855b-c3b1-4cb8-9013-7f2faa263f3b, 580.173.10, 120 MHz, 3996 MHz, 29, 179.86 W",
+        "3, NVIDIA GB300, GPU-7677caca-4322-8393-dcfa-441e208a4d9d, 580.173.10, 120 MHz, 3996 MHz, 28, 180.84 W"
+      ],
+      "complete": true
+    },
+    {
+      "impl": "port",
+      "rank": 0,
+      "job": "3578176",
+      "node": "theia0048.lyris.clusters.nvidia.com",
+      "gpu": "_CudaDeviceProperties(name='NVIDIA GB300', major=10, minor=3, total_memory=283261MB, multi_processor_count=152, uuid=30ceddb5-fa41-0714-1fc2-f1870ea6004f, pci_bus_id=6, pci_device_id=0, pci_domain_id=8, L2_cache_size=129MB)",
+      "settings": {
+        "backend": "flashinfer.moe_ep.backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl.backend.Nvfp4CutedslMegaKernelBackend",
+        "config": "MegaMoENvfp4Config(rank=0, world_size=4, num_tokens_per_rank=32, num_topk=4, num_total_experts=48, hidden=7168, intermediate=3072, internode=True, ranks_per_node=2, mma_tiler_mnk=(128, 128, 256), cluster_shape_mnk=(1, 1, 1), use_2cta_instrs=False, load_balance_mode='static', group_hint=536870912, force_static_sched=True, clc_bundle_size=None, num_sched_stages=None, flag_batch=4, epi_flag_batch=(1, 4), non_ubulk_fc2_store=True, enable_in_kernel_fc2_reduce=False, in_kernel_fc2_reduce=False, use_custom_finalize=False, use_persistent_finalize_kernel=False, token_back_mode='reuse_dispatch_warps', combine_dtype='bf16', apply_routing_weights_before_fc2=True, activation='swiglu', situ_beta=None, situ_linear_beta=None, gate_up_clamp=None, enable_iket=False, swiglu_alpha=None, swiglu_beta=None, enable_fc1_activation_per_token_scale=False)",
+        "kernel": "megamoe_nvfp4_mmatiler_128x128x256_cluster_1x1_1_cta_sched_static_expert_shape_12x3072x7168_grouphint_536870912_padding_64x128_fc2store_stg_no_inkernel_redg_do_topk_reduce_static_topk_reduce_token_back_by_reuse_dispatch_apply_topk_fc1_pre_quant_internode_relay_meta1_rpn2_fc2outBFloat16_combinebf16_sfvec16_accFloat32_swigluaNone_swiglubNone_clampNone_epiflag1x4_situNone_linearNone_ep_4_topk_4_maxtoken_32_flagbatch_4",
+        "source": "/lustre/fsw/coreai_devtech_all/qiangf/ncclGIN/port/flashinfer-nvfp4-gin/flashinfer/__init__.py"
+      },
+      "compiler": [
+        {
+          "target_module": "moe_nvfp4_swapab.megamoe_kernel",
+          "max_active_clusters": 152,
+          ".ptx": {
+            "path": "/lustre/fsw/coreai_devtech_all/qiangf/ncclGIN/port/migration-evidence/blackwell-fix-20261102/final-confirmation/job-3578176/port/rank-0.ptx",
+            "sha256": "0b9546f9abb03ed4c1c8c723c18b265fac9606fdd982438e5882e9678086f7b4"
+          },
+          ".cubin": {
+            "path": "/lustre/fsw/coreai_devtech_all/qiangf/ncclGIN/port/migration-evidence/blackwell-fix-20261102/final-confirmation/job-3578176/port/rank-0.cubin",
+            "sha256": "9015977af3b6e57d9eb5ba3b160fd16724608084155ac1bf1e371f0ceb4861bb"
+          }
+        }
+      ],
+      "source_commit": "74c0362878cb6dd5d0c90c346c7b420848563f1d",
+      "script_sha256": "6b28aae878ec77cae4d9fcc385071010c8459a1e0aceb3f0bfc24288ee725df2",
+      "benchmark_sha256": "5fa2448a6946c4e879b4225ffd932a85c0d344f49d14596efc0b9412a6c36700",
+      "clocks_before": [
+        "0, NVIDIA GB300, GPU-30ceddb5-fa41-0714-1fc2-f1870ea6004f, 580.173.10, 2070 MHz, 3996 MHz, 31, 236.62 W",
+        "1, NVIDIA GB300, GPU-54c90568-7ecf-acbd-7043-50bb74201743, 580.173.10, 2070 MHz, 3996 MHz, 31, 238.22 W",
+        "2, NVIDIA GB300, GPU-be32855b-c3b1-4cb8-9013-7f2faa263f3b, 580.173.10, 120 MHz, 3996 MHz, 29, 179.54 W",
+        "3, NVIDIA GB300, GPU-7677caca-4322-8393-dcfa-441e208a4d9d, 580.173.10, 120 MHz, 3996 MHz, 28, 180.37 W"
+      ],
+      "payload": {
+        "activation": {
+          "shape": [
+            32,
+            3584
+          ],
+          "stride": [
+            3584,
+            1
+          ],
+          "dtype": "torch.float4_e2m1fn_x2",
+          "sha256": "ef826af5d569ce903ff1a7d2dd92e66e00319378469a8a244df497abc1e3646e"
+        },
+        "activation_sf": {
+          "shape": [
+            32,
+            448
+          ],
+          "stride": [
+            448,
+            1
+          ],
+          "dtype": "torch.float8_e4m3fn",
+          "sha256": "2f85a191d2acd22c30ebaf91f3624ae1312eb1a62592b973c7127a1d775776ec"
+        },
+        "topk_idx": {
+          "shape": [
+            32,
+            4
+          ],
+          "stride": [
+            4,
+            1
+          ],
+          "dtype": "torch.int64",
+          "sha256": "dcc5c4aad9c2c1f37e5cffa9a8ddeaf1b5ddbdea0234f5b8bc4f86e059888169"
+        },
+        "topk_weights": {
+          "shape": [
+            32,
+            4
+          ],
+          "stride": [
+            4,
+            1
+          ],
+          "dtype": "torch.float32",
+          "sha256": "7da13b1966f03a5849ba1f5b9a48d9254b28de12461c05f0cc6837a5e12e414e"
+        },
+        "fc1_weight": {
+          "shape": [
+            12,
+            3584,
+            3072
+          ],
+          "stride": [
+            11010048,
+            1,
+            3584
+          ],
+          "dtype": "torch.float4_e2m1fn_x2",
+          "sha256": "3287f5f69a3b3031d941886520cd55a0f21c1c3317e9015f410f9bcb21131df7"
+        },
+        "fc1_weight_sf": {
+          "shape": [
+            12,
+            1376256
+          ],
+          "stride": [
+            1376256,
+            1
+          ],
+          "dtype": "torch.float8_e4m3fn",
+          "sha256": "9eea5ffe03f5b51678d984c879c415e342fc6f6863fb67c70db02fb981682714"
+        },
+        "fc2_weight": {
+          "shape": [
+            12,
+            768,
+            7168
+          ],
+          "stride": [
+            5505024,
+            1,
+            768
+          ],
+          "dtype": "torch.float4_e2m1fn_x2",
+          "sha256": "70d07c1e52c15cf57a6de960942a8588f30a3f1e4d987e8189487bfce79a3f3e"
+        },
+        "fc2_weight_sf": {
+          "shape": [
+            12,
+            688128
+          ],
+          "stride": [
+            688128,
+            1
+          ],
+          "dtype": "torch.float8_e4m3fn",
+          "sha256": "901c5dbcf71ce8ee748306e269a4f1721fbbfdb8684002ff27a102dde46c9763"
+        },
+        "fc1_alpha": {
+          "shape": [
+            12
+          ],
+          "stride": [
+            1
+          ],
+          "dtype": "torch.float32",
+          "sha256": "6ea78411bee8a810b9a18819c5a4ac7c827e71678cc4d1db9a0ab8c8d8a9b2e2"
+        },
+        "fc2_alpha": {
+          "shape": [
+            12
+          ],
+          "stride": [
+            1
+          ],
+          "dtype": "torch.float32",
+          "sha256": "6ea78411bee8a810b9a18819c5a4ac7c827e71678cc4d1db9a0ab8c8d8a9b2e2"
+        },
+        "fc1_norm_const": {
+          "shape": [
+            12
+          ],
+          "stride": [
+            1
+          ],
+          "dtype": "torch.float32",
+          "sha256": "6ea78411bee8a810b9a18819c5a4ac7c827e71678cc4d1db9a0ab8c8d8a9b2e2"
+        }
+      },
+      "protocol": "resident serialized source turns; standard5 and conditioned200 kept separate; profiles after all primary samples",
+      "backend_config": "cpu:gloo,cuda:nccl",
+      "source_hashes": {},
+      "profiles": {
+        "warm": {
+          "trace": "/lustre/fsw/coreai_devtech_all/qiangf/ncclGIN/port/migration-evidence/blackwell-fix-20261102/final-confirmation/job-3578176/port/rank-0-trace-warm.json",
+          "events": [
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_moe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812864_TVLayoutA11_0",
+              "duration_us": 220.769,
+              "start_us": 2836720798773.066
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_moe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168229376229376716_1",
+              "duration_us": 3.712,
+              "start_us": 2836720798994.507
+            },
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_moe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812864_TVLayoutA11_0",
+              "duration_us": 226.753,
+              "start_us": 2836720799502.862
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_moe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168229376229376716_1",
+              "duration_us": 3.68,
+              "start_us": 2836720799730.127
+            },
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_moe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812864_TVLayoutA11_0",
+              "duration_us": 240.225,
+              "start_us": 2836720800148.401
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_moe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168229376229376716_1",
+              "duration_us": 3.552,
+              "start_us": 2836720800389.17
+            },
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_moe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812864_TVLayoutA11_0",
+              "duration_us": 218.081,
+              "start_us": 2836720800783.987
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_moe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168229376229376716_1",
+              "duration_us": 3.777,
+              "start_us": 2836720801002.58
+            },
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_moe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812864_TVLayoutA11_0",
+              "duration_us": 206.209,
+              "start_us": 2836720801392.182
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_moe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168229376229376716_1",
+              "duration_us": 3.552,
+              "start_us": 2836720801598.903
+            }
+          ],
+          "calls": 5
+        },
+        "cold": {
+          "trace": "/lustre/fsw/coreai_devtech_all/qiangf/ncclGIN/port/migration-evidence/blackwell-fix-20261102/final-confirmation/job-3578176/port/rank-0-trace-cold.json",
+          "events": [
+            {
+              "name": "void at::native::vectorized_elementwise_kernel<8, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul> >(int, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul>)",
+              "duration_us": 133.089,
+              "start_us": 2836720806021.731
+            },
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_moe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812864_TVLayoutA11_0",
+              "duration_us": 216.835,
+              "start_us": 2836720807082.126
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_moe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168229376229376716_1",
+              "duration_us": 3.552,
+              "start_us": 2836720807299.505
+            },
+            {
+              "name": "void at::native::vectorized_elementwise_kernel<8, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul> >(int, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul>)",
+              "duration_us": 132.769,
+              "start_us": 2836720807350.929
+            },
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_moe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812864_TVLayoutA11_0",
+              "duration_us": 217.346,
+              "start_us": 2836720807942.616
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_moe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168229376229376716_1",
+              "duration_us": 3.424,
+              "start_us": 2836720808160.506
+            },
+            {
+              "name": "void at::native::vectorized_elementwise_kernel<8, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul> >(int, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul>)",
+              "duration_us": 132.801,
+              "start_us": 2836720808208.219
+            },
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_moe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812864_TVLayoutA11_0",
+              "duration_us": 219.459,
+              "start_us": 2836720808717.247
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_moe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168229376229376716_1",
+              "duration_us": 3.488,
+              "start_us": 2836720808937.25
+            },
+            {
+              "name": "void at::native::vectorized_elementwise_kernel<8, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul> >(int, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul>)",
+              "duration_us": 132.769,
+              "start_us": 2836720808986.306
+            },
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_moe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812864_TVLayoutA11_0",
+              "duration_us": 218.498,
+              "start_us": 2836720809493.8
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_moe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168229376229376716_1",
+              "duration_us": 3.616,
+              "start_us": 2836720809713.002
+            },
+            {
+              "name": "void at::native::vectorized_elementwise_kernel<8, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul> >(int, at::native::FillFunctor<unsigned char>, std::array<char*, 1ul>)",
+              "duration_us": 132.707,
+              "start_us": 2836720809755.946
+            },
+            {
+              "name": "kernel_cutlass_fc1fc2_kernel_impl_moe_nvfp4_swapabmegamoe_kernelSm100MegaMoEKernel_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____MMAAtom_ThrID10_ShapeMNK12812864_TVLayoutA11_0",
+              "duration_us": 219.682,
+              "start_us": 2836720810280.112
+            },
+            {
+              "name": "kernel_cutlass__reduce_bf16_internode_moe_nvfp4_swapabtopk_reduceTopkReduce_object_at__tensorptrbf16gmemalign128o232471689175042867271681_tensorptrbf16gmemalign128o21327168229376229376716_1",
+              "duration_us": 3.648,
+              "start_us": 2836720810500.434
+            }
+          ],
+          "calls": 5
+        }
+      },
+      "one_call_preflight_counts": {
+        "backend-forward": 1,
+        "launch": 1
+      },
+      "validation": "bitwise PASS",
+      "clocks_after": [
+        "0, NVIDIA GB300, GPU-30ceddb5-fa41-0714-1fc2-f1870ea6004f, 580.173.10, 2070 MHz, 3996 MHz, 31, 237.46 W",
+        "1, NVIDIA GB300, GPU-54c90568-7ecf-acbd-7043-50bb74201743, 580.173.10, 2070 MHz, 3996 MHz, 31, 238.92 W",
+        "2, NVIDIA GB300, GPU-be32855b-c3b1-4cb8-9013-7f2faa263f3b, 580.173.10, 120 MHz, 3996 MHz, 29, 179.86 W",
+        "3, NVIDIA GB300, GPU-7677caca-4322-8393-dcfa-441e208a4d9d, 580.173.10, 120 MHz, 3996 MHz, 28, 180.84 W"
+      ],
+      "complete": true
+    }
+  ],
+  "payload_identity": "all ranks match",
+  "compiler_audits": [],
+  "sample_count": 1600
+}

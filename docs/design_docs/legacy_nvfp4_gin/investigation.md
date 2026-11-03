@@ -436,3 +436,43 @@ all old N2R2 ratios remains unresolved. No prior observation has been dropped.
   one rank alternates streams. Explicit bound-device validation stays inside
   the existing collective boundary, before staging. Final17-test qualification
   also checks wrong-current-device recovery. No device binary change is intended.
+
+
+- **O34/PT9 completed:** final3578176 COMPLETED exit0 on theia0048/0115.
+  Old38f650e63 rejects the predicted one-rank stream change on all ranks;
+  corrected74c036287 passes17 strong/public tests per rank, including actual
+  compiled-call stream handles, bitwise outputs and bound-device recovery.
+  Its4 off finalizer tests and1 cache/graph test per rank also pass.
+- **O35:** final resident comparison validates16 groups/1600 samples, all
+  bit/payload/profile checks. Standard raw donor350.368→receiver349.312 us
+  warm and363.984→356.432 us cold; baseline round CV6.38/6.39% makes both
+  inconclusive. Conditioned200 protocol remains separate:359.440→319.792 us
+  warm,373.904→321.760 us cold, CV8.51/9.16%, also inconclusive. Public
+  standard medians1630.15/1656.86 us; native prepared402.74/404.10 us have
+  different wrapper scopes. No paired cross-allocation speedup is inferred.
+- **O36:** fixture audit corrects the initial performance plan's balanced
+  label: actual seeded random top-k has512 slots, all48 experts,4–23/expert.
+  Providers share identical payloads; balanced/sparse correctness fixtures
+  are distinct. Routing histogram is saved with the final evidence.
+- **R6:** [performance-fix-blackwell.md](performance-fix-blackwell.md) is the
+  coherent final correction report. The original report and failures remain.
+
+Final coverage: PH1 has paired host-intervention support (O18–O27) and the
+final guard count/latency is measured; it does not explain raw device spans.
+PH4 ordinary-off entry correction is qualified by all24 off gates (O31).
+PH5 placement intervention is causal within the EP4 launcher (O31), but the
+claim that placement eliminates ALL N2R2 noise is contradicted by O32/O35.
+PH3 arrival/state sensitivity remains supported as an intermediate observation;
+its deeper cause for all old N2R2 ratios is unknown. PH2 unconditional intrinsic
+kernel regression remains unestablished: direction reversals and identical
+paired binaries preclude attributing every raw ratio to changed device code,
+while noisy final baselines also preclude a universal no-regression claim.
+No old observation is removed. Practical off correction and public-host cost
+reduction are delivered; internode promotion remains an explicit evidence gap.
+A useful future check would require a demonstrably stable N2R2 launch baseline;
+repeating unchanged allocations until a passing sample appears is not warranted.
+
+Archive handoff for R6: optional per-invocation authorization requested;
+status pending. No session trace was collected, packaged or uploaded.
+The benchmark artifact index is ordinary experiment evidence, not a session
+trace archive. No destination is inferred from project remotes.

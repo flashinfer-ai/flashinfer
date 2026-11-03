@@ -46,8 +46,13 @@ routing weights, separate BF16 reduction and default PG are required. All
 ranks enter serialized control calls in the same order. Subgroups, graphs,
 autotune and custom activation/scale/finalization are rejected on mode.
 
-The correctness adapter currently rebuilds/validates on-mode launch arguments
-and uses control collectives on each public call. Its host overhead is
-unbenchmarked. By the user's explicit scope clarification, Rubin/local
-performance validation is not a completion gate; no timing or speedup claim
-is made. Production promotion and broader geometries need separate review.
+The final adapter caches session-bound launch arguments, binds the current
+stream when launching eager GIN, and retains two collective agreements per
+steady-state public call. It uses the lean existing non-GIN entry for ordinary
+off cases. All24 off performance gates pass against legacy F_BASE. Internode
+host overhead is reduced; raw donor comparisons remain inconclusive due to
+baseline dispersion, and native/public full-call scopes differ. No next
+baseline is used. Final3578176 passes17 strong/public tests per rank and the
+retained4+1 off finalizer/cache/graph checks per rank. See
+[performance correction](performance-fix-blackwell.md). Production promotion
+and broader geometries need separate review.

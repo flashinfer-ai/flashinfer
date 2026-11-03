@@ -1,0 +1,83 @@
+{
+  "construction": "torch.rand scores, seeded per rank; topk(4); no exact balancing step",
+  "global_expert_route_counts": [
+    10,
+    13,
+    17,
+    8,
+    6,
+    23,
+    8,
+    11,
+    16,
+    6,
+    8,
+    13,
+    8,
+    12,
+    17,
+    11,
+    12,
+    13,
+    16,
+    14,
+    14,
+    5,
+    12,
+    6,
+    11,
+    4,
+    10,
+    12,
+    12,
+    5,
+    15,
+    8,
+    10,
+    11,
+    8,
+    9,
+    8,
+    11,
+    9,
+    7,
+    11,
+    16,
+    8,
+    6,
+    8,
+    16,
+    7,
+    11
+  ],
+  "min_expert_routes": 4,
+  "max_expert_routes": 23,
+  "total_route_slots": 512,
+  "ranks": [
+    {
+      "rank": 0,
+      "route_slots": 128,
+      "remote_route_slots": 55,
+      "remote_tokens_node_deduplicated": 27
+    },
+    {
+      "rank": 1,
+      "route_slots": 128,
+      "remote_route_slots": 56,
+      "remote_tokens_node_deduplicated": 30
+    },
+    {
+      "rank": 2,
+      "route_slots": 128,
+      "remote_route_slots": 66,
+      "remote_tokens_node_deduplicated": 29
+    },
+    {
+      "rank": 3,
+      "route_slots": 128,
+      "remote_route_slots": 68,
+      "remote_tokens_node_deduplicated": 30
+    }
+  ],
+  "storage_mapping_verified": "pickle metadata ids\u2192storage2 uint8 bytes, original int64, zero offset, contiguous32x32 byte view; little endian"
+}

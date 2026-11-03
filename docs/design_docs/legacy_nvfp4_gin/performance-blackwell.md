@@ -1,5 +1,9 @@
 # Blackwell performance verification
 
+Historical pre-fix measurements. See [the correction report](performance-fix-blackwell.md)
+for the final source, 24 passing off gates, internode host corrections and
+remaining baseline-variance limitation. The original measurements below are retained.
+
 Completed 2026-11-02 on NVIDIA GB300 (SM103). Output checks passed throughout
 all accepted cases. **The off-mode performance gate did not pass overall.**
 Of 24 off comparisons, 10 passed the predeclared 5% limit,

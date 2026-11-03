@@ -1,6 +1,6 @@
 # Legacy NVFP4 GIN validation record
 
-Updated 2026-11-02. Host checks, real device results and incomplete gates are
+Updated 2026-11-03. Host checks, real device results and incomplete gates are
 reported separately. The fixed-scope migration is accepted: numerical/public-runtime, final
 sparse-poison/example and retained-finalizer checks pass. Job outcomes
 are tracked in [implementation-status.md](implementation-status.md); failure
@@ -42,7 +42,7 @@ requires Torch/FlashInfer; a missing dependency is BLOCKED, not a skip/pass.
 | CUDA arena typed views, real NCCL init/windows/LSA mapping | PASS, 3576298 | Actual GPU reads of every LSA peer, three create/close cycles/rank |
 | F_BASE/off versus receiver/off EP4 smoke | PASS, 3576310 | Two cases/rank/source, including per-token scale |
 | Donor and FI on-mode stage/numeric/relaunch checks | PASS for fixed case | 3576795: 24 strong calls/rank, exact protocol/message/L1 bytes and unchanged Torch tolerance; 3576839: four public control/lifetime cases/rank |
-| GPU performance | MEASURED on GB300; off gate did not pass overall | Subsequent explicit user request; [results and limits](performance-blackwell.md) |
+| GPU performance | Final off24/24 PASS; internode raw inconclusive | [Correction results and limits](performance-fix-blackwell.md); initial negative results retained |
 
 Raw command output and exact counts are in [host-checks.log](evidence/host-checks.log).
 The all-gather and resource harnesses exercise host control flow; they are not
@@ -89,8 +89,8 @@ baseline dispersion exceeds 5%, label the comparison inconclusive and fix the
 measurement environment before evaluating the gate. The subsequent [Blackwell protocol and results](performance-blackwell.md) explicitly
 separate the CUDA-event pipeline gate from independently profiled fused-kernel
 durations. The original waiver applied at correctness delivery; the user
-later explicitly requested the measurements. No overall performance pass or
-performance improvement is claimed.
+later explicitly requested the measurements. The final corrections pass all24 off gates; internode raw comparisons remain
+inconclusive. See [the correction report](performance-fix-blackwell.md).
 
 ## User scope clarification
 
@@ -166,7 +166,25 @@ above are unchanged; they are not timing measurements.
 
 Blackwell measurements are now complete: EP1/EP2/EP4 off against F_BASE and
 N2R2 on against the fixed donor, five alternating rounds and 100 primary
-samples per group. All accepted output-bit/payload checks passed. The off
-performance gate did not pass overall; on measurements show regression.
+samples per group. All accepted output-bit/payload checks passed. The initial off
+performance gate did not pass overall; the initial on measurements show regression.
 See the linked report for every case, dispersion, scope differences and
 retained failed/partial runs. No kernel tuning was included.
+
+
+## Performance-correction qualification, 2026-11-03
+
+Final3578176 COMPLETED, exit0, on theia0048/theia0115 using74c036287:
+17 strong/public tests per rank, no skips;4 selected off finalizer cases per
+rank and1 explicit-workspace/cache/graph case per rank pass. The final two
+providers complete1600 timing samples with exact bit/payload/profile checks.
+The old38f650e63 rank-local stream rejection reproduces before the corrected
+source passes stream-handle observation and current-device recovery tests.
+All111 runtime/test source hashes match the launch snapshot; all17 device
+hunk ledger hashes are unchanged by the performance fixes.
+
+Off acceptance uses4800 samples and24 passing gates from3578010/3578087/3578088.
+On standard raw350.37→349.31 us warm and363.98→356.43 us cold remains
+inconclusive (baseline round CV~6.4%). Native/public full-call scopes differ.
+The complete measured correction and retained failed jobs are documented in
+[performance-fix-blackwell.md](performance-fix-blackwell.md).

@@ -1,0 +1,17 @@
+{
+  "source": "74c0362878cb6dd5d0c90c346c7b420848563f1d",
+  "source_hashes_match": 111,
+  "device_ledger_hashes_match": 17,
+  "job": 3578176,
+  "slurm": "JobID|State|Elapsed|ExitCode\n3578176|COMPLETED|00:06:45|0:0\n3578176.batch|COMPLETED|00:06:45|0:0\n3578176.extern|COMPLETED|00:06:45|0:0\n3578176.0|COMPLETED|00:06:22|0:0\n",
+  "tests_per_rank": {
+    "gin_strong_public": 17,
+    "off_finalizers": 4,
+    "off_cache_graph": 1
+  },
+  "off_gates": {
+    "PASS": 24
+  },
+  "on_gate": "inconclusive-baseline-dispersion",
+  "next_baseline_used": false
+}

@@ -46,9 +46,16 @@ does not certify every R<=16 topology.
 Advance a row only with full-rank logs, fixed versions and the numerical,
 relaunch and lifetime gates in [validation](validation.md).
 
-## User scope clarification
+## Stream, device and performance qualification
 
-On 2026-11-02 the user stated: “我们的这个feature不涉及rubin环境，可以不用在本地验证”.
-Rubin/local performance measurements are therefore not a completion gate for
-this delivery. Existing Blackwell correctness checks continue. Performance is
-not measured, rather than passed; no hardware restriction is silently bypassed.
+Serialized eager calls may change CUDA streams on a single rank; final GPU
+qualification observes the actual compiled-call stream and bitwise output.
+The session remains bound to its initialized CUDA device. A current-device
+mismatch is rejected collectively before staging, and recovery is tested.
+Internode CUDA Graph capture remains rejected.
+
+The original local-performance waiver was superseded by the user's explicit
+Blackwell request. [Performance corrections](performance-fix-blackwell.md)
+pass24 off gates against legacy F_BASE. The internode native legacy donor
+comparison remains inconclusive under the predeclared dispersion rule.
+GPU-local CPU binding is a measurement recipe, not a correctness requirement.
