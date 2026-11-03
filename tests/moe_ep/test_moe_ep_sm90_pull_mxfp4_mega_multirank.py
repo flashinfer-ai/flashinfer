@@ -572,6 +572,15 @@ def _run_raw_oracle(routing_pattern, *, tactic=None, capture_graph=False):
         second_repeat = layer.forward(tensors(launches[1])).clone()
         torch.cuda.synchronize()
         torch.testing.assert_close(second_repeat, second, atol=0.0, rtol=0.0)
+        if tactic is not None:
+            # The pull fields do not change outputs: check that the requested
+            # ones reached the kernel instead of the serial, unrotated pull.
+            token_comm = layer._staged_workspace._frontend._mega.kernel.token_comm
+            assert token_comm.pull_batch == tactic.get("dispatch_pull_batch", 1)
+            assert token_comm.pull_rotate == tactic.get("dispatch_pull_rotate", False)
+            assert token_comm.compact_pull_buffer == tactic.get(
+                "compact_pull_buffer", False
+            )
         if capture_graph:
             dist.barrier()
             graph = torch.cuda.CUDAGraph()
