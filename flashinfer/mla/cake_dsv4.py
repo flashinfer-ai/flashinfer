@@ -1,4 +1,5 @@
-"""Source-level CAKE backend for DeepSeek V4 sparse MLA on SM100 and SM103.
+"""Source-level CAKE backend for DeepSeek V4 sparse MLA on SM100 and SM103, and
+for the FP8 decode route on SM107.
 
 Host contract (flashinfer#4671 hardening)
 -----------------------------------------
@@ -1780,8 +1781,8 @@ def run_cake_dsv4(
 ) -> torch.Tensor:
     """Launch the CAKE DSv4 route for flattened ``query [rows, num_heads, 512]``.
 
-    ``enable_pdl`` launches the programs that support it (the FP8 persistent
-    and M64 bodies) as programmatic dependents of the previous kernel on the
+    ``enable_pdl`` launches the programs that support it (the FP8 persistent,
+    M64 and low-head prefill bodies) as programmatic dependents of the previous kernel on the
     stream; they wait for it before their first global read.  The other
     programs launch without the attribute.
 
