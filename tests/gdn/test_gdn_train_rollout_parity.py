@@ -20,8 +20,10 @@ with ``deterministic=False``) against the rollout prefill
 ``chunk_gated_delta_rule`` on the same BF16 packed inputs with natural-log
 gates, post-sigmoid beta and scale ``128 ** -0.5``.
 
-The tolerance test is the contract; the bitwise arm is a strict xfail that
-starts failing the day the forwards agree bitwise.
+The tolerance test is the contract, judged with the training route's own
+reference budget (rel-RMS and max-abs relative to the largest rollout
+magnitude); the bitwise arm is a strict xfail that starts failing the day the
+forwards agree bitwise.
 """
 
 from __future__ import annotations
@@ -32,7 +34,10 @@ import torch
 from flashinfer import cake_gdn_train_kcp, gdn_train
 from flashinfer.gdn_prefill import chunk_gated_delta_rule
 from flashinfer.utils import is_sm100a_supported
-from tests.test_helpers.cake_gdn_det_train_kcp_reference import make_inputs
+from tests.test_helpers.cake_gdn_det_train_kcp_reference import (
+    error_metrics,
+    make_inputs,
+)
 
 D = 128
 SCALE = D**-0.5
@@ -44,7 +49,9 @@ SHAPES = (
     ("one-doc-4x8", (3000,), (4, 8)),
     ("qwen3next-16x32", (2048 + 37, 1000), (16, 32)),
 )
-OUT_ATOL = OUT_RTOL = 1e-2
+# the KCP training suites' reference budget (tests/experimental/test_cake_gdn_train_kcp_cp1.py)
+REL_RMS_MAX = 1e-2
+MAX_ABS_REL = 2e-2
 
 
 def _supported(route: str, device: torch.device) -> bool:
@@ -88,7 +95,7 @@ def _training_forward(route, inputs, cu, device):
             q, k, v, g, beta, ctx, scale=SCALE, save_for_backward=False
         )
     else:
-        part = cake_gdn_train_kcp.partition_kcp(cu64, 1)
+        part = cake_gdn_train_kcp.partition_kcp(cu64, 1, deterministic=False)
         ctx = cake_gdn_train_kcp.build_context_kcp(
             part, None, 0, device, deterministic=False
         )
@@ -142,19 +149,22 @@ def test_training_forward_matches_rollout_within_tolerance(
 ) -> None:
     out_train, out_roll = _both_forwards(route, lengths, heads, device)
     assert out_train.shape == out_roll.shape and out_train.dtype == out_roll.dtype
-    diff = (out_train.float() - out_roll.float()).abs()
+    m = error_metrics(out_train, out_roll)
     print(
-        f"\n{route}: out max-abs {diff.max().item():.3e} mean-abs {diff.mean().item():.3e} "
+        f"\n{route}: out rel-RMS {m['rel_rms']:.3e} max-abs {m['max_abs']:.3e} "
         f"exact {(out_train == out_roll).float().mean().item():.4f} "
-        f"ref max-abs {out_roll.float().abs().max().item():.3e}"
+        f"ref max-abs {m['ref_max_abs']:.3e}"
     )
-    torch.testing.assert_close(
-        out_train.float(), out_roll.float(), atol=OUT_ATOL, rtol=OUT_RTOL
+    assert m["nonfinite"] == 0, f"{m['nonfinite']} non-finite outputs"
+    assert m["rel_rms"] <= REL_RMS_MAX, f"rel-RMS {m['rel_rms']:.3e} > {REL_RMS_MAX}"
+    assert m["max_abs"] <= MAX_ABS_REL * m["ref_max_abs"], (
+        f"max-abs {m['max_abs']:.3e} > {MAX_ABS_REL} x {m['ref_max_abs']:.3e} (worst {m['worst']})"
     )
 
 
 @pytest.mark.xfail(
     strict=True,
+    raises=AssertionError,
     reason="#7932 asks for bitwise parity; training and rollout forwards reduce in different orders",
 )
 @pytest.mark.parametrize("route", ROUTES)

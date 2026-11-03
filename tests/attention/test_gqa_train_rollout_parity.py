@@ -25,8 +25,6 @@ the forwards agree bitwise, which is the signal to promote it.
 
 from __future__ import annotations
 
-import math
-
 import pytest
 import torch
 
@@ -47,8 +45,7 @@ LAYOUTS = (
     ("two_4k", (4096, 4096), 32, 4),
 )
 ROLLOUT_BACKENDS = ("auto", "fa2")
-# (atol, rtol) per rollout backend; measured on B100 (CC 10.0): out max-abs 7.8e-3 (auto) and 1.6e-2 (fa2) at O(1)
-# magnitudes, LSE max-abs 1.9e-6 (auto) and 1.4e-3 (fa2, exp2-domain accumulation).
+# (atol, rtol) per rollout backend, from SM100 measurements: out 1-2 BF16 ULP, LSE 1.9e-6 (auto) / 1.4e-3 (fa2)
 OUT_TOL = {"auto": (1e-2, 2e-2), "fa2": (2e-2, 2e-2)}
 LSE_TOL = {"auto": (1e-4, 1e-5), "fa2": (5e-3, 1e-3)}
 
@@ -97,9 +94,7 @@ def _rollout_forward(q, k, v, cu, hq, hkv, backend, device):
     wrapper.plan(
         cu, cu, hq, hkv, D, causal=True, sm_scale=SCALE, q_data_type=torch.bfloat16
     )
-    out, lse = wrapper.run(q, k, v, return_lse=True)
-    # the rollout LSE is [T, H] in the log2 domain; the training LSE is [H, T] natural-log
-    return out, lse.float().transpose(0, 1).contiguous() * math.log(2)
+    return wrapper.run(q, k, v, return_lse=True, lse_base="ln", lse_layout="HN")
 
 
 def _both_forwards(lengths, hq, hkv, backend, device):
@@ -140,6 +135,7 @@ def test_training_forward_matches_rollout_within_tolerance(
 
 @pytest.mark.xfail(
     strict=True,
+    raises=AssertionError,
     reason="#7932 asks for bitwise parity; training and rollout forwards reduce in different orders",
 )
 @pytest.mark.parametrize("backend", ROLLOUT_BACKENDS)
