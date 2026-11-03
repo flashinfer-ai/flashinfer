@@ -135,7 +135,7 @@ kernel_cake_mhc_det_train_bwd_token__ao22_rae7_rf3_pd1_l2l_ntr(__nv_bfloat16* __
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     float* dpre_part = reinterpret_cast<float*>(smem_raw + 1024);
     const int dpre_part_addr = smem + 1024;
     float* fold = reinterpret_cast<float*>(smem_raw + 3072);
@@ -147,8 +147,7 @@ kernel_cake_mhc_det_train_bwd_token__ao22_rae7_rf3_pd1_l2l_ntr(__nv_bfloat16* __
     uint8_t* ring = reinterpret_cast<uint8_t*>(smem_raw + 9216);
     const int ring_addr = smem + 9216;
 
-    // Mbarrier init (1 pipeline groups, 0 ordered-sequence groups, 16 barriers)
-    // Mbarriers at smem_raw[0..128)
+    // Mbarrier init (16 barriers at smem_raw[0..128))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
