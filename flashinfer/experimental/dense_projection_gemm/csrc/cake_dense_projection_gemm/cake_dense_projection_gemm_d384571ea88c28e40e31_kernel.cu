@@ -219,14 +219,15 @@ kernel_cake_dense_projection_gemm_d384571ea88c28e40e31(const __grid_constant__ C
     #define raw_empty_addr (mbar_base + 48)
     #define b_full_addr (mbar_base + 96)
     #define b_empty_addr (mbar_base + 144)
-    #define a_full_addr (mbar_base + 192)
-    #define a_empty_addr (mbar_base + 208)
-    #define chunk_full_addr (mbar_base + 224)
-    #define chunk_empty_addr (mbar_base + 240)
-    #define mainloop_done_addr (mbar_base + 256)
-    #define epilogue_done_addr (mbar_base + 264)
-    #define work_full_addr (mbar_base + 272)
-    #define work_empty_addr (mbar_base + 304)
+    #define b_read_addr (mbar_base + 192)
+    #define a_full_addr (mbar_base + 240)
+    #define a_empty_addr (mbar_base + 256)
+    #define chunk_full_addr (mbar_base + 272)
+    #define chunk_empty_addr (mbar_base + 288)
+    #define mainloop_done_addr (mbar_base + 304)
+    #define epilogue_done_addr (mbar_base + 312)
+    #define work_full_addr (mbar_base + 320)
+    #define work_empty_addr (mbar_base + 352)
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
@@ -252,8 +253,8 @@ kernel_cake_dense_projection_gemm_d384571ea88c28e40e31(const __grid_constant__ C
     const int work_response_addr = smem + 189440;
     asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
 
-    // Mbarrier init (12 pipeline groups, 0 ordered-sequence groups, 42 barriers)
-    // Mbarriers at smem_raw[0..336)
+    // Mbarrier init (13 pipeline groups, 0 ordered-sequence groups, 48 barriers)
+    // Mbarriers at smem_raw[0..384)
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -288,36 +289,43 @@ kernel_cake_dense_projection_gemm_d384571ea88c28e40e31(const __grid_constant__ C
             mbarrier_init(smem + 168, 1);
             mbarrier_init(smem + 176, 1);
             mbarrier_init(smem + 184, 1);
+            // b_read: 6 barriers, init_count=4
+            mbarrier_init(smem + 192, 4);
+            mbarrier_init(smem + 200, 4);
+            mbarrier_init(smem + 208, 4);
+            mbarrier_init(smem + 216, 4);
+            mbarrier_init(smem + 224, 4);
+            mbarrier_init(smem + 232, 4);
             // --- pipeline 'a_pipe' ---
             // a_full: 2 barriers, init_count=8
-            mbarrier_init(smem + 192, 8);
-            mbarrier_init(smem + 200, 8);
+            mbarrier_init(smem + 240, 8);
+            mbarrier_init(smem + 248, 8);
             // a_empty: 2 barriers, init_count=1
-            mbarrier_init(smem + 208, 1);
-            mbarrier_init(smem + 216, 1);
+            mbarrier_init(smem + 256, 1);
+            mbarrier_init(smem + 264, 1);
             // --- pipeline 'chunk_pipe' ---
             // chunk_full: 2 barriers, init_count=1
-            mbarrier_init(smem + 224, 1);
-            mbarrier_init(smem + 232, 1);
-            // chunk_empty: 2 barriers, init_count=16
-            mbarrier_init(smem + 240, 16);
-            mbarrier_init(smem + 248, 16);
-            // --- pipeline 'mainloop_pipe' ---
-            // mainloop_done: 1 barriers, init_count=1
-            mbarrier_init(smem + 256, 1);
-            // epilogue_done: 1 barriers, init_count=16
-            mbarrier_init(smem + 264, 16);
-            // --- pipeline 'work_pipe' ---
-            // work_full: 4 barriers, init_count=1
             mbarrier_init(smem + 272, 1);
             mbarrier_init(smem + 280, 1);
-            mbarrier_init(smem + 288, 1);
-            mbarrier_init(smem + 296, 1);
+            // chunk_empty: 2 barriers, init_count=16
+            mbarrier_init(smem + 288, 16);
+            mbarrier_init(smem + 296, 16);
+            // --- pipeline 'mainloop_pipe' ---
+            // mainloop_done: 1 barriers, init_count=1
+            mbarrier_init(smem + 304, 1);
+            // epilogue_done: 1 barriers, init_count=16
+            mbarrier_init(smem + 312, 16);
+            // --- pipeline 'work_pipe' ---
+            // work_full: 4 barriers, init_count=1
+            mbarrier_init(smem + 320, 1);
+            mbarrier_init(smem + 328, 1);
+            mbarrier_init(smem + 336, 1);
+            mbarrier_init(smem + 344, 1);
             // work_empty: 4 barriers, init_count=804
-            mbarrier_init(smem + 304, 804);
-            mbarrier_init(smem + 312, 804);
-            mbarrier_init(smem + 320, 804);
-            mbarrier_init(smem + 328, 804);
+            mbarrier_init(smem + 352, 804);
+            mbarrier_init(smem + 360, 804);
+            mbarrier_init(smem + 368, 804);
+            mbarrier_init(smem + 376, 804);
             asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         }
     }
@@ -327,9 +335,9 @@ kernel_cake_dense_projection_gemm_d384571ea88c28e40e31(const __grid_constant__ C
     asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
 
     // TMEM alloc (512 columns, 480 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 336);
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 384);
     if (warp == 0) {
-        int _tmem_hold = smem + 336;
+        int _tmem_hold = smem + 384;
         asm volatile("tcgen05.alloc.cta_group::2.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(512) : "memory");
         __syncwarp();
         asm volatile("tcgen05.relinquish_alloc_permit.cta_group::2.sync.aligned;");
@@ -767,6 +775,7 @@ kernel_cake_dense_projection_gemm_d384571ea88c28e40e31(const __grid_constant__ C
                         #pragma unroll 1
                         for (int iter_k_2 = 0; iter_k_2 < k_count_2; iter_k_2++) {
                             mbarrier_wait(b_empty_addr + (b_stage_1) * 8, _phase_b_empty);
+                            mbarrier_wait(b_read_addr + (b_stage_1) * 8, _phase_b_empty);
                             int k0_1 = (k_first_2 + iter_k_2) * 32;
                             #pragma unroll
                             for (int p_1 = 0; p_1 < 2; p_1++) {
@@ -1156,27 +1165,28 @@ kernel_cake_dense_projection_gemm_d384571ea88c28e40e31(const __grid_constant__ C
                     int k_count_4 = _min_3_4 - pair_step_4 - k_first_4;
                     int off_m_4 = ((first_pair_4 + seg_4) * 2 + rank_4) * 128;
                     int off_n_4 = column_tile_4 * 128;
-                    mbarrier_wait(raw_full_addr + (r_stage) * 8, _phase_raw_full);
-                    unsigned int first_col = a32_addr + r_stage * 16384 + (unsigned int)col_off;
-                    asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&x[0])) : "r"(first_col + (unsigned int)((lane_chunk ^ 0) << 4)));
-                    asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&x[1])) : "r"(first_col + (unsigned int)(128 + ((lane_chunk ^ 1) << 4))));
-                    asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&x[2])) : "r"(first_col + (unsigned int)(256 + ((lane_chunk ^ 2) << 4))));
-                    asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&x[3])) : "r"(first_col + (unsigned int)(384 + ((lane_chunk ^ 3) << 4))));
-                    asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&x[4])) : "r"(first_col + (unsigned int)(512 + ((lane_chunk ^ 4) << 4))));
-                    asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&x[5])) : "r"(first_col + (unsigned int)(640 + ((lane_chunk ^ 5) << 4))));
-                    asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&x[6])) : "r"(first_col + (unsigned int)(768 + ((lane_chunk ^ 6) << 4))));
-                    asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&x[7])) : "r"(first_col + (unsigned int)(896 + ((lane_chunk ^ 7) << 4))));
-                    asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&x[8])) : "r"(first_col + (unsigned int)(1024 + ((lane_chunk ^ 0) << 4))));
-                    asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&x[9])) : "r"(first_col + (unsigned int)(1152 + ((lane_chunk ^ 1) << 4))));
-                    asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&x[10])) : "r"(first_col + (unsigned int)(1280 + ((lane_chunk ^ 2) << 4))));
-                    asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&x[11])) : "r"(first_col + (unsigned int)(1408 + ((lane_chunk ^ 3) << 4))));
-                    asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&x[12])) : "r"(first_col + (unsigned int)(1536 + ((lane_chunk ^ 4) << 4))));
-                    asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&x[13])) : "r"(first_col + (unsigned int)(1664 + ((lane_chunk ^ 5) << 4))));
-                    asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&x[14])) : "r"(first_col + (unsigned int)(1792 + ((lane_chunk ^ 6) << 4))));
-                    asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&x[15])) : "r"(first_col + (unsigned int)(1920 + ((lane_chunk ^ 7) << 4))));
                     #pragma unroll 1
                     for (int iter_k_3 = 0; iter_k_3 < k_count_4; iter_k_3++) {
+                        mbarrier_wait(raw_full_addr + (r_stage) * 8, _phase_raw_full);
                         unsigned int src_col = a32_addr + r_stage * 16384 + (unsigned int)col_off;
+                        if (iter_k_3 == 0) {
+                            asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&x[0])) : "r"(src_col + (unsigned int)((lane_chunk ^ 0) << 4)));
+                            asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&x[1])) : "r"(src_col + (unsigned int)(128 + ((lane_chunk ^ 1) << 4))));
+                            asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&x[2])) : "r"(src_col + (unsigned int)(256 + ((lane_chunk ^ 2) << 4))));
+                            asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&x[3])) : "r"(src_col + (unsigned int)(384 + ((lane_chunk ^ 3) << 4))));
+                            asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&x[4])) : "r"(src_col + (unsigned int)(512 + ((lane_chunk ^ 4) << 4))));
+                            asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&x[5])) : "r"(src_col + (unsigned int)(640 + ((lane_chunk ^ 5) << 4))));
+                            asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&x[6])) : "r"(src_col + (unsigned int)(768 + ((lane_chunk ^ 6) << 4))));
+                            asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&x[7])) : "r"(src_col + (unsigned int)(896 + ((lane_chunk ^ 7) << 4))));
+                            asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&x[8])) : "r"(src_col + (unsigned int)(1024 + ((lane_chunk ^ 0) << 4))));
+                            asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&x[9])) : "r"(src_col + (unsigned int)(1152 + ((lane_chunk ^ 1) << 4))));
+                            asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&x[10])) : "r"(src_col + (unsigned int)(1280 + ((lane_chunk ^ 2) << 4))));
+                            asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&x[11])) : "r"(src_col + (unsigned int)(1408 + ((lane_chunk ^ 3) << 4))));
+                            asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&x[12])) : "r"(src_col + (unsigned int)(1536 + ((lane_chunk ^ 4) << 4))));
+                            asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&x[13])) : "r"(src_col + (unsigned int)(1664 + ((lane_chunk ^ 5) << 4))));
+                            asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&x[14])) : "r"(src_col + (unsigned int)(1792 + ((lane_chunk ^ 6) << 4))));
+                            asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&x[15])) : "r"(src_col + (unsigned int)(1920 + ((lane_chunk ^ 7) << 4))));
+                        }
                         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&y[0])) : "r"(src_col + (unsigned int)(2048 + ((lane_chunk ^ 0) << 4))));
                         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&y[1])) : "r"(src_col + (unsigned int)(2176 + ((lane_chunk ^ 1) << 4))));
                         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&y[2])) : "r"(src_col + (unsigned int)(2304 + ((lane_chunk ^ 2) << 4))));
@@ -1483,6 +1493,9 @@ kernel_cake_dense_projection_gemm_d384571ea88c28e40e31(const __grid_constant__ C
                         tmem_st_x8_u32(a_col + 424, (const uint32_t*)pm);
                         tmem_st_x8_u32(a_col + 456, (const uint32_t*)pl);
                         mbarrier_wait(b_full_addr + (b_stage_2) * 8, _phase_b_full);
+                        if (elect_sync()) {
+                            mbarrier_arrive(b_read_addr + (b_stage_2) * 8);
+                        }
                         asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                         asm volatile("tcgen05.fence::before_thread_sync;");
                         if (elect_sync()) {
