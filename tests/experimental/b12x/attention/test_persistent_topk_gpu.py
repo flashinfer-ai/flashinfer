@@ -152,3 +152,76 @@ def test_persistent_topk_multirow_eager_and_changed_graph_gpu(rows: int) -> None
     assert _allocator_counters(device) == before
     assert (output.data_ptr(), scratch.data_ptr()) == stable_ptrs
     _assert_exact(output, logits, lengths, page_table)
+
+
+def _tied_logits(pattern: str, rows: int, generator: torch.Generator) -> torch.Tensor:
+    if pattern == "all_tied":
+        return torch.zeros((rows, _WIDTH), dtype=torch.float32)
+    if pattern == "quantized":
+        return torch.randint(0, 4, (rows, _WIDTH), generator=generator).to(
+            torch.float32
+        )
+    return (torch.randn((rows, _WIDTH), generator=generator) * 4).half().float()
+
+
+def _lowest_column_reference(
+    logits: torch.Tensor, lengths: torch.Tensor, page_table: torch.Tensor
+) -> torch.Tensor:
+    columns = torch.arange(_WIDTH, dtype=torch.int64, device=logits.device)
+    masked = torch.where(
+        columns.unsqueeze(0) < lengths.unsqueeze(1),
+        logits,
+        torch.full_like(logits, float("-inf")),
+    )
+    order = torch.argsort(-masked, dim=1, stable=True)[:, :_TOPK]
+    return torch.gather(page_table, 1, order)
+
+
+@pytest.mark.parametrize("rows", (1, 3))
+@pytest.mark.parametrize("pattern", ("all_tied", "quantized", "fp16_rounded"))
+def test_persistent_topk_pivot_ties_select_lowest_columns_gpu(
+    rows: int, pattern: str
+) -> None:
+    """Pivot ties resolve to the lowest logical columns, identically on every launch."""
+    device = torch.device("cuda")
+    generator = torch.Generator(device="cpu").manual_seed(91_000 + rows)
+    logits = _tied_logits(pattern, rows, generator).to(device=device)
+    lengths = (
+        _WIDTH - 1 - torch.arange(rows, dtype=torch.int32, device=device) * 53
+    ).to(torch.int32)
+    logical = torch.arange(_WIDTH, dtype=torch.int32, device=device)
+    page_table = torch.stack(
+        tuple(
+            torch.roll(logical, shifts=row * 31) + row * 100_000 for row in range(rows)
+        )
+    )
+
+    columns = torch.arange(_WIDTH, device=device)
+    masked = torch.where(
+        columns.unsqueeze(0) < lengths.unsqueeze(1),
+        logits,
+        torch.full_like(logits, float("-inf")),
+    )
+    kth = torch.topk(masked, _TOPK, dim=1).values[:, -1:]
+    slots_at_pivot = _TOPK - (masked > kth).sum(dim=1)
+    ties_at_pivot = (masked == kth).sum(dim=1)
+    if pattern == "fp16_rounded":
+        assert bool((ties_at_pivot == slots_at_pivot).all().item())
+    else:
+        assert bool((ties_at_pivot > slots_at_pivot).all().item())
+
+    expected = _lowest_column_reference(logits, lengths, page_table)
+    expected_sets = [set(expected[row].tolist()) for row in range(rows)]
+    first: torch.Tensor | None = None
+    for _ in range(8):
+        output = run_persistent_topk2048(
+            logits, lengths, page_table_1=page_table, max_seq_len=_WIDTH, topk=_TOPK
+        )
+        torch.cuda.synchronize(device)
+        assert bool((output >= 0).all().item())
+        for row in range(rows):
+            assert set(output[row].tolist()) == expected_sets[row]
+        sorted_output = torch.sort(output, dim=1).values
+        if first is None:
+            first = sorted_output
+        assert torch.equal(sorted_output, first)
