@@ -1717,30 +1717,41 @@ def test_router_units_policy(monkeypatch):
         assert cake_backend.router_units("kn", arch=arch, sm_count=sms, **fwd) is None
     # weight gradient at T = 16231 (508 K blocks), inside the token windows (test_router_wgrad_token_windows):
     # sm_100a hidden 4096 "H1x5p44" (44 head units, then 5 tail units per CTA pair), hidden 5120 "H0.5x3" on sm_100a /
-    # sm_103a (76 head + 228 tail units) and "H0.5x4" on sm_107a (108 head + 432 tail units on 216 SMs; 106 + 424 on
-    # 212 and 104 + 416 on 208, ROUTER_RULES_BY_SM); hidden 6144, sm_103a hidden 4096 and sm_107a hidden 4096: the
-    # deterministic plan
-    for arch in ("sm_100a", "sm_103a"):
-        assert cake_backend.ROUTER_RULES[(arch, "nn_t", 6144, 256)] is None
-        assert (
-            cake_backend.router_units(
-                "nn_t", arch=arch, sm_count=152, M=6144, N=256, K=16231
-            )
-            is None
+    # sm_103a (76 head + 228 tail units), sm_103a hidden 6144 "H1x5p44" and "H0.5x4" on sm_107a (108 head + 432 tail
+    # units on 216 SMs; 106 + 424 on 212 and 104 + 416 on 208, ROUTER_RULES_BY_SM); sm_100a hidden 6144, sm_103a
+    # hidden 4096 (its window starts at 20480 tokens) and sm_107a hidden 4096: the deterministic plan
+    assert cake_backend.ROUTER_RULES[("sm_100a", "nn_t", 6144, 256)] is None
+    assert (
+        cake_backend.router_units(
+            "nn_t", arch="sm_100a", sm_count=152, M=6144, N=256, K=16231
         )
+        is None
+    )
+    assert cake_backend.ROUTER_RULES[("sm_103a", "nn_t", 6144, 256)] == (
+        (16172, 20480, "H1x5p44"),
+    )
+    assert cake_backend.router_partition(
+        "nn_t", arch="sm_103a", sm_count=152, M=6144, N=256, K=16231
+    ) == (44 + 5 * 76, 22, round(24 * 508 * 44 / 76))
     assert cake_backend.ROUTER_RULES[("sm_100a", "nn_t", 4096, 256)] == (
         (10240, 16384, "H1x5p44"),
     )
     assert cake_backend.router_partition(
         "nn_t", arch="sm_100a", sm_count=152, M=4096, N=256, K=16231
     ) == (44 + 5 * 76, 22, round(16 * 508 * 44 / 76))
-    assert cake_backend.ROUTER_RULES[("sm_103a", "nn_t", 4096, 256)] is None
+    assert cake_backend.ROUTER_RULES[("sm_103a", "nn_t", 4096, 256)] == (
+        (20480, 49152, "H1x4p44"),
+    )
     assert (
         cake_backend.router_partition(
             "nn_t", arch="sm_103a", sm_count=152, M=4096, N=256, K=16231
         )
         is None
     )
+    # sm_103a hidden 4096 at 20480 tokens (640 K blocks): 44 head units, then four tail units per CTA pair
+    assert cake_backend.router_partition(
+        "nn_t", arch="sm_103a", sm_count=152, M=4096, N=256, K=20480
+    ) == (44 + 4 * 76, 22, round(16 * 640 * 44 / 76))
     for arch in ("sm_100a", "sm_103a"):
         assert cake_backend.router_partition(
             "nn_t", arch=arch, sm_count=152, **wgrad5120
@@ -1869,13 +1880,16 @@ def test_router_units_policy(monkeypatch):
 ROUTER_WGRAD_WINDOWS = {
     ("sm_100a", 4096): ((10240, 16384, "H1x5p44"),),
     ("sm_100a", 5120): ((1, 128, "waves"), (10240, 32768, "H0.5x3")),
+    ("sm_103a", 4096): ((20480, 49152, "H1x4p44"),),
     ("sm_103a", 5120): ((1, 192, "waves"), (16172, 32768, "H0.5x3")),
+    ("sm_103a", 6144): ((16172, 20480, "H1x5p44"),),
     ("sm_107a", 5120): ((16172, 16384, "H0.5x4"),),
 }
 # the parts with a router table of their own (ROUTER_RULES_BY_SM) and their weight-gradient windows,
 # (arch, sm_count, hidden) -> ((first, last, spec), ...)
-ROUTER_BY_SM_PARTS = {("sm_107a", 208), ("sm_107a", 212)}
+ROUTER_BY_SM_PARTS = {("sm_103a", 148), ("sm_107a", 208), ("sm_107a", 212)}
 ROUTER_WGRAD_WINDOWS_BY_SM = {
+    ("sm_103a", 148, 5120): ((32768, 32768, "H0.5x3"),),
     ("sm_107a", 208, 5120): ((16172, 16384, "H0.5x4"),),
     ("sm_107a", 212, 5120): ((16172, 16384, "H0.5x4"),),
 }
@@ -1987,6 +2001,58 @@ def test_router_per_sm_count_tables_decide_only_their_own_sm_count(monkeypatch):
     assert cake_backend.router_partition(
         "nn_t", arch="sm_107a", sm_count=216, **wgrad
     ) == (540, 54, 24 * 508 // 2)
+
+
+def test_router_sm_103a_head_tail_windows_and_the_148_sm_table():
+    """The sm_103a weight gradient (256 experts).  On 152 SMs hidden 4096 runs "H1x4p44" (44 head and 304 tail units)
+    at 20480 to 49152 tokens and hidden 6144 "H1x5p44" (44 head and 380 tail units) at 16172 to 20480 tokens, the
+    deterministic program one token outside.  A 148-SM part takes its own table: hidden 5120 runs "H0.5x3" (74 head
+    and 222 tail units) at exactly 32768 tokens; the 152-SM windows and every other row run the deterministic program
+    there (on 148 SMs "waves" gives the deterministic program for hidden 5120 at every token count, so the table needs
+    no "waves" window).  One SM more or fewer than 148 or 152: the deterministic program."""
+
+    def part(sms, hidden, T):
+        return cake_backend.router_partition(
+            "nn_t", arch="sm_103a", sm_count=sms, M=hidden, N=256, K=T
+        )
+
+    # 152 SMs (ROUTER_RULES)
+    for T, k_iters in ((20480, 640), (24576, 768), (49152, 1536)):
+        assert part(152, 4096, T) == (
+            44 + 4 * 76,
+            22,
+            round(16 * k_iters * 44 / 76),
+        )
+    for T, k_iters in ((16172, 506), (16384, 512), (20480, 640)):
+        assert part(152, 6144, T) == (
+            44 + 5 * 76,
+            22,
+            round(24 * k_iters * 44 / 76),
+        )
+    for hidden, T in ((4096, 20479), (4096, 49153), (6144, 16171), (6144, 20481)):
+        assert part(152, hidden, T) is None, (hidden, T)
+    # 148 SMs (ROUTER_RULES_BY_SM): every row of ROUTER_RULES has an entry, only hidden 5120 a window
+    table = cake_backend.ROUTER_RULES_BY_SM[("sm_103a", 148)]
+    assert cake_backend.router_rules("sm_103a", 148) == (table, True)
+    assert set(table) == {k for k in cake_backend.ROUTER_RULES if k[0] == "sm_103a"}
+    for key, rule in table.items():
+        want = (
+            ((32768, 32768, "H0.5x3"),)
+            if key == ("sm_103a", "nn_t", 5120, 256)
+            else None
+        )
+        assert rule == want, key
+    assert part(148, 5120, 32768) == (74 + 3 * 74, 37, 20 * 1024 // 2)
+    for T in (64, 128, 192, 16172, 16384, 24576, 32767, 32769, 65536):
+        assert part(148, 5120, T) is None, T
+    for hidden, T in ((4096, 20480), (4096, 49152), (6144, 16172), (6144, 20480)):
+        assert part(148, hidden, T) is None, (hidden, T)
+    for T in (2, 64, 192, 32768):
+        assert cake_backend.router_waves(20, 2, -(-T // 32), 148) is None
+    # no table of their own: the head/tail windows hold on neither
+    for sms in (147, 149, 151, 153):
+        for hidden, T in ((4096, 20480), (5120, 32768), (6144, 16172)):
+            assert part(sms, hidden, T) is None, (sms, hidden, T)
 
 
 def test_k2_planner_plans_the_stream_k_router(monkeypatch):
@@ -2161,22 +2227,31 @@ ROUTER_SM_FACTS = (148, 152, 208, 212, 216)
 def test_k2_head_tail_program_of_each_architecture_and_sm_count():
     """With this checkout's registry and router tables, on every architecture and the SM counts of the measured parts,
     the weight gradient (256 experts, hidden 4096 / 5120 / 6144, token counts at and around the windows) runs the
-    head/tail program with the A parts in tensor memory exactly on sm_103a with 152 SMs, hidden 5120 and 16172 to
-    32768 tokens (the sm_103a head/tail window of ``ROUTER_RULES``); every other head/tail plan runs
-    ``router_fp32_gemm_atomic_nn_t_ht_c3_nreg``, and both carry the planner's partition.  The program is registered
-    for sm_103a only."""
+    head/tail program with the A parts in tensor memory exactly in the sm_103a head/tail windows (152 SMs, the
+    windows of ``ROUTER_RULES``: hidden 4096 at 20480 to 49152 tokens, hidden 5120 at 16172 to 32768, hidden 6144 at
+    16172 to 20480; 148 SMs, the table of ``ROUTER_RULES_BY_SM``: hidden 5120 at 32768); every other head/tail plan
+    runs ``router_fp32_gemm_atomic_nn_t_ht_c3_nreg``, and both carry the planner's partition.  The program is
+    registered for sm_103a only."""
     ts = cake_backend.ROUTER_HEAD_TAIL_TEMPLATES["sm_103a"]
     c3 = "router_fp32_gemm_atomic_nn_t" + cake_backend.ROUTER_HEAD_TAIL_SUFFIX
     assert [a for a, table in cake_jit.KERNELS.items() if ts in table] == ["sm_103a"]
     assert cake_jit.MODULES[cake_jit.select_module("sm_103a", ts)]["arches"] == [
         "sm_103a"
     ]
+    # the sm_103a head/tail windows, (sm_count, hidden) -> (first, last)
+    ts_windows = {
+        (152, 4096): (20480, 49152),
+        (152, 5120): (16172, 32768),
+        (152, 6144): (16172, 20480),
+        (148, 5120): (32768, 32768),
+    }
+    tokens = (8192, 10240, 16171, 16172, 16231, 16384, 16385, 20479, 20480, 24576)
     N, seen = 256, {}
     for arch in cake_jit.ARCHES:
         for sms in ROUTER_SM_FACTS:
             for hidden in (4096, 5120, 6144):
                 out = torch.empty(N, hidden)
-                for T in (8192, 10240, 16171, 16172, 16231, 16384, 16385, 32768, 32769):
+                for T in tokens + (24577, 32768, 32769, 49152, 49153):
                     # stride-0 views of the gradient [T, N] and the activations [T, hidden]: the layout classes of
                     # G.t() and X without their memory
                     G = torch.empty(1, N).expand(T, N)
@@ -2184,12 +2259,8 @@ def test_k2_head_tail_program_of_each_architecture_and_sm_count():
                     plan, _ = cake_backend.plan_atomic_router(
                         G.t(), X, out, arch=arch, sm_count=sms
                     )
-                    in_window = (
-                        arch == "sm_103a"
-                        and sms == 152
-                        and hidden == 5120
-                        and 16172 <= T <= 32768
-                    )
+                    first, last = ts_windows.get((sms, hidden), (1, 0))
+                    in_window = arch == "sm_103a" and first <= T <= last
                     if plan is None or not plan.head_spans:
                         assert not in_window, (arch, sms, hidden, T)
                         continue
@@ -2208,8 +2279,10 @@ def test_k2_head_tail_program_of_each_architecture_and_sm_count():
                     )
                     key = (arch, sms, plan.template)
                     seen[key] = seen.get(key, 0) + 1
-    # 16172, 16231, 16384, 16385 and 32768 tokens
-    assert seen.pop(("sm_103a", 152, ts)) == 5
+    # 152 SMs: hidden 4096 at 20480, 24576, 24577, 32768, 32769 and 49152 tokens, hidden 5120 at the nine counts from
+    # 16172 to 32768, hidden 6144 at the six counts from 16172 to 20480; 148 SMs: hidden 5120 at 32768
+    assert seen.pop(("sm_103a", 152, ts)) == 6 + 9 + 6
+    assert seen.pop(("sm_103a", 148, ts)) == 1
     assert seen and all(template == c3 for _, _, template in seen)
     assert {(arch, sms) for arch, sms, _ in seen} == {
         ("sm_100a", 152),
@@ -3210,6 +3283,7 @@ def test_k2_memo_under_concurrent_table_changes(monkeypatch):
 # ROUTER_RULES_BY_SM on 208-SM and 212-SM R200 parts
 ROUTER_TABLE_PARTS = (
     ("sm_100a", 152),
+    ("sm_103a", 148),
     ("sm_103a", 152),
     ("sm_107a", 208),
     ("sm_107a", 212),
@@ -4578,10 +4652,22 @@ def _top8_rows_differ(out, ref, tie_ulps=16):
     return int(differ.sum()), int(tie.sum())
 
 
-@pytest.mark.parametrize("T", [16172, 16231, 32768])
-def test_gpu_router_tmem_head_tail_program_on_152_sm_sm_103a(T):
-    """On a 152-SM sm_103a part the default plan of the hidden-5120 weight gradient in its head/tail window runs the
-    head/tail program with the A parts in tensor memory (``ROUTER_HEAD_TAIL_TEMPLATES``) and meets the gate of
+@pytest.mark.parametrize(
+    "hidden, T",
+    [
+        (5120, 16172),
+        (5120, 16231),
+        (5120, 32768),
+        (4096, 20480),
+        (4096, 49152),
+        (6144, 16172),
+        (6144, 20480),
+    ],
+)
+def test_gpu_router_tmem_head_tail_program_on_152_sm_sm_103a(hidden, T):
+    """On a 152-SM sm_103a part the default plan of the weight gradient in its head/tail windows (hidden 4096, 5120
+    and 6144, at the first and the last token count of each window) runs the head/tail program with the A parts in
+    tensor memory (``ROUTER_HEAD_TAIL_TEMPLATES``) and meets the gate of
     :func:`test_gpu_router_d11_gate` over ``RERUNS`` launches into a NaN-poisoned ``out``: finite, within the
     reordering bound of the K-order sum of the deterministic program's one-split partials of its segments, relative
     Frobenius error against FP64 at most ``ROUTER_REL_FRO_MAX``.  On whole tiles (one unit per tile) it stores the bits
@@ -4595,7 +4681,7 @@ def test_gpu_router_tmem_head_tail_program_on_152_sm_sm_103a(T):
     c3 = "router_fp32_gemm_atomic_nn_t" + cake_backend.ROUTER_HEAD_TAIL_SUFFIX
     _require_template(arch, ts)
     _require_template(arch, c3)
-    X, W, G = _router_inputs(T, device, SEED + 30, K=5120)
+    X, W, G = _router_inputs(T, device, SEED + 30, K=hidden)
     A, B, out = _router_case("wgrad", X, W, G)
     plan, reason = cake_backend.plan_atomic_router(
         A, B, out, arch=arch, sm_count=sm_count
@@ -4913,8 +4999,8 @@ def test_gpu_router_rows_without_a_verdict_run_the_deterministic_program_unplann
 
 def test_gpu_router_verdicts_set_at_run_time_are_seen(monkeypatch):
     """The convenience path keeps whether a router row has a verdict (per device and view geometry) and whether any
-    router table gives the forward one until a router table changes: on a row without a verdict the forward and the
-    weight gradient give the deterministic program's bits (unplanned, also on the second call, from the memo); a
+    router table gives the forward one until a router table changes: on a row without a verdict at the call's token
+    count the forward and the weight gradient give the deterministic program's bits (unplanned, also on the second call, from the memo); a
     verdict set at run time in the table of the device's SM count runs this package's program at the next call,
     without clearing a cache, and its removal the deterministic program again."""
     device, arch = _atomic_device_or_skip()
@@ -4923,10 +5009,14 @@ def test_gpu_router_verdicts_set_at_run_time_are_seen(monkeypatch):
     if table is cake_backend.ROUTER_RULES:
         # a verdict of ROUTER_RULES applies on this device whatever its SM count
         monkeypatch.setitem(cake_backend.ROUTER_SM_COUNT, arch, sm_count)
-    hidden, T = 6144, 1000  # no verdict on any architecture
+    hidden, T = 6144, 1000  # no verdict at 1000 tokens on any architecture
     X, W, G = _router_inputs(T, device, SEED + 26, K=hidden)
     keys = {"fwd": (arch, "kk", hidden, 256), "wgrad": (arch, "nn_t", hidden, 256)}
-    assert all(table.get(k) is None for k in keys.values())
+    for layout, M, K in (("kk", T, hidden), ("nn_t", hidden, T)):
+        spec = cake_backend._router_rule_spec(
+            layout, arch=arch, sm_count=sm_count, M=M, N=256, K=K
+        )
+        assert spec is None, layout
     cake_backend.clear_convenience_caches()
     want_fwd = det_backend.router_fp32_det_gemm(
         X, W.t(), torch.empty(T, 256, device=device)
@@ -4980,7 +5070,7 @@ def test_gpu_router_deterministic_program_through_the_binding():
     rows' launches are carved again with the same bits; another stream binds an arena of its own; a binding the
     deterministic package refuses raises its error."""
     device, arch = _atomic_device_or_skip()
-    hidden = 6144  # no router verdict on any architecture
+    hidden = 6144  # no router verdict below 16172 tokens on any architecture
     cake_backend.clear_convenience_caches()
 
     def check(T, seed, pad_out=False, pad_g=False):
@@ -5049,7 +5139,7 @@ def test_gpu_router_binding_pdl_waits_for_an_early_producer():
     reads both; each starts while its predecessor runs and must still read every value it wrote.  The flag is bound
     into the cached argument lists (a key per flag), and every launch gives the deterministic package's bits."""
     device, arch = _atomic_device_or_skip()
-    hidden, T = 6144, 4096  # no router verdict on any architecture
+    hidden, T = 6144, 4096  # no router verdict at 4096 tokens on any architecture
     X, W, _ = _router_inputs(T, device, SEED + 80, K=hidden)
     cake_backend.clear_convenience_caches()
     want_y = det_backend.router_det_forward(X, W, enable_pdl=False)
