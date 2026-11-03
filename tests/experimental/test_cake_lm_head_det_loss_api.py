@@ -472,11 +472,14 @@ def test_public_api_temperature_refuses_keep_logits(monkeypatch):
 
 
 def test_public_api_temperature_with_deterministic_false(monkeypatch):
-    """The det-free entries with ``deterministic=False``: the non-deterministic package has no temperature path, so
-    ``chunked_lm_head_logprob`` raises ``ValueError`` (not ``TypeError``) for a temperature other than ``None`` or a
-    scalar whose FP32 value is 1.0, before either package is reached; those two run the package's call without a
-    temperature.  Under torch's deterministic algorithms the call runs the deterministic entry, which gets the
-    temperature.  ``chunked_lm_head_preload(temperature=True)`` follows the same rule."""
+    """The det-free entries with ``deterministic=False``: ``chunked_lm_head_logprob`` passes a temperature other than
+    ``None`` or a scalar whose FP32 value is 1.0 to the non-deterministic package's temperature entry (the opt-in
+    module's with ``memory_mode`` or ``num_valid_rows``) unchanged, and refuses a ``bool`` with ``ValueError`` before
+    either package is reached; ``None`` and those scalars run the package's call without a temperature.  Under
+    torch's deterministic algorithms the call runs the deterministic entry, which gets the temperature.
+    ``chunked_lm_head_preload(temperature=True)`` passes the flag to the non-deterministic package's preload.
+    ``deterministic=True`` (the default) with a temperature still calls the deterministic entry, with the same
+    temperature object, and never the non-deterministic package."""
     _clear(monkeypatch)
     nd_calls, det_calls = [], []
 
@@ -496,16 +499,42 @@ def test_public_api_temperature_with_deterministic_false(monkeypatch):
     monkeypatch.setattr(public, "_DET_FALLBACK_WARNED", set())
     X, W, labels = _host_call()
     tau = torch.full((X.shape[0],), 0.7)
-    nd_only = "deterministic=False\\) takes no temperature"
-    for temperature in (0.7, 2, 1.0 + 1e-6, tau, torch.tensor(1.0), True):
+    for temperature in (0.7, 2, 1.0 + 1e-6, tau, torch.tensor(1.0)):
         for opt_in in ({}, {"memory_mode": "budget"}):
-            with pytest.raises(ValueError, match=nd_only):
-                public.chunked_lm_head_logprob(
-                    X, W, labels, deterministic=False, temperature=temperature, **opt_in
-                )
-    with pytest.raises(ValueError, match=nd_only):
-        public.chunked_lm_head_preload("cuda:0", deterministic=False, temperature=True)
-    assert not nd_calls and not det_calls
+            got = public.chunked_lm_head_logprob(
+                X,
+                W,
+                labels,
+                deterministic=False,
+                temperature=temperature,
+                check_temperature=True,
+                **opt_in,
+            )
+            assert got == "chunked_lm_head_logprob_temperature"
+            ((_, args, kw),) = nd_calls
+            nd_calls.clear()
+            assert args == (X, W, labels) and kw["deterministic"] is False
+            assert kw["temperature"] is temperature and kw["check_temperature"] is True
+            assert kw.get("memory_mode") == opt_in.get("memory_mode")
+    with pytest.raises(ValueError, match="not a bool"):
+        public.chunked_lm_head_logprob(
+            X, W, labels, deterministic=False, temperature=True
+        )
+    public.chunked_lm_head_preload("cuda:0", deterministic=False, temperature=True)
+    assert nd_calls == [("preload", ("cuda:0",), {"temperature": True})]
+    nd_calls.clear()
+    assert not det_calls
+    # deterministic=True (default) with a temperature: the deterministic entry, the same temperature object
+    got = public.chunked_lm_head_logprob(
+        X, W, labels, temperature=tau, check_temperature=True
+    )
+    assert got == "det"
+    ((name, args, kw),) = det_calls
+    det_calls.clear()
+    assert name == "logprob" and args == (X, W, labels)
+    assert kw["temperature"] is tau and kw["check_temperature"] is True
+    assert sorted(kw) == ["check_temperature", "temperature"]
+    assert not nd_calls
     # None and the scalars whose FP32 value is 1.0 are the call without a temperature
     for temperature in (None, 1.0, 1, 1.0 + 1e-9):
         got = public.chunked_lm_head_logprob(
