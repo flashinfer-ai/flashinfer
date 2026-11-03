@@ -1170,12 +1170,14 @@ def _plan(
     }
     # the saved-state path exists on the segmented route only (the serial route has no segment states)
     # an in-kernel Q/K L2 norm mode launches no gate epilogue: its GLM intra programs write the gate gradients
-    # themselves on every architecture (:func:`_gate_fused`)
+    # themselves on every architecture (:func:`_gate_fused`); the l2n keyword (:func:`_l2n_kw`) goes through an
+    # untyped reference, as in the deterministic package's ``_select_record``
+    select: Callable[..., str | None] = cake_jit.select_record
     records = {
         path: {
             stage: None
             if l2n != "off" and stage == "gate_epilogue"
-            else cake_jit.select_record(
+            else select(
                 stage, **scalars, arch=arch, path=path, gate=gate, **_l2n_kw(l2n)
             )
             for stage in _PATH_STAGES[path]
