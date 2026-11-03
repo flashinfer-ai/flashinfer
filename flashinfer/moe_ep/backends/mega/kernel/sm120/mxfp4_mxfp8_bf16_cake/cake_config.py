@@ -33,122 +33,12 @@ TransportTableSpec = Union[str, tuple]
 
 
 @dataclass
-class Sm120_Mxfp4_Mxfp8_Bf16_Cake_MegaMoeConfig:
-    """Static model parameters of the Cake persistent MegaMoE kernel.
+class Sm120CakeMegaMoeConfigBase:
+    """Fields and validation shared by the Cake SM120 MegaMoE configs.
 
-    ``intermediate_size`` is the post-SwiGLU width (``2 * intermediate_size``
-    gate+up rows are consumed per expert).  ``top_k`` routes per token.
-
-    ``shared_expert``:
-
-    * ``None`` (default): routed top-k sum only; the caller adds the shared
-      expert (``noshared`` kernel variant).
-    * ``"fp8_in_kernel"``: the kernel also evaluates one shared expert on
-      FP8 e4m3 weights and adds it to the output (``fp8shared`` variant).
-      Requires the shared-expert weights in the weight pack
-      (:class:`CakePrequantizedMoEWeightsWithSharedExpert`).
-
-    ``transport_table`` selects, per pair of EP ranks, how the kernel moves
-    dispatch payloads and expert results: ``SELF`` (same rank), ``LSA``
-    (load/store over NVLink or PCIe peer mappings, driven by copier CTAs) or
-    ``GIN`` (NCCL GPU-initiated networking puts).  Every pair that is LSA
-    reachable may use either; pairs on different hosts use GIN.
-
-    * ``"all_gin"`` (default): every remote pair uses GIN; the kernel runs its
-      copier-free schedule instances (no SM is reserved for copies).
-    * ``"all_lsa"`` / ``"lsa_where_reachable"``: a fixed table with LSA cells.
-      Any LSA cell selects the copier instances, which reserve one copier CTA
-      per LSA destination of a rank (the largest LSA count of any table row,
-      compiled in as ``MOE_LSA_COPIERS``); each copier pushes the dispatch
-      payload and the expert results of its destination with TMA bulk copies.
-    * a flat tuple of ``world_size * world_size`` cells (``0`` SELF on the
-      diagonal, ``1`` LSA, ``2`` GIN, symmetric): an explicit table, validated
-      against the measured LSA reachability and GIN availability, e.g. LSA only
-      between the two GPUs behind one PCIe switch.
-    * ``"tuned"``: the table recorded for this deployment (GPU, geometry, variant,
-      row capacity and peer topology) by the offline tuner
-      ``python -m flashinfer.moe_ep.tune --dtype sm120_mxfp4_mxfp8 ...`` in the moe_ep
-      knob cache (``FLASHINFER_MOE_EP_KNOB_CACHE``); ``all_gin`` when nothing is
-      recorded.  Resolved once at workspace creation (rank 0 reads, broadcasts).
-    * ``"auto"``: a setup-time probe scores the candidate tables (``all_gin``,
-      ``all_lsa``, ``lsa_where_reachable``, ``lsa_where_faster``) under a
-      concurrent all-to-all and keeps a mixed table only when it reproducibly
-      beats the best uniform one by 3 %.  The choice is made by rank 0 and
-      broadcast; ``transport_probe_report`` on the workspace records it.  Near a
-      decision margin the probe may pick different tables on different launches,
-      so production deployments should pin the table (or use the tuned table,
-      see ``flashinfer.moe_ep.tune --dtype sm120_mxfp4_mxfp8``).
-
-    Shapes: the device code is one parametric source compiled per deployment.  EP world
-    size comes from :class:`~flashinfer.moe_ep.config.BootstrapConfig`; the global expert
-    count, hidden size and ``max_tokens_per_rank`` from
-    :class:`~flashinfer.moe_ep.config.FleetParams`; ``intermediate_size``, ``top_k`` and
-    the variant from this config.  Supported region (checked in ``validate_init``, the
-    same guards the source enforces at compile time): EP world size 2..32,
-    ``num_experts % world_size == 0``
-    with at most 128 experts per rank and 1024 in total, ``hidden_size`` a multiple of
-    512 up to 7680, ``intermediate_size`` a multiple of 128, ``top_k`` from 1 to 16; the
-    kernel's row capacity is ``max_tokens_per_rank`` rounded up to 128 (at most 32640).
-    Above 16 EP ranks ``validate_init`` also compiles the device instances and rejects
-    parameter sets whose build spills registers.
-
-    ``codec_overflow_blocks`` (compile-time): the expert results return through a
-    lossless BF16 block codec (64-value blocks, 96 B coded or 128 B raw); each
-    return chunk reserves room for ``rows * codec_overflow_blocks`` raw blocks.
-    A chunk that needs more sets the kernel's ``protocol_error`` flag and that call's
-    output is not valid.  The flag is per call (cleared by the next launch) and the
-    forward path does not read it: check it with the backend's
-    ``protocol_error(workspace)`` (a host synchronization) after a call when needed,
-    and discard the workspace after a call that set it.
-    Default 16 (25 % of a row at ``hidden_size=4096``, 14 % at 7168;
-    real DeepSeek-V4 activations need ~0.3 %); 16..256.  Each extra block costs
-    ``128 * max_tokens_per_rank * top_k`` bytes per peer and ring slot of
-    symmetric memory.  Used by ``return_codec="bf16"`` only: with ``"int8"`` the device
-    build always uses the default (the value has no effect there, so it does not
-    create a separate build).
-
-    ``return_codec`` (compile-time) selects the wire format of the expert results:
-
-    * ``"bf16"`` (default): the lossless BF16 codec above; the output is the
-      slot-ordered fp32 sum of the exact BF16 expert results.
-    * ``"int8"``: every 64-value block of an expert result travels as 64 int8
-      codes plus one BF16 scale ``s = max(bf16(amax / 127), 2^-126)`` (the floor keeps
-      the scale of an all-zero block normal); the receiver sums
-      ``q * s`` in fp32 (the same order and rounding as ``"bf16"``).  A route
-      costs ``hidden_size * 66 / 64`` bytes (5280 B at ``hidden_size=5120``, against
-      ``hidden_size * 98 / 64`` plus overflow for ``"bf16"``), there is no overflow
-      area and no overflow failure mode, and the result windows shrink accordingly.
-      Each returned value carries an absolute error of at most ``s / 2`` (about
-      0.4 % of its block's largest magnitude).  Use it where the return wire is
-      the bottleneck (PCIe-only hosts, GIN across hosts).
-
-    Numerics: MXFP8 E4M3 activations (UE8M0 K32 scales) x MXFP4 E2M1 routed weights,
-    SwiGLU ``silu(gate) * up``, FP8 requant of the intermediate, BF16 output; no expert
-    biases.  ``swiglu_limit`` (a compile-time parameter of the device build) clamps the
-    SwiGLU inputs to ``gate <= L`` and ``-L <= up <= L`` before the activation:
-    ``10`` (default) is the DeepSeek-V4 clamp, ``0`` is standard unclamped SwiGLU
-    (DeepSeek-V3, Qwen3).
-
-    ``activation`` (compile-time) selects the gated activation applied after the clamp,
-    with the parameter names of the other moe_ep MegaMoE backends:
-
-    * ``"swiglu"`` (default): ``silu(gate) * up``; with ``swiglu_alpha`` and
-      ``swiglu_beta`` set (together) ``gate * sigmoid(swiglu_alpha * gate) * (up + swiglu_beta)``
-      (GPT-OSS / MiniMax-M3: ``swiglu_alpha=1.702, swiglu_beta=1.0``, with ``swiglu_limit``
-      as the clamp, e.g. 7).
-    * ``"situ"``: ``situ_beta * tanh(gate / situ_beta) * sigmoid(gate)`` times ``up``, or
-      with ``situ_linear_beta`` times ``situ_linear_beta * tanh(up / situ_linear_beta)``
-      (Kimi-K3).  SiTU takes no clamp: pass ``swiglu_limit=0``.
-
-    The float parameters are compiled in 1/1000 steps: exact multiples of 0.001 up to
-    1000, positive except ``swiglu_beta`` (>= 0).  The in-kernel shared expert uses the
-    same activation.
-
-    EPLB: pass ``num_experts`` = physical experts (logical experts plus redundant
-    replicas, divisible by the EP world size) and physical expert ids in ``topk_ids``;
-    each rank's weight pack holds its ``num_experts // world_size`` physical experts
-    (replicas carry a copy of their logical expert's weights).  The logical-to-physical
-    choice stays with the router.
+    Not a backend config itself: use :class:`Sm120_Mxfp4_Mxfp8_Bf16_Cake_MegaMoeConfig` (W4A8) or
+    ``Sm120_Nvfp4_Nvfp4_Bf16_Cake_MegaMoeConfig`` (NVFP4 W4A4).  The two are siblings, so an
+    ``isinstance`` check on either one does not match the other.
     """
 
     intermediate_size: int = 2048
@@ -284,7 +174,130 @@ class Sm120_Mxfp4_Mxfp8_Bf16_Cake_MegaMoeConfig:
         )
 
 
+@dataclass
+class Sm120_Mxfp4_Mxfp8_Bf16_Cake_MegaMoeConfig(Sm120CakeMegaMoeConfigBase):
+    """Static model parameters of the Cake persistent MegaMoE kernel.
+
+    ``intermediate_size`` is the post-SwiGLU width (``2 * intermediate_size``
+    gate+up rows are consumed per expert).  ``top_k`` routes per token.
+
+    ``shared_expert``:
+
+    * ``None`` (default): routed top-k sum only; the caller adds the shared
+      expert (``noshared`` kernel variant).
+    * ``"fp8_in_kernel"``: the kernel also evaluates one shared expert on
+      FP8 e4m3 weights and adds it to the output (``fp8shared`` variant).
+      Requires the shared-expert weights in the weight pack
+      (:class:`CakePrequantizedMoEWeightsWithSharedExpert`).
+
+    ``transport_table`` selects, per pair of EP ranks, how the kernel moves
+    dispatch payloads and expert results: ``SELF`` (same rank), ``LSA``
+    (load/store over NVLink or PCIe peer mappings, driven by copier CTAs) or
+    ``GIN`` (NCCL GPU-initiated networking puts).  Every pair that is LSA
+    reachable may use either; pairs on different hosts use GIN.
+
+    * ``"all_gin"`` (default): every remote pair uses GIN; the kernel runs its
+      copier-free schedule instances (no SM is reserved for copies).
+    * ``"all_lsa"`` / ``"lsa_where_reachable"``: a fixed table with LSA cells.
+      Any LSA cell selects the copier instances, which reserve one copier CTA
+      per LSA destination of a rank (the largest LSA count of any table row,
+      compiled in as ``MOE_LSA_COPIERS``); each copier pushes the dispatch
+      payload and the expert results of its destination with TMA bulk copies.
+    * a flat tuple of ``world_size * world_size`` cells (``0`` SELF on the
+      diagonal, ``1`` LSA, ``2`` GIN, symmetric): an explicit table, validated
+      against the measured LSA reachability and GIN availability, e.g. LSA only
+      between the two GPUs behind one PCIe switch.
+    * ``"tuned"``: the table recorded for this deployment (GPU, geometry, variant,
+      row capacity and peer topology) by the offline tuner
+      ``python -m flashinfer.moe_ep.tune --dtype sm120_mxfp4_mxfp8 ...`` in the moe_ep
+      knob cache (``FLASHINFER_MOE_EP_KNOB_CACHE``); ``all_gin`` when nothing is
+      recorded.  Resolved once at workspace creation (rank 0 reads, broadcasts).
+    * ``"auto"``: a setup-time probe scores the candidate tables (``all_gin``,
+      ``all_lsa``, ``lsa_where_reachable``, ``lsa_where_faster``) under a
+      concurrent all-to-all and keeps a mixed table only when it reproducibly
+      beats the best uniform one by 3 %.  The choice is made by rank 0 and
+      broadcast; ``transport_probe_report`` on the workspace records it.  Near a
+      decision margin the probe may pick different tables on different launches,
+      so production deployments should pin the table (or use the tuned table,
+      see ``flashinfer.moe_ep.tune --dtype sm120_mxfp4_mxfp8``).
+
+    Shapes: the device code is one parametric source compiled per deployment.  EP world
+    size comes from :class:`~flashinfer.moe_ep.config.BootstrapConfig`; the global expert
+    count, hidden size and ``max_tokens_per_rank`` from
+    :class:`~flashinfer.moe_ep.config.FleetParams`; ``intermediate_size``, ``top_k`` and
+    the variant from this config.  Supported region (checked in ``validate_init``, the
+    same guards the source enforces at compile time): EP world size 2..32,
+    ``num_experts % world_size == 0``
+    with at most 128 experts per rank and 1024 in total, ``hidden_size`` a multiple of
+    512 up to 7680, ``intermediate_size`` a multiple of 128, ``top_k`` from 1 to 16; the
+    kernel's row capacity is ``max_tokens_per_rank`` rounded up to 128 (at most 32640).
+    Above 16 EP ranks ``validate_init`` also compiles the device instances and rejects
+    parameter sets whose build spills registers.
+
+    ``codec_overflow_blocks`` (compile-time): the expert results return through a
+    lossless BF16 block codec (64-value blocks, 96 B coded or 128 B raw); each
+    return chunk reserves room for ``rows * codec_overflow_blocks`` raw blocks.
+    A chunk that needs more sets the kernel's ``protocol_error`` flag and that call's
+    output is not valid.  The flag is per call (cleared by the next launch) and the
+    forward path does not read it: check it with the backend's
+    ``protocol_error(workspace)`` (a host synchronization) after a call when needed,
+    and discard the workspace after a call that set it.
+    Default 16 (25 % of a row at ``hidden_size=4096``, 14 % at 7168;
+    real DeepSeek-V4 activations need ~0.3 %); 16..256.  Each extra block costs
+    ``128 * max_tokens_per_rank * top_k`` bytes per peer and ring slot of
+    symmetric memory.  Used by ``return_codec="bf16"`` only: with ``"int8"`` the device
+    build always uses the default (the value has no effect there, so it does not
+    create a separate build).
+
+    ``return_codec`` (compile-time) selects the wire format of the expert results:
+
+    * ``"bf16"`` (default): the lossless BF16 codec above; the output is the
+      slot-ordered fp32 sum of the exact BF16 expert results.
+    * ``"int8"``: every 64-value block of an expert result travels as 64 int8
+      codes plus one BF16 scale ``s = max(bf16(amax / 127), 2^-126)`` (the floor keeps
+      the scale of an all-zero block normal); the receiver sums
+      ``q * s`` in fp32 (the same order and rounding as ``"bf16"``).  A route
+      costs ``hidden_size * 66 / 64`` bytes (5280 B at ``hidden_size=5120``, against
+      ``hidden_size * 98 / 64`` plus overflow for ``"bf16"``), there is no overflow
+      area and no overflow failure mode, and the result windows shrink accordingly.
+      Each returned value carries an absolute error of at most ``s / 2`` (about
+      0.4 % of its block's largest magnitude).  Use it where the return wire is
+      the bottleneck (PCIe-only hosts, GIN across hosts).
+
+    Numerics: MXFP8 E4M3 activations (UE8M0 K32 scales) x MXFP4 E2M1 routed weights,
+    SwiGLU ``silu(gate) * up``, FP8 requant of the intermediate, BF16 output; no expert
+    biases.  ``swiglu_limit`` (a compile-time parameter of the device build) clamps the
+    SwiGLU inputs to ``gate <= L`` and ``-L <= up <= L`` before the activation:
+    ``10`` (default) is the DeepSeek-V4 clamp, ``0`` is standard unclamped SwiGLU
+    (DeepSeek-V3, Qwen3).
+
+    ``activation`` (compile-time) selects the gated activation applied after the clamp,
+    with the parameter names of the other moe_ep MegaMoE backends:
+
+    * ``"swiglu"`` (default): ``silu(gate) * up``; with ``swiglu_alpha`` and
+      ``swiglu_beta`` set (together) ``gate * sigmoid(swiglu_alpha * gate) * (up + swiglu_beta)``
+      (GPT-OSS / MiniMax-M3: ``swiglu_alpha=1.702, swiglu_beta=1.0``, with ``swiglu_limit``
+      as the clamp, e.g. 7).
+    * ``"situ"``: ``situ_beta * tanh(gate / situ_beta) * sigmoid(gate)`` times ``up``, or
+      with ``situ_linear_beta`` times ``situ_linear_beta * tanh(up / situ_linear_beta)``
+      (Kimi-K3).  SiTU takes no clamp: pass ``swiglu_limit=0``.
+
+    The float parameters are compiled in 1/1000 steps: exact multiples of 0.001 up to
+    1000, positive except ``swiglu_beta`` (>= 0).  The in-kernel shared expert uses the
+    same activation.
+
+    EPLB: pass ``num_experts`` = physical experts (logical experts plus redundant
+    replicas, divisible by the EP world size) and physical expert ids in ``topk_ids``;
+    each rank's weight pack holds its ``num_experts // world_size`` physical experts
+    (replicas carry a copy of their logical expert's weights).  The logical-to-physical
+    choice stays with the router.
+    """
+
+    kernel_name: str = "sm120_mxfp4_mxfp8_bf16_cake"
+
+
 __all__ = [
+    "Sm120CakeMegaMoeConfigBase",
     "CODEC_OVERFLOW_BLOCKS_DEFAULT",
     "CODEC_OVERFLOW_BLOCKS_RANGE",
     "RETURN_CODECS",

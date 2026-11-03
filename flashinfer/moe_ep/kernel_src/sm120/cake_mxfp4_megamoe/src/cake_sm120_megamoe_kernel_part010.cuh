@@ -1808,6 +1808,10 @@
                         {
                             if (map_dst_lsa != 0) {
                                 atomicMax(&protocol_error[0], 1);
+#elif (MOE_INSTANCE == 3 && (MOE_SW_POLICY_EP == 16 && (MOE_SW_WATCH_WIDE == 0 && (MOE_SW_ROLE_PEER_FOLD == 1 && (MOE_SW_RETURN_INT8 == 0 && (MOE_SW_WIDE_RANKS == 1 || (MOE_SW_WIDE_RANKS == 0 && MOE_SHARED_EXPERT == 0))))))) // moe-select
+#include "cake_sm120_megamoe_kernel_part004.cuh"
+#elif (MOE_INSTANCE == 3 && (MOE_SW_POLICY_EP == 16 && (MOE_SW_WATCH_WIDE == 0 && (MOE_SW_WIDE_RANKS == 1 || (MOE_SW_WIDE_RANKS == 0 && (MOE_SW_ROLE_PEER_FOLD == 1 && MOE_SHARED_EXPERT == 0)))))) // moe-select
+#include "cake_sm120_megamoe_kernel_part015.cuh"
 #elif (MOE_INSTANCE == 0 && (MOE_SW_WIDE_RANKS == 0 && (MOE_SW_ROLE_WARP_FOLD == 1 && (MOE_SW_ROLE_PEER_FOLD == 0 && MOE_SW_RETURN_INT8 == 0)))) // moe-select
                         }
                     } else {
@@ -2108,314 +2112,6 @@
                                         }
                                     }
                                 }
-#elif (MOE_INSTANCE == 0 && (MOE_SW_WIDE_RANKS == 0 && (MOE_SW_ROLE_WARP_FOLD == 1 && MOE_SW_ROLE_PEER_FOLD == 0))) // moe-select
-                        }
-                    } else {
-                        if (warp == 11 && lane == 4) {
-                            int sp_records = source_record_counts[rank];
-                            int _max_3f95d2 = (((sp_records + 8 - 1) / 8) > (dispatch_chunk_min_records) ? ((sp_records + 8 - 1) / 8) : (dispatch_chunk_min_records));
-                            int sp_q = _max_3f95d2;
-                            int sp_chunks = (sp_records + sp_q - 1) / sp_q;
-                            #pragma unroll 1
-                            for (int sp_chunk = 0; sp_chunk < sp_chunks; sp_chunk++) {
-                                {
-                                    unsigned int* _gca_p = reinterpret_cast<unsigned int*>(dispatch_chunk_scatter_counter) + (rank * 8 + sp_chunk);
-                                    while (true) {
-                                        unsigned int _gca_v;
-                                        asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_gca_v) : "l"(_gca_p) : "memory");
-                                        if (_gca_v >= (unsigned int)(dispatch_chunk_targets[rank * 8 + sp_chunk])) break;
-                                    }
-                                }
-                            }
-                            {
-                                unsigned int* _gc_p = reinterpret_cast<unsigned int*>(result_owner_progress) + (rank);
-                                unsigned int _gc_old;
-                                asm volatile("atom.release.gpu.global.add.u32 %0, [%1], 1;" : "=r"(_gc_old) : "l"(_gc_p) : "memory");
-                            }
-                            int sp_idx = 0;
-                            #pragma unroll 1
-                            for (int sp_iter = 0; sp_iter < MOE_X_1b61f2e4e4; sp_iter++) {
-                                int sp_ready = 0;
-                                unsigned long long sp_wait_t0 = 0;
-                                while (1) {
-                                    unsigned int _load_acquire_360280y;
-                                    asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_load_acquire_360280y) : "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(pr_gq_ctl)) + (1))) : "memory");
-                                    int sp_done = _load_acquire_360280y;
-                                    unsigned int _load_acquire_933ae6y;
-                                    asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_load_acquire_933ae6y) : "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(pr_gq_ctl)) + (0))) : "memory");
-                                    int sp_tail = _load_acquire_933ae6y;
-                                    if (sp_tail > sp_idx) {
-                                        sp_ready = 1;
-                                        break;
-                                    }
-                                    if (sp_done != 0) {
-                                        break;
-                                    }
-                                    unsigned long long gtimer_0_c4e315y_13;
-                                    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(gtimer_0_c4e315y_13) :: "memory");
-                                    unsigned long long wd_now_99fb2cy_12 = gtimer_0_c4e315y_13;
-                                    unsigned long long wd_t0_3a450e = sp_wait_t0;
-                                    if (sp_wait_t0 == 0) {
-                                        wd_t0_3a450e = wd_now_99fb2cy_12;
-                                    }
-                                    if (wd_now_99fb2cy_12 - wd_t0_3a450e > 600000000000) {
-                                        asm volatile("trap;" ::: "memory");
-                                    }
-                                    sp_wait_t0 = wd_t0_3a450e;
-                                }
-                                if (sp_ready == 0) {
-                                    break;
-                                }
-                                __threadfence_block();
-                                int sp_chunk_id = pr_gq[sp_idx];
-                                sp_idx += 1;
-                                if (sp_chunk_id / MOE_X_caa68debd6 == rank) {
-                                    {
-                                        unsigned int* _gc_p = reinterpret_cast<unsigned int*>(result_owner_progress) + (rank);
-                                        unsigned int _gc_old;
-                                        asm volatile("atom.release.gpu.global.add.u32 %0, [%1], 1;" : "=r"(_gc_old) : "l"(_gc_p) : "memory");
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                __syncwarp();
-            }
-        }
-        if (warp >= 1 && warp < (unsigned int)world_size) {
-            int map_source = (unsigned int)rank + warp;
-            if (map_source >= world_size) {
-                map_source = map_source - world_size;
-            }
-            int map_dst_lsa = 1;
-            if ((int)peer_transport[rank * world_size + map_source] == 2) {
-                map_dst_lsa = 0;
-            }
-            if (elect_sync()) {
-                int pr_cnt[1];
-                pr_cnt[0] = 0;
-                int map_records = source_record_counts[map_source];
-                int _max_6e6450 = (((map_records + 8 - 1) / 8) > (dispatch_chunk_min_records) ? ((map_records + 8 - 1) / 8) : (dispatch_chunk_min_records));
-                int map_q = _max_6e6450;
-                int map_chunks = (map_records + map_q - 1) / map_q;
-                #pragma unroll 1
-                for (int map_chunk = 0; map_chunk < map_chunks; map_chunk++) {
-                    {
-                        unsigned int* _gca_p = reinterpret_cast<unsigned int*>(dispatch_chunk_scatter_counter) + (map_source * 8 + map_chunk);
-                        while (true) {
-                            unsigned int _gca_v;
-                            asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_gca_v) : "l"(_gca_p) : "memory");
-                            if (_gca_v >= (unsigned int)(dispatch_chunk_targets[map_source * 8 + map_chunk])) break;
-                        }
-                    }
-                }
-                int _max_81cadb = ((source_route_counts[map_source]) > (0) ? (source_route_counts[map_source]) : (0));
-                int _min_9e4e87x = ((_max_81cadb) < (MOE_X_7830131351) ? (_max_81cadb) : (MOE_X_7830131351));
-                int map_routes = _min_9e4e87x;
-                int _max_6b25c1 = ((map_routes) > (1) ? (map_routes) : (1));
-                int map_count = _max_6b25c1;
-                unsigned long long map_local_byte = (unsigned long long)(map_source * 2 + slot) * (unsigned long long)MOE_X_51dea414ef + (unsigned long long)MOE_X_3296bcaabb;
-                unsigned long long map_remote_byte = (unsigned long long)(rank * 2 + slot) * (unsigned long long)MOE_X_51dea414ef + (unsigned long long)MOE_X_3296bcaabb;
-                {
-                    if (map_dst_lsa != 0) {
-                        {
-                            unsigned long long pr_nbytes = (unsigned long long)(map_count * 4 + 15) / 16 * 16;
-                            unsigned long long pr_base = lsa_peer_ptrs[5 * world_size + map_source];
-                            int pr_nblk = (int)((pr_nbytes + (unsigned long long)MOE_X_d21107c6b0) / (unsigned long long)MOE_X_16a8c0b8b4);
-                            #pragma unroll 1
-                            for (int pr_b = 0; pr_b < pr_nblk; pr_b++) {
-                                int pr_n = pr_cnt[0];
-                                int pr_s = warp * 2 + (unsigned int)(pr_n & 1);
-                                unsigned long long pr_off = (unsigned long long)pr_b * (unsigned long long)MOE_X_16a8c0b8b4;
-                                unsigned long long _min_fb5f0b = ((pr_nbytes - pr_off) < (MOE_X_16a8c0b8b4) ? (pr_nbytes - pr_off) : (MOE_X_16a8c0b8b4));
-                                unsigned long long pr_len = _min_fb5f0b;
-                                if (pr_n >= 2) {
-                                    asm volatile("cp.async.bulk.wait_group.read 1;");
-                                }
-                                mbarrier_arrive_expect_tx(pr_full_addr + (pr_s) * 8, (int)pr_len);
-                                cp_async_bulk_gmem2smem(pr_stage_addr + (unsigned int)(pr_s * MOE_X_16a8c0b8b4), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(reinterpret_cast<uint8_t*>(result_out)) + ((unsigned long long)(map_local_byte + pr_off) * (unsigned long long)1)), (int)pr_len, pr_full_addr + (pr_s) * 8);
-                                mbarrier_wait(pr_full_addr + (pr_s) * 8, pr_n >> 1 & 1);
-                                asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                                {
-                                    void* _cpbulk_dst_142d08 = reinterpret_cast<void*>(reinterpret_cast<uint8_t*>(pr_base + map_remote_byte + pr_off));
-                                    asm volatile(
-                                        "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
-                                        :: "l"(_cpbulk_dst_142d08), "r"(pr_stage_addr + (unsigned int)(pr_s * MOE_X_16a8c0b8b4)), "r"((uint32_t)((int)pr_len))
-                                        : "memory");
-                                }
-                                asm volatile("cp.async.bulk.commit_group;");
-                                pr_cnt[0] = pr_n + 1;
-                            }
-                            asm volatile("cp.async.bulk.wait_group 0;");
-                            asm volatile("fence.proxy.async;");
-                            __threadfence_system();
-                        }
-                    }
-                }
-                __threadfence_system();
-                if ((int)peer_transport[rank * world_size + map_source] == 2) {
-                    // gin_put_signal_add: strong remote completion on context 0
-                    {
-                        ncclGin __gin{*(gin_dev_comm), (int)(0)};
-                        __gin.put(ncclTeamWorld(*(gin_dev_comm)), (int)(map_source), result_inbox_gwin_window, (size_t)(map_remote_byte), result_out_gwin_window, (size_t)(map_local_byte), (size_t)(map_count * 4),
-                            ncclGin_StrongSignalAdd{(ncclGinSignal_t)(MOE_X_96e08f30e3 + rank), (uint64_t)(1)}, ncclGin_None{}, ncclCoopThread(), ncclGin_None{}, cuda::thread_scope_thread, cuda::thread_scope_device);
-                    }
-                } else {
-                    unsigned long long lsa_dst_b04e28 = lsa_peer_ptrs[5 * world_size + map_source] + map_remote_byte;
-                    unsigned long long lsa_flag_dbe169 = lsa_peer_ptrs[8 * world_size + map_source];
-                    unsigned int* lsa_remote_f8bacay_1 = reinterpret_cast<unsigned int*>(lsa_flag_dbe169);
-                    int lsa_channel_fe4879 = MOE_X_25bb534aec + (MOE_X_96e08f30e3 + rank);
-                    int lsa_state_index_85375e = (map_source * MOE_X_5fc76dab52 + lsa_channel_fe4879) * 2;
-                    unsigned int* lsa_state_83c5a8y_1 = lsa_send_state + lsa_state_index_85375e;
-                    unsigned long long gtimer_0_00d6c0y_2;
-                    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(gtimer_0_00d6c0y_2) :: "memory");
-                    unsigned long long lsa_start_c47806y_1 = gtimer_0_00d6c0y_2;
-                    unsigned int lsa_busy_c43afby_1 = 1;
-                    while (lsa_busy_c43afby_1 != 0) {
-                        uint32_t _atomic_cas_old_04259cy_1 = atomicCAS(reinterpret_cast<unsigned int*>(lsa_state_83c5a8y_1), static_cast<unsigned int>(0), static_cast<unsigned int>(1));
-                        lsa_busy_c43afby_1 = _atomic_cas_old_04259cy_1;
-                        if (lsa_busy_c43afby_1 != 0) {
-                            unsigned long long gtimer_1_ee26c6y_2;
-                            asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(gtimer_1_ee26c6y_2) :: "memory");
-                            if (gtimer_1_ee26c6y_2 - lsa_start_c47806y_1 > 600000000000) {
-                                asm volatile("trap;" ::: "memory");
-                            }
-                        }
-                    }
-                    __threadfence();
-                    uint8_t* lsa_pd_b3ef0ey_1 = reinterpret_cast<uint8_t*>(lsa_dst_b04e28);
-                    uint8_t* lsa_ps_490965 = reinterpret_cast<uint8_t*>(result_out + map_local_byte);
-                    if (((lsa_dst_b04e28 | (unsigned long long)result_out + map_local_byte) & 3) == 0) {
-                        unsigned int* lsa_pd32_10981dy_1 = reinterpret_cast<unsigned int*>(lsa_pd_b3ef0ey_1);
-                        unsigned int* lsa_ps32_8f09c0y_1 = reinterpret_cast<unsigned int*>(lsa_ps_490965);
-                        {
-                            int _max_a12c7f = ((1) > (1) ? (1) : (1));
-                            #pragma unroll 1
-                            for (int lsa_i_603fa4y_1 = 0; lsa_i_603fa4y_1 < _max_a12c7f; lsa_i_603fa4y_1++) {
-                                lsa_pd32_10981dy_1[lsa_i_603fa4y_1] = lsa_ps32_8f09c0y_1[lsa_i_603fa4y_1];
-                            }
-                        }
-                        #pragma unroll 4
-                        for (int lsa_tail_680f43y = 0; lsa_tail_680f43y < 4; lsa_tail_680f43y++) {
-                            if (lsa_tail_680f43y < 0) {
-                                unsigned long long lsa_tail_index_f8358c = 4 + lsa_tail_680f43y;
-                                lsa_pd_b3ef0ey_1[lsa_tail_index_f8358c] = lsa_ps_490965[lsa_tail_index_f8358c];
-                            }
-                        }
-                    } else if (1) {
-                        int _max_e8c8d8 = ((1) > (4) ? (1) : (4));
-                        #pragma unroll 1
-                        for (int lsa_byte_2aaaa1y_1 = 0; lsa_byte_2aaaa1y_1 < _max_e8c8d8; lsa_byte_2aaaa1y_1++) {
-                            lsa_pd_b3ef0ey_1[lsa_byte_2aaaa1y_1] = lsa_ps_490965[lsa_byte_2aaaa1y_1];
-                        }
-                    }
-                    unsigned int lsa_seq_84b040y_1 = lsa_state_83c5a8y_1[1] + 1;
-                    lsa_state_83c5a8y_1[1] = lsa_seq_84b040y_1;
-                    asm volatile("st.release.sys.global.u32 [%0], %1;" :: "l"(reinterpret_cast<unsigned int*>(lsa_remote_f8bacay_1 + (lsa_channel_fe4879 * 32))), "r"(static_cast<unsigned int>(lsa_seq_84b040y_1)) : "memory");
-                    asm volatile("st.release.gpu.global.u32 [%0], %1;" :: "l"(reinterpret_cast<unsigned int*>(lsa_state_83c5a8y_1)), "r"(static_cast<unsigned int>(0)) : "memory");
-                }
-                int h29_idx = 0;
-                #pragma unroll 1
-                for (int h29_iter = 0; h29_iter < MOE_X_1b61f2e4e4; h29_iter++) {
-                    int h29_ready = 0;
-                    unsigned long long h29_wait_t0 = 0;
-                    while (1) {
-                        int h29_done = 0;
-                        int h29_tail_seen = 0;
-                        {
-                            unsigned int _load_acquire_82a81by;
-                            asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_load_acquire_82a81by) : "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(pr_gq_ctl)) + (1))) : "memory");
-                            h29_done = (int)_load_acquire_82a81by;
-                            unsigned int _load_acquire_97aad4y;
-                            asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_load_acquire_97aad4y) : "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(pr_gq_ctl)) + (0))) : "memory");
-                            h29_tail_seen = (int)_load_acquire_97aad4y;
-                        }
-                        if (h29_tail_seen > h29_idx) {
-                            h29_ready = 1;
-                            break;
-                        }
-                        if (h29_done != 0) {
-                            break;
-                        }
-                        unsigned long long gtimer_0_c4e315y_14;
-                        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(gtimer_0_c4e315y_14) :: "memory");
-                        unsigned long long wd_now_99fb2cy_13 = gtimer_0_c4e315y_14;
-                        unsigned long long wd_t0_36c7fb = h29_wait_t0;
-                        if (h29_wait_t0 == 0) {
-                            wd_t0_36c7fb = wd_now_99fb2cy_13;
-                        }
-                        if (wd_now_99fb2cy_13 - wd_t0_36c7fb > 600000000000) {
-                            asm volatile("trap;" ::: "memory");
-                        }
-                        h29_wait_t0 = wd_t0_36c7fb;
-                    }
-                    if (h29_ready == 0) {
-                        break;
-                    }
-                    __threadfence_block();
-                    int h29_chunk = 0;
-                    {
-                        h29_chunk = pr_gq[h29_idx];
-                    }
-                    h29_idx += 1;
-                    atomicMax(&svc_qctl[3 + warp], h29_idx);
-                    int h29_source = h29_chunk / MOE_X_caa68debd6;
-                    if (h29_source == map_source) {
-                        int h29_chunk_local = h29_chunk - h29_source * MOE_X_caa68debd6;
-                        int _max_967b9a = ((source_route_counts[h29_source]) > (0) ? (source_route_counts[h29_source]) : (0));
-                        int _min_30de52x = ((_max_967b9a) < (MOE_X_7830131351) ? (_max_967b9a) : (MOE_X_7830131351));
-                        int h29_routes = _min_30de52x;
-                        int h29_pq = 128;
-                        if (h29_routes >= 768 && h29_routes < 768 || h29_routes >= 8192) {
-                            h29_pq = 64;
-                        }
-                        if (h29_routes < 768) {
-                            h29_pq = 32;
-                        }
-                        int _max_a86984 = (((h29_routes + h29_pq - 1) / h29_pq - 1) > (0) ? ((h29_routes + h29_pq - 1) / h29_pq - 1) : (0));
-                        int h29_pfull = _max_a86984;
-                        int h29_pts = h29_pfull * h29_pq;
-                        int h29_start = 0;
-                        int h29_cap = h29_pq;
-                        if (h29_chunk_local < h29_pfull) {
-                            h29_start = h29_chunk_local * h29_pq;
-                        } else {
-                            h29_start = h29_pts + (h29_chunk_local - h29_pfull) * 64;
-                            h29_cap = 64;
-                        }
-                        int _min_45345a = ((h29_routes - h29_start) < (h29_cap) ? (h29_routes - h29_start) : (h29_cap));
-                        int h29_chunk_rows = _min_45345a;
-                        int _atomic_old_7d39cb = atomicAdd(&result_ovf_cursor[h29_source * MOE_X_caa68debd6 + h29_chunk_local], 0);
-                        int h29_ovf = _atomic_old_7d39cb;
-                        unsigned long long h29_local_byte = (unsigned long long)(h29_source * 2 + slot) * (unsigned long long)MOE_X_51dea414ef + (unsigned long long)h29_start * (unsigned long long)MOE_X_efce35e873;
-                        unsigned long long h29_remote_byte = (unsigned long long)(rank * 2 + slot) * (unsigned long long)MOE_X_51dea414ef + (unsigned long long)h29_start * (unsigned long long)MOE_X_efce35e873;
-                        int _min_3be609 = ((h29_ovf) < (h29_chunk_rows * MOE_CODEC_OVF_BLOCKS) ? (h29_ovf) : (h29_chunk_rows * MOE_CODEC_OVF_BLOCKS));
-                        int h29_put_bytes = h29_chunk_rows * MOE_X_efce35e873 + _min_3be609 * 128;
-                        int _max_b65d03 = ((owner_route_counts[h29_source]) > (0) ? (owner_route_counts[h29_source]) : (0));
-                        int _min_532bb4x = ((_max_b65d03) < (MOE_X_7830131351) ? (_max_b65d03) : (MOE_X_7830131351));
-                        int c13a2_dual = (int)(h29_routes * MOE_X_4f81408915 >= collective_rows * MOE_X_474ae89bdd || h29_routes * MOE_X_4f81408915 >= collective_rows * MOE_X_fb8d28a056 && _min_532bb4x * MOE_X_4f81408915 >= collective_rows * MOE_X_474ae89bdd);
-                        {
-                            if (map_dst_lsa != 0) {
-                                {
-                                    int h29_nblk = (h29_put_bytes + 16384 - 1) / 16384;
-                                    {
-                                        unsigned int* _gca_p = reinterpret_cast<unsigned int*>(result_copy_done) + (h29_chunk);
-                                        while (true) {
-                                            unsigned int _gca_v;
-                                            asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_gca_v) : "l"(_gca_p) : "memory");
-                                            if (_gca_v >= (unsigned int)(h29_nblk)) break;
-                                        }
-                                    }
-                                }
-#elif (MOE_INSTANCE == 0 && (MOE_SW_WIDE_RANKS == 0 && (MOE_SW_TB_SCR_GLOBAL == 0 && (MOE_SW_TASK_GATE_U64 == 0 && MOE_SW_RETURN_INT8 == 0)))) // moe-select
-#include "cake_sm120_megamoe_kernel_part024.cuh"
-#elif (MOE_INSTANCE == 2 && (MOE_SW_WIDE_RANKS == 0 && (MOE_SW_TB_SCR_GLOBAL == 0 && (MOE_SW_TASK_GATE_U64 == 0 && (MOE_SW_ROLE_WARP_FOLD == 0 && MOE_SW_RETURN_INT8 == 0))))) // moe-select
-#include "cake_sm120_megamoe_kernel_part026.cuh"
-#elif (MOE_INSTANCE == 0 && (MOE_SW_POLICY_EP == 4 || MOE_SW_POLICY_EP == 8)) // moe-select
-#include "cake_sm120_megamoe_kernel_part025.cuh"
-#elif (MOE_INSTANCE == 2 && MOE_SW_ROLE_WARP_FOLD == 0) // moe-select
-#include "cake_sm120_megamoe_kernel_part027.cuh"
 #elif (MOE_INSTANCE == 3 && (MOE_SW_POLICY_EP == 16 && (MOE_SW_WIDE_RANKS == 0 && (MOE_SW_WATCH_WIDE == 1 && MOE_SW_RETURN_INT8 == 0)))) // moe-select
                         }
                     }
@@ -2721,6 +2417,306 @@
                         {
                             if (map_dst_lsa != 0) {
                                 atomicMax(&protocol_error[0], 1);
+#elif (MOE_INSTANCE == 0 && (MOE_SW_WIDE_RANKS == 0 && (MOE_SW_ROLE_WARP_FOLD == 1 && MOE_SW_ROLE_PEER_FOLD == 0))) // moe-select
+                        }
+                    } else {
+                        if (warp == 11 && lane == 4) {
+                            int sp_records = source_record_counts[rank];
+                            int _max_3f95d2 = (((sp_records + 8 - 1) / 8) > (dispatch_chunk_min_records) ? ((sp_records + 8 - 1) / 8) : (dispatch_chunk_min_records));
+                            int sp_q = _max_3f95d2;
+                            int sp_chunks = (sp_records + sp_q - 1) / sp_q;
+                            #pragma unroll 1
+                            for (int sp_chunk = 0; sp_chunk < sp_chunks; sp_chunk++) {
+                                {
+                                    unsigned int* _gca_p = reinterpret_cast<unsigned int*>(dispatch_chunk_scatter_counter) + (rank * 8 + sp_chunk);
+                                    while (true) {
+                                        unsigned int _gca_v;
+                                        asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_gca_v) : "l"(_gca_p) : "memory");
+                                        if (_gca_v >= (unsigned int)(dispatch_chunk_targets[rank * 8 + sp_chunk])) break;
+                                    }
+                                }
+                            }
+                            {
+                                unsigned int* _gc_p = reinterpret_cast<unsigned int*>(result_owner_progress) + (rank);
+                                unsigned int _gc_old;
+                                asm volatile("atom.release.gpu.global.add.u32 %0, [%1], 1;" : "=r"(_gc_old) : "l"(_gc_p) : "memory");
+                            }
+                            int sp_idx = 0;
+                            #pragma unroll 1
+                            for (int sp_iter = 0; sp_iter < MOE_X_1b61f2e4e4; sp_iter++) {
+                                int sp_ready = 0;
+                                unsigned long long sp_wait_t0 = 0;
+                                while (1) {
+                                    unsigned int _load_acquire_360280y;
+                                    asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_load_acquire_360280y) : "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(pr_gq_ctl)) + (1))) : "memory");
+                                    int sp_done = _load_acquire_360280y;
+                                    unsigned int _load_acquire_933ae6y;
+                                    asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_load_acquire_933ae6y) : "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(pr_gq_ctl)) + (0))) : "memory");
+                                    int sp_tail = _load_acquire_933ae6y;
+                                    if (sp_tail > sp_idx) {
+                                        sp_ready = 1;
+                                        break;
+                                    }
+                                    if (sp_done != 0) {
+                                        break;
+                                    }
+                                    unsigned long long gtimer_0_c4e315y_13;
+                                    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(gtimer_0_c4e315y_13) :: "memory");
+                                    unsigned long long wd_now_99fb2cy_12 = gtimer_0_c4e315y_13;
+                                    unsigned long long wd_t0_3a450e = sp_wait_t0;
+                                    if (sp_wait_t0 == 0) {
+                                        wd_t0_3a450e = wd_now_99fb2cy_12;
+                                    }
+                                    if (wd_now_99fb2cy_12 - wd_t0_3a450e > 600000000000) {
+                                        asm volatile("trap;" ::: "memory");
+                                    }
+                                    sp_wait_t0 = wd_t0_3a450e;
+                                }
+                                if (sp_ready == 0) {
+                                    break;
+                                }
+                                __threadfence_block();
+                                int sp_chunk_id = pr_gq[sp_idx];
+                                sp_idx += 1;
+                                if (sp_chunk_id / MOE_X_caa68debd6 == rank) {
+                                    {
+                                        unsigned int* _gc_p = reinterpret_cast<unsigned int*>(result_owner_progress) + (rank);
+                                        unsigned int _gc_old;
+                                        asm volatile("atom.release.gpu.global.add.u32 %0, [%1], 1;" : "=r"(_gc_old) : "l"(_gc_p) : "memory");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                __syncwarp();
+            }
+        }
+        if (warp >= 1 && warp < (unsigned int)world_size) {
+            int map_source = (unsigned int)rank + warp;
+            if (map_source >= world_size) {
+                map_source = map_source - world_size;
+            }
+            int map_dst_lsa = 1;
+            if ((int)peer_transport[rank * world_size + map_source] == 2) {
+                map_dst_lsa = 0;
+            }
+            if (elect_sync()) {
+                int pr_cnt[1];
+                pr_cnt[0] = 0;
+                int map_records = source_record_counts[map_source];
+                int _max_6e6450 = (((map_records + 8 - 1) / 8) > (dispatch_chunk_min_records) ? ((map_records + 8 - 1) / 8) : (dispatch_chunk_min_records));
+                int map_q = _max_6e6450;
+                int map_chunks = (map_records + map_q - 1) / map_q;
+                #pragma unroll 1
+                for (int map_chunk = 0; map_chunk < map_chunks; map_chunk++) {
+                    {
+                        unsigned int* _gca_p = reinterpret_cast<unsigned int*>(dispatch_chunk_scatter_counter) + (map_source * 8 + map_chunk);
+                        while (true) {
+                            unsigned int _gca_v;
+                            asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_gca_v) : "l"(_gca_p) : "memory");
+                            if (_gca_v >= (unsigned int)(dispatch_chunk_targets[map_source * 8 + map_chunk])) break;
+                        }
+                    }
+                }
+                int _max_81cadb = ((source_route_counts[map_source]) > (0) ? (source_route_counts[map_source]) : (0));
+                int _min_9e4e87x = ((_max_81cadb) < (MOE_X_7830131351) ? (_max_81cadb) : (MOE_X_7830131351));
+                int map_routes = _min_9e4e87x;
+                int _max_6b25c1 = ((map_routes) > (1) ? (map_routes) : (1));
+                int map_count = _max_6b25c1;
+                unsigned long long map_local_byte = (unsigned long long)(map_source * 2 + slot) * (unsigned long long)MOE_X_51dea414ef + (unsigned long long)MOE_X_3296bcaabb;
+                unsigned long long map_remote_byte = (unsigned long long)(rank * 2 + slot) * (unsigned long long)MOE_X_51dea414ef + (unsigned long long)MOE_X_3296bcaabb;
+                {
+                    if (map_dst_lsa != 0) {
+                        {
+                            unsigned long long pr_nbytes = (unsigned long long)(map_count * 4 + 15) / 16 * 16;
+                            unsigned long long pr_base = lsa_peer_ptrs[5 * world_size + map_source];
+                            int pr_nblk = (int)((pr_nbytes + (unsigned long long)MOE_X_d21107c6b0) / (unsigned long long)MOE_X_16a8c0b8b4);
+                            #pragma unroll 1
+                            for (int pr_b = 0; pr_b < pr_nblk; pr_b++) {
+                                int pr_n = pr_cnt[0];
+                                int pr_s = warp * 2 + (unsigned int)(pr_n & 1);
+                                unsigned long long pr_off = (unsigned long long)pr_b * (unsigned long long)MOE_X_16a8c0b8b4;
+                                unsigned long long _min_fb5f0b = ((pr_nbytes - pr_off) < (MOE_X_16a8c0b8b4) ? (pr_nbytes - pr_off) : (MOE_X_16a8c0b8b4));
+                                unsigned long long pr_len = _min_fb5f0b;
+                                if (pr_n >= 2) {
+                                    asm volatile("cp.async.bulk.wait_group.read 1;");
+                                }
+                                mbarrier_arrive_expect_tx(pr_full_addr + (pr_s) * 8, (int)pr_len);
+                                cp_async_bulk_gmem2smem(pr_stage_addr + (unsigned int)(pr_s * MOE_X_16a8c0b8b4), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(reinterpret_cast<uint8_t*>(result_out)) + ((unsigned long long)(map_local_byte + pr_off) * (unsigned long long)1)), (int)pr_len, pr_full_addr + (pr_s) * 8);
+                                mbarrier_wait(pr_full_addr + (pr_s) * 8, pr_n >> 1 & 1);
+                                asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                                {
+                                    void* _cpbulk_dst_142d08 = reinterpret_cast<void*>(reinterpret_cast<uint8_t*>(pr_base + map_remote_byte + pr_off));
+                                    asm volatile(
+                                        "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
+                                        :: "l"(_cpbulk_dst_142d08), "r"(pr_stage_addr + (unsigned int)(pr_s * MOE_X_16a8c0b8b4)), "r"((uint32_t)((int)pr_len))
+                                        : "memory");
+                                }
+                                asm volatile("cp.async.bulk.commit_group;");
+                                pr_cnt[0] = pr_n + 1;
+                            }
+                            asm volatile("cp.async.bulk.wait_group 0;");
+                            asm volatile("fence.proxy.async;");
+                            __threadfence_system();
+                        }
+                    }
+                }
+                __threadfence_system();
+                if ((int)peer_transport[rank * world_size + map_source] == 2) {
+                    // gin_put_signal_add: strong remote completion on context 0
+                    {
+                        ncclGin __gin{*(gin_dev_comm), (int)(0)};
+                        __gin.put(ncclTeamWorld(*(gin_dev_comm)), (int)(map_source), result_inbox_gwin_window, (size_t)(map_remote_byte), result_out_gwin_window, (size_t)(map_local_byte), (size_t)(map_count * 4),
+                            ncclGin_StrongSignalAdd{(ncclGinSignal_t)(MOE_X_96e08f30e3 + rank), (uint64_t)(1)}, ncclGin_None{}, ncclCoopThread(), ncclGin_None{}, cuda::thread_scope_thread, cuda::thread_scope_device);
+                    }
+                } else {
+                    unsigned long long lsa_dst_b04e28 = lsa_peer_ptrs[5 * world_size + map_source] + map_remote_byte;
+                    unsigned long long lsa_flag_dbe169 = lsa_peer_ptrs[8 * world_size + map_source];
+                    unsigned int* lsa_remote_f8bacay_1 = reinterpret_cast<unsigned int*>(lsa_flag_dbe169);
+                    int lsa_channel_fe4879 = MOE_X_25bb534aec + (MOE_X_96e08f30e3 + rank);
+                    int lsa_state_index_85375e = (map_source * MOE_X_5fc76dab52 + lsa_channel_fe4879) * 2;
+                    unsigned int* lsa_state_83c5a8y_1 = lsa_send_state + lsa_state_index_85375e;
+                    unsigned long long gtimer_0_00d6c0y_2;
+                    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(gtimer_0_00d6c0y_2) :: "memory");
+                    unsigned long long lsa_start_c47806y_1 = gtimer_0_00d6c0y_2;
+                    unsigned int lsa_busy_c43afby_1 = 1;
+                    while (lsa_busy_c43afby_1 != 0) {
+                        uint32_t _atomic_cas_old_04259cy_1 = atomicCAS(reinterpret_cast<unsigned int*>(lsa_state_83c5a8y_1), static_cast<unsigned int>(0), static_cast<unsigned int>(1));
+                        lsa_busy_c43afby_1 = _atomic_cas_old_04259cy_1;
+                        if (lsa_busy_c43afby_1 != 0) {
+                            unsigned long long gtimer_1_ee26c6y_2;
+                            asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(gtimer_1_ee26c6y_2) :: "memory");
+                            if (gtimer_1_ee26c6y_2 - lsa_start_c47806y_1 > 600000000000) {
+                                asm volatile("trap;" ::: "memory");
+                            }
+                        }
+                    }
+                    __threadfence();
+                    uint8_t* lsa_pd_b3ef0ey_1 = reinterpret_cast<uint8_t*>(lsa_dst_b04e28);
+                    uint8_t* lsa_ps_490965 = reinterpret_cast<uint8_t*>(result_out + map_local_byte);
+                    if (((lsa_dst_b04e28 | (unsigned long long)result_out + map_local_byte) & 3) == 0) {
+                        unsigned int* lsa_pd32_10981dy_1 = reinterpret_cast<unsigned int*>(lsa_pd_b3ef0ey_1);
+                        unsigned int* lsa_ps32_8f09c0y_1 = reinterpret_cast<unsigned int*>(lsa_ps_490965);
+                        {
+                            int _max_a12c7f = ((1) > (1) ? (1) : (1));
+                            #pragma unroll 1
+                            for (int lsa_i_603fa4y_1 = 0; lsa_i_603fa4y_1 < _max_a12c7f; lsa_i_603fa4y_1++) {
+                                lsa_pd32_10981dy_1[lsa_i_603fa4y_1] = lsa_ps32_8f09c0y_1[lsa_i_603fa4y_1];
+                            }
+                        }
+                        #pragma unroll 4
+                        for (int lsa_tail_680f43y = 0; lsa_tail_680f43y < 4; lsa_tail_680f43y++) {
+                            if (lsa_tail_680f43y < 0) {
+                                unsigned long long lsa_tail_index_f8358c = 4 + lsa_tail_680f43y;
+                                lsa_pd_b3ef0ey_1[lsa_tail_index_f8358c] = lsa_ps_490965[lsa_tail_index_f8358c];
+                            }
+                        }
+                    } else if (1) {
+                        int _max_e8c8d8 = ((1) > (4) ? (1) : (4));
+                        #pragma unroll 1
+                        for (int lsa_byte_2aaaa1y_1 = 0; lsa_byte_2aaaa1y_1 < _max_e8c8d8; lsa_byte_2aaaa1y_1++) {
+                            lsa_pd_b3ef0ey_1[lsa_byte_2aaaa1y_1] = lsa_ps_490965[lsa_byte_2aaaa1y_1];
+                        }
+                    }
+                    unsigned int lsa_seq_84b040y_1 = lsa_state_83c5a8y_1[1] + 1;
+                    lsa_state_83c5a8y_1[1] = lsa_seq_84b040y_1;
+                    asm volatile("st.release.sys.global.u32 [%0], %1;" :: "l"(reinterpret_cast<unsigned int*>(lsa_remote_f8bacay_1 + (lsa_channel_fe4879 * 32))), "r"(static_cast<unsigned int>(lsa_seq_84b040y_1)) : "memory");
+                    asm volatile("st.release.gpu.global.u32 [%0], %1;" :: "l"(reinterpret_cast<unsigned int*>(lsa_state_83c5a8y_1)), "r"(static_cast<unsigned int>(0)) : "memory");
+                }
+                int h29_idx = 0;
+                #pragma unroll 1
+                for (int h29_iter = 0; h29_iter < MOE_X_1b61f2e4e4; h29_iter++) {
+                    int h29_ready = 0;
+                    unsigned long long h29_wait_t0 = 0;
+                    while (1) {
+                        int h29_done = 0;
+                        int h29_tail_seen = 0;
+                        {
+                            unsigned int _load_acquire_82a81by;
+                            asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_load_acquire_82a81by) : "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(pr_gq_ctl)) + (1))) : "memory");
+                            h29_done = (int)_load_acquire_82a81by;
+                            unsigned int _load_acquire_97aad4y;
+                            asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_load_acquire_97aad4y) : "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(pr_gq_ctl)) + (0))) : "memory");
+                            h29_tail_seen = (int)_load_acquire_97aad4y;
+                        }
+                        if (h29_tail_seen > h29_idx) {
+                            h29_ready = 1;
+                            break;
+                        }
+                        if (h29_done != 0) {
+                            break;
+                        }
+                        unsigned long long gtimer_0_c4e315y_14;
+                        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(gtimer_0_c4e315y_14) :: "memory");
+                        unsigned long long wd_now_99fb2cy_13 = gtimer_0_c4e315y_14;
+                        unsigned long long wd_t0_36c7fb = h29_wait_t0;
+                        if (h29_wait_t0 == 0) {
+                            wd_t0_36c7fb = wd_now_99fb2cy_13;
+                        }
+                        if (wd_now_99fb2cy_13 - wd_t0_36c7fb > 600000000000) {
+                            asm volatile("trap;" ::: "memory");
+                        }
+                        h29_wait_t0 = wd_t0_36c7fb;
+                    }
+                    if (h29_ready == 0) {
+                        break;
+                    }
+                    __threadfence_block();
+                    int h29_chunk = 0;
+                    {
+                        h29_chunk = pr_gq[h29_idx];
+                    }
+                    h29_idx += 1;
+                    atomicMax(&svc_qctl[3 + warp], h29_idx);
+                    int h29_source = h29_chunk / MOE_X_caa68debd6;
+                    if (h29_source == map_source) {
+                        int h29_chunk_local = h29_chunk - h29_source * MOE_X_caa68debd6;
+                        int _max_967b9a = ((source_route_counts[h29_source]) > (0) ? (source_route_counts[h29_source]) : (0));
+                        int _min_30de52x = ((_max_967b9a) < (MOE_X_7830131351) ? (_max_967b9a) : (MOE_X_7830131351));
+                        int h29_routes = _min_30de52x;
+                        int h29_pq = 128;
+                        if (h29_routes >= 768 && h29_routes < 768 || h29_routes >= 8192) {
+                            h29_pq = 64;
+                        }
+                        if (h29_routes < 768) {
+                            h29_pq = 32;
+                        }
+                        int _max_a86984 = (((h29_routes + h29_pq - 1) / h29_pq - 1) > (0) ? ((h29_routes + h29_pq - 1) / h29_pq - 1) : (0));
+                        int h29_pfull = _max_a86984;
+                        int h29_pts = h29_pfull * h29_pq;
+                        int h29_start = 0;
+                        int h29_cap = h29_pq;
+                        if (h29_chunk_local < h29_pfull) {
+                            h29_start = h29_chunk_local * h29_pq;
+                        } else {
+                            h29_start = h29_pts + (h29_chunk_local - h29_pfull) * 64;
+                            h29_cap = 64;
+                        }
+                        int _min_45345a = ((h29_routes - h29_start) < (h29_cap) ? (h29_routes - h29_start) : (h29_cap));
+                        int h29_chunk_rows = _min_45345a;
+                        int _atomic_old_7d39cb = atomicAdd(&result_ovf_cursor[h29_source * MOE_X_caa68debd6 + h29_chunk_local], 0);
+                        int h29_ovf = _atomic_old_7d39cb;
+                        unsigned long long h29_local_byte = (unsigned long long)(h29_source * 2 + slot) * (unsigned long long)MOE_X_51dea414ef + (unsigned long long)h29_start * (unsigned long long)MOE_X_efce35e873;
+                        unsigned long long h29_remote_byte = (unsigned long long)(rank * 2 + slot) * (unsigned long long)MOE_X_51dea414ef + (unsigned long long)h29_start * (unsigned long long)MOE_X_efce35e873;
+                        int _min_3be609 = ((h29_ovf) < (h29_chunk_rows * MOE_CODEC_OVF_BLOCKS) ? (h29_ovf) : (h29_chunk_rows * MOE_CODEC_OVF_BLOCKS));
+                        int h29_put_bytes = h29_chunk_rows * MOE_X_efce35e873 + _min_3be609 * 128;
+                        int _max_b65d03 = ((owner_route_counts[h29_source]) > (0) ? (owner_route_counts[h29_source]) : (0));
+                        int _min_532bb4x = ((_max_b65d03) < (MOE_X_7830131351) ? (_max_b65d03) : (MOE_X_7830131351));
+                        int c13a2_dual = (int)(h29_routes * MOE_X_4f81408915 >= collective_rows * MOE_X_474ae89bdd || h29_routes * MOE_X_4f81408915 >= collective_rows * MOE_X_fb8d28a056 && _min_532bb4x * MOE_X_4f81408915 >= collective_rows * MOE_X_474ae89bdd);
+                        {
+                            if (map_dst_lsa != 0) {
+                                {
+                                    int h29_nblk = (h29_put_bytes + 16384 - 1) / 16384;
+                                    {
+                                        unsigned int* _gca_p = reinterpret_cast<unsigned int*>(result_copy_done) + (h29_chunk);
+                                        while (true) {
+                                            unsigned int _gca_v;
+                                            asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_gca_v) : "l"(_gca_p) : "memory");
+                                            if (_gca_v >= (unsigned int)(h29_nblk)) break;
+                                        }
+                                    }
+                                }
 #elif (MOE_INSTANCE == 3 && (MOE_SW_POLICY_EP == 16 && (MOE_SW_WIDE_RANKS == 0 && MOE_SW_WATCH_WIDE == 1))) // moe-select
                         }
                     }
@@ -3026,603 +3022,9 @@
                         {
                             if (map_dst_lsa != 0) {
                                 atomicMax(&protocol_error[0], 1);
-#elif (MOE_INSTANCE == 3 && (MOE_SW_POLICY_EP == 16 && (MOE_SW_WATCH_WIDE == 0 && (MOE_SW_ROLE_PEER_FOLD == 1 && (MOE_SW_RETURN_INT8 == 0 && (MOE_SW_WIDE_RANKS == 1 || (MOE_SW_WIDE_RANKS == 0 && MOE_SHARED_EXPERT == 0))))))) // moe-select
-#include "cake_sm120_megamoe_kernel_part004.cuh"
-#elif (MOE_INSTANCE == 3 && (MOE_SW_POLICY_EP == 16 && (MOE_SW_WATCH_WIDE == 0 && (MOE_SW_WIDE_RANKS == 1 || (MOE_SW_WIDE_RANKS == 0 && (MOE_SW_ROLE_PEER_FOLD == 1 && MOE_SHARED_EXPERT == 0)))))) // moe-select
-#include "cake_sm120_megamoe_kernel_part015.cuh"
-#elif (MOE_INSTANCE == 1 && (MOE_SW_WIDE_RANKS == 0 && (MOE_SW_WATCH_WIDE == 0 && (MOE_SW_TASK_GATE_U64 == 0 && MOE_SW_RETURN_INT8 == 0)))) // moe-select
-#include "cake_sm120_megamoe_kernel_part020.cuh"
-#elif (MOE_INSTANCE == 3 && (MOE_SW_WIDE_RANKS == 0 && (MOE_SW_TASK_GATE_U64 == 0 && (MOE_SW_ROLE_WARP_FOLD == 0 && MOE_SW_RETURN_INT8 == 0)))) // moe-select
-#include "cake_sm120_megamoe_kernel_part022.cuh"
-#elif (MOE_INSTANCE == 3 && (MOE_SW_WIDE_RANKS == 0 && (MOE_SW_ROLE_WARP_FOLD == 1 && (MOE_SW_ROLE_PEER_FOLD == 0 && MOE_SW_RETURN_INT8 == 0)))) // moe-select
-#include "cake_sm120_megamoe_kernel_part018.cuh"
-#elif (MOE_INSTANCE == 1 && (MOE_SW_POLICY_EP == 4 || MOE_SW_POLICY_EP == 8)) // moe-select
-#include "cake_sm120_megamoe_kernel_part021.cuh"
-#elif (MOE_INSTANCE == 3 && MOE_SW_ROLE_WARP_FOLD == 0) // moe-select
-#include "cake_sm120_megamoe_kernel_part023.cuh"
-#elif (MOE_INSTANCE == 3 && MOE_SW_ROLE_PEER_FOLD == 0) // moe-select
-#include "cake_sm120_megamoe_kernel_part019.cuh"
-#elif (MOE_INSTANCE == 2 && (MOE_SW_WIDE_RANKS == 0 && (MOE_SW_ROLE_PEER_FOLD == 0 && MOE_SW_RETURN_INT8 == 0))) // moe-select
-                        }
-                    } else {
-                        if (warp == 11 && lane == 4) {
-                            int sp_records = source_record_counts[rank];
-                            int _max_3f95d2 = (((sp_records + 8 - 1) / 8) > (dispatch_chunk_min_records) ? ((sp_records + 8 - 1) / 8) : (dispatch_chunk_min_records));
-                            int sp_q = _max_3f95d2;
-                            int sp_chunks = (sp_records + sp_q - 1) / sp_q;
-                            #pragma unroll 1
-                            for (int sp_chunk = 0; sp_chunk < sp_chunks; sp_chunk++) {
-                                {
-                                    unsigned int* _gca_p = reinterpret_cast<unsigned int*>(dispatch_chunk_scatter_counter) + (rank * 8 + sp_chunk);
-                                    while (true) {
-                                        unsigned int _gca_v;
-                                        asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_gca_v) : "l"(_gca_p) : "memory");
-                                        if (_gca_v >= (unsigned int)(dispatch_chunk_targets[rank * 8 + sp_chunk])) break;
-                                    }
-                                }
-                            }
-                            {
-                                unsigned int* _gc_p = reinterpret_cast<unsigned int*>(result_owner_progress) + (rank);
-                                unsigned int _gc_old;
-                                asm volatile("atom.release.gpu.global.add.u32 %0, [%1], 1;" : "=r"(_gc_old) : "l"(_gc_p) : "memory");
-                            }
-                            int sp_idx = 0;
-                            #pragma unroll 1
-                            for (int sp_iter = 0; sp_iter < MOE_X_1b61f2e4e4; sp_iter++) {
-                                int sp_ready = 0;
-                                unsigned long long sp_wait_t0 = 0;
-                                while (1) {
-                                    unsigned int _load_acquire_360280y;
-                                    asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_load_acquire_360280y) : "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(pr_gq_ctl)) + (1))) : "memory");
-                                    int sp_done = _load_acquire_360280y;
-                                    unsigned int _load_acquire_933ae6y;
-                                    asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_load_acquire_933ae6y) : "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(pr_gq_ctl)) + (0))) : "memory");
-                                    int sp_tail = _load_acquire_933ae6y;
-                                    if (sp_tail > sp_idx) {
-                                        sp_ready = 1;
-                                        break;
-                                    }
-                                    if (sp_done != 0) {
-                                        break;
-                                    }
-                                    unsigned long long gtimer_0_c4e315y_12;
-                                    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(gtimer_0_c4e315y_12) :: "memory");
-                                    unsigned long long wd_now_99fb2cy_11 = gtimer_0_c4e315y_12;
-                                    unsigned long long wd_t0_3a450e = sp_wait_t0;
-                                    if (sp_wait_t0 == 0) {
-                                        wd_t0_3a450e = wd_now_99fb2cy_11;
-                                    }
-                                    if (wd_now_99fb2cy_11 - wd_t0_3a450e > 600000000000) {
-                                        asm volatile("trap;" ::: "memory");
-                                    }
-                                    sp_wait_t0 = wd_t0_3a450e;
-                                }
-                                if (sp_ready == 0) {
-                                    break;
-                                }
-                                __threadfence_block();
-                                int sp_chunk_id = pr_gq[sp_idx];
-                                sp_idx += 1;
-                                if (sp_chunk_id / MOE_X_caa68debd6 == rank) {
-                                    {
-                                        unsigned int* _gc_p = reinterpret_cast<unsigned int*>(result_owner_progress) + (rank);
-                                        unsigned int _gc_old;
-                                        asm volatile("atom.release.gpu.global.add.u32 %0, [%1], 1;" : "=r"(_gc_old) : "l"(_gc_p) : "memory");
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                __syncwarp();
-            }
-        }
-        if (warp >= 1 && warp < (unsigned int)world_size) {
-            int map_source = (unsigned int)rank + warp;
-            if (map_source >= world_size) {
-                map_source = map_source - world_size;
-            }
-            int map_dst_lsa = 1;
-            if ((int)peer_transport[rank * world_size + map_source] == 2) {
-                map_dst_lsa = 0;
-            }
-            if (elect_sync()) {
-                int pr_cnt[1];
-                pr_cnt[0] = 0;
-                int map_records = source_record_counts[map_source];
-                int _max_6e6450 = (((map_records + 8 - 1) / 8) > (dispatch_chunk_min_records) ? ((map_records + 8 - 1) / 8) : (dispatch_chunk_min_records));
-                int map_q = _max_6e6450;
-                int map_chunks = (map_records + map_q - 1) / map_q;
-                #pragma unroll 1
-                for (int map_chunk = 0; map_chunk < map_chunks; map_chunk++) {
-                    {
-                        unsigned int* _gca_p = reinterpret_cast<unsigned int*>(dispatch_chunk_scatter_counter) + (map_source * 8 + map_chunk);
-                        while (true) {
-                            unsigned int _gca_v;
-                            asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_gca_v) : "l"(_gca_p) : "memory");
-                            if (_gca_v >= (unsigned int)(dispatch_chunk_targets[map_source * 8 + map_chunk])) break;
-                        }
-                    }
-                }
-                int _max_81cadb = ((source_route_counts[map_source]) > (0) ? (source_route_counts[map_source]) : (0));
-                int _min_9e4e87x = ((_max_81cadb) < (MOE_X_7830131351) ? (_max_81cadb) : (MOE_X_7830131351));
-                int map_routes = _min_9e4e87x;
-                int _max_6b25c1 = ((map_routes) > (1) ? (map_routes) : (1));
-                int map_count = _max_6b25c1;
-                unsigned long long map_local_byte = (unsigned long long)(map_source * 2 + slot) * (unsigned long long)MOE_X_41088b7354 + (unsigned long long)MOE_X_6df838802e;
-                unsigned long long map_remote_byte = (unsigned long long)(rank * 2 + slot) * (unsigned long long)MOE_X_41088b7354 + (unsigned long long)MOE_X_6df838802e;
-                {
-                    if (map_dst_lsa != 0) {
-                        {
-                            unsigned long long pr_nbytes = (unsigned long long)(map_count * 4 + 15) / 16 * 16;
-                            unsigned long long pr_base = lsa_peer_ptrs[5 * world_size + map_source];
-                            int pr_nblk = (int)((pr_nbytes + (unsigned long long)MOE_X_d21107c6b0) / (unsigned long long)MOE_X_16a8c0b8b4);
-                            #pragma unroll 1
-                            for (int pr_b = 0; pr_b < pr_nblk; pr_b++) {
-                                int pr_n = pr_cnt[0];
-                                int pr_s = warp * 2 + (unsigned int)(pr_n & 1);
-                                unsigned long long pr_off = (unsigned long long)pr_b * (unsigned long long)MOE_X_16a8c0b8b4;
-                                unsigned long long _min_fb5f0b = ((pr_nbytes - pr_off) < (MOE_X_16a8c0b8b4) ? (pr_nbytes - pr_off) : (MOE_X_16a8c0b8b4));
-                                unsigned long long pr_len = _min_fb5f0b;
-                                if (pr_n >= 2) {
-                                    asm volatile("cp.async.bulk.wait_group.read 1;");
-                                }
-                                mbarrier_arrive_expect_tx(pr_full_addr + (pr_s) * 8, (int)pr_len);
-                                cp_async_bulk_gmem2smem(pr_stage_addr + (unsigned int)(pr_s * MOE_X_16a8c0b8b4), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(reinterpret_cast<uint8_t*>(result_out)) + ((unsigned long long)(map_local_byte + pr_off) * (unsigned long long)1)), (int)pr_len, pr_full_addr + (pr_s) * 8);
-                                mbarrier_wait(pr_full_addr + (pr_s) * 8, pr_n >> 1 & 1);
-                                asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                                {
-                                    void* _cpbulk_dst_142d08 = reinterpret_cast<void*>(reinterpret_cast<uint8_t*>(pr_base + map_remote_byte + pr_off));
-                                    asm volatile(
-                                        "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
-                                        :: "l"(_cpbulk_dst_142d08), "r"(pr_stage_addr + (unsigned int)(pr_s * MOE_X_16a8c0b8b4)), "r"((uint32_t)((int)pr_len))
-                                        : "memory");
-                                }
-                                asm volatile("cp.async.bulk.commit_group;");
-                                pr_cnt[0] = pr_n + 1;
-                            }
-                            asm volatile("cp.async.bulk.wait_group 0;");
-                            asm volatile("fence.proxy.async;");
-                            __threadfence_system();
-                        }
-                    }
-                }
-                __threadfence_system();
-                if ((int)peer_transport[rank * world_size + map_source] == 2) {
-                    // gin_put_signal_add: strong remote completion on context 0
-                    {
-                        ncclGin __gin{*(gin_dev_comm), (int)(0)};
-                        __gin.put(ncclTeamWorld(*(gin_dev_comm)), (int)(map_source), result_inbox_gwin_window, (size_t)(map_remote_byte), result_out_gwin_window, (size_t)(map_local_byte), (size_t)(map_count * 4),
-                            ncclGin_StrongSignalAdd{(ncclGinSignal_t)(MOE_X_96e08f30e3 + rank), (uint64_t)(1)}, ncclGin_None{}, ncclCoopThread(), ncclGin_None{}, cuda::thread_scope_thread, cuda::thread_scope_device);
-                    }
-                } else {
-                    unsigned long long lsa_dst_b04e28 = lsa_peer_ptrs[5 * world_size + map_source] + map_remote_byte;
-                    unsigned long long lsa_flag_dbe169 = lsa_peer_ptrs[8 * world_size + map_source];
-                    unsigned int* lsa_remote_f8bacay = reinterpret_cast<unsigned int*>(lsa_flag_dbe169);
-                    int lsa_channel_fe4879 = MOE_X_25bb534aec + (MOE_X_96e08f30e3 + rank);
-                    int lsa_state_index_85375e = (map_source * MOE_X_5fc76dab52 + lsa_channel_fe4879) * 2;
-                    unsigned int* lsa_state_83c5a8y = lsa_send_state + lsa_state_index_85375e;
-                    unsigned long long gtimer_0_00d6c0y_1;
-                    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(gtimer_0_00d6c0y_1) :: "memory");
-                    unsigned long long lsa_start_c47806y = gtimer_0_00d6c0y_1;
-                    unsigned int lsa_busy_c43afby = 1;
-                    while (lsa_busy_c43afby != 0) {
-                        uint32_t _atomic_cas_old_04259cy = atomicCAS(reinterpret_cast<unsigned int*>(lsa_state_83c5a8y), static_cast<unsigned int>(0), static_cast<unsigned int>(1));
-                        lsa_busy_c43afby = _atomic_cas_old_04259cy;
-                        if (lsa_busy_c43afby != 0) {
-                            unsigned long long gtimer_1_ee26c6y_1;
-                            asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(gtimer_1_ee26c6y_1) :: "memory");
-                            if (gtimer_1_ee26c6y_1 - lsa_start_c47806y > 600000000000) {
-                                asm volatile("trap;" ::: "memory");
-                            }
-                        }
-                    }
-                    __threadfence();
-                    uint8_t* lsa_pd_b3ef0ey = reinterpret_cast<uint8_t*>(lsa_dst_b04e28);
-                    uint8_t* lsa_ps_490965 = reinterpret_cast<uint8_t*>(result_out + map_local_byte);
-                    if (((lsa_dst_b04e28 | (unsigned long long)result_out + map_local_byte) & 3) == 0) {
-                        unsigned int* lsa_pd32_10981dy = reinterpret_cast<unsigned int*>(lsa_pd_b3ef0ey);
-                        unsigned int* lsa_ps32_8f09c0y = reinterpret_cast<unsigned int*>(lsa_ps_490965);
-                        {
-                            int _max_a12c7f = ((1) > (1) ? (1) : (1));
-                            #pragma unroll 1
-                            for (int lsa_i_603fa4y = 0; lsa_i_603fa4y < _max_a12c7f; lsa_i_603fa4y++) {
-                                lsa_pd32_10981dy[lsa_i_603fa4y] = lsa_ps32_8f09c0y[lsa_i_603fa4y];
-                            }
-                        }
-                        #pragma unroll 4
-                        for (int lsa_tail_680f43y = 0; lsa_tail_680f43y < 4; lsa_tail_680f43y++) {
-                            if (lsa_tail_680f43y < 0) {
-                                unsigned long long lsa_tail_index_f8358c = 4 + lsa_tail_680f43y;
-                                lsa_pd_b3ef0ey[lsa_tail_index_f8358c] = lsa_ps_490965[lsa_tail_index_f8358c];
-                            }
-                        }
-                    } else if (1) {
-                        int _max_e8c8d8 = ((1) > (4) ? (1) : (4));
-                        #pragma unroll 1
-                        for (int lsa_byte_2aaaa1y = 0; lsa_byte_2aaaa1y < _max_e8c8d8; lsa_byte_2aaaa1y++) {
-                            lsa_pd_b3ef0ey[lsa_byte_2aaaa1y] = lsa_ps_490965[lsa_byte_2aaaa1y];
-                        }
-                    }
-                    unsigned int lsa_seq_84b040y = lsa_state_83c5a8y[1] + 1;
-                    lsa_state_83c5a8y[1] = lsa_seq_84b040y;
-                    asm volatile("st.release.sys.global.u32 [%0], %1;" :: "l"(reinterpret_cast<unsigned int*>(lsa_remote_f8bacay + (lsa_channel_fe4879 * 32))), "r"(static_cast<unsigned int>(lsa_seq_84b040y)) : "memory");
-                    asm volatile("st.release.gpu.global.u32 [%0], %1;" :: "l"(reinterpret_cast<unsigned int*>(lsa_state_83c5a8y)), "r"(static_cast<unsigned int>(0)) : "memory");
-                }
-                int h29_idx = 0;
-                #pragma unroll 1
-                for (int h29_iter = 0; h29_iter < MOE_X_1b61f2e4e4; h29_iter++) {
-                    int h29_ready = 0;
-                    unsigned long long h29_wait_t0 = 0;
-                    while (1) {
-                        int h29_done = 0;
-                        int h29_tail_seen = 0;
-                        {
-                            unsigned int _load_acquire_82a81by;
-                            asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_load_acquire_82a81by) : "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(pr_gq_ctl)) + (1))) : "memory");
-                            h29_done = (int)_load_acquire_82a81by;
-                            unsigned int _load_acquire_97aad4y;
-                            asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_load_acquire_97aad4y) : "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(pr_gq_ctl)) + (0))) : "memory");
-                            h29_tail_seen = (int)_load_acquire_97aad4y;
-                        }
-                        if (h29_tail_seen > h29_idx) {
-                            h29_ready = 1;
-                            break;
-                        }
-                        if (h29_done != 0) {
-                            break;
-                        }
-                        unsigned long long gtimer_0_c4e315y_13;
-                        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(gtimer_0_c4e315y_13) :: "memory");
-                        unsigned long long wd_now_99fb2cy_12 = gtimer_0_c4e315y_13;
-                        unsigned long long wd_t0_36c7fb = h29_wait_t0;
-                        if (h29_wait_t0 == 0) {
-                            wd_t0_36c7fb = wd_now_99fb2cy_12;
-                        }
-                        if (wd_now_99fb2cy_12 - wd_t0_36c7fb > 600000000000) {
-                            asm volatile("trap;" ::: "memory");
-                        }
-                        h29_wait_t0 = wd_t0_36c7fb;
-                    }
-                    if (h29_ready == 0) {
-                        break;
-                    }
-                    __threadfence_block();
-                    int h29_chunk = 0;
-                    {
-                        h29_chunk = pr_gq[h29_idx];
-                    }
-                    h29_idx += 1;
-                    atomicMax(&svc_qctl[3 + warp], h29_idx);
-                    int h29_source = h29_chunk / MOE_X_caa68debd6;
-                    if (h29_source == map_source) {
-                        int h29_chunk_local = h29_chunk - h29_source * MOE_X_caa68debd6;
-                        int _max_967b9a = ((source_route_counts[h29_source]) > (0) ? (source_route_counts[h29_source]) : (0));
-                        int _min_30de52x = ((_max_967b9a) < (MOE_X_7830131351) ? (_max_967b9a) : (MOE_X_7830131351));
-                        int h29_routes = _min_30de52x;
-                        int h29_pq = 128;
-                        if (h29_routes >= 768 && h29_routes < 768 || h29_routes >= 8192) {
-                            h29_pq = 64;
-                        }
-                        if (h29_routes < 768) {
-                            h29_pq = 32;
-                        }
-                        int _max_a86984 = (((h29_routes + h29_pq - 1) / h29_pq - 1) > (0) ? ((h29_routes + h29_pq - 1) / h29_pq - 1) : (0));
-                        int h29_pfull = _max_a86984;
-                        int h29_pts = h29_pfull * h29_pq;
-                        int h29_start = 0;
-                        int h29_cap = h29_pq;
-                        if (h29_chunk_local < h29_pfull) {
-                            h29_start = h29_chunk_local * h29_pq;
-                        } else {
-                            h29_start = h29_pts + (h29_chunk_local - h29_pfull) * 64;
-                            h29_cap = 64;
-                        }
-                        int _min_45345a = ((h29_routes - h29_start) < (h29_cap) ? (h29_routes - h29_start) : (h29_cap));
-                        int h29_chunk_rows = _min_45345a;
-                        int _atomic_old_7d39cb = atomicAdd(&result_ovf_cursor[h29_source * MOE_X_caa68debd6 + h29_chunk_local], 0);
-                        int h29_ovf = _atomic_old_7d39cb;
-                        unsigned long long h29_local_byte = (unsigned long long)(h29_source * 2 + slot) * (unsigned long long)MOE_X_41088b7354 + (unsigned long long)h29_start * (unsigned long long)MOE_X_7aa4be4d8c;
-                        unsigned long long h29_remote_byte = (unsigned long long)(rank * 2 + slot) * (unsigned long long)MOE_X_41088b7354 + (unsigned long long)h29_start * (unsigned long long)MOE_X_7aa4be4d8c;
-                        int _min_3be609 = ((h29_ovf) < (h29_chunk_rows * MOE_CODEC_OVF_BLOCKS) ? (h29_ovf) : (h29_chunk_rows * MOE_CODEC_OVF_BLOCKS));
-                        int h29_put_bytes = h29_chunk_rows * MOE_X_2a3dd8915f + _min_3be609 * 128;
-                        int _max_b65d03 = ((owner_route_counts[h29_source]) > (0) ? (owner_route_counts[h29_source]) : (0));
-                        int _min_532bb4x = ((_max_b65d03) < (MOE_X_7830131351) ? (_max_b65d03) : (MOE_X_7830131351));
-                        int c13a2_dual = (int)(h29_routes * MOE_X_4f81408915 >= collective_rows * MOE_X_474ae89bdd || h29_routes * MOE_X_4f81408915 >= collective_rows * MOE_X_fb8d28a056 && _min_532bb4x * MOE_X_4f81408915 >= collective_rows * MOE_X_474ae89bdd);
-                        {
-                            if (map_dst_lsa != 0) {
-                                atomicMax(&protocol_error[0], 1);
-#elif (MOE_INSTANCE == 2 && MOE_SW_ROLE_PEER_FOLD == 0) // moe-select
-                        }
-                    } else {
-                        if (warp == 11 && lane == 4) {
-                            int sp_records = source_record_counts[rank];
-                            int _max_3f95d2 = (((sp_records + 8 - 1) / 8) > (dispatch_chunk_min_records) ? ((sp_records + 8 - 1) / 8) : (dispatch_chunk_min_records));
-                            int sp_q = _max_3f95d2;
-                            int sp_chunks = (sp_records + sp_q - 1) / sp_q;
-                            #pragma unroll 1
-                            for (int sp_chunk = 0; sp_chunk < sp_chunks; sp_chunk++) {
-                                {
-                                    unsigned int* _gca_p = reinterpret_cast<unsigned int*>(dispatch_chunk_scatter_counter) + (rank * 8 + sp_chunk);
-                                    while (true) {
-                                        unsigned int _gca_v;
-                                        asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_gca_v) : "l"(_gca_p) : "memory");
-                                        if (_gca_v >= (unsigned int)(dispatch_chunk_targets[rank * 8 + sp_chunk])) break;
-                                    }
-                                }
-                            }
-                            {
-                                unsigned int* _gc_p = reinterpret_cast<unsigned int*>(result_owner_progress) + (rank);
-                                unsigned int _gc_old;
-                                asm volatile("atom.release.gpu.global.add.u32 %0, [%1], 1;" : "=r"(_gc_old) : "l"(_gc_p) : "memory");
-                            }
-                            int sp_idx = 0;
-                            #pragma unroll 1
-                            for (int sp_iter = 0; sp_iter < MOE_X_1b61f2e4e4; sp_iter++) {
-                                int sp_ready = 0;
-                                unsigned long long sp_wait_t0 = 0;
-                                while (1) {
-                                    unsigned int _load_acquire_360280y;
-                                    asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_load_acquire_360280y) : "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(pr_gq_ctl)) + (1))) : "memory");
-                                    int sp_done = _load_acquire_360280y;
-                                    unsigned int _load_acquire_933ae6y;
-                                    asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_load_acquire_933ae6y) : "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(pr_gq_ctl)) + (0))) : "memory");
-                                    int sp_tail = _load_acquire_933ae6y;
-                                    if (sp_tail > sp_idx) {
-                                        sp_ready = 1;
-                                        break;
-                                    }
-                                    if (sp_done != 0) {
-                                        break;
-                                    }
-                                    unsigned long long gtimer_0_c4e315y_12;
-                                    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(gtimer_0_c4e315y_12) :: "memory");
-                                    unsigned long long wd_now_99fb2cy_11 = gtimer_0_c4e315y_12;
-                                    unsigned long long wd_t0_3a450e = sp_wait_t0;
-                                    if (sp_wait_t0 == 0) {
-                                        wd_t0_3a450e = wd_now_99fb2cy_11;
-                                    }
-                                    if (wd_now_99fb2cy_11 - wd_t0_3a450e > 600000000000) {
-                                        asm volatile("trap;" ::: "memory");
-                                    }
-                                    sp_wait_t0 = wd_t0_3a450e;
-                                }
-                                if (sp_ready == 0) {
-                                    break;
-                                }
-                                __threadfence_block();
-                                int sp_chunk_id = pr_gq[sp_idx];
-                                sp_idx += 1;
-                                if (sp_chunk_id / MOE_X_caa68debd6 == rank) {
-                                    {
-                                        unsigned int* _gc_p = reinterpret_cast<unsigned int*>(result_owner_progress) + (rank);
-                                        unsigned int _gc_old;
-                                        asm volatile("atom.release.gpu.global.add.u32 %0, [%1], 1;" : "=r"(_gc_old) : "l"(_gc_p) : "memory");
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                __syncwarp();
-            }
-        }
-        if (warp >= 1 && warp < (unsigned int)world_size) {
-            int map_source = (unsigned int)rank + warp;
-            if (map_source >= world_size) {
-                map_source = map_source - world_size;
-            }
-            int map_dst_lsa = 1;
-            if ((int)peer_transport[rank * world_size + map_source] == 2) {
-                map_dst_lsa = 0;
-            }
-            if (elect_sync()) {
-                int pr_cnt[1];
-                pr_cnt[0] = 0;
-                int map_records = source_record_counts[map_source];
-                int _max_6e6450 = (((map_records + 8 - 1) / 8) > (dispatch_chunk_min_records) ? ((map_records + 8 - 1) / 8) : (dispatch_chunk_min_records));
-                int map_q = _max_6e6450;
-                int map_chunks = (map_records + map_q - 1) / map_q;
-                #pragma unroll 1
-                for (int map_chunk = 0; map_chunk < map_chunks; map_chunk++) {
-                    {
-                        unsigned int* _gca_p = reinterpret_cast<unsigned int*>(dispatch_chunk_scatter_counter) + (map_source * 8 + map_chunk);
-                        while (true) {
-                            unsigned int _gca_v;
-                            asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_gca_v) : "l"(_gca_p) : "memory");
-                            if (_gca_v >= (unsigned int)(dispatch_chunk_targets[map_source * 8 + map_chunk])) break;
-                        }
-                    }
-                }
-                int _max_81cadb = ((source_route_counts[map_source]) > (0) ? (source_route_counts[map_source]) : (0));
-                int _min_9e4e87x = ((_max_81cadb) < (MOE_X_7830131351) ? (_max_81cadb) : (MOE_X_7830131351));
-                int map_routes = _min_9e4e87x;
-                int _max_6b25c1 = ((map_routes) > (1) ? (map_routes) : (1));
-                int map_count = _max_6b25c1;
-                unsigned long long map_local_byte = (unsigned long long)(map_source * 2 + slot) * (unsigned long long)MOE_X_51dea414ef + (unsigned long long)MOE_X_3296bcaabb;
-                unsigned long long map_remote_byte = (unsigned long long)(rank * 2 + slot) * (unsigned long long)MOE_X_51dea414ef + (unsigned long long)MOE_X_3296bcaabb;
-                {
-                    if (map_dst_lsa != 0) {
-                        {
-                            unsigned long long pr_nbytes = (unsigned long long)(map_count * 4 + 15) / 16 * 16;
-                            unsigned long long pr_base = lsa_peer_ptrs[5 * world_size + map_source];
-                            int pr_nblk = (int)((pr_nbytes + (unsigned long long)MOE_X_d21107c6b0) / (unsigned long long)MOE_X_16a8c0b8b4);
-                            #pragma unroll 1
-                            for (int pr_b = 0; pr_b < pr_nblk; pr_b++) {
-                                int pr_n = pr_cnt[0];
-                                int pr_s = warp * 2 + (unsigned int)(pr_n & 1);
-                                unsigned long long pr_off = (unsigned long long)pr_b * (unsigned long long)MOE_X_16a8c0b8b4;
-                                unsigned long long _min_fb5f0b = ((pr_nbytes - pr_off) < (MOE_X_16a8c0b8b4) ? (pr_nbytes - pr_off) : (MOE_X_16a8c0b8b4));
-                                unsigned long long pr_len = _min_fb5f0b;
-                                if (pr_n >= 2) {
-                                    asm volatile("cp.async.bulk.wait_group.read 1;");
-                                }
-                                mbarrier_arrive_expect_tx(pr_full_addr + (pr_s) * 8, (int)pr_len);
-                                cp_async_bulk_gmem2smem(pr_stage_addr + (unsigned int)(pr_s * MOE_X_16a8c0b8b4), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(reinterpret_cast<uint8_t*>(result_out)) + ((unsigned long long)(map_local_byte + pr_off) * (unsigned long long)1)), (int)pr_len, pr_full_addr + (pr_s) * 8);
-                                mbarrier_wait(pr_full_addr + (pr_s) * 8, pr_n >> 1 & 1);
-                                asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                                {
-                                    void* _cpbulk_dst_142d08 = reinterpret_cast<void*>(reinterpret_cast<uint8_t*>(pr_base + map_remote_byte + pr_off));
-                                    asm volatile(
-                                        "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
-                                        :: "l"(_cpbulk_dst_142d08), "r"(pr_stage_addr + (unsigned int)(pr_s * MOE_X_16a8c0b8b4)), "r"((uint32_t)((int)pr_len))
-                                        : "memory");
-                                }
-                                asm volatile("cp.async.bulk.commit_group;");
-                                pr_cnt[0] = pr_n + 1;
-                            }
-                            asm volatile("cp.async.bulk.wait_group 0;");
-                            asm volatile("fence.proxy.async;");
-                            __threadfence_system();
-                        }
-                    }
-                }
-                __threadfence_system();
-                if ((int)peer_transport[rank * world_size + map_source] == 2) {
-                    // gin_put_signal_add: strong remote completion on context 0
-                    {
-                        ncclGin __gin{*(gin_dev_comm), (int)(0)};
-                        __gin.put(ncclTeamWorld(*(gin_dev_comm)), (int)(map_source), result_inbox_gwin_window, (size_t)(map_remote_byte), result_out_gwin_window, (size_t)(map_local_byte), (size_t)(map_count * 4),
-                            ncclGin_StrongSignalAdd{(ncclGinSignal_t)(MOE_X_96e08f30e3 + rank), (uint64_t)(1)}, ncclGin_None{}, ncclCoopThread(), ncclGin_None{}, cuda::thread_scope_thread, cuda::thread_scope_device);
-                    }
-                } else {
-                    unsigned long long lsa_dst_b04e28 = lsa_peer_ptrs[5 * world_size + map_source] + map_remote_byte;
-                    unsigned long long lsa_flag_dbe169 = lsa_peer_ptrs[8 * world_size + map_source];
-                    unsigned int* lsa_remote_f8bacay = reinterpret_cast<unsigned int*>(lsa_flag_dbe169);
-                    int lsa_channel_fe4879 = MOE_X_25bb534aec + (MOE_X_96e08f30e3 + rank);
-                    int lsa_state_index_85375e = (map_source * MOE_X_5fc76dab52 + lsa_channel_fe4879) * 2;
-                    unsigned int* lsa_state_83c5a8y = lsa_send_state + lsa_state_index_85375e;
-                    unsigned long long gtimer_0_00d6c0y_1;
-                    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(gtimer_0_00d6c0y_1) :: "memory");
-                    unsigned long long lsa_start_c47806y = gtimer_0_00d6c0y_1;
-                    unsigned int lsa_busy_c43afby = 1;
-                    while (lsa_busy_c43afby != 0) {
-                        uint32_t _atomic_cas_old_04259cy = atomicCAS(reinterpret_cast<unsigned int*>(lsa_state_83c5a8y), static_cast<unsigned int>(0), static_cast<unsigned int>(1));
-                        lsa_busy_c43afby = _atomic_cas_old_04259cy;
-                        if (lsa_busy_c43afby != 0) {
-                            unsigned long long gtimer_1_ee26c6y_1;
-                            asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(gtimer_1_ee26c6y_1) :: "memory");
-                            if (gtimer_1_ee26c6y_1 - lsa_start_c47806y > 600000000000) {
-                                asm volatile("trap;" ::: "memory");
-                            }
-                        }
-                    }
-                    __threadfence();
-                    uint8_t* lsa_pd_b3ef0ey = reinterpret_cast<uint8_t*>(lsa_dst_b04e28);
-                    uint8_t* lsa_ps_490965 = reinterpret_cast<uint8_t*>(result_out + map_local_byte);
-                    if (((lsa_dst_b04e28 | (unsigned long long)result_out + map_local_byte) & 3) == 0) {
-                        unsigned int* lsa_pd32_10981dy = reinterpret_cast<unsigned int*>(lsa_pd_b3ef0ey);
-                        unsigned int* lsa_ps32_8f09c0y = reinterpret_cast<unsigned int*>(lsa_ps_490965);
-                        {
-                            int _max_a12c7f = ((1) > (1) ? (1) : (1));
-                            #pragma unroll 1
-                            for (int lsa_i_603fa4y = 0; lsa_i_603fa4y < _max_a12c7f; lsa_i_603fa4y++) {
-                                lsa_pd32_10981dy[lsa_i_603fa4y] = lsa_ps32_8f09c0y[lsa_i_603fa4y];
-                            }
-                        }
-                        #pragma unroll 4
-                        for (int lsa_tail_680f43y = 0; lsa_tail_680f43y < 4; lsa_tail_680f43y++) {
-                            if (lsa_tail_680f43y < 0) {
-                                unsigned long long lsa_tail_index_f8358c = 4 + lsa_tail_680f43y;
-                                lsa_pd_b3ef0ey[lsa_tail_index_f8358c] = lsa_ps_490965[lsa_tail_index_f8358c];
-                            }
-                        }
-                    } else if (1) {
-                        int _max_e8c8d8 = ((1) > (4) ? (1) : (4));
-                        #pragma unroll 1
-                        for (int lsa_byte_2aaaa1y = 0; lsa_byte_2aaaa1y < _max_e8c8d8; lsa_byte_2aaaa1y++) {
-                            lsa_pd_b3ef0ey[lsa_byte_2aaaa1y] = lsa_ps_490965[lsa_byte_2aaaa1y];
-                        }
-                    }
-                    unsigned int lsa_seq_84b040y = lsa_state_83c5a8y[1] + 1;
-                    lsa_state_83c5a8y[1] = lsa_seq_84b040y;
-                    asm volatile("st.release.sys.global.u32 [%0], %1;" :: "l"(reinterpret_cast<unsigned int*>(lsa_remote_f8bacay + (lsa_channel_fe4879 * 32))), "r"(static_cast<unsigned int>(lsa_seq_84b040y)) : "memory");
-                    asm volatile("st.release.gpu.global.u32 [%0], %1;" :: "l"(reinterpret_cast<unsigned int*>(lsa_state_83c5a8y)), "r"(static_cast<unsigned int>(0)) : "memory");
-                }
-                int h29_idx = 0;
-                #pragma unroll 1
-                for (int h29_iter = 0; h29_iter < MOE_X_1b61f2e4e4; h29_iter++) {
-                    int h29_ready = 0;
-                    unsigned long long h29_wait_t0 = 0;
-                    while (1) {
-                        int h29_done = 0;
-                        int h29_tail_seen = 0;
-                        {
-                            unsigned int _load_acquire_82a81by;
-                            asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_load_acquire_82a81by) : "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(pr_gq_ctl)) + (1))) : "memory");
-                            h29_done = (int)_load_acquire_82a81by;
-                            unsigned int _load_acquire_97aad4y;
-                            asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_load_acquire_97aad4y) : "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(pr_gq_ctl)) + (0))) : "memory");
-                            h29_tail_seen = (int)_load_acquire_97aad4y;
-                        }
-                        if (h29_tail_seen > h29_idx) {
-                            h29_ready = 1;
-                            break;
-                        }
-                        if (h29_done != 0) {
-                            break;
-                        }
-                        unsigned long long gtimer_0_c4e315y_13;
-                        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(gtimer_0_c4e315y_13) :: "memory");
-                        unsigned long long wd_now_99fb2cy_12 = gtimer_0_c4e315y_13;
-                        unsigned long long wd_t0_36c7fb = h29_wait_t0;
-                        if (h29_wait_t0 == 0) {
-                            wd_t0_36c7fb = wd_now_99fb2cy_12;
-                        }
-                        if (wd_now_99fb2cy_12 - wd_t0_36c7fb > 600000000000) {
-                            asm volatile("trap;" ::: "memory");
-                        }
-                        h29_wait_t0 = wd_t0_36c7fb;
-                    }
-                    if (h29_ready == 0) {
-                        break;
-                    }
-                    __threadfence_block();
-                    int h29_chunk = 0;
-                    {
-                        h29_chunk = pr_gq[h29_idx];
-                    }
-                    h29_idx += 1;
-                    atomicMax(&svc_qctl[3 + warp], h29_idx);
-                    int h29_source = h29_chunk / MOE_X_caa68debd6;
-                    if (h29_source == map_source) {
-                        int h29_chunk_local = h29_chunk - h29_source * MOE_X_caa68debd6;
-                        int _max_967b9a = ((source_route_counts[h29_source]) > (0) ? (source_route_counts[h29_source]) : (0));
-                        int _min_30de52x = ((_max_967b9a) < (MOE_X_7830131351) ? (_max_967b9a) : (MOE_X_7830131351));
-                        int h29_routes = _min_30de52x;
-                        int h29_pq = 128;
-                        if (h29_routes >= 768 && h29_routes < 768 || h29_routes >= 8192) {
-                            h29_pq = 64;
-                        }
-                        if (h29_routes < 768) {
-                            h29_pq = 32;
-                        }
-                        int _max_a86984 = (((h29_routes + h29_pq - 1) / h29_pq - 1) > (0) ? ((h29_routes + h29_pq - 1) / h29_pq - 1) : (0));
-                        int h29_pfull = _max_a86984;
-                        int h29_pts = h29_pfull * h29_pq;
-                        int h29_start = 0;
-                        int h29_cap = h29_pq;
-                        if (h29_chunk_local < h29_pfull) {
-                            h29_start = h29_chunk_local * h29_pq;
-                        } else {
-                            h29_start = h29_pts + (h29_chunk_local - h29_pfull) * 64;
-                            h29_cap = 64;
-                        }
-                        int _min_45345a = ((h29_routes - h29_start) < (h29_cap) ? (h29_routes - h29_start) : (h29_cap));
-                        int h29_chunk_rows = _min_45345a;
-                        int _atomic_old_7d39cb = atomicAdd(&result_ovf_cursor[h29_source * MOE_X_caa68debd6 + h29_chunk_local], 0);
-                        int h29_ovf = _atomic_old_7d39cb;
-                        unsigned long long h29_local_byte = (unsigned long long)(h29_source * 2 + slot) * (unsigned long long)MOE_X_51dea414ef + (unsigned long long)h29_start * (unsigned long long)MOE_X_efce35e873;
-                        unsigned long long h29_remote_byte = (unsigned long long)(rank * 2 + slot) * (unsigned long long)MOE_X_51dea414ef + (unsigned long long)h29_start * (unsigned long long)MOE_X_efce35e873;
-                        int _min_3be609 = ((h29_ovf) < (h29_chunk_rows * MOE_CODEC_OVF_BLOCKS) ? (h29_ovf) : (h29_chunk_rows * MOE_CODEC_OVF_BLOCKS));
-                        int h29_put_bytes = h29_chunk_rows * MOE_X_efce35e873 + _min_3be609 * 128;
-                        int _max_b65d03 = ((owner_route_counts[h29_source]) > (0) ? (owner_route_counts[h29_source]) : (0));
-                        int _min_532bb4x = ((_max_b65d03) < (MOE_X_7830131351) ? (_max_b65d03) : (MOE_X_7830131351));
-                        int c13a2_dual = (int)(h29_routes * MOE_X_4f81408915 >= collective_rows * MOE_X_474ae89bdd || h29_routes * MOE_X_4f81408915 >= collective_rows * MOE_X_fb8d28a056 && _min_532bb4x * MOE_X_4f81408915 >= collective_rows * MOE_X_474ae89bdd);
-                        {
-                            if (map_dst_lsa != 0) {
-                                atomicMax(&protocol_error[0], 1);
-#elif (MOE_INSTANCE == 0 && (MOE_SW_WIDE_RANKS == 0 && MOE_SHARED_EXPERT == 1)) // moe-select
+#elif (MOE_INSTANCE == 0 && (MOE_SW_WIDE_RANKS == 0 && (MOE_SW_TB_SCR_GLOBAL == 0 && (MOE_SW_TASK_GATE_U64 == 0 && MOE_SW_RETURN_INT8 == 0)))) // moe-select
+#include "cake_sm120_megamoe_kernel_part024.cuh"
+#elif (MOE_INSTANCE == 0 && (MOE_SW_POLICY_EP == 16 && (MOE_SW_WIDE_RANKS == 0 && MOE_SHARED_EXPERT == 1))) // moe-select
                         }
                     } else {
                         if (warp == 11 && lane == 4) {
@@ -3690,7 +3092,7 @@
                                         asm volatile("atom.release.gpu.global.add.u32 %0, [%1], 1;" : "=r"(_gc_old) : "l"(_gc_p) : "memory");
                                     }
                                 }
-#elif (MOE_INSTANCE == 1 && (MOE_SW_WIDE_RANKS == 0 && (MOE_SW_WATCH_WIDE == 0 && (MOE_SW_ROLE_PEER_FOLD == 1 && MOE_SHARED_EXPERT == 1)))) // moe-select
+#elif (MOE_INSTANCE == 1 && (MOE_SW_POLICY_EP == 16 && (MOE_SW_WIDE_RANKS == 0 && (MOE_SW_WATCH_WIDE == 0 && (MOE_SW_ROLE_PEER_FOLD == 1 && MOE_SHARED_EXPERT == 1))))) // moe-select
                         }
                     }
                     __syncwarp();
@@ -3798,7 +3200,9 @@
                                         if (_gca_v >= (unsigned int)(dispatch_chunk_targets[map_source * 8 + map_chunk])) break;
                                     }
                                 }
-#elif (MOE_INSTANCE == 2 && (MOE_SW_WIDE_RANKS == 0 && MOE_SHARED_EXPERT == 1)) // moe-select
+#elif (MOE_INSTANCE == 2 && (MOE_SW_WIDE_RANKS == 0 && (MOE_SW_TB_SCR_GLOBAL == 0 && (MOE_SW_TASK_GATE_U64 == 0 && (MOE_SW_ROLE_WARP_FOLD == 0 && MOE_SW_RETURN_INT8 == 0))))) // moe-select
+#include "cake_sm120_megamoe_kernel_part026.cuh"
+#elif (MOE_INSTANCE == 2 && (MOE_SW_POLICY_EP == 16 && (MOE_SW_WIDE_RANKS == 0 && (MOE_SW_ROLE_PEER_FOLD == 1 && MOE_SHARED_EXPERT == 1)))) // moe-select
                         }
                     } else {
                         if (warp == 11 && lane == 4) {
@@ -3866,7 +3270,7 @@
                                         asm volatile("atom.release.gpu.global.add.u32 %0, [%1], 1;" : "=r"(_gc_old) : "l"(_gc_p) : "memory");
                                     }
                                 }
-#elif (MOE_INSTANCE == 3 && MOE_SW_WIDE_RANKS == 0) // moe-select
+#elif (MOE_INSTANCE == 3 && (MOE_SW_POLICY_EP == 16 && (MOE_SW_WIDE_RANKS == 0 && MOE_SW_ROLE_PEER_FOLD == 1))) // moe-select
                         }
                         {
                             unsigned int* _gc_p = reinterpret_cast<unsigned int*>(result_owner_progress) + (rank);
@@ -4074,6 +3478,10 @@
                                         asm volatile("atom.release.gpu.global.add.u32 %0, [%1], 1;" : "=r"(_gc_old) : "l"(_gc_p) : "memory");
                                     }
                                 }
+#elif (MOE_INSTANCE == 0 && (MOE_SW_POLICY_EP == 4 || MOE_SW_POLICY_EP == 8)) // moe-select
+#include "cake_sm120_megamoe_kernel_part025.cuh"
+#elif (MOE_INSTANCE == 2 && MOE_SW_ROLE_WARP_FOLD == 0) // moe-select
+#include "cake_sm120_megamoe_kernel_part027.cuh"
 #elif (MOE_INSTANCE == 0 && (MOE_SW_WATCH_WIDE == 0 && MOE_SW_RETURN_INT8 == 0)) // moe-select
                         }
                     } else {
@@ -4401,7 +3809,7 @@
                                         }
                                     }
                                 }
-#elif (MOE_INSTANCE == 2 && (MOE_SW_WATCH_WIDE == 0 && MOE_SW_RETURN_INT8 == 0)) // moe-select
+#elif (MOE_INSTANCE == 2 && (MOE_SW_WATCH_WIDE == 0 && (MOE_SW_TASK_GATE_U64 == 1 && (MOE_SW_ROLE_PEER_FOLD == 1 && MOE_SW_RETURN_INT8 == 0)))) // moe-select
                         }
                     } else {
                         if (warp == 11 && lane == 4) {
@@ -5045,7 +4453,7 @@
                                         }
                                     }
                                 }
-#elif (MOE_INSTANCE == 2 && MOE_SW_WATCH_WIDE == 0) // moe-select
+#elif (MOE_INSTANCE == 2 && (MOE_SW_WATCH_WIDE == 0 && MOE_SW_ROLE_PEER_FOLD == 1)) // moe-select
                         }
                     } else {
                         if (warp == 11 && lane == 4) {
@@ -5362,7 +4770,877 @@
                         {
                             if (h29_dst_lsa != 0) {
                                 atomicMax(&protocol_error[0], 1);
-#elif (MOE_INSTANCE == 1 && (MOE_SW_WIDE_RANKS == 0 && (MOE_SW_ROLE_PEER_FOLD == 0 && MOE_SW_RETURN_INT8 == 0))) // moe-select
+#elif (MOE_INSTANCE == 1 && (MOE_SW_WIDE_RANKS == 0 && (MOE_SW_WATCH_WIDE == 0 && (MOE_SW_TASK_GATE_U64 == 0 && MOE_SW_RETURN_INT8 == 0)))) // moe-select
+#include "cake_sm120_megamoe_kernel_part020.cuh"
+#elif (MOE_INSTANCE == 3 && (MOE_SW_WIDE_RANKS == 0 && (MOE_SW_TASK_GATE_U64 == 0 && (MOE_SW_ROLE_WARP_FOLD == 0 && MOE_SW_RETURN_INT8 == 0)))) // moe-select
+#include "cake_sm120_megamoe_kernel_part022.cuh"
+#elif (MOE_INSTANCE == 3 && (MOE_SW_WIDE_RANKS == 0 && MOE_SW_RETURN_INT8 == 0)) // moe-select
+#include "cake_sm120_megamoe_kernel_part018.cuh"
+#elif (MOE_INSTANCE == 1 && (MOE_SW_POLICY_EP == 4 || MOE_SW_POLICY_EP == 8)) // moe-select
+#include "cake_sm120_megamoe_kernel_part021.cuh"
+#elif (MOE_INSTANCE == 3 && MOE_SW_ROLE_WARP_FOLD == 0) // moe-select
+#include "cake_sm120_megamoe_kernel_part023.cuh"
+#elif (MOE_INSTANCE == 3 && MOE_SW_WIDE_RANKS == 0) // moe-select
+#include "cake_sm120_megamoe_kernel_part019.cuh"
+#elif (MOE_INSTANCE == 2 && (MOE_SW_WIDE_RANKS == 0 && MOE_SW_RETURN_INT8 == 0)) // moe-select
+                        }
+                    } else {
+                        if (warp == 11 && lane == 4) {
+                            int sp_records = source_record_counts[rank];
+                            int _max_3f95d2 = (((sp_records + 8 - 1) / 8) > (dispatch_chunk_min_records) ? ((sp_records + 8 - 1) / 8) : (dispatch_chunk_min_records));
+                            int sp_q = _max_3f95d2;
+                            int sp_chunks = (sp_records + sp_q - 1) / sp_q;
+                            #pragma unroll 1
+                            for (int sp_chunk = 0; sp_chunk < sp_chunks; sp_chunk++) {
+                                {
+                                    unsigned int* _gca_p = reinterpret_cast<unsigned int*>(dispatch_chunk_scatter_counter) + (rank * 8 + sp_chunk);
+                                    while (true) {
+                                        unsigned int _gca_v;
+                                        asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_gca_v) : "l"(_gca_p) : "memory");
+                                        if (_gca_v >= (unsigned int)(dispatch_chunk_targets[rank * 8 + sp_chunk])) break;
+                                    }
+                                }
+                            }
+                            {
+                                unsigned int* _gc_p = reinterpret_cast<unsigned int*>(result_owner_progress) + (rank);
+                                unsigned int _gc_old;
+                                asm volatile("atom.release.gpu.global.add.u32 %0, [%1], 1;" : "=r"(_gc_old) : "l"(_gc_p) : "memory");
+                            }
+                            int sp_idx = 0;
+                            #pragma unroll 1
+                            for (int sp_iter = 0; sp_iter < MOE_X_1b61f2e4e4; sp_iter++) {
+                                int sp_ready = 0;
+                                unsigned long long sp_wait_t0 = 0;
+                                while (1) {
+                                    unsigned int _load_acquire_360280y;
+                                    asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_load_acquire_360280y) : "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(pr_gq_ctl)) + (1))) : "memory");
+                                    int sp_done = _load_acquire_360280y;
+                                    unsigned int _load_acquire_933ae6y;
+                                    asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_load_acquire_933ae6y) : "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(pr_gq_ctl)) + (0))) : "memory");
+                                    int sp_tail = _load_acquire_933ae6y;
+                                    if (sp_tail > sp_idx) {
+                                        sp_ready = 1;
+                                        break;
+                                    }
+                                    if (sp_done != 0) {
+                                        break;
+                                    }
+                                    unsigned long long gtimer_0_c4e315y_12;
+                                    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(gtimer_0_c4e315y_12) :: "memory");
+                                    unsigned long long wd_now_99fb2cy_11 = gtimer_0_c4e315y_12;
+                                    unsigned long long wd_t0_3a450e = sp_wait_t0;
+                                    if (sp_wait_t0 == 0) {
+                                        wd_t0_3a450e = wd_now_99fb2cy_11;
+                                    }
+                                    if (wd_now_99fb2cy_11 - wd_t0_3a450e > 600000000000) {
+                                        asm volatile("trap;" ::: "memory");
+                                    }
+                                    sp_wait_t0 = wd_t0_3a450e;
+                                }
+                                if (sp_ready == 0) {
+                                    break;
+                                }
+                                __threadfence_block();
+                                int sp_chunk_id = pr_gq[sp_idx];
+                                sp_idx += 1;
+                                if (sp_chunk_id / MOE_X_caa68debd6 == rank) {
+                                    {
+                                        unsigned int* _gc_p = reinterpret_cast<unsigned int*>(result_owner_progress) + (rank);
+                                        unsigned int _gc_old;
+                                        asm volatile("atom.release.gpu.global.add.u32 %0, [%1], 1;" : "=r"(_gc_old) : "l"(_gc_p) : "memory");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                __syncwarp();
+            }
+        }
+        if (warp >= 1 && warp < (unsigned int)world_size) {
+            int map_source = (unsigned int)rank + warp;
+            if (map_source >= world_size) {
+                map_source = map_source - world_size;
+            }
+            int map_dst_lsa = 1;
+            if ((int)peer_transport[rank * world_size + map_source] == 2) {
+                map_dst_lsa = 0;
+            }
+            if (elect_sync()) {
+                int pr_cnt[1];
+                pr_cnt[0] = 0;
+                int map_records = source_record_counts[map_source];
+                int _max_6e6450 = (((map_records + 8 - 1) / 8) > (dispatch_chunk_min_records) ? ((map_records + 8 - 1) / 8) : (dispatch_chunk_min_records));
+                int map_q = _max_6e6450;
+                int map_chunks = (map_records + map_q - 1) / map_q;
+                #pragma unroll 1
+                for (int map_chunk = 0; map_chunk < map_chunks; map_chunk++) {
+                    {
+                        unsigned int* _gca_p = reinterpret_cast<unsigned int*>(dispatch_chunk_scatter_counter) + (map_source * 8 + map_chunk);
+                        while (true) {
+                            unsigned int _gca_v;
+                            asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_gca_v) : "l"(_gca_p) : "memory");
+                            if (_gca_v >= (unsigned int)(dispatch_chunk_targets[map_source * 8 + map_chunk])) break;
+                        }
+                    }
+                }
+                int _max_81cadb = ((source_route_counts[map_source]) > (0) ? (source_route_counts[map_source]) : (0));
+                int _min_9e4e87x = ((_max_81cadb) < (MOE_X_7830131351) ? (_max_81cadb) : (MOE_X_7830131351));
+                int map_routes = _min_9e4e87x;
+                int _max_6b25c1 = ((map_routes) > (1) ? (map_routes) : (1));
+                int map_count = _max_6b25c1;
+                unsigned long long map_local_byte = (unsigned long long)(map_source * 2 + slot) * (unsigned long long)MOE_X_41088b7354 + (unsigned long long)MOE_X_6df838802e;
+                unsigned long long map_remote_byte = (unsigned long long)(rank * 2 + slot) * (unsigned long long)MOE_X_41088b7354 + (unsigned long long)MOE_X_6df838802e;
+                {
+                    if (map_dst_lsa != 0) {
+                        {
+                            unsigned long long pr_nbytes = (unsigned long long)(map_count * 4 + 15) / 16 * 16;
+                            unsigned long long pr_base = lsa_peer_ptrs[5 * world_size + map_source];
+                            int pr_nblk = (int)((pr_nbytes + (unsigned long long)MOE_X_d21107c6b0) / (unsigned long long)MOE_X_16a8c0b8b4);
+                            #pragma unroll 1
+                            for (int pr_b = 0; pr_b < pr_nblk; pr_b++) {
+                                int pr_n = pr_cnt[0];
+                                int pr_s = warp * 2 + (unsigned int)(pr_n & 1);
+                                unsigned long long pr_off = (unsigned long long)pr_b * (unsigned long long)MOE_X_16a8c0b8b4;
+                                unsigned long long _min_fb5f0b = ((pr_nbytes - pr_off) < (MOE_X_16a8c0b8b4) ? (pr_nbytes - pr_off) : (MOE_X_16a8c0b8b4));
+                                unsigned long long pr_len = _min_fb5f0b;
+                                if (pr_n >= 2) {
+                                    asm volatile("cp.async.bulk.wait_group.read 1;");
+                                }
+                                mbarrier_arrive_expect_tx(pr_full_addr + (pr_s) * 8, (int)pr_len);
+                                cp_async_bulk_gmem2smem(pr_stage_addr + (unsigned int)(pr_s * MOE_X_16a8c0b8b4), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(reinterpret_cast<uint8_t*>(result_out)) + ((unsigned long long)(map_local_byte + pr_off) * (unsigned long long)1)), (int)pr_len, pr_full_addr + (pr_s) * 8);
+                                mbarrier_wait(pr_full_addr + (pr_s) * 8, pr_n >> 1 & 1);
+                                asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                                {
+                                    void* _cpbulk_dst_142d08 = reinterpret_cast<void*>(reinterpret_cast<uint8_t*>(pr_base + map_remote_byte + pr_off));
+                                    asm volatile(
+                                        "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
+                                        :: "l"(_cpbulk_dst_142d08), "r"(pr_stage_addr + (unsigned int)(pr_s * MOE_X_16a8c0b8b4)), "r"((uint32_t)((int)pr_len))
+                                        : "memory");
+                                }
+                                asm volatile("cp.async.bulk.commit_group;");
+                                pr_cnt[0] = pr_n + 1;
+                            }
+                            asm volatile("cp.async.bulk.wait_group 0;");
+                            asm volatile("fence.proxy.async;");
+                            __threadfence_system();
+                        }
+                    }
+                }
+                __threadfence_system();
+                if ((int)peer_transport[rank * world_size + map_source] == 2) {
+                    // gin_put_signal_add: strong remote completion on context 0
+                    {
+                        ncclGin __gin{*(gin_dev_comm), (int)(0)};
+                        __gin.put(ncclTeamWorld(*(gin_dev_comm)), (int)(map_source), result_inbox_gwin_window, (size_t)(map_remote_byte), result_out_gwin_window, (size_t)(map_local_byte), (size_t)(map_count * 4),
+                            ncclGin_StrongSignalAdd{(ncclGinSignal_t)(MOE_X_96e08f30e3 + rank), (uint64_t)(1)}, ncclGin_None{}, ncclCoopThread(), ncclGin_None{}, cuda::thread_scope_thread, cuda::thread_scope_device);
+                    }
+                } else {
+                    unsigned long long lsa_dst_b04e28 = lsa_peer_ptrs[5 * world_size + map_source] + map_remote_byte;
+                    unsigned long long lsa_flag_dbe169 = lsa_peer_ptrs[8 * world_size + map_source];
+                    unsigned int* lsa_remote_f8bacay = reinterpret_cast<unsigned int*>(lsa_flag_dbe169);
+                    int lsa_channel_fe4879 = MOE_X_25bb534aec + (MOE_X_96e08f30e3 + rank);
+                    int lsa_state_index_85375e = (map_source * MOE_X_5fc76dab52 + lsa_channel_fe4879) * 2;
+                    unsigned int* lsa_state_83c5a8y = lsa_send_state + lsa_state_index_85375e;
+                    unsigned long long gtimer_0_00d6c0y_1;
+                    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(gtimer_0_00d6c0y_1) :: "memory");
+                    unsigned long long lsa_start_c47806y = gtimer_0_00d6c0y_1;
+                    unsigned int lsa_busy_c43afby = 1;
+                    while (lsa_busy_c43afby != 0) {
+                        uint32_t _atomic_cas_old_04259cy = atomicCAS(reinterpret_cast<unsigned int*>(lsa_state_83c5a8y), static_cast<unsigned int>(0), static_cast<unsigned int>(1));
+                        lsa_busy_c43afby = _atomic_cas_old_04259cy;
+                        if (lsa_busy_c43afby != 0) {
+                            unsigned long long gtimer_1_ee26c6y_1;
+                            asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(gtimer_1_ee26c6y_1) :: "memory");
+                            if (gtimer_1_ee26c6y_1 - lsa_start_c47806y > 600000000000) {
+                                asm volatile("trap;" ::: "memory");
+                            }
+                        }
+                    }
+                    __threadfence();
+                    uint8_t* lsa_pd_b3ef0ey = reinterpret_cast<uint8_t*>(lsa_dst_b04e28);
+                    uint8_t* lsa_ps_490965 = reinterpret_cast<uint8_t*>(result_out + map_local_byte);
+                    if (((lsa_dst_b04e28 | (unsigned long long)result_out + map_local_byte) & 3) == 0) {
+                        unsigned int* lsa_pd32_10981dy = reinterpret_cast<unsigned int*>(lsa_pd_b3ef0ey);
+                        unsigned int* lsa_ps32_8f09c0y = reinterpret_cast<unsigned int*>(lsa_ps_490965);
+                        {
+                            int _max_a12c7f = ((1) > (1) ? (1) : (1));
+                            #pragma unroll 1
+                            for (int lsa_i_603fa4y = 0; lsa_i_603fa4y < _max_a12c7f; lsa_i_603fa4y++) {
+                                lsa_pd32_10981dy[lsa_i_603fa4y] = lsa_ps32_8f09c0y[lsa_i_603fa4y];
+                            }
+                        }
+                        #pragma unroll 4
+                        for (int lsa_tail_680f43y = 0; lsa_tail_680f43y < 4; lsa_tail_680f43y++) {
+                            if (lsa_tail_680f43y < 0) {
+                                unsigned long long lsa_tail_index_f8358c = 4 + lsa_tail_680f43y;
+                                lsa_pd_b3ef0ey[lsa_tail_index_f8358c] = lsa_ps_490965[lsa_tail_index_f8358c];
+                            }
+                        }
+                    } else if (1) {
+                        int _max_e8c8d8 = ((1) > (4) ? (1) : (4));
+                        #pragma unroll 1
+                        for (int lsa_byte_2aaaa1y = 0; lsa_byte_2aaaa1y < _max_e8c8d8; lsa_byte_2aaaa1y++) {
+                            lsa_pd_b3ef0ey[lsa_byte_2aaaa1y] = lsa_ps_490965[lsa_byte_2aaaa1y];
+                        }
+                    }
+                    unsigned int lsa_seq_84b040y = lsa_state_83c5a8y[1] + 1;
+                    lsa_state_83c5a8y[1] = lsa_seq_84b040y;
+                    asm volatile("st.release.sys.global.u32 [%0], %1;" :: "l"(reinterpret_cast<unsigned int*>(lsa_remote_f8bacay + (lsa_channel_fe4879 * 32))), "r"(static_cast<unsigned int>(lsa_seq_84b040y)) : "memory");
+                    asm volatile("st.release.gpu.global.u32 [%0], %1;" :: "l"(reinterpret_cast<unsigned int*>(lsa_state_83c5a8y)), "r"(static_cast<unsigned int>(0)) : "memory");
+                }
+                int h29_idx = 0;
+                #pragma unroll 1
+                for (int h29_iter = 0; h29_iter < MOE_X_1b61f2e4e4; h29_iter++) {
+                    int h29_ready = 0;
+                    unsigned long long h29_wait_t0 = 0;
+                    while (1) {
+                        int h29_done = 0;
+                        int h29_tail_seen = 0;
+                        {
+                            unsigned int _load_acquire_82a81by;
+                            asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_load_acquire_82a81by) : "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(pr_gq_ctl)) + (1))) : "memory");
+                            h29_done = (int)_load_acquire_82a81by;
+                            unsigned int _load_acquire_97aad4y;
+                            asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_load_acquire_97aad4y) : "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(pr_gq_ctl)) + (0))) : "memory");
+                            h29_tail_seen = (int)_load_acquire_97aad4y;
+                        }
+                        if (h29_tail_seen > h29_idx) {
+                            h29_ready = 1;
+                            break;
+                        }
+                        if (h29_done != 0) {
+                            break;
+                        }
+                        unsigned long long gtimer_0_c4e315y_13;
+                        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(gtimer_0_c4e315y_13) :: "memory");
+                        unsigned long long wd_now_99fb2cy_12 = gtimer_0_c4e315y_13;
+                        unsigned long long wd_t0_36c7fb = h29_wait_t0;
+                        if (h29_wait_t0 == 0) {
+                            wd_t0_36c7fb = wd_now_99fb2cy_12;
+                        }
+                        if (wd_now_99fb2cy_12 - wd_t0_36c7fb > 600000000000) {
+                            asm volatile("trap;" ::: "memory");
+                        }
+                        h29_wait_t0 = wd_t0_36c7fb;
+                    }
+                    if (h29_ready == 0) {
+                        break;
+                    }
+                    __threadfence_block();
+                    int h29_chunk = 0;
+                    {
+                        h29_chunk = pr_gq[h29_idx];
+                    }
+                    h29_idx += 1;
+                    atomicMax(&svc_qctl[3 + warp], h29_idx);
+                    int h29_source = h29_chunk / MOE_X_caa68debd6;
+                    if (h29_source == map_source) {
+                        int h29_chunk_local = h29_chunk - h29_source * MOE_X_caa68debd6;
+                        int _max_967b9a = ((source_route_counts[h29_source]) > (0) ? (source_route_counts[h29_source]) : (0));
+                        int _min_30de52x = ((_max_967b9a) < (MOE_X_7830131351) ? (_max_967b9a) : (MOE_X_7830131351));
+                        int h29_routes = _min_30de52x;
+                        int h29_pq = 128;
+                        if (h29_routes >= 768 && h29_routes < 768 || h29_routes >= 8192) {
+                            h29_pq = 64;
+                        }
+                        if (h29_routes < 768) {
+                            h29_pq = 32;
+                        }
+                        int _max_a86984 = (((h29_routes + h29_pq - 1) / h29_pq - 1) > (0) ? ((h29_routes + h29_pq - 1) / h29_pq - 1) : (0));
+                        int h29_pfull = _max_a86984;
+                        int h29_pts = h29_pfull * h29_pq;
+                        int h29_start = 0;
+                        int h29_cap = h29_pq;
+                        if (h29_chunk_local < h29_pfull) {
+                            h29_start = h29_chunk_local * h29_pq;
+                        } else {
+                            h29_start = h29_pts + (h29_chunk_local - h29_pfull) * 64;
+                            h29_cap = 64;
+                        }
+                        int _min_45345a = ((h29_routes - h29_start) < (h29_cap) ? (h29_routes - h29_start) : (h29_cap));
+                        int h29_chunk_rows = _min_45345a;
+                        int _atomic_old_7d39cb = atomicAdd(&result_ovf_cursor[h29_source * MOE_X_caa68debd6 + h29_chunk_local], 0);
+                        int h29_ovf = _atomic_old_7d39cb;
+                        unsigned long long h29_local_byte = (unsigned long long)(h29_source * 2 + slot) * (unsigned long long)MOE_X_41088b7354 + (unsigned long long)h29_start * (unsigned long long)MOE_X_7aa4be4d8c;
+                        unsigned long long h29_remote_byte = (unsigned long long)(rank * 2 + slot) * (unsigned long long)MOE_X_41088b7354 + (unsigned long long)h29_start * (unsigned long long)MOE_X_7aa4be4d8c;
+                        int _min_3be609 = ((h29_ovf) < (h29_chunk_rows * MOE_CODEC_OVF_BLOCKS) ? (h29_ovf) : (h29_chunk_rows * MOE_CODEC_OVF_BLOCKS));
+                        int h29_put_bytes = h29_chunk_rows * MOE_X_2a3dd8915f + _min_3be609 * 128;
+                        int _max_b65d03 = ((owner_route_counts[h29_source]) > (0) ? (owner_route_counts[h29_source]) : (0));
+                        int _min_532bb4x = ((_max_b65d03) < (MOE_X_7830131351) ? (_max_b65d03) : (MOE_X_7830131351));
+                        int c13a2_dual = (int)(h29_routes * MOE_X_4f81408915 >= collective_rows * MOE_X_474ae89bdd || h29_routes * MOE_X_4f81408915 >= collective_rows * MOE_X_fb8d28a056 && _min_532bb4x * MOE_X_4f81408915 >= collective_rows * MOE_X_474ae89bdd);
+                        {
+                            if (map_dst_lsa != 0) {
+                                atomicMax(&protocol_error[0], 1);
+#elif (MOE_INSTANCE == 2 && MOE_SW_WIDE_RANKS == 0) // moe-select
+                        }
+                    } else {
+                        if (warp == 11 && lane == 4) {
+                            int sp_records = source_record_counts[rank];
+                            int _max_3f95d2 = (((sp_records + 8 - 1) / 8) > (dispatch_chunk_min_records) ? ((sp_records + 8 - 1) / 8) : (dispatch_chunk_min_records));
+                            int sp_q = _max_3f95d2;
+                            int sp_chunks = (sp_records + sp_q - 1) / sp_q;
+                            #pragma unroll 1
+                            for (int sp_chunk = 0; sp_chunk < sp_chunks; sp_chunk++) {
+                                {
+                                    unsigned int* _gca_p = reinterpret_cast<unsigned int*>(dispatch_chunk_scatter_counter) + (rank * 8 + sp_chunk);
+                                    while (true) {
+                                        unsigned int _gca_v;
+                                        asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_gca_v) : "l"(_gca_p) : "memory");
+                                        if (_gca_v >= (unsigned int)(dispatch_chunk_targets[rank * 8 + sp_chunk])) break;
+                                    }
+                                }
+                            }
+                            {
+                                unsigned int* _gc_p = reinterpret_cast<unsigned int*>(result_owner_progress) + (rank);
+                                unsigned int _gc_old;
+                                asm volatile("atom.release.gpu.global.add.u32 %0, [%1], 1;" : "=r"(_gc_old) : "l"(_gc_p) : "memory");
+                            }
+                            int sp_idx = 0;
+                            #pragma unroll 1
+                            for (int sp_iter = 0; sp_iter < MOE_X_1b61f2e4e4; sp_iter++) {
+                                int sp_ready = 0;
+                                unsigned long long sp_wait_t0 = 0;
+                                while (1) {
+                                    unsigned int _load_acquire_360280y;
+                                    asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_load_acquire_360280y) : "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(pr_gq_ctl)) + (1))) : "memory");
+                                    int sp_done = _load_acquire_360280y;
+                                    unsigned int _load_acquire_933ae6y;
+                                    asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_load_acquire_933ae6y) : "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(pr_gq_ctl)) + (0))) : "memory");
+                                    int sp_tail = _load_acquire_933ae6y;
+                                    if (sp_tail > sp_idx) {
+                                        sp_ready = 1;
+                                        break;
+                                    }
+                                    if (sp_done != 0) {
+                                        break;
+                                    }
+                                    unsigned long long gtimer_0_c4e315y_12;
+                                    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(gtimer_0_c4e315y_12) :: "memory");
+                                    unsigned long long wd_now_99fb2cy_11 = gtimer_0_c4e315y_12;
+                                    unsigned long long wd_t0_3a450e = sp_wait_t0;
+                                    if (sp_wait_t0 == 0) {
+                                        wd_t0_3a450e = wd_now_99fb2cy_11;
+                                    }
+                                    if (wd_now_99fb2cy_11 - wd_t0_3a450e > 600000000000) {
+                                        asm volatile("trap;" ::: "memory");
+                                    }
+                                    sp_wait_t0 = wd_t0_3a450e;
+                                }
+                                if (sp_ready == 0) {
+                                    break;
+                                }
+                                __threadfence_block();
+                                int sp_chunk_id = pr_gq[sp_idx];
+                                sp_idx += 1;
+                                if (sp_chunk_id / MOE_X_caa68debd6 == rank) {
+                                    {
+                                        unsigned int* _gc_p = reinterpret_cast<unsigned int*>(result_owner_progress) + (rank);
+                                        unsigned int _gc_old;
+                                        asm volatile("atom.release.gpu.global.add.u32 %0, [%1], 1;" : "=r"(_gc_old) : "l"(_gc_p) : "memory");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                __syncwarp();
+            }
+        }
+        if (warp >= 1 && warp < (unsigned int)world_size) {
+            int map_source = (unsigned int)rank + warp;
+            if (map_source >= world_size) {
+                map_source = map_source - world_size;
+            }
+            int map_dst_lsa = 1;
+            if ((int)peer_transport[rank * world_size + map_source] == 2) {
+                map_dst_lsa = 0;
+            }
+            if (elect_sync()) {
+                int pr_cnt[1];
+                pr_cnt[0] = 0;
+                int map_records = source_record_counts[map_source];
+                int _max_6e6450 = (((map_records + 8 - 1) / 8) > (dispatch_chunk_min_records) ? ((map_records + 8 - 1) / 8) : (dispatch_chunk_min_records));
+                int map_q = _max_6e6450;
+                int map_chunks = (map_records + map_q - 1) / map_q;
+                #pragma unroll 1
+                for (int map_chunk = 0; map_chunk < map_chunks; map_chunk++) {
+                    {
+                        unsigned int* _gca_p = reinterpret_cast<unsigned int*>(dispatch_chunk_scatter_counter) + (map_source * 8 + map_chunk);
+                        while (true) {
+                            unsigned int _gca_v;
+                            asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_gca_v) : "l"(_gca_p) : "memory");
+                            if (_gca_v >= (unsigned int)(dispatch_chunk_targets[map_source * 8 + map_chunk])) break;
+                        }
+                    }
+                }
+                int _max_81cadb = ((source_route_counts[map_source]) > (0) ? (source_route_counts[map_source]) : (0));
+                int _min_9e4e87x = ((_max_81cadb) < (MOE_X_7830131351) ? (_max_81cadb) : (MOE_X_7830131351));
+                int map_routes = _min_9e4e87x;
+                int _max_6b25c1 = ((map_routes) > (1) ? (map_routes) : (1));
+                int map_count = _max_6b25c1;
+                unsigned long long map_local_byte = (unsigned long long)(map_source * 2 + slot) * (unsigned long long)MOE_X_51dea414ef + (unsigned long long)MOE_X_3296bcaabb;
+                unsigned long long map_remote_byte = (unsigned long long)(rank * 2 + slot) * (unsigned long long)MOE_X_51dea414ef + (unsigned long long)MOE_X_3296bcaabb;
+                {
+                    if (map_dst_lsa != 0) {
+                        {
+                            unsigned long long pr_nbytes = (unsigned long long)(map_count * 4 + 15) / 16 * 16;
+                            unsigned long long pr_base = lsa_peer_ptrs[5 * world_size + map_source];
+                            int pr_nblk = (int)((pr_nbytes + (unsigned long long)MOE_X_d21107c6b0) / (unsigned long long)MOE_X_16a8c0b8b4);
+                            #pragma unroll 1
+                            for (int pr_b = 0; pr_b < pr_nblk; pr_b++) {
+                                int pr_n = pr_cnt[0];
+                                int pr_s = warp * 2 + (unsigned int)(pr_n & 1);
+                                unsigned long long pr_off = (unsigned long long)pr_b * (unsigned long long)MOE_X_16a8c0b8b4;
+                                unsigned long long _min_fb5f0b = ((pr_nbytes - pr_off) < (MOE_X_16a8c0b8b4) ? (pr_nbytes - pr_off) : (MOE_X_16a8c0b8b4));
+                                unsigned long long pr_len = _min_fb5f0b;
+                                if (pr_n >= 2) {
+                                    asm volatile("cp.async.bulk.wait_group.read 1;");
+                                }
+                                mbarrier_arrive_expect_tx(pr_full_addr + (pr_s) * 8, (int)pr_len);
+                                cp_async_bulk_gmem2smem(pr_stage_addr + (unsigned int)(pr_s * MOE_X_16a8c0b8b4), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(reinterpret_cast<uint8_t*>(result_out)) + ((unsigned long long)(map_local_byte + pr_off) * (unsigned long long)1)), (int)pr_len, pr_full_addr + (pr_s) * 8);
+                                mbarrier_wait(pr_full_addr + (pr_s) * 8, pr_n >> 1 & 1);
+                                asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                                {
+                                    void* _cpbulk_dst_142d08 = reinterpret_cast<void*>(reinterpret_cast<uint8_t*>(pr_base + map_remote_byte + pr_off));
+                                    asm volatile(
+                                        "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
+                                        :: "l"(_cpbulk_dst_142d08), "r"(pr_stage_addr + (unsigned int)(pr_s * MOE_X_16a8c0b8b4)), "r"((uint32_t)((int)pr_len))
+                                        : "memory");
+                                }
+                                asm volatile("cp.async.bulk.commit_group;");
+                                pr_cnt[0] = pr_n + 1;
+                            }
+                            asm volatile("cp.async.bulk.wait_group 0;");
+                            asm volatile("fence.proxy.async;");
+                            __threadfence_system();
+                        }
+                    }
+                }
+                __threadfence_system();
+                if ((int)peer_transport[rank * world_size + map_source] == 2) {
+                    // gin_put_signal_add: strong remote completion on context 0
+                    {
+                        ncclGin __gin{*(gin_dev_comm), (int)(0)};
+                        __gin.put(ncclTeamWorld(*(gin_dev_comm)), (int)(map_source), result_inbox_gwin_window, (size_t)(map_remote_byte), result_out_gwin_window, (size_t)(map_local_byte), (size_t)(map_count * 4),
+                            ncclGin_StrongSignalAdd{(ncclGinSignal_t)(MOE_X_96e08f30e3 + rank), (uint64_t)(1)}, ncclGin_None{}, ncclCoopThread(), ncclGin_None{}, cuda::thread_scope_thread, cuda::thread_scope_device);
+                    }
+                } else {
+                    unsigned long long lsa_dst_b04e28 = lsa_peer_ptrs[5 * world_size + map_source] + map_remote_byte;
+                    unsigned long long lsa_flag_dbe169 = lsa_peer_ptrs[8 * world_size + map_source];
+                    unsigned int* lsa_remote_f8bacay = reinterpret_cast<unsigned int*>(lsa_flag_dbe169);
+                    int lsa_channel_fe4879 = MOE_X_25bb534aec + (MOE_X_96e08f30e3 + rank);
+                    int lsa_state_index_85375e = (map_source * MOE_X_5fc76dab52 + lsa_channel_fe4879) * 2;
+                    unsigned int* lsa_state_83c5a8y = lsa_send_state + lsa_state_index_85375e;
+                    unsigned long long gtimer_0_00d6c0y_1;
+                    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(gtimer_0_00d6c0y_1) :: "memory");
+                    unsigned long long lsa_start_c47806y = gtimer_0_00d6c0y_1;
+                    unsigned int lsa_busy_c43afby = 1;
+                    while (lsa_busy_c43afby != 0) {
+                        uint32_t _atomic_cas_old_04259cy = atomicCAS(reinterpret_cast<unsigned int*>(lsa_state_83c5a8y), static_cast<unsigned int>(0), static_cast<unsigned int>(1));
+                        lsa_busy_c43afby = _atomic_cas_old_04259cy;
+                        if (lsa_busy_c43afby != 0) {
+                            unsigned long long gtimer_1_ee26c6y_1;
+                            asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(gtimer_1_ee26c6y_1) :: "memory");
+                            if (gtimer_1_ee26c6y_1 - lsa_start_c47806y > 600000000000) {
+                                asm volatile("trap;" ::: "memory");
+                            }
+                        }
+                    }
+                    __threadfence();
+                    uint8_t* lsa_pd_b3ef0ey = reinterpret_cast<uint8_t*>(lsa_dst_b04e28);
+                    uint8_t* lsa_ps_490965 = reinterpret_cast<uint8_t*>(result_out + map_local_byte);
+                    if (((lsa_dst_b04e28 | (unsigned long long)result_out + map_local_byte) & 3) == 0) {
+                        unsigned int* lsa_pd32_10981dy = reinterpret_cast<unsigned int*>(lsa_pd_b3ef0ey);
+                        unsigned int* lsa_ps32_8f09c0y = reinterpret_cast<unsigned int*>(lsa_ps_490965);
+                        {
+                            int _max_a12c7f = ((1) > (1) ? (1) : (1));
+                            #pragma unroll 1
+                            for (int lsa_i_603fa4y = 0; lsa_i_603fa4y < _max_a12c7f; lsa_i_603fa4y++) {
+                                lsa_pd32_10981dy[lsa_i_603fa4y] = lsa_ps32_8f09c0y[lsa_i_603fa4y];
+                            }
+                        }
+                        #pragma unroll 4
+                        for (int lsa_tail_680f43y = 0; lsa_tail_680f43y < 4; lsa_tail_680f43y++) {
+                            if (lsa_tail_680f43y < 0) {
+                                unsigned long long lsa_tail_index_f8358c = 4 + lsa_tail_680f43y;
+                                lsa_pd_b3ef0ey[lsa_tail_index_f8358c] = lsa_ps_490965[lsa_tail_index_f8358c];
+                            }
+                        }
+                    } else if (1) {
+                        int _max_e8c8d8 = ((1) > (4) ? (1) : (4));
+                        #pragma unroll 1
+                        for (int lsa_byte_2aaaa1y = 0; lsa_byte_2aaaa1y < _max_e8c8d8; lsa_byte_2aaaa1y++) {
+                            lsa_pd_b3ef0ey[lsa_byte_2aaaa1y] = lsa_ps_490965[lsa_byte_2aaaa1y];
+                        }
+                    }
+                    unsigned int lsa_seq_84b040y = lsa_state_83c5a8y[1] + 1;
+                    lsa_state_83c5a8y[1] = lsa_seq_84b040y;
+                    asm volatile("st.release.sys.global.u32 [%0], %1;" :: "l"(reinterpret_cast<unsigned int*>(lsa_remote_f8bacay + (lsa_channel_fe4879 * 32))), "r"(static_cast<unsigned int>(lsa_seq_84b040y)) : "memory");
+                    asm volatile("st.release.gpu.global.u32 [%0], %1;" :: "l"(reinterpret_cast<unsigned int*>(lsa_state_83c5a8y)), "r"(static_cast<unsigned int>(0)) : "memory");
+                }
+                int h29_idx = 0;
+                #pragma unroll 1
+                for (int h29_iter = 0; h29_iter < MOE_X_1b61f2e4e4; h29_iter++) {
+                    int h29_ready = 0;
+                    unsigned long long h29_wait_t0 = 0;
+                    while (1) {
+                        int h29_done = 0;
+                        int h29_tail_seen = 0;
+                        {
+                            unsigned int _load_acquire_82a81by;
+                            asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_load_acquire_82a81by) : "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(pr_gq_ctl)) + (1))) : "memory");
+                            h29_done = (int)_load_acquire_82a81by;
+                            unsigned int _load_acquire_97aad4y;
+                            asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_load_acquire_97aad4y) : "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(pr_gq_ctl)) + (0))) : "memory");
+                            h29_tail_seen = (int)_load_acquire_97aad4y;
+                        }
+                        if (h29_tail_seen > h29_idx) {
+                            h29_ready = 1;
+                            break;
+                        }
+                        if (h29_done != 0) {
+                            break;
+                        }
+                        unsigned long long gtimer_0_c4e315y_13;
+                        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(gtimer_0_c4e315y_13) :: "memory");
+                        unsigned long long wd_now_99fb2cy_12 = gtimer_0_c4e315y_13;
+                        unsigned long long wd_t0_36c7fb = h29_wait_t0;
+                        if (h29_wait_t0 == 0) {
+                            wd_t0_36c7fb = wd_now_99fb2cy_12;
+                        }
+                        if (wd_now_99fb2cy_12 - wd_t0_36c7fb > 600000000000) {
+                            asm volatile("trap;" ::: "memory");
+                        }
+                        h29_wait_t0 = wd_t0_36c7fb;
+                    }
+                    if (h29_ready == 0) {
+                        break;
+                    }
+                    __threadfence_block();
+                    int h29_chunk = 0;
+                    {
+                        h29_chunk = pr_gq[h29_idx];
+                    }
+                    h29_idx += 1;
+                    atomicMax(&svc_qctl[3 + warp], h29_idx);
+                    int h29_source = h29_chunk / MOE_X_caa68debd6;
+                    if (h29_source == map_source) {
+                        int h29_chunk_local = h29_chunk - h29_source * MOE_X_caa68debd6;
+                        int _max_967b9a = ((source_route_counts[h29_source]) > (0) ? (source_route_counts[h29_source]) : (0));
+                        int _min_30de52x = ((_max_967b9a) < (MOE_X_7830131351) ? (_max_967b9a) : (MOE_X_7830131351));
+                        int h29_routes = _min_30de52x;
+                        int h29_pq = 128;
+                        if (h29_routes >= 768 && h29_routes < 768 || h29_routes >= 8192) {
+                            h29_pq = 64;
+                        }
+                        if (h29_routes < 768) {
+                            h29_pq = 32;
+                        }
+                        int _max_a86984 = (((h29_routes + h29_pq - 1) / h29_pq - 1) > (0) ? ((h29_routes + h29_pq - 1) / h29_pq - 1) : (0));
+                        int h29_pfull = _max_a86984;
+                        int h29_pts = h29_pfull * h29_pq;
+                        int h29_start = 0;
+                        int h29_cap = h29_pq;
+                        if (h29_chunk_local < h29_pfull) {
+                            h29_start = h29_chunk_local * h29_pq;
+                        } else {
+                            h29_start = h29_pts + (h29_chunk_local - h29_pfull) * 64;
+                            h29_cap = 64;
+                        }
+                        int _min_45345a = ((h29_routes - h29_start) < (h29_cap) ? (h29_routes - h29_start) : (h29_cap));
+                        int h29_chunk_rows = _min_45345a;
+                        int _atomic_old_7d39cb = atomicAdd(&result_ovf_cursor[h29_source * MOE_X_caa68debd6 + h29_chunk_local], 0);
+                        int h29_ovf = _atomic_old_7d39cb;
+                        unsigned long long h29_local_byte = (unsigned long long)(h29_source * 2 + slot) * (unsigned long long)MOE_X_51dea414ef + (unsigned long long)h29_start * (unsigned long long)MOE_X_efce35e873;
+                        unsigned long long h29_remote_byte = (unsigned long long)(rank * 2 + slot) * (unsigned long long)MOE_X_51dea414ef + (unsigned long long)h29_start * (unsigned long long)MOE_X_efce35e873;
+                        int _min_3be609 = ((h29_ovf) < (h29_chunk_rows * MOE_CODEC_OVF_BLOCKS) ? (h29_ovf) : (h29_chunk_rows * MOE_CODEC_OVF_BLOCKS));
+                        int h29_put_bytes = h29_chunk_rows * MOE_X_efce35e873 + _min_3be609 * 128;
+                        int _max_b65d03 = ((owner_route_counts[h29_source]) > (0) ? (owner_route_counts[h29_source]) : (0));
+                        int _min_532bb4x = ((_max_b65d03) < (MOE_X_7830131351) ? (_max_b65d03) : (MOE_X_7830131351));
+                        int c13a2_dual = (int)(h29_routes * MOE_X_4f81408915 >= collective_rows * MOE_X_474ae89bdd || h29_routes * MOE_X_4f81408915 >= collective_rows * MOE_X_fb8d28a056 && _min_532bb4x * MOE_X_4f81408915 >= collective_rows * MOE_X_474ae89bdd);
+                        {
+                            if (map_dst_lsa != 0) {
+                                atomicMax(&protocol_error[0], 1);
+#elif ((MOE_INSTANCE == 2 && MOE_SW_RETURN_INT8 == 0) || (MOE_INSTANCE == 3 && MOE_SW_RETURN_INT8 == 0)) // moe-select
+                            __threadfence();
+                            uint8_t* lsa_pd_b3ef0ey = reinterpret_cast<uint8_t*>(lsa_dst_b04e28);
+                            uint8_t* lsa_ps_490965 = reinterpret_cast<uint8_t*>(result_out + map_local_byte);
+                            if (((lsa_dst_b04e28 | (unsigned long long)result_out + map_local_byte) & 3) == 0) {
+                                unsigned int* lsa_pd32_10981dy = reinterpret_cast<unsigned int*>(lsa_pd_b3ef0ey);
+                                unsigned int* lsa_ps32_8f09c0y = reinterpret_cast<unsigned int*>(lsa_ps_490965);
+                                {
+                                    int _max_a12c7f = ((1) > (1) ? (1) : (1));
+                                    #pragma unroll 1
+                                    for (int lsa_i_603fa4y = 0; lsa_i_603fa4y < _max_a12c7f; lsa_i_603fa4y++) {
+                                        lsa_pd32_10981dy[lsa_i_603fa4y] = lsa_ps32_8f09c0y[lsa_i_603fa4y];
+                                    }
+                                }
+                                #pragma unroll 4
+                                for (int lsa_tail_680f43y = 0; lsa_tail_680f43y < 4; lsa_tail_680f43y++) {
+                                    if (lsa_tail_680f43y < 0) {
+                                        unsigned long long lsa_tail_index_f8358c = 4 + lsa_tail_680f43y;
+                                        lsa_pd_b3ef0ey[lsa_tail_index_f8358c] = lsa_ps_490965[lsa_tail_index_f8358c];
+                                    }
+                                }
+                            } else if (1) {
+                                int _max_e8c8d8 = ((1) > (4) ? (1) : (4));
+                                #pragma unroll 1
+                                for (int lsa_byte_2aaaa1y = 0; lsa_byte_2aaaa1y < _max_e8c8d8; lsa_byte_2aaaa1y++) {
+                                    lsa_pd_b3ef0ey[lsa_byte_2aaaa1y] = lsa_ps_490965[lsa_byte_2aaaa1y];
+                                }
+                            }
+                            unsigned int lsa_seq_84b040y = lsa_state_83c5a8y[1] + 1;
+                            lsa_state_83c5a8y[1] = lsa_seq_84b040y;
+                            asm volatile("st.release.sys.global.u32 [%0], %1;" :: "l"(reinterpret_cast<unsigned int*>(lsa_remote_f8bacay + (lsa_channel_fe4879 * 32))), "r"(static_cast<unsigned int>(lsa_seq_84b040y)) : "memory");
+                            asm volatile("st.release.gpu.global.u32 [%0], %1;" :: "l"(reinterpret_cast<unsigned int*>(lsa_state_83c5a8y)), "r"(static_cast<unsigned int>(0)) : "memory");
+                        }
+                    }
+                }
+                int h29_idx = 0;
+                #pragma unroll 1
+                for (int h29_iter = 0; h29_iter < MOE_X_1b61f2e4e4; h29_iter++) {
+                    int h29_ready = 0;
+                    unsigned long long h29_wait_t0 = 0;
+                    while (1) {
+                        int h29_done = 0;
+                        int h29_tail_seen = 0;
+                        {
+                            unsigned int _load_acquire_82a81by;
+                            asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_load_acquire_82a81by) : "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(pr_gq_ctl)) + (1))) : "memory");
+                            h29_done = (int)_load_acquire_82a81by;
+                            unsigned int _load_acquire_97aad4y;
+                            asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_load_acquire_97aad4y) : "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(pr_gq_ctl)) + (0))) : "memory");
+                            h29_tail_seen = (int)_load_acquire_97aad4y;
+                        }
+                        if (h29_tail_seen > h29_idx) {
+                            h29_ready = 1;
+                            break;
+                        }
+                        if (h29_done != 0) {
+                            break;
+                        }
+                        unsigned long long gtimer_0_c4e315y_7;
+                        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(gtimer_0_c4e315y_7) :: "memory");
+                        unsigned long long wd_now_99fb2cy_6 = gtimer_0_c4e315y_7;
+                        unsigned long long wd_t0_36c7fb = h29_wait_t0;
+                        if (h29_wait_t0 == 0) {
+                            wd_t0_36c7fb = wd_now_99fb2cy_6;
+                        }
+                        if (wd_now_99fb2cy_6 - wd_t0_36c7fb > 600000000000) {
+                            asm volatile("trap;" ::: "memory");
+                        }
+                        h29_wait_t0 = wd_t0_36c7fb;
+                    }
+                    if (h29_ready == 0) {
+                        break;
+                    }
+                    __threadfence_block();
+                    int h29_chunk = 0;
+                    {
+                        h29_chunk = pr_gq[h29_idx];
+                    }
+                    h29_idx += 1;
+                    #pragma unroll 1
+                    for (int h29_cpass = 0; h29_cpass < MOE_X_31a3e1eabe; h29_cpass++) {
+                        int h29_co = warp + (unsigned int)(h29_cpass * 7);
+                        if (h29_co < world_size) {
+                            atomicMax(&svc_qctl[3 + h29_co], h29_idx);
+                        }
+                    }
+                    int h29_source = h29_chunk / MOE_X_caa68debd6;
+                    int h29_off = h29_source - rank;
+                    if (h29_off < 0) {
+                        h29_off = h29_off + world_size;
+                    }
+                    int h29_mine = 0;
+                    #pragma unroll 1
+                    for (int h29_mpass = 0; h29_mpass < MOE_X_31a3e1eabe; h29_mpass++) {
+                        if ((unsigned int)h29_off == warp + (unsigned int)(h29_mpass * 7)) {
+                            h29_mine = 1;
+                        }
+                    }
+                    if (h29_mine != 0) {
+                        int h29_dst_lsa = 1;
+                        if ((int)peer_transport[rank * world_size + h29_source] == 2) {
+                            h29_dst_lsa = 0;
+                        }
+                        int h29_chunk_local = h29_chunk - h29_source * MOE_X_caa68debd6;
+                        int _max_967b9a = ((source_route_counts[h29_source]) > (0) ? (source_route_counts[h29_source]) : (0));
+                        int _min_30de52x = ((_max_967b9a) < (MOE_X_7830131351) ? (_max_967b9a) : (MOE_X_7830131351));
+                        int h29_routes = _min_30de52x;
+                        int h29_pq = 128;
+                        if (h29_routes >= 768 && h29_routes < 768 || h29_routes >= 8192) {
+                            h29_pq = 64;
+                        }
+                        if (h29_routes < 768) {
+                            h29_pq = 32;
+                        }
+                        int _max_a86984 = (((h29_routes + h29_pq - 1) / h29_pq - 1) > (0) ? ((h29_routes + h29_pq - 1) / h29_pq - 1) : (0));
+                        int h29_pfull = _max_a86984;
+                        int h29_pts = h29_pfull * h29_pq;
+                        int h29_start = 0;
+                        int h29_cap = h29_pq;
+                        if (h29_chunk_local < h29_pfull) {
+                            h29_start = h29_chunk_local * h29_pq;
+                        } else {
+                            h29_start = h29_pts + (h29_chunk_local - h29_pfull) * 64;
+                            h29_cap = 64;
+                        }
+                        int _min_45345a = ((h29_routes - h29_start) < (h29_cap) ? (h29_routes - h29_start) : (h29_cap));
+                        int h29_chunk_rows = _min_45345a;
+                        int _atomic_old_7d39cb = atomicAdd(&result_ovf_cursor[h29_source * MOE_X_caa68debd6 + h29_chunk_local], 0);
+                        int h29_ovf = _atomic_old_7d39cb;
+                        unsigned long long h29_local_byte = (unsigned long long)(h29_source * 2 + slot) * (unsigned long long)MOE_X_41088b7354 + (unsigned long long)h29_start * (unsigned long long)MOE_X_7aa4be4d8c;
+                        unsigned long long h29_remote_byte = (unsigned long long)(rank * 2 + slot) * (unsigned long long)MOE_X_41088b7354 + (unsigned long long)h29_start * (unsigned long long)MOE_X_7aa4be4d8c;
+                        int _min_3be609 = ((h29_ovf) < (h29_chunk_rows * MOE_CODEC_OVF_BLOCKS) ? (h29_ovf) : (h29_chunk_rows * MOE_CODEC_OVF_BLOCKS));
+                        int h29_put_bytes = h29_chunk_rows * MOE_X_2a3dd8915f + _min_3be609 * 128;
+                        int _max_b65d03 = ((owner_route_counts[h29_source]) > (0) ? (owner_route_counts[h29_source]) : (0));
+                        int _min_532bb4x = ((_max_b65d03) < (MOE_X_7830131351) ? (_max_b65d03) : (MOE_X_7830131351));
+                        int c13a2_dual = (int)(h29_routes * MOE_X_4f81408915 >= collective_rows * MOE_X_474ae89bdd || h29_routes * MOE_X_4f81408915 >= collective_rows * MOE_X_fb8d28a056 && _min_532bb4x * MOE_X_4f81408915 >= collective_rows * MOE_X_474ae89bdd);
+                        {
+                            if (h29_dst_lsa != 0) {
+                                atomicMax(&protocol_error[0], 1);
+#elif (MOE_INSTANCE == 2 || MOE_INSTANCE == 3) // moe-select
+                            __threadfence();
+                            uint8_t* lsa_pd_b3ef0ey = reinterpret_cast<uint8_t*>(lsa_dst_b04e28);
+                            uint8_t* lsa_ps_490965 = reinterpret_cast<uint8_t*>(result_out + map_local_byte);
+                            if (((lsa_dst_b04e28 | (unsigned long long)result_out + map_local_byte) & 3) == 0) {
+                                unsigned int* lsa_pd32_10981dy = reinterpret_cast<unsigned int*>(lsa_pd_b3ef0ey);
+                                unsigned int* lsa_ps32_8f09c0y = reinterpret_cast<unsigned int*>(lsa_ps_490965);
+                                {
+                                    int _max_a12c7f = ((1) > (1) ? (1) : (1));
+                                    #pragma unroll 1
+                                    for (int lsa_i_603fa4y = 0; lsa_i_603fa4y < _max_a12c7f; lsa_i_603fa4y++) {
+                                        lsa_pd32_10981dy[lsa_i_603fa4y] = lsa_ps32_8f09c0y[lsa_i_603fa4y];
+                                    }
+                                }
+                                #pragma unroll 4
+                                for (int lsa_tail_680f43y = 0; lsa_tail_680f43y < 4; lsa_tail_680f43y++) {
+                                    if (lsa_tail_680f43y < 0) {
+                                        unsigned long long lsa_tail_index_f8358c = 4 + lsa_tail_680f43y;
+                                        lsa_pd_b3ef0ey[lsa_tail_index_f8358c] = lsa_ps_490965[lsa_tail_index_f8358c];
+                                    }
+                                }
+                            } else if (1) {
+                                int _max_e8c8d8 = ((1) > (4) ? (1) : (4));
+                                #pragma unroll 1
+                                for (int lsa_byte_2aaaa1y = 0; lsa_byte_2aaaa1y < _max_e8c8d8; lsa_byte_2aaaa1y++) {
+                                    lsa_pd_b3ef0ey[lsa_byte_2aaaa1y] = lsa_ps_490965[lsa_byte_2aaaa1y];
+                                }
+                            }
+                            unsigned int lsa_seq_84b040y = lsa_state_83c5a8y[1] + 1;
+                            lsa_state_83c5a8y[1] = lsa_seq_84b040y;
+                            asm volatile("st.release.sys.global.u32 [%0], %1;" :: "l"(reinterpret_cast<unsigned int*>(lsa_remote_f8bacay + (lsa_channel_fe4879 * 32))), "r"(static_cast<unsigned int>(lsa_seq_84b040y)) : "memory");
+                            asm volatile("st.release.gpu.global.u32 [%0], %1;" :: "l"(reinterpret_cast<unsigned int*>(lsa_state_83c5a8y)), "r"(static_cast<unsigned int>(0)) : "memory");
+                        }
+                    }
+                }
+                int h29_idx = 0;
+                #pragma unroll 1
+                for (int h29_iter = 0; h29_iter < MOE_X_1b61f2e4e4; h29_iter++) {
+                    int h29_ready = 0;
+                    unsigned long long h29_wait_t0 = 0;
+                    while (1) {
+                        int h29_done = 0;
+                        int h29_tail_seen = 0;
+                        {
+                            unsigned int _load_acquire_82a81by;
+                            asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_load_acquire_82a81by) : "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(pr_gq_ctl)) + (1))) : "memory");
+                            h29_done = (int)_load_acquire_82a81by;
+                            unsigned int _load_acquire_97aad4y;
+                            asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_load_acquire_97aad4y) : "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(pr_gq_ctl)) + (0))) : "memory");
+                            h29_tail_seen = (int)_load_acquire_97aad4y;
+                        }
+                        if (h29_tail_seen > h29_idx) {
+                            h29_ready = 1;
+                            break;
+                        }
+                        if (h29_done != 0) {
+                            break;
+                        }
+                        unsigned long long gtimer_0_c4e315y_7;
+                        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(gtimer_0_c4e315y_7) :: "memory");
+                        unsigned long long wd_now_99fb2cy_6 = gtimer_0_c4e315y_7;
+                        unsigned long long wd_t0_36c7fb = h29_wait_t0;
+                        if (h29_wait_t0 == 0) {
+                            wd_t0_36c7fb = wd_now_99fb2cy_6;
+                        }
+                        if (wd_now_99fb2cy_6 - wd_t0_36c7fb > 600000000000) {
+                            asm volatile("trap;" ::: "memory");
+                        }
+                        h29_wait_t0 = wd_t0_36c7fb;
+                    }
+                    if (h29_ready == 0) {
+                        break;
+                    }
+                    __threadfence_block();
+                    int h29_chunk = 0;
+                    {
+                        h29_chunk = pr_gq[h29_idx];
+                    }
+                    h29_idx += 1;
+                    #pragma unroll 1
+                    for (int h29_cpass = 0; h29_cpass < MOE_X_31a3e1eabe; h29_cpass++) {
+                        int h29_co = warp + (unsigned int)(h29_cpass * 7);
+                        if (h29_co < world_size) {
+                            atomicMax(&svc_qctl[3 + h29_co], h29_idx);
+                        }
+                    }
+                    int h29_source = h29_chunk / MOE_X_caa68debd6;
+                    int h29_off = h29_source - rank;
+                    if (h29_off < 0) {
+                        h29_off = h29_off + world_size;
+                    }
+                    int h29_mine = 0;
+                    #pragma unroll 1
+                    for (int h29_mpass = 0; h29_mpass < MOE_X_31a3e1eabe; h29_mpass++) {
+                        if ((unsigned int)h29_off == warp + (unsigned int)(h29_mpass * 7)) {
+                            h29_mine = 1;
+                        }
+                    }
+                    if (h29_mine != 0) {
+                        int h29_dst_lsa = 1;
+                        if ((int)peer_transport[rank * world_size + h29_source] == 2) {
+                            h29_dst_lsa = 0;
+                        }
+                        int h29_chunk_local = h29_chunk - h29_source * MOE_X_caa68debd6;
+                        int _max_967b9a = ((source_route_counts[h29_source]) > (0) ? (source_route_counts[h29_source]) : (0));
+                        int _min_30de52x = ((_max_967b9a) < (MOE_X_7830131351) ? (_max_967b9a) : (MOE_X_7830131351));
+                        int h29_routes = _min_30de52x;
+                        int h29_pq = 128;
+                        if (h29_routes >= 768 && h29_routes < 768 || h29_routes >= 8192) {
+                            h29_pq = 64;
+                        }
+                        if (h29_routes < 768) {
+                            h29_pq = 32;
+                        }
+                        int _max_a86984 = (((h29_routes + h29_pq - 1) / h29_pq - 1) > (0) ? ((h29_routes + h29_pq - 1) / h29_pq - 1) : (0));
+                        int h29_pfull = _max_a86984;
+                        int h29_pts = h29_pfull * h29_pq;
+                        int h29_start = 0;
+                        int h29_cap = h29_pq;
+                        if (h29_chunk_local < h29_pfull) {
+                            h29_start = h29_chunk_local * h29_pq;
+                        } else {
+                            h29_start = h29_pts + (h29_chunk_local - h29_pfull) * 64;
+                            h29_cap = 64;
+                        }
+                        int _min_45345a = ((h29_routes - h29_start) < (h29_cap) ? (h29_routes - h29_start) : (h29_cap));
+                        int h29_chunk_rows = _min_45345a;
+                        int _atomic_old_7d39cb = atomicAdd(&result_ovf_cursor[h29_source * MOE_X_caa68debd6 + h29_chunk_local], 0);
+                        int h29_ovf = _atomic_old_7d39cb;
+                        unsigned long long h29_local_byte = (unsigned long long)(h29_source * 2 + slot) * (unsigned long long)MOE_X_51dea414ef + (unsigned long long)h29_start * (unsigned long long)MOE_X_efce35e873;
+                        unsigned long long h29_remote_byte = (unsigned long long)(rank * 2 + slot) * (unsigned long long)MOE_X_51dea414ef + (unsigned long long)h29_start * (unsigned long long)MOE_X_efce35e873;
+                        int _min_3be609 = ((h29_ovf) < (h29_chunk_rows * MOE_CODEC_OVF_BLOCKS) ? (h29_ovf) : (h29_chunk_rows * MOE_CODEC_OVF_BLOCKS));
+                        int h29_put_bytes = h29_chunk_rows * MOE_X_efce35e873 + _min_3be609 * 128;
+                        int _max_b65d03 = ((owner_route_counts[h29_source]) > (0) ? (owner_route_counts[h29_source]) : (0));
+                        int _min_532bb4x = ((_max_b65d03) < (MOE_X_7830131351) ? (_max_b65d03) : (MOE_X_7830131351));
+                        int c13a2_dual = (int)(h29_routes * MOE_X_4f81408915 >= collective_rows * MOE_X_474ae89bdd || h29_routes * MOE_X_4f81408915 >= collective_rows * MOE_X_fb8d28a056 && _min_532bb4x * MOE_X_4f81408915 >= collective_rows * MOE_X_474ae89bdd);
+                        {
+                            if (h29_dst_lsa != 0) {
+                                atomicMax(&protocol_error[0], 1);
+#elif (MOE_SW_WIDE_RANKS == 0 && (MOE_SW_ROLE_PEER_FOLD == 0 && MOE_SW_RETURN_INT8 == 0)) // moe-select
                         }
                     }
                     __syncwarp();
@@ -5677,7 +5955,7 @@
                                         }
                                     }
                                 }
-#elif (MOE_INSTANCE == 1 && MOE_SW_ROLE_PEER_FOLD == 0) // moe-select
+#elif MOE_SW_ROLE_PEER_FOLD == 0 // moe-select
                         }
                     }
                     __syncwarp();
@@ -5992,284 +6270,6 @@
                                         }
                                     }
                                 }
-#elif ((MOE_INSTANCE == 2 && MOE_SW_RETURN_INT8 == 0) || (MOE_INSTANCE == 3 && MOE_SW_RETURN_INT8 == 0)) // moe-select
-                            __threadfence();
-                            uint8_t* lsa_pd_b3ef0ey = reinterpret_cast<uint8_t*>(lsa_dst_b04e28);
-                            uint8_t* lsa_ps_490965 = reinterpret_cast<uint8_t*>(result_out + map_local_byte);
-                            if (((lsa_dst_b04e28 | (unsigned long long)result_out + map_local_byte) & 3) == 0) {
-                                unsigned int* lsa_pd32_10981dy = reinterpret_cast<unsigned int*>(lsa_pd_b3ef0ey);
-                                unsigned int* lsa_ps32_8f09c0y = reinterpret_cast<unsigned int*>(lsa_ps_490965);
-                                {
-                                    int _max_a12c7f = ((1) > (1) ? (1) : (1));
-                                    #pragma unroll 1
-                                    for (int lsa_i_603fa4y = 0; lsa_i_603fa4y < _max_a12c7f; lsa_i_603fa4y++) {
-                                        lsa_pd32_10981dy[lsa_i_603fa4y] = lsa_ps32_8f09c0y[lsa_i_603fa4y];
-                                    }
-                                }
-                                #pragma unroll 4
-                                for (int lsa_tail_680f43y = 0; lsa_tail_680f43y < 4; lsa_tail_680f43y++) {
-                                    if (lsa_tail_680f43y < 0) {
-                                        unsigned long long lsa_tail_index_f8358c = 4 + lsa_tail_680f43y;
-                                        lsa_pd_b3ef0ey[lsa_tail_index_f8358c] = lsa_ps_490965[lsa_tail_index_f8358c];
-                                    }
-                                }
-                            } else if (1) {
-                                int _max_e8c8d8 = ((1) > (4) ? (1) : (4));
-                                #pragma unroll 1
-                                for (int lsa_byte_2aaaa1y = 0; lsa_byte_2aaaa1y < _max_e8c8d8; lsa_byte_2aaaa1y++) {
-                                    lsa_pd_b3ef0ey[lsa_byte_2aaaa1y] = lsa_ps_490965[lsa_byte_2aaaa1y];
-                                }
-                            }
-                            unsigned int lsa_seq_84b040y = lsa_state_83c5a8y[1] + 1;
-                            lsa_state_83c5a8y[1] = lsa_seq_84b040y;
-                            asm volatile("st.release.sys.global.u32 [%0], %1;" :: "l"(reinterpret_cast<unsigned int*>(lsa_remote_f8bacay + (lsa_channel_fe4879 * 32))), "r"(static_cast<unsigned int>(lsa_seq_84b040y)) : "memory");
-                            asm volatile("st.release.gpu.global.u32 [%0], %1;" :: "l"(reinterpret_cast<unsigned int*>(lsa_state_83c5a8y)), "r"(static_cast<unsigned int>(0)) : "memory");
-                        }
-                    }
-                }
-                int h29_idx = 0;
-                #pragma unroll 1
-                for (int h29_iter = 0; h29_iter < MOE_X_1b61f2e4e4; h29_iter++) {
-                    int h29_ready = 0;
-                    unsigned long long h29_wait_t0 = 0;
-                    while (1) {
-                        int h29_done = 0;
-                        int h29_tail_seen = 0;
-                        {
-                            unsigned int _load_acquire_82a81by;
-                            asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_load_acquire_82a81by) : "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(pr_gq_ctl)) + (1))) : "memory");
-                            h29_done = (int)_load_acquire_82a81by;
-                            unsigned int _load_acquire_97aad4y;
-                            asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_load_acquire_97aad4y) : "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(pr_gq_ctl)) + (0))) : "memory");
-                            h29_tail_seen = (int)_load_acquire_97aad4y;
-                        }
-                        if (h29_tail_seen > h29_idx) {
-                            h29_ready = 1;
-                            break;
-                        }
-                        if (h29_done != 0) {
-                            break;
-                        }
-                        unsigned long long gtimer_0_c4e315y_7;
-                        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(gtimer_0_c4e315y_7) :: "memory");
-                        unsigned long long wd_now_99fb2cy_6 = gtimer_0_c4e315y_7;
-                        unsigned long long wd_t0_36c7fb = h29_wait_t0;
-                        if (h29_wait_t0 == 0) {
-                            wd_t0_36c7fb = wd_now_99fb2cy_6;
-                        }
-                        if (wd_now_99fb2cy_6 - wd_t0_36c7fb > 600000000000) {
-                            asm volatile("trap;" ::: "memory");
-                        }
-                        h29_wait_t0 = wd_t0_36c7fb;
-                    }
-                    if (h29_ready == 0) {
-                        break;
-                    }
-                    __threadfence_block();
-                    int h29_chunk = 0;
-                    {
-                        h29_chunk = pr_gq[h29_idx];
-                    }
-                    h29_idx += 1;
-                    #pragma unroll 1
-                    for (int h29_cpass = 0; h29_cpass < MOE_X_31a3e1eabe; h29_cpass++) {
-                        int h29_co = warp + (unsigned int)(h29_cpass * 7);
-                        if (h29_co < world_size) {
-                            atomicMax(&svc_qctl[3 + h29_co], h29_idx);
-                        }
-                    }
-                    int h29_source = h29_chunk / MOE_X_caa68debd6;
-                    int h29_off = h29_source - rank;
-                    if (h29_off < 0) {
-                        h29_off = h29_off + world_size;
-                    }
-                    int h29_mine = 0;
-                    #pragma unroll 1
-                    for (int h29_mpass = 0; h29_mpass < MOE_X_31a3e1eabe; h29_mpass++) {
-                        if ((unsigned int)h29_off == warp + (unsigned int)(h29_mpass * 7)) {
-                            h29_mine = 1;
-                        }
-                    }
-                    if (h29_mine != 0) {
-                        int h29_dst_lsa = 1;
-                        if ((int)peer_transport[rank * world_size + h29_source] == 2) {
-                            h29_dst_lsa = 0;
-                        }
-                        int h29_chunk_local = h29_chunk - h29_source * MOE_X_caa68debd6;
-                        int _max_967b9a = ((source_route_counts[h29_source]) > (0) ? (source_route_counts[h29_source]) : (0));
-                        int _min_30de52x = ((_max_967b9a) < (MOE_X_7830131351) ? (_max_967b9a) : (MOE_X_7830131351));
-                        int h29_routes = _min_30de52x;
-                        int h29_pq = 128;
-                        if (h29_routes >= 768 && h29_routes < 768 || h29_routes >= 8192) {
-                            h29_pq = 64;
-                        }
-                        if (h29_routes < 768) {
-                            h29_pq = 32;
-                        }
-                        int _max_a86984 = (((h29_routes + h29_pq - 1) / h29_pq - 1) > (0) ? ((h29_routes + h29_pq - 1) / h29_pq - 1) : (0));
-                        int h29_pfull = _max_a86984;
-                        int h29_pts = h29_pfull * h29_pq;
-                        int h29_start = 0;
-                        int h29_cap = h29_pq;
-                        if (h29_chunk_local < h29_pfull) {
-                            h29_start = h29_chunk_local * h29_pq;
-                        } else {
-                            h29_start = h29_pts + (h29_chunk_local - h29_pfull) * 64;
-                            h29_cap = 64;
-                        }
-                        int _min_45345a = ((h29_routes - h29_start) < (h29_cap) ? (h29_routes - h29_start) : (h29_cap));
-                        int h29_chunk_rows = _min_45345a;
-                        int _atomic_old_7d39cb = atomicAdd(&result_ovf_cursor[h29_source * MOE_X_caa68debd6 + h29_chunk_local], 0);
-                        int h29_ovf = _atomic_old_7d39cb;
-                        unsigned long long h29_local_byte = (unsigned long long)(h29_source * 2 + slot) * (unsigned long long)MOE_X_41088b7354 + (unsigned long long)h29_start * (unsigned long long)MOE_X_7aa4be4d8c;
-                        unsigned long long h29_remote_byte = (unsigned long long)(rank * 2 + slot) * (unsigned long long)MOE_X_41088b7354 + (unsigned long long)h29_start * (unsigned long long)MOE_X_7aa4be4d8c;
-                        int _min_3be609 = ((h29_ovf) < (h29_chunk_rows * MOE_CODEC_OVF_BLOCKS) ? (h29_ovf) : (h29_chunk_rows * MOE_CODEC_OVF_BLOCKS));
-                        int h29_put_bytes = h29_chunk_rows * MOE_X_2a3dd8915f + _min_3be609 * 128;
-                        int _max_b65d03 = ((owner_route_counts[h29_source]) > (0) ? (owner_route_counts[h29_source]) : (0));
-                        int _min_532bb4x = ((_max_b65d03) < (MOE_X_7830131351) ? (_max_b65d03) : (MOE_X_7830131351));
-                        int c13a2_dual = (int)(h29_routes * MOE_X_4f81408915 >= collective_rows * MOE_X_474ae89bdd || h29_routes * MOE_X_4f81408915 >= collective_rows * MOE_X_fb8d28a056 && _min_532bb4x * MOE_X_4f81408915 >= collective_rows * MOE_X_474ae89bdd);
-                        {
-                            if (h29_dst_lsa != 0) {
-                                atomicMax(&protocol_error[0], 1);
-#elif (MOE_INSTANCE == 2 || MOE_INSTANCE == 3) // moe-select
-                            __threadfence();
-                            uint8_t* lsa_pd_b3ef0ey = reinterpret_cast<uint8_t*>(lsa_dst_b04e28);
-                            uint8_t* lsa_ps_490965 = reinterpret_cast<uint8_t*>(result_out + map_local_byte);
-                            if (((lsa_dst_b04e28 | (unsigned long long)result_out + map_local_byte) & 3) == 0) {
-                                unsigned int* lsa_pd32_10981dy = reinterpret_cast<unsigned int*>(lsa_pd_b3ef0ey);
-                                unsigned int* lsa_ps32_8f09c0y = reinterpret_cast<unsigned int*>(lsa_ps_490965);
-                                {
-                                    int _max_a12c7f = ((1) > (1) ? (1) : (1));
-                                    #pragma unroll 1
-                                    for (int lsa_i_603fa4y = 0; lsa_i_603fa4y < _max_a12c7f; lsa_i_603fa4y++) {
-                                        lsa_pd32_10981dy[lsa_i_603fa4y] = lsa_ps32_8f09c0y[lsa_i_603fa4y];
-                                    }
-                                }
-                                #pragma unroll 4
-                                for (int lsa_tail_680f43y = 0; lsa_tail_680f43y < 4; lsa_tail_680f43y++) {
-                                    if (lsa_tail_680f43y < 0) {
-                                        unsigned long long lsa_tail_index_f8358c = 4 + lsa_tail_680f43y;
-                                        lsa_pd_b3ef0ey[lsa_tail_index_f8358c] = lsa_ps_490965[lsa_tail_index_f8358c];
-                                    }
-                                }
-                            } else if (1) {
-                                int _max_e8c8d8 = ((1) > (4) ? (1) : (4));
-                                #pragma unroll 1
-                                for (int lsa_byte_2aaaa1y = 0; lsa_byte_2aaaa1y < _max_e8c8d8; lsa_byte_2aaaa1y++) {
-                                    lsa_pd_b3ef0ey[lsa_byte_2aaaa1y] = lsa_ps_490965[lsa_byte_2aaaa1y];
-                                }
-                            }
-                            unsigned int lsa_seq_84b040y = lsa_state_83c5a8y[1] + 1;
-                            lsa_state_83c5a8y[1] = lsa_seq_84b040y;
-                            asm volatile("st.release.sys.global.u32 [%0], %1;" :: "l"(reinterpret_cast<unsigned int*>(lsa_remote_f8bacay + (lsa_channel_fe4879 * 32))), "r"(static_cast<unsigned int>(lsa_seq_84b040y)) : "memory");
-                            asm volatile("st.release.gpu.global.u32 [%0], %1;" :: "l"(reinterpret_cast<unsigned int*>(lsa_state_83c5a8y)), "r"(static_cast<unsigned int>(0)) : "memory");
-                        }
-                    }
-                }
-                int h29_idx = 0;
-                #pragma unroll 1
-                for (int h29_iter = 0; h29_iter < MOE_X_1b61f2e4e4; h29_iter++) {
-                    int h29_ready = 0;
-                    unsigned long long h29_wait_t0 = 0;
-                    while (1) {
-                        int h29_done = 0;
-                        int h29_tail_seen = 0;
-                        {
-                            unsigned int _load_acquire_82a81by;
-                            asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_load_acquire_82a81by) : "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(pr_gq_ctl)) + (1))) : "memory");
-                            h29_done = (int)_load_acquire_82a81by;
-                            unsigned int _load_acquire_97aad4y;
-                            asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_load_acquire_97aad4y) : "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(pr_gq_ctl)) + (0))) : "memory");
-                            h29_tail_seen = (int)_load_acquire_97aad4y;
-                        }
-                        if (h29_tail_seen > h29_idx) {
-                            h29_ready = 1;
-                            break;
-                        }
-                        if (h29_done != 0) {
-                            break;
-                        }
-                        unsigned long long gtimer_0_c4e315y_7;
-                        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(gtimer_0_c4e315y_7) :: "memory");
-                        unsigned long long wd_now_99fb2cy_6 = gtimer_0_c4e315y_7;
-                        unsigned long long wd_t0_36c7fb = h29_wait_t0;
-                        if (h29_wait_t0 == 0) {
-                            wd_t0_36c7fb = wd_now_99fb2cy_6;
-                        }
-                        if (wd_now_99fb2cy_6 - wd_t0_36c7fb > 600000000000) {
-                            asm volatile("trap;" ::: "memory");
-                        }
-                        h29_wait_t0 = wd_t0_36c7fb;
-                    }
-                    if (h29_ready == 0) {
-                        break;
-                    }
-                    __threadfence_block();
-                    int h29_chunk = 0;
-                    {
-                        h29_chunk = pr_gq[h29_idx];
-                    }
-                    h29_idx += 1;
-                    #pragma unroll 1
-                    for (int h29_cpass = 0; h29_cpass < MOE_X_31a3e1eabe; h29_cpass++) {
-                        int h29_co = warp + (unsigned int)(h29_cpass * 7);
-                        if (h29_co < world_size) {
-                            atomicMax(&svc_qctl[3 + h29_co], h29_idx);
-                        }
-                    }
-                    int h29_source = h29_chunk / MOE_X_caa68debd6;
-                    int h29_off = h29_source - rank;
-                    if (h29_off < 0) {
-                        h29_off = h29_off + world_size;
-                    }
-                    int h29_mine = 0;
-                    #pragma unroll 1
-                    for (int h29_mpass = 0; h29_mpass < MOE_X_31a3e1eabe; h29_mpass++) {
-                        if ((unsigned int)h29_off == warp + (unsigned int)(h29_mpass * 7)) {
-                            h29_mine = 1;
-                        }
-                    }
-                    if (h29_mine != 0) {
-                        int h29_dst_lsa = 1;
-                        if ((int)peer_transport[rank * world_size + h29_source] == 2) {
-                            h29_dst_lsa = 0;
-                        }
-                        int h29_chunk_local = h29_chunk - h29_source * MOE_X_caa68debd6;
-                        int _max_967b9a = ((source_route_counts[h29_source]) > (0) ? (source_route_counts[h29_source]) : (0));
-                        int _min_30de52x = ((_max_967b9a) < (MOE_X_7830131351) ? (_max_967b9a) : (MOE_X_7830131351));
-                        int h29_routes = _min_30de52x;
-                        int h29_pq = 128;
-                        if (h29_routes >= 768 && h29_routes < 768 || h29_routes >= 8192) {
-                            h29_pq = 64;
-                        }
-                        if (h29_routes < 768) {
-                            h29_pq = 32;
-                        }
-                        int _max_a86984 = (((h29_routes + h29_pq - 1) / h29_pq - 1) > (0) ? ((h29_routes + h29_pq - 1) / h29_pq - 1) : (0));
-                        int h29_pfull = _max_a86984;
-                        int h29_pts = h29_pfull * h29_pq;
-                        int h29_start = 0;
-                        int h29_cap = h29_pq;
-                        if (h29_chunk_local < h29_pfull) {
-                            h29_start = h29_chunk_local * h29_pq;
-                        } else {
-                            h29_start = h29_pts + (h29_chunk_local - h29_pfull) * 64;
-                            h29_cap = 64;
-                        }
-                        int _min_45345a = ((h29_routes - h29_start) < (h29_cap) ? (h29_routes - h29_start) : (h29_cap));
-                        int h29_chunk_rows = _min_45345a;
-                        int _atomic_old_7d39cb = atomicAdd(&result_ovf_cursor[h29_source * MOE_X_caa68debd6 + h29_chunk_local], 0);
-                        int h29_ovf = _atomic_old_7d39cb;
-                        unsigned long long h29_local_byte = (unsigned long long)(h29_source * 2 + slot) * (unsigned long long)MOE_X_51dea414ef + (unsigned long long)h29_start * (unsigned long long)MOE_X_efce35e873;
-                        unsigned long long h29_remote_byte = (unsigned long long)(rank * 2 + slot) * (unsigned long long)MOE_X_51dea414ef + (unsigned long long)h29_start * (unsigned long long)MOE_X_efce35e873;
-                        int _min_3be609 = ((h29_ovf) < (h29_chunk_rows * MOE_CODEC_OVF_BLOCKS) ? (h29_ovf) : (h29_chunk_rows * MOE_CODEC_OVF_BLOCKS));
-                        int h29_put_bytes = h29_chunk_rows * MOE_X_efce35e873 + _min_3be609 * 128;
-                        int _max_b65d03 = ((owner_route_counts[h29_source]) > (0) ? (owner_route_counts[h29_source]) : (0));
-                        int _min_532bb4x = ((_max_b65d03) < (MOE_X_7830131351) ? (_max_b65d03) : (MOE_X_7830131351));
-                        int c13a2_dual = (int)(h29_routes * MOE_X_4f81408915 >= collective_rows * MOE_X_474ae89bdd || h29_routes * MOE_X_4f81408915 >= collective_rows * MOE_X_fb8d28a056 && _min_532bb4x * MOE_X_4f81408915 >= collective_rows * MOE_X_474ae89bdd);
-                        {
-                            if (h29_dst_lsa != 0) {
-                                atomicMax(&protocol_error[0], 1);
 #elif MOE_SW_RETURN_INT8 == 0 // moe-select
                             __threadfence();
                             uint8_t* lsa_pd_b3ef0ey_1 = reinterpret_cast<uint8_t*>(lsa_dst_b04e28);

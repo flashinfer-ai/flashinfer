@@ -4907,26 +4907,26 @@
                                     unsigned long long gtimer_0_c4e315y_18;
                                     asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(gtimer_0_c4e315y_18) :: "memory");
                                     unsigned long long wd_now_99fb2cy_17 = gtimer_0_c4e315y_18;
-#elif (MOE_INSTANCE == 1 && (MOE_SW_POLICY_EP == 8 && MOE_SW_ROLE_WARP_FOLD == 1)) // moe-select
-                                    unsigned long long gtimer_0_c4e315y_6;
-                                    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(gtimer_0_c4e315y_6) :: "memory");
-                                    unsigned long long wd_now_99fb2cy_5 = gtimer_0_c4e315y_6;
 #elif (MOE_INSTANCE == 0 && (MOE_SW_POLICY_EP == 16 && (MOE_SW_WIDE_RANKS == 0 && (MOE_SW_WATCH_WIDE == 0 && (MOE_SW_ROLE_PEER_FOLD == 1 && MOE_SHARED_EXPERT == 1))))) // moe-select
                                     unsigned long long gtimer_0_c4e315y_16;
                                     asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(gtimer_0_c4e315y_16) :: "memory");
                                     unsigned long long wd_now_99fb2cy_15 = gtimer_0_c4e315y_16;
+#elif (MOE_INSTANCE == 1 && (MOE_SW_POLICY_EP == 8 && MOE_SW_ROLE_WARP_FOLD == 1)) // moe-select
+                                    unsigned long long gtimer_0_c4e315y_6;
+                                    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(gtimer_0_c4e315y_6) :: "memory");
+                                    unsigned long long wd_now_99fb2cy_5 = gtimer_0_c4e315y_6;
 #elif (MOE_INSTANCE == 2 && (MOE_SW_WATCH_WIDE == 0 && (MOE_SW_WIDE_RANKS == 1 || (MOE_SW_WIDE_RANKS == 0 && (MOE_SW_ROLE_WARP_FOLD == 1 && (MOE_SW_TASK_GATE_U64 == 0 || (MOE_SW_TASK_GATE_U64 == 1 && (MOE_SW_ROLE_PEER_FOLD == 0 || (MOE_SW_ROLE_PEER_FOLD == 1 && MOE_SHARED_EXPERT == 0))))))))) // moe-select
                                     unsigned long long gtimer_0_c4e315y_14;
                                     asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(gtimer_0_c4e315y_14) :: "memory");
                                     unsigned long long wd_now_99fb2cy_13 = gtimer_0_c4e315y_14;
-#elif (MOE_INSTANCE == 3 && (MOE_SW_WATCH_WIDE == 0 && MOE_SW_ROLE_WARP_FOLD == 1)) // moe-select
-                                    unsigned long long gtimer_0_c4e315y_5;
-                                    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(gtimer_0_c4e315y_5) :: "memory");
-                                    unsigned long long wd_now_99fb2cy_4 = gtimer_0_c4e315y_5;
 #elif ((MOE_INSTANCE == 0 && (MOE_SW_WATCH_WIDE == 0 && MOE_SW_ROLE_WARP_FOLD == 1)) || (MOE_INSTANCE == 2 && (MOE_SW_POLICY_EP == 16 && MOE_SW_WATCH_WIDE == 0))) // moe-select
                                     unsigned long long gtimer_0_c4e315y_15;
                                     asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(gtimer_0_c4e315y_15) :: "memory");
                                     unsigned long long wd_now_99fb2cy_14 = gtimer_0_c4e315y_15;
+#elif (MOE_INSTANCE == 3 && (MOE_SW_WATCH_WIDE == 0 && MOE_SW_ROLE_WARP_FOLD == 1)) // moe-select
+                                    unsigned long long gtimer_0_c4e315y_5;
+                                    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(gtimer_0_c4e315y_5) :: "memory");
+                                    unsigned long long wd_now_99fb2cy_4 = gtimer_0_c4e315y_5;
 #elif (MOE_INSTANCE == 2 || MOE_INSTANCE == 3) // moe-select
                                     unsigned long long gtimer_0_c4e315y_8;
                                     asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(gtimer_0_c4e315y_8) :: "memory");
@@ -4940,16 +4940,16 @@
                                     if (h20_full_wait_t0 == 0) {
 #if (MOE_INSTANCE == 0 && (MOE_SW_POLICY_EP == 8 && (MOE_SW_ROLE_WARP_FOLD == 1 && MOE_SHARED_EXPERT == 0))) // moe-select
                                         wd_t0_f69639 = wd_now_99fb2cy_17;
-#elif (MOE_INSTANCE == 1 && (MOE_SW_POLICY_EP == 8 && MOE_SW_ROLE_WARP_FOLD == 1)) // moe-select
-                                        wd_t0_f69639 = wd_now_99fb2cy_5;
 #elif (MOE_INSTANCE == 0 && (MOE_SW_POLICY_EP == 16 && (MOE_SW_WIDE_RANKS == 0 && (MOE_SW_WATCH_WIDE == 0 && (MOE_SW_ROLE_PEER_FOLD == 1 && MOE_SHARED_EXPERT == 1))))) // moe-select
                                         wd_t0_f69639 = wd_now_99fb2cy_15;
+#elif (MOE_INSTANCE == 1 && (MOE_SW_POLICY_EP == 8 && MOE_SW_ROLE_WARP_FOLD == 1)) // moe-select
+                                        wd_t0_f69639 = wd_now_99fb2cy_5;
 #elif (MOE_INSTANCE == 2 && (MOE_SW_WATCH_WIDE == 0 && (MOE_SW_WIDE_RANKS == 1 || (MOE_SW_WIDE_RANKS == 0 && (MOE_SW_ROLE_WARP_FOLD == 1 && (MOE_SW_TASK_GATE_U64 == 0 || (MOE_SW_TASK_GATE_U64 == 1 && (MOE_SW_ROLE_PEER_FOLD == 0 || (MOE_SW_ROLE_PEER_FOLD == 1 && MOE_SHARED_EXPERT == 0))))))))) // moe-select
                                         wd_t0_f69639 = wd_now_99fb2cy_13;
-#elif (MOE_INSTANCE == 3 && (MOE_SW_WATCH_WIDE == 0 && MOE_SW_ROLE_WARP_FOLD == 1)) // moe-select
-                                        wd_t0_f69639 = wd_now_99fb2cy_4;
 #elif ((MOE_INSTANCE == 0 && (MOE_SW_WATCH_WIDE == 0 && MOE_SW_ROLE_WARP_FOLD == 1)) || (MOE_INSTANCE == 2 && (MOE_SW_POLICY_EP == 16 && MOE_SW_WATCH_WIDE == 0))) // moe-select
                                         wd_t0_f69639 = wd_now_99fb2cy_14;
+#elif (MOE_INSTANCE == 3 && (MOE_SW_WATCH_WIDE == 0 && MOE_SW_ROLE_WARP_FOLD == 1)) // moe-select
+                                        wd_t0_f69639 = wd_now_99fb2cy_4;
 #elif (MOE_INSTANCE == 2 || MOE_INSTANCE == 3) // moe-select
                                         wd_t0_f69639 = wd_now_99fb2cy_7;
 #else // moe-select
@@ -4958,16 +4958,16 @@
                                     }
 #if (MOE_INSTANCE == 0 && (MOE_SW_POLICY_EP == 8 && (MOE_SW_ROLE_WARP_FOLD == 1 && MOE_SHARED_EXPERT == 0))) // moe-select
                                     if (wd_now_99fb2cy_17 - wd_t0_f69639 > 600000000000) {
-#elif (MOE_INSTANCE == 1 && (MOE_SW_POLICY_EP == 8 && MOE_SW_ROLE_WARP_FOLD == 1)) // moe-select
-                                    if (wd_now_99fb2cy_5 - wd_t0_f69639 > 600000000000) {
 #elif (MOE_INSTANCE == 0 && (MOE_SW_POLICY_EP == 16 && (MOE_SW_WIDE_RANKS == 0 && (MOE_SW_WATCH_WIDE == 0 && (MOE_SW_ROLE_PEER_FOLD == 1 && MOE_SHARED_EXPERT == 1))))) // moe-select
                                     if (wd_now_99fb2cy_15 - wd_t0_f69639 > 600000000000) {
+#elif (MOE_INSTANCE == 1 && (MOE_SW_POLICY_EP == 8 && MOE_SW_ROLE_WARP_FOLD == 1)) // moe-select
+                                    if (wd_now_99fb2cy_5 - wd_t0_f69639 > 600000000000) {
 #elif (MOE_INSTANCE == 2 && (MOE_SW_WATCH_WIDE == 0 && (MOE_SW_WIDE_RANKS == 1 || (MOE_SW_WIDE_RANKS == 0 && (MOE_SW_ROLE_WARP_FOLD == 1 && (MOE_SW_TASK_GATE_U64 == 0 || (MOE_SW_TASK_GATE_U64 == 1 && (MOE_SW_ROLE_PEER_FOLD == 0 || (MOE_SW_ROLE_PEER_FOLD == 1 && MOE_SHARED_EXPERT == 0))))))))) // moe-select
                                     if (wd_now_99fb2cy_13 - wd_t0_f69639 > 600000000000) {
-#elif (MOE_INSTANCE == 3 && (MOE_SW_WATCH_WIDE == 0 && MOE_SW_ROLE_WARP_FOLD == 1)) // moe-select
-                                    if (wd_now_99fb2cy_4 - wd_t0_f69639 > 600000000000) {
 #elif ((MOE_INSTANCE == 0 && (MOE_SW_WATCH_WIDE == 0 && MOE_SW_ROLE_WARP_FOLD == 1)) || (MOE_INSTANCE == 2 && (MOE_SW_POLICY_EP == 16 && MOE_SW_WATCH_WIDE == 0))) // moe-select
                                     if (wd_now_99fb2cy_14 - wd_t0_f69639 > 600000000000) {
+#elif (MOE_INSTANCE == 3 && (MOE_SW_WATCH_WIDE == 0 && MOE_SW_ROLE_WARP_FOLD == 1)) // moe-select
+                                    if (wd_now_99fb2cy_4 - wd_t0_f69639 > 600000000000) {
 #elif (MOE_INSTANCE == 2 || MOE_INSTANCE == 3) // moe-select
                                     if (wd_now_99fb2cy_7 - wd_t0_f69639 > 600000000000) {
 #else // moe-select

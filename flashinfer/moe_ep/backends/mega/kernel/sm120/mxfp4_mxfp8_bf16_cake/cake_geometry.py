@@ -87,6 +87,8 @@ class KernelParams:
     act_p1: int = 0
     # Wire format of the expert results: 0 lossless BF16 codec, 1 int8 + BF16 scale per 64 values.
     return_codec: int = 0
+    # Activation codec: 0 MXFP8 (W4A8), 1 NVFP4 (W4A4: E2M1 + E4M3 per 16 values, both GEMMs FP4).
+    act_codec: int = 0
 
     @property
     def local_experts(self) -> int:
@@ -110,6 +112,7 @@ class KernelParams:
             self.act_p0,
             self.act_p1,
             self.return_codec,
+            self.act_codec,
         )
 
     def env(self) -> dict[str, int]:
@@ -127,6 +130,7 @@ class KernelParams:
             "MOE_ACT_P0": self.act_p0,
             "MOE_ACT_P1": self.act_p1,
             "MOE_RETURN_CODEC": self.return_codec,
+            "MOE_ACT_CODEC": self.act_codec,
         }
 
 
@@ -295,6 +299,19 @@ def check_supported_region(params: KernelParams) -> None:
     lo, hi = SUPPORTED_RANKS
     if not lo <= params.ranks <= hi:
         raise GeometryError(f"EP world size {params.ranks} outside {lo}..{hi}")
+    if params.act_codec not in (0, 1):
+        raise GeometryError(
+            f"act_codec {params.act_codec} must be 0 (MXFP8) or 1 (NVFP4)"
+        )
+    if params.act_codec and params.hidden % 1024:
+        raise GeometryError(
+            f"NVFP4 activations need hidden_size % 1024 == 0, got {params.hidden}"
+        )
+    if params.act_codec and params.shared_expert and params.intermediate % 256:
+        raise GeometryError(
+            f"NVFP4 activations with the in-kernel shared expert need intermediate_size % 256 == 0, "
+            f"got {params.intermediate}"
+        )
     if params.experts % params.ranks:
         raise GeometryError(
             f"num_experts {params.experts} is not divisible by the EP world size {params.ranks}"
@@ -403,9 +420,16 @@ def _descriptors(c: dict[str, int]) -> dict[str, dict[str, Any]]:
         }
 
     out = {}
+    nvfp4 = bool(c.get("ACT_CODEC", 0))
     for g in ("W1", "W2"):
-        out[f"{g}_A"] = d("u8", [k, m], swz)
-        out[f"{g}_B"] = d("fp4_e2m1", [k, n], swz, fp4=True)
+        if nvfp4:
+            # NVFP4: pool / intermediate rows and routed weights are packed e2m1 bytes, 64 B (128 values) per
+            # K block row with the 64B swizzle.
+            out[f"{g}_A"] = d("u8", [k // 2, m], [4, 2, 3])
+            out[f"{g}_B"] = d("u8", [k // 2, n], [4, 2, 3])
+        else:
+            out[f"{g}_A"] = d("u8", [k, m], swz)
+            out[f"{g}_B"] = d("fp4_e2m1", [k, n], swz, fp4=True)
         out[f"{g}_B8"] = d("u8", [k, n], swz)
         out[f"{g}_SFA"] = d("u32", [m, 1], none)
         out[f"{g}_SFB"] = d("u32", [c["MMA_N_SUBTILES"], 8], none)
@@ -491,7 +515,8 @@ def describe_kernel(params: KernelParams) -> dict[str, Any]:
     variant = "fp8shared" if params.shared_expert else "noshared"
     return {
         "key": f"{variant}_ep{params.ranks}_e{params.experts}_k{params.top_k}"
-        f"_r{params.max_rows}_h{params.hidden}_i{params.intermediate}",
+        f"_r{params.max_rows}_h{params.hidden}_i{params.intermediate}"
+        + ("_nvfp4" if params.act_codec else ""),
         "params": params,
         "variant": variant,
         "world_size": params.ranks,

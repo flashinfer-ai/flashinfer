@@ -11,7 +11,7 @@
 #   bash tests/moe_ep/run_tests.sh mega_sm90     # 4-GPU Hopper sm90 pull FP8 + BF16 mega multirank
 #   bash tests/moe_ep/run_tests.sh mega_sm90_mxfp4 # 4-GPU Hopper MXFP4 accuracy
 #   bash tests/moe_ep/run_tests.sh mega_sm90_nvfp4 # 4-GPU Hopper NVFP4 accuracy + graph replay
-#   bash tests/moe_ep/run_tests.sh mega_sm120_cake # 4/8-GPU Blackwell-consumer sm120_mxfp4_mxfp8_bf16_cake (NCCL LSA + GIN)
+#   bash tests/moe_ep/run_tests.sh mega_sm120_cake # 4/8-GPU Blackwell-consumer sm120_mxfp4_mxfp8_bf16_cake + sm120_nvfp4_nvfp4_bf16_cake (NCCL LSA + GIN)
 #   bash tests/moe_ep/run_tests.sh mega_sm107    # Rubin EP2/4/8 (NPROC_MULTIRANK, default 4), all three formats
 #   bash tests/moe_ep/run_tests.sh qualify_sm107 # strict Rubin host/single/multirank suite; rejects skips
 #   bash tests/moe_ep/run_tests.sh sm90_push     # 2-GPU Hopper sm90_fp8_fp8_bf16_push_cuda kernel + backend
@@ -140,6 +140,7 @@ run_unit() {
     --ignore=tests/moe_ep/test_moe_ep_sm120_mxfp8_cutedsl_mega_multirank.py \
     --ignore=tests/moe_ep/test_moe_ep_sm107_block_scaled_mega_multirank.py \
     --ignore=tests/moe_ep/test_moe_ep_sm120_w4a8_cake_mega.py \
+    --ignore=tests/moe_ep/test_moe_ep_sm120_nvfp4_cake_mega.py \
     --ignore=tests/moe_ep/test_moe_ep_sm120_w4a8_cake_tables.py \
     --ignore=tests/moe_ep/test_moe_ep_sm120_w4a8_cake_eplb.py \
     --ignore=tests/moe_ep/test_mxfp8_cutedsl_preprocess_vs_reference.py \
@@ -500,6 +501,7 @@ run_mega_sm120_cake() {
   local test_file
   for test_file in \
     tests/moe_ep/test_moe_ep_sm120_w4a8_cake_mega.py \
+    tests/moe_ep/test_moe_ep_sm120_nvfp4_cake_mega.py \
     tests/moe_ep/test_moe_ep_sm120_w4a8_cake_tables.py \
     tests/moe_ep/test_moe_ep_sm120_w4a8_cake_eplb.py; do
     "${TORCHRUN}" --nproc_per_node="${NPROC_CAKE_SM120}" -m pytest \
