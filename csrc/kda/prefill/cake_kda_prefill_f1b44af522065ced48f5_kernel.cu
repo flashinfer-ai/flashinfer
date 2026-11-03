@@ -247,7 +247,7 @@ __device__ __forceinline__ void tmem_st_x8_u32(int addr, const uint32_t* src) {
 
 __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
     uint32_t result;
-    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xffffffff;"
+    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xFFFFFFFF;"
         : "=r"(result) : "r"(val));
     return result;
 }
@@ -317,7 +317,7 @@ kernel_cake_kda_prefill_f1b44af522065ced48f5(__nv_bfloat16* __restrict__ q, cons
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     __nv_bfloat16* smem_qd = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
     const int smem_qd_addr = smem + 1024;
     __nv_bfloat16* smem_g_raw = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
@@ -409,8 +409,7 @@ kernel_cake_kda_prefill_f1b44af522065ced48f5(__nv_bfloat16* __restrict__ q, cons
     unsigned int* smem_work_item_resolved = reinterpret_cast<unsigned int*>(smem_raw + 227348);
     const int smem_work_item_resolved_addr = smem + 227348;
 
-    // Mbarrier init (24 pipeline groups, 0 ordered-sequence groups, 93 barriers)
-    // Mbarriers at smem_raw[0..744)
+    // Mbarrier init (93 barriers at smem_raw[0..744))
 
     if (warp == 10) {
         // --- pipeline 'chunk_pipe' ---
@@ -485,32 +484,32 @@ kernel_cake_kda_prefill_f1b44af522065ced48f5(__nv_bfloat16* __restrict__ q, cons
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_tmem_state = taddr + 64;
+    const unsigned int tmem_tmem_state_decay_0 = taddr + 64;
+    const unsigned int tmem_tmem_state_decay_1 = taddr + 80;
+    const unsigned int tmem_tmem_state_decay_2 = taddr + 96;
+    const unsigned int tmem_tmem_state_decay_3 = taddr + 112;
+    const unsigned int tmem_tmem_state_decay_4 = taddr + 128;
+    const unsigned int tmem_tmem_state_decay_5 = taddr + 144;
+    const unsigned int tmem_tmem_state_decay_6 = taddr + 160;
+    const unsigned int tmem_tmem_state_decay_7 = taddr + 176;
+    const unsigned int tmem_tmem_state_inp = taddr;
+    const unsigned int tmem_tmem_state_inp_decay_0 = taddr;
+    const unsigned int tmem_tmem_state_inp_decay_1 = taddr + 8;
+    const unsigned int tmem_tmem_state_inp_decay_2 = taddr + 16;
+    const unsigned int tmem_tmem_state_inp_decay_3 = taddr + 24;
+    const unsigned int tmem_tmem_state_inp_decay_4 = taddr + 32;
+    const unsigned int tmem_tmem_state_inp_decay_5 = taddr + 40;
+    const unsigned int tmem_tmem_state_inp_decay_6 = taddr + 48;
+    const unsigned int tmem_tmem_state_inp_decay_7 = taddr + 56;
+    const unsigned int tmem_tmem_u_acc = taddr + 224;
+    const unsigned int tmem_tmem_u2_inp = taddr + 224;
+    const unsigned int tmem_tmem_u2_acc = taddr;
+    const unsigned int tmem_tmem_out = taddr + 192;
+    const unsigned int tmem_tmem_state_out = taddr + 64;
 
     // Kernel post-init ops
-    const int tmem_tmem_state = taddr + 64;
-    const int tmem_tmem_state_decay_0 = taddr + 64;
-    const int tmem_tmem_state_decay_1 = taddr + 80;
-    const int tmem_tmem_state_decay_2 = taddr + 96;
-    const int tmem_tmem_state_decay_3 = taddr + 112;
-    const int tmem_tmem_state_decay_4 = taddr + 128;
-    const int tmem_tmem_state_decay_5 = taddr + 144;
-    const int tmem_tmem_state_decay_6 = taddr + 160;
-    const int tmem_tmem_state_decay_7 = taddr + 176;
-    const int tmem_tmem_state_inp = taddr;
-    const int tmem_tmem_state_inp_decay_0 = taddr;
-    const int tmem_tmem_state_inp_decay_1 = taddr + 8;
-    const int tmem_tmem_state_inp_decay_2 = taddr + 16;
-    const int tmem_tmem_state_inp_decay_3 = taddr + 24;
-    const int tmem_tmem_state_inp_decay_4 = taddr + 32;
-    const int tmem_tmem_state_inp_decay_5 = taddr + 40;
-    const int tmem_tmem_state_inp_decay_6 = taddr + 48;
-    const int tmem_tmem_state_inp_decay_7 = taddr + 56;
-    const int tmem_tmem_u_acc = taddr + 224;
-    const int tmem_tmem_u2_inp = taddr + 224;
-    const int tmem_tmem_u2_acc = taddr;
-    const int tmem_tmem_out = taddr + 192;
-    const int tmem_tmem_state_out = taddr + 64;
     if (warp >= 8 && warp <= 11) {
         asm volatile("setmaxnreg.dec.sync.aligned.u32 48;");
     }

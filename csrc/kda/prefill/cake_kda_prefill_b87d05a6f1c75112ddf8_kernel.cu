@@ -227,7 +227,7 @@ __device__ __forceinline__ void tmem_st_x8_u32(int addr, const uint32_t* src) {
 
 __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
     uint32_t result;
-    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xffffffff;"
+    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xFFFFFFFF;"
         : "=r"(result) : "r"(val));
     return result;
 }
@@ -305,7 +305,7 @@ kernel_cake_kda_prefill_b87d05a6f1c75112ddf8(int* __restrict__ items, int num_he
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     __nv_bfloat16* smem_carry_hi = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
     const int smem_carry_hi_addr = smem + 1024;
     __nv_bfloat16* smem_carry_lo = reinterpret_cast<__nv_bfloat16*>(smem_raw + 33792);
@@ -355,8 +355,7 @@ kernel_cake_kda_prefill_b87d05a6f1c75112ddf8(int* __restrict__ items, int num_he
     float* smem_dpair_0_0 = reinterpret_cast<float*>(smem_raw + 231424);
     const int smem_dpair_0_addr_0 = smem + 231424;
 
-    // Mbarrier init (32 pipeline groups, 0 ordered-sequence groups, 32 barriers)
-    // Mbarriers at smem_raw[0..256)
+    // Mbarrier init (32 barriers at smem_raw[0..256))
 
     if (warp == 0) {
         // --- pipeline 'm_pipe' ---
@@ -436,23 +435,23 @@ kernel_cake_kda_prefill_b87d05a6f1c75112ddf8(int* __restrict__ items, int num_he
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_tmem_state = taddr + 64;
+    const unsigned int tmem_tmem_state_inp = taddr;
+    const unsigned int tmem_tmem_u_acc = taddr + 224;
+    const unsigned int tmem_tmem_u2_inp = taddr + 224;
+    const unsigned int tmem_tmem_u2_acc = taddr;
+    const unsigned int tmem_tmem_out = taddr + 192;
+    const unsigned int tmem_tmem_state_out = taddr + 64;
+    const unsigned int tmem_tmem_state_0 = taddr + 320;
+    const unsigned int tmem_tmem_state_inp_0 = taddr + 256;
+    const unsigned int tmem_tmem_u_acc_0 = taddr + 480;
+    const unsigned int tmem_tmem_u2_inp_0 = taddr + 480;
+    const unsigned int tmem_tmem_u2_acc_0 = taddr + 256;
+    const unsigned int tmem_tmem_out_0 = taddr + 448;
+    const unsigned int tmem_tmem_state_out_0 = taddr + 320;
 
     // Kernel post-init ops
-    const int tmem_tmem_state = taddr + 64;
-    const int tmem_tmem_state_inp = taddr;
-    const int tmem_tmem_u_acc = taddr + 224;
-    const int tmem_tmem_u2_inp = taddr + 224;
-    const int tmem_tmem_u2_acc = taddr;
-    const int tmem_tmem_out = taddr + 192;
-    const int tmem_tmem_state_out = taddr + 64;
-    const int tmem_tmem_state_0 = taddr + 320;
-    const int tmem_tmem_state_inp_0 = taddr + 256;
-    const int tmem_tmem_u_acc_0 = taddr + 480;
-    const int tmem_tmem_u2_inp_0 = taddr + 480;
-    const int tmem_tmem_u2_acc_0 = taddr + 256;
-    const int tmem_tmem_out_0 = taddr + 448;
-    const int tmem_tmem_state_out_0 = taddr + 320;
     if (warp >= 16 && warp <= 19) {
         asm volatile("setmaxnreg.dec.sync.aligned.u32 48;");
     }
@@ -1493,15 +1492,15 @@ kernel_cake_kda_prefill_b87d05a6f1c75112ddf8(int* __restrict__ items, int num_he
                             mbarrier_arrive_expect_tx(ops_full_addr, 23696);
                         }
                         int slot_bf16 = (int)0 * 16384;
-                        cp_async_bulk_gmem2smem(smem_qd_0_addr + (unsigned int)(slot_bf16 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(op_qd) + ((unsigned long long)(slab * 4096) * (unsigned long long)2)), 8192, ops_full_addr);
-                        cp_async_bulk_gmem2smem(smem_kd_0_addr + (unsigned int)(slot_bf16 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(op_kd) + ((unsigned long long)(slab * 4096) * (unsigned long long)2)), 8192, ops_full_addr);
+                        cp_async_bulk_gmem2smem(smem_qd_0_addr + (unsigned int)(slot_bf16 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(op_qd) + (unsigned long long)(slab * 4096) * (unsigned long long)2), 8192, ops_full_addr);
+                        cp_async_bulk_gmem2smem(smem_kd_0_addr + (unsigned int)(slot_bf16 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(op_kd) + (unsigned long long)(slab * 4096) * (unsigned long long)2), 8192, ops_full_addr);
                         if (step_chunks_3 > chunk_3 + 1) {
-                            cp_async_bulk_gmem2smem(smem_ft_0_addr + (unsigned int)(slot_bf16 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(op_ft) + ((unsigned long long)(slab * 6144) * (unsigned long long)2)), 12288, ops_full_addr);
+                            cp_async_bulk_gmem2smem(smem_ft_0_addr + (unsigned int)(slot_bf16 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(op_ft) + (unsigned long long)(slab * 6144) * (unsigned long long)2), 12288, ops_full_addr);
                         } else {
-                            cp_async_bulk_gmem2smem(smem_ft_0_addr + (unsigned int)((slot_bf16 + 4096) * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(op_ft) + ((unsigned long long)(slab * 6144 + 4096) * (unsigned long long)2)), 4096, ops_full_addr);
+                            cp_async_bulk_gmem2smem(smem_ft_0_addr + (unsigned int)((slot_bf16 + 4096) * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(op_ft) + (unsigned long long)(slab * 6144 + 4096) * (unsigned long long)2), 4096, ops_full_addr);
                         }
-                        cp_async_bulk_gmem2smem(smem_inv_0_addr + (unsigned int)(slot_bf16 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(op_inv) + ((unsigned long long)(slab * 1024) * (unsigned long long)2)), 2048, ops_full_addr);
-                        cp_async_bulk_gmem2smem(smem_vec_0_addr + (unsigned int)((int)0 * 8192 * 4), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(op_vec) + ((unsigned long long)(slab * 292) * (unsigned long long)4)), 1168, ops_full_addr);
+                        cp_async_bulk_gmem2smem(smem_inv_0_addr + (unsigned int)(slot_bf16 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(op_inv) + (unsigned long long)(slab * 1024) * (unsigned long long)2), 2048, ops_full_addr);
+                        cp_async_bulk_gmem2smem(smem_vec_0_addr + (unsigned int)((int)0 * 8192 * 4), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(op_vec) + (unsigned long long)(slab * 292) * (unsigned long long)4), 1168, ops_full_addr);
                         _phase_ops_free ^= 1;
                     }
                     _phase_m_free ^= 1;
@@ -2541,15 +2540,15 @@ kernel_cake_kda_prefill_b87d05a6f1c75112ddf8(int* __restrict__ items, int num_he
                             mbarrier_arrive_expect_tx(ops_full_0_addr, 23696);
                         }
                         int slot_bf16_1 = (int)0 * 16384;
-                        cp_async_bulk_gmem2smem(smem_qd_0_addr_0 + (unsigned int)(slot_bf16_1 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(op_qd) + ((unsigned long long)(slab_1 * 4096) * (unsigned long long)2)), 8192, ops_full_0_addr);
-                        cp_async_bulk_gmem2smem(smem_kd_0_addr_0 + (unsigned int)(slot_bf16_1 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(op_kd) + ((unsigned long long)(slab_1 * 4096) * (unsigned long long)2)), 8192, ops_full_0_addr);
+                        cp_async_bulk_gmem2smem(smem_qd_0_addr_0 + (unsigned int)(slot_bf16_1 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(op_qd) + (unsigned long long)(slab_1 * 4096) * (unsigned long long)2), 8192, ops_full_0_addr);
+                        cp_async_bulk_gmem2smem(smem_kd_0_addr_0 + (unsigned int)(slot_bf16_1 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(op_kd) + (unsigned long long)(slab_1 * 4096) * (unsigned long long)2), 8192, ops_full_0_addr);
                         if (step_chunks_7 > chunk_7 + 1) {
-                            cp_async_bulk_gmem2smem(smem_ft_0_addr_0 + (unsigned int)(slot_bf16_1 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(op_ft) + ((unsigned long long)(slab_1 * 6144) * (unsigned long long)2)), 12288, ops_full_0_addr);
+                            cp_async_bulk_gmem2smem(smem_ft_0_addr_0 + (unsigned int)(slot_bf16_1 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(op_ft) + (unsigned long long)(slab_1 * 6144) * (unsigned long long)2), 12288, ops_full_0_addr);
                         } else {
-                            cp_async_bulk_gmem2smem(smem_ft_0_addr_0 + (unsigned int)((slot_bf16_1 + 4096) * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(op_ft) + ((unsigned long long)(slab_1 * 6144 + 4096) * (unsigned long long)2)), 4096, ops_full_0_addr);
+                            cp_async_bulk_gmem2smem(smem_ft_0_addr_0 + (unsigned int)((slot_bf16_1 + 4096) * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(op_ft) + (unsigned long long)(slab_1 * 6144 + 4096) * (unsigned long long)2), 4096, ops_full_0_addr);
                         }
-                        cp_async_bulk_gmem2smem(smem_inv_0_addr_0 + (unsigned int)(slot_bf16_1 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(op_inv) + ((unsigned long long)(slab_1 * 1024) * (unsigned long long)2)), 2048, ops_full_0_addr);
-                        cp_async_bulk_gmem2smem(smem_vec_0_addr_0 + (unsigned int)((int)0 * 8192 * 4), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(op_vec) + ((unsigned long long)(slab_1 * 292) * (unsigned long long)4)), 1168, ops_full_0_addr);
+                        cp_async_bulk_gmem2smem(smem_inv_0_addr_0 + (unsigned int)(slot_bf16_1 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(op_inv) + (unsigned long long)(slab_1 * 1024) * (unsigned long long)2), 2048, ops_full_0_addr);
+                        cp_async_bulk_gmem2smem(smem_vec_0_addr_0 + (unsigned int)((int)0 * 8192 * 4), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(op_vec) + (unsigned long long)(slab_1 * 292) * (unsigned long long)4), 1168, ops_full_0_addr);
                         _phase_ops_free_0 ^= 1;
                     }
                     _phase_m_free_0 ^= 1;
