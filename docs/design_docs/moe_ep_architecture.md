@@ -329,7 +329,10 @@ GenPhase is excluded when its capacity or combine requirements are not met.
 Explicit inference or GenPhase with `knobs="auto"` uses the same complete-forward
 boundary, restricted to that variant. The Rubin offline CLI also measures staging,
 compute and writing an owned output, matching the default layer forward with
-BF16 inputs. Output copies are measured when the selected path requires them. Input generation, weight preparation, compilation and correctness
+BF16 inputs. Pass `--kernel-variant auto` to search both eligible variants and
+save their winners and the overall selection; explicit variants restrict the
+search. Offline searches bypass cached winners and do not install the result.
+Output copies are measured when the selected path requires them. Input generation, weight preparation, compilation and correctness
 checks are outside measurement. Match the deployment's input and output layouts
 when reusing automatic results; kernel-only records do not satisfy this objective.
 
