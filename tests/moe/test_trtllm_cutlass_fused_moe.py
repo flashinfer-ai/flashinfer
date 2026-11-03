@@ -1061,15 +1061,21 @@ def test_moe_deterministic_mode_selects_unfused_finalize():
     router_logits = torch.randn(batch_size, num_experts, dtype=torch.float32).cuda()
     w31_weight = (
         torch.randn(num_experts, 2 * intermediate_size, hidden_size, dtype=dtype).cuda()
-        / 5
+        / 10
     )
     w2_weight = (
-        torch.randn(num_experts, hidden_size, intermediate_size, dtype=dtype).cuda() / 5
+        torch.randn(num_experts, hidden_size, intermediate_size, dtype=dtype).cuda()
+        / 10
     )
     routing_weights, selected_experts = compute_routing(router_logits, top_k)
     selected_experts = selected_experts.to(torch.int)
     ref_output = compute_with_experts(
-        num_experts, x, w31_weight, w2_weight, selected_experts, routing_weights
+        num_experts,
+        x.float(),
+        w31_weight.float(),
+        w2_weight.float(),
+        selected_experts,
+        routing_weights,
     )
 
     major, minor = get_compute_capability(torch.device("cuda"))
@@ -1079,7 +1085,7 @@ def test_moe_deterministic_mode_selects_unfused_finalize():
     runners_before = set(runner_dict)
 
     def run_default():
-        out = torch.empty_like(ref_output)
+        out = torch.empty(batch_size, hidden_size, dtype=dtype, device="cuda")
         return fused_moe.cutlass_fused_moe(
             x,
             selected_experts,
@@ -1123,7 +1129,7 @@ def test_moe_deterministic_mode_selects_unfused_finalize():
         use_fused_finalize=False,
     )
 
-    torch.testing.assert_close(ref_output, out1, rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(ref_output, out1.float(), rtol=2e-2, atol=2e-2)
     assert torch.equal(out1, out2), "deterministic mode must give bit-identical outputs"
     assert ws_default == ws_unfused
     new_runners = set(runner_dict) - runners_before
