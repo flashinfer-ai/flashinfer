@@ -1085,7 +1085,9 @@ def test_get_aot_path_prefers_bundled_package_module(monkeypatch, tmp_path):
     assert jit_env.get_aot_path("attention_module") == expected
 
 
-def _run_bounded_parallel(tmp_path, concurrency, items, fail_item=None, ok_delay=0.3):
+def _run_bounded_parallel(
+    tmp_path, concurrency, items, fail_item=None, ok_delay=0.3, launch_delay=0
+):
     """Run the pool with a fake build that logs start/end and sleeps briefly."""
     common_script = (
         Path(__file__).resolve().parents[3] / "scripts" / "jit_cache_build_common.sh"
@@ -1094,6 +1096,10 @@ def _run_bounded_parallel(tmp_path, concurrency, items, fail_item=None, ok_delay
     script = f"""
 set -eo pipefail
 source "{common_script}"
+# Time passes before each launch decision, as it does while a pool of long
+# builds runs, so an item that fails at once has exited by then.
+eval "$(declare -f _reap_finished_items | sed '1s/_reap_finished_items/_reap_items_now/')"
+_reap_finished_items() {{ sleep {launch_delay}; _reap_items_now; }}
 fake_build() {{
   echo "start $1" >> "{log}"
   if [ "$1" = "{fail_item}" ]; then return 1; fi
@@ -1163,12 +1169,14 @@ def test_run_bounded_parallel_reports_failure_and_stops_starting_items(tmp_path)
 @pytest.mark.skipif(not _bash_supports_wait_n(), reason="needs bash >= 4.3")
 def test_run_bounded_parallel_does_not_start_items_after_a_finished_failure(tmp_path):
     # The pool never fills, so nothing waits on the item that failed at once:
-    # only a check before each launch can notice it.
-    items = ["bad"] + [f"ok{i}" for i in range(8)]
-    status, events = _run_bounded_parallel(tmp_path, 16, items, fail_item="bad")
+    # only a check before each launch can notice it. The delay before each
+    # launch guarantees that item has exited by the next one.
+    status, events = _run_bounded_parallel(
+        tmp_path, 16, ["bad", "ok1", "ok2"], fail_item="bad", launch_delay=0.3
+    )
 
     assert status == "failed"
-    assert "start ok7" not in events
+    assert events == ["start bad"]
 
 
 @pytest.mark.cpu_only
