@@ -409,6 +409,12 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             num_tokens=t.hidden_states.shape[0],
             enabled=self._kernel_config.enable_fc1_activation_per_token_scale,
         )
+        if self._kernel_config.internode:
+            ids = t.topk_ids
+            if torch.any((ids < -1) | (ids >= fleet_params.num_experts)).item():
+                raise ValueError(
+                    "GIN route IDs must be -1 or a valid global expert ID."
+                )
 
     def stage_inputs(
         self,
@@ -417,34 +423,10 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         *,
         quantize_input: bool,
     ) -> None:
-        if self._kernel_config.internode:
-            if torch.cuda.is_current_stream_capturing():
-                raise MoEEpConfigError(
-                    "Internode GIN does not support CUDA Graph capture."
-                )
-            from ......kernel_src.sm100.cutedsl_megamoe import collective_gin_preflight
-            import torch.distributed as dist
-
-            error = None
-            try:
-                self._validate_forward_local(
-                    t, self._gin_fleet_params, quantize_input=quantize_input
-                )
-                ids = t.topk_ids
-                if torch.any((ids < -1) | (ids >= workspace.num_total_experts)).item():
-                    raise ValueError(
-                        "GIN route IDs must be -1 or a valid global expert ID."
-                    )
-            except Exception as exc:
-                error = f"{type(exc).__name__}: {exc}"
-            collective_gin_preflight(
-                dist,
-                signature=("nvfp4-gin-v1",),
-                local_error=error,
-                phase="before-input-staging",
-            )
         num_tokens = t.hidden_states.shape[0]
-        # The layer runs validate_forward() only for the first forward of a
+        # GIN validates metadata and route values collectively on every public
+        # forward/staging call before the core's local checks. Other backends
+        # run validate_forward() only for the first forward of a
         # workspace (later forwards are gated on a stable input signature that
         # does not cover this optional tensor).  Presence and metadata of the
         # per-token scale are per-forward facts -- a forward that omits it

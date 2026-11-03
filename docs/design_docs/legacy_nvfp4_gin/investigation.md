@@ -330,3 +330,16 @@ compatibility evidence. No documentation example timing is used as a baseline.
   exact mechanism remains unresolved. This does not erase O18's old regression.
   The complete strong protocol/math plus public correctness suite passes
   15 tests on each of four ranks, with original tolerances retained.
+
+- R4: [checkpoint-04.md](checkpoint-04.md), the device-direction counterexample
+  and the reason not to attribute the old ratio to an intrinsic device defect.
+- All four before/host-candidate PTX and cubin pairs in 3577960 are byte-identical.
+- **PT6, planned:** move the existing GIN route-value check into the already
+  mandatory per-call collective validator and remove staging's duplicate
+  metadata/agreement pass. Public staging still enters that validator through
+  _prepare_inputs. Retain the independent per-launch session guard, so prepared
+  compute and mixed live sessions remain protected. Extend the real negative
+  test to call public stage_inputs as well as forward before recovery. Compare
+  fixed legacy donor and the two-agreement candidate with two resident providers
+  (same standard/conditioned protocols, all profiles after primary), and rerun
+  the complete 15-test strong/public qualification. No device/tuning changes.

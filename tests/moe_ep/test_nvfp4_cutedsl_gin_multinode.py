@@ -173,6 +173,8 @@ def test_nvfp4_gin_public_rank_local_errors():
                     )
             with pytest.raises((RuntimeError, ValueError), match="GIN|gin"):
                 layer.forward(inputs)
+            with pytest.raises((RuntimeError, ValueError), match="GIN|gin"):
+                layer.stage_inputs(inputs)
             dist.barrier()
         result = layer.forward(_inputs(bootstrap.rank, 2, "balanced"))
         torch.cuda.synchronize()
