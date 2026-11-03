@@ -1629,8 +1629,10 @@ def test_the_l2n_class_is_the_deterministic_l2n_class() -> None:
     library; the fused gradient's l2n class (``L2N_DQKG``) is the deterministic ``dqkg`` records' rules, plans and
     programs in the g class, serving ``"fused"`` / ``"fallback"``, each sharing its program with the raw-class record
     of the same deterministic record, which serves every mode.  The S1 records, the R1c records, the hand-off twins
-    and the tape WY twin serve the flag-off mode alone, and so do the narrowed g-class copies of the pair stages: no ND-only program
-    runs in an l2n mode."""
+    and the tape WY twin carry no ``l2n`` key, and the narrowed g-class copies of the pair stages serve the flag-off
+    mode alone: no ND-only record is selected in an l2n mode.  The tape WY twin is launched outside the selection
+    (its stage ``wy`` is no l2n stage): a tape backward of an l2n mode may run it, writing its WY record's ``w`` bit
+    for bit."""
     renamed = {"library", "kernel_symbol"}
 
     def serves(record: dict, mode: str) -> bool:
@@ -1679,7 +1681,7 @@ def test_the_l2n_class_is_the_deterministic_l2n_class() -> None:
         expected = {k: v for k, v in twin.items() if k not in renamed}
         expected.update(variant=name.removeprefix("dqkg_"), l2n=list(L2N_ON))
         assert {k: v for k, v in record.items() if k not in renamed} == expected, name
-    # no ND-only program serves an l2n mode
+    # no ND-only record carries an l2n mode
     nd_only = set(S1_RECORDS) | R1C_RECORDS | TWIN_RECORDS | TAPE_WY_RECORDS
     for name in sorted(nd_only):
         assert "l2n" not in cake_jit.MODULES[name], name

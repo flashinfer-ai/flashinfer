@@ -64,11 +64,13 @@ in, normalized inside the kernels; FlashInfer #7817) runs on both packages, in
 either gate mode: the entries forward the keyword to the package of the call's
 mode, and the workspace and the byte queries take it.  The mode has no ``S1``
 pair and no checkpoint hand-off: with ``deterministic=False`` it runs the
-deterministic package's in-kernel-norm programs in the same order, so ``out``
-and every gradient (``dg``, and in raw gate mode ``dA_log`` and ``ddt_bias``,
-included) are bitwise the deterministic package's.  Both packages' saved sets
-carry the mode and the FP32 reciprocal norms ``qk_rstd``, so either backward
-reads the other's set of that mode.
+deterministic package's in-kernel-norm programs in the same order (a tape
+backward may run the non-deterministic package's w-only WY twin in place of
+the WY program, writing the same ``w``), so ``out`` and every gradient
+(``dg``, and in raw gate mode ``dA_log`` and ``ddt_bias``, included) are
+bitwise the deterministic package's.  Both packages' saved sets carry the mode
+and the FP32 reciprocal norms ``qk_rstd``, so either backward reads the
+other's set of that mode.
 
 The mode of :func:`chunk_kda` is fixed at its forward call: the autograd node's
 backward is the forward's package.  Both packages write the saved set in the

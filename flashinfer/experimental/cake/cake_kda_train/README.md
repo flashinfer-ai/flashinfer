@@ -103,8 +103,9 @@ for the previous one passes its `bool` in that slot and raises `TypeError`.
   route), operands, saved `qk_rstd`, workspace and byte queries.  The mode is
   part of the plan, the workspace and the saved set, as in the deterministic
   package.  The registry copies the deterministic package's records of the
-  mode (see "Registry"), so an l2n call launches the deterministic programs
-  alone.
+  mode (see "Registry"), so an l2n call launches the deterministic programs,
+  and on the tape backward possibly the tape WY twin (see "Tape WY twin"),
+  which writes the WY program's `w` bit for bit.
 
 ## What changes: the `S1` backward pairs
 

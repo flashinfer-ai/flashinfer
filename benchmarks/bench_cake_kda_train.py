@@ -108,9 +108,10 @@ in its layout: every arm's norm and the norm's gradient are inside its
 boundaries.  The row compares flash-linear-attention's ``out`` with the
 non-deterministic arm's (``fla_l2n_out_vs_nd``: the relative RMS difference;
 an adapter that skips the norm shows here).  This package's in-kernel-norm mode
-runs the deterministic package's programs in the same order, so every result
-(``dg`` included) is bitwise the deterministic one and no path runs an S1
-pair.
+runs the deterministic package's programs in the same order (a tape backward
+may run this package's w-only WY twin in place of the WY program, writing the
+same ``w``), so every result (``dg`` included) is bitwise the deterministic one
+and no path runs an S1 pair.
 
 Memory: per row, arm and boundary one untimed call after the warm-up, between
 ``torch.cuda.reset_peak_memory_stats()`` and the allocator's counters, gives

@@ -5590,8 +5590,9 @@ def chunk_kda_bwd(
     program applies the pullback ``r * (dq_hat - y * <dq_hat, y>)`` (``y = x * r`` in FP32) before its one BF16
     store.  The fused gradient is the deterministic package's on every row (its ``dqkg_*_l2n`` copies; no ``S1``
     pair: the l2n GLM intra programs add no ``q * dq`` term), so the programs are the deterministic package's l2n
-    records and the results are bitwise its own on every path and arena option, in either gate mode.  A saved set
-    of the other mode is refused.
+    records -- the tape backward may launch the tape WY twin (:attr:`Plan.tape_wy_twin`) in place of its WY record,
+    writing the same ``w`` -- and the results are bitwise its own on every path and arena option, in either gate
+    mode.  A saved set of the other mode is refused.
     """
     _require_deterministic_false(deterministic, "chunk_kda_bwd")
     return _bwd_call(

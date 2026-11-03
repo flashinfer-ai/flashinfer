@@ -20,7 +20,9 @@ chunked training package (``flashinfer.experimental.cake.cake_kda_train``, every
 The package runs the deterministic package's l2n programs in the same order on every row: its l2n records are the
 deterministic package's, the fused gradient's l2n class copies the deterministic records (no S1 pair: no GLM intra
 program of an l2n mode adds the ``q * dq`` term), the gate epilogue never runs and the checkpoint hand-off never
-engages.  So every result of an l2n mode is the deterministic package's l2n result bit for bit, in both gate modes.
+engages.  The one program of this package's own an l2n mode may run is the tape WY twin, in place of the WY program
+on a tape backward, which writes the same ``w``.  So every result of an l2n mode is the deterministic package's l2n
+result bit for bit, in both gate modes.
 
 On the CPU (no kernel): the host rules this package shares with the deterministic package (the raw q / k operand
 rule, the mode keyword, the saved set's ``qk_rstd`` / ``qk_l2norm`` and its check, the layouts' transient ``qn`` /
