@@ -828,8 +828,10 @@ def test_nondeterministic_flag_selects_this_package(
     dx, dz, dw = cake_rmsnorm_silu_gate_train_backward(
         dy, x, z, w, EPS, deterministic=False
     )
-    routes = loader.ROUTES[loader.device_arch(torch.cuda.current_device())]
-    assert launched == [routes["fwd"], routes["bwd_bf16"]], launched
+    arch = loader.device_arch(torch.cuda.current_device())
+    routes = loader.ROUTES[arch]
+    fwd = loader.module_for_rows(arch, "fwd", 257 * 48, _sm_count())
+    assert launched == [fwd, routes["bwd_bf16"]], launched
     for name in launched:
         assert name not in deterministic_loader.MODULES, name
     assert torch.equal(
@@ -1171,7 +1173,7 @@ def _sm_count() -> int:
 
 # The rows per SM up to which each architecture runs the short forward, and
 # from which each architecture runs the mid and the long forward.
-SHORT_FORWARD_ROWS_PER_SM = {"sm_100a": 12, "sm_103a": 12, "sm_107a": 10}
+SHORT_FORWARD_ROWS_PER_SM = {"sm_100a": 12, "sm_103a": 12, "sm_107a": 59}
 MID_FORWARD_ROWS_PER_SM = {"sm_100a": 976, "sm_103a": 976, "sm_107a": 800}
 LONG_FORWARD_ROWS_PER_SM = {"sm_100a": 2400, "sm_103a": 2400, "sm_107a": 1740}
 # Forward inputs around and past the short, the mid and the long forward's
@@ -1263,7 +1265,9 @@ GATE_EDGE_VALUES = [
 ]
 # Forward inputs the short forward runs where the architecture routes it, and
 # those at its threshold on sm_100a and sm_103a, 12 rows per SM, on 148 SMs
-# (37x48, 253x7, 55x32) and on 152 SMs (38x48, 260x7, 57x32).
+# (37x48, 253x7, 55x32) and on 152 SMs (38x48, 260x7, 57x32), and on sm_107a,
+# 59 rows per SM, on 212 SMs (260x48, 1786x7, 390x32) and one token past it
+# (261x48, 1787x7, 391x32).
 GATE_EDGE_CASES = [
     pytest.param(1, 48, id="1x48"),
     pytest.param(13, 48, id="13x48"),
@@ -1278,6 +1282,13 @@ GATE_EDGE_CASES = [
     pytest.param(260, 7, id="260x7"),
     pytest.param(55, 32, id="55x32"),
     pytest.param(57, 32, id="57x32"),
+    pytest.param(129, 48, id="129x48"),
+    pytest.param(260, 48, id="260x48"),
+    pytest.param(261, 48, id="261x48"),
+    pytest.param(1786, 7, id="1786x7"),
+    pytest.param(1787, 7, id="1787x7"),
+    pytest.param(390, 32, id="390x32"),
+    pytest.param(391, 32, id="391x32"),
 ]
 
 

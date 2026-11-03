@@ -44,7 +44,7 @@ dispatches on it here:
 * ``deterministic=False`` runs the standalone non-deterministic package
   ``flashinfer.cake_rmsnorm_silu_gate_train_backend``: the same forward kernel
   (it has no reduction, so ``y`` has the same bits; up to 12 rows per SM on
-  SM100 and SM103, 10 on SM107, a forward with 16 threads to a row, and from
+  SM100 and SM103, 59 on SM107, a forward with 16 threads to a row, and from
   976 rows per SM on SM100 and SM103, 800 on SM107, a forward whose CTAs each
   walk several row
   blocks, also the same bits) and a one-kernel backward whose ``dx`` and ``dz`` are the
@@ -294,7 +294,7 @@ def cake_rmsnorm_silu_gate_train_forward(
         (:func:`flashinfer.cake_rmsnorm_silu_gate_det_train.cake_rmsnorm_silu_gate_det_train_forward`)
         with these arguments.  ``False`` runs the non-deterministic package's
         forward program, the same kernel rendered there, or up to 12 rows per
-        SM on SM100 / SM103 (10 on SM107) a forward with 16 threads to a row,
+        SM on SM100 / SM103 (59 on SM107) a forward with 16 threads to a row,
         and from 976 rows per SM on SM100 / SM103 (800 on SM107) a forward
         whose CTAs each
         walk several row blocks, with the same arithmetic (the forward has no reduction, so

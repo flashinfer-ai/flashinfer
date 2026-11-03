@@ -161,6 +161,18 @@ def _routes() -> dict[str, str]:
     return loader.ROUTES[loader.device_arch(torch.cuda.current_device())]
 
 
+def _forward_module(rows: int) -> str:
+    """The forward module ``module_for_rows`` runs for ``rows`` rows on this
+    device (the short forward where the architecture's rule routes them)."""
+    device_index = torch.cuda.current_device()
+    return loader.module_for_rows(
+        loader.device_arch(device_index),
+        "fwd",
+        rows,
+        loader.device_sm_count(device_index),
+    )
+
+
 def fp64_reference(dy, x, z, w, eps):
     """An independent FP64 forward and closed-form backward from the BF16 inputs:
     ``(y, dx, dz, dw)`` in FP64 (unrounded)."""
@@ -932,7 +944,8 @@ def test_autograd_matches_functional_and_checkpoint(launches):
     )
     yc.backward(dy)
     check(yc, xc.grad, zc.grad, wc.grad, "checkpoint")
-    assert launches == [routes["fwd"], routes["fwd"], routes["bwd_bf16"]], launches
+    fwd = _forward_module(x.numel() // D)
+    assert launches == [fwd, fwd, routes["bwd_bf16"]], launches
 
 
 def test_nondeterministic_mode_launches_this_package(launches):
@@ -943,7 +956,8 @@ def test_nondeterministic_mode_launches_this_package(launches):
     backward(
         dy, x, z, w, EPS, grad_weight=torch.empty(D, dtype=torch.float32, device="cuda")
     )
-    assert launches == [routes["fwd"], routes["bwd_bf16"], routes["bwd_f32"]], launches
+    fwd = _forward_module(x.numel() // D)
+    assert launches == [fwd, routes["bwd_bf16"], routes["bwd_f32"]], launches
     for name in launches:
         assert name.startswith("cake_rmsnorm_silu_gate_train_"), name
     assert loader.MODULES[routes["bwd_bf16"]]["role"] == "bwd_bf16"
@@ -1101,7 +1115,7 @@ SHORT_ROUTES = {
         "bwd_f32_short": ("max_rows", 256),
     },
     "sm_107a": {
-        "fwd_short": ("max_rows_per_sm", 10),
+        "fwd_short": ("max_rows_per_sm", 59),
         "bwd_bf16_short": ("max_rows", 256),
         "bwd_f32_short": ("max_rows", 256),
     },
@@ -1164,7 +1178,7 @@ def test_short_long_and_mid_modules_run_from_their_rows_per_sm(sm_count):
         for role, name in loader.ROUTES[arch].items():
             assert loader.MODULES[name]["role"] == role
         edges = {1, 48, 255, 256, 257, 2**31 - 1}
-        for start in (10, 12, 800, 976, 1024, 1280, 1740, 2400):
+        for start in (10, 12, 59, 800, 976, 1024, 1280, 1740, 2400):
             edges |= {start * sm_count - 1, start * sm_count, start * sm_count + 1}
         for role in loader.ROLES:
             for rows in sorted(edges):
@@ -1201,14 +1215,15 @@ def test_short_long_and_mid_modules_run_from_their_rows_per_sm(sm_count):
         for rows, tier in ((1, "_short"), (256, "_short"), (257, "")):
             got = loader.module_for_rows("sm_107a", role, rows, sm_count)
             assert got == loader.ROUTES["sm_107a"][role + tier], (role, rows)
-    # the forward on sm_107a: the short forward up to 10 rows per SM, the
+    # the forward on sm_107a: the short forward up to 59 rows per SM, the
     # forward above, then the mid forward from 800 rows per SM, then the long
     # forward from 1740
     routes = loader.ROUTES["sm_107a"]
     for rows, role in (
         (1, "fwd_short"),
-        (10 * sm_count, "fwd_short"),
-        (10 * sm_count + 1, "fwd"),
+        (10 * sm_count + 1, "fwd_short"),
+        (59 * sm_count, "fwd_short"),
+        (59 * sm_count + 1, "fwd"),
         (800 * sm_count - 1, "fwd"),
         (800 * sm_count, "fwd_mid"),
         (1740 * sm_count - 1, "fwd_mid"),
@@ -1311,9 +1326,11 @@ def test_mid_forward_grid_is_whole_waves_of_at_most_two_blocks_a_cta(
 
 
 # (rows, SMs) of the short forward: one CTA per 16-row block, up to 12 rows per
-# SM on sm_100a and sm_103a and 10 on sm_107a (each row count is checked on
+# SM on sm_100a and sm_103a and 59 on sm_107a (each row count is checked on
 # every architecture: past an architecture's bound the forward runs it), so at
-# most the SMs less 16 CTAs.
+# most the SMs less 16 CTAs on sm_100a and sm_103a, and on sm_107a, at the 212
+# and 216 SMs listed (the bound needs 205 or more, SHORT_FORWARD_MIN_SMS), at
+# most one wave of the 4 CTAs per SM its launch bounds give on the SMs less 16.
 SHORT_FORWARD_GRIDS = [
     (1, 148),
     (48, 148),  # T 1, H 48: 3 blocks
@@ -1324,11 +1341,30 @@ SHORT_FORWARD_GRIDS = [
     (12 * 148, 148),  # B200 at 12 rows per SM: 111 blocks
     (12 * 152, 152),  # GB300 at 12 rows per SM: 114 blocks
     (10 * 212, 212),  # R200 at 10 rows per SM: 133 blocks
+    (30 * 212, 212),  # R200 at 30 rows per SM: 398 blocks
+    (1786 * 7, 212),  # T 1786, H 7: 782 blocks, 58.97 rows per SM
+    (59 * 212, 212),  # R200 at 59 rows per SM: 782 blocks
+    (59 * 216, 216),  # 216-SM R200 at 59 rows per SM: 797 blocks
 ]
+# The most CTAs of the short forward's grid on sm_count SMs, from
+# SHORT_FORWARD_MIN_SMS SMs (64 on sm_100a and sm_103a, 205 on sm_107a; on
+# fewer SMs, as on a small MIG instance, the grid at the architecture's
+# threshold has more): at most the SMs less 16 on sm_100a and sm_103a, one
+# wave of 4 CTAs per SM on the SMs less 16 on sm_107a.
+SHORT_FORWARD_MAX_CTAS = {
+    "sm_100a": lambda sm_count: sm_count - 16,
+    "sm_103a": lambda sm_count: sm_count - 16,
+    "sm_107a": lambda sm_count: 4 * (sm_count - 16),
+}
+# The fewest SMs on which the short forward's grid at the architecture's
+# threshold keeps SHORT_FORWARD_MAX_CTAS: ceil(12 * SMs / 16) <= SMs - 16 from
+# 64 SMs on sm_100a and sm_103a, ceil(59 * SMs / 16) <= 4 * (SMs - 16) from 205
+# SMs on sm_107a (212 and 216 keep it; a small MIG instance does not).
+SHORT_FORWARD_MIN_SMS = {"sm_100a": 64, "sm_103a": 64, "sm_107a": 205}
 
 
 @pytest.mark.parametrize(("rows", "sm_count"), SHORT_FORWARD_GRIDS)
-def test_short_forward_grid_is_one_cta_a_block_below_one_cta_per_sm(rows, sm_count):
+def test_short_forward_grid_is_one_cta_a_block_beside_16_held_sms(rows, sm_count):
     name = loader.ROUTES["sm_100a"]["fwd_short"]
     routed = []
     for arch in ("sm_100a", "sm_103a", "sm_107a"):
@@ -1344,7 +1380,7 @@ def test_short_forward_grid_is_one_cta_a_block_below_one_cta_per_sm(rows, sm_cou
     record = loader.MODULES[name]
     assert record["grid_rule"] == {
         "kind": "row_blocks",
-        "max_rows_per_sm": {"sm_100a": 12, "sm_103a": 12, "sm_107a": 10},
+        "max_rows_per_sm": {"sm_100a": 12, "sm_103a": 12, "sm_107a": 59},
         "rows_per_cta": 16,
     }
     assert record["launch"]["block"] == (256, 1, 1)
@@ -1352,11 +1388,50 @@ def test_short_forward_grid_is_one_cta_a_block_below_one_cta_per_sm(rows, sm_cou
     assert record["arches"] == ["sm_100a", "sm_103a", "sm_107a"]
     grid = loader.launch_grid(record, rows=rows, sm_count=sm_count)
     assert grid == (-(-rows // 16), 1, 1)
-    assert grid[0] <= sm_count - 16
+    for arch in routed:
+        assert grid[0] <= SHORT_FORWARD_MAX_CTAS[arch](sm_count), (arch, grid)
     assert loader.launch_grid(record, rows=rows, sm_count=sm_count, ctas=7) == grid
     # the deterministic forward's grid: one 128-thread CTA per 16-row block
     fwd = loader.MODULES[loader.route_module("sm_100a", "fwd")]
     assert loader.launch_grid(fwd, rows=rows, sm_count=sm_count) == grid
+
+
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
+def test_short_forward_grid_bound_holds_from_its_fewest_sms(arch):
+    name = loader.ROUTES[arch]["fwd_short"]
+    record = loader.MODULES[name]
+    end = loader.max_rows_per_sm(name, arch)
+    for sm_count in range(1, 1025):
+        grid = loader.launch_grid(record, rows=end * sm_count, sm_count=sm_count)
+        fits = grid[0] <= SHORT_FORWARD_MAX_CTAS[arch](sm_count)
+        assert fits == (sm_count >= SHORT_FORWARD_MIN_SMS[arch]), (
+            arch,
+            sm_count,
+            grid,
+        )
+
+
+def test_short_forward_grid_at_its_threshold_keeps_the_bound_on_this_device():
+    """On the running device, the short forward's grid at the architecture's
+    threshold (the most rows it runs) keeps SHORT_FORWARD_MAX_CTAS; skipped
+    where the device has fewer SMs than the bound needs."""
+    device_index = torch.cuda.current_device()
+    arch = loader.device_arch(device_index)
+    sm_count = loader.device_sm_count(device_index)
+    name = loader.ROUTES[arch].get("fwd_short")
+    if name is None:
+        pytest.skip(f"{arch} routes no fwd_short module")
+    if sm_count < SHORT_FORWARD_MIN_SMS[arch]:
+        pytest.skip(
+            f"{sm_count} SMs: the short forward's grid bound on {arch} needs "
+            f"{SHORT_FORWARD_MIN_SMS[arch]} SMs or more"
+        )
+    rows = loader.max_rows_per_sm(name, arch) * sm_count
+    assert loader.module_for_rows(arch, "fwd", rows, sm_count) == name
+    assert loader.module_for_rows(arch, "fwd", rows + 1, sm_count) != name
+    grid = loader.launch_grid(loader.MODULES[name], rows=rows, sm_count=sm_count)
+    assert grid == (-(-rows // 16), 1, 1)
+    assert grid[0] <= SHORT_FORWARD_MAX_CTAS[arch](sm_count), (arch, sm_count, grid)
 
 
 # (rows, SMs) of the short backward: one cluster of 16 CTAs whatever the rows
@@ -1729,4 +1804,5 @@ def test_backward_alerts_under_deterministic_algorithms(launches):
     with pytest.warns(UserWarning, match=ALERT):
         y.backward(dy)
     assert_dw_within(wa.grad, dw64, mag, what="warn_only autograd dw")
-    assert launches == [routes["bwd_bf16"], routes["fwd"], routes["bwd_bf16"]], launches
+    fwd = _forward_module(x.numel() // D)
+    assert launches == [routes["bwd_bf16"], fwd, routes["bwd_bf16"]], launches
