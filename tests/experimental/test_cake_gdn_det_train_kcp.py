@@ -1211,7 +1211,7 @@ def _saved_formula(ctx, H_qk, HV, save_mode, boundary_mode, save_transfer, C) ->
         if save_transfer:
             total += ctx.N_out * 2 * hp.Hg_pad_by_rank[ctx.rank] * gp.STATE_TILE_BYTES
         if (save_transfer or save_mode == "full") and hp.P > 1:
-            total += (hp.P - 1) * ctx.n_frag * s
+            total += hp.P * ctx.n_frag * s
     if (
         save_mode == "full"
     ):  # every forward tape: h, v_new / w / u, Aqk / Akk, gamma, gcum / rowscale / qscale
@@ -2339,6 +2339,49 @@ def test_backward_forgets_its_own_saved_set_at_the_last_reader() -> None:
     assert "S_in" not in kcp.LAST_CALL["bwd"]["fresh_bytes"]
 
 
+@pytest.mark.parametrize(
+    "save_mode,save_transfer",
+    [("light", True), ("full", True), ("full", False)],
+    ids=["light-st", "full-st", "full-nost"],
+)
+@pytest.mark.parametrize("P", (2, 3))
+def test_saved_byte_query_counts_the_whole_m_seg_plane(
+    save_mode, save_transfer, P
+) -> None:
+    """The saved set keeps ``M_seg`` as the whole ``M_seg^T`` staging plane: ``[NSEG, HV]`` FP32 states with
+    ``NSEG = n_frag * P``, under ``save_transfer`` and under ``save_mode="full"``.  The byte query's ``M_seg`` term
+    (``P n_frag s``) equals the bytes of that saved tensor."""
+    kcp = _package("cake_kcp")
+    cu = [0, 100, 740, 817, 1817, 1946]
+    H_qk, HV = 2, 6
+    part = gp.partition_det_kcp(torch.tensor(cu, dtype=torch.int64), 1, "contiguous")
+    ctx = gp.build_context_det_kcp(part, None, 0, CPU)
+    ops = _inputs(cu, H_qk, HV)
+    _, saved = kcp.chunk_gdn_det_fwd_kcp(
+        ops["q"],
+        ops["k"],
+        ops["v"],
+        ops["g"],
+        ops["beta"],
+        ctx,
+        backend="fake",
+        segments=P,
+        save_mode=save_mode,
+        save_transfer=save_transfer,
+    )
+    assert saved is not None and saved.P == P and saved.M_seg is not None
+    plane = saved.M_seg.numel() * saved.M_seg.element_size()
+    assert plane == P * ctx.n_frag * HV * gp.STATE_TILE_BYTES
+    q = {
+        "H_qk": H_qk,
+        "HV": HV,
+        "save_mode": save_mode,
+        "save_transfer": save_transfer,
+        "P": P,
+    }
+    assert gb.gdn_det_saved_layout_kcp(ctx, **q)["M_seg"] == plane
+
+
 @pytest.mark.parametrize("use_qk_l2norm_in_kernel", (False, True))
 def test_full_backward_without_save_transfer_reads_no_unwritten_plane(
     monkeypatch, use_qk_l2norm_in_kernel
@@ -2375,18 +2418,18 @@ def test_full_backward_without_save_transfer_reads_no_unwritten_plane(
     )
     assert saved is not None and saved.P == 2 and saved.c1_recv is None
     assert saved.M_seg is not None and torch.isfinite(saved.M_seg).all()
-    assert (
-        gb.gdn_det_saved_layout_kcp(
-            ctx,
-            H_qk=H_qk,
-            HV=HV,
-            save_mode="full",
-            save_transfer=False,
-            P=2,
-            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-        )["M_seg"]
-        == (2 - 1) * ctx.n_frag * HV * gp.STATE_TILE_BYTES
-    )
+    m_seg_bytes = gb.gdn_det_saved_layout_kcp(
+        ctx,
+        H_qk=H_qk,
+        HV=HV,
+        save_mode="full",
+        save_transfer=False,
+        P=2,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+    )["M_seg"]
+    # the query counts the saved plane itself: NSEG = n_frag P states
+    assert m_seg_bytes == 2 * ctx.n_frag * HV * gp.STATE_TILE_BYTES
+    assert m_seg_bytes == saved.M_seg.numel() * saved.M_seg.element_size()
     # an older full saved set without M_seg would read an unwritten plane: refused
     with pytest.raises(ValueError, match="needs M_seg"):
         kcp.chunk_gdn_det_bwd_kcp(

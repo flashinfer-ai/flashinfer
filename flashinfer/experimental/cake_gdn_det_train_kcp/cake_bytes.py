@@ -52,7 +52,8 @@ with a successor in its document chain), ``N_in`` / ``N_out`` the group totals,
   saved set of one layer on this rank (design table 4.1): ``S_in`` (``n_in s``;
   the padded receive buffer), the owner's c1 receive tensor with
   ``save_transfer`` (``2 N_out s_owner``), ``M_seg`` at ``P > 1``
-  (``(P - 1) n_frag s``; see below) and the conv history rows (``n_hist_rows * C * 2``);
+  (``P n_frag s``, the whole ``M_seg^T`` plane; see below) and the conv history rows
+  (``n_hist_rows * C * 2``);
   ``save_mode="light"`` keeps no tape (its backward re-runs #1 and the #2 tape
   walk); ``save_mode="full"`` adds every forward tape: the ``h`` tape
   ``[NC_pad, HV, 128, 128]``, ``v_new`` / ``w`` / ``u`` ``[R, HV, 128]``, ``Aqk`` and
@@ -340,7 +341,7 @@ def gdn_det_saved_layout_kcp(
         "c1_recv": (ctx.N_out * 2 * hp.Hg_pad_by_rank[ctx.rank] * STATE_TILE_BYTES)
         if (saved and save_transfer)
         else 0,
-        "M_seg": ((P - 1) * ctx.n_frag * s)
+        "M_seg": (P * ctx.n_frag * s)
         if (saved and (save_transfer or save_mode == "full") and P > 1)
         else 0,
         "hist": ctx.halo.n_hist_rows * C * 2 if with_conv else 0,
