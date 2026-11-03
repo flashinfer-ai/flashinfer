@@ -68,12 +68,13 @@ PREFIX = "cake_gdn_train"
 KCP_SUFFIX = "_kcp"  # the context-parallel-only programs (``kcp_*``)
 _W = "sm100_sm103_sm107"
 
-# The nine programs of a step (the shipped records by program name: sixteen libraries), the three programs of the
-# in-kernel Q / K L2 norm (one library each) and the two test-only records.
+# The nine programs of a step and the output walk (the shipped records by program name: eighteen libraries), the three
+# programs of the in-kernel Q / K L2 norm (one library each) and the two test-only records.
 SHIPPED_PROGRAMS = (
     "fwd_prep",
     "kcp_fwdh_offset",
     "kcp_fwdh_tape",
+    "kcp_fwdh_out",
     "kcp_transfer_walk",
     "kcp_affine_merge",
     "fwd_o",
@@ -94,7 +95,7 @@ TEST_RECORDS = ("kcp_transfer_walk_three_mma", "kcp_transfer_walk_plain_tf32")
 # omitted one, so these pairs are frozen together with the kernels' build signatures.  The kernel modules are, so
 # far, the deterministic family's (``gdn_chunk_det_*``): the digests equal the twin's, the prefix differs, so no library
 # of this package is named like a library of ``cake_gdn_det_train_kcp`` (a lever that replaces a program updates
-# its row here).
+# its row here).  The output walk's module is det-neutral (``gdn_chunk_fwdh_out_v1_kcp``) and no det twin ships it.
 IDENTITIES = {
     "fwd_prep": (
         f"tart.gdn_chunk_train_fwd_prep.{_W}.gdn_chunk_det_train_fwd_prep_v1",
@@ -115,6 +116,11 @@ IDENTITIES = {
     "kcp_fwdh_tape_vh64": (
         f"tart.gdn_chunk_kcp_fwd_h.{_W}.gdn_chunk_det_fwdh_v1_kcp",
         {"program": "tape", "vh": 64},
+    ),
+    "kcp_fwdh_out": (f"tart.gdn_chunk_kcp_fwd_h.{_W}.gdn_chunk_fwdh_out_v1_kcp", {}),
+    "kcp_fwdh_out_vh64": (
+        f"tart.gdn_chunk_kcp_fwd_h.{_W}.gdn_chunk_fwdh_out_v1_kcp",
+        {"vh": 64},
     ),
     "kcp_transfer_walk": (
         f"tart.gdn_chunk_kcp_transfer_walk.{_W}.gdn_chunk_det_transfer_walk_v1_kcp",

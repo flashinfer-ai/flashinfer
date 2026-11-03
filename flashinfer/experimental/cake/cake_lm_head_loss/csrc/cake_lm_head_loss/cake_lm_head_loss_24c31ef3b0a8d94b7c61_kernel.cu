@@ -47,13 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define SMEM_BITMAP_OFF 0
-#define SMEM_BITMAP_STAGE_BYTES 32768
-#define SMEM_BITMAP_STRIDE 32768
-#define SMEM_TOTAL 32768
-#define THREADS 256
-
 #include <math_constants.h>
 
 extern "C" {
@@ -79,7 +72,7 @@ kernel_cake_lm_head_loss_24c31ef3b0a8d94b7c61(long long* __restrict__ ids, long 
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     unsigned int* bitmap = reinterpret_cast<unsigned int*>(smem_raw + 0);
     const int bitmap_addr = smem + 0;
 
@@ -98,7 +91,7 @@ kernel_cake_lm_head_loss_24c31ef3b0a8d94b7c61(long long* __restrict__ ids, long 
         if (tid == 0) {
             long long o_end = (long long)offsets[T];
             long long e_lo = ((o_end > 0) ? o_end : 0);
-            offsets32[T] = (int)(((e_lo < m64) ? e_lo : m64));
+            offsets32[T] = (int)((e_lo < m64) ? e_lo : m64);
         }
     }
     for (int t = bid * 8 + warp; t < T; t += row_stride) {
@@ -139,7 +132,7 @@ kernel_cake_lm_head_loss_24c31ef3b0a8d94b7c61(long long* __restrict__ ids, long 
                 bad = ((idv < 0 || idv >= v64) ? 1 : bad);
                 hit = ((idv == lab) ? 1 : 0);
                 long long lo_id = ((idv > 0) ? idv : 0);
-                ids32[lo + lane_1] = (int)(((lo_id < v64) ? lo_id : v64 - 1));
+                ids32[lo + lane_1] = (int)((lo_id < v64) ? lo_id : v64 - 1);
                 key = ((idv >= 0 && idv < (long long)V) ? (int)idv : key);
                 first = ((hit != 0) ? lane_1 : first);
             }
@@ -214,7 +207,7 @@ kernel_cake_lm_head_loss_24c31ef3b0a8d94b7c61(long long* __restrict__ ids, long 
                 bad = ((idv < 0 || idv >= v64_1) ? 1 : bad);
                 hit = ((idv == lab) ? 1 : 0);
                 long long lo_id_1 = ((idv > 0) ? idv : 0);
-                ids32[lo + i] = (int)(((lo_id_1 < v64_1) ? lo_id_1 : v64_1 - 1));
+                ids32[lo + i] = (int)((lo_id_1 < v64_1) ? lo_id_1 : v64_1 - 1);
                 first = ((hit != 0 && i < first) ? i : first);
             }
             for (int win = 0; win < num_windows; win++) {
@@ -245,7 +238,7 @@ kernel_cake_lm_head_loss_24c31ef3b0a8d94b7c61(long long* __restrict__ ids, long 
         int _warp_vote_1 = __any_sync(0xFFFFFFFF, dup != 0);
         bool any_dup = _warp_vote_1;
         int first_row;
-        asm volatile("redux.sync.min.s32 %0, %1, 0xffffffff;" : "=r"(first_row) : "r"(first));
+        asm volatile("redux.sync.min.s32 %0, %1, 0xFFFFFFFF;" : "=r"(first_row) : "r"(first));
         bool found = first_row < 2147483647;
         int code = 0;
         code = ((need && !found) ? 20 : code);

@@ -93,6 +93,13 @@ constexpr uint64_t kNarrowChunkC16TripFillDen = 10;
 constexpr uint64_t kPersistentRowsPerClusterNum = 5;
 constexpr uint64_t kPersistentRowsPerClusterDen = 2;
 constexpr uint64_t kSharedTilesRowsPerCluster = 4;
+// A shared-tile launch takes its low-latency form on sm_100 at every row count,
+// and elsewhere when its rows fit two waves of the shared-tile kernel's
+// resident clusters: on GB300, grids past two waves run faster with the
+// shared-tile kernel, while grids of one or two waves run faster with the
+// low-latency kernel; on B200 the low-latency kernel is faster at every wave
+// count (measured on B200 and GB300).
+constexpr uint64_t kSharedTilesLatencyMaxWaves = 2;
 // sm_103, 5- and 6-tile 8-CTA chunks whose CTA share exceeds 5 tiles: the
 // persistent kernel stays from 4 up to 6 rows per shared-tile cluster (296 to
 // 443 rows on GB300).
@@ -556,6 +563,27 @@ const void* cached_shared_tiles_kernel(CachedVariant variant, bool pdl) {
   return nullptr;
 }
 
+// The low-latency forms of the shared-tile kernels: the same shared memory,
+// launch bounds and outputs.
+const void* cached_shared_tiles_latency_kernel(CachedVariant variant, bool pdl) {
+  if (variant.max_tiles != kCachedMaxTiles) {
+    return nullptr;
+  }
+  if (variant.cluster_ctas == 8) {
+    return pdl ? reinterpret_cast<const void*>(
+                     kernel_flashinfer_blackwell_softmax_cached_cluster_c8_t4_s4_lat_pdl)
+               : reinterpret_cast<const void*>(
+                     kernel_flashinfer_blackwell_softmax_cached_cluster_c8_t4_s4_lat);
+  }
+  if (variant.cluster_ctas == 16) {
+    return pdl ? reinterpret_cast<const void*>(
+                     kernel_flashinfer_blackwell_softmax_cached_cluster_c16_t4_s4_lat_pdl)
+               : reinterpret_cast<const void*>(
+                     kernel_flashinfer_blackwell_softmax_cached_cluster_c16_t4_s4_lat);
+  }
+  return nullptr;
+}
+
 // Function attributes of a cluster launch: non-portable clusters above 8 CTAs,
 // and dynamic shared memory above the 48 KiB default.
 cudaError_t configure_cached_kernel(const void* kernel, int cluster_ctas,
@@ -692,6 +720,28 @@ cudaError_t shared_tile_resident_clusters(int cluster_ctas, bool pdl, int device
   return resident_clusters(
       kResidentSharedTiles, cached_shared_tiles_kernel({cluster_ctas, kCachedMaxTiles}, pdl),
       cluster_ctas, pdl, shared_tiles_dynamic_smem_bytes(cluster_ctas), device, clusters);
+}
+
+// Function attributes of the low-latency shared-tile kernels per device, 16
+// CTAs or not and PDL mode (1: set). Routing reads the shared-tile kernels'
+// resident clusters, which these kernels share.
+std::atomic<int> g_shared_tiles_latency_configured[kMaxDevices][2][2];
+
+cudaError_t configure_shared_tiles_latency_kernel(const void* kernel, int cluster_ctas, bool pdl,
+                                                  int device) {
+  std::atomic<int>* configured =
+      device >= 0 && device < kMaxDevices
+          ? &g_shared_tiles_latency_configured[device][cluster_ctas == 16][pdl]
+          : nullptr;
+  if (configured != nullptr && configured->load(std::memory_order_relaxed) != 0) {
+    return cudaSuccess;
+  }
+  const cudaError_t status =
+      configure_cached_kernel(kernel, cluster_ctas, shared_tiles_dynamic_smem_bytes(cluster_ctas));
+  if (status == cudaSuccess && configured != nullptr) {
+    configured->store(1, std::memory_order_relaxed);
+  }
+  return status;
 }
 
 struct CachedLaunch {
@@ -838,8 +888,15 @@ cudaError_t select_cached_route(uint32_t rows, uint32_t vocab_size, ParameterKin
     use_shared_tiles = false;
   }
   if (shared_resident > 0 && use_shared_tiles) {
-    *launch = {variant, shared_tiles, rows, shared_tiles_smem,
-               SoftmaxRoute::kCachedClusterSharedTiles};
+    const void* kernel = shared_tiles;
+    if (device_minor == 0 || rows64 <= kSharedTilesLatencyMaxWaves * shared_clusters) {
+      kernel = cached_shared_tiles_latency_kernel(variant, pdl);
+      status = configure_shared_tiles_latency_kernel(kernel, variant.cluster_ctas, pdl, device);
+      if (status != cudaSuccess) {
+        return status;
+      }
+    }
+    *launch = {variant, kernel, rows, shared_tiles_smem, SoftmaxRoute::kCachedClusterSharedTiles};
   } else if (shared_resident > 0 || !under_persistent) {
     *launch = {variant, persistent, persistent_clusters, persistent_smem,
                SoftmaxRoute::kCachedClusterPersistent};

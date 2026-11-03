@@ -390,3 +390,22 @@ def test_facade_reexports_the_handle_lazily() -> None:
         [sys.executable, "-c", code], capture_output=True, text=True, timeout=600
     )
     assert r.returncode == 0 and "FACADE_IMPORT_OK" in r.stdout, (r.stdout, r.stderr)
+
+
+@pytest.mark.cpu_only
+def test_graph_key_holds_the_backward_launch_form(monkeypatch) -> None:
+    """The backward's launch form (``cooperative``, FlashInfer issue #8365) is part of the graph validity key: the same
+    operands under the two forms are two keys, the same form one.  No kernel runs here."""
+    monkeypatch.delenv(conv_kcp.TEST_KNOBS_ENV, raising=False)
+    ctx = types.SimpleNamespace(T_r=8, n_frag=1, world_size=1)
+    x = torch.zeros(8, 16, dtype=torch.bfloat16)
+    try:
+        coop = conv_kcp._graph_entry("bwd", ctx, (x, None), "replay", variant=True)
+        split = conv_kcp._graph_entry("bwd", ctx, (x, None), "replay", variant=False)
+        assert coop is not None and split is not None and coop is not split
+        assert (
+            conv_kcp._graph_entry("bwd", ctx, (x, None), "replay", variant=False)
+            is split
+        )
+    finally:
+        conv_kcp._GRAPHS.clear()

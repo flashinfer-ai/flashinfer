@@ -50,7 +50,8 @@ ROWS = (
     5120, 5121, 6144, 6145, 12288, 12289, 14928, 14929, 15566, 15567, 16231, 16263, 16384, 16385, 19456, 19457, 19968,
     19969, 20480, 20481, 24064, 24065, 32768, 32769, 36352, 36353, 40448, 40449, 40960, 40961, 42496, 42497, 44032,
     44033, 45056, 45057, 48640, 48641, 50688, 50689, 52736, 52737, 55296, 55297, 58880, 58881, 65536, 65537, 70656,
-    70657, 80896, 80897, 81920, 81921, 99840, 99841, 114688, 114689, 139264, 139265, 1179648, 1179649, 1572864, 1572865,
+    70657, 80896, 80897, 81920, 81921, 99840, 99841, 114688, 114689, 139264, 139265, 720896, 720897, 1179648, 1179649,
+    1572864, 1572865,
 )  # fmt: skip
 # The row count standing in for an unbounded window's upper edge.
 OPEN_WINDOW_ROWS = 65536
@@ -321,9 +322,9 @@ def test_rows_cover_every_backward_window_edge() -> None:
 # five-CTA ring at issue distance three without the L2 hint (``a3``), both at ``tail_div=4``, in two sessions per
 # architecture (BF16 and FP32 weight alike); sm_107a runs the pipeline to 65536 rows and the ring above.  Above the
 # ring's dw accuracy edge of each architecture (80896 rows on sm_100a, 99840 on sm_103a, 70656 on sm_107a) the ring
-# with compensated dw sums (``dc``; on sm_100a and sm_107a its lean form ``dcln``, two rows per iteration with the
-# same arithmetic in the same order) runs instead, and above 1572864 rows its form with hi / lo partial rows
-# (``dchl``).
+# with compensated dw sums runs instead: its lean form ``dcln`` (two rows per iteration with the same arithmetic in the
+# same order), on sm_103a to 720896 rows and the ring itself (``dc``) above; above 1572864 rows its form with hi / lo
+# partial rows (``dchl``).
 H256_BWD_PROGRAMS = {
     "pd4": "rmsnorm_train_bwd_h256_t128x4_pd4_k_s32_split_pts_cl_td4",
     "a3": "rmsnorm_train_bwd_h256_t128x5_cpa8a3nhkc8_k_s32_split_pts_cl_td4_cs",
@@ -331,22 +332,26 @@ H256_BWD_PROGRAMS = {
     "dcln": "rmsnorm_train_bwd_h256_t128x5_cpa8a3nhftdfln_k_s32_split_pts_cl_td4_cs",
     "dchl": "rmsnorm_train_bwd_h256_t128x5_cpa8a3nhftdfhl_k_s32_split_pts_cl_td4_cs",
 }
+H256_BWD_RING = (
+    (0, 2048, "a3"),
+    (2048, 5120, "pd4"),
+    (5120, 12288, "a3"),
+    (12288, 40960, "pd4"),
+)
 H256_BWD_SPLIT = {
-    **{
-        arch: (
-            (0, 2048, "a3"),
-            (2048, 5120, "pd4"),
-            (5120, 12288, "a3"),
-            (12288, 40960, "pd4"),
-            (40960, edge, "a3"),
-            (edge, hl, dc),
-            (hl, None, "dchl"),
-        )
-        for arch, edge, hl, dc in (
-            ("sm_100a", 80896, 1572864, "dcln"),
-            ("sm_103a", 99840, 1572864, "dc"),
-        )
-    },
+    "sm_100a": (
+        *H256_BWD_RING,
+        (40960, 80896, "a3"),
+        (80896, 1572864, "dcln"),
+        (1572864, None, "dchl"),
+    ),
+    "sm_103a": (
+        *H256_BWD_RING,
+        (40960, 99840, "a3"),
+        (99840, 720896, "dcln"),
+        (720896, 1572864, "dc"),
+        (1572864, None, "dchl"),
+    ),
     "sm_107a": (
         (0, 65536, "pd4"),
         (65536, 70656, "a3"),

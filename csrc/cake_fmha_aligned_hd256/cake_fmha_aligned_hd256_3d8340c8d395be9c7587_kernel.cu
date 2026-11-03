@@ -43,52 +43,6 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
-#define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 112
-#define TMEM_TMEM_S0_OFFSET 0
-#define TMEM_TMEM_S1_OFFSET 8
-#define TMEM_TMEM_STATS0_OFFSET 16
-#define TMEM_TMEM_STATS1_OFFSET 48
-#define TMEM_TMEM_O0_C0_OFFSET 80
-#define TMEM_TMEM_O0_C1_OFFSET 88
-#define TMEM_TMEM_O1_C0_OFFSET 96
-#define TMEM_TMEM_O1_C1_OFFSET 104
-#define NUM_Q_PIPE_STAGES 2
-#define NUM_KV_PIPE_STAGES 4
-#define NUM_PAGE_PIPE_STAGES 6
-#define NUM_O_PIPE_STAGES 2
-#define SMEM_SMEM_Q_OFF 0
-#define SMEM_SMEM_Q_STAGE_BYTES 4096
-#define SMEM_SMEM_Q_STRIDE 4096
-#define SMEM_SMEM_KV_OFF 8192
-#define SMEM_SMEM_KV_STAGE_BYTES 32768
-#define SMEM_SMEM_KV_STRIDE 32768
-#define SMEM_SMEM_V_OFF 8192
-#define SMEM_SMEM_V_STAGE_BYTES 32768
-#define SMEM_SMEM_V_STRIDE 32768
-#define SMEM_SMEM_P0_OFF 139264
-#define SMEM_SMEM_P0_STAGE_BYTES 2048
-#define SMEM_SMEM_P0_STRIDE 2048
-#define SMEM_SMEM_P1_OFF 141312
-#define SMEM_SMEM_P1_STAGE_BYTES 2048
-#define SMEM_SMEM_P1_STRIDE 2048
-#define SMEM_SMEM_PAGE_IDS_OFF 143360
-#define SMEM_SMEM_PAGE_IDS_STAGE_BYTES 768
-#define SMEM_SMEM_PAGE_IDS_STRIDE 768
-#define SMEM_SMEM_CGA_OFF 144128
-#define SMEM_SMEM_CGA_STAGE_BYTES 33280
-#define SMEM_SMEM_CGA_STRIDE 33280
-#define SMEM_SMEM_RED0_OFF 177408
-#define SMEM_SMEM_RED0_STAGE_BYTES 128
-#define SMEM_SMEM_RED0_STRIDE 128
-#define SMEM_SMEM_RED1_OFF 177536
-#define SMEM_SMEM_RED1_STAGE_BYTES 128
-#define SMEM_SMEM_RED1_STRIDE 128
-#define SMEM_SMEM_CORR_RED_OFF 177664
-#define SMEM_SMEM_CORR_RED_STAGE_BYTES 256
-#define SMEM_SMEM_CORR_RED_STRIDE 256
-#define SMEM_TOTAL 178560
-#define THREADS 512
 #define BLOCK_N 128
 #define STEP_N 256
 #define HEAD_DIM 256
@@ -1035,10 +989,17 @@ kernel_cake_fmha_aligned_hd256_3d8340c8d395be9c7587(const __grid_constant__ CUte
                 int cta_offset_o = seq_offset_o * (num_q_heads * HEAD_DIM) + head_c * heads_o * HEAD_DIM;
                 int num_valid_slices = (num_valid_rows_o + 3) / 4;
                 int num_slices_per_cta = (num_valid_slices + (num_ctas_kv_c - 1)) / num_ctas_kv_c;
-                int num_ctas_kv_for_red = (num_valid_slices + (num_slices_per_cta - 1)) / num_slices_per_cta;
                 int rows_per_cta = num_slices_per_cta * 4;
                 int num_valid_rows_in_cta = ((rows_per_cta) < (num_valid_rows_o - rank_c * rows_per_cta) ? (rows_per_cta) : (num_valid_rows_o - rank_c * rows_per_cta));
                 int cga_stats_off = num_ctas_kv_c * rows_per_cta * 512;
+                int start_slice = rank_c * num_slices_per_cta;
+                int end_slice = ((start_slice + num_slices_per_cta) < (num_valid_slices) ? (start_slice + num_slices_per_cta) : (num_valid_slices));
+                int o_dst = tok_row_c / rows_per_cta;
+                int o_row_off = (rank_c * rows_per_cta + tok_row_c % rows_per_cta) * 512 + dst_col_bytes_c;
+                int stat_sel = wg_tid_c / 4;
+                int stat_row = wg_tid_c % 4 * 2 + stat_sel;
+                int stat_dst = stat_row / rows_per_cta;
+                int stat_off = cga_stats_off + (rank_c * rows_per_cta + stat_row % rows_per_cta) * 8;
                 float merged_max[2];
                 float scales_i0[2];
                 float scales_i1[2];
@@ -1094,8 +1055,6 @@ kernel_cake_fmha_aligned_hd256_3d8340c8d395be9c7587(const __grid_constant__ CUte
                     total_sum1 = total_sum1 + pair_c[1];
                 }
                 if (wg_tid_c < 8) {
-                    int stat_sel = wg_tid_c / 4;
-                    int stat_row = wg_tid_c % 4 * 2 + stat_sel;
                     float stat_max = merged_max[0];
                     float stat_sum = total_sum0;
                     if (stat_sel != 0) {
@@ -1103,11 +1062,10 @@ kernel_cake_fmha_aligned_hd256_3d8340c8d395be9c7587(const __grid_constant__ CUte
                         stat_sum = total_sum1;
                     }
                     if (stat_row < num_valid_rows_o) {
-                        int stat_dst = stat_row / rows_per_cta;
                         uint32_t stat_addr;
                         asm volatile(
                             "mapa.shared::cluster.u32 %0, %1, %2;"
-                            : "=r"(stat_addr) : "r"(smem_cga_addr + (unsigned int)(cga_stats_off + (rank_c * rows_per_cta + stat_row % rows_per_cta) * 8)), "r"(stat_dst));
+                            : "=r"(stat_addr) : "r"(smem_cga_addr + (unsigned int)stat_off), "r"(stat_dst));
                         uint32_t _mbar_peer_13;
                         asm(
                             "mapa.shared::cluster.u32 %0, %1, %2;"
@@ -1172,8 +1130,7 @@ kernel_cake_fmha_aligned_hd256_3d8340c8d395be9c7587(const __grid_constant__ CUte
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&o_vec[0])), "=r"(*reinterpret_cast<uint32_t*>(&o_vec[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&o_vec[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&o_vec[(0) + 3]))
                         : "r"(smem_p0_addr + (unsigned int)load_smem_off_c));
-                    int o_dst = tok_row_c / rows_per_cta;
-                    int o_off = (rank_c * rows_per_cta + tok_row_c % rows_per_cta) * 512 + dst_col_bytes_c;
+                    int o_off = o_row_off;
                     uint32_t _cluster_mapa_15;
                     asm volatile(
                         "mapa.shared::cluster.u32 %0, %1, %2;"
@@ -1235,28 +1192,25 @@ kernel_cake_fmha_aligned_hd256_3d8340c8d395be9c7587(const __grid_constant__ CUte
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&o_vec_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&o_vec_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&o_vec_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&o_vec_1[(0) + 3]))
                         : "r"(smem_p0_addr + (unsigned int)load_smem_off_c));
-                    int o_dst_1 = tok_row_c / rows_per_cta;
-                    int o_off_1 = (rank_c * rows_per_cta + tok_row_c % rows_per_cta) * 512 + 256 + dst_col_bytes_c;
+                    int o_off_1 = o_row_off + 256;
                     uint32_t _cluster_mapa_17;
                     asm volatile(
                         "mapa.shared::cluster.u32 %0, %1, %2;"
-                        : "=r"(_cluster_mapa_17) : "r"(smem_cga_addr + (unsigned int)o_off_1), "r"(o_dst_1));
+                        : "=r"(_cluster_mapa_17) : "r"(smem_cga_addr + (unsigned int)o_off_1), "r"(o_dst));
                     uint32_t _mbar_peer_18;
                     asm(
                         "mapa.shared::cluster.u32 %0, %1, %2;"
-                        : "=r"(_mbar_peer_18) : "r"(cga_full_addr), "r"(o_dst_1));
+                        : "=r"(_mbar_peer_18) : "r"(cga_full_addr), "r"(o_dst));
                     asm volatile(
                         "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
                         :: "r"(_cluster_mapa_17), "r"(o_vec_1[0]), "r"(o_vec_1[1]), "r"(o_vec_1[2]), "r"(o_vec_1[3]), "r"(_mbar_peer_18) : "memory");
                 }
                 asm volatile("barrier.sync 3, 128;" ::: "memory");
-                if (rank_c < num_ctas_kv_for_red) {
+                if (start_slice < num_valid_slices) {
                     if (wg_tid_c == 0) {
                         mbarrier_arrive_expect_tx(cga_full_addr, num_valid_rows_in_cta * num_ctas_kv_c * 520);
                     }
                     mbarrier_wait_cluster_hint(cga_full_addr, 0, 10000000);
-                    int start_slice = rank_c * num_slices_per_cta;
-                    int end_slice = ((start_slice + num_slices_per_cta) < (num_valid_slices) ? (start_slice + num_slices_per_cta) : (num_valid_slices));
                     #pragma unroll 1
                     for (int slice_r = start_slice; slice_r < end_slice; slice_r++) {
                         int row_r = slice_r * 4 + red_row_in_slice;

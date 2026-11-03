@@ -30,7 +30,8 @@ stage buckets of ``fp8:q128:short`` (``K <= 4096``, sm_100a and sm_103a) and
 ``fp8:full:le32:short`` (``K <= 32768``, sm_100a) launch the warp-scan text with a
 four-stage TMEM accumulator ring (identical logits and schedule words); on
 sm_103a the stage bucket of ``fp8:qle2048:short`` (``Q <= 136``,
-``K <= 8448``) launches the fused tiered text with that ring. A class
+``K <= 8448``) launches the fused tiered text with that ring (on sm_103a the
+route binds the ``source_consumer_release`` build of that text). A class
 is named by its query-BLOCK ceiling and served while the KV length is within
 the catalog policy's bound for that class (``fused_*_max_kv``); above the
 bound the two-launch route of the same query count serves the call. The FP4
@@ -79,6 +80,16 @@ partial kind or a ``:short`` route a program of its own that no route's
 ``stages`` name -- with the same host call, logits and schedule words as the
 record's program; the route name, its admission and its metadata buffer are the
 record's.
+
+A route record may carry ``variants`` (``{variant: [[stage, program], ...]}``):
+the stages a call asking for that variant launches in place of the record's
+own stages and its ``stage_buckets`` (:func:`route_stages` with ``variant``).
+The ``"raw"`` variant of a 32-head FP8 route launches, per stage and
+architecture, the raw-store twin of the record's program -- the same text
+without the cleaner, so each row's window cells are the cleaned program's bits
+and the cells outside the windows of its query block are left unwritten -- or
+the record's own program where no twin is catalogued; ``clean_logits=False``
+selects it (:class:`DenseMqaPlan`, :func:`fp8_mqa_logits`).
 """
 
 from __future__ import annotations
@@ -88,7 +99,9 @@ import json
 from pathlib import Path
 
 _ARCHES = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
-CATALOG_SCHEMA = "dense_mqa.v13"
+CATALOG_SCHEMA = "dense_mqa.v14"
+# The route variant a ``clean_logits=False`` call launches where the route record catalogues it.
+RAW_VARIANT = "raw"
 NUM_HEADS = 32  # default head count of the public helpers
 BLOCK_QH = 128  # query rows x heads per MMA tile
 BLOCK_Q = BLOCK_QH // NUM_HEADS
@@ -196,11 +209,15 @@ def stage_programs(stage, arches):
     return dict(by_arch)
 
 
-def route_stages(record, arch, keys, queries=None):
+def route_stages(record, arch, keys, queries=None, variant=None):
     """The stages a route record launches on ``arch`` for the KV length ``keys`` (``kv.shape[0]``) and the query
-    count ``queries``: the first ``stage_buckets[arch]`` entry with ``keys <= kv_max`` and, where the entry spells
-    ``max_queries``, ``queries <= max_queries`` (``[[stage, program], ...]``, one program name per stage), else the
-    record's ``stages``.  An entry with ``max_queries`` never matches when ``queries`` is not given."""
+    count ``queries``: the record's ``variants[variant]`` where ``variant`` is given and the record catalogues it
+    (its stages replace the record's own and its buckets); else the first ``stage_buckets[arch]`` entry with
+    ``keys <= kv_max`` and, where the entry spells ``max_queries``, ``queries <= max_queries`` (``[[stage, program],
+    ...]``, one program name per stage), else the record's ``stages``.  An entry with ``max_queries`` never matches
+    when ``queries`` is not given."""
+    if variant is not None and variant in record.get("variants", {}):
+        return record["variants"][variant]
     for bucket in record.get("stage_buckets", {}).get(arch, ()):
         bound = bucket.get("max_queries")
         if keys <= int(bucket["kv_max"]) and (
@@ -212,13 +229,14 @@ def route_stages(record, arch, keys, queries=None):
 
 def program_names(route=None, arch=None):
     """Names of the catalogued programs: all of them, those a route may launch on ``arch`` (stage order, then
-    its ``stage_buckets`` programs for ``arch``, then the sequence; a plan's ``program_names`` are the ones it
-    launches), or -- without ``arch`` -- the sorted union over the architectures."""
+    its ``stage_buckets`` programs for ``arch``, then its ``variants`` programs, then the sequence; a plan's
+    ``program_names`` are the ones it launches), or -- without ``arch`` -- the sorted union over the architectures."""
     catalog = _catalog()
     if route is None:
         return sorted(catalog["programs"])
     record = catalog["routes"].get(route) or catalog["paged_routes"][route]
     buckets = record.get("stage_buckets", {})
+    variants = record.get("variants", {})
     if arch is None:
         names = sorted(
             {
@@ -232,11 +250,22 @@ def program_names(route=None, arch=None):
                 for entry in entries
                 for _stage, program in entry["stages"]
             }
+            | {
+                program
+                for stages in variants.values()
+                for stage in stages
+                for program in stage_programs(stage, catalog["arches"]).values()
+            }
         )
     else:
         names = [stage_program(stage, arch) for stage in record["stages"]]
         for entry in buckets.get(arch, ()):
             for _stage, program in entry["stages"]:
+                if program not in names:
+                    names.append(program)
+        for stages in variants.values():
+            for stage in stages:
+                program = stage_program(stage, arch)
                 if program not in names:
                     names.append(program)
     if record.get("sequence"):
@@ -1070,7 +1099,11 @@ class DenseMqaPlan:
     reusable across streams because output and metadata are mutable. Output is
     FP32 with physical row stride logits_stride(K) = align8(K + 256); consume
     output[:, :K] (``logical_output``). On the 32-head routes every cell of the
-    output is written by each submission (``clean_logits == "fused"``); the
+    output is written by each submission (``clean_logits == "fused"``) unless
+    the plan is made with ``clean_logits=False``: then a route that catalogues
+    a ``"raw"`` variant launches its raw-store twins, which write each row's
+    window with the same bits and leave the cells outside the windows of its
+    query block unspecified (``plan.variant`` is ``"raw"``); the
     64-head routes are single-stage and store raw tiles only (cells outside the
     windows are unspecified): the grid-stride and one-split routes have no
     metadata buffer (``metadata`` must be None, ``plan.metadata`` is None, the
@@ -1100,7 +1133,13 @@ class DenseMqaPlan:
         metadata=None,
         sm_count=None,
         enforce_admission=True,
+        clean_logits=None,
     ):
+        """``clean_logits``: ``None`` launches the route's own programs; ``False``
+        its ``"raw"`` variant where the route record catalogues one (every cell
+        outside the windows is then unspecified; the route's own programs
+        otherwise); ``True`` requires a route whose programs write ``-inf``
+        outside the windows (``clean_logits == "fused"``) and launches them."""
         import torch
 
         arch, num_sms = _resolve_device(q, sm_count)
@@ -1231,6 +1270,18 @@ class DenseMqaPlan:
             else _export_route(precision, queries, keys, num_heads)
         )
         self.route = _catalog()["routes"][self.route_name]
+        if clean_logits and self.route.get("clean_logits") != "fused":
+            raise ValueError(
+                f"clean_logits=True is not available on route {self.route_name} (the program stores raw tiles, "
+                "DeepGEMM clean_logits=False semantics); pass clean_logits=False as the engine does"
+            )
+        self.variant = (
+            RAW_VARIANT
+            if clean_logits is False
+            and RAW_VARIANT in self.route.get("variants", {})
+            and not self.route.get("sequence")
+            else None
+        )
         self.config = dict(
             precision=precision,
             num_heads=num_heads,
@@ -1319,7 +1370,7 @@ class DenseMqaPlan:
         if sequence:
             selections = [(None, sequence)]
         else:
-            stages = route_stages(self.route, arch, keys, queries)
+            stages = route_stages(self.route, arch, keys, queries, self.variant)
             selections = [(stage[0], stage_program(stage, arch)) for stage in stages]
         self.program_names = [program for _stage, program in selections]
         for stage_name, program in selections:
@@ -1365,9 +1416,11 @@ def fp8_mqa_logits(
     FP32 scales [K])``, FP32 ``weights [Q, H]``, int32 ``ks`` / ``ke [Q]``.
     Returns the FP32 ``[Q, K]`` view of a freshly allocated
     ``[Q, logits_stride(K)]`` buffer (``logits_stride(K) = align8(K + 256)``, no
-    padding rows). On a ``"fused"`` route every cell is written (``-inf``
-    outside each row's window) and the ``clean_logits`` flag is accepted for
-    signature parity without changing the result.
+    padding rows). With ``clean_logits=True`` every cell is written (``-inf``
+    outside each row's window); with ``clean_logits=False`` (DeepGEMM's
+    default) only each row's window is defined: a route that catalogues a
+    ``"raw"`` variant launches its raw-store twins, which skip the cleanup and
+    write the window cells with the same bits.
     ``max_seqlen_k`` must be 0 (no narrowing of the returned view).
     A 32-head call whose ``[Q, logits_stride(K)]`` logits pass ``MAX_LAUNCH_LOGITS`` elements runs one
     launch per range of query rows.
@@ -1399,17 +1452,6 @@ def fp8_mqa_logits(
     if tuple(weights.shape) != (queries, num_heads):
         raise ValueError("weights must be [Q, H]")
     keys = int(kv_values.shape[0]) if kv_values.ndim == 2 else 0
-    if (
-        clean_logits
-        and route_record(
-            "fp8", queries, keys, num_heads, arch=device_arch(q.device)
-        ).get("clean_logits")
-        != "fused"
-    ):
-        raise ValueError(
-            "clean_logits=True is not available on this route (the program stores raw tiles, DeepGEMM "
-            "clean_logits=False semantics); pass clean_logits=False as the engine does"
-        )
     if kv_scales.ndim == 1 and (
         kv_scales.untyped_storage().nbytes() - kv_scales.storage_offset() * 4
     ) // 4 < align4(keys):
@@ -1453,6 +1495,14 @@ def fp8_mqa_logits(
             ).run()
         return output[:, :keys]
     plan = DenseMqaPlan(
-        "fp8", q, kv_values, weights, ks, ke, kv_scales=kv_scales, sm_count=sm_count
+        "fp8",
+        q,
+        kv_values,
+        weights,
+        ks,
+        ke,
+        kv_scales=kv_scales,
+        sm_count=sm_count,
+        clean_logits=bool(clean_logits),
     )
     return plan.run()

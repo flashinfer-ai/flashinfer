@@ -1,4 +1,5 @@
-"""Source-level CAKE backend for DeepSeek V4 sparse MLA on SM100 and SM103.
+"""Source-level CAKE backend for DeepSeek V4 sparse MLA on SM100 and SM103, and
+for the FP8 decode route on SM107.
 
 Host contract (flashinfer#4671 hardening)
 -----------------------------------------
@@ -967,6 +968,29 @@ def _fp8_h64_m64_program(sparse_topk: int) -> str:
     return "fp8_h64_prefill_source_persistent_m64_multi_tile"
 
 
+# Architectures that build the H64 cluster body (``fp8_lowhead_h64``); SM107
+# registers no program for it.
+_FP8_LOWHEAD_H64_ARCHES = frozenset({"sm_100a", "sm_103a"})
+
+
+def _fp8_h64_uses_cluster_body(
+    sparse_topk: int, num_query_tokens: int, arch: Optional[str]
+) -> bool:
+    """FP8/H64 decode rows of at most 12 tokens with two complete sparse tiles
+    and a partial third (widths 260-380), which the persistent body leaves (it
+    needs three complete tiles at <= 12 tokens): the H64 cluster body (two CTAs
+    per token, one wave) beats the M64 body there (1-12 tokens, widths
+    260-380, both cache layouts: B200 9.5-10.3 us vs 10.0-11.1 us, GB300
+    9.1-10.0 us vs 9.4-10.7 us).  Width 256 (no partial tile: B200 8.8-9.4 us
+    vs 7.6-8.9 us, GB300 8.5-9.2 us vs 7.2-8.3 us) and rows with one complete
+    tile keep the M64 body; so does ``arch=None`` (unknown device)."""
+    return (
+        arch in _FP8_LOWHEAD_H64_ARCHES
+        and num_query_tokens <= 12
+        and 2 * _TILE_KV < sparse_topk < 3 * _TILE_KV
+    )
+
+
 def canonical_arg_name(kind: str, name: str) -> str:
     """Map a registration ``arg_plan`` entry onto the host value vocabulary."""
     if kind == "tma_buffer":
@@ -1122,9 +1146,11 @@ def _route(
     compressed_page_size: int,
     num_query_tokens: int,
     sm_count: int,
+    arch: Optional[str] = None,
 ) -> str:
     """The variant one call runs; ``sm_count`` is the device's SM count (the
-    FP8/H64 decode rows pick their body by the waves of its grid)."""
+    FP8/H64 decode rows pick their body by the waves of its grid) and ``arch``
+    its ``sm_XYa`` target (``None``: routes that every architecture builds)."""
     if max_q_len <= 0:
         raise ValueError("max_q_len must be positive")
     is_swa = sparse_topk == 128
@@ -1189,9 +1215,11 @@ def _route(
                 return _fp8_persistent_program(num_query_tokens)
             if is_swa:
                 return "fp8_lowhead_prefill"
-            # Rows with fewer complete tiles: the M64 body beats the H64 cluster
-            # body at every token count (GB300, topk128x widths 204-252,
-            # 1-72 tokens: 7.9-8.5 us vs 8.8-10.4 us).
+            if _fp8_h64_uses_cluster_body(sparse_topk, num_query_tokens, arch):
+                return "fp8_lowhead_h64"
+            # Rows with one complete tile (and width 256): the M64 body beats
+            # the H64 cluster body at every token count (GB300, topk128x widths
+            # 204-252, 1-72 tokens: 7.9-8.5 us vs 8.8-10.4 us).
             return _fp8_h64_m64_program(sparse_topk)
         if is_swa:
             return "fp8_lowhead_prefill"
@@ -1473,6 +1501,7 @@ def cake_dsv4_workspace_requirement(
     batch_size: int,
     ragged: bool,
     sm_count: Optional[int] = None,
+    arch: Optional[str] = None,
 ) -> WorkspaceRequirement:
     """Route and exact workspace requirement of one call.
 
@@ -1483,11 +1512,16 @@ def cake_dsv4_workspace_requirement(
     length or the ragged maximum, ``batch_size`` = ``seq_lens.numel()``,
     ``ragged`` = ``cum_seq_lens_q is not None``, ``sm_count`` = the SM count
     of the device the call runs on (``None``: the current CUDA device's; the
-    workspace numbers do not depend on it, the route name may). Raises
-    ``ValueError`` for a shape ``backend="cake"`` has no kernel for.
+    workspace numbers do not depend on it, the route name may), ``arch`` = its
+    ``sm_XYa`` target (``None``: the current CUDA device's whenever CUDA is
+    available, else the route every architecture builds; the workspace numbers
+    do not depend on it either). Raises ``ValueError`` for a shape
+    ``backend="cake"`` has no kernel for.
     """
     if sm_count is None:
         sm_count = _device_sm_count(torch.device("cuda", torch.cuda.current_device()))
+    if arch is None and torch.cuda.is_available():
+        arch = _target_arch(torch.device("cuda", torch.cuda.current_device()))
     tokens = _positive_int(num_query_tokens, "num_query_tokens")
     heads = _positive_int(num_heads, "num_heads")
     batch = _positive_int(batch_size, "batch_size")
@@ -1502,6 +1536,7 @@ def cake_dsv4_workspace_requirement(
         compressed_page_size=int(compressed_page_size),
         num_query_tokens=tokens,
         sm_count=_positive_int(sm_count, "sm_count"),
+        arch=arch,
     )
     plan = _route_plan(
         route, num_query_tokens=tokens, num_heads=heads, sparse_topk=topk
@@ -1559,6 +1594,44 @@ _OUT_PHASE_BY_ROUTE: dict[str, int] = {
     #   bf16_h128_topk128x: hardening-000025 / -000031 -0.74 / -0.70 us GB300, the
     #   other rows of the route flat (|d| <= 0.03 us).
     "bf16_h128_topk128x": 0x800,
+}
+
+
+# Alignment of O that each route's program needs beyond the 2 bytes a
+# contiguous bf16 view guarantees, the widest O store of its kernels over every
+# architecture that runs the route: 32 = ``st.global.v8.b32`` at 16-element
+# offsets, 16 = ``int4`` stores at 8-element offsets or an O tensor map (TMA
+# store; its binding rejects an address off 16 bytes).  bf16_h128_topk4x_v52
+# writes O from its split-5 reducer (``int4`` on sm_103a, ``int2`` on sm_100a);
+# bf16_h128_topk128x from the split reducer (``int2``) or, above 16 tokens, the
+# row-first owners (``st.global.v8.b32``); bf16_h64_compressed_q8_v38 from the
+# H64 reducer (``int2``) or, with one split, the producer
+# (``st.global.v8.b32``).  A caller ``out`` off that alignment (a contiguous
+# view at +2 or +16 bytes) runs into an aligned staging buffer that is then
+# copied into ``out``: the same program, the same bits.  An aligned ``out``
+# (every allocation, every phase of ``_OUT_PHASE_BY_ROUTE``) takes no staging.
+_OUT_ALIGN_BY_ROUTE: dict[str, int] = {
+    "bf16_h128_prefill_v42": 32,
+    "bf16_h128_swa128": 16,
+    "bf16_h128_topk128x": 32,
+    "bf16_h128_topk4x_v52": 16,
+    "bf16_h16_h32_swa128_v44": 16,
+    "bf16_h32_topk128x_early_v47": 16,
+    "bf16_h64_compressed_q8_v38": 32,
+    "bf16_h64_guard_q_tma_batch_r25": 16,
+    "bf16_h64_prefill": 32,
+    "bf16_h8_h16_source_exact": 16,
+    "bf16_h8_swa128_v43": 16,
+    "bf16_swa128_single_cta": 16,
+    "fp8_h128_prefill_source_persistent": 16,
+    "fp8_h128_prefill_source_persistent_uniform": 16,
+    "fp8_h64_prefill_source_persistent_m64": 32,
+    "fp8_h64_prefill_source_persistent_m64_multi_tile": 32,
+    "fp8_h64_source_exact": 32,
+    "fp8_h8_h16_source_exact": 16,
+    "fp8_lowhead_h64": 32,
+    "fp8_lowhead_one_partition": 32,
+    "fp8_lowhead_prefill": 32,
 }
 
 
@@ -1780,8 +1853,8 @@ def run_cake_dsv4(
 ) -> torch.Tensor:
     """Launch the CAKE DSv4 route for flattened ``query [rows, num_heads, 512]``.
 
-    ``enable_pdl`` launches the programs that support it (the FP8 persistent
-    and M64 bodies) as programmatic dependents of the previous kernel on the
+    ``enable_pdl`` launches the programs that support it (the FP8 persistent,
+    M64, low-head prefill and H64 cluster bodies) as programmatic dependents of the previous kernel on the
     stream; they wait for it before their first global read.  The other
     programs launch without the attribute.
 
@@ -1794,7 +1867,9 @@ def run_cake_dsv4(
     the dense per-request query length (``query.shape[1]`` of the caller's
     ``[B, Q, H, 512]``) or the ragged maximum; ``seq_lens`` has one entry per
     request and ``cum_seq_lens_q`` (ragged only) ``batch_size + 1`` offsets.
-    Apart from the ``out=None`` output no device memory is allocated here
+    Apart from the ``out=None`` output and the staging buffer of a caller
+    ``out`` off its route's store alignment (``_OUT_ALIGN_BY_ROUTE``; an
+    aligned ``out`` takes none) no device memory is allocated here
     (the dense request offsets of the ragged-only producers and of row-tiled
     dense launches are process-lifetime constants, created on first use:
     warm such shapes up eagerly before a capture); see the module docstring
@@ -1885,6 +1960,7 @@ def run_cake_dsv4(
         compressed_page_size=compressed_kv_cache.shape[-2],
         num_query_tokens=meta.num_query_tokens,
         sm_count=_device_sm_count(device),
+        arch=arch,
     )
 
     if out is None:
@@ -1902,6 +1978,11 @@ def run_cake_dsv4(
                 f"out_shape {tuple(out.shape)} holds fewer than {num_query_tokens} rows"
             )
     out_rows = out.view(-1, num_heads, _HEAD_DIM)[:num_query_tokens]
+    staged_out: Optional[torch.Tensor] = None
+    out_align = _OUT_ALIGN_BY_ROUTE.get(route)
+    if out_align is not None and out_rows.data_ptr() % out_align:
+        staged_out = out_rows
+        out_rows = torch.empty_like(out_rows)
 
     if not ragged and batch_size * max_q_len < num_query_tokens:
         raise ValueError(
@@ -1986,6 +2067,8 @@ def run_cake_dsv4(
             rows_per_launch=rows_per_launch,
             request_offsets=request_offsets,
         )
+    if staged_out is not None:
+        staged_out.copy_(out_rows)
     return out
 
 

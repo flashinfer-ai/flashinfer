@@ -24,7 +24,8 @@ itself and forwards every keyword.  Every switch is a keyword argument; no
 environment variable is read.
 
 Operands (one packed batch of documents): ``q, k, v`` BF16 ``[1, S, H, 128]``
-(``q`` / ``k`` L2-normalized by the caller), ``g`` FP32 ``[1, S, H, 128]`` (the
+(``q`` / ``k`` L2-normalized by the caller, or raw with
+``use_qk_l2norm_in_kernel=True``), ``g`` FP32 ``[1, S, H, 128]`` (the
 natural-log decay gate, preactivated), ``beta`` BF16 ``[1, S, H]`` (through
 the sigmoid), ``cu_seqlens`` int32 ``[num_docs + 1]`` on the device.  The
 batch axis of 1 is optional; outputs take the rank of the inputs.  Gradients:
@@ -86,6 +87,7 @@ def chunk_kda_det_fwd(
     A_log: Optional[torch.Tensor] = None,
     dt_bias: Optional[torch.Tensor] = None,
     lower_bound: Optional[float] = None,
+    use_qk_l2norm_in_kernel: bool = False,
 ) -> tuple[torch.Tensor, Optional[Any]]:
     r"""Packed KDA chunked training forward.
 
@@ -132,6 +134,13 @@ def chunk_kda_det_fwd(
         FP32 ``[H * 128]`` or ``[H, 128]``, contiguous (raw gate mode).
     lower_bound : float, optional
         The gate's lower bound, required in raw gate mode: finite, ``-5.0 <= lower_bound < 0.0``.
+    use_qk_l2norm_in_kernel : bool
+        ``False`` (the default): ``q`` / ``k`` are L2-normalized by the caller and contiguous.  ``True``: ``q`` /
+        ``k`` are the raw rows, normalized per token and head inside the kernels (``bf16(x * r)``, ``r = 1 /
+        sqrt(sum(x^2) + 1e-6)`` in FP32); they may be strided views (unit innermost stride, head stride 128, token
+        stride a multiple of 8 elements and at least ``128 * H``, a 16-byte aligned address; never copied).  The
+        saved set adds the FP32 reciprocal norms ``[2, S, H]`` (no normalized rows are kept) and records the mode;
+        the workspace must be allocated with ``use_qk_l2norm_in_kernel=True``.
 
     Returns
     -------
@@ -156,6 +165,7 @@ def chunk_kda_det_fwd(
         A_log=A_log,
         dt_bias=dt_bias,
         lower_bound=lower_bound,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
     )
 
 
@@ -178,6 +188,7 @@ def chunk_kda_det_bwd(
     A_log: Optional[torch.Tensor] = None,
     dt_bias: Optional[torch.Tensor] = None,
     lower_bound: Optional[float] = None,
+    use_qk_l2norm_in_kernel: bool = False,
 ) -> tuple[torch.Tensor, ...]:
     r"""Packed KDA chunked training backward.
 
@@ -204,6 +215,9 @@ def chunk_kda_det_bwd(
     use_gate_in_kernel, A_log, dt_bias, lower_bound
         The forward's gate mode and raw gate parameters (see :func:`chunk_kda_det_fwd`); a saved set of the other mode,
         or with another ``lower_bound``, is refused.
+    use_qk_l2norm_in_kernel : bool
+        The forward's in-kernel Q/K L2 norm mode (``q`` / ``k`` then the raw rows; ``dq`` / ``dk`` their
+        gradients); a saved set of the other mode is refused.
 
     Returns
     -------
@@ -231,6 +245,7 @@ def chunk_kda_det_bwd(
         A_log=A_log,
         dt_bias=dt_bias,
         lower_bound=lower_bound,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
     )
 
 
@@ -252,6 +267,7 @@ def chunk_kda_det(
     A_log: Optional[torch.Tensor] = None,
     dt_bias: Optional[torch.Tensor] = None,
     lower_bound: Optional[float] = None,
+    use_qk_l2norm_in_kernel: bool = False,
 ) -> torch.Tensor:
     r"""Packed KDA chunked training as an autograd node (``torch.utils.checkpoint`` compatible).
 
@@ -259,7 +275,8 @@ def chunk_kda_det(
     operands, ``save_mode``, ``arena``, ``doc_lengths`` (the node records the option and the document lengths,
     so a backward that allocates its own workspace takes them too) and the raw gate mode
     (``use_gate_in_kernel=True``, ``A_log``, ``dt_bias``, ``lower_bound``: gradients to the raw gate ``g``, BF16,
-    and to ``A_log`` / ``dt_bias``, FP32) and :func:`chunk_kda_det_bwd` for the gradients.
+    and to ``A_log`` / ``dt_bias``, FP32), the in-kernel Q/K L2 norm (``use_qk_l2norm_in_kernel=True``: raw ``q`` /
+    ``k`` in, their gradients out) and :func:`chunk_kda_det_bwd` for the gradients.
     """
     from .experimental.cake_kda_det_train import cake_backend
 
@@ -279,6 +296,7 @@ def chunk_kda_det(
         A_log=A_log,
         dt_bias=dt_bias,
         lower_bound=lower_bound,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
     )
 
 
@@ -322,14 +340,15 @@ def kda_det_train_workspace(
     arena: Optional[Any] = None,
     doc_lengths: Optional[Sequence[int]] = None,
     use_gate_in_kernel: bool = False,
+    use_qk_l2norm_in_kernel: bool = False,
 ) -> Any:
     """A caller-owned ``KdaDetWorkspace`` (one arena of internal intermediates) for ``S`` tokens in ``num_docs``
     documents with ``H`` heads on ``device``, reused by every call that receives it: the forward layout only with
     ``backward=False``; ``save_mode`` is the default of the calls on it and sizes the arena for that mode;
     ``arena`` (:func:`kda_det_train_arena`) is the lower-memory arena option, off when ``None``; under a batched
     option ``doc_lengths`` (the documents' token counts) sizes the arena for the exact document groups instead of
-    the bound of every group; ``use_gate_in_kernel`` is the gate mode of the calls it serves (a call in the other
-    mode is refused)."""
+    the bound of every group; ``use_gate_in_kernel`` / ``use_qk_l2norm_in_kernel`` are the gate and Q/K L2 norm
+    modes of the calls it serves (a call in another mode is refused)."""
     from .experimental.cake_kda_det_train import cake_backend
 
     return cake_backend.KdaDetWorkspace.for_problem(
@@ -342,6 +361,7 @@ def kda_det_train_workspace(
         arena=arena,
         doc_lengths=doc_lengths,
         gate=_gate(use_gate_in_kernel),
+        l2n=_l2n(use_qk_l2norm_in_kernel),
     )
 
 
@@ -356,12 +376,13 @@ def kda_det_train_workspace_bytes(
     arena: Optional[Any] = None,
     doc_lengths: Optional[Sequence[int]] = None,
     use_gate_in_kernel: bool = False,
+    use_qk_l2norm_in_kernel: bool = False,
 ) -> int:
     """Bytes :func:`kda_det_train_workspace` allocates for the problem (``sm_count``: the device's SM count, the
     current CUDA device's when ``None``; it sets the segment count of the segmented recurrences; ``arena``: the
     lower-memory arena option, off when ``None``; ``doc_lengths``: the exact document groups of a batched option,
     else their bound; ``use_gate_in_kernel``: the gate mode, whose backward layouts carry no gate epilogue
-    buffers in raw mode)."""
+    buffers in raw mode; ``use_qk_l2norm_in_kernel``: the Q/K L2 norm mode, likewise without those buffers)."""
     from .experimental.cake_kda_det_train import cake_backend
 
     return cake_backend.workspace_bytes(
@@ -374,6 +395,7 @@ def kda_det_train_workspace_bytes(
         arena=arena,
         doc_lengths=doc_lengths,
         gate=_gate(use_gate_in_kernel),
+        l2n=_l2n(use_qk_l2norm_in_kernel),
     )
 
 
@@ -386,6 +408,15 @@ def _gate(use_gate_in_kernel: bool) -> str:
     return "raw" if use_gate_in_kernel else "g"
 
 
+def _l2n(use_qk_l2norm_in_kernel: bool) -> str:
+    """The backend's Q/K L2 norm mode of ``use_qk_l2norm_in_kernel`` (``ValueError`` for a non-bool)."""
+    if not isinstance(use_qk_l2norm_in_kernel, bool):
+        raise ValueError(
+            f"use_qk_l2norm_in_kernel must be a bool, got {use_qk_l2norm_in_kernel!r}"
+        )
+    return "fused" if use_qk_l2norm_in_kernel else "off"
+
+
 def kda_det_train_saved_bytes(
     S: int,
     H: int,
@@ -393,15 +424,22 @@ def kda_det_train_saved_bytes(
     *,
     save_mode: str = "light",
     sm_count: Optional[int] = None,
+    use_qk_l2norm_in_kernel: bool = False,
 ) -> int:
     """Bytes of the saved set: ``Aqk`` and ``Akk`` (``256 * S * H``), plus, when ``num_docs`` is given, the device
     tables and the version's per-call tensors: the forward's gated queries ``qg`` (and, on the rows whose backward
     reads it from the set, the WY representation ``w`` / ``u``) and the segment-boundary states under the size rule
-    with ``save_mode="light"``; the state tape, ``v_new`` and the segment transfers with ``save_mode="tape"``."""
+    with ``save_mode="light"``; the state tape, ``v_new`` and the segment transfers with ``save_mode="tape"``;
+    with ``use_qk_l2norm_in_kernel=True`` the FP32 reciprocal norms ``[2, S, H]`` (``8 * S * H``) in either."""
     from .experimental.cake_kda_det_train import cake_backend
 
     return cake_backend.saved_bytes(
-        S, H, num_docs, save_mode=save_mode, sm_count=sm_count
+        S,
+        H,
+        num_docs,
+        save_mode=save_mode,
+        sm_count=sm_count,
+        l2n=_l2n(use_qk_l2norm_in_kernel),
     )
 
 

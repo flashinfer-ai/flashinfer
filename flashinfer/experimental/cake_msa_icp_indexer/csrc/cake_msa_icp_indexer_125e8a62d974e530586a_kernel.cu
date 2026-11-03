@@ -40,23 +40,6 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
-#define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 512
-#define TMEM_ACC_OFFSET 0
-#define NUM_K_PIPE_STAGES 12
-#define NUM_ACC_PIPE_STAGES 4
-#define SMEM_SMEM_Q_OFF 1024
-#define SMEM_SMEM_Q_STAGE_BYTES 16384
-#define SMEM_SMEM_Q_STRIDE 16384
-#define SMEM_SMEM_K_OFF 17408
-#define SMEM_SMEM_K_STAGE_BYTES 16384
-#define SMEM_SMEM_K_STRIDE 16384
-#define SMEM_LISTS_OFF 1024
-#define SMEM_LISTS_STAGE_BYTES 16384
-#define SMEM_LISTS_STRIDE 16384
-#define SMEM_TOTAL 214016
-#define THREADS 192
-
 #include <math_constants.h>
 
 __device__ __forceinline__ uint32_t elect_sync() {
@@ -180,7 +163,7 @@ __device__ __forceinline__ void tma_2d_gmem2smem(
 
 __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
     uint32_t result;
-    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xffffffff;"
+    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xFFFFFFFF;"
         : "=r"(result) : "r"(val));
     return result;
 }
@@ -216,7 +199,7 @@ kernel_cake_msa_icp_indexer_125e8a62d974e530586a(const __grid_constant__ CUtenso
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     uint8_t* smem_q = reinterpret_cast<uint8_t*>(smem_raw + 1024);
     const int smem_q_addr = smem + 1024;
     uint8_t* smem_k = reinterpret_cast<uint8_t*>(smem_raw + 17408);
@@ -224,8 +207,7 @@ kernel_cake_msa_icp_indexer_125e8a62d974e530586a(const __grid_constant__ CUtenso
     unsigned long long* lists = reinterpret_cast<unsigned long long*>(smem_raw + 1024);
     const int lists_addr = smem + 1024;
 
-    // Mbarrier init (6 pipeline groups, 0 ordered-sequence groups, 34 barriers)
-    // Mbarriers at smem_raw[0..272)
+    // Mbarrier init (34 barriers at smem_raw[0..272))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -290,10 +272,8 @@ kernel_cake_msa_icp_indexer_125e8a62d974e530586a(const __grid_constant__ CUtenso
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
-
-    // Kernel post-init ops
-    const int tmem_acc = taddr;
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_acc = taddr;
 
     // ---- Role: epi ----
     if (warp <= 3) {
@@ -415,7 +395,7 @@ kernel_cake_msa_icp_indexer_125e8a62d974e530586a(const __grid_constant__ CUtenso
                             if (!(_thresh_mask_0 & (1u << 30))) acc[30] = -CUDART_INF_F;
                             if (!(_thresh_mask_0 & (1u << 31))) acc[31] = -CUDART_INF_F;
                         }
-                        float2 _reg_reduce_max2_3 = {-CAKE_INF, -CAKE_INF};
+                        float2 _reg_reduce_max2_3 = {-CUDART_INF_F, -CUDART_INF_F};
                         _reg_reduce_max2_3.x = max_noftz(_reg_reduce_max2_3.x, max_noftz(acc[0], acc[1]));
                         _reg_reduce_max2_3.y = max_noftz(_reg_reduce_max2_3.y, max_noftz(acc[2], acc[3]));
                         _reg_reduce_max2_3.x = max_noftz(_reg_reduce_max2_3.x, max_noftz(acc[4], acc[5]));
@@ -508,7 +488,7 @@ kernel_cake_msa_icp_indexer_125e8a62d974e530586a(const __grid_constant__ CUtenso
                             if (!(_thresh_mask_4 & (1u << 30))) acc[30] = -CUDART_INF_F;
                             if (!(_thresh_mask_4 & (1u << 31))) acc[31] = -CUDART_INF_F;
                         }
-                        float2 _reg_reduce_max2_7 = {-CAKE_INF, -CAKE_INF};
+                        float2 _reg_reduce_max2_7 = {-CUDART_INF_F, -CUDART_INF_F};
                         _reg_reduce_max2_7.x = max_noftz(_reg_reduce_max2_7.x, max_noftz(acc[0], acc[1]));
                         _reg_reduce_max2_7.y = max_noftz(_reg_reduce_max2_7.y, max_noftz(acc[2], acc[3]));
                         _reg_reduce_max2_7.x = max_noftz(_reg_reduce_max2_7.x, max_noftz(acc[4], acc[5]));
@@ -601,7 +581,7 @@ kernel_cake_msa_icp_indexer_125e8a62d974e530586a(const __grid_constant__ CUtenso
                             if (!(_thresh_mask_8 & (1u << 30))) acc[30] = -CUDART_INF_F;
                             if (!(_thresh_mask_8 & (1u << 31))) acc[31] = -CUDART_INF_F;
                         }
-                        float2 _reg_reduce_max2_11 = {-CAKE_INF, -CAKE_INF};
+                        float2 _reg_reduce_max2_11 = {-CUDART_INF_F, -CUDART_INF_F};
                         _reg_reduce_max2_11.x = max_noftz(_reg_reduce_max2_11.x, max_noftz(acc[0], acc[1]));
                         _reg_reduce_max2_11.y = max_noftz(_reg_reduce_max2_11.y, max_noftz(acc[2], acc[3]));
                         _reg_reduce_max2_11.x = max_noftz(_reg_reduce_max2_11.x, max_noftz(acc[4], acc[5]));
@@ -694,7 +674,7 @@ kernel_cake_msa_icp_indexer_125e8a62d974e530586a(const __grid_constant__ CUtenso
                             if (!(_thresh_mask_12 & (1u << 30))) acc[30] = -CUDART_INF_F;
                             if (!(_thresh_mask_12 & (1u << 31))) acc[31] = -CUDART_INF_F;
                         }
-                        float2 _reg_reduce_max2_15 = {-CAKE_INF, -CAKE_INF};
+                        float2 _reg_reduce_max2_15 = {-CUDART_INF_F, -CUDART_INF_F};
                         _reg_reduce_max2_15.x = max_noftz(_reg_reduce_max2_15.x, max_noftz(acc[0], acc[1]));
                         _reg_reduce_max2_15.y = max_noftz(_reg_reduce_max2_15.y, max_noftz(acc[2], acc[3]));
                         _reg_reduce_max2_15.x = max_noftz(_reg_reduce_max2_15.x, max_noftz(acc[4], acc[5]));

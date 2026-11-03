@@ -168,8 +168,9 @@ The packed GDN training routes come in four combinations:
   same results within the accuracy budgets.
 * When `q` / `k` / `v` are head views of one packed row, take them with
   `packed_qkv_views_kcp` for full backward speed: plain `split` views of the
-  row give the same gradients, but the backward is about 1.1-1.2 ms (33-37 %)
-  slower at `(16, 48)` and 32,768 tokens (**Packed Q/K/V** below).
+  row give the same gradients, but torch's split backward concatenates them:
+  about 0.2 ms (6-7 %) more backward on B200 and GB300 and 0.17 ms (7-8 %) on
+  R200 at `(16, 48)` and 32,768 tokens (**Packed Q/K/V** below).
 * `scale` defaults to `128 ** -0.5`.
 * The host reads no tensor contents (no `.item()`, `.tolist()`, no implicit
   synchronization): every table is built on the CPU from the partition
@@ -192,6 +193,20 @@ The packed GDN training routes come in four combinations:
   212-SM R200 the CP4 zigzag rows ran 1.2-2.5 % slower paired, and there is
   no 216-SM measurement.  The private lever `test_knobs={"walk_pair": 0}` (or
   `1`) forces one stream (or the pair on a zigzag partition).
+* A forward with `save_mode="light"` and `boundary_mode="saved"` that
+  launches the output program and hands no tapes to a backward runs the
+  output walk `kcp_fwdh_out` (#2+5 under "Kernel structure") at each of its
+  tape walks in place of the #2 tape walk and #5: each chunk's output comes
+  from the walk's own `h` snapshot and `v_new` operand, and the forward
+  allocates neither tape.  Its workspace peak is #1's, below the split
+  form's tape walk by the `h` / `v_new` tapes less #1's `akk` / `gcum`
+  (30,528 B per token at `HV = 48`; `gdn_workspace_layout_kcp(...)` reports
+  both as `forward` and `forward_split`).  The output and the saved set are
+  bitwise those of the split form.  `save_mode="full"`,
+  `boundary_mode="replay"`, a forward that hands its tapes to the kept-tape
+  backward, a re-run that leaves #5 out and the backward's replayed forward
+  keep the split form.  The private lever `test_knobs={"fused_o": 0}` forces
+  the split form.
 * Host launch path: the record, grid and merge columns of a launch are
   resolved once per launch key and kept with the context's tables; each
   forward or backward body, eager or captured, binds the caller's current
@@ -242,7 +257,7 @@ eager calls too.
 | `p_rule`, `walk_seg` | plan policy / explicit override | how many intra-rank segments a fragment is walked as (`P`); a function of metadata and the SM count only. The shipped policy `fill_small_guard` starts from the deterministic twin's `row_cost_lpt` plan, which costs the three per-rank programs over every rank's fragment table with a crossing-aware model and switches the whole row away from the per-rank default only when an alternative is cheaper by at least its margin (2 % for the `occ` program; 0 % for the `one` program, which has no segment composition and takes a model tie), then lowers `P` as described under "Numerical mode" (faster schedule); the same topology gives the same `P` on every rank |
 | `offset_class` | **`"fla"`**, `"fp32"` | the class of the forward offset `B_f`: the walk from zero with the reference rounding points, or an FP32 walk (`B_f` only) |
 | `use_qk_l2norm_in_kernel` | **`False`**, `True` | the per-token L2 norm of every 128-channel Q / K head inside the programs (FLA's `use_qk_l2norm_in_kernel`; see "In-kernel Q / K L2 norm" below); a literal keyword of the three entry points as well |
-| `test_knobs` | **`None`** | names the test-only values a test selects (`precision_mode` 1 or 2) and private levers such as `fwdh_vh` (forces the #2 value width); without it every test-only value is refused |
+| `test_knobs` | **`None`** | names the test-only values a test selects (`precision_mode` 1 or 2) and private levers such as `fwdh_vh` (forces the #2 value width) and `fused_o` (`0` forces the split tape walk and #5); without it every test-only value is refused |
 
 The validator refuses every test-only value not named in `test_knobs`,
 `exchange="ring"` without both of its conditions, `HV % H_qk != 0`, a
@@ -343,25 +358,33 @@ concatenates them).  Plain views of the same row
 (`qkv.split((H_qk * 128, H_qk * 128, HV * 128), -1)`, then
 `.view(T, heads, 128)`) run the same programs on the same operands and give
 the same results (within the accuracy budgets; bitwise in every run measured
-below), and the backward still writes one packed row, but torch's split
-backward then concatenates `dq` / `dk` / `dv` into a new row.  Measured cost
+below).  The backward writes one packed row only for the outputs of
+`packed_qkv_views_kcp` (or of the deterministic package's
+`packed_qkv_views_det_kcp`), as recorded by the forward.  For plain views,
+column slices and other views it writes three contiguous `dq` / `dk` / `dv`,
+and torch's split backward concatenates them into a new row.  Measured cost
 of the plain views (the #8367 repro with `deterministic=False`:
 `(H_qk, HV) = (16, 48)`, 32,768 tokens in five documents, one-rank context,
 forward and backward to the packed row, and the checkpointed step
 `torch.utils.checkpoint(views + chunk_gdn_kcp, use_reentrant=False)` =
 two forwards and one backward; CUDA-event ms, the median of 16 group
 medians (2 runs x 8 groups; a group = 2 blocks of 5 warm-up + 20 timed calls
-per view form, the forms interleaved in palindromic order; the B200 norm-off
-forward is from the one re-measure pair, after the first pair drifted by more
-than 2 %); one GPU per exclusive node; PyTorch 2.14.1+cu130, CUDA 13.0
-runtime):
+per view form, the forms interleaved in palindromic order).  The B200
+norm-off forward and backward reached the GPU's power cap: they are the
+median of the steady-block medians of 3 palindromic block pairs (a block =
+5 s idle, 20 warm-up calls, 300 timed calls), which still hit the cap in
+more than 5 % of the samples, so take them as approximate.  One GPU per
+exclusive node (R200: a 208-SM board); PyTorch 2.14.1+cu130, CUDA 13.0
+runtime:
 
 | GPU | in-kernel L2 norm | forward split / packed | backward split / packed | backward split - packed | checkpointed step split / packed |
 |---|---|---|---|---|---|
-| B200 (sm_100a, 148 SMs) | off | 1.568 / 1.575 | 4.386 / 3.195 | +1.191 (1.373x) | 6.039 / 4.839 (1.248x) |
-| B200 (sm_100a, 148 SMs) | on | 1.757 / 1.763 | 4.657 / 3.487 | +1.170 (1.336x) | 6.505 / 5.345 (1.217x) |
-| GB300 (sm_103a, 152 SMs) | off | 1.416 / 1.432 | 4.017 / 2.946 | +1.071 (1.364x) | 5.490 / 4.438 (1.237x) |
-| GB300 (sm_103a, 152 SMs) | on | 1.575 / 1.594 | 4.311 / 3.239 | +1.072 (1.331x) | 5.947 / 4.895 (1.215x) |
+| B200 (sm_100a, 148 SMs) | off | 1.436 / 1.432 | 3.389 / 3.187 | +0.202 (1.063x) | 4.992 / 4.795 (1.041x) |
+| B200 (sm_100a, 148 SMs) | on | 1.619 / 1.611 | 3.680 / 3.474 | +0.206 (1.059x) | 5.446 / 5.248 (1.038x) |
+| GB300 (sm_103a, 152 SMs) | off | 1.302 / 1.298 | 3.142 / 2.947 | +0.195 (1.066x) | 4.562 / 4.387 (1.040x) |
+| GB300 (sm_103a, 152 SMs) | on | 1.469 / 1.465 | 3.440 / 3.244 | +0.196 (1.060x) | 5.039 / 4.857 (1.037x) |
+| R200 (sm_107a, 208 SMs) | off | 0.945 / 0.944 | 2.264 / 2.090 | +0.174 (1.083x) | 3.309 / 3.144 (1.052x) |
+| R200 (sm_107a, 208 SMs) | on | 1.075 / 1.072 | 2.460 / 2.289 | +0.171 (1.075x) | 3.641 / 3.474 (1.048x) |
 
 The three views are the outputs of one custom autograd node.  Hooks and
 `retain_grad` on them fire as on any autograd output.  Its backward returns
@@ -379,7 +402,8 @@ gdn_comm_bytes_kcp(ctx, *, H_qk, HV, C) -> {rank: {c1_send, c1_recv, c2_recv, b1
     c1_recv / b1_recv on an owner = 2 * s_owner * (fragments it owns)      halo = rows(r) * C * 2
 gdn_saved_bytes_kcp(ctx, *, H_qk, HV, save_mode, save_transfer=True, P=None) -> per rank (the table above)
 gdn_workspace_bytes_kcp(ctx, *, H_qk, HV, P=None, reuse_recompute_tapes=None) -> per rank: the most the caller-held
-    workspace binds in the forward (the tape walk: pools + the eight live tapes) or the backward (its phases: the
+    workspace binds in the forward (the fused form: #1, the pools + the eight tapes #1 writes; the split form, also
+    `forward_split` of the layout: the tape walk, the pools + the eight live tapes) or the backward (its phases: the
     exchange, the adjoint tape walk, the end state); the default (`None`, i.e. `"auto"`) reports the replay form, the
     bound of both forms, in which the ten forward tapes are workspace; `reuse_recompute_tapes=True` gives the kept-tape
     figure, in which they are the recompute forward's hand-off tensors outside the workspace
@@ -410,11 +434,11 @@ exactly in FP64).  Programs: `fwd_prep_l2n` (#1 that first writes `qn` /
 `kn` with the pullback before the one BF16 rounding; `group_reduce="host"`
 runs the unchanged #8 and the reference pullback on the host, per block of
 2048 tokens) and `qk_apply` (`qn = bf16(q * r)` from the saved `r`).  Every
-other reader (#2, #3, #5, #7) is the unchanged program bound to `qn` / `kn`.
+other reader (#2, #3, #5, #2+5, #7) is the unchanged program bound to `qn` / `kn`.
 
 | path | `qn` / `kn` from | `r` the pullback reads | dropped |
 |---|---|---|---|
-| forward | `fwd_prep_l2n` | -- | `kn` before `out`, `qn` after #5 (a hand-off forward hands both over with its tapes); the arena `r` after #1 (the saved `r` is a fresh tensor) |
+| forward | `fwd_prep_l2n` | -- | `kn` before `out`, `qn` after #5 (a fused forward: both after its output walks; a hand-off forward hands both over with its tapes); the arena `r` after #1 (the saved `r` is a fresh tensor) |
 | light backward | the replay's `fwd_prep_l2n` | saved | after #8 |
 | kept recompute tapes | the recompute forward's `fwd_prep_l2n` (handed over with the tapes; no `qk_apply`) | saved | after #8 |
 | `save_mode="full"` | `qk_apply` after #6 | saved | after #8 |
@@ -473,26 +497,27 @@ and the reference's own error.
 
 ## Kernel structure of one training step
 
-Eight new programs and one reused program compose a step (the affine merge is
+Nine new programs and one reused program compose a step (the affine merge is
 the KDA KCP package's gate-free program, rendered under this package's prefix
 with the `_kcp` suffix; its 20-hex digests equal that package's):
 
 | # | program | role |
 |---|---|---|
 | 1 | `fwd_prep` | per chunk: cumulative gate, `gamma`, the WY representation (`w`, `u`), `Aqk`, `Akk` |
-| 2 | `kcp_fwdh` (`offset` / `tape` forms, each at value width `vh` 128 or 64) | the forward state walk over the rank's segments: from zero for the summary offset `B_f`, from `S_in` for the `h` / `v_new` tapes; the `vh` 64 form (two CTAs per segment and head, the `_vh64` records) runs when `n_walk × HV ≤ SM count` and writes bitwise-identical results |
+| 2 | `kcp_fwdh` (`offset` / `tape` forms, each at value width `vh` 128 or 64) | the forward state walk over the rank's segments: from zero for the summary offset `B_f`, from `S_in` for the `h` / `v_new` tapes; the `vh` 64 form (two CTAs per segment and head, the `_vh64` records) runs when `n_walk × HV ≤ SM count` or when its two-CTA grid finishes within the longest walked segment (LPT over two CTAs per SM) and writes bitwise-identical results |
 | 3 | `kcp_transfer_walk` | the transfer `M_f` of a segment, TF32 hi/lo on the tensor cores (`precision_mode` 0) on eight compute warps (a column half each); its `precision_mode` 1 / 2 forms are four-warp test-only programs of `build.test.json` with bitwise the same results |
 | 4 | `kcp_affine_merge` (`c8` / `c16`) | FP32 affine chains over state (`S = M S + B`) and map (compose) tiles; transposed for the adjoint |
 | 5 | `fwd_o` | the output from the `h` tape, `v_new` and `Aqk`; persistent, the tiles beyond the grid drawn in units from a ticket word |
+| 2+5 | `kcp_fwdh_out` (value width `vh` 128 or 64) | the output walk: #2's tape walk from `S_in` that writes each chunk's output from its `h` snapshot, its `v_new` operand, `q`, `Aqk` and `qscale` instead of the `h` / `v_new` tapes; the forward of a light, saved-boundary call that launches #5 runs it in place of the tape walk and #5 (see "Contract"); the `vh` 64 form (two CTAs per segment and head, the `_vh64` record) runs under the same rule as #2; bitwise the split form's output |
 | 6 | `bwd_prep` | `do_g`, `dv_intra`; persistent, the items beyond the grid drawn from a ticket word |
-| 7 | `kcp_dhu` (`offset` / `tape` forms, each at value width `vh` 128 or 64) | the adjoint state walk: the boundary adjoint from `dS_out`, the `dh` / `dv_new` tapes; the `vh` 64 form (two CTAs per segment and head, the `_vh64` records) writes bitwise-identical results |
+| 7 | `kcp_dhu` (`offset` / `tape` forms, each at value width `vh` 128 or 64) | the adjoint state walk: the boundary adjoint from `dS_out`, the `dh` / `dv_new` tapes; the `vh` 64 form (two CTAs per segment and head, the `_vh64` records) writes bitwise-identical results and runs for the offset walk always, for the tape walk on `sm_100a` / `sm_103a` always and on `sm_107a` when `2 × n_walk × HV ≤ 4 × SM count`; on `sm_100a`, a walk whose longest segment has at least 400 chunks and whose two-CTA grid ends later than the one-CTA grid (LPT over two CTAs per SM) takes the `sm_107a` rule for both forms |
 | 8 | `bwd_dqkg` | `dq`, `dk` (grouped FP32 reduction), `dv`, the `dg` / `dbeta` partials; persistent, the (chunk, Q/K head) groups drawn from a ticket word |
 | 9 | `gate_epilogue` | the reverse cumulative sum of the `dg` partials and the `dbeta` finalize, FP32 fixed order |
 
 Tensor cores are used through `tcgen05` only; the FP32 chains and the gate
-epilogue run on CUDA cores.  Sixteen shipped libraries result (the two walk
-forms of #2 and of #7, each at two value widths, the two merge widths), each
-for `sm_100a`, `sm_103a` and `sm_107a`.
+epilogue run on CUDA cores.  Eighteen shipped libraries result (the two walk
+forms of #2 and of #7 and the output walk, each at two value widths, the two
+merge widths), each for `sm_100a`, `sm_103a` and `sm_107a`.
 
 The persistent programs (#5, #6, #8) launch no cooperative grid: a CTA that
 finishes its static tile draws the remaining work through an `atom.inc` on a
@@ -528,7 +553,9 @@ resident on a side stream therefore delays one CTA, not the whole grid.
   chain under the per-rank programs (the shipped row policy may walk a whole
   fragment as one chain when its cost model prefers that); a partition beyond
   a cap is refused at context build.
-* The fused tape-walk-plus-output form is not part of this release: the
+* The output walk serves the light, saved-boundary forward only: under
+  `save_mode="full"` or `boundary_mode="replay"`, in a forward that hands its
+  tapes to the kept-tape backward and in the backward's replayed forward the
   output program runs after the tape walk.
 * The causal-convolution halo backward is the conv package's program; its
   launch form is that package's.
@@ -536,7 +563,8 @@ resident on a side stream therefore delays one CTA, not the whole grid.
 ## Status
 
 Experimental.  The kernels are the deterministic route's programs, rendered
-from the same Cake sources under this package's names; `build.json`'s
+from the same Cake sources under this package's names, and the output walk
+`kcp_fwdh_out`, which has no deterministic twin; `build.json`'s
 `generator` block names the producing revision.  This package differs from
 its deterministic twin in the default segment plan (`fill_small_guard`, see
 "Numerical mode").  The tests are `tests/experimental/test_cake_gdn_train_kcp*.py`

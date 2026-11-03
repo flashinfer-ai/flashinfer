@@ -233,7 +233,7 @@ cake_fp4_allreduce_tp4_twoshot_bf16_bv1_csp_fe_b1r(__nv_bfloat16* __restrict__ x
             long long g64 = (long long)gridDim.x;
             long long quads64 = (long long)(rows / 4);
             int r0 = (int)(4 * (bid64 * quads64 / g64));
-            int r1 = (int)(4 * ((bid64 + 1) * quads64 / g64));
+            int r1 = (int)(4 * ((bid64 + 1) * quads64 / g64) + (bid64 + 1) / g64 * (long long)(rows % 4));
             int nrows = r1 - r0;
             int warp_0 = (int)warp;
             int lane_1 = (int)lane;
