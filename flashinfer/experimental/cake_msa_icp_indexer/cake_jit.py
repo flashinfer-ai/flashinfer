@@ -15,8 +15,9 @@ limitations under the License.
 
 Registry and loader glue of the Cake MiniMax-M3 index-context-parallel (ICP)
 indexer kernels: the prefill device plan and chunk scorer, the decode scorer,
-the prefill Top16 selector (carrier rows), the decode Top16 selector and
-publisher (peer receive rows) and the owner-side candidate merge.
+the prefill Top16 selector (carrier rows), the fused prefill path's list
+scorer and list-to-carrier merge (the same carrier rows), the decode Top16
+selector and publisher (peer receive rows) and the owner-side candidate merge.
 
 Every record of ``MODULES`` is one mechanically exported program: a CUDA
 device translation unit plus a tvm-ffi binding, compiled for each exact
@@ -26,8 +27,9 @@ stem (its ``build.json`` entry is ``<library>_<arch>``), its ``role`` among
 :data:`ROLES`, the local K rows per page ``rows`` it is built for (``None``
 when the program serves every page layout), the ``page`` size it is built for
 (``None`` when its rows serve every page size) and the ``grid_rule`` that
-shapes its launch.  The tensor-core roles (``score``, ``decode_plane``) have one
-program per ``rows`` value and architecture group: ``sm_107a`` runs its own
+shapes its launch.  The tensor-core roles (``score``, ``score_topk16``,
+``decode_plane``, ``decode_topk``) have one program per ``rows`` value and
+architecture group: ``sm_107a`` runs its own
 schedule, never the ``sm_100a`` / ``sm_103a`` one.
 
 The derived leaves of a record (``kernel_symbol``, ``launch``, ``arg_plan``,
@@ -61,10 +63,14 @@ PREFIX = "cake_msa_icp_indexer"
 # ``decode_topk`` -> ``topk16_publish`` -> merge (the fused chain).  A prefill
 # merge is ``merge_prefill``; a decode merge is ``merge_legacy`` (one token per
 # CTA) for legacy rows of at least 8 tokens, else ``merge`` (4 tokens per CTA),
-# from launch metadata only.
+# from launch metadata only.  The fused prefill path replaces ``score`` and
+# ``select_prefill`` with ``score_topk16`` (each (CTA, item) cell's sorted
+# Top16 lists in a caller pool) and ``prefill_list_carrier`` (the lists of a
+# row merged into the same carrier rows).
 ROLES = (
     "plan",
     "score",
+    "score_topk16",
     "decode_plane",
     "decode_topk",
     "select_prefill",
@@ -73,6 +79,7 @@ ROLES = (
     "merge",
     "merge_legacy",
     "merge_prefill",
+    "prefill_list_carrier",
 )
 # Grid rules of the records (evaluated by :func:`launch_grid`): one CTA, one
 # CTA per streaming multiprocessor (the persistent prefill scorer, whose plan
@@ -100,7 +107,7 @@ LAUNCH_ARGUMENT = "enable_pdl"
 # segment metadata ``qo_lens`` / ``kv_lens`` / ``qo_offset`` int32 ``[B]`` and
 # ``qo_indptr`` / ``kv_indptr`` int32 ``[B + 1]``, ``work_range`` /
 # ``work_info`` int64 plan storage, ``max_score`` / ``scores`` FP32
-# ``[T, H, K]`` score rows, ``pool`` the fused path's sorted candidate lists,
+# ``[T, H, K]`` score rows, ``pool`` the fused paths' sorted candidate lists,
 # ``carrier`` int32 ``[H, T, 33]`` prefill rows, ``recv_bases`` int64
 # ``[world]`` peer receive-slot addresses, ``errors`` int32 ``[1]`` timeout
 # counter, ``generations`` int32 ``[3, H, capacity]`` publish counters,
@@ -137,7 +144,8 @@ LOGICAL_TENSORS = (
 # ``index_scale``, ``index_offset``, ``query_len``), element strides
 # (``bt_stride``, ``score_stride_t``, ``score_stride_h``,
 # ``carrier_stride_h``, ``carrier_stride_t``, ``pool_row_stride`` (uint64
-# words between the (token, head) rows of the decode pool), ``recv_stride_src``,
+# words between the (token, head) rows of the decode pool), ``pool_piece_stride``
+# (uint64 words between the pieces of the prefill pool), ``recv_stride_src``,
 # ``recv_stride_h``, ``recv_stride_t``, ``out_stride_t``, ``out_stride_h``)
 # and the selection / protocol scalars (``force_begin``, ``force_end``,
 # ``init_blocks``, ``local_blocks``, ``slot``, ``spin_limit``, ``tagged``,
@@ -166,6 +174,7 @@ LOGICAL_SCALARS = (
     "carrier_stride_h",
     "carrier_stride_t",
     "pool_row_stride",
+    "pool_piece_stride",
     "recv_stride_src",
     "recv_stride_h",
     "recv_stride_t",
