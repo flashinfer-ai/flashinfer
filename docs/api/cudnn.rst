@@ -34,7 +34,8 @@ on the install: its own CuTe-DSL check (``nvidia-cutlass-dsl`` 4.7.0 or newer,
 satisfied by FlashInfer's package minimum of 4.8.0) must pass, otherwise the
 backend engine would serve the graph and fa2 is kept. Callers passing
 ``fixed_split_size`` or ``disable_split_kv`` (fa2's batch-invariance controls)
-keep fa2 wherever fa2 can serve the rows. A CUDA-graph wrapper also tells
+keep fa2 wherever fa2 can serve the rows; ``fixed_cta_tile_q``, an fa2 planner
+option, always keeps fa2. A CUDA-graph wrapper also tells
 cudnn-frontend 1.31+ that the graph is replayed
 (``pygraph(is_cuda_graph_replay_expected=True)``), so the d256 decode tile leads
 with its split-KV plan, and the single-token d256 band then starts at 64 CTAs.

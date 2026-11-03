@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+from typing import Optional
+
 import pytest
 import torch
 from tests.test_helpers.jit_utils import (
@@ -58,7 +60,7 @@ def warmup_jit():
 @pytest.mark.parametrize("kv_len", [4096, 8192, 5000])
 @pytest.mark.parametrize("fixed_split_size", [2048])
 @pytest.mark.parametrize("disable_split_kv", [True, False])
-@pytest.mark.parametrize("fixed_cta_tile_q", [16, 64, 128])
+@pytest.mark.parametrize("fixed_cta_tile_q", [None, 16, 64, 128])
 @pytest.mark.parametrize("page_size", [1, 8, 16])
 @pytest.mark.parametrize("num_kv_heads", [4])
 @pytest.mark.parametrize("group_size", [1, 4, 8])
@@ -71,7 +73,7 @@ def test_batch_decode_tensor_cores(
     kv_len: int,
     fixed_split_size: int,
     disable_split_kv: bool,
-    fixed_cta_tile_q: int,
+    fixed_cta_tile_q: Optional[int],
     page_size: int,
     num_kv_heads: int,
     group_size: int,
@@ -201,7 +203,7 @@ def test_batch_decode_tensor_cores(
 @pytest.mark.parametrize("qo_len", [128, 256])
 @pytest.mark.parametrize("fixed_split_size", [2048])
 @pytest.mark.parametrize("disable_split_kv", [True, False])
-@pytest.mark.parametrize("fixed_cta_tile_q", [16, 64, 128])
+@pytest.mark.parametrize("fixed_cta_tile_q", [None, 16, 64, 128])
 @pytest.mark.parametrize("page_size", [1, 8, 16])
 @pytest.mark.parametrize("num_kv_heads", [4])
 @pytest.mark.parametrize("group_size", [1, 4, 8])
@@ -215,7 +217,7 @@ def test_batch_prefill_tensor_cores(
     qo_len: int,
     fixed_split_size: int,
     disable_split_kv: bool,
-    fixed_cta_tile_q: int,
+    fixed_cta_tile_q: Optional[int],
     page_size: int,
     num_kv_heads: int,
     group_size: int,
