@@ -852,9 +852,7 @@ class MoERunner(TunableRunner):
             resolve_nvfp4_4over6(self.config.quant.nvfp4_4over6)
         )
 
-    # Anything the profiled tensor shapes cannot reveal has to be listed here.
-    # The tuple is the persisted key (no runner_hash); __hash__ adds the EP rank offset.
-
+    # Persisted key (no runner_hash), so rank-invariant; __hash__ adds the EP offset.
     def _cache_key_extras(self) -> tuple:
         """Return stable tactic inputs absent from profiled tensor shapes."""
         routing = self.config.routing
