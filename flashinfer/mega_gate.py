@@ -29,6 +29,7 @@ def prepare_mega_gate(
     score_barriers=None,
     descriptor_workspace=None,
     enable_pdl=None,
+    num_sms=None,
 ):
     """Prepare a reusable routing plan; plan.run() returns indices and weights.
 
@@ -40,7 +41,8 @@ def prepare_mega_gate(
     exported DeepGEMM programs and accepts only their configurations (see
     MegaGatePlan); SM120 runs a CuTe DSL backend that also takes other K/E/top-k
     and no bias (see MegaGateSm12xPlan). Both document their optional metadata
-    and reusable workspace layouts.
+    and reusable workspace layouts. ``num_sms`` (SM12x only) caps the SMs the
+    kernel uses, for kernels that run at the same time.
     """
     import torch
 
@@ -71,8 +73,11 @@ def prepare_mega_gate(
             score_barriers=score_barriers,
             descriptor_workspace=descriptor_workspace,
             enable_pdl=enable_pdl,
+            num_sms=num_sms,
         )
 
+    if num_sms is not None:
+        raise ValueError("num_sms is only configurable on the SM12x backend")
     from .experimental.deepgemm_mega_gate.mega_gate import MegaGatePlan
 
     return MegaGatePlan(

@@ -75,6 +75,7 @@ class KernelSpec:
     has_physical_map: bool
     has_unmapped: bool
     enable_pdl: bool = False
+    has_fixed_routing: bool = False
 
     @property
     def name(self) -> str:
@@ -93,7 +94,8 @@ class KernelSpec:
             f"bt{c.block_tokens}_s{c.num_split_k}_st{c.num_stages}_g{c.num_gate_warps}"
             f"{'c' if c.cooperative_gate else ''}"
             f"{f'_n{c.mma_warps_n}' if c.mma_warps_n != 1 else ''}"
-            f"{'_pdl' if self.enable_pdl else ''}_k{self.hidden}"
+            f"{'_pdl' if self.enable_pdl else ''}{'_fixed' if self.has_fixed_routing else ''}"
+            f"_k{self.hidden}"
             f"_e{self.num_experts}_top{self.num_topk}_sh{self.num_shared}_f{flags}"
         )
 
@@ -128,6 +130,7 @@ def _fake_operands(spec: KernelSpec):
         fake(Float32, (sym(),), assumed_align=16),  # image_bias
         fake(Uint8, (sym(),), assumed_align=1),  # image_token_mask
         fake(Uint8, (sym(),), assumed_align=1),  # mask
+        fake(Uint8, (sym(),), assumed_align=1),  # fix_routing_mask
         fake(Int32, (sym(),), assumed_align=4),  # to_physical_map, flattened
         fake(Int32, (sym(),), assumed_align=16),  # logical_count, read as int4
         fake(Int64, (sym(), slots), stride_order=(1, 0), assumed_align=8),
@@ -171,6 +174,7 @@ def load_kernel(arch: str, device_index: int, spec: KernelSpec):
             has_physical_map=spec.has_physical_map,
             has_unmapped=spec.has_unmapped,
             enable_pdl=spec.enable_pdl,
+            has_fixed_routing=spec.has_fixed_routing,
         )
         # The subscript form: ``options=`` with a tuple silently drops TVM-FFI and
         # falls back to the several-times slower ctypes argument path.
@@ -198,6 +202,10 @@ class MegaGateSm12xPlan:
     int64[M,topk+shared] indices and FP32 weights: the unbiased scores normalized
     over the top-k and scaled by routed_scaling_factor, weight 1 on shared slots,
     index -1 and weight 0 for masked tokens. Deterministic mode never splits K.
+    Tokens flagged in fix_routing_mask (bool[M]) skip the top-k and take the logical
+    experts already in their unmapped_topk_idx row (required, read then written
+    back unchanged), weighted from their unbiased scores; force_random is not
+    supported.
 
     Optional scratch (FP32 split-K partial logits) and score_barriers
     (uint64[token blocks,16] arrival counters, zeroed once before first use; the
@@ -231,12 +239,16 @@ class MegaGateSm12xPlan:
         score_barriers=None,
         descriptor_workspace=None,
         enable_pdl=None,
+        num_sms=None,
         _config=None,
     ):
         """``enable_pdl`` launches with programmatic dependent launch (default: when the
         device supports it): the weight starts streaming while the previous kernel
-        finishes. ``_config`` (a ``MegaGateConfig``) overrides the heuristic; for tuning
-        and tests."""
+        finishes. ``num_sms`` caps the SMs the kernel uses (default: all), leaving the
+        rest to kernels that run at the same time, such as communication overlapped with
+        the gate: a worker group spins until all of its CTAs have arrived, so every CTA
+        of the grid must find a free SM. ``_config`` (a ``MegaGateConfig``) overrides the
+        heuristic; for tuning and tests."""
         import torch
 
         from flashinfer.utils import device_support_pdl
@@ -249,6 +261,10 @@ class MegaGateSm12xPlan:
             else torch.cuda.current_device()
         )
         arch, sms = device_facts(device_index)
+        if num_sms is not None:
+            if not 0 < int(num_sms) <= sms:
+                raise ValueError(f"num_sms must be in [1, {sms}]")
+            sms = int(num_sms)
         if (
             x.ndim != 2
             or weight.ndim != 2
@@ -274,9 +290,14 @@ class MegaGateSm12xPlan:
             raise NotImplementedError(
                 f"the SM12x Mega Gate supports {SCORING_FUNCS} scoring, got {scoring_func!r}"
             )
-        if fix_routing_mask is not None or force_random is not None:
+        if force_random is not None:
             raise NotImplementedError(
-                "fixed and random routing are not supported by the SM12x Mega Gate yet"
+                "random routing is not supported by the SM12x Mega Gate yet"
+            )
+        if fix_routing_mask is not None and unmapped_topk_idx is None:
+            raise ValueError(
+                "fix_routing_mask needs unmapped_topk_idx: its rows hold the fixed "
+                "tokens' logical experts"
             )
         if descriptor_workspace is not None:
             raise ValueError(
@@ -334,6 +355,8 @@ class MegaGateSm12xPlan:
             check(image_token_mask, "image_token_mask", torch.bool, (M,))
         if mask is not None:
             check(mask, "mask", torch.bool, (M,))
+        if fix_routing_mask is not None:
+            check(fix_routing_mask, "fix_routing_mask", torch.bool, (M,))
         if logical_count is not None:
             check(logical_count, "logical_count", torch.int32, (E + shared,))
             check_vector_aligned(logical_count, "logical_count")
@@ -363,6 +386,11 @@ class MegaGateSm12xPlan:
             if _config is not None
             else select_config(M, K, E, sms, bool(deterministic))
         )
+        if config.num_logical_ctas > sms:
+            raise ValueError(
+                f"the schedule's {config.num_logical_ctas} CTAs per token block "
+                f"exceed num_sms={sms}"
+            )
         # Persistent groups of num_logical_ctas CTAs; at most one CTA per SM keeps them co-resident.
         num_worker_groups = config.num_worker_groups(M, sms)
         if out is None:
@@ -396,6 +424,7 @@ class MegaGateSm12xPlan:
             has_mask=mask is not None,
             has_physical_map=to_physical_map is not None,
             has_unmapped=unmapped_topk_idx is not None,
+            has_fixed_routing=fix_routing_mask is not None,
             enable_pdl=device_support_pdl(x.device)
             if enable_pdl is None
             else bool(enable_pdl),
@@ -413,6 +442,9 @@ class MegaGateSm12xPlan:
             image_bias if image_bias is not None else dummy_f32,
             image_token_mask.view(torch.uint8) if image_bias is not None else dummy_u8,
             mask.view(torch.uint8) if mask is not None else dummy_u8,
+            fix_routing_mask.view(torch.uint8)
+            if fix_routing_mask is not None
+            else dummy_u8,
             to_physical_map.view(-1) if to_physical_map is not None else dummy_i32,
             logical_count if logical_count is not None else dummy_i32,
             out[0],

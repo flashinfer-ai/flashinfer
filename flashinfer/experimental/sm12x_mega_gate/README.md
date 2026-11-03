@@ -80,8 +80,13 @@ producer warp through a multi-stage mbarrier pipeline and `ldmatrix`
 
 Compared to the SM100 programs this backend also accepts other hidden sizes
 (multiples of 64), 1..1024 experts, top-k up to 32 slots, no bias, token masks
-and image bias. Fixed routing (`fix_routing_mask`) and random routing
-(`force_random`) are not implemented yet and raise `NotImplementedError`.
+and image bias. Fixed routing (`fix_routing_mask`, e.g. hash-routed layers) takes
+the flagged tokens' logical experts from `unmapped_topk_idx` instead of the top-k
+and weights them from their unbiased scores, as DeepGEMM does. Random routing
+(`force_random`) is not implemented yet and raises `NotImplementedError`.
+`num_sms` caps the SMs the kernel uses, leaving the rest to kernels that run at
+the same time (communication overlapped with the gate): decode-size calls use
+16-90 CTAs and barely notice a cap down to 64 SMs.
 
 Plans launch with programmatic dependent launch by default (`enable_pdl`): the
 tokens, maps and workspace are read only after `griddepcontrol.wait`, so the

@@ -146,6 +146,13 @@ def test_measured_splits_take_the_smallest_one_wave_block():
             bound = max_tokens
 
 
+def test_num_sms_is_sm12x_only():
+    x = torch.zeros((1, 64), dtype=torch.bfloat16)
+    weight = torch.zeros((8, 64), dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="SM12x"):
+        prepare_mega_gate(x, weight, 2, num_sms=16)
+
+
 # --------------------------------------------------------------- reference
 
 
@@ -224,6 +231,8 @@ def _check_routing(
     to_physical_map=None,
     logical_count=None,
     ep_rank=0,
+    fixed=None,
+    given=None,
 ):
     num_tokens = indices.shape[0]
     active = (
@@ -239,13 +248,17 @@ def _check_routing(
         return
     selected = logical[active]
     assert torch.all((selected >= 0) & (selected < num_experts))
-    ordered = selected.sort(dim=1).values
+    # Fixed-routing rows keep their given experts (duplicates allowed); the rest are ranked.
+    ranked = active if fixed is None else active & ~fixed
+    if fixed is not None:
+        assert torch.equal(logical[active & fixed], given[active & fixed])
+    ordered = logical[ranked].sort(dim=1).values
     assert torch.all(ordered[:, 1:] != ordered[:, :-1]), "duplicate experts in a row"
 
     # Top-k up to numerical ties of the FP32 kernel against the FP64 reference.
-    rows = ranking[active]
-    chosen = rows.gather(1, selected)
-    rest = rows.scatter(1, selected, float("-inf")).max(dim=1).values
+    rows = ranking[ranked]
+    chosen = rows.gather(1, logical[ranked])
+    rest = rows.scatter(1, logical[ranked], float("-inf")).max(dim=1).values
     tolerance = 1e-5 + 1e-5 * rows.abs().amax(dim=1)
     crossing = rest - chosen.min(dim=1).values
     assert torch.all(crossing <= tolerance), (
@@ -293,6 +306,8 @@ def _run_case(
     replicas=2,
     seed=0,
     config=None,
+    num_sms=None,
+    fixed_routing=None,
 ):
     x, weight, bias = _make_inputs(num_tokens, hidden, num_experts, seed=seed)
     if not with_bias:
@@ -310,6 +325,18 @@ def _run_case(
         image_bias = torch.randn(num_experts, dtype=torch.float32, device="cuda")
         image_token_mask = torch.rand(num_tokens, device="cuda") < 0.5
     logical = torch.empty((num_tokens, num_topk), dtype=torch.int64, device="cuda")
+    fixed = given = None
+    if fixed_routing is not None:  # "some" (every third token) or "all"
+        token_idx = torch.arange(num_tokens, device="cuda")
+        fixed = token_idx % 3 == 0 if fixed_routing == "some" else token_idx >= 0
+        given = torch.randint(
+            0,
+            num_experts,
+            (num_tokens, num_topk),
+            device="cuda",
+            generator=torch.Generator(device="cuda").manual_seed(seed + 1),
+        )
+        logical.copy_(given)
     prepare = prepare_mega_gate
     if config is not None:  # a forced schedule, for paths the heuristic picks elsewhere
         from flashinfer.experimental.sm12x_mega_gate.mega_gate import MegaGateSm12xPlan
@@ -330,6 +357,8 @@ def _run_case(
         num_shared_experts=max(num_shared, 1),
         routed_scaling_factor=SCALE,
         ep_rank=ep_rank,
+        **({} if num_sms is None else {"num_sms": num_sms}),
+        **({} if fixed is None else {"fix_routing_mask": fixed}),
     )
     indices, weights = plan.run()
     torch.cuda.synchronize()
@@ -347,6 +376,8 @@ def _run_case(
         to_physical_map=mapping,
         logical_count=counts,
         ep_rank=ep_rank,
+        fixed=fixed,
+        given=given,
     )
     return plan
 
@@ -423,6 +454,52 @@ def test_v4_flash_shape(num_tokens, physical, with_mask):
 def test_other_shapes(hidden, num_experts, num_topk, num_shared, num_tokens):
     _skip_unless_sm120()
     _run_case(num_tokens, hidden, num_experts, num_topk, num_shared=num_shared)
+
+
+@pytest.mark.parametrize("num_tokens", [1, 128, 1000])
+@pytest.mark.parametrize("num_sms", [12, 64])
+@pytest.mark.parametrize("shape", [PRODUCTION, V4_FLASH], ids=["E384", "E256"])
+def test_num_sms_caps_the_grid(num_tokens, num_sms, shape):
+    """A capped grid (SMs left to concurrent kernels) stays correct and within the cap."""
+    _skip_unless_sm120()
+    plan = _run_case(num_tokens, **shape, num_sms=num_sms)
+    assert plan.route["num_sms"] == num_sms
+    assert plan.route["launch_ctas"] <= num_sms
+
+
+@pytest.mark.parametrize("num_tokens", [1, 7, 129, 1000])
+@pytest.mark.parametrize("fixed_routing", ["some", "all"])
+@pytest.mark.parametrize(
+    "shape,num_shared", [(PRODUCTION, 1), (V4_FLASH, 0)], ids=["E384", "E256"]
+)
+def test_fixed_routing(num_tokens, fixed_routing, shape, num_shared):
+    """Hash-routed tokens (fix_routing_mask) keep the logical experts given in
+    unmapped_topk_idx, duplicates included, mapped and weighted from their unbiased
+    scores; unflagged tokens are ranked; masked tokens route nowhere."""
+    _skip_unless_sm120()
+    _run_case(
+        num_tokens,
+        **shape,
+        num_shared=num_shared,
+        with_mask=True,
+        fixed_routing=fixed_routing,
+    )
+
+
+def test_fixed_routing_needs_given_experts():
+    _skip_unless_sm120()
+    x, weight, bias = _make_inputs(4, 5120, 384)
+    fixed = torch.ones(4, dtype=torch.bool, device="cuda")
+    with pytest.raises(ValueError, match="unmapped_topk_idx"):
+        prepare_mega_gate(x, weight, 6, bias=bias, fix_routing_mask=fixed)
+
+
+def test_num_sms_out_of_range():
+    _skip_unless_sm120()
+    x, weight, bias = _make_inputs(4, 5120, 384)
+    for num_sms in (0, 1 << 10):
+        with pytest.raises(ValueError, match="num_sms"):
+            prepare_mega_gate(x, weight, 6, bias=bias, num_sms=num_sms)
 
 
 @pytest.mark.parametrize("num_tokens", [1, 33, 1000])

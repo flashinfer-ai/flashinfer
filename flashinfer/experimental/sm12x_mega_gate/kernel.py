@@ -293,6 +293,7 @@ class Sm12xMegaGateKernel:
         has_physical_map: bool,
         has_unmapped: bool,
         enable_pdl: bool = False,
+        has_fixed_routing: bool = False,
     ):
         self.enable_pdl = enable_pdl
         self.block_tokens = config.block_tokens
@@ -352,6 +353,7 @@ class Sm12xMegaGateKernel:
         self.has_mask = has_mask
         self.has_physical_map = has_physical_map
         self.has_unmapped = has_unmapped
+        self.has_fixed_routing = has_fixed_routing
         # The smallest butterfly covering the routed lanes; the other lanes add zero.
         self.sum_width = 8 if num_topk <= 8 else (16 if num_topk <= 16 else 32)
 
@@ -421,6 +423,7 @@ class Sm12xMegaGateKernel:
         image_bias: cute.Tensor,
         image_mask: cute.Tensor,
         mask: cute.Tensor,
+        fix_mask: cute.Tensor,
         physical_map: cute.Tensor,
         logical_count: cute.Tensor,
         topk_idx: cute.Tensor,
@@ -463,6 +466,7 @@ class Sm12xMegaGateKernel:
             image_bias,
             image_mask,
             mask,
+            fix_mask,
             physical_map,
             logical_count,
             topk_idx,
@@ -500,6 +504,7 @@ class Sm12xMegaGateKernel:
         image_bias: cute.Tensor,
         image_mask: cute.Tensor,
         mask: cute.Tensor,
+        fix_mask: cute.Tensor,
         physical_map: cute.Tensor,
         logical_count: cute.Tensor,
         topk_idx: cute.Tensor,
@@ -732,6 +737,7 @@ class Sm12xMegaGateKernel:
                             shared_magic,
                             image_mask,
                             mask,
+                            fix_mask,
                             physical_map,
                             topk_idx,
                             topk_weights,
@@ -799,6 +805,7 @@ class Sm12xMegaGateKernel:
                 image_bias,
                 image_mask,
                 mask,
+                fix_mask,
                 physical_map,
                 logical_count,
                 topk_idx,
@@ -831,6 +838,7 @@ class Sm12xMegaGateKernel:
         image_bias: cute.Tensor,
         image_mask: cute.Tensor,
         mask: cute.Tensor,
+        fix_mask: cute.Tensor,
         physical_map: cute.Tensor,
         logical_count: cute.Tensor,
         topk_idx: cute.Tensor,
@@ -944,6 +952,7 @@ class Sm12xMegaGateKernel:
                         lane_image_bias,
                         image_mask,
                         mask,
+                        fix_mask,
                         physical_map,
                         topk_idx,
                         topk_weights,
@@ -988,6 +997,7 @@ class Sm12xMegaGateKernel:
                         shared_magic,
                         image_mask,
                         mask,
+                        fix_mask,
                         physical_map,
                         topk_idx,
                         topk_weights,
@@ -1063,6 +1073,7 @@ class Sm12xMegaGateKernel:
         shared_magic: Uint32,
         image_mask: cute.Tensor,
         mask: cute.Tensor,
+        fix_mask: cute.Tensor,
         physical_map: cute.Tensor,
         topk_idx: cute.Tensor,
         topk_weights: cute.Tensor,
@@ -1095,6 +1106,7 @@ class Sm12xMegaGateKernel:
                         shared_count,
                         shared_magic,
                         image_mask,
+                        fix_mask,
                         physical_map,
                         topk_idx,
                         topk_weights,
@@ -1121,6 +1133,7 @@ class Sm12xMegaGateKernel:
                     shared_count,
                     shared_magic,
                     image_mask,
+                    fix_mask,
                     physical_map,
                     topk_idx,
                     topk_weights,
@@ -1404,6 +1417,7 @@ class Sm12xMegaGateKernel:
         shared_count: Int32,
         shared_magic: Uint32,
         image_mask: cute.Tensor,
+        fix_mask: cute.Tensor,
         physical_map: cute.Tensor,
         topk_idx: cute.Tensor,
         topk_weights: cute.Tensor,
@@ -1473,8 +1487,12 @@ class Sm12xMegaGateKernel:
                 wave * EXPERTS_PER_LANE,
             )
 
-        # 3. Warp top-k.
+        # 3. Warp top-k (a fixed-routing token keeps its given experts instead).
         selected_expert = self.topk_rounds(lane, keys, experts)
+        if const_expr(self.has_fixed_routing):
+            selected_expert = self.fixed_experts(
+                token, lane, fix_mask, unmapped_idx, selected_expert
+            )
 
         # 4. The selected expert's unbiased value and physical expert, fetched from the
         #    lane that holds them.
@@ -1593,6 +1611,7 @@ class Sm12xMegaGateKernel:
         lane_image_bias: cute.Tensor,
         image_mask: cute.Tensor,
         mask: cute.Tensor,
+        fix_mask: cute.Tensor,
         physical_map: cute.Tensor,
         topk_idx: cute.Tensor,
         topk_weights: cute.Tensor,
@@ -1689,6 +1708,7 @@ class Sm12xMegaGateKernel:
                                 exchange_experts,
                                 exchange_values,
                                 exchange_physical,
+                                fix_mask,
                             )
                         else:
                             self.store_masked_token(
@@ -1710,6 +1730,7 @@ class Sm12xMegaGateKernel:
                             exchange_experts,
                             exchange_values,
                             exchange_physical,
+                            fix_mask,
                         )
 
     @cute.jit
@@ -1780,6 +1801,7 @@ class Sm12xMegaGateKernel:
         exchange_experts: cute.Tensor,
         exchange_values: cute.Tensor,
         exchange_physical: cute.Tensor,
+        fix_mask: cute.Tensor,
     ):
         """Top-k rounds over a cooperative token slot's posted waves, then its slots."""
         base = Int32(slot * self.num_aligned_experts)
@@ -1795,6 +1817,10 @@ class Sm12xMegaGateKernel:
                 keys[wave * EXPERTS_PER_LANE + position] = wave_keys[position]
                 experts[wave * EXPERTS_PER_LANE + position] = wave_experts[position]
         selected_expert = self.topk_rounds(lane, keys, experts)
+        if const_expr(self.has_fixed_routing):
+            selected_expert = self.fixed_experts(
+                token, lane, fix_mask, unmapped_idx, selected_expert
+            )
         # Values and physical experts are posted by expert: one read each.
         expert = cutlass.min(
             cutlass.max(selected_expert, Int32(0)), Int32(self.num_experts - 1)
@@ -1821,6 +1847,29 @@ class Sm12xMegaGateKernel:
             routed_scale,
             map_width,
         )
+
+    @cute.jit
+    def fixed_experts(
+        self,
+        token: Int32,
+        lane: Int32,
+        fix_mask: cute.Tensor,
+        unmapped_idx: cute.Tensor,
+        selected_expert: Int32,
+    ) -> Int32:
+        """Fixed routing (DeepGEMM's ``fix_routing_mask``): a flagged token takes the
+        logical experts of its ``unmapped_idx`` row, in their order and duplicates
+        included, instead of the top-k; their weights come from its unbiased scores as
+        for a ranked token. An id out of [0, E) is clamped into it, so no lookup leaves
+        the tables."""
+        expert = selected_expert
+        if fix_mask[token] != Uint8(0):
+            if lane < Int32(self.num_topk):
+                given = Int32(unmapped_idx[Int64(token), Int64(lane)])
+                expert = cutlass.min(
+                    cutlass.max(given, Int32(0)), Int32(self.num_experts - 1)
+                )
+        return expert
 
     @cute.jit
     def finish_token(

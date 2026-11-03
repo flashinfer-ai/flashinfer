@@ -103,6 +103,12 @@ def main():
         "previous kernel)",
     )
     parser.add_argument("--no-baseline", action="store_true")
+    parser.add_argument(
+        "--num-sms",
+        type=int,
+        default=None,
+        help="cap the SMs the fused kernel uses (as when it shares the GPU)",
+    )
     args = parser.parse_args()
 
     props = torch.cuda.get_device_properties(0)
@@ -135,6 +141,7 @@ def main():
             routed_scaling_factor=args.scale,
             deterministic=args.deterministic,
             enable_pdl=args.pdl,
+            **({} if args.num_sms is None else {"num_sms": args.num_sms}),
         )
         fused = median_us(plan.run, args.cupti)
         moved = (x.numel() + weight.numel()) * 2
