@@ -25,12 +25,12 @@ from ``X`` ``[T, 4, H]``: the forward mapping, coefficients and collapse
 gradient and gradient statistics (``backward_prepare``), the single-cast input
 gradient with fixed-order FP32 parameter gradients (``backward_finish``),
 checkpoint replay (``forward_stats``) and autograd wrappers around the
-external branch. The caller holds the workspaces:
+external branch. The caller owns the workspaces. The helpers
 ``cake_mhc_det_train_forward_workspace_bytes`` / ``cake_mhc_det_train_forward_workspace``
 and ``cake_mhc_det_train_backward_workspace_bytes`` /
 ``cake_mhc_det_train_backward_workspace`` size and allocate a zero-initialized
 buffer for one hidden size (``hidden=``, default 4096) that serves the calls of
-that hidden size for every token count up to ``T``,
+that hidden size for every token count up to ``T``.
 ``cake_mhc_det_train_reset_workspace`` returns such a caller-owned buffer to its
 first-use state after an interrupted launch or capture, and
 ``is_cake_mhc_det_train_supported`` reports whether a device (optionally at a given
