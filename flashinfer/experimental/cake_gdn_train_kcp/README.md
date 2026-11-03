@@ -370,21 +370,21 @@ forward and backward to the packed row, and the checkpointed step
 two forwards and one backward; CUDA-event ms, the median of 16 group
 medians (2 runs x 8 groups; a group = 2 blocks of 5 warm-up + 20 timed calls
 per view form, the forms interleaved in palindromic order).  The B200
-forward and backward reached the GPU's power cap and are the median of the
-steady-block medians of 3 palindromic block pairs (a block = 5 s idle, 20 s
-warm-up, 300 timed calls); the R200 norm-off checkpointed step and norm-on
-forward are from the one re-measure pair, after the first pair drifted by
-more than 2 %.  One GPU per exclusive node (R200: a 208-SM board);
-PyTorch 2.14.1+cu130, CUDA 13.0 runtime:
+norm-off forward and backward reached the GPU's power cap: they are the
+median of the steady-block medians of 3 palindromic block pairs (a block =
+5 s idle, 20 warm-up calls, 300 timed calls), which still hit the cap in
+more than 5 % of the samples, so take them as approximate.  One GPU per
+exclusive node (R200: a 208-SM board); PyTorch 2.14.1+cu130, CUDA 13.0
+runtime:
 
 | GPU | in-kernel L2 norm | forward split / packed | backward split / packed | backward split - packed | checkpointed step split / packed |
 |---|---|---|---|---|---|
-| B200 (sm_100a, 148 SMs) | off | 1.674 / 1.666 | 3.390 / 3.187 | +0.203 (1.064x) | 5.214 / 5.023 (1.038x) |
-| B200 (sm_100a, 148 SMs) | on | 1.862 / 1.852 | 3.678 / 3.473 | +0.205 (1.059x) | 5.678 / 5.481 (1.036x) |
-| GB300 (sm_103a, 152 SMs) | off | 1.538 / 1.534 | 3.139 / 2.944 | +0.195 (1.066x) | 4.789 / 4.611 (1.039x) |
-| GB300 (sm_103a, 152 SMs) | on | 1.866 / 1.855 | 3.437 / 3.242 | +0.195 (1.060x) | 5.535 / 5.357 (1.033x) |
-| R200 (sm_107a, 208 SMs) | off | 1.111 / 1.108 | 2.264 / 2.093 | +0.171 (1.082x) | 3.467 / 3.302 (1.050x) |
-| R200 (sm_107a, 208 SMs) | on | 1.244 / 1.242 | 2.465 / 2.292 | +0.173 (1.075x) | 3.807 / 3.643 (1.045x) |
+| B200 (sm_100a, 148 SMs) | off | 1.436 / 1.432 | 3.389 / 3.187 | +0.202 (1.063x) | 4.992 / 4.795 (1.041x) |
+| B200 (sm_100a, 148 SMs) | on | 1.619 / 1.611 | 3.680 / 3.474 | +0.206 (1.059x) | 5.446 / 5.248 (1.038x) |
+| GB300 (sm_103a, 152 SMs) | off | 1.302 / 1.298 | 3.142 / 2.947 | +0.195 (1.066x) | 4.562 / 4.387 (1.040x) |
+| GB300 (sm_103a, 152 SMs) | on | 1.469 / 1.465 | 3.440 / 3.244 | +0.196 (1.060x) | 5.039 / 4.857 (1.037x) |
+| R200 (sm_107a, 208 SMs) | off | 0.945 / 0.944 | 2.264 / 2.090 | +0.174 (1.083x) | 3.309 / 3.144 (1.052x) |
+| R200 (sm_107a, 208 SMs) | on | 1.075 / 1.072 | 2.460 / 2.289 | +0.171 (1.075x) | 3.641 / 3.474 (1.048x) |
 
 The three views are the outputs of one custom autograd node.  Hooks and
 `retain_grad` on them fire as on any autograd output.  Its backward returns
