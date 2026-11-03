@@ -41,7 +41,7 @@ class NVLinkOneSidedConfig:
     ``lamport`` selects the Lamport transport for small steps: one dispatch and
     one combine kernel in which every pushed vector carries its own arrival, so
     no rank waits for a completion flag or fence. It needs compute capability
-    10.0 or 10.3, at most 64 EP ranks, a BF16 combine and a BF16, ``MXFP8``,
+    10.0, 10.3 or 10.7, at most 64 EP ranks, a BF16 combine and a BF16, ``MXFP8``,
     ``DeepSeekFp8`` or ``NVFP4`` dispatch format. Where every rank supports it,
     it takes every step without ``eplb_local_stats`` whose busiest rank sends
     at most ``lamport_max_tokens`` tokens, ahead of CFT. A step's busiest-rank
