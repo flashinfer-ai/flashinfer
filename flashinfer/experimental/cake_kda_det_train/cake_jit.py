@@ -6618,7 +6618,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "stage": "fwd_intra",
         "variant": "l2n",
     },
-    "fwd_intra_l2n_v37": {
+    "fwd_intra_v37_l2n": {
         "arches": ["sm_103a"],
         "arg_plan": [
             ["buffer", "qn_tma"],
@@ -6733,7 +6733,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ],
         },
         "stage": "fwd_intra",
-        "variant": "l2n_v37",
+        "variant": "v37_l2n",
     },
     "fwd_intra_v14_l2n": {
         "arches": ["sm_100a", "sm_103a", "sm_107a"],

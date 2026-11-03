@@ -203,7 +203,7 @@ FUSED_L2N_RECORDS = {
 }
 # The fused class's sm_103a forward intra program (fwd_intra v37: v35 with the norm in one pass over both tiles, every
 # output v35's bit for bit): a g record of its own with no raw twin, selected where its sibling is on sm_103a alone
-FUSED_L2N_SM103 = {"fwd_intra_l2n_v37": "fwd_intra_l2n"}
+FUSED_L2N_SM103 = {"fwd_intra_v37_l2n": "fwd_intra_l2n"}
 RAW_GLM_INTRA = "glm_intra_raw"
 RAW_FINALIZE = "param_finalize"
 # the raw operands the raw records bind in place of the activated gate g (the TMA reader of the forward takes the
@@ -383,7 +383,7 @@ RECORD_ARCHES = {
     "glm_intra_v14": ("sm_103a",),
     "glm_intra_v18": ("sm_107a",),
     "gate_epilogue": ("sm_100a",),
-    "fwd_intra_l2n_v37": ("sm_103a",),
+    "fwd_intra_v37_l2n": ("sm_103a",),
 }
 # The records of the segmented adjoint recurrence launch twice per stage (the carry between the passes); the
 # forward recurrence's passes are two stages (fwdh, fwdh_p3).
