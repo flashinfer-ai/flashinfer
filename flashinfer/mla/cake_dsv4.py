@@ -1150,7 +1150,8 @@ def _route(
 ) -> str:
     """The variant one call runs; ``sm_count`` is the device's SM count (the
     FP8/H64 decode rows pick their body by the waves of its grid) and ``arch``
-    its ``sm_XYa`` target (``None``: routes that every architecture builds)."""
+    its ``sm_XYa`` target (``None``: the architecture-independent choice, which
+    SM107 may not build: it has no BF16 programs)."""
     if max_q_len <= 0:
         raise ValueError("max_q_len must be positive")
     is_swa = sparse_topk == 128
@@ -1514,8 +1515,9 @@ def cake_dsv4_workspace_requirement(
     of the device the call runs on (``None``: the current CUDA device's; the
     workspace numbers do not depend on it, the route name may), ``arch`` = its
     ``sm_XYa`` target (``None``: the current CUDA device's whenever CUDA is
-    available, else the route every architecture builds; the workspace numbers
-    do not depend on it either). Raises ``ValueError`` for a shape
+    available, else the architecture-independent route, which SM107 may not
+    build: it has no BF16 programs; the workspace numbers do not depend on it
+    either). Raises ``ValueError`` for a shape
     ``backend="cake"`` has no kernel for.
     """
     if sm_count is None:

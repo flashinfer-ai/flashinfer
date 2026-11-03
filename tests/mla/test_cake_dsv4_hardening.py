@@ -1509,6 +1509,8 @@ def test_enable_pdl_h64_cluster_body_matches_and_waits_for_the_query_producer(
     plain = case.run(workspace=workspace, out=case.nan_out(), float_scales=True)
     torch.cuda.synchronize()
     assert {route for route, _ in calls} == {"fp8_lowhead_h64"}, calls
+    assert torch.isfinite(plain).all()
+    _assert_valid(plain, case)
     pdl = case.run(
         workspace=workspace, out=case.nan_out(), float_scales=True, enable_pdl=True
     )
