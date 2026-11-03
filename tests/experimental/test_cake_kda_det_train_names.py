@@ -176,7 +176,9 @@ def test_manifests_name_the_det_package_and_libraries() -> None:
     if test_only.is_file():
         assert json.loads(test_only.read_text())["package"] == NEW_PACKAGE
     single = {record["library"] for record in cake_jit.MODULES.values()}
-    assert len(single) == 78  # 65 g-gate, 8 raw-gate, 5 Q/K L2 norm fallback programs
+    # 65 g-gate, 8 raw-gate, 5 Q/K L2 norm fallback and 15 fused Q/K L2 norm programs (8 g-gate, fwd_intra v37
+    # on sm_103a among them, and 7 raw-gate)
+    assert len(single) == 93
     for library in single:
         assert re.fullmatch(r"cake_kda_det_train_[0-9a-f]{20}", library), library
     for name, record in cake_jit.MODULES.items():

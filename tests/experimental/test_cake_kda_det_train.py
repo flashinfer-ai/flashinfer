@@ -1133,7 +1133,13 @@ def test_the_raw_gate_records_mirror_the_g_records() -> None:
         a, b = modules[name], modules[sibling]
         assert list(a["arches"]) == ["sm_103a"], name
         assert a["l2n"] == b["l2n"] == ["fused"] and a.get("gate", "g") == "g", name
-        assert (a["stage"], a["grid_rule"], a["arg_plan"], a["logical"], a["launch"]) == (
+        assert (
+            a["stage"],
+            a["grid_rule"],
+            a["arg_plan"],
+            a["logical"],
+            a["launch"],
+        ) == (
             b["stage"],
             b["grid_rule"],
             b["arg_plan"],
@@ -1147,7 +1153,9 @@ def test_the_raw_gate_records_mirror_the_g_records() -> None:
                 {"kind": "arch_in", "arches": ["sm_103a"]},
             ],
         }, name
-        assert a["library"] not in {r["library"] for n, r in modules.items() if n != name}, name
+        assert a["library"] not in {
+            r["library"] for n, r in modules.items() if n != name
+        }, name
     # flag off (the in-kernel Q/K L2 norm's raw capture form serves the fallback mode alone)
     assert tuple(
         n
