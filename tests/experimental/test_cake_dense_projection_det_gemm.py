@@ -915,7 +915,9 @@ def test_registry_records_are_well_formed():
             assert plan_items[-4] == ["launch", "enable_pdl"]
             assert list(record["launch"]["block"]) == [256, 1, 1], name
             assert record["template"] in dict(
-                (t, w) for w, t in cake_backend.SWAP_TEMPLATES
+                (t, w)
+                for w, t in cake_backend.SWAP_TEMPLATES
+                + cake_backend.SWAP_TEMPLATES_WEIGHTS_STATIC
             )
             assert record["arches"] == list(cake_jit.ARCHES), name
         else:
@@ -6087,7 +6089,12 @@ def test_fused_split_selection_follows_the_registry(monkeypatch):
     source is a contiguous fp32 view of at most int32 elements; otherwise the torch chain splits."""
     assert cake_backend._split_grid(1) == (1, 1, 1)
     assert cake_backend._split_grid(3 * cake_backend.SPLIT_BLOCK_ELEMS + 1) == (4, 1, 1)
-    assert cake_backend._split_values("s", "p", 5) == {"src": "s", "parts": "p", "n": 5}
+    assert cake_backend._split_values("s", "p", 5) == {
+        "src": "s",
+        "parts": "p",
+        "n": 5,
+        "enable_pdl": 0,
+    }
     W = torch.empty(256, 6144)
     _cpu_router_registry(monkeypatch, fused=False)
     assert cake_backend.fused_split_module("sm_100a") is None
@@ -7969,7 +7976,9 @@ def test_eight_warp_form_rules_plan_their_programs(arch, T, monkeypatch):
             counters=dummy,
             ldo=plan.N,
             out_l=plan.M * plan.N,
+            enable_pdl=1,
         )
+        assert values["enable_pdl"] == 1
         assert values["fd_tiles_l"] == plan.m_tiles * plan.n_tiles
         assert values["fd_tiles_g"] == plan.group_m * plan.n_tiles
         assert values["fd_group"] == plan.group_m
@@ -9527,6 +9536,55 @@ def test_swapped_forward_pdl_waits_for_an_early_producer(T):
         _check(O2, torch.einsum("gtd,gdr->gtr", A2.double(), B2.double()))
 
 
+@pytest.mark.parametrize("T", [16, 128])
+def test_swapped_forward_default_waits_for_an_early_producer_writing_b(T):
+    """The default (``enable_pdl`` on, ``weights_static`` off) never reads ``B`` before the preceding kernel
+    completes: a long planner GEMM on a few CTAs (K = 65536) that triggers its dependents at entry writes the weights
+    the swapped forward reads next, and the forward sees every weight it wrote.  (The ``weights_static`` programs read
+    the NaN the weights were poisoned with in this chain: that is what the keyword states cannot happen.)"""
+    _require_swap()
+    G, D, R, Kp = 2, 256, 256, 65536
+    g = torch.Generator(device="cuda").manual_seed(SEED + 8)
+    y = (torch.randn(G, R, Kp, device="cuda", generator=g) * Kp**-0.5).to(
+        torch.bfloat16
+    )
+    z = torch.randn(G, D, Kp, device="cuda", generator=g).to(torch.bfloat16)
+    o = torch.randn(T, G, D, device="cuda", generator=g).to(torch.bfloat16)
+    w = torch.empty(G, R, D, device="cuda", dtype=torch.bfloat16)
+    res = torch.empty(T, G, R, device="cuda", dtype=torch.bfloat16)
+    A, B, O = o.transpose(0, 1), w.transpose(1, 2), res.transpose(0, 1)
+    launch = _swap_launch(A, B, O)
+    assert launch is not None
+    assert not cake_jit.MODULES[launch.module_name]["template"].endswith("_we")
+    for _ in range(3):
+        w.fill_(float("nan"))
+        res.fill_(float("nan"))
+        # the producer of the weights: w[g] = y[g] @ z[g].T on the planner's program (N < 2 M: not swapped)
+        cake_backend.dense_projection_det_gemm(y, z.transpose(1, 2), w)
+        cake_backend.dense_projection_det_gemm(A, B, O)
+        torch.cuda.synchronize()
+        assert bool(torch.isfinite(w).all())
+        _check(O, torch.einsum("gtd,gdr->gtr", A.double(), B.double()))
+
+
+def test_weights_static_runs_the_weights_early_program():
+    """``weights_static=True`` with PDL routes the swapped rows to the ``_we`` programs, which give the default's
+    bits on weights no kernel in flight writes."""
+    _require_swap()
+    for template in cake_backend.SWAP_TEMPLATES_WEIGHTS_STATIC:
+        _require_program(template[1])
+    A, B, out = _swap_views(64, seed=SEED + 9)
+    early = cake_backend._swap_ab_cached(A, B, out, False, True)
+    assert early is not None
+    assert cake_jit.MODULES[early.module_name]["template"].endswith("_we")
+    cake_backend.dense_projection_det_gemm(A, B, out)
+    first = out.clone()
+    out.fill_(float("nan"))
+    cake_backend.dense_projection_det_gemm(A, B, out, weights_static=True)
+    torch.cuda.synchronize()
+    assert torch.equal(out, first)
+
+
 def test_swapped_forward_replays_in_a_cuda_graph_with_pdl():
     """The swapped launch allocates nothing: a PDL chain captured into a CUDA graph replays on new values written
     into the bound views."""
@@ -9553,3 +9611,113 @@ def test_swapped_forward_replays_in_a_cuda_graph_with_pdl():
     torch.cuda.synchronize()
     _check(out, torch.einsum("gtd,gdr->gtr", A.double(), B.double()))
     _check(out2, torch.einsum("gtd,gdr->gtr", A2.double(), B2.double()))
+
+
+# ---------------------------------------------------------------------------
+# Programmatic dependent launch of the planner's programs
+# ---------------------------------------------------------------------------
+
+
+def test_every_program_takes_enable_pdl_per_call():
+    """Every program (the planner's, the eight-warp form, the swapped forward, the router and its split kernel) takes
+    the per-call PDL flag right before the grid."""
+    for name, record in cake_jit.MODULES.items():
+        plan = [list(item) for item in cake_jit.arg_plan_of(record)]
+        assert plan[-4] == ["launch", "enable_pdl"], (name, plan[-4])
+        assert sum(kind == "launch" for kind, _ in plan) == 1, name
+
+
+def test_weights_static_selects_the_weights_early_programs():
+    """Each swapped tile ships twice on every architecture: the default program, whose weight loads wait for the
+    preceding kernel, and the ``_we`` one, whose weight loads run ahead of the wait; ``weights_static`` picks it."""
+    for arch in cake_jit.ARCHES:
+        for (w, safe), (w_we, early) in zip(
+            cake_backend.SWAP_TEMPLATES,
+            cake_backend.SWAP_TEMPLATES_WEIGHTS_STATIC,
+            strict=True,
+        ):
+            assert w == w_we and early == f"{safe}_we"
+            assert cake_jit.select_module(arch, safe) != cake_jit.select_module(
+                arch, early
+            )
+        pick = cake_backend.swap_ab_template
+        assert pick(8, 64, 1024, 152, arch) == "swap_ab_w64_t64_s12"
+        assert pick(8, 64, 1024, 152, arch, True) == "swap_ab_w64_t64_s12_we"
+        assert pick(8, 256, 1024, 152, arch, True) == "swap_ab_w128_t64_s8_we"
+
+
+def test_enable_pdl_defaults_to_device_support():
+    if not _device_supported():
+        pytest.skip("requires a device with a registered generated instance")
+    device = torch.device("cuda")
+    assert cake_backend.pdl_enabled(None, device) is True
+    assert cake_backend.pdl_enabled(False, device) is False
+    assert cake_backend.pdl_enabled(True, device) is True
+
+
+def _pdl_chain_inputs(T, D1, R1, R2, seed):
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    x = torch.randn(T, D1, device="cuda", generator=g).to(torch.bfloat16)
+    w1 = (torch.randn(R1, D1, device="cuda", generator=g) * D1**-0.5).to(torch.bfloat16)
+    w2 = (torch.randn(R2, R1, device="cuda", generator=g) * R1**-0.5).to(torch.bfloat16)
+    return x, w1, w2
+
+
+@pytest.mark.parametrize("T", [256, 4096])
+def test_planner_pdl_waits_for_an_early_producer(T):
+    """A chain of programmatic dependent launches through the planner's programs: the first projection (K = 16384)
+    triggers its dependent at entry and writes the activation the second reads.  The second starts while the first
+    runs and must still read every row the first wrote, and at 256 rows both run stream-K out of one workspace arena
+    (the slabs and slice counters of the stream), which the second may touch only after the first completes."""
+    if not _device_supported():
+        pytest.skip("requires a device with a registered generated instance")
+    x, w1, w2 = _pdl_chain_inputs(T, 16384, 2048, 1024, SEED + 6)
+    mid = torch.empty(T, 2048, device="cuda", dtype=torch.bfloat16)
+    y = torch.empty(T, 1024, device="cuda", dtype=torch.bfloat16)
+    for _ in range(3):
+        mid.fill_(float("nan"))
+        y.fill_(float("nan"))
+        cake_backend.projection_det_forward(x, w1, mid, enable_pdl=True)
+        cake_backend.projection_det_forward(mid, w2, y, enable_pdl=True)
+        torch.cuda.synchronize()
+        _check(mid, x.double() @ w1.double().t())
+        _check(y, mid.double() @ w2.double().t())
+    # the default (the device supports PDL) gives the same bits
+    first = y.clone()
+    cake_backend.projection_det_forward(x, w1, mid)
+    cake_backend.projection_det_forward(mid, w2, y)
+    torch.cuda.synchronize()
+    assert torch.equal(y, first)
+
+
+def test_prepared_pdl_chain_replays_in_a_cuda_graph():
+    """Prepared launches fix ``enable_pdl`` at prepare time: a PDL chain of two prepared projections (the second reading the
+    first's output) captured into a CUDA graph replays on new values written into the bound views."""
+    if not _device_supported():
+        pytest.skip("requires a device with a registered generated instance")
+    T = 512
+    x, w1, w2 = _pdl_chain_inputs(T, 4096, 2048, 1024, SEED + 7)
+    mid = torch.empty(T, 2048, device="cuda", dtype=torch.bfloat16)
+    y = torch.empty(T, 1024, device="cuda", dtype=torch.bfloat16)
+    first = cake_backend.prepare_dense_projection_det_gemm(
+        x, w1.t(), mid, enable_pdl=True
+    )
+    second = cake_backend.prepare_dense_projection_det_gemm(
+        mid, w2.t(), y, enable_pdl=True
+    )
+    first()
+    second()
+    torch.cuda.synchronize()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        first()
+        second()
+    x.copy_(torch.randn(x.shape, device="cuda").to(torch.bfloat16))
+    mid.fill_(float("nan"))
+    y.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    _check(mid, x.double() @ w1.double().t())
+    _check(y, mid.double() @ w2.double().t())
