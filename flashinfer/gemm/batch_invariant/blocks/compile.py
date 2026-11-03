@@ -84,13 +84,17 @@ def get_compiled_gemm(
     )
     out_dt = OUT_DT[out_fmt] if direct else cutlass.Float32
     oal = ALIGN[out_fmt] if direct else ALIGN["f32"]
+    # N's declared divisibility is that of what N makes contiguous: B's rows for an N-major B (the input alignment), else
+    # only the output's rows (its alignment); the typed checks require the same, so a K-major fp8 weight with N a multiple
+    # of 8 but not 16 is a shape of the class
+    nal = al if b_major == "n" else oal
     grid = cfg.grid_clusters or clusters
     name = kernel_name(cfg, b_major, chunks, grid, in_fmt, out_fmt, batched, bias)
 
     def compile_fn():
         sym_m, sym_n, sym_kc = (
             cute.sym_int(32),
-            cute.sym_int(32, divisibility=al),
+            cute.sym_int(32, divisibility=nal),
             cute.sym_int(32, divisibility=al),
         )
         L = (
