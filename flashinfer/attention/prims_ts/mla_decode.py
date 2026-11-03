@@ -41,7 +41,7 @@ from .kernels.mla_decode.helpers.nvfp4_kv import (
 )
 
 from flashinfer.api_logging import flashinfer_experimental_api
-from flashinfer.utils import device_support_pdl, get_device_sm_count
+from flashinfer.utils import get_device_sm_count
 from flashinfer.trace.templates.attention import (
     prims_ts_decode_mla_one_shot_trace_dispatch,
     prims_ts_decode_mla_wrapper_trace_dispatch,
@@ -117,7 +117,6 @@ class _MLADecodeCompileSpec:
     write_final_lse: bool = True
     lse_mode: str = "none"
     scale_types: tuple[bool, bool, bool] = (False, False, False)
-    enable_pdl: bool = True
 
 
 @dataclass(frozen=True)
@@ -1164,7 +1163,6 @@ def _make_mla_decode_compile_spec(
     runtime_kv_lengths: bool = False,
     write_final_lse: bool = True,
     scale_types: tuple[bool, bool, bool] = (False, False, False),
-    enable_pdl: bool = True,
 ) -> _MLADecodeCompileSpec:
     """Keep policy resolution plan-specific and JIT identity batch-free."""
 
@@ -1190,7 +1188,6 @@ def _make_mla_decode_compile_spec(
         lse_mode=lse_mode,
         write_final_lse=write_final_lse,
         scale_types=scale_types,
-        enable_pdl=enable_pdl,
     )
 
 
@@ -1223,7 +1220,6 @@ def _get_compiled_mla_decode(
     packed_query = compile_spec.packed_query
     # Keep the cached spec pristine if compiled-callable caches are cleared.
     kernel = copy.copy(compile_spec.kernel)
-    kernel.enable_pdl = compile_spec.enable_pdl
     sparse = getattr(kernel, "direct_sparse", False)
     nvfp4_kv = getattr(kernel, "has_nvfp4_kv", False)
     dtype_map = {
@@ -1850,7 +1846,6 @@ class BatchMLADecodePagedTSWrapper:
             runtime_kv_lengths=True,
             write_final_lse=lse_mode != "none",
             scale_types=(*scale_types(softmax_scale, output_scale), False),
-            enable_pdl=device_support_pdl(device),
         )
         policy = spec.policy
         workspace_layout = _make_mla_workspace_layout(
@@ -3004,7 +2999,6 @@ class BatchSparseMLADecodePagedTSWrapper:
         spec = replace(
             spec,
             scale_types=scale_types(softmax_scale, output_scale, kv_cache_scale),
-            enable_pdl=device_support_pdl(device),
         )
         kernel = spec.kernel
         reload_d576 = (

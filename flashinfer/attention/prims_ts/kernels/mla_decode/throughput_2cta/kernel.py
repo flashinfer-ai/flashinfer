@@ -1012,7 +1012,6 @@ class MlaDecodeTs(Nvfp4KVConfig):
                 softmax_rescale_threshold_log2, qkv_dtype=qkv_dtype
             )
         )
-        self.enable_pdl = True
         self.fuse_sparse_reduction = False
         self.fuse_sparse_epilogue = False
         self.output_quant = None
@@ -1672,9 +1671,7 @@ class MlaDecodeTs(Nvfp4KVConfig):
         # Nonpersistent producers signal near retirement. The native reducer
         # can overlap setup, then waits for the complete prerequisite grid
         # before reading partials. Persistent schedules retain stream ordering.
-        use_one_wave_reducer_pdl = (
-            self.enable_pdl and acc_o is not None and not self.is_persistent
-        )
+        use_one_wave_reducer_pdl = acc_o is not None and not self.is_persistent
 
         # Host FP32 scales enter the device kernel in log2 units. Device
         # buffers retain natural units until they are loaded by the kernel.
@@ -1936,9 +1933,7 @@ class MlaDecodeTs(Nvfp4KVConfig):
     ) -> None:
         """MLA decode TS kernel: persistent tile-scheduled execution."""
         seq_len_q = self.seq_len_q if self.fixed_seqlen else max_q_len
-        if cutlass.const_expr(
-            self.enable_pdl and acc_o is not None and not self.is_persistent
-        ):
+        if cutlass.const_expr(acc_o is not None and not self.is_persistent):
             prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
         if cutlass.const_expr(isinstance(softmax_scale, cute.Tensor)):
             scale_softmax_log2 = softmax_scale[0] * LOG2_E
@@ -2509,9 +2504,7 @@ class MlaDecodeTs(Nvfp4KVConfig):
             )
             # Each producer CTA publishes completion only after its paired
             # TMEM lifetime and all scheduled output work have retired.
-            if cutlass.const_expr(
-                self.enable_pdl and acc_o is not None and not self.is_persistent
-            ):
+            if cutlass.const_expr(acc_o is not None and not self.is_persistent):
                 if prims.elect_sync():
                     prims.griddepcontrol(kind=prims.GridDepAction.LAUNCH_DEPENDENTS)
 
@@ -2583,7 +2576,7 @@ class MlaDecodeTs(Nvfp4KVConfig):
             mask_type=self.mask_type,
             lse_base_on_e=self.lse_base_on_e,
         )
-        if cutlass.const_expr(self.enable_pdl and not self.is_persistent):
+        if cutlass.const_expr(not self.is_persistent):
             prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
         run_reduction_kernel(
             self,
@@ -2632,7 +2625,7 @@ class MlaDecodeTs(Nvfp4KVConfig):
             mask_type=self.mask_type,
             lse_base_on_e=self.lse_base_on_e,
         )
-        if cutlass.const_expr(self.enable_pdl and not self.is_persistent):
+        if cutlass.const_expr(not self.is_persistent):
             prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
         attention_sinks = None
         if cutlass.const_expr(self.fuse_sparse_reduction):

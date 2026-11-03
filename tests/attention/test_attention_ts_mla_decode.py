@@ -3794,13 +3794,10 @@ def test_attention_ts_mla_decode_2cta_runtime_small_split_reduction(seq_len_q, k
 
 
 @_REQUIRES_PRIMTS_GPU
-@pytest.mark.parametrize(
-    "family,enable_pdl", (("1cta", True), ("2cta", True), ("2cta", False))
-)
-def test_dense_mla_global_scales_graph_replay(monkeypatch, family, enable_pdl):
+@pytest.mark.parametrize("family", ("1cta", "2cta"))
+def test_dense_mla_global_scales_graph_replay(family):
     from tests.test_helpers.pdl import late_store
 
-    monkeypatch.setattr(mla_decode_module, "device_support_pdl", lambda _: enable_pdl)
     case = _make_mla_case(
         batch_size=4 if family == "1cta" else 8,
         num_qo_heads=16 if family == "1cta" else 128,
