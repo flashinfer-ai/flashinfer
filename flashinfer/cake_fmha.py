@@ -2680,17 +2680,21 @@ def _decode_route_runs_program(route: CakeFmhaDecodeRoute) -> bool:
 def _decode_program_record(route: CakeFmhaDecodeRoute) -> tuple[str, str] | None:
     """``(program name, launch)`` the module pins for the route's program, or
     ``None`` when the route names no program or one this module does not
-    route on its target."""
+    route on its target (a length-aware twin runs where its stream-K
+    program is routed)."""
 
     if route.program is None:
         return None
-    family, identifier = route.program
     routes = _DECODE_PROGRAM_ROUTES.get(route.target, {})
-    if not any(
-        key[0] == family and served == identifier for key, served in routes.items()
-    ):
+    routed = {(key[0], served) for key, served in routes.items()}
+    routed |= {
+        twin
+        for program, twin in _DECODE_PROGRAM_LENGTH_AWARE.items()
+        if program in routed
+    }
+    if route.program not in routed:
         return None
-    return _DECODE_PROGRAMS.get((family, identifier))
+    return _DECODE_PROGRAMS.get(route.program)
 
 
 def _decode_program_lookup(
@@ -3827,11 +3831,11 @@ _DECODE_PROGRAM_ROUTES["sm103a"].update(
 _DECODE_PROGRAMS.update(
     {
         ("decode_bf16", "DEC_B128"): (
-            "cake_fmha_decode_bf16_4a8ccd779ab91c5d2cb5",
+            "cake_fmha_decode_bf16_bc385ebf14604aab347e",
             "streamk",
         ),
         ("decode_bf16", "DEC_B128_DS"): (
-            "cake_fmha_decode_bf16_4771b35b3b41de52fc15",
+            "cake_fmha_decode_bf16_0e44456c4d63adb24711",
             "streamk",
         ),
         ("decode_bf16", "DEC_B4C4"): (
@@ -3850,8 +3854,25 @@ _DECODE_PROGRAMS.update(
             "cake_fmha_decode_bf16_394b0caa8e0362fe9988",
             "bhq",
         ),
+        ("decode_bf16", "DEC_B128_LA"): (
+            "cake_fmha_decode_bf16_c64d254f01952ec24d95",
+            "streamk",
+        ),
+        ("decode_bf16", "DEC_B128_LA_DS"): (
+            "cake_fmha_decode_bf16_fdf3768a052c6ca9cd83",
+            "streamk",
+        ),
     }
 )
+# The length-aware twins of the stream-K programs: the same launch with each
+# request's units sized by its own length instead of ``max_seq_len``, so a
+# batch whose lengths differ streams only its requests' own KV blocks.  A
+# call runs the twin only when it asks for the length-aware schedule
+# (``length_aware_schedule``); its default route keeps the stream-K program.
+_DECODE_PROGRAM_LENGTH_AWARE: dict[tuple[str, str], tuple[str, str]] = {
+    ("decode_bf16", "DEC_B128"): ("decode_bf16", "DEC_B128_LA"),
+    ("decode_bf16", "DEC_B128_DS"): ("decode_bf16", "DEC_B128_LA_DS"),
+}
 
 
 def _decode_exact_sink_member_cannot_finish(
@@ -3926,9 +3947,11 @@ def _decode_bf16_program_select(
     uses_shared_paged_kv_idx: bool,
     no_block_scales: bool,
     pad_table: bool = False,
+    length_aware_schedule: bool = False,
 ) -> tuple[tuple[str, str], bool] | None:
     """``(program, device_scales)`` of a BF16 decode launch the generated
-    programs serve, or ``None``.
+    programs serve, or ``None``.  With ``length_aware_schedule`` a stream-K
+    hit runs its length-aware twin (:data:`_DECODE_PROGRAM_LENGTH_AWARE`).
 
     A hit takes a contiguous query, 16-token HND pages of head dim 128, a
     contiguous int32 shared page table the kernels read in place (eight
@@ -4020,6 +4043,8 @@ def _decode_bf16_program_select(
                 end = _decode_streamk_layout(batch_size, rows, grid)[2]
                 if groups == 0 or _decode_program_bytes_of(workspace_buffer) < end:
                     return None
+                if length_aware_schedule:
+                    program = _DECODE_PROGRAM_LENGTH_AWARE.get(program, program)
             if not _decode_bf16_program_table_fits(launch, block_tables, 8 * even) and (
                 not pad_table
                 or launch == "cluster"
@@ -4241,11 +4266,16 @@ def select_cake_fmha_decode_route(
     lse: torch.Tensor | None = None,
     multi_ctas_kv_counter_buffer: torch.Tensor | None = None,
     enable_pdl: bool | None = None,
+    length_aware_schedule: bool = False,
 ) -> CakeFmhaDecodeRoute | None:
     """Select an exact product decode route without broadening its contract.
 
     ``enable_pdl`` is the caller's launch mode; a generated program whose split-KV
     reducer waits on the decode grid serves only a call that asks for it.
+
+    ``length_aware_schedule`` is the caller's opt-in to the length-aware twin of
+    a stream-K BF16 program (:data:`_DECODE_PROGRAM_LENGTH_AWARE`); every other
+    route ignores it.
 
     A launch with ``lse`` takes the program route of the same launch without
     it, with ``return_lse`` set, when its JIT member is the route the module
@@ -4718,6 +4748,7 @@ def select_cake_fmha_decode_route(
             kv_layout=kv_layout,
             uses_shared_paged_kv_idx=uses_shared_paged_kv_idx,
             no_block_scales=no_block_scales,
+            length_aware_schedule=length_aware_schedule,
         )
         bf16_program = _decode_bf16_program_select(device, **program_kwargs)
         native = None

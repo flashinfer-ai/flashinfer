@@ -255,7 +255,7 @@ __device__ __forceinline__ float mul_f32_rn_noftz(float a, float b) {
 extern "C" {
 
 __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS) void
-kernel_cake_fmha_decode_bf16_4771b35b3b41de52fc15(const __grid_constant__ CUtensorMap Qt, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap V, __nv_bfloat16* __restrict__ O_ptr, float* __restrict__ LSE_ptr, int* __restrict__ page_table, int* __restrict__ causal_seqlens_kv_global, float* __restrict__ scale_log2_ptr, float* __restrict__ bmm2_ptr, float* __restrict__ sinks_ptr, unsigned int* __restrict__ split_counter, float* __restrict__ split_ws, int max_pages_per_seq, int max_local_seq_len, float softmax_scale_log2, int window_left, int num_q_heads, int num_kv_heads, int batch_size)
+kernel_cake_fmha_decode_bf16_0e44456c4d63adb24711(const __grid_constant__ CUtensorMap Qt, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap V, __nv_bfloat16* __restrict__ O_ptr, float* __restrict__ LSE_ptr, int* __restrict__ page_table, int* __restrict__ causal_seqlens_kv_global, float* __restrict__ scale_log2_ptr, float* __restrict__ bmm2_ptr, float* __restrict__ sinks_ptr, unsigned int* __restrict__ split_counter, float* __restrict__ split_ws, int max_pages_per_seq, int max_local_seq_len, float softmax_scale_log2, int window_left, int num_q_heads, int num_kv_heads, int batch_size)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);

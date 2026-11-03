@@ -34,12 +34,17 @@ def _loader(family):
 
 
 def _served() -> dict[tuple[str, str], set[str]]:
-    """``(family, identifier)`` -> the targets whose routes name it."""
+    """``(family, identifier)`` -> the targets whose routes name it (a
+    length-aware twin serves its stream-K program's targets on an opt-in
+    call)."""
 
     served: dict[tuple[str, str], set[str]] = {}
     for target, routes in cake_api._DECODE_PROGRAM_ROUTES.items():
         for key, identifier in routes.items():
             served.setdefault((key[0], identifier), set()).add(_TARGET_ARCH[target])
+    for key, twin in cake_api._DECODE_PROGRAM_LENGTH_AWARE.items():
+        if key in served:
+            served.setdefault(twin, set()).update(served[key])
     return served
 
 
@@ -1004,7 +1009,15 @@ def _bits(tensor):
     return tensor.view(dtype)
 
 
-def _run_decode(case, *, seq_lens=None, out=None, max_seq_len=None, lse=None):
+def _run_decode(
+    case,
+    *,
+    seq_lens=None,
+    out=None,
+    max_seq_len=None,
+    lse=None,
+    length_aware_schedule=False,
+):
     return decode_api.trtllm_batch_decode_with_kv_cache(
         case.query,
         case.kv_cache,
@@ -1024,6 +1037,7 @@ def _run_decode(case, *, seq_lens=None, out=None, max_seq_len=None, lse=None):
         enable_pdl=True,
         multi_ctas_kv_counter_buffer=case.counter,
         lse=lse,
+        length_aware_schedule=length_aware_schedule,
     )
 
 
@@ -2041,6 +2055,39 @@ def test_cake_fmha_decode_bf16_streamk_program_admission(
 
 @pytest.mark.parametrize("device_scales", (False, True))
 @pytest.mark.parametrize("target", ("sm100a", "sm103a"))
+def test_cake_fmha_decode_bf16_length_aware_schedule_is_opt_in(
+    decode_target, target, device_scales
+) -> None:
+    """A stream-K B128 launch runs its length-aware twin only when the caller
+    asks for the length-aware schedule (the twin's route runs its program);
+    the default keeps the stream-K program, and a launch the stream-K program
+    does not admit ignores it."""
+
+    identifier = "DEC_B128_DS" if device_scales else "DEC_B128"
+    twin = identifier.replace("DEC_B128", "DEC_B128_LA")
+    kwargs = _row_kwargs("bf16_b128_s4096", device_scales=device_scales)
+    decode_target(target)
+    assert _select(kwargs).program == ("decode_bf16", identifier)
+    assert _select({**kwargs, "length_aware_schedule": False}).program == (
+        "decode_bf16",
+        identifier,
+    )
+    route = _select({**kwargs, "length_aware_schedule": True})
+    assert route.program == ("decode_bf16", twin)
+    assert cake_api._DECODE_PROGRAMS[("decode_bf16", twin)][1] == "streamk"
+    # the twin's route runs its program (not the compat module)
+    assert cake_api.cake_fmha_route_is_optimized(route)
+    assert (
+        cake_api._decode_program_record(route)
+        == (cake_api._DECODE_PROGRAMS[("decode_bf16", twin)])
+    )
+    decode_target(target, sm_count=260)  # 65 groups: 128 requests not admitted
+    route = _select({**kwargs, "length_aware_schedule": True})
+    assert route is None or route.program is None, route
+
+
+@pytest.mark.parametrize("device_scales", (False, True))
+@pytest.mark.parametrize("target", ("sm100a", "sm103a"))
 def test_cake_fmha_decode_bf16_cluster_program_needs_a_cluster_per_tile(
     decode_target, target, device_scales
 ) -> None:
@@ -2320,6 +2367,7 @@ def _run_bf16(case, **kwargs):
         sinks=case.sinks,
         enable_pdl=True,
         multi_ctas_kv_counter_buffer=case.counter,
+        length_aware_schedule=kwargs.get("length_aware_schedule", False),
     )
 
 
@@ -2498,6 +2546,74 @@ def test_cake_decode_bf16_streamk_counters_are_graph_safe(
         if counter:
             assert not case.counter.any()
     assert set(served_programs) == {("decode_bf16", "DEC_B128")}
+
+
+@_GPU
+@pytest.mark.parametrize("device_scales", (False, True))
+@pytest.mark.parametrize("lengths", ("uniform", "ragged", "skewed"))
+def test_cake_decode_bf16_length_aware_program(
+    served_programs, lengths, device_scales
+) -> None:
+    """The length-aware twin of the stream-K B128 program (the caller's
+    opt-in) is within the BF16 tolerance of an FP32 reference on every
+    request, the same bits run to run and after a graph replay of new
+    in-place lengths, and, for a batch of equal lengths, the default
+    program's bits (the same cuts)."""
+
+    _require_full_device()
+    batch, kv_len = 128, SHAPE_ROWS["bf16_b128_s4096"][4]
+    ragged = None
+    if lengths == "ragged":
+        ragged = ([kv_len, 1, 2, 129, kv_len - 1, 255, kv_len // 2, 17] * batch)[:batch]
+    elif lengths == "skewed":
+        # a few long requests among short ones: one long request holds the
+        # cuts of several CTA groups
+        ragged = [kv_len] * 4 + [130] * (batch - 4)
+    case = _bf16_gpu_case(
+        "bf16_b128_s4096", seed=20261102, lengths=ragged, device_scales=device_scales
+    )
+    default = _run_bf16(case)
+    got = _run_bf16(case, length_aware_schedule=True)
+    again = _run_bf16(case, length_aware_schedule=True)
+    identifier = "DEC_B128_DS" if device_scales else "DEC_B128"
+    twin = identifier.replace("DEC_B128", "DEC_B128_LA")
+    assert served_programs == [
+        ("decode_bf16", identifier),
+        ("decode_bf16", twin),
+        ("decode_bf16", twin),
+    ]
+    assert torch.equal(_bits(got), _bits(again))
+    reference = _bf16_reference(case, list(range(batch)))
+    for b in range(batch):
+        torch.testing.assert_close(
+            got[b].float(), reference[b][0], atol=1e-2, rtol=1e-2, msg=f"request {b}"
+        )
+    if lengths == "uniform":
+        assert torch.equal(_bits(got), _bits(default))
+    # A graph captured once replays new in-place lengths bitwise to direct
+    # launches; the split counters read zero after every launch.
+    seq_lens = case.seq_lens.clone()
+    out = torch.empty_like(case.out)
+    _run_bf16(case, seq_lens=seq_lens, out=out, length_aware_schedule=True)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        _run_bf16(case, seq_lens=seq_lens, out=out, length_aware_schedule=True)
+    generator = torch.Generator(device="cuda").manual_seed(20261104)
+    for _ in range(3):
+        lengths_now = torch.randint(
+            1,
+            case.max_seq_len + 1,
+            (batch,),
+            generator=generator,
+            dtype=torch.int32,
+            device="cuda",
+        )
+        seq_lens.copy_(lengths_now)
+        graph.replay()
+        direct = _run_bf16(case, seq_lens=lengths_now, length_aware_schedule=True)
+        torch.cuda.synchronize()
+        assert torch.equal(_bits(out), _bits(direct))
+        assert not case.counter.any()
 
 
 # --- FP8 boundaries (host-only) ----------------------------------------------
