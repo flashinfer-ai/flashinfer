@@ -459,6 +459,26 @@ def _eq(a: dict, b: dict, names=TENSORS) -> bool:
     return all(torch.equal(a[n], b[n]) for n in names)
 
 
+@contextlib.contextmanager
+def _nan_allocations():
+    """Every tensor the package allocates (its ``_alloc``: outputs, saved set, pools, tapes) is filled with NaN
+    bytes while the block runs: a program that reads a plane no program of the call wrote gives non-finite results
+    instead of the bytes a previous call left in the caching allocator."""
+    real = kcp._alloc
+
+    def nan_alloc(shape, dtype, device):
+        t = real(shape, dtype, device)
+        if t.numel():
+            t.view(-1).view(torch.uint8).fill_(0xFF)
+        return t
+
+    kcp._alloc = nan_alloc
+    try:
+        yield
+    finally:
+        kcp._alloc = real
+
+
 def _plain_split_pass(buf, g, beta, dout, call, H_qk: int, HV: int, *, ckpt: bool):
     """Issue #8367: one autograd pass with q / k / v as plain ``split`` + ``view`` head views of a packed leaf holding
     ``buf`` (torch's own split backward concatenates the gradients).  Returns the results (``dq`` / ``dk`` / ``dv``
@@ -1190,6 +1210,16 @@ def _run_rank(
     flags["ring_eq_a2a"] = (not ring_eligible) or _eq(
         res_recompute, saved_pass(exchange="ring", save_transfer=False)
     )
+    # save_mode="full" without save_transfer (the keyword, or the ring exchange, which needs it): the full backward
+    # runs no transfer walk, so at P > 1 its merges read the saved M_seg^T plane; on NaN-filled allocations a read of
+    # an unwritten plane cannot pass on the bytes the forward left in the caching allocator
+    with _nan_allocations():
+        flags["full_no_transfer_eq"] = _eq(
+            res, saved_pass(save_mode="full", save_transfer=False)
+        )
+        flags["full_ring_eq_a2a"] = (not ring_eligible) or _eq(
+            res, saved_pass(save_mode="full", exchange="ring", save_transfer=False)
+        )
     res_host = saved_pass(group_reduce="host")
     info["host_reduce_eq_fused"] = _eq(
         res, res_host
@@ -2676,6 +2706,19 @@ def _run_rank_l2n(
         flags["l2n_ring_eq_a2a"] = _eq(
             res, saved_pass(exchange="ring", save_transfer=False, **L2N)
         )
+    # save_mode="full" without save_transfer (the keyword, or the ring exchange) on NaN-filled allocations, as in the
+    # norm-off row: at P > 1 the full backward's merges read the saved M_seg^T plane
+    with _nan_allocations():
+        flags["l2n_full_no_transfer_eq"] = _eq(
+            res, saved_pass(save_mode="full", save_transfer=False, **L2N)
+        )
+        if W > 1 and int(ctx.n_d_max) - 1 <= kcp.RING_MAX_HOPS:
+            flags["l2n_full_ring_eq_a2a"] = _eq(
+                res,
+                saved_pass(
+                    save_mode="full", exchange="ring", save_transfer=False, **L2N
+                ),
+            )
     res_host = saved_pass(group_reduce="host", **L2N)
     info["l2n_host_eq_fused"] = _eq(
         res, res_host

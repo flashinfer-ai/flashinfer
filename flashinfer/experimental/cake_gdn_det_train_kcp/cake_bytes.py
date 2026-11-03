@@ -59,8 +59,9 @@ with a successor in its document chain), ``N_in`` / ``N_out`` the group totals,
   ``Akk`` ``[R, HV, 64]`` (BF16), ``gamma [NC_pad, HV]`` and the FP32 row factors
   ``gcum`` / ``rowscale`` / ``qscale`` ``[R, HV]`` (the host skips #1 and the walk
   entirely).  ``M_seg`` is retained with
-  ``save_transfer`` only (the ``save_transfer=False`` form re-runs the transfer
-  walks, KDA semantics).  ``boundary_mode="replay"`` keeps no ``S_in`` /
+  ``save_transfer`` and with ``save_mode="full"`` (whose backward runs no transfer
+  walk); the light ``save_transfer=False`` form re-runs the transfer walks
+  (KDA semantics).  ``boundary_mode="replay"`` keeps no ``S_in`` /
   c1 tensor / ``M_seg`` (the backward re-runs the offset and transfer walks, the
   exchange and the merge).  Inputs are references (0 extra bytes); the int32
   tables live on the context (not per layer).
@@ -340,7 +341,7 @@ def gdn_det_saved_layout_kcp(
         if (saved and save_transfer)
         else 0,
         "M_seg": ((P - 1) * ctx.n_frag * s)
-        if (saved and save_transfer and P > 1)
+        if (saved and (save_transfer or save_mode == "full") and P > 1)
         else 0,
         "hist": ctx.halo.n_hist_rows * C * 2 if with_conv else 0,
     }
@@ -467,7 +468,9 @@ def gdn_det_workspace_layout_kcp(
     # (save_transfer under boundary_mode="saved" saves M_seg: the pool of that name is not sized, cake_kcp
     # SAVE_TRANSFER_FRESH_POOLS); the ring pools are sized only under exchange="ring" and are not workspace here
     plane = (hp.NSEG * HV * STATE_TILE_BYTES) if P > 1 else 0
-    staging = plane + (0 if (boundary_mode == "saved" and save_transfer) else plane)
+    staging = plane + (
+        0 if (boundary_mode == "saved" and (save_transfer or full)) else plane
+    )
     carry = (ctx.n_frag * (P - 1) * s) if P > 1 else 0
     # the forward tapes (#1 outputs + the #2 tape walk); in "light" they are workspace in the forward and, replayed,
     # in the backward; in "full" they are saved-set bytes (gdn_det_saved_layout_kcp), not workspace

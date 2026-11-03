@@ -646,3 +646,59 @@ def test_reuse_recompute_tapes_auto_follows_the_region_shape(
             kcp.LAST_CALL["bwd"]["tapes_source"],
         )
         assert kcp.kept_registry_size() == 0, (later_saver, form)
+
+
+# --------------------------------------------------------------------------- save_mode="full" without save_transfer at P > 1
+
+
+@pytest.mark.parametrize("norm", [False, True], ids=["l2n-off", "l2n-on"])
+def test_full_backward_without_save_transfer_matches_light_on_poisoned_memory(
+    device, monkeypatch, norm
+) -> None:
+    """``save_mode="full"`` with ``save_transfer=False`` at ``P = 2``: every tensor the package allocates is filled
+    with NaN bytes, so a read of a plane no program of the call wrote (the ``M_seg^T`` staging plane the backward's
+    merges read) shows up as a non-finite gradient.  The full form gives the light form's bits (out and the five
+    gradients) on a per-call, a fresh and a shared workspace, twice on the shared one."""
+    kcp = pytest.importorskip("flashinfer.experimental.cake_gdn_det_train_kcp.cake_kcp")
+    real_alloc = kcp._alloc
+
+    def nan_alloc(shape, dtype, dev):
+        t = real_alloc(shape, dtype, dev)
+        if t.numel():
+            t.view(-1).view(torch.uint8).fill_(0xFF)
+        return t
+
+    monkeypatch.setattr(kcp, "_alloc", nan_alloc)
+    cu = [0, 11000, 23000, 32768]
+    H, HV = 16, 48
+    inputs = make_inputs(cu, H, HV)
+    ctx = _local_context(cu, device)
+    dout = inputs["dout"].to(device)
+
+    def run(workspace, **kw) -> dict:
+        leaves = [inputs[n].to(device).detach().requires_grad_(True) for n in OPERANDS]
+        out = gdn_api.chunk_gdn_det_kcp(
+            *leaves,
+            ctx,
+            workspace=workspace,
+            segments=2,
+            save_transfer=False,
+            use_qk_l2norm_in_kernel=norm,
+            **kw,
+        )
+        out.backward(dout)
+        torch.cuda.synchronize(device)
+        return {
+            "out": out.detach(),
+            **{n: lf.grad for n, lf in zip(OPERANDS, leaves, strict=True)},
+        }
+
+    light = run(None)
+    assert kcp.LAST_CALL["fwd"]["P"] == 2
+    for n, t in light.items():
+        assert bool(torch.isfinite(t.float()).all()), ("light", n)
+    shared = kcp.WorkspaceDetKcp()
+    for i, ws in enumerate((None, kcp.WorkspaceDetKcp(), shared, shared)):
+        full = run(ws, save_mode="full")
+        for n in light:
+            assert torch.equal(full[n], light[n]), (i, n)

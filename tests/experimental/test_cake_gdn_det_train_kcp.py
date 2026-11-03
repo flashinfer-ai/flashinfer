@@ -1210,8 +1210,8 @@ def _saved_formula(ctx, H_qk, HV, save_mode, boundary_mode, save_transfer, C) ->
         total += ctx.n_in * s_pad
         if save_transfer:
             total += ctx.N_out * 2 * hp.Hg_pad_by_rank[ctx.rank] * gp.STATE_TILE_BYTES
-            if hp.P > 1:
-                total += (hp.P - 1) * ctx.n_frag * s
+        if (save_transfer or save_mode == "full") and hp.P > 1:
+            total += (hp.P - 1) * ctx.n_frag * s
     if (
         save_mode == "full"
     ):  # every forward tape: h, v_new / w / u, Aqk / Akk, gamma, gcum / rowscale / qscale
@@ -2337,6 +2337,51 @@ def test_backward_forgets_its_own_saved_set_at_the_last_reader() -> None:
     )
     assert all(torch.isfinite(g.float()).all() for g in g4)
     assert "S_in" not in kcp.LAST_CALL["bwd"]["fresh_bytes"]
+
+
+@pytest.mark.parametrize("use_qk_l2norm_in_kernel", (False, True))
+def test_full_backward_without_save_transfer_reads_no_unwritten_plane(
+    monkeypatch, use_qk_l2norm_in_kernel
+) -> None:
+    """``save_mode="full"`` with ``save_transfer=False`` at ``P > 1``: the backward's merges read the forward's
+    ``M_seg^T`` plane (``stage_m``), which the full backward does not rebuild (no transfer walk), so the saved set
+    carries it.  Every tensor the package allocates is filled with NaN bytes: an unwritten read shows up as a
+    non-finite gradient.  The full form gives the light form's bits on a fresh, a shared and a ``None`` workspace,
+    and its saved set holds ``M_seg``."""
+    kcp = _package("cake_kcp")
+    real_alloc = kcp._alloc
+
+    def nan_alloc(shape, dtype, device):
+        t = real_alloc(shape, dtype, device)
+        if t.numel():
+            t.view(-1).view(torch.uint8).fill_(0xFF)
+        return t
+
+    monkeypatch.setattr(kcp, "_alloc", nan_alloc)
+    cu = [0, 100, 740, 817, 1817, 1946]
+    H_qk, HV = 2, 6
+    part = gp.partition_det_kcp(torch.tensor(cu, dtype=torch.int64), 1, "contiguous")
+    ctx = gp.build_context_det_kcp(part, None, 0, CPU)
+    ops = _inputs(cu, H_qk, HV)
+    base = {
+        "segments": 2,
+        "save_transfer": False,
+        "use_qk_l2norm_in_kernel": use_qk_l2norm_in_kernel,
+    }
+    args = (ops["q"], ops["k"], ops["v"], ops["g"], ops["beta"], ctx)
+    _, saved = kcp.chunk_gdn_det_fwd_kcp(
+        *args, backend="fake", save_mode="full", **base
+    )
+    assert saved is not None and saved.P == 2 and saved.c1_recv is None
+    assert saved.M_seg is not None and torch.isfinite(saved.M_seg).all()
+    light = _ckpt_autograd(kcp, ctx, ops, ckpt=False, **base)
+    assert all(torch.isfinite(t.float()).all() for t in light.values())
+    shared = kcp.WorkspaceDetKcp()
+    for ws in (None, kcp.WorkspaceDetKcp(), shared, shared):
+        full = _ckpt_autograd(
+            kcp, ctx, ops, ckpt=False, workspace=ws, save_mode="full", **base
+        )
+        _assert_same(full, light, "save_mode=full without save_transfer")
 
 
 def test_transpose_tiles_scratch_is_bitwise_the_temporary_form() -> None:
