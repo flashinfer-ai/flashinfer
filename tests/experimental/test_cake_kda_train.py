@@ -222,7 +222,8 @@ WU_SAVED_H = 16
 WU_SEG_SAVED_ARCHES = ("sm_103a", "sm_107a")
 WU_SEG_MIN_CHAINS = 32
 # the table stage is optional too: on the forward and the replay of the segmented route up to 256 documents the
-# intra program writes the tables and no table record is selected; the gate epilogue launches on sm_107a alone
+# intra program writes the tables and no table record is selected; the gate epilogue launches on sm_100a alone (and
+# never in raw mode), the parameter finalize in raw mode alone
 OPTIONAL_STAGES = (
     "table",
     "seg_table",
@@ -233,6 +234,7 @@ OPTIONAL_STAGES = (
     "fwdh",
     "dav",
     "gate_epilogue",
+    "param_finalize",
 )
 # The stages of each path, in the registry's order (the forward's; the backward's with the tables, the intra
 # program on the replay path and seg_carry on the segmented route).
@@ -249,6 +251,7 @@ _BWD = (
     "dqkg",
     "glm_intra",
     "gate_epilogue",
+    "param_finalize",
 )
 PATH_STAGES = {
     "fwd": (
@@ -392,13 +395,14 @@ GRID_KINDS = (
     "docs_heads",
     "carry_groups",
     "segments_heads",
+    "head_chunk_blocks",
 )
 # the records delivered for a subset of the architectures (every other record ships on all three, the two-level
 # carry and the no-kb prep among them): the gate epilogue and its unfused GLM intra programs on sm_100a, the fused
 # ones on sm_103a (glm_intra_v14, glm_intra_v22) and sm_107a (glm_intra_v18, glm_intra_v23), and the S1 fused
 # gradient's builds with the L2 hints off on sm_107a (its rows from 16 heads).  The deterministic copies keep the
-# deterministic package's architectures (the same builds) but dqkg_davq / dqkg_int_davq, which ship only where
-# their rows launch them: sm_100a's saved-set rows up to 8 heads / sm_103a's replay from 16 heads.
+# deterministic package's architectures (the same builds; dqkg_davq / dqkg_int_davq share their programs with the
+# raw class, so they ship on the three though their g rules launch them on sm_100a / sm_103a alone).
 RECORD_ARCHES = {
     "glm_intra": ("sm_100a",),
     "glm_intra_v14": ("sm_103a",),
@@ -409,27 +413,29 @@ RECORD_ARCHES = {
     "glm_intra_v23": ("sm_107a",),
     "dqkg_davq_nohint_v24": ("sm_107a",),
     "dqkg_int_davq_nohint_v24": ("sm_107a",),
-    "dqkg_davq": ("sm_100a",),
-    "dqkg_int_davq": ("sm_103a",),
 }
-# The deterministic package's records no cell of this package launches: the sm_107a rows from 16 heads (the only
-# rows of the builds with the L2 hints off) run the S1 pair on every backward path, and the raw forget-gate class
-# (gate "raw": the forward intra, backward prep and GLM intra programs that read the raw gate, and the backward's
-# A_log / dt_bias gradient finalize) runs only under use_gate_in_kernel=True, which this package refuses.
-DET_RECORDS_NOT_LAUNCHED = frozenset(
-    (
-        "dqkg_davq_nohint",
-        "dqkg_int_davq_nohint",
-        "fwd_intra_raw",
-        "fwd_intra_v14_raw",
-        "bwd_prep_g8_raw",
-        "bwd_prep_g8_replay_raw",
-        "bwd_prep_g8_noqg_raw",
-        "bwd_prep_g8_noqg_nokb_raw",
-        "glm_intra_raw",
-        "param_finalize",
-    )
+# The deterministic package's records no g-mode cell of this package launches: the sm_107a rows from 16 heads (the
+# only rows of the builds with the L2 hints off) run the S1 pair on every backward path.  Their programs ship as the
+# raw class's (RAW_DQKG).
+DET_RECORDS_NOT_LAUNCHED = frozenset(("dqkg_davq_nohint", "dqkg_int_davq_nohint"))
+# The raw forget-gate mode (``use_gate_in_kernel=True``): the stages whose records come in a ``g`` and a ``raw`` class
+# (a record's ``gate``, ``"g"`` when absent) -- the deterministic package's and the fused gradient, whose S1 records
+# serve the activated gate alone -- and the fused gradient's raw class, record -> the deterministic record it copies
+# (rule, plan and program: raw mode runs the deterministic pair on every row, glm_intra_raw adds no q * dq term).
+GATE_STAGES = frozenset(
+    {"fwd_intra", "bwd_prep", "dqkg", "glm_intra", "gate_epilogue", "param_finalize"}
 )
+GATES = ("g", "raw")
+RAW_DQKG = {
+    "dqkg_raw": "dqkg",
+    "dqkg_int_raw": "dqkg_int",
+    "dqkg_davq_raw": "dqkg_davq",
+    "dqkg_int_davq_raw": "dqkg_int_davq",
+    "dqkg_davq_nohint_raw": "dqkg_davq_nohint",
+    "dqkg_int_davq_nohint_raw": "dqkg_int_davq_nohint",
+}
+# the raw-class fused gradient records that share their program with a g-class record of the same build
+RAW_DQKG_SHARED = ("dqkg_raw", "dqkg_int_raw", "dqkg_davq_raw", "dqkg_int_davq_raw")
 # The checkpoint hand-off's intra twins, intra record -> twin: new programs that also write every gk row and the
 # internal beta (``beta_int``); no path selects them, the hand-off's recompute launches one in place of its record.
 HANDOFF_TWINS = {"fwd_intra": "fwd_intra_v20", "fwd_intra_v14": "fwd_intra_v19"}
@@ -441,9 +447,14 @@ TAPE_WY_RECORDS = frozenset(TAPE_TWINS.values())
 # The logical names of the WY record's parameters the twin does not take: u and the operands only u reads.
 TAPE_WY_DROPPED = frozenset({"v", "beta", "u"})
 # The registry's size: the deterministic package's 75 records, less those, plus the seven S1 records, the hand-off
-# twins and the tape WY twin.
+# twins, the tape WY twin and the fused gradient's raw class.
 MODULE_COUNT = (
-    75 - len(DET_RECORDS_NOT_LAUNCHED) + 7 + len(TWIN_RECORDS) + len(TAPE_WY_RECORDS)
+    75
+    - len(DET_RECORDS_NOT_LAUNCHED)
+    + 7
+    + len(TWIN_RECORDS)
+    + len(TAPE_WY_RECORDS)
+    + len(RAW_DQKG)
 )
 # The records of the segmented adjoint recurrence launch twice per stage (the carry between the passes); the
 # forward recurrence's passes are two stages (fwdh, fwdh_p3).
@@ -558,20 +569,19 @@ def _route_rule(route: str) -> dict:
 
 
 def test_registry_records_are_well_formed() -> None:
-    # the deterministic package's records (their own copies) less the deterministic forms no cell of this package
-    # launches, plus the S1 records, the hand-off twins and the tape WY twin; two library pairs are shared (see the
-    # twins below)
+    # the deterministic package's records (their own copies) less the deterministic forms no g-mode cell of this
+    # package launches, plus the S1 records, the hand-off twins, the tape WY twin and the fused gradient's raw class;
+    # six library pairs are shared (see the twins below)
     assert cake_jit.HANDOFF_TWINS == HANDOFF_TWINS
     assert cake_jit.TAPE_TWINS == TAPE_TWINS
-    assert (
-        set(cake_jit.MODULES)
-        == (set(det_jit.MODULES) - DET_RECORDS_NOT_LAUNCHED)
-        | set(S1_RECORDS)
-        | TWIN_RECORDS
-        | TAPE_WY_RECORDS
+    assert cake_jit.GATE_STAGES == GATE_STAGES and tuple(cake_jit.GATES) == GATES
+    assert set(cake_jit.MODULES) == (
+        set(det_jit.MODULES) - DET_RECORDS_NOT_LAUNCHED
+    ) | set(S1_RECORDS) | TWIN_RECORDS | TAPE_WY_RECORDS | set(RAW_DQKG)
+    assert len(cake_jit.MODULES) == MODULE_COUNT == 89
+    assert len({r["library"] for r in cake_jit.MODULES.values()}) == (
+        MODULE_COUNT - 2 - len(RAW_DQKG_SHARED)
     )
-    assert len(cake_jit.MODULES) == MODULE_COUNT
-    assert len({r["library"] for r in cake_jit.MODULES.values()}) == MODULE_COUNT - 2
     assert set(cake_jit.S1_RECORDS) == S1_RECORDS and len(cake_jit.S1_RECORDS) == 7
     assert tuple(cake_jit.PATHS) == PATHS
     assert tuple(cake_jit.OPTIONAL_STAGES) == OPTIONAL_STAGES
@@ -660,17 +670,30 @@ def test_registry_records_are_well_formed() -> None:
         assert twins == [] or {name, *twins} in (
             {"fwdh_v3", "fwdh_p3"},
             {"wy_bwd", "wy_fwd_rows"},
+            *({raw, RAW_DQKG[raw]} for raw in RAW_DQKG_SHARED),
         ), name
+        # only a gate stage's records name a class
+        assert record.get("gate", "g") in (
+            GATES if record["stage"] in GATE_STAGES else ("g",)
+        ), name
+        assert record["stage"] in GATE_STAGES or "gate" not in record, name
     assert stages == set(cake_jit.STAGES)
     for stage in cake_jit.STAGES:
-        names = cake_jit.records_of_stage(stage)
-        kinds = [cake_jit.MODULES[n]["select_rule"]["kind"] for n in names]
-        if len(names) == 1 and stage in OPTIONAL_STAGES:
-            assert kinds[0] not in ("always", "otherwise"), stage
-        elif len(names) == 1:
-            assert kinds == ["always"], stage
-        else:
-            assert "always" not in kinds and kinds.count("otherwise") <= 1, stage
+        for gate in GATES if stage in GATE_STAGES else ("g",):
+            names = cake_jit.records_of_stage(stage, gate)
+            kinds = [cake_jit.MODULES[n]["select_rule"]["kind"] for n in names]
+            if not names:
+                # only an optional stage leaves a gate class empty (the gate epilogue's raw class, the finalize's g)
+                assert stage in OPTIONAL_STAGES and stage in GATE_STAGES, (stage, gate)
+            elif len(names) == 1 and stage in OPTIONAL_STAGES:
+                assert kinds[0] not in ("always", "otherwise"), (stage, gate)
+            elif len(names) == 1:
+                assert kinds == ["always"], (stage, gate)
+            else:
+                assert "always" not in kinds and kinds.count("otherwise") <= 1, (
+                    stage,
+                    gate,
+                )
     for name in cake_jit.MODULES:
         assert cake_jit.launches(name) == (2 if name in TWO_PASS_RECORDS else 1), name
     # the segmented records read the route (segment_plan's: the head bound, or a plan head of the architecture);
@@ -1091,6 +1114,7 @@ def _expected_records(
         "seg_carry": carry,
         "glm_intra": GATE_FUSED_RECORD[arch] if gate_fused else "glm_intra",
         "gate_epilogue": None if gate_fused else "gate_epilogue",
+        "param_finalize": None,
     }
     if path == "tape":
         out["wy"] = "wy_bwd"
@@ -1241,6 +1265,115 @@ PLAN_GRID = [
     for h in (1, 2, 4, 8, 16, 32, 64)
     for sm in (132, 148, 160, 212)
 ]
+
+
+def test_the_raw_class_is_the_deterministic_raw_class() -> None:
+    """Raw mode is the deterministic package's, record for record: every raw-class record of the registry is the
+    deterministic record of its name (a fused gradient record: of its ``RAW_DQKG`` record, with the class and its own
+    variant) under the copied library, every deterministic raw-class record has its copy, and the gate epilogue keeps
+    the deterministic record's g class."""
+    renamed = {"library", "kernel_symbol"}
+    raw = {name for name, rec in cake_jit.MODULES.items() if rec.get("gate") == "raw"}
+    det_raw = {
+        name for name, rec in det_jit.MODULES.items() if rec.get("gate") == "raw"
+    }
+    assert raw == det_raw | set(RAW_DQKG)
+    assert set(RAW_DQKG.values()) <= {
+        name for name, rec in det_jit.MODULES.items() if rec["stage"] == "dqkg"
+    }
+    for name in sorted(raw | {"gate_epilogue"}):
+        record, twin = cake_jit.MODULES[name], det_jit.MODULES[RAW_DQKG.get(name, name)]
+        assert record["library"] == twin["library"].replace(
+            "cake_kda_det_train_", "cake_kda_train_"
+        ), name
+        assert record["kernel_symbol"] == f"kernel_{record['library']}", name
+        expected = {key: value for key, value in twin.items() if key not in renamed}
+        if name in RAW_DQKG:
+            expected.update(variant=name.removeprefix("dqkg_"), gate="raw")
+        assert {
+            key: value for key, value in record.items() if key not in renamed
+        } == expected, name
+    # no S1 record is of the raw class
+    assert not raw & S1_RECORDS
+    assert cake_jit.MODULES["gate_epilogue"]["gate"] == "g"
+
+
+RAW_PLAN_GRID = [
+    (nc_pad, n, h, sm)
+    for nc_pad in (2, 6, 128, 4096)
+    for n in (1, 3, 300)
+    for h in (1, 2, 4, 8, 16, 32, 64, 128)
+    for sm in (148, 160, 212)
+]
+
+
+def test_raw_mode_selects_the_deterministic_records() -> None:
+    """On every (architecture, path, head count 1..128) cell raw mode selects one record per (stage, gate) class --
+    the deterministic package's raw-mode record of the stage (a fused gradient record: its ``RAW_DQKG`` copy) at the
+    same grid, never an S1 record -- and g mode selects the record it selects without a gate."""
+    for nc_pad, n, h, sm in RAW_PLAN_GRID:
+        for arch in ARCHES:
+            route, _segments, nseg = _expected_segments(n, h, sm, arch)
+            for path in PATHS:
+                if path == "light_states" and route == "serial":
+                    continue
+                for stage in PATH_STAGES[path]:
+                    scalars = {
+                        "num_chunks_pad": nc_pad,
+                        "num_seqs": n,
+                        "num_heads": h,
+                        "sm_count": sm,
+                        "arch": arch,
+                        "path": path,
+                    }
+                    where = (stage, nc_pad, n, h, sm, arch, path)
+                    g = cake_jit.select_record(stage, **scalars)
+                    assert cake_jit.select_record(stage, **scalars, gate="g") == g, (
+                        where
+                    )
+                    name = cake_jit.select_record(stage, **scalars, gate="raw")
+                    det_name = det_jit.select_record(stage, **scalars, gate="raw")
+                    assert RAW_DQKG.get(name, name) == det_name, where
+                    if name is None:
+                        assert stage in OPTIONAL_STAGES, where
+                        continue
+                    assert name not in S1_RECORDS, where
+                    gate = cake_jit.MODULES[name].get("gate", "g")
+                    assert gate == ("raw" if stage in GATE_STAGES else "g"), where
+                    if stage not in GATE_STAGES:
+                        assert name == g, where
+                    for launch in range(cake_jit.launches(name)):
+                        grid = {
+                            "num_chunks_pad": nc_pad,
+                            "num_seqs": n,
+                            "num_heads": h,
+                            "sm_count": sm,
+                            "num_segments": nseg,
+                            "launch": launch,
+                        }
+                        assert cake_jit.launch_grid(name, **grid) == (
+                            det_jit.launch_grid(det_name, **grid)
+                        ), where
+
+
+def test_records_of_stage_filters_the_gate_stages_by_class() -> None:
+    for stage in cake_jit.STAGES:
+        g = cake_jit.records_of_stage(stage)
+        raw = cake_jit.records_of_stage(stage, "raw")
+        assert cake_jit.records_of_stage(stage, "g") == g
+        if stage in GATE_STAGES:
+            assert not set(g) & set(raw), stage
+            assert all(cake_jit.MODULES[n].get("gate", "g") == "g" for n in g), stage
+            assert all(cake_jit.MODULES[n]["gate"] == "raw" for n in raw), stage
+        else:
+            assert g == raw, stage
+    assert set(cake_jit.records_of_stage("dqkg", "raw")) == set(RAW_DQKG)
+    assert cake_jit.records_of_stage("glm_intra", "raw") == ("glm_intra_raw",)
+    assert cake_jit.records_of_stage("param_finalize") == ()
+    assert cake_jit.records_of_stage("param_finalize", "raw") == ("param_finalize",)
+    assert cake_jit.records_of_stage("gate_epilogue", "raw") == ()
+    with pytest.raises(ValueError, match="gate 'activated' is not one of"):
+        cake_jit.records_of_stage("dqkg", "activated")
 
 
 def test_every_stage_selects_the_expected_record_and_grid() -> None:
@@ -3437,16 +3570,17 @@ def test_manifest_is_well_formed(manifest: dict) -> None:
     libraries = manifest["libraries"]
     names = [entry["name"] for entry in libraries]
     # The programs of cake_jit.MODULES, each built for the architectures its record delivers (all three but the
-    # records of RECORD_ARCHES; the two library twins, fwdh_v3 / fwdh_p3 and wy_bwd / wy_fwd_rows, are built once
-    # per architecture); the KCP programs have their own package.
+    # records of RECORD_ARCHES; the library twins, fwdh_v3 / fwdh_p3, wy_bwd / wy_fwd_rows and the four raw-class
+    # fused gradient records with their g-class records, are built once per architecture); the KCP programs have
+    # their own package.
     train_libraries = {
         (record["library"], arch)
         for record in cake_jit.MODULES.values()
         for arch in record["arches"]
     }
-    count = sum(
-        len(RECORD_ARCHES.get(name, ARCHES)) for name in cake_jit.MODULES
-    ) - 2 * len(ARCHES)
+    count = sum(len(RECORD_ARCHES.get(name, ARCHES)) for name in cake_jit.MODULES) - (
+        2 + len(RAW_DQKG_SHARED)
+    ) * len(ARCHES)
     assert len(train_libraries) == count
     assert len(names) == len(set(names)) == count
     for entry in libraries:
@@ -3483,10 +3617,11 @@ def test_copied_programs_are_the_deterministic_packages_sources(
     manifest: dict,
 ) -> None:
     """Every record but the S1 ones, the hand-off twins and the tape WY twin is a copy of the deterministic
-    package's record of the same name: the same digest in its library name (the package prefix aside), stage,
-    launch, operands and grid, and (outside the two pair stages, whose rules route the S1 cells) the same rule and
-    architectures; each of its libraries has the deterministic library's flags and sources, byte for byte once the
-    package name in them is replaced.  The S1 programs and the twins are the only new code."""
+    package's record of the same name (a raw-class fused gradient record: of its ``RAW_DQKG`` record): the same
+    digest in its library name (the package prefix aside), stage, launch, operands and grid, and (outside the
+    g class of the two pair stages, whose rules route the S1 cells) the same rule and architectures; each of its
+    libraries has the deterministic library's flags and sources, byte for byte once the package name in them is
+    replaced.  The S1 programs and the twins are the only new code."""
     det_manifest = _det_manifest_or_skip()
     det_dir = Path(det_jit.__file__).resolve().parent
     ours = {entry["name"]: entry for entry in manifest["libraries"]}
@@ -3495,14 +3630,21 @@ def test_copied_programs_are_the_deterministic_packages_sources(
     for name, record in cake_jit.MODULES.items():
         if name in S1_RECORDS or name in TWIN_RECORDS or name in TAPE_WY_RECORDS:
             continue
-        twin = det_jit.MODULES[name]
+        det_name = RAW_DQKG.get(name, name)
+        twin = det_jit.MODULES[det_name]
         assert record["library"] == twin["library"].replace(
             "cake_kda_det_train_", "cake_kda_train_"
         ), name
-        for key in ("stage", "variant", "ffi_entry", "launch", "arg_plan", "logical"):
+        for key in ("stage", "ffi_entry", "launch", "arg_plan", "logical"):
             assert record[key] == twin[key], (name, key)
+        if name in RAW_DQKG:
+            assert record["variant"] == name.removeprefix("dqkg_"), name
+            assert record["gate"] == "raw" and "gate" not in twin, name
+        else:
+            assert record["variant"] == twin["variant"], name
+            assert record.get("gate") == twin.get("gate"), name
         assert record["grid_rule"] == twin["grid_rule"], name
-        if record["stage"] not in ("dqkg", "glm_intra"):
+        if record["stage"] not in ("dqkg", "glm_intra") or name in RAW_DQKG:
             assert record["select_rule"] == twin["select_rule"], name
             assert list(record["arches"]) == list(twin["arches"]), name
         else:
@@ -3510,7 +3652,7 @@ def test_copied_programs_are_the_deterministic_packages_sources(
             assert set(record["arches"]) <= set(twin["arches"]), name
         for arch in record["arches"]:
             mine = ours[cake_jit.library_name(name, arch)]
-            source = theirs[det_jit.library_name(name, arch)]
+            source = theirs[det_jit.library_name(det_name, arch)]
             for key in ("nvcc_flags", "nvcc_flags_if", "min_cuda", "gencode", "entry"):
                 assert mine[key] == source[key], (name, arch, key)
             assert len(mine["sources"]) == len(source["sources"]) == 2

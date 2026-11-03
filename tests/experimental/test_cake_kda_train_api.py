@@ -801,8 +801,13 @@ def test_the_pairs_agree_on_every_head_count() -> None:
     """Over architecture x path x heads 1..128 (two packings each): the plan's record of every stage is the
     registry's, the only one whose rule admits the problem (or the stage's fallback); on every backward path the
     fused gradient and the GLM intra program are both S1 records or neither, exactly on the cells of the independent
-    table; every record of the pair stages runs on exactly the architectures it ships for."""
+    table; every g-class record of the pair stages runs on architectures it ships for, and every program of the pair
+    stages (the S1 records, the deterministic copies and the raw class, which shares four fused gradient programs
+    with the g class) runs on exactly the architectures it ships for, in g or raw mode, but the raw class's two
+    ``_nohint`` fused gradient programs: copies of the deterministic programs, they ship on the deterministic
+    package's architectures, while their rule (the deterministic one) selects them on sm_107a alone."""
     used: dict[str, set] = {}
+    raw_used: dict[str, set] = {}
     for arch in cake_jit.ARCHES:
         for H in range(1, 129):
             for S, N, sm in SWEEP_ROWS:
@@ -852,6 +857,14 @@ def test_the_pairs_agree_on_every_head_count() -> None:
                                 arch,
                             )
                             used.setdefault(name, set()).add(arch)
+                        raw = (
+                            cake_jit.select_record(stage, **scalars, gate="raw")
+                            if stage in PAIR_STAGES
+                            else None
+                        )
+                        if raw is not None:
+                            assert arch in cake_jit.MODULES[raw]["arches"], (raw, arch)
+                            raw_used.setdefault(raw, set()).add(arch)
                     if "dqkg" not in by_stage:
                         continue
                     s1 = _s1(arch, path, H)
@@ -868,11 +881,32 @@ def test_the_pairs_agree_on_every_head_count() -> None:
         assert set(cake_jit.records_of_stage(stage)) == {
             name for name in used if cake_jit.MODULES[name]["stage"] == stage
         }, stage
-    # every record of the pair stages (the S1 records and the deterministic copies) runs on every architecture it
-    # ships for: no shipped build of these stages is unreachable
-    for stage in PAIR_STAGES:
-        for name in cake_jit.records_of_stage(stage):
-            assert used[name] == set(cake_jit.MODULES[name]["arches"]), name
+        assert set(cake_jit.records_of_stage(stage, "raw")) == {
+            name for name in raw_used if cake_jit.MODULES[name]["stage"] == stage
+        }, stage
+    # every program of the pair stages (the S1 records, the deterministic copies and the raw class) runs on every
+    # architecture it ships for, in one mode or the other: no shipped build of these stages is unreachable but the
+    # deterministic package's own sm_100a / sm_103a builds of its two _nohint fused gradient programs
+    reached = {
+        (cake_jit.MODULES[name]["library"], arch)
+        for runs in (used, raw_used)
+        for name, arches in runs.items()
+        for arch in arches
+    }
+    shipped = {
+        (cake_jit.MODULES[name]["library"], arch)
+        for stage in PAIR_STAGES
+        for gate in ("g", "raw")
+        for name in cake_jit.records_of_stage(stage, gate)
+        for arch in cake_jit.MODULES[name]["arches"]
+    }
+    nohint = {
+        (cake_jit.MODULES[name]["library"], arch)
+        for name in ("dqkg_davq_nohint_raw", "dqkg_int_davq_nohint_raw")
+        for arch in ("sm_100a", "sm_103a")
+    }
+    assert nohint <= shipped and not nohint & reached
+    assert reached == shipped - nohint
 
 
 def test_the_plan_refuses_a_mixed_pair(monkeypatch) -> None:
