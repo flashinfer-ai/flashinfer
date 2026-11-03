@@ -450,6 +450,17 @@ def _check_cached_qkv_data_type(
         )
 
 
+def _record_mutated_args(mutates_args: Union[str, Iterable[str]]) -> Callable:
+    # Keep custom-op registration a no-op; logging only needs the declaration.
+    names = (mutates_args,) if isinstance(mutates_args, str) else tuple(mutates_args)
+
+    def decorate(fn: Callable) -> Callable:
+        fn.__dict__["_flashinfer_mutates_args"] = names
+        return fn
+
+    return decorate
+
+
 if TorchVersion(torch_version) < TorchVersion("2.4"):
 
     def register_custom_op(
@@ -461,7 +472,7 @@ if TorchVersion(torch_version) < TorchVersion("2.4"):
         device_types: Optional[Union[str, Sequence[str]]] = None,
         schema: Optional[str] = None,
     ) -> Callable:
-        return lambda x: x
+        return _record_mutated_args(mutates_args)
 
     def register_fake_op(
         name: str,
@@ -490,7 +501,7 @@ else:
         #     device_types=device_types,
         #     schema=schema,
         # )
-        return lambda x: x
+        return _record_mutated_args(mutates_args)
 
     def register_fake_op(
         name: str,
