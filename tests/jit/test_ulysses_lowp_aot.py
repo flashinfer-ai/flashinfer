@@ -86,6 +86,7 @@ def test_ulysses_lowp_aot_inventory(
 @pytest.mark.parametrize(
     ("arches", "expected"),
     [
+        (set(), {"89"}),  # Retry empty import-time device detection.
         ({(8, "9")}, {"89"}),
         ({(12, "0a")}, {"120a"}),
         ({(12, "0f")}, {"120a"}),
@@ -94,9 +95,15 @@ def test_ulysses_lowp_aot_inventory(
     ],
 )
 def test_ulysses_lowp_compilation_targets(monkeypatch, arches, expected):
-    from flashinfer.jit import comm
+    from flashinfer.jit import comm, core
 
     monkeypatch.setattr(comm.current_compilation_context, "TARGET_CUDA_ARCHS", arches)
+    if not arches:
+        monkeypatch.setattr(
+            core,
+            "CompilationContext",
+            lambda: SimpleNamespace(TARGET_CUDA_ARCHS={(8, "9")}),
+        )
     # Exercise the real generator: inventory mocks cannot detect extra cubins
     # in an architecture-specific provider. SM120 must retain its golden 120a
     # target even when the compilation context normalizes it to 120f.

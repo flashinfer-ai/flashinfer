@@ -319,8 +319,10 @@ def gen_ulysses_lowp_module() -> JitSpec:
     # source file covers both architectures. Only emit requested targets:
     # each AOT provider must contain binaries compatible with its own arch.
     # A multi-device JIT context may still request both architectures.
-    from .core import sm89_nvcc_flags, sm120a_nvcc_flags
+    from .core import check_cuda_arch, sm89_nvcc_flags, sm120a_nvcc_flags
 
+    # Preserve gen_jit_spec's retry when import-time device detection was empty.
+    check_cuda_arch()
     targets = current_compilation_context.TARGET_CUDA_ARCHS
     nvcc_flags = []
     if (8, "9") in targets:
