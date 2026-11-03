@@ -233,9 +233,9 @@ TABLE_NAMES = (
 COLLECTIVES = ("c1", "c2", "b1", "b2", "halo_fwd", "halo_bwd")
 TILE_B = 0  # half 0 of a c1 summary tile [2][128][128]: the offset B_f
 TILE_M = 1  # half 1: the transposed map M_f^T
-TILE_D = 0  # half 0 of a b1 pair tile [2][128][128]: the adjoint offset d_f (half 1 = the re-sent M_f^T, TILE_M)
-TILE_STRIDE_PLANE = 1  # kernel argument tile_stride: dense plane (c2 S_in, b2 dS_out, b1 offsets-only, carry, the P > 1 staging planes)
-TILE_STRIDE_PAIR = 2  # interleaved pair (c1 [B_f | M_f^T], b1 [d_f | M_f^T] with maps)
+TILE_D = 0  # the adjoint offset d_f opens each b1 owner block (the b1 buffers are dense planes; kept for the ABI names)
+TILE_STRIDE_PLANE = 1  # kernel argument tile_stride: dense plane (c2 S_in, b2 dS_out, both b1 forms, carry, the P > 1 staging planes)
+TILE_STRIDE_PAIR = 2  # interleaved pair (c1 [B_f | M_f^T])
 SUMMARY_TILE = 2 * TILE  # elements of one c1 summary tile of one head
 FLAG_CROSSING_IN = 1
 FLAG_CROSSING_OUT = 2
@@ -1457,19 +1457,24 @@ class KcpHeadPlan:
     addressing ``((h // Hg) * n + slot) * Hg + h % Hg`` is exact for every ``HV``; the padding is counted in that
     owner's splits, never read, and reported in ``pad_numel`` (elements per split; all zero for ``HV = 64``).
     ``full_groups`` (= no padding anywhere) and the explicit per-head tile tables are validation aids, not kernel ABI.
-    Buffer forms (the kernels' ``tile_stride`` argument per buffer is ``tile_stride``): c1 and the b1 buffer
-    with maps are interleaved PAIRS per ``(slot, head)`` — ``[B_f | M_f^T]`` (``TILE_B`` / ``TILE_M``) and
-    ``[d_f | M_f^T]`` (``TILE_D`` / ``TILE_M``; the ``M`` half of a document's last fragment is never written or
-    read); c2 (``S_in``), b2 (``dS_out``) and the offsets-only b1 buffer are dense planes.  Sender-side layout
-    ``[dst owner j][slot][hg < Hg]`` (pairs: ``[2][128][128]`` each), owner-side ``[src rank i][slot][hg]``.  Split
-    sizes are per peer rank in elements (FP32) of the flattened buffers; the buffer sizes are their sums (``numel``).
+    Buffer forms (the kernels' ``tile_stride`` argument per buffer is ``tile_stride``): c1 is interleaved PAIRS
+    per ``(slot, head)`` — ``[B_f | M_f^T]`` (``TILE_B`` / ``TILE_M``); c2 (``S_in``), b2 (``dS_out``) and both b1
+    forms are dense planes.  Sender-side layout ``[dst owner j][slot][hg < Hg]`` (pairs: ``[2][128][128]`` each),
+    owner-side ``[src rank i][slot][hg]``; the b1 buffer with maps holds per owner block the ``d_f`` plane of the
+    ``n_in`` crossing-in slots, then the ``M_f^T`` plane of the ``n_io`` maps that travel: ``[dst owner j][d: in_slot |
+    M: io_slot][hg]`` (owner side ``[src rank i][d: in_slot | M: io_slot][hg]``), where ``io_slot`` numbers the
+    rank's fragments that cross in AND out (``b1_m_index``; ``n_io_by_rank``) -- a document's last fragment has no
+    map to send, so every element of the b1 split is written.  Split sizes are per peer rank in elements (FP32) of
+    the flattened buffers; the buffer sizes are their sums (``numel``).
     Tile tables (units of ``TILE`` unless noted): ``out_tile[out_slot][h]`` (c1 send, units of ``SUMMARY_TILE``),
     ``h0_tile[in_slot][h]`` (``S_in`` = c2 receive), ``dht_tile[out_slot][h]`` (``dS_out`` = b2 receive),
-    ``b1_d_tile_d[in_slot][h]`` (offsets-only b1 send), ``b1_d_tile_dm[in_slot][h]`` / ``b1_m_tile_dm[in_slot][h]``
-    (the ``d_f`` and ``M_f^T`` halves of the b1 pair of a crossing-in fragment: ``2 * pair + TILE_D`` / ``+ TILE_M``).
+    ``b1_d_tile_d[in_slot][h]`` (offsets-only b1 send), ``b1_d_tile_dm[in_slot][h]`` / ``b1_m_tile_dm[io_slot][h]``
+    (the ``d_f`` tile of a crossing-in fragment and the ``M_f^T`` tile of a crossing-in-and-out fragment in the b1
+    buffer with maps).
     Segment tables of K1 / K2 / K3
     (``NSEG`` entries, segment ``p`` of fragment ``f`` is ``f * P + p``): ``h0_index`` (slot in ``S_in`` of segment 0
-    of a crossing-in fragment, else ``-1``), ``carry_index`` (slot in the forward carry buffer of segments ``>= 1``,
+    of a crossing-in fragment, else ``-1``), ``b1_m_index`` (``io_slot`` in the b1 map plane of segment 0 of a
+    fragment crossing in and out, else ``-1``), ``carry_index`` (slot in the forward carry buffer of segments ``>= 1``,
     ``f * (P - 1) + p - 1``, else ``-1``), ``dht_index`` / ``dcarry_index`` (the adjoint mirrors: last segment of a
     crossing-out fragment -> ``dS_out`` slot; segments ``< P - 1`` -> adjoint carry slot), ``out_index`` (``P = 1``:
     the c1 send element of a crossing-out fragment, else ``-1``; ``P > 1``: the staging slot ``= segment``),
@@ -1485,10 +1490,10 @@ class KcpHeadPlan:
     per element the element offsets (hg 0) of ``M^T`` and ``B`` in the c1 receive buffer (``fwd_m_off`` /
     ``fwd_b_off``) and of the produced ``S_in`` in the c2 send buffer (``fwd_out_off``); adjoint chains (document end
     -> start) with ``adj_d_off_d`` / ``adj_d_off_dm`` (``d_f`` in the b1 receive buffer without / with the re-sent
-    maps), ``adj_m_off_b1`` (``M^T`` in the b1 pair; ``-1`` for the document's last fragment, whose map is never
+    maps), ``adj_m_off_b1`` (``M^T`` in the b1 map plane; ``-1`` for the document's last fragment, whose map is never
     sent), ``adj_m_off_c1`` (``M^T`` in the c1 receive buffer: replay mode or ``save_transfer``) and ``adj_out_off``
     (``dS_out`` of the predecessor in the b2 send buffer).  ``hg_stride[table]`` is the element stride between
-    consecutive heads of each offset table (``SUMMARY_TILE`` in the pair buffers, ``TILE`` in the planes).  Every
+    consecutive heads of each offset table (``SUMMARY_TILE`` in the c1 pairs, ``TILE`` in the planes).  Every
     offset is ``-1`` or a non-negative multiple of 4 floats (checked here, before any launch).
     ``device_tables`` holds the int32 / int64 device copies of the tables the kernels read."""
 
@@ -1522,6 +1527,8 @@ class KcpHeadPlan:
     b1_d_tile_d: tuple[tuple[int, ...], ...]
     b1_d_tile_dm: tuple[tuple[int, ...], ...]
     b1_m_tile_dm: tuple[tuple[int, ...], ...]
+    b1_m_index: tuple[int, ...]
+    n_io_by_rank: tuple[int, ...]
     splits: dict[str, tuple[int, ...]]
     numel: dict[str, int]
     fwd_chain_doc: tuple[int, ...]
@@ -1604,10 +1611,25 @@ def _build_head_plan(
     pad_tiles = n_owners * Hg - HV
     n_in_by, n_out_by = ctx.n_in_by_rank, ctx.n_out_by_rank
     n_in, n_out = n_in_by[r], n_out_by[r]
+    # io_slot: the fragments of a rank that cross in AND out, in local order (their maps M_f travel on b1 with maps;
+    # a document's last fragment crosses in only and has no map to send)
+    io_slot_all = []
+    for rank_frs in part.fragments:
+        ios, k = [], 0
+        for f in rank_frs:
+            if f.crossing_in and f.crossing_out:
+                ios.append(k)
+                k += 1
+            else:
+                ios.append(-1)
+        io_slot_all.append(tuple(ios))
+    n_io_by = tuple(sum(1 for x in ios if x >= 0) for ios in io_slot_all)
+    n_io = n_io_by[r]
 
     # -- split sizes (elements) per peer: sender side [dst owner j][slot][hg < Hg_pad_j], owner side
-    # [src rank i][slot][hg].  c1 and b1-with-maps are interleaved pairs (SUMMARY_TILE per (slot, head));
-    # c2, b2 and the offsets-only b1 are dense planes (TILE).
+    # [src rank i][slot][hg].  c1 is interleaved pairs (SUMMARY_TILE per (slot, head)); c2, b2 and both b1 forms
+    # are dense planes (TILE); b1 with maps = the d_f plane of the n_in crossing-in slots + the M_f^T plane of the
+    # n_io slots whose map travels, per owner block.
     def _split_sizes(hg_owner, hg_self):
         return {
             "c1_send": tuple(n_out * hg_owner[j] * SUMMARY_TILE for j in range(W)),
@@ -1616,8 +1638,10 @@ def _build_head_plan(
             "c2_recv": tuple(n_in * hg_owner[j] * TILE for j in range(W)),
             "b1_send_d": tuple(n_in * hg_owner[j] * TILE for j in range(W)),
             "b1_recv_d": tuple(n_in_by[i] * hg_self * TILE for i in range(W)),
-            "b1_send_dm": tuple(n_in * hg_owner[j] * SUMMARY_TILE for j in range(W)),
-            "b1_recv_dm": tuple(n_in_by[i] * hg_self * SUMMARY_TILE for i in range(W)),
+            "b1_send_dm": tuple((n_in + n_io) * hg_owner[j] * TILE for j in range(W)),
+            "b1_recv_dm": tuple(
+                (n_in_by[i] + n_io_by[i]) * hg_self * TILE for i in range(W)
+            ),
             "b2_send": tuple(n_out_by[i] * hg_self * TILE for i in range(W)),
             "b2_recv": tuple(n_out * hg_owner[j] * TILE for j in range(W)),
         }
@@ -1650,11 +1674,17 @@ def _build_head_plan(
         j, hg = h // Hg, h % Hg
         return bases["b1_send_d"][j] // TILE + in_slot * Hg + hg
 
-    def b1_send_pair(
+    def b1_send_dm_tile(
         in_slot: int, h: int
-    ) -> int:  # units of SUMMARY_TILE, the b1 send pairs [d_f | M_f^T]
+    ) -> int:  # units of TILE, the d_f plane of the b1 send buffer with maps
         j, hg = h // Hg, h % Hg
-        return bases["b1_send_dm"][j] // SUMMARY_TILE + in_slot * Hg + hg
+        return bases["b1_send_dm"][j] // TILE + in_slot * Hg + hg
+
+    def b1_send_m_tile(
+        io_slot: int, h: int
+    ) -> int:  # units of TILE, the M_f^T plane behind the d_f plane of the owner block
+        j, hg = h // Hg, h % Hg
+        return bases["b1_send_dm"][j] // TILE + (n_in + io_slot) * Hg + hg
 
     # owner side: element offsets at hg 0 of the chain tables (used only when Hg_r > 0, where Hg_pad_r == Hg)
     def c1_recv_elem(src: int, out_slot: int) -> int:
@@ -1666,8 +1696,11 @@ def _build_head_plan(
     def b1_recv_d_elem(src: int, in_slot: int) -> int:
         return bases["b1_recv_d"][src] + in_slot * Hg * TILE
 
-    def b1_recv_pair_elem(src: int, in_slot: int) -> int:
-        return bases["b1_recv_dm"][src] + in_slot * Hg * SUMMARY_TILE
+    def b1_recv_dm_elem(src: int, in_slot: int) -> int:
+        return bases["b1_recv_dm"][src] + in_slot * Hg * TILE
+
+    def b1_recv_m_elem(src: int, io_slot: int) -> int:
+        return bases["b1_recv_dm"][src] + (n_in_by[src] + io_slot) * Hg * TILE
 
     def b2_send_elem(dst: int, out_slot: int) -> int:
         return bases["b2_send"][dst] + out_slot * Hg * TILE
@@ -1694,14 +1727,15 @@ def _build_head_plan(
         if f.crossing_in
     )
     b1_d_tile_dm = tuple(
-        tuple(2 * b1_send_pair(ctx.in_slot[f.slot], h) + TILE_D for h in range(HV))
+        tuple(b1_send_dm_tile(ctx.in_slot[f.slot], h) for h in range(HV))
         for f in mine
         if f.crossing_in
     )
+    io_slot = io_slot_all[r]
     b1_m_tile_dm = tuple(
-        tuple(2 * b1_send_pair(ctx.in_slot[f.slot], h) + TILE_M for h in range(HV))
+        tuple(b1_send_m_tile(io_slot[f.slot], h) for h in range(HV))
         for f in mine
-        if f.crossing_in
+        if io_slot[f.slot] >= 0
     )
 
     # -- segment plan and the K1 / K2 / K3 segment index tables
@@ -1733,10 +1767,12 @@ def _build_head_plan(
         [],
         [],
     )
+    b1_m_index = []
     for f in mine:
         for p in range(P):
             s = f.slot * P + p
             h0_index.append(ctx.in_slot[f.slot] if (p == 0 and f.crossing_in) else -1)
+            b1_m_index.append(io_slot[f.slot] if p == 0 else -1)
             carry_index.append(f.slot * (P - 1) + p - 1 if p >= 1 else -1)
             dht_index.append(
                 ctx.out_slot[f.slot] if (p == P - 1 and f.crossing_out) else -1
@@ -1801,11 +1837,11 @@ def _build_head_plan(
                 e, pred = frs[i], frs[i - 1]
                 in_s = ctx.in_slot_all[e.rank][e.slot]
                 adj_dd.append(b1_recv_d_elem(e.rank, in_s))
-                pair = b1_recv_pair_elem(e.rank, in_s)
-                adj_ddm.append(pair + TILE_D * TILE)
+                adj_ddm.append(b1_recv_dm_elem(e.rank, in_s))
                 if e.crossing_out:
                     out_s = ctx.out_slot_all[e.rank][e.slot]
-                    adj_mb1.append(pair + TILE_M * TILE)
+                    io_s = io_slot_all[e.rank][e.slot]
+                    adj_mb1.append(b1_recv_m_elem(e.rank, io_s))
                     adj_mc1.append(c1_recv_elem(e.rank, out_s) + TILE_M * TILE)
                 else:
                     adj_mb1.append(-1)
@@ -1832,8 +1868,8 @@ def _build_head_plan(
         "fwd_b_off": SUMMARY_TILE,
         "fwd_out_off": TILE,
         "adj_d_off_d": TILE,
-        "adj_d_off_dm": SUMMARY_TILE,
-        "adj_m_off_b1": SUMMARY_TILE,
+        "adj_d_off_dm": TILE,
+        "adj_m_off_b1": TILE,
         "adj_m_off_c1": SUMMARY_TILE,
         "adj_out_off": TILE,
     }
@@ -1841,7 +1877,7 @@ def _build_head_plan(
         "c1": TILE_STRIDE_PAIR,
         "c2": TILE_STRIDE_PLANE,
         "b1_d": TILE_STRIDE_PLANE,
-        "b1_dm": TILE_STRIDE_PAIR,
+        "b1_dm": TILE_STRIDE_PLANE,
         "b2": TILE_STRIDE_PLANE,
         "staging": TILE_STRIDE_PLANE,
         "carry": TILE_STRIDE_PLANE,
@@ -1870,6 +1906,7 @@ def _build_head_plan(
         {
             "seg_chunk_start": (seg_table, i32, None),
             "h0_index": (h0_index, i32, None),
+            "b1_m_index": (b1_m_index, i32, None),
             "carry_index": (carry_index, i32, None),
             "dht_index": (dht_index, i32, None),
             "dcarry_index": (dcarry_index, i32, None),
@@ -1926,6 +1963,8 @@ def _build_head_plan(
         b1_d_tile_d=b1_d_tile_d,
         b1_d_tile_dm=b1_d_tile_dm,
         b1_m_tile_dm=b1_m_tile_dm,
+        b1_m_index=tuple(b1_m_index),
+        n_io_by_rank=n_io_by,
         splits=splits,
         numel=numel,
         fwd_chain_doc=tuple(fwd_doc),

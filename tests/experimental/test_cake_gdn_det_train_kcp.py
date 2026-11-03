@@ -206,6 +206,35 @@ def _context_record(ctx, HV: int) -> dict:
     return rec
 
 
+# The b1 buffer with re-sent maps is this package's own compact layout (the d_f plane of the crossing-in slots, then
+# the maps of the fragments crossing in and out); the KDA module keeps one [d_f | M_f^T] pair per crossing-in slot,
+# whose map half of a document's last fragment is never written.  The parity record leaves that buffer out.
+B1_DM_FIELDS = (
+    "b1_d_tile_dm",
+    "b1_m_tile_dm",
+    "b1_m_index",
+    "n_io_by_rank",
+    "adj_d_off_dm",
+    "adj_m_off_b1",
+)
+B1_DM_KEYS = (*B1_DM_FIELDS, "b1_send_dm", "b1_recv_dm", "b1_dm")
+
+
+def _drop_b1_dm(rec: dict) -> dict:
+    """``rec`` (a :func:`_context_record`) without the fields and table keys of the b1 buffer with maps."""
+    for heads in (rec["heads"], rec["describe"].get("heads", {})):
+        for name in B1_DM_FIELDS:
+            heads.pop(name, None)
+        for table in ("splits", "numel", "pad_numel", "hg_stride", "tile_stride"):
+            if isinstance(heads.get(table), dict):
+                for key in B1_DM_KEYS:
+                    heads[table].pop(key, None)
+        if isinstance(heads.get("device_tables"), dict):
+            for key in B1_DM_KEYS:
+                heads["device_tables"].pop(key, None)
+    return rec
+
+
 def _sha(obj) -> str:
     return hashlib.sha256(json.dumps(obj, sort_keys=True).encode()).hexdigest()
 
@@ -260,12 +289,27 @@ def test_plan_parity_with_kda_on_rows(path, monkeypatch) -> None:
             sm_count=SM_COUNT,
             _kcp_test_knobs={"p_rule": "wave_fill1"},
         )
-        mine, theirs = _context_record(ctx, HV), _rename_h(_context_record(kctx, HV))
+        mine = _drop_b1_dm(_context_record(ctx, HV))
+        theirs = _drop_b1_dm(_rename_h(_context_record(kctx, HV)))
         records.append(mine)
         assert mine == theirs, (
             f"rank {r}: context / head plan differ from the KDA module (HV={HV})"
         )
         assert (ctx.n_in, ctx.n_out) == (n_in[r], n_out[r])
+        # the b1 buffer with maps: every send tile written once (d_f tiles + the maps of the fragments crossing in
+        # and out), the owner offsets inside the receive buffer
+        hp = ctx.heads(HV)
+        n_io = sum(1 for f in part.fragments[r] if f.crossing_in and f.crossing_out)
+        dm_tiles = sorted(
+            t
+            for rows in (hp.b1_d_tile_dm, hp.b1_m_tile_dm)
+            for row in rows
+            for t in row
+        )
+        assert dm_tiles == list(range(sum(hp.splits["b1_send_dm"]) // gp.TILE))
+        assert len(hp.b1_m_tile_dm) == hp.n_io_by_rank[r] == n_io
+        assert all(0 <= o < hp.numel["b1_recv_dm"] for o in hp.adj_d_off_dm)
+        assert all(o == -1 or 0 <= o < hp.numel["b1_recv_dm"] for o in hp.adj_m_off_b1)
         cb = gb.gdn_det_comm_bytes_kcp(ctx, H_qk=H_qk, HV=HV, C=C_CONV)
         entry = {
             "rank": r,
@@ -1271,22 +1315,39 @@ def test_byte_queries(W) -> None:
             ctx, H_qk=H_qk, HV=HV, C=C_CONV, save_transfer=False
         )
         s_owner = hp.Hg_r * gp.STATE_TILE_BYTES
-        # lower-bound form ("b1_design"): b1_send = s n_in + s n_out [not save_transfer]; owner
-        # b1_recv in d / m halves
-        assert maps["b1_design"]["send"] == s * (ctx.n_in + ctx.n_out)
-        assert maps["b1_design"]["recv"] == (ctx.N_in + ctx.N_out) * s_owner
+        # "b1_design": b1_send = s n_in + s n_io [not save_transfer] (n_io = fragments crossing in AND
+        # out: the maps the owner's adjoint chain reads; a document's last fragment sends none); owner
+        # b1_recv in d / m planes
+        n_io = sum(1 for f in part.fragments[r] if f.crossing_in and f.crossing_out)
+        N_io = sum(
+            1 for frs in part.fragments for f in frs if f.crossing_in and f.crossing_out
+        )
+        assert hp.n_io_by_rank[r] == n_io and sum(hp.n_io_by_rank) == N_io
+        assert maps["b1_design"]["send"] == s * (ctx.n_in + n_io)
+        assert maps["b1_design"]["recv"] == (ctx.N_in + N_io) * s_owner
         assert (
             maps["b1_d"] == cb["b1"] == cb["b1_replay"] == cb["b1_design"] == cb["b1_d"]
         )
-        assert maps["b1_m"] == {"send": s * ctx.n_out, "recv": ctx.N_out * s_owner}
+        assert maps["b1_m"] == {"send": s * n_io, "recv": N_io * s_owner}
         assert cb["b1_m"] == {"send": 0, "recv": 0}
         assert maps["B3"] == cb["B3"]  # the replay never re-sends maps
-        # "b1" = the plan's split tables: the re-sent maps are paired with the crossing-IN slots (2 s per
-        # crossing-in fragment); they differ from the design form per rank, the rank sums agree
+        # "b1" = the plan's split tables = the design form (no padding at (6, W)): the d_f plane of the
+        # crossing-in slots + the map plane of the fragments crossing in and out
+        assert maps["b1"] == maps["b1_design"]
         assert maps["b1"] == {
-            "send": 2 * s * ctx.n_in,
-            "recv": 2 * ctx.N_in * s_owner,
+            "send": s * (ctx.n_in + n_io),
+            "recv": (ctx.N_in + N_io) * s_owner,
         }
+        # every tile of the b1 send buffer with maps is written: the d_f tiles and the M_f^T tiles cover
+        # it exactly once (no never-written element reaches the collective)
+        dm_tiles = [
+            t
+            for rows in (hp.b1_d_tile_dm, hp.b1_m_tile_dm)
+            for row in rows
+            for t in row
+        ]
+        assert sorted(dm_tiles) == list(range(sum(hp.splits["b1_send_dm"]) // gp.TILE))
+        assert len(hp.b1_m_tile_dm) == n_io and len(hp.b1_d_tile_dm) == ctx.n_in
         assert cb["padding"]["b1"] == {
             "send": hp.pad_numel["b1_send_d"] * 4,
             "recv": hp.pad_numel["b1_recv_d"] * 4,
