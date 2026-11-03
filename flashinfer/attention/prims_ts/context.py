@@ -67,7 +67,6 @@ from .decode import (
     prepare_lse,
     validate_lse_mode,
     validate_attention_sinks,
-    _validate_scale,
     _validate_layout as _validate_kv_layout,
 )
 
@@ -95,6 +94,7 @@ if TYPE_CHECKING:
 _COMPILE_OPTIONS = "--enable-tvm-ffi --opt-level 3"
 _SUPPORTED_HEAD_DIMS = (128, 192, 256)
 _DEFAULT_PAGED_KV_PAGE_SIZE = 32
+_MAX_CONTEXT_SOFTMAX_SCALE = torch.finfo(torch.float32).max / math.log2(math.e)
 _SUPPORTED_PAGED_KV_PAGE_SIZES = (4, 8, 16, 32, 64, 128)
 _SUPPORTED_DTYPES = (
     torch.float16,
@@ -192,7 +192,6 @@ class _ContextPlanState:
 
     geometry: _ContextPlanGeometry
     softmax_scale: GlobalScale
-    scale_softmax_log2: GlobalScale
     output_scale: GlobalScale
     empty_i32: torch.Tensor
     variable_window_padded_starts: Optional[torch.Tensor]
@@ -238,7 +237,6 @@ class _PagedContextPlanState:
 
     geometry: _PagedContextPlanGeometry
     softmax_scale: GlobalScale
-    scale_softmax_log2: GlobalScale
     output_scale: GlobalScale
     compiled: Callable[..., None]
     policy: tuple[tuple[str, object], ...]
@@ -2126,7 +2124,7 @@ def _get_compiled_context(
         out: cute.Tensor,
         lse: cute.Tensor | None,
         attention_sinks: cute.Tensor | None,
-        scale_softmax_log2: cutlass.Float32 | cute.Tensor,
+        softmax_scale: cutlass.Float32 | cute.Tensor,
         output_scale: cutlass.Float32 | cute.Tensor,
         qo_indptr: cute.Tensor,
         kv_indptr: cute.Tensor,
@@ -2154,7 +2152,7 @@ def _get_compiled_context(
                 k,
                 v,
                 out,
-                scale_softmax_log2,
+                softmax_scale,
                 output_scale,
                 static_max_active_clusters,
                 stream,
@@ -2178,7 +2176,7 @@ def _get_compiled_context(
                 k,
                 v,
                 out,
-                scale_softmax_log2,
+                softmax_scale,
                 output_scale,
                 static_max_active_clusters,
                 stream,
@@ -2483,7 +2481,7 @@ def _get_compiled_paged_context(
         out: cute.Tensor,
         lse: cute.Tensor | None,
         attention_sinks: cute.Tensor | None,
-        scale_softmax_log2: cutlass.Float32 | cute.Tensor,
+        softmax_scale: cutlass.Float32 | cute.Tensor,
         output_scale: cutlass.Float32 | cute.Tensor,
         qo_indptr: cute.Tensor,
         block_tables: cute.Tensor,
@@ -2498,7 +2496,7 @@ def _get_compiled_paged_context(
             k_cache,
             v_cache,
             out,
-            scale_softmax_log2,
+            softmax_scale,
             output_scale,
             static_max_active_clusters,
             stream,
@@ -2965,11 +2963,12 @@ def _variable_window_buffers(geometry, empty_i32):
     return padded_starts, cta_starts
 
 
-def _context_softmax_operand(scale: GlobalScale) -> GlobalScale:
-    """Preserve host FP32 conversion; device scalars convert inside the kernel."""
-    if isinstance(scale, torch.Tensor):
-        return scale
-    return _validate_scale(scale * math.log2(math.e), "softmax_scale * log2(e)")
+def _validate_context_softmax_scale(scale: GlobalScale) -> None:
+    """Keep normalized host scales representable after the log2 conversion."""
+    if not isinstance(scale, torch.Tensor) and scale > _MAX_CONTEXT_SOFTMAX_SCALE:
+        raise ValueError(
+            "softmax_scale * log2(e) must be representable as a positive float32"
+        )
 
 
 class BatchPrefillTSWrapper:
@@ -3104,7 +3103,7 @@ class BatchPrefillTSWrapper:
             softmax_scale = geometry.head_dim**-0.5
         softmax_scale = normalize_scale(softmax_scale, "softmax_scale", geometry.device)
         output_scale = normalize_scale(output_scale, "output_scale", geometry.device)
-        scale_softmax_log2 = _context_softmax_operand(softmax_scale)
+        _validate_context_softmax_scale(softmax_scale)
         vc_output_scale_buffer = (
             torch.empty(
                 (
@@ -3153,7 +3152,6 @@ class BatchPrefillTSWrapper:
         self._plan_state = _ContextPlanState(
             geometry=geometry,
             softmax_scale=softmax_scale,
-            scale_softmax_log2=scale_softmax_log2,
             output_scale=output_scale,
             empty_i32=empty_i32,
             variable_window_padded_starts=variable_window_padded_starts,
@@ -3376,15 +3374,13 @@ class BatchPrefillTSWrapper:
             runtime_window_starts = state.empty_i32
             runtime_window_ends = state.empty_i32
             runtime_window_cta_starts = state.empty_i32
-        scale_softmax_log2 = (
-            state.scale_softmax_log2
-            if softmax_scale is None
-            else _context_softmax_operand(
-                resolve_scale(
-                    softmax_scale, state.softmax_scale, "softmax_scale", geometry.device
-                )
+        if softmax_scale is None:
+            softmax_scale = state.softmax_scale
+        else:
+            softmax_scale = resolve_scale(
+                softmax_scale, state.softmax_scale, "softmax_scale", geometry.device
             )
-        )
+            _validate_context_softmax_scale(softmax_scale)
         output_scale = resolve_scale(
             output_scale, state.output_scale, "output_scale", geometry.device
         )
@@ -3433,7 +3429,7 @@ class BatchPrefillTSWrapper:
             out,
             lse,
             attention_sinks,
-            scale_softmax_log2,
+            softmax_scale,
             output_scale,
             runtime_qo_indptr,
             runtime_kv_indptr,
@@ -3547,7 +3543,7 @@ class BatchPrefillPagedTSWrapper:
             softmax_scale = geometry.head_dim**-0.5
         softmax_scale = normalize_scale(softmax_scale, "softmax_scale", geometry.device)
         output_scale = normalize_scale(output_scale, "output_scale", geometry.device)
-        scale_softmax_log2 = _context_softmax_operand(softmax_scale)
+        _validate_context_softmax_scale(softmax_scale)
         compiled, policy = _get_compiled_paged_context(
             _paged_context_compile_spec(
                 geometry,
@@ -3565,7 +3561,6 @@ class BatchPrefillPagedTSWrapper:
         self._plan_state = _PagedContextPlanState(
             geometry=geometry,
             softmax_scale=softmax_scale,
-            scale_softmax_log2=scale_softmax_log2,
             output_scale=output_scale,
             compiled=compiled,
             policy=policy,
@@ -3671,15 +3666,13 @@ class BatchPrefillPagedTSWrapper:
                 max_q_len = geometry.max_q_len
             if max_kv_len is None:
                 max_kv_len = geometry.max_kv_len
-        scale_softmax_log2 = (
-            state.scale_softmax_log2
-            if softmax_scale is None
-            else _context_softmax_operand(
-                resolve_scale(
-                    softmax_scale, state.softmax_scale, "softmax_scale", geometry.device
-                )
+        if softmax_scale is None:
+            softmax_scale = state.softmax_scale
+        else:
+            softmax_scale = resolve_scale(
+                softmax_scale, state.softmax_scale, "softmax_scale", geometry.device
             )
-        )
+            _validate_context_softmax_scale(softmax_scale)
         output_scale = resolve_scale(
             output_scale, state.output_scale, "output_scale", geometry.device
         )
@@ -3708,7 +3701,7 @@ class BatchPrefillPagedTSWrapper:
             out,
             lse,
             attention_sinks,
-            scale_softmax_log2,
+            softmax_scale,
             output_scale,
             qo_indptr,
             block_tables,

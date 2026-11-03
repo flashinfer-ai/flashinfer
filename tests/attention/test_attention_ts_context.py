@@ -1295,7 +1295,6 @@ def test_attention_ts_context_rejects_cta_starts_for_non_variable_mask() -> None
             packed_query=False, mask_type="dense", vc=None, qk_dtype=torch.bfloat16
         ),
         softmax_scale=torch.empty(1),
-        scale_softmax_log2=torch.empty(1),
         output_scale=torch.empty(1),
         empty_i32=empty_i32,
         variable_window_padded_starts=None,
@@ -1338,7 +1337,6 @@ def test_attention_ts_context_paged_run_rejects_non_bool_validate() -> None:
     wrapper._plan_state = context_module._PagedContextPlanState(
         geometry=SimpleNamespace(device=torch.device("cpu"), out_dtype=torch.float32),
         softmax_scale=torch.empty(1),
-        scale_softmax_log2=torch.empty(1),
         output_scale=torch.empty(1),
         compiled=lambda *_: None,
         policy=(),

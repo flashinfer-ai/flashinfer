@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Copyright (c) 2026 by FlashInfer team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -3362,7 +3363,7 @@ class FmhaTs:
         k_cute: cute.Tensor,
         v_cute: cute.Tensor,
         o_cute: cute.Tensor,
-        scale_softmax_log2: Float32 | cute.Tensor,
+        scale_softmax: Float32 | cute.Tensor,
         output_scale: Float32 | cute.Tensor,
         max_active_clusters: int,
         stream: cuda_drv.CUstream,
@@ -3398,8 +3399,8 @@ class FmhaTs:
         tensors.
 
         Each global scale independently accepts a float32 scalar or a (1,)
-        float32 device tensor. Host softmax operands use log2 units; device
-        softmax operands use natural-exponential units and convert on device.
+        float32 device tensor. Softmax operands use natural-exponential units;
+        host scalars convert in this launcher and device tensors convert on device.
         FP8 callers fold Q/K/V descales and output quantization into them.
 
         VC-Attention additionally binds tile means and a static repair-tile count.
@@ -3408,6 +3409,12 @@ class FmhaTs:
         if cutlass.const_expr(self.cfg.use_sage_attention != (sage_scales is not None)):
             raise ValueError("sage_scales is required by, and only by, a Sage kernel")
         cfg = self.cfg
+        scale_softmax_log2 = scale_softmax
+        if cutlass.const_expr(not isinstance(scale_softmax, cute.Tensor)):
+            # Round only the product to FP32, matching the public host-scale contract.
+            scale_softmax_log2 = Float32(
+                cutlass.Float64(scale_softmax) * cutlass.Float64(1.4426950408889634)
+            )
         if cutlass.const_expr(
             cfg.use_paged_kv
             and (
