@@ -154,6 +154,10 @@ def test_mxfp4_w4a4_cli_preserves_forward_contract(monkeypatch, variant, early):
     from flashinfer.moe_ep.core.kernel import registry
     from flashinfer.moe_ep.kernel_src.sm107 import next_cutedsl_megamoe as package
 
+    def gather(results, value, **kwargs):
+        results[:] = [value] * len(results)
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", gather)
     args = tune._parse_args(
         [
             "--dtype",
@@ -204,7 +208,7 @@ def test_mxfp4_w4a4_cli_preserves_forward_contract(monkeypatch, variant, early):
     assert resolve.call_args.kwargs["kernel_variant"] == variant
     assert resolve.call_args.kwargs["apply_routing_weights_before_fc2"] is early
     assert execution.call_args.kwargs["quantize_input"] is True
-    backend._allocate_workspace.return_value.destroy.assert_called_once()
+    backend.destroy.assert_called_once_with(backend._allocate_workspace.return_value)
 
 
 def test_mxfp4_weight_ingestion_rejects_nvfp4_scales():
