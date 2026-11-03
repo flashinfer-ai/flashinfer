@@ -68,6 +68,7 @@ DEVICE_ROUTE = re.compile(r"^sm120:fp8:h(\d+):p(\d+):n(\d+):a(\d+):(\w+)$")
 # test_orphan_device_route_matches_the_default_route).
 ORPHANS = frozenset(
     {
+        "sm120:fp8:h32:p128:n5:a5:bta_ha_wr_ef",
         "sm120:fp8:h64:p64:n3:a3:bta_ha_wr_ef",
         "sm120:fp8:h64:p64:n5:a5:atom5_mx_mpf_bta_ha_k2q_ef",
         "sm120:fp8:h64:p64:n6:a6:atom6_mx_mpf_bta_ha_ef",
