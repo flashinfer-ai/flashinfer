@@ -7,7 +7,7 @@ import torch
 
 import flashinfer
 from flashinfer import mm_bf16_fp4, prepare_bf16_fp4_weights
-from flashinfer.autotuner import autotune
+from flashinfer.autotuner import AutoTuner, autotune
 from flashinfer.gemm.gemm_bf16_fp4 import (
     _CUDNN_BF16_FP4_MIN_BACKEND_VERSION,
     _unswizzle_sf_128x4,
@@ -657,3 +657,73 @@ def test_alpha_dtype_must_be_float32():
     alpha_bad = torch.ones(1, device=device, dtype=torch.bfloat16)
     with pytest.raises(TypeError):
         prepare_bf16_fp4_weights(b_fp4, b_sf, alpha_bad, backend="cute-dsl")
+
+
+def test_cudnn_default_plan_is_sm120_kernel_on_sm120():
+    """On sm_120 the cuDNN backend runs an sm120 kernel without autotuning.
+
+    Under cuDNN 9.24, 9.26 and 9.27 the heuristic modes A and B rank an sm80
+    kernel first for the bf16 x fp4 graph on sm_120, while the FALLBACK list's
+    first plan is the sm120 kernel; the backend consults FALLBACK first there.
+    The kernel name is the only observable of the plan choice: a renamed kernel
+    fails this test with the names printed rather than passing it.
+    """
+    _skip_if_backend_unavailable("cudnn")
+    import cudnn
+
+    device = torch.device("cuda")
+    if get_compute_capability(device) != (12, 0):
+        pytest.skip("sm_120 plan ordering only")
+    if cudnn.backend_version() < 92400:
+        pytest.skip("kernel ranking measured on cuDNN 9.24 and later")
+    torch.manual_seed(0)
+    m, n, k = 2048, 4096, 4096
+    a = torch.randn((m, k), device=device, dtype=torch.bfloat16)
+    b_fp4, b_sf, alpha = _make_random_fp4_weights(n, k, device)
+    b_p, sf_p, alpha_p = prepare_bf16_fp4_weights(b_fp4, b_sf, alpha, backend="cudnn")
+    # A winner cached by an earlier test in this process would be used even
+    # outside tuning; the default plan is what this test measures.
+    AutoTuner.get().clear_cache()
+    with autotune(False):
+        mm_bf16_fp4(a, b_p, sf_p, alpha_p, backend="cudnn")
+        torch.cuda.synchronize()
+        with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CUDA]
+        ) as prof:
+            mm_bf16_fp4(a, b_p, sf_p, alpha_p, backend="cudnn")
+            torch.cuda.synchronize()
+    kernels = [
+        e.key
+        for e in prof.key_averages()
+        if e.device_type == torch.autograd.DeviceType.CUDA
+    ]
+    names = [name for name in kernels if "blockScaleDequantize" in name]
+    assert names, (
+        f"no cuDNN block-scale-dequantize matmul kernel was profiled: {kernels}"
+    )
+    assert any("sm120" in name for name in names), names
+    assert not any("sm80" in name for name in kernels), kernels
+
+
+def test_bf16_fp4_heur_modes_order(monkeypatch):
+    """FALLBACK is queried first only on compute capability 12.0 with cuDNN 9.24+.
+
+    Every other device, sm_121 included, and older cuDNN versions keep the
+    usual [A, FALLBACK] order. Pure logic: needs cuDNN installed, not a GPU.
+    """
+    cudnn = pytest.importorskip("cudnn")
+
+    from flashinfer.gemm import gemm_bf16_fp4_cudnn as impl
+
+    default = [cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK]
+    for cc, version, expected in (
+        ((9, 0), 92700, default),
+        ((10, 0), 92700, default),
+        ((12, 0), 92700, [cudnn.heur_mode.FALLBACK, cudnn.heur_mode.A]),
+        ((12, 0), 92400, [cudnn.heur_mode.FALLBACK, cudnn.heur_mode.A]),
+        ((12, 0), 92301, default),
+        ((12, 1), 92700, default),
+    ):
+        monkeypatch.setattr(impl, "get_compute_capability", lambda device, _cc=cc: _cc)
+        monkeypatch.setattr(impl.cudnn, "backend_version", lambda _v=version: _v)
+        assert impl._bf16_fp4_heur_modes("cpu") == expected, (cc, version)

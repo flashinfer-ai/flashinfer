@@ -21,7 +21,7 @@ from ..fused_moe.utils import (
     get_hybrid_num_tokens_buckets,
     map_to_hybrid_bucket_uncapped,
 )
-from ..utils import _get_cache_buf, get_native_fp4_dtype
+from ..utils import _get_cache_buf, get_compute_capability, get_native_fp4_dtype
 
 from .gemm_base import (
     CUDNN_AVAILABLE,
@@ -113,6 +113,25 @@ def _build_bf16_fp4_graph_common(
     return c_final_cudnn_tensor
 
 
+def _bf16_fp4_heur_modes(device):
+    """Heuristic modes to query, in order, for the bf16 x fp4 cuDNN graph.
+
+    On compute capability 12.0 (sm_120) cuDNN's heuristic modes A and B both
+    rank an sm80 kernel first for this GEMM, while the first plan of the
+    FALLBACK list is the sm120 kernel, which is faster (measured on an RTX 5090
+    under cuDNN 9.24, 9.26 and 9.27; the numbers are in the change that added
+    this function). Querying FALLBACK first there, with cuDNN 9.24 or later,
+    makes that kernel the default plan. Every other device, sm_121 included,
+    and older cuDNN versions (not measured) keep the usual order.
+    """
+    if (
+        get_compute_capability(torch.device(device)) == (12, 0)
+        and cudnn.backend_version() >= 92400
+    ):
+        return [cudnn.heur_mode.FALLBACK, cudnn.heur_mode.A]
+    return [cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK]
+
+
 @functools.lru_cache(maxsize=2048)
 def build_cudnn_bf16_fp4_graph(
     batch,
@@ -168,9 +187,7 @@ def build_cudnn_bf16_fp4_graph(
             alpha_is_not_none,
         )
 
-        _finalize_cudnn_graph_for_tactic(
-            graph, tactic, [cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK]
-        )
+        _finalize_cudnn_graph_for_tactic(graph, tactic, _bf16_fp4_heur_modes(device))
         return graph
 
 
@@ -237,9 +254,7 @@ def build_cudnn_bf16_fp4_graph_override_shape(
         alpha_is_not_none,
     )
 
-    _finalize_cudnn_graph_for_tactic(
-        graph, tactic, [cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK]
-    )
+    _finalize_cudnn_graph_for_tactic(graph, tactic, _bf16_fp4_heur_modes(device))
     return graph
 
 
