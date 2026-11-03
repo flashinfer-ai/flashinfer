@@ -342,9 +342,11 @@ as layer warmup, bypassing cached winners at both levels. It does not install
 or prepare the final winner after the search.
 
 `--max-candidates` limits each variant's grid separately. `--sweep schedule`
-resolves a base configuration for each variant from its cache or defaults;
-an explicit `--base-knobs` dictionary is applied to both variants. Workload,
-warmup and measurement options apply to both searches. The default remains
+resolves each variant's base on EP rank zero and shares the grid across ranks.
+An explicit `--base-knobs` dictionary is applied to both variants. The sweep
+fails before tuning if an eligible variant has no valid schedule candidates;
+use a compatible base or select an explicit variant. Workload, warmup and
+measurement options apply to both searches. The default remains
 `--kernel-variant inference`.
 
 Use a separate cache file for each qualification job to avoid concurrent
