@@ -58,7 +58,8 @@ the chunks one pre-scan CTA covers) are the records' ``scan`` constants; the
 records' ``select`` tables.
 
 Where the ``dhu_tc2`` adjoint scan feeds ``tail_g2_bf16`` on one stream and
-takes at most half the SMs, or on ``sm_100a`` and ``sm_103a`` is the pass 2 of
+takes at most half the SMs (on ``sm_107a`` with the scan's release in batches
+of eight chunks), or on ``sm_100a`` and ``sm_103a`` is the pass 2 of
 a split plan with more CTAs than SMs on a call of enough tokens x value heads,
 the backward runs them as the wavefront pair
 ``dhu_tc2_wavefront`` / ``tail_g2_bf16_wavefront`` (the split pass 2 on
@@ -1467,8 +1468,10 @@ def _side_stream(device_index: int, main: torch.cuda.Stream) -> torch.cuda.Strea
 # fork, and the entry count reaches ``segments x HV`` only once the last CTA of the second round has started, after
 # the first round has given back the SMs it needs, so again the waiting tail never holds an SM a scan CTA still needs.
 # That pass 2 runs the scan ``dhu_tc2_wavefront_split`` (the elected release: with one release per store thread
-# the slower scan ate most of the overlap on sm_103a); the scan of at most half the SMs runs ``dhu_tc2_wavefront``.
-WAVEFRONT_ARCHS = ("sm_100a", "sm_103a")
+# the slower scan ate most of the overlap on sm_103a); the scan of at most half the SMs runs ``dhu_tc2_wavefront``,
+# whose sm_107a program releases in the elected form once per eight chunks (there the release per store thread
+# slowed the scan by about a fifth); the split side stays off sm_107a (``WAVEFRONT_SPLIT_ARCHS``).
+WAVEFRONT_ARCHS = ("sm_100a", "sm_103a", "sm_107a")
 # sm_100a: the host path of a call with fewer value heads outlasts its GPU work, so the pair's host cost is not hidden
 WAVEFRONT_MIN_V_HEADS = {"sm_100a": 32}
 # the split pass 2 of more CTAs than SMs: the pair (scan ``dhu_tc2_wavefront_split``) at any value-head count, on a
