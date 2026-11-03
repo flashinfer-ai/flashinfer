@@ -537,6 +537,7 @@ def _fp8_pth_quantize_append_paged_kv_cache_with_slot_mapping_init(
     page_size: int = 16,
     num_pages: int = 4,
     kv_layout: str = "NHD",
+    kv_data_type: str = "e4m3",
     device: str = "cuda",
     seed: int = 0,
 ):
@@ -565,6 +566,7 @@ def _fp8_pth_quantize_append_paged_kv_cache_with_slot_mapping_init(
         "paged_kv_cache": (k_slot, v_slot),
         "kv_cache_sf": (k_sf, v_sf),
         "kv_layout": kv_layout,
+        "kv_data_type": kv_data_type,
     }
 
 
@@ -584,6 +586,7 @@ def _fp8_pth_hnd_init(
     device: str = "cuda",
     seed: int = 0,
     kv_layout: str = "HND",
+    kv_data_type: str = "e4m3",
 ):
     return _fp8_pth_quantize_append_paged_kv_cache_with_slot_mapping_init(
         nnz_kv=nnz_kv,
@@ -594,6 +597,7 @@ def _fp8_pth_hnd_init(
         device=device,
         seed=seed,
         kv_layout=kv_layout,
+        kv_data_type=kv_data_type,
     )
 
 
@@ -601,6 +605,81 @@ cast(Any, _fp8_pth_hnd_init)._trace_init_dependencies = (
     _fp8_pth_paged_cache_shapes,
     _fp8_pth_quantize_append_paged_kv_cache_with_slot_mapping_init,
 )
+
+
+def _fp8_pth_e5m2_init(
+    *,
+    nnz_kv: int,
+    num_pages: int = 4,
+    num_kv_heads: int = 8,
+    head_dim: int = 128,
+    page_size: int = 16,
+    device: str = "cuda",
+    seed: int = 0,
+    kv_layout: str = "NHD",
+    kv_data_type: str = "e5m2",
+):
+    return _fp8_pth_quantize_append_paged_kv_cache_with_slot_mapping_init(
+        nnz_kv=nnz_kv,
+        num_pages=num_pages,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        page_size=page_size,
+        device=device,
+        seed=seed,
+        kv_layout=kv_layout,
+        kv_data_type=kv_data_type,
+    )
+
+
+cast(Any, _fp8_pth_e5m2_init)._trace_init_dependencies = (
+    _fp8_pth_paged_cache_shapes,
+    _fp8_pth_quantize_append_paged_kv_cache_with_slot_mapping_init,
+)
+
+
+def _fp8_pth_hnd_e5m2_init(
+    *,
+    nnz_kv: int,
+    num_pages: int = 4,
+    num_kv_heads: int = 8,
+    head_dim: int = 128,
+    page_size: int = 16,
+    device: str = "cuda",
+    seed: int = 0,
+    kv_layout: str = "HND",
+    kv_data_type: str = "e5m2",
+):
+    return _fp8_pth_e5m2_init(
+        nnz_kv=nnz_kv,
+        num_pages=num_pages,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        page_size=page_size,
+        device=device,
+        seed=seed,
+        kv_layout=kv_layout,
+        kv_data_type=kv_data_type,
+    )
+
+
+cast(Any, _fp8_pth_hnd_e5m2_init)._trace_init_dependencies = (
+    _fp8_pth_paged_cache_shapes,
+    _fp8_pth_quantize_append_paged_kv_cache_with_slot_mapping_init,
+    _fp8_pth_e5m2_init,
+)
+
+for _fp8_pth_init in (
+    _fp8_pth_quantize_append_paged_kv_cache_with_slot_mapping_init,
+    _fp8_pth_hnd_init,
+    _fp8_pth_e5m2_init,
+    _fp8_pth_hnd_e5m2_init,
+):
+    cast(Any, _fp8_pth_init)._trace_init_const_axes = (
+        "num_kv_heads",
+        "head_dim",
+        "page_size",
+    )
 
 
 _fp8_pth_nhd_trace = TraceTemplate(
@@ -623,6 +702,7 @@ _fp8_pth_nhd_trace = TraceTemplate(
         "append_key": Tensor(["nnz_kv", "num_kv_heads", "head_dim"]),
         "append_value": Tensor(["nnz_kv", "num_kv_heads", "head_dim"]),
         "kv_layout": Scalar("string", optional=True),
+        "kv_data_type": Scalar("string", optional=True),
         "slot_mapping": Tensor(["nnz_kv"], dtype="int32"),
         "paged_k_cache": Tensor(
             ["num_pages", "page_size", "num_kv_heads", "slot_last"],
@@ -700,11 +780,30 @@ for _descriptors in (_fp8_pth_hnd_trace.inputs, _fp8_pth_hnd_trace.outputs):
         ):
             _descriptor.dim_names[1:3] = ["num_kv_heads", "page_size"]
 
+# Distinct names prevent auto-dump from deduplicating the two FP8 formats.
+# Keep the existing e4m3 names for compatibility with recorded definitions.
+_fp8_pth_nhd_e5m2_trace = deepcopy(_fp8_pth_nhd_trace)
+_fp8_pth_nhd_e5m2_trace.name_prefix = f"{_fp8_pth_nhd_trace.name_prefix}_e5m2"
+_fp8_pth_nhd_e5m2_trace.init = _fp8_pth_e5m2_init
+_fp8_pth_hnd_e5m2_trace = deepcopy(_fp8_pth_hnd_trace)
+_fp8_pth_hnd_e5m2_trace.name_prefix = f"{_fp8_pth_hnd_trace.name_prefix}_e5m2"
+_fp8_pth_hnd_e5m2_trace.init = _fp8_pth_hnd_e5m2_init
+for _fp8_pth_template, _fp8_pth_format in (
+    (_fp8_pth_nhd_trace, "e4m3"),
+    (_fp8_pth_hnd_trace, "e4m3"),
+    (_fp8_pth_nhd_e5m2_trace, "e5m2"),
+    (_fp8_pth_hnd_e5m2_trace, "e5m2"),
+):
+    _fp8_pth_template.constraints.append(f"kv_data_type == {_fp8_pth_format!r}")
+
 
 def fp8_token_head_quantize_append_paged_kv_cache_with_slot_mapping_trace(**kwargs):
+    from ...page import _normalize_fp8_dtype
+
+    fp8_code = _normalize_fp8_dtype(kwargs.get("kv_data_type", "e4m3"))
     if kwargs.get("kv_layout", "NHD") == "HND":
-        return _fp8_pth_hnd_trace
-    return _fp8_pth_nhd_trace
+        return _fp8_pth_hnd_e5m2_trace if fp8_code else _fp8_pth_hnd_trace
+    return _fp8_pth_nhd_e5m2_trace if fp8_code else _fp8_pth_nhd_trace
 
 
 cast(
@@ -712,6 +811,8 @@ cast(
 ).templates = (
     _fp8_pth_nhd_trace,
     _fp8_pth_hnd_trace,
+    _fp8_pth_nhd_e5m2_trace,
+    _fp8_pth_hnd_e5m2_trace,
 )
 
 
