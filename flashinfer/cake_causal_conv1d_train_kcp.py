@@ -45,7 +45,8 @@ Name map: ``cake_causal_conv1d_det_kcp`` -> :func:`cake_causal_conv1d_kcp`, ``ca
     q, k, v = cake_causal_conv1d_multi_kcp((xq, xk, xv), (wq, wk, wv), ctx, deterministic=False)
 
 The non-deterministic backward beside a kernel of another stream (FlashInfer issue #8365): ``bwd_reserve_sms=K``
-(``deterministic=False`` only) launches the main backward ``K`` SMs short of its single wave::
+(``deterministic=False`` only, SM100 / SM103; ``ValueError`` on SM107) launches the main backward ``K`` SMs short of
+its single wave::
 
     y_local = cake_causal_conv1d_kcp(x_local, weight, ctx, deterministic=False, bwd_reserve_sms=1)
 """
@@ -156,7 +157,9 @@ def cake_causal_conv1d_kcp(
         leaves the grid unchanged at those widths (for example ``C`` = 10240, 6144 and 5120 on a 152-SM GB200 /
         GB300, ``C`` = 10240, 6144 and 3072 on a 148-SM B200) and launches one SM's CTAs fewer at every other width.
         Validated only when given: a ``bool`` or a non-``int`` raises ``TypeError``, a negative value or one not
-        below the device's SM count ``ValueError``.
+        below the device's SM count ``ValueError``.  On sm_107a ``K >= 1`` raises ``ValueError``: there the reserved
+        grid costs up to 1.055x the shipped grid unloaded (``C`` = 1024, 62585 tokens), above this opt-in's 1.040
+        limit.
 
         ==============  ===============  ================================================================
         deterministic   bwd_reserve_sms  backward
@@ -166,7 +169,8 @@ def cake_causal_conv1d_kcp(
                                          of another stream is ``cooperative=False`` of
                                          :mod:`flashinfer.cake_causal_conv1d_det_train_kcp`
         ``False``       ``None`` / 0     the non-deterministic backward's shipped grid
-        ``False``       ``K >= 1``       the non-deterministic backward ``K`` SMs short
+        ``False``       ``K >= 1``       the non-deterministic backward ``K`` SMs short (``ValueError`` on
+                                         sm_107a)
         ==============  ===============  ================================================================
 
         Portable spelling beside a one-SM kernel of another stream: ``cooperative=False`` for

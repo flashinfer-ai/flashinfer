@@ -94,7 +94,9 @@ launches the single-wave grid less ``K x ctas_per_sm`` CTAs, whatever the last
 channel-tile rank holds, so ``K`` SMs held by kernels of other streams leave the
 backward one wave.  It changes the launch grid only (same programs, ``dx``
 bitwise, ``dweight`` within the same budget); the host cache and graph keys hold
-``K``.  A multi-wave grid (``grid_mult`` > 1) launches unchanged.
+``K``.  A multi-wave grid (``grid_mult`` > 1) launches unchanged.  On sm_107a
+``K >= 1`` raises ``ValueError`` (:data:`RESERVE_UNSUPPORTED`): there the reserved
+grid costs up to 1.055x the shipped grid unloaded (C 1024, 62585 tokens).
 
 Checkpoint recompute without the halo exchange (FlashInfer issues #7815 /
 #7818): with ``recompute_handle=`` (:class:`RecomputeHandleKcp`, or any object
@@ -617,10 +619,25 @@ def _reserve(value: Any, entry: str) -> int:
     return int(value)
 
 
+# Architectures where ``bwd_reserve_sms >= 1`` is refused, with the reason.
+RESERVE_UNSUPPORTED = {
+    "sm_107a": (
+        "the reserved backward grid costs up to 1.055x the shipped grid unloaded there "
+        "(C=1024, 62585 tokens), above the 1.040 limit of this opt-in"
+    ),
+}
+
+
 def _reserve_fits(reserve: int, x: Any, entry: str) -> None:
-    """``ValueError`` when ``reserve`` SMs are not fewer than the SMs of ``x``'s device (checked at the call, before
-    the forward)."""
+    """``ValueError`` when ``reserve >= 1`` on an architecture of :data:`RESERVE_UNSUPPORTED`, or when ``reserve``
+    SMs are not fewer than the SMs of ``x``'s device (checked at the call, before the forward)."""
     if reserve and isinstance(x, torch.Tensor) and x.is_cuda:
+        arch = _device_arch(x.device)
+        if arch in RESERVE_UNSUPPORTED:
+            raise ValueError(
+                f"{entry}: bwd_reserve_sms={reserve} is not supported on {arch}: "
+                f"{RESERVE_UNSUPPORTED[arch]}; pass bwd_reserve_sms=None"
+            )
         sms = int(torch.cuda.get_device_properties(x.device).multi_processor_count)
         if reserve >= sms:
             raise ValueError(
@@ -1057,11 +1074,13 @@ def cake_causal_conv1d_backward_kcp(
     ``warn_only=True``) before it launches or exchanges anything.  Preallocated outputs: ``dx`` BF16 of
     ``x_local``'s shape and ``dweight`` FP32 ``[C, 4]``, contiguous; ``dweight`` must be 16-byte aligned (one
     16-byte store per channel; ``ValueError`` otherwise).  ``bwd_reserve_sms`` (``None`` = ``RESERVE_DEFAULT``):
-    the main backward's grid gives up that many SMs (:func:`_bwd_grid`); the graph key holds it.
+    the main backward's grid gives up that many SMs (:func:`_bwd_grid`); the graph key holds it.  ``ValueError`` for
+    ``K >= 1`` on sm_107a (:data:`RESERVE_UNSUPPORTED`) or at the device's SM count or above.
     """
 
     _require_nondeterministic(deterministic, "cake_causal_conv1d_backward_kcp")
     reserve = _reserve(bwd_reserve_sms, "cake_causal_conv1d_backward_kcp")
+    _reserve_fits(reserve, x_local, "cake_causal_conv1d_backward_kcp")
     _alert_nondeterministic("cake_causal_conv1d_backward_kcp")
     mode = _graph_mode(graph)
     if mode == "off":
@@ -1635,7 +1654,9 @@ def cake_causal_conv1d_kcp(
         backward launches its single-wave grid less ``K x ctas_per_sm`` CTAs, so it stays one wave while kernels of
         other streams hold up to ``K`` SMs; it costs the unloaded backward the work of ``K`` SMs.  ``y``, ``dx`` and
         the exchanges are unchanged; ``dweight`` stays within the budget.  ``TypeError`` for a ``bool`` or a
-        non-``int``; ``ValueError`` below zero or at the device's SM count or above.  The ranks of a group may differ.
+        non-``int``; ``ValueError`` below zero, at the device's SM count or above, or ``K >= 1`` on sm_107a
+        (:data:`RESERVE_UNSUPPORTED`: the reserved grid is outside the opt-in's unloaded-cost limit there).  The
+        ranks of a group may differ.
 
     Returns
     -------
@@ -1824,6 +1845,11 @@ def cake_causal_conv1d_multi_backward_kcp(
 
     _require_nondeterministic(deterministic, "cake_causal_conv1d_multi_backward_kcp")
     reserve = _reserve(bwd_reserve_sms, "cake_causal_conv1d_multi_backward_kcp")
+    _reserve_fits(
+        reserve,
+        xs[0] if isinstance(xs, (list, tuple)) and xs else None,
+        "cake_causal_conv1d_multi_backward_kcp",
+    )
     _alert_nondeterministic("cake_causal_conv1d_multi_backward_kcp")
     xs, weights, _ = _multi_operands(xs, weights, None)
     n = len(xs)
@@ -2098,6 +2124,7 @@ __all__ = [
     "GRAPH_STATS",
     "HANDLE_KEY",
     "RESERVE_DEFAULT",
+    "RESERVE_UNSUPPORTED",
     "RecomputeHandleKcp",
     "LAST_CALL",
     "graph_cache_clear",

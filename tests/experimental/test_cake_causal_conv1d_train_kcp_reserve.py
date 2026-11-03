@@ -27,6 +27,9 @@ process, world size 1, the deterministic KCP suite's contexts and FP64 oracle.
     (the multi call's bitwise the single calls'), ``dweight`` within budget, the reserved grid launched; activation
     checkpointing with a recompute handle keeps the reserve; graph replay keys a reserved call apart from a default
     one; a reserve at the device's SM count is refused before the forward.
+(d) sm_107a (``RESERVE_UNSUPPORTED``): every entry point refuses ``K >= 1`` with a ``ValueError`` that names the
+    architecture and the reason, before it launches anything; ``None`` and 0 pass.  (b) and (c) run where the
+    reserve is supported; on sm_107a the device itself is checked to refuse it.
 """
 
 from __future__ import annotations
@@ -54,6 +57,17 @@ from tests.test_cake_causal_conv1d_det_train_kcp import (
 
 LENS, CUTS = (5000, 1003), (1, 2, 4997, 1003)
 
+
+def _device_arch_or_none():
+    if not torch.cuda.is_available() or not pkg.is_cake_causal_conv1d_train_supported(
+        torch.device("cuda")
+    ):
+        return None
+    return conv_kcp._device_arch(torch.device("cuda"))
+
+
+ARCH = _device_arch_or_none()
+
 needs_gpu = pytest.mark.skipif(
     not torch.cuda.is_available()
     or not pkg.is_cake_causal_conv1d_train_supported(torch.device("cuda")),
@@ -61,6 +75,10 @@ needs_gpu = pytest.mark.skipif(
         "the non-deterministic cake_causal_conv1d_train package needs a supported CUDA device (SM100 / SM103 / "
         "SM107) and its rendered build.json / csrc"
     ),
+)
+needs_reserve = pytest.mark.skipif(
+    ARCH is None or ARCH in conv_kcp.RESERVE_UNSUPPORTED,
+    reason="bwd_reserve_sms >= 1 needs a device whose architecture supports the reserve (not sm_107a)",
 )
 
 
@@ -218,7 +236,7 @@ def _widths(device: torch.device) -> list[tuple[int, int, int, int]]:
     return [rows[t] for t in (True, False) if t in rows]
 
 
-@needs_gpu
+@needs_reserve
 @pytest.mark.parametrize("reserve", [1, 2])
 def test_backward_launches_the_reserved_grid(monkeypatch, reserve) -> None:
     device = torch.device("cuda")
@@ -269,7 +287,7 @@ def _autograd(p, entry, **kw):
     return y.detach(), x.grad, w.grad
 
 
-@needs_gpu
+@needs_reserve
 def test_autograd_single_and_multi_keep_the_reserve(monkeypatch) -> None:
     device = torch.device("cuda")
     _, (C, full, k, _) = _widths(
@@ -304,7 +322,7 @@ def test_autograd_single_and_multi_keep_the_reserve(monkeypatch) -> None:
         _dw_within(w.grad, dw_ref, "multi dweight vs FP64 oracle")
 
 
-@needs_gpu
+@needs_reserve
 def test_checkpoint_with_a_recompute_handle_keeps_the_reserve(monkeypatch) -> None:
     from torch.utils.checkpoint import checkpoint
 
@@ -338,7 +356,7 @@ def test_checkpoint_with_a_recompute_handle_keeps_the_reserve(monkeypatch) -> No
     handle.clear()
 
 
-@needs_gpu
+@needs_reserve
 def test_graph_replay_keys_the_reserve(monkeypatch) -> None:
     """A reserved backward and a default one on the same operands are two graph keys, each replaying its own grid;
     ``dx`` bitwise the eager result in both."""
@@ -372,7 +390,7 @@ def test_graph_replay_keys_the_reserve(monkeypatch) -> None:
         conv_kcp._GRAPHS.clear()
 
 
-@needs_gpu
+@needs_reserve
 def test_reserve_at_the_sm_count_is_refused_before_the_forward() -> None:
     device = torch.device("cuda")
     sms = torch.cuda.get_device_properties(device).multi_processor_count
@@ -381,3 +399,88 @@ def test_reserve_at_the_sm_count_is_refused_before_the_forward() -> None:
         facade.cake_causal_conv1d_kcp(
             p.x_local, p.w, p.ctx, deterministic=False, bwd_reserve_sms=sms
         )
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# (d) Architectures that refuse the reserve.
+
+
+def test_sm_107a_is_the_refused_architecture() -> None:
+    assert set(conv_kcp.RESERVE_UNSUPPORTED) == {"sm_107a"}
+    reason = conv_kcp.RESERVE_UNSUPPORTED["sm_107a"]
+    assert "1.055x" in reason and "C=1024" in reason and "1.040" in reason
+    assert "RESERVE_UNSUPPORTED" in conv_kcp.__all__
+
+
+def _refused_entries(p):
+    """Every entry point with ``deterministic=False``, as ``(name, call(K))``."""
+    x, w, ctx, dy = p.x_local, p.w, p.ctx, p.dy_local
+    return [
+        (
+            "cake_causal_conv1d_kcp",
+            lambda k: facade.cake_causal_conv1d_kcp(
+                x, w, ctx, deterministic=False, bwd_reserve_sms=k
+            ),
+        ),
+        (
+            "cake_causal_conv1d_multi_kcp",
+            lambda k: facade.cake_causal_conv1d_multi_kcp(
+                (x,), (w,), ctx, deterministic=False, bwd_reserve_sms=k
+            ),
+        ),
+        (
+            "cake_causal_conv1d_backward_kcp",
+            lambda k: conv_kcp.cake_causal_conv1d_backward_kcp(
+                x, w, ctx, dy, None, deterministic=False, bwd_reserve_sms=k
+            ),
+        ),
+        (
+            "cake_causal_conv1d_multi_backward_kcp",
+            lambda k: conv_kcp.cake_causal_conv1d_multi_backward_kcp(
+                [x], [w], ctx, [dy], [None], deterministic=False, bwd_reserve_sms=k
+            ),
+        ),
+    ]
+
+
+def _launch_nothing(monkeypatch):
+    def launched(*args, **kwargs):
+        raise AssertionError("a refused call reached a forward or backward launch")
+
+    monkeypatch.setattr(conv_kcp.CakeCausalConv1dFunctionKcp, "apply", launched)
+    monkeypatch.setattr(conv_kcp.CakeCausalConv1dMultiFunctionKcp, "apply", launched)
+    monkeypatch.setattr(conv_kcp, "_kcp_backward", launched)
+    monkeypatch.setattr(conv_kcp, "_kcp_backward_multi", launched)
+
+
+@needs_gpu
+@pytest.mark.parametrize("k", [1, 2])
+def test_reserve_is_refused_on_sm_107a(monkeypatch, k) -> None:
+    """With the device reported as sm_107a, all four entry points raise before any launch; the message names the
+    architecture and the measured cost."""
+
+    p = _problem(LENS, CUTS, 512, torch.device("cuda"))
+    monkeypatch.setattr(conv_kcp, "_device_arch", lambda device: "sm_107a")
+    _launch_nothing(monkeypatch)
+    for name, call in _refused_entries(p):
+        with pytest.raises(ValueError) as err:
+            call(k)
+        message = str(err.value)
+        assert message.startswith(
+            f"{name}: bwd_reserve_sms={k} is not supported on sm_107a"
+        ), message
+        assert "1.055x" in message and "bwd_reserve_sms=None" in message, message
+    for reserve in (conv_kcp.RESERVE_DEFAULT, 0):
+        conv_kcp._reserve_fits(reserve, p.x_local, "check")  # None / 0 pass on sm_107a
+
+
+@pytest.mark.skipif(
+    ARCH is None or ARCH not in conv_kcp.RESERVE_UNSUPPORTED,
+    reason="runs on a device whose architecture refuses the reserve (sm_107a)",
+)
+def test_this_device_refuses_the_reserve(monkeypatch) -> None:
+    p = _problem(LENS, CUTS, 512, torch.device("cuda"))
+    _launch_nothing(monkeypatch)
+    for _name, call in _refused_entries(p):
+        with pytest.raises(ValueError, match=f"not supported on {ARCH}"):
+            call(1)
