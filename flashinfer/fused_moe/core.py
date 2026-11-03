@@ -332,10 +332,8 @@ class TrtllmDaResources:
     body_workspace: TrtllmDaBodyWorkspace
     # Device scalar written by the selector with the replay-selected body index.
     selected_body: torch.Tensor
-    # Fixed-address copy of the selected tile's expanded-to-permuted map. This
-    # is populated inside each conditional body when LoRA exposes the FC1
-    # activation through the public multi-output ABI.
-    lora_expanded_idx_to_permuted_idx: Optional[torch.Tensor] = None
+    # Whether each captured invocation needs its own public LoRA outputs.
+    has_lora_auxiliary_outputs: bool = False
     # Stable FromLogits router outputs, or None for caller-precomputed routing.
     canonical_routing: Optional[TRTLLMCanonicalRouting] = None
 
@@ -2155,7 +2153,7 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
         # When do_finalize=False, the FC2 output format is determined on device based on runtime
         # expert distribution. Therefore it is not eligible for DA until we can canonicalize
         # output format. Finalized LoRA calls use the DA lane's fixed-address
-        # permutation map and shared maximum FC1 workspace for their auxiliary ABI.
+        # permutation map and FC1 activation copies for their auxiliary ABI.
         da_eligible = (
             routing_mode
             in (
@@ -2195,8 +2193,8 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             routing_method_type=routing_method_type,
             routed_scaling_factor=routed_scaling_factor,
             run_fixed_tactic=run_selected_tactic,
-            finish_switch=lambda resources: _unpack_trtllm_moe_output(
-                [output, *runtime.lora_auxiliary_outputs(resources)]
+            finish_switch=lambda auxiliary_outputs: _unpack_trtllm_moe_output(
+                [output, *runtime.lora_auxiliary_outputs(auxiliary_outputs)]
                 if gemm1_lora_delta is not None
                 else [],
                 output,
@@ -3282,8 +3280,8 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             routing_method_type=routing_method_type,
             routed_scaling_factor=routed_scaling_factor,
             run_fixed_tactic=run_selected_tactic,
-            finish_switch=lambda resources: _unpack_trtllm_moe_output(
-                [output, *runtime.lora_auxiliary_outputs(resources)]
+            finish_switch=lambda auxiliary_outputs: _unpack_trtllm_moe_output(
+                [output, *runtime.lora_auxiliary_outputs(auxiliary_outputs)]
                 if gemm1_lora_delta is not None
                 else [],
                 output,
@@ -3689,8 +3687,8 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             routing_method_type=routing_method_type,
             routed_scaling_factor=routed_scaling_factor,
             run_fixed_tactic=run_selected_tactic,
-            finish_switch=lambda resources: _unpack_trtllm_moe_output(
-                [output, *runtime.lora_auxiliary_outputs(resources)]
+            finish_switch=lambda auxiliary_outputs: _unpack_trtllm_moe_output(
+                [output, *runtime.lora_auxiliary_outputs(auxiliary_outputs)]
                 if gemm1_lora_delta is not None
                 else [],
                 output,
@@ -4038,8 +4036,8 @@ def _get_trtllm_moe_sm100_module_impl(enable_rubin: bool):
             routing_method_type=routing_method_type,
             routed_scaling_factor=routed_scaling_factor,
             run_fixed_tactic=run_selected_tactic,
-            finish_switch=lambda resources: _unpack_trtllm_moe_output(
-                [output, *runtime.lora_auxiliary_outputs(resources)]
+            finish_switch=lambda auxiliary_outputs: _unpack_trtllm_moe_output(
+                [output, *runtime.lora_auxiliary_outputs(auxiliary_outputs)]
                 if gemm1_lora_delta is not None
                 else [],
                 output,
@@ -4519,29 +4517,17 @@ class TrtllmDaRuntime:
             selected_body=torch.full(
                 (1,), -1, dtype=torch.int32, device=topk_ids.device
             ),
-            lora_expanded_idx_to_permuted_idx=(
-                torch.empty_like(routing_metadata.slots[0].expanded_idx_to_permuted_idx)
-                if has_lora_auxiliary_outputs
-                else None
-            ),
+            has_lora_auxiliary_outputs=has_lora_auxiliary_outputs,
             canonical_routing=canonical_routing,
         )
 
     def lora_auxiliary_outputs(
-        self, resources: TrtllmDaResources
+        self, outputs: Optional[tuple[torch.Tensor, torch.Tensor]]
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return the fixed-address public LoRA outputs for one DA lane."""
-        expanded_idx_to_permuted_idx = resources.lora_expanded_idx_to_permuted_idx
-        if expanded_idx_to_permuted_idx is None:
-            raise RuntimeError("DA LoRA auxiliary outputs were not prepared")
-
-        # Every DA-admitted LoRA body keeps its public post-activation FC1 output
-        # in field zero. All bodies in the plan share the field-wise maximum
-        # workspace, so this activation address is graph-stable.
-        return (
-            expanded_idx_to_permuted_idx,
-            resources.body_workspace.tensors[0],
-        )
+        """Require the invocation-owned LoRA outputs produced by a SWITCH capture."""
+        if outputs is None:
+            raise RuntimeError("DA LoRA auxiliary outputs were not captured")
+        return outputs
 
     def capture_switch(
         self,
@@ -4554,7 +4540,9 @@ class TrtllmDaRuntime:
         previous_conditional_node_handle: int,
         topk_weights: Optional[torch.Tensor] = None,
         **runner_kwargs,
-    ) -> Optional[tuple[DAGraphTopology, int]]:
+    ) -> Optional[
+        tuple[DAGraphTopology, int, Optional[tuple[torch.Tensor, torch.Tensor]]]
+    ]:
         """Inject one serial lane invocation or return None before graph mutation."""
         # Prove capture identity and transitive ordering before canonicalization writes any shared
         # lane storage. A failed proof leaves this invocation pristine for ordinary fallback.
@@ -4571,6 +4559,17 @@ class TrtllmDaRuntime:
             raise RuntimeError("Incomplete native DA workspace-lane inspection")
         if not lane_inspection[1]:
             return None
+
+        # Allocate in the outer graph pool for each invocation. The lane and
+        # its body workspace may be shared, but public outputs must not alias.
+        auxiliary_outputs = None
+        if resources.has_lora_auxiliary_outputs:
+            auxiliary_outputs = (
+                torch.empty_like(
+                    resources.routing_metadata.slots[0].expanded_idx_to_permuted_idx
+                ),
+                torch.empty_like(resources.body_workspace.tensors[0]),
+            )
 
         # Refresh canonical routing inside the outer capture when logits are the live framework
         # input, then expose its stable unpacked pair to every child body.
@@ -4642,22 +4641,25 @@ class TrtllmDaRuntime:
                         workspace.tensors,
                         **body_kwargs,
                     )
-                    if resources.lora_expanded_idx_to_permuted_idx is not None:
-                        # Tile-N changes permutation values even though the
-                        # public map shape is fixed. Copy the selected tile's
-                        # map inside its child graph so every replay publishes
-                        # the same output address with matching contents.
-                        resources.lora_expanded_idx_to_permuted_idx.copy_(
+                    if auxiliary_outputs is not None:
+                        # The selected tile defines both the permutation and
+                        # FC1 layout. Publish them before this lane is reused.
+                        auxiliary_outputs[0].copy_(
                             slots[body.tile_n].expanded_idx_to_permuted_idx
                         )
+                        # Field zero is the maximum-capacity post-activation
+                        # FC1 workspace, not the selected body's padded size.
+                        auxiliary_outputs[1].copy_(workspace.tensors[0])
                 runtime.end_da_body_capture(
                     device_index, stream_handle, body_graph_handle
                 )
         # Join the populated SWITCH to the outer capture and decode runtime-inspected topology.
         topology = runtime.finish_da_switch_capture(topk_ids, capture_state.to_native())
-        return DAGraphTopology.from_native(
-            topology
-        ), capture_state.conditional_node_handle
+        return (
+            DAGraphTopology.from_native(topology),
+            capture_state.conditional_node_handle,
+            auxiliary_outputs,
+        )
 
 
 def _validate_routing_replay_out(

@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import benchmarks.bench_trtllm_moe_da as da_benchmark
 from benchmarks.bench_trtllm_moe_da import (
     _canonical_inputs,
     _capture,
@@ -481,6 +482,138 @@ def test_llama4_public_routing_replay_writes_selected_ids(num_tokens: int) -> No
 
 
 # Auxiliary body ABI
+
+
+@pytest.mark.parametrize("precision", ("bf16", "mxfp8", "mxfp4", "w4a16", "mxint4"))
+def test_lora_same_shape_layers_keep_independent_outputs(
+    precision, monkeypatch
+) -> None:
+    """Two calls sharing a lane must preserve each call's map and FC1 activation."""
+    require_sm100()
+    shape = compact_shape(num_tokens=48)
+    first = _prepare_precision(precision, shape)
+    second = _prepare_precision(precision, shape)
+    layers = (first, second)
+    deltas = {
+        layer.output.data_ptr(): torch.randn(
+            shape.num_tokens,
+            shape.top_k,
+            2 * shape.intermediate_size,
+            device=layer.output.device,
+            dtype=torch.bfloat16,
+        )
+        .mul_(0.05)
+        .add_(index * 0.25)
+        for index, layer in enumerate(layers)
+    }
+    api_name = {
+        "bf16": "trtllm_bf16_routed_moe",
+        "mxfp8": "trtllm_fp8_block_scale_routed_moe",
+        "mxfp4": "trtllm_fp4_block_scale_routed_moe",
+        "w4a16": "trtllm_fp4_block_scale_routed_moe",
+        "mxint4": "trtllm_mxint4_block_scale_routed_moe",
+    }[precision]
+    public_api = getattr(da_benchmark, api_name)
+    results = []
+
+    def invoke_with_lora(*args, **kwargs):
+        """Keep the benchmark's public ABI while retaining its auxiliary outputs."""
+        result = public_api(
+            *args, gemm1_lora_delta=deltas[kwargs["output"].data_ptr()], **kwargs
+        )
+        assert isinstance(result, list) and len(result) == 3
+        results.append(result)
+        return result
+
+    monkeypatch.setattr(da_benchmark, api_name, invoke_with_lora)
+    distributions = ("uniform", "ddist:1.1", "ddist:2", "ddist:4")
+    factory = RoutingRealizationFactory()
+    for layer in layers:
+        layer.stage(*_realization(factory, shape, "ddist:4"))
+    graph = torch.cuda.CUDAGraph()
+    leases = []
+    with _temporary_environment(
+        FLASHINFER_DIST_AWARE_AUTOTUNE="1",
+        FLASHINFER_DA_DISTRIBUTIONS=",".join(distributions),
+        FLASHINFER_DA_BASELINE_GUARD="0",
+    ):
+        with autotune(True, tuning_buckets=(shape.num_tokens,)):
+            first.invoke()
+            second.invoke()
+        first.invoke()
+        second.invoke()
+        diagnostic = _matching_diagnostic(precision, shape, distributions)
+        assert diagnostic["policy"] == "da_switch", diagnostic
+        assert len(diagnostic["bodies"]) > 1, diagnostic
+
+        results.clear()
+        with torch.cuda.graph(graph):
+            first.invoke()
+            second.invoke()
+        captured = tuple(results)
+        leases = trtllm_moe_acquire_da_graph_leases(graph)
+
+    try:
+        assert len(leases) == 1
+        diagnostic = _matching_diagnostic(precision, shape, distributions)
+        assert diagnostic["topology"]["conditional_node_count"] == 2
+        assert diagnostic["topology"]["workspace_lane_invocation_count"] == 2
+        assert len(captured) == 2
+        pointers = tuple(tuple(t.data_ptr() for t in output) for output in captured)
+        assert pointers[0][1] != pointers[1][1]
+        assert pointers[0][2] != pointers[1][2]
+
+        def canonical_activation(outputs):
+            """Compare FC1 values in token-slot order, independent of tile padding."""
+            mapping = outputs[1].reshape(-1).to(torch.int64)
+            valid = mapping >= 0
+            assert torch.all(mapping[valid] < outputs[2].shape[0])
+            return valid, outputs[2][mapping[valid]]
+
+        selected_bodies = set()
+        for index, distribution in enumerate(distributions):
+            first.stage(
+                *_realization(
+                    factory, shape, distributions[(index + 1) % len(distributions)]
+                )
+            )
+            second.stage(*_realization(factory, shape, distribution))
+            graph.replay()
+            torch.cuda.synchronize()
+            diagnostic = _matching_diagnostic(precision, shape, distributions)
+            selected_bodies.add(diagnostic["selected_body"])
+            assert (
+                tuple(tuple(t.data_ptr() for t in output) for output in captured)
+                == pointers
+            )
+
+            # Ordinary and DA may select different tile sizes. Compare map
+            # validity and map-gathered FC1 values rather than raw row numbers.
+            da_values = [
+                (output[0].clone(), *canonical_activation(output))
+                for output in captured
+            ]
+            assert not torch.equal(da_values[0][2], da_values[1][2])
+            for layer, (da_output, da_valid, da_activation) in zip(
+                layers, da_values, strict=True
+            ):
+                with _temporary_environment(FLASHINFER_DIST_AWARE_AUTOTUNE="0"):
+                    layer.invoke()
+                ordinary = results[-1]
+                torch.cuda.synchronize()
+                ordinary_valid, ordinary_activation = canonical_activation(ordinary)
+                assert torch.equal(da_valid, ordinary_valid)
+                torch.testing.assert_close(da_output, ordinary[0], rtol=3e-2, atol=3e-2)
+                torch.testing.assert_close(
+                    da_activation, ordinary_activation, rtol=3e-2, atol=3e-2
+                )
+        assert len(selected_bodies) > 1, selected_bodies
+        assert all(0 <= body < len(diagnostic["bodies"]) for body in selected_bodies)
+    finally:
+        torch.cuda.synchronize()
+        graph.reset()
+        for lease in leases:
+            lease.release()
 
 
 def test_lora_public_capture_uses_graph_stable_da_outputs() -> None:

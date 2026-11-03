@@ -398,12 +398,15 @@ def run_dist_aware_tactic(
         )
         if capture_result is None:
             return None
-        topology, conditional_node_handle = capture_result
+        topology, conditional_node_handle, auxiliary_outputs = capture_result
         state.record_topology(topology)
         from flashinfer.fused_moe.da_moe import DACaptureOutcome
 
         return DACaptureOutcome(
-            finish_switch(resources), topology, conditional_node_handle
+            finish_switch(auxiliary_outputs),
+            topology,
+            conditional_node_handle,
+            () if auxiliary_outputs is None else auxiliary_outputs,
         )
 
     return state.dispatch(
