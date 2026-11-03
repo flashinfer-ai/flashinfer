@@ -4,7 +4,7 @@
 `MoEEpLayer` API，使一个 MoE 层能够跨两个独立 NVLink domain 执行。
 该能力必须显式启用，当前只开放下表中的固定配置。已有 intranode 默认行为保留。
 已执行的数值/公共 API 测试通过；off 性能门槛全部通过，internode 性能仍有验收缺口，
-且单 rank capture 的错误协商存在待修复 review 问题（见末节）。
+新增的 CUDA Graph 路径要求预先 warmup，并约束固定输入地址、shape 与资源生命周期。
 
 本文保留接口、设计、修改范围、验证和性能结论。来源与本地设备差异登记在
 [VENDOR.md](../../flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/VENDOR.md)。
@@ -36,7 +36,7 @@ off 模式不使用该参数。本 PR 没有改变 next provider 的实现或默
 | finalization | `FinalizeMode.AUTO` 或 `DEFAULT`，都解析为 DEFAULT 的独立 TopkReduce；不启用 in-kernel FC2 reduce |
 | 其他配置 | 默认 fast math、`input_norm_const=1.0`、`knobs=None`；不允许自定义 tile/cluster/schedule |
 
-不开放 subgroup、其他拓扑/shape、internode CUDA Graph、autotune、自定义 activation、
+不开放 subgroup、其他拓扑/shape、autotune、自定义 activation、
 epilogue scale、FC1 per-token scale、量化 combine 或自定义 finalizer。
 这些限制针对新增 on 路径；原有 off 路径保留其支持的 activation、scale、finalizer 和 graph。
 
@@ -106,7 +106,9 @@ torchrun --nnodes=2 --nproc-per-node=2 --node-rank="$NODE_RANK" \
 所有默认组 rank 必须按相同顺序进入初始化、forward/staging 和资源生命周期。
 这是集体调用契约，不能只让有 token 的 rank 调用。两个主机本身并不能证明是两个
 NVLink domain：运行时仍验证 NCCL device API、railed GIN/RDMA、LSA team 数与本地 peer 可达性。
-NCCL-only 默认组仍可使用原有控制协议；CPU Gloo 是已测的优化路径，并非额外正确性前提。
+GIN 初始化要求 PyTorch 的 Gloo backend 可用（不增加 off 路径依赖）。
+默认组有 CPU/Gloo 时直接复用；NCCL-only 默认组在 GIN 初始化时集体创建并缓存
+一个 Gloo 控制组。它随默认 PG 销毁，不在 capture 或 replay 中创建。
 
 底层 shim 的 `get_symm_buffer_for_mega_moe` 同时增加仅限关键字的
 `internode=False`、`ranks_per_node=None`、`process_group=None`；它们将配置传给
@@ -169,7 +171,8 @@ VENDOR 中登记为 pending-upstream diff，不声称是原 donor 的逐字副�
 
 初始化在 communicator、allocation、registration、peer mapping 等资源边界汇总
 rank-local 错误，避免某个 rank 提前退出、其他 rank 继续进入设备通信。
-公共 forward 和独立 `stage_inputs` 每次都校验 metadata、route 值与 bound device。
+eager 的公共 forward 和独立 `stage_inputs` 每次都校验 metadata、route 值与 bound device；
+capture 只校验 metadata 和绑定状态，route 值是每次 replay 的调用方前提。
 预检同时比较 phase、配置 signature 和 session identity。
 
 默认组有 `cpu:gloo` 时，正常路径收集固定大小 CPU header，使用 128-bit BLAKE2b
@@ -177,7 +180,8 @@ rank-local 错误，避免某个 rank 提前退出、其他 rank 继续进入设
 header all-gather 完成后，每个 rank 读取同一组 header，并共同决定是否进入
 object fallback；不会一部分 rank 继续 header、一部分 rank 单独进入 object。
 每个边界使用相同 header 协议，避免不同 phase 选择不同控制通信而挂起。
-NCCL-only 组保留 object-report 协议。该优化没有移除错误传播和拓扑检查。
+NCCL-only 默认组的 GIN 校验也使用预创建的 CPU 控制组。详细错误报告始终走
+CPU 通道；该路径不会在 capture 中意外提交 NCCL/CUDA collective。
 
 已汇总的 rank-local 输入错误表现为 `GinPreflightError`（`RuntimeError` 子类），
 在设备通信前于所有 rank 被拒绝，修正后可以继续调用。不能把所有 `RuntimeError`
@@ -193,13 +197,15 @@ NCCL-only 组保留 object-report 协议。该优化没有移除错误传播和�
 独立 session 可共存并已测试。
 允许单个 rank 在有序调用之间切换 eager CUDA stream，thunk 在执行时绑定当前 stream；
 这不提供跨 stream 的自动生产者依赖，调用方仍须保证输入和前次调用已正确排序。
-CUDA device 不能在 session 生命周期内更换。internode capture 被显式拒绝。
+CUDA device 不能在 session 生命周期内更换。Graph capture 和 eager 使用相同的
+已准备 thunk；调用时绑定 capture stream，并将当前模式纳入 CPU agreement，
+在 staging/launch 前共同拒绝混合 eager/capture。
 
 ### 2.5 控制开销与 off 路径
 
 准备好的 launch 参数按 workspace、weight identity、compiled callable 缓存。
-eager GIN 的 key 不包含 rank-local stream，以免仅一个 rank cache miss 后进入
-`launch-prepare`、其他 rank 却进入 `launch`。off/graph 的缓存仍按 stream 区分。
+GIN 的 key 不包含 rank-local stream，以免仅一个 rank cache miss 后进入
+`launch-prepare`、其他 rank 却进入 `launch`。off 路径（含其 Graph）的缓存仍按 stream 区分。
 去掉重复校验后，稳态 GIN 公共 forward 保留两次 collective agreement，原先为五次；
 首次编译和 cache miss 仍有额外准备步骤。
 
@@ -215,7 +221,7 @@ eager GIN 的 key 不包含 rank-local stream，以免仅一个 rank cache miss 
 
 | 范围 | 主要修改 | reviewer 关注点 |
 | --- | --- | --- |
-| `backends/mega/kernel/sm100/nvfp4_nvfp4_bf16_cutedsl/{config,backend}.py`（位于 `flashinfer/moe_ep/`） | 新参数、固定 allowlist、集体校验、workspace/launch cache、capture 拒绝 | 新开关不会自动选 next；错误在 staging 前传播 |
+| `backends/mega/kernel/sm100/nvfp4_nvfp4_bf16_cutedsl/{config,backend}.py`（位于 `flashinfer/moe_ep/`） | 新参数、固定 allowlist、集体校验、workspace/launch cache、预热后的 capture | 新开关不会自动选 next；错误在 staging 前传播 |
 | `flashinfer/moe_ep/core/kernel/base.py`、`modes/mega_layer.py` | 通用 collective-validation 能力和调用顺序 | 其他 backend 默认能力为 false；避免 rank-local 提前退出 |
 | `shim/gin.py`、`shim/gin_debug.py` | 注册 arena、NCCL/LSA session、错误边界和诊断 | 地址/生命周期；诊断不绕过 capability checks |
 | `shim/nvfp4.py`、`shim/autotune.py`、package exports | frontend/runtime 接线、非共享 GIN session、lean off entry、tuning 拒绝 | thunk 的 session/device/stream 归属 |
@@ -234,19 +240,32 @@ activation、singleton TMA 以及 BF16/MXFP8 兼容行为保留。VENDOR 列出�
 
 | 验证层 | 已完成结果 |
 | --- | --- |
-| Host contracts | 16 项：arena/wire、LSA offsets、集体错误和生命周期 |
+| Host contracts | 18 项：arena/wire、LSA offsets、集体错误、控制组复用/PG 重建和生命周期 |
 | 固定 N2R2 强 oracle | 每 rank 24 次 exact protocol 调用，全作业合计 96 项 transport/L1 byte 检查；包含 partial/empty rank、sparse holes 与 NaN invalid scores |
 | 独立 math | 原容差不变；最大 relative L2 为 `0.0026485608`，阈值 `0.02` |
-| 最终公共/强测试 | 每 rank 17 项通过，无 skips；覆盖 packed/BF16、rank-local 错误恢复、双 session/重建、capture 拒绝、单 rank stream 切换和 device mismatch |
-| 最终 off 兼容性 | 每 rank 4 项 finalizer 和 1 项 workspace/cache/graph 测试通过；更早 EP1/2/4、BF16/MXFP8 回归结果保留 |
+| 公共/强测试 | 每 rank 24 项通过，无 skips；包含三种 Graph 入口、BF16/packed、partial/empty rank、混合 capture 拒绝、未 warmup/metadata 错误恢复，以及已有 protocol/math/session/stream/device 检查 |
+| NCCL-only 默认组 | 每 rank 5 项通过，确认只在 capture 外创建一次 CPU/Gloo 控制组并复用 |
+| 当前 off 兼容性 | 每 rank 6 项通过：4 项 finalizer、1 项 workspace/cache/graph、1 项 legacy public graph replay |
 
-最终 GPU correctness source 为 `74c0362878cb6dd5d0c90c346c7b420848563f1d`；
-后续修改只涉及文档、vendor 状态说明和归档回执，Python runtime/test 字节未变。
-更早的 EP1/2/4、BF16/MXFP8 完整矩阵是历史验证，并未在最终源码重跑全部组合；
-最终源码重跑的是本表明确列出的17项与4+1项；每 rank 的24次 protocol 调用
-包含在17项测试中的 matrix/balanced 两个参数化 oracle case 内（各12次），不是额外一轮。失败的中间作业不计作通过。
-普通单机四 rank CI 不能替代两 domain 的 N2R2 验证。多节点测试需要正确的 torchrun
-geometry 和真实 rail/LSA 能力；跳过 topology-specific 测试不算验证成功。
+当前 runtime 验收 source 为 `3bb3a307b`，job `3578913` 在两台 GB200/SM100
+上 COMPLETED，exit0（CUDA13.3、Torch2.13dev、DSL4.6.2、NCCL2.30.7、driver580.196）。
+每种 Graph case 比较三份 Graph、12组变化输入，共36次 replay/rank；覆盖实际
+capture stream、输出污染、上游 clone 和下游 GPU 运算，profiler 断言 mega/reducer
+各一次。预初始化后的裸 compiled-call 实验 `3578784` 也通过每 rank16次 replay；
+它使用旧接收 worktree，其17个 device 文件与本 PR 一致，不代表原生 donor 的验收。
+
+后续 `19bd994fd`/`613421079` 仅增强测试：再连续排队12次 replay，并在每次
+replay 前污染 staged activation/SF/routes/weights 和输出，排除复用 eager 遗留输入的
+假通过。用预分配快照在一次最终同步后逐次比较，runtime 字节未变。最终补充 job
+`3579044` 在两台 GB200 上 COMPLETED，exit0：4个增强 Graph case/rank
+和5项 NCCL-only 检查/rank通过。每个 case 共48次精确 replay 比较，其中12次
+连续排队，无每轮主机同步/控制通信/分配；仅在末尾统一同步并校验预分配快照。
+更早 EP1/2/EP4、BF16/MXFP8 的全矩阵为历史证据；本轮只重新运行上表声明的范围。
+每 rank24次 protocol 调用包含在 matrix/balanced 两个 oracle case 中（各12次），
+93个非空批次的独立 math 最大 relative L2 为0.0026485608，阈值保持0.02。
+中间任务 `3578798` 虽通过24+5项测试，但因 launcher 重复销毁 PG 而 FAILED，
+不能算整轮验收通过；修复 launcher 后的 `3578913` 才是完整成功任务。
+普通单机四 rank CI 不能替代两个真实 domain；跳过拓扑测试不计为通过。
 
 Host contracts 不依赖 Torch/GPU；不能代替真实 CUDA/NCCL 结果：
 
@@ -270,6 +289,7 @@ torchrun --nnodes=2 --nproc-per-node=2 --node-rank="$NODE_RANK" \
 
 GPU 为 GB300（SM103，152 SM/device），Torch `2.13.0a0+9186a08b2c.nv26.07`、
 CUDA `13.3`、CuTe DSL `4.6.2`、nccl4py `0.3.1`、NCCL `2.30.7`、driver `580.173.10`。
+以下为此前 eager 性能测量，不是新 Graph 路径的计时或加速比。
 测量使用独占 GPU，未锁定 clocks；每对实现使用同一次 Slurm 作业资源分配（相同物理 GPU）和相同输入；
 这里的 allocation 不是指两个实现共享 CUDA 内存。
 
@@ -339,16 +359,70 @@ benchmark 的独立进程协议与最终 resident experiment 的 controller 不�
 ## 6. 合并评审边界
 
 本 PR 的可评审交付是默认关闭、固定范围的 legacy GIN 集成及上述验证结果。
-扩大 shape/topology、internode graphs、去掉公共校验、改变 reduce 精度/顺序、
+扩大 shape/topology、去掉 eager 公共校验、改变 reduce 精度/顺序、
 kernel autotuning 和正式 internode 性能 promotion 都需要后续工作。
 当前 PR 不以 baseline 波动为理由删除不利样本，也不将 correctness 通过等同于性能通过。
 
-已知 review 问题：当前 capture 拒绝有 rank-local 提前抛错的路径；仅一个 rank 处于
-capture 时，其他 rank 可能阻塞在 collective，直到 PG timeout。已通过的 capture 测试
-让所有 rank 同时 capture，不能覆盖这种非对称情况。该问题仍待修复，本轮提交清理
-没有更改 runtime，也不宣称已解决该 review finding。
+CUDA/PyTorch 由调用方管理 Graph；FI 提供可被捕获的 staging/launch 接口；
+GIN kernel 在设备端执行通信、计算和轮次推进，不自行创建 Graph。
 
-完整调查归档位于内部 `qiangf/agent-trace` 仓库，commit
+| 阶段 | CPU／Gloo | GPU |
+| --- | --- | --- |
+| Warmup（每个 session/workspace/权重准备状态） | 确认拓扑、初始化/注册、编译、准备参数、检查当前 route 值 | 初始化并执行一次 eager |
+| Capture（每份 Graph） | 执行 metadata、phase/session 和 capture-mode 的 CPU/Gloo 协商 | 录制 staging、mega/reduce 及相邻 GPU 操作 |
+| Replay（每批） | 不调用 FI Python、CPU/Gloo 预检 | 执行录制好的操作，更新设备通信状态 |
+
+输入或输出地址、shape/bucket 变化后需要使用相应输入重新 warmup/capture；
+不能让旧 Graph 自动改用新地址。只更新固定 buffer 内的数据不需要重新确认拓扑。
+初始化和 warmup 在 capture 外执行，并在开始 capture 前完成设备同步。
+
+使用现有 `MoEEpLayer`，由调用方通过 PyTorch 发起 capture：
+
+```python
+static = MoEEpTensors(hidden_states=x, topk_ids=ids, topk_weights=weights)
+layer.warmup(static)  # 所有 rank：初始化、注册、编译和 launch 参数准备
+# 当前输入的 route 值需要合法；也可在 Graph 外调用 stage_inputs 做 eager 校验。
+torch.cuda.synchronize()
+graph = torch.cuda.CUDAGraph()
+with torch.cuda.graph(graph):
+    y = layer.forward(static)  # 同时录制量化/staging、GIN mega、TopkReduce、output copy
+# 所有 rank 完成 capture 后，按相同顺序 replay。
+dist.barrier(group=dist.group.WORLD)
+graph.replay()
+```
+
+Capture 时执行 CPU metadata/phase/session 校验，但不读取 GPU route 值到 CPU；
+replay 不重跑捕获时的 Python forward，也不重新执行 CPU 预检。每个 rank 的 shape/地址在一份 Graph
+内固定；可以原位更新 activation、SF、route IDs/weights。调用方必须保证每次输入
+的 route ID 都在 `-1..47`，不能期待 replay 通过 CPU 抛出非法 route 值错误，
+也不能依赖设备端安全拒绝越界输入；违反此条件的执行不在支持范围内。
+输入更新与 replay 使用同一 stream，或由调用方使用 event/wait_stream 建立先后关系。
+同一 session 的多份 Graph 与 eager 可以串行交替使用，不能并发复用其 workspace；
+必须在下一次复用前消费输出，或将结果复制到独立存储。
+同一 workspace 的 Graph/eager 执行及共享输出的读取应使用同一 stream，或用
+event/wait_stream 保证前次执行与输出读取完成后再复用；不同 stream 上仅有 Python
+提交顺序并不构成设备执行顺序。
+这里的参与者是同一 GIN session 的全部默认 PG ranks；capture 的调用顺序/次数也应一致。
+所有参与 rank 必须按相同顺序、次数 replay，即使本 rank 的 live token 为零。
+固定 shape 为零的 rank 已有独立 bucket 测试；一份 Graph 内不改变实际 tensor shape。
+
+layer 持有准备后的量化权重；本次不承诺 Graph 中动态替换权重，修改原始 BF16
+weight pack 也不会自动更新已准备权重。必须让 layer、workspace/session、准备后的
+权重和 Graph 输入/输出保持有效，直至 Graph 不再使用且所有在途 replay 已完成；
+销毁 layer 会使捕获的设备指针失效。初始化、编译、参数重建和资源
+销毁仍在 Graph 外进行。metadata、未 warmup 或混合模式的 CPU 共同拒绝可修正后重新 capture；
+部分 Graph 应丢弃。设备/NCCL 错误仍按作业致命错误处理。
+
+低层调用方可在 capture 外集体调用 `nvfp4_mega_launch_thunk(w1, w2, workspace)`
+准备 launcher，`w1/w2` 为 kernel-ready 的 `(weight, scale)` 元组；
+再在目标 stream 的 capture 中调用它，GIN thunk 绑定当时的当前 stream。
+参数、权重或 workspace 生命周期改变后重新准备，不在 capture 中编译或注册。
+正式集成优先使用上述 `MoEEpLayer`；不扩展普通低层 `nvfp4_mega_moe` 的 capture 契约。
+
+
+此前迁移与 eager 性能的调查归档位于内部 `qiangf/agent-trace` 仓库，commit
 `2cf0a06da12654a3ab4089224523822f93de9807`，路径
 `cases/legacy-nvfp4-gin-blackwell-01a19f6e-r6`。它保留调查记录、报告和证据摘要；
-大型 tensor、profiler trace 和二进制仍保留在原始实验位置。归档不是运行本 PR 的前提。
+大型 tensor、profiler trace 和二进制仍保留在原始实验位置。该冻结归档不包含本轮
+新增 Graph 验证；本轮以本文 job IDs、对应测试源码及本地实验日志为准。
+归档不是运行本 PR 的前提。

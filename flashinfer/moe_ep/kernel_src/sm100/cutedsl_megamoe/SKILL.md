@@ -79,6 +79,11 @@ and NCCL imports lazy in that module and preserve all existing FI device
 patches. `src/src/nccl_gin_layout.py` is a byte-identical donor helper. Preserve
 the documented token-back generation-race correction until upstream absorbs
 it; numerical and performance acceptance status lives in the design document.
+GIN graphs require collective eager warmup with the same shape bucket before
+capture. Keep resources live and streams ordered; metadata/mode errors are
+agreed over CPU control during capture, while replay runs no host checks.
+Do not reintroduce GPU-to-host route reads into capture; each replay requires
+valid route IDs. Mixed eager/capture ranks must reject before device work.
 Qualify host contracts with
 `python -m unittest discover -s tests/cpu/moe_ep -p test_legacy_nvfp4_gin_contracts.py -v`
 from the repository root; this does not qualify CUDA or NCCL execution.

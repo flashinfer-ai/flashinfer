@@ -149,8 +149,12 @@ baseline. This is a partial MR !100 import, not a snapshot update:
 - Internode mode is experimental and default-off. The fixed N2R2 geometry
   passes strong protocol/math/byte/relaunch/public-lifetime qualification
   (final jobs 3576874/3576878, exit 0). Additional geometries remain disabled.
-  Subsequent GB300 validation passes17 strong/public tests per rank and the
-  retained4+1 off finalizer/cache/graph checks. All24 off performance gates
+  Subsequent GB200 graph qualification passes24 strong/public tests per rank,
+  5 NCCL-only checks and6 off finalizer/cache/graph checks. Additional queued
+  replay tests cover the public layer, split staging/compute and prepared
+  launch helpers. Initialization stays outside capture; GPU pointers/resources
+  remain live through replay. Graph replay performs no Python/Gloo preflight.
+  All24 off performance gates
   pass against legacy F_BASE. Internode public host overhead is reduced; raw
   native-donor comparisons remain inconclusive due to baseline dispersion.
   See the [PR design](../../../../../docs/design_docs/legacy_nvfp4_gin.md)
