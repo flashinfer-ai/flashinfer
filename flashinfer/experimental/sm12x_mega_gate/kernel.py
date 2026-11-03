@@ -875,9 +875,11 @@ class Sm12xMegaGateKernel:
             # Only CTAs with a share of the block wait for it.
             if logical_rank < tokens_in_block:
                 selector_shared_physical = Int32(0)
+                selector_fixed = Int32(0)
+                selector_given = Int32(NO_EXPERT)
                 if const_expr(self.cooperative):
                     # The CTA's tokens are known before their logits are: look up their
-                    # replicas while waiting.
+                    # replicas (and any fixed routing) while waiting.
                     selector_shared_physical = self.cooperative_lookups(
                         gate_warp,
                         lane,
@@ -893,6 +895,16 @@ class Sm12xMegaGateKernel:
                         map_width,
                         exchange_physical,
                     )
+                    if const_expr(self.has_fixed_routing):
+                        selector_fixed, selector_given = self.cooperative_fixed(
+                            gate_warp,
+                            lane,
+                            logical_rank,
+                            block_token_base,
+                            tokens_in_block,
+                            fix_mask,
+                            unmapped_idx,
+                        )
                 if gate_warp == Int32(0):
                     if lane == Int32(0):
                         address = counters_address + Int64(token_block) * Int64(
@@ -961,6 +973,8 @@ class Sm12xMegaGateKernel:
                         routed_scale,
                         map_width,
                         selector_shared_physical,
+                        selector_fixed,
+                        selector_given,
                         exchange_keys,
                         exchange_experts,
                         exchange_values,
@@ -1428,11 +1442,18 @@ class Sm12xMegaGateKernel:
         map_width: Int32,
     ):
         """Rank one token with one warp and store its routing slots."""
-        # 1. Load every split-K partial of the lane's experts before anything consumes them.
+        # 1. Load every split-K partial of the lane's experts before anything consumes them
+        #    (and a fixed-routing token's given experts).
         partials = [
             self.load_partials(scratch, token_block, t_local, lane, wave)
             for wave in range(self.num_waves)
         ]
+        fixed = Int32(0)
+        given_expert = Int32(NO_EXPERT)
+        if const_expr(self.has_fixed_routing):
+            fixed, given_expert = self.load_fixed_experts(
+                token, lane, fix_mask, unmapped_idx
+            )
         # While they are in flight, look up this token's replica of every lane expert (and
         # of the shared slot): no dependent lookup is left after the top-k.
         lane_physical = cute.make_rmem_tensor((self.num_lane_values,), Int32)
@@ -1488,11 +1509,12 @@ class Sm12xMegaGateKernel:
             )
 
         # 3. Warp top-k (a fixed-routing token keeps its given experts instead).
-        selected_expert = self.topk_rounds(lane, keys, experts)
+        selected_expert = given_expert
         if const_expr(self.has_fixed_routing):
-            selected_expert = self.fixed_experts(
-                token, lane, fix_mask, unmapped_idx, selected_expert
-            )
+            if fixed == Int32(0):
+                selected_expert = self.topk_rounds(lane, keys, experts)
+        else:
+            selected_expert = self.topk_rounds(lane, keys, experts)
 
         # 4. The selected expert's unbiased value and physical expert, fetched from the
         #    lane that holds them.
@@ -1620,6 +1642,8 @@ class Sm12xMegaGateKernel:
         routed_scale: Float32,
         map_width: Int32,
         selector_shared_physical: Int32,
+        selector_fixed: Int32,
+        selector_given: Int32,
         exchange_keys: cute.Tensor,
         exchange_experts: cute.Tensor,
         exchange_values: cute.Tensor,
@@ -1708,7 +1732,8 @@ class Sm12xMegaGateKernel:
                                 exchange_experts,
                                 exchange_values,
                                 exchange_physical,
-                                fix_mask,
+                                selector_fixed,
+                                selector_given,
                             )
                         else:
                             self.store_masked_token(
@@ -1730,7 +1755,8 @@ class Sm12xMegaGateKernel:
                             exchange_experts,
                             exchange_values,
                             exchange_physical,
-                            fix_mask,
+                            selector_fixed,
+                            selector_given,
                         )
 
     @cute.jit
@@ -1801,9 +1827,11 @@ class Sm12xMegaGateKernel:
         exchange_experts: cute.Tensor,
         exchange_values: cute.Tensor,
         exchange_physical: cute.Tensor,
-        fix_mask: cute.Tensor,
+        fixed: Int32,
+        given_expert: Int32,
     ):
-        """Top-k rounds over a cooperative token slot's posted waves, then its slots."""
+        """Top-k rounds over a cooperative token slot's posted waves, then its slots (a
+        fixed-routing token keeps its given experts: ``cooperative_fixed``)."""
         base = Int32(slot * self.num_aligned_experts)
         keys = cute.make_rmem_tensor((self.num_lane_values,), Int32)
         experts = cute.make_rmem_tensor((self.num_lane_values,), Int32)
@@ -1816,11 +1844,12 @@ class Sm12xMegaGateKernel:
             for position in cutlass.range_constexpr(EXPERTS_PER_LANE):
                 keys[wave * EXPERTS_PER_LANE + position] = wave_keys[position]
                 experts[wave * EXPERTS_PER_LANE + position] = wave_experts[position]
-        selected_expert = self.topk_rounds(lane, keys, experts)
+        selected_expert = given_expert
         if const_expr(self.has_fixed_routing):
-            selected_expert = self.fixed_experts(
-                token, lane, fix_mask, unmapped_idx, selected_expert
-            )
+            if fixed == Int32(0):
+                selected_expert = self.topk_rounds(lane, keys, experts)
+        else:
+            selected_expert = self.topk_rounds(lane, keys, experts)
         # Values and physical experts are posted by expert: one read each.
         expert = cutlass.min(
             cutlass.max(selected_expert, Int32(0)), Int32(self.num_experts - 1)
@@ -1849,27 +1878,53 @@ class Sm12xMegaGateKernel:
         )
 
     @cute.jit
-    def fixed_experts(
+    def load_fixed_experts(
         self,
         token: Int32,
         lane: Int32,
         fix_mask: cute.Tensor,
         unmapped_idx: cute.Tensor,
-        selected_expert: Int32,
-    ) -> Int32:
-        """Fixed routing (DeepGEMM's ``fix_routing_mask``): a flagged token takes the
-        logical experts of its ``unmapped_idx`` row, in their order and duplicates
-        included, instead of the top-k; their weights come from its unbiased scores as
-        for a ranked token. An id out of [0, E) is clamped into it, so no lookup leaves
-        the tables."""
-        expert = selected_expert
-        if fix_mask[token] != Uint8(0):
-            if lane < Int32(self.num_topk):
-                given = Int32(unmapped_idx[Int64(token), Int64(lane)])
-                expert = cutlass.min(
-                    cutlass.max(given, Int32(0)), Int32(self.num_experts - 1)
-                )
-        return expert
+    ):
+        """Fixed routing (DeepGEMM's ``fix_routing_mask``): whether a token keeps the
+        logical experts of its ``unmapped_idx`` row instead of the top-k (1 or 0), and the
+        expert of this lane's slot (NO_EXPERT past the top-k), in the row's order with
+        duplicates kept and ids clamped into [0, E) so no lookup leaves the tables. Read
+        before the token's logits are needed, so neither load is on the critical path;
+        the weights come from the token's unbiased scores as for a ranked token."""
+        given = Int32(
+            unmapped_idx[
+                Int64(token), Int64(cutlass.min(lane, Int32(self.num_topk - 1)))
+            ]
+        )
+        expert = cutlass.min(cutlass.max(given, Int32(0)), Int32(self.num_experts - 1))
+        return (
+            Int32(fix_mask[token]),
+            cutlass.select_(lane < Int32(self.num_topk), expert, Int32(NO_EXPERT)),
+        )
+
+    @cute.jit
+    def cooperative_fixed(
+        self,
+        gate_warp: Int32,
+        lane: Int32,
+        logical_rank: Int32,
+        block_token_base: Int32,
+        tokens_in_block: Int32,
+        fix_mask: cute.Tensor,
+        unmapped_idx: cute.Tensor,
+    ):
+        """Before a block's score wait: the fixed-routing flag and given experts of the
+        token this warp selects (``load_fixed_experts``), or (0, NO_EXPERT)."""
+        fixed = Int32(0)
+        given = Int32(NO_EXPERT)
+        for slot in cutlass.range_constexpr(self.cooperative_slots):
+            if gate_warp == Int32(self.slot_selector(slot)):
+                t_local = logical_rank + Int32(slot * self.num_logical_ctas)
+                if t_local < tokens_in_block:
+                    fixed, given = self.load_fixed_experts(
+                        block_token_base + t_local, lane, fix_mask, unmapped_idx
+                    )
+        return fixed, given
 
     @cute.jit
     def finish_token(
