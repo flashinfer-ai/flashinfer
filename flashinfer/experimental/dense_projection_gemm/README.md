@@ -230,8 +230,9 @@ head span.  At 152 SMs `"H1x5p44"` is 44 head and 380 tail units.
 and a fresh process per token count; the resident kernel holds 8, 16 or 32 SMs).  The `"waves"` rows are the FI-main
 `"waves"` plan (same kernel text, measured on this package's host path).  On GB200 the rows from 10240 tokens up ran at
 the GPU's software power cap: after 21 of their 24 runs `nvidia-smi` read `clocks_throttle_reasons` 0x4, at SM clocks of
-1297-1912 MHz (2062 MHz maximum); on the R200 parts it read 0x4 after some rows as well (on the 212-SM parts,
-sampled every 200 ms while the head/tail window rows ran: 0x4 in 17-47 % of the samples, median SM clock
+1297-1912 MHz (2062 MHz maximum); on the R200 parts it read 0x4 after some rows as well (sampled every 200 ms only
+during 6 of the 12 runs at hidden 5120 and 6 of the 10 at hidden 6144, those on two of the four 212-SM parts: 0x4 in
+17-47 % of the non-idle samples, median SM clock
 2388-2400 MHz, no hardware slowdown or thermal reason).  The arms of each row were measured interleaved, in paired
 groups.  Inside the head/tail windows cuBLAS FP32 in
 `CUBLAS_FP32_EMULATED_BF16X9_MATH` (the benchmark's `bf16x9` arm) took x1.455-1.565 (GB200 hidden 4096), x1.516-1.594
