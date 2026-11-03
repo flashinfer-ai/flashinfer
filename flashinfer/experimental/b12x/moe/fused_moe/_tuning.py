@@ -641,7 +641,7 @@ def _materialize_tuning(query, device, choice):
                 n=_dynamic_kernel_intermediate_size(
                     query.intermediate_size, effective_query.quant_mode
                 ),
-                deterministic_output=False,
+                deterministic_output=bool(query.deterministic_output),
                 planned_tile_m=config.dynamic_tile_m,
             )
         except RuntimeError as exc:

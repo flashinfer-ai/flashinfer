@@ -444,7 +444,7 @@ def test_heuristic_dynamic_route_mode_respects_deterministic_output(
 ):
     from b12x.preparation import FrozenMapping, DeviceIdentity
     from b12x.moe.fused_moe._tuning import MoeDecodeQuery
-    from flashinfer.experimental.b12x.moe.fused_moe._impl import (
+    from b12x.moe.fused_moe._impl import (
         _heuristic_dynamic_route_mode,
         _dynamic_direct_routing_selected,
         _dynamic_kernel_intermediate_size,
@@ -510,3 +510,71 @@ def test_heuristic_dynamic_route_mode_respects_deterministic_output(
         planned_tile_m=planned_tile_m,
     )
     assert is_direct == (not deterministic_output)
+
+
+@pytest.mark.parametrize("deterministic_output", [True, False])
+def test_materialize_tuning_respects_deterministic_output(
+    deterministic_output,
+):
+    from b12x.preparation import FrozenMapping, DeviceIdentity
+    from b12x.moe.fused_moe._tuning import MoeDecodeQuery, _materialize_tuning
+
+    query = MoeDecodeQuery(
+        quant_mode="w4a8_mx",
+        quant_modes=("w4a8_mx",),
+        source_format="mxfp8",
+        activation="silu",
+        io_dtype="bfloat16",
+        num_experts=384,
+        hidden_size=2048,
+        intermediate_size=2304,
+        top_k=8,
+        num_tokens=1,
+        routed_rows=8,
+        route_num_experts=384,
+        route_logits_dtype="float32",
+        apply_router_weight_on_input=False,
+        collect_activation_amax=False,
+        deterministic_output=deterministic_output,
+        swiglu_limit=None,
+        swiglu_alpha=1.702,
+        swiglu_beta=1.0,
+        w13_layout="fused",
+        weight_layouts=("fused",),
+        w4a16_weight_layout=None,
+        w4a16_scale_format=None,
+        w4a16_block_size_m=None,
+        fast_math=True,
+        numerical_recipe=None,
+        controls=FrozenMapping(),
+    )
+    device = DeviceIdentity(
+        vendor="nvidia",
+        compute_capability=(8, 0),
+        sm_count=108,
+        product_name="NVIDIA A100-PCIE-40GB",
+    )
+    choice = FrozenMapping(
+        {
+            "backend": "dynamic",
+            "route_planner": "internal",
+            "max_active_clusters": None,
+            "dynamic_tile_m": 16,
+            "dynamic_route_mode": "direct",
+            "nvfp4_share_input": False,
+            "nvfp4_materialize_intermediate": False,
+            "nvfp4_inline_scales": False,
+            "w4a16_route_mode": None,
+            "w4a16_tile_config": None,
+            "w4a16_block_size_m": None,
+            "w4a16_pipeline_stages": None,
+        }
+    )
+    if deterministic_output:
+        with pytest.raises(
+            ValueError, match="planned dynamic direct routing is unsupported"
+        ):
+            _materialize_tuning(query, device, choice)
+    else:
+        config = _materialize_tuning(query, device, choice)
+        assert config.dynamic_route_mode == "direct"
