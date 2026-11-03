@@ -1055,9 +1055,11 @@ def fp4_quantize(
     is_sf_8x4_layout: bool = False,
     is_global_scale_inversed: bool = False,
     enable_pdl: Optional[bool] = None,
-    backend: str = "cuda",
+    backend: str = "auto",
     # Appended last so existing positional construction keeps working.
     nvfp4_4over6: Optional[NVFP44Over6Config] = _UNSET,
+    *,
+    batch_invariant: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Quantize input tensor to FP4 format.
 
@@ -1092,7 +1094,9 @@ def fp4_quantize(
     backend : str
         Backend to use for quantization:
 
-        - ``"cuda"``: stable CUDA kernel (default).
+        - ``"auto"`` (default): the CUDA kernel, or the batch-invariant class
+          under ``batch_invariant=True`` (which requires ``"auto"``).
+        - ``"cuda"``: stable CUDA kernel.
         - ``"cute-dsl"``: CuTe-DSL kernel (SM100+, **experimental**).
           Supported combinations:
 
@@ -1108,6 +1112,18 @@ def fp4_quantize(
         - ``None``: 4over6 off. The environment is ignored.
         - :class:`NVFP44Over6Config`: on with exactly that recipe. The
           environment is ignored.
+
+    batch_invariant : bool
+        Run the batch-invariant class of the recipe instead of a backend:
+        ``nvfp4.quant`` for ``sf_vec_size=16, sf_use_ue8m0=False`` (the
+        per-tensor NVFP4 class; ``global_scale`` None is the scale 1.0 and
+        ``is_global_scale_inversed`` gives it ``1 / global_scale`` by one
+        correctly rounded fp32 division) and ``mxfp4.quant`` for
+        ``sf_vec_size=32, sf_use_ue8m0=True``; the same classes
+        :func:`nvfp4_quantize` and :func:`mxfp4_quantize` run. Other
+        recipes, fp8 input and a 4over6 recipe raise
+        :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`
+        instead of falling back. See ``flashinfer/batch_invariant/README.md``.
 
     Returns
     -------
@@ -1174,6 +1190,30 @@ def fp4_quantize(
     if global_scale is not None:
         global_scale = global_scale.to(device=input.device, dtype=torch.float32)
 
+    if batch_invariant:
+        if backend != "auto":
+            raise ValueError(
+                "fp4_quantize: batch_invariant=True requires backend='auto' "
+                f"(got backend={backend!r})"
+            )
+        from ..batch_invariant.quantization.nvfp4_api import (
+            fp4_quantize_batch_invariant,
+        )
+
+        return fp4_quantize_batch_invariant(
+            input,
+            global_scale,
+            sf_vec_size,
+            sf_use_ue8m0,
+            is_sf_swizzled_layout,
+            is_sf_8x4_layout,
+            is_global_scale_inversed,
+            enable_pdl,
+            nvfp4_4over6_config,
+        )
+    if backend == "auto":
+        backend = "cuda"
+
     if backend == "cute-dsl":
         return _fp4_quantize_cute_dsl(
             input,
@@ -1186,7 +1226,9 @@ def fp4_quantize(
             nvfp4_4over6_config,
         )
     elif backend != "cuda":
-        raise ValueError(f"Unknown backend: {backend}. Must be 'cuda' or 'cute-dsl'.")
+        raise ValueError(
+            f"Unknown backend: {backend}. Must be 'auto', 'cuda' or 'cute-dsl'."
+        )
 
     # for column major input, we need to transpose the input
     is_column_major = input.stride(-2) == 1

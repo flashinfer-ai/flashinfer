@@ -423,3 +423,68 @@ def test_zero_rows_and_unsupported_inputs():
         nvfp4_quantize_batch_invariant(x, gs, nvfp4_4over6=object())
     with pytest.raises(E, match="out_scale"):
         nvfp4_quantize_batch_invariant(x, gs, out_scale=torch.ones(4, device="cuda"))
+
+
+@needs_device
+def test_fp4_quantize_entry_point_runs_the_class():
+    """``flashinfer.fp4_quantize(..., batch_invariant=True)``, the entry point behind ``nvfp4_quantize``, runs the per-tensor
+    class with its own argument forms: the layout flags, ``global_scale`` None as the scale 1.0, ``is_global_scale_inversed``
+    as one correctly rounded division, a column-major input quantized as the transpose of its row-major view with the
+    outputs transposed back; the same bytes and views as ``nvfp4_quantize``; the recipes it does not have raise."""
+    from flashinfer.quantization.nvfp4_quantization_utils import NVFP44Over6Config
+
+    x = adversarial_inputs(128, 1024, torch.bfloat16, seed=5)
+    gs_t = torch.full((1,), _gs(x, False), dtype=torch.float32, device="cuda")
+
+    def host(outs):
+        return tuple(t.cpu() for t in outs)
+
+    for layout, flags in (
+        ("128x4", dict(is_sf_swizzled_layout=True)),
+        ("8x4", dict(is_sf_swizzled_layout=True, is_sf_8x4_layout=True)),
+        ("linear", dict(is_sf_swizzled_layout=False)),
+    ):
+        got = flashinfer.fp4_quantize(x, gs_t, 16, batch_invariant=True, **flags)
+        ref = flashinfer.nvfp4_quantize(
+            x, gs_t, sfLayout=FI_LAYOUTS[layout], batch_invariant=True
+        )
+        assert got[0].shape == ref[0].shape and got[1].shape == ref[1].shape
+        assert same_bits(host(got), host(ref)), layout
+    one = flashinfer.fp4_quantize(x, None, 16, batch_invariant=True)
+    assert same_bits(
+        host(one), host(flashinfer.nvfp4_quantize(x, 1.0, batch_invariant=True))
+    )
+    inv_t = 1.0 / gs_t
+    inv = flashinfer.fp4_quantize(
+        x, inv_t, 16, is_global_scale_inversed=True, batch_invariant=True
+    )
+    assert same_bits(
+        host(inv), host(flashinfer.nvfp4_quantize(x, 1.0 / inv_t, batch_invariant=True))
+    )
+    y = x.t().contiguous()  # row-major (1024, 128)
+    xc = y.t()  # x's values as a column-major (128, 1024) view
+    assert xc.stride(-2) == 1 and torch.equal(xc, x)
+    cm = flashinfer.fp4_quantize(xc, gs_t, 16, batch_invariant=True)
+    rm = flashinfer.fp4_quantize(y, gs_t, 16, batch_invariant=True)
+    assert torch.equal(cm[0], rm[0].t()) and torch.equal(cm[1], rm[1].t())
+    E = bi.BatchInvariantUnsupportedError
+    with pytest.raises(ValueError, match="requires backend='auto'"):
+        flashinfer.fp4_quantize(x, gs_t, 16, backend="cuda", batch_invariant=True)
+    with pytest.raises(E, match="sf_vec_size = 32 with sf_use_ue8m0 = False"):
+        flashinfer.fp4_quantize(x, gs_t, 32, sf_use_ue8m0=False, batch_invariant=True)
+    with pytest.raises(E, match="sf_vec_size = 16 with sf_use_ue8m0 = True"):
+        flashinfer.fp4_quantize(x, None, 16, sf_use_ue8m0=True, batch_invariant=True)
+    with pytest.raises(E, match="dtype"):
+        flashinfer.fp4_quantize(
+            x.to(torch.float8_e4m3fn), gs_t, 16, batch_invariant=True
+        )
+    with pytest.raises(E, match="4over6"):
+        flashinfer.fp4_quantize(
+            x,
+            gs_t,
+            16,
+            nvfp4_4over6=NVFP44Over6Config(
+                e4m3_max=448, err_mode="MAE", err_use_fast_math=False
+            ),
+            batch_invariant=True,
+        )

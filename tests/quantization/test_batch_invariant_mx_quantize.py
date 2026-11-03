@@ -361,3 +361,25 @@ def test_zero_rows_and_unsupported_inputs(fmt):
     if fmt is S.MXFP8:
         with pytest.raises(E, match="alignment"):
             api(x, alignment=48, batch_invariant=True)
+
+
+@needs_device
+def test_fp4_quantize_entry_point_runs_the_mxfp4_class():
+    """``flashinfer.fp4_quantize(..., sf_vec_size=32, sf_use_ue8m0=True, batch_invariant=True)``, the entry point behind
+    ``mxfp4_quantize``, runs the MXFP4 class with the entry point's layout flags and its ``(rows, columns)`` scale view of
+    the same bytes."""
+    x = adversarial_inputs(130, 1024, torch.bfloat16, seed=5, block=BLOCK)
+    for layout, flags in (
+        ("128x4", dict(is_sf_swizzled_layout=True)),
+        ("8x4", dict(is_sf_swizzled_layout=True, is_sf_8x4_layout=True)),
+        ("linear", dict(is_sf_swizzled_layout=False)),
+    ):
+        q, sf = flashinfer.fp4_quantize(
+            x, None, 32, sf_use_ue8m0=True, batch_invariant=True, **flags
+        )
+        rq, rsf = flashinfer.mxfp4_quantize(
+            x, sfLayout=FI_LAYOUTS[layout], batch_invariant=True
+        )
+        cols = 1024 // BLOCK if layout == "linear" else -(-(1024 // BLOCK) // 4) * 4
+        assert q.shape == rq.shape and sf.shape == (rsf.numel() // cols, cols)
+        assert torch.equal(q, rq) and torch.equal(sf.reshape(-1), rsf)

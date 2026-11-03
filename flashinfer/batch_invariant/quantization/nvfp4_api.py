@@ -286,3 +286,72 @@ def nvfp4_quantize_batch_invariant(
     if per_token_activation:
         return fp4, sf, res[2]
     return fp4, sf
+
+
+def fp4_quantize_batch_invariant(
+    input: torch.Tensor,
+    global_scale: Optional[torch.Tensor],
+    sf_vec_size: int,
+    sf_use_ue8m0: bool,
+    is_sf_swizzled_layout: bool,
+    is_sf_8x4_layout: bool,
+    is_global_scale_inversed: bool,
+    enable_pdl: Optional[bool],
+    nvfp4_4over6_config,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """``flashinfer.fp4_quantize(..., backend="auto", batch_invariant=True)``, the entry point behind
+    :func:`flashinfer.nvfp4_quantize` and :func:`flashinfer.mxfp4_quantize`: the per-tensor NVFP4 class for
+    ``sf_vec_size=16, sf_use_ue8m0=False`` and the MXFP4 class for ``sf_vec_size=32, sf_use_ue8m0=True``, the two recipes
+    it quantizes, with its own argument forms and output contract: ``x_q`` uint8 ``(..., K / 2)``; ``sf`` as a
+    ``(rows, columns)`` view (the padded columns of the swizzled layouts, ``K / sf_vec_size`` for the linear one); a
+    column-major input is quantized as the transpose of its row-major view and the outputs are transposed back, as the
+    entry point does; ``global_scale`` None is the scale 1.0; ``is_global_scale_inversed`` gives the class
+    ``1 / global_scale`` by one correctly rounded fp32 division. Any other recipe, an fp8 input or a 4over6 recipe raises
+    :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; nothing falls back."""
+    from ...utils import device_support_pdl
+    from .mx_api import CLASS_MXFP4, mxfp4_quantize_batch_invariant
+
+    is_nvfp4 = sf_vec_size == BLOCK and not sf_use_ue8m0
+    is_mxfp4 = sf_vec_size == 2 * BLOCK and sf_use_ue8m0
+    if not (is_nvfp4 or is_mxfp4):
+        raise unsupported(
+            f"{CLASS_NVFP4} / {CLASS_MXFP4}",
+            f"sf_vec_size = {sf_vec_size} with sf_use_ue8m0 = {sf_use_ue8m0}",
+            "sf_vec_size = 16 with e4m3 scales (the NVFP4 class) or sf_vec_size = 32 with UE8M0 scales (the MXFP4 class)",
+        )
+    cls = CLASS_NVFP4 if is_nvfp4 else CLASS_MXFP4
+    if nvfp4_4over6_config is not None:
+        raise unsupported(
+            cls,
+            "an NVFP4 4over6 scale-candidate search",
+            "the plain NVFP4 recipe (nvfp4_4over6=None): a candidate search is another specification",
+        )
+    if is_sf_swizzled_layout:
+        layout = "8x4" if is_sf_8x4_layout else "128x4"
+    else:
+        layout = "linear"
+    if enable_pdl is None:
+        enable_pdl = device_support_pdl(input.device)
+    # The entry point quantizes a column-major input as the transpose of its row-major view (a placement).
+    column_major = input.dim() >= 2 and input.stride(-2) == 1 and input.stride(-1) != 1
+    x = input.transpose(-2, -1) if column_major else input
+    if is_mxfp4:
+        codes, sf = mxfp4_quantize_batch_invariant(x, layout, bool(enable_pdl))
+    else:
+        if global_scale is None:
+            gs: Union[float, torch.Tensor] = 1.0
+        elif is_global_scale_inversed:
+            gs = 1.0 / global_scale.to(device=x.device, dtype=torch.float32)
+        else:
+            gs = global_scale
+        codes, sf = nvfp4_quantize_batch_invariant(
+            x, gs, layout, enable_pdl=bool(enable_pdl)
+        )
+    K = int(x.shape[-1])
+    cols = (
+        -(-(K // sf_vec_size) // 4) * 4 if is_sf_swizzled_layout else K // sf_vec_size
+    )
+    sf = sf.reshape(-1, cols)
+    if column_major:
+        codes, sf = codes.transpose(-2, -1), sf.transpose(-2, -1)
+    return codes, sf
