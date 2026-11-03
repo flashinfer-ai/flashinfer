@@ -185,19 +185,22 @@ def test_shared_multi_wave_selection_plans_the_balanced_program(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "mb,heads,count,sm_count",
+    "mb,heads,count,sm_count,routed",
     [
-        (32, 8, 16, 148),  # 256 tiles: fewer than two per SM
-        (64, 8, 4, 148),  # four blocks per query block: the ordinary kernel's
-        (38, 8, 16, 152),  # 304 tiles: two per SM on 152 SMs, routed
+        (14, 8, 16, 148, False),  # 112 tiles: fewer than 0.8 per SM
+        (15, 8, 16, 148, True),  # 120 tiles: 0.81 per SM on 148 SMs
+        (15, 8, 16, 152, False),  # 120 tiles: 0.79 per SM on 152 SMs
+        (16, 8, 8, 152, True),  # 128 tiles: the S = 1024 standings rows
+        (32, 8, 16, 148, True),  # 256 tiles: the S = 2048 standings rows
+        (64, 8, 4, 148, False),  # four blocks per query block: the ordinary kernel's
     ],
 )
-def test_route_needs_two_tiles_per_sm_and_more_than_four_blocks(
-    monkeypatch, mb, heads, count, sm_count
+def test_route_needs_eight_tenths_of_a_wave_and_more_than_four_blocks(
+    monkeypatch, mb, heads, count, sm_count, routed
 ):
+    assert cake_vsa._BLK64_BALANCED_MIN_WAVES == 0.8
     mask = _shared_mask(heads, mb, 64, [count] * mb, "cpu")
     plan = _plan_on_cpu(monkeypatch, mask, sm_count=sm_count)
-    routed = mb * heads >= 2 * sm_count and count > 4
     assert (plan["blk64_balanced"] is not None) == routed
 
 
@@ -357,10 +360,10 @@ def test_two_wrappers_on_two_streams_keep_their_own_counters():
 @requires_gpu
 def test_unrouted_plans_keep_the_per_head_programs():
     device = torch.device("cuda")
-    heads, seq = 8, 2048
+    heads, seq = 8, 896
     mb = seq // BLOCK
-    # 256 tiles: fewer than two per SM
-    mask = _shared_mask(heads, mb, mb, [16] * mb, device, seed=6)
+    # 112 tiles: fewer than 0.8 per SM on both targets
+    mask = _shared_mask(heads, mb, mb, [8] * mb, device, seed=6)
     q, k, v = _inputs(seq, seq, heads, device, seed=4)
     wrapper = BlockSparseAttentionWrapper(
         torch.empty((1,), dtype=torch.uint8, device=device), backend="cake"

@@ -18,9 +18,9 @@ every head, four selected 64-key blocks per M64N256 tile; a ragged selection of 
 than one wave is handed out in descending selection size through one global ticket
 counter that the kernel resets for the next launch. The host module
 ``flashinfer.cake_vsa`` selects the program at plan time (a shared selection of more
-than four blocks per query block on average and at least two tiles per SM) and launches
-the grid (min(query blocks x heads, SMs), 1, 1); every other block-64 plan keeps the
-module's per-head programs.
+than four blocks per query block on average and at least 0.8 (query block, head) tiles
+per SM) and launches the grid (min(query blocks x heads, SMs), 1, 1); every other
+block-64 plan keeps the module's per-head programs.
 
 Generated file: every value below is derived from the exported sources and checked
 against them; do not edit.

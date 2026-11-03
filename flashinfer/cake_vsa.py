@@ -36,8 +36,9 @@ _BLK64_ORDINARY_MAX_AVERAGE_SELECTED_BLOCKS = 24
 _FP16_DIRECT_Q_TILE = 256
 # The block-64 balanced program (``flashinfer.jit.cake_vsa_balanced``) serves a
 # selection shared by every head with more than four selected blocks per query
-# block on average and at least this many tiles per SM of its persistent grid.
-_BLK64_BALANCED_MIN_WAVES = 2
+# block on average and at least this many (query block, head) tiles per SM, that
+# is this fraction of a wave of its one-CTA-per-SM persistent grid.
+_BLK64_BALANCED_MIN_WAVES = 0.8
 _BLK64_BALANCED_BLOCKS_PER_GROUP = 4
 
 
