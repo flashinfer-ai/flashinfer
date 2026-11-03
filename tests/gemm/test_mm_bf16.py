@@ -181,11 +181,28 @@ def test_mm_bf16_autotune_unaligned_n(monkeypatch, n, k):
         pytest.skip("The CUTLASS BF16 backend is used on SM100-family.")
 
     monkeypatch.setattr(AutoTuner, "_instance", AutoTuner())
+
+    # Correctness alone does not pin this down: the tuner already caught
+    # CUTLASS's host-side can_implement rejection and moved on, so the result
+    # was right either way. Assert the shape never reaches CUTLASS at all.
+    profiled = set()
+    profile_single_kernel = AutoTuner._profile_single_kernel
+
+    def record_runner(self, runner, *args, **kwargs):
+        profiled.add(type(runner).__name__)
+        return profile_single_kernel(self, runner, *args, **kwargs)
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", record_runner)
+
     torch.manual_seed(0)
     a = torch.randn(64, k, device="cuda", dtype=torch.bfloat16)
     w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
     with autotune(True, tuning_buckets=[1, 32, 64]):
         mm_bf16(a, w.T, backend="auto")
+
+    assert profiled, "autotuning profiled nothing, so the assertion below is vacuous"
+    assert "CutlassBf16GemmRunner" not in profiled, profiled
+
     for m in (1, 32, 64):
         out = mm_bf16(a[:m], w.T, backend="auto")
         reference = (a[:m].float() @ w.float().T).to(torch.bfloat16)
