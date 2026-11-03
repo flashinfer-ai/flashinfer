@@ -30,10 +30,11 @@ ARCHES = ["sm_100a", "sm_103a"]
 N32 = "cake_kda_bf16_02c6dae5d13691ae05c3"
 N16 = "cake_kda_bf16_51e813006f17147a02a5"
 DIR = "cake_kda_bf16_893740628d53688ac269"
-# The next-state prefetch builds of the work-binned programs.
+# The next-state prefetch builds of the work-binned programs (the N16 build
+# also stores its final state with per-warp TMA boxes).
 PREFETCH = {
     N32: "cake_kda_prefill_4a42f56b2227bc7d99fa",
-    N16: "cake_kda_prefill_fb49a4a893151688ea5f",
+    N16: "cake_kda_prefill_e37381d75cc3b9e271d7",
 }
 # The per-warp checkpoint build of the owner/helper program, and the pooled
 # owner/helper program.
