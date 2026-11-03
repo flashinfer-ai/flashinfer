@@ -63,7 +63,8 @@ backend are experimental: no compatibility guarantee.
   every output, the raw gate's gradient and the per-rank parameter partial
   sums are bitwise those of the deterministic package.  The in-kernel q / k
   L2 norm (`use_qk_l2norm_in_kernel=True`, #7817) is not available here: the
-  entry points raise `ValueError` for it, and its off value
+  entry points, `kda_workspace_bytes_kcp` and `kda_saved_bytes_kcp` raise
+  `ValueError` for it, naming `deterministic=True`.  Its off value
   (`use_qk_l2norm_in_kernel=False`) is accepted, so a call that spells it out
   runs unchanged.
 

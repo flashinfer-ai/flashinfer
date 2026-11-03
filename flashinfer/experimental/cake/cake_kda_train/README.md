@@ -89,9 +89,16 @@ for the previous one passes its `bool` in that slot and raises `TypeError`.
   package of the call's mode.
 - Both packages' saved sets carry `gate` / `lower_bound`, so either backward
   reads the other's set of either gate mode; a backward in the other mode or
-  with another `lower_bound` is refused.  This package does not run the
-  in-kernel q / k L2 norm (#7817): its backward refuses a saved set of that
-  mode (`ValueError`).
+  with another `lower_bound` is refused.
+- The in-kernel q / k L2 norm (`use_qk_l2norm_in_kernel=True`, raw `q` / `k`
+  normalized inside the kernels, FlashInfer #7817) runs on the deterministic
+  package only, in either gate mode: the facade forwards the keyword to it
+  with `deterministic=True`, and this package's entry points raise
+  `ValueError` for it (`KdaWorkspace.for_problem`, `workspace_bytes` and
+  `saved_bytes` for `l2n` other than `"off"`).  `False` is accepted, so a
+  call that spells it out runs unchanged.  The saved set carries the
+  deterministic package's `qk_rstd` / `qk_l2norm` fields (`None` / `False`
+  here), and the backward refuses a set of that mode (`ValueError`).
 
 ## What changes: the `S1` backward pairs
 
@@ -289,6 +296,7 @@ changes:
 | `dqkg_davq_nohint`, `dqkg_int_davq_nohint` | not shipped (`sm_107a` runs the `S1` pairs from 16 heads); their programs ship as `dqkg_davq_nohint_raw` / `dqkg_int_davq_nohint_raw` |
 | `fwd_intra_raw`, `fwd_intra_v14_raw`, `bwd_prep_g8_raw`, `bwd_prep_g8_replay_raw`, `bwd_prep_g8_noqg_raw`, `bwd_prep_g8_noqg_nokb_raw`, `glm_intra_raw`, `param_finalize` | the raw gate mode's records, unchanged (all three architectures) |
 | `dqkg_raw`, `dqkg_int_raw`, `dqkg_davq_raw`, `dqkg_int_davq_raw`, `dqkg_davq_nohint_raw`, `dqkg_int_davq_nohint_raw` | new: the raw gate mode's `dqkg` class (`gate: "raw"`), the deterministic package's `dqkg` records of the same names without the suffix and their rules, so the raw mode selects the deterministic pair on every row (all three architectures) |
+| `fwd_intra_l2n`, `fwd_intra_v14_l2n`, `fwd_intra_v37_l2n`, `bwd_prep_g8_l2n`, `bwd_prep_g8_replay_l2n`, `bwd_prep_g8_noqg_l2n`, `bwd_prep_g8_noqg_nokb_l2n`, `glm_intra_l2n`, `glm_intra_l2n_capture`, `qk_l2norm`, `qk_l2norm_apply`, `qk_pullback`, `fwd_intra_raw_l2n`, `fwd_intra_v14_raw_l2n`, `bwd_prep_g8_raw_l2n`, `bwd_prep_g8_replay_raw_l2n`, `bwd_prep_g8_noqg_raw_l2n`, `bwd_prep_g8_noqg_nokb_raw_l2n`, `glm_intra_raw_l2n`, `glm_intra_raw_l2n_capture` | not shipped (the in-kernel Q/K L2 norm, which this package refuses) |
 | `fwd_intra_v19`, `fwd_intra_v20` | new: the checkpoint hand-off's intra twins of `fwd_intra_v14` and `fwd_intra` (all three architectures); no path selects them |
 | `wy_bwd_v9` | new: the tape WY twin of `wy_bwd`, writing `w` alone (all three architectures); no path selects it |
 

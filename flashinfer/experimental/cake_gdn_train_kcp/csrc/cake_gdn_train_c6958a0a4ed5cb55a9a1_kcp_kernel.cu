@@ -47,15 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define SMEM_X_BLOCK_OFF 0
-#define SMEM_X_BLOCK_STAGE_BYTES 4096
-#define SMEM_X_BLOCK_STRIDE 4096
-#define SMEM_SLABS_OFF 4096
-#define SMEM_SLABS_STAGE_BYTES 33024
-#define SMEM_SLABS_STRIDE 33024
-#define SMEM_TOTAL 37120
-#define THREADS 128
 #define LAUNCH_MIN_BLOCKS 2
 
 #include <math_constants.h>

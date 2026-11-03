@@ -31,7 +31,7 @@ next to this file (its entries sit beside the zero-history entries);
 ``aot/`` file when a builder compiled it and otherwise through FlashInfer's JIT
 from the same sources and flags, verifying every source digest first.
 
-The routes of an architecture are the three KCP kinds: ``kcp_fwd`` (one
+The routes of an architecture are the four KCP kinds: ``kcp_fwd`` (one
 program: ``y`` and the fragments' history rows ``hist`` from ``x``, ``weight``,
 ``cu_seqlens`` and the context's history tables), ``kcp_bwd`` (the fallback
 program and the big-channel ``_st8`` program, selected by the channel count
@@ -39,7 +39,13 @@ exactly as the zero-history backward route selects its programs: a record's
 ``select_rule`` ``channels_at_least`` owns ``C >= channels[arch]``, the record
 without a rule is the fallback; ``dx``, the deterministic FP32 ``dweight`` and
 the predecessor fragments' tail derivatives ``dpre_tail`` in one cooperative
-launch) and ``kcp_bwd_head`` (one program: the head-row derivatives
+launch), ``kcp_bwd_split`` (the same two programs built with ``split=True``,
+selected by the same rule: each is an ordinary launch one SM short of
+co-resident -- ``grid_rule.reserve_sms`` -- writing per-CTA ``dweight`` partial
+rows, followed on the same stream by the record's ``reduce`` program, the
+zero-history package's fixed-order reduction; a launch that no grid-wide
+barrier holds back starts beside kernels of other streams, FlashInfer issue
+#8365) and ``kcp_bwd_head`` (one program: the head-row derivatives
 ``dpre_head`` every consumer fragment sends back; its grid is
 ``max(1, n_frag x ceil(C / (threads x vec)))``, computed by :mod:`.kcp` from
 the record's ``grid_rule.geometry`` and launched through the record's
@@ -65,7 +71,8 @@ from: the forward and the head program with their kernel files' default
 keywords; the backward with ``vec=8, copy="tma2d"`` on sm_100a and sm_103a,
 with ``vec=8, min_blocks=2`` on sm_107a, and the big-channel backward with
 ``vec=8, copy="tma2d", stage_tokens=8, min_blocks=2`` -- the builds of the
-zero-history backward, which the KCP kernels extend.
+zero-history backward, which the KCP kernels extend; the ``kcp_bwd_split``
+programs add ``split=True`` to those keywords.
 """
 
 from __future__ import annotations
@@ -430,6 +437,282 @@ MODULES: dict[str, dict[str, Any]] = {
             "taps": 4,
         },
     },
+    "cake_causal_conv1d_det_train_facdd7ca702cfb7d821a_kcp": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "x"],
+            ["buffer", "w"],
+            ["buffer", "cu"],
+            ["buffer", "dy"],
+            ["buffer", "dx"],
+            ["buffer", "dw"],
+            ["buffer", "partial"],
+            ["buffer", "hist"],
+            ["buffer", "hist_row_off"],
+            ["buffer", "dpre_tail"],
+            ["buffer", "tail_row_off"],
+            ["parameter", "S"],
+            ["parameter", "C"],
+            ["parameter", "num_docs"],
+            ["parameter", "search_steps"],
+            ["parameter", "ct_vec"],
+            ["parameter", "n_sub"],
+            ["parameter", "n_ch_tiles"],
+            ["buffer", "x_map"],
+            ["buffer", "dy_map"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        # The ``split`` build of the cooperative fallback above (route
+        # ``kcp_bwd_split``, FlashInfer issue #8365): an ordinary launch with no
+        # grid-wide barrier that ends at its partial row; the record's
+        # ``reduce`` program sums the partial rows in the fixed order.  3 CTAs
+        # per SM (168 registers at 128 threads, the launch bound); the grid is
+        # the co-resident CTA count less the ``reserve_sms`` SMs
+        # (:func:`.kcp.launch_grid`).  The fallback program of the route (no
+        # ``select_rule``).  Besides ``dx``
+        # and ``dw`` it writes the predecessors' tail derivatives
+        # ``dpre_tail`` (FP32 ``[n_tail_rows, C]``) at the rows
+        # ``tail_row_off`` (int32 ``[n_frag, 3]``, ``-1`` = none) names and
+        # reads the forward's ``hist`` rows through ``hist_row_off``.
+        "grid_rule": {
+            "cooperative": False,
+            "ctas_per_sm": 3,
+            "reserve_sms": 1,
+            "geometry": {
+                "threads": 128,
+                "vec": 8,
+            },
+            "kind": "co_resident",
+        },
+        "kernel": "cake_causal_conv1d_det_train_facdd7ca702cfb7d821a_kcp",
+        "kernel_symbol": "kernel_cake_causal_conv1d_det_train_facdd7ca702cfb7d821a_kcp",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 50176,
+            "use_pdl": False,
+        },
+        "library": "cake_causal_conv1d_det_train_facdd7ca702cfb7d821a_kcp",
+        # The reduce program the host launches next on the same stream (``use_pdl``): the zero-history
+        # package's default fixed-order reduce over this program's partial rows (FlashInfer issue #8365).
+        "reduce": "cake_causal_conv1d_det_train_86b5ecfbd90aca4b52e5",
+        "logical": {
+            "C": "C",
+            "S": "S",
+            "ct_vec": "ct_vec",
+            "cu": "cu",
+            "dpre_tail": "dpre_tail",
+            "dw": "dw",
+            "dx": "dx",
+            "dy": "dy",
+            "dy_map": "dy",
+            "hist": "hist",
+            "hist_row_off": "hist_row_off",
+            "n_ch_tiles": "n_ch_tiles",
+            "n_sub": "n_sub",
+            "num_docs": "num_docs",
+            "partial": "partial",
+            "search_steps": "search_steps",
+            "tail_row_off": "tail_row_off",
+            "w": "w",
+            "x": "x",
+            "x_map": "x",
+        },
+        "role": "kcp_bwd_split",
+        # The FP32 ``partial`` workspace: ``[ceil(grid / n_ch_tiles), C, taps]``
+        # rows of per-CTA dweight partials, reduced in fixed order by the
+        # ``reduce`` program (:func:`partial_rows`, :func:`partial_bytes`).
+        "workspace_rule": {
+            "kind": "partial_rows",
+            "taps": 4,
+        },
+    },
+    "cake_causal_conv1d_det_train_f3bd6b02735ab7bbb8b5_kcp": {
+        "arches": [
+            "sm_107a",
+        ],
+        "arg_plan": [
+            ["buffer", "x"],
+            ["buffer", "w"],
+            ["buffer", "cu"],
+            ["buffer", "dy"],
+            ["buffer", "dx"],
+            ["buffer", "dw"],
+            ["buffer", "partial"],
+            ["buffer", "hist"],
+            ["buffer", "hist_row_off"],
+            ["buffer", "dpre_tail"],
+            ["buffer", "tail_row_off"],
+            ["parameter", "S"],
+            ["parameter", "C"],
+            ["parameter", "num_docs"],
+            ["parameter", "search_steps"],
+            ["parameter", "ct_vec"],
+            ["parameter", "n_sub"],
+            ["parameter", "n_ch_tiles"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        # The ``split`` build of the sm_107a fallback backward (``vec=8,
+        # min_blocks=2``: two CTAs per SM, bulk copies, no tensor maps): an
+        # ordinary launch followed by the record's ``reduce`` program; the grid
+        # is the co-resident CTA count less the ``reserve_sms`` SMs.
+        "grid_rule": {
+            "cooperative": False,
+            "ctas_per_sm": 2,
+            "reserve_sms": 1,
+            "geometry": {
+                "threads": 128,
+                "vec": 8,
+            },
+            "kind": "co_resident",
+        },
+        "kernel": "cake_causal_conv1d_det_train_f3bd6b02735ab7bbb8b5_kcp",
+        "kernel_symbol": "kernel_cake_causal_conv1d_det_train_f3bd6b02735ab7bbb8b5_kcp",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 50176,
+            "use_pdl": False,
+        },
+        "library": "cake_causal_conv1d_det_train_f3bd6b02735ab7bbb8b5_kcp",
+        # The reduce program the host launches next on the same stream (``use_pdl``): the zero-history
+        # package's default fixed-order reduce over this program's partial rows (FlashInfer issue #8365).
+        "reduce": "cake_causal_conv1d_det_train_86b5ecfbd90aca4b52e5",
+        "logical": {
+            "C": "C",
+            "S": "S",
+            "ct_vec": "ct_vec",
+            "cu": "cu",
+            "dpre_tail": "dpre_tail",
+            "dw": "dw",
+            "dx": "dx",
+            "dy": "dy",
+            "hist": "hist",
+            "hist_row_off": "hist_row_off",
+            "n_ch_tiles": "n_ch_tiles",
+            "n_sub": "n_sub",
+            "num_docs": "num_docs",
+            "partial": "partial",
+            "search_steps": "search_steps",
+            "tail_row_off": "tail_row_off",
+            "w": "w",
+            "x": "x",
+        },
+        "role": "kcp_bwd_split",
+        "workspace_rule": {
+            "kind": "partial_rows",
+            "taps": 4,
+        },
+    },
+    "cake_causal_conv1d_det_train_4e81b876cb5eb25e60e5_kcp": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+            "sm_107a",
+        ],
+        "arg_plan": [
+            ["buffer", "x"],
+            ["buffer", "w"],
+            ["buffer", "cu"],
+            ["buffer", "dy"],
+            ["buffer", "dx"],
+            ["buffer", "dw"],
+            ["buffer", "partial"],
+            ["buffer", "hist"],
+            ["buffer", "hist_row_off"],
+            ["buffer", "dpre_tail"],
+            ["buffer", "tail_row_off"],
+            ["parameter", "S"],
+            ["parameter", "C"],
+            ["parameter", "num_docs"],
+            ["parameter", "search_steps"],
+            ["parameter", "ct_vec"],
+            ["parameter", "n_sub"],
+            ["parameter", "n_ch_tiles"],
+            ["buffer", "x_map"],
+            ["buffer", "dy_map"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        # The big-channel backward (``stage_tokens=8``, eight-row TMA boxes per
+        # stage, two CTAs per SM): it runs when ``C >= select_rule.channels
+        # [arch]``, else the architecture's fallback record runs -- the
+        # zero-history backward's thresholds, which these programs' geometry
+        # measured.  The ``split`` build: an ordinary launch followed by the
+        # record's ``reduce`` program; the grid is the co-resident CTA count
+        # less the ``reserve_sms`` SMs.
+        "grid_rule": {
+            "cooperative": False,
+            "ctas_per_sm": 2,
+            "reserve_sms": 1,
+            "geometry": {
+                "threads": 128,
+                "vec": 8,
+            },
+            "kind": "co_resident",
+        },
+        "kernel": "cake_causal_conv1d_det_train_4e81b876cb5eb25e60e5_kcp",
+        "kernel_symbol": "kernel_cake_causal_conv1d_det_train_4e81b876cb5eb25e60e5_kcp",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 82944,
+            "use_pdl": False,
+        },
+        "library": "cake_causal_conv1d_det_train_4e81b876cb5eb25e60e5_kcp",
+        # The reduce program the host launches next on the same stream (``use_pdl``): the zero-history
+        # package's default fixed-order reduce over this program's partial rows (FlashInfer issue #8365).
+        "reduce": "cake_causal_conv1d_det_train_86b5ecfbd90aca4b52e5",
+        "logical": {
+            "C": "C",
+            "S": "S",
+            "ct_vec": "ct_vec",
+            "cu": "cu",
+            "dpre_tail": "dpre_tail",
+            "dw": "dw",
+            "dx": "dx",
+            "dy": "dy",
+            "dy_map": "dy",
+            "hist": "hist",
+            "hist_row_off": "hist_row_off",
+            "n_ch_tiles": "n_ch_tiles",
+            "n_sub": "n_sub",
+            "num_docs": "num_docs",
+            "partial": "partial",
+            "search_steps": "search_steps",
+            "tail_row_off": "tail_row_off",
+            "w": "w",
+            "x": "x",
+            "x_map": "x",
+        },
+        "role": "kcp_bwd_split",
+        "select_rule": {
+            "channels": {
+                "sm_100a": 512,
+                "sm_103a": 512,
+                "sm_107a": 1024,
+            },
+            "kind": "channels_at_least",
+        },
+        "workspace_rule": {
+            "kind": "partial_rows",
+            "taps": 4,
+        },
+    },
     "cake_causal_conv1d_det_train_17cd42fb05079bbbf840_kcp": {
         "arches": [
             "sm_100a",
@@ -500,14 +783,20 @@ MODULES: dict[str, dict[str, Any]] = {
 }
 
 # architecture -> KCP kind -> the records the route may launch, in launch
-# order.  The forward and the head route carry one program; the backward
-# route carries the architecture's fallback program first and the
-# big-channel ``_st8`` program second (:func:`selected_modules` launches one).
+# order.  The forward and the head route carry one program; each backward
+# route (``kcp_bwd``: the cooperative programs; ``kcp_bwd_split``: their
+# ``split`` builds, ordinary launches followed by the ``reduce`` program)
+# carries the architecture's fallback program first and the big-channel
+# ``_st8`` program second (:func:`selected_modules` launches one).
 ROUTES: dict[str, dict[str, list[str]]] = {
     "sm_100a": {
         "kcp_bwd": [
             "cake_causal_conv1d_det_train_5288d132a5cc927ae729_kcp",
             "cake_causal_conv1d_det_train_7485529a1755e5bd3036_kcp",
+        ],
+        "kcp_bwd_split": [
+            "cake_causal_conv1d_det_train_facdd7ca702cfb7d821a_kcp",
+            "cake_causal_conv1d_det_train_4e81b876cb5eb25e60e5_kcp",
         ],
         "kcp_bwd_head": [
             "cake_causal_conv1d_det_train_17cd42fb05079bbbf840_kcp",
@@ -521,6 +810,10 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_causal_conv1d_det_train_5288d132a5cc927ae729_kcp",
             "cake_causal_conv1d_det_train_7485529a1755e5bd3036_kcp",
         ],
+        "kcp_bwd_split": [
+            "cake_causal_conv1d_det_train_facdd7ca702cfb7d821a_kcp",
+            "cake_causal_conv1d_det_train_4e81b876cb5eb25e60e5_kcp",
+        ],
         "kcp_bwd_head": [
             "cake_causal_conv1d_det_train_17cd42fb05079bbbf840_kcp",
         ],
@@ -533,6 +826,10 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_causal_conv1d_det_train_6ea6d5fc9e7fa3f2d039_kcp",
             "cake_causal_conv1d_det_train_7485529a1755e5bd3036_kcp",
         ],
+        "kcp_bwd_split": [
+            "cake_causal_conv1d_det_train_f3bd6b02735ab7bbb8b5_kcp",
+            "cake_causal_conv1d_det_train_4e81b876cb5eb25e60e5_kcp",
+        ],
         "kcp_bwd_head": [
             "cake_causal_conv1d_det_train_17cd42fb05079bbbf840_kcp",
         ],
@@ -542,8 +839,17 @@ ROUTES: dict[str, dict[str, list[str]]] = {
     },
 }
 
-# The KCP kinds (the zero-history kinds are ``cake_jit.KINDS``).
+# The KCP kinds (the zero-history kinds are ``cake_jit.KINDS``): the launch
+# roles the non-deterministic KCP registry mirrors.
 KINDS = ("kcp_fwd", "kcp_bwd", "kcp_bwd_head")
+# The route of the backward's ``split`` builds (FlashInfer issue #8365): the
+# host (:mod:`.kcp`) runs the backward through ``kcp_bwd`` or
+# ``kcp_bwd_split`` per call (its ``cooperative`` argument).
+SPLIT_KIND = "kcp_bwd_split"
+# Every route of ``ROUTES[arch]``, and the backward routes (those that select
+# one record by the channel count).
+ROUTE_KINDS = ("kcp_fwd", "kcp_bwd", SPLIT_KIND, "kcp_bwd_head")
+BWD_KINDS = ("kcp_bwd", SPLIT_KIND)
 # The history / halo rows every fragment carries (the convolution width minus one).
 HALO = WIDTH - 1
 # Logical argument names the KCP host flow binds: the zero-history vocabulary
@@ -589,8 +895,8 @@ def route_modules(arch: str, kind: str) -> tuple[str, ...]:
     count.
     """
 
-    if kind not in KINDS:
-        raise ValueError(f"kind must be one of {KINDS}, got {kind!r}")
+    if kind not in ROUTE_KINDS:
+        raise ValueError(f"kind must be one of {ROUTE_KINDS}, got {kind!r}")
     names = ROUTES.get(arch, {}).get(kind)
     if not names:
         raise ValueError(
@@ -619,7 +925,7 @@ def selected_modules(
     """Ordered module names one KCP call launches on ``arch`` for ``C`` channels.
 
     The forward and the head route launch every program of their route
-    (:func:`route_modules`, one each).  The backward route carries the
+    (:func:`route_modules`, one each).  Each backward route carries the
     architecture's fallback program and the big-channel program and launches
     exactly one: the record whose :func:`select_rule` admits ``C`` on ``arch``
     when one does, else the route's single fallback record (the one without a
@@ -632,7 +938,7 @@ def selected_modules(
     """
 
     names = route_modules(arch, kind)
-    if kind != "kcp_bwd":
+    if kind not in BWD_KINDS:
         return names
     positive: list[str] = []
     fallback: list[str] = []
@@ -658,11 +964,13 @@ def selected_modules(
 
 
 def workspace_owners(arch: str) -> tuple[dict[str, Any], ...]:
-    """The KCP backward module records of ``arch`` that own a ``partial`` workspace, in route order."""
+    """The KCP backward module records of ``arch`` that own a ``partial`` workspace, in route order
+    (``kcp_bwd``, then ``kcp_bwd_split``)."""
 
     owners = tuple(
         MODULES[name]
-        for name in route_modules(arch, "kcp_bwd")
+        for kind in BWD_KINDS
+        for name in route_modules(arch, kind)
         if MODULES[name]["workspace_rule"] is not None
     )
     if not owners:
@@ -788,6 +1096,7 @@ def run_module(
 __all__ = [
     "ARCHES",
     "ARCH_BY_CAPABILITY",
+    "BWD_KINDS",
     "CHANNEL_MULTIPLE",
     "HALO",
     "INT32_MAX",
@@ -796,7 +1105,9 @@ __all__ = [
     "LOGICAL_TENSORS",
     "MODULES",
     "ROUTES",
+    "ROUTE_KINDS",
     "SELECT_KINDS",
+    "SPLIT_KIND",
     "WIDTH",
     "arch_for_capability",
     "channel_split",

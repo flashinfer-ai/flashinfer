@@ -47,42 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 512
-#define TMEM_ACC_QH_OFFSET 0
-#define TMEM_ACC_AV_OFFSET 256
-#define NUM_RING_STAGES 3
-#define NUM_ACCS_STAGES 2
-#define NUM_TK_PIPE_STAGES 4
-#define SMEM_Q_S_OFF 1024
-#define SMEM_Q_S_STAGE_BYTES 16384
-#define SMEM_Q_S_STRIDE 73728
-#define SMEM_H_S_OFF 17408
-#define SMEM_H_S_STAGE_BYTES 32768
-#define SMEM_H_S_STRIDE 73728
-#define SMEM_AQK_P_OFF 50176
-#define SMEM_AQK_P_STAGE_BYTES 8192
-#define SMEM_AQK_P_STRIDE 73728
-#define SMEM_VN_S_OFF 58368
-#define SMEM_VN_S_STAGE_BYTES 16384
-#define SMEM_VN_S_STRIDE 73728
-#define SMEM_Q_K_OFF 1024
-#define SMEM_Q_K_STAGE_BYTES 16384
-#define SMEM_Q_K_STRIDE 73728
-#define SMEM_H_MN_OFF 17408
-#define SMEM_H_MN_STAGE_BYTES 32768
-#define SMEM_H_MN_STRIDE 73728
-#define SMEM_AQK_K_OFF 50176
-#define SMEM_AQK_K_STAGE_BYTES 8192
-#define SMEM_AQK_K_STRIDE 73728
-#define SMEM_VN_MN_OFF 58368
-#define SMEM_VN_MN_STAGE_BYTES 16384
-#define SMEM_VN_MN_STRIDE 73728
-#define SMEM_TK_S_OFF 222208
-#define SMEM_TK_S_STAGE_BYTES 16
-#define SMEM_TK_S_STRIDE 16
-#define SMEM_TOTAL 222336
-#define THREADS 192
 #define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>

@@ -25,7 +25,8 @@ non-bool mode, the refusal of every mode but ``deterministic=False`` by the pack
 deterministic mode, which they do not alert: the S1 schedule has no unordered reduction), the raw gate mode (#7816)
 on both packages (the facade forwards its keywords to the package of the call's mode, this package takes them with
 the deterministic package's checks, a workspace serves one gate mode, either backward reads either package's saved
-set of either gate mode), the legacy names
+set of either gate mode), the deterministic package's in-kernel Q/K L2 norm (#7817: the facade forwards
+``use_qk_l2norm_in_kernel`` with ``deterministic=True``; the package refuses it and a saved set of it), the legacy names
 (``flashinfer.kda_train``, ``flashinfer.experimental.cake_kda_train``) that stay the deterministic objects, the
 deferred imports of the facade and the package's isolation from the deterministic modules, and a dispatch sweep
 over architecture x path x heads 1..128 (one record per stage, the fused gradient and the GLM intra program agreeing
@@ -836,6 +837,136 @@ def test_facade_runs_the_raw_gate_on_the_non_deterministic_package() -> None:
             assert got == facade.kda_train_workspace_bytes(
                 129, 1, 4, sm_count=148, backward=backward, use_gate_in_kernel=True
             )
+
+
+# the in-kernel Q/K L2 norm (#7817): the deterministic package's keyword, off at False
+_QK_L2NORM = "in-kernel Q/K L2 norm runs on the deterministic package only"
+
+
+@pytest.mark.parametrize("name", EXPERIMENTAL_ENTRIES)
+def test_package_refuses_the_in_kernel_qk_l2norm(name) -> None:
+    """The in-kernel Q/K L2 norm runs on the deterministic package only: with ``deterministic=False`` each entry
+    raises ``ValueError`` naming ``deterministic=True`` for ``use_qk_l2norm_in_kernel`` other than ``False``, before
+    its host checks; ``False`` reaches the host checks, as the omitted keyword does."""
+    call = PACKAGE_CALLS[name]
+    for value in (True, 1, "True", None):
+        with pytest.raises(ValueError, match=_QK_L2NORM) as info:
+            call(deterministic=False, use_qk_l2norm_in_kernel=value)
+        assert str(info.value).startswith(name), (value, str(info.value))
+        assert "deterministic=True" in str(info.value), value
+    with pytest.raises(ValueError, match="v: expected 3-D"):
+        call(deterministic=False, use_qk_l2norm_in_kernel=False, **GATE_OFF)
+
+
+def test_package_backward_refuses_a_saved_set_of_the_in_kernel_qk_l2norm() -> None:
+    """A saved set written with the in-kernel Q/K L2 norm (``qk_l2norm`` true, its reciprocal norms in ``qk_rstd``)
+    holds tensors formed from normalized q / k: the backward refuses it, of either package's type (both carry the
+    fields), before its host checks; the set with the mode off passes the refusal."""
+    t = torch.empty(0)
+    scale = cake_backend.SCALE
+    for saved_type in (cake_backend.KdaChunkSaved, det_backend.KdaDetChunkSaved):
+        l2n = saved_type(4, t, t, None, 1, 1, 1, scale, qg=t, qk_rstd=t, qk_l2norm=True)
+        with pytest.raises(ValueError, match="in-kernel q / k L2 norm") as info:
+            PACKAGE_CALLS["chunk_kda_bwd"](saved=l2n, deterministic=False)
+        assert "deterministic=True" in str(info.value), saved_type
+        off = saved_type(4, t, t, None, 1, 1, 1, scale, qg=t)
+        with pytest.raises(Exception) as info:  # noqa: B017 - the stand-in operands' error, never the refusal
+            PACKAGE_CALLS["chunk_kda_bwd"](saved=off, deterministic=False)
+        assert "L2 norm" not in str(info.value), str(info.value)
+
+
+def test_package_queries_refuse_the_in_kernel_qk_l2norm_layout() -> None:
+    """``workspace_bytes``, ``saved_bytes`` and ``KdaWorkspace.for_problem`` take the deterministic package's ``l2n``:
+    ``"off"`` only (the bytes of the omitted keyword); any other value is a ``ValueError`` naming
+    ``deterministic=True``, raised before the device is read."""
+    S, N, H = 129, 1, 4
+    assert cake_backend.workspace_bytes(
+        S, N, H, sm_count=148, l2n="off"
+    ) == cake_backend.workspace_bytes(S, N, H, sm_count=148)
+    assert cake_backend.saved_bytes(
+        S, H, N, sm_count=148, l2n="off"
+    ) == cake_backend.saved_bytes(S, H, N, sm_count=148)
+    for l2n in ("fused", "fallback", None, "OFF"):
+        with pytest.raises(ValueError, match="deterministic=True"):
+            cake_backend.workspace_bytes(S, N, H, sm_count=148, l2n=l2n)
+        with pytest.raises(ValueError, match="deterministic=True"):
+            cake_backend.saved_bytes(S, H, N, sm_count=148, l2n=l2n)
+        with pytest.raises(ValueError, match="deterministic=True"):
+            cake_backend.KdaWorkspace.for_problem(
+                S, N, H, "cpu", l2n=l2n, deterministic=False
+            )
+    with pytest.raises(ValueError, match="CUDA devices"):
+        cake_backend.KdaWorkspace.for_problem(
+            S, N, H, "cpu", l2n="off", deterministic=False
+        )
+
+
+def test_facade_forwards_the_in_kernel_qk_l2norm(monkeypatch) -> None:
+    """``deterministic=True`` hands ``use_qk_l2norm_in_kernel`` (the same object) to the deterministic package, and
+    to its workspace and byte queries as ``l2n="fused"``; ``deterministic=False`` hands ``False`` / ``"off"`` to
+    this package (whose entries refuse any other); under torch's deterministic mode the deterministic package
+    receives it; the workspace and the byte queries refuse a non-bool."""
+    log = _recorders(monkeypatch)
+    operands = tuple(object() for _ in range(6))
+    calls = {
+        "chunk_kda_fwd": lambda **kw: facade.chunk_kda_fwd(*operands, **kw),
+        "chunk_kda_bwd": lambda **kw: facade.chunk_kda_bwd(*operands, object(), **kw),
+        "chunk_kda": lambda **kw: facade.chunk_kda(*operands, **kw),
+    }
+    queries = {
+        "kda_train_workspace": lambda **kw: facade.kda_train_workspace(
+            1, 1, 1, "cpu", **kw
+        ),
+        "kda_train_workspace_bytes": lambda **kw: facade.kda_train_workspace_bytes(
+            1, 1, 1, sm_count=148, **kw
+        ),
+        "kda_train_saved_bytes": lambda **kw: facade.kda_train_saved_bytes(1, 1, **kw),
+    }
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        for name, call in calls.items():
+            assert call(use_qk_l2norm_in_kernel=True) == "det", name
+            assert log[-1][2]["use_qk_l2norm_in_kernel"] is True, name
+            assert call(deterministic=False) == "nd", name
+            assert log[-1][2]["use_qk_l2norm_in_kernel"] is False, name
+        with _TorchDeterministic():
+            for name, call in calls.items():
+                assert call(deterministic=False, use_qk_l2norm_in_kernel=True) == "det"
+                assert log[-1][2]["use_qk_l2norm_in_kernel"] is True, name
+        for name, query in queries.items():
+            assert query(use_qk_l2norm_in_kernel=True) == "det", name
+            assert log[-1][2]["l2n"] == "fused", name
+            assert query(deterministic=False) == "nd", name
+            assert log[-1][2]["l2n"] == "off", name
+            for bad in (1, None, "True"):
+                with pytest.raises(
+                    ValueError, match="use_qk_l2norm_in_kernel must be a bool"
+                ):
+                    query(use_qk_l2norm_in_kernel=bad)
+
+
+def test_facade_refuses_the_in_kernel_qk_l2norm_on_the_non_deterministic_package() -> (
+    None
+):
+    """Without recorders: ``deterministic=False`` reaches this package, whose entries, workspace and byte queries
+    refuse ``use_qk_l2norm_in_kernel=True`` (``ValueError`` naming ``deterministic=True``)."""
+    on = {"use_qk_l2norm_in_kernel": True, "deterministic": False}
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ExperimentalWarning)
+        for name, args in (
+            ("chunk_kda_fwd", _bad_operands()),
+            ("chunk_kda_bwd", (*_bad_operands(), torch.zeros(4, 1, 128))),
+            ("chunk_kda", _bad_operands()),
+        ):
+            with pytest.raises(ValueError, match=_QK_L2NORM):
+                getattr(facade, name)(*args, **on)
+        for query in (
+            lambda: facade.kda_train_workspace_bytes(129, 1, 4, sm_count=148, **on),
+            lambda: facade.kda_train_saved_bytes(129, 4, 1, sm_count=148, **on),
+            lambda: facade.kda_train_workspace(129, 1, 4, "cpu", **on),
+        ):
+            with pytest.raises(ValueError, match="deterministic=True"):
+                query()
 
 
 def test_package_exports_the_det_free_names_only() -> None:

@@ -94,15 +94,18 @@ Raw gate mode (``use_gate_in_kernel=True`` with ``A_log``, ``dt_bias`` and
 ``lower_bound``; FlashInfer #7816) runs on both packages: the compute entries
 forward the keywords, ``chunk_kda_bwd_kcp`` then returns seven tensors
 (``dA_log`` / ``ddt_bias`` this rank's partial sums, summed over the group with
-:func:`reduce_gate_param_grads_kcp`), and ``kda_workspace_bytes_kcp`` takes
-``use_gate_in_kernel``.  With ``deterministic=False`` the rank-local stages run
-the non-deterministic single-rank package's raw records, copies of the
-deterministic raw programs on every row, so every output, the raw gate's
-gradient and the parameter partial sums are bitwise those of
+:func:`reduce_gate_param_grads_kcp`), and ``kda_workspace_bytes_kcp`` /
+``kda_saved_bytes_kcp`` take ``use_gate_in_kernel``.  With ``deterministic=False``
+the rank-local stages run the non-deterministic single-rank package's raw
+records, copies of the deterministic raw programs on every row, so every output,
+the raw gate's gradient and the parameter partial sums are bitwise those of
 ``deterministic=True``; the checkpoint hand-off does not engage in this mode.
-``deterministic=False`` raises ``ValueError`` for ``use_qk_l2norm_in_kernel=True``
-(#7817; the in-kernel q / k L2 norm is not available on that package); its off
-value (``use_qk_l2norm_in_kernel=False``) is accepted on both routes.
+The in-kernel q / k L2 norm (``use_qk_l2norm_in_kernel=True``, #7817) runs on
+the deterministic package only: the compute entries forward it, and
+``kda_workspace_bytes_kcp`` / ``kda_saved_bytes_kcp`` take it.
+``deterministic=False`` raises ``ValueError`` naming ``deterministic=True`` for
+it; its off value (``use_qk_l2norm_in_kernel=False``) is accepted on both
+routes.
 
 The width-4 causal convolution with halo of the same partition takes this module's ``ctx``.
 """
@@ -576,6 +579,7 @@ def kda_workspace_bytes_kcp(
     local_arena: Optional[str] = None,
     lean_passes: Optional[int] = None,
     use_gate_in_kernel: bool = False,
+    use_qk_l2norm_in_kernel: bool = False,
     deterministic: bool = True,
 ) -> int:
     """Bytes of this rank's KCP workspace for ``H`` heads on the package ``deterministic`` selects (the same for both
@@ -584,7 +588,9 @@ def kda_workspace_bytes_kcp(
     (``WorkspaceKcp`` / ``WorkspaceDetKcp`` ``(local_arena="lean", lean_passes=...)``, opt-in: the backward's lean
     local arena, its tail in ``lean_passes`` passes, two by default); ``None`` keeps the replay arena.
     ``use_gate_in_kernel``: the workspace's gate mode (``WorkspaceKcp`` / ``WorkspaceDetKcp``
-    ``(use_gate_in_kernel=True)``, the raw gate mode; the same for both values of ``deterministic``)."""
+    ``(use_gate_in_kernel=True)``, the raw gate mode; the same for both values of ``deterministic``);
+    ``use_qk_l2norm_in_kernel``: its in-kernel q / k L2 norm mode (``WorkspaceDetKcp(use_qk_l2norm_in_kernel=True)``),
+    ``True`` with ``deterministic=False`` raises ``ValueError``."""
     det = _deterministic(deterministic, "kda_workspace_bytes_kcp")
     plan = _det_plan() if det else _nd_plan()
     if save_transfer is None:
@@ -600,6 +606,7 @@ def kda_workspace_bytes_kcp(
         local_arena=local_arena,
         lean_passes=lean_passes,
         use_gate_in_kernel=use_gate_in_kernel,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
     )
 
 
@@ -631,17 +638,22 @@ def kda_saved_bytes_kcp(
     with_conv: bool = True,
     C: int = 8192,
     checkpoint_keep: Optional[str] = None,
+    use_gate_in_kernel: bool = False,
+    use_qk_l2norm_in_kernel: bool = False,
     checkpoint_handoff: bool = False,
     deterministic: bool = True,
 ) -> int:
     """Bytes of this rank's KCP saved set for ``H`` heads on the package ``deterministic`` selects (the same for both
     values, except ``checkpoint_handoff=True``); see :func:`flashinfer.cake_kda_det_train_kcp.kda_det_saved_bytes_kcp`
-    for ``save_transfer``, ``with_conv``, ``C`` and ``checkpoint_keep``.  ``checkpoint_handoff`` (a ``bool``, the
-    hand-off decision, not :func:`chunk_kda_kcp`'s mode; another value raises ``TypeError``; ``False`` by default: the
-    light set): ``True`` is the saved set, at the same ``save_transfer``, of a ``deterministic=False`` forward that
-    the checkpoint hand-off engages on (plus :func:`kda_handoff_bytes_kcp`, without the carry plane; see
-    :func:`chunk_kda_kcp`).  The deterministic package has no hand-off: ``deterministic=True`` ignores it and returns
-    that package's figure."""
+    for ``save_transfer``, ``with_conv``, ``C``, ``checkpoint_keep``, ``use_gate_in_kernel`` (the saved set's gate
+    mode, the raw gate mode of ``WorkspaceKcp`` / ``WorkspaceDetKcp`` ``(use_gate_in_kernel=True)``; the same bytes
+    in both gate modes and for both values of ``deterministic``) and ``use_qk_l2norm_in_kernel`` (the saved set of
+    the in-kernel q / k L2 norm; ``True`` with ``deterministic=False`` raises ``ValueError``).
+    ``checkpoint_handoff`` (a ``bool``, the hand-off decision, not :func:`chunk_kda_kcp`'s mode; another value raises
+    ``TypeError``; ``False`` by default: the light set): ``True`` is the saved set, at the same ``save_transfer``, of
+    a ``deterministic=False`` forward that the checkpoint hand-off engages on (plus :func:`kda_handoff_bytes_kcp`,
+    without the carry plane; see :func:`chunk_kda_kcp`).  The deterministic package has no hand-off:
+    ``deterministic=True`` ignores it and returns that package's figure."""
     if not isinstance(checkpoint_handoff, bool):
         raise TypeError(
             "kda_saved_bytes_kcp: checkpoint_handoff is the hand-off decision (a bool), not chunk_kda_kcp's mode; "
@@ -660,6 +672,8 @@ def kda_saved_bytes_kcp(
             with_conv=with_conv,
             C=C,
             checkpoint_keep=checkpoint_keep,
+            use_gate_in_kernel=use_gate_in_kernel,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
         )
     return plan.kda_saved_bytes_kcp(
         ctx,
@@ -669,6 +683,8 @@ def kda_saved_bytes_kcp(
         with_conv=with_conv,
         C=C,
         checkpoint_keep=checkpoint_keep,
+        use_gate_in_kernel=use_gate_in_kernel,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
         checkpoint_handoff=checkpoint_handoff,
     )
 
