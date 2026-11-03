@@ -1103,6 +1103,11 @@ the shortest prefix reaching top-p. See `docs/api/sampling.rst` and
 `tests/utils/test_sampling_tie_break.py`. Preserve this order through top-k-first
 selection, including ties created by normalization inside the gathered top-p boundary. The rejection loop
 may terminate only after accepting a token or resolving the final boundary set.
+Use the absolute top-p threshold consistently in rejection, renorm search and
+boundary quotas, including AIR. Resolve ties only where the requested prefix
+cuts a group or a cumulative comparison is uncertain. Keep the three rejection
+kernels within the 1024-thread register budget on every compiled architecture;
+check compiler register/spill reports as well as real launches.
 
 ## Development Workflow
 

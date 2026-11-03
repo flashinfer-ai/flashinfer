@@ -1439,6 +1439,9 @@ def top_p_sampling_from_probs(
     Sort by probability descending, then original token index ascending. Keep
     the shortest prefix reaching ``top_p``, including the crossing token.
     This selected set is independent of ``deterministic``.
+    Compare cumulative input probabilities directly with ``top_p``; the threshold
+    is not scaled by the row sum. Supply nonnegative, normalized probabilities.
+    ``top_p >= 1`` disables top-p filtering.
 
     Parameters
     ----------
@@ -1884,8 +1887,9 @@ def _top_k_first_fast_path(
     # Local import avoids a module-level cycle between sampling and topk.
     from .topk import TopKTieBreak, top_k as _radix_top_k
 
-    # Scalar k can directly use deterministic index order. Tensor thresholds
-    # first need value order to mask each row past its own k.
+    # Selection must obey SMALL even for nondeterministic random draws. Keeping
+    # deterministic index order also avoids sorting scalar-k outputs; tensor
+    # thresholds first need value order to mask each row past its own k.
     select_k = top_k if isinstance(top_k, int) else top_k_max
     values, gathered_indices = _radix_top_k(
         x,
@@ -2155,6 +2159,10 @@ def top_k_top_p_sampling_from_probs(
     not change this convention. The two filter orders retain their normalization
     semantics.
 
+    For probability inputs, top-p compares cumulative input mass directly with
+    ``top_p`` (after top-k renormalization for ``top_k_first``). Supply
+    nonnegative, normalized probabilities; ``top_p >= 1`` disables top-p filtering.
+
     Parameters
     ----------
     probs: torch.Tensor
@@ -2328,6 +2336,9 @@ def top_p_renorm_probs(
     Sort by probability descending, then original token index ascending. Keep
     the shortest prefix reaching ``top_p``, including the crossing token, and
     renormalize its mass. This matches :func:`top_p_sampling_from_probs`.
+    Compare cumulative input probabilities directly with ``top_p``, without
+    scaling it by the row sum. Supply nonnegative, normalized probabilities.
+    ``top_p >= 1`` disables filtering and only normalizes the input.
 
     Parameters
     ----------

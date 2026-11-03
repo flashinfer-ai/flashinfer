@@ -104,7 +104,7 @@ def reference_top_p_support(
     values = probs_row[order]
     before = values.cumsum(0) - values
     keep = torch.zeros_like(probs_row, dtype=torch.bool)
-    keep[order] = before < (top_p + shift) * values.sum()
+    keep[order] = (before < top_p + shift) | (top_p >= 1)
     return keep
 
 
