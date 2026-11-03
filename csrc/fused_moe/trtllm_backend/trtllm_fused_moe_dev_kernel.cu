@@ -21,7 +21,6 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <cstdlib>
 #include <cub/cub.cuh>
 #include <cuda/functional>
 #include <cuda/std/functional>
@@ -45,17 +44,6 @@ __host__ __device__ constexpr static U arrayConvert(T const& input) {
 namespace moe::dev {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
-
-// A/B switch for the rewritten glue kernels (activationDeepSeekKernelV2, finalizeKernelV2):
-// FLASHINFER_MOE_GLUE_V1=1 restores the previous kernel selection. Read once per process.
-// Temporary: to be removed with the old kernels once the end-to-end comparison is done.
-inline bool useLegacyGlueKernels() {
-  static bool const legacy = [] {
-    char const* v = std::getenv("FLASHINFER_MOE_GLUE_V1");
-    return v != nullptr && v[0] == '1';
-  }();
-  return legacy;
-}
 
 inline bool isAligned16(void const* ptr) {
   return (reinterpret_cast<std::uintptr_t>(ptr) & 15u) == 0;
@@ -409,24 +397,29 @@ __global__ void activationDeepSeekKernel(KernelParams params) {
 // Numerics are those of activationDeepSeekKernel, operation for operation: x = scale * float(e4m3),
 // silu(x2) * x1 (gatedSilu with the OAI controls), scale = max(amax / 448, FLT_MIN) and
 // e4m3(out / scale) with the saturating round-to-nearest-even conversion. Every row the old kernel
-// wrote gets the same bytes. Padding rows inside an expert's last tile (permutedIdxToTokenIdx ==
-// -1), which the old kernel left with stale bytes, get zeros and the FLT_MIN scale: GEMM2 reads
-// them as tile rows but nobody reads its result rows, and a defined buffer is cheaper to reason
-// about. Rows at or past *totalNumPaddedTokens are not touched.
+// wrote gets the same bytes. NaN inputs: the block amax is reduced with fmaxf, which drops a NaN,
+// as the old kernel's 2- and 4-token instantiations do; its 1-token instantiation reduced with
+// cuda::maximum<>, which keeps a NaN only in the left operand, so with a NaN in GEMM1's output that
+// variant and this kernel can differ in that row. Padding rows inside an expert's last tile
+// (permutedIdxToTokenIdx == -1), which the old kernel left with stale bytes, get zeros and the
+// FLT_MIN scale: GEMM2 reads them as tile rows but nobody reads its result rows, and a defined
+// buffer is cheaper to reason about. Rows at or past *totalNumPaddedTokens are not touched.
 
 constexpr int DEEP_SEEK_ACTIVATION_V2_THREADS_PER_CTA = 128;
 constexpr int DEEP_SEEK_ACTIVATION_V2_NUM_ELTS_PER_SF = 128;
-// Grid cap: one resident wave at 128 threads and up to 64 registers per thread, so the CTAs that
-// find their row past the live count never wait for a slot.
+// Grid cap: one resident wave at 128 threads and up to 64 registers per thread (52-56 in the
+// sm_100a build), so the CTAs that find their row past the live count never wait for a slot.
 constexpr int DEEP_SEEK_ACTIVATION_V2_MAX_CTAS_PER_SM = 8;
 // Smallest token count for which this kernel is selected; below it activationDeepSeekKernel runs
 // as before. Its 1- and 2-token instantiations finish in 2.1-3.3 us up to 16 tokens where this
-// kernel's floor is 3.7-5.1 us, and every parallel split measured crosses over between 32 and 64
-// tokens. Own times (PDL off), old / new us, GLM-5.3 shapes (H 6144, I 2048, 256 experts, top-k 8):
-// B300, 148 SMs at 2032 MHz, 2026-11-03, EP8: 2.7 / 4.0 at T = 8, 4.3 / 4.3 at 32, 7.1 / 4.5 at
-// 64, 9.6 / 4.8 at 128 (EP4 x TP2, EP2 x TP4 and TP8 behave alike, TP8 2.4 / 4.8 at 32 and
-// 3.9 / 5.0 at 64); Rubin sm107, 208 SMs, 2026-11-03, EP8: 2.6 / 4.3 at 8, 4.6 / 4.3 at 32,
-// 5.8 / 4.3 at 64, 8.0 / 4.6 at 128.
+// kernel takes 3.7-5.1 us. Activation plus finalize cross over between 32 and 64 tokens in every
+// parallel split measured; this kernel alone is at parity at 32 and ahead from 64 tokens for EP8,
+// crosses between 32 and 64 for EP4 x TP2, between 64 and 128 for EP2 x TP4 and between 128 and
+// 256 for TP8, where the finalize's gain covers its 0.5-1.1 us loss at 64. Own times (PDL off),
+// old / new us, GLM-5.3 shapes (H 6144, I 2048, 256 experts, top-k 8): B300, 148 SMs at 2032 MHz,
+// 2026-11-03, EP8: 2.7 / 4.0 at T = 8, 4.3 / 4.3 at 32, 7.1 / 4.5 at 64, 9.6 / 4.8 at 128; TP8
+// 2.4 / 4.8 at 32 and 3.9 / 5.0 at 64; Rubin sm107, 2026-11-03, EP8: 2.6 / 4.3 at 8, 4.6 / 4.3 at
+// 32, 5.8 / 4.3 at 64, 8.0 / 4.6 at 128.
 constexpr int DEEP_SEEK_ACTIVATION_V2_MIN_TOKENS = 64;
 
 // Loads one lane's 16 bytes of the linear half and of the gate half of permuted row `row`, column
@@ -634,15 +627,16 @@ void run(Data const& data, void* stream) {
     // Output dimension is innerDim / 2, and each scale block is 128 elements
     int const outputDim = data.innerDim / 2;
 
-    // The row-parallel kernel needs the row -> token map and the row count (callers that build
-    // activation::Data without them, such as the standalone activation op, keep the old kernel),
-    // whole 128-column scale blocks (the scale indexing of both kernels assumes it), 16-byte
-    // aligned rows and at least DEEP_SEEK_ACTIVATION_V2_MIN_TOKENS tokens (below that the old
-    // kernel's small-batch instantiations are faster; see the constant).
+    // The row-parallel kernel needs the row -> token map and the row-count bound (callers that
+    // build activation::Data without them, such as the standalone activation op, keep the old
+    // kernel), at least one whole 128-column scale block (the scale indexing of both kernels
+    // assumes whole blocks; the row split divides by their count), 16-byte aligned rows and at
+    // least DEEP_SEEK_ACTIVATION_V2_MIN_TOKENS tokens (below that the old kernel's small-batch
+    // instantiations are faster; see the constant).
     int const eltBytes = tg::dtypeGetNumBits(data.mDtypeElt) / 8;
     bool const useRowParallel =
-        !useLegacyGlueKernels() && data.permutedIdxToTokenIdx != nullptr &&
-        data.totalMaxPaddedTokens > 0 && data.numTokens >= DEEP_SEEK_ACTIVATION_V2_MIN_TOKENS &&
+        data.permutedIdxToTokenIdx != nullptr && data.totalMaxPaddedTokens > 0 &&
+        data.numTokens >= DEEP_SEEK_ACTIVATION_V2_MIN_TOKENS && outputDim > 0 &&
         outputDim % NUM_ELTS_PER_SF == 0 && (outputDim * eltBytes) % 16 == 0 &&
         isAligned16(data.inPtr) && isAligned16(data.outPtr);
     if (useRowParallel) {
@@ -1374,7 +1368,7 @@ constexpr int FINALIZE_V2_MAX_CTAS_PER_SM = 32;
 // the small-batch kernel is 0.0-0.5 us faster than it, in every parallel split measured. Own
 // times (PDL off), old / new us, GLM-5.3 shapes at EP8: B300, 148 SMs at 2032 MHz, 2026-11-03:
 // small-batch 2.6 / 2.7 at T = 8 and 3.1 / 3.5 at 32, VecLoad 5.9 / 3.7 at 64 and 6.2 / 3.8 at
-// 128; Rubin sm107, 208 SMs, 2026-11-03: 2.6 / 2.7 at 8, 3.3 / 3.7 at 32, 5.9 / 3.5 at 64,
+// 128; Rubin sm107, 2026-11-03: 2.6 / 2.7 at 8, 3.3 / 3.7 at 32, 5.9 / 3.5 at 64,
 // 6.2 / 3.8 at 128.
 constexpr int FINALIZE_SMALL_GRID_CTA_BOUND = 1184;
 
@@ -1567,9 +1561,9 @@ void run(Data const& data, void* stream) {
     int64_t const numSlices =
         (numVecs + FINALIZE_V2_THREADS_PER_CTA - 1) / FINALIZE_V2_THREADS_PER_CTA;
     bool const useSliceGrid =
-        !useLegacyGlueKernels() && vectorWidthAligned && data.topK <= MaxTopK &&
-        isAligned16(data.inPtr) && (data.inPtr2 == nullptr || isAligned16(data.inPtr2)) &&
-        isAligned16(data.outPtr) && numBlocksX * numBlocksY >= FINALIZE_SMALL_GRID_CTA_BOUND &&
+        vectorWidthAligned && data.topK <= MaxTopK && isAligned16(data.inPtr) &&
+        (data.inPtr2 == nullptr || isAligned16(data.inPtr2)) && isAligned16(data.outPtr) &&
+        numBlocksX * numBlocksY >= FINALIZE_SMALL_GRID_CTA_BOUND &&
         (int64_t)data.numTokens * numSlices <= (int64_t)numSms * FINALIZE_V2_MAX_CTAS_PER_SM;
     // With topK <= SMALL_BATCH_FINALIZE_MAX_LOADS there is a single topK group, and the
     // shared-memory reduction costs more than the split saves.
