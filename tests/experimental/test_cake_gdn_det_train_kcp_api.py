@@ -1101,6 +1101,7 @@ def test_walk_width_rules_follow_the_pinned_vectors() -> None:
             memo={}, hp=types.SimpleNamespace(seg_chunk_start=tuple(seg)), H=hv
         )
         tb._memo_put = types.MethodType(kcp._Tables._memo_put, tb)
+        tb._walk_chains = types.MethodType(kcp._Tables._walk_chains, tb)
         want = kcp.walk_vh64_fits(chains, hv, sm)
         assert kcp._Tables.walk_fits(tb, list(range(n_walk)), sm) is want, vid
 
@@ -1672,6 +1673,158 @@ def test_dhu_form_rule_follows_the_architecture_recommendation() -> None:
         for prog in kcp.DHU_PROGRAMS:
             assert jit.select_record(prog, ctas_per_head=2) == prog + kcp.VH64_SUFFIX
             assert jit.MODULES[prog + kcp.VH64_SUFFIX]["program"] == prog
+
+
+def test_dhu_long_chain_walk_takes_the_two_wave_rule_on_sm_100a() -> None:
+    """On ``sm_100a`` (:data:`DHU_LONG_CHAIN_ARCHES`) a #7 walk whose longest segment has at least
+    ``DHU_LONG_CHAIN_MIN_CHUNKS`` = 400 chunks and whose two-CTA grid ends later than its one-CTA grid (LPT over
+    ``2 * sm_count`` slots: :func:`walk_dhu_long_chain`) takes the two-wave rule (vh = 64 iff ``2 * n_walk * HV <= 4 *
+    sm_count``) for the offset and the tape walk.  ``sm_103a``, ``sm_107a`` and the fake backend (``arch`` ``None``)
+    keep their rules for the same walk.  (The det package has no launch cache, so resolve_launch alone carries the
+    flag.)"""
+    kcp = _mod("cake_kcp")
+    assert kcp.DHU_LONG_CHAIN_ARCHES == ("sm_100a",)
+    assert kcp.DHU_LONG_CHAIN_MIN_CHUNKS == 400
+    # one segment of L0 chunks and five of 140 at HV 48 on 148 SMs (296 slots): the one-CTA grid ends at L0 (48 long
+    # CTAs, 240 short ones one per slot); the two-CTA grid puts 480 short CTAs on the 200 other slots, three deep on
+    # 80 of them: 420 > L0 for L0 = 399 / 400, so only the 400-chunk segment reaches the clause
+    assert kcp.walk_dhu_long_chain(((400, 1), (140, 5)), 48, 148)
+    assert not kcp.walk_dhu_long_chain(((399, 1), (140, 5)), 48, 148)
+    # a long segment whose two-CTA grid still ends at it (three short CTAs deep = 300 < 500): not a long-chain walk
+    assert not kcp.walk_dhu_long_chain(((500, 1), (100, 5)), 48, 148)
+    assert not kcp.walk_dhu_long_chain((), 48, 148)
+    assert not kcp.walk_dhu_long_chain(((400, 1), (140, 5)), 48, 0)
+    # the twelve-segment #7 walk of a P1-shaped CP2 rank on 148 SMs: one-CTA LPT 536, two-CTA LPT 640
+    p1 = (
+        (536, 1),
+        (451, 1),
+        (147, 1),
+        (138, 1),
+        (126, 2),
+        (96, 1),
+        (90, 1),
+        (61, 1),
+        (59, 1),
+        (44, 1),
+        (43, 1),
+    )
+    assert kcp.walk_dhu_long_chain(p1, 48, 148)
+    for tape in (True, False):
+        # sm_100a: 2 * 12 * 48 = 1152 > 4 * 148 -> vh 128 for both forms; without the clause both are vh 64
+        assert (
+            kcp.dhu_vh(12, 48, 148, tape=tape, arch="sm_100a", long_chain=True) == 128
+        )
+        assert kcp.dhu_vh(12, 48, 148, tape=tape, arch="sm_100a") == 64
+        # the two-wave rule still takes vh 64 where the grid fits: 2 * 6 * 48 = 576 <= 592
+        assert kcp.dhu_vh(6, 48, 148, tape=tape, arch="sm_100a", long_chain=True) == 64
+        # forced knob wins
+        assert (
+            kcp.dhu_vh(12, 48, 148, 64, tape=tape, arch="sm_100a", long_chain=True)
+            == 64
+        )
+        # not on sm_103a or the fake backend
+        for arch in ("sm_103a", None):
+            assert kcp.dhu_vh(12, 48, 152, tape=tape, arch=arch, long_chain=True) == 64
+    # sm_107a keeps its rules: the offset walk stays vh 64; the tape walk keeps the two-wave rule it already has
+    assert kcp.dhu_vh(12, 48, 208, tape=False, arch="sm_107a", long_chain=True) == 64
+    assert kcp.dhu_vh(8, 48, 212, arch="sm_107a", long_chain=True) == 64  # 768 <= 848
+    assert kcp.dhu_vh(9, 48, 212, arch="sm_107a", long_chain=True) == 128  # 864 > 848
+    # resolve_launch reads the clause flag
+    for prog in kcp.DHU_PROGRAMS:
+        base = {
+            "_grid_args": {"n_walk": 12, "num_heads": 48},
+            "_sm_count": 148,
+            "_dhu_vh": None,
+            "_arch": "sm_100a",
+            "_grid": 12 * 48,
+        }
+        long_args = {**base, "_dhu_long_chain": True}
+        record, _values, grid, _is_test = kcp.resolve_launch(prog, dict(long_args))
+        assert record == prog and grid == (12 * 48, 1, 1), (prog, record, grid)
+
+
+@pytest.mark.parametrize("longest", [24, 23])
+def test_dhu_long_chain_flag_follows_the_plan_chains(monkeypatch, longest) -> None:
+    """Plan test of the #7 long-chain flag (the 400-chunk threshold lowered to 24 so the rank stays small): one
+    contiguous rank of six documents of ``longest`` / 10 / 10 / 10 / 10 / 10 chunks at HV 6 on 18 SMs (36 slots),
+    one segment per document.  The one-CTA grid ends at the longest segment (6 long CTAs, 30 short ones one per
+    slot); the two-CTA grid puts 60 short CTAs on the 24 other slots, three deep on 12 of them (30 > ``longest``).
+    So ``_Tables.walk_long_chain`` holds for 24 and not for 23, and the backward's #7 launches carry that flag to
+    :func:`dhu_vh` (the fake backend has no architecture, so the forms themselves stay vh 64)."""
+    kcp, plan = _mod("cake_kcp"), _mod("cake_kcp_plan")
+    monkeypatch.setattr(kcp, "DHU_LONG_CHAIN_MIN_CHUNKS", 24)
+    cu = _cu((longest * 64,) + (10 * 64,) * 5)
+    ops = _walk_form_ops(cu, 2, 6)
+    ctx = plan.build_context_det_kcp(
+        plan.partition_det_kcp(cu, 1, "contiguous"), None, 0, "cpu", sm_count=18
+    )
+    tb = kcp._Tables(ctx, 6, P=1)
+    assert sorted(tb._walk_chains(tb.walk_live)) == [(10, 5), (longest, 1)]
+    assert tb.walk_long_chain(tb.walk_live, 18) is (longest == 24)
+    seen: list = []
+    real = kcp.dhu_vh
+
+    def recording(*args, **kw):
+        seen.append(kw.get("long_chain"))
+        return real(*args, **kw)
+
+    monkeypatch.setattr(kcp, "dhu_vh", recording)
+    leaves = [
+        ops[n].detach().clone().requires_grad_(True)
+        for n in ("q", "k", "v", "g", "beta")
+    ]
+    out = kcp.chunk_gdn_det_kcp(*leaves, ctx, backend="fake", segments=1)
+    out.backward(ops["dout"])
+    assert seen and all(isinstance(x, bool) for x in seen)
+    assert any(seen) is (longest == 24), seen
+
+
+# The #7 long-chain clause rows of test_vectors_v3.json (R7C, schema r7c-walk-width-test-vectors-v2): every row with
+# dhu_long_chain set plus rows with a segment of at least 400 chunks that are not long-chain walks, one or two per SM
+# count.  Fields: id, SM, arch, HV, n_walk, chains (chunks:count, descending), dhu_long_chain, dhu_offset_vh, dhu_tape_vh.
+DHU_LONG_CHAIN_VECTORS = (
+    "4305 148 sm_100a 48 2 2048:1,2003:1 0 64 64",
+    "4435 148 sm_100a 48 3 434:1,342:1,250:1 0 64 64",
+    "4832 148 sm_100a 48 12 521:1,472:1,131:1,125:2,124:1,88:1,87:1,60:1,57:1,42:1,40:1 1 128 128",
+    "4833 148 sm_100a 48 12 536:1,451:1,147:1,138:1,126:2,96:1,90:1,61:1,59:1,44:1,43:1 1 128 128",
+    "8899 152 sm_103a 48 1 2003:1 0 64 64",
+    "8900 152 sm_103a 48 1 2025:1 0 64 64",
+    "9679 152 sm_103a 48 12 521:1,472:1,131:1,125:2,124:1,88:1,87:1,60:1,57:1,42:1,40:1 1 64 64",
+    "9680 152 sm_103a 48 12 536:1,451:1,147:1,138:1,126:2,96:1,90:1,61:1,59:1,44:1,43:1 1 64 64",
+    "14082 208 sm_107a 48 2 2048:1,2003:1 0 64 64",
+    "14654 208 sm_107a 48 8 497:1,450:1,247:1,235:1,159:1,150:1,117:2 1 64 64",
+    "19133 212 sm_107a 48 2 2048:1,2003:1 0 64 64",
+    "24232 216 sm_107a 48 2 2048:1,2003:1 0 64 64",
+)
+
+
+def test_dhu_long_chain_rule_follows_the_pinned_vectors() -> None:
+    """The #7 long-chain flag (:func:`walk_dhu_long_chain`) and the #7 forms of the pinned v3 vector rows: the flag
+    of the chains, ``_Tables.walk_long_chain`` of a plan whose segments carry the same chains, and ``dhu_vh`` of the
+    offset and tape walks with that flag under the row's architecture."""
+    kcp = _mod("cake_kcp")
+    rows = [line.split() for line in DHU_LONG_CHAIN_VECTORS]
+    assert len(rows) >= 10
+    assert sum(r[6] == "1" for r in rows) == 5
+    for vid, sm, arch, hv, n_walk, chains, long_chain, off, tape in rows:
+        sm, hv, n_walk = int(sm), int(hv), int(n_walk)
+        ch = tuple(tuple(int(x) for x in c.split(":")) for c in chains.split(","))
+        assert sum(n for _, n in ch) == n_walk, vid
+        flag = kcp.walk_dhu_long_chain(ch, hv, sm)
+        assert flag is (long_chain == "1"), vid
+        seg = [0]
+        for c, n in ch:
+            for _ in range(n):
+                seg.append(seg[-1] + c)
+        tb = types.SimpleNamespace(
+            memo={}, hp=types.SimpleNamespace(seg_chunk_start=tuple(seg)), H=hv
+        )
+        tb._memo_put = types.MethodType(kcp._Tables._memo_put, tb)
+        tb._walk_chains = types.MethodType(kcp._Tables._walk_chains, tb)
+        assert kcp._Tables.walk_long_chain(tb, list(range(n_walk)), sm) is flag, vid
+        got_off = kcp.dhu_vh(n_walk, hv, sm, tape=False, arch=arch, long_chain=flag)
+        got_tape = kcp.dhu_vh(n_walk, hv, sm, tape=True, arch=arch, long_chain=flag)
+        assert (got_off, got_tape) == (int(off), int(tape)), vid
 
 
 def test_workspace_holds_one_zeroed_ticket_slot_per_persistent_site() -> None:
