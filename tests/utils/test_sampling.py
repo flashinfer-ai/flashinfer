@@ -1092,6 +1092,7 @@ def test_blackwell_cached_cluster_balanced_chunk_per_arch(
         (64, 151936),
         (32, 128000),
         (32, 152064),
+        (1024, 151936),  # past two waves of shared-tile clusters
     ],
 )
 @pytest.mark.parametrize("seed", [0, 1, 2])
