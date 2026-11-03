@@ -380,6 +380,11 @@ def plan_record(prepared):
             ],
             rule_value=p.units,
         )
+        if getattr(p, "simt", None) is not None:
+            # the SIMT program: one CTA per output tile, the window spec of its tile
+            record.update(
+                simt=list(p.simt), rule_value="simt_n{}m{}s{}".format(*p.simt)
+            )
     elif hasattr(prepared, "splits"):
         record["splits"] = prepared.splits
     return record
