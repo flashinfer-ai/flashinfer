@@ -1121,6 +1121,21 @@ def _shape_with_splits(device, sizes, ks, split):
     return None
 
 
+# The group sizes a split-tail case tries, in order: which sizes split a tail depends on
+# the form and the SM count (``ACC_SIZES`` splits no k256t tail at 160 or 208 SMs).
+SPLIT_SIZES = (ACC_SIZES,) + tuple([300 * m, 0, 1, 700 * m] for m in (4, 8, 16))
+
+
+def _split_case(device, form):
+    """``(sizes, n, k)``: the first group sizes of ``SPLIT_SIZES`` with a shape whose
+    weight-gradient plan on ``device`` splits the ``form`` tail; None when none does."""
+    for sizes in SPLIT_SIZES:
+        shape = _shape_with_splits(device, sizes, base._form_ks(form), split=True)
+        if shape is not None:
+            return (list(sizes), *shape)
+    return None
+
+
 def _padded_out(e, n, k, dtype, device, fill_bits):
     """An ``[e, n, k]`` view of a row- and expert-padded buffer whose every element (the
     padding included) holds the bit pattern ``fill_bits``; returns ``(out, buffer)``."""
@@ -1341,26 +1356,26 @@ def test_fused_split_tail_matches_the_reference(form, out_dtype, monkeypatch):
     device = base._require_program("wgrad", out_dtype)
     base._fresh_stream_workspaces(monkeypatch)
     _require_fused(device, form, out_dtype, monkeypatch)
-    shape = _shape_with_splits(device, ACC_SIZES, base._form_ks(form), split=True)
-    assert shape is not None, f"no candidate shape splits the {form} tail"
-    n, k = shape
-    x, _w, g, offs = base._inputs(ACC_SIZES, n, k, device, seed=33)
+    case = _split_case(device, form)
+    assert case is not None, f"no candidate shape splits the {form} tail"
+    sizes, n, k = case
+    x, _w, g, offs = base._inputs(sizes, n, k, device, seed=33)
     dw32 = _overwrites(g, x, offs, out_dtype)[0]
     gen = torch.Generator(device=device).manual_seed(34)
-    out0 = _out0("randn", dw32, ACC_SIZES, out_dtype, gen)
+    out0 = _out0("randn", dw32, sizes, out_dtype, gen)
     out = out0.clone()
     launch = prepare_wgrad(g, x, offs, out=out, accumulate=True)
     plan = launch.plan
     assert plan["accumulate"] == "fused" and plan["tail_splits"] > 1, plan
-    expected = _expected(out0, g, x, ACC_SIZES)
-    mask = _special_mask(out0, ACC_SIZES)
+    expected = _expected(out0, g, x, sizes)
+    mask = _special_mask(out0, sizes)
     for _ in range(base.REPEATS):
         out.copy_(out0)
         launch.launch()
         torch.cuda.synchronize()
         _assert_within_budget(out, expected, mask)
-        _assert_no_lost_update(out, out0, dw32, ACC_SIZES)
-        for group, rows in enumerate(ACC_SIZES):
+        _assert_no_lost_update(out, out0, dw32, sizes)
+        for group, rows in enumerate(sizes):
             if not rows:
                 assert torch.equal(_bits(out[group]), _bits(out0[group])), group
     base._assert_tail_at_rest(device)
@@ -2086,18 +2101,22 @@ def _sanitize():
                     if not base._force_form(mp, form, arch):
                         continue
                     # The small groups never split a tail; the split case takes
-                    # the groups the split-tail tests use.
-                    sizes = list(ACC_SIZES) if split else [300, 0, 1, 700]
-                    shape = _shape_with_splits(
-                        device, sizes, base._form_ks(form), split
-                    )
-                    if shape is None:
+                    # the split-tail tests' candidates.
+                    if split:
+                        case = _split_case(device, form)
+                    else:
+                        sizes = [300, 0, 1, 700]
+                        shape = _shape_with_splits(
+                            device, sizes, base._form_ks(form), split
+                        )
+                        case = None if shape is None else (sizes, *shape)
+                    if case is None:
                         print(
                             f"SANITIZE skip {form} {out_dtype} split={split}: no shape"
                         )
                         missing.append((form, out_dtype, split))
                         continue
-                    n, k = shape
+                    sizes, n, k = case
                     x, _w, g, offs = base._inputs(sizes, n, k, device, seed=57)
                     out0 = torch.randn(len(sizes), n, k, device=device).to(out_dtype)
                     out = out0.clone()
