@@ -948,27 +948,12 @@ ROUTER_SM_COUNT: dict[str, int] = {"sm_100a": 152, "sm_103a": 152, "sm_107a": 21
 #: a row without an entry in it, and every token count outside its windows, runs the deterministic program.
 #: The sm_107a tables were measured on 208-SM and 212-SM R200 parts at 16172 to 16384 tokens: hidden 5120 takes
 #: "H0.5x4" there (104 head and 416 tail units on 208 SMs, 106 and 424 on 212); hidden 4096 and 6144 and the forward
-#: keep the deterministic plan, as on 216 SMs.  The sm_103a table was measured on 148-SM B300 parts, which without
-#: it run the deterministic program in every router row (the windows of :data:`ROUTER_RULES` other than "waves"
-#: hold only on :data:`ROUTER_SM_COUNT` SMs): hidden 5120 takes "H0.5x3" (74 head and 222 tail units) at 32768
-#: tokens only -- at 16172 to 24576 and at 49152 and 65536 tokens it was more than 3 % slower than the
-#: deterministic plan next to a resident kernel on at least one part.
-#: The rows without a window there copy verdicts measured elsewhere: the forward as measured on 152 SMs, hidden
-#: 4096 and 6144 as measured on one 148-SM part at 16172 to 16384 tokens with the head/tail program these rows ran
-#: before ``ROUTER_HEAD_TAIL_TEMPLATES`` (no partition met the rule there); their 152-SM windows were not measured on
-#: 148 SMs.  No "waves" window: on 148 SMs :func:`router_waves` gives hidden 5120 the deterministic program at every
-#: token count.
+#: keep the deterministic plan, as on 216 SMs.
 # fmt: off
 ROUTER_RULES_BY_SM: dict[
     tuple[str, int],
     dict[tuple[str, str, int, int], Optional[Union[str, int, tuple[tuple[int, int, Union[str, int]], ...]]]],
 ] = _VerdictTable({
-    ("sm_103a", 148): _VerdictTable({
-        ("sm_103a", "kk", 4096, 256): None, ("sm_103a", "kk", 5120, 256): None, ("sm_103a", "kk", 6144, 256): None,
-        ("sm_103a", "nn_t", 4096, 256): None,
-        ("sm_103a", "nn_t", 5120, 256): ((32768, 32768, "H0.5x3"),),
-        ("sm_103a", "nn_t", 6144, 256): None,
-    }),
     ("sm_107a", 208): _VerdictTable({
         ("sm_107a", "kk", 4096, 256): None, ("sm_107a", "kk", 5120, 256): None, ("sm_107a", "kk", 6144, 256): None,
         ("sm_107a", "nn_t", 4096, 256): None,
@@ -990,8 +975,7 @@ ROUTER_HEAD_TAIL_SUFFIX = "_ht_c3_nreg"
 #: ``router_fp32_gemm_atomic_nn_t`` + :data:`ROUTER_HEAD_TAIL_SUFFIX`: on ``sm_103a``, the head/tail program with the
 #: BF16 parts of ``A`` in tensor memory (the same products, accumulators, partition and part segments; two TMEM chunk
 #: buffers, six slots of raw ``A`` tiles and six of ``B`` parts in shared memory).  ``sm_103a`` takes a head/tail
-#: partition only in the windows where this program was measured: those of :data:`ROUTER_RULES` on 152 SMs and the
-#: hidden 5120 window of the 148-SM table of :data:`ROUTER_RULES_BY_SM`.
+#: partition only in the windows of :data:`ROUTER_RULES` on 152 SMs, where it was measured.
 ROUTER_HEAD_TAIL_TEMPLATES: dict[str, str] = {
     "sm_103a": "router_fp32_gemm_ts_r6p6_atomic_nn_t_ht_c2_nreg",
 }
