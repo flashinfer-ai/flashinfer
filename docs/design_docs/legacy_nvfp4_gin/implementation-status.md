@@ -17,7 +17,7 @@ publication has been performed.
 | P2 | Targeted device port; FI sparse/activation/scale/shared behavior retained | EP1/EP2/EP4 and shared compatibility results below |
 | P3 | Formal public runtime, collective errors, session isolation/recreation and capture rejection passed | 3576839: 4 tests/rank |
 | P4 | Fixed-term, independent math, transport/L1 byte and relaunch checks passed | 3576795; augmented final run 3576874 passed |
-| P5 | Provenance, supported-case and review material prepared | Final review/evidence complete; Rubin/local performance waived by user |
+| P5 | Provenance, supported-case and review material prepared | Final review/evidence complete; subsequent Blackwell measurements reported separately |
 
 ## Current measured evidence
 
@@ -50,5 +50,8 @@ nccl4py 0.3.1, driver 580.173.10.
 ## User scope clarification
 
 The user stated: “我们的这个feature不涉及rubin环境，可以不用在本地验证”.
-Rubin/local performance measurements are not a completion gate for this
-delivery. They are not measured, rather than passed. No speedup is claimed.
+This waived performance measurements at the original correctness delivery.
+The user subsequently requested Blackwell measurements; they are now complete
+and recorded in [performance-blackwell.md](performance-blackwell.md). All
+accepted output checks pass, but the off performance gate did not pass overall
+and on measurements show regression. No speedup is claimed.

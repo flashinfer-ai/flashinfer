@@ -42,7 +42,7 @@ requires Torch/FlashInfer; a missing dependency is BLOCKED, not a skip/pass.
 | CUDA arena typed views, real NCCL init/windows/LSA mapping | PASS, 3576298 | Actual GPU reads of every LSA peer, three create/close cycles/rank |
 | F_BASE/off versus receiver/off EP4 smoke | PASS, 3576310 | Two cases/rank/source, including per-token scale |
 | Donor and FI on-mode stage/numeric/relaunch checks | PASS for fixed case | 3576795: 24 strong calls/rank, exact protocol/message/L1 bytes and unchanged Torch tolerance; 3576839: four public control/lifetime cases/rank |
-| GPU performance | NOT MEASURED; waived for this delivery | User clarified that this feature does not require Rubin/local validation; no performance claim |
+| GPU performance | MEASURED on GB300; off gate did not pass overall | Subsequent explicit user request; [results and limits](performance-blackwell.md) |
 
 Raw command output and exact counts are in [host-checks.log](evidence/host-checks.log).
 The all-gather and resource harnesses exercise host control flow; they are not
@@ -73,7 +73,7 @@ cycles, without zeroing away the protocol state. Test resource recreation,
 failed initialization, two-session isolation or explicit mutual exclusion,
 and every supported/rejected mode through the public backend.
 
-## Deferred performance protocol (not executed)
+## Original performance proposal (superseded by the subsequent Blackwell experiment)
 
 Use alternating baseline/receiver runs on identical hardware, clocks, routing,
 inputs, tuning and cache protocol. For off, use F_BASE as the control; for on,
@@ -86,16 +86,19 @@ restrictions and do not change any fixed DeepSeek CI guard.
 Proposed off regression gate: receiver median no more than 5% above F_BASE
 for each qualified case in both fused-kernel and full-call intervals. If
 baseline dispersion exceeds 5%, label the comparison inconclusive and fix the
-measurement environment before evaluating the gate. This threshold was declared before measurement but has not been evaluated.
-The user waived local Rubin/performance validation for this delivery; no
-regression-timing pass or performance improvement is claimed.
+measurement environment before evaluating the gate. The subsequent [Blackwell protocol and results](performance-blackwell.md) explicitly
+separate the CUDA-event pipeline gate from independently profiled fused-kernel
+durations. The original waiver applied at correctness delivery; the user
+later explicitly requested the measurements. No overall performance pass or
+performance improvement is claimed.
 
 ## User scope clarification
 
 On 2026-11-02 the user stated: “我们的这个feature不涉及rubin环境，可以不用在本地验证”.
-Rubin/local performance measurements are therefore not a completion gate for
-this delivery. Existing Blackwell correctness checks continue. Performance is
-not measured, rather than passed; no hardware restriction is silently bypassed.
+This waived performance measurements at the original correctness delivery.
+The user later explicitly requested Blackwell performance measurements,
+superseding this waiver for that experiment. The subsequent results are
+reported below; the fixed DeepSeek CI guard remains unchanged.
 
 ## Real execution summary
 
@@ -160,3 +163,10 @@ request supersedes the earlier local-performance waiver for this experiment.
 The predeclared matrix/protocol and live measurement record are in
 [performance-blackwell.md](performance-blackwell.md). Correctness results
 above are unchanged; they are not timing measurements.
+
+Blackwell measurements are now complete: EP1/EP2/EP4 off against F_BASE and
+N2R2 on against the fixed donor, five alternating rounds and 100 primary
+samples per group. All accepted output-bit/payload checks passed. The off
+performance gate did not pass overall; on measurements show regression.
+See the linked report for every case, dispersion, scope differences and
+retained failed/partial runs. No kernel tuning was included.
