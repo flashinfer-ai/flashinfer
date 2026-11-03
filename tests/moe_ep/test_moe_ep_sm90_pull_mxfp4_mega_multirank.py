@@ -635,22 +635,26 @@ def test_moe_ep_sm90_pull_mxfp4_mega_multirank_raw_oracle_and_workspace_reuse(
 @pytest.mark.gpu_2
 @pytest.mark.arch_hopper
 @pytest.mark.parametrize(
-    "tile_n,tail_pairs,pull",
+    "tile_n,tail_pairs,pull,tokens",
     [
-        (64, False, {}),
-        (64, True, {}),
-        (72, False, {}),
-        (80, False, {}),
-        (80, True, {}),
-        (64, False, {"dispatch_pull_batch": 2, "dispatch_pull_rotate": True}),
-        (64, False, {"dispatch_pull_batch": 3, "dispatch_pull_rotate": True}),
-        (64, False, {"compact_pull_buffer": True, "dispatch_pull_rotate": True}),
+        (64, False, {}, 129),
+        (64, True, {}, 129),
+        (72, False, {}, 129),
+        (72, False, {}, 200),
+        (80, False, {}, 129),
+        (80, False, {}, 200),
+        (80, True, {}, 129),
+        (64, False, {"dispatch_pull_batch": 2, "dispatch_pull_rotate": True}, 200),
+        (64, False, {"dispatch_pull_batch": 3, "dispatch_pull_rotate": True}, 200),
+        (64, False, {"compact_pull_buffer": True, "dispatch_pull_rotate": True}, 129),
     ],
     ids=(
         "n64",
         "n64-tail",
         "n72",
+        "n72-multitile",
         "n80",
+        "n80-multitile",
         "n80-tail",
         "n64-pull2-rotate",
         "n64-pull3-rotate",
@@ -658,20 +662,20 @@ def test_moe_ep_sm90_pull_mxfp4_mega_multirank_raw_oracle_and_workspace_reuse(
     ),
 )
 def test_moe_ep_sm90_pull_mxfp4_m256_k128_independent_oracle(
-    monkeypatch, tile_n, tail_pairs, pull
+    monkeypatch, tile_n, tail_pairs, pull, tokens
 ):
-    """Folded K128 tiles (N64 across a tile boundary, partial N72/N80) and the
-    pull-buffer variants match raw math."""
+    """Folded K128 tiles (N64 across a tile boundary, partial and multi-tile N72/N80)
+    and the pull-buffer variants match raw math."""
     import sys
 
     module = sys.modules[__name__]
     monkeypatch.setattr(module, "HIDDEN", 2560)
     monkeypatch.setattr(module, "INTERMEDIATE", 640)
-    # EP2 routes 64/65 rows per expert: across an N64 tile boundary, and into
-    # one partial N72/N80 tile. A batched pull gets 200 tokens so that a rank
-    # pulls more rows than one pass of its 132 * batch slots.
-    batched = pull.get("dispatch_pull_batch", 1) > 1
-    monkeypatch.setattr(module, "TOKENS_PER_RANK", 200 if batched else 129)
+    # With 129 tokens EP2 routes 64/65 rows per expert: across an N64 tile
+    # boundary, and into one partial N72/N80 tile. With 200 tokens (about 100
+    # rows per expert) N72/N80 run a full tile and a partial one, and a batched
+    # pull has more rows per rank than one pass of its 132 * batch slots.
+    monkeypatch.setattr(module, "TOKENS_PER_RANK", tokens)
     tactic = dict(
         _fused_tactic(),
         mma_tiler_mnk=(256, tile_n, 128),

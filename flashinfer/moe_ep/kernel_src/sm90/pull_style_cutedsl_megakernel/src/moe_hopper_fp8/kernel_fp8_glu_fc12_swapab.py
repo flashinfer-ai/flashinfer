@@ -183,9 +183,10 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
                 "Sm90SwapABSwigluFp8Fc12Kernel token tiles N72/N80 require M=256; "
                 f"got mma_tiler_mnk={mma_tiler_mnk}."
             )
-        if sf_padding_block % n != 0:
+        if fp8_scale_mode in ("blockwise", "mxfp4_hybrid") and sf_padding_block % n:
             # The activation-SF TMA addresses token tile t of an expert as
-            # (expert SF base + t * N) // N, so every SF base must divide by N.
+            # (expert SF base + t * N) // N, so every SF base must divide by N;
+            # per-tensor scaling has no activation-SF TMA.
             raise ValueError(
                 f"sf_padding_block={sf_padding_block} must be a multiple of the "
                 f"token tile N={n}."

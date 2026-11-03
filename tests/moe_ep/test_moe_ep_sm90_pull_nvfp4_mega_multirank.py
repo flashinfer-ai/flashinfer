@@ -327,7 +327,7 @@ def _factory_conversion_knobs():
 
 
 @pytest.mark.parametrize(
-    "conversion_layout", ["fallback", "factory", "sf2-r1", "sf0-n72"]
+    "conversion_layout", ["fallback", "factory", "sf2-r1", "sf0-n72", "sf0-n80"]
 )
 def test_sm90_nvfp4_public_ep4_matches_raw_weight_oracles(conversion_layout):
     import torch
@@ -351,7 +351,8 @@ def test_sm90_nvfp4_public_ep4_matches_raw_weight_oracles(conversion_layout):
     bootstrap = BootstrapConfig(world_size=WORLD_SIZE, rank=rank, device=local_rank)
     ensure_moe_ep_cuda_device(bootstrap)
     scale_ring = conversion_layout == "sf2-r1"
-    wide_tile = conversion_layout == "sf0-n72"
+    wide_tile = conversion_layout in ("sf0-n72", "sf0-n80")
+    tile_n = 80 if conversion_layout == "sf0-n80" else 72
     large = scale_ring or wide_tile
     tokens = 1024 if large else TOKENS
     hidden_size = 1280 if large else HIDDEN
@@ -388,10 +389,10 @@ def test_sm90_nvfp4_public_ep4_matches_raw_weight_oracles(conversion_layout):
             "nvfp4_sf_stages": 2,
         }
         if wide_tile:
-            # 1024 rows per expert: 14 full N72 tiles and a 16-row tail. The
-            # token tile does not change the math, so the N64 baseline below
-            # must match byte for byte.
-            knobs = dict(knobs, mma_tiler_mnk=(256, 72, 256), nvfp4_sf_stages=0)
+            # 1024 rows per expert: 14 full N72 tiles and a 16-row tail, or 12
+            # full N80 tiles and a 64-row tail. The token tile does not change
+            # the math, so the N64 baseline below must match byte for byte.
+            knobs = dict(knobs, mma_tiler_mnk=(256, tile_n, 256), nvfp4_sf_stages=0)
     config = Sm90_Fp8_Nvfp4_Bf16_PullCutedsl_MegaMoeConfig(
         intermediate_size=intermediate_size,
         top_k=WORLD_SIZE,
@@ -435,7 +436,7 @@ def test_sm90_nvfp4_public_ep4_matches_raw_weight_oracles(conversion_layout):
         if large:
             # Use a second public layer so constructing the fixed baseline
             # cannot replace the tested layer's default workspace. Only the ring
-            # depth (sf2-r1) or the token tile (sf0-n72) differs; K64 weights,
+            # depth (sf2-r1) or the token tile (sf0-n72, sf0-n80) differs; K64 weights,
             # the remaining geometry and overlap stay identical.
             baseline_knobs = (
                 dict(knobs, mma_tiler_mnk=(256, 64, 256))

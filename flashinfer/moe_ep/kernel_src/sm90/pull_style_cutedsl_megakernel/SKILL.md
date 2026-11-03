@@ -221,7 +221,8 @@ not picked them up):
   `swapab_token_tile_n_choices`, which the swap-AB kernel and epilogue take
   for `fp8_scale_mode="mxfp4_hybrid"`; FP8 keeps `SwapABTokenTileNChoices`
   and its shim list. The swap-AB kernel also rejects N72/N80 without M=256
-  and an `sf_padding_block` that is not a multiple of N, because the
+  and, for the scale modes with activation SF (`blockwise`, `mxfp4_hybrid`),
+  an `sf_padding_block` that is not a multiple of N, because the
   activation-SF TMA addresses a tile as `(expert SF base + tile * N) // N`;
   the MX frontend pads the SF pool accordingly, and every existing N keeps
   128. `fused_comm_policy.py` enables paired BF16 stores for

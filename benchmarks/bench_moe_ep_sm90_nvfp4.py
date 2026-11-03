@@ -170,8 +170,8 @@ def parse_args():
     parser.add_argument(
         "--mx-compact",
         action="store_true",
-        help="Force the MXFP4 compact pull buffer (default: the configuration's "
-        "default, which follows the MXFP4 tactic)",
+        help="Force the MXFP4 compact pull buffer, also over a knobs-JSON config "
+        "(default: the configuration's default, which follows the MXFP4 tactic)",
     )
     parser.add_argument(
         "--output", type=Path, default=Path("sm90_nvfp4_benchmark.json")
@@ -484,7 +484,7 @@ def main():
                         forced = (
                             {"compact_pull_buffer": True} if args.mx_compact else {}
                         )
-                        config = MXConfig(**common, **{**forced, **override})
+                        config = MXConfig(**common, **{**override, **forced})
                         transformed, pack = prepared_mx, packs["mx"]
                     layer = MoEEpLayer(
                         bootstrap=BootstrapConfig(
