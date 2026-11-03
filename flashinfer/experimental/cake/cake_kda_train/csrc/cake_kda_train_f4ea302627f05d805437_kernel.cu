@@ -47,38 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 256
-#define TMEM_ACC_OFFSET 0
-#define NUM_ONE_STAGES 1
-#define NUM_TWO_STAGES 2
-#define NUM_FOUR_STAGES 4
-#define SMEM_GK_P_OFF 0
-#define SMEM_GK_P_STAGE_BYTES 8192
-#define SMEM_GK_P_STRIDE 8192
-#define SMEM_K_P_OFF 32768
-#define SMEM_K_P_STAGE_BYTES 8192
-#define SMEM_K_P_STRIDE 8192
-#define SMEM_RING_OFF 49152
-#define SMEM_RING_STAGE_BYTES 16384
-#define SMEM_RING_STRIDE 16384
-#define SMEM_DAB_OFF 81920
-#define SMEM_DAB_STAGE_BYTES 8192
-#define SMEM_DAB_STRIDE 8192
-#define SMEM_Q_P_OFF 98304
-#define SMEM_Q_P_STAGE_BYTES 2048
-#define SMEM_Q_P_STRIDE 2048
-#define SMEM_TILES_OFF 106496
-#define SMEM_TILES_STAGE_BYTES 2048
-#define SMEM_TILES_STRIDE 2048
-#define SMEM_BETA_S_OFF 114688
-#define SMEM_BETA_S_STAGE_BYTES 256
-#define SMEM_BETA_S_STRIDE 256
-#define SMEM_POOL_F32_OFF 0
-#define SMEM_POOL_F32_STAGE_BYTES 114944
-#define SMEM_POOL_F32_STRIDE 114944
-#define SMEM_TOTAL 115200
-#define THREADS 288
 #define LAUNCH_MIN_BLOCKS 2
 
 #include <math_constants.h>
