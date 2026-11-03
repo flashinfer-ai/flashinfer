@@ -174,7 +174,7 @@ __device__ __forceinline__ void cp_async_bulk_gmem2smem(
 
 __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
     uint32_t result;
-    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xffffffff;"
+    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xFFFFFFFF;"
         : "=r"(result) : "r"(val));
     return result;
 }
@@ -211,7 +211,7 @@ kernel_cake_kda_prefill_0c19a9863fa28a7dad1a(int* __restrict__ items, int num_he
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     __nv_bfloat16* smem_r = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
     const int smem_r_addr = smem + 1024;
     float* smem_d = reinterpret_cast<float*>(smem_raw + 99328);
@@ -219,8 +219,7 @@ kernel_cake_kda_prefill_0c19a9863fa28a7dad1a(int* __restrict__ items, int num_he
     __nv_bfloat16* smem_panel = reinterpret_cast<__nv_bfloat16*>(smem_raw + 102400);
     const int smem_panel_addr = smem + 102400;
 
-    // Mbarrier init (7 pipeline groups, 0 ordered-sequence groups, 13 barriers)
-    // Mbarriers at smem_raw[0..104)
+    // Mbarrier init (13 barriers at smem_raw[0..104))
 
     if (warp == 0) {
         // --- pipeline 'r_pipe' ---
@@ -258,12 +257,10 @@ kernel_cake_kda_prefill_0c19a9863fa28a7dad1a(int* __restrict__ items, int num_he
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
-
-    // Kernel post-init ops
-    const int tmem_tmem_m = taddr;
-    const int tmem_tmem_inp = taddr + 128;
-    const int tmem_tmem_m_alt = taddr + 192;
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_tmem_m = taddr;
+    const unsigned int tmem_tmem_inp = taddr + 128;
+    const unsigned int tmem_tmem_m_alt = taddr + 192;
 
     // ---- Role: compute ----
     if (warp <= 3) {
@@ -759,7 +756,7 @@ kernel_cake_kda_prefill_0c19a9863fa28a7dad1a(int* __restrict__ items, int num_he
                     mbarrier_wait(r_free_addr + (load_stage) * 8, _phase_r_free);
                     mbarrier_arrive_expect_tx(r_full_addr + (load_stage) * 8, 33280);
                     tma_4d_gmem2smem(smem_r_addr + load_stage * 32768, (&pair_tma), 0, (snap_outer_3 + p_3 * num_heads) * 128, 0, 0, r_full_addr + (load_stage) * 8);
-                    cp_async_bulk_gmem2smem(smem_d_addr + (unsigned int)((int)load_stage * 256 * 4), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(dpair) + ((unsigned long long)(long long)((snap_outer_3 + p_3 * num_heads) * 128) * (unsigned long long)4)), 512, r_full_addr + (load_stage) * 8);
+                    cp_async_bulk_gmem2smem(smem_d_addr + (unsigned int)((int)load_stage * 256 * 4), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(dpair) + (unsigned long long)(long long)((snap_outer_3 + p_3 * num_heads) * 128) * (unsigned long long)4), 512, r_full_addr + (load_stage) * 8);
                     load_stage += 1;
                     if (load_stage == 3) { load_stage = 0; _phase_r_free ^= 1; }
                 }
