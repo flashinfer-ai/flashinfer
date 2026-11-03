@@ -321,10 +321,13 @@ it handles these rows on the device, without a host synchronization:
   above a default 4096-row chunk: a one-chunk backward is too short to repay
   the partition launch; `set_zero_dlogp_min_rows`; `None` = never).  The
   call's plan decides: under the skip the last chunk's bf16 fused cast runs
-  its counted form instead of the TMA-epilogue form (the same `dW` bits), and
-  a plan with a form that has no counted one (an explicitly pinned swapped dX
-  tile or weight-gradient TMA epilogue) runs the backward without the skip:
-  no partition launch, rows in the forward's order.
+  its counted form -- the counted TMA-epilogue form
+  (`gemm_dw_cast_bf16_tma_dcnt`) where the plan without the skip takes the
+  TMA-epilogue cast (`dw_cast_tma_rule`: two or more chunks and a last chunk
+  of 1 .. 1792 rows), else the counted per-thread form; the same `dW` bits
+  either way -- and a plan with a form that has no counted one (an explicitly
+  pinned swapped dX tile or weight-gradient TMA epilogue) runs the backward
+  without the skip: no partition launch, rows in the forward's order.
 
 Non-finite values: a NaN `dlogp` keeps its row live (NaN in its `dX` row and
 in `dW`, as without the skip).  A non-finite `X` row of a zero-gradient row

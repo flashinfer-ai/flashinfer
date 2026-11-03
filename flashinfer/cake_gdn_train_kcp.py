@@ -463,6 +463,16 @@ def chunk_gdn_kcp(
     convolution call, and this call shares one of them.  Needs ``boundary_mode="saved"`` and ``graph="off"``; implies ``save_transfer=False``.  A forward
     outside the backward that finds an entry raises (a handle reused across micro-steps).
 
+    ``q`` / ``k`` / ``v`` that are head views of one packed ``[..., T, (2 H_qk + HV) * 128]`` row (the convolution's
+    output) get the full backward speed as the views of
+    ``flashinfer.experimental.cake_gdn_train_kcp.packed_qkv_views_kcp`` or
+    ``flashinfer.cake_gdn_det_train_kcp.packed_qkv_views_det_kcp``: both packages take the packed gradient layout
+    from the operands' pointers and strides, and both helpers' split nodes pass a packed gradient row on without a
+    copy.  Plain ``split`` / ``view`` views of the row give the same results, but torch's split backward
+    concatenates ``dq`` / ``dk`` / ``dv`` into a new row: on the non-deterministic route, about 1.1-1.2 ms
+    (33-37 %) more backward per call at ``(16, 48)`` and 32,768 tokens on B200 and GB300, with the in-kernel norm
+    off or on (``flashinfer/experimental/cake_gdn_train_kcp/README.md``, "Packed Q/K/V").
+
     ``deterministic`` (default ``True``) selects the route (see the module docstring); the checkpoint recompute of a
     forward runs the forward's route as long as the torch deterministic-algorithms setting does not change in between.
     """

@@ -536,6 +536,8 @@ kernel_cake_dsv4_3fce080f96f6dc5e9f8c(const __grid_constant__ CUtensorMap tmap_q
 
     // Kernel post-init ops
     const int tmem_tmem_scratch = taddr;
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     if (warp >= 8 && warp <= 11) {
         asm volatile("setmaxnreg.inc.sync.aligned.u32 136;");
     }
@@ -2080,10 +2082,10 @@ kernel_cake_dsv4_3fce080f96f6dc5e9f8c(const __grid_constant__ CUtensorMap tmap_q
             unsigned int source_work_x_4 = blockIdx.x;
             unsigned int source_work_z_4 = blockIdx.z;
             if (cta_rank == 0) {
-                uint32_t _mbar_token_0 = mbarrier_try_wait(s_empty_addr, 1);
-                mbarrier_wait_token(s_empty_addr, 1, _mbar_token_0);
-                uint32_t _mbar_token_1 = mbarrier_try_wait(s_empty_addr + 8, 1);
-                mbarrier_wait_token(s_empty_addr + 8, 1, _mbar_token_1);
+                uint32_t _mbar_token_0_0 = mbarrier_try_wait(s_empty_addr, 1);
+                mbarrier_wait_token(s_empty_addr, 1, _mbar_token_0_0);
+                uint32_t _mbar_token_0_1 = mbarrier_try_wait(s_empty_addr + 8, 1);
+                mbarrier_wait_token(s_empty_addr + 8, 1, _mbar_token_0_1);
             }
             int pv_qk_cursor = 0;
             int pv_qk_single_wave = 0;
@@ -2145,11 +2147,11 @@ kernel_cake_dsv4_3fce080f96f6dc5e9f8c(const __grid_constant__ CUtensorMap tmap_q
                                 tcgen05_mma_f8f6f4((tmem_tmem_scratch + (first_score_col)), _mma_ss_a_desc_3, _mma_ss_b_desc_3, 69206032, 1);
                             }
                         }
-                        int mma_a_lo_1 = (((smem_q_full_addr + 8192) >> 4) & 0x3FFF) + (0) * 2048;
-                        int mma_b_lo_1 = (((smem_k_full_addr + 16384) >> 4) & 0x3FFF) + (mma_k_stage) * 4096;
+                        int mma_a_lo_1_0 = (((smem_q_full_addr + 8192) >> 4) & 0x3FFF) + (0) * 2048;
+                        int mma_b_lo_1_0 = (((smem_k_full_addr + 16384) >> 4) & 0x3FFF) + (mma_k_stage) * 4096;
                         {
-                            uint64_t _mma_ss_a_desc_4 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(mma_a_lo_1);
-                            uint64_t _mma_ss_b_desc_4 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(mma_b_lo_1);
+                            uint64_t _mma_ss_a_desc_4 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(mma_a_lo_1_0);
+                            uint64_t _mma_ss_b_desc_4 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(mma_b_lo_1_0);
                             if (elect_sync()) {
                                 tcgen05_mma_f8f6f4((tmem_tmem_scratch + (first_score_col)), _mma_ss_a_desc_4, _mma_ss_b_desc_4, 69206032, 1);
                             }
@@ -2169,11 +2171,11 @@ kernel_cake_dsv4_3fce080f96f6dc5e9f8c(const __grid_constant__ CUtensorMap tmap_q
                                 tcgen05_mma_f8f6f4((tmem_tmem_scratch + (first_score_col)), _mma_ss_a_desc_4, _mma_ss_b_desc_4, 69206032, 1);
                             }
                         }
-                        int mma_a_lo_2 = (((smem_q_full_addr + 16384) >> 4) & 0x3FFF) + (0) * 2048;
-                        int mma_b_lo_2 = (((smem_k_full_addr + 32768) >> 4) & 0x3FFF) + (mma_k_stage) * 4096;
+                        int mma_a_lo_1_1 = (((smem_q_full_addr + 16384) >> 4) & 0x3FFF) + (0) * 2048;
+                        int mma_b_lo_1_1 = (((smem_k_full_addr + 32768) >> 4) & 0x3FFF) + (mma_k_stage) * 4096;
                         {
-                            uint64_t _mma_ss_a_desc_5 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(mma_a_lo_2);
-                            uint64_t _mma_ss_b_desc_5 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(mma_b_lo_2);
+                            uint64_t _mma_ss_a_desc_5 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(mma_a_lo_1_1);
+                            uint64_t _mma_ss_b_desc_5 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(mma_b_lo_1_1);
                             if (elect_sync()) {
                                 tcgen05_mma_f8f6f4((tmem_tmem_scratch + (first_score_col)), _mma_ss_a_desc_5, _mma_ss_b_desc_5, 69206032, 1);
                             }
@@ -2193,11 +2195,11 @@ kernel_cake_dsv4_3fce080f96f6dc5e9f8c(const __grid_constant__ CUtensorMap tmap_q
                                 tcgen05_mma_f8f6f4((tmem_tmem_scratch + (first_score_col)), _mma_ss_a_desc_5, _mma_ss_b_desc_5, 69206032, 1);
                             }
                         }
-                        int mma_a_lo_3 = (((smem_q_full_addr + 24576) >> 4) & 0x3FFF) + (0) * 2048;
-                        int mma_b_lo_3 = (((smem_k_full_addr + 49152) >> 4) & 0x3FFF) + (mma_k_stage) * 4096;
+                        int mma_a_lo_1_2 = (((smem_q_full_addr + 24576) >> 4) & 0x3FFF) + (0) * 2048;
+                        int mma_b_lo_1_2 = (((smem_k_full_addr + 49152) >> 4) & 0x3FFF) + (mma_k_stage) * 4096;
                         {
-                            uint64_t _mma_ss_a_desc_6 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(mma_a_lo_3);
-                            uint64_t _mma_ss_b_desc_6 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(mma_b_lo_3);
+                            uint64_t _mma_ss_a_desc_6 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(mma_a_lo_1_2);
+                            uint64_t _mma_ss_b_desc_6 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(mma_b_lo_1_2);
                             if (elect_sync()) {
                                 tcgen05_mma_f8f6f4((tmem_tmem_scratch + (first_score_col)), _mma_ss_a_desc_6, _mma_ss_b_desc_6, 69206032, 1);
                             }
@@ -2239,11 +2241,11 @@ kernel_cake_dsv4_3fce080f96f6dc5e9f8c(const __grid_constant__ CUtensorMap tmap_q
                                 mbarrier_wait(pv_pair_ready_addr + (_stage_pv_pair_ready) * 8, _parity_pv_pair_ready);
                             }
                             asm volatile("tcgen05.fence::after_thread_sync;");
-                            int mma_a_lo_4 = (((smem_q_full_addr) >> 4) & 0x3FFF) + (0) * 2048;
-                            int mma_b_lo_4 = (((smem_k_full_addr) >> 4) & 0x3FFF) + (mma_k_stage) * 4096;
+                            int mma_a_lo_1 = (((smem_q_full_addr) >> 4) & 0x3FFF) + (0) * 2048;
+                            int mma_b_lo_1 = (((smem_k_full_addr) >> 4) & 0x3FFF) + (mma_k_stage) * 4096;
                             {
-                                uint64_t _mma_ss_a_desc_7 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(mma_a_lo_4);
-                                uint64_t _mma_ss_b_desc_7 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(mma_b_lo_4);
+                                uint64_t _mma_ss_a_desc_7 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(mma_a_lo_1);
+                                uint64_t _mma_ss_b_desc_7 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(mma_b_lo_1);
                                 if (elect_sync()) {
                                     tcgen05_mma_f8f6f4((tmem_tmem_scratch + (score_col)), _mma_ss_a_desc_7, _mma_ss_b_desc_7, 69206032, 0);
                                 }
@@ -2263,11 +2265,11 @@ kernel_cake_dsv4_3fce080f96f6dc5e9f8c(const __grid_constant__ CUtensorMap tmap_q
                                     tcgen05_mma_f8f6f4((tmem_tmem_scratch + (score_col)), _mma_ss_a_desc_7, _mma_ss_b_desc_7, 69206032, 1);
                                 }
                             }
-                            int mma_a_lo_1_1 = (((smem_q_full_addr + 8192) >> 4) & 0x3FFF) + (0) * 2048;
-                            int mma_b_lo_1_1 = (((smem_k_full_addr + 16384) >> 4) & 0x3FFF) + (mma_k_stage) * 4096;
+                            int mma_a_lo_1_3 = (((smem_q_full_addr + 8192) >> 4) & 0x3FFF) + (0) * 2048;
+                            int mma_b_lo_1_3 = (((smem_k_full_addr + 16384) >> 4) & 0x3FFF) + (mma_k_stage) * 4096;
                             {
-                                uint64_t _mma_ss_a_desc_8 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(mma_a_lo_1_1);
-                                uint64_t _mma_ss_b_desc_8 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(mma_b_lo_1_1);
+                                uint64_t _mma_ss_a_desc_8 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(mma_a_lo_1_3);
+                                uint64_t _mma_ss_b_desc_8 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(mma_b_lo_1_3);
                                 if (elect_sync()) {
                                     tcgen05_mma_f8f6f4((tmem_tmem_scratch + (score_col)), _mma_ss_a_desc_8, _mma_ss_b_desc_8, 69206032, 1);
                                 }
@@ -2287,11 +2289,11 @@ kernel_cake_dsv4_3fce080f96f6dc5e9f8c(const __grid_constant__ CUtensorMap tmap_q
                                     tcgen05_mma_f8f6f4((tmem_tmem_scratch + (score_col)), _mma_ss_a_desc_8, _mma_ss_b_desc_8, 69206032, 1);
                                 }
                             }
-                            int mma_a_lo_2_1 = (((smem_q_full_addr + 16384) >> 4) & 0x3FFF) + (0) * 2048;
-                            int mma_b_lo_2_1 = (((smem_k_full_addr + 32768) >> 4) & 0x3FFF) + (mma_k_stage) * 4096;
+                            int mma_a_lo_1_4 = (((smem_q_full_addr + 16384) >> 4) & 0x3FFF) + (0) * 2048;
+                            int mma_b_lo_1_4 = (((smem_k_full_addr + 32768) >> 4) & 0x3FFF) + (mma_k_stage) * 4096;
                             {
-                                uint64_t _mma_ss_a_desc_9 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(mma_a_lo_2_1);
-                                uint64_t _mma_ss_b_desc_9 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(mma_b_lo_2_1);
+                                uint64_t _mma_ss_a_desc_9 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(mma_a_lo_1_4);
+                                uint64_t _mma_ss_b_desc_9 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(mma_b_lo_1_4);
                                 if (elect_sync()) {
                                     tcgen05_mma_f8f6f4((tmem_tmem_scratch + (score_col)), _mma_ss_a_desc_9, _mma_ss_b_desc_9, 69206032, 1);
                                 }
@@ -2311,11 +2313,11 @@ kernel_cake_dsv4_3fce080f96f6dc5e9f8c(const __grid_constant__ CUtensorMap tmap_q
                                     tcgen05_mma_f8f6f4((tmem_tmem_scratch + (score_col)), _mma_ss_a_desc_9, _mma_ss_b_desc_9, 69206032, 1);
                                 }
                             }
-                            int mma_a_lo_3_1 = (((smem_q_full_addr + 24576) >> 4) & 0x3FFF) + (0) * 2048;
-                            int mma_b_lo_3_1 = (((smem_k_full_addr + 49152) >> 4) & 0x3FFF) + (mma_k_stage) * 4096;
+                            int mma_a_lo_1_5 = (((smem_q_full_addr + 24576) >> 4) & 0x3FFF) + (0) * 2048;
+                            int mma_b_lo_1_5 = (((smem_k_full_addr + 49152) >> 4) & 0x3FFF) + (mma_k_stage) * 4096;
                             {
-                                uint64_t _mma_ss_a_desc_10 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(mma_a_lo_3_1);
-                                uint64_t _mma_ss_b_desc_10 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(mma_b_lo_3_1);
+                                uint64_t _mma_ss_a_desc_10 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(mma_a_lo_1_5);
+                                uint64_t _mma_ss_b_desc_10 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(mma_b_lo_1_5);
                                 if (elect_sync()) {
                                     tcgen05_mma_f8f6f4((tmem_tmem_scratch + (score_col)), _mma_ss_a_desc_10, _mma_ss_b_desc_10, 69206032, 1);
                                 }
@@ -2613,11 +2615,11 @@ kernel_cake_dsv4_3fce080f96f6dc5e9f8c(const __grid_constant__ CUtensorMap tmap_q
                             int _parity_k_full = (int)((unsigned int)(pv_tile_cursor + pv_tile) / 2 % 2);
                             mbarrier_wait(k_full_addr + (_stage_k_full) * 8, _parity_k_full);
                             asm volatile("tcgen05.fence::after_thread_sync;");
-                            int mma_a_lo_5 = (((smem_p_fp8_addr) >> 4) & 0x3FFF) + (pv_phase) * 512;
-                            int mma_b_lo_5 = ((((smem_v_full_addr) >> 4) & 0x3FFF) | 0x4000000) + (pv_v_stage) * 4096;
+                            int mma_a_lo_2 = (((smem_p_fp8_addr) >> 4) & 0x3FFF) + (pv_phase) * 512;
+                            int mma_b_lo_2 = ((((smem_v_full_addr) >> 4) & 0x3FFF) | 0x4000000) + (pv_v_stage) * 4096;
                             {
-                                uint64_t _mma_ss_a_desc_3 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(mma_a_lo_5);
-                                uint64_t _mma_ss_b_desc_3 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(mma_b_lo_5);
+                                uint64_t _mma_ss_a_desc_3 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(mma_a_lo_2);
+                                uint64_t _mma_ss_b_desc_3 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(mma_b_lo_2);
                                 if (elect_sync()) {
                                     tcgen05_mma_f8f6f4((tmem_tmem_scratch + (256)), _mma_ss_a_desc_3, _mma_ss_b_desc_3, 69271568, ((pv_first) ? 0 : 1));
                                 }
@@ -2637,11 +2639,11 @@ kernel_cake_dsv4_3fce080f96f6dc5e9f8c(const __grid_constant__ CUtensorMap tmap_q
                                     tcgen05_mma_f8f6f4((tmem_tmem_scratch + (256)), _mma_ss_a_desc_3, _mma_ss_b_desc_3, 69271568, 1);
                                 }
                             }
-                            int mma_a_lo_1_2 = (((smem_p_fp8_addr) >> 4) & 0x3FFF) + (pv_phase) * 512;
-                            int mma_b_lo_1_2 = ((((smem_v_full_addr + 32768) >> 4) & 0x3FFF) | 0x4000000) + (pv_v_stage) * 4096;
+                            int mma_a_lo_1_6 = (((smem_p_fp8_addr) >> 4) & 0x3FFF) + (pv_phase) * 512;
+                            int mma_b_lo_1_6 = ((((smem_v_full_addr + 32768) >> 4) & 0x3FFF) | 0x4000000) + (pv_v_stage) * 4096;
                             {
-                                uint64_t _mma_ss_a_desc_4 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(mma_a_lo_1_2);
-                                uint64_t _mma_ss_b_desc_4 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(mma_b_lo_1_2);
+                                uint64_t _mma_ss_a_desc_4 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(mma_a_lo_1_6);
+                                uint64_t _mma_ss_b_desc_4 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(mma_b_lo_1_6);
                                 if (elect_sync()) {
                                     tcgen05_mma_f8f6f4((tmem_tmem_scratch + (1048832)), _mma_ss_a_desc_4, _mma_ss_b_desc_4, 69271568, ((pv_first) ? 0 : 1));
                                 }
@@ -2689,11 +2691,11 @@ kernel_cake_dsv4_3fce080f96f6dc5e9f8c(const __grid_constant__ CUtensorMap tmap_q
                                     tcgen05_mma_f8f6f4((tmem_tmem_scratch + (384)), _mma_ss_a_desc_5, _mma_ss_b_desc_5, 69271568, 1);
                                 }
                             }
-                            int mma_a_lo_1_0 = (((smem_p_fp8_addr) >> 4) & 0x3FFF) + (pv_phase) * 512;
-                            int mma_b_lo_1_0 = ((((smem_v_full_addr + 49152) >> 4) & 0x3FFF) | 0x4000000) + (pv_v_stage) * 4096;
+                            int mma_a_lo_1_6_1 = (((smem_p_fp8_addr) >> 4) & 0x3FFF) + (pv_phase) * 512;
+                            int mma_b_lo_1_6_1 = ((((smem_v_full_addr + 49152) >> 4) & 0x3FFF) | 0x4000000) + (pv_v_stage) * 4096;
                             {
-                                uint64_t _mma_ss_a_desc_6 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(mma_a_lo_1_0);
-                                uint64_t _mma_ss_b_desc_6 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(mma_b_lo_1_0);
+                                uint64_t _mma_ss_a_desc_6 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(mma_a_lo_1_6_1);
+                                uint64_t _mma_ss_b_desc_6 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(mma_b_lo_1_6_1);
                                 if (elect_sync()) {
                                     tcgen05_mma_f8f6f4((tmem_tmem_scratch + (1048960)), _mma_ss_a_desc_6, _mma_ss_b_desc_6, 69271568, ((pv_first) ? 0 : 1));
                                 }

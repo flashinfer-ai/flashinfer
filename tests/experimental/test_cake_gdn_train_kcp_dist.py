@@ -50,7 +50,8 @@ collectives are the deterministic layer's) run under Slurm.
 
 Packed QKV (#7817): under ``layout="tma"`` the backward of strided packed views writes one packed dQKV row, and
 ``packed_qkv_views_kcp`` hands it to a packed leaf without a concatenation (both within the budgets of the contiguous
-call).  ``test_l2n_rows`` / ``test_l2n_layer_checkpoint_rows``: the in-kernel Q / K L2 norm
+call); plain ``split`` views of the leaf, direct and checkpointed, keep torch's split backward and their hooks and
+``retain_grad`` (issue #8367; within the same budgets).  ``test_l2n_rows`` / ``test_l2n_layer_checkpoint_rows``: the in-kernel Q / K L2 norm
 (``use_qk_l2norm_in_kernel=True``) on raw rows, every form within the FP64 budgets of the norm-off rows and of its
 partner, the deterministic package with the norm within the same constants, the token-local program outputs exact
 (see the block comment before ``V1_LIBRARIES``).
@@ -843,6 +844,16 @@ def _programs_exported() -> bool:
         return bool(libraries)
 
 
+def _forward_arena_tapes(backend: str, device, T_r: int) -> tuple[str, ...]:
+    """The forward tapes an eager light, saved-boundary forward leaves in a caller's arena: the output walk's two
+    (``FWD_TAPES_ARENA_AFTER_FUSED``) where the forward folds #5 into its tape walks (``cake_kcp._fuse_o``: tokens and
+    the registry's output-walk records for this backend's architecture), else the four #5 reads."""
+    arch = None if backend == "fake" else _mod("cake_backend").device_arch(device.index)
+    if T_r > 0 and kcp.fused_o_shipped(arch):
+        return kcp.FWD_TAPES_ARENA_AFTER_FUSED
+    return kcp.FWD_TAPES_ARENA_AFTER_FWD
+
+
 def _backend_name() -> str:
     name = os.environ.get("KCP_TEST_BACKEND")
     if name:
@@ -996,6 +1007,71 @@ def _packed_views(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
     kv.copy_(k)
     vv.copy_(v)
     return buf, qv, kv, vv
+
+
+def _plain_split_pass(buf, g, beta, dout, call, H_qk: int, HV: int, *, ckpt: bool):
+    """Issue #8367: one autograd pass with q / k / v as plain ``split`` + ``view`` head views of a packed leaf holding
+    ``buf`` (torch's own split backward concatenates the gradients).  Returns the results (``dq`` / ``dk`` / ``dv``
+    cut from the leaf's gradient) and whether the tensor hooks and ``retain_grad`` set on the views and on the split
+    outputs of the original forward fired once each with the gradient the leaf received in the same pass (exact:
+    structural; vacuous at ``T_r = 0``)."""
+    T = int(buf.shape[0])
+    sizes = (H_qk * 128, H_qk * 128, HV * 128)
+    row = buf.detach().clone().requires_grad_(True)
+    g_leaf, b_leaf = (x.detach().clone().requires_grad_(True) for x in (g, beta))
+    fired: dict[str, list] = {}
+    views: dict[str, torch.Tensor] = {}
+
+    def fn(row_, g_, b_):
+        parts = row_.split(sizes, dim=-1)
+        q_, k_, v_ = (
+            p.view(T, n, 128) for p, n in zip(parts, (H_qk, H_qk, HV), strict=True)
+        )
+        if not views:  # the original forward (a checkpoint recompute builds a graph no backward runs)
+            views.update(
+                q=q_, k=k_, v=v_, **{f"part{i}": p for i, p in enumerate(parts)}
+            )
+            for name, t in views.items():
+                t.register_hook(
+                    lambda gr, name=name: fired.setdefault(name, []).append(gr.clone())
+                )
+                t.retain_grad()
+        return call(q_, k_, v_, g_, b_)
+
+    if ckpt:
+        from torch.utils.checkpoint import checkpoint
+
+        out = checkpoint(fn, row, g_leaf, b_leaf, use_reentrant=False)
+    else:
+        out = fn(row, g_leaf, b_leaf)
+    out.backward(dout)
+    ga = row.grad
+    cols = {
+        "q": (0, sizes[0]),
+        "k": (sizes[0], 2 * sizes[0]),
+        "v": (2 * sizes[0], None),
+    }
+    res = {
+        "out": out.detach(),
+        **{
+            "d" + n: ga[:, a:b].reshape(T, h, 128)
+            for (n, (a, b)), h in zip(cols.items(), (H_qk, H_qk, HV), strict=True)
+        },
+        "dg": g_leaf.grad,
+        "dbeta": b_leaf.grad,
+    }
+    hooks = T == 0 or (
+        sorted(fired) == sorted(views)
+        and all(len(x) == 1 for x in fired.values())
+        and all(
+            torch.equal(fired[n][0].reshape(T, -1), ga[:, a:b])
+            and torch.equal(views[n].grad.reshape(T, -1), ga[:, a:b])
+            and torch.equal(fired[f"part{i}"][0], ga[:, a:b])
+            and torch.equal(views[f"part{i}"].grad, ga[:, a:b])
+            for i, (n, (a, b)) in enumerate(cols.items())
+        )
+    )
+    return res, hooks
 
 
 def _rounded(nbytes: int) -> int:
@@ -1380,7 +1456,13 @@ def _kept_record(T_r: int) -> dict:
     replay); a rank without tokens has no tapes and runs the replay form as before."""
     bwd = kcp.LAST_CALL["bwd"]
     seq = list(bwd["sequence"])
-    forward_programs = {"fwd_prep", "kcp_fwdh_offset", "kcp_fwdh_tape", "fwd_o"}
+    forward_programs = {
+        "fwd_prep",
+        "kcp_fwdh_offset",
+        "kcp_fwdh_tape",
+        "kcp_fwdh_out",
+        "fwd_o",
+    }
     first_local = next(
         (s_ for s_ in seq if s_ in kcp.LOCAL_PROGRAMS or s_ in forward_programs), None
     )
@@ -1818,6 +1900,19 @@ def _run_rank(
         or kcp.PACKED_SPLIT_STATS["aliased"] - split_before["aliased"] == 1
     )
     del qkv_leaf, g_leaf, b_leaf, out_split, ga, res_split
+
+    # issue #8367: plain split views of the packed leaf keep torch's autograd path (its split backward concatenates):
+    # within the budgets of the autograd call, direct and checkpointed, with the hooks and retain_grad on the views firing
+    def gdn_call(*a):
+        return kcp.chunk_gdn_kcp(*a, ctx, workspace=ws, deterministic=False, **base)
+
+    for ck, tag in ((False, "direct"), (True, "ckpt")):
+        res_plain, hooks_ok = _plain_split_pass(
+            _buf, g, beta, dout, gdn_call, H_qk, HV, ckpt=ck
+        )
+        arm(f"plain_split_{tag}", res_plain, res_auto, "autograd")
+        flags[f"plain_split_{tag}_hooks_fire"] = hooks_ok
+        del res_plain
     del _buf, qs, ks, vs
     # gradient accumulation: .backward() twice -> half the accumulated gradient against the FP64 gradient
     judge.fp64(
@@ -1869,11 +1964,14 @@ def _run_rank(
             leaf.grad = None
         torch.cuda.synchronize(device)
         gc.collect()
+        arena_after = _forward_arena_tapes(backend, device, int(q.shape[0]))
         if wsp is not None:
             # the warm-up backward's replay re-bound the arena tapes an eager forward drops before its output
-            # (FWD_DEAD_BEFORE_O); start from the state a forward leaves so the delta is the output alone
-            for name in kcp.FWD_DEAD_BEFORE_O + kcp.FWD_DEAD_AFTER_PREP:
-                wsp.release_tape(name)
+            # (FWD_DEAD_BEFORE_O; a fused forward binds no h / v_new either); start from the state a forward
+            # leaves so the delta is the output alone
+            for name in kcp.FWD_TAPES:
+                if name not in arena_after:
+                    wsp.release_tape(name)
             for name in kcp.FWD_DEAD_POOLS:
                 wsp.release_pool(name)
             torch.cuda.synchronize(device)
@@ -1921,12 +2019,13 @@ def _run_rank(
             )
         out.backward(dout)
         if wsp is not None and form == "caller_ws_kept":
-            # a kept backward leaves the caller's arena as a forward leaves it: of the forward tapes only the four
-            # #5 reads are bound (no dead tape, no kept tape beyond them), no entry survives the backward
+            # a kept backward leaves the caller's arena as a forward leaves it: of the forward tapes only the ones
+            # the forward leaves are bound (the four #5 reads; a fused forward's two), no dead tape, no kept tape
+            # beyond them, no entry survives the backward
             dbg["arena_tapes_after_backward"] = sorted(wsp._tapes)
             flags["kept_ws_as_forward_leaves"] = (
                 set(wsp._tapes) & set(kcp.FWD_TAPES)
-            ) <= set(kcp.FWD_TAPES_ARENA_AFTER_FWD) and kcp.kept_registry_size() == 0
+            ) <= set(arena_after) and kcp.kept_registry_size() == 0
         del out, leaves
     info["retained_bytes"] = retained
     info["retained_block_bytes"] = retained_block
@@ -3348,6 +3447,8 @@ V1_LIBRARIES = {
     "kcp_transfer_walk_three_mma": "cake_gdn_train_2f42874614b85ffc14fe_kcp",
     "kcp_transfer_walk_plain_tf32": "cake_gdn_train_efbba796414578cbd8b5_kcp",
 }
+# The output walk (#2 with #5 folded in): no v1 record, launched by the norm-off and the norm-on forward alike.
+NORM_OFF_EXTRA_RECORDS = ("kcp_fwdh_out", "kcp_fwdh_out_vh64")
 L2N_SKIP = (
     "the in-kernel Q/K L2 norm records (fwd_prep_l2n, bwd_dqkg_l2n, qk_apply) are not in the shipped registry "
     "yet: use_qk_l2norm_in_kernel cannot run on the kernel backend"
@@ -3618,7 +3719,8 @@ def _run_rank_l2n(
         if partner is not None:
             judge.cross(f"{name}_vs_{partner_name}", r_, partner, gate=gate)
 
-    # norm off unchanged: the v1 records keep their names; the norm-off route launches only them
+    # norm off unchanged: the v1 records keep their names; the norm-off route launches only them and the output
+    # walk (a program of both routes, new beside the v1 records; NORM_OFF_EXTRA_RECORDS)
     flags["norm_off_libraries_pinned"] = all(
         ({**jit.MODULES, **jit.TEST_MODULES}.get(n) or {}).get("library") == lib
         for n, lib in V1_LIBRARIES.items()
@@ -3633,7 +3735,8 @@ def _run_rank_l2n(
     }
     info["norm_off_records"] = sorted(used)
     flags["norm_off_launches_v1_only"] = (
-        used <= set(V1_LIBRARIES) and not res_off["fwd"]["qk_l2norm"]
+        used <= set(V1_LIBRARIES) | set(NORM_OFF_EXTRA_RECORDS)
+        and not res_off["fwd"]["qk_l2norm"]
     )
     del res_off
 
@@ -3860,7 +3963,22 @@ def _run_rank_l2n(
     flags["l2n_packed_split_aliased"] = (
         T_r == 0 or kcp.PACKED_SPLIT_STATS["aliased"] - split_before["aliased"] == 1
     )
-    del qkv_leaf, g_leaf, b_leaf, out_split, ga, res_split, buf, qs, ks, vs, res_auto
+    del qkv_leaf, g_leaf, b_leaf, out_split, ga, res_split
+
+    # issue #8367 with the norm: plain split views, direct and checkpointed (see _run_rank)
+    def gdn_call(*a):
+        return kcp.chunk_gdn_kcp(
+            *a, ctx, workspace=ws, deterministic=False, **base, **L2N
+        )
+
+    for ck, tag in ((False, "direct"), (True, "ckpt")):
+        res_plain, hooks_ok = _plain_split_pass(
+            buf, g, beta, dout, gdn_call, H_qk, HV, ckpt=ck
+        )
+        arm(f"plain_split_{tag}", res_plain, res_auto, "autograd")
+        flags[f"l2n_plain_split_{tag}_hooks_fire"] = hooks_ok
+        del res_plain
+    del buf, qs, ks, vs, res_auto
 
     # (e) CUDA-graph replay with the norm: the fourth forward + backward replays; judged within the budgets
     graph_info: dict[str, object] = {}

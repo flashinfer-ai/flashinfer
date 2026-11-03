@@ -51,7 +51,6 @@ namespace {
 constexpr int64_t kWorldSize = 4;
 constexpr int64_t kCapMax = 103000;
 constexpr int64_t kGridMax = 4096;
-constexpr int64_t kRowMultiple = 4;
 constexpr int64_t kHidden = 6144;
 constexpr int64_t kTableEntries = 8;
 constexpr int64_t kCtrlWords = 16384;
@@ -76,8 +75,6 @@ void run(TensorView x, TensorView out, TensorView ts_wire, TensorView ts_rs, Ten
       << "cap must be in [1, " << kCapMax << "], got " << cap;
   TVM_FFI_CHECK(rows >= 1 && rows <= cap, ValueError)
       << "rows must be in [1, cap = " << cap << "], got " << rows;
-  TVM_FFI_CHECK(rows % kRowMultiple == 0, ValueError)
-      << "rows must be a multiple of " << kRowMultiple << ", got " << rows;
   TVM_FFI_CHECK(grid_x >= 1 && grid_x <= kGridMax, ValueError)
       << "grid_x must be in [1, " << kGridMax << "], got " << grid_x;
   const int64_t capo = (cap + 3) / 4;

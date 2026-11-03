@@ -1,4 +1,5 @@
-"""Source-level CAKE backend for DeepSeek V4 sparse MLA on SM100 and SM103.
+"""Source-level CAKE backend for DeepSeek V4 sparse MLA on SM100 and SM103, and
+for the FP8 decode route on SM107.
 
 Host contract (flashinfer#4671 hardening)
 -----------------------------------------
@@ -264,6 +265,11 @@ def _bf16_h128_prefill_uses_snake_feed(
     if (int(sparse_topk) + _TILE_KV - 1) // _TILE_KV < 2:
         return False
     return 2 * (tokens % clusters) > clusters
+
+
+@functools.lru_cache(maxsize=None)
+def _device_sm_count(device: torch.device) -> int:
+    return int(torch.cuda.get_device_properties(device).multi_processor_count)
 
 
 @functools.lru_cache(maxsize=None)
@@ -901,6 +907,9 @@ _SCALAR_VALUE_NAMES = frozenset(
     }
 )
 _GRID_NAMES = ("grid_x", "grid_y", "grid_z")
+# The per-call launch argument of the programs that leave programmatic dependent
+# launch to each call (``["launch", "enable_pdl"]`` in their plan, 0 or 1).
+_LAUNCH_NAMES = ("enable_pdl",)
 # Producers whose generated ABI reads request boundaries from cum_seq_lens_q
 # only; run_cake_dsv4 synthesizes the dense offsets for them.
 _RAGGED_ONLY_ROUTES = frozenset(
@@ -923,18 +932,27 @@ def _fp8_persistent_program(num_query_tokens: int) -> str:
     return "fp8_h128_prefill_source_persistent"
 
 
-# Mirrors the Cake seed's H64_M64_MIN_TOKENS
-# (portfolio_v34.persistent_program): FP8/H64 rows admitted to the persistent
-# body with at least this many tokens run the H64-specific single-CTA M64 body.
-_FP8_H64_M64_MIN_TOKENS = 128
-
-
 def _fp8_h64_uses_persistent_body(sparse_topk: int, num_query_tokens: int) -> bool:
-    """FP8/H64 persistent-body rule (Cake seed ``portfolio_v34.uses_persistent_body``)."""
+    """FP8/H64 rows that run the FP8/H128 persistent body while it fits one wave
+    (Cake seed ``portfolio_v34.uses_persistent_body``)."""
     full_tiles = sparse_topk // 128
     if num_query_tokens <= 12:
         return full_tiles >= 3
-    return full_tiles >= 2 or num_query_tokens >= 128
+    return full_tiles >= 2
+
+
+def _fp8_h64_uses_m64_body(num_query_tokens: int, sm_count: int) -> bool:
+    """FP8/H64 decode rows (``max_q_len < 257``) whose two-CTA-per-token bodies
+    no longer fit one wave.
+
+    The FP8/H128 persistent body, the SWA producer and the H64 cluster body
+    launch two CTAs per token; once ``2 * tokens`` exceeds the SM count their
+    second wave costs more than the single-CTA M64 body (one CTA per token)
+    saves by running each token on one SM.  GB300 (152 SMs), q_len 4,
+    DSv4-Flash widths: 84-120 tokens SWA-only 11.2-11.9 -> 7.0-7.5 us, topk4x
+    640 14.2-15.9 -> 14.3-14.8 us; 128-512 tokens the M64 body led already.
+    """
+    return 2 * num_query_tokens > sm_count
 
 
 # Mirrors the Cake M64 seed's box_k_gather_for_width (TILE_KV = 128).  The M64
@@ -968,6 +986,8 @@ def is_bindable_arg(kind: str, name: str) -> bool:
         return canonical in _SCALAR_VALUE_NAMES
     if kind == "grid":
         return name in _GRID_NAMES
+    if kind == "launch":
+        return name in _LAUNCH_NAMES
     return False
 
 
@@ -985,6 +1005,12 @@ def _bind_argument(
                 f"CAKE DSv4 {variant} has an unknown grid argument: {name}"
             )
         return grid[name]
+    if kind == "launch":
+        if name not in _LAUNCH_NAMES:
+            raise ValueError(
+                f"CAKE DSv4 {variant} has an unknown launch argument: {name}"
+            )
+        return int(bool(values.get(name, False)))
     if kind not in ("buffer", "tma_buffer", "parameter"):
         raise ValueError(
             f"CAKE DSv4 {variant} has an unknown argument kind {kind!r} for {name}"
@@ -1096,7 +1122,10 @@ def _route(
     batch_size: int,
     compressed_page_size: int,
     num_query_tokens: int,
+    sm_count: int,
 ) -> str:
+    """The variant one call runs; ``sm_count`` is the device's SM count (the
+    FP8/H64 decode rows pick their body by the waves of its grid)."""
     if max_q_len <= 0:
         raise ValueError("max_q_len must be positive")
     is_swa = sparse_topk == 128
@@ -1147,29 +1176,26 @@ def _route(
             # 1.24-1.25x, width-260 rows 56/59/68/71 GB300 1.38-1.49x /
             # B200 1.33-1.43x (one-partition producer 0.99-1.27x).
             return "fp8_h8_h16_source_exact"
-        if num_heads == 64 and _fp8_h64_uses_persistent_body(
-            sparse_topk, num_query_tokens
-        ):
-            # Mirrors the Cake seed's H64_PERSISTENT_* rule:
-            # 12-token rows with >= 3 complete sparse tiles; every many-token
-            # compressed row (>= 2 complete tiles); SWA-only rows from 128
-            # tokens.  Same persistent FP8 body as FP8/H128 (heads >= num_heads
-            # predicated): GB300 1.23-1.26x / B200 1.15x on the 12-token rows,
-            # 1.02-1.92x on the 16-128-token hardening rows where the
-            # per-token cluster body and the SWA producer sat at 0.6-0.87x.
-            # Evaluated before the SWA-only test on purpose.
-            if num_query_tokens >= _FP8_H64_M64_MIN_TOKENS:
-                # H64-specific single-CTA M64 persistent body (one
-                # CTA per token, unified 128-row KV stage, no V gathers): GB300
-                # 1.25-1.55x / B200 1.22-1.44x on the 128-512 token rows where
-                # the FP8/H128 body sat at 0.81-1.13x.  Two exported programs,
-                # selected by the item width.
+        if num_heads == 64:
+            if _fp8_h64_uses_m64_body(num_query_tokens, sm_count):
+                # H64-specific single-CTA M64 persistent body (one CTA per
+                # token, unified 128-row KV stage, no V gathers).  Two exported
+                # programs, selected by the item width.
                 return _fp8_h64_m64_program(sparse_topk)
-            return _fp8_persistent_program(num_query_tokens)
+            if _fp8_h64_uses_persistent_body(sparse_topk, num_query_tokens):
+                # Same persistent FP8 body as FP8/H128 (heads >= num_heads
+                # predicated) for the multi-tile rows of one wave: GB300 10.5-12.0
+                # us vs 13.4-14.1 us for the M64 body on the 1-72-token topk4x
+                # 640 rows.
+                return _fp8_persistent_program(num_query_tokens)
+            if is_swa:
+                return "fp8_lowhead_prefill"
+            # Rows with fewer complete tiles: the M64 body beats the H64 cluster
+            # body at every token count (GB300, topk128x widths 204-252,
+            # 1-72 tokens: 7.9-8.5 us vs 8.8-10.4 us).
+            return _fp8_h64_m64_program(sparse_topk)
         if is_swa:
             return "fp8_lowhead_prefill"
-        if num_heads == 64:
-            return "fp8_lowhead_h64"
         # One producer partition owns up to three sparse tiles (widths up to
         # 384) and writes final O directly (one partition measured 1.18-1.26x
         # on the width-260 rows).  No two-partition producer is exported for
@@ -1447,17 +1473,22 @@ def cake_dsv4_workspace_requirement(
     max_q_len: int,
     batch_size: int,
     ragged: bool,
+    sm_count: Optional[int] = None,
 ) -> WorkspaceRequirement:
-    """Route and exact workspace requirement of one call, without device access.
+    """Route and exact workspace requirement of one call.
 
     The arguments are the route inputs of :func:`run_cake_dsv4`:
     ``num_query_tokens`` = metadata rows, ``sparse_topk`` = combined table
     width, ``compressed_page_size`` = ``compressed_kv_cache.shape[-2]``
     (irrelevant for SWA-only calls), ``max_q_len`` = dense per-request query
     length or the ragged maximum, ``batch_size`` = ``seq_lens.numel()``,
-    ``ragged`` = ``cum_seq_lens_q is not None``. Raises ``ValueError`` for a
-    shape ``backend="cake"`` has no kernel for.
+    ``ragged`` = ``cum_seq_lens_q is not None``, ``sm_count`` = the SM count
+    of the device the call runs on (``None``: the current CUDA device's; the
+    workspace numbers do not depend on it, the route name may). Raises
+    ``ValueError`` for a shape ``backend="cake"`` has no kernel for.
     """
+    if sm_count is None:
+        sm_count = _device_sm_count(torch.device("cuda", torch.cuda.current_device()))
     tokens = _positive_int(num_query_tokens, "num_query_tokens")
     heads = _positive_int(num_heads, "num_heads")
     batch = _positive_int(batch_size, "batch_size")
@@ -1471,6 +1502,7 @@ def cake_dsv4_workspace_requirement(
         batch_size=batch,
         compressed_page_size=int(compressed_page_size),
         num_query_tokens=tokens,
+        sm_count=_positive_int(sm_count, "sm_count"),
     )
     plan = _route_plan(
         route, num_query_tokens=tokens, num_heads=heads, sparse_topk=topk
@@ -1745,8 +1777,14 @@ def run_cake_dsv4(
     extra_sparse_topk_lens: Optional[torch.Tensor] = None,
     sparse_topk_lens_offset: int = 0,
     out_shape: Optional[tuple[int, ...]] = None,
+    enable_pdl: bool = False,
 ) -> torch.Tensor:
     """Launch the CAKE DSv4 route for flattened ``query [rows, num_heads, 512]``.
+
+    ``enable_pdl`` launches the programs that support it (the FP8 persistent,
+    M64 and low-head prefill bodies) as programmatic dependents of the previous kernel on the
+    stream; they wait for it before their first global read.  The other
+    programs launch without the attribute.
 
     ``out=None`` allocates the output here, after the route is known, so the
     routes in ``_OUT_PHASE_BY_ROUTE`` get their measured-fast base phase;
@@ -1847,6 +1885,7 @@ def run_cake_dsv4(
         batch_size=batch_size,
         compressed_page_size=compressed_kv_cache.shape[-2],
         num_query_tokens=meta.num_query_tokens,
+        sm_count=_device_sm_count(device),
     )
 
     if out is None:
@@ -1906,6 +1945,7 @@ def run_cake_dsv4(
         "ragged_query": int(ragged),
         "num_splits": 1,
         "total_work_items": num_query_tokens,
+        "enable_pdl": bool(enable_pdl),
     }
     plan = _route_plan(
         route,

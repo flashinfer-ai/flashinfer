@@ -1570,6 +1570,7 @@ def test_program_vocabulary_is_the_design_list() -> None:
         "fwd_prep",
         "kcp_fwdh_offset",
         "kcp_fwdh_tape",
+        "kcp_fwdh_out",
         "kcp_transfer_walk",
         "kcp_affine_merge",
         "fwd_o",
@@ -1594,11 +1595,15 @@ def test_program_vocabulary_is_the_design_list() -> None:
     assert (
         kcp.TART_MODULE_OF["kcp_affine_merge"] == "kda_chunk_kcp_affine_merge_fp32_v1"
     )  # reused verbatim
+    # the output walk is this package's own program: a det-neutral module that no deterministic twin ships
+    assert kcp.TART_MODULE_OF["kcp_fwdh_out"] == "gdn_chunk_fwdh_out_v1_kcp"
     for name, module in kcp.TART_MODULE_OF.items():
-        if name != "kcp_affine_merge":
-            # the programs' kernel modules are, so far, the deterministic family's (provenance stems; a lever that
-            # replaces a program updates this line); the context-parallel-only programs carry the ``_kcp`` suffix
+        if name not in ("kcp_affine_merge", "kcp_fwdh_out"):
+            # the other programs' kernel modules are, so far, the deterministic family's (provenance stems; a lever
+            # that replaces a program updates this line)
             assert module.startswith("gdn_chunk_det_"), (name, module)
+        if name != "kcp_affine_merge":
+            # the context-parallel-only programs carry the ``_kcp`` suffix
             assert module.endswith("_kcp") == name.startswith("kcp_"), (name, module)
     assert kcp.FWD_TAPES == (
         "w",
@@ -1620,7 +1625,12 @@ def test_program_vocabulary_is_the_design_list() -> None:
         "dg_part",
         "gamma_dot",
     )
-    for prog in ("kcp_fwdh_offset", "kcp_transfer_walk", "kcp_dhu_offset"):
+    for prog in (
+        "kcp_fwdh_offset",
+        "kcp_fwdh_out",
+        "kcp_transfer_walk",
+        "kcp_dhu_offset",
+    ):
         args = kcp.PROGRAM_ARGS[prog]
         assert (
             "num_heads" in args
@@ -1642,6 +1652,13 @@ def test_program_vocabulary_is_the_design_list() -> None:
     assert "group_reduce" in kcp.PROGRAM_ARGS["bwd_dqkg"]
     assert set(kcp.HOST_ONLY_ARGS) <= set(kcp.PROGRAM_ARGS["bwd_dqkg"])
     assert "o" in kcp.PROGRAM_ARGS["fwd_o"] and "out" not in kcp.PROGRAM_ARGS["fwd_o"]
+    # the output walk: the tape walk's inputs and #5's operands, writes o and neither tape nor final-state pool
+    fused = kcp.PROGRAM_ARGS["kcp_fwdh_out"]
+    assert {"q", "aqk", "qscale", "o", "h0", "h0_index"} <= set(fused)
+    assert not {"h_tape", "v_new", "out", "out_index", "ticket"} & set(fused)
+    assert set(fused) - {"q", "aqk", "qscale", "o"} <= set(
+        kcp.PROGRAM_ARGS["kcp_fwdh_tape"]
+    )
     assert (
         "do" in kcp.PROGRAM_ARGS["bwd_prep"]
         and "dout" not in kcp.PROGRAM_ARGS["bwd_prep"]
@@ -1707,7 +1724,7 @@ def test_fwdh_form_rule_follows_the_l8a_decision() -> None:
     """#2 runs the vh = 64 form when ``n_walk * HV <= sm_count``, else vh = 128; the test knob
     ``fwdh_vh`` forces a form (the two forms are within the same accuracy budget; the fake-backend suite checks it)."""
     kcp = _mod("cake_kcp")
-    assert kcp.FWDH_PROGRAMS == ("kcp_fwdh_offset", "kcp_fwdh_tape")
+    assert kcp.FWDH_PROGRAMS == ("kcp_fwdh_offset", "kcp_fwdh_tape", "kcp_fwdh_out")
     assert kcp.fwdh_vh(3, 48, 152) == 64  # 144 head-CTAs <= 152 SMs (GB300)
     assert kcp.fwdh_vh(4, 48, 152) == 128  # 192 > 152
     assert kcp.fwdh_vh(1, 48, 148) == 64
@@ -1883,6 +1900,7 @@ def test_host_tables_build_on_the_cpu_for_every_rank(row) -> None:
         for prog in (
             "kcp_fwdh_offset",
             "kcp_fwdh_tape",
+            "kcp_fwdh_out",
             "kcp_transfer_walk",
             "kcp_affine_merge",
             "fwd_o",
