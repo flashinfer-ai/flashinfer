@@ -20,7 +20,7 @@ from flashinfer.gemm.batch_invariant.api import (
     mm_bf16_batch_invariant,
 )
 from flashinfer.gemm.batch_invariant.blocks.operands import can_implement
-from flashinfer.gemm.batch_invariant.cost_model import PARTS
+from flashinfer.gemm.batch_invariant.heuristic import PARTS
 from flashinfer.gemm.batch_invariant.generator import (
     REFERENCE_SHAPE,
     Knobs,
@@ -269,7 +269,7 @@ def test_weight_layouts_agree():
 @needs_device
 @pytest.mark.parametrize("M,N,K", [(1000, 4096, 4096), (37, 2048, 4000)])
 def test_config_agreement(M, N, K):
-    """R3: every configuration the tuner may choose (the cost model's top candidates on both parts) and a spread of
+    """R3: every configuration the tuner may choose (the dispatcher's top candidates on both parts) and a spread of
     hand-picked records (64- / 128- / 256-row tiles, 1- and 2-CTA MMA, clusters, both rasters, swizzles, a decode
     tile) give identical bits."""
     a, b = adv_bf16(M, K, 61), adv_bf16(K, N, 62)
@@ -421,6 +421,66 @@ def test_misaligned_a_is_copied_and_keeps_the_bits():
     assert a_off.is_contiguous() and a_off.data_ptr() % 16 == 2
     assert torch.equal(bits(bi_mm(a_off, b)), bits(bi_mm(a, b)))
     assert torch.equal(bits(bi_mm(a_off[:1], b)), bits(bi_mm(a[:1], b)))
+
+
+@needs_device
+def test_persistent_grid_is_the_device_co_resident_cluster_count():
+    """The compiled persistent grid is the launch device's co-resident cluster count for the configuration's cluster
+    shape (the GPC-aware occupancy query), not SMs // cluster size: the launched grid, read from a profiler trace of a
+    many-tile GEMM, is that many clusters; the kernel's cache key carries the count; the bits are those of any other grid."""
+    import json
+    import tempfile
+
+    import cutlass.utils as cutlass_utils
+    from torch.profiler import ProfilerActivity, profile
+
+    from flashinfer.gemm.batch_invariant.api import persistent_clusters
+    from flashinfer.gemm.batch_invariant.blocks.compile import kernel_name
+
+    dev = torch.device("cuda", torch.cuda.current_device())
+    sms = torch.cuda.get_device_properties(dev).multi_processor_count
+    a, b = rnd_bf16(4096, 1024, 161), rnd_bf16(1024, 4096, 162)
+    ref = bits(bi_mm(a, b))
+    for cfg in [
+        Knobs((128, 128), (1, 1), False, True, "m", 1),
+        Knobs((128, 128), (2, 1), False, True, "m", 1),
+        Knobs((256, 128), (2, 2), True, True, "m", 1),
+    ]:
+        size = cfg.cluster_m * cfg.cluster_n
+        query = cutlass_utils.HardwareInfo(device_id=dev.index).get_max_active_clusters(
+            size
+        )
+        clusters = persistent_clusters(dev, cfg)
+        assert clusters == query and 0 < clusters <= sms // size, (
+            cfg.describe(),
+            clusters,
+            query,
+        )
+        assert kernel_name(cfg, "n", 1, clusters).endswith(f"_g{clusters}")
+        out = mm_bf16_batch_invariant(
+            a, b, config=cfg
+        )  # compiled before the profiled launch
+        torch.cuda.synchronize()
+        with profile(activities=[ProfilerActivity.CUDA]) as prof:
+            mm_bf16_batch_invariant(a, b, config=cfg, out=out)
+            torch.cuda.synchronize()
+        with tempfile.NamedTemporaryFile(suffix=".json") as f:
+            prof.export_chrome_trace(f.name)
+            with open(f.name) as trace:
+                events = [
+                    e
+                    for e in json.load(trace)["traceEvents"]
+                    if e.get("cat") == "kernel" and "grid" in e.get("args", {})
+                ]
+        assert events, "no kernel in the trace"
+        grid = max(events, key=lambda e: e["dur"])["args"]["grid"]
+        launched = grid[0] * grid[1] * grid[2]
+        assert launched == clusters * size, (
+            cfg.describe(),
+            grid,
+            clusters,
+        )  # 512 tiles: more than the grid
+        assert torch.equal(bits(out), ref), cfg.describe()
 
 
 @needs_device

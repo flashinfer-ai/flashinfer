@@ -27,7 +27,7 @@ from flashinfer.gemm.batch_invariant.api import (
     mm_fp8_batch_invariant,
 )
 from flashinfer.gemm.batch_invariant.blocks.operands import can_implement
-from flashinfer.gemm.batch_invariant.cost_model import PARTS
+from flashinfer.gemm.batch_invariant.heuristic import PARTS
 from flashinfer.gemm.batch_invariant.generator import (
     REFERENCE_SHAPE,
     Knobs,
@@ -352,7 +352,7 @@ def test_weight_layouts_agree():
 @needs_device
 @pytest.mark.parametrize("M,N,K,dt", [(1000, 4096, 4096, E4), (37, 2048, 4000, E5)])
 def test_config_agreement(M, N, K, dt):
-    """R3: every configuration the tuner may choose (the cost model's top candidates on every part, both layouts) and a spread
+    """R3: every configuration the tuner may choose (the dispatcher's top candidates on every part, both layouts) and a spread
     of hand-picked records (64- / 128- / 256-row tiles, 1- and 2-CTA MMA, clusters, both rasters, swizzles, the 16-wide decode
     tile) give identical bits, for both weight layouts."""
     fmt = "e4m3" if dt == E4 else "e5m2"

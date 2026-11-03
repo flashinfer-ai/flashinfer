@@ -88,7 +88,7 @@ class Knobs:
     use_tma_store: bool = True  # the only store path that compiles with dynamic shapes
     raster_along: str = "m"
     swizzle_size: int = 1
-    grid_clusters: int = 0  # persistent grid size in clusters; 0 = one per SM
+    grid_clusters: int = 0  # persistent grid size in clusters; 0 = the launch device's co-resident cluster count
     cta_chunks: bool = False  # the in-CTA chunk fold (split class): one CTA folds every chunk of its tile
 
     # named views

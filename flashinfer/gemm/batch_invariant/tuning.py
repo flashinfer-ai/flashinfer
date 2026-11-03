@@ -5,7 +5,7 @@
 
 The flag requires ``backend="auto"``: the class replaces the backends rather than joining them (a backend's kernel
 is batch-variant, so the autotuner must never be free to pick one). Within the class the autotuner is free: the
-runner's tactics are the cost model's top configurations for the shape, every one of which computes the same bits
+runner's tactics are the dispatcher's top configurations for the shape, every one of which computes the same bits
 (R3), so a tuned and an untuned process agree bit for bit and differ in speed only. Tactic ``-1`` is the dispatcher's
 default configuration.
 """
@@ -48,7 +48,7 @@ CUSTOM_OP_BMM_FP8 = "fp8_bmm_batch_invariant"
 #: The APIs the runner serves and the position of the output in their input lists.
 APIS = ("mm_bf16", "bmm_fp8")
 OUT_INDEX = {"mm_bf16": 2, "bmm_fp8": 4}
-#: How many of the cost model's configurations the autotuner profiles per shape bucket.
+#: How many of the dispatcher's configurations the autotuner profiles per shape bucket.
 TOP_K = 10
 
 __all__ = [
@@ -125,7 +125,7 @@ TUNING_CONFIG_BMM_FP8 = _tuning_config(
 
 class BatchInvariantGemmRunner(TunableRunner):
     """A class as one autotuner runner: fixed API, operand format, weight layout, chunk count (a function of the weight
-    shape) and part (SM count and architecture family); the tactics are the top configurations of the cost model for the
+    shape) and part (SM count and architecture family); the tactics are the top configurations of the dispatcher's heuristic for the
     profiled shape. Any tactic computes the class, so a cached tactic from another bucket or another process is as
     correct as the default; one the kernel cannot implement for the real shape falls back to the default configuration.
     Inputs: ``mm_bf16`` ``[a (M, K), b (K, N), out]``; ``bmm_fp8`` ``[A (b, M, K), B (b, K, N), A_scale, B_scale, out]``."""

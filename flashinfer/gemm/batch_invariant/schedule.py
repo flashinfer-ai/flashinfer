@@ -1,10 +1,10 @@
 # Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""Dispatch of the GEMM classes: the chunk rule (a function of the weight shape and the format only) and the cost-model
+"""Dispatch of the GEMM classes: the chunk rule (a function of the weight shape and the format only) and the heuristic
 dispatcher.
 
 Every record of a configuration space computes the class (R3), so the choice here never reaches the bits; it only
-moves time. The choice is the cost model's argmin over the space (``cost_model.rank``); ``rank_topk`` is the autotuner's
+moves time. The choice is the heuristic's best record of the space (``heuristic.rank``); ``rank_topk`` is the autotuner's
 tactic list.
 """
 
@@ -72,11 +72,11 @@ def rank_topk(
     family: Optional[str] = None,
     in_fmt: str = "bf16",
 ) -> List[GemmConfig]:
-    """The dispatcher's ranked list (what FlashInfer's autotuner profiles under ``batch_invariant=True``): `cost_model.rank`'s
-    order (the model's argmin first), distinct records, at most ``k``; ``default_config(...) == rank_topk(...)[0]``. Every entry
+    """The dispatcher's ranked list (what FlashInfer's autotuner profiles under ``batch_invariant=True``): `heuristic.rank`'s
+    order (the heuristic's best first), distinct records, at most ``k``; ``default_config(...) == rank_topk(...)[0]``. Every entry
     is a member of the class's enumerated space, so an autotuner may pick among them freely without changing a single bit.
     ``sm_count`` and ``family`` name the part (the operand device's). Empty when nothing implements the shape."""
-    from .cost_model import rank
+    from .heuristic import rank
 
     out: List[GemmConfig] = []
     for rec, _t in rank(M, N, K, chunks, b_major, 2, sm_count, family, in_fmt=in_fmt):
@@ -97,7 +97,7 @@ def default_config(
     family: Optional[str] = None,
     in_fmt: str = "bf16",
 ) -> GemmConfig:
-    """The dispatcher's pick: `rank_topk(...)[0]`, the cost model's argmin over the class's space for the shape, the layout,
+    """The dispatcher's pick: `rank_topk(...)[0]`, the heuristic's best record of the class's space for the shape, the layout,
     the format and the part. May depend on anything: every record is canonical."""
     top = rank_topk(M, N, K, chunks, b_major, sm_count, 1, family, in_fmt)
     if not top:

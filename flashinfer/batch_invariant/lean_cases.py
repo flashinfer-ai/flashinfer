@@ -34,7 +34,7 @@ import os
 from typing import Dict, List, Tuple
 
 from .fp_interface import term
-from ..gemm.batch_invariant.cost_model import PARTS
+from ..gemm.batch_invariant.heuristic import PARTS
 from ..gemm.batch_invariant.generator import (
     REFERENCE_SHAPE,
     Knobs,
