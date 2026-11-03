@@ -138,8 +138,8 @@ def _forced(plan, q, k, v, return_lse):
 # --------------------------------------------------------------------------- plan-time route (no GPU)
 
 
-def _plan_on_cpu(monkeypatch, mask, sm_count=148, **overrides):
-    monkeypatch.setattr(cake_vsa, "_arch_for_device", lambda _device: "sm_100a")
+def _plan_on_cpu(monkeypatch, mask, sm_count=148, arch="sm_100a", **overrides):
+    monkeypatch.setattr(cake_vsa, "_arch_for_device", lambda _device: arch)
     monkeypatch.setattr(cake_vsa, "_device_index", lambda _device: 0)
     monkeypatch.setattr(cake_vsa, "_sm_count", lambda _index: sm_count)
     heads, mb, nb = mask.shape
@@ -184,68 +184,85 @@ def test_shared_multi_wave_selection_plans_the_balanced_program(monkeypatch):
     assert plan["blk64_profile"] in ("blk64_persistent", "blk64_persistent_ws_m64n256")
 
 
-@pytest.mark.parametrize(
-    "mb,heads,count,sm_count,routed",
-    [
-        (14, 8, 16, 148, False),  # 112 tiles: fewer than 0.8 per SM
-        (15, 8, 16, 148, True),  # 120 tiles: 0.81 per SM on 148 SMs
-        (15, 8, 16, 152, False),  # 120 tiles: 0.79 per SM on 152 SMs
-        (16, 8, 8, 152, True),  # 128 tiles: the S = 1024 standings rows
-        (32, 8, 16, 148, True),  # 256 tiles: the S = 2048 standings rows
-        (64, 8, 4, 148, False),  # four blocks per query block: the ordinary kernel's
-    ],
-)
-def test_route_needs_eight_tenths_of_a_wave_and_more_than_four_blocks(
-    monkeypatch, mb, heads, count, sm_count, routed
-):
-    assert cake_vsa._BLK64_BALANCED_MIN_WAVES == 0.8
-    mask = _shared_mask(heads, mb, 64, [count] * mb, "cpu")
-    plan = _plan_on_cpu(monkeypatch, mask, sm_count=sm_count)
-    assert (plan["blk64_balanced"] is not None) == routed
-
-
 _WS = "blk64_persistent_ws_m64n256"
 
 
+@pytest.mark.parametrize("arch,sm_count", [("sm_100a", 148), ("sm_103a", 152)])
 @pytest.mark.parametrize(
-    "mb,heads,nb,counts,routed",
+    "mb,heads,counts,routed",
     [
-        # fewer than eight blocks per query block on average: the per-head programs
-        (16, 8, 64, [5] * 16, False),
-        (16, 8, 64, [7] * 16, False),
-        (16, 8, 64, [8] * 16, True),
-        # the per-head plan is the M64N256 WS program (rows of whole groups of four,
-        # more than 24 blocks on average): rows in one group-count bucket up to 64
-        # blocks, rows in several buckets from 1.05 waves (156 tiles on 148 SMs)
-        (16, 8, 128, [64] * 16, True),  # the cap (one wave of 128 tiles)
-        (16, 8, 128, [68] * 16, False),  # longer rows in one bucket
-        (64, 8, 256, [96] * 64, False),  # longer rows in one bucket, 512 tiles
-        (32, 8, 256, [252, 256] * 16, False),  # both in the last bucket
-        (32, 8, 256, [248, 256] * 16, True),  # buckets 62 and 63, 256 tiles
-        (16, 8, 128, [32, 64] * 8, False),  # several buckets in one wave
-        (38, 4, 256, [64, 128] * 19, False),  # 152 tiles: 1.03 waves
-        (39, 4, 256, [64, 128] * 19 + [64], True),  # 156 tiles: 1.05 waves
-        # the per-head plan is the ordinary program: balanced at any length
-        (16, 8, 128, [65] * 16, True),
-        (16, 8, 256, [8, 40] * 8, True),  # whole groups, 24 blocks on average
+        # fewer than seven blocks per query block on average: the per-head programs
+        (16, 8, [5] * 16, False),
+        (16, 8, [6] * 16, False),
+        (16, 8, [7] * 16, True),
+        (16, 8, [4, 10] * 8, True),  # seven on average
+        (16, 8, [4, 9] * 8, False),  # six and a half
+        (64, 8, [4] * 64, False),  # four blocks per query block: the ordinary kernel's
+        # the per-head plan is the ordinary program: any grid of 8 tiles and up
+        (1, 8, [16], True),  # 8 tiles
+        (8, 1, [7] * 8, True),  # 8 tiles
+        (7, 1, [16] * 7, False),  # 7 tiles
+        (4, 1, [7] * 4, False),  # 4 tiles
+        (14, 8, [16] * 14, True),  # 112 tiles, under one wave
+        (16, 8, [8] * 16, True),  # 128 tiles: the S = 1024 standings rows
+        (32, 8, [16] * 32, True),  # 256 tiles: the S = 2048 standings rows
+        (16, 8, [65] * 16, True),  # not whole groups
+        (16, 8, [8, 40] * 8, True),  # whole groups, 24 blocks on average
     ],
 )
-def test_route_keeps_the_per_head_programs_where_they_are_faster(
-    monkeypatch, mb, heads, nb, counts, routed
+def test_route_needs_seven_blocks_and_eight_tiles(
+    monkeypatch, arch, sm_count, mb, heads, counts, routed
 ):
-    assert cake_vsa._BLK64_BALANCED_MIN_AVERAGE_BLOCKS == 8
-    assert cake_vsa._BLK64_BALANCED_WS_MAX_ROW_BLOCKS == 64
-    assert cake_vsa._BLK64_BALANCED_WS_RAGGED_MIN_WAVES == 1.05
-    mask = _shared_mask(heads, mb, nb, counts, "cpu")
-    plan = _plan_on_cpu(monkeypatch, mask, sm_count=148)
-    ws = all(c % 4 == 0 for c in counts) and sum(counts) > 24 * mb
-    assert (plan["blk64_profile"] == _WS) == ws
+    assert cake_vsa._BLK64_BALANCED_MIN_AVERAGE_BLOCKS == 7
+    assert cake_vsa._BLK64_BALANCED_MIN_TILES == 8
+    mask = _shared_mask(heads, mb, 256, counts, "cpu")
+    plan = _plan_on_cpu(monkeypatch, mask, sm_count=sm_count, arch=arch)
+    assert plan["blk64_profile"] != _WS
     assert (plan["blk64_balanced"] is not None) == routed
 
 
+@pytest.mark.parametrize(
+    "mb,heads,nb,counts,sm_count,sm100a,sm103a",
+    [
+        # the per-head plan is the M64N256 WS program (rows of whole groups of four,
+        # more than 24 blocks on average). sm_100a: from 0.8 tiles per SM, rows in
+        # one group-count bucket up to 64 blocks, rows in several buckets from 1.05
+        # waves (156 tiles on 148 SMs, 160 on 152). sm_103a: every such selection.
+        (14, 8, 64, [40] * 14, 148, False, True),  # 112 tiles: 0.76 waves
+        (1, 8, 64, [40], 148, False, True),  # 8 tiles
+        (15, 8, 64, [40] * 15, 148, True, True),  # 120 tiles: 0.81 waves on 148 SMs
+        (15, 8, 64, [40] * 15, 152, False, True),  # 0.79 waves on 152 SMs
+        (16, 8, 128, [64] * 16, 148, True, True),  # the cap (one wave of 128 tiles)
+        (16, 8, 128, [68] * 16, 148, False, True),  # longer rows in one bucket
+        (64, 8, 256, [96] * 64, 148, False, True),  # longer rows in one bucket, 512 tiles
+        (32, 8, 256, [252, 256] * 16, 148, False, True),  # both in the last bucket
+        (32, 8, 256, [248, 256] * 16, 148, True, True),  # buckets 62 and 63
+        (16, 8, 128, [32, 64] * 8, 148, False, True),  # several buckets in one wave
+        (38, 4, 256, [64, 128] * 19, 148, False, True),  # 152 tiles: 1.03 waves
+        (39, 4, 256, [64, 128] * 19 + [64], 148, True, True),  # 156 tiles: 1.05 waves
+        (39, 4, 256, [64, 128] * 19 + [64], 152, False, True),  # 1.03 waves on 152 SMs
+        (7, 1, 64, [40] * 7, 148, False, False),  # 7 tiles
+    ],
+)
+def test_route_keeps_the_ws_program_where_it_is_faster(
+    monkeypatch, mb, heads, nb, counts, sm_count, sm100a, sm103a
+):
+    assert cake_vsa._BLK64_BALANCED_WS_MIN_WAVES == 0.8
+    assert cake_vsa._BLK64_BALANCED_WS_MAX_ROW_BLOCKS == 64
+    assert cake_vsa._BLK64_BALANCED_WS_RAGGED_MIN_WAVES == 1.05
+    mask = _shared_mask(heads, mb, nb, counts, "cpu")
+    for arch, routed in (("sm_100a", sm100a), ("sm_103a", sm103a)):
+        plan = _plan_on_cpu(monkeypatch, mask, sm_count=sm_count, arch=arch)
+        assert plan["blk64_profile"] == _WS
+        assert (plan["blk64_balanced"] is not None) == routed, arch
+
+
 def test_balanced_beats_per_head_boundaries():
-    def beats(profile, fewest, most, selected=None, mb=1, tiles=128, sm_count=148):
+    def beats(
+        profile, fewest, most, selected=None, mb=1, tiles=128, sm_count=148, arch="sm_100a"
+    ):
         return cake_vsa._blk64_balanced_beats_per_head(
+            arch=arch,
             per_head_profile=profile,
             selected=most if selected is None else selected,
             mb=mb,
@@ -256,14 +273,20 @@ def test_balanced_beats_per_head_boundaries():
         )
 
     assert beats("blk64_persistent", 256, 256)
-    assert beats("blk64_persistent", 8, 8) and not beats("blk64_persistent", 7, 7)
-    assert not beats("blk64_persistent", 4, 12, selected=7)
+    assert beats("blk64_persistent", 7, 7) and not beats("blk64_persistent", 6, 6)
+    assert not beats("blk64_persistent", 4, 12, selected=6)
+    assert beats("blk64_persistent", 8, 8, tiles=8)
+    assert not beats("blk64_persistent", 8, 8, tiles=7)
     assert beats(_WS, 64, 64) and not beats(_WS, 68, 68)
+    assert not beats(_WS, 64, 64, tiles=118) and beats(_WS, 64, 64, tiles=119)
     assert not beats(_WS, 252, 256, tiles=512)  # both in the last bucket
     assert beats(_WS, 248, 256, tiles=512)
     assert not beats(_WS, 32, 64, tiles=155) and beats(_WS, 32, 64, tiles=156)
     assert not beats(_WS, 32, 64, tiles=159, sm_count=152)
     assert beats(_WS, 32, 64, tiles=160, sm_count=152)
+    for most, tiles in ((68, 128), (256, 512), (64, 8), (64, 155)):
+        assert beats(_WS, 32, most, tiles=tiles, sm_count=152, arch="sm_103a")
+    assert not beats(_WS, 64, 64, tiles=7, sm_count=152, arch="sm_103a")
     buckets = [cake_vsa._blk64_group_bucket(c) for c in (1, 4, 5, 248, 252, 256)]
     assert buckets == [1, 1, 2, 62, 63, 63]
 
@@ -426,8 +449,8 @@ def test_unrouted_plans_keep_the_per_head_programs():
     device = torch.device("cuda")
     heads, seq = 8, 896
     mb = seq // BLOCK
-    # 112 tiles: fewer than 0.8 per SM on both targets
-    mask = _shared_mask(heads, mb, mb, [8] * mb, device, seed=6)
+    # six blocks per query block: fewer than seven on both targets
+    mask = _shared_mask(heads, mb, mb, [6] * mb, device, seed=6)
     q, k, v = _inputs(seq, seq, heads, device, seed=4)
     wrapper = BlockSparseAttentionWrapper(
         torch.empty((1,), dtype=torch.uint8, device=device), backend="cake"
