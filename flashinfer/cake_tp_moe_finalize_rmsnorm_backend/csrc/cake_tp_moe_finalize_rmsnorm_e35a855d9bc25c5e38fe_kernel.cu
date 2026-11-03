@@ -94,7 +94,7 @@ kernel_cake_tp_moe_finalize_rmsnorm_e35a855d9bc25c5e38fe(__nv_bfloat16* __restri
     int cta_rank;
     asm volatile("mov.b32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
 
-    // Kernel setup ops
+    // Prologue
     float* warp_tab = reinterpret_cast<float*>(smem_raw + 0);
     const int warp_tab_addr = smem + 0;
     float* cta_tab = reinterpret_cast<float*>(smem_raw + 64);
@@ -134,7 +134,7 @@ kernel_cake_tp_moe_finalize_rmsnorm_e35a855d9bc25c5e38fe(__nv_bfloat16* __restri
     __nv_bfloat16* a_peer3 = reinterpret_cast<__nv_bfloat16*>(a_peer_addr3);
     int idx8[8];
     {
-        const int4* _ivptr_0 = reinterpret_cast<const int4*>(idx + (slot * 8) + 0);
+        const int4* _ivptr_0 = reinterpret_cast<const int4*>(idx + slot * 8 + 0);
         int4 _ivld_0;
         _ivld_0 = *_ivptr_0;
         idx8[0 + 0] = _ivld_0.x;
@@ -155,7 +155,7 @@ kernel_cake_tp_moe_finalize_rmsnorm_e35a855d9bc25c5e38fe(__nv_bfloat16* __restri
     if (weights_fp32 != 0) {
         float _vec_load_0[4];
         {
-            float4 _v4 = *reinterpret_cast<const float4*>(reinterpret_cast<float*>(expert_weights + (slot * 8)) + 0);
+            float4 _v4 = *reinterpret_cast<const float4*>(reinterpret_cast<float*>(expert_weights + slot * 8) + 0);
             _vec_load_0[0 + 0] = _v4.x;
             _vec_load_0[0 + 1] = _v4.y;
             _vec_load_0[0 + 2] = _v4.z;
@@ -180,7 +180,7 @@ kernel_cake_tp_moe_finalize_rmsnorm_e35a855d9bc25c5e38fe(__nv_bfloat16* __restri
     } else {
         unsigned int _vec_load_2[4];
         {
-            uint4 _uv4_4 = *reinterpret_cast<const uint4*>(expert_weights + (slot * 4) + 0);
+            uint4 _uv4_4 = *reinterpret_cast<const uint4*>(expert_weights + slot * 4 + 0);
             _vec_load_2[0 + 0] = _uv4_4.x;
             _vec_load_2[0 + 1] = _uv4_4.y;
             _vec_load_2[0 + 2] = _uv4_4.z;
