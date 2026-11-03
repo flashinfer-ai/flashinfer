@@ -85,7 +85,9 @@ def _compile_target_key(io: dict) -> tuple[int, str]:
     if device_index is None:
         device_index = torch.cuda.current_device()
 
-    return int(device_index), _get_compile_arch()
+    # The architecture is resolved from the current device.
+    with torch.cuda.device(device_index):
+        return int(device_index), _get_compile_arch()
 
 
 @functools.cache
@@ -139,6 +141,9 @@ def _arg_type_key(value: Any) -> Any:
 def _disk_kernel_name(cfg_hash: str, fc1_or_fc2: str, io: dict) -> str:
     """Name of a GEMM in the persistent module: everything its code depends on
     besides the module-level sources, CuTe-DSL stack and compile architecture.
+
+    Includes the capability of the current device, which must be the device
+    the GEMM is compiled for.
     """
     import torch
 
@@ -197,16 +202,18 @@ def _compile_or_load(
         return _compile_for_launch(io, stream)
 
     source_sha256 = _kernel_source_sha256()
-    if cute_dsl_cache_disabled() or source_sha256 is None:
-        return compile_fn()
-    spec = JitSpecCuteDsl(
-        _DISK_MODULE_NAME,
-        _disk_kernel_name(cfg_hash, fc1_or_fc2, io),
-        compile_fn,
-        source_sha256,
-        enable_tvm_ffi=False,
-    )
+    # ``cute.compile``, the spec's module directory and metadata, and the
+    # kernel name all resolve the target architecture from the current device.
     with torch.cuda.device(device_index):
+        if cute_dsl_cache_disabled() or source_sha256 is None:
+            return compile_fn()
+        spec = JitSpecCuteDsl(
+            _DISK_MODULE_NAME,
+            _disk_kernel_name(cfg_hash, fc1_or_fc2, io),
+            compile_fn,
+            source_sha256,
+            enable_tvm_ffi=False,
+        )
         kernel = spec.try_load()
         if kernel is None:
             # The module lock is held only to commit the artifact, so the

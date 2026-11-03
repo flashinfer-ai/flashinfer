@@ -12,9 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
+from unittest import mock
+
 import pytest
 import torch
 
+from flashinfer.jit import cute_dsl_core
 from flashinfer.prims_ts.moe import compile_cache
 
 
@@ -134,3 +138,60 @@ def test_disk_kernel_name_covers_compile_time_inputs(monkeypatch):
     others.append(compile_cache._disk_kernel_name("cfg", "fc1", _fake_launch_io()))
 
     assert len({name, *others}) == len(others) + 1
+
+
+@pytest.mark.cpu_only
+def test_compiled_gemm_targets_the_launch_device(monkeypatch, request):
+    # The launch tensors live on device 1 (SM103) while device 0 (SM100) is
+    # current: the GEMM must be keyed, named, compiled and persisted for SM103.
+    capabilities = {0: (10, 0), 1: (10, 3)}
+    current = [0]
+
+    @contextlib.contextmanager
+    def device(index):
+        previous, current[0] = current[0], index
+        try:
+            yield
+        finally:
+            current[0] = previous
+
+    def get_device_capability(index=None):
+        return capabilities[current[0] if index is None else index]
+
+    monkeypatch.delenv("CUTE_DSL_ARCH", raising=False)
+    monkeypatch.delenv("FLASHINFER_CUTE_DSL_DISABLE_CACHE", raising=False)
+    monkeypatch.setattr(torch.cuda, "device", device)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: current[0])
+    monkeypatch.setattr(torch.cuda, "get_device_capability", get_device_capability)
+    monkeypatch.setattr(compile_cache, "_kernel_source_sha256", lambda: "sources")
+
+    specs = []
+
+    class MissingSpec(cute_dsl_core.JitSpecCuteDsl):
+        def try_load(self):
+            return None
+
+        def compile_and_persist(self):
+            specs.append((self, current[0]))
+
+        def load(self):
+            return self
+
+    monkeypatch.setattr(cute_dsl_core, "JitSpecCuteDsl", MissingSpec)
+    compile_cache._COMPILED_GEMM_CACHE.clear()
+    request.addfinalizer(compile_cache._COMPILED_GEMM_CACHE.clear)
+
+    io = _fake_launch_io()
+    io["_keepalive"] = (
+        mock.NonCallableMock(spec=torch.Tensor, device=torch.device("cuda", 1)),
+    )
+    compile_cache.get_compiled_gemm("cfg", "fc1", io, None)
+
+    ((key, compiled),) = compile_cache._COMPILED_GEMM_CACHE.items()
+    assert key[-2:] == (1, "sm103a")
+    ((spec, compile_device),) = specs
+    assert compiled is spec
+    assert compile_device == 1
+    assert spec.module_dir_name == f"{compile_cache._DISK_MODULE_NAME}_sm103a_cute_dsl"
+    assert spec.expected_meta["arch"] == "sm103a"
+    assert spec.kernel_name.startswith("fc1_sm103_")
