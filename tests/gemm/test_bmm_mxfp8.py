@@ -133,8 +133,7 @@ def _per_batch_cos_sim(res, reference):
     )
 
 
-# #3604 regression anchor: b>1 with m (or n) not a multiple of 128 is only correct with a
-# per-batch scale; the folded mxfp8_quantize(A) scale is rejected (see the CPU test below).
+# #3604 regression anchor: b>1 with m or n not a multiple of 128 needs a per-batch scale.
 @pytest.mark.parametrize("b,m,n,k", [(4, 130, 256, 256), (2, 200, 160, 512)])
 @pytest.mark.parametrize("scale_ndim", [3, 1])
 @pytest.mark.parametrize("backend", ["cudnn", "cutlass"])

@@ -124,10 +124,7 @@ void mxfp8_gemm_sm120_impl(TensorView mat1, TensorView mat2, TensorView mat1Scal
     TVM_FFI_LOG_AND_THROW(NotImplementedError) << "mat1 must be a matrix or a batch of matrices";
   }
 
-  // The kernel reads the hardware-native swizzled layout (Sm1xxBlkScaledConfig::
-  // tile_atom_to_shape_SFA/SFB): one [pad_up(rows, 128), pad_up(k / 32, 4)] F8_128x4 block per
-  // batch, passed either as a 3D [b, rows_pad, k_pad] tensor or flattened to 1D. A linear scale
-  // or a buffer padded over the folded b * rows makes the kernel read the wrong scales.
+  // One F8_128x4 swizzled block per batch (tile_atom_to_shape_SFA/SFB with L = b), 3D or flat 1D.
   constexpr int64_t sfVecSize = 32;
   auto pad_up = [](int64_t value, int64_t multiple) {
     return (value + multiple - 1) / multiple * multiple;

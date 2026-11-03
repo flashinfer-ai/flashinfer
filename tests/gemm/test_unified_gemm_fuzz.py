@@ -282,8 +282,7 @@ def _run_mm_mxfp8(a, b, out, backend, cfg):
 
 
 def _mxfp8_quantize_bmm_operand(x):
-    # mxfp8_quantize(x) on a 3D x pads the folded B*rows, which bmm_mxfp8 only accepts when rows is
-    # a multiple of 128 (#3604); otherwise stack one swizzled block per batch -> [B, rows_pad, k_pad].
+    # The folded 3D quantize is only per-batch separable when rows % 128 == 0 (#3604).
     if x.shape[0] == 1 or x.shape[1] % 128 == 0:
         return mxfp8_quantize(
             x, True
