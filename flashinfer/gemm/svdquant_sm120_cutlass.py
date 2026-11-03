@@ -10,6 +10,7 @@ import functools
 import weakref
 from abc import abstractmethod
 from collections import OrderedDict
+from collections.abc import Callable
 from typing import Final, List, Optional
 
 import torch
@@ -53,6 +54,7 @@ _SM120_FUSED_LINEAR_MK = _sm120_routes.SM120_FUSED_LINEAR_MK
 _sm120_producer_variants = _sm120_routes.sm120_producer_variants
 _sm120_decode_producer_variant = _sm120_routes.sm120_decode_producer_variant
 _sm120_variant_packs_l2t = _sm120_routes.sm120_variant_packs_l2t
+_sm120_variant_reads_kmajor_l2t = _sm120_routes.sm120_variant_reads_kmajor_l2t
 _sm120_pack_tactic = _sm120_routes.sm120_pack_tactic
 _sm120_unpack_tactic = _sm120_routes.sm120_unpack_tactic
 _SM120_LINEAR_ROUTE_ABI_VERSION = _sm120_routes.SM120_LINEAR_ROUTE_ABI_VERSION
@@ -77,9 +79,9 @@ def get_nvfp4_svdquant_sm120_module(lora_rank: int = SVDQUANT_LORA_RANK_GRANULAR
 
     A rank a given tile cannot stage still compiles that tile at rank 32; the
     collective's ``can_implement`` then refuses it, so the autotuner simply sees
-    a smaller candidate plane rather than a build failure. Today only the K256
-    tiles (11 of 31 configs) stage rank 64, because the byte-exact path overlays
-    the rank tile on a residual stage worth TileK/4 bf16 columns.
+    smaller candidate set rather than a build failure. The byte-exact path
+    overlays LoRA chunks on residual stages and supports ranks 64 and 128
+    through multiple chunks when the whole rank does not fit one stage.
     """
     return gen_gemm_sm120_module_cutlass_nvfp4_svdquant(
         lora_rank=lora_rank
@@ -152,46 +154,189 @@ def _pack_sm120_m537_l2t(l2t_smoothed: torch.Tensor) -> torch.Tensor:
     )
 
 
-def _cached_sm120_m537_l2t(
+# Layouts built once by prepare_svdquant_l2t(), keyed by source identity and storage.
+# A hit needs the same live tensor object and, for tensors that carry one, the
+# version it was prepared at; inference tensors carry none, and preparing one is
+# the caller's promise to prepare again after changing it.
+_SM120_PREPARED_L2T: dict[
+    tuple, tuple[weakref.ReferenceType, Optional[int], dict[str, torch.Tensor]]
+] = {}
+
+
+def _prepared_l2t_key(l2t_smoothed: torch.Tensor) -> tuple:
+    """Identify a live source and its storage metadata, keeping aliases independent."""
+    return (
+        id(l2t_smoothed),
+        l2t_smoothed.device,
+        l2t_smoothed.data_ptr(),
+        tuple(l2t_smoothed.shape),
+        tuple(l2t_smoothed.stride()),
+        l2t_smoothed.dtype,
+    )
+
+
+def _prepared_l2t_layout(
+    l2t_smoothed: torch.Tensor, layout: str
+) -> Optional[torch.Tensor]:
+    """Look up a prepared layout if source identity and its available version match."""
+    entry = _SM120_PREPARED_L2T.get(_prepared_l2t_key(l2t_smoothed))
+    if entry is None or entry[0]() is not l2t_smoothed:
+        return None
+    if entry[1] is not None and entry[1] != int(l2t_smoothed._version):
+        return None
+    return entry[2].get(layout)
+
+
+# The rank-128 linear workspace ends in the quantize-to-GEMM handoff counter, so a
+# cached one may only be reused on the stream it was allocated for. One is kept
+# per device, tagged with that stream; a call on another stream allocates a new
+# one and drops the old. The caching allocator hands a dropped block out again
+# only to later work on its own stream, so kernels still queued there are
+# unaffected, and the cache holds one workspace per device however many streams
+# callers use (keying a process-wide cache by stream kept one per stream forever).
+_SM120_LINEAR_WORKSPACE: dict[torch.device, tuple[int, torch.Tensor]] = {}
+
+
+def _sm120_linear_workspace(size: int, device: torch.device, rank: int) -> torch.Tensor:
+    """Keep the quantize handoff private to each stream or captured graph."""
+    name = "nvfp4_svdquant_gemm_workspace"
+    if rank != 128:
+        return _get_cache_buf(name, size, device)
+    size += 8  # Aligned completion counter beyond every GEMM tactic's scratch.
+    if device.type != "cuda":
+        return _get_cache_buf(name, size, device)
+    if torch.cuda.is_current_stream_capturing():
+        # Graphs can share a capture stream and replay on different streams.
+        return torch.empty(size, dtype=torch.uint8, device=device)
+    if device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    stream = torch.cuda.current_stream(device).cuda_stream
+    cached = _SM120_LINEAR_WORKSPACE.get(device)
+    if cached is None or cached[0] != stream or cached[1].numel() < size:
+        cached = (stream, torch.empty(size, dtype=torch.uint8, device=device))
+        _SM120_LINEAR_WORKSPACE[device] = cached
+    return cached[1]
+
+
+def prepare_sm120_l2t(l2t_smoothed: torch.Tensor) -> None:
+    """Build every L2T layout an SM120 fused producer may read for this matrix.
+
+    Which layout a call reads depends on M through the tuned producer, so the
+    rank-32 packed layout (for K in the packed set) and the rank-128 K-major
+    layout are both built when they can apply.
+    """
+    if l2t_smoothed.is_cuda and torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("Prepare SVDQuant L2T before CUDA graph capture")
+    rank = l2t_smoothed.shape[1]
+    layouts: dict[str, torch.Tensor] = {}
+    if rank == 32 and l2t_smoothed.shape[0] in _SM120_M537_PACKED_L2T_K:
+        layouts["m537"] = _pack_sm120_m537_l2t(l2t_smoothed)
+    if rank == 128:
+        layouts["kmajor"] = _pack_sm120_kmajor_l2t(l2t_smoothed)
+    key = _prepared_l2t_key(l2t_smoothed)
+    if not layouts:
+        _SM120_PREPARED_L2T.pop(key, None)
+        return
+
+    previous = _SM120_PREPARED_L2T.get(key)
+    if previous is not None and previous[0]() is l2t_smoothed:
+        # Captured graphs retain these addresses. Refresh the existing storage,
+        # including layouts originally allocated in inference mode.
+        with torch.inference_mode():
+            for name, packed in layouts.items():
+                previous[2][name].copy_(packed)
+        layouts = previous[2]
+
+    def discard(dead_ref: weakref.ReferenceType, *, key: tuple = key) -> None:
+        """Release this source's layouts without removing a replacement cache entry."""
+        current = _SM120_PREPARED_L2T.get(key)
+        if current is not None and current[0] is dead_ref:
+            _SM120_PREPARED_L2T.pop(key, None)
+
+    version = None if l2t_smoothed.is_inference() else int(l2t_smoothed._version)
+    _SM120_PREPARED_L2T[key] = (weakref.ref(l2t_smoothed, discard), version, layouts)
+
+
+def _cached_l2t_pack(
     l2t_smoothed: torch.Tensor,
+    pack: Callable[[torch.Tensor], torch.Tensor],
+    cache: OrderedDict[int, tuple[weakref.ReferenceType, int, torch.Tensor]],
+    layout: str,
 ) -> torch.Tensor:
-    """Cache a shared L2T pack and invalidate it on mutation."""
+    """Cache one L2T layout transform per source tensor; invalidate on mutation."""
+    # A layout built by prepare_svdquant_l2t() also serves graph capture and
+    # inference tensors, which otherwise repack on every call (and replay).
+    prepared = _prepared_l2t_layout(l2t_smoothed, layout)
+    if prepared is not None:
+        return prepared
     # Capture the pack so graph replay observes weight updates without Python
     # cache lookups. Keep graph-owned buffers out of the eager cache as well.
     # Inference tensors have no version counter and must also be repacked.
     if l2t_smoothed.is_inference() or (
         l2t_smoothed.is_cuda and torch.cuda.is_current_stream_capturing()
     ):
-        return _pack_sm120_m537_l2t(l2t_smoothed)
+        return pack(l2t_smoothed)
 
     source_id = id(l2t_smoothed)
     source_version = int(l2t_smoothed._version)
-    cached = _SM120_M537_PACKED_L2T_CACHE.get(source_id)
+    cached = cache.get(source_id)
     if (
         cached is not None
         and cached[0]() is l2t_smoothed
         and cached[1] == source_version
     ):
-        _SM120_M537_PACKED_L2T_CACHE.move_to_end(source_id)
+        cache.move_to_end(source_id)
         return cached[2]
 
-    packed = _pack_sm120_m537_l2t(l2t_smoothed)
+    packed = pack(l2t_smoothed)
 
     def discard(dead_ref: weakref.ReferenceType, *, key: int = source_id) -> None:
-        current = _SM120_M537_PACKED_L2T_CACHE.get(key)
+        """Evict a dead source only if its weak reference still owns the cache slot."""
+        current = cache.get(key)
         if current is not None and current[0] is dead_ref:
-            _SM120_M537_PACKED_L2T_CACHE.pop(key, None)
+            cache.pop(key, None)
 
     source_ref = weakref.ref(l2t_smoothed, discard)
-    _SM120_M537_PACKED_L2T_CACHE[source_id] = (
-        source_ref,
-        source_version,
-        packed,
-    )
-    _SM120_M537_PACKED_L2T_CACHE.move_to_end(source_id)
-    while len(_SM120_M537_PACKED_L2T_CACHE) > _SM120_M537_PACKED_L2T_CACHE_CAPACITY:
-        _SM120_M537_PACKED_L2T_CACHE.popitem(last=False)
+    cache[source_id] = (source_ref, source_version, packed)
+    cache.move_to_end(source_id)
+    while len(cache) > _SM120_M537_PACKED_L2T_CACHE_CAPACITY:
+        cache.popitem(last=False)
     return packed
+
+
+def _cached_sm120_m537_l2t(l2t_smoothed: torch.Tensor) -> torch.Tensor:
+    """Cache the M537 / packed-small-M L2T pack."""
+    return _cached_l2t_pack(
+        l2t_smoothed, _pack_sm120_m537_l2t, _SM120_M537_PACKED_L2T_CACHE, "m537"
+    )
+
+
+_SM120_KMAJOR_L2T_CACHE: OrderedDict[
+    int, tuple[weakref.ReferenceType, int, torch.Tensor]
+] = OrderedDict()
+
+
+def _pack_sm120_kmajor_l2t(l2t_smoothed: torch.Tensor) -> torch.Tensor:
+    """K-major L2T, l2[rank][K], viewed with the [K, rank] shape the FFI checks."""
+    return l2t_smoothed.t().contiguous().view(l2t_smoothed.shape)
+
+
+def _cached_sm120_kmajor_l2t(l2t_smoothed: torch.Tensor) -> torch.Tensor:
+    """Cache the K-major L2T the wide-rank large-M producer reads."""
+    return _cached_l2t_pack(
+        l2t_smoothed, _pack_sm120_kmajor_l2t, _SM120_KMAJOR_L2T_CACHE, "kmajor"
+    )
+
+
+def _sm120_fused_l2t(
+    l2t_smoothed: torch.Tensor, m: int, k: int, producer_variant: int, rank: int
+) -> torch.Tensor:
+    """The L2T layout the chosen fused producer reads."""
+    if _sm120_variant_packs_l2t(m, k, producer_variant, rank):
+        return _cached_sm120_m537_l2t(l2t_smoothed)
+    if _sm120_variant_reads_kmajor_l2t(m, k, producer_variant, rank):
+        return _cached_sm120_kmajor_l2t(l2t_smoothed)
+    return l2t_smoothed
 
 
 def _sm120_fused_linear_supported(m: int, k: int, rank: int) -> bool:
@@ -435,6 +580,7 @@ def _sm120_run_unfused_linear_prefix(
 def _sm120_fused_linear_runner(
     enable_pdl: bool, device: torch.device, rank: int = 32
 ) -> _SvdquantRunner:
+    """Build a rank-specialized runner for jointly selected prefix and GEMM tactics."""
     module = get_nvfp4_svdquant_sm120_module(rank)
 
     class Sm120FusedLinearRunner(_SvdquantRunner):
@@ -458,6 +604,7 @@ def _sm120_fused_linear_runner(
             do_preparation: bool = False,
             **kwargs,
         ):
+            """Launch the selected producer/layout and GEMM using caller-owned scratch."""
             (
                 x,
                 weight_fp4,
@@ -482,12 +629,9 @@ def _sm120_fused_linear_runner(
             family, tiling, address_policy = _sm120_decode_producer_variant(
                 m_rt, k_rt, producer_variant, rank
             )
-            # M537 and packed small-M producers share the packed L2T layout;
-            # the remaining producers read the original row-major matrix.
-            fused_l2t_smoothed = (
-                _cached_sm120_m537_l2t(l2t_smoothed)
-                if _sm120_variant_packs_l2t(m_rt, k_rt, producer_variant, rank)
-                else l2t_smoothed
+            # Each producer family selects its packed, K-major or row-major layout.
+            fused_l2t_smoothed = _sm120_fused_l2t(
+                l2t_smoothed, m_rt, k_rt, producer_variant, rank
             )
             module.nvfp4_svdquant_linear_sm120(
                 x,
@@ -948,7 +1092,7 @@ def svdquant_linear(
     if rank not in _SM120_CUTLASS_LORA_RANKS:
         raise ValueError(
             "the SM120 CUTLASS SVDQuant linear backend supports LoRA ranks "
-            f"32 and 64, got {rank}"
+            f"32, 64 and 128, got {rank}"
         )
 
     if m == 0:
@@ -968,9 +1112,7 @@ def svdquant_linear(
     workspace_bytes = max(
         DEFAULT_WORKSPACE_SIZE, _sm120_max_workspace_bytes(x.device, m, n, k, rank)
     )
-    workspace_buffer = _get_cache_buf(
-        "nvfp4_svdquant_gemm_workspace", workspace_bytes, x.device
-    )
+    workspace_buffer = _sm120_linear_workspace(workspace_bytes, x.device, rank)
     inputs = [
         x,
         weight_fp4,

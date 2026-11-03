@@ -26,6 +26,8 @@ SM120_TACTIC_ABI_VERSION: Final = 3
 SM120_LINEAR_ROUTE_ABI_VERSION: Final = 5
 SM120_PACKED_SMALL_M_ROUTE_ABI_VERSION: Final = 10
 SM120_RANK64_FUSED_ROUTE_ABI_VERSION: Final = 11
+# 17: rank-128 PDL routes include an explicit quantize-output handoff.
+SM120_RANK128_FUSED_ROUTE_ABI_VERSION: Final = 17
 
 # Historical route versions remain the fallback for shapes without the new
 # packed small-M family. Candidate admission below determines the v10 scope.
@@ -80,6 +82,8 @@ def sm120_linear_route_abi_version(m: int, k: int, rank: int) -> int:
     """Return the persistent route namespace for one exact linear shape."""
     if rank == 64:
         return SM120_RANK64_FUSED_ROUTE_ABI_VERSION
+    if rank == 128:
+        return SM120_RANK128_FUSED_ROUTE_ABI_VERSION
     if rank == 32 and any(
         family == SM120_FAMILY_SMALL_M_PACKED
         for family, _, _ in sm120_producer_variants(m, k)
@@ -120,6 +124,27 @@ SM120_RANK64_PRODUCER_GEOMETRY_LADDER: Final[tuple[tuple[int, int, int], ...]] =
     (512, 32, 256),
 )
 
+# Rank 128 additionally offers K64 geometries that stage B (L2T) in shared
+# memory with cp.async; they mirror FI_SVDQ_RANK128_STAGED_B_GEOMETRIES and are
+# appended after the shared ladder so existing producer indices keep their meaning.
+SM120_RANK128_STAGED_B_GEOMETRY_LADDER: Final[tuple[tuple[int, int, int], ...]] = (
+    (320, 64, 64),
+    (352, 48, 64),
+    (384, 64, 64),
+    (384, 80, 64),
+    (416, 80, 64),
+    (768, 160, 64),
+    (832, 160, 64),
+)
+# One down warp's staged slice: 16 columns x (64 + 8) bf16.
+_STAGED_B_SLICE_BYTES: Final = 16 * (64 + 8) * 2
+
+
+def _stages_b(rank: int, tile_k: int) -> bool:
+    """Mirrors large_m_stages_b() in the producer header."""
+    return rank > 64 and tile_k == 64
+
+
 # How the runtime row offset is formed. Both are built; which one is faster is a
 # property of the geometry -- accumulating wins on some and loses on others --
 # so the tuner picks, on the device it is running
@@ -129,7 +154,24 @@ SM120_ADDRESS_POLICIES: Final[tuple[int, ...]] = (0, 1)  # 0 recompute, 1 accumu
 _GEOMETRY_SF_VEC: Final = 16
 _GEOMETRY_ELEM_BYTES: Final = 2
 _GEOMETRY_SHARED_LIMIT: Final = 48 * 1024
+_STAGED_B_SHARED_LIMIT: Final = 99 * 1024
 _GEOMETRY_MMA_N: Final = 8
+
+
+def _staged_b_row_split(tile_m: int) -> int:
+    """Mirrors staged_b_row_split(): above 80 rows two down-warp sets share B."""
+    return 2 if tile_m > 80 else 1
+
+
+def _staged_b_shared_bytes(tile_m: int, tile_k: int, long_k: bool) -> int:
+    """Mirrors staged_b_shared_bytes() (dynamic shared memory of the staged kernel)."""
+    sf = 2 * (tile_m * (tile_k // _GEOMETRY_SF_VEC) if long_k else 1)
+    return (
+        2 * tile_m * (tile_k + 8) * _GEOMETRY_ELEM_BYTES
+        + 2 * tile_k * _GEOMETRY_ELEM_BYTES
+        + (sf + 15) // 16 * 16
+        + 8 * _STAGED_B_SLICE_BYTES
+    )
 
 
 def sm120_producer_geometry_is_valid(
@@ -146,13 +188,23 @@ def sm120_producer_geometry_is_valid(
         return False
     if tile_k % (4 * _GEOMETRY_SF_VEC):
         return False
-    if not (0 < tile_m <= 80 and tile_m % 16 == 0):
+    staged = _stages_b(rank, tile_k)
+    max_tile_m = 160 if staged else 80
+    if not (0 < tile_m <= max_tile_m and tile_m % 16 == 0):
         return False
-    quant_threads = block_threads - (rank // _GEOMETRY_MMA_N) * 32
+    # Mirrors large_m_down_warps(): one n8 fragment per down warp up to rank 64,
+    # eight wide down warps above it.
+    down_warps = min(rank // _GEOMETRY_MMA_N, 8)
+    if staged:
+        if tile_m % (16 * _staged_b_row_split(tile_m)):
+            return False
+        down_warps *= _staged_b_row_split(tile_m)
+    quant_threads = block_threads - down_warps * 32
     if block_threads % 32 or quant_threads <= 0:
         return False
     sf_cols_per_tile = tile_k // _GEOMETRY_SF_VEC
-    if (tile_m * sf_cols_per_tile) % quant_threads:
+    # The staged-B kernel's quantize loop tolerates a remainder.
+    if (tile_m * sf_cols_per_tile) % quant_threads and not staged:
         return False
     long_k = k >= 8192
     padded_m = (m + 127) // 128 * 128
@@ -161,6 +213,8 @@ def sm120_producer_geometry_is_valid(
         prefetch_lines = k * rank * _GEOMETRY_ELEM_BYTES // 128
         if grid_blocks * block_threads < prefetch_lines:
             return False
+    if staged:
+        return _staged_b_shared_bytes(tile_m, tile_k, long_k) <= _STAGED_B_SHARED_LIMIT
     shared_bytes = (
         2 * tile_m * (tile_k + 8) * _GEOMETRY_ELEM_BYTES
         + 2 * tile_k * _GEOMETRY_ELEM_BYTES
@@ -183,9 +237,21 @@ SM120_SMALL_M_TILING_LADDER: Final[tuple[tuple[int, int, int], ...]] = (
     (1024, 16, 16),
 )
 
+# Rank-128 small-M producer with LoRA-down split over K across a cluster of CTAs:
+# (block threads, down tile columns, K splits). Mirrors
+# FI_SVDQ_SMALL_M_SPLIT_TILINGS in nvfp4_smooth_quantize_lora_down_sm120.cuh.
+SM120_SMALL_M_SPLIT_TILING_LADDER: Final[tuple[tuple[int, int, int], ...]] = (
+    (512, 16, 4),
+    (1024, 16, 2),
+    (1024, 16, 4),
+)
+# Splitting K only pays while the (M / 16) x (rank / tile columns) down tiles
+# leave SMs idle; above this M the unsplit families already fill the card.
+SM120_SMALL_M_SPLIT_MAX_M: Final = 512
+
 # LoRA ranks the native CUTLASS kernels can stage. Other multiples of 32 compile
 # but leave no tactic, so callers exclude them before loading a module.
-SM120_CUTLASS_LORA_RANKS: Final[tuple[int, ...]] = (32, 64)
+SM120_CUTLASS_LORA_RANKS: Final[tuple[int, ...]] = (32, 64, 128)
 
 SM120_FAMILY_LARGE_M: Final = 0
 SM120_FAMILY_SMALL_M: Final = 1
@@ -198,6 +264,14 @@ SM120_FAMILY_M537: Final = 2
 # whether it wins on a card nobody measured.
 SM120_FAMILY_CUBLASLT: Final = 3
 SM120_FAMILY_SMALL_M_PACKED: Final = 4
+# Rank-128 small-M producer whose LoRA-down CTAs split K over a thread-block
+# cluster and reduce through distributed shared memory; see
+# SM120_SMALL_M_SPLIT_TILING_LADDER.
+SM120_FAMILY_SMALL_M_SPLIT: Final = 6
+# Warp-specialized rank-128 large-M producer (persistent grid, producer warp +
+# mbarrier stage ring). Tiling = (tile M, tile K, stages * 100 + quantize
+# warps); the address-policy slot carries the grid mode.
+SM120_FAMILY_WS_RANK128: Final = 5
 
 # M537 and packed small-M producers share the lane-packed L2T layout. Other
 # families read row-major L2T, so the selected family determines preprocessing.
@@ -217,6 +291,47 @@ def sm120_m537_is_valid(m: int, k: int) -> bool:
     return m == SM120_M537_M and k in (5120, 5376, 7168)
 
 
+# Mirrors FI_SVDQ_RANK128_WS_TILINGS in nvfp4_smooth_quantize_lora_down_ws_sm120.cuh:
+# (tile M, tile K, down layout * 1000 + stages * 100 + quantize warps), down
+# layout 0 = 2x4 down warps (rows x columns), 1 = 2x8, 2 = 1x8.
+SM120_RANK128_WS_TILING_LADDER: Final[tuple[tuple[int, int, int], ...]] = (
+    (160, 64, 1205),
+    (160, 64, 205),
+    (160, 64, 1210),
+    (144, 64, 2209),
+    (128, 64, 204),
+    (96, 64, 306),
+    (96, 64, 1303),
+    (80, 64, 2305),
+    (64, 64, 304),
+    (64, 64, 1304),
+    (48, 64, 2403),
+    (32, 64, 402),
+    (32, 64, 404),
+)
+# Grid mode (the address-policy slot): 0 = one CTA per SM.
+SM120_WS_GRID_MODES: Final[tuple[int, ...]] = (0,)
+_WS_RANK: Final = 128
+
+
+def _ws_shared_bytes(tile_m: int, tile_k: int, stages: int) -> int:
+    """Mirrors WsConfig::kSmemBytes (128-byte-swizzled TMA tiles, 1 KB aligned)."""
+    stage = (
+        (tile_m * tile_k * 2 + _WS_RANK * tile_k * 2 + tile_k * 2 + 1023) // 1024 * 1024
+    )
+    return 1024 + stages * stage + 2 * stages * 8
+
+
+def sm120_ws_tiling_is_valid(
+    m: int, k: int, tile_m: int, tile_k: int, packed: int
+) -> bool:
+    """Python counterpart of launch_ws_kernel's guards."""
+    stages = packed // 100 % 10
+    if tile_k % 64 or m <= 0 or k <= 0 or k % tile_k or m > (1 << 30) or stages <= 0:
+        return False
+    return _ws_shared_bytes(tile_m, tile_k, stages) <= _STAGED_B_SHARED_LIMIT
+
+
 def sm120_small_m_tiling_is_valid(
     m: int,
     k: int,
@@ -233,6 +348,9 @@ def sm120_small_m_tiling_is_valid(
         return False
     if k % down_warps or (k // down_warps) % 16:
         return False
+    # The rank-128 down loop consumes K in 32-element chunks.
+    if rank > 64 and (k // down_warps) % 32:
+        return False
     if k % (4 * _GEOMETRY_SF_VEC):
         return False
     if down_tile_cols % _GEOMETRY_MMA_N or down_tile_cols // _GEOMETRY_MMA_N <= 0:
@@ -240,9 +358,34 @@ def sm120_small_m_tiling_is_valid(
     down_n_tiles = rank // down_tile_cols
     if down_n_tiles * down_tile_cols != rank:
         return False
+    if rank > 64:
+        # Rank 128 splits quantize work per item, not per RowsPerQuantBlock rows.
+        return True
     padded_m = (m + 127) // 128 * 128
     quant_blocks = (m + rows_per_quant_block - 1) // rows_per_quant_block
     return quant_blocks * rows_per_quant_block <= padded_m
+
+
+def sm120_small_m_split_tiling_is_valid(
+    m: int,
+    k: int,
+    block_threads: int,
+    down_tile_cols: int,
+    k_splits: int,
+    rank: int = 128,
+) -> bool:
+    """Python counterpart of the split-K small-M launcher guards."""
+    if rank != 128 or not 0 < m <= SM120_SMALL_M_SPLIT_MAX_M:
+        return False
+    if block_threads <= 0 or block_threads % 32 or k_splits <= 1:
+        return False
+    if k % 32 or k // 32 < k_splits * (block_threads // 32):
+        return False
+    if k % (4 * _GEOMETRY_SF_VEC):
+        return False
+    if down_tile_cols % _GEOMETRY_MMA_N or down_tile_cols // _GEOMETRY_MMA_N <= 0:
+        return False
+    return rank % down_tile_cols == 0
 
 
 @functools.cache
@@ -253,16 +396,21 @@ def sm120_producer_variants(
 
     Producer families are enumerated from their own constraints, so a shape
     nobody measured still reaches the fused prefix and a card nobody measured on
-    ranks the candidates itself. The address policy is a large-M axis only; the
-    small-M kernel forms its addresses differently and takes 0.
+    ranks the candidates itself. The address policy is a large-M axis; the
+    small-M kernel forms its addresses differently and takes 0, except that at
+    rank 128 policy 1 repeats each small-M tiling with the GEMM mainloop
+    acquiring the quantize output through a barrier, so that it runs under
+    LoRA-down instead of after it.
     """
     if rank not in SM120_CUTLASS_LORA_RANKS:
         return ()
     geometries = (
         SM120_RANK64_PRODUCER_GEOMETRY_LADDER
-        if rank == 64
+        if rank >= 64
         else SM120_PRODUCER_GEOMETRY_LADDER
     )
+    if rank == 128:
+        geometries = geometries + SM120_RANK128_STAGED_B_GEOMETRY_LADDER
     large = tuple(
         (SM120_FAMILY_LARGE_M, geometry, policy)
         for geometry in geometries
@@ -276,6 +424,25 @@ def sm120_producer_variants(
     )
     if rank == 64:
         return large + small
+    if rank == 128:
+        # Only the large-M producers stage wide fragments. The warp-specialized
+        # and small-M families follow the shared ladder in that order so
+        # existing indices keep their meaning.
+        ws = tuple(
+            (SM120_FAMILY_WS_RANK128, tiling, grid_mode)
+            for tiling in SM120_RANK128_WS_TILING_LADDER
+            if sm120_ws_tiling_is_valid(m, k, *tiling)
+            for grid_mode in SM120_WS_GRID_MODES
+        )
+        deferred = tuple((family, tiling, 1) for family, tiling, _ in small)
+        # Appended last so every earlier index keeps its meaning.
+        split = tuple(
+            (SM120_FAMILY_SMALL_M_SPLIT, tiling, policy)
+            for policy in SM120_ADDRESS_POLICIES
+            for tiling in SM120_SMALL_M_SPLIT_TILING_LADDER
+            if sm120_small_m_split_tiling_is_valid(m, k, *tiling, rank)
+        )
+        return large + ws + small + deferred + split
     m537 = (
         ((SM120_FAMILY_M537, SM120_M537_TILING, 0),)
         if sm120_m537_is_valid(m, k)
@@ -301,6 +468,27 @@ def sm120_variant_packs_l2t(m: int, k: int, variant: int, rank: int = 32) -> boo
     """
     family, _, _ = sm120_decode_producer_variant(m, k, variant, rank)
     return family in SM120_FAMILY_PACKS_L2T
+
+
+def sm120_variant_reads_kmajor_l2t(
+    m: int, k: int, variant: int, rank: int = 32
+) -> bool:
+    """Whether the chosen producer reads L2T K-major (every rank-128 family).
+
+    Mirrors large_m_kmajor_l2() and the Rank > 64 small-M path in
+    nvfp4_smooth_quantize_lora_down_sm120.cuh.
+    """
+    family, _, _ = sm120_decode_producer_variant(m, k, variant, rank)
+    return (
+        family
+        in (
+            SM120_FAMILY_LARGE_M,
+            SM120_FAMILY_WS_RANK128,
+            SM120_FAMILY_SMALL_M,
+            SM120_FAMILY_SMALL_M_SPLIT,
+        )
+        and rank > 64
+    )
 
 
 def sm120_producer_variant_count(m: int, k: int, rank: int = 32) -> int:

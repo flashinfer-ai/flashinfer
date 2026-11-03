@@ -32,6 +32,7 @@ SVDQuant NVFP4 GEMM (SM100)
 
     mm_nvfp4_svdquant
     nvfp4_quantize_smooth
+    prepare_svdquant_l2t
     svdquant_linear
 
 Quantized-base GEMM with runtime BF16 LoRA (SM90, SM100, SM103)

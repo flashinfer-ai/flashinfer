@@ -1,6 +1,7 @@
 """Operands and measurements for the SM120 SVDQuant backend comparison."""
 
 import math
+import os
 import subprocess
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -13,7 +14,13 @@ import torch
 from typing_extensions import assert_never
 
 import flashinfer
-from flashinfer import SfLayout, mm_nvfp4_svdquant, nvfp4_quantize, svdquant_linear
+from flashinfer import (
+    SfLayout,
+    mm_nvfp4_svdquant,
+    nvfp4_quantize,
+    prepare_svdquant_l2t,
+    svdquant_linear,
+)
 from flashinfer.autotune_cache import MeasurementPolicy
 from flashinfer.autotuner import AutoTuner, _tactic_to_json
 
@@ -24,7 +31,34 @@ TuningL2 = Literal["operator", "warm", "cold"]
 JsonValue: TypeAlias = (
     str | int | float | bool | None | list["JsonValue"] | dict[str, "JsonValue"]
 )
-BACKENDS: Final[tuple[Backend, ...]] = ("cute-dsl", "cutlass-sm120", "auto")
+
+
+class InvalidBackendsError(ValueError):
+    def __init__(self, value: str) -> None:
+        """Retain the rejected environment value and identify supported backends."""
+        self.value = value
+        super().__init__(
+            "SVDQ_BENCH_BACKENDS must list cute-dsl, cutlass-sm120 or auto; "
+            f"got {value!r}"
+        )
+
+
+def parse_backends(value: str) -> tuple[Backend, ...]:
+    """Validate backend names while preserving reference order and removing duplicates."""
+    selected: list[Backend] = []
+    for token in value.split(","):
+        match token.strip():
+            case "cute-dsl" | "cutlass-sm120" | "auto" as backend:
+                selected.append(backend)
+            case _:
+                raise InvalidBackendsError(value)
+    return tuple(dict.fromkeys(selected))
+
+
+# The first backend supplies the accuracy reference and speedup denominator.
+BACKENDS: Final = parse_backends(
+    os.environ.get("SVDQ_BENCH_BACKENDS", "cute-dsl,cutlass-sm120,auto")
+)
 REDUCTION_ELEMENTS: Final = 1 << 20
 
 
@@ -226,6 +260,11 @@ def build_case(
 def make_call(
     case: Case, operation: Operation, backend: Backend, enable_pdl: bool
 ) -> Call:
+    """Bind a workload for repeated execution outside setup and preparation costs.
+
+    GEMM reuses its output allocation. Linear calls prepare L2T only for backends
+    that can select CUTLASS producers, leaving CuTe-only setup independent of JIT.
+    """
     operands: tuple[torch.Tensor, ...]
     match operation:
         case "gemm":
@@ -254,7 +293,13 @@ def make_call(
                 case.w_sf,
                 case.alpha,
                 case.pqs,
-                case.l2t,
+                # Prepared once, as a model loader does; graph replay then
+                # reuses the derived layouts instead of re-laying them out.
+                (
+                    prepare_svdquant_l2t(case.l2t)
+                    if backend in ("cutlass-sm120", "auto")
+                    else case.l2t
+                ),
                 case.l1,
                 case.global_sf,
             )

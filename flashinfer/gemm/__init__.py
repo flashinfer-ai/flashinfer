@@ -71,6 +71,7 @@ from .gemm_bf16_fp4 import (
 from .gemm_svdquant import (
     mm_nvfp4_svdquant as mm_nvfp4_svdquant,
     nvfp4_quantize_smooth as nvfp4_quantize_smooth,
+    prepare_svdquant_l2t as prepare_svdquant_l2t,
     svdquant_linear as svdquant_linear,
 )
 from .cake_quant_lora_gemm import (

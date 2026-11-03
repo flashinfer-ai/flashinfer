@@ -57,6 +57,11 @@ def parse_shape(text: str) -> ShapeCase:
 def parse_options(
     argv: Sequence[str] | None = None, *, description: str | None = None
 ) -> Options:
+    """Parse benchmark workloads and reject incompatible timing or rank options.
+
+    Repeated shapes, operations and ranks are deduplicated in input order.
+    Invalid durations, counts or eager/cold-L2 combinations exit through argparse.
+    """
     parser = argparse.ArgumentParser(
         description=description, formatter_class=argparse.RawDescriptionHelpFormatter
     )
@@ -72,7 +77,7 @@ def parse_options(
     )
     parser.add_argument("--output", type=Path, help="JSONL file; default: stdout")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--rank", type=int, choices=(32, 64), action="append")
+    parser.add_argument("--rank", type=int, choices=(32, 64, 128), action="append")
     parser.add_argument(
         "--untuned", action="store_true", help="measure defaults without autotuning"
     )
