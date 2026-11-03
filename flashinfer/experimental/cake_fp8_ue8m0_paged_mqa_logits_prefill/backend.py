@@ -353,8 +353,8 @@ def paged_mqa_logits_prefill(
         f"block_tables must hold {-(-work.max_len // PAGE)} blocks per request "
         f"(the longest row's keys); got {block_tables.shape[1]}",
     )
-    work = work.items
-    if work.shape[0] == 0:
+    items = work.items
+    if items.shape[0] == 0:
         return out
     device_index = q.device.index
     num_blocks = kv_fused.shape[0]
@@ -391,14 +391,14 @@ def paged_mqa_logits_prefill(
                 num_blocks,
                 BLOCK_BYTES // 16,
                 table,
-                work.view(-1),
+                items.view(-1),
                 out.view(-1),
                 block_tables.stride(0),
-                work.shape[0],
+                items.shape[0],
                 out.stride(0),
                 1,
                 # Persistent CTAs: CTA c takes items c, c + grid, ...
-                min(work.shape[0], get_device_sm_count(q.device)),
+                min(items.shape[0], get_device_sm_count(q.device)),
                 1,
                 1,
             )
