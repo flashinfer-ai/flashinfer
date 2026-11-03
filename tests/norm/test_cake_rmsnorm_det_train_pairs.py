@@ -320,11 +320,11 @@ def test_rows_cover_every_backward_window_edge() -> None:
 
 # The H = 256 backward route: per sm_100a / sm_103a window the faster of the four-CTA pipeline (``pd4``) and the
 # five-CTA ring at issue distance three without the L2 hint (``a3``), both at ``tail_div=4``, in two sessions per
-# architecture (BF16 and FP32 weight alike); sm_107a runs the pipeline to 2048 rows.  Above the ring's dw accuracy
-# edge (80896 rows on sm_100a, 99840 on sm_103a) and above 2048 rows on sm_107a the ring with compensated dw sums
-# runs instead: its lean form ``dcln`` (two rows per iteration with the same arithmetic in the same order), on sm_103a
-# to 720896 rows and the ring itself (``dc``) above; above 1572864 rows its form with hi / lo partial rows
-# (``dchl``).
+# architecture (BF16 and FP32 weight alike); sm_107a runs the pipeline to 65536 rows and the ring above.  Above the
+# ring's dw accuracy edge of each architecture (80896 rows on sm_100a, 99840 on sm_103a, 70656 on sm_107a) the ring
+# with compensated dw sums runs instead: its lean form ``dcln`` (two rows per iteration with the same arithmetic in the
+# same order), on sm_103a to 720896 rows and the ring itself (``dc``) above; above 1572864 rows its form with hi / lo
+# partial rows (``dchl``).
 H256_BWD_PROGRAMS = {
     "pd4": "rmsnorm_train_bwd_h256_t128x4_pd4_k_s32_split_pts_cl_td4",
     "a3": "rmsnorm_train_bwd_h256_t128x5_cpa8a3nhkc8_k_s32_split_pts_cl_td4_cs",
@@ -353,8 +353,9 @@ H256_BWD_SPLIT = {
         (1572864, None, "dchl"),
     ),
     "sm_107a": (
-        (0, 2048, "pd4"),
-        (2048, 1572864, "dcln"),
+        (0, 65536, "pd4"),
+        (65536, 70656, "a3"),
+        (70656, 1572864, "dcln"),
         (1572864, None, "dchl"),
     ),
 }
@@ -593,7 +594,7 @@ ACCURACY_EDGES = {
     "sm_107a": {
         "h1536": 45056,
         "h2048": 50688,
-        "h256": 2048,
+        "h256": 70656,
         "h4096": 24064,
         "h5120": 19968,
         "h6144": 19456,
