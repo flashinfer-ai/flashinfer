@@ -462,6 +462,15 @@ constexpr int DEEP_SEEK_ACTIVATION_V2_NUM_ELTS_PER_SF = 128;
 // Grid cap: one resident wave at 128 threads and up to 64 registers per thread, so the CTAs that
 // find their row past the live count never wait for a slot.
 constexpr int DEEP_SEEK_ACTIVATION_V2_MAX_CTAS_PER_SM = 8;
+// Smallest token count for which this kernel is selected; below it activationDeepSeekKernel runs
+// as before. Its 1- and 2-token instantiations finish in 2.1-3.3 us up to 16 tokens where this
+// kernel's floor is 3.7-5.1 us, and every parallel split measured crosses over between 32 and 64
+// tokens. Own times (PDL off), old / new us, GLM-5.3 shapes (H 6144, I 2048, 256 experts, top-k 8):
+// B300, 148 SMs at 2032 MHz, 2026-11-03, EP8: 2.7 / 4.0 at T = 8, 4.3 / 4.3 at 32, 7.1 / 4.5 at
+// 64, 9.6 / 4.8 at 128 (EP4 x TP2, EP2 x TP4 and TP8 behave alike, TP8 2.4 / 4.8 at 32 and
+// 3.9 / 5.0 at 64); Rubin sm107, 208 SMs, 2026-11-03, EP8: 2.6 / 4.3 at 8, 4.6 / 4.3 at 32,
+// 5.8 / 4.3 at 64, 8.0 / 4.6 at 128.
+constexpr int DEEP_SEEK_ACTIVATION_V2_MIN_TOKENS = 64;
 
 // Loads one lane's 16 bytes of the linear half and of the gate half of permuted row `row`, column
 // block `colBlock`, and the two block scales.
@@ -676,13 +685,15 @@ void run(Data const& data, void* stream) {
     // The row-parallel kernel needs the row -> token map and the row count (callers that build
     // activation::Data without them, such as the standalone activation op, keep the old kernel),
     // the 128-column scale block it is written for (a 32-column block stays on the kernel above),
-    // whole scale blocks (the scale indexing of both kernels assumes it) and 16-byte aligned rows.
+    // whole scale blocks (the scale indexing of both kernels assumes it), 16-byte aligned rows and
+    // at least DEEP_SEEK_ACTIVATION_V2_MIN_TOKENS tokens (below that the old kernel's small-batch
+    // instantiations are faster; see the constant).
     int const eltBytes = tg::dtypeGetNumBits(data.mDtypeElt) / 8;
     bool const useRowParallel =
         !useLegacyGlueKernels() && data.permutedIdxToTokenIdx != nullptr &&
-        data.totalMaxPaddedTokens > 0 && data.mDeepSeekSfBlockSize == NUM_ELTS_PER_SF &&
-        outputDim % NUM_ELTS_PER_SF == 0 && (outputDim * eltBytes) % 16 == 0 &&
-        isAligned16(data.inPtr) && isAligned16(data.outPtr);
+        data.totalMaxPaddedTokens > 0 && data.numTokens >= DEEP_SEEK_ACTIVATION_V2_MIN_TOKENS &&
+        data.mDeepSeekSfBlockSize == NUM_ELTS_PER_SF && outputDim % NUM_ELTS_PER_SF == 0 &&
+        (outputDim * eltBytes) % 16 == 0 && isAligned16(data.inPtr) && isAligned16(data.outPtr);
     if (useRowParallel) {
       int const numSfBlocksPerRow = outputDim / NUM_ELTS_PER_SF;
       int const sfBlocksPerCta = DEEP_SEEK_ACTIVATION_V2_THREADS_PER_CTA /
@@ -1405,6 +1416,16 @@ constexpr int FINALIZE_V2_THREADS_PER_CTA = 128;
 constexpr int FINALIZE_V2_LOADS_IN_FLIGHT = 8;
 // Largest grid, in CTAs per SM, for which this kernel is selected (about four resident waves).
 constexpr int FINALIZE_V2_MAX_CTAS_PER_SM = 32;
+// The per-token rule in run() calls a grid of fewer than this many 256-thread CTAs small (148 SMs
+// x 8 CTAs, see its comment) and gives it finalizeKernelSmallBatch or the scalar finalizeKernel;
+// larger grids take finalizeKernelVecLoad. finalizeKernelV2 replaces only the latter: it is
+// 1.5-1.7x faster than finalizeKernelVecLoad at 64-128 tokens of width 6144, while below the bound
+// the small-batch kernel is 0.0-0.5 us faster than it, in every parallel split measured. Own
+// times (PDL off), old / new us, GLM-5.3 shapes at EP8: B300, 148 SMs at 2032 MHz, 2026-11-03:
+// small-batch 2.6 / 2.7 at T = 8 and 3.1 / 3.5 at 32, VecLoad 5.9 / 3.7 at 64 and 6.2 / 3.8 at
+// 128; Rubin sm107, 208 SMs, 2026-11-03: 2.6 / 2.7 at 8, 3.3 / 3.7 at 32, 5.9 / 3.5 at 64,
+// 6.2 / 3.8 at 128.
+constexpr int FINALIZE_SMALL_GRID_CTA_BOUND = 1184;
 
 template <typename KernelParams>
 __global__ void __launch_bounds__(FINALIZE_V2_THREADS_PER_CTA)
@@ -1581,11 +1602,12 @@ void run(Data const& data, void* stream) {
     int64_t const finalizeElemsPerVector = 128 / tg::dtypeGetNumBits(data.mDtypeElt);
     bool const vectorWidthAligned = data.hiddenDim % finalizeElemsPerVector == 0 &&
                                     data.hiddenDimPadded % finalizeElemsPerVector == 0;
-    // The (token, slice) grid kernel replaces the per-token vectorized kernel and the small-batch
-    // split while its grid is at most a few waves (measured: 1.3-1.7x faster than them at 64 and
-    // 256 tokens of width 6144, 0.8x at 2048, where the per-token kernel's longer-lived CTAs keep
-    // more bytes in flight); above that the per-token vectorized kernel stays. The scalar
-    // finalizeKernel stays for rows that are not 16-byte vectors.
+    // The (token, slice) grid kernel replaces the per-token vectorized kernel between the
+    // small-grid bound and a few waves (measured: 1.3-1.7x faster than it at 64 and 256 tokens of
+    // width 6144, 0.8x at 2048, where the per-token kernel's longer-lived CTAs keep more bytes in
+    // flight); above that the per-token vectorized kernel stays, below the bound the small-batch
+    // split and the scalar finalizeKernel stay (see FINALIZE_SMALL_GRID_CTA_BOUND). The scalar
+    // finalizeKernel also stays for rows that are not 16-byte vectors.
     int device{-1};
     cudaGetDevice(&device);
     int numSms = 0;
@@ -1596,13 +1618,13 @@ void run(Data const& data, void* stream) {
     bool const useSliceGrid =
         !useLegacyGlueKernels() && vectorWidthAligned && data.topK <= MaxTopK &&
         isAligned16(data.inPtr) && (data.inPtr2 == nullptr || isAligned16(data.inPtr2)) &&
-        isAligned16(data.outPtr) &&
+        isAligned16(data.outPtr) && numBlocksX * numBlocksY >= FINALIZE_SMALL_GRID_CTA_BOUND &&
         (int64_t)data.numTokens * numSlices <= (int64_t)numSms * FINALIZE_V2_MAX_CTAS_PER_SM;
     // With topK <= SMALL_BATCH_FINALIZE_MAX_LOADS there is a single topK group, and the
     // shared-memory reduction costs more than the split saves.
     bool const useSmallBatch =
-        !useSliceGrid && numBlocksX * numBlocksY < 1184 && vectorWidthAligned &&
-        data.topK > SMALL_BATCH_FINALIZE_MAX_LOADS &&
+        !useSliceGrid && numBlocksX * numBlocksY < FINALIZE_SMALL_GRID_CTA_BOUND &&
+        vectorWidthAligned && data.topK > SMALL_BATCH_FINALIZE_MAX_LOADS &&
         data.topK <= SMALL_BATCH_FINALIZE_MAX_TOPK_GROUPS * SMALL_BATCH_FINALIZE_MAX_LOADS;
     if (useSliceGrid) {
       dim3 numBlocks(data.numTokens, static_cast<unsigned>(numSlices));
@@ -1618,7 +1640,7 @@ void run(Data const& data, void* stream) {
       dim3 numBlocks(data.numTokens, (numVecs + vecsPerBlock - 1) / vecsPerBlock);
       dim3 blockDim(vecsPerBlock, kSplit);
       LAUNCH_TOPK_EXPW(data, finalizeKernelSmallBatch, numBlocks, blockDim, 0, stream);
-    } else if (numBlocksX * numBlocksY < 1184 || !vectorWidthAligned) {
+    } else if (numBlocksX * numBlocksY < FINALIZE_SMALL_GRID_CTA_BOUND || !vectorWidthAligned) {
       // The number 1184 comes from 148 * 8, where 148 is the number of SMs (Streaming
       // Multiprocessors) in the Blackwell architecture, and the value 8 means that each Streaming
       // Multiprocessor (SM) can hold up to 8 blocks for this kernel. This limitation is intended to
