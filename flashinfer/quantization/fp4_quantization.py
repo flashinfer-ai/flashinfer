@@ -1578,12 +1578,14 @@ def nvfp4_quantize(
     do_shuffle=False,
     sf_vec_size=16,
     enable_pdl=None,
-    backend: str = "cuda",
+    backend: str = "auto",
     per_token_activation: bool = False,
     expanded_idx_to_permuted_idx: Optional[torch.Tensor] = None,
     out_scale: Optional[torch.Tensor] = None,
     # Appended last so existing positional construction keeps working.
     nvfp4_4over6: Optional[NVFP44Over6Config] = _UNSET,
+    *,
+    batch_invariant: bool = False,
 ):
     r"""Quantize input tensor to NVFP4 format.
 
@@ -1608,7 +1610,9 @@ def nvfp4_quantize(
     backend : str
         Backend to use for quantization:
 
-        - ``"cuda"``: stable CUDA kernel (default).
+        - ``"auto"`` (default): ``"cuda"``, or the batch-invariant kernel
+          under ``batch_invariant=True`` (which requires ``"auto"``).
+        - ``"cuda"``: stable CUDA kernel.
         - ``"cute-dsl"``: CuTe-DSL kernel (SM100+, **experimental**);
           supports all ``sfLayout`` values
           (``layout_128x4`` / ``layout_8x4`` / ``layout_linear``)
@@ -1638,6 +1642,21 @@ def nvfp4_quantize(
         - ``None``: 4over6 off. The environment is ignored.
         - :class:`NVFP44Over6Config`: on with exactly that recipe. The
           environment is ignored.
+    batch_invariant : bool
+        ``True`` runs the batch-invariant NVFP4 quantization class in place
+        of the backends (requires ``backend="auto"``): a row's bits depend on
+        its values and the global scale alone, not on the batch it is
+        quantized in, its position, the configuration chosen or the SM count,
+        and the result is deterministic. Per-tensor (the class
+        ``nvfp4.quant``: ``a_global_sf`` is an input;
+        ``flashinfer.batch_invariant.fingerprint("nvfp4_quantize")``) and
+        per-token (``nvfp4.quant.pertoken``: the row's scale is derived from
+        its amax; ``fingerprint("nvfp4_quantize_per_token", K=)``), all three
+        scale-factor layouts and ``do_shuffle``. An explicit 4over6 recipe,
+        ``sf_vec_size != 16``, an fp8 input, ``expanded_idx_to_permuted_idx``
+        and ``out_scale`` raise
+        :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`
+        instead of falling back. See ``flashinfer/batch_invariant/README.md``.
 
     Returns
     -------
@@ -1664,6 +1683,30 @@ def nvfp4_quantize(
     """
     nvfp4_4over6_config = resolve_nvfp4_4over6(nvfp4_4over6)
     nvfp4_4over6_is_explicit = nvfp4_4over6 is not _UNSET
+    if batch_invariant:
+        if backend != "auto":
+            raise ValueError(
+                "nvfp4_quantize: batch_invariant=True requires backend='auto' "
+                f"(got backend={backend!r})"
+            )
+        from ..batch_invariant.quantization.nvfp4_api import (
+            nvfp4_quantize_batch_invariant,
+        )
+
+        return nvfp4_quantize_batch_invariant(
+            a,
+            a_global_sf,
+            sfLayout,
+            do_shuffle,
+            sf_vec_size,
+            enable_pdl,
+            per_token_activation,
+            expanded_idx_to_permuted_idx,
+            out_scale,
+            nvfp4_4over6_config,
+        )
+    if backend == "auto":
+        backend = "cuda"
     if per_token_activation:
         if sf_vec_size != 16:
             raise ValueError(
@@ -1878,9 +1921,11 @@ def nvfp4_quantize(
 @flashinfer_api(trace=mxfp4_quantize_trace)
 def mxfp4_quantize(
     a: torch.Tensor,
-    backend: str = "cuda",
+    backend: str = "auto",
     enable_pdl: Optional[bool] = None,
     sfLayout: SfLayout = SfLayout.layout_128x4,
+    *,
+    batch_invariant: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Quantize input tensor to MXFP4 format.
 
@@ -1891,7 +1936,9 @@ def mxfp4_quantize(
     backend : str
         Backend to use for quantization:
 
-        - ``"cuda"``: stable CUDA kernel (default).
+        - ``"auto"`` (default): ``"cuda"``, or the batch-invariant kernel
+          under ``batch_invariant=True`` (which requires ``"auto"``).
+        - ``"cuda"``: stable CUDA kernel.
         - ``"cute-dsl"``: CuTe-DSL kernel (SM100+, **experimental**).
     enable_pdl : bool, optional
         Whether to enable Programmatic Dependent Launch.  Only used when
@@ -1901,6 +1948,17 @@ def mxfp4_quantize(
         Scale-factor layout.  Defaults to ``SfLayout.layout_128x4``.
         Supported layouts are ``layout_128x4``, ``layout_8x4``, and
         ``layout_linear``.
+    batch_invariant : bool
+        ``True`` runs the batch-invariant MXFP4 quantization class in place
+        of the backends (requires ``backend="auto"``): a row's bits depend on
+        its values alone, not on the batch it is quantized in, its position,
+        the configuration chosen or the SM count, and the result is
+        deterministic. The dataflow is TransformerEngine's MX chain carried
+        to e2m1, fingerprinted as
+        ``flashinfer.batch_invariant.fingerprint("mxfp4_quantize")``.
+        Unsupported inputs raise
+        :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`
+        instead of falling back. See ``flashinfer/batch_invariant/README.md``.
 
     Returns
     -------
@@ -1917,6 +1975,19 @@ def mxfp4_quantize(
     notice.  Use at your own risk for production workloads.
     """
     sfLayout = SfLayout(sfLayout)
+    if batch_invariant:
+        if backend != "auto":
+            raise ValueError(
+                "mxfp4_quantize: batch_invariant=True requires backend='auto' "
+                f"(got backend={backend!r})"
+            )
+        from ..batch_invariant.quantization.mx_api import (
+            mxfp4_quantize_batch_invariant,
+        )
+
+        return mxfp4_quantize_batch_invariant(a, sfLayout, enable_pdl)
+    if backend == "auto":
+        backend = "cuda"
     if backend == "cute-dsl":
         from ..cute_dsl import is_cute_dsl_available
 
@@ -1954,7 +2025,9 @@ def mxfp4_quantize(
         )
         return a_fp4, a_sf
     else:
-        raise ValueError(f"Unknown backend: {backend}. Must be 'cuda' or 'cute-dsl'.")
+        raise ValueError(
+            f"Unknown backend: {backend}. Must be 'auto', 'cuda' or 'cute-dsl'."
+        )
 
 
 @flashinfer_api

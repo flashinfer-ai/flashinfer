@@ -60,3 +60,25 @@ lake exe axioms                                # the axiom policy: 0 with sorry,
 
 The Lean steps are not run in CI. The `lean/` directory is part of the repository only: it has no `__init__.py` and
 no package data entry, so no `.lean` file is in the wheel.
+
+## Quantization
+
+The quantizers have no cross-row reduction: a block's scale and codes depend on that block alone, so FlashInfer's own
+kernels are already batch invariant in the R1 / R2 sense. What `batch_invariant=True` adds is a specified, fingerprinted
+dataflow (R3 across the enumerated configurations, R4 across the scale-factor layouts and the input dtypes that widen
+exactly), a closed-form dispatcher whose every pick is a member of one enumerated space, and the exact CPU model and Lean
+statements of the chains. The flag requires `backend="auto"` (the default, which runs the CUDA kernel without the flag).
+
+| API | Classes and fingerprint | Numerics | Supported inputs |
+|---|---|---|---|
+| `mxfp8_quantize` | `mxfp8.quant`; `fingerprint("mxfp8_quantize")` (no dimension: one specification per format) | TransformerEngine's MXFP8 chain: block amax as a pairwise `max` tree over `abs`, the UE8M0 scale `cvt.rp.satfinite.ue8m0(amax * fp32(1/448))`, the exact inverse `2^(127 - e8)` at every byte, the elements `cvt.rn.satfinite.e4m3(mul.rn(x, inv))`. Bit-identical to the `cuda` / `cute-dsl` backends except on blocks whose amax is below `448 * 2^-127` (the class keeps the values under the exact inverse; the backends zero the codes), NaN elements (`0x7F` vs the clamp `0x7E`) and infinite elements (`-inf` gives `-448`, the backends `+448`) | bf16 / f16 / fp32 inputs of shape `(..., K)`, `K` a multiple of 32 and rows of at most 128 KiB, `alignment` padding; the 128x4, 8x4 and linear scale layouts (placements of the store: the same bytes); SM100 / SM103 / SM107 |
+| `mxfp4_quantize` | `mxfp4.quant`; `fingerprint("mxfp4_quantize")` | the same chain carried to e2m1 (`fp32(1/6)`, `cvt.rn.satfinite.e2m1`), for parity with FlashInfer's and TensorRT-LLM's MXFP4 quantizers | as above (`K` a multiple of 32); the three layouts |
+| `nvfp4_quantize` | per-tensor `nvfp4.quant` (`fingerprint("nvfp4_quantize")`), per-token `nvfp4.quant.pertoken` (`fingerprint("nvfp4_quantize_per_token", K=)`: the row amax tree spans the row, so the row length is a dimension) | FlashInfer's NVFP4 chain under its exact (non-fast-math) path: the block amax as a pairwise `max` tree over `abs`, `sf = cvt.rn.satfinite.e4m3(amax * (gs * fp32(1/6)))`, `inv = fmin(1 / (sf * (1 / gs)), FLT_MAX)` with correctly rounded divisions, the elements `cvt.rn.satfinite.e2m1(mul.rn(x, inv))`; per token the row's global scale `gs = nzor(fmin((1 / gs_inv) / ramax, FLT_MAX), 1)` (`ramax` the row amax tree; `FLT_MAX` for an all-zero row) and the returned per-token scale `1 / gs`. Bit-identical to the `cuda` and `cute-dsl` backends under `FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH=1` (codes, scale bytes, per-token scales, every layout, `do_shuffle`); their default path takes the two reciprocals with `rcp.approx.ftz` (a small share of codes and scale bytes move across a rounding boundary) and stores `ramax * gs_inv` as the per-token scale (within two ulps of the class's reciprocal) | bf16 / f16 / fp32 inputs, `K` a multiple of 16; the per-tensor global scale an input (a float or a 1-element fp32 tensor), the per-token inverse base scale; the three layouts and `do_shuffle` (FlashInfer's own host shuffles applied to the class's linear-layout bytes; a multiple of 32 rows, as FlashInfer's shuffle requires); `sf_vec_size` 16; no 4over6 recipe, no fp8 input, no `expanded_idx_to_permuted_idx`, no `out_scale`; SM100 / SM103 / SM107 |
+
+The quantizers' dispatcher is a closed form of `(M, K, element bytes, SM count, layout)`: one configuration per call, no
+autotuning (`quantization/mx_schedule.py`, `quantization/nvfp4_schedule.py`), fitted on CUPTI sweeps of both parts.
+The Lean model (`lean/BIKernels/Canon.lean`, `Semantics.lean`, `MXQuant.lean`, `Quant.lean`) states the engine's reduction
+orders and the chains; `lake exe quantconformance` prints its terms for the generated cases
+(`lean/BIKernels/QuantCases.lean`, rendered by `quantization/lean_cases.py`), which the device-free test
+`tests/batch_invariant/test_quant_lean.py` compares with the Python specification. Tests:
+`tests/quantization/test_batch_invariant_mx_quantize.py` (both MX formats) and `test_batch_invariant_nvfp4_quantize.py`.
