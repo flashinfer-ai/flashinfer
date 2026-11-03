@@ -475,6 +475,7 @@ def main():
                 },
             )
             manifest["cases"].append(case)
+            Path(str(prefix) + "-manifest.json").write_text(json.dumps(manifest, indent=2))
             for cache in ("warm", "cold"):
                 for scope in ("raw_pipeline", "full_operator"):
                     launch = (
@@ -532,6 +533,8 @@ def main():
                     )
             adapter["close"]()
             barrier()
+            case["complete"] = True
+            Path(str(prefix) + "-manifest.json").write_text(json.dumps(manifest, indent=2))
     manifest["clocks_after"] = gpu_clock()
     manifest["complete"] = True
     Path(str(prefix) + "-manifest.json").write_text(json.dumps(manifest, indent=2))
