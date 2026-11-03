@@ -10,10 +10,11 @@ A record rebuild exports to tvm-ffi only the tensors that moved since the
 site's previous record (``_ffi_arguments_reusing``).  A moved tensor bound
 again at the next argument position (``out`` / ``out_tma``, the FP32 final
 state and its tensor map) takes the export of that position instead of a
-second one.  The first launch of a binding passes the bound torch tensors
-and builds no exported record; a second launch builds it and later launches
-reuse it until a rebind drops it.  ``_ffi_arguments`` is replaced by a
-recording stub, so no tvm-ffi conversion runs.
+second one.  The first launch of a binding passes the bound torch tensors,
+builds no exported record and drops the exports kept for the previous
+binding; a second launch builds it and later launches reuse it until a
+rebind drops it.  ``_ffi_arguments`` is replaced by a recording stub, so
+no tvm-ffi conversion runs.
 """
 
 from types import SimpleNamespace
@@ -102,6 +103,8 @@ class _Launch:
     def __init__(self):
         self.builds = []
         self.launched = []
+        self.prepare_module = None
+        self.module = SimpleNamespace()
 
     def _build_launch_records(self, export=True):
         self.builds.append(export)
@@ -126,3 +129,44 @@ def test_a_rebind_makes_the_next_launch_raw():
     launch._launch_in_stream()
     assert launch.builds == [False, True, False, True]
     assert launch.launched == ["raw", "exported", "raw", "exported"]
+
+
+def test_a_raw_launch_drops_the_previous_binding_exports():
+    launch = _Launch()
+    launch.prepare_module = SimpleNamespace()
+    launch._launch_in_stream()
+    launch._launch_in_stream()
+    for owner in (launch.prepare_module, launch.module):
+        owner._ffi_export_memo = {None: ((_tensor(), 0, "ffi"),)}
+    launch._launch_in_stream()
+    assert "_ffi_export_memo" in launch.module.__dict__
+    runtime._invalidate_launch_records(launch)
+    launch._launch_in_stream()
+    assert "_ffi_export_memo" not in launch.module.__dict__
+    assert "_ffi_export_memo" not in launch.prepare_module.__dict__
+    assert launch.launched == ["raw", "exported", "exported", "raw"]
+
+
+@pytest.mark.parametrize(
+    "builder", ["_work_bin_mix_record", "_m64_owner_helper_record"]
+)
+@pytest.mark.parametrize("export", [False, True])
+def test_a_route_builder_forwards_export(monkeypatch, builder, export):
+    reused = []
+
+    def reuse(owner, site, arguments):
+        reused.append(owner)
+        return tuple(arguments)
+
+    monkeypatch.setattr(runtime, "_ffi_arguments_reusing", reuse)
+    t = _tensor()
+    module = SimpleNamespace(
+        _ready=True,
+        _call=object(),
+        _arguments=lambda grid, bindings: [bindings["x"], grid],
+    )
+    launch = SimpleNamespace(module=module, grid=3, args={"x": t})
+    method = getattr(runtime.FlashKDABlackwellBF16FusedLaunch, builder)
+    _, arguments = method(launch, export)
+    assert arguments[0] is t and arguments[1] == 3
+    assert reused == ([module] if export else [])

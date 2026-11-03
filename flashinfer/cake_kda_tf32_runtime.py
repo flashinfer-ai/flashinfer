@@ -5065,7 +5065,13 @@ class FlashKDABlackwellBF16FusedLaunch:
                 # them for less host time than exporting each moved tensor
                 # ahead of it.  The instance-level None marks that launch; a
                 # second launch of the same binding builds the exported
-                # record and reuses it until the next rebind.
+                # record and reuses it until the next rebind.  The exports
+                # kept for the previous binding are dropped here, so a
+                # binding launched only once does not keep its predecessor's
+                # tensors alive.
+                for owner in (self.prepare_module, self.module):
+                    if owner is not None:
+                        owner.__dict__.pop("_ffi_export_memo", None)
                 self._launch_records = None
                 _run_launch_records(self._build_launch_records(export=False))
                 return
