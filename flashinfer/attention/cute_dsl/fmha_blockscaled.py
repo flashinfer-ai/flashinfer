@@ -79,6 +79,7 @@ def _get_variant_name(
     enable_skip_softmax: bool = False,
     enable_sink: bool = False,
     use_pdl: bool = False,
+    p_exp_mode: str = "exp2",
 ) -> str:
     """Generate the block-scaled variant name used by the artifact compiler."""
     pv_str = _dtype_to_str(pv_dtype)
@@ -91,7 +92,8 @@ def _get_variant_name(
     sink_str = "_sink" if enable_sink else ""
     pdl_str = "_pdl" if use_pdl else ""
     ffi_str = "_tvmffi" if enable_tvm_ffi else ""
-    return f"cute_dsl_fmha_blockscaled_{qk_mode}_{pv_str}_{out_str}_h{head_dim}_{causal_str}_{persist_str}{varlen_str}{lse_str}{skip_str}{sink_str}{pdl_str}{ffi_str}"
+    exp_str = "" if p_exp_mode == "exp2" else f"_{p_exp_mode}"
+    return f"cute_dsl_fmha_blockscaled_{qk_mode}_{pv_str}_{out_str}_h{head_dim}_{causal_str}_{persist_str}{varlen_str}{lse_str}{skip_str}{sink_str}{pdl_str}{exp_str}{ffi_str}"
 
 
 @functools.cache
@@ -109,6 +111,7 @@ def get_cute_dsl_fmha_blockscaled_kernel(
     enable_skip_softmax: bool = False,
     enable_sink: bool = False,
     use_pdl: bool = False,
+    p_exp_mode: str = "exp2",
 ):
     """Load a compiled block-scaled FMHA kernel from local or remote artifacts."""
     if qk_mode not in _BLOCKSCALED_MODES:
@@ -129,6 +132,7 @@ def get_cute_dsl_fmha_blockscaled_kernel(
         enable_skip_softmax=enable_skip_softmax,
         enable_sink=enable_sink,
         use_pdl=use_pdl,
+        p_exp_mode=p_exp_mode,
     )
 
     # Check for local .so directory (development mode)
@@ -178,7 +182,8 @@ def cute_dsl_fmha_blockscaled_prefill(
     mapping with fixed beta=-0.35. It requires E4M3 V and uses the generated
     FP8 weights for PV, with FP16 partial sums reduced into the FP32 denominator
     (including approximate LSE), using the shared Prims-TS encoding helpers.
-    Expcast variants are JIT-only; the default retains artifact-first loading.
+    Each mode uses a distinct artifact name, with JIT fallback when no matching
+    artifact is available. Existing exp2 artifact names are unchanged.
 
     The per-tensor scales accept a Python float or a 0-d tensor (as returned by the
     quantizer); tensors are converted to floats here at the eager boundary.
@@ -204,32 +209,32 @@ def cute_dsl_fmha_blockscaled_prefill(
         and skip_softmax_threshold_scale_factor > 0
     )
     kernel_fn = None
-    if p_exp_mode == "exp2":
-        try:
-            if window_left != -1 or window_right != -1:
-                # The artifact name has no window axis, so only its traced
-                # no-window/causal-right-bound signatures are safe to load.
-                raise RuntimeError(
-                    "windowed block-scaled DSL FMHA variants are not exported"
-                )
-            kernel_fn = get_cute_dsl_fmha_blockscaled_kernel(
-                _get_gpu_arch(q.device),
-                qk_mode,
-                v.dtype,
-                o.dtype,
-                D,
-                is_causal,
-                is_persistent=False,
-                enable_tvm_ffi=True,
-                with_lse=lse is not None,
-                enable_skip_softmax=use_skip_softmax,
-                use_pdl=enable_pdl,
+    try:
+        if window_left != -1 or window_right != -1:
+            # The artifact name has no window axis, so only its traced
+            # no-window/causal-right-bound signatures are safe to load.
+            raise RuntimeError(
+                "windowed block-scaled DSL FMHA variants are not exported"
             )
-        except (RuntimeError, FileNotFoundError) as e:
-            logger.info(
-                f"Block-scaled DSL FMHA cubin unavailable ({e}); JIT-compiling the kernel."
-            )
-            kernel_fn = None
+        kernel_fn = get_cute_dsl_fmha_blockscaled_kernel(
+            _get_gpu_arch(q.device),
+            qk_mode,
+            v.dtype,
+            o.dtype,
+            D,
+            is_causal,
+            is_persistent=False,
+            enable_tvm_ffi=True,
+            with_lse=lse is not None,
+            enable_skip_softmax=use_skip_softmax,
+            use_pdl=enable_pdl,
+            p_exp_mode=p_exp_mode,
+        )
+    except (RuntimeError, FileNotFoundError) as e:
+        logger.info(
+            f"Block-scaled DSL FMHA cubin unavailable ({e}); JIT-compiling the kernel."
+        )
+        kernel_fn = None
     if kernel_fn is None:
         kernel_fn = compile_cute_dsl_fmha_blockscaled_kernel(
             qk_mode,
