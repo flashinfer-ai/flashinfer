@@ -2406,3 +2406,55 @@ def test_cake_decode_program_launches_on_the_current_torch_stream(
     assert torch.equal(_bits(out), _bits(direct))
     family = "decode_fp8" if row.startswith("fp8") else "decode_bf16"
     assert set(served_programs) == {(family, SHAPE_ROWS[row][-1][target])}
+
+
+# --- GPU: pages past each request's length -----------------------------------
+
+
+def _poison_pages_past_the_lengths(case, poison):
+    """Every table slot past a request's last page: its page holds NaN keys and
+    values (``nan_pages``), or the slot names no page of the pool
+    (``garbage_ids``).  The slots up to each length stay."""
+
+    page, width = case.kv_cache.shape[3], case.block_tables.shape[1]
+    used = (case.seq_lens.long() + page - 1) // page
+    past = torch.arange(width, device=used.device)[None, :] >= used[:, None]
+    if poison == "nan_pages":
+        case.kv_cache[case.block_tables[past].long()] = float("nan")
+        return
+    junk = torch.tensor(
+        (-1, 2**31 - 1, case.kv_cache.shape[0] + 5, -(2**30)),
+        dtype=torch.int32,
+        device=used.device,
+    )
+    count = int(past.sum())
+    case.block_tables[past] = junk[torch.arange(count, device=used.device) % 4]
+
+
+@_GPU
+@pytest.mark.parametrize("poison", ("nan_pages", "garbage_ids"))
+@pytest.mark.parametrize("device_scales", (False, True))
+@pytest.mark.parametrize("row", _BF16_GPU_ROWS)
+def test_cake_decode_bf16_programs_read_no_page_past_the_length(
+    served_programs, row, device_scales, poison
+) -> None:
+    """A program walks each request's table only up to the request's length:
+    pages past it (NaN, or ids outside the pool) leave every output bit as the
+    clean cache gives it, and a request without keys writes zeros."""
+
+    target = _require_full_device()
+    batch, kv_len, page = SHAPE_ROWS[row][2], SHAPE_ROWS[row][4], SHAPE_ROWS[row][7]
+    lengths = [kv_len, 0, 1, page, page + 1, kv_len - page, 255, kv_len // 2]
+    lengths = (lengths * batch)[:batch]
+    case = _bf16_gpu_case(
+        row, seed=20261102, lengths=lengths, device_scales=device_scales
+    )
+    clean = _run_bf16(case)
+    _poison_pages_past_the_lengths(case, poison)
+    got = _run_bf16(case)
+    identifier = SHAPE_ROWS[row][-1][target] + ("_DS" if device_scales else "")
+    assert set(served_programs) == {("decode_bf16", identifier)}
+    assert torch.isfinite(got.float()).all()
+    assert torch.equal(_bits(got), _bits(clean))
+    empty = [b for b, length in enumerate(lengths) if length == 0]
+    assert not got[empty].float().any()
