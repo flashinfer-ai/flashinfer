@@ -939,6 +939,11 @@ def autotune(
             automatically.  Must contain **at least one** value when provided;
             pass ``None`` (or omit) to inherit the current buckets.
 
+            The buckets choose which sizes are profiled.  Cache keys are
+            still built by each op's own ``map_to_tuning_buckets``, so tuning
+            and inference map a runtime size to the same bucket even when the
+            largest bucket is not one the op's mapper produces.
+
             **Selecting buckets** -- more buckets give finer-grained profiling
             (better peak performance) at the cost of longer tuning time; fewer
             buckets make tuning faster but coarser.  When the set of possible
@@ -948,7 +953,9 @@ def autotune(
             workload: for latency-sensitive inference, add more small sizes;
             for throughput-oriented serving, cover the larger range.
 
-        round_up: Controls how runtime sizes map to profiled buckets.
+        round_up: Controls how runtime sizes map to profiled buckets when
+            ``tuning_buckets`` is not given.  It has no effect together with
+            ``tuning_buckets``, because the op's own mapper is used then.
 
             * ``None`` (default) -- inherit from enclosing ``autotune()``
               context, or ``False`` if there is none.
@@ -2680,7 +2687,10 @@ class AutoTuner:
             new_map: Callable[[int], int]
             if buckets is not None:
                 new_gen = tuple(sorted(set(buckets)))
-                new_map = make_bucket_mapper(new_gen, round_map=round_up_flag)
+                # Keep the op's own mapper so tuning and inference build the
+                # same cache key even if the largest bucket is off the op's grid
+                # (e.g. 21504 vs. 32768).
+                new_map = spec.map_to_tuning_buckets
             elif round_up_flag:
                 if isinstance(spec.gen_tuning_buckets, (list, tuple)):
                     sorted_gen = tuple(sorted(set(spec.gen_tuning_buckets)))

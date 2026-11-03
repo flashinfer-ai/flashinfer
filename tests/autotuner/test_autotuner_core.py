@@ -1292,6 +1292,51 @@ def test_autotune_context_custom_buckets(monkeypatch):
     assert unique_shapes == [100, 200, 500]
 
 
+def test_tuning_buckets_off_grid_top_bucket_matches_inference_key(monkeypatch):
+    """A top tuning bucket off the op's grid must be found at inference.
+
+    Tuning with an override whose largest bucket (24) is not a value the op's
+    mapper produces (it rounds 24 up to 32) must store the result under the key
+    inference looks up, instead of leaving the op's top bucket untuned.
+    """
+    tuner = reset_autotuner()
+    runner = DummyRunner(valid_tactics=(0, 1))
+
+    def next_pow2(x: int) -> int:
+        return 1 if x <= 1 else 1 << (x - 1).bit_length()
+
+    config = TuningConfig(
+        dynamic_tensor_specs=(
+            DynamicTensorSpec(
+                input_idx=(0,),
+                dim_idx=(0,),
+                gen_tuning_buckets=(8, 16, 32),
+                map_to_tuning_buckets=next_pow2,
+            ),
+        ),
+    )
+
+    def fake_profile(self, runner_obj, prof_inputs, tactic, tuning_config=None, **kw):
+        n = prof_inputs[0].shape[0]
+        if n == 24:
+            return {0: 5.0, 1: 1.0}[tactic]
+        return {0: 1.0, 1: 5.0}[tactic]
+
+    monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
+
+    buckets = (8, 16, 24)
+    tune_inputs = [torch.empty((24, 16), dtype=torch.float32)]
+    with autotune(tune_mode=True, tuning_buckets=buckets, round_up=True):
+        tuner.choose_one("off_grid_top_bucket_test", [runner], config, tune_inputs)
+
+    infer_inputs = [torch.empty((24, 16), dtype=torch.float32)]
+    _, tactic = tuner.choose_one(
+        "off_grid_top_bucket_test", [runner], config, infer_inputs
+    )
+
+    assert tactic == 1, f"Expected the tactic tuned at 24 (key 32), got {tactic}"
+
+
 def test_tuning_overrides_preserve_tensor_initializers():
     """Bucket overrides must retain the per-input initializer mapping."""
 
@@ -1805,7 +1850,11 @@ def test_autotune_context_round_up(monkeypatch):
 
 
 def test_autotune_context_both_overrides(monkeypatch):
-    """autotune with both custom buckets and round_up=True."""
+    """With tuning_buckets set, keys come from the op's own mapper.
+
+    ``round_up`` is accepted but does not change the mapping while
+    ``tuning_buckets`` is given.
+    """
     tuner = reset_autotuner()
     runner = DummyRunner(valid_tactics=(0, 1))
 
@@ -1822,24 +1871,26 @@ def test_autotune_context_both_overrides(monkeypatch):
 
     def fake_profile(self, runner_obj, prof_inputs, tactic, tuning_config=None, **kw):
         n = prof_inputs[0].shape[0]
-        if n == 300:
+        if n == 256:
             return {0: 1.0, 1: 5.0}[tactic]
         return {0: 5.0, 1: 1.0}[tactic]
 
     monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
 
     tune_inputs = [torch.empty((300, 16), dtype=torch.float32)]
-    with autotune(tune_mode=True, tuning_buckets=(100, 300, 600), round_up=True):
+    with autotune(tune_mode=True, tuning_buckets=(256, 512, 1024), round_up=True):
         tuner.choose_one("both_overrides_test", [runner], config, tune_inputs)
 
-    # 250 rounds UP to 300 with custom buckets
-    infer_inputs = [torch.empty((250, 16), dtype=torch.float32)]
-    with autotune(tune_mode=False, tuning_buckets=(100, 300, 600), round_up=True):
+    # 300 maps to bucket 256 through the op's own (floor) mapper.
+    infer_inputs = [torch.empty((300, 16), dtype=torch.float32)]
+    with autotune(tune_mode=False, tuning_buckets=(256, 512, 1024), round_up=True):
+        mapper = tuner.get_effective_map_to_tuning_buckets(config)
+        assert mapper(250) == last_positive_power_of_2(250)
         _, tactic = tuner.choose_one(
             "both_overrides_test", [runner], config, infer_inputs
         )
 
-    assert tactic == 0, f"Expected tactic 0 (bucket 300 via round_up), got {tactic}"
+    assert tactic == 0, f"Expected tactic 0 (bucket 256 via op mapper), got {tactic}"
 
 
 def test_autotune_context_restores_overrides():
@@ -1883,25 +1934,25 @@ def test_choose_one_with_custom_buckets_selects_best_tactic(monkeypatch):
 
     def fake_profile(self, runner_obj, prof_inputs, tactic, tuning_config=None, **kw):
         n = prof_inputs[0].shape[0]
-        if n <= 200:
+        if n <= 128:
             return {0: 3.0, 1: 1.0, 2: 5.0}[tactic]  # tactic 1 best for small
-        elif n <= 400:
+        elif n <= 256:
             return {0: 1.0, 1: 5.0, 2: 3.0}[tactic]  # tactic 0 best for medium
         else:
             return {0: 5.0, 1: 3.0, 2: 1.0}[tactic]  # tactic 2 best for large
 
     monkeypatch.setattr(AutoTuner, "_profile_single_kernel", fake_profile)
 
-    custom_buckets = (100, 300, 500)
-    tune_inputs = [torch.empty((500, 64), dtype=torch.float32)]
+    custom_buckets = (128, 256, 512)
+    tune_inputs = [torch.empty((512, 64), dtype=torch.float32)]
     with autotune(tune_mode=True, tuning_buckets=custom_buckets):
         tuner.choose_one("custom_select_test", [runner], config, tune_inputs)
 
-    # Inference with custom buckets (floor rounding):
-    # 150 -> bucket 100 -> tactic 1
-    # 350 -> bucket 300 -> tactic 0
-    # 450 -> bucket 300 -> tactic 0
-    # 600 -> bucket 500 -> tactic 2
+    # Inference maps sizes with the op's own (floor) mapper:
+    # 150 -> bucket 128 -> tactic 1
+    # 350 -> bucket 256 -> tactic 0
+    # 450 -> bucket 256 -> tactic 0
+    # 600 -> bucket 512 -> tactic 2
     test_cases = [
         (150, 1),
         (350, 0),
