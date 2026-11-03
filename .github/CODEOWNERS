@@ -26,6 +26,13 @@ tests/attention/               @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv 
 flashinfer/msa_ops/            @rmhaskarnvidia @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv @jimmyzho @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang @Anerudhan
 tests/msa_ops/                 @rmhaskarnvidia @saltyminty @yzh119 @nv-yunzheq @bkryu @qsang-nv @jimmyzho @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang @Anerudhan
 
+# ── SDSA ──
+docs/design_docs/sdsa_indexer.md    @netanel-haber @amirkl94 @saltyminty @aleozlx @yzh119 @Jingfan-Sun @YangXu1990uiuc @bkryu @Anerudhan
+flashinfer/sdsa/                    @netanel-haber @amirkl94 @saltyminty @aleozlx @yzh119 @Jingfan-Sun @YangXu1990uiuc @bkryu @Anerudhan
+flashinfer/trace/templates/sdsa.py  @netanel-haber @amirkl94 @saltyminty @aleozlx @yzh119 @Jingfan-Sun @YangXu1990uiuc @bkryu @Anerudhan
+tests/sdsa/                         @netanel-haber @amirkl94 @saltyminty @aleozlx @yzh119 @Jingfan-Sun @YangXu1990uiuc @bkryu @Anerudhan
+tests/trace/fi_trace_out/sdsa_*     @netanel-haber @amirkl94 @saltyminty @aleozlx @yzh119 @Jingfan-Sun @YangXu1990uiuc @bkryu @Anerudhan
+
 # ── GEMM ──
 flashinfer/gemm/               @dhiraj113 @yzh119 @aleozlx @bkryu @jiahanc @StudyingShao @Jingfan-Sun @YangXu1990uiuc @jimmyzho @yyihuang @yanqinz2 @Anerudhan
 include/flashinfer/gemm/       @dhiraj113 @yzh119 @aleozlx @bkryu @jiahanc @StudyingShao @Jingfan-Sun @YangXu1990uiuc @jimmyzho @yyihuang @yanqinz2 @Anerudhan
