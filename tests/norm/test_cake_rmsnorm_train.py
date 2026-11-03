@@ -871,7 +871,7 @@ def test_repeated_launches_against_fp64_and_det(
 # (on sm_103a its twosum form) above it; a single kernel also runs from T 1 up
 # to T 22 with FP32 weight on sm_100a and with both weight dtypes on sm_103a,
 # up to T 18 (BF16 weight) and 13 (FP32 weight) on sm_107a, and with BF16
-# weight up to T 896 on sm_100a and from T 320 to 896 on sm_103a.  The plain
+# weight up to T 896 on sm_100a.  The plain
 # edge is the deterministic package's own switch to its compensated pair.  The
 # accuracy edge is T 65536, the top of the qualified range, on
 # sm_100a, T 61952 on sm_103a and T 49152 on sm_107a, for both weight dtypes:
