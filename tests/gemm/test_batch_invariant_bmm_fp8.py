@@ -550,6 +550,73 @@ def test_autotuning_profiles_every_candidate_and_keeps_the_bits(b, N, K, layout)
 
 
 @needs_device
+@pytest.mark.parametrize("N", [24, 40, 136])
+def test_n_a_multiple_of_8_with_a_k_major_weight(N):
+    """The typed checks require N as a multiple of 8 (the output's 16-byte rows) and a multiple of 16 only for an N-major B
+    (its 16-byte rows); the compiled kernel declares the same, so these shapes run (the split class at N = 24 / 40, the
+    unsplit at N = 136) through the one-product and the batched entries, and the N-major layout still raises."""
+    M, K = 16, 4096
+    a, Bk = adv_fp8(M, K, seed=161), weights(1, N, K, 162)[0]
+    sa, sb = scales()
+    out = mm_fp8_batch_invariant(a, Bk, sa, sb)
+    assert out.shape == (M, N) and norm_rel_err(out, a, Bk, sa, sb) <= 2.0**-8
+    batched = bmm_fp8_batch_invariant(a[None], Bk[None], sa, sb, torch.bfloat16)
+    assert torch.equal(bits(batched[0]), bits(out))
+    assert torch.equal(bits(bi_bmm(a[None], Bk[None], sa, sb)), bits(batched))
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match="multiple of 16"):
+        mm_fp8_batch_invariant(a, Bk.contiguous(), sa, sb)
+
+
+@needs_device
+def test_trace_apply_does_not_replace_the_class():
+    """A Trace Apply solution registered for the call's definition name replaces the plain API call (the control); under
+    ``batch_invariant=True`` it must not: the flag fixes the call's dataflow to the class, and the wrapper passes the call
+    through to the operator, whose flag path runs the class."""
+    import flashinfer.trace_apply as ta
+    from flashinfer.trace_apply.apply import (
+        _registry_by_fi_api,
+        bind_namespace,
+        build_extractor_maps,
+        extract_axes,
+    )
+
+    b, M, N, K = 1, 16, 4096, 4096
+    A, B = adv_fp8(b, M, K, seed=171), weights(b, N, K, 172)
+    sa, sb = scales()
+    ref = bits(bi_bmm(A, B, sa, sb)).clone()
+    reg = _registry_by_fi_api()
+    key = next(k for k in reg if k.endswith(".bmm_fp8"))
+    original, templates = reg[key]
+    ns = bind_namespace(original, (A, B, sa, sb, torch.bfloat16), {})
+    name = templates[0].definition_name(
+        extract_axes(build_extractor_maps(templates), ns)
+    )
+    calls: list = []
+
+    def solution(*args, **kwargs):
+        calls.append(1)
+        return torch.full((b, M, N), 2.0, dtype=torch.bfloat16, device="cuda")
+
+    ta.enable_apply({name: solution})
+    try:
+        plain = flashinfer.bmm_fp8(A, B, sa, sb, torch.bfloat16)
+        assert calls and bool(torch.all(plain == 2.0)), (
+            "the control: the solution replaces the plain call"
+        )
+        seen = len(calls)
+        got = flashinfer.bmm_fp8(
+            A, B, sa, sb, torch.bfloat16, backend="auto", batch_invariant=True
+        )
+        assert len(calls) == seen, (
+            "the registered solution ran under batch_invariant=True"
+        )
+        assert torch.equal(bits(got), ref)
+        assert ta.stats().get(key, {}).get("fallback_batch_invariant", 0) >= 1
+    finally:
+        ta.disable_apply()
+
+
+@needs_device
 def test_unsupported_inputs_raise_and_nothing_falls_back():
     A, B = adv_fp8(2, 16, 4096, seed=121), weights(2, 4096, 4096, 122)
     sa, sb = scales()
