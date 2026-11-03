@@ -3,7 +3,9 @@
 """Generate ``lean/BIKernels/Cases.lean`` from the Python side.
 
 For the GEMM classes (bf16 at the ``mma16`` step; e4m3 / e5m2 at the ``mma32`` step with the scaled chain; mxfp8 at the
-``mma32mx`` step and mxfp8_k64 at the ``mma64mx8`` step, the block-scaled steps with the unscaled chain) the file carries
+``mma32mx`` step and mxfp8_k64 at the ``mma64mx8`` step, the block-scaled steps with the unscaled chain; nvfp4 / nvfp4_k128
+at ``mma64bs`` / ``mma128bs`` and mxfp4 / mxfp4_k128 at ``mma64mx`` / ``mma128mx4``, the 4-bit block-scaled steps with the
+alpha chain) the file carries
 
 * the spec terms of both classes of each format at sampled (K, chunks): the *Python spec* (``gemm.spec.GemmSpec``)
   S-expression, with a Lean theorem that the Lean model (``BIK.GEMM.kfold`` / ``kchunk`` and their ``32`` / ``MX8`` /
@@ -45,7 +47,7 @@ from ..gemm.batch_invariant.generator import (
     MainloopBlock,
     enumerate_space,
 )
-from ..gemm.batch_invariant.schedule import chunks_for, default_config
+from ..gemm.batch_invariant.schedule import chunks_for, default_config, fp4_class_for
 from ..gemm.batch_invariant.spec import MMA_K_OF, GemmSpec, reduction
 
 LEAN_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lean")
@@ -133,6 +135,12 @@ MX_CHUNK_EXTRA = [
 DECODE_SHAPE = (8, 4096, 4096, 1)
 #: A split-class shape with two chunks: its block-scaled space holds the in-cluster split records of factor 2.
 C2_SHAPE = (16, 128, 4096, 2)
+#: The 4-bit classes: NVFP4 (``nvfp4``: the sm_100 / sm_103 instruction, 64 elements per step; ``nvfp4_k128``: the sm_107 one)
+#: and MXFP4 (``mxfp4`` / ``mxfp4_k128``), the caller's alpha as the chain's scalar; the K = 64 cases at 4 .. 16 steps.
+GEMM_FP4_CASES = [(256, 1), (512, 1), (1024, 2), (1024, 4)]
+GEMM_FP4_K128_CASES = [(512, 1), (1024, 1), (2048, 2), (2048, 4)]
+GEMM_FP4_OUT_CASES = [(256, "bf16"), (512, "f16"), (256, "f32")]
+GEMM_FP4_K128_OUT_CASES = [(512, "bf16"), (1024, "f16"), (512, "f32")]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -163,10 +171,25 @@ class LeanFormat:
     out_cases: Tuple[Tuple[int, str], ...]
     chunk_extra: Tuple[Tuple[int, int], ...]
     extra_spaces: Tuple[Tuple[str, Tuple[int, int, int, int], str, str, str], ...] = ()
+    class_rule: Optional[str] = (
+        None  # the Lean class rule the format's shape table checks (the sm_107 NVFP4 class)
+    )
 
     @property
     def mk(self) -> int:
         return MMA_K_OF[self.in_fmt]
+
+    @property
+    def step(self) -> str:
+        return STEP_OF_P[self.p]
+
+    @property
+    def elem(self) -> str:
+        """The Lean chain applied to a fold: ``outputElem false`` (bf16, the MXFP8 classes), ``outputElem true`` (the fp8
+        classes) or ``outputElemAlpha`` (the 4-bit classes)."""
+        if self.p in ("BS", "BS128", "MX4", "MX4K128"):
+            return "outputElemAlpha"
+        return f"outputElem {'true' if self.scaled else 'false'}"
 
     def chain_head(self, fmt: str) -> str:
         """``outputKfold{p} "<fmt>"``: the class's chain (the bf16 definition takes the ``scaled`` flag)."""
@@ -191,6 +214,18 @@ class LeanFormat:
         names += [f"{self.th}_space_{sfx.lower()}_ok" for sfx, *_ in self.extra_spaces]
         return tuple(names)
 
+
+STEP_OF_P = {
+    "": "mma16",
+    "32": "mma32",
+    "MX8": "mma32mx",
+    "MX8K64": "mma64mx8",
+    "BS": "mma64bs",
+    "BS128": "mma128bs",
+    "MX4": "mma64mx",
+    "MX4K128": "mma128mx4",
+}
+CHUNK_SUFFIX = {"": "", "32": "_fp8", "MX8": "_mx", "BS": "_fp4", "BS128": "_fp4k128"}
 
 _MX_EXTRA = (
     (
@@ -292,6 +327,91 @@ FORMATS: Tuple[LeanFormat, ...] = (
         tuple(MX_CHUNK_EXTRA),
         _MX_EXTRA,
     ),
+    LeanFormat(
+        "nvfp4",
+        "BS",
+        "gemmbs",
+        "gemm_nvfp4",
+        "gemmNvfp4Space",
+        "gemmNvfp4Dispatch",
+        "ConfigOKNvfp4",
+        "gemmMainloopInnerNvfp4",
+        "chunksForFp4",
+        "chunkTableFp4",
+        "chunksfp4",
+        True,
+        ("k",),
+        None,
+        tuple(GEMM_FP4_CASES),
+        tuple(GEMM_MX_LOOP_CASES),
+        tuple(GEMM_FP4_OUT_CASES),
+        tuple(MX_CHUNK_EXTRA),
+        _MX_EXTRA,
+    ),
+    LeanFormat(
+        "nvfp4_k128",
+        "BS128",
+        "gemmbs128",
+        "gemm_nvfp4k128",
+        "gemmNvfp4K128Space",
+        "gemmNvfp4K128Dispatch",
+        "ConfigOKNvfp4K128",
+        "gemmMainloopInnerNvfp4K128",
+        "chunksForFp4K128",
+        "chunkTableFp4K128",
+        "chunksfp4k128",
+        True,
+        ("k",),
+        ("sm_107",),
+        tuple(GEMM_FP4_K128_CASES),
+        tuple(GEMM_MX_LOOP_CASES),
+        tuple(GEMM_FP4_K128_OUT_CASES),
+        tuple(MX_CHUNK_EXTRA),
+        _MX_EXTRA,
+        "fp4ClassK128",
+    ),
+    LeanFormat(
+        "mxfp4",
+        "MX4",
+        "gemmmx4",
+        "gemm_mx4",
+        "gemmMx4Space",
+        "gemmMx4Dispatch",
+        "ConfigOKMx4",
+        "gemmMainloopInnerMx4",
+        "chunksForMx",
+        None,
+        "chunksmx",
+        True,
+        ("k",),
+        ("sm_100", "sm_103"),
+        tuple(GEMM_FP4_CASES),
+        tuple(GEMM_MX_LOOP_CASES),
+        tuple(GEMM_FP4_OUT_CASES),
+        tuple(MX_CHUNK_EXTRA),
+        _MX_EXTRA,
+    ),
+    LeanFormat(
+        "mxfp4_k128",
+        "MX4K128",
+        "gemmmx4k128",
+        "gemm_mx4k128",
+        "gemmMx4K128Space",
+        "gemmMx4K128Dispatch",
+        "ConfigOKMx4K128",
+        "gemmMainloopInnerMx4K128",
+        "chunksForMx",
+        None,
+        "chunksmx",
+        True,
+        ("k",),
+        ("sm_107",),
+        tuple(GEMM_FP4_K128_CASES),
+        tuple(GEMM_MX_LOOP_CASES),
+        tuple(GEMM_FP4_K128_OUT_CASES),
+        tuple(MX_CHUNK_EXTRA),
+        _MX_EXTRA,
+    ),
 )
 BY_FMT: Dict[str, LeanFormat] = {F.in_fmt: F for F in FORMATS}
 #: The generated theorems closed by ``native_decide`` (the exhaustive checks over the configuration spaces); every
@@ -348,6 +468,13 @@ def bias_cases() -> List[Tuple[int, int, str]]:
 def chunk_table(in_fmt: str = "bf16") -> List[Tuple[int, int, int]]:
     shapes = CHUNK_TABLE_SHAPES + list(BY_FMT[in_fmt].chunk_extra)
     return [(N, K, chunks_for(N, K, in_fmt)) for N, K in shapes]
+
+
+def class_table() -> List[Tuple[int, int, bool]]:
+    """``(N, K, k128)``: whether the sm_107 parts run the NVFP4 weight shape at the sm_107 instruction's class
+    (`schedule.fp4_class_for`), over the chunk-table shapes; Lean's ``fp4ClassK128`` re-derives it."""
+    shapes = CHUNK_TABLE_SHAPES + list(MX_CHUNK_EXTRA)
+    return [(N, K, fp4_class_for(N, K, "sm_107") == "nvfp4_k128") for N, K in shapes]
 
 
 def spaces(in_fmt: str = "bf16") -> Tuple[List[Knobs], List[Knobs]]:
@@ -424,17 +551,21 @@ def _render_format(L: List[str], F: LeanFormat) -> None:
     """The cases of one format."""
     in_fmt, p, tag, th, sp, ok = F.in_fmt, F.p, F.tag, F.th, F.sp, F.ok
     kfold, loop = f"kfold{p}", f"kblockLoop{p}"
-    scaled = "true" if F.scaled else "false"
     mk = F.mk
-    step = {"": "mma16", "32": "mma32", "MX8": "mma32mx", "MX8K64": "mma64mx8"}[p]
+    step = F.step
+    chain_doc = (
+        ", the alpha chain"
+        if F.elem == "outputElemAlpha"
+        else (", the scaled chain" if F.scaled else "")
+    )
     L.append(
         f"/-! The spec terms of the two {in_fmt} classes (`gemm/spec.py` vs `GEMM.lean`, the `{step}` step"
-        + (", the scaled chain" if F.scaled else "")
+        + chain_doc
         + "): the Python spec's output element, reproduced by the Lean model node for node. -/"
     )
     for i, (K, C, sx) in enumerate(spec_cases(in_fmt)):
         L.append(
-            f'theorem {tag}{i}_spec : (outputElem {scaled} "bf16" ({F.fold_term(K // mk, C)})).sexpr = {lean_str(sx)} := by decide  -- K={K} C={C}'
+            f'theorem {tag}{i}_spec : ({F.elem} "bf16" ({F.fold_term(K // mk, C)})).sexpr = {lean_str(sx)} := by decide  -- K={K} C={C}'
         )
     L.append(
         f"def {tag}Cases : List (Nat × Nat) := ["
@@ -467,7 +598,11 @@ def _render_format(L: List[str], F: LeanFormat) -> None:
     L.append("")
     L.append(
         f"/-! The {in_fmt} epilogue chain (`spec.output_elem`"
-        + (", `mul.rn alpha` then the conversion" if F.scaled else "")
+        + (
+            ", `mul.rn alpha` (the given scalar) then the conversion"
+            if F.elem == "outputElemAlpha"
+            else (", `mul.rn alpha` then the conversion" if F.scaled else "")
+        )
         + f"): `outputKfold{p}` against the Python spec's output term per output format. -/"
     )
     for i, (K, fmt, sx) in enumerate(out_cases(in_fmt)):
@@ -489,9 +624,25 @@ def _render_format(L: List[str], F: LeanFormat) -> None:
             + ", ".join(f"({N}, {K}, {C})" for N, K, C in chunk_table(in_fmt))
             + "]"
         )
-        suffix = {"": "", "32": "_fp8", "MX8": "_mx"}[p]
+        suffix = CHUNK_SUFFIX[p]
         L.append(
             f"theorem chunk_rule_matches{suffix} : {F.table}.all (fun ⟨N, K, C⟩ => {F.rule} N K == C) = true := by decide"
+        )
+        L.append("")
+    if F.class_rule is not None:
+        L.append(
+            f"/-- The sm_107 parts' NVFP4 class per weight shape (`schedule.fp4_class_for`: true = the sm_107 instruction's class); "
+            f"Lean's `{F.class_rule}` re-derives it. -/"
+        )
+        L.append(
+            "def fp4ClassTable : List (Nat × Nat × Bool) := ["
+            + ", ".join(
+                f"({N}, {K}, {'true' if b else 'false'})" for N, K, b in class_table()
+            )
+            + "]"
+        )
+        L.append(
+            f"theorem fp4_class_rule_matches : fp4ClassTable.all (fun ⟨N, K, b⟩ => {F.class_rule} N K == b) = true := by decide"
         )
         L.append("")
     space, spacec = spaces(in_fmt)

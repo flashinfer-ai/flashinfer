@@ -25,7 +25,15 @@ def decidedTheorems : List Name :=
    ``BIK.gemm_mx8_space_ok, ``BIK.gemm_mx8_space_c4_ok, ``BIK.gemm_mx8_space_c4_cta_twins, ``BIK.gemm_mx8_dispatch_in_space,
    ``BIK.gemm_mx8_space_decode_ok, ``BIK.gemm_mx8_space_c2_ok,
    ``BIK.gemm_mx8k64_space_ok, ``BIK.gemm_mx8k64_space_c4_ok, ``BIK.gemm_mx8k64_space_c4_cta_twins, ``BIK.gemm_mx8k64_dispatch_in_space,
-   ``BIK.gemm_mx8k64_space_decode_ok, ``BIK.gemm_mx8k64_space_c2_ok]
+   ``BIK.gemm_mx8k64_space_decode_ok, ``BIK.gemm_mx8k64_space_c2_ok,
+   ``BIK.gemm_nvfp4_space_ok, ``BIK.gemm_nvfp4_space_c4_ok, ``BIK.gemm_nvfp4_space_c4_cta_twins, ``BIK.gemm_nvfp4_dispatch_in_space,
+   ``BIK.gemm_nvfp4_space_decode_ok, ``BIK.gemm_nvfp4_space_c2_ok,
+   ``BIK.gemm_nvfp4k128_space_ok, ``BIK.gemm_nvfp4k128_space_c4_ok, ``BIK.gemm_nvfp4k128_space_c4_cta_twins, ``BIK.gemm_nvfp4k128_dispatch_in_space,
+   ``BIK.gemm_nvfp4k128_space_decode_ok, ``BIK.gemm_nvfp4k128_space_c2_ok,
+   ``BIK.gemm_mx4_space_ok, ``BIK.gemm_mx4_space_c4_ok, ``BIK.gemm_mx4_space_c4_cta_twins, ``BIK.gemm_mx4_dispatch_in_space,
+   ``BIK.gemm_mx4_space_decode_ok, ``BIK.gemm_mx4_space_c2_ok,
+   ``BIK.gemm_mx4k128_space_ok, ``BIK.gemm_mx4k128_space_c4_ok, ``BIK.gemm_mx4k128_space_c4_cta_twins, ``BIK.gemm_mx4k128_dispatch_in_space,
+   ``BIK.gemm_mx4k128_space_decode_ok, ``BIK.gemm_mx4k128_space_c2_ok]
 def moduleOf (env : Environment) (n : Name) : Option Name :=
   match env.getModuleIdxFor? n with
   | some idx => env.header.moduleNames[idx.toNat]?

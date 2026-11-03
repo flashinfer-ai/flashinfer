@@ -29,6 +29,7 @@ from typing import List, Tuple
 
 from ...batch_invariant import canon
 from .spec import (
+    ALPHA_GIVEN,
     BLOCK_SCALED,
     ELEM_BITS_OF,
     MMA_K_OF,
@@ -84,6 +85,10 @@ CTA_CHUNKS_MAX_TN = {
     "e5m2": 256,
     "mxfp8": 192,
     "mxfp8_k64": 256,
+    "nvfp4": 192,
+    "nvfp4_k128": 256,
+    "mxfp4": 192,
+    "mxfp4_k128": 256,
 }
 #: The block-scaled instruction fixes MMA M at 128 (1-CTA) / 256 (2-CTA): its scale-factor atom spans 128 rows, so no
 #: 64-row CTA tile exists; tile N below 64 would need sub-tile scale-factor addressing; a scale-factor tile multicasts to
@@ -103,12 +108,15 @@ MAX_TILE_N_CLUSTER_K = {2: 128, 4: 64}
 #: multicast), no in-cluster split.
 TILES_N_NARROW = (8, 16, 32)
 SWAP_WIDE_TILE_N = 64
+#: The 64-wide swapped token tile exists for the UE8M0 classes (their scale-factor atom covers the tile's K extent of one stage);
+#: the NVFP4 classes keep the narrow token tiles only.
+SWAP_WIDE_FMTS = ("mxfp8", "mxfp8_k64", "mxfp4", "mxfp4_k128")
 #: B-reuse (the sm_107 instructions only): a 512-row tiler on the 2-CTA 256-row instruction; each CTA pair issues two
 #: instructions per K step on the two halves of the tile, the B fragment loaded into the collector buffer by the first and
 #: consumed by the second: half the B smem traffic per MMA. One accumulator per half, the same K steps in order from +0:
 #: a placement of the class. Dense records only (no swap, no in-cluster split, no in-CTA chunk fold).
 TILE_M_BREUSE = 512
-BREUSE_FMTS = ("mxfp8_k64",)
+BREUSE_FMTS = ("nvfp4_k128", "mxfp8_k64", "mxfp4_k128")
 
 
 @dataclass(frozen=True)
@@ -201,7 +209,9 @@ class Knobs:
                     and self.cluster_k == 1
                     and (
                         (self.tile_n in TILES_N_NARROW and not two)
-                        or self.tile_n == SWAP_WIDE_TILE_N
+                        or (
+                            self.tile_n == SWAP_WIDE_TILE_N and in_fmt in SWAP_WIDE_FMTS
+                        )
                     )
                 )
             else:
@@ -249,9 +259,16 @@ class Knobs:
     def instruction(self, in_fmt: str = "bf16") -> str:
         """The MMA instruction variant these knobs select for the format: the A2 assumption surface."""
         if in_fmt in BLOCK_SCALED:
-            kind = "kind::mxf8f6f4.block_scale"
+            kind = {
+                "mxfp8": "kind::mxf8f6f4.block_scale",
+                "mxfp8_k64": "kind::mxf8f6f4.block_scale",
+                "nvfp4": "kind::mxf4nvf4.block_scale",
+                "nvfp4_k128": "kind::mxf4nvf4.block_scale",
+                "mxfp4": "kind::mxf4.block_scale",
+                "mxfp4_k128": "kind::mxf4nvf4.block_scale",
+            }[in_fmt]
             sf = f" sf={SF_FMT[in_fmt]}/{SF_VEC[in_fmt]}"
-            arch = " (sm_107a)" if in_fmt in ("mxfp8_k64",) else ""
+            arch = " (sm_107a)" if in_fmt.endswith(("_k64", "_k128")) else ""
             breuse = (
                 " x2 b-reuse (FILL/LASTUSE)"
                 if self.b_reuse and in_fmt in BREUSE_FMTS
@@ -497,5 +514,13 @@ class GemmKernelPlan:
             f"{self.knobs.describe()} | {self.block.op} x{self.block.steps(self.K)}"
             + (f" in {self.chunks} chunks" if self.chunks > 1 else "")
             + f" | {self.epilogue.describe()}"
-            + (" | alpha = mul.rn(a_scale, b_scale)" if is_scaled(self.in_fmt) else "")
+            + (
+                (
+                    " | alpha = the given scalar"
+                    if self.in_fmt in ALPHA_GIVEN
+                    else " | alpha = mul.rn(a_scale, b_scale)"
+                )
+                if is_scaled(self.in_fmt)
+                else ""
+            )
         )

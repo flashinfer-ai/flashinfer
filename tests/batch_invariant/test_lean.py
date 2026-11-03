@@ -110,7 +110,7 @@ def test_lean_model_matches_python_engine_and_spec():
     assert r.returncode == 0, (r.stdout + r.stderr)[-4000:]
     r = _lake("exe", "conformance", timeout=600)
     assert r.returncode == 0, r.stderr[-2000:]
-    kinds = {"gemmbias": "spec"}
+    kinds = {"gemmbias": "spec", "fp4class": "fp4class"}
     for F in lean_cases.FORMATS:
         kinds[F.tag] = "spec"
         kinds[F.tag + "loop"] = "loop"
@@ -133,6 +133,9 @@ def test_lean_model_matches_python_engine_and_spec():
         elif kind == "chunks":
             _, N, K, C = line.split(" ")
             lean[(tag, int(N), int(K))] = int(C)
+        elif kind == "fp4class":
+            _, N, K, b = line.split(" ")
+            lean[("fp4class", int(N), int(K))] = bool(int(b))
         else:
             raise AssertionError(f"unexpected conformance line: {line[:80]}")
     checked = 0
@@ -153,6 +156,10 @@ def test_lean_model_matches_python_engine_and_spec():
             assert lean[(F.chunk_tag, N, K)] == C, (in_fmt, N, K)
             if F.table is not None:
                 checked += 1
+    # the sm_107 NVFP4 class rule
+    for N, K, b in lean_cases.class_table():
+        assert lean[("fp4class", N, K)] == b, (N, K)
+        checked += 1
     # the biased chain of the bf16 classes
     for K, C, sx in lean_cases.bias_cases():
         assert lean[("gemmbias", K // MMA_K, C)] == sx, (K, C)

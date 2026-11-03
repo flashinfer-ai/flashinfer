@@ -18,7 +18,8 @@ states exactly what the proofs claim about that space and where the single hardw
 Everything is stated for the opaque primitive of the class: `mma16` (bf16) and, through the same definitions at any
 step (`tileResultG`), `mma32` (the fp8 classes, whose knob constraints `ConfigOKFp8` lack the 8-wide tile) and
 `mma32mx` / `mma64mx8` (the MXFP8 classes, whose knob constraints `ConfigOKMx8` / `ConfigOKMx8K64` are the block-scaled
-instruction's). The hardware hypothesis is that every MMA instruction variant the space selects (`tm ∈ {64,128}` 1-CTA,
+instruction's) and `mma64bs` / `mma128bs` / `mma64mx` / `mma128mx4` (the NVFP4 and MXFP4 classes, `ConfigOKNvfp4` /
+`ConfigOKNvfp4K128` / `ConfigOKMx4` / `ConfigOKMx4K128`). The hardware hypothesis is that every MMA instruction variant the space selects (`tm ∈ {64,128}` 1-CTA,
 `{128,256}` 2-CTA, `tn ∈ 32..256` and the decode tiles; for the block-scaled classes also the swapped operand order of
 the decode records and the B-reuse pair of the sm_107 class) is the same per-element function of its primitive. No Lean
 statement can discharge it; the GPU test `test_config_agreement` checks the dispatcher's candidates bit for bit against
@@ -76,26 +77,33 @@ dims of at most 4 (a scale-factor tile multicasts to at most 4 CTAs), at most 16
 swizzle 1/2/4/8; MMA M 128 (1-CTA) / 256 (2-CTA) -- the scale-factor atom spans 128 rows -- or, where `breuse`, the
 512-row B-reuse tiler on the 2-CTA instruction (two instructions per K step on the tile's halves sharing one B fragment,
 dense records only); tile N 64 / 128 / 192 / 256, or for the swapped decode record (`swapAb`: no N cluster, no in-cluster
-split) the narrow token tiles 8 / 16 / 32 on the 1-CTA instruction or the 64-wide one on either; the in-cluster split
-`clusterK` 2 / 4 on a 1-CTA (1, 1) cluster with tile N at most 128 / 64 (the mailbox); the in-CTA chunk fold under
-`maxTn`. The generated `gemm_mx8_space_ok` / `gemm_mx8k64_space_ok` check every emitted record against it. -/
-def ConfigOKBlockScaled (breuse : Bool) (maxTn : Nat) (c : Config) : Bool :=
+split) the narrow token tiles 8 / 16 / 32 on the 1-CTA instruction or, where `wideSwap` (the UE8M0 formats), the 64-wide one
+on either; the in-cluster split `clusterK` 2 / 4 on a 1-CTA (1, 1) cluster with tile N at most 128 / 64 (the mailbox); the
+in-CTA chunk fold under `maxTn`. The generated `gemm_*_space_ok` theorems check every emitted record against it. -/
+def ConfigOKBlockScaled (breuse wideSwap : Bool) (maxTn : Nat) (c : Config) : Bool :=
   (c.clusterM == 1 || c.clusterM == 2 || c.clusterM == 4) && (c.clusterN == 1 || c.clusterN == 2 || c.clusterN == 4) &&
   (c.clusterM * c.clusterN ≤ 16) && (!c.twoCta || c.clusterM % 2 == 0) &&
   (c.swizzle == 1 || c.swizzle == 2 || c.swizzle == 4 || c.swizzle == 8) &&
   ((if c.twoCta then c.tm == 256 else c.tm == 128) || (breuse && c.tm == 512 && c.twoCta && !c.swapAb && c.clusterK == 1)) &&
   (c.clusterK == 1 || c.clusterK == 2 || c.clusterK == 4) &&
   (if c.swapAb then
-      c.clusterN == 1 && c.clusterK == 1 && (((c.tn == 8 || c.tn == 16 || c.tn == 32) && !c.twoCta) || c.tn == 64)
+      c.clusterN == 1 && c.clusterK == 1 && (((c.tn == 8 || c.tn == 16 || c.tn == 32) && !c.twoCta) || (wideSwap && c.tn == 64))
     else (c.tn == 64 || c.tn == 128 || c.tn == 192 || c.tn == 256)) &&
   (c.clusterK == 1 || (c.clusterM == 1 && c.clusterN == 1 && !c.twoCta && c.tn ≤ (if c.clusterK == 4 then 64 else 128))) &&
   CtaChunksOK maxTn c
 
 /-- `gemm.mxfp8.*` (the sm_100 / sm_103 instruction): no B-reuse, the in-CTA chunk fold up to tile N 192. -/
-def ConfigOKMx8 (c : Config) : Bool := ConfigOKBlockScaled false 192 c
+def ConfigOKMx8 (c : Config) : Bool := ConfigOKBlockScaled false true 192 c
 
 /-- `gemm.mxfp8.*64` (the sm_107 instruction): the B-reuse records, the in-CTA chunk fold at every tile N. -/
-def ConfigOKMx8K64 (c : Config) : Bool := ConfigOKBlockScaled true 256 c
+def ConfigOKMx8K64 (c : Config) : Bool := ConfigOKBlockScaled true true 256 c
+
+/-- The NVFP4 classes (e4m3 scales per 16: the narrow token tiles only) and the MXFP4 classes (UE8M0 scales per 32: the 64-wide
+token tile too), each at its instruction's TMEM budget and, on the sm_107 instruction, with the B-reuse records. -/
+def ConfigOKNvfp4 (c : Config) : Bool := ConfigOKBlockScaled false false 192 c
+def ConfigOKNvfp4K128 (c : Config) : Bool := ConfigOKBlockScaled true false 256 c
+def ConfigOKMx4 (c : Config) : Bool := ConfigOKBlockScaled false true 192 c
+def ConfigOKMx4K128 (c : Config) : Bool := ConfigOKBlockScaled true true 256 c
 
 /-- The in-CTA chunk fold (`ctaChunks`, `gemm/blocks/epilogue.py`) is the split kernel with the CONSTANT assignment
 of every chunk to one CTA: that CTA computes each chunk's partial from +0 in turn (the mainloop's fold per chunk) and
@@ -136,6 +144,43 @@ theorem ctaSplitMX8K64_eq_kchunkMX8K64 (a : RowData) (b : ColData) (C kc : Nat) 
 theorem clusterSplitMX8K64_eq_kchunkMX8K64 (a : RowData) (b : ColData) (C kc : Nat) :
     clusterSplitMX8K64 a b C kc = kchunkMX8K64 a b C kc :=
   splitKernelMX8K64_eq_kchunkMX8K64 a b C kc _
+
+/-- The 4-bit classes' three implementations of one `C` are one term too (the same bodies as the MXFP8 classes'). -/
+def ctaSplitBS (a : RowData) (b : ColData) (C kc : Nat) : GTerm := splitKernelBS a b C kc (fun _ => 0)
+def clusterSplitBS (a : RowData) (b : ColData) (C kc : Nat) : GTerm := splitKernelBS a b C kc (fun c => c)
+
+theorem ctaSplitBS_eq_kchunkBS (a : RowData) (b : ColData) (C kc : Nat) : ctaSplitBS a b C kc = kchunkBS a b C kc :=
+  splitKernelBS_eq_kchunkBS a b C kc _
+
+theorem clusterSplitBS_eq_kchunkBS (a : RowData) (b : ColData) (C kc : Nat) : clusterSplitBS a b C kc = kchunkBS a b C kc :=
+  splitKernelBS_eq_kchunkBS a b C kc _
+
+def ctaSplitBS128 (a : RowData) (b : ColData) (C kc : Nat) : GTerm := splitKernelBS128 a b C kc (fun _ => 0)
+def clusterSplitBS128 (a : RowData) (b : ColData) (C kc : Nat) : GTerm := splitKernelBS128 a b C kc (fun c => c)
+
+theorem ctaSplitBS128_eq_kchunkBS128 (a : RowData) (b : ColData) (C kc : Nat) : ctaSplitBS128 a b C kc = kchunkBS128 a b C kc :=
+  splitKernelBS128_eq_kchunkBS128 a b C kc _
+
+theorem clusterSplitBS128_eq_kchunkBS128 (a : RowData) (b : ColData) (C kc : Nat) : clusterSplitBS128 a b C kc = kchunkBS128 a b C kc :=
+  splitKernelBS128_eq_kchunkBS128 a b C kc _
+
+def ctaSplitMX4 (a : RowData) (b : ColData) (C kc : Nat) : GTerm := splitKernelMX4 a b C kc (fun _ => 0)
+def clusterSplitMX4 (a : RowData) (b : ColData) (C kc : Nat) : GTerm := splitKernelMX4 a b C kc (fun c => c)
+
+theorem ctaSplitMX4_eq_kchunkMX4 (a : RowData) (b : ColData) (C kc : Nat) : ctaSplitMX4 a b C kc = kchunkMX4 a b C kc :=
+  splitKernelMX4_eq_kchunkMX4 a b C kc _
+
+theorem clusterSplitMX4_eq_kchunkMX4 (a : RowData) (b : ColData) (C kc : Nat) : clusterSplitMX4 a b C kc = kchunkMX4 a b C kc :=
+  splitKernelMX4_eq_kchunkMX4 a b C kc _
+
+def ctaSplitMX4K128 (a : RowData) (b : ColData) (C kc : Nat) : GTerm := splitKernelMX4K128 a b C kc (fun _ => 0)
+def clusterSplitMX4K128 (a : RowData) (b : ColData) (C kc : Nat) : GTerm := splitKernelMX4K128 a b C kc (fun c => c)
+
+theorem ctaSplitMX4K128_eq_kchunkMX4K128 (a : RowData) (b : ColData) (C kc : Nat) : ctaSplitMX4K128 a b C kc = kchunkMX4K128 a b C kc :=
+  splitKernelMX4K128_eq_kchunkMX4K128 a b C kc _
+
+theorem clusterSplitMX4K128_eq_kchunkMX4K128 (a : RowData) (b : ColData) (C kc : Nat) : clusterSplitMX4K128 a b C kc = kchunkMX4K128 a b C kc :=
+  splitKernelMX4K128_eq_kchunkMX4K128 a b C kc _
 
 /-- `foldSteps` splits anywhere: `m + n` steps from `t0` are `m` steps, then `n` from `t0 + m`. -/
 theorem foldSteps_add (a : RowData) (b : ColData) (acc : GTerm) (t0 m n : Nat) :
@@ -229,6 +274,36 @@ def kblockLoopMX8K64 (a : RowData) (b : ColData) (kb S : Nat) (acc : GTerm) (nbl
 theorem kblockLoopMX8K64_eq_kfoldMX8K64 (a : RowData) (b : ColData) (kb S nblk : Nat) :
     kblockLoopMX8K64 a b kb S .zero nblk = kfoldMX8K64 a b (nblk * kb) :=
   kblockLoopG_eq_kfoldG GTerm.mma64mx8 a b kb S nblk
+
+/-- The block-scaled mainloops at the 4-bit steps (radix 4 per 128-byte stage at the sm_100 / sm_103 instructions, 2 at the
+sm_107 ones). -/
+def kblockLoopBS (a : RowData) (b : ColData) (kb S : Nat) (acc : GTerm) (nblk : Nat) : GTerm :=
+  kblockLoopG GTerm.mma64bs a b kb S acc nblk
+
+theorem kblockLoopBS_eq_kfoldBS (a : RowData) (b : ColData) (kb S nblk : Nat) :
+    kblockLoopBS a b kb S .zero nblk = kfoldBS a b (nblk * kb) :=
+  kblockLoopG_eq_kfoldG GTerm.mma64bs a b kb S nblk
+
+def kblockLoopBS128 (a : RowData) (b : ColData) (kb S : Nat) (acc : GTerm) (nblk : Nat) : GTerm :=
+  kblockLoopG GTerm.mma128bs a b kb S acc nblk
+
+theorem kblockLoopBS128_eq_kfoldBS128 (a : RowData) (b : ColData) (kb S nblk : Nat) :
+    kblockLoopBS128 a b kb S .zero nblk = kfoldBS128 a b (nblk * kb) :=
+  kblockLoopG_eq_kfoldG GTerm.mma128bs a b kb S nblk
+
+def kblockLoopMX4 (a : RowData) (b : ColData) (kb S : Nat) (acc : GTerm) (nblk : Nat) : GTerm :=
+  kblockLoopG GTerm.mma64mx a b kb S acc nblk
+
+theorem kblockLoopMX4_eq_kfoldMX4 (a : RowData) (b : ColData) (kb S nblk : Nat) :
+    kblockLoopMX4 a b kb S .zero nblk = kfoldMX4 a b (nblk * kb) :=
+  kblockLoopG_eq_kfoldG GTerm.mma64mx a b kb S nblk
+
+def kblockLoopMX4K128 (a : RowData) (b : ColData) (kb S : Nat) (acc : GTerm) (nblk : Nat) : GTerm :=
+  kblockLoopG GTerm.mma128mx4 a b kb S acc nblk
+
+theorem kblockLoopMX4K128_eq_kfoldMX4K128 (a : RowData) (b : ColData) (kb S nblk : Nat) :
+    kblockLoopMX4K128 a b kb S .zero nblk = kfoldMX4K128 a b (nblk * kb) :=
+  kblockLoopG_eq_kfoldG GTerm.mma128mx4 a b kb S nblk
 
 /-- One output tile under `cfg`: the owning CTA (a function of the config) runs the k-block loop from a reset
 accumulator. `prev` is whatever that CTA's accumulator held from the previous tile of its persistent schedule. -/
@@ -421,5 +496,138 @@ theorem tileResultMX8K64_ne_tileResultMX8 (c₁ c₂ : Config) (S₁ S₂ : Nat)
     tileResultMX8K64 c₁ S₁ p a b 1 1 ≠ tileResultMX8 c₂ S₂ q a b 2 1 := by
   rw [tileResultMX8K64_eq_kfoldMX8K64, tileResultMX8_eq_kfoldMX8]
   exact kfoldMX8K64_ne_kfoldMX8 a b
+
+/-! ## The 4-bit tiles: the same statements at the `mma64bs`, `mma128bs`, `mma64mx` and `mma128mx4` steps, through the alpha chain -/
+
+def tileResultBS (cfg : Config) (S : Nat) (prev : GTerm) (a : RowData) (b : ColData) (kb nblk : Nat) : GTerm :=
+  tileResultG GTerm.mma64bs cfg S prev a b kb nblk
+
+theorem tileResultBS_eq_kfoldBS (cfg : Config) (S : Nat) (p : GTerm) (a : RowData) (b : ColData) (kb nblk : Nat) :
+    tileResultBS cfg S p a b kb nblk = kfoldBS a b (nblk * kb) := tileResultG_eq_kfoldG GTerm.mma64bs cfg S p a b kb nblk
+
+theorem config_invarianceBS (c₁ c₂ : Config) (S₁ S₂ : Nat) (p q : GTerm) (a : RowData) (b : ColData) (kb nblk : Nat) :
+    tileResultBS c₁ S₁ p a b kb nblk = tileResultBS c₂ S₂ q a b kb nblk :=
+  config_invarianceG GTerm.mma64bs c₁ c₂ S₁ S₂ p q a b kb nblk
+
+theorem space_invariantBS (space : List Config) :
+    ∀ c₁ ∈ space, ∀ c₂ ∈ space, ∀ (S₁ S₂ : Nat) (p q : GTerm) (a : RowData) (b : ColData) (kb nblk : Nat),
+      tileResultBS c₁ S₁ p a b kb nblk = tileResultBS c₂ S₂ q a b kb nblk :=
+  fun c₁ _ c₂ _ S₁ S₂ p q a b kb nblk => config_invarianceBS c₁ c₂ S₁ S₂ p q a b kb nblk
+
+theorem tileOutputBS_eq_outputKfoldBS (fmt : String) (cfg : Config) (S : Nat) (p : GTerm)
+    (a : RowData) (b : ColData) (kb nblk : Nat) :
+    outputElemAlpha fmt (tileResultBS cfg S p a b kb nblk) = outputKfoldBS fmt a b (nblk * kb) := by
+  unfold outputKfoldBS; rw [tileResultBS_eq_kfoldBS]
+
+theorem outputBS_config_invariance (fmt : String) (c₁ c₂ : Config) (S₁ S₂ : Nat) (p q : GTerm)
+    (a : RowData) (b : ColData) (kb nblk : Nat) :
+    outputElemAlpha fmt (tileResultBS c₁ S₁ p a b kb nblk) = outputElemAlpha fmt (tileResultBS c₂ S₂ q a b kb nblk) := by
+  rw [config_invarianceBS c₁ c₂ S₁ S₂ p q a b kb nblk]
+
+theorem config_invarianceBS_bits {α : Type} (P : Prims α) (c₁ c₂ : Config) (S₁ S₂ : Nat) (p q : GTerm)
+    (a : RowData) (b : ColData) (kb nblk : Nat) :
+    eval P (tileResultBS c₁ S₁ p a b kb nblk) = eval P (tileResultBS c₂ S₂ q a b kb nblk) := by
+  rw [config_invarianceBS c₁ c₂ S₁ S₂ p q a b kb nblk]
+
+def tileResultBS128 (cfg : Config) (S : Nat) (prev : GTerm) (a : RowData) (b : ColData) (kb nblk : Nat) : GTerm :=
+  tileResultG GTerm.mma128bs cfg S prev a b kb nblk
+
+theorem tileResultBS128_eq_kfoldBS128 (cfg : Config) (S : Nat) (p : GTerm) (a : RowData) (b : ColData) (kb nblk : Nat) :
+    tileResultBS128 cfg S p a b kb nblk = kfoldBS128 a b (nblk * kb) := tileResultG_eq_kfoldG GTerm.mma128bs cfg S p a b kb nblk
+
+theorem config_invarianceBS128 (c₁ c₂ : Config) (S₁ S₂ : Nat) (p q : GTerm) (a : RowData) (b : ColData) (kb nblk : Nat) :
+    tileResultBS128 c₁ S₁ p a b kb nblk = tileResultBS128 c₂ S₂ q a b kb nblk :=
+  config_invarianceG GTerm.mma128bs c₁ c₂ S₁ S₂ p q a b kb nblk
+
+theorem space_invariantBS128 (space : List Config) :
+    ∀ c₁ ∈ space, ∀ c₂ ∈ space, ∀ (S₁ S₂ : Nat) (p q : GTerm) (a : RowData) (b : ColData) (kb nblk : Nat),
+      tileResultBS128 c₁ S₁ p a b kb nblk = tileResultBS128 c₂ S₂ q a b kb nblk :=
+  fun c₁ _ c₂ _ S₁ S₂ p q a b kb nblk => config_invarianceBS128 c₁ c₂ S₁ S₂ p q a b kb nblk
+
+theorem tileOutputBS128_eq_outputKfoldBS128 (fmt : String) (cfg : Config) (S : Nat) (p : GTerm)
+    (a : RowData) (b : ColData) (kb nblk : Nat) :
+    outputElemAlpha fmt (tileResultBS128 cfg S p a b kb nblk) = outputKfoldBS128 fmt a b (nblk * kb) := by
+  unfold outputKfoldBS128; rw [tileResultBS128_eq_kfoldBS128]
+
+theorem outputBS128_config_invariance (fmt : String) (c₁ c₂ : Config) (S₁ S₂ : Nat) (p q : GTerm)
+    (a : RowData) (b : ColData) (kb nblk : Nat) :
+    outputElemAlpha fmt (tileResultBS128 c₁ S₁ p a b kb nblk) = outputElemAlpha fmt (tileResultBS128 c₂ S₂ q a b kb nblk) := by
+  rw [config_invarianceBS128 c₁ c₂ S₁ S₂ p q a b kb nblk]
+
+theorem config_invarianceBS128_bits {α : Type} (P : Prims α) (c₁ c₂ : Config) (S₁ S₂ : Nat) (p q : GTerm)
+    (a : RowData) (b : ColData) (kb nblk : Nat) :
+    eval P (tileResultBS128 c₁ S₁ p a b kb nblk) = eval P (tileResultBS128 c₂ S₂ q a b kb nblk) := by
+  rw [config_invarianceBS128 c₁ c₂ S₁ S₂ p q a b kb nblk]
+
+def tileResultMX4 (cfg : Config) (S : Nat) (prev : GTerm) (a : RowData) (b : ColData) (kb nblk : Nat) : GTerm :=
+  tileResultG GTerm.mma64mx cfg S prev a b kb nblk
+
+theorem tileResultMX4_eq_kfoldMX4 (cfg : Config) (S : Nat) (p : GTerm) (a : RowData) (b : ColData) (kb nblk : Nat) :
+    tileResultMX4 cfg S p a b kb nblk = kfoldMX4 a b (nblk * kb) := tileResultG_eq_kfoldG GTerm.mma64mx cfg S p a b kb nblk
+
+theorem config_invarianceMX4 (c₁ c₂ : Config) (S₁ S₂ : Nat) (p q : GTerm) (a : RowData) (b : ColData) (kb nblk : Nat) :
+    tileResultMX4 c₁ S₁ p a b kb nblk = tileResultMX4 c₂ S₂ q a b kb nblk :=
+  config_invarianceG GTerm.mma64mx c₁ c₂ S₁ S₂ p q a b kb nblk
+
+theorem space_invariantMX4 (space : List Config) :
+    ∀ c₁ ∈ space, ∀ c₂ ∈ space, ∀ (S₁ S₂ : Nat) (p q : GTerm) (a : RowData) (b : ColData) (kb nblk : Nat),
+      tileResultMX4 c₁ S₁ p a b kb nblk = tileResultMX4 c₂ S₂ q a b kb nblk :=
+  fun c₁ _ c₂ _ S₁ S₂ p q a b kb nblk => config_invarianceMX4 c₁ c₂ S₁ S₂ p q a b kb nblk
+
+theorem tileOutputMX4_eq_outputKfoldMX4 (fmt : String) (cfg : Config) (S : Nat) (p : GTerm)
+    (a : RowData) (b : ColData) (kb nblk : Nat) :
+    outputElemAlpha fmt (tileResultMX4 cfg S p a b kb nblk) = outputKfoldMX4 fmt a b (nblk * kb) := by
+  unfold outputKfoldMX4; rw [tileResultMX4_eq_kfoldMX4]
+
+theorem outputMX4_config_invariance (fmt : String) (c₁ c₂ : Config) (S₁ S₂ : Nat) (p q : GTerm)
+    (a : RowData) (b : ColData) (kb nblk : Nat) :
+    outputElemAlpha fmt (tileResultMX4 c₁ S₁ p a b kb nblk) = outputElemAlpha fmt (tileResultMX4 c₂ S₂ q a b kb nblk) := by
+  rw [config_invarianceMX4 c₁ c₂ S₁ S₂ p q a b kb nblk]
+
+theorem config_invarianceMX4_bits {α : Type} (P : Prims α) (c₁ c₂ : Config) (S₁ S₂ : Nat) (p q : GTerm)
+    (a : RowData) (b : ColData) (kb nblk : Nat) :
+    eval P (tileResultMX4 c₁ S₁ p a b kb nblk) = eval P (tileResultMX4 c₂ S₂ q a b kb nblk) := by
+  rw [config_invarianceMX4 c₁ c₂ S₁ S₂ p q a b kb nblk]
+
+def tileResultMX4K128 (cfg : Config) (S : Nat) (prev : GTerm) (a : RowData) (b : ColData) (kb nblk : Nat) : GTerm :=
+  tileResultG GTerm.mma128mx4 cfg S prev a b kb nblk
+
+theorem tileResultMX4K128_eq_kfoldMX4K128 (cfg : Config) (S : Nat) (p : GTerm) (a : RowData) (b : ColData) (kb nblk : Nat) :
+    tileResultMX4K128 cfg S p a b kb nblk = kfoldMX4K128 a b (nblk * kb) := tileResultG_eq_kfoldG GTerm.mma128mx4 cfg S p a b kb nblk
+
+theorem config_invarianceMX4K128 (c₁ c₂ : Config) (S₁ S₂ : Nat) (p q : GTerm) (a : RowData) (b : ColData) (kb nblk : Nat) :
+    tileResultMX4K128 c₁ S₁ p a b kb nblk = tileResultMX4K128 c₂ S₂ q a b kb nblk :=
+  config_invarianceG GTerm.mma128mx4 c₁ c₂ S₁ S₂ p q a b kb nblk
+
+theorem space_invariantMX4K128 (space : List Config) :
+    ∀ c₁ ∈ space, ∀ c₂ ∈ space, ∀ (S₁ S₂ : Nat) (p q : GTerm) (a : RowData) (b : ColData) (kb nblk : Nat),
+      tileResultMX4K128 c₁ S₁ p a b kb nblk = tileResultMX4K128 c₂ S₂ q a b kb nblk :=
+  fun c₁ _ c₂ _ S₁ S₂ p q a b kb nblk => config_invarianceMX4K128 c₁ c₂ S₁ S₂ p q a b kb nblk
+
+theorem tileOutputMX4K128_eq_outputKfoldMX4K128 (fmt : String) (cfg : Config) (S : Nat) (p : GTerm)
+    (a : RowData) (b : ColData) (kb nblk : Nat) :
+    outputElemAlpha fmt (tileResultMX4K128 cfg S p a b kb nblk) = outputKfoldMX4K128 fmt a b (nblk * kb) := by
+  unfold outputKfoldMX4K128; rw [tileResultMX4K128_eq_kfoldMX4K128]
+
+theorem outputMX4K128_config_invariance (fmt : String) (c₁ c₂ : Config) (S₁ S₂ : Nat) (p q : GTerm)
+    (a : RowData) (b : ColData) (kb nblk : Nat) :
+    outputElemAlpha fmt (tileResultMX4K128 c₁ S₁ p a b kb nblk) = outputElemAlpha fmt (tileResultMX4K128 c₂ S₂ q a b kb nblk) := by
+  rw [config_invarianceMX4K128 c₁ c₂ S₁ S₂ p q a b kb nblk]
+
+theorem config_invarianceMX4K128_bits {α : Type} (P : Prims α) (c₁ c₂ : Config) (S₁ S₂ : Nat) (p q : GTerm)
+    (a : RowData) (b : ColData) (kb nblk : Nat) :
+    eval P (tileResultMX4K128 c₁ S₁ p a b kb nblk) = eval P (tileResultMX4K128 c₂ S₂ q a b kb nblk) := by
+  rw [config_invarianceMX4K128 c₁ c₂ S₁ S₂ p q a b kb nblk]
+
+/-- **Two instructions, two classes**, for either 4-bit format (one 128-wide step against two 64-wide ones over the same K). -/
+theorem tileResultBS128_ne_tileResultBS (c₁ c₂ : Config) (S₁ S₂ : Nat) (p q : GTerm) (a : RowData) (b : ColData) :
+    tileResultBS128 c₁ S₁ p a b 1 1 ≠ tileResultBS c₂ S₂ q a b 2 1 := by
+  rw [tileResultBS128_eq_kfoldBS128, tileResultBS_eq_kfoldBS]
+  exact kfoldBS128_ne_kfoldBS a b
+
+theorem tileResultMX4K128_ne_tileResultMX4 (c₁ c₂ : Config) (S₁ S₂ : Nat) (p q : GTerm) (a : RowData) (b : ColData) :
+    tileResultMX4K128 c₁ S₁ p a b 1 1 ≠ tileResultMX4 c₂ S₂ q a b 2 1 := by
+  rw [tileResultMX4K128_eq_kfoldMX4K128, tileResultMX4_eq_kfoldMX4]
+  exact kfoldMX4K128_ne_kfoldMX4 a b
 
 end BIK.GEMM
