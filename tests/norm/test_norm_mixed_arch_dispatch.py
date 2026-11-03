@@ -15,16 +15,42 @@ from flashinfer.norm import _is_arch_compatible, _use_cuda_norm
 
 
 class TestArchCompatibility:
-    """Test the CUDA binary compatibility logic."""
+    """Test the CUDA binary compatibility logic for architecture matching.
+
+    These tests verify that _is_arch_compatible() correctly implements CUDA's
+    forward compatibility rules: a cubin compiled for sm_X.Y can run on sm_X.Z
+    when Z >= Y (same major architecture, target minor version >= captured).
+    """
 
     def test_same_arch_exact_match(self):
-        """Same major and minor should be compatible."""
+        """Verify exact architecture matches are compatible.
+
+        When the captured architecture exactly matches the target device's
+        compute capability, the kernel should be compatible and use the DSL path.
+
+        Test cases:
+        - sm_86 captured, sm_86 device: compatible
+        - sm_89 captured, sm_89 device: compatible
+        - sm_100a captured, sm_100 device: compatible (variant suffix stripped)
+        """
         assert _is_arch_compatible("sm_86", (8, 6))
         assert _is_arch_compatible("sm_89", (8, 9))
         assert _is_arch_compatible("sm_100a", (10, 0))
 
     def test_forward_compatibility_same_major(self):
-        """Forward compatibility: sm_X.Y runs on sm_X.Z when Z >= Y."""
+        """Verify forward compatibility within the same major architecture.
+
+        CUDA allows forward compatibility: a cubin compiled for an older minor
+        version can run on a newer minor version within the same major architecture.
+        However, backward compatibility (running on older minor versions) is not
+        guaranteed.
+
+        Test cases:
+        - sm_86 cubin on sm_89 device: compatible (forward, 8.9 >= 8.6)
+        - sm_89 cubin on sm_86 device: incompatible (backward, 8.6 < 8.9)
+        - sm_100a cubin on sm_103 device: compatible (forward, 10.3 >= 10.0)
+        - sm_103 cubin on sm_100 device: incompatible (backward, 10.0 < 10.3)
+        """
         # sm_86 cubin can run on sm_89 (same major, higher minor)
         assert _is_arch_compatible("sm_86", (8, 9))
         assert not _is_arch_compatible("sm_89", (8, 6))

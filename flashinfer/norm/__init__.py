@@ -192,18 +192,45 @@ def _is_arch_compatible(captured_arch: str, device_cap: tuple[int, int]) -> bool
 
 
 def _use_cuda_norm(device: torch.device) -> bool:
-    """Return ``True`` when the CUDA JIT norm kernels should be used instead
-    of the CuTe DSL ones.
+    """Determine whether to use CUDA JIT norm kernels instead of CuTe DSL.
 
-    Besides the explicit ``FLASHINFER_USE_CUDA_NORM`` opt-in, this covers:
-    1. Devices whose architecture the installed CuTe DSL cannot target (e.g.
-       Rubin/sm_107 against a DSL without ``sm_107a``, unless
-       ``CUTE_DSL_ARCH=sm_100f`` was exported before the process started).
-    2. Mixed-architecture hosts where the DSL's compile target (captured from
-       device 0 at import time) differs from the target device's capability.
+    This function implements the dispatch logic for norm operations, deciding
+    between the CuTe DSL path (default) and the CUDA JIT fallback path.
 
-    The CUDA JIT kernels are functionally equivalent, so norm falls back
-    instead of raising like the DSL-only kernels do."""
+    The CUDA JIT path is selected when:
+    1. ``FLASHINFER_USE_CUDA_NORM=1`` is set (explicit opt-in for debugging)
+    2. The target device's architecture is not supported by the installed CuTe DSL
+       (e.g., Rubin/sm_107 against a DSL without ``sm_107a``, unless
+       ``CUTE_DSL_ARCH=sm_100f`` was exported before the process started)
+    3. Mixed-architecture hosts where the DSL's compile target (captured from
+       device 0 at import time) is not binary-compatible with the target device's
+       compute capability. This prevents ``cudaErrorNoKernelImageForDevice`` errors
+       when the DSL compiled for a different architecture than the target device.
+
+    CUDA binary compatibility rules: a cubin compiled for sm_X.Y can run on
+    sm_X.Z when Z >= Y (forward compatibility within the same major architecture).
+    For example, an sm_86 cubin runs on sm_89, but not vice versa.
+
+    The CUDA JIT kernels are functionally equivalent to the CuTe DSL ones, so
+    norm operations fall back to CUDA JIT instead of raising errors like the
+    DSL-only kernels do.
+
+    Args:
+        device: Target device for norm operation (e.g., ``torch.device("cuda:1")``)
+
+    Returns:
+        ``True`` if CUDA JIT kernels should be used, ``False`` for CuTe DSL path.
+
+    Examples:
+        >>> # Single-architecture host: use DSL path
+        >>> _use_cuda_norm(torch.device("cuda:0"))
+        False
+
+        >>> # Mixed-architecture host (device 0: sm_89, device 1: sm_86)
+        >>> # DSL compiled for sm_89, but launching on sm_86
+        >>> _use_cuda_norm(torch.device("cuda:1"))
+        True
+    """
     if _USE_CUDA_NORM:
         return True
 
