@@ -58,6 +58,12 @@ from ..utils import (
 # Always import gen_norm_module for JIT warmup and CUDA fallback
 from ..jit.norm import gen_norm_module
 
+# Import DSL arch probe for mixed-architecture compatibility check
+try:
+    from ..cute_dsl.availability import _dsl_captured_arch
+except ImportError:
+    _dsl_captured_arch = None
+
 # Use CUDA JIT implementation instead of CuTe DSL (for debugging/fallback)
 # Also fallback to CUDA JIT if nvidia-cutlass-dsl is not installed
 _USE_CUDA_NORM = os.environ.get("FLASHINFER_USE_CUDA_NORM", "0") == "1"
@@ -140,19 +146,82 @@ def _cute_dsl_supports_arch(major: int, minor: int) -> bool:
         return True
 
 
+def _is_arch_compatible(captured_arch: str, device_cap: tuple[int, int]) -> bool:
+    """Check if a captured CUDA architecture can run on a target device using
+    CUDA binary compatibility rules.
+
+    CUDA binary compatibility: a cubin compiled for sm_X.Y can run on sm_X.Z
+    when Z >= Y (forward compatibility within the same major architecture).
+
+    Args:
+        captured_arch: DSL's compile target (e.g., "sm_100a", "sm_89")
+        device_cap: Target device's compute capability (major, minor)
+
+    Returns:
+        True if the captured arch can run on the target device.
+    """
+    # Parse captured arch (e.g., "sm_100a" -> (10, 0), "sm_89" -> (8, 9))
+    if not captured_arch or not captured_arch.startswith("sm_"):
+        return False
+
+    arch_str = captured_arch[3:]  # Remove "sm_" prefix
+    # Remove trailing 'a' or 'f' (architecture variants like sm_100a, sm_100f)
+    arch_str = arch_str.rstrip("af")
+
+    try:
+        if "_" in arch_str:
+            # Format like "100" or "12_0"
+            parts = arch_str.replace("_", " ").split()
+            captured_major = int(parts[0])
+            captured_minor = int(parts[1]) if len(parts) > 1 else 0
+        else:
+            # Format like "89" -> (8, 9)
+            captured_major = int(arch_str[:-1])
+            captured_minor = int(arch_str[-1])
+    except (ValueError, IndexError):
+        return False
+
+    device_major, device_minor = device_cap
+
+    # Same major architecture: forward compatibility (minor >= captured)
+    if captured_major == device_major:
+        return device_minor >= captured_minor
+
+    # Different major architecture: incompatible
+    return False
+
+
 def _use_cuda_norm(device: torch.device) -> bool:
     """Return ``True`` when the CUDA JIT norm kernels should be used instead
     of the CuTe DSL ones.
 
-    Besides the explicit ``FLASHINFER_USE_CUDA_NORM`` opt-in, this covers
-    devices whose architecture the installed CuTe DSL cannot target (e.g.
-    Rubin/sm_107 against a DSL without ``sm_107a``, unless
-    ``CUTE_DSL_ARCH=sm_100f`` was exported before the process started).
+    Besides the explicit ``FLASHINFER_USE_CUDA_NORM`` opt-in, this covers:
+    1. Devices whose architecture the installed CuTe DSL cannot target (e.g.
+       Rubin/sm_107 against a DSL without ``sm_107a``, unless
+       ``CUTE_DSL_ARCH=sm_100f`` was exported before the process started).
+    2. Mixed-architecture hosts where the DSL's compile target (captured from
+       device 0 at import time) differs from the target device's capability.
+
     The CUDA JIT kernels are functionally equivalent, so norm falls back
     instead of raising like the DSL-only kernels do."""
     if _USE_CUDA_NORM:
         return True
-    return not _cute_dsl_supports_arch(*torch.cuda.get_device_capability(device))
+
+    device_cap = torch.cuda.get_device_capability(device)
+
+    # Check if DSL supports the device's architecture at all
+    if not _cute_dsl_supports_arch(*device_cap):
+        return True
+
+    # Check if DSL's captured compile target is compatible with this device
+    # (handles mixed-architecture hosts where device 0 != target device)
+    if _dsl_captured_arch is not None:
+        captured_arch = _dsl_captured_arch()
+        if captured_arch is not None and not _is_arch_compatible(captured_arch, device_cap):
+            # DSL compiled for a different architecture; fall back to CUDA JIT
+            return True
+
+    return False
 
 
 @functools.cache
