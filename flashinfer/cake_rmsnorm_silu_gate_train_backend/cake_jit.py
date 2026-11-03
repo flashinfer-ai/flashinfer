@@ -334,7 +334,7 @@ MODULES: dict[str, dict[str, Any]] = {
     # threads, 16 lanes per row (16-row blocks), launch bounds for 4 CTAs per
     # SM, the packed gate computed before the sum of squares (build {"lanes":
     # 16, "math": "x2_early", "min_blocks": 4, "threads": 256}), one block per
-    # CTA, up to 10 rows per SM.
+    # CTA, up to 12 rows per SM.
     "cake_rmsnorm_silu_gate_train_55ff8a9d0ba6d83285b5": {
         "arches": [
             "sm_100a",
@@ -359,7 +359,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "ffi_entry": "run",
         "grid_rule": {
             "kind": "row_blocks",
-            "max_rows_per_sm": 10,
+            "max_rows_per_sm": 12,
             "rows_per_cta": 16,
         },
         "kernel": "cake_rmsnorm_silu_gate_train_55ff8a9d0ba6d83285b5",

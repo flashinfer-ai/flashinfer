@@ -407,7 +407,8 @@ GRID_KINDS = (
 # ones on sm_103a (glm_intra_v14, glm_intra_v22) and sm_107a (glm_intra_v18, glm_intra_v23), and the S1 fused
 # gradient's builds with the L2 hints off on sm_107a (its rows from 16 heads).  The deterministic copies keep the
 # deterministic package's architectures (the same builds; dqkg_davq / dqkg_int_davq share their programs with the
-# raw class, so they ship on the three though their g rules launch them on sm_100a / sm_103a alone).
+# raw class, so they ship on the three though their g rules launch them on sm_100a / sm_103a alone), and the raw
+# class's two fused gradient builds with the L2 hints off ship on sm_107a alone, as the deterministic package's do.
 RECORD_ARCHES = {
     "glm_intra": ("sm_100a",),
     "glm_intra_v14": ("sm_103a",),
@@ -418,6 +419,8 @@ RECORD_ARCHES = {
     "glm_intra_v23": ("sm_107a",),
     "dqkg_davq_nohint_v24": ("sm_107a",),
     "dqkg_int_davq_nohint_v24": ("sm_107a",),
+    "dqkg_davq_nohint_raw": ("sm_107a",),
+    "dqkg_int_davq_nohint_raw": ("sm_107a",),
 }
 # The deterministic package's records no cell of this package launches: the sm_107a rows from 16 heads (the only
 # rows of the builds with the L2 hints off) run the S1 pair on every backward path of the g mode (their programs ship

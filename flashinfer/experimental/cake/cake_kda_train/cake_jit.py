@@ -6759,7 +6759,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "variant": "int_davq_raw",
     },
     "dqkg_davq_nohint_raw": {
-        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+        "arches": ["sm_107a"],
         "arg_plan": [
             ["buffer", "do_tma"],
             ["buffer", "vn_tma"],
@@ -6839,7 +6839,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "variant": "davq_nohint_raw",
     },
     "dqkg_int_davq_nohint_raw": {
-        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+        "arches": ["sm_107a"],
         "arg_plan": [
             ["buffer", "do_tma"],
             ["buffer", "vn_tma"],

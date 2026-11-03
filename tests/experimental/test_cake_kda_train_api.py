@@ -1061,9 +1061,7 @@ def test_the_pairs_agree_on_every_head_count() -> None:
     fused gradient and the GLM intra program are both S1 records or neither, exactly on the cells of the independent
     table; every g-class record of the pair stages runs on architectures it ships for, and every program of the pair
     stages (the S1 records, the deterministic copies and the raw class, which shares four fused gradient programs
-    with the g class) runs on exactly the architectures it ships for, in g or raw mode, but the raw class's two
-    ``_nohint`` fused gradient programs: copies of the deterministic programs, they ship on the deterministic
-    package's architectures, while their rule (the deterministic one) selects them on sm_107a alone."""
+    with the g class) runs on exactly the architectures it ships for, in g or raw mode."""
     used: dict[str, set] = {}
     raw_used: dict[str, set] = {}
     for arch in cake_jit.ARCHES:
@@ -1143,8 +1141,7 @@ def test_the_pairs_agree_on_every_head_count() -> None:
             name for name in raw_used if cake_jit.MODULES[name]["stage"] == stage
         }, stage
     # every program of the pair stages (the S1 records, the deterministic copies and the raw class) runs on every
-    # architecture it ships for, in one mode or the other: no shipped build of these stages is unreachable but the
-    # deterministic package's own sm_100a / sm_103a builds of its two _nohint fused gradient programs
+    # architecture it ships for, in one mode or the other: no shipped build of these stages is unreachable
     reached = {
         (cake_jit.MODULES[name]["library"], arch)
         for runs in (used, raw_used)
@@ -1158,13 +1155,7 @@ def test_the_pairs_agree_on_every_head_count() -> None:
         for name in cake_jit.records_of_stage(stage, gate)
         for arch in cake_jit.MODULES[name]["arches"]
     }
-    nohint = {
-        (cake_jit.MODULES[name]["library"], arch)
-        for name in ("dqkg_davq_nohint_raw", "dqkg_int_davq_nohint_raw")
-        for arch in ("sm_100a", "sm_103a")
-    }
-    assert nohint <= shipped and not nohint & reached
-    assert reached == shipped - nohint
+    assert reached == shipped
 
 
 def test_the_plan_refuses_a_mixed_pair(monkeypatch) -> None:

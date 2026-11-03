@@ -364,6 +364,8 @@ class _VariantProtocol:
         )._contract()
         native["config"].pop("kernel_variant")
         return {
+            # Earlier outer winners could come from another workload's knobs.
+            "search_version": 2,
             "native": native,
             "timing_boundary": "complete_forward_candidates",
             "variants": variants,
@@ -565,8 +567,7 @@ class _VariantProtocol:
                 )
                 candidate_sets = [knobs_to_try]
                 if knob_record is not None:
-                    # Recheck and time cached knobs at this workload. A bucket
-                    # fallback's old score cannot select the overall winner.
+                    # Remeasure each variant's cached winner before comparing them.
                     candidate_sets.insert(
                         0, [knob_cache._knobs_from_json(knob_record["knobs"])]
                     )
@@ -603,8 +604,7 @@ class _VariantProtocol:
                         else {}
                     )
                     knob_record["profiling_policy"] = measurement
-                # Preserve a reused record's original capacity, live count and
-                # score; measuring one cached choice is not a new knob search.
+                # Remeasuring one cached choice does not replace its search score.
                 inner_records.append(knob_record)
                 candidates.append(
                     {

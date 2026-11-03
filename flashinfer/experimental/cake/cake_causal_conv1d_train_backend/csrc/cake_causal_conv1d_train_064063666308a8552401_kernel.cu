@@ -47,18 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define SMEM_RED_OFF 1024
-#define SMEM_RED_STAGE_BYTES 16384
-#define SMEM_RED_STRIDE 16384
-#define SMEM_REDC_OFF 17408
-#define SMEM_REDC_STAGE_BYTES 16384
-#define SMEM_REDC_STRIDE 16384
-#define SMEM_STAGE_BUF_OFF 33792
-#define SMEM_STAGE_BUF_STAGE_BYTES 32768
-#define SMEM_STAGE_BUF_STRIDE 32768
-#define SMEM_TOTAL 66560
-#define THREADS 128
 #define LAUNCH_MIN_BLOCKS 2
 
 #include <math_constants.h>
@@ -1447,56 +1435,39 @@ kernel_cake_causal_conv1d_train_064063666308a8552401(__nv_bfloat16* __restrict__
         double zd[2];
         zd[0] = zero64;
         zd[1] = zero64;
+        int nw = (lim - ch0) * 4;
         #pragma unroll 1
-        for (int c0_0 = ch0 + tid; c0_0 < ch0 + ct_vec * 8; c0_0 += 256) {
+        for (int k0_2 = 0; k0_2 < ct_vec * 8; k0_2 += 256) {
             #pragma unroll
-            for (int j_6 = 0; j_6 < 2; j_6++) {
-                int cl = c0_0 + 128 * j_6;
-                if (cl < lim) {
-                    long long cl64 = (long long)cl;
+            for (int j_6 = 0; j_6 < 8; j_6++) {
+                int wl = k0_2 * 4 + tid + 128 * j_6;
+                if (wl < nw) {
                     #pragma unroll
                     for (int s_5 = 0; s_5 < 4; s_5++) {
-                        #pragma unroll
-                        for (int e_1 = 0; e_1 < 4; e_1++) {
-                            {
-                                d[(j_6 * 4 + s_5) * 4 + e_1] = *reinterpret_cast<const double*>(dw_acc + (cstride * (long long)s_5 + cl64 * 4 + (long long)e_1));
-                            }
+                        {
+                            d[j_6 * 4 + s_5] = *reinterpret_cast<const double*>(dw_acc + (cstride * (long long)s_5 + (long long)(ch0 * 4 + wl)));
                         }
                     }
                 }
             }
             #pragma unroll
-            for (int j_7 = 0; j_7 < 2; j_7++) {
-                int c = c0_0 + 128 * j_7;
-                if (c < lim) {
-                    long long c64_2 = (long long)c;
-                    long long bi = (long long)C * 4 + c64_2;
+            for (int j_7 = 0; j_7 < 8; j_7++) {
+                int wq = k0_2 * 4 + tid + 128 * j_7;
+                if (wq < nw) {
+                    long long wg = (long long)(ch0 * 4 + wq);
                     #pragma unroll
                     for (int s_6 = 0; s_6 < 4; s_6++) {
-                        reinterpret_cast<int4*>(dw_acc + (cstride * (long long)s_6 + c64_2 * 4))[0] = reinterpret_cast<int4*>(zd)[0];
-                        reinterpret_cast<int4*>(dw_acc + (cstride * (long long)s_6 + c64_2 * 4 + 2))[0] = reinterpret_cast<int4*>(zd)[0];
+                        *reinterpret_cast<unsigned long long*>(dw_acc + (cstride * (long long)s_6 + wg)) = (unsigned long long)((unsigned long long)(zd[(0) + 0]));
                     }
                     #pragma unroll
                     for (int s_7 = 1; s_7 < 4; s_7++) {
-                        #pragma unroll
-                        for (int e_2 = 0; e_2 < 4; e_2++) {
-                            d[j_7 * 4 * 4 + e_2] = d[j_7 * 4 * 4 + e_2] + d[(j_7 * 4 + s_7) * 4 + e_2];
-                        }
+                        d[j_7 * 4] = d[j_7 * 4] + d[j_7 * 4 + s_7];
                     }
-                    #pragma unroll
-                    for (int e_3 = 0; e_3 < 4; e_3++) {
-                        a[4 * j_7 + e_3] = (float)d[j_7 * 4 * 4 + e_3];
-                    }
+                    a[j_7] = (float)d[j_7 * 4];
                     if ((flags & 2) != 0) {
-                        #pragma unroll
-                        for (int e_4 = 0; e_4 < 4; e_4++) {
-                            *(reinterpret_cast<__nv_bfloat16*>(reinterpret_cast<__nv_bfloat16*>(dw)) + (c64_2 * 4 + (long long)e_4)) = (__nv_bfloat16)a[4 * j_7 + e_4];
-                        }
+                        *(reinterpret_cast<__nv_bfloat16*>(reinterpret_cast<__nv_bfloat16*>(dw)) + (wg)) = (__nv_bfloat16)a[j_7];
                     } else {
-                        {
-                            float4 _v4 = make_float4(a[4 * j_7 + 0], a[4 * j_7 + 1], a[4 * j_7 + 2], a[4 * j_7 + 3]);
-                            *reinterpret_cast<float4*>(reinterpret_cast<float*>(dw) + c64_2 * 4) = _v4;
-                        }
+                        *(reinterpret_cast<float*>(reinterpret_cast<float*>(dw)) + (wg)) = a[j_7];
                     }
                 }
             }

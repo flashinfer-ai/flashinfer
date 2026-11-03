@@ -1171,7 +1171,7 @@ def _sm_count() -> int:
 
 # The rows per SM up to which sm_100a and sm_103a run the short forward, and
 # from which each architecture runs the mid and the long forward.
-SHORT_FORWARD_ROWS_PER_SM = 10
+SHORT_FORWARD_ROWS_PER_SM = 12
 MID_FORWARD_ROWS_PER_SM = {"sm_100a": 976, "sm_103a": 976, "sm_107a": 800}
 LONG_FORWARD_ROWS_PER_SM = {"sm_100a": 2400, "sm_103a": 2400, "sm_107a": 1740}
 # Forward inputs around and past the short, the mid and the long forward's
@@ -1262,12 +1262,23 @@ GATE_EDGE_VALUES = [
     float("-inf"),
     float("nan"),
 ]
-# Forward inputs the short forward runs where the architecture routes it.
+# Forward inputs the short forward runs where the architecture routes it, and
+# those at its threshold of 12 rows per SM on 148 SMs (37x48, 253x7, 55x32)
+# and on 152 SMs (38x48, 260x7, 57x32).
 GATE_EDGE_CASES = [
     pytest.param(1, 48, id="1x48"),
     pytest.param(13, 48, id="13x48"),
     pytest.param(30, 48, id="30x48"),
+    pytest.param(31, 48, id="31x48"),
+    pytest.param(33, 48, id="33x48"),
+    pytest.param(37, 48, id="37x48"),
+    pytest.param(38, 48, id="38x48"),
     pytest.param(13, 7, id="13x7"),
+    pytest.param(217, 7, id="217x7"),
+    pytest.param(253, 7, id="253x7"),
+    pytest.param(260, 7, id="260x7"),
+    pytest.param(55, 32, id="55x32"),
+    pytest.param(57, 32, id="57x32"),
 ]
 
 

@@ -135,8 +135,8 @@ rows are provisional; the `cake_jit` docstring lists the edits that return
 them to the deterministic pair.  If the `sm_107a` `S1` rows are rejected, the
 deterministic copies `dqkg_davq` / `dqkg_int_davq` get the `sm_107a` rows
 back, and the deterministic `dqkg_davq_nohint` / `dqkg_int_davq_nohint`
-records ship again (their programs ship on all three architectures already,
-for the raw gate mode).
+records ship again (their programs ship on `sm_107a` already, for the raw gate
+mode).
 
 The raw gate mode has no `S1` pair: its backward runs the deterministic
 package's raw-mode pair on every row (`dqkg_raw`, `dqkg_int_raw`,
@@ -295,7 +295,7 @@ changes:
 | `glm_intra`, `glm_intra_v14`, `glm_intra_v18` | the same programs; rules narrowed to the deterministic-pair rows |
 | `dqkg_davq_nohint`, `dqkg_int_davq_nohint` | not shipped (`sm_107a` runs the `S1` pairs from 16 heads); their programs ship as `dqkg_davq_nohint_raw` / `dqkg_int_davq_nohint_raw` |
 | `fwd_intra_raw`, `fwd_intra_v14_raw`, `bwd_prep_g8_raw`, `bwd_prep_g8_replay_raw`, `bwd_prep_g8_noqg_raw`, `bwd_prep_g8_noqg_nokb_raw`, `glm_intra_raw`, `param_finalize` | the raw gate mode's records, unchanged (all three architectures) |
-| `dqkg_raw`, `dqkg_int_raw`, `dqkg_davq_raw`, `dqkg_int_davq_raw`, `dqkg_davq_nohint_raw`, `dqkg_int_davq_nohint_raw` | new: the raw gate mode's `dqkg` class (`gate: "raw"`), the deterministic package's `dqkg` records of the same names without the suffix and their rules, so the raw mode selects the deterministic pair on every row (all three architectures) |
+| `dqkg_raw`, `dqkg_int_raw`, `dqkg_davq_raw`, `dqkg_int_davq_raw`, `dqkg_davq_nohint_raw`, `dqkg_int_davq_nohint_raw` | new: the raw gate mode's `dqkg` class (`gate: "raw"`), the deterministic package's `dqkg` records of the same names without the suffix and their rules, so the raw mode selects the deterministic pair on every row (on the deterministic records' architectures: the `_nohint` forms on `sm_107a`, the others on all three) |
 | `fwd_intra_l2n`, `fwd_intra_v14_l2n`, `fwd_intra_v37_l2n`, `bwd_prep_g8_l2n`, `bwd_prep_g8_replay_l2n`, `bwd_prep_g8_noqg_l2n`, `bwd_prep_g8_noqg_nokb_l2n`, `glm_intra_l2n`, `glm_intra_l2n_capture`, `qk_l2norm`, `qk_l2norm_apply`, `qk_pullback`, `fwd_intra_raw_l2n`, `fwd_intra_v14_raw_l2n`, `bwd_prep_g8_raw_l2n`, `bwd_prep_g8_replay_raw_l2n`, `bwd_prep_g8_noqg_raw_l2n`, `bwd_prep_g8_noqg_nokb_raw_l2n`, `glm_intra_raw_l2n`, `glm_intra_raw_l2n_capture` | not shipped (the in-kernel Q/K L2 norm, which this package refuses) |
 | `fwd_intra_v19`, `fwd_intra_v20` | new: the checkpoint hand-off's intra twins of `fwd_intra_v14` and `fwd_intra` (all three architectures); no path selects them |
 | `wy_bwd_v9` | new: the tape WY twin of `wy_bwd`, writing `w` alone (all three architectures); no path selects it |
@@ -303,7 +303,7 @@ changes:
 The stages of `cake_jit.GATE_STAGES` select among the records of the call's
 gate mode (a record's `gate`, `"g"` when absent).
 
-`build.json` has 231 entries: 77 on `sm_100a`, 76 on `sm_103a` and 78 on
+`build.json` has 227 entries: 75 on `sm_100a`, 74 on `sm_103a` and 78 on
 `sm_107a`.
 
 ## Layout of this package
