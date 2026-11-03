@@ -85,6 +85,9 @@ CHANNELS = (
 )
 # 262143 / 262144: both sides of the sm_107a token-floored backward program's floor.
 TOKENS = (1, 1000, 65536, 98304, 147456, 250340, 262143, 262144)
+# The deterministic package's programs this package does not have: the row-group backward program of route ``bwd``
+# on sm_107a (264 <= C < 512).  Every other record pairs with this package's at the same route position.
+DET_ONLY = frozenset({"cake_causal_conv1d_det_train_50aa818e2b2338fb34a4"})
 
 
 @contextmanager
@@ -102,6 +105,12 @@ def _args(record: dict) -> set[str]:
     return {name for kind, name in record["arg_plan"] if kind != "grid"}
 
 
+def _det_route(arch: str, kind: str) -> list[str]:
+    """The deterministic route of ``(arch, kind)`` without its :data:`DET_ONLY` programs."""
+
+    return [name for name in det_jit.ROUTES[arch][kind] if name not in DET_ONLY]
+
+
 def _pairs(role: str):
     """``(arch, kind, new record name, det record name)`` of every route of ``role``, in route order: the
     deterministic route's programs, position for position (the route's channel-band programs follow them, see
@@ -111,7 +120,7 @@ def _pairs(role: str):
         for kind in cake_jit.KINDS:
             if cake_jit.route_role(kind) != role:
                 continue
-            new, det = cake_jit.ROUTES[arch][kind], det_jit.ROUTES[arch][kind]
+            new, det = cake_jit.ROUTES[arch][kind], _det_route(arch, kind)
             assert len(new) >= len(det), (arch, kind)
             for name, det_name in zip(new[: len(det)], det, strict=True):
                 yield arch, kind, name, det_name
@@ -130,7 +139,7 @@ def _bands():
 
     for arch in ARCHES:
         for kind in cake_jit.KINDS:
-            new, det = cake_jit.ROUTES[arch][kind], det_jit.ROUTES[arch][kind]
+            new, det = cake_jit.ROUTES[arch][kind], _det_route(arch, kind)
             moved = [
                 (name, det_name)
                 for name, det_name in zip(new[: len(det)], det, strict=True)
@@ -308,19 +317,27 @@ def test_channel_band_programs_take_their_twins_lowest_channels() -> None:
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("arch", ARCHES)
-def test_selection_matches_the_deterministic_package(arch) -> None:
+def test_selection_matches_the_deterministic_package(arch, monkeypatch) -> None:
     """A call selects the program at the same route position as the deterministic package for every ``(S, C)``,
-    and plans the same scalars (``y`` / ``dx`` keep their per-element arithmetic)."""
+    and plans the same scalars (``y`` / ``dx`` keep their per-element arithmetic).  Where the deterministic package
+    selects a det-only program, this package selects what the deterministic package selects without its det-only
+    records."""
 
     twin_of = {
         band: twin for band_arch, _, band, twin, _ in _bands() if band_arch == arch
     }
+    det_only_hits = set()
     for kind in cake_jit.KINDS:
-        new, det = cake_jit.ROUTES[arch][kind], det_jit.ROUTES[arch][kind]
+        new, det = cake_jit.ROUTES[arch][kind], _det_route(arch, kind)
         for C in CHANNELS:
             for S in TOKENS:
                 (name,) = cake_jit.selected_modules(arch, kind, C=C, S=S)
                 (det_name,) = det_jit.selected_modules(arch, kind, C=C, S=S)
+                if det_name in DET_ONLY:
+                    det_only_hits.add(det_name)
+                    with monkeypatch.context() as m:
+                        m.setitem(det_jit.ROUTES[arch], kind, det)
+                        (det_name,) = det_jit.selected_modules(arch, kind, C=C, S=S)
                 # A channel-band program serves its twin's route position.
                 position = new.index(twin_of.get(name, name))
                 assert position == det.index(det_name), (arch, kind, C, S)
@@ -335,6 +352,10 @@ def test_selection_matches_the_deterministic_package(arch) -> None:
                     geometry=det_record["grid_rule"]["geometry"],
                     role=det_record["role"],
                 ), (arch, kind, C, S)
+    det_only_routed = {
+        name for name in DET_ONLY if arch in det_jit.MODULES[name]["arches"]
+    }
+    assert det_only_hits == det_only_routed, arch
 
 
 def _align16(n: int) -> int:
