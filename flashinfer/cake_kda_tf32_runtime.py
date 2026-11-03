@@ -102,7 +102,7 @@ def _build_kda_module(factory, *args, **kwargs):
 # windows reuse the same variable-shape direct-M128 identity. Remaining regions
 # retain the source-derived compatibility fallback.
 import heapq
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import cache
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -963,8 +963,11 @@ def _ffi_arguments_reusing(owner, site, arguments) -> tuple:
     other argument of a rebuilt record is the same tensor object at the same
     address as in the record it replaces.  Such a tensor reuses its previous
     tvm-ffi export (same data pointer, shape, strides and dtype); only the
-    tensors that moved go through :func:`_ffi_arguments` again.  ``owner``
-    keeps the last export of each record ``site`` until that site is rebuilt.
+    tensors that moved go through :func:`_ffi_arguments` again.  A moved
+    tensor bound again at the next position (``out`` / ``out_tma``, the FP32
+    final state and its tensor map) takes the export of that position.
+    ``owner`` keeps the last export of each record ``site`` until that site is
+    rebuilt.
     """
     import torch
 
@@ -972,7 +975,8 @@ def _ffi_arguments_reusing(owner, site, arguments) -> tuple:
     previous = memo.get(site, ())
     exported = list(arguments)
     kept: list = [None] * len(exported)
-    fresh = []
+    fresh: list[tuple[int, Any, int]] = []
+    repeats: list[int] = []
     for position, value in enumerate(exported):
         if not isinstance(value, torch.Tensor):
             continue
@@ -981,6 +985,8 @@ def _ffi_arguments_reusing(owner, site, arguments) -> tuple:
         if prior is not None and prior[0] is value and prior[1] == pointer:
             exported[position] = prior[2]
             kept[position] = prior
+        elif fresh and fresh[-1][0] == position - 1 and fresh[-1][1] is value:
+            repeats.append(position)
         else:
             fresh.append((position, value, pointer))
     if fresh:
@@ -988,17 +994,25 @@ def _ffi_arguments_reusing(owner, site, arguments) -> tuple:
         for (position, value, pointer), ffi_value in zip(fresh, converted, strict=True):
             exported[position] = ffi_value
             kept[position] = (value, pointer, ffi_value)
+        for position in repeats:
+            exported[position] = exported[position - 1]
+            kept[position] = kept[position - 1]
     memo[site] = tuple(kept)
     return tuple(exported)
 
 
-def _prepared_kernel_record(module, grid, bindings) -> tuple:
-    """(native entry, positional arguments) of one ``PreparedKernel.launch``."""
+def _prepared_kernel_record(module, grid, bindings, export: bool = True) -> tuple:
+    """(native entry, positional arguments) of one ``PreparedKernel.launch``.
+
+    With ``export`` the tensors are tvm-ffi exports (:func:`_ffi_arguments_reusing`);
+    without it they are the bound torch tensors, which the call converts.
+    """
     if not module._ready:
         raise RuntimeError("TMA descriptors must be initialized during preparation")
-    return module._call, _ffi_arguments_reusing(
-        module, None, module._arguments(grid, bindings)
-    )
+    arguments = module._arguments(grid, bindings)
+    if not export:
+        return module._call, tuple(arguments)
+    return module._call, _ffi_arguments_reusing(module, None, arguments)
 
 
 def _run_launch_records(records) -> None:
@@ -4657,6 +4671,22 @@ class FlashKDABlackwellBF16FusedLaunch:
                 initial_state_f32=initial_state_f32_pointer,
                 final_state_f32=final_state_f32_pointer,
             )
+            # A program built with final_state_warp_tma (or the turnover program
+            # a bin-mix launch falls back to) stores the final state through a
+            # tensor map of the caller's [N_or_pool, H, 128, 128] FP32 final
+            # state; without a final state the map covers one unused panel.
+            if _takes_final_state_tma(self.module) or (
+                self.work_bin_mix and _takes_final_state_tma(bin_mix_fallback[0])
+            ):
+                self.args["final_state_f32_tma"] = (
+                    final_state
+                    if final_state is not None
+                    else torch.empty(
+                        (1, 1, HEAD_DIM, HEAD_DIM),
+                        dtype=torch.float32,
+                        device=q.device,
+                    )
+                )
         if self.work_bin_mix:
             # The give ring (chunk_state) and its ready words (zero_workspace):
             # the owner zeroes each word it takes, so the program leaves every
@@ -4897,8 +4927,11 @@ class FlashKDABlackwellBF16FusedLaunch:
         self.module.prepare(grid=self.grid, **self.args)
         self._descriptors_stale = False
 
-    def _build_launch_records(self) -> list:
-        """The staging copies and kernel launches of one launch(), in order."""
+    def _build_launch_records(self, export: bool = True) -> list:
+        """The staging copies and kernel launches of one launch(), in order.
+
+        ``export`` as in :func:`_prepared_kernel_record`.
+        """
         records = [
             (destination.copy_, (source,))
             for destination, source in self._token_storage_refreshes
@@ -4908,19 +4941,19 @@ class FlashKDABlackwellBF16FusedLaunch:
         if self.prepare_module is not None:
             records.append(
                 _prepared_kernel_record(
-                    self.prepare_module, self.prepare_grid, self.prepare_args
+                    self.prepare_module, self.prepare_grid, self.prepare_args, export
                 )
             )
         records.append(
-            self._m64_owner_helper_record()
+            self._m64_owner_helper_record(export)
             if self.m64_owner_helpers
-            else self._work_bin_mix_record()
+            else self._work_bin_mix_record(export)
             if self.work_bin_mix
-            else _prepared_kernel_record(self.module, self.grid, self.args)
+            else _prepared_kernel_record(self.module, self.grid, self.args, export)
         )
         return records
 
-    def _m64_owner_helper_record(self) -> tuple:
+    def _m64_owner_helper_record(self, export: bool = True) -> tuple:
         """The launch record of the M64 owner/helper build.
 
         The driver can refuse the cooperative grid although the capacity probe
@@ -4929,7 +4962,9 @@ class FlashKDABlackwellBF16FusedLaunch:
         have taken (_fall_back_from_m64_owner_helper) and launches that instead;
         a refused launch leaves the words untouched.
         """
-        call, arguments = _prepared_kernel_record(self.module, self.grid, self.args)
+        call, arguments = _prepared_kernel_record(
+            self.module, self.grid, self.args, export
+        )
 
         def launch(*packed):
             if self.m64_owner_helpers:
@@ -4967,7 +5002,7 @@ class FlashKDABlackwellBF16FusedLaunch:
                 schedule,
             )
 
-    def _work_bin_mix_record(self) -> tuple:
+    def _work_bin_mix_record(self, export: bool = True) -> tuple:
         """The launch record of the bin-mix build.
 
         A helper bin's chunks reach their owner through the ring while both
@@ -4976,7 +5011,9 @@ class FlashKDABlackwellBF16FusedLaunch:
         (_fall_back_from_work_bin_mix) and launches that instead; a refused
         launch leaves the ring words untouched.
         """
-        call, arguments = _prepared_kernel_record(self.module, self.grid, self.args)
+        call, arguments = _prepared_kernel_record(
+            self.module, self.grid, self.args, export
+        )
 
         def launch(*packed):
             if self.work_bin_mix:
@@ -5022,6 +5059,22 @@ class FlashKDABlackwellBF16FusedLaunch:
             self._prepare_descriptors_in_stream()
         records = self._launch_records
         if records is None:
+            if "_launch_records" not in self.__dict__:
+                # The first launch of a binding (a new plan, or a plan-cache
+                # rebind) passes the bound torch tensors: the call converts
+                # them for less host time than exporting each moved tensor
+                # ahead of it.  The instance-level None marks that launch; a
+                # second launch of the same binding builds the exported
+                # record and reuses it until the next rebind.  The exports
+                # kept for the previous binding are dropped here, so a
+                # binding launched only once does not keep its predecessor's
+                # tensors alive.
+                for owner in (self.prepare_module, self.module):
+                    if owner is not None:
+                        owner.__dict__.pop("_ffi_export_memo", None)
+                self._launch_records = None
+                _run_launch_records(self._build_launch_records(export=False))
+                return
             records = self._launch_records = tuple(self._build_launch_records())
         _run_launch_records(records)
 
@@ -5492,6 +5545,18 @@ def _affine_window_table(
         if merge_final_positions is not None:
             table[window][3] = merge_final_positions[seq]
     return [value for row in table for value in row]
+
+
+# Arguments a launch binds itself for the generated programs whose plans name
+# them (no shipped module plan does): the tensor map of the caller's FP32
+# final state that a program built with final_state_warp_tma stores through.
+RUNTIME_BOUND_ARGS = (("tma_buffer", "final_state_f32_tma"),)
+
+
+def _takes_final_state_tma(module) -> bool:
+    """``module`` stores the FP32 final state through ``final_state_f32_tma``."""
+    plan = getattr(module, "_arg_plan", ())
+    return any(name == RUNTIME_BOUND_ARGS[0][1] for _kind, name in plan)
 
 
 def _gathers_window_indices(launch) -> bool:
@@ -7280,6 +7345,12 @@ class _RebindView:
     shape: tuple[int, ...]
     stride: tuple[int, ...]
     dtype: Any
+    # Keys of the same container bound to the same tensor object as ``key``
+    # (``q`` / ``q_tma``, an in-place pool's ``initial_state_f32`` /
+    # ``final_state_f32``): re-pointed with ``key``'s view.
+    aliases: tuple = ()
+    # ``key`` or an alias is a TMA descriptor source (``*_tma``).
+    described: bool = False
 
 
 @dataclass(frozen=True)
@@ -7358,6 +7429,11 @@ AFFINE_REBIND_ATTRIBUTES = (
 # checkpoint buffer (``rows_tma``).  When a plan-cache rebind moves one of
 # them the composite must re-encode those descriptors before its next launch.
 APPLY_ROUTE_DESCRIPTOR_ATTRIBUTES = ("_out_tail", "_checkpoint_output")
+
+
+def _rebind_argument_container(container_name: str) -> bool:
+    """A launch's argument dict (``args`` / ``prepare_args``, of a part too)."""
+    return container_name.rsplit(".", 1)[-1] in ("args", "prepare_args")
 
 
 def _rebind_owner(impl, container_name: str):
@@ -7447,11 +7523,26 @@ def capture_rebind_plan(impl, inputs: dict) -> RebindPlan:
 
     views: list[_RebindView] = []
     addresses: list[_RebindAddress] = []
+    # (container, id of the bound tensor) -> index of its view spec; the
+    # container's argument dict holds every value, so ids stay unique here.
+    primaries: dict[tuple[str, int], int] = {}
     for container_name, container in _rebind_containers(impl).items():
         for key, value in container.items():
             if isinstance(value, torch.Tensor):
                 hit = classify(value)
                 if hit is not None:
+                    described = isinstance(key, str) and key.endswith("_tma")
+                    primary = primaries.get((container_name, id(value)))
+                    if primary is not None:
+                        spec = views[primary]
+                        views[primary] = replace(
+                            spec,
+                            aliases=spec.aliases + (key,),
+                            described=spec.described or described,
+                        )
+                        continue
+                    if _rebind_argument_container(container_name):
+                        primaries[(container_name, id(value))] = len(views)
                     views.append(
                         _RebindView(
                             container_name,
@@ -7461,6 +7552,7 @@ def capture_rebind_plan(impl, inputs: dict) -> RebindPlan:
                             tuple(value.shape),
                             tuple(value.stride()),
                             value.dtype,
+                            described=described,
                         )
                     )
             elif (
@@ -7576,11 +7668,7 @@ def rebind_prepared_launch(
             sub._keepalive = owned + new_inputs
     if later_views or later_addresses or deferred_owned:
         for spec in later_views:
-            if (
-                isinstance(spec.key, str)
-                and spec.key.endswith("_tma")
-                and (changed is None or spec.input_name in changed)
-            ):
+            if spec.described and (changed is None or spec.input_name in changed):
                 tma_moved = True
         impl._deferred_rebind = (
             tuple(later_views),
@@ -7664,7 +7752,7 @@ def _apply_rebind_specs(
         touched.add(spec.container)
         container = containers[spec.container]
         replacement = view_for(spec)
-        if isinstance(spec.key, str) and spec.key.endswith("_tma"):
+        if spec.described:
             # With ``changed`` the moved inputs are known; otherwise compare
             # the recorded pointer with the previous binding.
             moved = (
@@ -7695,6 +7783,8 @@ def _apply_rebind_specs(
                     tma_moved = True
                     impl._apply_descriptors_stale = True
         container[spec.key] = replacement
+        for alias in spec.aliases:
+            container[alias] = replacement
     for address in address_specs:
         touched.add(address.container)
         containers[address.container][address.key] = (

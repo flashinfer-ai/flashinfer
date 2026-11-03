@@ -297,9 +297,13 @@ def test_program_lookup_on_sm103a(monkeypatch):
 def test_shipped_loader_names_the_unbounded_direct_bin_mix_build():
     # One bin-mix build on each architecture of WORK_BIN_MIX_ARCHES, beside
     # the turnover build of the same module, registered like every generated
-    # program; none on another architecture.
+    # program; none on another architecture.  A module's bin-mix build is one
+    # program for every architecture or a build of its own per architecture
+    # (the sm_103a DIR build takes the per-warp TMA final-state store); each
+    # program ships for exactly the architectures whose routes name it.
     routes = registry._RENDERED_WORK_BIN_MIX_ROUTES
     assert set(routes) == {"sm_100a", "sm_103a"}
+    routed: dict[str, set[str]] = {}
     for arch, by_module in routes.items():
         if arch not in runtime.WORK_BIN_MIX_ARCHES:
             assert by_module == {}, arch
@@ -308,10 +312,12 @@ def test_shipped_loader_names_the_unbounded_direct_bin_mix_build():
         for module, program in by_module.items():
             assert module in TURN[arch], (arch, module)
             assert program != TURN[arch][module]
-            assert registry._RENDERED_MODULES[program]["arches"] == list(
-                runtime.WORK_BIN_MIX_ARCHES
-            )
+            shipped = registry._RENDERED_MODULES[program]["arches"]
+            assert arch in shipped, (arch, program)
+            routed.setdefault(program, set()).add(arch)
             assert runtime._work_bin_mix_program(TURN[arch][module], arch) == program
+    for program, arches in routed.items():
+        assert set(registry._RENDERED_MODULES[program]["arches"]) == arches, program
 
 
 # ------------------------------------------------------------- the plan
