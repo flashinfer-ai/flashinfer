@@ -241,23 +241,27 @@ def test_matches_reference(M, N, K, dt):
 
 
 @needs_device
+@pytest.mark.parametrize("dt", [E4, E5], ids=["e4m3", "e5m2"])
+@pytest.mark.parametrize("od", [torch.bfloat16, torch.float16], ids=["bf16", "f16"])
 @pytest.mark.parametrize("b,M,N,K", [(3, 300, 4096, 4096), (2, 37, 128, 8192)])
-def test_determinism_and_graph_replay(b, M, N, K):
-    A, B = adv_fp8(b, M, K, seed=21), weights(b, N, K, 22)
-    sa, sb = scales()
-    ref = bits(bi_bmm(A, B, sa, sb)).clone()
+def test_determinism_and_graph_replay(b, M, N, K, od, dt):
+    """Run to run and under CUDA-graph replay, for both fp8 formats and both output dtypes: the batched unsplit launch
+    (N = 4096) and the per-element split launch (N = 128, C = 4)."""
+    A, B = adv_fp8(b, M, K, seed=21, dt=dt), weights(b, N, K, 22, dt=dt)
+    sa, sb = scales() if od == torch.bfloat16 else scales(2**-9 * 1.3, 2**-6 * 0.7)
+    ref = bits(bi_bmm(A, B, sa, sb, od)).clone()
     for _ in range(3):
-        assert torch.equal(bits(bi_bmm(A, B, sa, sb)), ref)
-    out = torch.empty(b, M, N, dtype=torch.bfloat16, device="cuda")
+        assert torch.equal(bits(bi_bmm(A, B, sa, sb, od)), ref)
+    out = torch.empty(b, M, N, dtype=od, device="cuda")
     s = torch.cuda.Stream()
     s.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(s):
         bi_bmm(
-            A, B, sa, sb, out=out
+            A, B, sa, sb, od, out=out
         )  # warm-up on the side stream: the compile happens outside the capture
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g):
-            bi_bmm(A, B, sa, sb, out=out)
+            bi_bmm(A, B, sa, sb, od, out=out)
     torch.cuda.current_stream().wait_stream(s)
     for _ in range(2):
         out.zero_()
@@ -388,30 +392,32 @@ def test_config_agreement(M, N, K, dt):
 
 
 @needs_device
+@pytest.mark.parametrize("dt", [E4, E5], ids=["e4m3", "e5m2"])
 @pytest.mark.parametrize(
     "M,N,K,od", [(37, 128, 8192, torch.bfloat16), (300, 64, 16384, torch.float16)]
 )
-def test_cta_chunk_fold_equals_workspace_split(M, N, K, od):
+def test_cta_chunk_fold_equals_workspace_split(M, N, K, od, dt):
     """The split class ``kchunk[C].scaled`` has two implementations: the workspace split (chunks on different CTAs, an fp32
     workspace, a fixup fold in chunk order and the chain) and the in-CTA chunk fold (one CTA folds every chunk of its tile
     through a TMEM running sum, the chain after the last chunk). They are one term in Lean (``ctaSplit32_eq_kchunk32``)
     and one bit pattern here, on both weight layouts and both output dtypes; and the split class is a different
     specification from the unsplit fold (expected)."""
-    C = chunks_for(N, K, "e4m3")
+    fmt = "e4m3" if dt == E4 else "e5m2"
+    C = chunks_for(N, K, fmt)
     assert C > 1
-    a, Bk = adv_fp8(M, K, seed=71), weights(1, N, K, 72)[0]
-    sa, sb = scales()
+    a, Bk = adv_fp8(M, K, seed=71, dt=dt), weights(1, N, K, 72, dt=dt)[0]
+    sa, sb = scales() if od == torch.bfloat16 else scales(2**-9 * 1.3, 2**-6 * 0.7)
     ws = Knobs((128, 64), (1, 1), False, True, "m", 1)
     ref = bits(mm_fp8_batch_invariant(a, Bk, sa, sb, out_dtype=od, config=ws, chunks=C))
     recs = [
-        k for k in rank_topk(M, N, K, C, "k", 204, 10, "sm_107", "e4m3") if k.cta_chunks
+        k for k in rank_topk(M, N, K, C, "k", 204, 10, "sm_107", fmt) if k.cta_chunks
     ]
     recs += [
         Knobs((64, 32), (1, 4), False, True, "m", 1, 0, True),
         Knobs((128, 64), (1, 1), False, True, "n", 1, 0, True),
         Knobs((256, 128), (2, 1), True, True, "m", 2, 0, True),
     ]
-    recs = [k for k in dict.fromkeys(recs) if can_implement(k, M, N, K, "k", C, "e4m3")]
+    recs = [k for k in dict.fromkeys(recs) if can_implement(k, M, N, K, "k", C, fmt)]
     assert len(recs) >= 3
     for k in recs:
         for B in (Bk, Bk.contiguous()):
