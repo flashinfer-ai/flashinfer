@@ -667,11 +667,12 @@ for the full integration)::
         o_ = attention(q_, k_, v_)
         o = comm.gather_heads(o_)    # [B,S_global,H_local,D] -> [B,S_local,H,D]
 
-Existing callers can continue passing ``max_elems=...`` instead of
-``max_bytes=...``; the constructor multiplies it by ``dtype.itemsize``.
-Pass only one capacity argument. ``comm.max_elems`` remains available in the
-construction dtype, while ``comm.max_bytes`` is the byte capacity used by the
-new packed-chunk API.
+The v0.7.2 spelling ``max_elems=...`` (a capacity in elements of ``dtype``)
+is still accepted and converted to ``max_elems * dtype.itemsize`` bytes with a
+``DeprecationWarning``; it is deprecated since v0.7.3 and scheduled for
+removal in a future release. Pass exactly one capacity argument. ``comm.max_elems``,
+the v0.7.2 attribute, remains available in the construction dtype;
+``comm.max_bytes`` is the byte capacity used by the packed-chunk API.
 
 Preallocated outputs and NCCL staging can be reused across serialized calls::
 
