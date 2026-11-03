@@ -2224,8 +2224,6 @@ __device__ __forceinline__ void flashinfer_blackwell_softmax_cached_cluster_c8_t
     unsigned long long row_base = (unsigned long long)row * (unsigned long long)vocab_size;
     int chunk_begin = rank * chunk_elements;
     int chunk_end = ((chunk_begin + chunk_elements) < (vocab_size) ? (chunk_begin + chunk_elements) : (vocab_size));
-    const int thread_elem = tid * 8;
-    const int chunk_room = chunk_end - chunk_begin;
     float cache[64];
     float tile_max[8];
     __syncthreads();
@@ -2267,8 +2265,9 @@ __device__ __forceinline__ void flashinfer_blackwell_softmax_cached_cluster_c8_t
     }
     #pragma unroll
     for (int tile = 0; tile < 4; tile++) {
-        if (thread_elem < chunk_room - tile * 2048) {
-            unsigned long long index = row_base + (unsigned long long)chunk_begin + (unsigned long long)(thread_elem + tile * 2048);
+        int elem = chunk_begin + (tile * 256 + tid) * 8;
+        if (elem < chunk_end) {
+            unsigned long long index = row_base + (unsigned long long)elem;
             float _vec_load_0[8];
             {
                 unsigned _ldv8_8_0;
@@ -2306,81 +2305,282 @@ __device__ __forceinline__ void flashinfer_blackwell_softmax_cached_cluster_c8_t
             }
         }
     }
-    float run_max = -CUDART_INF_F;
+    float run_max = -CUDART_MAX_NORMAL_F;
     float run_sum = 0.0f;
     float inv_temperature = 1.0f / temperature;
-    #pragma unroll
-    for (int tile_1 = 0; tile_1 < 4; tile_1++) {
-        tile_max[tile_1] = -CUDART_INF_F;
-        if (thread_elem < chunk_room - tile_1 * 2048) {
-            float max_here = -CUDART_INF_F;
-            #pragma unroll
-            for (int j_1 = 0; j_1 < 8; j_1++) {
-                float scaled = cache[tile_1 * 8 + j_1] * inv_temperature;
-                cache[tile_1 * 8 + j_1] = scaled;
-                max_here = max_noftz(max_here, scaled);
-            }
-            float new_max;
-            asm("max.f32 %0, %1, %2;" : "=f"(new_max) : "f"(run_max), "f"(max_here));
-            float safe_max = ((new_max == -CUDART_INF_F) ? 0.0f : new_max);
-            const float _exp2_shift_15 = exp2_shift(safe_max);
-            float _exp2_9 = exp2_rescale_shifted(run_max, exp2_shift(run_max), safe_max, _exp2_shift_15);
-            float acc = run_sum * _exp2_9;
-            #pragma unroll
-            for (int j_2 = 0; j_2 < 8; j_2++) {
-                float p = exp2_term(cache[tile_1 * 8 + j_2], safe_max);
-                cache[tile_1 * 8 + j_2] = p;
-                acc += p;
-            }
-            run_sum = acc;
-            run_max = new_max;
-            tile_max[tile_1] = new_max;
-        }
-    }
+    // Shared tile 4 is waited on and read before the register tiles are exponentiated, so that its wait and
+    // loads overlap their arithmetic. Its values stay 0 where it holds no data for this thread.
     int tile_begin_3 = chunk_begin + 8192;
-    tile_max[4] = -CUDART_INF_F;
+    int elem_2 = chunk_begin + (1024 + tid) * 8;
+    unsigned int at = tiles_addr + (unsigned int)(tid * 32);
+    float values[8];
+    #pragma unroll
+    for (int j_3 = 0; j_3 < 8; j_3++) {
+        values[j_3] = 0.0f;
+    }
     if (tile_begin_3 < chunk_end) {
         mbarrier_wait(landed_addr, 0);
-        if (thread_elem < chunk_room - 8192) {
-            unsigned int at = tiles_addr + (unsigned int)(tid * 32);
-            float values[8];
+        if (elem_2 < chunk_end) {
             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                 : "=r"(*reinterpret_cast<uint32_t*>(&values[0])), "=r"(*reinterpret_cast<uint32_t*>(&values[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&values[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&values[(0) + 3]))
                 : "r"(at));
             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                 : "=r"(*reinterpret_cast<uint32_t*>(&values[4])), "=r"(*reinterpret_cast<uint32_t*>(&values[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&values[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&values[(4) + 3]))
                 : "r"(at + 16));
-            float max_here_1 = -CUDART_INF_F;
+        }
+    }
+    tile_max[4] = -CUDART_INF_F;
+    int elem_4 = chunk_begin + (768 + tid) * 8;
+    if (elem_4 < chunk_end) {
+        // All four register tiles hold data, so the first pass is one straight-line block. Shared tile 4 is
+        // exponentiated whether or not it holds data; its results are kept only where it does. Every value
+        // goes through the same operations as in the per-tile loop of the other branch.
+        float new_max_1;
+        float acc_1;
+        if (inv_temperature == 1.0f) {
+            // The row's temperature is the same for the whole CTA. At 1 the products x * 1.0f are skipped:
+            // they only flush subnormals and quiet NaNs, which the exponents do too, and a subnormal maximum
+            // acts as a zero.
+            float max_here[5];
+            max_here[0] = max_noftz(
+                max_noftz(max_noftz(cache[0], cache[1]), max_noftz(cache[2], cache[3])),
+                max_noftz(max_noftz(cache[4], cache[5]), max_noftz(cache[6], cache[7])));
+            max_here[1] = max_noftz(
+                max_noftz(max_noftz(cache[8 + 0], cache[8 + 1]), max_noftz(cache[8 + 2], cache[8 + 3])),
+                max_noftz(max_noftz(cache[8 + 4], cache[8 + 5]), max_noftz(cache[8 + 6], cache[8 + 7])));
+            {
+                float new_max;
+                asm("max.f32 %0, %1, %2;" : "=f"(new_max) : "f"(run_max), "f"(max_here[0]));
+                float acc = -0.0f;
+                #pragma unroll
+                for (int j_2 = 0; j_2 < 8; j_2++) {
+                    float p = exp2_term(cache[0 + j_2], new_max);
+                    cache[0 + j_2] = p;
+                    acc += p;
+                }
+                run_sum = acc;
+                run_max = new_max;
+                tile_max[0] = new_max;
+            }
+            max_here[2] = max_noftz(
+                max_noftz(max_noftz(cache[16 + 0], cache[16 + 1]), max_noftz(cache[16 + 2], cache[16 + 3])),
+                max_noftz(max_noftz(cache[16 + 4], cache[16 + 5]), max_noftz(cache[16 + 6], cache[16 + 7])));
+            {
+                float new_max;
+                asm("max.f32 %0, %1, %2;" : "=f"(new_max) : "f"(run_max), "f"(max_here[1]));
+                float _exp2_9 = exp2_rescale(run_max, new_max);
+                float acc = run_sum * _exp2_9;
+                #pragma unroll
+                for (int j_2 = 0; j_2 < 8; j_2++) {
+                    float p = exp2_term(cache[8 + j_2], new_max);
+                    cache[8 + j_2] = p;
+                    acc += p;
+                }
+                run_sum = acc;
+                run_max = new_max;
+                tile_max[1] = new_max;
+            }
+            max_here[3] = max_noftz(
+                max_noftz(max_noftz(cache[24 + 0], cache[24 + 1]), max_noftz(cache[24 + 2], cache[24 + 3])),
+                max_noftz(max_noftz(cache[24 + 4], cache[24 + 5]), max_noftz(cache[24 + 6], cache[24 + 7])));
+            {
+                float new_max;
+                asm("max.f32 %0, %1, %2;" : "=f"(new_max) : "f"(run_max), "f"(max_here[2]));
+                float _exp2_9 = exp2_rescale(run_max, new_max);
+                float acc = run_sum * _exp2_9;
+                #pragma unroll
+                for (int j_2 = 0; j_2 < 8; j_2++) {
+                    float p = exp2_term(cache[16 + j_2], new_max);
+                    cache[16 + j_2] = p;
+                    acc += p;
+                }
+                run_sum = acc;
+                run_max = new_max;
+                tile_max[2] = new_max;
+            }
+            max_here[4] = max_noftz(
+                max_noftz(max_noftz(values[0], values[1]), max_noftz(values[2], values[3])),
+                max_noftz(max_noftz(values[4], values[5]), max_noftz(values[6], values[7])));
+            {
+                float new_max;
+                asm("max.f32 %0, %1, %2;" : "=f"(new_max) : "f"(run_max), "f"(max_here[3]));
+                float _exp2_9 = exp2_rescale(run_max, new_max);
+                float acc = run_sum * _exp2_9;
+                #pragma unroll
+                for (int j_2 = 0; j_2 < 8; j_2++) {
+                    float p = exp2_term(cache[24 + j_2], new_max);
+                    cache[24 + j_2] = p;
+                    acc += p;
+                }
+                run_sum = acc;
+                run_max = new_max;
+                tile_max[3] = new_max;
+            }
+            asm("max.f32 %0, %1, %2;" : "=f"(new_max_1) : "f"(run_max), "f"(max_here[4]));
+            float _exp2_10 = exp2_rescale(run_max, new_max_1);
+            acc_1 = run_sum * _exp2_10;
+            #pragma unroll
+            for (int j_4 = 0; j_4 < 8; j_4++) {
+                float p_1 = exp2_term(values[j_4], new_max_1);
+                values[j_4] = p_1;
+                acc_1 += p_1;
+            }
+        } else {
+            float max_here[5];
+            #pragma unroll
+            for (int j_1 = 0; j_1 < 8; j_1++) {
+                float scaled = cache[0 + j_1] * inv_temperature;
+                cache[0 + j_1] = scaled;
+            }
+            max_here[0] = max_noftz(
+                max_noftz(max_noftz(cache[0], cache[1]), max_noftz(cache[2], cache[3])),
+                max_noftz(max_noftz(cache[4], cache[5]), max_noftz(cache[6], cache[7])));
+            #pragma unroll
+            for (int j_1 = 0; j_1 < 8; j_1++) {
+                float scaled = cache[8 + j_1] * inv_temperature;
+                cache[8 + j_1] = scaled;
+            }
+            max_here[1] = max_noftz(
+                max_noftz(max_noftz(cache[8 + 0], cache[8 + 1]), max_noftz(cache[8 + 2], cache[8 + 3])),
+                max_noftz(max_noftz(cache[8 + 4], cache[8 + 5]), max_noftz(cache[8 + 6], cache[8 + 7])));
+            {
+                float new_max;
+                asm("max.f32 %0, %1, %2;" : "=f"(new_max) : "f"(run_max), "f"(max_here[0]));
+                float acc = -0.0f;
+                #pragma unroll
+                for (int j_2 = 0; j_2 < 8; j_2++) {
+                    float p = exp2_term(cache[0 + j_2], new_max);
+                    cache[0 + j_2] = p;
+                    acc += p;
+                }
+                run_sum = acc;
+                run_max = new_max;
+                tile_max[0] = new_max;
+            }
+            #pragma unroll
+            for (int j_1 = 0; j_1 < 8; j_1++) {
+                float scaled = cache[16 + j_1] * inv_temperature;
+                cache[16 + j_1] = scaled;
+            }
+            max_here[2] = max_noftz(
+                max_noftz(max_noftz(cache[16 + 0], cache[16 + 1]), max_noftz(cache[16 + 2], cache[16 + 3])),
+                max_noftz(max_noftz(cache[16 + 4], cache[16 + 5]), max_noftz(cache[16 + 6], cache[16 + 7])));
+            {
+                float new_max;
+                asm("max.f32 %0, %1, %2;" : "=f"(new_max) : "f"(run_max), "f"(max_here[1]));
+                float _exp2_9 = exp2_rescale(run_max, new_max);
+                float acc = run_sum * _exp2_9;
+                #pragma unroll
+                for (int j_2 = 0; j_2 < 8; j_2++) {
+                    float p = exp2_term(cache[8 + j_2], new_max);
+                    cache[8 + j_2] = p;
+                    acc += p;
+                }
+                run_sum = acc;
+                run_max = new_max;
+                tile_max[1] = new_max;
+            }
+            #pragma unroll
+            for (int j_1 = 0; j_1 < 8; j_1++) {
+                float scaled = cache[24 + j_1] * inv_temperature;
+                cache[24 + j_1] = scaled;
+            }
+            max_here[3] = max_noftz(
+                max_noftz(max_noftz(cache[24 + 0], cache[24 + 1]), max_noftz(cache[24 + 2], cache[24 + 3])),
+                max_noftz(max_noftz(cache[24 + 4], cache[24 + 5]), max_noftz(cache[24 + 6], cache[24 + 7])));
+            {
+                float new_max;
+                asm("max.f32 %0, %1, %2;" : "=f"(new_max) : "f"(run_max), "f"(max_here[2]));
+                float _exp2_9 = exp2_rescale(run_max, new_max);
+                float acc = run_sum * _exp2_9;
+                #pragma unroll
+                for (int j_2 = 0; j_2 < 8; j_2++) {
+                    float p = exp2_term(cache[16 + j_2], new_max);
+                    cache[16 + j_2] = p;
+                    acc += p;
+                }
+                run_sum = acc;
+                run_max = new_max;
+                tile_max[2] = new_max;
+            }
             #pragma unroll
             for (int j_3 = 0; j_3 < 8; j_3++) {
                 float scaled_1 = values[j_3] * inv_temperature;
                 values[j_3] = scaled_1;
-                max_here_1 = max_noftz(max_here_1, scaled_1);
             }
-            float new_max_1;
-            asm("max.f32 %0, %1, %2;" : "=f"(new_max_1) : "f"(run_max), "f"(max_here_1));
-            float safe_max_1 = ((new_max_1 == -CUDART_INF_F) ? 0.0f : new_max_1);
-            const float _exp2_shift_16 = exp2_shift(safe_max_1);
-            float _exp2_10 = exp2_rescale_shifted(run_max, exp2_shift(run_max), safe_max_1, _exp2_shift_16);
-            float acc_1 = run_sum * _exp2_10;
+            max_here[4] = max_noftz(
+                max_noftz(max_noftz(values[0], values[1]), max_noftz(values[2], values[3])),
+                max_noftz(max_noftz(values[4], values[5]), max_noftz(values[6], values[7])));
+            {
+                float new_max;
+                asm("max.f32 %0, %1, %2;" : "=f"(new_max) : "f"(run_max), "f"(max_here[3]));
+                float _exp2_9 = exp2_rescale(run_max, new_max);
+                float acc = run_sum * _exp2_9;
+                #pragma unroll
+                for (int j_2 = 0; j_2 < 8; j_2++) {
+                    float p = exp2_term(cache[24 + j_2], new_max);
+                    cache[24 + j_2] = p;
+                    acc += p;
+                }
+                run_sum = acc;
+                run_max = new_max;
+                tile_max[3] = new_max;
+            }
+            asm("max.f32 %0, %1, %2;" : "=f"(new_max_1) : "f"(run_max), "f"(max_here[4]));
+            float _exp2_10 = exp2_rescale(run_max, new_max_1);
+            acc_1 = run_sum * _exp2_10;
             #pragma unroll
             for (int j_4 = 0; j_4 < 8; j_4++) {
-                float p_1 = exp2_term(values[j_4], safe_max_1);
+                float p_1 = exp2_term(values[j_4], new_max_1);
                 values[j_4] = p_1;
                 acc_1 += p_1;
             }
+        }
+        const bool tile4_here = elem_2 < chunk_end;
+        if (tile4_here) {
             asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(at), "r"(__float_as_uint(values[0])), "r"(__float_as_uint(values[1])), "r"(__float_as_uint(values[2])), "r"(__float_as_uint(values[3])) : "memory");
             asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(at + 16), "r"(__float_as_uint(values[4])), "r"(__float_as_uint(values[5])), "r"(__float_as_uint(values[6])), "r"(__float_as_uint(values[7])) : "memory");
-            run_sum = acc_1;
-            run_max = new_max_1;
-            tile_max[4] = new_max_1;
+        }
+        run_sum = tile4_here ? acc_1 : run_sum;
+        run_max = tile4_here ? new_max_1 : run_max;
+        tile_max[4] = tile4_here ? new_max_1 : -CUDART_INF_F;
+    } else {
+        // Some register tile of this thread is empty, so shared tile 4 holds none of its data either.
+        #pragma unroll
+        for (int tile_1 = 0; tile_1 < 4; tile_1++) {
+            int elem_1 = chunk_begin + (tile_1 * 256 + tid) * 8;
+            tile_max[tile_1] = -CUDART_INF_F;
+            if (elem_1 < chunk_end) {
+                #pragma unroll
+                for (int j_1 = 0; j_1 < 8; j_1++) {
+                    float scaled = cache[tile_1 * 8 + j_1] / temperature;
+                    cache[tile_1 * 8 + j_1] = scaled;
+                }
+                float max_here = max_noftz(
+                    max_noftz(max_noftz(cache[tile_1 * 8 + 0], cache[tile_1 * 8 + 1]), max_noftz(cache[tile_1 * 8 + 2], cache[tile_1 * 8 + 3])),
+                    max_noftz(max_noftz(cache[tile_1 * 8 + 4], cache[tile_1 * 8 + 5]), max_noftz(cache[tile_1 * 8 + 6], cache[tile_1 * 8 + 7])));
+                float new_max;
+                asm("max.f32 %0, %1, %2;" : "=f"(new_max) : "f"(run_max), "f"(max_here));
+                float _exp2_9 = exp2_rescale(run_max, new_max);
+                float acc = (tile_1 == 0) ? -0.0f : run_sum * _exp2_9;
+                #pragma unroll
+                for (int j_2 = 0; j_2 < 8; j_2++) {
+                    float p = exp2_term(cache[tile_1 * 8 + j_2], new_max);
+                    cache[tile_1 * 8 + j_2] = p;
+                    acc += p;
+                }
+                run_sum = acc;
+                run_max = new_max;
+                tile_max[tile_1] = new_max;
+            }
         }
     }
     int tile_begin_0_1 = chunk_begin + 10240;
+    int elem_1_1 = chunk_begin + (1280 + tid) * 8;
     tile_max[5] = -CUDART_INF_F;
     if (tile_begin_0_1 < chunk_end) {
         mbarrier_wait(landed_addr + 8, 0);
-        if (thread_elem < chunk_room - 10240) {
+        if (elem_1_1 < chunk_end) {
             unsigned int at_1 = tiles_addr + 8192 + (unsigned int)(tid * 32);
             float values_1[8];
             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
@@ -2389,22 +2589,21 @@ __device__ __forceinline__ void flashinfer_blackwell_softmax_cached_cluster_c8_t
             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                 : "=r"(*reinterpret_cast<uint32_t*>(&values_1[4])), "=r"(*reinterpret_cast<uint32_t*>(&values_1[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&values_1[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&values_1[(4) + 3]))
                 : "r"(at_1 + 16));
-            float max_here_2 = -CUDART_INF_F;
             #pragma unroll
             for (int j_5 = 0; j_5 < 8; j_5++) {
-                float scaled_2 = values_1[j_5] * inv_temperature;
+                float scaled_2 = values_1[j_5] / temperature;
                 values_1[j_5] = scaled_2;
-                max_here_2 = max_noftz(max_here_2, scaled_2);
             }
+            float max_here_2 = max_noftz(
+                max_noftz(max_noftz(values_1[0], values_1[1]), max_noftz(values_1[2], values_1[3])),
+                max_noftz(max_noftz(values_1[4], values_1[5]), max_noftz(values_1[6], values_1[7])));
             float new_max_2;
             asm("max.f32 %0, %1, %2;" : "=f"(new_max_2) : "f"(run_max), "f"(max_here_2));
-            float safe_max_2 = ((new_max_2 == -CUDART_INF_F) ? 0.0f : new_max_2);
-            const float _exp2_shift_17 = exp2_shift(safe_max_2);
-            float _exp2_11 = exp2_rescale_shifted(run_max, exp2_shift(run_max), safe_max_2, _exp2_shift_17);
+            float _exp2_11 = exp2_rescale(run_max, new_max_2);
             float acc_2 = run_sum * _exp2_11;
             #pragma unroll
             for (int j_6 = 0; j_6 < 8; j_6++) {
-                float p_2 = exp2_term(values_1[j_6], safe_max_2);
+                float p_2 = exp2_term(values_1[j_6], new_max_2);
                 values_1[j_6] = p_2;
                 acc_2 += p_2;
             }
@@ -2416,10 +2615,11 @@ __device__ __forceinline__ void flashinfer_blackwell_softmax_cached_cluster_c8_t
         }
     }
     int tile_begin_2_1 = chunk_begin + 12288;
+    int elem_3 = chunk_begin + (1536 + tid) * 8;
     tile_max[6] = -CUDART_INF_F;
     if (tile_begin_2_1 < chunk_end) {
         mbarrier_wait(landed_addr + 16, 0);
-        if (thread_elem < chunk_room - 12288) {
+        if (elem_3 < chunk_end) {
             unsigned int at_2 = tiles_addr + 16384 + (unsigned int)(tid * 32);
             float values_2[8];
             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
@@ -2428,22 +2628,21 @@ __device__ __forceinline__ void flashinfer_blackwell_softmax_cached_cluster_c8_t
             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                 : "=r"(*reinterpret_cast<uint32_t*>(&values_2[4])), "=r"(*reinterpret_cast<uint32_t*>(&values_2[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&values_2[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&values_2[(4) + 3]))
                 : "r"(at_2 + 16));
-            float max_here_3 = -CUDART_INF_F;
             #pragma unroll
             for (int j_7 = 0; j_7 < 8; j_7++) {
-                float scaled_3 = values_2[j_7] * inv_temperature;
+                float scaled_3 = values_2[j_7] / temperature;
                 values_2[j_7] = scaled_3;
-                max_here_3 = max_noftz(max_here_3, scaled_3);
             }
+            float max_here_3 = max_noftz(
+                max_noftz(max_noftz(values_2[0], values_2[1]), max_noftz(values_2[2], values_2[3])),
+                max_noftz(max_noftz(values_2[4], values_2[5]), max_noftz(values_2[6], values_2[7])));
             float new_max_3;
             asm("max.f32 %0, %1, %2;" : "=f"(new_max_3) : "f"(run_max), "f"(max_here_3));
-            float safe_max_3 = ((new_max_3 == -CUDART_INF_F) ? 0.0f : new_max_3);
-            const float _exp2_shift_18 = exp2_shift(safe_max_3);
-            float _exp2_12 = exp2_rescale_shifted(run_max, exp2_shift(run_max), safe_max_3, _exp2_shift_18);
+            float _exp2_12 = exp2_rescale(run_max, new_max_3);
             float acc_3 = run_sum * _exp2_12;
             #pragma unroll
             for (int j_8 = 0; j_8 < 8; j_8++) {
-                float p_3 = exp2_term(values_2[j_8], safe_max_3);
+                float p_3 = exp2_term(values_2[j_8], new_max_3);
                 values_2[j_8] = p_3;
                 acc_3 += p_3;
             }
@@ -2455,10 +2654,11 @@ __device__ __forceinline__ void flashinfer_blackwell_softmax_cached_cluster_c8_t
         }
     }
     int tile_begin_4 = chunk_begin + 14336;
+    int elem_5 = chunk_begin + (1792 + tid) * 8;
     tile_max[7] = -CUDART_INF_F;
     if (tile_begin_4 < chunk_end) {
         mbarrier_wait(landed_addr + 24, 0);
-        if (thread_elem < chunk_room - 14336) {
+        if (elem_5 < chunk_end) {
             unsigned int at_3 = tiles_addr + 24576 + (unsigned int)(tid * 32);
             float values_3[8];
             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
@@ -2467,22 +2667,21 @@ __device__ __forceinline__ void flashinfer_blackwell_softmax_cached_cluster_c8_t
             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                 : "=r"(*reinterpret_cast<uint32_t*>(&values_3[4])), "=r"(*reinterpret_cast<uint32_t*>(&values_3[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&values_3[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&values_3[(4) + 3]))
                 : "r"(at_3 + 16));
-            float max_here_4 = -CUDART_INF_F;
             #pragma unroll
             for (int j_9 = 0; j_9 < 8; j_9++) {
-                float scaled_4 = values_3[j_9] * inv_temperature;
+                float scaled_4 = values_3[j_9] / temperature;
                 values_3[j_9] = scaled_4;
-                max_here_4 = max_noftz(max_here_4, scaled_4);
             }
+            float max_here_4 = max_noftz(
+                max_noftz(max_noftz(values_3[0], values_3[1]), max_noftz(values_3[2], values_3[3])),
+                max_noftz(max_noftz(values_3[4], values_3[5]), max_noftz(values_3[6], values_3[7])));
             float new_max_4;
             asm("max.f32 %0, %1, %2;" : "=f"(new_max_4) : "f"(run_max), "f"(max_here_4));
-            float safe_max_4 = ((new_max_4 == -CUDART_INF_F) ? 0.0f : new_max_4);
-            const float _exp2_shift_19 = exp2_shift(safe_max_4);
-            float _exp2_13 = exp2_rescale_shifted(run_max, exp2_shift(run_max), safe_max_4, _exp2_shift_19);
+            float _exp2_13 = exp2_rescale(run_max, new_max_4);
             float acc_4 = run_sum * _exp2_13;
             #pragma unroll
             for (int j_10 = 0; j_10 < 8; j_10++) {
-                float p_4 = exp2_term(values_3[j_10], safe_max_4);
+                float p_4 = exp2_term(values_3[j_10], new_max_4);
                 values_3[j_10] = p_4;
                 acc_4 += p_4;
             }
@@ -2495,9 +2694,7 @@ __device__ __forceinline__ void flashinfer_blackwell_softmax_cached_cluster_c8_t
     }
     float warp_max;
     asm volatile("redux.sync.max.f32 %0, %1, 0xffffffff;" : "=f"(warp_max) : "f"(run_max));
-    float safe_warp_max = ((warp_max == -CUDART_INF_F) ? 0.0f : warp_max);
-    const float _exp2_shift_20 = exp2_shift(safe_warp_max);
-    float _exp2_14 = exp2_rescale_shifted(run_max, exp2_shift(run_max), safe_warp_max, _exp2_shift_20);
+    float _exp2_14 = exp2_rescale(run_max, warp_max);
     float warp_sum = run_sum * _exp2_14;
     #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1)
@@ -2552,10 +2749,6 @@ __device__ __forceinline__ void flashinfer_blackwell_softmax_cached_cluster_c8_t
     }
     float row_max;
     asm volatile("redux.sync.max.f32 %0, %1, 0xffffffff;" : "=f"(row_max) : "f"(lane_max));
-    float tile_rescale[4];
-    #pragma unroll
-    for (int tile_h = 0; tile_h < 4; tile_h++)
-        tile_rescale[tile_h] = exp2_rescale(tile_max[tile_h], row_max);
     float lane_sum = 0.0f;
     #pragma unroll
     for (int k_3 = 0; k_3 < 2; k_3++) {
@@ -2567,11 +2760,14 @@ __device__ __forceinline__ void flashinfer_blackwell_softmax_cached_cluster_c8_t
     for (int offset = 16; offset > 0; offset >>= 1)
         row_sum += __shfl_xor_sync(0xFFFFFFFF, row_sum, offset);
     float inv_sum = approx_rcp(row_sum);
+    int tid_o;
+    asm volatile("mov.u32 %0, %%tid.x;" : "=r"(tid_o));
     #pragma unroll
     for (int tile_2 = 0; tile_2 < 4; tile_2++) {
-        if (thread_elem < chunk_room - tile_2 * 2048) {
-            unsigned long long index_1 = row_base + (unsigned long long)chunk_begin + (unsigned long long)(thread_elem + tile_2 * 2048);
-            float _exp2_18 = tile_rescale[tile_2];
+        int elem_0 = chunk_begin + (tile_2 * 256 + tid_o) * 8;
+        if (elem_0 < chunk_end) {
+            unsigned long long index_1 = row_base + (unsigned long long)elem_0;
+            float _exp2_18 = exp2_rescale(tile_max[tile_2], row_max);
             float scale = _exp2_18 * inv_sum;
             float out_values[8];
             #pragma unroll
@@ -2602,9 +2798,10 @@ __device__ __forceinline__ void flashinfer_blackwell_softmax_cached_cluster_c8_t
             }
         }
     }
-    if (thread_elem < chunk_room - 8192) {
-        unsigned long long index_2 = row_base + (unsigned long long)chunk_begin + (unsigned long long)(thread_elem + 8192);
-        unsigned int at_4 = tiles_addr + (unsigned int)(tid * 32);
+    int elem_6 = chunk_begin + (1024 + tid_o) * 8;
+    if (elem_6 < chunk_end) {
+        unsigned long long index_2 = row_base + (unsigned long long)elem_6;
+        unsigned int at_4 = tiles_addr + (unsigned int)(tid_o * 32);
         float values_4[8];
         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
             : "=r"(*reinterpret_cast<uint32_t*>(&values_4[0])), "=r"(*reinterpret_cast<uint32_t*>(&values_4[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&values_4[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&values_4[(0) + 3]))
@@ -2642,9 +2839,10 @@ __device__ __forceinline__ void flashinfer_blackwell_softmax_cached_cluster_c8_t
             #endif
         }
     }
-    if (thread_elem < chunk_room - 10240) {
-        unsigned long long index_3 = row_base + (unsigned long long)chunk_begin + (unsigned long long)(thread_elem + 10240);
-        unsigned int at_5 = tiles_addr + 8192 + (unsigned int)(tid * 32);
+    int elem_7 = chunk_begin + (1280 + tid_o) * 8;
+    if (elem_7 < chunk_end) {
+        unsigned long long index_3 = row_base + (unsigned long long)elem_7;
+        unsigned int at_5 = tiles_addr + 8192 + (unsigned int)(tid_o * 32);
         float values_5[8];
         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
             : "=r"(*reinterpret_cast<uint32_t*>(&values_5[0])), "=r"(*reinterpret_cast<uint32_t*>(&values_5[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&values_5[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&values_5[(0) + 3]))
@@ -2682,9 +2880,10 @@ __device__ __forceinline__ void flashinfer_blackwell_softmax_cached_cluster_c8_t
             #endif
         }
     }
-    if (thread_elem < chunk_room - 12288) {
-        unsigned long long index_4 = row_base + (unsigned long long)chunk_begin + (unsigned long long)(thread_elem + 12288);
-        unsigned int at_6 = tiles_addr + 16384 + (unsigned int)(tid * 32);
+    int elem_8 = chunk_begin + (1536 + tid_o) * 8;
+    if (elem_8 < chunk_end) {
+        unsigned long long index_4 = row_base + (unsigned long long)elem_8;
+        unsigned int at_6 = tiles_addr + 16384 + (unsigned int)(tid_o * 32);
         float values_6[8];
         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
             : "=r"(*reinterpret_cast<uint32_t*>(&values_6[0])), "=r"(*reinterpret_cast<uint32_t*>(&values_6[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&values_6[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&values_6[(0) + 3]))
@@ -2722,9 +2921,10 @@ __device__ __forceinline__ void flashinfer_blackwell_softmax_cached_cluster_c8_t
             #endif
         }
     }
-    if (thread_elem < chunk_room - 14336) {
-        unsigned long long index_5 = row_base + (unsigned long long)chunk_begin + (unsigned long long)(thread_elem + 14336);
-        unsigned int at_7 = tiles_addr + 24576 + (unsigned int)(tid * 32);
+    int elem_9 = chunk_begin + (1792 + tid_o) * 8;
+    if (elem_9 < chunk_end) {
+        unsigned long long index_5 = row_base + (unsigned long long)elem_9;
+        unsigned int at_7 = tiles_addr + 24576 + (unsigned int)(tid_o * 32);
         float values_7[8];
         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
             : "=r"(*reinterpret_cast<uint32_t*>(&values_7[0])), "=r"(*reinterpret_cast<uint32_t*>(&values_7[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&values_7[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&values_7[(0) + 3]))
@@ -2881,8 +3081,6 @@ __device__ __forceinline__ void flashinfer_blackwell_softmax_cached_cluster_c16_
     unsigned long long row_base = (unsigned long long)row * (unsigned long long)vocab_size;
     int chunk_begin = rank * chunk_elements;
     int chunk_end = ((chunk_begin + chunk_elements) < (vocab_size) ? (chunk_begin + chunk_elements) : (vocab_size));
-    const int thread_elem = tid * 8;
-    const int chunk_room = chunk_end - chunk_begin;
     float cache[64];
     float tile_max[8];
     __syncthreads();
@@ -2924,8 +3122,9 @@ __device__ __forceinline__ void flashinfer_blackwell_softmax_cached_cluster_c16_
     }
     #pragma unroll
     for (int tile = 0; tile < 4; tile++) {
-        if (thread_elem < chunk_room - tile * 2048) {
-            unsigned long long index = row_base + (unsigned long long)chunk_begin + (unsigned long long)(thread_elem + tile * 2048);
+        int elem = chunk_begin + (tile * 256 + tid) * 8;
+        if (elem < chunk_end) {
+            unsigned long long index = row_base + (unsigned long long)elem;
             float _vec_load_0[8];
             {
                 unsigned _ldv8_8_0;
@@ -2963,81 +3162,282 @@ __device__ __forceinline__ void flashinfer_blackwell_softmax_cached_cluster_c16_
             }
         }
     }
-    float run_max = -CUDART_INF_F;
+    float run_max = -CUDART_MAX_NORMAL_F;
     float run_sum = 0.0f;
     float inv_temperature = 1.0f / temperature;
-    #pragma unroll
-    for (int tile_1 = 0; tile_1 < 4; tile_1++) {
-        tile_max[tile_1] = -CUDART_INF_F;
-        if (thread_elem < chunk_room - tile_1 * 2048) {
-            float max_here = -CUDART_INF_F;
-            #pragma unroll
-            for (int j_1 = 0; j_1 < 8; j_1++) {
-                float scaled = cache[tile_1 * 8 + j_1] * inv_temperature;
-                cache[tile_1 * 8 + j_1] = scaled;
-                max_here = max_noftz(max_here, scaled);
-            }
-            float new_max;
-            asm("max.f32 %0, %1, %2;" : "=f"(new_max) : "f"(run_max), "f"(max_here));
-            float safe_max = ((new_max == -CUDART_INF_F) ? 0.0f : new_max);
-            const float _exp2_shift_21 = exp2_shift(safe_max);
-            float _exp2_9 = exp2_rescale_shifted(run_max, exp2_shift(run_max), safe_max, _exp2_shift_21);
-            float acc = run_sum * _exp2_9;
-            #pragma unroll
-            for (int j_2 = 0; j_2 < 8; j_2++) {
-                float p = exp2_term(cache[tile_1 * 8 + j_2], safe_max);
-                cache[tile_1 * 8 + j_2] = p;
-                acc += p;
-            }
-            run_sum = acc;
-            run_max = new_max;
-            tile_max[tile_1] = new_max;
-        }
-    }
+    // Shared tile 4 is waited on and read before the register tiles are exponentiated, so that its wait and
+    // loads overlap their arithmetic. Its values stay 0 where it holds no data for this thread.
     int tile_begin_3 = chunk_begin + 8192;
-    tile_max[4] = -CUDART_INF_F;
+    int elem_2 = chunk_begin + (1024 + tid) * 8;
+    unsigned int at = tiles_addr + (unsigned int)(tid * 32);
+    float values[8];
+    #pragma unroll
+    for (int j_3 = 0; j_3 < 8; j_3++) {
+        values[j_3] = 0.0f;
+    }
     if (tile_begin_3 < chunk_end) {
         mbarrier_wait(landed_addr, 0);
-        if (thread_elem < chunk_room - 8192) {
-            unsigned int at = tiles_addr + (unsigned int)(tid * 32);
-            float values[8];
+        if (elem_2 < chunk_end) {
             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                 : "=r"(*reinterpret_cast<uint32_t*>(&values[0])), "=r"(*reinterpret_cast<uint32_t*>(&values[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&values[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&values[(0) + 3]))
                 : "r"(at));
             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                 : "=r"(*reinterpret_cast<uint32_t*>(&values[4])), "=r"(*reinterpret_cast<uint32_t*>(&values[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&values[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&values[(4) + 3]))
                 : "r"(at + 16));
-            float max_here_1 = -CUDART_INF_F;
+        }
+    }
+    tile_max[4] = -CUDART_INF_F;
+    int elem_4 = chunk_begin + (768 + tid) * 8;
+    if (elem_4 < chunk_end) {
+        // All four register tiles hold data, so the first pass is one straight-line block. Shared tile 4 is
+        // exponentiated whether or not it holds data; its results are kept only where it does. Every value
+        // goes through the same operations as in the per-tile loop of the other branch.
+        float new_max_1;
+        float acc_1;
+        if (inv_temperature == 1.0f) {
+            // The row's temperature is the same for the whole CTA. At 1 the products x * 1.0f are skipped:
+            // they only flush subnormals and quiet NaNs, which the exponents do too, and a subnormal maximum
+            // acts as a zero.
+            float max_here[5];
+            max_here[0] = max_noftz(
+                max_noftz(max_noftz(cache[0], cache[1]), max_noftz(cache[2], cache[3])),
+                max_noftz(max_noftz(cache[4], cache[5]), max_noftz(cache[6], cache[7])));
+            max_here[1] = max_noftz(
+                max_noftz(max_noftz(cache[8 + 0], cache[8 + 1]), max_noftz(cache[8 + 2], cache[8 + 3])),
+                max_noftz(max_noftz(cache[8 + 4], cache[8 + 5]), max_noftz(cache[8 + 6], cache[8 + 7])));
+            {
+                float new_max;
+                asm("max.f32 %0, %1, %2;" : "=f"(new_max) : "f"(run_max), "f"(max_here[0]));
+                float acc = -0.0f;
+                #pragma unroll
+                for (int j_2 = 0; j_2 < 8; j_2++) {
+                    float p = exp2_term(cache[0 + j_2], new_max);
+                    cache[0 + j_2] = p;
+                    acc += p;
+                }
+                run_sum = acc;
+                run_max = new_max;
+                tile_max[0] = new_max;
+            }
+            max_here[2] = max_noftz(
+                max_noftz(max_noftz(cache[16 + 0], cache[16 + 1]), max_noftz(cache[16 + 2], cache[16 + 3])),
+                max_noftz(max_noftz(cache[16 + 4], cache[16 + 5]), max_noftz(cache[16 + 6], cache[16 + 7])));
+            {
+                float new_max;
+                asm("max.f32 %0, %1, %2;" : "=f"(new_max) : "f"(run_max), "f"(max_here[1]));
+                float _exp2_9 = exp2_rescale(run_max, new_max);
+                float acc = run_sum * _exp2_9;
+                #pragma unroll
+                for (int j_2 = 0; j_2 < 8; j_2++) {
+                    float p = exp2_term(cache[8 + j_2], new_max);
+                    cache[8 + j_2] = p;
+                    acc += p;
+                }
+                run_sum = acc;
+                run_max = new_max;
+                tile_max[1] = new_max;
+            }
+            max_here[3] = max_noftz(
+                max_noftz(max_noftz(cache[24 + 0], cache[24 + 1]), max_noftz(cache[24 + 2], cache[24 + 3])),
+                max_noftz(max_noftz(cache[24 + 4], cache[24 + 5]), max_noftz(cache[24 + 6], cache[24 + 7])));
+            {
+                float new_max;
+                asm("max.f32 %0, %1, %2;" : "=f"(new_max) : "f"(run_max), "f"(max_here[2]));
+                float _exp2_9 = exp2_rescale(run_max, new_max);
+                float acc = run_sum * _exp2_9;
+                #pragma unroll
+                for (int j_2 = 0; j_2 < 8; j_2++) {
+                    float p = exp2_term(cache[16 + j_2], new_max);
+                    cache[16 + j_2] = p;
+                    acc += p;
+                }
+                run_sum = acc;
+                run_max = new_max;
+                tile_max[2] = new_max;
+            }
+            max_here[4] = max_noftz(
+                max_noftz(max_noftz(values[0], values[1]), max_noftz(values[2], values[3])),
+                max_noftz(max_noftz(values[4], values[5]), max_noftz(values[6], values[7])));
+            {
+                float new_max;
+                asm("max.f32 %0, %1, %2;" : "=f"(new_max) : "f"(run_max), "f"(max_here[3]));
+                float _exp2_9 = exp2_rescale(run_max, new_max);
+                float acc = run_sum * _exp2_9;
+                #pragma unroll
+                for (int j_2 = 0; j_2 < 8; j_2++) {
+                    float p = exp2_term(cache[24 + j_2], new_max);
+                    cache[24 + j_2] = p;
+                    acc += p;
+                }
+                run_sum = acc;
+                run_max = new_max;
+                tile_max[3] = new_max;
+            }
+            asm("max.f32 %0, %1, %2;" : "=f"(new_max_1) : "f"(run_max), "f"(max_here[4]));
+            float _exp2_10 = exp2_rescale(run_max, new_max_1);
+            acc_1 = run_sum * _exp2_10;
+            #pragma unroll
+            for (int j_4 = 0; j_4 < 8; j_4++) {
+                float p_1 = exp2_term(values[j_4], new_max_1);
+                values[j_4] = p_1;
+                acc_1 += p_1;
+            }
+        } else {
+            float max_here[5];
+            #pragma unroll
+            for (int j_1 = 0; j_1 < 8; j_1++) {
+                float scaled = cache[0 + j_1] * inv_temperature;
+                cache[0 + j_1] = scaled;
+            }
+            max_here[0] = max_noftz(
+                max_noftz(max_noftz(cache[0], cache[1]), max_noftz(cache[2], cache[3])),
+                max_noftz(max_noftz(cache[4], cache[5]), max_noftz(cache[6], cache[7])));
+            #pragma unroll
+            for (int j_1 = 0; j_1 < 8; j_1++) {
+                float scaled = cache[8 + j_1] * inv_temperature;
+                cache[8 + j_1] = scaled;
+            }
+            max_here[1] = max_noftz(
+                max_noftz(max_noftz(cache[8 + 0], cache[8 + 1]), max_noftz(cache[8 + 2], cache[8 + 3])),
+                max_noftz(max_noftz(cache[8 + 4], cache[8 + 5]), max_noftz(cache[8 + 6], cache[8 + 7])));
+            {
+                float new_max;
+                asm("max.f32 %0, %1, %2;" : "=f"(new_max) : "f"(run_max), "f"(max_here[0]));
+                float acc = -0.0f;
+                #pragma unroll
+                for (int j_2 = 0; j_2 < 8; j_2++) {
+                    float p = exp2_term(cache[0 + j_2], new_max);
+                    cache[0 + j_2] = p;
+                    acc += p;
+                }
+                run_sum = acc;
+                run_max = new_max;
+                tile_max[0] = new_max;
+            }
+            #pragma unroll
+            for (int j_1 = 0; j_1 < 8; j_1++) {
+                float scaled = cache[16 + j_1] * inv_temperature;
+                cache[16 + j_1] = scaled;
+            }
+            max_here[2] = max_noftz(
+                max_noftz(max_noftz(cache[16 + 0], cache[16 + 1]), max_noftz(cache[16 + 2], cache[16 + 3])),
+                max_noftz(max_noftz(cache[16 + 4], cache[16 + 5]), max_noftz(cache[16 + 6], cache[16 + 7])));
+            {
+                float new_max;
+                asm("max.f32 %0, %1, %2;" : "=f"(new_max) : "f"(run_max), "f"(max_here[1]));
+                float _exp2_9 = exp2_rescale(run_max, new_max);
+                float acc = run_sum * _exp2_9;
+                #pragma unroll
+                for (int j_2 = 0; j_2 < 8; j_2++) {
+                    float p = exp2_term(cache[8 + j_2], new_max);
+                    cache[8 + j_2] = p;
+                    acc += p;
+                }
+                run_sum = acc;
+                run_max = new_max;
+                tile_max[1] = new_max;
+            }
+            #pragma unroll
+            for (int j_1 = 0; j_1 < 8; j_1++) {
+                float scaled = cache[24 + j_1] * inv_temperature;
+                cache[24 + j_1] = scaled;
+            }
+            max_here[3] = max_noftz(
+                max_noftz(max_noftz(cache[24 + 0], cache[24 + 1]), max_noftz(cache[24 + 2], cache[24 + 3])),
+                max_noftz(max_noftz(cache[24 + 4], cache[24 + 5]), max_noftz(cache[24 + 6], cache[24 + 7])));
+            {
+                float new_max;
+                asm("max.f32 %0, %1, %2;" : "=f"(new_max) : "f"(run_max), "f"(max_here[2]));
+                float _exp2_9 = exp2_rescale(run_max, new_max);
+                float acc = run_sum * _exp2_9;
+                #pragma unroll
+                for (int j_2 = 0; j_2 < 8; j_2++) {
+                    float p = exp2_term(cache[16 + j_2], new_max);
+                    cache[16 + j_2] = p;
+                    acc += p;
+                }
+                run_sum = acc;
+                run_max = new_max;
+                tile_max[2] = new_max;
+            }
             #pragma unroll
             for (int j_3 = 0; j_3 < 8; j_3++) {
                 float scaled_1 = values[j_3] * inv_temperature;
                 values[j_3] = scaled_1;
-                max_here_1 = max_noftz(max_here_1, scaled_1);
             }
-            float new_max_1;
-            asm("max.f32 %0, %1, %2;" : "=f"(new_max_1) : "f"(run_max), "f"(max_here_1));
-            float safe_max_1 = ((new_max_1 == -CUDART_INF_F) ? 0.0f : new_max_1);
-            const float _exp2_shift_22 = exp2_shift(safe_max_1);
-            float _exp2_10 = exp2_rescale_shifted(run_max, exp2_shift(run_max), safe_max_1, _exp2_shift_22);
-            float acc_1 = run_sum * _exp2_10;
+            max_here[4] = max_noftz(
+                max_noftz(max_noftz(values[0], values[1]), max_noftz(values[2], values[3])),
+                max_noftz(max_noftz(values[4], values[5]), max_noftz(values[6], values[7])));
+            {
+                float new_max;
+                asm("max.f32 %0, %1, %2;" : "=f"(new_max) : "f"(run_max), "f"(max_here[3]));
+                float _exp2_9 = exp2_rescale(run_max, new_max);
+                float acc = run_sum * _exp2_9;
+                #pragma unroll
+                for (int j_2 = 0; j_2 < 8; j_2++) {
+                    float p = exp2_term(cache[24 + j_2], new_max);
+                    cache[24 + j_2] = p;
+                    acc += p;
+                }
+                run_sum = acc;
+                run_max = new_max;
+                tile_max[3] = new_max;
+            }
+            asm("max.f32 %0, %1, %2;" : "=f"(new_max_1) : "f"(run_max), "f"(max_here[4]));
+            float _exp2_10 = exp2_rescale(run_max, new_max_1);
+            acc_1 = run_sum * _exp2_10;
             #pragma unroll
             for (int j_4 = 0; j_4 < 8; j_4++) {
-                float p_1 = exp2_term(values[j_4], safe_max_1);
+                float p_1 = exp2_term(values[j_4], new_max_1);
                 values[j_4] = p_1;
                 acc_1 += p_1;
             }
+        }
+        const bool tile4_here = elem_2 < chunk_end;
+        if (tile4_here) {
             asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(at), "r"(__float_as_uint(values[0])), "r"(__float_as_uint(values[1])), "r"(__float_as_uint(values[2])), "r"(__float_as_uint(values[3])) : "memory");
             asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(at + 16), "r"(__float_as_uint(values[4])), "r"(__float_as_uint(values[5])), "r"(__float_as_uint(values[6])), "r"(__float_as_uint(values[7])) : "memory");
-            run_sum = acc_1;
-            run_max = new_max_1;
-            tile_max[4] = new_max_1;
+        }
+        run_sum = tile4_here ? acc_1 : run_sum;
+        run_max = tile4_here ? new_max_1 : run_max;
+        tile_max[4] = tile4_here ? new_max_1 : -CUDART_INF_F;
+    } else {
+        // Some register tile of this thread is empty, so shared tile 4 holds none of its data either.
+        #pragma unroll
+        for (int tile_1 = 0; tile_1 < 4; tile_1++) {
+            int elem_1 = chunk_begin + (tile_1 * 256 + tid) * 8;
+            tile_max[tile_1] = -CUDART_INF_F;
+            if (elem_1 < chunk_end) {
+                #pragma unroll
+                for (int j_1 = 0; j_1 < 8; j_1++) {
+                    float scaled = cache[tile_1 * 8 + j_1] / temperature;
+                    cache[tile_1 * 8 + j_1] = scaled;
+                }
+                float max_here = max_noftz(
+                    max_noftz(max_noftz(cache[tile_1 * 8 + 0], cache[tile_1 * 8 + 1]), max_noftz(cache[tile_1 * 8 + 2], cache[tile_1 * 8 + 3])),
+                    max_noftz(max_noftz(cache[tile_1 * 8 + 4], cache[tile_1 * 8 + 5]), max_noftz(cache[tile_1 * 8 + 6], cache[tile_1 * 8 + 7])));
+                float new_max;
+                asm("max.f32 %0, %1, %2;" : "=f"(new_max) : "f"(run_max), "f"(max_here));
+                float _exp2_9 = exp2_rescale(run_max, new_max);
+                float acc = (tile_1 == 0) ? -0.0f : run_sum * _exp2_9;
+                #pragma unroll
+                for (int j_2 = 0; j_2 < 8; j_2++) {
+                    float p = exp2_term(cache[tile_1 * 8 + j_2], new_max);
+                    cache[tile_1 * 8 + j_2] = p;
+                    acc += p;
+                }
+                run_sum = acc;
+                run_max = new_max;
+                tile_max[tile_1] = new_max;
+            }
         }
     }
     int tile_begin_0_1 = chunk_begin + 10240;
+    int elem_1_1 = chunk_begin + (1280 + tid) * 8;
     tile_max[5] = -CUDART_INF_F;
     if (tile_begin_0_1 < chunk_end) {
         mbarrier_wait(landed_addr + 8, 0);
-        if (thread_elem < chunk_room - 10240) {
+        if (elem_1_1 < chunk_end) {
             unsigned int at_1 = tiles_addr + 8192 + (unsigned int)(tid * 32);
             float values_1[8];
             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
@@ -3046,22 +3446,21 @@ __device__ __forceinline__ void flashinfer_blackwell_softmax_cached_cluster_c16_
             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                 : "=r"(*reinterpret_cast<uint32_t*>(&values_1[4])), "=r"(*reinterpret_cast<uint32_t*>(&values_1[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&values_1[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&values_1[(4) + 3]))
                 : "r"(at_1 + 16));
-            float max_here_2 = -CUDART_INF_F;
             #pragma unroll
             for (int j_5 = 0; j_5 < 8; j_5++) {
-                float scaled_2 = values_1[j_5] * inv_temperature;
+                float scaled_2 = values_1[j_5] / temperature;
                 values_1[j_5] = scaled_2;
-                max_here_2 = max_noftz(max_here_2, scaled_2);
             }
+            float max_here_2 = max_noftz(
+                max_noftz(max_noftz(values_1[0], values_1[1]), max_noftz(values_1[2], values_1[3])),
+                max_noftz(max_noftz(values_1[4], values_1[5]), max_noftz(values_1[6], values_1[7])));
             float new_max_2;
             asm("max.f32 %0, %1, %2;" : "=f"(new_max_2) : "f"(run_max), "f"(max_here_2));
-            float safe_max_2 = ((new_max_2 == -CUDART_INF_F) ? 0.0f : new_max_2);
-            const float _exp2_shift_23 = exp2_shift(safe_max_2);
-            float _exp2_11 = exp2_rescale_shifted(run_max, exp2_shift(run_max), safe_max_2, _exp2_shift_23);
+            float _exp2_11 = exp2_rescale(run_max, new_max_2);
             float acc_2 = run_sum * _exp2_11;
             #pragma unroll
             for (int j_6 = 0; j_6 < 8; j_6++) {
-                float p_2 = exp2_term(values_1[j_6], safe_max_2);
+                float p_2 = exp2_term(values_1[j_6], new_max_2);
                 values_1[j_6] = p_2;
                 acc_2 += p_2;
             }
@@ -3073,10 +3472,11 @@ __device__ __forceinline__ void flashinfer_blackwell_softmax_cached_cluster_c16_
         }
     }
     int tile_begin_2_1 = chunk_begin + 12288;
+    int elem_3 = chunk_begin + (1536 + tid) * 8;
     tile_max[6] = -CUDART_INF_F;
     if (tile_begin_2_1 < chunk_end) {
         mbarrier_wait(landed_addr + 16, 0);
-        if (thread_elem < chunk_room - 12288) {
+        if (elem_3 < chunk_end) {
             unsigned int at_2 = tiles_addr + 16384 + (unsigned int)(tid * 32);
             float values_2[8];
             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
@@ -3085,22 +3485,21 @@ __device__ __forceinline__ void flashinfer_blackwell_softmax_cached_cluster_c16_
             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                 : "=r"(*reinterpret_cast<uint32_t*>(&values_2[4])), "=r"(*reinterpret_cast<uint32_t*>(&values_2[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&values_2[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&values_2[(4) + 3]))
                 : "r"(at_2 + 16));
-            float max_here_3 = -CUDART_INF_F;
             #pragma unroll
             for (int j_7 = 0; j_7 < 8; j_7++) {
-                float scaled_3 = values_2[j_7] * inv_temperature;
+                float scaled_3 = values_2[j_7] / temperature;
                 values_2[j_7] = scaled_3;
-                max_here_3 = max_noftz(max_here_3, scaled_3);
             }
+            float max_here_3 = max_noftz(
+                max_noftz(max_noftz(values_2[0], values_2[1]), max_noftz(values_2[2], values_2[3])),
+                max_noftz(max_noftz(values_2[4], values_2[5]), max_noftz(values_2[6], values_2[7])));
             float new_max_3;
             asm("max.f32 %0, %1, %2;" : "=f"(new_max_3) : "f"(run_max), "f"(max_here_3));
-            float safe_max_3 = ((new_max_3 == -CUDART_INF_F) ? 0.0f : new_max_3);
-            const float _exp2_shift_24 = exp2_shift(safe_max_3);
-            float _exp2_12 = exp2_rescale_shifted(run_max, exp2_shift(run_max), safe_max_3, _exp2_shift_24);
+            float _exp2_12 = exp2_rescale(run_max, new_max_3);
             float acc_3 = run_sum * _exp2_12;
             #pragma unroll
             for (int j_8 = 0; j_8 < 8; j_8++) {
-                float p_3 = exp2_term(values_2[j_8], safe_max_3);
+                float p_3 = exp2_term(values_2[j_8], new_max_3);
                 values_2[j_8] = p_3;
                 acc_3 += p_3;
             }
@@ -3112,10 +3511,11 @@ __device__ __forceinline__ void flashinfer_blackwell_softmax_cached_cluster_c16_
         }
     }
     int tile_begin_4 = chunk_begin + 14336;
+    int elem_5 = chunk_begin + (1792 + tid) * 8;
     tile_max[7] = -CUDART_INF_F;
     if (tile_begin_4 < chunk_end) {
         mbarrier_wait(landed_addr + 24, 0);
-        if (thread_elem < chunk_room - 14336) {
+        if (elem_5 < chunk_end) {
             unsigned int at_3 = tiles_addr + 24576 + (unsigned int)(tid * 32);
             float values_3[8];
             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
@@ -3124,22 +3524,21 @@ __device__ __forceinline__ void flashinfer_blackwell_softmax_cached_cluster_c16_
             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                 : "=r"(*reinterpret_cast<uint32_t*>(&values_3[4])), "=r"(*reinterpret_cast<uint32_t*>(&values_3[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&values_3[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&values_3[(4) + 3]))
                 : "r"(at_3 + 16));
-            float max_here_4 = -CUDART_INF_F;
             #pragma unroll
             for (int j_9 = 0; j_9 < 8; j_9++) {
-                float scaled_4 = values_3[j_9] * inv_temperature;
+                float scaled_4 = values_3[j_9] / temperature;
                 values_3[j_9] = scaled_4;
-                max_here_4 = max_noftz(max_here_4, scaled_4);
             }
+            float max_here_4 = max_noftz(
+                max_noftz(max_noftz(values_3[0], values_3[1]), max_noftz(values_3[2], values_3[3])),
+                max_noftz(max_noftz(values_3[4], values_3[5]), max_noftz(values_3[6], values_3[7])));
             float new_max_4;
             asm("max.f32 %0, %1, %2;" : "=f"(new_max_4) : "f"(run_max), "f"(max_here_4));
-            float safe_max_4 = ((new_max_4 == -CUDART_INF_F) ? 0.0f : new_max_4);
-            const float _exp2_shift_25 = exp2_shift(safe_max_4);
-            float _exp2_13 = exp2_rescale_shifted(run_max, exp2_shift(run_max), safe_max_4, _exp2_shift_25);
+            float _exp2_13 = exp2_rescale(run_max, new_max_4);
             float acc_4 = run_sum * _exp2_13;
             #pragma unroll
             for (int j_10 = 0; j_10 < 8; j_10++) {
-                float p_4 = exp2_term(values_3[j_10], safe_max_4);
+                float p_4 = exp2_term(values_3[j_10], new_max_4);
                 values_3[j_10] = p_4;
                 acc_4 += p_4;
             }
@@ -3152,9 +3551,7 @@ __device__ __forceinline__ void flashinfer_blackwell_softmax_cached_cluster_c16_
     }
     float warp_max;
     asm volatile("redux.sync.max.f32 %0, %1, 0xffffffff;" : "=f"(warp_max) : "f"(run_max));
-    float safe_warp_max = ((warp_max == -CUDART_INF_F) ? 0.0f : warp_max);
-    const float _exp2_shift_26 = exp2_shift(safe_warp_max);
-    float _exp2_14 = exp2_rescale_shifted(run_max, exp2_shift(run_max), safe_warp_max, _exp2_shift_26);
+    float _exp2_14 = exp2_rescale(run_max, warp_max);
     float warp_sum = run_sum * _exp2_14;
     #pragma unroll
     for (int offset = 16; offset > 0; offset >>= 1)
@@ -3209,10 +3606,6 @@ __device__ __forceinline__ void flashinfer_blackwell_softmax_cached_cluster_c16_
     }
     float row_max;
     asm volatile("redux.sync.max.f32 %0, %1, 0xffffffff;" : "=f"(row_max) : "f"(lane_max));
-    float tile_rescale[4];
-    #pragma unroll
-    for (int tile_h = 0; tile_h < 4; tile_h++)
-        tile_rescale[tile_h] = exp2_rescale(tile_max[tile_h], row_max);
     float lane_sum = 0.0f;
     #pragma unroll
     for (int k_3 = 0; k_3 < 4; k_3++) {
@@ -3224,11 +3617,14 @@ __device__ __forceinline__ void flashinfer_blackwell_softmax_cached_cluster_c16_
     for (int offset = 16; offset > 0; offset >>= 1)
         row_sum += __shfl_xor_sync(0xFFFFFFFF, row_sum, offset);
     float inv_sum = approx_rcp(row_sum);
+    int tid_o;
+    asm volatile("mov.u32 %0, %%tid.x;" : "=r"(tid_o));
     #pragma unroll
     for (int tile_2 = 0; tile_2 < 4; tile_2++) {
-        if (thread_elem < chunk_room - tile_2 * 2048) {
-            unsigned long long index_1 = row_base + (unsigned long long)chunk_begin + (unsigned long long)(thread_elem + tile_2 * 2048);
-            float _exp2_18 = tile_rescale[tile_2];
+        int elem_0 = chunk_begin + (tile_2 * 256 + tid_o) * 8;
+        if (elem_0 < chunk_end) {
+            unsigned long long index_1 = row_base + (unsigned long long)elem_0;
+            float _exp2_18 = exp2_rescale(tile_max[tile_2], row_max);
             float scale = _exp2_18 * inv_sum;
             float out_values[8];
             #pragma unroll
@@ -3259,9 +3655,10 @@ __device__ __forceinline__ void flashinfer_blackwell_softmax_cached_cluster_c16_
             }
         }
     }
-    if (thread_elem < chunk_room - 8192) {
-        unsigned long long index_2 = row_base + (unsigned long long)chunk_begin + (unsigned long long)(thread_elem + 8192);
-        unsigned int at_4 = tiles_addr + (unsigned int)(tid * 32);
+    int elem_6 = chunk_begin + (1024 + tid_o) * 8;
+    if (elem_6 < chunk_end) {
+        unsigned long long index_2 = row_base + (unsigned long long)elem_6;
+        unsigned int at_4 = tiles_addr + (unsigned int)(tid_o * 32);
         float values_4[8];
         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
             : "=r"(*reinterpret_cast<uint32_t*>(&values_4[0])), "=r"(*reinterpret_cast<uint32_t*>(&values_4[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&values_4[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&values_4[(0) + 3]))
@@ -3299,9 +3696,10 @@ __device__ __forceinline__ void flashinfer_blackwell_softmax_cached_cluster_c16_
             #endif
         }
     }
-    if (thread_elem < chunk_room - 10240) {
-        unsigned long long index_3 = row_base + (unsigned long long)chunk_begin + (unsigned long long)(thread_elem + 10240);
-        unsigned int at_5 = tiles_addr + 8192 + (unsigned int)(tid * 32);
+    int elem_7 = chunk_begin + (1280 + tid_o) * 8;
+    if (elem_7 < chunk_end) {
+        unsigned long long index_3 = row_base + (unsigned long long)elem_7;
+        unsigned int at_5 = tiles_addr + 8192 + (unsigned int)(tid_o * 32);
         float values_5[8];
         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
             : "=r"(*reinterpret_cast<uint32_t*>(&values_5[0])), "=r"(*reinterpret_cast<uint32_t*>(&values_5[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&values_5[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&values_5[(0) + 3]))
@@ -3339,9 +3737,10 @@ __device__ __forceinline__ void flashinfer_blackwell_softmax_cached_cluster_c16_
             #endif
         }
     }
-    if (thread_elem < chunk_room - 12288) {
-        unsigned long long index_4 = row_base + (unsigned long long)chunk_begin + (unsigned long long)(thread_elem + 12288);
-        unsigned int at_6 = tiles_addr + 16384 + (unsigned int)(tid * 32);
+    int elem_8 = chunk_begin + (1536 + tid_o) * 8;
+    if (elem_8 < chunk_end) {
+        unsigned long long index_4 = row_base + (unsigned long long)elem_8;
+        unsigned int at_6 = tiles_addr + 16384 + (unsigned int)(tid_o * 32);
         float values_6[8];
         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
             : "=r"(*reinterpret_cast<uint32_t*>(&values_6[0])), "=r"(*reinterpret_cast<uint32_t*>(&values_6[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&values_6[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&values_6[(0) + 3]))
@@ -3379,9 +3778,10 @@ __device__ __forceinline__ void flashinfer_blackwell_softmax_cached_cluster_c16_
             #endif
         }
     }
-    if (thread_elem < chunk_room - 14336) {
-        unsigned long long index_5 = row_base + (unsigned long long)chunk_begin + (unsigned long long)(thread_elem + 14336);
-        unsigned int at_7 = tiles_addr + 24576 + (unsigned int)(tid * 32);
+    int elem_9 = chunk_begin + (1792 + tid_o) * 8;
+    if (elem_9 < chunk_end) {
+        unsigned long long index_5 = row_base + (unsigned long long)elem_9;
+        unsigned int at_7 = tiles_addr + 24576 + (unsigned int)(tid_o * 32);
         float values_7[8];
         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
             : "=r"(*reinterpret_cast<uint32_t*>(&values_7[0])), "=r"(*reinterpret_cast<uint32_t*>(&values_7[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&values_7[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&values_7[(0) + 3]))

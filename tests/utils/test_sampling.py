@@ -1084,6 +1084,33 @@ def test_blackwell_cached_cluster_balanced_chunk_per_arch(
 
 
 @pytest.mark.parametrize(
+    "rows,vocab_size",
+    [
+        (32, 151936),  # on B200 a full wave of 16-CTA clusters and one more
+        (16, 151936),
+        (48, 151936),
+        (64, 151936),
+        (32, 128000),
+        (32, 152064),
+    ],
+)
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_blackwell_softmax_unit_temperature_relative_error(rows, vocab_size, seed):
+    # A scalar temperature of 1 and no temperature run the same kernel and give
+    # identical outputs, each within 1e-6 relative error of float64 softmax.
+    _skip_unless_b200_or_gb300()
+    torch.manual_seed(seed)
+    logits = torch.randn(rows, vocab_size, device="cuda")
+    expected = torch.softmax(logits.double(), dim=-1)
+    unit = flashinfer.sampling.softmax(logits, temperature=1.0)
+    none = flashinfer.sampling.softmax(logits, temperature=None)
+
+    assert torch.equal(unit, none)
+    rel = (unit.double() - expected).abs() / expected
+    assert rel.max().item() <= 1e-6
+
+
+@pytest.mark.parametrize(
     "rows,vocab_size,cluster_ctas,sm100_chunk,sm103_chunk",
     [
         # 16-CTA shared-tile kernel: up to 9 waves and from 9 up to 13 waves
