@@ -3104,7 +3104,7 @@ class BatchPrefillTSWrapper:
             softmax_scale = geometry.head_dim**-0.5
         softmax_scale = normalize_scale(softmax_scale, "softmax_scale", geometry.device)
         output_scale = normalize_scale(output_scale, "output_scale", geometry.device)
-        _context_softmax_operand(softmax_scale)
+        scale_softmax_log2 = _context_softmax_operand(softmax_scale)
         vc_output_scale_buffer = (
             torch.empty(
                 (
@@ -3153,7 +3153,7 @@ class BatchPrefillTSWrapper:
         self._plan_state = _ContextPlanState(
             geometry=geometry,
             softmax_scale=softmax_scale,
-            scale_softmax_log2=_context_softmax_operand(softmax_scale),
+            scale_softmax_log2=scale_softmax_log2,
             output_scale=output_scale,
             empty_i32=empty_i32,
             variable_window_padded_starts=variable_window_padded_starts,
@@ -3547,7 +3547,7 @@ class BatchPrefillPagedTSWrapper:
             softmax_scale = geometry.head_dim**-0.5
         softmax_scale = normalize_scale(softmax_scale, "softmax_scale", geometry.device)
         output_scale = normalize_scale(output_scale, "output_scale", geometry.device)
-        _context_softmax_operand(softmax_scale)
+        scale_softmax_log2 = _context_softmax_operand(softmax_scale)
         compiled, policy = _get_compiled_paged_context(
             _paged_context_compile_spec(
                 geometry,
@@ -3565,7 +3565,7 @@ class BatchPrefillPagedTSWrapper:
         self._plan_state = _PagedContextPlanState(
             geometry=geometry,
             softmax_scale=softmax_scale,
-            scale_softmax_log2=_context_softmax_operand(softmax_scale),
+            scale_softmax_log2=scale_softmax_log2,
             output_scale=output_scale,
             compiled=compiled,
             policy=policy,
