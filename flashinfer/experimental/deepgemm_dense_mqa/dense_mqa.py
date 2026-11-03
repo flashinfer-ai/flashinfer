@@ -25,9 +25,9 @@ heads, 2 for 64 heads). The one-shot ``fp8_mqa_logits`` mirrors DeepGEMM's
 logits program (the ``q1`` and ``<tier>`` routes), or ONE logits launch that
 computes the schedule in-kernel (the ``:short`` routes: the fused single-query
 chain ``q1:short``, the warp-scan classes ``q128:short`` / ``le32:short`` and
-the CTA-scan classes ``le768:short`` (FP8) / ``le1024:short`` (FP4)). On sm_100a
-the stage buckets of ``fp8:q128:short`` (``K <= 4096``) and
-``fp8:full:le32:short`` (``K <= 32768``) launch the warp-scan text with a
+the CTA-scan classes ``le768:short`` (FP8) / ``le1024:short`` (FP4)). The
+stage buckets of ``fp8:q128:short`` (``K <= 4096``, sm_100a and sm_103a) and
+``fp8:full:le32:short`` (``K <= 32768``, sm_100a) launch the warp-scan text with a
 four-stage TMEM accumulator ring (identical logits and schedule words); on
 sm_103a the stage bucket of ``fp8:qle2048:short`` (``Q <= 136``,
 ``K <= 8448``) launches the fused tiered text with that ring. A class
@@ -94,6 +94,9 @@ BLOCK_QH = 128  # query rows x heads per MMA tile
 BLOCK_Q = BLOCK_QH // NUM_HEADS
 BLOCK_KV = 256
 HEAD_DIM = 128
+# The most FP32 logits one launch of a 32-head FP8 program writes: its stores form 32-bit element offsets, so
+# fp8_mqa_logits launches a longer prefill chunk per range of query rows.
+MAX_LAUNCH_LOGITS = 1 << 32
 # Query ceiling of the single-launch fused Q <= 128 route (``fp8:qle128:short``): the ``le128`` tier's token ceiling
 # (32 scan lanes x BLOCK_Q); its KV bound is the catalog policy ``fused_qle128_max_kv``.
 FUSED_QLE128_MAX_Q = 128
@@ -469,7 +472,11 @@ def route_name(precision, queries, keys, num_heads=NUM_HEADS):
     a class bound may be a per-architecture map -- the FP4 ``fused_scan32_max_kv`` /
     ``fused_scan1024_max_kv`` are ``{"sm_100a": 1048576, "sm_103a": 1048832}`` /
     ``{"sm_100a": 65536, "sm_103a": 65792}`` -- where the logical name applies the most
-    permissive value and :func:`served_route` the device's own).
+    permissive value and :func:`served_route` the device's own; the FP8 32-block class
+    and the FP4 32- and 1024-block classes also carry a per-architecture small-Q band,
+    ``fused_scan<ceiling>_small_q_max_queries`` / ``fused_scan<ceiling>_small_q_max_kv``,
+    that raises the class's bound for a query count up to the band's query bound,
+    :func:`_scan_class_bound`).
     The logical name needs one rule: every architecture must share the tier's
     precedence (``ValueError`` otherwise -- pass the device to :func:`served_route`).
     """
@@ -497,17 +504,36 @@ def _scan_bound(value, arch):
     return int(value)
 
 
+def _scan_class_bound(bounds, ceiling, queries, arch=None):
+    """The KV bound of the scan class ``ceiling`` for a call of ``queries`` on ``arch``: ``fused_scan<ceiling>_max_kv``,
+    raised to ``fused_scan<ceiling>_small_q_max_kv[arch]`` for a query count up to
+    ``fused_scan<ceiling>_small_q_max_queries[arch]`` where the class publishes that per-architecture small-Q band (each
+    band measured on its device; a query bound below every query count of the class -- 1 for a 32-block class, 128 for
+    the 1024-block class -- where an architecture has none).  ``arch=None`` reads the most permissive architecture (the
+    logical route name)."""
+    bound = _scan_bound(bounds[f"fused_scan{ceiling}_max_kv"], arch)
+    band_queries = bounds.get(f"fused_scan{ceiling}_small_q_max_queries")
+    if band_queries is None:
+        return bound
+    band_kv = bounds[f"fused_scan{ceiling}_small_q_max_kv"]
+    for name in sorted(band_queries) if arch is None else (arch,):
+        if queries <= int(band_queries[name]):
+            bound = max(bound, int(band_kv[name]))
+    return bound
+
+
 def _fused_scan_class(queries, keys, bounds, arch=None):
     """The in-kernel scan class that serves a 32-head call, or 0: the SMALLEST
     query-block ceiling of ``bounds["fused_scan_ceilings"]`` covering ``ceil(Q / 4)``
-    when ``K <= bounds["fused_scan<ceiling>_max_kv"]``. The class is fixed by the
+    when ``K`` is within the class's bound for the query count (``fused_scan<ceiling>_max_kv``
+    or its small-Q band, :func:`_scan_class_bound`). The class is fixed by the
     query count and only its own KV bound is consulted; above it the call takes
     the two-launch route, never a larger class."""
     blocks = (queries + BLOCK_Q - 1) // BLOCK_Q
     for ceiling in bounds["fused_scan_ceilings"]:
         ceiling = int(ceiling)
         if blocks <= ceiling:
-            if keys <= _scan_bound(bounds[f"fused_scan{ceiling}_max_kv"], arch):
+            if keys <= _scan_class_bound(bounds, ceiling, queries, arch):
                 return ceiling
             return 0
     return 0
@@ -1215,6 +1241,16 @@ class DenseMqaPlan:
         )
         stride = logits_stride(keys)
         padded_rows = (queries + bq - 1) // bq * bq
+        if (
+            precision == "fp8"
+            and num_heads == NUM_HEADS
+            and padded_rows * stride > MAX_LAUNCH_LOGITS
+        ):
+            raise ValueError(
+                f"the {NUM_HEADS}-head FP8 programs address at most {MAX_LAUNCH_LOGITS} logits per launch "
+                f"(Q = {queries}, logits_stride = {stride}); split the queries into row ranges "
+                "(fp8_mqa_logits does)"
+            )
         if output is None:
             rows = padded_rows if precision == "fp4" else queries
             output = torch.empty((rows, stride), dtype=torch.float32, device=q.device)[
@@ -1333,6 +1369,8 @@ def fp8_mqa_logits(
     outside each row's window) and the ``clean_logits`` flag is accepted for
     signature parity without changing the result.
     ``max_seqlen_k`` must be 0 (no narrowing of the returned view).
+    A 32-head call whose ``[Q, logits_stride(K)]`` logits pass ``MAX_LAUNCH_LOGITS`` elements runs one
+    launch per range of query rows.
     ``sm_count`` is the CTA budget (default: the device's SM count). Rows below
     the query block (``Q < BLOCK_Q``) are padded here where the route's program
     needs a whole block, and a KV-scale buffer whose storage is shorter than
@@ -1391,6 +1429,29 @@ def fp8_mqa_logits(
         )
         w_storage[:queries] = weights
         q, weights = q_storage, w_storage
+    stride = logits_stride(keys)
+    if (
+        num_heads == NUM_HEADS
+        and (queries + bq - 1) // bq * bq * stride > MAX_LAUNCH_LOGITS
+    ):
+        # One launch per range of whole query blocks; a short last range ends at Q and starts one block earlier.
+        rows = MAX_LAUNCH_LOGITS // stride // bq * bq
+        output = torch.empty((queries, stride), dtype=torch.float32, device=q.device)
+        for start in range(0, queries, rows):
+            start = min(start, queries - bq)
+            stop = min(queries, start + rows)
+            DenseMqaPlan(
+                "fp8",
+                q[start:stop],
+                kv_values,
+                weights[start:stop],
+                ks[start:stop],
+                ke[start:stop],
+                kv_scales=kv_scales,
+                output=output[start:stop],
+                sm_count=sm_count,
+            ).run()
+        return output[:, :keys]
     plan = DenseMqaPlan(
         "fp8", q, kv_values, weights, ks, ke, kv_scales=kv_scales, sm_count=sm_count
     )

@@ -147,6 +147,30 @@ from .sage_scales import (
 from cutlass.experimental import primitives as prims
 
 SmemDescOffsets: TypeAlias = tuple[int, int]
+
+# MXFP8 Q/K. One E8M0 scale per 32 channels of a token, so a 128-token tile of
+# head dimension 128 carries 512 scale bytes, the 128x4 atom the quantizer
+# writes. The load warp copies each atom behind its Q tile or K stage with the
+# tile's own barrier. The tensor core reads the scales from tensor memory, four
+# columns per operand, which the MMA warp fills with one 32x128b copy broadcast
+# to the four lane quarters. The eight columns of a QK step live in the tail of
+# the peer S tile, which is dead between the peer softmax's load and the peer's
+# next QK.
+MX_SCALE_TILE_BYTES = 512
+MX_SCALE_TMEM_COL = 120
+
+
+@cute.jit
+def _mx_scale_slot(smem_base: cutlass.Array, byte_offset: int) -> cutlass.Array:
+    """The shared-memory slot of one scale atom, the destination of its bulk copy."""
+    return cutlass.Array(
+        smem_base.data_ptr() + byte_offset,
+        dtype=cutlass.Uint8,
+        shape=(MX_SCALE_TILE_BYTES,),
+        addrspace=3,
+    )
+
+
 TmemAddr: TypeAlias = int | Int32
 TmemPtr: TypeAlias = cutlass.Array
 
@@ -199,8 +223,14 @@ def _mask_score_quad(
     score1: Float32,
     score2: Float32,
     score3: Float32,
+    first_bit: cutlass.Constexpr[int] = 0,
 ) -> tuple[Float32, Float32, Float32, Float32]:
-    """Expand four bitmap bits with setp and replace invalid scores."""
+    """Expand bits ``first_bit + [0, 4)`` with setp and replace invalid scores."""
+    compare = "".join(
+        f"and.b32 bit, {{$r0}}, {1 << (first_bit + i):#x};\n"
+        f"setp.ne.u32 valid{i}, bit, 0;\n"
+        for i in range(4)
+    )
     return cute.arch.inline_ptx(
         """
         {
@@ -210,14 +240,9 @@ def _mask_score_quad(
             mov.b32 {$w1}, {$r2};
             mov.b32 {$w2}, {$r3};
             mov.b32 {$w3}, {$r4};
-            and.b32 bit, {$r0}, 0x1;
-            setp.ne.u32 valid0, bit, 0;
-            and.b32 bit, {$r0}, 0x2;
-            setp.ne.u32 valid1, bit, 0;
-            and.b32 bit, {$r0}, 0x4;
-            setp.ne.u32 valid2, bit, 0;
-            and.b32 bit, {$r0}, 0x8;
-            setp.ne.u32 valid3, bit, 0;
+        """
+        + compare
+        + """
             @!valid0 mov.b32 {$w0}, 0xff7fffff;
             @!valid1 mov.b32 {$w1}, 0xff7fffff;
             @!valid2 mov.b32 {$w2}, 0xff7fffff;
@@ -478,6 +503,11 @@ class FmhaConfig:
     # tiles the shared K/V ring keeps in flight, so the ring never throttles
     # the K loads.
     sage_k_scale_stages: int = 4
+    # MXFP8 Q/K, selected by a Float8E8M0FNU Q/K input dtype. The QK UMMA is the
+    # block-scaled kind with one E8M0 scale per 32 channels of the E4M3
+    # operands. The scale atoms ride the Q and K loads and the MMA warp copies
+    # them into tensor memory before each QK step.
+    use_mxfp8_qk: bool = False
 
     # Variable sequence length mode stores Q/K/V/O as flattened
     # [sum_seqlen, head, dim] tensors and uses cum_seqlen_* for per-batch
@@ -1684,6 +1714,7 @@ class SmemQResource(MemoryResource):
 
     sQ_array: cutlass.Array = field(init=False, default=None)
     tma_q_desc: cutlass.Pointer | None = field(init=False, default=None)
+    q_scales: cute.Tensor | None = field(init=False, default=None)
     cfg: Constexpr[FmhaConfig] = field(init=False, default=None)
     _alloc: Constexpr[Optional[SmemAllocation]] = field(init=False, default=None)
     desc_q0_base: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
@@ -1694,14 +1725,18 @@ class SmemQResource(MemoryResource):
         tma_q_desc: cutlass.Pointer | None,
         pipeline_config: PipelineConfig,
         cfg: FmhaConfig,
+        q_scales: cute.Tensor | None = None,
         **kwargs: Any,
     ) -> None:
         """Bind the Q TMA descriptor and reserve SMEM for staged Q tiles."""
         super().__init__(pipeline_config=pipeline_config, **kwargs)
         self.tma_q_desc = tma_q_desc
+        self.q_scales = q_scales
         self.cfg = cfg
         total_elements = cfg.sQ_shape[0] * cfg.sQ_shape[1]
         size_bytes = total_elements * cfg.q_dtype.width // 8
+        if cfg.use_mxfp8_qk:
+            size_bytes += cfg.sQ_shape[0] * MX_SCALE_TILE_BYTES
         self._alloc = SmemAllocation(
             "smem_q", size_bytes, alignment=cfg.buffer_align_bytes
         )
@@ -1813,6 +1848,34 @@ class SmemQResource(MemoryResource):
                         q_coords,
                         stage_info.barrier,
                     )
+            if cutlass.const_expr(self.cfg.use_mxfp8_qk):
+                # The Q scale atom of this tile lands behind the Q tiles.
+                prims.cp_async_bulk_shared_cluster_global(
+                    _mx_scale_slot(
+                        stage_info.context.smem_base,
+                        self._alloc.offset
+                        + self.cfg.sQ_shape[0] * self.cfg.tma_copy_q_bytes
+                        + inst_idx * MX_SCALE_TILE_BYTES,
+                    ),
+                    self.q_scales.iterator
+                    + cute.crd2idx(
+                        (
+                            batch_coord,
+                            q_head_coord,
+                            # The second Q tile of the last work tile can lie
+                            # past the sequence; its rows are dropped, so it
+                            # reads the last atom instead of the next head's.
+                            cute.math.min(
+                                q_seq_offset // self.cfg.q_tile_m,
+                                Int32(self.q_scales.shape[2] - 1),
+                            ),
+                            0,
+                        ),
+                        self.q_scales.layout,
+                    ),
+                    stage_info.barrier,
+                    MX_SCALE_TILE_BYTES,
+                )
 
     def _build_q_descriptor(self, inst_idx: int) -> prims.Tcgen05SmemDesc:
         """Build SMEM descriptor for the current Q tile.
@@ -2243,6 +2306,7 @@ class SmemKVResource(MemoryResource):
     sK_array: cutlass.Array = field(init=False, default=None)
     tma_k_desc: cutlass.Pointer | None = field(init=False, default=None)
     tma_v_desc: cutlass.Pointer | None = field(init=False, default=None)
+    k_scales: cute.Tensor | None = field(init=False, default=None)
     page_offsets_kv: Optional["SmemPageOffsetsKvResource"] = field(
         init=False, default=None
     )
@@ -2263,6 +2327,7 @@ class SmemKVResource(MemoryResource):
         tma_v_desc: cutlass.Pointer | None,
         pipeline_config: PipelineConfig,
         cfg: FmhaConfig,
+        k_scales: cute.Tensor | None = None,
         page_offsets_kv: Optional["SmemPageOffsetsKvResource"] = None,
         page_offsets_v: Optional["SmemPageOffsetsKvResource"] = None,
         block_tables: cute.Pointer | None = None,
@@ -2281,6 +2346,7 @@ class SmemKVResource(MemoryResource):
         self.role = role
         self.tma_k_desc = tma_k_desc
         self.tma_v_desc = tma_v_desc
+        self.k_scales = k_scales
         self.page_offsets_kv = page_offsets_kv
         self.page_offsets_v = (
             page_offsets_v if page_offsets_v is not None else page_offsets_kv
@@ -2291,6 +2357,8 @@ class SmemKVResource(MemoryResource):
         # cfg.kv_stage, which is cfg.sK_shape[0].
         total_elements = pipeline_config.num_stages * cfg.sK_shape[1]
         size_bytes = total_elements * self._buffer_dtype(cfg, role).width // 8
+        if cfg.use_mxfp8_qk and role == "k":
+            size_bytes += pipeline_config.num_stages * MX_SCALE_TILE_BYTES
         self._alloc = SmemAllocation(
             f"smem_{role}", size_bytes, alignment=cfg.buffer_align_bytes
         )
@@ -2506,6 +2574,34 @@ class SmemKVResource(MemoryResource):
                         kv_coords,
                         stage_info.barrier,
                     )
+            if cutlass.const_expr(self.cfg.use_mxfp8_qk and not is_v):
+                # The K scale atom of this tile lands behind the K ring.
+                prims.cp_async_bulk_shared_cluster_global(
+                    _mx_scale_slot(
+                        stage_info.context.smem_base,
+                        self._alloc.offset
+                        + self.pipeline_config.num_stages * self.cfg.tma_copy_kv_bytes
+                        + stage_info.stage_idx * MX_SCALE_TILE_BYTES,
+                    ),
+                    self.k_scales.iterator
+                    + cute.crd2idx(
+                        (
+                            batch_coord,
+                            kv_head_coord,
+                            # The causal paired domain rounds the K tile count
+                            # up to even; the padded iteration's rows are masked,
+                            # so it reads the last atom instead of the next head's.
+                            cute.math.min(
+                                seq_offset // self.cfg.kv_tile_n,
+                                Int32(self.k_scales.shape[2] - 1),
+                            ),
+                            0,
+                        ),
+                        self.k_scales.layout,
+                    ),
+                    stage_info.barrier,
+                    MX_SCALE_TILE_BYTES,
+                )
 
     @producer_work
     @cute.jit
@@ -2962,6 +3058,10 @@ class TmemSPResource(MemoryResource):
     seqlen_k: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
     # p_in_smem: this group's SMEM P tile.
     smem_p: Optional[SmemPResource] = field(init=False, default=None)
+    # MXFP8 Q/K: the K ring allocation and depth, behind which the K scale atoms
+    # sit, and the destination of each QK step's scale copy in the peer S tail.
+    smem_k_alloc: Constexpr[Optional[SmemAllocation]] = field(init=False, default=None)
+    smem_k_stages: int = field(init=False, default=0)
     variable_window_start: Constexpr[TaskLocalVariable] = (
         TaskLocalVariable.uninitialized()
     )
@@ -3012,6 +3112,7 @@ class TmemSPResource(MemoryResource):
         sage_scales: cute.Pointer | None = None,
         num_kv_heads: int | Int32 = 0,
         score_seed_owner: Optional["TmemSPResource"] = None,
+        smem_k: Optional[SmemKVResource] = None,
         **kwargs: Any,
     ) -> None:
         """Bind S/P TMEM offsets, Q peer index, and optional varlen metadata.
@@ -3020,11 +3121,16 @@ class TmemSPResource(MemoryResource):
         K/V tiles at the end of the loop are VC-Attention outlier tiles. It is
         zero on plans that restore the tile means. VC-Attention-QK8 plans carry
         the fixed Q and K/V lengths on ``cfg``, which address the scale tables.
+        ``smem_k`` is the K staging resource whose scale atoms an MXFP8 QK step
+        copies.
         """
         super().__init__(pipeline_config=pipeline_config, **kwargs)
         self.cfg = cfg
         self.vc_repair_tiles = vc_repair_tiles
         self.score_seed_owner = score_seed_owner
+        if smem_k is not None:
+            self.smem_k_alloc = smem_k._alloc
+            self.smem_k_stages = smem_k.pipeline_config.num_stages
         self.tmem_s_offset = tmem_s_offset
         self.tmem_p_offset = tmem_p_offset
         self.q_half = q_half
@@ -3433,6 +3539,19 @@ class TmemSPResource(MemoryResource):
             # instructions per MMA call).
             desc_q_base_ = freeze_smem_descriptor(desc_q_base)
             desc_k_base_ = freeze_smem_descriptor(desc_k_base)
+            if cutlass.const_expr(self.cfg.use_mxfp8_qk):
+                # The scales of this QK step sit in the tail of the peer S tile.
+                tmem_ptr_sf = self.tmem_ptr_s_cached.subview(
+                    (
+                        self.cfg.tmem_s1_offset
+                        if self.q_half == 0
+                        else self.cfg.tmem_s0_offset
+                    )
+                    - self.tmem_s_offset
+                    + MX_SCALE_TMEM_COL
+                )
+                if prims.elect_sync():
+                    self._mx_copy_scales(desc_q_base, desc_k_base, tmem_ptr_sf)
 
             # INT32 scores accumulate onto the seeded bias; FP32 scores
             # overwrite S with the first K phase.
@@ -3462,16 +3581,78 @@ class TmemSPResource(MemoryResource):
                     dk = desc_k_base_ + ((local_increment + k_tma_iter_offset) >> 4)
                     if issue_mma:
                         if prims.elect_sync():
-                            prims.tcgen05_mma(
-                                mma_kind,
-                                cta_group,
-                                tmem_ptr_s,
-                                dq,
-                                dk,
-                                idesc_qk,
-                                scale_d,
-                            )
+                            if cutlass.const_expr(self.cfg.use_mxfp8_qk):
+                                # K step k reads scale byte k of each lane's column.
+                                prims.tcgen05_mma_block_scale(
+                                    prims.Tcgen05MMAKind.MXF8F6F4,
+                                    cta_group,
+                                    tmem_ptr_s,
+                                    dq,
+                                    dk,
+                                    prims.Tcgen05MxInstrDesc.build(
+                                        a_dtype=self.cfg.q_dtype,
+                                        b_dtype=self.cfg.q_dtype,
+                                        scale_format=prims.MxScaleFormat.E8M0,
+                                        n_dim=self.cfg.qk_mma_tiler[1],
+                                        m_dim=self.cfg.qk_mma_tiler[0],
+                                        a_sf_id=k_idx,
+                                        b_sf_id=k_idx,
+                                    ),
+                                    scale_d,
+                                    tmem_ptr_sf,
+                                    tmem_ptr_sf.subview(4),
+                                    scale_vec_size=prims.Tcgen05MMAScaleVecSize.X1,
+                                )
+                            else:
+                                prims.tcgen05_mma(
+                                    mma_kind,
+                                    cta_group,
+                                    tmem_ptr_s,
+                                    dq,
+                                    dk,
+                                    idesc_qk,
+                                    scale_d,
+                                )
                     scale_d = True
+
+    @cute.jit
+    def _mx_copy_scales(
+        self,
+        desc_q_base: prims.Tcgen05SmemDesc,
+        desc_k_base: prims.Tcgen05SmemDesc,
+        tmem_ptr_sf: TmemPtr,
+    ) -> None:
+        """Copy this QK step's Q and K scale atoms to ``tmem_ptr_sf``, the peer S tail.
+
+        Each atom sits behind the ring its tile belongs to, so the start field of
+        the tile's descriptor locates it. One 32x128b copy broadcast to the four
+        lane quarters fills the four columns of one operand.
+        """
+        cfg = self.cfg
+        q_bytes = Int32((desc_q_base & Int64(0x3FFF)) << 4)
+        k_bytes = Int32((desc_k_base & Int64(0x3FFF)) << 4)
+        k_stages = self.smem_k_stages
+        k_stage = (k_bytes - Int32(self.smem_k_alloc.offset)) // cfg.tma_copy_kv_bytes
+        slots = (
+            q_bytes
+            + (cfg.sQ_shape[0] - self.q_half) * cfg.tma_copy_q_bytes
+            + self.q_half * MX_SCALE_TILE_BYTES,
+            k_bytes
+            + k_stages * cfg.tma_copy_kv_bytes
+            - k_stage * (cfg.tma_copy_kv_bytes - MX_SCALE_TILE_BYTES),
+        )
+        for operand in cutlass.range_constexpr(2):
+            prims.tcgen05_cp(
+                prims.Tcgen05CpShape.SHAPE_32X128B,
+                tmem_ptr_sf.subview(4 * operand),
+                prims.Tcgen05SmemDesc.build(
+                    slots[operand],
+                    leading_byte_offset=16,
+                    stride_byte_offset=128,
+                    layout=prims.Tcgen05SmemSwizzle.NONE,
+                ),
+                multicast=prims.Tcgen05CpMulticast.WARPX4,
+            )
 
     @producer_work
     @cute.jit
@@ -5319,6 +5500,78 @@ class TmemSPResource(MemoryResource):
             )
         return self._reduce_row_max(s_data, row_max)
 
+    @cute.jit
+    def _mask_window_chunks(
+        self,
+        s_data: SoftmaxChunks,
+        base_k: Int32,
+        window_start: Optional[Int32],
+        window_end: Optional[Int32],
+    ) -> SoftmaxChunks:
+        """Mask scores of keys ``base_k + [0, N)`` outside ``[window_start, window_end)``.
+
+        ``None`` leaves that side unbounded. With both bounds, each 32-column
+        chunk builds one valid-bit word, so a score costs a bit test and a
+        predicated mask value. A single bound keeps one create_mask and a select,
+        which is as cheap and measured faster on fixed-length BF16 plans.
+        """
+        tmem_x = self.cfg.tmem_x_load_s
+        num_chunks = self.cfg.qk_mma_tiler[1] // tmem_x
+        if cutlass.const_expr(window_start is None or window_end is None):
+            masked_values = cutlass.vector.full(
+                [tmem_x],
+                self.cfg.qk_acc_dtype(_SOFTMAX_MASK_VALUE),
+                dtype=self.cfg.qk_acc_dtype,
+            )
+            all_true_mask = cutlass.vector.create_mask([tmem_x], [tmem_x])
+        for chunk_idx in cutlass.range_constexpr(num_chunks):
+            chunk_base = base_k + Int32(chunk_idx * tmem_x)
+            if cutlass.const_expr(window_end is None):
+                left_mask_inverted = cutlass.vector.create_mask(
+                    [tmem_x], [window_start - chunk_base]
+                )
+                mask = left_mask_inverted ^ all_true_mask
+                s_data[chunk_idx] = cutlass.vector.where(
+                    mask, s_data[chunk_idx], masked_values
+                )
+            elif cutlass.const_expr(window_start is None):
+                right_oob_start_idx = cute.math.min(
+                    cute.math.max(window_end - chunk_base, Int32(0)),
+                    Int32(tmem_x),
+                )
+                mask = cutlass.vector.create_mask([tmem_x], [right_oob_start_idx])
+                s_data[chunk_idx] = cutlass.vector.where(
+                    mask, s_data[chunk_idx], masked_values
+                )
+            else:
+                chunk_left = cute.math.min(
+                    cute.math.max(window_start - chunk_base, Int32(0)),
+                    Int32(tmem_x),
+                )
+                chunk_right = cute.math.min(
+                    cute.math.max(window_end - chunk_base, Int32(0)),
+                    Int32(tmem_x),
+                )
+                valid_bits = _bmsk_clamp(chunk_left, chunk_right - chunk_left)
+                chunk = s_data[chunk_idx]
+                masked_scores = []
+                for quad_idx in cutlass.range_constexpr(tmem_x // 4):
+                    quad_base = quad_idx * 4
+                    masked_scores.extend(
+                        _mask_score_quad(
+                            valid_bits,
+                            chunk[quad_base],
+                            chunk[quad_base + 1],
+                            chunk[quad_base + 2],
+                            chunk[quad_base + 3],
+                            quad_base,
+                        )
+                    )
+                s_data[chunk_idx] = cutlass.Vector.from_elements(
+                    tuple(masked_scores), self.cfg.qk_acc_dtype
+                )
+        return s_data
+
     @consumer_work(returns=(old_row_max, row_max))
     @cute.jit
     def left_masked_row_max(
@@ -5329,8 +5582,6 @@ class TmemSPResource(MemoryResource):
         q_offset: Int32,
     ) -> tuple[SoftmaxScalar, SoftmaxScalar]:
         """Apply the bottom-right-aligned sliding-window left mask."""
-        tmem_x = self.cfg.tmem_x_load_s
-        num_chunks = self.cfg.qk_mma_tiler[1] // tmem_x
         num_softmax_warps = 4
         warp_id_in_sg = cute.arch.warp_idx() % num_softmax_warps
         tmem_row_id = warp_id_in_sg * cute.arch.WARP_SIZE
@@ -5363,37 +5614,13 @@ class TmemSPResource(MemoryResource):
                 (seq_tile_coord * self.cfg.q_tile_m - self.cfg.window_size_left)
                 // self.cfg.kv_tile_n,
             )
-        kv_tile_abs = kv_tile_start + stage_info.loop_offset
-
-        masked_values = cutlass.vector.full(
-            [tmem_x],
-            self.cfg.qk_acc_dtype(_SOFTMAX_MASK_VALUE),
-            dtype=self.cfg.qk_acc_dtype,
-        )
-        all_true_mask = cutlass.vector.create_mask([tmem_x], [tmem_x])
-
-        for chunk_idx in cutlass.range_constexpr(num_chunks):
-            base_k = kv_tile_abs * self.cfg.kv_tile_n + chunk_idx * tmem_x
-            left_oob_end_idx = window_bound_left - base_k
-            left_mask_inverted = cutlass.vector.create_mask(
-                [tmem_x], [left_oob_end_idx]
-            )
-            mask = left_mask_inverted ^ all_true_mask
-            if cutlass.const_expr(self.cfg.has_varlen or self.cfg.has_q_offset):
-                # Packed requests share a worst-case window span, and fixed
-                # bottom-right windows can begin at a non-aligned Q/K offset.
-                window_bound_right = index_q + q_offset
-                right_oob_start_idx = window_bound_right + Int32(1) - base_k
-                right_oob_start_idx = cute.math.min(
-                    cute.math.max(right_oob_start_idx, Int32(0)),
-                    Int32(tmem_x),
-                )
-                right_mask = cutlass.vector.create_mask([tmem_x], [right_oob_start_idx])
-                mask = mask & right_mask
-            s_data[chunk_idx] = cutlass.vector.where(
-                mask, s_data[chunk_idx], masked_values
-            )
-
+        base_k = (kv_tile_start + stage_info.loop_offset) * self.cfg.kv_tile_n
+        window_end = None
+        if cutlass.const_expr(self.cfg.has_varlen or self.cfg.has_q_offset):
+            # Packed requests share a worst-case window span, and fixed
+            # bottom-right windows can begin at a non-aligned Q/K offset.
+            window_end = index_q + q_offset + Int32(1)
+        s_data = self._mask_window_chunks(s_data, base_k, window_bound_left, window_end)
         return self._reduce_row_max(s_data, row_max)
 
     @consumer_work(returns=(old_row_max, row_max))
@@ -5658,8 +5885,6 @@ class TmemSPResource(MemoryResource):
         Sliding-window tails need both bounds because the final tile can also
         contain keys to the left of the visible window.
         """
-        tmem_x = self.cfg.tmem_x_load_s
-        num_chunks = self.cfg.qk_mma_tiler[1] // tmem_x
         num_softmax_warps = 4
         warp_id_in_sg = cute.arch.warp_idx() % num_softmax_warps
         s_data = self._load_s_chunks(stage_info)
@@ -5698,31 +5923,12 @@ class TmemSPResource(MemoryResource):
             else:
                 # Tail uses the first tile after the loop domain.
                 base_k = (kv_tile_start + stage_info.loop_end) * self.cfg.kv_tile_n
-            for chunk_idx in cutlass.range_constexpr(num_chunks):
-                chunk_base_k = base_k + chunk_idx * tmem_x
-                window_bound_right = index_q + q_offset
-                right_oob_start_idx = window_bound_right + Int32(1) - chunk_base_k
-                right_oob_start_idx = cute.math.min(
-                    cute.math.max(right_oob_start_idx, Int32(0)),
-                    Int32(tmem_x),
-                )
-                mask = cutlass.vector.create_mask([tmem_x], [right_oob_start_idx])
-                if cutlass.const_expr(self.needs_window_tail_left_mask):
-                    left_oob_end_idx = window_bound_left - chunk_base_k
-                    left_mask_inverted = cutlass.vector.create_mask(
-                        [tmem_x], [left_oob_end_idx]
-                    )
-                    all_true_mask = cutlass.vector.create_mask([tmem_x], [tmem_x])
-                    left_mask = left_mask_inverted ^ all_true_mask
-                    mask = mask & left_mask
-                masked_values = cutlass.vector.full(
-                    [tmem_x],
-                    self.cfg.qk_acc_dtype(_SOFTMAX_MASK_VALUE),
-                    dtype=self.cfg.qk_acc_dtype,
-                )
-                s_data[chunk_idx] = cutlass.vector.where(
-                    mask, s_data[chunk_idx], masked_values
-                )
+            window_start = None
+            if cutlass.const_expr(self.needs_window_tail_left_mask):
+                window_start = window_bound_left
+            s_data = self._mask_window_chunks(
+                s_data, base_k, window_start, index_q + q_offset + Int32(1)
+            )
         return self._reduce_row_max(s_data, row_max)
 
     @cute.jit

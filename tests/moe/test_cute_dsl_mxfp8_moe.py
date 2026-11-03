@@ -8,7 +8,9 @@ Two oracles, as in the other FlashInfer MXFP8 tests:
   to the weights, the input and the GEMM1->GEMM2 intermediate (tight tolerance;
   catches scale-layout and ordering errors that cosine similarity hides).
 
-The MoE is a non-gated ReLU^2 MoE: out = sum_k w_k * (relu(x @ W1[e].T)^2 @ W2[e].T).
+The MoE is a non-gated ReLU^2 MoE: out = sum_k w_k * (relu(x @ W1[e].T)^2 @ W2[e].T),
+or its clamped variant (ActivationType.ClampedRelu2), which replaces
+relu(z)^2 with relu(L * tanh(z / L))^2.
 """
 
 import pytest
@@ -72,8 +74,12 @@ def _quantize_weights(w: torch.Tensor):
     return q.view(num_experts, rows, cols), sf_mma
 
 
-def _reference(x, w1, w2, topk_ids, topk_w, quantized: bool):
-    """Non-gated ReLU^2 MoE in FP32. ``quantized`` applies MXFP8 qdq everywhere."""
+def _reference(x, w1, w2, topk_ids, topk_w, quantized: bool, clamp_limit=None):
+    """Non-gated ReLU^2 MoE in FP32. ``quantized`` applies MXFP8 qdq everywhere.
+
+    ``clamp_limit=L`` maps the FC1 output through ``L * tanh(z / L)`` before the
+    ReLU^2 (ActivationType.ClampedRelu2).
+    """
     qdq = _qdq_mxfp8 if quantized else (lambda t: t.float())
     xf, w1f, w2f = qdq(x), qdq(w1), qdq(w2)
     out = torch.zeros(x.shape[0], w2.shape[1], dtype=torch.float32, device=x.device)
@@ -82,13 +88,17 @@ def _reference(x, w1, w2, topk_ids, topk_w, quantized: bool):
         if tok.numel() == 0:
             continue
         z = xf[tok] @ w1f[e].T
+        if clamp_limit is not None:
+            z = clamp_limit * torch.tanh(z / clamp_limit)
         h = torch.relu(z) ** 2
         y = qdq(h) @ w2f[e].T
         out.index_add_(0, tok, y * topk_w[tok, slot].unsqueeze(1))
     return out
 
 
-def _run_kernel(x, w1, w2, topk_ids, topk_w, num_experts, tactic=None):
+def _run_kernel(
+    x, w1, w2, topk_ids, topk_w, num_experts, tactic=None, clamp_limit=None
+):
     from flashinfer import cute_dsl_fused_moe
     from flashinfer.fp8_quantization import mxfp8_quantize
 
@@ -114,10 +124,22 @@ def _run_kernel(x, w1, w2, topk_ids, topk_w, num_experts, tactic=None):
         top_k=topk_ids.shape[1],
         num_local_experts=num_experts,
         output_dtype=torch.bfloat16,
-        activation_type=ActivationType.Relu2.value,
+        activation_type=(
+            ActivationType.Relu2.value
+            if clamp_limit is None
+            else ActivationType.ClampedRelu2.value
+        ),
         quant_mode="mxfp8",
         tactic=tactic,
+        clamped_relu2_limit=_limit_tensor(clamp_limit),
     )
+
+
+def _limit_tensor(clamp_limit):
+    """ClampedRelu2 takes its limit as a one-element float32 CUDA tensor."""
+    if clamp_limit is None or isinstance(clamp_limit, torch.Tensor):
+        return clamp_limit
+    return torch.tensor([clamp_limit], dtype=torch.float32, device="cuda")
 
 
 def _gemm1_n192_tactic(tile):
@@ -183,6 +205,119 @@ def test_mxfp8_relu2_gemm1_n192(tile):
     cos_q = _cos(out, ref_q)
     assert cos_q > 0.999, f"cos vs MXFP8 reference {cos_q:.5f}"
     torch.testing.assert_close(out, ref_q, rtol=5e-2, atol=5e-2 * ref_q.abs().max())
+
+
+# z = x @ W1[e].T has std ~1.9 for this shape, so both limits clamp a large
+# fraction of the positive outputs (L=0.5 hard, L=2.0 the tail).
+@pytest.mark.parametrize("clamp_limit", [0.5, 2.0])
+@pytest.mark.parametrize("tactic", [None, "n192"])
+def test_mxfp8_clamped_relu2_moe(clamp_limit, tactic):
+    num_tokens, hidden, inter, num_experts, top_k = 33, 896, 1152, 16, 4
+    x, w1, w2, topk_ids, topk_w = _make_case(
+        num_tokens, hidden, inter, num_experts, top_k
+    )
+    out = _run_kernel(
+        x,
+        w1,
+        w2,
+        topk_ids,
+        topk_w,
+        num_experts,
+        tactic=_gemm1_n192_tactic(128) if tactic == "n192" else None,
+        clamp_limit=clamp_limit,
+    ).float()
+
+    ref_bf16 = _reference(
+        x, w1, w2, topk_ids, topk_w, quantized=False, clamp_limit=clamp_limit
+    )
+    cos = _cos(out, ref_bf16)
+    assert cos > MIN_COS_SIM_VS_BF16, f"cos vs BF16 {cos:.4f}"
+
+    ref_q = _reference(
+        x, w1, w2, topk_ids, topk_w, quantized=True, clamp_limit=clamp_limit
+    )
+    cos_q = _cos(out, ref_q)
+    assert cos_q > 0.999, f"cos vs MXFP8 reference {cos_q:.5f}"
+    torch.testing.assert_close(out, ref_q, rtol=5e-2, atol=5e-2 * ref_q.abs().max())
+
+    # The clamp must be active: the result is much closer to the clamped
+    # reference than to plain ReLU^2.
+    ref_plain = _reference(x, w1, w2, topk_ids, topk_w, quantized=True)
+    err_clamped = (out - ref_q).abs().max()
+    err_plain = (out - ref_plain).abs().max()
+    assert err_clamped < 0.2 * err_plain, (
+        f"clamped err {err_clamped:.4g} vs plain-ReLU^2 err {err_plain:.4g}"
+    )
+
+
+def test_mxfp8_clamped_relu2_limit_is_read_at_runtime():
+    """Different limit values reuse one compiled GEMM1 kernel.
+
+    The limit tensor is read by the kernel at launch, so a new tensor or an
+    in-place update of the same tensor takes effect without recompiling.
+    """
+    from flashinfer.fused_moe.cute_dsl import (
+        blockscaled_contiguous_gather_grouped_gemm_act_fusion as gemm1_module,
+    )
+
+    tactic = _gemm1_n192_tactic(128)
+    x, w1, w2, topk_ids, topk_w = _make_case(33, 896, 1152, 16, 4)
+    limit = _limit_tensor(0.5)
+    out_a = _run_kernel(
+        x, w1, w2, topk_ids, topk_w, 16, tactic=tactic, clamp_limit=limit
+    ).float()
+    num_compiled = len(gemm1_module._gather_kernel_cache)
+
+    limit.fill_(2.0)  # in-place update of the same tensor
+    out_b = _run_kernel(
+        x, w1, w2, topk_ids, topk_w, 16, tactic=tactic, clamp_limit=limit
+    ).float()
+    out_c = _run_kernel(
+        x, w1, w2, topk_ids, topk_w, 16, tactic=tactic, clamp_limit=1.0
+    ).float()
+    assert len(gemm1_module._gather_kernel_cache) == num_compiled
+
+    for out, value in ((out_a, 0.5), (out_b, 2.0), (out_c, 1.0)):
+        ref_q = _reference(
+            x, w1, w2, topk_ids, topk_w, quantized=True, clamp_limit=value
+        )
+        cos_q = _cos(out, ref_q)
+        assert cos_q > 0.999, f"L={value}: cos vs MXFP8 reference {cos_q:.5f}"
+    assert not torch.allclose(out_a, out_b)
+
+
+def test_mxfp8_clamped_relu2_rejects_invalid_limit():
+    """The limit is checked against the MXFP8 input before any GPU work."""
+    from flashinfer import cute_dsl_fused_moe
+
+    x, w1, w2, topk_ids, topk_w = _make_case(8, 256, 256, 4, 2)
+    w1_q, w1_sf = _quantize_weights(w1)
+    w2_q, w2_sf = _quantize_weights(w2)
+    ones = torch.ones(4, dtype=torch.float32, device="cuda")
+    x_q = x.to(torch.float8_e4m3fn)
+    x_sf = torch.zeros(8, 256 // MXFP8_BLOCK, dtype=torch.uint8, device="cuda")
+    kwargs = dict(
+        x=x_q,
+        x_sf=x_sf,
+        token_selected_experts=topk_ids,
+        token_final_scales=topk_w,
+        w1_weight=w1_q,
+        w1_weight_sf=w1_sf,
+        w1_alpha=ones,
+        fc2_input_scale=None,
+        w2_weight=w2_q,
+        w2_weight_sf=w2_sf,
+        w2_alpha=ones,
+        num_experts=4,
+        top_k=2,
+        activation_type=ActivationType.ClampedRelu2.value,
+        quant_mode="mxfp8",
+    )
+    with pytest.raises(ValueError, match="requires a one-element"):
+        cute_dsl_fused_moe(**kwargs)
+    # The limit must live on the input's device.
+    with pytest.raises(ValueError, match="Invalid device of ClampedRelu2"):
+        cute_dsl_fused_moe(**kwargs, clamped_relu2_limit=torch.ones(1))
 
 
 def test_mxfp8_relu2_gemm1_n192_rejects_partial_n_tile():

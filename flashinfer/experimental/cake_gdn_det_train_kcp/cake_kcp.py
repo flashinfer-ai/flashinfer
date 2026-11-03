@@ -52,7 +52,9 @@ again go to the owners (``b1``); the owner walks each chain backwards
 fragment's ``dS_out`` (``b2``); the adjoint tape walk (#7 ``program=tape``)
 runs from it; ``bwd_dqkg`` (#8, the FP32 group reduction of the ``r`` value
 heads' ``dq`` / ``dk`` fused) and ``gate_epilogue`` (#9) finish the gradients.
-One compute stream; the collectives are asynchronous on the caller's process
+One compute stream (on ``sm_100a`` / ``sm_103a`` with a zigzag / zigzag-per-document partition of at most 8 ranks: the
+summaries' offset walk on a side stream beside the transfer walk, fork / join with CUDA events, :func:`_walk_pair_enabled`);
+the collectives are asynchronous on the caller's process
 group and waited at their first consumer; the issue order is the same on
 every rank, so a checkpoint replay re-runs the same program order.  With a recompute handle
 (``recompute_handle``, :class:`RecomputeHandleDetKcp`) the original forward stores its ``S_in`` in the handle and torch's
@@ -93,8 +95,10 @@ program bound to ``qn`` / ``kn``; #8 runs as ``bwd_dqkg_l2n``, which applies the
 and the saved ``r``) before the one BF16 rounding of ``dq`` / ``dk`` (``group_reduce="host"``: the unchanged #8 and the
 pullback of :mod:`.cake_l2n` on the host, chunked by token blocks).  The saved set gains ``qk_rstd`` only
 (``KCP_SAVED_VERSION`` 2); ``qn`` / ``kn`` never outlive a call: the forward drops ``kn`` before its output and
-``qn`` after #5; the backward gets them from #1_l2n again (light replay, replay mode) or from ``qk_apply``
-(``qn = bf16(q * r)`` from the saved ``r``: ``save_mode="full"`` and the kept recompute tapes) and drops them after #8.
+``qn`` after #5 (a hand-off forward hands both over with its tapes instead); the backward gets them from #1_l2n
+again (light replay, replay mode), from the recompute forward's #1_l2n through the kept hand-off (the kept recompute
+tapes) or from ``qk_apply`` (``qn = bf16(q * r)`` from the saved ``r``: ``save_mode="full"`` only) and drops them
+after #8.
 The numeric orders are :mod:`.cake_l2n`'s (FTZ off), bitwise the device programs'.
 
 This module reads tensor contents nowhere (no ``.item()``, no ``.tolist()``
@@ -108,7 +112,7 @@ queries) is :mod:`.cake_kcp_plan` / :mod:`.cake_bytes`.
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Any
 
 import torch
@@ -155,10 +159,10 @@ PROGRAMS = (
     "gate_epilogue",  # #9: dg from the partials (reverse cumsum + chunk term), dbeta pass-through
     "fwd_prep_l2n",  # #1 with the in-kernel Q / K L2 norm: qn / kn / rstd first, then #1's body on qn / kn
     "bwd_dqkg_l2n",  # #8 on qn / kn with the norm's pullback before the BF16 rounding of dq / dk (group_reduce = 1)
-    "qk_apply",  # qn = bf16(q * r), kn likewise, from the saved rstd (backward of save_mode="full" / kept tapes)
+    "qk_apply",  # qn = bf16(q * r), kn likewise, from the saved rstd (backward of save_mode="full")
 )
 # The in-kernel Q / K L2 norm programs (``use_qk_l2norm_in_kernel``): #1 and #8 run as their ``_l2n`` siblings, and
-# ``qk_apply`` rebuilds ``qn`` / ``kn`` where the backward has no #1 replay.
+# ``qk_apply`` rebuilds ``qn`` / ``kn`` where the backward has no #1 replay and no kept hand-off (save_mode="full").
 L2N_PROGRAMS = ("fwd_prep_l2n", "bwd_dqkg_l2n", "qk_apply")
 LOCAL_PROGRAMS = (
     "fwd_prep",
@@ -493,8 +497,9 @@ FWD_TAPES = (
 BWD_TAPES = ("do_g", "dv_intra", "dh_tape", "dv_new", "dg_part", "gamma_dot")
 # In-kernel Q / K L2 norm: the normalized rows (BF16 ``[T_r, H_qk, 128]``, contiguous) and the FP32 ``r`` of q and k
 # (``[2, T_r, H_qk]``: plane 0 = q, plane 1 = k).  Arena tapes of the call that writes them (never saved): the forward
-# drops ``kn`` before its output (the tape walks were its last readers) and ``qn`` after #5; the backward drops both
-# with the arena ``qk_rstd`` after #8 (or the host reduction).  A forward that keeps a saved set writes a fresh
+# drops ``kn`` before its output (the tape walks were its last readers) and ``qn`` after #5 -- a hand-off forward
+# (``reuse_recompute_tapes``) unbinds both instead and hands them to the backward with its tapes (``_KeptTapes.qk``);
+# the backward drops both with the arena ``qk_rstd`` after #8 (or the host reduction).  A forward that keeps a saved set writes a fresh
 # ``qk_rstd`` (the saved set's tensor, bound in ``CallDetKcp.bufs``); the light replay's #1_l2n writes the arena one.
 QK_TAPES: tuple[str, ...] = ("qn", "kn")
 QK_RSTD = "qk_rstd"
@@ -611,7 +616,8 @@ FWD_TAPES_ARENA_AFTER_FWD: tuple[str, ...] = tuple(
 # tapes as fresh tensors unbound from the arena -- plus the ``stage_m`` plane when the saved set carries no ``M_seg``
 # (``save_transfer=False`` at ``P > 1``) -- in the registry below, keyed by the graph task id and the identities
 # (data pointers) of the call's operands and saved ``S_in``; the backward node of the same task takes the entry and
-# runs the ``save_mode="full"`` form of the backward on those tapes, so nothing is launched before #6.  The kept
+# runs the ``save_mode="full"`` form of the backward on those tapes, so nothing is launched before #6 (with
+# ``use_qk_l2norm_in_kernel`` the recompute's ``qn`` / ``kn`` go along, so no ``qk_apply`` either).  The kept
 # tapes are produced with the replay's own tape-walk form (``_replay_tape_walk``), so they are the replay's launch
 # list by construction.  Correctness never depends on the registry: a backward that finds no entry runs the replay.
 # Lifetime: ONE live entry.  A hand-off forward evicts the registry before its first launch (the evicted set is freed
@@ -880,9 +886,11 @@ def _recompute_output_dead(n_saved: int) -> tuple[bool, str]:
 class _KeptTapes:
     """The recompute forward's tapes on their way to the backward of the same graph task (``reuse_recompute_tapes``):
     the ten :data:`FWD_TAPES` as fresh tensors, the ``stage_m`` plane when the saved set carries no ``M_seg``, the
-    arena geometry they were produced at and the graph task id."""
+    arena geometry they were produced at and the graph task id.  ``qk``: with ``use_qk_l2norm_in_kernel`` the
+    normalized rows ``qn`` / ``kn`` the recompute's #1_l2n wrote (:data:`QK_TAPES`, unbound from the arena like the
+    tapes), so the backward runs no ``qk_apply``; empty without the norm."""
 
-    __slots__ = ("tapes", "stage_m", "geometry", "gid")
+    __slots__ = ("tapes", "stage_m", "geometry", "gid", "qk")
 
     def __init__(
         self,
@@ -890,15 +898,18 @@ class _KeptTapes:
         stage_m: torch.Tensor | None,
         geometry: tuple[int, int, int, int] | None,
         gid: int,
+        qk: dict[str, torch.Tensor] | None = None,
     ) -> None:
         self.tapes = tapes
         self.stage_m = stage_m
         self.geometry = geometry
         self.gid = int(gid)
+        self.qk = {} if qk is None else qk
 
     def clear(self) -> None:
         self.tapes = {}
         self.stage_m = None
+        self.qk = {}
 
 
 _KEPT: dict[tuple, _KeptTapes] = {}
@@ -2786,6 +2797,9 @@ class CallDetKcp:
         self.schedule = str(opts.knob("schedule"))
         self.cols_rule = str(opts.knob("cols_rule"))
         self.debug_sequence = bool(opts.knob("debug_sequence"))
+        self.walk_pair = _walk_pair_enabled(opts.knob("walk_pair"), ctx, self.device)
+        # (name, args) of the launches resolved while _walk_pair defers them (issued on its side stream); else None
+        self._deferred: list[tuple[str, dict[str, Any]]] | None = None
         if int(tb.fused_walks) != int(opts.knob("fused_walks")):
             raise ValueError(
                 f"tables built with fused_walks={tb.fused_walks}, the call asks for {opts.knob('fused_walks')}"
@@ -2915,6 +2929,9 @@ class CallDetKcp:
         self.sequence.append(name)
         args["_call"] = self
         args["_grid"] = int(grid)
+        if self._deferred is not None:
+            self._deferred.append((name, args))
+            return
         self.backend.run(name, args)
 
     def _walk_common(self, walk: Sequence[int]) -> dict[str, Any]:
@@ -3458,7 +3475,8 @@ def _record(kind: str, call: CallDetKcp) -> None:
         ),  # forward: None | "capture" (stored S_in in the handle) | "replay" (S_in from the handle, no exchange)
         "qk_l2norm": call.l2n,  # use_qk_l2norm_in_kernel
         # where qn / kn came from: forward "fwd_prep" (#1_l2n); backward "recompute" (the replay mode's forward),
-        # "replay" (the light replay's #1_l2n) or "qk_apply" (save_mode="full" / kept tapes); None without the norm
+        # "replay" (the light replay's #1_l2n), "kept" (the recompute forward's #1_l2n, handed over with the kept
+        # tapes) or "qk_apply" (save_mode="full"); None without the norm
         "qk_source": call.scratch.get("qk_source"),
         # the r #1_l2n wrote (forward: "fresh" = the saved set's tensor, "arena") / the pullback read (backward:
         # "saved", "arena" in the replay mode); None without the norm
@@ -3776,6 +3794,115 @@ def _ring_backward(call: CallDetKcp, *, walk_ends: bool = False) -> None:
 # Launch sequences (one compute stream; waits at first consumption; shipped schedule wait_first + fused tape walks)
 
 
+# Walk pair (test knob ``walk_pair``, default ``None`` = auto): the summaries' offset walk and transfer walk read the
+# same tapes (k, w, u, rowscale, gamma) and the tables only and write disjoint tiles, so the offset walk may run beside
+# the transfer walk.
+# Its launch is resolved on the current stream (pools, tapes and device tables are bound and uploaded there: nothing
+# is allocated on the side stream) and issued on a per-device side stream after a fork event recorded on the current
+# stream; the transfer walk follows on the current stream, which then waits on the side stream's join event before
+# anything else is enqueued.  The deferred launch arguments stay referenced until that wait is enqueued, so no tensor
+# the side stream reads returns to the allocator (and to the current stream's reuse) before the join; every later use
+# or free is ordered after it.  No host synchronization, no device-to-host copy; the launches, their arguments and
+# outputs and the call's sequence / records are those of walk_pair=0.  Under graph="replay" the side stream joins and
+# leaves the capture through the same two events.
+# The pair is enabled on the zigzag partitions only (WALK_PAIR_LAYOUTS) of at most WALK_PAIR_MAX_WORLD ranks; a
+# contiguous or explicit partition, or a larger world, keeps the walk_pair=0 path (GB300 CP8: the contiguous rows, three
+# summaries per rank, ran 1-3 % slower paired; GB300 CP16: one summary per rank, no measured gain).  The default (auto)
+# pairs only on the architectures in WALK_PAIR_AUTO_CAPABILITIES: sm_100a (GB200) and sm_103a (GB300), where no zigzag
+# row at CP2 / CP4 / CP8 ran more than 1 % slower in both timing sessions and the CP4 / CP8 rows gained up to 6-8 %.
+# sm_107a keeps one stream: on a 212-SM R200 the CP4 zigzag rows ran 1.2-2.5 % slower paired in both sessions, and
+# there is no 216-SM measurement.  An explicit walk_pair=0 / 1 forces either path (still on the zigzag partitions only).
+WALK_PAIR_LAYOUTS = ("zigzag", "zigzag_per_document")
+WALK_PAIR_MAX_WORLD = 8
+WALK_PAIR_AUTO_CAPABILITIES = ((10, 0), (10, 3))  # sm_100a, sm_103a
+_SIDE_STREAMS: dict[int, torch.cuda.Stream] = {}
+_CAPABILITIES: dict[int, tuple[int, int]] = {}
+WALK_PAIR_STATS: dict[str, int] = {
+    "paired": 0,  # walk pairs issued as fork / join
+    "single": 0,  # walk pairs with the knob on that had one side empty (issued on the current stream only)
+}
+
+
+def _device_capability(device: torch.device | None) -> tuple[int, int] | None:
+    """The compute capability of a CUDA ``device`` (read once per device index, host only); ``None`` off CUDA."""
+    if device is None or device.type != "cuda":
+        return None
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    capability = _CAPABILITIES.get(index)
+    if capability is None:
+        capability = _CAPABILITIES[index] = tuple(
+            torch.cuda.get_device_capability(index)
+        )
+    return capability
+
+
+def _walk_pair_enabled(
+    knob: int | None, ctx: Any, device: torch.device | None = None
+) -> bool:
+    """The walk pair as applied to the call: only for a context whose partition layout is in
+    :data:`WALK_PAIR_LAYOUTS` and whose world has at most :data:`WALK_PAIR_MAX_WORLD` ranks; there ``walk_pair=0`` /
+    ``1`` forces it off / on, and the default ``None`` (auto) turns it on when ``device`` is a CUDA device whose
+    capability is in :data:`WALK_PAIR_AUTO_CAPABILITIES` (``sm_100a``, ``sm_103a``)."""
+    part = getattr(ctx, "partition", None)
+    layout, world = getattr(part, "layout", None), getattr(part, "world_size", None)
+    if layout not in WALK_PAIR_LAYOUTS or world is None or world > WALK_PAIR_MAX_WORLD:
+        return False
+    if knob is None:
+        return _device_capability(device) in WALK_PAIR_AUTO_CAPABILITIES
+    return bool(knob)
+
+
+def _side_stream(device: torch.device) -> torch.cuda.Stream:
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    stream = _SIDE_STREAMS.get(index)
+    if stream is None:
+        # torch draws every torch.cuda.Stream from a per-device, per-priority pool of 32 (round robin): a default-priority
+        # stream would also be every 32nd later default-priority stream of the process (a caller's side stream, the
+        # process group's streams), and the offset walk would queue behind that stream's work.  The greatest priority
+        # level's pool is not drawn by default-priority users.
+        greatest = torch.cuda.Stream.priority_range()[1]
+        stream = _SIDE_STREAMS[index] = torch.cuda.Stream(
+            device=index, priority=greatest
+        )
+    return stream
+
+
+def _walk_pair(
+    call: CallDetKcp, side: Callable[[], None], main: Callable[[], None]
+) -> None:
+    """``side()`` then ``main()``: in this order on the current stream (walk pair off, a CPU device), or with the
+    launches of ``side()`` on the side stream concurrently with ``main()`` (walk pair on, see above)."""
+    if not call.walk_pair or call.device.type != "cuda":
+        side()
+        main()
+        return
+    pending: list[tuple[str, dict[str, Any]]] = []
+    call._deferred = pending
+    try:
+        side()
+    finally:
+        call._deferred = None
+    if not pending:
+        WALK_PAIR_STATS["single"] += 1
+        main()
+        return
+    current = torch.cuda.current_stream(call.device)
+    stream = _side_stream(call.device)
+    fork = torch.cuda.Event()
+    fork.record(current)
+    stream.wait_event(fork)
+    with torch.cuda.stream(stream):
+        for name, args in pending:
+            call.backend.run(name, args)
+    join = torch.cuda.Event()
+    join.record(stream)
+    n_main = call.counters["launches"]
+    main()
+    current.wait_event(join)
+    WALK_PAIR_STATS["paired" if call.counters["launches"] > n_main else "single"] += 1
+    pending.clear()  # the side launches' arguments are released only after the join is enqueued
+
+
 def _offset_walk(call: CallDetKcp, walk: Sequence[int], out: Indexed) -> None:
     """The offset ``B_f`` / ``b_seg`` of the segments ``walk`` from the zero state into ``out``: the #2 offset walk
     from zero with the local rounding points (``offset_class="fla"``, the default) or the #3 transfer walk
@@ -3800,28 +3927,38 @@ def _summaries(call: CallDetKcp) -> None:
     family -> ``M_f``, transposed into the pairs)."""
     tb = call.tb
     if tb.P == 1:
-        _offset_walk(
-            call, tb.walk_offset, call.indexed("c1_send", tb.out_index, tb.c1_b_tiles)
+        _walk_pair(
+            call,
+            lambda: _offset_walk(
+                call,
+                tb.walk_offset,
+                call.indexed("c1_send", tb.out_index, tb.c1_b_tiles),
+            ),
+            lambda: call.walk(
+                "kcp_transfer_walk",
+                tb.walk_offset,
+                out=call.indexed("c1_send", tb.out_index, tb.c1_m_tiles),
+                init_mode=0,
+                use_u=0,
+                write_transposed=0,
+            ),
         )
-        call.walk(
+        return
+    _walk_pair(
+        call,
+        lambda: _offset_walk(
+            call,
+            tb.walk_offset,
+            call.indexed("stage_b", tb.seg_index, tb.stage_tiles),
+        ),
+        lambda: call.walk(
             "kcp_transfer_walk",
             tb.walk_offset,
-            out=call.indexed("c1_send", tb.out_index, tb.c1_m_tiles),
+            out=call.indexed("stage_m", tb.seg_index, tb.stage_tiles),
             init_mode=0,
             use_u=0,
             write_transposed=0,
-        )
-        return
-    _offset_walk(
-        call, tb.walk_offset, call.indexed("stage_b", tb.seg_index, tb.stage_tiles)
-    )
-    call.walk(
-        "kcp_transfer_walk",
-        tb.walk_offset,
-        out=call.indexed("stage_m", tb.seg_index, tb.stage_tiles),
-        init_mode=0,
-        use_u=0,
-        write_transposed=0,
+        ),
     )
     call.merge(
         "map"
@@ -4061,17 +4198,28 @@ def _replay_from_states(call: CallDetKcp, *, have_m: bool) -> None:
     if (
         tb.P > 1
     ):  # the forward carries again: b_seg (and M_seg^T unless saved) -> carries from 0 / S_in
-        _offset_walk(
-            call, tb.walk_all, call.indexed("stage_b", tb.seg_index, tb.stage_tiles)
-        )
-        if not have_m:
-            call.walk(
-                "kcp_transfer_walk",
+
+        def offset() -> None:
+            _offset_walk(
+                call,
                 tb.walk_all,
-                out=call.indexed("stage_m", tb.seg_index, tb.stage_tiles),
-                init_mode=0,
-                use_u=0,
-                write_transposed=0,
+                call.indexed("stage_b", tb.seg_index, tb.stage_tiles),
+            )
+
+        if have_m:
+            offset()
+        else:
+            _walk_pair(
+                call,
+                offset,
+                lambda: call.walk(
+                    "kcp_transfer_walk",
+                    tb.walk_all,
+                    out=call.indexed("stage_m", tb.seg_index, tb.stage_tiles),
+                    init_mode=0,
+                    use_u=0,
+                    write_transposed=0,
+                ),
             )
         call.merge("carry_start")
         call.merge("carry_in")
@@ -4110,7 +4258,8 @@ def _kept_release(call: CallDetKcp, kept: _KeptTapes) -> None:
     forward leaves in the arena (:data:`FWD_TAPES_ARENA_AFTER_FWD`) return to this call's workspace when it holds
     none of that name at the same geometry -- a caller-held workspace ends a kept backward as a forward leaves it,
     so the next checkpointed forward allocates nothing but its output (#7039, caller-workspace form) -- and the
-    other six are freed here, with the handed-over ``stage_m`` plane."""
+    other six are freed here, with the handed-over ``stage_m`` plane and the handed-over ``qn`` / ``kn`` (already
+    unbound from the call after #8 with the norm's other buffers; a forward leaves no norm row in the arena)."""
     for name in FWD_TAPES:
         t = kept.tapes.get(name)
         call.tapes.pop(name, None)
@@ -4171,14 +4320,21 @@ def _backward(call: CallDetKcp, saved: SavedDetKcp | None) -> None:
             if kept.stage_m is not None:
                 call.bufs["stage_m"] = kept.stage_m
             call.scratch["tapes_source"] = "kept"
+            if call.l2n:
+                # the recompute forward's qn / kn (its #1_l2n wrote them from the raw rows, the r of the saved set
+                # is its own): bound as they are, so no program re-reads the full raw Q / K to normalize them
+                for name in QK_TAPES:
+                    call.tapes[name] = kept.qk[name]
+                call.scratch["qk_source"] = "kept"
         else:  # light replay: #1 again (gamma / g_cum / akk included) + the #2 tape walk from the saved S_in
             _replay_tapes(call, saved)
             call.scratch["tapes_source"] = "replay"
             if call.l2n:
                 call.scratch["qk_source"] = "replay"
     call.local("bwd_prep")
-    if call.l2n and call.scratch.get("tapes_source") in ("saved", "kept"):
-        # no #1 replay: qn / kn from the raw rows and the saved r (bitwise #1_l2n's), before the first q / k reader
+    if call.l2n and call.scratch.get("tapes_source") == "saved":
+        # save_mode="full": no #1 replay and no hand-off: qn / kn from the raw rows and the saved r (bitwise
+        # #1_l2n's), before the first q / k reader
         call.local("qk_apply")
         call.scratch["qk_source"] = "qk_apply"
     if call.l2n and call.opts.knob("record_qk"):
@@ -4796,8 +4952,9 @@ def _fwd_body(
     s_in: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, SavedDetKcp | None]:
     """The forward's allocations and launches (eagerly or inside a capture): the sequence, ``out`` and #5, the saved
-    set.  ``hand_off``: the ten forward tapes (and the ``stage_m`` plane when the saved set carries no ``M_seg``)
-    leave the arena as the saved set's ``kept`` hand-off instead of being dropped (``reuse_recompute_tapes``).
+    set.  ``hand_off``: the ten forward tapes (and the ``stage_m`` plane when the saved set carries no ``M_seg``;
+    with the norm also ``qn`` / ``kn``) leave the arena as the saved set's ``kept`` hand-off instead of being dropped
+    (``reuse_recompute_tapes``).
     ``autograd_node`` with ``recompute_output="auto"`` (eager only): #5 is left out when the forward is torch's
     checkpoint recompute whose output nothing reads (:func:`_recompute_output_dead`; ``out`` is allocated as ever,
     never written) -- only for an ``executable`` node (the one that packs the saved tensors the proof counts); a
@@ -4840,8 +4997,8 @@ def _fwd_body(
             call.release_tapes(
                 FWD_DEAD_BEFORE_O, keep=saved_tapes(call.opts.save_mode) if save else ()
             )
-        if call.l2n:
-            # the tape walks were kn's last readers (a hand-off forward hands only the ten forward tapes over)
+        if call.l2n and not hand_off:
+            # the tape walks were kn's last readers (a hand-off forward hands kn over with its tapes)
             call.release_tapes(("kn",))
         call.release_pools(FWD_DEAD_POOLS)
     call.out = _alloc((call.T_r, call.HV, D), call.backend.dtypes["out"], call.device)
@@ -4867,17 +5024,21 @@ def _fwd_body(
     call.scratch["fwd_o_reason"] = reason
     if launch:
         call.local("fwd_o")
-    if call.l2n and call.opts.graph == "off":
+    if call.l2n and call.opts.graph == "off" and not hand_off:
         call.release_tapes(("qn",))  # #5 was qn's last reader (or #5 is left out)
     kept = None
     if hand_off:
+        # with the norm the rows #1_l2n wrote go along: the backward binds them instead of running qk_apply
+        qk = {n: call.tape(n) for n in QK_TAPES} if call.l2n else {}
         kept = _KeptTapes(
             {n: call.tape(n) for n in FWD_TAPES},
             stage_m,
             call.ws.geometry,
             _graph_task_id(),
+            qk,
         )
-        for n in FWD_TAPES:  # unbound: a later forward on this workspace cannot overwrite the kept tensors
+        # unbound: a later forward on this workspace cannot overwrite the kept tensors
+        for n in (*FWD_TAPES, *qk):
             call.ws.release_tape(n)
     if saved is not None and kept is not None:
         saved = dataclasses.replace(saved, kept=kept)
@@ -5019,6 +5180,16 @@ def _check_saved(saved: SavedDetKcp, call: CallDetKcp) -> None:
         for name in FWD_TAPES:
             shape, dtype = tape_spec(name, R=R, NC_pad=NC_pad, HV=call.HV, T=call.T_r)
             _check(kept.tapes[name], f"kept.{name}", shape, dtype, call.device)
+        # the normalized rows travel with the tapes exactly when the call runs the norm
+        if set(kept.qk) != (set(QK_TAPES) if call.l2n else set()):
+            raise ValueError(
+                "saved: the kept recompute tapes carry qn / kn exactly when use_qk_l2norm_in_kernel is on"
+            )
+        for name in kept.qk:
+            shape, dtype = tape_spec(
+                name, R=R, NC_pad=NC_pad, HV=call.HV, T=call.T_r, H_qk=call.H_qk
+            )
+            _check(kept.qk[name], f"kept.{name}", shape, dtype, call.device)
         if tb.P > 1 and not opts.save_transfer:
             if kept.stage_m is None:
                 raise ValueError(
@@ -5363,7 +5534,12 @@ def packed_qkv_views_det_kcp(
 
     :func:`chunk_gdn_det_kcp` takes the views as they are (token stride ``(2 H_qk + HV) * 128``) and its backward writes
     ``dq`` / ``dk`` / ``dv`` as the same views of one fresh packed row; this split's backward hands that row on as
-    the gradient of ``qkv`` without a concatenation.  Any other incoming gradient is concatenated."""
+    the gradient of ``qkv`` without a concatenation.  Any other incoming gradient is concatenated.
+
+    Needs a dense channel axis (``qkv.stride(-1) == 1``).  The views are the outputs of one custom autograd node:
+    hooks and ``retain_grad`` on them fire as on any autograd output; a missing gradient counts as zeros and a
+    hook that returns a new gradient makes the backward concatenate (``PACKED_SPLIT_STATS``); autograd refuses an
+    in-place change to the views while ``qkv`` requires grad."""
     H_qk, HV = int(H_qk), int(HV)
     validate_heads(H_qk, HV)
     C = (2 * H_qk + HV) * D
@@ -5404,7 +5580,13 @@ def chunk_gdn_det_kcp(
     (:class:`RecomputeHandleDetKcp`): the checkpoint recompute of this forward exchanges nothing -- it reads the
     incoming states the original forward stored in the handle; needs ``boundary_mode="saved"`` and ``graph="off"``,
     implies ``save_transfer=False`` (a ``save_transfer=True`` keyword or ``options`` dict entry is refused; a
-    :class:`OptionsDetKcp` instance's value is replaced by ``False``) and refuses ``debug_sequence``."""
+    :class:`OptionsDetKcp` instance's value is replaced by ``False``) and refuses ``debug_sequence``.
+
+    ``q`` / ``k`` / ``v`` that are head views of one packed ``[..., T, (2 H_qk + HV) * 128]`` row get the full backward
+    speed only as :func:`packed_qkv_views_det_kcp` views.  Plain ``split`` / ``view`` views of the row give bitwise
+    the same results, but torch's split backward concatenates ``dq`` / ``dk`` / ``dv`` into a new row: about 1.1 ms
+    (33-36 %) more backward per call at ``(16, 48)`` and 32,768 tokens on GB200 and GB300, with the in-kernel norm off
+    or on (README, "Packed Q/K/V")."""
     over = _literal_overrides(
         options,
         ("save_mode", save_mode, _opt.SAVE_MODE_DEFAULT),

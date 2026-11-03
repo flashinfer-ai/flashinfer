@@ -622,7 +622,7 @@ def dsa_indexer_det_workspace_size(
     ``S``, ``ratio`` and ``top_k``; prepare a call's buffer for its own geometry
     (or for the largest bound over the geometries it will serve).  The bound
     covers both sampling modes: where the record's ``l6_solo_rule``,
-    ``split_wave_scope`` or ``wide_pair_snake_only`` gives a call with the
+    ``l6_solo_unsampled_max_queries``, ``split_wave_scope`` or ``wide_pair_snake_only`` gives a call with the
     sampled first threshold off (``sample_tiles_max=0``) another unit
     geometry, pair or split than the sampled default, the larger of the two
     plans.

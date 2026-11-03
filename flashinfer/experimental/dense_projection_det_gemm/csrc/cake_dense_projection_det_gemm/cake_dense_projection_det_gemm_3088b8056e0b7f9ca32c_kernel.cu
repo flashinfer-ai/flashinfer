@@ -163,6 +163,8 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
     }
 
     __syncwarp();
+    asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
+    asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
 
     // TMEM alloc (512 columns, 512 used)
 #if !defined(CAKE_DPG_DENSE_PROJ_DET_GEMM_KN_N256_TMA2_PD2_PRO7)
@@ -182,8 +184,6 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
     }
 
     __syncthreads();
-    asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
-    asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
     const int taddr = tmem_addr_storage[0];

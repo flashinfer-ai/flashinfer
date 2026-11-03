@@ -56,8 +56,10 @@ from ._inputs_helper import CuteDslMoEInputsHelper
 from .blackwell.moe_w4a16 import launch_w4a16_moe
 from .blackwell.moe_w4a16_kernel import Sm100W4A16GroupedGemmKernel
 from .moe_utils import (
+    W4A16_CUTE_DSL_MOE_ACTIVATION_TYPES,
     normalize_cute_dsl_moe_activation_type,
     rubin_moe_cluster_covers_one_tile,
+    validate_cute_dsl_moe_clamped_relu2_config,
     validate_cute_dsl_moe_situ_config,
 )
 
@@ -490,6 +492,11 @@ class CuteDslFusedMoERunner(TunableRunner):
         localized_memset_stream: Optional stream used to overlap output zeroing.
         situ_beta: When set with ActivationType.Swiglu, use the SiTU gate.
         situ_linear_beta: Optional SiTU tanh clamp for the up branch.
+        clamped_relu2_limit: One-element float32 CUDA tensor holding the
+            ActivationType.ClampedRelu2 limit (required with it, rejected
+            otherwise). Kept as a runner attribute like the other activation
+            parameters and read by the kernel at runtime, so its value is not
+            part of the cache key; the activation type is.
 
     Also supports Rubin (SM107): tactic format is architecture-dependent —
     see _extract_tactic_params.
@@ -518,8 +525,10 @@ class CuteDslFusedMoERunner(TunableRunner):
         localized_streams: Optional[list] = None,
         localized_sm_count: Optional[int] = None,
         localized_memset_stream: Optional[torch.cuda.Stream] = None,
+        clamped_relu2_limit: Optional[torch.Tensor] = None,
     ):
         activation_type, gated = normalize_cute_dsl_moe_activation_type(activation_type)
+        validate_cute_dsl_moe_clamped_relu2_config(activation_type, clamped_relu2_limit)
         validate_cute_dsl_moe_situ_config(activation_type, situ_beta, situ_linear_beta)
         quant_mode = quant_mode.lower()
         if quant_mode not in ("w4a4", "w4a8", "mxfp8"):
@@ -545,6 +554,7 @@ class CuteDslFusedMoERunner(TunableRunner):
         self.swiglu_limit = swiglu_limit
         self.situ_beta = situ_beta
         self.situ_linear_beta = situ_linear_beta
+        self.clamped_relu2_limit = clamped_relu2_limit
         self.use_per_token_activation = use_per_token_activation
         self.quant_mode = quant_mode
         self.use_cuda_graph = use_cuda_graph
@@ -812,11 +822,11 @@ class CuteDslFusedMoERunner(TunableRunner):
 
             if _is_rubin_tactic(tactic):
                 # The Rubin (SM107) gather kernel implements SwiGLU (and its
-                # SiTU variant) plus Relu2, but not GeGLU-tanh; skip Rubin
-                # tactics for the unimplemented activation.
-                if (
-                    ActivationType(int(self.activation_type))
-                    == ActivationType.GegluTanh
+                # SiTU variant) plus Relu2, but not GeGLU-tanh or ClampedRelu2;
+                # skip Rubin tactics for the unimplemented activations.
+                if ActivationType(int(self.activation_type)) in (
+                    ActivationType.GegluTanh,
+                    ActivationType.ClampedRelu2,
                 ):
                     return False
 
@@ -1068,6 +1078,7 @@ class CuteDslFusedMoERunner(TunableRunner):
             swiglu_limit=self.swiglu_limit,
             situ_beta=self.situ_beta,
             situ_linear_beta=self.situ_linear_beta,
+            clamped_relu2_limit=self.clamped_relu2_limit,
             **kwargs,
         )
 
@@ -1143,7 +1154,9 @@ class CuteDslFusedMoEW4A16Runner(TunableRunner):
         situ_beta: Optional[float] = None,
         situ_linear_beta: Optional[float] = None,
     ):
-        activation_type, _ = normalize_cute_dsl_moe_activation_type(activation_type)
+        activation_type, _ = normalize_cute_dsl_moe_activation_type(
+            activation_type, W4A16_CUTE_DSL_MOE_ACTIVATION_TYPES, backend="W4A16"
+        )
         validate_cute_dsl_moe_situ_config(activation_type, situ_beta, situ_linear_beta)
         if output_dtype != torch.bfloat16:
             raise ValueError("W4A16 only supports BF16 output")

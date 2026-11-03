@@ -33,6 +33,7 @@ import inspect
 import json
 import pathlib
 import sys
+import types
 import warnings
 
 import pytest
@@ -318,6 +319,215 @@ def test_test_knobs_are_a_keyword_dict_with_known_keys() -> None:
         o.knob("walk_geometry")
 
 
+def test_walk_pair_knob_defaults_to_auto() -> None:
+    assert opt.TEST_KNOBS["walk_pair"] == (None, 0, 1)
+    assert opt.TEST_KNOB_DEFAULTS["walk_pair"] is None
+    assert make_options().knob("walk_pair") is None
+    assert make_options(test_knobs={"walk_pair": None}).knob("walk_pair") is None
+    assert make_options(test_knobs={"walk_pair": 0}).knob("walk_pair") == 0
+    assert make_options(test_knobs={"walk_pair": 1}).knob("walk_pair") == 1
+    for bad in (2, -1, True, False, "1"):
+        with pytest.raises(ValueError):
+            make_options(test_knobs={"walk_pair": bad})
+    keys = {make_options(test_knobs={"walk_pair": v}).key() for v in (None, 0, 1)}
+    assert len(keys) == 3
+    with pytest.raises(TypeError):
+        make_options(walk_pair=1)  # a test knob, never a public option
+
+
+@pytest.mark.parametrize(
+    "knob, layout, world, capability, on",
+    [
+        (None, "zigzag", 2, (10, 3), True),
+        (None, "zigzag", 4, (10, 0), True),
+        (None, "zigzag_per_document", 4, (10, 3), True),
+        (None, "zigzag_per_document", 8, (10, 0), True),
+        (None, "contiguous", 4, (10, 3), False),
+        (None, "explicit", 4, (10, 0), False),
+        (None, "zigzag", 16, (10, 3), False),
+        (None, "zigzag_per_document", 16, (10, 0), False),
+        (None, "zigzag", 4, (10, 7), False),
+        (None, "zigzag_per_document", 8, (10, 7), False),
+        (None, "zigzag", 4, (9, 0), False),
+        (None, "zigzag", 4, (12, 0), False),
+        (0, "zigzag", 4, (10, 3), False),
+        (0, "zigzag_per_document", 8, (10, 0), False),
+        (1, "zigzag", 4, (10, 7), True),
+        (1, "zigzag", 4, (10, 3), True),
+        (1, "zigzag", 16, (10, 3), False),
+        (1, "contiguous", 4, (10, 0), False),
+    ],
+)
+def test_walk_pair_auto_is_on_for_zigzag_up_to_8_ranks_on_sm100_and_sm103(
+    monkeypatch, knob, layout, world, capability, on
+) -> None:
+    """The default (``None``) pairs the walks on a zigzag / zigzag-per-document partition of at most 8 ranks on
+    ``sm_100a`` / ``sm_103a`` only (``sm_107a`` keeps one stream); an explicit 0 / 1 forces either path there."""
+    kcp = _mod("cake_kcp")
+    assert kcp.WALK_PAIR_AUTO_CAPABILITIES == ((10, 0), (10, 3))
+    queried: list = []
+
+    def capability_of(index):
+        queried.append(index)
+        return capability
+
+    monkeypatch.setattr(kcp, "_CAPABILITIES", {})
+    monkeypatch.setattr(torch.cuda, "get_device_capability", capability_of)
+    ctx = types.SimpleNamespace(
+        partition=types.SimpleNamespace(layout=layout, world_size=world)
+    )
+    device = torch.device("cuda", 1)
+    assert kcp._walk_pair_enabled(knob, ctx, device) is on
+    assert kcp._walk_pair_enabled(knob, ctx, device) is on
+    assert len(queried) <= 1  # the capability is read once per device
+    assert all(index == 1 for index in queried)
+
+
+def test_walk_pair_auto_is_off_without_a_cuda_device(monkeypatch) -> None:
+    kcp = _mod("cake_kcp")
+
+    def no_query(index):
+        raise AssertionError("no capability query off CUDA")
+
+    monkeypatch.setattr(kcp, "_CAPABILITIES", {})
+    monkeypatch.setattr(torch.cuda, "get_device_capability", no_query)
+    ctx = types.SimpleNamespace(
+        partition=types.SimpleNamespace(layout="zigzag", world_size=4)
+    )
+    assert kcp._walk_pair_enabled(None, ctx, torch.device("cpu")) is False
+    assert kcp._walk_pair_enabled(None, ctx) is False
+    assert kcp._walk_pair_enabled(1, ctx, torch.device("cpu")) is True
+
+
+@pytest.mark.parametrize(
+    "knob, layout, world, on",
+    [
+        (1, "zigzag", 2, True),
+        (1, "zigzag", 8, True),
+        (1, "zigzag_per_document", 8, True),
+        (1, "zigzag", 16, False),
+        (1, "zigzag_per_document", 16, False),
+        (1, "contiguous", 8, False),
+        (1, "explicit", 8, False),
+        (0, "zigzag", 8, False),
+        (0, "zigzag_per_document", 4, False),
+    ],
+)
+def test_walk_pair_is_on_for_zigzag_partitions_up_to_8_ranks(
+    knob, layout, world, on
+) -> None:
+    kcp = _mod("cake_kcp")
+    assert kcp.WALK_PAIR_LAYOUTS == ("zigzag", "zigzag_per_document")
+    assert kcp.WALK_PAIR_MAX_WORLD == 8
+    ctx = types.SimpleNamespace(
+        partition=types.SimpleNamespace(layout=layout, world_size=world)
+    )
+    assert kcp._walk_pair_enabled(knob, ctx) is on
+    assert kcp._walk_pair_enabled(knob, types.SimpleNamespace()) is False
+
+
+class _Stream:
+    def __init__(self, name: str, log: list) -> None:
+        self.name, self.log = name, log
+
+    def wait_event(self, event) -> None:
+        self.log.append(("wait", self.name, event.name))
+
+
+def _walk_pair_stub(monkeypatch, *, walk_pair: bool, device: str):
+    """A stand-in call for ``cake_kcp._walk_pair`` with CPU stand-ins for the CUDA stream / event API: every
+    stream operation and every backend launch (with the stream it was issued on) goes to the returned log; the call's
+    ``kernel`` is the host module's own ``CallKcp.kernel`` (the deferral under test)."""
+    kcp = _mod("cake_kcp")
+    log: list = []
+    current, side = _Stream("current", log), _Stream("side", log)
+    active = [current]
+    names = iter(f"ev{i}" for i in range(100))
+
+    class _Event:
+        def __init__(self) -> None:
+            self.name = next(names)
+
+        def record(self, stream) -> None:
+            log.append(("record", self.name, stream.name))
+
+    class _StreamContext:
+        def __init__(self, stream) -> None:
+            self.stream = stream
+
+        def __enter__(self) -> None:
+            active.append(self.stream)
+
+        def __exit__(self, *exc) -> None:
+            active.pop()
+
+    class _Backend:
+        def run(self, name: str, args: dict) -> None:
+            log.append(("run", name, active[-1].name))
+
+    monkeypatch.setattr(torch.cuda, "Event", _Event)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device=None: current)
+    monkeypatch.setattr(torch.cuda, "stream", _StreamContext)
+    monkeypatch.setattr(kcp, "_side_stream", lambda device: side)
+    call = types.SimpleNamespace(
+        walk_pair=walk_pair,
+        device=torch.device(device),
+        _deferred=None,
+        backend=_Backend(),
+        counters={"launches": 0},
+        sequence=[],
+    )
+
+    def launch(name: str):
+        return lambda: kcp.CallKcp.kernel(call, name, 1)
+
+    return kcp, call, log, launch
+
+
+def test_walk_pair_forks_and_joins_around_the_side_launches(monkeypatch) -> None:
+    """``walk_pair=1``: the offset walk's launch is resolved first and issued on the side stream after the side stream
+    waits on a fork event recorded on the current stream; the transfer walk follows on the current stream, which then
+    waits on the side stream's join event.  The call's launch sequence is the one-stream order."""
+    kcp, call, log, launch = _walk_pair_stub(monkeypatch, walk_pair=True, device="cuda")
+    paired = kcp.WALK_PAIR_STATS["paired"]
+    kcp._walk_pair(call, launch("kcp_fwdh_offset"), launch("kcp_transfer_walk"))
+    assert call.sequence == ["kcp_fwdh_offset", "kcp_transfer_walk"]
+    assert call._deferred is None
+    assert log == [
+        ("record", "ev0", "current"),
+        ("wait", "side", "ev0"),
+        ("run", "kcp_fwdh_offset", "side"),
+        ("record", "ev1", "side"),
+        ("run", "kcp_transfer_walk", "current"),
+        ("wait", "current", "ev1"),
+    ]
+    assert kcp.WALK_PAIR_STATS["paired"] == paired + 1
+
+
+@pytest.mark.parametrize("walk_pair, device", [(False, "cuda"), (True, "cpu")])
+def test_walk_pair_off_or_on_the_cpu_is_one_stream(
+    monkeypatch, walk_pair, device
+) -> None:
+    kcp, call, log, launch = _walk_pair_stub(
+        monkeypatch, walk_pair=walk_pair, device=device
+    )
+    kcp._walk_pair(call, launch("kcp_fwdh_offset"), launch("kcp_transfer_walk"))
+    assert log == [
+        ("run", "kcp_fwdh_offset", "current"),
+        ("run", "kcp_transfer_walk", "current"),
+    ]
+    assert call.sequence == ["kcp_fwdh_offset", "kcp_transfer_walk"]
+
+
+def test_walk_pair_with_an_empty_side_walk_issues_on_the_current_stream(
+    monkeypatch,
+) -> None:
+    kcp, call, log, launch = _walk_pair_stub(monkeypatch, walk_pair=True, device="cuda")
+    kcp._walk_pair(call, lambda: None, launch("kcp_transfer_walk"))
+    assert log == [("run", "kcp_transfer_walk", "current")]
+    assert call._deferred is None
+
+
 def test_options_from_instance_mapping_and_keywords_agree() -> None:
     a = make_options(OptionsKcp(save_mode="full"), boundary_mode="replay")
     b = make_options({"save_mode": "full", "boundary_mode": "replay"})
@@ -375,7 +585,8 @@ def test_facade_exposes_the_contract_names_keyword_only() -> None:
     for n in names:
         assert callable(getattr(facade, n)), n
         assert n in facade.__all__
-    # exactly the contract names plus the three public types; nothing else is public
+    # exactly the contract names plus the three public types; nothing else is public (the package-level
+    # packed_qkv_views_kcp is not a facade name)
     types = (
         "OptionsKcp",
         "ContextKcp",
@@ -425,6 +636,7 @@ def test_package_init_re_exports_the_route() -> None:
         "gdn_comm_bytes_kcp",
         "gdn_saved_bytes_kcp",
         "gdn_workspace_bytes_kcp",
+        "packed_qkv_views_kcp",
         "OptionsKcp",
         "ContextKcp",
         "SavedKcp",
@@ -1018,10 +1230,54 @@ def test_facade_context_graph_replay_hint(monkeypatch) -> None:
             facade.build_context_kcp(object(), None, 0, "cpu", graph_replay=bad)
 
 
+def test_facade_forwards_the_l2n_option_on_both_routes(monkeypatch) -> None:
+    """#7817 / #8063: ``use_qk_l2norm_in_kernel`` reaches the non-deterministic package unchanged (keyword, mapping and
+    the other route's options instance) on every compute entry and byte query, as it reaches the deterministic route;
+    under torch's deterministic algorithms ``deterministic=False`` still runs the deterministic route."""
+    facade = importlib.import_module(FACADE)
+    det_opt = importlib.import_module(f"{DET_PACKAGE}.cake_options")
+    seen = _route_recorders(monkeypatch)
+    calls = _facade_calls(facade)
+    for entry in (
+        "chunk_gdn_kcp",
+        "chunk_gdn_fwd_kcp",
+        "chunk_gdn_bwd_kcp",
+        "gdn_workspace_bytes_kcp",
+        "gdn_saved_bytes_kcp",
+    ):
+        for flag in (False, True):
+            seen.clear()
+            assert calls[entry](use_qk_l2norm_in_kernel=flag, deterministic=False) == (
+                f"nondet:{entry}"
+            )
+            assert seen[-1][1]["use_qk_l2norm_in_kernel"] is flag, entry
+            seen.clear()
+            assert calls[entry](use_qk_l2norm_in_kernel=flag).startswith("det:")
+            assert seen[-1][1]["use_qk_l2norm_in_kernel"] is flag, entry
+    t = torch.zeros(1)
+    det_o = det_opt.OptionsDetKcp(use_qk_l2norm_in_kernel=True)
+    facade.chunk_gdn_kcp(t, t, t, t, t, object(), options=det_o, deterministic=False)
+    assert seen[-1][0] == "nondet:chunk_gdn_kcp"
+    assert seen[-1][1]["options"]["use_qk_l2norm_in_kernel"] is True
+    mapping = {"use_qk_l2norm_in_kernel": True}
+    facade.chunk_gdn_fwd_kcp(
+        t, t, t, t, t, object(), options=mapping, deterministic=False
+    )
+    assert (
+        seen[-1][0] == "nondet:chunk_gdn_fwd_kcp" and seen[-1][1]["options"] == mapping
+    )
+    nd_o = OptionsKcp(use_qk_l2norm_in_kernel=True)
+    assert nd_o.use_qk_l2norm_in_kernel is True
+    facade.chunk_gdn_bwd_kcp(
+        t, t, t, t, t, object(), t, options=nd_o, deterministic=False
+    )
+    assert seen[-1][0] == "nondet:chunk_gdn_bwd_kcp" and seen[-1][1]["options"] is nd_o
+
+
 def test_facade_converts_an_options_instance_of_the_other_route(monkeypatch) -> None:
-    """An options instance of the other route reaches the routed package as the mapping of its fields (the
-    deterministic-only ``use_qk_l2norm_in_kernel`` left out at ``False`` on the non-deterministic route); the routed
-    package's own instance, a mapping and ``None`` pass through unchanged."""
+    """An options instance of the other route reaches the routed package as the mapping of all its fields
+    (``use_qk_l2norm_in_kernel`` included: both routes have it); the routed package's own instance, a mapping and
+    ``None`` pass through unchanged."""
     facade = importlib.import_module(FACADE)
     det_opt = importlib.import_module(f"{DET_PACKAGE}.cake_options")
     seen = _route_recorders(monkeypatch)
@@ -1033,11 +1289,7 @@ def test_facade_converts_an_options_instance_of_the_other_route(monkeypatch) -> 
     )
     got = seen[-1][1]["options"]
     assert isinstance(got, dict) and got["save_mode"] == "full"
-    assert got == {
-        f.name: getattr(det_o, f.name)
-        for f in dataclasses.fields(det_o)
-        if f.name != "use_qk_l2norm_in_kernel"
-    }
+    assert got == {f.name: getattr(det_o, f.name) for f in dataclasses.fields(det_o)}
     facade.chunk_gdn_fwd_kcp(
         t, t, t, t, t, object(), options=own_o, deterministic=False
     )
@@ -1326,7 +1578,18 @@ def test_program_vocabulary_is_the_design_list() -> None:
         "kcp_dhu_tape",
         "bwd_dqkg",
         "gate_epilogue",
+        "fwd_prep_l2n",
+        "bwd_dqkg_l2n",
+        "qk_apply",
     )
+    # the in-kernel Q / K L2 norm (use_qk_l2norm_in_kernel): #1 / #8 siblings and the backward's qk_apply
+    assert kcp.L2N_PROGRAMS == ("fwd_prep_l2n", "bwd_dqkg_l2n", "qk_apply")
+    assert set(kcp.L2N_PROGRAMS) <= set(kcp.LOCAL_PROGRAMS)
+    assert kcp.L2N_SIBLING_OF == {
+        "fwd_prep": "fwd_prep_l2n",
+        "bwd_dqkg": "bwd_dqkg_l2n",
+    }
+    assert kcp.QK_TAPES == ("qn", "kn") and kcp.QK_RSTD == "qk_rstd"
     assert set(kcp.PROGRAM_ARGS) == set(kcp.PROGRAMS)
     assert (
         kcp.TART_MODULE_OF["kcp_affine_merge"] == "kda_chunk_kcp_affine_merge_fp32_v1"
@@ -1422,9 +1685,14 @@ def test_program_args_are_the_registry_logical_names() -> None:
         needed = set(rec["logical"].values())
         missing = needed - set(kcp.PROGRAM_ARGS[rec["program"]])
         assert not missing, (rec_name, sorted(missing))
-    # record resolution through the registry: shipped records, the merge variants by ncols, the test twins
+    # record resolution through the registry: shipped records, the merge variants by ncols, the test twins (the
+    # in-kernel L2 norm programs once their records ship; refused with a clear message before)
     for prog in kcp.PROGRAMS:
         if prog == "kcp_affine_merge":
+            continue
+        if prog in kcp.L2N_PROGRAMS and not jit.records_of_program(prog):
+            with pytest.raises(ValueError, match="no shipped record"):
+                jit.select_record(prog)
             continue
         assert jit.select_record(prog) == prog
     assert jit.select_record("kcp_affine_merge", ncols=128) == "kcp_affine_merge_c8"

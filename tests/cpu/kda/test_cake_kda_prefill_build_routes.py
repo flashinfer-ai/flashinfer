@@ -32,13 +32,13 @@ N16 = "cake_kda_bf16_51e813006f17147a02a5"
 DIR = "cake_kda_bf16_893740628d53688ac269"
 # The next-state prefetch builds of the work-binned programs.
 PREFETCH = {
-    N32: "cake_kda_prefill_0cfd846d62326f938704",
-    N16: "cake_kda_prefill_cb5c38847fbc141ab226",
+    N32: "cake_kda_prefill_4a42f56b2227bc7d99fa",
+    N16: "cake_kda_prefill_fb49a4a893151688ea5f",
 }
 # The per-warp checkpoint build of the owner/helper program, and the pooled
 # owner/helper program.
-CHECKPOINT_SLICES = {DIR: "cake_kda_prefill_a1718dac35b1811fc4f0"}
-POOLED = {DIR: "cake_kda_prefill_2056bae01a94fb39ddf2"}
+CHECKPOINT_SLICES = {DIR: "cake_kda_prefill_ba0babf290c384f20023"}
+POOLED = {DIR: "cake_kda_prefill_c9f26577363f5853f195"}
 
 
 @pytest.fixture

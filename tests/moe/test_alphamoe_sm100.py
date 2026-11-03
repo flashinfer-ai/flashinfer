@@ -526,7 +526,8 @@ def test_alphamoe_sm100_validates_tma_and_output_alignment():
 # Busy 8-row route subtiles up to which M <= 8 runs the four-CTA quad variants
 # (QuadClusterCapacity in csrc/alphamoe_sm100.cu), measured per device class by
 # SM count: 74 on GB300 (152 SMs), 71 on B200 (148 SMs). Past it the CTA pair
-# runs.
+# runs: the deep-ring pair (pd, one CTA per SM) while the bound fits SMs / 2
+# pairs, p2 beyond.
 _QUAD_CLUSTER_CAPACITY = {148: 71, 152: 74}
 
 
@@ -549,7 +550,8 @@ def test_alphamoe_sm100_m8_quad_cluster_capacity(m, top_k, block_m):
     With more experts than routes, the plan's bound on busy 8-row subtiles is
     m * top_k * block_m / 8. The quad variants run up to the device's measured
     capacity and the pair above it, so a failed occupancy query (no cap) fails
-    here.
+    here; past the quad, the deep-ring pair runs while the bound fits SMs / 2
+    pairs (UsesPairDeepRing) and p2 beyond.
     """
     _skip_if_not_sm100_sm103()
     sms = torch.cuda.get_device_properties(0).multi_processor_count
@@ -559,7 +561,9 @@ def test_alphamoe_sm100_m8_quad_cluster_capacity(m, top_k, block_m):
     case = _make_case(m, 256, 7168, 257, top_k, block_m, False, 0.8, 1.0, seed)
     names = cuda_kernel_names(lambda: _launch(case))
     quad = any("w8a8_i2" in x or "w8a8_im" in x for x in names)
+    deep = any("w8a8_pd" in x for x in names)
     pair = any("w8a8_p2" in x or "w8a8_pl" in x for x in names)
     bound = m * top_k * block_m // 8
-    assert quad != pair, names
+    assert quad + deep + pair == 1, names
     assert quad == (bound <= _QUAD_CLUSTER_CAPACITY[sms]), (sms, bound, names)
+    assert deep == (not quad and bound <= sms // 2), (sms, bound, names)
