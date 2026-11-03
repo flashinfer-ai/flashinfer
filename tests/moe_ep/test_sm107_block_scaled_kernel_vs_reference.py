@@ -544,10 +544,10 @@ def test_sm107_knob_cache_and_candidates(monkeypatch, tmp_path):
             quant_kind=quant_kind,
         )
         candidates = pkg.sm107_candidates(quant_kind)
-        assert len(candidates) == 16
+        assert len(candidates) == 32
         assert all(pkg.is_valid_sm107(knobs, base) for knobs in candidates)
         with_ikr = pkg.sm107_candidates(quant_kind, allow_in_kernel_fc2_reduce=True)
-        assert len(with_ikr) == 32
+        assert len(with_ikr) == 64
         assert all(pkg.is_valid_sm107(knobs, base) for knobs in with_ikr)
         schedule = pkg.sm107_schedule_candidates(candidates[0])
         assert len(schedule) == 8

@@ -326,6 +326,13 @@ Report Torch staging cost separately when evaluating a fused staging implementat
 
 ## Offline tuning
 
+The regular inference grid has 32 candidates. It retains the original 16 in
+the same order, then adds N64 tiles at two K depths and uniform-cluster
+phase-interleaved launches for N128/N256. The added launches use cluster
+sizes two and four, epilogue flag batches `(2, 4)`, and FC2 bulk stores on/off.
+N64 bulk stores use one TMA stage; wider tiles use two. The GenPhase grid is
+unchanged. Layer warmup and the offline CLI use the same candidate generator.
+
 The CLI always searches afresh and leaves its input workspace unchanged. It
 writes each winner to the managed FlashInfer v2 store and the MegaMoE file on
 EP rank zero. The default store is `FLASHINFER_CACHE_DIR/autotune`;
