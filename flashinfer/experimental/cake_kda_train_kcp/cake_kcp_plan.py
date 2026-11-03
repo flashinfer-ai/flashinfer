@@ -3175,7 +3175,8 @@ def local_tail_count_words(arena_bytes: int, H: int) -> int:
 # The route needs, for every problem, a record of the mode's class on each of its stages: the existing backend's
 # ``cake_jit.select_record(..., l2n=mode)`` (a stage of its ``L2N_STAGES`` selects among the records whose ``l2n``
 # modes hold the mode) for the stages of :data:`QK_L2NORM_STAGES` on the route's two local paths (the forward's
-# ``fwd_nosave``, the backward's ``replay``); in the fused form the forward's intra program normalizes and on the
+# ``fwd_nosave``, the backward's ``replay``): the deterministic package's stages and this package's fused gradient
+# (``dqkg``, an l2n stage of its registry, whose ``dqkg_*_l2n`` class the mode selects); in the fused form the forward's intra program normalizes and on the
 # replay exactly one first q / k reader does, the intra program or the prep, as the existing order of the problem
 # gives (:func:`qk_l2norm_intra_first`; in the fallback form none of them does).  The check selects over the
 # fixed grid :data:`QK_L2NORM_GRID` x :data:`QK_L2NORM_SMS` (no rank's tokens: at most and above the intra programs'
@@ -3202,10 +3203,14 @@ _QK_L2NORM_SEPARATE = (
     (LOCAL_PATH_BWD, "qk_apply"),
     (LOCAL_PATH_BWD, "qk_pullback"),
 )
+# this package's fused gradient: an l2n stage of the single-rank registry (no GLM intra program of an l2n mode adds
+# the S1 pair's ``q * dq`` term, so an l2n mode selects the ``dqkg_*_l2n`` copies of the deterministic records), on
+# the backward's path in both forms
+_QK_L2NORM_GRADIENT = ((LOCAL_PATH_BWD, "dqkg"),)
 # (path, stage) per form
 QK_L2NORM_STAGES = {
-    "fused": _QK_L2NORM_READERS,
-    "fallback": _QK_L2NORM_READERS + _QK_L2NORM_SEPARATE,
+    "fused": _QK_L2NORM_READERS + _QK_L2NORM_GRADIENT,
+    "fallback": _QK_L2NORM_READERS + _QK_L2NORM_SEPARATE + _QK_L2NORM_GRADIENT,
 }
 # (num_chunks_pad, num_seqs, num_heads) of the check: 1 / 256 / 257 documents (the intra programs switch above 256),
 # 4 / 16 / 64 heads (the segmented route at few heads and at the 16 heads some architectures list, the serial route

@@ -618,7 +618,6 @@ QK_L2NORM_CONSTANTS = (
     "QK_L2NORM_PENDING",
     "QK_L2NORM_FORMS",
     "QK_L2NORM_FORM_DEFAULT",
-    "QK_L2NORM_STAGES",
     "QK_L2NORM_GRID",
     "QK_L2NORM_SMS",
     "QK_L2NORM_SMS_ANY",
@@ -629,9 +628,10 @@ QK_L2NORM_CONSTANTS = (
 
 def test_l2n_vocabulary_is_the_deterministic_packages() -> None:
     """The keyword and the form knob have the deterministic package's kind and default on every entry, byte query and
-    workspace; the capability check's stages, grid, SM counts, layouts, slots and pending message, the fallback
-    form's stages and the saved set's version are the deterministic package's; the mode adds the same fields to the
-    saved set (in the same place)."""
+    workspace; the capability check's grid, SM counts, layouts, slots and pending message, the fallback form's stages
+    and the saved set's version are the deterministic package's, and its stages are the deterministic package's
+    plus this package's fused gradient (``dqkg``, an l2n stage of its registry) on the backward's path; the mode adds
+    the same fields to the saved set (in the same place)."""
     for (module, name), (det_module, det_name) in zip(
         L2N_ENTRIES, DET_L2N_ENTRIES, strict=True
     ):
@@ -648,6 +648,12 @@ def test_l2n_vocabulary_is_the_deterministic_packages() -> None:
         assert (p.kind, p.default) == (dp.kind, dp.default), knob
     for name in QK_L2NORM_CONSTANTS:
         assert getattr(cake_kcp_plan, name) == getattr(det_kcp_plan, name), name
+    gradient = ((cake_kcp.LOCAL_PATH_BWD, "dqkg"),)
+    det_stages = det_kcp_plan.QK_L2NORM_STAGES
+    assert set(det_stages) == {"fused", "fallback"}
+    want = {form: stages + gradient for form, stages in det_stages.items()}
+    assert want == cake_kcp_plan.QK_L2NORM_STAGES
+    assert "dqkg" in cake_jit.L2N_STAGES and "dqkg" not in det_jit.L2N_STAGES
     assert cake_kcp.L2N_FALLBACK_STAGES == det_kcp.L2N_FALLBACK_STAGES
     assert cake_kcp.KCP_SAVED_VERSION == det_kcp.KCP_SAVED_VERSION
     fields = [f.name for f in dataclasses.fields(cake_kcp.SavedKcp)]
@@ -1619,7 +1625,8 @@ def _fake_pick(stage: str, path: str, mode: str, docs: int, heads: int, arch: st
     """The fake registry's selection, shaped as the existing backend's: the intra programs switch above 256
     documents; fused, the forward's intra program is the ``_l2n`` twin and on the replay the intra program (at most
     256 documents) or the prep (above) is; the GLM intra program per architecture (fused, its twin; fallback, its
-    capture form); the fallback form's separate programs (none in the fused form)."""
+    capture form); this package's fused gradient (its l2n class, both forms); the fallback form's separate programs
+    (none in the fused form)."""
     few = docs <= 256
     twin = "_l2n" if mode == "fused" else ""
     if stage == "fwd_intra":
@@ -1630,6 +1637,8 @@ def _fake_pick(stage: str, path: str, mode: str, docs: int, heads: int, arch: st
     if stage == "glm_intra":
         glm = {"sm_100a": "glm_intra", "sm_103a": "glm_intra_v14"}
         return glm.get(arch, "glm_intra_v18") + (twin or "_cap")
+    if stage == "dqkg":
+        return "dqkg_int_l2n" if few else "dqkg_l2n"
     return stage if mode == "fallback" else None
 
 
@@ -1716,7 +1725,7 @@ def test_l2n_capability_check() -> None:
     """:func:`cake_kcp_plan.qk_l2norm_missing` (form, gate, arch): rank-independent inputs only (no context, no token
     count, no plan).  It selects through the existing backend's ``select_record(..., l2n=form)`` (and ``gate=`` in
     the raw gate mode) every stage of :data:`cake_kcp_plan.QK_L2NORM_STAGES` of the form on the route's two local
-    paths, over the fixed grid :data:`cake_kcp_plan.QK_L2NORM_GRID` at each SM count of the architecture
+    paths (this package's fused gradient ``dqkg`` among them), over the fixed grid :data:`cake_kcp_plan.QK_L2NORM_GRID` at each SM count of the architecture
     (:data:`cake_kcp_plan.QK_L2NORM_SMS`; every exported architecture for ``None``), each problem once; the grid
     holds both document regimes (at most and above 256) on both recurrence routes (segmented and serial) on every
     architecture.  A reason while the existing backend's entry points lack ``use_qk_l2norm_in_kernel``, its plan or
@@ -1735,8 +1744,12 @@ def test_l2n_capability_check() -> None:
     F, B = cake_kcp.LOCAL_PATH_FWD, cake_kcp.LOCAL_PATH_BWD
     readers = ((F, "fwd_intra"), (B, "fwd_intra"), (B, "bwd_prep"), (B, "glm_intra"))
     separate = ((F, "qk_l2norm"), (B, "qk_l2norm"), (B, "qk_apply"), (B, "qk_pullback"))
+    gradient = ((B, "dqkg"),)
     stages = cake_kcp_plan.QK_L2NORM_STAGES
-    assert stages == {"fused": readers, "fallback": readers + separate}
+    assert stages == {
+        "fused": readers + gradient,
+        "fallback": readers + separate + gradient,
+    }
     assert cake_kcp_plan.QK_L2NORM_LAYOUTS == ("fwd", "fwd_kcp", "replay")
     # the grid: both document regimes on both routes, on every architecture at each of its SM counts
     grid, sms = cake_kcp_plan.QK_L2NORM_GRID, cake_kcp_plan.QK_L2NORM_SMS
@@ -1805,6 +1818,13 @@ def test_l2n_capability_check() -> None:
             f"selects no glm_intra on {B} (sm_107a, 212 SMs, 1 documents, 16 heads, 1 chunks)",
         ),
         ({"pick": _pick_but(lambda s, *k: s == "qk_pullback", None)}, "fallback", f"selects no qk_pullback on {B}"),
+        # this package's fused gradient, an l2n stage of its registry, in both forms
+        ({"pick": _pick_but(lambda s, *k: s == "dqkg", None)}, None, f"selects no dqkg on {B}"),
+        (
+            {"pick": _pick_but(lambda s, p, m, d, h, a: s == "dqkg" and m == "fused" and d > 256, bad)},
+            "fused",
+            f"selects no dqkg on {B} ({where}): {bad}",
+        ),
         (
             {"pick": _pick_but(lambda s, p, m, d, h, a: s == "qk_apply" and d > 256, None)},
             "fallback",
@@ -1940,6 +1960,38 @@ def test_l2n_capability_check_is_kept() -> None:
                 n = len(calls)
                 assert cake_kcp_plan.qk_l2norm_missing(form, gate) == why
                 assert len(calls) > n
+
+
+@pytest.mark.parametrize("gate", ("g", "raw"))
+@pytest.mark.parametrize("form", ("fused", "fallback"))
+def test_l2n_capability_check_passes_on_the_registry(form: str, gate: str) -> None:
+    """The unpatched capability check (uncached) passes on this package's registry and ``build.json`` for both forms
+    and gate modes on every exported architecture: every stage of :data:`cake_kcp_plan.QK_L2NORM_STAGES` selects a
+    delivered, exported record of the mode over the whole grid, the fused gradient (``dqkg``, an l2n stage of this
+    package's registry) too -- once per problem and SM count, never an S1 record -- so the flag-on rows of this file
+    run rather than skip."""
+    select = cake_jit.select_record
+    picked: list = []
+
+    def recording(stage, **kw):
+        name = select(stage, **kw)
+        if stage == "dqkg":
+            picked.append(name)
+        return name
+
+    with pytest.MonkeyPatch.context() as m:
+        m.setattr(cake_jit, "select_record", functools.wraps(select)(recording))
+        assert cake_kcp_plan._qk_l2norm_missing(form, gate, None) is None
+    sms = cake_kcp_plan.QK_L2NORM_SMS
+    problems = len(cake_kcp_plan.QK_L2NORM_GRID) * sum(
+        len(sms.get(a, cake_kcp_plan.QK_L2NORM_SMS_ANY)) for a in cake_jit.ARCHES
+    )
+    assert problems > 0 and len(picked) == problems, (len(picked), problems)
+    for name in set(picked):
+        record = cake_jit.MODULES[name]
+        assert name not in cake_jit.S1_RECORDS, name
+        assert form in record.get("l2n", ["off"]), name
+        assert record.get("gate", "g") == gate, name
 
 
 def test_l2n_stage_values_merge() -> None:
