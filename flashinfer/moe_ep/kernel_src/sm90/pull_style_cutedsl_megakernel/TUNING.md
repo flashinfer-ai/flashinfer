@@ -783,8 +783,8 @@ and the per-process source/command records.
 ### Paired output stores and zero-count updates (2026-09-18)
 
 Paired BF16 output stores reuse row-address calculations and write adjacent
-values together. The MXFP4 path requires M256/N64/K256, complete channel
-clusters (`H % (256 * cluster_m) == 0`), epilogue token-back, BF16 combine,
+values together. The MXFP4 path requires M256 with N64, N72 or N80 and K128
+or K256 (K128 joined in October 2026), complete channel clusters (`H % (256 * cluster_m) == 0`), epilogue token-back, BF16 combine,
 and neither dispatch deduplication nor in-kernel top-k reduction. Other
 layouts use scalar stores. Zero-count elision skips zero local count updates
 when dispatch deduplication is disabled; grid rendezvous, empty-expert/rank
@@ -890,18 +890,33 @@ CGA1x1x1 group-330 candidate with two dispatch warps and FC1 store offload,
 folded N64 CGA1x1x1 candidates with groups 264 and 132, and a folded N64
 CGA1x2x1 group-132 tail-pair candidate. All five use one scheduler stage;
 the folded candidates use one dispatch warp, early FC1 publication and
-direct FC1 stores. For this shape, the complete eligible union grows from
-three to eight candidates without changing the heuristic defaults.
+direct FC1 stores. For this shape, the complete eligible union grew from
+three to eight candidates; since October 2026 the shape also has its own
+per-bucket default table, whose entries and N72/N80 tilings join the union
+(see below).
 For H7168/I3072/E384/EP4, optional N8/readiness choices expand these to 28;
 three large-token configurations and 12 distinct tail-pair neighbors bring
 the total to 43. Every model considers the same bounded extension catalog,
 then filters candidates through tile alignment and strategy eligibility.
 Other shapes can therefore have fewer than 43 candidates. Tuning skips the
 candidates with dispatch-side token-back (`reuse_dispatch_warps`, two of the
-43): that path shows run-to-run output differences on main whose cause is
-open, and an explicit `token_back_mode` still selects it. Token capacity
+43): that path can give intermittent run-to-run output differences whose
+cause is open. An explicit `token_back_mode` still selects it, and the untuned
+defaults of the published-exact routing profile still use it above 512
+tokens per rank. Token capacity
 changes the ordering of this union; the per-bucket defaults and their N72/N80
 tilings described below then add table- and capacity-dependent members.
+
+The pull-buffer fields are tactic fields. `compact_pull_buffer` sizes the
+pull buffer for the active dispatch warps. `dispatch_pull_batch` keeps 1-4
+rows in flight per active dispatch warp in the idle slots of the full buffer
+(`dispatch_pull_batch * active_dispatch_warps <= 4`, `epi_warps` token-back,
+neither dedup nor grouped token-back); with a batch above 1, `flag_batch` has
+no effect. `dispatch_pull_rotate` rotates the rows a warp takes on each pass
+and is not combined with dispatch-side token-back. Explicit values override a
+cached or default tactic: an explicit compact buffer or dispatch-side
+`token_back_mode` drops the tactic's batch to 1 (a dispatch-side mode also its
+rotation), and an explicit batch above 1 drops the tactic's compact buffer.
 
 Untuned launches use per-bucket defaults measured on H200 with
 block-permutation routing in October 2026

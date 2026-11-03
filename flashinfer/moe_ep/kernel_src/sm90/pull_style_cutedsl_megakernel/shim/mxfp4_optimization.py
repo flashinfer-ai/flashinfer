@@ -54,6 +54,9 @@ def _normalize_pull_fields(
         raise ValueError("dispatch_pull_batch must be an int in 1..4")
     if type(rotate) is not bool:
         raise ValueError("dispatch_pull_rotate must be a bool")
+    if rotate and core["token_back_mode"] != "epi_warps":
+        # Dispatch-side token-back keeps the unrotated serial pull loop.
+        raise ValueError("dispatch_pull_rotate requires token_back_mode='epi_warps'")
     if batch > 1:
         # The batch keeps rows in the idle slots of the 4-slot pull buffer of
         # the serial epi_warps dispatch path.
@@ -576,6 +579,15 @@ def mxfp4_fused_default_provenance(routing_profile: str) -> dict[str, Any] | Non
     if tables is None:
         return None
     tactics = [tactic for _, table in tables for tactic in table.values()]
+    # The candidate domain at a capacity follows that bucket's default, so the
+    # bucket-to-tactic mapping is bound as well as the set of tactics.
+    mapping = json.dumps(
+        [
+            [dict(reference), sorted(table.items(), key=lambda item: item[0])]
+            for reference, table in tables
+        ],
+        sort_keys=True,
+    )
     return {
         "eligibility": "measured_shape_tables_n72_n80_tilings_v2",
         "reference_shapes": [dict(reference) for reference, _ in tables],
@@ -585,6 +597,7 @@ def mxfp4_fused_default_provenance(routing_profile: str) -> dict[str, Any] | Non
                 *(v for t in tactics for v in _row_tile_variants(t).values()),
             ]
         ),
+        "bucket_tables_sha256": hashlib.sha256(mapping.encode()).hexdigest(),
     }
 
 
@@ -642,9 +655,10 @@ def hopper_mxfp4_candidates(
             continue
         if candidate not in result:
             result.append(dict(candidate))
-    # Dispatch-side token-back (reuse / standalone warps) shows run-to-run
-    # output differences on main (cause open), so tuning never selects it; an
-    # explicit token_back_mode still can.
+    # Dispatch-side token-back (reuse / standalone warps) can give run-to-run
+    # output differences (cause open), so tuning never selects it. An explicit
+    # token_back_mode still can, as can the untuned defaults of the
+    # published-exact routing profile above 512 tokens.
     return [
         candidate
         for candidate in result

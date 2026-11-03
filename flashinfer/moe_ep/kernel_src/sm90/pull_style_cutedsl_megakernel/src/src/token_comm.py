@@ -579,13 +579,22 @@ class TokenInPullTokenBackPush:
         if not 1 <= int(pull_batch) <= max_pull_batch:
             raise ValueError(
                 f"pull_batch={pull_batch} needs that many free pull-buffer slots per "
-                f"active dispatch warp; this layout has {max_pull_batch} (requires "
+                f"active dispatch warp; this layout has {max_pull_batch}: "
+                f"num_dispatch_warps // active_dispatch_warps = "
+                f"{self.num_dispatch_warps} // {self.active_dispatch_warps} with "
                 "compact_pull_buffer=False, a BF16 combine and no dispatch-side "
-                "token-back, dedup or grouped token-back)"
+                "token-back, dedup or grouped token-back, else 1"
             )
         self._pull_batch = int(pull_batch)
         # Rotation: pass k takes row k*G + (g + k) % G instead of k*G + g, so a
         # global warp does not see one source-rank parity for a whole launch.
+        # Layouts with token-back warps keep the unrotated serial loop they had
+        # before rotation existed.
+        if pull_rotate and self.enable_token_back:
+            raise ValueError(
+                "pull_rotate=True needs token-back in the epilogue warps; "
+                "dispatch-side token-back and SF token-back keep the serial loop"
+            )
         self._pull_rotate = bool(pull_rotate)
 
         # Standalone token-back: a dedicated warpgroup (size == dispatch group)
@@ -1679,7 +1688,8 @@ class TokenInPullTokenBackPush:
         the per-(rank, expert) receive counts come from registers preloaded
         once per launch, so resolving a token issues no memory access. It is
         kept apart from the serial loop's inline mapping so that the serial
-        path (FP8, BF16 and every ``pull_batch=1`` tactic) compiles as on main.
+        path compiles as before when rotation is off (FP8, BF16 and every
+        tactic with ``pull_batch=1`` and ``pull_rotate=False``).
         """
         NUM_EXPERTS_PER_LANE: cutlass.Constexpr[int] = (
             self.num_experts_per_rank + 31
@@ -1809,7 +1819,8 @@ class TokenInPullTokenBackPush:
         pool stores once and publishes them behind one release fence.  Token
         order, pool placement and readiness counts match the serial loop; each
         row's readiness is published after that fence, so the serial loop's
-        ``flag_batch`` coalescing does not apply here.
+        ``flag_batch`` coalescing does not apply here: with ``pull_batch > 1``
+        a ``flag_batch`` above 1 has no effect.
         """
         R: cutlass.Constexpr[int] = self._pull_batch
         pull_mbar_ptr = token_comm_storage.pull_mbar.data_ptr()
@@ -1855,7 +1866,8 @@ class TokenInPullTokenBackPush:
         num_global_warps: cutlass.Constexpr[int] = num_sms * self.active_dispatch_warps
         # Rotated assignment as in the serial loop.  Here the R modulos are
         # resolved in phase A ahead of the loads, off the round-trip chain; an
-        # incremental form measured ~3% slower (FP8, R=3, T=8192).
+        # incremental form measured ~3% slower in an earlier FP8 prototype
+        # (R=3, T=8192).
         global_warp = sm_idx * Int32(self.active_dispatch_warps) + warp_idx
         pull_pass = Int32(0)
         sf_passes: cutlass.Constexpr[int] = (self.sf_uint32_per_token + 31) // 32

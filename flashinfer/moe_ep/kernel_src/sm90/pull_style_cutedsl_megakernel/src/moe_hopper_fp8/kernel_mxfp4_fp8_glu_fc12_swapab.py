@@ -889,13 +889,14 @@ class Sm90SwapABSwigluMxfp4Fp8Fc12Kernel(
     def _prefetch_next_stage(self) -> bool:
         """Wait for and load the next K128 stage while the current WGMMAs run.
 
-        Only token tiles of N >= 64 have WGMMAs long enough to hide it; N16
-        and N32 tiles keep the in-order loop (measured 2-3% slower with it).
-        Dispatch-side token-back (FC2 rows staged in the local pool) keeps the
-        in-order loop too: the early wait made that path's run-to-run output
-        differences on main far more frequent (their cause is open).
+        Token tiles N64, N72 and N80 have WGMMAs long enough to hide it; N16
+        and N32 tiles keep the in-order loop (measured 2-3% slower with it),
+        and so does the unmeasured N128. Dispatch-side token-back (FC2 rows
+        staged in the local pool) keeps the in-order loop too: the early wait
+        made that path's intermittent run-to-run output differences far more
+        frequent (their cause is open).
         """
-        return self.mma_tiler[1] >= 64 and not self.token_back_by_dispatch
+        return self.mma_tiler[1] in (64, 72, 80) and not self.token_back_by_dispatch
 
     @cute.jit
     def _wait_and_load_stage(

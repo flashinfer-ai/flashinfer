@@ -635,29 +635,43 @@ def test_moe_ep_sm90_pull_mxfp4_mega_multirank_raw_oracle_and_workspace_reuse(
 @pytest.mark.gpu_2
 @pytest.mark.arch_hopper
 @pytest.mark.parametrize(
-    "tile_n,tail_pairs,pull_batch",
+    "tile_n,tail_pairs,pull",
     [
-        (64, False, 1),
-        (64, True, 1),
-        (72, False, 1),
-        (80, False, 1),
-        (80, True, 1),
-        (64, False, 2),
+        (64, False, {}),
+        (64, True, {}),
+        (72, False, {}),
+        (80, False, {}),
+        (80, True, {}),
+        (64, False, {"dispatch_pull_batch": 2, "dispatch_pull_rotate": True}),
+        (64, False, {"dispatch_pull_batch": 3, "dispatch_pull_rotate": True}),
+        (64, False, {"compact_pull_buffer": True, "dispatch_pull_rotate": True}),
     ],
-    ids=("n64", "n64-tail", "n72", "n80", "n80-tail", "n64-pull2-rotate"),
+    ids=(
+        "n64",
+        "n64-tail",
+        "n72",
+        "n80",
+        "n80-tail",
+        "n64-pull2-rotate",
+        "n64-pull3-rotate",
+        "n64-compact-rotate",
+    ),
 )
 def test_moe_ep_sm90_pull_mxfp4_m256_k128_independent_oracle(
-    monkeypatch, tile_n, tail_pairs, pull_batch
+    monkeypatch, tile_n, tail_pairs, pull
 ):
-    """Folded K128 candidates match raw math across full and partial token tiles."""
+    """Folded K128 tiles (N64 across a tile boundary, partial N72/N80) and the
+    pull-buffer variants match raw math."""
     import sys
 
     module = sys.modules[__name__]
     monkeypatch.setattr(module, "HIDDEN", 2560)
     monkeypatch.setattr(module, "INTERMEDIATE", 640)
     # EP2 routes 64/65 rows per expert: across an N64 tile boundary, and into
-    # one partial N72/N80 tile.
-    monkeypatch.setattr(module, "TOKENS_PER_RANK", 129)
+    # one partial N72/N80 tile. A batched pull gets 200 tokens so that a rank
+    # pulls more rows than one pass of its 132 * batch slots.
+    batched = pull.get("dispatch_pull_batch", 1) > 1
+    monkeypatch.setattr(module, "TOKENS_PER_RANK", 200 if batched else 129)
     tactic = dict(
         _fused_tactic(),
         mma_tiler_mnk=(256, tile_n, 128),
@@ -669,9 +683,9 @@ def test_moe_ep_sm90_pull_mxfp4_m256_k128_independent_oracle(
         fc1_early_done_publish=True,
         tail_split_pairs=tail_pairs,
     )
-    if pull_batch > 1:
-        # Rows in flight per dispatch warp, with the rotated row assignment.
-        tactic.update(dispatch_pull_batch=pull_batch, dispatch_pull_rotate=True)
+    # Rows in flight per dispatch warp, the rotated row assignment, and the
+    # serial rotated loop on the compact buffer.
+    tactic.update(pull)
     _run_raw_oracle("cross_rank", tactic=tactic)
 
 

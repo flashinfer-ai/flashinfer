@@ -143,8 +143,9 @@ not picked them up):
   and `_weight_sf_state` (default identity); the NV shim supplies only the
   delayed scale-producer loop and early-release policy. Preserve these hooks
   when reapplying the scale-ring extension.
-- Dispatch pull batch + rotation and swap-AB FC1/FC2 dedup (2026-10-26,
-  measured on H200 MegaMoE shapes in October): `src/src/token_comm.py` ctor knobs
+- Dispatch pull batch + rotation and the shared swap-AB epilogue copy
+  (2026-10-26, measured on H200 MegaMoE shapes in October):
+  `src/src/token_comm.py` ctor knobs
   `pull_batch` (default 1) / `pull_rotate` (default False) and properties
   `pull_batch` / `pull_rotate`. `_dispatch_pull_batched` keeps R rows in
   flight in the idle slots of the 4-slot pull buffer (R x
@@ -153,9 +154,11 @@ not picked them up):
   release fence per pass, so `flag_batch` applies to the serial loop only.
   `_choose_pull_token` repeats the serial loop's token -> (expert, rank, row)
   walk with register-held counts; it stays separate so that the serial path
-  (FP8, BF16 and every `pull_batch=1` tactic) compiles as before. Rotation
-  makes pass k take row `k*G + (g + k) % G`; the serial loop keeps that
-  index incremental. `src/src/ptx_helpers.py` adds
+  compiles as before when rotation is off (FP8, BF16 and every tactic with
+  `pull_batch=1` and `pull_rotate=False`). Rotation makes pass k take row
+  `k*G + (g + k) % G`; the serial loop keeps that index incremental, and the
+  ctor rejects rotation for layouts with token-back warps (dispatch-side or
+  SF token-back), which keep the unrotated serial loop. `src/src/ptx_helpers.py` adds
   `red_add_relaxed_gpu_s32_raw`. `megamoe_kernel_fp8.py` takes ctor kwargs
   `dispatch_pull_batch` / `dispatch_pull_rotate`. `epilogue_fp8_swapab.py`
   and the MX `run_wgmma_task_tile` take `n_half` as a runtime value, so for
@@ -163,23 +166,28 @@ not picked them up):
   share one code copy (the calls share `fc1_args` / `store_args` /
   `fc2_args`); FP8 keeps one copy per half and compiles as before.
   Dispatch-side token-back (`reuse_dispatch_warps` / `standalone_warps`)
-  keeps one copy per half: that path shows run-to-run output differences on
-  main as well, which the shared copy made far more frequent; the cause is
-  open. Host side, MX/NV only: `compact_pull_buffer`, `dispatch_pull_batch`
+  keeps one copy per half: that path can give intermittent run-to-run output
+  differences without these changes too, which the shared copy made far more
+  frequent; the cause is open. Host side, MX/NV only: `compact_pull_buffer`, `dispatch_pull_batch`
   and `dispatch_pull_rotate` are MX tactic and config fields (NV already had
   the first; FP8 does not expose them), see
   `shim/mxfp4_optimization.py::MXFP4_PULL_DEFAULTS`. A normalized tactic
   omits them at their defaults. Explicit frontend values (and the MX
   backend's `compact_pull_buffer`) override a cached or default tactic, as
   `token_back_mode` does: an explicit compact buffer or dispatch-side
-  token-back drops the tactic's batch to 1, and an explicit batch > 1 drops
-  the tactic's compact buffer and rejects a conflicting token-back, dedup or
-  dispatch-warp layout. The drop tree has none of this. When re-syncing,
-  re-add the two token_comm knobs with their properties,
-  `_choose_pull_token`, `_dispatch_pull_batched` and the `pull_batch > 1`
-  branch at the pull call site; drop `cutlass.Constexpr` from the
-  epilogue's `n_half` parameters and keep the per-half copies under
-  `_token_back_by_dispatch` or a scale mode other than `mxfp4_hybrid`.
+  token-back drops the tactic's batch to 1 (dispatch-side token-back also
+  its rotation), and an explicit batch > 1 drops the tactic's compact buffer
+  and rejects a conflicting token-back, dedup or dispatch-warp layout. The
+  drop tree has none of this. When re-syncing, re-add the two token_comm
+  knobs with their properties and the rotation check,
+  `_choose_pull_token`, `_dispatch_pull_batched`, the `pull_batch > 1`
+  branch at the pull call site and the serial loop's rotated row index;
+  `red_add_relaxed_gpu_s32_raw` in `ptx_helpers.py`; the
+  `dispatch_pull_batch` / `dispatch_pull_rotate` kwargs of
+  `megamoe_kernel_fp8.py`; and the runtime `n_half` of the epilogue and the
+  MX `run_wgmma_task_tile` (drop `cutlass.Constexpr` from those parameters),
+  keeping the per-half copies under `_token_back_by_dispatch` or a scale
+  mode other than `mxfp4_hybrid`.
 - Paired BF16 FC2 stores for K128 MXFP4 tiles (2026-10-27, measured on
   H2560/I640/E512/top10/EP2 in October):
   `src/moe_hopper_fp8/mxfp4_policy.py` resolves `paired_stores` for tile K
@@ -192,10 +200,10 @@ not picked them up):
   `kernel_mxfp4_fp8_glu_fc12_swapab.py` wait for and load stage 0 before
   the K loop; each iteration waits for the next stage and loads its packed
   weights after the (last) WGMMA commit, while the WGMMAs read the
-  converted registers (`_wait_and_load_stage`). Only token tiles of
-  N >= 64 use it (`_prefetch_next_stage`): N16/N32 tiles measured 2-3%
-  slower with it and keep the in-order K loop unchanged, as does
-  dispatch-side token-back (the early wait made that path's run-to-run
+  converted registers (`_wait_and_load_stage`). Only token tiles N64, N72
+  and N80 use it (`_prefetch_next_stage`): N16/N32 tiles measured 2-3%
+  slower with it and keep the in-order K loop unchanged, as do the
+  unmeasured N128 tiles and dispatch-side token-back (the early wait made that path's run-to-run
   differences far more frequent). The K256 paths (`*_k256*`, NV's FC1 K256
   override) are unchanged. NV K128 tiles share these loops. Not in the drop
   tree; when re-syncing, re-add `_prefetch_next_stage`,

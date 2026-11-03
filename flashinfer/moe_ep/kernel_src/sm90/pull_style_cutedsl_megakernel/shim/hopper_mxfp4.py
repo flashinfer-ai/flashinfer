@@ -1109,10 +1109,18 @@ def _resolve_hopper_mxfp4_mega_moe_config(
             compact_pull_buffer or token_back_mode not in (None, "epi_warps")
         ):
             resolved["dispatch_pull_batch"] = 1
+        # Dispatch-side token-back keeps the unrotated serial pull loop, so an
+        # explicit dispatch-side mode also drops the tactic's rotation.
+        if (
+            token_back_mode not in (None, "epi_warps")
+            and "dispatch_pull_rotate" in resolved
+        ):
+            resolved["dispatch_pull_rotate"] = False
         # Symmetrically, an explicit batch > 1 needs the full buffer and drops
         # the tactic's compact one. It cannot override the tactic's token-back,
-        # dedup or dispatch-warp layout, so a conflict there is an error.
-        if dispatch_pull_batch is not None and dispatch_pull_batch > 1:
+        # dedup or dispatch-warp layout, so a conflict there is an error. Other
+        # values fall through to the config's validation.
+        if type(dispatch_pull_batch) is int and dispatch_pull_batch > 1:
             if compact_pull_buffer is None:
                 resolved["compact_pull_buffer"] = False
             mode = token_back_mode or resolved.get("token_back_mode", "epi_warps")
@@ -1123,16 +1131,17 @@ def _resolve_hopper_mxfp4_mega_moe_config(
                 or resolved.get("grouped_token_back", False)
                 or dispatch_pull_batch * warps > 4
             ):
+                source = "requested" if token_back_mode is not None else "the tactic's"
                 raise ValueError(
                     f"dispatch_pull_batch={dispatch_pull_batch} needs "
                     "token_back_mode='epi_warps' without dedup_dispatch or "
                     "grouped_token_back, and dispatch_pull_batch * "
-                    "active_dispatch_warps <= 4; the selected tactic has "
-                    f"token_back_mode={mode!r}, "
+                    f"active_dispatch_warps <= 4; got {source} "
+                    f"token_back_mode={mode!r} and the tactic's "
                     f"dedup_dispatch={resolved.get('dedup_dispatch', False)}, "
                     f"grouped_token_back={resolved.get('grouped_token_back', False)}, "
-                    f"active_dispatch_warps={warps}. Pass a complete tactic with "
-                    "knobs= or leave dispatch_pull_batch unset."
+                    f"active_dispatch_warps={warps}. Choose a tactic that allows "
+                    "it or leave dispatch_pull_batch unset."
                 )
 
     config = MegaMoEHopperMxfp4Config(

@@ -53,10 +53,12 @@ SwapABTokenTileNChoices = (8, 16, 32, 64, 128)
 SwapABPackedFp4TokenTileNChoices = (8, 16, 32, 64, 72, 80, 128)
 
 
-def swapab_token_tile_n_choices(fp8_scale_mode: str) -> tuple:
+def swapab_token_tile_n_choices(fp8_scale_mode: str) -> tuple[int, ...]:
     if fp8_scale_mode == "mxfp4_hybrid":
         return SwapABPackedFp4TokenTileNChoices
     return SwapABTokenTileNChoices
+
+
 SwapABBlockwiseFc1GroupChunkChoices = (1, 2, 4, 8)
 SwapABBlockwiseFc1GroupChunks = int(
     os.environ.get("MEGA_SWAPAB_FC1_GROUP_CHUNKS", "1")
@@ -2240,12 +2242,13 @@ class SwapABFp8GluEpilogue:
                         or self.fp8_scale_mode != "mxfp4_hybrid"
                     ):
                         # Dispatch-side token-back (reuse / standalone warps)
-                        # shows run-to-run output differences on main, and the
-                        # shared runtime-half copy made them far more frequent.
-                        # The cause is open (no register spills; reuse of the
-                        # WGMMA A registers in flight is not ruled out), so this
-                        # layout keeps main's code: one copy per half. So does
-                        # FP8 (per-tensor, blockwise): only packed FP4 shares one.
+                        # can give intermittent run-to-run output differences,
+                        # and the shared runtime-half copy made them far more
+                        # frequent. The cause is open (no register spills; reuse
+                        # of the WGMMA A registers in flight is not ruled out),
+                        # so this layout keeps one copy per half, as before. So
+                        # do the FP8 scale modes (per-tensor, blockwise): only
+                        # the packed-FP4 mxfp4_hybrid path shares one copy.
                         if n_half == cutlass.Int32(0):
                             (
                                 ab_consumer_state,
