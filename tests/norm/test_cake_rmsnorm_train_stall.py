@@ -260,7 +260,7 @@ def test_backward_keeps_its_speed_beside_a_resident_kernel(
     )
 
 
-@pytest.mark.parametrize("rows", (129, 4096, 16384))
+@pytest.mark.parametrize("rows", (1, 3, 129, 4096, 16384))
 @pytest.mark.parametrize("hidden,residual", ROUTES, ids=lambda v: str(v))
 def test_outputs_do_not_depend_on_the_launch_grid(
     hidden: int, residual: bool, rows: int, monkeypatch: pytest.MonkeyPatch

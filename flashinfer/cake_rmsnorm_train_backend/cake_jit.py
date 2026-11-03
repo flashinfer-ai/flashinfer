@@ -4540,6 +4540,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_100a",
         ],
         "grid_rule": {
+            "col_tasks": 64,
             "ctas_per_sm": 2,
             "grid_factor": 2,
             "kind": "claimed_chunks",
@@ -4573,6 +4574,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_100a",
         ],
         "grid_rule": {
+            "col_tasks": 64,
             "ctas_per_sm": 2,
             "grid_factor": 2,
             "kind": "claimed_chunks",
@@ -4606,6 +4608,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_100a",
         ],
         "grid_rule": {
+            "col_tasks": 128,
             "ctas_per_sm": 2,
             "grid_factor": 2,
             "kind": "claimed_chunks",
@@ -4639,6 +4642,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_100a",
         ],
         "grid_rule": {
+            "col_tasks": 128,
             "ctas_per_sm": 2,
             "grid_factor": 2,
             "kind": "claimed_chunks",
@@ -4672,6 +4676,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_100a",
         ],
         "grid_rule": {
+            "col_tasks": 80,
             "ctas_per_sm": 1,
             "grid_factor": 1,
             "kind": "claimed_chunks",
@@ -4705,6 +4710,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_100a",
         ],
         "grid_rule": {
+            "col_tasks": 96,
             "ctas_per_sm": 1,
             "grid_factor": 1,
             "kind": "claimed_chunks",
@@ -4738,6 +4744,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_100a",
         ],
         "grid_rule": {
+            "col_tasks": 96,
             "ctas_per_sm": 1,
             "grid_factor": 1,
             "kind": "claimed_chunks",
@@ -4771,6 +4778,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_100a",
         ],
         "grid_rule": {
+            "col_tasks": 96,
             "ctas_per_sm": 1,
             "grid_factor": 1,
             "kind": "claimed_chunks",
@@ -4804,6 +4812,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_100a",
         ],
         "grid_rule": {
+            "col_tasks": 96,
             "ctas_per_sm": 1,
             "grid_factor": 1,
             "kind": "claimed_chunks",
@@ -5398,6 +5407,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_103a",
         ],
         "grid_rule": {
+            "col_tasks": 80,
             "ctas_per_sm": 1,
             "grid_factor": 1,
             "kind": "claimed_chunks",
@@ -5431,6 +5441,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_103a",
         ],
         "grid_rule": {
+            "col_tasks": 96,
             "ctas_per_sm": 1,
             "grid_factor": 1,
             "kind": "claimed_chunks",
@@ -5464,6 +5475,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_103a",
         ],
         "grid_rule": {
+            "col_tasks": 96,
             "ctas_per_sm": 1,
             "grid_factor": 1,
             "kind": "claimed_chunks",
@@ -5497,6 +5509,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_103a",
         ],
         "grid_rule": {
+            "col_tasks": 96,
             "ctas_per_sm": 1,
             "grid_factor": 1,
             "kind": "claimed_chunks",
@@ -5530,6 +5543,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_103a",
         ],
         "grid_rule": {
+            "col_tasks": 96,
             "ctas_per_sm": 1,
             "grid_factor": 1,
             "kind": "claimed_chunks",
@@ -5695,6 +5709,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_107a",
         ],
         "grid_rule": {
+            "col_tasks": 96,
             "ctas_per_sm": 1,
             "grid_factor": 1,
             "kind": "claimed_chunks",
@@ -5728,6 +5743,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_107a",
         ],
         "grid_rule": {
+            "col_tasks": 96,
             "ctas_per_sm": 1,
             "grid_factor": 1,
             "kind": "claimed_chunks",
@@ -6982,6 +6998,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_103a",
         ],
         "grid_rule": {
+            "col_tasks": 80,
             "ctas_per_sm": 1,
             "grid_factor": 1,
             "kind": "claimed_chunks",
@@ -7180,6 +7197,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_103a",
         ],
         "grid_rule": {
+            "col_tasks": 96,
             "ctas_per_sm": 1,
             "grid_factor": 1,
             "kind": "claimed_chunks",
@@ -7213,6 +7231,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_103a",
         ],
         "grid_rule": {
+            "col_tasks": 96,
             "ctas_per_sm": 1,
             "grid_factor": 1,
             "kind": "claimed_chunks",
@@ -7543,6 +7562,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_107a",
         ],
         "grid_rule": {
+            "col_tasks": 96,
             "ctas_per_sm": 1,
             "grid_factor": 1,
             "kind": "claimed_chunks",
@@ -7609,6 +7629,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_103a",
         ],
         "grid_rule": {
+            "col_tasks": 96,
             "ctas_per_sm": 1,
             "grid_factor": 1,
             "kind": "claimed_chunks",
@@ -7675,6 +7696,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_107a",
         ],
         "grid_rule": {
+            "col_tasks": 96,
             "ctas_per_sm": 1,
             "grid_factor": 1,
             "kind": "claimed_chunks",
@@ -15387,7 +15409,10 @@ def launch_grid(
     ctas_per_sm * SM count`` persistent CTAs claim the chunks of the table of
     :func:`chunk_rounds` (``rows_per_issue`` rows per pipeline step of the
     kernel, under the taper its record spells: :func:`chunk_taper`), so the
-    grid is ``min(slots, n_chunks)``; the launch is a plain
+    grid is ``min(slots, n_chunks)``; a column-task kernel's rule spells its
+    ``col_tasks`` (``H / col`` column tasks, tickets beside the chunks), so its
+    grid is ``min(slots, n_chunks + col_tasks)`` and a small ``T`` runs every
+    task at once.  The launch is a plain
     one -- no co-residency is required -- and ``ctas_per_sm`` is the production
     grid factor capped at the launch bound the kernel declares.  ``rows`` must
     be positive; the public API returns empty outputs for zero rows without
@@ -15413,7 +15438,8 @@ def launch_grid(
         slots = int(rule["ctas_per_sm"]) * sm_count(device_index)
         grid_x = min(
             slots,
-            n_chunks(rows, slots, int(rule["rows_per_issue"]), *chunk_taper(rule)),
+            n_chunks(rows, slots, int(rule["rows_per_issue"]), *chunk_taper(rule))
+            + int(rule.get("col_tasks", 0)),
         )
     else:
         raise ValueError(f"unknown Cake RMSNorm training grid rule: {kind!r}")
