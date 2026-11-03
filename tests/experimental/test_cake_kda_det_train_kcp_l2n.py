@@ -71,6 +71,7 @@ from tests.experimental.test_cake_kda_det_train_kcp_dist import (
     _local_slices,
     _partition,
     _programs_exported,
+    _requested,
     _to_global,
 )
 from tests.test_helpers.cake_kda_det_train_reference import (
@@ -2851,21 +2852,22 @@ def _run_rank(
         qn, kn, v, g, beta, ctx, workspace=ws_off, save_for_backward=False, **GK
     )
     reported["out_eq_flag_off_on_normalized"] = _bits_equal(out_c, res["out"])
-    # retained after a saving forward: the rstd only (the allocator's 512-byte granule)
+    # retained after a saving forward: the rstd only.  The bytes the callers requested (``requested_bytes``):
+    # ``memory_allocated`` counts the caching allocator's blocks, whose rounding and the slack of an unsplit cached
+    # block (up to 1 MiB per tensor) depend on the allocator state the earlier passes leave
     torch.cuda.synchronize(device)
     gc.collect()
     retained = {}
     for tag, workspace, l2n in (("on", ws, True), ("off", ws_off, False)):
-        before = torch.cuda.memory_allocated(device)
+        before = _requested(device)
         kw = {"use_qk_l2norm_in_kernel": l2n, **GK}
         o, s = cake_kcp.chunk_kda_det_fwd_kcp(
             q, k, v, g, beta, ctx, workspace=workspace, **kw
         )
         torch.cuda.synchronize(device)
-        retained[tag] = torch.cuda.memory_allocated(device) - before
+        retained[tag] = _requested(device) - before
         del o, s
-    granule = -(-8 * T * H // 512) * 512
-    flags["retained_fwd_delta_is_rstd"] = retained["on"] - retained["off"] == granule
+    flags["retained_fwd_delta_is_rstd"] = retained["on"] - retained["off"] == 8 * T * H
     red = red_fb = None
     if raw_gate:
         red = cake_kcp.reduce_gate_param_grads_det_kcp(
