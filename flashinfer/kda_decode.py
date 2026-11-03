@@ -1105,7 +1105,9 @@ def kda_delta_rule_mtp_ucache_flush(
     initial_state_indices : torch.Tensor, optional
         ``[B]`` int32 pool slot per request; ``-1`` marks a padded row whose
         output row is left untouched (pass a preallocated ``output``).
-        Defaults to ``arange(B)``.
+        Non-negative slots must be unique across rows (rows sharing a slot
+        would race on the same pool and ring entries). Defaults to
+        ``arange(B)``.
     use_qk_l2norm_in_kernel : bool
         Must be ``True``.
     scale : float, optional
@@ -1144,8 +1146,8 @@ def kda_delta_rule_mtp_ucache_flush(
     ------
     ValueError
         On any shape / dtype / device / range violation. The device-value
-        range checks (slot indices, ``hist_len``, ``cache_base``) need one
-        host synchronization and are skipped during CUDA-graph capture.
+        checks (slot range and uniqueness, ``hist_len``, ``cache_base``) need
+        one host synchronization and are skipped during CUDA-graph capture.
     NotImplementedError
         For ``T`` outside ``{4, 8}`` or block-strided pools.
     """

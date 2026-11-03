@@ -1323,8 +1323,9 @@ def test_lower_bound_range(t):
 
 
 def test_input_validation_raises_value_error():
-    """initial_state_indices dtype / length / range and the k / v shapes
-    are validated with ValueError before launch."""
+    """initial_state_indices dtype / length / range / uniqueness and the
+    k / v shapes are validated with ValueError before launch. Repeated -1
+    padding is legal (covered by test_padded_rows_and_permuted_pool)."""
     _skip_if_not_sm90_or_later()
     mod = _load_flush()
     POOL = 6
@@ -1366,6 +1367,7 @@ def test_input_validation_raises_value_error():
         "long indices": dict(idx=torch.arange(6, **_I32)),
         "slot == pool": dict(idx=torch.tensor([0, 1, POOL, 2], **_I32)),
         "slot < -1": dict(idx=torch.tensor([0, -2, 1, 2], **_I32)),
+        "duplicate slot": dict(idx=torch.tensor([0, 3, 3, 2], **_I32)),
         "k batch": dict(k=k[:3]),
         "k heads": dict(k=k[:, :, :6].contiguous()),
         "v batch": dict(v=v[:3]),

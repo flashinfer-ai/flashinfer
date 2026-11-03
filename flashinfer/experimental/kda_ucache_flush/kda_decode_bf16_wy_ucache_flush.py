@@ -2514,7 +2514,8 @@ def _validate_device_ranges(
     pool: int,
     hist_cap: int,
 ) -> None:
-    """Range-check the device-resident index tensors with ONE host sync.
+    """Range-check the device-resident index tensors (and slot uniqueness)
+    with ONE host sync.
 
     Skipped under CUDA-graph capture (a capture cannot read device values);
     the graph-replay contract is that the caller only replays with inputs
@@ -2522,21 +2523,32 @@ def _validate_device_ranges(
     """
     if torch.cuda.is_current_stream_capturing():
         return
+    # Rows sharing a slot would run unsynchronized CTAs against the same
+    # pool state and ring rows (concurrent appends, double folds), so
+    # non-negative slots must be unique; -1 padding may repeat.
+    srt = initial_state_indices.sort().values
+    dup = ((srt[1:] == srt[:-1]) & (srt[1:] >= 0)).sum().to(srt.dtype)
     stats = torch.stack(
         [
             initial_state_indices.min(),
             initial_state_indices.max(),
+            dup,
             hist_len.min().to(initial_state_indices.dtype),
             hist_len.max().to(initial_state_indices.dtype),
             cache_base.min().to(initial_state_indices.dtype),
             cache_base.max().to(initial_state_indices.dtype),
         ]
     ).tolist()
-    idx_min, idx_max, hl_min, hl_max, cb_min, cb_max = stats
+    idx_min, idx_max, n_dup, hl_min, hl_max, cb_min, cb_max = stats
     _check(
         idx_min >= -1 and idx_max < pool,
         f"initial_state_indices must be -1 (padded row) or a pool slot in "
         f"[0, {pool}); got min={idx_min} max={idx_max}.",
+    )
+    _check(
+        n_dup == 0,
+        f"initial_state_indices has {n_dup} duplicated pool slot(s); each "
+        "non-negative slot may appear at most once per call.",
     )
     _check(
         hl_min >= 0 and hl_max <= hist_cap,
@@ -2596,7 +2608,8 @@ def kda_delta_rule_mtp_ucache_flush(
     - ``q``, ``k``: [B, T, H, 128] bf16; ``v``: [B, T, H, 128] bf16;
       ``g``: [B, T, H, 128] bf16; ``b``: [B, T, H] bf16; T in {4, 8}.
     - ``initial_state_indices``: [B] int32, each -1 (padded row: the CTA
-      retires, its output row is left untouched) or a slot in [0, pool).
+      retires, its output row is left untouched) or a slot in [0, pool);
+      non-negative slots must be unique.
     - ``hist_len`` / ``cache_base``: [B] int32 in [0, min(w_ring, 32 - T)]
       and [0, 32). Range checks on the three index tensors need one host
       sync; they run on every eager call and are skipped under CUDA-graph
