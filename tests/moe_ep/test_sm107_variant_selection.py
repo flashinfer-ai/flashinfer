@@ -452,6 +452,7 @@ def forward_sweep(protocol, monkeypatch):
     }
     grid = [{"epi_flag_batches": (flag, 4)} for flag in (1, 2)]
     measured = []
+    staged_routing, measured_routing = [], []
     events = []
     buffers = []
     state = SimpleNamespace(
@@ -459,6 +460,7 @@ def forward_sweep(protocol, monkeypatch):
         contract=contract,
         grid=grid,
         measured=measured,
+        measured_routing=measured_routing,
         buffers=buffers,
         failure=None,
         rejected=set(),
@@ -524,6 +526,9 @@ def forward_sweep(protocol, monkeypatch):
 
         def stage_inputs(self, tensors, workspace, *, quantize_input):
             events.append("stage")
+            staged_routing.append(
+                (tensors.topk_ids.clone(), tensors.topk_weights.clone())
+            )
             workspace.note_staged_tokens(tensors.num_tokens)
 
         def compute(self, workspace, weights, *, output):
@@ -559,6 +564,7 @@ def forward_sweep(protocol, monkeypatch):
         assert events[-len(expected_events) :] == expected_events
         key = (trial.config.kernel_variant, trial.config.epi_flag_batches[0])
         measured.append(key)
+        measured_routing.append(staged_routing[-1])
         return [state.scores[key]] * repeats
 
     monkeypatch.setattr(backend, "_backend", Kernel)
@@ -731,6 +737,7 @@ def test_offline_variants_search_afresh_and_publish_without_installing(
             (v, flag) for v in ("inference", "genphase") for flag in (1, 2)
         ]
         state.measured.clear()
+        state.measured_routing.clear()
         protocol.owner._tuning_state = AutoTuningState()
         sweep = Mock(wraps=native._sweep_sm107_block_scaled_mega_moe)
         monkeypatch.setattr(native, "_sweep_sm107_block_scaled_mega_moe", sweep)
@@ -768,6 +775,11 @@ def test_offline_variants_search_afresh_and_publish_without_installing(
         )
         assert winner == {"variant": "genphase", "knobs": state.grid[0]}
         assert state.measured == [("inference", 1), ("genphase", 1)]
+        if skew is not None:
+            assert state.measured_routing
+            for ids, weights in state.measured_routing:
+                assert torch.all(ids == 2)
+                assert torch.all(weights == 0.25)
         assert all(
             c.kwargs["warmup_iters"] == 1 and c.kwargs["timed_iters"] == 2
             for c in sweep.call_args_list
@@ -784,6 +796,68 @@ def test_offline_variants_search_afresh_and_publish_without_installing(
         overall = AutoTuner.get().protocol_context(selection.NAMESPACE).records()
         assert len(overall) == 1
         assert next(iter(overall.values()))["knobs"]["epi_flag_batches"] == [1, 4]
+
+
+@pytest.mark.parametrize("bulk", [False, True])
+def test_offline_auto_schedule_requires_a_valid_base_for_each_variant(
+    forward_sweep, bulk
+):
+    import json
+    from flashinfer.moe_ep import tune
+    from flashinfer.moe_ep.backends.mega.kernel.sm107 import tuning
+
+    state = forward_sweep
+    protocol = state.protocol
+    args = tune._parse_args(
+        [
+            "--arch",
+            "sm107",
+            "--dtype",
+            "mxfp8_e4m3",
+            "--hidden",
+            "512",
+            "--intermediate",
+            "256",
+            "--num-experts",
+            "8",
+            "--topk",
+            "3",
+            "--max-tokens",
+            "128",
+            "--kernel-variant",
+            "auto",
+            "--sweep",
+            "schedule",
+            "--base-knobs",
+            json.dumps({"fc2_use_bulk": bulk, "epi_flag_batches": [1, 4]}),
+            "--max-candidates",
+            "1",
+        ]
+    )
+
+    def search():
+        return tuning._tune_variants(
+            args,
+            0,
+            1,
+            128,
+            "mxfp8_e4m3",
+            protocol.backend,
+            protocol.owner,
+            protocol.weights,
+            protocol.output,
+        )
+
+    with autotune_v2(persistent_cache=False):
+        if bulk:
+            assert search()["variant"] == "genphase"
+            assert state.measured == [("inference", 1), ("genphase", 1)]
+        else:
+            with pytest.raises(
+                ValueError, match="No valid genphase schedule candidates"
+            ):
+                search()
+            assert not state.measured
 
 
 def _fixed_forward_tune(protocol, variant, candidates):

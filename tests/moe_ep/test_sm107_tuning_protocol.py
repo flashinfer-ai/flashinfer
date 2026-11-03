@@ -877,6 +877,72 @@ def _subgroup_worker(rank, rendezvous):
                 with pytest.raises(RuntimeError, match="candidate compilation failed"):
                     native._prepare_collectively(prepare, 2, group)
 
+                from flashinfer.moe_ep import tune
+                from flashinfer.moe_ep.backends.mega.kernel.sm107.tuning import (
+                    _collective_candidates,
+                )
+
+                with pytest.MonkeyPatch.context() as local:
+                    local.setenv(
+                        "FLASHINFER_MOE_EP_KNOB_CACHE",
+                        f"{rendezvous.removeprefix('file://')}.rank-{rank}.json",
+                    )
+                    args = tune._parse_args(
+                        [
+                            "--arch",
+                            "sm107",
+                            "--dtype",
+                            cfg.quant_kind,
+                            "--hidden",
+                            "128",
+                            "--intermediate",
+                            "64",
+                            "--num-experts",
+                            "4",
+                            "--topk",
+                            "2",
+                            "--max-tokens",
+                            "128",
+                            "--sweep",
+                            "schedule",
+                        ]
+                    )
+                    for variant in ("inference", "genphase"):
+                        base = {
+                            **native.sm107_candidates(
+                                cfg.quant_kind, kernel_variant=variant
+                            )[0],
+                            "epi_flag_batches": (rank, 4),
+                        }
+                        query = {**protocol._query(128), "kernel_variant": variant}
+                        knob_cache.record_knobs(base, **query)
+                        choices = _collective_candidates(
+                            args,
+                            rank - 1,
+                            2,
+                            128,
+                            cfg.quant_kind,
+                            variant,
+                            process_group=group,
+                        )
+                        assert choices
+                        assert all(k["epi_flag_batches"] == (1, 4) for k in choices)
+                        assert knob_cache.lookup_knobs(**query)["epi_flag_batches"] == (
+                            rank,
+                            4,
+                        )
+                    args.base_knobs = "{"
+                    with pytest.raises(ValueError, match="JSONDecodeError"):
+                        _collective_candidates(
+                            args,
+                            rank - 1,
+                            2,
+                            128,
+                            cfg.quant_kind,
+                            "inference",
+                            process_group=group,
+                        )
+
                 from flashinfer.moe_ep.backends.mega.kernel.sm107 import automatic
 
                 backend = SimpleNamespace(
