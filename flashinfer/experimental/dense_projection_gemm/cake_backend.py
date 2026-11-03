@@ -2588,16 +2588,19 @@ def dense_projection_gemm(
     *,
     transposed_out: bool = False,
     deterministic: bool = True,
+    enable_pdl: bool = False,
 ) -> torch.Tensor:
     """``out[l, m, n] = sum_k A[l, m, k] B[l, k, n]`` for strided views (the cached convenience path; see the
     deterministic package for the view contract).  ``deterministic=False`` runs a weight-gradient layout (both
     operands MN-major) on this package's split-K program where the planner takes the row; every other layout and
-    row runs the deterministic program."""
+    row runs the deterministic program.  ``enable_pdl`` reaches the deterministic program, whose swapped
+    small-token forward launches as a programmatic dependent launch (see its ``dense_projection_det_gemm``); this
+    package's programs launch without the attribute."""
     if _resolve_deterministic(deterministic, "dense_projection_gemm") or (
         _route(_k1_layout(A, B)) == "det"
     ):
         return _det_entry("dense_projection_gemm")(
-            A, B, out, transposed_out=transposed_out
+            A, B, out, transposed_out=transposed_out, enable_pdl=enable_pdl
         )
     return _atomic_k1(
         "launch",
@@ -2607,7 +2610,7 @@ def dense_projection_gemm(
         transposed_out=transposed_out,
         own={},
         det_call=lambda: _det_entry("dense_projection_gemm")(
-            A, B, out, transposed_out=transposed_out
+            A, B, out, transposed_out=transposed_out, enable_pdl=enable_pdl
         ),
     )
 

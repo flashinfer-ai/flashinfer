@@ -179,6 +179,34 @@ module's argument plan by keyword (`bind_launch`, fails closed on an unknown
 name).  Given the same device the result is bitwise identical to the Cake
 launcher's.
 
+### The swapped small-token forward
+
+The convenience path (`dense_projection_det_gemm`) runs a batched forward row
+that the planner would swap (`swap_small_m`: `L > 1`, `M <= 256`, `N >= 2 M`)
+on a program that puts the weight rows in the MMA's M and the tokens in its N
+(the `swap_ab_<tile>` templates), when `A` and `B` are K-major, the output is
+BF16 without `transposed_out`, `K` is a multiple of 64 and every view's row and
+batch strides and start are in 16-byte units.  A CTA streams a
+`tile_w x 64` weight box per stage through a deep TMA ring (64 rows over 12
+stages, or 128 rows over 8) against a 64-token tile, single CTA, no split: each
+output element is the one FP32 sum of its whole K, rounded once.  The tile is
+the narrow one while its `ceil(N / 64) * ceil(M / 64) * L` CTAs fit one wave of
+the device's SMs, the wide one while its CTAs fit two waves; a row whose wide
+tiles need more than two waves runs the planner's program, which streams the
+weights faster there (`swap_ab_template`, `SWAP_MAX_WAVES`).  The program
+reads the caller's views through tensor maps that carry their strides and
+stores at `l * out_l + m * ldo + n`, so the token-major `[T, L, K]` /
+`[T, L, N]` views of a grouped projection run without a copy.  Every other row,
+and every prepared launch, runs the planner's program.
+
+`enable_pdl=True` launches the swapped program as a programmatic dependent
+launch: every CTA triggers its dependents at entry, the weight loads start
+before `griddepcontrol.wait` and only the token loads wait for the predecessor
+grid, so the weight stream overlaps the predecessor's tail.  `B` must then not
+be written by a kernel still in flight on the stream (a weight is a parameter
+of the model).  The planner's programs take no PDL wait and launch without the
+attribute whatever `enable_pdl` says.
+
 ### K2 contract
 
 * `A`, `B`, `out` FP32 2-D views: `A [M, K]` with unit stride on `m` or `k`

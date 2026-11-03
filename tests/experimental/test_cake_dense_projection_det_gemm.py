@@ -797,7 +797,7 @@ def _l2_bytes() -> int:
 # ---------------------------------------------------------------------------
 
 
-ARG_KINDS = {"buffer", "tma_buffer", "workspace", "parameter", "grid"}
+ARG_KINDS = {"buffer", "tma_buffer", "workspace", "parameter", "launch", "grid"}
 
 
 def test_registry_records_are_well_formed():
@@ -905,6 +905,19 @@ def test_registry_records_are_well_formed():
             # the fp32 source, the [3, ...] BF16 stack and the element count
             assert ["buffer", "src"] in plan_items and ["buffer", "parts"] in plan_items
             assert ["parameter", "n"] in plan_items
+        elif record["template"].startswith("swap_ab_"):
+            # the swapped forward: the views' strides in its tensor maps and output pitches, PDL per call, 256
+            # threads, no cluster, every architecture
+            assert ["parameter", "ldo"] in plan_items and [
+                "parameter",
+                "out_l",
+            ] in plan_items
+            assert plan_items[-4] == ["launch", "enable_pdl"]
+            assert list(record["launch"]["block"]) == [256, 1, 1], name
+            assert record["template"] in dict(
+                (t, w) for w, t in cake_backend.SWAP_TEMPLATES
+            )
+            assert record["arches"] == list(cake_jit.ARCHES), name
         else:
             assert ["parameter", "k_iters_split"] in plan_items
         launch = record["launch"]
@@ -914,6 +927,7 @@ def test_registry_records_are_well_formed():
             [1, 1, 1]
             if record["template"].endswith("_c1")
             or record["template"] == cake_backend.SPLIT_TEMPLATE
+            or record["template"].startswith("swap_ab_")
             else [CTA_GROUP, 1, 1]
         )
         assert list(launch["cluster"]) == want_cluster, (name, launch)
@@ -6243,9 +6257,9 @@ def test_template_knobs_invert_instance_symbol():
         for template in table:
             tokens = cake_backend._template_tokens(template)
             if tokens is None:
-                # the router programs and the fused split program carry no knob tokens
+                # the router programs, the fused split program and the swapped forward carry no knob tokens
                 assert (
-                    template.startswith("router_fp32_det_gemm_")
+                    template.startswith(("router_fp32_det_gemm_", "swap_ab_"))
                     or template == cake_backend.SPLIT_TEMPLATE
                 ), (
                     arch,
@@ -9149,3 +9163,187 @@ def test_repeated_router_launches_are_bitwise_identical(op, T):
         prepared.launch()
         torch.cuda.synchronize()
         assert torch.equal(v["out"], first)
+
+
+# ---------------------------------------------------------------------------
+# The swapped small-token forward (``swap_ab_<tile>`` programs)
+# ---------------------------------------------------------------------------
+
+SWAP_TEMPLATES = dict((t, w) for w, t in cake_backend.SWAP_TEMPLATES)
+
+
+def test_swap_ab_template_fills_one_wave_with_the_narrow_tile():
+    """The narrow weight tile while its CTAs fit one wave of the device's SMs, the wide one up to two waves, the
+    planner's program beyond; ``None`` on an architecture that registers neither."""
+    pick = cake_backend.swap_ab_template
+    for arch in cake_jit.ARCHES:
+        # the grouped wo_a rows: 8 groups x 1024 weight rows, 64-token tiles
+        assert pick(8, 64, 1024, 152, arch) == "swap_ab_w64_t64_s12"  # 128 CTAs
+        assert pick(8, 65, 1024, 152, arch) == "swap_ab_w128_t64_s8"  # 256 > 152
+        assert pick(8, 128, 1024, 256, arch) == "swap_ab_w64_t64_s12"  # 256 <= 256
+        assert pick(8, 256, 1024, 152, arch) == "swap_ab_w128_t64_s8"  # 256 <= 2 waves
+        # past two waves of the wide tile the planner's program runs
+        assert pick(8, 64, 4096, 152, arch) == "swap_ab_w128_t64_s8"  # 256 CTAs
+        assert pick(8, 128, 4096, 152, arch) is None  # 512 CTAs
+        assert pick(8, 128, 4096, 256, arch) == "swap_ab_w128_t64_s8"  # 512 <= 2 x 256
+    assert pick(8, 64, 1024, 152, "sm_90a") is None
+
+
+def _swap_views(T, G=8, D=4096, R=1024, seed=SEED, token_major=True):
+    """The grouped projection views ``A [G, T, D]``, ``B [G, D, R]`` (K-major weights) and ``out [G, T, R]``:
+    token-major ``[T, G, *]`` storage permuted (SGLang's ``o`` and ``result``), or contiguous ``[G, T, *]``."""
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    w = (torch.randn(G, R, D, device="cuda", generator=g) * D**-0.5).to(torch.bfloat16)
+    if token_major:
+        o = torch.randn(T, G, D, device="cuda", generator=g).to(torch.bfloat16)
+        res = torch.full((T, G, R), float("nan"), device="cuda", dtype=torch.bfloat16)
+        return o.transpose(0, 1), w.transpose(1, 2), res.transpose(0, 1)
+    o = torch.randn(G, T, D, device="cuda", generator=g).to(torch.bfloat16)
+    res = torch.full((G, T, R), float("nan"), device="cuda", dtype=torch.bfloat16)
+    return o, w.transpose(1, 2), res
+
+
+def _require_swap():
+    if not _device_supported():
+        pytest.skip(
+            "requires a device with a registered generated instance "
+            f"(compute capability {_registered_capabilities()})"
+        )
+    for template in SWAP_TEMPLATES:
+        _require_program(template)
+
+
+def _swap_launch(A, B, out):
+    return cake_backend._swap_ab_cached(A, B, out, False)
+
+
+def _swap_expected(A, B):
+    """The template :func:`swap_ab_template` picks for these views on this device."""
+    L, M, _ = A.shape
+    facts = cake_backend.device_facts(A.device)
+    return cake_backend.swap_ab_template(L, M, B.shape[2], facts.sm_count, facts.arch)
+
+
+@pytest.mark.parametrize("token_major", [True, False])
+@pytest.mark.parametrize("T", [1, 7, 16, 63, 64, 65, 100, 128, 192, 255, 256])
+def test_swapped_forward_matches_fp64_on_the_grouped_views(T, token_major):
+    """Every batched forward row of at most 256 tokens runs a swapped program, in place on SGLang's token-major
+    views or on contiguous ones, within the BF16 budget of the FP64 reference."""
+    _require_swap()
+    A, B, out = _swap_views(T, token_major=token_major)
+    launch, template = _swap_launch(A, B, out), _swap_expected(A, B)
+    assert (
+        template is not None
+    )  # the grouped wo_a rows fit two waves of a Blackwell part
+    assert cake_jit.MODULES[launch.module_name]["template"] == template
+    cake_backend.dense_projection_det_gemm(A, B, out)
+    torch.cuda.synchronize()
+    _check(out, torch.einsum("gtd,gdr->gtr", A.double(), B.double()))
+
+
+@pytest.mark.parametrize(
+    "L, T, K, N", [(2, 33, 128, 512), (3, 100, 4160, 1032), (16, 8, 576, 256)]
+)
+def test_swapped_forward_other_shapes(L, T, K, N):
+    """Other batches, K (a multiple of 64) and N (a multiple of 8, not of the weight tile): tails in both tiles."""
+    _require_swap()
+    A, B, out = _swap_views(T, G=L, D=K, R=N, seed=SEED + 1)
+    launch = _swap_launch(A, B, out)
+    assert launch is not None
+    assert cake_jit.MODULES[launch.module_name]["template"] == _swap_expected(A, B)
+    cake_backend.dense_projection_det_gemm(A, B, out)
+    torch.cuda.synchronize()
+    _check(out, torch.einsum("gtd,gdr->gtr", A.double(), B.double()))
+
+
+def test_swapped_forward_declines_the_rows_it_does_not_take():
+    """Rows the swapped programs do not serve stay on the planner: more than 256 tokens, more than two waves of
+    tiles, one batch, an FP32 output, a transposed store, an MN-major weight view, a K that is not a multiple of
+    64."""
+    _require_swap()
+    A, B, out = _swap_views(257)
+    assert _swap_launch(A, B, out) is None
+    wide = 128 * (2 * cake_backend.device_sm_count(A.device) // 8 + 1)
+    A, B, out = _swap_views(64, G=8, D=1024, R=wide)
+    assert (
+        _swap_expected(A, B) is None and _swap_launch(A, B, out) is None
+    )  # past two waves
+    A, B, out = _swap_views(64, G=1)
+    assert _swap_launch(A[0], B[0], out[0]) is None and _swap_launch(A, B, out) is None
+    A, B, out = _swap_views(64)
+    assert _swap_launch(A, B, out.float()) is None
+    assert _swap_launch(A, B.contiguous(), out) is None  # B unit stride on n: MN-major
+    A, B, out = _swap_views(64, D=4096 + 8)
+    assert _swap_launch(A, B, out) is None
+    assert cake_backend._swap_ab_launch(*_swap_views(64), True) is None
+
+
+def test_swapped_forward_is_bitwise_repeatable():
+    """One FP32 sum per output element, rounded once: reruns give the same bits."""
+    _require_swap()
+    for T in (64, 128):
+        A, B, out = _swap_views(T, seed=SEED + 2)
+        cake_backend.dense_projection_det_gemm(A, B, out)
+        first = out.clone()
+        for _ in range(REPEATS):
+            out.fill_(float("nan"))
+            cake_backend.dense_projection_det_gemm(A, B, out, enable_pdl=True)
+            torch.cuda.synchronize()
+            assert torch.equal(out, first)
+
+
+@pytest.mark.parametrize("T", [16, 128])
+def test_swapped_forward_pdl_waits_for_an_early_producer(T):
+    """A chain of programmatic dependent launches whose producer triggers its dependents at entry: the first
+    projection (K = 16384, long) writes the activation the second reads.  The second starts while the first runs
+    (its weights load ahead of the wait) and must still read every token the first wrote."""
+    _require_swap()
+    G, D1, R1, R2 = 8, 16384, 1024, 2048
+    g = torch.Generator(device="cuda").manual_seed(SEED + 3)
+    x = torch.randn(T, G, D1, device="cuda", generator=g).to(torch.bfloat16)
+    w1 = (torch.randn(G, R1, D1, device="cuda", generator=g) * D1**-0.5).to(
+        torch.bfloat16
+    )
+    w2 = (torch.randn(G, R2, R1, device="cuda", generator=g) * R1**-0.5).to(
+        torch.bfloat16
+    )
+    for _ in range(3):
+        mid = torch.full((T, G, R1), float("nan"), device="cuda", dtype=torch.bfloat16)
+        y = torch.full((T, G, R2), float("nan"), device="cuda", dtype=torch.bfloat16)
+        A1, B1, O1 = x.transpose(0, 1), w1.transpose(1, 2), mid.transpose(0, 1)
+        A2, B2, O2 = mid.transpose(0, 1), w2.transpose(1, 2), y.transpose(0, 1)
+        assert _swap_launch(A1, B1, O1) is not None
+        assert _swap_launch(A2, B2, O2) is not None
+        cake_backend.dense_projection_det_gemm(A1, B1, O1, enable_pdl=True)
+        cake_backend.dense_projection_det_gemm(A2, B2, O2, enable_pdl=True)
+        torch.cuda.synchronize()
+        assert bool(torch.isfinite(mid).all()) and bool(torch.isfinite(y).all())
+        _check(O2, torch.einsum("gtd,gdr->gtr", A2.double(), B2.double()))
+
+
+def test_swapped_forward_replays_in_a_cuda_graph_with_pdl():
+    """The swapped launch allocates nothing: a PDL chain captured into a CUDA graph replays on new values written
+    into the bound views."""
+    _require_swap()
+    A, B, out = _swap_views(96, seed=SEED + 4)
+    _, B2, out2 = _swap_views(96, R=4096, D=1024, seed=SEED + 5)
+    A2 = out  # the second projection reads the first's output
+
+    def chain():
+        cake_backend.dense_projection_det_gemm(A, B, out, enable_pdl=True)
+        cake_backend.dense_projection_det_gemm(A2, B2, out2, enable_pdl=True)
+
+    chain()
+    torch.cuda.synchronize()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        chain()
+    A.copy_(torch.randn(A.shape, device="cuda").to(torch.bfloat16))
+    out.fill_(float("nan"))
+    out2.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    _check(out, torch.einsum("gtd,gdr->gtr", A.double(), B.double()))
+    _check(out2, torch.einsum("gtd,gdr->gtr", A2.double(), B2.double()))

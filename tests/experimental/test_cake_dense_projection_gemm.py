@@ -292,7 +292,11 @@ def test_use_deterministic_backend_binds_a_vendored_copy(monkeypatch):
 # entry point -> (positional arguments, keyword arguments, the call the deterministic object receives)
 # fmt: off
 DEFAULT_CALLS = {
-    "dense_projection_gemm": (("A", "B", "out"), {"transposed_out": True}, (("A", "B", "out"), {"transposed_out": True})),
+    "dense_projection_gemm": (
+        ("A", "B", "out"),
+        {"transposed_out": True, "enable_pdl": True},
+        (("A", "B", "out"), {"transposed_out": True, "enable_pdl": True}),
+    ),
     "plan_dense_projection_gemm": (
         ("A", "B", "out"),
         {"sm_count": 148, "l2_bytes": 1 << 20, "transposed_out": True, "block_n": 128},
@@ -395,10 +399,14 @@ def test_k1_routes(monkeypatch, layout):
         assert args[0] == "launch" and args[1] is A and args[2] is B and args[3] is out
         assert kwargs["transposed_out"] is False and kwargs["own"] == {}
         assert kwargs["det_call"]() is det.result  # a row the planner does not take
-        assert det.calls == [((A, B, out), {"transposed_out": False})]
+        assert det.calls == [
+            ((A, B, out), {"transposed_out": False, "enable_pdl": False})
+        ]
     else:
         assert result is det.result and not atomic.calls
-        assert det.calls == [((A, B, out), {"transposed_out": False})]
+        assert det.calls == [
+            ((A, B, out), {"transposed_out": False, "enable_pdl": False})
+        ]
 
 
 def test_k1_operation_routes(monkeypatch):
