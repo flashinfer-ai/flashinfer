@@ -483,6 +483,7 @@ class MegaMoENvfp4Frontend:
         inputs: MegaMoENvfp4Inputs,
         *,
         num_tokens: Optional[int] = None,
+        _bind_stream_at_launch: bool = False,
     ) -> Callable[[], None]:
         """Zero-arg launcher with args prebuilt (compiles if needed).
 
@@ -530,6 +531,8 @@ class MegaMoENvfp4Frontend:
                 compiled(**runtime_kwargs)
 
         if self.config.internode:
+            from cuda.bindings import driver as cuda
+
             inner = thunk
             session = self._gin_session
 
@@ -541,9 +544,15 @@ class MegaMoENvfp4Frontend:
                         raise RuntimeError(
                             "GIN launch thunk belongs to a closed session."
                         )
+                    if torch.cuda.current_device() != session.device:
+                        raise RuntimeError("GIN launch uses a different CUDA device.")
                 except Exception as exc:
                     error = f"{type(exc).__name__}: {exc}"
                 self._gin_agree(error, "launch")
+                if _bind_stream_at_launch:
+                    runtime_kwargs["stream"] = cuda.CUstream(
+                        torch.cuda.current_stream().cuda_stream
+                    )
                 inner()
 
         return thunk

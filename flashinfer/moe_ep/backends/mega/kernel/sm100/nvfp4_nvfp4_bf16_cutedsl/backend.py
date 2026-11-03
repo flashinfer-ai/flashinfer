@@ -75,6 +75,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
                 "NVFP4 GenPhase requires kernel_name='sm100_nvfp4_nvfp4_bf16_cutedsl_next'."
             )
         self._kernel_config: Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig = config
+        self._gin_device: int | None = None
         self.requires_collective_forward_validation = config.internode
         self.supports_live_token_tuning = not config.internode
         self.supports_unfinalized_output = config.finalize_mode is FinalizeMode.NONE
@@ -119,6 +120,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         error = None
         try:
             self._validate_init_local(bootstrap, fleet_params)
+            self._gin_device = torch.cuda.current_device()
             if (
                 k.activation != "swiglu"
                 or k.swiglu_alpha is not None
@@ -387,7 +389,10 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
                 if t.scales.dtype != torch.float8_e4m3fn:
                     raise ValueError("GIN activation SF must be float8_e4m3fn.")
                 tensors.append(t.scales)
-            device = torch.device("cuda", torch.cuda.current_device())
+            current_device = torch.cuda.current_device()
+            if current_device != self._gin_device:
+                raise ValueError("GIN inputs must use the session's bound CUDA device.")
+            device = torch.device("cuda", current_device)
             if any(
                 tensor.device != device or not tensor.is_contiguous()
                 for tensor in tensors
@@ -573,7 +578,12 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         if clamp is not None:
             fe.set_gate_up_clamp(clamp)
         mega = fe._mega
-        stream = torch.cuda.current_stream().cuda_stream
+        # GIN preparation is collective. A stream change on only one rank
+        # must not create a local cache miss and a different collective order.
+        # Its eager-only thunk binds the current stream at execution instead.
+        stream = (
+            None if fe.config.internode else torch.cuda.current_stream().cuda_stream
+        )
         weight_identity = tuple(
             id(tensor) for transformed in transformed_weights for tensor in transformed
         )
@@ -595,7 +605,10 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             inputs = self._mega_inputs(workspace, transformed_weights)
             # Full validation happens inside make_launch_thunk's
             # _prepare_launch_inputs (run()'s slow-path validator).
-            thunk = fe.make_launch_thunk(inputs)
+            if fe.config.internode:
+                thunk = fe.make_launch_thunk(inputs, _bind_stream_at_launch=True)
+            else:
+                thunk = fe.make_launch_thunk(inputs)
             mega = fe._mega
             assert mega is not None and mega.compiled is not None
             key = (key[0], key[1], id(mega.compiled), stream)

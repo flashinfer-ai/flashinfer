@@ -33,6 +33,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("root", type=Path)
     parser.add_argument("--on-root", type=Path)
+    parser.add_argument("--ep2-root", type=Path)
     parser.add_argument("--ep4-root", type=Path)
     parser.add_argument("--require-complete", action="store_true")
     parser.add_argument("--off-only", action="store_true")
@@ -43,6 +44,11 @@ def main():
     incomplete = []
 
     def source_paths(pattern, *, profiles=False):
+        overrides = {
+            ep: root
+            for ep, root in ((2, args.ep2_root), (4, args.ep4_root))
+            if root is not None
+        }
         runs = [("off", args.root)]
         if not args.off_only:
             runs.append(("on", args.on_root or args.root))
@@ -54,21 +60,20 @@ def main():
             )
             directory = run_root / subtree / mode
             for path in directory.glob(pattern):
-                if (
-                    mode == "off"
-                    and args.ep4_root
-                    and path.relative_to(directory).parts[0] == "ep4"
+                if mode == "off" and any(
+                    path.relative_to(directory).parts[0] == f"ep{ep}"
+                    for ep in overrides
                 ):
                     continue
                 yield path
-        if args.ep4_root:
+        for ep, run_root in overrides.items():
             subtree = (
                 "profiles"
-                if profiles and (args.ep4_root / "profiles" / "off").is_dir()
+                if profiles and (run_root / "profiles" / "off").is_dir()
                 else "measurements"
             )
-            yield from (args.ep4_root / subtree / "off").glob(
-                pattern.replace("ep*", "ep4")
+            yield from (run_root / subtree / "off").glob(
+                pattern.replace("ep*", f"ep{ep}")
             )
 
     for path in sorted(source_paths("ep*/round-*/*/rank-0-manifest.json")):
@@ -265,6 +270,7 @@ def main():
         run_roots=dict(
             off=str(args.root),
             on=str(args.on_root or args.root),
+            off_ep2=str(args.ep2_root) if args.ep2_root else None,
             off_ep4=str(args.ep4_root) if args.ep4_root else None,
         ),
         rows=results,

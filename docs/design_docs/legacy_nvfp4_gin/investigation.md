@@ -343,3 +343,96 @@ compatibility evidence. No documentation example timing is used as a baseline.
   fixed legacy donor and the two-agreement candidate with two resident providers
   (same standard/conditioned protocols, all profiles after primary), and rerun
   the complete 15-test strong/public qualification. No device/tuning changes.
+
+- **O27/PT6 completed:** 3578050, theia0083/theia0121, two resident providers,
+  final candidate38f650e63. All1600 primary samples pass bit checks/payload
+  identity;15 strong/public tests pass on each rank, including invalid public
+  staging and recovery. Standard warm full1513.24 us versus native387.31 us;
+  cold1594.61 versus393.88 us. Wrapper scopes differ. Standard raw warm
+  donor329.55→candidate299.54 us, cold342.62→321.68 us. Donor round CV6.58%
+  and5.76% still prevent a formal5% no-regression claim. The 200-call conditioned
+  results stay separate. Full sampled data: resident-v2/job-3578050/summary.json.
+- **O28, final unbound off matrix:** 3578010 (theia0248 EP1/EP2) and3578011
+  (theia0154 EP4) complete30 paired source points,4800 critical-rank samples,
+  all output/payload/profile checks.9 PASS,0 REGRESSION,15 inconclusive baseline
+  dispersion. All medians are within the5% limit, but that does not make noisy
+  cases pass.8 EP1 gates and EP2 T64 warm-raw gate pass. Deferred profiling
+  alone did NOT fix EP4 noise, so it is not established as that noise's cause.
+  Four finalizer tests, one cache/graph test and three layer/scale tests pass
+  per rank at EP4, retaining the extended-entry fallback's correctness.
+- **O29, profiled local arrival skew:** old3577696 F_BASE EP4 traces contain
+  15 same-host paired calls with GPU start skew>100 us; the largest is6328.8 us
+  while GPU end skew is0.1 us. Other samples show~3.3–3.6 ms start skew with
+  near-simultaneous completion. Thus those long profiled spans include waiting
+  for late peers, not only arithmetic. This does not establish the cause of
+  every unprofiled sample. Derived CSV: blackwell-fix-20261102/profile-launch-skew.csv.
+- **O30, topology/placement observations:** read-only topology probe on
+  theia0154 maps GPU0/1 to CPU NUMA0 and GPU2/3 to NUMA1. A live read-only probe
+  during3578050 finds EVERY worker restricted to CPUs0-31 on both nodes. The
+  same32-CPU Slurm task configuration is used by the unbound off jobs; their
+  workers exited before a direct affinity read completed. Do not relabel that
+  inference as a direct EP4 process observation.
+- **PH5, candidate:** shared CPU placement can delay some ranks' submissions
+  and make collective device spans include peer-arrival waits. This predicts
+  lower variance with GPU-local disjoint CPU sets. It is compatible with O29
+  and O30 but not yet proven by those observations. **PT7, launched3578088:**
+  on ONE exclusive GB300 node, interleave fixed F_BASE/shared32,
+  F_BASE/GPU-local8-per-rank, and candidate/GPU-local8-per-rank over five rounds.
+  Both placements use32 physical CPUs total, all original timing/cache rules
+  and output checks retained. NVML queries and bindings precede Torch/CUDA
+  context creation; sidecars record actual sets. The final pinned pair also
+  receives deferred profiles.3578087 repeats unresolved EP2 gates with the same
+  binding; its eight primary gates now pass. EP4 results remain pending.
+- **PT8, launched3578114:** repeat the final two-provider resident N2R2
+  comparison under the same pre-context NVML local binding. Old unbound and
+  conditioned measurements remain separate; no baseline cherry-picking.
+
+Sources S3/S4 (guidance, not current-root-cause proof): Glean retrieved the
+NVIDIA Grace tuning guide and NVBug5914874 after the affinity/launch-latency
+query. The latter concerns Strata/Rubin and cannot establish a GB300 diagnosis:
+https://docs.nvidia.com/dccpu/grace-perf-tuning-guide/index.html
+https://nvbugswb.nvidia.com/NVBugs5/redir.aspx?url=/5914874.
+NVML's documented node-scope CPU mask API is used only for the benchmark
+placement experiment; installed driver calls succeed and actual masks are
+recorded. No GPU clocks or memory policy are modified:
+https://docs.nvidia.com/deploy/archive/R535/nvml-api/group__nvmlAffinity.html.
+
+- **O31/PT7 completed:**3578087 (theia0154) and3578088 (theia0095) complete.
+  Together with retained EP1 from3578010, all24 off gates PASS (48 groups,
+  4800 critical-rank samples), all bits/per-rank payloads/profile counts valid.
+  On the SAME EP4 allocation, unchanged F_BASE shared32 raw round-CVs are
+  6.31/16.85/88.38/40.03% for T64warm/cold,T1024warm/cold; GPU-local binding
+  gives2.42/3.09/0.97/2.01%. This is a controlled placement intervention using
+  32 distinct worker CPUs either way. PH5 is supported within this launcher;
+  it does not distinguish NUMA locality, per-rank partitioning or detailed
+  driver mechanisms. CPU masks/UUIDs are observed, not inferred, in sidecars.
+- R5: [checkpoint-05.md](checkpoint-05.md), the off qualification and bounded
+  placement conclusion. PT8 is the remaining final on confirmation.
+
+Current coverage revision: PH1 explains the measured public-call envelope,
+not raw device cost. PH4 explains the ordinary-off entry intervention and the
+confirmed raw regressions are now absent under qualified measurement. PH5
+accounts for reproducible EP4 placement noise; it does not explain every old
+EP1/on case. PH2 remains unestablished as an unconditional device slowdown.
+PH3 covers observed state/arrival sensitivity but the exact mechanism behind
+all old N2R2 ratios remains unresolved. No prior observation has been dropped.
+
+- **O32/PT8:**3578114 completed all1600 timing samples, bit checks, payload
+  checks and profiles, but the job FAILED afterward: the affinity wrapper
+  called main() on a worker module that executes at import and has no main.
+  Consequently its later correctness phase did not run. Retain whole-job
+  failure and do not label it a qualification pass. Standard raw medians are
+  donor364.75→port322.38 us warm and369.39→338.30 us cold; baselineCV~11%
+  remains inconclusive. Thus local binding alone is NOT established as a fix
+  for all N2R2 noise. The corrected wrapper will not double-invoke that module.
+- **O33, source review/prediction:** the cached GIN thunk key still included
+  the local CUDA stream. A stream change on only one rank would make that
+  rank enter launch-prepare while cached peers enter launch; compact phase
+  checking would reject the call. The cache optimization must not add this
+  restriction. **PT9, planned:** reproduce the previous38f650e63 rejection,
+  bind the current stream at execution for managed eager-GIN thunks (keep
+  off/graph thunks stream-specific), retain launch/session/capture agreement,
+  and test actual compiled-call stream handles plus bitwise outputs while only
+  one rank alternates streams. Explicit bound-device validation stays inside
+  the existing collective boundary, before staging. Final17-test qualification
+  also checks wrong-current-device recovery. No device binary change is intended.

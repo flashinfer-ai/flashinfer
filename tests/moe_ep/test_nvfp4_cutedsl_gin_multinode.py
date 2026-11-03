@@ -265,6 +265,72 @@ def test_nvfp4_gin_public_sessions_and_recreation():
                 layer.destroy()
 
 
+def test_nvfp4_gin_public_rank_local_stream_rebinding():
+    bootstrap = _bootstrap()
+    layer = _layer(bootstrap)
+    failed = False
+    try:
+        inputs = _inputs(bootstrap.rank, 0, "balanced")
+        expected = layer.forward(inputs).clone()
+        torch.cuda.synchronize()
+        mega = layer._workspace._frontend._mega
+        compiled = mega.compiled
+        streams = []
+
+        def tracked(**kwargs):
+            streams.append(int(kwargs["stream"]))
+            return compiled(**kwargs)
+
+        mega.compiled = tracked
+        layer.forward(inputs)  # Collectively prepare the instrumented target.
+        torch.cuda.synchronize()
+        default = torch.cuda.current_stream()
+        alternate = torch.cuda.Stream()
+        for iteration in range(3):
+            target = (
+                alternate if bootstrap.rank == 1 and iteration % 2 == 0 else default
+            )
+            target.wait_stream(default)
+            with torch.cuda.stream(target):
+                actual = layer.forward(inputs)
+                assert streams[-1] == target.cuda_stream
+            torch.cuda.synchronize()
+            assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+        mega.compiled = compiled
+    except BaseException:
+        failed = True
+        raise
+    finally:
+        if not failed:
+            layer.destroy()
+
+
+def test_nvfp4_gin_public_rank_local_device_binding():
+    bootstrap = _bootstrap()
+    layer = _layer(bootstrap)
+    failed = False
+    try:
+        layer.forward(_inputs(bootstrap.rank, 0, "balanced"))
+        torch.cuda.synchronize()
+        bound_device = torch.cuda.current_device()
+        target = (bound_device + 1) % 2 if bootstrap.rank == 1 else bound_device
+        with torch.cuda.device(target):
+            inputs = _inputs(bootstrap.rank, 1, "balanced")
+            with pytest.raises((RuntimeError, ValueError), match="GIN|gin"):
+                layer.forward(inputs)
+            with pytest.raises((RuntimeError, ValueError), match="GIN|gin"):
+                layer.stage_inputs(inputs)
+        actual = layer.forward(_inputs(bootstrap.rank, 2, "balanced"))
+        torch.cuda.synchronize()
+        assert torch.isfinite(actual).all()
+    except BaseException:
+        failed = True
+        raise
+    finally:
+        if not failed:
+            layer.destroy()
+
+
 def test_nvfp4_gin_public_capture_rejection():
     bootstrap = _bootstrap()
     layer = _layer(bootstrap)
