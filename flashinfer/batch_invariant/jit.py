@@ -45,12 +45,20 @@ MODULE_ROOTS: Dict[str, Tuple[str, ...]] = {
         "gemm/batch_invariant/blocks/compile.py",
         "gemm/batch_invariant/fixup.py",
     ),
+    # the block-scaled kernels (the MXFP8 classes): their own module, so an edit to the block-scaled body leaves the dense
+    # module's objects valid and vice versa (the split's fixup stays in the dense module)
+    "batch_invariant_gemm_blockscaled": (
+        "gemm/batch_invariant/blocks/compile_blockscaled.py",
+    ),
 }
 
 #: Sources outside the mode's directories that a module's kernels import absolutely, relative to the flashinfer
 #: package: the relative-import closure cannot reach them, so they are keyed explicitly (a missing file is an error).
 MODULE_EXTRA_SOURCES: Dict[str, Tuple[str, ...]] = {
     "batch_invariant_gemm": (
+        "cute_dsl/attention/fmha/helpers/static_persistent_tile_scheduler.py",
+    ),
+    "batch_invariant_gemm_blockscaled": (
         "cute_dsl/attention/fmha/helpers/static_persistent_tile_scheduler.py",
     ),
 }
@@ -60,6 +68,10 @@ MODULE_EXTRA_SOURCES: Dict[str, Tuple[str, ...]] = {
 #: the walk, so an edit to them (or recalibrated constants) does not recompile the module's kernels.
 MODULE_NON_KERNEL_SOURCES: Dict[str, Tuple[str, ...]] = {
     "batch_invariant_gemm": (
+        "gemm/batch_invariant/schedule.py",
+        "gemm/batch_invariant/heuristic.py",
+    ),
+    "batch_invariant_gemm_blockscaled": (
         "gemm/batch_invariant/schedule.py",
         "gemm/batch_invariant/heuristic.py",
     ),

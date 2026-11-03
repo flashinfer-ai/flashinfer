@@ -56,6 +56,7 @@ def _b12x_gemm_mxfp8_requirement(
     out_dtype: torch.dtype = torch.bfloat16,
     use_8x4_sf_layout: bool = True,
     backend: Literal["cutlass", "cute-dsl", "trtllm", "cudnn", "b12x", "auto"] = "auto",
+    batch_invariant: bool = False,
 ):
     if get_cuda_version().major < 13:
         if backend != "b12x":
