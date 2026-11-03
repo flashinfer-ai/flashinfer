@@ -130,6 +130,10 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
                 or k.enable_in_kernel_fc2_reduce
                 or k.combine_dtype != "bf16"
                 or k.enable_fc1_activation_per_token_scale
+                or any(
+                    value is not None
+                    for value in (k.fc1_alpha, k.fc2_alpha, k.fc1_norm_const)
+                )
                 or not k.apply_routing_weights_before_fc2
                 or (
                     bootstrap.world_size,
@@ -362,6 +366,13 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         quantize_input: bool,
     ) -> None:
         if self._kernel_config.internode:
+            if any(
+                value is not None
+                for value in (t.fc1_alpha, t.fc2_alpha, t.fc1_norm_const)
+            ):
+                raise ValueError(
+                    "GIN runtime epilogue-scale overrides are not qualified."
+                )
             expected_dtype = (
                 torch.bfloat16 if quantize_input else torch.float4_e2m1fn_x2
             )

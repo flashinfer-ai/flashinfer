@@ -1501,6 +1501,9 @@ def get_symm_buffer_for_mega_moe(
             or num_valid_tokens_tensor is not None
             or combine_dtype != "bf16"
             or enable_fc1_activation_per_token_scale
+            or any(
+                value is not None for value in (fc1_alpha, fc2_alpha, fc1_norm_const)
+            )
             or not apply_routing_weights_before_fc2
             or knobs is not None
         ):

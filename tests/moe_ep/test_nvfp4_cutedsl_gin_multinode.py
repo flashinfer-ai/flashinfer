@@ -29,8 +29,12 @@ pytestmark = [pytest.mark.gpu_4, pytest.mark.arch_blackwell, pytest.mark.node_ex
 
 
 def _bootstrap():
-    if int(os.environ.get("WORLD_SIZE", "1")) != 4:
-        pytest.skip("requires a real N2R2 torchrun job")
+    topology = tuple(
+        int(os.environ.get(name, "1"))
+        for name in ("WORLD_SIZE", "LOCAL_WORLD_SIZE", "GROUP_WORLD_SIZE")
+    )
+    if topology != (4, 2, 2):
+        pytest.skip("requires N2R2 torchrun: two worker groups, two local ranks each")
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     if not dist.is_initialized():
         dist.init_process_group(backend="cpu:gloo,cuda:nccl")
@@ -132,6 +136,7 @@ def test_nvfp4_gin_public_layer_relaunch(case):
         {"enable_fc1_activation_per_token_scale": True},
         {"swiglu_alpha": 1.702, "swiglu_beta": 1.0},
         {"ranks_per_node": 4},
+        {"fc1_alpha": 2.0},
     ],
 )
 def test_nvfp4_gin_public_config_rejection(changes):
@@ -147,7 +152,7 @@ def test_nvfp4_gin_public_rank_local_errors():
     try:
         layer.forward(_inputs(bootstrap.rank, 0, "balanced"))
         torch.cuda.synchronize()
-        for kind in ("route", "dtype", "capacity", "output"):
+        for kind in ("route", "dtype", "capacity", "output", "epilogue_scale"):
             inputs = _inputs(bootstrap.rank, 1, "balanced")
             if bootstrap.rank == 1:
                 if kind == "route":
@@ -158,6 +163,10 @@ def test_nvfp4_gin_public_rank_local_errors():
                     inputs.hidden_states = inputs.hidden_states.repeat(2, 1)
                     inputs.topk_ids = inputs.topk_ids.repeat(2, 1)
                     inputs.topk_weights = inputs.topk_weights.repeat(2, 1)
+                elif kind == "epilogue_scale":
+                    inputs.fc1_alpha = torch.ones(
+                        12, device="cuda", dtype=torch.float32
+                    )
                 else:
                     inputs.output = torch.empty(
                         (32, 1), device="cuda", dtype=torch.bfloat16
