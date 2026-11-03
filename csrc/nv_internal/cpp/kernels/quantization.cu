@@ -517,8 +517,7 @@ template void invokeNvfp4QuantAndPerTokenScale<__nv_bfloat16>(
 // FP4/MXFP8 Quantization
 
 // Filling and draining the TMA pipeline costs ~2 us more than the vectorized kernel's launch, which
-// its higher bandwidth repays only on large inputs: ~32 MiB on B200 and RTX 5080 (cold L2). The
-// grid spans row tiles only, so wide inputs with few rows stay on the vectorized kernel.
+// its higher bandwidth repays only on large inputs: ~32 MiB on B200 and RTX 5080 (cold L2).
 template <typename T>
 bool useTmaQuantization(int b, int m, int n) {
   constexpr int64_t kMinTmaInputBytes = 32ll << 20;
