@@ -2262,8 +2262,12 @@ class BatchDecodeWithPagedKVCacheWrapper:
             ``64`` for 256 <= VO < 512; and ``16`` and ``32`` for VO >= 512.
             QK >= 512 with VO < 512 supports only ``16``.
             Requires the ``fa2`` backend (and ``use_tensor_cores=True`` for decode);
-            ``backend="auto"`` selects FA2 when this is set. Tile ``16`` is rejected
-            at plan time when it does not fit the GPU's shared memory.
+            ``backend="auto"`` selects FA2 when this is set. Tile ``16`` requires
+            SM80 or newer for head dims below 512. Planning rejects a tile whose Q
+            tile plus one K step already exceeds the GPU's shared memory; this is a
+            lower bound, so some large-head layouts (e.g. QK=576, VO=512, tile 32 on
+            99 KiB GPUs) still pass planning and fail at launch, as they do under
+            the automatic tile choice.
             Under CUDA graphs, every plan of a wrapper must pass the same value.
             For batch invariance, also use ``disable_split_kv=True`` or a fixed split size.
         Note
@@ -5652,10 +5656,20 @@ def fast_decode_plan(
             else None,
             fixed_split_size=fixed_split_size,
             disable_split_kv=disable_split_kv,
+            fixed_cta_tile_q=fixed_cta_tile_q,
         )
     if (
         wants_cudnn
         or self._cudnn_auto
+        # An eager auto wrapper whose cached module is not FA2 (e.g. FA3 on
+        # Hopper) must replan to pin FA2 for a fixed tile. Under CUDA graphs the
+        # captured backend stays, and the checks below reject the tile.
+        or (
+            fixed_cta_tile_q is not None
+            and self._requested_backend == "auto"
+            and self._backend != "fa2"
+            and not self.is_cuda_graph_enabled
+        )
         or getattr(self, "_use_xqa_mtp_decode", False)
         or (
             self._requested_backend == "auto"

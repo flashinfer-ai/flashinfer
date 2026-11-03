@@ -280,3 +280,63 @@ def test_fixed_tile_plan_and_workspace_use_fa2(make_wrapper, monkeypatch, tile, 
     assert calls["plan"][0][18] == tile
     assert len(calls["workspace"][0]) == 20
     assert calls["workspace"][0][16] == tile
+
+
+def _fast_plan(wrapper, indices, **options):
+    return decode.fast_decode_plan(
+        wrapper,
+        torch.arange(17, dtype=torch.int32) * 64,
+        indices,
+        torch.full((16,), 16, dtype=torch.int32),
+        32,
+        8,
+        128,
+        16,
+        q_len_per_req=1,
+        q_data_type=torch.float16,
+        **options,
+    )
+
+
+def test_fast_plan_cudnn_probe_sees_fixed_tile(make_wrapper, monkeypatch):
+    wrapper, plan, indices = make_wrapper(graph=False)
+    plan(q_len_per_req=1)
+    seen = []
+    monkeypatch.setattr(
+        decode.BatchDecodeWithPagedKVCacheWrapper,
+        "_auto_prefers_cudnn",
+        lambda *args, **kwargs: seen.append(kwargs.get("fixed_cta_tile_q")) or False,
+    )
+    _fast_plan(wrapper, indices, fixed_cta_tile_q=64)
+    assert seen == [64]
+
+
+def test_fast_plan_eager_fixed_tile_replans_cached_fa3(make_wrapper, monkeypatch):
+    wrapper, plan, indices = make_wrapper(graph=False)
+    plan(q_len_per_req=1)
+    # What an auto plan caches on Hopper for an FP8 KV cache.
+    wrapper._backend = "fa3"
+    tiles = []
+    regular_plan = wrapper._plan_impl
+
+    def record(*args, **kwargs):
+        tiles.append(kwargs["fixed_cta_tile_q"])
+        return regular_plan(*args, **kwargs)
+
+    monkeypatch.setattr(wrapper, "_plan_impl", record)
+    _fast_plan(wrapper, indices, fixed_cta_tile_q=64)
+    assert tiles == [64]
+    assert wrapper.resolved_backend == "fa2"
+
+
+def test_fast_plan_graph_fixed_tile_keeps_cached_fa3(make_wrapper, monkeypatch):
+    wrapper, plan, indices = make_wrapper(graph=True)
+    plan(q_len_per_req=1)
+    wrapper._backend = "fa3"
+
+    def unexpected_regular_plan(*args, **kwargs):
+        raise AssertionError("a captured backend must not be replanned")
+
+    monkeypatch.setattr(wrapper, "_plan_impl", unexpected_regular_plan)
+    with pytest.raises(ValueError, match="only supported for the fa2 backend"):
+        _fast_plan(wrapper, indices, fixed_cta_tile_q=64)

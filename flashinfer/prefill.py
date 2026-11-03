@@ -3729,8 +3729,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
             ``64`` for 256 <= VO < 512; and ``16`` and ``32`` for VO >= 512.
             QK >= 512 with VO < 512 supports only ``16``.
             Requires the ``fa2`` backend (and ``use_tensor_cores=True`` for decode);
-            ``backend="auto"`` selects FA2 when this is set. Tile ``16`` is rejected
-            at plan time when it does not fit the GPU's shared memory.
+            ``backend="auto"`` selects FA2 when this is set. Tile ``16`` requires
+            SM80 or newer for head dims below 512. Planning rejects a tile whose Q
+            tile plus one K step already exceeds the GPU's shared memory; this is a
+            lower bound, so some large-head layouts (e.g. QK=576, VO=512, tile 32 on
+            99 KiB GPUs) still pass planning and fail at launch, as they do under
+            the automatic tile choice.
             Under CUDA graphs, every plan of a wrapper must pass the same value.
             For batch invariance, also use ``disable_split_kv=True`` or a fixed split size.
         Note
@@ -5886,8 +5890,12 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             ``64`` for 256 <= VO < 512; and ``16`` and ``32`` for VO >= 512.
             QK >= 512 with VO < 512 supports only ``16``.
             Requires the ``fa2`` backend (and ``use_tensor_cores=True`` for decode);
-            ``backend="auto"`` selects FA2 when this is set. Tile ``16`` is rejected
-            at plan time when it does not fit the GPU's shared memory.
+            ``backend="auto"`` selects FA2 when this is set. Tile ``16`` requires
+            SM80 or newer for head dims below 512. Planning rejects a tile whose Q
+            tile plus one K step already exceeds the GPU's shared memory; this is a
+            lower bound, so some large-head layouts (e.g. QK=576, VO=512, tile 32 on
+            99 KiB GPUs) still pass planning and fail at launch, as they do under
+            the automatic tile choice.
             Under CUDA graphs, every plan of a wrapper must pass the same value.
             For batch invariance, also use ``disable_split_kv=True`` or a fixed split size.
         seq_lens: Optional[torch.Tensor]

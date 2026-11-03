@@ -550,7 +550,7 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
                                    int32_t fixed_split_size, bool disable_split_kv,
                                    int32_t fixed_cta_tile_q, int64_t uniform_q_len,
                                    bool fixed_uniform_q_len, uint32_t head_dim_qk = 0,
-                                   uint32_t kv_dtype_bytes = 2) {
+                                   uint32_t kv_dtype_bytes = 2, uint32_t q_dtype_bytes = 2) {
   std::vector<IdType> request_indices, qo_tile_indices, kv_tile_indices, merge_indptr, o_indptr;
   merge_indptr.push_back(0);
   o_indptr.push_back(0);
@@ -620,15 +620,37 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
               << " is not supported with head_dim=" << head_dim << " and head_dim_qk=" << qk;
       FLASHINFER_ERROR(err_msg.str());
     }
-    // The automatic heuristic falls back to 64 when the 1x4 layout (its smallest
-    // KV step or its cross-warp merge buffers) does not fit shared memory; a
-    // fixed 16 would otherwise only fail at run time when the kernel launches.
-    if (fixed_cta_tile_q == 16 && head_dim < 512 && qk < 512 &&
-        !FA2CtaTileQ16FitsSmem(qk, head_dim, kv_dtype_bytes)) {
+    if (fixed_cta_tile_q == 16 && head_dim < 512 && qk < 512) {
+      // Below SM80 the heuristic never selects the 1x4 layout for these heads.
+      // Its launch-time NUM_MMA_KV can be invalid there (e.g. SM75 fp16 with
+      // head_dim 64 picks an odd NUM_MMA_KV, which NUM_MMA_D_VO == 4 rejects).
+      if (GetCudaComputeCapability().first < 8) {
+        std::ostringstream err_msg;
+        err_msg << "fixed_cta_tile_q=16 requires SM80 or newer with head_dim=" << head_dim
+                << " and head_dim_qk=" << qk << "; use fixed_cta_tile_q=64";
+        FLASHINFER_ERROR(err_msg.str());
+      }
+      // The heuristic also falls back to 64 when the 1x4 layout (its smallest
+      // KV step or its cross-warp merge buffers) does not fit shared memory.
+      if (!FA2CtaTileQ16FitsSmem(qk, head_dim, kv_dtype_bytes, q_dtype_bytes)) {
+        std::ostringstream err_msg;
+        err_msg << "fixed_cta_tile_q=16 does not fit this GPU's shared memory with head_dim="
+                << head_dim << ", head_dim_qk=" << qk << " and " << kv_dtype_bytes
+                << "-byte KV; use fixed_cta_tile_q=64";
+        FLASHINFER_ERROR(err_msg.str());
+      }
+    }
+    // A lower bound of every layout's shared memory: the Q tile plus one 16-row
+    // K step. Below it the kernel can only fail at launch, e.g. tile 128 with
+    // QK=448 and a 16-bit query needs 114688 bytes for the Q tile alone.
+    const uint64_t min_smem =
+        uint64_t(fixed_cta_tile_q) * qk * q_dtype_bytes + uint64_t(16) * qk * kv_dtype_bytes;
+    const uint32_t max_smem = GetMaxSharedMemoryPerBlockOptin();
+    if (min_smem > max_smem) {
       std::ostringstream err_msg;
-      err_msg << "fixed_cta_tile_q=16 does not fit this GPU's shared memory with head_dim="
-              << head_dim << ", head_dim_qk=" << qk << " and " << kv_dtype_bytes
-              << "-byte KV; use fixed_cta_tile_q=64";
+      err_msg << "fixed_cta_tile_q=" << fixed_cta_tile_q << " needs at least " << min_smem
+              << " bytes of shared memory with head_dim_qk=" << qk << ", but this GPU allows "
+              << max_smem << " per block; use a smaller tile";
       FLASHINFER_ERROR(err_msg.str());
     }
     cta_tile_q = fixed_cta_tile_q;
@@ -818,7 +840,7 @@ inline cudaError_t PrefillPlanImpl(
     int64_t num_colocated_ctas,  // for POD attention, limit prefill
                                  // splits by #colocated decode CTAs
     int64_t uniform_q_len, bool fixed_uniform_q_len, cudaStream_t stream,
-    uint32_t kv_dtype_bytes = 2) {
+    uint32_t kv_dtype_bytes = 2, uint32_t q_dtype_bytes = 2) {
   (void)sizeof_dtype_o;
   if (num_qo_heads % num_kv_heads != 0) {
     std::ostringstream err_msg;
@@ -844,7 +866,7 @@ inline cudaError_t PrefillPlanImpl(
                              num_kv_heads, head_dim_vo, page_size, max_batch_size_if_split,
                              enable_cuda_graph, window_left, fixed_split_size, disable_split_kv,
                              fixed_cta_tile_q, uniform_q_len, fixed_uniform_q_len, head_dim_qk,
-                             kv_dtype_bytes);
+                             kv_dtype_bytes, q_dtype_bytes);
 
   plan_info.cta_tile_q = cta_tile_q;
   plan_info.total_num_rows = total_num_rows;
@@ -988,16 +1010,17 @@ inline cudaError_t PrefillPlan(void* float_buffer, size_t float_workspace_size_i
                                int64_t num_colocated_ctas,  // for POD attention, limit prefill
                                                             // splits by #colocated decode CTAs
                                int64_t uniform_q_len, bool fixed_uniform_q_len, cudaStream_t stream,
-                               uint32_t kv_dtype_bytes = 2) {
+                               uint32_t kv_dtype_bytes = 2, uint32_t q_dtype_bytes = 2) {
   size_t used_float_workspace_size = 0;
   size_t used_int_workspace_size = 0;
-  return PrefillPlanImpl<true>(
-      used_float_workspace_size, used_int_workspace_size, float_buffer,
-      float_workspace_size_in_bytes, int_buffer, page_locked_int_buffer,
-      int_workspace_size_in_bytes, plan_info, qo_indptr_h, kv_indptr_h, total_num_rows, batch_size,
-      num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo, page_size, enable_cuda_graph,
-      sizeof_dtype_o, window_left, fixed_split_size, disable_split_kv, fixed_cta_tile_q,
-      num_colocated_ctas, uniform_q_len, fixed_uniform_q_len, stream, kv_dtype_bytes);
+  return PrefillPlanImpl<true>(used_float_workspace_size, used_int_workspace_size, float_buffer,
+                               float_workspace_size_in_bytes, int_buffer, page_locked_int_buffer,
+                               int_workspace_size_in_bytes, plan_info, qo_indptr_h, kv_indptr_h,
+                               total_num_rows, batch_size, num_qo_heads, num_kv_heads, head_dim_qk,
+                               head_dim_vo, page_size, enable_cuda_graph, sizeof_dtype_o,
+                               window_left, fixed_split_size, disable_split_kv, fixed_cta_tile_q,
+                               num_colocated_ctas, uniform_q_len, fixed_uniform_q_len, stream,
+                               kv_dtype_bytes, q_dtype_bytes);
 }
 
 template <typename IdType>
@@ -1008,7 +1031,7 @@ inline cudaError_t PrefillPlanWorkspaceSize(
     bool enable_cuda_graph, uint32_t sizeof_dtype_o, int32_t window_left, int32_t fixed_split_size,
     bool disable_split_kv, int32_t fixed_cta_tile_q, int64_t num_colocated_ctas,
     int64_t uniform_q_len, bool fixed_uniform_q_len, cudaStream_t stream,
-    uint32_t kv_dtype_bytes = 2) {
+    uint32_t kv_dtype_bytes = 2, uint32_t q_dtype_bytes = 2) {
   PrefillPlanInfo plan_info;
   return PrefillPlanImpl<false>(float_workspace_size_in_bytes, int_workspace_size_in_bytes,
                                 /*float_buffer=*/nullptr, /*float_workspace_size_in_bytes=*/0,
@@ -1018,7 +1041,7 @@ inline cudaError_t PrefillPlanWorkspaceSize(
                                 head_dim_qk, head_dim_vo, page_size, enable_cuda_graph,
                                 sizeof_dtype_o, window_left, fixed_split_size, disable_split_kv,
                                 fixed_cta_tile_q, num_colocated_ctas, uniform_q_len,
-                                fixed_uniform_q_len, stream, kv_dtype_bytes);
+                                fixed_uniform_q_len, stream, kv_dtype_bytes, q_dtype_bytes);
 }
 
 inline float cost_function(int qo_len, int kv_len) { return 2 * float(qo_len) + kv_len; }

@@ -83,6 +83,8 @@ def test_batch_decode_tensor_cores(
 ):
     if head_dim >= 256 and fixed_cta_tile_q == 128:
         pytest.skip("fixed_cta_tile_q=128 is not supported with head_dim >= 256")
+    if fixed_cta_tile_q == 16 and torch.cuda.get_device_capability()[0] < 8:
+        pytest.skip("fixed_cta_tile_q=16 requires SM80 or newer")
     num_qo_heads = num_kv_heads * group_size
     q = torch.randn(
         batch_size, num_qo_heads, head_dim, device="cuda:0", dtype=torch.float16
@@ -227,6 +229,8 @@ def test_batch_prefill_tensor_cores(
 ):
     if head_dim >= 256 and fixed_cta_tile_q == 128:
         pytest.skip("fixed_cta_tile_q=128 is not supported with head_dim >= 256")
+    if fixed_cta_tile_q == 16 and torch.cuda.get_device_capability()[0] < 8:
+        pytest.skip("fixed_cta_tile_q=16 requires SM80 or newer")
     num_qo_heads = num_kv_heads * group_size
     q = torch.randn(
         batch_size * qo_len,

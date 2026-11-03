@@ -44,6 +44,16 @@ using namespace flashinfer;
 using tvm::ffi::Array;
 using tvm::ffi::Optional;
 
+namespace {
+// The scheduler takes the tile as int32_t: check the full value first so that an
+// out-of-range one (e.g. 2**32 + 16) cannot narrow into an accepted tile.
+void CheckFixedCtaTileQ(int64_t fixed_cta_tile_q) {
+  TVM_FFI_ICHECK(fixed_cta_tile_q == -1 || fixed_cta_tile_q == 16 || fixed_cta_tile_q == 32 ||
+                 fixed_cta_tile_q == 64 || fixed_cta_tile_q == 128)
+      << "fixed_cta_tile_q should be -1 or one of {16, 32, 64, 128}, but got " << fixed_cta_tile_q;
+}
+}  // namespace
+
 Array<int64_t> BatchPrefillWithKVCachePlan(
     TensorView float_workspace_buffer, TensorView int_workspace_buffer,
     TensorView page_locked_int_workspace_buffer, TensorView qo_indptr, TensorView kv_indptr,
@@ -57,6 +67,7 @@ Array<int64_t> BatchPrefillWithKVCachePlan(
   size_t int_workspace_size_in_bytes =
       int_workspace_buffer.size(0) * get_element_size(int_workspace_buffer);
 
+  CheckFixedCtaTileQ(fixed_cta_tile_q);
   PrefillPlanInfo plan_info;
 
   ffi::CUDADeviceGuard device_guard(float_workspace_buffer.device().device_id);
@@ -69,7 +80,7 @@ Array<int64_t> BatchPrefillWithKVCachePlan(
       num_kv_heads, head_dim_qk, head_dim_vo, page_size, enable_cuda_graph,
       /*sizeof_dtype_o=*/2, window_left, fixed_split_size, disable_split_kv, fixed_cta_tile_q,
       num_colocated_ctas, uniform_q_len, fixed_uniform_q_len, stream,
-      /*kv_dtype_bytes=*/sizeof(DTypeKV));
+      /*kv_dtype_bytes=*/sizeof(DTypeKV), /*q_dtype_bytes=*/sizeof(DTypeQ));
 
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "Failed to plan prefill with error: " << cudaGetErrorString(status);
@@ -86,6 +97,7 @@ Array<int64_t> BatchPrefillWithKVCacheWorkspaceSize(
     bool fixed_uniform_q_len = false) {
   (void)kv_len_arr;
   (void)causal;
+  CheckFixedCtaTileQ(fixed_cta_tile_q);
   size_t float_workspace_size_in_bytes = 0;
   size_t int_workspace_size_in_bytes = 0;
 
@@ -97,7 +109,7 @@ Array<int64_t> BatchPrefillWithKVCacheWorkspaceSize(
       total_num_rows, batch_size, num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo, page_size,
       enable_cuda_graph, /*sizeof_dtype_o=*/2, window_left, fixed_split_size, disable_split_kv,
       fixed_cta_tile_q, num_colocated_ctas, uniform_q_len, fixed_uniform_q_len, stream,
-      /*kv_dtype_bytes=*/sizeof(DTypeKV));
+      /*kv_dtype_bytes=*/sizeof(DTypeKV), /*q_dtype_bytes=*/sizeof(DTypeQ));
 
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "Failed to calculate prefill workspace size with error: " << cudaGetErrorString(status);
