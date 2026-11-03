@@ -103,7 +103,8 @@ class CakeFmhaDecodeRoute:
     # one identifier ``flashinfer.jit.cake_fmha_aligned_hd64.ALIGNED_HD64_BF16``
     # that ``aligned_hd64_selected`` chose; aligned hd256 q1 decode: the
     # identifier (``flashinfer.jit.cake_fmha_aligned_hd256.ALIGNED_HD256_BF16`` /
-    # ``ALIGNED_HD256_CGA2_BF16`` / ``ALIGNED_HD256_CGA4_BF16``) of the program
+    # ``ALIGNED_HD256_CGA2_BF16`` / ``ALIGNED_HD256_CGA4_BF16`` /
+    # ``ALIGNED_HD256_CGA8_BF16``) of the program
     # ``aligned_hd256_program`` named; aligned speculative decode (1 to 4 query
     # tokens per request): the identifier
     # ``flashinfer.jit.cake_fmha_aligned_mtp_q32.ALIGNED_MTP_Q32_CGA2_BF16`` of the
@@ -328,11 +329,11 @@ _ALIGNED_HD64_SKIP_CORR_THRESHOLD = 0.0
 
 # The aligned hd256 q1 decode programs are likewise a generated in-tree unit,
 # ``csrc/cake_fmha_aligned_hd256/`` with the loader
-# ``flashinfer.jit.cake_fmha_aligned_hd256``: three BF16 programs shipped for
+# ``flashinfer.jit.cake_fmha_aligned_hd256``: four BF16 programs shipped for
 # sm_100a and sm_103a whose 8-row query tile holds a KV head's eight query
 # heads.  The persistent program runs one CTA per (request, KV head) tile and
 # feeds its persistent loop through cluster launch control; the cluster
-# programs split each tile's KV sequence over a cluster of 2 or 4 CTAs and
+# programs split each tile's KV sequence over a cluster of 2, 4 or 8 CTAs and
 # merge the partials through distributed shared memory.
 # ``aligned_hd256_program`` names a launch's program as ``(kind, CTAs per
 # tile)``; the route's component chain is that program's identifier below.  The
@@ -344,6 +345,7 @@ _ALIGNED_HD256_PROGRAM_IDS: dict[tuple[str, int], str] = {
     ("persistent", 1): "ALIGNED_HD256_BF16",
     ("cga", 2): "ALIGNED_HD256_CGA2_BF16",
     ("cga", 4): "ALIGNED_HD256_CGA4_BF16",
+    ("cga", 8): "ALIGNED_HD256_CGA8_BF16",
 }
 # Program identifier -> (CTAs per (request, KV head) tile, program name): the
 # CTAs are the launch grid's x extent and the record's cluster ``(CTAs, 1, 1)``.
@@ -351,9 +353,10 @@ _ALIGNED_HD256_PROGRAMS: dict[str, tuple[int, str]] = {
     "ALIGNED_HD256_BF16": (1, "cake_fmha_aligned_hd256_50326788c79371d913ba"),
     "ALIGNED_HD256_CGA2_BF16": (2, "cake_fmha_aligned_hd256_3d8340c8d395be9c7587"),
     "ALIGNED_HD256_CGA4_BF16": (4, "cake_fmha_aligned_hd256_7ba007d1a2873ce28e12"),
+    "ALIGNED_HD256_CGA8_BF16": (8, "cake_fmha_aligned_hd256_dc665a26118a54d4ccb7"),
 }
 # The bindings' host parameters, in the kernels' order (then the grid); the
-# three programs share them.
+# four programs share them.
 _ALIGNED_HD256_HOST_PARAMS = (
     "Q",
     "K",
@@ -1204,7 +1207,7 @@ def cake_fmha_aligned_hd256_launch_grid(
     program, batch_size: int, num_kv_heads: int
 ) -> tuple[int, int, int]:
     """The launch grid of one aligned hd256 q1 decode: ``(CTAs, num_kv_heads,
-    batch_size)``, one CTA (the persistent program) or one cluster of 2 / 4 CTAs
+    batch_size)``, one CTA (the persistent program) or one cluster of 2 / 4 / 8 CTAs
     (``blockIdx.x`` the cluster rank) per (request, KV head) tile, ``blockIdx.y``
     the KV head and ``blockIdx.z`` the request.  ``program`` is the generated
     loader's ``CakeProgram`` record; its ``cluster`` is ``(CTAs, 1, 1)``.  The
@@ -2063,7 +2066,7 @@ def aligned_hd64_selected(
 # program of cluster size N.  ``arch`` is the source's target spelling and ``sm_count``
 # the device's multiprocessor count.
 #
-# Copied at source revision ``94f177693211b2abc624c487ffd64bb1f8094a17``;
+# Copied at source revision ``38d7a8878e025385ab9f995b1b0ae5d722685dc2``;
 # ``tests/attention/test_cake_fmha_aligned_hd256.py`` holds the source selector
 # test's expectations.
 # ---------------------------------------------------------------------------
@@ -2092,6 +2095,7 @@ SEL_HD256_PINS = {
         ((512, 32768), ("persistent", 1)),  # uniform_b64_hkv8_s32768
         ((1024, 32768), ("persistent", 1)),  # uniform_b128_hkv8_s32768
         ((1024, 4096), ("persistent", 1)),  # uniform_b128_hkv8_s4096
+        ((8, 4096), ("cga", 8)),  # uniform_b1_hkv8_s4096
     ),
     "sm_103a": (  # derived at 152 SMs
         ((16, 237569), None),  # agentx_b16_hkv1
@@ -2107,6 +2111,7 @@ SEL_HD256_PINS = {
         ((512, 32768), None),  # uniform_b64_hkv8_s32768
         ((1024, 32768), ("persistent", 1)),  # uniform_b128_hkv8_s32768
         ((1024, 4096), ("persistent", 1)),  # uniform_b128_hkv8_s4096
+        ((8, 4096), ("cga", 8)),  # uniform_b1_hkv8_s4096
     ),
 }
 # Band rectangles per target: ((tiles_lo, tiles_hi, kv_lo, kv_hi), program), inclusive
@@ -4625,7 +4630,7 @@ def select_cake_fmha_decode_route(
             # selector's bands for this target read one faster than the
             # balanced route below and the trtllm-gen split at this device's
             # SM count picks that program's kernel class (the persistent
-            # program, or the cluster program of 2 / 4 CTAs).  They read the
+            # program, or the cluster program of 2 / 4 / 8 CTAs).  They read the
             # K / V pools and the query in place (contiguous; their TMA maps
             # derive every stride from the shapes) with an int32 page table
             # and lengths.
