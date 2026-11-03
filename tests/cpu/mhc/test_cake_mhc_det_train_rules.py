@@ -224,7 +224,7 @@ LIBRARY_ARCHES = {
     "cake_mhc_det_train_bwd_token__dot_ao8_trows_dyn": ("sm_100a", "sm_103a"),
     "cake_mhc_det_train_bwd_token__rt64": ("sm_100a", "sm_103a", "sm_107a"),
     "cake_mhc_det_train_fn_split": ("sm_100a", "sm_103a", "sm_107a"),
-    "cake_mhc_det_train_fn_split__dual": ("sm_100a", "sm_103a"),
+    "cake_mhc_det_train_fn_split__dual": ("sm_100a", "sm_103a", "sm_107a"),
     "cake_mhc_det_train_fn_split__tv128": ("sm_100a", "sm_103a"),
     "cake_mhc_det_train_fn_split__tv128_t128": ("sm_107a",),
     "cake_mhc_det_train_fwd_coef__g2_el": ("sm_107a",),
@@ -317,6 +317,7 @@ RECORD_SCALARS = {
 FN_SPLIT_CARRY = {
     "sm_100a": {"record": "cake_mhc_det_train_fn_split__dual", "bands": ((0, 4096),)},
     "sm_103a": {"record": "cake_mhc_det_train_fn_split__dual", "bands": ((0, 2048),)},
+    "sm_107a": {"record": "cake_mhc_det_train_fn_split__dual", "bands": ((0, 4096),)},
 }
 # The reference master's per-architecture tables of record (generated from the master text).
 TABLES = {
@@ -1249,7 +1250,7 @@ RECORD_ARCHES = {
     "cake_mhc_det_train_fn_split": ("sm_100a", "sm_103a", "sm_107a"),
     "cake_mhc_det_train_fn_split__tv128__t": ("sm_100a", "sm_103a"),
     "cake_mhc_det_train_fn_split__tv128_t128__t": ("sm_107a",),
-    "cake_mhc_det_train_fn_split__dual": ("sm_100a", "sm_103a"),
+    "cake_mhc_det_train_fn_split__dual": ("sm_100a", "sm_103a", "sm_107a"),
     "cake_mhc_det_train_fwd_map__nsx_st5_mb1": ("sm_103a",),
     "cake_mhc_det_train_fwd_map__nsx": ("sm_103a",),
     "cake_mhc_det_train_fwd_map__nsx__tk": ("sm_103a",),
