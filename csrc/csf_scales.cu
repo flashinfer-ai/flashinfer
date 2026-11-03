@@ -307,6 +307,7 @@ void CheckCsfScales(TensorView scales, TensorView fixed) {
   CHECK_INPUT_AND_TYPE(fixed, dl_uint8);
   CHECK_DIM(3, scales);
   CHECK_DIM(3, fixed);
+  CHECK_DEVICE(fixed, scales);
   const int64_t rows = scales.size(1), cols = scales.size(2);
   TVM_FFI_ICHECK(rows % kSlabRows == 0 && cols % 2 == 0 && cols > 0 && rows * cols <= 1 << 24)
       << "CSF scales need rows % 16 == 0, even cols and rows * cols <= 2^24, got " << rows << " x "
@@ -323,6 +324,7 @@ int NumBlocks(int64_t num_rows) { return static_cast<int>((num_rows + kWarps - 1
 void csf_encode_rows(TensorView scales, TensorView fixed, TensorView row_exceptions) {
   CheckCsfScales(scales, fixed);
   CHECK_INPUT_AND_TYPE(row_exceptions, dl_int32);
+  CHECK_DEVICE(row_exceptions, scales);
   const int64_t num_rows = scales.size(0) * scales.size(1);
   TVM_FFI_ICHECK_EQ(row_exceptions.numel(), num_rows);
   if (num_rows == 0) return;
@@ -338,6 +340,8 @@ void csf_encode_exceptions(TensorView scales, TensorView fixed, TensorView row_o
   CheckCsfScales(scales, fixed);
   CHECK_INPUT_AND_TYPE(row_offsets, dl_int64);
   CHECK_INPUT_AND_TYPE(exceptions, dl_uint32);
+  CHECK_DEVICE(row_offsets, scales);
+  CHECK_DEVICE(exceptions, scales);
   const int64_t num_rows = scales.size(0) * scales.size(1);
   TVM_FFI_ICHECK_EQ(row_offsets.numel(), num_rows + 1);
   if (exceptions.numel() == 0) return;
@@ -359,6 +363,8 @@ void csf_expand(TensorView fixed, TensorView exceptions, TensorView exc_offsets,
   CHECK_INPUT_AND_TYPE(out, dl_uint8);
   CHECK_DIM(3, fixed);
   CHECK_DIM(3, out);
+  CHECK_DEVICE(exceptions, fixed);
+  CHECK_DEVICE(exc_offsets, fixed);
   CHECK_DEVICE(out, fixed);
   const int64_t num_experts = fixed.size(0), slabs = fixed.size(1);
   const int64_t rows = slabs * kSlabRows, cols = (fixed.size(2) / kSlabRows - 1) * 2;
