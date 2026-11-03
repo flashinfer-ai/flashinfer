@@ -923,7 +923,8 @@ def test_k1_excluded_token_counts():
 
 
 def test_k1_rule_table_entries_decide_the_row(monkeypatch):
-    kw = dict(L=1, M=4096, N=32, K=16231, out_f32=True)
+    # 16172 tokens: 16231 is a 216-SM token count of K1_SPLIT_RULE_EXCLUDED_TOKENS for sm_107a 4096 -> 32 FP32
+    kw = dict(L=1, M=4096, N=32, K=16172, out_f32=True)
     key = ("sm_103a", 1, 4096, 32, "f32")
     assert cake_backend.k1_plan(arch="sm_103a", sm_count=152, **kw) == (64, 2)
     monkeypatch.setitem(cake_backend.K1_SPLIT_RULES, key, None)
@@ -955,8 +956,9 @@ def test_k1_rule_table_entries_decide_the_row(monkeypatch):
 def test_k1_per_sm_count_tables_decide_only_their_own_sm_count(monkeypatch):
     """Below the architecture's SM-count floor a part takes the table of :data:`K1_SPLIT_RULES_BY_SM` for its exact
     SM count; another SM count below the floor runs the deterministic program, and from the floor up the verdicts of
-    :data:`K1_SPLIT_RULES` decide as before (a per-SM-count table never changes the 216-SM routing)."""
-    kw = dict(L=1, M=4096, N=32, K=16231, out_f32=True)
+    :data:`K1_SPLIT_RULES` decide as before (a per-SM-count table never changes the 216-SM routing).  At 16172 tokens:
+    16231 is a 216-SM token count of :data:`K1_SPLIT_RULE_EXCLUDED_TOKENS` for ``4096 -> 32`` FP32."""
+    kw = dict(L=1, M=4096, N=32, K=16172, out_f32=True)
     key = ("sm_107a", 1, 4096, 32, "f32")
     tables = dict(cake_backend.K1_SPLIT_RULES_BY_SM)
     tables[("sm_107a", 210)] = {key: (64, 2)}
