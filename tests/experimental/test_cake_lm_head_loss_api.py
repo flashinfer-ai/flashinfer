@@ -556,7 +556,7 @@ def _require_device():
     if not torch.cuda.is_available() or torch.cuda.get_device_capability(0) not in (
         det_backend.SUPPORTED_COMPUTE_CAPABILITIES
     ):
-        pytest.skip("requires a compute capability 10.0 / 10.3 device")
+        pytest.skip("requires a compute capability 10.0 / 10.3 / 10.7 device")
     if not det_backend.generated_program_available(torch.device("cuda"), entry="loss"):
         pytest.skip(
             "the deterministic package's programs are not registered for this device"

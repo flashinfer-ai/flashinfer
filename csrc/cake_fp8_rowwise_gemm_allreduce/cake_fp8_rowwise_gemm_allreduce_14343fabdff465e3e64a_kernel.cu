@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ * Copyright (c) 2026 by FlashInfer team.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -31,16 +31,13 @@
 #define SMEM_STAGING_OFF 132096
 #define SMEM_STAGING_STAGE_BYTES 16384
 #define SMEM_STAGING_STRIDE 16384
-#define SMEM_COMM_OFF 197632
-#define SMEM_COMM_STAGE_BYTES 24576
-#define SMEM_COMM_STRIDE 24576
-#define SMEM_TOTAL 222208
+#define SMEM_TOTAL 197632
 #define THREADS 384
 
 extern "C" {
 
 __global__ __launch_bounds__(THREADS)
-    __cluster_dims__(2, 1, 1) void kernel_cake_fp8_rowwise_gemm_allreduce_40d34f41bf331a3a97a7(
+    __cluster_dims__(2, 1, 1) void kernel_cake_fp8_rowwise_gemm_allreduce_14343fabdff465e3e64a(
         const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap W,
         const __grid_constant__ CUtensorMap OUT, __nv_bfloat16* __restrict__ out_ptr,
         float* __restrict__ sa, float* __restrict__ sw, unsigned int* __restrict__ ctl,
@@ -69,7 +66,6 @@ __global__ __launch_bounds__(THREADS)
 #define tma_free_addr (mbar_base + 32)
 #define mainloop_done_addr (mbar_base + 64)
 #define epilogue_done_addr (mbar_base + 80)
-#define pull_bar_addr (mbar_base + 96)
 
   const int bid = blockIdx.x;
   const int num_bids = gridDim.x;
@@ -88,11 +84,9 @@ __global__ __launch_bounds__(THREADS)
   const int smem_w_addr = smem + SMEM_SMEM_W_OFF;
   __nv_bfloat16* staging = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_STAGING_OFF);
   const int staging_addr = smem + SMEM_STAGING_OFF;
-  uint8_t* comm = reinterpret_cast<uint8_t*>(smem_raw + SMEM_COMM_OFF);
-  const int comm_addr = smem + SMEM_COMM_OFF;
 
-  // Mbarrier init (5 pipeline groups, 0 ordered-sequence groups, 14 barriers)
-  // Mbarriers at smem_raw[0..112)
+  // Mbarrier init (4 pipeline groups, 0 ordered-sequence groups, 12 barriers)
+  // Mbarriers at smem_raw[0..96)
 
   if (warp == 0) {
     uint32_t leader = elect_sync();
@@ -115,9 +109,6 @@ __global__ __launch_bounds__(THREADS)
       // epilogue_done: 2 barriers, init_count=8
       mbarrier_init(smem + 80, 8);
       mbarrier_init(smem + 88, 8);
-      // pull_bar: 2 barriers, init_count=1
-      mbarrier_init(smem + 96, 1);
-      mbarrier_init(smem + 104, 1);
       asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     }
   }
@@ -128,9 +119,9 @@ __global__ __launch_bounds__(THREADS)
   asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
 
   // TMEM alloc (512 columns, 512 used)
-  volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 112);
+  volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 96);
   if (warp == 0) {
-    int _tmem_hold = smem + 112;
+    int _tmem_hold = smem + 96;
     asm volatile(
         "tcgen05.alloc.cta_group::2.sync.aligned.shared::cta.b32 [%0], %1;" ::"r"(_tmem_hold),
         "r"(512)
@@ -158,7 +149,7 @@ __global__ __launch_bounds__(THREADS)
       unsigned int step_e = num_clusters;
       int rank_e = pg_rank;
       int world_e = pg_world;
-      int slots_e = ((world_e > 2) ? world_e : 1);
+      int slots_e = 1;
       const int epi_warp = warp % 4;
       const int local_row = epi_warp * 32 + lane;
       const int epi_tid = epi_warp * 32 + lane;
@@ -291,36 +282,22 @@ __global__ __launch_bounds__(THREADS)
         if (warp == 0) {
           if (elect_sync()) {
             if (c_tile < C) {
-              if (owner_t == rank_e) {
-#pragma unroll
-                for (int j_1 = 0; j_1 < 4; j_1++) {
-                  tma_store_3d((&OUT), 0, off_m, off_n / 64 + j_1,
-                               staging_addr + (unsigned int)(j_1 * 16384));
-                }
-                asm volatile("cp.async.bulk.commit_group;");
-                asm volatile("cp.async.bulk.wait_group 0;");
-                asm volatile("fence.proxy.async;");
-              } else {
-                // nvlink_push: peers.ptrs[owner_t] + (((unsigned long long)c_tile * (unsigned long
-                // long)slots_e + (unsigned long long)k_e) * (unsigned long long)grid_n + (unsigned
-                // long long)bid_n) * 65536 <- smem(staging_addr), 65536B
-                {
-                  void* __remote = (void*)((char*)((S_peers).ptrs[owner_t]) +
-                                           (uint64_t)((((unsigned long long)c_tile *
-                                                            (unsigned long long)slots_e +
-                                                        (unsigned long long)k_e) *
-                                                           (unsigned long long)grid_n +
-                                                       (unsigned long long)bid_n) *
-                                                      65536));
-                  asm volatile(
-                      "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;" ::"l"(__remote),
-                      "r"(staging_addr), "r"((uint32_t)(65536))
-                      : "memory");
-                }
-                asm volatile("cp.async.bulk.commit_group;");
-                asm volatile("cp.async.bulk.wait_group 0;");
-                asm volatile("fence.proxy.async;");
+              // nvlink_push: peers.ptrs[rank_e] + ((unsigned long long)c_tile * (unsigned long
+              // long)grid_n + (unsigned long long)bid_n) * 65536 <- smem(staging_addr), 65536B
+              {
+                void* __remote =
+                    (void*)((char*)((S_peers).ptrs[rank_e]) +
+                            (uint64_t)(((unsigned long long)c_tile * (unsigned long long)grid_n +
+                                        (unsigned long long)bid_n) *
+                                       65536));
+                asm volatile(
+                    "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;" ::"l"(__remote),
+                    "r"(staging_addr), "r"((uint32_t)(65536))
+                    : "memory");
               }
+              asm volatile("cp.async.bulk.commit_group;");
+              asm volatile("cp.async.bulk.wait_group 0;");
+              asm volatile("fence.proxy.async;");
               uint32_t _atomic_inc_old_4;
               asm volatile("atom.acq_rel.gpu.global.inc.u32 %0, [%1], %2;"
                            : "=r"(_atomic_inc_old_4)
@@ -564,14 +541,17 @@ __global__ __launch_bounds__(THREADS)
       int rank_r = pg_rank;
       int world_r = pg_world;
       unsigned int world_ru = (unsigned int)world_r;
-      int slots_r = ((world_r > 2) ? world_r : 1);
+      int slots_r = 1;
       uint32_t _relaxed_ld_3;
       asm volatile("ld.relaxed.gpu.u32 %0, [%1];"
                    : "=r"(_relaxed_ld_3)
                    : "l"(ctl + (2 * C_cap + 1024 + 1))
                    : "memory");
       unsigned int e_r = _relaxed_ld_3 + 1;
-      int g_eff = ((gridDim.x < 4) ? gridDim.x : 4);
+      int g_cap = ((gridDim.x < 4) ? gridDim.x : 4);
+      int g_row = C / world_r / 2;
+      int g_row1 = ((g_row > 1) ? g_row : 1);
+      int g_eff = ((g_row1 < g_cap) ? g_row1 : g_cap);
       int g = blockIdx.x % g_eff;
       int cta_in_g = blockIdx.x / g_eff;
       int n_g = (gridDim.x - 1 - g) / g_eff + 1;
@@ -581,9 +561,7 @@ __global__ __launch_bounds__(THREADS)
       int warps_g = n_g * 4;
       int n_blocks = grid_n * 16;
       unsigned long long slot_elems = (unsigned long long)grid_n * 32768;
-      int slot_r = comm_addr + (unsigned int)(rw * 4096);
-      int y_slot_r = slots_r - 1;
-      unsigned long long y_off = (unsigned long long)y_slot_r * slot_elems;
+      int chunk_vecs_r = grid_n * 4096;
 #pragma unroll 1
       for (int c = rank_r + g * world_r; c < C; c += g_eff * world_r) {
         if (warp == 6) {
@@ -615,18 +593,30 @@ __global__ __launch_bounds__(THREADS)
         asm volatile("fence.acquire.sys;" ::: "memory");
         unsigned long long chunk_elem = (unsigned long long)c * (unsigned long long)slots_r *
                                         (unsigned long long)grid_n * 32768;
+        int steal_slot = 2 * C_cap + 1024 + 2 + c;
+        int n_vblocks = chunk_vecs_r / 32;
+        int steal_trips = 2 * ((n_vblocks + warps_g - 1) / warps_g);
+        unsigned int b_fetch = 0;
+        if (lane == 0) {
+          unsigned int _atomic_old_0 = atomicAdd(&ctl[steal_slot], 1);
+          b_fetch = _atomic_old_0;
+        }
+        int _uniform_0 = make_warp_uniform(b_fetch);
+        int b_cur = _uniform_0;
 #pragma unroll 1
-        for (int b = warp_g; b < n_blocks; b += warps_g) {
+        for (int i = 0; i < steal_trips; i++) {
+          if (b_cur < n_vblocks) {
+            if (i < steal_trips - 1) {
+              if (lane == 0) {
+                unsigned int _atomic_old_1 = atomicAdd(&ctl[steal_slot], 1);
+                b_fetch = _atomic_old_1;
+              }
+            }
+            int _uniform_1 = make_warp_uniform(b_fetch);
+            int b_next = _uniform_1;
 #pragma unroll
-          for (int w = 0; w < 4; w++) {
-            int rows_w[2];
-            unsigned long long o_w[2];
-            unsigned long long s_w[2];
-            float y[16];
-            float pv[16];
-#pragma unroll
-            for (int i = 0; i < 2; i++) {
-              int v = b * 256 + (w * 2 + i) * 32 + lane;
+            for (int j_1 = 0; j_1 < 1; j_1++) {
+              int v = b_cur * 32 + j_1 * 32 + lane;
               int n_t = v / 4096;
               int w_t = v % 4096;
               int slab = w_t / 1024;
@@ -634,204 +624,101 @@ __global__ __launch_bounds__(THREADS)
               int swz = w_t % 8;
               int col = n_t * 256 + slab * 64 + (swz ^ r & 7) * 8;
               int row_c = c * 128 + r;
-              rows_w[i] = row_c;
-              s_w[i] = chunk_elem + (unsigned long long)v * 8;
-              o_w[i] = (unsigned long long)row_c * (unsigned long long)N + (unsigned long long)col;
-            }
-            if (0 == rank_r) {
+              unsigned long long s_elem = chunk_elem + (unsigned long long)v * 8;
+              unsigned long long o_elem =
+                  (unsigned long long)row_c * (unsigned long long)N + (unsigned long long)col;
+              if (row_c < M) {
+                float y[8];
+                float pv[56];
+                float _vec_load_4[8];
+                {
+                  const uint4* _vptr_1 = reinterpret_cast<const uint4*>(
+                      reinterpret_cast<__nv_bfloat16*>(S_peers.ptrs[0]) + s_elem + 0);
+                  uint4 _vld_1[1];
 #pragma unroll
-              for (int i_1 = 0; i_1 < 2; i_1++) {
-                int row_i = rows_w[i_1];
-                if (row_i < M) {
-                  unsigned long long o_i = o_w[i_1];
-                  float _vec_load_4[8];
-                  {
-                    const uint4* _vptr_1 = reinterpret_cast<const uint4*>(out_ptr + o_i + 0);
-                    uint4 _vld_1[1];
+                  for (int _blk = 0; _blk < 1; _blk++) {
+                    asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
+                                 : "=r"(_vld_1[_blk].x), "=r"(_vld_1[_blk].y), "=r"(_vld_1[_blk].z),
+                                   "=r"(_vld_1[_blk].w)
+                                 : "l"((const void*)(_vptr_1 + _blk))
+                                 : "memory");
+                    uint32_t* _vpairs_1 = reinterpret_cast<uint32_t*>(&_vld_1[_blk]);
 #pragma unroll
-                    for (int _blk = 0; _blk < 1; _blk++) {
-                      asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-                                   : "=r"(_vld_1[_blk].x), "=r"(_vld_1[_blk].y),
-                                     "=r"(_vld_1[_blk].z), "=r"(_vld_1[_blk].w)
-                                   : "l"((const void*)(_vptr_1 + _blk))
-                                   : "memory");
-                      uint32_t* _vpairs_1 = reinterpret_cast<uint32_t*>(&_vld_1[_blk]);
-#pragma unroll
-                      for (int _pair = 0; _pair < 4; _pair++) {
-                        (&_vec_load_4[0 + _blk * 8 + _pair * 2])[0] =
-                            __uint_as_float(static_cast<uint32_t>(_vpairs_1[_pair]) << 16);
-                        (&_vec_load_4[0 + _blk * 8 + _pair * 2])[1] =
-                            __uint_as_float(static_cast<uint32_t>(_vpairs_1[_pair]) & 0xffff0000u);
-                      }
+                    for (int _pair = 0; _pair < 4; _pair++) {
+                      (&_vec_load_4[0 + _blk * 8 + _pair * 2])[0] =
+                          __uint_as_float(static_cast<uint32_t>(_vpairs_1[_pair]) << 16);
+                      (&_vec_load_4[0 + _blk * 8 + _pair * 2])[1] =
+                          __uint_as_float(static_cast<uint32_t>(_vpairs_1[_pair]) & 0xffff0000u);
                     }
                   }
-#pragma unroll
-                  for (int k = 0; k < 8; k++) {
-                    y[i_1 * 8 + k] = _vec_load_4[k];
-                  }
                 }
-              }
-            } else {
-              int k_s = ((rank_r > 0) ? 0 : -1);
 #pragma unroll
-              for (int i_2 = 0; i_2 < 2; i_2++) {
-                int row_i_1 = rows_w[i_2];
-                if (row_i_1 < M) {
-                  unsigned long long s_i = s_w[i_2];
-                  float _vec_load_5[8];
-                  {
-                    const uint4* _vptr_2 = reinterpret_cast<const uint4*>(
-                        reinterpret_cast<__nv_bfloat16*>(S) +
-                        (s_i + (unsigned long long)k_s * slot_elems) + 0);
-                    uint4 _vld_2[1];
-#pragma unroll
-                    for (int _blk = 0; _blk < 1; _blk++) {
-                      asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-                                   : "=r"(_vld_2[_blk].x), "=r"(_vld_2[_blk].y),
-                                     "=r"(_vld_2[_blk].z), "=r"(_vld_2[_blk].w)
-                                   : "l"((const void*)(_vptr_2 + _blk))
-                                   : "memory");
-                      uint32_t* _vpairs_2 = reinterpret_cast<uint32_t*>(&_vld_2[_blk]);
-#pragma unroll
-                      for (int _pair = 0; _pair < 4; _pair++) {
-                        (&_vec_load_5[0 + _blk * 8 + _pair * 2])[0] =
-                            __uint_as_float(static_cast<uint32_t>(_vpairs_2[_pair]) << 16);
-                        (&_vec_load_5[0 + _blk * 8 + _pair * 2])[1] =
-                            __uint_as_float(static_cast<uint32_t>(_vpairs_2[_pair]) & 0xffff0000u);
-                      }
-                    }
-                  }
-#pragma unroll
-                  for (int k_1 = 0; k_1 < 8; k_1++) {
-                    y[i_2 * 8 + k_1] = _vec_load_5[k_1];
-                  }
+                for (int k = 0; k < 8; k++) {
+                  y[k] = _vec_load_4[k];
                 }
-              }
-            }
-#pragma unroll 1
-            for (int s = 1; s < world_r; s++) {
-              if (s == rank_r) {
 #pragma unroll
-                for (int i_3 = 0; i_3 < 2; i_3++) {
-                  int row_i_2 = rows_w[i_3];
-                  if (row_i_2 < M) {
-                    unsigned long long o_i_1 = o_w[i_3];
-                    float _vec_load_6[8];
+                for (int s = 1; s < 8; s++) {
+                  if (world_r > s) {
+                    float _vec_load_5[8];
                     {
-                      const uint4* _vptr_3 = reinterpret_cast<const uint4*>(out_ptr + o_i_1 + 0);
-                      uint4 _vld_3[1];
+                      const uint4* _vptr_2 = reinterpret_cast<const uint4*>(
+                          reinterpret_cast<__nv_bfloat16*>(S_peers.ptrs[s]) + s_elem + 0);
+                      uint4 _vld_2[1];
 #pragma unroll
                       for (int _blk = 0; _blk < 1; _blk++) {
                         asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-                                     : "=r"(_vld_3[_blk].x), "=r"(_vld_3[_blk].y),
-                                       "=r"(_vld_3[_blk].z), "=r"(_vld_3[_blk].w)
-                                     : "l"((const void*)(_vptr_3 + _blk))
+                                     : "=r"(_vld_2[_blk].x), "=r"(_vld_2[_blk].y),
+                                       "=r"(_vld_2[_blk].z), "=r"(_vld_2[_blk].w)
+                                     : "l"((const void*)(_vptr_2 + _blk))
                                      : "memory");
-                        uint32_t* _vpairs_3 = reinterpret_cast<uint32_t*>(&_vld_3[_blk]);
+                        uint32_t* _vpairs_2 = reinterpret_cast<uint32_t*>(&_vld_2[_blk]);
 #pragma unroll
                         for (int _pair = 0; _pair < 4; _pair++) {
-                          (&_vec_load_6[0 + _blk * 8 + _pair * 2])[0] =
-                              __uint_as_float(static_cast<uint32_t>(_vpairs_3[_pair]) << 16);
-                          (&_vec_load_6[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(
-                              static_cast<uint32_t>(_vpairs_3[_pair]) & 0xffff0000u);
+                          (&_vec_load_5[0 + _blk * 8 + _pair * 2])[0] =
+                              __uint_as_float(static_cast<uint32_t>(_vpairs_2[_pair]) << 16);
+                          (&_vec_load_5[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(
+                              static_cast<uint32_t>(_vpairs_2[_pair]) & 0xffff0000u);
                         }
                       }
                     }
+#pragma unroll
+                    for (int k_1 = 0; k_1 < 8; k_1++) {
+                      pv[(s - 1) * 8 + k_1] = _vec_load_5[k_1];
+                    }
+                  }
+                }
+#pragma unroll
+                for (int s_1 = 1; s_1 < 8; s_1++) {
+                  if (world_r > s_1) {
 #pragma unroll
                     for (int k_2 = 0; k_2 < 8; k_2++) {
-                      pv[i_3 * 8 + k_2] = _vec_load_6[k_2];
+                      y[k_2] = y[k_2] + pv[(s_1 - 1) * 8 + k_2];
                     }
                   }
-                }
-              } else {
-                int k_s_1 = ((rank_r > s) ? s : s - 1);
-#pragma unroll
-                for (int i_4 = 0; i_4 < 2; i_4++) {
-                  int row_i_3 = rows_w[i_4];
-                  if (row_i_3 < M) {
-                    unsigned long long s_i_1 = s_w[i_4];
-                    float _vec_load_7[8];
-                    {
-                      const uint4* _vptr_4 = reinterpret_cast<const uint4*>(
-                          reinterpret_cast<__nv_bfloat16*>(S) +
-                          (s_i_1 + (unsigned long long)k_s_1 * slot_elems) + 0);
-                      uint4 _vld_4[1];
-#pragma unroll
-                      for (int _blk = 0; _blk < 1; _blk++) {
-                        asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-                                     : "=r"(_vld_4[_blk].x), "=r"(_vld_4[_blk].y),
-                                       "=r"(_vld_4[_blk].z), "=r"(_vld_4[_blk].w)
-                                     : "l"((const void*)(_vptr_4 + _blk))
-                                     : "memory");
-                        uint32_t* _vpairs_4 = reinterpret_cast<uint32_t*>(&_vld_4[_blk]);
-#pragma unroll
-                        for (int _pair = 0; _pair < 4; _pair++) {
-                          (&_vec_load_7[0 + _blk * 8 + _pair * 2])[0] =
-                              __uint_as_float(static_cast<uint32_t>(_vpairs_4[_pair]) << 16);
-                          (&_vec_load_7[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(
-                              static_cast<uint32_t>(_vpairs_4[_pair]) & 0xffff0000u);
-                        }
-                      }
-                    }
-#pragma unroll
-                    for (int k_3 = 0; k_3 < 8; k_3++) {
-                      pv[i_4 * 8 + k_3] = _vec_load_7[k_3];
-                    }
-                  }
-                }
-              }
-#pragma unroll
-              for (int i_5 = 0; i_5 < 2; i_5++) {
-                int row_a = rows_w[i_5];
-                if (row_a < M) {
-#pragma unroll
-                  for (int k_4 = 0; k_4 < 8; k_4++) {
-                    y[i_5 * 8 + k_4] = y[i_5 * 8 + k_4] + pv[i_5 * 8 + k_4];
-                  }
-                }
-              }
-            }
-#pragma unroll
-            for (int i_6 = 0; i_6 < 2; i_6++) {
-              int row_s = rows_w[i_6];
-              if (row_s < M) {
-                unsigned long long o_s = o_w[i_6];
-                unsigned long long s_s = s_w[i_6];
-                float y_i[8];
-#pragma unroll
-                for (int k_5 = 0; k_5 < 8; k_5++) {
-                  y_i[k_5] = y[i_6 * 8 + k_5];
                 }
                 {
                   __nv_bfloat162 _pk[4];
-                  _pk[0] = __floats2bfloat162_rn(y_i[0 + 0], y_i[0 + 1]);
-                  _pk[1] = __floats2bfloat162_rn(y_i[0 + 2], y_i[0 + 3]);
-                  _pk[2] = __floats2bfloat162_rn(y_i[0 + 4], y_i[0 + 5]);
-                  _pk[3] = __floats2bfloat162_rn(y_i[0 + 6], y_i[0 + 7]);
-                  *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(out_ptr + o_s))[0]) =
+                  _pk[0] = __floats2bfloat162_rn(y[0 + 0], y[0 + 1]);
+                  _pk[1] = __floats2bfloat162_rn(y[0 + 2], y[0 + 3]);
+                  _pk[2] = __floats2bfloat162_rn(y[0 + 4], y[0 + 5]);
+                  _pk[3] = __floats2bfloat162_rn(y[0 + 6], y[0 + 7]);
+                  *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(out_ptr + o_elem))[0]) =
                       *reinterpret_cast<uint4*>(&_pk[0]);
                 }
-                if (world_r > 1) {
-                  uint32_t y_i_bf16[4];
+                uint32_t y_bf16[4];
 #pragma unroll
-                  for (int _lp = 0; _lp < 4; _lp++) {
-                    __nv_bfloat162 _bf2 =
-                        __float22bfloat162_rn(make_float2(y_i[_lp * 2 + 0], y_i[_lp * 2 + 1 + 0]));
-                    y_i_bf16[_lp] = *(uint32_t*)&_bf2;
-                  }
-                  {
-                    __nv_bfloat162 _pk[4];
-                    _pk[0] = __floats2bfloat162_rn(y_i[0 + 0], y_i[0 + 1]);
-                    _pk[1] = __floats2bfloat162_rn(y_i[0 + 2], y_i[0 + 3]);
-                    _pk[2] = __floats2bfloat162_rn(y_i[0 + 4], y_i[0 + 5]);
-                    _pk[3] = __floats2bfloat162_rn(y_i[0 + 6], y_i[0 + 7]);
-                    *reinterpret_cast<uint4*>(&(
-                        (__nv_bfloat16*)(reinterpret_cast<__nv_bfloat16*>(S) + (s_s + y_off)))[0]) =
-                        *reinterpret_cast<uint4*>(&_pk[0]);
-                  }
+                for (int _lp = 0; _lp < 4; _lp++) {
+                  __nv_bfloat162 _bf2 =
+                      __float22bfloat162_rn(make_float2(y[_lp * 2 + 0], y[_lp * 2 + 1 + 0]));
+                  y_bf16[_lp] = *(uint32_t*)&_bf2;
                 }
+                asm volatile("multimem.st.relaxed.sys.global.v4.f32 [%0], {%1, %2, %3, %4};" ::"l"(
+                                 S_mc + (s_elem / 2)),
+                             "r"(y_bf16[0]), "r"(y_bf16[1]), "r"(y_bf16[2]), "r"(y_bf16[3])
+                             : "memory");
               }
             }
+            b_cur = b_next;
           }
         }
         __threadfence_system();
@@ -843,6 +730,10 @@ __global__ __launch_bounds__(THREADS)
                        : "l"(&ctl[C_cap + c]), "r"(static_cast<uint32_t>(limit_r))
                        : "memory");
           if (_atomic_inc_old_7 == (unsigned int)limit_r) {
+            asm volatile("st.relaxed.sys.u32 [%0], %1;" ::"l"(
+                             (reinterpret_cast<unsigned int*>(ctl) + (steal_slot))),
+                         "r"(static_cast<unsigned int>(0))
+                         : "memory");
             asm volatile(
                 "st.relaxed.sys.u32 [%0], %1;" ::"l"((
                     reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(flags)) + (c))),
@@ -898,7 +789,7 @@ __global__ __launch_bounds__(THREADS)
     {  // drainers_main
       int rank_d = pg_rank;
       int world_d = pg_world;
-      int slots_d = ((world_d > 2) ? world_d : 1);
+      int slots_d = 1;
       uint32_t _relaxed_ld_5;
       asm volatile("ld.relaxed.gpu.u32 %0, [%1];"
                    : "=r"(_relaxed_ld_5)
@@ -910,9 +801,6 @@ __global__ __launch_bounds__(THREADS)
       int lane_d = (blockIdx.x * 2 + dw) * 32 + lane;
       int lanes_d = gridDim.x * 64;
       int n_blocks_d = grid_n * 16;
-      int slot_d = comm_addr + 16384 + (unsigned int)(dw * 4096);
-      int y_slot_d = slots_d - 1;
-      unsigned int pull_phase = 0;
 #pragma unroll 1
       for (int c_1 = 0; c_1 < C; c_1++) {
         if (c_1 % world_d != rank_d) {
@@ -944,59 +832,60 @@ __global__ __launch_bounds__(THREADS)
           }
           asm volatile("bar.sync 3, 64;" ::: "memory");
           asm volatile("fence.acquire.sys;" ::: "memory");
-          unsigned long long chunk_elem_d = ((unsigned long long)c_1 * (unsigned long long)slots_d +
-                                             (unsigned long long)y_slot_d) *
+          unsigned long long chunk_elem_d = (unsigned long long)c_1 * (unsigned long long)slots_d *
                                             (unsigned long long)grid_n * 32768;
-          int owner_d = c_1 % world_d;
 #pragma unroll 1
-          for (int b_1 = blockIdx.x * 2 + dw; b_1 < n_blocks_d; b_1 += gridDim.x * 2) {
-            if (elect_sync()) {
-              mbarrier_arrive_expect_tx(pull_bar_addr + (dw) * 8, 4096);
-              // nvlink_pull: smem(slot_d) <- peers.ptrs[owner_d] + chunk_elem_d * 2 + (unsigned
-              // long long)b_1 * 4096, 4096B
-              {
-                const void* __remote =
-                    (const void*)((const char*)((S_peers).ptrs[owner_d]) +
-                                  (uint64_t)(chunk_elem_d * 2 + (unsigned long long)b_1 * 4096));
-                asm volatile(
-                    "cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes"
-                    " [%0], [%1], %2, [%3];" ::"r"(slot_d),
-                    "l"(__remote), "r"((uint32_t)(4096)), "r"(pull_bar_addr + (dw) * 8)
-                    : "memory");
-              }
-            }
-            mbarrier_wait(pull_bar_addr + (dw) * 8, pull_phase);
-            pull_phase ^= 1;
-            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+          for (int v0 = lane_d; v0 < chunk_vecs; v0 += 8 * lanes_d) {
+            int fan_v[8];
+            int fan_row[8];
+            unsigned long long fan_dst[8];
+            int fan_words[32];
 #pragma unroll
-            for (int j_2 = 0; j_2 < 8; j_2++) {
-              int v_1 = b_1 * 256 + j_2 * 32 + lane;
-              int n_t_1 = v_1 / 4096;
-              int w_t_1 = v_1 % 4096;
+            for (int k_3 = 0; k_3 < 8; k_3++) {
+              int v_k = v0 + k_3 * lanes_d;
+              int n_t_1 = v_k / 4096;
+              int w_t_1 = v_k % 4096;
               int slab_1 = w_t_1 / 1024;
               int r_1 = w_t_1 % 1024 / 8;
               int swz_1 = w_t_1 % 8;
               int col_1 = n_t_1 * 256 + slab_1 * 64 + (swz_1 ^ r_1 & 7) * 8;
               int row_c_1 = c_1 * 128 + r_1;
-              if (row_c_1 < M) {
-                int words_d[4];
-                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                             : "=r"(*reinterpret_cast<uint32_t*>(&words_d[0])),
-                               "=r"(*reinterpret_cast<uint32_t*>(&words_d[(0) + 1])),
-                               "=r"(*reinterpret_cast<uint32_t*>(&words_d[(0) + 2])),
-                               "=r"(*reinterpret_cast<uint32_t*>(&words_d[(0) + 3]))
-                             : "r"(slot_d + (j_2 * 32 + lane) * 16));
-                unsigned long long o_word = ((unsigned long long)row_c_1 * (unsigned long long)N +
-                                             (unsigned long long)col_1) /
-                                            2;
+              unsigned long long o_word = ((unsigned long long)row_c_1 * (unsigned long long)N +
+                                           (unsigned long long)col_1) /
+                                          2;
+              fan_v[k_3] = v_k;
+              fan_row[k_3] = row_c_1;
+              fan_dst[k_3] = o_word;
+              if (v_k < chunk_vecs && row_c_1 < M) {
+                unsigned long long s_word = (chunk_elem_d + (unsigned long long)v_k * 8) / 2;
                 {
-                  int4 _iv4 =
-                      make_int4(words_d[0 + 0], words_d[0 + 1], words_d[0 + 2], words_d[0 + 3]);
-                  *reinterpret_cast<int4*>(reinterpret_cast<int*>(out_ptr) + o_word + 0) = _iv4;
+                  const int4* _ivptr_1 =
+                      reinterpret_cast<const int4*>(reinterpret_cast<int*>(S) + s_word + 0);
+                  int4 _ivld_1;
+                  asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
+                               : "=r"(_ivld_1.x), "=r"(_ivld_1.y), "=r"(_ivld_1.z), "=r"(_ivld_1.w)
+                               : "l"((const void*)(_ivptr_1))
+                               : "memory");
+                  fan_words[k_3 * 4 + 0] = _ivld_1.x;
+                  fan_words[k_3 * 4 + 1] = _ivld_1.y;
+                  fan_words[k_3 * 4 + 2] = _ivld_1.z;
+                  fan_words[k_3 * 4 + 3] = _ivld_1.w;
                 }
               }
             }
-            __syncwarp();
+#pragma unroll
+            for (int k_4 = 0; k_4 < 8; k_4++) {
+              int v_s = fan_v[k_4];
+              int row_s = fan_row[k_4];
+              unsigned long long o_s = fan_dst[k_4];
+              if (v_s < chunk_vecs && row_s < M) {
+                {
+                  int4 _iv4 = make_int4(fan_words[k_4 * 4 + 0], fan_words[k_4 * 4 + 1],
+                                        fan_words[k_4 * 4 + 2], fan_words[k_4 * 4 + 3]);
+                  *reinterpret_cast<int4*>(reinterpret_cast<int*>(out_ptr) + o_s + 0) = _iv4;
+                }
+              }
+            }
           }
         }
       }

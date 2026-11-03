@@ -47,36 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 96
-#define TMEM_ACC_BIG_OFFSET 0
-#define NUM_TMA_PIPE_STAGES 4
-#define NUM_CHUNK_PIPE_STAGES 2
-#define NUM_UNIT_PIPE_STAGES 1
-#define NUM_TK_PIPE_STAGES 2
-#define SMEM_A_S_OFF 0
-#define SMEM_A_S_STAGE_BYTES 16384
-#define SMEM_A_S_STRIDE 28672
-#define SMEM_B1_S_OFF 16384
-#define SMEM_B1_S_STAGE_BYTES 4096
-#define SMEM_B1_S_STRIDE 28672
-#define SMEM_B2_S_OFF 20480
-#define SMEM_B2_S_STAGE_BYTES 4096
-#define SMEM_B2_S_STRIDE 28672
-#define SMEM_B3_S_OFF 24576
-#define SMEM_B3_S_STAGE_BYTES 4096
-#define SMEM_B3_S_STRIDE 28672
-#define SMEM_TK_S_OFF 114688
-#define SMEM_TK_S_STAGE_BYTES 8
-#define SMEM_TK_S_STRIDE 8
-#define SMEM_TK_F_OFF 114696
-#define SMEM_TK_F_STAGE_BYTES 4
-#define SMEM_TK_F_STRIDE 4
-#define SMEM_B01_S_OFF 16384
-#define SMEM_B01_S_STAGE_BYTES 8192
-#define SMEM_B01_S_STRIDE 28672
-#define SMEM_TOTAL 114944
-#define THREADS 192
 #define LAUNCH_MIN_BLOCKS 2
 
 #include <math_constants.h>
@@ -270,8 +240,6 @@ kernel_cake_mhc_det_train_fwd_map__tk_nsx_g2_ol2l_ct_ef_cap(const __grid_constan
     }
 
     __syncthreads();
-
-    // Kernel pre-TMEM ops
     if (warp == 2) {
         if (elect_sync()) {
             int units = m_tiles << log2_pk;

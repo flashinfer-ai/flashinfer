@@ -988,8 +988,8 @@ MODULES: dict[str, dict[str, Any]] = {
         "arg_plan": "bf16_h64_split_qlayout",
         "arches": ["sm_100a", "sm_103a"],
         "identity": {
-            "sm_100a": "2f99b2a7afaaebd7155d2f7a9eb549cd251617145789bcfec11db0eb325baf70",
-            "sm_103a": "bddd4c2730d1e8ff49a6499206753612675f3349a2ead78db4c100590f761eb3",
+            "sm_100a": "fac9b6db2449cb8fa4785c8aeca7d00afe97b124b658e270722501c329897125",
+            "sm_103a": "6b8c4d478b03aeef864d7ddf8afcc8d33aa8e5261a64bac2cd0a66e58ffb6be2",
         },
     },
     "cake_dsv4_88757d413062636b5640": {

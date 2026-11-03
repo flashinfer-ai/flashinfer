@@ -1235,6 +1235,51 @@ def test_checkpoint_replay_is_bitwise(T: int, hidden: int) -> None:
         )
 
 
+@pytest.mark.parametrize("T", (129, 1024, 2049, 4097))
+@pytest.mark.parametrize("bump", (False, True))
+def test_checkpoint_carry(T: int, bump: bool, hidden: int, monkeypatch) -> None:
+    """The checkpoint carry (``save_stats=False`` inside a band of ``cake_jit.FN_SPLIT_CARRY``): the replay's dual-layout
+    split hands the transposed split to the prepare node's backward on a fourth edge, whose ``bwd_finish`` then runs
+    without its split; the gradients are bitwise those of the saved-statistics backward.  An in-place update of ``fn``
+    between the replay and the prepare node's backward (``bump``: a version bump that keeps the values) makes the
+    prepare node's backward split ``fn`` again."""
+    i = _make_inputs(T, hidden=hidden, seed=SEED + 13)
+    carry = loader.fn_split_carry(T, _arch(), hidden) is not None
+    carried: list[bool] = []
+    finish = pkg._backward_finish
+
+    def spy(*args, **kwargs):
+        carried.append(kwargs.get("fnTp") is not None)
+        return finish(*args, **kwargs)
+
+    monkeypatch.setattr(pkg, "_backward_finish", spy)
+    grads, edges = [], []
+    for save_stats in (True, False):
+        leaves = [
+            i[k].clone().requires_grad_(True) for k in ("X", "fn", "scale", "base")
+        ]
+        U, handle = pkg.cake_mhc_det_train_prepare(*leaves, save_stats=save_stats)
+        edges.append(len(handle.edges))
+        B = (U.float() + i["B"].float()).to(BF16)
+        if bump:
+
+            def bump_fn(grad, fn=leaves[1]):
+                with torch.no_grad():
+                    fn.mul_(1.0)
+                return grad
+
+            B.register_hook(bump_fn)
+        Y = pkg.cake_mhc_det_train_finish(leaves[0], B, handle)
+        (Y.float() * i["dY"].float()).sum().backward()
+        grads.append(tuple(leaf.grad.clone() for leaf in leaves))
+    assert edges == [2, 4 if carry else 3], edges
+    assert carried == [False, carry and not bump], carried
+    for saved, replayed in zip(*grads, strict=True):
+        assert torch.equal(saved, replayed), (
+            "the checkpoint carry changed a gradient bit"
+        )
+
+
 def _live_bytes(*, baseline: bool = False) -> int | None:
     """Bytes the live CUDA tensors asked the caching allocator for (its ``requested_bytes``), not the bytes of the
     blocks they occupy (``torch.cuda.memory_allocated``): a tensor placed in a reused free block up to 1 MiB larger

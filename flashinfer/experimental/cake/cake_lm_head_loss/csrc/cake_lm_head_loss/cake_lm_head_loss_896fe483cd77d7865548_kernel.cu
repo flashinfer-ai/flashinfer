@@ -441,8 +441,13 @@ kernel_cake_lm_head_loss_896fe483cd77d7865548(const __grid_constant__ CUtensorMa
                         mbarrier_wait(tma_full_addr + (mma_tma_stage) * 8, _phase_tma_full);
                         asm volatile("tcgen05.fence::after_thread_sync;");
                         int init_flag = ((mm_k == 0) ? 1 : 0);
+#if __CUDA_ARCH__ == 1070
+                        int mm_a_lo = ((((ring_mn_addr) >> 4) & 0x7FFF) | 0x2000000) + (mma_tma_stage) * 3072;
+                        int mm_b_lo = ((((ring_k_addr) >> 4) & 0x7FFF) | 0x4000000) + (mma_tma_stage) * 3072;
+#else
                         int mm_a_lo = ((((ring_mn_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 3072;
                         int mm_b_lo = ((((ring_k_addr) >> 4) & 0x3FFF) | 0x4000000) + (mma_tma_stage) * 3072;
+#endif
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -478,7 +483,11 @@ kernel_cake_lm_head_loss_896fe483cd77d7865548(const __grid_constant__ CUtensorMa
                     "}\n"
                     :: "r"(mm_a_lo), "r"(mm_b_lo), "r"(tmem_accum), "r"(((init_flag) ? 0 : 1)), "r"(((0x10408490U & ~(0x3fU << 17)) | ((static_cast<uint32_t>(sw_n0_1) >> 3) << 17))) : "memory");
                         if (sw_n1_1 > 0) {
+#if __CUDA_ARCH__ == 1070
+                            int mm_b1_lo = ((((ring_k_addr_0) >> 4) & 0x7FFF) | 0x4000000) + (mma_tma_stage) * 3072;
+#else
                             int mm_b1_lo = ((((ring_k_addr_0) >> 4) & 0x3FFF) | 0x4000000) + (mma_tma_stage) * 3072;
+#endif
                             asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
