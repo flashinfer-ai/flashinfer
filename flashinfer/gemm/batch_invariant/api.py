@@ -100,8 +100,12 @@ def sm_count_of(device: torch.device) -> int:
     return torch.cuda.get_device_properties(device).multi_processor_count
 
 
-# the devices' answers to the occupancy query, keyed (device index, cluster size); a failed query is not kept
+# the devices' answers to the occupancy query, keyed (device index, cluster size). A failed query is retried on the
+# next call up to _QUERY_ATTEMPTS times; then the part's nominal capacity is kept in its place (logged once), so a device
+# whose query cannot succeed is neither asked again nor re-ranked on every call.
 _CO_RESIDENT: Dict[Tuple[int, int], int] = {}
+_QUERY_FAILURES: Dict[Tuple[int, int], int] = {}
+_QUERY_ATTEMPTS = 3
 _REGISTERED_DEVICES: set = set()
 
 
@@ -140,8 +144,10 @@ def _query_co_resident_clusters(device_index: int, cluster_size: int) -> int:
 def _co_resident_clusters(
     device_index: int, cluster_size: int, sm_count: int, family: str
 ) -> int:
-    """How many clusters of ``cluster_size`` CTAs the device can host at once: the device's answer, asked once and kept;
-    if the query fails (logged), the part's nominal capacity for this call only, so a later call asks again."""
+    """How many clusters of ``cluster_size`` CTAs the device can host at once: the device's answer, asked once and kept.
+    A failed query (logged) gives the part's nominal capacity; the next call asks again, up to ``_QUERY_ATTEMPTS`` times
+    in all, after which the nominal capacity is kept for the process like an answer (a launch parameter: the bits never
+    depend on it)."""
     from .heuristic import capacity_for
 
     key = (device_index, cluster_size)
@@ -149,22 +155,38 @@ def _co_resident_clusters(
         try:
             _CO_RESIDENT[key] = _query_co_resident_clusters(device_index, cluster_size)
         except Exception as e:  # noqa: BLE001
-            logger.warning(
-                "batch_invariant: the co-resident cluster query failed on device %d (%s: %s); the part's nominal "
-                "cluster capacity is used for this call",
-                device_index,
-                type(e).__name__,
-                e,
-            )
-            return capacity_for(family, sm_count).get(cluster_size) or max(
+            nominal = capacity_for(family, sm_count).get(cluster_size) or max(
                 1, sm_count // cluster_size
             )
+            _QUERY_FAILURES[key] = _QUERY_FAILURES.get(key, 0) + 1
+            if _QUERY_FAILURES[key] >= _QUERY_ATTEMPTS:
+                _CO_RESIDENT[key] = nominal
+                logger.warning(
+                    "batch_invariant: the co-resident cluster query failed %d times on device %d (%s: %s); the part's "
+                    "nominal cluster capacity (%d clusters of %d CTAs) is kept for this process",
+                    _QUERY_FAILURES[key],
+                    device_index,
+                    type(e).__name__,
+                    e,
+                    nominal,
+                    cluster_size,
+                )
+            else:
+                logger.warning(
+                    "batch_invariant: the co-resident cluster query failed on device %d (%s: %s); the part's nominal "
+                    "cluster capacity is used for this call",
+                    device_index,
+                    type(e).__name__,
+                    e,
+                )
+            return nominal
     return _CO_RESIDENT[key]
 
 
 def _register_device(device_index: int, sm_count: int, family: str) -> None:
-    """Once per device (again after a failed query): the device's L2 size and the co-resident cluster counts of the
-    cluster sizes the space uses, into the heuristic's tables; only successful queries are recorded."""
+    """Once per device (again after a failed query, until its retries are spent): the device's L2 size and the
+    co-resident cluster counts of the cluster sizes the space uses, into the heuristic's tables; a query's answer, or
+    the nominal capacity kept after the retries, is recorded."""
     if device_index in _REGISTERED_DEVICES:
         return
     from .generator import CLUSTERS

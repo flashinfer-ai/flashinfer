@@ -589,6 +589,86 @@ def test_misaligned_a_is_copied_and_keeps_the_bits():
     assert torch.equal(bits(bi_mm(a_off[:1], b)), bits(bi_mm(a[:1], b)))
 
 
+def test_registering_an_unchanged_device_value_keeps_the_rank_cache():
+    """The device's L2 size and cluster capacities are registered on every call until the device is registered; a value
+    the heuristic already holds must not clear its cached rankings (the re-ranking costs milliseconds per call)."""
+    from flashinfer.gemm.batch_invariant import heuristic as H
+
+    fam, sm = "sm_100", 148
+    saved_cap = {k: dict(v) for k, v in H._QUERIED_CAPACITY.items()}
+    saved_l2 = dict(H._QUERIED_L2)
+    try:
+        H.register_capacity(fam, sm, 2, 70)
+        H.register_l2(fam, sm, 1.0e8)
+        H.rank(300, 4096, 4096, 1, "k", 2, sm, fam)
+        size = H.rank.cache_info().currsize
+        assert size >= 1
+        H.register_capacity(fam, sm, 2, 70)
+        H.register_l2(fam, sm, 1.0e8)
+        assert H.rank.cache_info().currsize == size
+        H.register_capacity(fam, sm, 2, 71)
+        assert H.rank.cache_info().currsize == 0
+    finally:
+        H._QUERIED_CAPACITY.clear()
+        H._QUERIED_CAPACITY.update(saved_cap)
+        H._QUERIED_L2.clear()
+        H._QUERIED_L2.update(saved_l2)
+        H.rank.cache_clear()
+
+
+@needs_device
+def test_failed_occupancy_query_is_retried_a_bounded_number_of_times(monkeypatch):
+    """A device whose occupancy query fails gets the part's nominal capacity; the query is retried on later calls a bounded
+    number of times, then the nominal value is kept, so a process on such a device does not re-query and re-rank on every
+    call."""
+    from flashinfer.gemm.batch_invariant import api
+    from flashinfer.gemm.batch_invariant import heuristic as H
+
+    dev = torch.device("cuda", torch.cuda.current_device())
+    index = dev.index
+    sm, fam = api.part_of(dev)
+    saved = (
+        dict(api._CO_RESIDENT),
+        set(api._REGISTERED_DEVICES),
+        dict(api._QUERY_FAILURES),
+        {k: dict(v) for k, v in H._QUERIED_CAPACITY.items()},
+    )
+    calls: list = []
+
+    def failing(device_index, cluster_size):
+        calls.append(cluster_size)
+        raise RuntimeError("no occupancy query on this device")
+
+    monkeypatch.setattr(api, "_query_co_resident_clusters", failing)
+    try:
+        for k in [k for k in api._CO_RESIDENT if k[0] == index]:
+            del api._CO_RESIDENT[k]
+        api._REGISTERED_DEVICES.discard(index)
+        api._QUERY_FAILURES.clear()
+        cfg = Knobs((128, 128), (2, 1), False, True, "m", 1)
+        first = api.persistent_clusters(dev, cfg)
+        assert first >= 1
+        for _ in range(api._QUERY_ATTEMPTS + 2):
+            assert api.persistent_clusters(dev, cfg) == first
+        sizes = {size for size in calls}
+        assert len(calls) <= api._QUERY_ATTEMPTS * len(sizes)
+        settled = len(calls)
+        for _ in range(10):
+            assert api.persistent_clusters(dev, cfg) == first
+        assert len(calls) == settled  # no further queries once the retries are spent
+        assert index in api._REGISTERED_DEVICES
+    finally:
+        api._CO_RESIDENT.clear()
+        api._CO_RESIDENT.update(saved[0])
+        api._REGISTERED_DEVICES.clear()
+        api._REGISTERED_DEVICES.update(saved[1])
+        api._QUERY_FAILURES.clear()
+        api._QUERY_FAILURES.update(saved[2])
+        H._QUERIED_CAPACITY.clear()
+        H._QUERIED_CAPACITY.update(saved[3])
+        H.rank.cache_clear()
+
+
 @needs_device
 def test_persistent_grid_is_the_device_co_resident_cluster_count():
     """The compiled persistent grid is the launch device's co-resident cluster count for the configuration's cluster
