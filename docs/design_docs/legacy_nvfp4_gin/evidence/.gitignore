@@ -1,0 +1,3 @@
+# Reproduce these pairwise diffs with scripts/audit_legacy_nvfp4_gin.py.
+comparisons/
+merge-preview/

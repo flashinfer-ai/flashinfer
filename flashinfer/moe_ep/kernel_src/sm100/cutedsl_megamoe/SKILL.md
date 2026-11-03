@@ -69,6 +69,20 @@ constants/helpers are eager; the `mega_runner`/`mega_reference` helpers pull
 
 ## When the kernel team drops a new version of src/
 
+The in-progress legacy NVFP4 GIN migration uses a targeted MR !100 import,
+not the full-drop procedure below. Follow its
+[migration audit](../../../../../docs/design_docs/legacy_nvfp4_gin/migration-audit.md)
+and per-file provenance ledger. `shim/gin.py` owns live NCCL initialization,
+registered arenas and lifecycle; the formal NVFP4 backend exposes an explicit
+default-off experimental internode path with a fixed allowlist. Keep Torch
+and NCCL imports lazy in that module and preserve all existing FI device
+patches. `src/src/nccl_gin_layout.py` is a byte-identical donor helper. Preserve
+the documented token-back generation-race correction until upstream absorbs
+it; numerical and performance acceptance status lives in the validation log.
+Qualify host contracts with
+`python -m unittest discover -s tests/cpu/moe_ep -p test_legacy_nvfp4_gin_contracts.py -v`
+from the repository root; this does not qualify CUDA or NCCL execution.
+
 1. **Replace `src/`** with the drop's five kernel packages (the drop is a full
    repo; copy only these dirs):
    ```bash

@@ -23,7 +23,8 @@ _FINISH_SUM_TAG = 0x80000000
 @dsl_user_op
 @cute.jit
 def software_grid_sync(counter_ptr, sm_idx, num_sms, tid_in_group,
-                       *, num_threads=None, loc=None, ip=None):
+                       *, num_threads=None, barrier_id: int = 10,
+                       loc=None, ip=None):
     """Grid-wide barrier replacing cooperative_groups::this_grid().sync().
 
     counter_ptr  : Pointer to a single u32 in global memory, zero-initialised
@@ -50,6 +51,11 @@ def software_grid_sync(counter_ptr, sm_idx, num_sms, tid_in_group,
                    ``tid_in_group = local_warp_idx * 32 + lane_idx`` where
                    ``local_warp_idx`` is the warp index *within* the dispatch
                    group (0..3 for the 4 dispatch warps).
+    barrier_id   : Named barrier used for the wrapping CTA sync (default
+                   10, the dispatch-group barrier). A participant subset that
+                   syncs while another subset of the same CTA may be waiting on
+                   barrier 10 with a different thread count must pass its own
+                   id: mixing counts on one named barrier is undefined.
     num_threads  : Number of threads participating on the wrapping
                    NamedBarrier.  Default ``None`` -> ``cute.arch.sync_threads()``
                    (= bar.sync 0, full CTA). Pass an explicit count (e.g. 128
@@ -73,7 +79,7 @@ def software_grid_sync(counter_ptr, sm_idx, num_sms, tid_in_group,
         cute.arch.sync_threads(loc=loc, ip=ip)
     else:
         # TODO: Remove this hardcode.
-        cute.arch.barrier(barrier_id=10, number_of_threads=num_threads,
+        cute.arch.barrier(barrier_id=barrier_id, number_of_threads=num_threads,
                           loc=loc, ip=ip)
 
     # PTX add.u32 treats the operand as a raw 32-bit bit pattern so signed
@@ -131,5 +137,5 @@ def software_grid_sync(counter_ptr, sm_idx, num_sms, tid_in_group,
     if cutlass.const_expr(num_threads is None):
         cute.arch.sync_threads(loc=loc, ip=ip)
     else:
-        cute.arch.barrier(barrier_id=10, number_of_threads=num_threads,
+        cute.arch.barrier(barrier_id=barrier_id, number_of_threads=num_threads,
                           loc=loc, ip=ip)

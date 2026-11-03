@@ -590,6 +590,10 @@ class MoEEpMegaLayer(nn.Module):
                 kernel = self._default_workspace_handle._kernel
         else:
             fleet_params, backend_workspace, kernel = self._resolve_workspace(workspace)
+        if kernel.requires_collective_forward_validation:
+            kernel.validate_forward(
+                t, fleet_params, quantize_input=self._mega_config.quantize_input
+            )
         quantize_input = self._resolve_quantize_input(t)
         signature = self._input_signature(t)
         validation_key = None if backend_workspace is None else id(backend_workspace)
@@ -598,7 +602,9 @@ class MoEEpMegaLayer(nn.Module):
             if validation_key is None
             else self._forward_signatures.get(validation_key)
         )
-        if previous_signature is None:
+        if kernel.requires_collective_forward_validation:
+            pass  # Validated collectively above, including steady-state metadata.
+        elif previous_signature is None:
             kernel.validate_forward(
                 t,
                 fleet_params,
@@ -750,6 +756,10 @@ class MoEEpMegaLayer(nn.Module):
             fleet_params = self._fleet_params
         else:
             fleet_params, _, _ = self._resolve_workspace(workspace)
+        if self._kernel.requires_collective_forward_validation:
+            self._kernel.validate_forward(
+                t, fleet_params, quantize_input=self._mega_config.quantize_input
+            )
         if t.num_tokens > fleet_params.max_tokens_per_rank:
             raise MoEEpConfigError(
                 f"{t.num_tokens} tokens exceed max_tokens_per_rank="

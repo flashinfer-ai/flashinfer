@@ -74,11 +74,12 @@ class SwapABSwigluFp4Fc12WorkTileInfo(MoEWorkTileInfo):
     def peek_ready(self):
         """Decode the sched-warp counter peek result from slot 7's bit 16.
 
-        Returns a Boolean SSA: True iff the sched-warp's enrich-time
-        peek of the fc1_done_counter (for this fc2 work tile) observed
-        saturation, allowing the TMA-B warp to skip its own spin_wait.
-        For fc1 tiles or when peek wasn't done, returns False (fc12 sched
-        ext only sets the bit on Linear2 phase work tiles).
+        For an FC1 tile the bit records whether ``fc1_ready_counter`` was
+        saturated when the scheduler decoded the tile.  The experimental
+        ready-first policy may use that observation to reorder work, and the
+        TMA-B warp may skip its later spin.  For an FC2 tile the bit records
+        the corresponding ``fc1_done_counter`` observation.  If no applicable
+        peek was performed, the bit is clear.
         """
         return ((self.phase_and_peek >> Int32(PhaseBits)) & Int32(1)) != Int32(0)
 
@@ -179,8 +180,17 @@ class SwapABSwigluFp4Fc12SchedExtension(MoESchedExtension):
         fc1_ready_counter_ptr: Optional[Pointer] = None,
         token_cluster_size: int = 1,
         fc1_done_per_cta_token: bool = False,
+        # Memory scope of the fc1-ready peek. Single-node kernels publish the
+        # counter with GPU-scope releases (main's default); the internode
+        # kernel's relay peers publish at system scope.
+        fc1_ready_peek_scope: str = "gpu",
     ):
         super().__init__(workspace=None)
+        if fc1_ready_peek_scope not in ("gpu", "sys"):
+            raise ValueError(
+                f"fc1_ready_peek_scope must be gpu or sys, got {fc1_ready_peek_scope!r}"
+            )
+        self.fc1_ready_peek_scope = fc1_ready_peek_scope
         if sf_vec_size <= 0:
             raise ValueError(f"sf_vec_size must be positive, got {sf_vec_size}.")
         self.sf_vec_size = sf_vec_size
@@ -289,6 +299,10 @@ class SwapABSwigluFp4Fc12SchedExtension(MoESchedExtension):
                             counter_ptr,
                             lambda v: v >= base_work.valid_tokens_in_cta_tile,
                             peek_only=True,
+                            # Peer fan-out writers publish the relay rows of the
+                            # internode kernel at system scope; single-node kernels
+                            # keep main's GPU-scope acquire (internode master switch).
+                            scope=self.fc1_ready_peek_scope,
                         )
                         peek_bit = Int32(0)
                         if peek_ready:

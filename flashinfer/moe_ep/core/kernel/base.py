@@ -128,6 +128,7 @@ class MegaKernelBackend(ABC):
     # existing backends retain the materializing output path.
     supports_output_view: bool = False
     supports_unfinalized_output: bool = False
+    requires_collective_forward_validation: bool = False
     supports_live_token_tuning: bool = False
     supports_auto_workspaces: bool = False
     _knob_cache_module: str

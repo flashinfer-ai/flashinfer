@@ -115,6 +115,47 @@ replace its own device snapshot.
   kernel repo's `docs/FC1_PER_TOKEN_SCALE_NEXT_DESIGN.md`); re-derive on the
   next re-sync.
 
+## Targeted legacy NVFP4 GIN migration (in progress)
+
+The original snapshot SHA and all existing pending patches above remain the
+baseline. This is a partial MR !100 import, not a snapshot update:
+
+- MR base: `41a45039cf81c150f969907dffdd0ba2f10661ca`.
+- Donor: `bc461f87c7b8fdee98fe3655fd2b77fd7819b1e6`, identical tree to merge
+  `f863d7540614bd546a42867c21adbf51d573061a`.
+- Targeted device dependency port: shared `token_comm`, `ptx_helpers`,
+  `grid_sync`, `iket_compat`; new `lsa_peer_mapper`, `megamoe_config`,
+  `token_segments`, `nccl_gin_layout`, common `direct_meta`/`pipeline_timing`;
+  legacy NVFP4 `custom_ext`, `epilogue_refactor`, `fc1_fc2_fuse_sched`,
+  `kernel_fc12`, `megamoe_kernel`, `moe_utils`, `topk_reduce`.
+- The GIN layout module is byte-identical to the fixed donor. Other files
+  are selectively merged to retain FI sparse decode, masked/static/persistent
+  reduction, custom activation, per-token scale and singleton-TMA behavior.
+  Existing FI `inputs_process`, runners and BF16/MXFP8 kernels are retained.
+- Host adaptation lives in `shim/gin.py`, `shim/gin_debug.py` and the NVFP4
+  shim/backend. The core accesses only the package exports and a generic
+  collective-forward-validation capability; it never imports raw sources.
+- **Pending-upstream correctness diff, token-back generation:** GIN deferral
+  now waits for `internode_barrier_counter+1`, rather than sampling
+  `combine_issue_counter+1`. A fast relay producer can increment the latter
+  before a slow consumer samples it, causing a wait for the next launch and
+  circular tail deadlock. Job 3576773 localized that guard after nine exact
+  matrix iterations. The rail generation advances after token-back retirement,
+  giving a stable current-launch target. Validation is tracked in the audit.
+- Optional `FLASHINFER_GIN_GUARD_DIAGNOSTICS=1` prints fixed source-site tags
+  before device guards trap; it is disabled by default. No support check is
+  bypassed. The old shared `nvlink_barrier` keyword defaults remain available
+  for FI graph probes; GIN callers pass explicit local rank/thread counts.
+- Internode mode is experimental and default-off. Strong numerical/lifetime
+  qualification and performance acceptance remain incomplete; see the live
+  validation record for exact outcomes. No production support is claimed.
+
+The recovered original vendor object is available in the receiving checkout.
+It is not an ancestor of MR !100. See the
+[migration audit](../../../../../docs/design_docs/legacy_nvfp4_gin/migration-audit.md)
+for fixed-source hashes, pairwise comparisons, dependency/ABI inventory and
+the implementation/validation ledger.
+
 ## Related trees
 
 - `kernel_src/sm90/pull_style_cutedsl_megakernel/` is a **separate snapshot**
