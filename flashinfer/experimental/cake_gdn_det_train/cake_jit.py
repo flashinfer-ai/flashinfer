@@ -64,7 +64,10 @@ at entry, and the tail walks the chunks in the scan's ready order
 ``tile_order`` and waits on each count before it reads them;
 ``tail_g2_bf16_wavefront`` also exports ``wait_geq`` (``cuStreamWaitValue32``
 on the entry count, the record's ``wait_entry``), which the chain enqueues on
-the side stream before the tail.
+the side stream before the tail.  ``dhu_tc2_wavefront_split`` is the scan a
+split plan pairs with the tail: on SM100 / SM103 its store warps release the
+counts in an elected form (one thread fences and adds 64 to each word, once
+per four chunks); on SM107 it is the ``dhu_tc2_wavefront`` program.
 Every other launch is a
 plain stream-ordered launch: nothing cooperative, no PDL (the chain may put
 two launches of one stage on two streams, each over its own sequences).
@@ -109,6 +112,7 @@ STAGES = (
     "dhu_pre_dvl_r64k1",
     "dhu_tc2",
     "dhu_tc2_wavefront",
+    "dhu_tc2_wavefront_split",
     "dqkwg",
     "wy_bwd",
     "wy_bwd_bf16",
@@ -1061,6 +1065,86 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "library": "cake_gdn_det_train_77231bf6aa5083c535df",
         "stage": "dhu_tc2_wavefront",
+    },
+    "dhu_tc2_wavefront_split": {
+        "arches": ["sm_100a", "sm_103a"],
+        "arg_plan": [
+            ["buffer", "qn_tma"],
+            ["buffer", "kn_tma"],
+            ["buffer", "w_tma"],
+            ["buffer", "do_tma"],
+            ["buffer", "g_cs"],
+            ["buffer", "dht"],
+            ["buffer", "dh_out"],
+            ["buffer", "dv2"],
+            ["buffer", "dh0"],
+            ["buffer", "seg_state"],
+            ["buffer", "chunk_start"],
+            ["buffer", "chunk_len"],
+            ["buffer", "seg_chunk_start"],
+            ["buffer", "seg_seq"],
+            ["buffer", "seq_chunk_start"],
+            ["parameter", "num_heads"],
+            ["parameter", "num_v_heads"],
+            ["parameter", "use_final_state_grad"],
+            ["parameter", "store_initial_state_grad"],
+            ["parameter", "scale"],
+            ["buffer", "ready"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "kernel_symbol": "kernel_cake_gdn_det_train_2cbd42650ff19da3a651",
+        "launch": {
+            "block": (384, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 222976,
+            "use_pdl": False,
+        },
+        "library": "cake_gdn_det_train_2cbd42650ff19da3a651",
+        "stage": "dhu_tc2_wavefront_split",
+    },
+    "dhu_tc2_wavefront_split_sm_107a": {
+        "arches": ["sm_107a"],
+        "arg_plan": [
+            ["buffer", "qn_tma"],
+            ["buffer", "kn_tma"],
+            ["buffer", "w_tma"],
+            ["buffer", "do_tma"],
+            ["buffer", "g_cs"],
+            ["buffer", "dht"],
+            ["buffer", "dh_out"],
+            ["buffer", "dv2"],
+            ["buffer", "dh0"],
+            ["buffer", "seg_state"],
+            ["buffer", "chunk_start"],
+            ["buffer", "chunk_len"],
+            ["buffer", "seg_chunk_start"],
+            ["buffer", "seg_seq"],
+            ["buffer", "seq_chunk_start"],
+            ["parameter", "num_heads"],
+            ["parameter", "num_v_heads"],
+            ["parameter", "use_final_state_grad"],
+            ["parameter", "store_initial_state_grad"],
+            ["parameter", "scale"],
+            ["buffer", "ready"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "kernel_symbol": "kernel_cake_gdn_det_train_77231bf6aa5083c535df",
+        "launch": {
+            "block": (384, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 222976,
+            "use_pdl": False,
+        },
+        "library": "cake_gdn_det_train_77231bf6aa5083c535df",
+        "stage": "dhu_tc2_wavefront_split",
     },
     "dqkwg": {
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
