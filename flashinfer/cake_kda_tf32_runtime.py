@@ -1001,13 +1001,18 @@ def _ffi_arguments_reusing(owner, site, arguments) -> tuple:
     return tuple(exported)
 
 
-def _prepared_kernel_record(module, grid, bindings) -> tuple:
-    """(native entry, positional arguments) of one ``PreparedKernel.launch``."""
+def _prepared_kernel_record(module, grid, bindings, export: bool = True) -> tuple:
+    """(native entry, positional arguments) of one ``PreparedKernel.launch``.
+
+    With ``export`` the tensors are tvm-ffi exports (:func:`_ffi_arguments_reusing`);
+    without it they are the bound torch tensors, which the call converts.
+    """
     if not module._ready:
         raise RuntimeError("TMA descriptors must be initialized during preparation")
-    return module._call, _ffi_arguments_reusing(
-        module, None, module._arguments(grid, bindings)
-    )
+    arguments = module._arguments(grid, bindings)
+    if not export:
+        return module._call, tuple(arguments)
+    return module._call, _ffi_arguments_reusing(module, None, arguments)
 
 
 def _run_launch_records(records) -> None:
@@ -4922,8 +4927,11 @@ class FlashKDABlackwellBF16FusedLaunch:
         self.module.prepare(grid=self.grid, **self.args)
         self._descriptors_stale = False
 
-    def _build_launch_records(self) -> list:
-        """The staging copies and kernel launches of one launch(), in order."""
+    def _build_launch_records(self, export: bool = True) -> list:
+        """The staging copies and kernel launches of one launch(), in order.
+
+        ``export`` as in :func:`_prepared_kernel_record`.
+        """
         records = [
             (destination.copy_, (source,))
             for destination, source in self._token_storage_refreshes
@@ -4933,19 +4941,19 @@ class FlashKDABlackwellBF16FusedLaunch:
         if self.prepare_module is not None:
             records.append(
                 _prepared_kernel_record(
-                    self.prepare_module, self.prepare_grid, self.prepare_args
+                    self.prepare_module, self.prepare_grid, self.prepare_args, export
                 )
             )
         records.append(
-            self._m64_owner_helper_record()
+            self._m64_owner_helper_record(export)
             if self.m64_owner_helpers
-            else self._work_bin_mix_record()
+            else self._work_bin_mix_record(export)
             if self.work_bin_mix
-            else _prepared_kernel_record(self.module, self.grid, self.args)
+            else _prepared_kernel_record(self.module, self.grid, self.args, export)
         )
         return records
 
-    def _m64_owner_helper_record(self) -> tuple:
+    def _m64_owner_helper_record(self, export: bool = True) -> tuple:
         """The launch record of the M64 owner/helper build.
 
         The driver can refuse the cooperative grid although the capacity probe
@@ -4954,7 +4962,9 @@ class FlashKDABlackwellBF16FusedLaunch:
         have taken (_fall_back_from_m64_owner_helper) and launches that instead;
         a refused launch leaves the words untouched.
         """
-        call, arguments = _prepared_kernel_record(self.module, self.grid, self.args)
+        call, arguments = _prepared_kernel_record(
+            self.module, self.grid, self.args, export
+        )
 
         def launch(*packed):
             if self.m64_owner_helpers:
@@ -4992,7 +5002,7 @@ class FlashKDABlackwellBF16FusedLaunch:
                 schedule,
             )
 
-    def _work_bin_mix_record(self) -> tuple:
+    def _work_bin_mix_record(self, export: bool = True) -> tuple:
         """The launch record of the bin-mix build.
 
         A helper bin's chunks reach their owner through the ring while both
@@ -5001,7 +5011,9 @@ class FlashKDABlackwellBF16FusedLaunch:
         (_fall_back_from_work_bin_mix) and launches that instead; a refused
         launch leaves the ring words untouched.
         """
-        call, arguments = _prepared_kernel_record(self.module, self.grid, self.args)
+        call, arguments = _prepared_kernel_record(
+            self.module, self.grid, self.args, export
+        )
 
         def launch(*packed):
             if self.work_bin_mix:
@@ -5047,6 +5059,16 @@ class FlashKDABlackwellBF16FusedLaunch:
             self._prepare_descriptors_in_stream()
         records = self._launch_records
         if records is None:
+            if "_launch_records" not in self.__dict__:
+                # The first launch of a binding (a new plan, or a plan-cache
+                # rebind) passes the bound torch tensors: the call converts
+                # them for less host time than exporting each moved tensor
+                # ahead of it.  The instance-level None marks that launch; a
+                # second launch of the same binding builds the exported
+                # record and reuses it until the next rebind.
+                self._launch_records = None
+                _run_launch_records(self._build_launch_records(export=False))
+                return
             records = self._launch_records = tuple(self._build_launch_records())
         _run_launch_records(records)
 

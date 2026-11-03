@@ -10,8 +10,10 @@ A record rebuild exports to tvm-ffi only the tensors that moved since the
 site's previous record (``_ffi_arguments_reusing``).  A moved tensor bound
 again at the next argument position (``out`` / ``out_tma``, the FP32 final
 state and its tensor map) takes the export of that position instead of a
-second one.  ``_ffi_arguments`` is replaced by a recording stub, so no
-tvm-ffi conversion runs.
+second one.  The first launch of a binding passes the bound torch tensors
+and builds no exported record; a second launch builds it and later launches
+reuse it until a rebind drops it.  ``_ffi_arguments`` is replaced by a
+recording stub, so no tvm-ffi conversion runs.
 """
 
 from types import SimpleNamespace
@@ -74,3 +76,53 @@ def test_a_repeat_at_a_later_position_is_exported_again(exports):
     out = runtime._ffi_arguments_reusing(owner, None, (a, b, a))
     assert len(exports) == 1 and len(exports[0]) == 3
     assert out[0] == out[2] == ("ffi", id(a))
+
+
+def test_a_raw_record_passes_the_bound_tensors(exports):
+    t = _tensor()
+    module = SimpleNamespace(
+        _ready=True,
+        _call=object(),
+        _arguments=lambda grid, bindings: [bindings["x"], grid],
+    )
+    call, arguments = runtime._prepared_kernel_record(module, 3, {"x": t}, export=False)
+    assert call is module._call and arguments[0] is t and arguments[1] == 3
+    assert exports == []
+    _, arguments = runtime._prepared_kernel_record(module, 3, {"x": t})
+    assert exports == [(t,)] and arguments[0] == ("ffi", id(t))
+
+
+class _Launch:
+    """The launch-record state of ``FlashKDABlackwellBF16FusedLaunch``."""
+
+    _launch_records = None
+    _descriptors_stale = False
+    _launch_in_stream = runtime.FlashKDABlackwellBF16FusedLaunch._launch_in_stream
+
+    def __init__(self):
+        self.builds = []
+        self.launched = []
+
+    def _build_launch_records(self, export=True):
+        self.builds.append(export)
+        kind = "exported" if export else "raw"
+        return [(self.launched.append, (kind,))]
+
+
+def test_the_first_launch_of_a_binding_is_raw():
+    launch = _Launch()
+    for _ in range(3):
+        launch._launch_in_stream()
+    assert launch.builds == [False, True]
+    assert launch.launched == ["raw", "exported", "exported"]
+
+
+def test_a_rebind_makes_the_next_launch_raw():
+    launch = _Launch()
+    launch._launch_in_stream()
+    launch._launch_in_stream()
+    runtime._invalidate_launch_records(launch)
+    launch._launch_in_stream()
+    launch._launch_in_stream()
+    assert launch.builds == [False, True, False, True]
+    assert launch.launched == ["raw", "exported", "raw", "exported"]
