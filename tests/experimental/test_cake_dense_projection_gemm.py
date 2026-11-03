@@ -546,18 +546,18 @@ SM_COUNTS = {"sm_100a": 148, "sm_103a": 152, "sm_107a": 216}
         ("sm_100a", 148, 28),
         ("sm_103a", 152, 32),
         ("sm_103a", 148, 28),
-        ("sm_107a", 216, 27),
+        ("sm_107a", 216, 26),
         ("sm_107a", 212, 19),
         ("sm_107a", 208, 14),
         ("sm_107a", 210, 0),
     ],
 )
 def test_k1_planners_take_the_measured_rows(arch, sm_count, rows):
-    """The verdicts of the three architectures take 28 / 32 / 27 of the 124 weight-gradient rows (the MLA head rows,
+    """The verdicts of the three architectures take 28 / 32 / 26 of the 124 weight-gradient rows (the MLA head rows,
     ``L = 64``, run the deterministic program), at 16172 and 16231 tokens; on 148 SMs sm_103a leaves ``4096 -> 48`` to
     the deterministic program (28 rows).  On sm_107a the token counts of :data:`K1_SPLIT_RULE_EXCLUDED_TOKENS` run the
-    deterministic program (seven FP32 rows at 16231 tokens on 216 SMs).  The per-SM-count sm_107a tables take 19 rows
-    on 212 SMs and 14 on 208 SMs; an SM count below 216 without a table takes none."""
+    deterministic program (seven FP32 rows and one BF16 row at 16231 tokens on 216 SMs).  The per-SM-count sm_107a
+    tables take 19 rows on 212 SMs and 14 on 208 SMs; an SM count below 216 without a table takes none."""
     taken = 0
     for d_in, d_out in WGRAD_SHAPES:
         for out_f32 in (False, True):
@@ -684,10 +684,13 @@ def test_k1_planner_choices():
     assert p107(6144, 32, 208, out_f32=True) is None
     assert p107(8192, 128, 212) == (128, 2)
     assert p107(8192, 128, 208) is None
-    # 5120 -> 1024 BF16: one split of 256-wide tiles on 216 SMs; on 208 it misses, on 212 it runs the deterministic
-    # program as well
+    # 5120 -> 1024 BF16: one split of 256-wide tiles on 216 SMs, except at 16231 tokens (the deterministic program);
+    # on 208 it misses, on 212 it runs the deterministic program as well
     assert p107(5120, 1024, 212) is None
-    assert p107(5120, 1024, 216) == (256, 1)
+    assert p107(5120, 1024, 216) is None
+    assert cake_backend.k1_plan(
+        arch="sm_107a", M=5120, N=1024, sm_count=216, L=1, K=16172, out_f32=False
+    ) == (256, 1)
     assert p107(5120, 1024, 208) is None
     assert (
         cake_backend.k1_plan(arch="sm_107a", M=4096, N=48, sm_count=216, **kw) is None
@@ -1124,9 +1127,9 @@ def test_k1_sm107a_token_counts_of_the_deterministic_rules():
     SM count: an entry of 208 or 212 SMs holds on exactly that SM count (not on the other table's part, nor from 216
     SMs up), an entry of 216 SMs from 216 SMs up; the neighbouring token counts keep the row's verdict."""
 
-    def p(M, N, sms, T):
+    def p(M, N, sms, T, out_f32=True):
         return cake_backend.k1_plan(
-            arch="sm_107a", L=1, M=M, N=N, K=T, out_f32=True, sm_count=sms
+            arch="sm_107a", L=1, M=M, N=N, K=T, out_f32=out_f32, sm_count=sms
         )
 
     # 4096 -> 512: the deterministic program at 16231 and 16384 tokens on 208, 212 and 216 SMs
@@ -1158,10 +1161,19 @@ def test_k1_sm107a_token_counts_of_the_deterministic_rules():
     assert p(5120, 512, 212, 16231) is None and p(5120, 512, 212, 16384) is None
     for sms in (208, 216):
         assert p(5120, 512, sms, 16231) == (128, 1), sms
-    # 5120 -> 1024: no entry; every part keeps the 256-wide one-split program at both token counts
+    # 5120 -> 1024 FP32: no entry; every part keeps the 256-wide one-split program at both token counts
     for sms in (208, 212, 216):
         for T in (16231, 16384):
             assert p(5120, 1024, sms, T) == (256, 1), (sms, T)
+    # 5120 -> 1024 BF16: 16231 tokens from 216 SMs up (the neighbouring token counts and 16384 keep the 256-wide
+    # one-split program); 208 and 212 SMs run the deterministic program at every token count (their tables)
+    for sms in (216, 217, 280):
+        assert p(5120, 1024, sms, 16231, out_f32=False) is None, sms
+        for T in (16172, 16230, 16232, 16384):
+            assert p(5120, 1024, sms, T, out_f32=False) == (256, 1), (sms, T)
+    for sms in (208, 212):
+        for T in (16231, 16384):
+            assert p(5120, 1024, sms, T, out_f32=False) is None, (sms, T)
     # 5120 -> 32 keeps its verdict at both token counts; 4096 -> 32 too, except at 16231 tokens on 216 SMs
     for sms in (208, 212, 216):
         for T in (16231, 16384):
@@ -3598,6 +3610,58 @@ def test_gpu_planned_rows_run_the_programs_of_their_verdicts():
     )
     if not ran:
         pytest.skip(f"no verdict of {arch} applies on {sm_count} SMs")
+
+
+def test_gpu_k1_sm_count_overrides_run_their_programs():
+    """Unforced (``deterministic=False``, no split count), on a part of exactly the SM count of a table of
+    :data:`K1_SPLIT_OVERRIDES_BY_SM` (``sm_107a``: 216 SMs): every overridden row prepares and runs the override's
+    program at the first and the last token count of :data:`K1_SPLIT_RULES_BY_SM_TOKENS` (``4096 -> 1024`` FP32 at
+    16172 and 16384 tokens: the 192-wide row-major-store program at one split), meets the deterministic package's
+    FP64 budget and, where both run one split, gives the bits of the row's :data:`K1_SPLIT_RULES` program (256-wide
+    transposed tiles) on the same inputs.  A part of any other SM count skips."""
+    device, arch = _atomic_device_or_skip()
+    sm_count = det_backend.device_facts(device).sm_count
+    table = cake_backend.K1_SPLIT_OVERRIDES_BY_SM.get((arch, sm_count), {})
+    rows = sorted((key, choice) for key, choice in table.items() if choice is not None)
+    if not rows:
+        pytest.skip(f"no K1 override of {arch} on {sm_count} SMs")
+    g = torch.Generator(device=device).manual_seed(SEED + 93)
+    ran = 0
+    for key, (block_n, splits) in rows:
+        _, L, M, N, dt = key
+        f32 = dt == "f32"
+        rule = cake_backend.K1_SPLIT_RULES[key]
+        for T in cake_backend.K1_SPLIT_RULES_BY_SM_TOKENS:
+            want = cake_backend.k1_plan(
+                arch=arch, L=L, M=M, N=N, K=T, out_f32=f32, sm_count=sm_count
+            )
+            if want is None:  # a token count of K1_SPLIT_RULE_EXCLUDED_TOKENS
+                continue
+            assert want == (block_n, splits), (key, T)
+            G, X = _bf16((T, N), device, g), _bf16((T, M), device, g)
+            out_dtype = torch.float32 if f32 else torch.bfloat16
+            out = torch.full((N, M), float("nan"), device=device, dtype=out_dtype)
+            prepared = cake_backend.prepare_projection_wgrad(
+                G, X, out, deterministic=False
+            )
+            assert isinstance(prepared, cake_backend.PreparedAtomicGemm), (key, T)
+            assert (prepared.plan.block_n, prepared.plan.splits) == want
+            assert prepared.template == cake_backend.atomic_k1_template(block_n, f32)
+            _assert_ran(prepared.launch, prepared.module_name)
+            torch.cuda.synchronize()
+            _k1_check(out, G.double().t() @ X.double(), f"{M} {N} {dt} {T}")
+            if rule is not None and rule[1] == 1 and splits == 1:
+                same = torch.full_like(out, float("nan"))
+                recorded = _k1_prepare(G, X, same, arch, 1, rule[0])
+                assert recorded.template != prepared.template
+                _assert_ran(recorded.launch, recorded.module_name)
+                torch.cuda.synchronize()
+                assert torch.equal(out, same), (key, T)
+            ran += 1
+    print(
+        f"K1_OVERRIDES {arch} sm_count={sm_count}: {ran} launches ran the override programs"
+    )
+    assert ran
 
 
 def test_gpu_router_token_windows_run_at_their_edges():

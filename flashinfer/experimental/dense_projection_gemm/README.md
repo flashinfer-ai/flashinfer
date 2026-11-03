@@ -158,7 +158,7 @@ slower there: BF16 output at 1024 tokens on `sm_103a` `4096 -> 48`, `6144 -> 32`
 `6144 -> 32`; FP32 output at 1024 tokens on `sm_100a` `6144 -> 32`; FP32 output at 8192 tokens on `sm_103a`
 `4096 -> 48`, `5120 -> 128`.  At 65536 tokens neither program meets the BF16 error budget.*
 
-| K1 row `d_in -> d_out` (FP32 out) | 208 SMs | 212 SMs | 216 SMs |
+| K1 row `d_in -> d_out` (FP32 out unless marked BF16) | 208 SMs | 212 SMs | 216 SMs |
 |---|---|---|---|
 | `4096 -> 32` | -- | -- | 16231 |
 | `4096 -> 48` | 16231; 16384 | -- | 16231; 16384 |
@@ -170,6 +170,7 @@ slower there: BF16 output at 1024 tokens on `sm_103a` `4096 -> 48`, `6144 -> 32`
 | `5120 -> 64` | 16231 | 16231 | 16231; 16384 |
 | `5120 -> 512` | -- | 16231; 16384 | -- |
 | `5120 -> 1024` | -- | -- | -- |
+| `5120 -> 1024` BF16 | -- | -- | 16231 |
 
 *Table: the K1 token counts that run the deterministic program on `sm_107a` parts (`K1_SPLIT_RULE_EXCLUDED_TOKENS`;
 `--`: none).  They are token counts of the deterministic package's `sm_107a` rules for single token counts (16231 and
@@ -187,7 +188,9 @@ medians over the runs, or median of the paired ratios, in eager launches or in g
 SMs and `5120 -> 1024` on 208 SMs were measured twice; the rule takes the runs of both measurements together.  On 216
 SMs the 192-wide row-major program of `4096 -> 1024` FP32 (the 216-SM override) was measured in the same runs against
 the 256-wide tiles and the deterministic plan: faster than both at 16172 and 16384 tokens in every run, not faster than
-the deterministic package's 16231-token plan, which that token count keeps.*
+the deterministic package's 16231-token plan, which that token count keeps.  The 216-SM entry of `5120 -> 1024` BF16
+(16231 tokens) is not a token count of those rules: the deterministic plan there is the row's plan at every token count,
+and the row's program left the backward pass 1.5 % slower in eager launches (ratio of the medians over the runs).*
 
 `"waves"` (`router_waves`) launches whole waves of the device's CTA pairs (`pairs = sm_count // 2`): `c * pairs`
 units with `c = max(2, round(tiles * k_iters / (68 * pairs))) + 1`, and only where the deterministic plan's six

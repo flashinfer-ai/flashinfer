@@ -359,11 +359,12 @@ K1_RULE_MIN_SM_COUNT: dict[tuple[str, int, int, int, str], int] = {
 #: token counts keep the verdict: below 512, above 65536 (except those rows), between two measured token counts with
 #: different outcomes, and on parts with fewer than 152 SMs.  The sm_107a entries are single token counts of the
 #: deterministic package's sm_107a rules for one token count (16231 and 16384 tokens; 16231 only for ``4096 -> 1024``),
-#: which give the row a faster deterministic plan there.  On 208, 212 and 216 SMs they come from a re-measurement at
-#: 16172, 16231 and 16384 tokens against those plans (the protocol is in the sm_107a K1 token table of the README): a
-#: measured token count is an entry where the row's program failed the rule above in some run, or left the backward
-#: pass or the checkpointed step more than 1.3 % slower than the deterministic program (ratio of the medians over the
-#: runs, or median of the paired ratios, in eager launches or in graph replays).
+#: which give the row a faster deterministic plan there, and 16231 tokens of ``5120 -> 1024`` BF16 on 216 SMs (measured
+#: in the same runs; the deterministic plan there is the row's plan at every token count).  On 208, 212 and 216 SMs they
+#: come from a re-measurement at 16172, 16231 and 16384 tokens against those plans (the protocol is in the sm_107a K1
+#: token table of the README): a measured token count is an entry where the row's program failed the rule above in some
+#: run, or left the backward pass or the checkpointed step more than 1.3 % slower than the deterministic program (ratio
+#: of the medians over the runs, or median of the paired ratios, in eager launches or in graph replays).
 # fmt: off
 K1_SPLIT_RULE_EXCLUDED_TOKENS: dict[
     tuple[str, int, int, int, str], tuple[tuple[int, int, Optional[int]], ...]
@@ -416,6 +417,7 @@ K1_SPLIT_RULE_EXCLUDED_TOKENS: dict[
         (208, 16231, 16231), (212, 16231, 16231), (216, 16231, 16231), (216, 16384, 16384),
     ),
     ("sm_107a", 1, 5120, 512, "f32"): ((212, 16231, 16231), (212, 16384, 16384)),
+    ("sm_107a", 1, 5120, 1024, "bf16"): ((216, 16231, 16231),),
 }
 # fmt: on
 #: Per-SM-count verdicts of the parts of an architecture with fewer SMs than its :data:`K1_MIN_SM_COUNT`,
