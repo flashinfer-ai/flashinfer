@@ -40,28 +40,6 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
-#define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 384
-#define TMEM_ACC_OFFSET 0
-#define TMEM_TQ_0_OFFSET 256
-#define TMEM_TQ_1_OFFSET 288
-#define TMEM_TQ_2_OFFSET 320
-#define TMEM_TQ_3_OFFSET 352
-#define NUM_Q_PIPE_STAGES 2
-#define NUM_K_PIPE_STAGES 8
-#define NUM_ACC_PIPE_STAGES 2
-#define SMEM_SMEM_Q_OFF 1024
-#define SMEM_SMEM_Q_STAGE_BYTES 16384
-#define SMEM_SMEM_Q_STRIDE 16384
-#define SMEM_SMEM_K_OFF 66560
-#define SMEM_SMEM_K_STAGE_BYTES 16384
-#define SMEM_SMEM_K_STRIDE 16384
-#define SMEM_STAGE_OFF 197632
-#define SMEM_STAGE_STAGE_BYTES 33792
-#define SMEM_STAGE_STRIDE 33792
-#define SMEM_TOTAL 231424
-#define THREADS 320
-
 #include <math_constants.h>
 
 __device__ __forceinline__ uint32_t elect_sync() {
@@ -570,7 +548,7 @@ kernel_cake_msa_icp_indexer_3f58c1277a9aa67c62ea(const __grid_constant__ CUtenso
                                     }
                                     float part_0 = -CUDART_INF_F;
 #if __CUDA_ARCH__ == 1030
-                                    float2 _reg_reduce_max2_7 = {-CAKE_INF, -CAKE_INF};
+                                    float2 _reg_reduce_max2_7 = {-CUDART_INF_F, -CUDART_INF_F};
                                     _reg_reduce_max2_7.x = max_noftz(_reg_reduce_max2_7.x, max_noftz(v_0[0], v_0[1]));
                                     _reg_reduce_max2_7.y = max_noftz(_reg_reduce_max2_7.y, max_noftz(v_0[2], v_0[3]));
                                     _reg_reduce_max2_7.x = max_noftz(_reg_reduce_max2_7.x, max_noftz(v_0[4], v_0[5]));
@@ -590,7 +568,7 @@ kernel_cake_msa_icp_indexer_3f58c1277a9aa67c62ea(const __grid_constant__ CUtenso
                                     float _reg_array_reduce_6 = row_max_reduce(_reg_reduce_max2_7);
                                     part_0 = _reg_array_reduce_6;
 #else
-                                    float2 _reg_reduce_max2_6 = {-CAKE_INF, -CAKE_INF};
+                                    float2 _reg_reduce_max2_6 = {-CUDART_INF_F, -CUDART_INF_F};
                                     _reg_reduce_max2_6.x = max_noftz(_reg_reduce_max2_6.x, max_noftz(v_0[0], v_0[1]));
                                     _reg_reduce_max2_6.y = max_noftz(_reg_reduce_max2_6.y, max_noftz(v_0[2], v_0[3]));
                                     _reg_reduce_max2_6.x = max_noftz(_reg_reduce_max2_6.x, max_noftz(v_0[4], v_0[5]));
@@ -727,12 +705,12 @@ kernel_cake_msa_icp_indexer_3f58c1277a9aa67c62ea(const __grid_constant__ CUtenso
                                     }
                                     float part_1 = -CUDART_INF_F;
 #if __CUDA_ARCH__ == 1030
-                                    float2 _reg_reduce_max2_13 = {-CAKE_INF, -CAKE_INF};
+                                    float2 _reg_reduce_max2_13 = {-CUDART_INF_F, -CUDART_INF_F};
                                     row_max_x32_accum(&v_0[(32) + 0], _reg_reduce_max2_13);
                                     float _reg_array_reduce_12 = row_max_reduce(_reg_reduce_max2_13);
                                     part_1 = _reg_array_reduce_12;
 #else
-                                    float2 _reg_reduce_max2_11 = {-CAKE_INF, -CAKE_INF};
+                                    float2 _reg_reduce_max2_11 = {-CUDART_INF_F, -CUDART_INF_F};
                                     row_max_x32_accum(&v_0[(32) + 0], _reg_reduce_max2_11);
                                     float _reg_array_reduce_10 = row_max_reduce(_reg_reduce_max2_11);
                                     part_1 = _reg_array_reduce_10;
@@ -854,12 +832,12 @@ kernel_cake_msa_icp_indexer_3f58c1277a9aa67c62ea(const __grid_constant__ CUtenso
                                     }
                                     float part_2 = -CUDART_INF_F;
 #if __CUDA_ARCH__ == 1030
-                                    float2 _reg_reduce_max2_19 = {-CAKE_INF, -CAKE_INF};
+                                    float2 _reg_reduce_max2_19 = {-CUDART_INF_F, -CUDART_INF_F};
                                     row_max_x32_accum(&v_0[(64) + 0], _reg_reduce_max2_19);
                                     float _reg_array_reduce_18 = row_max_reduce(_reg_reduce_max2_19);
                                     part_2 = _reg_array_reduce_18;
 #else
-                                    float2 _reg_reduce_max2_16 = {-CAKE_INF, -CAKE_INF};
+                                    float2 _reg_reduce_max2_16 = {-CUDART_INF_F, -CUDART_INF_F};
                                     row_max_x32_accum(&v_0[(64) + 0], _reg_reduce_max2_16);
                                     float _reg_array_reduce_15 = row_max_reduce(_reg_reduce_max2_16);
                                     part_2 = _reg_array_reduce_15;
@@ -981,12 +959,12 @@ kernel_cake_msa_icp_indexer_3f58c1277a9aa67c62ea(const __grid_constant__ CUtenso
                                     }
                                     float part_3 = -CUDART_INF_F;
 #if __CUDA_ARCH__ == 1030
-                                    float2 _reg_reduce_max2_25 = {-CAKE_INF, -CAKE_INF};
+                                    float2 _reg_reduce_max2_25 = {-CUDART_INF_F, -CUDART_INF_F};
                                     row_max_x32_accum(&v_0[(96) + 0], _reg_reduce_max2_25);
                                     float _reg_array_reduce_24 = row_max_reduce(_reg_reduce_max2_25);
                                     part_3 = _reg_array_reduce_24;
 #else
-                                    float2 _reg_reduce_max2_21 = {-CAKE_INF, -CAKE_INF};
+                                    float2 _reg_reduce_max2_21 = {-CUDART_INF_F, -CUDART_INF_F};
                                     row_max_x32_accum(&v_0[(96) + 0], _reg_reduce_max2_21);
                                     float _reg_array_reduce_20 = row_max_reduce(_reg_reduce_max2_21);
                                     part_3 = _reg_array_reduce_20;
@@ -1164,7 +1142,7 @@ kernel_cake_msa_icp_indexer_3f58c1277a9aa67c62ea(const __grid_constant__ CUtenso
                                         if (!(_thresh_mask_23 & (1u << 31))) v_1[31] = -CUDART_INF_F;
                                     }
                                     float part_4 = -CUDART_INF_F;
-                                    float2 _reg_reduce_max2_26 = {-CAKE_INF, -CAKE_INF};
+                                    float2 _reg_reduce_max2_26 = {-CUDART_INF_F, -CUDART_INF_F};
                                     _reg_reduce_max2_26.x = max_noftz(_reg_reduce_max2_26.x, max_noftz(v_1[0], v_1[1]));
                                     _reg_reduce_max2_26.y = max_noftz(_reg_reduce_max2_26.y, max_noftz(v_1[2], v_1[3]));
                                     _reg_reduce_max2_26.x = max_noftz(_reg_reduce_max2_26.x, max_noftz(v_1[4], v_1[5]));
@@ -1248,7 +1226,7 @@ kernel_cake_msa_icp_indexer_3f58c1277a9aa67c62ea(const __grid_constant__ CUtenso
                                         if (!(_thresh_mask_28 & (1u << 31))) v_1[31] = -CUDART_INF_F;
                                     }
                                     float part_4 = -CUDART_INF_F;
-                                    float2 _reg_reduce_max2_31 = {-CAKE_INF, -CAKE_INF};
+                                    float2 _reg_reduce_max2_31 = {-CUDART_INF_F, -CUDART_INF_F};
                                     _reg_reduce_max2_31.x = max_noftz(_reg_reduce_max2_31.x, max_noftz(v_1[0], v_1[1]));
                                     _reg_reduce_max2_31.y = max_noftz(_reg_reduce_max2_31.y, max_noftz(v_1[2], v_1[3]));
                                     _reg_reduce_max2_31.x = max_noftz(_reg_reduce_max2_31.x, max_noftz(v_1[4], v_1[5]));
@@ -1364,12 +1342,12 @@ kernel_cake_msa_icp_indexer_3f58c1277a9aa67c62ea(const __grid_constant__ CUtenso
                                     }
                                     float part_5 = -CUDART_INF_F;
 #if __CUDA_ARCH__ == 1030
-                                    float2 _reg_reduce_max2_37 = {-CAKE_INF, -CAKE_INF};
+                                    float2 _reg_reduce_max2_37 = {-CUDART_INF_F, -CUDART_INF_F};
                                     row_max_x32_accum(&v_1[(32) + 0], _reg_reduce_max2_37);
                                     float _reg_array_reduce_36 = row_max_reduce(_reg_reduce_max2_37);
                                     part_5 = _reg_array_reduce_36;
 #else
-                                    float2 _reg_reduce_max2_31 = {-CAKE_INF, -CAKE_INF};
+                                    float2 _reg_reduce_max2_31 = {-CUDART_INF_F, -CUDART_INF_F};
                                     row_max_x32_accum(&v_1[(32) + 0], _reg_reduce_max2_31);
                                     float _reg_array_reduce_30 = row_max_reduce(_reg_reduce_max2_31);
                                     part_5 = _reg_array_reduce_30;
@@ -1491,12 +1469,12 @@ kernel_cake_msa_icp_indexer_3f58c1277a9aa67c62ea(const __grid_constant__ CUtenso
                                     }
                                     float part_6 = -CUDART_INF_F;
 #if __CUDA_ARCH__ == 1030
-                                    float2 _reg_reduce_max2_43 = {-CAKE_INF, -CAKE_INF};
+                                    float2 _reg_reduce_max2_43 = {-CUDART_INF_F, -CUDART_INF_F};
                                     row_max_x32_accum(&v_1[(64) + 0], _reg_reduce_max2_43);
                                     float _reg_array_reduce_42 = row_max_reduce(_reg_reduce_max2_43);
                                     part_6 = _reg_array_reduce_42;
 #else
-                                    float2 _reg_reduce_max2_36 = {-CAKE_INF, -CAKE_INF};
+                                    float2 _reg_reduce_max2_36 = {-CUDART_INF_F, -CUDART_INF_F};
                                     row_max_x32_accum(&v_1[(64) + 0], _reg_reduce_max2_36);
                                     float _reg_array_reduce_35 = row_max_reduce(_reg_reduce_max2_36);
                                     part_6 = _reg_array_reduce_35;
@@ -1618,12 +1596,12 @@ kernel_cake_msa_icp_indexer_3f58c1277a9aa67c62ea(const __grid_constant__ CUtenso
                                     }
                                     float part_7 = -CUDART_INF_F;
 #if __CUDA_ARCH__ == 1030
-                                    float2 _reg_reduce_max2_49 = {-CAKE_INF, -CAKE_INF};
+                                    float2 _reg_reduce_max2_49 = {-CUDART_INF_F, -CUDART_INF_F};
                                     row_max_x32_accum(&v_1[(96) + 0], _reg_reduce_max2_49);
                                     float _reg_array_reduce_48 = row_max_reduce(_reg_reduce_max2_49);
                                     part_7 = _reg_array_reduce_48;
 #else
-                                    float2 _reg_reduce_max2_41 = {-CAKE_INF, -CAKE_INF};
+                                    float2 _reg_reduce_max2_41 = {-CUDART_INF_F, -CUDART_INF_F};
                                     row_max_x32_accum(&v_1[(96) + 0], _reg_reduce_max2_41);
                                     float _reg_array_reduce_40 = row_max_reduce(_reg_reduce_max2_41);
                                     part_7 = _reg_array_reduce_40;
@@ -1855,7 +1833,7 @@ kernel_cake_msa_icp_indexer_3f58c1277a9aa67c62ea(const __grid_constant__ CUtenso
                                     }
                                     float part_8 = -CUDART_INF_F;
 #if __CUDA_ARCH__ == 1030
-                                    float2 _reg_reduce_max2_55 = {-CAKE_INF, -CAKE_INF};
+                                    float2 _reg_reduce_max2_55 = {-CUDART_INF_F, -CUDART_INF_F};
                                     _reg_reduce_max2_55.x = max_noftz(_reg_reduce_max2_55.x, max_noftz(v_2[0], v_2[1]));
                                     _reg_reduce_max2_55.y = max_noftz(_reg_reduce_max2_55.y, max_noftz(v_2[2], v_2[3]));
                                     _reg_reduce_max2_55.x = max_noftz(_reg_reduce_max2_55.x, max_noftz(v_2[4], v_2[5]));
@@ -1875,7 +1853,7 @@ kernel_cake_msa_icp_indexer_3f58c1277a9aa67c62ea(const __grid_constant__ CUtenso
                                     float _reg_array_reduce_54 = row_max_reduce(_reg_reduce_max2_55);
                                     part_8 = _reg_array_reduce_54;
 #else
-                                    float2 _reg_reduce_max2_46 = {-CAKE_INF, -CAKE_INF};
+                                    float2 _reg_reduce_max2_46 = {-CUDART_INF_F, -CUDART_INF_F};
                                     _reg_reduce_max2_46.x = max_noftz(_reg_reduce_max2_46.x, max_noftz(v_2[0], v_2[1]));
                                     _reg_reduce_max2_46.y = max_noftz(_reg_reduce_max2_46.y, max_noftz(v_2[2], v_2[3]));
                                     _reg_reduce_max2_46.x = max_noftz(_reg_reduce_max2_46.x, max_noftz(v_2[4], v_2[5]));
@@ -2014,12 +1992,12 @@ kernel_cake_msa_icp_indexer_3f58c1277a9aa67c62ea(const __grid_constant__ CUtenso
                                     }
                                     float part_9 = -CUDART_INF_F;
 #if __CUDA_ARCH__ == 1030
-                                    float2 _reg_reduce_max2_61 = {-CAKE_INF, -CAKE_INF};
+                                    float2 _reg_reduce_max2_61 = {-CUDART_INF_F, -CUDART_INF_F};
                                     row_max_x32_accum(&v_2[(32) + 0], _reg_reduce_max2_61);
                                     float _reg_array_reduce_60 = row_max_reduce(_reg_reduce_max2_61);
                                     part_9 = _reg_array_reduce_60;
 #else
-                                    float2 _reg_reduce_max2_51 = {-CAKE_INF, -CAKE_INF};
+                                    float2 _reg_reduce_max2_51 = {-CUDART_INF_F, -CUDART_INF_F};
                                     row_max_x32_accum(&v_2[(32) + 0], _reg_reduce_max2_51);
                                     float _reg_array_reduce_50 = row_max_reduce(_reg_reduce_max2_51);
                                     part_9 = _reg_array_reduce_50;
@@ -2143,12 +2121,12 @@ kernel_cake_msa_icp_indexer_3f58c1277a9aa67c62ea(const __grid_constant__ CUtenso
                                     }
                                     float part_10 = -CUDART_INF_F;
 #if __CUDA_ARCH__ == 1030
-                                    float2 _reg_reduce_max2_67 = {-CAKE_INF, -CAKE_INF};
+                                    float2 _reg_reduce_max2_67 = {-CUDART_INF_F, -CUDART_INF_F};
                                     row_max_x32_accum(&v_2[(64) + 0], _reg_reduce_max2_67);
                                     float _reg_array_reduce_66 = row_max_reduce(_reg_reduce_max2_67);
                                     part_10 = _reg_array_reduce_66;
 #else
-                                    float2 _reg_reduce_max2_56 = {-CAKE_INF, -CAKE_INF};
+                                    float2 _reg_reduce_max2_56 = {-CUDART_INF_F, -CUDART_INF_F};
                                     row_max_x32_accum(&v_2[(64) + 0], _reg_reduce_max2_56);
                                     float _reg_array_reduce_55 = row_max_reduce(_reg_reduce_max2_56);
                                     part_10 = _reg_array_reduce_55;
@@ -2272,12 +2250,12 @@ kernel_cake_msa_icp_indexer_3f58c1277a9aa67c62ea(const __grid_constant__ CUtenso
                                     }
                                     float part_11 = -CUDART_INF_F;
 #if __CUDA_ARCH__ == 1030
-                                    float2 _reg_reduce_max2_73 = {-CAKE_INF, -CAKE_INF};
+                                    float2 _reg_reduce_max2_73 = {-CUDART_INF_F, -CUDART_INF_F};
                                     row_max_x32_accum(&v_2[(96) + 0], _reg_reduce_max2_73);
                                     float _reg_array_reduce_72 = row_max_reduce(_reg_reduce_max2_73);
                                     part_11 = _reg_array_reduce_72;
 #else
-                                    float2 _reg_reduce_max2_61 = {-CAKE_INF, -CAKE_INF};
+                                    float2 _reg_reduce_max2_61 = {-CUDART_INF_F, -CUDART_INF_F};
                                     row_max_x32_accum(&v_2[(96) + 0], _reg_reduce_max2_61);
                                     float _reg_array_reduce_60 = row_max_reduce(_reg_reduce_max2_61);
                                     part_11 = _reg_array_reduce_60;
@@ -2487,7 +2465,7 @@ kernel_cake_msa_icp_indexer_3f58c1277a9aa67c62ea(const __grid_constant__ CUtenso
                                     }
                                     float part_12 = -CUDART_INF_F;
 #if __CUDA_ARCH__ == 1030
-                                    float2 _reg_reduce_max2_79 = {-CAKE_INF, -CAKE_INF};
+                                    float2 _reg_reduce_max2_79 = {-CUDART_INF_F, -CUDART_INF_F};
                                     _reg_reduce_max2_79.x = max_noftz(_reg_reduce_max2_79.x, max_noftz(v_3[0], v_3[1]));
                                     _reg_reduce_max2_79.y = max_noftz(_reg_reduce_max2_79.y, max_noftz(v_3[2], v_3[3]));
                                     _reg_reduce_max2_79.x = max_noftz(_reg_reduce_max2_79.x, max_noftz(v_3[4], v_3[5]));
@@ -2507,7 +2485,7 @@ kernel_cake_msa_icp_indexer_3f58c1277a9aa67c62ea(const __grid_constant__ CUtenso
                                     float _reg_array_reduce_78 = row_max_reduce(_reg_reduce_max2_79);
                                     part_12 = _reg_array_reduce_78;
 #else
-                                    float2 _reg_reduce_max2_66 = {-CAKE_INF, -CAKE_INF};
+                                    float2 _reg_reduce_max2_66 = {-CUDART_INF_F, -CUDART_INF_F};
                                     _reg_reduce_max2_66.x = max_noftz(_reg_reduce_max2_66.x, max_noftz(v_3[0], v_3[1]));
                                     _reg_reduce_max2_66.y = max_noftz(_reg_reduce_max2_66.y, max_noftz(v_3[2], v_3[3]));
                                     _reg_reduce_max2_66.x = max_noftz(_reg_reduce_max2_66.x, max_noftz(v_3[4], v_3[5]));
@@ -2646,12 +2624,12 @@ kernel_cake_msa_icp_indexer_3f58c1277a9aa67c62ea(const __grid_constant__ CUtenso
                                     }
                                     float part_13 = -CUDART_INF_F;
 #if __CUDA_ARCH__ == 1030
-                                    float2 _reg_reduce_max2_85 = {-CAKE_INF, -CAKE_INF};
+                                    float2 _reg_reduce_max2_85 = {-CUDART_INF_F, -CUDART_INF_F};
                                     row_max_x32_accum(&v_3[(32) + 0], _reg_reduce_max2_85);
                                     float _reg_array_reduce_84 = row_max_reduce(_reg_reduce_max2_85);
                                     part_13 = _reg_array_reduce_84;
 #else
-                                    float2 _reg_reduce_max2_71 = {-CAKE_INF, -CAKE_INF};
+                                    float2 _reg_reduce_max2_71 = {-CUDART_INF_F, -CUDART_INF_F};
                                     row_max_x32_accum(&v_3[(32) + 0], _reg_reduce_max2_71);
                                     float _reg_array_reduce_70 = row_max_reduce(_reg_reduce_max2_71);
                                     part_13 = _reg_array_reduce_70;
@@ -2775,12 +2753,12 @@ kernel_cake_msa_icp_indexer_3f58c1277a9aa67c62ea(const __grid_constant__ CUtenso
                                     }
                                     float part_14 = -CUDART_INF_F;
 #if __CUDA_ARCH__ == 1030
-                                    float2 _reg_reduce_max2_91 = {-CAKE_INF, -CAKE_INF};
+                                    float2 _reg_reduce_max2_91 = {-CUDART_INF_F, -CUDART_INF_F};
                                     row_max_x32_accum(&v_3[(64) + 0], _reg_reduce_max2_91);
                                     float _reg_array_reduce_90 = row_max_reduce(_reg_reduce_max2_91);
                                     part_14 = _reg_array_reduce_90;
 #else
-                                    float2 _reg_reduce_max2_76 = {-CAKE_INF, -CAKE_INF};
+                                    float2 _reg_reduce_max2_76 = {-CUDART_INF_F, -CUDART_INF_F};
                                     row_max_x32_accum(&v_3[(64) + 0], _reg_reduce_max2_76);
                                     float _reg_array_reduce_75 = row_max_reduce(_reg_reduce_max2_76);
                                     part_14 = _reg_array_reduce_75;
@@ -2904,12 +2882,12 @@ kernel_cake_msa_icp_indexer_3f58c1277a9aa67c62ea(const __grid_constant__ CUtenso
                                     }
                                     float part_15 = -CUDART_INF_F;
 #if __CUDA_ARCH__ == 1030
-                                    float2 _reg_reduce_max2_97 = {-CAKE_INF, -CAKE_INF};
+                                    float2 _reg_reduce_max2_97 = {-CUDART_INF_F, -CUDART_INF_F};
                                     row_max_x32_accum(&v_3[(96) + 0], _reg_reduce_max2_97);
                                     float _reg_array_reduce_96 = row_max_reduce(_reg_reduce_max2_97);
                                     part_15 = _reg_array_reduce_96;
 #else
-                                    float2 _reg_reduce_max2_81 = {-CAKE_INF, -CAKE_INF};
+                                    float2 _reg_reduce_max2_81 = {-CUDART_INF_F, -CUDART_INF_F};
                                     row_max_x32_accum(&v_3[(96) + 0], _reg_reduce_max2_81);
                                     float _reg_array_reduce_80 = row_max_reduce(_reg_reduce_max2_81);
                                     part_15 = _reg_array_reduce_80;

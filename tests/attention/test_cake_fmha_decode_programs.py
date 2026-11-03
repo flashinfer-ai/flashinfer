@@ -2087,6 +2087,62 @@ def test_cake_fmha_decode_bf16_length_aware_schedule_is_opt_in(
 
 
 @pytest.mark.parametrize("device_scales", (False, True))
+@pytest.mark.parametrize("kv_len", (300, 512, 640, 1024, 1152))
+@pytest.mark.parametrize("target", ("sm100a", "sm103a"))
+def test_cake_fmha_decode_b128_short_kv_runs_no_exact_retained_member(
+    decode_target, target, kv_len, device_scales
+) -> None:
+    """No exact B128 q1 32/4 retained-KV member serves a short-KV launch (at
+    most nine 128-token blocks) of that shape; that member gave wrong,
+    run-to-run different outputs on sm_103a.  The registry resolves the
+    generic retained-KV member for the shape, a table the stream-K program
+    reads in place takes DEC_B128 / DEC_B128_DS, and a narrower table takes
+    that program on a padded copy (device scales) or the generic member."""
+
+    from flashinfer.jit import cake_fmha as jit_cake_fmha
+
+    def selector(use_scale_ptr):
+        return jit_cake_fmha._resolve_decode_native_bf16_selector(
+            target,
+            128,
+            1,
+            32,
+            4,
+            has_sink=False,
+            has_window=False,
+            use_scale_ptr=use_scale_ptr,
+            retain_kv_l2=True,
+        )
+
+    decode_target(target)
+    for use_scale_ptr in (False, True):
+        assert "BATCH_SIZE" not in (selector(use_scale_ptr) or {})
+    identifier = "DEC_B128_DS" if device_scales else "DEC_B128"
+    blocks = -(-kv_len // 128)
+    wide = 8 * max(4, blocks + blocks % 2)
+    for width in (-(-kv_len // 16), wide):
+        kwargs = _row_kwargs(
+            "bf16_b128_s4096",
+            kv_len=kv_len,
+            width=width,
+            device_scales=device_scales,
+        )
+        route = _select(kwargs)
+        assert route is not None and route.retain_kv_l2, route
+        if cake_api._decode_route_runs_program(route):
+            assert route.program == ("decode_bf16", identifier), route
+            continue
+        assert width < wide and not device_scales, route
+        assert route.component == "decode_native_bf16", route
+        assert selector(route.use_scale_ptr) == {
+            "HAS_SINK": 0,
+            "HAS_WINDOW": 0,
+            "RETAIN_KV_L2": 1,
+            "USE_SCALE_PTR": 0,
+        }
+
+
+@pytest.mark.parametrize("device_scales", (False, True))
 @pytest.mark.parametrize("target", ("sm100a", "sm103a"))
 def test_cake_fmha_decode_bf16_cluster_program_needs_a_cluster_per_tile(
     decode_target, target, device_scales

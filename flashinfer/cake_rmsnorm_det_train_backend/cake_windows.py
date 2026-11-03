@@ -269,7 +269,8 @@ PROGRAM_WINDOWS: dict[str, dict[str, tuple[tuple[int, int | None, str], ...]]] =
             (5120, 12288, "cake_rmsnorm_det_train_a385ae1681a2c078344e"),
             (12288, 40960, "cake_rmsnorm_det_train_af005462cd6a301f31c4"),
             (40960, 99840, "cake_rmsnorm_det_train_a385ae1681a2c078344e"),
-            (99840, 1572864, "cake_rmsnorm_det_train_0291949ba535c646c3a8"),
+            (99840, 720896, "cake_rmsnorm_det_train_083ea823c691e0631ad3"),
+            (720896, 1572864, "cake_rmsnorm_det_train_0291949ba535c646c3a8"),
             (1572864, None, "cake_rmsnorm_det_train_c18297d75c0d424978fd"),
         ),
         "bwd_w32_h256": (
@@ -278,7 +279,8 @@ PROGRAM_WINDOWS: dict[str, dict[str, tuple[tuple[int, int | None, str], ...]]] =
             (5120, 12288, "cake_rmsnorm_det_train_420788e663a2c3a810f6"),
             (12288, 40960, "cake_rmsnorm_det_train_b7d9577ff884de98ea06"),
             (40960, 99840, "cake_rmsnorm_det_train_420788e663a2c3a810f6"),
-            (99840, 1572864, "cake_rmsnorm_det_train_89505762fa1cbf33cb8f"),
+            (99840, 720896, "cake_rmsnorm_det_train_c4c89f0d04b7b3a38d0b"),
+            (720896, 1572864, "cake_rmsnorm_det_train_89505762fa1cbf33cb8f"),
             (1572864, None, "cake_rmsnorm_det_train_f788ef57163552825d27"),
         ),
         "bwd_h4096": (
@@ -738,6 +740,7 @@ EDGES: dict[str, dict[str, tuple[tuple[int, str], ...]]] = {
             (12288, "same"),
             (40960, "same"),
             (99840, "same"),
+            (720896, "same"),
             (1572864, "same"),
         ),
         "bwd_w32_h256": (
@@ -746,6 +749,7 @@ EDGES: dict[str, dict[str, tuple[tuple[int, str], ...]]] = {
             (12288, "same"),
             (40960, "same"),
             (99840, "same"),
+            (720896, "same"),
             (1572864, "same"),
         ),
         "bwd_h4096": ((256, "same"), (1024, "same"), (4096, "same"), (48640, "same")),
@@ -1158,7 +1162,7 @@ its own windows.
   (55296, inf) 018f0cd7
 * ``sm_103a`` ``bwd_h256``: (0, 2048] a385ae16 = (2048, 5120] af005462 =
   (5120, 12288] a385ae16 = (12288, 40960] af005462 = (40960, 99840] a385ae16 =
-  (99840, 1572864] 0291949b = (1572864, inf) c18297d7
+  (99840, 720896] 083ea823 = (720896, 1572864] 0291949b = (1572864, inf) c18297d7
 * ``sm_103a`` ``bwd_h4096``: (0, 256] 50044ee3 = (256, 1024] ad2bb26e =
   (1024, 4096] 24643edc = (4096, 48640] 35a0b0ca = (48640, inf) 850eec3a
 * ``sm_103a`` ``bwd_h512``: (0, 1024] 09601d42 ~ (1024, 4096] 8e7f4d81 =

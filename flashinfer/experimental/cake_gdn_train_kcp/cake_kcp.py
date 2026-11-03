@@ -3033,6 +3033,7 @@ class CallKcp:
         scale: float,
         ops: dict[str, torch.Tensor],
         backward: bool,
+        packed_grads: bool = True,
     ) -> None:
         self.ctx, self.ws, self.tb, self.backend, self.opts = ctx, ws, tb, backend, opts
         self.H_qk, self.HV = int(H_qk), int(HV)
@@ -3073,6 +3074,8 @@ class CallKcp:
         self.grad_layout: str | None = (
             None  # "packed" | "separate" (the backward's dq / dk / dv)
         )
+        # whether dq / dk / dv may be the head views of one packed dQKV row (:func:`_alloc_grads`)
+        self.packed_grads = bool(packed_grads)
         self.exchange = _exchange_scheme(tb, opts)
         # use_qk_l2norm_in_kernel: the q / k readers bind qn / kn (:meth:`qk`), #1 / #8 run as their _l2n siblings
         self.l2n = bool(opts.use_qk_l2norm_in_kernel)
@@ -5051,9 +5054,11 @@ def _prepare(
     dout=None,
     fresh_pools: Sequence[str] = (),
     saved_backward: bool = False,
+    packed_grads: bool = True,
 ):
     """``fresh_pools``: the pools this call binds fresh / saved tensors for (never read from the workspace);
-    ``saved_backward``: a backward from a saved set (it never exchanges through the forward's pools)."""
+    ``saved_backward``: a backward from a saved set (it never exchanges through the forward's pools);
+    ``packed_grads``: a backward may write ``dq`` / ``dk`` / ``dv`` as views of one packed row (:func:`_alloc_grads`)."""
     backend = get_backend(opts.backend)
     if (
         opts.use_qk_l2norm_in_kernel
@@ -5143,6 +5148,7 @@ def _prepare(
         scale=SCALE if scale is None else float(scale),
         ops=ops,
         backward=backward,
+        packed_grads=packed_grads,
     )
     backend.begin_call(call)
     return call, batched
@@ -5754,8 +5760,10 @@ def _bwd_entry(
     scale: float | None,
     workspace: WorkspaceKcp | None,
     opts: OptionsKcp,
+    packed_grads: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """:func:`chunk_gdn_bwd_kcp` with validated options and mode."""
+    """:func:`chunk_gdn_bwd_kcp` with validated options and mode.  ``packed_grads``: ``dq`` / ``dk`` / ``dv`` may be
+    the head views of one packed row when ``q`` / ``k`` / ``v`` are (:func:`_alloc_grads`); part of the graph key."""
     entry = None
     if opts.graph != "off":
         kept = () if saved is None else saved.tensors()
@@ -5767,7 +5775,7 @@ def _bwd_entry(
             opts,
             scale,
             (q, k, v, g, beta, dout, *kept),
-            (saved is not None,),
+            (saved is not None, packed_grads),
         )
     if entry is not None and entry.replayable(workspace):
         _graph_replay("bwd", entry)
@@ -5787,6 +5795,7 @@ def _bwd_entry(
         dout=dout,
         fresh_pools=_saved_fresh_pools(saved),
         saved_backward=saved is not None,
+        packed_grads=packed_grads,
     )
     if saved is not None:
         _check_saved(saved, call)
@@ -5811,6 +5820,7 @@ def _bwd_entry(
             dout=dout,
             fresh_pools=_saved_fresh_pools(saved),
             saved_backward=saved is not None,
+            packed_grads=packed_grads,
         )
         if saved is not None:
             _check_saved(saved, call)
@@ -5826,18 +5836,25 @@ def _alloc_grads(call: CallKcp) -> None:
     """The five gradient outputs, fresh per call.  Allocated right before #8 (:func:`_backward` calls this after the
     adjoint tape walk and the ``BWD_DEAD_BEFORE_DQKG`` release): only #8 / #9 write them, and allocating them at the
     top of the backward put 2 x (dq + dk) + dv + dbeta + dg at the backward's peak moment -- the adjoint tape walk --
-    for nothing (R2-L1 1b)."""
+    for nothing (R2-L1 1b).
+
+    ``dq`` / ``dk`` / ``dv`` are the head views of one packed dQKV row when ``q`` / ``k`` / ``v`` are those of one
+    packed row and ``call.packed_grads`` (autograd: the operands are the outputs of :func:`packed_qkv_views_kcp`'s
+    split node, which hands that row on; the explicit backward: always), and three contiguous tensors otherwise."""
     dt = call.backend.dtypes
     T, H_qk, HV = call.T_r, call.H_qk, call.HV
     o = call.ops
     packed = (
-        dt["dq"] == dt["dk"] == dt["dv"] == o["q"].dtype
+        call.packed_grads
+        and dt["dq"] == dt["dk"] == dt["dv"] == o["q"].dtype
         and _packed_rows(o["q"], o["k"], o["v"], H_qk, HV) is not None
     )
     if packed:
         # q / k / v are head views of one packed row: dq / dk / dv are the same views of one fresh dQKV row, so the
         # layer below (the convolution's backward) reads one contiguous [T, (2 H_qk + HV) * 128] gradient with no
-        # concatenation (:func:`packed_qkv_views_kcp`)
+        # concatenation (:func:`packed_qkv_views_kcp`).  Any other consumer of the gradients (torch's split, view or
+        # slice backward) concatenates or copies them, which is faster from three contiguous tensors than from three
+        # column views of one row: those get separate gradients
         qkv = _alloc((T, (2 * H_qk + HV) * D), dt["dq"], call.device)
         a, b = H_qk * D, 2 * H_qk * D
         dq = qkv[:, :a].view(T, H_qk, D)
@@ -5878,11 +5895,28 @@ class ChunkGDNFunctionKcp(torch.autograd.Function):
     ``recompute_output="auto"`` the recompute of a region this node closes (the last saver) leaves its output program
     out (the frame proof of :func:`_recompute_output_dead`); its output is read by nothing.  ``executable`` (read by
     :func:`chunk_gdn_kcp` before ``apply``, where grad mode is still the caller's) says whether autograd will create
-    this node and pack its saved tensors at all; a non-executable node never skips."""
+    this node and pack its saved tensors at all; a non-executable node never skips.  ``packed_grads`` (also read by
+    :func:`chunk_gdn_kcp` before ``apply``, from the operands' autograd nodes) says whether the backward may write
+    ``dq`` / ``dk`` / ``dv`` as views of one packed row: only for the outputs of :func:`packed_qkv_views_kcp`'s split
+    node, which hands that row on (:func:`_feeds_packed_split`).  It is decided in the original forward and kept on
+    the node, never read from the operands in the backward (under a non-reentrant checkpoint those are the
+    recompute's detached tensors)."""
 
     @staticmethod
     def forward(
-        fctx, q, k, v, g, beta, ctx, scale, workspace, opts, executable, handle
+        fctx,
+        q,
+        k,
+        v,
+        g,
+        beta,
+        ctx,
+        scale,
+        workspace,
+        opts,
+        executable,
+        handle,
+        packed_grads=True,
     ):
         boundary = None if handle is None else _handle_lookup(handle)
         gid = _graph_task_id() if opts.reuse_recompute_tapes else -1
@@ -5940,6 +5974,7 @@ class ChunkGDNFunctionKcp(torch.autograd.Function):
         )
         # the forward's numerical mode: the backward reads only a forward of its own mode
         fctx.kcp_mode = MODE
+        fctx.kcp_packed_grads = bool(packed_grads)
         return out
 
     @staticmethod
@@ -5993,8 +6028,9 @@ class ChunkGDNFunctionKcp(torch.autograd.Function):
             scale=scale,
             workspace=workspace,
             opts=opts,
+            packed_grads=fctx.kcp_packed_grads,
         )
-        return dq, dk, dv, dg, dbeta, None, None, None, None, None, None
+        return dq, dk, dv, dg, dbeta, None, None, None, None, None, None, None
 
 
 # chunk_gdn_kcp's validated options per keyword set (no ``options`` object): an OptionsKcp built and checked once per
@@ -6021,6 +6057,28 @@ def _keyword_options(over: dict[str, Any], knobs: dict[str, Any]) -> OptionsKcp:
     return opts
 
 
+# the deterministic package's packed Q/K/V split, by module and class name (never imported here)
+_DET_PACKED_SPLIT = (
+    "flashinfer.experimental.cake_gdn_det_train_kcp.cake_kcp",
+    "PackedQKVSplitDetKcp",
+)
+
+
+def _feeds_packed_split(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> bool:
+    """Whether ``q`` / ``k`` / ``v`` are the three outputs, in order, of one :func:`packed_qkv_views_kcp` split node
+    (or of the deterministic package's ``packed_qkv_views_det_kcp`` node): the consumers that hand a packed dQKV row
+    on as ``qkv``'s gradient without a copy.  Autograd metadata only (no tensor content read)."""
+    node = q.grad_fn
+    if node is None or k.grad_fn is not node or v.grad_fn is not node:
+        return False
+    if (q.output_nr, k.output_nr, v.output_nr) != (0, 1, 2):
+        return False
+    cls = getattr(type(node), "_forward_cls", None)
+    if cls is PackedQKVSplitKcp:
+        return True
+    return cls is not None and (cls.__module__, cls.__qualname__) == _DET_PACKED_SPLIT
+
+
 PACKED_SPLIT_STATS: dict[str, int] = {
     "aliased": 0,  # split backwards that returned the incoming packed dQKV row itself
     "concatenated": 0,  # split backwards that concatenated (the gradients were not one packed row)
@@ -6042,7 +6100,8 @@ def _qkv_views(
 class PackedQKVSplitKcp(torch.autograd.Function):
     """:func:`packed_qkv_views_kcp` as an autograd node.  The backward returns the packed gradient row itself when the
     three incoming gradients are the head views of one packed row (what :func:`chunk_gdn_kcp`'s backward writes for
-    packed operands) and concatenates them otherwise (a missing gradient counts as zeros)."""
+    this node's outputs when they are packed operands: :func:`_feeds_packed_split`) and concatenates them otherwise
+    (a missing gradient counts as zeros)."""
 
     @staticmethod
     def forward(fctx, qkv, H_qk, HV):
@@ -6128,9 +6187,10 @@ def chunk_gdn_kcp(
 
     ``q`` / ``k`` / ``v`` that are head views of one packed ``[..., T, (2 H_qk + HV) * 128]`` row get the full backward
     speed as :func:`packed_qkv_views_kcp` views (conditions: README, "Packed Q/K/V").  Plain ``split`` / ``view``
-    views of the row run the same programs on the same operands and give the same results, but torch's split
-    backward concatenates ``dq`` / ``dk`` / ``dv`` into a new row: about 1.1-1.2 ms (33-37 %) more backward per call
-    at ``(16, 48)`` and 32,768 tokens on B200 and GB300, with the in-kernel norm off or on (README, "Packed Q/K/V")."""
+    views of the row run the same programs on the same operands and give the same results, but the backward writes
+    three contiguous ``dq`` / ``dk`` / ``dv`` for them and torch's split backward concatenates them into a new row:
+    about 0.2 ms (6-7 %) more backward per call at ``(16, 48)`` and 32,768 tokens on B200 and GB300 and 0.17 ms
+    (7-8 %) on R200, with the in-kernel norm off or on (README, "Packed Q/K/V")."""
     check_mode(deterministic, "chunk_gdn_kcp")
     over = _literal_overrides(
         options,
@@ -6173,7 +6233,18 @@ def chunk_gdn_kcp(
         t.requires_grad for t in (q, k, v, g, beta)
     )
     return ChunkGDNFunctionKcp.apply(
-        q, k, v, g, beta, ctx, scale, workspace, opts, executable, recompute_handle
+        q,
+        k,
+        v,
+        g,
+        beta,
+        ctx,
+        scale,
+        workspace,
+        opts,
+        executable,
+        recompute_handle,
+        executable and _feeds_packed_split(q, k, v),
     )
 
 

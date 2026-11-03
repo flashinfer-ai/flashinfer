@@ -1232,9 +1232,13 @@ TWO_STREAM_FORMS = {
 
 
 def _adjoint_two_streams(form: str, heads: tuple[int, int]) -> bool:
-    """Whether the adjoint ``dhu_tc2`` runs as two groups on a grouped table: a serial plan beside ``tail_g2``, the
-    pass 2 of a split plan beside ``tail_g3``; the other pairings keep the adjoint on the caller's stream."""
-    return (form, heads[1] // heads[0]) in (("serial", 2), ("split", 3))
+    """Whether the adjoint ``dhu_tc2`` runs as two groups on a grouped table on this device: a serial plan beside
+    ``tail_g2`` (beside ``tail_g3`` too on the architectures of ``TWO_STREAM_SERIAL_G3_ARCHS``), the pass 2 of a split
+    plan beside ``tail_g3``; the other pairings keep the adjoint on the caller's stream."""
+    arch = cake_backend.device_arch(torch.cuda.current_device())
+    serial = (2, 3) if arch in cake_chain.TWO_STREAM_SERIAL_G3_ARCHS else (2,)
+    group = heads[1] // heads[0]
+    return (form == "serial" and group in serial) or (form, group) == ("split", 3)
 
 
 @pytest.mark.parametrize("save_state", [True, False], ids=["saved", "recompute"])
@@ -1266,8 +1270,8 @@ def test_two_streams_match_one_stream(
         runs.append(_run(inputs, seq_lens, initial_state=h0, output_final_state=True, dht=dht, streams=streams,
                          lpt=lpt, save_state=save_state, **STREAM_PINS))  # fmt: skip
         side = [stage for stage, stream in launches[start:] if stream != main]
-        # the side stream: wy_tc and fwd_ho of the forward's group A, dhu_tc2 of the adjoint's group B beside tail_g2
-        # of group A (beside tail_g3 a serial adjoint scan runs one launch on the caller's stream)
+        # the side stream: wy_tc and fwd_ho of the forward's group A, dhu_tc2 of the adjoint's group B beside the
+        # fused tail of group A (beside tail_g3 off TWO_STREAM_SERIAL_G3_ARCHS one launch on the caller's stream)
         expected = ["wy_tc", "fwd_ho"] + (
             ["dhu_tc2"] if _adjoint_two_streams("serial", heads) else []
         )
@@ -2282,8 +2286,8 @@ def test_head_pairs_dispatch_the_fused_tail(pair, device, monkeypatch) -> None:
 def test_head_pairs_run_the_two_stream_tail(pair, form, device, monkeypatch) -> None:
     # HV = 3 H with the planner on few SMs: the pass 2 of a split plan on dhu_tc2 runs as two groups, the side stream
     # scanning group B while the caller's stream runs tail_g3 of group A; a serial tcgen05 adjoint scan, grouped on the
-    # table, keeps one launch on the caller's stream; the outputs pass the FP64 gate and equal the one-stream call
-    # bitwise
+    # table, does the same on the architectures of TWO_STREAM_SERIAL_G3_ARCHS and elsewhere keeps one launch on the
+    # caller's stream; the outputs pass the FP64 gate and equal the one-stream call bitwise
     heads, beta_dtype = pair
     num_v_heads = heads[1]
     if form == "serial":
@@ -2301,7 +2305,7 @@ def test_head_pairs_run_the_two_stream_tail(pair, form, device, monkeypatch) -> 
     two = _run(inputs, PAIR_LAYOUT, streams=2, **pins)
     stages = [stage for stage, _stream in launches]
     side = [stage for stage, stream in launches if stream != main]
-    if form == "split":
+    if _adjoint_two_streams(form, heads):
         assert side.count("dhu_tc2") == 1 and tail not in side, launches
         assert stages.count("dhu_tc2") == 2 and stages.count(tail) == 2, stages
     else:

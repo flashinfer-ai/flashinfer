@@ -78,6 +78,14 @@ for the previous one passes its `bool` in that slot and raises `TypeError`.
   saved set carries the deterministic package's `gate` / `lower_bound`
   fields (`"g"` / `None` here); the backward refuses a set of the raw gate
   mode or of the in-kernel L2 norm (#7817).
+- The in-kernel q / k L2 norm (`use_qk_l2norm_in_kernel=True`, raw `q` / `k`
+  normalized inside the kernels, FlashInfer #7817) runs on the deterministic
+  package only, the same way: the facade forwards the keyword to it with
+  `deterministic=True`, and this package's entry points raise `ValueError`
+  for it (`KdaWorkspace.for_problem`, `workspace_bytes` and `saved_bytes`
+  for `l2n` other than `"off"`).  `False` is accepted, so a call that spells
+  it out runs unchanged.  The saved set carries the deterministic package's
+  `qk_rstd` / `qk_l2norm` fields (`None` / `False` here).
 
 ## What changes: the `S1` backward pairs
 
@@ -261,6 +269,7 @@ changes:
 | `glm_intra`, `glm_intra_v14`, `glm_intra_v18` | the same programs; rules narrowed to the deterministic-pair rows |
 | `dqkg_davq_nohint`, `dqkg_int_davq_nohint` | not shipped (`sm_107a` runs the `S1` pairs from 16 heads) |
 | `fwd_intra_raw`, `fwd_intra_v14_raw`, `bwd_prep_g8_raw`, `bwd_prep_g8_replay_raw`, `bwd_prep_g8_noqg_raw`, `bwd_prep_g8_noqg_nokb_raw`, `glm_intra_raw`, `param_finalize` | not shipped (the raw gate mode, which this package refuses) |
+| `fwd_intra_l2n`, `fwd_intra_v14_l2n`, `fwd_intra_v37_l2n`, `bwd_prep_g8_l2n`, `bwd_prep_g8_replay_l2n`, `bwd_prep_g8_noqg_l2n`, `bwd_prep_g8_noqg_nokb_l2n`, `glm_intra_l2n`, `glm_intra_l2n_capture`, `qk_l2norm`, `qk_l2norm_apply`, `qk_pullback`, `fwd_intra_raw_l2n`, `fwd_intra_v14_raw_l2n`, `bwd_prep_g8_raw_l2n`, `bwd_prep_g8_replay_raw_l2n`, `bwd_prep_g8_noqg_raw_l2n`, `bwd_prep_g8_noqg_nokb_raw_l2n`, `glm_intra_raw_l2n`, `glm_intra_raw_l2n_capture` | not shipped (the in-kernel Q/K L2 norm, which this package refuses) |
 | `fwd_intra_v19`, `fwd_intra_v20` | new: the checkpoint hand-off's intra twins of `fwd_intra_v14` and `fwd_intra` (all three architectures); no path selects them |
 | `wy_bwd_v9` | new: the tape WY twin of `wy_bwd`, writing `w` alone (all three architectures); no path selects it |
 

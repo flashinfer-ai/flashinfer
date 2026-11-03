@@ -1171,7 +1171,7 @@ def _sm_count() -> int:
 
 # The rows per SM up to which sm_100a and sm_103a run the short forward, and
 # from which each architecture runs the mid and the long forward.
-SHORT_FORWARD_ROWS_PER_SM = 10
+SHORT_FORWARD_ROWS_PER_SM = 12
 MID_FORWARD_ROWS_PER_SM = {"sm_100a": 976, "sm_103a": 976, "sm_107a": 800}
 LONG_FORWARD_ROWS_PER_SM = {"sm_100a": 2400, "sm_103a": 2400, "sm_107a": 1740}
 # Forward inputs around and past the short, the mid and the long forward's
@@ -1239,6 +1239,78 @@ def test_forward_around_the_long_threshold_matches_the_deterministic_package(
         want = routes["fwd_mid"]
     assert name == want, (arch, rows, sms)
     assert torch.equal(y, det_forward(x, z, w, EPS)), "y vs the deterministic package"
+
+
+# Gate inputs at and past the edges of the packed gate's range: below -41,
+# subnormal and zero, infinite and NaN, beside saturated and ordinary ones.
+GATE_EDGE_VALUES = [
+    -1e4,
+    -100.0,
+    -42.0,
+    -41.0,
+    -40.0,
+    -1e-30,
+    -1e-39,
+    -0.0,
+    0.0,
+    1e-39,
+    1e-30,
+    40.0,
+    100.0,
+    1e4,
+    float("inf"),
+    float("-inf"),
+    float("nan"),
+]
+# Forward inputs the short forward runs where the architecture routes it, and
+# those at its threshold of 12 rows per SM on 148 SMs (37x48, 253x7, 55x32)
+# and on 152 SMs (38x48, 260x7, 57x32).
+GATE_EDGE_CASES = [
+    pytest.param(1, 48, id="1x48"),
+    pytest.param(13, 48, id="13x48"),
+    pytest.param(30, 48, id="30x48"),
+    pytest.param(31, 48, id="31x48"),
+    pytest.param(33, 48, id="33x48"),
+    pytest.param(37, 48, id="37x48"),
+    pytest.param(38, 48, id="38x48"),
+    pytest.param(13, 7, id="13x7"),
+    pytest.param(217, 7, id="217x7"),
+    pytest.param(253, 7, id="253x7"),
+    pytest.param(260, 7, id="260x7"),
+    pytest.param(55, 32, id="55x32"),
+    pytest.param(57, 32, id="57x32"),
+]
+
+
+@requires_device
+@pytest.mark.parametrize("tokens,heads", GATE_EDGE_CASES)
+def test_forward_gate_edges_match_the_deterministic_package(
+    tokens, heads, determinism_setting, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With gate inputs at and past the packed gate's range in two of every
+    three rows (a quarter of their elements, so the range check fails for some
+    threads of a row and holds for others) and ordinary ones in the rest,
+    ``y`` is the deterministic package's bits, NaN included, and the forward
+    launches ``module_for_rows``' module."""
+    sms = _sm_count()
+    arch = loader.device_arch(torch.cuda.current_device())
+    x, z, w, _ = suite.make(tokens, heads, seed=23)
+    g = torch.Generator(device=z.device).manual_seed(24)
+    values = torch.tensor(GATE_EDGE_VALUES, device=z.device).bfloat16()
+    pick = torch.randint(
+        0, len(GATE_EDGE_VALUES), z.shape, device=z.device, generator=g
+    )
+    edge = torch.rand(z.shape, device=z.device, generator=g) < 0.25
+    rows = torch.arange(tokens * heads, device=z.device).view(tokens, heads, 1)
+    edge &= rows % 3 != 0
+    z.copy_(torch.where(edge, values[pick], z))
+    launched = _spy_launches(monkeypatch)
+    y = nd_forward(x, z, w, EPS)
+    assert launched == [loader.module_for_rows(arch, "fwd", tokens * heads, sms)]
+    want = det_forward(x, z, w, EPS)
+    assert torch.equal(y.view(torch.int16), want.view(torch.int16)), (
+        "y vs the deterministic package"
+    )
 
 
 # The rows per SM from which each architecture runs the long backward.

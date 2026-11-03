@@ -79,6 +79,15 @@ no bit changes; a replayed graph (``graph="replay"``) contains no host work.
 ``_set_test_knobs({"host_trim": 0})`` (with ``CAKE_KCP_TEST_KNOBS=1``) selects
 the previous host path for the A/B record.
 
+Backward grid beside a concurrent kernel (FlashInfer issue #8365): the main
+backward launches :func:`_bwd_grid`, ``ctas_per_sm x SM count`` CTAs less
+``ctas_per_sm`` when the last channel-tile rank of that grid holds at least
+``ctas_per_sm`` CTAs.  A kernel on another stream that keeps one SM's shared
+memory leaves room for ``ctas_per_sm`` fewer CTAs; with the full grid the top
+CTAs, each carrying a whole token stream, then run in a second wave.  The
+program derives its token streams and ticket count from ``gridDim``, so ``dx``
+keeps its bits and ``dweight`` sums the same terms in other partial sums.
+
 Checkpoint recompute without the halo exchange (FlashInfer issues #7815 /
 #7818): with ``recompute_handle=`` (:class:`RecomputeHandleKcp`, or any object
 with an ``entries`` dict) the original forward exchanges as always and stores
@@ -552,6 +561,22 @@ def _launch_trim(
                 ) from None
     with tvm_ffi.use_raw_stream(_ffi_device(device_index), _raw_stream(device_index)):
         getattr(module, entry)(*args)
+
+
+def _bwd_grid(
+    record: dict[str, Any], n_ch_tiles: int, device_index: int
+) -> tuple[int, int, int]:
+    """The main backward program's launch grid (issue #8365): :func:`launch_grid` of ``record`` on the device, less
+    ``ctas_per_sm`` CTAs when that grid is a single wave (``grid_mult`` 1) whose last channel-tile rank holds at
+    least ``ctas_per_sm`` CTAs (``grid % n_ch_tiles >= ctas_per_sm``), so the grid fits on one SM fewer; any other
+    grid launches unchanged.  The trimmed grid keeps every channel tile's CTAs but one rank's worth at most."""
+    grid = launch_grid(record, device_index=device_index)
+    rule = record["grid_rule"]
+    k = int(rule["ctas_per_sm"])
+    single_wave = int(rule["grid_mult"][_loader.device_arch(device_index)]) == 1
+    if single_wave and grid[0] % int(n_ch_tiles) >= k:
+        return (grid[0] - k, grid[1], grid[2])
+    return grid
 
 
 def _set_test_knobs(knobs: Optional[dict]) -> dict:
@@ -1130,7 +1155,12 @@ def _kcp_backward(
     if work is not None:
         work.wait()
     for name in names:
-        run_module(name, values, device_index=device_index)
+        run_module(
+            name,
+            values,
+            device_index=device_index,
+            grid=_bwd_grid(_loader.MODULES[name], scalars["n_ch_tiles"], device_index),
+        )
     return dx_out, dw_out
 
 
@@ -1246,7 +1276,9 @@ def _bwd_host(
             e["launches"] = tuple(
                 _launch_plan(
                     name,
-                    launch_grid(_loader.MODULES[name], device_index=device_index),
+                    _bwd_grid(
+                        _loader.MODULES[name], scalars["n_ch_tiles"], device_index
+                    ),
                     device_index,
                 )
                 for name in names

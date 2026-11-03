@@ -6199,3 +6199,206 @@ def test_fused_forward_releases_a_caller_arenas_tapes_and_kept_backward_leaves_t
         assert kcp.kept_registry_size() == 0
     for n in ("out",) + CKPT_GRADS:
         assert torch.equal(arms[1][n], arms[0][n]), n
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# The gradient layout follows the consumer of q / k / v (issue #8367).  Only a packed Q/K/V split node that hands a
+# packed dQKV row on (packed_qkv_views_kcp's, or the deterministic package's packed_qkv_views_det_kcp's) gets one;
+# plain split / view / slice views of a packed row and leaf views get three contiguous gradients, which torch's split
+# backward concatenates faster than three column views of one row.  The explicit backward keeps the pointer rule.
+
+ROW_FORMS = ("contiguous", "packed", "det", "plain", "slice", "leaf")
+CKPT_FORMS = ("direct", "nonreentrant", "reentrant", "handle")
+
+
+def _row_views(kcp, form: str, row: torch.Tensor, H_qk: int, HV: int):
+    """q / k / v of ``form`` over the packed ``[T, (2 H_qk + HV) * 128]`` row: ``"packed"`` =
+    :func:`packed_qkv_views_kcp`, ``"det"`` = the deterministic package's ``packed_qkv_views_det_kcp``, ``"plain"`` =
+    ``split`` + ``view``, ``"slice"`` = column slices + ``view``."""
+    T, a = row.shape[0], H_qk * 128
+    if form == "packed":
+        return kcp.packed_qkv_views_kcp(row, H_qk=H_qk, HV=HV)
+    if form == "det":
+        det = pytest.importorskip("flashinfer.experimental.cake_gdn_det_train_kcp")
+        return det.packed_qkv_views_det_kcp(row, H_qk=H_qk, HV=HV)
+    if form == "plain":
+        parts = row.split((a, a, HV * 128), dim=-1)
+        return tuple(
+            p.view(T, n, 128) for p, n in zip(parts, (H_qk, H_qk, HV), strict=True)
+        )
+    assert form == "slice", form
+    return (
+        row[:, :a].view(T, H_qk, 128),
+        row[:, a : 2 * a].view(T, H_qk, 128),
+        row[:, 2 * a :].view(T, HV, 128),
+    )
+
+
+def _layout_pass(kcp, ctx, ops, form: str, mode: str, **opts) -> dict:
+    """One autograd pass of ``chunk_gdn_kcp`` (fake backend) with q / k / v of ``form`` over one packed leaf row
+    holding ``q | k | v``: a :func:`_row_views` form, ``"contiguous"`` (three contiguous leaves holding the same
+    values) or ``"leaf"`` (three leaves that are head views of the row).  ``mode``: ``"direct"``, a checkpoint whose
+    function makes the views (``"nonreentrant"`` / ``"reentrant"``) or the non-reentrant checkpoint with a
+    :class:`RecomputeHandleKcp` (``"handle"``).  Returns ``out``, the row gradient (the leaves' gradients side by side
+    for the leaf forms), ``dg``, ``dbeta``, the backward's ``grad_layout``, the ``PACKED_SPLIT_STATS`` deltas of this
+    package (``split``) and of the deterministic one (``det_split``, ``"det"`` form only) and the (strides,
+    contiguous) of every gradient a hook on the ``q`` that the backward reaches received."""
+    T, H_qk, HV = ops["q"].shape[0], ops["q"].shape[1], ops["v"].shape[1]
+    a = H_qk * 128
+    row = torch.cat([ops[n].reshape(T, -1) for n in ("q", "k", "v")], -1)
+    row = row.contiguous().requires_grad_(True)
+    g, beta = (ops[n].detach().clone().requires_grad_(True) for n in ("g", "beta"))
+    leaves: tuple = ()
+    if form == "contiguous":
+        leaves = tuple(ops[n].detach().clone().requires_grad_(True) for n in "qkv")
+    elif form == "leaf":
+        cols = ((0, a), (a, 2 * a), (2 * a, None))
+        leaves = tuple(
+            row.detach()[:, lo:hi].view(T, n, 128).requires_grad_(True)
+            for (lo, hi), n in zip(cols, (H_qk, H_qk, HV), strict=True)
+        )
+    hooks: list = []
+    armed: list = []
+    o = {"backend": "fake", **opts}
+    if mode == "handle":
+        o["save_transfer"] = False
+
+    def fn(row, g, beta, *rest):
+        q, k, v = rest[:3] if leaves else _row_views(kcp, form, row, H_qk, HV)
+        # the q the backward reaches (a reentrant checkpoint: the re-run's; its first pass runs without grad)
+        if torch.is_grad_enabled() and q.requires_grad and not armed:
+            armed.append(True)
+            q.register_hook(
+                lambda gr: hooks.append((tuple(gr.stride()), gr.is_contiguous()))
+            )
+        handle = rest[-1] if mode == "handle" else None
+        return kcp.chunk_gdn_kcp(
+            q, k, v, g, beta, ctx, recompute_handle=handle, **o, deterministic=False
+        )
+
+    args = (row, g, beta, *leaves)
+    if mode == "handle":
+        args = (*args, kcp.RecomputeHandleKcp())
+    det_kcp = (
+        importlib.import_module(
+            "flashinfer.experimental.cake_gdn_det_train_kcp.cake_kcp"
+        )
+        if form == "det"
+        else None
+    )
+    before = dict(kcp.PACKED_SPLIT_STATS)
+    det_before = dict(det_kcp.PACKED_SPLIT_STATS) if det_kcp is not None else {}
+    if mode == "direct":
+        out = fn(*args)
+    else:
+        from torch.utils.checkpoint import checkpoint
+
+        out = checkpoint(fn, *args, use_reentrant=mode == "reentrant")
+    out.backward(ops["dout"])
+    return {
+        "out": out.detach(),
+        "row": torch.cat([x.grad.reshape(T, -1) for x in leaves], -1)
+        if leaves
+        else row.grad,
+        "dg": g.grad,
+        "dbeta": beta.grad,
+        "grad_layout": kcp.LAST_CALL["bwd"]["grad_layout"],
+        "split": {n: kcp.PACKED_SPLIT_STATS[n] - before[n] for n in before},
+        "det_split": {
+            n: det_kcp.PACKED_SPLIT_STATS[n] - det_before[n] for n in det_before
+        },
+        "hooks": hooks,
+    }
+
+
+@pytest.mark.parametrize("mode", CKPT_FORMS)
+@pytest.mark.parametrize("form", ROW_FORMS[1:])
+def test_gradient_layout_follows_the_consumer_of_the_views(form, mode) -> None:
+    """Head views of one packed row get ``dq`` / ``dk`` / ``dv`` as the same views of one packed dQKV row only when
+    they are the outputs of a split node that hands that row on (``packed_qkv_views_kcp`` or the deterministic
+    package's ``packed_qkv_views_det_kcp``: ``grad_layout="packed"``, that split's ``aliased`` count + 1); plain
+    ``split`` / ``view`` and slice views and leaf views get three contiguous gradients (``"separate"``; no split
+    count moves).  The decision is the original forward's (a non-reentrant checkpoint's recompute sees detached
+    tensors), the reentrant re-run's own (it makes the views) and the handle form's.  A hook on ``q`` fires once,
+    with a contiguous gradient exactly when the layout is separate.  ``out``, the row gradient, ``dg`` and ``dbeta``
+    are bitwise those of contiguous operands (the same programs on the same operands, only the gradient layout
+    differs: a property of the fake backend's emulation) and within the budget of the FP64 reference."""
+    kcp, ctx, ops = _ckpt_setup()
+    ref = _layout_pass(kcp, ctx, ops, "contiguous", mode)
+    assert ref["grad_layout"] == "separate" and ref["split"] == {
+        "aliased": 0,
+        "concatenated": 0,
+    }
+    got = _layout_pass(kcp, ctx, ops, form, mode)
+    what = f"form={form} mode={mode}"
+    packed = form in ("packed", "det")
+    assert got["grad_layout"] == ("packed" if packed else "separate"), what
+    assert got["split"] == {"aliased": int(form == "packed"), "concatenated": 0}, (
+        what,
+        got["split"],
+    )
+    if form == "det":
+        assert got["det_split"] == {"aliased": 1, "concatenated": 0}, (
+            what,
+            got["det_split"],
+        )
+    assert len(got["hooks"]) == 1 and got["hooks"][0][1] == (not packed), (
+        what,
+        got["hooks"],
+    )
+    for n in ("out", "row", "dg", "dbeta"):
+        assert torch.equal(got[n], ref[n]), (what, n)
+    T, H_qk = ops["q"].shape[0], ops["q"].shape[1]
+    a = H_qk * 128
+    res = {
+        "out": got["out"],
+        "dq": got["row"][:, :a].reshape(T, H_qk, 128),
+        "dk": got["row"][:, a : 2 * a].reshape(T, H_qk, 128),
+        "dv": got["row"][:, 2 * a :].reshape(ops["v"].shape),
+        "dg": got["dg"],
+        "dbeta": got["dbeta"],
+    }
+    _arms_within_budget({"views": res}, _ckpt_reference(), ("out",) + CKPT_GRADS, what)
+
+
+def test_explicit_backward_keeps_the_packed_layout_of_any_packed_views() -> None:
+    """``chunk_gdn_bwd_kcp`` has no consumer to look at: head views of one packed row (here plain ``split`` views) get
+    ``dq`` / ``dk`` / ``dv`` as the same views of one fresh packed row, whatever made the views."""
+    kcp, ctx, ops = _ckpt_setup()
+    T, H_qk, HV = ops["q"].shape[0], ops["q"].shape[1], ops["v"].shape[1]
+    row = torch.cat([ops[n].reshape(T, -1) for n in ("q", "k", "v")], -1).contiguous()
+    q, k, v = _row_views(kcp, "plain", row, H_qk, HV)
+    o = {"backend": "fake", "deterministic": False}
+    out, saved = kcp.chunk_gdn_fwd_kcp(q, k, v, ops["g"], ops["beta"], ctx, **o)
+    dq, dk, dv, _, _ = kcp.chunk_gdn_bwd_kcp(
+        q, k, v, ops["g"], ops["beta"], ctx, ops["dout"], saved=saved, **o
+    )
+    assert kcp.LAST_CALL["bwd"]["grad_layout"] == "packed"
+    assert dq.stride() == q.stride() and dv.stride() == v.stride()
+    step = dq.element_size() * H_qk * 128
+    assert dk.data_ptr() == dq.data_ptr() + step
+    assert dv.data_ptr() == dq.data_ptr() + 2 * step
+
+
+def test_backward_graph_key_carries_the_gradient_layout(monkeypatch) -> None:
+    """The backward's CUDA-graph key holds the layout decision next to the saved-set flag: a graph captured for
+    packed views never replays its packed gradient row for plain views of the same pointers, or the reverse."""
+    kcp, ctx, ops = _ckpt_setup()
+    flags: list = []
+
+    def spy(kind, *args):
+        if kind == "bwd":
+            flags.append(args[-1])
+        return None  # never captured: every call runs eagerly
+
+    monkeypatch.setattr(kcp, "_graph_entry", spy)
+    ws = kcp.WorkspaceKcp()
+    layouts = [
+        _layout_pass(kcp, ctx, ops, form, "direct", graph="replay", workspace=ws)[
+            "grad_layout"
+        ]
+        for form in ("packed", "plain", "packed")
+    ]
+    assert layouts == ["packed", "separate", "packed"]
+    assert [f[-1] for f in flags] == [True, False, True], flags
+    assert len({f[:-1] for f in flags}) == 1, flags

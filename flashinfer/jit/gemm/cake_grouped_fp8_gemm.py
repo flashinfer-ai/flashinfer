@@ -421,6 +421,18 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "arg_plan": "plan0",
         "arches": ["sm_100a", "sm_103a"],
     },
+    "cake_grouped_fp8_gemm_ad951349d53d895b5975": {
+        "kernel": "kernel_cake_grouped_fp8_gemm_ad951349d53d895b5975",
+        "sources": [
+            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_ad951349d53d895b5975_kernel.cu",
+            "cake_grouped_fp8_gemm/cake_grouped_fp8_gemm_ad951349d53d895b5975_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "tma_abi": "grid_constant",
+        "arg_plan": "plan3",
+        "arches": ["sm_103a"],
+    },
     "cake_grouped_fp8_gemm_b51037becc0c4cf72026": {
         "kernel": "kernel_cake_grouped_fp8_gemm_b51037becc0c4cf72026",
         "sources": [
@@ -709,6 +721,10 @@ MODULES: dict[str, dict[str, str]] = {
         "arch": "sm_103a",
         "program": "cake_grouped_fp8_gemm_a14c6ac9847f0cefb838",
     },
+    "cake_grouped_fp8_gemm_ad951349d53d895b5975_sm_103a": {
+        "arch": "sm_103a",
+        "program": "cake_grouped_fp8_gemm_ad951349d53d895b5975",
+    },
     "cake_grouped_fp8_gemm_b51037becc0c4cf72026_sm_100a": {
         "arch": "sm_100a",
         "program": "cake_grouped_fp8_gemm_b51037becc0c4cf72026",
@@ -767,6 +783,7 @@ ROUTES: dict[str, Any] = {
     "bs_ue8m0_n256_run32": "cake_grouped_fp8_gemm_6da15715d9ab967a1cc3",
     "bs_ue8m0_n256_s16": "cake_grouped_fp8_gemm_007fd314577a65b33485",
     "bs_ue8m0_swap": "cake_grouped_fp8_gemm_7ee216a957327349cf41",
+    "bs_ue8m0_swap_bm64": "cake_grouped_fp8_gemm_ad951349d53d895b5975",
     "bs_ue8m0_swap_c1": "cake_grouped_fp8_gemm_31c7f6826b9f7a2db092",
     "bs_ue8m0_swap_carry": "cake_grouped_fp8_gemm_07c6b16218daec7a1273",
     "bs_ue8m0_swap_carry_s16": "cake_grouped_fp8_gemm_4c6307d24f3915e88028",
@@ -803,6 +820,7 @@ ROUTE_GEOMETRY: dict[str, dict[str, int]] = {
     "bs_ue8m0_n256_run32": {"tile_m": 128, "tile_n": 256, "cluster_ctas": 1},
     "bs_ue8m0_n256_s16": {"tile_m": 128, "tile_n": 256, "cluster_ctas": 1},
     "bs_ue8m0_swap": {"tile_m": 128, "tile_n": 256, "cluster_ctas": 2},
+    "bs_ue8m0_swap_bm64": {"tile_m": 64, "tile_n": 256, "cluster_ctas": 2},
     "bs_ue8m0_swap_c1": {"tile_m": 32, "tile_n": 128, "cluster_ctas": 1},
     "bs_ue8m0_swap_carry": {"tile_m": 128, "tile_n": 256, "cluster_ctas": 2},
     "bs_ue8m0_swap_carry_s16": {"tile_m": 128, "tile_n": 256, "cluster_ctas": 2},
