@@ -6466,9 +6466,10 @@ Array<Optional<Tensor>> trtllm_fp4_block_scale_moe(
       config_index, mSupportedTileN, num_tokens, totalExpertsPerToken, totalLocalExperts);
   bool const is_da_launch = is_da_body_preparation || !da_routing_metadata.empty();
   // A default-tactic launch moves to another tile when none of its tile's kernels loads on this
-  // driver (GitHub #5322). An explicit tactic names its tile, and a DA launch's routing metadata
-  // was prepared for its tile, so both keep it.
-  std::vector<int64_t> const tile_order = (config == -1 && !is_da_launch)
+  // driver (GitHub #5322). An explicit tactic names its tile, also one whose config is the tile's
+  // default ([tile, -1]), and a DA launch's routing metadata was prepared for its tile, so both
+  // keep it.
+  std::vector<int64_t> const tile_order = (config_index[0] == -1 && !is_da_launch)
                                               ? tileFallbackOrder(resolved_tile_N, launchers_map)
                                               : std::vector<int64_t>{resolved_tile_N};
   for (size_t attempt = 0; attempt < tile_order.size(); ++attempt) {
@@ -6806,8 +6807,10 @@ Array<Array<int64_t>> trtllm_get_valid_moe_factorizations(
           top_k, hidden_size, intermediate_size, num_local_experts, num_tokens,
           hidden_size_output > 0 ? hidden_size_output : hidden_size);
     } catch (tensorrt_llm::kernels::NoLoadableKernelError const&) {
-      // No kernel of this tile loads on this driver (GitHub #5322): the tile has no anchor, and
-      // profiling rejects its tactics one by one as run() raises for each.
+      // No kernel of this tile loads on this driver (GitHub #5322): the tile has no anchor, so its
+      // rows are left out and the factorized tactic space never sees the tile; the launch falls
+      // back to another tile through tileFallbackOrder().
+      continue;
     }
     result.push_back({tileN, configIndex, components.gemm1Config, components.gemm2Config,
                       configIndex == anchorIndex ? 1 : 0});
