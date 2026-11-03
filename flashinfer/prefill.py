@@ -2735,11 +2735,10 @@ def _blackwell_ragged_auto_upgrade(
     on FA2. The walk tests *capability*, so the order decides the winner
     wherever both candidates are eligible.
 
-    Both candidates' run paths receive only ``causal`` and the scales, so any
-    request for RoPE, a custom mask, a sliding window, a logits soft cap, the
-    multi-item-scoring pointers or attention sinks stashed on the wrapper
-    (vLLM's ``_sinks``) disqualifies every upgrade: selecting one would
-    silently drop the feature.
+    RoPE, custom masks, a logits soft cap and multi-item-scoring pointers
+    disqualify every upgrade. Sliding windows and attention sinks stashed on
+    the wrapper (vLLM's ``_sinks``) are supported by the cuDNN graph path, but
+    disqualify CUTLASS, whose run path receives only ``causal`` and the scales.
 
     ``cudnn`` is chosen only when the installed cuDNN can consume the caller's
     token-unit indptrs directly (``batch_offsets_units="tokens"``: they serve as
@@ -6492,16 +6491,21 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 self._seq_lens_q, self._seq_lens_kv = self._cudnn_mask_buffers
 
         if self._backend == "cudnn":
+            if not _CUDNN_GRAPH_AVAILABLE and (
+                window_left >= 0 or getattr(self, "_sinks", None) is not None
+            ):
+                raise NotImplementedError(
+                    "sliding windows and attention sinks require the cuDNN graph backend"
+                )
             if (
                 pos_encoding_mode != "NONE"
-                or window_left != -1
                 or logits_soft_cap != 0
                 or self._custom_mask_buf is not None
                 or prefix_len_ptr is not None
             ):
                 raise NotImplementedError(
-                    "cuDNN ragged prefill supports only causal or full attention without "
-                    "position encoding, window_left, logits_soft_cap or custom masks"
+                    "cuDNN ragged prefill does not support position encoding, "
+                    "logits_soft_cap or custom masks"
                 )
             # The graph's padded dims default to the indptr diffs computed
             # above, and cuDNN reads cu_seq_lens as int32. Done once here so

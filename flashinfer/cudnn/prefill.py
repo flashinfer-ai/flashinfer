@@ -292,6 +292,23 @@ class UIDs(Enum):
     O_AMAX_UID = 161  # Output amax tensor
 
 
+def _validate_prefill_sinks(q, sinks):
+    if sinks is None:
+        return
+    if (
+        sinks.dim() != 1
+        or sinks.shape[0] != q.shape[1]
+        or sinks.dtype != torch.float32
+        or sinks.device != q.device
+        or not sinks.is_contiguous()
+    ):
+        raise ValueError(
+            f"sinks must be a contiguous float32 tensor of shape (num_heads_qo,) = "
+            f"({q.shape[1]},) on {q.device}, got shape {tuple(sinks.shape)} "
+            f"with dtype {sinks.dtype}, device {sinks.device}, and stride {sinks.stride()}"
+        )
+
+
 def _prefill_runtime_key(q, k_cache, v_cache, scale, o_data_type):
     # Only execute-time tensors belong here. Plan metadata is keyed once by
     # _prefill_descriptor_key; pointer values never select a graph.
@@ -373,6 +390,7 @@ def _prefill_descriptor_key(
         ),
         token_offsets or cu_seq_lens_q is not None,
         window_left,
+        # Validation fixes dtype/stride; Q's runtime key fixes the head count.
         sinks is not None,
     )
     key = (core, (return_lse, layout(batch_offsets_stats) if return_lse else None))
@@ -853,6 +871,9 @@ if CUDNN_AVAILABLE:
             mask_kwargs = {}
             if window_left is not None:
                 mask_kwargs["diagonal_band_left_bound"] = window_left + 1
+                mask_kwargs["diagonal_alignment"] = (
+                    cudnn.diagonal_alignment.BOTTOM_RIGHT
+                )
 
             # Attention sinks: one extra logit per head that joins the softmax
             # denominator without contributing a value row.
@@ -1736,6 +1757,7 @@ class CudnnPrefillGraph:
     def run_planned(
         self, q, k_cache, v_cache, out, lse, workspace_buffer, *, plan, lse_base="log2"
     ):
+        _validate_prefill_sinks(q, plan.metadata.sinks)
         device = plan.device
         if any(
             t.device != device for t in (q, k_cache, v_cache, out, workspace_buffer)
@@ -1820,6 +1842,7 @@ class CudnnPrefillGraph:
         metadata: _PrefillMetadata,
         lse_base: str = "log2",
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        _validate_prefill_sinks(q, metadata.sinks)
         device = q.device
         var_map = _prefill_plan_bindings(metadata, q.dtype, device)
         var_map.update(
@@ -1963,6 +1986,7 @@ def prepare_cudnn_batch_prefill(
     The public low-level entry point instead calls :meth:`CudnnPrefillGraph.run`
     with metadata resolved for that call.
     """
+    _validate_prefill_sinks(q, metadata.sinks)
     override_cache = metadata.override_shape(q, k_cache)
     workspace_bytes = workspace_buffer.numel() * workspace_buffer.element_size()
 
@@ -2223,13 +2247,23 @@ def cudnn_batch_prefill_with_kv_cache(
         Whether to plan the operation in a CUDA-graph-capture-safe mode.
     backend : Optional[str]
         Optional cuDNN backend selector (e.g. ``"cubin"``).  When ``None``,
-        autodetects based on cuDNN availability.
+        autodetects based on cuDNN availability. Sliding windows and attention
+        sinks require the cuDNN graph backend; the cubin backend rejects them.
     o_data_type : Optional[torch.dtype]
         Optional output dtype; defaults to ``q.dtype``.
     lse_base : str
         ``"log2"`` (default): return the LSE in base 2 like every other FlashInfer
         backend. ``"ln"``: return cuDNN's native natural-log stats, skipping the
         conversion kernel.
+    window_left : Optional[int]
+        Left window size for the cuDNN graph path. Keys before ``p - window_left``
+        are masked, where ``p`` is the query's bottom-right-aligned position in
+        the KV sequence. Causality independently masks keys after ``p``.
+        ``None`` disables the left window.
+    sinks : Optional[torch.Tensor]
+        Per-query-head attention sink logits for the cuDNN graph path. Must be
+        a contiguous float32 tensor of shape ``(num_heads_qo,)`` on ``q``'s
+        device. Noncontiguous tensors are rejected without copying.
 
     Returns
     -------
@@ -2287,6 +2321,11 @@ def cudnn_batch_prefill_with_kv_cache(
         d_vo = v_cache.shape[3]
 
     use_cudnn_graph = CUDNN_AVAILABLE and backend != "cubin"
+    if not use_cudnn_graph and (window_left is not None or sinks is not None):
+        raise NotImplementedError(
+            "sliding windows and attention sinks require the cuDNN graph backend; "
+            "the cubin backend does not support them"
+        )
 
     # The LSE is packed (total_qo_tokens, h_qo) -- FlashInfer's convention, the
     # shape every other backend returns and the wrappers allocate -- unless the
