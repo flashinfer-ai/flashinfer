@@ -494,6 +494,17 @@ def test_workspace_split_at_large_m():
         mm_bf16_batch_invariant(
             a[:16], b, config=ws_rec, chunks=C, workspace=ws[1 : 1 + C * 16 * N]
         )  # 4-byte offset
+    # the workspace may not overlap what the launch reads: the operands (and the output, the bias)
+    for what, kw in (
+        ("A", dict(a=ws.view(torch.bfloat16)[: 16 * K].view(16, K), b=b)),
+        ("B", dict(a=a[:16], b=ws.view(torch.bfloat16)[: K * N].view(N, K).t())),
+    ):
+        with pytest.raises(
+            bi.BatchInvariantUnsupportedError, match=f"{what} overlapping the workspace"
+        ):
+            mm_bf16_batch_invariant(
+                config=ws_rec, chunks=C, workspace=ws[: C * 16 * N], **kw
+            )
     with pytest.raises(bi.BatchInvariantUnsupportedError, match="workspace"):
         mm_bf16_batch_invariant(
             a[:16], b, config=ws_rec, chunks=C, workspace=ws[: 2 * C * 16 * N : 2]
