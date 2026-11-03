@@ -150,6 +150,20 @@ def test_dispatcher_picks_are_members_of_the_space(family, sm_count):
                         assert cfg in space, cfg.describe()
 
 
+def test_hbm_traffic_follows_the_tile_order():
+    """The traffic model: the operands' own bytes when every band's panels stay resident in the L2, refetches per band
+    or per wave when they do not, fewer of them with a wider swizzle band, and never below the operands' own bytes."""
+    from flashinfer.gemm.batch_invariant.heuristic import hbm_traffic
+
+    M, N, K, eb = 32768, 12288, 8192, 2.0
+    unique = (M + N) * K * eb + M * N * 2
+    args = (M, N, K, eb, 2, 256, 256, M // 256, N // 256, 1, 102)
+    assert hbm_traffic(*args, 1, "m", float("inf")) == unique
+    l2 = 80 * 2**20
+    assert hbm_traffic(*args, 1, "m", l2) > hbm_traffic(*args, 8, "m", l2) >= unique
+    assert hbm_traffic(*args, 1, "n", l2) > hbm_traffic(*args, 8, "n", l2) >= unique
+
+
 def test_tactic_encoding_round_trips():
     for cfg in enumerate_space(16, 128, 8192, chunks=4)[::97]:
         t = tuning.knobs_to_tactic(cfg)
@@ -522,3 +536,10 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
         mm_bf16_batch_invariant(
             a, b, torch.empty(16, 4096, dtype=torch.float16, device="cuda")
         )
+
+
+@needs_device
+def test_chunk_count_must_be_positive():
+    a, b = adv_bf16(16, 4096, 151).cuda(), adv_bf16(4096, 4096, 152).cuda()
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match="chunks = 0"):
+        mm_bf16_batch_invariant(a, b, chunks=0)

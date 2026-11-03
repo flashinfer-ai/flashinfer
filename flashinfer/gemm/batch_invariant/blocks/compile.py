@@ -57,6 +57,7 @@ def get_compiled_gemm(
     in_fmt: str = "bf16",
     out_fmt: str = "bf16",
     batched: bool = False,
+    family: str = "",
 ):
     """bf16: ``kernel(a3, b3, c3)``; fp8: ``kernel(a3, b3, c3, a_scale, b_scale)`` with 1-element fp32 scales, for the
     direct stores: the unsplit class and the in-CTA chunk fold, whose chain multiplies by their product. The unsplit class
@@ -64,8 +65,9 @@ def get_compiled_gemm(
     partials through the UNSCALED body (the fixup applies the chain) or, with ``cfg.cta_chunks``, folds the chunks in the
     CTA (the same operand views, the output direct with L = 1). ``clusters`` is the persistent grid in clusters the body is compiled for: the launch
     device's co-resident cluster count for the knobs' cluster shape (``api.persistent_clusters``), unless the knobs
-    force one (``cfg.grid_clusters``); it is part of the cache key. A placement: which CTA computes which tile, never
-    the bits."""
+    force one (``cfg.grid_clusters``); it is part of the cache key, as is ``family``, the launch device's architecture
+    family (devices of two architectures in one process get their own callables; the module on disk is per architecture
+    already). A placement: which CTA computes which tile, never the bits."""
     in_dt, al = IN_DT[in_fmt], ALIGN[in_fmt]
     in_cta = cfg.cta_chunks and chunks > 1
     direct = chunks == 1 or in_cta

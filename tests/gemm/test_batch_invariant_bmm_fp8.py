@@ -582,3 +582,47 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
     assert out.shape == (2, 0, 4096) and out.dtype == torch.bfloat16
     out = bi_bmm(A[:0], B[:0], sa, sb, torch.float16)
     assert out.shape == (0, 16, 4096) and out.dtype == torch.float16
+
+
+@needs_device
+def test_chunk_count_and_workspace_checks():
+    """``chunks`` must be positive (the typed error, not a division by zero), and a caller workspace may not overlap the
+    output or a scale: the split class writes its partials there before the fixup reads them."""
+    b, M, N, K = 1, 64, 128, 8192  # N = 128: the chunk rule splits
+    A, B = adv_fp8(b, M, K, seed=131), weights(b, N, K, 132)
+    sa, sb = scales()
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match="chunks = 0"):
+        bmm_fp8_batch_invariant(A, B, sa, sb, torch.bfloat16, chunks=0)
+    C = chunks_for(N, K, "e4m3")
+    assert C > 1
+    ws = torch.empty(C * M * N + 64, dtype=torch.float32, device="cuda")
+    ref = bits(bi_bmm(A, B, sa, sb)).clone()
+    got = bmm_fp8_batch_invariant(
+        A, B, sa, sb, torch.bfloat16, workspace=ws[: C * M * N]
+    )
+    assert torch.equal(bits(got), ref)
+    with pytest.raises(
+        bi.BatchInvariantUnsupportedError, match="overlapping the workspace"
+    ):
+        bmm_fp8_batch_invariant(A, B, ws[:1], sb, torch.bfloat16, workspace=ws)
+    out = ws.view(torch.bfloat16)[: b * M * N].view(b, M, N)
+    with pytest.raises(
+        bi.BatchInvariantUnsupportedError, match="overlapping the workspace"
+    ):
+        bmm_fp8_batch_invariant(A, B, sa, sb, torch.bfloat16, out=out, workspace=ws)
+    out = torch.empty(b, M, N, dtype=torch.bfloat16, device="cuda")
+    got = bmm_fp8_batch_invariant(A, B, sa, sb, torch.bfloat16, out=out, workspace=ws)
+    assert torch.equal(bits(got), ref)
+
+
+@needs_device
+def test_singleton_row_output_takes_any_row_stride():
+    """At M = 1 the output's row stride is a size-1 mode's: a (b, 1, N) output with strides (N, 1, 1) gets the bits of a
+    contiguous one."""
+    b, N, K = 2, 2048, 4096
+    A, B = adv_fp8(b, 1, K, seed=141), weights(b, N, K, 142)
+    sa, sb = scales()
+    ref = bits(bi_bmm(A, B, sa, sb)).clone()
+    out = torch.empty(b, N, 1, dtype=torch.bfloat16, device="cuda").permute(0, 2, 1)
+    assert out.stride() == (N, 1, 1)
+    assert torch.equal(bits(bi_bmm(A, B, sa, sb, out=out)), ref)

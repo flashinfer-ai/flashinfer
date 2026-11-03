@@ -71,12 +71,14 @@ def rank_topk(
     k: int = 10,
     family: Optional[str] = None,
     in_fmt: str = "bf16",
+    nominal: bool = False,
 ) -> List[GemmConfig]:
     """The dispatcher's ranked list (what FlashInfer's autotuner profiles under ``batch_invariant=True``): `heuristic.rank`'s
     order (the heuristic's best first) with the raster twin of each of the best ceil(k/2) records inserted after it,
     distinct records, at most ``k``; ``default_config(...) == rank_topk(...)[0]``. Every entry
     is a member of the class's enumerated space, so an autotuner may pick among them freely without changing a single bit.
-    ``sm_count`` and ``family`` name the part (the operand device's). Empty when nothing implements the shape."""
+    ``sm_count`` and ``family`` name the part (the operand device's); ``nominal`` ranks at the family's nominal table (the
+    generated Lean cases), never a device's queried numbers. Empty when nothing implements the shape."""
     import dataclasses
 
     from .heuristic import rank
@@ -84,7 +86,16 @@ def rank_topk(
     ranked: List[GemmConfig] = [
         rec
         for rec, _t in rank(
-            M, N, K, chunks, b_major, 2, sm_count, family, in_fmt=in_fmt
+            M,
+            N,
+            K,
+            chunks,
+            b_major,
+            2,
+            sm_count,
+            family,
+            in_fmt=in_fmt,
+            nominal=nominal,
         )
     ]  # distinct by construction (the enumerated space has no duplicates)
     present = set(ranked)
@@ -118,10 +129,11 @@ def default_config(
     sm_count: Optional[int] = None,
     family: Optional[str] = None,
     in_fmt: str = "bf16",
+    nominal: bool = False,
 ) -> GemmConfig:
     """The dispatcher's pick: `rank_topk(...)[0]`, the heuristic's best record of the class's space for the shape, the layout,
     the format and the part. May depend on anything: every record is canonical."""
-    top = rank_topk(M, N, K, chunks, b_major, sm_count, 1, family, in_fmt)
+    top = rank_topk(M, N, K, chunks, b_major, sm_count, 1, family, in_fmt, nominal)
     if not top:
         raise ValueError(
             f"no record of the class implements {(M, N, K)} ({in_fmt}) in layout {b_major} with {chunks} chunks"

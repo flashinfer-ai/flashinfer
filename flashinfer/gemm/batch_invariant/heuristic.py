@@ -7,12 +7,14 @@ For a shape, layout, format and part it orders the records of the enumerated spa
 FlashInfer's autotuner. Nothing here reaches the bits: every record of the space computes the class (R3), the heuristic
 only orders them, so it may be as rough as it is.
 
-The estimate uses the part's nominal numbers (SM count, co-resident cluster capacity per cluster size, the dense bf16
-MMA rate per SM, the L2 -> SMEM and HBM bandwidths per SM) and a few shape constants (`CONSTANTS`: per-CTA row
-efficiency, the transaction efficiency of narrow B boxes, the multicast benefit, the shared-L2 fraction, per-step and
-fixup floors, raster / swizzle / 2-CTA adjustments). Every number is empirical and shared by all parts and formats;
-none is fitted per part. The format enters through its structure only: element width, MMA K step and the 8-bit kind's
-doubled instruction rate.
+The estimate uses the part's numbers (SM count, co-resident cluster capacity per cluster size, L2 size, the dense bf16
+MMA rate per SM, the L2 -> SMEM and HBM bandwidths per SM; the capacity and the L2 size are the device's own once the
+API has queried them in the process, else the family's nominal table, which ``nominal=True`` selects regardless: the
+generated Lean cases are the nominal parts' dispatch) and a few shape constants (`CONSTANTS`: per-CTA row efficiency,
+the transaction efficiency of a row-major weight's narrow boxes, the multicast benefit, the shared-L2 fraction, the
+usable L2 fraction of the HBM traffic model, per-step and fixup floors, raster / swizzle / 2-CTA adjustments). Every
+constant is empirical and shared by all parts and formats; none is fitted per part. The format enters through its
+structure only: element width, MMA K step and the 8-bit kind's doubled instruction rate.
 """
 
 from __future__ import annotations
@@ -34,7 +36,7 @@ logger = logging.getLogger(__name__)
 class Part:
     """A part's nominal numbers. ``family`` is the compute capability's family (sm_107 / sm_100 / sm_103); ``capacity`` the
     co-resident cluster count per cluster size at the nominal SM count (the driver's GPC-aware occupancy); the rates are per
-    SM per cycle, dense bf16 for the MMA."""
+    SM per cycle, dense bf16 for the MMA; ``l2_bytes`` the L2 size."""
 
     family: str
     sm_count: int
@@ -42,6 +44,7 @@ class Part:
     mma_flop_per_clk: float = 8192.0
     load_bytes_per_clk: float = 64.0
     hbm_bytes_per_clk: float = 32.0
+    l2_bytes: float = 112 * 2**20
 
 
 _RUBIN_CAPACITY = ((1, 204), (2, 102), (4, 42), (8, 20))
@@ -49,8 +52,12 @@ _B200_CAPACITY = ((1, 148), (2, 74), (4, 33), (8, 15))
 
 PART_TABLE: Dict[str, Part] = {
     "sm_107": Part("sm_107", 204, _RUBIN_CAPACITY, hbm_bytes_per_clk=32.0),
-    "sm_100": Part("sm_100", 148, _B200_CAPACITY, hbm_bytes_per_clk=28.0),
-    "sm_103": Part("sm_103", 148, _B200_CAPACITY, hbm_bytes_per_clk=28.0),
+    "sm_100": Part(
+        "sm_100", 148, _B200_CAPACITY, hbm_bytes_per_clk=28.0, l2_bytes=126.5 * 2**20
+    ),
+    "sm_103": Part(
+        "sm_103", 148, _B200_CAPACITY, hbm_bytes_per_clk=28.0, l2_bytes=126.5 * 2**20
+    ),
 }
 
 #: The parts as (family, SM count): what the dispatcher serves, what the generated Lean cases and the tests enumerate.
@@ -74,12 +81,14 @@ def family_of(cc: Tuple[int, int]) -> str:
 _QUERIED_CAPACITY: Dict[Tuple[str, int], Dict[int, int]] = {}
 
 
-def capacity_for(family: str, sm_count: Optional[int]) -> Dict[int, int]:
+def capacity_for(
+    family: str, sm_count: Optional[int], nominal: bool = False
+) -> Dict[int, int]:
     """Co-resident clusters per cluster size for the part: the device's own numbers when the API has queried them in this
-    process, else the family's nominal table scaled to ``sm_count``."""
+    process (unless ``nominal``), else the family's nominal table scaled to ``sm_count``."""
     part = PART_TABLE.get(family, PART_TABLE["sm_107"])
     sms = sm_count or part.sm_count
-    q = _QUERIED_CAPACITY.get((family, sms))
+    q = None if nominal else _QUERIED_CAPACITY.get((family, sms))
     if q:
         return q
     return {
@@ -88,11 +97,32 @@ def capacity_for(family: str, sm_count: Optional[int]) -> Dict[int, int]:
 
 
 def register_capacity(family: str, sm_count: int, size: int, clusters: int) -> None:
-    """Record a device's co-resident cluster count for one cluster size (from `api.co_resident_clusters`)."""
+    """Record a device's co-resident cluster count for one cluster size (from the API's occupancy query)."""
     cap = _QUERIED_CAPACITY.setdefault(
         (family, sm_count), dict(capacity_for(family, sm_count))
     )
     cap[size] = clusters
+    rank.cache_clear()
+
+
+# the L2 sizes devices reported at run time, keyed like the capacities
+_QUERIED_L2: Dict[Tuple[str, int], float] = {}
+
+
+def l2_for(family: str, sm_count: Optional[int], nominal: bool = False) -> float:
+    """The part's L2 size in bytes: the device's own once the API has recorded it (unless ``nominal``), else the
+    family's."""
+    part = PART_TABLE.get(family, PART_TABLE["sm_107"])
+    if not nominal:
+        q = _QUERIED_L2.get((family, sm_count or part.sm_count))
+        if q:
+            return q
+    return part.l2_bytes
+
+
+def register_l2(family: str, sm_count: int, l2_bytes: float) -> None:
+    """Record a device's L2 size (from the API's device properties)."""
+    _QUERIED_L2[(family, sm_count)] = float(l2_bytes)
     rank.cache_clear()
 
 
@@ -106,6 +136,9 @@ CONSTANTS: Dict[str, float] = dict(
     eff64b=0.5,  # ... 64 bytes (128 and wider: 1)
     mcast_pow=1.25,  # multicast divides an operand's traffic by cluster_dim ** mcast_pow
     l2_frac=1.0,  # the shared L2 fabric delivers this fraction of SMs x load bandwidth in aggregate
+    l2_resident=0.7,  # the fraction of the L2 the HBM traffic model may keep resident between a panel's uses
+    refetch=1.3,  # the refetched bytes' HBM time beyond the absorbed share adds this many times over
+    absorb=0.4,  # the fraction of the body's time during which refetched bytes stream without a stall
     step_floor=32.0,  # cycles per k-step no tile can beat
     fixup_floor=8000.0,  # cycles of the workspace split's fixup launch
     raster_pow=0.1,  # the wrong raster: (tile-count imbalance) ** raster_pow
@@ -133,6 +166,60 @@ def decode_sane(k: Knobs, M: int) -> bool:
     )
 
 
+def hbm_traffic(
+    M: int,
+    N: int,
+    K: int,
+    eb: float,
+    out_bytes: int,
+    cl_rows: int,
+    cl_cols: int,
+    ncl_m: int,
+    ncl_n: int,
+    items: int,
+    cap: int,
+    sw: int,
+    rast: str,
+    l2: float,
+) -> float:
+    """HBM bytes of the launch under the persistent scheduler's tile order: raster along m walks M within a band of ``sw``
+    cluster tiles along N (along n: mirrored), ``cap`` clusters per wave, ``items`` work items (the workspace split) each
+    over K / items. Within a wave every CTA runs the same k-step, so one wave's operand slabs are shared through the L2;
+    across waves a band's panels stay resident when they fit in ``l2`` beside one wave's share of the other operand, else
+    they are fetched again every wave of the band, and the other operand is fetched once when the whole of it fits beside
+    one band, else once per band (never more than once per wave). ``l2`` is the usable L2 in bytes; the cluster tile is
+    ``cl_rows`` x ``cl_cols`` and the grid ``ncl_m`` x ``ncl_n`` cluster tiles."""
+    kk = K / items
+    a_panel = cl_rows * kk * eb
+    b_panel = cl_cols * kk * eb
+    a_all = (
+        M * kk * eb
+    )  # the operands themselves (out-of-bounds boxes cost no HBM traffic)
+    b_all = N * kk * eb
+    waves_total = max(1, -(-(ncl_m * ncl_n) // cap))
+    if rast == "m":
+        s_eff = max(1, min(sw, ncl_n))
+        bands = -(-ncl_n // s_eff)
+        band = s_eff * b_panel  # the resident B band
+        wave_other = min(ncl_m, -(-cap // s_eff)) * a_panel  # one wave's A rows
+        waves_per_band = max(1, -(-(ncl_m * s_eff) // cap))
+        a_traffic = a_all * (1 if a_all + band <= l2 else min(bands, waves_total))
+        b_traffic = b_all * (
+            1 if (waves_per_band == 1 or band + wave_other <= l2) else waves_per_band
+        )
+    else:
+        s_eff = max(1, min(sw, ncl_m))
+        bands = -(-ncl_m // s_eff)
+        band = s_eff * a_panel
+        wave_other = min(ncl_n, -(-cap // s_eff)) * b_panel
+        waves_per_band = max(1, -(-(ncl_n * s_eff) // cap))
+        b_traffic = b_all * (1 if b_all + band <= l2 else min(bands, waves_total))
+        a_traffic = a_all * (
+            1 if (waves_per_band == 1 or band + wave_other <= l2) else waves_per_band
+        )
+    return items * (a_traffic + b_traffic) + M * N * out_bytes
+
+
 def estimate_cycles(
     k: Knobs,
     M: int,
@@ -145,15 +232,20 @@ def estimate_cycles(
     sm_count: Optional[int],
     out_bytes: int = 2,
     c: Optional[Dict[str, float]] = None,
+    nominal: bool = False,
 ) -> float:
     """SM-cycles of the launch for record ``k`` at the shape: waves of CTA tiles over the part's co-resident cluster
     capacity, each the slower of its MMA and its L2 -> SMEM traffic per k-step plus a floor, bounded below by the shared
-    L2 fabric and by the unique HBM bytes, plus the epilogue and (workspace split) the fixup; raster, swizzle and 2-CTA
-    adjustments multiply. Lower is better; ``inf`` when the record cannot tile the shape."""
+    L2 fabric and by the operands' HBM bytes, plus the stall of the bytes the scheduler's tile order fetches again
+    (`hbm_traffic`) beyond what the body's duration streams unnoticed, the epilogue and (workspace split) the fixup;
+    raster, swizzle and 2-CTA adjustments multiply. ``b_major`` does not enter the estimate (the narrow-tile cost is
+    measured alike in both layouts); the layout selects the space. ``nominal`` takes the family's table for the
+    capacity and the L2 size instead of a device's queried numbers. Lower is better; ``inf`` when the record cannot
+    tile the shape."""
     p = c or CONSTANTS
     part = PART_TABLE.get(family, PART_TABLE["sm_107"])
     sms = sm_count or part.sm_count
-    cap = capacity_for(family, sms)
+    cap = capacity_for(family, sms, nominal)
     tm, tn = k.mma_tiler_mn
     cm, cn = k.cluster_shape_mn
     group = 2 if k.use_2cta_instrs else 1
@@ -182,6 +274,8 @@ def estimate_cycles(
     flops = 2.0 * rows * tn * kk
     mma_eff = 1.0 if rows >= 128 else p["rows64_eff"]
     mma_cycles = flops / (rate * mma_eff)
+    # a narrow N tile (the CTA's share tn / group, in bytes): its B box wastes transactions for a row-major weight and each
+    # MMA's A-operand read is amortised over fewer MACs in either layout; the cost is measured alike in both layouts
     wb = tn / group * eb
     b_eff = (
         p["eff16b"]
@@ -213,8 +307,34 @@ def estimate_cycles(
         if ws
         else 0.0
     )
+    hbm_bytes = hbm_traffic(
+        M,
+        N,
+        K,
+        eb,
+        out_bytes,
+        cm * rows,
+        cn * tn,
+        pad_m // cm,
+        pad_n // cn,
+        items,
+        capacity,
+        k.swizzle_size,
+        k.raster_along,
+        p["l2_resident"] * l2_for(family, sms, nominal),
+    )
     unique = (M * K + K * N) * eb + M * N * out_bytes
-    t = max(body + epi, unique / (part.hbm_bytes_per_clk * sms)) + fix
+    bw = part.hbm_bytes_per_clk * sms
+    # the operands' own bytes bound the launch from below (overlapped with the body). The bytes the tile order fetches
+    # again are hidden while the HBM is lightly loaded: a fraction `absorb` of the body's time streams them at no cost
+    # (less what the operands themselves already take); beyond that the pipeline stalls and `refetch` x the remainder
+    # adds to the launch
+    slack = max(0.0, p["absorb"] * body - unique / bw)
+    t = (
+        max(body + epi, unique / bw)
+        + p["refetch"] * max(0.0, (hbm_bytes - unique) / bw - slack)
+        + fix
+    )
     # L2 locality. Raster: along the axis with fewer tiles (consecutive CTAs then share the larger operand's panel); the
     # wrong choice costs more the more unbalanced the tile grid. Swizzle: groups of ``swizzle_size`` tiles along the slow
     # axis; a group larger than that axis leaves CTAs idle (the overrun), a valid group helps only when many tiles are in
@@ -255,10 +375,12 @@ def rank(
     arch_name: Optional[str] = None,
     topk: Optional[int] = None,
     in_fmt: str = "bf16",
+    nominal: bool = False,
 ) -> Tuple[Tuple[Knobs, float], ...]:
     """The records of the class's enumerated space for the shape, layout and format (at M <= DECODE_M the `decode_sane`
     subset) ordered by the estimate, best first; ``topk`` truncates. ``arch_name`` is accepted for the former signature and
-    ignored. Cached per argument tuple."""
+    ignored; ``nominal`` ranks at the family's nominal table (the generated Lean cases), never a device's queried numbers.
+    Cached per argument tuple."""
     fam = family or "sm_107"
     space = enumerate_space(M, N, K, chunks=chunks, b_major=b_major, in_fmt=in_fmt)
     guarded = [k for k in space if decode_sane(k, M)]
@@ -268,7 +390,17 @@ def rank(
     scored = [
         (
             estimate_cycles(
-                k, M, N, K, chunks, b_major, in_fmt, fam, sm_count, out_bytes
+                k,
+                M,
+                N,
+                K,
+                chunks,
+                b_major,
+                in_fmt,
+                fam,
+                sm_count,
+                out_bytes,
+                nominal=nominal,
             ),
             i,
             k,
@@ -290,8 +422,18 @@ def best_record(
     sm_count: Optional[int] = None,
     family: Optional[str] = None,
     in_fmt: str = "bf16",
+    nominal: bool = False,
 ) -> Knobs:
     """The dispatcher's pick: the first of `rank` (a member of the enumerated space by construction)."""
-    return rank(M, N, K, chunks, b_major, out_bytes, sm_count, family, in_fmt=in_fmt)[
-        0
-    ][0]
+    return rank(
+        M,
+        N,
+        K,
+        chunks,
+        b_major,
+        out_bytes,
+        sm_count,
+        family,
+        in_fmt=in_fmt,
+        nominal=nominal,
+    )[0][0]

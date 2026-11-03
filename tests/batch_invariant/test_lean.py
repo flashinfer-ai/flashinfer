@@ -42,6 +42,49 @@ def test_generated_cases_are_current():
         assert f"``BIK.{name}" in axioms, f"{name} is not pinned in Axioms.lean"
 
 
+def test_rendering_takes_the_nominal_parts():
+    """The dispatch cases are the nominal parts' (``nominal=True``): a device's queried co-resident capacity or L2 size,
+    recorded by the API earlier in the same process, never changes what `render` emits, while the device's own dispatch
+    does follow its numbers."""
+    from flashinfer.gemm.batch_invariant import heuristic as H
+    from flashinfer.gemm.batch_invariant.schedule import chunks_for, default_config
+
+    key = ("sm_100", 148)
+    shapes = [
+        (M, N, K)
+        for M in (1, 300, 4096, 16384)
+        for N, K in ((4096, 4096), (512, 16384), (14336, 4096))
+    ]
+
+    def picks(nominal):
+        return [
+            default_config(M, N, K, chunks_for(N, K), b, 148, "sm_100", nominal=nominal)
+            for M, N, K in shapes
+            for b in ("n", "k")
+        ]
+
+    before = picks(True)
+    saved = (H._QUERIED_CAPACITY.pop(key, None), H._QUERIED_L2.pop(key, None))
+    try:
+        H.register_capacity("sm_100", 148, 4, 30)
+        H.register_capacity("sm_100", 148, 8, 14)
+        H.register_l2("sm_100", 148, 32 * 2**20)
+        assert H.capacity_for("sm_100", 148)[4] == 30
+        assert H.capacity_for("sm_100", 148, nominal=True)[4] == 33
+        assert H.l2_for("sm_100", 148) == 32 * 2**20
+        assert H.l2_for("sm_100", 148, nominal=True) == H.PART_TABLE["sm_100"].l2_bytes
+        assert picks(True) == before
+        assert picks(False) != before
+    finally:
+        H._QUERIED_CAPACITY.pop(key, None)
+        H._QUERIED_L2.pop(key, None)
+        if saved[0] is not None:
+            H._QUERIED_CAPACITY[key] = saved[0]
+        if saved[1] is not None:
+            H._QUERIED_L2[key] = saved[1]
+        H.rank.cache_clear()
+
+
 def _lake(*args, timeout):
     env = dict(
         os.environ,

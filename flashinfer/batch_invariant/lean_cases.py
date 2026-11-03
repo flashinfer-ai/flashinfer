@@ -177,8 +177,9 @@ def spaces(in_fmt: str = "bf16") -> Tuple[List[Knobs], List[Knobs]]:
 
 
 def dispatch_cases(in_fmt: str = "bf16") -> Dict[Knobs, Tuple[int, int, int]]:
-    """Every record the dispatcher returns over the grid (both weight layouts, every part of `PARTS`), with the first shape that
-    selects it."""
+    """Every record the dispatcher returns over the grid (both weight layouts, every part of `PARTS`) at the parts' nominal
+    numbers (``nominal=True``: a device's queried capacity or L2 size never enters the rendering), with the first shape
+    that selects it."""
     disp: Dict[Knobs, Tuple[int, int, int]] = {}
     pairs = [(N, K) for N in DISPATCH_NS for K in DISPATCH_NS]
     pairs += [(N, K) for K in DISPATCH_BIG for N in DISPATCH_NS[::3]]
@@ -189,7 +190,9 @@ def dispatch_cases(in_fmt: str = "bf16") -> Dict[Knobs, Tuple[int, int, int]]:
             for b_major in ("n", "k"):
                 for family, sm in PARTS:
                     k = dataclasses.replace(
-                        default_config(M, N, K, C, b_major, sm, family, in_fmt),
+                        default_config(
+                            M, N, K, C, b_major, sm, family, in_fmt, nominal=True
+                        ),
                         grid_clusters=0,
                     )
                     disp.setdefault(k, (M, N, K))
@@ -333,8 +336,9 @@ def _render_format(L: List[str], in_fmt: str) -> None:
     disp = dispatch_cases(in_fmt)
     dn = "gemmFp8Dispatch" if fp8 else "gemmDispatch"
     L.append(
-        f"/-! Every knob record the {in_fmt} dispatcher returns over the shape grid (both weight layouts; Rubin NVL8 / NVL72, "
-        "B200 / GB200, B300), with the first shape that selects it; each is a member of the enumerated space (R3 membership). -/"
+        f"/-! Every knob record the {in_fmt} dispatcher returns over the shape grid (both weight layouts; the nominal parts "
+        "Rubin NVL8 / NVL72, B200 / GB200, B300: the table's co-resident capacities and L2 sizes, never a device's queried "
+        "numbers), with the first shape that selects it; each is a member of the enumerated space (R3 membership). -/"
     )
     L.append(
         f"def {dn} : List (Nat × Nat × Nat × Config) := ["

@@ -16,9 +16,8 @@ back."""
 
 from __future__ import annotations
 
-import functools
 import logging
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 
@@ -62,45 +61,88 @@ def sm_count_of(device: torch.device) -> int:
     return torch.cuda.get_device_properties(device).multi_processor_count
 
 
-@functools.cache
-def _co_resident_clusters(device_index: int, cluster_size: int, sm_count: int) -> int:
-    """How many clusters of ``cluster_size`` CTAs the device can host at once for a one-CTA-per-SM body: the CuTe DSL's
-    GPC-aware occupancy query, after a CUDA context on the device has been made current (the query fails without one);
-    ``sm_count // cluster_size`` if the query fails, which is logged."""
+# the devices' answers to the occupancy query, keyed (device index, cluster size); a failed query is not kept
+_CO_RESIDENT: Dict[Tuple[int, int], int] = {}
+_REGISTERED_DEVICES: set = set()
+
+
+def _query_co_resident_clusters(device_index: int, cluster_size: int) -> int:
+    """The CuTe DSL's GPC-aware occupancy query for a one-CTA-per-SM body, with the device's primary context made
+    current on the calling thread for its duration (the query needs one; the previous current context is restored).
+    No stream work and no synchronisation: legal during CUDA graph capture."""
     import cutlass.utils as cutlass_utils
+    from cuda.bindings import driver as cu  # the DSL's own driver binding
 
+    def ok(result):
+        err, *values = result
+        if err != cu.CUresult.CUDA_SUCCESS:
+            raise RuntimeError(f"{err}")
+        return values[0] if values else None
+
+    ok(cu.cuInit(0))
+    dev = ok(cu.cuDeviceGet(device_index))
+    prev = ok(cu.cuCtxGetCurrent())
+    ctx = ok(cu.cuDevicePrimaryCtxRetain(dev))
     try:
-        torch.cuda.synchronize(device_index)  # a current context on the device
-        with torch.cuda.device(device_index):
-            n = int(
-                cutlass_utils.HardwareInfo(
-                    device_id=device_index
-                ).get_max_active_clusters(cluster_size)
+        ok(cu.cuCtxSetCurrent(ctx))
+        n = int(
+            cutlass_utils.HardwareInfo(device_id=device_index).get_max_active_clusters(
+                cluster_size
             )
-        if n <= 0:
-            raise RuntimeError(f"the occupancy query returned {n}")
-        return n
-    except Exception as e:  # noqa: BLE001
-        logger.warning(
-            "batch_invariant: the co-resident cluster query failed on device %d (%s: %s); the dispatcher uses the part's "
-            "nominal cluster capacity",
-            device_index,
-            type(e).__name__,
-            e,
         )
-        return sm_count // cluster_size
+    finally:
+        ok(cu.cuCtxSetCurrent(prev))
+        ok(cu.cuDevicePrimaryCtxRelease(dev))
+    if n <= 0:
+        raise RuntimeError(f"the occupancy query returned {n}")
+    return n
 
 
-@functools.cache
+def _co_resident_clusters(
+    device_index: int, cluster_size: int, sm_count: int, family: str
+) -> int:
+    """How many clusters of ``cluster_size`` CTAs the device can host at once: the device's answer, asked once and kept;
+    if the query fails (logged), the part's nominal capacity for this call only, so a later call asks again."""
+    from .heuristic import capacity_for
+
+    key = (device_index, cluster_size)
+    if key not in _CO_RESIDENT:
+        try:
+            _CO_RESIDENT[key] = _query_co_resident_clusters(device_index, cluster_size)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "batch_invariant: the co-resident cluster query failed on device %d (%s: %s); the part's nominal "
+                "cluster capacity is used for this call",
+                device_index,
+                type(e).__name__,
+                e,
+            )
+            return capacity_for(family, sm_count).get(cluster_size) or max(
+                1, sm_count // cluster_size
+            )
+    return _CO_RESIDENT[key]
+
+
 def _register_device(device_index: int, sm_count: int, family: str) -> None:
-    """Once per device: the co-resident cluster counts of the cluster sizes the space uses, into the heuristic's table."""
+    """Once per device (again after a failed query): the device's L2 size and the co-resident cluster counts of the
+    cluster sizes the space uses, into the heuristic's tables; only successful queries are recorded."""
+    if device_index in _REGISTERED_DEVICES:
+        return
     from .generator import CLUSTERS
-    from .heuristic import register_capacity
+    from .heuristic import register_capacity, register_l2
 
+    register_l2(
+        family, sm_count, torch.cuda.get_device_properties(device_index).L2_cache_size
+    )
+    complete = True
     for size in sorted({cm * cn for cm, cn in CLUSTERS}):
-        register_capacity(
-            family, sm_count, size, _co_resident_clusters(device_index, size, sm_count)
-        )
+        n = _co_resident_clusters(device_index, size, sm_count, family)
+        if (device_index, size) in _CO_RESIDENT:
+            register_capacity(family, sm_count, size, n)
+        else:
+            complete = False
+    if complete:
+        _REGISTERED_DEVICES.add(device_index)
 
 
 def persistent_clusters(device: torch.device, cfg: Knobs) -> int:
@@ -112,14 +154,13 @@ def persistent_clusters(device: torch.device, cfg: Knobs) -> int:
     if cfg.grid_clusters:
         return cfg.grid_clusters
     index = device.index if device.index is not None else torch.cuda.current_device()
-    return _co_resident_clusters(
-        index, cfg.cluster_m * cfg.cluster_n, sm_count_of(device)
-    )
+    sm, fam = part_of(device)
+    return _co_resident_clusters(index, cfg.cluster_m * cfg.cluster_n, sm, fam)
 
 
 def part_of(device: torch.device) -> Tuple[int, str]:
     """The part the dispatcher models for ``device``: its SM count and architecture family (`heuristic.family_of`); the
-    first call for a device also records its co-resident cluster capacity for the heuristic."""
+    first call for a device also records its L2 size and co-resident cluster capacity for the heuristic."""
     from ...batch_invariant.support import compute_capability
     from .heuristic import family_of
 
@@ -242,6 +283,20 @@ def _check_workspace(
     return workspace.reshape(-1)[: C * M * N].view(C, M, N)
 
 
+def _byte_span(t: torch.Tensor) -> Tuple[int, int]:
+    """The half-open byte range a tensor's elements occupy."""
+    if t.numel() == 0:
+        return 0, 0
+    last = sum((n - 1) * s for n, s in zip(t.shape, t.stride(), strict=True) if n > 1)
+    lo = t.data_ptr()
+    return lo, lo + (last + 1) * t.element_size()
+
+
+def _overlaps(x: torch.Tensor, y: torch.Tensor) -> bool:
+    (a0, a1), (b0, b1) = _byte_span(x), _byte_span(y)
+    return a0 < b1 and b0 < a1
+
+
 def _check_scale(
     s: torch.Tensor, name: str, device: torch.device, cls: str
 ) -> torch.Tensor:
@@ -285,7 +340,13 @@ def _run(
 
     scaled = is_scaled(in_fmt)
     kernel = get_compiled_gemm(
-        config, b_major, C, persistent_clusters(a.device, config), in_fmt, out_fmt
+        config,
+        b_major,
+        C,
+        persistent_clusters(a.device, config),
+        in_fmt,
+        out_fmt,
+        family=part_of(a.device)[1],
     )
     # the kernel sees 3-D (m, k, l) / (n, k, l) / (m, n, l) tensors: l = the K chunk (1 for the unsplit class and the in-CTA
     # fold's output); every stride handed over is a multiple of the declared 16-byte alignment, the size-1 l stride included
@@ -304,6 +365,14 @@ def _run(
         ws = torch.empty(C, M, N, dtype=torch.float32, device=a.device)
     else:
         ws = _check_workspace(workspace, C, M, N, a.device, cls)
+        for t, what in ((out, "the output"), *((sc, "a scale") for sc in scales)):
+            if _overlaps(t, ws):
+                raise unsupported(
+                    cls,
+                    f"{what} overlapping the workspace",
+                    "a workspace disjoint from the output and the scales (the partials are written before the fixup "
+                    "reads them)",
+                )
     ws = ws.permute(1, 2, 0)  # chunk-major storage (C, M, N) viewed as (M, N, C)
     kernel(a3, b3, ws)  # the unscaled body: raw fp32 partials
     rows = min(M, MAX_GRID_Y)
@@ -329,6 +398,8 @@ def mm_bf16_batch_invariant(
     if M == 0:
         return out  # no rows: nothing to launch
     C = chunks if chunks is not None else chunks_for(N, K)
+    if C < 1:
+        raise unsupported(CLASS, f"chunks = {C}", "a positive chunk count")
     if C > 1 and K % (MMA_K_OF["bf16"] * C):
         raise unsupported(
             CLASS,
@@ -436,6 +507,8 @@ def mm_fp8_batch_invariant(
     if M == 0:
         return out  # no rows: nothing to launch
     C = chunks if chunks is not None else chunks_for(N, K, in_fmt)
+    if C < 1:
+        raise unsupported(cls, f"chunks = {C}", "a positive chunk count")
     if C > 1 and K % (MMA_K_OF[in_fmt] * C):
         raise unsupported(
             cls,
@@ -595,6 +668,8 @@ def bmm_fp8_batch_invariant(
     if b == 0 or M == 0:
         return out  # nothing to launch
     C = chunks if chunks is not None else chunks_for(N, K, in_fmt)
+    if C < 1:
+        raise unsupported(cls, f"chunks = {C}", "a positive chunk count")
     if C > 1 and K % (MMA_K_OF[in_fmt] * C):
         raise unsupported(
             cls,
@@ -615,6 +690,7 @@ def bmm_fp8_batch_invariant(
             in_fmt,
             out_fmt,
             True,
+            family=part_of(A.device)[1],
         )
         # (m, k, l) / (n, k, l) / (m, n, l) views with l = the batch element
         kernel(
