@@ -408,9 +408,10 @@ def test_forward_programs_switch_on_row_count(hidden: int, residual: bool) -> No
 
 @pytest.mark.parametrize("hidden", HIDDEN_SIZES)
 def test_backward_programs_switch_on_row_count(hidden: int) -> None:
-    """Exactly one pair -- a main program and its dw reduce program -- runs per
-    call, every exported backward program runs for some row count, and forward
-    + backward match the FP64 reference on both sides of each switch point."""
+    """Exactly one pair -- a main program and its dw reduce program -- or one
+    column-task program runs per call, every exported backward program runs for
+    some row count, and forward + backward match the FP64 reference on both
+    sides of each switch point."""
 
     _skip_unless_hidden(hidden)
     arch = loader.arch_for_capability(_capability())
@@ -418,9 +419,13 @@ def test_backward_programs_switch_on_row_count(hidden: int) -> None:
     launched = set()
     for rows in _switch_rows(arch, hidden, "bwd", False):
         selected = loader.selected_modules(arch, hidden, "bwd", False, rows=rows)
-        assert len(selected) == 2, f"hidden={hidden} rows={rows}: {selected}"
-        main, reduce = (loader.MODULES[name] for name in selected)
-        assert main.get("workspace_rule") is not None and reduce["role"] == "bwd_reduce"
+        workspace = loader.MODULES[selected[0]].get("workspace_rule") or {}
+        if workspace.get("kind") == "claim_sum_f64":
+            assert len(selected) == 1, f"hidden={hidden} rows={rows}: {selected}"
+        else:
+            assert len(selected) == 2, f"hidden={hidden} rows={rows}: {selected}"
+            main, reduce = (loader.MODULES[name] for name in selected)
+            assert workspace and reduce["role"] == "bwd_reduce"
         launched.update(selected)
         _check_case(hidden, rows)
     assert launched == set(names), (

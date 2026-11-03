@@ -341,17 +341,19 @@ def _workspace_record(
 ) -> dict:
     """The backward module that sizes the partial / counter workspace for ``rows`` tokens.
 
-    Every main backward module of a route (the record owning a
-    ``workspace_rule``; the dw reduce records own none) claims its chunks on
-    ``slots = ctas_per_sm x SMs`` persistent CTAs; a route that switches
-    modules on the row count is sized by the module with the largest partial
-    capacity, whose layout every module of the route shares.
+    Every main backward module of a pair (the record owning a
+    ``chunk_partials`` workspace rule; the dw reduce records own none) claims
+    its chunks on ``slots = ctas_per_sm x SMs`` persistent CTAs; a route that
+    switches modules on the row count is sized by the module with the largest
+    partial capacity, whose layout every pair module of the route shares.  A
+    column-task module (``claim_sum_f64``) binds no partial rows and does not
+    size them.
     """
 
     owners = [
         record
         for record in _backward_module_records(arch, hidden, residual, w_dtype)
-        if record.get("workspace_rule") is not None
+        if (record.get("workspace_rule") or {}).get("kind") == "chunk_partials"
     ]
     if not owners:
         raise RuntimeError(
@@ -408,7 +410,8 @@ def cake_rmsnorm_det_train_backward_workspace_bytes(
     persistent grid (``cake_jit.chunk_capacity``), and two rows per chunk
     (the partial's high and low part) for a module whose workspace rule
     spells ``partial_rows`` 2, among the modules a call of at most ``rows``
-    tokens can launch.  The size grows with
+    tokens can launch.  A column-task module (the small token counts of a
+    route, workspace rule ``claim_sum_f64``) uses the counters alone.  The size grows with
     ``rows`` and a buffer sized for ``rows`` serves every call with at most
     that many tokens.  The counters must be zero on first use (allocate with
     ``torch.zeros`` or use :func:`cake_rmsnorm_det_train_backward_workspace`); the
@@ -495,9 +498,13 @@ def _workspace_views(
         )
     hidden = int(record["hidden"])
     begin = layout["partial_offset"]
-    n_rows = layout["n_chunks"] * layout["partial_rows"]
-    partial = workspace[begin : begin + 4 * n_rows * hidden].view(torch.float32)
-    partial = partial.view(n_rows, hidden)
+    if record["workspace_rule"]["kind"] == "claim_sum_f64":
+        # A column-task kernel keeps no sums: ``partial`` binds an empty region.
+        partial = workspace[begin:begin].view(torch.float64)
+    else:
+        n_rows = layout["n_chunks"] * layout["partial_rows"]
+        partial = workspace[begin : begin + 4 * n_rows * hidden].view(torch.float32)
+        partial = partial.view(n_rows, hidden)
     begin = layout["counters_offset"]
     counters = workspace[begin : begin + 4 * max(layout["counters"], 1)].view(
         torch.uint32
@@ -807,7 +814,10 @@ def cake_rmsnorm_det_train_backward(
     # The chunk table is the launched main module's (its slot count and rows
     # per pipeline step); the partial capacity is the route's.  The main kernel
     # claims the chunks from the counters and writes one partial row per chunk;
-    # the dw reduce record launched after it folds the ``n_chunks`` rows.
+    # the dw reduce record launched after it folds the ``n_chunks`` rows.  A
+    # column-task module (the small token counts of a route) runs alone: its
+    # CTAs claim the column tasks and the chunks, store ``dx`` by row and
+    # ``dw`` by column, each column summed in a fixed order.
     partial, counters, layout = _workspace_views(
         workspace, launched[0], rows=rows, device=device, owner=owner
     )
