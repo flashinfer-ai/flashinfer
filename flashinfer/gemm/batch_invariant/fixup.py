@@ -98,7 +98,7 @@ class SplitKFixupScaled(SplitKFixup):
         stream,
     ):
         n_vec = cute.ceil_div(N, VEC)
-        self.kernel(mW, mY, mSa, mSb, M, N, n_vec, rows).launch(
+        self.kernel(mW, mY, mSa, mSb, None, M, N, n_vec, rows).launch(
             grid=[cute.ceil_div(n_vec, THREADS), rows, 1],
             block=[THREADS, 1, 1],
             stream=stream,
