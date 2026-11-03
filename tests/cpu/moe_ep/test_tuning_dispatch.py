@@ -103,8 +103,12 @@ def test_blackwell_genphase_dtype_dispatch(dtype, implementation, dispatched):
         ["--arch", "sm100", "--fc1-alpha", "0.5"],
         ["--arch", "sm107", "--dtype", "mxfp8_e4m3", "--input-norm-const", "2"],
         ["--arch", "sm107", "--no-do-finalize"],
+        ["--arch", "sm100", "--kernel-variant", "auto"],
+        ["--dtype", "sm90_fp8_e4m3", "--kernel-variant", "auto"],
+        ["--dtype", "sm120_mxfp4_mxfp8", "--kernel-variant", "auto"],
+        ["--arch", "sm107", "--kernel-variant", "auto", "--max-candidates", "0"],
+        ["--arch", "sm107", "--kernel-variant", "auto", "--timed-iters", "0"],
         ["--arch", "sm100", "--dtype", "bf16", "--no-do-finalize"],
-        ["--arch", "sm107", "--no-apply-routing-weights-before-fc2"],
         ["--arch", "sm100", "--no-do-finalize", "--allow-nondeterministic"],
         [
             "--arch",
@@ -191,9 +195,11 @@ def test_situ_and_scaling_options_reach_sm107_tuner(monkeypatch):
             "0.25",
             "--fc1-norm-const",
             "4",
+            "--no-apply-routing-weights-before-fc2",
         ]
     )
     (args,) = received
+    assert not args.apply_routing_weights_before_fc2
     assert (args.activation, args.situ_beta, args.situ_linear_beta) == (
         "situ",
         1.25,
@@ -227,11 +233,34 @@ def test_mxfp4_tuner_rejects_unwired_architecture(arch, capsys):
 
 
 @pytest.mark.cpu_only
-def test_genphase_reaches_sm107_tuner(dispatched):
+@pytest.mark.parametrize("variant", ["genphase", "auto"])
+@pytest.mark.parametrize(
+    "dtype", ["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8", "mxfp4"]
+)
+def test_variant_reaches_sm107_tuner(dispatched, variant, dtype):
     assert (
-        tune.main([*_GEOMETRY, "--arch", "sm107", "--kernel-variant", "genphase"]) == 17
+        tune.main(
+            [
+                *_GEOMETRY,
+                "--arch",
+                "sm107",
+                "--dtype",
+                dtype,
+                "--kernel-variant",
+                variant,
+            ]
+        )
+        == 17
     )
     assert len(dispatched) == 1
+
+
+@pytest.mark.cpu_only
+def test_auto_variant_rejects_detected_blackwell(dispatched, monkeypatch, capsys):
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (10, 0))
+    assert tune.main([*_GEOMETRY, "--kernel-variant", "auto"]) == 2
+    assert not dispatched
+    assert "requires SM107" in capsys.readouterr().err
 
 
 @pytest.mark.cpu_only

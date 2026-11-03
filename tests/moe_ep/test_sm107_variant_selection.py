@@ -300,16 +300,18 @@ def test_collective_cache_hits_reconcile_different_winners(protocol, monkeypatch
     }
     other = {"contract": contract, "variant": "inference", "knobs": {}}
     with autotune_v2(mode="replay", persistent_cache=False):
-        context = selection._context()
-        controls = (False, False, False, False, False, selection._identity(context)[1])
-        gather = Mock(
-            side_effect=[
-                [controls, controls],
+        responses = iter(
+            [
                 [contract, contract],
                 [first, other],
                 [[True, True], [True, True]],
                 [None, None],
             ]
+        )
+        gather = Mock(
+            side_effect=lambda value: [value, value]
+            if gather.call_count == 1
+            else next(responses)
         )
         monkeypatch.setattr(protocol.backend, "_gather", gather)
         selected = AutoTuner.get().choose_with_protocol(selection.NAMESPACE, protocol)
@@ -647,6 +649,93 @@ def test_full_forward_sweep_selects_across_all_knobs(
         assert all(buffer.destroyed for buffer in buffers)
     else:
         assert not any(buffer.destroyed for buffer in buffers)
+
+
+def test_offline_variants_search_afresh_and_publish_without_installing(
+    forward_sweep, monkeypatch
+):
+    from flashinfer.moe_ep import tune
+    from flashinfer.moe_ep.backends.mega.kernel.sm107 import tuning
+    from flashinfer.moe_ep.kernel_src.sm107 import next_cutedsl_megamoe as package
+    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim import (
+        autotune as native,
+        tuning_protocol,
+    )
+
+    state = forward_sweep
+    protocol = state.protocol
+    args = tune._parse_args(
+        [
+            "--arch",
+            "sm107",
+            "--dtype",
+            "mxfp8_e4m3",
+            "--kernel-variant",
+            "auto",
+            "--hidden",
+            "512",
+            "--intermediate",
+            "256",
+            "--num-experts",
+            "8",
+            "--topk",
+            "3",
+            "--max-tokens",
+            "128",
+            "--live-tokens",
+            "4",
+            "--max-candidates",
+            "1",
+            "--warmup-iters",
+            "1",
+            "--timed-iters",
+            "2",
+        ]
+    )
+    monkeypatch.setattr(package, "sm107_candidates", native.sm107_candidates)
+    monkeypatch.setattr(
+        selection._VariantProtocol, "_contract", lambda *a: state.contract
+    )
+    install = Mock(side_effect=AssertionError("offline tuning installed a workspace"))
+    monkeypatch.setattr(selection._VariantProtocol, "_install", install)
+
+    with autotune_v2():
+        AutoTuner.get().choose_with_protocol(selection.NAMESPACE, protocol)
+        assert state.measured == [
+            (v, flag) for v in ("inference", "genphase") for flag in (1, 2)
+        ]
+        state.measured.clear()
+        protocol.owner._tuning_state = AutoTuningState()
+        sweep = Mock(wraps=native._sweep_sm107_block_scaled_mega_moe)
+        monkeypatch.setattr(native, "_sweep_sm107_block_scaled_mega_moe", sweep)
+        winner = tuning._tune_variants(
+            args,
+            0,
+            1,
+            128,
+            "mxfp8_e4m3",
+            protocol.backend,
+            protocol.owner,
+            protocol.weights,
+            protocol.output,
+        )
+        assert winner == {"variant": "genphase", "knobs": state.grid[0]}
+        assert state.measured == [("inference", 1), ("genphase", 1)]
+        assert all(
+            c.kwargs["warmup_iters"] == 1 and c.kwargs["timed_iters"] == 2
+            for c in sweep.call_args_list
+        )
+        assert protocol.owner._tuning_state.winner is None
+        install.assert_not_called()
+        records = AutoTuner.get().protocol_context(tuning_protocol.NAMESPACE).records()
+        assert len(records) == 2
+        assert all(
+            tuple(r["knobs"]["epi_flag_batches"]) == (1, 4) for r in records.values()
+        )
+        assert len(knob_cache._load_entries(knob_cache.knob_cache_path())) == 2
+        overall = AutoTuner.get().protocol_context(selection.NAMESPACE).records()
+        assert len(overall) == 1
+        assert next(iter(overall.values()))["knobs"]["epi_flag_batches"] == [1, 4]
 
 
 def _fixed_forward_tune(protocol, variant, candidates):
