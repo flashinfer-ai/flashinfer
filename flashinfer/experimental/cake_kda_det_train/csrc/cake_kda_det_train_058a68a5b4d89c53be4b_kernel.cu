@@ -47,122 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 448
-#define TMEM_ACC_DQ_OFFSET 0
-#define TMEM_ACC_DK_OFFSET 128
-#define TMEM_ACC_DW_OFFSET 256
-#define TMEM_ACC_DA_OFFSET 384
-#define TMEM_ACC_DVB_OFFSET 0
-#define TMEM_ACC_DKGB_OFFSET 128
-#define TMEM_ACC_DA1_OFFSET 256
-#define TMEM_ACC_DA2_OFFSET 320
-#define NUM_ONE_STAGES 1
-#define NUM_WORK_STAGES 4
-#define SMEM_SMEM_V0_OFF 1024
-#define SMEM_SMEM_V0_STAGE_BYTES 16384
-#define SMEM_SMEM_V0_STRIDE 57344
-#define SMEM_SMEM_V0_0_OFF 17408
-#define SMEM_SMEM_V0_0_STAGE_BYTES 16384
-#define SMEM_SMEM_V0_0_STRIDE 57344
-#define SMEM_SMEM_V0_1_OFF 33792
-#define SMEM_SMEM_V0_1_STAGE_BYTES 16384
-#define SMEM_SMEM_V0_1_STRIDE 57344
-#define SMEM_SMEM_V3_OFF 1024
-#define SMEM_SMEM_V3_STAGE_BYTES 16384
-#define SMEM_SMEM_V3_STRIDE 57344
-#define SMEM_SMEM_V3_0_OFF 17408
-#define SMEM_SMEM_V3_0_STAGE_BYTES 16384
-#define SMEM_SMEM_V3_0_STRIDE 57344
-#define SMEM_SMEM_V3_1_OFF 33792
-#define SMEM_SMEM_V3_1_STAGE_BYTES 16384
-#define SMEM_SMEM_V3_1_STRIDE 57344
-#define SMEM_DV2_MN_OFF 33792
-#define SMEM_DV2_MN_STAGE_BYTES 16384
-#define SMEM_DV2_MN_STRIDE 57344
-#define SMEM_AKK_K_OFF 50176
-#define SMEM_AKK_K_STAGE_BYTES 8192
-#define SMEM_AKK_K_STRIDE 57344
-#define SMEM_AKK_MN_OFF 50176
-#define SMEM_AKK_MN_STAGE_BYTES 8192
-#define SMEM_AKK_MN_STRIDE 57344
-#define SMEM_DAB_K_OFF 58368
-#define SMEM_DAB_K_STAGE_BYTES 8192
-#define SMEM_DAB_K_STRIDE 8192
-#define SMEM_DA1B_MN_OFF 66560
-#define SMEM_DA1B_MN_STAGE_BYTES 8192
-#define SMEM_DA1B_MN_STRIDE 8192
-#define SMEM_DA1B_W_OFF 66560
-#define SMEM_DA1B_W_STAGE_BYTES 8192
-#define SMEM_DA1B_W_STRIDE 8192
-#define SMEM_RING_F32_OFF 1024
-#define SMEM_RING_F32_STAGE_BYTES 57344
-#define SMEM_RING_F32_STRIDE 57344
-#define SMEM_V_P_OFF 58368
-#define SMEM_V_P_STAGE_BYTES 8192
-#define SMEM_V_P_STRIDE 8192
-#define SMEM_V_K_OFF 58368
-#define SMEM_V_K_STAGE_BYTES 16384
-#define SMEM_V_K_STRIDE 16384
-#define SMEM_H_P_OFF 74752
-#define SMEM_H_P_STAGE_BYTES 16384
-#define SMEM_H_P_STRIDE 16384
-#define SMEM_DH_P_OFF 107520
-#define SMEM_DH_P_STAGE_BYTES 16384
-#define SMEM_DH_P_STRIDE 16384
-#define SMEM_H_K_OFF 74752
-#define SMEM_H_K_STAGE_BYTES 32768
-#define SMEM_H_K_STRIDE 32768
-#define SMEM_DH_K_OFF 107520
-#define SMEM_DH_K_STAGE_BYTES 32768
-#define SMEM_DH_K_STRIDE 32768
-#define SMEM_DWB_K_OFF 140288
-#define SMEM_DWB_K_STAGE_BYTES 16384
-#define SMEM_DWB_K_STRIDE 16384
-#define SMEM_DWB_MN_OFF 140288
-#define SMEM_DWB_MN_STAGE_BYTES 16384
-#define SMEM_DWB_MN_STRIDE 16384
-#define SMEM_KGB_K_OFF 156672
-#define SMEM_KGB_K_STAGE_BYTES 16384
-#define SMEM_KGB_K_STRIDE 16384
-#define SMEM_GK_P_OFF 173056
-#define SMEM_GK_P_STAGE_BYTES 8192
-#define SMEM_GK_P_STRIDE 8192
-#define SMEM_GK_S_OFF 173056
-#define SMEM_GK_S_STAGE_BYTES 32768
-#define SMEM_GK_S_STRIDE 32768
-#define SMEM_K_P_OFF 205824
-#define SMEM_K_P_STAGE_BYTES 8192
-#define SMEM_K_P_STRIDE 8192
-#define SMEM_K_S_OFF 205824
-#define SMEM_K_S_STAGE_BYTES 16384
-#define SMEM_K_S_STRIDE 16384
-#define SMEM_Q_P_OFF 74752
-#define SMEM_Q_P_STAGE_BYTES 8192
-#define SMEM_Q_P_STRIDE 8192
-#define SMEM_Q_S_OFF 74752
-#define SMEM_Q_S_STAGE_BYTES 16384
-#define SMEM_Q_S_STRIDE 16384
-#define SMEM_BETA_S_OFF 223744
-#define SMEM_BETA_S_STAGE_BYTES 512
-#define SMEM_BETA_S_STRIDE 512
-#define SMEM_REC_S_OFF 224256
-#define SMEM_REC_S_STAGE_BYTES 16
-#define SMEM_REC_S_STRIDE 16
-#define SMEM_WORK_RESP_OFF 224272
-#define SMEM_WORK_RESP_STAGE_BYTES 16
-#define SMEM_WORK_RESP_STRIDE 16
-#define SMEM_NXT_S_OFF 224336
-#define SMEM_NXT_S_STAGE_BYTES 16
-#define SMEM_NXT_S_STRIDE 16
-#define SMEM_DGK_S_OFF 222208
-#define SMEM_DGK_S_STAGE_BYTES 512
-#define SMEM_DGK_S_STRIDE 512
-#define SMEM_DBP_S_OFF 222720
-#define SMEM_DBP_S_STAGE_BYTES 1024
-#define SMEM_DBP_S_STRIDE 1024
-#define SMEM_TOTAL 224384
-#define THREADS 576
 #define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
@@ -320,7 +204,7 @@ kernel_cake_kda_det_train_058a68a5b4d89c53be4b(const __grid_constant__ CUtensorM
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     __nv_bfloat16* smem_v0 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
     const int smem_v0_addr = smem + 1024;
     __nv_bfloat16* smem_v0_0 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 17408);
@@ -390,8 +274,7 @@ kernel_cake_kda_det_train_058a68a5b4d89c53be4b(const __grid_constant__ CUtensorM
     float* dbp_s = reinterpret_cast<float*>(smem_raw + 222720);
     const int dbp_s_addr = smem + 222720;
 
-    // Mbarrier init (22 pipeline groups, 0 ordered-sequence groups, 28 barriers)
-    // Mbarriers at smem_raw[0..224)
+    // Mbarrier init (28 barriers at smem_raw[0..224))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -466,17 +349,15 @@ kernel_cake_kda_det_train_058a68a5b4d89c53be4b(const __grid_constant__ CUtensorM
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
-
-    // Kernel post-init ops
-    const int tmem_acc_dq = taddr;
-    const int tmem_acc_dk = taddr + 128;
-    const int tmem_acc_dw = taddr + 256;
-    const int tmem_acc_da = taddr + 384;
-    const int tmem_acc_dvb = taddr;
-    const int tmem_acc_dkgb = taddr + 128;
-    const int tmem_acc_da1 = taddr + 256;
-    const int tmem_acc_da2 = taddr + 320;
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_acc_dq = taddr;
+    const unsigned int tmem_acc_dk = taddr + 128;
+    const unsigned int tmem_acc_dw = taddr + 256;
+    const unsigned int tmem_acc_da = taddr + 384;
+    const unsigned int tmem_acc_dvb = taddr;
+    const unsigned int tmem_acc_dkgb = taddr + 128;
+    const unsigned int tmem_acc_da1 = taddr + 256;
+    const unsigned int tmem_acc_da2 = taddr + 320;
 
     // ---- Role: compute ----
     if (warp <= 15) {
@@ -538,7 +419,7 @@ kernel_cake_kda_det_train_058a68a5b4d89c53be4b(const __grid_constant__ CUtensorM
                 int bbase = (it_i & 1) * 64;
                 float beta_t = beta_s[t_row + bbase];
                 int cbos = rec_s[(it_i & 1) * 2];
-                __nv_bfloat16* dv_item = dv_out + ((long long)(cbos * num_heads + head_1) * 128);
+                __nv_bfloat16* dv_item = dv_out + (long long)(cbos * num_heads + head_1) * 128;
                 int clen = rec_s[(it_i & 1) * 2 + 1];
                 float dgk_inter = 0.0f;
                 mbarrier_wait(h_full_addr, _phase_h_full_0);
