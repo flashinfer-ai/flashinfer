@@ -199,13 +199,21 @@ stores at `l * out_l + m * ldo + n`, so the token-major `[T, L, K]` /
 `[T, L, N]` views of a grouped projection run without a copy.  Every other row,
 and every prepared launch, runs the planner's program.
 
-`enable_pdl=True` launches the swapped program as a programmatic dependent
-launch: every CTA triggers its dependents at entry, the weight loads start
-before `griddepcontrol.wait` and only the token loads wait for the predecessor
-grid, so the weight stream overlaps the predecessor's tail.  `B` must then not
-be written by a kernel still in flight on the stream (a weight is a parameter
-of the model).  The planner's programs take no PDL wait and launch without the
-attribute whatever `enable_pdl` says.
+Every K1 entry point (`dense_projection_det_gemm`, the `projection_det_*`
+operations and the prepared launches) takes `enable_pdl`, by default whether
+the device supports programmatic dependent launch (every architecture the
+package serves does), and launches its program as a programmatic dependent
+launch under it: every CTA triggers its dependents at entry.  The planner's
+programs wait for the predecessor grid before their first global access
+(operands, output, stream-K workspace and counters), right after their
+prologue, so the prologue overlaps the predecessor's tail.  The swapped
+program waits the same way by default.  `weights_static=True` states that no
+kernel still in flight on the stream writes `B` (a weight of the model between
+updates): the swapped rows then run the `_we` programs, whose weight loads start
+before `griddepcontrol.wait` while only the token loads wait, so the weight
+stream overlaps the predecessor's tail.  Do not pass it right after a kernel
+that writes the weights (an optimizer step).  The router (K2) and its fused
+split take `enable_pdl` too and wait before their first global access.
 
 ### K2 contract
 

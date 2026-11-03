@@ -47,22 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define SMEM_S_MHI_OFF 0
-#define SMEM_S_MHI_STAGE_BYTES 32768
-#define SMEM_S_MHI_STRIDE 32768
-#define SMEM_S_MLO_OFF 32768
-#define SMEM_S_MLO_STAGE_BYTES 32768
-#define SMEM_S_MLO_STRIDE 32768
-#define SMEM_S_HHI_OFF 65536
-#define SMEM_S_HHI_STAGE_BYTES 32768
-#define SMEM_S_HHI_STRIDE 32768
-#define SMEM_S_HLO_OFF 98304
-#define SMEM_S_HLO_STAGE_BYTES 32768
-#define SMEM_S_HLO_STRIDE 32768
-#define SMEM_TOTAL 131072
-#define THREADS 256
-
 #include <math_constants.h>
 
 extern "C" {

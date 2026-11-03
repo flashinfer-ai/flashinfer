@@ -252,12 +252,12 @@ different streams never share them.  After an aborted launch, call `PreparedAtom
 the split and the program; prepared launches of both programs allocate nothing and can be captured in a CUDA graph.
 A prepared K2 launch binds everything but the stream when prepared (its FFI arguments are converted once), so a call
 issues its launches back to back.  A cached K1 launch of the convenience path orders its arguments once per cache key
-and converts its workspace once per arena growth; a call rebuilds and converts only its operand views.  A K1 call that
+(the PDL flag is bound, so it is part of the key) and converts its workspace once per arena growth; a call rebuilds and converts only its operand views.  A K1 call that
 runs the deterministic program -- the forward, the input gradient, a weight-gradient row without a verdict -- launches
 it through a cached binding of this package: the deterministic package's plan and program (its bits, with its `sk` /
 `cta_rows` knobs and its weight-gradient orientation), with its stream-K slabs and slice counters in this package's
 arena, keyed by the entry point's own tensors.  A batched forward that the deterministic package runs on its swapped
-small-token program makes that package's call.
+small-token program makes that package's call (with `enable_pdl` and `weights_static`).
 A cached K2 launch of the convenience path orders its arguments once per cache key
 and converts the arena's BF16x3 stack once per arena growth, so a call converts only the caller's views.  A K2 call
 that runs the deterministic program -- the input gradient, the forward without a split count, a call without a split
