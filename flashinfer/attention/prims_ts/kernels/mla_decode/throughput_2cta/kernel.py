@@ -128,6 +128,7 @@ from .tasks import (
     create_padding_task,
     create_output_tma_task,
     create_scheduler_task,
+    MlaStagedOutputTask,
 )
 
 
@@ -696,7 +697,9 @@ def build_mla_decode_task_manager(
         iterations_pv_n=cfg.iterations_pv_n,
         per_n_o_pipeline=cfg.use_fp8_split_mma_schedule,
         work_queue=work_queue,
-        task_class=non_interleaved_task_class,
+        task_class=(
+            MlaStagedOutputTask if cfg.stage_bf16_output else non_interleaved_task_class
+        ),
         domain=task_domain,
         num_registers=cfg.correction_reg_num,
     )
@@ -1199,6 +1202,24 @@ class MlaDecodeTs(Nvfp4KVConfig):
             and self.seq_len_q == 1
             and cfg.mma_pv_tiler_mn == (128, 256)
         )
+        # The same whole-tile geometry stores BF16 rows from the correction
+        # warps through 32 KiB of swizzled SMEM instead of 32-row strided
+        # vector stores, which throttle the LSU that softmax also uses. A
+        # third V stage leaves no SMEM for the staging boxes (GB300 H128
+        # top-k 512 prefill, 1024 rows: 77.8 -> 76.2 us).
+        cfg.stage_bf16_output = bool(
+            self.output_quant is None
+            and self.fuse_sparse_epilogue
+            and cfg.is_fp8_qkv()
+            and cfg.use_bf16_output
+            and not cfg.has_nvfp4_kv
+            and not cfg.rope_dim
+            and cfg.page_size == 1
+            and self.num_heads == 128
+            and self.seq_len_q == 1
+            and cfg.mma_pv_tiler_mn == (128, 256)
+            and cfg.load_v_stage == 2
+        )
         return cfg
 
     @cute.jit
@@ -1568,6 +1589,20 @@ class MlaDecodeTs(Nvfp4KVConfig):
                 output_view,
                 box_dims=(128, box_heads, 1, 64 // box_heads),
                 stride_order=(0, 1, 2, 3),
+                swizzle=cuda.TensorMapSwizzle.s128b,
+                l2_promotion=cuda.TensorMapL2Promotion.l2_128b,
+            )
+
+        if cutlass.const_expr(cfg.stage_bf16_output):
+            # Flattened sparse rows are contiguous [rows * H, 512] BF16 output.
+            output_rows = cute.size(o) // 512
+            tma_desc_o = create_tensor_map_tiled_from_view(
+                cute.make_tensor(
+                    o.iterator,
+                    cute.make_layout((512, output_rows), stride=(1, 512)),
+                ),
+                box_dims=(64, 32),
+                stride_order=(0, 1),
                 swizzle=cuda.TensorMapSwizzle.s128b,
                 l2_promotion=cuda.TensorMapL2Promotion.l2_128b,
             )
@@ -2015,7 +2050,9 @@ class MlaDecodeTs(Nvfp4KVConfig):
                 alignment=16,
             )
         smem_o = None
-        if cutlass.const_expr(cfg.use_tma_output):
+        # Both staged outputs use 32 KiB: two 16 KiB FP8 N-slice stages, or
+        # two 4 KiB BF16 boxes for each of the four correction warps.
+        if cutlass.const_expr(cfg.use_tma_output or cfg.stage_bf16_output):
             smem_o = cutlass.Array(
                 cutlass.Uint8,
                 OUTPUT_TMA_STAGES * OUTPUT_TMA_STAGE_BYTES,

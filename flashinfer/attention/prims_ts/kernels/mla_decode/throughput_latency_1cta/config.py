@@ -179,6 +179,8 @@ class MlaConfig(Nvfp4KVConfig):
     load_num_warps: int = 1
     whole_kv_tile: bool = False
     single_raw_prefetch: bool = False
+    # Whole-tile raw NVFP4 record buffers (1 or 2); see raw_record_stages.
+    raw_record_ring: int = 1
     compact_nv_rope: bool = False
     q_tma_stage: bool = False
     q_nope_tmem: bool = False
@@ -277,6 +279,47 @@ class MlaConfig(Nvfp4KVConfig):
     def async_nvfp4_kv_gather(self) -> bool:
         """Use independent gather/transform warps with two retained tiles."""
         return self.has_nvfp4_kv and self.whole_kv_tile
+
+    def raw_record_ring_fits(self) -> bool:
+        """Return whether a second 128-row raw record buffer fits in SMEM.
+
+        Only D512 pure-NVFP4 records (288 B, 36 KiB per buffer) leave room
+        beside the two retained whole tiles. RoPE (D576) layouts and mixed
+        FP8 sources (512 B records) keep one raw buffer.
+        """
+        return not self.rope_dim and self.raw_record_stride <= 288
+
+    @property
+    def raw_record_stages(self) -> int:
+        """Return how many whole-tile raw NVFP4 record buffers the gather ring holds.
+
+        With two buffers the metadata warps gather tile i+1 while converters
+        still read tile i; see configure_sparse_mla for when it is selected.
+        """
+        if not self.single_raw_prefetch:
+            return 1
+        assert self.raw_record_ring in (1, 2)
+        assert self.raw_record_ring == 1 or self.raw_record_ring_fits()
+        return self.raw_record_ring
+
+    @property
+    def early_raw_snapshot(self) -> bool:
+        """Snapshot raw NVFP4 records into registers before acquiring the KV tile.
+
+        Enabled with the two-slot raw ring (pure NVFP4 D512 sources only), so
+        the converter's raw-slot release no longer waits for PV to free a
+        retained whole-tile stage and two gathers stay in flight.
+        """
+        return (
+            self.async_nvfp4_kv_gather
+            and self.raw_record_stages == 2
+            and self.kv_cache_format != "fp8"
+        )
+
+    @property
+    def raw_record_stage_bytes(self) -> int:
+        """Return SMEM bytes of one raw record buffer (128 gathered rows)."""
+        return 128 * self.raw_record_stride
 
     @property
     def one_insts_kv_swap(self) -> bool:
@@ -2033,8 +2076,23 @@ def configure_sparse_mla(
         page_stages = 1
     if profile.page_pipeline_stages:
         page_stages = profile.page_pipeline_stages
+    # Persistent D512 NVFP4 schedules (several work tiles per CTA) use a
+    # two-slot raw record ring with early register snapshots and four
+    # metadata stages, so two gathers stay in flight while PV holds both
+    # retained tiles (GB300 H64 B128 top-k 1024 Sq4: 83.4 -> 78.3 us;
+    # prefill H64 Sq1024: 136.5 -> 130.0 us). Short nonpersistent split
+    # loops keep one raw buffer: there the extra 36 KiB of SMEM costs
+    # ~0.3 us (H128 B1-B4: 13.3 -> 13.6 us) and gains nothing.
+    raw_record_ring = (
+        2
+        if retained_nvfp4_kv
+        and cfg.raw_record_ring_fits()
+        and cfg.kv_cache_format != "fp8"
+        and cfg.use_persistent_scheduler
+        else 1
+    )
     if retained_nvfp4_kv:
-        page_stages = 2
+        page_stages = 4 if raw_record_ring == 2 else 2
     if single and reuse and kv_stages >= 6 and not cfg.is_fp8_qkv():
         page_stages = 1
 
@@ -2114,6 +2172,7 @@ def configure_sparse_mla(
             single_raw_prefetch=True,
             page_offsets_entries_per_stage=132,
             whole_kv_tile=True,
+            raw_record_ring=raw_record_ring,
         )
         kv_stages = 2
     return dataclass_replace(

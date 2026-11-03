@@ -2446,6 +2446,13 @@ def _resolve_sparse_mla_plan(
         kv_cache_format=kv_cache_format,
         compute_capability=torch.cuda.get_device_capability(device),
     )
+    if (
+        output_quant is not None
+        and profile.family == "2cta"
+        and q_dtype != torch.bfloat16
+    ):
+        # The staged quantized-output tile takes the SMEM of a third V stage.
+        profile = replace(profile, kv_pipeline_stages=0)
     # Reloading V from L2 shortens native FP8 decode's producer lifetime.
     # Sustained grids amortize the retained-KV/CLC pipeline instead; packed
     # caches and two-source/sink plans retain their format-specific schedules.

@@ -170,6 +170,9 @@ class MlaDecodeConfig(Nvfp4KVConfig):
 
     # Final quantized output can use a staged TMA store on padding warp 10.
     use_tma_output: bool = False
+    # Final BF16 sparse output: each correction warp stages its 32-row boxes
+    # in swizzled SMEM and issues its own TMA stores.
+    stage_bf16_output: bool = False
 
     # Pipeline stage counts for the captured schedule resources.  The combined
     # K/V stage count keeps enough delayed-V stages live for K-before-V overlap.
@@ -522,7 +525,21 @@ def make_mla_decode_config(
         cfg.correction_reg_num = 160 if sparse_gather_warps == 8 else 192
         cfg.other_reg_num = 64
 
-    if sparse_kv_stages:
+    split_fp8_kv_stages = (
+        qkv_dtype == "e4m3"
+        and page_size == 1
+        and sparse_gather_warps == 1
+        and not has_nvfp4_kv
+        and not rope_dim
+        and not fuse_output_quant
+    )
+    if sparse_kv_stages and split_fp8_kv_stages:
+        # Native FP8 D512 counts both split streams: two K stages, the rest V.
+        # A third V stage spends the remaining 32 KiB per CTA on gather depth.
+        if sparse_kv_stages not in (4, 5):
+            raise ValueError("FP8 split K/V pipeline supports four or five stages")
+        cfg.load_k_stage, cfg.load_v_stage = 2, sparse_kv_stages - 2
+    elif sparse_kv_stages:
         if qkv_dtype != "bf16" or page_size != 1 or sparse_gather_warps not in (4, 8):
             raise ValueError("pipeline tuning requires multi-warp BF16 sparse 2CTA")
         if sparse_kv_stages < 4:

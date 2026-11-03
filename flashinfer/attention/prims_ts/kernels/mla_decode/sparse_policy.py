@@ -233,7 +233,9 @@ def base_bf16_profile(rows, heads, capacity, sm_count):
     return profile
 
 
-def choose_fp8_profile(rows, heads, query_length, capacity, sm_count, rope_dim):
+def choose_fp8_profile(
+    rows, heads, query_length, capacity, sm_count, rope_dim, kv_cache_format="native"
+):
     """Prefer resident split grids or sustained-throughput schedules when eligible.
 
     Falls back to :func:`base_fp8_profile`; ``rope_dim`` has the same meaning.
@@ -330,6 +332,25 @@ def choose_fp8_profile(rows, heads, query_length, capacity, sm_count, rope_dim):
         return SparseMlaProfile(
             family="2cta", split_kv=4 if small_long_grid else 1, gather_issue_warps=1
         )
+    if (
+        heads == 64
+        and kv_cache_format == "native"
+        and rope_dim == 0
+        and query_length <= 8
+        and 512 <= capacity < 2048
+        and rows >= 16
+        and rows * 2 < sm_count
+    ):
+        # DSv4 SWA128 + top-k 512/1024 (capacity 640/1152) below one M64 wave:
+        # one 2CTA cluster per row, padded to 128 heads, shares each row's KV
+        # gather across two SMs without a KV split or GMEM merge. Every M64
+        # alternative either idles half the device (one split per row) or
+        # pays a standalone merge (GB300 top-k 1024, 64 rows: 22.4 -> 17.4 us,
+        # 24 rows: 17.1 -> 14.8 us; top-k 512, 24 rows: 14.9 -> 11.5 us).
+        # Below 16 rows the split M64 grids win (top-k 1024, 8 rows: 11.3 vs
+        # 14.1 us), and from one wave of rows the 1CTA throughput schedule
+        # does (96 rows: 25.4 vs 27.1 us).
+        return SparseMlaProfile(family="2cta", scheduler="static", gather_issue_warps=1)
     if heads == 64 and capacity >= 512 and (rows * 2 >= sm_count):
         # Sustained M64 work amortizes eight issuers, expanded coordinate
         # registers and CLC setup. Paired correction reduces stats traffic.
@@ -345,8 +366,16 @@ def choose_fp8_profile(rows, heads, query_length, capacity, sm_count, rope_dim):
     if heads == 128 and rows * 2 >= sm_count:
         # Planned capacity is at least 256. Once the two-CTA grid fills a
         # device wave, share KV across H128 even for short selected lists.
-        # BF16's CLC choice below is a separately qualified schedule.
-        return SparseMlaProfile(family="2cta", scheduler="static", gather_issue_warps=1)
+        # BF16's CLC choice below is a separately qualified schedule. Short-Q
+        # rows gather distinct, mostly HBM-resident lists; a third D512 V stage
+        # hides that latency, while L2-resident prefill gathers gain nothing
+        # from it.
+        return SparseMlaProfile(
+            family="2cta",
+            scheduler="static",
+            gather_issue_warps=1,
+            kv_pipeline_stages=5 if query_length <= 8 and not rope_dim else 0,
+        )
     if (
         heads <= 16
         and capacity >= 512
@@ -627,14 +656,30 @@ def resolve_sparse_mla_profile(
         # Retain complete converted tiles even when the query grid is small.
         # Fill one resident wave with power-of-two KV partitions, preserving
         # at least two tiles per split for the eight-issuer steady-state loop.
+        # D512 NVFP4 goes down to one tile per split: at DSv4 capacities
+        # (640/1152) two tiles per split left B1 on two CTAs (GB300 H16 B1
+        # top-k 512: 12.0 -> 11.1 us, H32: 13.6 -> 12.5 us). Keep-AB takes
+        # exactly one tile per split when every tile fits in the wave, since a
+        # power-of-two count leaves a two-tile CTA on the critical path (H32
+        # top-k 512, B2: 12.0 -> 10.0 us; top-k 1024, B1: 12.5 -> 10.9 us);
+        # eight-issuer Swap-AB needs a multi-tile steady-state loop.
         # Persistent 1CTA queues do not enumerate KV splits, so small grids
         # use the same reuse resources with a nonpersistent split schedule.
         persistent = rows * 2 >= sm_count
-        split_limit = min(capacity // 128 // 2, max(1, sm_count // rows))
-        splits = 1 if persistent else 1 << (split_limit.bit_length() - 1)
         # Above sixteen heads, WS M64 wins on GB300: its N256 PV consumes
         # Dv512 in two passes, whereas the narrow Swap-AB path needs four.
         keep = heads > 16
+        d512_nvfp4 = kv_cache_format == "nvfp4" and rope_dim == 0
+        min_split_tiles = 1 if d512_nvfp4 else 2
+        split_limit = min(capacity // 128 // min_split_tiles, max(1, sm_count // rows))
+        splits = 1 if persistent else 1 << (split_limit.bit_length() - 1)
+        if (
+            d512_nvfp4
+            and keep
+            and not persistent
+            and capacity // 128 * rows <= sm_count
+        ):
+            splits = capacity // 128
         return SparseMlaProfile(
             family="keep" if keep else "swap",
             tile_size_q=64 if keep else 8 if heads <= 8 else 16,
@@ -649,24 +694,38 @@ def resolve_sparse_mla_profile(
         )
     if dtype == "fp8":
         profile = choose_fp8_profile(
-            rows, heads, query_length, capacity, sm_count, rope_dim
+            rows, heads, query_length, capacity, sm_count, rope_dim, kv_cache_format
         )
+        if kv_cache_format != "native" and profile.family == "2cta":
+            # The third V stage was measured only for native E4M3 pools;
+            # converted pools keep their loader stages.
+            profile = replace(profile, kv_pipeline_stages=0)
     else:
         profile = choose_bf16_profile(rows, heads, query_length, capacity, sm_count)
-    # D576 NVFP4 keeps this schedule down to one row: the general small-grid
-    # choice partitions V over four CTAs that each repeat the K conversion
+    # Converted KV keeps this schedule down to one row: the general small-grid
+    # choice partitions V over head_dim CTAs that each repeat the K conversion
     # (GB300 H64 top-k 2048, B1 Sq4: 32.3 -> 13.1 us; Sq8: 18.0 -> 14.2 us).
+    # This holds at DSv4 SWA128 + top-k 512/1024 capacities too (D512 NVFP4,
+    # GB300 H64 32 rows: 58.8 -> 15.2 us, 64 rows: 71.2 -> 18.6 us; H128
+    # 4 rows: 27.8 -> 13.3 us), one V owner per KV tile as in cake's NVFP4
+    # small-grid plan.
     if (
         kv_cache_format != "native"
         and dtype == "fp8"
         and query_length <= 8
-        and capacity >= 2048
-        and rows >= (1 if rope_dim == 64 else 16)
         and rows * 2 < sm_count
+        and (
+            (capacity >= 2048 and rows >= (1 if rope_dim == 64 else 16))
+            or (kv_cache_format == "nvfp4" and rope_dim == 0 and capacity >= 512)
+        )
     ):
         if (
             heads == 64
             or (heads == 128 and kv_cache_format == "fp8" and rows * 4 < sm_count)
+            # D512 NVFP4 H128: two whole-tile M64 heads repeat the conversion
+            # twice instead of four V partitions (GB300 top-k 512, 4 rows:
+            # 27.8 -> 13.3 us; 64 rows: 20.9 -> 17.5 us).
+            or (heads == 128 and kv_cache_format == "nvfp4" and rope_dim == 0)
             # D576 NVFP4 H128 below 16 rows: two whole-tile M64 heads beat the
             # 2CTA split (GB300 top-k 2048, H96 B1 Sq8: 27.3 -> 16.8 us).
             or (heads == 128 and rope_dim == 64 and rows < 16)
@@ -675,10 +734,22 @@ def resolve_sparse_mla_profile(
             # retained WS tiles. At low row counts, two M64 head tiles also
             # beat group-2 mixed-pool startup despite repeating KV conversion.
             # Power-of-two splits fill most of a resident wave without adding
-            # a short split for a source-boundary tile.
+            # a short split for a source-boundary tile. Short D512 NVFP4 lists
+            # take one tile per split when all tiles fit in the wave: four
+            # splits of five tiles leave a two-tile CTA on the critical path
+            # (GB300 top-k 512, H64 B1: 13.3 -> 11.8 us; H128 B1: 14.0 -> 12.3
+            # us). Nine single-tile splits do not beat eight for top-k 1024
+            # (H64 B1: 13.2 -> 14.4 us), so longer lists keep powers of two.
             work = rows * ceil(heads / 64)
             split_limit = min(capacity // 128, max(1, sm_count // work))
             wave_splits = 1 << (split_limit.bit_length() - 1)
+            if (
+                kv_cache_format == "nvfp4"
+                and rope_dim == 0
+                and capacity // 128 <= 8
+                and capacity // 128 * work <= sm_count
+            ):
+                wave_splits = capacity // 128
             profile = SparseMlaProfile(
                 family="keep",
                 split_kv=wave_splits,

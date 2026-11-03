@@ -688,6 +688,13 @@ def test_rope_quant_plan_options():
         pytest.param(0, 2, 8, 2049, True, False, True, id="small-head-long-kv-reuse"),
         pytest.param(1, 0, 64, 513, True, False, True, id="multiwave-prefill"),
         pytest.param(0, 4, 128, 2049, True, False, True, id="multiwave-decode"),
+        pytest.param(0, 1, 128, 1025, True, False, True, id="two-cta-wave"),
+        # Mid-grid H64 rows on one padded 2CTA cluster per row.
+        pytest.param(32, 1, 64, 513, True, False, True, id="h64-two-cta-mid"),
+        pytest.param(16, 4, 64, 1025, True, False, False, id="h64-two-cta-mid-holes"),
+        # Long-Q wave grids stage the BF16 output through SMEM/TMA stores.
+        pytest.param(1, 0, 128, 1025, True, False, True, id="two-cta-wave-prefill"),
+        pytest.param(1, 0, 128, 513, True, False, False, id="two-cta-wave-holes"),
         # Short lists (capacity 256 and 384) with enough rows for the H128 2CTA tile.
         pytest.param(0, 1, 128, 64, True, False, True, id="short-two-cta-decode"),
         pytest.param(1, 0, 128, 64, True, False, True, id="short-two-cta-prefill"),
@@ -1439,6 +1446,11 @@ def make_tensor_fp8_cache(pages, page_size):
         (64, 2, 129, 129),
         (128, 8, 513, 129),
         (64, 16, 2049, 129),
+        # Persistent D512 grids select the two-slot raw record ring.
+        (64, 96, 1024, 0),
+        (64, 80, 1024, 129),
+        (16, 128, 1024, 129),
+        (32, 96, 2048, 0),
     ],
 )
 def test_d512_nvfp4_sources_graph(
