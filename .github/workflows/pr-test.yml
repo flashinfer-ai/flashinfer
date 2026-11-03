@@ -616,7 +616,13 @@ jobs:
             junit/**/*.xml
             junit/**/*.telemetry.json
             junit/**/*.meta.json
+            junit/**/*.results.json
+            junit/**/*.log
             junit/**/*.memory.csv
+            junit/resource-telemetry/**/*
+            junit/memory_summary.csv
+            junit/test_timings.csv
+            junit/source_summary.csv
             junit/collection-*/*.log
             junit/jit-builds.jsonl
             junit/run-summary.json
@@ -637,6 +643,16 @@ jobs:
           name: junit-shard-${{ matrix.name }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             junit-shard/**/*.xml
+            junit-shard/**/resource-telemetry/**/*
+            junit-shard/**/*.memory.csv
+            junit-shard/**/memory_summary.csv
+            junit-shard/**/test_timings.csv
+            junit-shard/**/source_summary.csv
+            junit-shard/**/run-summary.json
+            junit-shard/**/*.telemetry.json
+            junit-shard/**/*.meta.json
+            junit-shard/**/*.results.json
+            junit-shard/**/*.log
           if-no-files-found: warn
           retention-days: 14
 

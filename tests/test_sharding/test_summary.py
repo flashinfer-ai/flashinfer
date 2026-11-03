@@ -223,6 +223,34 @@ def test_source_summary_aggregates_local_resources_and_failed_diagnostics(
     assert "  - tests/test_sample.py::test_case_1" in terminal
 
 
+def test_missing_gpu_sample_preserves_host_memory_and_marks_partial(
+    tmp_path: Path,
+) -> None:
+    plan = _summary_plan()
+    for index, unit in enumerate(plan.units):
+        _write_final_batch(
+            tmp_path,
+            unit,
+            failed=False,
+            launched_at=10,
+            exited_at=12,
+            rss_mib=100 + index * 200,
+            gpu_mib=900,
+            monitor_memory=True,
+        )
+        batch = unit.batches[0]
+        path = summary_module.batch_xml_path(tmp_path, unit, batch).with_name(
+            f"{batch.id}.memory.csv"
+        )
+        path.write_text(
+            f"timestamp,host_rss_mib,gpu_memory_mib\n1,{100 + index * 200},\n"
+        )
+    source = summary_module.publish_summary(tmp_path, plan)["sources"][0]
+    assert source["max_host_rss_mib"] == 300
+    assert source["memory_samples"] == 2
+    assert source["partial_resources"]
+
+
 def test_terminal_summary_lists_detailed_failures_before_deduplicated_files(
     tmp_path: Path,
 ) -> None:

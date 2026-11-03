@@ -169,7 +169,9 @@ def _memory_samples(path: Path) -> list[dict[str, float]]:
                     {
                         "timestamp": float(row["timestamp"]),
                         "host_rss_mib": float(row["host_rss_mib"]),
-                        "gpu_memory_mib": float(row["gpu_memory_mib"]),
+                        # Preserve host samples when GPU telemetry is unavailable.
+                        "gpu_memory_mib": float(row["gpu_memory_mib"] or 0),
+                        "gpu_memory_available": float(bool(row["gpu_memory_mib"])),
                     }
                 )
     except (OSError, KeyError, TypeError, ValueError):
@@ -433,7 +435,9 @@ def _source_and_failure_summaries(
                 if not bool(meta.get("synthetic", False)):
                     row["partial_resources"] = True
             if not bool(meta.get("synthetic", False)) and (
-                not bool(meta.get("monitor_memory", True)) or not samples
+                not bool(meta.get("monitor_memory", True))
+                or not samples
+                or any(not sample["gpu_memory_available"] for sample in samples)
             ):
                 row["partial_resources"] = True
             for case in validation.cases:
