@@ -3892,6 +3892,44 @@
     },
     {
       "arch": "sm_100a",
+      "closure_sha256": "447893fba4bb7810c37ac5d4a4247dfd9e005d61bdc77468a6e65ad48e83e700",
+      "entry": "run",
+      "gencode": "-gencode=arch=compute_100a,code=sm_100a",
+      "min_cuda": "12.8",
+      "name": "cake_dense_projection_det_gemm_a555af4859495921a208_sm_100a",
+      "nvcc_flags": [],
+      "nvcc_flags_if": [],
+      "path": "aot/cake_dense_projection_det_gemm_a555af4859495921a208_sm_100a.so",
+      "sha256": {
+        "csrc/cake_dense_projection_det_gemm/cake_dense_projection_det_gemm_a555af4859495921a208_binding.cu": "4fd880a27bff9d255db89bac28e6861accc20591cdfe65263a712ea0a2fcc2f7",
+        "csrc/cake_dense_projection_det_gemm/cake_dense_projection_det_gemm_a555af4859495921a208_kernel.cu": "359e59c9d490189ca0043e002b71484502f31eeeb4687a33b0dccc667311b1f8"
+      },
+      "sources": [
+        "csrc/cake_dense_projection_det_gemm/cake_dense_projection_det_gemm_a555af4859495921a208_kernel.cu",
+        "csrc/cake_dense_projection_det_gemm/cake_dense_projection_det_gemm_a555af4859495921a208_binding.cu"
+      ]
+    },
+    {
+      "arch": "sm_103a",
+      "closure_sha256": "0e2baa78bf3e0f3676c454b7f4ac50156c18eb88ff1f8e58e6cbbd876a090471",
+      "entry": "run",
+      "gencode": "-gencode=arch=compute_103a,code=sm_103a",
+      "min_cuda": "12.9",
+      "name": "cake_dense_projection_det_gemm_a555af4859495921a208_sm_103a",
+      "nvcc_flags": [],
+      "nvcc_flags_if": [],
+      "path": "aot/cake_dense_projection_det_gemm_a555af4859495921a208_sm_103a.so",
+      "sha256": {
+        "csrc/cake_dense_projection_det_gemm/cake_dense_projection_det_gemm_a555af4859495921a208_binding.cu": "4fd880a27bff9d255db89bac28e6861accc20591cdfe65263a712ea0a2fcc2f7",
+        "csrc/cake_dense_projection_det_gemm/cake_dense_projection_det_gemm_a555af4859495921a208_kernel.cu": "359e59c9d490189ca0043e002b71484502f31eeeb4687a33b0dccc667311b1f8"
+      },
+      "sources": [
+        "csrc/cake_dense_projection_det_gemm/cake_dense_projection_det_gemm_a555af4859495921a208_kernel.cu",
+        "csrc/cake_dense_projection_det_gemm/cake_dense_projection_det_gemm_a555af4859495921a208_binding.cu"
+      ]
+    },
+    {
+      "arch": "sm_100a",
       "closure_sha256": "f95cf8307672b28f2027a60cc9491a73ddc57a2e56d5dc71e089165fe375add8",
       "entry": "run",
       "gencode": "-gencode=arch=compute_100a,code=sm_100a",
