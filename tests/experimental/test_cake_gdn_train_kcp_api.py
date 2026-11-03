@@ -1790,6 +1790,86 @@ def test_forward_walk_form_follows_the_plan_chains() -> None:
         )
 
 
+@pytest.mark.parametrize(("sm", "want"), [(20, True), (12, False)])
+def test_walk_forms_agree_across_forward_recompute_and_handle(
+    monkeypatch, sm, want
+) -> None:
+    """The width rules read host plan integers only, so the forward, torch's checkpoint recompute and the recompute
+    from a :class:`RecomputeHandleKcp` launch the same form of every #2 and #7 walk program.  The rank of
+    :func:`test_forward_walk_form_follows_the_plan_chains` (HV 6, one segment per document): at 20 SMs the chain
+    clause takes the ``_vh64`` record of the forward walks, at 12 SMs vh = 128; the fake backend has no
+    architecture, so #7 takes vh = 64.  Each path logs the records of every recorded call (``_record``)."""
+    kcp, plan = _mod("cake_kcp"), _mod("cake_kcp_plan")
+    cu = _cu((24 * 64, 16 * 64, 14 * 64, 10 * 64))
+    ops = _mode_ops(cu, (2, 6))
+    ctx = plan.build_context_kcp(
+        plan.partition_kcp(cu, 1, "contiguous"), None, 0, "cpu", sm_count=sm
+    )
+    log: list = []
+    record = kcp._record
+
+    def recording(kind, call):
+        record(kind, call)
+        log.append((kind, [r for r, _ in kcp.LAST_CALL[kind]["records"]]))
+
+    monkeypatch.setattr(kcp, "_record", recording)
+
+    def run(ckpt: bool, handle: bool) -> dict:
+        del log[:]
+        leaves = [
+            ops[n].detach().clone().requires_grad_(True)
+            for n in ("q", "k", "v", "g", "beta")
+        ]
+        hd = kcp.RecomputeHandleKcp() if handle else None
+
+        def fn(q, k, v, g, beta, h):
+            return kcp.chunk_gdn_kcp(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                ctx,
+                recompute_handle=h,
+                backend="fake",
+                segments=1,
+                deterministic=False,
+            )
+
+        if ckpt:
+            from torch.utils.checkpoint import checkpoint
+
+            out = checkpoint(fn, *leaves, hd, use_reentrant=False)
+        else:
+            out = fn(*leaves, hd)
+        out.backward(ops["dout"])
+        forms: dict = {}
+        for _kind, records in log:
+            for r in records:
+                base = r.removesuffix(kcp.VH64_SUFFIX)
+                if base in kcp.FWDH_PROGRAMS + kcp.DHU_PROGRAMS:
+                    forms.setdefault(base, set()).add(r.endswith(kcp.VH64_SUFFIX))
+        return {"kinds": [k for k, _ in log], "forms": forms}
+
+    paths = {
+        "forward": run(False, False),
+        "recompute": run(True, False),
+        "handle": run(True, True),
+    }
+    for name in ("recompute", "handle"):
+        # a checkpointed path records the forward and torch's recompute of it
+        assert paths[name]["kinds"].count("fwd") == 2, (name, paths[name]["kinds"])
+    for name, p in paths.items():
+        forms = p["forms"]
+        fwdh = [b for b in forms if b in kcp.FWDH_PROGRAMS]
+        dhu = [b for b in forms if b in kcp.DHU_PROGRAMS]
+        assert fwdh and dhu, (name, forms)
+        assert all(forms[b] == {want} for b in fwdh), (name, sm, forms)
+        assert all(forms[b] == {True} for b in dhu), (name, forms)
+    assert paths["recompute"]["forms"] == paths["forward"]["forms"]
+    assert paths["handle"]["forms"] == paths["forward"]["forms"]
+
+
 def test_tape_shapes_follow_the_frozen_set() -> None:
     kcp = _mod("cake_kcp")
     R, NC_pad, HV, T = 256, 4, 6, 200
