@@ -40,7 +40,7 @@ Every entry point takes ``deterministic`` (default ``True``):
   CTAs claim row chunks, write ``dx`` and add their per-column ``dw`` sums into
   FP64 sums in the workspace in the order they finish; the CTA that finishes
   last rounds the sums into ``dw``.  ``dx`` is bitwise reproducible and within
-  one BF16 ulp of max(|dx|, rms(dx)) of the deterministic backward's ``dx``
+  one BF16 ulp of ``max(|dx|, rms(dx))`` of the deterministic backward's ``dx``
   (not always bitwise equal to it); ``dw`` is not guaranteed bitwise
   reproducible (the order of the FP64 additions depends on scheduling).  In
   the windows the backward docstring's notes name, a twosum single kernel keeps
