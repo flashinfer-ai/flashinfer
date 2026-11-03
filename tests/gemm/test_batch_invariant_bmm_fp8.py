@@ -591,6 +591,15 @@ def test_chunk_count_and_workspace_checks():
     b, M, N, K = 1, 64, 128, 8192  # N = 128: the chunk rule splits
     A, B = adv_fp8(b, M, K, seed=131), weights(b, N, K, 132)
     sa, sb = scales()
+    # a caller-forced configuration the kernel cannot implement: the 16-wide tile of the 2-CTA pair needs a K-major weight
+    # on kind::f8f6f4 (the only guard is the launch path's, for the unsplit class the batched launch's)
+    A1, B1 = adv_fp8(1, 16, 4096, seed=141), weights(1, 4096, 4096, 142)
+    forced = Knobs((256, 16), (2, 1), True, True, "m", 1)
+    assert not can_implement(forced, 16, 4096, 4096, "n", 1, "e4m3")
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match="enumerated space"):
+        bmm_fp8_batch_invariant(
+            A1, B1.contiguous(), sa, sb, torch.bfloat16, config=forced
+        )
     with pytest.raises(bi.BatchInvariantUnsupportedError, match="chunks = 0"):
         bmm_fp8_batch_invariant(A, B, sa, sb, torch.bfloat16, chunks=0)
     C = chunks_for(N, K, "e4m3")
