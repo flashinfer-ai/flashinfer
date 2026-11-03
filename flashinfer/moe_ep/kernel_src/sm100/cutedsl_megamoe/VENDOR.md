@@ -115,7 +115,7 @@ replace its own device snapshot.
   kernel repo's `docs/FC1_PER_TOKEN_SCALE_NEXT_DESIGN.md`); re-derive on the
   next re-sync.
 
-## Targeted legacy NVFP4 GIN migration (in progress)
+## Targeted legacy NVFP4 GIN migration
 
 The original snapshot SHA and all existing pending patches above remain the
 baseline. This is a partial MR !100 import, not a snapshot update:
@@ -149,8 +149,12 @@ baseline. This is a partial MR !100 import, not a snapshot update:
 - Internode mode is experimental and default-off. The fixed N2R2 geometry
   passes strong protocol/math/byte/relaunch/public-lifetime qualification
   (final jobs 3576874/3576878, exit 0). Additional geometries remain disabled.
-  The user waived Rubin/local performance validation; no timing or speedup
-  claim is made. See the validation record for exact scope and outcomes.
+  Subsequent GB300 validation passes17 strong/public tests per rank and the
+  retained4+1 off finalizer/cache/graph checks. All24 off performance gates
+  pass against legacy F_BASE. Internode public host overhead is reduced; raw
+  native-donor comparisons remain inconclusive due to baseline dispersion.
+  See the [PR design](../../../../../docs/design_docs/legacy_nvfp4_gin/pr-design.md)
+  and performance report for exact scopes; no universal speedup is claimed.
 
 The recovered original vendor object is available in the receiving checkout.
 It is not an ancestor of MR !100. See the

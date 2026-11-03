@@ -1,5 +1,7 @@
 # Review draft: legacy NVFP4 NCCL GIN
 
+Reviewer entry point: [PR design and measured results](pr-design.md).
+
 ## Description
 
 The legacy NVFP4 MegaMoE backend previously assumed one NVLink domain and

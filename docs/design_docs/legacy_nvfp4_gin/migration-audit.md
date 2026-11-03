@@ -1,9 +1,10 @@
 # Legacy NVFP4 NCCL GIN migration audit
 
-This record is for the engineer implementing the migration.
+This record is the detailed source/merge audit. For the reviewer overview, see
+[interfaces, design, changes and performance](pr-design.md).
 
 This targeted import implements the legacy NVFP4 GIN device closure and the
-formal FI host path. Numerical acceptance is still in progress; consult
+formal FI host path. Fixed-scope numerical acceptance is complete; consult
 [implementation status](implementation-status.md) for measured outcomes.
 The [device hunk ledger](evidence/device-hunk-ledger.json) records imported
 files; source comparisons remain reproducible from the fixed objects below.
