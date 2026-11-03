@@ -67,12 +67,32 @@ def apply_chain_biased(
 ):
     """The chain's ops before the conversion when the chain has the bias step: per element, the bias of the element's
     output column (``coords``: the output coordinates partitioned like the accumulator), widened exactly, through the
-    same ``apply_pre`` as the term. Columns at or beyond ``N`` belong to the clipped part of a partial tile: the store
-    drops them, so they are left alone (no read past the bias)."""
-    for e in cutlass.range_constexpr(cute.size(frag)):
-        n = coords[e][1]
-        if n < N:
-            frag[e] = chain.apply_pre(CuteF32, frag[e], alpha, CuteF32.widen(mBias[n]))
+    same ``apply_pre`` as the term. The fragment's elements are consecutive columns of one row for the epilogue's TMEM
+    load shapes, so when the whole run lies inside the bias at a 16-byte boundary the bias slice is read with one
+    vector copy; otherwise (a partial tile's last run, an unaligned run) element by element, and the columns at or
+    beyond ``N`` are left alone: the store drops them and the bias is never read past its end."""
+    V = cute.size(frag)
+    n0 = coords[0][1]
+    n_last = coords[V - 1][1]
+    if n_last - n0 == V - 1 and n0 + V <= N and n0 % 8 == 0:
+        base = mBias.iterator.toint() + cutlass.Int64(cute.assume(n0, divby=8)) * 2
+        gB = cute.make_tensor(
+            cute.make_ptr(
+                cutlass.BFloat16, base, cute.AddressSpace.gmem, assumed_align=16
+            ),
+            cute.make_layout((V,)),
+        )
+        rB = cute.make_rmem_tensor((V,), cutlass.BFloat16)
+        cute.autovec_copy(gB, rB)
+        for e in cutlass.range_constexpr(V):
+            frag[e] = chain.apply_pre(CuteF32, frag[e], alpha, CuteF32.widen(rB[e]))
+    else:
+        for e in cutlass.range_constexpr(V):
+            n = coords[e][1]
+            if n < N:
+                frag[e] = chain.apply_pre(
+                    CuteF32, frag[e], alpha, CuteF32.widen(mBias[n])
+                )
 
 
 @cute.jit
