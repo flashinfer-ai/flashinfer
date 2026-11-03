@@ -78,11 +78,12 @@ Tensors (public entry point ``kda_delta_rule_mtp_ucache_flush``)
   cache_base             [B]                int32   in       ring window origin
   output                 [B, T, H, V]       bf16    out      draft-token outputs (returned)
 
-  Scalars: scale (float, default 1/sqrt(K)); lower_bound (float < 0, Kimi
-  K3 default -5.0); flush_min (int, default W_RING - T + 1 = lazy flush).
+  Scalars: scale (float, default 1/sqrt(K)); lower_bound (float in
+  [-80/T, 0), Kimi K3 default -5.0); flush_min (int, default
+  W_RING - T + 1 = lazy flush); w_ring (16 or 32, default 16).
 
 Ring tensors are pool-indexed via initial_state_indices and MUST be
-zero-initialized at allocation. Legal hist_len at call time: [0, 16];
+zero-initialized at allocation. Legal hist_len at call time: [0, min(w_ring, 32 - T)];
 cache_base: [0, 32).
 
 High-level flow (per CTA = one (request, head))
@@ -99,7 +100,6 @@ High-level flow (per CTA = one (request, head))
 
 import torch
 import math
-import os
 import weakref
 from typing import Optional
 
@@ -1605,11 +1605,18 @@ class KdaDecodeUCacheFlushKernel:
                         )
                 if const_expr(NJB == 2 and _jb == 0):
                     # issue g-ring round 2 (rows [16, 32)) into the SAME
-                    # staging block — round 1 is fully consumed above; the
-                    # transfer overlaps this round's scores GEMM and is
-                    # awaited (with a publish barrier) before round 2's
-                    # w-scale. The predicate on each load already skips
-                    # rows >= P; nothing to issue at P <= 16.
+                    # staging block. The transfer overlaps this round's
+                    # scores GEMM and is awaited (with a publish barrier)
+                    # before round 2's w-scale. The predicate on each load
+                    # already skips rows >= P; nothing to issue at P <= 16.
+                    #
+                    # WAR barrier: each warp's w-scale pass above reads
+                    # round-1 sWhist rows that the OTHER warp's cp.asyncs
+                    # below overwrite. Without this sync a lagging warp can
+                    # read round-2 decays as round-1 replay weights
+                    # (observed on B200 at T=4, P>16: up to ~5% of identical
+                    # launches drifted by up to 0.2).
+                    _bar_sync_1_64()
                     for _g2 in cutlass.range_constexpr(W_BLK * K_DIM // (64 * 4)):
                         _g2_chunk = (tidx - Int32(64)) + _g2 * Int32(64)
                         _g2_row = _g2_chunk // Int32(K_DIM // 4)
@@ -2469,11 +2476,20 @@ class KdaDecodeUCacheFlushKernel:
 _CACHE: dict = {}
 _F32_CACHE: dict = {}
 
+# Largest allowed per-step log-decay span T * |lower_bound|. The kernel folds
+# the per-channel decay into the MMA operands, and ktil = k_hat * exp(-cum)
+# reaches exp(T * |lower_bound|) with a saturating gate. bf16/f32 overflow at
+# exp(88.7); past that ktil becomes inf and the Gram GEMM produces NaN
+# (inf * underflowed khat). 80 keeps a margin below the overflow point:
+# lower_bound >= -20 at T=4 and >= -10 at T=8 (Kimi K3 uses -5).
+MAX_LOG_DECAY_SPAN = 80.0
+
 
 def _cached_f32(t):
     """Cast-cache the per-layer constant A_log / dt_bias to contiguous fp32,
     keyed by source-tensor identity (weakref-evicted; see the GDN kernel's
-    _cached_bf16 for the data_ptr-staleness rationale)."""
+    _cached_bf16 for the data_ptr-staleness rationale). Must be called on the
+    caller's persistent tensor, never on a per-call view or temporary."""
     if t.dtype == torch.float32 and t.is_contiguous():
         return t
     key = id(t)
@@ -2483,6 +2499,53 @@ def _cached_f32(t):
         _F32_CACHE[key] = c
         weakref.finalize(t, _F32_CACHE.pop, key, None)
     return c
+
+
+def _check(cond: bool, msg: str) -> None:
+    """Input-contract check that survives ``python -O`` (unlike ``assert``)."""
+    if not cond:
+        raise ValueError(f"kda_delta_rule_mtp_ucache_flush: {msg}")
+
+
+def _validate_device_ranges(
+    initial_state_indices: torch.Tensor,
+    hist_len: torch.Tensor,
+    cache_base: torch.Tensor,
+    pool: int,
+    hist_cap: int,
+) -> None:
+    """Range-check the device-resident index tensors with ONE host sync.
+
+    Skipped under CUDA-graph capture (a capture cannot read device values);
+    the graph-replay contract is that the caller only replays with inputs
+    that passed these checks eagerly.
+    """
+    if torch.cuda.is_current_stream_capturing():
+        return
+    stats = torch.stack(
+        [
+            initial_state_indices.min(),
+            initial_state_indices.max(),
+            hist_len.min().to(initial_state_indices.dtype),
+            hist_len.max().to(initial_state_indices.dtype),
+            cache_base.min().to(initial_state_indices.dtype),
+            cache_base.max().to(initial_state_indices.dtype),
+        ]
+    ).tolist()
+    idx_min, idx_max, hl_min, hl_max, cb_min, cb_max = stats
+    _check(
+        idx_min >= -1 and idx_max < pool,
+        f"initial_state_indices must be -1 (padded row) or a pool slot in "
+        f"[0, {pool}); got min={idx_min} max={idx_max}.",
+    )
+    _check(
+        hl_min >= 0 and hl_max <= hist_cap,
+        f"hist_len out of legal range [0, {hist_cap}]: min={hl_min} max={hl_max}.",
+    )
+    _check(
+        cb_min >= 0 and cb_max < RING_SLOTS,
+        f"cache_base out of legal range [0, {RING_SLOTS}): min={cb_min} max={cb_max}.",
+    )
 
 
 def kda_delta_rule_mtp_ucache_flush(
@@ -2507,7 +2570,7 @@ def kda_delta_rule_mtp_ucache_flush(
     flush_min: Optional[int] = None,
     restart_hist_on_flush: bool = True,
     pdl_trigger: bool = False,
-    w_ring: Optional[int] = None,
+    w_ring: int = W_RING,
     tma_late: Optional[bool] = None,
 ) -> torch.Tensor:
     """KDA decode output + u-cache append + PER-REQUEST state flush.
@@ -2528,156 +2591,227 @@ def kda_delta_rule_mtp_ucache_flush(
         g_log = lower_bound * sigmoid(exp(A_log[h]) * (g + dt_bias[h,:]))
     beta = sigmoid(b) is applied in-kernel (b carries logits).
 
-    flush_min defaults to W_RING - T + 1 (lazy). Legal hist_len at call
-    time: [0, 16]; cache_base: [0, 32).
+    Contract (every violation raises ``ValueError``):
+
+    - ``q``, ``k``: [B, T, H, 128] bf16; ``v``: [B, T, H, 128] bf16;
+      ``g``: [B, T, H, 128] bf16; ``b``: [B, T, H] bf16; T in {4, 8}.
+    - ``initial_state_indices``: [B] int32, each -1 (padded row: the CTA
+      retires, its output row is left untouched) or a slot in [0, pool).
+    - ``hist_len`` / ``cache_base``: [B] int32 in [0, min(w_ring, 32 - T)]
+      and [0, 32). Range checks on the three index tensors need one host
+      sync; they run on every eager call and are skipped under CUDA-graph
+      capture.
+    - ``lower_bound`` in [-MAX_LOG_DECAY_SPAN / T, 0): -20 at T=4, -10 at T=8.
+    - ``w_ring`` (16 or 32) is the logical history window. flush_min
+      defaults to the lazy cap min(w_ring - T + 1, 32 - 2T + 1); w_ring=32
+      requires flush_min > 16.
+    - ``tma_late`` (None = batch heuristic) only selects the load schedule;
+      it never changes results.
 
     Returns ``output`` of shape ``[B, T, H, V]`` bf16.
     """
-    assert q is not None and k is not None and v is not None
-    assert b is not None and initial_state_source is not None
-    assert use_qk_l2norm_in_kernel, (
-        "kda_delta_rule_mtp_ucache_flush: use_qk_l2norm_in_kernel=False is not "
-        "supported (the kernel always applies Q/K L2 normalization)."
+    _check(
+        q is not None and k is not None and v is not None and b is not None,
+        "q, k, v and b are required.",
     )
-    assert lower_bound is not None and lower_bound < 0.0, (
-        f"lower_bound must be a negative float (Kimi K3 gate); got {lower_bound}."
+    _check(initial_state_source is not None, "initial_state_source is required.")
+    _check(
+        use_qk_l2norm_in_kernel,
+        "use_qk_l2norm_in_kernel=False is not supported (the kernel always "
+        "applies Q/K L2 normalization).",
     )
-
+    _check(q.dim() == 4, f"q must be [B, T, H, K]; got {tuple(q.shape)}.")
     B, T_in, H, K_dim = q.shape
-    HV = v.shape[2]
-    V_dim = v.shape[3]
-    dev = q.device
-    assert K_dim == K_DIM and V_dim == V_DIM_C, (
-        f"this kernel requires K==V=={K_DIM}; got K={K_dim}, V={V_dim}."
-    )
-    assert H == HV, f"KDA has no GQA: H ({H}) must equal HV ({HV})."
+    _check(K_dim == K_DIM, f"this kernel requires K == {K_DIM}; got K={K_dim}.")
     if T_in not in (4, 8):
         raise NotImplementedError(
             f"kda_delta_rule_mtp_ucache_flush: T={T_in} unsupported — native T in "
             "{4, 8} only."
         )
+    _check(
+        tuple(k.shape) == tuple(q.shape),
+        f"k must match q's shape {tuple(q.shape)}; got {tuple(k.shape)}.",
+    )
+    _check(
+        v.dim() == 4 and tuple(v.shape[:2]) == (B, T_in),
+        f"v must be [B={B}, T={T_in}, H, V]; got {tuple(v.shape)}.",
+    )
+    HV, V_dim = v.shape[2], v.shape[3]
+    _check(V_dim == V_DIM_C, f"this kernel requires V == {V_DIM_C}; got V={V_dim}.")
+    _check(H == HV, f"KDA has no GQA: H ({H}) must equal HV ({HV}).")
+    lower_bound = float(lower_bound)
+    _check(
+        -MAX_LOG_DECAY_SPAN / T_in <= lower_bound < 0.0,
+        f"lower_bound must be in [{-MAX_LOG_DECAY_SPAN / T_in:g}, 0) at T={T_in} "
+        f"(T * |lower_bound| <= {MAX_LOG_DECAY_SPAN:g} keeps exp(-cum) inside "
+        f"the f32/bf16 range); got {lower_bound}.",
+    )
+    dev = q.device
+    _check(dev.type == "cuda", f"inputs must be CUDA tensors; got {dev}.")
 
     if scale is None:
         scale = 1.0 / math.sqrt(K_dim)
     if initial_state_indices is None:
         initial_state_indices = torch.arange(B, dtype=torch.int32, device=dev)
-    else:
-        initial_state_indices = initial_state_indices.contiguous()
-    assert (
-        q.dtype == IO_TORCH
-        and k.dtype == IO_TORCH
-        and v.dtype == IO_TORCH
-        and g.dtype == IO_TORCH
-        and b.dtype == IO_TORCH
-    ), (
-        f"bf16-only kernel; got q={q.dtype} k={k.dtype} v={v.dtype} g={g.dtype} "
-        f"b={b.dtype}."
+    _check(
+        initial_state_indices.dtype == torch.int32,
+        f"initial_state_indices must be int32; got {initial_state_indices.dtype}.",
     )
-    assert tuple(g.shape) == (B, T_in, HV, K_dim), (
-        f"g must be [B,T,H,K]={B, T_in, HV, K_dim}; got {tuple(g.shape)}"
+    # Its length sets the launch grid, so a longer buffer would launch CTAs
+    # that read q/k/v/hist_len out of bounds.
+    _check(
+        tuple(initial_state_indices.shape) == (B,),
+        f"initial_state_indices must have shape ({B},); got "
+        f"{tuple(initial_state_indices.shape)}.",
     )
-    assert tuple(b.shape) == (B, T_in, HV)
-    assert initial_state_source.dtype == IO_TORCH, (
+    initial_state_indices = initial_state_indices.contiguous()
+    for name, t in (("q", q), ("k", k), ("v", v), ("g", g), ("b", b)):
+        _check(t.dtype == IO_TORCH, f"bf16-only kernel; got {name}={t.dtype}.")
+    _check(
+        tuple(g.shape) == (B, T_in, HV, K_dim),
+        f"g must be [B,T,H,K]={(B, T_in, HV, K_dim)}; got {tuple(g.shape)}.",
+    )
+    _check(
+        tuple(b.shape) == (B, T_in, HV),
+        f"b must be [B,T,H]={(B, T_in, HV)}; got {tuple(b.shape)}.",
+    )
+    _check(
+        initial_state_source.dtype == IO_TORCH,
         f"initial_state_source must be {IO_TORCH} (pool, H, V, K); got "
-        f"{initial_state_source.dtype}."
+        f"{initial_state_source.dtype}.",
     )
 
-    # A_log [H] fp32; dt_bias [H*K] fp32 (accept [H, K] and flatten).
+    # A_log [H] fp32; dt_bias [H*K] fp32 (accept [H, K] and flatten). Cast
+    # the caller's persistent tensor BEFORE reshaping so the cache key is
+    # stable (a reshape is a fresh object every call).
+    _check(A_log.numel() == HV, f"A_log must have H={HV} elements.")
+    _check(
+        dt_bias.numel() == HV * K_dim, f"dt_bias must have H*K={HV * K_dim} elements."
+    )
     A_log = _cached_f32(A_log)
-    dt_bias = _cached_f32(dt_bias.reshape(-1))
-    assert A_log.numel() == HV, f"A_log must have H={HV} elements."
-    assert dt_bias.numel() == HV * K_dim, f"dt_bias must have H*K={HV * K_dim} elems."
+    dt_bias = _cached_f32(dt_bias).reshape(-1)
 
     def _inner_dense(t: torch.Tensor, name: str) -> bool:
         dense_inner = torch.empty(t.shape[1:], device="meta").stride()
-        assert tuple(t.stride()[1:]) == tuple(dense_inner) and t.stride(0) >= (
-            t.shape[1] * dense_inner[0] if t.dim() > 1 else 1
-        ), (
+        _check(
+            tuple(t.stride()[1:]) == tuple(dense_inner)
+            and t.stride(0) >= (t.shape[1] * dense_inner[0] if t.dim() > 1 else 1),
             f"{name}: inner dims must be dense (block-strided dim 0 is OK); "
-            f"got shape {tuple(t.shape)} strides {tuple(t.stride())}"
+            f"got shape {tuple(t.shape)} strides {tuple(t.stride())}.",
         )
         return t.is_contiguous()
 
     h0 = initial_state_source
 
     # --- ring validation -----------------------------------------------------
-    assert (
+    _check(
         k_cache is not None
         and u_cache is not None
         and g_cache is not None
-        and hist_len is not None
-    ), "kda ucache: k_cache/u_cache/g_cache/hist_len are required."
+        and hist_len is not None,
+        "k_cache/u_cache/g_cache/hist_len are required.",
+    )
     _pool = h0.shape[0]
+    _check(
+        tuple(h0.shape) == (_pool, H, V_dim, K_dim),
+        f"initial_state_source must be [pool, H={H}, V={V_dim}, K={K_dim}]; "
+        f"got {tuple(h0.shape)}.",
+    )
     _pools_contig = _inner_dense(h0, "initial_state_source")
-    assert k_cache.dtype == IO_TORCH
+    _check(k_cache.dtype == IO_TORCH, f"k_cache must be bf16; got {k_cache.dtype}.")
     _pools_contig &= _inner_dense(k_cache, "k_cache")
-    assert tuple(k_cache.shape) == (_pool, H, RING_SLOTS, K_dim), (
+    _check(
+        tuple(k_cache.shape) == (_pool, H, RING_SLOTS, K_dim),
         f"k_cache must be [pool={_pool}, H={H}, {RING_SLOTS}, K={K_dim}]; "
-        f"got {tuple(k_cache.shape)}"
+        f"got {tuple(k_cache.shape)}.",
     )
-    assert u_cache.dtype == IO_TORCH
+    _check(u_cache.dtype == IO_TORCH, f"u_cache must be bf16; got {u_cache.dtype}.")
     _pools_contig &= _inner_dense(u_cache, "u_cache")
-    assert tuple(u_cache.shape) == (_pool, HV, RING_SLOTS, V_dim)
-    assert g_cache.dtype == torch.float32
-    _pools_contig &= _inner_dense(g_cache, "g_cache")
-    assert tuple(g_cache.shape) == (_pool, HV, RING_SLOTS, K_dim), (
-        f"g_cache must be [pool={_pool}, H={HV}, {RING_SLOTS}, K={K_dim}] fp32 "
-        f"(per-channel cumulative log-decay); got {tuple(g_cache.shape)}"
+    _check(
+        tuple(u_cache.shape) == (_pool, HV, RING_SLOTS, V_dim),
+        f"u_cache must be [pool={_pool}, H={HV}, {RING_SLOTS}, V={V_dim}]; "
+        f"got {tuple(u_cache.shape)}.",
     )
-    assert hist_len.dtype == torch.int32 and hist_len.shape[0] == B
+    _check(
+        g_cache.dtype == torch.float32, f"g_cache must be fp32; got {g_cache.dtype}."
+    )
+    _pools_contig &= _inner_dense(g_cache, "g_cache")
+    _check(
+        tuple(g_cache.shape) == (_pool, HV, RING_SLOTS, K_dim),
+        f"g_cache must be [pool={_pool}, H={HV}, {RING_SLOTS}, K={K_dim}] fp32 "
+        f"(per-channel cumulative log-decay); got {tuple(g_cache.shape)}.",
+    )
+    _check(
+        hist_len.dtype == torch.int32 and tuple(hist_len.shape) == (B,),
+        f"hist_len must be int32 [{B}]; got {hist_len.dtype} {tuple(hist_len.shape)}.",
+    )
     # (w32) deep-window mode: logical window w_ring in {16, 32} over the
     # same 32-slot physical ring. Capacity algebra (same as the GDN W32
     # fork): flush_min <= min(w_ring - T + 1, RING - 2T + 1) — 13 @T=4 /
     # 9 @T=8 at w_ring=16; 25 @T=4 / 17 @T=8 at w_ring=32 — and
     # hist_len <= min(w_ring, RING - T).
-    _wr_env = os.environ.get("KDA_UCACHE_WRING")
-    if w_ring is None:
-        w_ring = int(_wr_env) if _wr_env else W_RING
-    assert w_ring in (16, 32), f"w_ring must be 16 or 32, got {w_ring}"
+    _check(w_ring in (16, 32), f"w_ring must be 16 or 32; got {w_ring}.")
     _hist_cap = min(w_ring, RING_SLOTS - T_in)
     if restart_hist_on_flush:
-        if cache_base is None:
-            raise ValueError(
-                "kda_delta_rule_mtp_ucache_flush: restart_hist_on_flush=True "
-                "commits ring cursors in place and needs a caller-owned "
-                "cache_base (got None)."
-            )
-        assert hist_len.is_contiguous() and cache_base.is_contiguous(), (
+        _check(
+            cache_base is not None,
+            "restart_hist_on_flush=True commits ring cursors in place and "
+            "needs a caller-owned cache_base (got None).",
+        )
+        _check(
+            hist_len.is_contiguous() and cache_base.is_contiguous(),
             "restart_hist_on_flush=True: hist_len and cache_base must be "
             "contiguous — .contiguous() would copy them and the in-place "
-            "cursor commit would be lost on the caller's tensors."
+            "cursor commit would be lost on the caller's tensors.",
         )
-        if not torch.cuda.is_current_stream_capturing():
-            _hl_min, _hl_max = (int(x.item()) for x in hist_len.aminmax())
-            assert _hl_min >= 0 and _hl_max <= _hist_cap, (
-                f"hist_len out of legal range [0, {_hist_cap}]: "
-                f"min={_hl_min} max={_hl_max}"
-            )
-            _cb_min, _cb_max = (int(x.item()) for x in cache_base.aminmax())
-            assert _cb_min >= 0 and _cb_max < RING_SLOTS, (
-                f"cache_base out of legal range [0, {RING_SLOTS}): "
-                f"min={_cb_min} max={_cb_max}"
-            )
     hist_len = hist_len.contiguous()
     if cache_base is None:
         cache_base = torch.zeros_like(hist_len)
-    assert cache_base.dtype == torch.int32 and cache_base.shape[0] == B
+    _check(
+        cache_base.dtype == torch.int32 and tuple(cache_base.shape) == (B,),
+        f"cache_base must be int32 [{B}]; got {cache_base.dtype} "
+        f"{tuple(cache_base.shape)}.",
+    )
     cache_base = cache_base.contiguous()
+    for name, t in (
+        ("k", k),
+        ("v", v),
+        ("g", g),
+        ("b", b),
+        ("A_log", A_log),
+        ("dt_bias", dt_bias),
+        ("initial_state_source", h0),
+        ("initial_state_indices", initial_state_indices),
+        ("k_cache", k_cache),
+        ("u_cache", u_cache),
+        ("g_cache", g_cache),
+        ("hist_len", hist_len),
+        ("cache_base", cache_base),
+    ):
+        _check(t.device == dev, f"{name} is on {t.device}, expected {dev}.")
+    # Both cursor modes: an out-of-contract hist_len silently reads past the
+    # w_ring-row tile and an out-of-range slot index writes another
+    # request's pool / ring rows.
+    _validate_device_ranges(
+        initial_state_indices, hist_len, cache_base, _pool, _hist_cap
+    )
     _fm_cap = min(w_ring - T_in + 1, RING_SLOTS - 2 * T_in + 1)
     if flush_min is None:
         flush_min = _fm_cap  # lazy: flush exactly when the window overflows
-    assert 1 <= flush_min <= _fm_cap, (
+    _check(
+        1 <= flush_min <= _fm_cap,
         f"flush_min={flush_min} out of range [1, {_fm_cap}] for T={T_in}, "
-        f"w_ring={w_ring} (tile cap w_ring-T+1, ring cap RING-2T+1)."
+        f"w_ring={w_ring} (tile cap w_ring-T+1, ring cap RING-2T+1).",
     )
     if w_ring == 32:
         # The deep-window kernel skips its round-2 pipeline (which zeroes
         # khist rows [16, 32)) CTA-uniformly at P <= 16; a fold there would
         # read stale bytes. A deep window with a shallow flush threshold is
         # self-defeating anyway — require the fold to live past block 1.
-        assert flush_min > 16, (
+        _check(
+            flush_min > 16,
             f"w_ring=32 requires flush_min > 16 (got {flush_min}); use "
-            "w_ring=16 for shallow flush thresholds."
+            "w_ring=16 for shallow flush thresholds.",
         )
     if not _pools_contig:
         raise NotImplementedError(
@@ -2699,13 +2833,9 @@ def kda_delta_rule_mtp_ucache_flush(
     # see the schedule-and-w_ring-dependent CTA/SM figures just below.
     # (tma-late) schedule choice by batch: measured crossover on B200 is
     # between B*HV = 384 (late loses ~5-8%) and 768 (late wins 3-17%) —
-    # split at ~4 work-CTAs per SM. Env/arg override for experiments.
-    _tl_env = os.environ.get("KDA_UCACHE_TMA_LATE")
+    # split at ~4 work-CTAs per SM. The tma_late argument overrides it.
     if tma_late is None:
-        if _tl_env is not None:
-            tma_late = _tl_env != "0"
-        else:
-            tma_late = 4 * _num_sms <= B * HV
+        tma_late = 4 * _num_sms <= B * HV
     tma_late = bool(tma_late)
     # SMEM (w16): tma-late -> 7 CTAs/SM at T<=4, 6 at T=8; tma-early -> 5
     # regardless of T. w32: tma-late -> 5, tma-early -> 4.
@@ -2714,9 +2844,6 @@ def kda_delta_rule_mtp_ucache_flush(
     else:
         _mbp_cap = (7 if T_in <= 4 else 6) if tma_late else 5
     mbp = max(1, min(_needed + 1, _mbp_cap))
-    _mbp_env = os.environ.get("KDA_UCACHE_MBP")
-    if _mbp_env:
-        mbp = int(_mbp_env)
     t_disc = 4 if T_in <= 4 else 8
     cache_key: tuple = (
         "kda-ucache-flush-v1",
@@ -2747,6 +2874,8 @@ def kda_delta_rule_mtp_ucache_flush(
         out_t = output
         _out_aliased = True
     else:
+        # Padded rows (index -1) are never written by the kernel; callers
+        # that pad must pass a preallocated ``output``.
         out_t = torch.empty(B, T_in, HV, V_dim, dtype=IO_TORCH, device=dev)
 
     stream = cuda.CUstream(torch.cuda.current_stream(device=dev).cuda_stream)
@@ -2804,6 +2933,7 @@ def kda_delta_rule_mtp_ucache_flush(
 
 __all__ = [
     "kda_delta_rule_mtp_ucache_flush",
+    "MAX_LOG_DECAY_SPAN",
     "KdaDecodeUCacheFlushKernel",
     "K_DIM",
     "V_DIM_C",

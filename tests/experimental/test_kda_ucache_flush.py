@@ -14,8 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 ---------------------------------------------------------------------------
-Correctness tests for the KDA ucache verify+flush kernel
-(flashinfer/kda_kernels/kda_decode_bf16_wy_ucache_flush.py) — the KDA
+Correctness tests for the experimental KDA ucache verify+flush kernel
+(``flashinfer.kda_decode.kda_delta_rule_mtp_ucache_flush``, backend in
+flashinfer/experimental/kda_ucache_flush/) — the KDA
 (Kimi Delta Attention / Kimi K3) analogue of the GDN replayssm kernel in
 tests/gdn/test_decode_ucache.py.
 
@@ -54,20 +55,22 @@ HOW THIS TESTS, IN PLAIN WORDS
   the stack; "16-bit state only"); g_cache is fp32 always.
 
 Run:
-  pytest tests/kda/test_decode_ucache.py -v
+  pytest tests/experimental/test_kda_ucache_flush.py -v
 """
 
 from __future__ import annotations
 
-import importlib.util
 import math
-from pathlib import Path
+import types
 
 import pytest
 import torch
 import torch.nn.functional as F
 
-pytestmark = pytest.mark.long_running
+pytestmark = [
+    pytest.mark.long_running,
+    pytest.mark.filterwarnings("ignore::flashinfer.api_logging.ExperimentalWarning"),
+]
 
 DEV = "cuda"
 # Kimi K3 KDA geometry at serving TP; T=4 == MTP draft-3 verify window.
@@ -77,12 +80,7 @@ RING = 32  # physical ring depth (kernel RING_SLOTS); window wraps mod RING
 FLUSH_MIN = 13  # == W - T + 1
 SCALE = 1.0 / math.sqrt(K)
 LOWER_BOUND = -5.0  # Kimi K3 gate lower bound
-
-_FLUSH_PATH = str(
-    Path(__file__).resolve().parents[2]
-    / "flashinfer/kda_kernels/kda_decode_bf16_wy_ucache_flush.py"
-)
-_MODULE_CACHE: dict = {}
+_I32 = {"dtype": torch.int32, "device": DEV}
 
 
 def _skip_if_not_sm90_or_later():
@@ -94,27 +92,28 @@ def _skip_if_not_sm90_or_later():
 
 
 def _load_flush():
-    if "flush" in _MODULE_CACHE:
-        return _MODULE_CACHE["flush"]
-    spec = importlib.util.spec_from_file_location("kda_uc_flush", _FLUSH_PATH)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    _MODULE_CACHE["flush"] = mod
-    return mod
+    """Every test goes through the public experimental entry point."""
+    from flashinfer.kda_decode import kda_delta_rule_mtp_ucache_flush
+
+    return types.SimpleNamespace(
+        kda_delta_rule_mtp_ucache_flush=kda_delta_rule_mtp_ucache_flush
+    )
 
 
 # ---------------------------------------------------------------------------
 # The fp32 oracle. Slow and simple on purpose - this IS the spec.
 # One request at a time. State S is [H, V, K]; decay scales the K axis.
 # ---------------------------------------------------------------------------
-def _gate_log(g_raw, A_log, dt_bias):
+def _gate_log(g_raw, A_log, dt_bias, lb=LOWER_BOUND):
     """Kimi K3 lower-bound gate, fp32: lb * sigmoid(exp(A_log) * (g + bias)).
     g_raw [.., H, K]; A_log [H] fp32; dt_bias [H*K] fp32. Returns [.., H, K]."""
     x = g_raw.float() + dt_bias.float().view(H, K)
-    return LOWER_BOUND * torch.sigmoid(torch.exp(A_log.float())[:, None] * x)
+    return lb * torch.sigmoid(torch.exp(A_log.float())[:, None] * x)
 
 
-def _ref_fp32(q, k, v, g, b, A_log, dt_bias, S0, kc, uc, gc, P, t_len=T):
+def _ref_fp32(
+    q, k, v, g, b, A_log, dt_bias, S0, kc, uc, gc, P, t_len=T, lb=LOWER_BOUND
+):
     f = torch.float32
     S = S0.to(f).clone()
 
@@ -134,7 +133,7 @@ def _ref_fp32(q, k, v, g, b, A_log, dt_bias, S0, kc, uc, gc, P, t_len=T):
     qhat = F.normalize(q.to(f), dim=-1) * SCALE
     y = torch.zeros(t_len, H, V, dtype=f, device=q.device)
     for t in range(t_len):
-        glog = _gate_log(g[t], A_log, dt_bias)  # [H, K]
+        glog = _gate_log(g[t], A_log, dt_bias, lb)  # [H, K]
         beta = torch.sigmoid(b[t].to(f))  # [H]
         S = S * torch.exp(glog)[:, None, :]  # per-channel decay
         pred = torch.einsum("hvk,hk->hv", S, khat[t])  # S k
@@ -207,13 +206,21 @@ def _logical_rings(kc_r, uc_r, gc_r, base, w=W):
     )
 
 
-def _run(mod, case, flush_min=FLUSH_MIN, restart=False, w_ring=16, tma_late=None):
+def _run(
+    mod,
+    case,
+    flush_min=FLUSH_MIN,
+    restart=False,
+    w_ring=16,
+    tma_late=None,
+    lb=LOWER_BOUND,
+):
     q, k, v, g, b, A_log, dt_bias, pool, kc, uc, gc, hl, cb, idx = case
     return mod.kda_delta_rule_mtp_ucache_flush(
         A_log,
         g,
         dt_bias,
-        lower_bound=LOWER_BOUND,
+        lower_bound=lb,
         q=q,
         k=k,
         v=v,
@@ -565,7 +572,7 @@ def test_capacity_validation():
     case = _make_case(B, [12, 12, 12, 12], seed=7, bases=[0, 5, 28, 30])
     q, k, v, g, b, A_log, dt_bias, pool, kc, uc, gc, hl, cb, idx = case
 
-    with pytest.raises(AssertionError):
+    with pytest.raises(ValueError):
         run_case = (
             q,
             k,
@@ -586,7 +593,7 @@ def test_capacity_validation():
 
     hl_bad = hl.clone()
     hl_bad[1] = 17  # > W - allowed by RING but not by the 16-row tile
-    with pytest.raises(AssertionError, match="hist_len out of legal range"):
+    with pytest.raises(ValueError, match="hist_len out of legal range"):
         run_case = (
             q,
             k,
@@ -921,7 +928,7 @@ def test_w32_capacity_validation():
     mod = _load_flush()
     case = _make_case(4, [12, 12, 12, 12], seed=7, bases=[0, 5, 28, 30])
     q, k, v, g, b, A_log, dt_bias, pool, kc, uc, gc, hl, cb, idx = case
-    with pytest.raises(AssertionError):
+    with pytest.raises(ValueError):
         _run(
             mod,
             (
@@ -946,7 +953,7 @@ def test_w32_capacity_validation():
         )
     hl_bad = hl.clone()
     hl_bad[1] = 29  # appends would wrap into the live window
-    with pytest.raises(AssertionError, match="hist_len out of legal range"):
+    with pytest.raises(ValueError, match="hist_len out of legal range"):
         _run(
             mod,
             (q, k, v, g, b, A_log, dt_bias, pool, kc, uc, gc, hl_bad, cb.clone(), idx),
@@ -957,7 +964,7 @@ def test_w32_capacity_validation():
     # shallow flush thresholds are w16 territory (round-2 zeroing is
     # skipped CTA-uniformly at P <= 16, so a fold there would read stale
     # khist rows).
-    with pytest.raises(AssertionError, match="flush_min > 16"):
+    with pytest.raises(ValueError, match="flush_min > 16"):
         _run(
             mod,
             (
@@ -980,3 +987,392 @@ def test_w32_capacity_validation():
             restart=True,
             w_ring=32,
         )
+
+
+# ---------------------------------------------------------------------------
+# Review follow-ups (PR #4864): API surface, w32 WAR race, restart path,
+# validation in both cursor modes, lower_bound range, index validation.
+# ---------------------------------------------------------------------------
+def test_entry_point_is_experimental_and_not_exported():
+    import flashinfer.kda_decode as kda_decode
+    import flashinfer.kda_kernels as kda_kernels
+
+    assert kda_decode.kda_delta_rule_mtp_ucache_flush.is_experimental
+    assert "kda_delta_rule_mtp_ucache_flush" not in kda_kernels.__all__
+    assert not hasattr(kda_kernels, "kda_delta_rule_mtp_ucache_flush")
+
+
+@pytest.mark.parametrize("t", [4, 8])
+@pytest.mark.parametrize("tma_late", [False, True])
+def test_w32_deep_window_repeat_determinism(t, tma_late):
+    """w_ring=32 stages g-ring round 2 into the buffer round 1's w-scale
+    reads. Without the WAR barrier a lagging warp reads round-2 decays as
+    round-1 replay weights, which shows up as rare run-to-run drift at
+    large B with P > 16 (the second j-block is live). Repeat identical
+    launches and require every one to be bitwise equal to the first.
+
+    Without the barrier this fails reliably on B200 at T=4 (1-7 of 150
+    launches drift, up to ~0.2); T=8 has not been seen to trip it."""
+    _skip_if_not_sm90_or_later()
+    mod = _load_flush()
+    B0, REPLICAS, REPEATS = 512, 8, 150
+    B = B0 * REPLICAS
+    fm = _w32_fm(t)
+    cap = RING - t
+    gen = torch.Generator().manual_seed(5 + t)
+    hist = torch.randint(17, cap + 1, (B0,), generator=gen).tolist()
+    bases = torch.randint(0, RING, (B0,), generator=gen).tolist()
+    case = _make_case(B0, hist, seed=11 + t, bases=bases, t=t)
+    # tile the B0-row case REPLICAS times: more CTAs per launch = more
+    # chances for the race per launch, at no case-building cost
+    case = [
+        x.repeat(REPLICAS, *([1] * (x.dim() - 1))) if x.shape[0] == B0 else x
+        for x in case
+    ]
+    q, k, v, g, b, A_log, dt_bias, pool, kc, uc, gc, hl, cb, idx = case
+    idx = torch.arange(B, **_I32)
+    snap = [x.clone() for x in (pool, kc, uc, gc)]
+    out = torch.empty(B, t, H, V, dtype=torch.bfloat16, device=DEV)
+
+    def once():
+        for dst, src in zip((pool, kc, uc, gc), snap, strict=True):
+            dst.copy_(src)
+        mod.kda_delta_rule_mtp_ucache_flush(
+            A_log,
+            g,
+            dt_bias,
+            lower_bound=LOWER_BOUND,
+            q=q,
+            k=k,
+            v=v,
+            b=b,
+            initial_state_source=pool,
+            initial_state_indices=idx,
+            k_cache=kc,
+            u_cache=uc,
+            g_cache=gc,
+            hist_len=hl,
+            cache_base=cb,
+            scale=SCALE,
+            flush_min=fm,
+            restart_hist_on_flush=False,
+            output=out,
+            w_ring=32,
+            tma_late=tma_late,
+        )
+        return out.clone(), pool.clone()
+
+    y0, p0 = once()
+    assert torch.isfinite(y0.float()).all()
+    bad = 0
+    for _ in range(REPEATS):
+        y, p = once()
+        bad += int(not (torch.equal(y, y0) and torch.equal(p, p0)))
+    assert bad == 0, f"{bad}/{REPEATS} identical w32 launches differ"
+
+
+def _sequential_fp32(pool0, q, k, v, g, b, A_log, dt_bias):
+    """Plain token-by-token KDA recurrence for one request, all tokens.
+    Returns y [N, H, V]."""
+    f = torch.float32
+    S = pool0.to(f).clone()
+    khat = F.normalize(k.to(f), dim=-1)
+    qhat = F.normalize(q.to(f), dim=-1) * SCALE
+    ys = []
+    for t in range(q.shape[0]):
+        glog = _gate_log(g[t], A_log, dt_bias)
+        beta = torch.sigmoid(b[t].to(f))
+        S = S * torch.exp(glog)[:, None, :]
+        u_t = (v[t].to(f) - torch.einsum("hvk,hk->hv", S, khat[t])) * beta[:, None]
+        S = S + u_t[:, :, None] * khat[t][:, None, :]
+        ys.append(torch.einsum("hvk,hk->hv", S, qhat[t]))
+    return torch.stack(ys)
+
+
+@pytest.mark.parametrize("graph", [False, True], ids=["eager", "cuda_graph"])
+@pytest.mark.parametrize("w_ring", [16, 32])
+def test_restart_hist_on_flush_across_steps(graph, w_ring):
+    """restart_hist_on_flush=True (the default) commits the ring cursors in
+    place: flush rows slide cache_base by hist_len and reset hist_len. Run
+    several T=4 steps back to back (every draft accepted, so the caller adds
+    T to hist_len after each launch), crossing at least one fold per row,
+    and compare every step's output to one sequential fp32 recurrence over
+    all tokens. The graph variant captures (launch + commit + accept) once
+    and replays it per step with fresh inputs copied into static buffers;
+    its outputs, pool and rings must equal the eager run's bitwise."""
+    _skip_if_not_sm90_or_later()
+    mod = _load_flush()
+    B, t = 4, T
+    fm = W - t + 1 if w_ring == 16 else _w32_fm(t)
+    steps = fm // t + 3  # every row folds at least once
+    gen = torch.Generator(device=DEV).manual_seed(4864 + w_ring)
+    io = torch.bfloat16
+
+    def rn(*s, sc=1.0):
+        return (torch.randn(*s, generator=gen, device=DEV) * sc).to(io)
+
+    N = steps * t
+    qa, ka = rn(B, N, H, K), rn(B, N, H, K)
+    va, ba, ga = rn(B, N, H, V, sc=0.5), rn(B, N, H), rn(B, N, H, K, sc=0.5)
+    A_log = (torch.rand(H, generator=gen, device=DEV) * 0.6 - 0.3).float()
+    dt_bias = (torch.randn(H * K, generator=gen, device=DEV) * 0.5).float()
+    pool0 = (torch.randn(B, H, V, K, generator=gen, device=DEV) * 0.5).to(io)
+    bases0 = [0, 7, 29, 31]
+
+    def fresh_state():
+        return (
+            pool0.clone(),
+            torch.zeros(B, H, RING, K, dtype=io, device=DEV),
+            torch.zeros(B, H, RING, V, dtype=io, device=DEV),
+            torch.zeros(B, H, RING, K, dtype=torch.float32, device=DEV),
+            torch.zeros(B, dtype=torch.int32, device=DEV),
+            torch.tensor(bases0, dtype=torch.int32, device=DEV),
+        )
+
+    sq, sk = torch.empty_like(qa[:, :t]), torch.empty_like(ka[:, :t])
+    sv, sb, sg = (
+        torch.empty_like(va[:, :t]),
+        torch.empty_like(ba[:, :t]),
+        torch.empty_like(ga[:, :t]),
+    )
+    out = torch.empty(B, t, H, V, dtype=io, device=DEV)
+
+    def load(step):
+        sl = slice(step * t, (step + 1) * t)
+        for dst, src in zip((sq, sk, sv, sb, sg), (qa, ka, va, ba, ga), strict=True):
+            dst.copy_(src[:, sl])
+
+    def make_step(state):
+        pool, kc, uc, gc, hl, cb = state
+
+        def step_fn():
+            mod.kda_delta_rule_mtp_ucache_flush(
+                A_log,
+                sg,
+                dt_bias,
+                lower_bound=LOWER_BOUND,
+                q=sq,
+                k=sk,
+                v=sv,
+                b=sb,
+                initial_state_source=pool,
+                k_cache=kc,
+                u_cache=uc,
+                g_cache=gc,
+                hist_len=hl,
+                cache_base=cb,
+                scale=SCALE,
+                flush_min=fm,
+                restart_hist_on_flush=True,
+                output=out,
+                w_ring=w_ring,
+            )
+            hl.add_(t)  # caller commit: all T drafts accepted
+
+        return step_fn
+
+    def run_all(use_graph):
+        state = fresh_state()
+        step_fn = make_step(state)
+        if use_graph:
+            # warm up on a throwaway copy so the real state starts pristine
+            warm_state = fresh_state()
+            load(0)
+            warm = make_step(warm_state)
+            side = torch.cuda.Stream()
+            side.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(side):
+                warm()
+            torch.cuda.current_stream().wait_stream(side)
+            graph_obj = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph_obj):
+                step_fn()
+        ys, hist_seen = [], []
+        for s in range(steps):
+            load(s)
+            hist_seen.append(state[4].clone())
+            if use_graph:
+                graph_obj.replay()
+            else:
+                step_fn()
+            ys.append(out.clone())
+        torch.cuda.synchronize()
+        return torch.cat(ys, dim=1), state, torch.stack(hist_seen)
+
+    y_eager, st_eager, hist_seen = run_all(False)
+    # the schedule really crossed folds: some step saw hist_len >= flush_min
+    # for every row, and the commit reset it afterwards
+    assert bool((hist_seen >= fm).any(dim=0).all()), hist_seen.tolist()
+    assert int(hist_seen.max()) <= fm + t - 1
+    for r in range(B):
+        y_ref = _sequential_fp32(
+            pool0[r], qa[r], ka[r], va[r], ga[r], ba[r], A_log, dt_bias
+        )
+        err = (y_eager[r].float() - y_ref).abs().max().item()
+        assert err < 3e-2, f"row {r}: |y - sequential fp32| = {err:.2e}"
+
+    if graph:
+        y_graph, st_graph, _ = run_all(True)
+        assert torch.equal(y_graph, y_eager), "graph replay output != eager"
+        for name, a, e in zip(
+            ("pool", "k_cache", "u_cache", "g_cache", "hist_len", "cache_base"),
+            st_graph,
+            st_eager,
+            strict=True,
+        ):
+            assert torch.equal(a, e), f"graph replay {name} != eager"
+
+
+def test_hist_len_validated_without_restart():
+    """The hist_len / cache_base range check also runs in the caller-owned
+    cursor mode (restart_hist_on_flush=False), raising ValueError."""
+    _skip_if_not_sm90_or_later()
+    mod = _load_flush()
+    case = _make_case(4, [12, 12, 12, 12], seed=7, bases=[0, 5, 28, 30])
+    q, k, v, g, b, A_log, dt_bias, pool, kc, uc, gc, hl, cb, idx = case
+    for bad_hl, bad_cb in (([12, 20, 0, 0], None), (None, [0, 32, 0, 0])):
+        hl_x = hl.clone() if bad_hl is None else torch.tensor(bad_hl, **_I32)
+        cb_x = cb.clone() if bad_cb is None else torch.tensor(bad_cb, **_I32)
+        with pytest.raises(ValueError, match="out of legal range"):
+            _run(
+                mod,
+                (q, k, v, g, b, A_log, dt_bias, pool, kc, uc, gc, hl_x, cb_x, idx),
+                restart=False,
+            )
+
+
+@pytest.mark.parametrize("t", [4, 8])
+def test_lower_bound_range(t):
+    """T * |lower_bound| must stay <= 80 (exp(-cum) inside the f32 range).
+    The boundary value runs with a fully saturating gate and still matches
+    the fp32 oracle; one step past it is rejected."""
+    _skip_if_not_sm90_or_later()
+    mod = _load_flush()
+    lb_ok = -80.0 / t
+    fm = W - t + 1
+    case = _make_case(4, [0, 5, fm - 1, fm], seed=21, bases=[0, 30, 3, 17], t=t)
+    q, k, v, g, b, A_log, dt_bias, pool, kc, uc, gc, hl, cb, idx = case
+    g = torch.full_like(g, 30.0)  # sigmoid -> 1: glog == lower_bound per token
+    A_log = torch.zeros_like(A_log)
+    pool_before = pool.clone()
+    y = _run(
+        mod,
+        (
+            q,
+            k,
+            v,
+            g,
+            b,
+            A_log,
+            dt_bias,
+            pool,
+            kc.clone(),
+            uc.clone(),
+            gc.clone(),
+            hl.clone(),
+            cb.clone(),
+            idx,
+        ),
+        flush_min=fm,
+        lb=lb_ok,
+    )
+    assert torch.isfinite(y.float()).all()
+    for r in range(4):
+        kc_l, uc_l, gc_l = _logical_rings(kc[r], uc[r], gc[r], int(cb[r]))
+        y_ref, _ = _ref_fp32(
+            q[r],
+            k[r],
+            v[r],
+            g[r],
+            b[r],
+            A_log,
+            dt_bias,
+            pool_before[r],
+            kc_l,
+            uc_l,
+            gc_l,
+            int(hl[r]),
+            t_len=t,
+            lb=lb_ok,
+        )
+        err = (y[r].float() - y_ref).abs().max().item()
+        assert err < Y_TOL, f"row {r}: |y - fp32 ref| = {err:.2e} at lb={lb_ok}"
+    for bad in (lb_ok - 0.5, 0.0, 1.0):
+        with pytest.raises(ValueError, match="lower_bound"):
+            _run(
+                mod,
+                (
+                    q,
+                    k,
+                    v,
+                    g,
+                    b,
+                    A_log,
+                    dt_bias,
+                    pool,
+                    kc,
+                    uc,
+                    gc,
+                    hl.clone(),
+                    cb.clone(),
+                    idx,
+                ),
+                flush_min=fm,
+                lb=bad,
+            )
+
+
+def test_input_validation_raises_value_error():
+    """initial_state_indices dtype / length / range and the k / v shapes
+    are validated with ValueError before launch."""
+    _skip_if_not_sm90_or_later()
+    mod = _load_flush()
+    POOL = 6
+    case = _make_case(4, [3, 3, 3, 3], seed=3, pool_size=POOL)
+    q, k, v, g, b, A_log, dt_bias, pool, kc, uc, gc, hl, cb, idx = case
+
+    def call(**over):
+        args = dict(
+            q=q,
+            k=k,
+            v=v,
+            b=b,
+            idx=idx,
+            g=g,
+        )
+        args.update(over)
+        return mod.kda_delta_rule_mtp_ucache_flush(
+            A_log,
+            args["g"],
+            dt_bias,
+            lower_bound=LOWER_BOUND,
+            q=args["q"],
+            k=args["k"],
+            v=args["v"],
+            b=args["b"],
+            initial_state_source=pool,
+            initial_state_indices=args["idx"],
+            k_cache=kc,
+            u_cache=uc,
+            g_cache=gc,
+            hist_len=hl.clone(),
+            cache_base=cb.clone(),
+            restart_hist_on_flush=False,
+        )
+
+    bad = {
+        "int64 indices": dict(idx=idx.long()),
+        "short indices": dict(idx=idx[:3]),
+        "long indices": dict(idx=torch.arange(6, **_I32)),
+        "slot == pool": dict(idx=torch.tensor([0, 1, POOL, 2], **_I32)),
+        "slot < -1": dict(idx=torch.tensor([0, -2, 1, 2], **_I32)),
+        "k batch": dict(k=k[:3]),
+        "k heads": dict(k=k[:, :, :6].contiguous()),
+        "v batch": dict(v=v[:3]),
+        "v tokens": dict(v=torch.cat([v, v], dim=1)),
+    }
+    for name, over in bad.items():
+        with pytest.raises(ValueError):
+            call(**over)
+            pytest.fail(f"{name}: accepted")
+    call()  # the unmodified case is accepted

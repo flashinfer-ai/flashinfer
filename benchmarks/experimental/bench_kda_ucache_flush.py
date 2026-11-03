@@ -15,7 +15,7 @@ limitations under the License.
 
 ---------------------------------------------------------------------------
 Flush-rate sweep for the KDA ucache verify+flush kernel
-(flashinfer/kda_kernels/kda_decode_bf16_wy_ucache_flush.py).
+(the experimental ``flashinfer.kda_decode.kda_delta_rule_mtp_ucache_flush``).
 
 One table per fold rate (methodology matches bench_gdn_ucache_flush_w32.py:
 CUDA-graph replay, pure-kernel timing i.e. restart_hist_on_flush=False,
@@ -35,15 +35,14 @@ Geometry: Kimi K3 at serving TP — H == HV == 12, K == V == 128,
 lower_bound = -5. T in {4, 8} via --t (default 8 — Kimi K3's draft length).
 
 Run:
-  python benchmarks/bench_kda_ucache_flush.py [--iters 500] [--t 8]
+  python benchmarks/experimental/bench_kda_ucache_flush.py [--iters 500] [--t 8]
 """
 
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import math
-from pathlib import Path
+import warnings
 
 import numpy as np
 import torch
@@ -56,17 +55,13 @@ RING = 32
 SCALE = 1.0 / math.sqrt(K)
 LOWER_BOUND = -5.0
 
-_KPATH = (
-    Path(__file__).resolve().parents[1]
-    / "flashinfer/kda_kernels/kda_decode_bf16_wy_ucache_flush.py"
-)
-
 
 def load():
-    spec = importlib.util.spec_from_file_location("kda_uc_bench", str(_KPATH))
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod.kda_delta_rule_mtp_ucache_flush
+    from flashinfer.api_logging import ExperimentalWarning
+    from flashinfer.kda_decode import kda_delta_rule_mtp_ucache_flush
+
+    warnings.filterwarnings("ignore", category=ExperimentalWarning)
+    return kda_delta_rule_mtp_ucache_flush
 
 
 torch.manual_seed(0)
@@ -141,6 +136,7 @@ def bench_point(fn, flush_min, B, T, hist, iters, seed):
             scale=SCALE,
             flush_min=flush_min,
             restart_hist_on_flush=False,  # pure kernel: no cursor-commit ops
+            w_ring=16,
         )
 
     gr = graphed(call)
