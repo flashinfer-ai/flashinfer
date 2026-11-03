@@ -349,6 +349,12 @@ def chunk_gdn_det_kcp(
     ``use_qk_l2norm_in_kernel`` (keyword-only, default ``False``): the in-kernel per-head L2 norm of ``q`` / ``k``
     (module docstring); it is part of the saved set and of the recompute handle's entry, so a checkpoint, a handle
     and a CUDA-graph replay see it like any other option.
+
+    ``q`` / ``k`` / ``v`` that are head views of one packed ``[..., T, (2 H_qk + HV) * 128]`` row (the convolution's
+    output) get the full backward speed only as :func:`packed_qkv_views_det_kcp` views.  Plain ``split`` / ``view``
+    views of the row give bitwise the same results, but torch's split backward concatenates ``dq`` / ``dk`` /
+    ``dv`` into a new row: about 1.1 ms (33-36 %) more backward per call at ``(16, 48)`` and 32,768 tokens on GB200
+    and GB300, with the in-kernel norm off or on (package README, "Packed Q/K/V").
     """
     return _pkg().chunk_gdn_det_kcp(
         q,
@@ -376,7 +382,13 @@ def packed_qkv_views_det_kcp(
     r"""``q`` / ``k`` / ``v`` as head views ``[..., T, H_qk | H_qk | HV, 128]`` of a packed
     ``[..., T, (2 H_qk + HV) * 128]`` row, with no copy.  :func:`chunk_gdn_det_kcp` takes the views as they are and its
     backward writes ``dq`` / ``dk`` / ``dv`` into one packed row, which this split's backward returns as the gradient
-    of ``qkv`` without a concatenation.
+    of ``qkv`` without a concatenation.  Plain ``split`` views of ``qkv`` give the same gradients through torch's
+    split backward, which concatenates them (:func:`chunk_gdn_det_kcp`).
+
+    Needs a dense channel axis (``qkv.stride(-1) == 1``).  The views are the outputs of one custom autograd node:
+    hooks and ``retain_grad`` on them fire as on any autograd output; its backward concatenates instead when the
+    incoming gradients are not the head views of one packed row (a missing gradient counts as zeros, a hook that
+    returns a new gradient); autograd refuses an in-place change to the views while ``qkv`` requires grad.
 
     Example::
 

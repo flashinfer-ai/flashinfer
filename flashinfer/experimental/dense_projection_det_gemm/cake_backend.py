@@ -53,6 +53,10 @@ partial wave whose halves fit the CTA pairs and K has at least 16 steps;
 multi-wave problems stay data-parallel) and binds the argument plan of the
 registered module (``cake_jit.MODULES`` / ``cake_jit.KERNELS``).  The result
 is bitwise identical to the Cake launcher's on the same device.
+The convenience path runs a batched forward of at most 256 tokens on the
+swapped program instead (the weight rows in the MMA's M, at most two waves of
+single-CTA tiles over the caller's strided views; :func:`swap_ab_template`),
+which takes ``enable_pdl`` per call (:func:`dense_projection_det_gemm`).
 
 K2 -- FP32 router GEMM through split-BF16x3 emulation
 ----------------------------------------------------
@@ -4285,11 +4289,194 @@ def _launch_cached_gemm(
     return out
 
 
+# --- the swapped small-token forward -------------------------------------------------------
+#
+# A batched forward row the planner would swap (:func:`swap_small_m`: few tokens against many weight rows) runs on a
+# program that puts the weight rows in the MMA's M and the tokens in its N (``swap_ab_<tile>`` templates): the
+# weights stream through a deep TMA ring, at most two waves of single-CTA tiles, and every output element is the one FP32 sum
+# of its whole K, rounded once (no split, so the bits do not depend on the tile).  The program reads ``A`` and the
+# K-major ``B`` through tensor maps over the caller's views and stores into ``out`` at
+# ``l * out_l + m * ldo + n``, so token-major views run without a copy.  Its weight loads run ahead of the PDL wait
+# (only the token loads wait): with ``enable_pdl`` the call overlaps its weight stream with the predecessor's tail,
+# which requires that no kernel still in flight on the stream writes ``B``.
+SWAP_TILE_T = 64  # tokens per CTA of the swapped programs
+#: Weight rows per CTA -> the template serving them, in preference order: the narrow tile while its CTAs fit one
+#: wave (more CTAs streaming the weights), the wide one otherwise.
+SWAP_TEMPLATES: Tuple[Tuple[int, str], ...] = (
+    (64, "swap_ab_w64_t64_s12"),
+    (128, "swap_ab_w128_t64_s8"),
+)
+#: The most waves of single-CTA tiles a swapped forward runs in.  Its CTAs each stream their weight rows once; past
+#: two waves the planner's pair tiles stream them faster (GB300: 8 x 4096 x 1024 at 64 tokens, 256 CTAs, 17.0 us
+#: against 20.5 us; at 128 tokens, 512 CTAs, 25.1 us against 21.7 us).
+SWAP_MAX_WAVES = 2
+
+
+@dataclass(frozen=True)
+class _SwapLaunch:
+    """A routed swapped forward: the module entry, its grid and the scalars of its argument plan."""
+
+    module_name: str
+    entry: Callable[..., Any] = field(repr=False)
+    grid: Tuple[int, int, int]
+    M: int
+    N: int
+    K: int
+    L: int
+    ldo: int
+    out_l: int
+
+
+def _aligned_view(t: torch.Tensor) -> bool:
+    """A ``[L, rows, K]`` K-major view the swapped program's tensor maps take: unit K stride, row and batch strides
+    in whole 16-byte units, a 16-byte aligned start."""
+    return (
+        t.stride(2) == 1
+        and t.stride(1) % 8 == 0
+        and t.stride(0) % 8 == 0
+        and t.data_ptr() % 16 == 0
+    )
+
+
+def swap_ab_template(L: int, M: int, N: int, sm_count: int, arch: str) -> Optional[str]:
+    """The ``swap_ab_<tile>`` template a swapped forward of ``L`` batches of ``M`` tokens against ``N`` weight rows
+    runs on ``arch``: the first of :data:`SWAP_TEMPLATES` whose CTAs fit one wave of the device's SMs, else the
+    widest; ``None`` when that one needs more than :data:`SWAP_MAX_WAVES` waves (the planner's program is faster
+    there) or ``arch`` registers none of them."""
+    table = KERNELS.get(arch, {})
+    registered = [(w, t) for w, t in SWAP_TEMPLATES if t in table]
+    if not registered:
+        return None
+    m_tiles = -(-M // SWAP_TILE_T)
+    for tile_w, template in registered:
+        if -(-N // tile_w) * m_tiles * L <= sm_count:
+            return template
+    tile_w, template = registered[-1]
+    if -(-N // tile_w) * m_tiles * L > SWAP_MAX_WAVES * sm_count:
+        return None
+    return template
+
+
+def _swap_ab_launch(
+    A: torch.Tensor, B: torch.Tensor, out: torch.Tensor, transposed_out: bool
+) -> Optional[_SwapLaunch]:
+    """The swapped launch of a K1 call, or ``None`` when the call stays on the planner: a batched forward
+    (``A`` K-major, ``B`` K-major, BF16 out, no transposed store) that :func:`swap_small_m` selects, with ``K`` a
+    multiple of 64, the views' strides and starts in 16-byte units and a registered swapped program."""
+    if (
+        transposed_out
+        or out.dtype != torch.bfloat16
+        or A.dtype != torch.bfloat16
+        or B.dtype != torch.bfloat16
+        or A.dim() != 3
+        or B.dim() != 3
+        or out.dim() != 3
+    ):
+        return None
+    L, M, K = (int(s) for s in A.shape)
+    N = int(B.shape[2])
+    if (
+        tuple(B.shape) != (L, K, N)
+        or tuple(out.shape) != (L, M, N)
+        or not swap_small_m(L, M, N, transposed_out)
+        or K % BLOCK_K != 0
+        or N % 8 != 0
+    ):
+        return None
+    W = B.transpose(1, 2)
+    if not (_aligned_view(A) and _aligned_view(W)):
+        return None
+    ldo = int(out.stride(1)) if M > 1 else N
+    out_l = int(out.stride(0))
+    if (
+        out.stride(2) != 1
+        or ldo % 8 != 0
+        or ldo < N
+        or out_l % 8 != 0
+        or out.data_ptr() % 16 != 0
+        or max(ldo, out_l) > 2**31 - 1
+    ):
+        return None
+    device = _same_cuda_device(A, B, out)
+    facts = device_facts(device)
+    if facts.arch is None:
+        return None
+    template = swap_ab_template(L, M, N, facts.sm_count, facts.arch)
+    if template is None:
+        return None
+    module_name = select_module(facts.arch, template)
+    tile_w = dict((t, w) for w, t in SWAP_TEMPLATES)[template]
+    grid = (-(-N // tile_w), -(-M // SWAP_TILE_T), L)
+    module = load_cake_dense_projection_det_gemm_module(module_name, facts.arch)
+    entry = getattr(module, MODULES[module_name]["ffi_entry"])
+    return _SwapLaunch(module_name, entry, grid, M, N, K, L, ldo, out_l)
+
+
+_SWAP_CACHE: "OrderedDict[tuple, Union[_SwapLaunch, bool]]" = OrderedDict()
+
+
+def _swap_ab_cached(
+    A: torch.Tensor, B: torch.Tensor, out: torch.Tensor, transposed_out: bool
+) -> Optional[_SwapLaunch]:
+    """:func:`_swap_ab_launch` cached by the device and the geometry of the views (a routed launch, or ``False``
+    for a row that stays on the planner) in a least-recently-used cache of ``CONVENIENCE_CACHE_SIZE`` entries."""
+    if not (A.is_cuda and B.is_cuda and out.is_cuda):
+        return None
+    key = convenience_key(
+        _cuda_index(out.device), 0, (bool(transposed_out),), A, B, out
+    )
+    hit = _cache_get(_SWAP_CACHE, key)
+    if hit is None:
+        launch = _swap_ab_launch(A, B, out, transposed_out)
+        with _PLAN_LOCK:
+            hit = _cache_put(_SWAP_CACHE, key, launch if launch is not None else False)
+    return hit or None
+
+
+def _run_swap_ab(
+    launch: _SwapLaunch,
+    A: torch.Tensor,
+    B: torch.Tensor,
+    out: torch.Tensor,
+    enable_pdl: bool,
+) -> torch.Tensor:
+    index = _cuda_index(out.device)
+    with _ffi_stream_context(index):
+        launch.entry(
+            B.transpose(1, 2),
+            A,
+            flat_alias(out).view(torch.uint8),
+            launch.M,
+            launch.N,
+            launch.K,
+            launch.L,
+            launch.ldo,
+            launch.out_l,
+            int(bool(enable_pdl)),
+            *launch.grid,
+        )
+    return out
+
+
 def dense_projection_det_gemm(
-    A: torch.Tensor, B: torch.Tensor, out: torch.Tensor, *, transposed_out: bool = False
+    A: torch.Tensor,
+    B: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    transposed_out: bool = False,
+    enable_pdl: bool = False,
 ) -> torch.Tensor:
     """``out[l, m, n] = sum_k A[l, m, k] B[l, k, n]`` for strided views (the cached convenience path:
-    planned once per device, stream and view geometry, then rebound and launched)."""
+    planned once per device, stream and view geometry, then rebound and launched).
+
+    A batched forward row of few tokens (:func:`swap_small_m`) runs the swapped program (:func:`swap_ab_template`),
+    every other row the planner's program.  ``enable_pdl`` launches the swapped program as a programmatic dependent
+    launch: its weight loads start before the predecessor grid completes and its token loads wait for it, so ``B``
+    must not be written by a kernel still in flight on the stream.  The planner's programs take no PDL wait and
+    always launch without the attribute."""
+    swap = _swap_ab_cached(A, B, out, transposed_out)
+    if swap is not None:
+        return _run_swap_ab(swap, A, B, out, enable_pdl)
     return _launch_cached_gemm(A, B, out, transposed_out=transposed_out)
 
 
@@ -4880,6 +5067,7 @@ def clear_convenience_caches() -> None:
     with _PLAN_LOCK:
         _K1_CACHE.clear()
         _K2_CACHE.clear()
+        _SWAP_CACHE.clear()
         _ARENAS.clear()
 
 

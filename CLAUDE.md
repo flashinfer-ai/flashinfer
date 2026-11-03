@@ -49,6 +49,7 @@ FlashInfer is a GPU kernel library for LLM serving that uses **JIT (Just-In-Time
 | Enable distribution-aware MoE autotune and kernel dispatch (experimental; TRT-LLM MoE only) | `export FLASHINFER_DIST_AWARE_AUTOTUNE=1` |
 | Prims-TS debug checks / task-manager verify | `export FLASHINFER_PRIMS_TS_DEBUG_CHECKS=1` |
 | Override Prims-TS CuTe-DSL compile options | `export FLASHINFER_PRIMS_TS_COMPILE_OPTIONS="--opt-level 2"` |
+| Plan cake_fmha small-M decode splits on the launch stream's SM partition when partitions come from the raw driver API (green-context helpers and `torch.cuda.green_contexts` enable it automatically) | `export FLASHINFER_CAKE_FMHA_SM_PARTITIONS=1` |
 | Configure NVFP4 4over6 quantization (preferred over the env vars) | `nvfp4_quantize(..., nvfp4_4over6=NVFP44Over6Config(e4m3_max=256))` |
 
 The minimum Python version used by CI and build tooling is defined in
@@ -658,6 +659,11 @@ Every public API decorated with `@flashinfer_api` should also carry a `trace=` a
 5. **Update the docstring** in `tests/trace/example.py` to list the new file(s).
 6. **Run tests**: `pytest tests/trace/ -v` — all template-consistency and end-to-end tests must pass.
 7. **Commit the new JSON files** under `tests/trace/fi_trace_out/` alongside the code changes.
+
+For an init shared by multiple Const shapes, list the keyword-only parameters in
+`init._trace_init_const_axes` to bind their defaults to each dumped definition's
+resolved Const values. Test the exported snippet with only Var axes supplied so
+standalone replay does not depend on callers overriding Const defaults.
 
 **Example implementations:**
 - **Simple**: `flashinfer/norm/__init__.py` (RMSNorm) - no Jinja, good starting point

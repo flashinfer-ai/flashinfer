@@ -1408,6 +1408,39 @@ def test_dense_route_table_is_catalog_driven():
     assert not _runtime.dense_route_available(32, 0, 4096)
 
 
+@pytest.mark.parametrize("queries", [1030, 1027])
+def test_fp8_mqa_logits_row_ranges(queries, monkeypatch):
+    """A 32-head call whose logits pass ``MAX_LAUNCH_LOGITS`` runs one launch per
+    range of query rows (the last range re-anchored to end at Q) with the same bits
+    as one launch, and a plan over that many logits is refused."""
+    _skip_unless_exported()
+    keys, heads = 4096, 32
+    arch = _runtime.device_arch(torch.device("cuda"))
+    if not _runtime.dense_route_available(heads, queries, keys, arch=arch):
+        pytest.skip(
+            f"catalog has no admitted route for H={heads}, Q={queries}, K={keys} on {arch}"
+        )
+    from flashinfer.dense_mqa import fp8_mqa_logits
+
+    torch.manual_seed(5)
+    q = torch.randn(queries, heads, 128, device="cuda").to(torch.float8_e4m3fn)
+    kv = torch.randn(keys, 128, device="cuda").to(torch.float8_e4m3fn)
+    scales = torch.rand(keys, device="cuda") + 0.5
+    weights = torch.randn(queries, heads, device="cuda")
+    ke = torch.arange(keys - queries + 1, keys + 1, device="cuda", dtype=torch.int32)
+    ks = torch.clamp(ke - 1000, min=0)
+    whole = fp8_mqa_logits(q, (kv, scales), weights, ks, ke).clone()
+    # 256 rows of logits per launch: five ranges, the last one short.
+    monkeypatch.setattr(
+        _runtime, "MAX_LAUNCH_LOGITS", 256 * _runtime.logits_stride(keys)
+    )
+    split = fp8_mqa_logits(q, (kv, scales), weights, ks, ke)
+    torch.cuda.synchronize()
+    assert torch.equal(split, whole)
+    with pytest.raises(ValueError, match="row ranges"):
+        _runtime.DenseMqaPlan("fp8", q, kv, weights, ks, ke, kv_scales=scales)
+
+
 @pytest.mark.parametrize(
     "queries,keys,heads",
     [
@@ -1431,8 +1464,8 @@ def test_dense_route_table_is_catalog_driven():
 def test_fp8_mqa_logits_one_shot(queries, keys, heads):
     """``fp8_mqa_logits(q, (kv, scales), weights, ks, ke)``: the plan's result on
     an exact ``[Q]`` slice (rows below the query block padded by the entry), the
-    same bits whether ``clean_logits`` is passed or not, and ``max_seqlen_k``
-    rejected."""
+    same window bits whether ``clean_logits`` is passed or not (``-inf`` outside
+    the windows with ``clean_logits=True``), and ``max_seqlen_k`` rejected."""
     _skip_unless_exported()
     arch = _runtime.device_arch(torch.device("cuda"))
     if not _runtime.dense_route_available(heads, queries, keys, arch=arch):
@@ -1461,7 +1494,9 @@ def test_fp8_mqa_logits_one_shot(queries, keys, heads):
     torch.cuda.synchronize()
     assert tuple(out.shape) == (queries, keys)
     assert out.dtype == torch.float32 and out.stride(1) == 1 and out.stride(0) % 4 == 0
-    assert torch.equal(out, out_clean)
+    position = torch.arange(keys, device="cuda")[None, :]
+    window = (position >= ks[:, None]) & (position < ke[:, None])
+    assert torch.equal(out[window], out_clean[window])
     if heads == 32:
         expected = _reference(
             "fp8", q, kv, None, scales, weights, ks, ke, queries, keys
@@ -1480,11 +1515,9 @@ def test_fp8_mqa_logits_one_shot(queries, keys, heads):
         )
     finite = torch.isfinite(expected)
     if record["clean_logits"] == "fused":
-        assert torch.equal(torch.isfinite(out), finite)
-    else:
-        assert torch.isfinite(
-            out[finite]
-        ).all()  # raw stores: cells outside the windows are unspecified
+        assert torch.equal(torch.isfinite(out_clean), finite)
+    # clean_logits=False: cells outside the windows are unspecified
+    assert torch.isfinite(out[finite]).all()
     torch.testing.assert_close(out[finite], expected[finite], atol=0.1, rtol=0.1)
     with pytest.raises(ValueError):
         fp8_mqa_logits(q, (kv, scales), weights, ks, ke, max_seqlen_k=keys)
@@ -1745,6 +1778,114 @@ def test_dense_stage_bucket_program_is_bitwise_to_the_default(
         assert torch.equal(forced_meta[span:], plain_meta[span:]), route
         checked.add(route)
     assert checked == listed, (queries, side, window, checked, listed)
+
+
+# Per 32-head FP8 route that may carry a ``"raw"`` variant: one (Q, K) the route serves on both architectures. A route
+# whose record carries the variant on the device's architecture and is missing here fails the test.
+_RAW_POINTS = {
+    "fp8:q1:short": (1, 4096),
+    "fp8:q1": (1, 1049088),
+    "fp8:q128:short": (128, 4096),
+    "fp8:full:le32:short": (16, 32768),
+    "fp8:partial:le32:short": (3, 8192),
+    "fp8:full:le16": (16, 1048832),
+    "fp8:partial:le16": (3, 1048832),
+    "fp8:full:le128": (128, 131584),
+    "fp8:partial:le128": (33, 1048832),
+    "fp8:qle128:short": (37, 4137),
+    "fp8:qle2048:short": (1024, 33803),
+    "fp8:full:le768:short": (2052, 2048),
+    "fp8:partial:le768:short": (2053, 2048),
+    "fp8:full:le2048": (2048, 65792),
+    "fp8:partial:le2048": (130, 66048),
+    "fp8:full:any": (2052, 8448),
+    "fp8:partial:any": (2053, 8448),
+}
+
+
+@pytest.mark.parametrize("window", ["full", "causal", "multiseq2"])
+@pytest.mark.parametrize("route", sorted(_RAW_POINTS))
+def test_dense_raw_variant_is_bitwise_to_the_cleaned_window(route, window):
+    """``clean_logits=False`` on a route whose record carries the ``"raw"`` variant launches the variant's programs
+    (the raw-store twins of the record's programs, the metadata stage's own): each row's window cells are bitwise the
+    cleaned plan's and the ScheduleMeta words the same, each arm on caller-owned output and metadata poisoned
+    differently; the cleaned plan writes every cell, and on two-request windows the raw plan leaves cells outside the
+    windows of a query block unwritten."""
+    _skip_unless_exported()
+    arch = _runtime.device_arch(torch.device("cuda"))
+    routes = _runtime._catalog()["routes"]
+    carried = {
+        name
+        for name, record in routes.items()
+        if _runtime.RAW_VARIANT in record.get("variants", {})
+    }
+    assert carried <= set(_RAW_POINTS), sorted(carried - set(_RAW_POINTS))
+    record = routes.get(route)
+    if record is None or route not in carried:
+        pytest.skip(f"{route} carries no raw variant")
+    queries, keys = _RAW_POINTS[route]
+    assert _runtime.served_route("fp8", queries, keys, 32, arch=arch) == route
+    assert record["clean_logits"] == "fused" and not record.get("sequence")
+    variant = _runtime.route_stages(record, arch, keys, queries, _runtime.RAW_VARIANT)
+    expected = [_runtime.stage_program(stage, arch) for stage in variant]
+    own = [_runtime.stage_program(stage, arch) for stage in record["stages"]]
+    assert [stage for stage, _p in variant] == [stage for stage, _p in record["stages"]]
+    q, kv, scales, weights = _bucket_inputs("fp8", queries, keys, 32)
+    if (
+        queries < _runtime.BLOCK_Q
+    ):  # the 32-head programs read a whole query block of Q and weight rows
+        q = torch.cat([q, q.new_zeros(_runtime.BLOCK_Q - queries, 32, 128)])
+        weights = torch.cat(
+            [weights, weights.new_zeros(_runtime.BLOCK_Q - queries, 32)]
+        )
+    starts, ends = _bucket_window(window, queries, keys)
+    sms = _runtime.device_facts(torch.cuda.current_device())[1]
+    words = _runtime.metadata_words(queries, sms, 32)
+    arms = {}
+    for clean, poison in ((True, (0x7FC00001, -1)), (False, (0x7FC00002, -2))):
+        backing = torch.empty(
+            (queries, _runtime.logits_stride(keys)), dtype=torch.float32, device="cuda"
+        )
+        backing.view(torch.int32).fill_(poison[0])
+        metadata = torch.full((words,), poison[1], dtype=torch.int32, device="cuda")
+        plan = _runtime.DenseMqaPlan(
+            "fp8",
+            q,
+            kv,
+            weights,
+            starts,
+            ends,
+            output=backing,
+            metadata=metadata,
+            clean_logits=clean,
+            **scales,
+        )
+        assert plan.route_name == route
+        if clean:
+            assert plan.variant is None
+        else:
+            assert plan.variant == _runtime.RAW_VARIANT
+            assert plan.program_names == expected and expected != own, (
+                plan.program_names,
+                own,
+            )
+        plan.run()
+        torch.cuda.synchronize()
+        arms[clean] = (backing.view(torch.int32)[:, :keys], metadata, poison[0])
+    (clean_out, clean_meta, _), (raw_out, raw_meta, raw_poison) = (
+        arms[True],
+        arms[False],
+    )
+    position = torch.arange(keys, device="cuda")[None, :]
+    inside = (position >= starts[:, None]) & (position < ends[:, None])
+    assert torch.equal(raw_out[inside], clean_out[inside]), (route, window)
+    minus_inf = torch.tensor(float("-inf"), device="cuda").view(torch.int32)
+    assert bool((clean_out[~inside] == minus_inf).all()), (route, window)
+    if window == "multiseq2" and queries >= 8:
+        assert bool((raw_out[~inside] == raw_poison).any()), (route, window)
+    span = (3 * sms + 1) // 2 * 2
+    assert torch.equal(clean_meta[: 3 * sms], raw_meta[: 3 * sms]), route
+    assert torch.equal(clean_meta[span:], raw_meta[span:]), route
 
 
 _LADDER = re.compile(

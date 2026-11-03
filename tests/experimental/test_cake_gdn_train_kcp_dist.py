@@ -50,7 +50,8 @@ collectives are the deterministic layer's) run under Slurm.
 
 Packed QKV (#7817): under ``layout="tma"`` the backward of strided packed views writes one packed dQKV row, and
 ``packed_qkv_views_kcp`` hands it to a packed leaf without a concatenation (both within the budgets of the contiguous
-call).  ``test_l2n_rows`` / ``test_l2n_layer_checkpoint_rows``: the in-kernel Q / K L2 norm
+call); plain ``split`` views of the leaf, direct and checkpointed, keep torch's split backward and their hooks and
+``retain_grad`` (issue #8367; within the same budgets).  ``test_l2n_rows`` / ``test_l2n_layer_checkpoint_rows``: the in-kernel Q / K L2 norm
 (``use_qk_l2norm_in_kernel=True``) on raw rows, every form within the FP64 budgets of the norm-off rows and of its
 partner, the deterministic package with the norm within the same constants, the token-local program outputs exact
 (see the block comment before ``V1_LIBRARIES``).
@@ -998,6 +999,71 @@ def _packed_views(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
     return buf, qv, kv, vv
 
 
+def _plain_split_pass(buf, g, beta, dout, call, H_qk: int, HV: int, *, ckpt: bool):
+    """Issue #8367: one autograd pass with q / k / v as plain ``split`` + ``view`` head views of a packed leaf holding
+    ``buf`` (torch's own split backward concatenates the gradients).  Returns the results (``dq`` / ``dk`` / ``dv``
+    cut from the leaf's gradient) and whether the tensor hooks and ``retain_grad`` set on the views and on the split
+    outputs of the original forward fired once each with the gradient the leaf received in the same pass (exact:
+    structural; vacuous at ``T_r = 0``)."""
+    T = int(buf.shape[0])
+    sizes = (H_qk * 128, H_qk * 128, HV * 128)
+    row = buf.detach().clone().requires_grad_(True)
+    g_leaf, b_leaf = (x.detach().clone().requires_grad_(True) for x in (g, beta))
+    fired: dict[str, list] = {}
+    views: dict[str, torch.Tensor] = {}
+
+    def fn(row_, g_, b_):
+        parts = row_.split(sizes, dim=-1)
+        q_, k_, v_ = (
+            p.view(T, n, 128) for p, n in zip(parts, (H_qk, H_qk, HV), strict=True)
+        )
+        if not views:  # the original forward (a checkpoint recompute builds a graph no backward runs)
+            views.update(
+                q=q_, k=k_, v=v_, **{f"part{i}": p for i, p in enumerate(parts)}
+            )
+            for name, t in views.items():
+                t.register_hook(
+                    lambda gr, name=name: fired.setdefault(name, []).append(gr.clone())
+                )
+                t.retain_grad()
+        return call(q_, k_, v_, g_, b_)
+
+    if ckpt:
+        from torch.utils.checkpoint import checkpoint
+
+        out = checkpoint(fn, row, g_leaf, b_leaf, use_reentrant=False)
+    else:
+        out = fn(row, g_leaf, b_leaf)
+    out.backward(dout)
+    ga = row.grad
+    cols = {
+        "q": (0, sizes[0]),
+        "k": (sizes[0], 2 * sizes[0]),
+        "v": (2 * sizes[0], None),
+    }
+    res = {
+        "out": out.detach(),
+        **{
+            "d" + n: ga[:, a:b].reshape(T, h, 128)
+            for (n, (a, b)), h in zip(cols.items(), (H_qk, H_qk, HV), strict=True)
+        },
+        "dg": g_leaf.grad,
+        "dbeta": b_leaf.grad,
+    }
+    hooks = T == 0 or (
+        sorted(fired) == sorted(views)
+        and all(len(x) == 1 for x in fired.values())
+        and all(
+            torch.equal(fired[n][0].reshape(T, -1), ga[:, a:b])
+            and torch.equal(views[n].grad.reshape(T, -1), ga[:, a:b])
+            and torch.equal(fired[f"part{i}"][0], ga[:, a:b])
+            and torch.equal(views[f"part{i}"].grad, ga[:, a:b])
+            for i, (n, (a, b)) in enumerate(cols.items())
+        )
+    )
+    return res, hooks
+
+
 def _rounded(nbytes: int) -> int:
     return -(-nbytes // ALLOC_GRANULE) * ALLOC_GRANULE if nbytes else 0
 
@@ -1818,6 +1884,19 @@ def _run_rank(
         or kcp.PACKED_SPLIT_STATS["aliased"] - split_before["aliased"] == 1
     )
     del qkv_leaf, g_leaf, b_leaf, out_split, ga, res_split
+
+    # issue #8367: plain split views of the packed leaf keep torch's autograd path (its split backward concatenates):
+    # within the budgets of the autograd call, direct and checkpointed, with the hooks and retain_grad on the views firing
+    def gdn_call(*a):
+        return kcp.chunk_gdn_kcp(*a, ctx, workspace=ws, deterministic=False, **base)
+
+    for ck, tag in ((False, "direct"), (True, "ckpt")):
+        res_plain, hooks_ok = _plain_split_pass(
+            _buf, g, beta, dout, gdn_call, H_qk, HV, ckpt=ck
+        )
+        arm(f"plain_split_{tag}", res_plain, res_auto, "autograd")
+        flags[f"plain_split_{tag}_hooks_fire"] = hooks_ok
+        del res_plain
     del _buf, qs, ks, vs
     # gradient accumulation: .backward() twice -> half the accumulated gradient against the FP64 gradient
     judge.fp64(
@@ -3860,7 +3939,22 @@ def _run_rank_l2n(
     flags["l2n_packed_split_aliased"] = (
         T_r == 0 or kcp.PACKED_SPLIT_STATS["aliased"] - split_before["aliased"] == 1
     )
-    del qkv_leaf, g_leaf, b_leaf, out_split, ga, res_split, buf, qs, ks, vs, res_auto
+    del qkv_leaf, g_leaf, b_leaf, out_split, ga, res_split
+
+    # issue #8367 with the norm: plain split views, direct and checkpointed (see _run_rank)
+    def gdn_call(*a):
+        return kcp.chunk_gdn_kcp(
+            *a, ctx, workspace=ws, deterministic=False, **base, **L2N
+        )
+
+    for ck, tag in ((False, "direct"), (True, "ckpt")):
+        res_plain, hooks_ok = _plain_split_pass(
+            buf, g, beta, dout, gdn_call, H_qk, HV, ckpt=ck
+        )
+        arm(f"plain_split_{tag}", res_plain, res_auto, "autograd")
+        flags[f"l2n_plain_split_{tag}_hooks_fire"] = hooks_ok
+        del res_plain
+    del buf, qs, ks, vs, res_auto
 
     # (e) CUDA-graph replay with the norm: the fourth forward + backward replays; judged within the budgets
     graph_info: dict[str, object] = {}

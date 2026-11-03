@@ -27,8 +27,8 @@ against that suite's source below), over repeated runs (worst case), and compare
 deterministic package on the same inputs: ``loss`` / ``logp`` / ``lse`` and ``dW`` keep their fixed
 order and equal its bits; ``dX`` meets the budgets and its distance to the deterministic ``dX`` is
 reported.  The host layer (mode contract, PyTorch's deterministic-algorithms alert, the reference
-backend) runs anywhere; the device tests need an SM100 / SM103 GPU and the package's rendered
-programs.
+backend) runs anywhere; the device tests need an SM100 / SM103 / SM107 GPU and the package's
+rendered programs.
 """
 
 import ast
@@ -37,6 +37,7 @@ import dataclasses
 import functools
 import gc
 import inspect
+import json
 import math
 import os
 import subprocess
@@ -353,6 +354,57 @@ def test_loader_is_the_deterministic_packages_bytes():
     assert (PACKAGE_DIR / "cake_build.py").read_bytes() == (
         det_dir / "cake_build.py"
     ).read_bytes()
+
+
+def test_each_supported_architecture_has_its_record_and_libraries():
+    """The supported compute capabilities name exactly the architectures of the registry's records (``(10, 7)``
+    only with an ``sm_107a`` record), ``build.json`` builds exactly those architectures, and every registered stage
+    of each record has its ``<library>_<arch>`` entry.  The ``sm_107a`` record registers the ``sm_103a`` record's
+    stages and programs but the zero-gradient row skip's (the ``_dcnt`` forms and the partition kernel), which
+    ``sm_107a`` does not build: its log-probability backward never runs the skip."""
+    assert cake_backend.SUPPORTED_COMPUTE_CAPABILITIES == {
+        (10, 0): "sm_100a",
+        (10, 3): "sm_103a",
+        (10, 7): "sm_107a",
+    }
+    arches = set(cake_backend.SUPPORTED_COMPUTE_CAPABILITIES.values())
+    by_arch = {record["arch"]: name for name, record in cake_jit.MODULES.items()}
+    assert set(by_arch) == arches and len(by_arch) == len(cake_jit.MODULES)
+    if not (PACKAGE_DIR / "build.json").is_file():
+        pytest.skip(
+            "the package's programs are not rendered in this checkout (no build.json)"
+        )
+    manifest = json.loads((PACKAGE_DIR / "build.json").read_text())
+    entries = {entry["name"]: entry for entry in manifest["libraries"]}
+    assert set(manifest["arch_flags"]) == arches
+    assert {entry["arch"] for entry in entries.values()} == arches
+    for arch, name in by_arch.items():
+        stages = cake_jit.registered_stages(name)
+        assert stages, name
+        for stage in stages:
+            library = cake_jit.library_name(name, stage)
+            assert library.endswith("_" + arch), (name, stage)
+            assert library in entries and entries[library]["arch"] == arch, (
+                name,
+                stage,
+            )
+    sm107, sm103 = by_arch["sm_107a"], by_arch["sm_103a"]
+    skip_stages = {
+        stage
+        for stage in cake_jit.registered_stages(sm103)
+        if stage.endswith("_dcnt") or stage == cake_backend.ZERO_DLOGP_PARTITION_STAGE
+    }
+    assert cake_backend.LOGPROB_DZ_DCNT_STAGE in skip_stages
+    assert cake_backend.ZERO_DLOGP_PARTITION_STAGE in skip_stages
+    assert cake_jit.registered_stages(sm107) == tuple(
+        stage for stage in cake_jit.registered_stages(sm103) if stage not in skip_stages
+    )
+    for stage in cake_jit.registered_stages(sm107):
+        assert (
+            cake_jit.MODULES[sm107][stage]["library"]
+            == cake_jit.MODULES[sm103][stage]["library"]
+        ), stage
+    assert cake_jit.MODULES[sm107]["geometry"] == cake_jit.MODULES[sm103]["geometry"]
 
 
 def _mode_calls(X, W, labels):
@@ -1476,7 +1528,7 @@ def test_binding_cache_owned_bytes_while_another_thread_remembers(module):
 
 
 # ---------------------------------------------------------------------------
-# Device (SM100 / SM103 with the package's rendered programs)
+# Device (SM100 / SM103 / SM107 with the package's rendered programs)
 # ---------------------------------------------------------------------------
 
 
@@ -1489,7 +1541,7 @@ def _device_supported() -> bool:
 
 def _require_program(*, entry: str = "loss"):
     if not _device_supported():
-        pytest.skip("requires a compute capability 10.0 / 10.3 device")
+        pytest.skip("requires a compute capability 10.0 / 10.3 / 10.7 device")
     if not (PACKAGE_DIR / "build.json").is_file():
         pytest.skip(
             "the package's programs are not rendered in this checkout (no build.json)"
@@ -3142,16 +3194,44 @@ def _red_stage_pins(stage: str, k_slices: int = 4) -> dict:
     }
 
 
+def test_device_loads_the_libraries_of_its_architecture():
+    """On a registered device every stage of the device's record loads the library ``build.json`` builds for the
+    device's architecture (``<library>_sm_107a`` on compute capability 10.7): the prebuilt one under ``aot/`` when
+    the package ships it, else FlashInfer's JIT build."""
+    _require_program(entry="loss")
+    name, record = cake_backend.record_for(CUDA)
+    arch = record["arch"]
+    capability = torch.cuda.get_device_capability(0)
+    assert arch == cake_backend.SUPPORTED_COMPUTE_CAPABILITIES[capability]
+    libraries = []
+    for stage in cake_jit.registered_stages(name):
+        library = cake_jit.library_name(name, stage)
+        assert library.endswith("_" + arch), (stage, library)
+        assert cake_jit.load_cake_lm_head_loss_module(name, stage) is not None
+        libraries.append(library)
+    prebuilt = sum(cake_build.prebuilt_path(library).is_file() for library in libraries)
+    print(
+        f"\n{arch} (capability {capability}): {len(libraries)} stages loaded "
+        f"({len(set(libraries))} libraries, {prebuilt} stages prebuilt); "
+        f"first {cake_build.library_path(libraries[0])}"
+    )
+
+
 @pytest.mark.parametrize("stage", RED_STAGES)
 def test_device_every_reduction_form_runs_within_the_budgets(glm_weight, stage):
-    """Every ``gemm_dx_red*`` form the running architecture registers (``gemm_dx_red_swab`` on ``sm_103a`` only), pinned
-    at four K slices on a call of two whole 4096-row chunks: the launch record shows it launched on both, the outputs
-    pass the deterministic suite's gates against the FP64 oracle, and ``loss`` / ``logp`` / ``dW`` are the
+    """Every ``gemm_dx_red*`` form the running architecture registers and its tuning accepts (``gemm_dx_red_swab`` on
+    the ``DX_SWAB_ARCHES`` only: ``sm_107a`` registers it with the ``sm_103a`` stages, but no rule or pin selects it),
+    pinned at four K slices on a call of two whole 4096-row chunks: the launch record shows it launched on both, the
+    outputs pass the deterministic suite's gates against the FP64 oracle, and ``loss`` / ``logp`` / ``dW`` are the
     deterministic package's bits."""
     _require_program(entry="loss")
-    module_name, _ = cake_backend.record_for(CUDA)
+    module_name, record = cake_backend.record_for(CUDA)
     if stage not in cake_jit.registered_stages(module_name):
         pytest.skip(f"{stage} is not registered for this architecture")
+    if stage.endswith("_swab") and record["arch"] not in cake_backend.DX_SWAB_ARCHES:
+        pytest.skip(
+            f"{stage}: the swapped dX tile is pinned on {', '.join(cake_backend.DX_SWAB_ARCHES)} only"
+        )
     inp = _device_inputs(8192, "ce", W=glm_weight, ignore_frac=0.0)
     tuning = {"dx": _red_stage_pins(stage)}
     cake_backend.BINDING_CACHE.clear()
@@ -6375,6 +6455,28 @@ def _logprob_call(inp, C=4096, *, package="nd"):
     return _run(inp, C, package=package, entry="logprob", backend="cake")
 
 
+def _has_zero_dlogp_skip():
+    """Whether this device's record registers the zero-gradient row skip: the counted dz arm
+    (``LOGPROB_DZ_DCNT_STAGE``) and the partition kernel (``ZERO_DLOGP_PARTITION_STAGE``); the ``sm_107a`` record
+    has neither."""
+    module_name, _record = cake_backend.record_for(CUDA)
+    stages = cake_jit.registered_stages(module_name)
+    return (
+        cake_backend.LOGPROB_DZ_DCNT_STAGE in stages
+        and cake_backend.ZERO_DLOGP_PARTITION_STAGE in stages
+    )
+
+
+def _require_zero_dlogp_skip():
+    """Skip a test of the skip itself on a device whose record does not register it
+    (:func:`test_device_zero_dlogp_skip_is_off_without_the_counted_forms` covers that record)."""
+    _require_program(entry="logprob")
+    if not _has_zero_dlogp_skip():
+        pytest.skip(
+            "this device's record registers no zero-gradient row skip (no counted forms, no partition kernel)"
+        )
+
+
 def test_zero_dlogp_partition_orders_the_live_rows_first():
     """``zero_dlogp_partition``: the valid rows of a nonzero ``dlogp`` (NaN included) first, then the zero-gradient
     rows (``+0`` and ``-0``), each group in ascending order; ``lse`` in that order; the inclusive scan of the live rows
@@ -6430,7 +6532,7 @@ def test_device_zero_dlogp_partition_kernel_is_the_reference(T, chunk, kind):
     per-chunk counts (at least one in the first chunk) -- over random, 512-row group, all-zero, single-live,
     last-chunk-live and no-zero gradients, with signed zeros, NaN gradients (live on a valid row, ignored rows
     included) and NaN statistics among them."""
-    _require_program(entry="logprob")
+    _require_zero_dlogp_skip()
     module_name, _record = cake_backend.record_for(CUDA)
     assert cake_backend.ZERO_DLOGP_PARTITION_STAGE in cake_jit.registered_stages(
         module_name
@@ -6706,7 +6808,7 @@ def test_device_zero_dlogp_skip_runs_the_partition_kernel(glm_weight, monkeypatc
     """The backward with the skip forms its row order with the partition kernel, never the PyTorch reference, and gives
     the backward that forms it with the reference the same ``dW`` bits (the same row order) and the same exact ``+0``
     zero rows of ``dX``."""
-    _require_program(entry="logprob")
+    _require_zero_dlogp_skip()
     module_name, _record = cake_backend.record_for(CUDA)
     assert cake_backend.ZERO_DLOGP_PARTITION_STAGE in cake_jit.registered_stages(
         module_name
@@ -6760,7 +6862,7 @@ def test_device_zero_dlogp_plan_without_counted_forms_runs_the_shipped_backward(
     (first call) and from the remembered binding (second call) -- and runs the backward without the skip: the plan and
     launch sequence of the backward with the skip off, the same ``logp`` and ``dW`` bits, ``dX`` within its unordered
     K-slice reduction, the zero rows' ``dX`` zeros."""
-    _require_program(entry="logprob")
+    _require_zero_dlogp_skip()
     base = _device_inputs(8117, "ce", W=glm_weight)
     zero = _zero_dlogp_set(base, ("random", 0.3))
     inp = _with_zero_dlogp(base, zero, negative_zero=False)
@@ -6796,6 +6898,53 @@ def test_device_zero_dlogp_plan_without_counted_forms_runs_the_shipped_backward(
         assert dx_diff <= scale * 2**-7, (dx_diff, scale)
 
 
+def test_device_zero_dlogp_skip_is_off_without_the_counted_forms(
+    glm_weight, monkeypatch
+):
+    """On a record that registers no zero-gradient row skip (``sm_107a``: no counted forms, no partition kernel) a
+    backward that would be eligible elsewhere (floor 0, compacted, the dz arm) is not eligible and runs the shipped
+    backward: no partition, binding (first call) and from the remembered binding (second call); every remembered plan
+    without counted forms; the same ``logp`` and ``dW`` bits as the backward with the skip off, ``dX`` within its
+    unordered K-slice reduction, the zero rows' ``dX`` zeros."""
+    _require_program(entry="logprob")
+    if _has_zero_dlogp_skip():
+        pytest.skip("this device's record registers the zero-gradient row skip")
+    _module_name, record = cake_backend.record_for(CUDA)
+    base = _device_inputs(8117, "ce", W=glm_weight)
+    zero = _zero_dlogp_set(base, ("random", 0.3))
+    inp = _with_zero_dlogp(base, zero, negative_zero=False)
+    valid = inp.labels >= 0
+    index = valid.nonzero().squeeze(1)
+    with _zero_dlogp_floor(0):
+        assert not cake_backend._zero_dlogp_skip(CUDA, index, "cake", True, True, True)
+
+    def refused(*args, **kwargs):
+        raise AssertionError("a record without the counted forms ran the partition")
+
+    cake_backend.BINDING_CACHE.clear()
+    monkeypatch.setattr(cake_backend, "zero_dlogp_partition", refused)
+    with _zero_dlogp_floor(0):
+        runs = [_logprob_call(inp), _logprob_call(inp)]
+    with _zero_dlogp_floor(None):
+        plain = _logprob_call(inp)
+    plans = _logprob_bwd_plans()
+    assert plans and not any(plan.dcnt for plan, _run in plans)
+    live = valid & ~zero
+    scale = float(plain["dX"][live].float().abs().max())
+    for run in runs:
+        for key in ("logp", "dW"):
+            assert _same_bits(run[key], plain[key]), key
+        assert not bool(run["dX"][zero | ~valid].float().any())
+        dx_diff = float(
+            (run["dX"][live].float() - plain["dX"][live].float()).abs().max()
+        )
+        assert dx_diff <= scale * 2**-7, (dx_diff, scale)
+    print(
+        f"\nzero-dlogp skip on {record['arch']}: off (no counted forms, no partition kernel); "
+        f"{len(plans)} remembered backward plan(s), none counted"
+    )
+
+
 def test_device_zero_dlogp_short_last_chunk_keeps_the_counted_cast(
     glm_weight, monkeypatch
 ):
@@ -6803,7 +6952,7 @@ def test_device_zero_dlogp_short_last_chunk_keeps_the_counted_cast(
     about 650 rows) keeps the skip: the partition runs (binding and remembered binding), the remembered plan casts the
     last chunk through the counted shipped cast, and the results pass the skip suite's checks against the backward
     without the skip and the FP64 oracle."""
-    _require_program(entry="logprob")
+    _require_zero_dlogp_skip()
     _module_name, record = cake_backend.record_for(CUDA)
     base = _device_inputs(5000, "ce", W=glm_weight)
     zero = _zero_dlogp_set(base, ("random", 0.5))
@@ -6850,7 +6999,7 @@ def test_device_zero_dlogp_default_floor_is_one_row_above_a_chunk(
 ):
     """The default floor is one row above a default 4096-row chunk: a backward of 4096 valid rows runs without the skip,
     one of 4097 valid rows runs it (the zero rows' ``dX`` zeros either way)."""
-    _require_program(entry="logprob")
+    _require_zero_dlogp_skip()
     assert (
         cake_backend.ZERO_DLOGP_MIN_ROWS_DEFAULT
         == cake_backend.DEFAULT_CHUNK_SIZE + 1

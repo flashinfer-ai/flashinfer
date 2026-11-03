@@ -166,7 +166,12 @@ def test_the_registry_spells_only_canonical_names():
             "cake::dense_projection_det_gemm::"
         )
         assert record["template"].startswith(
-            ("dense_proj_det_gemm_", "router_fp32_det_gemm_", "split_fp32_det_bf16x3")
+            (
+                "dense_proj_det_gemm_",
+                "router_fp32_det_gemm_",
+                "split_fp32_det_bf16x3",
+                "swap_ab_",
+            )
         )
         assert (
             "build" not in record

@@ -4011,6 +4011,7 @@ kernel_cake_fmha_context_nvfp4(CakeFmhaTensorMap const* Q, CakeFmhaTensorMap con
                     unsigned int n = num_n_blocks_3 - 1 - ni;
                     int base_tok = n * (unsigned int)BLOCK_N;
                     mbarrier_wait(page_empty_addr + (po_stage) * 8, _phase_page_empty);
+                    __syncwarp();
                     int pg_idx = po_stage * 16;
                     int pg_lane = lane;
                     if (pg_lane < 8) {
