@@ -61,6 +61,7 @@ from tests.experimental.test_cake_kda_det_train_raw_gate_accuracy import (
     torch_gate,
 )
 from tests.experimental.test_cake_kda_train_kcp_dist import (
+    _init_group,
     _local_slices,
     _partition,
     _programs_exported,
@@ -846,7 +847,7 @@ def param_vs_explicit(cand, expl, ref, W: int, *, parts_of: str, parts: list) ->
     }
 
 
-def _run_rank(rank: int, W: int, row, port: int, result_dir: str | None) -> dict:
+def _run_rank(rank: int, W: int, row, rdzv: str | None, result_dir: str | None) -> dict:
     """One rank: the raw-mode KCP passes, their bitwise flags, the explicit-mode launch comparison, the reduction
     helper; gathered to rank 0 and compared with the single-rank raw path and the FP64 reference there."""
     from torch.utils.checkpoint import checkpoint
@@ -855,9 +856,7 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir: str | None) -> dict
     device = torch.device("cuda", rank % max(torch.cuda.device_count(), 1))
     torch.cuda.set_device(device)
     if W > 1 and not dist.is_initialized():
-        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-        os.environ.setdefault("MASTER_PORT", str(port))
-        dist.init_process_group("nccl", rank=rank, world_size=W, device_id=device)
+        _init_group(rank, W, device, rdzv)
     group = dist.group.WORLD if W > 1 else None
     part, cu = _partition(lengths, W, layout)
     ctx = cake_kcp_plan.build_context_kcp(part, group, rank, device)
@@ -1241,9 +1240,9 @@ def _run_rank(rank: int, W: int, row, port: int, result_dir: str | None) -> dict
     return report
 
 
-def _spawn_entry(rank: int, W: int, row, port: int, result_dir: str) -> None:
+def _spawn_entry(rank: int, W: int, row, rdzv: str | None, result_dir: str) -> None:
     try:
-        report = _run_rank(rank, W, row, port, result_dir)
+        report = _run_rank(rank, W, row, rdzv, result_dir)
         if not report["pass"]:
             raise AssertionError(f"rank {rank}: {report}")
     finally:
@@ -1276,19 +1275,19 @@ def test_raw_gate_rows_match_single_rank_and_fp64(row) -> None:
                 "the KCP programs are not exported in the package's build.json yet"
             )
         report = _run_rank(
-            int(os.environ["SLURM_PROCID"]), W, row, int(os.environ.get("MASTER_PORT", "29500")),
+            int(os.environ["SLURM_PROCID"]), W, row, None,
             os.environ.get("KCP_TEST_RESULT_DIR"),
         )  # fmt: skip
         assert report["pass"], report
         return
     _skip_unless_runnable(W)
     if W == 1:
-        report = _run_rank(0, 1, row, 0, os.environ.get("KCP_TEST_RESULT_DIR"))
+        report = _run_rank(0, 1, row, None, os.environ.get("KCP_TEST_RESULT_DIR"))
         assert report["pass"], report
         return
     with tempfile.TemporaryDirectory(prefix="cake_kcp_raw_") as tmp:
         result_dir = os.environ.get("KCP_TEST_RESULT_DIR") or tmp
-        _start_ranks(_spawn_entry, W, row, result_dir)
+        _start_ranks(_spawn_entry, W, row, tmp, result_dir)
         with open(os.path.join(result_dir, "raw-" + _row_id(row) + ".json")) as fh:
             report = json.load(fh)
     assert report["pass"], report

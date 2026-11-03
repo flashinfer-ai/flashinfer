@@ -38,13 +38,13 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from tests.experimental.test_cake_kda_train_kcp_dist import _rendezvous
 from tests.experimental.test_cake_kda_train_kcp_shared_ws import (
     DIST_ROWS,
     PACKS,
     _bwd,
     _device_or_skip,
     _dist_row_id,
-    _free_port,
     _fwd,
     _handle_pass,
     _operands,
@@ -1074,7 +1074,7 @@ def _run_lean_rank(
     rank: int,
     W: int,
     row,
-    port: int,
+    rdzv: str | None,
     result_dir: str | None,
     lean_passes: int | None = None,
 ) -> dict:
@@ -1083,7 +1083,7 @@ def _run_lean_rank(
     bitwise out / saved sets / gradients, the bytes equal ``kda_workspace_bytes_kcp`` and below the replay ones, no
     pointer moved, every pack of the rank on the lean layout.  The verdicts are gathered to every rank."""
     _packs_, H, _w, _layout, exchange = row
-    _device, ctxs, ops = _rank_packs(rank, W, row, port)
+    _device, ctxs, ops = _rank_packs(rank, W, row, rdzv)
     kw = {"exchange": exchange}
     ring = exchange == "ring"
     rid = (
@@ -1153,11 +1153,16 @@ def _bound_rank_threads(W: int) -> None:
 
 
 def _spawn_lean_entry(
-    rank: int, W: int, row, port: int, result_dir: str, lean_passes: int | None = None
+    rank: int,
+    W: int,
+    row,
+    rdzv: str | None,
+    result_dir: str,
+    lean_passes: int | None = None,
 ) -> None:
     try:
         _bound_rank_threads(W)
-        report = _run_lean_rank(rank, W, row, port, result_dir, lean_passes)
+        report = _run_lean_rank(rank, W, row, rdzv, result_dir, lean_passes)
         if not report["pass"]:
             raise AssertionError(f"rank {rank}: {report}")
     finally:
@@ -1207,7 +1212,7 @@ def _run_lean_row(row, lean_passes: int | None) -> None:
             int(os.environ["SLURM_PROCID"]),
             W,
             row,
-            int(os.environ.get("MASTER_PORT", "29500")),
+            None,
             os.environ.get("KCP_TEST_RESULT_DIR"),
             lean_passes,
         )
@@ -1220,7 +1225,7 @@ def _run_lean_row(row, lean_passes: int | None) -> None:
         result_dir = os.environ.get("KCP_TEST_RESULT_DIR") or tmp
         mp.start_processes(
             _spawn_lean_entry,
-            args=(W, row, _free_port(), result_dir, lean_passes),
+            args=(W, row, _rendezvous(tmp), result_dir, lean_passes),
             nprocs=W,
             join=True,
             start_method="spawn",
