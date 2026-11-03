@@ -472,6 +472,12 @@ DW_CAST_STAGES = ("gemm_dw_cast_bf16", "gemm_dw_cast_f32")
 DW_CAST_TMA_MAX_ROWS: dict[str, int] = {"sm_100a": 1792, "sm_103a": 1792}
 
 
+# Its form under the zero-gradient row skip (:data:`DCNT_BASES`): the same TMA cast with the K steps bounded by the
+# last chunk's device count of live rows, so a counted plan keeps the rule's cast (a record without it: the shipped
+# cast's counted form).
+DW_CAST_TMA_DCNT_STAGE = "gemm_dw_cast_bf16_tma_dcnt"
+
+
 def dw_cast_tma_rule(num_chunks: int, rows_last: int, arch: Optional[str]) -> bool:
     """Does the deferred BF16 dW cast of a call of ``num_chunks`` chunks, whose last chunk has ``rows_last``
     rows, run the TMA-epilogue form on ``arch``?"""
@@ -647,7 +653,8 @@ STAGE_KNOBS = (
 # and the K-sliced dX reduction skip the work items whose pair of row tiles starts at or past the count (their rows keep
 # what they held: never read), the weight-gradient accumulate and bf16 fused cast run ``ceil(count / 64)`` of its K
 # steps (one at least on a first chunk; none leaves the accumulator as it was, and the cast writes ``bf16(g * WS)``).
-# The bases that have the form (not the swapped dX tile, not the TMA-epilogue forms):
+# The bases that have the form (not the swapped dX tile, not the accumulate's TMA epilogue; the bf16 fused cast's TMA
+# store has it too, :data:`DW_CAST_TMA_DCNT_STAGE`):
 DCNT_BASES = ("gemm_logits_dz", "gemm_dx_red", "gemm_dw_acc", "gemm_dw_cast_bf16")
 
 
@@ -674,7 +681,8 @@ def stage_variant(
     weight-gradient accumulate / fp32 fused cast on the 2-D blocked raster
     (``group_n`` set); ``epi_store="tma"``: the weight-gradient accumulate's TMA reduce-add or the bf16 fused cast's
     TMA store (:func:`dw_cast_tma_rule`); ``dcnt``: the form bounded by the device count of the chunk's live rows
-    (:data:`DCNT_BASES`, the zero-gradient row skip).  The slice count, the raster height and the block width
+    (:data:`DCNT_BASES`, the zero-gradient row skip; the bf16 fused cast's TMA store has one too,
+    :data:`DW_CAST_TMA_DCNT_STAGE`).  The slice count, the raster height and the block width
     themselves are launch scalars (:func:`gemm_scalars`), not part of the name."""
     if base not in BASE_STAGES:
         raise ValueError(f"unknown base stage {base!r}")
@@ -728,9 +736,13 @@ def stage_variant(
             )
         name += "_tma"
     if dcnt:
-        if base not in DCNT_BASES or swab or name.endswith("_tma"):
+        if (
+            base not in DCNT_BASES
+            or swab
+            or (name.endswith("_tma") and base != "gemm_dw_cast_bf16")
+        ):
             raise ValueError(
-                f"{base}: the device-count row bound exists for {DCNT_BASES} only (not the swapped or TMA-epilogue forms)"
+                f"{base}: the device-count row bound exists for {DCNT_BASES} only (not the swapped or the accumulate's TMA-epilogue forms)"
             )
         name += "_dcnt"
     return name
@@ -1996,17 +2008,23 @@ def _modes_off():
     return contextlib.nullcontext() if _DISABLE_MODES is None else _DISABLE_MODES()
 
 
-# Reused per-call host state, per thread (``_thread_state``): the dW side stream and its fork event, the dX fill stream
-# and its join event (:func:`set_dx_fill_side_stream`), the hidden valid-row count's pinned cells and events and its
-# int32 count constant.  A call records the fork event and waits on
-# it, and writes a count cell and reads it back behind its event, before it returns, so the calls of one thread never
-# share them in flight; two threads get their own (a shared fork event or cell let one thread's call wait on, or read,
-# the other's).  None of it is a tensor of a workspace or a binding.
+# the per-thread, per-device host state of the calls (:func:`_thread_state`)
 _THREAD_STATE = threading.local()
 
 
 def _thread_state(name: str) -> dict:
-    """This thread's dict ``name`` of the reused per-call state (created empty on first use)."""
+    """The calling thread's per-device dict ``name`` of the calls' host state (created empty on first use) --
+    ``"dw_streams"`` (device index -> (dW side stream, fork event), :func:`_dw_stream`), ``"fill_streams"`` (device
+    index -> (dX fill stream, join event), :func:`_fill_stream`, :func:`set_dx_fill_side_stream`), ``"cells"`` /
+    ``"pair_cells"`` (device index -> (pinned int32 [1] / [2] cell, event) of the hidden valid-row count,
+    :func:`_hidden_count_cell` / :func:`_hidden_count_pair_cell`), ``"arange"`` (device index -> the growing int32
+    constant 1, 2, .., :func:`_hidden_count_arange`) and ``"arange_streams"`` (device index -> the raw streams the
+    constant was recorded on, :func:`_current_raw_stream`).  None is a tensor of a workspace or a binding.  A call
+    records its fork / join event and waits on it, and writes a count cell and reads it back behind its event, before it
+    returns, so the calls of one thread never share them in flight; calls of different threads on one device (each on
+    its own stream) never share a stream, an event, a cell or the constant: one thread's call cannot re-record another's
+    fork event, overwrite its count before the read, or reallocate the constant its queued kernels read; one thread
+    runs one call at a time."""
     state = getattr(_THREAD_STATE, name, None)
     if state is None:
         state = {}
@@ -2558,6 +2576,66 @@ def set_zero_dlogp_min_rows(rows: Optional[int]) -> Optional[int]:
     return previous
 
 
+# Per device index (:func:`_skip_record`): the record :func:`record_for` selects and whether it registers the partition
+# kernel and the whole zero-gradient row skip (the partition kernel and the counted dz arm).  The registry is fixed at
+# import and a device keeps its architecture, so each device resolves this once; the skip path's per-call host work
+# (:func:`_zero_dlogp_skip`, :func:`zero_dlogp_partition`, both ahead of the backward's first launch) reads it instead of
+# selecting the record and scanning its stages on every call.
+_SKIP_RECORDS: dict[int, tuple[str, dict[str, Any], bool, bool]] = {}
+
+
+def _skip_record(index: int) -> tuple[str, dict[str, Any], bool, bool]:
+    """``(module_name, record, partition, skip)`` of CUDA device ``index``: its record (:func:`record_for`; raises when
+    absent), whether the record registers :data:`ZERO_DLOGP_PARTITION_STAGE` and whether it also registers
+    :data:`LOGPROB_DZ_DCNT_STAGE` (the zero-gradient row skip).  Resolved once per device; threads that resolve it
+    together all return the first stored entry (the same values)."""
+    entry = _SKIP_RECORDS.get(index)
+    if entry is None:
+        module_name, record = record_for(torch.device("cuda", index))
+        stages = registered_stages(module_name)
+        partition = ZERO_DLOGP_PARTITION_STAGE in stages
+        entry = _SKIP_RECORDS.setdefault(
+            index,
+            (
+                module_name,
+                record,
+                partition,
+                partition and LOGPROB_DZ_DCNT_STAGE in stages,
+            ),
+        )
+    return entry
+
+
+def _flat(t: torch.Tensor) -> torch.Tensor:
+    """``t.reshape(-1).contiguous()``, without the view when ``t`` already is a contiguous 1-D tensor (``t`` itself)."""
+    return t if t.dim() == 1 and t.is_contiguous() else t.reshape(-1).contiguous()
+
+
+def _partition_outputs(
+    rows: int, T: int, num_chunks: int, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The partition kernel's four outputs split from ONE int32 allocation (int64 ``order [rows]``, FP32
+    ``lse_out [rows]``, int32 ``scan [T]`` and ``counts [num_chunks]``), each region at a :data:`WORKSPACE_ALIGN`-byte
+    boundary as the workspace regions (:func:`_align`); one caching-allocator call instead of four ahead of the backward's
+    first launch.  The regions are disjoint views of one block that lives as long as any of them."""
+    o_lse = _align(8 * rows) // 4
+    o_scan = o_lse + _align(4 * rows) // 4
+    o_counts = o_scan + _align(4 * T) // 4
+    block = torch.empty((o_counts + num_chunks,), dtype=torch.int32, device=device)
+    order, _, lse_out, _, scan, _, counts = block.split_with_sizes(
+        (
+            2 * rows,
+            o_lse - 2 * rows,
+            rows,
+            o_scan - o_lse - rows,
+            T,
+            o_counts - o_scan - T,
+            num_chunks,
+        )
+    )
+    return order.view(torch.int64), lse_out.view(torch.float32), scan, counts
+
+
 def zero_dlogp_partition(
     labels: torch.Tensor,
     dlogp: torch.Tensor,
@@ -2576,7 +2654,13 @@ def zero_dlogp_partition(
     the backward, ahead of its first GEMM.  The kernel reads ``labels`` for the valid rows instead of ``row_index``,
     which must be the ascending index of the rows with a non-negative label (the forward's valid-row index, as the
     backward passes it).  Any other call (another device or backend, a record without the kernel, an int64 / FP32
-    contract the inputs do not meet) runs the reference."""
+    contract the inputs do not meet) runs the reference.
+
+    The call sits on the host path ahead of the backward's first launch, where the GPU waits: the device's record is
+    resolved once (:func:`_skip_record`), the four outputs are one allocation (:func:`_partition_outputs`) and, while
+    :data:`BINDING_CACHE` is enabled, the templated launch of each ``(device, T, chunk)`` form is remembered with the
+    eager output-boundary launches (:func:`_eager_launch`'s cache, under a key of those values) -- a later call only
+    slots its tensors into it: the same entry, grid and arguments as a fresh binding."""
     rows = int(row_index.numel())
     device = dlogp.device
     if (
@@ -2589,36 +2673,44 @@ def zero_dlogp_partition(
         or dlogp.dtype != torch.float32
     ):
         return zero_dlogp_partition_reference(labels, dlogp, row_index, lse, chunk)
-    module_name, record = record_for(device)
-    if ZERO_DLOGP_PARTITION_STAGE not in registered_stages(module_name):
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    module_name, record, partition, _skip = _skip_record(index)
+    if not partition:
         return zero_dlogp_partition_reference(labels, dlogp, row_index, lse, chunk)
-    record_abi(record)
-    geometry = Geometry.from_record(record)
     T = int(labels.numel())
-    num_chunks = -(-rows // int(chunk))
-    order = torch.empty((rows,), dtype=torch.int64, device=device)
-    lse_ordered = torch.empty((rows,), dtype=torch.float32, device=device)
-    scan = torch.empty((T,), dtype=torch.int32, device=device)
-    counts = torch.empty((num_chunks,), dtype=torch.int32, device=device)
-    values: dict[str, Any] = {name: None for name in COMMON_TENSORS}
-    values.update({name: 0 for name in COMMON_SCALARS})
-    values.update(
-        labels=labels.reshape(-1).contiguous(),
-        dlogp=dlogp.reshape(-1).contiguous(),
-        lse=lse.reshape(-1).contiguous(),
+    chunk = int(chunk)
+    num_chunks = -(-rows // chunk)
+    order, lse_ordered, scan, counts = _partition_outputs(rows, T, num_chunks, device)
+    tensors = dict(
+        labels=_flat(labels),
+        dlogp=_flat(dlogp),
+        lse=_flat(lse),
         order=order,
         lse_out=lse_ordered,
         scan=scan,
         counts=counts,
-        T=T,
-        chunk=int(chunk),
-        num_chunks=num_chunks,
     )
-    launch, arguments = _eager_launch(
-        record, module_name, ZERO_DLOGP_PARTITION_STAGE, values, device, geometry
-    )
-    index = device.index if device.index is not None else torch.cuda.current_device()
-    with _ffi_stream_context(int(index)):
+    cache = BINDING_CACHE
+    form = (ZERO_DLOGP_PARTITION_STAGE, "form", index, T, chunk, num_chunks)
+    launch = cache.eager_lookup(form, record) if cache.enabled else None
+    if launch is None:
+        record_abi(record)
+        values: dict[str, Any] = {name: None for name in COMMON_TENSORS}
+        values.update({name: 0 for name in COMMON_SCALARS})
+        values.update(tensors, T=T, chunk=chunk, num_chunks=num_chunks)
+        launch, arguments = _eager_launch(
+            record,
+            module_name,
+            ZERO_DLOGP_PARTITION_STAGE,
+            values,
+            device,
+            Geometry.from_record(record),
+        )
+        if cache.enabled:
+            cache.eager_remember(form, record, launch.templated())
+    else:
+        arguments = launch.arguments_for(tensors)
+    with _ffi_stream_context(index):
         if launch.prepare is not None:
             launch.prepare(*arguments)
         launch.entry(*arguments)
@@ -3453,6 +3545,7 @@ def make_plan(
     dx_red_min_rows: Optional[int] = None,
     logprob_keep: bool = False,
     dcnt: bool = False,
+    counted_tma_cast: bool = True,
 ) -> Plan:
     """The chunk schedule; ``dx_max_slices`` > 1 (the K-sliced reduction form registered) picks each chunk's slice count
     with :func:`dx_slices` under ``dx_slice_policy`` (``None`` = :func:`dx_slice_policy`; ``dx_resident`` = the device's
@@ -3470,8 +3563,9 @@ def make_plan(
     (:attr:`Plan.logprob_dz`, :attr:`Plan.logprob_lbl`).  ``logprob_keep`` (a log-probability plan, a registered
     program): the kept-logits plan (:class:`_KeptPlan`), which runs neither arm.  ``dcnt`` (a log-probability plan
     with the dz arm, a registered program): the zero-gradient row skip's ``_dcnt`` forms (:attr:`Plan.dcnt`), the
-    last chunk's bf16 fused cast in its shipped form instead of the TMA epilogue (:func:`dw_cast_tma_rule`); off when a
-    chunk takes a form without one (an explicitly pinned weight-gradient TMA epilogue or swapped dX tile)."""
+    last chunk's bf16 fused cast in the TMA epilogue's counted form where :func:`dw_cast_tma_rule` takes the TMA
+    epilogue (``counted_tma_cast=False``, a record without that form: the shipped cast's counted form instead); off when
+    a chunk takes a form without one (an explicitly pinned weight-gradient TMA epilogue or swapped dX tile)."""
     if (logprob_dz or logprob_lbl or logprob_keep) and problem.entry != "logprob":
         raise ValueError("the logits GEMM arms belong to the log-probability entry")
     if logprob_keep:
@@ -3543,15 +3637,16 @@ def make_plan(
     )
     if (
         variants
-        and not dcnt
+        and (not dcnt or counted_tma_cast)
         and need_dw
         and fuse_dw_cast
         and not (problem.entry == "loss" and problem.grad_weight_dtype == torch.float32)
         and "epi_store" not in tuning.get("dw", {})
         and dw_cast_tma_rule(len(chunks), chunks[-1][1], arch)
     ):
-        # the deferred last chunk's bf16 cast takes the TMA epilogue; an explicit ``epi_store`` keeps the shipped cast,
-        # and so does a counted plan (the shipped cast has the counted form, the TMA one has none; the same dW bits)
+        # the deferred last chunk's bf16 cast takes the TMA epilogue (a counted plan its counted form,
+        # DW_CAST_TMA_DCNT_STAGE, unless ``counted_tma_cast`` is off); an explicit ``epi_store`` keeps the shipped
+        # cast (the same dW bits)
         variants = variants[:-1] + (replace(variants[-1], dw_cast_tma=True),)
     hidden_group: Optional[int] = None
     if hidden_count:
@@ -4185,13 +4280,7 @@ def _ffi_stream_context(index: int):
     device = _FFI_DEVICES.get(index)
     if device is None:
         device = _FFI_DEVICES[index] = tvm_ffi.device(f"cuda:{index}")
-    getter = getattr(torch._C, "_cuda_getCurrentRawStream", None)
-    raw = (
-        getter(index)
-        if getter is not None
-        else torch.cuda.current_stream(index).cuda_stream
-    )
-    return tvm_ffi.use_raw_stream(device, raw)
+    return tvm_ffi.use_raw_stream(device, _current_raw_stream(index))
 
 
 def side_stream_schedule(
@@ -5579,6 +5668,9 @@ def prepare_lm_head_loss(
         logprob_keep=keep,
     )
     plan = plan_of(dcnt=dcnt is not None)
+    if plan.dcnt and any(s not in stages for s in plan.stages):
+        # a record without the counted TMA cast: the counted plan with the shipped cast's counted form
+        plan = plan_of(dcnt=True, counted_tma_cast=False)
     if plan.dcnt and any(s not in stages for s in plan.stages):
         # a record without the counted forms: the shipped plan, every row computed
         plan = plan_of(dcnt=False)
@@ -7761,9 +7853,10 @@ def _zero_dlogp_skip(
         or device.type != "cuda"
     ):
         return False
-    module_name, _record = record_for(device)
-    stages = registered_stages(module_name)
-    return LOGPROB_DZ_DCNT_STAGE in stages and ZERO_DLOGP_PARTITION_STAGE in stages
+    # the device's record and its stages, resolved once per device (:func:`_skip_record`)
+    return _skip_record(
+        device.index if device.index is not None else torch.cuda.current_device()
+    )[3]
 
 
 def backward_logprob(

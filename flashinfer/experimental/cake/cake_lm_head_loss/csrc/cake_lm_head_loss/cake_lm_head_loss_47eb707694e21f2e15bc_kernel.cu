@@ -54,48 +54,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define CAKE_PROGRAM_KERNEL kernel_cake_lm_head_loss_47eb707694e21f2e15bc
 #endif
 
-#define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 512
-#define TMEM_ACCUM_OFFSET 0
-#if CAKE_DX_ST3
-#define NUM_TMA_PIPE_STAGES 3
-#else
-#define NUM_TMA_PIPE_STAGES 4
-#endif  // CAKE_DX_ST3
-#define NUM_MAINLOOP_PIPE_STAGES 1
-#define NUM_EPI_STORE_PIPE_STAGES 2
-#define NUM_CLC_PIPE_STAGES 2
-#define NUM_THR_PIPE_STAGES 2
-#define SMEM_SMEM_V0_OFF 1024
-#define SMEM_SMEM_V0_STAGE_BYTES 16384
-#define SMEM_SMEM_V0_STRIDE 49152
-#define SMEM_SMEM_V1_OFF 17408
-#define SMEM_SMEM_V1_STAGE_BYTES 16384
-#define SMEM_SMEM_V1_STRIDE 49152
-#define SMEM_SMEM_V1_0_OFF 33792
-#define SMEM_SMEM_V1_0_STAGE_BYTES 16384
-#define SMEM_SMEM_V1_0_STRIDE 49152
-#if CAKE_DX_ST3
-#define SMEM_SMEM_EPI_OFF 148480
-#else
-#define SMEM_SMEM_EPI_OFF 197632
-#endif  // CAKE_DX_ST3
-#define SMEM_SMEM_EPI_STAGE_BYTES 16384
-#define SMEM_SMEM_EPI_STRIDE 16384
-#if CAKE_DX_ST3
-#define SMEM_CLC_RESP_OFF 181248
-#else
-#define SMEM_CLC_RESP_OFF 230400
-#endif  // CAKE_DX_ST3
-#define SMEM_CLC_RESP_STAGE_BYTES 16
-#define SMEM_CLC_RESP_STRIDE 16
-#if CAKE_DX_ST3
-#define SMEM_TOTAL 181376
-#else
-#define SMEM_TOTAL 230528
-#endif  // CAKE_DX_ST3
-#define THREADS 224
-
 #include <math_constants.h>
 
 __device__ __forceinline__ uint32_t elect_sync() {
