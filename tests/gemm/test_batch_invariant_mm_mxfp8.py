@@ -785,6 +785,19 @@ def test_chunk_count_and_workspace_checks():
         bi.BatchInvariantUnsupportedError, match="overlapping the workspace"
     ):
         mm_mxfp8_batch_invariant(a, b, sfa, sfb, out=out, config=wsplit, workspace=ws)
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match="A overlapping"):
+        mm_mxfp8_batch_invariant(
+            ws.view(E4)[: 16 * K].view(16, K),
+            b,
+            swizzle_sf(torch.zeros(16, K // 32, dtype=torch.uint8)),
+            sfb,
+            config=wsplit,
+            workspace=ws,
+        )
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match="scales overlapping"):
+        mm_mxfp8_batch_invariant(
+            a, b, sfa, ws.view(torch.uint8)[: sfb.numel()], config=wsplit, workspace=ws
+        )
     big_m = 70000
     ab, sfab = adv_mx(big_m, K, 133, cancel=False)
     full = bits(mm_mxfp8_batch_invariant(ab, b, sfab, sfb, config=wsplit, chunks=C))

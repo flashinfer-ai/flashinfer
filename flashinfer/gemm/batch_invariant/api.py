@@ -1028,12 +1028,20 @@ def _run_mx(
         ws = torch.empty(C, M, N, dtype=torch.float32, device=a.device)
     else:
         ws = _check_workspace(workspace, C, M, N, a.device, cls)
-        if _overlaps(out, ws):
-            raise unsupported(
-                cls,
-                "the output overlapping the workspace",
-                "a workspace disjoint from the output (the partials are written before the fixup reads them)",
-            )
+        for t, what in (
+            (a, "A"),
+            (b_nk, "B"),
+            (sfa, "A's scales"),
+            (sfb, "B's scales"),
+            (out, "the output"),
+        ):
+            if _overlaps(t, ws):
+                raise unsupported(
+                    cls,
+                    f"{what} overlapping the workspace",
+                    "a workspace disjoint from the operands, their scales and the output (the partials are written there "
+                    "while the operands are read and before the fixup reads them)",
+                )
     ws = ws.permute(1, 2, 0)  # chunk-major storage (C, M, N) viewed as (M, N, C)
     kernel(a3, b3, sfa, sfb, ws)  # the unscaled body: raw fp32 partials
     rows = min(M, MAX_GRID_Y)
