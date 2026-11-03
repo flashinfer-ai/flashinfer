@@ -79,6 +79,9 @@ _INT32_MAX = (1 << 31) - 1
 # work_range); the column total is an int32.
 PLAN_ITEM_TOKENS = 64
 _PLAN_FIELD_MAX = (1 << 16) - 1
+# The fused prefill path's list pool: one piece per (scorer CTA, plan item)
+# cell, each piece one sorted 16-key uint64 list per (item query row, head).
+PREFILL_PIECE_WORDS = PLAN_ITEM_TOKENS * NUM_INDEX_HEADS * TOPK
 _FP8 = torch.float8_e4m3fn
 
 
@@ -343,6 +346,38 @@ def decode_pool_bytes(
     return max_decode_tokens * num_heads * cake_jit.MAX_DECODE_SPLITS * TOPK * 8
 
 
+def prefill_pool_pieces(*, total_q: int, batch: int, num_ctas: int) -> int:
+    """Pieces of the fused prefill path's list pool for a window of at most
+    ``total_q`` query tokens in ``batch`` segments scored by ``num_ctas``
+    CTAs: the plan cuts at most ``ceil(total_q / 64) + batch - 1`` items
+    across the CTAs' monotone slices, and the cell of CTA ``s`` and item
+    ``j`` is piece ``s + j``."""
+    if total_q < 1 or batch < 1 or num_ctas < 1:
+        raise ValueError("total_q, batch and num_ctas must be positive")
+    items = (total_q + PLAN_ITEM_TOKENS - 1) // PLAN_ITEM_TOKENS + batch - 1
+    return items + num_ctas - 1
+
+
+def prefill_pool_bytes(
+    *,
+    total_q: int,
+    batch: int,
+    device: torch.device,
+    num_heads: int = NUM_INDEX_HEADS,
+) -> int:
+    """Bytes of the fused prefill path's caller-owned list pool for a query
+    window of at most ``total_q`` tokens in ``batch`` segments on ``device``
+    (its SM count is the scorer's CTA count): ``pieces * 64 * H * 16 * 8``
+    (:func:`prefill_pool_pieces`).  No pool zeroing is ever needed."""
+    _heads(num_heads)
+    index = torch.device(device).index
+    num_ctas = cake_jit.sm_count(
+        torch.cuda.current_device() if index is None else index
+    )
+    pieces = prefill_pool_pieces(total_q=total_q, batch=batch, num_ctas=num_ctas)
+    return pieces * PREFILL_PIECE_WORDS * 8
+
+
 def comm_layout(world_size: int, heads_per_rank: int, capacity: int) -> dict[str, Any]:
     """Layout of the caller's decode receive storage (one symmetric int32
     allocation per rank, zeroed once and never reset).
@@ -454,6 +489,27 @@ def fused_decode_min_batch(arch: str, page_size: int, world_size: int) -> Option
     ):
         return None
     return batch
+
+
+# The prefill chain of a serving default: (architecture, page size, world
+# size) combinations on which the caller should run the fused prefill path
+# (list scorer and list-to-carrier merge, in a caller pool of
+# ``prefill_pool_bytes``).  Empty: no combination has a measured end-to-end
+# win yet, so the default everywhere is the score rows and the Top16 select;
+# the facade runs the fused path only when the caller passes a pool.  Both
+# paths write the same carrier rows.
+FUSED_PREFILL: frozenset[tuple[str, int, int]] = frozenset()
+
+
+def fused_prefill(arch: str, page_size: int, world_size: int) -> bool:
+    """Whether the serving default on ``arch`` at ``page_size`` /
+    ``world_size`` is the fused prefill path (:data:`FUSED_PREFILL`; also
+    ``False`` when the architecture lacks its programs).  Host metadata only
+    (no device read, no environment)."""
+    return (arch, page_size, world_size) in FUSED_PREFILL and (
+        cake_jit.has_role("score_topk16", arch)
+        and cake_jit.has_role("prefill_list_carrier", arch)
+    )
 
 
 # --------------------------------------------------------------------------- prefill
@@ -725,17 +781,7 @@ def topk_select_prefill(
     _heads(h)
     k_cols = _score_rows("scores", scores, t, h, 1, MAX_SELECT_COLUMNS)
     _vector("num_valid_pages", num_valid_pages, torch.int32, t)
-    if (
-        carrier.dtype != torch.int32
-        or carrier.ndim != 3
-        or tuple(carrier.shape) != (h, t, ROW_WORDS)
-        or carrier.stride(2) != 1
-        or carrier.stride(1) < ROW_WORDS
-        or carrier.stride(0) < t * carrier.stride(1)
-    ):
-        raise ValueError(
-            f"carrier must be int32 [{h}, {t}, 33] with unit last stride and non-overlapping rows"
-        )
+    _carrier(carrier, h, t)
     _forced(force_begin_blocks, force_end_blocks)
     _index_map(index_scale, index_offset)
     dev = _device_index(scores)
@@ -766,6 +812,154 @@ def topk_select_prefill(
         grid=cake_jit.launch_grid(name, tokens=t, heads=h),
         arch=arch,
         device_index=dev,
+    )
+
+
+def _carrier(carrier: torch.Tensor, h: int, t: int) -> None:
+    if (
+        carrier.dtype != torch.int32
+        or carrier.ndim != 3
+        or tuple(carrier.shape) != (h, t, ROW_WORDS)
+        or carrier.stride(2) != 1
+        or carrier.stride(1) < ROW_WORDS
+        or carrier.stride(0) < t * carrier.stride(1)
+    ):
+        raise ValueError(
+            f"carrier must be int32 [{h}, {t}, 33] with unit last stride and non-overlapping rows"
+        )
+
+
+def prefill_score_select(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    block_table: torch.Tensor,
+    plan: MSAIcpScorePlan,
+    num_valid_pages: torch.Tensor,
+    pool: torch.Tensor,
+    carrier: torch.Tensor,
+    *,
+    rank: int,
+    tp: int,
+    compact: bool = False,
+    force_begin_blocks: int = 0,
+    force_end_blocks: int = 0,
+    enable_pdl: bool = False,
+) -> None:
+    """The fused prefill path of one query chunk: the list scorer keeps, per
+    (CTA, plan item) cell, each query row's sorted Top16 candidate keys in
+    ``pool``; the list-to-carrier merge folds a (token, head) row's lists
+    into its carrier row.  The carrier rows equal those of
+    :func:`index_score_sharded` into score rows of ``K`` columns followed by
+    :func:`topk_select_prefill` with the layout's ``index_scale`` /
+    ``index_offset``, for every ``K`` of at least the plan's columns (half,
+    rounded up, when ``compact``), without the score rows."""
+    _world(tp, rank)
+    _query("q", q)
+    if not isinstance(plan, MSAIcpScorePlan):
+        raise ValueError(
+            "plan must come from msa_icp_index_score_sharded_plan[_device]"
+        )
+    if plan.total_q != q.shape[0] or plan.num_qo_heads != q.shape[1]:
+        raise ValueError("q does not match the plan's total_q / num_qo_heads")
+    page_size = k.shape[1] * tp if k.ndim == 3 else 0
+    if page_size not in SUPPORTED_PAGE_SIZES:
+        raise ValueError("k must hold 128 / tp or 256 / tp rows per page")
+    rows = _index_k("k", k, tp, page_size)
+    blocks_per_page = page_size // 128
+    if bool(compact) != (blocks_per_page == 2):
+        raise ValueError(
+            "the fused prefill path takes compact columns exactly for P256 shards"
+        )
+    cols = (plan.columns + 1) // 2 if compact else plan.columns
+    t, h = q.shape[0], q.shape[1]
+    _block_table(
+        block_table, plan.batch, (plan.columns + blocks_per_page - 1) // blocks_per_page
+    )
+    _vector("num_valid_pages", num_valid_pages, torch.int32, t)
+    _carrier(carrier, h, t)
+    _forced(force_begin_blocks, force_end_blocks)
+    num_ctas = plan.packed_work_range.numel()
+    need = (
+        prefill_pool_pieces(total_q=t, batch=plan.batch, num_ctas=num_ctas)
+        * PREFILL_PIECE_WORDS
+        * 8
+    )
+    if (
+        pool.dtype != torch.uint8
+        or not pool.is_contiguous()
+        or pool.numel() < need
+        or pool.numel() % 8
+        or pool.data_ptr() % 16
+    ):
+        raise ValueError(
+            "pool must be contiguous 16-byte aligned uint8 of a multiple of 8 and at least "
+            f"msa_icp_prefill_pool_bytes bytes ({need} for this plan)"
+        )
+    dev = _device_index(q)
+    _same_device(
+        q.device,
+        k=k,
+        block_table=block_table,
+        num_valid_pages=num_valid_pages,
+        pool=pool,
+        carrier=carrier,
+        work_range=plan.packed_work_range,
+    )
+    arch = cake_jit.device_arch(dev)
+    scorer = cake_jit.route("score_topk16", rows, arch, page=page_size)
+    merger = cake_jit.route("prefill_list_carrier", None, arch)
+    values = {
+        # The TMA descriptors read FP8 bytes.
+        "q": q.view(torch.uint8),
+        "k": k.view(torch.uint8),
+        "block_table": block_table,
+        "qo_lens": plan.qo_segment_lens,
+        "kv_lens": plan.kv_segment_lens,
+        "qo_indptr": plan.qo_segment_offsets,
+        "kv_indptr": plan.kv_segment_offsets,
+        "qo_offset": plan.qo_offset,
+        "work_range": plan.packed_work_range,
+        "work_info": plan.packed_work_info,
+        "num_valid_pages": num_valid_pages,
+        # uint64 keys: piece ``s + j`` of CTA ``s`` and item ``j`` holds one
+        # sorted 16-key list per (item query row, head).
+        "pool": pool.view(torch.uint64),
+        "pool_piece_stride": PREFILL_PIECE_WORDS,
+        "carrier": carrier,
+        "batch": plan.batch,
+        "total_q": t,
+        "num_tokens": t,
+        "num_heads": h,
+        "num_ctas": num_ctas,
+        "columns": plan.columns,
+        # The candidate column bound of a row (the materialized path's score
+        # row width clamps nothing below it).
+        "score_cols": cols,
+        "rank": rank,
+        "world": tp,
+        "page_size": page_size,
+        "compact": int(compact),
+        "bt_stride": block_table.stride(0),
+        "carrier_stride_h": carrier.stride(0),
+        "carrier_stride_t": carrier.stride(1),
+        "force_begin": force_begin_blocks,
+        "force_end": force_end_blocks,
+    }
+    cake_jit.run_module(
+        scorer,
+        values,
+        grid=cake_jit.launch_grid(scorer, sm_count=num_ctas),
+        arch=arch,
+        device_index=dev,
+        enable_pdl=enable_pdl,
+    )
+    cake_jit.run_module(
+        merger,
+        values,
+        grid=cake_jit.launch_grid(merger, tokens=t, heads=h),
+        arch=arch,
+        device_index=dev,
+        enable_pdl=enable_pdl,
     )
 
 
@@ -1309,6 +1503,7 @@ __all__ = [
     "decode_score_publish",
     "decode_splits",
     "fused_decode_min_batch",
+    "fused_prefill",
     "index_layout",
     "index_score_columns",
     "index_score_plan_storage",
@@ -1319,6 +1514,9 @@ __all__ = [
     "merge_candidates",
     "merge_role",
     "plane_splits",
+    "prefill_pool_bytes",
+    "prefill_pool_pieces",
+    "prefill_score_select",
     "topk_select_prefill",
     "topk_select_publish",
     "warmup",

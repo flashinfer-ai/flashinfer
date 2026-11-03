@@ -40,28 +40,6 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
-#define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 384
-#define TMEM_ACC_OFFSET 0
-#define TMEM_TQ_0_OFFSET 256
-#define TMEM_TQ_1_OFFSET 288
-#define TMEM_TQ_2_OFFSET 320
-#define TMEM_TQ_3_OFFSET 352
-#define NUM_Q_PIPE_STAGES 2
-#define NUM_K_PIPE_STAGES 8
-#define NUM_ACC_PIPE_STAGES 2
-#define SMEM_SMEM_Q_OFF 1024
-#define SMEM_SMEM_Q_STAGE_BYTES 16384
-#define SMEM_SMEM_Q_STRIDE 16384
-#define SMEM_SMEM_K_OFF 66560
-#define SMEM_SMEM_K_STAGE_BYTES 16384
-#define SMEM_SMEM_K_STRIDE 16384
-#define SMEM_STAGE_OFF 197632
-#define SMEM_STAGE_STAGE_BYTES 33792
-#define SMEM_STAGE_STRIDE 33792
-#define SMEM_TOTAL 231424
-#define THREADS 320
-
 #include <math_constants.h>
 
 __device__ __forceinline__ uint32_t elect_sync() {
@@ -103,6 +81,33 @@ __device__ __forceinline__ void mbarrier_wait(int mbar_addr, int phase) {
 }
 
 
+__device__ __forceinline__ void tcgen05_mma_f8f6f4(
+    int taddr, uint64_t a_desc, uint64_t b_desc,
+    uint32_t i_desc, int enable_input_d) {
+    asm volatile(
+        "{\n\t"
+        ".reg .pred p;\n\t"
+        "setp.ne.b32 p, %4, 0;\n\t"
+        "tcgen05.mma.cta_group::1.kind::f8f6f4 [%0], %1, %2, %3, p;\n\t"
+        "}\n"
+        :: "r"(taddr), "l"(a_desc), "l"(b_desc),
+           "r"(i_desc), "r"(enable_input_d)
+         : "memory");
+}
+
+
+
+union MmaSmemDesc {
+    uint64_t u64;
+    uint32_t u32[2];
+};
+
+__device__ __forceinline__ void incr_smem_desc_lo(uint64_t& smem_desc, uint32_t offset) {
+    MmaSmemDesc tmp;
+    tmp.u64 = smem_desc;
+    tmp.u32[0] += offset;
+    smem_desc = tmp.u64;
+}
 
 
 __device__ __forceinline__ void elect_commit(int mbar_addr) {
@@ -188,7 +193,6 @@ __device__ __forceinline__ void tma_2d_gmem2smem(
 
 
 
-
 __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
     uint32_t result;
     asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xffffffff;"
@@ -199,7 +203,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(320) void
-kernel_cake_msa_icp_indexer_cef6a25ea6bc74e445b7(const __grid_constant__ CUtensorMap q, const __grid_constant__ CUtensorMap k, int* __restrict__ block_table, float* __restrict__ max_score, int* __restrict__ qo_lens, int* __restrict__ kv_lens, int* __restrict__ qo_indptr, int* __restrict__ qo_offset, long long* __restrict__ work_range, long long* __restrict__ work_info, int rank, int compact, int bt_stride, long long score_stride_t, long long score_stride_h, int score_cols)
+kernel_cake_msa_icp_indexer_8d78ca49e2ea355fce56(const __grid_constant__ CUtensorMap q, const __grid_constant__ CUtensorMap k, int* __restrict__ block_table, float* __restrict__ max_score, int* __restrict__ qo_lens, int* __restrict__ kv_lens, int* __restrict__ qo_indptr, int* __restrict__ qo_offset, long long* __restrict__ work_range, long long* __restrict__ work_info, int rank, int compact, int bt_stride, long long score_stride_t, long long score_stride_h, int score_cols)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -220,7 +224,7 @@ kernel_cake_msa_icp_indexer_cef6a25ea6bc74e445b7(const __grid_constant__ CUtenso
     #define k_full_addr (mbar_base + 32)
     #define k_empty_addr (mbar_base + 96)
     #define acc_full_addr (mbar_base + 160)
-    #define acc_empty_addr (mbar_base + 176)
+    #define acc_empty_addr (mbar_base + 192)
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
@@ -235,8 +239,8 @@ kernel_cake_msa_icp_indexer_cef6a25ea6bc74e445b7(const __grid_constant__ CUtenso
     float* stage = reinterpret_cast<float*>(smem_raw + 197632);
     const int stage_addr = smem + 197632;
 
-    // Mbarrier init (6 pipeline groups, 0 ordered-sequence groups, 24 barriers)
-    // Mbarriers at smem_raw[0..192)
+    // Mbarrier init (6 pipeline groups, 0 ordered-sequence groups, 28 barriers)
+    // Mbarriers at smem_raw[0..224)
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -268,22 +272,26 @@ kernel_cake_msa_icp_indexer_cef6a25ea6bc74e445b7(const __grid_constant__ CUtenso
             mbarrier_init(smem + 144, 1);
             mbarrier_init(smem + 152, 1);
             // --- pipeline 'acc_pipe' ---
-            // acc_full: 2 barriers, init_count=1
+            // acc_full: 4 barriers, init_count=1
             mbarrier_init(smem + 160, 1);
             mbarrier_init(smem + 168, 1);
-            // acc_empty: 2 barriers, init_count=128
-            mbarrier_init(smem + 176, 128);
-            mbarrier_init(smem + 184, 128);
+            mbarrier_init(smem + 176, 1);
+            mbarrier_init(smem + 184, 1);
+            // acc_empty: 4 barriers, init_count=128
+            mbarrier_init(smem + 192, 128);
+            mbarrier_init(smem + 200, 128);
+            mbarrier_init(smem + 208, 128);
+            mbarrier_init(smem + 216, 128);
             asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         }
     }
 
     __syncwarp();
 
-    // TMEM alloc (512 columns, 384 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 192);
+    // TMEM alloc (512 columns, 512 used)
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 224);
     if (warp == 0) {
-        int _tmem_hold = smem + 192;
+        int _tmem_hold = smem + 224;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(512) : "memory");
         __syncwarp();
         asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
@@ -296,10 +304,6 @@ kernel_cake_msa_icp_indexer_cef6a25ea6bc74e445b7(const __grid_constant__ CUtenso
 
     // Kernel post-init ops
     const int tmem_acc = taddr;
-    const int tq_0 = taddr + 256;
-    const int tq_1 = taddr + 288;
-    const int tq_2 = taddr + 320;
-    const int tq_3 = taddr + 352;
     asm volatile("griddepcontrol.wait;" ::: "memory");
 
     // ---- Role: epi ----
@@ -312,6 +316,7 @@ kernel_cake_msa_icp_indexer_cef6a25ea6bc74e445b7(const __grid_constant__ CUtenso
             int c1 = (int)(wr >> 48 & 65535);
             int j_end = ((c1 > 0) ? j1 + 1 : j1);
             int wg = warp / 4;
+            unsigned int acc = 0;
             int quarter = warp % 4;
             int lane_1 = lane;
             int lrow = quarter * 32 + lane_1;
@@ -343,7 +348,7 @@ kernel_cake_msa_icp_indexer_cef6a25ea6bc74e445b7(const __grid_constant__ CUtenso
                     int t_base = qo_indptr[b];
                     int c_first = kt0 * wcols;
                     int use_stage = 0;
-                    if ((kt1 - kt0) * wcols >= 64) {
+                    if ((kt1 - kt0) * wcols >= 128) {
                         use_stage = 1;
                     }
                     int windows[2];
@@ -371,10 +376,10 @@ kernel_cake_msa_icp_indexer_cef6a25ea6bc74e445b7(const __grid_constant__ CUtenso
                             int mine_0 = 1;
                             mine_0 = ((0 == wg) ? 1 : 0);
                             if (mine_0 != 0) {
-                                mbarrier_wait(acc_full_addr + (wg) * 8, _phase_acc_full);
+                                mbarrier_wait(acc_full_addr + ((unsigned int)wg + acc) * 8, _phase_acc_full);
                                 asm volatile("tcgen05.fence::after_thread_sync;");
                                 float v_0[128];
-                                unsigned int tile_addr_0 = taddr + lane_base + (unsigned int)wg * 128;
+                                unsigned int tile_addr_0 = taddr + lane_base + ((unsigned int)wg + acc) * 128;
                                 float pm_0 = -CUDART_INF_F;
                                 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1000)
                                 #error "TmemLoadRed requires tcgen05.ld.red support (sm_103/sm_101-sm_110 family), not sm_100"
@@ -395,8 +400,9 @@ kernel_cake_msa_icp_indexer_cef6a25ea6bc74e445b7(const __grid_constant__ CUtenso
                                     : "r"(tile_addr_0 + 64));
                                 asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
                                 asm volatile("tcgen05.fence::before_thread_sync;");
-                                mbarrier_arrive(acc_empty_addr + (wg) * 8);
-                                _phase_acc_full ^= 1;
+                                mbarrier_arrive(acc_empty_addr + ((unsigned int)wg + acc) * 8);
+                                acc += 2;
+                                if (acc >= 4) { acc -= 4; _phase_acc_full ^= 1; }
                                 int row_stage_0 = (quarter * 32 + lane_1) * 33 - windows[0];
                                 int lim_0 = cpre_0;
                                 int p_0 = kt_0 * 2;
@@ -404,6 +410,9 @@ kernel_cake_msa_icp_indexer_cef6a25ea6bc74e445b7(const __grid_constant__ CUtenso
                                 float m_0 = -CUDART_INF_F;
                                 int masked_0 = 1;
                                 m_0 = pm_0;
+                                if (m_0 != m_0) {
+                                    m_0 = -CUDART_INF_F;
+                                }
                                 int _warp_vote_2 = __any_sync(0xFFFFFFFF, nvis_0 < 64);
                                 masked_0 = _warp_vote_2;
                                 if (masked_0 != 0) {
@@ -457,7 +466,7 @@ kernel_cake_msa_icp_indexer_cef6a25ea6bc74e445b7(const __grid_constant__ CUtenso
                                         if (!(_thresh_mask_4 & (1u << 31))) v_0[31] = -CUDART_INF_F;
                                     }
                                     float part_0 = -CUDART_INF_F;
-                                    float2 _reg_reduce_max2_7 = {-CAKE_INF, -CAKE_INF};
+                                    float2 _reg_reduce_max2_7 = {-CUDART_INF_F, -CUDART_INF_F};
                                     _reg_reduce_max2_7.x = max_noftz(_reg_reduce_max2_7.x, max_noftz(v_0[0], v_0[1]));
                                     _reg_reduce_max2_7.y = max_noftz(_reg_reduce_max2_7.y, max_noftz(v_0[2], v_0[3]));
                                     _reg_reduce_max2_7.x = max_noftz(_reg_reduce_max2_7.x, max_noftz(v_0[4], v_0[5]));
@@ -526,7 +535,7 @@ kernel_cake_msa_icp_indexer_cef6a25ea6bc74e445b7(const __grid_constant__ CUtenso
                                         if (!(_thresh_mask_9 & (1u << 31))) v_0[63] = -CUDART_INF_F;
                                     }
                                     float part_1 = -CUDART_INF_F;
-                                    float2 _reg_reduce_max2_12 = {-CAKE_INF, -CAKE_INF};
+                                    float2 _reg_reduce_max2_12 = {-CUDART_INF_F, -CUDART_INF_F};
                                     row_max_x32_accum(&v_0[(32) + 0], _reg_reduce_max2_12);
                                     float _reg_array_reduce_11 = row_max_reduce(_reg_reduce_max2_12);
                                     part_1 = _reg_array_reduce_11;
@@ -539,6 +548,9 @@ kernel_cake_msa_icp_indexer_cef6a25ea6bc74e445b7(const __grid_constant__ CUtenso
                                 float m_1 = -CUDART_INF_F;
                                 int masked_1 = 1;
                                 m_1 = pm_1;
+                                if (m_1 != m_1) {
+                                    m_1 = -CUDART_INF_F;
+                                }
                                 int _warp_vote_13 = __any_sync(0xFFFFFFFF, nvis_1 < 64);
                                 masked_1 = _warp_vote_13;
                                 if (masked_1 != 0) {
@@ -592,7 +604,7 @@ kernel_cake_msa_icp_indexer_cef6a25ea6bc74e445b7(const __grid_constant__ CUtenso
                                         if (!(_thresh_mask_15 & (1u << 31))) v_0[95] = -CUDART_INF_F;
                                     }
                                     float part_2 = -CUDART_INF_F;
-                                    float2 _reg_reduce_max2_18 = {-CAKE_INF, -CAKE_INF};
+                                    float2 _reg_reduce_max2_18 = {-CUDART_INF_F, -CUDART_INF_F};
                                     row_max_x32_accum(&v_0[(64) + 0], _reg_reduce_max2_18);
                                     float _reg_array_reduce_17 = row_max_reduce(_reg_reduce_max2_18);
                                     part_2 = _reg_array_reduce_17;
@@ -646,7 +658,7 @@ kernel_cake_msa_icp_indexer_cef6a25ea6bc74e445b7(const __grid_constant__ CUtenso
                                         if (!(_thresh_mask_20 & (1u << 31))) v_0[127] = -CUDART_INF_F;
                                     }
                                     float part_3 = -CUDART_INF_F;
-                                    float2 _reg_reduce_max2_23 = {-CAKE_INF, -CAKE_INF};
+                                    float2 _reg_reduce_max2_23 = {-CUDART_INF_F, -CUDART_INF_F};
                                     row_max_x32_accum(&v_0[(96) + 0], _reg_reduce_max2_23);
                                     float _reg_array_reduce_22 = row_max_reduce(_reg_reduce_max2_23);
                                     part_3 = _reg_array_reduce_22;
@@ -677,10 +689,10 @@ kernel_cake_msa_icp_indexer_cef6a25ea6bc74e445b7(const __grid_constant__ CUtenso
                             int mine_1 = 1;
                             mine_1 = ((1 == wg) ? 1 : 0);
                             if (mine_1 != 0) {
-                                mbarrier_wait(acc_full_addr + (wg) * 8, _phase_acc_full);
+                                mbarrier_wait(acc_full_addr + ((unsigned int)wg + acc) * 8, _phase_acc_full);
                                 asm volatile("tcgen05.fence::after_thread_sync;");
                                 float v_1[128];
-                                unsigned int tile_addr_1 = taddr + lane_base + (unsigned int)wg * 128;
+                                unsigned int tile_addr_1 = taddr + lane_base + ((unsigned int)wg + acc) * 128;
                                 float pm_2 = -CUDART_INF_F;
                                 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1000)
                                 #error "TmemLoadRed requires tcgen05.ld.red support (sm_103/sm_101-sm_110 family), not sm_100"
@@ -701,8 +713,9 @@ kernel_cake_msa_icp_indexer_cef6a25ea6bc74e445b7(const __grid_constant__ CUtenso
                                     : "r"(tile_addr_1 + 64));
                                 asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
                                 asm volatile("tcgen05.fence::before_thread_sync;");
-                                mbarrier_arrive(acc_empty_addr + (wg) * 8);
-                                _phase_acc_full ^= 1;
+                                mbarrier_arrive(acc_empty_addr + ((unsigned int)wg + acc) * 8);
+                                acc += 2;
+                                if (acc >= 4) { acc -= 4; _phase_acc_full ^= 1; }
                                 int row_stage_1 = ((4 + quarter) * 32 + lane_1) * 33 - windows[1];
                                 int lim_2 = cpre_1;
                                 int p_2 = kt_0 * 2;
@@ -710,6 +723,9 @@ kernel_cake_msa_icp_indexer_cef6a25ea6bc74e445b7(const __grid_constant__ CUtenso
                                 float m_2 = -CUDART_INF_F;
                                 int masked_2 = 1;
                                 m_2 = pm_2;
+                                if (m_2 != m_2) {
+                                    m_2 = -CUDART_INF_F;
+                                }
                                 int _warp_vote_24 = __any_sync(0xFFFFFFFF, nvis_2 < 64);
                                 masked_2 = _warp_vote_24;
                                 if (masked_2 != 0) {
@@ -763,7 +779,7 @@ kernel_cake_msa_icp_indexer_cef6a25ea6bc74e445b7(const __grid_constant__ CUtenso
                                         if (!(_thresh_mask_26 & (1u << 31))) v_1[31] = -CUDART_INF_F;
                                     }
                                     float part_4 = -CUDART_INF_F;
-                                    float2 _reg_reduce_max2_29 = {-CAKE_INF, -CAKE_INF};
+                                    float2 _reg_reduce_max2_29 = {-CUDART_INF_F, -CUDART_INF_F};
                                     _reg_reduce_max2_29.x = max_noftz(_reg_reduce_max2_29.x, max_noftz(v_1[0], v_1[1]));
                                     _reg_reduce_max2_29.y = max_noftz(_reg_reduce_max2_29.y, max_noftz(v_1[2], v_1[3]));
                                     _reg_reduce_max2_29.x = max_noftz(_reg_reduce_max2_29.x, max_noftz(v_1[4], v_1[5]));
@@ -832,7 +848,7 @@ kernel_cake_msa_icp_indexer_cef6a25ea6bc74e445b7(const __grid_constant__ CUtenso
                                         if (!(_thresh_mask_31 & (1u << 31))) v_1[63] = -CUDART_INF_F;
                                     }
                                     float part_5 = -CUDART_INF_F;
-                                    float2 _reg_reduce_max2_34 = {-CAKE_INF, -CAKE_INF};
+                                    float2 _reg_reduce_max2_34 = {-CUDART_INF_F, -CUDART_INF_F};
                                     row_max_x32_accum(&v_1[(32) + 0], _reg_reduce_max2_34);
                                     float _reg_array_reduce_33 = row_max_reduce(_reg_reduce_max2_34);
                                     part_5 = _reg_array_reduce_33;
@@ -845,6 +861,9 @@ kernel_cake_msa_icp_indexer_cef6a25ea6bc74e445b7(const __grid_constant__ CUtenso
                                 float m_3 = -CUDART_INF_F;
                                 int masked_3 = 1;
                                 m_3 = pm_3;
+                                if (m_3 != m_3) {
+                                    m_3 = -CUDART_INF_F;
+                                }
                                 int _warp_vote_35 = __any_sync(0xFFFFFFFF, nvis_3 < 64);
                                 masked_3 = _warp_vote_35;
                                 if (masked_3 != 0) {
@@ -898,7 +917,7 @@ kernel_cake_msa_icp_indexer_cef6a25ea6bc74e445b7(const __grid_constant__ CUtenso
                                         if (!(_thresh_mask_37 & (1u << 31))) v_1[95] = -CUDART_INF_F;
                                     }
                                     float part_6 = -CUDART_INF_F;
-                                    float2 _reg_reduce_max2_40 = {-CAKE_INF, -CAKE_INF};
+                                    float2 _reg_reduce_max2_40 = {-CUDART_INF_F, -CUDART_INF_F};
                                     row_max_x32_accum(&v_1[(64) + 0], _reg_reduce_max2_40);
                                     float _reg_array_reduce_39 = row_max_reduce(_reg_reduce_max2_40);
                                     part_6 = _reg_array_reduce_39;
@@ -952,7 +971,7 @@ kernel_cake_msa_icp_indexer_cef6a25ea6bc74e445b7(const __grid_constant__ CUtenso
                                         if (!(_thresh_mask_42 & (1u << 31))) v_1[127] = -CUDART_INF_F;
                                     }
                                     float part_7 = -CUDART_INF_F;
-                                    float2 _reg_reduce_max2_45 = {-CAKE_INF, -CAKE_INF};
+                                    float2 _reg_reduce_max2_45 = {-CUDART_INF_F, -CUDART_INF_F};
                                     row_max_x32_accum(&v_1[(96) + 0], _reg_reduce_max2_45);
                                     float _reg_array_reduce_44 = row_max_reduce(_reg_reduce_max2_45);
                                     part_7 = _reg_array_reduce_44;
@@ -988,10 +1007,10 @@ kernel_cake_msa_icp_indexer_cef6a25ea6bc74e445b7(const __grid_constant__ CUtenso
                             int mine_2 = 1;
                             mine_2 = ((0 == wg) ? 1 : 0);
                             if (mine_2 != 0) {
-                                mbarrier_wait(acc_full_addr + (wg) * 8, _phase_acc_full);
+                                mbarrier_wait(acc_full_addr + ((unsigned int)wg + acc) * 8, _phase_acc_full);
                                 asm volatile("tcgen05.fence::after_thread_sync;");
                                 float v_2[128];
-                                unsigned int tile_addr_2 = taddr + lane_base + (unsigned int)wg * 128;
+                                unsigned int tile_addr_2 = taddr + lane_base + ((unsigned int)wg + acc) * 128;
                                 float pm_4 = -CUDART_INF_F;
                                 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1000)
                                 #error "TmemLoadRed requires tcgen05.ld.red support (sm_103/sm_101-sm_110 family), not sm_100"
@@ -1012,8 +1031,9 @@ kernel_cake_msa_icp_indexer_cef6a25ea6bc74e445b7(const __grid_constant__ CUtenso
                                     : "r"(tile_addr_2 + 64));
                                 asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
                                 asm volatile("tcgen05.fence::before_thread_sync;");
-                                mbarrier_arrive(acc_empty_addr + (wg) * 8);
-                                _phase_acc_full ^= 1;
+                                mbarrier_arrive(acc_empty_addr + ((unsigned int)wg + acc) * 8);
+                                acc += 2;
+                                if (acc >= 4) { acc -= 4; _phase_acc_full ^= 1; }
                                 int row_stage_2 = (quarter * 32 + lane_1) * 33 - windows[0];
                                 int lim_4 = cpre_0;
                                 int p_4 = kt_1 * 2;
@@ -1021,6 +1041,9 @@ kernel_cake_msa_icp_indexer_cef6a25ea6bc74e445b7(const __grid_constant__ CUtenso
                                 float m_4 = -CUDART_INF_F;
                                 int masked_4 = 1;
                                 m_4 = pm_4;
+                                if (m_4 != m_4) {
+                                    m_4 = -CUDART_INF_F;
+                                }
                                 int _warp_vote_46 = __any_sync(0xFFFFFFFF, nvis_4 < 64);
                                 masked_4 = _warp_vote_46;
                                 if (masked_4 != 0) {
@@ -1074,7 +1097,7 @@ kernel_cake_msa_icp_indexer_cef6a25ea6bc74e445b7(const __grid_constant__ CUtenso
                                         if (!(_thresh_mask_48 & (1u << 31))) v_2[31] = -CUDART_INF_F;
                                     }
                                     float part_8 = -CUDART_INF_F;
-                                    float2 _reg_reduce_max2_51 = {-CAKE_INF, -CAKE_INF};
+                                    float2 _reg_reduce_max2_51 = {-CUDART_INF_F, -CUDART_INF_F};
                                     _reg_reduce_max2_51.x = max_noftz(_reg_reduce_max2_51.x, max_noftz(v_2[0], v_2[1]));
                                     _reg_reduce_max2_51.y = max_noftz(_reg_reduce_max2_51.y, max_noftz(v_2[2], v_2[3]));
                                     _reg_reduce_max2_51.x = max_noftz(_reg_reduce_max2_51.x, max_noftz(v_2[4], v_2[5]));
@@ -1143,7 +1166,7 @@ kernel_cake_msa_icp_indexer_cef6a25ea6bc74e445b7(const __grid_constant__ CUtenso
                                         if (!(_thresh_mask_53 & (1u << 31))) v_2[63] = -CUDART_INF_F;
                                     }
                                     float part_9 = -CUDART_INF_F;
-                                    float2 _reg_reduce_max2_56 = {-CAKE_INF, -CAKE_INF};
+                                    float2 _reg_reduce_max2_56 = {-CUDART_INF_F, -CUDART_INF_F};
                                     row_max_x32_accum(&v_2[(32) + 0], _reg_reduce_max2_56);
                                     float _reg_array_reduce_55 = row_max_reduce(_reg_reduce_max2_56);
                                     part_9 = _reg_array_reduce_55;
@@ -1158,6 +1181,9 @@ kernel_cake_msa_icp_indexer_cef6a25ea6bc74e445b7(const __grid_constant__ CUtenso
                                 float m_5 = -CUDART_INF_F;
                                 int masked_5 = 1;
                                 m_5 = pm_5;
+                                if (m_5 != m_5) {
+                                    m_5 = -CUDART_INF_F;
+                                }
                                 int _warp_vote_57 = __any_sync(0xFFFFFFFF, nvis_5 < 64);
                                 masked_5 = _warp_vote_57;
                                 if (masked_5 != 0) {
@@ -1211,7 +1237,7 @@ kernel_cake_msa_icp_indexer_cef6a25ea6bc74e445b7(const __grid_constant__ CUtenso
                                         if (!(_thresh_mask_59 & (1u << 31))) v_2[95] = -CUDART_INF_F;
                                     }
                                     float part_10 = -CUDART_INF_F;
-                                    float2 _reg_reduce_max2_62 = {-CAKE_INF, -CAKE_INF};
+                                    float2 _reg_reduce_max2_62 = {-CUDART_INF_F, -CUDART_INF_F};
                                     row_max_x32_accum(&v_2[(64) + 0], _reg_reduce_max2_62);
                                     float _reg_array_reduce_61 = row_max_reduce(_reg_reduce_max2_62);
                                     part_10 = _reg_array_reduce_61;
@@ -1265,7 +1291,7 @@ kernel_cake_msa_icp_indexer_cef6a25ea6bc74e445b7(const __grid_constant__ CUtenso
                                         if (!(_thresh_mask_64 & (1u << 31))) v_2[127] = -CUDART_INF_F;
                                     }
                                     float part_11 = -CUDART_INF_F;
-                                    float2 _reg_reduce_max2_67 = {-CAKE_INF, -CAKE_INF};
+                                    float2 _reg_reduce_max2_67 = {-CUDART_INF_F, -CUDART_INF_F};
                                     row_max_x32_accum(&v_2[(96) + 0], _reg_reduce_max2_67);
                                     float _reg_array_reduce_66 = row_max_reduce(_reg_reduce_max2_67);
                                     part_11 = _reg_array_reduce_66;
@@ -1279,10 +1305,10 @@ kernel_cake_msa_icp_indexer_cef6a25ea6bc74e445b7(const __grid_constant__ CUtenso
                             int mine_3 = 1;
                             mine_3 = ((1 == wg) ? 1 : 0);
                             if (mine_3 != 0) {
-                                mbarrier_wait(acc_full_addr + (wg) * 8, _phase_acc_full);
+                                mbarrier_wait(acc_full_addr + ((unsigned int)wg + acc) * 8, _phase_acc_full);
                                 asm volatile("tcgen05.fence::after_thread_sync;");
                                 float v_3[128];
-                                unsigned int tile_addr_3 = taddr + lane_base + (unsigned int)wg * 128;
+                                unsigned int tile_addr_3 = taddr + lane_base + ((unsigned int)wg + acc) * 128;
                                 float pm_6 = -CUDART_INF_F;
                                 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1000)
                                 #error "TmemLoadRed requires tcgen05.ld.red support (sm_103/sm_101-sm_110 family), not sm_100"
@@ -1303,8 +1329,9 @@ kernel_cake_msa_icp_indexer_cef6a25ea6bc74e445b7(const __grid_constant__ CUtenso
                                     : "r"(tile_addr_3 + 64));
                                 asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
                                 asm volatile("tcgen05.fence::before_thread_sync;");
-                                mbarrier_arrive(acc_empty_addr + (wg) * 8);
-                                _phase_acc_full ^= 1;
+                                mbarrier_arrive(acc_empty_addr + ((unsigned int)wg + acc) * 8);
+                                acc += 2;
+                                if (acc >= 4) { acc -= 4; _phase_acc_full ^= 1; }
                                 int row_stage_3 = ((4 + quarter) * 32 + lane_1) * 33 - windows[1];
                                 int lim_5 = cpre_1;
                                 int p_6 = kt_1 * 2;
@@ -1312,6 +1339,9 @@ kernel_cake_msa_icp_indexer_cef6a25ea6bc74e445b7(const __grid_constant__ CUtenso
                                 float m_6 = -CUDART_INF_F;
                                 int masked_6 = 1;
                                 m_6 = pm_6;
+                                if (m_6 != m_6) {
+                                    m_6 = -CUDART_INF_F;
+                                }
                                 int _warp_vote_68 = __any_sync(0xFFFFFFFF, nvis_6 < 64);
                                 masked_6 = _warp_vote_68;
                                 if (masked_6 != 0) {
@@ -1365,7 +1395,7 @@ kernel_cake_msa_icp_indexer_cef6a25ea6bc74e445b7(const __grid_constant__ CUtenso
                                         if (!(_thresh_mask_70 & (1u << 31))) v_3[31] = -CUDART_INF_F;
                                     }
                                     float part_12 = -CUDART_INF_F;
-                                    float2 _reg_reduce_max2_73 = {-CAKE_INF, -CAKE_INF};
+                                    float2 _reg_reduce_max2_73 = {-CUDART_INF_F, -CUDART_INF_F};
                                     _reg_reduce_max2_73.x = max_noftz(_reg_reduce_max2_73.x, max_noftz(v_3[0], v_3[1]));
                                     _reg_reduce_max2_73.y = max_noftz(_reg_reduce_max2_73.y, max_noftz(v_3[2], v_3[3]));
                                     _reg_reduce_max2_73.x = max_noftz(_reg_reduce_max2_73.x, max_noftz(v_3[4], v_3[5]));
@@ -1434,7 +1464,7 @@ kernel_cake_msa_icp_indexer_cef6a25ea6bc74e445b7(const __grid_constant__ CUtenso
                                         if (!(_thresh_mask_75 & (1u << 31))) v_3[63] = -CUDART_INF_F;
                                     }
                                     float part_13 = -CUDART_INF_F;
-                                    float2 _reg_reduce_max2_78 = {-CAKE_INF, -CAKE_INF};
+                                    float2 _reg_reduce_max2_78 = {-CUDART_INF_F, -CUDART_INF_F};
                                     row_max_x32_accum(&v_3[(32) + 0], _reg_reduce_max2_78);
                                     float _reg_array_reduce_77 = row_max_reduce(_reg_reduce_max2_78);
                                     part_13 = _reg_array_reduce_77;
@@ -1449,6 +1479,9 @@ kernel_cake_msa_icp_indexer_cef6a25ea6bc74e445b7(const __grid_constant__ CUtenso
                                 float m_7 = -CUDART_INF_F;
                                 int masked_7 = 1;
                                 m_7 = pm_7;
+                                if (m_7 != m_7) {
+                                    m_7 = -CUDART_INF_F;
+                                }
                                 int _warp_vote_79 = __any_sync(0xFFFFFFFF, nvis_7 < 64);
                                 masked_7 = _warp_vote_79;
                                 if (masked_7 != 0) {
@@ -1502,7 +1535,7 @@ kernel_cake_msa_icp_indexer_cef6a25ea6bc74e445b7(const __grid_constant__ CUtenso
                                         if (!(_thresh_mask_81 & (1u << 31))) v_3[95] = -CUDART_INF_F;
                                     }
                                     float part_14 = -CUDART_INF_F;
-                                    float2 _reg_reduce_max2_84 = {-CAKE_INF, -CAKE_INF};
+                                    float2 _reg_reduce_max2_84 = {-CUDART_INF_F, -CUDART_INF_F};
                                     row_max_x32_accum(&v_3[(64) + 0], _reg_reduce_max2_84);
                                     float _reg_array_reduce_83 = row_max_reduce(_reg_reduce_max2_84);
                                     part_14 = _reg_array_reduce_83;
@@ -1556,7 +1589,7 @@ kernel_cake_msa_icp_indexer_cef6a25ea6bc74e445b7(const __grid_constant__ CUtenso
                                         if (!(_thresh_mask_86 & (1u << 31))) v_3[127] = -CUDART_INF_F;
                                     }
                                     float part_15 = -CUDART_INF_F;
-                                    float2 _reg_reduce_max2_89 = {-CAKE_INF, -CAKE_INF};
+                                    float2 _reg_reduce_max2_89 = {-CUDART_INF_F, -CUDART_INF_F};
                                     row_max_x32_accum(&v_3[(96) + 0], _reg_reduce_max2_89);
                                     float _reg_array_reduce_88 = row_max_reduce(_reg_reduce_max2_89);
                                     part_15 = _reg_array_reduce_88;
@@ -1669,9 +1702,11 @@ kernel_cake_msa_icp_indexer_cef6a25ea6bc74e445b7(const __grid_constant__ CUtenso
             int j_end_2 = ((c1_2 > 0) ? j1_2 + 1 : j1_2);
             unsigned int q_slot_1 = 0;
             unsigned int k_stage_1 = 0;
+            unsigned int acc_g_0 = 0;
+            unsigned int acc_g_1 = 0;
             unsigned int _phase_q_full = 0;
             unsigned int _phase_k_full = 0;
-            unsigned int _phase_acc_empty_0 = 1;
+            unsigned int _phase_acc_empty = 1;
             unsigned int _phase_acc_empty_1 = 1;
             #pragma unroll 1
             for (int j_2 = j0_2; j_2 < j_end_2; j_2++) {
@@ -1691,207 +1726,69 @@ kernel_cake_msa_icp_indexer_cef6a25ea6bc74e445b7(const __grid_constant__ CUtenso
                 int kt1_2 = (ce_2 + 2 - 1) / 2;
                 if (kt1_2 > kt0_2) {
                     mbarrier_wait(q_full_addr + (q_slot_1) * 8, _phase_q_full);
-                    asm volatile("tcgen05.fence::after_thread_sync;");
-                    uint32_t _elected_0 = elect_sync();
-                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                    #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
-                    #endif
-                    {
-                        uint64_t _tcgen05_cp_desc_1 = ((((uint64_t)(smem_q_addr + q_slot_1 * 2 * 16384 + 0)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
-                        asm volatile(
-                            "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
-                            "@leader tcgen05.cp.cta_group::1.128x256b [%0], %1;\n\t}\n"
-                            :: "r"((uint32_t)(taddr + 256 + q_slot_1 * 64)), "l"(_tcgen05_cp_desc_1), "r"(_elected_0)
-                            : "memory");
-                    }
-                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                    #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
-                    #endif
-                    {
-                        uint64_t _tcgen05_cp_desc_2 = ((((uint64_t)(smem_q_addr + q_slot_1 * 2 * 16384 + 32)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
-                        asm volatile(
-                            "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
-                            "@leader tcgen05.cp.cta_group::1.128x256b [%0], %1;\n\t}\n"
-                            :: "r"((uint32_t)(taddr + 264 + q_slot_1 * 64)), "l"(_tcgen05_cp_desc_2), "r"(_elected_0)
-                            : "memory");
-                    }
-                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                    #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
-                    #endif
-                    {
-                        uint64_t _tcgen05_cp_desc_3 = ((((uint64_t)(smem_q_addr + q_slot_1 * 2 * 16384 + 64)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
-                        asm volatile(
-                            "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
-                            "@leader tcgen05.cp.cta_group::1.128x256b [%0], %1;\n\t}\n"
-                            :: "r"((uint32_t)(taddr + 272 + q_slot_1 * 64)), "l"(_tcgen05_cp_desc_3), "r"(_elected_0)
-                            : "memory");
-                    }
-                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                    #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
-                    #endif
-                    {
-                        uint64_t _tcgen05_cp_desc_4 = ((((uint64_t)(smem_q_addr + q_slot_1 * 2 * 16384 + 96)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
-                        asm volatile(
-                            "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
-                            "@leader tcgen05.cp.cta_group::1.128x256b [%0], %1;\n\t}\n"
-                            :: "r"((uint32_t)(taddr + 280 + q_slot_1 * 64)), "l"(_tcgen05_cp_desc_4), "r"(_elected_0)
-                            : "memory");
-                    }
-                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                    #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
-                    #endif
-                    {
-                        uint64_t _tcgen05_cp_desc_5 = ((((uint64_t)(smem_q_addr + (q_slot_1 * 2 + 1) * 16384 + 0)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
-                        asm volatile(
-                            "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
-                            "@leader tcgen05.cp.cta_group::1.128x256b [%0], %1;\n\t}\n"
-                            :: "r"((uint32_t)(taddr + 288 + q_slot_1 * 64)), "l"(_tcgen05_cp_desc_5), "r"(_elected_0)
-                            : "memory");
-                    }
-                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                    #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
-                    #endif
-                    {
-                        uint64_t _tcgen05_cp_desc_6 = ((((uint64_t)(smem_q_addr + (q_slot_1 * 2 + 1) * 16384 + 32)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
-                        asm volatile(
-                            "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
-                            "@leader tcgen05.cp.cta_group::1.128x256b [%0], %1;\n\t}\n"
-                            :: "r"((uint32_t)(taddr + 296 + q_slot_1 * 64)), "l"(_tcgen05_cp_desc_6), "r"(_elected_0)
-                            : "memory");
-                    }
-                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                    #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
-                    #endif
-                    {
-                        uint64_t _tcgen05_cp_desc_7 = ((((uint64_t)(smem_q_addr + (q_slot_1 * 2 + 1) * 16384 + 64)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
-                        asm volatile(
-                            "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
-                            "@leader tcgen05.cp.cta_group::1.128x256b [%0], %1;\n\t}\n"
-                            :: "r"((uint32_t)(taddr + 304 + q_slot_1 * 64)), "l"(_tcgen05_cp_desc_7), "r"(_elected_0)
-                            : "memory");
-                    }
-                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                    #error "Tcgen05Cp requires Blackwell tcgen05.cp support"
-                    #endif
-                    {
-                        uint64_t _tcgen05_cp_desc_8 = ((((uint64_t)(smem_q_addr + (q_slot_1 * 2 + 1) * 16384 + 96)) & 0x7FFFFULL) >> 4ULL) | (((((uint64_t)(16)) & 0x3FFFFULL) >> 4ULL) << 16ULL) | (((((uint64_t)(1024)) & 0x3FFFFULL) >> 4ULL) << 32ULL) | (1ULL << 46ULL) | (2ULL << 61ULL);
-                        asm volatile(
-                            "{\n\t.reg .pred leader;\n\tsetp.ne.b32 leader, %2, 0;\n\t"
-                            "@leader tcgen05.cp.cta_group::1.128x256b [%0], %1;\n\t}\n"
-                            :: "r"((uint32_t)(taddr + 312 + q_slot_1 * 64)), "l"(_tcgen05_cp_desc_8), "r"(_elected_0)
-                            : "memory");
-                    }
                     #pragma unroll 1
                     for (int kt_2 = kt0_2; kt_2 < kt1_2; kt_2++) {
                         mbarrier_wait(k_full_addr + (k_stage_1) * 8, _phase_k_full);
-                        int b_lo = make_warp_uniform((((smem_k_addr) >> 4) & 0x7FFF) + (k_stage_1) * 1024);
-                        mbarrier_wait(acc_empty_addr, _phase_acc_empty_0);
+                        int b_lo = make_warp_uniform((((smem_k_addr) >> 4) & 0x3FFF) + (k_stage_1) * 1024);
+                        mbarrier_wait(acc_empty_addr + (0 + acc_g_0) * 8, _phase_acc_empty);
                         asm volatile("tcgen05.fence::after_thread_sync;");
-                        if (elect_sync()) {
-                            if (q_slot_1 == 0) {
-                                asm volatile(
-                    "{\n\t"
-                    ".reg .pred p0, p1;\n\t"
-                    ".reg .b32 dhi, blo, ta, id;\n\t"
-                    ".reg .b64 db;\n\t"
-                    ""
-                    "setp.ne.b32 p0, %3, 0;\n\t"
-                    "setp.ne.b32 p1, 1, 0;\n\t"
-                    ""
-                    "mov.b32 dhi, 0x40004040;\n\t"
-                    "mov.b32 id, 673185808;\n\t"
-                    "mov.b32 ta, %2;\n\t"
-                    "mov.b32 blo, %1;\n\t"
-                    "mov.b64 db, {blo, dhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f8f6f4 [%0], [ta], db, id, p0;\n\t"
-                    "add.u32 ta, ta, 16;\n\t"
-                    "add.u32 blo, blo, 4;\n\t"
-                    "mov.b64 db, {blo, dhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f8f6f4 [%0], [ta], db, id, p1;\n\t"
-                    "}\n"
-                    :: "r"((tmem_acc + (0 * 128))), "r"(b_lo), "r"(tq_0), "r"(0) : "memory");
+                        int a_lo_0 = make_warp_uniform((((smem_q_addr) >> 4) & 0x3FFF) + (q_slot_1 * 2) * 1024);
+                        {
+                            uint64_t _mma_ss_a_desc_0 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(a_lo_0);
+                            uint64_t _mma_ss_b_desc_0 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(b_lo);
+                            if (elect_sync()) {
+                                tcgen05_mma_f8f6f4((tmem_acc + ((0 + acc_g_0) * 128)), _mma_ss_a_desc_0, _mma_ss_b_desc_0, 136314896, 0);
                             }
-                            if (q_slot_1 == 1) {
-                                asm volatile(
-                    "{\n\t"
-                    ".reg .pred p0, p1;\n\t"
-                    ".reg .b32 dhi, blo, ta, id;\n\t"
-                    ".reg .b64 db;\n\t"
-                    ""
-                    "setp.ne.b32 p0, %3, 0;\n\t"
-                    "setp.ne.b32 p1, 1, 0;\n\t"
-                    ""
-                    "mov.b32 dhi, 0x40004040;\n\t"
-                    "mov.b32 id, 673185808;\n\t"
-                    "mov.b32 ta, %2;\n\t"
-                    "mov.b32 blo, %1;\n\t"
-                    "mov.b64 db, {blo, dhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f8f6f4 [%0], [ta], db, id, p0;\n\t"
-                    "add.u32 ta, ta, 16;\n\t"
-                    "add.u32 blo, blo, 4;\n\t"
-                    "mov.b64 db, {blo, dhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f8f6f4 [%0], [ta], db, id, p1;\n\t"
-                    "}\n"
-                    :: "r"((tmem_acc + (0 * 128))), "r"(b_lo), "r"(tq_2), "r"(0) : "memory");
+                            incr_smem_desc_lo(_mma_ss_a_desc_0, 2U);
+                            incr_smem_desc_lo(_mma_ss_b_desc_0, 2U);
+                            if (elect_sync()) {
+                                tcgen05_mma_f8f6f4((tmem_acc + ((0 + acc_g_0) * 128)), _mma_ss_a_desc_0, _mma_ss_b_desc_0, 136314896, 1);
+                            }
+                            incr_smem_desc_lo(_mma_ss_a_desc_0, 2U);
+                            incr_smem_desc_lo(_mma_ss_b_desc_0, 2U);
+                            if (elect_sync()) {
+                                tcgen05_mma_f8f6f4((tmem_acc + ((0 + acc_g_0) * 128)), _mma_ss_a_desc_0, _mma_ss_b_desc_0, 136314896, 1);
+                            }
+                            incr_smem_desc_lo(_mma_ss_a_desc_0, 2U);
+                            incr_smem_desc_lo(_mma_ss_b_desc_0, 2U);
+                            if (elect_sync()) {
+                                tcgen05_mma_f8f6f4((tmem_acc + ((0 + acc_g_0) * 128)), _mma_ss_a_desc_0, _mma_ss_b_desc_0, 136314896, 1);
                             }
                         }
-                        elect_commit(acc_full_addr);
-                        mbarrier_wait(acc_empty_addr + 8, _phase_acc_empty_1);
+                        elect_commit(acc_full_addr + (0 + acc_g_0) * 8);
+                        mbarrier_wait(acc_empty_addr + (1 + acc_g_1) * 8, _phase_acc_empty_1);
                         asm volatile("tcgen05.fence::after_thread_sync;");
-                        if (elect_sync()) {
-                            if (q_slot_1 == 0) {
-                                asm volatile(
-                    "{\n\t"
-                    ".reg .pred p0, p1;\n\t"
-                    ".reg .b32 dhi, blo, ta, id;\n\t"
-                    ".reg .b64 db;\n\t"
-                    ""
-                    "setp.ne.b32 p0, %3, 0;\n\t"
-                    "setp.ne.b32 p1, 1, 0;\n\t"
-                    ""
-                    "mov.b32 dhi, 0x40004040;\n\t"
-                    "mov.b32 id, 673185808;\n\t"
-                    "mov.b32 ta, %2;\n\t"
-                    "mov.b32 blo, %1;\n\t"
-                    "mov.b64 db, {blo, dhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f8f6f4 [%0], [ta], db, id, p0;\n\t"
-                    "add.u32 ta, ta, 16;\n\t"
-                    "add.u32 blo, blo, 4;\n\t"
-                    "mov.b64 db, {blo, dhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f8f6f4 [%0], [ta], db, id, p1;\n\t"
-                    "}\n"
-                    :: "r"((tmem_acc + (1 * 128))), "r"(b_lo), "r"(tq_1), "r"(0) : "memory");
+                        int a_lo_1 = make_warp_uniform((((smem_q_addr) >> 4) & 0x3FFF) + (q_slot_1 * 2 + 1) * 1024);
+                        {
+                            uint64_t _mma_ss_a_desc_1 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(a_lo_1);
+                            uint64_t _mma_ss_b_desc_1 = (static_cast<uint64_t>(0x40004040U) << 32) | static_cast<uint32_t>(b_lo);
+                            if (elect_sync()) {
+                                tcgen05_mma_f8f6f4((tmem_acc + ((1 + acc_g_1) * 128)), _mma_ss_a_desc_1, _mma_ss_b_desc_1, 136314896, 0);
                             }
-                            if (q_slot_1 == 1) {
-                                asm volatile(
-                    "{\n\t"
-                    ".reg .pred p0, p1;\n\t"
-                    ".reg .b32 dhi, blo, ta, id;\n\t"
-                    ".reg .b64 db;\n\t"
-                    ""
-                    "setp.ne.b32 p0, %3, 0;\n\t"
-                    "setp.ne.b32 p1, 1, 0;\n\t"
-                    ""
-                    "mov.b32 dhi, 0x40004040;\n\t"
-                    "mov.b32 id, 673185808;\n\t"
-                    "mov.b32 ta, %2;\n\t"
-                    "mov.b32 blo, %1;\n\t"
-                    "mov.b64 db, {blo, dhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f8f6f4 [%0], [ta], db, id, p0;\n\t"
-                    "add.u32 ta, ta, 16;\n\t"
-                    "add.u32 blo, blo, 4;\n\t"
-                    "mov.b64 db, {blo, dhi};\n\t"
-                    "tcgen05.mma.cta_group::1.kind::f8f6f4 [%0], [ta], db, id, p1;\n\t"
-                    "}\n"
-                    :: "r"((tmem_acc + (1 * 128))), "r"(b_lo), "r"(tq_3), "r"(0) : "memory");
+                            incr_smem_desc_lo(_mma_ss_a_desc_1, 2U);
+                            incr_smem_desc_lo(_mma_ss_b_desc_1, 2U);
+                            if (elect_sync()) {
+                                tcgen05_mma_f8f6f4((tmem_acc + ((1 + acc_g_1) * 128)), _mma_ss_a_desc_1, _mma_ss_b_desc_1, 136314896, 1);
+                            }
+                            incr_smem_desc_lo(_mma_ss_a_desc_1, 2U);
+                            incr_smem_desc_lo(_mma_ss_b_desc_1, 2U);
+                            if (elect_sync()) {
+                                tcgen05_mma_f8f6f4((tmem_acc + ((1 + acc_g_1) * 128)), _mma_ss_a_desc_1, _mma_ss_b_desc_1, 136314896, 1);
+                            }
+                            incr_smem_desc_lo(_mma_ss_a_desc_1, 2U);
+                            incr_smem_desc_lo(_mma_ss_b_desc_1, 2U);
+                            if (elect_sync()) {
+                                tcgen05_mma_f8f6f4((tmem_acc + ((1 + acc_g_1) * 128)), _mma_ss_a_desc_1, _mma_ss_b_desc_1, 136314896, 1);
                             }
                         }
-                        elect_commit(acc_full_addr + 8);
+                        elect_commit(acc_full_addr + (1 + acc_g_1) * 8);
                         elect_commit(k_empty_addr + (k_stage_1) * 8);
                         k_stage_1 += 1;
                         if (k_stage_1 == 8) { k_stage_1 = 0; _phase_k_full ^= 1; }
-                        _phase_acc_empty_0 ^= 1;
-                        _phase_acc_empty_1 ^= 1;
+                        acc_g_0 += 2;
+                        if (acc_g_0 >= 4) { acc_g_0 -= 4; _phase_acc_empty ^= 1; }
+                        acc_g_1 += 2;
+                        if (acc_g_1 >= 4) { acc_g_1 -= 4; _phase_acc_empty_1 ^= 1; }
                     }
                     elect_commit(q_empty_addr + (q_slot_1) * 8);
                     q_slot_1 += 1;

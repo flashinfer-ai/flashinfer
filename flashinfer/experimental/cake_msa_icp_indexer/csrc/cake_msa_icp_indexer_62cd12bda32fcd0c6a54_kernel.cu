@@ -40,24 +40,6 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
-#define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 512
-#define TMEM_ACC_OFFSET 0
-#define NUM_Q_PIPE_STAGES 2
-#define NUM_K_PIPE_STAGES 8
-#define NUM_ACC_PIPE_STAGES 4
-#define SMEM_SMEM_Q_OFF 1024
-#define SMEM_SMEM_Q_STAGE_BYTES 16384
-#define SMEM_SMEM_Q_STRIDE 16384
-#define SMEM_SMEM_K_OFF 66560
-#define SMEM_SMEM_K_STAGE_BYTES 16384
-#define SMEM_SMEM_K_STRIDE 16384
-#define SMEM_STAGE_OFF 197632
-#define SMEM_STAGE_STAGE_BYTES 33792
-#define SMEM_STAGE_STRIDE 33792
-#define SMEM_TOTAL 231424
-#define THREADS 320
-
 #include <math_constants.h>
 
 __device__ __forceinline__ uint32_t elect_sync() {
@@ -222,7 +204,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(320) void
-kernel_cake_msa_icp_indexer_cdcc9a2c2f7c3df64d6e(const __grid_constant__ CUtensorMap q, const __grid_constant__ CUtensorMap k, int* __restrict__ block_table, float* __restrict__ max_score, int* __restrict__ qo_lens, int* __restrict__ kv_lens, int* __restrict__ qo_indptr, int* __restrict__ qo_offset, long long* __restrict__ work_range, long long* __restrict__ work_info, int rank, int compact, int bt_stride, long long score_stride_t, long long score_stride_h, int score_cols)
+kernel_cake_msa_icp_indexer_62cd12bda32fcd0c6a54(const __grid_constant__ CUtensorMap q, const __grid_constant__ CUtensorMap k, int* __restrict__ block_table, float* __restrict__ max_score, int* __restrict__ qo_lens, int* __restrict__ kv_lens, int* __restrict__ qo_indptr, int* __restrict__ qo_offset, long long* __restrict__ work_range, long long* __restrict__ work_info, int rank, int compact, int bt_stride, long long score_stride_t, long long score_stride_h, int score_cols)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -341,11 +323,8 @@ kernel_cake_msa_icp_indexer_cdcc9a2c2f7c3df64d6e(const __grid_constant__ CUtenso
             int lrow = quarter * 32 + lane_1;
             int head = lrow % 4;
             unsigned int lane_base = (unsigned int)(quarter * 32) << 16;
-            int own = rank * 2 / 4;
+            int own = rank * 2 / 2;
             int wcols = 2;
-            if (compact == 0) {
-                wcols = 4;
-            }
             unsigned int _phase_acc_full = 0;
             #pragma unroll 1
             for (int j = j0; j < j_end; j++) {
@@ -361,8 +340,8 @@ kernel_cake_msa_icp_indexer_cdcc9a2c2f7c3df64d6e(const __grid_constant__ CUtenso
                     ce = c1;
                 }
                 int cb = ((j == j0) ? c0 : 0);
-                int kt0 = cb / 4;
-                int kt1 = (ce + 4 - 1) / 4;
+                int kt0 = cb / 2;
+                int kt1 = (ce + 2 - 1) / 2;
                 if (kt1 > kt0) {
                     int q_len = qo_lens[b];
                     int kv_len = kv_lens[b];
@@ -378,31 +357,15 @@ kernel_cake_msa_icp_indexer_cdcc9a2c2f7c3df64d6e(const __grid_constant__ CUtenso
                         u_0 = _min_0;
                     }
                     int cpre_0 = (((u_0 + 127) / 128) < (score_cols) ? ((u_0 + 127) / 128) : (score_cols));
-                    if (compact != 0) {
-                        int nvb_0 = (u_0 + 127) / 128;
-                        cpre_0 = 0;
-                        if (nvb_0 > own) {
-                            int _min_1 = (((nvb_0 - 1 - own) / 2 + 1) < (score_cols) ? ((nvb_0 - 1 - own) / 2 + 1) : (score_cols));
-                            cpre_0 = _min_1;
-                        }
-                    }
                     windows[0] = c_first - c_first % 32;
                     long long off_0 = (long long)(t_base + r_0) * score_stride_t + (long long)head * score_stride_h;
                     int r_1 = it * 64 + 32 + lrow / 4;
                     int u_1 = 0;
                     if (r_1 < q_len) {
-                        int _min_2 = ((kv_len) < (q_off + r_1 + 1) ? (kv_len) : (q_off + r_1 + 1));
-                        u_1 = _min_2;
+                        int _min_1 = ((kv_len) < (q_off + r_1 + 1) ? (kv_len) : (q_off + r_1 + 1));
+                        u_1 = _min_1;
                     }
                     int cpre_1 = (((u_1 + 127) / 128) < (score_cols) ? ((u_1 + 127) / 128) : (score_cols));
-                    if (compact != 0) {
-                        int nvb_1 = (u_1 + 127) / 128;
-                        cpre_1 = 0;
-                        if (nvb_1 > own) {
-                            int _min_3 = (((nvb_1 - 1 - own) / 2 + 1) < (score_cols) ? ((nvb_1 - 1 - own) / 2 + 1) : (score_cols));
-                            cpre_1 = _min_3;
-                        }
-                    }
                     windows[1] = c_first - c_first % 32;
                     long long off_1 = (long long)(t_base + r_1) * score_stride_t + (long long)head * score_stride_h;
                     if (use_stage == 1) {
@@ -443,264 +406,254 @@ kernel_cake_msa_icp_indexer_cdcc9a2c2f7c3df64d6e(const __grid_constant__ CUtenso
                                 int row_stage_0 = (quarter * 32 + lane_1) * 33 - windows[0];
                                 int lim_0 = cpre_0;
                                 int p_0 = kt_0 * 2;
-                                int nvis_0 = ((u_0 - 256 * p_0 - 64 * rank) > (0) ? (u_0 - 256 * p_0 - 64 * rank) : (0));
+                                int nvis_0 = (((u_0 - 128 * p_0 - rank + 2 - 1) / 2) > (0) ? ((u_0 - 128 * p_0 - rank + 2 - 1) / 2) : (0));
                                 float m_0 = -CUDART_INF_F;
                                 int masked_0 = 1;
                                 if (masked_0 != 0) {
                                     m_0 = -CUDART_INF_F;
-                                    int _warp_vote_4 = __any_sync(0xFFFFFFFF, nvis_0 < 32);
-                                    if (_warp_vote_4 != 0) {
-                                        uint32_t _thresh_mask_5;
+                                    int _warp_vote_2 = __any_sync(0xFFFFFFFF, nvis_0 < 32);
+                                    if (_warp_vote_2 != 0) {
+                                        uint32_t _thresh_mask_3;
                                         {
-                                            int _lim_6 = nvis_0;
-                                            if (_lim_6 <= 0) { _thresh_mask_5 = 0u; }
-                                            else if (_lim_6 >= 32) { _thresh_mask_5 = 0xFFFFFFFFu; }
+                                            int _lim_4 = nvis_0;
+                                            if (_lim_4 <= 0) { _thresh_mask_3 = 0u; }
+                                            else if (_lim_4 >= 32) { _thresh_mask_3 = 0xFFFFFFFFu; }
                                             else {
                                                 asm volatile("{"
                                                     ".reg .u32 t;\n\t"
                                                     "shl.b32 t, 1, %1;\n\t"
                                                     "add.u32 %0, t, -1;\n\t"
-                                                    "}" : "=r"(_thresh_mask_5) : "r"(_lim_6));
+                                                    "}" : "=r"(_thresh_mask_3) : "r"(_lim_4));
                                             }
                                         }
-                                        if (!(_thresh_mask_5 & (1u << 0))) v_0[0] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_5 & (1u << 1))) v_0[1] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_5 & (1u << 2))) v_0[2] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_5 & (1u << 3))) v_0[3] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_5 & (1u << 4))) v_0[4] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_5 & (1u << 5))) v_0[5] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_5 & (1u << 6))) v_0[6] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_5 & (1u << 7))) v_0[7] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_5 & (1u << 8))) v_0[8] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_5 & (1u << 9))) v_0[9] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_5 & (1u << 10))) v_0[10] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_5 & (1u << 11))) v_0[11] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_5 & (1u << 12))) v_0[12] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_5 & (1u << 13))) v_0[13] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_5 & (1u << 14))) v_0[14] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_5 & (1u << 15))) v_0[15] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_5 & (1u << 16))) v_0[16] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_5 & (1u << 17))) v_0[17] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_5 & (1u << 18))) v_0[18] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_5 & (1u << 19))) v_0[19] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_5 & (1u << 20))) v_0[20] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_5 & (1u << 21))) v_0[21] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_5 & (1u << 22))) v_0[22] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_5 & (1u << 23))) v_0[23] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_5 & (1u << 24))) v_0[24] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_5 & (1u << 25))) v_0[25] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_5 & (1u << 26))) v_0[26] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_5 & (1u << 27))) v_0[27] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_5 & (1u << 28))) v_0[28] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_5 & (1u << 29))) v_0[29] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_5 & (1u << 30))) v_0[30] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_5 & (1u << 31))) v_0[31] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_3 & (1u << 0))) v_0[0] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_3 & (1u << 1))) v_0[1] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_3 & (1u << 2))) v_0[2] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_3 & (1u << 3))) v_0[3] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_3 & (1u << 4))) v_0[4] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_3 & (1u << 5))) v_0[5] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_3 & (1u << 6))) v_0[6] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_3 & (1u << 7))) v_0[7] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_3 & (1u << 8))) v_0[8] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_3 & (1u << 9))) v_0[9] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_3 & (1u << 10))) v_0[10] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_3 & (1u << 11))) v_0[11] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_3 & (1u << 12))) v_0[12] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_3 & (1u << 13))) v_0[13] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_3 & (1u << 14))) v_0[14] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_3 & (1u << 15))) v_0[15] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_3 & (1u << 16))) v_0[16] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_3 & (1u << 17))) v_0[17] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_3 & (1u << 18))) v_0[18] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_3 & (1u << 19))) v_0[19] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_3 & (1u << 20))) v_0[20] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_3 & (1u << 21))) v_0[21] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_3 & (1u << 22))) v_0[22] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_3 & (1u << 23))) v_0[23] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_3 & (1u << 24))) v_0[24] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_3 & (1u << 25))) v_0[25] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_3 & (1u << 26))) v_0[26] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_3 & (1u << 27))) v_0[27] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_3 & (1u << 28))) v_0[28] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_3 & (1u << 29))) v_0[29] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_3 & (1u << 30))) v_0[30] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_3 & (1u << 31))) v_0[31] = -CUDART_INF_F;
                                     }
                                     float part_0 = -CUDART_INF_F;
-                                    float2 _reg_reduce_max2_8 = {-CAKE_INF, -CAKE_INF};
-                                    _reg_reduce_max2_8.x = max_noftz(_reg_reduce_max2_8.x, max_noftz(v_0[0], v_0[1]));
-                                    _reg_reduce_max2_8.y = max_noftz(_reg_reduce_max2_8.y, max_noftz(v_0[2], v_0[3]));
-                                    _reg_reduce_max2_8.x = max_noftz(_reg_reduce_max2_8.x, max_noftz(v_0[4], v_0[5]));
-                                    _reg_reduce_max2_8.y = max_noftz(_reg_reduce_max2_8.y, max_noftz(v_0[6], v_0[7]));
-                                    _reg_reduce_max2_8.x = max_noftz(_reg_reduce_max2_8.x, max_noftz(v_0[8], v_0[9]));
-                                    _reg_reduce_max2_8.y = max_noftz(_reg_reduce_max2_8.y, max_noftz(v_0[10], v_0[11]));
-                                    _reg_reduce_max2_8.x = max_noftz(_reg_reduce_max2_8.x, max_noftz(v_0[12], v_0[13]));
-                                    _reg_reduce_max2_8.y = max_noftz(_reg_reduce_max2_8.y, max_noftz(v_0[14], v_0[15]));
-                                    _reg_reduce_max2_8.x = max_noftz(_reg_reduce_max2_8.x, max_noftz(v_0[16], v_0[17]));
-                                    _reg_reduce_max2_8.y = max_noftz(_reg_reduce_max2_8.y, max_noftz(v_0[18], v_0[19]));
-                                    _reg_reduce_max2_8.x = max_noftz(_reg_reduce_max2_8.x, max_noftz(v_0[20], v_0[21]));
-                                    _reg_reduce_max2_8.y = max_noftz(_reg_reduce_max2_8.y, max_noftz(v_0[22], v_0[23]));
-                                    _reg_reduce_max2_8.x = max_noftz(_reg_reduce_max2_8.x, max_noftz(v_0[24], v_0[25]));
-                                    _reg_reduce_max2_8.y = max_noftz(_reg_reduce_max2_8.y, max_noftz(v_0[26], v_0[27]));
-                                    _reg_reduce_max2_8.x = max_noftz(_reg_reduce_max2_8.x, max_noftz(v_0[28], v_0[29]));
-                                    _reg_reduce_max2_8.y = max_noftz(_reg_reduce_max2_8.y, max_noftz(v_0[30], v_0[31]));
-                                    float _reg_array_reduce_7 = row_max_reduce(_reg_reduce_max2_8);
-                                    part_0 = _reg_array_reduce_7;
+                                    float2 _reg_reduce_max2_6 = {-CUDART_INF_F, -CUDART_INF_F};
+                                    _reg_reduce_max2_6.x = max_noftz(_reg_reduce_max2_6.x, max_noftz(v_0[0], v_0[1]));
+                                    _reg_reduce_max2_6.y = max_noftz(_reg_reduce_max2_6.y, max_noftz(v_0[2], v_0[3]));
+                                    _reg_reduce_max2_6.x = max_noftz(_reg_reduce_max2_6.x, max_noftz(v_0[4], v_0[5]));
+                                    _reg_reduce_max2_6.y = max_noftz(_reg_reduce_max2_6.y, max_noftz(v_0[6], v_0[7]));
+                                    _reg_reduce_max2_6.x = max_noftz(_reg_reduce_max2_6.x, max_noftz(v_0[8], v_0[9]));
+                                    _reg_reduce_max2_6.y = max_noftz(_reg_reduce_max2_6.y, max_noftz(v_0[10], v_0[11]));
+                                    _reg_reduce_max2_6.x = max_noftz(_reg_reduce_max2_6.x, max_noftz(v_0[12], v_0[13]));
+                                    _reg_reduce_max2_6.y = max_noftz(_reg_reduce_max2_6.y, max_noftz(v_0[14], v_0[15]));
+                                    _reg_reduce_max2_6.x = max_noftz(_reg_reduce_max2_6.x, max_noftz(v_0[16], v_0[17]));
+                                    _reg_reduce_max2_6.y = max_noftz(_reg_reduce_max2_6.y, max_noftz(v_0[18], v_0[19]));
+                                    _reg_reduce_max2_6.x = max_noftz(_reg_reduce_max2_6.x, max_noftz(v_0[20], v_0[21]));
+                                    _reg_reduce_max2_6.y = max_noftz(_reg_reduce_max2_6.y, max_noftz(v_0[22], v_0[23]));
+                                    _reg_reduce_max2_6.x = max_noftz(_reg_reduce_max2_6.x, max_noftz(v_0[24], v_0[25]));
+                                    _reg_reduce_max2_6.y = max_noftz(_reg_reduce_max2_6.y, max_noftz(v_0[26], v_0[27]));
+                                    _reg_reduce_max2_6.x = max_noftz(_reg_reduce_max2_6.x, max_noftz(v_0[28], v_0[29]));
+                                    _reg_reduce_max2_6.y = max_noftz(_reg_reduce_max2_6.y, max_noftz(v_0[30], v_0[31]));
+                                    float _reg_array_reduce_5 = row_max_reduce(_reg_reduce_max2_6);
+                                    part_0 = _reg_array_reduce_5;
                                     m_0 = fmaxf(m_0, part_0);
-                                    int _warp_vote_9 = __any_sync(0xFFFFFFFF, nvis_0 < 64);
-                                    if (_warp_vote_9 != 0) {
-                                        uint32_t _thresh_mask_10;
+                                    int _warp_vote_7 = __any_sync(0xFFFFFFFF, nvis_0 < 64);
+                                    if (_warp_vote_7 != 0) {
+                                        uint32_t _thresh_mask_8;
                                         {
-                                            int _lim_11 = nvis_0 - 32;
-                                            if (_lim_11 <= 0) { _thresh_mask_10 = 0u; }
-                                            else if (_lim_11 >= 32) { _thresh_mask_10 = 0xFFFFFFFFu; }
+                                            int _lim_9 = nvis_0 - 32;
+                                            if (_lim_9 <= 0) { _thresh_mask_8 = 0u; }
+                                            else if (_lim_9 >= 32) { _thresh_mask_8 = 0xFFFFFFFFu; }
                                             else {
                                                 asm volatile("{"
                                                     ".reg .u32 t;\n\t"
                                                     "shl.b32 t, 1, %1;\n\t"
                                                     "add.u32 %0, t, -1;\n\t"
-                                                    "}" : "=r"(_thresh_mask_10) : "r"(_lim_11));
+                                                    "}" : "=r"(_thresh_mask_8) : "r"(_lim_9));
                                             }
                                         }
-                                        if (!(_thresh_mask_10 & (1u << 0))) v_0[32] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_10 & (1u << 1))) v_0[33] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_10 & (1u << 2))) v_0[34] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_10 & (1u << 3))) v_0[35] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_10 & (1u << 4))) v_0[36] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_10 & (1u << 5))) v_0[37] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_10 & (1u << 6))) v_0[38] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_10 & (1u << 7))) v_0[39] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_10 & (1u << 8))) v_0[40] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_10 & (1u << 9))) v_0[41] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_10 & (1u << 10))) v_0[42] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_10 & (1u << 11))) v_0[43] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_10 & (1u << 12))) v_0[44] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_10 & (1u << 13))) v_0[45] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_10 & (1u << 14))) v_0[46] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_10 & (1u << 15))) v_0[47] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_10 & (1u << 16))) v_0[48] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_10 & (1u << 17))) v_0[49] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_10 & (1u << 18))) v_0[50] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_10 & (1u << 19))) v_0[51] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_10 & (1u << 20))) v_0[52] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_10 & (1u << 21))) v_0[53] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_10 & (1u << 22))) v_0[54] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_10 & (1u << 23))) v_0[55] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_10 & (1u << 24))) v_0[56] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_10 & (1u << 25))) v_0[57] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_10 & (1u << 26))) v_0[58] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_10 & (1u << 27))) v_0[59] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_10 & (1u << 28))) v_0[60] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_10 & (1u << 29))) v_0[61] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_10 & (1u << 30))) v_0[62] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_10 & (1u << 31))) v_0[63] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_8 & (1u << 0))) v_0[32] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_8 & (1u << 1))) v_0[33] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_8 & (1u << 2))) v_0[34] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_8 & (1u << 3))) v_0[35] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_8 & (1u << 4))) v_0[36] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_8 & (1u << 5))) v_0[37] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_8 & (1u << 6))) v_0[38] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_8 & (1u << 7))) v_0[39] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_8 & (1u << 8))) v_0[40] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_8 & (1u << 9))) v_0[41] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_8 & (1u << 10))) v_0[42] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_8 & (1u << 11))) v_0[43] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_8 & (1u << 12))) v_0[44] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_8 & (1u << 13))) v_0[45] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_8 & (1u << 14))) v_0[46] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_8 & (1u << 15))) v_0[47] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_8 & (1u << 16))) v_0[48] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_8 & (1u << 17))) v_0[49] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_8 & (1u << 18))) v_0[50] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_8 & (1u << 19))) v_0[51] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_8 & (1u << 20))) v_0[52] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_8 & (1u << 21))) v_0[53] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_8 & (1u << 22))) v_0[54] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_8 & (1u << 23))) v_0[55] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_8 & (1u << 24))) v_0[56] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_8 & (1u << 25))) v_0[57] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_8 & (1u << 26))) v_0[58] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_8 & (1u << 27))) v_0[59] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_8 & (1u << 28))) v_0[60] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_8 & (1u << 29))) v_0[61] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_8 & (1u << 30))) v_0[62] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_8 & (1u << 31))) v_0[63] = -CUDART_INF_F;
                                     }
                                     float part_1 = -CUDART_INF_F;
-                                    float2 _reg_reduce_max2_13 = {-CAKE_INF, -CAKE_INF};
-                                    row_max_x32_accum(&v_0[(32) + 0], _reg_reduce_max2_13);
-                                    float _reg_array_reduce_12 = row_max_reduce(_reg_reduce_max2_13);
-                                    part_1 = _reg_array_reduce_12;
+                                    float2 _reg_reduce_max2_11 = {-CUDART_INF_F, -CUDART_INF_F};
+                                    row_max_x32_accum(&v_0[(32) + 0], _reg_reduce_max2_11);
+                                    float _reg_array_reduce_10 = row_max_reduce(_reg_reduce_max2_11);
+                                    part_1 = _reg_array_reduce_10;
                                     m_0 = fmaxf(m_0, part_1);
                                 }
                                 m_0 = ((m_0 == 0.0f) ? 0.0f : m_0);
-                                if (compact != 0) {
-                                    stage[row_stage_0 + p_0] = m_0;
-                                } else {
-                                    stage[row_stage_0 + 2 * p_0 + own] = m_0;
-                                    stage[row_stage_0 + 2 * p_0 + 1 - own] = -CUDART_INF_F;
-                                }
+                                stage[row_stage_0 + p_0] = m_0;
                                 int p_1 = kt_0 * 2 + 1;
-                                int nvis_1 = ((u_0 - 256 * p_1 - 64 * rank) > (0) ? (u_0 - 256 * p_1 - 64 * rank) : (0));
+                                int nvis_1 = (((u_0 - 128 * p_1 - rank + 2 - 1) / 2) > (0) ? ((u_0 - 128 * p_1 - rank + 2 - 1) / 2) : (0));
                                 float m_1 = -CUDART_INF_F;
                                 int masked_1 = 1;
                                 if (masked_1 != 0) {
                                     m_1 = -CUDART_INF_F;
-                                    int _warp_vote_14 = __any_sync(0xFFFFFFFF, nvis_1 < 32);
-                                    if (_warp_vote_14 != 0) {
-                                        uint32_t _thresh_mask_15;
+                                    int _warp_vote_12 = __any_sync(0xFFFFFFFF, nvis_1 < 32);
+                                    if (_warp_vote_12 != 0) {
+                                        uint32_t _thresh_mask_13;
                                         {
-                                            int _lim_16 = nvis_1;
-                                            if (_lim_16 <= 0) { _thresh_mask_15 = 0u; }
-                                            else if (_lim_16 >= 32) { _thresh_mask_15 = 0xFFFFFFFFu; }
+                                            int _lim_14 = nvis_1;
+                                            if (_lim_14 <= 0) { _thresh_mask_13 = 0u; }
+                                            else if (_lim_14 >= 32) { _thresh_mask_13 = 0xFFFFFFFFu; }
                                             else {
                                                 asm volatile("{"
                                                     ".reg .u32 t;\n\t"
                                                     "shl.b32 t, 1, %1;\n\t"
                                                     "add.u32 %0, t, -1;\n\t"
-                                                    "}" : "=r"(_thresh_mask_15) : "r"(_lim_16));
+                                                    "}" : "=r"(_thresh_mask_13) : "r"(_lim_14));
                                             }
                                         }
-                                        if (!(_thresh_mask_15 & (1u << 0))) v_0[64] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_15 & (1u << 1))) v_0[65] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_15 & (1u << 2))) v_0[66] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_15 & (1u << 3))) v_0[67] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_15 & (1u << 4))) v_0[68] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_15 & (1u << 5))) v_0[69] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_15 & (1u << 6))) v_0[70] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_15 & (1u << 7))) v_0[71] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_15 & (1u << 8))) v_0[72] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_15 & (1u << 9))) v_0[73] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_15 & (1u << 10))) v_0[74] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_15 & (1u << 11))) v_0[75] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_15 & (1u << 12))) v_0[76] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_15 & (1u << 13))) v_0[77] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_15 & (1u << 14))) v_0[78] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_15 & (1u << 15))) v_0[79] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_15 & (1u << 16))) v_0[80] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_15 & (1u << 17))) v_0[81] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_15 & (1u << 18))) v_0[82] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_15 & (1u << 19))) v_0[83] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_15 & (1u << 20))) v_0[84] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_15 & (1u << 21))) v_0[85] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_15 & (1u << 22))) v_0[86] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_15 & (1u << 23))) v_0[87] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_15 & (1u << 24))) v_0[88] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_15 & (1u << 25))) v_0[89] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_15 & (1u << 26))) v_0[90] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_15 & (1u << 27))) v_0[91] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_15 & (1u << 28))) v_0[92] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_15 & (1u << 29))) v_0[93] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_15 & (1u << 30))) v_0[94] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_15 & (1u << 31))) v_0[95] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_13 & (1u << 0))) v_0[64] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_13 & (1u << 1))) v_0[65] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_13 & (1u << 2))) v_0[66] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_13 & (1u << 3))) v_0[67] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_13 & (1u << 4))) v_0[68] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_13 & (1u << 5))) v_0[69] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_13 & (1u << 6))) v_0[70] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_13 & (1u << 7))) v_0[71] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_13 & (1u << 8))) v_0[72] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_13 & (1u << 9))) v_0[73] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_13 & (1u << 10))) v_0[74] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_13 & (1u << 11))) v_0[75] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_13 & (1u << 12))) v_0[76] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_13 & (1u << 13))) v_0[77] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_13 & (1u << 14))) v_0[78] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_13 & (1u << 15))) v_0[79] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_13 & (1u << 16))) v_0[80] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_13 & (1u << 17))) v_0[81] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_13 & (1u << 18))) v_0[82] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_13 & (1u << 19))) v_0[83] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_13 & (1u << 20))) v_0[84] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_13 & (1u << 21))) v_0[85] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_13 & (1u << 22))) v_0[86] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_13 & (1u << 23))) v_0[87] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_13 & (1u << 24))) v_0[88] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_13 & (1u << 25))) v_0[89] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_13 & (1u << 26))) v_0[90] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_13 & (1u << 27))) v_0[91] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_13 & (1u << 28))) v_0[92] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_13 & (1u << 29))) v_0[93] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_13 & (1u << 30))) v_0[94] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_13 & (1u << 31))) v_0[95] = -CUDART_INF_F;
                                     }
                                     float part_2 = -CUDART_INF_F;
-                                    float2 _reg_reduce_max2_18 = {-CAKE_INF, -CAKE_INF};
-                                    row_max_x32_accum(&v_0[(64) + 0], _reg_reduce_max2_18);
-                                    float _reg_array_reduce_17 = row_max_reduce(_reg_reduce_max2_18);
-                                    part_2 = _reg_array_reduce_17;
+                                    float2 _reg_reduce_max2_16 = {-CUDART_INF_F, -CUDART_INF_F};
+                                    row_max_x32_accum(&v_0[(64) + 0], _reg_reduce_max2_16);
+                                    float _reg_array_reduce_15 = row_max_reduce(_reg_reduce_max2_16);
+                                    part_2 = _reg_array_reduce_15;
                                     m_1 = fmaxf(m_1, part_2);
-                                    int _warp_vote_19 = __any_sync(0xFFFFFFFF, nvis_1 < 64);
-                                    if (_warp_vote_19 != 0) {
-                                        uint32_t _thresh_mask_20;
+                                    int _warp_vote_17 = __any_sync(0xFFFFFFFF, nvis_1 < 64);
+                                    if (_warp_vote_17 != 0) {
+                                        uint32_t _thresh_mask_18;
                                         {
-                                            int _lim_21 = nvis_1 - 32;
-                                            if (_lim_21 <= 0) { _thresh_mask_20 = 0u; }
-                                            else if (_lim_21 >= 32) { _thresh_mask_20 = 0xFFFFFFFFu; }
+                                            int _lim_19 = nvis_1 - 32;
+                                            if (_lim_19 <= 0) { _thresh_mask_18 = 0u; }
+                                            else if (_lim_19 >= 32) { _thresh_mask_18 = 0xFFFFFFFFu; }
                                             else {
                                                 asm volatile("{"
                                                     ".reg .u32 t;\n\t"
                                                     "shl.b32 t, 1, %1;\n\t"
                                                     "add.u32 %0, t, -1;\n\t"
-                                                    "}" : "=r"(_thresh_mask_20) : "r"(_lim_21));
+                                                    "}" : "=r"(_thresh_mask_18) : "r"(_lim_19));
                                             }
                                         }
-                                        if (!(_thresh_mask_20 & (1u << 0))) v_0[96] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_20 & (1u << 1))) v_0[97] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_20 & (1u << 2))) v_0[98] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_20 & (1u << 3))) v_0[99] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_20 & (1u << 4))) v_0[100] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_20 & (1u << 5))) v_0[101] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_20 & (1u << 6))) v_0[102] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_20 & (1u << 7))) v_0[103] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_20 & (1u << 8))) v_0[104] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_20 & (1u << 9))) v_0[105] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_20 & (1u << 10))) v_0[106] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_20 & (1u << 11))) v_0[107] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_20 & (1u << 12))) v_0[108] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_20 & (1u << 13))) v_0[109] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_20 & (1u << 14))) v_0[110] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_20 & (1u << 15))) v_0[111] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_20 & (1u << 16))) v_0[112] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_20 & (1u << 17))) v_0[113] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_20 & (1u << 18))) v_0[114] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_20 & (1u << 19))) v_0[115] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_20 & (1u << 20))) v_0[116] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_20 & (1u << 21))) v_0[117] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_20 & (1u << 22))) v_0[118] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_20 & (1u << 23))) v_0[119] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_20 & (1u << 24))) v_0[120] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_20 & (1u << 25))) v_0[121] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_20 & (1u << 26))) v_0[122] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_20 & (1u << 27))) v_0[123] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_20 & (1u << 28))) v_0[124] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_20 & (1u << 29))) v_0[125] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_20 & (1u << 30))) v_0[126] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_20 & (1u << 31))) v_0[127] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_18 & (1u << 0))) v_0[96] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_18 & (1u << 1))) v_0[97] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_18 & (1u << 2))) v_0[98] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_18 & (1u << 3))) v_0[99] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_18 & (1u << 4))) v_0[100] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_18 & (1u << 5))) v_0[101] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_18 & (1u << 6))) v_0[102] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_18 & (1u << 7))) v_0[103] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_18 & (1u << 8))) v_0[104] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_18 & (1u << 9))) v_0[105] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_18 & (1u << 10))) v_0[106] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_18 & (1u << 11))) v_0[107] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_18 & (1u << 12))) v_0[108] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_18 & (1u << 13))) v_0[109] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_18 & (1u << 14))) v_0[110] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_18 & (1u << 15))) v_0[111] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_18 & (1u << 16))) v_0[112] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_18 & (1u << 17))) v_0[113] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_18 & (1u << 18))) v_0[114] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_18 & (1u << 19))) v_0[115] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_18 & (1u << 20))) v_0[116] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_18 & (1u << 21))) v_0[117] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_18 & (1u << 22))) v_0[118] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_18 & (1u << 23))) v_0[119] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_18 & (1u << 24))) v_0[120] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_18 & (1u << 25))) v_0[121] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_18 & (1u << 26))) v_0[122] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_18 & (1u << 27))) v_0[123] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_18 & (1u << 28))) v_0[124] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_18 & (1u << 29))) v_0[125] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_18 & (1u << 30))) v_0[126] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_18 & (1u << 31))) v_0[127] = -CUDART_INF_F;
                                     }
                                     float part_3 = -CUDART_INF_F;
-                                    float2 _reg_reduce_max2_23 = {-CAKE_INF, -CAKE_INF};
-                                    row_max_x32_accum(&v_0[(96) + 0], _reg_reduce_max2_23);
-                                    float _reg_array_reduce_22 = row_max_reduce(_reg_reduce_max2_23);
-                                    part_3 = _reg_array_reduce_22;
+                                    float2 _reg_reduce_max2_21 = {-CUDART_INF_F, -CUDART_INF_F};
+                                    row_max_x32_accum(&v_0[(96) + 0], _reg_reduce_max2_21);
+                                    float _reg_array_reduce_20 = row_max_reduce(_reg_reduce_max2_21);
+                                    part_3 = _reg_array_reduce_20;
                                     m_1 = fmaxf(m_1, part_3);
                                 }
                                 m_1 = ((m_1 == 0.0f) ? 0.0f : m_1);
-                                if (compact != 0) {
-                                    stage[row_stage_0 + p_1] = m_1;
-                                } else {
-                                    stage[row_stage_0 + 2 * p_1 + own] = m_1;
-                                    stage[row_stage_0 + 2 * p_1 + 1 - own] = -CUDART_INF_F;
-                                }
+                                stage[row_stage_0 + p_1] = m_1;
                                 int c_end_0 = (kt_0 + 1) * wcols;
                                 if (c_end_0 % 32 == 0 || kt_0 == kt1 - 1) {
                                     __syncwarp();
@@ -756,264 +709,254 @@ kernel_cake_msa_icp_indexer_cdcc9a2c2f7c3df64d6e(const __grid_constant__ CUtenso
                                 int row_stage_1 = ((4 + quarter) * 32 + lane_1) * 33 - windows[1];
                                 int lim_2 = cpre_1;
                                 int p_2 = kt_0 * 2;
-                                int nvis_2 = ((u_1 - 256 * p_2 - 64 * rank) > (0) ? (u_1 - 256 * p_2 - 64 * rank) : (0));
+                                int nvis_2 = (((u_1 - 128 * p_2 - rank + 2 - 1) / 2) > (0) ? ((u_1 - 128 * p_2 - rank + 2 - 1) / 2) : (0));
                                 float m_2 = -CUDART_INF_F;
                                 int masked_2 = 1;
                                 if (masked_2 != 0) {
                                     m_2 = -CUDART_INF_F;
-                                    int _warp_vote_24 = __any_sync(0xFFFFFFFF, nvis_2 < 32);
-                                    if (_warp_vote_24 != 0) {
-                                        uint32_t _thresh_mask_25;
+                                    int _warp_vote_22 = __any_sync(0xFFFFFFFF, nvis_2 < 32);
+                                    if (_warp_vote_22 != 0) {
+                                        uint32_t _thresh_mask_23;
                                         {
-                                            int _lim_26 = nvis_2;
-                                            if (_lim_26 <= 0) { _thresh_mask_25 = 0u; }
-                                            else if (_lim_26 >= 32) { _thresh_mask_25 = 0xFFFFFFFFu; }
+                                            int _lim_24 = nvis_2;
+                                            if (_lim_24 <= 0) { _thresh_mask_23 = 0u; }
+                                            else if (_lim_24 >= 32) { _thresh_mask_23 = 0xFFFFFFFFu; }
                                             else {
                                                 asm volatile("{"
                                                     ".reg .u32 t;\n\t"
                                                     "shl.b32 t, 1, %1;\n\t"
                                                     "add.u32 %0, t, -1;\n\t"
-                                                    "}" : "=r"(_thresh_mask_25) : "r"(_lim_26));
+                                                    "}" : "=r"(_thresh_mask_23) : "r"(_lim_24));
                                             }
                                         }
-                                        if (!(_thresh_mask_25 & (1u << 0))) v_1[0] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_25 & (1u << 1))) v_1[1] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_25 & (1u << 2))) v_1[2] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_25 & (1u << 3))) v_1[3] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_25 & (1u << 4))) v_1[4] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_25 & (1u << 5))) v_1[5] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_25 & (1u << 6))) v_1[6] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_25 & (1u << 7))) v_1[7] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_25 & (1u << 8))) v_1[8] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_25 & (1u << 9))) v_1[9] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_25 & (1u << 10))) v_1[10] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_25 & (1u << 11))) v_1[11] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_25 & (1u << 12))) v_1[12] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_25 & (1u << 13))) v_1[13] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_25 & (1u << 14))) v_1[14] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_25 & (1u << 15))) v_1[15] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_25 & (1u << 16))) v_1[16] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_25 & (1u << 17))) v_1[17] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_25 & (1u << 18))) v_1[18] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_25 & (1u << 19))) v_1[19] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_25 & (1u << 20))) v_1[20] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_25 & (1u << 21))) v_1[21] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_25 & (1u << 22))) v_1[22] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_25 & (1u << 23))) v_1[23] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_25 & (1u << 24))) v_1[24] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_25 & (1u << 25))) v_1[25] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_25 & (1u << 26))) v_1[26] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_25 & (1u << 27))) v_1[27] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_25 & (1u << 28))) v_1[28] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_25 & (1u << 29))) v_1[29] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_25 & (1u << 30))) v_1[30] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_25 & (1u << 31))) v_1[31] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_23 & (1u << 0))) v_1[0] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_23 & (1u << 1))) v_1[1] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_23 & (1u << 2))) v_1[2] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_23 & (1u << 3))) v_1[3] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_23 & (1u << 4))) v_1[4] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_23 & (1u << 5))) v_1[5] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_23 & (1u << 6))) v_1[6] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_23 & (1u << 7))) v_1[7] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_23 & (1u << 8))) v_1[8] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_23 & (1u << 9))) v_1[9] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_23 & (1u << 10))) v_1[10] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_23 & (1u << 11))) v_1[11] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_23 & (1u << 12))) v_1[12] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_23 & (1u << 13))) v_1[13] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_23 & (1u << 14))) v_1[14] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_23 & (1u << 15))) v_1[15] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_23 & (1u << 16))) v_1[16] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_23 & (1u << 17))) v_1[17] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_23 & (1u << 18))) v_1[18] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_23 & (1u << 19))) v_1[19] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_23 & (1u << 20))) v_1[20] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_23 & (1u << 21))) v_1[21] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_23 & (1u << 22))) v_1[22] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_23 & (1u << 23))) v_1[23] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_23 & (1u << 24))) v_1[24] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_23 & (1u << 25))) v_1[25] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_23 & (1u << 26))) v_1[26] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_23 & (1u << 27))) v_1[27] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_23 & (1u << 28))) v_1[28] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_23 & (1u << 29))) v_1[29] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_23 & (1u << 30))) v_1[30] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_23 & (1u << 31))) v_1[31] = -CUDART_INF_F;
                                     }
                                     float part_4 = -CUDART_INF_F;
-                                    float2 _reg_reduce_max2_28 = {-CAKE_INF, -CAKE_INF};
-                                    _reg_reduce_max2_28.x = max_noftz(_reg_reduce_max2_28.x, max_noftz(v_1[0], v_1[1]));
-                                    _reg_reduce_max2_28.y = max_noftz(_reg_reduce_max2_28.y, max_noftz(v_1[2], v_1[3]));
-                                    _reg_reduce_max2_28.x = max_noftz(_reg_reduce_max2_28.x, max_noftz(v_1[4], v_1[5]));
-                                    _reg_reduce_max2_28.y = max_noftz(_reg_reduce_max2_28.y, max_noftz(v_1[6], v_1[7]));
-                                    _reg_reduce_max2_28.x = max_noftz(_reg_reduce_max2_28.x, max_noftz(v_1[8], v_1[9]));
-                                    _reg_reduce_max2_28.y = max_noftz(_reg_reduce_max2_28.y, max_noftz(v_1[10], v_1[11]));
-                                    _reg_reduce_max2_28.x = max_noftz(_reg_reduce_max2_28.x, max_noftz(v_1[12], v_1[13]));
-                                    _reg_reduce_max2_28.y = max_noftz(_reg_reduce_max2_28.y, max_noftz(v_1[14], v_1[15]));
-                                    _reg_reduce_max2_28.x = max_noftz(_reg_reduce_max2_28.x, max_noftz(v_1[16], v_1[17]));
-                                    _reg_reduce_max2_28.y = max_noftz(_reg_reduce_max2_28.y, max_noftz(v_1[18], v_1[19]));
-                                    _reg_reduce_max2_28.x = max_noftz(_reg_reduce_max2_28.x, max_noftz(v_1[20], v_1[21]));
-                                    _reg_reduce_max2_28.y = max_noftz(_reg_reduce_max2_28.y, max_noftz(v_1[22], v_1[23]));
-                                    _reg_reduce_max2_28.x = max_noftz(_reg_reduce_max2_28.x, max_noftz(v_1[24], v_1[25]));
-                                    _reg_reduce_max2_28.y = max_noftz(_reg_reduce_max2_28.y, max_noftz(v_1[26], v_1[27]));
-                                    _reg_reduce_max2_28.x = max_noftz(_reg_reduce_max2_28.x, max_noftz(v_1[28], v_1[29]));
-                                    _reg_reduce_max2_28.y = max_noftz(_reg_reduce_max2_28.y, max_noftz(v_1[30], v_1[31]));
-                                    float _reg_array_reduce_27 = row_max_reduce(_reg_reduce_max2_28);
-                                    part_4 = _reg_array_reduce_27;
+                                    float2 _reg_reduce_max2_26 = {-CUDART_INF_F, -CUDART_INF_F};
+                                    _reg_reduce_max2_26.x = max_noftz(_reg_reduce_max2_26.x, max_noftz(v_1[0], v_1[1]));
+                                    _reg_reduce_max2_26.y = max_noftz(_reg_reduce_max2_26.y, max_noftz(v_1[2], v_1[3]));
+                                    _reg_reduce_max2_26.x = max_noftz(_reg_reduce_max2_26.x, max_noftz(v_1[4], v_1[5]));
+                                    _reg_reduce_max2_26.y = max_noftz(_reg_reduce_max2_26.y, max_noftz(v_1[6], v_1[7]));
+                                    _reg_reduce_max2_26.x = max_noftz(_reg_reduce_max2_26.x, max_noftz(v_1[8], v_1[9]));
+                                    _reg_reduce_max2_26.y = max_noftz(_reg_reduce_max2_26.y, max_noftz(v_1[10], v_1[11]));
+                                    _reg_reduce_max2_26.x = max_noftz(_reg_reduce_max2_26.x, max_noftz(v_1[12], v_1[13]));
+                                    _reg_reduce_max2_26.y = max_noftz(_reg_reduce_max2_26.y, max_noftz(v_1[14], v_1[15]));
+                                    _reg_reduce_max2_26.x = max_noftz(_reg_reduce_max2_26.x, max_noftz(v_1[16], v_1[17]));
+                                    _reg_reduce_max2_26.y = max_noftz(_reg_reduce_max2_26.y, max_noftz(v_1[18], v_1[19]));
+                                    _reg_reduce_max2_26.x = max_noftz(_reg_reduce_max2_26.x, max_noftz(v_1[20], v_1[21]));
+                                    _reg_reduce_max2_26.y = max_noftz(_reg_reduce_max2_26.y, max_noftz(v_1[22], v_1[23]));
+                                    _reg_reduce_max2_26.x = max_noftz(_reg_reduce_max2_26.x, max_noftz(v_1[24], v_1[25]));
+                                    _reg_reduce_max2_26.y = max_noftz(_reg_reduce_max2_26.y, max_noftz(v_1[26], v_1[27]));
+                                    _reg_reduce_max2_26.x = max_noftz(_reg_reduce_max2_26.x, max_noftz(v_1[28], v_1[29]));
+                                    _reg_reduce_max2_26.y = max_noftz(_reg_reduce_max2_26.y, max_noftz(v_1[30], v_1[31]));
+                                    float _reg_array_reduce_25 = row_max_reduce(_reg_reduce_max2_26);
+                                    part_4 = _reg_array_reduce_25;
                                     m_2 = fmaxf(m_2, part_4);
-                                    int _warp_vote_29 = __any_sync(0xFFFFFFFF, nvis_2 < 64);
-                                    if (_warp_vote_29 != 0) {
-                                        uint32_t _thresh_mask_30;
+                                    int _warp_vote_27 = __any_sync(0xFFFFFFFF, nvis_2 < 64);
+                                    if (_warp_vote_27 != 0) {
+                                        uint32_t _thresh_mask_28;
                                         {
-                                            int _lim_31 = nvis_2 - 32;
-                                            if (_lim_31 <= 0) { _thresh_mask_30 = 0u; }
-                                            else if (_lim_31 >= 32) { _thresh_mask_30 = 0xFFFFFFFFu; }
+                                            int _lim_29 = nvis_2 - 32;
+                                            if (_lim_29 <= 0) { _thresh_mask_28 = 0u; }
+                                            else if (_lim_29 >= 32) { _thresh_mask_28 = 0xFFFFFFFFu; }
                                             else {
                                                 asm volatile("{"
                                                     ".reg .u32 t;\n\t"
                                                     "shl.b32 t, 1, %1;\n\t"
                                                     "add.u32 %0, t, -1;\n\t"
-                                                    "}" : "=r"(_thresh_mask_30) : "r"(_lim_31));
+                                                    "}" : "=r"(_thresh_mask_28) : "r"(_lim_29));
                                             }
                                         }
-                                        if (!(_thresh_mask_30 & (1u << 0))) v_1[32] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_30 & (1u << 1))) v_1[33] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_30 & (1u << 2))) v_1[34] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_30 & (1u << 3))) v_1[35] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_30 & (1u << 4))) v_1[36] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_30 & (1u << 5))) v_1[37] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_30 & (1u << 6))) v_1[38] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_30 & (1u << 7))) v_1[39] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_30 & (1u << 8))) v_1[40] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_30 & (1u << 9))) v_1[41] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_30 & (1u << 10))) v_1[42] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_30 & (1u << 11))) v_1[43] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_30 & (1u << 12))) v_1[44] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_30 & (1u << 13))) v_1[45] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_30 & (1u << 14))) v_1[46] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_30 & (1u << 15))) v_1[47] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_30 & (1u << 16))) v_1[48] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_30 & (1u << 17))) v_1[49] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_30 & (1u << 18))) v_1[50] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_30 & (1u << 19))) v_1[51] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_30 & (1u << 20))) v_1[52] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_30 & (1u << 21))) v_1[53] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_30 & (1u << 22))) v_1[54] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_30 & (1u << 23))) v_1[55] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_30 & (1u << 24))) v_1[56] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_30 & (1u << 25))) v_1[57] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_30 & (1u << 26))) v_1[58] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_30 & (1u << 27))) v_1[59] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_30 & (1u << 28))) v_1[60] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_30 & (1u << 29))) v_1[61] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_30 & (1u << 30))) v_1[62] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_30 & (1u << 31))) v_1[63] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_28 & (1u << 0))) v_1[32] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_28 & (1u << 1))) v_1[33] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_28 & (1u << 2))) v_1[34] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_28 & (1u << 3))) v_1[35] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_28 & (1u << 4))) v_1[36] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_28 & (1u << 5))) v_1[37] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_28 & (1u << 6))) v_1[38] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_28 & (1u << 7))) v_1[39] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_28 & (1u << 8))) v_1[40] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_28 & (1u << 9))) v_1[41] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_28 & (1u << 10))) v_1[42] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_28 & (1u << 11))) v_1[43] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_28 & (1u << 12))) v_1[44] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_28 & (1u << 13))) v_1[45] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_28 & (1u << 14))) v_1[46] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_28 & (1u << 15))) v_1[47] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_28 & (1u << 16))) v_1[48] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_28 & (1u << 17))) v_1[49] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_28 & (1u << 18))) v_1[50] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_28 & (1u << 19))) v_1[51] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_28 & (1u << 20))) v_1[52] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_28 & (1u << 21))) v_1[53] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_28 & (1u << 22))) v_1[54] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_28 & (1u << 23))) v_1[55] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_28 & (1u << 24))) v_1[56] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_28 & (1u << 25))) v_1[57] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_28 & (1u << 26))) v_1[58] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_28 & (1u << 27))) v_1[59] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_28 & (1u << 28))) v_1[60] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_28 & (1u << 29))) v_1[61] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_28 & (1u << 30))) v_1[62] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_28 & (1u << 31))) v_1[63] = -CUDART_INF_F;
                                     }
                                     float part_5 = -CUDART_INF_F;
-                                    float2 _reg_reduce_max2_33 = {-CAKE_INF, -CAKE_INF};
-                                    row_max_x32_accum(&v_1[(32) + 0], _reg_reduce_max2_33);
-                                    float _reg_array_reduce_32 = row_max_reduce(_reg_reduce_max2_33);
-                                    part_5 = _reg_array_reduce_32;
+                                    float2 _reg_reduce_max2_31 = {-CUDART_INF_F, -CUDART_INF_F};
+                                    row_max_x32_accum(&v_1[(32) + 0], _reg_reduce_max2_31);
+                                    float _reg_array_reduce_30 = row_max_reduce(_reg_reduce_max2_31);
+                                    part_5 = _reg_array_reduce_30;
                                     m_2 = fmaxf(m_2, part_5);
                                 }
                                 m_2 = ((m_2 == 0.0f) ? 0.0f : m_2);
-                                if (compact != 0) {
-                                    stage[row_stage_1 + p_2] = m_2;
-                                } else {
-                                    stage[row_stage_1 + 2 * p_2 + own] = m_2;
-                                    stage[row_stage_1 + 2 * p_2 + 1 - own] = -CUDART_INF_F;
-                                }
+                                stage[row_stage_1 + p_2] = m_2;
                                 int p_3 = kt_0 * 2 + 1;
-                                int nvis_3 = ((u_1 - 256 * p_3 - 64 * rank) > (0) ? (u_1 - 256 * p_3 - 64 * rank) : (0));
+                                int nvis_3 = (((u_1 - 128 * p_3 - rank + 2 - 1) / 2) > (0) ? ((u_1 - 128 * p_3 - rank + 2 - 1) / 2) : (0));
                                 float m_3 = -CUDART_INF_F;
                                 int masked_3 = 1;
                                 if (masked_3 != 0) {
                                     m_3 = -CUDART_INF_F;
-                                    int _warp_vote_34 = __any_sync(0xFFFFFFFF, nvis_3 < 32);
-                                    if (_warp_vote_34 != 0) {
-                                        uint32_t _thresh_mask_35;
+                                    int _warp_vote_32 = __any_sync(0xFFFFFFFF, nvis_3 < 32);
+                                    if (_warp_vote_32 != 0) {
+                                        uint32_t _thresh_mask_33;
                                         {
-                                            int _lim_36 = nvis_3;
-                                            if (_lim_36 <= 0) { _thresh_mask_35 = 0u; }
-                                            else if (_lim_36 >= 32) { _thresh_mask_35 = 0xFFFFFFFFu; }
+                                            int _lim_34 = nvis_3;
+                                            if (_lim_34 <= 0) { _thresh_mask_33 = 0u; }
+                                            else if (_lim_34 >= 32) { _thresh_mask_33 = 0xFFFFFFFFu; }
                                             else {
                                                 asm volatile("{"
                                                     ".reg .u32 t;\n\t"
                                                     "shl.b32 t, 1, %1;\n\t"
                                                     "add.u32 %0, t, -1;\n\t"
-                                                    "}" : "=r"(_thresh_mask_35) : "r"(_lim_36));
+                                                    "}" : "=r"(_thresh_mask_33) : "r"(_lim_34));
                                             }
                                         }
-                                        if (!(_thresh_mask_35 & (1u << 0))) v_1[64] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_35 & (1u << 1))) v_1[65] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_35 & (1u << 2))) v_1[66] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_35 & (1u << 3))) v_1[67] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_35 & (1u << 4))) v_1[68] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_35 & (1u << 5))) v_1[69] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_35 & (1u << 6))) v_1[70] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_35 & (1u << 7))) v_1[71] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_35 & (1u << 8))) v_1[72] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_35 & (1u << 9))) v_1[73] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_35 & (1u << 10))) v_1[74] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_35 & (1u << 11))) v_1[75] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_35 & (1u << 12))) v_1[76] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_35 & (1u << 13))) v_1[77] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_35 & (1u << 14))) v_1[78] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_35 & (1u << 15))) v_1[79] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_35 & (1u << 16))) v_1[80] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_35 & (1u << 17))) v_1[81] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_35 & (1u << 18))) v_1[82] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_35 & (1u << 19))) v_1[83] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_35 & (1u << 20))) v_1[84] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_35 & (1u << 21))) v_1[85] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_35 & (1u << 22))) v_1[86] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_35 & (1u << 23))) v_1[87] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_35 & (1u << 24))) v_1[88] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_35 & (1u << 25))) v_1[89] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_35 & (1u << 26))) v_1[90] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_35 & (1u << 27))) v_1[91] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_35 & (1u << 28))) v_1[92] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_35 & (1u << 29))) v_1[93] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_35 & (1u << 30))) v_1[94] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_35 & (1u << 31))) v_1[95] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_33 & (1u << 0))) v_1[64] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_33 & (1u << 1))) v_1[65] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_33 & (1u << 2))) v_1[66] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_33 & (1u << 3))) v_1[67] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_33 & (1u << 4))) v_1[68] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_33 & (1u << 5))) v_1[69] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_33 & (1u << 6))) v_1[70] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_33 & (1u << 7))) v_1[71] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_33 & (1u << 8))) v_1[72] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_33 & (1u << 9))) v_1[73] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_33 & (1u << 10))) v_1[74] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_33 & (1u << 11))) v_1[75] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_33 & (1u << 12))) v_1[76] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_33 & (1u << 13))) v_1[77] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_33 & (1u << 14))) v_1[78] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_33 & (1u << 15))) v_1[79] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_33 & (1u << 16))) v_1[80] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_33 & (1u << 17))) v_1[81] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_33 & (1u << 18))) v_1[82] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_33 & (1u << 19))) v_1[83] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_33 & (1u << 20))) v_1[84] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_33 & (1u << 21))) v_1[85] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_33 & (1u << 22))) v_1[86] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_33 & (1u << 23))) v_1[87] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_33 & (1u << 24))) v_1[88] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_33 & (1u << 25))) v_1[89] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_33 & (1u << 26))) v_1[90] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_33 & (1u << 27))) v_1[91] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_33 & (1u << 28))) v_1[92] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_33 & (1u << 29))) v_1[93] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_33 & (1u << 30))) v_1[94] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_33 & (1u << 31))) v_1[95] = -CUDART_INF_F;
                                     }
                                     float part_6 = -CUDART_INF_F;
-                                    float2 _reg_reduce_max2_38 = {-CAKE_INF, -CAKE_INF};
-                                    row_max_x32_accum(&v_1[(64) + 0], _reg_reduce_max2_38);
-                                    float _reg_array_reduce_37 = row_max_reduce(_reg_reduce_max2_38);
-                                    part_6 = _reg_array_reduce_37;
+                                    float2 _reg_reduce_max2_36 = {-CUDART_INF_F, -CUDART_INF_F};
+                                    row_max_x32_accum(&v_1[(64) + 0], _reg_reduce_max2_36);
+                                    float _reg_array_reduce_35 = row_max_reduce(_reg_reduce_max2_36);
+                                    part_6 = _reg_array_reduce_35;
                                     m_3 = fmaxf(m_3, part_6);
-                                    int _warp_vote_39 = __any_sync(0xFFFFFFFF, nvis_3 < 64);
-                                    if (_warp_vote_39 != 0) {
-                                        uint32_t _thresh_mask_40;
+                                    int _warp_vote_37 = __any_sync(0xFFFFFFFF, nvis_3 < 64);
+                                    if (_warp_vote_37 != 0) {
+                                        uint32_t _thresh_mask_38;
                                         {
-                                            int _lim_41 = nvis_3 - 32;
-                                            if (_lim_41 <= 0) { _thresh_mask_40 = 0u; }
-                                            else if (_lim_41 >= 32) { _thresh_mask_40 = 0xFFFFFFFFu; }
+                                            int _lim_39 = nvis_3 - 32;
+                                            if (_lim_39 <= 0) { _thresh_mask_38 = 0u; }
+                                            else if (_lim_39 >= 32) { _thresh_mask_38 = 0xFFFFFFFFu; }
                                             else {
                                                 asm volatile("{"
                                                     ".reg .u32 t;\n\t"
                                                     "shl.b32 t, 1, %1;\n\t"
                                                     "add.u32 %0, t, -1;\n\t"
-                                                    "}" : "=r"(_thresh_mask_40) : "r"(_lim_41));
+                                                    "}" : "=r"(_thresh_mask_38) : "r"(_lim_39));
                                             }
                                         }
-                                        if (!(_thresh_mask_40 & (1u << 0))) v_1[96] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_40 & (1u << 1))) v_1[97] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_40 & (1u << 2))) v_1[98] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_40 & (1u << 3))) v_1[99] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_40 & (1u << 4))) v_1[100] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_40 & (1u << 5))) v_1[101] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_40 & (1u << 6))) v_1[102] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_40 & (1u << 7))) v_1[103] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_40 & (1u << 8))) v_1[104] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_40 & (1u << 9))) v_1[105] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_40 & (1u << 10))) v_1[106] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_40 & (1u << 11))) v_1[107] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_40 & (1u << 12))) v_1[108] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_40 & (1u << 13))) v_1[109] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_40 & (1u << 14))) v_1[110] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_40 & (1u << 15))) v_1[111] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_40 & (1u << 16))) v_1[112] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_40 & (1u << 17))) v_1[113] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_40 & (1u << 18))) v_1[114] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_40 & (1u << 19))) v_1[115] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_40 & (1u << 20))) v_1[116] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_40 & (1u << 21))) v_1[117] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_40 & (1u << 22))) v_1[118] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_40 & (1u << 23))) v_1[119] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_40 & (1u << 24))) v_1[120] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_40 & (1u << 25))) v_1[121] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_40 & (1u << 26))) v_1[122] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_40 & (1u << 27))) v_1[123] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_40 & (1u << 28))) v_1[124] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_40 & (1u << 29))) v_1[125] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_40 & (1u << 30))) v_1[126] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_40 & (1u << 31))) v_1[127] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_38 & (1u << 0))) v_1[96] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_38 & (1u << 1))) v_1[97] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_38 & (1u << 2))) v_1[98] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_38 & (1u << 3))) v_1[99] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_38 & (1u << 4))) v_1[100] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_38 & (1u << 5))) v_1[101] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_38 & (1u << 6))) v_1[102] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_38 & (1u << 7))) v_1[103] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_38 & (1u << 8))) v_1[104] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_38 & (1u << 9))) v_1[105] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_38 & (1u << 10))) v_1[106] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_38 & (1u << 11))) v_1[107] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_38 & (1u << 12))) v_1[108] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_38 & (1u << 13))) v_1[109] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_38 & (1u << 14))) v_1[110] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_38 & (1u << 15))) v_1[111] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_38 & (1u << 16))) v_1[112] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_38 & (1u << 17))) v_1[113] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_38 & (1u << 18))) v_1[114] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_38 & (1u << 19))) v_1[115] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_38 & (1u << 20))) v_1[116] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_38 & (1u << 21))) v_1[117] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_38 & (1u << 22))) v_1[118] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_38 & (1u << 23))) v_1[119] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_38 & (1u << 24))) v_1[120] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_38 & (1u << 25))) v_1[121] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_38 & (1u << 26))) v_1[122] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_38 & (1u << 27))) v_1[123] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_38 & (1u << 28))) v_1[124] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_38 & (1u << 29))) v_1[125] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_38 & (1u << 30))) v_1[126] = -CUDART_INF_F;
+                                        if (!(_thresh_mask_38 & (1u << 31))) v_1[127] = -CUDART_INF_F;
                                     }
                                     float part_7 = -CUDART_INF_F;
-                                    float2 _reg_reduce_max2_43 = {-CAKE_INF, -CAKE_INF};
-                                    row_max_x32_accum(&v_1[(96) + 0], _reg_reduce_max2_43);
-                                    float _reg_array_reduce_42 = row_max_reduce(_reg_reduce_max2_43);
-                                    part_7 = _reg_array_reduce_42;
+                                    float2 _reg_reduce_max2_41 = {-CUDART_INF_F, -CUDART_INF_F};
+                                    row_max_x32_accum(&v_1[(96) + 0], _reg_reduce_max2_41);
+                                    float _reg_array_reduce_40 = row_max_reduce(_reg_reduce_max2_41);
+                                    part_7 = _reg_array_reduce_40;
                                     m_3 = fmaxf(m_3, part_7);
                                 }
                                 m_3 = ((m_3 == 0.0f) ? 0.0f : m_3);
-                                if (compact != 0) {
-                                    stage[row_stage_1 + p_3] = m_3;
-                                } else {
-                                    stage[row_stage_1 + 2 * p_3 + own] = m_3;
-                                    stage[row_stage_1 + 2 * p_3 + 1 - own] = -CUDART_INF_F;
-                                }
+                                stage[row_stage_1 + p_3] = m_3;
                                 int c_end_1 = (kt_0 + 1) * wcols;
                                 if (c_end_1 % 32 == 0 || kt_0 == kt1 - 1) {
                                     __syncwarp();
@@ -1069,10 +1012,10 @@ kernel_cake_msa_icp_indexer_cdcc9a2c2f7c3df64d6e(const __grid_constant__ CUtenso
                     ce_1 = c1_1;
                 }
                 int cb_1 = ((j_1 == j0_1) ? c0_1 : 0);
-                int kt0_1 = cb_1 / 4;
-                int kt1_1 = (ce_1 + 4 - 1) / 4;
+                int kt0_1 = cb_1 / 2;
+                int kt1_1 = (ce_1 + 2 - 1) / 2;
                 if (kt1_1 > kt0_1) {
-                    int pages_end = (ce_1 + 1) / 2;
+                    int pages_end = ce_1;
                     int q_row = (qo_indptr[b_1] + it_1 * 64) * 4;
                     mbarrier_wait(q_empty_addr + (q_slot) * 8, _phase_q_empty);
                     if (elect_sync()) {
@@ -1156,8 +1099,8 @@ kernel_cake_msa_icp_indexer_cdcc9a2c2f7c3df64d6e(const __grid_constant__ CUtenso
                     ce_2 = c1_2;
                 }
                 int cb_2 = ((j_2 == j0_2) ? c0_2 : 0);
-                int kt0_2 = cb_2 / 4;
-                int kt1_2 = (ce_2 + 4 - 1) / 4;
+                int kt0_2 = cb_2 / 2;
+                int kt1_2 = (ce_2 + 2 - 1) / 2;
                 if (kt1_2 > kt0_2) {
                     mbarrier_wait(q_full_addr + (q_slot_1) * 8, _phase_q_full);
                     #pragma unroll 1

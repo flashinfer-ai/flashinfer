@@ -17,15 +17,17 @@ The per-layer facade of the Cake MiniMax-M3 ICP indexer: one object per rank,
 built once from the serving limits, that runs the decode chain (scorer ->
 Top16 select and publish into the owners' receive rows -> owner merge) and the
 prefill / mixed chain (per window device plan; per query chunk scorer and
-Top16 select into a carrier; the caller's one exchange per layer; merge).
+Top16 select into a carrier, or with a caller pool the fused list scorer and
+list-to-carrier merge into the same carrier; the caller's one exchange per
+layer; merge).
 
 The caller owns every buffer that crosses ranks or outlives a call: the
 receive storage and its counters (``comm``, laid out by
 :func:`~.cake_backend.comm_layout`), the decode score rows, the prefill score
-scratch and carriers, and the outputs.  The facade owns only the prefill plan
-storage of its query windows and, on the layouts where its decode runs the
-fused chain (:func:`~.cake_backend.fused_decode_min_batch`), that chain's
-pool, both allocated once here.  No method allocates,
+scratch or list pool, the carriers, and the outputs.  The facade owns only
+the prefill plan storage of its query windows and, on the layouts where its
+decode runs the fused chain (:func:`~.cake_backend.fused_decode_min_batch`),
+that chain's pool, both allocated once here.  No method allocates,
 synchronizes or reads a device value; every method is CUDA Graph safe once
 :meth:`MSAIcpIndexerPlan.warmup` has loaded the programs.  ``warmup`` must run
 on every rank before the first exchange (a kernel loaded lazily at its first
@@ -90,6 +92,16 @@ def prefill_score_columns(max_seq_len: int, page_size: int) -> int:
     """Row pitch of the prefill score scratch: the scorer's columns rounded up
     to a multiple of 16."""
     return (cb.index_score_columns(max_seq_len, page_size) + 15) // 16 * 16
+
+
+def prefill_window_tokens(max_num_batched_tokens: int) -> int:
+    """Query tokens per prefill window of the fused path: the plan storage's
+    capacity, ``min(8192, max_num_batched_tokens)``.  Its list pool does not
+    grow with the history, so unlike :func:`prefill_chunk_tokens` the window
+    does not shrink for long sequences."""
+    if max_num_batched_tokens < 1:
+        raise ValueError("max_num_batched_tokens must be positive")
+    return min(_CHUNK_MAX, max_num_batched_tokens)
 
 
 def prefill_chunk_tokens(max_seq_len: int, page_size: int, num_heads: int) -> int:
@@ -178,6 +190,11 @@ class MSAIcpIndexerPlan:
             if self.fused_decode_min_batch is not None
             else None
         )
+        # The prefill chain rule: whether the caller's default on this layout
+        # is the fused path (list pool of ``prefill_pool_shape()``, windows of
+        # ``prefill_window_tokens()``); ``prefill_local`` runs the fused path
+        # exactly when it is given a pool.
+        self.fused_prefill = cb.fused_prefill(self.arch, page_size, world_size)
         self.index_scale, self.index_offset = cb.index_layout(
             page_size, world_size, rank
         )
@@ -239,6 +256,25 @@ class MSAIcpIndexerPlan:
             min(chunk, self.max_num_batched_tokens),
             self.num_index_heads,
             prefill_score_columns(seq, self.page_size),
+        )
+
+    def prefill_window_tokens(self) -> int:
+        """Query tokens per window of the fused prefill path (the plan
+        storage's capacity, independent of the history length)."""
+        return prefill_window_tokens(self.max_num_batched_tokens)
+
+    def prefill_pool_shape(self) -> tuple[int]:
+        """The fused prefill path's list pool ``[bytes]`` (uint8, 16-byte
+        aligned; never zeroed) for any window of this facade's limits:
+        ``prefill_window_tokens()`` tokens in up to ``max_num_seqs``
+        segments, scored by one CTA per SM of the device."""
+        return (
+            cb.prefill_pool_bytes(
+                total_q=self.prefill_window_tokens(),
+                batch=self.max_num_seqs,
+                device=self.device,
+                num_heads=self.num_index_heads,
+            ),
         )
 
     def prefill_carrier_shape(self) -> tuple[int, int, int, int]:
@@ -517,13 +553,42 @@ class MSAIcpIndexerPlan:
         index_k: torch.Tensor,
         block_table: torch.Tensor,
         window_plan: cb.MSAIcpScorePlan,
-        score_scratch: torch.Tensor,
+        score_scratch: Optional[torch.Tensor],
         num_valid_pages: torch.Tensor,
         carrier_view: torch.Tensor,
+        *,
+        pool: Optional[torch.Tensor] = None,
     ) -> None:
         """Score one query chunk into ``score_scratch[:T]`` and write its
         per-(head, token) Top16 rows into ``carrier_view`` (int32 ``[H, T, 33]``,
-        typically ``send[:, start:end]``)."""
+        typically ``send[:, start:end]``).
+
+        With ``pool`` (uint8 of ``prefill_pool_shape()``) the fused path runs
+        instead: the list scorer keeps each (CTA, plan item) cell's sorted
+        Top16 lists in ``pool`` and the list-to-carrier merge writes the same
+        carrier rows; ``score_scratch`` is unused and may be ``None``.  One
+        pool serves every window, chunk and layer (the list scorer writes
+        every list its merge reads, so the pool is never zeroed)."""
+        if pool is not None:
+            cb.prefill_score_select(
+                query,
+                index_k,
+                block_table,
+                window_plan,
+                num_valid_pages,
+                pool,
+                carrier_view,
+                rank=self.rank,
+                tp=self.world_size,
+                compact=self.page_size == 256,
+                force_begin_blocks=self.init_blocks,
+                force_end_blocks=self.local_blocks,
+            )
+            return
+        if score_scratch is None:
+            raise ValueError(
+                "prefill_local needs score_scratch unless it is given a pool"
+            )
         t = query.shape[0]
         scores = score_scratch[:t]
         cb.index_score_sharded(
