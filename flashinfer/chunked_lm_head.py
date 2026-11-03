@@ -1285,10 +1285,10 @@ def chunked_lm_head_logprob(
     slices is dropped, with one warning).  A value that is not a ``bool`` is a
     ``TypeError``.  ``temperature`` / ``check_temperature`` reach either
     package: the non-deterministic one runs the same temperature forms
-    (``logp`` and ``dW`` the deterministic entry's bits; ``dX`` the same
-    products, a sliced chunk's in the unordered reduction) and its backward
-    runs every row's gradient work with a temperature (no zero-gradient row
-    skip).
+    (``logp`` the deterministic entry's bits, ``dW`` too when no valid row has
+    a zero ``dlogp``; ``dX`` the same products, a sliced chunk's in the
+    unordered reduction) and its zero-gradient row skip runs the dX / dW
+    GEMMs of the rows with a nonzero ``dlogp`` only, with a temperature too.
     """
     if deterministic is True:
         try:
