@@ -1892,11 +1892,15 @@ def _window_meta(w: ref.PrefillWindow) -> tuple[torch.Tensor, ...]:
 
 @pytest.mark.parametrize("fused", (False, True), ids=("materialized", "fused"))
 @pytest.mark.parametrize("lay", LAYOUTS, ids=LAYOUT_IDS)
-def test_facade_prefill_matches_the_oracle(lay: ref.IcpLayout, fused: bool) -> None:
+def test_facade_prefill_matches_the_oracle(
+    lay: ref.IcpLayout, fused: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """``prepare_msa_icp_indexer`` per rank: one plan per query window,
     per-chunk local scoring into the carrier (reused score scratch, or with
-    ``fused`` a caller pool of ``prefill_pool_shape()`` and no score scratch),
-    the emulated exchange and the merge."""
+    ``fused`` a caller pool of ``prefill_pool_shape()`` and no score scratch,
+    every window on the fused path), the emulated exchange and the merge."""
+    if fused:  # no short windows: every window runs the fused path
+        monkeypatch.setattr(cake_backend, "SHORT_PREFILL_MAX_TOKENS", {})
     case = ref.make_prefill_case(
         "facade",
         page_size=lay.page_size,
@@ -1984,6 +1988,97 @@ def test_facade_prefill_matches_the_oracle(lay: ref.IcpLayout, fused: bool) -> N
         plans[o].prefill_merge(received, inp["nvalid"], out)
         torch.cuda.synchronize()
         assert_words(out, exp.outputs[o], f"facade {lay.name} owner {o}")
+
+
+@pytest.mark.parametrize("lay", LAYOUTS, ids=LAYOUT_IDS)
+def test_facade_prefill_short_windows_run_the_score_rows(
+    lay: ref.IcpLayout, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With a pool, a window of at most ``prefill_short_tokens`` query tokens
+    runs the score rows and the Top16 select in the facade's own scratch and
+    a longer window the fused path (no caller score scratch); the carriers
+    equal the oracle's either way."""
+    arch = cake_jit.device_arch(DEV.index)
+    case = ref.make_prefill_case(
+        "short",
+        page_size=lay.page_size,
+        q_lens=[300, 1, 45],
+        prefixes=[0, 4000, 700],
+        padding_tokens=3,
+        chunk=128,
+        seed=37,
+    )
+    windows = case.windows()
+    sizes = [w.total_q for w in windows]
+    short = min(sizes)
+    assert short < max(sizes)
+    monkeypatch.setattr(
+        cake_backend,
+        "SHORT_PREFILL_MAX_TOKENS",
+        {(arch, lay.page_size, lay.tp): short},
+    )
+    exp = prefill_expect(case, lay, fast=False, with_global=True)
+    inp = prefill_case_inputs(case, lay)
+    plans = [
+        msa_ops.prepare_msa_icp_indexer(
+            world_size=lay.tp,
+            rank=r,
+            num_index_heads=H,
+            page_size=lay.page_size,
+            init_blocks=case.init_blocks,
+            local_blocks=case.local_blocks,
+            max_decode_tokens=16,
+            max_decode_query_len=4,
+            max_num_batched_tokens=8192 * len(windows),
+            max_num_seqs=case.batch,
+            max_model_len=8192,
+            num_sparse_layers=3,
+            device=DEV,
+        )
+        for r in range(lay.tp)
+    ]
+    assert plans[0].prefill_short_tokens == short
+    select = cake_jit.route("select_prefill", None, arch)
+    carrier = cake_jit.route("prefill_list_carrier", None, arch)
+    send = [
+        torch.full(
+            (H, case.total_q, ref.ROW_WORDS), POISON_I32, dtype=torch.int32, device=DEV
+        )
+        for _ in range(lay.tp)
+    ]
+    pools = [
+        torch.full(p.prefill_pool_shape(), POOL_POISON, dtype=torch.uint8, device=DEV)
+        for p in plans
+    ]
+    for r in range(lay.tp):
+        for wi, w in enumerate(windows):
+            wplan = plans[r].prefill_window_plan(
+                wi,
+                *_window_meta(w),
+                total_q=w.total_q,
+                max_query_len=max(max(w.q_lens), 1),
+                max_seq_len=max(max(w.kv_lens), 1),
+            )
+            args = (
+                inp["q"][w.start : w.end],
+                inp["shards"][r],
+                inp["block_table"],
+                wplan,
+                None,
+                inp["nvalid"][w.start : w.end],
+                send[r][:, w.start : w.end],
+            )
+            with cake_jit.record_launches() as calls:
+                plans[r].prefill_local(*args, pool=pools[r])
+            names = [c.name for c in calls]
+            if w.total_q <= short:
+                assert select in names and carrier not in names, names
+            else:
+                assert carrier in names and select not in names, names
+            plans[r].prefill_local(*args, pool=pools[r])
+    torch.cuda.synchronize()
+    for r in range(lay.tp):
+        assert_words(send[r], exp.carriers[r], f"short {lay.name} rank {r} carrier")
 
 
 # =========================================================================== CUDA Graph replay

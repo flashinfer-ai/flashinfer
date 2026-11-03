@@ -512,6 +512,47 @@ def fused_prefill(arch: str, page_size: int, world_size: int) -> bool:
     )
 
 
+# Short prefill windows: on (architecture, page size, world size), a query
+# window of at most this many tokens runs the score rows and the Top16 select
+# even when the caller passes a list pool, in the facade's own score scratch
+# of that many rows (:attr:`MSAIcpIndexerPlan.prefill_short_tokens`).  For
+# short windows the list-to-carrier merge, which folds one sorted list per
+# scoring CTA into every (token, head) row, costs more than the score rows
+# the fused path saves.  Each value is the window size, from 1 to 8192
+# tokens at histories of 8K to 200K tokens, that minimizes the worst
+# per-window loss against the faster path (kernel time, CUDA Graph replay,
+# cold L2).  Both paths write the same carrier rows.
+SHORT_PREFILL_MAX_TOKENS: dict[tuple[str, int, int], int] = {
+    ("sm_100a", 128, 2): 512,
+    ("sm_100a", 128, 4): 512,
+    ("sm_100a", 256, 2): 1024,
+    ("sm_100a", 256, 4): 512,
+    ("sm_103a", 128, 2): 512,
+    ("sm_103a", 128, 4): 512,
+    ("sm_103a", 256, 2): 1024,
+    ("sm_103a", 256, 4): 1024,
+    ("sm_107a", 128, 2): 512,
+    ("sm_107a", 128, 4): 512,
+    ("sm_107a", 256, 2): 1024,
+    ("sm_107a", 256, 4): 1024,
+}
+
+
+def short_prefill_max_tokens(arch: str, page_size: int, world_size: int) -> int:
+    """The largest query window (tokens) that runs the score rows and the
+    Top16 select although the caller passes a list pool on ``arch`` at
+    ``page_size`` / ``world_size`` (:data:`SHORT_PREFILL_MAX_TOKENS`; 0: every
+    window with a pool runs the fused path, also when the architecture lacks
+    the fused programs).  Host metadata only (no device read, no
+    environment)."""
+    if not (
+        cake_jit.has_role("score_topk16", arch)
+        and cake_jit.has_role("prefill_list_carrier", arch)
+    ):
+        return 0
+    return SHORT_PREFILL_MAX_TOKENS.get((arch, page_size, world_size), 0)
+
+
 # --------------------------------------------------------------------------- prefill
 
 

@@ -1891,9 +1891,12 @@ def test_facade_prefill_takes_the_fused_path_with_a_pool(
     scorer -> list-to-carrier merge into the same carrier and needs no score
     scratch (``None``).  The facade allocates no prefill pool (the rule is
     empty), sizes the caller's from its limits and windows from the plan
-    capacity, and ``prefill_local`` allocates nothing."""
+    capacity, and ``prefill_local`` allocates nothing.  No short windows here
+    (an empty short-window table), so every window with a pool is fused."""
     fake = _intercept(monkeypatch, arch, real_registry=False)
+    monkeypatch.setattr(cb, "SHORT_PREFILL_MAX_TOKENS", {})
     plan = _decode_facade(page, world, capacity=16)
+    assert plan.prefill_short_tokens == 0 and plan._short_scratch is None
     assert plan.fused_prefill is False
     assert plan.prefill_window_tokens() == 256  # min(8192, max_num_batched_tokens)
     (nbytes,) = plan.prefill_pool_shape()
@@ -1929,6 +1932,54 @@ def test_facade_prefill_takes_the_fused_path_with_a_pool(
     with pytest.raises(ValueError, match="score_scratch"):
         plan.prefill_local(*args)
     assert not fake
+
+
+@pytest.mark.parametrize("arch", ARCHES)
+@pytest.mark.parametrize(("page", "world"), LAYOUTS)
+def test_facade_prefill_short_window_runs_the_score_rows_with_a_pool(
+    monkeypatch, page: int, world: int, arch: str
+) -> None:
+    """With a pool, a window of at most ``prefill_short_tokens`` tokens runs
+    score -> select_prefill into the facade's own score scratch (allocated
+    once at construction: ``[min(table, max_num_batched_tokens), H, pitch]``
+    float32), never the caller's; a longer window runs the fused path.
+    ``prefill_local`` allocates nothing either way."""
+    fake = _intercept(monkeypatch, arch, real_registry=False)
+    plan = _decode_facade(page, world, capacity=16)
+    short = min(cb.SHORT_PREFILL_MAX_TOKENS[(arch, page, world)], 256)
+    assert plan.prefill_short_tokens == short
+    assert tuple(plan._short_scratch.shape) == (short, H, plan.prefill_score_columns)
+    assert plan._short_scratch.dtype == torch.float32
+    a = fused_prefill_args(page, world)
+    t = a["q"].shape[0]
+    assert t <= short
+    caller = _t((8, H, 16), torch.float32)
+    args = [a["q"], a["k"], a["block_table"], a["plan"], None]
+    args += [a["num_valid_pages"], a["carrier"]]
+    monkeypatch.setattr(cake_indexer, "torch", _NoAllocTorch())
+    for scratch_arg in (None, caller):
+        fake.clear()
+        args[4] = scratch_arg
+        plan.prefill_local(*args, pool=a["pool"])
+        assert fake.roles() == ["score", "select_prefill"]
+        scorer, select = fake
+        assert _same_storage(scorer.values["max_score"], plan._short_scratch)
+        assert _same_storage(select.values["scores"], plan._short_scratch)
+        assert select.values["carrier"] is a["carrier"]
+        assert not any(
+            _same_storage(x, a["pool"]) for f in fake for x in f.values.values()
+        )
+        assert not any(
+            _same_storage(x, caller) for f in fake for x in f.values.values()
+        )
+    monkeypatch.setattr(cake_indexer, "torch", torch)
+    monkeypatch.setattr(cb, "SHORT_PREFILL_MAX_TOKENS", {(arch, page, world): t - 1})
+    plan = _decode_facade(page, world, capacity=16)
+    assert plan.prefill_short_tokens == t - 1
+    fake.clear()
+    args[4] = None
+    plan.prefill_local(*args, pool=a["pool"])
+    assert fake.roles() == ["score_topk16", "prefill_list_carrier"]
 
 
 # The per-call tensors and arguments ``decode`` still checks once its comm is

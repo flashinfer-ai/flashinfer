@@ -27,7 +27,12 @@ Top16 list of each plan work item in a caller-owned uint8 `pool`
 (`msa_icp_prefill_pool_bytes`, 32 KiB per list piece) and a list merger writes
 the carrier rows of `msa_icp_topk_select_prefill`, byte for byte, without the
 FP32 score scratch.  The facade runs it when `prefill_local(..., pool=...)` is
-given (`score_scratch` may then be `None`); `prefill_pool_shape()` sizes the
+given (`score_scratch` may then be `None`), except that a window of at most
+`prefill_short_tokens` tokens (`cake_backend.SHORT_PREFILL_MAX_TOKENS`, per
+layout) runs the score rows and the Top16 select in a scratch the facade
+allocates once (`[prefill_short_tokens, H, pitch]` float32 at the
+`max_model_len` pitch): for short windows the list merge costs more than the
+score rows it saves.  `prefill_pool_shape()` sizes the
 pool for windows of `prefill_window_tokens()` = `min(8192,
 max_num_batched_tokens)` tokens.  `MSAIcpIndexerPlan.fused_prefill` is the
 serving default per layout (`cake_backend.FUSED_PREFILL`) and is `False` on

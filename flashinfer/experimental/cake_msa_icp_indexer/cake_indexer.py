@@ -25,9 +25,11 @@ The caller owns every buffer that crosses ranks or outlives a call: the
 receive storage and its counters (``comm``, laid out by
 :func:`~.cake_backend.comm_layout`), the decode score rows, the prefill score
 scratch or list pool, the carriers, and the outputs.  The facade owns only
-the prefill plan storage of its query windows and, on the layouts where its
-decode runs the fused chain (:func:`~.cake_backend.fused_decode_min_batch`),
-that chain's pool, both allocated once here.  No method allocates,
+the prefill plan storage of its query windows, on the layouts where its
+decode runs the fused chain (:func:`~.cake_backend.fused_decode_min_batch`)
+that chain's pool, and on the layouts with short prefill windows
+(:func:`~.cake_backend.short_prefill_max_tokens`) their score scratch, all
+allocated once here.  No method allocates,
 synchronizes or reads a device value; every method is CUDA Graph safe once
 :meth:`MSAIcpIndexerPlan.warmup` has loaded the programs.  ``warmup`` must run
 on every rank before the first exchange (a kernel loaded lazily at its first
@@ -206,6 +208,26 @@ class MSAIcpIndexerPlan:
         # The smallest chunk any step can use (the longest sequence) bounds the
         # number of query windows of one step.
         self.prefill_score_columns = prefill_score_columns(max_model_len, page_size)
+        # Short prefill windows: with a pool, a window of at most
+        # ``prefill_short_tokens`` query tokens runs the score rows and the
+        # Top16 select in this scratch (``[prefill_short_tokens, H, pitch]``
+        # float32 at the model's pitch) instead of the fused path.
+        short = min(
+            cb.short_prefill_max_tokens(self.arch, page_size, world_size),
+            max_num_batched_tokens,
+        )
+        if self.prefill_score_columns >= cb.MAX_SELECT_COLUMNS:
+            short = 0
+        self.prefill_short_tokens = short
+        self._short_scratch = (
+            torch.empty(
+                (short, num_index_heads, self.prefill_score_columns),
+                dtype=torch.float32,
+                device=device,
+            )
+            if short
+            else None
+        )
         chunk = prefill_chunk_tokens(max_model_len, page_size, num_index_heads)
         self.max_prefill_windows = (max_num_batched_tokens + chunk - 1) // chunk
         storage = cb.index_score_plan_storage(
@@ -569,8 +591,21 @@ class MSAIcpIndexerPlan:
         Top16 lists in ``pool`` and the list-to-carrier merge writes the same
         carrier rows; ``score_scratch`` is unused and may be ``None``.  One
         pool serves every window, chunk and layer (the list scorer writes
-        every list its merge reads, so the pool is never zeroed)."""
-        if pool is not None:
+        every list its merge reads, so the pool is never zeroed).  A chunk of
+        at most :attr:`prefill_short_tokens` tokens (whose plan's columns fit
+        the model's pitch) runs the score rows and the Top16 select in the
+        facade's own scratch even with a pool: the same carrier rows, decided
+        on the host from the chunk's size."""
+        t = query.shape[0]
+        if pool is not None and (
+            t > self.prefill_short_tokens
+            or (
+                (window_plan.columns + 1) // 2
+                if self.page_size == 256
+                else window_plan.columns
+            )
+            > self.prefill_score_columns
+        ):
             cb.prefill_score_select(
                 query,
                 index_k,
@@ -586,11 +621,12 @@ class MSAIcpIndexerPlan:
                 force_end_blocks=self.local_blocks,
             )
             return
+        if pool is not None:
+            score_scratch = self._short_scratch
         if score_scratch is None:
             raise ValueError(
                 "prefill_local needs score_scratch unless it is given a pool"
             )
-        t = query.shape[0]
         scores = score_scratch[:t]
         cb.index_score_sharded(
             query,
