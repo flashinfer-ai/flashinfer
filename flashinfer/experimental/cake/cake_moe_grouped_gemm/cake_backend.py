@@ -164,6 +164,27 @@ its own of the size it needs.  A launch whose tail is not split
 (``tail_splits == 1``) passes one-element placeholders that the kernel does not
 touch.  The weight gradient keeps no per-preparation partials on the 512-wide k
 tile.
+
+Accumulate mode.  ``prepare_grouped_gemm_wgrad(..., out=out, accumulate=True)``
+(also ``grouped_gemm_wgrad`` and the autograd wrapper's
+``fuse_wgrad_accumulation``) adds the weight gradient into ``out``:
+``out[e] <- out[e] + G_e^T X_e``, Megatron's gradient-accumulation fusion.  The
+host selects the route, the k tile, the stage and the plan exactly as for the
+overwrite of ``out.dtype`` (the twin); ``plan["accumulate"]`` records how the
+launch adds.  ``"fused"``: the 512-wide k tile, where the route serves the
+twin's accumulate build (the stage of the twin's name with ``ACC_SUFFIX``: the
+same argument plan, launch shape and host plan, an epilogue that adds into C)
+on the device's architecture and C is 32-byte aligned (its base, row pitch and
+expert pitch); one launch, which leaves an empty group's ``out[e]`` and the
+padding untouched.  ``"composed"`` (``plan["accumulate_reason"]``: the
+256-wide k tile, a stage without an accumulate build, or the alignment, the
+last with one ``UserWarning`` per process): the twin writes into a contiguous
+scratch of ``out.dtype`` that the preparation allocates and keeps with the
+launch, and the launch adds it with ``out.add_`` on the same stream.  Both
+routes check before any launch that ``out`` cannot overlap itself (row pitch at
+least ``K``, expert pitch at least ``N`` row pitches) nor ``g``, ``x`` or
+``offs``.  ``plan["accumulate"]`` is ``"off"`` for an overwrite.  A launch
+adds once more at every ``launch()`` and every CUDA graph replay.
 """
 
 from __future__ import annotations
@@ -185,6 +206,7 @@ from .cake_jit import (
     ROUTES,
     load_module,
     program_registered,
+    record_name,
     select_module,
     stage_binding,
     stage_served,
@@ -204,6 +226,16 @@ K256_TAIL_TILE_K = 256
 # (half-release, eight epilogue warps) build; the four-warp builds use the first four.
 TAIL_TICKETS_PER_CTA = 8
 _DTYPE_NAMES = {torch.bfloat16: "bfloat16", torch.float32: "float32"}
+# Accumulate mode (module docstring): the stage that adds into C is the overwrite stage's name with this
+# suffix, on the same weight-gradient route.
+ACC_SUFFIX = "_acc"
+# The byte alignment of C's base, row pitch and expert pitch the accumulate builds need (their C accesses
+# are 32-byte vectors); a less aligned ``out`` takes the composed route.
+ACC_ALIGN = 32
+# ``plan["accumulate"]``: an overwrite, one launch that adds into C, or the overwrite into a scratch and an add.
+ACCUMULATE_MODES = ("off", "fused", "composed")
+# The once-per-process warnings of this module that were issued (the composed route taken for alignment).
+_WARNED: set[str] = set()
 
 
 # ---------------------------------------------------------------------------
@@ -304,15 +336,51 @@ def _alert_not_deterministic(entry: str) -> None:
     )
 
 
+def _require_flag(value: object, keyword: str, entry: str) -> None:
+    """Refuse a non-bool value of the switch ``keyword`` of ``entry`` (``ValueError``, as for ``deterministic``)."""
+    if not isinstance(value, bool):
+        raise ValueError(f"{entry}: {keyword} must be a bool, got {value!r}")
+
+
+def acc_stage_served(out_dtype: str, arch: str) -> bool:
+    """True when the 512-wide k tile route of ``out_dtype`` (``"bfloat16"`` / ``"float32"``) serves an
+    accumulate stage (a stage named ``<twin>`` + ``ACC_SUFFIX``) on ``arch``."""
+    name = record_name("wgrad", out_dtype=out_dtype, tile_k=512)
+    route = ROUTES.get(name)
+    if route is None or arch not in route["arches"]:
+        return False
+    return any(
+        item["name"].endswith(ACC_SUFFIX) and stage_served(name, item["name"], arch)
+        for item in route["stages"]
+    )
+
+
 def generated_program_available(
-    device: torch.device, op: str = "fwd", out_dtype: Optional[torch.dtype] = None
+    device: torch.device,
+    op: str = "fwd",
+    out_dtype: Optional[torch.dtype] = None,
+    *,
+    accumulate: bool = False,
 ) -> bool:
-    """True when this checkout registers the program of ``op`` for ``device``."""
+    """True when this checkout registers the program of ``op`` for ``device``.
+
+    With ``accumulate=True`` (weight gradient only): True when the 512-wide k tile route of
+    ``out_dtype`` (either output dtype when None) serves an accumulate stage on the device's
+    architecture, that is when some weight gradient into an ``out`` of that dtype takes the fused
+    route (``plan["accumulate"] == "fused"``); the composed route needs only the overwrite programs."""
+    _require_flag(accumulate, "accumulate", "generated_program_available")
+    if accumulate and op != "wgrad":
+        raise ValueError(
+            f"generated_program_available: accumulate=True applies to the weight gradient, got op={op!r}"
+        )
     arch = arch_for(device)
     if arch is None:
         return False
     name = _DTYPE_NAMES.get(out_dtype) if out_dtype is not None else None
-    return program_registered(op, arch, out_dtype=name)
+    if not accumulate:
+        return program_registered(op, arch, out_dtype=name)
+    dtypes = (name,) if name else ("bfloat16", "float32")
+    return any(acc_stage_served(dtype, arch) for dtype in dtypes if dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -837,6 +905,26 @@ def select_wgrad_stage(
     return stage, wave
 
 
+def wgrad_accumulate_mode(
+    name: str, stage: str, tile_k: int, arch: str, *, aligned: bool = True
+) -> tuple[str, Optional[str]]:
+    """``(plan["accumulate"], plan["accumulate_reason"])`` of a weight gradient that adds into its output,
+    for the route ``name``, main stage ``stage`` and k tile ``tile_k`` the overwrite of the same output dtype
+    selects on ``arch`` (module docstring, accumulate mode).
+
+    ``("fused", None)`` with the 512-wide k tile when the route serves ``stage + ACC_SUFFIX`` on ``arch`` and
+    the output is ``ACC_ALIGN``-byte aligned (``aligned``); else ``("composed", reason)`` with ``reason``
+    ``"tile_k"`` (the 256-wide k tile), ``"stage"`` (no accumulate build of ``stage`` on ``arch``) or
+    ``"alignment"``, checked in that order."""
+    if tile_k != 512:
+        return "composed", "tile_k"
+    if not stage_served(name, stage + ACC_SUFFIX, arch):
+        return "composed", "stage"
+    if not aligned:
+        return "composed", "alignment"
+    return "fused", None
+
+
 # ---------------------------------------------------------------------------
 # Prepared launches
 # ---------------------------------------------------------------------------
@@ -861,6 +949,11 @@ try:
     _current_device = torch._C._cuda_getDevice
 except AttributeError:  # pragma: no cover - older torch
     _current_device = torch.cuda.current_device
+# The version-counter bump of a tensor written in place outside torch (a fused accumulate launch).
+try:
+    _increment_version = torch.autograd.graph.increment_version
+except AttributeError:  # pragma: no cover - older torch
+    _increment_version = torch._C._increment_version
 
 # The workspace kinds a program's argument plan may name, by argument name.
 STREAM_WORKSPACES = ("sched", "wave_sync", "tail_sums", "tail_tickets")
@@ -1245,6 +1338,18 @@ class GroupedGemmLaunch:
     non-determinism alert when it is on, also when it was switched on after
     the preparation.  Under CUDA graph capture the check runs when the launch
     is captured; a replay of the graph does not check again.
+
+    A weight gradient prepared with ``accumulate=True`` adds into ``out`` at
+    every ``launch()`` and every replay of a graph that captured it (it is not
+    idempotent).  On the composed route (``plan["accumulate"] ==
+    "composed"``) ``add_from`` is the scratch the bound programs write and the
+    launch adds it into ``out`` with ``out.add_`` on the same stream (which
+    bumps ``out._version``); the scratch belongs to the prepared launch, so
+    one prepared composed launch must not be in flight on two streams at once.
+    On the fused route (``bump_version``) the kernel adds in place and the
+    launch bumps ``out._version`` with
+    ``torch.autograd.graph.increment_version`` (not for an inference tensor),
+    when it is launched or captured, not at a graph replay.
     """
 
     op: str
@@ -1260,6 +1365,11 @@ class GroupedGemmLaunch:
     # Kept alive with the launch.
     workspaces: tuple[torch.Tensor, ...] = field(default=(), repr=False)
     device_index: int = -1
+    # Composed accumulate: the contiguous scratch of ``out.dtype`` the bound programs write, added into
+    # ``out`` after them; None otherwise.
+    add_from: Optional[torch.Tensor] = field(default=None, repr=False)
+    # Fused accumulate: the kernel wrote ``out`` in place; bump its version counter after the launch.
+    bump_version: bool = False
 
     def launch(self) -> torch.Tensor:
         if self.op == "wgrad":
@@ -1287,6 +1397,14 @@ class GroupedGemmLaunch:
                             bound[c0], bound[c1] = split
                     arguments = bound
                 item.entry(*arguments)
+        if self.add_from is not None:
+            # Outside autograd, as the fused route's in-place write: ``out`` may be a leaf that requires
+            # grad, or an inference tensor (updated in place only in inference mode).
+            mode = torch.inference_mode if self.out.is_inference() else torch.no_grad
+            with mode():
+                self.out.add_(self.add_from)
+        elif self.bump_version and not self.out.is_inference():
+            _increment_version(self.out)
         return self.out
 
     __call__ = launch
@@ -1435,6 +1553,8 @@ def _finish(
     workspaces: list,
     *,
     zero_fill: bool = False,
+    add_from: Optional[torch.Tensor] = None,
+    bump_version: bool = False,
 ) -> GroupedGemmLaunch:
     return GroupedGemmLaunch(
         op=op,
@@ -1446,6 +1566,8 @@ def _finish(
         zero_fill=zero_fill,
         workspaces=tuple(workspaces),
         device_index=_device_index(out.device),
+        add_from=add_from,
+        bump_version=bump_version,
     )
 
 
@@ -1591,6 +1713,119 @@ def prepare_grouped_gemm_dgrad(
     return _prepare_row_op("dgrad", g, w, offs, out)
 
 
+def _byte_span(t: torch.Tensor) -> tuple[int, int]:
+    """The device bytes ``[start, end)`` the elements of ``t`` lie in (an empty range when it has none)."""
+    if t.numel() == 0:
+        return 0, 0
+    extent = 1 + sum(
+        (size - 1) * stride for size, stride in zip(t.shape, t.stride(), strict=True)
+    )
+    start = int(t.data_ptr())
+    return start, start + extent * t.element_size()
+
+
+def _check_accumulate_out(
+    out: Optional[torch.Tensor],
+    out_dtype: Optional[torch.dtype],
+    operands: dict[str, torch.Tensor],
+    entry: str,
+) -> None:
+    """The checks of a weight gradient that adds into ``out`` (module docstring, accumulate mode), made before
+    any launch whatever route it takes: ``out`` given, ``out_dtype`` None or ``out``'s dtype, bfloat16 or
+    float32, three dimensions with unit stride along ``K``, rows and experts that cannot overlap (row stride
+    at least ``K``, expert stride at least ``N`` row strides: an expanded ``out`` is refused), on the device of
+    ``operands`` (name -> tensor) and sharing no byte with any of them."""
+    if out is None:
+        raise ValueError(
+            f"{entry}: accumulate=True adds the weight gradient into out; pass the [E, N, K] tensor "
+            "to add into as out"
+        )
+    if out_dtype is not None and out_dtype != out.dtype:
+        raise ValueError(
+            f"{entry}: accumulate=True adds in the dtype of out ({out.dtype}); out_dtype must be None or "
+            f"that dtype, got {out_dtype}"
+        )
+    if out.dtype not in _DTYPE_NAMES:
+        raise ValueError(
+            f"{entry}: accumulate=True needs a bfloat16 or float32 out, got {out.dtype}"
+        )
+    if out.dim() != 3 or out.stride(2) != 1:
+        raise ValueError(
+            f"{entry}: out must be an [E, N, K] tensor with unit stride along K"
+        )
+    groups, n, k = (int(v) for v in out.shape)
+    ldc, stride_e = int(out.stride(1)), int(out.stride(0))
+    if n > 1 and ldc < k:
+        raise ValueError(
+            f"{entry}: accumulate=True reads and writes every row of out, so its rows must not overlap: "
+            f"the row stride {ldc} is below K={k}"
+        )
+    if groups > 1 and stride_e < n * ldc:
+        raise ValueError(
+            f"{entry}: accumulate=True reads and writes every expert of out, so its experts must not "
+            f"overlap: the expert stride {stride_e} is below N * row stride = {n * ldc} (an expanded "
+            "out has expert stride 0)"
+        )
+    lo, hi = _byte_span(out)
+    for name, t in operands.items():
+        if t.device != out.device:
+            raise ValueError(f"{entry}: out must be on the device of {name}")
+        start, end = _byte_span(t)
+        if lo < end and start < hi:
+            raise ValueError(
+                f"{entry}: out shares memory with {name}; accumulate=True writes out while the "
+                f"kernel reads {name}"
+            )
+
+
+def _accumulate_aligned(out: torch.Tensor) -> bool:
+    """Whether the base, the row pitch and (more than one expert) the expert pitch of ``out`` are
+    ``ACC_ALIGN``-byte aligned, as the accumulate builds need."""
+    size = out.element_size()
+    if int(out.data_ptr()) % ACC_ALIGN or int(out.stride(1)) * size % ACC_ALIGN:
+        return False
+    return out.shape[0] <= 1 or int(out.stride(0)) * size % ACC_ALIGN == 0
+
+
+def _check_accumulate_call(
+    g: torch.Tensor,
+    x: torch.Tensor,
+    offs: torch.Tensor,
+    out: Optional[torch.Tensor],
+    out_dtype: Optional[torch.dtype],
+    num_groups: Optional[int],
+    accumulate: object,
+    entry: str,
+) -> bool:
+    """The accumulate checks of a weight-gradient call before it runs anything, for a caller that composes
+    the add itself (the facade's deterministic route): ``accumulate`` a bool and, when True, the checks of
+    :func:`_check_accumulate_out` and an ``out`` of shape ``[E, N, K]`` (``E`` = ``num_groups``, else
+    ``offs.numel()``; ``N`` = the columns of ``g``, ``K`` those of ``x``).  Returns ``accumulate``."""
+    _require_flag(accumulate, "accumulate", entry)
+    if not accumulate:
+        return False
+    if g.dim() != 2 or x.dim() != 2:
+        raise ValueError(
+            f"{entry}: g must be a [sum_m, N] tensor and x a [sum_m, K] tensor"
+        )
+    _check_accumulate_out(out, out_dtype, {"g": g, "x": x, "offs": offs}, entry)
+    groups = int(offs.numel()) if num_groups is None else int(num_groups)
+    shape = (groups, int(g.shape[1]), int(x.shape[1]))
+    if tuple(out.shape) != shape:
+        raise ValueError(
+            f"{entry}: out must be a {out.dtype} {list(shape)} tensor, got {list(out.shape)}"
+        )
+    return True
+
+
+def _warn_once(key: str, message: str) -> None:
+    """A ``UserWarning`` naming the caller's frame, the first time ``key`` warns in this process."""
+    if key in _WARNED:
+        return
+    _WARNED.add(key)
+    warnings.warn(message, UserWarning, stacklevel=_caller_stacklevel())
+
+
 def _prepare_wgrad(
     g: torch.Tensor,
     x: torch.Tensor,
@@ -1598,8 +1833,15 @@ def _prepare_wgrad(
     out: Optional[torch.Tensor],
     out_dtype: Optional[torch.dtype],
     num_groups: Optional[int],
+    *,
+    accumulate: bool = False,
 ) -> GroupedGemmLaunch:
     """The weight-gradient preparation of :func:`prepare_grouped_gemm_wgrad`, after its mode check and alert."""
+    _require_flag(accumulate, "accumulate", "prepare_grouped_gemm_wgrad")
+    if accumulate:
+        _check_accumulate_out(
+            out, out_dtype, {"g": g, "x": x, "offs": offs}, "prepare_grouped_gemm_wgrad"
+        )
     c = host_plan_constants()
     block_n = int(c["block_n"])
     if g.dtype != torch.bfloat16 or x.dtype != torch.bfloat16:
@@ -1691,8 +1933,27 @@ def _prepare_wgrad(
         constants=c,
     )
     plan["wave_mode"] = int(c["wave_sync_mode"][arch]) if wave else 0
+    mode, reason = "off", None
+    if accumulate:
+        # The route, the tile, the stage and the plan are the overwrite's (the twin's); only the
+        # binding differs (module docstring, accumulate mode).
+        mode, reason = wgrad_accumulate_mode(
+            name, main_stage, tile_k, arch, aligned=_accumulate_aligned(out)
+        )
+        if reason == "alignment":
+            _warn_once(
+                "accumulate_alignment",
+                "prepare_grouped_gemm_wgrad(accumulate=True): out is not "
+                f"{ACC_ALIGN}-byte aligned (base, row pitch or expert pitch), so the weight "
+                "gradient is written to a scratch and added with out.add_ (the composed route, "
+                'plan["accumulate"] == "composed"); this warning is issued once per process',
+            )
+    plan["accumulate"] = mode
+    if reason is not None:
+        plan["accumulate_reason"] = reason
     if sum_m == 0:
-        return _finish("wgrad", name, plan, out, (), [], [], zero_fill=True)
+        # No row: an overwrite stores exact zeros, an accumulate leaves out as it is (no launch, no add).
+        return _finish("wgrad", name, plan, out, (), [], [], zero_fill=not accumulate)
     grid_x, clusters, splits = plan["grid"][0], plan["clusters"], plan["tail_splits"]
     slots = _aligned_bytes(
         grid_x * int(c["tmap_slots_per_cta"]) * int(c["tmap_slot_bytes"]),
@@ -1700,7 +1961,15 @@ def _prepare_wgrad(
         "per-CTA descriptor slots",
     )
     workspaces: list = [slots]
-    c_view = _span_view(out)
+    # The tensor the bound programs write: out, or on the composed route a contiguous scratch of its
+    # dtype (allocated here; from the graph's pool when the preparation runs under capture).
+    add_from = None
+    target = out
+    if mode == "composed":
+        add_from = target = torch.empty(
+            num_groups, n, k, dtype=out.dtype, device=device
+        )
+    c_view = _span_view(target)
     main_kwargs = dict(
         A=g,
         B=x,
@@ -1713,8 +1982,8 @@ def _prepare_wgrad(
         sum_m=sum_m,
         N=n,
         K=k,
-        ldc=int(out.stride(1)),
-        stride_e=int(out.stride(0)),
+        ldc=int(target.stride(1)),
+        stride_e=int(target.stride(0)),
         wave_mode=plan["wave_mode"],
         grid=plan["grid"],
     )
@@ -1743,8 +2012,9 @@ def _prepare_wgrad(
         )
         main_kwargs["partials"] = partials
         workspaces.append(partials)
-    stages = [main_stage]
-    launches = [_bind(name, main_stage, main_kwargs, arch, sizes=sizes)]
+    bound = main_stage + ACC_SUFFIX if mode == "fused" else main_stage
+    stages = [bound]
+    launches = [_bind(name, bound, main_kwargs, arch, sizes=sizes)]
     if plan["tail_reduce_grid"] is not None:
         reduce_kwargs = dict(
             partials=partials,
@@ -1753,8 +2023,8 @@ def _prepare_wgrad(
             num_groups=num_groups,
             N=n,
             K=k,
-            ldc=int(out.stride(1)),
-            stride_e=int(out.stride(0)),
+            ldc=int(target.stride(1)),
+            stride_e=int(target.stride(0)),
             num_clusters=clusters,
             tail_splits=splits,
             raster_rows=plan["raster_rows"],
@@ -1762,7 +2032,17 @@ def _prepare_wgrad(
         )
         stages.append("tail_reduce")
         launches.append(_bind(reduce_name, "tail_reduce", reduce_kwargs, arch))
-    return _finish("wgrad", name, plan, out, tuple(stages), launches, workspaces)
+    return _finish(
+        "wgrad",
+        name,
+        plan,
+        out,
+        tuple(stages),
+        launches,
+        workspaces,
+        add_from=add_from,
+        bump_version=mode == "fused",
+    )
 
 
 def prepare_grouped_gemm_wgrad(
@@ -1774,6 +2054,7 @@ def prepare_grouped_gemm_wgrad(
     num_groups: Optional[int] = None,
     *,
     deterministic: bool = True,
+    accumulate: bool = False,
 ) -> GroupedGemmLaunch:
     """Prepare ``dW[E, N, K] = grouped G[e].T @ X[e]`` (bf16 in; bf16 or fp32 out), non-deterministic.
 
@@ -1790,7 +2071,20 @@ def prepare_grouped_gemm_wgrad(
     to run; with the 256-wide k tile the deterministic program and its ordered
     tail reduce run.  Under ``torch.use_deterministic_algorithms(True)`` this
     function raises the non-determinism alert (module docstring).
+
+    ``accumulate=True`` adds instead: every launch computes
+    ``out[e] <- out[e] + G[e].T @ X[e]`` into the caller's ``out`` (required, bf16
+    or fp32; ``out_dtype`` None or ``out.dtype``; rows and experts that do not
+    overlap, no memory shared with ``g``, ``x`` or ``offs``; ``ValueError``
+    otherwise).  Empty groups are not written by the fused route, and no row
+    (``sum_m == 0``) launches nothing and leaves ``out`` unchanged.
+    ``plan["accumulate"]`` is ``"fused"`` (one launch of the stage's accumulate
+    build, ``stages == (stage + ACC_SUFFIX,)``) or ``"composed"`` (the overwrite
+    into a scratch of ``out.dtype`` held by the launch, then ``out.add_``;
+    ``plan["accumulate_reason"]`` says why); every other plan key is the
+    overwrite's (module docstring, accumulate mode).  Each ``launch()`` and each
+    replay of a graph that captured it adds again.
     """
     _require_deterministic_false(deterministic, "prepare_grouped_gemm_wgrad")
     _alert_not_deterministic("prepare_grouped_gemm_wgrad")
-    return _prepare_wgrad(g, x, offs, out, out_dtype, num_groups)
+    return _prepare_wgrad(g, x, offs, out, out_dtype, num_groups, accumulate=accumulate)

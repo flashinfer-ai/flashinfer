@@ -359,7 +359,10 @@ def test_routes_mirror_the_deterministic_package():
     (``cake_backend.ROW_BASES``: the same tensors again), which a deterministic build
     of an older kernel does not.  A wave-synchronised stage may be missing on an
     architecture whose host plan never selects it (not in ``wave_sync_archs`` for the
-    route's k tile).  (A CPU check; it lives here because the backend suite imports no
+    route's k tile).  The accumulate stages of the 512-wide k tile (``<stage>_acc``,
+    which the deterministic package does not have) are left out of the mirror; their
+    twins are mirrored, and ``test_cake_moe_grouped_gemm_acc.py`` checks them against
+    their twins.  (A CPU check; it lives here because the backend suite imports no
     package but its own.)"""
     det_routes, det_programs = det_jit.ROUTES, det_jit.PROGRAMS
     routes, programs = cake_jit.ROUTES, cake_jit.PROGRAMS
@@ -385,6 +388,7 @@ def test_routes_mirror_the_deterministic_package():
                 s["name"]
                 for s in route["stages"]
                 if arch in programs[s["program"]]["arches"]
+                and not s["name"].endswith(cb.ACC_SUFFIX)
             }
             expected_stages = det_stages - {"tail_reduce"} if unordered else det_stages
             unselected = set()
