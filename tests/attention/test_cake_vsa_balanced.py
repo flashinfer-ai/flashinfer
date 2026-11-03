@@ -234,7 +234,7 @@ def test_route_needs_seven_blocks_and_eight_tiles(
         (15, 8, 64, [40] * 15, 152, False, True),  # 0.79 waves on 152 SMs
         (16, 8, 128, [64] * 16, 148, True, True),  # the cap (one wave of 128 tiles)
         (16, 8, 128, [68] * 16, 148, False, True),  # longer rows in one bucket
-        (64, 8, 256, [96] * 64, 148, False, True),  # longer rows in one bucket, 512 tiles
+        (64, 8, 256, [96] * 64, 148, False, True),  # one bucket, 512 tiles
         (32, 8, 256, [252, 256] * 16, 148, False, True),  # both in the last bucket
         (32, 8, 256, [248, 256] * 16, 148, True, True),  # buckets 62 and 63
         (16, 8, 128, [32, 64] * 8, 148, False, True),  # several buckets in one wave
@@ -259,7 +259,14 @@ def test_route_keeps_the_ws_program_where_it_is_faster(
 
 def test_balanced_beats_per_head_boundaries():
     def beats(
-        profile, fewest, most, selected=None, mb=1, tiles=128, sm_count=148, arch="sm_100a"
+        profile,
+        fewest,
+        most,
+        selected=None,
+        mb=1,
+        tiles=128,
+        sm_count=148,
+        arch="sm_100a",
     ):
         return cake_vsa._blk64_balanced_beats_per_head(
             arch=arch,
