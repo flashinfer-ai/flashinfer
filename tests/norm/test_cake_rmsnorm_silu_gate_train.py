@@ -1090,12 +1090,12 @@ TIER_ROUTES = {
 # whose grid is one cluster of 16 CTAs whatever the rows).
 SHORT_ROUTES = {
     "sm_100a": {
-        "fwd_short": ("max_rows_per_sm", 10),
+        "fwd_short": ("max_rows_per_sm", 12),
         "bwd_bf16_short": ("max_rows", 256),
         "bwd_f32_short": ("max_rows", 256),
     },
     "sm_103a": {
-        "fwd_short": ("max_rows_per_sm", 10),
+        "fwd_short": ("max_rows_per_sm", 12),
         "bwd_bf16_short": ("max_rows", 256),
         "bwd_f32_short": ("max_rows", 256),
     },
@@ -1163,14 +1163,14 @@ def test_short_long_and_mid_modules_run_from_their_rows_per_sm(sm_count):
                 want = _tier_module(arch, role, rows, sm_count)
                 got = loader.module_for_rows(arch, role, rows, sm_count)
                 assert got == want, (arch, role, rows)
-    # the forward on sm_100a: the short forward up to 10 rows per SM, the
+    # the forward on sm_100a: the short forward up to 12 rows per SM, the
     # forward above, then the mid forward from 976 rows per SM, then the long
     # forward from 2400
     routes = loader.ROUTES["sm_100a"]
     for rows, role in (
         (1, "fwd_short"),
-        (10 * sm_count, "fwd_short"),
-        (10 * sm_count + 1, "fwd"),
+        (12 * sm_count, "fwd_short"),
+        (12 * sm_count + 1, "fwd"),
         (976 * sm_count - 1, "fwd"),
         (976 * sm_count, "fwd_mid"),
         (2400 * sm_count - 1, "fwd_mid"),
@@ -1298,8 +1298,8 @@ def test_mid_forward_grid_is_whole_waves_of_at_most_two_blocks_a_cta(
     assert loader.launch_grid(record, rows=rows, sm_count=sm_count, ctas=7) == grid
 
 
-# (rows, SMs) of the short forward: one CTA per 16-row block, up to 10 rows per
-# SM, so fewer CTAs than SMs.
+# (rows, SMs) of the short forward: one CTA per 16-row block, up to 12 rows per
+# SM, so at most the SMs less 16 CTAs.
 SHORT_FORWARD_GRIDS = [
     (1, 148),
     (48, 148),  # T 1, H 48: 3 blocks
@@ -1307,6 +1307,8 @@ SHORT_FORWARD_GRIDS = [
     (21 * 48, 148),  # 6.8 rows per SM on B200
     (10 * 148, 148),  # B200 at 10 rows per SM: 93 blocks
     (10 * 152, 152),  # GB300 at 10 rows per SM: 95 blocks
+    (12 * 148, 148),  # B200 at 12 rows per SM: 111 blocks
+    (12 * 152, 152),  # GB300 at 12 rows per SM: 114 blocks
 ]
 
 
@@ -1320,7 +1322,7 @@ def test_short_forward_grid_is_one_cta_a_block_below_one_cta_per_sm(rows, sm_cou
     record = loader.MODULES[name]
     assert record["grid_rule"] == {
         "kind": "row_blocks",
-        "max_rows_per_sm": 10,
+        "max_rows_per_sm": 12,
         "rows_per_cta": 16,
     }
     assert record["launch"]["block"] == (256, 1, 1)
@@ -1328,7 +1330,7 @@ def test_short_forward_grid_is_one_cta_a_block_below_one_cta_per_sm(rows, sm_cou
     assert record["arches"] == ["sm_100a", "sm_103a"]
     grid = loader.launch_grid(record, rows=rows, sm_count=sm_count)
     assert grid == (-(-rows // 16), 1, 1)
-    assert grid[0] < sm_count
+    assert grid[0] <= sm_count - 16
     assert loader.launch_grid(record, rows=rows, sm_count=sm_count, ctas=7) == grid
     # the deterministic forward's grid: one 128-thread CTA per 16-row block
     fwd = loader.MODULES[loader.route_module("sm_100a", "fwd")]

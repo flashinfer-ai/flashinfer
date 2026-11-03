@@ -43,237 +43,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 572
-#define TMEM_TMEM_SFA_OFFSET 512
-#define TMEM_TMEM_SFB_OFFSET 524
-#define TMEM_TMEM_SFB_HI_OFFSET 548
-#define TMEM_ACCUMULATOR_OFFSET 0
-#define NUM_SCHEDULE_PIPE_STAGES 1
-#define NUM_DRAIN_PIPE_0_STAGES 1
-#define NUM_DRAIN_PIPE_1_STAGES 1
-#define NUM_DRAIN_PIPE_2_STAGES 1
-#define NUM_DRAIN_PIPE_3_STAGES 1
-#define NUM_DRAIN_PIPE_4_STAGES 1
-#define NUM_DRAIN_PIPE_5_STAGES 1
-#define NUM_DRAIN_PIPE_6_STAGES 1
-#define NUM_DRAIN_PIPE_7_STAGES 1
-#define SMEM_A_NT_OFF 1024
-#define SMEM_A_NT_STAGE_BYTES 16384
-#define SMEM_A_NT_STRIDE 16384
-#define SMEM_MN_VIEW_OFF 1024
-#define SMEM_MN_VIEW_STAGE_BYTES 16384
-#define SMEM_MN_VIEW_STRIDE 16384
-#define SMEM_B_NT_OFF 66560
-#define SMEM_B_NT_STAGE_BYTES 16384
-#define SMEM_B_NT_STRIDE 16384
-#define SMEM_MN_VIEW_0_OFF 66560
-#define SMEM_MN_VIEW_0_STAGE_BYTES 16384
-#define SMEM_MN_VIEW_0_STRIDE 16384
-#define SMEM_B_NT_HI_OFF 132096
-#define SMEM_B_NT_HI_STAGE_BYTES 16384
-#define SMEM_B_NT_HI_STRIDE 16384
-#define SMEM_MN_VIEW_1_OFF 132096
-#define SMEM_MN_VIEW_1_STAGE_BYTES 16384
-#define SMEM_MN_VIEW_1_STRIDE 16384
-#define SMEM_D_SMEM_OFF 207872
-#define SMEM_D_SMEM_STAGE_BYTES 8192
-#define SMEM_D_SMEM_STRIDE 8192
-#define SMEM_FLAT_VIEW_OFF 207872
-#define SMEM_FLAT_VIEW_STAGE_BYTES 24576
-#define SMEM_FLAT_VIEW_STRIDE 24576
-#define SMEM_SW_DH_OFF 1024
-#define SMEM_SW_DH_STAGE_BYTES 32768
-#define SMEM_SW_DH_STRIDE 32768
-#define SMEM_SW_GATE_OFF 66560
-#define SMEM_SW_GATE_STAGE_BYTES 32768
-#define SMEM_SW_GATE_STRIDE 32768
-#define SMEM_SW_UP_OFF 132096
-#define SMEM_SW_UP_STAGE_BYTES 32768
-#define SMEM_SW_UP_STRIDE 32768
-#define SMEM_FLAT_VIEW_0_OFF 197632
-#define SMEM_FLAT_VIEW_0_STAGE_BYTES 1024
-#define SMEM_FLAT_VIEW_0_STRIDE 1024
-#define SMEM_FLAT_VIEW_1_OFF 1024
-#define SMEM_FLAT_VIEW_1_STAGE_BYTES 65536
-#define SMEM_FLAT_VIEW_1_STRIDE 65536
-#define SMEM_FLAT_VIEW_2_OFF 66560
-#define SMEM_FLAT_VIEW_2_STAGE_BYTES 65536
-#define SMEM_FLAT_VIEW_2_STRIDE 65536
-#define SMEM_FLAT_VIEW_3_OFF 132096
-#define SMEM_FLAT_VIEW_3_STAGE_BYTES 65536
-#define SMEM_FLAT_VIEW_3_STRIDE 65536
-#define SMEM_REPLAY_GATE_OFF 1024
-#define SMEM_REPLAY_GATE_STAGE_BYTES 32768
-#define SMEM_REPLAY_GATE_STRIDE 32768
-#define SMEM_REPLAY_UP_OFF 99328
-#define SMEM_REPLAY_UP_STAGE_BYTES 32768
-#define SMEM_REPLAY_UP_STRIDE 32768
-#define SMEM_FLAT_VIEW_4_OFF 197632
-#define SMEM_FLAT_VIEW_4_STAGE_BYTES 34816
-#define SMEM_FLAT_VIEW_4_STRIDE 34816
-#define SMEM_FLAT_VIEW_5_OFF 197632
-#define SMEM_FLAT_VIEW_5_STAGE_BYTES 34816
-#define SMEM_FLAT_VIEW_5_STRIDE 34816
-#define SMEM_SMEM_V19_OFF 1024
-#define SMEM_SMEM_V19_STAGE_BYTES 81920
-#define SMEM_SMEM_V19_STRIDE 81920
-#define SMEM_SMEM_V19_0_OFF 17408
-#define SMEM_SMEM_V19_0_STAGE_BYTES 66048
-#define SMEM_SMEM_V19_0_STRIDE 66048
-#define SMEM_SMEM_V19_1_OFF 99328
-#define SMEM_SMEM_V19_1_STAGE_BYTES 81920
-#define SMEM_SMEM_V19_1_STRIDE 81920
-#define SMEM_SMEM_V19_2_OFF 115712
-#define SMEM_SMEM_V19_2_STAGE_BYTES 66048
-#define SMEM_SMEM_V19_2_STRIDE 66048
-#define SMEM_FLAT_VIEW_6_OFF 1024
-#define SMEM_FLAT_VIEW_6_STAGE_BYTES 131072
-#define SMEM_FLAT_VIEW_6_STRIDE 131072
-#define SMEM_FLAT_VIEW_7_OFF 199680
-#define SMEM_FLAT_VIEW_7_STAGE_BYTES 512
-#define SMEM_FLAT_VIEW_7_STRIDE 512
-#define SMEM_SMEM_V25_OFF 1024
-#define SMEM_SMEM_V25_STAGE_BYTES 131072
-#define SMEM_SMEM_V25_STRIDE 131072
-#define SMEM_SMEM_V26_OFF 1280
-#define SMEM_SMEM_V26_STAGE_BYTES 130816
-#define SMEM_SMEM_V26_STRIDE 130816
-#define SMEM_SMEM_V27_OFF 1536
-#define SMEM_SMEM_V27_STAGE_BYTES 130560
-#define SMEM_SMEM_V27_STRIDE 130560
-#define SMEM_SMEM_V28_OFF 1792
-#define SMEM_SMEM_V28_STAGE_BYTES 130304
-#define SMEM_SMEM_V28_STRIDE 130304
-#define SMEM_SMEM_V29_OFF 132096
-#define SMEM_SMEM_V29_STAGE_BYTES 16384
-#define SMEM_SMEM_V29_STRIDE 16384
-#define SMEM_SMEM_V30_OFF 148480
-#define SMEM_SMEM_V30_STAGE_BYTES 16384
-#define SMEM_SMEM_V30_STRIDE 16384
-#define SMEM_SMEM_V31_OFF 164864
-#define SMEM_SMEM_V31_STAGE_BYTES 512
-#define SMEM_SMEM_V31_STRIDE 512
-#define SMEM_SMEM_V32_OFF 165376
-#define SMEM_SMEM_V32_STAGE_BYTES 512
-#define SMEM_SMEM_V32_STRIDE 512
-#define SMEM_SMEM_V33_OFF 165888
-#define SMEM_SMEM_V33_STAGE_BYTES 16384
-#define SMEM_SMEM_V33_STRIDE 16384
-#define SMEM_SMEM_V34_OFF 182272
-#define SMEM_SMEM_V34_STAGE_BYTES 16384
-#define SMEM_SMEM_V34_STRIDE 16384
-#define SMEM_SMEM_V35_OFF 198656
-#define SMEM_SMEM_V35_STAGE_BYTES 512
-#define SMEM_SMEM_V35_STRIDE 512
-#define SMEM_SMEM_V36_OFF 199168
-#define SMEM_SMEM_V36_STAGE_BYTES 512
-#define SMEM_SMEM_V36_STRIDE 512
-#define SMEM_SMEM_V37_OFF 1024
-#define SMEM_SMEM_V37_STAGE_BYTES 65536
-#define SMEM_SMEM_V37_STRIDE 65536
-#define SMEM_SMEM_V38_OFF 1280
-#define SMEM_SMEM_V38_STAGE_BYTES 65280
-#define SMEM_SMEM_V38_STRIDE 65280
-#define SMEM_SMEM_V39_OFF 66560
-#define SMEM_SMEM_V39_STAGE_BYTES 65536
-#define SMEM_SMEM_V39_STRIDE 65536
-#define SMEM_SMEM_V40_OFF 66816
-#define SMEM_SMEM_V40_STAGE_BYTES 65280
-#define SMEM_SMEM_V40_STRIDE 65280
-#define SMEM_FLAT_VIEW_8_OFF 1024
-#define SMEM_FLAT_VIEW_8_STAGE_BYTES 229376
-#define SMEM_FLAT_VIEW_8_STRIDE 229376
-#define SMEM_SMEM_V42_OFF 1024
-#define SMEM_SMEM_V42_STAGE_BYTES 16384
-#define SMEM_SMEM_V42_STRIDE 16384
-#define SMEM_SMEM_V43_OFF 66560
-#define SMEM_SMEM_V43_STAGE_BYTES 16384
-#define SMEM_SMEM_V43_STRIDE 16384
-#define SMEM_SMEM_V44_OFF 132096
-#define SMEM_SMEM_V44_STAGE_BYTES 16384
-#define SMEM_SMEM_V44_STRIDE 16384
-#define SMEM_SMEM_V45_OFF 197632
-#define SMEM_SMEM_V45_STAGE_BYTES 512
-#define SMEM_SMEM_V45_STRIDE 512
-#define SMEM_SMEM_V46_OFF 199680
-#define SMEM_SMEM_V46_STAGE_BYTES 1024
-#define SMEM_SMEM_V46_STRIDE 1024
-#define SMEM_SMEM_V47_OFF 203776
-#define SMEM_SMEM_V47_STAGE_BYTES 1024
-#define SMEM_SMEM_V47_STRIDE 1024
-#define SMEM_SMEM_V48_OFF 1024
-#define SMEM_SMEM_V48_STAGE_BYTES 16384
-#define SMEM_SMEM_V48_STRIDE 16384
-#define SMEM_SMEM_V49_OFF 99328
-#define SMEM_SMEM_V49_STAGE_BYTES 16384
-#define SMEM_SMEM_V49_STRIDE 16384
-#define SMEM_SMEM_V50_OFF 197632
-#define SMEM_SMEM_V50_STAGE_BYTES 512
-#define SMEM_SMEM_V50_STRIDE 512
-#define SMEM_SMEM_V51_OFF 200704
-#define SMEM_SMEM_V51_STAGE_BYTES 1024
-#define SMEM_SMEM_V51_STRIDE 1024
-#define SMEM_SMEM_V52_OFF 207872
-#define SMEM_SMEM_V52_STAGE_BYTES 16384
-#define SMEM_SMEM_V52_STRIDE 16384
-#define SMEM_SMEM_V53_OFF 224256
-#define SMEM_SMEM_V53_STAGE_BYTES 4096
-#define SMEM_SMEM_V53_STRIDE 4096
-#define SMEM_SMEM_V54_OFF 228352
-#define SMEM_SMEM_V54_STAGE_BYTES 512
-#define SMEM_SMEM_V54_STRIDE 512
-#define SMEM_SMEM_V55_OFF 228864
-#define SMEM_SMEM_V55_STAGE_BYTES 512
-#define SMEM_SMEM_V55_STRIDE 512
-#define SMEM_SMEM_V56_OFF 1024
-#define SMEM_SMEM_V56_STAGE_BYTES 65536
-#define SMEM_SMEM_V56_STRIDE 65536
-#define SMEM_SMEM_V57_OFF 1024
-#define SMEM_SMEM_V57_STAGE_BYTES 65536
-#define SMEM_SMEM_V57_STRIDE 65536
-#define SMEM_SMEM_V57_0_OFF 66560
-#define SMEM_SMEM_V57_0_STAGE_BYTES 32768
-#define SMEM_SMEM_V57_0_STRIDE 32768
-#define SMEM_SMEM_V57_1_OFF 99328
-#define SMEM_SMEM_V57_1_STAGE_BYTES 32768
-#define SMEM_SMEM_V57_1_STRIDE 32768
-#define SMEM_SMEM_V57_2_OFF 132096
-#define SMEM_SMEM_V57_2_STAGE_BYTES 1024
-#define SMEM_SMEM_V57_2_STRIDE 1024
-#define SMEM_SMEM_V57_3_OFF 133120
-#define SMEM_SMEM_V57_3_STAGE_BYTES 1024
-#define SMEM_SMEM_V57_3_STRIDE 1024
-#define SMEM_SMEM_V62_OFF 132096
-#define SMEM_SMEM_V62_STAGE_BYTES 1024
-#define SMEM_SMEM_V62_STRIDE 1024
-#define SMEM_SMEM_V62_0_OFF 133120
-#define SMEM_SMEM_V62_0_STAGE_BYTES 1024
-#define SMEM_SMEM_V62_0_STRIDE 1024
-#define SMEM_SMEM_V56_0_OFF 134144
-#define SMEM_SMEM_V56_0_STAGE_BYTES 32768
-#define SMEM_SMEM_V56_0_STRIDE 32768
-#define SMEM_SMEM_V57_4_OFF 134144
-#define SMEM_SMEM_V57_4_STAGE_BYTES 32768
-#define SMEM_SMEM_V57_4_STRIDE 32768
-#define SMEM_SMEM_V57_5_OFF 166912
-#define SMEM_SMEM_V57_5_STAGE_BYTES 16384
-#define SMEM_SMEM_V57_5_STRIDE 16384
-#define SMEM_SMEM_V57_6_OFF 183296
-#define SMEM_SMEM_V57_6_STAGE_BYTES 16384
-#define SMEM_SMEM_V57_6_STRIDE 16384
-#define SMEM_SMEM_V57_7_OFF 199680
-#define SMEM_SMEM_V57_7_STAGE_BYTES 512
-#define SMEM_SMEM_V57_7_STRIDE 512
-#define SMEM_SMEM_V57_8_OFF 200192
-#define SMEM_SMEM_V57_8_STAGE_BYTES 512
-#define SMEM_SMEM_V57_8_STRIDE 512
-#define SMEM_SMEM_V70_OFF 200704
-#define SMEM_SMEM_V70_STAGE_BYTES 1024
-#define SMEM_SMEM_V70_STRIDE 1024
-#define SMEM_TOTAL 232448
-#define THREADS 256
-#define CAKE_TMEM_HOLD_OFFSET 704
 #define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
@@ -557,7 +326,7 @@ kernel_cake_mok_backward_mxfp8_fp32(const __grid_constant__ CUtensorMap dy_s, co
     int cta_rank;
     asm volatile("mov.b32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
 
-    // Kernel setup ops
+    // Prologue
     __nv_bfloat16* a_nt = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
     const int a_nt_addr = smem + 1024;
     __nv_bfloat16* mn_view = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
@@ -700,6 +469,8 @@ kernel_cake_mok_backward_mxfp8_fp32(const __grid_constant__ CUtensorMap dy_s, co
     const int smem_v57_addr_8 = smem + 200192;
     float* smem_v70 = reinterpret_cast<float*>(smem_raw + 200704);
     const int smem_v70_addr = smem + 200704;
+
+    // Kernel setup ops
     int tokens = num_tokens[0];
     int i_tiles = intermediate / 128;
     int shared_down = local_tokens / 256 * ((intermediate + 511) / 512);
@@ -731,8 +502,7 @@ kernel_cake_mok_backward_mxfp8_fp32(const __grid_constant__ CUtensorMap dy_s, co
     }
     asm volatile("setmaxnreg.inc.sync.aligned.u32 256;");
 
-    // Mbarrier init (33 pipeline groups, 0 ordered-sequence groups, 57 barriers)
-    // Mbarriers at smem_raw[0..704)
+    // Mbarrier init (57 barriers at smem_raw[0..704))
 
     if (threadIdx.x == 0) {
         // replay_arrived: 3 barriers, init_count=1
@@ -854,14 +624,14 @@ kernel_cake_mok_backward_mxfp8_fp32(const __grid_constant__ CUtensorMap dy_s, co
     asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_tmem_sfa = taddr + 512;
+    const unsigned int tmem_tmem_sfb = taddr + 524;
+    const unsigned int tmem_tmem_sfb_hi = taddr + 548;
+    const unsigned int tmem_accumulator = taddr;
 
     // Kernel post-init ops
-    const int tmem_tmem_sfa = taddr + 512;
-    const int tmem_tmem_sfb = taddr + 524;
-    const int tmem_tmem_sfb_hi = taddr + 548;
-    const int tmem_accumulator = taddr;
-    unsigned int taddr_1 = reinterpret_cast<const volatile unsigned int*>(reinterpret_cast<uint8_t*>(smem_raw) + CAKE_TMEM_HOLD_OFFSET)[0];
+    unsigned int taddr_1 = taddr;
     int cta_rank_0 = cta_rank;
     int cluster = bid / 2;
     int gemm_deep = 0;
@@ -902,7 +672,7 @@ kernel_cake_mok_backward_mxfp8_fp32(const __grid_constant__ CUtensorMap dy_s, co
         }
         __syncthreads();
         if (tid == 0) {
-            asm volatile("red.release.gpu.global.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(weight_ready)) + (0))), "r"(static_cast<unsigned int>(1)) : "memory");
+            asm volatile("red.release.gpu.global.add.u32 [%0], %1;" :: "l"(reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(weight_ready))), "r"(static_cast<unsigned int>(1)) : "memory");
             int poll_first;
             asm volatile("ld.relaxed.gpu.s32 %0, [%1];" : "=r"(poll_first) : "l"(weight_ready + 0) : "memory");
             int poll = poll_first;
@@ -934,7 +704,7 @@ kernel_cake_mok_backward_mxfp8_fp32(const __grid_constant__ CUtensorMap dy_s, co
             }
             __syncthreads();
             if (peer_1 >= 0) {
-                cp_async_bulk_gmem2smem(smem_v37_addr + (unsigned int)(tid * 256 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(reinterpret_cast<__nv_bfloat16*>(dy_peers[peer_1])) + ((unsigned long long)((unsigned long long)(peer_token / topk) * (unsigned long long)hidden + (unsigned long long)(task % col_blocks * 512)) * (unsigned long long)2)), min_1 * 2, dispatch_arrived_addr);
+                cp_async_bulk_gmem2smem(smem_v37_addr + (unsigned int)(tid * 256 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(reinterpret_cast<__nv_bfloat16*>(dy_peers[peer_1])) + (unsigned long long)((unsigned long long)(peer_token / topk) * (unsigned long long)hidden + (unsigned long long)(task % col_blocks * 512)) * (unsigned long long)2), min_1 * 2, dispatch_arrived_addr);
             } else if (tid < 128) {
                 #pragma unroll
                 for (int vec = 0; vec < 32; vec++) {
@@ -961,7 +731,7 @@ kernel_cake_mok_backward_mxfp8_fp32(const __grid_constant__ CUtensorMap dy_s, co
                 }
                 __syncthreads();
                 if (peer_2 >= 0) {
-                    cp_async_bulk_gmem2smem(smem_v39_addr + (unsigned int)(tid * 256 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(reinterpret_cast<__nv_bfloat16*>(dy_peers[peer_2])) + ((unsigned long long)((unsigned long long)(peer_token_1 / topk) * (unsigned long long)hidden + (unsigned long long)(col_block * 512) + 256) * (unsigned long long)2)), hi_cols * 2, dispatch_arrived_hi_addr);
+                    cp_async_bulk_gmem2smem(smem_v39_addr + (unsigned int)(tid * 256 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(reinterpret_cast<__nv_bfloat16*>(dy_peers[peer_2])) + (unsigned long long)((unsigned long long)(peer_token_1 / topk) * (unsigned long long)hidden + (unsigned long long)(col_block * 512) + 256) * (unsigned long long)2), hi_cols * 2, dispatch_arrived_hi_addr);
                 } else if (tid < 128) {
                     #pragma unroll
                     for (int vec_1 = 0; vec_1 < 32; vec_1++) {
@@ -1475,7 +1245,7 @@ kernel_cake_mok_backward_mxfp8_fp32(const __grid_constant__ CUtensorMap dy_s, co
                 }
                 __syncthreads();
                 if (peer_3 >= 0) {
-                    cp_async_bulk_gmem2smem(smem_v37_addr + (unsigned int)(tid * 256 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(reinterpret_cast<__nv_bfloat16*>(dy_peers[peer_3])) + ((unsigned long long)((unsigned long long)(peer_token_2 / topk) * (unsigned long long)hidden + (unsigned long long)(next_task % col_blocks * 512)) * (unsigned long long)2)), min_2 * 2, dispatch_arrived_addr);
+                    cp_async_bulk_gmem2smem(smem_v37_addr + (unsigned int)(tid * 256 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(reinterpret_cast<__nv_bfloat16*>(dy_peers[peer_3])) + (unsigned long long)((unsigned long long)(peer_token_2 / topk) * (unsigned long long)hidden + (unsigned long long)(next_task % col_blocks * 512)) * (unsigned long long)2), min_2 * 2, dispatch_arrived_addr);
                 } else if (tid < 128) {
                     #pragma unroll
                     for (int vec_2 = 0; vec_2 < 32; vec_2++) {
@@ -2081,31 +1851,31 @@ kernel_cake_mok_backward_mxfp8_fp32(const __grid_constant__ CUtensorMap dy_s, co
                     __syncthreads();
                     if (peers[0] >= 0) {
                         int chunk_cols_1 = ((1024) < (hidden - columns[0] * 1024) ? (1024) : (hidden - columns[0] * 1024));
-                        cp_async_bulk_gmem2smem(flat_view_addr_8 + (unsigned int)(tid * 1024 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(dx_routed_ptr) + ((unsigned long long)((unsigned long long)rows_1[0] * (unsigned long long)hidden + (unsigned long long)(columns[0] * 1024)) * (unsigned long long)2)), chunk_cols_1 * 2, combine_arrived_addr);
+                        cp_async_bulk_gmem2smem(flat_view_addr_8 + (unsigned int)(tid * 1024 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(dx_routed_ptr) + (unsigned long long)((unsigned long long)rows_1[0] * (unsigned long long)hidden + (unsigned long long)(columns[0] * 1024)) * (unsigned long long)2), chunk_cols_1 * 2, combine_arrived_addr);
                     }
                     if (peers[1] >= 0) {
                         int chunk_cols_2 = ((1024) < (hidden - columns[1] * 1024) ? (1024) : (hidden - columns[1] * 1024));
-                        cp_async_bulk_gmem2smem(flat_view_addr_8 + (unsigned int)((16 + tid) * 1024 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(dx_routed_ptr) + ((unsigned long long)((unsigned long long)rows_1[1] * (unsigned long long)hidden + (unsigned long long)(columns[1] * 1024)) * (unsigned long long)2)), chunk_cols_2 * 2, combine_arrived_addr + 8);
+                        cp_async_bulk_gmem2smem(flat_view_addr_8 + (unsigned int)((16 + tid) * 1024 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(dx_routed_ptr) + (unsigned long long)((unsigned long long)rows_1[1] * (unsigned long long)hidden + (unsigned long long)(columns[1] * 1024)) * (unsigned long long)2), chunk_cols_2 * 2, combine_arrived_addr + 8);
                     }
                     if (peers[2] >= 0) {
                         int chunk_cols_3 = ((1024) < (hidden - columns[2] * 1024) ? (1024) : (hidden - columns[2] * 1024));
-                        cp_async_bulk_gmem2smem(flat_view_addr_8 + (unsigned int)((32 + tid) * 1024 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(dx_routed_ptr) + ((unsigned long long)((unsigned long long)rows_1[2] * (unsigned long long)hidden + (unsigned long long)(columns[2] * 1024)) * (unsigned long long)2)), chunk_cols_3 * 2, combine_arrived_addr + 16);
+                        cp_async_bulk_gmem2smem(flat_view_addr_8 + (unsigned int)((32 + tid) * 1024 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(dx_routed_ptr) + (unsigned long long)((unsigned long long)rows_1[2] * (unsigned long long)hidden + (unsigned long long)(columns[2] * 1024)) * (unsigned long long)2), chunk_cols_3 * 2, combine_arrived_addr + 16);
                     }
                     if (peers[3] >= 0) {
                         int chunk_cols_4 = ((1024) < (hidden - columns[3] * 1024) ? (1024) : (hidden - columns[3] * 1024));
-                        cp_async_bulk_gmem2smem(flat_view_addr_8 + (unsigned int)((48 + tid) * 1024 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(dx_routed_ptr) + ((unsigned long long)((unsigned long long)rows_1[3] * (unsigned long long)hidden + (unsigned long long)(columns[3] * 1024)) * (unsigned long long)2)), chunk_cols_4 * 2, combine_arrived_addr + 24);
+                        cp_async_bulk_gmem2smem(flat_view_addr_8 + (unsigned int)((48 + tid) * 1024 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(dx_routed_ptr) + (unsigned long long)((unsigned long long)rows_1[3] * (unsigned long long)hidden + (unsigned long long)(columns[3] * 1024)) * (unsigned long long)2), chunk_cols_4 * 2, combine_arrived_addr + 24);
                     }
                     if (peers[4] >= 0) {
                         int chunk_cols_5 = ((1024) < (hidden - columns[4] * 1024) ? (1024) : (hidden - columns[4] * 1024));
-                        cp_async_bulk_gmem2smem(flat_view_addr_8 + (unsigned int)((64 + tid) * 1024 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(dx_routed_ptr) + ((unsigned long long)((unsigned long long)rows_1[4] * (unsigned long long)hidden + (unsigned long long)(columns[4] * 1024)) * (unsigned long long)2)), chunk_cols_5 * 2, combine_arrived_addr + 32);
+                        cp_async_bulk_gmem2smem(flat_view_addr_8 + (unsigned int)((64 + tid) * 1024 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(dx_routed_ptr) + (unsigned long long)((unsigned long long)rows_1[4] * (unsigned long long)hidden + (unsigned long long)(columns[4] * 1024)) * (unsigned long long)2), chunk_cols_5 * 2, combine_arrived_addr + 32);
                     }
                     if (peers[5] >= 0) {
                         int chunk_cols_6 = ((1024) < (hidden - columns[5] * 1024) ? (1024) : (hidden - columns[5] * 1024));
-                        cp_async_bulk_gmem2smem(flat_view_addr_8 + (unsigned int)((80 + tid) * 1024 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(dx_routed_ptr) + ((unsigned long long)((unsigned long long)rows_1[5] * (unsigned long long)hidden + (unsigned long long)(columns[5] * 1024)) * (unsigned long long)2)), chunk_cols_6 * 2, combine_arrived_addr + 40);
+                        cp_async_bulk_gmem2smem(flat_view_addr_8 + (unsigned int)((80 + tid) * 1024 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(dx_routed_ptr) + (unsigned long long)((unsigned long long)rows_1[5] * (unsigned long long)hidden + (unsigned long long)(columns[5] * 1024)) * (unsigned long long)2), chunk_cols_6 * 2, combine_arrived_addr + 40);
                     }
                     if (peers[6] >= 0) {
                         int chunk_cols_7 = ((1024) < (hidden - columns[6] * 1024) ? (1024) : (hidden - columns[6] * 1024));
-                        cp_async_bulk_gmem2smem(flat_view_addr_8 + (unsigned int)((96 + tid) * 1024 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(dx_routed_ptr) + ((unsigned long long)((unsigned long long)rows_1[6] * (unsigned long long)hidden + (unsigned long long)(columns[6] * 1024)) * (unsigned long long)2)), chunk_cols_7 * 2, combine_arrived_addr + 48);
+                        cp_async_bulk_gmem2smem(flat_view_addr_8 + (unsigned int)((96 + tid) * 1024 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(dx_routed_ptr) + (unsigned long long)((unsigned long long)rows_1[6] * (unsigned long long)hidden + (unsigned long long)(columns[6] * 1024)) * (unsigned long long)2), chunk_cols_7 * 2, combine_arrived_addr + 48);
                     }
                     if (valid_tiles > 0) {
                         int _parity_combine_arrived = (int)((unsigned int)combine_seq_0 % 2);
@@ -2364,7 +2134,7 @@ kernel_cake_mok_backward_mxfp8_fp32(const __grid_constant__ CUtensorMap dy_s, co
                     }
                     __syncthreads();
                     if (peer_5 >= 0) {
-                        cp_async_bulk_gmem2smem(smem_v37_addr + (unsigned int)(tid * 256 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(reinterpret_cast<__nv_bfloat16*>(x_peers[peer_5])) + ((unsigned long long)((unsigned long long)(peer_token_3 / topk) * (unsigned long long)hidden + (unsigned long long)(task_7 % col_blocks_3 * 512)) * (unsigned long long)2)), _min_2 * 2, dispatch_arrived_addr);
+                        cp_async_bulk_gmem2smem(smem_v37_addr + (unsigned int)(tid * 256 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(reinterpret_cast<__nv_bfloat16*>(x_peers[peer_5])) + (unsigned long long)((unsigned long long)(peer_token_3 / topk) * (unsigned long long)hidden + (unsigned long long)(task_7 % col_blocks_3 * 512)) * (unsigned long long)2), _min_2 * 2, dispatch_arrived_addr);
                     } else if (tid < 128) {
                         #pragma unroll
                         for (int vec_3 = 0; vec_3 < 32; vec_3++) {
@@ -2391,7 +2161,7 @@ kernel_cake_mok_backward_mxfp8_fp32(const __grid_constant__ CUtensorMap dy_s, co
                         }
                         __syncthreads();
                         if (peer_6 >= 0) {
-                            cp_async_bulk_gmem2smem(smem_v39_addr + (unsigned int)(tid * 256 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(reinterpret_cast<__nv_bfloat16*>(x_peers[peer_6])) + ((unsigned long long)((unsigned long long)(peer_token_4 / topk) * (unsigned long long)hidden + (unsigned long long)(col_block_1 * 512) + 256) * (unsigned long long)2)), hi_cols_1 * 2, dispatch_arrived_hi_addr);
+                            cp_async_bulk_gmem2smem(smem_v39_addr + (unsigned int)(tid * 256 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(reinterpret_cast<__nv_bfloat16*>(x_peers[peer_6])) + (unsigned long long)((unsigned long long)(peer_token_4 / topk) * (unsigned long long)hidden + (unsigned long long)(col_block_1 * 512) + 256) * (unsigned long long)2), hi_cols_1 * 2, dispatch_arrived_hi_addr);
                         } else if (tid < 128) {
                             #pragma unroll
                             for (int vec_4 = 0; vec_4 < 32; vec_4++) {
@@ -2894,7 +2664,7 @@ kernel_cake_mok_backward_mxfp8_fp32(const __grid_constant__ CUtensorMap dy_s, co
                         }
                         __syncthreads();
                         if (peer_7 >= 0) {
-                            cp_async_bulk_gmem2smem(smem_v37_addr + (unsigned int)(tid * 256 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(reinterpret_cast<__nv_bfloat16*>(x_peers[peer_7])) + ((unsigned long long)((unsigned long long)(peer_token_5 / topk) * (unsigned long long)hidden + (unsigned long long)(next_task_1 % col_blocks_3 * 512)) * (unsigned long long)2)), _min_3 * 2, dispatch_arrived_addr);
+                            cp_async_bulk_gmem2smem(smem_v37_addr + (unsigned int)(tid * 256 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(reinterpret_cast<__nv_bfloat16*>(x_peers[peer_7])) + (unsigned long long)((unsigned long long)(peer_token_5 / topk) * (unsigned long long)hidden + (unsigned long long)(next_task_1 % col_blocks_3 * 512)) * (unsigned long long)2), _min_3 * 2, dispatch_arrived_addr);
                         } else if (tid < 128) {
                             #pragma unroll
                             for (int vec_5 = 0; vec_5 < 32; vec_5++) {
@@ -3410,7 +3180,7 @@ kernel_cake_mok_backward_mxfp8_fp32(const __grid_constant__ CUtensorMap dy_s, co
                     }
                     __syncthreads();
                     if (peer_8 >= 0) {
-                        cp_async_bulk_gmem2smem(smem_v37_addr + (unsigned int)(tid * 256 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(reinterpret_cast<__nv_bfloat16*>(dy_peers[peer_8])) + ((unsigned long long)((unsigned long long)(peer_token_6 / topk) * (unsigned long long)hidden + (unsigned long long)(task_0 % col_blocks_0_1 * 512)) * (unsigned long long)2)), min_1_1 * 2, dispatch_arrived_addr);
+                        cp_async_bulk_gmem2smem(smem_v37_addr + (unsigned int)(tid * 256 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(reinterpret_cast<__nv_bfloat16*>(dy_peers[peer_8])) + (unsigned long long)((unsigned long long)(peer_token_6 / topk) * (unsigned long long)hidden + (unsigned long long)(task_0 % col_blocks_0_1 * 512)) * (unsigned long long)2), min_1_1 * 2, dispatch_arrived_addr);
                     } else if (tid < 128) {
                         #pragma unroll
                         for (int vec_6 = 0; vec_6 < 32; vec_6++) {
@@ -3437,7 +3207,7 @@ kernel_cake_mok_backward_mxfp8_fp32(const __grid_constant__ CUtensorMap dy_s, co
                         }
                         __syncthreads();
                         if (peer_9 >= 0) {
-                            cp_async_bulk_gmem2smem(smem_v39_addr + (unsigned int)(tid * 256 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(reinterpret_cast<__nv_bfloat16*>(dy_peers[peer_9])) + ((unsigned long long)((unsigned long long)(peer_token_7 / topk) * (unsigned long long)hidden + (unsigned long long)(col_block_2 * 512) + 256) * (unsigned long long)2)), hi_cols_2 * 2, dispatch_arrived_hi_addr);
+                            cp_async_bulk_gmem2smem(smem_v39_addr + (unsigned int)(tid * 256 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(reinterpret_cast<__nv_bfloat16*>(dy_peers[peer_9])) + (unsigned long long)((unsigned long long)(peer_token_7 / topk) * (unsigned long long)hidden + (unsigned long long)(col_block_2 * 512) + 256) * (unsigned long long)2), hi_cols_2 * 2, dispatch_arrived_hi_addr);
                         } else if (tid < 128) {
                             #pragma unroll
                             for (int vec_7 = 0; vec_7 < 32; vec_7++) {
@@ -3951,7 +3721,7 @@ kernel_cake_mok_backward_mxfp8_fp32(const __grid_constant__ CUtensorMap dy_s, co
                         }
                         __syncthreads();
                         if (peer_10 >= 0) {
-                            cp_async_bulk_gmem2smem(smem_v37_addr + (unsigned int)(tid * 256 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(reinterpret_cast<__nv_bfloat16*>(dy_peers[peer_10])) + ((unsigned long long)((unsigned long long)(peer_token_8 / topk) * (unsigned long long)hidden + (unsigned long long)(next_task_2 % col_blocks_0_1 * 512)) * (unsigned long long)2)), min_2_1 * 2, dispatch_arrived_addr);
+                            cp_async_bulk_gmem2smem(smem_v37_addr + (unsigned int)(tid * 256 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(reinterpret_cast<__nv_bfloat16*>(dy_peers[peer_10])) + (unsigned long long)((unsigned long long)(peer_token_8 / topk) * (unsigned long long)hidden + (unsigned long long)(next_task_2 % col_blocks_0_1 * 512)) * (unsigned long long)2), min_2_1 * 2, dispatch_arrived_addr);
                         } else if (tid < 128) {
                             #pragma unroll
                             for (int vec_8 = 0; vec_8 < 32; vec_8++) {
@@ -8112,10 +7882,9 @@ kernel_cake_mok_backward_mxfp8_fp32(const __grid_constant__ CUtensorMap dy_s, co
                     int col_blocks_10 = intermediate / 128;
                     int num_tiles_1 = tokens / 128 * col_blocks_10;
                     int macro_row_offset_1 = tile_word_2 * (macro_size / 128);
-                    int first_tile_2 = tile_word_1 * 6 + cta_rank_0 * 3;
                     int global_mini_7 = tile_word_2 * (macro_size / mini_size) + tile_word_3;
                     int mini_tiles = mini_size / 128 * col_blocks_10;
-                    first_tile_2 = first_tile_2 + global_mini_7 * mini_tiles;
+                    int first_tile_2 = tile_word_1 * 6 + cta_rank_0 * 3 + global_mini_7 * mini_tiles;
                     int tile_end_1 = ((num_tiles_1) < ((global_mini_7 + 1) * mini_tiles) ? (num_tiles_1) : ((global_mini_7 + 1) * mini_tiles));
                     int macro_tiles_3 = macro_size / 128;
                     if (first_tile_2 < tile_end_1) {
@@ -11049,10 +10818,10 @@ kernel_cake_mok_backward_mxfp8_fp32(const __grid_constant__ CUtensorMap dy_s, co
                                         task_2_1 = decoded_cluster - comm_clusters - shared_down - shared_swiglu;
                                     } else {
                                         int weight_task_2 = decoded_cluster - comm_clusters - shared_down - shared_swiglu - shared_dx;
-                                        uint32_t _fast_div_q_17 = (shared_wgrad_div.divisor != 1) ? (__umulhi((uint32_t)((unsigned int)weight_task_2), shared_wgrad_div.multiplier) >> shared_wgrad_div.shift_right) : (uint32_t)((unsigned int)weight_task_2);
-                                        uint32_t _fast_div_r_17 = (uint32_t)((unsigned int)weight_task_2) - _fast_div_q_17 * (uint32_t)(shared_wgrad_div.divisor);
-                                        kind_1 = (int)_fast_div_q_17 + 3;
-                                        task_2_1 = (int)_fast_div_r_17;
+                                        uint32_t _fast_div_q_11 = (shared_wgrad_div.divisor != 1) ? (__umulhi((uint32_t)((unsigned int)weight_task_2), shared_wgrad_div.multiplier) >> shared_wgrad_div.shift_right) : (uint32_t)((unsigned int)weight_task_2);
+                                        uint32_t _fast_div_r_11 = (uint32_t)((unsigned int)weight_task_2) - _fast_div_q_11 * (uint32_t)(shared_wgrad_div.divisor);
+                                        kind_1 = (int)_fast_div_q_11 + 3;
+                                        task_2_1 = (int)_fast_div_r_11;
                                     }
                                 }
                             } else {
@@ -11060,23 +10829,23 @@ kernel_cake_mok_backward_mxfp8_fp32(const __grid_constant__ CUtensorMap dy_s, co
                                 int macro_task_1 = routed_1;
                                 int replay_tasks_1 = 0;
                                 if (routed_1 >= saved_tasks) {
-                                    uint32_t _fast_div_q_18 = (replay_macro_tasks_div.divisor != 1) ? (__umulhi((uint32_t)((unsigned int)(routed_1 - saved_tasks)), replay_macro_tasks_div.multiplier) >> replay_macro_tasks_div.shift_right) : (uint32_t)((unsigned int)(routed_1 - saved_tasks));
-                                    uint32_t _fast_div_r_18 = (uint32_t)((unsigned int)(routed_1 - saved_tasks)) - _fast_div_q_18 * (uint32_t)(replay_macro_tasks_div.divisor);
-                                    macro_3 = (int)_fast_div_q_18 + 1;
-                                    macro_task_1 = (int)_fast_div_r_18;
+                                    uint32_t _fast_div_q_12 = (replay_macro_tasks_div.divisor != 1) ? (__umulhi((uint32_t)((unsigned int)(routed_1 - saved_tasks)), replay_macro_tasks_div.multiplier) >> replay_macro_tasks_div.shift_right) : (uint32_t)((unsigned int)(routed_1 - saved_tasks));
+                                    uint32_t _fast_div_r_12 = (uint32_t)((unsigned int)(routed_1 - saved_tasks)) - _fast_div_q_12 * (uint32_t)(replay_macro_tasks_div.divisor);
+                                    macro_3 = (int)_fast_div_q_12 + 1;
+                                    macro_task_1 = (int)_fast_div_r_12;
                                 }
                                 int _min_268 = ((tokens - macro_3 * macro_size) < (macro_size) ? (tokens - macro_3 * macro_size) : (macro_size));
-                                uint32_t _fast_div_q_19 = (mini_size_div.divisor != 1) ? (__umulhi((uint32_t)((unsigned int)(_min_268 + mini_size - 1)), mini_size_div.multiplier) >> mini_size_div.shift_right) : (uint32_t)((unsigned int)(_min_268 + mini_size - 1));
-                                uint32_t _fast_div_r_19 = (uint32_t)((unsigned int)(_min_268 + mini_size - 1)) - _fast_div_q_19 * (uint32_t)(mini_size_div.divisor);
-                                int macro_minis_1 = (int)_fast_div_q_19;
+                                uint32_t _fast_div_q_13 = (mini_size_div.divisor != 1) ? (__umulhi((uint32_t)((unsigned int)(_min_268 + mini_size - 1)), mini_size_div.multiplier) >> mini_size_div.shift_right) : (uint32_t)((unsigned int)(_min_268 + mini_size - 1));
+                                uint32_t _fast_div_r_13 = (uint32_t)((unsigned int)(_min_268 + mini_size - 1)) - _fast_div_q_13 * (uint32_t)(mini_size_div.divisor);
+                                int macro_minis_1 = (int)_fast_div_q_13;
                                 if (routed_1 >= saved_tasks) {
                                     replay_tasks_1 = macro_minis_1 * mini_replay;
                                 }
                                 if (macro_task_1 < replay_tasks_1) {
-                                    uint32_t _fast_div_q_20 = (mini_replay_div.divisor != 1) ? (__umulhi((uint32_t)((unsigned int)macro_task_1), mini_replay_div.multiplier) >> mini_replay_div.shift_right) : (uint32_t)((unsigned int)macro_task_1);
-                                    uint32_t _fast_div_r_20 = (uint32_t)((unsigned int)macro_task_1) - _fast_div_q_20 * (uint32_t)(mini_replay_div.divisor);
-                                    mini_4 = (int)_fast_div_q_20;
-                                    int mini_task_2 = (int)_fast_div_r_20;
+                                    uint32_t _fast_div_q_14 = (mini_replay_div.divisor != 1) ? (__umulhi((uint32_t)((unsigned int)macro_task_1), mini_replay_div.multiplier) >> mini_replay_div.shift_right) : (uint32_t)((unsigned int)macro_task_1);
+                                    uint32_t _fast_div_r_14 = (uint32_t)((unsigned int)macro_task_1) - _fast_div_q_14 * (uint32_t)(mini_replay_div.divisor);
+                                    mini_4 = (int)_fast_div_q_14;
+                                    int mini_task_2 = (int)_fast_div_r_14;
                                     if (mini_task_2 < mini_replay_gate) {
                                         kind_1 = 6;
                                         task_2_1 = mini_task_2;
@@ -11090,10 +10859,10 @@ kernel_cake_mok_backward_mxfp8_fp32(const __grid_constant__ CUtensorMap dy_s, co
                                 } else {
                                     int bwd_task_1 = macro_task_1 - replay_tasks_1;
                                     if (bwd_task_1 < macro_minis_1 * mini_bwd) {
-                                        uint32_t _fast_div_q_21 = (mini_bwd_div.divisor != 1) ? (__umulhi((uint32_t)((unsigned int)bwd_task_1), mini_bwd_div.multiplier) >> mini_bwd_div.shift_right) : (uint32_t)((unsigned int)bwd_task_1);
-                                        uint32_t _fast_div_r_21 = (uint32_t)((unsigned int)bwd_task_1) - _fast_div_q_21 * (uint32_t)(mini_bwd_div.divisor);
-                                        mini_4 = (int)_fast_div_q_21;
-                                        int mini_task_3 = (int)_fast_div_r_21;
+                                        uint32_t _fast_div_q_15 = (mini_bwd_div.divisor != 1) ? (__umulhi((uint32_t)((unsigned int)bwd_task_1), mini_bwd_div.multiplier) >> mini_bwd_div.shift_right) : (uint32_t)((unsigned int)bwd_task_1);
+                                        uint32_t _fast_div_r_15 = (uint32_t)((unsigned int)bwd_task_1) - _fast_div_q_15 * (uint32_t)(mini_bwd_div.divisor);
+                                        mini_4 = (int)_fast_div_q_15;
+                                        int mini_task_3 = (int)_fast_div_r_15;
                                         if (mini_task_3 < mini_down) {
                                             kind_1 = 0;
                                             task_2_1 = mini_task_3;
@@ -11106,10 +10875,10 @@ kernel_cake_mok_backward_mxfp8_fp32(const __grid_constant__ CUtensorMap dy_s, co
                                         }
                                     } else {
                                         int weight_task_3 = bwd_task_1 - macro_minis_1 * mini_bwd;
-                                        uint32_t _fast_div_q_22 = (weight_tasks_div.divisor != 1) ? (__umulhi((uint32_t)((unsigned int)weight_task_3), weight_tasks_div.multiplier) >> weight_tasks_div.shift_right) : (uint32_t)((unsigned int)weight_task_3);
-                                        uint32_t _fast_div_r_22 = (uint32_t)((unsigned int)weight_task_3) - _fast_div_q_22 * (uint32_t)(weight_tasks_div.divisor);
-                                        kind_1 = (int)_fast_div_q_22 + 3;
-                                        task_2_1 = (int)_fast_div_r_22;
+                                        uint32_t _fast_div_q_16 = (weight_tasks_div.divisor != 1) ? (__umulhi((uint32_t)((unsigned int)weight_task_3), weight_tasks_div.multiplier) >> weight_tasks_div.shift_right) : (uint32_t)((unsigned int)weight_task_3);
+                                        uint32_t _fast_div_r_16 = (uint32_t)((unsigned int)weight_task_3) - _fast_div_q_16 * (uint32_t)(weight_tasks_div.divisor);
+                                        kind_1 = (int)_fast_div_q_16 + 3;
+                                        task_2_1 = (int)_fast_div_r_16;
                                     }
                                 }
                             }

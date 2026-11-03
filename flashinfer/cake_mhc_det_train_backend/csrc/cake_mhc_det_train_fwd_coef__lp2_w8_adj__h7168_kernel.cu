@@ -87,7 +87,7 @@ kernel_cake_mhc_det_train_fwd_coef__lp2_w8_adj__h7168(float* __restrict__ spart,
     #pragma unroll
     for (int j = 0; j < 2; j++) {
         tokr[j] = bid * 8 + (2 * warp_1 + j);
-        tcr[j] = (long long)(((tokr[j] < T) ? tokr[j] : T - 1));
+        tcr[j] = (long long)((tokr[j] < T) ? tokr[j] : T - 1);
         s_acc[j] = 0.0f;
     }
     #pragma unroll 8

@@ -47,48 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 128
-#define TMEM_ACC_OFFSET 0
-#define NUM_ONE_STAGES 1
-#define NUM_TWO_STAGES 2
-#define NUM_Q_PIPE_STAGES 3
-#define NUM_OPS_PIPE_STAGES 4
-#define SMEM_GK_P_OFF 0
-#define SMEM_GK_P_STAGE_BYTES 8192
-#define SMEM_GK_P_STRIDE 8192
-#define SMEM_K_P_OFF 32768
-#define SMEM_K_P_STAGE_BYTES 8192
-#define SMEM_K_P_STRIDE 8192
-#define SMEM_Q_P_OFF 68608
-#define SMEM_Q_P_STAGE_BYTES 1024
-#define SMEM_Q_P_STRIDE 1024
-#define SMEM_B_RING_OFF 49152
-#define SMEM_B_RING_STAGE_BYTES 8192
-#define SMEM_B_RING_STRIDE 8192
-#define SMEM_L1_S_OFF 65536
-#define SMEM_L1_S_STAGE_BYTES 1024
-#define SMEM_L1_S_STRIDE 1024
-#define SMEM_L2_S_OFF 66560
-#define SMEM_L2_S_STAGE_BYTES 2048
-#define SMEM_L2_S_STRIDE 2048
-#define SMEM_L3_S_OFF 68608
-#define SMEM_L3_S_STAGE_BYTES 3072
-#define SMEM_L3_S_STRIDE 3072
-#define SMEM_AII_S_OFF 71680
-#define SMEM_AII_S_STAGE_BYTES 1024
-#define SMEM_AII_S_STRIDE 1024
-#define SMEM_XCH_S_OFF 71680
-#define SMEM_XCH_S_STAGE_BYTES 4096
-#define SMEM_XCH_S_STRIDE 4096
-#define SMEM_TOT_S_OFF 75264
-#define SMEM_TOT_S_STAGE_BYTES 512
-#define SMEM_TOT_S_STRIDE 512
-#define SMEM_BETA_S_OFF 75776
-#define SMEM_BETA_S_STAGE_BYTES 256
-#define SMEM_BETA_S_STRIDE 256
-#define SMEM_TOTAL 76160
-#define THREADS 256
 #define LAUNCH_MIN_BLOCKS 3
 
 #include <math_constants.h>
@@ -266,7 +224,7 @@ kernel_cake_kda_train_c9395e21a813579c4bfc(const __grid_constant__ CUtensorMap q
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     float* gk_p = reinterpret_cast<float*>(smem_raw + 0);
     const int gk_p_addr = smem + 0;
     __nv_bfloat16* k_p = reinterpret_cast<__nv_bfloat16*>(smem_raw + 32768);
@@ -289,6 +247,8 @@ kernel_cake_kda_train_c9395e21a813579c4bfc(const __grid_constant__ CUtensorMap q
     const int tot_s_addr = smem + 75264;
     float* beta_s = reinterpret_cast<float*>(smem_raw + 75776);
     const int beta_s_addr = smem + 75776;
+
+    // Kernel setup ops
     int chunk_s = blockIdx.x;
     int clen_s = chunk_len[chunk_s];
     int ext0_s = chunk_bos[chunk_s];
@@ -484,8 +444,7 @@ kernel_cake_kda_train_c9395e21a813579c4bfc(const __grid_constant__ CUtensorMap q
     }
     if (__syncthreads_and(clen_s == 0)) return;
 
-    // Mbarrier init (8 pipeline groups, 0 ordered-sequence groups, 14 barriers)
-    // Mbarriers at smem_raw[76032..76144)
+    // Mbarrier init (14 barriers at smem_raw[76032..76144))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -534,10 +493,8 @@ kernel_cake_kda_train_c9395e21a813579c4bfc(const __grid_constant__ CUtensorMap q
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
-
-    // Kernel post-init ops
-    const int tmem_acc = taddr;
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_acc = taddr;
 
     // === Task calls (declaration order) ===
     int chunk = blockIdx.x;
@@ -3111,7 +3068,7 @@ kernel_cake_kda_train_c9395e21a813579c4bfc(const __grid_constant__ CUtensorMap q
             "mov.b64 db, {blo, dhi};\n\t"
             "tcgen05.mma.cta_group::1.kind::tf32 [%0], [ta], db, id, p1;\n\t"
             "}\n"
-            :: "r"((tmem_acc + (64))), "r"(_smem_desc_lo_98), "r"(tmem_acc), "r"(0) : "memory");
+            :: "r"((tmem_acc + (64))), "r"(_smem_desc_lo_98), "r"(tmem_acc + 0), "r"(0) : "memory");
             tcgen05_commit(hop_addr);
             mbarrier_wait(hop_addr, _phase_hop_0);
             _phase_hop_0 ^= 1;
@@ -3180,7 +3137,7 @@ kernel_cake_kda_train_c9395e21a813579c4bfc(const __grid_constant__ CUtensorMap q
             "mov.b64 db, {blo, dhi};\n\t"
             "tcgen05.mma.cta_group::1.kind::tf32 [%0], [ta], db, id, p1;\n\t"
             "}\n"
-            :: "r"((tmem_acc + (80))), "r"(_smem_desc_lo_100), "r"(tmem_acc), "r"(0) : "memory");
+            :: "r"((tmem_acc + (80))), "r"(_smem_desc_lo_100), "r"(tmem_acc + 0), "r"(0) : "memory");
             tcgen05_commit(hop_addr);
             mbarrier_wait(hop_addr, _phase_hop_0);
             _phase_hop_0 ^= 1;
@@ -3257,7 +3214,7 @@ kernel_cake_kda_train_c9395e21a813579c4bfc(const __grid_constant__ CUtensorMap q
             "mov.b64 db, {blo, dhi};\n\t"
             "tcgen05.mma.cta_group::1.kind::tf32 [%0], [ta], db, id, p1;\n\t"
             "}\n"
-            :: "r"((tmem_acc + (96))), "r"(_smem_desc_lo_102), "r"(tmem_acc), "r"(0) : "memory");
+            :: "r"((tmem_acc + (96))), "r"(_smem_desc_lo_102), "r"(tmem_acc + 0), "r"(0) : "memory");
             tcgen05_commit(hop_addr);
             mbarrier_wait(hop_addr, _phase_hop_0);
             _phase_hop_0 ^= 1;

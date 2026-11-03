@@ -220,12 +220,7 @@ jobs:
           # Targets requested by the triggering `@flashinfer-bot run <paths>` comment,
           # already validated in the step above. Empty for an unparameterised run.
           REQUESTED_TEST_PATH: ${{ steps.scope.outputs.test_path }}
-          # Temporarily off on PRs: two of the three H100 hosts dropped out of the
-          # pool (last jobs 2026-10-14 and 2026-10-22), and the remaining two
-          # runners cannot keep up with the full-run load, so PR H100 jobs queued
-          # for hours. Scheduled runs on main keep the lane. Set back to 'true'
-          # once capacity is restored.
-          H100_ON_PRS: 'false'
+          H100_ON_PRS: 'true'
           EVENT_NAME: ${{ github.event_name }}
         run: |
           RUN_H100=true

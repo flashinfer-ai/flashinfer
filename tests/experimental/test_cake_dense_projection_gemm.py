@@ -25,6 +25,7 @@ limitations under the License.
 
 import ast
 import contextlib
+import dataclasses
 import inspect
 import json
 import re
@@ -398,11 +399,18 @@ def test_k1_routes(monkeypatch, layout):
         ((args, kwargs),) = atomic.calls
         assert args[0] == "launch" and args[1] is A and args[2] is B and args[3] is out
         assert kwargs["transposed_out"] is False and kwargs["own"] == {}
+        assert kwargs["enable_pdl"] is None and kwargs["weights_static"] is False
         assert kwargs["det_call"]() is det.result  # a row the planner does not take
         assert det.calls == [
             ((A, B, out), {"transposed_out": False, "enable_pdl": None})
         ]
+        # ... runs the deterministic package's call through this package's binding
+        dA, dB, dout, transposed, knobs = kwargs["det_args"]()
+        assert (
+            dA is A and dB is B and dout is out and transposed is False and knobs == ()
+        )
     else:
+        # CPU views: the binding hands the call to the deterministic package
         assert result is det.result and not atomic.calls
         assert det.calls == [
             ((A, B, out), {"transposed_out": False, "enable_pdl": None})
@@ -445,6 +453,70 @@ def test_k1_operation_routes(monkeypatch):
         ((G, X, out), {"out_dtype": None, "sk": "auto", "cta_rows": None})
     ]
     assert prepare.calls == [((G, X, out), {"sk": "auto", "cta_rows": None})]
+    # ... through this package's binding of the deterministic package's call: its orientation and knobs
+    assert (
+        launch_kwargs["det_knobs"] == ("auto", None)
+        and "det_args" not in prepare_kwargs
+    )
+    dA, dB, dout, transposed, knobs = launch_kwargs["det_args"]()
+    wA, wB, wtransposed = det_backend.wgrad_views(G, X, arch=None, out_f32=False)
+    assert dA.equal(wA) and dB.equal(wB) and dout is out and transposed == wtransposed
+    assert knobs == (("cta_rows", None), ("sk", "auto"))
+
+
+@pytest.mark.parametrize("pdl", [None, True])
+@pytest.mark.parametrize("op", ["fwd", "dgrad", "kk", "kn"])
+def test_k1_deterministic_programs_run_through_the_binding(monkeypatch, op, pdl):
+    """``deterministic=False`` K1 calls that run the deterministic program go through this package's binding
+    (``_det_k1``): keyed by the entry point's own tensors, with the deterministic package's convenience call as the
+    plan (``det_args``) and as the fallback (``det_call``), the entry point's ``enable_pdl`` (and the generic entry's
+    ``weights_static``) passed to both; ``deterministic=True`` calls the deterministic package."""
+    names = {"fwd": "projection_forward", "dgrad": "projection_dgrad"}
+    det = _patch_det(monkeypatch, names.get(op, "dense_projection_gemm"))
+    binding = Recorder()
+    monkeypatch.setattr(cake_backend, "_det_k1", binding)
+    X, W, G = torch.zeros(64, 32), torch.zeros(16, 32), torch.zeros(64, 16)
+    if op == "fwd":
+        call = lambda d: cake_backend.projection_forward(  # noqa: E731
+            X, W, deterministic=d, enable_pdl=pdl
+        )
+    elif op == "dgrad":
+        call = lambda d: cake_backend.projection_dgrad(  # noqa: E731
+            G, W, out_dtype=torch.float32, deterministic=d, enable_pdl=pdl
+        )
+    else:
+        A, B, out = _k1_views(op)
+        call = lambda d: cake_backend.dense_projection_gemm(  # noqa: E731
+            A, B, out, deterministic=d, enable_pdl=pdl, weights_static=bool(pdl)
+        )
+    assert call(False) is binding.result and not det.calls
+    ((sources, flags, det_args, det_call, enable_pdl, *rest), kwargs) = binding.calls[0]
+    assert not kwargs and enable_pdl is pdl
+    pdl_kw = {} if pdl is None else {"enable_pdl": pdl}
+    dA, dB, dout, transposed, knobs = det_args()
+    assert dout is sources[-1] and transposed is False and knobs == ()
+    if op == "fwd":
+        assert sources[0] is X and sources[1] is W and flags == ("fwd",) and not rest
+        assert tuple(dout.shape) == (64, 16) and dout.dtype == torch.bfloat16
+        assert dA is X and dB.equal(W.t())
+        assert det_call() is det.result and det.calls == [((X, W, dout), pdl_kw)]
+    elif op == "dgrad":
+        assert sources[0] is G and sources[1] is W and flags == ("dgrad",) and not rest
+        assert tuple(dout.shape) == (64, 32) and dout.dtype == torch.float32
+        assert dA is G and dB is W
+        assert det_call() is det.result
+        assert det.calls == [((G, W, dout), {"out_dtype": torch.float32, **pdl_kw})]
+    else:
+        assert all(x is y for x, y in zip(sources, (A, B, out), strict=True))
+        assert flags == ("gemm", False) and rest == [bool(pdl)]
+        assert dA is A and dB is B
+        assert det_call() is det.result
+        want = {"transposed_out": False, "enable_pdl": pdl}
+        if pdl:
+            want["weights_static"] = True
+        assert det.calls == [((A, B, out), want)]
+    det.calls.clear()
+    assert call(True) is det.result and len(det.calls) == 1 and len(binding.calls) == 1
 
 
 def _same_entry_views(views, a_view, split_src, flags) -> None:
@@ -1966,9 +2038,10 @@ def test_k2_planner_plans_the_stream_k_router(monkeypatch):
 
 def test_k2_planner_plans_the_head_tail_router(monkeypatch):
     """A head/tail verdict (``"H0.5x4"`` on sm_107a, set here for hidden 4096, 5120 and 6144; sm_100a / sm_103a at
-    hidden 5120) runs the head/tail program: ``router_fp32_gemm_atomic_nn_t_ht_c3_nreg`` with
-    the partition's ``head_spans`` / ``head_steps``, which the launch passes to the program; without that template
-    registered the row runs the deterministic program."""
+    hidden 5120) runs the head/tail program of the architecture: ``router_fp32_gemm_atomic_nn_t_ht_c3_nreg`` (on
+    sm_103a ``router_fp32_gemm_ts_r6p6_atomic_nn_t_ht_c2_nreg``) with the partition's ``head_spans`` /
+    ``head_steps``, which the launch passes to the program; without that template registered the row runs the
+    deterministic program."""
     arch, T, N = "sm_107a", 16231, 256
     kw = dict(arch=arch, sm_count=216)
     for hidden in (4096, 5120, 6144):
@@ -2044,8 +2117,17 @@ def test_k2_planner_plans_the_head_tail_router(monkeypatch):
             G.t(), X4, torch.zeros(N, 4096), arch=arch, sm_count=sms
         )
         assert plan is None and "planner" in reason
-    # sm_100a / sm_103a, hidden 5120: three tail units per pair (76 head + 228 tail units on 152 SMs)
-    for gb in ("sm_100a", "sm_103a"):
+    # sm_100a / sm_103a, hidden 5120: three tail units per pair (76 head + 228 tail units on 152 SMs); sm_103a runs
+    # the head/tail program with the A parts in tensor memory, and the deterministic program while this checkout does
+    # not register it
+    ts = "router_fp32_gemm_ts_r6p6_atomic_nn_t_ht_c2_nreg"
+    templates = cake_backend.ROUTER_HEAD_TAIL_TEMPLATES
+    assert templates == {"sm_103a": ts}
+    for gb, template in (
+        ("sm_100a", "router_fp32_gemm_atomic_nn_t_ht_c3_nreg"),
+        ("sm_103a", ts),
+    ):
+        assert cake_backend.router_head_tail_template(gb) == template
         monkeypatch.setitem(cake_jit.KERNELS, gb, {})
         _register(
             monkeypatch,
@@ -2054,16 +2136,87 @@ def test_k2_planner_plans_the_head_tail_router(monkeypatch):
             "router_fp32_gemm_atomic_nn_t",
             "router_fp32_gemm_atomic_nn_t_ht_c3_nreg",
         )
+        if gb == "sm_103a":
+            plan, reason = cake_backend.plan_atomic_router(
+                G.t(), X5, torch.zeros(N, 5120), arch=gb, sm_count=152
+            )
+            assert plan is None and reason == f"{ts} is not registered for sm_103a"
+            _register(monkeypatch, gb, ts)
         plan, _ = cake_backend.plan_atomic_router(
             G.t(), X5, torch.zeros(N, 5120), arch=gb, sm_count=152
         )
         assert (plan.template, plan.units, plan.head_spans, plan.head_steps) == (
-            "router_fp32_gemm_atomic_nn_t_ht_c3_nreg",
+            template,
             304,
             38,
             20 * 254,
         )
         assert plan.grid == (608, 1, 1) and plan.part_tiles
+
+
+#: The SM counts of the parts the router tables were measured on (GB200 / GB300: 148 and 152; R200: 208, 212, 216).
+ROUTER_SM_FACTS = (148, 152, 208, 212, 216)
+
+
+def test_k2_head_tail_program_of_each_architecture_and_sm_count():
+    """With this checkout's registry and router tables, on every architecture and the SM counts of the measured parts,
+    the weight gradient (256 experts, hidden 4096 / 5120 / 6144, token counts at and around the windows) runs the
+    head/tail program with the A parts in tensor memory exactly on sm_103a with 152 SMs, hidden 5120 and 16172 to
+    32768 tokens (the sm_103a head/tail window of ``ROUTER_RULES``); every other head/tail plan runs
+    ``router_fp32_gemm_atomic_nn_t_ht_c3_nreg``, and both carry the planner's partition.  The program is registered
+    for sm_103a only."""
+    ts = cake_backend.ROUTER_HEAD_TAIL_TEMPLATES["sm_103a"]
+    c3 = "router_fp32_gemm_atomic_nn_t" + cake_backend.ROUTER_HEAD_TAIL_SUFFIX
+    assert [a for a, table in cake_jit.KERNELS.items() if ts in table] == ["sm_103a"]
+    assert cake_jit.MODULES[cake_jit.select_module("sm_103a", ts)]["arches"] == [
+        "sm_103a"
+    ]
+    N, seen = 256, {}
+    for arch in cake_jit.ARCHES:
+        for sms in ROUTER_SM_FACTS:
+            for hidden in (4096, 5120, 6144):
+                out = torch.empty(N, hidden)
+                for T in (8192, 10240, 16171, 16172, 16231, 16384, 16385, 32768, 32769):
+                    # stride-0 views of the gradient [T, N] and the activations [T, hidden]: the layout classes of
+                    # G.t() and X without their memory
+                    G = torch.empty(1, N).expand(T, N)
+                    X = torch.empty(1, hidden).expand(T, hidden)
+                    plan, _ = cake_backend.plan_atomic_router(
+                        G.t(), X, out, arch=arch, sm_count=sms
+                    )
+                    in_window = (
+                        arch == "sm_103a"
+                        and sms == 152
+                        and hidden == 5120
+                        and 16172 <= T <= 32768
+                    )
+                    if plan is None or not plan.head_spans:
+                        assert not in_window, (arch, sms, hidden, T)
+                        continue
+                    assert plan.template == (ts if in_window else c3), (
+                        arch,
+                        sms,
+                        hidden,
+                        T,
+                    )
+                    assert (
+                        plan.units,
+                        plan.head_spans,
+                        plan.head_steps,
+                    ) == cake_backend.router_partition(
+                        "nn_t", arch=arch, M=hidden, N=N, K=T, sm_count=sms
+                    )
+                    key = (arch, sms, plan.template)
+                    seen[key] = seen.get(key, 0) + 1
+    # 16172, 16231, 16384, 16385 and 32768 tokens
+    assert seen.pop(("sm_103a", 152, ts)) == 5
+    assert seen and all(template == c3 for _, _, template in seen)
+    assert {(arch, sms) for arch, sms, _ in seen} == {
+        ("sm_100a", 152),
+        ("sm_107a", 208),
+        ("sm_107a", 212),
+        ("sm_107a", 216),
+    }
 
 
 def test_k2_values_feed_every_registered_router_program():
@@ -2096,6 +2249,20 @@ def test_k2_values_feed_every_registered_router_program():
                 "grid_y",
                 "grid_z",
             ]
+        if (
+            cake_jit.MODULES[name]["template"]
+            in cake_backend.ROUTER_HEAD_TAIL_TEMPLATES.values()
+        ):
+            # the head/tail program with the A parts in tensor memory also takes the launch flag (0 here)
+            assert [a for _, a in plan_args][-6:] == [
+                "head_spans",
+                "head_steps",
+                "enable_pdl",
+                "grid_x",
+                "grid_y",
+                "grid_z",
+            ]
+            assert arguments[-4] == 0
 
 
 def test_k2_out_fill_is_one_driver_memset_with_a_zero_fallback(monkeypatch):
@@ -2337,6 +2504,411 @@ def test_splitk_binding_is_the_deterministic_launch(monkeypatch, case, pdl):
                     det_backend._split_grid(n),
                 ),
             )
+
+
+def test_k1_view_recipes():
+    """``_k1_view_recipe`` rebuilds a launch view from the call's tensor that holds its data pointer: the tensor as is,
+    its ``unsqueeze(0)`` or one strided view of the same geometry (checked when bound); a pointer argument takes a
+    contiguous tensor as is; a view of no call tensor, or of call tensors that alias, has no recipe."""
+    SELF, UNSQ, STRIDED = (
+        cake_backend._K1_VIEW_SELF,
+        cake_backend._K1_VIEW_UNSQUEEZE,
+        cake_backend._K1_VIEW_STRIDED,
+    )
+    X, W = (
+        torch.zeros(64, 32, dtype=torch.bfloat16),
+        torch.zeros(16, 32, dtype=torch.bfloat16),
+    )
+    out = torch.zeros(64, 16 + 8, dtype=torch.bfloat16)[:, :16]
+    dense = torch.zeros(64, 16, dtype=torch.bfloat16)
+    recipe = cake_backend._k1_view_recipe
+
+    def rebuilt(view, sources, pointer=False):
+        s, how, shape, strides = recipe(view, sources, pointer=pointer)
+        t = sources[s]
+        t = (
+            t.unsqueeze(0)
+            if how == UNSQ
+            else t.as_strided(shape, strides)
+            if how == STRIDED
+            else t
+        )
+        assert t.data_ptr() == view.data_ptr() and t.dtype == view.dtype
+        if not pointer:
+            assert _geometry(t) == _geometry(view)
+        return s, how
+
+    assert rebuilt(X.unsqueeze(0), (X, W.t(), dense)) == (0, UNSQ)
+    # the forward's B from W.t()
+    assert rebuilt(W.unsqueeze(0), (X, W.t(), dense)) == (1, STRIDED)
+    assert rebuilt(W.unsqueeze(0), (X, W, dense)) == (1, UNSQ)
+    assert rebuilt(X.t().unsqueeze(0).transpose(1, 2), (X.t(), W, dense)) == (
+        0,
+        STRIDED,
+    )
+    batched = torch.zeros(4, 64, 32, dtype=torch.bfloat16)
+    assert rebuilt(batched, (batched, W, dense)) == (0, SELF)
+    flat = det_backend.flat_alias(dense.unsqueeze(0))
+    # a contiguous out as the pointer
+    assert rebuilt(flat, (X, W, dense), pointer=True) == (2, SELF)
+    padded = det_backend.flat_alias(out.unsqueeze(0))
+    assert rebuilt(padded, (X, W, out), pointer=True) == (2, STRIDED)
+    assert rebuilt(out.unsqueeze(0), (X, W, out)) == (2, UNSQ)
+    # another tensor's data, another dtype
+    assert (
+        recipe(
+            torch.zeros(1, 64, 32, dtype=torch.bfloat16), (X, W, dense), pointer=False
+        )
+        is None
+    )
+    assert (
+        recipe(X.view(torch.int16).unsqueeze(0), (X, W, dense), pointer=False) is None
+    )
+    # call tensors that start at the same data pointer (aliasing is not part of the key): no recipe
+    assert recipe(X.unsqueeze(0), (X, X[:, :16], dense), pointer=False) is None
+    assert recipe(flat, (X, dense.view(64, 16), dense), pointer=True) is None
+
+
+def _cpu_k1_launches(monkeypatch, arch="sm_103a"):
+    """CPU binding tests of the K1 launches (nothing is loaded or launched): the device facts of a 152-SM part, the
+    deterministic package's dummies on the CPU, one stand-in module whose entry records its arguments, the FFI
+    conversion as the identity; returns that entry."""
+    monkeypatch.setattr(cake_backend.tvm_ffi, "from_dlpack", lambda t, **_: t)
+    facts = det_backend.DeviceFacts(
+        index=0, arch=arch, sm_count=152, l2_bytes=126 << 20
+    )
+    monkeypatch.setattr(det_backend, "_same_cuda_device", lambda A, B, out: out.device)
+    monkeypatch.setattr(det_backend, "device_facts", lambda device=None: facts)
+    monkeypatch.setattr(det_backend, "require_arch", lambda device: arch)
+    monkeypatch.setattr(det_backend, "_device_index", lambda device: 0)
+    monkeypatch.setattr(det_backend, "_current_raw_stream", lambda index: 0)
+    monkeypatch.setattr(
+        det_backend, "_dummy_key", lambda device, dtype, tag=None: ("cpu", dtype, tag)
+    )
+    monkeypatch.setattr(det_backend, "_DUMMIES", {})
+    monkeypatch.setattr(
+        det_backend,
+        "_ffi_stream_context",
+        lambda index, raw=None: contextlib.nullcontext(),
+    )
+    module = _FakeModule()
+    monkeypatch.setattr(
+        det_backend,
+        "load_cake_dense_projection_det_gemm_module",
+        lambda name, a: module,
+    )
+    monkeypatch.setattr(
+        cake_backend, "load_cake_dense_projection_gemm_module", lambda name, a: module
+    )
+    monkeypatch.setattr(cake_backend, "_ATOMIC_ARENAS", {})
+    for cache in ("_K1_ATOMIC_CACHE", "_K1_DET_CACHE"):
+        monkeypatch.setattr(cake_backend, cache, type(getattr(cake_backend, cache))())
+    return module.entry
+
+
+def _same_k1_arguments(got: list, want: list, arg_plan: list) -> None:
+    """A bound K1 launch's arguments are the per-call ordered ones: the same view geometry for a TMA operand, the
+    same data pointer and dtype (and a contiguous tensor) for a pointer argument, the same values otherwise."""
+    kinds = [kind for kind, _ in arg_plan]
+    assert len(got) == len(want) == len(kinds)
+    for i, (g, w, kind) in enumerate(zip(got, want, kinds, strict=True)):
+        if isinstance(w, torch.Tensor):
+            assert isinstance(g, torch.Tensor), i
+            if kind == "buffer":
+                assert (g.data_ptr(), g.dtype) == (w.data_ptr(), w.dtype), i
+                assert g.is_contiguous(), i
+            else:
+                assert _geometry(g) == _geometry(w), i
+        else:
+            assert type(g) is type(w) and g == w, (i, g, w)
+
+
+def _k1_det_call(case, arch):
+    """``(sources, (A, B, out, transposed_out, knobs))`` of a K1 call of the deterministic program on fresh CPU
+    tensors: the entry point's own tensors and the deterministic package's convenience call."""
+    bf16 = torch.bfloat16
+    T, K, N = (64 if case == "fwd_few_tokens" else 1000), 4096, 128
+    X, W, G = (
+        torch.empty(T, K, dtype=bf16),
+        torch.empty(N, K, dtype=bf16),
+        torch.empty(T, N, dtype=bf16),
+    )
+    if case.startswith("fwd"):
+        out = (
+            torch.empty(T, N + 64, dtype=bf16)[:, :N]
+            if case.endswith("padded_out")
+            else torch.empty(T, N, dtype=bf16)
+        )
+        return (X, W, out), (X, W.t(), out, False, ())
+    if case.startswith("dgrad"):
+        out = torch.empty(T, K, dtype=torch.float32 if case.endswith("f32") else bf16)
+        return (G, W, out), (G, W, out, False, ())
+    if case.startswith("wgrad"):
+        if case.endswith("wide"):
+            G = torch.empty(T, 2048, dtype=bf16)
+        out = torch.empty(G.shape[1], K, dtype=torch.float32 if "f32" in case else bf16)
+        A, B, transposed = det_backend.wgrad_views(
+            G, X, arch=arch, out_f32=out.dtype == torch.float32
+        )
+        knobs = (("cta_rows", None), ("sk", False if case.endswith("sk") else "auto"))
+        return (X.t(), G, out), (A, B, out, transposed, knobs)
+    # the batched MLA forward: strided head views of [T, H, slot] activations
+    H, slot, D_in, D_out = 8, 256, 192, 512
+    act = torch.empty(T, H, slot, dtype=bf16)[..., :D_in]
+    A, B = act.permute(1, 0, 2), torch.empty(H, D_in, D_out, dtype=bf16)
+    out = torch.empty(T, H, D_out, dtype=bf16).permute(1, 0, 2)
+    return (A, B, out), (A, B, out, False, ())
+
+
+K1_DET_CASES = [
+    "fwd", "fwd_padded_out", "fwd_few_tokens", "dgrad", "dgrad_f32", "wgrad_f32", "wgrad", "wgrad_f32_wide",
+    "wgrad_f32_sk", "batched",
+]  # fmt: skip
+
+
+@pytest.mark.parametrize("pdl", [0, 1])
+@pytest.mark.parametrize("case", K1_DET_CASES)
+def test_k1_det_binding_is_the_deterministic_launch(monkeypatch, case, pdl):
+    """The binding of the deterministic K1 program on this package's convenience path (``_plan_det_k1``) is the
+    deterministic package's plan and program with its argument list ordered once: with the views of a later call's
+    own tensors (new data pointers) in place, the arguments are the ones the deterministic package's convenience path
+    resolves for that call (``_k1_views`` / ``_k1_values``; ``out`` itself for its pointer when contiguous), with the
+    stream-K slabs and slice counters of this package's arena -- carved again after the arena grows -- and the bound
+    PDL flag."""
+    arch = "sm_103a"
+    entry_fn = _cpu_k1_launches(monkeypatch, arch)
+    sources, (A, B, out, transposed, knobs) = _k1_det_call(case, arch)
+    entry = cake_backend._plan_det_k1(A, B, out, transposed, knobs, sources, 0, 0, pdl)
+    plan, *_, module_name = det_backend._k1_plan(
+        A, B, out, transposed_out=transposed, knobs=dict(knobs)
+    )
+    assert entry.plan == plan and entry.k1 is not None and entry.entry is entry_fn
+    arena = entry.arena
+    assert arena.buffers["k1_det_counters"].dtype == torch.uint32
+    arg_plan = det_backend.arg_plan_of(det_backend.MODULES[module_name])
+    for grow in (1, 4):
+        if grow > 1:
+            arena.require("k1_det_ws", arena.buffers["k1_det_ws"].numel() * grow)
+        # a later call: fresh tensors of the key's geometry
+        sources2, (A2, B2, out2, _, _) = _k1_det_call(case, arch)
+        entry_fn.calls.clear()
+        cake_backend._launch_k1_binding(
+            det_backend, entry.entry, entry.k1, arena, sources2, 0, 0
+        )
+        assert entry.k1.version == arena.version
+        ((got, _),) = entry_fn.calls
+        swapped = det_backend._k1_swapped(plan, A2, B2, transposed_out=transposed)
+        a_desc, b_desc, O3 = det_backend._k1_views(A2, B2, out2, swapped=swapped)
+        ldo, out_l = det_backend._out_strides(O3)
+        values = det_backend._k1_values(
+            plan,
+            out2.device,
+            A=a_desc,
+            B=b_desc,
+            out3=O3,
+            o_alias=det_backend.flat_alias(O3),
+            ws=arena.buffers["k1_det_ws"],
+            counters=arena.buffers["k1_det_counters"],
+            ldo=ldo,
+            out_l=out_l,
+            enable_pdl=pdl,
+        )
+        want = det_backend._order_arguments(module_name, arg_plan, values, plan.grid)
+        _same_k1_arguments(got, want, arg_plan)
+        assert got[[name for _, name in arg_plan].index("enable_pdl")] == pdl
+
+
+@pytest.mark.parametrize("pdl", [0, 1])
+@pytest.mark.parametrize("case", ["two_splits", "one_split", "padded_out"])
+def test_k1_atomic_binding_is_the_ordered_launch(monkeypatch, case, pdl):
+    """A cached K1 launch of this package binds its argument list once (``_bind_atomic_k1``): with a later call's
+    views in place it is the list the unbound launch orders per call (``_launch_atomic_k1_unbound``), with the
+    arena's split slots and tickets (several splits) or the dummies (one split), and the PDL flag."""
+    arch = "sm_103a"
+    entry_fn = _cpu_k1_launches(monkeypatch, arch)
+    splits = 1 if case == "one_split" else 2
+    T, N, K = 1000, 32, 4096
+
+    def call():
+        G, X = (
+            torch.empty(T, N, dtype=torch.bfloat16),
+            torch.empty(T, K, dtype=torch.bfloat16),
+        )
+        out = (
+            torch.empty(N, K + 64)[:, :K]
+            if case == "padded_out"
+            else torch.empty(N, K, dtype=torch.float32)
+        )
+        return X.t(), G, out
+
+    A, B, out = call()
+    plan, *_ = cake_backend.plan_atomic_gemm(
+        A, B, out, transposed_out=True, arch=arch, sm_count=152, splits=splits
+    )
+    assert plan is not None and plan.splits == splits
+    module_name = cake_jit.select_module(arch, plan.template)
+    fn, arg_plan = cake_backend._atomic_entry(module_name, plan.grid, arch)
+    arena = None
+    if splits > 1:
+        arena = cake_backend._atomic_arena_for(0, 0, out.device)
+        arena.require("k1_slots", plan.ws_f32_elems)
+        arena.require("k1_tickets", plan.counters_u32)
+    bound = cake_backend._bind_atomic_k1(
+        plan, module_name, arg_plan, A, B, out, arena, pdl
+    )
+    assert bound is not None and (bound.workspace == ()) == (arena is None)
+    entry = cake_backend._CachedAtomic(
+        plan=plan,
+        arch=arch,
+        module_name=module_name,
+        entry=fn,
+        arg_plan=arg_plan,
+        arena=arena,
+    )
+    A2, B2, out2 = call()
+    cake_backend._launch_k1_binding(det_backend, fn, bound, arena, (A2, B2, out2), 0, 0)
+    cake_backend._launch_atomic_k1_unbound(entry, A2, B2, out2, 0, 0, pdl)
+    (got, _), (want, _) = entry_fn.calls
+    _same_k1_arguments(got, want, arg_plan)
+    assert got[[name for _, name in arg_plan].index("enable_pdl")] == pdl
+
+
+def test_k1_convenience_calls_cache_their_bindings(monkeypatch):
+    """The K1 entry points with ``deterministic=False`` plan once per key and launch the bound program after: the
+    forward and the input gradient in ``_K1_DET_CACHE`` (keyed by their own tensors), the weight gradient in
+    ``_K1_ATOMIC_CACHE`` -- a row without a verdict bound to the deterministic package's plan of
+    ``projection_det_wgrad`` (its orientation; another ``sk`` is another key and plan), a row with one to this
+    package's program."""
+    arch = "sm_103a"
+    entry_fn = _cpu_k1_launches(monkeypatch, arch)
+    monkeypatch.setattr(cake_backend, "_k1_index", lambda *views: 0)
+    bf16, T = torch.bfloat16, 1000
+    X, W, G = (
+        torch.empty(T, 4096, dtype=bf16),
+        torch.empty(128, 4096, dtype=bf16),
+        torch.empty(T, 128, dtype=bf16),
+    )
+    out_f, out_d, out_w = (
+        torch.empty(T, 128, dtype=bf16),
+        torch.empty(T, 4096, dtype=bf16),
+        torch.empty(128, 4096),
+    )
+    for _ in range(2):
+        assert (
+            cake_backend.projection_forward(X, W, out_f, deterministic=False) is out_f
+        )
+        assert cake_backend.projection_dgrad(G, W, out_d, deterministic=False) is out_d
+        assert cake_backend.projection_wgrad(G, X, out_w, deterministic=False) is out_w
+    assert len(entry_fn.calls) == 6
+    det_entries = list(cake_backend._K1_DET_CACHE.items())
+    # the flags, the PDL flag (the device's default: on) and ``weights_static``
+    assert [key[2] for key, _ in det_entries] == [
+        (("fwd",), 1, False),
+        (("dgrad",), 1, False),
+    ]
+    assert all(e.k1 is not None and e.arena is not None for _, e in det_entries)
+    ((key, wgrad),) = cake_backend._K1_ATOMIC_CACHE.items()
+    assert wgrad.plan is None and wgrad.k1 is not None and key[2][3] == ("auto", None)
+    assert key[2][4:] == (1, False)
+    # the PDL flag is bound into the argument list: another flag is another key
+    entry_fn.calls.clear()
+    assert (
+        cake_backend.projection_forward(
+            X, W, out_f, deterministic=False, enable_pdl=False
+        )
+        is out_f
+    )
+    assert next(reversed(cake_backend._K1_DET_CACHE))[2] == (("fwd",), 0, False)
+    module_name = det_backend._k1_plan(X, W.t(), out_f, transposed_out=False, knobs={})[
+        -1
+    ]
+    names = [n for _, n in det_backend.arg_plan_of(det_backend.MODULES[module_name])]
+    ((args, _),) = entry_fn.calls
+    assert args[names.index("enable_pdl")] == 0
+    # the deterministic package's orientation of the call (its architecture lookup of ``out``'s device)
+    A, B, transposed = det_backend.wgrad_views(
+        G, X, arch=det_backend.arch_for(out_w.device), out_f32=True
+    )
+    assert (
+        wgrad.det_plan
+        == det_backend._k1_plan(
+            A, B, out_w, transposed_out=transposed, knobs=dict(sk="auto", cta_rows=None)
+        )[0]
+    )
+    cake_backend.projection_wgrad(G, X, out_w, sk=False, deterministic=False)
+    assert len(cake_backend._K1_ATOMIC_CACHE) == 2
+    sk_entry = next(reversed(cake_backend._K1_ATOMIC_CACHE.values()))
+    assert (
+        sk_entry.det_plan
+        == det_backend._k1_plan(
+            A, B, out_w, transposed_out=transposed, knobs=dict(sk=False, cta_rows=None)
+        )[0]
+    )
+    # a row with a verdict: this package's program, bound
+    key = (arch, 1, 4096, 128, "f32")
+    monkeypatch.setitem(cake_backend.K1_SPLIT_RULES, key, (128, 2))
+    monkeypatch.delitem(cake_backend.K1_SPLIT_RULE_EXCLUDED_TOKENS, key, raising=False)
+    cake_backend._K1_ATOMIC_CACHE.clear()
+    cake_backend.projection_wgrad(G, X, out_w, deterministic=False)
+    ((_, atomic),) = cake_backend._K1_ATOMIC_CACHE.items()
+    assert atomic.plan is not None and atomic.plan.splits == 2 and atomic.k1 is not None
+    assert atomic.det_plan is None and atomic.arena is not None
+
+
+def test_k1_swapped_small_token_forward_stays_on_the_deterministic_call(monkeypatch):
+    """A batched forward the deterministic package runs on its swapped small-token program (``_swap_ab_launch``) is
+    not bound here: its entry stays unbound and ``dense_projection_gemm`` makes the deterministic package's call, with
+    ``enable_pdl`` and ``weights_static`` (part of the key); a batched forward of more tokens is bound."""
+    arch = "sm_103a"
+    entry_fn = _cpu_k1_launches(monkeypatch, arch)
+    monkeypatch.setattr(cake_backend, "_k1_index", lambda *views: 0)
+    det = _patch_det(monkeypatch, "dense_projection_gemm")
+    bf16, L, K, N = torch.bfloat16, 8, 4096, 1024
+
+    def views(M):
+        A = torch.empty(L, M, K, dtype=bf16)
+        return (
+            A,
+            torch.empty(L, N, K, dtype=bf16).transpose(1, 2),
+            torch.empty(L, M, N, dtype=bf16),
+        )
+
+    A, B, out = views(64)
+    for weights_static in (False, True):
+        launch = det_backend._swap_ab_launch(A, B, out, False, weights_static)
+        assert launch is not None
+        entry = cake_backend._plan_det_k1(
+            A, B, out, False, (), (A, B, out), 0, 0, 1, weights_static
+        )
+        assert entry.plan is None and entry.k1 is None and entry.entry is None
+        for _ in range(2):
+            result = cake_backend.dense_projection_gemm(
+                A,
+                B,
+                out,
+                deterministic=False,
+                enable_pdl=True,
+                weights_static=weights_static,
+            )
+            assert result is det.result
+    want = {"transposed_out": False, "enable_pdl": True}
+    assert det.calls == 2 * [((A, B, out), want)] + 2 * [
+        ((A, B, out), {**want, "weights_static": True})
+    ]
+    # ``weights_static`` is part of the key
+    assert len(cake_backend._K1_DET_CACHE) == 2
+    assert all(e.k1 is None for e in cake_backend._K1_DET_CACHE.values())
+    entry_fn.calls.clear()
+    A, B, out = views(1000)
+    assert det_backend._swap_ab_launch(A, B, out, False) is None
+    assert (
+        cake_backend.dense_projection_gemm(
+            A, B, out, deterministic=False, enable_pdl=True
+        )
+        is out
+    )
+    assert len(det.calls) == 4 and len(entry_fn.calls) == 1
+    assert next(reversed(cake_backend._K1_DET_CACHE.values())).k1 is not None
 
 
 def _router_spec_tokens(rule) -> set:
@@ -2875,6 +3447,43 @@ def test_deterministic_backend_follows_the_binding_and_sys_modules(monkeypatch):
     assert cake_backend.deterministic_backend() is det_backend
 
 
+def test_use_deterministic_backend_drops_the_convenience_entries(monkeypatch):
+    """A binding drops this package's convenience entries and arenas: an entry holds the plan and program of the
+    package bound before, so a call with an unchanged key would launch that package's program."""
+    fake_pkg, fake = (
+        ModuleType("vendored_det_pkg3"),
+        ModuleType("vendored_det_pkg3.cake_backend"),
+    )
+    for name in cake_backend.DETERMINISTIC_NAMES.values():
+        setattr(fake, name, Recorder())
+    monkeypatch.setitem(sys.modules, "vendored_det_pkg3", fake_pkg)
+    monkeypatch.setitem(sys.modules, "vendored_det_pkg3.cake_backend", fake)
+    monkeypatch.setattr(cake_jit, "_det_package", cake_jit._det_package)
+    caches = (
+        cake_backend._K1_ATOMIC_CACHE,
+        cake_backend._K1_DET_CACHE,
+        cake_backend._K2_ATOMIC_CACHE,
+        cake_backend._K2_SPLITK_CACHE,
+    )
+    key = ("dense-projection-gemm-test", object())
+    try:
+        for module in (fake, det_backend):
+            for cache in caches:
+                cache[key] = None
+            cake_backend._ATOMIC_ARENAS[(99, 99)] = cake_backend._AtomicArena(
+                torch.device("cpu"), (99, 99)
+            )
+            cake_backend.use_deterministic_backend(module)
+            assert cake_backend.deterministic_backend() is module
+            assert not any(key in cache for cache in caches)
+            assert (99, 99) not in cake_backend._ATOMIC_ARENAS
+    finally:
+        for cache in caches:
+            cache.pop(key, None)
+        cake_backend._ATOMIC_ARENAS.pop((99, 99), None)
+        cake_backend.use_deterministic_backend(det_backend)
+
+
 @pytest.mark.parametrize("shift_elems, ldo", [(1, 256), (2, 256), (0, 258)])
 def test_k2_misaligned_out_takes_the_deterministic_path(monkeypatch, shift_elems, ldo):
     """An ``out`` the reduce-add map cannot address (off a 16-byte boundary, or rows not a multiple of 4 elements)
@@ -3006,8 +3615,10 @@ def test_registered_templates_are_the_ones_the_planners_name():
         "router_fp32_gemm_atomic_nn_t",
         "router_fp32_gemm_atomic_nn_t" + cake_backend.ROUTER_HEAD_TAIL_SUFFIX,
     }
-    for table in cake_jit.KERNELS.values():
-        assert set(table) <= wanted, sorted(set(table) - wanted)
+    for arch, table in cake_jit.KERNELS.items():
+        assert set(table) <= wanted | {cake_backend.router_head_tail_template(arch)}, (
+            sorted(set(table) - wanted)
+        )
 
 
 def test_no_det_token_in_generated_names_and_no_negated_token_in_the_package():
@@ -3067,6 +3678,7 @@ def test_clear_convenience_caches_clears_both_packages():
     key = ("dense-projection-gemm-test", object())
     det_backend._K2_CACHE[key] = None
     cake_backend._K1_ATOMIC_CACHE[key] = None
+    cake_backend._K1_DET_CACHE[key] = None
     cake_backend._K2_SPLITK_CACHE[key] = None
     cake_backend._ATOMIC_ARENAS[(99, 99)] = cake_backend._AtomicArena(
         torch.device("cpu"), (99, 99)
@@ -3076,12 +3688,14 @@ def test_clear_convenience_caches_clears_both_packages():
         assert (
             key not in det_backend._K2_CACHE
             and key not in cake_backend._K1_ATOMIC_CACHE
+            and key not in cake_backend._K1_DET_CACHE
             and key not in cake_backend._K2_SPLITK_CACHE
         )
         assert (99, 99) not in cake_backend._ATOMIC_ARENAS
     finally:
         det_backend._K2_CACHE.pop(key, None)
         cake_backend._K1_ATOMIC_CACHE.pop(key, None)
+        cake_backend._K1_DET_CACHE.pop(key, None)
         cake_backend._K2_SPLITK_CACHE.pop(key, None)
         cake_backend._ATOMIC_ARENAS.pop((99, 99), None)
 
@@ -3094,6 +3708,10 @@ def test_the_split_k_workspace_kinds():
     assert kinds["k1_slots"] == (torch.float32, True)
     # the deterministic K2 program's partials: written by the program before the reduction reads them
     assert kinds["k2_splitk_partials"] == (torch.float32, False)
+    # the deterministic K1 program's stream-K slabs (no state between launches) and its slice counters (the
+    # deterministic package's kinds: zero when allocated, zero again after every complete launch)
+    assert kinds["k1_det_ws"] == det_backend._ARENA_KINDS["k1_ws"]
+    assert kinds["k1_det_counters"] == det_backend._ARENA_KINDS["k1_counters"]
     assert not set(kinds) & set(det_backend._ARENA_KINDS)
     arena = cake_backend._AtomicArena(torch.device("cpu"), (0, 0))
     tickets = arena.require("k1_tickets", 100)
@@ -3532,6 +4150,160 @@ def test_gpu_det_then_atomic_share_a_stream_not_a_workspace(k1_rule):
     assert _arena_tickets_zero()
 
 
+def test_gpu_k1_deterministic_program_through_the_binding():
+    """``deterministic=False`` K1 calls that run the deterministic program -- the forward, the input gradient (BF16
+    and FP32 out), the weight gradient of rows without a verdict (both orientations, BF16 and FP32 out, another
+    ``sk``), the batched head views of the generic entry -- go through this package's binding and give the
+    deterministic package's bits: dense and padded outputs (the padding untouched), fresh tensors on every call, a
+    larger row growing the arena (the smaller rows' bindings carved again), another stream with an arena of its own,
+    the slice counters zero after the launches; a batched call the deterministic package runs on its swapped
+    small-token program stays unbound (that package's call); a binding the deterministic package refuses raises its
+    error."""
+    device = _det_device_or_skip()
+    cake_backend.clear_convenience_caches()
+    rows = (("kv_a", 576, 6144), ("4096to128", 128, 4096), ("wide", 2048, 4096))
+    ran, swapped = set(), set()
+
+    def check(T, seed, pad_out=False):
+        g = torch.Generator(device=device).manual_seed(seed)
+        for name, N, K in rows:
+            X, W, G = (
+                _bf16((T, K), device, g),
+                _bf16((N, K), device, g, K**-0.5),
+                _bf16((T, N), device, g),
+            )
+            # fmt: off
+            calls = {
+                "fwd": ((T, N), torch.bfloat16, lambda o, d: cake_backend.projection_forward(X, W, o, deterministic=d)),
+                "dgrad": ((T, K), torch.bfloat16, lambda o, d: cake_backend.projection_dgrad(G, W, o, deterministic=d)),
+                "dgrad_f32": ((T, K), torch.float32, lambda o, d: cake_backend.projection_dgrad(G, W, o, deterministic=d)),
+                "wgrad": ((N, K), torch.bfloat16, lambda o, d: cake_backend.projection_wgrad(G, X, o, deterministic=d)),
+                "wgrad_f32": ((N, K), torch.float32, lambda o, d: cake_backend.projection_wgrad(G, X, o, deterministic=d)),
+                "wgrad_sk": ((N, K), torch.float32, lambda o, d: cake_backend.projection_wgrad(G, X, o, sk=False, deterministic=d)),
+            }
+            # fmt: on
+            arch = det_backend.arch_for(device)
+            sm_count = det_backend.device_facts(device).sm_count
+            for op, ((rows_, cols), dtype, call) in calls.items():
+                f32 = dtype == torch.float32
+                if op.startswith("wgrad") and cake_backend.k1_plan(
+                    arch=arch, L=1, M=K, N=N, K=T, out_f32=f32, sm_count=sm_count
+                ):
+                    continue  # a row with a verdict: this package's program
+                if pad_out:
+                    storage = torch.full(
+                        (rows_, cols + 64), 7.0, device=device, dtype=dtype
+                    )
+                    out = storage[:, :cols]
+                else:
+                    out = torch.empty(rows_, cols, device=device, dtype=dtype)
+                want = call(out, True).clone()
+                for _ in range(2):
+                    out.fill_(float("nan"))
+                    assert call(out, False) is out
+                    assert torch.equal(out, want), (name, op, T, pad_out)
+                if pad_out:
+                    assert bool((storage[:, cols:] == 7.0).all()), (name, op)
+                ran.add(op)
+        # the batched MLA forward / input gradient head views of the generic entry
+        H, slot, D_in, D_out = 64, 256, 192, 512
+        act = _bf16((T, H, slot), device, g)[..., :D_in]
+        weight = _bf16((H, D_in, D_out), device, g, D_in**-0.5)
+        d_out = _bf16((T, H, D_out), device, g)
+        for A, B, shape in (
+            (act.permute(1, 0, 2), weight, (T, H, D_out)),
+            (d_out.permute(1, 0, 2), weight.transpose(1, 2), (T, H, D_in)),
+        ):
+            out = torch.empty(shape, device=device, dtype=torch.bfloat16).permute(
+                1, 0, 2
+            )
+            if det_backend._swap_ab_launch(A, B, out, False) is not None:
+                swapped.add((T, shape))
+            want = cake_backend.dense_projection_gemm(A, B, out).clone()
+            out.fill_(float("nan"))
+            assert (
+                cake_backend.dense_projection_gemm(A, B, out, deterministic=False)
+                is out
+            )
+            assert torch.equal(out, want), (T, tuple(shape))
+
+    for T, pad_out in ((1000, False), (4097, True), (64, False)):
+        check(T, SEED + 80 + T, pad_out)
+    assert {"fwd", "dgrad", "dgrad_f32", "wgrad_f32", "wgrad_sk"} <= ran
+    det_entries = [e for e in cake_backend._K1_DET_CACHE.values() if e.k1 is not None]
+    unbound = [e for e in cake_backend._K1_DET_CACHE.values() if e.k1 is None]
+    assert len(unbound) == len(swapped) and all(e.plan is None for e in unbound)
+    wgrad_entries = [
+        e for e in cake_backend._K1_ATOMIC_CACHE.values() if e.plan is None
+    ]
+    assert det_entries and wgrad_entries
+    assert all(e.k1 is not None for e in wgrad_entries)
+    assert all(e.det_plan is not None for e in wgrad_entries)
+    versions = {id(e): e.k1.version for e in det_entries + wgrad_entries}
+    # the arena grows: the bindings are carved again
+    for arena in list(cake_backend._ATOMIC_ARENAS.values()):
+        for kind in ("k1_det_ws", "k1_det_counters"):
+            if kind in arena.buffers:
+                arena.require(kind, 2 * arena.buffers[kind].numel())
+    for T, pad_out in ((1000, False), (4097, True), (64, False)):
+        check(T, SEED + 81 + T, pad_out)
+    assert all(e.k1.version != versions[id(e)] for e in det_entries + wgrad_entries)
+    stream = torch.cuda.Stream(device)
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        check(1000, SEED + 82)
+    torch.cuda.synchronize()
+    assert stream.cuda_stream in {key[1] for key in cake_backend._ATOMIC_ARENAS}
+    for arena in cake_backend._ATOMIC_ARENAS.values():
+        counters = arena.buffers.get("k1_det_counters")
+        assert counters is not None and not bool(counters.view(torch.int32).any())
+    # a binding the deterministic package refuses: its error
+    g = torch.Generator(device=device).manual_seed(SEED + 83)
+    X, W = _bf16((1001, 4096), device, g), _bf16((128, 4096), device, g)
+    storage = torch.empty(1001 * 4096 + 8, device=device, dtype=torch.bfloat16)
+    Xm = storage[1 : 1 + 1001 * 4096].view(1001, 4096)
+    Xm.copy_(X)
+    with pytest.raises(ValueError, match="16-byte aligned") as refused:
+        cake_backend.projection_forward(Xm, W)
+    with pytest.raises(ValueError, match=re.escape(str(refused.value))):
+        cake_backend.projection_forward(Xm, W, deterministic=False)
+
+
+def test_gpu_k1_bound_launch_is_the_unbound_launch(k1_rule):
+    """A row with a verdict at two splits (two partials per element: bitwise reproducible): the convenience path's
+    bound launch gives the bits of the per-call ordered launch (``_launch_atomic_k1_unbound``) and of the prepared
+    launch, on fresh tensors every call, the tickets zero after."""
+    device, arch = _atomic_device_or_skip()
+    G, X, out = _k1_wgrad_inputs("indexer_k", 4097, torch.float32, device, SEED + 90)
+    k1_rule(G, X, out, 2)
+    prepared = _k1_prepare(G, X, torch.empty_like(out), arch, 2)
+    prepared.launch()
+    want = prepared.out.clone()
+    for i in range(3):
+        G2, X2, out2 = G.clone(), X.clone(), torch.full_like(out, float("nan"))
+        assert cake_backend.projection_wgrad(G2, X2, out2, deterministic=False) is out2
+        torch.cuda.synchronize()
+        assert torch.equal(out2, want), i
+        assert _arena_tickets_zero()
+    entries = [e for e in cake_backend._K1_ATOMIC_CACHE.values() if e.plan is not None]
+    (entry,) = entries
+    assert entry.k1 is not None and entry.plan.splits == 2
+    det = det_backend
+    index = out.get_device()
+    unbound = torch.full_like(out, float("nan"))
+    cake_backend._launch_atomic_k1_unbound(
+        entry,
+        X.t(),
+        G,
+        unbound,
+        index,
+        det._current_raw_stream(index),
+        int(det.pdl_enabled(None, index)),
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(unbound, want) and _arena_tickets_zero()
+
+
 @pytest.mark.parametrize("splits", [1, 2])
 def test_gpu_k1_pdl_waits_for_an_early_producer(splits, k1_rule):
     """This package's weight gradient as a programmatic dependent launch: the deterministic forward before it
@@ -3557,6 +4329,41 @@ def test_gpu_k1_pdl_waits_for_an_early_producer(splits, k1_rule):
         torch.cuda.synchronize()
         _k1_check(out, G.double().t() @ X.double())
     assert _arena_tickets_zero()
+
+
+def test_gpu_k1_bound_deterministic_program_waits_for_an_early_producer():
+    """The deterministic program through this package's binding as a programmatic dependent launch: the
+    deterministic forward before it (K = 8192) triggers its dependents at entry and writes ``G``; the input gradient
+    with ``deterministic=False`` (bound, ``enable_pdl=True``) starts while it runs and must still read every row it
+    wrote -- the deterministic package's bits -- and its slice counters end zero."""
+    device = _det_device_or_skip()
+    cake_backend.clear_convenience_caches()
+    T, N, K = 4096, 128, 4096
+    g = torch.Generator(device=device).manual_seed(SEED + 61)
+    H = _bf16((T, 8192), device, g)
+    Wg = _bf16((N, 8192), device, g, 8192**-0.5)
+    W = _bf16((N, K), device, g, K**-0.5)
+    G = torch.empty(T, N, device=device, dtype=torch.bfloat16)
+    dX = torch.empty(T, K, device=device, dtype=torch.bfloat16)
+    cake_backend.projection_forward(H, Wg, G, enable_pdl=False)
+    want = cake_backend.projection_dgrad(G, W, enable_pdl=False).clone()
+    for _ in range(3):
+        G.fill_(float("nan"))
+        dX.fill_(float("nan"))
+        cake_backend.projection_forward(H, Wg, G, enable_pdl=True)
+        assert (
+            cake_backend.projection_dgrad(
+                G, W, dX, deterministic=False, enable_pdl=True
+            )
+            is dX
+        )
+        torch.cuda.synchronize()
+        assert torch.equal(dX, want)
+    entries = [e for e in cake_backend._K1_DET_CACHE.values() if e.k1 is not None]
+    assert entries
+    for arena in cake_backend._ATOMIC_ARENAS.values():
+        counters = arena.buffers.get("k1_det_counters")
+        assert counters is None or not bool(counters.view(torch.int32).any())
 
 
 # ---------------------------------------------------------------------------
@@ -3771,6 +4578,66 @@ def _top8_rows_differ(out, ref, tie_ulps=16):
     return int(differ.sum()), int(tie.sum())
 
 
+@pytest.mark.parametrize("T", [16172, 16231, 32768])
+def test_gpu_router_tmem_head_tail_program_on_152_sm_sm_103a(T):
+    """On a 152-SM sm_103a part the default plan of the hidden-5120 weight gradient in its head/tail window runs the
+    head/tail program with the A parts in tensor memory (``ROUTER_HEAD_TAIL_TEMPLATES``) and meets the gate of
+    :func:`test_gpu_router_d11_gate` over ``RERUNS`` launches into a NaN-poisoned ``out``: finite, within the
+    reordering bound of the K-order sum of the deterministic program's one-split partials of its segments, relative
+    Frobenius error against FP64 at most ``ROUTER_REL_FRO_MAX``.  On whole tiles (one unit per tile) it stores the bits
+    of the three-chunk-buffer head/tail program at the same partition, which are the deterministic program's one-split
+    result.  Skips on any other device."""
+    device, arch = _atomic_device_or_skip()
+    sm_count = det_backend.device_facts(device).sm_count
+    if arch != "sm_103a" or sm_count != 152:
+        pytest.skip(f"needs a 152-SM sm_103a part, got {arch} with {sm_count} SMs")
+    ts = cake_backend.ROUTER_HEAD_TAIL_TEMPLATES["sm_103a"]
+    c3 = "router_fp32_gemm_atomic_nn_t" + cake_backend.ROUTER_HEAD_TAIL_SUFFIX
+    _require_template(arch, ts)
+    _require_template(arch, c3)
+    X, W, G = _router_inputs(T, device, SEED + 30, K=5120)
+    A, B, out = _router_case("wgrad", X, W, G)
+    plan, reason = cake_backend.plan_atomic_router(
+        A, B, out, arch=arch, sm_count=sm_count
+    )
+    assert plan is not None and plan.template == ts and plan.head_spans > 0, reason
+    prepared = cake_backend.prepare_router_fp32_gemm(A, B, out, deterministic=False)
+    assert isinstance(prepared, cake_backend.PreparedAtomicRouterGemm)
+    assert prepared.plan == plan
+    assert prepared.module_name == cake_jit.select_module(arch, ts)
+    ref = A.double() @ B.double()
+    expected, bound = _router_segment_reference(A, B, plan)
+    expected, bound = expected.t(), bound.t()
+    _assert_ran(prepared.launch, prepared.module_name)
+    worst = 0.0
+    for i in range(RERUNS):
+        out.fill_(float("nan"))
+        prepared.launch()
+        torch.cuda.synchronize()
+        assert bool(torch.isfinite(out).all()), i
+        worst = max(worst, _rel_fro(out, ref))
+        assert bool(((out.double() - expected.double()).abs() <= bound).all()), i
+    assert worst <= ROUTER_REL_FRO_MAX, worst
+    # whole tiles: no part tile, no fill of out, one segment per tile
+    whole = dataclasses.replace(plan, units=plan.tiles, head_spans=0, head_steps=0)
+    assert not whole.part_tiles and whole.reproducible
+    stores = {}
+    for template in (ts, c3):
+        stores[template] = torch.full_like(out, float("nan"))
+        launch = cake_backend._prepare_atomic_k2(
+            dataclasses.replace(whole, template=template),
+            A,
+            B,
+            stores[template],
+            arch,
+        )
+        launch.launch()
+        torch.cuda.synchronize()
+    det_out = torch.empty_like(out)
+    cake_backend.router_fp32_gemm(A, B, det_out, splits=1)
+    assert torch.equal(stores[ts], stores[c3]) and torch.equal(stores[ts], det_out)
+
+
 def test_gpu_router_entry_points_reach_the_stream_k_program(router_rule):
     """``router_forward`` / ``router_wgrad`` with ``deterministic=False`` and a verdict for each row (no forward
     verdict ships; the weight gradient of this hidden size runs the deterministic plan): the forward repeats bit
@@ -3921,6 +4788,54 @@ def test_gpu_k1_sm_count_overrides_run_their_programs():
     print(
         f"K1_OVERRIDES {arch} sm_count={sm_count}: {ran} launches ran the override programs"
     )
+    assert ran
+
+
+def test_gpu_k1_sm_count_overrides_through_the_convenience_binding():
+    """Unforced (``deterministic=False``, no split count), on a part of exactly the SM count of a table of
+    :data:`K1_SPLIT_OVERRIDES_BY_SM` (``sm_107a``: 216 SMs): the convenience path of every overridden row binds the
+    override's program (its :data:`_K1_ATOMIC_CACHE` entry) at the first and the last token count of
+    :data:`K1_SPLIT_RULES_BY_SM_TOKENS` and gives the bits of the prepared launch, the tickets zero after.  A part of
+    any other SM count skips."""
+    device, arch = _atomic_device_or_skip()
+    sm_count = det_backend.device_facts(device).sm_count
+    table = cake_backend.K1_SPLIT_OVERRIDES_BY_SM.get((arch, sm_count), {})
+    rows = sorted((key, choice) for key, choice in table.items() if choice is not None)
+    if not rows:
+        pytest.skip(f"no K1 override of {arch} on {sm_count} SMs")
+    g = torch.Generator(device=device).manual_seed(SEED + 94)
+    ran = 0
+    for key, (block_n, splits) in rows:
+        _, L, M, N, dt = key
+        f32 = dt == "f32"
+        for T in cake_backend.K1_SPLIT_RULES_BY_SM_TOKENS:
+            plan = cake_backend.k1_plan(
+                arch=arch, L=L, M=M, N=N, K=T, out_f32=f32, sm_count=sm_count
+            )
+            if plan != (block_n, splits):  # an excluded token count
+                continue
+            G, X = _bf16((T, N), device, g), _bf16((T, M), device, g)
+            out_dtype = torch.float32 if f32 else torch.bfloat16
+            want = torch.full((N, M), float("nan"), device=device, dtype=out_dtype)
+            prepared = cake_backend.prepare_projection_wgrad(
+                G, X, want, deterministic=False
+            )
+            prepared.launch()
+            cake_backend.clear_convenience_caches()
+            out = torch.full_like(want, float("nan"))
+            assert cake_backend.projection_wgrad(G, X, out, deterministic=False) is out
+            torch.cuda.synchronize()
+            (entry,) = [
+                e for e in cake_backend._K1_ATOMIC_CACHE.values() if e.plan is not None
+            ]
+            assert entry.k1 is not None, (key, T)
+            assert (entry.plan.block_n, entry.plan.splits) == plan, (key, T)
+            if splits <= 2:  # at most two partials per element: bitwise reproducible
+                assert torch.equal(out, want), (key, T)
+            else:
+                _k1_check(out, G.double().t() @ X.double(), f"{M} {N} {dt} {T}")
+            assert _arena_tickets_zero()
+            ran += 1
     assert ran
 
 
