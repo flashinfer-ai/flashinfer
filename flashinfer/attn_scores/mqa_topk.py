@@ -147,6 +147,29 @@ class FP8MQATopKWrapper:
         ``error`` and ``repair_error`` outside capture; the latter sets bit 16
         on fast-mode or explicit Qwen numerical contract violations. Planning
         is capturable after eager preparation.
+
+        Parameters
+        ----------
+        qo_indptr : torch.Tensor
+            CUDA int32 prefix array of shape ``[2]`` containing the query
+            offsets in original tokens for the single request.
+        kv_indptr : torch.Tensor
+            CUDA int32 prefix array of shape ``[2]`` containing the KV offsets
+            in original tokens for the single request.
+        num_query_rows : int, optional
+            Extent of the supplied Q storage. Defaults to ``max_chunk_size``.
+        next_n : int, optional
+            Assert that the request has exactly this many query rows.
+        host_length_hints : tuple[torch.Tensor, torch.Tensor], optional
+            ``(query_prefix, kv_bounds)`` as contiguous CPU int32 or int64
+            tensors of shapes ``[2]`` and ``[1]``. The query prefix must fit
+            the supplied Q extent, and each KV bound must lie in
+            ``[0, max_context_length]``. Device violations set error bit 2.
+            Omit when capturing ``plan`` in a CUDA graph.
+
+        Returns
+        -------
+        None
         """
         return self._capacity_plan.plan(
             qo_indptr,
