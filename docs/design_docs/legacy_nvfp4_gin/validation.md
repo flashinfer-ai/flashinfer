@@ -1,7 +1,8 @@
 # Legacy NVFP4 GIN validation record
 
 Updated 2026-11-02. Host checks, real device results and incomplete gates are
-reported separately. Main numerical/public-runtime checks pass; final augmented checks remain queued. Current job outcomes
+reported separately. The fixed-scope migration is accepted: numerical/public-runtime, final
+sparse-poison/example and retained-finalizer checks pass. Job outcomes
 are tracked in [implementation-status.md](implementation-status.md); failure
 mechanisms and hypotheses are tracked in [investigation.md](investigation.md).
 
@@ -118,5 +119,36 @@ not measured, rather than passed; no hardware restriction is silently bypassed.
   pre-staged packed input parity. Whole job COMPLETED, exit 0.
 
 Final jobs 3576874 (sparse-poison strong oracles/example) and 3576878
-(retained finalization/cache) are queued. Launchers and full logs reside in
+(retained finalization/cache) both COMPLETED with exit 0. Launchers and full logs reside in
 `/lustre/fsw/coreai_devtech_all/qiangf/ncclGIN/port/migration-evidence/`.
+
+Single-node CI must not interpret four local ranks as N2R2. The GIN helper
+requires torchrun `WORLD_SIZE=4`, `LOCAL_WORLD_SIZE=2`, `GROUP_WORLD_SIZE=2`
+before starting the control group. Other launch geometries skip only these
+topology-specific tests; runtime LSA/RDMA checks still verify actual domains.
+The recorded N2R2 passes execute every selected case and are not skip results.
+
+## Final acceptance
+
+- 3576874: four ranks each collected and passed 14 tests, no skips. Each
+  rank reports 24 exact fixed-term protocol calls (`max_diff=0`,
+  `mismatches=0`); all 96 transport/L1 byte checks pass. Sparse route holes
+  carry NaN weights to check that invalid payloads/scores are ignored.
+  Independent Torch math passes its unchanged tolerance on 93 nonempty
+  batches; maximum relative L2 0.0026485608 is below 0.02. Three empty output
+  batches still execute the full communication protocol. The executable
+  example then passes 12 finite/shape calls/rank in fresh worker processes.
+- 3576878: four finalizer cases/rank pass (persistent partial/full capacity,
+  per-token scale, external finalization with early/late route weighting
+  and graphs); one explicit-workspace/cache/graph case/rank passes.
+- Runtime code is committed as `fb033d522` plus `79a519e20`. The final
+  launcher captured base/source hashes and a bounded patch; all Python
+  hashes match the final implementation. Log SHA-256 and per-rank execution
+  manifests are retained in [qualification-results.json](evidence/qualification-results.json).
+- Some inherited outer launcher banners say “donor”; the actual receiving
+  cwd, pytest rootdir and captured source hashes identify FI execution.
+  Job classifications above use the executed code, not that old banner.
+
+The default-off migration is complete within the fixed supported case.
+Broader topologies, precision/mode additions and performance promotion are
+separate work. No push, merge or publication was performed.

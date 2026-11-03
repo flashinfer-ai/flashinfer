@@ -1415,6 +1415,174 @@
       "passed": 263,
       "failed": 0,
       "skipped": 1
+    },
+    {
+      "rank": 0,
+      "world": 4,
+      "node": "theia0028.lyris.clusters.nvidia.com",
+      "nodeids": [
+        "tests/moe_ep/test_nvfp4_cutedsl_gin_off_regressions.py::test_legacy_nvfp4_off_persistent_finalization[17-False]",
+        "tests/moe_ep/test_nvfp4_cutedsl_gin_off_regressions.py::test_legacy_nvfp4_off_persistent_finalization[64-True]",
+        "tests/moe_ep/test_mega_native_topk_reduce_multirank.py::test_external_weighted_reduction_live_rows_and_cuda_graph[nvfp4-False]",
+        "tests/moe_ep/test_mega_native_topk_reduce_multirank.py::test_external_weighted_reduction_live_rows_and_cuda_graph[nvfp4-True]"
+      ],
+      "collect_only": false,
+      "outcomes": {
+        "tests/moe_ep/test_nvfp4_cutedsl_gin_off_regressions.py::test_legacy_nvfp4_off_persistent_finalization[17-False]": "passed",
+        "tests/moe_ep/test_nvfp4_cutedsl_gin_off_regressions.py::test_legacy_nvfp4_off_persistent_finalization[64-True]": "passed",
+        "tests/moe_ep/test_mega_native_topk_reduce_multirank.py::test_external_weighted_reduction_live_rows_and_cuda_graph[nvfp4-False]": "passed",
+        "tests/moe_ep/test_mega_native_topk_reduce_multirank.py::test_external_weighted_reduction_live_rows_and_cuda_graph[nvfp4-True]": "passed"
+      },
+      "exitstatus": 0,
+      "job": 3576878,
+      "phase": "ep4-legacy-finalize",
+      "passed": 4,
+      "failed": 0,
+      "skipped": 0
+    },
+    {
+      "rank": 1,
+      "world": 4,
+      "node": "theia0028.lyris.clusters.nvidia.com",
+      "nodeids": [
+        "tests/moe_ep/test_nvfp4_cutedsl_gin_off_regressions.py::test_legacy_nvfp4_off_persistent_finalization[17-False]",
+        "tests/moe_ep/test_nvfp4_cutedsl_gin_off_regressions.py::test_legacy_nvfp4_off_persistent_finalization[64-True]",
+        "tests/moe_ep/test_mega_native_topk_reduce_multirank.py::test_external_weighted_reduction_live_rows_and_cuda_graph[nvfp4-False]",
+        "tests/moe_ep/test_mega_native_topk_reduce_multirank.py::test_external_weighted_reduction_live_rows_and_cuda_graph[nvfp4-True]"
+      ],
+      "collect_only": false,
+      "outcomes": {
+        "tests/moe_ep/test_nvfp4_cutedsl_gin_off_regressions.py::test_legacy_nvfp4_off_persistent_finalization[17-False]": "passed",
+        "tests/moe_ep/test_nvfp4_cutedsl_gin_off_regressions.py::test_legacy_nvfp4_off_persistent_finalization[64-True]": "passed",
+        "tests/moe_ep/test_mega_native_topk_reduce_multirank.py::test_external_weighted_reduction_live_rows_and_cuda_graph[nvfp4-False]": "passed",
+        "tests/moe_ep/test_mega_native_topk_reduce_multirank.py::test_external_weighted_reduction_live_rows_and_cuda_graph[nvfp4-True]": "passed"
+      },
+      "exitstatus": 0,
+      "job": 3576878,
+      "phase": "ep4-legacy-finalize",
+      "passed": 4,
+      "failed": 0,
+      "skipped": 0
+    },
+    {
+      "rank": 2,
+      "world": 4,
+      "node": "theia0028.lyris.clusters.nvidia.com",
+      "nodeids": [
+        "tests/moe_ep/test_nvfp4_cutedsl_gin_off_regressions.py::test_legacy_nvfp4_off_persistent_finalization[17-False]",
+        "tests/moe_ep/test_nvfp4_cutedsl_gin_off_regressions.py::test_legacy_nvfp4_off_persistent_finalization[64-True]",
+        "tests/moe_ep/test_mega_native_topk_reduce_multirank.py::test_external_weighted_reduction_live_rows_and_cuda_graph[nvfp4-False]",
+        "tests/moe_ep/test_mega_native_topk_reduce_multirank.py::test_external_weighted_reduction_live_rows_and_cuda_graph[nvfp4-True]"
+      ],
+      "collect_only": false,
+      "outcomes": {
+        "tests/moe_ep/test_nvfp4_cutedsl_gin_off_regressions.py::test_legacy_nvfp4_off_persistent_finalization[17-False]": "passed",
+        "tests/moe_ep/test_nvfp4_cutedsl_gin_off_regressions.py::test_legacy_nvfp4_off_persistent_finalization[64-True]": "passed",
+        "tests/moe_ep/test_mega_native_topk_reduce_multirank.py::test_external_weighted_reduction_live_rows_and_cuda_graph[nvfp4-False]": "passed",
+        "tests/moe_ep/test_mega_native_topk_reduce_multirank.py::test_external_weighted_reduction_live_rows_and_cuda_graph[nvfp4-True]": "passed"
+      },
+      "exitstatus": 0,
+      "job": 3576878,
+      "phase": "ep4-legacy-finalize",
+      "passed": 4,
+      "failed": 0,
+      "skipped": 0
+    },
+    {
+      "rank": 3,
+      "world": 4,
+      "node": "theia0028.lyris.clusters.nvidia.com",
+      "nodeids": [
+        "tests/moe_ep/test_nvfp4_cutedsl_gin_off_regressions.py::test_legacy_nvfp4_off_persistent_finalization[17-False]",
+        "tests/moe_ep/test_nvfp4_cutedsl_gin_off_regressions.py::test_legacy_nvfp4_off_persistent_finalization[64-True]",
+        "tests/moe_ep/test_mega_native_topk_reduce_multirank.py::test_external_weighted_reduction_live_rows_and_cuda_graph[nvfp4-False]",
+        "tests/moe_ep/test_mega_native_topk_reduce_multirank.py::test_external_weighted_reduction_live_rows_and_cuda_graph[nvfp4-True]"
+      ],
+      "collect_only": false,
+      "outcomes": {
+        "tests/moe_ep/test_nvfp4_cutedsl_gin_off_regressions.py::test_legacy_nvfp4_off_persistent_finalization[17-False]": "passed",
+        "tests/moe_ep/test_nvfp4_cutedsl_gin_off_regressions.py::test_legacy_nvfp4_off_persistent_finalization[64-True]": "passed",
+        "tests/moe_ep/test_mega_native_topk_reduce_multirank.py::test_external_weighted_reduction_live_rows_and_cuda_graph[nvfp4-False]": "passed",
+        "tests/moe_ep/test_mega_native_topk_reduce_multirank.py::test_external_weighted_reduction_live_rows_and_cuda_graph[nvfp4-True]": "passed"
+      },
+      "exitstatus": 0,
+      "job": 3576878,
+      "phase": "ep4-legacy-finalize",
+      "passed": 4,
+      "failed": 0,
+      "skipped": 0
+    },
+    {
+      "rank": 0,
+      "world": 4,
+      "node": "theia0028.lyris.clusters.nvidia.com",
+      "nodeids": [
+        "tests/moe_ep/test_mega_workspace_knobs_multirank.py::test_explicit_workspace_knobs_and_graph_replay"
+      ],
+      "collect_only": false,
+      "outcomes": {
+        "tests/moe_ep/test_mega_workspace_knobs_multirank.py::test_explicit_workspace_knobs_and_graph_replay": "passed"
+      },
+      "exitstatus": 0,
+      "job": 3576878,
+      "phase": "ep4-workspace-cache",
+      "passed": 1,
+      "failed": 0,
+      "skipped": 0
+    },
+    {
+      "rank": 1,
+      "world": 4,
+      "node": "theia0028.lyris.clusters.nvidia.com",
+      "nodeids": [
+        "tests/moe_ep/test_mega_workspace_knobs_multirank.py::test_explicit_workspace_knobs_and_graph_replay"
+      ],
+      "collect_only": false,
+      "outcomes": {
+        "tests/moe_ep/test_mega_workspace_knobs_multirank.py::test_explicit_workspace_knobs_and_graph_replay": "passed"
+      },
+      "exitstatus": 0,
+      "job": 3576878,
+      "phase": "ep4-workspace-cache",
+      "passed": 1,
+      "failed": 0,
+      "skipped": 0
+    },
+    {
+      "rank": 2,
+      "world": 4,
+      "node": "theia0028.lyris.clusters.nvidia.com",
+      "nodeids": [
+        "tests/moe_ep/test_mega_workspace_knobs_multirank.py::test_explicit_workspace_knobs_and_graph_replay"
+      ],
+      "collect_only": false,
+      "outcomes": {
+        "tests/moe_ep/test_mega_workspace_knobs_multirank.py::test_explicit_workspace_knobs_and_graph_replay": "passed"
+      },
+      "exitstatus": 0,
+      "job": 3576878,
+      "phase": "ep4-workspace-cache",
+      "passed": 1,
+      "failed": 0,
+      "skipped": 0
+    },
+    {
+      "rank": 3,
+      "world": 4,
+      "node": "theia0028.lyris.clusters.nvidia.com",
+      "nodeids": [
+        "tests/moe_ep/test_mega_workspace_knobs_multirank.py::test_explicit_workspace_knobs_and_graph_replay"
+      ],
+      "collect_only": false,
+      "outcomes": {
+        "tests/moe_ep/test_mega_workspace_knobs_multirank.py::test_explicit_workspace_knobs_and_graph_replay": "passed"
+      },
+      "exitstatus": 0,
+      "job": 3576878,
+      "phase": "ep4-workspace-cache",
+      "passed": 1,
+      "failed": 0,
+      "skipped": 0
     }
   ],
   "on_controls": {
@@ -1438,5 +1606,48 @@
         "skipped": 0
       }
     }
+  },
+  "final_on": {
+    "job": 3576874,
+    "ranks": {
+      "2": {
+        "calls": 24,
+        "max_diff": 0.0,
+        "mismatches": 0
+      },
+      "0": {
+        "calls": 24,
+        "max_diff": 0.0,
+        "mismatches": 0
+      },
+      "3": {
+        "calls": 24,
+        "max_diff": 0.0,
+        "mismatches": 0
+      },
+      "1": {
+        "calls": 24,
+        "max_diff": 0.0,
+        "mismatches": 0
+      }
+    },
+    "tests_per_rank": 14,
+    "skipped": 0,
+    "independent_math_calls": 93,
+    "max_relative_l2": 0.002648560795933008,
+    "dispatch_byte_checks": 96,
+    "example_calls_per_rank": 12,
+    "source_base": "fb033d522729346524b3c62090a84dd56e5dbfe7",
+    "source_python_matches_final": true
+  },
+  "final_logs": {
+    "/lustre/fsw/coreai_devtech_all/qiangf/ncclGIN/port/migration-evidence/fi-gin-3576874.out": "b582922ac3476b8a304371dce42082c804ec3e84e691593b6704a72e3e2275cb",
+    "/lustre/fsw/coreai_devtech_all/qiangf/ncclGIN/port/migration-evidence/fi-gin-3576874.err": "d1903b2eccc5742333d3ea50e8de7071514b59553763e61cdb4dcabcb61de317",
+    "/lustre/fsw/coreai_devtech_all/qiangf/ncclGIN/port/migration-evidence/regression-3576878.out": "5d55802fc055e79fea846cc3de52d60ecad3747941ee47ffdfa36e8af1641508",
+    "/lustre/fsw/coreai_devtech_all/qiangf/ncclGIN/port/migration-evidence/regression-3576878.err": "ebed0e077392664627da39c5b5fa01443ace518864c0ee38254e3715a6e6509a",
+    "/lustre/fsw/coreai_devtech_all/qiangf/ncclGIN/port/migration-evidence/regression-3576822.out": "f1e1480423459fa89f75a7e7e844003c9bd64622b2e8864340939d43fcb6c904",
+    "/lustre/fsw/coreai_devtech_all/qiangf/ncclGIN/port/migration-evidence/regression-3576822.err": "ebed0e077392664627da39c5b5fa01443ace518864c0ee38254e3715a6e6509a",
+    "/lustre/fsw/coreai_devtech_all/qiangf/ncclGIN/port/migration-evidence/fi-gin-3576839.out": "90aaf167814e8a065f0a7fee3e685532c7629259e5775893c13e142169342d48",
+    "/lustre/fsw/coreai_devtech_all/qiangf/ncclGIN/port/migration-evidence/fi-gin-3576839.err": "c26e31d4840b3eccd798f080d1bf86c9d5ec89a7f98d7e7f7635ade88321480b"
   }
 }

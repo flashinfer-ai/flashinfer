@@ -146,9 +146,11 @@ baseline. This is a partial MR !100 import, not a snapshot update:
   before device guards trap; it is disabled by default. No support check is
   bypassed. The old shared `nvlink_barrier` keyword defaults remain available
   for FI graph probes; GIN callers pass explicit local rank/thread counts.
-- Internode mode is experimental and default-off. Strong numerical/lifetime
-  qualification and performance acceptance remain incomplete; see the live
-  validation record for exact outcomes. No production support is claimed.
+- Internode mode is experimental and default-off. The fixed N2R2 geometry
+  passes strong protocol/math/byte/relaunch/public-lifetime qualification
+  (final jobs 3576874/3576878, exit 0). Additional geometries remain disabled.
+  The user waived Rubin/local performance validation; no timing or speedup
+  claim is made. See the validation record for exact scope and outcomes.
 
 The recovered original vendor object is available in the receiving checkout.
 It is not an ancestor of MR !100. See the

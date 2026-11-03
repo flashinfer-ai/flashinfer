@@ -14,12 +14,12 @@ default-off; broader production support requires separate qualification.
 | Target gate-up/down width | Runner/shim `intermediate=3072`; FC2 input width=1536 | Public intermediate_size=1536 maps to runner intermediate=3072 |
 | Target tile/cluster | MMA (128,128,256), cluster (1,1,1), static scheduling | Compiles and runs finite relaunch cases |
 | Target math/finalize | Standard SwiGLU, NVFP4×NVFP4, BF16 combine, separate TopkReduce | Strong protocol/Torch oracle passes |
-| Routing | Balanced, local-only/remote-only/mixed and partial/empty cases | Matrix-first and balanced numeric checks pass after generation-race correction |
+| Routing | Balanced, local-only/remote-only/mixed and partial/empty cases | Matrix-first/balanced/partial/empty/sparse-poison numeric and byte checks pass |
 | N2R4, N4R8 and other geometries | No FI numerical evidence | Not enabled |
 | 48 or 64 experts **per rank** | Historical boundary not recovered/reproduced | Unqualified; 48 **total** above is unrelated |
 | Subgroup | All default-group ranks must join preflight | Host error aggregation tested; real runtime rejection passed; public backend checks implemented |
 | CUDA Graph capture | Reject internode capture; preserve existing intranode graphs | Public capture rejection/recovery passes |
-| Custom activation/scale/finalize, autotune, experimental comm options | Preserve off behavior; reject unqualified on combinations | Four config rejections and single-rank metadata errors/recovery pass |
+| Custom activation/scale/finalize, autotune, experimental comm options | Preserve off behavior; reject unqualified on combinations | Five config rejections, including epilogue scales, and single-rank metadata errors/recovery pass |
 
 On mode resolves the donor `group_hint=one` to 536870912, uses epilogue
 publication `(1,4)` and reuses dispatch warps for token-back. The public

@@ -144,3 +144,31 @@ No performance conclusion is justified.
   and pre-staged input parity. Its explicit failure-evidence plugin prints the
   first local failure and exits through the launcher rather than entering a
   damaged collective test-session teardown. Normal collection is unchanged.
+
+## Final checkpoint R2 and conclusion
+
+- **O14, measured:** 3576839 completed, four public control/lifetime tests
+  passed on each rank. The rank-local dtype escape is corrected; negative
+  validation no longer strands peers.
+- **O15, measured:** 3576874 completed on theia0018/theia0020, 14 tests/rank
+  passed without skips. Matrix-first and balanced routes each run 12 times;
+  sparse holes carry NaN weights. All 96 protocol comparisons have zero bit
+  mismatches, all 96 dispatch-byte checks pass, and 93 nonempty Torch
+  comparisons retain the original tolerance (max relative L2 0.0026485608).
+  The standalone public example passes another 12 calls/rank in fresh workers.
+- **O16, measured:** 3576878 completed, off persistent/external finalization
+  and explicit-workspace/cache/graph tests pass on all four ranks. Together
+  with 3576704/3576822, the recorded EP1/EP2/EP4 and BF16/MXFP8 matrix passes.
+- **O17, checked:** The captured final Python hashes match implementation
+  commits fb033d522 + 79a519e20. The 17-file device hunk ledger hashes also
+  match. Changed-file pre-commit/type/style checks and 16 host contracts pass.
+- H1 is a retained adapter-contract correction; H2's unconditional donor-local
+  failure was contradicted. The localized generation race explains a real
+  measured guard failure and is corrected by a stable current-launch target.
+  O15/O16 support the correction without erasing O1–O13 or weakening numeric
+  checks. No unconditional mapper defect remains supported by the evidence.
+- The user waived Rubin/local performance validation for this feature. No
+  latency/speedup conclusion follows from correctness observations.
+- R2: [checkpoint-02.md](checkpoint-02.md), final Markdown evidence checkpoint.
+  Fixed-scope migration is complete; upstreaming the local race correction
+  and qualifying additional modes/topologies are separate follow-up work.

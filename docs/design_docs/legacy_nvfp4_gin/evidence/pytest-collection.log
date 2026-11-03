@@ -1,0 +1,7 @@
+$ /tmp/fi-legacy-nvfp4-gin-host/bin/python -m pytest --collect-only -q tests/cpu/moe_ep/test_legacy_nvfp4_gin_contracts.py
+ImportError while loading conftest '/lustre/fsw/coreai_devtech_all/qiangf/ncclGIN/port/flashinfer-nvfp4-gin/tests/conftest.py'.
+tests/conftest.py:22: in <module>
+    import torch
+E   ModuleNotFoundError: No module named 'torch'
+
+exit_code=4

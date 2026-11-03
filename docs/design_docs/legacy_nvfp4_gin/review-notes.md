@@ -25,10 +25,10 @@ and [investigation](investigation.md). The vendor baseline is retained in VENDOR
 
 - [x] Pre-commit hooks run on changed files, including mypy and Ruff.
 - [x] Standalone host arena/preflight/lifetime contracts: 16 passed.
-- [x] Real N2R2 protocol/Torch/transport-byte oracles: 24 calls/rank exact.
+- [x] Real N2R2 protocol/Torch/transport-byte oracles: 24 calls/rank exact, including sparse holes and NaN invalid weights.
 - [x] Real public negative, two-session, recreation, capture and packed-input tests.
 - [x] Off EP1/EP2/EP4 routing/reset/graph and BF16/MXFP8 compatibility tests.
-- [ ] Final sparse-poison/example and off finalizer qualification jobs complete.
+- [x] Final sparse-poison/example and off finalizer qualification jobs complete (3576874 / 3576878, exit 0).
 
 Targeted correctness CI is appropriate, with explicit EP1/EP2/EP4 launch
 geometry and a separate two-domain N2R2 lane. Suggested files are the new GIN
