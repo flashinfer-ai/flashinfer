@@ -2246,6 +2246,88 @@ MODULES: dict[str, dict[str, Any]] = {
             "taps": 4,
         },
     },
+    # Rendered by the exporter from the family adapter's scaffold: the backward
+    # with vec 8, min_blocks 2, copy tma2d, stage_pair, straddle_rows
+    # (2 CTAs per SM); it runs when C >= select_rule.channels[arch] and no
+    # routed record of a higher threshold admits C; below every threshold the
+    # fallback record (no select_rule) runs.
+    "cake_causal_conv1d_det_train_50aa818e2b2338fb34a4": {
+        "arches": [
+            "sm_107a",
+        ],
+        "arg_plan": [
+            ["buffer", "x"],
+            ["buffer", "w"],
+            ["buffer", "cu"],
+            ["buffer", "dy"],
+            ["buffer", "dx"],
+            ["buffer", "partial"],
+            ["parameter", "S"],
+            ["parameter", "C"],
+            ["parameter", "num_docs"],
+            ["parameter", "search_steps"],
+            ["parameter", "ct_vec"],
+            ["parameter", "n_sub"],
+            ["parameter", "n_ch_tiles"],
+            ["buffer", "x_map"],
+            ["buffer", "dy_map"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "cooperative": False,
+            "ctas_per_sm": 2,
+            "geometry": {
+                "threads": 128,
+                "vec": 8,
+            },
+            "grid_mult": {
+                "sm_107a": 1,
+            },
+            "kind": "occupancy",
+        },
+        "kernel": "cake_causal_conv1d_det_train_50aa818e2b2338fb34a4",
+        "kernel_symbol": "kernel_cake_causal_conv1d_det_train_50aa818e2b2338fb34a4",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 66560,
+            "use_pdl": False,
+        },
+        "library": "cake_causal_conv1d_det_train_50aa818e2b2338fb34a4",
+        "logical": {
+            "C": "C",
+            "S": "S",
+            "ct_vec": "ct_vec",
+            "cu": "cu",
+            "dx": "dx",
+            "dy": "dy",
+            "dy_map": "dy",
+            "n_ch_tiles": "n_ch_tiles",
+            "n_sub": "n_sub",
+            "num_docs": "num_docs",
+            "partial": "partial",
+            "search_steps": "search_steps",
+            "w": "w",
+            "x": "x",
+            "x_map": "x",
+        },
+        "reduce": "cake_causal_conv1d_det_train_86b5ecfbd90aca4b52e5",
+        "role": "bwd",
+        "select_rule": {
+            "channels": {
+                "sm_107a": 264,
+            },
+            "kind": "channels_at_least",
+        },
+        "workspace_rule": {
+            "kind": "partial_rows",
+            "taps": 4,
+        },
+    },
     # The reduce program every backward route shares: the second launch of a
     # backward call.  Launched programmatically dependent on the main program
     # (``use_pdl``: the binding sets the programmatic-stream-serialization
@@ -2593,6 +2675,7 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_causal_conv1d_det_train_d46036aa2bc5f90bb0f6",
             "cake_causal_conv1d_det_train_aeff6106e2822f313a0c",
             "cake_causal_conv1d_det_train_9a07bcaa0223632640ee",
+            "cake_causal_conv1d_det_train_50aa818e2b2338fb34a4",
         ],
         "bwd_bias": [
             "cake_causal_conv1d_det_train_cc7a117aee9c7ae829c4",
