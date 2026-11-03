@@ -1450,11 +1450,6 @@ def _resolve_context_plan_geometry(
     )
     if sage is not None:
         _validate_context_sage_config(geometry, sage)
-    elif qk_dtype == torch.int8:
-        raise NotImplementedError(
-            "int8 Q/K require a Sage recipe (sage=SageAttentionConfig(...)) that "
-            "dequantizes them"
-        )
     # The recipe is rejected before the device, as in block-sparse plans.
     _validate_int8_qk_device(qk_dtype, device_index)
     return geometry
@@ -1713,7 +1708,10 @@ def _two_cta_umma_geometry_eligible(geometry: _ContextPlanGeometry) -> bool:
     # tile-mean ring and row-sum operands leave room for one K/V stage per CTA
     # at one CTA and three in the halved form. The VC tail needs two.
     # VC-Attention-QK8 keeps the E4M3 K ring and follows the device default.
-    vc_qk16 = geometry.vc is not None and geometry.qk_dtype != torch.float8_e4m3fn
+    vc_qk16 = geometry.vc is not None and geometry.qk_dtype not in (
+        torch.float8_e4m3fn,
+        torch.int8,
+    )
     two_cta = _default_two_cta_umma(
         geometry.device_index, geometry.qk_dtype.itemsize * 8
     )
@@ -2012,7 +2010,7 @@ def _get_compiled_context(
     two_cta_umma = compile_spec.two_cta_umma
     vc_attention = compile_spec.vc is not None
     sage_scale_layout = compile_spec.sage_scale_layout
-    vc_qk8 = vc_attention and qk_dtype_key == "float8_e4m3fn"
+    vc_qk8 = vc_attention and qk_dtype_key in ("float8_e4m3fn", "int8")
 
     import cutlass
     import cutlass.cute as cute
@@ -2267,7 +2265,7 @@ def _get_compiled_context(
             head_dim=head_dim_vo or head_dim,
             seq_len_q=max_q_len,
             num_qo_heads=num_qo_heads,
-            qk_fp8=vc_qk8,
+            qk_quant=vc_qk8,
         )
         if compile_spec.vc.demean:
             vc_mu_fake = fake_compact(cutlass.BFloat16, vc_shapes["tile_means"], 16)
@@ -2995,7 +2993,7 @@ class BatchPrefillTSWrapper:
         """Select/cache one execution policy, obtain compiled kernels, and bind resources.
 
         ``vc_config`` selects a VC-Attention recipe and the planned Q/K dtype
-        picks its Q/K side. bf16 Q/K runs VC-Attention-QK16 and E4M3
+        picks its Q/K side. bf16 Q/K runs VC-Attention-QK16 and E4M3 or INT8
         Q/K runs VC-Attention-QK8, whose Hadamard-rotated, per-block scaled Q
         and K need ``vc.q_scale`` and ``vc.k_scale`` on every :meth:`run`. V is
         E4M3 in both, stored as per-128-token-tile residuals whose bf16 tile
@@ -3022,7 +3020,7 @@ class BatchPrefillTSWrapper:
             raise TypeError("use_attention_sinks must be a bool")
         if out_dtype is not None:
             resolved_out_dtype = out_dtype
-        elif sage is not None or q_dtype == torch.float8_e8m0fnu:
+        elif sage is not None or q_dtype in (torch.float8_e8m0fnu, torch.int8):
             # As in block-sparse Sage plans; an 8-bit output is not a recipe, and
             # the MXFP8 token is a scale dtype, not an output dtype.
             resolved_out_dtype = torch.bfloat16
@@ -3030,8 +3028,8 @@ class BatchPrefillTSWrapper:
             resolved_out_dtype = q_dtype
         if v_dtype is not None:
             resolved_v_dtype = v_dtype
-        elif k_dtype == torch.float8_e8m0fnu:
-            # MXFP8 Q/K keeps E4M3 V.
+        elif k_dtype in (torch.float8_e8m0fnu, torch.int8):
+            # MXFP8 and INT8 Q/K keep E4M3 V.
             resolved_v_dtype = torch.float8_e4m3fn
         else:
             resolved_v_dtype = k_dtype
@@ -3039,6 +3037,12 @@ class BatchPrefillTSWrapper:
             raise NotImplementedError(
                 "attention-ts context requires Q and K to use the same dtype; "
                 f"got q_dtype={q_dtype} and k_dtype={k_dtype}"
+            )
+        if k_dtype == torch.int8 and sage is None and vc_config is None:
+            raise NotImplementedError(
+                "int8 Q/K require a Sage recipe (sage=SageAttentionConfig(...)) or a "
+                "VC-Attention recipe (vc_config=VCAttentionConfig(...)) that "
+                "dequantizes them"
             )
         geometry = _resolve_context_plan_geometry(
             device=device,
@@ -3112,7 +3116,7 @@ class BatchPrefillTSWrapper:
                 head_dim=geometry.head_dim_vo or geometry.head_dim,
                 seq_len_q=geometry.max_q_len,
                 num_qo_heads=geometry.num_qo_heads,
-                qk_fp8=geometry.qk_dtype == torch.float8_e4m3fn,
+                qk_quant=geometry.qk_dtype in (torch.float8_e4m3fn, torch.int8),
             )
         sage_state = (
             _build_context_sage_state(geometry) if geometry.sage is not None else None
@@ -3248,7 +3252,7 @@ class BatchPrefillTSWrapper:
         if vc is not None:
             if validate:
                 validate_vc_params(vc, state.vc_scale_shapes, device=geometry.device)
-            if geometry.qk_dtype == torch.float8_e4m3fn:
+            if geometry.qk_dtype in (torch.float8_e4m3fn, torch.int8):
                 if vc.q_scale is None or vc.k_scale is None:
                     raise ValueError(
                         "VC-Attention-QK8 plans require vc.q_scale and vc.k_scale"
@@ -3258,7 +3262,7 @@ class BatchPrefillTSWrapper:
             elif vc.q_scale is not None or vc.k_scale is not None:
                 raise ValueError(
                     "vc.q_scale and vc.k_scale belong to VC-Attention-QK8 plans with "
-                    "E4M3 Q/K"
+                    "E4M3 or INT8 Q/K"
                 )
             vc_mu = vc.tile_means
             # VC plans have equal Q and K/V head counts, so the per-channel V

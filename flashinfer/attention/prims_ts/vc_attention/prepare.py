@@ -43,6 +43,7 @@ from cutlass import Float32, Int32, Int64
 
 from . import (
     E4M3_MAX,
+    INT8_QK_MAX,
     VC_HEAD_DIM,
     VC_K_BLOCK_SIZE,
     VC_MEAN_GROUP_TILES,
@@ -158,6 +159,46 @@ def _pack_row_fp8(vals, base: cutlass.Constexpr[int], scale_inv: Float32):
     )
     for j in cutlass.range_constexpr(_COLS_PER_THREAD // 4):
         packed[j] = _pack_float4_to_fp8_e4m3(
+            vals[base + 4 * j] * scale_inv,
+            vals[base + 4 * j + 1] * scale_inv,
+            vals[base + 4 * j + 2] * scale_inv,
+            vals[base + 4 * j + 3] * scale_inv,
+        )
+    return packed.data_ptr().load(count=_COLS_PER_THREAD // 4, alignment=8)
+
+
+@cute.jit
+def _pack_float4_to_int8(
+    v0: Float32, v1: Float32, v2: Float32, v3: Float32, *, loc=None, ip=None
+) -> Int32:
+    """Round four FP32 values to the nearest INT8, saturating, packed low to high."""
+    return cute.arch.inline_ptx(
+        "{\n"
+        "  .reg .s32 i0, i1, i2, i3;\n"
+        "  .reg .b32 hi;\n"
+        "  cvt.rni.s32.f32 i0, {$r0};\n"
+        "  cvt.rni.s32.f32 i1, {$r1};\n"
+        "  cvt.rni.s32.f32 i2, {$r2};\n"
+        "  cvt.rni.s32.f32 i3, {$r3};\n"
+        "  mov.b32 hi, 0;\n"
+        "  cvt.pack.sat.s8.s32.b32 hi, i3, i2, hi;\n"
+        "  cvt.pack.sat.s8.s32.b32 {$w0}, i1, i0, hi;\n"
+        "}",
+        write_only_types=[Int32],
+        read_only_args=[v0, v1, v2, v3],
+        loc=loc,
+        ip=ip,
+    )
+
+
+@cute.jit
+def _pack_row_int8(vals, base: cutlass.Constexpr[int], scale_inv: Float32):
+    """This thread's 8 values from ``base`` times ``scale_inv`` as two INT8 words."""
+    packed = cutlass.Array(
+        Int32, _COLS_PER_THREAD // 4, space=cutlass.AddressSpace.rmem
+    )
+    for j in cutlass.range_constexpr(_COLS_PER_THREAD // 4):
+        packed[j] = _pack_float4_to_int8(
             vals[base + 4 * j] * scale_inv,
             vals[base + 4 * j + 1] * scale_inv,
             vals[base + 4 * j + 2] * scale_inv,
@@ -813,7 +854,12 @@ class VcQKPass(_Shape):
         for i in cutlass.range_constexpr(_ROWS_PER_THREAD):
             _hadamard128_row(vals, i * _COLS_PER_THREAD, cg)
         # Step 3. Block amax of the rotated values over the valid rows, reduced
-        # across the CTA. One E4M3 scale per block follows from it.
+        # across the CTA. One scale per block follows from it, for the E4M3 or
+        # INT8 codes the output tensor holds.
+        if cutlass.const_expr(mX8.element_type == cutlass.Int8):
+            code_max = INT8_QK_MAX
+        else:
+            code_max = E4M3_MAX
         amax = Float32(0.0)
         for i in cutlass.range_constexpr(_ROWS_PER_THREAD):
             pos = nb * VC_K_BLOCK_SIZE + rg + _ROW_GROUPS * i
@@ -823,7 +869,7 @@ class VcQKPass(_Shape):
                     amax = cute.arch.fmax(amax, cute.arch.fmax(v, -v))
         amax = _block_max(amax, red, tidx)
         scale = cute.arch.fmax(
-            amax * Float32(_HADAMARD_NORM / E4M3_MAX), Float32(1e-12)
+            amax * Float32(_HADAMARD_NORM / code_max), Float32(1e-12)
         )
         # Step 4. Thread 0 writes the block scale to its flat slot in the table.
         if tidx == 0:
@@ -833,8 +879,8 @@ class VcQKPass(_Shape):
                 mem_space=1,
                 dtype=Float32,
             ).store(scale)
-        # Step 5. Quantize the rotated rows with that scale and store the E4M3
-        # block in output row order.
+        # Step 5. Quantize the rotated rows with that scale and store the block
+        # in output row order.
         scale_inv = Float32(_HADAMARD_NORM) / scale
         x8_base = _row_base(
             mX8.iterator.toint(), b, rows_out, h, col0, 1, self.row_bytes8
@@ -842,11 +888,20 @@ class VcQKPass(_Shape):
         for i in cutlass.range_constexpr(_ROWS_PER_THREAD):
             pos = nb * VC_K_BLOCK_SIZE + rg + _ROW_GROUPS * i
             if pos < rows_out:
-                cutlass.inttoptr(
-                    x8_base + Int64(pos) * self.row_bytes8, mem_space=1, dtype=Int32
-                ).store(
-                    _pack_row_fp8(vals, i * _COLS_PER_THREAD, scale_inv), alignment=8
-                )
+                if cutlass.const_expr(mX8.element_type == cutlass.Int8):
+                    cutlass.inttoptr(
+                        x8_base + Int64(pos) * self.row_bytes8, mem_space=1, dtype=Int32
+                    ).store(
+                        _pack_row_int8(vals, i * _COLS_PER_THREAD, scale_inv),
+                        alignment=8,
+                    )
+                else:
+                    cutlass.inttoptr(
+                        x8_base + Int64(pos) * self.row_bytes8, mem_space=1, dtype=Int32
+                    ).store(
+                        _pack_row_fp8(vals, i * _COLS_PER_THREAD, scale_inv),
+                        alignment=8,
+                    )
 
     @cute.kernel
     def kernel(
@@ -1205,6 +1260,11 @@ def _fake1d(dtype, align=32):
     )
 
 
+def _code_dtype(dtype: torch.dtype):
+    """The CuTe element type of a QK8 code tensor."""
+    return cutlass.Int8 if dtype == torch.int8 else cutlass.Float8E4M3FN
+
+
 def _in_dtype(dtype: torch.dtype):
     if dtype == torch.bfloat16:
         return cutlass.BFloat16, True
@@ -1216,6 +1276,7 @@ def _in_dtype(dtype: torch.dtype):
 @functools.lru_cache(maxsize=None)
 def _compiled(
     dtype: torch.dtype,
+    qk8_dtype: torch.dtype,
     demean: bool,
     batch: int,
     seq_len_kv: int,
@@ -1225,7 +1286,8 @@ def _compiled(
     repair_tokens: int,
 ):
     """The kernels of one geometry. ``seq_len_q`` is 0 under QK16 and ``repair_tokens`` is 0
-    without repair. Absent operands are ``None`` at compile time as at run time.
+    without repair. ``qk8_dtype`` is the Q/K code type the QK8 kernel writes. Absent
+    operands are ``None`` at compile time as at run time.
 
     Each kernel goes through the PrimTS on-disk CuTe DSL cache like the context
     kernels, keyed by this geometry and the attention source tree, so a process
@@ -1234,6 +1296,7 @@ def _compiled(
     cdt, is_bf16 = _in_dtype(dtype)
     spec = (
         str(dtype),
+        str(qk8_dtype),
         demean,
         batch,
         seq_len_kv,
@@ -1252,6 +1315,7 @@ def _compiled(
     f32 = lambda: _fake1d(Float32, 64)  # noqa: E731
     i32 = lambda: _fake1d(Int32, 16)  # noqa: E731
     e4m3 = lambda: _fake1d(cutlass.Float8E4M3FN, 16)  # noqa: E731
+    x8 = lambda: _fake1d(_code_dtype(qk8_dtype), 16)  # noqa: E731
     x16 = lambda: _fake1d(cdt)  # noqa: E731
     qk8, repair = seq_len_q > 0, repair_tiles > 0
     shape = (is_bf16, batch, seq_len_kv, num_heads, repair_tiles)
@@ -1327,8 +1391,8 @@ def _compiled(
                 perm,
                 i32() if repair else None,
                 f32(),
-                e4m3(),
-                e4m3(),
+                x8(),
+                x8(),
                 f32(),
                 f32(),
                 stream,
@@ -1344,44 +1408,58 @@ def vc_prepare(
 ):
     """VC-Attention-QK16 operands ``(k_perm, v8, v_scale, mean, mu)`` of
     contiguous ``[B, S, H, D]`` K and V in ``perm`` order."""
-    return _prepare(None, k, v, perm, demean=demean, repair_tiles=0, repair_tokens=0)[
-        :5
-    ]
+    # No Q, so the QK pass is not built and the code type only keys the cache.
+    return _prepare(
+        None,
+        k,
+        v,
+        perm,
+        qk8_dtype=torch.float8_e4m3fn,
+        demean=demean,
+        repair_tiles=0,
+        repair_tokens=0,
+    )[:5]
 
 
 @torch.no_grad()
-def vc_prepare_fp8(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    perm: torch.Tensor,
-    *,
-    demean: bool = True,
-):
+def _prepare_qk8(q, k, v, perm, *, qk8_dtype: torch.dtype, demean: bool):
     """VC-Attention-QK8 operands ``(q8, k8, v8, q_scale, k_scale, v_scale, mean,
-    mu)`` of contiguous ``[B, S, H, D]`` Q, K and V, K and V in ``perm`` order."""
+    mu)`` of contiguous ``[B, S, H, D]`` Q, K and V, K and V in ``perm`` order,
+    with Q/K codes of ``qk8_dtype``."""
     if q.shape[-1] != VC_HEAD_DIM or not q.is_contiguous():
         raise ValueError(
             f"VC fused preparation needs contiguous head_dim {VC_HEAD_DIM} Q"
         )
     k8, v8, v_scale, mean, mu, q8, q_scale, k_scale = _prepare(
-        q, k, v, perm, demean=demean, repair_tiles=0, repair_tokens=0
+        q,
+        k,
+        v,
+        perm,
+        qk8_dtype=qk8_dtype,
+        demean=demean,
+        repair_tiles=0,
+        repair_tokens=0,
     )
     return q8, k8, v8, q_scale, k_scale, v_scale, mean, mu
 
 
+def vc_prepare_fp8(q, k, v, perm, *, demean: bool = True):
+    """``_prepare_qk8`` with E4M3 Q/K codes."""
+    return _prepare_qk8(q, k, v, perm, qk8_dtype=torch.float8_e4m3fn, demean=demean)
+
+
+def vc_prepare_int8(q, k, v, perm, *, demean: bool = True):
+    """``_prepare_qk8`` with INT8 Q/K codes, for the INT8 tensor core of SM100."""
+    return _prepare_qk8(q, k, v, perm, qk8_dtype=torch.int8, demean=demean)
+
+
 @torch.no_grad()
-def vc_prepare_repair(
-    q: torch.Tensor | None,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    *,
-    repair_tiles: int,
-    repair_tokens: int,
+def _prepare_repair(
+    q, k, v, *, qk8_dtype: torch.dtype, repair_tiles: int, repair_tokens: int
 ):
     """V repair operands ``(q8, k_all, v_all, q_scale, k_scale, v_scale)`` in
     input order plus ``repair_tiles`` tiles of the ``repair_tokens`` largest-residual
-    tokens. The QK8 entries are ``None`` under QK16."""
+    tokens. The QK8 entries, Q/K codes of ``qk8_dtype``, are ``None`` under QK16."""
     if q is not None and (q.shape[-1] != VC_HEAD_DIM or not q.is_contiguous()):
         raise ValueError(
             f"VC fused preparation needs contiguous head_dim {VC_HEAD_DIM} Q"
@@ -1393,6 +1471,7 @@ def vc_prepare_repair(
         k,
         v,
         None,
+        qk8_dtype=qk8_dtype,
         demean=False,
         repair_tiles=repair_tiles,
         repair_tokens=repair_tokens,
@@ -1400,9 +1479,44 @@ def vc_prepare_repair(
     return q8, k_all, v_all, q_scale, k_scale, v_scale
 
 
-def _prepare(q, k, v, perm, *, demean: bool, repair_tiles: int, repair_tokens: int):
+def vc_prepare_repair(q, k, v, *, repair_tiles: int, repair_tokens: int):
+    """``_prepare_repair`` with E4M3 Q/K codes under QK8."""
+    return _prepare_repair(
+        q,
+        k,
+        v,
+        qk8_dtype=torch.float8_e4m3fn,
+        repair_tiles=repair_tiles,
+        repair_tokens=repair_tokens,
+    )
+
+
+def vc_prepare_repair_int8(q, k, v, *, repair_tiles: int, repair_tokens: int):
+    """``_prepare_repair`` with INT8 Q/K codes, for the INT8 tensor core of SM100."""
+    return _prepare_repair(
+        q,
+        k,
+        v,
+        qk8_dtype=torch.int8,
+        repair_tiles=repair_tiles,
+        repair_tokens=repair_tokens,
+    )
+
+
+def _prepare(
+    q,
+    k,
+    v,
+    perm,
+    *,
+    qk8_dtype: torch.dtype,
+    demean: bool,
+    repair_tiles: int,
+    repair_tokens: int,
+):
     """Run the passes and return ``(k_out, v8, v_scale, mean, mu, q8, q_scale,
-    k_scale)``. ``q`` selects QK8 and the QK8 outputs are ``None`` without it."""
+    k_scale)``. ``q`` selects QK8 and the QK8 outputs, Q/K codes of ``qk8_dtype``,
+    are ``None`` without it."""
     b, s_k, h, d = k.shape
     if d != VC_HEAD_DIM:
         raise ValueError(f"VC fused preparation supports head_dim {VC_HEAD_DIM} only")
@@ -1415,7 +1529,15 @@ def _prepare(q, k, v, perm, *, demean: bool, repair_tiles: int, repair_tokens: i
     s_q = 0 if q is None else q.shape[1]
     with torch.cuda.device(dev):
         ker = _compiled(
-            k.dtype, bool(demean), b, s_k, h, repair_tiles, s_q, repair_tokens
+            k.dtype,
+            qk8_dtype,
+            bool(demean),
+            b,
+            s_k,
+            h,
+            repair_tiles,
+            s_q,
+            repair_tokens,
         )
     if not repair and (
         perm is None or tuple(perm.shape) != (b, h, s_k) or perm.device != dev
@@ -1472,8 +1594,8 @@ def _prepare(q, k, v, perm, *, demean: bool, repair_tiles: int, repair_tokens: i
         )
     if q is None:
         return k_perm, v8, v_scale, mean, mu, None, None, None
-    k8 = torch.empty((b, rows, h, d), dtype=torch.float8_e4m3fn, device=dev)
-    q8 = torch.empty((b, s_q, h, d), dtype=torch.float8_e4m3fn, device=dev)
+    k8 = torch.empty((b, rows, h, d), dtype=qk8_dtype, device=dev)
+    q8 = torch.empty((b, s_q, h, d), dtype=qk8_dtype, device=dev)
     k_scale = torch.empty(
         (h, b, (rows + VC_K_BLOCK_SIZE - 1) // VC_K_BLOCK_SIZE),
         dtype=torch.float32,
