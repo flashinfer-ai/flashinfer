@@ -2686,7 +2686,7 @@ def test_gpu_l2n_flag_off_identity_w1() -> None:
             )
             rec_b = dict(cake_kcp.LAST_CALL["bwd"])
             # as on the base of this change: a flag-off launch record carries no key of the mode
-            assert not {"l2n", "l2n_rstd"} & (set(rec_f) | set(rec_b)), tag
+            assert not {"l2n", "l2n_rstd", "l2n_twin"} & (set(rec_f) | set(rec_b)), tag
             got[tag] = {
                 "tensors": {"out": out, **dict(zip(TOKEN_GRADS, grads, strict=True))},
                 "record": {
@@ -2865,8 +2865,18 @@ def _run_rank(
     flags["first_reader_rstd"] = T == 0 or (
         tuple(rec_f["l2n_rstd"]) == (0, 1) and tuple(rec_b["l2n_rstd"]) == (1, 0)
     )
-    # the record whose saved-rstd twin the saved-mode backward ran (the twin's bits are checked by saved_eq_replay)
+    # the saved-mode backward ran the saved-rstd twin of its plan's prep exactly where one ships for the device (the
+    # call's local plan: its (T_r, n_frag, H) key on this device); the twin's bits are checked by saved_eq_replay
     reported["saved_rstd_twin"] = rec_b.get("l2n_twin")
+    want_twin = None
+    if T > 0:
+        arch = cake_jit.device_arch(device.index)
+        prep = cake_backend.plan(
+            T, int(ctx.n_frag), H, cake_jit.sm_count(device.index), arch, gate=gate, l2n="fused"
+        ).record("bwd_prep", cake_kcp.LOCAL_PATH_BWD)  # fmt: skip
+        twin = cake_kcp_plan.saved_rstd_record(prep, arch)
+        want_twin = None if twin == prep else (prep, twin)
+    flags["saved_rstd_twin"] = rec_b.get("l2n_twin") == want_twin
     rep, saved_rep, _ = saved_pass()
     flags["rstd_repeat_bitwise"] = _bits_equal(saved_rep.qk_rstd, rstd)
     del saved_rep
@@ -2939,7 +2949,9 @@ def _run_rank(
         _local_stages(rec_b) == _local_stages(rec_bo)
     )
     # a flag-off launch record carries no key of the mode
-    flags["flag_off_records"] = not ({"l2n", "l2n_rstd"} & (set(rec_fo) | set(rec_bo)))
+    flags["flag_off_records"] = not (
+        {"l2n", "l2n_rstd", "l2n_twin"} & (set(rec_fo) | set(rec_bo))
+    )
     flags["zero_token_rank_no_stage"] = T > 0 or (
         rec_f["n_stages"] == 0 and rec_b["n_stages"] == 0
     )
