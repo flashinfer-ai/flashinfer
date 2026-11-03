@@ -501,6 +501,8 @@ class MegaMoENvfp4Frontend:
         if self.config.internode:
             error = None
             try:
+                # Compilation, registration and launch lowering belong to
+                # eager warmup. Capture may only use an existing thunk.
                 ensure_not_capturing("internode GIN preparation")
                 launch_inputs = self._prepare_launch_inputs(
                     inputs, num_tokens=num_tokens
@@ -539,7 +541,6 @@ class MegaMoENvfp4Frontend:
             def thunk() -> None:
                 error = None
                 try:
-                    ensure_not_capturing("internode GIN execution")
                     if session is None or session._closed:
                         raise RuntimeError(
                             "GIN launch thunk belongs to a closed session."
@@ -564,7 +565,11 @@ class MegaMoENvfp4Frontend:
         key = self._mega_compile_key()
         collective_gin_preflight(
             dist,
-            signature=(key[:1] + key[2:], getattr(self._gin_session, "identity", None)),
+            signature=(
+                key[:1] + key[2:],
+                getattr(self._gin_session, "identity", None),
+                torch.cuda.is_current_stream_capturing(),
+            ),
             local_error=error,
             phase=phase,
         )

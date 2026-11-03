@@ -7,7 +7,9 @@ This file executes correctness checks only and reports no timings.
 
 from __future__ import annotations
 
+import json
 import os
+from contextlib import nullcontext
 
 import pytest
 import torch
@@ -331,25 +333,235 @@ def test_nvfp4_gin_public_rank_local_device_binding():
             layer.destroy()
 
 
-def test_nvfp4_gin_public_capture_rejection():
+@pytest.mark.parametrize("quantize_input", [True, False], ids=["bf16", "packed"])
+@pytest.mark.parametrize("partial", [False, True], ids=["full", "partial"])
+def test_nvfp4_gin_public_graph_replay(quantize_input, partial, monkeypatch, tmp_path):
+    """Capture the public staging/kernel/reduce path and adjacent GPU work."""
     bootstrap = _bootstrap()
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
+        nvfp4_quantize_per_block_16,
+    )
+
+    layer = _layer(bootstrap, quantize_input=quantize_input)
+    failed = False
+    graphs, outputs = [], []
+    n = (0, 7, 32, 13)[bootstrap.rank] if partial else 32
+
+    def batch(iteration):
+        t = _inputs(bootstrap.rank, iteration, "balanced")
+        # Keep the graph's shape bucket fixed while changing payloads/routes.
+        if iteration % 3 != 0:
+            node = bootstrap.rank // 2
+            expert = bootstrap.rank * 12 if iteration % 3 == 1 else (1 - node) * 24
+            t.topk_ids.copy_(
+                torch.arange(expert, expert + 4, device="cuda").repeat(32, 1)
+            )
+        if iteration % 4 == 3:
+            t.topk_ids[::3, 1] = -1
+            t.topk_weights[::3, 1] = float("nan")
+        if not quantize_input:
+            t.hidden_states, t.scales = nvfp4_quantize_per_block_16(
+                t.hidden_states.float(), 1.0
+            )
+            t.scales = t.scales[:n].contiguous()
+        t.hidden_states = t.hidden_states[:n].contiguous()
+        t.topk_ids = t.topk_ids[:n].contiguous()
+        t.topk_weights = t.topk_weights[:n].contiguous()
+        return t
+
+    try:
+        static = batch(0)
+        layer.warmup(static)
+        torch.cuda.synchronize()
+        mega = layer._workspace._frontend._mega
+        compiled, streams = mega.compiled, []
+
+        def tracked(**kwargs):
+            streams.append(int(kwargs["stream"]))
+            return compiled(**kwargs)
+
+        monkeypatch.setattr(mega, "compiled", tracked)
+        layer.forward(static)  # Prepare the instrumented callable outside capture.
+        torch.cuda.synchronize()
+        for split in (False, True):
+            stream = torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream):
+                # A caller owns capture and can include surrounding kernels.
+                t = MoEEpTensors(
+                    hidden_states=static.hidden_states.clone(),
+                    scales=static.scales,
+                    topk_ids=static.topk_ids,
+                    topk_weights=static.topk_weights,
+                )
+                if split:
+                    layer.stage_inputs(t)
+                    y = layer.compute_staged(output=None)
+                else:
+                    y = layer.forward(t)
+                output = y.float() * 2 + 1
+            assert streams[-1] == stream.cuda_stream
+            graphs.append(graph)
+            outputs.append(output)
+        dist.barrier()
+
+        def no_host_agreement(*args, **kwargs):
+            raise AssertionError("graph replay must not execute Python GIN agreement")
+
+        for iteration in range(1, 13):
+            current = batch(iteration)
+            expected = layer.forward(current).float() * 2 + 1
+            static.hidden_states.copy_(current.hidden_states)
+            static.topk_ids.copy_(current.topk_ids)
+            static.topk_weights.copy_(current.topk_weights)
+            if static.scales is not None:
+                static.scales.copy_(current.scales)
+            torch.cuda.synchronize()
+            for graph, actual in zip(graphs, outputs, strict=True):
+                # An empty graph, stale workspace result, or missing staging
+                # cannot pass by reusing the just-computed eager result.
+                layer._workspace.output_activation.fill_(float("nan"))
+                actual.fill_(float("nan"))
+                calls = len(streams)
+                with monkeypatch.context() as context:
+                    context.setattr(
+                        layer._workspace._frontend, "_gin_agree", no_host_agreement
+                    )
+                    graph.replay()
+                    torch.cuda.synchronize()
+                assert len(streams) == calls
+                assert torch.equal(actual, expected), (bootstrap.rank, iteration)
+            dist.barrier()
+
+        with torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ]
+        ) as prof:
+            graphs[0].replay()
+            torch.cuda.synchronize()
+        trace = tmp_path / "gin-graph.json"
+        prof.export_chrome_trace(str(trace))
+        names = [
+            event["name"]
+            for event in json.loads(trace.read_text())["traceEvents"]
+            if event.get("cat") == "kernel"
+        ]
+        assert sum("fc1fc2_kernel_impl" in name for name in names) == 1, names
+        assert sum("kernel_cutlass__reduce_" in name for name in names) == 1, names
+        assert torch.equal(outputs[0], expected)
+        print(
+            f"[rank {bootstrap.rank}] GIN_GRAPH_PASS packed={not quantize_input} "
+            f"tokens={n} graphs=2 replays=24 mega=1 reduce=1",
+            flush=True,
+        )
+    except BaseException:
+        failed = True
+        raise
+    finally:
+        if not failed:
+            graphs.clear()
+            outputs.clear()
+            layer.destroy()
+
+
+@pytest.mark.parametrize("method", ["forward", "stage_inputs"])
+def test_nvfp4_gin_public_mixed_capture_rejection(method):
+    bootstrap = _bootstrap()
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.gin import (
+        GinPreflightError,
+    )
+
     layer = _layer(bootstrap)
     failed = False
     try:
         inputs = _inputs(bootstrap.rank, 0, "balanced")
-        layer.forward(inputs)
+        expected = layer.forward(inputs).clone()
         torch.cuda.synchronize()
         stream = torch.cuda.Stream()
         stream.wait_stream(torch.cuda.current_stream())
+        graph = torch.cuda.CUDAGraph()
+        capture = (
+            torch.cuda.graph(graph, stream=stream)
+            if bootstrap.rank == 1
+            else nullcontext()
+        )
+        with pytest.raises(GinPreflightError, match="configuration differs"), capture:
+            getattr(layer, method)(inputs)
+        actual = layer.forward(inputs)
+        torch.cuda.synchronize()
+        assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+        del graph
+    except BaseException:
+        failed = True
+        raise
+    finally:
+        if not failed:
+            layer.destroy()
+
+
+def test_nvfp4_gin_public_graph_requires_warmup():
+    bootstrap = _bootstrap()
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.gin import (
+        GinPreflightError,
+    )
+
+    layer = _layer(bootstrap)
+    failed = False
+    try:
+        inputs = _inputs(bootstrap.rank, 0, "balanced")
+        # Only one rank is cold: all peers must reject before recording work.
+        layer.warmup(inputs)
+        torch.cuda.synchronize()
+        if bootstrap.rank == 1:
+            layer._kernel._thunk_states.clear()
+        graph = torch.cuda.CUDAGraph()
         with (
-            pytest.raises((RuntimeError, ValueError), match="GIN|gin"),
-            torch.cuda.graph(torch.cuda.CUDAGraph(), stream=stream),
+            pytest.raises(GinPreflightError, match="warmup"),
+            torch.cuda.graph(graph),
         ):
             layer.forward(inputs)
-        torch.cuda.current_stream().wait_stream(stream)
+        # Rewarm all ranks in the same preparation phase after the rejection.
+        layer._kernel._thunk_states.clear()
         output = layer.forward(inputs)
         torch.cuda.synchronize()
         assert torch.isfinite(output).all()
+        del graph
+    except BaseException:
+        failed = True
+        raise
+    finally:
+        if not failed:
+            layer.destroy()
+
+
+def test_nvfp4_gin_public_graph_metadata_error_recovery():
+    bootstrap = _bootstrap()
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.gin import (
+        GinPreflightError,
+    )
+
+    layer = _layer(bootstrap)
+    failed = False
+    try:
+        inputs = _inputs(bootstrap.rank, 0, "balanced")
+        layer.warmup(inputs)
+        torch.cuda.synchronize()
+        bad = _inputs(bootstrap.rank, 1, "balanced")
+        if bootstrap.rank == 1:
+            bad.hidden_states = bad.hidden_states.float()
+        graph = torch.cuda.CUDAGraph()
+        with (
+            pytest.raises(GinPreflightError, match="dtype"),
+            torch.cuda.graph(graph),
+        ):
+            layer.forward(bad)
+        output = layer.forward(inputs)
+        torch.cuda.synchronize()
+        assert torch.isfinite(output).all()
+        del graph
     except BaseException:
         failed = True
         raise

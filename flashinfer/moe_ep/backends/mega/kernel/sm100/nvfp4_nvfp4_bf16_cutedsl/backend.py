@@ -333,14 +333,22 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             return self._validate_forward_local(
                 t, fleet_params, quantize_input=quantize_input
             )
-        if torch.cuda.is_current_stream_capturing():
-            raise MoEEpConfigError("Internode GIN does not support CUDA Graph capture.")
+        capturing = torch.cuda.is_current_stream_capturing()
         import torch.distributed as dist
         from ......kernel_src.sm100.cutedsl_megamoe import collective_gin_preflight
 
         error = None
         try:
-            self._validate_forward_local(t, fleet_params, quantize_input=quantize_input)
+            if capturing and not self._thunk_states:
+                raise ValueError(
+                    "GIN capture requires warmup on all ranks before capture."
+                )
+            self._validate_forward_local(
+                t,
+                fleet_params,
+                quantize_input=quantize_input,
+                check_route_values=not capturing,
+            )
             if t.num_tokens > fleet_params.max_tokens_per_rank:
                 raise ValueError("GIN live token count exceeds capacity.")
             if t.output is not None and (
@@ -356,7 +364,9 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         collective_gin_preflight(
             dist,
             phase="backend-forward",
-            signature=("nvfp4-gin-v1",),
+            # Mixed eager/capture would launch on only the eager ranks.
+            # CPU agreement runs during capture, never during graph replay.
+            signature=("nvfp4-gin-v1", capturing),
             local_error=error,
         )
 
@@ -366,6 +376,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         fleet_params: FleetParams,
         *,
         quantize_input: bool,
+        check_route_values: bool = True,
     ) -> None:
         if self._kernel_config.internode:
             if any(
@@ -414,7 +425,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             num_tokens=t.hidden_states.shape[0],
             enabled=self._kernel_config.enable_fc1_activation_per_token_scale,
         )
-        if self._kernel_config.internode:
+        if self._kernel_config.internode and check_route_values:
             ids = t.topk_ids
             if torch.any((ids < -1) | (ids >= fleet_params.num_experts)).item():
                 raise ValueError(
@@ -521,7 +532,13 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
     ) -> None:
         frontend = workspace._frontend
         if frontend.config.internode:
-            raise RuntimeError("Internode GIN CUDA Graph capture is not qualified.")
+            error = None
+            try:
+                self._prepared_thunk_state(workspace, transformed_weights)
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"
+            frontend._gin_agree(error, "capture-ready")
+            return
         mega = frontend._mega
         if mega is None or mega.compiled is None:
             raise RuntimeError(
@@ -595,6 +612,11 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         )
         state = self._thunk_states.get(key)
         if state is None or key[2] is None:
+            if fe.config.internode and torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "GIN capture requires a prepared launch; call layer.warmup() "
+                    "with this workspace and weights before capture."
+                )
             # A pooled frontend can be recompiled by another layer. Release
             # thunks retaining the old compiled session and its freed scratch.
             self._thunk_states = {

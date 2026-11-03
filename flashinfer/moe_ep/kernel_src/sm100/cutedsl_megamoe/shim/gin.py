@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Callable
+from weakref import WeakKeyDictionary
 
 
 def _positive_int(name: str, value: int) -> None:
@@ -279,6 +280,30 @@ def validate_gin_rail_support(comm, *, world_size: int, ranks_per_node: int) -> 
         )
 
 
+_gin_control_groups: Any = WeakKeyDictionary()
+
+
+def _gin_control_group(dist):
+    """Reuse CPU WORLD or initialize one CPU group before any graph capture.
+
+    GIN sessions are initialized collectively outside capture. A NCCL-only
+    default group needs a Gloo control group so capture-time errors never
+    enqueue CUDA collectives. The default PG owns the child group's lifetime;
+    destroying WORLD tears it down along with the other process groups.
+    """
+    world = dist.group.WORLD
+    get_config = getattr(dist, "get_backend_config", None)
+    if get_config is None:
+        return world, False
+    if "cpu:gloo" in str(get_config(world)):
+        return world, True
+    group = _gin_control_groups.get(world)
+    if group is None:
+        group = dist.new_group(backend="gloo")
+        _gin_control_groups[world] = group
+    return group, True
+
+
 def collective_gin_preflight(
     dist,
     *,
@@ -305,8 +330,8 @@ def collective_gin_preflight(
         local_error = "; ".join(
             filter(None, (local_error, "EP subgroups are unsupported."))
         )
-    backend_config = getattr(dist, "get_backend_config", None)
-    if backend_config is not None and "cpu:gloo" in str(backend_config(world)):
+    control, cpu_control = _gin_control_group(dist)
+    if cpu_control:
         import hashlib
         import torch
 
@@ -328,7 +353,7 @@ def collective_gin_preflight(
             (rank, *words, bool(local_error)), dtype=torch.int64, device="cpu"
         )
         headers = torch.empty(size * 4, dtype=torch.int64, device="cpu")
-        dist.all_gather_into_tensor(headers, header, group=world)
+        dist.all_gather_into_tensor(headers, header, group=control)
         if all(
             entry[0] == peer and tuple(entry[1:3]) == words and not entry[3]
             for peer, entry in enumerate(headers.view(size, 4).tolist())
@@ -336,7 +361,7 @@ def collective_gin_preflight(
             return
     report = (dist.get_rank(group=world), phase, signature, local_error)
     reports: list[Any] = [None] * dist.get_world_size(group=world)
-    dist.all_gather_object(reports, report, group=world)
+    dist.all_gather_object(reports, report, group=control)
     errors = []
     baseline = reports[0]
     baseline_valid = isinstance(baseline, tuple) and len(baseline) == 4

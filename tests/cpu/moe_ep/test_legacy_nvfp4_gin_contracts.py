@@ -177,6 +177,39 @@ class _ControlWorld:
 
 
 class PreflightTests(unittest.TestCase):
+    def test_cpu_control_reuses_world(self):
+        world = object()
+        dist = SimpleNamespace(
+            group=SimpleNamespace(WORLD=world),
+            get_backend_config=lambda group: "cpu:gloo,cuda:nccl",
+        )
+        self.assertEqual(gin._gin_control_group(dist), (world, True))
+
+    def test_nccl_only_control_is_reused_and_scoped_to_world(self):
+        class World:
+            pass
+
+        created = []
+
+        def new_group(*, backend):
+            self.assertEqual(backend, "gloo")
+            group = object()
+            created.append(group)
+            return group
+
+        dist = SimpleNamespace(
+            group=SimpleNamespace(WORLD=World()),
+            get_backend_config=lambda group: "cuda:nccl",
+            new_group=new_group,
+        )
+        first, cpu = gin._gin_control_group(dist)
+        self.assertTrue(cpu)
+        self.assertIs(gin._gin_control_group(dist)[0], first)
+        self.assertEqual(len(created), 1)
+        dist.group.WORLD = World()
+        self.assertIsNot(gin._gin_control_group(dist)[0], first)
+        self.assertEqual(len(created), 2)
+
     def test_rail_capability_requires_device_rdma_and_distinct_domains(self):
         def support(**changes):
             fields = dict(device_api_support=True, railed_gin_type="GPI", n_lsa_teams=2)
