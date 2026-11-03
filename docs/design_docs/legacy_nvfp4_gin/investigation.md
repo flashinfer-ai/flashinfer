@@ -473,6 +473,24 @@ A useful future check would require a demonstrably stable N2R2 launch baseline;
 repeating unchanged allocations until a passing sample appears is not warranted.
 
 Archive handoff for R6: optional per-invocation authorization requested;
-status pending. No session trace was collected, packaged or uploaded.
+status was pending at the frozen investigation handoff. No session trace had
+been collected, packaged or uploaded at that boundary.
 The benchmark artifact index is ordinary experiment evidence, not a session
 trace archive. No destination is inferred from project remotes.
+
+Post-snapshot archive receipt, 2026-11-03: the user explicitly authorized
+collection/upload and supplied
+`ssh://git@gitlab-master.nvidia.com:12051/qiangf/agent-trace.git`.
+Status **uploaded**, remote branch `main` verified at
+`2cf0a06da12654a3ab4089224523822f93de9807`.
+Repository path: `cases/legacy-nvfp4-gin-blackwell-01a19f6e-r6`.
+Local bundle: `port/migration-evidence/trace-archive-20261103/cases/legacy-nvfp4-gin-blackwell-01a19f6e-r6`.
+Receipt alongside it:
+`legacy-nvfp4-gin-blackwell-01a19f6e-r6.upload-f3d64ab6dc82279c3aeb.json`.
+The frozen bundle is unchanged. It contains1272 visible parent-session events
+from original lines1–5409,22 explicit text artifacts and3 research-skill
+snapshots; original final handoff L5452 is a separate exact-text artifact.
+Archive operations, separate child sessions, large traces/tensors/binaries
+and internal reasoning are excluded. Three compactions and131 source
+truncation markers remain documented; unknown/nonvisible schemas are counted.
+No added tool truncation, skill optimization or replay was performed.
