@@ -244,7 +244,7 @@ eager calls too.
 
 | option | values | meaning |
 |---|---|---|
-| `save_mode` | **`"light"`**, `"full"` | `"light"` keeps the boundary states and the cheap per-chunk tables and replays the intra-rank tapes in the backward; `"full"` keeps the tapes (`h`, `v_new`, `w`, `u`, `Aqk`: 67,584 B per token at `HV = 48`) |
+| `save_mode` | **`"light"`**, `"full"` | `"light"` keeps the boundary states (with `save_transfer=True` also the received summary pairs and `M_seg`) and no tape: the backward re-runs the chunk preparation and replays the intra-rank tapes; `"full"` also keeps `M_seg` and every forward tape (the ten tapes `h`, `v_new`, `w`, `u`, `Aqk`, `Akk`, `gamma`, `gcum`, `rowscale`, `qscale`: 74,307 B per padded token row at `HV = 48`) |
 | `boundary_mode` | **`"saved"`**, `"replay"` | whether the cross-rank boundary states (`S_in`, the owner's received summaries) are kept in the saved set or recomputed (exchange included) in the backward |
 | `exchange` | **`"a2a"`**, `"ring"` | the collective schedule; `"ring"` only when every document crosses at most 3 ranks (`n_d_max - 1 <= 2`) and `save_transfer=False` |
 | `save_transfer` | **`True`**, `False` | keep the received summary pairs for the backward (`False` re-sends the transposed transfers) |
@@ -270,7 +270,8 @@ the shipped route never reads.
 
 With `s = HV * 128 * 128 * 4` bytes (3 MiB at `HV = 48`), `n_in(r)` the
 rank's fragments with a predecessor on another rank and `n_out(r)` those with
-a successor:
+a successor (the per-token figures are bytes per padded token row, `R = 64 *
+NC_pad` rows per rank, at `HV = 48`):
 
 | item | `save_mode="full"` | `save_mode="light"` | bytes per rank |
 |---|---|---|---|
@@ -279,8 +280,10 @@ a successor:
 | received summary pairs (owner, `save_transfer=True`) | yes | yes | `2 * s_owner * n_owned_fragments` |
 | `M_seg` (segment transfers, `P > 1`) | yes | `save_transfer=True` only (else rebuilt by the replay) | `P * n_frag * s` |
 | convolution history rows | yes | yes | `<= 3 * n_in * C * 2` |
-| `gamma`, `gcum`, `Akk` | yes | yes | about 6,339 B per token |
+| `gamma`, `gcum`, `Akk` (chunk-preparation outputs) | yes | **no** (the chunk preparation re-runs in the backward) | about 6,339 B per token |
+| `rowscale`, `qscale` (chunk-preparation FP32 row factors) | yes | **no** (the chunk preparation re-runs in the backward) | 384 B per token |
 | `h` tape, `v_new`, `w`, `u`, `Aqk` | yes | **no** (replayed in the backward) | 67,584 B per token |
+| `qk_rstd` (`use_qk_l2norm_in_kernel=True`) FP32 | yes | yes | `8 * T_r * H_qk` |
 
 Everything is attached through the autograd `save_for_backward` only, so a
 `torch.utils.checkpoint(use_reentrant=False)` forward retains 0 B per entry
@@ -400,7 +403,8 @@ gdn_comm_bytes_kcp(ctx, *, H_qk, HV, C) -> {rank: {c1_send, c1_recv, c2_recv, b1
     c1_send = 2 * s * n_out(r)      c2_recv = s * n_in(r)      b2_recv = s * n_out(r)
     b1_send = s * n_in(r) * (1 if save_transfer else 2)
     c1_recv / b1_recv on an owner = 2 * s_owner * (fragments it owns)      halo = rows(r) * C * 2
-gdn_saved_bytes_kcp(ctx, *, H_qk, HV, save_mode, save_transfer=True, P=None) -> per rank (the table above)
+gdn_saved_bytes_kcp(ctx, *, H_qk, HV, save_mode="light", boundary_mode="saved", save_transfer=True, with_conv=True,
+    C=None, P=None, use_qk_l2norm_in_kernel=False) -> per rank (the table above)
 gdn_workspace_bytes_kcp(ctx, *, H_qk, HV, P=None, reuse_recompute_tapes=None) -> per rank: the most the caller-held
     workspace binds in the forward (the fused form: #1, the pools + the eight tapes #1 writes; the split form, also
     `forward_split` of the layout: the tape walk, the pools + the eight live tapes) or the backward (its phases: the
