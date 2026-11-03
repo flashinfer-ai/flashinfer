@@ -420,6 +420,16 @@ def test_nvfp4_gin_public_graph_replay(quantize_input, partial, monkeypatch, tmp
         def no_host_agreement(*args, **kwargs):
             raise AssertionError("graph replay must not execute Python GIN agreement")
 
+        def poison_workspace():
+            # Eager reference calls have already staged current inputs. Erase
+            # them so every graph must restore its own recorded staging.
+            workspace = layer._workspace
+            workspace.x.view(torch.uint8).zero_()
+            workspace.x_sf.view(torch.uint8).zero_()
+            workspace.topk_idx.fill_(-1)
+            workspace.topk_weights.fill_(float("nan"))
+            workspace.output_activation.fill_(float("nan"))
+
         for iteration in range(1, 13):
             current = batch(iteration)
             expected = layer.forward(current).float() * 2 + 1
@@ -432,7 +442,7 @@ def test_nvfp4_gin_public_graph_replay(quantize_input, partial, monkeypatch, tmp
             for graph, actual in zip(graphs, outputs, strict=True):
                 # An empty graph, stale workspace result, or missing staging
                 # cannot pass by reusing the just-computed eager result.
-                layer._workspace.output_activation.fill_(float("nan"))
+                poison_workspace()
                 actual.fill_(float("nan"))
                 calls = len(streams)
                 with monkeypatch.context() as context:
@@ -452,7 +462,7 @@ def test_nvfp4_gin_public_graph_replay(quantize_input, partial, monkeypatch, tmp
             context.setattr(layer._workspace._frontend, "_gin_agree", no_host_agreement)
             for iteration, snapshot in enumerate(snapshots):
                 index = iteration % len(graphs)
-                layer._workspace.output_activation.fill_(float("nan"))
+                poison_workspace()
                 outputs[index].fill_(float("nan"))
                 graphs[index].replay()
                 snapshot.copy_(outputs[index])
