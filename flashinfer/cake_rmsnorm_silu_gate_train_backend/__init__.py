@@ -26,7 +26,7 @@ decorations and the user-facing documentation live in
 
 Numerical contract against the deterministic package: the forward is the
 deterministic package's forward kernel rendered here (it has no reduction, so
-its bits are the same), and up to 12 rows per SM on sm_100a / sm_103a (10 on
+its bits are the same), and up to 12 rows per SM on sm_100a / sm_103a (59 on
 sm_107a) a forward with 16 threads to a row (the same bits) and from 976 rows
 per SM on sm_100a / sm_103a (800 on sm_107a) a forward whose CTAs each walk
 several row
@@ -105,10 +105,13 @@ Host design (the input layout rules are the deterministic package's):
   ready, the graph zero-fills one of its own).
 - Grids (``cake_jit.module_for_rows`` picks the module from the rows and
   the device's SM count): the forward launches one CTA per block of 16 rows;
-  up to 12 rows per SM on sm_100a and sm_103a (10 on sm_107a) it launches the
+  up to 12 rows per SM on sm_100a and sm_103a (59 on sm_107a) it launches the
   short forward, one 256-thread CTA per block of 16 rows (16 threads to a row:
-  fewer CTAs
-  than SMs), and from more rows a forward whose CTA ``b`` walks the blocks
+  fewer CTAs than SMs on sm_100a and sm_103a; on sm_107a with 205 SMs or
+  more, as with 212 or 216, at most ``4 * (SMs - 16)``, one wave of 4 CTAs
+  per SM on all SMs but 16, while with fewer SMs, as on a small MIG instance,
+  the grid at 59 rows per SM is larger), and from more rows a forward whose
+  CTA ``b`` walks the blocks
   ``b``, ``b + grid``, ..., loading each next block while it computes the
   current one, in the fewest whole waves that give no CTA more than a few
   blocks: from 976 rows per SM on sm_100a and sm_103a (800 on sm_107a) the
@@ -444,7 +447,7 @@ def cake_rmsnorm_silu_gate_train_forward(
 
     The deterministic package's forward kernel rendered here (it has no
     reduction: the same bits), or up to 12 rows per SM on sm_100a / sm_103a
-    (10 on sm_107a) the short forward, from 976 rows per SM on sm_100a /
+    (59 on sm_107a) the short forward, from 976 rows per SM on sm_100a /
     sm_103a (800 on
     sm_107a) the mid forward and from 2400 (1740) the long forward (the same
     bits).  The
