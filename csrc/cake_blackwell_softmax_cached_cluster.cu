@@ -3868,7 +3868,7 @@ __device__ __forceinline__ void flashinfer_blackwell_softmax_cached_cluster_c8_t
             if (elem_1 < chunk_end) {
                 #pragma unroll
                 for (int j_1 = 0; j_1 < 8; j_1++) {
-                    float scaled = cache[tile_1 * 8 + j_1] / temperature;
+                    float scaled = cache[tile_1 * 8 + j_1] * inv_temperature;
                     cache[tile_1 * 8 + j_1] = scaled;
                 }
                 float max_here = max_noftz(
@@ -3906,7 +3906,7 @@ __device__ __forceinline__ void flashinfer_blackwell_softmax_cached_cluster_c8_t
                 : "r"(at_1 + 16));
             #pragma unroll
             for (int j_5 = 0; j_5 < 8; j_5++) {
-                float scaled_2 = values_1[j_5] / temperature;
+                float scaled_2 = values_1[j_5] * inv_temperature;
                 values_1[j_5] = scaled_2;
             }
             float max_here_2 = max_noftz(
@@ -3945,7 +3945,7 @@ __device__ __forceinline__ void flashinfer_blackwell_softmax_cached_cluster_c8_t
                 : "r"(at_2 + 16));
             #pragma unroll
             for (int j_7 = 0; j_7 < 8; j_7++) {
-                float scaled_3 = values_2[j_7] / temperature;
+                float scaled_3 = values_2[j_7] * inv_temperature;
                 values_2[j_7] = scaled_3;
             }
             float max_here_3 = max_noftz(
@@ -3984,7 +3984,7 @@ __device__ __forceinline__ void flashinfer_blackwell_softmax_cached_cluster_c8_t
                 : "r"(at_3 + 16));
             #pragma unroll
             for (int j_9 = 0; j_9 < 8; j_9++) {
-                float scaled_4 = values_3[j_9] / temperature;
+                float scaled_4 = values_3[j_9] * inv_temperature;
                 values_3[j_9] = scaled_4;
             }
             float max_here_4 = max_noftz(
@@ -4726,7 +4726,7 @@ __device__ __forceinline__ void flashinfer_blackwell_softmax_cached_cluster_c16_
             if (elem_1 < chunk_end) {
                 #pragma unroll
                 for (int j_1 = 0; j_1 < 8; j_1++) {
-                    float scaled = cache[tile_1 * 8 + j_1] / temperature;
+                    float scaled = cache[tile_1 * 8 + j_1] * inv_temperature;
                     cache[tile_1 * 8 + j_1] = scaled;
                 }
                 float max_here = max_noftz(
@@ -4764,7 +4764,7 @@ __device__ __forceinline__ void flashinfer_blackwell_softmax_cached_cluster_c16_
                 : "r"(at_1 + 16));
             #pragma unroll
             for (int j_5 = 0; j_5 < 8; j_5++) {
-                float scaled_2 = values_1[j_5] / temperature;
+                float scaled_2 = values_1[j_5] * inv_temperature;
                 values_1[j_5] = scaled_2;
             }
             float max_here_2 = max_noftz(
@@ -4803,7 +4803,7 @@ __device__ __forceinline__ void flashinfer_blackwell_softmax_cached_cluster_c16_
                 : "r"(at_2 + 16));
             #pragma unroll
             for (int j_7 = 0; j_7 < 8; j_7++) {
-                float scaled_3 = values_2[j_7] / temperature;
+                float scaled_3 = values_2[j_7] * inv_temperature;
                 values_2[j_7] = scaled_3;
             }
             float max_here_3 = max_noftz(
@@ -4842,7 +4842,7 @@ __device__ __forceinline__ void flashinfer_blackwell_softmax_cached_cluster_c16_
                 : "r"(at_3 + 16));
             #pragma unroll
             for (int j_9 = 0; j_9 < 8; j_9++) {
-                float scaled_4 = values_3[j_9] / temperature;
+                float scaled_4 = values_3[j_9] * inv_temperature;
                 values_3[j_9] = scaled_4;
             }
             float max_here_4 = max_noftz(
