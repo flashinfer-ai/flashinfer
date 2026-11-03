@@ -6343,6 +6343,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 )
                 if (
                     self._backend == "fa2"
+                    and not pins_kv_split(fixed_split_size, disable_split_kv)
                     and self._kv_layout == "NHD"
                     and num_qo_heads == num_kv_heads
                     and same_qk_segments
@@ -6371,7 +6372,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 # take the first backend whose kernel serves this problem
                 # exactly; none eligible -> stay on FA2. Explicit backends are
                 # never rewritten.
-                elif self._backend == "fa2":
+                elif self._backend == "fa2" and not pins_kv_split(
+                    fixed_split_size, disable_split_kv
+                ):
                     upgraded = _blackwell_ragged_auto_upgrade(
                         self.device,
                         self._kv_layout,

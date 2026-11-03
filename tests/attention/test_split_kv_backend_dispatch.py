@@ -18,8 +18,9 @@ limitations under the License.
 
 Only the fa2 planner takes the two split-KV controls. ``backend="auto"`` keeps
 fa2 whenever either is set (also where it would take fa3 for FP8 decode or
-Hopper prefill), an explicit ``fa3`` raises, and the values reach the fa2
-planner intact. The CPU cases mock the compiled module (issue #7981).
+Hopper prefill, or upgrade ragged prefill on Blackwell), an explicit ``fa3``
+raises, and the values reach the fa2 planner intact. The CPU cases mock the
+compiled module (issue #7981).
 """
 
 from contextlib import nullcontext
@@ -71,7 +72,9 @@ def planner_calls(monkeypatch):
         "_auto_prefers_cudnn",
         lambda self, *a, **k: False,
     )
-    monkeypatch.setattr(prefill, "_blackwell_ragged_auto_upgrade", lambda *a, **k: None)
+    monkeypatch.setattr(
+        prefill, "_blackwell_ragged_auto_upgrade", lambda *a, **k: "cudnn"
+    )
     return calls
 
 
@@ -255,8 +258,7 @@ def test_sm90_fp8_query_auto_decode_does_not_drop_split_control(control):
     wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
         workspace, "NHD", use_tensor_cores=True, backend="auto"
     )
-    # fa2 is the only planner that takes the control and it has no e4m3-query
-    # decode on SM90, so the plan must fail instead of silently taking fa3.
+    # fa2 has no e4m3-query decode on SM90: fail rather than silently take fa3.
     with pytest.raises((ValueError, NotImplementedError)):
         wrapper.plan(
             indptr,
