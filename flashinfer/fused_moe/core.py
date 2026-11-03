@@ -6212,6 +6212,20 @@ def trtllm_fp8_block_scale_moe(
         Valid (unpadded) intermediate dimension.  When provided,
         ``intermediate_size`` is treated as padded and only the valid region is
         computed.  Default ``None`` (use the full ``intermediate_size``).
+
+        The kernels tile expert weights in 128-row blocks, so
+        ``intermediate_size`` (and with it the FC1 row count ``M``) must be a
+        multiple of ``128``; a model dimension that is not (``1856``, ``928``)
+        is supported by padding and declaring, not by passing it directly.
+        Zero-pad the weights to a multiple of ``128`` (the gate and up halves
+        of FC1 separately, so the rows stay ``[gate; up]`` at the padded
+        size), fill the padded block scales with a neutral finite value
+        (E8M0 ``127``, i.e. ``2**0``, for MXFP8; ``1.0`` for the ``float32``
+        DeepSeek scales), pass the padded size as ``intermediate_size`` and
+        the real one here.  The kernel reads the ``[valid, roundUp(valid, 128))``
+        stretch of the padding and masks the rest, so it must hold zeros and
+        finite scales.  ``hidden_size`` follows the same rule through
+        ``valid_hidden_size``.
     gemm1_bias : Optional[torch.Tensor]
         Optional FC1 bias, float32 (keyword-only).  Shape is
         ``[local_num_experts, 2 * intermediate_size]`` for gated activations
@@ -6806,6 +6820,20 @@ def trtllm_fp4_block_scale_moe(
         Valid (unpadded) intermediate dimension.  When provided,
         ``intermediate_size`` is treated as padded and only the valid region is
         computed.  Default ``None`` (use the full ``intermediate_size``).
+
+        The kernels tile expert weights in 128-row blocks, so
+        ``intermediate_size`` (and with it the FC1 row count ``M``) must be a
+        multiple of ``128``; a model dimension that is not (``1856``, ``928``)
+        is supported by padding and declaring, not by passing it directly.
+        Zero-pad the weights to a multiple of ``128`` (the gate and up halves
+        of FC1 separately, so the rows stay ``[gate; up]`` at the padded
+        size), fill the padded block scales with a neutral finite value
+        (E8M0 ``127``, i.e. ``2**0``, for MXFP4; E4M3 ``1.0`` for NVFP4),
+        pass the padded size as ``intermediate_size`` and the real one here.
+        The kernel reads the ``[valid, roundUp(valid, 128))``
+        stretch of the padding and masks the rest, so it must hold zeros and
+        finite scales.  ``hidden_size`` follows the same rule through
+        ``valid_hidden_size``.
     workspace_buffer : Optional[torch.Tensor]
         Caller-owned 1-D ``uint8`` CUDA buffer of at least
         :func:`trtllm_fused_moe_workspace_size` bytes. When given, the launch
