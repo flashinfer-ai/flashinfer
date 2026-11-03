@@ -409,7 +409,12 @@ def _run(
         ws = torch.empty(C, M, N, dtype=torch.float32, device=a.device)
     else:
         ws = _check_workspace(workspace, C, M, N, a.device, cls)
-        operands = ((out, "the output"), *((sc, "a scale") for sc in scales))
+        operands = (
+            (a, "A"),
+            (b_nk, "B"),
+            (out, "the output"),
+            *((sc, "a scale") for sc in scales),
+        )
         if bias is not None:
             operands += ((bias, "the bias"),)
         for t, what in operands:
@@ -417,8 +422,8 @@ def _run(
                 raise unsupported(
                     cls,
                     f"{what} overlapping the workspace",
-                    "a workspace disjoint from the output, the scales and the bias (the partials are written before "
-                    "the fixup reads them)",
+                    "a workspace disjoint from the operands, the output, the scales and the bias (the partials are "
+                    "written there while the operands are read and before the fixup reads them)",
                 )
     ws = ws.permute(1, 2, 0)  # chunk-major storage (C, M, N) viewed as (M, N, C)
     kernel(a3, b3, ws)  # the unscaled, unbiased body: raw fp32 partials

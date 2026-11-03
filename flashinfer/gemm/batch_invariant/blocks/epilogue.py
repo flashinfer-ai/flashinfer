@@ -57,6 +57,23 @@ def tmem_store_atom_for(load_atom: cute.CopyAtom, elem_ty) -> cute.CopyAtom:
 
 
 @cute.jit
+def bias_per_element(
+    chain,
+    mBias: cute.Tensor,
+    coords: cute.Tensor,
+    frag: cute.Tensor,
+    alpha,
+    N: cutlass.Int32,
+):
+    """The biased chain's ops before the conversion, element by element: the bias of the element's output column, widened
+    exactly; the columns at or beyond ``N`` are left alone (the store drops them and the bias is never read past its end)."""
+    for e in cutlass.range_constexpr(cute.size(frag)):
+        n = coords[e][1]
+        if n < N:
+            frag[e] = chain.apply_pre(CuteF32, frag[e], alpha, CuteF32.widen(mBias[n]))
+
+
+@cute.jit
 def apply_chain_biased(
     chain,
     mBias: cute.Tensor,
@@ -67,32 +84,36 @@ def apply_chain_biased(
 ):
     """The chain's ops before the conversion when the chain has the bias step: per element, the bias of the element's
     output column (``coords``: the output coordinates partitioned like the accumulator), widened exactly, through the
-    same ``apply_pre`` as the term. The fragment's elements are consecutive columns of one row for the epilogue's TMEM
-    load shapes, so when the whole run lies inside the bias at a 16-byte boundary the bias slice is read with one
-    vector copy; otherwise (a partial tile's last run, an unaligned run) element by element, and the columns at or
-    beyond ``N`` are left alone: the store drops them and the bias is never read past its end."""
+    same ``apply_pre`` as the term. Whether the fragment's elements are consecutive columns of one row is decided at
+    trace time from the fragment's coordinate layout (its per-element offsets are static): for the TMEM load shapes
+    that give such a run, when the whole run lies inside the bias at a 16-byte boundary the bias slice is read with one
+    vector copy, else (a partial tile's last run, an unaligned run) element by element; the load shapes whose fragment
+    interleaves rows and columns read element by element."""
     V = cute.size(frag)
-    n0 = coords[0][1]
-    n_last = coords[V - 1][1]
-    if n_last - n0 == V - 1 and n0 + V <= N and n0 % 8 == 0:
-        base = mBias.iterator.toint() + cutlass.Int64(cute.assume(n0, divby=8)) * 2
-        gB = cute.make_tensor(
-            cute.make_ptr(
-                cutlass.BFloat16, base, cute.AddressSpace.gmem, assumed_align=16
-            ),
-            cute.make_layout((V,)),
-        )
-        rB = cute.make_rmem_tensor((V,), cutlass.BFloat16)
-        cute.autovec_copy(gB, rB)
-        for e in cutlass.range_constexpr(V):
-            frag[e] = chain.apply_pre(CuteF32, frag[e], alpha, CuteF32.widen(rB[e]))
+    offs = [
+        coords.layout(e) for e in range(V)
+    ]  # the fragment's (row, column) offsets relative to element 0
+    is_run = all(
+        o[0] == offs[0][0] and o[1] == offs[0][1] + e for e, o in enumerate(offs)
+    )
+    if cutlass.const_expr(is_run):
+        n0 = coords[0][1]
+        if n0 + V <= N and n0 % 8 == 0:
+            base = mBias.iterator.toint() + cutlass.Int64(cute.assume(n0, divby=8)) * 2
+            gB = cute.make_tensor(
+                cute.make_ptr(
+                    cutlass.BFloat16, base, cute.AddressSpace.gmem, assumed_align=16
+                ),
+                cute.make_layout((V,)),
+            )
+            rB = cute.make_rmem_tensor((V,), cutlass.BFloat16)
+            cute.autovec_copy(gB, rB)
+            for e in cutlass.range_constexpr(V):
+                frag[e] = chain.apply_pre(CuteF32, frag[e], alpha, CuteF32.widen(rB[e]))
+        else:
+            bias_per_element(chain, mBias, coords, frag, alpha, N)
     else:
-        for e in cutlass.range_constexpr(V):
-            n = coords[e][1]
-            if n < N:
-                frag[e] = chain.apply_pre(
-                    CuteF32, frag[e], alpha, CuteF32.widen(mBias[n])
-                )
+        bias_per_element(chain, mBias, coords, frag, alpha, N)
 
 
 @cute.jit

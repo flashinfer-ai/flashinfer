@@ -605,6 +605,15 @@ def test_chunk_count_and_workspace_checks():
         bi.BatchInvariantUnsupportedError, match="overlapping the workspace"
     ):
         bmm_fp8_batch_invariant(A, B, ws[:1], sb, torch.bfloat16, workspace=ws)
+    with pytest.raises(bi.BatchInvariantUnsupportedError, match="A overlapping"):
+        bmm_fp8_batch_invariant(
+            ws.view(torch.float8_e4m3fn)[: b * 16 * K].view(b, 16, K),
+            B,
+            sa,
+            sb,
+            torch.bfloat16,
+            workspace=ws,
+        )
     out = ws.view(torch.bfloat16)[: b * M * N].view(b, M, N)
     with pytest.raises(
         bi.BatchInvariantUnsupportedError, match="overlapping the workspace"
