@@ -3179,15 +3179,24 @@ def _qk_l2norm_readers(mode: str, picked: dict[tuple[str, str], str]) -> str | N
     fwd = picked[(LOCAL_PATH_FWD, "fwd_intra")]
     intra = picked[(LOCAL_PATH_BWD, "fwd_intra")]
     prep = picked[(LOCAL_PATH_BWD, "bwd_prep")]
-    twins = [r for r in (intra, prep) if r.endswith("_l2n")]
+    twins = [r for r in (intra, prep) if qk_l2norm_twin(r)]
     if mode == "fused":
-        if not fwd.endswith("_l2n"):
+        if not qk_l2norm_twin(fwd):
             return f"the forward's intra record {fwd} does not normalize"
         if len(twins) != 1:
             return f"{len(twins)} of the replay's records {intra} / {prep} normalize"
-    elif twins or fwd.endswith("_l2n"):
+    elif twins or qk_l2norm_twin(fwd):
         return f"the fallback form's readers {fwd} / {intra} / {prep} normalize"
     return None
+
+
+def qk_l2norm_twin(record: str) -> bool:
+    """Whether the existing backend's record ``record`` is the ``_l2n`` twin of its stage, the program that normalizes
+    the raw q / k rows itself: the registry's ``l2n`` key of the record lists the fused mode only (absent:
+    ``["off"]``).  The key decides, not the name: a twin may carry a version suffix (``fwd_intra_l2n_v37``)."""
+    from ..cake_kda_det_train import cake_jit
+
+    return list(cake_jit.MODULES[record].get("l2n", ("off",))) == ["fused"]
 
 
 def _qk_l2norm_problem(
@@ -3348,8 +3357,9 @@ def require_qk_l2norm(mode: str, gate: str = "g", arch: str | None = None) -> No
 def qk_l2norm_intra_first(plan, path: str = LOCAL_PATH_BWD) -> bool:
     """Whether the first q / k reader of a backward on ``path`` of ``plan`` (a ``cake_backend.Plan`` of the fused
     mode) is its intra program, the ``_l2n`` twin the existing backend runs before the prep there, rather than its
-    prep (the fallback mode's plain records read the normalized rows of the separate normalization: ``False``)."""
-    return str(plan.record("fwd_intra", path)).endswith("_l2n")
+    prep (the fallback mode's plain records read the normalized rows of the separate normalization: ``False``);
+    :func:`qk_l2norm_twin` of the plan's intra record."""
+    return qk_l2norm_twin(str(plan.record("fwd_intra", path)))
 
 
 def kda_det_workspace_bytes_kcp(

@@ -1312,7 +1312,7 @@ def test_l2n_call_values_per_path() -> None:
             assert cake_kcp._qk_l2norm_begin(call) is None and call.l2n_values is None
 
 
-def test_l2n_stage_order() -> None:
+def test_l2n_stage_order(monkeypatch) -> None:
     """The backward's rows before its walks (:func:`cake_kcp._bwd_rows`): flag off, the prep, the intra program, the
     WY program (as before the mode); fused, the plan's first q / k reader first (the intra program where its record is
     the ``_l2n`` twin, else the prep); fallback, ``qk_apply`` (from a saved rstd) or ``qk_l2norm`` before the
@@ -1337,6 +1337,21 @@ def test_l2n_stage_order() -> None:
         c.stage = lambda name, **extra: seq.append((name, extra.get("saved", "-")))
         return c
 
+    # the registry's l2n keys of the records below: a twin serves the fused mode only, whatever its name
+    plain = {"l2n": ["off", "fallback", "fused"]}
+    twin = {"l2n": ["fused"]}
+    monkeypatch.setattr(
+        cake_jit,
+        "MODULES",
+        {
+            "fwd_intra": plain,
+            "fwd_intra_v14": plain,
+            "fwd_intra_l2n": twin,
+            "fwd_intra_v14_l2n": twin,
+            "fwd_intra_l2n_v37": twin,
+        },
+    )
+
     saved = object()
     cases = (
         (("off", "fwd_intra_v14"), saved, ["bwd_prep", "fwd_intra", "wy"]),
@@ -1355,6 +1370,7 @@ def test_l2n_stage_order() -> None:
     cake_kcp._qk_l2norm_stage(call("fused", "fwd_intra_l2n", (0, 1)))
     assert seq == []
     assert cake_kcp_plan.qk_l2norm_intra_first(Plan("fwd_intra_v14_l2n"))
+    assert cake_kcp_plan.qk_l2norm_intra_first(Plan("fwd_intra_l2n_v37"))
     assert not cake_kcp_plan.qk_l2norm_intra_first(Plan("fwd_intra_v14"))
 
 
@@ -1434,7 +1450,12 @@ def _fake_registry(
 
     class Modules(dict):
         def __missing__(self, name):
-            return {"arches": list((arches or {}).get(name, cake_jit.ARCHES))}
+            # the l2n key as the real registry's: the twins (``_l2n``, any ``_v<N>`` suffix) serve the fused mode only
+            twin = re.search(r"_l2n(_v\d+)?$", name) is not None
+            return {
+                "arches": list((arches or {}).get(name, cake_jit.ARCHES)),
+                "l2n": ["fused"] if twin else ["off", "fallback", "fused"],
+            }
 
     class Libraries:
         def __contains__(self, lib):
@@ -1549,6 +1570,8 @@ def test_l2n_capability_check() -> None:
             f"selects no qk_apply on {B} ({where})",
         ),
         ({"pick": _pick_but(lambda s, p, *k: s == "qk_l2norm" and p == F, bad)}, "fallback", f"qk_l2norm on {F}"),
+        # a twin with a version suffix (the registry's l2n key decides, not the name)
+        ({"pick": _pick_but(lambda s, p, m, *k: s == "fwd_intra" and p == F and m == "fused", "fwd_intra_l2n_v37")}, None, None),
         # the fused form's first readers: both / neither on the replay, a plain forward intra program
         (
             {"pick": _pick_but(lambda s, p, m, *k: s == "bwd_prep" and m == "fused", "bwd_prep_g8_replay_l2n")},
