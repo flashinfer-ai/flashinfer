@@ -114,6 +114,7 @@ def test_xqa_mtp_policy_does_not_extrapolate_devices(make_wrapper, monkeypatch, 
         {"logits_soft_cap": 1.0},
         {"fixed_split_size": 1},
         {"disable_split_kv": True},
+        {"fixed_cta_tile_q": 64},
         {"o_data_type": torch.bfloat16},
         {"window_left": 128},
         {"heads": (16, 8)},
@@ -259,3 +260,23 @@ def test_xqa_mtp_fallback_restores_shared_semaphore(make_wrapper):
     wrapper.run(q, kv, enable_pdl=False, return_lse=True)
     assert bool(torch.all(workspace[:semaphore_bytes] == 0))
     assert bool(torch.all(workspace[semaphore_bytes:] == 127))
+
+
+@pytest.mark.parametrize("tile", [16, 64, 128])
+@pytest.mark.parametrize("graph", [False, True])
+def test_fixed_tile_plan_and_workspace_use_fa2(make_wrapper, monkeypatch, tile, graph):
+    wrapper, plan, _ = make_wrapper(graph=graph)
+    calls = {"plan": [], "workspace": []}
+    module = SimpleNamespace(
+        plan=lambda *args: calls["plan"].append(args) or [0],
+        workspace_size=lambda *args: calls["workspace"].append(args) or (32, 16),
+    )
+    monkeypatch.setattr(decode, "get_batch_prefill_module", lambda *args: module)
+    assert plan(query=True, fixed_cta_tile_q=tile) == (32, 16)
+    plan(fixed_cta_tile_q=tile)
+    assert not wrapper._use_xqa_mtp_decode
+    assert wrapper.resolved_backend == "fa2"
+    assert len(calls["plan"][0]) == 22
+    assert calls["plan"][0][18] == tile
+    assert len(calls["workspace"][0]) == 20
+    assert calls["workspace"][0][16] == tile

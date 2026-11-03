@@ -160,7 +160,7 @@ def test_batch_prefill_invalid_fixed_cta_tile_q():
             kv_data_type=torch.float16,
             fixed_split_size=2048,
             disable_split_kv=True,
-            fixed_cta_tile_q=32,
+            fixed_cta_tile_q=48,
         )
 
 
@@ -234,8 +234,9 @@ def test_batch_prefill_fixed_cta_tile_q_rejected_for_non_fa2_backend():
         (batch_size,), page_size, dtype=torch.int32, device="cuda:0"
     )
     workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device="cuda:0")
-    wrapper = BatchPrefillWithPagedKVCacheWrapper(workspace_buffer, "NHD")
-    wrapper._backend = "fa3"
+    wrapper = BatchPrefillWithPagedKVCacheWrapper(
+        workspace_buffer, "NHD", backend="fa3"
+    )
     with pytest.raises(
         ValueError, match="fixed_cta_tile_q is only supported for the fa2 backend"
     ):

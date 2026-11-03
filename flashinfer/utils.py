@@ -199,18 +199,33 @@ def _check_kv_layout(kv_layout: str) -> None:
         raise KeyError("Invalid kv_layout {}".format(kv_layout))
 
 
-def _validate_fixed_cta_tile_q(fixed_cta_tile_q: Optional[int], head_dim: int) -> int:
-    """Validate fixed_cta_tile_q and return the integer value to pass to the kernel
-    (-1 means auto-select)."""
+def _validate_fixed_cta_tile_q(
+    fixed_cta_tile_q: Optional[int], head_dim: int, head_dim_qk: Optional[int] = None
+) -> int:
+    """Validate the FA2 query tile against the QK/VO kernel instantiations.
+
+    ``head_dim`` is the VO dimension; ``-1`` tells the planner to auto-select.
+    """
     if fixed_cta_tile_q is None:
         return -1
-    if fixed_cta_tile_q not in (16, 64, 128):
+    if type(fixed_cta_tile_q) is not int or fixed_cta_tile_q not in (16, 32, 64, 128):
         raise ValueError(
-            f"fixed_cta_tile_q should be one of {{16, 64, 128}}, got {fixed_cta_tile_q}"
+            f"fixed_cta_tile_q should be one of {{16, 32, 64, 128}}, got {fixed_cta_tile_q}"
         )
-    if fixed_cta_tile_q == 128 and head_dim >= 256:
+    qk = head_dim if head_dim_qk is None else head_dim_qk
+    supported: tuple[int, ...]
+    if head_dim >= 512:
+        supported = (16, 32)
+    elif qk >= 512:
+        supported = (16,)
+    elif head_dim >= 256:
+        supported = (16, 64)
+    else:
+        supported = (16, 64, 128)
+    if fixed_cta_tile_q not in supported:
         raise ValueError(
-            f"fixed_cta_tile_q=128 is not supported with head_dim={head_dim} (requires head_dim < 256)"
+            f"fixed_cta_tile_q={fixed_cta_tile_q} is not supported with head_dim={head_dim} "
+            f"and head_dim_qk={qk}; supported tiles are {supported}"
         )
     return fixed_cta_tile_q
 

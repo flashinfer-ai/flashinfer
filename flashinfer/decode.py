@@ -1814,6 +1814,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         fixed_split_size: Optional[int] = None,
         disable_split_kv: bool = False,
         q_len_per_req: int = 1,
+        fixed_cta_tile_q: Optional[int] = None,
     ) -> Tuple[int, int]:
         r"""Return the caller-owned workspace size required by :meth:`plan`.
 
@@ -1878,6 +1879,10 @@ class BatchDecodeWithPagedKVCacheWrapper:
         q_len_per_req : int
             The number of query tokens per request. Defaults to ``1``.
 
+        fixed_cta_tile_q : Optional[int]
+            Fixed FA2 query tile, with the same head-dimension and backend restrictions
+            as :meth:`plan`. Defaults to ``None``. Pass the same value to both methods.
+
         Returns
         -------
         Tuple[int, int]
@@ -1892,6 +1897,14 @@ class BatchDecodeWithPagedKVCacheWrapper:
         ... )
         >>> wrapper.plan(...)
         """
+        if fixed_cta_tile_q is not None and self._requested_backend not in (
+            "auto",
+            "fa2",
+        ):
+            raise ValueError(
+                "fixed_cta_tile_q is only supported for the fa2 backend, "
+                f'got backend={self._requested_backend!r}; set backend="fa2" explicitly.'
+            )
         _check_workspace_buffer_alignment(
             self._float_workspace_buffer, "float_workspace_buffer"
         )
@@ -1945,6 +1958,11 @@ class BatchDecodeWithPagedKVCacheWrapper:
             raise ValueError(
                 "fixed_split_size is only supported by tensor core decode for now."
             )
+        if fixed_cta_tile_q is not None and not self.use_tensor_cores:
+            raise ValueError(
+                "fixed_cta_tile_q is only supported by tensor core decode for now."
+            )
+        fixed_cta_tile_q = _validate_fixed_cta_tile_q(fixed_cta_tile_q, head_dim)
         if fixed_split_size is None:
             fixed_split_size = -1
         if self.is_cuda_graph_enabled:
@@ -1972,37 +1990,41 @@ class BatchDecodeWithPagedKVCacheWrapper:
             kv_lens_arr_host = get_seq_lens(indptr_host, last_page_len_host, page_size)
         else:
             kv_lens_arr_host = seq_lens.cpu().to(torch.int32)
-        if _is_xqa_mtp_decode_supported(
-            self.device,
-            self._requested_backend,
-            self.use_tensor_cores,
-            q_len_per_req,
-            q_data_type,
-            kv_data_type,
-            head_dim,
-            page_size,
-            pos_encoding_mode,
-            logits_soft_cap,
-            fixed_split_size,
-            self._jit_module is not None,
-            uses_cudnn=backend == "cudnn",
-            disable_split_kv=disable_split_kv,
-            o_data_type=o_data_type,
-        ) and _xqa_mtp_decode_has_measured_shape(
-            device=self.device,
-            backend=self._requested_backend,
-            kv_layout=self._kv_layout,
-            use_cuda_graph=self.is_cuda_graph_enabled,
-            batch_size=batch_size,
-            q_len_per_req=q_len_per_req,
-            q_data_type=q_data_type,
-            kv_data_type=kv_data_type,
-            head_dim=head_dim,
-            page_size=page_size,
-            num_qo_heads=num_qo_heads,
-            num_kv_heads=num_kv_heads,
-            kv_lens_arr_host=kv_lens_arr_host,
-            window_left=window_left,
+        if (
+            _is_xqa_mtp_decode_supported(
+                self.device,
+                self._requested_backend,
+                self.use_tensor_cores,
+                q_len_per_req,
+                q_data_type,
+                kv_data_type,
+                head_dim,
+                page_size,
+                pos_encoding_mode,
+                logits_soft_cap,
+                fixed_split_size,
+                self._jit_module is not None,
+                uses_cudnn=backend == "cudnn",
+                disable_split_kv=disable_split_kv,
+                o_data_type=o_data_type,
+            )
+            and fixed_cta_tile_q == -1
+            and _xqa_mtp_decode_has_measured_shape(
+                device=self.device,
+                backend=self._requested_backend,
+                kv_layout=self._kv_layout,
+                use_cuda_graph=self.is_cuda_graph_enabled,
+                batch_size=batch_size,
+                q_len_per_req=q_len_per_req,
+                q_data_type=q_data_type,
+                kv_data_type=kv_data_type,
+                head_dim=head_dim,
+                page_size=page_size,
+                num_qo_heads=num_qo_heads,
+                num_kv_heads=num_kv_heads,
+                kv_lens_arr_host=kv_lens_arr_host,
+                window_left=window_left,
+            )
         ):
             raise NotImplementedError(
                 "workspace_size is not available for XQA MTP plans; "
@@ -2043,6 +2065,10 @@ class BatchDecodeWithPagedKVCacheWrapper:
                         "q_len_per_req > 1 is currently only supported on the "
                         "fa2 tensor-core backend."
                     )
+                if fixed_cta_tile_q != -1 and backend != "fa2":
+                    raise ValueError(
+                        "fixed_cta_tile_q is only supported for the fa2 backend"
+                    )
                 module = get_batch_prefill_module(
                     backend,
                     q_data_type,
@@ -2081,7 +2107,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             if backend == "fa2":
                 args.append(fixed_split_size)
                 args.append(disable_split_kv)
-                args.append(-1)  # fixed_cta_tile_q
+                args.append(fixed_cta_tile_q)  # fixed_cta_tile_q
                 args.append(0)  # num_colocated_ctas
                 args.append(q_len_per_req)  # uniform_q_len
                 args.append(True)  # fixed_uniform_q_len
@@ -2231,8 +2257,14 @@ class BatchDecodeWithPagedKVCacheWrapper:
             (or ``bf16`` on SM80+), and the ``fa2`` tensor-core backend is forced.
             Defaults to ``False``.
         fixed_cta_tile_q : Optional[int]
-            Fixed CTA tile size for FA2 attention planning. Supported values are ``16``, ``64``, and
-            ``128``. Defaults to ``None`` (auto heuristic).
+            Fixed query tile for the FA2 planner, overriding the batch-length heuristic and
+            ``uniform_q_len`` tile selection. Defaults to ``None`` (auto heuristic).
+            Supported tiles are ``16``, ``64``, and ``128`` for VO < 256; ``16`` and
+            ``64`` for 256 <= VO < 512; and ``16`` and ``32`` for VO >= 512.
+            QK >= 512 with VO < 512 supports only ``16``.
+            Requires ``backend="fa2"`` (and ``use_tensor_cores=True`` for decode).
+            On Hopper, set ``backend="fa2"`` explicitly: ``backend="auto"`` can select FA3.
+            For batch invariance, also use ``disable_split_kv=True`` or a fixed split size.
         Note
         ----
         The :meth:`plan` method should be called before any :meth:`run` or
@@ -2312,6 +2344,14 @@ class BatchDecodeWithPagedKVCacheWrapper:
         fixed_cta_tile_q: Optional[int] = None,
     ) -> None:
         """Shared plan() implementation for the paged-decode wrapper across backends."""
+        if fixed_cta_tile_q is not None and self._requested_backend not in (
+            "auto",
+            "fa2",
+        ):
+            raise ValueError(
+                "fixed_cta_tile_q is only supported for the fa2 backend, "
+                f'got backend={self._requested_backend!r}; set backend="fa2" explicitly.'
+            )
         _check_workspace_buffer_alignment(
             self._float_workspace_buffer, "float_workspace_buffer"
         )
@@ -2420,6 +2460,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
             fixed_split_size=fixed_split_size,
             disable_split_kv=disable_split_kv,
         )
+        if fixed_cta_tile_q is not None and self._uses_cudnn:
+            raise ValueError("fixed_cta_tile_q is only supported for the fa2 backend")
         if self.is_cuda_graph_enabled:
             # The resolved backend is part of the frozen CUDA-graph shape: a
             # captured graph replays the kernels it was captured with, and
@@ -2537,38 +2579,42 @@ class BatchDecodeWithPagedKVCacheWrapper:
             kv_lens_arr_host = get_seq_lens(indptr_host, last_page_len_host, page_size)
         else:
             kv_lens_arr_host = seq_lens.cpu().to(torch.int32)
-        use_xqa_mtp_decode = _is_xqa_mtp_decode_supported(
-            self.device,
-            self._backend,
-            self.use_tensor_cores,
-            q_len_per_req,
-            q_data_type,
-            kv_data_type,
-            head_dim,
-            page_size,
-            pos_encoding_mode,
-            logits_soft_cap,
-            fixed_split_size,
-            self._jit_module is not None,
-            uses_cudnn=self._uses_cudnn,
-            use_token_head_sf=use_token_head_sf,
-            disable_split_kv=disable_split_kv,
-            o_data_type=o_data_type,
-        ) and _xqa_mtp_decode_has_measured_shape(
-            device=self.device,
-            backend=self._requested_backend,
-            kv_layout=self._kv_layout,
-            use_cuda_graph=self.is_cuda_graph_enabled,
-            batch_size=batch_size,
-            q_len_per_req=q_len_per_req,
-            q_data_type=q_data_type,
-            kv_data_type=kv_data_type,
-            head_dim=head_dim,
-            page_size=page_size,
-            num_qo_heads=num_qo_heads,
-            num_kv_heads=num_kv_heads,
-            kv_lens_arr_host=kv_lens_arr_host,
-            window_left=window_left,
+        use_xqa_mtp_decode = (
+            _is_xqa_mtp_decode_supported(
+                self.device,
+                self._backend,
+                self.use_tensor_cores,
+                q_len_per_req,
+                q_data_type,
+                kv_data_type,
+                head_dim,
+                page_size,
+                pos_encoding_mode,
+                logits_soft_cap,
+                fixed_split_size,
+                self._jit_module is not None,
+                uses_cudnn=self._uses_cudnn,
+                use_token_head_sf=use_token_head_sf,
+                disable_split_kv=disable_split_kv,
+                o_data_type=o_data_type,
+            )
+            and fixed_cta_tile_q == -1
+            and _xqa_mtp_decode_has_measured_shape(
+                device=self.device,
+                backend=self._requested_backend,
+                kv_layout=self._kv_layout,
+                use_cuda_graph=self.is_cuda_graph_enabled,
+                batch_size=batch_size,
+                q_len_per_req=q_len_per_req,
+                q_data_type=q_data_type,
+                kv_data_type=kv_data_type,
+                head_dim=head_dim,
+                page_size=page_size,
+                num_qo_heads=num_qo_heads,
+                num_kv_heads=num_kv_heads,
+                kv_lens_arr_host=kv_lens_arr_host,
+                window_left=window_left,
+            )
         )
         if self.is_cuda_graph_enabled:
             if (
@@ -5663,6 +5709,7 @@ def fast_decode_plan(
             fixed_split_size=fixed_split_size,
             disable_split_kv=disable_split_kv,
             q_len_per_req=q_len_per_req,
+            fixed_cta_tile_q=fixed_cta_tile_q,
         )
     if q_len_per_req < 1:
         raise ValueError(f"q_len_per_req must be >= 1, got {q_len_per_req}")
@@ -5804,7 +5851,7 @@ def fast_decode_plan(
             kv_lens_arr_host = get_seq_lens(indptr_host, last_page_len_host, page_size)
 
             try:
-                # Make sure we pass exactly 20 arguments for fa2 backend and 16 arguments for fa3 backend
+                # FA2 takes the split controls, fixed tile, and uniform-query hints.
                 args = [
                     self._float_workspace_buffer,
                     self._int_workspace_buffer,

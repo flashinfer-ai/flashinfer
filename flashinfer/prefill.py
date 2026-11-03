@@ -3254,6 +3254,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         fixed_split_size: Optional[int] = None,
         disable_split_kv: bool = False,
         uniform_q_len: Optional[int] = None,
+        fixed_cta_tile_q: Optional[int] = None,
     ) -> Tuple[int, int]:
         r"""Return the caller-owned workspace size required by :meth:`plan`.
 
@@ -3344,6 +3345,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
         disable_split_kv : bool
             Whether to disable the split-kv. Defaults to ``False``.
 
+        fixed_cta_tile_q : Optional[int]
+            Fixed FA2 query tile, with the same head-dimension and backend restrictions
+            as :meth:`plan`. Defaults to ``None``. Pass the same value to both methods.
+
         Returns
         -------
         Tuple[int, int]
@@ -3358,6 +3363,14 @@ class BatchPrefillWithPagedKVCacheWrapper:
         ... )
         >>> wrapper.plan(...)
         """
+        if fixed_cta_tile_q is not None and self._requested_backend not in (
+            "auto",
+            "fa2",
+        ):
+            raise ValueError(
+                "fixed_cta_tile_q is only supported for the fa2 backend, "
+                f'got backend={self._requested_backend!r}; set backend="fa2" explicitly.'
+            )
         if self._backend == "cute-dsl-prims":
             qo_indptr_host = qo_indptr.to("cpu")
             if seq_lens is None:
@@ -3413,6 +3426,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
             head_dim_vo = head_dim_qk
         if fixed_split_size is None:
             fixed_split_size = -1
+
+        fixed_cta_tile_q = _validate_fixed_cta_tile_q(
+            fixed_cta_tile_q, head_dim_vo, head_dim_qk
+        )
 
         # Normalized like plan(): the native size query reads raw pointers (#5260).
         qo_indptr = qo_indptr.contiguous()
@@ -3472,6 +3489,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     q_data_type,
                     kv_data_type,
                 )
+            if fixed_cta_tile_q != -1 and backend != "fa2":
+                raise ValueError(
+                    "fixed_cta_tile_q is only supported for the fa2 backend"
+                )
             if backend == "cudnn":
                 raise NotImplementedError(
                     "workspace_size is not available for cudnn prefill backend"
@@ -3515,7 +3536,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         if backend == "fa2":
             args.append(fixed_split_size)
             args.append(disable_split_kv)
-            args.append(-1)  # fixed_cta_tile_q
+            args.append(fixed_cta_tile_q)  # fixed_cta_tile_q
             args.append(0)  # num_colocated_ctas
             args.append(
                 _resolve_uniform_q_len(
@@ -3701,8 +3722,14 @@ class BatchPrefillWithPagedKVCacheWrapper:
             enabled, the query must be fp16/bf16 and the backend is forced to ``fa2``.
             Defaults to ``False``.
         fixed_cta_tile_q : Optional[int]
-            Fixed CTA tile size for FA2 prefill. Supported values are ``16``, ``64``, and ``128``.
-            Defaults to ``None`` (auto heuristic).
+            Fixed query tile for the FA2 planner, overriding the batch-length heuristic and
+            ``uniform_q_len`` tile selection. Defaults to ``None`` (auto heuristic).
+            Supported tiles are ``16``, ``64``, and ``128`` for VO < 256; ``16`` and
+            ``64`` for 256 <= VO < 512; and ``16`` and ``32`` for VO >= 512.
+            QK >= 512 with VO < 512 supports only ``16``.
+            Requires ``backend="fa2"`` (and ``use_tensor_cores=True`` for decode).
+            On Hopper, set ``backend="fa2"`` explicitly: ``backend="auto"`` can select FA3.
+            For batch invariance, also use ``disable_split_kv=True`` or a fixed split size.
         Note
         ----
         The :meth:`plan` method should be called before any :meth:`run` or
@@ -3715,6 +3742,14 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
         The :meth:`plan` method cannot be used in Cuda Graph or in ``torch.compile``.
         """
+        if fixed_cta_tile_q is not None and self._requested_backend not in (
+            "auto",
+            "fa2",
+        ):
+            raise ValueError(
+                "fixed_cta_tile_q is only supported for the fa2 backend, "
+                f'got backend={self._requested_backend!r}; set backend="fa2" explicitly.'
+            )
         _check_workspace_buffer_alignment(
             self._float_workspace_buffer, "float_workspace_buffer"
         )
@@ -3805,7 +3840,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
         paged_kv_last_page_len = paged_kv_last_page_len.contiguous()
         if seq_lens is not None:
             seq_lens = seq_lens.contiguous()
-        fixed_cta_tile_q = _validate_fixed_cta_tile_q(fixed_cta_tile_q, head_dim_vo)
+        fixed_cta_tile_q = _validate_fixed_cta_tile_q(
+            fixed_cta_tile_q, head_dim_vo, head_dim_qk
+        )
 
         batch_size = len(qo_indptr) - 1
         self._batch_size = batch_size
@@ -3923,6 +3960,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 )
             ):
                 self._backend = "cudnn"
+
+        if fixed_cta_tile_q != -1 and self._backend != "fa2":
+            raise ValueError(
+                "fixed_cta_tile_q is only supported for the fa2 backend, "
+                f'got backend={self._backend!r}; set backend="fa2" explicitly.'
+            )
 
         self._cudnn_paged_bounds = None
         if self._requested_backend == "auto" and self._backend == "cudnn":
@@ -4180,20 +4223,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
         elif self._jit_module is not None:
             self._cached_module = self._jit_module
         else:
-            if self._backend == "auto":
-                self._backend = determine_attention_backend(
-                    self.device,
-                    PosEncodingMode[pos_encoding_mode].value,
-                    use_fp16_qk_reduction,
-                    self._custom_mask_buf is not None,  # use_custom_mask
-                    q_data_type,
-                    kv_data_type,
-                )
-            if fixed_cta_tile_q != -1 and self._backend != "fa2":
-                raise ValueError(
-                    f"fixed_cta_tile_q is only supported for the fa2 backend, "
-                    f"got backend={self._backend!r}"
-                )
             if self._backend != "cudnn":
                 get_module_args = (
                     q_data_type,
@@ -5851,8 +5880,14 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         disable_split_kv : bool,
             Whether to disable the split-kv for determinism in CUDA Graph, defaults to ``False``.
         fixed_cta_tile_q : Optional[int]
-            Fixed CTA tile size for FA2 prefill. Supported values are ``16``, ``64``, and ``128``.
-            Defaults to ``None`` (auto heuristic).
+            Fixed query tile for the FA2 planner, overriding the batch-length heuristic and
+            ``uniform_q_len`` tile selection. Defaults to ``None`` (auto heuristic).
+            Supported tiles are ``16``, ``64``, and ``128`` for VO < 256; ``16`` and
+            ``64`` for 256 <= VO < 512; and ``16`` and ``32`` for VO >= 512.
+            QK >= 512 with VO < 512 supports only ``16``.
+            Requires ``backend="fa2"`` (and ``use_tensor_cores=True`` for decode).
+            On Hopper, set ``backend="fa2"`` explicitly: ``backend="auto"`` can select FA3.
+            For batch invariance, also use ``disable_split_kv=True`` or a fixed split size.
         seq_lens: Optional[torch.Tensor]
             Only used by the cudnn backend. A 1D int32 tensor with the kv sequence length
             of each prompt, shape: ``[batch_size]``. Optional: cuDNN derives it from ``kv_indptr``.
@@ -5898,6 +5933,14 @@ class BatchPrefillWithRaggedKVCacheWrapper:
 
         The :meth:`plan` method cannot be used in Cuda Graph or in ``torch.compile``.
         """
+        if fixed_cta_tile_q is not None and self._requested_backend not in (
+            "auto",
+            "fa2",
+        ):
+            raise ValueError(
+                "fixed_cta_tile_q is only supported for the fa2 backend, "
+                f'got backend={self._requested_backend!r}; set backend="fa2" explicitly.'
+            )
         q_data_type = canonicalize_torch_dtype(q_data_type)
         if kv_data_type is None:
             kv_data_type = q_data_type
@@ -5909,7 +5952,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             head_dim_vo = head_dim_qk
         if fixed_split_size is None:
             fixed_split_size = -1
-        fixed_cta_tile_q = _validate_fixed_cta_tile_q(fixed_cta_tile_q, head_dim_vo)
+        fixed_cta_tile_q = _validate_fixed_cta_tile_q(
+            fixed_cta_tile_q, head_dim_vo, head_dim_qk
+        )
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
         self._head_dim_qk = head_dim_qk

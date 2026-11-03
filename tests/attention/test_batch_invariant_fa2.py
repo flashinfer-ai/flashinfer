@@ -122,7 +122,7 @@ def test_batch_decode_tensor_cores(
     workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device="cuda:0")
 
     wrapper_tensor_cores = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
-        workspace_buffer, kv_layout, use_tensor_cores=True
+        workspace_buffer, kv_layout, use_tensor_cores=True, backend="fa2"
     )
     wrapper_tensor_cores.plan(
         kv_indptr,
@@ -275,7 +275,7 @@ def test_batch_prefill_tensor_cores(
     )
 
     wrapper_tensor_cores = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-        workspace_buffer, kv_layout
+        workspace_buffer, kv_layout, backend="fa2"
     )
     wrapper_tensor_cores.plan(
         q_indptr,

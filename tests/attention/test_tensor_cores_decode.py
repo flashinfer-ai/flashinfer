@@ -739,10 +739,8 @@ def test_batch_decode_fixed_cta_tile_q_rejected_for_non_fa2_backend():
     )
     workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device="cuda:0")
     wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
-        workspace_buffer, use_tensor_cores=True
+        workspace_buffer, use_tensor_cores=True, backend="fa3"
     )
-    # Patch _backend to simulate a resolved non-fa2 tensor-core backend without needing fa3 hardware.
-    wrapper._backend = "fa3"
     with pytest.raises(
         ValueError, match="fixed_cta_tile_q is only supported for the fa2 backend"
     ):
