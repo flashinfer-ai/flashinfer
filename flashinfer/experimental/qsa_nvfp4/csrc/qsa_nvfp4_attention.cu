@@ -36,12 +36,10 @@ cudaError_t dispatch_format(int64_t kv_format, Fn&& fn) {
 
 // Inputs are validated by the Python API; this only forwards pointers, strides and sizes.
 // kv_format is 0 (NVFP4, with k_sf / v_sf), 1 (FP8-e4m3) or 2 (BF16).
-// partial_out / partial_lse are read only when num_splits > 1.
 void run(TensorView q, TensorView k_data, TensorView v_data, Optional<TensorView> k_sf,
          Optional<TensorView> v_sf, TensorView indices, TensorView block_table,
-         TensorView token_to_req, TensorView gate, TensorView out, TensorView partial_out,
-         TensorView partial_lse, double score_scale, double output_scale, int64_t kv_format,
-         int64_t num_splits) {
+         TensorView token_to_req, TensorView gate, TensorView out, double score_scale,
+         double output_scale, int64_t kv_format, int64_t num_splits) {
   qsa_nvfp4::Params p;
   const int64_t element_bytes = get_element_size(k_data);
   p.q = static_cast<const nv_bfloat16*>(q.data_ptr());
@@ -54,8 +52,6 @@ void run(TensorView q, TensorView k_data, TensorView v_data, Optional<TensorView
   p.token_to_req = static_cast<const int32_t*>(token_to_req.data_ptr());
   p.gate = static_cast<const nv_bfloat16*>(gate.data_ptr());
   p.out = static_cast<nv_bfloat16*>(out.data_ptr());
-  p.partial_out = static_cast<float*>(partial_out.data_ptr());
-  p.partial_lse = static_cast<float*>(partial_lse.data_ptr());
   p.q_stride_row = q.strides()[0];
   p.q_stride_head = q.strides()[1];
   p.data_stride_block = k_data.strides()[0] * element_bytes;
@@ -83,6 +79,16 @@ void run(TensorView q, TensorView k_data, TensorView v_data, Optional<TensorView
   p.num_splits = static_cast<int32_t>(num_splits);
 
   ffi::CUDADeviceGuard device_guard(q.device().device_id);
+  // Split partials, merged into out on the same stream; a single split writes out directly.
+  Optional<ffi::Tensor> partial_out, partial_lse;
+  p.partial_out = p.partial_lse = nullptr;
+  if (num_splits > 1) {
+    partial_out =
+        alloc_tensor({num_splits, q.size(0), q.size(1), q.size(2)}, dl_float32, q.device());
+    partial_lse = alloc_tensor({num_splits, q.size(0), q.size(1)}, dl_float32, q.device());
+    p.partial_out = static_cast<float*>(partial_out.value().data_ptr());
+    p.partial_lse = static_cast<float*>(partial_lse.value().data_ptr());
+  }
   const cudaError_t status = dispatch_format(kv_format, [&](auto format) {
     constexpr uint32_t kTileTokens = qsa_nvfp4::KvTraits<decltype(format)::value>::kTileTokens;
     p.num_tiles = (p.topk + kTileTokens - 1) / kTileTokens;
