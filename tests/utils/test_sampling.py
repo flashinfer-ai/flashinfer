@@ -1116,12 +1116,13 @@ def test_blackwell_softmax_unit_temperature_relative_error(rows, vocab_size, see
 @pytest.mark.parametrize(
     "rows,prefix_rows,vocab_size",
     [
-        # 16-CTA shared-tile kernel: five waves of resident clusters, and a
+        # 16-CTA shared-tile kernel: five waves of resident clusters on B200
+        # (the last with the balanced chunk for a per-row temperature), and a
         # prefix within two waves that takes the low-latency kernel.
-        (156, 32, 151936),
-        (156, 62, 151936),
+        (155, 32, 151936),
+        (155, 62, 151936),
         # 8-CTA shared-tile kernel.
-        (356, 62, 66000),
+        (355, 62, 66000),
     ],
 )
 @pytest.mark.parametrize("temperature_kind", ["none", "scalar", "per_row"])
