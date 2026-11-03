@@ -52,7 +52,7 @@ with a successor in its document chain), ``N_in`` / ``N_out`` the group totals,
   saved set of one layer on this rank (design table 4.1): ``S_in`` (``n_in s``;
   the padded receive buffer), the owner's c1 receive tensor with
   ``save_transfer`` (``2 N_out s_owner``), ``M_seg`` at ``P > 1``
-  (``(P - 1) n_frag s``) and the conv history rows (``n_hist_rows * C * 2``);
+  (``(P - 1) n_frag s``; see below) and the conv history rows (``n_hist_rows * C * 2``);
   ``save_mode="light"`` keeps no tape (its backward re-runs #1 and the #2 tape
   walk); ``save_mode="full"`` adds every forward tape: the ``h`` tape
   ``[NC_pad, HV, 128, 128]``, ``v_new`` / ``w`` / ``u`` ``[R, HV, 128]``, ``Aqk`` and
@@ -465,8 +465,9 @@ def gdn_det_workspace_layout_kcp(
     full = save_mode == "full"
     kept = kept_form and not full  # the kept-tape backward is the light form's
     # staging planes at P > 1: stage_b always; stage_m only when the call does not bind the saved M_seg^T for it
-    # (save_transfer under boundary_mode="saved" saves M_seg: the pool of that name is not sized, cake_kcp
-    # SAVE_TRANSFER_FRESH_POOLS); the ring pools are sized only under exchange="ring" and are not workspace here
+    # (save_transfer or save_mode="full" under boundary_mode="saved" saves M_seg: the pool of that name is not sized,
+    # cake_kcp SAVE_TRANSFER_FRESH_POOLS / _FULL_FRESH_POOLS); the ring pools are sized only under exchange="ring" and
+    # are not workspace here
     plane = (hp.NSEG * HV * STATE_TILE_BYTES) if P > 1 else 0
     staging = plane + (
         0 if (boundary_mode == "saved" and (save_transfer or full)) else plane
