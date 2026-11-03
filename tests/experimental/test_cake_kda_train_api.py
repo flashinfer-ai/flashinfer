@@ -1101,6 +1101,8 @@ def test_package_exports_the_det_free_names_only() -> None:
         assert name in pkg.__all__, name
         assert getattr(pkg, name) is getattr(cake_backend, name), name
     assert "S1_RECORDS" in pkg.__all__ and pkg.S1_RECORDS is cake_jit.S1_RECORDS
+    # the in-kernel Q/K L2 norm modes are the backend's, as in the deterministic package
+    assert "L2N_MODES" in cake_backend.__all__ and "L2N_MODES" not in pkg.__all__
     for name in (
         "chunk_kda_det",
         "chunk_kda_det_fwd",

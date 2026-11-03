@@ -25,11 +25,8 @@ limitations under the License.
 # ``chunk_kda_fwd``, ``chunk_kda_bwd`` and ``chunk_kda`` of this package take
 # ``deterministic: bool = True`` and raise ``ValueError`` unless it is
 # ``False``.  The package imports nothing from the deterministic package.
-# ``L2N_MODES`` are the in-kernel Q/K L2 norm modes of a plan
-# (``use_qk_l2norm_in_kernel=True`` runs ``"fused"``).
 
 from .cake_backend import (
-    L2N_MODES,
     SAVE_MODES,
     SAVED_VERSION,
     SAVED_VERSION_TAPE,
@@ -55,7 +52,6 @@ from .cake_jit import ARCH_BY_CAPABILITY, ARCHES, S1_RECORDS
 __all__ = [
     "ARCHES",
     "ARCH_BY_CAPABILITY",
-    "L2N_MODES",
     "S1_RECORDS",
     "SAVE_MODES",
     "SAVED_VERSION",
