@@ -38,9 +38,10 @@ from . import cake_build
 # * ``KERNELS``: ``arch -> template -> module name``, the table the host planner resolves a launch through.
 #
 # Only the programs of the non-deterministic schedule live here (program names ``cake_dense_projection_gemm_<hex>``,
-# templates ``dense_proj_gemm_atomic_*`` / ``router_fp32_gemm_atomic_*`` / ``router_fp32_gemm_ts_*``).  Every program
-# the deterministic package registers (``cake_dense_projection_det_gemm_<hex>``, templates ``dense_proj_det_gemm_*``,
-# ``router_fp32_det_gemm_*``, ``split_fp32_det_bf16x3``) is served by that package: :func:`select_module` and
+# templates ``dense_proj_gemm_atomic_*`` / ``router_fp32_gemm_atomic_*`` / ``router_fp32_gemm_ts_*`` /
+# ``router_fp32_gemm_simt_*``).  Every program the deterministic package registers
+# (``cake_dense_projection_det_gemm_<hex>``, templates ``dense_proj_det_gemm_*``, ``router_fp32_det_gemm_*``,
+# ``split_fp32_det_bf16x3``) is served by that package: :func:`select_module` and
 # :func:`load_cake_dense_projection_gemm_module` forward its templates and names to it.
 
 # fmt: off
@@ -88,11 +89,13 @@ DET_PROGRAM_PREFIX = "cake_dense_projection_det_gemm_"
 #: The instance templates of this package's programs, and of the deterministic package's.  The token ``atomic``
 #: keeps every template of this package different from every template the deterministic package registers and
 #: from every template it registered before its rename (``dense_proj_gemm_<layout>...``, ``router_fp32_gemm_<ab>``);
-#: ``router_fp32_gemm_ts_`` names the router weight gradient's head/tail programs with the ``A`` parts in tensor memory.
+#: ``router_fp32_gemm_ts_`` names the router weight gradient's head/tail programs with the ``A`` parts in tensor memory,
+#: ``router_fp32_gemm_simt_`` its exact-FP32 programs on the CUDA cores (one FFMA per product, no BF16 parts).
 TEMPLATE_PREFIXES = (
     "dense_proj_gemm_atomic_",
     "router_fp32_gemm_atomic_",
     "router_fp32_gemm_ts_",
+    "router_fp32_gemm_simt_",
 )
 DET_TEMPLATE_PREFIXES = (
     "dense_proj_det_gemm_",

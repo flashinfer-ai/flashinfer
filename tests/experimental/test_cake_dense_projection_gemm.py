@@ -1995,6 +1995,192 @@ def test_router_per_sm_count_tables_decide_only_their_own_sm_count(monkeypatch):
     ) == (540, 54, 24 * 508 // 2)
 
 
+def test_router_simt_specs_name_their_tiles_and_templates():
+    """A SIMT window spec ``"simt_n<tile_n>m<tile_m>s<slices>"`` names its tile and the template of its program;
+    every other spec is none."""
+    assert cake_backend.router_simt_tile("simt_n64m64s4") == (64, 64, 4)
+    assert cake_backend.router_simt_tile("simt_n128m64s2") == (128, 64, 2)
+    for spec in (
+        None,
+        3,
+        "waves",
+        "H0.5x3",
+        "S2",
+        "simt",
+        "simt_n64m64",
+        "xsimt_n64m64s4",
+    ):
+        assert cake_backend.router_simt_tile(spec) is None, spec
+    assert (
+        cake_backend.router_simt_template((128, 64, 2))
+        == "router_fp32_gemm_simt_n128m64s2"
+    )
+    assert cake_backend.router_simt_template((64, 64, 4)).startswith(
+        cake_jit.TEMPLATE_PREFIXES
+    )
+
+
+def test_router_simt_windows_decide_the_weight_gradient_only(monkeypatch):
+    """A SIMT window of the weight gradient: :func:`router_simt` gives its tile at every token count of the window,
+    on the SM count of the table only (:data:`ROUTER_SM_COUNT`, or a part's own table), when the tile divides the
+    hidden size and the experts; :func:`router_partition` gives no partition there (the launch is no stream-K launch).
+    A caller's split count, the forward and every token count outside the window take the stream-K planner."""
+    arch, hidden, N = "sm_103a", 5120, 256
+    key = (arch, "nn_t", hidden, N)
+    monkeypatch.setitem(
+        cake_backend.ROUTER_RULES,
+        key,
+        (
+            (1, 128, "simt_n64m64s2"),
+            (129, 256, "simt_n64m64s4"),
+            (16172, 32768, "H0.5x3"),
+        ),
+    )
+    kw = dict(arch=arch, M=hidden, N=N)
+    for T, want in (
+        (1, (64, 64, 2)),
+        (64, (64, 64, 2)),
+        (128, (64, 64, 2)),
+        (129, (64, 64, 4)),
+        (256, (64, 64, 4)),
+    ):
+        assert cake_backend.router_simt("nn_t", sm_count=152, K=T, **kw) == want, T
+        assert cake_backend.router_partition("nn_t", sm_count=152, K=T, **kw) is None, T
+        # another SM count: no SIMT window (the deterministic program)
+        for sms in (148, 151, 153, 160):
+            assert cake_backend.router_simt("nn_t", sm_count=sms, K=T, **kw) is None
+            assert (
+                cake_backend.router_partition("nn_t", sm_count=sms, K=T, **kw) is None
+            )
+        # a caller's split count runs the stream-K program
+        assert (
+            cake_backend.router_simt("nn_t", sm_count=152, K=T, splits=1, **kw) is None
+        )
+        assert cake_backend.router_partition(
+            "nn_t", sm_count=152, K=T, splits=1, **kw
+        ) == (
+            hidden // 256 * 2,
+            0,
+            0,
+        )
+    for T in (257, 1024, 16171):
+        assert cake_backend.router_simt("nn_t", sm_count=152, K=T, **kw) is None, T
+        assert cake_backend.router_partition("nn_t", sm_count=152, K=T, **kw) is None, T
+    assert cake_backend.router_simt("nn_t", sm_count=152, K=16172, **kw) is None
+    assert (
+        cake_backend.router_partition("nn_t", sm_count=152, K=16172, **kw) is not None
+    )
+    # the forward never takes a SIMT window
+    monkeypatch.setitem(
+        cake_backend.ROUTER_RULES, (arch, "kk", hidden, N), "simt_n64m64s4"
+    )
+    assert (
+        cake_backend.router_simt("kk", arch=arch, sm_count=152, M=64, N=N, K=hidden)
+        is None
+    )
+    # a tile that does not divide the hidden size: no SIMT program, and no partition either
+    hidden_odd = dict(arch=arch, M=5184, N=N, K=64)
+    monkeypatch.setitem(
+        cake_backend.ROUTER_RULES, (arch, "nn_t", 5184, N), "simt_n64m128s2"
+    )
+    assert cake_backend.router_simt("nn_t", sm_count=152, **hidden_odd) is None
+    assert cake_backend.router_partition("nn_t", sm_count=152, **hidden_odd) is None
+    # a part with a table of its own takes its own windows only
+    tables = dict(cake_backend.ROUTER_RULES_BY_SM)
+    tables[("sm_107a", 210)] = {
+        ("sm_107a", "nn_t", 6144, N): ((1, 256, "simt_n128m64s2"),)
+    }
+    monkeypatch.setattr(cake_backend, "ROUTER_RULES_BY_SM", tables)
+    wgrad = dict(arch="sm_107a", M=6144, N=N, K=200)
+    assert cake_backend.router_simt("nn_t", sm_count=210, **wgrad) == (128, 64, 2)
+    for sms in (209, 211, 216):
+        assert cake_backend.router_simt("nn_t", sm_count=sms, **wgrad) is None
+
+
+def test_k2_planner_plans_the_simt_router(monkeypatch):
+    """In a SIMT window the weight gradient's plan runs the SIMT program of the window's tile: the swapped launch
+    (``M`` hidden, ``N`` experts, ``K`` tokens) over one CTA per tile of the transposed ``out``, the operands' row
+    strides bound, no stack, no part tiles, every element stored once.  Views the program cannot read through
+    whole rows of a multiple of 4 elements, and a template this checkout does not register, run the deterministic
+    program."""
+    arch, hidden, N, T = "sm_100a", 4096, 256, 231
+    kw = dict(arch=arch, sm_count=152)
+    monkeypatch.setitem(
+        cake_backend.ROUTER_RULES,
+        (arch, "nn_t", hidden, N),
+        ((1, 256, "simt_n128m64s2"),),
+    )
+    monkeypatch.setitem(cake_jit.KERNELS, arch, {})  # whatever this checkout registers
+    X, G, out = torch.zeros(T, hidden), torch.zeros(T, N), torch.zeros(N, hidden)
+    plan, reason = cake_backend.plan_atomic_router(G.t(), X, out, **kw)
+    assert (
+        plan is None and "router_fp32_gemm_simt_n128m64s2 is not registered" in reason
+    )
+    _register(monkeypatch, arch, "router_fp32_gemm_simt_n128m64s2")
+    plan, reason = cake_backend.plan_atomic_router(G.t(), X, out, **kw)
+    assert plan is not None, reason
+    assert (
+        plan.template,
+        plan.simt,
+        plan.layout,
+        plan.swapped,
+        plan.a_mn,
+        plan.b_mn,
+    ) == (
+        "router_fp32_gemm_simt_n128m64s2",
+        (128, 64, 2),
+        "nn_t",
+        True,
+        True,
+        True,
+    )
+    assert (plan.M, plan.N, plan.K, plan.lda, plan.ldb) == (hidden, N, T, hidden, N)
+    # 64 x 2 CTAs, ceil(231 / 16) K blocks of 16 rows
+    assert (plan.m_tiles, plan.n_tiles, plan.k_iters, plan.units) == (64, 2, 15, 0)
+    assert plan.grid == (64, 2, 1)
+    assert not plan.part_tiles and plan.reproducible
+    assert plan.head_spans == 0 and plan.head_steps == 0
+    # the values the program takes: the operands' and out's row strides, the launch's dimensions
+    values = cake_backend._simt_values(
+        plan, A="x", B="g", out="o", ldo=hidden + 4, enable_pdl=1
+    )
+    assert values == dict(
+        A="x",
+        B="g",
+        out="o",
+        M=hidden,
+        N=N,
+        K=T,
+        lda=hidden,
+        ldb=N,
+        ldo=hidden + 4,
+        enable_pdl=1,
+    )
+    # padded rows (multiples of 4 elements) are read in place
+    Xp, Gp = torch.zeros(T, hidden + 8)[:, :hidden], torch.zeros(T, N + 4)[:, :N]
+    plan, _ = cake_backend.plan_atomic_router(Gp.t(), Xp, out, **kw)
+    assert (plan.template, plan.lda, plan.ldb) == (
+        "router_fp32_gemm_simt_n128m64s2",
+        hidden + 8,
+        N + 4,
+    )
+    # output-gradient rows that are not a multiple of 4 elements: the deterministic program
+    G2 = torch.zeros(T, N + 2)[:, :N]
+    plan, reason = cake_backend.plan_atomic_router(G2.t(), X, out, **kw)
+    assert plan is None and "output gradient's rows" in reason
+    # stride-0 operands (the views of a broadcast): the deterministic program
+    G0, X0 = torch.zeros(1, N).expand(T, N), torch.zeros(1, hidden).expand(T, hidden)
+    plan, reason = cake_backend.plan_atomic_router(G0.t(), X0, out, **kw)
+    assert plan is None and "SIMT" in reason
+    # a caller's split count runs the stream-K program at the window's token counts
+    _register(monkeypatch, arch, "router_fp32_gemm_atomic_nn_t")
+    plan, _ = cake_backend.plan_atomic_router(G.t(), X, out, splits=1, **kw)
+    assert plan.template == "router_fp32_gemm_atomic_nn_t" and plan.simt is None
+    # past the window: the deterministic program (no verdict)
+    X3, G3 = torch.zeros(257, hidden), torch.zeros(257, N)
+    assert cake_backend.plan_atomic_router(G3.t(), X3, out, **kw)[0] is None
+
+
 def test_k2_planner_plans_the_stream_k_router(monkeypatch):
     arch, T, K, N = "sm_103a", 4099, 6144, 256
     X, W, G = torch.zeros(T, K), torch.zeros(N, K), torch.zeros(T, N)
@@ -2267,8 +2453,10 @@ def test_k2_head_tail_program_of_each_architecture_and_sm_count():
 
 
 def test_k2_values_feed_every_registered_router_program():
-    """The keyword arguments of a K2 launch name every argument of every registered router program's argument plan
-    (the head/tail program's ``head_spans`` / ``head_steps`` included)."""
+    """The keyword arguments of a K2 launch name every argument of every registered stream-K router program's
+    argument plan (the head/tail program's ``head_spans`` / ``head_steps`` included); those of a SIMT launch every
+    argument of every registered SIMT program's plan, the operands' row strides and the launch flag before the
+    grid."""
     out = torch.zeros(256, 5120)
     plan = cake_backend.AtomicRouterPlan(
         M=5120, N=256, K=16231, a_mn=True, b_mn=True, swapped=True, layout="nn_t", m_tiles=40,
@@ -2276,8 +2464,54 @@ def test_k2_values_feed_every_registered_router_program():
         head_spans=54, head_steps=5080,
     )  # fmt: skip
     values = cake_backend._k2_values(plan, A="a", parts="b", out=out)
+    simt_prefix = cake_jit.TEMPLATE_PREFIXES[3]
+    simt_plan = dataclasses.replace(
+        plan,
+        template="router_fp32_gemm_simt_n64m64s4",
+        m_tiles=80,
+        n_tiles=4,
+        k_iters=1015,
+        units=0,
+        head_spans=0,
+        head_steps=0,
+        simt=(64, 64, 4),
+        lda=5120,
+        ldb=256,
+    )
+    simt_values = cake_backend._simt_values(
+        simt_plan, A="x", B="g", out="o", ldo=5120, enable_pdl=1
+    )
+    for name, record in cake_jit.MODULES.items():
+        if not record["template"].startswith(simt_prefix):
+            continue
+        plan_args = cake_jit.arg_plan_of(record)
+        arguments = cake_backend._order_atomic_arguments(
+            name, plan_args, simt_values, simt_plan.grid
+        )
+        assert [a for _, a in plan_args] == [
+            "A", "B", "out", "M", "N", "K", "lda", "ldb", "ldo", "enable_pdl",
+            "grid_x", "grid_y", "grid_z",
+        ]  # fmt: skip
+        assert arguments == [
+            "x",
+            "g",
+            "o",
+            5120,
+            256,
+            16231,
+            5120,
+            256,
+            5120,
+            1,
+            80,
+            4,
+            1,
+        ]
     names = [
-        n for n, r in cake_jit.MODULES.items() if r["template"].startswith("router_")
+        n
+        for n, r in cake_jit.MODULES.items()
+        if r["template"].startswith("router_")
+        and not r["template"].startswith(simt_prefix)
     ]
     for name in names:
         plan_args = cake_jit.arg_plan_of(cake_jit.MODULES[name])
@@ -4980,6 +5214,161 @@ def test_gpu_router_tmem_head_tail_program_in_its_windows(hidden, T):
     det_out = torch.empty_like(out)
     cake_backend.router_fp32_gemm(A, B, det_out, splits=1)
     assert torch.equal(stores[ts], stores[c3]) and torch.equal(stores[ts], det_out)
+
+
+#: The SIMT programs' tiles ``(tile_n, tile_m, slices)`` a test forces (each runs where this checkout registers it).
+SIMT_TILES = ((64, 64, 4), (64, 64, 2), (128, 64, 2))
+
+
+def _simt_spec(tile) -> str:
+    return "simt_n{}m{}s{}".format(*tile)
+
+
+def _simt_device_or_skip(tile) -> tuple[torch.device, str, str]:
+    device, arch = _atomic_device_or_skip()
+    template = cake_backend.router_simt_template(tile)
+    if template not in cake_jit.KERNELS[arch]:
+        pytest.skip(f"{template} is not registered for {arch}")
+    return device, arch, template
+
+
+@pytest.mark.parametrize("tile", SIMT_TILES, ids=_simt_spec)
+@pytest.mark.parametrize(
+    ("hidden", "T"),
+    [(4096, 1), (4096, 64), (5120, 17), (5120, 192), (6144, 255), (6144, 256)],
+)
+def test_gpu_router_simt_program_in_its_window(router_rule, tile, hidden, T):
+    """A SIMT window (forced for the row on this device) runs the SIMT program of its tile and no other program:
+    over ``RERUNS`` launches into a NaN-poisoned ``out`` the weight gradient is finite, within
+    ``ROUTER_REL_FRO_MAX`` of FP64 and the same bits every time (every element stored once, its slices added in a
+    fixed order), and the prepared launch, the cached launch of ``router_fp32_gemm``, ``router_wgrad`` (its entry
+    cache) and a padded ``out`` (written in place, its padding untouched) give those bits."""
+    device, arch, template = _simt_device_or_skip(tile)
+    sm_count = det_backend.device_facts(device).sm_count
+    X, W, G = _router_inputs(T, device, SEED + 40, K=hidden)
+    A, B, out = _router_case("wgrad", X, W, G)
+    router_rule("wgrad", A, B, _simt_spec(tile))
+    plan, reason = cake_backend.plan_atomic_router(
+        A, B, out, arch=arch, sm_count=sm_count
+    )
+    assert plan is not None and plan.simt == tile and plan.template == template, reason
+    prepared = cake_backend.prepare_router_fp32_gemm(A, B, out, deterministic=False)
+    assert isinstance(prepared, cake_backend.PreparedAtomicRouterGemm)
+    assert prepared.plan == plan and not prepared.fused_split
+    assert prepared.module_name == cake_jit.select_module(arch, template)
+    _assert_ran(prepared.launch, prepared.module_name)
+    ref = A.double() @ B.double()
+    first = None
+    for i in range(RERUNS):
+        out.fill_(float("nan"))
+        prepared.launch()
+        torch.cuda.synchronize()
+        assert bool(torch.isfinite(out).all()), i
+        if first is None:
+            first = out.clone()
+            assert _rel_fro(out, ref) <= ROUTER_REL_FRO_MAX
+        else:
+            assert torch.equal(out, first), i
+    for _ in range(2):
+        cached = torch.full_like(out, float("nan"))
+        cake_backend.router_fp32_gemm(A, B, cached, deterministic=False)
+        entry = torch.full_like(out, float("nan"))
+        cake_backend.router_wgrad(G, X, entry, deterministic=False)
+        torch.cuda.synchronize()
+        assert torch.equal(cached, first) and torch.equal(entry, first)
+    _assert_ran(
+        lambda: cake_backend.router_wgrad(G, X, entry, deterministic=False),
+        prepared.module_name,
+    )
+    padded = torch.full((256, hidden + 4), float("nan"), device=device)
+    cake_backend.router_wgrad(G, X, padded[:, :hidden], deterministic=False)
+    torch.cuda.synchronize()
+    assert torch.equal(padded[:, :hidden], first)
+    assert bool(padded[:, hidden:].isnan().all())
+
+
+@pytest.mark.parametrize("tile", SIMT_TILES, ids=_simt_spec)
+def test_gpu_router_simt_program_replays_in_a_cuda_graph(router_rule, tile):
+    """``router_wgrad`` in a SIMT window captured into a CUDA graph (its entry cache, the prepared launch) replays the
+    eager bits into a NaN-poisoned ``out``; the activations and the gradient changed between replays are read
+    again."""
+    device, arch, template = _simt_device_or_skip(tile)
+    hidden, T = 5120, 128
+    X, W, G = _router_inputs(T, device, SEED + 41, K=hidden)
+    A, B, out = _router_case("wgrad", X, W, G)
+    router_rule("wgrad", A, B, _simt_spec(tile))
+    eager = torch.empty_like(out)
+    cake_backend.router_wgrad(G, X, eager, deterministic=False)
+    prepared = cake_backend.prepare_router_fp32_gemm(G.t(), X, out, deterministic=False)
+    assert prepared.plan.simt == tile
+    entry_out = torch.empty_like(out)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(2):
+            cake_backend.router_wgrad(G, X, entry_out, deterministic=False)
+            prepared.launch()
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        cake_backend.router_wgrad(G, X, entry_out, deterministic=False)
+        prepared.launch()
+    for scale in (1.0, -0.5):
+        X.mul_(scale)
+        want = torch.empty_like(out)
+        cake_backend.router_wgrad(G, X, want, deterministic=False)
+        entry_out.fill_(float("nan"))
+        out.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(entry_out, want) and torch.equal(out, want), scale
+    assert scale != 1.0 and not torch.equal(want, eager)
+
+
+def test_gpu_router_simt_program_waits_for_an_early_producer(router_rule):
+    """The SIMT program as a programmatic dependent launch: the forward writes ``Y``, the input gradient reads it and
+    writes ``dX``, the weight gradient in a SIMT window reads both; it starts while its predecessor runs and must
+    still read every value it wrote, with every PDL flag and the same bits."""
+    device, arch = _atomic_device_or_skip()
+    tile = next(
+        (
+            t
+            for t in SIMT_TILES
+            if cake_backend.router_simt_template(t) in cake_jit.KERNELS[arch]
+        ),
+        None,
+    )
+    if tile is None:
+        pytest.skip(f"no SIMT program is registered for {arch}")
+    hidden, T = 6144, 256
+    X, W, _ = _router_inputs(T, device, SEED + 81, K=hidden)
+    Y = torch.empty(T, 256, device=device)
+    dX = torch.empty(T, hidden, device=device)
+    dW = torch.empty(256, hidden, device=device)
+    router_rule("wgrad", Y.t(), dX, _simt_spec(tile))
+    want_y = det_backend.router_det_forward(X, W, enable_pdl=False)
+    want_dx = det_backend.router_det_dgrad(want_y, W, enable_pdl=False)
+    want_dw = torch.empty_like(dW)
+    cake_backend.router_wgrad(
+        want_y, want_dx, want_dw, deterministic=False, enable_pdl=False
+    )
+    torch.cuda.synchronize()
+    assert (
+        _rel_fro(want_dw, want_y.double().t() @ want_dx.double()) <= ROUTER_REL_FRO_MAX
+    )
+    for pdl in (True, False, None):
+        for _ in range(3):
+            for t in (Y, dX, dW):
+                t.fill_(float("nan"))
+            kw = dict(deterministic=False, enable_pdl=pdl)
+            cake_backend.router_forward(X, W, Y, **kw)
+            cake_backend.router_dgrad(Y, W, dX, **kw)
+            cake_backend.router_wgrad(Y, dX, dW, **kw)
+            torch.cuda.synchronize()
+            assert torch.equal(Y, want_y) and torch.equal(dX, want_dx), pdl
+            assert torch.equal(dW, want_dw), pdl
+    assert {key[2][1][1] for key in cake_backend._K2_ATOMIC_CACHE} == {0, 1}
 
 
 def test_gpu_router_entry_points_reach_the_stream_k_program(router_rule):
