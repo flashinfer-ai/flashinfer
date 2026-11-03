@@ -17,8 +17,21 @@ indexer").
 | Plan | `msa_icp_index_score_sharded_plan_device`, once per query window and step | -- |
 | Score | `msa_icp_index_score_sharded` per query chunk into caller score scratch | `msa_icp_decode_index_score_sharded` into caller score rows |
 | Local Top16 | `msa_icp_topk_select_prefill` into the caller's carrier `[H, T, 33]` | `msa_icp_topk_select_publish` into the owner ranks' receive rows |
+| Fused option | `msa_icp_prefill_score_select`: score and local Top16 in one chain, into the same carrier | `msa_icp_decode_score_publish` |
 | Exchange | the caller's one all-to-all per layer | (in the publish: peer stores) |
 | Merge | `msa_icp_merge_candidates(prefill=True)` | `msa_icp_merge_candidates` (legacy or tagged rows) |
+
+The prefill fused option replaces the score and local Top16 steps of one
+query window with `msa_icp_prefill_score_select`: a list scorer keeps the
+Top16 list of each plan work item in a caller-owned uint8 `pool`
+(`msa_icp_prefill_pool_bytes`, 32 KiB per list piece) and a list merger writes
+the carrier rows of `msa_icp_topk_select_prefill`, byte for byte, without the
+FP32 score scratch.  The facade runs it when `prefill_local(..., pool=...)` is
+given (`score_scratch` may then be `None`); `prefill_pool_shape()` sizes the
+pool for windows of `prefill_window_tokens()` = `min(8192,
+max_num_batched_tokens)` tokens.  `MSAIcpIndexerPlan.fused_prefill` is the
+serving default per layout (`cake_backend.FUSED_PREFILL`) and is `False` on
+every layout in this version.
 
 The decode column is the default chain.  Its score plane cuts each request
 into one wave of the scorer (SMs x resident CTAs per SM / batch, at most 128
