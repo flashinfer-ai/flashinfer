@@ -439,6 +439,19 @@ def test_replay_import_requires_provenance_before_tuning_reuse(state):
     state.sweep.assert_called_once()
 
 
+def test_shared_fallback_does_not_hide_exact_file_result_when_tuning(state):
+    with autotune_v2():
+        assert state.run(num_tokens=1) == {"fc2_use_bulk": False}
+    record = next(
+        iter(state.tuner.get_protocol_records(tuning_protocol.NAMESPACE).values())
+    )
+    exact = {**record, "live_tokens": 4, "knobs": {"fc2_use_bulk": True}}
+    knob_cache.write_record(exact)
+    with autotune_v2():
+        assert state.run() == {"fc2_use_bulk": True}
+    state.sweep.assert_called_once()
+
+
 def test_compatibility_file_failure_does_not_break_selection(state, monkeypatch):
     def unavailable(*args):
         raise OSError("cache storage is unavailable")
@@ -825,6 +838,35 @@ def _subgroup_worker(rank, rendezvous):
                         tuning_protocol.NAMESPACE, protocol
                     ) == {"fc2_use_bulk": False}
                 assert workspace.install_tuned_knobs.call_count == 2
+                with autotune_v2(persistent_cache=False):
+                    tuner.clear_cache()
+                    context = tuner.protocol_context(tuning_protocol.NAMESPACE)
+                    if rank == 1:
+                        fallback = knob_cache.make_record(
+                            {"fc2_use_bulk": True}, **protocol._query(1)
+                        )
+                        fallback["profiling_policy"] = (
+                            tuning_protocol.measurement_settings(context)
+                        )
+                        context.publish("fallback", fallback)
+                    sweep = Mock(return_value=({"fc2_use_bulk": False}, 1.0, 1))
+                    patch.setattr(native, "_sweep_sm107_block_scaled_mega_moe", sweep)
+                    assert tuner.choose_with_protocol(
+                        tuning_protocol.NAMESPACE, protocol
+                    ) == {"fc2_use_bulk": False}
+                    sweep.assert_called_once()
+                    exact = [
+                        r for r in context.records().values() if r["live_tokens"] == 8
+                    ]
+                    if rank == 1:
+                        assert len(exact) == 1
+                    else:
+                        assert not exact
+                    # The writer's EP-wide result satisfies every rank's next call.
+                    assert tuner.choose_with_protocol(
+                        tuning_protocol.NAMESPACE, protocol
+                    ) == {"fc2_use_bulk": False}
+                    sweep.assert_called_once()
                 with autotune(rank == 1), pytest.raises(ValueError, match="controls"):
                     tuner.choose_with_protocol(tuning_protocol.NAMESPACE, protocol)
 
