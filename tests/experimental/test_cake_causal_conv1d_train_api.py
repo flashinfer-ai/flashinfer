@@ -438,10 +438,11 @@ def test_facade_signatures_mirror_the_packages() -> None:
 
     for entry, det_name in KCP_ENTRIES.items():
         mine = _parameters(getattr(kcp_facade, entry))
-        assert mine[-1] == ("deterministic", inspect.Parameter.KEYWORD_ONLY, True), (
-            entry
-        )
-        assert mine[:-1] == _parameters(getattr(det_kcp_facade, det_name)), entry
+        assert mine[-2:] == [
+            ("deterministic", inspect.Parameter.KEYWORD_ONLY, True),
+            ("bwd_reserve_sms", inspect.Parameter.KEYWORD_ONLY, None),
+        ], entry
+        assert mine[:-2] == _parameters(getattr(det_kcp_facade, det_name)), entry
         theirs = {name for name, *_ in _parameters(getattr(kcp_backend, entry))}
         assert {name for name, *_ in mine} <= theirs, entry
 

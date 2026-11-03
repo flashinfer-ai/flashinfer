@@ -43,6 +43,11 @@ Name map: ``cake_causal_conv1d_det_kcp`` -> :func:`cake_causal_conv1d_kcp`, ``ca
     y_local = cake_causal_conv1d_kcp(x_local, weight, ctx)                       # deterministic (default)
     y_local = cake_causal_conv1d_kcp(x_local, weight, ctx, deterministic=False)  # one-launch backward
     q, k, v = cake_causal_conv1d_multi_kcp((xq, xk, xv), (wq, wk, wv), ctx, deterministic=False)
+
+The non-deterministic backward beside a kernel of another stream (FlashInfer issue #8365): ``bwd_reserve_sms=K``
+(``deterministic=False`` only) launches the main backward ``K`` SMs short of its single wave::
+
+    y_local = cake_causal_conv1d_kcp(x_local, weight, ctx, deterministic=False, bwd_reserve_sms=1)
 """
 
 from __future__ import annotations
@@ -57,6 +62,30 @@ from .api_logging import flashinfer_experimental_api
 _FEATURE = "Cake context-parallel causal conv1d + SiLU training with a selectable numerical mode (SM100/SM103/SM107)"
 # The entry points that already warned about the deterministic fallback under torch's deterministic mode.
 _FALLBACK_WARNED: set[str] = set()
+
+
+def _bwd_reserve_sms(
+    bwd_reserve_sms: object, deterministic: object, entry: str
+) -> Optional[int]:
+    """The validated ``bwd_reserve_sms`` keyword (``None`` when not given: no validation)."""
+
+    if bwd_reserve_sms is None:
+        return None
+    if isinstance(bwd_reserve_sms, bool) or not isinstance(bwd_reserve_sms, int):
+        raise TypeError(
+            f"{entry}: bwd_reserve_sms must be an int or None, got {type(bwd_reserve_sms).__name__}"
+        )
+    if bwd_reserve_sms < 0:
+        raise ValueError(
+            f"{entry}: bwd_reserve_sms must be >= 0, got {bwd_reserve_sms}"
+        )
+    if deterministic is True and bwd_reserve_sms >= 1:
+        raise ValueError(
+            f"{entry}: bwd_reserve_sms={bwd_reserve_sms} applies to deterministic=False only; the deterministic "
+            "backward's form beside a kernel of another stream is cooperative=False "
+            "(flashinfer.cake_causal_conv1d_det_train_kcp)"
+        )
+    return int(bwd_reserve_sms)
 
 
 def _deterministic(deterministic: object, entry: str) -> bool:
@@ -90,6 +119,7 @@ def cake_causal_conv1d_kcp(
     *,
     recompute_handle: Optional[Any] = None,
     deterministic: bool = True,
+    bwd_reserve_sms: Optional[int] = None,
 ) -> torch.Tensor:
     """Autograd-enabled context-parallel packed width-4 depthwise causal convolution + SiLU of this rank's fragments.
 
@@ -115,6 +145,34 @@ def cake_causal_conv1d_kcp(
         ``True`` (default): ``cake_causal_conv1d_det_kcp`` (fixed-order, bitwise reproducible ``dweight`` partial).
         ``False``: the one-launch backward with an unordered ``dweight`` partial (``y`` / ``dx`` bitwise the
         deterministic ones).  torch's deterministic mode turns ``False`` into ``True`` with a one-time warning.
+    bwd_reserve_sms : int, optional
+        Keyword-only, default ``None`` (the non-deterministic package's ``RESERVE_DEFAULT``, 0).  The SMs the
+        non-deterministic main backward leaves to kernels of other streams (issue #8365): ``K >= 1`` launches its
+        single-wave grid ``K x ctas_per_sm`` CTAs short, so a kernel of another stream that holds up to ``K`` SMs
+        (for example a communication kernel) does not push the top CTAs into a second wave; the unloaded backward
+        gives up the work of those ``K`` SMs.  ``y``, ``dx`` and the exchanges are unchanged and ``dweight`` stays
+        within the same budget.  With ``K = 0`` (or ``None``) the backward already launches one SM's CTAs short
+        wherever the last channel-tile rank of the full grid holds at least ``ctas_per_sm`` CTAs, so ``K = 1``
+        leaves the grid unchanged at those widths (for example ``C`` = 10240, 6144 and 5120 on a 152-SM GB200 /
+        GB300, ``C`` = 10240, 6144 and 3072 on a 148-SM B200) and launches one SM's CTAs fewer at every other width.
+        Validated only when given: a ``bool`` or a non-``int`` raises ``TypeError``, a negative value or one not
+        below the device's SM count ``ValueError``.
+
+        ==============  ===============  ================================================================
+        deterministic   bwd_reserve_sms  backward
+        ==============  ===============  ================================================================
+        ``True``        ``None`` / 0     the deterministic entry point (the keyword is not forwarded)
+        ``True``        ``>= 1``         ``ValueError``: the deterministic backward's form beside a kernel
+                                         of another stream is ``cooperative=False`` of
+                                         :mod:`flashinfer.cake_causal_conv1d_det_train_kcp`
+        ``False``       ``None`` / 0     the non-deterministic backward's shipped grid
+        ``False``       ``K >= 1``       the non-deterministic backward ``K`` SMs short
+        ==============  ===============  ================================================================
+
+        Portable spelling beside a one-SM kernel of another stream: ``cooperative=False`` for
+        ``deterministic=True``, ``bwd_reserve_sms=1`` for ``deterministic=False``.  Under
+        ``torch.use_deterministic_algorithms(True)``, ``deterministic=False`` runs the deterministic entry point and
+        the keyword (validated) is not forwarded.  Each rank may choose its own value (no collective depends on it).
 
     Returns
     -------
@@ -123,6 +181,7 @@ def cake_causal_conv1d_kcp(
         partial.
     """
 
+    reserve = _bwd_reserve_sms(bwd_reserve_sms, deterministic, "cake_causal_conv1d_kcp")
     if _deterministic(deterministic, "cake_causal_conv1d_kcp"):
         from .cake_causal_conv1d_det_train_kcp import (  # noqa: PLC0415
             cake_causal_conv1d_det_kcp,
@@ -141,6 +200,7 @@ def cake_causal_conv1d_kcp(
         ctx,
         recompute_handle=recompute_handle,
         deterministic=False,
+        **({} if reserve is None else {"bwd_reserve_sms": reserve}),
     )
 
 
@@ -152,6 +212,7 @@ def cake_causal_conv1d_multi_kcp(
     *,
     recompute_handle: Optional[Any] = None,
     deterministic: bool = True,
+    bwd_reserve_sms: Optional[int] = None,
 ) -> tuple[torch.Tensor, ...]:
     """Autograd-enabled context-parallel convolutions of several tensors of one layer (for example its q, k and v)
     with one halo exchange per direction.
@@ -175,6 +236,8 @@ def cake_causal_conv1d_multi_kcp(
         :func:`cake_causal_conv1d_kcp`.
     deterministic : bool
         As in :func:`cake_causal_conv1d_kcp`.
+    bwd_reserve_sms : int, optional
+        As in :func:`cake_causal_conv1d_kcp`, one value for every tensor of the call.
 
     Returns
     -------
@@ -182,6 +245,9 @@ def cake_causal_conv1d_multi_kcp(
         The ``n`` BF16 outputs, each of its input's shape.
     """
 
+    reserve = _bwd_reserve_sms(
+        bwd_reserve_sms, deterministic, "cake_causal_conv1d_multi_kcp"
+    )
     if _deterministic(deterministic, "cake_causal_conv1d_multi_kcp"):
         from .cake_causal_conv1d_det_train_kcp import (  # noqa: PLC0415
             cake_causal_conv1d_det_multi_kcp,
@@ -200,6 +266,7 @@ def cake_causal_conv1d_multi_kcp(
         ctx,
         recompute_handle=recompute_handle,
         deterministic=False,
+        **({} if reserve is None else {"bwd_reserve_sms": reserve}),
     )
 
 
