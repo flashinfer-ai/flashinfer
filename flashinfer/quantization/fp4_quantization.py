@@ -1115,14 +1115,11 @@ def fp4_quantize(
     Tuple[torch.Tensor, torch.Tensor]
         ``(x_q, sf)`` where ``x_q`` has shape ``[M, K/2]`` with dtype
         ``FLOAT4_E2M1X2`` and ``sf`` is the ``uint8`` scale-factor tensor
-        with one scale per ``sf_vec_size`` elements along ``K``.  The
-        ``"cuda"`` backend returns a flat 1D buffer of length
-        ``round_up(M, R) * round_up(K / sf_vec_size, 4)`` for the swizzled
-        layouts (``R = 128`` for 128x4, ``R = 8`` for 8x4) and
-        ``M * K / sf_vec_size`` for the linear layout; the ``"cute-dsl"``
-        backend returns the same bytes as 2D
-        ``[round_up(M, R), round_up(K / sf_vec_size, 4)]`` (swizzled) or
-        ``[M, K / sf_vec_size]`` (linear).
+        with one scale per ``sf_vec_size`` elements along ``K``.  Both
+        backends return it 2D: ``[round_up(M, R), round_up(K / sf_vec_size, 4)]``
+        for the swizzled layouts (``R = 128`` for 128x4, ``R = 8`` for 8x4),
+        so the buffer holds ``round_up(M, R) * round_up(K / sf_vec_size, 4)``
+        bytes, and ``[M, K / sf_vec_size]`` for the linear layout.
 
     Raises
     ------
@@ -1660,14 +1657,12 @@ def nvfp4_quantize(
     Tuple[torch.Tensor, torch.Tensor]
         ``(x_q, sf)`` where ``x_q`` has shape ``[M, K/2]`` with dtype
         ``FLOAT4_E2M1X2`` and ``sf`` holds the E4M3 scale factors
-        (``uint8``), one per ``sf_vec_size`` elements along ``K``.  The
-        ``"cuda"`` backend returns a flat 1D buffer of length
-        ``round_up(M, R) * round_up(K / sf_vec_size, 4)`` for the swizzled
-        layouts (``R = 128`` for ``layout_128x4``, ``R = 8`` for
-        ``layout_8x4``) and ``M * K / sf_vec_size`` for ``layout_linear``;
-        the ``"cute-dsl"`` backend returns the same bytes as 2D
-        ``[round_up(M, R), round_up(K / sf_vec_size, 4)]`` (swizzled) or
-        ``[M, K / sf_vec_size]`` (linear).  When
+        (``uint8``), one per ``sf_vec_size`` elements along ``K``.  Both
+        backends return it 2D: ``[round_up(M, R), round_up(K / sf_vec_size, 4)]``
+        for the swizzled layouts (``R = 128`` for ``layout_128x4``, ``R = 8``
+        for ``layout_8x4``), so the buffer holds
+        ``round_up(M, R) * round_up(K / sf_vec_size, 4)`` bytes, and
+        ``[M, K / sf_vec_size]`` for ``layout_linear``.  When
         ``per_token_activation=True``, a third tensor containing per-token
         FP32 scales is also returned.
 
@@ -1938,13 +1933,12 @@ def mxfp4_quantize(
     Tuple[torch.Tensor, torch.Tensor]
         ``(x_q, sf)`` where ``x_q`` has shape ``[M, K/2]`` with dtype
         ``uint8`` (``FLOAT4_E2M1X2``) and ``sf`` is the UE8M0 scale-factor
-        tensor (``uint8``) with one scale per 32 elements along ``K``.  The
-        ``"cuda"`` backend returns a flat 1D buffer of length
-        ``round_up(M, R) * round_up(K / 32, 4)`` for the swizzled layouts
-        (``R = 128`` for ``layout_128x4``, ``R = 8`` for ``layout_8x4``) and
-        ``M * K / 32`` for ``layout_linear``; the ``"cute-dsl"`` backend
-        returns the same bytes as 2D ``[round_up(M, R), round_up(K / 32, 4)]``
-        (swizzled) or ``[M, K / 32]`` (linear).
+        tensor (``uint8``) with one scale per 32 elements along ``K``.  Both
+        backends return it 2D: ``[round_up(M, R), round_up(K / 32, 4)]`` for
+        the swizzled layouts (``R = 128`` for ``layout_128x4``, ``R = 8`` for
+        ``layout_8x4``), so the buffer holds
+        ``round_up(M, R) * round_up(K / 32, 4)`` bytes, and ``[M, K / 32]``
+        for ``layout_linear``.
 
     Warnings
     --------
