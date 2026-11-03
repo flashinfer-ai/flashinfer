@@ -50,10 +50,12 @@ from . import cake_build
 # architecture (see ``cake_policy``), ``POLICY`` the per-architecture host
 # dispatch record and ``NUMERICS`` the documented numerics of the programs.
 # The launch geometry of a program (block, cluster, dynamic shared memory) is
-# fixed in its host binding.
+# fixed in its host binding.  A scan binding takes ``zero_region`` (slot kind
+# ``zero``) right before the grid: a byte range of the workspace it zeroes on
+# the launch stream right before the launch, or an empty tensor (nothing).
 ARCHES = ("sm_100a", "sm_103a", "sm_107a")
 STAGES: list[str] = ["scan", "merge", "finalize", "finalize_rank"]
-ABI: str = "dsa_indexer_v2"
+ABI: str = "dsa_indexer_v3"
 NUMERICS: dict[str, str] = {"zero_sign_policy": "positive_accumulator"}
 FFI_ENTRY: str = "run"
 ARG_PLANS: dict[str, list[list[str]]] = {
@@ -80,6 +82,7 @@ ARG_PLANS: dict[str, list[list[str]]] = {
         ["parameter", "grid_ctas"],
         ["parameter", "softmax_scale"],
         ["parameter", "n_split"],
+        ["zero", "zero_region"],
         ["grid", "grid_x"],
         ["grid", "grid_y"],
         ["grid", "grid_z"],
@@ -120,8 +123,9 @@ ARG_PLANS: dict[str, list[list[str]]] = {
 # architecture but the physical kinds of ``POLICY[arch]["static_scan_kinds"]``
 # (the sm_107a l6 programs), which keep the static enumeration.  Every completed
 # scan launch leaves the ticket word at 0; the host (``cake_backend``) zeroes the
-# tail once when it prepares a runner on its own workspace, and before every run
-# on a caller-owned ``workspace_buffer`` (others may write that buffer between runs).
+# tail once when it prepares a runner on its own workspace, and on a caller-owned
+# ``workspace_buffer`` (others may write that buffer between runs) passes it as
+# the scan's ``zero_region``, which the scan binding zeroes before every launch.
 TICKET_TAIL_ARCHES: tuple[str, ...] = ("sm_100a", "sm_103a", "sm_107a")
 PROGRAMS: dict[str, dict[str, Any]] = {
     "cake_dsa_indexer_det_topk_04db38446d526901fed3": {

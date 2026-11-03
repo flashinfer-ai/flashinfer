@@ -301,6 +301,7 @@ def test_registry_records_are_well_formed():
                 "raw_pointer",
                 "nullable_raw_pointer",
                 "parameter",
+                "zero",
                 "grid",
             ), (role, kind, arg)
             if kind != "grid":
@@ -3342,7 +3343,7 @@ _TICKET_WORD_BYTES = 8 * 16
 
 def _assert_ticket_tail_zero(runner) -> None:
     """The ticket word reads 0 after every completed run (every completed scan launch leaves it 0; a
-    backend-owned tail is zeroed once at prepare, a caller-owned one again before every run); None
+    backend-owned tail is zeroed once at prepare, a caller-owned one by the scan binding before every scan launch); None
     for a program without a tail (``static_scan_kinds``).  The segment order behind it is not checked: an :lsf launch
     leaves it written.  A static call (``runner._tail_static``, ``cake_policy.ticket_static_path``) never touches the word,
     which then holds whatever the buffer held: nothing to check."""
@@ -3379,6 +3380,7 @@ def test_prepared_runner_ticket_tail_is_zero_at_prepare_after_runs_and_after_a_f
         pytest.skip("no ticket tail for this program (static_scan_kinds)")
     assert not runner._tail_shared  # backend-owned: nothing else writes the tail
     assert not runner._tail_static  # the call draws tickets
+    assert _scan_zero_region(runner).numel() == 0  # the scan binding zeroes nothing
     torch.cuda.synchronize()
     _assert_ticket_tail_zero(runner)  # zeroed once, at prepare
     expected = runner()
@@ -3416,12 +3418,29 @@ def _workspace_bytes(inputs: ref.IndexerInputs, device: torch.device) -> int:
     )
 
 
+def _scan_zero_region(runner) -> torch.Tensor:
+    """The ``zero_region`` argument the runner's scan launch passes its binding."""
+    (scan,) = [launch for launch in runner.launches if launch.role == "scan"]
+    plan = cake_backend.ARG_PLANS["scan"]
+    (index,) = [i for i, (kind, _name) in enumerate(plan) if kind == "zero"]
+    return scan.arguments[index]
+
+
 def _caller_owned_runner(inputs: ref.IndexerInputs, workspace: torch.Tensor):
     """A runner on the caller-owned ``workspace`` (skips where its program has no ticket tail)."""
     runner = _prepare(inputs, workspace_buffer=workspace)
     if runner.ticket_tail is None:
         pytest.skip("no ticket tail for this program (static_scan_kinds)")
     assert runner._tail_shared
+    # the scan binding zeroes the tail right before every scan launch; nothing on a static call
+    zero_region = _scan_zero_region(runner)
+    if runner._tail_static:
+        assert zero_region.numel() == 0
+    else:
+        assert (zero_region.data_ptr(), zero_region.numel()) == (
+            runner.ticket_tail.data_ptr(),
+            cake_policy.TICKET_TAIL_BYTES,
+        )
     return runner
 
 
@@ -3467,7 +3486,8 @@ def test_caller_owned_workspace_shared_by_two_geometries_keeps_every_run_exact()
 
 def test_caller_owned_workspace_tail_written_between_runs_is_restored_before_the_next_run():
     """The direct hazard: on a caller-owned workspace another kernel writes the ticket word between two
-    runs of a cached runner; the next run zeroes it first and stays bit-exact, and the tail reads 0 after."""
+    runs of a cached runner; the next run's scan binding zeroes it first and the run stays bit-exact, and the tail
+    reads 0 after."""
     _require_program()
     device = torch.device("cuda", torch.cuda.current_device())
     inputs = ref.make_random_inputs(
@@ -3476,17 +3496,17 @@ def test_caller_owned_workspace_tail_written_between_runs_is_restored_before_the
     workspace = torch.empty(
         _workspace_bytes(inputs, device), dtype=torch.uint8, device=device
     )
+    # whatever the buffer held: prepare zeroes nothing, the scan binding does
+    workspace.fill_(0xFF)
     runner = _caller_owned_runner(inputs, workspace)
     assert not runner._tail_static  # the call draws tickets
-    torch.cuda.synchronize()
-    _assert_ticket_tail_zero(runner)  # zeroed at prepare as well
     expected = _cloned(runner())
     torch.cuda.synchronize()
     _assert_ticket_tail_zero(runner)
     _judge_ok(expected, ref.select_reference(inputs))
     for fill in (7, 0xFF, 1):
         # what another kernel could leave in a shared buffer; not a failed launch,
-        # so the shared flag alone drives the memset
+        # so the scan binding's zero_region alone restores it
         runner.ticket_tail.fill_(fill)
         assert not runner._tail_dirty
         out = runner()
@@ -3496,9 +3516,10 @@ def test_caller_owned_workspace_tail_written_between_runs_is_restored_before_the
 
 
 def test_eager_entry_zeroes_a_caller_owned_tail_once_per_call(monkeypatch):
-    """The eager entry with a caller-owned workspace: ``prepare`` zeroes the ticket tail on the current stream and the run
-    that follows does not repeat the memset; a tail another kernel left non-zero before the call is still restored, so
-    every call stays bit-exact and leaves the word 0.  A prepared runner on the same buffer still zeroes it every run."""
+    """The eager entry with a caller-owned workspace: the scan binding zeroes the ticket tail right before the scan
+    launch and no host-side memset runs (neither in ``prepare`` nor in the run); a tail another kernel left non-zero
+    before the call is restored, so every call stays bit-exact and leaves the word 0.  A prepared runner on the same
+    buffer restores it on every run the same way."""
     _require_program()
     device = torch.device("cuda", torch.cuda.current_device())
     inputs = ref.make_random_inputs(
@@ -3508,7 +3529,7 @@ def test_eager_entry_zeroes_a_caller_owned_tail_once_per_call(monkeypatch):
         _workspace_bytes(inputs, device), dtype=torch.uint8, device=device
     )
     expected = _cloned(_run(inputs))
-    runners, run_memsets = [], []
+    runners, host_memsets = [], []
     prepare = cake_backend.prepare_dsa_indexer_det_topk
 
     def counting_prepare(*args, **kwargs):
@@ -3516,7 +3537,7 @@ def test_eager_entry_zeroes_a_caller_owned_tail_once_per_call(monkeypatch):
         if runner.ticket_tail is not None:
             tail = runner.ticket_tail
             zero = tail.zero_
-            tail.zero_ = lambda: (run_memsets.append(1), zero())[1]
+            tail.zero_ = lambda: (host_memsets.append(1), zero())[1]
         runners.append(runner)
         return runner
 
@@ -3539,19 +3560,19 @@ def test_eager_entry_zeroes_a_caller_owned_tail_once_per_call(monkeypatch):
         _assert_ticket_tail_zero(runners[-1])
     if runners[-1].ticket_tail is None:
         pytest.skip("no ticket tail for this program (static_scan_kinds)")
-    assert runners[-1]._tail_shared and not run_memsets  # zeroed by prepare only
+    assert runners[-1]._tail_shared and not host_memsets  # the scan binding zeroes it
     assert not runners[-1]._tail_static  # the call draws tickets
     runner = runners[-1]
     runner.ticket_tail.fill_(7)
-    out = runner()  # the prepared runner's own run restores a shared tail
+    out = runner()  # the prepared runner's scan binding restores a shared tail
     torch.cuda.synchronize()
-    assert ref.same_bits(out, expected) and run_memsets == [1]
+    assert ref.same_bits(out, expected) and not host_memsets
     _assert_ticket_tail_zero(runner)
 
 
 def test_caller_owned_workspace_graph_replay_restores_the_tail():
-    """A graph capturing a caller-owned runner carries the tail memset node: corrupting the tail between
-    replays leaves every replay bit-exact and the tail 0 afterwards."""
+    """A graph capturing a caller-owned runner carries the scan binding's tail memset node: corrupting the tail
+    between replays leaves every replay bit-exact and the tail 0 afterwards."""
     _require_program()
     device = torch.device("cuda", torch.cuda.current_device())
     inputs = ref.make_random_inputs(
@@ -3704,7 +3725,7 @@ def test_static_call_skips_the_tail_memset_and_never_touches_the_ticket_word():
     out = drawing()
     torch.cuda.synchronize()
     assert ref.same_bits(out, expected_d)
-    _assert_ticket_tail_zero(drawing)  # zeroed before its run, left 0 by its scan
+    _assert_ticket_tail_zero(drawing)  # zeroed by its scan binding, left 0 by its scan
     out = runner()  # the static runner after the drawing one wrote the buffer
     torch.cuda.synchronize()
     assert ref.same_bits(out, expected_s) and not memsets

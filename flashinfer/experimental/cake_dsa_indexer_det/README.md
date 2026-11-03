@@ -216,8 +216,9 @@ that writes the registry verifies the record against them before it is frozen.
 * **No host synchronization**: the segment boundaries and offsets are read on
   the device only; the host uses `T`, `Tkv`, `S`, `ratio`, `top_k`, the SM
   count and the strides.  The eager entry point allocates the outputs and the
-  workspace (unless supplied) through the caching allocator and zeroes the
-  ticket tail of a supplied workspace once per call (none on a static call:
+  workspace (unless supplied) through the caching allocator; the scan binding
+  zeroes the ticket tail of a supplied workspace right before every scan
+  launch, in the same host call (none on a static call:
   where the shape alone bounds the work units by the grid,
   `cake_policy.ticket_static_path`, the scan never touches the ticket word;
   none for a program of the record's `static_scan_kinds`, the sm_107a l6
