@@ -3,34 +3,39 @@
   "description": "Indexer-throwaway v2 CuTe DSL source snapshot with private namespace and compatibility adapters, explicit ReLU policy, padding-safe sample histograms and NaN-low exact selection.",
   "files": {
     "__init__.py": "2df72e171180e11ebdd195976b27a318551e9d86dc92698da439715a071c3975",
-    "api.py": "d26d617afb00c90ba1aa5c7f87374278c5b99b3dd91df344ca4490482764fdb8",
+    "api.py": "19fa1c45d5389e7b5a58737b4c449f0d72e827cfc4a6f63c740e0650d67b2baf",
     "mqa_logits_util.py": "aea6af94cfc1b2c65e88cf80eb610e7b1901820a22e60a7bc942a361b539bbf0",
     "ordering.py": "57207b5b698c1d597179080a0649108d08aecb6d1ac8acda7330384a54acb5ab",
     "packed.py": "14a0bc3f51e27efa83218ad457d33d1b278a17c387d5845ed06599a2e327b617",
     "pdl.py": "eaed9f3bb0b8c8b9b33f29ff86748eddacb196608092aa472d4d1a711ca5fadb",
     "prefill/__init__.py": "f2c4efff8fbb50d966fe21eeaccc24be64b25b81a2537f7f44a6eefb5d654ae9",
-    "prefill/api.py": "d7f776691c73bf6da79db5b93576c2f58398edd1210bd12d231de6270e99025c",
+    "prefill/api.py": "703279a32756ff6f726de0979d99d7853dde75d23e67015309f0062230786f7c",
     "prefill/boundary_extremes.py": "d41121cdc1ec7565226d5287f7c5869fbc0751864bb656d2a0e0017fdb32c14e",
-    "prefill/candidate_streaming.py": "4f278e70cded436676086fe4f029b94850d0ba250c94087a53c47ac6814b8458",
-    "prefill/crossing_glmflash_mid.py": "3cebb4fc5c20ea26cfab3cd634655990870a3de665a7b562a7c97a93a41fe214",
-    "prefill/crossing_glmfull_short.py": "95e59fb5471161125be5efedf92c85f22af9034e6e14d53d04ac177c44bd5226",
-    "prefill/crossing_precounted.py": "bdce62aa3125f8c87b82973ce256b637e728372af885bc9bb81a0748315d4271",
-    "prefill/crossing_precounted_mxfp4.py": "3bd316dafc7c5f4a9fda2408165fd6caf20a1949486ed2e042e87add962b4499",
-    "prefill/fp4_glm_fulltile_filter.py": "ceaecc59817d37e78d529132b08c83424010e90f157147ce88d6462b34e233ef",
+    "prefill/candidate_streaming.py": "e5e60fea1f9329b715022dd4aab950c39ffb5b0cb336b3f8ccebc7c5e502d68d",
+    "prefill/crossing_glmflash_mid.py": "bebbad9d67373a2d1f33a857a7e70b2c6fc125947bcd0e31f9a6250f01fead11",
+    "prefill/crossing_glmfull_short.py": "653cf21eff1a111fdf3cfd810ace8f5688af97525e3facafd8c25c1b65d10cfb",
+    "prefill/crossing_precounted.py": "f6af7f241bdd8a0594eb2d1b10eef5e18b27f89c27a13e6647b65e5a3fbccdd8",
+    "prefill/crossing_precounted_mxfp4.py": "05036a17fb182de1bf4d08cba3a4b5d065dadc07accf0bc1db13317bc0432806",
+    "prefill/fp4_glm_fulltile_filter.py": "06a0747f31e1cd3862e59ced3adfd25503e82dc6d9deecebb7b016f7a7b79cea",
     "prefill/fp4_glmflash_queue_recovery.py": "a07d0e4bf3142854c5f228517e7f36e8cab1bd77dbb1c1259fd16258516c4ddd",
-    "prefill/fp4_queue_recovery.py": "e643c14e9f3cd70fb995b74d1987ca14d645f3491e02df6d7b2bf9e890ef7cba",
-    "prefill/fp4_safe_filter.py": "106fa013b17940cdfa51c45043c3fb728e2e1babc9f91237512095b23f30ae07",
-    "prefill/fp8_fulltile_filter.py": "bed0eb4642da70a9d4b5876e16c867748f9aa4510f9c7e43ba25f80efb4e5690",
-    "prefill/fp8_glm_mid_loop_filter.py": "3f8a18319702a484dae7391987297567c9549cb95d7360da7819fffd2de147fb",
+    "prefill/fp4_queue_recovery.py": "d483b4c8f49314641cedafb1d765e007559db64fa5ea4e8da36c022dfcffb92b",
+    "prefill/fp4_safe_filter.py": "97a0db6b9741dc51107926728ba243587c9f161fd127133ecd9b492c1aafa203",
+    "prefill/fp4_shared_kv_safe_filter.py": "8aacf356cfa0c0ca1b169f1ff3158ce62946012963ffc5e72df288672d97ab9d",
+    "prefill/fp8_fulltile_filter.py": "862e596dcf5c004693ba3825e4965db1933fa2f1f3b80b525290e54920b8328d",
+    "prefill/fp8_glm_mid_loop_filter.py": "9e643360560a737fb677b3b5c93311e26046e095c4f43cd947f91b8171a5bf4c",
     "prefill/fp8_glmflash_queue_recovery.py": "afca871b121c0bb10f63c94d20ce18612ed324825ae267d3128c61c4a18f364b",
-    "prefill/fp8_glmfull_fulltile_filter.py": "bed0eb4642da70a9d4b5876e16c867748f9aa4510f9c7e43ba25f80efb4e5690",
-    "prefill/fp8_queue_recovery.py": "e58d676b4be0a598008d71ec2e794aa81d4f1b28527e51cca661448f5f538b56",
-    "prefill/fp8_qwen_packed_filter.py": "d02e00fd42a19f6b8926d291260e3c7604ca0cd05cbc2c91a94b5eb63b53e9e7",
-    "prefill/fp8_safe_filter.py": "aaf46f059a394a5217dd918a01c10a2f7a20c6810705a70cfb8befb7681878df",
+    "prefill/fp8_glmfull_fulltile_filter.py": "172bf88bc42b390e86f546b18b50ca8655765c1440abd5d619aa45089ce2305c",
+    "prefill/fp8_queue_recovery.py": "2327dd8fc0d5aa4578ccb6a9cfd1bb78fb593934a0aba1640f3a8d1a1ff4b31c",
+    "prefill/fp8_qwen_packed_filter.py": "f19c00d459b09dbc8fa17f74bcd0db197dd94ff502c24600aec65258ca65f19a",
+    "prefill/fp8_safe_filter.py": "4bd8373a8c1ffbfb2b8d027a55e17afc61aebd01cde46ee5e3cf169bde435804",
+    "prefill/fp8_shared_kv_safe_filter.py": "f40092cea6ec86e95c1321c8b46e1f97d686da56c16cf51d668c1dabcd6a0180",
     "prefill/fused_recovery_emit.py": "a31134acf8b8e6fcfa76dcbc9cb2100c7862020f132197103d52ff7fa595f3d6",
     "prefill/half_bucket_uniform.py": "4648143e794ab85b55aa4bbae0d9bd1268ceeaa287427c57d2ff94c8f8ca0c0c",
     "prefill/half_filter_boundary.py": "4ed9126107b6db2ce7a1ad9404c7c42dd2a8f78c02cba30172bd5434f0996d3d",
     "prefill/integer_relu_fast.py": "0a4bf73011638cb06d6c93693a53ef314b7831899d336f3908cd0d8d9596feb1",
+    "prefill/native_bf16_math.py": "da2c07f0f2ba20f227ee1db103ec3b7109bd986c4807d9db02260faff133d905",
+    "prefill/native_heads.py": "a0294c3d812dd541e948b18c8264d443474e677cc368f97cde5a8a0f83c1321f",
+    "prefill/native_lowp_math.py": "660cc167bb3ca7c26d50426da9c1ebaf939d11430150fd65f3ae7a15fbd64f3d",
     "prefill/policy_dsv4.py": "ced62b10d5c15671134c0f1b29bf44f955151d12f9dda7b8b709af492c44c35d",
     "prefill/policy_glm_short.py": "dfe12f0116f47a9223adf89028760478178e2a153e2ead19d8090672d0a3ae71",
     "prefill/policy_q4_128.py": "8c967b90ddd540683ed61f7478cf2cb0f7b2aa845830eca5674ac6dc7fdbcd4c",
@@ -39,25 +44,27 @@
     "prefill/proposal_short.py": "379c4c7ca4584962a541f8bead934e9100db3841e32b6d04819fe9e43adddb8c",
     "prefill/proposal_top16.py": "3ca66f42f754ddceb8a463bba389c46b4bc80b53a6bccdf6a41e57484d0073a6",
     "prefill/proposal_warp.py": "84106de7e2922fae11e7a717658d2aa665dcf979074cafb8520ebd05bf7c0a73",
+    "prefill/proposal_warp_128.py": "08e7838f1aa462ec22e796b298fc0515ae3f01ed0fe73288e4a7595933e9fdf5",
     "prefill/qsa_publish.py": "317d05b3804dc87c3d2bee56b72ce847dd0044dcf8f942cd76cb52eaaf628f56",
-    "prefill/queue_recovery_compile.py": "bd4781b900b75472f7580b10d377eb49c0fc98c41f9045720151ef15774d18c0",
+    "prefill/queue_recovery_compile.py": "f148c4b0037c32ac0e0d8caf71ab59e8ea387d2bb96abf435cfe45371bb132d0",
     "prefill/recovery_selection.py": "331235a7b28009b0b0f29ef5e5c7e4d12205e92fc10516af8f009ae88f17e938",
     "prefill/recovery_streaming.py": "8f8f343576a903eabbe25b918f8c667a28600ca5cb5707b6d58d005a70d2d59e",
-    "prefill/safe_filter_compile.py": "40aeae382f8f8c01eba0b83d884590a3a9041e7191638adc83eabe7d450546ee",
+    "prefill/safe_filter_compile.py": "39581355a4802e56a58fd29848985ca896cae466616bf477507311e6a522cf03",
     "prefill/sample_bucket.py": "c2411bc1c330ffe8ac052a2cda11b66407a6e0076ecf39526e9b93bcc7f0c507",
     "prefill/sample_count_policy.py": "ce589d6d473ddf6fd9854838113f7a6f0e8107a441ec136e89046c34817853fa",
     "prefill/sample_policy.py": "0c5a6f9fa11d91e42d25644f26932ba358c00791f8a5b404d0d3ea5d1e483bca",
     "prefill/sample_rank_margin.py": "ce474de496ba13d6068a42bea840237419f3fcd47a22f148a8aa8ed0e657b798",
-    "prefill/sampler_upper_fp4.py": "182abfdc8fdcb9ff5c6d6842da70d78c10eaae418506a748b828cf4d3afe69e5",
-    "prefill/sampler_upper_fp8.py": "16dfe4b0f56dc1c82012c56815bfe2896c60a4e8ff6f9adb3b87aa8ddc3be7ff",
-    "prefill/sampler_upper_glmflash_fp4.py": "50ac74e70036a1538e6de61e30ba7ebbc0108bbec1f445fc36d7db2922bf1656",
+    "prefill/sampler_upper_fp4.py": "18900884492fbbefb24a89eeefb99d6a45c546ab9483273decda2c9f3d1b628f",
+    "prefill/sampler_upper_fp8.py": "cd17003b11a7c15690160410ef33dc88f85a001394f14e4f2d7d96b8577e7ba1",
+    "prefill/sampler_upper_glmflash_fp4.py": "20599fb8af3bb780a130a559feb84889e2aec26f121791e932c9847624f059a6",
     "prefill/selection.py": "ca25e4e116076575dbdbb9a83ba82b8b1a4da3e449a8542e1ebee7de061ff2ac",
+    "prefill/short_domain.py": "86702f61b0a6bf99baf7e303a5396b3aafed3c74345a34f318f691627d5878ea",
     "prefill/small_crossing.py": "52b53acac901c735b94a5c1c43c77a51fe5e8550dce7b6f0ddb3ad31f98c4098",
     "prefill/subset_barrier.py": "47424b8263246265d53679da9693e8f66e488ce7037a72e3adf875b640a4cebb",
     "prefill/subset_named_barrier.py": "d5e9894dedfa2158ea33a27d461a2219d9065d5cef0cb31a4b4f9af6796523a7",
-    "prefill/upper_compile.py": "f259177a344318c1a2ac2347b452f7af4e03fece93e5b95c85f968176babbdd7",
+    "prefill/upper_compile.py": "4234e5f50d523cd53623b644e37697c797631062dfa7d6b0e6c6d61db97e304f",
     "prefill/upper_proposal.py": "bc85d6b188caa87f0dba854a669c6e8161587295514f5e0aad818e9a0714fdf9",
-    "prefill/weighted_heads.py": "e3f33c9a983ed1ee92098ab6b2913425bbc01473d8e862119cf9ff52e2cb9bcf"
+    "prefill/weighted_heads.py": "9ba1eb5a0a481d7e683a4442d548f36cdf82b6eb7ce5957483bf84b93a250829"
   },
   "pre_relocation_snapshot": {
     "description": "Previous sealed snapshot hashes before package-only ImportFrom relocation; reverse this rewrite to reproduce these bytes.",
@@ -319,6 +326,132 @@
         "prefill/crossing_glmflash_mid.py": {
           "before_sha256": "29b9bb883c965f79afcf760575a2ffcf5bbc42fb626438fbf5c6c569bb42c0ad",
           "after_sha256": "3cebb4fc5c20ea26cfab3cd634655990870a3de665a7b562a7c97a93a41fe214"
+        }
+      }
+    },
+    {
+      "name": "extended-prefill-encodings-and-native-math",
+      "description": "Add block-scaled FP8, BF16 weights, native low-precision head accumulation, shared-KV filtering and updated prefill policies. Newly introduced modules have no prior hash.",
+      "files": {
+        "api.py": {
+          "before_sha256": "d26d617afb00c90ba1aa5c7f87374278c5b99b3dd91df344ca4490482764fdb8",
+          "after_sha256": "19fa1c45d5389e7b5a58737b4c449f0d72e827cfc4a6f63c740e0650d67b2baf"
+        },
+        "prefill/api.py": {
+          "before_sha256": "d7f776691c73bf6da79db5b93576c2f58398edd1210bd12d231de6270e99025c",
+          "after_sha256": "703279a32756ff6f726de0979d99d7853dde75d23e67015309f0062230786f7c"
+        },
+        "prefill/candidate_streaming.py": {
+          "before_sha256": "4f278e70cded436676086fe4f029b94850d0ba250c94087a53c47ac6814b8458",
+          "after_sha256": "e5e60fea1f9329b715022dd4aab950c39ffb5b0cb336b3f8ccebc7c5e502d68d"
+        },
+        "prefill/crossing_glmflash_mid.py": {
+          "before_sha256": "3cebb4fc5c20ea26cfab3cd634655990870a3de665a7b562a7c97a93a41fe214",
+          "after_sha256": "bebbad9d67373a2d1f33a857a7e70b2c6fc125947bcd0e31f9a6250f01fead11"
+        },
+        "prefill/crossing_glmfull_short.py": {
+          "before_sha256": "95e59fb5471161125be5efedf92c85f22af9034e6e14d53d04ac177c44bd5226",
+          "after_sha256": "653cf21eff1a111fdf3cfd810ace8f5688af97525e3facafd8c25c1b65d10cfb"
+        },
+        "prefill/crossing_precounted.py": {
+          "before_sha256": "bdce62aa3125f8c87b82973ce256b637e728372af885bc9bb81a0748315d4271",
+          "after_sha256": "f6af7f241bdd8a0594eb2d1b10eef5e18b27f89c27a13e6647b65e5a3fbccdd8"
+        },
+        "prefill/crossing_precounted_mxfp4.py": {
+          "before_sha256": "3bd316dafc7c5f4a9fda2408165fd6caf20a1949486ed2e042e87add962b4499",
+          "after_sha256": "05036a17fb182de1bf4d08cba3a4b5d065dadc07accf0bc1db13317bc0432806"
+        },
+        "prefill/fp4_glm_fulltile_filter.py": {
+          "before_sha256": "ceaecc59817d37e78d529132b08c83424010e90f157147ce88d6462b34e233ef",
+          "after_sha256": "06a0747f31e1cd3862e59ced3adfd25503e82dc6d9deecebb7b016f7a7b79cea"
+        },
+        "prefill/fp4_queue_recovery.py": {
+          "before_sha256": "e643c14e9f3cd70fb995b74d1987ca14d645f3491e02df6d7b2bf9e890ef7cba",
+          "after_sha256": "d483b4c8f49314641cedafb1d765e007559db64fa5ea4e8da36c022dfcffb92b"
+        },
+        "prefill/fp4_safe_filter.py": {
+          "before_sha256": "106fa013b17940cdfa51c45043c3fb728e2e1babc9f91237512095b23f30ae07",
+          "after_sha256": "97a0db6b9741dc51107926728ba243587c9f161fd127133ecd9b492c1aafa203"
+        },
+        "prefill/fp4_shared_kv_safe_filter.py": {
+          "before_sha256": null,
+          "after_sha256": "8aacf356cfa0c0ca1b169f1ff3158ce62946012963ffc5e72df288672d97ab9d"
+        },
+        "prefill/fp8_fulltile_filter.py": {
+          "before_sha256": "bed0eb4642da70a9d4b5876e16c867748f9aa4510f9c7e43ba25f80efb4e5690",
+          "after_sha256": "862e596dcf5c004693ba3825e4965db1933fa2f1f3b80b525290e54920b8328d"
+        },
+        "prefill/fp8_glm_mid_loop_filter.py": {
+          "before_sha256": "3f8a18319702a484dae7391987297567c9549cb95d7360da7819fffd2de147fb",
+          "after_sha256": "9e643360560a737fb677b3b5c93311e26046e095c4f43cd947f91b8171a5bf4c"
+        },
+        "prefill/fp8_glmfull_fulltile_filter.py": {
+          "before_sha256": "bed0eb4642da70a9d4b5876e16c867748f9aa4510f9c7e43ba25f80efb4e5690",
+          "after_sha256": "172bf88bc42b390e86f546b18b50ca8655765c1440abd5d619aa45089ce2305c"
+        },
+        "prefill/fp8_queue_recovery.py": {
+          "before_sha256": "e58d676b4be0a598008d71ec2e794aa81d4f1b28527e51cca661448f5f538b56",
+          "after_sha256": "2327dd8fc0d5aa4578ccb6a9cfd1bb78fb593934a0aba1640f3a8d1a1ff4b31c"
+        },
+        "prefill/fp8_qwen_packed_filter.py": {
+          "before_sha256": "d02e00fd42a19f6b8926d291260e3c7604ca0cd05cbc2c91a94b5eb63b53e9e7",
+          "after_sha256": "f19c00d459b09dbc8fa17f74bcd0db197dd94ff502c24600aec65258ca65f19a"
+        },
+        "prefill/fp8_safe_filter.py": {
+          "before_sha256": "aaf46f059a394a5217dd918a01c10a2f7a20c6810705a70cfb8befb7681878df",
+          "after_sha256": "4bd8373a8c1ffbfb2b8d027a55e17afc61aebd01cde46ee5e3cf169bde435804"
+        },
+        "prefill/fp8_shared_kv_safe_filter.py": {
+          "before_sha256": null,
+          "after_sha256": "f40092cea6ec86e95c1321c8b46e1f97d686da56c16cf51d668c1dabcd6a0180"
+        },
+        "prefill/native_bf16_math.py": {
+          "before_sha256": null,
+          "after_sha256": "da2c07f0f2ba20f227ee1db103ec3b7109bd986c4807d9db02260faff133d905"
+        },
+        "prefill/native_heads.py": {
+          "before_sha256": null,
+          "after_sha256": "a0294c3d812dd541e948b18c8264d443474e677cc368f97cde5a8a0f83c1321f"
+        },
+        "prefill/native_lowp_math.py": {
+          "before_sha256": null,
+          "after_sha256": "660cc167bb3ca7c26d50426da9c1ebaf939d11430150fd65f3ae7a15fbd64f3d"
+        },
+        "prefill/proposal_warp_128.py": {
+          "before_sha256": null,
+          "after_sha256": "08e7838f1aa462ec22e796b298fc0515ae3f01ed0fe73288e4a7595933e9fdf5"
+        },
+        "prefill/queue_recovery_compile.py": {
+          "before_sha256": "bd4781b900b75472f7580b10d377eb49c0fc98c41f9045720151ef15774d18c0",
+          "after_sha256": "f148c4b0037c32ac0e0d8caf71ab59e8ea387d2bb96abf435cfe45371bb132d0"
+        },
+        "prefill/safe_filter_compile.py": {
+          "before_sha256": "40aeae382f8f8c01eba0b83d884590a3a9041e7191638adc83eabe7d450546ee",
+          "after_sha256": "39581355a4802e56a58fd29848985ca896cae466616bf477507311e6a522cf03"
+        },
+        "prefill/sampler_upper_fp4.py": {
+          "before_sha256": "182abfdc8fdcb9ff5c6d6842da70d78c10eaae418506a748b828cf4d3afe69e5",
+          "after_sha256": "18900884492fbbefb24a89eeefb99d6a45c546ab9483273decda2c9f3d1b628f"
+        },
+        "prefill/sampler_upper_fp8.py": {
+          "before_sha256": "16dfe4b0f56dc1c82012c56815bfe2896c60a4e8ff6f9adb3b87aa8ddc3be7ff",
+          "after_sha256": "cd17003b11a7c15690160410ef33dc88f85a001394f14e4f2d7d96b8577e7ba1"
+        },
+        "prefill/sampler_upper_glmflash_fp4.py": {
+          "before_sha256": "50ac74e70036a1538e6de61e30ba7ebbc0108bbec1f445fc36d7db2922bf1656",
+          "after_sha256": "20599fb8af3bb780a130a559feb84889e2aec26f121791e932c9847624f059a6"
+        },
+        "prefill/short_domain.py": {
+          "before_sha256": null,
+          "after_sha256": "86702f61b0a6bf99baf7e303a5396b3aafed3c74345a34f318f691627d5878ea"
+        },
+        "prefill/upper_compile.py": {
+          "before_sha256": "f259177a344318c1a2ac2347b452f7af4e03fece93e5b95c85f968176babbdd7",
+          "after_sha256": "4234e5f50d523cd53623b644e37697c797631062dfa7d6b0e6c6d61db97e304f"
+        },
+        "prefill/weighted_heads.py": {
+          "before_sha256": "e3f33c9a983ed1ee92098ab6b2913425bbc01473d8e862119cf9ff52e2cb9bcf",
+          "after_sha256": "9ba1eb5a0a481d7e683a4442d548f36cdf82b6eb7ce5957483bf84b93a250829"
         }
       }
     }

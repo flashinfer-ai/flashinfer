@@ -1,6 +1,7 @@
 """Reference-style coarse histogram, exact crossing-bin refinement, radix fallback."""
 from .. import memory as indexer_memory
 from ..pdl import pdl_prologue
+from .short_domain import candidate_bounds
 import functools
 from .candidate_streaming import select_stream
 from .small_crossing import refine_quantized
@@ -36,8 +37,9 @@ def numeric_bucket(score,lower,inverse_span,bins:cutlass.Constexpr=1024):
 
 
 class Crossing:
-    def __init__(self,k,dtype,shift=15,qblock=2,precounted=False,wide_cache=False,compact=False,packed=False,pro_short=False,exact_ties=False,glm_short=False,glm_mid_bins=False, pdl=False):
+    def __init__(self,k,dtype,shift=15,qblock=2,precounted=False,wide_cache=False,compact=False,packed=False,pro_short=False,exact_ties=False,glm_short=False,glm_mid_bins=False, pdl=False, exhaustive=False, candidate_cols=0):
         self.pdl = bool(pdl)
+        self.exhaustive = exhaustive
         self.k,self.dtype,self.shift=k,dtype,shift
         self.packed=packed
         self.exact_ties=exact_ties
@@ -46,16 +48,33 @@ class Crossing:
         self.barrier_id=0 if qblock>4 or compact else 13
         self.precounted=precounted
         self.threads=256 if (qblock>4 or compact) and (k==512 or pro_short or glm_short) and not wide_cache else 512
+        # One warp per candidate bank; keep 512 bins and the same per-bank cache.
+        self.half_threads = compact and packed and qblock == 4 and k == 512 and not wide_cache
+        if self.half_threads: self.threads=128
         self.bins_per_thread=4 if glm_mid_bins and glm_short and self.threads==256 else 2
+        if self.half_threads: self.bins_per_thread=4
         self.bins=self.threads*self.bins_per_thread
         self.bank_threads=self.threads//4
         self.cache_items=16 if glm_short else 8
+        if self.half_threads: self.cache_items=16
         self.bank_cache=self.bank_threads*self.cache_items
+        # Use this geometry for arenas up to twice the shared cache size;
+        # larger arenas need more threads to limit global reloads.
+        self.ds_half = packed and qblock == 2 and k == 2048 and dtype == cutlass.BFloat16 and 0 < candidate_cols - 8 <= 2 * self.threads * self.cache_items
+        if self.ds_half:
+            self.barrier_id=0
+            self.threads=256
+            self.half_threads=True
+            self.bins_per_thread=2
+            self.bins=512
+            self.bank_threads=64
+            self.cache_items=16
+            self.bank_cache=1024
 
     @cute.jit
     def __call__(self,candidates,counts,starts,ends,out,thresholds,samples,recovery_queue,stream:cuda.CUstream):
         self.kernel(candidates,counts,starts,ends,out,thresholds,samples,recovery_queue).launch(
-            grid=(out.shape[0],1,1),block=(self.threads,1,1),stream=stream,min_blocks_per_mp=(6 if self.exact_ties and self.threads==256 else 2048//self.threads), use_pdl=self.pdl)
+            grid=(out.shape[0],1,1),block=(self.threads,1,1),stream=stream,min_blocks_per_mp=(6 if self.ds_half else 12 if self.half_threads else 6 if self.exact_ties and self.threads==256 else 2048//self.threads), use_pdl=self.pdl)
 
     @cute.kernel
     def kernel(self,candidates,counts,starts,ends,out,thresholds,samples,recovery_queue):
@@ -67,7 +86,7 @@ class Crossing:
                 task_row=row+lane
                 needs=False
                 if task_row<out.shape[0] and lane<self.qblock:
-                    needs=counts[task_row]<min(self.k,ends[task_row]-starts[task_row])
+                    needs=(ends[task_row]-starts[task_row]>self.k)&(counts[task_row]<self.k)
                 mask=cute.arch.vote_ballot_sync(needs)
                 if lane==0 and mask!=0:
                     position=cute.arch.atomic_add(recovery_queue.iterator.llvm_ptr,cutlass.Int32(1),sem='relaxed',scope='gpu')
@@ -76,17 +95,19 @@ class Crossing:
             if row%self.qblock==0 and tid<32:
                 task_row=row+lane//8
                 valid=(lane//8<self.qblock)&(task_row<out.shape[0])
-                amount=cutlass.Int32(0);required_row=cutlass.Int32(0)
+                amount=cutlass.Int32(0);required_row=cutlass.Int32(0);visible_row=cutlass.Int32(0)
                 if cutlass.const_expr(self.precounted):
                     if valid and lane%8==0:
                         amount=counts[task_row]
-                        required_row=min(self.k,ends[task_row]-starts[task_row])
+                        visible_row=ends[task_row]-starts[task_row]
+                        required_row=min(self.k,visible_row)
                 else:
                     if valid:
                         amount=cutlass.Int32(candidates[task_row,lane%8])
-                        required_row=min(self.k,ends[task_row]-starts[task_row])
+                        visible_row=ends[task_row]-starts[task_row]
+                        required_row=min(self.k,visible_row)
                     for step in cutlass.range_constexpr(3):amount+=cute.arch.shuffle_sync_bfly(amount,1<<step)
-                needs=valid&(lane%8==0)&(amount<required_row)
+                needs=valid&(lane%8==0)&(visible_row>self.k)&(amount<required_row)
                 mask=cute.arch.vote_ballot_sync(needs)
                 if lane==0 and mask!=0:
                     position=cute.arch.atomic_add(recovery_queue.iterator.llvm_ptr,cutlass.Int32(1),sem='relaxed',scope='gpu')
@@ -106,8 +127,13 @@ class Crossing:
                 counts[row]=total
             cute.arch.barrier(barrier_id=self.barrier_id,number_of_threads=self.threads)
         n=counts[row];required=min(self.k,ends[row]-starts[row])
-        if required==0:
-            for i in cutlass.range(tid,self.k,self.threads):out[row,i]=-1
+        if ends[row]-starts[row]<=self.k:
+            # Every visible key belongs to the result; scores and sampling are
+            # irrelevant. Output order is unspecified by the TopK contract.
+            for i in cutlass.range(tid,self.k,self.threads):
+                value=cutlass.Int32(-1)
+                if i<required:value=starts[row]+i
+                out[row,i]=value
         elif n>=required:
             bank=tid//self.bank_threads;local=tid%self.bank_threads
             bank_count=cutlass.Int32(candidates[row,bank])
@@ -169,12 +195,16 @@ class Crossing:
                     other=cute.arch.shuffle_sync_bfly(upper,1<<step)
                     upper=max(upper,other)
                 cute.arch.barrier(barrier_id=self.barrier_id,number_of_threads=self.threads)
+            if cutlass.const_expr(self.exhaustive):
+                threshold_value, upper = candidate_bounds(
+                    candidates, row, bank, local, bank_count, span, hist,
+                    self.dtype, self.packed, self.threads, self.bank_threads, self.barrier_id)
             span_value=upper-threshold_value;inverse_span=cutlass.Float32(-1.0)
             if (span_value>0.0)&(span_value<float('inf')):
                 # Bucket boundaries need only be monotone. Full score keys
                 # still determine the exact crossing-bin and fallback result.
                 # Keep normal reciprocal/multiply operands away from FTZ and
-                # overflow; exceptional spans retain the original division.
+                # overflow; exceptional spans use division.
                 if (span_value>=1.2037062152420224e-35)&(span_value<=8.307674973655724e34):
                     inverse_span=cutlass.Float32(self.bins-1)*cute.arch.rcp_approx(span_value)
                 else:
@@ -185,14 +215,19 @@ class Crossing:
             else:
                 hist[tid*2]=0;hist[tid*2+1]=0
             cute.arch.barrier(barrier_id=self.barrier_id,number_of_threads=self.threads)
-            prefix_meta=cute.make_rmem_tensor((self.cache_items,),cutlass.Uint32)
+            # Keep two 16-bit bucket IDs per register; indices stay in the shared candidate cache.
+            prefix_meta=cute.make_rmem_tensor((self.cache_items//2 if self.ds_half else self.cache_items,),cutlass.Uint32)
             for j in cutlass.range_constexpr(self.cache_items):
                 offset=j*self.bank_threads+local
-                prefix_meta[j]=cutlass.Uint32(0)
+                if cutlass.const_expr(self.ds_half):
+                    if cutlass.const_expr(j%2==0):prefix_meta[j//2]=cutlass.Uint32(0)
+                else:prefix_meta[j]=cutlass.Uint32(0)
                 if offset<bank_count:
                     entry=cached[bank*self.bank_cache+offset]
                     bucket=numeric_bucket(candidate_score(entry,self.dtype,self.packed),threshold_value,inverse_span,self.bins)
-                    prefix_meta[j]=(cutlass.Uint32(bucket)<<20)|cutlass.Uint32(candidate_index(entry,self.packed))
+                    if cutlass.const_expr(self.ds_half):
+                        prefix_meta[j//2]=prefix_meta[j//2]|(cutlass.Uint32(bucket)<<((j%2)*16))
+                    else:prefix_meta[j]=(cutlass.Uint32(bucket)<<20)|cutlass.Uint32(candidate_index(entry,self.packed))
                     cute.arch.atomic_add((hist.iterator+bucket).llvm_ptr,cutlass.Int32(1),sem='relaxed',scope='cta')
             entry_buffer=cute.make_rmem_tensor((4,),self.entry_type)
             for base in cutlass.range(self.bank_cache,bank_count,self.bank_threads*4):
@@ -211,32 +246,71 @@ class Crossing:
                         cute.arch.atomic_add((hist.iterator+bucket).llvm_ptr,cutlass.Int32(1),sem='relaxed',scope='cta')
             cute.arch.barrier(barrier_id=self.barrier_id,number_of_threads=self.threads)
             if cutlass.const_expr(self.bins_per_thread==4):
-                bin_counts=cute.make_rmem_tensor((self.bins_per_thread,),cutlass.Int32)
-                count=cutlass.Int32(0)
-                for j in cutlass.range_constexpr(self.bins_per_thread):
-                    bin_counts[j]=hist[tid*self.bins_per_thread+j]
-                    count+=bin_counts[j]
-                prefix=count
-                for step in cutlass.range_constexpr(5):
-                    delta=1<<step
-                    other=cute.arch.shuffle_sync_up(prefix,delta,mask=-1,mask_and_clamp=0)
-                    if lane>=delta:prefix+=other
-                # Slots1312..1327 are disjoint from bucket counts, ck/ci and state.
-                # One CTA barrier publishes all sixteen warp totals and completes
-                # every original histogram read before in-place prefix writes.
-                if lane==31:hist[1312+warp]=prefix
-                cute.arch.barrier(barrier_id=self.barrier_id,number_of_threads=self.threads)
-                prior=cutlass.Int32(0)
-                if lane<warp:prior=hist[1312+lane]
-                prior=cute.arch.warp_redux_sync(prior,'add')
-                cumulative=prior+prefix
-                bin_prefix=cumulative-count
-                for j in cutlass.range_constexpr(self.bins_per_thread):
-                    hist[tid*self.bins_per_thread+j]=bin_prefix
-                    next_prefix=bin_prefix+bin_counts[j]
-                    if (next_prefix>=required)&(bin_prefix<required):
-                        state[0]=tid*self.bins_per_thread+j;state[1]=bin_prefix;state[2]=bin_counts[j]
-                    bin_prefix=next_prefix
+                if cutlass.const_expr(self.half_threads):
+                    count=cutlass.Int32(0)
+                    for j in cutlass.range_constexpr(self.bins_per_thread):
+                        count+=hist[tid*self.bins_per_thread+j]
+                    prefix=count
+                    for step in cutlass.range_constexpr(5):
+                        delta=1<<step
+                        other=cute.arch.shuffle_sync_up(prefix,delta,mask=-1,mask_and_clamp=0)
+                        if lane>=delta:prefix+=other
+                    # Slots1312..1327 are disjoint from bucket counts, ck/ci and state.
+                    # One CTA barrier publishes all sixteen warp totals and completes
+                    # every original histogram read before in-place prefix writes.
+                    if lane==31:hist[1312+warp]=prefix
+                    cute.arch.barrier(barrier_id=self.barrier_id,number_of_threads=self.threads)
+                    prior=cutlass.Int32(0)
+                    if lane<warp:prior=hist[1312+lane]
+                    prior=cute.arch.warp_redux_sync(prior,'add')
+                    cumulative=prior+prefix
+                    bin_prefix=cumulative-count
+                    for j in cutlass.range_constexpr(self.bins_per_thread):
+                        # Re-read after the scan barrier to avoid keeping four counts live.
+                        # Each thread exclusively owns these four histogram slots.
+                        bin_count=hist[tid*self.bins_per_thread+j]
+                        hist[tid*self.bins_per_thread+j]=bin_prefix
+                        next_prefix=bin_prefix+bin_count
+                        if (next_prefix>=required)&(bin_prefix<required):
+                            state[0]=tid*self.bins_per_thread+j;state[1]=bin_prefix;state[2]=bin_count
+                            if cutlass.const_expr(self.qblock==2 and self.dtype==cutlass.BFloat16 and self.k==2048 and not self.exact_ties):
+                                proof=False
+                                if (bin_count>32)&(bin_count!=required-(bin_prefix)):
+                                    proof=uniform_half_bucket(tid*self.bins_per_thread+j,threshold_value,inverse_span,self.bins,self.dtype)
+                                state[4]=cutlass.Int32(proof)
+                        bin_prefix=next_prefix
+                else:
+                    bin_counts=cute.make_rmem_tensor((self.bins_per_thread,),cutlass.Int32)
+                    count=cutlass.Int32(0)
+                    for j in cutlass.range_constexpr(self.bins_per_thread):
+                        bin_counts[j]=hist[tid*self.bins_per_thread+j]
+                        count+=bin_counts[j]
+                    prefix=count
+                    for step in cutlass.range_constexpr(5):
+                        delta=1<<step
+                        other=cute.arch.shuffle_sync_up(prefix,delta,mask=-1,mask_and_clamp=0)
+                        if lane>=delta:prefix+=other
+                    # Slots1312..1327 are disjoint from bucket counts, ck/ci and state.
+                    # One CTA barrier publishes all sixteen warp totals and completes
+                    # every original histogram read before in-place prefix writes.
+                    if lane==31:hist[1312+warp]=prefix
+                    cute.arch.barrier(barrier_id=self.barrier_id,number_of_threads=self.threads)
+                    prior=cutlass.Int32(0)
+                    if lane<warp:prior=hist[1312+lane]
+                    prior=cute.arch.warp_redux_sync(prior,'add')
+                    cumulative=prior+prefix
+                    bin_prefix=cumulative-count
+                    for j in cutlass.range_constexpr(self.bins_per_thread):
+                        hist[tid*self.bins_per_thread+j]=bin_prefix
+                        next_prefix=bin_prefix+bin_counts[j]
+                        if (next_prefix>=required)&(bin_prefix<required):
+                            state[0]=tid*self.bins_per_thread+j;state[1]=bin_prefix;state[2]=bin_counts[j]
+                            if cutlass.const_expr(self.qblock==2 and self.dtype==cutlass.BFloat16 and self.k==2048 and not self.exact_ties):
+                                proof=False
+                                if (bin_counts[j]>32)&(bin_counts[j]!=required-(bin_prefix)):
+                                    proof=uniform_half_bucket(tid*self.bins_per_thread+j,threshold_value,inverse_span,self.bins,self.dtype)
+                                state[4]=cutlass.Int32(proof)
+                        bin_prefix=next_prefix
             else:
                 count0=hist[tid*2];count1=hist[tid*2+1]
                 count=count0+count1;prefix=count
@@ -257,16 +331,29 @@ class Crossing:
                 hist[tid*2+1]=cumulative-count1
                 if (cumulative-count1>=required)&(cumulative-count<required):
                     state[0]=tid*2;state[1]=cumulative-count;state[2]=count0
+                    if cutlass.const_expr(self.qblock==2 and self.dtype==cutlass.BFloat16 and self.k==2048 and not self.exact_ties):
+                        proof=False
+                        if (count0>32)&(count0!=required-(cumulative-count)):
+                            proof=uniform_half_bucket(tid*2,threshold_value,inverse_span,self.bins,self.dtype)
+                        state[4]=cutlass.Int32(proof)
                 if (cumulative>=required)&(cumulative-count1<required):
                     state[0]=tid*2+1;state[1]=cumulative-count1;state[2]=count1
+                    if cutlass.const_expr(self.qblock==2 and self.dtype==cutlass.BFloat16 and self.k==2048 and not self.exact_ties):
+                        proof=False
+                        if (count1>32)&(count1!=required-(cumulative-count1)):
+                            proof=uniform_half_bucket(tid*2+1,threshold_value,inverse_span,self.bins,self.dtype)
+                        state[4]=cutlass.Int32(proof)
             if tid==0:state[3]=0
             cute.arch.barrier(barrier_id=self.barrier_id,number_of_threads=self.threads)
             crossing=state[0];above=state[1];m=state[2]
             need=required-above;whole=m==need
             uniform_boundary=False
             if cutlass.const_expr(self.dtype==cutlass.BFloat16 and self.k==2048 and not self.exact_ties):
-                if (m>32)&(not whole):
-                    uniform_boundary=uniform_half_bucket(crossing,threshold_value,inverse_span,self.bins,self.dtype)
+                if cutlass.const_expr(self.qblock==2):
+                    uniform_boundary=state[4]!=0
+                else:
+                    if (m>32)&(not whole):
+                        uniform_boundary=uniform_half_bucket(crossing,threshold_value,inverse_span,self.bins,self.dtype)
             if cutlass.const_expr(self.exact_ties):
                 if (m>32)&(not whole):
                     uniform_boundary=uniform_half_bucket(crossing,threshold_value,inverse_span,self.bins,self.dtype)
@@ -275,7 +362,9 @@ class Crossing:
                     for j in cutlass.range_constexpr(self.cache_items):
                         offset=j*self.bank_threads+local
                         if offset<bank_count:
-                            if cutlass.Int32(prefix_meta[j]>>20)==crossing:
+                            if cutlass.const_expr(self.ds_half):bucket=cutlass.Int32((prefix_meta[j//2]>>((j%2)*16))&cutlass.Uint32(65535))
+                            else:bucket=cutlass.Int32(prefix_meta[j]>>20)
+                            if bucket==crossing:
                                 entry=cached[bank*self.bank_cache+offset]
                                 key=score_key(candidate_score(entry,self.dtype,self.packed))
                                 lo=min(lo,key);hi=max(hi,key)
@@ -298,9 +387,14 @@ class Crossing:
                 for j in cutlass.range_constexpr(self.cache_items):
                     offset=j*self.bank_threads+local
                     if offset<bank_count:
-                        meta=prefix_meta[j]
-                        index=cutlass.Int32(meta&cutlass.Uint32(0xFFFFF))
-                        bucket=cutlass.Int32(meta>>20)
+                        if cutlass.const_expr(self.ds_half):
+                            meta_entry=cached[bank*self.bank_cache+offset]
+                            index=candidate_index(meta_entry,self.packed)
+                            bucket=cutlass.Int32((prefix_meta[j//2]>>((j%2)*16))&cutlass.Uint32(65535))
+                        else:
+                            meta=prefix_meta[j]
+                            index=cutlass.Int32(meta&cutlass.Uint32(0xFFFFF))
+                            bucket=cutlass.Int32(meta>>20)
                         if (bucket<crossing)|(whole&(bucket==crossing)):
                             pos=cute.arch.atomic_add((hist.iterator+bucket).llvm_ptr,cutlass.Int32(1),sem='relaxed',scope='cta')
                             staged[pos]=index
@@ -367,7 +461,7 @@ class Crossing:
 
 
 @functools.cache
-def compile_selector(k,dtype,shift,signature,qblock=2,precounted=False,wide_cache=False,compact=False,pro_short=False,exact_ties=False,glm_short=False,glm_mid_bins=False, pdl=False):
+def compile_selector(k,dtype,shift,signature,qblock=2,precounted=False,wide_cache=False,compact=False,pro_short=False,exact_ties=False,glm_short=False,glm_mid_bins=False, pdl=False, exhaustive=False, candidate_cols=0):
     tensors=[]
     for i,(d,ndim) in enumerate(signature):
         dims=tuple(cute.sym_int() for _ in range(ndim))
@@ -376,5 +470,5 @@ def compile_selector(k,dtype,shift,signature,qblock=2,precounted=False,wide_cach
         else:
             t=cute.runtime.make_fake_compact_tensor(DTYPES[d],dims,stride_order=tuple(reversed(range(ndim))),assumed_align=16)
         tensors.append(t)
-    return cute.compile(Crossing(k,dtype,shift,qblock,precounted,wide_cache,compact,DTYPES[signature[0][0]]==cutlass.Int32,pro_short,exact_ties,glm_short,glm_mid_bins, pdl=pdl),*tensors,
+    return cute.compile(Crossing(k,dtype,shift,qblock,precounted,wide_cache,compact,DTYPES[signature[0][0]]==cutlass.Int32,pro_short,exact_ties,glm_short,glm_mid_bins, pdl=pdl, exhaustive=exhaustive, candidate_cols=candidate_cols),*tensors,
                         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),options='--enable-tvm-ffi')

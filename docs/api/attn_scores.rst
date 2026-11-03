@@ -109,3 +109,45 @@ internal scheduling policy for that configuration, so the returned tensor
   min_block_table_width
   padded_seq_len
   precompile_paged_mqa_logits
+
+Selective v2 block-scaled FP8 prefill
+-----------------------------------
+
+The continuous-K ``FP8MQATopKWrapper(backend="v2", qkv_dtype="mxfp8")``
+accepts E4M3FN ``q[R,H,128]`` and ``k[N,128]`` with one UE8M0 scale per 32
+values. Pass ``q_scale`` as ``int32[R,H]`` or ``uint8[R,H,4]`` and ``k_scale``
+as ``uint8[N,4]``. Each int32 packs four consecutive scale bytes. Physical K
+storage must contain a multiple of 256 rows; ``plan`` describes the live
+causal extent. Supported heads are 4, 32 and 64, with D128 and one request.
+
+These buffers can be produced directly by DeepGEMM's
+``per_token_cast_to_fp8(..., use_ue8m0=True, gran_k=32,
+use_packed_ue8m0=True)``. A comparison should quantize once outside both
+measurements and pass the same tensors and scale bytes to both operators.
+The legacy ``qkv_dtype="fp8"`` format has an FP32 per-token K scale and no Q
+scale; it is a different numerical contract.
+
+MXFP8 supports FP32, FP16 and BF16 logits storage. The default uses FP32
+head accumulation. H4, H32 and H64 also accept explicit ``math_mode="native_bf16"``
+or ``"native_fp16"`` with the corresponding logits dtype. Only the native
+BF16 contract matches the SM100 DeepGEMM BF16 head arithmetic. FP16/BF16
+output storage alone does not change accumulation precision. MXFP8 always
+uses the general ReLU path; FP4 integer shortcuts do not apply.
+
+The four selective stages retain sampling, threshold filtering, candidate
+selection and exact recovery. K2 writes retained candidates, rather than the
+full logits matrix. Use ``benchmarks/bench_real_input_data.py`` with
+``--qkv fp8 --fp8-quantization deepgemm --scope api --staged-inputs`` and
+``--arms v2 deepgemm deepgemm_prepared --gvr-root <GVR-directory>`` to share
+quantized inputs. Select matching accumulation and logits dtypes before
+reporting a speed comparison.
+
+Backend v2 accepts ``weights_dtype=torch.bfloat16`` in addition to the
+default ``torch.float32`` for all supported QK and logits dtypes. Pass
+weights with the declared dtype to every run. BF16 weights may use padded
+rows with contiguous heads, so DeepGEMM's H4 weights with row stride eight
+can be shared directly. Staging retains BF16 storage; native BF16 kernels
+load adjacent weights as packed pairs and reuse them in the epilogue.
+Weights storage and head accumulation are independent: select
+``math_mode="native_bf16"`` explicitly to match DeepGEMM's arithmetic.
+Backend v1 still requires FP32 weights.

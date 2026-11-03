@@ -235,6 +235,32 @@ def test_v2_unsupported_contract(kwargs, match):
         FP8MQATopKWrapper(**settings)
 
 
+@pytest.mark.parametrize(
+    "name,config",
+    [
+        ("DS-V3.2", (64, 128, 2048, 1)),
+        ("DS-V4-Flash", (64, 128, 512, 4)),
+        ("DS-V4-Pro", (64, 128, 1024, 4)),
+        ("GLM-5.3-Flash", (32, 128, 512, 4)),
+        ("GLM-5.3", (32, 128, 2048, 1)),
+        ("Qwen3.8-Flash-Next", (4, 128, 512, 4)),
+    ],
+)
+def test_v2_automatic_model_config(name, config):
+    from flashinfer.experimental.attn_scores.indexer_config import resolve_model_config
+
+    assert resolve_model_config(*config) == name
+    assert resolve_model_config(*config, model_config=name) == name
+    with pytest.raises(ValueError, match="compression_ratio"):
+        resolve_model_config(*config[:3], 2, model_config=name)
+
+
+def test_v2_uncompressed_h4_keeps_general_weights_contract():
+    from flashinfer.experimental.attn_scores.indexer_config import resolve_model_config
+
+    assert resolve_model_config(4, 128, 512, 1) is None
+
+
 def _blackwell():
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
         (10, 0),
@@ -549,7 +575,8 @@ def test_v2_fast_contract_changes_fail_closed(encoding):
         assert torch.all(result >= 0)
 
 
-def test_v2_qwen_contract_changes_fail_closed():
+@pytest.mark.parametrize("named", [False, True])
+def test_v2_qwen_contract_changes_fail_closed(named):
     _blackwell()
     rows, keys, heads = 64, 8192, 4
     q = torch.ones((rows, heads, 128), device="cuda", dtype=torch.float8_e4m3fn)
@@ -557,16 +584,17 @@ def test_v2_qwen_contract_changes_fail_closed():
     weights = torch.full((rows, heads), 128**-0.5, device="cuda")
     scales = torch.ones(keys, device="cuda")
     qo = torch.tensor([0, rows], device="cuda", dtype=torch.int32)
-    kv = torch.tensor([0, keys], device="cuda", dtype=torch.int32)
+    kv = torch.tensor([0, keys * 4], device="cuda", dtype=torch.int32)
     op = FP8MQATopKWrapper(
         backend="v2",
         num_heads=heads,
-        max_context_length=keys,
+        max_context_length=keys * 4,
+        compression_ratio=4,
         max_chunk_size=rows,
         max_batch_size=1,
         device="cuda",
         num_keys=k.shape[0],
-        model_config="Qwen3.8-Flash-Next",
+        model_config="Qwen3.8-Flash-Next" if named else None,
     )
     op.plan(qo, kv)
     op.run(q, weights, k, k_scale=scales)
@@ -921,7 +949,8 @@ def _check_v2_capacity_padding(
             .squeeze(-1)
         )
         reference_q = query * 8
-    weights = torch.full((rows, heads), 1 / heads, device="cuda")
+    weight = 128**-0.5 if (heads, top_k, ratio) == (4, 512, 4) else 1 / heads
+    weights = torch.full((rows, heads), weight, device="cuda")
     qo = torch.tensor([0, rows], device="cuda", dtype=torch.int32)
     kv = torch.tensor([0, keys * ratio], device="cuda", dtype=torch.int32)
     model = ("DS-V4-Flash" if top_k == 512 else "DS-V4-Pro") if preset else None
@@ -961,11 +990,11 @@ def _check_v2_capacity_padding(
     old_tf32 = torch.backends.cuda.matmul.allow_tf32
     torch.backends.cuda.matmul.allow_tf32 = False
     try:
-        # Every head has identical Q and weight 1/H, so the independent FP32
-        # weighted ReLU reference equals this one-head dot product exactly.
+        # Every head has identical Q and a common weight, so the independent
+        # FP32 reference is the one-head dot product times heads * weight.
         for first in range(0, rows, 32):
             stop = min(first + 32, rows)
-            scores = reference_q[first:stop] @ bits.T
+            scores = (reference_q[first:stop] @ bits.T) * (heads * weight)
             scores.masked_fill_(positions[None] >= ends[first:stop, None], -torch.inf)
             indices = selected[first:stop].long()
             assert bool(((indices >= 0) & (indices < ends[first:stop, None])).all())

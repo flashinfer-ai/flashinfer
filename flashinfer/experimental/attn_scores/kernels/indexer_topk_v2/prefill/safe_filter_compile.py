@@ -1,14 +1,28 @@
 import functools,torch,cutlass,cutlass.cute as cute
 from ..api import DTYPES
 @functools.cache
-def compile_filter(qkv,k,cap,dtype,sms,signature,safe,epi=8,full_q_blocks=False,heads=64,small_head_large_kv=False,dense_candidates=False,qsa_weights=0,qsa_unit_scale=False,offsets32=False,glm_kv_parts=1,glm_mid_kv=False,dsv4=False,aligned_k=False,glm_integer_period=0,dsv32_short=False,glm_short_tile=False,glm_dual_kv=False,glm_prepare_sf=False,packed_store_enabled=False,glm_mx_tiny=False,q8192_flash_epi=False,q8192_glm_dual_kv=False,q8192_pair_queries=False, pdl=False):
+def compile_filter(qkv,k,cap,dtype,sms,signature,safe,epi=8,full_q_blocks=False,heads=64,small_head_large_kv=False,dense_candidates=False,qsa_weights=0,qsa_unit_scale=False,offsets32=False,glm_kv_parts=1,glm_mid_kv=False,dsv4=False,aligned_k=False,glm_integer_period=0,dsv32_short=False,glm_short_tile=False,glm_dual_kv=False,glm_prepare_sf=False,packed_store_enabled=False,glm_mx_tiny=False,q8192_flash_epi=False,q8192_glm_dual_kv=False,q8192_pair_queries=False, pdl=False, native_bf16=False, native_fp16=False, shared_kv_queries=False, shared_fp8_queries=False):
+ block_fp8 = qkv == 'mxfp8'
+ if block_fp8:qkv = 'mxfp4'
+ if native_bf16 and native_fp16:raise ValueError('native modes are mutually exclusive')
+ if native_fp16 and (qkv not in ('fp8','mxfp4') or heads not in (4,32,64) or dtype!=cutlass.Float16 or safe):raise ValueError('native_fp16 requires H4/H32/H64 FP8 or MXFP4 inputs and FP16 logits with strict sampler')
+ if native_bf16 and (qkv not in ('fp8','mxfp4') or heads not in (4,32,64) or dtype!=cutlass.BFloat16 or safe):raise ValueError('native_bf16 requires H4/H32/H64 FP8 or MXFP4 inputs and BF16 logits with strict sampler')
+ if shared_kv_queries and not (qkv=='mxfp4' and heads==64 and (native_bf16 or native_fp16)):
+  raise ValueError('shared KV query pairs require H64 native MXFP4')
+ if shared_fp8_queries:
+  if not (qkv=='fp8' and heads==64 and native_fp16 and dtype==cutlass.Float16 and not safe):
+   raise ValueError('shared FP8 query pairs require H64 native_fp16')
+  from .fp8_shared_kv_safe_filter import compile_shared_filter
+  return compile_shared_filter(k,cap,sms,signature,pdl)
  if qkv=='mxfp4':
-  if glm_mx_tiny:from .fp4_glm_fulltile_filter import FP4PrefillMQALogitsKernel as GEMM
+  if block_fp8 or ((native_bf16 or native_fp16) and heads in (4,32)):from .fp4_safe_filter import FP4PrefillMQALogitsKernel as GEMM
+  elif shared_kv_queries:from .fp4_shared_kv_safe_filter import FP4PrefillMQALogitsKernel as GEMM
+  elif glm_mx_tiny:from .fp4_glm_fulltile_filter import FP4PrefillMQALogitsKernel as GEMM
   elif heads==32 and k==512 and glm_short_tile:from .fp4_glm_fulltile_filter import FP4PrefillMQALogitsKernel as GEMM
   else:from .fp4_safe_filter import FP4PrefillMQALogitsKernel as GEMM
   tune=dict(use_batched_store=False,num_umma_stages=1,num_kv_stages=4,max_w_in_reg=64,num_epi_subtiles=1,math_registers=112,store_registers=32)
  else:
-  if q8192_pair_queries:from .fp8_safe_filter import FP8PrefillMQALogitsKernel as GEMM
+  if q8192_pair_queries or ((native_bf16 or native_fp16) and heads in (4,32)):from .fp8_safe_filter import FP8PrefillMQALogitsKernel as GEMM
   elif heads==4 and DTYPES[signature[-2][0]]==cutlass.Int32:from .fp8_qwen_packed_filter import FP8PrefillMQALogitsKernel as GEMM
   elif heads==32 and k==2048 and dense_candidates and glm_short_tile:from .fp8_glmfull_fulltile_filter import FP8PrefillMQALogitsKernel as GEMM
   elif heads==32 and k==512 and dense_candidates and not glm_short_tile and dtype in (cutlass.Float16,cutlass.BFloat16):from .fp8_glm_mid_loop_filter import FP8PrefillMQALogitsKernel as GEMM
@@ -46,6 +60,21 @@ def compile_filter(qkv,k,cap,dtype,sms,signature,safe,epi=8,full_q_blocks=False,
  if q8192_flash_epi:attrs.update(num_epi_subtiles=4)
  if q8192_glm_dual_kv:attrs.update(num_q_stages=2)
  if q8192_pair_queries:attrs.update(glm_pair_queries=True,q_stage_override=1,num_epi_subtiles=4,dsv4_aligned_k=True)
+ if (native_bf16 or native_fp16) and heads in (4,32):
+  attrs.pop('glm_full_tiles',None)
+  attrs.update(weights_prepared=False,glm_pair_queries=False) if qkv=='fp8' else attrs.update(weights_prepared=False)
+  if heads==4:attrs.update(num_epi_subtiles=1)
+ # Native BF16 accepts NaN scores conservatively; K3/K4 retain exact recovery.
+ if native_bf16:attrs.update(native_bf16=True,dsv4_unordered=True)
+ if native_fp16:attrs.update(native_fp16=True,dsv4_unordered=True)
+ if block_fp8:attrs.update(input_dtype=cutlass.Float8E4M3FN,dsv4_integer_period=0,dsv4_integer_offset=0,dsv4_finite_integer=False)
+ weight_dtype = DTYPES[signature[4 if qkv=="mxfp4" else 3][0]]
+ if weight_dtype == cutlass.BFloat16:
+  if qkv=="fp8":
+   from .fp8_safe_filter import FP8PrefillMQALogitsKernel as GEMM
+   attrs.pop("glm_full_tiles",None)
+  elif not shared_kv_queries or block_fp8:from .fp4_safe_filter import FP4PrefillMQALogitsKernel as GEMM
+  attrs["weight_dtype"] = weight_dtype
  tensors=[]
  for i,(d,shape) in enumerate(signature):
   dims=tuple(cute.sym_int() if x<0 else x for x in shape);order=tuple(reversed(range(len(shape))))
@@ -53,4 +82,4 @@ def compile_filter(qkv,k,cap,dtype,sms,signature,safe,epi=8,full_q_blocks=False,
   if i in(len(signature)-7,len(signature)-2):t=cute.runtime.make_fake_tensor(DTYPES[d],dims,stride=((shape[1] if heads in (4,32) and i==len(signature)-2 else cute.sym_int64()),1),assumed_align=16)
   else:t=cute.runtime.make_fake_compact_tensor(DTYPES[d],dims,stride_order=order,assumed_align=16)
   tensors.append(t)
- return cute.compile(GEMM(**attrs),*tensors,cutlass.Int32(1),cutlass.Int32(1),cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),options='--enable-tvm-ffi'+(' --ptxas-options=--maxrregcount=96' if qkv=='fp8' and heads!=32 else ''))
+ return cute.compile(GEMM(**attrs),*tensors,cutlass.Int32(1),cutlass.Int32(1),cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),options='--enable-tvm-ffi'+(' --ptxas-options=--maxrregcount=96' if qkv=='fp8' and heads!=32 and not (native_bf16 or native_fp16) else ''))

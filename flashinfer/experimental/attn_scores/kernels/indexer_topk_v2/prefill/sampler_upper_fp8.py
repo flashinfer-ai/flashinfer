@@ -91,6 +91,7 @@ class FP8PrefillMQALogitsKernel:
         max_umma_pipeline: bool = False,
         num_epi_subtiles: int = 1,
         epi_dtype=cutlass.Float32,
+        weight_dtype=cutlass.Float32,
         acc_dtype=cutlass.Float32,
         output_dtype=cutlass.Float32,
         use_relu_trick: bool = False,
@@ -118,8 +119,15 @@ class FP8PrefillMQALogitsKernel:
         sample_shared: bool = False,
         glm_short_quantile: bool = False,
         pdl: bool = False,
+        native_bf16: bool = False,
+        native_fp16: bool = False,
     ):
         self.pdl = bool(pdl)
+        # Match native K2/K4 head math without changing the sampled positions.
+        self.native_lowp = bool(native_bf16 or native_fp16)
+        assert not (native_bf16 and native_fp16)
+        assert not native_fp16 or output_dtype == cutlass.Float16
+        assert not self.native_lowp or (num_heads in (4, 32, 64) and output_dtype == (cutlass.Float16 if native_fp16 else cutlass.BFloat16) and not use_relu_trick)
         if (acc_dtype, epi_dtype) not in (
             (cutlass.Float32, cutlass.Float32),
             (cutlass.Float32, cutlass.Float16),
@@ -173,12 +181,14 @@ class FP8PrefillMQALogitsKernel:
         self.smem_subpartition_opt = smem_subpartition_opt
         self.num_epi_subtiles = num_epi_subtiles
         self.epi_dtype = epi_dtype
+        self.weight_dtype = weight_dtype
+        self.weight_bytes = 2 if weight_dtype == cutlass.BFloat16 else 4
         # The optional ReLU identity (x+abs(x))/2 can overflow for x >= 2**127.
         # Enable it only when input scales and weights keep the intermediate finite.
         self.use_relu_trick = use_relu_trick
         self.epi_bytes = 2 if epi_dtype == cutlass.Float16 else 4
-        w_stage_bytes = self.N * self.epi_bytes
-        self.w_stage_stride = ((w_stage_bytes + 127) // 128 * 128) // self.epi_bytes
+        w_stage_bytes = self.N * self.weight_bytes
+        self.w_stage_stride = ((w_stage_bytes + 127) // 128 * 128) // self.weight_bytes
         self.output_dtype = output_dtype
         if num_epi_subtiles > 1 and num_heads % num_epi_subtiles != 0:
             raise ValueError("num_heads must be divisible by num_epi_subtiles")
@@ -211,7 +221,7 @@ class FP8PrefillMQALogitsKernel:
             SMEM_BUDGET = smem_capacity - 1024
             # KV+Scale per stage (×2 groups): 2 * (block_kv*head_dim + block_kv*4)
             kv_scale_per_stage = 2 * (block_kv * head_dim + block_kv * 4)
-            qw_per_stage = self.N * head_dim + self.w_stage_stride * self.epi_bytes
+            qw_per_stage = self.N * head_dim + self.w_stage_stride * self.weight_bytes
             qw_total = qw_per_stage * self.num_q_stages
             self.num_kv_stages = (SMEM_BUDGET - qw_total) // kv_scale_per_stage
         else:
@@ -383,7 +393,7 @@ class FP8PrefillMQALogitsKernel:
         )
 
         b_copy_size = cute.size_in_bytes(b_dtype, b_smem_layout)
-        w_copy_size = self.N * self.epi_bytes
+        w_copy_size = self.N * self.weight_bytes
         # Per KV block: block_kv * head_dim (KV) + block_kv * 4 (scales)
         self.num_kv_scale_tma_bytes = self.block_kv * self.head_dim + self.block_kv * 4
         self.num_q_tma_bytes = b_copy_size * atom_thr_size + w_copy_size
@@ -708,7 +718,7 @@ class FP8PrefillMQALogitsKernel:
         if cutlass.const_expr(self.smem_pad_bytes > 0):
             _ = smem.allocate(self.smem_pad_bytes)
         sW = smem.allocate_tensor(
-            element_type=self.epi_dtype,
+            element_type=self.weight_dtype,
             layout=w_smem_layout_staged,
             byte_alignment=128,
         )
@@ -1223,7 +1233,11 @@ class FP8PrefillMQALogitsKernel:
                         kv_cons_state_math_0.advance()
                         tAcc = tCtAcc_base_0[(None,None,None,umma_cons_state_0.index)][((None,None),0,0)]
                         tTR = thr_copy_ref.partition_S(cute.flat_divide(tAcc,epi_sub_mn))
-                        s_acc = cute.full((4,),0.0,dtype=cutlass.Float32)
+                        if cutlass.const_expr(self.native_lowp):
+                            s_acc=cute.make_rmem_tensor((2,),cutlass.Uint32)
+                            s_acc.fill(0)
+                        else:
+                            s_acc = cute.full((4,),0.0,dtype=cutlass.Float32)
                         for i in cutlass.range_constexpr(num_epi_subtiles):
                             cute.copy(tiled_copy_ref,tTR[(None,None,None,0,query_slot*num_epi_subtiles+i)],tTR_rAcc)
                             cute.arch.fence_view_async_tmem_load()
@@ -1232,23 +1246,37 @@ class FP8PrefillMQALogitsKernel:
                                 # are in registers. Reuse also protects staged SFA.
                                 umma_pipeline_0.consumer_release(umma_cons_state_0)
                                 umma_cons_state_0.advance()
-                            for h in cutlass.range_constexpr(0,64//num_epi_subtiles,4):
-                                x4 = _subview(tTR_rAcc,h,4)
-                                if cutlass.const_expr(self.use_relu_trick):
-                                    a4 = indexer_add_packed_f32x2(x4,abs(x4),rnd=_RND_RN)
-                                else:
-                                    a4 = cute.max(x4,zero4,propagate_nan=True)
-                                if cutlass.const_expr(i*(64//num_epi_subtiles)+h<0):
-                                    w4 = _subview(w_cache,i*(64//num_epi_subtiles)+h,4)
-                                else:
-                                    shared_w = cute.make_rmem_tensor((4,),cutlass.Float32)
-                                    for j in cutlass.range_constexpr(4):
-                                        w=sW[(query_slot*64+i*(64//num_epi_subtiles)+h+j,q_stage_local)]
-                                        if cutlass.const_expr(self.use_relu_trick and not self.weights_prepared):w=w*0.5
-                                        shared_w[j]=w
-                                    w4=shared_w.load()
-                                s_acc = indexer_fma_packed_f32x2(a4,w4,s_acc,rnd=_RND_RN)
-                        score = (s_acc[0]+s_acc[1]+s_acc[2]+s_acc[3])*scale_val
+                            if cutlass.const_expr(self.native_lowp):
+                                for h in cutlass.range_constexpr(0,64//num_epi_subtiles,4):
+                                    base_head=query_slot*64+i*(64//num_epi_subtiles)+h
+                                    a01=native_fp8_pack_relu(self.output_dtype,tTR_rAcc[h],tTR_rAcc[h+1])
+                                    a23=native_fp8_pack_relu(self.output_dtype,tTR_rAcc[h+2],tTR_rAcc[h+3])
+                                    w01=native_weight_pair(sW,base_head,q_stage_local,self.output_dtype,fp8=True)
+                                    w23=native_weight_pair(sW,base_head+2,q_stage_local,self.output_dtype,fp8=True)
+                                    s_acc[0]=native_fma(self.output_dtype,a01,w01,s_acc[0])
+                                    s_acc[1]=native_fma(self.output_dtype,a23,w23,s_acc[1])
+                            else:
+                                for h in cutlass.range_constexpr(0,64//num_epi_subtiles,4):
+                                    x4 = _subview(tTR_rAcc,h,4)
+                                    if cutlass.const_expr(self.use_relu_trick):
+                                        a4 = indexer_add_packed_f32x2(x4,abs(x4),rnd=_RND_RN)
+                                    else:
+                                        a4 = cute.max(x4,zero4,propagate_nan=True)
+                                    if cutlass.const_expr(i*(64//num_epi_subtiles)+h<0):
+                                        w4 = _subview(w_cache,i*(64//num_epi_subtiles)+h,4)
+                                    else:
+                                        shared_w = cute.make_rmem_tensor((4,),cutlass.Float32)
+                                        for j in cutlass.range_constexpr(4):
+                                            w=cutlass.Float32(sW[(query_slot*64+i*(64//num_epi_subtiles)+h+j,q_stage_local)])
+                                            if cutlass.const_expr(self.use_relu_trick and not self.weights_prepared):w=w*0.5
+                                            shared_w[j]=w
+                                        w4=shared_w.load()
+                                    s_acc = indexer_fma_packed_f32x2(a4,w4,s_acc,rnd=_RND_RN)
+                        if cutlass.const_expr(self.native_lowp):
+                            reduced=native_add(self.output_dtype,s_acc[0],s_acc[1])
+                            score=cutlass.Float32(self.output_dtype(native_lo(self.output_dtype,reduced)+native_hi(self.output_dtype,reduced)))*scale_val
+                        else:
+                            score = (s_acc[0]+s_acc[1]+s_acc[2]+s_acc[3])*scale_val
                         if outrow<num_q_tokens:
                             rounded=self.output_dtype(float('-inf'))
                             if (kv_pos>=kv_start)&(kv_pos<kv_end):rounded=self.output_dtype(score)
@@ -1263,8 +1291,8 @@ class FP8PrefillMQALogitsKernel:
                         rank=model_proposal_rank((max(1,num_kv_tokens) if cutlass.const_expr(self.pro_common_domain) else max(1,kv_end-kv_start)),samples,self.top_k,self.sample_sigma,self.num_heads,dsv4=self.dsv4)
                         if cutlass.const_expr(self.sample_rank_sigma>0):
                             rank=shape_margin_rank(max(1,kv_end-kv_start),samples,self.top_k,self.sample_rank_sigma)
-                        # Quantile is useful only when enough samples are expected
-                        # above it. Sparse tails retain the original maximum.
+                        # Use a quantile only when enough samples are expected above it;
+                        # sparse tails use the maximum.
                         high_rank=min(samples,max(1,self.top_k*samples//(2*(max(1,num_kv_tokens) if cutlass.const_expr(self.pro_common_domain) else max(1,kv_end-kv_start)))))
                         if high_rank<8:high_rank=cutlass.Int32(1)
                         propose_parallel(outrow,local_tidx,mLogits,hist,scalar,thresholds,samples,rank,cutlass.Int32(10)+query_slot,high_rank,candidates,ignore_padding=self.dsv4,extend_high=self.dsv4,narrow_range=(samples*self.top_k>=6*(max(1,num_kv_tokens) if cutlass.const_expr(self.pro_common_domain) else max(1,kv_end-kv_start))))
@@ -1319,15 +1347,15 @@ class FP8PrefillMQALogitsKernel:
                             outrow = q_block_idx * self.block_q + slot
                             token_idx = min(outrow,num_q_tokens-1)
                             if cutlass.const_expr(self.num_heads==32):
-                                head_acc=cute.full((4,),0.0,dtype=cutlass.Float32)
+                                head_acc=head_zero(self.output_dtype if self.native_lowp else None)
                                 for epi_i in cutlass.range_constexpr(num_epi_subtiles):
                                     cute.copy(tiled_copy_ref,tTR[(None,None,None,0,slot*num_epi_subtiles+epi_i)],tTR_rAcc)
                                     cute.arch.fence_view_async_tmem_load()
                                     if cutlass.const_expr(local_q==queries_per_wg-1 and epi_i==num_epi_subtiles-1):
                                         umma_pipeline_0.consumer_release(umma_cons_state_0)
                                         umma_cons_state_0.advance()
-                                    head_acc=weighted_heads_partial(tTR_rAcc,sW,slot,q_stage_local,epi_i*(32//num_epi_subtiles),32//num_epi_subtiles,32,head_acc,self.use_relu_trick)
-                                score=head_acc[0]+head_acc[1]+head_acc[2]+head_acc[3]
+                                    head_acc=weighted_heads_partial(tTR_rAcc,sW,slot,q_stage_local,epi_i*(32//num_epi_subtiles),32//num_epi_subtiles,32,head_acc,self.use_relu_trick,native_dtype=self.output_dtype if self.native_lowp else None,fp8=True)
+                                score=head_sum(head_acc,self.output_dtype if self.native_lowp else None)
                                 score=score*scale_val
                             else:
                                 cute.copy(tiled_copy_ref,tTR[(None,None,None,0,slot)],tTR_rAcc)
@@ -1345,8 +1373,11 @@ class FP8PrefillMQALogitsKernel:
                                     w = cutlass.Float32(0.0883883461356163) if cutlass.const_expr(self.qsa_weights==2) else sW[(slot*4+h,q_stage_local)]
                                     if cutlass.const_expr(self.use_relu_trick and not self.weights_prepared):w = w*0.5
                                     shared_w[h] = w
-                                acc4 = indexer_fma_packed_f32x2(a4,shared_w.load(),zero4,rnd=_RND_RN)
-                                score = (acc4[0]+acc4[1]+acc4[2]+acc4[3]) *scale_val
+                                if cutlass.const_expr(self.native_lowp):
+                                    score=head_sum(native_head_fma4(x4,shared_w.load(),head_zero(self.output_dtype),self.output_dtype,True),self.output_dtype) *scale_val
+                                else:
+                                    acc4 = indexer_fma_packed_f32x2(a4,shared_w.load(),zero4,rnd=_RND_RN)
+                                    score = (acc4[0]+acc4[1]+acc4[2]+acc4[3]) *scale_val
                             if outrow < num_q_tokens:
                                 kv_start = mCuSeqLenKStart[token_idx]
                                 kv_end = mCuSeqLenKEnd[token_idx]
@@ -1424,3 +1455,11 @@ from .policy_dsv4 import dsv4_cached_sample_key
 from .sample_rank_margin import shape_margin_rank
 
 from .sample_count_policy import shape_sample_key
+
+from .native_lowp_math import native_pack, native_pack_relu, native_fma, native_add, native_lo, native_hi
+
+from .native_lowp_math import native_fp8_pack, native_fp8_pack_relu
+
+from .native_heads import head_zero, head_sum, native_head_fma4
+
+from .native_heads import native_weight_pair

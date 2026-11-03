@@ -1103,10 +1103,9 @@ class FP8PrefillMQALogitsKernel:
                 while has_work:
                     q_block_idx = next_q_block_idx
                     num_kv = next_num_kv
-                    # Preserve the original live-tile bound. Empty ranges issue
-                    # one producer/MMA dummy; retire it before loading Q/weights
-                    # so its conditional state does not enter the scoring loop.
-                    # It needs no TMEM read or scale load.
+                    # Retire the empty-range producer/MMA tile before Q/weight loads
+                    # to keep its conditional state outside the scoring loop.
+                    # No TMEM read or scale load is needed.
                     kv_idx = _kv_lo_for_block(q_block_idx)
                     if kv_idx >= num_kv:
                         if cutlass.const_expr(self.num_heads == 64 and self.dsv4_direct_sync):
@@ -1323,10 +1322,9 @@ class FP8PrefillMQALogitsKernel:
                 while has_work:
                     q_block_idx = next_q_block_idx
                     num_kv = next_num_kv
-                    # Preserve the original live-tile bound. Empty ranges issue
-                    # one producer/MMA dummy; retire it before loading Q/weights
-                    # so its conditional state does not enter the scoring loop.
-                    # It needs no TMEM read or scale load.
+                    # Retire the empty-range producer/MMA tile before Q/weight loads
+                    # to keep its conditional state outside the scoring loop.
+                    # No TMEM read or scale load is needed.
                     kv_idx = _kv_lo_for_block(q_block_idx)
                     if kv_idx >= num_kv:
                         if cutlass.const_expr(self.num_heads == 64 and self.dsv4_direct_sync):

@@ -116,6 +116,7 @@ class FP4PrefillMQALogitsKernel:
         num_sms: int = 148,
         num_epi_subtiles: int = 1,
         epi_dtype=cutlass.Float32,
+        weight_dtype=cutlass.Float32,
         output_dtype=cutlass.Float32,
         remove_online_sf_transpose: bool = False,
         use_batched_store: bool = True,
@@ -136,9 +137,18 @@ class FP4PrefillMQALogitsKernel:
         store_registers: int = 168,
         persistent_sample: bool = True,
         pdl: bool = False,
+        native_bf16: bool = False,
+        native_fp16: bool = False,
+        input_dtype=cutlass.Float4E2M1FN,
     ):
         # Static FP4 invariants imposed by the TMEM and SMEM layouts below.
         self.pdl = bool(pdl)
+        assert input_dtype in (cutlass.Float4E2M1FN, cutlass.Float8E4M3FN)
+        self.input_dtype = input_dtype
+        self.native_lowp = bool(native_bf16 or native_fp16)
+        assert not (native_bf16 and native_fp16)
+        assert not native_fp16 or output_dtype == cutlass.Float16
+        assert not self.native_lowp or (num_heads in (4, 32, 64) and output_dtype == (cutlass.Float16 if native_fp16 else cutlass.BFloat16) and epi_dtype == cutlass.Float32 and not use_relu_trick)
         assert num_heads in (4, 32, 64), "prefill recovery supports H4/H64"
         assert head_dim == 128, "FP4 kernel hardcodes head_dim=128"
         assert epi_dtype in (
@@ -172,6 +182,8 @@ class FP4PrefillMQALogitsKernel:
         self.num_sms = num_sms
         self.num_epi_subtiles = num_epi_subtiles
         self.epi_dtype = epi_dtype
+        self.weight_dtype = weight_dtype
+        self.weight_bytes = 2 if weight_dtype == cutlass.BFloat16 else 4
         # When True, skip the in-kernel SMEM warp_transpose for KV SF; assume
         # the host has pre-arranged GMEM SF into UTCCP chunk layout (block_kv=128
         # = 1 UTCCP atom). Q SF transpose is NOT affected by this flag (deferred
@@ -196,8 +208,8 @@ class FP4PrefillMQALogitsKernel:
         # sW stage stride padded to 128-byte SMEM alignment for TMA bulk copy.
         # Without padding, e.g. fp16 + N=32 gives 64B per stage, so stage 1
         # at +64 would be misaligned (TMA requires 128-byte aligned SMEM dest).
-        w_stage_bytes = self.N * self.epi_bytes
-        self.w_stage_stride = ((w_stage_bytes + 127) // 128 * 128) // self.epi_bytes
+        w_stage_bytes = self.N * self.weight_bytes
+        self.w_stage_stride = ((w_stage_bytes + 127) // 128 * 128) // self.weight_bytes
         self.output_dtype = output_dtype
         if num_epi_subtiles > 1 and num_heads % num_epi_subtiles != 0:
             raise ValueError("num_heads must be divisible by num_epi_subtiles")
@@ -228,7 +240,7 @@ class FP4PrefillMQALogitsKernel:
         self.sf_dtype = cutlass.Float8E8M0FNU
         self.sf_vec_size = 32
         # MXF4 instruction K is 64.
-        self.umma_inst_k = 64
+        self.umma_inst_k = 64 if input_dtype == cutlass.Float4E2M1FN else 32
         self.cta_group = tcgen05.CtaGroup.ONE
         self.cluster_shape_mn = (1, 1)
         self.mma_tiler_mn = (block_kv, self.N)
@@ -418,15 +430,15 @@ class FP4PrefillMQALogitsKernel:
         num_kv_tokens: cutlass.Int32,
         stream: cuda.CUstream,
     ):
-        half_head_dim = self.head_dim // 2  # FP4 packed bytes per row
+        half_head_dim = self.head_dim * self.input_dtype.width // 8
 
         # Recast KV to FP4. Each uint8 byte becomes 2 FP4 elements,
         # so layout positions and the iterator scale accordingly.
-        kv_fp4 = cute.recast_tensor(kv, Float4E2M1FN)
+        kv_fp4 = cute.recast_tensor(kv, self.input_dtype)
 
         # Q (b) was passed as uint8 (FP4-packed bytes); recast to FP4 so MMA
         # type inference and TMA descriptors are correct.
-        b = cute.recast_tensor(b, Float4E2M1FN)
+        b = cute.recast_tensor(b, self.input_dtype)
 
         # KV data view: [block_kv, head_dim, num_kv_blocks] FP4 elements
         # (contiguous, no block_table indirection).
@@ -541,7 +553,7 @@ class FP4PrefillMQALogitsKernel:
         )
 
         b_copy_size = cute.size_in_bytes(b_dtype, b_smem_layout)
-        w_copy_size = self.N * self.epi_bytes
+        w_copy_size = self.N * self.weight_bytes
         # Per KV block (FP4):
         #   block_kv * (head_dim/2) bytes data + block_kv * 4 bytes SF
         self.num_kv_sf_tma_bytes = self.block_kv * half_head_dim + self.block_kv * 4
@@ -999,7 +1011,7 @@ class FP4PrefillMQALogitsKernel:
         )
         # Weights SMEM: [N, num_q_stages], shared Q barrier
         sW = smem.allocate_tensor(
-            element_type=self.epi_dtype,
+            element_type=self.weight_dtype,
             layout=w_smem_layout_staged,
             byte_alignment=128,
         )
@@ -1827,7 +1839,11 @@ class FP4PrefillMQALogitsKernel:
                             if cutlass.const_expr(self.epi_dtype != cutlass.Float32):
                                 ps = packed_zero
                             else:
-                                s_acc = cute.full((4,), 0.0, dtype=cutlass.Float32)
+                                if cutlass.const_expr(self.native_lowp):
+                                    s_acc=cute.make_rmem_tensor((2,),cutlass.Uint32)
+                                    s_acc.fill(0)
+                                else:
+                                    s_acc = cute.full((4,), 0.0, dtype=cutlass.Float32)
                                 if cutlass.const_expr(not self.use_relu_trick):
                                     zero4 = cute.full((4,), 0.0, dtype=cutlass.Float32)
                                 zero4 = cute.full((4,), 0.0, dtype=cutlass.Float32)
@@ -1858,68 +1874,84 @@ class FP4PrefillMQALogitsKernel:
                                 reg_h_end = min(
                                     subtile_n, max(0, NUM_W_IN_REG - i * subtile_n)
                                 )
-                                for h in cutlass.range_constexpr(0, reg_h_end, 4):
-                                    n0 = h
-                                    h_g = i * subtile_n + h
-                                    # packed path catches fp16 & bf16
-                                    if cutlass.const_expr(
-                                        self.epi_dtype != cutlass.Float32
-                                    ):
-                                        pa = _subview(tTR_rAcc, n0, 4).to(
-                                            self.epi_dtype
-                                        )
-                                        pa = cute.max(pa, packed_zero)
-                                        r0 = t * NUM_W_IN_REG + h_g
-                                        pw = _subview(w_cache, r0, 4)
-                                        ps = cute.fma(pa, pw, ps)
-                                    else:
-                                        if cutlass.const_expr(self.use_relu_trick):
-                                            # The doubled-ReLU path pairs with pre-halved register weights.
-                                            x4 = _subview(tTR_rAcc, n0, 4)
-                                            a4 = indexer_add_packed_f32x2(
-                                                x4, abs(x4), rnd=_RND_RN
+                                if cutlass.const_expr(self.native_lowp):
+                                    for h in cutlass.range_constexpr(0, reg_h_end, 4):
+                                        h_g=i*subtile_n+h
+                                        x4=_subview(tTR_rAcc,h,4)
+                                        w4=_subview(w_cache, t*NUM_W_IN_REG+h_g,4)
+                                        s_acc[0]=native_fma(self.output_dtype,native_pack_relu(self.output_dtype,x4[0],x4[1]),native_pack(self.output_dtype,w4[0],w4[1]),s_acc[0])
+                                        s_acc[1]=native_fma(self.output_dtype,native_pack_relu(self.output_dtype,x4[2],x4[3]),native_pack(self.output_dtype,w4[2],w4[3]),s_acc[1])
+                                else:
+                                    for h in cutlass.range_constexpr(0, reg_h_end, 4):
+                                        n0 = h
+                                        h_g = i * subtile_n + h
+                                        # packed path catches fp16 & bf16
+                                        if cutlass.const_expr(
+                                            self.epi_dtype != cutlass.Float32
+                                        ):
+                                            pa = _subview(tTR_rAcc, n0, 4).to(
+                                                self.epi_dtype
                                             )
+                                            pa = cute.max(pa, packed_zero)
+                                            r0 = t * NUM_W_IN_REG + h_g
+                                            pw = _subview(w_cache, r0, 4)
+                                            ps = cute.fma(pa, pw, ps)
                                         else:
+                                            if cutlass.const_expr(self.use_relu_trick):
+                                                # The doubled-ReLU path pairs with pre-halved register weights.
+                                                x4 = _subview(tTR_rAcc, n0, 4)
+                                                a4 = indexer_add_packed_f32x2(
+                                                    x4, abs(x4), rnd=_RND_RN
+                                                )
+                                            else:
+                                                a4 = cute.max(
+                                                    _subview(tTR_rAcc, n0, 4),
+                                                    zero4,
+                                                    propagate_nan=True,
+                                                )
+                                            r0 = t * NUM_W_IN_REG + h_g
+                                            w4 = _subview(w_cache, r0, 4)
+                                            s_acc = indexer_fma_packed_f32x2(
+                                                a4, w4, s_acc, rnd=_RND_RN
+                                            )
+                                # SMEM-path: weights from shared mem
+                                smem_h_start = max(0, NUM_W_IN_REG - i * subtile_n)
+                                if cutlass.const_expr(self.native_lowp):
+                                    for h in cutlass.range_constexpr(smem_h_start, subtile_n, 4):
+                                        h_g=i*subtile_n+h
+                                        x4=_subview(tTR_rAcc,h,4)
+                                        w4=_subview(sw_col, t*num_heads+h_g,4)
+                                        s_acc[0]=native_fma(self.output_dtype,native_pack_relu(self.output_dtype,x4[0],x4[1]),native_pack(self.output_dtype,w4[0],w4[1]),s_acc[0])
+                                        s_acc[1]=native_fma(self.output_dtype,native_pack_relu(self.output_dtype,x4[2],x4[3]),native_pack(self.output_dtype,w4[2],w4[3]),s_acc[1])
+                                else:
+                                    for h in cutlass.range_constexpr(
+                                        smem_h_start, subtile_n, 4
+                                    ):
+                                        n0 = h
+                                        h_g = i * subtile_n + h
+                                        # packed path catches fp16 & bf16
+                                        if cutlass.const_expr(
+                                            self.epi_dtype != cutlass.Float32
+                                        ):
+                                            pa = _subview(tTR_rAcc, n0, 4).to(
+                                                self.epi_dtype
+                                            )
+                                            pa = cute.max(pa, packed_zero)
+                                            w_i = t * num_heads + h_g
+                                            pw = _subview(sw_col, w_i, 4)
+                                            ps = cute.fma(pa, pw, ps)
+                                        else:
+                                            # Shared-memory weights use scalar max and remain unscaled.
                                             a4 = cute.max(
                                                 _subview(tTR_rAcc, n0, 4),
                                                 zero4,
                                                 propagate_nan=True,
                                             )
-                                        r0 = t * NUM_W_IN_REG + h_g
-                                        w4 = _subview(w_cache, r0, 4)
-                                        s_acc = indexer_fma_packed_f32x2(
-                                            a4, w4, s_acc, rnd=_RND_RN
-                                        )
-                                # SMEM-path: weights from shared mem
-                                smem_h_start = max(0, NUM_W_IN_REG - i * subtile_n)
-                                for h in cutlass.range_constexpr(
-                                    smem_h_start, subtile_n, 4
-                                ):
-                                    n0 = h
-                                    h_g = i * subtile_n + h
-                                    # packed path catches fp16 & bf16
-                                    if cutlass.const_expr(
-                                        self.epi_dtype != cutlass.Float32
-                                    ):
-                                        pa = _subview(tTR_rAcc, n0, 4).to(
-                                            self.epi_dtype
-                                        )
-                                        pa = cute.max(pa, packed_zero)
-                                        w_i = t * num_heads + h_g
-                                        pw = _subview(sw_col, w_i, 4)
-                                        ps = cute.fma(pa, pw, ps)
-                                    else:
-                                        # Shared-memory weights use scalar max and remain unscaled.
-                                        a4 = cute.max(
-                                            _subview(tTR_rAcc, n0, 4),
-                                            zero4,
-                                            propagate_nan=True,
-                                        )
-                                        w_i = t * num_heads + h_g
-                                        w4 = _subview(sw_col, w_i, 4)
-                                        s_acc = indexer_fma_packed_f32x2(
-                                            a4, w4, s_acc, rnd=_RND_RN
-                                        )
+                                            w_i = t * num_heads + h_g
+                                            w4 = _subview(sw_col, w_i, 4).to(cutlass.Float32)
+                                            s_acc = indexer_fma_packed_f32x2(
+                                                a4, w4, s_acc, rnd=_RND_RN
+                                            )
                             # result reduction — packed path catches both
                             if cutlass.const_expr(self.epi_dtype != cutlass.Float32):
                                 # Spelled out, not reduce(): the (S0+S2)+(S1+S3)
@@ -1930,7 +1962,11 @@ class FP4PrefillMQALogitsKernel:
                             else:
                                 # Preserve left-to-right accumulation. ReLU scaling is already folded
                                 # into the register weights; do not rescale the final sum.
-                                result_t = s_acc[0] + s_acc[1] + s_acc[2] + s_acc[3]
+                                if cutlass.const_expr(self.native_lowp):
+                                    reduced=native_add(self.output_dtype,s_acc[0],s_acc[1])
+                                    result_t=cutlass.Float32(self.output_dtype(native_lo(self.output_dtype,reduced)+native_hi(self.output_dtype,reduced)))
+                                else:
+                                    result_t = s_acc[0] + s_acc[1] + s_acc[2] + s_acc[3]
                             # drop * scale_val (FP4 SF baked into acc).
                             if cutlass.const_expr(self.mode == "filter"):
                                 outrow=q_block_idx*block_q_val+t
@@ -2152,7 +2188,11 @@ class FP4PrefillMQALogitsKernel:
                             if cutlass.const_expr(self.epi_dtype != cutlass.Float32):
                                 ps = packed_zero
                             else:
-                                s_acc = cute.full((4,), 0.0, dtype=cutlass.Float32)
+                                if cutlass.const_expr(self.native_lowp):
+                                    s_acc=cute.make_rmem_tensor((2,),cutlass.Uint32)
+                                    s_acc.fill(0)
+                                else:
+                                    s_acc = cute.full((4,), 0.0, dtype=cutlass.Float32)
                                 if cutlass.const_expr(not self.use_relu_trick):
                                     zero4 = cute.full((4,), 0.0, dtype=cutlass.Float32)
                                 zero4 = cute.full((4,), 0.0, dtype=cutlass.Float32)
@@ -2180,68 +2220,84 @@ class FP4PrefillMQALogitsKernel:
                                 reg_h_end = min(
                                     subtile_n, max(0, NUM_W_IN_REG - i * subtile_n)
                                 )
-                                for h in cutlass.range_constexpr(0, reg_h_end, 4):
-                                    n0 = h
-                                    h_g = i * subtile_n + h
-                                    # packed (fp16/bf16) vs fp32
-                                    if cutlass.const_expr(
-                                        self.epi_dtype != cutlass.Float32
-                                    ):
-                                        pa = _subview(tTR_rAcc, n0, 4).to(
-                                            self.epi_dtype
-                                        )
-                                        pa = cute.max(pa, packed_zero)
-                                        r0 = t * NUM_W_IN_REG + h_g
-                                        pw = _subview(w_cache, r0, 4)
-                                        ps = cute.fma(pa, pw, ps)
-                                    else:
-                                        if cutlass.const_expr(self.use_relu_trick):
-                                            # The doubled-ReLU path pairs with pre-halved register weights.
-                                            x4 = _subview(tTR_rAcc, n0, 4)
-                                            a4 = indexer_add_packed_f32x2(
-                                                x4, abs(x4), rnd=_RND_RN
+                                if cutlass.const_expr(self.native_lowp):
+                                    for h in cutlass.range_constexpr(0, reg_h_end, 4):
+                                        h_g=i*subtile_n+h
+                                        x4=_subview(tTR_rAcc,h,4)
+                                        w4=_subview(w_cache, t*NUM_W_IN_REG+h_g,4)
+                                        s_acc[0]=native_fma(self.output_dtype,native_pack_relu(self.output_dtype,x4[0],x4[1]),native_pack(self.output_dtype,w4[0],w4[1]),s_acc[0])
+                                        s_acc[1]=native_fma(self.output_dtype,native_pack_relu(self.output_dtype,x4[2],x4[3]),native_pack(self.output_dtype,w4[2],w4[3]),s_acc[1])
+                                else:
+                                    for h in cutlass.range_constexpr(0, reg_h_end, 4):
+                                        n0 = h
+                                        h_g = i * subtile_n + h
+                                        # packed (fp16/bf16) vs fp32
+                                        if cutlass.const_expr(
+                                            self.epi_dtype != cutlass.Float32
+                                        ):
+                                            pa = _subview(tTR_rAcc, n0, 4).to(
+                                                self.epi_dtype
                                             )
+                                            pa = cute.max(pa, packed_zero)
+                                            r0 = t * NUM_W_IN_REG + h_g
+                                            pw = _subview(w_cache, r0, 4)
+                                            ps = cute.fma(pa, pw, ps)
                                         else:
+                                            if cutlass.const_expr(self.use_relu_trick):
+                                                # The doubled-ReLU path pairs with pre-halved register weights.
+                                                x4 = _subview(tTR_rAcc, n0, 4)
+                                                a4 = indexer_add_packed_f32x2(
+                                                    x4, abs(x4), rnd=_RND_RN
+                                                )
+                                            else:
+                                                a4 = cute.max(
+                                                    _subview(tTR_rAcc, n0, 4),
+                                                    zero4,
+                                                    propagate_nan=True,
+                                                )
+                                            r0 = t * NUM_W_IN_REG + h_g
+                                            w4 = _subview(w_cache, r0, 4)
+                                            s_acc = indexer_fma_packed_f32x2(
+                                                a4, w4, s_acc, rnd=_RND_RN
+                                            )
+                                # SMEM-path
+                                smem_h_start = max(0, NUM_W_IN_REG - i * subtile_n)
+                                if cutlass.const_expr(self.native_lowp):
+                                    for h in cutlass.range_constexpr(smem_h_start, subtile_n, 4):
+                                        h_g=i*subtile_n+h
+                                        x4=_subview(tTR_rAcc,h,4)
+                                        w4=_subview(sw_col, t*num_heads+h_g,4)
+                                        s_acc[0]=native_fma(self.output_dtype,native_pack_relu(self.output_dtype,x4[0],x4[1]),native_pack(self.output_dtype,w4[0],w4[1]),s_acc[0])
+                                        s_acc[1]=native_fma(self.output_dtype,native_pack_relu(self.output_dtype,x4[2],x4[3]),native_pack(self.output_dtype,w4[2],w4[3]),s_acc[1])
+                                else:
+                                    for h in cutlass.range_constexpr(
+                                        smem_h_start, subtile_n, 4
+                                    ):
+                                        n0 = h
+                                        h_g = i * subtile_n + h
+                                        # packed (fp16/bf16) vs fp32
+                                        if cutlass.const_expr(
+                                            self.epi_dtype != cutlass.Float32
+                                        ):
+                                            pa = _subview(tTR_rAcc, n0, 4).to(
+                                                self.epi_dtype
+                                            )
+                                            pa = cute.max(pa, packed_zero)
+                                            w_i = t * num_heads + h_g
+                                            pw = _subview(sw_col, w_i, 4)
+                                            ps = cute.fma(pa, pw, ps)
+                                        else:
+                                            # Shared-memory weights use scalar max and remain unscaled.
                                             a4 = cute.max(
                                                 _subview(tTR_rAcc, n0, 4),
                                                 zero4,
                                                 propagate_nan=True,
                                             )
-                                        r0 = t * NUM_W_IN_REG + h_g
-                                        w4 = _subview(w_cache, r0, 4)
-                                        s_acc = indexer_fma_packed_f32x2(
-                                            a4, w4, s_acc, rnd=_RND_RN
-                                        )
-                                # SMEM-path
-                                smem_h_start = max(0, NUM_W_IN_REG - i * subtile_n)
-                                for h in cutlass.range_constexpr(
-                                    smem_h_start, subtile_n, 4
-                                ):
-                                    n0 = h
-                                    h_g = i * subtile_n + h
-                                    # packed (fp16/bf16) vs fp32
-                                    if cutlass.const_expr(
-                                        self.epi_dtype != cutlass.Float32
-                                    ):
-                                        pa = _subview(tTR_rAcc, n0, 4).to(
-                                            self.epi_dtype
-                                        )
-                                        pa = cute.max(pa, packed_zero)
-                                        w_i = t * num_heads + h_g
-                                        pw = _subview(sw_col, w_i, 4)
-                                        ps = cute.fma(pa, pw, ps)
-                                    else:
-                                        # Shared-memory weights use scalar max and remain unscaled.
-                                        a4 = cute.max(
-                                            _subview(tTR_rAcc, n0, 4),
-                                            zero4,
-                                            propagate_nan=True,
-                                        )
-                                        w_i = t * num_heads + h_g
-                                        w4 = _subview(sw_col, w_i, 4)
-                                        s_acc = indexer_fma_packed_f32x2(
-                                            a4, w4, s_acc, rnd=_RND_RN
-                                        )
+                                            w_i = t * num_heads + h_g
+                                            w4 = _subview(sw_col, w_i, 4).to(cutlass.Float32)
+                                            s_acc = indexer_fma_packed_f32x2(
+                                                a4, w4, s_acc, rnd=_RND_RN
+                                            )
                             # result reduction
                             if cutlass.const_expr(self.epi_dtype != cutlass.Float32):
                                 # Spelled out, not reduce(): the (S0+S2)+(S1+S3)
@@ -2252,7 +2308,11 @@ class FP4PrefillMQALogitsKernel:
                             else:
                                 # Preserve left-to-right accumulation. ReLU scaling is already folded
                                 # into the register weights; do not rescale the final sum.
-                                result_t = s_acc[0] + s_acc[1] + s_acc[2] + s_acc[3]
+                                if cutlass.const_expr(self.native_lowp):
+                                    reduced=native_add(self.output_dtype,s_acc[0],s_acc[1])
+                                    result_t=cutlass.Float32(self.output_dtype(native_lo(self.output_dtype,reduced)+native_hi(self.output_dtype,reduced)))
+                                else:
+                                    result_t = s_acc[0] + s_acc[1] + s_acc[2] + s_acc[3]
                             # drop * scale_val (FP4 SF baked into acc).
                             if cutlass.const_expr(self.mode == "filter"):
                                 outrow=q_block_idx*block_q_val+t
@@ -2332,3 +2392,7 @@ def publish_bank(score,active,tau,row,index,cursor,bank_rows,dtype:cutlass.Const
 from .fused_recovery_emit import emit,finish_recovery
 
 from .fused_recovery_emit import prepare_threshold
+
+from .native_lowp_math import native_pack, native_pack_relu, native_fma, native_add, native_lo, native_hi
+
+from .native_heads import native_weight_pair

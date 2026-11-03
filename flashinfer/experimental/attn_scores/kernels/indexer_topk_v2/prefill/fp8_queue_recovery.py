@@ -90,6 +90,7 @@ class FP8PrefillMQALogitsKernel:
         max_umma_pipeline: bool = False,
         num_epi_subtiles: int = 1,
         epi_dtype=cutlass.Float32,
+        weight_dtype=cutlass.Float32,
         acc_dtype=cutlass.Float32,
         output_dtype=cutlass.Float32,
         use_relu_trick: bool = False,
@@ -104,8 +105,15 @@ class FP8PrefillMQALogitsKernel:
         weights_prepared: bool = False,
         persistent_sample: bool = True,
         pdl: bool = False,
+        native_bf16: bool = False,
+        native_fp16: bool = False,
     ):
         self.pdl = bool(pdl)
+        # Opt-in BF16 head math; the default FP32 epilogue is retained.
+        self.native_lowp = bool(native_bf16 or native_fp16)
+        assert not (native_bf16 and native_fp16)
+        assert not native_fp16 or output_dtype == cutlass.Float16
+        assert not self.native_lowp or (num_heads in (4, 32, 64) and output_dtype == (cutlass.Float16 if native_fp16 else cutlass.BFloat16) and not use_relu_trick and not weights_prepared)
         if (acc_dtype, epi_dtype) not in (
             (cutlass.Float32, cutlass.Float32),
             (cutlass.Float32, cutlass.Float16),
@@ -147,12 +155,14 @@ class FP8PrefillMQALogitsKernel:
         self.smem_subpartition_opt = smem_subpartition_opt
         self.num_epi_subtiles = num_epi_subtiles
         self.epi_dtype = epi_dtype
+        self.weight_dtype = weight_dtype
+        self.weight_bytes = 2 if weight_dtype == cutlass.BFloat16 else 4
         # The optional ReLU identity (x+abs(x))/2 can overflow for x >= 2**127.
         # Enable it only when input scales and weights keep the intermediate finite.
         self.use_relu_trick = use_relu_trick
         self.epi_bytes = 2 if epi_dtype == cutlass.Float16 else 4
-        w_stage_bytes = self.N * self.epi_bytes
-        self.w_stage_stride = ((w_stage_bytes + 127) // 128 * 128) // self.epi_bytes
+        w_stage_bytes = self.N * self.weight_bytes
+        self.w_stage_stride = ((w_stage_bytes + 127) // 128 * 128) // self.weight_bytes
         self.output_dtype = output_dtype
         if num_epi_subtiles > 1 and num_heads % num_epi_subtiles != 0:
             raise ValueError("num_heads must be divisible by num_epi_subtiles")
@@ -182,7 +192,7 @@ class FP8PrefillMQALogitsKernel:
             SMEM_BUDGET = smem_capacity - 1024
             # KV+Scale per stage (×2 groups): 2 * (block_kv*head_dim + block_kv*4)
             kv_scale_per_stage = 2 * (block_kv * head_dim + block_kv * 4)
-            qw_per_stage = self.N * head_dim + self.w_stage_stride * self.epi_bytes
+            qw_per_stage = self.N * head_dim + self.w_stage_stride * self.weight_bytes
             qw_total = qw_per_stage * self.num_q_stages
             self.num_kv_stages = (SMEM_BUDGET - qw_total) // kv_scale_per_stage
         else:
@@ -356,7 +366,7 @@ class FP8PrefillMQALogitsKernel:
         )
 
         b_copy_size = cute.size_in_bytes(b_dtype, b_smem_layout)
-        w_copy_size = self.N * self.epi_bytes
+        w_copy_size = self.N * self.weight_bytes
         # Per KV block: block_kv * head_dim (KV) + block_kv * 4 (scales)
         self.num_kv_scale_tma_bytes = self.block_kv * self.head_dim + self.block_kv * 4
         self.num_q_tma_bytes = b_copy_size * atom_thr_size + w_copy_size
@@ -748,7 +758,7 @@ class FP8PrefillMQALogitsKernel:
         if cutlass.const_expr(self.smem_pad_bytes > 0):
             _ = smem.allocate(self.smem_pad_bytes)
         sW = smem.allocate_tensor(
-            element_type=self.epi_dtype,
+            element_type=self.weight_dtype,
             layout=w_smem_layout_staged,
             byte_alignment=128,
         )
@@ -1389,7 +1399,11 @@ class FP8PrefillMQALogitsKernel:
                                     # the shared ReLU zero under staged assignment.
                                     ps = cute.full((4,), 0.0, dtype=cutlass.Float16)
                                 else:
-                                    s_acc = cute.full((4,), 0.0, dtype=cutlass.Float32)
+                                    if cutlass.const_expr(self.native_lowp):
+                                        s_acc=cute.make_rmem_tensor((2,),cutlass.Uint32)
+                                        s_acc.fill(0)
+                                    else:
+                                        s_acc = cute.full((4,), 0.0, dtype=cutlass.Float32)
                                     if cutlass.const_expr(not self.use_relu_trick):
                                         zero4 = cute.full((4,), 0.0, dtype=cutlass.Float32)
                                 for i in cutlass.range_constexpr(num_epi_subtiles):
@@ -1415,81 +1429,101 @@ class FP8PrefillMQALogitsKernel:
                                     reg_h_end = min(
                                         subtile_n, max(0, NUM_W_IN_REG - i * subtile_n)
                                     )
-                                    for h in cutlass.range_constexpr(0, reg_h_end, 4):
-                                        n0 = h
-                                        h_g = i * subtile_n + h
-                                        if cutlass.const_expr(
-                                            self.epi_dtype == cutlass.Float16
-                                        ):
-                                            pa = _subview(tTR_rAcc, n0, 4).to(
-                                                cutlass.Float16
-                                            )
-                                            pa = cute.max(pa, packed_zero)
-                                            r0 = t * NUM_W_IN_REG + h_g
-                                            pw = _subview(w_cache, r0, 4)
-                                            ps = cute.fma(pa, pw, ps)
-                                        else:
-                                            if cutlass.const_expr(self.use_relu_trick):
-                                                # Doubled ReLU folds its factor of 1/2 into scale_half.
-                                                # It requires bounded inputs because x+abs(x) can overflow.
-                                                x4 = _subview(tTR_rAcc, n0, 4)
-                                                a4 = indexer_add_packed_f32x2(
-                                                    x4, abs(x4), rnd=_RND_RN
+                                    if cutlass.const_expr(self.native_lowp):
+                                        for h in cutlass.range_constexpr(0, reg_h_end, 4):
+                                            h_g=i*subtile_n+h
+                                            x4=_subview(tTR_rAcc,h,4)
+                                            w4=_subview(w_cache, t*NUM_W_IN_REG+h_g,4)
+                                            s_acc[0]=native_fma(self.output_dtype,native_fp8_pack_relu(self.output_dtype,x4[0],x4[1]),native_fp8_pack(self.output_dtype,w4[0],w4[1]),s_acc[0])
+                                            s_acc[1]=native_fma(self.output_dtype,native_fp8_pack_relu(self.output_dtype,x4[2],x4[3]),native_fp8_pack(self.output_dtype,w4[2],w4[3]),s_acc[1])
+                                    else:
+                                        for h in cutlass.range_constexpr(0, reg_h_end, 4):
+                                            n0 = h
+                                            h_g = i * subtile_n + h
+                                            if cutlass.const_expr(
+                                                self.epi_dtype == cutlass.Float16
+                                            ):
+                                                pa = _subview(tTR_rAcc, n0, 4).to(
+                                                    cutlass.Float16
                                                 )
+                                                pa = cute.max(pa, packed_zero)
+                                                r0 = t * NUM_W_IN_REG + h_g
+                                                pw = _subview(w_cache, r0, 4)
+                                                ps = cute.fma(pa, pw, ps)
                                             else:
-                                                a4 = cute.max(
-                                                    _subview(tTR_rAcc, n0, 4),
-                                                    zero4,
-                                                    propagate_nan=True,
+                                                if cutlass.const_expr(self.use_relu_trick):
+                                                    # Doubled ReLU folds its factor of 1/2 into scale_half.
+                                                    # It requires bounded inputs because x+abs(x) can overflow.
+                                                    x4 = _subview(tTR_rAcc, n0, 4)
+                                                    a4 = indexer_add_packed_f32x2(
+                                                        x4, abs(x4), rnd=_RND_RN
+                                                    )
+                                                else:
+                                                    a4 = cute.max(
+                                                        _subview(tTR_rAcc, n0, 4),
+                                                        zero4,
+                                                        propagate_nan=True,
+                                                    )
+                                                r0 = t * NUM_W_IN_REG + h_g
+                                                w4 = _subview(w_cache, r0, 4)
+                                                s_acc = indexer_fma_packed_f32x2(
+                                                    a4, w4, s_acc, rnd=_RND_RN
                                                 )
-                                            r0 = t * NUM_W_IN_REG + h_g
-                                            w4 = _subview(w_cache, r0, 4)
-                                            s_acc = indexer_fma_packed_f32x2(
-                                                a4, w4, s_acc, rnd=_RND_RN
-                                            )
                                     # SMEM-path: weights from shared mem
                                     smem_h_start = max(0, NUM_W_IN_REG - i * subtile_n)
-                                    for h in cutlass.range_constexpr(
-                                        smem_h_start, subtile_n, 4
-                                    ):
-                                        n0 = h
-                                        h_g = i * subtile_n + h
-                                        if cutlass.const_expr(
-                                            self.epi_dtype == cutlass.Float16
+                                    if cutlass.const_expr(self.native_lowp):
+                                        for h in cutlass.range_constexpr(smem_h_start, subtile_n, 4):
+                                            h_g=i*subtile_n+h
+                                            x4=_subview(tTR_rAcc,h,4)
+                                            w4=_subview(sw_col, t*num_heads+h_g,4)
+                                            s_acc[0]=native_fma(self.output_dtype,native_fp8_pack_relu(self.output_dtype,x4[0],x4[1]),native_fp8_pack(self.output_dtype,w4[0],w4[1]),s_acc[0])
+                                            s_acc[1]=native_fma(self.output_dtype,native_fp8_pack_relu(self.output_dtype,x4[2],x4[3]),native_fp8_pack(self.output_dtype,w4[2],w4[3]),s_acc[1])
+                                    else:
+                                        for h in cutlass.range_constexpr(
+                                            smem_h_start, subtile_n, 4
                                         ):
-                                            pa = _subview(tTR_rAcc, n0, 4).to(
-                                                cutlass.Float16
-                                            )
-                                            pa = cute.max(pa, packed_zero)
-                                            w_i = t * num_heads + h_g
-                                            pw = _subview(sw_col, w_i, 4)
-                                            ps = cute.fma(pa, pw, ps)
-                                        else:
-                                            if cutlass.const_expr(self.use_relu_trick):
-                                                # relu(x) = (x + |x|) / 2 (see
-                                                # reg-path above).
-                                                x4 = _subview(tTR_rAcc, n0, 4)
-                                                a4 = indexer_add_packed_f32x2(
-                                                    x4, abs(x4), rnd=_RND_RN
+                                            n0 = h
+                                            h_g = i * subtile_n + h
+                                            if cutlass.const_expr(
+                                                self.epi_dtype == cutlass.Float16
+                                            ):
+                                                pa = _subview(tTR_rAcc, n0, 4).to(
+                                                    cutlass.Float16
                                                 )
+                                                pa = cute.max(pa, packed_zero)
+                                                w_i = t * num_heads + h_g
+                                                pw = _subview(sw_col, w_i, 4)
+                                                ps = cute.fma(pa, pw, ps)
                                             else:
-                                                a4 = cute.max(
-                                                    _subview(tTR_rAcc, n0, 4),
-                                                    zero4,
-                                                    propagate_nan=True,
+                                                if cutlass.const_expr(self.use_relu_trick):
+                                                    # relu(x) = (x + |x|) / 2 (see
+                                                    # reg-path above).
+                                                    x4 = _subview(tTR_rAcc, n0, 4)
+                                                    a4 = indexer_add_packed_f32x2(
+                                                        x4, abs(x4), rnd=_RND_RN
+                                                    )
+                                                else:
+                                                    a4 = cute.max(
+                                                        _subview(tTR_rAcc, n0, 4),
+                                                        zero4,
+                                                        propagate_nan=True,
+                                                    )
+                                                w_i = t * num_heads + h_g
+                                                w4 = _subview(sw_col, w_i, 4).to(cutlass.Float32)
+                                                if cutlass.const_expr(self.use_relu_trick and not self.weights_prepared):
+                                                    w4 = w4 * 0.5
+                                                s_acc = indexer_fma_packed_f32x2(
+                                                    a4, w4, s_acc, rnd=_RND_RN
                                                 )
-                                            w_i = t * num_heads + h_g
-                                            w4 = _subview(sw_col, w_i, 4)
-                                            if cutlass.const_expr(self.use_relu_trick and not self.weights_prepared):
-                                                w4 = w4 * 0.5
-                                            s_acc = indexer_fma_packed_f32x2(
-                                                a4, w4, s_acc, rnd=_RND_RN
-                                            )
 
                                 if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
                                     result_t = (ps[0] + ps[2]) + (ps[1] + ps[3])
                                 else:
-                                    result_t = s_acc[0] + s_acc[1] + s_acc[2] + s_acc[3]
+                                    if cutlass.const_expr(self.native_lowp):
+                                        reduced=native_add(self.output_dtype,s_acc[0],s_acc[1])
+                                        result_t=cutlass.Float32(self.output_dtype(native_lo(self.output_dtype,reduced)+native_hi(self.output_dtype,reduced)))
+                                    else:
+                                        result_t = s_acc[0] + s_acc[1] + s_acc[2] + s_acc[3]
 
                                 # Prefill boundary check + flat logits store
                                 if cutlass.const_expr(self.mode == "filter"):
@@ -1743,7 +1777,11 @@ class FP8PrefillMQALogitsKernel:
                                     # the shared ReLU zero under staged assignment.
                                     ps = cute.full((4,), 0.0, dtype=cutlass.Float16)
                                 else:
-                                    s_acc = cute.full((4,), 0.0, dtype=cutlass.Float32)
+                                    if cutlass.const_expr(self.native_lowp):
+                                        s_acc=cute.make_rmem_tensor((2,),cutlass.Uint32)
+                                        s_acc.fill(0)
+                                    else:
+                                        s_acc = cute.full((4,), 0.0, dtype=cutlass.Float32)
                                     if cutlass.const_expr(not self.use_relu_trick):
                                         zero4 = cute.full((4,), 0.0, dtype=cutlass.Float32)
                                 for i in cutlass.range_constexpr(num_epi_subtiles):
@@ -1768,80 +1806,100 @@ class FP8PrefillMQALogitsKernel:
                                     reg_h_end = min(
                                         subtile_n, max(0, NUM_W_IN_REG - i * subtile_n)
                                     )
-                                    for h in cutlass.range_constexpr(0, reg_h_end, 4):
-                                        n0 = h
-                                        h_g = i * subtile_n + h
-                                        if cutlass.const_expr(
-                                            self.epi_dtype == cutlass.Float16
-                                        ):
-                                            pa = _subview(tTR_rAcc, n0, 4).to(
-                                                cutlass.Float16
-                                            )
-                                            pa = cute.max(pa, packed_zero)
-                                            r0 = t * NUM_W_IN_REG + h_g
-                                            pw = _subview(w_cache, r0, 4)
-                                            ps = cute.fma(pa, pw, ps)
-                                        else:
-                                            if cutlass.const_expr(self.use_relu_trick):
-                                                # Doubled ReLU folds its factor of 1/2 into scale_half.
-                                                # It requires bounded inputs because x+abs(x) can overflow.
-                                                x4 = _subview(tTR_rAcc, n0, 4)
-                                                a4 = indexer_add_packed_f32x2(
-                                                    x4, abs(x4), rnd=_RND_RN
+                                    if cutlass.const_expr(self.native_lowp):
+                                        for h in cutlass.range_constexpr(0, reg_h_end, 4):
+                                            h_g=i*subtile_n+h
+                                            x4=_subview(tTR_rAcc,h,4)
+                                            w4=_subview(w_cache, t*NUM_W_IN_REG+h_g,4)
+                                            s_acc[0]=native_fma(self.output_dtype,native_fp8_pack_relu(self.output_dtype,x4[0],x4[1]),native_fp8_pack(self.output_dtype,w4[0],w4[1]),s_acc[0])
+                                            s_acc[1]=native_fma(self.output_dtype,native_fp8_pack_relu(self.output_dtype,x4[2],x4[3]),native_fp8_pack(self.output_dtype,w4[2],w4[3]),s_acc[1])
+                                    else:
+                                        for h in cutlass.range_constexpr(0, reg_h_end, 4):
+                                            n0 = h
+                                            h_g = i * subtile_n + h
+                                            if cutlass.const_expr(
+                                                self.epi_dtype == cutlass.Float16
+                                            ):
+                                                pa = _subview(tTR_rAcc, n0, 4).to(
+                                                    cutlass.Float16
                                                 )
+                                                pa = cute.max(pa, packed_zero)
+                                                r0 = t * NUM_W_IN_REG + h_g
+                                                pw = _subview(w_cache, r0, 4)
+                                                ps = cute.fma(pa, pw, ps)
                                             else:
-                                                a4 = cute.max(
-                                                    _subview(tTR_rAcc, n0, 4),
-                                                    zero4,
-                                                    propagate_nan=True,
+                                                if cutlass.const_expr(self.use_relu_trick):
+                                                    # Doubled ReLU folds its factor of 1/2 into scale_half.
+                                                    # It requires bounded inputs because x+abs(x) can overflow.
+                                                    x4 = _subview(tTR_rAcc, n0, 4)
+                                                    a4 = indexer_add_packed_f32x2(
+                                                        x4, abs(x4), rnd=_RND_RN
+                                                    )
+                                                else:
+                                                    a4 = cute.max(
+                                                        _subview(tTR_rAcc, n0, 4),
+                                                        zero4,
+                                                        propagate_nan=True,
+                                                    )
+                                                r0 = t * NUM_W_IN_REG + h_g
+                                                w4 = _subview(w_cache, r0, 4)
+                                                s_acc = indexer_fma_packed_f32x2(
+                                                    a4, w4, s_acc, rnd=_RND_RN
                                                 )
-                                            r0 = t * NUM_W_IN_REG + h_g
-                                            w4 = _subview(w_cache, r0, 4)
-                                            s_acc = indexer_fma_packed_f32x2(
-                                                a4, w4, s_acc, rnd=_RND_RN
-                                            )
                                     smem_h_start = max(0, NUM_W_IN_REG - i * subtile_n)
-                                    for h in cutlass.range_constexpr(
-                                        smem_h_start, subtile_n, 4
-                                    ):
-                                        n0 = h
-                                        h_g = i * subtile_n + h
-                                        if cutlass.const_expr(
-                                            self.epi_dtype == cutlass.Float16
+                                    if cutlass.const_expr(self.native_lowp):
+                                        for h in cutlass.range_constexpr(smem_h_start, subtile_n, 4):
+                                            h_g=i*subtile_n+h
+                                            x4=_subview(tTR_rAcc,h,4)
+                                            w4=_subview(sw_col, t*num_heads+h_g,4)
+                                            s_acc[0]=native_fma(self.output_dtype,native_fp8_pack_relu(self.output_dtype,x4[0],x4[1]),native_fp8_pack(self.output_dtype,w4[0],w4[1]),s_acc[0])
+                                            s_acc[1]=native_fma(self.output_dtype,native_fp8_pack_relu(self.output_dtype,x4[2],x4[3]),native_fp8_pack(self.output_dtype,w4[2],w4[3]),s_acc[1])
+                                    else:
+                                        for h in cutlass.range_constexpr(
+                                            smem_h_start, subtile_n, 4
                                         ):
-                                            pa = _subview(tTR_rAcc, n0, 4).to(
-                                                cutlass.Float16
-                                            )
-                                            pa = cute.max(pa, packed_zero)
-                                            w_i = t * num_heads + h_g
-                                            pw = _subview(sw_col, w_i, 4)
-                                            ps = cute.fma(pa, pw, ps)
-                                        else:
-                                            if cutlass.const_expr(self.use_relu_trick):
-                                                # relu(x) = (x + |x|) / 2 (see
-                                                # reg-path above).
-                                                x4 = _subview(tTR_rAcc, n0, 4)
-                                                a4 = indexer_add_packed_f32x2(
-                                                    x4, abs(x4), rnd=_RND_RN
+                                            n0 = h
+                                            h_g = i * subtile_n + h
+                                            if cutlass.const_expr(
+                                                self.epi_dtype == cutlass.Float16
+                                            ):
+                                                pa = _subview(tTR_rAcc, n0, 4).to(
+                                                    cutlass.Float16
                                                 )
+                                                pa = cute.max(pa, packed_zero)
+                                                w_i = t * num_heads + h_g
+                                                pw = _subview(sw_col, w_i, 4)
+                                                ps = cute.fma(pa, pw, ps)
                                             else:
-                                                a4 = cute.max(
-                                                    _subview(tTR_rAcc, n0, 4),
-                                                    zero4,
-                                                    propagate_nan=True,
+                                                if cutlass.const_expr(self.use_relu_trick):
+                                                    # relu(x) = (x + |x|) / 2 (see
+                                                    # reg-path above).
+                                                    x4 = _subview(tTR_rAcc, n0, 4)
+                                                    a4 = indexer_add_packed_f32x2(
+                                                        x4, abs(x4), rnd=_RND_RN
+                                                    )
+                                                else:
+                                                    a4 = cute.max(
+                                                        _subview(tTR_rAcc, n0, 4),
+                                                        zero4,
+                                                        propagate_nan=True,
+                                                    )
+                                                w_i = t * num_heads + h_g
+                                                w4 = _subview(sw_col, w_i, 4).to(cutlass.Float32)
+                                                if cutlass.const_expr(self.use_relu_trick and not self.weights_prepared):
+                                                    w4 = w4 * 0.5
+                                                s_acc = indexer_fma_packed_f32x2(
+                                                    a4, w4, s_acc, rnd=_RND_RN
                                                 )
-                                            w_i = t * num_heads + h_g
-                                            w4 = _subview(sw_col, w_i, 4)
-                                            if cutlass.const_expr(self.use_relu_trick and not self.weights_prepared):
-                                                w4 = w4 * 0.5
-                                            s_acc = indexer_fma_packed_f32x2(
-                                                a4, w4, s_acc, rnd=_RND_RN
-                                            )
 
                                 if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
                                     result_t = (ps[0] + ps[2]) + (ps[1] + ps[3])
                                 else:
-                                    result_t = s_acc[0] + s_acc[1] + s_acc[2] + s_acc[3]
+                                    if cutlass.const_expr(self.native_lowp):
+                                        reduced=native_add(self.output_dtype,s_acc[0],s_acc[1])
+                                        result_t=cutlass.Float32(self.output_dtype(native_lo(self.output_dtype,reduced)+native_hi(self.output_dtype,reduced)))
+                                    else:
+                                        result_t = s_acc[0] + s_acc[1] + s_acc[2] + s_acc[3]
 
                                 if cutlass.const_expr(self.mode == "filter"):
                                     outrow=q_block_idx*block_q_val+t
@@ -1918,3 +1976,9 @@ def publish_bank(score,active,tau,row,index,cursor,bank_rows,dtype:cutlass.Const
 from .fused_recovery_emit import emit,finish_recovery
 
 from .fused_recovery_emit import prepare_threshold
+
+from .native_lowp_math import native_pack, native_pack_relu, native_fma, native_add, native_lo, native_hi
+
+from .native_lowp_math import native_fp8_pack, native_fp8_pack_relu
+
+from .native_heads import native_weight_pair

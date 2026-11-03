@@ -14,7 +14,8 @@ def stream_key(entry,dtype:cutlass.Constexpr,packed:cutlass.Constexpr):
 @cute.jit
 def select_stream(row,tid,source,n,required,hist,out,k:cutlass.Constexpr,dtype:cutlass.Constexpr,threads:cutlass.Constexpr=512,barrier_id:cutlass.Constexpr=13,banks:cutlass.Constexpr=8):
     bank_threads=threads//banks
-    radix_bits=8 if cutlass.const_expr(threads==256) else 9
+    # The radix width must match log2(threads); 128-thread callers use four banks.
+    radix_bits=7 if cutlass.const_expr(threads==128) else 8 if cutlass.const_expr(threads==256) else 9
     lane=cute.arch.lane_idx();warp=tid//32
     bank=tid//bank_threads;local=tid%bank_threads
     # Both bank layouts reserve eight count slots before candidate payloads.

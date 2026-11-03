@@ -60,7 +60,7 @@ def parse():
     p.add_argument("--scope", choices=("api", "kernel"), default="api")
     p.add_argument(
         "--length-axis",
-        choices=("historical", "original"),
+        choices=("historical", "original", "history"),
         default="historical",
         help="historical: captured history/keys axis; original: total tokens before KV compression",
     )
@@ -83,7 +83,7 @@ def parse():
         default=None,
     )
     p.add_argument(
-        "--math-mode", choices=("relu_strict", "relu_fast"), default="relu_fast"
+        "--math-mode", choices=("relu_strict", "relu_fast", "native_bf16", "native_fp16"), default="relu_fast"
     )
     p.add_argument("--prefill-q", type=int, choices=(4096, 8192), default=8192)
     p.add_argument("--samples-per-config", type=int, default=120)
@@ -108,7 +108,17 @@ def parse():
         action="store_true",
         help="Use public input_buffers() for producer-owned Q/weights/scales; stage once outside timing",
     )
+    p.add_argument("--fp8-quantization", choices=("captured", "deepgemm"), default="captured", help="deepgemm: quantize once to E4M3+UE8M0/32 and share Q/K/scales between v2 and DG")
+    p.add_argument("--gvr-root", type=Path, help="Unmodified BF16-capable TRT-LLM GVR prefill module directory for aligned DG comparisons")
     a = p.parse_args()
+    a.arms = list(dict.fromkeys("v2" if arm == "v2_generic" else arm for arm in a.arms))
+    if a.fp8_quantization == "deepgemm":
+        if a.qkv != ["fp8"] or a.scope != "api" or not set(a.arms) <= {"v2", "deepgemm", "deepgemm_prepared"}:
+            p.error("aligned FP8 requires --qkv fp8 --scope api and --arms v2 deepgemm [deepgemm_prepared]")
+        if a.gvr_root is None:
+            p.error("aligned FP8 requires --gvr-root")
+    elif any(arm.startswith("deepgemm") for arm in a.arms):
+        p.error("DeepGEMM arms require --fp8-quantization deepgemm")
     if not 0 <= a.shard < a.shards or min(a.samples_per_config, a.repetitions) <= 0:
         p.error("positive counts and 0 <= shard < shards required")
     if a.length_axis == "original" and (
@@ -198,6 +208,10 @@ def load_inputs(a, case, n, loader):
         a.data_root, case, case["source_key_tokens"], a.prefill_q
     )
     crop = inputs["k"].shape[0] - n
+    if crop < 0:
+        raise ValueError(
+            f"capture has {inputs['k'].shape[0]} keys, fewer than requested {n}"
+        )
     inputs["k"] = inputs["k"][crop:].contiguous()
     if case["qkv_dtype"] == "mxfp4":
         # Captures can use signed packed bytes; the public API uses uint8 storage.
@@ -251,6 +265,7 @@ def continuous(a, inputs, dtype, backend, *, pool_inputs=None, generic=False):
         k_scale = torch.ones(n, device=k.device, dtype=torch.float32)
     elif a.current_qkv == "mxfp4":
         k_scale = k_scale.view(torch.uint8).reshape(n, 4)
+    weights_dtype = inputs["weights"].dtype
     wrapper = FP8MQATopKWrapper(
         backend=backend,
         num_heads=heads,
@@ -264,6 +279,7 @@ def continuous(a, inputs, dtype, backend, *, pool_inputs=None, generic=False):
         num_keys=n,
         qkv_dtype=a.current_qkv,
         logits_dtype=dtype,
+        weights_dtype=weights_dtype,
         model_config=a.model if backend == "v2" and not generic else None,
         math_mode=a.math_mode,
     )
@@ -295,7 +311,7 @@ def continuous(a, inputs, dtype, backend, *, pool_inputs=None, generic=False):
 
 
 def full_gvr2(a, inputs, pool_inputs):
-    """Reuse the MR baseline as-is, including its FP32/strict score recipe."""
+    """Use the FlashInfer Full/GVR2 baseline with FP32 strict scoring."""
     import torch
     from bench_fp8_mqa_selective_logits import _FullGVR
     from flashinfer.attn_scores.fp8_kernel_config import _FP8MQAKernelConfig
@@ -541,6 +557,9 @@ def execute_public(a, job, loader):
 
 
 def execute(a, job, loader):
+    if getattr(a, "fp8_quantization", "captured") == "deepgemm":
+        import bench_mxfp8_alignment
+        return bench_mxfp8_alignment.execute(sys.modules[__name__], a, job, loader)
     import torch
     import cutlass.cute as cute
     import cutlass.pipeline as pipeline
@@ -620,7 +639,7 @@ def execute(a, job, loader):
                 full.workspace_owners,
                 (*pool_inputs, inputs["q"], inputs["weights"], full.output),
             )
-    for arm in ("v1", "v2_generic", "v2"):
+    for arm in ("v1", "v2"):
         if arm not in a.arms:
             continue
         if arm == "v1" and (
@@ -637,7 +656,7 @@ def execute(a, job, loader):
 
             op = SelectiveTopK(
                 **args,
-                model_config=None if arm == "v2_generic" else a.model,
+                compression_ratio=MODELS[a.model][2],
                 math_mode=a.math_mode,
             )
             run, output = op.run, op.output
@@ -649,7 +668,7 @@ def execute(a, job, loader):
                 dtype,
                 backend,
                 pool_inputs=pool_inputs,
-                generic=arm == "v2_generic",
+                generic=True,
             )
             from bench_fp8_mqa_selective_logits import _workspace_inventory
 
@@ -728,7 +747,7 @@ def main():
     ratio = MODELS[a.model][2]
     for encoding in a.qkv:
         for length in a.lengths:
-            requested = length // ratio if a.length_axis == "original" else length
+            requested = requested_key_length(length, a.length_axis, ratio, a.prefill_q)
             cases = loader.choose(
                 a.data_root,
                 requested,
@@ -748,6 +767,14 @@ def main():
                         case=case,
                         n=case.get("gemm_key_tokens", requested),
                         length=length,
+                        length_axis=a.length_axis,
+                        physical_key_tokens=case.get("gemm_key_tokens", requested),
+                        total_tokens=case.get("gemm_key_tokens", requested) * ratio,
+                        history_tokens=(
+                            case.get("gemm_key_tokens", requested) * ratio - a.prefill_q
+                        )
+                        if a.scope == "api"
+                        else None,
                         logits=logits,
                         scope=a.scope,
                         input_stat=[stat.st_size, stat.st_mtime_ns],

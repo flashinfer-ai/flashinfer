@@ -1,4 +1,4 @@
-# Indexer-throwaway v2
+# Selective v2 prefill
 
 This private CuTe DSL package implements sampling, candidate scoring, exact
 selection and recovery. Use `flashinfer.FP8MQATopKWrapper(backend="v2")` with
@@ -9,15 +9,15 @@ storage, even when the live context is shorter. The gather is part of the paged
 layer time; it is absent from the continuous API. Prepare every pool outside
 capture, and retain the wrapper and graph inputs until caller graphs are discarded.
 
-Pipeline ordering and packed-arithmetic compatibility adapters are private to
-this package. Importing the backend preserves shared CuTe pipeline and arithmetic
-methods, so later v1 and Full kernel compilation keeps its existing behavior.
+V2 supports single-request prefill with H4/H32/H64, D128, TopK 512/1024/2048,
+compression ratios 1/4, and at most 1,048,576 physical keys. Query capacity must
+be a multiple of 64 (H4), 8 (H32), or 4 (H64). Smaller live steps reuse this
+capacity; missing output entries are padded with -1. Decode and trace export
+are unsupported.
 
-The backend supports one prefill request with H4/H32/H64, logical D128,
-K512/K1024/K2048, page sizes 32/64/128, compression ratios 1/4 and at most
-1,048,576 keys after pooling. H8 and batched decode are unsupported. Row capacity must be
-a multiple of 64 (H4), 8 (H32) or 4 (H64). Smaller live steps can reuse the capacity;
-inactive and short rows receive -1 padding. Trace export is unsupported.
+Policy selection uses `(num_heads, head_dim, top_k, compression_ratio)`.
+An optional `model_config` must agree with those fields; it does not select a
+separate implementation. These tuples have model-specific contracts:
 
 Continuous FP8 K is `[N,128]` with FP32 scales `[N]`. MXFP4 K is packed
 uint8 `[N,64]` with four UE8M0 scale bytes per key; Q has 64 bytes per head.
@@ -39,20 +39,20 @@ selects its numerical/template contract. The native model profiles are:
 | GLM-5.3 | 32 | 2048 | 1 |
 | Qwen3.8-Flash-Next | 4 | 512 | 4 |
 
-All six profiles support FP16, BF16 and FP32 logits; the profiles do not assign
-a unique logits dtype per model. Compression ratios used as controls should be
-labelled separately from the native profiles.
+FP8 uses E4M3FN Q/K and FP32 per-key scales. MXFP8 uses E4M3FN Q/K with
+UE8M0 scales per 32 elements. MXFP4 packs two values per uint8 byte and uses
+the same scale granularity. Block-scaled K storage must have a multiple of
+256 rows; the plan describes the live extent. Pass block-scaled `q_scale`
+as uint8[R,H,4] or its int32[R,H] view, and `k_scale` as uint8[N,4].
 
-The Qwen template requires weights equal to FP32(1/sqrt(128)) and, for FP8,
-unit key scales. The adapter checks the actual layer payload on every replay.
-A violation returns -1 and accumulates bit 16 in `repair_error` until `plan`
-resets it. Other templates support arbitrary per-head weights in strict mode.
-Fast mode requires finite active weights that are zero or have magnitude at
-least 2**-125; MXFP4 additionally requires active Q/K scale bytes at most 159.
-These bounds are checked on every layer/replay and use the same bit-16 failure
-signal. Unused row and key capacity does not participate in the checks. A model's
-compression ratio describes already-compressed storage; the backend does not
-compress inputs.
+`logits_dtype` selects FP32, FP16, or BF16 score rounding before selection.
+`weights_dtype` independently selects FP32 or BF16 input storage; BF16 weights
+may have padded rows with contiguous heads. `math_mode` is fixed for the
+wrapper's lifetime. Strict/fast modes use FP32 head accumulation; explicit
+`native_bf16` and `native_fp16` use matching head arithmetic and logits dtype.
+See the public wrapper docstring for the reduction and FP8/FP16 scaling rules.
+K1, K2, and K4 share the same score rule. NaNs rank with negative infinity;
+equal-score ties need not produce identical indices.
 
 `VENDOR_MANIFEST.json` authenticates all current Python modules. Its
 pre-relocation hashes describe the original snapshot, before the import-prefix
@@ -84,10 +84,7 @@ bins exactly, and skips constant low bits in BF16 streaming radix keys.
 The strict/fast math contract, NaN-low ordering and private CuTe
 compatibility helpers remain FlashInfer-specific.
 
-Candidate payloads retain NaNs until the existing NaN-low ordering helpers;
-fused publishers already use this representation. Removing the duplicate
-encode-time conversion avoids extra K2 register pressure without changing
-selection semantics. Crossing selectors use the source's single interval guard:
-callers keep -1 for invalid spans, and a finite positive span guarantees a finite
-lower bound and a positive reciprocal. These local changes are recorded after
-the BF16 source patch in the manifest; the K2 filter bodies are unchanged.
+`VENDOR_MANIFEST.json` records SHA-256 digests of all Python modules. Device
+tests cover score-multiset correctness, ties, captured input changes, numerical
+contracts, and recovery. Copyright notices and the [BSD-3-Clause license](LICENSE)
+are retained with the source.

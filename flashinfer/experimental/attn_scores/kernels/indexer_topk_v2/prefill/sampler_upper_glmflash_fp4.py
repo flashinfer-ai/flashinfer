@@ -1560,8 +1560,8 @@ class FP4PrefillMQALogitsKernel:
                         scalar=cute.make_tensor(sample_scalar.iterator+query_slot*2,cute.make_layout(2))
                         samples=(cutlass.Int32(self.fixed_samples) if cutlass.const_expr(self.fixed_samples>0) else block_samples(q_block_idx,mCuSeqLenKEnd,num_q_tokens,self.block_q,self.top_k,heads=self.num_heads,coverage=4 if self.qsa_weights==2 or self.num_heads==32 else 8,dsv4=self.dsv4,anchor_upper=(num_kv_tokens if cutlass.const_expr(self.pro_common_domain) else 0)))
                         rank=short_margin_rank((max(1,num_kv_tokens) if cutlass.const_expr(self.pro_common_domain) else max(1,kv_end-kv_start)),samples,self.top_k,self.sample_sigma,self.num_heads,dsv4=self.dsv4)
-                        # Quantile is useful only when enough samples are expected
-                        # above it. Sparse tails retain the original maximum.
+                        # Use a quantile only when enough samples are expected above it;
+                        # sparse tails use the maximum.
                         high_rank=min(samples,max(1,self.top_k*samples//(2*(max(1,num_kv_tokens) if cutlass.const_expr(self.pro_common_domain) else max(1,kv_end-kv_start)))))
                         if high_rank<8:high_rank=cutlass.Int32(1)
                         if cutlass.const_expr(self.dsv4_shared_scores):
@@ -1661,9 +1661,15 @@ class FP4PrefillMQALogitsKernel:
                         high_rank = min(samples,max(1,self.top_k*samples//(2*(max(1,num_kv_tokens) if cutlass.const_expr(self.pro_common_domain) else max(1,kv_end-kv_start)))))
                         if high_rank<8:high_rank=cutlass.Int32(1)
                         if cutlass.const_expr(self.sample_shared_capacity > 0):
-                            propose_warp(outrow,cute.arch.lane_idx(),sample_scores,hist,thresholds,samples,rank,high_rank,candidates,extend_short=self.qsa_weights==2 or self.num_heads==32,score_row=slot)
+                            if cutlass.const_expr(self.fixed_samples == 128 and self.num_heads == 32 and self.top_k == 512):
+                                propose_warp_128(outrow,cute.arch.lane_idx(),sample_scores,hist,thresholds,samples,rank,high_rank,candidates,extend_short=self.qsa_weights==2 or self.num_heads==32,score_row=slot)
+                            else:
+                                propose_warp(outrow,cute.arch.lane_idx(),sample_scores,hist,thresholds,samples,rank,high_rank,candidates,extend_short=self.qsa_weights==2 or self.num_heads==32,score_row=slot)
                         else:
-                            propose_warp(outrow,cute.arch.lane_idx(),mLogits,hist,thresholds,samples,rank,high_rank,candidates,extend_short=self.qsa_weights==2 or self.num_heads==32)
+                            if cutlass.const_expr(self.fixed_samples == 128 and self.num_heads == 32 and self.top_k == 512):
+                                propose_warp_128(outrow,cute.arch.lane_idx(),mLogits,hist,thresholds,samples,rank,high_rank,candidates,extend_short=self.qsa_weights==2 or self.num_heads==32)
+                            else:
+                                propose_warp(outrow,cute.arch.lane_idx(),mLogits,hist,thresholds,samples,rank,high_rank,candidates,extend_short=self.qsa_weights==2 or self.num_heads==32)
                     subset_barrier(barrier_id=cutlass.Int32(10)+query_slot,number_of_threads=128)
                     q_pipeline.consumer_release(q_cons_state)
                     q_cons_state.advance()
@@ -1706,6 +1712,7 @@ from .proposal_parallel import propose as propose_parallel
 from .policy_qwen import qwen_cached_sample_key
 
 from .proposal_warp import propose_warp
+from .proposal_warp_128 import propose_warp_128
 
 from .policy_dsv4 import runtime_samples,block_samples,model_sample_key,model_proposal_rank
 

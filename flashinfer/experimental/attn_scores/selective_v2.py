@@ -19,6 +19,22 @@ from .selective_capacity import (
 class _V2StepInputs(_CapacityStepInputs):
     """Stage MXFP4 scales with the same cross-alias checks as Q and weights."""
 
+    def _payload_copies(self, q, weights):
+        # v2 owns its BF16 contract; v1 retains its FP32-only validation.
+        if not all(isinstance(t, torch.Tensor) for t in (q, weights)):
+            raise ValueError("step inputs must be tensors")
+        if (
+            q.device != self.device or q.dtype != self.q.dtype or q.ndim != 3
+            or q.shape[1:] != self.q.shape[1:]
+            or q.shape[0] > self.capacity.max_chunk_size or not q.is_contiguous()
+            or weights.device != self.device or weights.dtype != self.weights.dtype
+            or weights.shape != (q.shape[0], self.capacity.num_heads)
+            or weights.stride(1) != 1 or weights.stride(0) < self.capacity.num_heads
+            or (weights.dtype == torch.float32 and not weights.is_contiguous())
+        ):
+            raise ValueError("Q and weights must match the planned shapes and dtypes")
+        return ((self.q[:q.shape[0]], q), (self.weights[:q.shape[0]], weights))
+
     def input_buffers(self):
         result = super().input_buffers()
         if getattr(self, "q_scale", None) is not None:
@@ -55,6 +71,7 @@ class _CapacityV2TopKPlan(_ContinuousSelectiveTopKPlan):
         math_mode="relu_strict",
         qkv_dtype="fp8",
         logits_dtype=torch.float32,
+        weights_dtype=torch.float32,
         model_config=None,
     ):
         if num_heads not in (4, 32, 64) or head_dim != 128:
@@ -63,28 +80,19 @@ class _CapacityV2TopKPlan(_ContinuousSelectiveTopKPlan):
             raise ValueError(
                 "backend='v2' supports single-request prefill only; decode is unsupported"
             )
-        if qkv_dtype not in ("fp8", "mxfp4"):
-            raise ValueError("v2 qkv_dtype must be 'fp8' or 'mxfp4'")
+        if qkv_dtype not in ("fp8", "mxfp4", "mxfp8"):
+            raise ValueError("v2 qkv_dtype must be 'fp8', 'mxfp4' or 'mxfp8'")
         if logits_dtype not in (torch.float16, torch.bfloat16, torch.float32):
             raise ValueError("v2 logits_dtype must be float16, bfloat16 or float32")
+        if weights_dtype not in (torch.float32, torch.bfloat16):
+            raise ValueError("v2 weights_dtype must be float32 or bfloat16")
         if top_k not in (512, 1024, 2048):
             raise ValueError("backend='v2' supports top_k=512/1024/2048")
-        models = {
-            "DS-V3.2": (64, 2048),
-            "Qwen3.8-Flash-Next": (4, 512),
-            "GLM-5.3-Flash": (32, 512),
-            "DS-V4-Flash": (64, 512),
-            "DS-V4-Pro": (64, 1024),
-            "GLM-5.3": (32, 2048),
-        }
-        if model_config is not None and (
-            not isinstance(model_config, str)
-            or model_config not in models
-            or models[model_config] != (num_heads, top_k)
-        ):
-            raise ValueError(
-                "v2 model_config must match its supported head count and TopK"
-            )
+        from .indexer_config import resolve_model_config
+
+        model_config = resolve_model_config(
+            num_heads, head_dim, top_k, compression_ratio, model_config
+        )
         row_alignment = max(8 if num_heads == 32 else 1, 256 // num_heads)
         if (
             type(max_chunk_size) is not int
@@ -110,7 +118,14 @@ class _CapacityV2TopKPlan(_ContinuousSelectiveTopKPlan):
         self._logits_dtype = logits_dtype
         self._model_config = model_config
         self._top_k = top_k
-        self._math_mode = math_mode
+        from ._math_policy_v2 import validate_math_mode
+
+        self._math_mode = validate_math_mode(
+            math_mode,
+            qkv_dtype=qkv_dtype,
+            num_heads=num_heads,
+            logits_dtype=logits_dtype,
+        )
         from .selective_logits import _validate_selective_device
 
         _validate_selective_device(torch.device(device))
@@ -118,9 +133,9 @@ class _CapacityV2TopKPlan(_ContinuousSelectiveTopKPlan):
             num_keys = physical
         if type(num_keys) is not int or not 0 < num_keys <= 1048576:
             raise ValueError("v2 num_keys must be in 1..1048576")
-        if qkv_dtype == "mxfp4" and num_keys % 256:
+        if qkv_dtype in ("mxfp4", "mxfp8") and num_keys % 256:
             raise ValueError(
-                "MXFP4 K storage must have a multiple of 256 rows; plan describes the live extent"
+                "Block-scaled K storage must have a multiple of 256 rows; plan describes the live extent"
             )
         self._num_keys = num_keys
         self._capacity = capacity
@@ -140,6 +155,10 @@ class _CapacityV2TopKPlan(_ContinuousSelectiveTopKPlan):
             )
         else:
             self._state.q.zero_()
+        if weights_dtype == torch.bfloat16:
+            self._state.weights = torch.empty(
+                (max_chunk_size, num_heads), device=device, dtype=weights_dtype
+            )
         self._state.weights.fill_(128**-0.5)
         self._q_scale = (
             torch.full(
@@ -148,7 +167,7 @@ class _CapacityV2TopKPlan(_ContinuousSelectiveTopKPlan):
                 device=device,
                 dtype=torch.int32,
             )
-            if qkv_dtype == "mxfp4"
+            if qkv_dtype in ("mxfp4", "mxfp8")
             else None
         )
         self._state.q_scale = self._q_scale
@@ -159,6 +178,7 @@ class _CapacityV2TopKPlan(_ContinuousSelectiveTopKPlan):
         self._repair_error = torch.zeros(1, device=device, dtype=torch.int32)
         self._starts = torch.zeros(max_chunk_size, device=device, dtype=torch.int32)
         self._ends = torch.zeros_like(self._starts)
+        self._score_ends = torch.zeros_like(self._starts)
         self._keys = None
         self._scales = None
         self._qwen = model_config == "Qwen3.8-Flash-Next"
@@ -204,6 +224,30 @@ class _CapacityV2TopKPlan(_ContinuousSelectiveTopKPlan):
                 merged.append((begin, end))
         self._protected_ranges = tuple(merged)
 
+    def _pool_key(self, keys):
+        if self._qkv_dtype != "mxfp8":
+            return super()._pool_key(keys)
+        scale = self._k_scale
+        if (
+            not isinstance(keys, torch.Tensor)
+            or keys.shape != (self._num_keys, 128)
+            or keys.dtype != torch.float8_e4m3fn
+            or keys.device != self._state.device
+            or not keys.is_contiguous()
+            or keys.data_ptr() % 16
+        ):
+            raise ValueError("MXFP8 K requires aligned contiguous E4M3FN CUDA [N,128]")
+        if (
+            not isinstance(scale, torch.Tensor)
+            or scale.device != keys.device
+            or scale.dtype != torch.uint8
+            or scale.shape != (self._num_keys, 4)
+            or not scale.is_contiguous()
+            or scale.data_ptr() % 16
+        ):
+            raise ValueError("MXFP8 k_scale requires aligned contiguous UE8M0 uint8[N,4]")
+        return keys.data_ptr(), scale.data_ptr(), self._layout(keys), self._layout(scale)
+
     def prepare_pool(self, keys, *, k_scale=None):
         """Warm each K/scale binding; CUDA graphs belong to the caller."""
         if k_scale is not None:
@@ -240,8 +284,12 @@ class _CapacityV2TopKPlan(_ContinuousSelectiveTopKPlan):
                         top_k=self.top_k,
                         logits_dtype=self._logits_dtype,
                         model_config=self._model_config,
+                        compression_ratio=self._capacity.compression_ratio,
                         math_mode=self.math_mode,
                         out=self._selected,
+                        _score_ends=self._score_ends,
+                        # Validate live rows/scales on replay; capacity padding is inactive.
+                        _validate_numerics=False,
                     )
                     self._template_engine = engine
                     self._template_keys, self._template_scales = keys, self._k_scale
@@ -323,7 +371,7 @@ class _CapacityV2TopKPlan(_ContinuousSelectiveTopKPlan):
         state = self._state
         scales = (
             self._scales.view(torch.int32)
-            if self._qkv_dtype == "mxfp4"
+            if self._qkv_dtype in ("mxfp4", "mxfp8")
             else self._scales
         )
         tensors = (
@@ -335,6 +383,7 @@ class _CapacityV2TopKPlan(_ContinuousSelectiveTopKPlan):
             state.row_ends,
             self._starts,
             self._ends,
+            self._score_ends,
             self._metadata_flags,
             self._repair_error,
         )
@@ -343,8 +392,9 @@ class _CapacityV2TopKPlan(_ContinuousSelectiveTopKPlan):
             self._capacity.num_heads,
             self._qwen,
             self._fast,
-            self._qkv_dtype == "mxfp4",
+            self._qkv_dtype in ("mxfp4", "mxfp8"),
             self._metadata_flags.numel(),
+            top_k=self.top_k,
         )
         self._metadata_args[self._pool_key(keys)] = args
         if self._metadata_compiled is None:
@@ -386,14 +436,18 @@ class _CapacityV2TopKPlan(_ContinuousSelectiveTopKPlan):
         for _, stage in engine.stages[:3]:
             stage.run()
         counts = engine.counts.cpu().to(torch.int64)
-        required = (self._ends - self._starts).clamp(max=self.top_k).cpu()
+        visible = (self._ends - self._starts).cpu()
+        required = visible.clamp(max=self.top_k)
+        scoring = visible > self.top_k
         queued = engine.recovery_queue.cpu().tolist()
         tasks = queued[1 : 1 + queued[0]]
         qtile = engine.recovery_qtile
         stats = dict(
-            underfilled_rows=int(((counts % (1 << 24)) < required).count_nonzero()),
-            overflow_rows=int((counts < 0).count_nonzero()),
-            repair_trigger_rows=int((counts < required).count_nonzero()),
+            underfilled_rows=int(
+                (((counts % (1 << 24)) < required) & scoring).count_nonzero()
+            ),
+            overflow_rows=int(((counts < 0) & scoring).count_nonzero()),
+            repair_trigger_rows=int(((counts < required) & scoring).count_nonzero()),
             first_repair_rows=sum(
                 min(qtile, counts.numel() - task * qtile) for task in tasks
             ),
@@ -424,14 +478,14 @@ class _CapacityV2TopKPlan(_ContinuousSelectiveTopKPlan):
             raise ValueError("Q rows must match plan num_query_rows")
         if self._qkv_dtype == "fp8":
             if q_scale is not None:
-                raise TypeError("q_scale is only supported for MXFP4")
+                raise TypeError("q_scale requires MXFP4 or MXFP8")
         else:
             if (
                 not isinstance(q_scale, torch.Tensor)
                 or q_scale.device != self._state.device
                 or not q_scale.is_contiguous()
             ):
-                raise ValueError("MXFP4 requires contiguous CUDA q_scale")
+                raise ValueError("Block-scaled inputs require contiguous CUDA q_scale")
             if q_scale.dtype == torch.uint8 and q_scale.shape == (*q.shape[:2], 4):
                 q_scale = q_scale.view(torch.int32).reshape(q.shape[:2])
             if q_scale.dtype != torch.int32 or q_scale.shape != q.shape[:2]:

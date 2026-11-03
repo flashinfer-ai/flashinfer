@@ -1,6 +1,7 @@
 """Reference-style coarse histogram, exact crossing-bin refinement, radix fallback."""
 from .. import memory as indexer_memory
 from ..pdl import pdl_prologue
+from .short_domain import candidate_bounds
 from .boundary_extremes import select_extreme
 import functools
 from .candidate_streaming import select_stream
@@ -36,8 +37,9 @@ def numeric_bucket(score,lower,inverse_span,bins:cutlass.Constexpr=1024):
 
 
 class Crossing:
-    def __init__(self,k,dtype,shift=15,qblock=2,precounted=False,wide_cache=False,candidate_cols=0,offsets32=False,compact=False,packed=False,pro_short=False,exact_ties=False,glm_short=False,boundary_extremes=False,register_cache=False, pdl=False):
+    def __init__(self,k,dtype,shift=15,qblock=2,precounted=False,wide_cache=False,candidate_cols=0,offsets32=False,compact=False,packed=False,pro_short=False,exact_ties=False,glm_short=False,boundary_extremes=False,register_cache=False, pdl=False, exhaustive=False):
         self.pdl = bool(pdl)
+        self.exhaustive = exhaustive
         self.k,self.dtype,self.shift=k,dtype,shift
         self.boundary_extremes=boundary_extremes
         self.register_cache=packed and compact and not wide_cache
@@ -78,7 +80,7 @@ class Crossing:
                 task_row=row+lane
                 needs=False
                 if task_row<out.shape[0] and lane<self.qblock:
-                    needs=counts[task_row]<min(self.k,ends[task_row]-starts[task_row])
+                    needs=(ends[task_row]-starts[task_row]>self.k)&(counts[task_row]<self.k)
                 mask=cute.arch.vote_ballot_sync(needs)
                 if lane==0 and mask!=0:
                     position=cute.arch.atomic_add(recovery_queue.iterator.llvm_ptr,cutlass.Int32(1),sem='relaxed',scope='gpu')
@@ -87,17 +89,19 @@ class Crossing:
             if row%self.qblock==0 and tid<32:
                 task_row=row+lane//8
                 valid=(lane//8<self.qblock)&(task_row<out.shape[0])
-                amount=cutlass.Int32(0);required_row=cutlass.Int32(0)
+                amount=cutlass.Int32(0);required_row=cutlass.Int32(0);visible_row=cutlass.Int32(0)
                 if cutlass.const_expr(self.precounted):
                     if valid and lane%8==0:
                         amount=counts[task_row]
-                        required_row=min(self.k,ends[task_row]-starts[task_row])
+                        visible_row=ends[task_row]-starts[task_row]
+                        required_row=min(self.k,visible_row)
                 else:
                     if valid:
                         amount=cutlass.Int32(candidates[task_row,lane%8])
-                        required_row=min(self.k,ends[task_row]-starts[task_row])
+                        visible_row=ends[task_row]-starts[task_row]
+                        required_row=min(self.k,visible_row)
                     for step in cutlass.range_constexpr(3):amount+=cute.arch.shuffle_sync_bfly(amount,1<<step)
-                needs=valid&(lane%8==0)&(amount<required_row)
+                needs=valid&(lane%8==0)&(visible_row>self.k)&(amount<required_row)
                 mask=cute.arch.vote_ballot_sync(needs)
                 if lane==0 and mask!=0:
                     position=cute.arch.atomic_add(recovery_queue.iterator.llvm_ptr,cutlass.Int32(1),sem='relaxed',scope='gpu')
@@ -119,8 +123,13 @@ class Crossing:
             cute.arch.barrier(barrier_id=self.barrier_id,number_of_threads=self.threads)
         if cutlass.const_expr(self.early_metadata):n=early_n;required=early_required
         else:n=counts[row];required=min(self.k,ends[row]-starts[row])
-        if required==0:
-            for i in cutlass.range(tid,self.k,self.threads):out[row,i]=-1
+        if ends[row]-starts[row]<=self.k:
+            # Every visible key belongs to the result; scores and sampling are
+            # irrelevant. Output order is unspecified by the TopK contract.
+            for i in cutlass.range(tid,self.k,self.threads):
+                value=cutlass.Int32(-1)
+                if i<required:value=starts[row]+i
+                out[row,i]=value
         elif n>=required:
             bank=tid//self.bank_threads;local=tid%self.bank_threads
             if cutlass.const_expr(self.early_metadata):bank_count=early_count;threshold_value=early_tau
@@ -174,6 +183,10 @@ class Crossing:
                     other=cute.arch.shuffle_sync_bfly(upper,1<<step)
                     upper=max(upper,other)
                 cute.arch.barrier(barrier_id=self.barrier_id,number_of_threads=self.threads)
+            if cutlass.const_expr(self.exhaustive):
+                threshold_value, upper = candidate_bounds(
+                    candidates, row, bank, local, bank_count, span, hist,
+                    self.dtype, self.packed, self.threads, self.bank_threads, self.barrier_id)
             span_value=upper-threshold_value;inverse_span=cutlass.Float32(-1.0)
             if (span_value>0.0)&(span_value<float('inf')):inverse_span=cutlass.Float32(self.bins-1)/span_value
             if cutlass.const_expr(not self.register_cache):cute.arch.cp_async_wait_group(0)
@@ -343,7 +356,7 @@ class Crossing:
 
 
 @functools.cache
-def compile_selector(k,dtype,shift,signature,qblock=2,precounted=False,wide_cache=False,candidate_cols=0,offsets32=False,compact=False,pro_short=False,exact_ties=False,glm_short=False,boundary_extremes=False,register_cache=False, pdl=False):
+def compile_selector(k,dtype,shift,signature,qblock=2,precounted=False,wide_cache=False,candidate_cols=0,offsets32=False,compact=False,pro_short=False,exact_ties=False,glm_short=False,boundary_extremes=False,register_cache=False, pdl=False, exhaustive=False):
     tensors=[]
     for i,(d,ndim) in enumerate(signature):
         dims=tuple(cute.sym_int() for _ in range(ndim))
@@ -352,5 +365,5 @@ def compile_selector(k,dtype,shift,signature,qblock=2,precounted=False,wide_cach
         else:
             t=cute.runtime.make_fake_compact_tensor(DTYPES[d],dims,stride_order=tuple(reversed(range(ndim))),assumed_align=16)
         tensors.append(t)
-    return cute.compile(Crossing(k,dtype,shift,qblock,precounted,wide_cache,candidate_cols,offsets32,compact,DTYPES[signature[0][0]]==cutlass.Int32,pro_short,exact_ties,glm_short,boundary_extremes,register_cache, pdl=pdl),*tensors,
+    return cute.compile(Crossing(k,dtype,shift,qblock,precounted,wide_cache,candidate_cols,offsets32,compact,DTYPES[signature[0][0]]==cutlass.Int32,pro_short,exact_ties,glm_short,boundary_extremes,register_cache, pdl=pdl, exhaustive=exhaustive),*tensors,
                         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),options='--enable-tvm-ffi')

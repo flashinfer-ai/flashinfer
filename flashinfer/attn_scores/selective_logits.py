@@ -253,6 +253,35 @@ class FP8MQATopKWrapper:
     before compression. It defaults to B * floor(max_context_length / ratio).
     MXFP4 storage must be padded to a multiple of 256 rows.
 
+    Backend v2 infers its model policy from ``num_heads``, ``head_dim``,
+    ``top_k`` and ``compression_ratio``. An optional ``model_config`` name
+    must agree with those fields and does not select a different policy.
+    Qwen's H4/D128/K512/CR4 contract requires weights ``1/sqrt(128)``
+    rounded to the selected weights dtype and, for FP8, unit K scales;
+    these conditions are checked on replay.
+    Length policies use physical K rows, including the queries' compressed keys.
+
+    ``weights_dtype`` defaults to ``torch.float32``. Backend v2 also accepts
+    ``torch.bfloat16`` for every supported QK, logits and arithmetic mode.
+    Weights must match the planned dtype; BF16 weights may have padded rows
+    with contiguous heads, including DeepGEMM's H4 row stride of eight.
+    Input storage dtype does not select head accumulation precision.
+
+    ``math_mode="native_bf16"`` and ``math_mode="native_fp16"`` are opt-in
+    v2 modes for H4/H32/H64 FP8, MXFP8 or MXFP4 inputs, requiring the
+    matching logits dtype.
+    QK dots accumulate in FP32. ReLU results and weights are rounded to the
+    native dtype, followed by four native FMA chains and the rounded tree
+    ``(c0+c2)+(c1+c3)``. FP8 native_fp16 first divides QK by 512 and multiplies
+    weights by 512. This power-of-two rebalance follows from the E4M3FN/D128
+    maximum dot product; it avoids overflowing the FP16 conversion of raw QK.
+    It is independent of input values. Other native modes use no rebalance.
+    FP8 applies the original FP32 key scale after the sum, then rounds the
+    output. MXFP4 block scales are applied within the dot product.
+    Native modes have their own rounding, underflow and overflow behavior;
+    they differ from FP32 head accumulation in ``relu_strict``/``relu_fast``.
+    K1, K2 and K4 share this score rule; K2 writes only filtered candidates.
+
     Construct outside capture, plan once per step, and run once per layer.
     Prepare every v2 K/scale binding before capture. Keep this wrapper and all
     capture inputs alive until the caller discards its graphs. Calls on a
@@ -280,6 +309,7 @@ class FP8MQATopKWrapper:
         num_keys=None,
         qkv_dtype="fp8",
         logits_dtype=torch.float32,
+        weights_dtype=torch.float32,
         model_config=None,
         max_workspace_size=None,
     ):
@@ -299,10 +329,11 @@ class FP8MQATopKWrapper:
         if backend == "v1" and (
             qkv_dtype != "fp8"
             or logits_dtype != torch.float32
+            or weights_dtype != torch.float32
             or model_config is not None
         ):
             raise ValueError(
-                "v1 supports FP8 inputs and FP32 logits without model_config"
+                "v1 supports FP8 inputs, FP32 weights and FP32 logits without model_config"
             )
         from ._math_policy import _validate_math_mode
         from ..experimental.attn_scores import _continuous_plan_type
@@ -316,13 +347,14 @@ class FP8MQATopKWrapper:
             head_dim=head_dim,
             top_k=top_k,
             compression_ratio=compression_ratio,
-            math_mode=_validate_math_mode(math_mode),
+            math_mode=math_mode if backend == "v2" else _validate_math_mode(math_mode),
             num_keys=num_keys,
         )
         if backend == "v2":
             options.update(
                 qkv_dtype=qkv_dtype,
                 logits_dtype=logits_dtype,
+                weights_dtype=weights_dtype,
                 model_config=model_config,
             )
         if strategy == "full":

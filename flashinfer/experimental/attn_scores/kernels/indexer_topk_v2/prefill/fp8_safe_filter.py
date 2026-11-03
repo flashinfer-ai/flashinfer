@@ -112,6 +112,7 @@ class FP8PrefillMQALogitsKernel:
         max_umma_pipeline: bool = False,
         num_epi_subtiles: int = 1,
         epi_dtype=cutlass.Float32,
+        weight_dtype=cutlass.Float32,
         acc_dtype=cutlass.Float32,
         output_dtype=cutlass.Float32,
         use_relu_trick: bool = False,
@@ -144,8 +145,15 @@ class FP8PrefillMQALogitsKernel:
         glm_pair_queries: bool = False,
         q_stage_override: int = 0,
         pdl: bool = False,
+        native_bf16: bool = False,
+        native_fp16: bool = False,
     ):
         self.pdl = bool(pdl)
+        # Opt-in BF16 head math; the default FP32 epilogue is retained.
+        self.native_lowp = bool(native_bf16 or native_fp16)
+        assert not (native_bf16 and native_fp16)
+        assert not native_fp16 or output_dtype == cutlass.Float16
+        assert not self.native_lowp or (num_heads in (4, 32, 64) and output_dtype == (cutlass.Float16 if native_fp16 else cutlass.BFloat16))
         if (acc_dtype, epi_dtype) not in (
             (cutlass.Float32, cutlass.Float32),
             (cutlass.Float32, cutlass.Float16),
@@ -205,14 +213,24 @@ class FP8PrefillMQALogitsKernel:
         self.remove_kv_wait_in_epilogue = remove_kv_wait_in_epilogue
         self.early_tmem_copy = early_tmem_copy
         self.smem_subpartition_opt = smem_subpartition_opt
+        # Pair Q columns before MMA and load 32 FP32 values per epilogue step.
+        # The paired layout avoids spills while preserving four chains per query.
+        self.interleaved_queries = (num_heads == 32 and top_k == 512
+            and umma_n == 256 and not glm_two_math_wg and glm_integer_period == 0
+            and weights_prepared and use_relu_trick)
+        if self.interleaved_queries:
+            num_epi_subtiles = 1
         self.num_epi_subtiles = num_epi_subtiles
         self.epi_dtype = epi_dtype
+        self.weight_dtype = weight_dtype
+        self.packed_bf16_weights = weight_dtype == cutlass.BFloat16 and native_bf16
+        self.weight_bytes = 2 if weight_dtype == cutlass.BFloat16 else 4
         # The optional ReLU identity (x+abs(x))/2 can overflow for x >= 2**127.
         # Enable it only when input scales and weights keep the intermediate finite.
         self.use_relu_trick = use_relu_trick
         self.epi_bytes = 2 if epi_dtype == cutlass.Float16 else 4
-        w_stage_bytes = self.N * self.epi_bytes
-        self.w_stage_stride = ((w_stage_bytes + 127) // 128 * 128) // self.epi_bytes
+        w_stage_bytes = self.N * self.weight_bytes
+        self.w_stage_stride = ((w_stage_bytes + 127) // 128 * 128) // self.weight_bytes
         self.output_dtype = output_dtype
         self.glm_integer_period = glm_integer_period
         if num_epi_subtiles > 1 and num_heads % num_epi_subtiles != 0:
@@ -249,7 +267,7 @@ class FP8PrefillMQALogitsKernel:
             SMEM_BUDGET = smem_capacity - 1024
             # KV+Scale per stage (×2 groups): 2 * (block_kv*head_dim + block_kv*4)
             kv_scale_per_stage = 2 * (block_kv * head_dim + block_kv * 4)
-            qw_per_stage = self.N * head_dim + self.w_stage_stride * self.epi_bytes
+            qw_per_stage = self.N * head_dim + self.w_stage_stride * self.weight_bytes
             qw_total = qw_per_stage * self.num_q_stages
             self.num_kv_stages = (SMEM_BUDGET - qw_total) // kv_scale_per_stage
         else:
@@ -351,6 +369,16 @@ class FP8PrefillMQALogitsKernel:
         # TMA descriptors use true operand extents. Hardware zero-fills ragged
         # tiles while completing the full transaction byte count.
         b = cute.recast_tensor(b, cutlass.Float8E4M3FN)
+        if cutlass.const_expr(self.interleaved_queries):
+            # TMA reads adjacent queries in alternating columns, without a copy.
+            b = cute.make_tensor(
+                b.iterator,
+                cute.make_layout(
+                    ((2, 32, b.shape[0] // 64), b.shape[1]),
+                    stride=((32 * b.stride[0], b.stride[0], 64 * b.stride[0]),
+                            b.stride[1]),
+                ),
+            )
         kv_fp8 = cute.recast_tensor(kv, cutlass.Float8E4M3FN)
 
         a_dtype = kv_fp8.element_type
@@ -420,7 +448,7 @@ class FP8PrefillMQALogitsKernel:
         )
 
         b_copy_size = cute.size_in_bytes(b_dtype, b_smem_layout)
-        w_copy_size = self.N * self.epi_bytes
+        w_copy_size = self.N * self.weight_bytes
         # Per KV block: block_kv * head_dim (KV) + block_kv * 4 (scales)
         self.num_kv_scale_tma_bytes = self.block_kv * self.head_dim
         self.num_q_tma_bytes = b_copy_size * atom_thr_size + w_copy_size
@@ -782,7 +810,7 @@ class FP8PrefillMQALogitsKernel:
         if cutlass.const_expr(self.smem_pad_bytes > 0):
             _ = smem.allocate(self.smem_pad_bytes)
         sW = smem.allocate_tensor(
-            element_type=self.epi_dtype,
+            element_type=self.weight_dtype,
             layout=w_smem_layout_staged,
             byte_alignment=128,
         )
@@ -938,7 +966,9 @@ class FP8PrefillMQALogitsKernel:
 
         # ===== WARP-SPECIALIZED EXECUTION =====
 
-        if cutlass.const_expr(self.num_heads==32):
+        # H64 native math needs 112 registers: producers release to 32 first.
+        # 512 * 112 + 128 * 32 fits the SM register file without spills.
+        if cutlass.const_expr(self.num_heads==32 or self.native_lowp):
             if not is_math_warp:cute.arch.warpgroup_reg_dealloc(32)
         if is_tma_warp_0:
             # TMA warp 0: loads Q+Weights (on Q-block change) + KV group 0
@@ -1084,7 +1114,7 @@ class FP8PrefillMQALogitsKernel:
                     has_work = next_q_block_idx >= 0
 
         elif is_math_warp:
-            if cutlass.const_expr(self.num_heads==32):cute.arch.warpgroup_reg_alloc(104 if self.glm_two_math_wg else 112)
+            if cutlass.const_expr(self.num_heads==32 or self.native_lowp):cute.arch.warpgroup_reg_alloc(104 if self.glm_two_math_wg else 112)
             tmem.allocate(num_tmem_alloc_cols_total)
             subset_barrier(barrier_id=1,number_of_threads=self.num_math_threads+32)
             tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
@@ -1118,20 +1148,29 @@ class FP8PrefillMQALogitsKernel:
                     # K3/K4 still select exact top-k, including overflow recovery.
                     if cutlass.const_expr(self.dsv4_unordered):
                         if tau!=tau:tau=cutlass.Float32(float('-inf'))
-                    for h in cutlass.range_constexpr(64):
-                        w = sW[(query_slot*64+h,q_stage_local)]
-                        if cutlass.const_expr(self.use_relu_trick and not self.weights_prepared):w = w*0.5
-                        if cutlass.const_expr(self.use_relu_trick and ((self.dsv4_integer_head_mask >> h) & 1)):
-                            w = w * 2.0
-                        w_cache[h] = w
+                    if cutlass.const_expr(self.native_lowp):
+                        native_weights=cute.make_rmem_tensor((32,),cutlass.Uint32)
+                        for h in cutlass.range_constexpr(32):
+                            wa=cutlass.Float32(sW[(query_slot*64+h*2,q_stage_local)])
+                            wb=cutlass.Float32(sW[(query_slot*64+h*2+1,q_stage_local)])
+                            if cutlass.const_expr(self.use_relu_trick and self.weights_prepared):
+                                wa=wa*2.0
+                                wb=wb*2.0
+                            native_weights[h]=native_weight_pair(sW,query_slot*64+h*2,q_stage_local,self.output_dtype,fp8=True)
+                    else:
+                        for h in cutlass.range_constexpr(64):
+                            w = cutlass.Float32(sW[(query_slot*64+h,q_stage_local)])
+                            if cutlass.const_expr(self.use_relu_trick and not self.weights_prepared):w = w*0.5
+                            if cutlass.const_expr(self.use_relu_trick and ((self.dsv4_integer_head_mask >> h) & 1)):
+                                w = w * 2.0
+                            w_cache[h] = w
                     bank_span = (candidates.shape[1]-8)//4
                     bank_id = local_tidx//32
                     bank_rows = cute.make_tensor(candidates.iterator+cutlass.Int64(outrow)*candidates.stride[0]+8+bank_id*bank_span,cute.make_layout((1,bank_span),stride=(bank_span,1)))
                     cursor_even = cutlass.Int32(0)
                     kv_idx = _kv_lo_for_block(q_block_idx)
-                    # Retire an empty producer tile without scoring it.
-                    # Keep the generic template's Q/weight setup and KV-start
-                    # location unchanged; moving this earlier regresses its loop.
+                    # Retire empty producer tiles after Q/weight setup so the
+                    # empty-range branch does not affect scoring-loop scheduling.
                     if kv_idx >= num_kv:
                         if cutlass.const_expr(self.num_heads == 64 and self.dsv4_direct_sync):
                             cute.arch.mbarrier_wait(storage.umma_mbar_0.data_ptr()+umma_cons_state_0.index,umma_cons_state_0.phase)
@@ -1152,7 +1191,11 @@ class FP8PrefillMQALogitsKernel:
                             umma_pipeline_0.consumer_wait(umma_cons_state_0,umma_ready)
                         tAcc = tCtAcc_base_0[(None,None,None,umma_cons_state_0.index)][((None,None),0,0)]
                         tTR = thr_copy_ref.partition_S(cute.flat_divide(tAcc,epi_sub_mn))
-                        s_acc = cute.full((4,),0.0,dtype=cutlass.Float32)
+                        if cutlass.const_expr(self.native_lowp):
+                            s_acc=cute.make_rmem_tensor((2,),cutlass.Uint32)
+                            s_acc.fill(0)
+                        else:
+                            s_acc = cute.full((4,),0.0,dtype=cutlass.Float32)
                         for i in cutlass.range_constexpr(num_epi_subtiles):
                             cute.copy(tiled_copy_ref,tTR[(None,None,None,0,query_slot*num_epi_subtiles+i)],tTR_rAcc)
                             cute.arch.fence_view_async_tmem_load()
@@ -1164,18 +1207,29 @@ class FP8PrefillMQALogitsKernel:
                                 else:
                                     umma_pipeline_0.consumer_release(umma_cons_state_0)
                                 umma_cons_state_0.advance()
-                            for h in cutlass.range_constexpr(0,64//num_epi_subtiles,4):
-                                x4 = _subview(tTR_rAcc,h,4)
-                                if cutlass.const_expr(self.use_relu_trick):
-                                    if cutlass.const_expr((self.dsv4_integer_head_mask >> (i*(64//num_epi_subtiles)+h)) & 1):
-                                        a4 = integer_relu4(x4)
+                            if cutlass.const_expr(self.native_lowp):
+                                for h in cutlass.range_constexpr(0,64//num_epi_subtiles,4):
+                                    x4=_subview(tTR_rAcc,h,4)
+                                    woff=(i*(64//num_epi_subtiles)+h)//2
+                                    s_acc[0]=native_fma(self.output_dtype,native_fp8_pack_relu(self.output_dtype,x4[0],x4[1]),native_weights[woff],s_acc[0])
+                                    s_acc[1]=native_fma(self.output_dtype,native_fp8_pack_relu(self.output_dtype,x4[2],x4[3]),native_weights[woff+1],s_acc[1])
+                            else:
+                                for h in cutlass.range_constexpr(0,64//num_epi_subtiles,4):
+                                    x4 = _subview(tTR_rAcc,h,4)
+                                    if cutlass.const_expr(self.use_relu_trick):
+                                        if cutlass.const_expr((self.dsv4_integer_head_mask >> (i*(64//num_epi_subtiles)+h)) & 1):
+                                            a4 = integer_relu4(x4)
+                                        else:
+                                            a4 = indexer_add_packed_f32x2(x4,abs(x4),rnd=_RND_RN)
                                     else:
-                                        a4 = indexer_add_packed_f32x2(x4,abs(x4),rnd=_RND_RN)
-                                else:
-                                    a4 = cute.max(x4,zero4,propagate_nan=True)
-                                w4 = _subview(w_cache,i*(64//num_epi_subtiles)+h,4)
-                                s_acc = indexer_fma_packed_f32x2(a4,w4,s_acc,rnd=_RND_RN)
-                        score = (s_acc[0]+s_acc[1]+s_acc[2]+s_acc[3])*scale_val
+                                        a4 = cute.max(x4,zero4,propagate_nan=True)
+                                    w4 = _subview(w_cache,i*(64//num_epi_subtiles)+h,4)
+                                    s_acc = indexer_fma_packed_f32x2(a4,w4,s_acc,rnd=_RND_RN)
+                        if cutlass.const_expr(self.native_lowp):
+                            reduced=native_add(self.output_dtype,s_acc[0],s_acc[1])
+                            score=native_sum_fp32(self.output_dtype,reduced)*scale_val
+                        else:
+                            score = (s_acc[0]+s_acc[1]+s_acc[2]+s_acc[3])*scale_val
                         if cutlass.const_expr(self.full_q_blocks) or outrow < num_q_tokens:
                             valid=(kv_pos>=kv_start)&(kv_pos<kv_end)
                             if kv_idx%2==0:
@@ -1195,7 +1249,11 @@ class FP8PrefillMQALogitsKernel:
                                 umma_pipeline_0.consumer_wait(umma_cons_state_0,umma_ready)
                             tAcc = tCtAcc_base_0[(None,None,None,umma_cons_state_0.index)][((None,None),0,0)]
                             tTR = thr_copy_ref.partition_S(cute.flat_divide(tAcc,epi_sub_mn))
-                            s_acc = cute.full((4,),0.0,dtype=cutlass.Float32)
+                            if cutlass.const_expr(self.native_lowp):
+                                s_acc=cute.make_rmem_tensor((2,),cutlass.Uint32)
+                                s_acc.fill(0)
+                            else:
+                                s_acc = cute.full((4,),0.0,dtype=cutlass.Float32)
                             for i in cutlass.range_constexpr(num_epi_subtiles):
                                 cute.copy(tiled_copy_ref,tTR[(None,None,None,0,query_slot*num_epi_subtiles+i)],tTR_rAcc)
                                 cute.arch.fence_view_async_tmem_load()
@@ -1207,18 +1265,29 @@ class FP8PrefillMQALogitsKernel:
                                     else:
                                         umma_pipeline_0.consumer_release(umma_cons_state_0)
                                     umma_cons_state_0.advance()
-                                for h in cutlass.range_constexpr(0,64//num_epi_subtiles,4):
-                                    x4 = _subview(tTR_rAcc,h,4)
-                                    if cutlass.const_expr(self.use_relu_trick):
-                                        if cutlass.const_expr((self.dsv4_integer_head_mask >> (i*(64//num_epi_subtiles)+h)) & 1):
-                                            a4 = integer_relu4(x4)
+                                if cutlass.const_expr(self.native_lowp):
+                                    for h in cutlass.range_constexpr(0,64//num_epi_subtiles,4):
+                                        x4=_subview(tTR_rAcc,h,4)
+                                        woff=(i*(64//num_epi_subtiles)+h)//2
+                                        s_acc[0]=native_fma(self.output_dtype,native_fp8_pack_relu(self.output_dtype,x4[0],x4[1]),native_weights[woff],s_acc[0])
+                                        s_acc[1]=native_fma(self.output_dtype,native_fp8_pack_relu(self.output_dtype,x4[2],x4[3]),native_weights[woff+1],s_acc[1])
+                                else:
+                                    for h in cutlass.range_constexpr(0,64//num_epi_subtiles,4):
+                                        x4 = _subview(tTR_rAcc,h,4)
+                                        if cutlass.const_expr(self.use_relu_trick):
+                                            if cutlass.const_expr((self.dsv4_integer_head_mask >> (i*(64//num_epi_subtiles)+h)) & 1):
+                                                a4 = integer_relu4(x4)
+                                            else:
+                                                a4 = indexer_add_packed_f32x2(x4,abs(x4),rnd=_RND_RN)
                                         else:
-                                            a4 = indexer_add_packed_f32x2(x4,abs(x4),rnd=_RND_RN)
-                                    else:
-                                        a4 = cute.max(x4,zero4,propagate_nan=True)
-                                    w4 = _subview(w_cache,i*(64//num_epi_subtiles)+h,4)
-                                    s_acc = indexer_fma_packed_f32x2(a4,w4,s_acc,rnd=_RND_RN)
-                            score = (s_acc[0]+s_acc[1]+s_acc[2]+s_acc[3])*scale_val
+                                            a4 = cute.max(x4,zero4,propagate_nan=True)
+                                        w4 = _subview(w_cache,i*(64//num_epi_subtiles)+h,4)
+                                        s_acc = indexer_fma_packed_f32x2(a4,w4,s_acc,rnd=_RND_RN)
+                            if cutlass.const_expr(self.native_lowp):
+                                reduced=native_add(self.output_dtype,s_acc[0],s_acc[1])
+                                score=native_sum_fp32(self.output_dtype,reduced)*scale_val
+                            else:
+                                score = (s_acc[0]+s_acc[1]+s_acc[2]+s_acc[3])*scale_val
                             if cutlass.const_expr(self.full_q_blocks) or outrow < num_q_tokens:
                                 valid=(kv_pos>=kv_start)&(kv_pos<kv_end)
                                 if kv_idx%2==0:
@@ -1226,8 +1295,8 @@ class FP8PrefillMQALogitsKernel:
                                 else:
                                     cursor_even=publish_bank(score,valid,tau,0,kv_pos,cursor_even,bank_rows,self.output_dtype,pred_store=(self.pro_packed_store and bank_rows.element_type==cutlass.Int32),raw_half=self.dsv4_cast,unordered=self.dsv4_unordered,pro_raw_packed=(self.pro_packed_store and bank_rows.element_type==cutlass.Int32))
                             kv_idx=kv_idx+1
-                    while kv_idx+7<(min(num_kv,kv_end//128) if cutlass.const_expr(self.dsv4_full_tiles) else num_kv):
-                        for kv_unroll in cutlass.range_constexpr(8):
+                    while kv_idx+(15 if self.native_lowp else 7)<(min(num_kv,kv_end//128) if cutlass.const_expr(self.dsv4_full_tiles) else num_kv):
+                        for kv_unroll in cutlass.range_constexpr(16 if self.native_lowp else 8):
                             kv_pos = kv_idx*128+m_coord
                             if cutlass.const_expr(self.dsv4_direct_sync):
                                 scale_val=mS_raw[kv_pos if cutlass.const_expr(self.dsv4_aligned_k) else min(kv_pos,num_kv_tokens-1)]
@@ -1238,7 +1307,11 @@ class FP8PrefillMQALogitsKernel:
                                 umma_pipeline_0.consumer_wait(umma_cons_state_0,umma_ready)
                             tAcc = tCtAcc_base_0[(None,None,None,umma_cons_state_0.index)][((None,None),0,0)]
                             tTR = thr_copy_ref.partition_S(cute.flat_divide(tAcc,epi_sub_mn))
-                            s_acc = cute.full((4,),0.0,dtype=cutlass.Float32)
+                            if cutlass.const_expr(self.native_lowp):
+                                s_acc=cute.make_rmem_tensor((2,),cutlass.Uint32)
+                                s_acc.fill(0)
+                            else:
+                                s_acc = cute.full((4,),0.0,dtype=cutlass.Float32)
                             for i in cutlass.range_constexpr(num_epi_subtiles):
                                 cute.copy(tiled_copy_ref,tTR[(None,None,None,0,query_slot*num_epi_subtiles+i)],tTR_rAcc)
                                 cute.arch.fence_view_async_tmem_load()
@@ -1250,18 +1323,29 @@ class FP8PrefillMQALogitsKernel:
                                     else:
                                         umma_pipeline_0.consumer_release(umma_cons_state_0)
                                     umma_cons_state_0.advance()
-                                for h in cutlass.range_constexpr(0,64//num_epi_subtiles,4):
-                                    x4 = _subview(tTR_rAcc,h,4)
-                                    if cutlass.const_expr(self.use_relu_trick):
-                                        if cutlass.const_expr((self.dsv4_integer_head_mask >> (i*(64//num_epi_subtiles)+h)) & 1):
-                                            a4 = integer_relu4(x4)
+                                if cutlass.const_expr(self.native_lowp):
+                                    for h in cutlass.range_constexpr(0,64//num_epi_subtiles,4):
+                                        x4=_subview(tTR_rAcc,h,4)
+                                        woff=(i*(64//num_epi_subtiles)+h)//2
+                                        s_acc[0]=native_fma(self.output_dtype,native_fp8_pack_relu(self.output_dtype,x4[0],x4[1]),native_weights[woff],s_acc[0])
+                                        s_acc[1]=native_fma(self.output_dtype,native_fp8_pack_relu(self.output_dtype,x4[2],x4[3]),native_weights[woff+1],s_acc[1])
+                                else:
+                                    for h in cutlass.range_constexpr(0,64//num_epi_subtiles,4):
+                                        x4 = _subview(tTR_rAcc,h,4)
+                                        if cutlass.const_expr(self.use_relu_trick):
+                                            if cutlass.const_expr((self.dsv4_integer_head_mask >> (i*(64//num_epi_subtiles)+h)) & 1):
+                                                a4 = integer_relu4(x4)
+                                            else:
+                                                a4 = indexer_add_packed_f32x2(x4,abs(x4),rnd=_RND_RN)
                                         else:
-                                            a4 = indexer_add_packed_f32x2(x4,abs(x4),rnd=_RND_RN)
-                                    else:
-                                        a4 = cute.max(x4,zero4,propagate_nan=True)
-                                    w4 = _subview(w_cache,i*(64//num_epi_subtiles)+h,4)
-                                    s_acc = indexer_fma_packed_f32x2(a4,w4,s_acc,rnd=_RND_RN)
-                            score = (s_acc[0]+s_acc[1]+s_acc[2]+s_acc[3])*scale_val
+                                            a4 = cute.max(x4,zero4,propagate_nan=True)
+                                        w4 = _subview(w_cache,i*(64//num_epi_subtiles)+h,4)
+                                        s_acc = indexer_fma_packed_f32x2(a4,w4,s_acc,rnd=_RND_RN)
+                            if cutlass.const_expr(self.native_lowp):
+                                reduced=native_add(self.output_dtype,s_acc[0],s_acc[1])
+                                score=native_sum_fp32(self.output_dtype,reduced)*scale_val
+                            else:
+                                score = (s_acc[0]+s_acc[1]+s_acc[2]+s_acc[3])*scale_val
                             if cutlass.const_expr(self.full_q_blocks) or outrow < num_q_tokens:
                                 valid=True if cutlass.const_expr(self.dsv4_full_tiles) else (kv_pos>=kv_start)&(kv_pos<kv_end)
                                 if cutlass.const_expr(kv_unroll%2==0):
@@ -1280,7 +1364,11 @@ class FP8PrefillMQALogitsKernel:
                             umma_pipeline_0.consumer_wait(umma_cons_state_0,umma_ready)
                         tAcc = tCtAcc_base_0[(None,None,None,umma_cons_state_0.index)][((None,None),0,0)]
                         tTR = thr_copy_ref.partition_S(cute.flat_divide(tAcc,epi_sub_mn))
-                        s_acc = cute.full((4,),0.0,dtype=cutlass.Float32)
+                        if cutlass.const_expr(self.native_lowp):
+                            s_acc=cute.make_rmem_tensor((2,),cutlass.Uint32)
+                            s_acc.fill(0)
+                        else:
+                            s_acc = cute.full((4,),0.0,dtype=cutlass.Float32)
                         for i in cutlass.range_constexpr(num_epi_subtiles):
                             cute.copy(tiled_copy_ref,tTR[(None,None,None,0,query_slot*num_epi_subtiles+i)],tTR_rAcc)
                             cute.arch.fence_view_async_tmem_load()
@@ -1292,18 +1380,29 @@ class FP8PrefillMQALogitsKernel:
                                 else:
                                     umma_pipeline_0.consumer_release(umma_cons_state_0)
                                 umma_cons_state_0.advance()
-                            for h in cutlass.range_constexpr(0,64//num_epi_subtiles,4):
-                                x4 = _subview(tTR_rAcc,h,4)
-                                if cutlass.const_expr(self.use_relu_trick):
-                                    if cutlass.const_expr((self.dsv4_integer_head_mask >> (i*(64//num_epi_subtiles)+h)) & 1):
-                                        a4 = integer_relu4(x4)
+                            if cutlass.const_expr(self.native_lowp):
+                                for h in cutlass.range_constexpr(0,64//num_epi_subtiles,4):
+                                    x4=_subview(tTR_rAcc,h,4)
+                                    woff=(i*(64//num_epi_subtiles)+h)//2
+                                    s_acc[0]=native_fma(self.output_dtype,native_fp8_pack_relu(self.output_dtype,x4[0],x4[1]),native_weights[woff],s_acc[0])
+                                    s_acc[1]=native_fma(self.output_dtype,native_fp8_pack_relu(self.output_dtype,x4[2],x4[3]),native_weights[woff+1],s_acc[1])
+                            else:
+                                for h in cutlass.range_constexpr(0,64//num_epi_subtiles,4):
+                                    x4 = _subview(tTR_rAcc,h,4)
+                                    if cutlass.const_expr(self.use_relu_trick):
+                                        if cutlass.const_expr((self.dsv4_integer_head_mask >> (i*(64//num_epi_subtiles)+h)) & 1):
+                                            a4 = integer_relu4(x4)
+                                        else:
+                                            a4 = indexer_add_packed_f32x2(x4,abs(x4),rnd=_RND_RN)
                                     else:
-                                        a4 = indexer_add_packed_f32x2(x4,abs(x4),rnd=_RND_RN)
-                                else:
-                                    a4 = cute.max(x4,zero4,propagate_nan=True)
-                                w4 = _subview(w_cache,i*(64//num_epi_subtiles)+h,4)
-                                s_acc = indexer_fma_packed_f32x2(a4,w4,s_acc,rnd=_RND_RN)
-                        score = (s_acc[0]+s_acc[1]+s_acc[2]+s_acc[3])*scale_val
+                                        a4 = cute.max(x4,zero4,propagate_nan=True)
+                                    w4 = _subview(w_cache,i*(64//num_epi_subtiles)+h,4)
+                                    s_acc = indexer_fma_packed_f32x2(a4,w4,s_acc,rnd=_RND_RN)
+                        if cutlass.const_expr(self.native_lowp):
+                            reduced=native_add(self.output_dtype,s_acc[0],s_acc[1])
+                            score=native_sum_fp32(self.output_dtype,reduced)*scale_val
+                        else:
+                            score = (s_acc[0]+s_acc[1]+s_acc[2]+s_acc[3])*scale_val
                         if cutlass.const_expr(self.full_q_blocks) or outrow < num_q_tokens:
                             valid=(kv_pos>=kv_start)&(kv_pos<kv_end)
                             if kv_idx%2==0:
@@ -1335,7 +1434,7 @@ class FP8PrefillMQALogitsKernel:
                     end_cache = cute.make_rmem_tensor((self.block_q // (self.num_math_threads//128),), cutlass.Int32)
                     tau_cache = cute.make_rmem_tensor((self.block_q // (self.num_math_threads//128),), cutlass.Float32)
                     if cutlass.const_expr(self.num_heads==32):
-                        glm_weights=cute.make_rmem_tensor((queries_per_wg*32,),cutlass.Float32)
+                        glm_weights=cute.make_rmem_tensor((queries_per_wg*(32//2 if self.packed_bf16_weights else 32),),cutlass.Uint32 if self.packed_bf16_weights else cutlass.Float32)
                     if cutlass.const_expr(self.qsa_weights==1):
                         uniform_cache = cute.make_rmem_tensor((queries_per_wg,),cutlass.Float32)
                     for local_q in cutlass.range_constexpr(self.block_q // (self.num_math_threads//128)):
@@ -1349,13 +1448,19 @@ class FP8PrefillMQALogitsKernel:
                         if cutlass.const_expr(self.num_heads==32):
                             if tau_cache[local_q]!=tau_cache[local_q]:tau_cache[local_q]=cutlass.Float32(float("inf"))
                         if cutlass.const_expr(self.num_heads==32):
-                            for cached_h in cutlass.range_constexpr(32):glm_weights[local_q*32+cached_h]=sW[(slot*self.num_heads+cached_h,q_stage_local)]
+                            if cutlass.const_expr(self.packed_bf16_weights):
+                                for cached_h in cutlass.range_constexpr(32//2):
+                                    glm_weights[local_q*(32//2)+cached_h]=native_weight_pair(sW,slot*32+2*cached_h,q_stage_local,cutlass.BFloat16)
+                            else:
+                                if cutlass.const_expr(self.interleaved_queries):
+                                    for cached_h in cutlass.range_constexpr(32):glm_weights[cached_h*2+local_q]=_uniform_weight(mW_raw.iterator+(q_block_idx*self.block_q+slot)*self.num_heads+cached_h)
+                                else:
+                                    for cached_h in cutlass.range_constexpr(32):glm_weights[local_q*32+cached_h]=sW[(slot*self.num_heads+cached_h,q_stage_local)]
                         if cutlass.const_expr(self.qsa_weights==1):
                             uniform_cache[local_q] = sW[(slot*4,q_stage_local)]
                     kv_idx = _kv_lo_for_block(q_block_idx)
-                    # Retire an empty producer tile without scoring it.
-                    # Keep the generic template's Q/weight setup and KV-start
-                    # location unchanged; moving this earlier regresses its loop.
+                    # Retire empty producer tiles after Q/weight setup so the
+                    # empty-range branch does not affect scoring-loop scheduling.
                     if kv_idx >= num_kv:
                         if cutlass.const_expr(self.num_heads == 64 and self.dsv4_direct_sync):
                             cute.arch.mbarrier_wait(storage.umma_mbar_0.data_ptr()+umma_cons_state_0.index,umma_cons_state_0.phase)
@@ -1372,11 +1477,27 @@ class FP8PrefillMQALogitsKernel:
                                 umma_pipeline_0.consumer_wait(umma_cons_state_0)
                                 tAcc = tCtAcc_base_0[(None,None,None,umma_cons_state_0.index)][((None,None),0,0)]
                                 tTR = thr_copy_ref.partition_S(cute.flat_divide(tAcc,epi_sub_mn))
-                                if cutlass.const_expr(self.glm_pair_queries):
+                                if cutlass.const_expr(self.interleaved_queries):
+                                    slot0=query_slot*queries_per_wg
+                                    pair_acc=cute.make_rmem_tensor((8,),cutlass.Float32)
+                                    pair_acc.fill(0.0)
+                                    for chunk in cutlass.range_constexpr(2*num_epi_subtiles):
+                                        cute.copy(tiled_copy_ref,tTR[(None,None,None,0,slot0*num_epi_subtiles+chunk)],tTR_rAcc)
+                                        cute.arch.fence_view_async_tmem_load()
+                                        if cutlass.const_expr(chunk==2*num_epi_subtiles-1):
+                                            umma_pipeline_0.consumer_release(umma_cons_state_0)
+                                            umma_cons_state_0.advance()
+                                        pair_acc=interleaved_partial(tTR_rAcc,glm_weights,pair_acc,chunk*(16//num_epi_subtiles),16//num_epi_subtiles,self.use_relu_trick)
+                                    result=cute.make_tensor(pair_acc.iterator,cute.make_layout(2)).load()
+                                    for chain in cutlass.range_constexpr(1,4):
+                                        result=indexer_add_packed_f32x2(result,cute.make_tensor(pair_acc.iterator+chain*2,cute.make_layout(2)).load(),rnd="rn")
+                                    scores[0]=result[0]*scale_val
+                                    scores[1]=result[1]*scale_val
+                                elif cutlass.const_expr(self.glm_pair_queries):
                                     pair_fragment=cute.make_rmem_tensor(tTR_rAcc.layout,cutlass.Float32)
                                     slot0=query_slot*queries_per_wg
-                                    acc0=cute.full((4,),0.0,dtype=cutlass.Float32)
-                                    acc1=cute.full((4,),0.0,dtype=cutlass.Float32)
+                                    acc0=head_zero(self.output_dtype if self.native_lowp else None)
+                                    acc1=head_zero(self.output_dtype if self.native_lowp else None)
                                     for epi_i in cutlass.range_constexpr(num_epi_subtiles):
                                         cute.copy(tiled_copy_ref,tTR[(None,None,None,0,slot0*num_epi_subtiles+epi_i)],tTR_rAcc)
                                         cute.copy(tiled_copy_ref,tTR[(None,None,None,0,(slot0+1)*num_epi_subtiles+epi_i)],pair_fragment)
@@ -1386,24 +1507,24 @@ class FP8PrefillMQALogitsKernel:
                                             umma_cons_state_0.advance()
                                         acc0,acc1=weighted_pair_partial_cached(tTR_rAcc,pair_fragment,glm_weights,0,
                                             epi_i*(32//num_epi_subtiles),32//num_epi_subtiles,acc0,acc1,
-                                            self.use_relu_trick,self.weights_prepared,integer_period=0)
-                                    scores[0]=(acc0[0]+acc0[1]+acc0[2]+acc0[3])*scale_val
-                                    scores[1]=(acc1[0]+acc1[1]+acc1[2]+acc1[3])*scale_val
+                                            self.use_relu_trick,self.weights_prepared,integer_period=0,native_dtype=self.output_dtype if self.native_lowp else None,fp8=True)
+                                    scores[0]=(head_sum(acc0,self.output_dtype if self.native_lowp else None))*scale_val
+                                    scores[1]=(head_sum(acc1,self.output_dtype if self.native_lowp else None))*scale_val
                                 else:
                                     for local_q in cutlass.range_constexpr(self.block_q // (self.num_math_threads//128)):
                                         slot = query_slot * queries_per_wg + local_q
                                         outrow = q_block_idx * self.block_q + slot
                                         token_idx = outrow if cutlass.const_expr(self.full_q_blocks) else min(outrow,num_q_tokens-1)
                                         if cutlass.const_expr(self.num_heads==32):
-                                            head_acc=cute.full((4,),0.0,dtype=cutlass.Float32)
+                                            head_acc=head_zero(self.output_dtype if self.native_lowp else None)
                                             for epi_i in cutlass.range_constexpr(num_epi_subtiles):
                                                 cute.copy(tiled_copy_ref,tTR[(None,None,None,0,slot*num_epi_subtiles+epi_i)],tTR_rAcc)
                                                 cute.arch.fence_view_async_tmem_load()
                                                 if cutlass.const_expr(local_q==queries_per_wg-1 and epi_i==num_epi_subtiles-1):
                                                     umma_pipeline_0.consumer_release(umma_cons_state_0)
                                                     umma_cons_state_0.advance()
-                                                head_acc=weighted_partial_cached(tTR_rAcc,sW,glm_weights,slot,local_q,q_stage_local,epi_i*(32//num_epi_subtiles),32//num_epi_subtiles,32,head_acc,self.use_relu_trick,self.weights_prepared,integer_period=self.glm_integer_period)
-                                            score=(head_acc[0]+head_acc[1]+head_acc[2]+head_acc[3])*scale_val
+                                                head_acc=weighted_partial_cached(tTR_rAcc,sW,glm_weights,slot,local_q,q_stage_local,epi_i*(32//num_epi_subtiles),32//num_epi_subtiles,32,head_acc,self.use_relu_trick,self.weights_prepared,integer_period=self.glm_integer_period,native_dtype=self.output_dtype if self.native_lowp else None,fp8=True)
+                                            score=(head_sum(head_acc,self.output_dtype if self.native_lowp else None))*scale_val
                                         else:
                                             if cutlass.const_expr(self.N==64):
                                                 cute.copy(tiled_copy_ref,tTR[(None,None,None,0,slot)],tTR_rAcc)
@@ -1424,11 +1545,14 @@ class FP8PrefillMQALogitsKernel:
                                                 elif cutlass.const_expr(self.qsa_weights==1):
                                                     w = uniform_cache[local_q]
                                                 else:
-                                                    w = sW[(slot*4+h,q_stage_local)]
+                                                    w = cutlass.Float32(sW[(slot*4+h,q_stage_local)])
                                                 if cutlass.const_expr(self.use_relu_trick and not self.weights_prepared):w = w*0.5
                                                 shared_w[h] = w
-                                            acc4 = indexer_fma_packed_f32x2(a4,shared_w.load(),zero4,rnd=_RND_RN)
-                                            score = (acc4[0]+acc4[1]+acc4[2]+acc4[3]) *scale_val
+                                            if cutlass.const_expr(self.native_lowp):
+                                                score=head_sum(native_head_fma4(x4,shared_w.load(),head_zero(self.output_dtype),self.output_dtype,True),self.output_dtype) *scale_val
+                                            else:
+                                                acc4 = indexer_fma_packed_f32x2(a4,shared_w.load(),zero4,rnd=_RND_RN)
+                                                score = (acc4[0]+acc4[1]+acc4[2]+acc4[3]) *scale_val
                                         scores[local_q] = score
                                 if cutlass.const_expr(self.num_heads!=32):
                                     umma_pipeline_0.consumer_release(umma_cons_state_0)
@@ -1467,11 +1591,27 @@ class FP8PrefillMQALogitsKernel:
                         umma_pipeline_0.consumer_wait(umma_cons_state_0)
                         tAcc = tCtAcc_base_0[(None,None,None,umma_cons_state_0.index)][((None,None),0,0)]
                         tTR = thr_copy_ref.partition_S(cute.flat_divide(tAcc,epi_sub_mn))
-                        if cutlass.const_expr(self.glm_pair_queries):
+                        if cutlass.const_expr(self.interleaved_queries):
+                            slot0=query_slot*queries_per_wg
+                            pair_acc=cute.make_rmem_tensor((8,),cutlass.Float32)
+                            pair_acc.fill(0.0)
+                            for chunk in cutlass.range_constexpr(2*num_epi_subtiles):
+                                cute.copy(tiled_copy_ref,tTR[(None,None,None,0,slot0*num_epi_subtiles+chunk)],tTR_rAcc)
+                                cute.arch.fence_view_async_tmem_load()
+                                if cutlass.const_expr(chunk==2*num_epi_subtiles-1):
+                                    umma_pipeline_0.consumer_release(umma_cons_state_0)
+                                    umma_cons_state_0.advance()
+                                pair_acc=interleaved_partial(tTR_rAcc,glm_weights,pair_acc,chunk*(16//num_epi_subtiles),16//num_epi_subtiles,self.use_relu_trick)
+                            result=cute.make_tensor(pair_acc.iterator,cute.make_layout(2)).load()
+                            for chain in cutlass.range_constexpr(1,4):
+                                result=indexer_add_packed_f32x2(result,cute.make_tensor(pair_acc.iterator+chain*2,cute.make_layout(2)).load(),rnd="rn")
+                            scores[0]=result[0]*scale_val
+                            scores[1]=result[1]*scale_val
+                        elif cutlass.const_expr(self.glm_pair_queries):
                             pair_fragment=cute.make_rmem_tensor(tTR_rAcc.layout,cutlass.Float32)
                             slot0=query_slot*queries_per_wg
-                            acc0=cute.full((4,),0.0,dtype=cutlass.Float32)
-                            acc1=cute.full((4,),0.0,dtype=cutlass.Float32)
+                            acc0=head_zero(self.output_dtype if self.native_lowp else None)
+                            acc1=head_zero(self.output_dtype if self.native_lowp else None)
                             for epi_i in cutlass.range_constexpr(num_epi_subtiles):
                                 cute.copy(tiled_copy_ref,tTR[(None,None,None,0,slot0*num_epi_subtiles+epi_i)],tTR_rAcc)
                                 cute.copy(tiled_copy_ref,tTR[(None,None,None,0,(slot0+1)*num_epi_subtiles+epi_i)],pair_fragment)
@@ -1481,24 +1621,24 @@ class FP8PrefillMQALogitsKernel:
                                     umma_cons_state_0.advance()
                                 acc0,acc1=weighted_pair_partial_cached(tTR_rAcc,pair_fragment,glm_weights,0,
                                     epi_i*(32//num_epi_subtiles),32//num_epi_subtiles,acc0,acc1,
-                                    self.use_relu_trick,self.weights_prepared,integer_period=0)
-                            scores[0]=(acc0[0]+acc0[1]+acc0[2]+acc0[3])*scale_val
-                            scores[1]=(acc1[0]+acc1[1]+acc1[2]+acc1[3])*scale_val
+                                    self.use_relu_trick,self.weights_prepared,integer_period=0,native_dtype=self.output_dtype if self.native_lowp else None,fp8=True)
+                            scores[0]=(head_sum(acc0,self.output_dtype if self.native_lowp else None))*scale_val
+                            scores[1]=(head_sum(acc1,self.output_dtype if self.native_lowp else None))*scale_val
                         else:
                             for local_q in cutlass.range_constexpr(self.block_q // (self.num_math_threads//128)):
                                 slot = query_slot * queries_per_wg + local_q
                                 outrow = q_block_idx * self.block_q + slot
                                 token_idx = outrow if cutlass.const_expr(self.full_q_blocks) else min(outrow,num_q_tokens-1)
                                 if cutlass.const_expr(self.num_heads==32):
-                                    head_acc=cute.full((4,),0.0,dtype=cutlass.Float32)
+                                    head_acc=head_zero(self.output_dtype if self.native_lowp else None)
                                     for epi_i in cutlass.range_constexpr(num_epi_subtiles):
                                         cute.copy(tiled_copy_ref,tTR[(None,None,None,0,slot*num_epi_subtiles+epi_i)],tTR_rAcc)
                                         cute.arch.fence_view_async_tmem_load()
                                         if cutlass.const_expr(local_q==queries_per_wg-1 and epi_i==num_epi_subtiles-1):
                                             umma_pipeline_0.consumer_release(umma_cons_state_0)
                                             umma_cons_state_0.advance()
-                                        head_acc=weighted_partial_cached(tTR_rAcc,sW,glm_weights,slot,local_q,q_stage_local,epi_i*(32//num_epi_subtiles),32//num_epi_subtiles,32,head_acc,self.use_relu_trick,self.weights_prepared,integer_period=self.glm_integer_period)
-                                    score=(head_acc[0]+head_acc[1]+head_acc[2]+head_acc[3])*scale_val
+                                        head_acc=weighted_partial_cached(tTR_rAcc,sW,glm_weights,slot,local_q,q_stage_local,epi_i*(32//num_epi_subtiles),32//num_epi_subtiles,32,head_acc,self.use_relu_trick,self.weights_prepared,integer_period=self.glm_integer_period,native_dtype=self.output_dtype if self.native_lowp else None,fp8=True)
+                                    score=(head_sum(head_acc,self.output_dtype if self.native_lowp else None))*scale_val
                                 else:
                                     if cutlass.const_expr(self.N==64):
                                         cute.copy(tiled_copy_ref,tTR[(None,None,None,0,slot)],tTR_rAcc)
@@ -1519,11 +1659,14 @@ class FP8PrefillMQALogitsKernel:
                                         elif cutlass.const_expr(self.qsa_weights==1):
                                             w = uniform_cache[local_q]
                                         else:
-                                            w = sW[(slot*4+h,q_stage_local)]
+                                            w = cutlass.Float32(sW[(slot*4+h,q_stage_local)])
                                         if cutlass.const_expr(self.use_relu_trick and not self.weights_prepared):w = w*0.5
                                         shared_w[h] = w
-                                    acc4 = indexer_fma_packed_f32x2(a4,shared_w.load(),zero4,rnd=_RND_RN)
-                                    score = (acc4[0]+acc4[1]+acc4[2]+acc4[3]) *scale_val
+                                    if cutlass.const_expr(self.native_lowp):
+                                        score=head_sum(native_head_fma4(x4,shared_w.load(),head_zero(self.output_dtype),self.output_dtype,True),self.output_dtype) *scale_val
+                                    else:
+                                        acc4 = indexer_fma_packed_f32x2(a4,shared_w.load(),zero4,rnd=_RND_RN)
+                                        score = (acc4[0]+acc4[1]+acc4[2]+acc4[3]) *scale_val
                                 scores[local_q] = score
                         if cutlass.const_expr(self.num_heads!=32):
                             umma_pipeline_0.consumer_release(umma_cons_state_0)
@@ -1615,3 +1758,24 @@ from .weighted_heads import weighted_partial_cached
 from .qsa_publish import publish_pair as fused_publish_pair
 
 from .weighted_heads import weighted_pair_partial_cached
+
+from .fp4_safe_filter import _uniform_weight
+@cute.jit
+def interleaved_partial(fragment,weights,acc,offset:cutlass.Constexpr,width:cutlass.Constexpr,relu:cutlass.Constexpr):
+    # Pair across queries; keep the original head order in each FP32 chain.
+    for h in cutlass.range_constexpr(width):
+        x=cute.make_tensor(fragment.iterator+h*2,cute.make_layout(2)).load()
+        if cutlass.const_expr(relu):positive=indexer_add_packed_f32x2(x,abs(x),rnd="rn")
+        else:positive=cute.max(x,cute.full((2,),0.0,dtype=cutlass.Float32),propagate_nan=True)
+        w=cute.make_tensor(weights.iterator+(offset+h)*2,cute.make_layout(2)).load()
+        chain=cute.make_tensor(acc.iterator+((offset+h)%4)*2,cute.make_layout(2))
+        chain.store(indexer_fma_packed_f32x2(positive,w,chain.load(),rnd="rn"))
+    return acc
+
+from .native_lowp_math import native_pack, native_pack_relu, native_fma, native_add, native_lo, native_hi, native_sum_fp32
+
+from .native_lowp_math import native_fp8_pack, native_fp8_pack_relu
+
+from .native_heads import head_zero, head_sum, native_head_fma4
+
+from .native_heads import native_weight_pair

@@ -1894,8 +1894,7 @@ class FP4PrefillMQALogitsKernel:
                             if cutlass.const_expr(self.qsa_weights==1):
                                 uniform_cache[local_q] = sW[(slot*4,q_stage_local)]
                         kv_idx = _kv_lo_for_block(q_block_idx)
-                        # Retire an empty capacity tile without changing the
-                        # original scoring-loop bound or Q/weight load order.
+                        # Retire empty capacity tiles without scoring or reordering Q/weight loads.
                         if kv_idx >= num_kv:
                             cute.arch.mbarrier_wait(
                                 math_barriers + umma_cons_state_0.index,
@@ -2275,8 +2274,7 @@ class FP4PrefillMQALogitsKernel:
                             if cutlass.const_expr(self.qsa_weights==1):
                                 uniform_cache[local_q] = sW[(slot*4,q_stage_local)]
                         kv_idx = _kv_lo_for_block(q_block_idx)
-                        # Retire an empty capacity tile without changing the
-                        # original scoring-loop bound or Q/weight load order.
+                        # Retire empty capacity tiles without scoring or reordering Q/weight loads.
                         if kv_idx >= num_kv:
                             cute.arch.mbarrier_wait(
                                 math_barriers + umma_cons_state_0.index,
