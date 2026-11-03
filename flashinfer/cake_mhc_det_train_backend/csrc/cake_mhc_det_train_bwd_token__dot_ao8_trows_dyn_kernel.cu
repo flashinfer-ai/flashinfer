@@ -142,7 +142,7 @@ kernel_cake_mhc_det_train_bwd_token__dot_ao8_trows_dyn(__nv_bfloat16* __restrict
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     float* dpre_part = reinterpret_cast<float*>(smem_raw + 1024);
     const int dpre_part_addr = smem + 1024;
     unsigned int* _tkv = reinterpret_cast<unsigned int*>(smem_raw + 3072);
@@ -154,8 +154,7 @@ kernel_cake_mhc_det_train_bwd_token__dot_ao8_trows_dyn(__nv_bfloat16* __restrict
     uint8_t* ring = reinterpret_cast<uint8_t*>(smem_raw + 11264);
     const int ring_addr = smem + 11264;
 
-    // Mbarrier init (2 pipeline groups, 0 ordered-sequence groups, 18 barriers)
-    // Mbarriers at smem_raw[0..144)
+    // Mbarrier init (18 barriers at smem_raw[0..144))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -302,17 +301,17 @@ kernel_cake_mhc_det_train_bwd_token__dot_ao8_trows_dyn(__nv_bfloat16* __restrict
         int t1 = ((g0 + 8 < T) ? g0 + 8 : T);
         int t_last = t1 - 1;
         int th_1_0 = g0 + 2;
-        long long th_t_0 = (long long)(((th_1_0 < t1) ? th_1_0 : t_last));
+        long long th_t_0 = (long long)((th_1_0 < t1) ? th_1_0 : t_last);
         int th_1_1 = g0 + 3;
-        long long th_t_1 = (long long)(((th_1_1 < t1) ? th_1_1 : t_last));
+        long long th_t_1 = (long long)((th_1_1 < t1) ? th_1_1 : t_last);
         int th_1_2 = g0 + 4;
-        long long th_t_2 = (long long)(((th_1_2 < t1) ? th_1_2 : t_last));
+        long long th_t_2 = (long long)((th_1_2 < t1) ? th_1_2 : t_last);
         int th_1_3 = g0 + 5;
-        long long th_t_3 = (long long)(((th_1_3 < t1) ? th_1_3 : t_last));
+        long long th_t_3 = (long long)((th_1_3 < t1) ? th_1_3 : t_last);
         int th_1_4 = g0 + 6;
-        long long th_t_4 = (long long)(((th_1_4 < t1) ? th_1_4 : t_last));
+        long long th_t_4 = (long long)((th_1_4 < t1) ? th_1_4 : t_last);
         int th_1_5 = g0 + 7;
-        long long th_t_5 = (long long)(((th_1_5 < t1) ? th_1_5 : t_last));
+        long long th_t_5 = (long long)((th_1_5 < t1) ? th_1_5 : t_last);
         int tok = g0 + warp_0;
         int cur_base = (gi[0] & 1) * 256 + warp_0 * 32;
         int own_base = (gi[0] & 1) * 256 + warp_0 * 4 + lane_hi;
@@ -3910,13 +3909,13 @@ kernel_cake_mhc_det_train_bwd_token__dot_ao8_trows_dyn(__nv_bfloat16* __restrict
         unsigned int tku[1];
         asm volatile("ld.shared.b32 %0, [%1];" : "=r"(*reinterpret_cast<uint32_t*>(&tku[0])) : "r"(tkv_addr + tc * 4) : "memory");
         int gtk;
-        asm volatile("redux.sync.max.s32 %0, %1, 0xffffffff;" : "=r"(gtk) : "r"((int)tku[0]));
+        asm volatile("redux.sync.max.s32 %0, %1, 0xFFFFFFFF;" : "=r"(gtk) : "r"((int)tku[0]));
         bool nv = gtk < g_end;
         int gn8 = gtk * 8;
         int gn_end = ((gn8 + 8 < T) ? gn8 + 8 : T);
         int gn1 = ((gn8 + 1 < gn_end) ? gn8 + 1 : gn_end - 1);
-        long long t6 = (long long)(((nv) ? gn8 : t_last));
-        long long t7 = (long long)(((nv) ? gn1 : t_last));
+        long long t6 = (long long)((nv) ? gn8 : t_last);
+        long long t7 = (long long)((nv) ? gn1 : t_last);
         mbarrier_wait(ring_bar_addr + (st_a) * 8, 1);
         unsigned int ring_pk_29[8];
         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"

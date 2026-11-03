@@ -1241,7 +1241,8 @@ def swap_small_m(L: int, M: int, N: int, transposed_out: bool) -> bool:
 # (arch, A MN-major, B MN-major, fp32 output, transposed output, batched, N, K, M); a ragged rule leaves the
 # token count out (M = None for forward / input gradients, K = None for weight gradients), and an exact key names
 # one token count (the 216-SM tranche's sm_107a T-exact weight-gradient rules at K = 16231 and 16384; the GB
-# T-exact forward / input-gradient rules of sm_100a and sm_103a at M = 16172, 16231 or 16384).
+# T-exact forward / input-gradient rules of sm_100a and sm_103a at M = 16172, 16231 or 16384; the GB T-exact
+# weight-gradient rules of sm_100a and sm_103a at K = 16231 or 16384).
 # The round-2 to round-33 rules mirror the former launcher's row table; the shapes tranche below them (sm_100a and
 # sm_103a) was measured with this package's planner and extends it per architecture (three round-33 sm_100a keys were
 # re-measured and re-valued there).  An architecture-wide default (``ARCH_RULE_DEFAULTS``, round 33) sits under every rule
@@ -1549,6 +1550,15 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_100a', False, False, False, False, False, 6144, 2048, 16231): {"block_n": 256, "cta_rows": 128, "htail": True, "cgrp": True, "pro": 15},
     ('sm_100a', False, True, False, False, False, 6144, 2048, 16172): {"block_n": 256, "cta_rows": 128, "htail": True, "cgrp": True, "pro": 15, "group_m": 16},
     ('sm_100a', False, True, False, False, False, 6144, 2048, 16231): {"block_n": 256, "cta_rows": 128, "htail": True, "cgrp": True, "pro": 15, "group_m": 16},
+    # ---- sm_100a: the GB T-exact rules of round 2 - the q_b 2048 x 16384 input gradient (the ragged rule's overlapped
+    #      half-tail program with the column-grouped raster: 8-column-tile groups at T 16172, 16-column-tile groups at T 16231) and the
+    #      17408 -> 5120 weight gradient in its direct orientation (the half-tail program through the one-slot TMA store,
+    #      12-row raster groups, at T 16231 / 16384), each with the per-tile K partitions of the row's plan without it,
+    #      measured on GB200 against that plan ----
+    ('sm_100a', False, True, False, False, False, 2048, 16384, 16172): {"cta_rows": 256, "sk_parts": 2, "ovl": True, "htail": True, "cgrp": True, "group_m": 8},
+    ('sm_100a', False, True, False, False, False, 2048, 16384, 16231): {"cta_rows": 256, "sk_parts": 2, "ovl": True, "htail": True, "cgrp": True, "group_m": 16},
+    ('sm_100a', True, True, False, False, False, 17408, 16231, 5120): {"cta_rows": 256, "htail": True, "epi": 'tma', "slots": 1, "group_m": 12},
+    ('sm_100a', True, True, False, False, False, 17408, 16384, 5120): {"cta_rows": 256, "htail": True, "epi": 'tma', "slots": 1, "group_m": 12},
     # ---- sm_103a: the shapes tranche - forward / input gradient / weight gradient rows at K 4096 - 17408 and N 32 - 17408,
     #      measured with this package's planner against cuBLAS on GB300 at T 16172 - 16384 (see the test table
     #      MEASURED_SHAPE_ROWS); a row whose measured choice equals the planner's default carries no rule ----
@@ -1660,6 +1670,16 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_103a', False, False, False, False, False, 6144, 2048, 16231): {"block_n": 256, "cta_rows": 128, "htail": True, "cgrp": True, "pro": 15},
     ('sm_103a', False, True, False, False, False, 6144, 2048, 16172): {"block_n": 256, "cta_rows": 128, "htail": True, "cgrp": True, "pro": 15, "group_m": 16},
     ('sm_103a', False, True, False, False, False, 6144, 2048, 16231): {"block_n": 256, "cta_rows": 128, "htail": True, "cgrp": True, "pro": 15, "group_m": 16},
+    # ---- sm_103a: the GB T-exact rules of round 2 - the q_b 2048 x 16384 input gradient (the column-grouped raster
+    #      in 16-column-tile groups at T 16172 / 16231) and the 5120 -> 17408 / 17408 -> 5120 weight gradients at
+    #      T 16231 / 16384 (the half-tail program through the one-slot TMA store, 12-row raster groups: the sm_100a key's
+    #      program on the 17408 -> 5120 row, restated here), measured on GB300 like the sm_100a rules above ----
+    ('sm_103a', False, True, False, False, False, 2048, 16384, 16172): {"cta_rows": 256, "sk_parts": 2, "ovl": True, "htail": True, "cgrp": True, "group_m": 16},
+    ('sm_103a', False, True, False, False, False, 2048, 16384, 16231): {"cta_rows": 256, "sk_parts": 2, "ovl": True, "htail": True, "cgrp": True, "group_m": 16},
+    ('sm_103a', True, True, False, False, False, 5120, 16231, 17408): {"cta_rows": 256, "htail": True, "epi": 'tma', "slots": 1, "group_m": 12},
+    ('sm_103a', True, True, False, False, False, 5120, 16384, 17408): {"cta_rows": 256, "htail": True, "epi": 'tma', "slots": 1, "group_m": 12},
+    ('sm_103a', True, True, False, False, False, 17408, 16231, 5120): {"cta_rows": 256, "htail": True, "epi": 'tma', "slots": 1, "group_m": 12},
+    ('sm_103a', True, True, False, False, False, 17408, 16384, 5120): {"cta_rows": 256, "htail": True, "epi": 'tma', "slots": 1, "group_m": 12},
 }
 # fmt: on
 

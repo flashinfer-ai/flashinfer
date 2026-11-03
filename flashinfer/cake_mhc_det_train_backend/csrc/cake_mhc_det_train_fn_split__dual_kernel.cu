@@ -89,7 +89,7 @@ kernel_cake_mhc_det_train_fn_split__dual(float* __restrict__ fn, __nv_bfloat16* 
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     unsigned int* tile = reinterpret_cast<unsigned int*>(smem_raw + 0);
     const int tile_addr = smem + 0;
 

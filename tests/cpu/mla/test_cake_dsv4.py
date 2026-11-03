@@ -2403,6 +2403,7 @@ def test_every_route_result_has_a_registered_kernel(monkeypatch, arch):
                             compressed_page_size=page_size,
                             num_query_tokens=tokens,
                             sm_count=_SM_COUNT,
+                            arch=arch,
                         )
                     except ValueError:
                         rejected += 1
@@ -2510,7 +2511,7 @@ def test_bf16_h128_prefill_launches_the_snake_body_for_tail_majority_rows(
             2,
             260,
             "fp8_h64_prefill_source_persistent_m64_multi_tile",
-        ),  # 12 tokens, 2 tiles: the M64 body beats the H64 cluster body
+        ),  # 12 tokens, 2 tiles, no arch: the M64 body (SM100 / SM103: below)
         (16, 64, 640, "fp8_h128_prefill_source_persistent_uniform"),  # hardening-000018
         (64, 64, 640, "fp8_h128_prefill_source_persistent_uniform"),  # hardening-000030
         (
@@ -2569,6 +2570,76 @@ def test_fp8_h64_rows_follow_the_persistent_body_rule(
         )
         == expected
     )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a", None])
+@pytest.mark.parametrize("page_size", [2, 64])
+@pytest.mark.parametrize("sparse_topk", [252, 256, 260, 380, 384])
+def test_fp8_h64_two_tile_decode_rows_take_the_h64_cluster_body_on_sm100_sm103(
+    arch, page_size, sparse_topk
+):
+    """FP8/H64 decode rows of at most 12 tokens with two complete tiles and a
+    partial third run the H64 cluster body where it is built (SM100 / SM103);
+    width 256 and one complete tile keep the M64 body, three tiles or 13+
+    tokens the persistent body, and SM107 or an unknown architecture the M64
+    body."""
+    for tokens in range(1, 14):
+        route = _route(
+            dtype=torch.float8_e4m3fn,
+            num_heads=64,
+            batch_size=3,
+            max_q_len=5,
+            ragged=True,
+            sparse_topk=sparse_topk,
+            compressed_page_size=page_size,
+            num_query_tokens=tokens,
+            sm_count=_SM_COUNT,
+            arch=arch,
+        )
+        full_tiles = sparse_topk // 128
+        if full_tiles >= (3 if tokens <= 12 else 2):
+            expected = "fp8_h128_prefill_source_persistent_uniform"
+        elif 256 < sparse_topk < 384 and arch in ("sm_100a", "sm_103a"):
+            expected = "fp8_lowhead_h64"
+        else:
+            expected = "fp8_h64_prefill_source_persistent_m64_multi_tile"
+        assert route == expected, (tokens, route)
+        if arch is not None:
+            assert route in _ARCH_REGISTRATIONS[arch]["variants"], (arch, route)
+
+
+@pytest.mark.cpu_only
+def test_workspace_requirement_routes_by_the_device_arch(monkeypatch):
+    """The requirement's route follows the architecture the launch routes by;
+    the workspace numbers do not depend on it."""
+    shape = dict(
+        dtype=torch.float8_e4m3fn,
+        num_heads=64,
+        num_query_tokens=12,
+        sm_count=_SM_COUNT,
+        sparse_topk=260,
+        compressed_page_size=2,
+        max_q_len=5,
+        batch_size=3,
+        ragged=True,
+    )
+    h64 = cake.cake_dsv4_workspace_requirement(**shape, arch="sm_100a")
+    m64 = cake.cake_dsv4_workspace_requirement(**shape, arch="sm_107a")
+    assert h64.route == "fp8_lowhead_h64"
+    assert m64.route == "fp8_h64_prefill_source_persistent_m64_multi_tile"
+    assert (h64.single_launch_bytes, h64.minimum_bytes) == (
+        m64.single_launch_bytes,
+        m64.minimum_bytes,
+    )
+    # arch=None: the current CUDA device's architecture, whatever sm_count says.
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(cake, "_target_arch", lambda device: "sm_103a")
+    assert cake.cake_dsv4_workspace_requirement(**shape).route == "fp8_lowhead_h64"
+    # Without CUDA: the route every architecture builds.
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    assert cake.cake_dsv4_workspace_requirement(**shape).route == m64.route
 
 
 @pytest.mark.cpu_only
@@ -3022,6 +3093,7 @@ def test_route_plan_matches_the_dispatcher(monkeypatch, arch):
                             compressed_page_size=page_size,
                             num_query_tokens=tokens,
                             sm_count=_SM_COUNT,
+                            arch=arch,
                         )
                     except ValueError:
                         continue

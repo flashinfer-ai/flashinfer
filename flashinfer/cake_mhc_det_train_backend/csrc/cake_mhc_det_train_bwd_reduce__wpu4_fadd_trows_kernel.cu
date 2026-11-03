@@ -88,7 +88,7 @@ kernel_cake_mhc_det_train_bwd_reduce__wpu4_fadd_trows(float* __restrict__ dfn_pa
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     float* vw = reinterpret_cast<float*>(smem_raw + 0);
     const int vw_addr = smem + 0;
 

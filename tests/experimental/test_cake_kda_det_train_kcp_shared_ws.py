@@ -29,7 +29,6 @@ task).
 import gc
 import json
 import os
-import socket
 import tempfile
 import time
 import weakref
@@ -39,6 +38,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from tests.experimental.test_cake_kda_det_train_kcp_dist import _init_group, _rendezvous
 from tests.test_helpers.cake_host_sync import (
     allocator_counts,
     census,
@@ -1317,16 +1317,14 @@ def _dist_row_id(row) -> str:
     return f"p{len(packs)}-h{H}-w{W}-{layout}-{exchange}"
 
 
-def _rank_packs(rank: int, W: int, row, port: int):
+def _rank_packs(rank: int, W: int, row, rdzv: str | None):
     """This rank's device (the process group initialized for ``W > 1``), the row's packs prepared on it and seeded
     operands per pack."""
     packs, H, _w, layout, exchange = row
     device = torch.device("cuda", rank % max(torch.cuda.device_count(), 1))
     torch.cuda.set_device(device)
     if W > 1 and not dist.is_initialized():
-        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-        os.environ.setdefault("MASTER_PORT", str(port))
-        dist.init_process_group("nccl", rank=rank, world_size=W, device_id=device)
+        _init_group(rank, W, device, rdzv)
     group = dist.group.WORLD if W > 1 else None
     ctxs = [
         kp.build_context_det_kcp(_part(lengths, W, layout), group, rank, device)
@@ -1343,13 +1341,15 @@ def _rank_packs(rank: int, W: int, row, port: int):
     return device, ctxs, ops
 
 
-def _run_dist_rank(rank: int, W: int, row, port: int, result_dir: str | None) -> dict:
+def _run_dist_rank(
+    rank: int, W: int, row, rdzv: str | None, result_dir: str | None
+) -> dict:
     """One rank: the four packs on one workspace per pack (reference) and on one reserved shared workspace (the
     interleaved schedule, the arena NaN-filled before every forward), bitwise compared on this rank; the shared
     workspace's bytes against ``kda_det_workspace_bytes_kcp(ctxs)`` and the per-pack sum, pointer stability over two rounds.
     The verdicts are gathered to every rank."""
     packs, H, _w, layout, exchange = row
-    device, ctxs, ops = _rank_packs(rank, W, row, port)
+    device, ctxs, ops = _rank_packs(rank, W, row, rdzv)
     kw = {"exchange": exchange}
     ring = exchange == "ring"
     report: dict = {"rank": rank, "row": _dist_row_id(row), "pass": True, "fail": []}
@@ -1419,22 +1419,16 @@ def _run_dist_rank(rank: int, W: int, row, port: int, result_dir: str | None) ->
 
 
 def _spawn_dist_entry(
-    rank: int, W: int, row, port: int, result_dir: str, kind: str = "shared"
+    rank: int, W: int, row, rdzv: str | None, result_dir: str, kind: str = "shared"
 ) -> None:
     try:
-        report = RANK_RUNNERS[kind](rank, W, row, port, result_dir)
+        report = RANK_RUNNERS[kind](rank, W, row, rdzv, result_dir)
         if not report["pass"]:
             raise AssertionError(f"rank {rank}: {report}")
     finally:
         if dist.is_initialized():
             cake_kcp.graph_cache_clear()
             dist.destroy_process_group()
-
-
-def _free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
 
 
 @pytest.mark.parametrize("row", DIST_ROWS, ids=_dist_row_id)
@@ -1458,7 +1452,7 @@ def _launch(row, kind: str) -> None:
             int(os.environ["SLURM_PROCID"]),
             W,
             row,
-            int(os.environ.get("MASTER_PORT", "29500")),
+            None,
             os.environ.get("KCP_TEST_RESULT_DIR"),
         )
         assert report["pass"], report
@@ -1470,7 +1464,7 @@ def _launch(row, kind: str) -> None:
         result_dir = os.environ.get("KCP_TEST_RESULT_DIR") or tmp
         mp.start_processes(
             _spawn_dist_entry,
-            args=(W, row, _free_port(), result_dir, kind),
+            args=(W, row, _rendezvous(tmp), result_dir, kind),
             nprocs=W,
             join=True,
             start_method="spawn",
@@ -1489,7 +1483,9 @@ def _handle_row_id(row) -> str:
     return "handles-" + _dist_row_id(row)
 
 
-def _run_handle_rank(rank: int, W: int, row, port: int, result_dir: str | None) -> dict:
+def _run_handle_rank(
+    rank: int, W: int, row, rdzv: str | None, result_dir: str | None
+) -> dict:
     """One rank: the row's packs on one workspace per pack without handles (the reference), then on ONE reserved
     shared workspace with two checkpointed layers per pack and one recompute handle per pack and layer, for every
     tier (``"transfer"`` with a2a only) and both orders (:func:`_handle_pass`; the arena and the pools poisoned
@@ -1498,7 +1494,7 @@ def _run_handle_rank(rank: int, W: int, row, port: int, result_dir: str | None) 
     no pointer moved.  The stored element counts are gathered: the row must store non-empty tensors on some rank (of
     each tier's members).  The verdicts are gathered to every rank."""
     _packs_, H, _w, _layout, exchange = row
-    _device, ctxs, ops = _rank_packs(rank, W, row, port)
+    _device, ctxs, ops = _rank_packs(rank, W, row, rdzv)
     kw = {"exchange": exchange}
     report: dict = {"rank": rank, "row": _handle_row_id(row), "pass": True, "fail": []}
     ref, _ = _handle_pass(ctxs, ops, [_new_ws() for _ in ctxs], **kw)

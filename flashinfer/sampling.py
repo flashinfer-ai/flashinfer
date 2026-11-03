@@ -1257,9 +1257,10 @@ def top_p_sampling_from_probs(
         shape should be ``(unique_batch_size, num_classes)`` where unique_batch_size is the number of unique
         probability distributions.
     top_p: Union[torch.Tensor, float]
-        Either a float or a tensor of shape ``(batch_size,)``, representing the threshold for top-p sampling.
+        Either a float or a tensor of shape ``(batch_size,)``, or ``(unique_batch_size,)`` when indices is
+        provided, representing the threshold for top-p sampling.
         If a float, the same threshold is used for all requests.
-        If a tensor, each request has its own threshold.
+        If a tensor, each row of probs has its own threshold, and outputs that indices maps to the same row share it.
     indices: Optional[torch.Tensor]
         Optional indices tensor of shape ``(batch_size,)``, dtype ``torch.int32`` or ``torch.int64``
         that maps each output to a row in probs. The output tensor will have the same dtype as indices.
@@ -1387,9 +1388,10 @@ def top_k_sampling_from_probs(
         shape should be ``(unique_batch_size, num_classes)`` where unique_batch_size is the number of unique
         probability distributions.
     top_k: Union[torch.Tensor, int]
-        Either a scalar or a tensor of shape ``(batch_size,)``, representing the threshold for top-k sampling.
+        Either a scalar or a tensor of shape ``(batch_size,)``, or ``(unique_batch_size,)`` when indices is
+        provided, representing the threshold for top-k sampling.
         If a scalar, the same threshold is used for all requests.
-        If a tensor, each request has its own threshold.
+        If a tensor, each row of probs has its own threshold, and outputs that indices maps to the same row share it.
     indices: Optional[torch.Tensor]
         Optional indices tensor of shape ``(batch_size,)``, dtype ``torch.int32`` or ``torch.int64``
         that maps each output to a row in probs. The output tensor will have the same dtype as indices.
@@ -1518,9 +1520,10 @@ def min_p_sampling_from_probs(
         shape should be ``(unique_batch_size, num_classes)`` where unique_batch_size is the number of unique
         probability distributions.
     min_p: Union[torch.Tensor, float]
-        Either a scalar or a tensor of shape ``(batch_size,)``, representing the threshold for min-p sampling.
+        Either a scalar or a tensor of shape ``(batch_size,)``, or ``(unique_batch_size,)`` when indices is
+        provided, representing the threshold for min-p sampling.
         If a scalar, the same threshold is used for all requests.
-        If a tensor, each request has its own threshold.
+        If a tensor, each row of probs has its own threshold, and outputs that indices maps to the same row share it.
     indices: Optional[torch.Tensor]
         Optional indices tensor of shape ``(batch_size,)``, dtype ``torch.int32`` or ``torch.int64``
         that maps each output to a row in probs. The output tensor will have the same dtype as indices.
@@ -1640,8 +1643,14 @@ def _top_k_first_fast_path_applicable(
     # deriving the bound from top_k.max() would add a host sync on every call.
     # Other tensor shapes fall back, which raises ValueError.
     select_k = top_k if isinstance(top_k, int) else top_k_max
+    valid_indices = indices is None or (
+        isinstance(indices, torch.Tensor)
+        and indices.ndim == 1
+        and indices.device == x.device
+        and indices.dtype in (torch.int32, torch.int64)
+    )
     return (
-        indices is None
+        valid_indices
         and (isinstance(top_k, int) or top_k.shape == (x.size(0),))
         and select_k is not None
         and 0 < select_k <= _TOP_K_FIRST_FAST_PATH_MAX_K
@@ -1654,6 +1663,7 @@ def _top_k_first_fast_path(
     x: torch.Tensor,
     top_k: Union[torch.Tensor, int],
     top_p: Union[torch.Tensor, float],
+    indices: Optional[torch.Tensor],
     *,
     top_k_max: Optional[int] = None,
     from_logits: bool,
@@ -1669,8 +1679,9 @@ def _top_k_first_fast_path(
     Selects the top-k entries with the parallel radix/cluster top-k kernel, then runs
     top-p sampling over only those k entries. ``sorted=True`` gives an identical,
     deterministic ordering for both logits and probs inputs, so the two entry points
-    reduce to the same ``probs_k`` and stay sample-aligned. This is distribution-equivalent
-    to the masked full-vocab path (validated TV ~0.01) but far cheaper at small batch.
+    reduce to the same ``probs_k`` and stay sample-aligned. Passing ``indices`` through
+    the compact sampling step also keeps the exact-k boundary-tie behavior independent
+    of whether ``indices`` is provided, without expanding the compact rows.
 
     A ``top_k`` tensor selects ``top_k_max`` sorted entries, so masking each row past
     its own k leaves exactly its top-k.
@@ -1699,10 +1710,11 @@ def _top_k_first_fast_path(
     else:
         # renormalizing the k retained probabilities == top_k_renorm over the full vocab.
         probs_k = values / values.sum(dim=-1, keepdim=True)
+
     result = top_p_sampling_from_probs(
         probs_k,
         top_p,
-        None,
+        indices,
         deterministic,
         check_nan=check_nan,
         generator=generator,
@@ -1712,11 +1724,14 @@ def _top_k_first_fast_path(
     )
 
     def _map(local):
-        return (
-            gathered_indices.gather(1, local.view(-1, 1).long())
-            .squeeze(1)
-            .to(torch.int32)
-        )
+        if indices is None:
+            # Avoid advanced-indexing setup on the common non-indexed fast path.
+            return (
+                gathered_indices.gather(1, local.view(-1, 1).long())
+                .squeeze(1)
+                .to(torch.int32)
+            )
+        return gathered_indices[indices.long(), local.long()].to(indices.dtype)
 
     if return_valid:
         local, valid = result
@@ -1754,19 +1769,21 @@ def top_k_top_p_sampling_from_logits(
         shape should be ``(unique_batch_size, num_classes)`` where unique_batch_size is the number of unique
         probability distributions.
     top_k: Union[torch.Tensor, int]
-        Either a scalar or a tensor of shape ``(batch_size,)``, representing the threshold for top-k sampling.
+        Either a scalar or a tensor of shape ``(batch_size,)``, or ``(unique_batch_size,)`` when indices is
+        provided, representing the threshold for top-k sampling.
         If a scalar, the same threshold is used for all requests.
-        If a tensor, each request has its own threshold.
+        If a tensor, each row of logits has its own threshold, and outputs that indices maps to the same row share it.
     top_p: Union[torch.Tensor, float]
-        Either a scalar or a tensor of shape ``(batch_size,)``, representing the threshold for top-p sampling.
+        Either a scalar or a tensor of shape ``(batch_size,)``, or ``(unique_batch_size,)`` when indices is
+        provided, representing the threshold for top-p sampling.
         If a scalar, the same threshold is used for all requests.
-        If a tensor, each request has its own threshold.
+        If a tensor, each row of logits has its own threshold, and outputs that indices maps to the same row share it.
     indices: Optional[torch.Tensor]
         Optional indices tensor of shape ``(batch_size,)``, dtype ``torch.int32`` or ``torch.int64``
-        that maps each output to a row in probs. The output tensor will have the same dtype as indices.
-        For example, if indices[i] = j, then the i-th output will be sampled from probs[j].
+        that maps each output to a row in logits. The output tensor will have the same dtype as indices.
+        For example, if indices[i] = j, then the i-th output will be sampled from logits[j].
         This allows reusing the same probability distribution for multiple outputs.
-        If indices is not provided, the i-th output will be sampled from the i-th row of probs
+        If indices is not provided, the i-th output will be sampled from the i-th row of logits
         and output dtype defaults to ``torch.int32``.
     filter_apply_order: str
         The order of applying top-k and top-p sampling, should be either ``"top_k_first"`` or ``"joint"``.
@@ -1807,7 +1824,7 @@ def top_k_top_p_sampling_from_logits(
         incremented based on the number of random values consumed by the operation.
     top_k_max: Optional[int]
         Unchecked upper bound on a ``top_k`` tensor; keep it tight. Used only with
-        ``"top_k_first"``, no ``indices``, ``top_k_max <= 256`` and ``num_classes >= 65536``,
+        ``"top_k_first"``, ``top_k_max <= 256`` and ``num_classes >= 65536``,
         where rows above it (including "no top-k" rows) sample with ``top_k = top_k_max``.
         Otherwise ignored. Default is ``None``.
 
@@ -1860,6 +1877,7 @@ def top_k_top_p_sampling_from_logits(
                 logits,
                 top_k,
                 top_p,
+                indices,
                 top_k_max=top_k_max,
                 from_logits=True,
                 deterministic=deterministic,
@@ -1930,13 +1948,15 @@ def top_k_top_p_sampling_from_probs(
         shape should be ``(unique_batch_size, num_classes)`` where unique_batch_size is the number of unique
         probability distributions.
     top_k: Union[torch.Tensor, int]
-        Either a scalar or a tensor of shape ``(batch_size,)``, representing the threshold for top-k sampling.
+        Either a scalar or a tensor of shape ``(batch_size,)``, or ``(unique_batch_size,)`` when indices is
+        provided, representing the threshold for top-k sampling.
         If a scalar, the same threshold is used for all requests.
-        If a tensor, each request has its own threshold.
+        If a tensor, each row of probs has its own threshold, and outputs that indices maps to the same row share it.
     top_p: Union[torch.Tensor, float]
-        Either a scalar or a tensor of shape ``(batch_size,)``, representing the threshold for top-p sampling.
+        Either a scalar or a tensor of shape ``(batch_size,)``, or ``(unique_batch_size,)`` when indices is
+        provided, representing the threshold for top-p sampling.
         If a scalar, the same threshold is used for all requests.
-        If a tensor, each request has its own threshold.
+        If a tensor, each row of probs has its own threshold, and outputs that indices maps to the same row share it.
     indices: Optional[torch.Tensor]
         Optional indices tensor of shape ``(batch_size,)``, dtype ``torch.int32`` or ``torch.int64``
         that maps each output to a row in probs. The output tensor will have the same dtype as indices.
@@ -1987,7 +2007,7 @@ def top_k_top_p_sampling_from_probs(
         after the renormalization step.  Defaults to ``False``.
     top_k_max: Optional[int]
         Unchecked upper bound on a ``top_k`` tensor; keep it tight. Used only with
-        ``"top_k_first"``, no ``indices``, ``top_k_max <= 256`` and ``num_classes >= 65536``,
+        ``"top_k_first"``, ``top_k_max <= 256`` and ``num_classes >= 65536``,
         where rows above it (including "no top-k" rows) sample with ``top_k = top_k_max``.
         Otherwise ignored. Default is ``None``.
 
@@ -2039,6 +2059,7 @@ def top_k_top_p_sampling_from_probs(
                 probs,
                 top_k,
                 top_p,
+                indices,
                 top_k_max=top_k_max,
                 from_logits=False,
                 deterministic=deterministic,

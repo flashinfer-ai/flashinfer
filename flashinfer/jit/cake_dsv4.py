@@ -1135,11 +1135,11 @@ MODULES: dict[str, dict[str, Any]] = {
             "common/cake_dsv4_cbf3168c696847fd3f69_binding.cu",
         ],
         "compile_flags": ["--use_fast_math"],
-        "arg_plan": "fp8_lowhead_qlayout",
+        "arg_plan": "fp8_lowhead_prefill",
         "arches": ["sm_100a", "sm_103a"],
         "identity": {
-            "sm_100a": "8afe0f0222f2ae71dd2da015a91f683a7ce1f1af150b9664c61599681a5f2434",
-            "sm_103a": "770a7af77c1f2abf4024977e5440d72ef72b8f5884f3ffe4cb6c51b37d2e9fa1",
+            "sm_100a": "1805f23a2001fe8a9e6bfa4efdc9104c9df345bbc6a59d051483372e126a5534",
+            "sm_103a": "1408f1cf42e4f32c795d4f4bcaefcba78e6ddc86d6037717ffdc4df8b49e0a04",
         },
     },
     "cake_dsv4_cf7e7f261a5e1c42f98f": {

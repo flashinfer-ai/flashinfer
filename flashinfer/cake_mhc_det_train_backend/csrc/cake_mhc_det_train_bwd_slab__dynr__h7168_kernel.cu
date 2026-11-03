@@ -154,7 +154,7 @@ __device__ __forceinline__ void tma_store_2d(
 
 __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
     uint32_t result;
-    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xffffffff;"
+    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xFFFFFFFF;"
         : "=r"(result) : "r"(val));
     return result;
 }
@@ -212,7 +212,7 @@ kernel_cake_mhc_det_train_bwd_slab__dynr__h7168(const __grid_constant__ CUtensor
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     unsigned int* wtv = reinterpret_cast<unsigned int*>(smem_raw + 222208);
     const int wtv_addr = smem + 222208;
     unsigned int* tkv = reinterpret_cast<unsigned int*>(smem_raw + 228352);
@@ -269,6 +269,8 @@ kernel_cake_mhc_det_train_bwd_slab__dynr__h7168(const __grid_constant__ CUtensor
     const int dzn1_addr = smem + 78848;
     __nv_bfloat16* dzn2 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 82944);
     const int dzn2_addr = smem + 82944;
+
+    // Kernel setup ops
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&X))) : "memory");
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&dY))) : "memory");
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&dU))) : "memory");
@@ -276,8 +278,7 @@ kernel_cake_mhc_det_train_bwd_slab__dynr__h7168(const __grid_constant__ CUtensor
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&fnTp))) : "memory");
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&dX))) : "memory");
 
-    // Mbarrier init (12 pipeline groups, 0 ordered-sequence groups, 22 barriers)
-    // Mbarriers at smem_raw[0..176)
+    // Mbarrier init (22 barriers at smem_raw[0..176))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -338,14 +339,14 @@ kernel_cake_mhc_det_train_bwd_slab__dynr__h7168(const __grid_constant__ CUtensor
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_accw = taddr;
+    const unsigned int tmem_dfb0 = taddr + 256;
+    const unsigned int tmem_dfb1 = taddr + 320;
+    const unsigned int tmem_dfs0 = taddr + 384;
+    const unsigned int tmem_dfs1 = taddr + 448;
 
     // Kernel post-init ops
-    const int tmem_accw = taddr;
-    const int tmem_dfb0 = taddr + 256;
-    const int tmem_dfb1 = taddr + 320;
-    const int tmem_dfs0 = taddr + 384;
-    const int tmem_dfs1 = taddr + 448;
     if (warp >= 0 && warp <= 3) {
         asm volatile("setmaxnreg.dec.sync.aligned.u32 48;");
     }
@@ -1095,7 +1096,7 @@ kernel_cake_mhc_det_train_bwd_slab__dynr__h7168(const __grid_constant__ CUtensor
                                     "setp.ne.b32 p, %0, 0;\n\t"
                                     "@p cp.async.cg.shared::cta.global [%1], [%2], 16;\n\t"
                                     "}"
-                                    :: "r"((lane_1 < 16) ? 1 : 0), "r"(wtab + (unsigned int)(lane_1 * 48)), "l"(tokp + ((unsigned long long)rowq * 24)));
+                                    :: "r"((lane_1 < 16) ? 1 : 0), "r"(wtab + (unsigned int)(lane_1 * 48)), "l"(tokp + (unsigned long long)rowq * 24));
                                 #pragma unroll
                                 for (int kq_2 = 0; kq_2 < 2; kq_2++) {
                                     int rowa = t0_1 + tokbase + wq_r4[kq_2];
@@ -2571,7 +2572,7 @@ kernel_cake_mhc_det_train_bwd_slab__dynr__h7168(const __grid_constant__ CUtensor
                                 "setp.ne.b32 p, %0, 0;\n\t"
                                 "@p cp.async.cg.shared::cta.global [%1], [%2], 16;\n\t"
                                 "}"
-                                :: "r"((lane_1 < 16) ? 1 : 0), "r"(wtab + (unsigned int)(lane_1 * 48)), "l"(tokp + ((unsigned long long)rowq_1 * 24)));
+                                :: "r"((lane_1 < 16) ? 1 : 0), "r"(wtab + (unsigned int)(lane_1 * 48)), "l"(tokp + (unsigned long long)rowq_1 * 24));
                             #pragma unroll
                             for (int kq_4 = 0; kq_4 < 2; kq_4++) {
                                 int rowa_2 = t0_1 + 64 + tokbase + wq_r4[kq_4];
@@ -2643,7 +2644,7 @@ kernel_cake_mhc_det_train_bwd_slab__dynr__h7168(const __grid_constant__ CUtensor
                                         "setp.ne.b32 p, %0, 0;\n\t"
                                         "@p cp.async.cg.shared::cta.global [%1], [%2], 16;\n\t"
                                         "}"
-                                        :: "r"((lane_1 < 16) ? 1 : 0), "r"(wtab + (unsigned int)(lane_1 * 48)), "l"(tokp + ((unsigned long long)rowq_2 * 24)));
+                                        :: "r"((lane_1 < 16) ? 1 : 0), "r"(wtab + (unsigned int)(lane_1 * 48)), "l"(tokp + (unsigned long long)rowq_2 * 24));
                                     #pragma unroll
                                     for (int kq_6 = 0; kq_6 < 2; kq_6++) {
                                         int rowa_4 = row0_1_1 + tokbase + wq_r4[kq_6];
