@@ -1044,6 +1044,10 @@ def test_nontranspose_fp32_t1_body_rule_follows_the_batch_band() -> None:
     assert cake_gdn.CAKE_GDN_NONTRANSPOSE_FP32_T1_RULE_BAND_FALLBACKS == {
         "small_upper": "small",
     }
+    # the H16 / HV32 B28 row at scale 1.0 keeps the small band's twin on sm_107a
+    assert cake_gdn.CAKE_GDN_NONTRANSPOSE_FP32_T1_ARCH_ROW_BANDS == {
+        ("sm_107a", 16, 32, 28, 1.0): "small",
+    }
     assert cake_gdn.CAKE_GDN_NONTRANSPOSE_FP32_T1_ARCH_BODIES == {
         ("sm_107a", "small"): "gdn_decode_nontranspose_fp32_t1_mid4_rc_kq128",
         ("sm_107a", "small_upper"): "gdn_decode_nontranspose_fp32_t1_hqsplit_tma3",
@@ -1198,6 +1202,24 @@ def test_decode_resolver_routes_the_fp32_nontranspose_t1_body_per_batch_band(
             + ("_mid4_rc_kq128" if arch == "sm_107a" else "")
         ), (arch, batch_size, trace.route_id)
         assert cake_gdn._kernel_record(trace.variant_name)["tma_abi"] == "pointer"
+    # the H16 / HV32 B28 row at scale 1.0 keeps mid4_rc_kq128 on sm_107a (the per-row
+    # table); at scale K^-0.5 and at its neighbours B27 / B29 it takes hqsplit_tma3
+    for batch_size, scale in ((28, 1.0), (28, 128**-0.5), (27, 1.0), (29, 1.0)):
+        route = _decode(
+            arch=arch, layout="nontranspose", batch_size=batch_size, scale=scale
+        )
+        keep = (batch_size, scale) == (28, 1.0)
+        suffix = ""
+        if arch == "sm_107a":
+            suffix = "_mid4_rc_kq128" if keep else "_hqsplit_tma3"
+        assert route.route_id == (
+            f"flashinfer.gdn_decode.direct_fp32_t1_nontranspose_small{suffix}"
+        ), (arch, batch_size, scale, route.route_id)
+        assert cake_gdn._kernel_record(route.variant_name)["specializations"] == {
+            "H": 16,
+            "HV": 32,
+            "SCALE": scale,
+        }
     pretranspose = _decode(arch=arch, layout="pretranspose")
     with pytest.raises(
         cake_gdn.CakeGDNUnsupportedError, match="not an fp32-state T=1 nontranspose"

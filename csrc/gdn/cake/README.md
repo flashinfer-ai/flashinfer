@@ -250,7 +250,10 @@ tensor the capture saw, exactly as the pointer ABI's captured pointer does; a
 different state tensor needs its own capture (or the eager path, which
 encodes per call). Nothing is cached by pointer. The TMA-state records cover
 H=16 / HV=32 only; the H=4 / HV=8 trace row keeps `mid4_rc_kq128` in the
-upper small band. SM100a/SM103a keep the shipped bodies.
+upper small band. The H=16 / HV=32 B=28 row at scale 1.0 also keeps
+`mid4_rc_kq128` (`hqsplit_tma3` ran it at 0.996x on a 216-SM R200; the same
+row at scale K^-0.5 takes `hqsplit_tma3`). SM100a/SM103a keep the shipped
+bodies.
 
 Single-token BF16-state decode admits every Qwen3.5 per-rank linear-attention
 geometry at any batch: H/HV = 16/32, 8/16, 4/8 (Qwen3.5-35B-A3B TP1/TP2/TP4)

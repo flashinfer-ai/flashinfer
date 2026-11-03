@@ -1717,10 +1717,11 @@ def cake_gdn_fp32_t1_ctas_per_state(variant_name: str) -> int:
 # band, the `tilev32_x2` twin of the wave-fit range 32 <= B < 37 and the `hqsplit` twin
 # from 37 on, whose records stay in the manifest.  The TMA-state records cover H16/HV32
 # only: a row of another geometry in the upper small band (the H4/HV8 trace row) keeps
-# the small band's twin (`NONTRANSPOSE_FP32_T1_RULE_BAND_FALLBACKS`).  Like the twins it
-# replaces (whose 16-byte vector state loads and stores fault on a misaligned address),
-# it needs a 16-byte aligned state base: its host shim refuses any other state with a
-# ValueError before launch.  Every twin keeps the per-lane statements and the
+# the small band's twin (`NONTRANSPOSE_FP32_T1_RULE_BAND_FALLBACKS`), and so does the
+# H16/HV32 B=28 row at scale 1.0 (`NONTRANSPOSE_FP32_T1_ARCH_ROW_BANDS`).  Like the
+# twins it replaces (whose 16-byte vector state loads and stores fault on a misaligned
+# address), it needs a 16-byte aligned state base: its host shim refuses any other state
+# with a ValueError before launch.  Every twin keeps the per-lane statements and the
 # accumulation order: bitwise-identical output and state.  B200 / B300 keep the shipped
 # bodies.  The rule band folds onto the band of the shipped body / route id through the
 # `_RULE_BANDS` table, so route ids keep naming `small` / `large` (plus the twin
@@ -1764,6 +1765,16 @@ CAKE_GDN_NONTRANSPOSE_FP32_T1_ARCH_BODIES: dict[tuple[str, str], str] = {
 # for the row's specializations on that architecture)
 CAKE_GDN_NONTRANSPOSE_FP32_T1_RULE_BAND_FALLBACKS: dict[str, str] = {
     "small_upper": "small",
+}
+# ((architecture, num_q_heads, num_v_heads, batch_size, scale) -> rule band whose body
+# the row runs instead of its batch band's): rows where the band's twin measured slower
+# than the body they ran before.  On a 216-SM R200 the H16/HV32 B=28 row at scale 1.0
+# ran 0.996x of `mid4_rc_kq128` on `hqsplit_tma3`, so it keeps `mid4_rc_kq128`; the
+# same row at scale K^-0.5 (1.008x) takes `hqsplit_tma3`.
+CAKE_GDN_NONTRANSPOSE_FP32_T1_ARCH_ROW_BANDS: dict[
+    tuple[str, int, int, int, float], str
+] = {
+    ("sm_107a", 16, 32, 28, 1.0): "small",
 }
 # CTAs per state head each nontranspose fp32 T=1 body launches (the host grid is B * HV
 # times this), keyed by the record's schedule.
@@ -1812,7 +1823,11 @@ def cake_gdn_nontranspose_fp32_t1_band_route(
 def cake_gdn_nontranspose_fp32_t1_route(
     batch_size: int, arch: CakeGDNArch
 ) -> tuple[str, str]:
-    """``(schedule, route id)`` of the fp32-state T=1 K-major decode for ``batch_size`` rows on ``arch``."""
+    """``(schedule, route id)`` of the fp32-state T=1 K-major decode for ``batch_size`` rows on ``arch``.
+
+    The batch-band rule only: the resolver also applies the per-row table and the band
+    fallbacks (``select_cake_gdn_decode_variant``).
+    """
 
     return cake_gdn_nontranspose_fp32_t1_band_route(
         cake_gdn_nontranspose_fp32_t1_rule_band(batch_size), arch
@@ -2183,8 +2198,12 @@ def select_cake_gdn_decode_variant(
         # The body follows the batch band per architecture (sm_107a runs the `mid4`
         # twin below 21 rows); the route id names a twin and the host reads the
         # record's CTAs per state head for the grid.  A band whose twin ships no
-        # record for the row's specializations keeps its fallback band's body.
-        rule_band = cake_gdn_nontranspose_fp32_t1_rule_band(batch_size)
+        # record for the row's specializations keeps its fallback band's body; a row
+        # listed in the per-row table runs the body of the band it names.
+        rule_band = CAKE_GDN_NONTRANSPOSE_FP32_T1_ARCH_ROW_BANDS.get(
+            (arch, num_q_heads, num_v_heads, batch_size, scale),
+            cake_gdn_nontranspose_fp32_t1_rule_band(batch_size),
+        )
         schedule_attr, route = cake_gdn_nontranspose_fp32_t1_band_route(rule_band, arch)
         fallback = CAKE_GDN_NONTRANSPOSE_FP32_T1_RULE_BAND_FALLBACKS.get(rule_band)
         if fallback is not None and not _has_variant(
