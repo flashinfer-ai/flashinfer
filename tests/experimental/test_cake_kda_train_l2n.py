@@ -1320,6 +1320,48 @@ def test_l2n_launch_sequences_are_the_deterministic_l2n(
     assert launches > 0
 
 
+@pytest.mark.parametrize("mode", L2N_ON)
+@pytest.mark.parametrize("gate", GATES)
+def test_l2n_handoff_poison_hook_is_flag_off_only(
+    gate: str, mode: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The hand-off's test hook (``_HANDOFF_POISON``: ``dv2`` NaN-filled before the prep) fills nothing in an l2n
+    mode, whose ``kn`` rows may sit on ``dv2``'s bytes and where the hand-off never engages: with the hook on, the
+    backward from a light set, from a tape set and the replay give the bits of the same calls with it off."""
+    device = _l2n_device(mode)
+    count = _Count()
+    calls = 0
+    for lengths, heads in L2N_LAUNCH_ROWS:
+        S, N = sum(lengths), len(lengths)
+        inputs = _l2n_inputs(lengths, heads, device, gate)
+        for save_mode in ("light", "tape"):
+            ws = cake_backend.KdaWorkspace.for_problem(
+                S,
+                N,
+                heads,
+                device,
+                save_mode=save_mode,
+                gate=gate,
+                l2n=mode,
+                deterministic=False,
+            )
+            _, saved = _fwd(inputs, gate, workspace=ws)
+            sources = [("set", saved)]
+            if save_mode == "light":
+                sources.append(("replay", None))
+            for label, source in sources:
+                tag = (lengths, heads, save_mode, label)
+                monkeypatch.setattr(cake_backend, "_HANDOFF_POISON", False)
+                got = _bwd(inputs, source, gate, workspace=ws)
+                ref = dict(zip(_names(gate), (t.clone() for t in got), strict=True))
+                monkeypatch.setattr(cake_backend, "_HANDOFF_POISON", True)
+                count.grads(_bwd(inputs, source, gate, workspace=ws), ref, gate, tag)
+                calls += 1
+            del ws
+    assert calls == 3 * len(L2N_LAUNCH_ROWS)
+    assert count.n == calls * len(_names(gate)) > 0
+
+
 L2N_ARENA_ROWS = [
     ((63, 1, 65), 4),
     ((100, 640, 77, 1000, 129), 2),

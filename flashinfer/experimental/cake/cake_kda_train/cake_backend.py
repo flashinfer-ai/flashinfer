@@ -5444,8 +5444,9 @@ def _backward_launches(
     if intra_first:
         replay_intra()
     # tests: dv2 NaN-filled before the prep or the zero fill, so a dv2 row neither writes and a later launch reads
-    # shows in the gradients (the same fill on both kinds of hand-off record and without one)
-    if _HANDOFF_POISON:
+    # shows in the gradients (the same fill on both kinds of hand-off record and without one); flag-off mode only:
+    # the hand-off never engages in an l2n mode, whose rows may sit on dv2's bytes (_l2n_rows_in_arena)
+    if _HANDOFF_POISON and p.l2n == "off":
         b.dv2.fill_(float("nan"))
     if rows is None:
         # prep's pad-row zero-fill target: the saved v_new already carries its pads.  The checkpoint hand-off's
