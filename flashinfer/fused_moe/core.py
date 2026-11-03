@@ -625,14 +625,17 @@ def deinterleave_gated_rows(x: torch.Tensor, block: int) -> torch.Tensor:
     top half; order the result as ``[X1; X2]`` (linear/up half first, gate
     half second) before handing it to a ``trtllm_*_moe`` entry point or to
     :func:`reorder_rows_for_gated_act_gemm`.  ``block=1`` is the inverse of
-    :func:`reorder_rows_for_gated_act_gemm`.  This is a one-time host-side
-    weight preparation; the kernels have no interleaved FC1 variant.
+    :func:`reorder_rows_for_gated_act_gemm`.  Like that helper it permutes
+    dimension ``0``, so apply it to each expert's ``[M, hidden_size]`` slice,
+    not to a stacked ``[num_experts, M, hidden_size]`` tensor.  This is a
+    one-time host-side weight preparation; the kernels have no interleaved
+    FC1 variant.
 
     Parameters
     ----------
     x : torch.Tensor
-        Tensor with an even number of rows divisible by ``2 * block``.  Any
-        dtype is accepted; only the row dimension is reordered.
+        Tensor whose row count is a multiple of ``2 * block``.  Any dtype is
+        accepted; only the row dimension is reordered.
     block : int
         Number of consecutive rows per chunk in the interleaved layout.
 
@@ -5063,14 +5066,15 @@ def trtllm_bf16_moe(
         weights, ``bfloat16``.  ``M`` equals ``2 * intermediate_size`` for
         gated activations and ``intermediate_size`` for non-gated
         activations.
-        For gated activations the ``M`` rows are the two halves stacked as
-        ``[X1; X2]``: rows ``[0, intermediate_size)`` are ``X1`` (linear/up)
-        and rows ``[intermediate_size, 2 * intermediate_size)`` are ``X2``
-        (gate), before the ``use_shuffled_weight`` preprocessing
-        (:func:`reorder_rows_for_gated_act_gemm` then ``shuffle_matrix_a``).
-        Weights stored with gate and linear rows interleaved in fixed-width
-        blocks are de-interleaved once at load time with
-        :func:`deinterleave_gated_rows`; there is no kernel variant for an
+        For gated activations each expert's logical ``[M, hidden_size]``
+        matrix, before the ``use_shuffled_weight`` preprocessing
+        (:func:`reorder_rows_for_gated_act_gemm` then ``shuffle_matrix_a``)
+        and any layout conversion, stacks the two halves as ``[X1; X2]``:
+        rows ``[0, intermediate_size)`` are ``X1`` (linear/up) and rows
+        ``[intermediate_size, 2 * intermediate_size)`` are ``X2`` (gate).
+        Weights stored with the halves interleaved in fixed-width row blocks
+        are de-interleaved per expert at load time with
+        :func:`deinterleave_gated_rows`; no kernel variant reads an
         interleaved FC1.
     gemm2_weights : torch.Tensor
         ``[num_experts, hidden_size // 128, intermediate_size, 128]``
@@ -5304,14 +5308,15 @@ def trtllm_bf16_routed_moe(
         ``[num_experts, M // 128, hidden_size // 128, 128]`` first-layer
         weights, ``bfloat16``.  ``M`` equals ``2 * intermediate_size`` for
         gated activations and ``intermediate_size`` for non-gated activations.
-        For gated activations the ``M`` rows are the two halves stacked as
-        ``[X1; X2]``: rows ``[0, intermediate_size)`` are ``X1`` (linear/up)
-        and rows ``[intermediate_size, 2 * intermediate_size)`` are ``X2``
-        (gate), before the ``use_shuffled_weight`` preprocessing
-        (:func:`reorder_rows_for_gated_act_gemm` then ``shuffle_matrix_a``).
-        Weights stored with gate and linear rows interleaved in fixed-width
-        blocks are de-interleaved once at load time with
-        :func:`deinterleave_gated_rows`; there is no kernel variant for an
+        For gated activations each expert's logical ``[M, hidden_size]``
+        matrix, before the ``use_shuffled_weight`` preprocessing
+        (:func:`reorder_rows_for_gated_act_gemm` then ``shuffle_matrix_a``)
+        and any layout conversion, stacks the two halves as ``[X1; X2]``:
+        rows ``[0, intermediate_size)`` are ``X1`` (linear/up) and rows
+        ``[intermediate_size, 2 * intermediate_size)`` are ``X2`` (gate).
+        Weights stored with the halves interleaved in fixed-width row blocks
+        are de-interleaved per expert at load time with
+        :func:`deinterleave_gated_rows`; no kernel variant reads an
         interleaved FC1.
     gemm2_weights : torch.Tensor
         ``[num_experts, hidden_size // 128, intermediate_size, 128]``
@@ -6180,14 +6185,15 @@ def trtllm_fp8_block_scale_moe(
         ``weight_layout == WeightLayout.BlockMajorK`` (``2``).  ``M`` is
         ``2 * intermediate_size`` for gated activations and
         ``intermediate_size`` for non-gated activations.
-        For gated activations the ``M`` rows are the two halves stacked as
-        ``[X1; X2]``: rows ``[0, intermediate_size)`` are ``X1`` (linear/up)
-        and rows ``[intermediate_size, 2 * intermediate_size)`` are ``X2``
-        (gate), before the ``use_shuffled_weight`` preprocessing
-        (:func:`reorder_rows_for_gated_act_gemm` then ``shuffle_matrix_a``).
-        Weights stored with gate and linear rows interleaved in fixed-width
-        blocks are de-interleaved once at load time with
-        :func:`deinterleave_gated_rows`; there is no kernel variant for an
+        For gated activations each expert's logical ``[M, hidden_size]``
+        matrix, before the ``use_shuffled_weight`` preprocessing
+        (:func:`reorder_rows_for_gated_act_gemm` then ``shuffle_matrix_a``)
+        and any layout conversion, stacks the two halves as ``[X1; X2]``:
+        rows ``[0, intermediate_size)`` are ``X1`` (linear/up) and rows
+        ``[intermediate_size, 2 * intermediate_size)`` are ``X2`` (gate).
+        Weights stored with the halves interleaved in fixed-width row blocks
+        are de-interleaved per expert at load time with
+        :func:`deinterleave_gated_rows`; no kernel variant reads an
         interleaved FC1.
     gemm1_weights_scale : torch.Tensor
         ``[num_experts, 2*intermediate_size // (32 if mxfp8 else 128), hidden_size // (32 if mxfp8 else 128)]``
@@ -6473,14 +6479,15 @@ def trtllm_fp8_block_scale_routed_moe(
         ``[num_experts, M, hidden_size]`` first-layer weights where ``M`` is
         ``2 * intermediate_size`` for gated activations and
         ``intermediate_size`` for non-gated.
-        For gated activations the ``M`` rows are the two halves stacked as
-        ``[X1; X2]``: rows ``[0, intermediate_size)`` are ``X1`` (linear/up)
-        and rows ``[intermediate_size, 2 * intermediate_size)`` are ``X2``
-        (gate), before the ``use_shuffled_weight`` preprocessing
-        (:func:`reorder_rows_for_gated_act_gemm` then ``shuffle_matrix_a``).
-        Weights stored with gate and linear rows interleaved in fixed-width
-        blocks are de-interleaved once at load time with
-        :func:`deinterleave_gated_rows`; there is no kernel variant for an
+        For gated activations each expert's logical ``[M, hidden_size]``
+        matrix, before the ``use_shuffled_weight`` preprocessing
+        (:func:`reorder_rows_for_gated_act_gemm` then ``shuffle_matrix_a``)
+        and any layout conversion, stacks the two halves as ``[X1; X2]``:
+        rows ``[0, intermediate_size)`` are ``X1`` (linear/up) and rows
+        ``[intermediate_size, 2 * intermediate_size)`` are ``X2`` (gate).
+        Weights stored with the halves interleaved in fixed-width row blocks
+        are de-interleaved per expert at load time with
+        :func:`deinterleave_gated_rows`; no kernel variant reads an
         interleaved FC1.
     gemm1_weights_scale : torch.Tensor
         ``[num_experts, 2*intermediate_size // (32 if mxfp8 else 128), hidden_size // (32 if mxfp8 else 128)]``
