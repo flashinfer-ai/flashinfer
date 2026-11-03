@@ -345,8 +345,9 @@ K1_RULE_MIN_SM_COUNT: dict[tuple[str, int, int, int, str], int] = {
     ("sm_103a", 1, 4096, 48, "bf16"): 152,
     ("sm_103a", 1, 4096, 48, "f32"): 152,
 }
-#: Token counts at which a row of :data:`K1_SPLIT_RULES` or of a table of :data:`K1_SPLIT_RULES_BY_SM` does not take
-#: its verdict, ``key -> ((sm_count, min_tokens, max_tokens), ...)``: a token count (``K`` of the weight gradient) from
+#: Token counts at which a row of :data:`K1_SPLIT_RULES` (or its entry in :data:`K1_SPLIT_OVERRIDES_BY_SM`) or of a
+#: table of :data:`K1_SPLIT_RULES_BY_SM` does not take its verdict, ``key -> ((sm_count, min_tokens, max_tokens),
+#: ...)``: a token count (``K`` of the weight gradient) from
 #: ``min_tokens`` to ``max_tokens`` (``None``: no upper bound) runs the deterministic program on a part of at least
 #: ``sm_count`` SMs where ``sm_count`` is at or above the row's SM-count floor (:data:`K1_MIN_SM_COUNT`,
 #: :data:`K1_RULE_MIN_SM_COUNT`), and on a part of exactly ``sm_count`` SMs below it (the parts of
@@ -364,14 +365,12 @@ K1_RULE_MIN_SM_COUNT: dict[tuple[str, int, int, int, str], int] = {
 #: token counts keep the verdict: below 512, above 65536 (except those rows), between two measured token counts with
 #: different outcomes, and on parts with fewer than 152 SMs.  The sm_107a entries are single token counts of the
 #: deterministic package's sm_107a rules for one token count (16231 and 16384 tokens; 16231 only for ``4096 -> 1024``),
-#: which give the row a faster deterministic plan there.  On 208 and 212 SMs they come from a re-measurement at 16172,
-#: 16231 and 16384 tokens against those plans (the protocol is in the sm_107a K1 token table of the README): a measured
-#: token count is an entry where the row's program failed the rule above in some run, or left the backward pass or the
-#: checkpointed step more than 1.3 % slower than the deterministic program (ratio of the medians over the runs, or
-#: median of the paired ratios, in eager launches or in graph replays).  The 216-SM entries were not measured on
-#: 216-SM parts: they are the token counts where the deterministic package's speed-up of the row on a 216-SM part (its
-#: own measurement against its earlier plan) leaves this package's program less than 2 % faster than the deterministic
-#: program; the other rows keep their 216-SM verdicts there.
+#: which give the row a faster deterministic plan there, and 16231 tokens of ``5120 -> 1024`` BF16 on 216 SMs (measured
+#: in the same runs; the deterministic plan there is the row's plan at every token count).  On 208, 212 and 216 SMs they
+#: come from a re-measurement at 16172, 16231 and 16384 tokens against those plans (the protocol is in the sm_107a K1
+#: token table of the README): a measured token count is an entry where the row's program failed the rule above in some
+#: run, or left the backward pass or the checkpointed step more than 1.3 % slower than the deterministic program (ratio
+#: of the medians over the runs, or median of the paired ratios, in eager launches or in graph replays).
 # fmt: off
 K1_SPLIT_RULE_EXCLUDED_TOKENS: dict[
     tuple[str, int, int, int, str], tuple[tuple[int, int, Optional[int]], ...]
@@ -404,10 +403,13 @@ K1_SPLIT_RULE_EXCLUDED_TOKENS: dict[
     ("sm_103a", 1, 6144, 32, "f32"): ((152, 512, 512),),
     ("sm_103a", 1, 6144, 128, "bf16"): ((152, 512, 8192),),
     ("sm_103a", 1, 6144, 128, "f32"): ((152, 512, 8192),),
+    ("sm_107a", 1, 4096, 32, "f32"): ((216, 16231, 16231),),
     ("sm_107a", 1, 4096, 48, "f32"): (
         (208, 16231, 16231), (208, 16384, 16384), (216, 16231, 16231), (216, 16384, 16384),
     ),
-    ("sm_107a", 1, 4096, 64, "f32"): ((208, 16231, 16231), (208, 16384, 16384)),
+    ("sm_107a", 1, 4096, 64, "f32"): (
+        (208, 16231, 16231), (208, 16384, 16384), (216, 16231, 16231), (216, 16384, 16384),
+    ),
     ("sm_107a", 1, 4096, 512, "f32"): (
         (208, 16231, 16231), (208, 16384, 16384), (212, 16231, 16231), (212, 16384, 16384),
         (216, 16231, 16231), (216, 16384, 16384),
@@ -415,9 +417,13 @@ K1_SPLIT_RULE_EXCLUDED_TOKENS: dict[
     ("sm_107a", 1, 4096, 1024, "f32"): ((208, 16231, 16231), (212, 16231, 16231), (216, 16231, 16231)),
     ("sm_107a", 1, 5120, 48, "f32"): (
         (208, 16231, 16231), (208, 16384, 16384), (212, 16231, 16231), (216, 16231, 16231),
+        (216, 16384, 16384),
     ),
-    ("sm_107a", 1, 5120, 64, "f32"): ((208, 16231, 16231), (212, 16231, 16231), (216, 16231, 16231)),
+    ("sm_107a", 1, 5120, 64, "f32"): (
+        (208, 16231, 16231), (212, 16231, 16231), (216, 16231, 16231), (216, 16384, 16384),
+    ),
     ("sm_107a", 1, 5120, 512, "f32"): ((212, 16231, 16231), (212, 16384, 16384)),
+    ("sm_107a", 1, 5120, 1024, "bf16"): ((216, 16231, 16231),),
 }
 # fmt: on
 #: Per-SM-count verdicts of the parts of an architecture with fewer SMs than its :data:`K1_MIN_SM_COUNT`,
@@ -473,9 +479,28 @@ K1_SPLIT_RULES_BY_SM: dict[
 }
 # fmt: on
 #: The token counts (``K`` of the weight gradient, ``(min_tokens, max_tokens)``) the tables of
-#: :data:`K1_SPLIT_RULES_BY_SM` hold for: they were measured at 16172 to 16384 tokens only, and on those parts every
-#: other token count runs the deterministic program.
+#: :data:`K1_SPLIT_RULES_BY_SM` and :data:`K1_SPLIT_OVERRIDES_BY_SM` hold for: they were measured at 16172 to 16384
+#: tokens only.  Below the SM-count floor every other token count runs the deterministic program; an override leaves
+#: every other token count to :data:`K1_SPLIT_RULES`.
 K1_SPLIT_RULES_BY_SM_TOKENS: tuple[int, int] = (16172, 16384)
+#: Verdicts that replace a row's :data:`K1_SPLIT_RULES` verdict on the parts of exactly one SM count from the row's
+#: SM-count floor up, ``(arch, sm_count) -> {key: (block_n, num_splits) or None}`` (keys and values as in
+#: :data:`K1_SPLIT_RULES`, measured on parts of exactly that SM count under the same rule, in two jobs on different
+#: parts), at the token counts of :data:`K1_SPLIT_RULES_BY_SM_TOKENS` only, except the token counts of
+#: :data:`K1_SPLIT_RULE_EXCLUDED_TOKENS` for the part.  Every other token count, every other SM count and every row
+#: without an entry keep the verdict of :data:`K1_SPLIT_RULES`.  On 216 SMs ``4096 -> 1024`` FP32 takes the 192-wide
+#: row-major program at one split (88 tiles of 256 ``d_out`` rows by 192 ``d_in`` columns, 176 CTAs, one wave next to a
+#: kernel holding 32 SMs), which keeps more SMs busy than the 128 CTAs of the 256-wide transposed tile; at 16231 tokens
+#: the row runs the deterministic program (its entry in :data:`K1_SPLIT_RULE_EXCLUDED_TOKENS`).
+# fmt: off
+K1_SPLIT_OVERRIDES_BY_SM: dict[
+    tuple[str, int], dict[tuple[str, int, int, int, str], Optional[tuple[int, int]]]
+] = {
+    ("sm_107a", 216): {
+        ("sm_107a", 1, 4096, 1024, "f32"): (192, 1),
+    },
+}
+# fmt: on
 
 
 def k1_splits_fit(splits: int, K: int) -> bool:
@@ -497,17 +522,23 @@ def k1_plan(
     """``(block_n, num_splits)`` of this package's K1 program for the transposed-store launch ``out[l, n, m]``
     (``M``, ``N`` as in the comment above; ``K`` the token count) on a device of ``sm_count`` SMs, or ``None``: the
     row runs the deterministic program.  The row's verdict in :data:`K1_SPLIT_RULES` from the SM-count floor of the
-    row (:data:`K1_MIN_SM_COUNT`, :data:`K1_RULE_MIN_SM_COUNT`) up; below the floor the row's verdict in the table of
-    :data:`K1_SPLIT_RULES_BY_SM` for exactly ``sm_count``, only at a ``K`` of :data:`K1_SPLIT_RULES_BY_SM_TOKENS`;
-    either except at a ``K`` of the row's entries in :data:`K1_SPLIT_RULE_EXCLUDED_TOKENS` for this part (from the
-    entry's SM count up where that count is at or above the floor, exactly that SM count below it).  A row without a
-    verdict, a ``K`` of those entries, every other ``K`` below the floor and a ``K`` too short for the split count
-    (:func:`k1_splits_fit`) run the deterministic program."""
+    row (:data:`K1_MIN_SM_COUNT`, :data:`K1_RULE_MIN_SM_COUNT`) up, replaced at a ``K`` of
+    :data:`K1_SPLIT_RULES_BY_SM_TOKENS` by the row's entry in the table of :data:`K1_SPLIT_OVERRIDES_BY_SM` for exactly
+    ``sm_count``, if any; below the floor the row's verdict in the table of :data:`K1_SPLIT_RULES_BY_SM` for exactly
+    ``sm_count``, only at a ``K`` of :data:`K1_SPLIT_RULES_BY_SM_TOKENS`; either except at a ``K`` of the row's entries
+    in :data:`K1_SPLIT_RULE_EXCLUDED_TOKENS` for this part (from the entry's SM count up where that count is at or above
+    the floor, exactly that SM count below it).  A row without a verdict, a ``K`` of those entries, every other ``K``
+    below the floor and a ``K`` too short for the split count (:func:`k1_splits_fit`) run the deterministic program."""
     key = (arch, int(L), int(M), int(N), "f32" if out_f32 else "bf16")
     floor = max(K1_MIN_SM_COUNT.get(arch, 0), K1_RULE_MIN_SM_COUNT.get(key, 0))
+    first, last = K1_SPLIT_RULES_BY_SM_TOKENS
+    in_window = first <= int(K) <= last
     if int(sm_count) >= floor:
         choice = K1_SPLIT_RULES.get(key)
-    elif K1_SPLIT_RULES_BY_SM_TOKENS[0] <= int(K) <= K1_SPLIT_RULES_BY_SM_TOKENS[1]:
+        if in_window:
+            overrides = K1_SPLIT_OVERRIDES_BY_SM.get((arch, int(sm_count)), {})
+            choice = overrides.get(key, choice)
+    elif in_window:
         choice = K1_SPLIT_RULES_BY_SM.get((arch, int(sm_count)), {}).get(key)
     else:
         choice = None
@@ -935,6 +966,14 @@ ROUTER_RULES_BY_SM: dict[
 #: The template suffix of the weight gradient's head/tail program (``router_fp32_gemm_atomic_nn_t`` + suffix): the
 #: head/tail partition on three TMEM chunk buffers, with register reallocation between its warpgroups.
 ROUTER_HEAD_TAIL_SUFFIX = "_ht_c3_nreg"
+#: The weight gradient's head/tail program of an architecture that runs another one than
+#: ``router_fp32_gemm_atomic_nn_t`` + :data:`ROUTER_HEAD_TAIL_SUFFIX`: on ``sm_103a``, the head/tail program with the
+#: BF16 parts of ``A`` in tensor memory (the same products, accumulators, partition and part segments; two TMEM chunk
+#: buffers, six slots of raw ``A`` tiles and six of ``B`` parts in shared memory).  ``sm_103a`` takes a head/tail
+#: partition only in the hidden 5120 window of :data:`ROUTER_RULES` on 152 SMs, where it was measured.
+ROUTER_HEAD_TAIL_TEMPLATES: dict[str, str] = {
+    "sm_103a": "router_fp32_gemm_ts_r6p6_atomic_nn_t_ht_c2_nreg",
+}
 _ROUTER_HEAD_TAIL_SPEC = re.compile(r"H(\d+(?:\.\d+)?)x(\d+)(?:p(\d+))?")
 #: The forward's largest explicit split count: an element of the forward takes at most two partials, so a forward
 #: recomputed under activation checkpointing repeats bit for bit (``0 + a + b == 0 + b + a``).
@@ -1020,6 +1059,14 @@ def router_head_pairs(spec: Union[str, int, None]) -> Optional[int]:
         if match and match.group(3) is not None:
             return int(match.group(3))
     return None
+
+
+def router_head_tail_template(arch: str) -> str:
+    """The template of the weight gradient's head/tail program on ``arch``: :data:`ROUTER_HEAD_TAIL_TEMPLATES`, else
+    ``router_fp32_gemm_atomic_nn_t`` + :data:`ROUTER_HEAD_TAIL_SUFFIX`."""
+    return ROUTER_HEAD_TAIL_TEMPLATES.get(
+        arch, cake_jit.TEMPLATE_PREFIXES[1] + "nn_t" + ROUTER_HEAD_TAIL_SUFFIX
+    )
 
 
 def router_partition_of(
@@ -1310,7 +1357,7 @@ def plan_atomic_router(
     the deterministic path, which serves or refuses it as that package does), a template this checkout does not
     register for ``arch``, or the planner (:func:`router_partition`).  An explicit ``splits`` (``1`` included) runs
     this package's program when the view and the registry allow it; a head/tail partition runs the head/tail program
-    (``router_fp32_gemm_atomic_nn_t`` + :data:`ROUTER_HEAD_TAIL_SUFFIX`)."""
+    of the architecture (:func:`router_head_tail_template`)."""
     if (
         A.dtype != torch.float32
         or B.dtype != torch.float32
@@ -1364,7 +1411,7 @@ def plan_atomic_router(
         return None, "the planner keeps the row on the deterministic program"
     units, head_spans, head_steps = partition
     if head_spans:
-        template += ROUTER_HEAD_TAIL_SUFFIX
+        template = router_head_tail_template(arch)
         if template not in cake_jit.KERNELS.get(arch, {}):
             return None, f"{template} is not registered for {arch}"
     m_tiles, n_tiles, k_iters = _router_grid(M_eff, N_eff, K)
@@ -1563,7 +1610,7 @@ def _k2_values(
 ) -> dict[str, Any]:
     """The keyword arguments of a K2 launch of this package (ordered by the program's argument plan): ``out`` is
     passed twice, as the store pointer and as the reduce-add map ``D``; ``head_spans`` / ``head_steps`` are read by the
-    head/tail program only; ``enable_pdl`` is the launch's PDL flag (0 or 1)."""
+    head/tail programs only; ``enable_pdl`` is the launch's PDL flag (0 or 1)."""
     return dict(
         A=A,
         B=parts,

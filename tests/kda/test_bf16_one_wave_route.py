@@ -15,6 +15,7 @@ carrier and is routed to the direct N32 body beyond one 64-token chunk.
 import pytest
 import torch
 
+import flashinfer.cake_kda_tf32_runtime as runtime
 from flashinfer import prepare_bf16_kda_prefill
 from flashinfer.kda_prefill import select_bf16_schedule_route
 
@@ -25,7 +26,19 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+@pytest.fixture
+def stock_m64_route(monkeypatch):
+    """Hold the mixed-length M64 split off: mixed-length launches keep the
+    stock M64 value-split program."""
+    monkeypatch.setattr(runtime, "MIXLEN_ARCHES", frozenset())
+
+
 def _prepare(lengths, heads, *, active_beta):
+    return _launch(lengths, heads, active_beta=active_beta)[0]
+
+
+def _launch(lengths, heads, *, active_beta):
+    """The schedule and the outputs (out, final pool rows, checkpoint rows) of one launch."""
     torch.manual_seed(7)
     tokens = sum(lengths)
     shape = (1, tokens, heads, 128)
@@ -70,7 +83,7 @@ def _prepare(lengths, heads, *, active_beta):
     assert torch.isfinite(out).all()
     assert torch.isfinite(pool[indices]).all()
     assert torch.isfinite(cp).all()
-    return str(call.schedule)
+    return str(call.schedule), out, pool[indices], cp
 
 
 @pytest.mark.parametrize(
@@ -109,12 +122,33 @@ def _prepare(lengths, heads, *, active_beta):
         ),
     ],
 )
+@pytest.mark.usefixtures("stock_m64_route")
 def test_one_wave_bf16_grid_uses_m64_value_split(lengths, heads, active_beta, expected):
     # A long launch whose 2-CTA clusters fit one wave takes the pair-share build
     # of the same split (schedule suffix ``_pair_share``, the same bits); the
     # active-beta split has no pair-share build and the other rows are short.
     schedule = _prepare(lengths, heads, active_beta=active_beta)
     assert schedule == expected
+
+
+def test_one_wave_mixed_length_grid_takes_the_mixlen_split(monkeypatch):
+    """The 33 + 1025-token logit-beta row above mixes a long and a short
+    sequence: it takes the mixed-length split ("rng": the 1025-token sequence
+    on the owner/helper build, the 33-token one on the M64 value split), bit
+    for bit the stock pair-share launch."""
+    lengths, heads = (33, 1025), 12
+    schedule, *got = _launch(lengths, heads, active_beta=False)
+    helpers = f"_owner{runtime.MIXLEN_HELPERS}helper"
+    assert schedule.startswith("mixlen_rng["), schedule
+    assert f"{helpers}@1-1" in schedule, schedule
+    assert "fused_m64_independent_dvsplit_fp32_state@0-0" in schedule, schedule
+    monkeypatch.setattr(runtime, "MIXLEN_ARCHES", frozenset())
+    stock, *want = _launch(lengths, heads, active_beta=False)
+    assert stock == "fused_m64_independent_dvsplit_fp32_state_pair_share", stock
+    for name, a, b in zip(
+        ("out", "final state", "checkpoint rows"), got, want, strict=True
+    ):
+        assert torch.equal(a.view(torch.uint8), b.view(torch.uint8)), name
 
 
 def test_short_h12_logit_beta_keeps_direct_n16_tile():

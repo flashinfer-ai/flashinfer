@@ -160,6 +160,31 @@ def _candidates(args, rank, world_size, max_tokens, quant_kind, variant):
     return candidates
 
 
+def _collective_candidates(
+    args, rank, world_size, max_tokens, quant_kind, variant, *, process_group=None
+):
+    """Share rank zero's schedule grid instead of using each rank's knob cache."""
+    if args.sweep != "schedule" or world_size == 1:
+        return _candidates(args, rank, world_size, max_tokens, quant_kind, variant)
+    import torch.distributed as dist
+
+    result = None
+    if rank == 0:
+        try:
+            result = (
+                _candidates(args, rank, world_size, max_tokens, quant_kind, variant),
+                None,
+            )
+        except Exception as exc:
+            result = (None, f"{type(exc).__name__}: {exc}")
+    results = [None] * world_size
+    dist.all_gather_object(results, result, group=process_group)
+    candidates, error = results[0]
+    if error is not None:
+        raise ValueError(f"Cannot build {variant} schedule candidates: {error}")
+    return candidates
+
+
 def tune_one(
     args, rank: int, world_size: int, max_tokens: int, quant_kind: str
 ) -> dict:
@@ -264,8 +289,14 @@ def tune_one(
                 tensors.topk_weights.copy_(workspace.topk_weights[:live_tokens])
             return execution.tune(l1, l2, workspace, **kwargs)
 
-        candidates = _candidates(
-            args, rank, world_size, max_tokens, quant_kind, args.kernel_variant
+        candidates = _collective_candidates(
+            args,
+            rank,
+            world_size,
+            max_tokens,
+            quant_kind,
+            args.kernel_variant,
+            process_group=backend.ep_comm_group if world_size > 1 else None,
         )
 
         return finish_sweep(
@@ -310,6 +341,9 @@ def _tune_variants(
     import json
 
     from flashinfer.autotuner import AutoTuner
+    from .....kernel_src.sm107.next_cutedsl_megamoe.shim.autotune import (
+        is_valid_sm107,
+    )
     from .variant_selection import NAMESPACE, _VariantProtocol
 
     tensors = workspace.tensors
@@ -330,9 +364,25 @@ def _tune_variants(
 
     candidates = {}
     for variant in backend._eligible(workspace.fleet):
-        choices = _candidates(args, rank, world_size, max_tokens, quant_kind, variant)
+        choices = _collective_candidates(
+            args,
+            rank,
+            world_size,
+            max_tokens,
+            quant_kind,
+            variant,
+            process_group=backend.ep_comm_group if world_size > 1 else None,
+        )
         if args.max_candidates is not None:
             choices = choices[: args.max_candidates]
+        if args.sweep == "schedule":
+            cfg = backend._backend(variant)._resolved_config(workspace.fleet)
+            supported = any(is_valid_sm107(knobs, cfg) for knobs in choices)
+            if not all(backend._gather(supported)):
+                raise ValueError(
+                    f"No valid {variant} schedule candidates; use compatible "
+                    "--base-knobs or select an explicit --kernel-variant."
+                )
         candidates[variant] = choices
         if rank == 0:
             print(

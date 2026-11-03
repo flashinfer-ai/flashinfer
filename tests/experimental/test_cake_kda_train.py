@@ -379,6 +379,7 @@ SELECT_KINDS = (
     "carry_chain",
     "arch_in",
     "path_in",
+    "l2n_in",
 )
 GRID_KINDS = (
     "fixed",
@@ -413,9 +414,12 @@ RECORD_ARCHES = {
     "dqkg_int_davq": ("sm_103a",),
 }
 # The deterministic package's records no cell of this package launches: the sm_107a rows from 16 heads (the only
-# rows of the builds with the L2 hints off) run the S1 pair on every backward path, and the raw forget-gate class
+# rows of the builds with the L2 hints off) run the S1 pair on every backward path, the raw forget-gate class
 # (gate "raw": the forward intra, backward prep and GLM intra programs that read the raw gate, and the backward's
-# A_log / dt_bias gradient finalize) runs only under use_gate_in_kernel=True, which this package refuses.
+# A_log / dt_bias gradient finalize) runs only under use_gate_in_kernel=True, and the in-kernel Q/K L2 norm's
+# records (#7817: its fused class, 7 g records with their 7 raw twins and the sm_103a forward intra form, the 2
+# GLM intra capture forms and the 3 programs of its fallback route) run only under use_qk_l2norm_in_kernel=True;
+# this package refuses both modes.
 DET_RECORDS_NOT_LAUNCHED = frozenset(
     (
         "dqkg_davq_nohint",
@@ -428,6 +432,26 @@ DET_RECORDS_NOT_LAUNCHED = frozenset(
         "bwd_prep_g8_noqg_nokb_raw",
         "glm_intra_raw",
         "param_finalize",
+        "fwd_intra_l2n",
+        "fwd_intra_v14_l2n",
+        "fwd_intra_v37_l2n",
+        "bwd_prep_g8_l2n",
+        "bwd_prep_g8_replay_l2n",
+        "bwd_prep_g8_noqg_l2n",
+        "bwd_prep_g8_noqg_nokb_l2n",
+        "glm_intra_l2n",
+        "fwd_intra_raw_l2n",
+        "fwd_intra_v14_raw_l2n",
+        "bwd_prep_g8_raw_l2n",
+        "bwd_prep_g8_replay_raw_l2n",
+        "bwd_prep_g8_noqg_raw_l2n",
+        "bwd_prep_g8_noqg_nokb_raw_l2n",
+        "glm_intra_raw_l2n",
+        "glm_intra_l2n_capture",
+        "glm_intra_raw_l2n_capture",
+        "qk_l2norm",
+        "qk_l2norm_apply",
+        "qk_pullback",
     )
 )
 # The checkpoint hand-off's intra twins, intra record -> twin: new programs that also write every gk row and the
@@ -440,10 +464,10 @@ TAPE_TWINS = {"wy_bwd": "wy_bwd_v9"}
 TAPE_WY_RECORDS = frozenset(TAPE_TWINS.values())
 # The logical names of the WY record's parameters the twin does not take: u and the operands only u reads.
 TAPE_WY_DROPPED = frozenset({"v", "beta", "u"})
-# The registry's size: the deterministic package's 75 records, less those, plus the seven S1 records, the hand-off
+# The registry's size: the deterministic package's 95 records, less those, plus the seven S1 records, the hand-off
 # twins and the tape WY twin.
 MODULE_COUNT = (
-    75 - len(DET_RECORDS_NOT_LAUNCHED) + 7 + len(TWIN_RECORDS) + len(TAPE_WY_RECORDS)
+    95 - len(DET_RECORDS_NOT_LAUNCHED) + 7 + len(TWIN_RECORDS) + len(TAPE_WY_RECORDS)
 )
 # The records of the segmented adjoint recurrence launch twice per stage (the carry between the passes); the
 # forward recurrence's passes are two stages (fwdh, fwdh_p3).
@@ -555,6 +579,10 @@ def _carry_choice(
 
 def _route_rule(route: str) -> dict:
     return {"kind": "route_in", "routes": [route]}
+
+
+# the in-kernel Q/K L2 norm leaf of the copied deterministic rules (#7817): the unfused modes keep the record
+L2N_UNFUSED = {"kind": "l2n_in", "modes": ["off", "fallback"]}
 
 
 def test_registry_records_are_well_formed() -> None:
@@ -698,9 +726,17 @@ def test_registry_records_are_well_formed() -> None:
         "kind": "all_of",
         "rules": [seg_rule, docs_rule],
     }
+    # the deterministic package's fused Q/K L2 norm programs take its forward rows (#7817); this package's l2n is
+    # "off", which the leaf admits
     assert cake_jit.MODULES["fwd_intra"]["select_rule"] == {
-        "kind": "any_of",
-        "rules": [serial_rule, above_rule],
+        "kind": "all_of",
+        "rules": [
+            {"kind": "any_of", "rules": [serial_rule, above_rule]},
+            {
+                "kind": "any_of",
+                "rules": [L2N_UNFUSED, {"kind": "path_in", "paths": ["replay"]}],
+            },
+        ],
     }
     assert cake_jit.MODULES["seg_table"]["select_rule"] == {
         "kind": "all_of",
@@ -869,8 +905,17 @@ def test_registry_records_are_well_formed() -> None:
         "paths": ["tape"],
     }
     assert cake_jit.MODULES["bwd_prep_g8_replay"]["select_rule"] == {
-        "kind": "path_in",
-        "paths": ["replay"],
+        "kind": "all_of",
+        "rules": [
+            {"kind": "path_in", "paths": ["replay"]},
+            {
+                "kind": "any_of",
+                "rules": [
+                    L2N_UNFUSED,
+                    {"kind": "all_of", "rules": [seg_rule, docs_rule]},
+                ],
+            },
+        ],
     }
     assert cake_jit.MODULES["bwd_prep_g8_noqg"]["select_rule"] == {
         "kind": "all_of",
@@ -1359,6 +1404,127 @@ def test_select_record_checks_its_inputs() -> None:
     # a stage no record of the path admits is not an optional stage: the registry refuses the question
     with pytest.raises(ValueError, match="no record admits"):
         cake_jit.select_record("dqkg", **kwargs, arch="sm_100a", path="fwd")
+
+
+def test_the_l2n_leaf_admits_exactly_when_off_is_listed() -> None:
+    """The package refuses the in-kernel Q/K L2 norm at every entry, so an ``l2n_in`` leaf of a copied rule reads
+    l2n ``"off"``: it admits exactly when ``"off"`` is one of its modes, alone or under ``all_of`` / ``any_of``,
+    whatever the other scalars; an unknown kind still raises."""
+    scalars = dict(
+        ctas=64,
+        num_seqs=2,
+        num_heads=8,
+        sm_count=148,
+        num_segments=0,
+        arch="sm_100a",
+        path="fwd",
+    )
+    modes = ("off", "fallback", "fused")
+    for n in range(len(modes) + 1):
+        for listed in itertools.combinations(modes, n):
+            leaf = {"kind": "l2n_in", "modes": list(listed)}
+            expected = "off" in listed
+            assert cake_jit._admits(leaf, **scalars) is expected, listed
+            for path in PATHS:
+                assert (
+                    cake_jit._admits(leaf, **{**scalars, "path": path}) is expected
+                ), (listed, path)
+            always = {"kind": "always"}
+            assert (
+                cake_jit._admits({"kind": "all_of", "rules": [always, leaf]}, **scalars)
+                is expected
+            )
+            never = {"kind": "path_in", "paths": []}
+            assert (
+                cake_jit._admits({"kind": "any_of", "rules": [never, leaf]}, **scalars)
+                is expected
+            )
+    with pytest.raises(ValueError, match="unknown Cake KDA training selection rule"):
+        cake_jit._admits({"kind": "l2n"}, **scalars)
+
+
+# The rules of the copied records before the deterministic package's fused Q/K L2 norm class (FlashInfer #8277 at
+# 20a67232, the rules this package copied until #7817).  Every record whose rule now reads the l2n leaf is listed.
+PRE_L2N_RULES = {
+    "fwd_intra": {
+        "kind": "any_of",
+        "rules": [
+            {"kind": "route_in", "routes": ["serial"]},
+            {"kind": "docs_above", "min": 256},
+        ],
+    },
+    "bwd_prep_g8_replay": {"kind": "path_in", "paths": ["replay"]},
+}
+
+
+def test_the_l2n_leaf_keeps_every_pick_of_the_pre_l2n_rules(monkeypatch) -> None:
+    """With l2n ``"off"`` the re-copied rules select the same record as the rules this package copied before the
+    fused Q/K L2 norm class (``PRE_L2N_RULES``) on every stage that holds one of them: every path and architecture,
+    device sizes, head counts and (tokens, documents) rows with one-token, sub-chunk, chunk-plus-one and long
+    documents around the 256-document bound.  A later change of a copied rule that moves a pick fails here."""
+    with_l2n = {
+        name
+        for name, record in cake_jit.MODULES.items()
+        if "l2n_in" in _rule_kinds(record["select_rule"])
+    }
+    assert with_l2n == set(PRE_L2N_RULES)
+    stages = sorted({cake_jit.MODULES[name]["stage"] for name in PRE_L2N_RULES})
+    sm_counts = {
+        "sm_100a": (132, 148, 152),
+        "sm_103a": (148, 152, 160),
+        "sm_107a": (148, 212, 216),
+    }
+    heads = (1, 2, 4, 8, 15, 16, 17, 32, 64, 96, 128)
+    rows = set()
+    for docs in (1, 2, 3, 4, 8, 16, 33, 64, 128, 255, 256, 257, 512, 1024):
+        for length in (1, 63, 65, 4096):
+            if docs * length <= 1 << 20:
+                rows.add((docs * length, docs))
+        rows.add((docs * BT + 1, docs))
+    for tokens in (8192, 65536, 262144):
+        rows.update({(tokens, 1), (tokens, 4)})
+
+    def picks() -> dict:
+        out = {}
+        for arch in ARCHES:
+            for sm_count in sm_counts[arch]:
+                for num_heads in heads:
+                    for tokens, docs in sorted(rows):
+                        chunks = -(-tokens // BT) + docs
+                        for path in PATHS:
+                            for stage in stages:
+                                key = (
+                                    arch,
+                                    sm_count,
+                                    num_heads,
+                                    tokens,
+                                    docs,
+                                    path,
+                                    stage,
+                                )
+                                try:
+                                    out[key] = cake_jit.select_record(
+                                        stage,
+                                        num_chunks_pad=chunks + chunks % 2,
+                                        num_seqs=docs,
+                                        num_heads=num_heads,
+                                        sm_count=sm_count,
+                                        arch=arch,
+                                        path=path,
+                                    )
+                                except ValueError as error:
+                                    out[key] = f"ValueError: {error}"
+        return out
+
+    now = picks()
+    for name, rule in PRE_L2N_RULES.items():
+        monkeypatch.setitem(cake_jit.MODULES[name], "select_rule", rule)
+    before = picks()
+    assert len(now) == len(before) > 0
+    moved = [(key, before[key], now[key]) for key in now if now[key] != before[key]]
+    assert moved == [], moved[:10]
+    # the grid reaches both re-copied records
+    assert set(PRE_L2N_RULES) <= set(now.values())
 
 
 def test_segment_args_follow_the_proportional_rule() -> None:
@@ -2463,14 +2629,19 @@ def test_saved_set_version_4_fields_and_the_autograd_extras() -> None:
         "u",
         "gate",
         "lower_bound",
+        "qk_rstd",
+        "qk_l2norm",
         "deterministic",
     ]
-    for name in ("h", "v_new", "seg_m", "hseg", "seg_state", "qg", "w", "u"):
+    for name in ("h", "v_new", "seg_m", "hseg", "seg_state", "qg", "w", "u", "qk_rstd"):
         assert KdaChunkSaved.__dataclass_fields__[name].default is None, name
     # the deterministic package's gate-mode fields (#7816), at its defaults: this package's forward writes the
     # explicit gate and its backward refuses a raw-mode set
     assert KdaChunkSaved.__dataclass_fields__["gate"].default == "g"
     assert KdaChunkSaved.__dataclass_fields__["lower_bound"].default is None
+    # the deterministic package's in-kernel Q/K L2 norm fields (#7817), at its defaults: this package's forward
+    # writes no reciprocal norms and the mode off, and its backward refuses a set with the mode on
+    assert KdaChunkSaved.__dataclass_fields__["qk_l2norm"].default is False
     # the mode of the forward that wrote the set: this package's forward writes False (the deterministic package's
     # sets have the same format, and the backward reads either)
     assert KdaChunkSaved.__dataclass_fields__["deterministic"].default is False
