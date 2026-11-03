@@ -263,14 +263,24 @@ __global__ void CsfExpandKernel(CsfExpandParams p, uint8_t* __restrict__ out) {
   }
 }
 
+// An odd number of words per tile row, past the row's last group of four that the swizzle
+// permutes within.
+int TileWords(int64_t cols) { return static_cast<int>((cols + 15) / 16 * 4 + 1); }
+
+// The tile and the staged slabs, about 192 bytes per column.
+int64_t ExpandSmemBytes(int64_t cols) {
+  return kTileRows * 4 * TileWords(cols) + kTileSlabs * SlabBytes(static_cast<int>(cols));
+}
+
 template <Dest kDest, int kUnit>
 void LaunchCsfExpandUnit(const CsfExpandParams& p, int64_t num_items, uint8_t* out,
                          cudaStream_t stream) {
-  // The tile and the staged slabs.
-  size_t smem = static_cast<size_t>(kTileRows) * p.tile_words * 4 + kTileSlabs * SlabBytes(p.cols);
+  const int64_t smem = ExpandSmemBytes(p.cols);
   auto kernel = CsfExpandKernel<kDest, kUnit>;
-  cudaError_t status =
-      cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+  cudaError_t status = cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                            static_cast<int>(smem));
+  // Clear the error, or the next launch check reports it.
+  if (status != cudaSuccess) cudaGetLastError();
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "csf_expand needs " << smem << " bytes of shared memory: " << cudaGetErrorString(status);
   const dim3 grid(num_items, (p.rows + kTileRows - 1) / kTileRows);
@@ -386,9 +396,7 @@ void csf_expand(TensorView fixed, TensorView exceptions, TensorView exc_offsets,
   p.cols = static_cast<int>(cols);
   p.out_cols = static_cast<int>(out_cols);
   p.rotate_slabs = swap_row_halves ? static_cast<int>(slabs / 2) : 0;
-  // An odd number of words per tile row, past the row's last group of four that the swizzle
-  // permutes within.
-  p.tile_words = static_cast<int>((cols + 15) / 16 * 4 + 1);
+  p.tile_words = TileWords(cols);
   int64_t num_items = num_experts;
   if (token_selected_experts.has_value()) {
     TensorView experts = token_selected_experts.value();
@@ -401,6 +409,16 @@ void csf_expand(TensorView fixed, TensorView exceptions, TensorView exc_offsets,
     num_items = experts.numel();
   }
   if (num_items == 0 || num_experts == 0 || rows == 0) return;
+  int max_smem;
+  TVM_FFI_ICHECK_EQ(cudaDeviceGetAttribute(&max_smem, cudaDevAttrMaxSharedMemoryPerBlockOptin,
+                                           fixed.device().device_id),
+                    cudaSuccess);
+  if (ExpandSmemBytes(cols) > max_smem) {
+    int64_t max_cols = 0;
+    while (ExpandSmemBytes(max_cols + 2) <= max_smem) max_cols += 2;
+    TVM_FFI_THROW(ValueError) << "csf_expand supports up to " << max_cols
+                              << " columns on this device, got " << cols;
+  }
   const cudaStream_t stream = get_stream(fixed.device());
   uint8_t* dst = static_cast<uint8_t*>(out.data_ptr());
   if (dest == Dest::kSwizzled128x4) {

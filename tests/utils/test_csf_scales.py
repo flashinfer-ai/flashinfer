@@ -155,6 +155,14 @@ def test_expand_csf_scales_no_rows():
         expand_csf_scales(csf, out, layout=layout)
 
 
+def test_expand_csf_scales_too_wide():
+    csf = encode_csf_scales(torch.zeros(16, 2048, dtype=torch.uint8, device="cuda"))
+    out = torch.empty(1, 16, 2048, dtype=torch.uint8, device="cuda")
+    with pytest.raises(ValueError, match="supports up to"):
+        expand_csf_scales(csf, out)
+    check_encode(np.zeros((1, 32, 32), np.uint8))  # no CUDA error left behind
+
+
 def check_routed(out, ref, poison, routed):
     for e in range(ref.shape[0]):
         assert torch.equal(

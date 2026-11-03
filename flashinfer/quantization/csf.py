@@ -127,7 +127,9 @@ def expand_csf_scales(
     Parameters
     ----------
     csf : CsfScales
-        Scales from :func:`encode_csf_scales`, one matrix per expert.
+        Scales from :func:`encode_csf_scales`, one matrix per expert. Expansion takes about
+        192 bytes of shared memory per column, so ``cols`` can be at most 864 on SM80, 1200
+        on SM90 and SM100, and 518 on SM86, SM89 and SM120.
     out : torch.Tensor
         Contiguous destination in a one-byte dtype on the scales' device, written in place:
 
