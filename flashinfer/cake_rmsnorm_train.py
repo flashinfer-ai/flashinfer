@@ -30,8 +30,8 @@ Every entry point takes ``deterministic`` (default ``True``):
 * ``deterministic=True`` runs :mod:`flashinfer.cake_rmsnorm_det_train` with the
   same arguments: ``dw`` through a fixed row-chunk partition and a fixed-order
   reduction (a main kernel and a reduce kernel), bitwise reproducible for a
-  given token count on a given architecture.  The default call returns exactly
-  that package's results.
+  given token count on devices with the same SM count.  The default call
+  returns exactly that package's results.
 * ``deterministic=False`` runs this package's kernels: the same forward programs
   (the forward has no cross-row reduction) and, per token-count window, the
   backward form this build's registry lists for the window
