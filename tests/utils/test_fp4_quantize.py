@@ -2217,8 +2217,8 @@ def test_nvfp4_quantize_tma_backend_parity(
 
 # The CUDA TMA kernel walks rows in tiles of 16 for half/bf16, while 8x4 scale
 # factors are allocated for rows padded only to 8; m % 16 in [1, 8] leaves a
-# partial tile past that allocation.
-NVFP4_TMA_PARTIAL_ROW_TILE_SHAPES = [(1025, 512), (1032, 512), (1032, 2048)]
+# partial tile past that allocation. Each shape is large enough to take TMA.
+NVFP4_TMA_PARTIAL_ROW_TILE_SHAPES = [(1025, 16384), (1032, 16384), (1032, 32768)]
 
 
 @pytest.mark.parametrize("dtype", DTYPES)
