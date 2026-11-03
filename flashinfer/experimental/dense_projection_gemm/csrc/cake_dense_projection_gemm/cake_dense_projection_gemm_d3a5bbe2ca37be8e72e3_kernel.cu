@@ -184,29 +184,33 @@ kernel_cake_dense_projection_gemm_d3a5bbe2ca37be8e72e3(float* __restrict__ A, fl
     }
     asm volatile("cp.async.wait_group 0;");
     __syncthreads();
-    unsigned int part = smem_addr + (unsigned int)(slice_id * 16384);
+    unsigned int park = smem_addr + (unsigned int)(warp * 8192 + lane * 16);
     #pragma unroll
     for (int r_1 = 0; r_1 < 8; r_1++) {
-        int row = r_1 / 4 * 32 + ty * 4 + r_1 % 4;
         #pragma unroll
         for (int h = 0; h < 2; h++) {
-            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(part + (unsigned int)((row * 64 + h * 32 + tx * 4) * 4)), "r"(__as_u32(acc[r_1 * 8 + h * 4])), "r"(__as_u32(acc[r_1 * 8 + h * 4 + 1])), "r"(__as_u32(acc[r_1 * 8 + h * 4 + 2])), "r"(__as_u32(acc[r_1 * 8 + h * 4 + 3])) : "memory");
+            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(park + (unsigned int)((r_1 * 2 + h) * (32 * 16))), "r"(__as_u32(acc[r_1 * 8 + h * 4])), "r"(__as_u32(acc[r_1 * 8 + h * 4 + 1])), "r"(__as_u32(acc[r_1 * 8 + h * 4 + 2])), "r"(__as_u32(acc[r_1 * 8 + h * 4 + 3])) : "memory");
         }
     }
     __syncthreads();
     #pragma unroll
     for (int c_5 = 0; c_5 < 4; c_5++) {
         int v = c_5 * 256 + tid;
+        int n = v / 16;
+        int mc = v % 16;
+        int pst = n % 32 / 4 * 8 + mc % 8;
+        int prow = n / 32 * 4 + n % 4;
+        int chunk = (pst / 32 * 16 + prow * 2 + mc / 8) * 32 + pst % 32;
         float total[4];
         asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
             : "=r"(*reinterpret_cast<uint32_t*>(&total[0])), "=r"(*reinterpret_cast<uint32_t*>(&total[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&total[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&total[(0) + 3]))
-            : "r"(smem_addr + (unsigned int)(v * 16)));
+            : "r"(smem_addr + (unsigned int)(chunk * 16)));
         #pragma unroll
         for (int q = 1; q < 4; q++) {
             float other[4];
             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                 : "=r"(*reinterpret_cast<uint32_t*>(&other[0])), "=r"(*reinterpret_cast<uint32_t*>(&other[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&other[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&other[(0) + 3]))
-                : "r"(smem_addr + (unsigned int)(q * 16384 + v * 16)));
+                : "r"(smem_addr + (unsigned int)(q * 16384 + chunk * 16)));
             #pragma unroll
             for (int e_1 = 0; e_1 < 4; e_1++) {
                 total[e_1] = total[e_1] + other[e_1];
