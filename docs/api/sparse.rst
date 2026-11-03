@@ -191,6 +191,17 @@ exchange and before CUDA Graph capture: it loads every kernel into the device's
 context, so that no first launch waits on module loading while a peer's merge
 spins.
 
+``msa_icp_prefill_score_select`` fuses the prefill score and local Top16 steps
+of one query window: a list scorer keeps per-work-item Top16 lists in a
+caller-owned uint8 ``pool`` (``msa_icp_prefill_pool_bytes``) and a list merger
+writes the same carrier rows as ``msa_icp_index_score_sharded`` followed by
+``msa_icp_topk_select_prefill``, without the score scratch. The plan's
+``prefill_local`` runs it when given a ``pool``; ``prefill_pool_shape()`` and
+``prefill_window_tokens()`` size the pool for windows of at most
+``min(8192, max_num_batched_tokens)`` tokens. ``fused_prefill`` on the plan is
+the serving default per layout (``cake_backend.FUSED_PREFILL``); it is ``False``
+on every layout in this version, so the fused path runs only on request.
+
 .. autosummary::
     :toctree: ../generated
 
@@ -199,6 +210,7 @@ spins.
     msa_icp_index_score_sharded_plan_device
     msa_icp_index_score_sharded
     msa_icp_topk_select_prefill
+    msa_icp_prefill_score_select
     msa_icp_decode_index_score_sharded
     msa_icp_topk_select_publish
     msa_icp_decode_score_publish
@@ -207,4 +219,5 @@ spins.
     msa_icp_index_score_columns
     msa_icp_decode_score_columns
     msa_icp_decode_pool_bytes
+    msa_icp_prefill_pool_bytes
     msa_icp_comm_layout
