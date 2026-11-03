@@ -2429,6 +2429,24 @@ def test_skip_ops_prevents_profiling(monkeypatch):
     assert len(profile_calls) == 0
 
 
+def test_sticky_cuda_error_does_not_synchronize_during_capture(monkeypatch):
+    """A device synchronize during capture invalidates the graph rather than
+    just failing, and the first one here is exception-suppressed, so the check
+    has to come before it. rank_tactics reaches this helper with no capture
+    pre-check of its own."""
+    from flashinfer.autotuner.autotuner import _sticky_cuda_error
+
+    synchronized = []
+    monkeypatch.setattr(torch.cuda, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    monkeypatch.setattr(
+        torch.cuda, "synchronize", lambda *a, **k: synchronized.append(True)
+    )
+
+    assert _sticky_cuda_error() is None
+    assert synchronized == []
+
+
 def test_active_capture_allows_warm_tuning_cache_hits(monkeypatch):
     """A public tuning context may read a warm cache during capture but may not profile."""
     tuner = reset_autotuner()

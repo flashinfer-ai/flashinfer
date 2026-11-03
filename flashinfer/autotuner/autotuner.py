@@ -1363,14 +1363,19 @@ def _sticky_cuda_error() -> Exception | None:
     The first synchronize may fail just to report the failed tactic itself. A
     sticky error (an illegal memory access, a device-side assert, ...) cannot
     be cleared and fails every later CUDA call, so it fails the second too.
+
+    The capture check comes before both: a device synchronize during capture
+    does not merely fail, it invalidates the capture, and suppressing its
+    exception would hide that. ``rank_tactics`` reaches here with no capture
+    pre-check of its own, unlike ``choose_one``.
     """
     if not torch.cuda.is_initialized():
         return None
-    with contextlib.suppress(Exception):
-        torch.cuda.synchronize()
     try:
         if torch.cuda.is_current_stream_capturing():
             return None
+        with contextlib.suppress(Exception):
+            torch.cuda.synchronize()
         torch.cuda.synchronize()
     except Exception as error:
         return error
