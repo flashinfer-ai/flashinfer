@@ -34,13 +34,13 @@ def prepare_mega_gate(
 
     Inputs are BF16[M,K] and BF16[E,K]. Output is int64[M,topk+shared] plus
     FP32 weights. Plans preserve physical/logical expert mapping, unbiased
-    scoring, deterministic routing, and the current PyTorch CUDA stream.
-    SM100a/SM103a run the exported DeepGEMM programs and accept only their
-    configurations (see MegaGatePlan); SM120 runs a CuTe DSL backend that also
-    takes other K/E/top-k, no bias, token masks and image bias (see
-    MegaGateSm12xPlan). Both document their reusable workspace layouts.
-    ``enable_pdl`` (SM12x only) launches with programmatic dependent launch,
-    by default when the device supports it.
+    scoring, the token mask, the image bias, deterministic routing, and the
+    current PyTorch CUDA stream. ``enable_pdl`` (default: when the device
+    supports it) launches with programmatic dependent launch. SM10x runs the
+    exported DeepGEMM programs and accepts only their configurations (see
+    MegaGatePlan); SM120 runs a CuTe DSL backend that also takes other K/E/top-k
+    and no bias (see MegaGateSm12xPlan). Both document their optional metadata
+    and reusable workspace layouts.
     """
     import torch
 
@@ -73,8 +73,6 @@ def prepare_mega_gate(
             enable_pdl=enable_pdl,
         )
 
-    if enable_pdl is not None:
-        raise ValueError("enable_pdl is only configurable on the SM12x backend")
     from .experimental.deepgemm_mega_gate.mega_gate import MegaGatePlan
 
     return MegaGatePlan(

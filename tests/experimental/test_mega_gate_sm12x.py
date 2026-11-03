@@ -146,13 +146,6 @@ def test_measured_splits_take_the_smallest_one_wave_block():
             bound = max_tokens
 
 
-def test_enable_pdl_is_sm12x_only():
-    x = torch.zeros((1, 64), dtype=torch.bfloat16)
-    weight = torch.zeros((8, 64), dtype=torch.bfloat16)
-    with pytest.raises(ValueError, match="SM12x"):
-        prepare_mega_gate(x, weight, 2, enable_pdl=True)
-
-
 # --------------------------------------------------------------- reference
 
 
