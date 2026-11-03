@@ -18,7 +18,7 @@ import inspect
 import os
 import typing
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 import pytest
 import torch
@@ -64,6 +64,9 @@ class PdlApi:
     )
     # Optional parameters these calls require.
     required: Tuple[str, ...] = ()
+    # The GPUs it runs on, for APIs that do not raise BackendSupportedError
+    # elsewhere. None: any GPU.
+    compute_capabilities: Optional[Tuple[int, ...]] = None
 
     @property
     def params(self):
@@ -124,6 +127,9 @@ def _row_scale(inputs):
 
 
 _LOW_M = (dict(M=1), dict(M=8), dict(M=32))
+# quantize_with_block_size is compiled empty below SM100 and returns
+# uninitialized output there without raising.
+_FP4_QUANTIZE_CCS = (100, 103, 107, 110, 120, 121)
 
 _PDL_APIS = [
     PdlApi(
@@ -171,6 +177,8 @@ _PDL_APIS = [
         flashinfer.tgv_gemm_sm100,
         tgv_gemm_sm100_trace,
         axes=_LOW_M,
+        # Raises ValueError elsewhere.
+        compute_capabilities=(100, 103, 107),
     ),
     PdlApi(
         "mm_M1_16_K7168_N256",
@@ -191,12 +199,14 @@ _PDL_APIS = [
         axes=tuple(dict(M=m, K=4096) for m in (1, 128)),
         # Optional only for UE8M0 scales.
         required=("global_scale",),
+        compute_capabilities=_FP4_QUANTIZE_CCS,
     ),
     PdlApi(
         "nvfp4_quantize",
         flashinfer.nvfp4_quantize,
         quantize_templates.nvfp4_quantize_trace,
         axes=tuple(dict(M=m, K=4096) for m in (1, 128)),
+        compute_capabilities=_FP4_QUANTIZE_CCS,
     ),
     PdlApi(
         "rmsnorm_quant",
@@ -233,6 +243,11 @@ _KNOWN_RACES = {
 # Does not reproduce on SM120 with these shapes.
 _KNOWN_RACES_SM10X = {
     ("mm_fp4", "cute-dsl", "alpha"): "fixed by #7288",
+}
+
+# Calls that fail when the optional operands are left out: (api, backend) -> why.
+_FAILS_WITHOUT_OPTIONAL = {
+    ("mm_fp4", "cutlass"): "the fp4_gemm binding requires alpha (default None)",
 }
 
 
@@ -315,11 +330,17 @@ class _Call:
 
 
 def _call_or_skip(case):
+    major, minor = torch.cuda.get_device_capability()
+    supported = case.spec.compute_capabilities
+    if supported is not None and major * 10 + minor not in supported:
+        pytest.skip(f"{case.spec.name} does not run on SM{major}{minor}")
+    if not case.with_optional:
+        reason = _FAILS_WITHOUT_OPTIONAL.get((case.spec.name, case.backend))
+        if reason is not None:
+            pytest.skip(f"{case.id}: {reason}")
     try:
         return _Call(case)
-    # TypeError: a backend whose binding requires an operand the template
-    # marks optional, such as alpha for the CUTLASS FP4 GEMM.
-    except (BackendSupportedError, NotImplementedError, TypeError, ValueError) as exc:
+    except (BackendSupportedError, NotImplementedError) as exc:
         pytest.skip(f"{case.id} unavailable here: {exc}")
 
 
