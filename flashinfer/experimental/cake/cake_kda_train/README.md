@@ -170,7 +170,12 @@ replicas.  `cake_jit.R1C_PAIRS` maps each GLM intra record to its cast and
 whose two records disagree on a path (a cast after `glm_intra_raw`, or
 `param_finalize` after an `R1c` program, reads values nothing wrote).
 `param_acc` is a buffer of the workspace outside the arena (2 KiB per head
-with one replica, 16 KiB per head with 8).
+with one replica, 16 KiB per head with 8), shared by the workspace's plan
+views.  `KdaWorkspace.bytes` is the arena alone, `param_acc_bytes` the
+accumulators, and `workspace_bytes` / `memory_report` count both.  The
+workspace allocates `param_acc` zeroed at its first `R1c` backward; a backward
+that stops between the two programs leaves it marked, and the next backward
+zeroes it before its GLM intra launch.
 
 | arch | raw gate backward (every path) |
 | --- | --- |

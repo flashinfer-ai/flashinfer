@@ -39,9 +39,15 @@ and no atomic adds: repeated calls give bitwise the same results, and ``dq``,
 ``dk``, ``dv`` and ``dbeta`` are bitwise the deterministic package's.  ``dg``
 differs from the deterministic package's by FP32 rounding only.  The saved set
 has the deterministic package's format (the forward programs are the same).
-The raw gate mode (below) runs the deterministic pair on every row: there
-``out`` and every gradient, ``dA_log`` / ``ddt_bias`` included, are bitwise
-the deterministic package's.
+The raw gate mode (below) runs the deterministic fused gradient on every row:
+there ``out`` and every gradient but ``dA_log`` / ``ddt_bias`` are bitwise the
+deterministic package's, and on ``sm_107a`` those two are bitwise too.  On
+``sm_100a`` / ``sm_103a`` the raw backward reduces ``dA_log`` / ``ddt_bias``
+with the ``R1c`` pairs (:data:`cake_jit.R1C_PAIRS`): an unordered FP64 sum,
+rounded once to FP32, so the two can differ by one FP32 ulp from run to run and
+from the deterministic package; that backward alone raises PyTorch's
+non-determinism alert under ``torch.use_deterministic_algorithms(True)``
+(:func:`_alert_nondeterministic`).
 
 Operands (one packed batch of documents, GLM-5.3-Flash geometry): ``q, k, v``
 BF16 ``[1, S, H, 128]`` (``q`` / ``k`` L2-normalized by the caller), ``g`` FP32
@@ -59,8 +65,13 @@ raw gate BF16 ``[1, S, H, 128]`` (any view with unit innermost stride and
 host float ``lower_bound`` (``-5 <= lower_bound < 0``); the kernels form the
 activated gate ``lower_bound * sigmoid(exp(A_log) * (g + dt_bias))`` in their
 prefix passes, and the backward returns the BF16 ``d g`` with ``dA_log`` /
-``d dt_bias`` (the GLM intra program writes per-chunk partials, outside the
-arena, which one ``param_finalize`` launch reduces in a fixed order).  The
+``d dt_bias``.  On ``sm_107a`` the GLM intra program writes per-chunk partials,
+outside the arena, which one ``param_finalize`` launch reduces in a fixed
+order.  On ``sm_100a`` / ``sm_103a`` the ``R1c`` GLM intra program adds each
+chunk's terms in FP64 into the workspace's accumulators
+(:attr:`KdaWorkspace.param_acc`, ``[stripes, H, 2, 128]``, outside the arena)
+and one cast launch of the ``param_finalize`` stage sums the replicas in a
+fixed order, rounds once to FP32 and zeroes the accumulators again.  The
 mode is part of the plan (:attr:`Plan.gate`), the workspace and the saved set.
 Every gate-dependent stage (``cake_jit.GATE_STAGES``, the fused gradient
 among them) runs the deterministic package's raw class: the ``S1`` pairs
@@ -163,7 +174,10 @@ on the segmented route), so the backward skips its recurrence recompute (WY
 still runs for ``w``).
 
 Repeated calls on the same inputs give bitwise the same outputs: the kernels
-reduce in a fixed order and use no atomic adds.  The checkpoint replay
+reduce in a fixed order and use no atomic adds, except the ``R1c`` GLM intra
+programs of the raw gate mode on ``sm_100a`` / ``sm_103a``, whose FP64 adds into
+``param_acc`` arrive in no fixed order (``dA_log`` / ``ddt_bias`` within one
+FP32 ulp; every other output bitwise).  The checkpoint replay
 (``saved=None``) and a saved-set backward can select different pairs on some
 rows (:data:`cake_jit.S1_RECORDS`); their ``dg`` then differ by FP32 rounding,
 and every other gradient is bitwise the same.
@@ -237,6 +251,7 @@ import subprocess
 import sys
 import threading
 import types
+import warnings
 import weakref
 from collections.abc import Callable, Iterator, Sequence
 from typing import Any, Protocol
@@ -517,7 +532,9 @@ class Plan:
     activated FP32 gate, ``"raw"`` the raw BF16 gate of ``use_gate_in_kernel``): the stages of
     ``cake_jit.GATE_STAGES`` select within that class, every other stage selects the same record in both modes;
     in raw mode ``gate_fused`` is True on every architecture (no raw gate epilogue), ``param_finalize`` runs once
-    per backward and the fused gradient is the deterministic package's on every row (no ``S1`` record).  The
+    per backward and the fused gradient is the deterministic package's on every row (no ``S1`` record); on
+    ``sm_100a`` / ``sm_103a`` the ``glm_intra`` and ``param_finalize`` records are an ``R1c`` pair
+    (:data:`cake_jit.R1C_PAIRS`, :func:`_r1c_stripes`), on ``sm_107a`` ``glm_intra_raw`` and ``param_finalize``.  The
     forward layouts do not depend on it.
     """
 
@@ -973,7 +990,14 @@ def _check_pairs(
     GLM intra program; a deterministic GLM intra program after it drops the term, and an ``S1`` one after a
     deterministic fused gradient adds it twice.  Either is a silent ``dg`` error, so the registry is wrong.  In raw
     mode (``gate="raw"``) neither may be: the raw GLM intra program adds no ``q * dq`` term, so the raw class runs
-    the deterministic fused gradient on every row."""
+    the deterministic fused gradient on every row.
+
+    The parameter-gradient pair of raw mode: on every path with a ``glm_intra`` stage, an ``R1c`` GLM intra record
+    (:data:`cake_jit.R1C_PAIRS`) must be followed by its own cast and ``glm_intra_raw`` by ``param_finalize``.  The
+    ``R1c`` program's FP64 sums in ``param_acc`` are read by its cast alone (whose replica count is the GLM intra
+    record's, :data:`cake_jit.R1C_STRIPES`), and ``param_finalize`` reads the per-chunk partials only
+    ``glm_intra_raw`` writes; any other pair reads values nothing wrote.  In g mode no ``R1c`` record may be
+    selected."""
     for path, by_stage in records.items():
         if "dqkg" not in by_stage:
             continue
@@ -985,7 +1009,26 @@ def _check_pairs(
                     f"plan: path {path!r} selects the S1 record(s) {s1} in raw gate mode ({arch}, H={H}); the "
                     "raw class runs the deterministic fused gradient and GLM intra program on every row"
                 )
+            fin = by_stage.get("param_finalize")
+            want = cake_jit.R1C_PAIRS.get(glm, "param_finalize")
+            if fin != want:
+                raise ValueError(
+                    f"plan: path {path!r} pairs glm_intra record {glm!r} with param_finalize record {fin!r} in raw "
+                    f"gate mode ({arch}, H={H}); it must be {want!r}: the R1c GLM intra program's FP64 sums are "
+                    "read by its cast alone, and a cast after glm_intra_raw (or param_finalize after an R1c "
+                    "program) reads accumulators (partials) nothing wrote"
+                )
             continue
+        r1c = [
+            name
+            for name in (glm, by_stage.get("param_finalize"))
+            if name in cake_jit.R1C_PAIRS or name in cake_jit.R1C_PAIRS.values()
+        ]
+        if r1c:
+            raise ValueError(
+                f"plan: path {path!r} selects the R1c record(s) {r1c} in g mode ({arch}, H={H}); the R1c pairs "
+                "serve the raw gate mode alone"
+            )
         if (dqkg in cake_jit.S1_RECORDS) != (glm in cake_jit.S1_RECORDS):
             raise ValueError(
                 f"plan: path {path!r} pairs dqkg record {dqkg!r} with glm_intra record {glm!r} ({arch}, H={H}); "
@@ -1168,7 +1211,8 @@ def arena_for_budget(
     program, batching on the proportional rows) is skipped; the batched steps take the lean four-pass layouts where
     the row admits them.  ``ValueError`` naming the smallest arena seen when nothing fits.  The layouts are those
     of the plan's gate mode (:attr:`Plan.gate`; the raw mode's backward layouts drop the gate epilogue's buffers on
-    every architecture)."""
+    every architecture).  The budget bounds the arena alone: the ``R1c`` accumulators of a raw backward workspace
+    lie outside it (:attr:`KdaWorkspace.param_acc_bytes`)."""
     budget = int(arena_budget_bytes)
     smallest: int | None = None
 
@@ -1813,9 +1857,13 @@ def workspace_bytes(
     ``sm_count`` and ``arch`` (:func:`_arch_sms`: the current device's SM count when ``sm_count`` is ``None``, the
     current device's architecture when ``arch`` is ``None``).  ``gate`` is the gate mode (:attr:`Plan.gate`): the
     raw mode's backward layouts carry no ``dg_int`` / ``db_int`` on any architecture (the forward layouts are the
-    same in both modes).  The outputs, the saved set and the raw mode's per-call parameter partials are allocated
-    per call: :func:`saved_bytes`, :func:`output_bytes`, :func:`memory_report`.  ``l2n``: the deterministic
-    query's in-kernel Q/K L2 norm mode; ``"off"`` only, any other is refused (:func:`_refuse_l2n_layout`)."""
+    same in both modes).  A raw backward workspace whose plan selects an ``R1c`` pair (``sm_100a`` / ``sm_103a``,
+    :func:`_r1c_stripes`) also holds the FP64 accumulators ``param_acc`` outside the arena
+    (:attr:`KdaWorkspace.param_acc_bytes`), which this query adds: it is :attr:`KdaWorkspace.bytes` (the arena) +
+    :attr:`KdaWorkspace.param_acc_bytes`.  The outputs, the saved set and the deterministic pair's per-call parameter
+    partials are allocated per call: :func:`saved_bytes`, :func:`output_bytes`, :func:`memory_report`.  ``l2n``: the
+    deterministic query's in-kernel Q/K L2 norm mode; ``"off"`` only, any other is refused
+    (:func:`_refuse_l2n_layout`)."""
     _refuse_l2n_layout(l2n, "workspace_bytes")
     if save_mode not in SAVE_MODES:
         raise ValueError(
@@ -1824,8 +1872,14 @@ def workspace_bytes(
     _check_gate(gate)
     arch, sms = _arch_sms(sm_count, arch)
     S, num_docs, H = int(S), int(num_docs), int(H)
+    # the R1c accumulators of a raw backward workspace (outside the arena; 0 elsewhere)
+    acc = (
+        _param_acc_bytes(plan(S, num_docs, H, sms, arch, gate=gate))
+        if gate == "raw" and backward
+        else 0
+    )
     if arena is not None and (arena.lean or arena.batched):
-        return plan(S, num_docs, H, sms, arch, gate=gate).arena_bytes(
+        return acc + plan(S, num_docs, H, sms, arch, gate=gate).arena_bytes(
             backward=backward,
             save_mode=save_mode,
             arena=arena,
@@ -1834,7 +1888,7 @@ def workspace_bytes(
         )
     _nc_max, nc_pad, rows = _check_problem(S, num_docs, H, sms)
     nseg = _num_segments(num_docs, H, sms, arch)
-    return _arena_bytes(
+    return acc + _arena_bytes(
         rows,
         H,
         nc_pad,
@@ -1962,11 +2016,95 @@ def _raw_finalize_scratch(NC_pad: int, H: int, device: torch.device) -> dict[str
 
 
 def _raw_partials_bytes(NC_pad: int, H: int) -> int:
-    """The raw backward's per-call parameter partials ``dA_part`` / ``db_part``: FP32 ``[NC_pad, H, 128, 2]`` each
-    (the per-chunk ``(hi, lo)`` pairs of the GLM intra program), plus ``param_finalize``'s FP32 per-segment scratch
-    ``part2`` ``[H, seg_cap, 128, 4]`` and its u32 ticket ``[H]``, outside the arena, freed with the call."""
+    """The raw backward's per-call parameter partials ``dA_part`` / ``db_part`` of ``glm_intra_raw``: FP32
+    ``[NC_pad, H, 128, 2]`` each (the per-chunk ``(hi, lo)`` pairs of the GLM intra program), plus
+    ``param_finalize``'s FP32 per-segment scratch ``part2`` ``[H, seg_cap, 128, 4]`` and its u32 ticket ``[H]``,
+    outside the arena, freed with the call.  An ``R1c`` plan (:func:`_r1c_stripes`) allocates none of them: its
+    accumulators are the workspace's (:func:`_param_acc_bytes`)."""
     part2 = int(H) * _finalize_segments(NC_pad) * D * 4 * 4
     return 2 * int(NC_pad) * int(H) * D * 2 * 4 + part2 + 4 * int(H)
+
+
+def _r1c_stripes(p: Plan) -> int | None:
+    """The replica count of the ``R1c`` GLM intra record a raw plan's backward selects
+    (:data:`cake_jit.R1C_STRIPES`, the leading extent of ``param_acc``), ``None`` on a ``"g"`` plan and on a raw
+    plan of the deterministic pair (``glm_intra_raw`` + ``param_finalize``: ``sm_107a``).  Every backward path of the
+    plan selects the same GLM intra record (the registry's rules read the architecture and the head count alone):
+    ``RuntimeError`` otherwise, since one workspace's accumulators serve every path."""
+    if p.gate != "raw":
+        return None
+    glm = {
+        by_stage["glm_intra"]
+        for by_stage in p.records.values()
+        if by_stage.get("glm_intra") is not None
+    }
+    if len(glm) != 1:
+        raise RuntimeError(
+            f"plan ({p.arch}, H={p.H}): the backward paths select the raw GLM intra records {sorted(glm)}; one "
+            "record serves every path of a raw plan"
+        )
+    stripes = cake_jit.R1C_STRIPES.get(glm.pop())
+    return None if stripes is None else int(stripes)
+
+
+def _param_acc_bytes(p: Plan) -> int:
+    """Bytes of the ``R1c`` accumulators ``param_acc`` of a raw backward workspace of plan ``p``: FP64 ``[stripes,
+    H, 2, 128]`` (2 KiB per head with one replica, 16 KiB per head with 8), 0 where the plan selects no ``R1c``
+    record (:func:`_r1c_stripes`)."""
+    stripes = _r1c_stripes(p)
+    return 0 if stripes is None else 8 * stripes * int(p.H) * 2 * D
+
+
+def _r1c_alert_due(arch: str, H: int, sm_count: int) -> bool:
+    """Whether a raw backward of ``H`` heads on ``arch`` runs an ``R1c`` pair (and so alerts under torch's
+    deterministic algorithms, :func:`_alert_nondeterministic`): the selection of the plan of a one-chunk problem of
+    ``H`` heads.  The ``R1c`` records' rules read the architecture and the head count alone, so every problem of
+    ``H`` heads selects the same pair, and the context-parallel route's ranks, whose local problems differ, decide
+    alike (a decision one rank took alone could leave its peers waiting in a collective)."""
+    return (
+        _r1c_stripes(plan(BT, 1, int(H), int(sm_count), arch, gate="raw")) is not None
+    )
+
+
+def _alert_r1c(device: torch.device, H: int, entry: str) -> None:
+    """:func:`_alert_nondeterministic` for a raw gate backward of ``H`` heads on ``device`` that runs an ``R1c``
+    pair (:func:`_r1c_alert_due`); nothing while torch's deterministic algorithms are off (the device and the
+    registry are then not consulted), and nothing on a device that is not a CUDA device or that no record targets
+    (the call is refused later by its device check)."""
+    if not torch.are_deterministic_algorithms_enabled():
+        return
+    device = torch.device(device)
+    if device.type != "cuda":
+        return
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    arch = cake_jit.arch_for_capability(tuple(torch.cuda.get_device_capability(index)))
+    if arch is not None and _r1c_alert_due(arch, H, cake_jit.sm_count(index)):
+        _alert_nondeterministic(entry)
+
+
+def _alert_nondeterministic(entry: str) -> None:
+    """PyTorch's alert for an operation without a deterministic implementation, when torch's deterministic
+    algorithms are enabled: a ``RuntimeError``, or a ``UserWarning`` under
+    ``torch.use_deterministic_algorithms(True, warn_only=True)``; nothing otherwise.  Called by the entry points
+    whose raw gate backward runs an ``R1c`` pair (:func:`_r1c_alert_due`: the unordered FP64 parameter-gradient
+    reduce on ``sm_100a`` / ``sm_103a``), before they allocate, launch or exchange anything.  The alert is raised
+    here, not through a private PyTorch hook (PyTorch exposes no public Python entry for it)."""
+    if not torch.are_deterministic_algorithms_enabled():
+        return
+    if torch.is_deterministic_algorithms_warn_only_enabled():
+        warnings.warn(
+            f"{entry} does not have a deterministic implementation, but you set "
+            "'torch.use_deterministic_algorithms(True, warn_only=True)'; "
+            "flashinfer.cake_kda_det_train is the deterministic package",
+            stacklevel=3,
+        )
+        return
+    raise RuntimeError(
+        f"{entry} does not have a deterministic implementation, but you set "
+        "'torch.use_deterministic_algorithms(True)'; flashinfer.cake_kda_det_train is "
+        "the deterministic package, or use the 'warn_only=True' option if that is acceptable for your "
+        "application"
+    )
 
 
 def lifetime_table(
@@ -2091,7 +2229,9 @@ def memory_report(
     ``"raw"`` the backward layouts drop ``dg_int`` / ``db_int`` on every architecture, ``out_bwd`` is the raw mode's
     outputs (:func:`output_bytes`) and ``bwd_partials`` the per-call parameter partials ``dA_part`` / ``db_part``
     and the finalize's scratch (:func:`_raw_partials_bytes`, allocated by the backward outside the arena; 0 in
-    ``"g"`` mode), which the backward totals include; the raw mode never engages the checkpoint hand-off, so
+    ``"g"`` mode and on the ``R1c`` rows, :func:`_r1c_stripes`) and ``param_acc`` the ``R1c`` rows' FP64
+    accumulators (:attr:`KdaWorkspace.param_acc_bytes`, held by the workspace outside the arena; 0 elsewhere), both
+    of which the backward totals include; the raw mode never engages the checkpoint hand-off, so
     ``handoff_bytes`` and ``handoff_budget_bytes`` are 0 and ``handoff_bytes_rows`` ``None`` there."""
     if save_mode not in SAVE_MODES:
         raise ValueError(
@@ -2185,8 +2325,14 @@ def memory_report(
     saved = saved_bytes(S, H, num_docs, save_mode=save_mode, sm_count=sms, arch=arch)
     out_f = output_bytes(S, H, backward=False)
     out_b = output_bytes(S, H, backward=True, gate=gate)
-    # the raw backward's per-call parameter partials (outside the arena, live from GLM intra to param_finalize)
-    partials = _raw_partials_bytes(nc_pad, H) if gate == "raw" else 0
+    # the raw backward's per-call parameter partials (outside the arena, live from GLM intra to param_finalize) on
+    # the deterministic pair's rows, the workspace's R1c accumulators on the others
+    acc = (
+        _param_acc_bytes(plan(S, num_docs, H, sms, arch, gate=gate))
+        if gate == "raw"
+        else 0
+    )
+    partials = _raw_partials_bytes(nc_pad, H) if gate == "raw" and not acc else 0
     # The per-call segment states in the saved set: tape two blocks (seg_state, its transfer half is the saved
     # seg_m), light three (hseg and the seg_state pair, version 4) when the size rule holds; none on the serial route.
     if recur != "seg":
@@ -2275,6 +2421,7 @@ def memory_report(
         "out_fwd": out_f,
         "out_bwd": out_b,
         "bwd_partials": partials,
+        "param_acc": acc,
         "fwd_total_fwd_arena": arena_fwd_conf
         + out_f
         + saved,  # a forward-only workspace
@@ -2283,12 +2430,14 @@ def memory_report(
         + saved,  # the same workspace serving every boundary
         "bwd_total": arena_bwd_conf
         + out_b
-        + partials,  # the saved set exists before the call
+        + partials
+        + acc,  # the saved set exists before the call
         "replay_total": arena_bwd
         + out_f
         + saved
         + out_b
-        + partials,  # the default arena: lean serves no replay
+        + partials
+        + acc,  # the default arena: lean serves no replay
         # one checkpoint hand-off record (light calls under torch.utils.checkpoint), a tape and a row record, the
         # device's budget for this shape's tape records and the per-call arenas of a backward that took a record
         "handoff_bytes": handoff,
@@ -2599,6 +2748,15 @@ class KdaWorkspace:
     :meth:`for_budget`): the workspace launches this package's programs, so a construction that swaps only the
     import path of the deterministic package's workspace fails instead of handing its entries this package's
     pairs.
+
+    A raw-mode backward workspace whose plan selects an ``R1c`` pair (``sm_100a`` / ``sm_103a``,
+    :func:`_r1c_stripes`) also holds :attr:`param_acc`, the FP64 accumulators of the parameter gradients (``[stripes,
+    H, 2, 128]``) outside the arena, shared by every view (:meth:`with_plan`, :meth:`batch_view`) like :attr:`eye`:
+    zero when first allocated, filled by the ``R1c`` GLM intra launches of one backward and zeroed again by its
+    cast.  :attr:`param_acc_bytes` is their size, so :func:`workspace_bytes` is :attr:`bytes` +
+    :attr:`param_acc_bytes`.  Two backwards in flight on one workspace (two streams) are not supported, for the
+    accumulators as for the arena; a backward that stops between its GLM intra launches and its cast (an exception)
+    leaves partial sums, which the next backward on the workspace zeroes first.
     """
 
     def __init__(
@@ -2688,6 +2846,11 @@ class KdaWorkspace:
         # view of this arena (with_plan, batch_view), since the flags the epochs stamp live in the shared eye
         self._eye_box: list[torch.Tensor | None] = [None]
         self._epoch: list[int] = [0]
+        # the R1c accumulators (param_acc, allocated zero by the first backward that reads them) and whether a backward
+        # added into them without its cast completing (the next one zeroes them first): one-entry lists, shared by every
+        # view of this arena like the eye
+        self._param_acc_box: list[torch.Tensor | None] = [None]
+        self._param_acc_dirty: list[bool] = [False]
         # the batched option's views of this arena per group geometry, and per doc_lengths its groups with their
         # host-derived state blocks and tail counts and the device copy of those integers (None until a call needs
         # it); the doc_lengths a CUDA-graph capture used, whose entries the cache keeps for the workspace's lifetime
@@ -2764,6 +2927,33 @@ class KdaWorkspace:
                 D, dtype=torch.float32, device=self.device
             )
         return eye
+
+    @property
+    def param_acc(self) -> torch.Tensor | None:
+        """The ``R1c`` accumulators of the parameter gradients, FP64 ``[stripes, H, 2, 128]`` (:func:`_r1c_stripes`;
+        chunk ``c`` adds into replica ``c mod stripes``) outside the arena, ``None`` on a workspace whose plan selects
+        no ``R1c`` record (``"g"`` mode, ``sm_107a``) or that serves no backward.  Allocated zero on first use (the
+        per-call workspaces of the calls without one: per call, as :attr:`eye`) and shared by every view of this
+        arena: one storage of the largest view's elements, each view reading its own leading part (every element is
+        zero between backwards, so the views' shapes need not agree)."""
+        stripes = _r1c_stripes(self.plan) if self.backward else None
+        if stripes is None:
+            return None
+        n = stripes * self.plan.H * 2 * D
+        acc = self._param_acc_box[0]
+        if acc is None or acc.numel() < n:
+            # a fresh zero storage (a smaller one in use by queued work goes back to the allocator in stream order)
+            acc = self._param_acc_box[0] = torch.zeros(
+                n, dtype=torch.float64, device=self.device
+            )
+            self._param_acc_dirty[0] = False
+        return acc[:n].view(stripes, self.plan.H, 2, D)
+
+    @property
+    def param_acc_bytes(self) -> int:
+        """Bytes of :attr:`param_acc` under this workspace's plan (0 where it is ``None``): the term
+        :func:`workspace_bytes` adds to :attr:`bytes` for a raw backward workspace of an ``R1c`` plan."""
+        return _param_acc_bytes(self.plan) if self.backward else 0
 
     @property
     def flags(self) -> torch.Tensor:
@@ -2857,7 +3047,7 @@ class KdaWorkspace:
         the default, lean, two tail passes, four, then four passes over document groups halving from half the pack
         down to one document per group, which needs ``doc_lengths``); ``ValueError`` when none fits
         (``deterministic=False`` required, refused before the device is read).  ``gate``: the gate mode, as
-        :meth:`for_problem`."""
+        :meth:`for_problem`.  The budget bounds the arena alone (:attr:`param_acc` lies outside it)."""
         _require_deterministic_false(deterministic, "KdaWorkspace")
         _check_gate(gate)
         index = _device_index(torch.device(device))
@@ -3147,15 +3337,18 @@ def _entry_acquire(
 
 
 def _entry_release(ws: KdaWorkspace, key: tuple[Any, ...] | None) -> None:
-    """Free the device memory of a call's workspace (arena storage, eye, the device copies of doc_lengths and of
-    what derives from them: the caching allocator takes them back on the call's stream, as when a per-call tensor
-    dies) and keep the rest for the next call with the same key."""
+    """Free the device memory of a call's workspace (arena storage, eye, the ``R1c`` accumulators, the device copies
+    of doc_lengths and of what derives from them: the caching allocator takes them back on the call's stream, as when
+    a per-call tensor dies) and keep the rest for the next call with the same key."""
     if key is None:
         return
     ws.arena.untyped_storage().resize_(0)
     # the next call builds a fresh eye (flags 0 / the identity's 1.0f), so its epochs restart below any flag value
     ws._eye_box[0] = None
     ws._epoch[0] = 0
+    # and fresh zero R1c accumulators
+    ws._param_acc_box[0] = None
+    ws._param_acc_dirty[0] = False
     ws._doc_cache = {k: packing.on_host() for k, packing in ws._doc_cache.items()}
     with _entry_lock:
         free = _entry_pool.setdefault(key, [])
@@ -4439,7 +4632,8 @@ def _backward_launches(
     (the pad chunks trail the real ones, and the adjoint recurrence writes every row of every real chunk
     afterwards).  ``gate_values`` are the raw gate mode's operands and outputs (``g`` / ``dg`` are then ``None``):
     the raw gate view and parameters, ``dg_raw``, and the per-chunk partials ``dA_part`` / ``db_part`` as views at
-    the group's first chunk; ``param_finalize`` is never launched here (once per call, by :func:`_backward`)."""
+    the group's first chunk (or, on an ``R1c`` plan, the workspace's accumulators ``param_acc`` whole);
+    ``param_finalize`` is never launched here (once per call, by :func:`_backward`)."""
     p = ws.plan
     b = views
     # The operand sources of the backward programs: the saved Aqk / Akk token rows and the user's dout on the
@@ -4604,14 +4798,24 @@ def chunk_kda_bwd(
 
     Raw gate mode (``use_gate_in_kernel=True``, the forward's ``A_log`` / ``dt_bias`` / ``lower_bound``): the raw
     prep and intra records activate the gate again, the fused gradient is the deterministic package's on every row
-    (no ``S1`` pair: the raw GLM intra program adds no ``q * dq`` term), the raw GLM intra program writes ``dg``
-    and the per-chunk ``(hi, lo)`` partials of the two parameter gradients into per-call buffers outside the arena
-    (FP32 ``[NC_pad, H, 128, 2]`` each; the groups and the tail ranges take views at their first chunk), and one
-    ``param_finalize`` launch after the last group / range reduces them in an order fixed by the global chunk
-    alone (the bound is ``seq_chunk_start[num_docs]``, or on a batched call the pack's real chunk count from
-    ``doc_lengths``).  The programs are the deterministic package's raw records: the seven results are bitwise its
-    own on every path and arena option.  No gate epilogue runs.  A saved set of the other mode, or with another
-    ``lower_bound`` (its FP32 value), is refused with ``ValueError``, as is a workspace of the other mode.
+    (no ``S1`` pair: the raw GLM intra programs add no ``q * dq`` term) and the raw GLM intra program writes ``dg``.
+    On ``sm_107a`` (``glm_intra_raw``) it also writes the per-chunk ``(hi, lo)`` partials of the two parameter
+    gradients into per-call buffers outside the arena (FP32 ``[NC_pad, H, 128, 2]`` each; the groups and the tail
+    ranges take views at their first chunk), and one ``param_finalize`` launch after the last group / range reduces
+    them in an order fixed by the global chunk alone (the bound is ``seq_chunk_start[num_docs]``, or on a batched
+    call the pack's real chunk count from ``doc_lengths``): the seven results are bitwise the deterministic
+    package's on every path and arena option.  On ``sm_100a`` / ``sm_103a`` the ``R1c`` GLM intra program
+    (``glm_intra_v20c``; on ``sm_100a`` from 32 heads ``glm_intra_v20c_r8``) adds each chunk's merged pairs in FP64
+    into the workspace's accumulators :attr:`KdaWorkspace.param_acc` (every group and tail range into the same
+    sums) and one cast launch after the last group / range sums the replicas in ascending order, rounds once to
+    ``dA_log`` / ``ddt_bias`` and zeroes the accumulators.  The FP64 additions arrive in no fixed order, so
+    ``dA_log`` / ``ddt_bias`` can differ by one FP32 ulp from run to run and from the deterministic package (their
+    error against the FP64 reference stays within its bound); the other five results are bitwise the
+    deterministic package's.  That backward raises PyTorch's non-determinism alert under
+    ``torch.use_deterministic_algorithms(True)`` (``RuntimeError``; a ``UserWarning`` with ``warn_only=True``)
+    before it allocates or launches anything (:func:`_alert_nondeterministic`).  No gate epilogue runs.  A saved
+    set of the other mode, or with another ``lower_bound`` (its FP32 value), is refused with ``ValueError``, as is
+    a workspace of the other mode.
     """
     _require_deterministic_false(deterministic, "chunk_kda_bwd")
     _refuse_qk_l2norm("chunk_kda_bwd", use_qk_l2norm_in_kernel)
@@ -4671,6 +4875,10 @@ def _bwd_call(
     gp = _gate_params(gate, A_log, dt_bias, lower_bound, H, v.device)
     dout = _squeeze_batch(dout, "dout", 3)
     _check(dout, "dout", (S, H, D), torch.bfloat16, v.device)
+    if gp is not None:
+        # the raw backward's R1c pair reduces dA_log / ddt_bias in no fixed order: under torch's deterministic
+        # algorithms it is refused (or warned about) here, before anything is allocated or launched
+        _alert_r1c(v.device, H, "chunk_kda_bwd")
     option = (
         arena
         if arena is not None
@@ -4897,23 +5105,41 @@ def _backward(
     # the gate's gradient: FP32 dg, or in raw mode the raw gate's BF16 gradient (contiguous token rows)
     dg = _alloc((S, H, D), torch.float32 if gp is None else torch.bfloat16, ws.device)
     dbeta = _alloc((S, H), torch.bfloat16, ws.device)
-    # raw mode: the parameter gradients and their per-chunk (hi, lo) partials, per call and outside the arena (GLM
-    # intra writes the partials of the real chunks only; param_finalize reads those alone)
+    # raw mode: the parameter gradients and, for the deterministic pair (glm_intra_raw + param_finalize), their
+    # per-chunk (hi, lo) partials, per call and outside the arena (GLM intra writes the partials of the real chunks
+    # only; param_finalize reads those alone); an R1c pair adds into the workspace's FP64 accumulators instead
     raw_out: dict[str, torch.Tensor] = {}
+    r1c = gp is not None and _r1c_stripes(p) is not None
     if gp is not None:
         raw_out = {
             "dg_raw": dg,
-            "dA_part": _alloc((p.NC_pad, H, D, 2), torch.float32, ws.device),
-            "db_part": _alloc((p.NC_pad, H, D, 2), torch.float32, ws.device),
             "dA_log": _alloc((H,), torch.float32, ws.device),
             "ddt_bias": _alloc((H * D,), torch.float32, ws.device),
         }
+        if r1c:
+            acc = ws.param_acc
+            if acc is None:  # an R1c plan always has them on a backward workspace
+                raise RuntimeError(
+                    "chunk_kda_bwd: the workspace holds no R1c accumulators"
+                )
+            if ws._param_acc_dirty[0]:
+                # an earlier backward stopped between its GLM intra launches and its cast: its partial sums go
+                acc.zero_()
+            # cleared by the cast (_param_finalize)
+            ws._param_acc_dirty[0] = True
+            raw_out["param_acc"] = acc
+        else:
+            raw_out["dA_part"] = _alloc((p.NC_pad, H, D, 2), torch.float32, ws.device)
+            raw_out["db_part"] = _alloc((p.NC_pad, H, D, 2), torch.float32, ws.device)
 
     def gate_values(c0: int = 0) -> dict[str, Any] | None:
         """The raw mode's operands and outputs of a launch sequence whose chunks start at the pack's chunk ``c0``
-        (a group's first chunk): the partials as views offset by it, like the per-chunk rows of ``gk``."""
+        (a group's first chunk): the partials as views offset by it, like the per-chunk rows of ``gk``; the ``R1c``
+        accumulators whole (every group adds into the same sums)."""
         if gp is None:
             return None
+        if r1c:
+            return {**_raw_values(g, gp), **raw_out}
         return {
             **_raw_values(g, gp),
             **raw_out,
@@ -5099,13 +5325,37 @@ def _param_finalize(
     seq_chunk_start: torch.Tensor,
     num_seqs: int,
 ) -> None:
-    """The raw mode's ``param_finalize`` launch (once per backward, grid ``(H, seg_cap, 1)``: one CTA per head and
-    segment of :data:`FINALIZE_SEGMENT` chunks of the partials' ``NC_pad`` rows): ``dA_log`` / ``ddt_bias`` from the
-    per-chunk partials of the chunks ``[0, seq_chunk_start[num_seqs])``.  The per-segment scratch ``part2`` and the
-    per-head ticket (zero; the last CTA of each head sets it back to zero) are this call's."""
+    """The raw mode's launch of the ``param_finalize`` stage (once per backward, after the last group / tail range).
+
+    The deterministic pair's ``param_finalize`` (grid ``(H, seg_cap, 1)``: one CTA per head and segment of
+    :data:`FINALIZE_SEGMENT` chunks of the partials' ``NC_pad`` rows): ``dA_log`` / ``ddt_bias`` from the per-chunk
+    partials of the chunks ``[0, seq_chunk_start[num_seqs])``.  The per-segment scratch ``part2`` and the per-head
+    ticket (zero; the last CTA of each head sets it back to zero) are this call's.
+
+    An ``R1c`` cast (``"param_acc"`` in ``raw_out``; grid ``(H, 1, 1)``: one CTA per head): ``dA_log`` / ``ddt_bias``
+    from the replicas of the workspace's accumulators, summed in ascending order and rounded once, which it zeroes
+    (the workspace's dirty flag is cleared: the next backward adds into zeros)."""
     H = ws.plan.H
-    seg_cap = _finalize_segments(raw_out["dA_part"].shape[0])
     grid = ws.plan.grid("param_finalize", path, 0)
+    if "param_acc" in raw_out:
+        if tuple(grid) != (H, 1, 1):
+            raise ValueError(
+                f"param_finalize: plan grid {tuple(grid)} of the R1c cast "
+                f"{ws.plan.record('param_finalize', path)!r} != (H, 1, 1) = {(H, 1, 1)}"
+            )
+        ws.run(
+            "param_finalize",
+            {
+                "param_acc": raw_out["param_acc"],
+                "dA_log": raw_out["dA_log"],
+                "ddt_bias": raw_out["ddt_bias"],
+                "num_heads": H,
+            },
+            path=path,
+        )
+        ws._param_acc_dirty[0] = False
+        return
+    seg_cap = _finalize_segments(raw_out["dA_part"].shape[0])
     if tuple(grid) != (H, seg_cap, 1):
         raise ValueError(
             f"param_finalize: plan grid {tuple(grid)} != (H, seg_cap, 1) = {(H, seg_cap, 1)} for "

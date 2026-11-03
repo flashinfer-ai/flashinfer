@@ -3150,7 +3150,8 @@ def kda_workspace_bytes_kcp(
     use_qk_l2norm_in_kernel: bool = False,
 ) -> int:
     """Caller-held workspace bytes of one rank: the local arena for ``(T_r, n_frag, H)`` (zero on a rank without
-    tokens; the existing backend's arena, ``kda_train_workspace_bytes``, or for a backward workspace under
+    tokens; the existing backend's arena, ``kda_train_workspace_bytes``, which on a raw backward workspace of an
+    ``R1c`` plan includes the FP64 parameter-gradient accumulators outside the arena, or for a backward workspace under
     ``local_arena="lean"`` (opt-in; the default ``None`` is ``"replay"``) the lean arena of :func:`local_arena_bytes`
     plus its tail-count table, ``4 * local_tail_count_words(arena, H)`` bytes, where the lean layout serves the row;
     a forward-only light
