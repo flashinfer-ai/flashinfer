@@ -367,7 +367,16 @@ K1_RULE_MIN_SM_COUNT: dict[tuple[str, int, int, int, str], int] = {
 #: come from a re-measurement at 16172, 16231 and 16384 tokens against those plans (the protocol is in the sm_107a K1
 #: token table of the README): a measured token count is an entry where the row's program failed the rule above in some
 #: run, or left the backward pass or the checkpointed step more than 1.3 % slower than the deterministic program (ratio
-#: of the medians over the runs, or median of the paired ratios, in eager launches or in graph replays).
+#: of the medians over the runs, or median of the paired ratios, in eager launches or in graph replays).  In addition,
+#: the sm_107a FP32 rows ``4096 -> 512``, ``4096 -> 1024``, ``5120 -> 512`` and ``5120 -> 1024`` run the deterministic
+#: program from 40961 tokens up on parts of 216 SMs or more: their one-split program adds the whole token reduction of
+#: an output in one chain, and its FP64 error grows about linearly with the token count until it misses the
+#: deterministic package's FP32 error budget (relative Frobenius error 5e-5).  Measured with the 216-SM rules on a
+#: 212-SM R200 part (the same program and accumulation order as on 216 SMs; the error does not depend on the SM count)
+#: against an FP64 reference, 5 seeds, at 32768, 36864, 40960, 45056, 49152, 57344, 65536 and 131072 tokens: within the
+#: budget on every seed up to 40960 tokens and above it on every seed from 45056 tokens up (7.6e-5 at 65536 tokens,
+#: where the deterministic program's is 3.8e-5).  The range has no upper bound: the error keeps growing with the token
+#: count.  The token counts between 40960 and 45056 run the deterministic program too (not measured).
 # fmt: off
 K1_SPLIT_RULE_EXCLUDED_TOKENS: dict[
     tuple[str, int, int, int, str], tuple[tuple[int, int, Optional[int]], ...]
@@ -409,9 +418,11 @@ K1_SPLIT_RULE_EXCLUDED_TOKENS: dict[
     ),
     ("sm_107a", 1, 4096, 512, "f32"): (
         (208, 16231, 16231), (208, 16384, 16384), (212, 16231, 16231), (212, 16384, 16384),
-        (216, 16231, 16231), (216, 16384, 16384),
+        (216, 16231, 16231), (216, 16384, 16384), (216, 40961, None),
     ),
-    ("sm_107a", 1, 4096, 1024, "f32"): ((208, 16231, 16231), (212, 16231, 16231), (216, 16231, 16231)),
+    ("sm_107a", 1, 4096, 1024, "f32"): (
+        (208, 16231, 16231), (212, 16231, 16231), (216, 16231, 16231), (216, 40961, None),
+    ),
     ("sm_107a", 1, 5120, 48, "f32"): (
         (208, 16231, 16231), (208, 16384, 16384), (212, 16231, 16231), (216, 16231, 16231),
         (216, 16384, 16384),
@@ -419,8 +430,9 @@ K1_SPLIT_RULE_EXCLUDED_TOKENS: dict[
     ("sm_107a", 1, 5120, 64, "f32"): (
         (208, 16231, 16231), (212, 16231, 16231), (216, 16231, 16231), (216, 16384, 16384),
     ),
-    ("sm_107a", 1, 5120, 512, "f32"): ((212, 16231, 16231), (212, 16384, 16384)),
+    ("sm_107a", 1, 5120, 512, "f32"): ((212, 16231, 16231), (212, 16384, 16384), (216, 40961, None)),
     ("sm_107a", 1, 5120, 1024, "bf16"): ((216, 16231, 16231),),
+    ("sm_107a", 1, 5120, 1024, "f32"): ((216, 40961, None),),
 }
 # fmt: on
 #: Per-SM-count verdicts of the parts of an architecture with fewer SMs than its :data:`K1_MIN_SM_COUNT`,
