@@ -58,7 +58,7 @@ __device__ __forceinline__ float max_noftz(float a, float b) {
 extern "C" {
 
 __global__ __launch_bounds__(128) void
-kernel_cake_msa_icp_indexer_7bb0a4a2f772f7ac3c9b(float* __restrict__ scores, int* __restrict__ num_valid_pages, long long* __restrict__ recv_bases, int* __restrict__ errors, int* __restrict__ generations, int total_q, int score_cols, long long score_stride_t, long long score_stride_h, int slot, int rank, int world, int heads_per_rank, int capacity, int force_begin, int force_end, int spin_limit, int tagged, int index_scale, int index_offset)
+kernel_cake_msa_icp_indexer_c52df55290af4f4eb793(float* __restrict__ scores, int* __restrict__ num_valid_pages, int* __restrict__ carrier, int total_q, int score_cols, long long score_stride_t, long long score_stride_h, long long carrier_stride_h, long long carrier_stride_t, int force_begin, int force_end, int index_scale, int index_offset)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -83,10 +83,6 @@ kernel_cake_msa_icp_indexer_7bb0a4a2f772f7ac3c9b(float* __restrict__ scores, int
     const int slab_k_addr = smem + 0;
     int* slab_c = reinterpret_cast<int*>(smem_raw + 1024);
     const int slab_c_addr = smem + 1024;
-    unsigned int* list_k = reinterpret_cast<unsigned int*>(smem_raw + 2048);
-    const int list_k_addr = smem + 2048;
-    int* list_c = reinterpret_cast<int*>(smem_raw + 2304);
-    const int list_c_addr = smem + 2304;
 
     // Kernel post-init ops
     asm volatile("griddepcontrol.wait;" ::: "memory");
@@ -94,40 +90,37 @@ kernel_cake_msa_icp_indexer_7bb0a4a2f772f7ac3c9b(float* __restrict__ scores, int
     // === Task calls (declaration order) ===
     int sub = (int)warp;
     int lane_1 = (int)lane;
-    int t = (int)blockIdx.x;
+    int t = (int)blockIdx.x * 4 + sub;
     int h = (int)blockIdx.y;
-    if (sub == 0 && lane_1 == 0) {
-        asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
-    }
-    float* row = scores + ((long long)t * score_stride_t + (long long)h * score_stride_h);
-    int nv = num_valid_pages[t];
-    int s_shift = index_scale - 1;
-    int kcap = score_cols << s_shift;
-    int ng = ((nv > 0) ? nv : 0);
-    ng = ((ng < 8192) ? ng : 8192);
-    ng = ((ng < kcap) ? ng : kcap);
-    int lpc_n = ((ng > index_offset) ? (ng - 1 - index_offset >> s_shift) + 1 : 0);
-    int L = lpc_n;
-    int lpc_n_0 = ((force_begin > index_offset) ? (force_begin - 1 - index_offset >> s_shift) + 1 : 0);
-    int lfb = lpc_n_0;
-    int fe0 = ((ng > force_end) ? ng - force_end : 0);
-    int lpc_n_1 = ((fe0 > index_offset) ? (fe0 - 1 - index_offset >> s_shift) + 1 : 0);
-    int flen = ((lpc_n_1 > lfb) ? lpc_n_1 - lfb : 0);
-    int sel[1];
-    sel[0] = ((lane_1 < L) ? lane_1 : 2147483647);
-    if (L > 16) {
-        unsigned int ck[1];
-        int cc[1];
-        unsigned int kb[10];
-        unsigned int hk[2];
-        int hc[2];
-        ck[0] = 0;
-        cc[0] = 2147483647;
-        int wbase = sub * 64;
-        int last = L - 1;
-        int c0 = 32 * sub;
-        while (c0 < L + 32 * sub) {
-            if (c0 < L) {
+    if (t < total_q) {
+        float* row = scores + ((long long)t * score_stride_t + (long long)h * score_stride_h);
+        int nv = num_valid_pages[t];
+        int s_shift = index_scale - 1;
+        int kcap = score_cols << s_shift;
+        int ng = ((nv > 0) ? nv : 0);
+        ng = ((ng < 8192) ? ng : 8192);
+        ng = ((ng < kcap) ? ng : kcap);
+        int lpc_n = ((ng > index_offset) ? (ng - 1 - index_offset >> s_shift) + 1 : 0);
+        int L = lpc_n;
+        int lpc_n_0 = ((force_begin > index_offset) ? (force_begin - 1 - index_offset >> s_shift) + 1 : 0);
+        int lfb = lpc_n_0;
+        int fe0 = ((ng > force_end) ? ng - force_end : 0);
+        int lpc_n_1 = ((fe0 > index_offset) ? (fe0 - 1 - index_offset >> s_shift) + 1 : 0);
+        int flen = ((lpc_n_1 > lfb) ? lpc_n_1 - lfb : 0);
+        int sel[1];
+        sel[0] = ((lane_1 < L) ? lane_1 : 2147483647);
+        if (L > 16) {
+            unsigned int ck[1];
+            int cc[1];
+            unsigned int kb[20];
+            unsigned int hk[2];
+            int hc[2];
+            ck[0] = 0;
+            cc[0] = 2147483647;
+            int wbase = sub * 64;
+            int last = L - 1;
+            int c0 = 0;
+            while (c0 < L) {
                 int ci_0 = c0 + lane_1;
                 float xi_0 = row[((ci_0 < L) ? ci_0 : last)];
                 float ok_xc = max_noftz(xi_0, -CUDART_INF_F) + 0.0f;
@@ -136,7 +129,7 @@ kernel_cake_msa_icp_indexer_7bb0a4a2f772f7ac3c9b(float* __restrict__ scores, int
                 unsigned int ok_k = ok_xb ^ ((unsigned int)((int)ok_xb >> 31) | 2147483648u);
                 unsigned int kf_0 = (((unsigned int)(ci_0 - lfb) >= (unsigned int)flen) ? 4286578688u : ok_k);
                 kb[0] = ((ci_0 < L) ? kf_0 : 0);
-                int ci_1 = c0 + lane_1 + 128;
+                int ci_1 = c0 + lane_1 + 32;
                 float xi_1 = row[((ci_1 < L) ? ci_1 : last)];
                 float ok_xc_0 = max_noftz(xi_1, -CUDART_INF_F) + 0.0f;
                 unsigned int ok_xb_0 = 0;
@@ -144,7 +137,7 @@ kernel_cake_msa_icp_indexer_7bb0a4a2f772f7ac3c9b(float* __restrict__ scores, int
                 unsigned int ok_k_0 = ok_xb_0 ^ ((unsigned int)((int)ok_xb_0 >> 31) | 2147483648u);
                 unsigned int kf_1 = (((unsigned int)(ci_1 - lfb) >= (unsigned int)flen) ? 4286578688u : ok_k_0);
                 kb[1] = ((ci_1 < L) ? kf_1 : 0);
-                int ci_2 = c0 + lane_1 + 256;
+                int ci_2 = c0 + lane_1 + 64;
                 float xi_2 = row[((ci_2 < L) ? ci_2 : last)];
                 float ok_xc_1 = max_noftz(xi_2, -CUDART_INF_F) + 0.0f;
                 unsigned int ok_xb_1 = 0;
@@ -152,7 +145,7 @@ kernel_cake_msa_icp_indexer_7bb0a4a2f772f7ac3c9b(float* __restrict__ scores, int
                 unsigned int ok_k_1 = ok_xb_1 ^ ((unsigned int)((int)ok_xb_1 >> 31) | 2147483648u);
                 unsigned int kf_2 = (((unsigned int)(ci_2 - lfb) >= (unsigned int)flen) ? 4286578688u : ok_k_1);
                 kb[2] = ((ci_2 < L) ? kf_2 : 0);
-                int ci_3 = c0 + lane_1 + 384;
+                int ci_3 = c0 + lane_1 + 96;
                 float xi_3 = row[((ci_3 < L) ? ci_3 : last)];
                 float ok_xc_2 = max_noftz(xi_3, -CUDART_INF_F) + 0.0f;
                 unsigned int ok_xb_2 = 0;
@@ -160,7 +153,7 @@ kernel_cake_msa_icp_indexer_7bb0a4a2f772f7ac3c9b(float* __restrict__ scores, int
                 unsigned int ok_k_2 = ok_xb_2 ^ ((unsigned int)((int)ok_xb_2 >> 31) | 2147483648u);
                 unsigned int kf_3 = (((unsigned int)(ci_3 - lfb) >= (unsigned int)flen) ? 4286578688u : ok_k_2);
                 kb[3] = ((ci_3 < L) ? kf_3 : 0);
-                int ci_4 = c0 + lane_1 + 512;
+                int ci_4 = c0 + lane_1 + 128;
                 float xi_4 = row[((ci_4 < L) ? ci_4 : last)];
                 float ok_xc_3 = max_noftz(xi_4, -CUDART_INF_F) + 0.0f;
                 unsigned int ok_xb_3 = 0;
@@ -168,7 +161,7 @@ kernel_cake_msa_icp_indexer_7bb0a4a2f772f7ac3c9b(float* __restrict__ scores, int
                 unsigned int ok_k_3 = ok_xb_3 ^ ((unsigned int)((int)ok_xb_3 >> 31) | 2147483648u);
                 unsigned int kf_4 = (((unsigned int)(ci_4 - lfb) >= (unsigned int)flen) ? 4286578688u : ok_k_3);
                 kb[4] = ((ci_4 < L) ? kf_4 : 0);
-                int ci_5 = c0 + lane_1 + 640;
+                int ci_5 = c0 + lane_1 + 160;
                 float xi_5 = row[((ci_5 < L) ? ci_5 : last)];
                 float ok_xc_4 = max_noftz(xi_5, -CUDART_INF_F) + 0.0f;
                 unsigned int ok_xb_4 = 0;
@@ -176,7 +169,7 @@ kernel_cake_msa_icp_indexer_7bb0a4a2f772f7ac3c9b(float* __restrict__ scores, int
                 unsigned int ok_k_4 = ok_xb_4 ^ ((unsigned int)((int)ok_xb_4 >> 31) | 2147483648u);
                 unsigned int kf_5 = (((unsigned int)(ci_5 - lfb) >= (unsigned int)flen) ? 4286578688u : ok_k_4);
                 kb[5] = ((ci_5 < L) ? kf_5 : 0);
-                int ci_6 = c0 + lane_1 + 768;
+                int ci_6 = c0 + lane_1 + 192;
                 float xi_6 = row[((ci_6 < L) ? ci_6 : last)];
                 float ok_xc_5 = max_noftz(xi_6, -CUDART_INF_F) + 0.0f;
                 unsigned int ok_xb_5 = 0;
@@ -184,7 +177,7 @@ kernel_cake_msa_icp_indexer_7bb0a4a2f772f7ac3c9b(float* __restrict__ scores, int
                 unsigned int ok_k_5 = ok_xb_5 ^ ((unsigned int)((int)ok_xb_5 >> 31) | 2147483648u);
                 unsigned int kf_6 = (((unsigned int)(ci_6 - lfb) >= (unsigned int)flen) ? 4286578688u : ok_k_5);
                 kb[6] = ((ci_6 < L) ? kf_6 : 0);
-                int ci_7 = c0 + lane_1 + 896;
+                int ci_7 = c0 + lane_1 + 224;
                 float xi_7 = row[((ci_7 < L) ? ci_7 : last)];
                 float ok_xc_6 = max_noftz(xi_7, -CUDART_INF_F) + 0.0f;
                 unsigned int ok_xb_6 = 0;
@@ -192,7 +185,7 @@ kernel_cake_msa_icp_indexer_7bb0a4a2f772f7ac3c9b(float* __restrict__ scores, int
                 unsigned int ok_k_6 = ok_xb_6 ^ ((unsigned int)((int)ok_xb_6 >> 31) | 2147483648u);
                 unsigned int kf_7 = (((unsigned int)(ci_7 - lfb) >= (unsigned int)flen) ? 4286578688u : ok_k_6);
                 kb[7] = ((ci_7 < L) ? kf_7 : 0);
-                int ci_8 = c0 + lane_1 + 1024;
+                int ci_8 = c0 + lane_1 + 256;
                 float xi_8 = row[((ci_8 < L) ? ci_8 : last)];
                 float ok_xc_7 = max_noftz(xi_8, -CUDART_INF_F) + 0.0f;
                 unsigned int ok_xb_7 = 0;
@@ -200,7 +193,7 @@ kernel_cake_msa_icp_indexer_7bb0a4a2f772f7ac3c9b(float* __restrict__ scores, int
                 unsigned int ok_k_7 = ok_xb_7 ^ ((unsigned int)((int)ok_xb_7 >> 31) | 2147483648u);
                 unsigned int kf_8 = (((unsigned int)(ci_8 - lfb) >= (unsigned int)flen) ? 4286578688u : ok_k_7);
                 kb[8] = ((ci_8 < L) ? kf_8 : 0);
-                int ci_9 = c0 + lane_1 + 1152;
+                int ci_9 = c0 + lane_1 + 288;
                 float xi_9 = row[((ci_9 < L) ? ci_9 : last)];
                 float ok_xc_8 = max_noftz(xi_9, -CUDART_INF_F) + 0.0f;
                 unsigned int ok_xb_8 = 0;
@@ -208,6 +201,86 @@ kernel_cake_msa_icp_indexer_7bb0a4a2f772f7ac3c9b(float* __restrict__ scores, int
                 unsigned int ok_k_8 = ok_xb_8 ^ ((unsigned int)((int)ok_xb_8 >> 31) | 2147483648u);
                 unsigned int kf_9 = (((unsigned int)(ci_9 - lfb) >= (unsigned int)flen) ? 4286578688u : ok_k_8);
                 kb[9] = ((ci_9 < L) ? kf_9 : 0);
+                int ci_10 = c0 + lane_1 + 320;
+                float xi_10 = row[((ci_10 < L) ? ci_10 : last)];
+                float ok_xc_9 = max_noftz(xi_10, -CUDART_INF_F) + 0.0f;
+                unsigned int ok_xb_9 = 0;
+                ok_xb_9 = reinterpret_cast<unsigned int*>(&ok_xc_9)[0];
+                unsigned int ok_k_9 = ok_xb_9 ^ ((unsigned int)((int)ok_xb_9 >> 31) | 2147483648u);
+                unsigned int kf_10 = (((unsigned int)(ci_10 - lfb) >= (unsigned int)flen) ? 4286578688u : ok_k_9);
+                kb[10] = ((ci_10 < L) ? kf_10 : 0);
+                int ci_11 = c0 + lane_1 + 352;
+                float xi_11 = row[((ci_11 < L) ? ci_11 : last)];
+                float ok_xc_10 = max_noftz(xi_11, -CUDART_INF_F) + 0.0f;
+                unsigned int ok_xb_10 = 0;
+                ok_xb_10 = reinterpret_cast<unsigned int*>(&ok_xc_10)[0];
+                unsigned int ok_k_10 = ok_xb_10 ^ ((unsigned int)((int)ok_xb_10 >> 31) | 2147483648u);
+                unsigned int kf_11 = (((unsigned int)(ci_11 - lfb) >= (unsigned int)flen) ? 4286578688u : ok_k_10);
+                kb[11] = ((ci_11 < L) ? kf_11 : 0);
+                int ci_12 = c0 + lane_1 + 384;
+                float xi_12 = row[((ci_12 < L) ? ci_12 : last)];
+                float ok_xc_11 = max_noftz(xi_12, -CUDART_INF_F) + 0.0f;
+                unsigned int ok_xb_11 = 0;
+                ok_xb_11 = reinterpret_cast<unsigned int*>(&ok_xc_11)[0];
+                unsigned int ok_k_11 = ok_xb_11 ^ ((unsigned int)((int)ok_xb_11 >> 31) | 2147483648u);
+                unsigned int kf_12 = (((unsigned int)(ci_12 - lfb) >= (unsigned int)flen) ? 4286578688u : ok_k_11);
+                kb[12] = ((ci_12 < L) ? kf_12 : 0);
+                int ci_13 = c0 + lane_1 + 416;
+                float xi_13 = row[((ci_13 < L) ? ci_13 : last)];
+                float ok_xc_12 = max_noftz(xi_13, -CUDART_INF_F) + 0.0f;
+                unsigned int ok_xb_12 = 0;
+                ok_xb_12 = reinterpret_cast<unsigned int*>(&ok_xc_12)[0];
+                unsigned int ok_k_12 = ok_xb_12 ^ ((unsigned int)((int)ok_xb_12 >> 31) | 2147483648u);
+                unsigned int kf_13 = (((unsigned int)(ci_13 - lfb) >= (unsigned int)flen) ? 4286578688u : ok_k_12);
+                kb[13] = ((ci_13 < L) ? kf_13 : 0);
+                int ci_14 = c0 + lane_1 + 448;
+                float xi_14 = row[((ci_14 < L) ? ci_14 : last)];
+                float ok_xc_13 = max_noftz(xi_14, -CUDART_INF_F) + 0.0f;
+                unsigned int ok_xb_13 = 0;
+                ok_xb_13 = reinterpret_cast<unsigned int*>(&ok_xc_13)[0];
+                unsigned int ok_k_13 = ok_xb_13 ^ ((unsigned int)((int)ok_xb_13 >> 31) | 2147483648u);
+                unsigned int kf_14 = (((unsigned int)(ci_14 - lfb) >= (unsigned int)flen) ? 4286578688u : ok_k_13);
+                kb[14] = ((ci_14 < L) ? kf_14 : 0);
+                int ci_15 = c0 + lane_1 + 480;
+                float xi_15 = row[((ci_15 < L) ? ci_15 : last)];
+                float ok_xc_14 = max_noftz(xi_15, -CUDART_INF_F) + 0.0f;
+                unsigned int ok_xb_14 = 0;
+                ok_xb_14 = reinterpret_cast<unsigned int*>(&ok_xc_14)[0];
+                unsigned int ok_k_14 = ok_xb_14 ^ ((unsigned int)((int)ok_xb_14 >> 31) | 2147483648u);
+                unsigned int kf_15 = (((unsigned int)(ci_15 - lfb) >= (unsigned int)flen) ? 4286578688u : ok_k_14);
+                kb[15] = ((ci_15 < L) ? kf_15 : 0);
+                int ci_16 = c0 + lane_1 + 512;
+                float xi_16 = row[((ci_16 < L) ? ci_16 : last)];
+                float ok_xc_15 = max_noftz(xi_16, -CUDART_INF_F) + 0.0f;
+                unsigned int ok_xb_15 = 0;
+                ok_xb_15 = reinterpret_cast<unsigned int*>(&ok_xc_15)[0];
+                unsigned int ok_k_15 = ok_xb_15 ^ ((unsigned int)((int)ok_xb_15 >> 31) | 2147483648u);
+                unsigned int kf_16 = (((unsigned int)(ci_16 - lfb) >= (unsigned int)flen) ? 4286578688u : ok_k_15);
+                kb[16] = ((ci_16 < L) ? kf_16 : 0);
+                int ci_17 = c0 + lane_1 + 544;
+                float xi_17 = row[((ci_17 < L) ? ci_17 : last)];
+                float ok_xc_16 = max_noftz(xi_17, -CUDART_INF_F) + 0.0f;
+                unsigned int ok_xb_16 = 0;
+                ok_xb_16 = reinterpret_cast<unsigned int*>(&ok_xc_16)[0];
+                unsigned int ok_k_16 = ok_xb_16 ^ ((unsigned int)((int)ok_xb_16 >> 31) | 2147483648u);
+                unsigned int kf_17 = (((unsigned int)(ci_17 - lfb) >= (unsigned int)flen) ? 4286578688u : ok_k_16);
+                kb[17] = ((ci_17 < L) ? kf_17 : 0);
+                int ci_18 = c0 + lane_1 + 576;
+                float xi_18 = row[((ci_18 < L) ? ci_18 : last)];
+                float ok_xc_17 = max_noftz(xi_18, -CUDART_INF_F) + 0.0f;
+                unsigned int ok_xb_17 = 0;
+                ok_xb_17 = reinterpret_cast<unsigned int*>(&ok_xc_17)[0];
+                unsigned int ok_k_17 = ok_xb_17 ^ ((unsigned int)((int)ok_xb_17 >> 31) | 2147483648u);
+                unsigned int kf_18 = (((unsigned int)(ci_18 - lfb) >= (unsigned int)flen) ? 4286578688u : ok_k_17);
+                kb[18] = ((ci_18 < L) ? kf_18 : 0);
+                int ci_19 = c0 + lane_1 + 608;
+                float xi_19 = row[((ci_19 < L) ? ci_19 : last)];
+                float ok_xc_18 = max_noftz(xi_19, -CUDART_INF_F) + 0.0f;
+                unsigned int ok_xb_18 = 0;
+                ok_xb_18 = reinterpret_cast<unsigned int*>(&ok_xc_18)[0];
+                unsigned int ok_k_18 = ok_xb_18 ^ ((unsigned int)((int)ok_xb_18 >> 31) | 2147483648u);
+                unsigned int kf_19 = (((unsigned int)(ci_19 - lfb) >= (unsigned int)flen) ? 4286578688u : ok_k_18);
+                kb[19] = ((ci_19 < L) ? kf_19 : 0);
                 unsigned int bk = ck[0];
                 int bc = cc[0];
                 int bt_0 = (int)(kb[0] > bk);
@@ -215,31 +288,61 @@ kernel_cake_msa_icp_indexer_7bb0a4a2f772f7ac3c9b(float* __restrict__ scores, int
                 bc = ((bt_0 != 0) ? c0 + lane_1 : bc);
                 int bt_1 = (int)(kb[1] > bk);
                 bk = ((bt_1 != 0) ? kb[1] : bk);
-                bc = ((bt_1 != 0) ? c0 + lane_1 + 128 : bc);
+                bc = ((bt_1 != 0) ? c0 + lane_1 + 32 : bc);
                 int bt_2 = (int)(kb[2] > bk);
                 bk = ((bt_2 != 0) ? kb[2] : bk);
-                bc = ((bt_2 != 0) ? c0 + lane_1 + 256 : bc);
+                bc = ((bt_2 != 0) ? c0 + lane_1 + 64 : bc);
                 int bt_3 = (int)(kb[3] > bk);
                 bk = ((bt_3 != 0) ? kb[3] : bk);
-                bc = ((bt_3 != 0) ? c0 + lane_1 + 384 : bc);
+                bc = ((bt_3 != 0) ? c0 + lane_1 + 96 : bc);
                 int bt_4 = (int)(kb[4] > bk);
                 bk = ((bt_4 != 0) ? kb[4] : bk);
-                bc = ((bt_4 != 0) ? c0 + lane_1 + 512 : bc);
+                bc = ((bt_4 != 0) ? c0 + lane_1 + 128 : bc);
                 int bt_5 = (int)(kb[5] > bk);
                 bk = ((bt_5 != 0) ? kb[5] : bk);
-                bc = ((bt_5 != 0) ? c0 + lane_1 + 640 : bc);
+                bc = ((bt_5 != 0) ? c0 + lane_1 + 160 : bc);
                 int bt_6 = (int)(kb[6] > bk);
                 bk = ((bt_6 != 0) ? kb[6] : bk);
-                bc = ((bt_6 != 0) ? c0 + lane_1 + 768 : bc);
+                bc = ((bt_6 != 0) ? c0 + lane_1 + 192 : bc);
                 int bt_7 = (int)(kb[7] > bk);
                 bk = ((bt_7 != 0) ? kb[7] : bk);
-                bc = ((bt_7 != 0) ? c0 + lane_1 + 896 : bc);
+                bc = ((bt_7 != 0) ? c0 + lane_1 + 224 : bc);
                 int bt_8 = (int)(kb[8] > bk);
                 bk = ((bt_8 != 0) ? kb[8] : bk);
-                bc = ((bt_8 != 0) ? c0 + lane_1 + 1024 : bc);
+                bc = ((bt_8 != 0) ? c0 + lane_1 + 256 : bc);
                 int bt_9 = (int)(kb[9] > bk);
                 bk = ((bt_9 != 0) ? kb[9] : bk);
-                bc = ((bt_9 != 0) ? c0 + lane_1 + 1152 : bc);
+                bc = ((bt_9 != 0) ? c0 + lane_1 + 288 : bc);
+                int bt_10 = (int)(kb[10] > bk);
+                bk = ((bt_10 != 0) ? kb[10] : bk);
+                bc = ((bt_10 != 0) ? c0 + lane_1 + 320 : bc);
+                int bt_11 = (int)(kb[11] > bk);
+                bk = ((bt_11 != 0) ? kb[11] : bk);
+                bc = ((bt_11 != 0) ? c0 + lane_1 + 352 : bc);
+                int bt_12 = (int)(kb[12] > bk);
+                bk = ((bt_12 != 0) ? kb[12] : bk);
+                bc = ((bt_12 != 0) ? c0 + lane_1 + 384 : bc);
+                int bt_13 = (int)(kb[13] > bk);
+                bk = ((bt_13 != 0) ? kb[13] : bk);
+                bc = ((bt_13 != 0) ? c0 + lane_1 + 416 : bc);
+                int bt_14 = (int)(kb[14] > bk);
+                bk = ((bt_14 != 0) ? kb[14] : bk);
+                bc = ((bt_14 != 0) ? c0 + lane_1 + 448 : bc);
+                int bt_15 = (int)(kb[15] > bk);
+                bk = ((bt_15 != 0) ? kb[15] : bk);
+                bc = ((bt_15 != 0) ? c0 + lane_1 + 480 : bc);
+                int bt_16 = (int)(kb[16] > bk);
+                bk = ((bt_16 != 0) ? kb[16] : bk);
+                bc = ((bt_16 != 0) ? c0 + lane_1 + 512 : bc);
+                int bt_17 = (int)(kb[17] > bk);
+                bk = ((bt_17 != 0) ? kb[17] : bk);
+                bc = ((bt_17 != 0) ? c0 + lane_1 + 544 : bc);
+                int bt_18 = (int)(kb[18] > bk);
+                bk = ((bt_18 != 0) ? kb[18] : bk);
+                bc = ((bt_18 != 0) ? c0 + lane_1 + 576 : bc);
+                int bt_19 = (int)(kb[19] > bk);
+                bk = ((bt_19 != 0) ? kb[19] : bk);
+                bc = ((bt_19 != 0) ? c0 + lane_1 + 608 : bc);
                 hk[0] = bk;
                 hc[0] = bc;
                 unsigned int ws_pb_0 = __shfl_xor_sync(0xFFFFFFFF, hk[0], 1);
@@ -381,30 +484,50 @@ kernel_cake_msa_icp_indexer_7bb0a4a2f772f7ac3c9b(float* __restrict__ scores, int
                 int bnd_c = __shfl_sync(0xFFFFFFFF, hc[0], 15);
                 bnd_c = ((bnd_k != 0) ? bnd_c : -1);
                 bnd_k = ((bnd_k != 0) ? bnd_k : 1);
-                int fc_sv[11];
+                int fc_sv[21];
                 int fc_cnt = 0;
                 fc_sv[0] = (int)(kb[0] > bnd_k || kb[0] == bnd_k && c0 + lane_1 <= bnd_c);
                 fc_cnt = fc_cnt + fc_sv[0];
-                fc_sv[1] = (int)(kb[1] > bnd_k || kb[1] == bnd_k && c0 + lane_1 + 128 <= bnd_c);
+                fc_sv[1] = (int)(kb[1] > bnd_k || kb[1] == bnd_k && c0 + lane_1 + 32 <= bnd_c);
                 fc_cnt = fc_cnt + fc_sv[1];
-                fc_sv[2] = (int)(kb[2] > bnd_k || kb[2] == bnd_k && c0 + lane_1 + 256 <= bnd_c);
+                fc_sv[2] = (int)(kb[2] > bnd_k || kb[2] == bnd_k && c0 + lane_1 + 64 <= bnd_c);
                 fc_cnt = fc_cnt + fc_sv[2];
-                fc_sv[3] = (int)(kb[3] > bnd_k || kb[3] == bnd_k && c0 + lane_1 + 384 <= bnd_c);
+                fc_sv[3] = (int)(kb[3] > bnd_k || kb[3] == bnd_k && c0 + lane_1 + 96 <= bnd_c);
                 fc_cnt = fc_cnt + fc_sv[3];
-                fc_sv[4] = (int)(kb[4] > bnd_k || kb[4] == bnd_k && c0 + lane_1 + 512 <= bnd_c);
+                fc_sv[4] = (int)(kb[4] > bnd_k || kb[4] == bnd_k && c0 + lane_1 + 128 <= bnd_c);
                 fc_cnt = fc_cnt + fc_sv[4];
-                fc_sv[5] = (int)(kb[5] > bnd_k || kb[5] == bnd_k && c0 + lane_1 + 640 <= bnd_c);
+                fc_sv[5] = (int)(kb[5] > bnd_k || kb[5] == bnd_k && c0 + lane_1 + 160 <= bnd_c);
                 fc_cnt = fc_cnt + fc_sv[5];
-                fc_sv[6] = (int)(kb[6] > bnd_k || kb[6] == bnd_k && c0 + lane_1 + 768 <= bnd_c);
+                fc_sv[6] = (int)(kb[6] > bnd_k || kb[6] == bnd_k && c0 + lane_1 + 192 <= bnd_c);
                 fc_cnt = fc_cnt + fc_sv[6];
-                fc_sv[7] = (int)(kb[7] > bnd_k || kb[7] == bnd_k && c0 + lane_1 + 896 <= bnd_c);
+                fc_sv[7] = (int)(kb[7] > bnd_k || kb[7] == bnd_k && c0 + lane_1 + 224 <= bnd_c);
                 fc_cnt = fc_cnt + fc_sv[7];
-                fc_sv[8] = (int)(kb[8] > bnd_k || kb[8] == bnd_k && c0 + lane_1 + 1024 <= bnd_c);
+                fc_sv[8] = (int)(kb[8] > bnd_k || kb[8] == bnd_k && c0 + lane_1 + 256 <= bnd_c);
                 fc_cnt = fc_cnt + fc_sv[8];
-                fc_sv[9] = (int)(kb[9] > bnd_k || kb[9] == bnd_k && c0 + lane_1 + 1152 <= bnd_c);
+                fc_sv[9] = (int)(kb[9] > bnd_k || kb[9] == bnd_k && c0 + lane_1 + 288 <= bnd_c);
                 fc_cnt = fc_cnt + fc_sv[9];
-                fc_sv[10] = (int)(ck[0] > bnd_k || ck[0] == bnd_k && cc[0] <= bnd_c);
+                fc_sv[10] = (int)(kb[10] > bnd_k || kb[10] == bnd_k && c0 + lane_1 + 320 <= bnd_c);
                 fc_cnt = fc_cnt + fc_sv[10];
+                fc_sv[11] = (int)(kb[11] > bnd_k || kb[11] == bnd_k && c0 + lane_1 + 352 <= bnd_c);
+                fc_cnt = fc_cnt + fc_sv[11];
+                fc_sv[12] = (int)(kb[12] > bnd_k || kb[12] == bnd_k && c0 + lane_1 + 384 <= bnd_c);
+                fc_cnt = fc_cnt + fc_sv[12];
+                fc_sv[13] = (int)(kb[13] > bnd_k || kb[13] == bnd_k && c0 + lane_1 + 416 <= bnd_c);
+                fc_cnt = fc_cnt + fc_sv[13];
+                fc_sv[14] = (int)(kb[14] > bnd_k || kb[14] == bnd_k && c0 + lane_1 + 448 <= bnd_c);
+                fc_cnt = fc_cnt + fc_sv[14];
+                fc_sv[15] = (int)(kb[15] > bnd_k || kb[15] == bnd_k && c0 + lane_1 + 480 <= bnd_c);
+                fc_cnt = fc_cnt + fc_sv[15];
+                fc_sv[16] = (int)(kb[16] > bnd_k || kb[16] == bnd_k && c0 + lane_1 + 512 <= bnd_c);
+                fc_cnt = fc_cnt + fc_sv[16];
+                fc_sv[17] = (int)(kb[17] > bnd_k || kb[17] == bnd_k && c0 + lane_1 + 544 <= bnd_c);
+                fc_cnt = fc_cnt + fc_sv[17];
+                fc_sv[18] = (int)(kb[18] > bnd_k || kb[18] == bnd_k && c0 + lane_1 + 576 <= bnd_c);
+                fc_cnt = fc_cnt + fc_sv[18];
+                fc_sv[19] = (int)(kb[19] > bnd_k || kb[19] == bnd_k && c0 + lane_1 + 608 <= bnd_c);
+                fc_cnt = fc_cnt + fc_sv[19];
+                fc_sv[20] = (int)(ck[0] > bnd_k || ck[0] == bnd_k && cc[0] <= bnd_c);
+                fc_cnt = fc_cnt + fc_sv[20];
                 int fc_inc = fc_cnt;
                 {
                     uint32_t fc_inc_scan = (uint32_t)fc_inc;
@@ -424,50 +547,100 @@ kernel_cake_msa_icp_indexer_7bb0a4a2f772f7ac3c9b(float* __restrict__ scores, int
                 fc_pos = fc_pos + fc_sv[0];
                 if (fc_sv[1] != 0 && fc_pos < 64) {
                     slab_k[wbase + fc_pos] = kb[1];
-                    slab_c[wbase + fc_pos] = c0 + lane_1 + 128;
+                    slab_c[wbase + fc_pos] = c0 + lane_1 + 32;
                 }
                 fc_pos = fc_pos + fc_sv[1];
                 if (fc_sv[2] != 0 && fc_pos < 64) {
                     slab_k[wbase + fc_pos] = kb[2];
-                    slab_c[wbase + fc_pos] = c0 + lane_1 + 256;
+                    slab_c[wbase + fc_pos] = c0 + lane_1 + 64;
                 }
                 fc_pos = fc_pos + fc_sv[2];
                 if (fc_sv[3] != 0 && fc_pos < 64) {
                     slab_k[wbase + fc_pos] = kb[3];
-                    slab_c[wbase + fc_pos] = c0 + lane_1 + 384;
+                    slab_c[wbase + fc_pos] = c0 + lane_1 + 96;
                 }
                 fc_pos = fc_pos + fc_sv[3];
                 if (fc_sv[4] != 0 && fc_pos < 64) {
                     slab_k[wbase + fc_pos] = kb[4];
-                    slab_c[wbase + fc_pos] = c0 + lane_1 + 512;
+                    slab_c[wbase + fc_pos] = c0 + lane_1 + 128;
                 }
                 fc_pos = fc_pos + fc_sv[4];
                 if (fc_sv[5] != 0 && fc_pos < 64) {
                     slab_k[wbase + fc_pos] = kb[5];
-                    slab_c[wbase + fc_pos] = c0 + lane_1 + 640;
+                    slab_c[wbase + fc_pos] = c0 + lane_1 + 160;
                 }
                 fc_pos = fc_pos + fc_sv[5];
                 if (fc_sv[6] != 0 && fc_pos < 64) {
                     slab_k[wbase + fc_pos] = kb[6];
-                    slab_c[wbase + fc_pos] = c0 + lane_1 + 768;
+                    slab_c[wbase + fc_pos] = c0 + lane_1 + 192;
                 }
                 fc_pos = fc_pos + fc_sv[6];
                 if (fc_sv[7] != 0 && fc_pos < 64) {
                     slab_k[wbase + fc_pos] = kb[7];
-                    slab_c[wbase + fc_pos] = c0 + lane_1 + 896;
+                    slab_c[wbase + fc_pos] = c0 + lane_1 + 224;
                 }
                 fc_pos = fc_pos + fc_sv[7];
                 if (fc_sv[8] != 0 && fc_pos < 64) {
                     slab_k[wbase + fc_pos] = kb[8];
-                    slab_c[wbase + fc_pos] = c0 + lane_1 + 1024;
+                    slab_c[wbase + fc_pos] = c0 + lane_1 + 256;
                 }
                 fc_pos = fc_pos + fc_sv[8];
                 if (fc_sv[9] != 0 && fc_pos < 64) {
                     slab_k[wbase + fc_pos] = kb[9];
-                    slab_c[wbase + fc_pos] = c0 + lane_1 + 1152;
+                    slab_c[wbase + fc_pos] = c0 + lane_1 + 288;
                 }
                 fc_pos = fc_pos + fc_sv[9];
                 if (fc_sv[10] != 0 && fc_pos < 64) {
+                    slab_k[wbase + fc_pos] = kb[10];
+                    slab_c[wbase + fc_pos] = c0 + lane_1 + 320;
+                }
+                fc_pos = fc_pos + fc_sv[10];
+                if (fc_sv[11] != 0 && fc_pos < 64) {
+                    slab_k[wbase + fc_pos] = kb[11];
+                    slab_c[wbase + fc_pos] = c0 + lane_1 + 352;
+                }
+                fc_pos = fc_pos + fc_sv[11];
+                if (fc_sv[12] != 0 && fc_pos < 64) {
+                    slab_k[wbase + fc_pos] = kb[12];
+                    slab_c[wbase + fc_pos] = c0 + lane_1 + 384;
+                }
+                fc_pos = fc_pos + fc_sv[12];
+                if (fc_sv[13] != 0 && fc_pos < 64) {
+                    slab_k[wbase + fc_pos] = kb[13];
+                    slab_c[wbase + fc_pos] = c0 + lane_1 + 416;
+                }
+                fc_pos = fc_pos + fc_sv[13];
+                if (fc_sv[14] != 0 && fc_pos < 64) {
+                    slab_k[wbase + fc_pos] = kb[14];
+                    slab_c[wbase + fc_pos] = c0 + lane_1 + 448;
+                }
+                fc_pos = fc_pos + fc_sv[14];
+                if (fc_sv[15] != 0 && fc_pos < 64) {
+                    slab_k[wbase + fc_pos] = kb[15];
+                    slab_c[wbase + fc_pos] = c0 + lane_1 + 480;
+                }
+                fc_pos = fc_pos + fc_sv[15];
+                if (fc_sv[16] != 0 && fc_pos < 64) {
+                    slab_k[wbase + fc_pos] = kb[16];
+                    slab_c[wbase + fc_pos] = c0 + lane_1 + 512;
+                }
+                fc_pos = fc_pos + fc_sv[16];
+                if (fc_sv[17] != 0 && fc_pos < 64) {
+                    slab_k[wbase + fc_pos] = kb[17];
+                    slab_c[wbase + fc_pos] = c0 + lane_1 + 544;
+                }
+                fc_pos = fc_pos + fc_sv[17];
+                if (fc_sv[18] != 0 && fc_pos < 64) {
+                    slab_k[wbase + fc_pos] = kb[18];
+                    slab_c[wbase + fc_pos] = c0 + lane_1 + 576;
+                }
+                fc_pos = fc_pos + fc_sv[18];
+                if (fc_sv[19] != 0 && fc_pos < 64) {
+                    slab_k[wbase + fc_pos] = kb[19];
+                    slab_c[wbase + fc_pos] = c0 + lane_1 + 608;
+                }
+                fc_pos = fc_pos + fc_sv[19];
+                if (fc_sv[20] != 0 && fc_pos < 64) {
                     slab_k[wbase + fc_pos] = ck[0];
                     slab_c[wbase + fc_pos] = cc[0];
                 }
@@ -852,30 +1025,50 @@ kernel_cake_msa_icp_indexer_7bb0a4a2f772f7ac3c9b(float* __restrict__ scores, int
                     bnd_k = _shfl_sync_0;
                     int _shfl_sync_1 = __shfl_sync(0xFFFFFFFF, hc[0], 15);
                     bnd_c = _shfl_sync_1;
-                    int fc_sv_0[11];
+                    int fc_sv_0[21];
                     int fc_cnt_0 = 0;
                     fc_sv_0[0] = (int)(kb[0] > bnd_k || kb[0] == bnd_k && c0 + lane_1 <= bnd_c);
                     fc_cnt_0 = fc_cnt_0 + fc_sv_0[0];
-                    fc_sv_0[1] = (int)(kb[1] > bnd_k || kb[1] == bnd_k && c0 + lane_1 + 128 <= bnd_c);
+                    fc_sv_0[1] = (int)(kb[1] > bnd_k || kb[1] == bnd_k && c0 + lane_1 + 32 <= bnd_c);
                     fc_cnt_0 = fc_cnt_0 + fc_sv_0[1];
-                    fc_sv_0[2] = (int)(kb[2] > bnd_k || kb[2] == bnd_k && c0 + lane_1 + 256 <= bnd_c);
+                    fc_sv_0[2] = (int)(kb[2] > bnd_k || kb[2] == bnd_k && c0 + lane_1 + 64 <= bnd_c);
                     fc_cnt_0 = fc_cnt_0 + fc_sv_0[2];
-                    fc_sv_0[3] = (int)(kb[3] > bnd_k || kb[3] == bnd_k && c0 + lane_1 + 384 <= bnd_c);
+                    fc_sv_0[3] = (int)(kb[3] > bnd_k || kb[3] == bnd_k && c0 + lane_1 + 96 <= bnd_c);
                     fc_cnt_0 = fc_cnt_0 + fc_sv_0[3];
-                    fc_sv_0[4] = (int)(kb[4] > bnd_k || kb[4] == bnd_k && c0 + lane_1 + 512 <= bnd_c);
+                    fc_sv_0[4] = (int)(kb[4] > bnd_k || kb[4] == bnd_k && c0 + lane_1 + 128 <= bnd_c);
                     fc_cnt_0 = fc_cnt_0 + fc_sv_0[4];
-                    fc_sv_0[5] = (int)(kb[5] > bnd_k || kb[5] == bnd_k && c0 + lane_1 + 640 <= bnd_c);
+                    fc_sv_0[5] = (int)(kb[5] > bnd_k || kb[5] == bnd_k && c0 + lane_1 + 160 <= bnd_c);
                     fc_cnt_0 = fc_cnt_0 + fc_sv_0[5];
-                    fc_sv_0[6] = (int)(kb[6] > bnd_k || kb[6] == bnd_k && c0 + lane_1 + 768 <= bnd_c);
+                    fc_sv_0[6] = (int)(kb[6] > bnd_k || kb[6] == bnd_k && c0 + lane_1 + 192 <= bnd_c);
                     fc_cnt_0 = fc_cnt_0 + fc_sv_0[6];
-                    fc_sv_0[7] = (int)(kb[7] > bnd_k || kb[7] == bnd_k && c0 + lane_1 + 896 <= bnd_c);
+                    fc_sv_0[7] = (int)(kb[7] > bnd_k || kb[7] == bnd_k && c0 + lane_1 + 224 <= bnd_c);
                     fc_cnt_0 = fc_cnt_0 + fc_sv_0[7];
-                    fc_sv_0[8] = (int)(kb[8] > bnd_k || kb[8] == bnd_k && c0 + lane_1 + 1024 <= bnd_c);
+                    fc_sv_0[8] = (int)(kb[8] > bnd_k || kb[8] == bnd_k && c0 + lane_1 + 256 <= bnd_c);
                     fc_cnt_0 = fc_cnt_0 + fc_sv_0[8];
-                    fc_sv_0[9] = (int)(kb[9] > bnd_k || kb[9] == bnd_k && c0 + lane_1 + 1152 <= bnd_c);
+                    fc_sv_0[9] = (int)(kb[9] > bnd_k || kb[9] == bnd_k && c0 + lane_1 + 288 <= bnd_c);
                     fc_cnt_0 = fc_cnt_0 + fc_sv_0[9];
-                    fc_sv_0[10] = (int)(ck[0] > bnd_k || ck[0] == bnd_k && cc[0] <= bnd_c);
+                    fc_sv_0[10] = (int)(kb[10] > bnd_k || kb[10] == bnd_k && c0 + lane_1 + 320 <= bnd_c);
                     fc_cnt_0 = fc_cnt_0 + fc_sv_0[10];
+                    fc_sv_0[11] = (int)(kb[11] > bnd_k || kb[11] == bnd_k && c0 + lane_1 + 352 <= bnd_c);
+                    fc_cnt_0 = fc_cnt_0 + fc_sv_0[11];
+                    fc_sv_0[12] = (int)(kb[12] > bnd_k || kb[12] == bnd_k && c0 + lane_1 + 384 <= bnd_c);
+                    fc_cnt_0 = fc_cnt_0 + fc_sv_0[12];
+                    fc_sv_0[13] = (int)(kb[13] > bnd_k || kb[13] == bnd_k && c0 + lane_1 + 416 <= bnd_c);
+                    fc_cnt_0 = fc_cnt_0 + fc_sv_0[13];
+                    fc_sv_0[14] = (int)(kb[14] > bnd_k || kb[14] == bnd_k && c0 + lane_1 + 448 <= bnd_c);
+                    fc_cnt_0 = fc_cnt_0 + fc_sv_0[14];
+                    fc_sv_0[15] = (int)(kb[15] > bnd_k || kb[15] == bnd_k && c0 + lane_1 + 480 <= bnd_c);
+                    fc_cnt_0 = fc_cnt_0 + fc_sv_0[15];
+                    fc_sv_0[16] = (int)(kb[16] > bnd_k || kb[16] == bnd_k && c0 + lane_1 + 512 <= bnd_c);
+                    fc_cnt_0 = fc_cnt_0 + fc_sv_0[16];
+                    fc_sv_0[17] = (int)(kb[17] > bnd_k || kb[17] == bnd_k && c0 + lane_1 + 544 <= bnd_c);
+                    fc_cnt_0 = fc_cnt_0 + fc_sv_0[17];
+                    fc_sv_0[18] = (int)(kb[18] > bnd_k || kb[18] == bnd_k && c0 + lane_1 + 576 <= bnd_c);
+                    fc_cnt_0 = fc_cnt_0 + fc_sv_0[18];
+                    fc_sv_0[19] = (int)(kb[19] > bnd_k || kb[19] == bnd_k && c0 + lane_1 + 608 <= bnd_c);
+                    fc_cnt_0 = fc_cnt_0 + fc_sv_0[19];
+                    fc_sv_0[20] = (int)(ck[0] > bnd_k || ck[0] == bnd_k && cc[0] <= bnd_c);
+                    fc_cnt_0 = fc_cnt_0 + fc_sv_0[20];
                     int fc_inc_0 = fc_cnt_0;
                     {
                         uint32_t fc_inc_0_scan = (uint32_t)fc_inc_0;
@@ -895,50 +1088,100 @@ kernel_cake_msa_icp_indexer_7bb0a4a2f772f7ac3c9b(float* __restrict__ scores, int
                     fc_pos_0 = fc_pos_0 + fc_sv_0[0];
                     if (fc_sv_0[1] != 0 && fc_pos_0 < 64) {
                         slab_k[wbase + fc_pos_0] = kb[1];
-                        slab_c[wbase + fc_pos_0] = c0 + lane_1 + 128;
+                        slab_c[wbase + fc_pos_0] = c0 + lane_1 + 32;
                     }
                     fc_pos_0 = fc_pos_0 + fc_sv_0[1];
                     if (fc_sv_0[2] != 0 && fc_pos_0 < 64) {
                         slab_k[wbase + fc_pos_0] = kb[2];
-                        slab_c[wbase + fc_pos_0] = c0 + lane_1 + 256;
+                        slab_c[wbase + fc_pos_0] = c0 + lane_1 + 64;
                     }
                     fc_pos_0 = fc_pos_0 + fc_sv_0[2];
                     if (fc_sv_0[3] != 0 && fc_pos_0 < 64) {
                         slab_k[wbase + fc_pos_0] = kb[3];
-                        slab_c[wbase + fc_pos_0] = c0 + lane_1 + 384;
+                        slab_c[wbase + fc_pos_0] = c0 + lane_1 + 96;
                     }
                     fc_pos_0 = fc_pos_0 + fc_sv_0[3];
                     if (fc_sv_0[4] != 0 && fc_pos_0 < 64) {
                         slab_k[wbase + fc_pos_0] = kb[4];
-                        slab_c[wbase + fc_pos_0] = c0 + lane_1 + 512;
+                        slab_c[wbase + fc_pos_0] = c0 + lane_1 + 128;
                     }
                     fc_pos_0 = fc_pos_0 + fc_sv_0[4];
                     if (fc_sv_0[5] != 0 && fc_pos_0 < 64) {
                         slab_k[wbase + fc_pos_0] = kb[5];
-                        slab_c[wbase + fc_pos_0] = c0 + lane_1 + 640;
+                        slab_c[wbase + fc_pos_0] = c0 + lane_1 + 160;
                     }
                     fc_pos_0 = fc_pos_0 + fc_sv_0[5];
                     if (fc_sv_0[6] != 0 && fc_pos_0 < 64) {
                         slab_k[wbase + fc_pos_0] = kb[6];
-                        slab_c[wbase + fc_pos_0] = c0 + lane_1 + 768;
+                        slab_c[wbase + fc_pos_0] = c0 + lane_1 + 192;
                     }
                     fc_pos_0 = fc_pos_0 + fc_sv_0[6];
                     if (fc_sv_0[7] != 0 && fc_pos_0 < 64) {
                         slab_k[wbase + fc_pos_0] = kb[7];
-                        slab_c[wbase + fc_pos_0] = c0 + lane_1 + 896;
+                        slab_c[wbase + fc_pos_0] = c0 + lane_1 + 224;
                     }
                     fc_pos_0 = fc_pos_0 + fc_sv_0[7];
                     if (fc_sv_0[8] != 0 && fc_pos_0 < 64) {
                         slab_k[wbase + fc_pos_0] = kb[8];
-                        slab_c[wbase + fc_pos_0] = c0 + lane_1 + 1024;
+                        slab_c[wbase + fc_pos_0] = c0 + lane_1 + 256;
                     }
                     fc_pos_0 = fc_pos_0 + fc_sv_0[8];
                     if (fc_sv_0[9] != 0 && fc_pos_0 < 64) {
                         slab_k[wbase + fc_pos_0] = kb[9];
-                        slab_c[wbase + fc_pos_0] = c0 + lane_1 + 1152;
+                        slab_c[wbase + fc_pos_0] = c0 + lane_1 + 288;
                     }
                     fc_pos_0 = fc_pos_0 + fc_sv_0[9];
                     if (fc_sv_0[10] != 0 && fc_pos_0 < 64) {
+                        slab_k[wbase + fc_pos_0] = kb[10];
+                        slab_c[wbase + fc_pos_0] = c0 + lane_1 + 320;
+                    }
+                    fc_pos_0 = fc_pos_0 + fc_sv_0[10];
+                    if (fc_sv_0[11] != 0 && fc_pos_0 < 64) {
+                        slab_k[wbase + fc_pos_0] = kb[11];
+                        slab_c[wbase + fc_pos_0] = c0 + lane_1 + 352;
+                    }
+                    fc_pos_0 = fc_pos_0 + fc_sv_0[11];
+                    if (fc_sv_0[12] != 0 && fc_pos_0 < 64) {
+                        slab_k[wbase + fc_pos_0] = kb[12];
+                        slab_c[wbase + fc_pos_0] = c0 + lane_1 + 384;
+                    }
+                    fc_pos_0 = fc_pos_0 + fc_sv_0[12];
+                    if (fc_sv_0[13] != 0 && fc_pos_0 < 64) {
+                        slab_k[wbase + fc_pos_0] = kb[13];
+                        slab_c[wbase + fc_pos_0] = c0 + lane_1 + 416;
+                    }
+                    fc_pos_0 = fc_pos_0 + fc_sv_0[13];
+                    if (fc_sv_0[14] != 0 && fc_pos_0 < 64) {
+                        slab_k[wbase + fc_pos_0] = kb[14];
+                        slab_c[wbase + fc_pos_0] = c0 + lane_1 + 448;
+                    }
+                    fc_pos_0 = fc_pos_0 + fc_sv_0[14];
+                    if (fc_sv_0[15] != 0 && fc_pos_0 < 64) {
+                        slab_k[wbase + fc_pos_0] = kb[15];
+                        slab_c[wbase + fc_pos_0] = c0 + lane_1 + 480;
+                    }
+                    fc_pos_0 = fc_pos_0 + fc_sv_0[15];
+                    if (fc_sv_0[16] != 0 && fc_pos_0 < 64) {
+                        slab_k[wbase + fc_pos_0] = kb[16];
+                        slab_c[wbase + fc_pos_0] = c0 + lane_1 + 512;
+                    }
+                    fc_pos_0 = fc_pos_0 + fc_sv_0[16];
+                    if (fc_sv_0[17] != 0 && fc_pos_0 < 64) {
+                        slab_k[wbase + fc_pos_0] = kb[17];
+                        slab_c[wbase + fc_pos_0] = c0 + lane_1 + 544;
+                    }
+                    fc_pos_0 = fc_pos_0 + fc_sv_0[17];
+                    if (fc_sv_0[18] != 0 && fc_pos_0 < 64) {
+                        slab_k[wbase + fc_pos_0] = kb[18];
+                        slab_c[wbase + fc_pos_0] = c0 + lane_1 + 576;
+                    }
+                    fc_pos_0 = fc_pos_0 + fc_sv_0[18];
+                    if (fc_sv_0[19] != 0 && fc_pos_0 < 64) {
+                        slab_k[wbase + fc_pos_0] = kb[19];
+                        slab_c[wbase + fc_pos_0] = c0 + lane_1 + 608;
+                    }
+                    fc_pos_0 = fc_pos_0 + fc_sv_0[19];
+                    if (fc_sv_0[20] != 0 && fc_pos_0 < 64) {
                         slab_k[wbase + fc_pos_0] = ck[0];
                         slab_c[wbase + fc_pos_0] = cc[0];
                     }
@@ -1321,392 +1564,10 @@ kernel_cake_msa_icp_indexer_7bb0a4a2f772f7ac3c9b(float* __restrict__ scores, int
                 hc[1] = ((ws_tk_94 != 0) ? ws_pc_94 : hc[1]);
                 ck[0] = ((lane_1 < 16) ? hk[0] : 0);
                 cc[0] = ((lane_1 < 16) ? hc[0] : 2147483647);
+                c0 = c0 + 640;
             }
-            c0 = c0 + 1280;
+            sel[0] = cc[0];
         }
-        if (lane_1 < 16) {
-            list_k[sub * 16 + lane_1] = ck[0];
-            list_c[sub * 16 + lane_1] = cc[0];
-        }
-        asm volatile("barrier.sync 1, 128;" ::: "memory");
-        if (sub == 0) {
-            hk[0] = list_k[lane_1];
-            hc[0] = list_c[lane_1];
-            hk[1] = list_k[32 + lane_1];
-            hc[1] = list_c[32 + lane_1];
-            unsigned int ws_pb_95 = __shfl_xor_sync(0xFFFFFFFF, hk[0], 1);
-            int ws_pc_95 = __shfl_xor_sync(0xFFFFFFFF, hc[0], 1);
-            int or_r_94 = (int)(ws_pb_95 > hk[0] || ws_pb_95 == hk[0] && ws_pc_95 < hc[0]);
-            int ws_lower_95 = (int)((lane_1 & 1) == 0);
-            int ws_desc_95 = (int)((lane_1 & 2) == 0);
-            int ws_wmax_95 = ws_desc_95 * ws_lower_95 + (1 - ws_desc_95) * (1 - ws_lower_95);
-            int ws_tk_95 = ((ws_wmax_95 != 0) ? or_r_94 : 1 - or_r_94);
-            hk[0] = ((ws_tk_95 != 0) ? ws_pb_95 : hk[0]);
-            hc[0] = ((ws_tk_95 != 0) ? ws_pc_95 : hc[0]);
-            unsigned int ws_pb_96 = __shfl_xor_sync(0xFFFFFFFF, hk[1], 1);
-            int ws_pc_96 = __shfl_xor_sync(0xFFFFFFFF, hc[1], 1);
-            int or_r_94_1 = (int)(ws_pb_96 > hk[1] || ws_pb_96 == hk[1] && ws_pc_96 < hc[1]);
-            int ws_lower_96 = (int)((lane_1 & 1) == 0);
-            int ws_desc_96 = (int)((lane_1 & 2) == 0);
-            int ws_wmax_96 = ws_desc_96 * ws_lower_96 + (1 - ws_desc_96) * (1 - ws_lower_96);
-            int ws_tk_96 = ((ws_wmax_96 != 0) ? or_r_94_1 : 1 - or_r_94_1);
-            hk[1] = ((ws_tk_96 != 0) ? ws_pb_96 : hk[1]);
-            hc[1] = ((ws_tk_96 != 0) ? ws_pc_96 : hc[1]);
-            unsigned int ws_pb_97 = __shfl_xor_sync(0xFFFFFFFF, hk[0], 2);
-            int ws_pc_97 = __shfl_xor_sync(0xFFFFFFFF, hc[0], 2);
-            int or_r_95 = (int)(ws_pb_97 > hk[0] || ws_pb_97 == hk[0] && ws_pc_97 < hc[0]);
-            int ws_lower_97 = (int)((lane_1 & 2) == 0);
-            int ws_desc_97 = (int)((lane_1 & 4) == 0);
-            int ws_wmax_97 = ws_desc_97 * ws_lower_97 + (1 - ws_desc_97) * (1 - ws_lower_97);
-            int ws_tk_97 = ((ws_wmax_97 != 0) ? or_r_95 : 1 - or_r_95);
-            hk[0] = ((ws_tk_97 != 0) ? ws_pb_97 : hk[0]);
-            hc[0] = ((ws_tk_97 != 0) ? ws_pc_97 : hc[0]);
-            unsigned int ws_pb_98 = __shfl_xor_sync(0xFFFFFFFF, hk[1], 2);
-            int ws_pc_98 = __shfl_xor_sync(0xFFFFFFFF, hc[1], 2);
-            int or_r_96 = (int)(ws_pb_98 > hk[1] || ws_pb_98 == hk[1] && ws_pc_98 < hc[1]);
-            int ws_lower_98 = (int)((lane_1 & 2) == 0);
-            int ws_desc_98 = (int)((lane_1 & 4) == 0);
-            int ws_wmax_98 = ws_desc_98 * ws_lower_98 + (1 - ws_desc_98) * (1 - ws_lower_98);
-            int ws_tk_98 = ((ws_wmax_98 != 0) ? or_r_96 : 1 - or_r_96);
-            hk[1] = ((ws_tk_98 != 0) ? ws_pb_98 : hk[1]);
-            hc[1] = ((ws_tk_98 != 0) ? ws_pc_98 : hc[1]);
-            unsigned int ws_pb_99 = __shfl_xor_sync(0xFFFFFFFF, hk[0], 1);
-            int ws_pc_99 = __shfl_xor_sync(0xFFFFFFFF, hc[0], 1);
-            int or_r_97 = (int)(ws_pb_99 > hk[0] || ws_pb_99 == hk[0] && ws_pc_99 < hc[0]);
-            int ws_lower_99 = (int)((lane_1 & 1) == 0);
-            int ws_desc_99 = (int)((lane_1 & 4) == 0);
-            int ws_wmax_99 = ws_desc_99 * ws_lower_99 + (1 - ws_desc_99) * (1 - ws_lower_99);
-            int ws_tk_99 = ((ws_wmax_99 != 0) ? or_r_97 : 1 - or_r_97);
-            hk[0] = ((ws_tk_99 != 0) ? ws_pb_99 : hk[0]);
-            hc[0] = ((ws_tk_99 != 0) ? ws_pc_99 : hc[0]);
-            unsigned int ws_pb_100 = __shfl_xor_sync(0xFFFFFFFF, hk[1], 1);
-            int ws_pc_100 = __shfl_xor_sync(0xFFFFFFFF, hc[1], 1);
-            int or_r_98 = (int)(ws_pb_100 > hk[1] || ws_pb_100 == hk[1] && ws_pc_100 < hc[1]);
-            int ws_lower_100 = (int)((lane_1 & 1) == 0);
-            int ws_desc_100 = (int)((lane_1 & 4) == 0);
-            int ws_wmax_100 = ws_desc_100 * ws_lower_100 + (1 - ws_desc_100) * (1 - ws_lower_100);
-            int ws_tk_100 = ((ws_wmax_100 != 0) ? or_r_98 : 1 - or_r_98);
-            hk[1] = ((ws_tk_100 != 0) ? ws_pb_100 : hk[1]);
-            hc[1] = ((ws_tk_100 != 0) ? ws_pc_100 : hc[1]);
-            unsigned int ws_pb_101 = __shfl_xor_sync(0xFFFFFFFF, hk[0], 4);
-            int ws_pc_101 = __shfl_xor_sync(0xFFFFFFFF, hc[0], 4);
-            int or_r_99 = (int)(ws_pb_101 > hk[0] || ws_pb_101 == hk[0] && ws_pc_101 < hc[0]);
-            int ws_lower_101 = (int)((lane_1 & 4) == 0);
-            int ws_desc_101 = (int)((lane_1 & 8) == 0);
-            int ws_wmax_101 = ws_desc_101 * ws_lower_101 + (1 - ws_desc_101) * (1 - ws_lower_101);
-            int ws_tk_101 = ((ws_wmax_101 != 0) ? or_r_99 : 1 - or_r_99);
-            hk[0] = ((ws_tk_101 != 0) ? ws_pb_101 : hk[0]);
-            hc[0] = ((ws_tk_101 != 0) ? ws_pc_101 : hc[0]);
-            unsigned int ws_pb_102 = __shfl_xor_sync(0xFFFFFFFF, hk[1], 4);
-            int ws_pc_102 = __shfl_xor_sync(0xFFFFFFFF, hc[1], 4);
-            int or_r_100 = (int)(ws_pb_102 > hk[1] || ws_pb_102 == hk[1] && ws_pc_102 < hc[1]);
-            int ws_lower_102 = (int)((lane_1 & 4) == 0);
-            int ws_desc_102 = (int)((lane_1 & 8) == 0);
-            int ws_wmax_102 = ws_desc_102 * ws_lower_102 + (1 - ws_desc_102) * (1 - ws_lower_102);
-            int ws_tk_102 = ((ws_wmax_102 != 0) ? or_r_100 : 1 - or_r_100);
-            hk[1] = ((ws_tk_102 != 0) ? ws_pb_102 : hk[1]);
-            hc[1] = ((ws_tk_102 != 0) ? ws_pc_102 : hc[1]);
-            unsigned int ws_pb_103 = __shfl_xor_sync(0xFFFFFFFF, hk[0], 2);
-            int ws_pc_103 = __shfl_xor_sync(0xFFFFFFFF, hc[0], 2);
-            int or_r_101 = (int)(ws_pb_103 > hk[0] || ws_pb_103 == hk[0] && ws_pc_103 < hc[0]);
-            int ws_lower_103 = (int)((lane_1 & 2) == 0);
-            int ws_desc_103 = (int)((lane_1 & 8) == 0);
-            int ws_wmax_103 = ws_desc_103 * ws_lower_103 + (1 - ws_desc_103) * (1 - ws_lower_103);
-            int ws_tk_103 = ((ws_wmax_103 != 0) ? or_r_101 : 1 - or_r_101);
-            hk[0] = ((ws_tk_103 != 0) ? ws_pb_103 : hk[0]);
-            hc[0] = ((ws_tk_103 != 0) ? ws_pc_103 : hc[0]);
-            unsigned int ws_pb_104 = __shfl_xor_sync(0xFFFFFFFF, hk[1], 2);
-            int ws_pc_104 = __shfl_xor_sync(0xFFFFFFFF, hc[1], 2);
-            int or_r_102 = (int)(ws_pb_104 > hk[1] || ws_pb_104 == hk[1] && ws_pc_104 < hc[1]);
-            int ws_lower_104 = (int)((lane_1 & 2) == 0);
-            int ws_desc_104 = (int)((lane_1 & 8) == 0);
-            int ws_wmax_104 = ws_desc_104 * ws_lower_104 + (1 - ws_desc_104) * (1 - ws_lower_104);
-            int ws_tk_104 = ((ws_wmax_104 != 0) ? or_r_102 : 1 - or_r_102);
-            hk[1] = ((ws_tk_104 != 0) ? ws_pb_104 : hk[1]);
-            hc[1] = ((ws_tk_104 != 0) ? ws_pc_104 : hc[1]);
-            unsigned int ws_pb_105 = __shfl_xor_sync(0xFFFFFFFF, hk[0], 1);
-            int ws_pc_105 = __shfl_xor_sync(0xFFFFFFFF, hc[0], 1);
-            int or_r_103 = (int)(ws_pb_105 > hk[0] || ws_pb_105 == hk[0] && ws_pc_105 < hc[0]);
-            int ws_lower_105 = (int)((lane_1 & 1) == 0);
-            int ws_desc_105 = (int)((lane_1 & 8) == 0);
-            int ws_wmax_105 = ws_desc_105 * ws_lower_105 + (1 - ws_desc_105) * (1 - ws_lower_105);
-            int ws_tk_105 = ((ws_wmax_105 != 0) ? or_r_103 : 1 - or_r_103);
-            hk[0] = ((ws_tk_105 != 0) ? ws_pb_105 : hk[0]);
-            hc[0] = ((ws_tk_105 != 0) ? ws_pc_105 : hc[0]);
-            unsigned int ws_pb_106 = __shfl_xor_sync(0xFFFFFFFF, hk[1], 1);
-            int ws_pc_106 = __shfl_xor_sync(0xFFFFFFFF, hc[1], 1);
-            int or_r_104 = (int)(ws_pb_106 > hk[1] || ws_pb_106 == hk[1] && ws_pc_106 < hc[1]);
-            int ws_lower_106 = (int)((lane_1 & 1) == 0);
-            int ws_desc_106 = (int)((lane_1 & 8) == 0);
-            int ws_wmax_106 = ws_desc_106 * ws_lower_106 + (1 - ws_desc_106) * (1 - ws_lower_106);
-            int ws_tk_106 = ((ws_wmax_106 != 0) ? or_r_104 : 1 - or_r_104);
-            hk[1] = ((ws_tk_106 != 0) ? ws_pb_106 : hk[1]);
-            hc[1] = ((ws_tk_106 != 0) ? ws_pc_106 : hc[1]);
-            unsigned int ws_pb_107 = __shfl_xor_sync(0xFFFFFFFF, hk[0], 8);
-            int ws_pc_107 = __shfl_xor_sync(0xFFFFFFFF, hc[0], 8);
-            int or_r_105 = (int)(ws_pb_107 > hk[0] || ws_pb_107 == hk[0] && ws_pc_107 < hc[0]);
-            int ws_lower_107 = (int)((lane_1 & 8) == 0);
-            int ws_desc_107 = (int)((lane_1 & 16) == 0);
-            int ws_wmax_107 = ws_desc_107 * ws_lower_107 + (1 - ws_desc_107) * (1 - ws_lower_107);
-            int ws_tk_107 = ((ws_wmax_107 != 0) ? or_r_105 : 1 - or_r_105);
-            hk[0] = ((ws_tk_107 != 0) ? ws_pb_107 : hk[0]);
-            hc[0] = ((ws_tk_107 != 0) ? ws_pc_107 : hc[0]);
-            unsigned int ws_pb_108 = __shfl_xor_sync(0xFFFFFFFF, hk[1], 8);
-            int ws_pc_108 = __shfl_xor_sync(0xFFFFFFFF, hc[1], 8);
-            int or_r_106 = (int)(ws_pb_108 > hk[1] || ws_pb_108 == hk[1] && ws_pc_108 < hc[1]);
-            int ws_lower_108 = (int)((lane_1 & 8) == 0);
-            int ws_desc_108 = (int)((lane_1 & 16) == 0);
-            int ws_wmax_108 = ws_desc_108 * ws_lower_108 + (1 - ws_desc_108) * (1 - ws_lower_108);
-            int ws_tk_108 = ((ws_wmax_108 != 0) ? or_r_106 : 1 - or_r_106);
-            hk[1] = ((ws_tk_108 != 0) ? ws_pb_108 : hk[1]);
-            hc[1] = ((ws_tk_108 != 0) ? ws_pc_108 : hc[1]);
-            unsigned int ws_pb_109 = __shfl_xor_sync(0xFFFFFFFF, hk[0], 4);
-            int ws_pc_109 = __shfl_xor_sync(0xFFFFFFFF, hc[0], 4);
-            int or_r_107 = (int)(ws_pb_109 > hk[0] || ws_pb_109 == hk[0] && ws_pc_109 < hc[0]);
-            int ws_lower_109 = (int)((lane_1 & 4) == 0);
-            int ws_desc_109 = (int)((lane_1 & 16) == 0);
-            int ws_wmax_109 = ws_desc_109 * ws_lower_109 + (1 - ws_desc_109) * (1 - ws_lower_109);
-            int ws_tk_109 = ((ws_wmax_109 != 0) ? or_r_107 : 1 - or_r_107);
-            hk[0] = ((ws_tk_109 != 0) ? ws_pb_109 : hk[0]);
-            hc[0] = ((ws_tk_109 != 0) ? ws_pc_109 : hc[0]);
-            unsigned int ws_pb_110 = __shfl_xor_sync(0xFFFFFFFF, hk[1], 4);
-            int ws_pc_110 = __shfl_xor_sync(0xFFFFFFFF, hc[1], 4);
-            int or_r_108 = (int)(ws_pb_110 > hk[1] || ws_pb_110 == hk[1] && ws_pc_110 < hc[1]);
-            int ws_lower_110 = (int)((lane_1 & 4) == 0);
-            int ws_desc_110 = (int)((lane_1 & 16) == 0);
-            int ws_wmax_110 = ws_desc_110 * ws_lower_110 + (1 - ws_desc_110) * (1 - ws_lower_110);
-            int ws_tk_110 = ((ws_wmax_110 != 0) ? or_r_108 : 1 - or_r_108);
-            hk[1] = ((ws_tk_110 != 0) ? ws_pb_110 : hk[1]);
-            hc[1] = ((ws_tk_110 != 0) ? ws_pc_110 : hc[1]);
-            unsigned int ws_pb_111 = __shfl_xor_sync(0xFFFFFFFF, hk[0], 2);
-            int ws_pc_111 = __shfl_xor_sync(0xFFFFFFFF, hc[0], 2);
-            int or_r_109 = (int)(ws_pb_111 > hk[0] || ws_pb_111 == hk[0] && ws_pc_111 < hc[0]);
-            int ws_lower_111 = (int)((lane_1 & 2) == 0);
-            int ws_desc_111 = (int)((lane_1 & 16) == 0);
-            int ws_wmax_111 = ws_desc_111 * ws_lower_111 + (1 - ws_desc_111) * (1 - ws_lower_111);
-            int ws_tk_111 = ((ws_wmax_111 != 0) ? or_r_109 : 1 - or_r_109);
-            hk[0] = ((ws_tk_111 != 0) ? ws_pb_111 : hk[0]);
-            hc[0] = ((ws_tk_111 != 0) ? ws_pc_111 : hc[0]);
-            unsigned int ws_pb_112 = __shfl_xor_sync(0xFFFFFFFF, hk[1], 2);
-            int ws_pc_112 = __shfl_xor_sync(0xFFFFFFFF, hc[1], 2);
-            int or_r_110 = (int)(ws_pb_112 > hk[1] || ws_pb_112 == hk[1] && ws_pc_112 < hc[1]);
-            int ws_lower_112 = (int)((lane_1 & 2) == 0);
-            int ws_desc_112 = (int)((lane_1 & 16) == 0);
-            int ws_wmax_112 = ws_desc_112 * ws_lower_112 + (1 - ws_desc_112) * (1 - ws_lower_112);
-            int ws_tk_112 = ((ws_wmax_112 != 0) ? or_r_110 : 1 - or_r_110);
-            hk[1] = ((ws_tk_112 != 0) ? ws_pb_112 : hk[1]);
-            hc[1] = ((ws_tk_112 != 0) ? ws_pc_112 : hc[1]);
-            unsigned int ws_pb_113 = __shfl_xor_sync(0xFFFFFFFF, hk[0], 1);
-            int ws_pc_113 = __shfl_xor_sync(0xFFFFFFFF, hc[0], 1);
-            int or_r_111 = (int)(ws_pb_113 > hk[0] || ws_pb_113 == hk[0] && ws_pc_113 < hc[0]);
-            int ws_lower_113 = (int)((lane_1 & 1) == 0);
-            int ws_desc_113 = (int)((lane_1 & 16) == 0);
-            int ws_wmax_113 = ws_desc_113 * ws_lower_113 + (1 - ws_desc_113) * (1 - ws_lower_113);
-            int ws_tk_113 = ((ws_wmax_113 != 0) ? or_r_111 : 1 - or_r_111);
-            hk[0] = ((ws_tk_113 != 0) ? ws_pb_113 : hk[0]);
-            hc[0] = ((ws_tk_113 != 0) ? ws_pc_113 : hc[0]);
-            unsigned int ws_pb_114 = __shfl_xor_sync(0xFFFFFFFF, hk[1], 1);
-            int ws_pc_114 = __shfl_xor_sync(0xFFFFFFFF, hc[1], 1);
-            int or_r_112 = (int)(ws_pb_114 > hk[1] || ws_pb_114 == hk[1] && ws_pc_114 < hc[1]);
-            int ws_lower_114 = (int)((lane_1 & 1) == 0);
-            int ws_desc_114 = (int)((lane_1 & 16) == 0);
-            int ws_wmax_114 = ws_desc_114 * ws_lower_114 + (1 - ws_desc_114) * (1 - ws_lower_114);
-            int ws_tk_114 = ((ws_wmax_114 != 0) ? or_r_112 : 1 - or_r_112);
-            hk[1] = ((ws_tk_114 != 0) ? ws_pb_114 : hk[1]);
-            hc[1] = ((ws_tk_114 != 0) ? ws_pc_114 : hc[1]);
-            unsigned int ws_pb_115 = __shfl_xor_sync(0xFFFFFFFF, hk[0], 16);
-            int ws_pc_115 = __shfl_xor_sync(0xFFFFFFFF, hc[0], 16);
-            int or_r_113 = (int)(ws_pb_115 > hk[0] || ws_pb_115 == hk[0] && ws_pc_115 < hc[0]);
-            int ws_lower_115 = (int)((lane_1 & 16) == 0);
-            int ws_desc_115 = (int)((lane_1 & 0) == 0);
-            int ws_wmax_115 = ws_desc_115 * ws_lower_115 + (1 - ws_desc_115) * (1 - ws_lower_115);
-            int ws_tk_115 = ((ws_wmax_115 != 0) ? or_r_113 : 1 - or_r_113);
-            hk[0] = ((ws_tk_115 != 0) ? ws_pb_115 : hk[0]);
-            hc[0] = ((ws_tk_115 != 0) ? ws_pc_115 : hc[0]);
-            unsigned int ws_pb_116 = __shfl_xor_sync(0xFFFFFFFF, hk[1], 16);
-            int ws_pc_116 = __shfl_xor_sync(0xFFFFFFFF, hc[1], 16);
-            int or_r_114 = (int)(ws_pb_116 > hk[1] || ws_pb_116 == hk[1] && ws_pc_116 < hc[1]);
-            int ws_lower_116 = (int)((lane_1 & 16) == 0);
-            int ws_desc_116 = 0;
-            int ws_wmax_116 = ws_desc_116 * ws_lower_116 + (1 - ws_desc_116) * (1 - ws_lower_116);
-            int ws_tk_116 = ((ws_wmax_116 != 0) ? or_r_114 : 1 - or_r_114);
-            hk[1] = ((ws_tk_116 != 0) ? ws_pb_116 : hk[1]);
-            hc[1] = ((ws_tk_116 != 0) ? ws_pc_116 : hc[1]);
-            unsigned int ws_pb_117 = __shfl_xor_sync(0xFFFFFFFF, hk[0], 8);
-            int ws_pc_117 = __shfl_xor_sync(0xFFFFFFFF, hc[0], 8);
-            int or_r_115 = (int)(ws_pb_117 > hk[0] || ws_pb_117 == hk[0] && ws_pc_117 < hc[0]);
-            int ws_lower_117 = (int)((lane_1 & 8) == 0);
-            int ws_desc_117 = (int)((lane_1 & 0) == 0);
-            int ws_wmax_117 = ws_desc_117 * ws_lower_117 + (1 - ws_desc_117) * (1 - ws_lower_117);
-            int ws_tk_117 = ((ws_wmax_117 != 0) ? or_r_115 : 1 - or_r_115);
-            hk[0] = ((ws_tk_117 != 0) ? ws_pb_117 : hk[0]);
-            hc[0] = ((ws_tk_117 != 0) ? ws_pc_117 : hc[0]);
-            unsigned int ws_pb_118 = __shfl_xor_sync(0xFFFFFFFF, hk[1], 8);
-            int ws_pc_118 = __shfl_xor_sync(0xFFFFFFFF, hc[1], 8);
-            int or_r_116 = (int)(ws_pb_118 > hk[1] || ws_pb_118 == hk[1] && ws_pc_118 < hc[1]);
-            int ws_lower_118 = (int)((lane_1 & 8) == 0);
-            int ws_desc_118 = 0;
-            int ws_wmax_118 = ws_desc_118 * ws_lower_118 + (1 - ws_desc_118) * (1 - ws_lower_118);
-            int ws_tk_118 = ((ws_wmax_118 != 0) ? or_r_116 : 1 - or_r_116);
-            hk[1] = ((ws_tk_118 != 0) ? ws_pb_118 : hk[1]);
-            hc[1] = ((ws_tk_118 != 0) ? ws_pc_118 : hc[1]);
-            unsigned int ws_pb_119 = __shfl_xor_sync(0xFFFFFFFF, hk[0], 4);
-            int ws_pc_119 = __shfl_xor_sync(0xFFFFFFFF, hc[0], 4);
-            int or_r_117 = (int)(ws_pb_119 > hk[0] || ws_pb_119 == hk[0] && ws_pc_119 < hc[0]);
-            int ws_lower_119 = (int)((lane_1 & 4) == 0);
-            int ws_desc_119 = (int)((lane_1 & 0) == 0);
-            int ws_wmax_119 = ws_desc_119 * ws_lower_119 + (1 - ws_desc_119) * (1 - ws_lower_119);
-            int ws_tk_119 = ((ws_wmax_119 != 0) ? or_r_117 : 1 - or_r_117);
-            hk[0] = ((ws_tk_119 != 0) ? ws_pb_119 : hk[0]);
-            hc[0] = ((ws_tk_119 != 0) ? ws_pc_119 : hc[0]);
-            unsigned int ws_pb_120 = __shfl_xor_sync(0xFFFFFFFF, hk[1], 4);
-            int ws_pc_120 = __shfl_xor_sync(0xFFFFFFFF, hc[1], 4);
-            int or_r_118 = (int)(ws_pb_120 > hk[1] || ws_pb_120 == hk[1] && ws_pc_120 < hc[1]);
-            int ws_lower_120 = (int)((lane_1 & 4) == 0);
-            int ws_desc_120 = 0;
-            int ws_wmax_120 = ws_desc_120 * ws_lower_120 + (1 - ws_desc_120) * (1 - ws_lower_120);
-            int ws_tk_120 = ((ws_wmax_120 != 0) ? or_r_118 : 1 - or_r_118);
-            hk[1] = ((ws_tk_120 != 0) ? ws_pb_120 : hk[1]);
-            hc[1] = ((ws_tk_120 != 0) ? ws_pc_120 : hc[1]);
-            unsigned int ws_pb_121 = __shfl_xor_sync(0xFFFFFFFF, hk[0], 2);
-            int ws_pc_121 = __shfl_xor_sync(0xFFFFFFFF, hc[0], 2);
-            int or_r_119 = (int)(ws_pb_121 > hk[0] || ws_pb_121 == hk[0] && ws_pc_121 < hc[0]);
-            int ws_lower_121 = (int)((lane_1 & 2) == 0);
-            int ws_desc_121 = (int)((lane_1 & 0) == 0);
-            int ws_wmax_121 = ws_desc_121 * ws_lower_121 + (1 - ws_desc_121) * (1 - ws_lower_121);
-            int ws_tk_121 = ((ws_wmax_121 != 0) ? or_r_119 : 1 - or_r_119);
-            hk[0] = ((ws_tk_121 != 0) ? ws_pb_121 : hk[0]);
-            hc[0] = ((ws_tk_121 != 0) ? ws_pc_121 : hc[0]);
-            unsigned int ws_pb_122 = __shfl_xor_sync(0xFFFFFFFF, hk[1], 2);
-            int ws_pc_122 = __shfl_xor_sync(0xFFFFFFFF, hc[1], 2);
-            int or_r_120 = (int)(ws_pb_122 > hk[1] || ws_pb_122 == hk[1] && ws_pc_122 < hc[1]);
-            int ws_lower_122 = (int)((lane_1 & 2) == 0);
-            int ws_desc_122 = 0;
-            int ws_wmax_122 = ws_desc_122 * ws_lower_122 + (1 - ws_desc_122) * (1 - ws_lower_122);
-            int ws_tk_122 = ((ws_wmax_122 != 0) ? or_r_120 : 1 - or_r_120);
-            hk[1] = ((ws_tk_122 != 0) ? ws_pb_122 : hk[1]);
-            hc[1] = ((ws_tk_122 != 0) ? ws_pc_122 : hc[1]);
-            unsigned int ws_pb_123 = __shfl_xor_sync(0xFFFFFFFF, hk[0], 1);
-            int ws_pc_123 = __shfl_xor_sync(0xFFFFFFFF, hc[0], 1);
-            int or_r_121 = (int)(ws_pb_123 > hk[0] || ws_pb_123 == hk[0] && ws_pc_123 < hc[0]);
-            int ws_lower_123 = (int)((lane_1 & 1) == 0);
-            int ws_desc_123 = (int)((lane_1 & 0) == 0);
-            int ws_wmax_123 = ws_desc_123 * ws_lower_123 + (1 - ws_desc_123) * (1 - ws_lower_123);
-            int ws_tk_123 = ((ws_wmax_123 != 0) ? or_r_121 : 1 - or_r_121);
-            hk[0] = ((ws_tk_123 != 0) ? ws_pb_123 : hk[0]);
-            hc[0] = ((ws_tk_123 != 0) ? ws_pc_123 : hc[0]);
-            unsigned int ws_pb_124 = __shfl_xor_sync(0xFFFFFFFF, hk[1], 1);
-            int ws_pc_124 = __shfl_xor_sync(0xFFFFFFFF, hc[1], 1);
-            int or_r_122 = (int)(ws_pb_124 > hk[1] || ws_pb_124 == hk[1] && ws_pc_124 < hc[1]);
-            int ws_lower_124 = (int)((lane_1 & 1) == 0);
-            int ws_desc_124 = 0;
-            int ws_wmax_124 = ws_desc_124 * ws_lower_124 + (1 - ws_desc_124) * (1 - ws_lower_124);
-            int ws_tk_124 = ((ws_wmax_124 != 0) ? or_r_122 : 1 - or_r_122);
-            hk[1] = ((ws_tk_124 != 0) ? ws_pb_124 : hk[1]);
-            hc[1] = ((ws_tk_124 != 0) ? ws_pc_124 : hc[1]);
-            unsigned int ce_xk_2 = hk[0];
-            int ce_xi_2 = hc[0];
-            unsigned int ce_yk_2 = hk[1];
-            int ce_yi_2 = hc[1];
-            int ce_take_2 = (int)(ce_yk_2 > ce_xk_2 || ce_yk_2 == ce_xk_2 && ce_yi_2 < ce_xi_2);
-            hk[0] = ((ce_take_2 != 0) ? ce_yk_2 : ce_xk_2);
-            hc[0] = ((ce_take_2 != 0) ? ce_yi_2 : ce_xi_2);
-            hk[1] = ((ce_take_2 != 0) ? ce_xk_2 : ce_yk_2);
-            hc[1] = ((ce_take_2 != 0) ? ce_xi_2 : ce_yi_2);
-            unsigned int ws_pb_125 = __shfl_xor_sync(0xFFFFFFFF, hk[0], 16);
-            int ws_pc_125 = __shfl_xor_sync(0xFFFFFFFF, hc[0], 16);
-            int or_r_123 = (int)(ws_pb_125 > hk[0] || ws_pb_125 == hk[0] && ws_pc_125 < hc[0]);
-            int ws_lower_125 = (int)((lane_1 & 16) == 0);
-            int ws_desc_125 = (int)((lane_1 & 0) == 0);
-            int ws_wmax_125 = ws_desc_125 * ws_lower_125 + (1 - ws_desc_125) * (1 - ws_lower_125);
-            int ws_tk_125 = ((ws_wmax_125 != 0) ? or_r_123 : 1 - or_r_123);
-            hk[0] = ((ws_tk_125 != 0) ? ws_pb_125 : hk[0]);
-            hc[0] = ((ws_tk_125 != 0) ? ws_pc_125 : hc[0]);
-            unsigned int ws_pb_126 = __shfl_xor_sync(0xFFFFFFFF, hk[1], 16);
-            int ws_pc_126 = __shfl_xor_sync(0xFFFFFFFF, hc[1], 16);
-            int or_r_124 = (int)(ws_pb_126 > hk[1] || ws_pb_126 == hk[1] && ws_pc_126 < hc[1]);
-            int ws_lower_126 = (int)((lane_1 & 16) == 0);
-            int ws_desc_126 = (int)((lane_1 & 0) == 0);
-            int ws_wmax_126 = ws_desc_126 * ws_lower_126 + (1 - ws_desc_126) * (1 - ws_lower_126);
-            int ws_tk_126 = ((ws_wmax_126 != 0) ? or_r_124 : 1 - or_r_124);
-            hk[1] = ((ws_tk_126 != 0) ? ws_pb_126 : hk[1]);
-            hc[1] = ((ws_tk_126 != 0) ? ws_pc_126 : hc[1]);
-            unsigned int ws_pb_127 = __shfl_xor_sync(0xFFFFFFFF, hk[0], 8);
-            int ws_pc_127 = __shfl_xor_sync(0xFFFFFFFF, hc[0], 8);
-            int or_r_125 = (int)(ws_pb_127 > hk[0] || ws_pb_127 == hk[0] && ws_pc_127 < hc[0]);
-            int ws_lower_127 = (int)((lane_1 & 8) == 0);
-            int ws_desc_127 = (int)((lane_1 & 0) == 0);
-            int ws_wmax_127 = ws_desc_127 * ws_lower_127 + (1 - ws_desc_127) * (1 - ws_lower_127);
-            int ws_tk_127 = ((ws_wmax_127 != 0) ? or_r_125 : 1 - or_r_125);
-            hk[0] = ((ws_tk_127 != 0) ? ws_pb_127 : hk[0]);
-            hc[0] = ((ws_tk_127 != 0) ? ws_pc_127 : hc[0]);
-            unsigned int ws_pb_128 = __shfl_xor_sync(0xFFFFFFFF, hk[1], 8);
-            int ws_pc_128 = __shfl_xor_sync(0xFFFFFFFF, hc[1], 8);
-            int or_r_126 = (int)(ws_pb_128 > hk[1] || ws_pb_128 == hk[1] && ws_pc_128 < hc[1]);
-            int ws_lower_128 = (int)((lane_1 & 8) == 0);
-            int ws_desc_128 = (int)((lane_1 & 0) == 0);
-            int ws_wmax_128 = ws_desc_128 * ws_lower_128 + (1 - ws_desc_128) * (1 - ws_lower_128);
-            int ws_tk_128 = ((ws_wmax_128 != 0) ? or_r_126 : 1 - or_r_126);
-            hk[1] = ((ws_tk_128 != 0) ? ws_pb_128 : hk[1]);
-            hc[1] = ((ws_tk_128 != 0) ? ws_pc_128 : hc[1]);
-            unsigned int ws_pb_129 = __shfl_xor_sync(0xFFFFFFFF, hk[0], 4);
-            int ws_pc_129 = __shfl_xor_sync(0xFFFFFFFF, hc[0], 4);
-            int or_r_127 = (int)(ws_pb_129 > hk[0] || ws_pb_129 == hk[0] && ws_pc_129 < hc[0]);
-            int ws_lower_129 = (int)((lane_1 & 4) == 0);
-            int ws_desc_129 = (int)((lane_1 & 0) == 0);
-            int ws_wmax_129 = ws_desc_129 * ws_lower_129 + (1 - ws_desc_129) * (1 - ws_lower_129);
-            int ws_tk_129 = ((ws_wmax_129 != 0) ? or_r_127 : 1 - or_r_127);
-            hk[0] = ((ws_tk_129 != 0) ? ws_pb_129 : hk[0]);
-            hc[0] = ((ws_tk_129 != 0) ? ws_pc_129 : hc[0]);
-            unsigned int ws_pb_130 = __shfl_xor_sync(0xFFFFFFFF, hk[1], 4);
-            int ws_pc_130 = __shfl_xor_sync(0xFFFFFFFF, hc[1], 4);
-            int or_r_128 = (int)(ws_pb_130 > hk[1] || ws_pb_130 == hk[1] && ws_pc_130 < hc[1]);
-            int ws_lower_130 = (int)((lane_1 & 4) == 0);
-            int ws_desc_130 = (int)((lane_1 & 0) == 0);
-            int ws_wmax_130 = ws_desc_130 * ws_lower_130 + (1 - ws_desc_130) * (1 - ws_lower_130);
-            int ws_tk_130 = ((ws_wmax_130 != 0) ? or_r_128 : 1 - or_r_128);
-            hk[1] = ((ws_tk_130 != 0) ? ws_pb_130 : hk[1]);
-            hc[1] = ((ws_tk_130 != 0) ? ws_pc_130 : hc[1]);
-            unsigned int ws_pb_131 = __shfl_xor_sync(0xFFFFFFFF, hk[0], 2);
-            int ws_pc_131 = __shfl_xor_sync(0xFFFFFFFF, hc[0], 2);
-            int or_r_129 = (int)(ws_pb_131 > hk[0] || ws_pb_131 == hk[0] && ws_pc_131 < hc[0]);
-            int ws_lower_131 = (int)((lane_1 & 2) == 0);
-            int ws_desc_131 = (int)((lane_1 & 0) == 0);
-            int ws_wmax_131 = ws_desc_131 * ws_lower_131 + (1 - ws_desc_131) * (1 - ws_lower_131);
-            int ws_tk_131 = ((ws_wmax_131 != 0) ? or_r_129 : 1 - or_r_129);
-            hk[0] = ((ws_tk_131 != 0) ? ws_pb_131 : hk[0]);
-            hc[0] = ((ws_tk_131 != 0) ? ws_pc_131 : hc[0]);
-            unsigned int ws_pb_132 = __shfl_xor_sync(0xFFFFFFFF, hk[1], 2);
-            int ws_pc_132 = __shfl_xor_sync(0xFFFFFFFF, hc[1], 2);
-            int or_r_130 = (int)(ws_pb_132 > hk[1] || ws_pb_132 == hk[1] && ws_pc_132 < hc[1]);
-            int ws_lower_132 = (int)((lane_1 & 2) == 0);
-            int ws_desc_132 = (int)((lane_1 & 0) == 0);
-            int ws_wmax_132 = ws_desc_132 * ws_lower_132 + (1 - ws_desc_132) * (1 - ws_lower_132);
-            int ws_tk_132 = ((ws_wmax_132 != 0) ? or_r_130 : 1 - or_r_130);
-            hk[1] = ((ws_tk_132 != 0) ? ws_pb_132 : hk[1]);
-            hc[1] = ((ws_tk_132 != 0) ? ws_pc_132 : hc[1]);
-            unsigned int ws_pb_133 = __shfl_xor_sync(0xFFFFFFFF, hk[0], 1);
-            int ws_pc_133 = __shfl_xor_sync(0xFFFFFFFF, hc[0], 1);
-            int or_r_131 = (int)(ws_pb_133 > hk[0] || ws_pb_133 == hk[0] && ws_pc_133 < hc[0]);
-            int ws_lower_133 = (int)((lane_1 & 1) == 0);
-            int ws_desc_133 = (int)((lane_1 & 0) == 0);
-            int ws_wmax_133 = ws_desc_133 * ws_lower_133 + (1 - ws_desc_133) * (1 - ws_lower_133);
-            int ws_tk_133 = ((ws_wmax_133 != 0) ? or_r_131 : 1 - or_r_131);
-            hk[0] = ((ws_tk_133 != 0) ? ws_pb_133 : hk[0]);
-            hc[0] = ((ws_tk_133 != 0) ? ws_pc_133 : hc[0]);
-            unsigned int ws_pb_134 = __shfl_xor_sync(0xFFFFFFFF, hk[1], 1);
-            int ws_pc_134 = __shfl_xor_sync(0xFFFFFFFF, hc[1], 1);
-            int or_r_132 = (int)(ws_pb_134 > hk[1] || ws_pb_134 == hk[1] && ws_pc_134 < hc[1]);
-            int ws_lower_134 = (int)((lane_1 & 1) == 0);
-            int ws_desc_134 = (int)((lane_1 & 0) == 0);
-            int ws_wmax_134 = ws_desc_134 * ws_lower_134 + (1 - ws_desc_134) * (1 - ws_lower_134);
-            int ws_tk_134 = ((ws_wmax_134 != 0) ? or_r_132 : 1 - or_r_132);
-            hk[1] = ((ws_tk_134 != 0) ? ws_pb_134 : hk[1]);
-            hc[1] = ((ws_tk_134 != 0) ? ws_pc_134 : hc[1]);
-            sel[0] = hc[0];
-        }
-    }
-    if (sub == 0) {
         int s16_pv_0 = __shfl_xor_sync(0xFFFFFFFF, sel[0], 1);
         int s16_km_0 = 1 - ((int)((lane_1 & 2) == 0) ^ (int)((lane_1 & 1) == 0));
         int s16_tm_0 = ((s16_km_0 != 0) ? (int)(s16_pv_0 < sel[0]) : (int)(s16_pv_0 > sel[0]));
@@ -1754,58 +1615,14 @@ kernel_cake_msa_icp_indexer_7bb0a4a2f772f7ac3c9b(float* __restrict__ scores, int
             float xr = row[cv];
             raw = reinterpret_cast<int*>(&xr)[0];
         }
+        asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
         int gid = ((live != 0) ? (cv << s_shift) + index_offset : -1);
-        int pr_owner = h / heads_per_rank;
-        int pr_hloc = h - pr_owner * heads_per_rank;
-        long long pr_row = (long long)((slot * world + rank) * heads_per_rank + pr_hloc) * (long long)capacity + (long long)t;
-        long long pr_peer = recv_bases[pr_owner];
-        if (tagged != 0) {
-            int* pr_gen_at = generations + ((long long)(slot * world * heads_per_rank + h) * (long long)capacity + (long long)t);
-            unsigned int pr_gen = 0;
-            if (lane_1 == 0) {
-                int pr_old = *pr_gen_at;
-                pr_gen = (unsigned int)pr_old + 1;
-                pr_gen = ((pr_gen != 0) ? pr_gen : 1);
-            }
-            unsigned int _shfl_sync_2 = __shfl_sync(0xFFFFFFFF, pr_gen, 0);
-            pr_gen = _shfl_sync_2;
-            unsigned long long* pr_row64 = reinterpret_cast<unsigned long long*>(pr_peer) + (pr_row * 32);
-            unsigned long long pr_tag = (unsigned long long)pr_gen << 32;
-            if (lane_1 < 16) {
-                asm volatile("st.relaxed.sys.u64 [%0], %1;" :: "l"(reinterpret_cast<unsigned long long*>(pr_row64 + lane_1)), "l"(static_cast<unsigned long long>(pr_tag | (unsigned long long)(unsigned int)raw)) : "memory");
-                asm volatile("st.relaxed.sys.u64 [%0], %1;" :: "l"(reinterpret_cast<unsigned long long*>(pr_row64 + (16 + lane_1))), "l"(static_cast<unsigned long long>(pr_tag | (unsigned long long)(unsigned int)gid)) : "memory");
-            }
-            __syncwarp();
-            if (lane_1 == 0) {
-                pr_gen_at[0] = (int)pr_gen;
-            }
-        } else {
-            int* pr_row32 = reinterpret_cast<int*>(pr_peer) + (pr_row * 33);
-            if (lane_1 == 0) {
-                int pr_spins = 0;
-                int pr_rd0;
-                asm volatile("ld.acquire.sys.global.s32 %0, [%1];" : "=r"(pr_rd0) : "l"(reinterpret_cast<int*>(pr_row32 + 32)) : "memory");
-                int pr_ready = pr_rd0;
-                while (pr_ready != 0) {
-                    pr_spins = pr_spins + 1;
-                    if (pr_spins >= spin_limit) {
-                        int pr_err = atomicAdd(errors, 1);
-                        asm volatile("trap;" ::: "memory");
-                    }
-                    int pr_rd1;
-                    asm volatile("ld.acquire.sys.global.s32 %0, [%1];" : "=r"(pr_rd1) : "l"(reinterpret_cast<int*>(pr_row32 + 32)) : "memory");
-                    pr_ready = pr_rd1;
-                }
-            }
-            __syncwarp();
-            if (lane_1 < 16) {
-                asm volatile("st.relaxed.sys.s32 [%0], %1;" :: "l"(reinterpret_cast<int*>(pr_row32 + lane_1)), "r"(static_cast<int>(raw)) : "memory");
-                asm volatile("st.relaxed.sys.s32 [%0], %1;" :: "l"(reinterpret_cast<int*>(pr_row32 + (16 + lane_1))), "r"(static_cast<int>(gid)) : "memory");
-            }
-            __syncwarp();
-            if (lane_1 == 0) {
-                asm volatile("st.release.sys.global.s32 [%0], %1;" :: "l"(reinterpret_cast<int*>(pr_row32 + 32)), "r"(static_cast<int>(1)) : "memory");
-            }
+        int gid_hi = __shfl_sync(0xFFFFFFFF, gid, lane_1 & 15);
+        int word = ((lane_1 < 16) ? raw : gid_hi);
+        int* crow = carrier + ((long long)h * carrier_stride_h + (long long)t * carrier_stride_t);
+        crow[lane_1] = word;
+        if (lane_1 == 0) {
+            crow[32] = 1;
         }
     }
 }

@@ -52,7 +52,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 extern "C" {
 
 __global__ __launch_bounds__(128) void
-kernel_cake_msa_icp_indexer_1916ac93b213cdcffd4c(unsigned long long* __restrict__ pool, long long* __restrict__ recv_bases, int* __restrict__ errors, int* __restrict__ generations, int total_q, int num_heads, int splits, long long pool_row_stride, int slot, int rank, int world, int heads_per_rank, int capacity, int spin_limit, int tagged)
+kernel_cake_msa_icp_indexer_c8ec74ba3924c207331d(unsigned long long* __restrict__ pool, long long* __restrict__ recv_bases, int* __restrict__ errors, int* __restrict__ generations, int* __restrict__ token_count, int num_heads, int splits, long long pool_row_stride, int slot, int rank, int world, int heads_per_rank, int capacity, int spin_limit, int tagged)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -75,7 +75,8 @@ kernel_cake_msa_icp_indexer_1916ac93b213cdcffd4c(unsigned long long* __restrict_
     if (sub == 0 && lane_1 == 0) {
         asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     }
-    if (t < total_q) {
+    int n_tok = *token_count;
+    if (t < n_tok) {
         unsigned long long* lists = pool + ((long long)(t * num_heads + h) * pool_row_stride);
         unsigned long long R[16];
         unsigned long long B[16];
