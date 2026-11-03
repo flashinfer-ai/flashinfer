@@ -1091,7 +1091,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "arg_plan": "bf16_swa_decode_qlayout",
         "arches": ["sm_100a"],
         "identity": {
-            "sm_100a": "cad88341403732c7ae0b50f2ec501f2a7e9fcaebfb1b06577216e05800289429",
+            "sm_100a": "717635d85e956dc8f0332111940fa97d38f58e7f5ef22506b91e148cfb9e6a8c",
         },
     },
     "cake_dsv4_d9d623599c9697a9ccf3": {
