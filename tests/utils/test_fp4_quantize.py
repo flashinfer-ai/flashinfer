@@ -1,4 +1,5 @@
 import functools
+import itertools
 import os
 from dataclasses import dataclass
 
@@ -2220,10 +2221,16 @@ def test_nvfp4_quantize_tma_backend_parity(
 # factors are allocated for rows padded only to 8; m % 16 in [1, 8] leaves a
 # partial tile past that allocation. Each shape is large enough to take TMA.
 NVFP4_TMA_PARTIAL_ROW_TILE_SHAPES = [(4097, 4096), (4104, 4096), (4104, 8192)]
+# FP8 walks rows in tiles of 8, which the swizzled layouts already pad to; only
+# the linear layout leaves a partial tile, at m % 8 in [1, 7].
+NVFP4_FP8_TMA_PARTIAL_ROW_TILE_SHAPES = [(4097, 8192), (4103, 8192)]
+NVFP4_TMA_PARTIAL_ROW_TILE_CASES = [
+    *itertools.product(DTYPES, NVFP4_TMA_PARTIAL_ROW_TILE_SHAPES),
+    *itertools.product([torch.float8_e4m3fn], NVFP4_FP8_TMA_PARTIAL_ROW_TILE_SHAPES),
+]
 
 
-@pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("shape", NVFP4_TMA_PARTIAL_ROW_TILE_SHAPES)
+@pytest.mark.parametrize(("dtype", "shape"), NVFP4_TMA_PARTIAL_ROW_TILE_CASES)
 @pytest.mark.parametrize("sf_layout", NVFP4_SF_LAYOUTS)
 @pytest.mark.parametrize("device", CUDA_DEVICES)
 @torch.inference_mode()
@@ -2241,8 +2248,8 @@ def test_nvfp4_quantize_tma_scale_stays_in_buffer(
     torch.manual_seed(42)
 
     m, n = shape
-    x = torch.randn((m, n), dtype=dtype)
-    tensor_amax = torch.abs(x).max().to(torch.float32)
+    x = torch.randn((m, n)).to(dtype)
+    tensor_amax = torch.abs(x.float()).max().to(torch.float32)
     global_scale = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / tensor_amax
 
     # Back the scale-factor allocation (the only 1-D uint8 buffer) with a guard
