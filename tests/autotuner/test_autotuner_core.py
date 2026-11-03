@@ -1302,16 +1302,13 @@ def test_tuning_buckets_off_grid_top_bucket_matches_inference_key(monkeypatch):
     tuner = reset_autotuner()
     runner = DummyRunner(valid_tactics=(0, 1))
 
-    def next_pow2(x: int) -> int:
-        return 1 if x <= 1 else 1 << (x - 1).bit_length()
-
     config = TuningConfig(
         dynamic_tensor_specs=(
             DynamicTensorSpec(
                 input_idx=(0,),
                 dim_idx=(0,),
                 gen_tuning_buckets=(8, 16, 32),
-                map_to_tuning_buckets=next_pow2,
+                map_to_tuning_buckets=next_positive_power_of_2,
             ),
         ),
     )

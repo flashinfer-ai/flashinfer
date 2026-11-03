@@ -1018,12 +1018,10 @@ def autotune(
     With ``tuning_buckets``, cache keys come from each op's own mapper, so
     bucket lists whose sizes map to the same op bucket share one entry.
 
-    **Using both parameters together** -- ``round_up`` has no effect when
-    ``tuning_buckets`` is given.  For
-    ``autotune(tuning_buckets=(100, 300, 600), round_up=True)``, profiling runs
-    at 100, 300, and 600, and each op's own mapper decides which bucket a
-    runtime size uses.  A size whose op bucket is not in the list finds no
-    tuned entry inside the context and uses the default tactic.
+    **Using both parameters together** -- ``round_up`` has no effect.  Each
+    op's own mapper decides which bucket a runtime size uses, and a size whose
+    op bucket is not in the list finds no tuned entry inside the context and
+    uses the default tactic.
 
     Examples::
 
