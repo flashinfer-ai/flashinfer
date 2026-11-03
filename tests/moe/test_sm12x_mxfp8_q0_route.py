@@ -55,7 +55,7 @@ def _make_inputs(num_tokens, hidden_size, top_k, num_experts):
     return x, ids, weights
 
 
-def _assert_output(x, topk_ids, topk_weights, num_experts, output):
+def _assert_output(x, topk_ids, topk_weights, num_experts, output, token_only=False):
     offsets, token_map, token_weights, q_out, scale_out = output
     routed = topk_ids >= 0
     counts = torch.bincount(topk_ids[routed].long(), minlength=num_experts)
@@ -64,6 +64,12 @@ def _assert_output(x, topk_ids, topk_weights, num_experts, output):
     assert torch.equal(offsets, offsets_ref)
     q_ref, scale_ref = mxfp8_act_quantize(x)
     scale_ref = pack_ue8m0_to_int32(scale_ref)
+    if token_only:
+        assert q_out.shape == x.shape
+        assert scale_out.shape == (scale_ref.shape[1], x.shape[0])
+        assert q_out.is_contiguous() and scale_out.is_contiguous()
+        assert torch.equal(q_out.view(torch.uint8), q_ref.view(torch.uint8))
+        assert torch.equal(scale_out, scale_ref.t())
     seen = torch.zeros_like(topk_ids, dtype=torch.bool)
     for expert in range(num_experts):
         begin, end = map(int, offsets[expert : expert + 2].tolist())
@@ -77,14 +83,16 @@ def _assert_output(x, topk_ids, topk_weights, num_experts, output):
             )
             seen[token, slot] = True
             assert torch.equal(token_weights[row], topk_weights[token, slot])
-            assert torch.equal(
-                q_out[row].view(torch.uint8), q_ref[token].view(torch.uint8)
-            )
-            scale_row = scale_begin + row - begin
-            assert torch.equal(scale_out[:, scale_row], scale_ref[token])
+            if not token_only:
+                assert torch.equal(
+                    q_out[row].view(torch.uint8), q_ref[token].view(torch.uint8)
+                )
+                scale_row = scale_begin + row - begin
+                assert torch.equal(scale_out[:, scale_row], scale_ref[token])
     assert torch.equal(seen, routed)
 
 
+@pytest.mark.parametrize("token_only", [False, True])
 @pytest.mark.parametrize(
     "routing,num_tokens,top_k,num_experts",
     (
@@ -93,7 +101,9 @@ def _assert_output(x, topk_ids, topk_weights, num_experts, output):
         ("large_expert_fallback", 65, 4, 1025),
     ),
 )
-def test_mxfp8_q0_route_prefill_distributions(routing, num_tokens, top_k, num_experts):
+def test_mxfp8_q0_route_prefill_distributions(
+    routing, num_tokens, top_k, num_experts, token_only
+):
     _skip_if_not_sm120()
     hidden_size = 512
     x, topk_ids, topk_weights = _make_inputs(
@@ -112,8 +122,9 @@ def test_mxfp8_q0_route_prefill_distributions(routing, num_tokens, top_k, num_ex
         num_experts,
         workspace13=torch.empty(shape13, dtype=torch.bfloat16, device="cuda"),
         workspace2=torch.empty(shape2, dtype=torch.bfloat16, device="cuda"),
+        token_only=token_only,
     )
-    _assert_output(x, topk_ids, topk_weights, num_experts, output)
+    _assert_output(x, topk_ids, topk_weights, num_experts, output, token_only)
 
 
 def _mask_unrouted(topk_ids, pattern):
@@ -133,6 +144,7 @@ def _mask_unrouted(topk_ids, pattern):
     return topk_ids.masked_fill(masked, -1)
 
 
+@pytest.mark.parametrize("token_only", [False, True])
 @pytest.mark.parametrize("pattern", ("tail", "all", "mixed"))
 @pytest.mark.parametrize(
     "path,num_tokens,top_k,num_experts",
@@ -142,7 +154,9 @@ def _mask_unrouted(topk_ids, pattern):
         ("large_expert_fallback", 65, 4, 1025),
     ),
 )
-def test_mxfp8_q0_route_skips_unrouted(path, num_tokens, top_k, num_experts, pattern):
+def test_mxfp8_q0_route_skips_unrouted(
+    path, num_tokens, top_k, num_experts, pattern, token_only
+):
     """A negative expert id gets no routed row; the routed pairs are unchanged."""
     _skip_if_not_sm120()
     hidden_size = 512
@@ -160,9 +174,21 @@ def test_mxfp8_q0_route_skips_unrouted(path, num_tokens, top_k, num_experts, pat
         x, topk_ids, num_experts, workspace13=workspace13, workspace2=workspace2
     )
     output = mxfp8_q0_route_triton(
-        x, topk_ids, topk_weights, num_experts, workspace=workspace
+        x,
+        topk_ids,
+        topk_weights,
+        num_experts,
+        workspace=workspace,
+        token_only=token_only,
     )
-    _assert_output(x, topk_ids, topk_weights, num_experts, output)
+    _assert_output(x, topk_ids, topk_weights, num_experts, output, token_only)
     unrouted = topk_ids < 0
     assert bool((workspace.dst_rows[unrouted] == -1).all().item())
     assert bool((workspace.scale_dst_rows[unrouted] == -1).all().item())
+
+
+def test_mxfp8_q0_route_token_only_allocates_workspace():
+    _skip_if_not_sm120()
+    x, ids, weights = _make_inputs(5, 1536, 4, 7)
+    output = mxfp8_q0_route_triton(x, ids, weights, 7, token_only=True)
+    _assert_output(x, ids, weights, 7, output, token_only=True)

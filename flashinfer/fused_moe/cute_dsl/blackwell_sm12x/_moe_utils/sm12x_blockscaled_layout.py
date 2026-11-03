@@ -490,6 +490,20 @@ class Sm120SfConfigMxfp8Mxfp4:
     def make_sfb_ue8m0_view(self, frg_int32, tile_k):
         return self.make_sf_ue8m0_view(frg_int32, self.grank_b, tile_k)
 
+    def make_sfb_ue8m0_view_pingpong(self, frg_int32):
+        """Preserve the four-warp MMA_N fragment order when unpacking int32 scales."""
+        base = self.make_sfb_ue8m0_view(frg_int32, 128)
+        layout = cute.make_layout(
+            (base.shape[0], frg_int32.shape[1], base.shape[2], base.shape[3]),
+            stride=(
+                base.stride[0],
+                cute.transform_leaf(lambda s: s * self.PACK_NSF, frg_int32.stride[1]),
+                base.stride[2],
+                base.stride[3],
+            ),
+        )
+        return cute.make_tensor(base.iterator, layout)
+
 
 class Sm120SfConfigFp8:
     NUM_SCALE_COPY_THREADS = 32
