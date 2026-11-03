@@ -327,7 +327,7 @@ def _radix_round(
     s_scalars: cute.Tensor,
     hist_ptr: Int32,
 ) -> Int32:
-    """One group-wide radix-select round over score keys or, with ``select_index``, over the complemented logical column of pivot ties."""
+    """One group-wide radix-select round over score keys or, if ``select_index``, over complemented pivot-tie columns."""
     current_hist_word = (hist_round % Int32(3)) * Int32(_RADIX)
     next_hist_word = ((hist_round + Int32(1)) % Int32(3)) * Int32(_RADIX)
     shift = Uint32(24 - round_idx * 8)
