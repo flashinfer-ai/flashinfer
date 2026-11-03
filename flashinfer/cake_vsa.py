@@ -40,6 +40,16 @@ _FP16_DIRECT_Q_TILE = 256
 # is this fraction of a wave of its one-CTA-per-SM persistent grid.
 _BLK64_BALANCED_MIN_WAVES = 0.8
 _BLK64_BALANCED_BLOCKS_PER_GROUP = 4
+# Where it is the faster program (``_blk64_balanced_beats_per_head``, measured on
+# B200): at least this many selected blocks per query block on average, and, where
+# the per-head plan is the M64N256 WS program, rows of at most
+# _BLK64_BALANCED_WS_MAX_ROW_BLOCKS blocks in one group-count bucket of the kernel's
+# histogram (_BLK64_BALANCED_NUM_BUCKETS) or rows in several buckets over at least
+# _BLK64_BALANCED_WS_RAGGED_MIN_WAVES waves.
+_BLK64_BALANCED_MIN_AVERAGE_BLOCKS = 8
+_BLK64_BALANCED_WS_MAX_ROW_BLOCKS = 64
+_BLK64_BALANCED_WS_RAGGED_MIN_WAVES = 1.05
+_BLK64_BALANCED_NUM_BUCKETS = 64
 
 
 def _device_index(device: torch.device) -> int:
@@ -427,6 +437,9 @@ def plan_cake_vsa(
             mb=mb,
             num_qo_heads=num_qo_heads,
             device=device,
+            per_head_profile=blk64_profile,
+            fewest=min_selected_blocks,
+            most=max_selected_blocks,
         )
     shared_indptr = shared_indices = None
     if R != 64 and dense is not None and torch.equal(dense, dense[:1].expand_as(dense)):
@@ -670,6 +683,51 @@ def cake_vsa_balanced_launch_grid(
     return max(1, min(int(total_tiles), int(sm_count))), 1, 1
 
 
+def _blk64_group_bucket(count: int) -> int:
+    """The kernel's histogram bucket of a row of ``count`` selected blocks: its
+    group count (four blocks per group), capped at the last bucket."""
+
+    groups = -(-count // _BLK64_BALANCED_BLOCKS_PER_GROUP)
+    return min(groups, _BLK64_BALANCED_NUM_BUCKETS - 1)
+
+
+def _blk64_balanced_beats_per_head(
+    *,
+    per_head_profile: str,
+    selected: int,
+    mb: int,
+    fewest: int,
+    most: int,
+    tiles: int,
+    sm_count: int,
+) -> bool:
+    """Whether the balanced program is the faster block-64 program for a shared
+    selection of ``selected`` blocks over ``mb`` query blocks whose rows select
+    ``fewest`` to ``most`` blocks, over ``tiles`` (query block, head) tiles, given
+    the per-head plan's profile.
+
+    Measured on B200 (FlashInfer's bench timer, cold L2, per-head programs against
+    the forced balanced program): with fewer than
+    ``_BLK64_BALANCED_MIN_AVERAGE_BLOCKS`` blocks per query block on average the
+    balanced program's groups of four are partly empty and it is not faster on
+    every grid. Against the per-head ordinary program it is faster on every longer
+    selection. Against the per-head M64N256 WS program
+    (``blk64_persistent_ws_m64n256``) it is faster on rows in one group-count
+    bucket of at most ``_BLK64_BALANCED_WS_MAX_ROW_BLOCKS`` blocks, and on rows in
+    several buckets once the grid holds ``_BLK64_BALANCED_WS_RAGGED_MIN_WAVES``
+    waves, which its count-ordered queue rebalances; on longer one-bucket rows, and
+    on rows in several buckets in about one wave, the WS program is faster.
+    """
+
+    if selected < _BLK64_BALANCED_MIN_AVERAGE_BLOCKS * mb:
+        return False
+    if per_head_profile != "blk64_persistent_ws_m64n256":
+        return True
+    if _blk64_group_bucket(fewest) == _blk64_group_bucket(most):
+        return most <= _BLK64_BALANCED_WS_MAX_ROW_BLOCKS
+    return tiles >= _BLK64_BALANCED_WS_RAGGED_MIN_WAVES * sm_count
+
+
 def _plan_blk64_balanced(
     dense: torch.Tensor,
     row_counts: torch.Tensor,
@@ -679,16 +737,22 @@ def _plan_blk64_balanced(
     mb: int,
     num_qo_heads: int,
     device: torch.device,
+    per_head_profile: str,
+    fewest: int,
+    most: int,
 ) -> Optional[dict[str, Any]]:
     """Plan-time route and metadata of the block-64 balanced program, or ``None``.
 
     The program walks one selection shared by every head (``indptr`` /
     ``indices``, columns ascending) over full 64-token KV blocks. It serves a
     plan whose selection holds more than four blocks per query block on average
-    and fills at least ``_BLK64_BALANCED_MIN_WAVES`` tiles per SM; every row
-    selects at least one block (validated by the caller). Its ticket counter
-    (four ``uint32``, zero between launches: the kernel resets it at the end of
-    every launch) belongs to the plan, so each plan launches in stream order.
+    and fills at least ``_BLK64_BALANCED_MIN_WAVES`` tiles per SM, where it is
+    the faster program (``_blk64_balanced_beats_per_head``, from the per-head
+    plan's ``per_head_profile`` and the caller's host-side row-count bounds
+    ``fewest`` / ``most``); every row selects at least one block (validated by
+    the caller). Its ticket counter (four ``uint32``, zero between launches: the
+    kernel resets it at the end of every launch) belongs to the plan, so each
+    plan launches in stream order.
     """
 
     if not torch.equal(dense, dense[:1].expand_as(dense)):
@@ -697,7 +761,19 @@ def _plan_blk64_balanced(
     selected = int(counts.sum().item())
     if selected <= _BLK64_BALANCED_BLOCKS_PER_GROUP * mb:
         return None
-    if mb * num_qo_heads < _BLK64_BALANCED_MIN_WAVES * _sm_count(_device_index(device)):
+    tiles = mb * num_qo_heads
+    sm_count = _sm_count(_device_index(device))
+    if tiles < _BLK64_BALANCED_MIN_WAVES * sm_count:
+        return None
+    if not _blk64_balanced_beats_per_head(
+        per_head_profile=per_head_profile,
+        selected=selected,
+        mb=mb,
+        fewest=fewest,
+        most=most,
+        tiles=tiles,
+        sm_count=sm_count,
+    ):
         return None
     if not bool(torch.all(kv_block_lens == C).item()):
         return None
