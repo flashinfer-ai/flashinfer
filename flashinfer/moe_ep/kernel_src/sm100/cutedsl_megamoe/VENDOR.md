@@ -153,14 +153,15 @@ baseline. This is a partial MR !100 import, not a snapshot update:
   retained4+1 off finalizer/cache/graph checks. All24 off performance gates
   pass against legacy F_BASE. Internode public host overhead is reduced; raw
   native-donor comparisons remain inconclusive due to baseline dispersion.
-  See the [PR design](../../../../../docs/design_docs/legacy_nvfp4_gin/pr-design.md)
-  and performance report for exact scopes; no universal speedup is claimed.
+  See the [PR design](../../../../../docs/design_docs/legacy_nvfp4_gin.md)
+  for exact scopes; no universal speedup is claimed.
 
 The recovered original vendor object is available in the receiving checkout.
 It is not an ancestor of MR !100. See the
-[migration audit](../../../../../docs/design_docs/legacy_nvfp4_gin/migration-audit.md)
-for fixed-source hashes, pairwise comparisons, dependency/ABI inventory and
-the implementation/validation ledger.
+[design and validation record](../../../../../docs/design_docs/legacy_nvfp4_gin.md)
+for the fixed sources, implementation, supported scope and validation results.
+Detailed source audits and experiment artifacts are retained in the separate
+investigation archive rather than checked into this package.
 
 ## Related trees
 

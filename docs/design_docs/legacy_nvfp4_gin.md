@@ -3,11 +3,12 @@
 本 PR 将 legacy MegaMoE 的 NVFP4 NCCL GIN 路径接入 FlashInfer 的正式
 `MoEEpLayer` API，使一个 MoE 层能够跨两个独立 NVLink domain 执行。
 该能力必须显式启用，当前只开放下表中的固定配置。已有 intranode 默认行为保留。
-固定范围的正确性验证已完成；off 性能门槛全部通过，internode 性能仍有明确的验收缺口。
+已执行的数值/公共 API 测试通过；off 性能门槛全部通过，internode 性能仍有验收缺口，
+且单 rank capture 的错误协商存在待修复 review 问题（见末节）。
 
-本文面向 API、通信和 kernel reviewer，说明最终行为与修改理由。
-[迁移审计](migration-audit.md)保留来源与逐文件记录；
-[性能报告](performance-fix-blackwell.md)保留每个测量范围、原始证据引用及失败历史。
+本文保留接口、设计、修改范围、验证和性能结论。来源与本地设备差异登记在
+[VENDOR.md](../../flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/VENDOR.md)。
+调查过程、日志和统计文件保存在独立归档中，不作为代码依赖。
 
 ## 1. 接口变化与调用约定
 
@@ -94,7 +95,7 @@ dist.destroy_process_group()
 和 K-major layout 必须满足现有 `nvfp4_nvfp4_bf16_cutedsl/weights.py` 与 transformed-weight
 validator，不能只凭相同 dtype 复用其他 kernel 的权重。本次 example 的权重准备采用 BF16 路径。
 
-[完整可执行示例](../../../examples/nvfp4_gin.py)包含 weights、fleet/bootstrap、
+[完整可执行示例](../../examples/nvfp4_gin.py)包含 weights、fleet/bootstrap、
 imports 和销毁流程。在两个独立 domain 上分别设置 `NODE_RANK=0/1`：
 
 ```bash
@@ -218,17 +219,16 @@ eager GIN 的 key 不包含 rank-local stream，以免仅一个 rank cache miss 
 | `flashinfer/moe_ep/core/kernel/base.py`、`modes/mega_layer.py` | 通用 collective-validation 能力和调用顺序 | 其他 backend 默认能力为 false；避免 rank-local 提前退出 |
 | `shim/gin.py`、`shim/gin_debug.py` | 注册 arena、NCCL/LSA session、错误边界和诊断 | 地址/生命周期；诊断不绕过 capability checks |
 | `shim/nvfp4.py`、`shim/autotune.py`、package exports | frontend/runtime 接线、非共享 GIN session、lean off entry、tuning 拒绝 | thunk 的 session/device/stream 归属 |
-| `src/src/`、`src/common/`、`src/moe_nvfp4_swapab/` | 17 个 device 文件的针对性 import/merge | wire ABI、generation、barrier 和 FI 既有差异；详见 hunk ledger |
+| `src/src/`、`src/common/`、`src/moe_nvfp4_swapab/` | 17 个 device 文件的针对性 import/merge | wire ABI、generation、barrier 和 FI 既有差异；见 VENDOR 的 targeted-import 记录 |
 | `tests/cpu/moe_ep/`、`tests/moe_ep/test_nvfp4_cutedsl_gin_*.py` | host contracts、真实 N2R2 公共 API/强 oracle、off finalizer 回归 | 拓扑 guard、全 rank 结果和无效 route |
-| `examples/nvfp4_gin.py`、`benchmarks/moe_ep/*legacy_nvfp4_gin*.py` | 可执行示例、基线断言、计时与报告 | 独立的计时范围、payload provenance 和失败留存 |
-| `scripts/audit_legacy_nvfp4_gin.py`、本目录 | 固定源审计、设计与验证记录 | 部分迁移，不将整个 vendor snapshot 改标为 donor |
+| `examples/nvfp4_gin.py`、`benchmarks/moe_ep/bench_legacy_nvfp4_gin.py` | 可执行示例、基线断言与可复现计时 | 区分 raw/full；逐 rank 输出 payload 与结果校验 |
+| 本文、package `VENDOR.md` | 设计、支持范围、验证与 targeted-import 来源 | 不将整个 vendor snapshot 改标为 donor |
 
 原 vendor snapshot 为 `fa662f345980f75776ae0c85d2e5c188918ded26`。
 此次 donor 固定于 `f863d7540614bd546a42867c21adbf51d573061a`，接收基线
 F_BASE 固定于 `e74a1677ab95a1b97aa1c6b6a80b3cf5c0ebac34`。
 这不是整包替换：FI 的 sparse decode、masked reduction、per-token scale、custom
-activation、singleton TMA 以及 BF16/MXFP8 兼容行为保留。逐文件差异见
-[device hunk ledger](evidence/device-hunk-ledger.json)；后续同步仍需保留这些本地修改。
+activation、singleton TMA 以及 BF16/MXFP8 兼容行为保留。VENDOR 列出针对性 import 的文件与待上游修复；后续同步仍需保留这些本地修改。
 
 ## 4. 正确性验证与可复现性
 
@@ -239,7 +239,6 @@ activation、singleton TMA 以及 BF16/MXFP8 兼容行为保留。逐文件差�
 | 独立 math | 原容差不变；最大 relative L2 为 `0.0026485608`，阈值 `0.02` |
 | 最终公共/强测试 | 每 rank 17 项通过，无 skips；覆盖 packed/BF16、rank-local 错误恢复、双 session/重建、capture 拒绝、单 rank stream 切换和 device mismatch |
 | 最终 off 兼容性 | 每 rank 4 项 finalizer 和 1 项 workspace/cache/graph 测试通过；更早 EP1/2/4、BF16/MXFP8 回归结果保留 |
-| 源码一致性 | GPU 验收时检查的 111 个包/测试文件 hash 与 launch snapshot 一致（包含 Python、脚本与元数据）；17 个 device 文件与迁移 ledger 一致 |
 
 最终 GPU correctness source 为 `74c0362878cb6dd5d0c90c346c7b420848563f1d`；
 后续修改只涉及文档、vendor 状态说明和归档回执，Python runtime/test 字节未变。
@@ -249,8 +248,21 @@ activation、singleton TMA 以及 BF16/MXFP8 兼容行为保留。逐文件差�
 普通单机四 rank CI 不能替代两 domain 的 N2R2 验证。多节点测试需要正确的 torchrun
 geometry 和真实 rail/LSA 能力；跳过 topology-specific 测试不算验证成功。
 
-复现命令及环境见 [validation](validation.md)。login 环境没有 Torch/GPU，
-不能用 host contracts 代替真实 CUDA/NCCL 结果；文档变更不重新触发完整 GPU 矩阵。
+Host contracts 不依赖 Torch/GPU；不能代替真实 CUDA/NCCL 结果：
+
+```bash
+python -m unittest discover -s tests/cpu/moe_ep -p test_legacy_nvfp4_gin_contracts.py -v
+```
+
+在两个真实独立 domain 上，使用前述 torchrun geometry 和下面两个测试文件执行
+strong/public 验证；普通单机4rank不等价：
+
+```bash
+torchrun --nnodes=2 --nproc-per-node=2 --node-rank="$NODE_RANK" \
+  --master-addr="$MASTER_ADDR" --master-port=29500 -m pytest \
+  tests/moe_ep/test_nvfp4_cutedsl_gin_oracles.py \
+  tests/moe_ep/test_nvfp4_cutedsl_gin_multinode.py -v -x
+```
 
 ## 5. Blackwell 性能
 
@@ -277,17 +289,17 @@ on fixture 使用固定种子的 random top-k，不是严格均衡路由；所�
 
 ### 5.2 结果
 
-Off shape 为 H2048、公共 I1024、E8、K4。下表是 warm raw median，单位 µs；
+Off shape 为 H2048、公共 I1024、E8、K4。下表为 median µs，均为 F_BASE legacy → receiver；
 EP1/2/4 × T64/1024 × warm/cold × raw/full 的完整 **24 项门槛均通过**。每项包含两个 source 各100个样本，合计4800样本。
 
-| EP | T/rank | F_BASE legacy | Receiver |
-| --- | --- | ---: | ---: |
-| 1 | 64 | 91.44 | 87.50 |
-| 1 | 1024 | 132.40 | 127.07 |
-| 2 | 64 | 106.98 | 101.52 |
-| 2 | 1024 | 152.82 | 146.02 |
-| 4 | 64 | 129.73 | 124.43 |
-| 4 | 1024 | 184.62 | 181.89 |
+| EP | T/rank | Warm raw | Cold raw | Warm full | Cold full |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 64 | 91.44 → 87.50 | 95.68 → 90.91 | 211.91 → 207.97 | 202.06 → 199.99 |
+| 1 | 1024 | 132.40 → 127.07 | 136.98 → 131.42 | 237.33 → 234.87 | 238.56 → 231.43 |
+| 2 | 64 | 106.98 → 101.52 | 106.46 → 102.11 | 226.71 → 217.63 | 217.39 → 212.37 |
+| 2 | 1024 | 152.82 → 146.02 | 156.82 → 152.78 | 264.48 → 256.95 | 259.99 → 254.90 |
+| 4 | 64 | 129.73 → 124.43 | 130.90 → 124.03 | 249.62 → 241.95 | 246.21 → 240.35 |
+| 4 | 1024 | 184.62 → 181.89 | 186.27 → 180.62 | 299.97 → 293.81 | 296.12 → 287.70 |
 
 On shape 为 N2R2、T32、H7168、公共 I1536、E48、K4。
 同一 allocation 的 host 修复对照测得 FI public full-call **6155.76 → 2208.60 µs**；
@@ -309,10 +321,20 @@ launch 方差；但它没有消除所有 N2R2 波动。旧 raw +18.8% 回退在�
 发生方向反转，最终 baseline 仍未达到稳定性门槛。结论是 off 修复已验收、GIN host
 开销已降低；internode 原始流水线没有足够稳定的基线来正式验收，也不宣称普遍加速。
 
-完整 cold/full、独立 conditioned protocol、分布、binding 和失败记录见
-[性能报告](performance-fix-blackwell.md)，统计见
-[off summary](evidence/blackwell-fix-off-summary.json)及
-[on summary](evidence/blackwell-fix-on-summary.json)。
+性能入口为 [bench_legacy_nvfp4_gin.py](../../benchmarks/moe_ep/bench_legacy_nvfp4_gin.py)，
+使用相同 fixture、独立进程和指定 source checkout 运行，输出逐 rank 的样本和 manifest：
+
+- Off：分别从固定 F_BASE 与 receiver 导入 FlashInfer，使用 `--mode off --impl base/port`，
+  对 EP1/2/4 执行五轮；脚本覆盖 T64/1024。双方必须共享 `--root` fixture。
+- On：先在 receiver 的 N2R2 launcher 中用 `--mode on --impl port --prepare` 生成 fixture；
+  再分别运行 `--impl port` 与 `--impl donor`，donor 进程的 `PYTHONPATH` 指向固定 donor
+  checkout，避免导入 FI；每次使用同一 `--root` 和不同 `--round`。
+- 使用 `--skip-profiles` 将 primary samples 与 profiler 分开；全部 primary 完成后以
+  `--profile-only` 采集。baseline/receiver 轮次顺序交替，warm/cold 不能混合汇总。
+
+benchmark 的独立进程协议与最终 resident experiment 的 controller 不相同；
+最终 resident 数据、conditioned protocol、旧负面结果和失败记录随调查归档保留，
+不把未运行过的新协议结果代入本文数字。
 
 ## 6. 合并评审边界
 
@@ -320,3 +342,13 @@ launch 方差；但它没有消除所有 N2R2 波动。旧 raw +18.8% 回退在�
 扩大 shape/topology、internode graphs、去掉公共校验、改变 reduce 精度/顺序、
 kernel autotuning 和正式 internode 性能 promotion 都需要后续工作。
 当前 PR 不以 baseline 波动为理由删除不利样本，也不将 correctness 通过等同于性能通过。
+
+已知 review 问题：当前 capture 拒绝有 rank-local 提前抛错的路径；仅一个 rank 处于
+capture 时，其他 rank 可能阻塞在 collective，直到 PG timeout。已通过的 capture 测试
+让所有 rank 同时 capture，不能覆盖这种非对称情况。该问题仍待修复，本轮提交清理
+没有更改 runtime，也不宣称已解决该 review finding。
+
+完整调查归档位于内部 `qiangf/agent-trace` 仓库，commit
+`2cf0a06da12654a3ab4089224523822f93de9807`，路径
+`cases/legacy-nvfp4-gin-blackwell-01a19f6e-r6`。它保留调查记录、报告和证据摘要；
+大型 tensor、profiler trace 和二进制仍保留在原始实验位置。归档不是运行本 PR 的前提。
