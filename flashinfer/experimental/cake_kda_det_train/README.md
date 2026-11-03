@@ -608,7 +608,8 @@ arch)` resolves them once per problem into `Plan.records[path][stage]` (cached
 on its arguments; `arch=None` takes the current CUDA device's architecture, or
 the first exported one when no exported device is present), and
 `Plan.launch_count(path)` is the launch count of each path (`"bwd"`: the
-backward from the plan's own light saved set).
+backward from the plan's own light saved set; the in-kernel Q/K L2 norm
+fallback's replay counts `qk_l2norm` and no `qk_apply`, the launches it makes).
 
 ### Programs by stage
 
