@@ -303,7 +303,7 @@ def test_plan_route_policy(arch, M, K, pdl, kind, schedule_id, grid_x, sm_count)
         | _ROUND_32_ROWS
     ).get((arch, M, K, sm_count), (kind, schedule_id, grid_x))
     if (sm_count == SM_COUNT and (M, K) in _CLC_CELLS[arch]) or (
-        sm_count == 152 and arch == "sm_103a" and (M, K) in _ROUND_32_CLC_CELLS_152
+        sm_count == 152 and arch == "sm_103a" and (M, K) in _ROUND_32_34_CLC_CELLS_152
     ):
         # rounds 28 / 29 / 32: the cell runs the token-queue build (``_clc``) of its program, one
         # CTA per token
@@ -473,8 +473,8 @@ def test_round_2_cells_take_their_table_program():
             dense = plan_route(arch, sm_count, M, K, pdl)
             # Round 6: the (256, 7) write cells of sm_100a and of sm_103a at 148 SMs run the
             # snapshot-write variant of the program their dense cell runs; round 29: so do the
-            # sm_100a (4096, 1), sm_103a (4096, 1) write cells at 148 SMs (``_clc``); round 33: so
-            # do the token-queue write cells whose dense cell runs the same ``_clc`` program.
+            # sm_100a (4096, 1), sm_103a (4096, 1) write cells at 148 SMs (``_clc``); rounds 33 and
+            # 34: so do the token-queue write cells whose dense cell runs the same ``_clc`` program.
             on_dense = (arch, sm_count, M, K) in {
                 ("sm_100a", 148, 256, 7),
                 ("sm_100a", 148, 4096, 1),
@@ -493,11 +493,13 @@ def test_round_2_cells_take_their_table_program():
     # (4096, 1) at 152 SMs, one key per PDL mode (off, on); round 29 the token-queue (``_clc``)
     # write cells sm_100a [(4096, 1)], sm_103a [(4096, 1)] at 148 SMs; round 33 the token-queue
     # write cells sm_100a [(4096, 4), (4096, 7)] and sm_103a [(4096, 4), (4096, 7)] at 148 SMs and
-    # sm_103a [(4096, 1), (4096, 4), (4096, 7)] at 152 SMs ((4096, 1) leaves its held program).
+    # sm_103a [(4096, 1), (4096, 4), (4096, 7)] at 152 SMs ((4096, 1) leaves its held program);
+    # round 34 the token-queue write cells sm_100a [(1024, 4)] at 148 SMs and sm_103a [(1024, 1)]
+    # at 152 SMs.
     assert list(_r2_cells("WRITE_PERSISTENT_KEY_CELLS")) == [
         ("sm_100a", 148, 256, 7, "persistent:k7_nc4_d2_f111000000000000_fm"),
         ("sm_100a", 148, 1024, 1, "persistent:k1_nc2_d3_f110000000000000_fm"),
-        ("sm_100a", 148, 1024, 4, "persistent:k4_nc3_d2_f111000000000000"),
+        ("sm_100a", 148, 1024, 4, "persistent:k4_nc3_d2_f111000000000000_clc"),
         ("sm_100a", 148, 1024, 7, "persistent:k7_nc4_d2_f111000000000000_fm"),
         ("sm_100a", 148, 4096, 1, "persistent:k1_nc4_d2_f110000000000000_clc"),
         ("sm_100a", 148, 4096, 4, "persistent:k4_nc3_d2_f111000000000000_clc"),
@@ -529,6 +531,16 @@ def test_round_2_cells_take_their_table_program():
         ("sm_103a", 148, 4096, 7, "persistent:k7_nc4_d2_f110000000000000_clc"),
         ("sm_103a", 152, 256, 4, "persistent:k4_nc3_d2_f111000000000000_fm"),
         ("sm_103a", 152, 256, 7, "persistent:k7_nc4_d2_f110000000000000_fm"),
+        (
+            "sm_103a",
+            152,
+            1024,
+            1,
+            [
+                "persistent:k1_nc4_d2_f110000000000010_clc",
+                "persistent:k1_nc4_d2_f110000000100000_clc",
+            ],
+        ),
         ("sm_103a", 152, 1024, 7, "persistent:k7_nc4_d2_f111000000000000_fm"),
         (
             "sm_103a",
@@ -735,7 +747,7 @@ def test_round_2_cells_take_their_table_program():
             for K in (2, 3):
                 key = plan_route("sm_103a", sm_count, M, K, False).kernel_key
                 if (sm_count == SM_COUNT and (M, K) in _CLC_CELLS["sm_103a"]) or (
-                    sm_count == 152 and (M, K) in _ROUND_32_CLC_CELLS_152
+                    sm_count == 152 and (M, K) in _ROUND_32_34_CLC_CELLS_152
                 ):
                     assert key.endswith("_clc"), (sm_count, M, K, key)
                     key = key.removesuffix("_clc")
@@ -1020,15 +1032,83 @@ _ROUND_33_CLC_WRITE_CELLS = {
         },
     },
 }
+# Round 34: more 148-SM cells run the ``_clc`` build of the program they ran before (B200: eleven
+# cells; B300: sixteen cells, six of them on three new token-queue builds of fast-math programs),
+# per architecture (M, K) -> the key of the program without the suffix (a pair: the keys at PDL
+# off and on).
+_ROUND_34_CLC_CELLS_148 = {
+    "sm_100a": {
+        (768, 6): "persistent:k6_nc4_d2_f110000000000000",
+        (768, 7): "persistent:k7_nc4_d2_f110000000000000_fm",
+        (1536, 6): "persistent:k6_nc4_d2_f110000000000000",
+        (1536, 7): "persistent:k7_nc4_d2_f110000000000000_fm",
+        (2048, 1): "persistent:k1_nc2_d2_f110000000000000",
+        (2048, 4): "persistent:k4_nc3_d3_f110000000000000",
+        (3072, 1): "persistent:k1_nc4_d2_f110000000000000",
+        (3072, 2): "persistent:k2_nc4_d2_f110000000000000_crfnone",
+        (3072, 3): "persistent:k3_nc4_d2_f010000000000000_crfnone",
+        (3072, 4): "persistent:k4_nc3_d3_f110000000000000",
+        (3072, 5): "persistent:k5_nc4_d3_f010000000000000",
+    },
+    "sm_103a": {
+        (1024, 1): (
+            "persistent:k1_nc4_d2_f110000000000010_fm",
+            "persistent:k1_nc4_d2_f110000000100000_fm",
+        ),
+        (1024, 6): "persistent:k6_nc4_d2_f111000000000000_fm",
+        (1536, 4): "persistent:k4_nc5_d2_f011001000000000_fm",
+        (1536, 7): "persistent:k7_nc4_d2_f110000000000000_fm",
+        (2048, 1): (
+            "persistent:k1_nc4_d2_f110000000000010_fm",
+            "persistent:k1_nc4_d2_f110000000100000_fm",
+        ),
+        (2048, 3): "persistent:k3_nc4_d2_f011000000000000",
+        (2048, 4): "persistent:k4_nc3_d3_f110000000000000",
+        (2048, 5): "persistent:k5_nc4_d3_f010000000000000",
+        (2048, 6): "persistent:k6_nc4_d2_f111000000000000_fm",
+        (2048, 7): "persistent:k7_nc4_d2_f110000000000000_fm",
+        (3072, 1): (
+            "persistent:k1_nc4_d2_f110000000000010_fm",
+            "persistent:k1_nc4_d2_f110000000000000_fm",
+        ),
+        (3072, 2): "persistent:k2_nc4_d2_f011010000000000",
+        (3072, 3): "persistent:k3_nc4_d2_f011000000000000",
+        (3072, 4): "persistent:k4_nc5_d2_f011001000000000_fm",
+        (3072, 5): "persistent:k5_nc3_d3_f010000000000000",
+        (6144, 5): "persistent:k5_nc3_d3_f010000000000000",
+    },
+}
+# Round 34: snapshot-write cells that run the ``_write_clc`` build of their write program, per
+# architecture and SM count, (M, K) -> that write program (a pair: the keys at PDL off and on):
+# B200 (1024, 4) at 148 SMs, GB300 (1024, 1) at 152 SMs.
+_ROUND_34_CLC_WRITE_CELLS = {
+    "sm_100a": {
+        148: {
+            (1024, 4): "persistent:k4_nc3_d2_f111000000000000_write",
+        },
+        152: {},
+    },
+    "sm_103a": {
+        148: {},
+        152: {
+            (1024, 1): (
+                "persistent:k1_nc4_d2_f110000000000010_write",
+                "persistent:k1_nc4_d2_f110000000100000_write",
+            ),
+        },
+    },
+}
 _CLC_CELLS = {
     "sm_100a": (_CLC_CELLS_148 - {(8192, 6)})
     | set(_ROUND_29_CLC_CELLS["sm_100a"])
     | set(_ROUND_32_CLC_CELLS_148["sm_100a"])
-    | set(_ROUND_33_CLC_CELLS_148["sm_100a"]),
+    | set(_ROUND_33_CLC_CELLS_148["sm_100a"])
+    | set(_ROUND_34_CLC_CELLS_148["sm_100a"]),
     "sm_103a": _CLC_CELLS_148
     | set(_ROUND_29_CLC_CELLS["sm_103a"])
     | set(_ROUND_32_CLC_CELLS_148["sm_103a"])
-    | set(_ROUND_33_CLC_CELLS_148["sm_103a"]),
+    | set(_ROUND_33_CLC_CELLS_148["sm_103a"])
+    | set(_ROUND_34_CLC_CELLS_148["sm_103a"]),
 }
 # Round 31: the sm_103a cells at 152 SMs (GB300) that run the ``_clc`` build of a round-28
 # program, (M, K) -> the key of that program; (4096, 6), (4096, 7) and (6144, 7) ran the f111
@@ -1088,6 +1168,47 @@ _ROUND_32_CLC_CELLS_152 = {
     (16384, 7): "persistent:k7_nc4_d2_f110000000000000",
     (16384, 8): "persistent:k8_nc5_d2_f110000000000000",
 }
+# Round 34: the sm_103a cells at 152 SMs (GB300) that run a ``_clc`` program at both PDL modes:
+# the token-queue build of the program they ran before, or of the f110 program of their K
+# ((M, K) -> the key of that program, a pair: the keys at PDL off and on).
+_ROUND_34_CLC_CELLS_152 = {
+    (768, 7): "persistent:k7_nc4_d2_f110000000000000",
+    (768, 8): "persistent:k8_nc5_d2_f110000000000000",
+    (1536, 6): "persistent:k6_nc4_d2_f110000000000000",
+    (1536, 8): "persistent:k8_nc5_d2_f110000000000000",
+    (2048, 3): "persistent:k3_nc4_d2_f011000000000000",
+    (2048, 4): "persistent:k4_nc3_d3_f110000000000000",
+    (2048, 5): "persistent:k5_nc3_d3_f010000000000000",
+    (2048, 6): "persistent:k6_nc4_d2_f110000000000000",
+    (2048, 7): "persistent:k7_nc4_d2_f110000000000000",
+    (2048, 8): "persistent:k8_nc5_d2_f110000000000000",
+    (3072, 1): (
+        "persistent:k1_nc4_d2_f110000000000010_fm",
+        "persistent:k1_nc4_d2_f110000000000000_fm",
+    ),
+    (3072, 2): "persistent:k2_nc4_d2_f011010000000000",
+    (3072, 3): "persistent:k3_nc4_d2_f011000000000000",
+    (3072, 4): "persistent:k4_nc5_d2_f011001000000000_fm",
+    (3072, 5): "persistent:k5_nc3_d3_f010000000000000",
+    (3072, 8): "persistent:k8_nc5_d2_f110000000000000",
+    (6144, 5): "persistent:k5_nc4_d3_f010000000000000",
+}
+# Round 34: the sm_103a K1 cells at 152 SMs (GB300) that run the ``_clc`` build at PDL off only,
+# (M, K) -> (the key of that program at PDL off, the key the cell keeps at PDL on).
+_ROUND_34_CLC_CELLS_152_PDL_OFF = {
+    (1024, 1): (
+        "persistent:k1_nc4_d2_f110000000000010_fm",
+        "persistent:k1_nc4_d2_f110000000100000_fm",
+    ),
+    (2048, 1): (
+        "persistent:k1_nc4_d2_f110000000000010_fm",
+        "persistent:k1_nc4_d2_f110000000100000_fm",
+    ),
+}
+# The cells at 152 SMs that rounds 32 and 34 move to a ``_clc`` program at both PDL modes.
+_ROUND_32_34_CLC_CELLS_152 = (
+    _ROUND_32_CLC_CELLS_152.keys() | _ROUND_34_CLC_CELLS_152.keys()
+)
 
 
 def _at_pdl(value, pdl):
@@ -1103,6 +1224,8 @@ def _clc_static_key(arch, M, K, pdl):
         return _at_pdl(_ROUND_32_CLC_CELLS_148[arch][(M, K)], pdl)
     if (M, K) in _ROUND_33_CLC_CELLS_148[arch]:
         return _at_pdl(_ROUND_33_CLC_CELLS_148[arch][(M, K)], pdl)
+    if (M, K) in _ROUND_34_CLC_CELLS_148[arch]:
+        return _at_pdl(_ROUND_34_CLC_CELLS_148[arch][(M, K)], pdl)
     return _CLC_KEYS[K].removesuffix("_clc")
 
 
@@ -1118,7 +1241,9 @@ def test_clc_cells_take_the_token_queue_programs():
     ``_ROUND_31_CLC_CELLS_152`` run it (round 31) and the ``_ROUND_32_CLC_CELLS_152`` (round 32;
     round 32 also adds the ``_ROUND_32_CLC_CELLS_148``, round 33 the ``_ROUND_33_CLC_CELLS_148``);
     round 33 runs the ``_write_clc`` build of the ``_ROUND_33_CLC_WRITE_CELLS`` snapshot writes at
-    148 and 152 SMs; no other cell, SM count or snapshot-write plan runs one."""
+    148 and 152 SMs; round 34 adds the ``_ROUND_34_CLC_CELLS_148``, the ``_ROUND_34_CLC_CELLS_152``,
+    the ``_ROUND_34_CLC_CELLS_152_PDL_OFF`` (at PDL off) and the ``_ROUND_34_CLC_WRITE_CELLS``; no
+    other cell, SM count or snapshot-write plan runs one."""
 
     def clc_cells(table_name):
         return {
@@ -1134,7 +1259,10 @@ def test_clc_cells_take_the_token_queue_programs():
         (arch, 148, M, K) for arch, cells in _CLC_CELLS.items() for M, K in cells
     } | {
         ("sm_103a", 152, M, K)
-        for M, K in _ROUND_31_CLC_CELLS_152.keys() | _ROUND_32_CLC_CELLS_152.keys()
+        for M, K in _ROUND_31_CLC_CELLS_152.keys()
+        | _ROUND_32_CLC_CELLS_152.keys()
+        | _ROUND_34_CLC_CELLS_152.keys()
+        | _ROUND_34_CLC_CELLS_152_PDL_OFF.keys()
     }
     assert clc_cells("WRITE_PERSISTENT_KEY_CELLS") == {
         (arch, 148, M, K)
@@ -1142,7 +1270,8 @@ def test_clc_cells_take_the_token_queue_programs():
         for M, K in cells
     } | {
         (arch, sm_count, M, K)
-        for arch, by_sm in _ROUND_33_CLC_WRITE_CELLS.items()
+        for round_cells in (_ROUND_33_CLC_WRITE_CELLS, _ROUND_34_CLC_WRITE_CELLS)
+        for arch, by_sm in round_cells.items()
         for sm_count, cells in by_sm.items()
         for M, K in cells
     }
@@ -1170,12 +1299,15 @@ def test_clc_cells_take_the_token_queue_programs():
                 if arch != "sm_103a" or (
                     (M, K) not in _ROUND_31_CLC_CELLS_152
                     and (M, K) not in _ROUND_32_CLC_CELLS_152
+                    and (M, K) not in _ROUND_34_CLC_CELLS_152
+                    and (pdl or (M, K) not in _ROUND_34_CLC_CELLS_152_PDL_OFF)
                 ):
                     others.append(plan_route(arch, 152, M, K, pdl))
                 if (
                     K < MAX_BLOCKS
                     and (M, K) not in _ROUND_29_CLC_WRITE_CELLS[arch]
                     and (M, K) not in _ROUND_33_CLC_WRITE_CELLS[arch][148]
+                    and (M, K) not in _ROUND_34_CLC_WRITE_CELLS[arch][148]
                 ):
                     # the snapshot write of block K (K = MAX_BLOCKS has no block to write)
                     others.append(plan_route(arch, 148, M, K, pdl, block_write_idx=K))
@@ -1184,8 +1316,14 @@ def test_clc_cells_take_the_token_queue_programs():
                     assert "_clc_token_queue" not in other.schedule_id, other
                     if other.kind == "persistent":
                         assert other.grid_x < M, other
-    clc_152 = _ROUND_31_CLC_CELLS_152 | _ROUND_32_CLC_CELLS_152
-    assert len(clc_152) == len(_ROUND_31_CLC_CELLS_152) + len(_ROUND_32_CLC_CELLS_152)
+    clc_152 = {}
+    for round_cells in (
+        _ROUND_31_CLC_CELLS_152,
+        _ROUND_32_CLC_CELLS_152,
+        _ROUND_34_CLC_CELLS_152,
+    ):
+        assert not clc_152.keys() & round_cells.keys()
+        clc_152 |= round_cells
     for (M, K), value in sorted(clc_152.items()):
         for pdl in (False, True):
             static_key = _at_pdl(value, pdl)
@@ -1211,6 +1349,7 @@ def test_clc_cells_take_the_token_queue_programs():
             if (
                 K < MAX_BLOCKS
                 and (M, K) not in _ROUND_33_CLC_WRITE_CELLS["sm_103a"][152]
+                and (M, K) not in _ROUND_34_CLC_WRITE_CELLS["sm_103a"][152]
             ):
                 others.append(plan_route("sm_103a", 152, M, K, pdl, block_write_idx=K))
             for other in others:
@@ -1249,6 +1388,53 @@ def test_clc_cells_take_the_token_queue_programs():
         for (M, K), value in sorted(cells.items())
     ]
     for arch, sm_count, M, K, value in write_cells_33:
+        for pdl in (False, True):
+            write_key = _at_pdl(value, pdl)
+            dense_key = f"{write_key.removesuffix('_write')}_clc"
+            dense = cb._persistent_plan_for_key(arch, sm_count, M, K, pdl, dense_key)
+            plan = plan_route(arch, sm_count, M, K, pdl, block_write_idx=K)
+            assert plan.kind == "persistent" and plan.fallback_from is None, plan
+            assert plan.kernel_key == f"{write_key}_clc", (arch, M, K, pdl, plan)
+            assert (plan.grid_x, plan.threads) == (M, cb.PERSISTENT_THREADS), plan
+            assert plan.schedule_id == f"{dense.schedule_id}_write", plan
+            assert plan.route_id.endswith(f".pdl{int(pdl)}.clc_token_queue"), plan
+            assert ".write1." in plan.route_id, plan
+            if MODULES:
+                record = MODULES[KERNELS[arch][plan.kernel_key]]
+                assert record["schedule_id"] == plan.schedule_id, plan
+            other = plan_route(arch, sm_count, M + 1, K, pdl, block_write_idx=K)
+            assert not other.kernel_key.endswith("_clc"), (arch, M, K, other)
+            assert "_clc_token_queue" not in other.schedule_id, other
+    # Round 34: the GB300 K1 cells that run the ``_clc`` build at PDL off keep their program at PDL on.
+    pdl_off_cells = sorted(_ROUND_34_CLC_CELLS_152_PDL_OFF.items())
+    for (M, K), (static_key, kept_key) in pdl_off_cells:
+        static = cb._persistent_plan_for_key("sm_103a", 152, M, K, False, static_key)
+        plan = plan_route("sm_103a", 152, M, K, False)
+        assert plan.kind == "persistent" and plan.fallback_from is None, plan
+        assert plan.kernel_key == f"{static_key}_clc", (M, K, plan)
+        assert plan.grid_x == M and plan.threads == cb.PERSISTENT_THREADS, plan
+        assert plan.schedule_id == f"{static.schedule_id}_clc_token_queue", plan
+        assert plan.route_id.endswith(".pdl0.clc_token_queue"), plan
+        if MODULES:
+            assert MODULES[KERNELS["sm_103a"][plan.kernel_key]]["schedule_id"] == (
+                plan.schedule_id
+            ), plan
+        kept = plan_route("sm_103a", 152, M, K, True)
+        assert kept.kernel_key == kept_key and kept.fallback_from is None, kept
+        assert "_clc_token_queue" not in kept.schedule_id, kept
+        for other in (
+            plan_route("sm_103a", 152, M - 1, K, False),
+            plan_route("sm_103a", 152, M + 1, K, False),
+        ):
+            assert not other.kernel_key.endswith("_clc"), (M, K, other)
+            assert "_clc_token_queue" not in other.schedule_id, other
+    write_cells_34 = [
+        (arch, sm_count, M, K, value)
+        for arch, by_sm in _ROUND_34_CLC_WRITE_CELLS.items()
+        for sm_count, cells in by_sm.items()
+        for (M, K), value in sorted(cells.items())
+    ]
+    for arch, sm_count, M, K, value in write_cells_34:
         for pdl in (False, True):
             write_key = _at_pdl(value, pdl)
             dense_key = f"{write_key.removesuffix('_write')}_clc"
@@ -1504,6 +1690,256 @@ def test_round_33_cells_take_their_programs():
                 assert key in KERNELS[arch], (arch, key)
 
 
+# Round 34: the cells that change program, (architecture, SM count, M, K, snapshot write of block K)
+# -> (kernel key or the (PDL off, PDL on) pair, grid): on sm_100a at 148 SMs (B200) the ``_clc``
+# builds of eleven dense programs and the ``_write_clc`` build of the (1024, 4) write program; on
+# sm_103a at 148 SMs (B300) sixteen ``_clc`` builds (six on three new fast-math builds); at 152 SMs
+# (GB300) nineteen dense ``_clc`` programs (the K1 (1024, 1) and (2048, 1) cells at PDL off only:
+# they keep their program at PDL on) and the ``_write_clc`` build of the (1024, 1) write programs.
+_ROUND_34_CELLS = {
+    ("sm_100a", 148, 768, 6, False): ("persistent:k6_nc4_d2_f110000000000000_clc", 768),
+    ("sm_100a", 148, 768, 7, False): (
+        "persistent:k7_nc4_d2_f110000000000000_fm_clc",
+        768,
+    ),
+    ("sm_100a", 148, 1024, 4, True): (
+        "persistent:k4_nc3_d2_f111000000000000_write_clc",
+        1024,
+    ),
+    ("sm_100a", 148, 1536, 6, False): (
+        "persistent:k6_nc4_d2_f110000000000000_clc",
+        1536,
+    ),
+    ("sm_100a", 148, 1536, 7, False): (
+        "persistent:k7_nc4_d2_f110000000000000_fm_clc",
+        1536,
+    ),
+    ("sm_100a", 148, 2048, 1, False): (
+        "persistent:k1_nc2_d2_f110000000000000_clc",
+        2048,
+    ),
+    ("sm_100a", 148, 2048, 4, False): (
+        "persistent:k4_nc3_d3_f110000000000000_clc",
+        2048,
+    ),
+    ("sm_100a", 148, 3072, 1, False): (
+        "persistent:k1_nc4_d2_f110000000000000_clc",
+        3072,
+    ),
+    ("sm_100a", 148, 3072, 2, False): (
+        "persistent:k2_nc4_d2_f110000000000000_crfnone_clc",
+        3072,
+    ),
+    ("sm_100a", 148, 3072, 3, False): (
+        "persistent:k3_nc4_d2_f010000000000000_crfnone_clc",
+        3072,
+    ),
+    ("sm_100a", 148, 3072, 4, False): (
+        "persistent:k4_nc3_d3_f110000000000000_clc",
+        3072,
+    ),
+    ("sm_100a", 148, 3072, 5, False): (
+        "persistent:k5_nc4_d3_f010000000000000_clc",
+        3072,
+    ),
+    ("sm_103a", 148, 1024, 1, False): (
+        (
+            "persistent:k1_nc4_d2_f110000000000010_fm_clc",
+            "persistent:k1_nc4_d2_f110000000100000_fm_clc",
+        ),
+        1024,
+    ),
+    ("sm_103a", 148, 1024, 6, False): (
+        "persistent:k6_nc4_d2_f111000000000000_fm_clc",
+        1024,
+    ),
+    ("sm_103a", 148, 1536, 4, False): (
+        "persistent:k4_nc5_d2_f011001000000000_fm_clc",
+        1536,
+    ),
+    ("sm_103a", 148, 1536, 7, False): (
+        "persistent:k7_nc4_d2_f110000000000000_fm_clc",
+        1536,
+    ),
+    ("sm_103a", 148, 2048, 1, False): (
+        (
+            "persistent:k1_nc4_d2_f110000000000010_fm_clc",
+            "persistent:k1_nc4_d2_f110000000100000_fm_clc",
+        ),
+        2048,
+    ),
+    ("sm_103a", 148, 2048, 3, False): (
+        "persistent:k3_nc4_d2_f011000000000000_clc",
+        2048,
+    ),
+    ("sm_103a", 148, 2048, 4, False): (
+        "persistent:k4_nc3_d3_f110000000000000_clc",
+        2048,
+    ),
+    ("sm_103a", 148, 2048, 5, False): (
+        "persistent:k5_nc4_d3_f010000000000000_clc",
+        2048,
+    ),
+    ("sm_103a", 148, 2048, 6, False): (
+        "persistent:k6_nc4_d2_f111000000000000_fm_clc",
+        2048,
+    ),
+    ("sm_103a", 148, 2048, 7, False): (
+        "persistent:k7_nc4_d2_f110000000000000_fm_clc",
+        2048,
+    ),
+    ("sm_103a", 148, 3072, 1, False): (
+        (
+            "persistent:k1_nc4_d2_f110000000000010_fm_clc",
+            "persistent:k1_nc4_d2_f110000000000000_fm_clc",
+        ),
+        3072,
+    ),
+    ("sm_103a", 148, 3072, 2, False): (
+        "persistent:k2_nc4_d2_f011010000000000_clc",
+        3072,
+    ),
+    ("sm_103a", 148, 3072, 3, False): (
+        "persistent:k3_nc4_d2_f011000000000000_clc",
+        3072,
+    ),
+    ("sm_103a", 148, 3072, 4, False): (
+        "persistent:k4_nc5_d2_f011001000000000_fm_clc",
+        3072,
+    ),
+    ("sm_103a", 148, 3072, 5, False): (
+        "persistent:k5_nc3_d3_f010000000000000_clc",
+        3072,
+    ),
+    ("sm_103a", 148, 6144, 5, False): (
+        "persistent:k5_nc3_d3_f010000000000000_clc",
+        6144,
+    ),
+    ("sm_103a", 152, 768, 7, False): ("persistent:k7_nc4_d2_f110000000000000_clc", 768),
+    ("sm_103a", 152, 768, 8, False): ("persistent:k8_nc5_d2_f110000000000000_clc", 768),
+    ("sm_103a", 152, 1024, 1, False): (
+        (
+            "persistent:k1_nc4_d2_f110000000000010_fm_clc",
+            "persistent:k1_nc4_d2_f110000000100000_fm",
+        ),
+        1024,
+    ),
+    ("sm_103a", 152, 1024, 1, True): (
+        (
+            "persistent:k1_nc4_d2_f110000000000010_write_clc",
+            "persistent:k1_nc4_d2_f110000000100000_write_clc",
+        ),
+        1024,
+    ),
+    ("sm_103a", 152, 1536, 6, False): (
+        "persistent:k6_nc4_d2_f110000000000000_clc",
+        1536,
+    ),
+    ("sm_103a", 152, 1536, 8, False): (
+        "persistent:k8_nc5_d2_f110000000000000_clc",
+        1536,
+    ),
+    ("sm_103a", 152, 2048, 1, False): (
+        (
+            "persistent:k1_nc4_d2_f110000000000010_fm_clc",
+            "persistent:k1_nc4_d2_f110000000100000_fm",
+        ),
+        2048,
+    ),
+    ("sm_103a", 152, 2048, 3, False): (
+        "persistent:k3_nc4_d2_f011000000000000_clc",
+        2048,
+    ),
+    ("sm_103a", 152, 2048, 4, False): (
+        "persistent:k4_nc3_d3_f110000000000000_clc",
+        2048,
+    ),
+    ("sm_103a", 152, 2048, 5, False): (
+        "persistent:k5_nc3_d3_f010000000000000_clc",
+        2048,
+    ),
+    ("sm_103a", 152, 2048, 6, False): (
+        "persistent:k6_nc4_d2_f110000000000000_clc",
+        2048,
+    ),
+    ("sm_103a", 152, 2048, 7, False): (
+        "persistent:k7_nc4_d2_f110000000000000_clc",
+        2048,
+    ),
+    ("sm_103a", 152, 2048, 8, False): (
+        "persistent:k8_nc5_d2_f110000000000000_clc",
+        2048,
+    ),
+    ("sm_103a", 152, 3072, 1, False): (
+        (
+            "persistent:k1_nc4_d2_f110000000000010_fm_clc",
+            "persistent:k1_nc4_d2_f110000000000000_fm_clc",
+        ),
+        3072,
+    ),
+    ("sm_103a", 152, 3072, 2, False): (
+        "persistent:k2_nc4_d2_f011010000000000_clc",
+        3072,
+    ),
+    ("sm_103a", 152, 3072, 3, False): (
+        "persistent:k3_nc4_d2_f011000000000000_clc",
+        3072,
+    ),
+    ("sm_103a", 152, 3072, 4, False): (
+        "persistent:k4_nc5_d2_f011001000000000_fm_clc",
+        3072,
+    ),
+    ("sm_103a", 152, 3072, 5, False): (
+        "persistent:k5_nc3_d3_f010000000000000_clc",
+        3072,
+    ),
+    ("sm_103a", 152, 3072, 8, False): (
+        "persistent:k8_nc5_d2_f110000000000000_clc",
+        3072,
+    ),
+    ("sm_103a", 152, 6144, 5, False): (
+        "persistent:k5_nc4_d3_f010000000000000_clc",
+        6144,
+    ),
+}
+
+
+def test_round_34_cells_take_their_programs():
+    """Round 34: each ``_ROUND_34_CELLS`` cell runs its persistent program at both PDL modes,
+    registered and without a fallback, on its grid with the persistent thread count (a ``_clc``
+    program on one CTA per token); a write cell runs the snapshot write of block K."""
+    for (arch, sm_count, M, K, write), (value, grid_x) in sorted(
+        _ROUND_34_CELLS.items()
+    ):
+        for pdl in (False, True):
+            key = _at_pdl(value, pdl)
+            plan = plan_route(
+                arch, sm_count, M, K, pdl, block_write_idx=K if write else -1
+            )
+            token_queue = key.endswith("_clc")
+            assert (plan.kind, plan.kernel_key) == ("persistent", key), (
+                arch,
+                sm_count,
+                M,
+                K,
+                write,
+                pdl,
+                plan,
+            )
+            if token_queue:
+                assert plan.grid_x == grid_x, plan
+            else:
+                assert 1 <= plan.grid_x <= sm_count, plan
+            assert plan.threads == cb.PERSISTENT_THREADS, plan
+            assert plan.fallback_from is None, plan
+            assert ("_fastmath" in plan.schedule_id) is ("_fm" in key), plan
+            assert ("_clc_token_queue" in plan.schedule_id) is token_queue, plan
+            assert plan.schedule_id.endswith("_write") is write, plan
+            assert (".write1." in plan.route_id) is write, plan
+            if MODULES:
+                assert key in KERNELS[arch], (arch, key)
+
+
 def test_a_registered_fallback_never_resolves_to_a_clc_program(monkeypatch):
     """A ``_clc`` program covers every token only on its cell's grid of ``M`` CTAs, so the
     registered-variant fallback never resolves to one: an unregistered ``_clc`` cell resolves to
@@ -1666,8 +2102,12 @@ def test_plan_route_snapshot_write_takes_the_write_variants(arch, M, K, pdl):
     max_m = cb._SMALL_M_DIRECT_MAX_M[arch].get(K)
     assert plan.fallback_from is None
     assert f".k{K}.delta1.write1.norm1.pdl{int(pdl)}." in plan.route_id
-    if (M, K) in _ROUND_33_CLC_WRITE_CELLS[arch][SM_COUNT]:
-        # Round 33: the cell runs the token-queue build of its write program, one CTA per token
+    if (M, K) in (
+        _ROUND_33_CLC_WRITE_CELLS[arch][SM_COUNT].keys()
+        | _ROUND_34_CLC_WRITE_CELLS[arch][SM_COUNT].keys()
+    ):
+        # Rounds 33 and 34: the cell runs the token-queue build of its write program, one CTA
+        # per token
         # (test_clc_cells_take_the_token_queue_programs checks it exactly).
         assert plan.schedule_id.endswith("_clc_token_queue_write"), plan
         assert plan.kernel_key.endswith("_write_clc") and plan.grid_x == M, plan
@@ -1934,7 +2374,10 @@ def test_persistent_key_is_the_complete_flag_tuple():
     b = plan_route("sm_103a", SM_COUNT, 1024, 1, False)
     for plan in (a, b):
         assert plan.kind == "persistent"
-        assert re.fullmatch(r"persistent:k1_nc\d_d\d_f[01]{15}(_fm)?", plan.kernel_key)
+        # round 34: the B300 (1024, 1) cell runs the token-queue build (``_clc``) of its program
+        assert re.fullmatch(
+            r"persistent:k1_nc\d_d\d_f[01]{15}(_fm)?(_clc)?", plan.kernel_key
+        )
     # The PDL mode only changes the launch argument and the route id.
     assert a.route_id != b.route_id
 
