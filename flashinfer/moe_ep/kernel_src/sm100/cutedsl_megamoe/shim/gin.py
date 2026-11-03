@@ -305,6 +305,35 @@ def collective_gin_preflight(
         local_error = "; ".join(
             filter(None, (local_error, "EP subgroups are unsupported."))
         )
+    backend_config = getattr(dist, "get_backend_config", None)
+    if backend_config is not None and "cpu:gloo" in str(backend_config(world)):
+        import hashlib
+        import torch
+
+        # Use the same fixed-size CPU header at EVERY boundary, including
+        # initialization and failures. Mixing compact and object protocols by
+        # phase would hang when different ranks enter different boundaries.
+        # CPU control also remains usable when a rank's CUDA binding is wrong.
+        # A mismatch takes the original detailed-report path on every rank.
+        fingerprint = hashlib.blake2b(
+            repr((phase, signature)).encode(), digest_size=16
+        ).digest()
+        words = tuple(
+            int.from_bytes(fingerprint[offset : offset + 8], "little", signed=True)
+            for offset in (0, 8)
+        )
+        rank = dist.get_rank(group=world)
+        size = dist.get_world_size(group=world)
+        header = torch.tensor(
+            (rank, *words, bool(local_error)), dtype=torch.int64, device="cpu"
+        )
+        headers = torch.empty(size * 4, dtype=torch.int64, device="cpu")
+        dist.all_gather_into_tensor(headers, header, group=world)
+        if all(
+            entry[0] == peer and tuple(entry[1:3]) == words and not entry[3]
+            for peer, entry in enumerate(headers.view(size, 4).tolist())
+        ):
+            return
     report = (dist.get_rank(group=world), phase, signature, local_error)
     reports: list[Any] = [None] * dist.get_world_size(group=world)
     dist.all_gather_object(reports, report, group=world)

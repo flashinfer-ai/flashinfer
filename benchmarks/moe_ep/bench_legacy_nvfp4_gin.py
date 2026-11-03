@@ -72,7 +72,11 @@ def make_fi(args, tokens, *, prepare=False):
     hidden, intermediate, experts = (
         (7168, 1536, 48) if args.mode == "on" else (2048, 1024, 8)
     )
-    config = dict(intermediate_size=intermediate, top_k=4)
+    config = dict(
+        intermediate_size=intermediate,
+        top_k=4,
+        kernel_name="sm100_nvfp4_nvfp4_bf16_cutedsl",
+    )
     if args.mode == "on":
         config.update(internode=True, ranks_per_node=2)
     bootstrap = BootstrapConfig(
@@ -141,6 +145,10 @@ def make_fi(args, tokens, *, prepare=False):
         weights=weights,
         backend=backend,
     )
+    backend_class = type(layer._kernel).__module__ + "." + type(layer._kernel).__name__
+    assert backend_class.endswith(
+        ".nvfp4_nvfp4_bf16_cutedsl.backend.Nvfp4CutedslMegaKernelBackend"
+    ), f"Expected legacy backend, got {backend_class}"
     first = layer.forward(inputs)
     torch.cuda.synchronize()
     workspace = layer._workspace
@@ -203,6 +211,7 @@ def make_fi(args, tokens, *, prepare=False):
         payload=payload,
         close=layer.destroy,
         settings=dict(
+            backend=backend_class,
             config=repr(fe.config),
             kernel=fe._mega.kernel.name(),
             source=str(__import__("flashinfer").__file__),
@@ -214,6 +223,8 @@ def make_donor(args, tokens):
     # Do not import FlashInfer here: its top-level raw source aliases would
     # contaminate the fixed donor's common/src namespace.
     from pre_unification.moe_nvfp4_swapab import mega_runner as runner
+
+    assert "/pre_unification/moe_nvfp4_swapab/" in str(Path(runner.__file__).resolve())
 
     rank, world = dist.get_rank(), dist.get_world_size()
     fixture = torch.load(
@@ -316,7 +327,13 @@ def make_donor(args, tokens):
         expected=fixture["expected"],
         payload=payload,
         close=tester.close,
-        settings=dict(kernel=tester._kernel.name(), source=runner.__file__),
+        settings=dict(
+            kernel=tester._kernel.name(),
+            source=runner.__file__,
+            backend=type(tester._kernel).__module__
+            + "."
+            + type(tester._kernel).__name__,
+        ),
     )
 
 

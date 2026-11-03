@@ -586,10 +586,6 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
     ) -> tuple:
         kcfg = self._kernel_config
         fe = workspace._frontend
-        if fe.config.internode:
-            inputs = self._mega_inputs(workspace, transformed_weights)
-            thunk = fe.make_launch_thunk(inputs)
-            return (None, thunk, workspace.output_activation)
         fe.set_swiglu_params(kcfg.swiglu_alpha, kcfg.swiglu_beta)
         clamp = _resolve_gate_up_clamp(kcfg)
         if clamp is not None:

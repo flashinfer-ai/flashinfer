@@ -185,6 +185,46 @@ def test_nvfp4_gin_public_rank_local_errors():
             layer.destroy()
 
 
+def test_nvfp4_gin_public_rank_local_errors_control_headers(monkeypatch):
+    bootstrap = _bootstrap()
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.gin import (
+        GinPreflightError,
+        collective_gin_preflight,
+    )
+
+    object_reports = []
+    original = dist.all_gather_object
+
+    def detailed_report(*args, **kwargs):
+        object_reports.append(True)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(dist, "all_gather_object", detailed_report)
+    collective_gin_preflight(dist, phase="ready", signature=(32,), local_error=None)
+    assert not object_reports
+    for kind in ("phase", "configuration", "error", "subgroup"):
+        different = bootstrap.rank == 1
+        before = len(object_reports)
+        with pytest.raises(GinPreflightError, match="GIN"):
+            collective_gin_preflight(
+                dist,
+                phase="different-boundary"
+                if different and kind == "phase"
+                else "ready",
+                signature=(64 if different and kind == "configuration" else 32,),
+                local_error="rank-local rejection"
+                if different and kind == "error"
+                else None,
+                requested_group=object() if different and kind == "subgroup" else None,
+            )
+        assert len(object_reports) == before + 1
+        # Rejection must leave the common control sequence usable by all ranks.
+        collective_gin_preflight(
+            dist, phase="recovered", signature=(32,), local_error=None
+        )
+        assert len(object_reports) == before + 1
+
+
 def test_nvfp4_gin_public_sessions_and_recreation():
     bootstrap = _bootstrap()
     layers = [_layer(bootstrap), _layer(bootstrap)]

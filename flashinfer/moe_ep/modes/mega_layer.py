@@ -566,6 +566,7 @@ class MoEEpMegaLayer(nn.Module):
         *,
         workspace: MoEEpMegaWorkspace | None = None,
         compile_tokens_per_rank: int | None = None,
+        _validated_kernel: MegaKernelBackend | None = None,
     ) -> tuple[FleetParams, Any, MegaKernelBackend, bool, Any]:
         if (
             compile_tokens_per_rank is not None
@@ -590,7 +591,10 @@ class MoEEpMegaLayer(nn.Module):
                 kernel = self._default_workspace_handle._kernel
         else:
             fleet_params, backend_workspace, kernel = self._resolve_workspace(workspace)
-        if kernel.requires_collective_forward_validation:
+        if (
+            kernel.requires_collective_forward_validation
+            and kernel is not _validated_kernel
+        ):
             kernel.validate_forward(
                 t, fleet_params, quantize_input=self._mega_config.quantize_input
             )
@@ -771,7 +775,18 @@ class MoEEpMegaLayer(nn.Module):
             kernel,
             quantize_input,
             transformed_weights,
-        ) = self._prepare_inputs(t, workspace=workspace)
+        ) = self._prepare_inputs(
+            t,
+            workspace=workspace,
+            # forward() has already agreed on this call's input errors. An
+            # explicit workspace may resolve to another backend; that backend
+            # must still validate before the core's rank-local checks.
+            _validated_kernel=(
+                self._kernel
+                if self._kernel.requires_collective_forward_validation
+                else None
+            ),
+        )
         output = t.output
         if output is None and not return_workspace_view:
             # Owned-output allocation must stay ahead of the staging round

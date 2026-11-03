@@ -172,3 +172,122 @@ No performance conclusion is justified.
 - R2: [checkpoint-02.md](checkpoint-02.md), final Markdown evidence checkpoint.
   Fixed-scope migration is complete; upstreaming the local race correction
   and qualifying additional modes/topologies are separate follow-up work.
+
+## Performance regression follow-up (2026-11-02)
+
+Task: fix the measured Blackwell regression before further migration work.
+User constraint: use the fixed legacy cutedsl_megamoe baseline, never next.
+Keep the existing ordered/numeric/control/lifetime qualification; do not buy
+latency by removing rank-local error agreement or weakening support checks.
+Completion requires paired Blackwell measurements against legacy, preserved
+correctness, and explicit disposition of the noisy off cases. The earlier
+measurement report and raw samples remain immutable historical evidence.
+
+- **O18, measured previously:** GB300 jobs 3577461/3577696 off and 3577625 on
+  produced the complete 56-group matrix in performance-blackwell.md. Off has
+  10 passes, 2 pipeline regressions and 12 inconclusive baseline-noise cases.
+  On warm raw pipeline is 315.76→375.26 us; independent fused profile is
+  244.610→310.243 us. These are separate scopes, not a causal attribution.
+- **O19, measured previously:** On full call is 380.63→6876.83 us. Native donor
+  adapter and FI public API include different host checks. This factor is not
+  an isolated device-kernel slowdown.
+- **O20, source audited:** Benchmark donor imports the fixed commit f863d754
+  pre_unification/moe_nvfp4_swapab runner. FI config defaults to the explicit
+  legacy registry key sm100_nvfp4_nvfp4_bf16_cutedsl, mapped to
+  nvfp4_nvfp4_bf16_cutedsl.backend.Nvfp4CutedslMegaKernelBackend. No next
+  provider is selected. Subsequent runs will assert and record these paths.
+- **O21, source fact:** Public forward invokes collective validate_forward
+  before _prepare_inputs, which invokes it again. Staging revalidates and
+  agrees; internode _prepared_thunk_state unconditionally rebuilds its thunk;
+  make_launch_thunk agrees after preparation and before every launch.
+  collective_gin_preflight uses all_gather_object on the default PG. Counts
+  and contribution to O19 have not yet been measured.
+
+| Hypothesis | O18 pipeline/fused | O19 full-call | O20 baseline | O21 source |
+| --- | --- | --- | --- | --- |
+| PH1 redundant collective/preparation work dominates full-call overhead | Undetermined; cannot explain raw compiled call directly | Candidate, predicts high measured preflight/prepare share | Consistent | Consistent, execution contribution unmeasured |
+| PH2 retained FI device features or layout/codegen differences slow the fused kernel | Candidate, requires matched-device intervention | Could explain only the device fraction | Consistent | Outside this mechanism |
+| PH3 cross-rank timing/launch ordering or node noise affects pipeline ratios | Candidate; EP4 baseline noise is measured | Undetermined | Consistent | Undetermined |
+
+**PT1, planned before execution:** on one exclusive N2R2 GB300 allocation,
+reuse the validated fixture, assert legacy module/config paths, measure full
+call/preflight/prepare counts, and separately capture raw kernels. Compare
+unchanged object agreement with CPU-control transport and compact fixed-size
+agreement as diagnostic interventions. Checks/errors remain enabled; these
+are mechanism probes, not production claims. A drop in full-call time with
+unchanged raw timing supports PH1; it cannot establish PH2. No configuration
+tuning is selected at this stage.
+
+Knowledge lookup: Glean searched the concrete PyTorch all_gather_object/Gloo
+and CuTe DSL host-latency context. Original NVIDIA CUTLASS host-latency guide
+was retrieved through nvidiadocs:
+https://docs.nvidia.com/cutlass/latest/media/docs/operators/tutorials/003_host_latency_best_practices.html.
+Its compile-once and argument-wrapper guidance motivates checking preparation
+reuse. It describes CUTLASS Operator API, not this DSL 4.6.2 legacy runner;
+its example speedups are not applicable measurements for this investigation.
+
+- **O22, measured/PT1 completed:** job 3577851, theia0095/theia0201, 20 warm
+  diagnostic samples, bitwise pass. Original public full 6978.907 us; CPU
+  object agreement 5565.586 us; compact CPU agreement 3317.156 us. There are
+  five preflights/call (backend-forward twice), rank-0 medians 1104–1251 us,
+  and 214 us kwargs reconstruction. PH1 is supported for the full-call scope
+  by the controlled transport intervention. PH1 does not explain raw pipeline.
+  Raw donor/FI medians remain 304.480/334.672 us (+9.9%), preserving PH2/PH3.
+- R3: [checkpoint-03.md](checkpoint-03.md), Markdown intermediate report.
+- **PT2, launched 3577867:** pristine receiver c597d35ba isolated in
+  flashinfer-nvfp4-gin-before-perf, fixed native legacy donor, record actual
+  compile settings and PTX/cubins, and compare compact CUDA agreement with
+  the already measured compact CPU intervention. No next baseline/provider.
+  Its outcome determines the control transport; device code is still unchanged.
+
+- PT2 job 3577867 failed in the diagnostic compiler-output extractor before
+  timing: this DSL returns PTX text, whereas the extractor assumed a filename.
+  No timing is accepted. The correction saves text/bytes directly and isolates
+  dump directories per rank. Replacement 3577883 also runs real negative
+  preflight/session/capture tests against the host optimization.
+- **PH4, candidate:** additional optional GIN parameters on the non-GIN JIT
+  entry point add host marshalling/launch-envelope overhead. Donor already
+  uses launch_without_gin for its off entry, but FI compiles __call__ directly.
+  This could affect the small-T off raw span without changing fused duration;
+  it cannot explain the on fused difference. **PT3, planned:** original versus
+  existing lean non-GIN entry on pristine FI c597d35ba, EP1/EP2, T64/T1024,
+  two alternating diagnostic rounds, unchanged internal kernel and existing
+  exact output fixture. No production device edit or next provider involved.
+
+- **O23, measured/PT2 replacement completed:** 3577883 on theia0090/theia0201
+  reproduces a counterexample with unchanged device code: raw medians donor
+  359.728 us versus pristine FI 316.848 us; separate fused medians
+  291.775 versus 287.107 us. Both compile with 152 active clusters. Compiler
+  outputs have near-identical instruction counts; this does not establish
+  identical machine code or a GPU root cause. The compact-CUDA host probe
+  reaches 1872.808 us but adds CUDA binding requirements, so the production
+  candidate uses CPU headers when the existing default PG supplies Gloo.
+  The CUDA-versus-CPU numbers come from different allocations and are not a
+  paired transport ranking. PH2 is not established as an unconditional device
+  slowdown; PH3 remains candidate. O18 is retained, not discarded.
+- **O24, measured:** the same job runs the production host candidate's five
+  control tests on all four ranks: per-rank errors, compact-header phase/config/
+  subgroup errors and recovery, two live sessions/recreation, capture rejection,
+  and prequantized parity. All pass. Host contracts: 16 passed; changed-file
+  pre-commit including mypy/Ruff passes. Full oracle requalification is pending.
+- Production candidate caches the existing session-bound thunk (its per-launch
+  session/capture agreement is retained), removes the duplicate same-call
+  forward validation only for the identical backend object, and exchanges
+  a fixed CPU error/configuration header before falling back to full reports
+  on any mismatch. All boundaries use that header protocol, so phase mismatch
+  cannot mix compact and object wire formats. NCCL-only default PGs retain
+  the original object protocol. No kernel/tuning change is included.
+- **PT4, planned:** keep legacy donor, pristine FI and optimized FI resident
+  in independent processes/contexts on the same GPUs, with strictly serialized
+  source turns and five alternating rounds. Primary protocol retains five
+  warmups/20 calls and separate cold/warm measurements. Secondary 200-raw-call
+  conditioning is reported separately to test state sensitivity. Profiles
+  run only after ALL primary samples. Record every rank; require exact output
+  checks, stable baseline dispersion for any 5% no-regression claim, and the
+  complete public/strong-oracle correctness suite. No next provider is allowed.
+
+Source S2: the public PyTorch distributed source documents get_backend_config
+and warns about object-collective overhead:
+https://github.com/pytorch/pytorch/blob/main/docs/source/distributed.md.
+This supports API selection only; installed-container execution O24 is the
+compatibility evidence. No documentation example timing is used as a baseline.
