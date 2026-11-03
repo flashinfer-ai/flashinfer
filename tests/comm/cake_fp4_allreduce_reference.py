@@ -237,13 +237,14 @@ def row_scales(amax: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 def encode_rows(
-    values: torch.Tensor, inv: torch.Tensor
+    values: torch.Tensor, inv: torch.Tensor, *, canonical: bool = True
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Float32 rows ``[R, 6144]`` with the row scales ``inv`` ``[R]`` -> (values ``[R, 3072]`` u8, scales ``[R, 384]`` u8).
 
     Per block of 16: ``sf = e4m3(div_rn(mul_rn(blockmax, inv), 6))``,
     ``m = sf > 0 ? div_rn(inv, sf) : 0``, ``q = e2m1(mul_rn(x, m))`` with ``-0``
-    canonicalised to ``+0``.
+    canonicalised to ``+0``; ``canonical=False`` keeps the ``-0`` codes that
+    ``cvt.rn.satfinite.e2m1x2.f32`` emits for small negative values.
     """
     rows = values.shape[0]
     blocks = values.reshape(rows, BLOCKS_PER_ROW, BLOCK)
@@ -254,7 +255,9 @@ def encode_rows(
     sff = e4m3_to_f32(sf)
     m = torch.where(sff > 0, f32_div_rn(inv_b, sff), torch.zeros_like(sff))
     g = f32_mul_rn(blocks, m.reshape(rows, BLOCKS_PER_ROW, 1).expand_as(blocks))
-    codes = canon_neg0(e2m1_rn_satfinite(g))
+    codes = e2m1_rn_satfinite(g)
+    if canonical:
+        codes = canon_neg0(codes)
     return pack_e2m1(codes.reshape(rows, HIDDEN)), sf
 
 
@@ -292,12 +295,16 @@ def global_scale(x: torch.Tensor) -> torch.Tensor:
 
 
 def encode_records(x: torch.Tensor, gs: torch.Tensor) -> torch.Tensor:
-    """The pre-quantised input records ``[R, 3456]`` u8 of ``x`` under the static scale ``gs``: ``inv = div_rn(1, gs)`` for every row."""
+    """The pre-quantised input records ``[R, 3456]`` u8 of ``x`` under the static scale ``gs``: ``inv = div_rn(1, gs)`` for every row.
+
+    The records keep the E2M1 ``-0`` codes a producer's quantiser emits; the
+    kernels canonicalise them on the wire, where ``-0`` is the sentinel.
+    """
     f = x.to(torch.float32)
     rows = f.shape[0]
     one = torch.ones((rows,), dtype=torch.float32, device=f.device)
     inv = f32_div_rn(one, gs.to(torch.float32).reshape(-1)[:1].expand(rows))
-    q, sf = encode_rows(f, inv)
+    q, sf = encode_rows(f, inv, canonical=False)
     return torch.cat((q, sf), dim=1).contiguous()
 
 
