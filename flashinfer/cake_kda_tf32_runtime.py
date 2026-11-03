@@ -102,7 +102,7 @@ def _build_kda_module(factory, *args, **kwargs):
 # windows reuse the same variable-shape direct-M128 identity. Remaining regions
 # retain the source-derived compatibility fallback.
 import heapq
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import cache
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -7280,6 +7280,12 @@ class _RebindView:
     shape: tuple[int, ...]
     stride: tuple[int, ...]
     dtype: Any
+    # Keys of the same container bound to the same tensor object as ``key``
+    # (``q`` / ``q_tma``, an in-place pool's ``initial_state_f32`` /
+    # ``final_state_f32``): re-pointed with ``key``'s view.
+    aliases: tuple = ()
+    # ``key`` or an alias is a TMA descriptor source (``*_tma``).
+    described: bool = False
 
 
 @dataclass(frozen=True)
@@ -7358,6 +7364,11 @@ AFFINE_REBIND_ATTRIBUTES = (
 # checkpoint buffer (``rows_tma``).  When a plan-cache rebind moves one of
 # them the composite must re-encode those descriptors before its next launch.
 APPLY_ROUTE_DESCRIPTOR_ATTRIBUTES = ("_out_tail", "_checkpoint_output")
+
+
+def _rebind_argument_container(container_name: str) -> bool:
+    """A launch's argument dict (``args`` / ``prepare_args``, of a part too)."""
+    return container_name.rsplit(".", 1)[-1] in ("args", "prepare_args")
 
 
 def _rebind_owner(impl, container_name: str):
@@ -7447,11 +7458,26 @@ def capture_rebind_plan(impl, inputs: dict) -> RebindPlan:
 
     views: list[_RebindView] = []
     addresses: list[_RebindAddress] = []
+    # (container, id of the bound tensor) -> index of its view spec; the
+    # container's argument dict holds every value, so ids stay unique here.
+    primaries: dict[tuple[str, int], int] = {}
     for container_name, container in _rebind_containers(impl).items():
         for key, value in container.items():
             if isinstance(value, torch.Tensor):
                 hit = classify(value)
                 if hit is not None:
+                    described = isinstance(key, str) and key.endswith("_tma")
+                    primary = primaries.get((container_name, id(value)))
+                    if primary is not None:
+                        spec = views[primary]
+                        views[primary] = replace(
+                            spec,
+                            aliases=spec.aliases + (key,),
+                            described=spec.described or described,
+                        )
+                        continue
+                    if _rebind_argument_container(container_name):
+                        primaries[(container_name, id(value))] = len(views)
                     views.append(
                         _RebindView(
                             container_name,
@@ -7461,6 +7487,7 @@ def capture_rebind_plan(impl, inputs: dict) -> RebindPlan:
                             tuple(value.shape),
                             tuple(value.stride()),
                             value.dtype,
+                            described=described,
                         )
                     )
             elif (
@@ -7576,11 +7603,7 @@ def rebind_prepared_launch(
             sub._keepalive = owned + new_inputs
     if later_views or later_addresses or deferred_owned:
         for spec in later_views:
-            if (
-                isinstance(spec.key, str)
-                and spec.key.endswith("_tma")
-                and (changed is None or spec.input_name in changed)
-            ):
+            if spec.described and (changed is None or spec.input_name in changed):
                 tma_moved = True
         impl._deferred_rebind = (
             tuple(later_views),
@@ -7664,7 +7687,7 @@ def _apply_rebind_specs(
         touched.add(spec.container)
         container = containers[spec.container]
         replacement = view_for(spec)
-        if isinstance(spec.key, str) and spec.key.endswith("_tma"):
+        if spec.described:
             # With ``changed`` the moved inputs are known; otherwise compare
             # the recorded pointer with the previous binding.
             moved = (
@@ -7695,6 +7718,8 @@ def _apply_rebind_specs(
                     tma_moved = True
                     impl._apply_descriptors_stale = True
         container[spec.key] = replacement
+        for alias in spec.aliases:
+            container[alias] = replacement
     for address in address_specs:
         touched.add(address.container)
         containers[address.container][address.key] = (
