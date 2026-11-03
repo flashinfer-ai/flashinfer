@@ -541,7 +541,7 @@ def test_two_kernel_matches_monolithic(tmp_path, request):
             dt1_proc[slot],
         )
 
-    def _run(k, *, algorithm=None, enable_pdl=False):
+    def _run(k, *, algorithm=None, enable_pdl=False, strided_trackers=False):
         torch.manual_seed(k + 100)
         x2 = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
         dt2 = repeat(
@@ -558,13 +558,17 @@ def test_two_kernel_matches_monolithic(tmp_path, request):
         if algorithm is not None:
             kw.update(_two_kernel_scratch(batch, nheads, T, max_window, dtype, device))
             kw["algorithm"] = algorithm
+        rs = ring_start.clone()
+        pnat = torch.full((cache_size,), k, device=device, dtype=torch.int32)
+        if strided_trackers:
+            rs, pnat = _strided_column(rs), _strided_column(pnat)
         checkpointing_ssu(
             st,
             xc,
             bc,
             dtc,
-            ring_start.clone(),
-            torch.full((cache_size,), k, device=device, dtype=torch.int32),
+            rs,
+            pnat,
             x=x2,
             dt=dt2,
             A=A,
@@ -603,7 +607,9 @@ def test_two_kernel_matches_monolithic(tmp_path, request):
     request.addfinalizer(tuner.clear_cache)
     cache_path = tmp_path / "checkpointing_ssu_autotune.json"
     with autotune(True, cache=str(cache_path)):
-        tuned = _run(2, algorithm="auto")
+        # Tune with strided trackers; the contiguous warm call reuses the tactic
+        # (the cache key ignores strides), so the two must match bit-for-bit.
+        tuned = _run(2, algorithm="auto", strided_trackers=True)
         warm = _run(2, algorithm="auto")
 
     profiled_configs = {
@@ -5346,6 +5352,23 @@ def _pad_outer(t, pad):
     return full.narrow(1, 0, shape[1])
 
 
+def _strided_column(t, stride=3):
+    """Return a 1-D view of `t` with stride `stride` (>= 3): column 0 of a
+    (len(t), stride) buffer, as for trackers stored inside a larger per-slot
+    page.  Columns 1 and 2 hold `t` rolled by 1 and -1, so a kernel that
+    ignores the stride reads wrong but in-range values for the other slots.
+    The remaining columns are left uninitialized."""
+    full = torch.empty(t.numel(), stride, device=t.device, dtype=t.dtype)
+    full[:, 0] = t
+    full[:, 1] = t.roll(1)
+    full[:, 2] = t.roll(-1)
+    return full[:, 0]
+
+
+# Slot 3 * stride > 2**31: an int32 tracker index computation overflows.
+_LARGE_TRACKER_STRIDE = 3 * 2**28
+
+
 def _pad_inner(t, pad, dim):
     """Pad `t` along axis `dim` by `pad` rows, slice back to original.
     Result has stride(dim-1) > size(dim) * stride(dim)."""
@@ -5365,11 +5388,20 @@ def _pad_inner(t, pad, dim):
     ],
 )
 @pytest.mark.parametrize("varlen", [False, True], ids=["non_varlen", "varlen"])
-def test_checkpointing_ssu_noncontig(state_dtype, varlen):
+@pytest.mark.parametrize("two_kernel", [False, True], ids=["mono", "two_kernel"])
+@pytest.mark.parametrize(
+    "tracker_stride",
+    [3, _LARGE_TRACKER_STRIDE],
+    ids=["tracker_stride3", "tracker_stride_gt_int32"],
+)
+def test_checkpointing_ssu_noncontig(state_dtype, varlen, two_kernel, tracker_stride):
     """Run the kernel on tensors with non-default (padded) strides and
     compare to a contiguous-clone reference.  Exercises stride plumbing
-    for x / dt / B / C / z / out / x_cache / B_cache / dt_cache.
+    for x / dt / B / C / z / out / x_cache / B_cache / dt_cache and the
+    ring_start / prev_num_accepted trackers.
     """
+    if two_kernel and state_dtype == torch.int8:
+        pytest.skip("8-bit state is monolith-only")
     device = "cuda"
     nheads, head_dim, d_state, ngroups = 16, 64, 128, 1
     dtype = torch.bfloat16
@@ -5388,6 +5420,10 @@ def test_checkpointing_ssu_noncontig(state_dtype, varlen):
         cu_seqlens = None
     cache_size = batch
     total_tokens = sum(seq_lens)
+    # Two (cache_size, tracker_stride) int32 tracker buffers (24 GiB when large).
+    tracker_bytes = 2 * cache_size * tracker_stride * 4
+    if torch.cuda.mem_get_info()[0] < tracker_bytes + (4 << 30):
+        pytest.skip(f"needs {tracker_bytes / 2**30:.0f} GiB free for tracker buffers")
 
     is_quantized = state_dtype in (torch.int8, torch.float8_e4m3fn)
     quant_max = 127.0 if state_dtype == torch.int8 else 448.0
@@ -5492,6 +5528,11 @@ def test_checkpointing_ssu_noncontig(state_dtype, varlen):
         cu_seqlens=cu_seqlens,
         max_seqlen=npredicted if varlen else None,
         **common_static,
+        **(
+            _two_kernel_scratch(batch, nheads, npredicted, max_window, dtype, device)
+            if two_kernel
+            else {}
+        ),
     )
 
     # ── Run 2: same data via non-contiguous tensors ──
@@ -5539,14 +5580,16 @@ def test_checkpointing_ssu_noncontig(state_dtype, varlen):
     # Cache writes: the _nc views alias the padded storage so written rows
     # persist there.  Compare via .contiguous() at the end.  (The views
     # already hold the contig data — _pad_inner copies it.)
-    pt_test = prev_tokens.clone()
+    ring_start_nc = _strided_column(ring_start, tracker_stride)
+    pt_test = _strided_column(prev_tokens, tracker_stride)
+    assert ring_start_nc.stride(0) == pt_test.stride(0) == tracker_stride
 
     checkpointing_ssu(
         state_test,
         x_cache_nc,
         B_cache_nc,
         dt_cache_nc,
-        ring_start.clone(),
+        ring_start_nc,
         pt_test,
         x=x_nc,
         dt=dt_nc,
@@ -5558,6 +5601,11 @@ def test_checkpointing_ssu_noncontig(state_dtype, varlen):
         cu_seqlens=cu_seqlens,
         max_seqlen=npredicted if varlen else None,
         **common_static,
+        **(
+            _two_kernel_scratch(batch, nheads, npredicted, max_window, dtype, device)
+            if two_kernel
+            else {}
+        ),
     )
 
     # ── Compare ──

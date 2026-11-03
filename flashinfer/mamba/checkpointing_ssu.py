@@ -797,8 +797,11 @@ def checkpointing_ssu(
     ring_start : torch.Tensor
         Ring head per slot (oldest live row), shape (state_cache_size,), int32.
         The HOST owns bookkeeping: advance by the replayed count on flush.
+        May be a strided 1-D view (stride(0) in [1, 2^31)), e.g. a per-slot field
+        inside a larger cache page.  Only read by the kernels.
     prev_num_accepted_tokens : torch.Tensor
         Number of old tokens to replay, shape (state_cache_size,), int32.
+        May be a strided 1-D view, like ``ring_start``.  Only read by the kernels.
     x : torch.Tensor
         New token inputs, shape (batch, T, nheads, dim).
     dt : torch.Tensor

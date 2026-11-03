@@ -1002,8 +1002,8 @@ __global__ __maxnreg__(main_maxnreg(NUM_STAGES)) void checkpointing_ssu_main_ker
       int64_t const raw_slot = sbi ? static_cast<int64_t>(sbi[seq]) : seq;
       if (raw_slot != params.pad_slot_id) {
         cache_slot = static_cast<int32_t>(raw_slot);  // cache slots ≪ 2^31
-        pnat = prev_ptr[raw_slot];
-        ring_start = __ldg(rsp + raw_slot);
+        pnat = prev_ptr[tracker_offset(raw_slot, params.prev_num_accepted_stride)];
+        ring_start = __ldg(rsp + tracker_offset(raw_slot, params.ring_start_stride));
       }
       D_val = D_ptr ? toFloat(D_ptr[work_unit % NHEADS]) : 0.f;
       A_val = toFloat(A_ptr[work_unit % NHEADS]);

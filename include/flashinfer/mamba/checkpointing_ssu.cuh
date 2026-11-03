@@ -162,6 +162,15 @@ struct CheckpointingSsuParams {
   // (the write path folds old tokens into state via the replay instead), and
   // the main does OUT.3 = cb_old @ old_x.  Caller-provided when two-kernel.
   void* __restrict__ cb_old{nullptr};  // bf16 (batch, nheads, 32, 8), fragA-native
+
+  // Element strides of ring_start / prev_num_accepted along the slot dim
+  // (1 = contiguous; larger when the trackers live inside a per-slot cache
+  // page).  Host-checked to fit in int32; kernels index with tracker_offset().
+  // Stored as int64 on purpose: with int32 fields the small-batch monolithic
+  // kernel measured ~5% slower on B200 (different prologue scheduling).
+  // Appended last, like the scratch above, so earlier fields keep their offsets.
+  int64_t ring_start_stride{1};
+  int64_t prev_num_accepted_stride{1};
 };
 
 }  // namespace flashinfer::mamba::checkpointing
