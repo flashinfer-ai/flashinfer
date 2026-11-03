@@ -48,10 +48,14 @@ import torch
 
 from tests.test_helpers.cake_kda_det_train_reference import (
     GRAD_NAMES,
+    LOWER_BOUND,
+    RAW_GRAD_NAMES,
     elementwise_gate,
     error_metrics,
+    kda_exact_raw_with_grads,
     kda_exact_with_grads,
     make_inputs,
+    make_raw_inputs,
 )
 from tests.test_helpers.cake_package import cake_package
 
@@ -1374,6 +1378,123 @@ def test_records_of_stage_filters_the_gate_stages_by_class() -> None:
     assert cake_jit.records_of_stage("gate_epilogue", "raw") == ()
     with pytest.raises(ValueError, match="gate 'activated' is not one of"):
         cake_jit.records_of_stage("dqkg", "activated")
+
+
+def test_raw_plans_are_the_deterministic_raw_plans() -> None:
+    """``plan(..., gate="raw")`` is the deterministic package's raw plan of the problem: the same geometry and route,
+    on every path the same record per stage (the fused gradient's: the ``RAW_DQKG`` copy of the deterministic
+    record, never an S1 record) with the same launches and grids, no gate epilogue and the parameter finalize once
+    per backward path (one CTA per head and segment of 128 chunks); a separate cache entry from the g-mode plan of
+    the problem, whose records it shares on every stage outside ``GATE_STAGES``; the checkpoint hand-off never
+    engages on it, in any mode; the raw mode's byte queries (the workspace, the outputs, the memory report outside
+    the hand-off's fields) are the deterministic package's; an unknown gate mode is a ``ValueError``."""
+    rows = list(SHAPES) + [
+        ((2000,) * 3, 64),
+        ((129, 300), 16),
+        ((63, 1, 65), 16),
+        ((129,), 128),
+    ]
+    for lengths, heads in rows:
+        S, N = sum(lengths), len(lengths)
+        for sm in (148, 160, 212):
+            for arch in ARCHES:
+                where = (lengths, heads, sm, arch)
+                pg = cake_backend.plan(S, N, heads, sm, arch)
+                pr = cake_backend.plan(S, N, heads, sm, arch, gate="raw")
+                dr = det_backend.plan(S, N, heads, sm, arch, gate="raw")
+                assert (pg.gate, pr.gate, dr.gate) == ("g", "raw", "raw"), where
+                assert pr is not pg, where
+                assert cake_backend.plan(S, N, heads, sm, arch, gate="raw") is pr
+                assert cake_backend.plan(S, N, heads, sm, arch, gate="g") is pg
+                assert pr.gate_fused is True and dr.gate_fused is True, where
+                for field in (
+                    "S",
+                    "N",
+                    "H",
+                    "sm_count",
+                    "arch",
+                    "NC_max",
+                    "NC_pad",
+                    "R",
+                    "recur",
+                    "P",
+                    "NSEG",
+                    "proportional",
+                    "seg_arg",
+                    "gsize",
+                ):
+                    assert getattr(pr, field) == getattr(dr, field), (where, field)
+                    assert getattr(pr, field) == getattr(pg, field), (where, field)
+                assert set(pr.records) == set(dr.records) == set(pg.records), where
+                for path, by_stage in pr.records.items():
+                    at = (*where, path)
+                    mapped = {
+                        stage: RAW_DQKG.get(name, name)
+                        for stage, name in by_stage.items()
+                    }
+                    assert mapped == dr.records[path], at
+                    assert not set(by_stage.values()) & S1_RECORDS, at
+                    for stage, name in by_stage.items():
+                        if name is None:
+                            continue
+                        if stage == "dqkg":
+                            assert name in RAW_DQKG, at
+                        if stage not in GATE_STAGES:
+                            assert name == pg.records[path][stage], (*at, stage)
+                        assert pr.launches(stage, path) == dr.launches(stage, path)
+                        for i in range(pr.launches(stage, path)):
+                            assert pr.grid(stage, path, i) == dr.grid(stage, path, i), (
+                                *at,
+                                stage,
+                                i,
+                            )
+                    backward = path not in ("fwd", "fwd_nosave")
+                    assert pr.dispatched("param_finalize", path) is backward, at
+                    assert not pr.dispatched("gate_epilogue", path), at
+                    assert not pg.dispatched("param_finalize", path), at
+                    if backward:
+                        assert pr.grid("param_finalize", path) == (
+                            heads,
+                            max(1, -(-pr.NC_pad // 128)),
+                            1,
+                        ), at
+                        assert pr.launches("param_finalize", path) == 1, at
+                    for tables in (True, False):
+                        assert pr.launch_count(path, tables=tables) == (
+                            dr.launch_count(path, tables=tables)
+                        ), (*at, tables)
+                for mode in ("on", "auto", "off"):
+                    assert not cake_backend._handoff_engages(pr, mode, 0), (where, mode)
+                for mode in cake_backend.MODES:
+                    assert pr.workspace_bytes(mode) == dr.workspace_bytes(mode), (
+                        where,
+                        mode,
+                    )
+        q = {"sm_count": 148, "arch": "sm_100a"}
+        for backward, save_mode in itertools.product((True, False), ("light", "tape")):
+            assert cake_backend.workspace_bytes(
+                S, N, heads, backward=backward, save_mode=save_mode, gate="raw", **q
+            ) == det_backend.workspace_bytes(
+                S, N, heads, backward=backward, save_mode=save_mode, gate="raw", **q
+            ), (lengths, heads, backward, save_mode)
+        for backward in (True, False):
+            assert cake_backend.output_bytes(
+                S, heads, backward=backward, gate="raw"
+            ) == det_backend.output_bytes(S, heads, backward=backward, gate="raw")
+        for save_mode in ("light", "tape"):
+            nd = cake_backend.memory_report(S, N, heads, save_mode, gate="raw", **q)
+            det = det_backend.memory_report(S, N, heads, save_mode, gate="raw", **q)
+            assert {key: nd[key] for key in det} == det, (lengths, heads, save_mode)
+            assert nd["bwd_partials"] > 0 and nd["gate"] == "raw"
+            assert nd["handoff_bytes"] == nd["handoff_budget_bytes"] == 0
+            assert nd["handoff_bytes_rows"] is None
+    for gate in ("G", None, "activated"):
+        with pytest.raises(ValueError, match="gate must be one of"):
+            cake_backend.plan(129, 1, 4, 148, "sm_100a", gate=gate)
+        with pytest.raises(ValueError, match="gate must be one of"):
+            cake_backend.memory_report(
+                129, 1, 4, sm_count=148, arch="sm_100a", gate=gate
+            )
 
 
 def test_every_stage_selects_the_expected_record_and_grid() -> None:
@@ -3711,6 +3832,7 @@ def _expected_launches(
     saved_tables: bool = True,
     tail_passes: int = 1,
     tape_wy: str | None = None,
+    finalize: bool = True,
 ) -> list[str]:
     """The launch order of ``path`` on plan ``p`` (the records by name), spelled from the composition's rules:
     the tables (on the forward and the replay where the plan dispatches a table program; on a saved-set path only
@@ -3719,10 +3841,12 @@ def _expected_launches(
     the replay: before the prep where it writes the tables), WY where
     a fused program does not form the representation, the recurrence (the segmented passes around the carry),
     dA / dv where the fused gradient does not host it, the adjoint recurrence, the fused gradient, GLM intra and,
-    on sm_107a, the gate epilogue (the tail stages once per chunk range of a lean workspace's ``tail_passes``).
-    The carry record is the row's: the overlap pair's on the forward's overlap rows, the two-level carry where its
-    rule accepts, else the chain carry.  ``tape_wy``: the record the tape backward launches for WY in place of the
-    plan's (the tape WY twin, :func:`cake_backend._tape_wy_record`)."""
+    on sm_107a, the gate epilogue (the tail stages once per chunk range of a lean workspace's ``tail_passes``),
+    then on a raw-gate plan the parameter finalize once (``finalize=False``: a document group of a batched call,
+    whose finalize runs once after the last group).  The carry record is the row's: the overlap pair's on the
+    forward's overlap rows, the two-level carry where its rule accepts, else the chain carry.  ``tape_wy``: the
+    record the tape backward launches for WY in place of the plan's (the tape WY twin,
+    :func:`cake_backend._tape_wy_record`)."""
     seg = p.recur == "seg"
     seq: list[str] = []
     # the table programs where the plan dispatches them (the segmented route's intra program writes the tables
@@ -3765,6 +3889,8 @@ def _expected_launches(
     seq += [dhu, p.record("seg_carry", path), dhu] if seg else [dhu]
     ranges = cake_backend._tail_ranges(p.NC_pad, tail_passes)
     seq += _tail_records(p, path) * len(ranges)
+    if finalize and p.dispatched("param_finalize", path):
+        seq.append(p.record("param_finalize", path))
     return seq
 
 
@@ -6095,7 +6221,11 @@ def _expected_batched_launches(p, arena, lengths, path, *, passes=None):
             path,
             saved_tables=False,
             tail_passes=t,
+            finalize=False,
         )
+    # the raw mode's parameter finalize: once, after the last group, over the whole problem's partials
+    if p.dispatched("param_finalize", path):
+        seq.append(p.record("param_finalize", path))
     return seq
 
 
@@ -6117,7 +6247,9 @@ def _check_group_launches(launched, p, arena, lengths, path, *, passes=None) -> 
         expected = (
             _expected_launches(pb, path)
             if forward
-            else _expected_launches(pb, path, saved_tables=False, tail_passes=t)
+            else _expected_launches(
+                pb, path, saved_tables=False, tail_passes=t, finalize=False
+            )
         )
         group = launched[pos : pos + len(expected)]
         pos += len(expected)
@@ -6147,6 +6279,13 @@ def _check_group_launches(launched, p, arena, lengths, path, *, passes=None) -> 
                         num_segments=pb.NSEG,
                     )
                     assert tuple(grid) == tuple(want), (name, b, i)
+    # the raw mode's parameter finalize closes the call: once, one CTA per (head, segment of 128 chunks)
+    if not forward and p.dispatched("param_finalize", path):
+        name, grid, *_ = launched[pos]
+        assert name == p.record("param_finalize", path)
+        assert tuple(grid) == tuple(p.grid("param_finalize", path))
+        assert tuple(grid) == (p.H, max(1, -(-p.NC_pad // 128)), 1)
+        pos += 1
     assert pos == len(launched)
 
 
@@ -8542,3 +8681,897 @@ def test_the_tape_wy_rule_on_this_device(
     }, (key, s)
     for name, a, b in zip(GRAD_ORDER, got, want, strict=True):
         assert _raw_bits_equal(a, b), (key, name)
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# The raw gate mode (``use_gate_in_kernel=True``) on this package: the BF16 raw gate (any view with a unit innermost
+# stride and 16-byte token / head strides), ``A_log`` FP32 [H], ``dt_bias`` FP32 [H * 128] or [H, 128] and the lower
+# bound in place of the activated FP32 ``g``; the backward returns the BF16 gradient of the raw gate and the two
+# parameter gradients too.  The raw mode runs the deterministic package's raw-mode programs in the same order (the
+# fused gradient's raw class copies the deterministic records, no S1 pair, no checkpoint hand-off), so every result is
+# bitwise the deterministic package's raw mode on every path: repeats, the replay, the light, light-states and tape
+# sets of either package, caller workspaces, the lean tail passes, the batched groups, strided views, autograd and
+# ``torch.utils.checkpoint``.  The deterministic package's raw mode is the reference of every comparison below.
+
+RAW_LEAVES = ("q", "k", "v", "g", "beta", "A_log", "dt_bias")
+RAW_LEAF_GRADS = ("dq", "dk", "dv", "dg", "dbeta", "dA_log", "ddt_bias")
+RAW_RETURN_NAMES = ("dq", "dk", "dv", "dbeta", "dg", "dA_log", "ddt_bias")
+RAW_FINALIZE = "param_finalize"
+
+
+def _rg_kw(inputs) -> dict:
+    return {
+        "use_gate_in_kernel": True,
+        "A_log": inputs["A_log"],
+        "dt_bias": inputs["dt_bias"],
+        "lower_bound": LOWER_BOUND,
+    }
+
+
+def _rg_ops(inputs):
+    return tuple(inputs[n] for n in ("q", "k", "v", "g", "beta", "cu_seqlens", "dout"))
+
+
+def _rg_fwd(inputs, *, det=False, g=None, **kwargs):
+    """The raw-mode forward of this package (``det``: of the deterministic package) on ``inputs`` (``g``: another
+    view of the same raw gate)."""
+    q, k, v, raw, beta, cu, _dout = _rg_ops(inputs)
+    fwd = det_backend.chunk_kda_det_fwd if det else chunk_kda_fwd
+    return fwd(
+        q,
+        k,
+        v,
+        raw if g is None else g,
+        beta,
+        cu,
+        scale=SCALE,
+        **_rg_kw(inputs),
+        **kwargs,
+    )
+
+
+def _rg_bwd(inputs, saved, *, det=False, g=None, **kwargs):
+    """The raw-mode backward of this package (``det``: of the deterministic package) from ``saved`` (``None``: the
+    replay)."""
+    q, k, v, raw, beta, cu, dout = _rg_ops(inputs)
+    bwd = det_backend.chunk_kda_det_bwd if det else chunk_kda_bwd
+    return bwd(
+        q,
+        k,
+        v,
+        raw if g is None else g,
+        beta,
+        cu,
+        dout,
+        saved=saved,
+        scale=SCALE,
+        **_rg_kw(inputs),
+        **kwargs,
+    )
+
+
+def _rg_run(inputs, *, det=False, g=None, save=True, **kwargs):
+    """The raw-mode forward with its saved set and the backward from it: ``out``, the seven results by name
+    (:data:`RAW_RETURN_NAMES`) and the saved set."""
+    bwd_kwargs = {
+        n: kwargs[n] for n in ("workspace", "arena", "doc_lengths") if n in kwargs
+    }
+    out, saved = _rg_fwd(inputs, det=det, g=g, save_for_backward=save, **kwargs)
+    grads = _rg_bwd(inputs, saved, det=det, g=g, **bwd_kwargs)
+    assert len(grads) == len(RAW_RETURN_NAMES)
+    return out, dict(zip(RAW_RETURN_NAMES, grads, strict=True)), saved
+
+
+def _rg_reference(inputs):
+    """The deterministic package's raw-mode ``out`` and seven results (cloned) and its saved set: the bits every
+    comparison of this section expects."""
+    out, grads, saved = _rg_run(inputs, det=True)
+    ref_out, ref = _clone_all(out, grads)
+    return ref_out, ref, saved
+
+
+def _rg_check(got, reference: dict, tag=None) -> None:
+    """The seven results of a raw-mode backward (in :data:`RAW_RETURN_NAMES` order) bit for bit."""
+    _check_bits(list(got), reference, RAW_RETURN_NAMES, tag=tag)
+
+
+def _rg_leaves(inputs) -> list[torch.Tensor]:
+    return [inputs[n].detach().clone().requires_grad_(True) for n in RAW_LEAVES]
+
+
+def _rg_autograd(leaves, cu, *, det=False, **kwargs) -> torch.Tensor:
+    q, k, v, raw, beta, a_log, dt_bias = leaves
+    fn = det_backend.chunk_kda_det if det else chunk_kda
+    return fn(
+        q,
+        k,
+        v,
+        raw,
+        beta,
+        cu,
+        use_gate_in_kernel=True,
+        A_log=a_log,
+        dt_bias=dt_bias,
+        lower_bound=LOWER_BOUND,
+        **kwargs,
+    )
+
+
+def _rg_leaf_check(leaves, reference: dict, tag=None) -> None:
+    _check_bits([leaf.grad for leaf in leaves], reference, RAW_LEAF_GRADS, tag=tag)
+
+
+def _rg_recorder(launched: list, jit=None):
+    """A workspace launcher that records ``(record, grid, num_seqs, num_chunks_pad)`` and runs the record (``jit``:
+    the package's ``cake_jit``, this package's by default)."""
+    jit = cake_jit if jit is None else jit
+
+    def recording(name, values, *, grid, device_index):
+        launched.append(
+            (
+                name,
+                tuple(grid),
+                int(values.get("num_seqs", -1)),
+                int(values.get("num_chunks_pad", -1)),
+            )
+        )
+        jit.run_module(name, values, grid=grid, device_index=device_index)
+
+    return recording
+
+
+@pytest.mark.parametrize("shape", SHAPES, ids=_shape_id)
+def test_raw_gate_matches_the_exact_reference_and_the_deterministic_raw_mode(
+    device, manifest, shape
+) -> None:
+    """The raw mode against the exact FP64 recurrence whose gate is activated from the same BF16 raw gate and FP32
+    parameters in FP64 (the declared elementwise gate of every output, the parameter gradients included) and against
+    the deterministic package's raw mode on the same inputs: ``out``, the saved set's tensors and the seven results
+    bit for bit; the result dtypes and shapes (``dg`` the BF16 contiguous gradient of the raw gate, ``dA_log`` FP32
+    ``[H]``, ``ddt_bias`` FP32 in ``dt_bias``'s shape); the saved set records the gate mode, the lower bound and
+    ``deterministic=False``."""
+    lengths, heads = shape
+    S = sum(lengths)
+    inputs = make_raw_inputs(lengths, heads, device)
+    out, grads, saved = _rg_run(inputs)
+    torch.cuda.synchronize(device)
+    assert (saved.gate, saved.lower_bound, saved.deterministic) == (
+        "raw",
+        LOWER_BOUND,
+        False,
+    )
+    assert out.shape == (S, heads, D) and out.dtype == torch.bfloat16
+    assert grads["dg"].shape == (S, heads, D) and grads["dg"].dtype == torch.bfloat16
+    assert grads["dg"].is_contiguous()
+    assert grads["dA_log"].shape == (heads,) and grads["dA_log"].dtype == torch.float32
+    assert grads["ddt_bias"].shape == (heads * D,)
+    assert grads["ddt_bias"].dtype == torch.float32
+    q, k, v, raw, beta, cu, dout = _rg_ops(inputs)
+    ref_out, ref_grads = kda_exact_raw_with_grads(
+        q,
+        k,
+        v,
+        raw,
+        beta,
+        inputs["A_log"],
+        inputs["dt_bias"],
+        dout,
+        cu,
+        SCALE,
+        LOWER_BOUND,
+    )
+    candidates = {"out": out, **grads}
+    references = {"out": ref_out, **ref_grads}
+    failures = []
+    for name in ("out",) + RAW_GRAD_NAMES:
+        assert candidates[name].shape == references[name].shape, name
+        gate = elementwise_gate(candidates[name], references[name], ATOL, RTOL)
+        if not gate["pass"]:
+            failures.append(
+                (name, gate, error_metrics(candidates[name], references[name]))
+            )
+    assert not failures, failures
+    det_out, det_grads, det_saved = _rg_run(inputs, det=True)
+    assert _bits_equal(out, det_out), shape
+    _rg_check(grads.values(), det_grads, tag=shape)
+    assert (det_saved.gate, det_saved.lower_bound) == ("raw", LOWER_BOUND)
+    for name in ("Aqk", "Akk", "qg"):
+        a, b = getattr(saved, name), getattr(det_saved, name)
+        assert (a is None) == (b is None), name
+        if a is not None:
+            assert _bits_equal(a, b), (shape, name)
+
+
+@pytest.mark.parametrize("shape", SHAPES[6:10] + SHAPES[11:13], ids=_shape_id)
+def test_raw_gate_paths_are_bitwise_the_deterministic_raw_mode(
+    device, manifest, shape
+) -> None:
+    """On one call's inputs every path gives the deterministic package's raw-mode results bit for bit: repeats, the
+    replay (``saved=None``), a saved set without its tables, caller workspaces of the raw mode (and their replay),
+    the tape set from the default entry and from a tape workspace (its replay too), a light set on the tape
+    workspace, and either package's backward from the other package's light and tape sets."""
+    lengths, heads = shape
+    S, N = sum(lengths), len(lengths)
+    inputs = make_raw_inputs(lengths, heads, device)
+    ref_out, ref, det_saved = _rg_reference(inputs)
+    out, grads, saved = _rg_run(inputs)
+    assert _bits_equal(out, ref_out)
+    _rg_check(grads.values(), ref, tag="saved set")
+    del out, grads
+    for i in range(2):
+        out, grads, _ = _rg_run(inputs)
+        assert _bits_equal(out, ref_out), i
+        _rg_check(grads.values(), ref, tag=("repeat", i))
+    _rg_check(_rg_bwd(inputs, None), ref, tag="replay")
+    bare = dataclasses.replace(saved, tables=None)
+    assert (bare.gate, bare.lower_bound) == ("raw", LOWER_BOUND)
+    for name, other in (("bare", bare), ("saved", saved)):
+        ws = KdaWorkspace.for_problem(
+            S, N, heads, device, gate="raw", deterministic=False
+        )
+        assert ws.gate == ws.plan.gate == "raw"
+        _rg_check(_rg_bwd(inputs, other, workspace=ws), ref, tag=name)
+    ws = KdaWorkspace.for_problem(S, N, heads, device, gate="raw", deterministic=False)
+    assert ws.bytes == cake_backend.workspace_bytes(
+        S, N, heads, sm_count=ws.plan.sm_count, gate="raw"
+    )
+    out_w, grads_w, _ = _rg_run(inputs, workspace=ws)
+    assert _bits_equal(out_w, ref_out)
+    _rg_check(grads_w.values(), ref, tag="workspace")
+    _rg_check(_rg_bwd(inputs, None, workspace=ws), ref, tag="workspace replay")
+    out_t, grads_t, saved_t = _rg_run(inputs, save_mode="tape")
+    assert saved_t.version == cake_backend.SAVED_VERSION_TAPE and saved_t.gate == "raw"
+    assert _bits_equal(out_t, ref_out)
+    _rg_check(grads_t.values(), ref, tag="tape")
+    tape_ws = KdaWorkspace.for_problem(
+        S, N, heads, device, save_mode="tape", gate="raw", deterministic=False
+    )
+    out_tw, grads_tw, saved_tw = _rg_run(inputs, workspace=tape_ws)
+    assert saved_tw.version == cake_backend.SAVED_VERSION_TAPE
+    assert _bits_equal(out_tw, ref_out)
+    _rg_check(grads_tw.values(), ref, tag="tape workspace")
+    _rg_check(_rg_bwd(inputs, None, workspace=tape_ws), ref, tag="tape ws replay")
+    _rg_check(_rg_bwd(inputs, saved, workspace=tape_ws), ref, tag="light set")
+    # either package's backward from the other's raw sets (light and tape)
+    _, det_saved_t = _rg_fwd(inputs, det=True, save_mode="tape")
+    for tag, nd_set, det_set in (
+        ("light", saved, det_saved),
+        ("tape", saved_t, det_saved_t),
+    ):
+        _rg_check(_rg_bwd(inputs, det_set), ref, tag=(tag, "det set, nd backward"))
+        _rg_check(
+            _rg_bwd(inputs, nd_set, det=True), ref, tag=(tag, "nd set, det backward")
+        )
+
+
+@pytest.mark.parametrize(("num_docs", "heads"), STATE_SHAPES, ids=["n1-h1", "n2-h2"])
+def test_raw_gate_saved_states_are_bitwise_the_deterministic_raw_mode(
+    device, manifest, num_docs, heads
+) -> None:
+    """The segmented rows that save the segment-boundary states (``light_states``) in raw mode: the gradients from
+    that set, from the replay, from the tape set and from lean workspaces (the tail once per range, the finalize
+    once, last) are the deterministic package's bit for bit."""
+    sm, arch = cake_jit.sm_count(device.index), cake_jit.device_arch(device.index)
+    nseg = cake_backend.plan(1, num_docs, heads, sm, arch).NSEG
+    S = cake_backend.SEG_SAVE_MIN_TOKENS_PER_SEG * nseg
+    lengths = _split(S, num_docs)
+    inputs = make_raw_inputs(lengths, heads, device)
+    p = cake_backend.plan(S, num_docs, heads, sm, arch, gate="raw")
+    assert p.recur == "seg" and p.seg_save and p.light_path == "light_states"
+    ref_out, ref, _ = _rg_reference(inputs)
+    out, grads, saved = _rg_run(inputs)
+    assert saved.hseg is not None and saved.gate == "raw"
+    assert _bits_equal(out, ref_out)
+    _rg_check(grads.values(), ref, tag="light_states")
+    _rg_check(_rg_bwd(inputs, None), ref, tag="replay")
+    out_t, grads_t, _ = _rg_run(inputs, save_mode="tape")
+    assert _bits_equal(out_t, ref_out)
+    _rg_check(grads_t.values(), ref, tag="tape")
+    launched: list = []
+    for t in (1, 3):
+        arena = cake_backend.KdaArena(lean=True, tail_passes=t)
+        ws = KdaWorkspace.for_problem(
+            S,
+            num_docs,
+            heads,
+            device,
+            arena=arena,
+            gate="raw",
+            launcher=_rg_recorder(launched),
+            deterministic=False,
+        )
+        launched.clear()
+        got = _rg_bwd(inputs, saved, workspace=ws)
+        names = [n for n, *_ in launched]
+        assert names == _expected_launches(ws.plan, "light_states", tail_passes=t)
+        assert names.count(RAW_FINALIZE) == 1 and names[-1] == RAW_FINALIZE
+        _check_tail_grids([(n, g) for n, g, *_ in launched], ws.plan, "light_states", t)
+        _rg_check(got, ref, tag=("light_states", t))
+
+
+@pytest.mark.parametrize("shape", [((63, 1, 65), 2), ((129, 63), 16)], ids=_shape_id)
+def test_raw_gate_autograd_and_checkpoint_are_bitwise_the_deterministic_raw_mode(
+    device, manifest, monkeypatch, shape
+) -> None:
+    """The autograd entry gives the leaves the deterministic package's raw-mode gradients (``dg`` to the raw gate,
+    ``dA_log`` / ``ddt_bias`` to the parameters, the latter in ``dt_bias``'s shape) bit for bit, directly and under
+    ``torch.utils.checkpoint`` (non-reentrant and reentrant) with every ``checkpoint_handoff`` value and the
+    environment override: the raw mode never makes or takes a hand-off record.  The parameters may be frozen; a
+    non-contiguous upstream gradient is accepted; under torch's deterministic algorithms (an alert as an error) the
+    package raises nothing and gives the same bits.  The node rebuilds the saved set with its gate mode and FP32
+    lower bound, and the backward refuses a call whose lower bound or gate mode differs from the set's."""
+    from torch.utils.checkpoint import checkpoint
+
+    lengths, heads = shape
+    inputs = make_raw_inputs(lengths, heads, device)
+    ref_out, ref, _ = _rg_reference(inputs)
+    cu, dout = inputs["cu_seqlens"], inputs["dout"]
+    leaves = _rg_leaves(inputs)
+    o = _rg_autograd(leaves, cu, det=True)
+    o.backward(dout)
+    _rg_leaf_check(leaves, ref, tag="deterministic autograd")
+
+    def no_handoff(*args, **kwargs):
+        raise AssertionError(
+            "the raw gate mode made or took a checkpoint hand-off record"
+        )
+
+    monkeypatch.setattr(cake_backend, "_handoff_request", no_handoff)
+    monkeypatch.setattr(cake_backend, "_handoff_take", no_handoff)
+    monkeypatch.setattr(cake_backend, "_handoff_publish", no_handoff)
+    for env in (None, "on", "off"):
+        if env is None:
+            monkeypatch.delenv(cake_backend.HANDOFF_ENV, raising=False)
+        else:
+            monkeypatch.setenv(cake_backend.HANDOFF_ENV, env)
+        for mode in ("auto", "on", "off"):
+            tag = (env, mode)
+            leaves = _rg_leaves(inputs)
+            o = _rg_autograd(leaves, cu, checkpoint_handoff=mode)
+            assert _bits_equal(o, ref_out), tag
+            o.backward(dout)
+            _rg_leaf_check(leaves, ref, tag=(*tag, "autograd"))
+            for reentrant in (False, True):
+                leaves = _rg_leaves(inputs)
+                o = checkpoint(
+                    lambda *a, _m=mode: _rg_autograd(
+                        list(a), cu, checkpoint_handoff=_m
+                    ),
+                    *leaves,
+                    use_reentrant=reentrant,
+                )
+                o.backward(dout)
+                _rg_leaf_check(leaves, ref, tag=(*tag, "checkpoint", reentrant))
+    monkeypatch.delenv(cake_backend.HANDOFF_ENV, raising=False)
+    # dt_bias as [H, 128]: the same values, its gradient in that shape (explicit and autograd)
+    inputs_2d = dict(inputs, dt_bias=inputs["dt_bias"].view(heads, D).clone())
+    got = _rg_bwd(inputs_2d, None)
+    assert got[6].shape == (heads, D)
+    ref_2d = dict(ref, ddt_bias=ref["ddt_bias"].view(heads, D))
+    _rg_check(got, ref_2d, tag="dt_bias 2-D explicit")
+    leaves = _rg_leaves(inputs_2d)
+    _rg_autograd(leaves, cu).backward(dout)
+    _rg_leaf_check(leaves, ref_2d, tag="dt_bias 2-D autograd")
+    # frozen parameters: the other gradients are unchanged
+    leaves = _rg_leaves(inputs)
+    leaves[5].requires_grad_(False)
+    leaves[6].requires_grad_(False)
+    _rg_autograd(leaves, cu).backward(dout)
+    assert leaves[5].grad is None and leaves[6].grad is None
+    _check_bits(
+        [leaf.grad for leaf in leaves[:5]], ref, RAW_LEAF_GRADS[:5], tag="frozen"
+    )
+    # a non-contiguous upstream gradient
+    leaves = _rg_leaves(inputs)
+    o = _rg_autograd(leaves, cu)
+    dout_nc = dout.transpose(0, 1).contiguous().transpose(0, 1)
+    assert not dout_nc.is_contiguous()
+    o.backward(dout_nc)
+    _rg_leaf_check(leaves, ref, tag="non-contiguous dout")
+    # torch's deterministic algorithms: no alert, the same bits
+    saved_mode = (
+        torch.are_deterministic_algorithms_enabled(),
+        torch.is_deterministic_algorithms_warn_only_enabled(),
+    )
+    torch.use_deterministic_algorithms(True)
+    try:
+        out, grads, _ = _rg_run(inputs)
+        leaves = _rg_leaves(inputs)
+        _rg_autograd(leaves, cu).backward(dout)
+    finally:
+        torch.use_deterministic_algorithms(saved_mode[0], warn_only=saved_mode[1])
+    assert _bits_equal(out, ref_out)
+    _rg_check(grads.values(), ref, tag="torch deterministic")
+    _rg_leaf_check(leaves, ref, tag="torch deterministic autograd")
+    # the node's backward: the rebuilt saved set carries the gate mode and the FP32 lower bound
+    original = cake_backend._bwd_call
+    seen: list = []
+
+    def capture(*args, **kwargs):
+        saved_ = kwargs["saved"]
+        seen.append(
+            (
+                saved_.gate,
+                saved_.lower_bound,
+                kwargs.get("use_gate_in_kernel"),
+                kwargs.get("lower_bound"),
+                kwargs.get("handoff"),
+            )
+        )
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(cake_backend, "_bwd_call", capture)
+    leaves = _rg_leaves(inputs)
+    _rg_autograd(leaves, cu).backward(dout)
+    assert seen == [("raw", LOWER_BOUND, True, LOWER_BOUND, None)]
+    _rg_leaf_check(leaves, ref, tag="captured")
+
+    # the round trip refuses a backward whose lower bound or gate mode differs from the forward's set
+    def other_bound(*args, **kwargs):
+        return original(*args, **dict(kwargs, lower_bound=-4.0))
+
+    monkeypatch.setattr(cake_backend, "_bwd_call", other_bound)
+    o = _rg_autograd(_rg_leaves(inputs), cu)
+    with pytest.raises(ValueError, match="lower_bound"):
+        o.backward(dout)
+    g32 = torch.zeros(sum(lengths), heads, D, dtype=torch.float32, device=device)
+
+    def g_mode(*args, **kwargs):
+        args = list(args)
+        args[3] = g32
+        kwargs = dict(
+            kwargs, use_gate_in_kernel=False, A_log=None, dt_bias=None, lower_bound=None
+        )
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(cake_backend, "_bwd_call", g_mode)
+    o = _rg_autograd(_rg_leaves(inputs), cu)
+    with pytest.raises(ValueError, match="written by a forward in gate mode"):
+        o.backward(dout)
+
+
+def test_raw_gate_strided_views_are_bitwise_the_deterministic_raw_mode(
+    device, manifest
+) -> None:
+    """The raw gate as a column slice of a fused projection (strides ``(F, 128, 1)``) and as a head-interleaved split
+    (strides ``(H w, w, 1)``), the columns outside the view filled with NaN: the forward, the backward from the saved
+    set and the replay give the deterministic package's contiguous-gate results bit for bit (a set saved from the
+    contiguous gate serves the strided call and the other way round); through autograd the raw gate's gradient lands
+    in the slice of the projection's gradient and zeros elsewhere.  The batch axis of 1 is optional."""
+    for lengths, heads in (((63, 1, 65), 2), ((129,), 4)):
+        S = sum(lengths)
+        inputs = make_raw_inputs(lengths, heads, device)
+        raw = inputs["g"]
+        cu, dout = inputs["cu_seqlens"], inputs["dout"]
+        ref_out, ref, _ = _rg_reference(inputs)
+        _, saved = _rg_fwd(inputs)
+        width = heads * D
+        views = []
+        for c0, extra in ((8, 0), (24, 40)):
+            proj = torch.full(
+                (S, c0 + width + extra),
+                float("nan"),
+                dtype=torch.bfloat16,
+                device=device,
+            )
+            proj[:, c0 : c0 + width] = raw.reshape(S, width)
+            view = proj[:, c0 : c0 + width].view(S, heads, D)
+            assert view.stride() == (c0 + width + extra, D, 1)
+            views.append((("projection", c0, extra), proj, c0, view))
+        split = torch.full(
+            (S, heads, 136), float("nan"), dtype=torch.bfloat16, device=device
+        )
+        split[..., :D] = raw
+        views.append((("interleaved", 136), None, 0, split[..., :D]))
+        for tag, proj, c0, view in views:
+            assert not view.is_contiguous() and _bits_equal(view.contiguous(), raw), tag
+            out_v, grads_v, saved_v = _rg_run(inputs, g=view)
+            assert _bits_equal(out_v, ref_out), tag
+            _rg_check(grads_v.values(), ref, tag=tag)
+            assert grads_v["dg"].is_contiguous()
+            _rg_check(_rg_bwd(inputs, None, g=view), ref, tag=(tag, "replay"))
+            _rg_check(_rg_bwd(inputs, saved, g=view), ref, tag=(tag, "strided call"))
+            _rg_check(_rg_bwd(inputs, saved_v), ref, tag=(tag, "contiguous call"))
+            if proj is None:
+                continue
+            leaf = proj.detach().clone().requires_grad_(True)
+            leaves = _rg_leaves(inputs)
+            leaves[3] = leaf[:, c0 : c0 + width].view(S, heads, D)
+            o = _rg_autograd(leaves, cu)
+            assert _bits_equal(o, ref_out), tag
+            o.backward(dout)
+            assert _bits_equal(
+                leaf.grad[:, c0 : c0 + width].reshape(S, heads, D).contiguous(),
+                ref["dg"],
+            ), tag
+            outside = torch.cat([leaf.grad[:, :c0], leaf.grad[:, c0 + width :]], dim=1)
+            assert not bool(outside.any()), tag
+            _check_bits(
+                [x.grad for i, x in enumerate(leaves) if i != 3],
+                ref,
+                tuple(n for i, n in enumerate(RAW_LEAF_GRADS) if i != 3),
+                tag=(tag, "autograd"),
+            )
+    # the batch axis of 1: the same results with the outputs ranked like the inputs
+    lengths, heads = (64, 64), 1
+    flat = make_raw_inputs(lengths, heads, device)
+    batched = make_raw_inputs(lengths, heads, device, batched=True)
+    ref_out, ref, _ = _rg_reference(flat)
+    b_out, b_grads, _ = _rg_run(batched)
+    assert b_out.shape == (1, sum(lengths), heads, D) and _bits_equal(b_out[0], ref_out)
+    for name in ("dq", "dk", "dv", "dbeta", "dg"):
+        assert b_grads[name].dim() == ref[name].dim() + 1, name
+        assert _bits_equal(b_grads[name][0], ref[name]), name
+    for name in ("dA_log", "ddt_bias"):  # the parameters carry no batch axis
+        assert _bits_equal(b_grads[name], ref[name]), name
+
+
+def test_raw_gate_launch_sequences_are_the_deterministic_raw_mode(
+    device, manifest, monkeypatch
+) -> None:
+    """The raw mode's launch lists on every path are the deterministic package's raw-mode lists (the fused gradient's
+    records by their ``RAW_DQKG`` names) with the same grids and scalars, and the lists this suite spells from the
+    plan: the raw records on the gate stages, no gate epilogue, no S1 record and the parameter finalize once, last,
+    on every backward path.  The tape backward with the tape WY twin's rule (the twin where it admits it) gives the
+    same bits.  No call of the raw mode allocates an FP32 token-row tensor: neither the activated gate nor its
+    gradient exists."""
+    allocs: list = []
+    original_alloc = cake_backend._alloc
+
+    def spy(shape, dtype, device_):
+        allocs.append((tuple(int(x) for x in shape), dtype))
+        return original_alloc(shape, dtype, device_)
+
+    monkeypatch.setattr(cake_backend, "_alloc", spy)
+    for lengths, heads in (
+        ((63, 1, 65), 2),
+        ((129,), 16),
+        ((63, 1, 65), 64),
+        ((63, 1, 65, 30), 2),
+        ((20, 20, 20, 20, 20, 20, 20), 8),
+        ((63, 1, 65), 4),
+    ):
+        S, N = sum(lengths), len(lengths)
+        inputs = make_raw_inputs(lengths, heads, device)
+        nd_log: list = []
+        det_log: list = []
+        workspaces = {}
+        for save_mode in ("light", "tape"):
+            workspaces[save_mode] = (
+                KdaWorkspace.for_problem(
+                    S,
+                    N,
+                    heads,
+                    device,
+                    save_mode=save_mode,
+                    gate="raw",
+                    launcher=_rg_recorder(nd_log),
+                    deterministic=False,
+                ),
+                det_backend.KdaDetWorkspace.for_problem(
+                    S,
+                    N,
+                    heads,
+                    device,
+                    save_mode=save_mode,
+                    gate="raw",
+                    launcher=_rg_recorder(det_log, det_jit),
+                ),
+            )
+        ws, det_ws = workspaces["light"]
+        p = ws.plan
+        assert p.gate == "raw" and p.gate_fused and ws.gate == "raw"
+
+        def taken():
+            nd = [(RAW_DQKG.get(n, n), *rest) for n, *rest in nd_log]
+            names = [n for n, *_ in nd_log]
+            det = list(det_log)
+            nd_log.clear()
+            det_log.clear()
+            assert nd == det, (lengths, heads)
+            assert not set(names) & S1_RECORDS
+            return names
+
+        def no_fp32_token_rows(tag):
+            for shape, dtype in allocs:
+                assert not (
+                    dtype == torch.float32
+                    and len(shape) >= 3
+                    and shape[-2:] == (heads, D)
+                    and shape[-3] in (S, p.R)
+                ), (tag, shape)
+            allocs.clear()
+
+        def check_backward(seq, path, **kw):
+            assert seq == _expected_launches(p, path, **kw), (lengths, heads, path)
+            assert seq.count(RAW_FINALIZE) == 1 and seq[-1] == RAW_FINALIZE
+            assert "gate_epilogue" not in seq and "glm_intra_raw" in seq
+            assert p.record("dqkg", path) in seq and p.record("dqkg", path) in RAW_DQKG
+
+        allocs.clear()
+        out, saved = _rg_fwd(inputs, workspace=ws)
+        _, det_saved = _rg_fwd(inputs, det=True, workspace=det_ws)
+        seq = taken()
+        assert seq == _expected_launches(p, "fwd") and len(seq) == p.launch_count("fwd")
+        no_fp32_token_rows("fwd")
+        _rg_fwd(inputs, workspace=ws, save_for_backward=False)
+        _rg_fwd(inputs, det=True, workspace=det_ws, save_for_backward=False)
+        assert taken() == _expected_launches(p, "fwd_nosave")
+        ref = _rg_bwd(inputs, det_saved, det=True, workspace=det_ws)
+        ref = dict(zip(RAW_RETURN_NAMES, (t.clone() for t in ref), strict=True))
+        got = _rg_bwd(inputs, saved, workspace=ws)
+        _rg_check(got, ref, tag=(lengths, heads, "light"))
+        seq = taken()
+        check_backward(seq, "light")
+        assert len(seq) == p.launch_count("light")
+        no_fp32_token_rows("light")
+        _rg_bwd(inputs, dataclasses.replace(saved, tables=None), workspace=ws)
+        _rg_bwd(
+            inputs,
+            dataclasses.replace(det_saved, tables=None),
+            det=True,
+            workspace=det_ws,
+        )
+        seq = taken()
+        check_backward(seq, "light", saved_tables=False)
+        assert len(seq) == p.launch_count("light", tables=False)
+        _rg_check(_rg_bwd(inputs, None, workspace=ws), ref, tag="replay")
+        _rg_bwd(inputs, None, det=True, workspace=det_ws)
+        seq = taken()
+        check_backward(seq, "replay")
+        assert len(seq) == p.launch_count("replay")
+        no_fp32_token_rows("replay")
+        tape_ws, det_tape_ws = workspaces["tape"]
+        monkeypatch.setattr(cake_backend, "_TAPE_WY", False)  # the plan's WY record
+        _, saved_t = _rg_fwd(inputs, workspace=tape_ws)
+        _, det_saved_t = _rg_fwd(inputs, det=True, workspace=det_tape_ws)
+        assert taken() == _expected_launches(p, "fwd")
+        _rg_check(_rg_bwd(inputs, saved_t, workspace=tape_ws), ref, tag="tape")
+        _rg_bwd(inputs, det_saved_t, det=True, workspace=det_tape_ws)
+        seq = taken()
+        check_backward(seq, "tape")
+        assert len(seq) == p.launch_count("tape")
+        no_fp32_token_rows("tape")
+        monkeypatch.setattr(cake_backend, "_TAPE_WY", None)  # the twin's rule
+        twin = cake_backend._tape_wy_record(tape_ws.plan, device.index)
+        _rg_check(_rg_bwd(inputs, saved_t, workspace=tape_ws), ref, tag="tape wy rule")
+        seq = [n for n, *_ in nd_log]
+        nd_log.clear()
+        check_backward(seq, "tape", tape_wy=twin)
+        records = ws.records()
+        for path in ("fwd", "fwd_nosave", "light", "tape", "replay"):
+            expected = set(_expected_launches(p, path, saved_tables=False))
+            assert expected == set(records[path].values()), path
+
+
+RAW_BATCHED_ROWS = [
+    ((63, 1, 65), 4),
+    ((100, 640, 77, 1000, 129), 2),
+    ((20, 20, 20, 20, 20, 20, 20), 8),
+    ((63, 1, 65), 64),
+    ((129, 300), 16),
+]
+
+
+@pytest.mark.parametrize("shape", RAW_BATCHED_ROWS, ids=_shape_id)
+def test_raw_gate_lean_and_batched_arenas_are_bitwise_the_deterministic_raw_mode(
+    device, manifest, shape
+) -> None:
+    """Lean workspaces of one to four tail passes (each range's tail writes its slice of the per-chunk partials, the
+    finalize runs once after the last range) and document groups (two, three, one document each; default and lean
+    layouts: the finalize once after the last group over the whole pack) give the deterministic package's default
+    raw-mode results bit for bit: the forward, the backward from either package's default set and from its own,
+    a per-call arena, the replay group by group (not lean), the autograd node carrying the option; the launch
+    lists are the plan's, every group's in turn and the finalize once, last.  A lean workspace refuses the
+    replay."""
+    lengths, heads = shape
+    S, N = sum(lengths), len(lengths)
+    inputs = make_raw_inputs(lengths, heads, device)
+    cu, dout = inputs["cu_seqlens"], inputs["dout"]
+    ref_out, ref, det_saved = _rg_reference(inputs)
+    _, saved = _rg_fwd(inputs)
+    launched: list = []
+    for t in (1, 2, 3, 4):
+        arena = cake_backend.KdaArena(lean=True, tail_passes=t)
+        ws = KdaWorkspace.for_problem(
+            S,
+            N,
+            heads,
+            device,
+            arena=arena,
+            gate="raw",
+            launcher=_rg_recorder(launched),
+            deterministic=False,
+        )
+        p = ws.plan
+        assert ws.bytes == cake_backend.workspace_bytes(
+            S, N, heads, sm_count=p.sm_count, arena=arena, gate="raw"
+        )
+        launched.clear()
+        o, saved_l = _rg_fwd(inputs, workspace=ws)
+        assert _bits_equal(o, ref_out)
+        launched.clear()
+        got = _rg_bwd(inputs, saved_l, workspace=ws)
+        names = [n for n, *_ in launched]
+        assert names == _expected_launches(p, "light", tail_passes=t), (shape, t)
+        assert names.count(RAW_FINALIZE) == 1 and names[-1] == RAW_FINALIZE
+        _check_tail_grids([(n, g) for n, g, *_ in launched], p, "light", t)
+        _rg_check(got, ref, tag=("lean", t))
+        for ws_arg, arena_arg in ((ws, None), (None, arena), (ws, arena)):
+            for set_tag, source in (("nd set", saved), ("det set", det_saved)):
+                got = _rg_bwd(inputs, source, workspace=ws_arg, arena=arena_arg)
+                _rg_check(got, ref, tag=(t, ws_arg is None, arena_arg is None, set_tag))
+        with pytest.raises(ValueError, match="lean=False"):
+            _rg_bwd(inputs, None, workspace=ws)
+        leaves = _rg_leaves(inputs)
+        o = _rg_autograd(leaves, cu, arena=arena)
+        assert _bits_equal(o, ref_out)
+        o.backward(dout)
+        _rg_leaf_check(leaves, ref, tag=(t, "autograd"))
+        del ws
+    for label, kw in _partitions(lengths):
+        for lean in (False, True):
+            arena = cake_backend.KdaArena(lean=lean, tail_passes=3 if lean else 1, **kw)
+            tag = (label, lean)
+            ws = KdaWorkspace.for_problem(
+                S,
+                N,
+                heads,
+                device,
+                arena=arena,
+                doc_lengths=lengths,
+                gate="raw",
+                launcher=_rg_recorder(launched),
+                deterministic=False,
+            )
+            p = ws.plan
+            assert p.gate == "raw" and len(p.batches(arena, lengths)) >= 2, tag
+            launched.clear()
+            o, saved_b = _rg_fwd(inputs, workspace=ws, doc_lengths=lengths)
+            assert _bits_equal(o, ref_out), tag
+            assert [n for n, *_ in launched] == _expected_batched_launches(
+                p, arena, lengths, "fwd"
+            ), tag
+            for name, source in (
+                ("nd default set", saved),
+                ("det default set", det_saved),
+                ("batched set", saved_b),
+            ):
+                launched.clear()
+                got = _rg_bwd(inputs, source, workspace=ws, doc_lengths=lengths)
+                _rg_check(got, ref, tag=(*tag, name))
+                path = p.light_path
+                passes = _group_passes(p, arena, lengths, path, nbytes=ws.bytes)
+                names = [n for n, *_ in launched]
+                assert names == _expected_batched_launches(
+                    p, arena, lengths, path, passes=passes
+                ), (*tag, name)
+                assert names.count(RAW_FINALIZE) == 1 and names[-1] == RAW_FINALIZE
+                _check_group_launches(launched, p, arena, lengths, path, passes=passes)
+            _rg_check(_rg_bwd(inputs, saved_b), ref, tag=(*tag, "default backward"))
+            _rg_check(
+                _rg_bwd(inputs, saved_b, det=True), ref, tag=(*tag, "det backward")
+            )
+            got = _rg_bwd(inputs, saved, arena=arena, doc_lengths=lengths)
+            _rg_check(got, ref, tag=(*tag, "per-call"))
+            if not lean:
+                launched.clear()
+                got = _rg_bwd(inputs, None, workspace=ws, doc_lengths=lengths)
+                _rg_check(got, ref, tag=(*tag, "replay"))
+                names = [n for n, *_ in launched]
+                assert names.count(RAW_FINALIZE) == 1 and names[-1] == RAW_FINALIZE
+            leaves = _rg_leaves(inputs)
+            o = _rg_autograd(leaves, cu, arena=arena, doc_lengths=lengths)
+            assert _bits_equal(o, ref_out), tag
+            o.backward(dout)
+            _rg_leaf_check(leaves, ref, tag=(*tag, "autograd"))
+            del ws
+
+
+def test_raw_gate_checkpointed_forward_retains_no_workspace(device, manifest) -> None:
+    """Under activation checkpointing the raw mode's forward keeps nothing beyond its output (the implicit
+    workspace, a per-call one, a caller's), with the deterministic package's gradients through the checkpoint."""
+    from torch.utils.checkpoint import checkpoint
+
+    lengths, heads = (100, 640, 77, 1000, 129), 2
+    S, N = sum(lengths), len(lengths)
+    inputs = make_raw_inputs(lengths, heads, device)
+    cu, dout = inputs["cu_seqlens"], inputs["dout"]
+    ref_out, ref, _ = _rg_reference(inputs)
+    plan = cake_backend.plan(
+        S,
+        N,
+        heads,
+        cake_jit.sm_count(device.index),
+        cake_jit.device_arch(device.index),
+        gate="raw",
+    )
+    leaves = _rg_leaves(inputs)
+
+    def implicit(*a):
+        return _rg_autograd(list(a), cu)
+
+    def per_call(*a):
+        ws = KdaWorkspace(plan, device, backward=True, deterministic=False)
+        return _rg_autograd(list(a), cu, workspace=ws)
+
+    shared = KdaWorkspace(plan, device, backward=True, deterministic=False)
+    assert shared.gate == "raw"
+
+    def on_shared(*a):
+        return _rg_autograd(list(a), cu, workspace=shared)
+
+    for fn in (implicit, per_call, on_shared):
+        warm = fn(*leaves)
+        assert _bits_equal(warm, ref_out), fn.__name__
+        del warm
+        assert _retained_after_checkpointed_forward(fn, *leaves) == 0, fn.__name__
+        for leaf in leaves:
+            leaf.grad = None
+        o = checkpoint(fn, *leaves, use_reentrant=False)
+        o.backward(dout)
+        _rg_leaf_check(leaves, ref, tag=fn.__name__)
+
+
+def test_raw_gate_workspace_content_never_reaches_a_result(
+    device, manifest, monkeypatch
+) -> None:
+    """Write-before-read in raw mode: an arena filled with NaN bytes and per-call backward buffers (the outputs and
+    the per-chunk partials, only the real chunks of which are written and read) filled with NaN bytes give the
+    deterministic package's results bit for bit, on the light, replay, tape and lean paths."""
+    cases = (
+        ((129,), 2, "light", None),
+        ((100, 640, 77, 1000, 129), 2, "light", None),
+        ((63, 1, 65, 30), 2, "light", 3),
+        ((20, 20, 20, 20, 20, 20, 20), 8, "light", 2),
+        ((100, 0, 300), 2, "tape", None),
+    )
+    original_alloc = cake_backend._alloc
+
+    def nan_alloc(shape, dtype, device_):
+        t = original_alloc(shape, dtype, device_)
+        if t.is_floating_point():
+            t.view(torch.uint8).fill_(0xFF)
+        return t
+
+    for lengths, heads, save_mode, passes in cases:
+        S, N = sum(lengths), len(lengths)
+        case = (lengths, heads, save_mode, passes)
+        inputs = make_raw_inputs(lengths, heads, device)
+        ref_out, ref, _ = _rg_reference(inputs)
+        arena = (
+            None
+            if passes is None
+            else cake_backend.KdaArena(lean=True, tail_passes=passes)
+        )
+        plan = cake_backend.plan(
+            S,
+            N,
+            heads,
+            cake_jit.sm_count(device.index),
+            cake_jit.device_arch(device.index),
+            gate="raw",
+        )
+        poisoned = KdaWorkspace(
+            plan,
+            device,
+            backward=True,
+            save_mode=save_mode,
+            arena=arena,
+            deterministic=False,
+        )
+        poisoned.arena.fill_(0xFF)
+        torch.cuda.synchronize()
+        o, saved_p = _rg_fwd(inputs, workspace=poisoned)
+        assert _bits_equal(o, ref_out), case
+        poisoned.arena.fill_(0xFF)
+        monkeypatch.setattr(cake_backend, "_alloc", nan_alloc)
+        got = _rg_bwd(inputs, saved_p, workspace=poisoned)
+        monkeypatch.setattr(cake_backend, "_alloc", original_alloc)
+        _rg_check(got, ref, tag=case)
+        if arena is None:
+            poisoned.arena.fill_(0xFF)
+            monkeypatch.setattr(cake_backend, "_alloc", nan_alloc)
+            got = _rg_bwd(inputs, None, workspace=poisoned)
+            monkeypatch.setattr(cake_backend, "_alloc", original_alloc)
+            _rg_check(got, ref, tag=(case, "replay"))

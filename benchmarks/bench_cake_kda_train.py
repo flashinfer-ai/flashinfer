@@ -46,6 +46,21 @@ rounding on the rows whose backward runs the S1 pair).  The JSON records the
 device, architecture, SM count, torch, CUDA and flash-linear-attention versions
 (the distribution's and ``fla.__version__``).
 
+``--gate`` selects the forget gate's form per row: ``g`` (the default) the
+activated FP32 gate the caller passes, ``raw`` the raw gate mode
+(``use_gate_in_kernel=True``: the BF16 raw gate, FP32 ``A_log`` /
+``dt_bias``, lower bound -5, activated in the kernels).  In the raw mode the
+three arms run their raw forms on the same operands: the deterministic
+package's and this package's raw mode (both workspaces of ``gate="raw"``;
+the ``ckpt`` leaves include ``A_log`` and ``dt_bias``) and
+flash-linear-attention's ``chunk_kda(use_gate_in_kernel=True, ...)``, whose
+``out`` the row compares with the non-deterministic arm's
+(``fla_raw_out_vs_nd``: the relative RMS difference; an adapter that drops a
+gate term shows here).  This package's raw mode runs the deterministic
+package's programs in the same order, so every result (``dg`` of the raw gate,
+``dA_log`` and ``ddt_bias`` included) is bitwise the deterministic one and no
+path runs an S1 pair.
+
 Memory: per row, arm and boundary one untimed call after the warm-up, between
 ``torch.cuda.reset_peak_memory_stats()`` and the allocator's counters, gives
 ``peak_bytes`` (the peak allocation of the call beyond what was allocated
@@ -75,12 +90,14 @@ Example::
     python benchmarks/bench_cake_kda_train.py --seqlen 16384 65536 --docs 3 --heads 4 64
     python benchmarks/bench_cake_kda_train.py --seqlen 261393 --docs 4 --heads 4 --rounds 5 --json out.json
     python benchmarks/bench_cake_kda_train.py --seqlen 65536 --docs 3 --heads 16 --side-stream
+    python benchmarks/bench_cake_kda_train.py --seqlen 16384 65536 --docs 3 --heads 4 64 --gate g raw
 """
 
 from __future__ import annotations
 
 import argparse
 import gc
+import itertools
 import json
 import math
 import statistics
@@ -101,12 +118,18 @@ from flashinfer.experimental.cake_kda_det_train import (  # noqa: E402
     cake_backend as det_backend,
 )
 from flashinfer.testing import bench_gpu_time  # noqa: E402
-from tests.test_helpers.cake_kda_det_train_reference import make_inputs  # noqa: E402
+from tests.test_helpers.cake_kda_det_train_reference import (  # noqa: E402
+    LOWER_BOUND,
+    make_inputs,
+    make_raw_inputs,
+)
 
 BOUNDARIES = ("fwd", "bwd", "ckpt", "replay")
 DEFAULT_BOUNDARIES = ("fwd", "bwd", "ckpt")
 ARMS = ("det", "nd", "fla")
 GRAD_ORDER = ("dq", "dk", "dv", "dbeta", "dg")  # the order the backward returns
+RAW_GRAD_ORDER = GRAD_ORDER + ("dA_log", "ddt_bias")  # the raw gate mode's
+GATES = ("g", "raw")
 # ``--side-stream``: a one-thread kernel resident on another stream while a Cake call runs.  It spins for at least
 # SIDE_MIN_CYCLES (about 5 ms at 2 GHz) and SIDE_CYCLES_PER_MS per ms of the call's slowest warm-up (twice the call at
 # 2 GHz); the call starts after PRE_SLEEP_CYCLES on its own stream, so the side kernel is resident first.
@@ -183,11 +206,37 @@ def _error(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {exc}"
 
 
+def _gate_of(inputs: dict) -> str:
+    """The gate mode of a row's operands: ``"raw"`` for :func:`make_raw_inputs`' (with ``A_log``)."""
+    return "raw" if "A_log" in inputs else "g"
+
+
+def _raw_kw(inputs: dict, params=None) -> dict:
+    """The raw gate mode's keywords of a Cake call on ``inputs`` (``params``: the ``(A_log, dt_bias)`` leaves of an
+    autograd call), empty in the explicit gate mode."""
+    if _gate_of(inputs) == "g":
+        return {}
+    a_log, dt_bias = (inputs["A_log"], inputs["dt_bias"]) if params is None else params
+    return {
+        "use_gate_in_kernel": True,
+        "A_log": a_log,
+        "dt_bias": dt_bias,
+        "lower_bound": LOWER_BOUND,
+    }
+
+
+def _leaf_names(inputs: dict) -> tuple[str, ...]:
+    """The autograd leaves of a row: ``q, k, v, g, beta`` and in the raw gate mode ``A_log, dt_bias``."""
+    names = ("q", "k", "v", "g", "beta")
+    return names + (("A_log", "dt_bias") if _gate_of(inputs) == "raw" else ())
+
+
 def cake_boundaries(
     inputs: dict, ws, *, deterministic: bool
 ) -> dict[str, Callable[[], object]]:
     """The boundaries of one Cake arm on its workspace: the deterministic package's entries, or this package's
-    with ``deterministic=False``.  Each closure returns its results (the memory call holds them)."""
+    with ``deterministic=False``, in the gate mode of ``inputs``.  Each closure returns its results (the memory
+    call holds them)."""
     q, k, v, g, beta, cu, dout = (
         inputs[n] for n in ("q", "k", "v", "g", "beta", "cu_seqlens", "dout")
     )
@@ -201,42 +250,49 @@ def cake_boundaries(
         bwd_fn = nd_backend.chunk_kda_bwd
         autograd_fn = nd_backend.chunk_kda
         mode = {"deterministic": False}
+    raw = _raw_kw(inputs)
 
     def fwd() -> object:
         return fwd_fn(
-            q, k, v, g, beta, cu, save_for_backward=True, workspace=ws, **mode
+            q, k, v, g, beta, cu, save_for_backward=True, workspace=ws, **mode, **raw
         )
 
     _, saved = fwd_fn(
-        q, k, v, g, beta, cu, save_for_backward=True, workspace=ws, **mode
+        q, k, v, g, beta, cu, save_for_backward=True, workspace=ws, **mode, **raw
     )
 
     def bwd() -> object:
-        return bwd_fn(q, k, v, g, beta, cu, dout, saved=saved, workspace=ws, **mode)
+        return bwd_fn(
+            q, k, v, g, beta, cu, dout, saved=saved, workspace=ws, **mode, **raw
+        )
 
     def replay() -> object:
-        return bwd_fn(q, k, v, g, beta, cu, dout, saved=None, workspace=ws, **mode)
+        return bwd_fn(
+            q, k, v, g, beta, cu, dout, saved=None, workspace=ws, **mode, **raw
+        )
 
     leaves = [
-        inputs[n].detach().clone().requires_grad_(True)
-        for n in ("q", "k", "v", "g", "beta")
+        inputs[n].detach().clone().requires_grad_(True) for n in _leaf_names(inputs)
     ]
 
-    def ckpt() -> object:
-        o = checkpoint(
-            lambda *a: autograd_fn(*a, cu, workspace=ws, **mode),
-            *leaves,
-            use_reentrant=False,
+    def step(*a):
+        # the raw mode's A_log / dt_bias are leaves too (gradients to them)
+        return autograd_fn(
+            *a[:5], cu, workspace=ws, **mode, **_raw_kw(inputs, a[5:] or None)
         )
+
+    def ckpt() -> object:
+        o = checkpoint(step, *leaves, use_reentrant=False)
         return torch.autograd.grad(o, leaves, dout)
 
     return {"fwd": fwd, "bwd": bwd, "ckpt": ckpt, "replay": replay}
 
 
 def fla_boundaries(inputs: dict) -> dict[str, Callable[[], object]] | None:
-    """flash-linear-attention's ``chunk_kda`` on the same preactivated operands (no in-kernel L2 norm, gate or
-    sigmoid), or ``None`` when the package is not installed.  The first call runs here: an exception from it
-    propagates to the caller (:func:`run_row` records it as ``fla_error``)."""
+    """flash-linear-attention's ``chunk_kda`` on the same operands (no in-kernel L2 norm or beta sigmoid; the
+    preactivated gate, or in the raw gate mode its in-kernel gate with ``A_log``, ``dt_bias`` and the lower bound),
+    or ``None`` when the package is not installed.  The first call runs here: an exception from it propagates to
+    the caller (:func:`run_row` records it as ``fla_error``)."""
     try:
         from fla.ops.kda import chunk_kda as fla_chunk_kda
     except Exception:
@@ -245,7 +301,19 @@ def fla_boundaries(inputs: dict) -> dict[str, Callable[[], object]] | None:
         inputs[n] for n in ("q", "k", "v", "g", "beta", "cu_seqlens", "dout")
     )
 
-    def call(q_, k_, v_, g_, beta_):
+    raw_mode = _gate_of(inputs) == "raw"
+
+    def call(q_, k_, v_, g_, beta_, *params):
+        gate = (
+            {
+                "use_gate_in_kernel": True,
+                "A_log": params[0],
+                "dt_bias": params[1],
+                "lower_bound": LOWER_BOUND,
+            }
+            if raw_mode
+            else {"use_gate_in_kernel": False}
+        )
         o, _ = fla_chunk_kda(
             q_.unsqueeze(0),
             k_.unsqueeze(0),
@@ -256,16 +324,15 @@ def fla_boundaries(inputs: dict) -> dict[str, Callable[[], object]] | None:
             initial_state=None,
             output_final_state=False,
             use_qk_l2norm_in_kernel=False,
-            use_gate_in_kernel=False,
             use_beta_sigmoid_in_kernel=False,
             safe_gate=True,
             cu_seqlens=cu,
+            **gate,
         )
         return o.squeeze(0)
 
     leaves = [
-        inputs[n].detach().clone().requires_grad_(True)
-        for n in ("q", "k", "v", "g", "beta")
+        inputs[n].detach().clone().requires_grad_(True) for n in _leaf_names(inputs)
     ]
 
     def fwd() -> object:
@@ -284,18 +351,31 @@ def fla_boundaries(inputs: dict) -> dict[str, Callable[[], object]] | None:
 
 
 def _results(inputs: dict, ws, *, deterministic: bool, replay: bool) -> dict:
-    """``out`` and the gradients of one Cake arm (from the saved set, or the replay's)."""
+    """``out`` and the gradients of one Cake arm (from the saved set, or the replay's), in the gate mode of
+    ``inputs``."""
     q, k, v, g, beta, cu, dout = (
         inputs[n] for n in ("q", "k", "v", "g", "beta", "cu_seqlens", "dout")
     )
+    raw = _raw_kw(inputs)
     if deterministic:
-        out, saved = det_backend.chunk_kda_det_fwd(q, k, v, g, beta, cu, workspace=ws)
+        out, saved = det_backend.chunk_kda_det_fwd(
+            q, k, v, g, beta, cu, workspace=ws, **raw
+        )
         grads = det_backend.chunk_kda_det_bwd(
-            q, k, v, g, beta, cu, dout, saved=None if replay else saved, workspace=ws
+            q,
+            k,
+            v,
+            g,
+            beta,
+            cu,
+            dout,
+            saved=None if replay else saved,
+            workspace=ws,
+            **raw,
         )
     else:
         out, saved = nd_backend.chunk_kda_fwd(
-            q, k, v, g, beta, cu, workspace=ws, deterministic=False
+            q, k, v, g, beta, cu, workspace=ws, deterministic=False, **raw
         )
         grads = nd_backend.chunk_kda_bwd(
             q,
@@ -308,10 +388,12 @@ def _results(inputs: dict, ws, *, deterministic: bool, replay: bool) -> dict:
             saved=None if replay else saved,
             workspace=ws,
             deterministic=False,
+            **raw,
         )
+    order = RAW_GRAD_ORDER if raw else GRAD_ORDER
     return {
         "out": out.clone(),
-        **{n: t.clone() for n, t in zip(GRAD_ORDER, grads, strict=True)},
+        **{n: t.clone() for n, t in zip(order, grads, strict=True)},
     }
 
 
@@ -322,7 +404,8 @@ def _bits_equal(a: torch.Tensor, b: torch.Tensor) -> bool:
 
 def _nd_vs_det(inputs: dict, det_ws, nd_ws) -> dict:
     """The non-deterministic results against the deterministic ones on the same inputs, from the saved set and from
-    the replay: the outputs that are bitwise, and ``dg``'s differing elements and largest difference."""
+    the replay: the outputs that are bitwise (in the raw gate mode every one, ``dA_log`` and ``ddt_bias``
+    included), and ``dg``'s differing elements and largest difference."""
     report = {}
     for label, replay in (("saved", False), ("replay", True)):
         det = _results(inputs, det_ws, deterministic=True, replay=replay)
@@ -330,6 +413,9 @@ def _nd_vs_det(inputs: dict, det_ws, nd_ws) -> dict:
         diff = (nd["dg"].double() - det["dg"].double()).abs()
         report[label] = {
             "bitwise": [name for name in det if _bits_equal(nd[name], det[name])],
+            "not_bitwise": [
+                name for name in det if not _bits_equal(nd[name], det[name])
+            ],
             "dg_differing_elements": int((diff > 0).sum().item()),
             "dg_max_abs_diff": float(diff.max().item()) if diff.numel() else 0.0,
             "dg_max_abs": float(det["dg"].abs().max().item()) if diff.numel() else 0.0,
@@ -429,18 +515,22 @@ def run_row(
     lengths: tuple[int, ...] | None = None,
     fla_alone: bool = False,
     arms_alone: bool = False,
+    gate: str = "g",
 ) -> dict:
     lengths = split_docs(seqlen, docs) if lengths is None else lengths
-    inputs = make_inputs(lengths, heads, device)
+    make = {"g": make_inputs, "raw": make_raw_inputs}[gate]
+    inputs = make(lengths, heads, device)
 
     def det_workspace():
-        ws = det_backend.KdaDetWorkspace.for_problem(seqlen, docs, heads, device)
+        ws = det_backend.KdaDetWorkspace.for_problem(
+            seqlen, docs, heads, device, gate=gate
+        )
         ws.load()
         return ws
 
     def nd_workspace():
         ws = nd_backend.KdaWorkspace.for_problem(
-            seqlen, docs, heads, device, deterministic=False
+            seqlen, docs, heads, device, gate=gate, deterministic=False
         )
         ws.load()
         return ws
@@ -451,6 +541,7 @@ def run_row(
         "docs": docs,
         "lengths": list(lengths),
         "heads": heads,
+        "gate": gate,
         "arch": nd_ws.arch,
         "recurrence": nd_ws.plan.recur,
         "segments_per_doc": nd_ws.plan.P,
@@ -499,6 +590,12 @@ def run_row(
             fla_failed(exc)
         if fla is not None:
             arms["fla"] = fla
+    if gate == "raw" and "fla" in arms:
+        # flash-linear-attention's raw form against this package's out on the same operands
+        try:
+            row["fla_raw_out_vs_nd"] = _fla_raw_out_vs_nd(inputs, arms["fla"], nd_ws)
+        except Exception as exc:
+            fla_failed(exc)
     # warm every closure once (libraries loaded, the allocator primed) before the first timed round
     for arm in list(arms):
         try:
@@ -645,9 +742,17 @@ def run_row(
     return row
 
 
+def _fla_raw_out_vs_nd(inputs: dict, fla: dict, nd_ws) -> float:
+    """The relative RMS difference of flash-linear-attention's raw-mode ``out`` from this package's on the same
+    operands (an FLA adapter that drops a gate term differs by far more than the two kernels' roundings)."""
+    out_fla = fla["fwd"]().detach().double()
+    out_nd = cake_boundaries(inputs, nd_ws, deterministic=False)["fwd"]()[0].double()
+    return float((out_fla - out_nd).pow(2).mean().sqrt() / out_nd.pow(2).mean().sqrt())
+
+
 def _print_row(row: dict, boundaries: tuple[str, ...]) -> None:
     cells = [
-        f"S={row['seqlen']:>7} N={row['docs']} H={row['heads']:>2} {row['arch']} "
+        f"S={row['seqlen']:>7} N={row['docs']} H={row['heads']:>2} gate={row['gate']} {row['arch']} "
         f"{row['recurrence']}{'/P' + str(row['segments_per_doc']) if row['recurrence'] == 'seg' else ''} "
         f"S1[{','.join(row['s1_paths']) or '-'}]"
     ]
@@ -661,6 +766,8 @@ def _print_row(row: dict, boundaries: tuple[str, ...]) -> None:
         if name in row["ratio_fla_over_nd"]:
             cell += f" fla {row['ms']['fla'][name]:8.3f} fla/nd x{row['ratio_fla_over_nd'][name]:5.2f}"
         cells.append(cell)
+    if "fla_raw_out_vs_nd" in row:
+        cells.append(f"fla raw out vs nd rel RMS {row['fla_raw_out_vs_nd']:.2e}")
     if "fla_error" in row:
         cells.append(f"fla error: {row['fla_error'][:120]}")
     print(" | ".join(cells))
@@ -701,6 +808,8 @@ def _write_json(
                 if args.side_stream
                 else None,
                 "boundaries": list(boundaries),
+                "gates": list(args.gate),
+                "lower_bound": LOWER_BOUND if "raw" in args.gate else None,
                 "rows": rows,
             },
             f,
@@ -713,6 +822,14 @@ def main() -> int:
     parser.add_argument("--seqlen", type=int, nargs="+", default=[16384, 65536])
     parser.add_argument("--docs", type=int, nargs="+", default=[3])
     parser.add_argument("--heads", type=int, nargs="+", default=[4])
+    parser.add_argument(
+        "--gate",
+        type=str,
+        nargs="+",
+        default=["g"],
+        choices=GATES,
+        help="the forget gate's forms per row: g (the activated FP32 gate) and / or raw (use_gate_in_kernel=True)",
+    )
     parser.add_argument(
         "--lengths",
         type=str,
@@ -784,44 +901,47 @@ def main() -> int:
     else:
         packs = [split_docs(s, d) for s in args.seqlen for d in args.docs]
     rows = []
-    for lengths in packs:
-        for heads in args.heads:
-            row = run_row(
-                sum(lengths),
-                len(lengths),
-                heads,
-                device=device,
-                baseline=not args.no_baseline,
-                boundaries=boundaries,
-                rounds=args.rounds,
-                side_stream=args.side_stream,
-                lengths=lengths,
-                fla_alone=args.fla_alone,
-                arms_alone=args.arms_alone,
+    for lengths, heads, gate in itertools.product(packs, args.heads, args.gate):
+        row = run_row(
+            sum(lengths),
+            len(lengths),
+            heads,
+            device=device,
+            baseline=not args.no_baseline,
+            boundaries=boundaries,
+            rounds=args.rounds,
+            side_stream=args.side_stream,
+            lengths=lengths,
+            fla_alone=args.fla_alone,
+            arms_alone=args.arms_alone,
+            gate=gate,
+        )
+        _print_row(row, boundaries)
+        rows.append(row)
+        if args.json:
+            _write_json(
+                args.json,
+                rows,
+                boundaries,
+                device,
+                arch,
+                timer,
+                fla_version,
+                fla_module_version,
+                args,
             )
-            _print_row(row, boundaries)
-            rows.append(row)
-            if args.json:
-                _write_json(
-                    args.json,
-                    rows,
-                    boundaries,
-                    device,
-                    arch,
-                    timer,
-                    fla_version,
-                    fla_module_version,
-                    args,
-                )
-    for name in boundaries:
+    for gate, name in itertools.product(args.gate, boundaries):
         ratios = [
-            r["ratio_det_over_nd"][name] for r in rows if name in r["ratio_det_over_nd"]
+            r["ratio_det_over_nd"][name]
+            for r in rows
+            if r["gate"] == gate and name in r["ratio_det_over_nd"]
         ]
         if ratios:
             geo = math.exp(sum(math.log(x) for x in ratios) / len(ratios))
             slower = sum(x < 1.0 for x in ratios)
             print(
-                f"# {name}: det / nd geomean x{geo:.4f} over {len(ratios)} rows; nd slower on {slower} rows"
+                f"# gate={gate} {name}: det / nd geomean x{geo:.4f} over {len(ratios)} rows; "
+                f"nd slower on {slower} rows"
             )
     if args.json:
         _write_json(
