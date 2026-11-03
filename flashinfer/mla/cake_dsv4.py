@@ -1565,7 +1565,7 @@ _OUT_PHASE_BY_ROUTE: dict[str, int] = {
 
 # Routes whose program needs O aligned beyond the 2 bytes a contiguous bf16
 # view guarantees: fp8_lowhead_one_partition writes 32 bytes
-# (``st.global.v8.b32``) at O + 16-element offsets on sm_100a, so O must be
+# (``st.global.v8.b32``) at O + 16-element offsets on sm_100a and sm_103a, so O must be
 # 32-byte aligned.  A caller ``out`` off that alignment (a contiguous view at
 # +2 or +16 bytes) runs into an aligned staging buffer that is then copied
 # into ``out``: the same program, the same bits.  An aligned ``out`` (every
