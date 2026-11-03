@@ -466,30 +466,75 @@ _CONTEXT_PROGRAM_ROUTES: dict[
 # persistent CTA per SM).  A loader whose record differs fails closed at load.
 _CONTEXT_PROGRAMS: dict[tuple[str, str], tuple[str, int | None, bool]] = {
     ("context_bf16", "Q8192"): (
-        "cake_fmha_context_bf16_eb5b942877557703876d",
+        "cake_fmha_context_bf16_4846f01db726c36dfe88",
         256,
         False,
     ),
-    ("context_bf16", "B128"): ("cake_fmha_context_bf16_31373706c9fcb1a2b1db", 2, False),
+    ("context_bf16", "B128"): ("cake_fmha_context_bf16_3a71b4d96d0cdfb0513e", 2, False),
     ("context_bf16", "Q511_SM100A"): (
-        "cake_fmha_context_bf16_fe2dfd2eb24d75a1bccc",
+        "cake_fmha_context_bf16_4621c524ebfd2b2bb926",
         11,
         True,
     ),
     ("context_bf16", "Q511_SM103A"): (
-        "cake_fmha_context_bf16_8bd7d679916961178c03",
+        "cake_fmha_context_bf16_ea4e4fc120a1a50b6101",
         11,
         True,
     ),
     ("context_bf16", "Q257_SM100A"): (
-        "cake_fmha_context_bf16_d400e81a0185922f0097",
+        "cake_fmha_context_bf16_0dacafa48890bec55adf",
         6,
         True,
     ),
     ("context_bf16", "Q257_SM103A"): (
-        "cake_fmha_context_bf16_5fa928327be121e0c987",
+        "cake_fmha_context_bf16_a7a7514ecb102296c143",
         6,
         True,
+    ),
+    ("context_bf16", "RUNTIME_PACK1"): (
+        "cake_fmha_context_bf16_0e97d38f12331ab6bf15",
+        None,
+        False,
+    ),
+    ("context_bf16", "RUNTIME_PACK2"): (
+        "cake_fmha_context_bf16_2fd6b5d88ab61e1b00cd",
+        None,
+        False,
+    ),
+    ("context_bf16", "RUNTIME_PACK4"): (
+        "cake_fmha_context_bf16_a43572c3d68d52af005e",
+        None,
+        False,
+    ),
+    ("context_bf16", "RUNTIME_PACK5"): (
+        "cake_fmha_context_bf16_b9fcf2cc30ac830a5612",
+        None,
+        False,
+    ),
+    ("context_bf16", "RUNTIME_PACK6"): (
+        "cake_fmha_context_bf16_332d799e56da647e1489",
+        None,
+        False,
+    ),
+    ("context_bf16", "RUNTIME_PACK7"): (
+        "cake_fmha_context_bf16_99afb64fff4548ad0af8",
+        None,
+        False,
+    ),
+    ("context_bf16", "RUNTIME_PACK8"): (
+        "cake_fmha_context_bf16_f7d40147af812ca23526",
+        None,
+        False,
+    ),
+    ("context_bf16", "RUNTIME_PACK12"): (
+        "cake_fmha_context_bf16_de6d5f8c9e69623b5baa",
+        None,
+        False,
+    ),
+    ("context_bf16", "RUNTIME_PACK16"): (
+        "cake_fmha_context_bf16_7c076f3c4a8dd7a6ab97",
+        None,
+        False,
     ),
     ("context_fp8", "B256"): ("cake_fmha_context_fp8_d910d4336baa2166efb0", 1, False),
     ("context_fp8", "B256_SCALE_PTR"): (
@@ -827,6 +872,38 @@ _CONTEXT_FP8_RUNTIME_ROUTES: dict[str, dict[tuple[int, int | None], str]] = {
         (1, None): "RUNTIME_PACK1_PX",
     },
 }
+# The runtime-size BF16 programs (``RUNTIME_PACK<g>``): the persistent
+# programs of the head-group-packed kernel with every size a launch argument.
+# Their tile work is that of the JIT module of the same pack, so their output
+# is the JIT module's bit for bit; a program serves only the calls whose JIT
+# pack (:func:`_context_pack_g`) is its own.  Per target, ``(pack_g,
+# page_size)`` names the program (``None``: every page size 16 .. 1024).  The
+# host consults them only for a causal call without LSE or sink that no exact
+# route serves.
+_CONTEXT_BF16_RUNTIME_ROUTES: dict[str, dict[tuple[int, int | None], str]] = {
+    "sm100a": {
+        (16, None): "RUNTIME_PACK16",
+        (12, None): "RUNTIME_PACK12",
+        (8, None): "RUNTIME_PACK8",
+        (7, None): "RUNTIME_PACK7",
+        (6, None): "RUNTIME_PACK6",
+        (5, None): "RUNTIME_PACK5",
+        (4, None): "RUNTIME_PACK4",
+        (2, None): "RUNTIME_PACK2",
+        (1, None): "RUNTIME_PACK1",
+    },
+    "sm103a": {
+        (16, None): "RUNTIME_PACK16",
+        (12, None): "RUNTIME_PACK12",
+        (8, None): "RUNTIME_PACK8",
+        (7, None): "RUNTIME_PACK7",
+        (6, None): "RUNTIME_PACK6",
+        (5, None): "RUNTIME_PACK5",
+        (4, None): "RUNTIME_PACK4",
+        (2, None): "RUNTIME_PACK2",
+        (1, None): "RUNTIME_PACK1",
+    },
+}
 # Short sm103a launches keep each stage's P tile in its own S columns: the
 # program an exact, runtime-size or (every page size) one-stage route names
 # maps to the same schedule and arguments with the default P placement, for
@@ -1077,6 +1154,20 @@ _CONTEXT_FP8_RUNTIME_PARAMS = (
 )
 
 
+# A runtime-size BF16 program takes the sizes after the BF16 parameters: the
+# m-block count, the whole 8-unit L2 sections of the tile order, the work
+# units per request, the query heads, the GQA group and the log2 page size.
+_CONTEXT_BF16_RUNTIME_PARAMS = (
+    *_CONTEXT_HOST_PARAMS["context_bf16"],
+    "m_blocks",
+    "full_sections",
+    "bh_units",
+    "q_heads",
+    "group",
+    "page_shift",
+)
+
+
 # A split-KV FP8 program takes the runtime-size parameters, then the split
 # plan, the FP32 partials and the per-tile arrival counters.
 _CONTEXT_FP8_SPLIT_PARAMS = (
@@ -1099,6 +1190,8 @@ def _context_program_params(
     if program in _CONTEXT_FP8_SPLIT_PROGRAMS:
         return _CONTEXT_FP8_SPLIT_PARAMS
     if num_m_blocks is None:
+        if component == "context_bf16":
+            return _CONTEXT_BF16_RUNTIME_PARAMS
         return _CONTEXT_FP8_RUNTIME_PARAMS
     return _CONTEXT_HOST_PARAMS[component]
 
@@ -7075,6 +7168,13 @@ def select_cake_fmha_context_route(
                 )
                 total_bh = batch_size * (num_q_heads // pack)
                 l2_swizzle = 8 if total_bh % 8 == 0 else 1
+        # A BF16 call no exact route serves: the runtime-size program of its
+        # JIT pack and page size (the same tile work as the JIT module).
+        runtime_bf16 = _CONTEXT_BF16_RUNTIME_ROUTES.get(target)
+        if program is None and component == "context_bf16" and runtime_bf16:
+            program = runtime_bf16.get((pack_g, page_size)) or runtime_bf16.get(
+                (pack_g, None)
+            )
         # An FP8 call of at most the keys of its route's short-KV entry, where
         # the target names one: the entry's program (the same schedule, pack,
         # m-blocks and arguments).
@@ -7525,10 +7625,18 @@ class CakeFmhaContextProgramModule:
                 row_stride,
                 num_ctas,
                 counter,
-                num_ctas,
-                1,
-                1,
             )
+            if self.runtime:
+                arguments = (
+                    *arguments,
+                    num_m_blocks,
+                    total_bh // 8,
+                    units_per_batch,
+                    num_q_heads,
+                    num_q_heads // key_cache.shape[1],
+                    key_cache.shape[2].bit_length() - 1,
+                )
+            arguments = (*arguments, num_ctas, 1, 1)
         elif route.component == "context_nvfp4":
             arguments = (
                 query.view(torch.uint8),

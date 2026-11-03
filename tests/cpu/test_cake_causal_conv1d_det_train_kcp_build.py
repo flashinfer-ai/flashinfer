@@ -15,7 +15,10 @@ limitations under the License.
 
 The KCP registry (``kcp_jit``) of the Cake causal convolution training package: the records against the frozen
 kernel ABIs and the identity rule, the routes and the selection by channel count, and the ``build.json`` entries of
-the KCP programs.  No device is needed; nothing is built or launched.
+the KCP programs.  Each backward program ships twice: the cooperative build (route ``kcp_bwd``) and its ``split``
+build (route ``kcp_bwd_split``, FlashInfer issue #8365), an ordinary launch one SM short of co-resident
+(``reserve_sms``) whose ``dweight`` partial rows the zero-history package's fixed-order reduce program sums.  No device
+is needed; nothing is built or launched.
 """
 
 from __future__ import annotations
@@ -68,6 +71,15 @@ HEAD_PLAN = [
     ["parameter", "num_docs"], *GRID,
 ]  # fmt: skip
 
+REDUCE = "cake_causal_conv1d_det_train_86b5ecfbd90aca4b52e5"
+FALLBACK = "cake_causal_conv1d_det_train_5288d132a5cc927ae729_kcp"
+R200_FALLBACK = "cake_causal_conv1d_det_train_6ea6d5fc9e7fa3f2d039_kcp"
+BIG = "cake_causal_conv1d_det_train_7485529a1755e5bd3036_kcp"
+SPLIT_FALLBACK = "cake_causal_conv1d_det_train_facdd7ca702cfb7d821a_kcp"
+SPLIT_R200_FALLBACK = "cake_causal_conv1d_det_train_f3bd6b02735ab7bbb8b5_kcp"
+SPLIT_BIG = "cake_causal_conv1d_det_train_4e81b876cb5eb25e60e5_kcp"
+BWD_ROLES = ("kcp_bwd", "kcp_bwd_split")
+
 # program name -> (module, build keywords, arches, role, plan, ctas_per_sm)
 PROGRAMS = {
     "cake_causal_conv1d_det_train_675940a7a4fc0dba4b53_kcp": (
@@ -99,6 +111,30 @@ PROGRAMS = {
         {"vec": 8, "copy": "tma2d", "stage_tokens": 8, "min_blocks": 2},
         ARCHES,
         "kcp_bwd",
+        BWD_TMA_PLAN,
+        2,
+    ),
+    SPLIT_FALLBACK: (
+        BWD,
+        {"vec": 8, "copy": "tma2d", "split": True},
+        ("sm_100a", "sm_103a"),
+        "kcp_bwd_split",
+        BWD_TMA_PLAN,
+        3,
+    ),
+    SPLIT_R200_FALLBACK: (
+        BWD,
+        {"vec": 8, "min_blocks": 2, "split": True},
+        ("sm_107a",),
+        "kcp_bwd_split",
+        BWD_PLAN,
+        2,
+    ),
+    SPLIT_BIG: (
+        BWD,
+        {"vec": 8, "copy": "tma2d", "stage_tokens": 8, "min_blocks": 2, "split": True},
+        ARCHES,
+        "kcp_bwd_split",
         BWD_TMA_PLAN,
         2,
     ),
@@ -148,6 +184,9 @@ def test_record_matches_the_frozen_abi(name: str) -> None:
     assert record["grid_rule"]["geometry"] == {"threads": 128, "vec": 8}
     assert record["grid_rule"]["cooperative"] is (role == "kcp_bwd")
     assert record["launch"]["cooperative"] is (role == "kcp_bwd")
+    assert record["grid_rule"].get("reserve_sms", 0) == (
+        1 if role == "kcp_bwd_split" else 0
+    )
     assert (
         record["launch"]["block"] == (128, 1, 1)
         and record["launch"]["use_pdl"] is False
@@ -156,49 +195,66 @@ def test_record_matches_the_frozen_abi(name: str) -> None:
     assert set(record["logical"]) == kept
     vocabulary = set(kcp_jit.LOGICAL_TENSORS) | set(kcp_jit.LOGICAL_SCALARS)
     assert set(record["logical"].values()) <= vocabulary
-    if role == "kcp_bwd":
+    if role in BWD_ROLES:
         assert record["workspace_rule"] == {
             "kind": "partial_rows",
             "taps": kcp_jit.WIDTH,
         }
     else:
         assert record["workspace_rule"] is None
+    if role == "kcp_bwd_split":
+        # the reduce program the host launches after the main program: the zero-history package's default reduce
+        assert record["reduce"] == REDUCE and REDUCE in cake_jit.MODULES
+    else:
+        assert "reduce" not in record
 
 
 @pytest.mark.cpu_only
 def test_routes_and_selection() -> None:
     assert kcp_jit.KINDS == ("kcp_fwd", "kcp_bwd", "kcp_bwd_head")
+    assert kcp_jit.ROUTE_KINDS == (
+        "kcp_fwd",
+        "kcp_bwd",
+        "kcp_bwd_split",
+        "kcp_bwd_head",
+    )
+    assert kcp_jit.BWD_KINDS == BWD_ROLES
     for arch in ARCHES:
         routes = kcp_jit.ROUTES[arch]
-        assert set(routes) == set(kcp_jit.KINDS)
+        assert set(routes) == set(kcp_jit.ROUTE_KINDS)
         assert routes["kcp_fwd"] == [
             "cake_causal_conv1d_det_train_675940a7a4fc0dba4b53_kcp"
         ]
         assert routes["kcp_bwd_head"] == [
             "cake_causal_conv1d_det_train_17cd42fb05079bbbf840_kcp"
         ]
-        fallback = (
-            "cake_causal_conv1d_det_train_6ea6d5fc9e7fa3f2d039_kcp"
-            if arch == "sm_107a"
-            else "cake_causal_conv1d_det_train_5288d132a5cc927ae729_kcp"
-        )
-        big = "cake_causal_conv1d_det_train_7485529a1755e5bd3036_kcp"
-        assert routes["kcp_bwd"] == [fallback, big]
-        assert kcp_jit.route_modules(arch, "kcp_bwd") == (fallback, big)
-        assert kcp_jit.select_rule(kcp_jit.MODULES[big]) == {
-            "channels": BIG_C_MIN,
-            "kind": "channels_at_least",
-        }
-        assert kcp_jit.select_rule(kcp_jit.MODULES[fallback]) is None
-        assert kcp_jit.selected_modules(arch, "kcp_bwd", C=BIG_C_MIN[arch] - 8) == (
-            fallback,
-        )
-        assert kcp_jit.selected_modules(arch, "kcp_bwd", C=BIG_C_MIN[arch]) == (big,)
-        assert kcp_jit.selected_modules(arch, "kcp_bwd", C=8192) == (big,)
+        for kind, fallback, big in (
+            ("kcp_bwd", R200_FALLBACK if arch == "sm_107a" else FALLBACK, BIG),
+            (
+                "kcp_bwd_split",
+                SPLIT_R200_FALLBACK if arch == "sm_107a" else SPLIT_FALLBACK,
+                SPLIT_BIG,
+            ),
+        ):
+            assert routes[kind] == [fallback, big]
+            assert kcp_jit.route_modules(arch, kind) == (fallback, big)
+            assert kcp_jit.select_rule(kcp_jit.MODULES[big]) == {
+                "channels": BIG_C_MIN,
+                "kind": "channels_at_least",
+            }
+            assert kcp_jit.select_rule(kcp_jit.MODULES[fallback]) is None
+            assert kcp_jit.selected_modules(arch, kind, C=BIG_C_MIN[arch] - 8) == (
+                fallback,
+            )
+            assert kcp_jit.selected_modules(arch, kind, C=BIG_C_MIN[arch]) == (big,)
+            assert kcp_jit.selected_modules(arch, kind, C=8192) == (big,)
         assert kcp_jit.selected_modules(arch, "kcp_fwd", C=256) == (
             routes["kcp_fwd"][0],
         )
         assert kcp_jit.workspace_record(arch)["role"] == "kcp_bwd"
+        assert {owner["role"] for owner in kcp_jit.workspace_owners(arch)} == set(
+            BWD_ROLES
+        )
     head = kcp_jit.MODULES["cake_causal_conv1d_det_train_17cd42fb05079bbbf840_kcp"]
     assert kcp_jit.head_grid(head, n_frag=3, C=4096) == (3 * 4, 1, 1)
     assert kcp_jit.head_grid(head, n_frag=0, C=4096) == (1, 1, 1)
@@ -230,3 +286,32 @@ def test_build_manifest_lists_the_kcp_programs() -> None:
             assert f"{name}_{arch}" not in libraries, (name, arch)
             with pytest.raises(RuntimeError, match="is not delivered for"):
                 kcp_jit.library_name(name, arch)
+
+
+@pytest.mark.cpu_only
+def test_backward_launch_form_selects_the_route(monkeypatch) -> None:
+    """The host's ``cooperative`` argument (FlashInfer issue #8365): ``None`` is the package default, a bool picks the
+    ``kcp_bwd`` (cooperative) or ``kcp_bwd_split`` route, anything else is refused; the split records launch
+    ``ctas_per_sm x (SMs - reserve_sms)`` CTAs (:func:`kcp.launch_grid`), the cooperative ones the co-resident count."""
+
+    kcp = cake_package("cake_causal_conv1d_det_train", "kcp")
+    assert kcp.COOPERATIVE_DEFAULT is True
+    assert kcp._cooperative(None) is kcp.COOPERATIVE_DEFAULT
+    assert kcp._cooperative(True) is True and kcp._cooperative(False) is False
+    for bad in (0, 1, "split", 1.0):
+        with pytest.raises(TypeError, match="cooperative must be None or a bool"):
+            kcp._cooperative(bad)
+    assert kcp._bwd_kind(True) == "kcp_bwd"
+    assert kcp._bwd_kind(False) == "kcp_bwd_split"
+    for name, (_m, _k, _a, role, _p, ctas_per_sm) in PROGRAMS.items():
+        if role not in BWD_ROLES:
+            continue
+        record = kcp_jit.MODULES[name]
+        full = (ctas_per_sm * 148, 1, 1)  # the co-resident grid of a 148-SM device
+        reserve = 1 if role == "kcp_bwd_split" else 0
+        monkeypatch.setattr(kcp, "_record_launch_grid", lambda record, **_kw: full)
+        assert kcp.launch_grid(record, device_index=0) == (
+            ctas_per_sm * (148 - reserve),
+            1,
+            1,
+        )
