@@ -1731,6 +1731,8 @@ _OUT_ALIGN_CASES = [
     _align_case("fp8_lowhead_one_partition", 32, _FP8, [4] * 3, width=256, form="q4"),
     _align_case("fp8_lowhead_one_partition", 32, _FP8, [1] * 3, width=256, form="q1"),
     _align_case("fp8_lowhead_prefill", 32, _FP8, [4] * 3),
+    # 12 tokens, sparse_topk 260: two complete tiles and a partial third.
+    _align_case("fp8_lowhead_h64", 64, _FP8, [5, 4, 3], "ragged", 132, page=2),
     _align_case("fp8_h64_prefill_source_persistent_m64", 32, _FP8, [257]),
     _align_case(
         "fp8_h64_prefill_source_persistent_m64_multi_tile", 32, _FP8, [257], width=256
