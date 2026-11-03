@@ -7771,19 +7771,27 @@ class _MixLenSplitLaunch:
         self._fork = torch.cuda.Event() if sides else None
         self._join = {side: torch.cuda.Event() for side in sides}
         self.split_mode = mode
-        self.schedule = (
-            f"mixlen_{mode}["
+        first = getattr(self, self._layout[0][0])
+        self.route = first.route
+        self.gate_kind = first.gate_kind
+        self.gpu_arch = first.gpu_arch
+        self.sm_count = first.sm_count
+
+    @property
+    def schedule(self) -> str:
+        """The split's part programs, read from each part's current schedule.
+
+        A part that falls back from a refused cooperative launch switches its
+        own ``schedule``; reading it here keeps the composite name current.
+        """
+        return (
+            f"mixlen_{self.split_mode}["
             + "+".join(
                 f"{getattr(self, name).schedule}@{seqs[0]}-{seqs[1]}{'/s%d' % side if side else ''}"
                 for name, side, seqs in self._layout
             )
             + "]"
         )
-        first = getattr(self, self._layout[0][0])
-        self.route = first.route
-        self.gate_kind = first.gate_kind
-        self.gpu_arch = first.gpu_arch
-        self.sm_count = first.sm_count
 
     def __getattr__(self, name):
         if name.startswith("_"):
