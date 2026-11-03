@@ -1742,8 +1742,33 @@ def test_cake_decode_smallm_in_an_sm_partition_completes(api) -> None:
         ("bf16_b4_s1024", {"kv_len": 1, "width": 32}, "DEC_B4C4"),
         ("bf16_b4_s1024", {"kv_len": 1}, None),
         ("bf16_b128_s4096", {"kv_len": 4000, "width": 256}, "DEC_B128"),
+        # A table narrower than the kernels read keeps a JIT member that
+        # serves the launch; the stream-K program's 16-byte page-id loads also
+        # need a width of a multiple of four pages.
         ("bf16_b128_s4096", {"kv_len": 4000}, None),
         ("bf16_b128_s4096", {"width": 255}, None),
+        ("bf16_b128_s4096", {"width": 258}, None),
+        ("bf16_b128_s4096", {"width": 260}, "DEC_B128"),
+        ("bf16_b128_s4096", {"kv_len": 1300, "width": 97}, None),
+        # Short KV (at most nine 128-token blocks) on a table that fits.
+        ("bf16_b128_s4096", {"kv_len": 1152, "width": 80}, "DEC_B128"),
+        ("bf16_b128_s4096", {"kv_len": 1152}, None),
+        ("bf16_b256_s4096_sink", {"kv_len": 1152, "width": 80}, "DEC_SINK"),
+        ("bf16_b256_s4096_sink", {"kv_len": 1152}, None),
+        # No JIT member serves a sink launch the exact member cannot finish:
+        # the program takes it with its table padded at the end of the
+        # workspace, when the workspace holds that copy past its scratch.
+        ("bf16_b256_s4096_sink", {"kv_len": 1300, "width": 82}, "DEC_SINK"),
+        (
+            "bf16_b256_s4096_sink",
+            {"kv_len": 1300, "width": 82, "workspace_bytes": 132352},
+            "DEC_SINK",
+        ),
+        (
+            "bf16_b256_s4096_sink",
+            {"kv_len": 1300, "width": 82, "workspace_bytes": 132095},
+            None,
+        ),
         ("bf16_b128_s4096", {"batch": 127}, None),
         ("bf16_b128_s4096", {"batch": 129}, None),
         ("bf16_b256_s4096_sink", {"batch": 255}, None),
@@ -1985,6 +2010,45 @@ def test_cake_decode_bf16_program_values(monkeypatch, row, grid, device_scales) 
         assert "split_ws" not in values and "split_counter" not in values
 
 
+@pytest.mark.parametrize(
+    ("row", "kv_len", "width", "device_scales"),
+    [
+        ("bf16_b256_s4096_sink", 1300, 82, False),
+        ("bf16_b256_s4096_sink", 1300, 82, True),
+        ("bf16_b128_s4096", 4000, 250, True),
+        ("bf16_b128_s4096", 1152, 72, True),
+    ],
+)
+def test_cake_decode_bf16_program_reads_a_padded_table(
+    monkeypatch, row, kv_len, width, device_scales
+) -> None:
+    """A launch no JIT member serves, with a table narrower than the kernels
+    read (eight pages per evened 128-token block): the program reads a copy
+    in the last 256-byte-aligned bytes of the workspace, the caller's pages
+    then page 0, its width the row stride.  The LSE scratch stays at the JIT
+    route's offset."""
+
+    kwargs, launches = _program_values(
+        monkeypatch, row, device_scales=device_scales, kv_len=kv_len, width=width
+    )
+    ((_, values),) = launches
+    batch = kwargs["batch_size"]
+    blocks = -(-kv_len // 128)
+    pages = 8 * max(4, blocks + blocks % 2)
+    table = values["page_table"]
+    workspace = kwargs["workspace_buffer"]
+    offset = (workspace.numel() - batch * pages * 4) // 256 * 256
+    assert table.shape == (batch, pages) and table.dtype == torch.int32
+    assert table.data_ptr() == workspace.data_ptr() + offset
+    assert values["max_pages_per_seq"] == pages
+    # the workspace was poisoned: the copy and the padding were written
+    assert torch.equal(table[:, :width], kwargs["block_tables"])
+    assert not table[:, width:].any()
+    assert values["LSE_ptr"].data_ptr() == (
+        workspace.data_ptr() + (batch * 4 + 15) // 16 * 16
+    )
+
+
 @pytest.mark.parametrize("counters", ("caller", "small_caller", "workspace"))
 @pytest.mark.parametrize("sm_count", (148, 152))
 def test_cake_decode_bf16_streamk_counters_follow_the_buffers(
@@ -2124,6 +2188,80 @@ def test_cake_decode_bf16_programs_match_reference_and_the_jit_route(
         assert torch.equal(_bits(got), _bits(jit))
     else:
         torch.testing.assert_close(got.float(), jit.float(), atol=1e-2, rtol=1e-2)
+
+
+@_GPU
+@pytest.mark.parametrize("lengths", ("uniform", "ragged"))
+@pytest.mark.parametrize(
+    ("row", "kv_len", "device_scales"),
+    [
+        ("bf16_b256_s4096_sink", 1300, False),
+        ("bf16_b256_s4096_sink", 1300, True),
+        ("bf16_b128_s4096", 1300, True),
+    ],
+)
+def test_cake_decode_bf16_program_padded_table_matches_the_wide_table(
+    served_programs, row, kv_len, device_scales, lengths
+) -> None:
+    """A table holding only each request's pages (82 for 1300 keys, under
+    the 96 the kernels read) of a launch no JIT member serves runs the
+    program on a padded copy: the bits of the table widened with page 0, and
+    the FP32 reference."""
+
+    target = _require_full_device()
+    batch = SHAPE_ROWS[row][2]
+    seq = [kv_len] * batch
+    if lengths == "ragged":
+        seq = ([kv_len, 1, 2, 129, kv_len - 1, 255, kv_len // 2, 17] * batch)[:batch]
+    case = _bf16_gpu_case(row, seed=20261101, lengths=seq, device_scales=device_scales)
+    pages = -(-kv_len // 16)
+    case.block_tables = case.block_tables[:, :pages].contiguous()
+    case.max_seq_len = kv_len
+    narrow = _run_bf16(case)
+    identifier = SHAPE_ROWS[row][-1][target]
+    if device_scales:
+        identifier = _device_scale_program("decode_bf16", identifier)
+    assert served_programs == [("decode_bf16", identifier)]
+    wide = torch.zeros((batch, 96), dtype=torch.int32, device="cuda")
+    wide[:, :pages] = case.block_tables
+    case.block_tables = wide
+    widened = _run_bf16(case)
+    assert served_programs[-1] == ("decode_bf16", identifier)
+    assert torch.equal(_bits(narrow), _bits(widened))
+    batches = list(range(batch)) if "B128" in identifier else [0, 1, 2, batch - 1]
+    reference = _bf16_reference(case, batches)
+    for b in batches:
+        torch.testing.assert_close(
+            narrow[b].float(), reference[b][0], atol=1e-2, rtol=1e-2, msg=f"request {b}"
+        )
+
+
+@_GPU
+@pytest.mark.parametrize("width", (97, 98, 99))
+def test_cake_decode_bf16_odd_width_table_matches_the_reference(
+    served_programs, width
+) -> None:
+    """A table whose width is not a multiple of four pages (1300 keys): the
+    stream-K program and the JIT member read page ids with 16-byte loads, so
+    the launch keeps the member, which reads a padded copy, and matches the
+    FP32 reference."""
+
+    _require_full_device()
+    batch, kv_len = 128, 1300
+    case = _bf16_gpu_case("bf16_b128_s4096", seed=20261102, lengths=[kv_len] * batch)
+    pages = -(-kv_len // 16)
+    table = torch.zeros((batch, width), dtype=torch.int32, device="cuda")
+    table[:, :pages] = case.block_tables[:, :pages]
+    case.block_tables = table
+    case.max_seq_len = kv_len
+    got = _run_bf16(case)
+    torch.cuda.synchronize()
+    assert served_programs == []
+    reference = _bf16_reference(case, list(range(batch)))
+    for b in range(batch):
+        torch.testing.assert_close(
+            got[b].float(), reference[b][0], atol=1e-2, rtol=1e-2, msg=f"request {b}"
+        )
 
 
 @_GPU
@@ -2406,3 +2544,55 @@ def test_cake_decode_program_launches_on_the_current_torch_stream(
     assert torch.equal(_bits(out), _bits(direct))
     family = "decode_fp8" if row.startswith("fp8") else "decode_bf16"
     assert set(served_programs) == {(family, SHAPE_ROWS[row][-1][target])}
+
+
+# --- GPU: pages past each request's length -----------------------------------
+
+
+def _poison_pages_past_the_lengths(case, poison):
+    """Every table slot past a request's last page: its page holds NaN keys and
+    values (``nan_pages``), or the slot names no page of the pool
+    (``garbage_ids``).  The slots up to each length stay."""
+
+    page, width = case.kv_cache.shape[3], case.block_tables.shape[1]
+    used = (case.seq_lens.long() + page - 1) // page
+    past = torch.arange(width, device=used.device)[None, :] >= used[:, None]
+    if poison == "nan_pages":
+        case.kv_cache[case.block_tables[past].long()] = float("nan")
+        return
+    junk = torch.tensor(
+        (-1, 2**31 - 1, case.kv_cache.shape[0] + 5, -(2**30)),
+        dtype=torch.int32,
+        device=used.device,
+    )
+    count = int(past.sum())
+    case.block_tables[past] = junk[torch.arange(count, device=used.device) % 4]
+
+
+@_GPU
+@pytest.mark.parametrize("poison", ("nan_pages", "garbage_ids"))
+@pytest.mark.parametrize("device_scales", (False, True))
+@pytest.mark.parametrize("row", _BF16_GPU_ROWS)
+def test_cake_decode_bf16_programs_read_no_page_past_the_length(
+    served_programs, row, device_scales, poison
+) -> None:
+    """A program walks each request's table only up to the request's length:
+    pages past it (NaN, or ids outside the pool) leave every output bit as the
+    clean cache gives it, and a request without keys writes zeros."""
+
+    target = _require_full_device()
+    batch, kv_len, page = SHAPE_ROWS[row][2], SHAPE_ROWS[row][4], SHAPE_ROWS[row][7]
+    lengths = [kv_len, 0, 1, page, page + 1, kv_len - page, 255, kv_len // 2]
+    lengths = (lengths * batch)[:batch]
+    case = _bf16_gpu_case(
+        row, seed=20261102, lengths=lengths, device_scales=device_scales
+    )
+    clean = _run_bf16(case)
+    _poison_pages_past_the_lengths(case, poison)
+    got = _run_bf16(case)
+    identifier = SHAPE_ROWS[row][-1][target] + ("_DS" if device_scales else "")
+    assert set(served_programs) == {("decode_bf16", identifier)}
+    assert torch.isfinite(got.float()).all()
+    assert torch.equal(_bits(got), _bits(clean))
+    empty = [b for b, length in enumerate(lengths) if length == 0]
+    assert not got[empty].float().any()

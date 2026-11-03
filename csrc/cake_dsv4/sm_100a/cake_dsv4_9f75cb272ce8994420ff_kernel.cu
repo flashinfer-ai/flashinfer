@@ -575,6 +575,8 @@ kernel_cake_dsv4_9f75cb272ce8994420ff(const __grid_constant__ CUtensorMap tmap_q
 
     // Kernel post-init ops
     const int tmem_tmem_scratch = taddr;
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     if (warp >= 8 && warp <= 11) {
         asm volatile("setmaxnreg.inc.sync.aligned.u32 136;");
     }
@@ -2135,8 +2137,8 @@ kernel_cake_dsv4_9f75cb272ce8994420ff(const __grid_constant__ CUtensorMap tmap_q
                     "@leader tcgen05.mma.cta_group::2.kind::f8f6f4 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
                     :: "r"(mma_a_lo), "r"(mma_b_lo), "r"((tmem_tmem_scratch + (first_score_col))), "r"(0) : "memory");
-                        int mma_a_lo_1 = (((smem_q_full_addr + 8192) >> 4) & 0x3FFF) + (0) * 2048;
-                        int mma_b_lo_1 = (((smem_k_full_addr + 8192) >> 4) & 0x3FFF) + (mma_k_stage) * 2048;
+                        int mma_a_lo_1_0 = (((smem_q_full_addr + 8192) >> 4) & 0x3FFF) + (0) * 2048;
+                        int mma_b_lo_1_0 = (((smem_k_full_addr + 8192) >> 4) & 0x3FFF) + (mma_k_stage) * 2048;
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -2170,9 +2172,9 @@ kernel_cake_dsv4_9f75cb272ce8994420ff(const __grid_constant__ CUtensorMap tmap_q
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f8f6f4 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
-                    :: "r"(mma_a_lo_1), "r"(mma_b_lo_1), "r"((tmem_tmem_scratch + (first_score_col))), "r"(1) : "memory");
-                        int mma_a_lo_2 = (((smem_q_full_addr + 16384) >> 4) & 0x3FFF) + (0) * 2048;
-                        int mma_b_lo_2 = (((smem_k_full_addr + 16384) >> 4) & 0x3FFF) + (mma_k_stage) * 2048;
+                    :: "r"(mma_a_lo_1_0), "r"(mma_b_lo_1_0), "r"((tmem_tmem_scratch + (first_score_col))), "r"(1) : "memory");
+                        int mma_a_lo_1_1 = (((smem_q_full_addr + 16384) >> 4) & 0x3FFF) + (0) * 2048;
+                        int mma_b_lo_1_1 = (((smem_k_full_addr + 16384) >> 4) & 0x3FFF) + (mma_k_stage) * 2048;
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -2206,9 +2208,9 @@ kernel_cake_dsv4_9f75cb272ce8994420ff(const __grid_constant__ CUtensorMap tmap_q
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f8f6f4 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
-                    :: "r"(mma_a_lo_2), "r"(mma_b_lo_2), "r"((tmem_tmem_scratch + (first_score_col))), "r"(1) : "memory");
-                        int mma_a_lo_3 = (((smem_q_full_addr + 24576) >> 4) & 0x3FFF) + (0) * 2048;
-                        int mma_b_lo_3 = (((smem_k_full_addr + 24576) >> 4) & 0x3FFF) + (mma_k_stage) * 2048;
+                    :: "r"(mma_a_lo_1_1), "r"(mma_b_lo_1_1), "r"((tmem_tmem_scratch + (first_score_col))), "r"(1) : "memory");
+                        int mma_a_lo_1_2 = (((smem_q_full_addr + 24576) >> 4) & 0x3FFF) + (0) * 2048;
+                        int mma_b_lo_1_2 = (((smem_k_full_addr + 24576) >> 4) & 0x3FFF) + (mma_k_stage) * 2048;
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -2242,7 +2244,7 @@ kernel_cake_dsv4_9f75cb272ce8994420ff(const __grid_constant__ CUtensorMap tmap_q
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f8f6f4 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
-                    :: "r"(mma_a_lo_3), "r"(mma_b_lo_3), "r"((tmem_tmem_scratch + (first_score_col))), "r"(1) : "memory");
+                    :: "r"(mma_a_lo_1_2), "r"(mma_b_lo_1_2), "r"((tmem_tmem_scratch + (first_score_col))), "r"(1) : "memory");
                         if (cta_rank == 0) {
                             elect_commit_cg2_multicast(k_empty_addr + (mma_k_stage) * 8, (uint16_t)(3));
                         }
@@ -2260,8 +2262,8 @@ kernel_cake_dsv4_9f75cb272ce8994420ff(const __grid_constant__ CUtensorMap tmap_q
                         if (cta_rank == 0) {
                             mbarrier_wait(k_full_addr + (mma_k_stage) * 8, _phase_k_full);
                             asm volatile("tcgen05.fence::after_thread_sync;");
-                            int mma_a_lo_4 = (((smem_q_full_addr) >> 4) & 0x3FFF) + (0) * 2048;
-                            int mma_b_lo_4 = (((smem_k_full_addr) >> 4) & 0x3FFF) + (mma_k_stage) * 2048;
+                            int mma_a_lo_1 = (((smem_q_full_addr) >> 4) & 0x3FFF) + (0) * 2048;
+                            int mma_b_lo_1 = (((smem_k_full_addr) >> 4) & 0x3FFF) + (mma_k_stage) * 2048;
                             asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -2295,9 +2297,9 @@ kernel_cake_dsv4_9f75cb272ce8994420ff(const __grid_constant__ CUtensorMap tmap_q
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f8f6f4 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
-                    :: "r"(mma_a_lo_4), "r"(mma_b_lo_4), "r"((tmem_tmem_scratch + (score_col))), "r"(0) : "memory");
-                            int mma_a_lo_1_1 = (((smem_q_full_addr + 8192) >> 4) & 0x3FFF) + (0) * 2048;
-                            int mma_b_lo_1_1 = (((smem_k_full_addr + 8192) >> 4) & 0x3FFF) + (mma_k_stage) * 2048;
+                    :: "r"(mma_a_lo_1), "r"(mma_b_lo_1), "r"((tmem_tmem_scratch + (score_col))), "r"(0) : "memory");
+                            int mma_a_lo_1_3 = (((smem_q_full_addr + 8192) >> 4) & 0x3FFF) + (0) * 2048;
+                            int mma_b_lo_1_3 = (((smem_k_full_addr + 8192) >> 4) & 0x3FFF) + (mma_k_stage) * 2048;
                             asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -2331,9 +2333,9 @@ kernel_cake_dsv4_9f75cb272ce8994420ff(const __grid_constant__ CUtensorMap tmap_q
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f8f6f4 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
-                    :: "r"(mma_a_lo_1_1), "r"(mma_b_lo_1_1), "r"((tmem_tmem_scratch + (score_col))), "r"(1) : "memory");
-                            int mma_a_lo_2_1 = (((smem_q_full_addr + 16384) >> 4) & 0x3FFF) + (0) * 2048;
-                            int mma_b_lo_2_1 = (((smem_k_full_addr + 16384) >> 4) & 0x3FFF) + (mma_k_stage) * 2048;
+                    :: "r"(mma_a_lo_1_3), "r"(mma_b_lo_1_3), "r"((tmem_tmem_scratch + (score_col))), "r"(1) : "memory");
+                            int mma_a_lo_1_4 = (((smem_q_full_addr + 16384) >> 4) & 0x3FFF) + (0) * 2048;
+                            int mma_b_lo_1_4 = (((smem_k_full_addr + 16384) >> 4) & 0x3FFF) + (mma_k_stage) * 2048;
                             asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -2367,9 +2369,9 @@ kernel_cake_dsv4_9f75cb272ce8994420ff(const __grid_constant__ CUtensorMap tmap_q
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f8f6f4 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
-                    :: "r"(mma_a_lo_2_1), "r"(mma_b_lo_2_1), "r"((tmem_tmem_scratch + (score_col))), "r"(1) : "memory");
-                            int mma_a_lo_3_1 = (((smem_q_full_addr + 24576) >> 4) & 0x3FFF) + (0) * 2048;
-                            int mma_b_lo_3_1 = (((smem_k_full_addr + 24576) >> 4) & 0x3FFF) + (mma_k_stage) * 2048;
+                    :: "r"(mma_a_lo_1_4), "r"(mma_b_lo_1_4), "r"((tmem_tmem_scratch + (score_col))), "r"(1) : "memory");
+                            int mma_a_lo_1_5 = (((smem_q_full_addr + 24576) >> 4) & 0x3FFF) + (0) * 2048;
+                            int mma_b_lo_1_5 = (((smem_k_full_addr + 24576) >> 4) & 0x3FFF) + (mma_k_stage) * 2048;
                             asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -2403,7 +2405,7 @@ kernel_cake_dsv4_9f75cb272ce8994420ff(const __grid_constant__ CUtensorMap tmap_q
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f8f6f4 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
-                    :: "r"(mma_a_lo_3_1), "r"(mma_b_lo_3_1), "r"((tmem_tmem_scratch + (score_col))), "r"(1) : "memory");
+                    :: "r"(mma_a_lo_1_5), "r"(mma_b_lo_1_5), "r"((tmem_tmem_scratch + (score_col))), "r"(1) : "memory");
                             if (cta_rank == 0) {
                                 elect_commit_cg2_multicast(k_empty_addr + (mma_k_stage) * 8, (uint16_t)(3));
                             }
@@ -2652,8 +2654,8 @@ kernel_cake_dsv4_9f75cb272ce8994420ff(const __grid_constant__ CUtensorMap tmap_q
                             mbarrier_wait(o_empty_addr, _parity_o_empty);
                             mbarrier_wait(v_full_addr + (pv_v_stage) * 8, _phase_v_full);
                             asm volatile("tcgen05.fence::after_thread_sync;");
-                            int mma_a_lo_5 = (((smem_p_fp8_addr) >> 4) & 0x3FFF) + (pv_phase) * 512;
-                            int mma_b_lo_5 = ((((smem_v_full_addr) >> 4) & 0x3FFF) | 0x4000000) + (pv_v_stage) * 2048;
+                            int mma_a_lo_0 = (((smem_p_fp8_addr) >> 4) & 0x3FFF) + (pv_phase) * 512;
+                            int mma_b_lo_0 = ((((smem_v_full_addr) >> 4) & 0x3FFF) | 0x4000000) + (pv_v_stage) * 2048;
                             asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -2687,9 +2689,9 @@ kernel_cake_dsv4_9f75cb272ce8994420ff(const __grid_constant__ CUtensorMap tmap_q
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f8f6f4 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
-                    :: "r"(mma_a_lo_5), "r"(mma_b_lo_5), "r"((tmem_tmem_scratch + (256))), "r"(((pv_first) ? 0 : 1)) : "memory");
-                            int mma_a_lo_1_2 = (((smem_p_fp8_addr) >> 4) & 0x3FFF) + (pv_phase) * 512;
-                            int mma_b_lo_1_2 = ((((smem_v_full_addr + 16384) >> 4) & 0x3FFF) | 0x4000000) + (pv_v_stage) * 2048;
+                    :: "r"(mma_a_lo_0), "r"(mma_b_lo_0), "r"((tmem_tmem_scratch + (256))), "r"(((pv_first) ? 0 : 1)) : "memory");
+                            int mma_a_lo_2 = (((smem_p_fp8_addr) >> 4) & 0x3FFF) + (pv_phase) * 512;
+                            int mma_b_lo_2 = ((((smem_v_full_addr + 16384) >> 4) & 0x3FFF) | 0x4000000) + (pv_v_stage) * 2048;
                             asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -2723,7 +2725,7 @@ kernel_cake_dsv4_9f75cb272ce8994420ff(const __grid_constant__ CUtensorMap tmap_q
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f8f6f4 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
                     "}\n"
-                    :: "r"(mma_a_lo_1_2), "r"(mma_b_lo_1_2), "r"((tmem_tmem_scratch + (384))), "r"(((pv_first) ? 0 : 1)) : "memory");
+                    :: "r"(mma_a_lo_2), "r"(mma_b_lo_2), "r"((tmem_tmem_scratch + (384))), "r"(((pv_first) ? 0 : 1)) : "memory");
                             if (cta_rank == 0) {
                                 elect_commit_cg2_multicast(v_empty_addr + (pv_v_stage) * 8, (uint16_t)(3));
                             }
