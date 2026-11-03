@@ -79,7 +79,7 @@ def _bmm_fp8_fingerprint(
     return spec_fingerprint(K, _out_fmt(out_dtype), chunks_for(N, K, fmt), fmt)
 
 
-def _mx_family(arch) -> str:
+def _mx_family(arch, op: str = "mm_mxfp8") -> str:
     """The architecture family behind ``arch``: a family name (``"sm_100"`` / ``"sm_103"`` / ``"sm_107"``), a compute
     capability such as ``(10, 7)``, a ``torch.device``, or None for the current CUDA device."""
     from ..gemm.batch_invariant.heuristic import PART_TABLE, family_of
@@ -87,8 +87,8 @@ def _mx_family(arch) -> str:
     if arch is None:
         if not torch.cuda.is_available():
             raise ValueError(
-                "fingerprint('mm_mxfp8') needs arch= (an architecture family 'sm_100' / 'sm_103' / 'sm_107', a compute "
-                "capability or a device) when no CUDA device is available: the MXFP8 class is the architecture's"
+                f"fingerprint({op!r}) needs arch= (an architecture family 'sm_100' / 'sm_103' / 'sm_107', a compute "
+                "capability or a device) when no CUDA device is available: the block-scaled class is the architecture's"
             )
         arch = torch.device("cuda", torch.cuda.current_device())
     if isinstance(arch, torch.device):
@@ -98,7 +98,7 @@ def _mx_family(arch) -> str:
     if isinstance(arch, str):
         if arch not in PART_TABLE:
             raise ValueError(
-                f"fingerprint('mm_mxfp8') takes arch as one of {sorted(PART_TABLE)}, a compute capability or a device, not {arch!r}"
+                f"fingerprint({op!r}) takes arch as one of {sorted(PART_TABLE)}, a compute capability or a device, not {arch!r}"
             )
         return arch
     return family_of(tuple(arch))
@@ -116,6 +116,23 @@ def _mm_mxfp8_fingerprint(
     )
 
 
+def _mm_fp4_fingerprint(
+    N: int,
+    K: int,
+    out_dtype: Union[torch.dtype, str],
+    use_nvfp4: bool = True,
+    arch=None,
+) -> str:
+    from ..gemm.batch_invariant.schedule import chunks_for, fp4_class_for, mx_class_for
+    from ..gemm.batch_invariant.spec import spec_fingerprint
+
+    family = _mx_family(arch, "mm_fp4")
+    fmt = fp4_class_for(N, K, family) if use_nvfp4 else mx_class_for("mxfp4", family)
+    return spec_fingerprint(
+        K, _out_fmt(out_dtype, "mm_fp4"), chunks_for(N, K, fmt), fmt
+    )
+
+
 #: The FlashInfer APIs with a batch-invariant class, by API name.
 CLASSES: Dict[str, ClassInfo] = {
     "mm_bf16": ClassInfo("gemm.bf16", ("N", "K"), _mm_bf16_fingerprint, ("bias",)),
@@ -128,6 +145,16 @@ CLASSES: Dict[str, ClassInfo] = {
     # sm_103 one 32 (gemm.mxfp8.*64 vs gemm.mxfp8.*); `arch` defaults to the current CUDA device's
     "mm_mxfp8": ClassInfo(
         "gemm.mxfp8", ("N", "K", "out_dtype"), _mm_mxfp8_fingerprint, ("arch",)
+    ),
+    # the 4-bit classes: `use_nvfp4` picks NVFP4 (e4m3 scales per 16, gemm.nvfp4.*) or MXFP4 (UE8M0 per 32, gemm.mxfp4.*);
+    # the architecture is a dimension as for mm_mxfp8 (the sm_107 instruction folds 128 elements per step: on SM107 the
+    # MXFP4 class is gemm.mxfp4.*128, the NVFP4 class gemm.nvfp4.*128 for the weight shapes its chunk rule leaves unsplit
+    # and gemm.nvfp4.* otherwise); the caller's alpha is the chain's `mul.rn`, its value an input
+    "mm_fp4": ClassInfo(
+        "gemm.fp4",
+        ("N", "K", "out_dtype"),
+        _mm_fp4_fingerprint,
+        ("use_nvfp4", "arch"),
     ),
 }
 
@@ -153,6 +180,12 @@ def fingerprint(op: str, **dims) -> str:
     the block-scaled step of that architecture's instruction (32 e4m3 elements with one UE8M0 scale per row on SM100 /
     SM103, 64 with two on SM107: two classes, ``gemm.mxfp8.*`` and ``gemm.mxfp8.*64``), the chunk count of the weight
     shape and the conversion are the specification; the block scales, like the operands, are inputs.
+    ``mm_fp4`` takes ``N, K`` and ``out_dtype``, and optionally ``use_nvfp4`` (True by default: the NVFP4 classes with
+    one e4m3 scale per 16 elements, ``gemm.nvfp4.*``; False: the MXFP4 classes with one UE8M0 scale per 32,
+    ``gemm.mxfp4.*``) and ``arch`` as for ``mm_mxfp8``: the SM107 instruction folds 128 elements per step
+    (``gemm.mxfp4.*128`` on SM107; ``gemm.nvfp4.*128`` on SM107 for the weight shapes its chunk rule leaves unsplit,
+    ``gemm.nvfp4.*`` otherwise), the chunk count, the chain's ``mul.rn`` by the caller's alpha and the conversion are
+    the specification; the alpha's value and the block scales are inputs.
 
     >>> fingerprint("mm_bf16", N=4096, K=4096)  # doctest: +SKIP
     'gemm-bf16-kfold-...'
@@ -162,6 +195,8 @@ def fingerprint(op: str, **dims) -> str:
     'gemm-e4m3-kfold-scaled-...'
     >>> fingerprint("mm_mxfp8", N=4096, K=4096, out_dtype=torch.bfloat16, arch="sm_107")  # doctest: +SKIP
     'gemm-mxfp8-k64-kfold-...'
+    >>> fingerprint("mm_fp4", N=4096, K=4096, out_dtype=torch.bfloat16, arch="sm_100")  # doctest: +SKIP
+    'gemm-nvfp4-kfold-...'
     """
     info = CLASSES.get(op)
     if info is None:
@@ -181,7 +216,8 @@ def fingerprint(op: str, **dims) -> str:
 
 def class_name(op: str) -> str:
     """The consistency class (family) name behind the API ``op`` (``"gemm.bf16"``; ``"gemm.fp8"`` for the two fp8 classes
-    ``gemm.e4m3`` / ``gemm.e5m2`` behind ``bmm_fp8``; ``"gemm.mxfp8"`` for the two MXFP8 classes behind ``mm_mxfp8``)."""
+    ``gemm.e4m3`` / ``gemm.e5m2`` behind ``bmm_fp8``; ``"gemm.mxfp8"`` for the two MXFP8 classes behind ``mm_mxfp8``;
+    ``"gemm.fp4"`` for the NVFP4 and MXFP4 classes behind ``mm_fp4``)."""
     info = CLASSES.get(op)
     if info is None:
         raise ValueError(
