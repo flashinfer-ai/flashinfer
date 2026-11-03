@@ -1087,6 +1087,15 @@ def test_capacity_keyword_errors_go_through_joint_validation():
         UlyssesCommunicator._validate_configs_jointly(None, [ok, bad])
 
 
+def test_max_elems_attribute_is_derived_from_max_bytes():
+    """v0.7.2 exposed ``comm.max_elems``; it is now ``max_bytes // itemsize``."""
+    comm = object.__new__(UlyssesCommunicator)
+    comm.max_bytes = 2048
+    for dtype in (torch.float16, torch.bfloat16, torch.float32):
+        comm.dtype = dtype
+        assert comm.max_elems == 2048 // dtype.itemsize
+
+
 @requires_cuda
 def test_ctor_nccl_backend_never_touches_ipc_jit(gloo_pg, monkeypatch):
     forbid_ipc_and_jit(monkeypatch)
@@ -1106,6 +1115,7 @@ def test_ctor_accepts_deprecated_max_elems(gloo_pg, monkeypatch, dtype):
     with pytest.warns(DeprecationWarning, match="max_elems"):
         comm = UlyssesCommunicator(gloo_pg, max_elems=1024, dtype=dtype, backend="nccl")
     assert comm.max_bytes == 1024 * dtype.itemsize
+    assert comm.max_elems == 1024  # the v0.7.2 attribute, now derived
     comm.close()
 
 

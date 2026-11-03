@@ -591,6 +591,12 @@ class UlyssesCommunicator:
 
         self._state = _OPEN
 
+    @property
+    def max_elems(self) -> int:
+        """Capacity in elements of the construction ``dtype``: the v0.7.2
+        attribute, derived from ``max_bytes`` as on ``main`` (#4924)."""
+        return self.max_bytes // self.dtype.itemsize
+
     # ---- collective helpers ---------------------------------------------------
 
     def _group_supports_cuda_alltoall(self) -> Tuple[bool, str]:
