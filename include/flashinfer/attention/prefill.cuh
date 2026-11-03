@@ -4164,9 +4164,6 @@ __device__ __forceinline__ void vosplit_compute_pv(
   }
 }
 
-<<<<<<< HEAD
-template <typename KTraits, typename DTypeO>
-=======
 // vosplit_compute_pv for KTraits::USE_FP8_MMA: e4m3 P (written by vosplit_softmax_store_p) times
 // e4m3 V on m16n8k32 MMA over all CTA_TILE_KV tokens and this warp's output slice. V fragments
 // come from ldmatrix.trans pairs split by byte_perm into even and odd dims, so o_frag holds dims
@@ -4229,8 +4226,7 @@ __device__ __forceinline__ void vosplit_compute_pv_fp8(
   }
 }
 
-template <typename KTraits>
->>>>>>> origin/main
+template <typename KTraits, typename DTypeO>
 __device__ __forceinline__ void vosplit_write_o(
     float (*o_frag)[KTraits::NUM_MMA_D_VO_PER_WARP][8], float (*d)[2], DTypeO* o_ptr_base,
     const uint32_t o_packed_idx_base, const uint32_t qo_upper_bound, const uint32_t o_stride_n,
