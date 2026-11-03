@@ -1376,7 +1376,7 @@ def test_persistent_work_order_redeals_the_fill_tail_only():
 
 def _scan_deal_fill(work, *, grid, n_bulk, projected):
     # the deal as a scan of the grid per fill item (the specification the
-    # run-sorted form must reproduce item for item)
+    # partition form must reproduce item for item)
     out, loads, fill_slots = list(work), [0] * grid, []
     for bid, positions in enumerate(backend._kmaj_p_snake_positions(len(work), grid)):
         fill_slots.append([pos for pos in positions if pos >= n_bulk])
@@ -1401,10 +1401,10 @@ def _scan_deal_fill(work, *, grid, n_bulk, projected):
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("num_sms", [1, 2, 7, 148, 152])
-@pytest.mark.parametrize("fill_groups", [2, 8, 128])
+@pytest.mark.parametrize("fill_groups", [2, 8, 64, 128])
 @pytest.mark.parametrize("seed", range(6))
 def test_persistent_work_order_deal_matches_the_grid_scan(num_sms, fill_groups, seed):
-    # the run-sorted deal places every fill item where the scan of the grid
+    # the partitioned deal places every fill item where the scan of the grid
     # does, the lower bound is below every order, and the order the plan keeps
     # is the one of the two deals computed unconditionally (fill_groups 2: one
     # run of equal fill items)
@@ -1438,6 +1438,52 @@ def test_persistent_work_order_deal_matches_the_grid_scan(num_sms, fill_groups, 
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("num_sms", [148, 152])
+@pytest.mark.parametrize("seed", range(3))
+def test_persistent_work_order_deal_matches_the_grid_scan_on_long_lists(num_sms, seed):
+    # lists shaped like the plan's (power-of-two group counts, a short bulk
+    # prefix, thousands of fill items, largest first except for seed 1): both
+    # deals place every fill item where the scan of the grid does, and the
+    # order the plan keeps (_kmaj_p_lpt_order on the group counts) is the one
+    # the policy picks among the input and the two deals
+    rng = random.Random(500000 + 1000 * num_sms + seed)
+    fill_groups = (32, 64, 128)[seed]
+    groups = [g for g in (1, 2, 4, 8, 16, 32, 64) if g < fill_groups]
+    work = [
+        (rng.choice((fill_groups, 2 * fill_groups)), ("bulk", i))
+        for i in range(rng.randrange(0, 2 * num_sms))
+    ]
+    fill = [rng.choice(groups) for _ in range(rng.randrange(12, 20) * num_sms)]
+    if seed != 1:
+        fill.sort(reverse=True)
+    work += [(size, ("fill", i)) for i, size in enumerate(fill)]
+    grid = min(len(work), num_sms)
+    sizes = [size for size, _entry in work]
+    n_bulk = len(work) - len(fill)
+    bound = backend._kmaj_p_lpt_lower_bound(sizes, grid=grid, n_bulk=n_bulk)
+    input_load = max(backend._kmaj_p_snake_group_loads(work, num_sms=num_sms))
+    best, best_load = list(work), input_load
+    for projected in (False, True):
+        dealt, load = backend._kmaj_p_deal_fill(
+            work, grid=grid, n_bulk=n_bulk, projected=projected
+        )
+        assert (dealt, load) == _scan_deal_fill(
+            work, grid=grid, n_bulk=n_bulk, projected=projected
+        )
+        if best_load > bound and load < best_load:
+            best, best_load = dealt, load
+    source = backend._kmaj_p_lpt_order(
+        torch.tensor(sizes, dtype=torch.int64).numpy(),
+        num_sms=num_sms,
+        fill_groups=fill_groups,
+    )
+    out = list(work) if source is None else [work[i] for i in source.tolist()]
+    assert out == best
+    out = backend._kmaj_p_order_work_lpt(work, num_sms=num_sms, fill_groups=fill_groups)
+    assert out == best
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("paged,group", [(True, 16), (False, 16), (True, 8)])
 @pytest.mark.parametrize("num_sms", [4, 148, 152])
 def test_persistent_plan_order_moves_items_only(paged, group, num_sms, monkeypatch):
@@ -1466,7 +1512,7 @@ def test_persistent_plan_order_moves_items_only(paged, group, num_sms, monkeypat
     )
     lpt = backend._build_kmaj_p_plan(q2k, **kwargs)
     with monkeypatch.context() as patch:
-        patch.setattr(backend, "_kmaj_p_order_work_lpt", lambda work, **_: list(work))
+        patch.setattr(backend, "_kmaj_p_lpt_order", lambda sizes, **_: None)
         qres = backend._build_kmaj_p_plan(q2k, **kwargs)
     for key in ("k2q_row_ptr", "k2q_qsplit_indices", "split_counts"):
         assert torch.equal(lpt[key], qres[key]), key
@@ -1511,17 +1557,17 @@ def test_persistent_fused_batch_keeps_the_q_resident_order(
         group_size=16,
     )
     ordered = []
-    lpt = backend._kmaj_p_order_work_lpt
+    lpt = backend._kmaj_p_lpt_order
 
-    def recording_lpt(work, **order):
-        ordered.append(len(work))
-        return lpt(work, **order)
+    def recording_lpt(sizes, **order):
+        ordered.append(len(sizes))
+        return lpt(sizes, **order)
 
     with monkeypatch.context() as patch:
-        patch.setattr(backend, "_kmaj_p_order_work_lpt", recording_lpt)
+        patch.setattr(backend, "_kmaj_p_lpt_order", recording_lpt)
         plan = backend._build_kmaj_p_plan(q2k, **kwargs)
     with monkeypatch.context() as patch:
-        patch.setattr(backend, "_kmaj_p_order_work_lpt", lambda work, **_: list(work))
+        patch.setattr(backend, "_kmaj_p_lpt_order", lambda sizes, **_: None)
         qres = backend._build_kmaj_p_plan(q2k, **kwargs)
     work_count = int(plan["work_count"])
     assert plan["fused"] is fused

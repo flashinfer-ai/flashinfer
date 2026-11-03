@@ -91,11 +91,13 @@ from __future__ import annotations
 import bisect
 import functools
 import math
+import operator
 import threading
 import weakref
 from contextlib import nullcontext
 from typing import Any, NamedTuple, Optional, Tuple
 
+import numpy as np
 import torch
 import tvm_ffi
 
@@ -2804,146 +2806,286 @@ def _kmaj_p_snake_group_loads(work, *, num_sms: int) -> list[int]:
     ]
 
 
-def _kmaj_p_fill_layout(sizes: torch.Tensor, *, grid: int, n_bulk: int):
-    """The static snake of a work list (group counts ``sizes``, int64 on the
-    host) on ``grid`` CTAs, split at the bulk prefix ``n_bulk``: each CTA's
-    bulk load, its fill slot count and its group load under the input order,
-    and the fill slots of all CTAs, CTA by CTA, each in its processing order
-    (the positions of :func:`_kmaj_p_snake_positions` at or past
-    ``n_bulk``)."""
+def _kmaj_p_group_counts(work) -> np.ndarray:
+    """The group counts of a work list as an int64 array."""
 
-    count = int(sizes.numel())
-    grid = max(1, int(grid))
+    groups = map(operator.itemgetter(0), work)
+    return np.fromiter(groups, dtype=np.int64, count=len(work))
+
+
+def _kmaj_p_snake_counts(limit: int, grid: int) -> np.ndarray:
+    """Per CTA of the static snake on ``grid`` CTAs, how many of its positions
+    lie below ``limit``: one per full wave, plus one in the partial wave for
+    the first CTAs after an even wave count and the last ones after an odd
+    one (:func:`_kmaj_p_snake_positions`)."""
+
+    waves, rest = divmod(int(limit), grid)
+    lanes = np.arange(grid, dtype=np.int64)
+    if waves % 2:
+        lanes = grid - 1 - lanes
+    return waves + (lanes < rest)
+
+
+def _kmaj_p_snake_table(values: np.ndarray, count: int, grid: int) -> np.ndarray:
+    """``[wave, CTA]``: the entry of ``values`` at each CTA's position of each
+    wave of a ``count``-item list under the static snake (0 past ``values``)."""
+
     waves = max(1, -(-count // grid))
-    wave = torch.arange(waves, dtype=torch.int64).unsqueeze(1)
-    bid = torch.arange(grid, dtype=torch.int64).unsqueeze(0)
-    positions = (wave * grid + torch.where(wave % 2 == 0, bid, grid - 1 - bid)).t()
-    valid = positions < count
-    groups = torch.zeros_like(positions)
-    groups[valid] = sizes[positions[valid]]
-    fill = valid & (positions >= n_bulk)
-    bulk_loads = groups.masked_fill(fill, 0).sum(dim=1)
-    return bulk_loads, fill.sum(dim=1), groups.sum(dim=1), positions[fill]
+    table = np.zeros(waves * grid, dtype=np.int64)
+    table[: values.shape[0]] = values
+    table = table.reshape(waves, grid)
+    table[1::2] = table[1::2, ::-1].copy()
+    return table
 
 
-def _kmaj_p_deal_fill(work, *, grid: int, n_bulk: int, projected: bool, layout=None):
-    """Deal the fill items ``work[n_bulk:]`` largest first (stable) into the
-    fill slots of the snake, each CTA's positions past the bulk prefix in its
-    processing order: to the CTA with the smallest group load, or, with
-    ``projected``, the smallest load plus the item plus the smallest undealt
-    items its other remaining slots must still take (ties to the lower CTA
-    index).  Returns the dealt list and its largest per-CTA group load.
+def _kmaj_p_fill_layout(sizes: np.ndarray, *, grid: int, n_bulk: int):
+    """The static snake of a work list (group counts ``sizes``, int64) on
+    ``grid`` CTAs, split at the bulk prefix ``n_bulk``: per CTA its bulk load,
+    its fill slot count, its group load under the input order and the wave of
+    its first fill slot (the k-th fill slot of a CTA is its position of wave
+    ``first + k``)."""
+
+    count = int(sizes.shape[0])
+    grid = max(1, int(grid))
+    input_loads = _kmaj_p_snake_table(sizes, count, grid).sum(axis=0)
+    first = _kmaj_p_snake_counts(n_bulk, grid)
+    left = _kmaj_p_snake_counts(count, grid) - first
+    if n_bulk:
+        bulk_loads = _kmaj_p_snake_table(sizes[:n_bulk], count, grid).sum(axis=0)
+    else:
+        bulk_loads = np.zeros(grid, dtype=np.int64)
+    return bulk_loads, left, input_loads, first
+
+
+def _kmaj_p_smallest(dealt: np.ndarray) -> np.ndarray:
+    """``smallest[j]``: the sum of the ``j`` smallest of the descending sizes
+    ``dealt``."""
+
+    smallest = np.zeros(dealt.shape[0] + 1, dtype=np.int64)
+    np.cumsum(dealt[::-1], out=smallest[1:])
+    return smallest
+
+
+def _kmaj_p_lpt_lower_bound(
+    sizes, *, grid: int, n_bulk: int, layout=None, smallest=None
+) -> int:
+    """A lower bound of the largest per-CTA group load of every order of a
+    work list (group counts ``sizes``, bulk prefix ``n_bulk``) whose bulk
+    items keep their positions under the static snake: the rounded-up mean
+    load, and each CTA's bulk load plus the smallest fill items its fill
+    slots can take (``layout``: :func:`_kmaj_p_fill_layout` of the list on
+    ``grid``, ``smallest``: :func:`_kmaj_p_smallest` of its fill items, when
+    the caller has them)."""
+
+    sizes = np.asarray(sizes, dtype=np.int64)
+    grid = max(1, int(grid))
+    if layout is None:
+        layout = _kmaj_p_fill_layout(sizes, grid=grid, n_bulk=n_bulk)
+    bulk_loads, left = layout[0], layout[1]
+    if smallest is None:
+        smallest = _kmaj_p_smallest(np.sort(sizes[n_bulk:])[::-1])
+    bound = -(-int(sizes.sum()) // grid)
+    return max(bound, int((bulk_loads + smallest[left]).max()))
+
+
+def _kmaj_p_fill_order(fill: np.ndarray):
+    """``(order, dealt)``: the fill items largest first (stable) as indices
+    into ``fill`` (None when ``fill`` already descends) and their sizes."""
+
+    if fill.shape[0] < 2 or bool((fill[:-1] >= fill[1:]).all()):
+        return None, fill
+    order = np.argsort(-fill, kind="stable")
+    return order, fill[order]
+
+
+def _kmaj_p_fill_takes(left: np.ndarray):
+    """``(owner, step)`` of every fill slot, CTA by CTA, each CTA's slots in
+    processing order: the k-th take of a CTA lands in its k-th fill slot."""
+
+    total = int(left.sum())
+    owner = np.repeat(np.arange(left.shape[0], dtype=np.int64), left)
+    step = np.arange(total, dtype=np.int64) - np.repeat(np.cumsum(left) - left, left)
+    return owner, step
+
+
+def _kmaj_p_deal_setup(dealt: np.ndarray, bulk_loads: np.ndarray, left: np.ndarray):
+    """What the deals of the descending fill sizes ``dealt`` share: the key
+    dtype, the ``(owner, step)`` of every fill slot
+    (:func:`_kmaj_p_fill_takes`) and the runs of equal items as
+    ``(start, end, size)``."""
+
+    grid = int(bulk_loads.shape[0])
+    # above every key of every take: a load, one take's items and the tail
+    span = (
+        int(bulk_loads.max())
+        + 2 * int(dealt.sum())
+        + int(left.max()) * int(dealt[0])
+        + 1
+    )
+    dtype = np.int32 if (span + 1) * grid < 2**31 - 1 else np.int64
+    owner, step = _kmaj_p_fill_takes(left)
+    edges = (np.flatnonzero(dealt[1:] != dealt[:-1]) + 1).tolist()
+    starts, ends = [0, *edges], [*edges, int(dealt.shape[0])]
+    sizes = dealt[starts].tolist()
+    return dtype, owner, step, list(zip(starts, ends, sizes, strict=True))
+
+
+def _kmaj_p_deal(dealt, smallest, bulk_loads, left, setup, projected: bool):
+    """One deal of the descending fill sizes ``dealt`` into the CTAs' fill
+    slots (``setup``: :func:`_kmaj_p_deal_setup`).  Each item goes, largest
+    first, to the CTA with the smallest group load, or, for the projected
+    deal, the smallest load plus the item plus the smallest undealt items its
+    other open slots must still take (ties to the lower CTA index).
 
     The open slots of all CTAs always equal the undealt items, so a CTA's key
     changes only when it takes an item, and over a run of equal items the
     keys of its successive takes do not decrease (an item adds its size, and
     the projected term drops one of the smallest undealt items, which are no
     larger).  Each run of equal items therefore goes, in deal order, to the
-    smallest ``(key, CTA)`` pairs of all CTAs' successive takes, found by one
-    sort per run instead of a scan of the grid per item.  ``layout`` is
-    :func:`_kmaj_p_fill_layout` of the list on ``grid``, when the caller has
-    it."""
+    smallest ``(key, CTA)`` pairs of all CTAs' successive takes.  Every
+    untaken take carries the composite ``key * grid + CTA``; one partition
+    per run selects the run's takes and the taken ones are dropped.
 
-    count = len(work)
-    sizes = torch.tensor([int(group) for group, _entry in work], dtype=torch.int64)
-    if layout is None:
-        layout = _kmaj_p_fill_layout(sizes, grid=grid, n_bulk=n_bulk)
-    loads, left, _input_loads, fill_slots = layout
-    grid = int(loads.numel())
-    loads, left = loads.clone(), left.clone()
-    fill_sizes = sizes[n_bulk:]
-    n_fill = int(fill_sizes.numel())
-    if int(left.sum()) != n_fill:
-        raise AssertionError("the fill slots and the fill items do not match")
-    order = torch.argsort(-fill_sizes, stable=True)
-    dealt_sizes = fill_sizes[order]
-    smallest = torch.cat(
-        (torch.zeros(1, dtype=torch.int64), dealt_sizes.flip(0).cumsum(0))
-    )
-    picks = torch.empty(n_fill, dtype=torch.int64)
-    ctas = torch.arange(grid, dtype=torch.int64)
-    runs = torch.unique_consecutive(dealt_sizes, return_counts=True)
-    start = 0
-    for size, length in zip(runs[0].tolist(), runs[1].tolist(), strict=True):
-        takes = left.clamp(max=length)
-        owner = torch.repeat_interleave(ctas, takes)
-        step = torch.arange(owner.numel(), dtype=torch.int64)
-        step -= torch.repeat_interleave(takes.cumsum(0) - takes, takes)
-        key = loads[owner] + step * size
+    Returns the largest final load and the composite keys each run selected
+    (unsorted)."""
+
+    grid = int(bulk_loads.shape[0])
+    dtype, owners, steps, runs = setup
+    total = int(dealt.shape[0])
+    tails = None
+    if projected:
+        tails = (smallest[left[owners] - 1 - steps] * grid).astype(dtype)
+    steps = steps.astype(dtype)
+    loads = bulk_loads.astype(dtype) * grid + np.arange(grid, dtype=dtype)
+    taken = np.zeros(grid, dtype=dtype)
+    chosen = []
+    for start, end, size in runs:
+        scale = size * grid
+        base = loads - taken * scale
         if projected:
-            key += smallest[left[owner] - 1 - step]
-        chosen = owner[torch.argsort(key * grid + owner, stable=True)[:length]]
-        picks[start : start + length] = chosen
-        taken = torch.bincount(chosen, minlength=grid)
-        loads += taken * size
-        left -= taken
-        start += length
-    if bool((left != 0).any()):
-        raise AssertionError("the fill slots and the fill items do not match")
-    permutation = torch.arange(count, dtype=torch.int64)
-    permutation[fill_slots] = order[torch.argsort(picks, stable=True)] + n_bulk
-    return [work[index] for index in permutation.tolist()], int(loads.max())
+            base += scale
+        comp = base[owners] + steps * scale
+        if tails is not None:
+            comp += tails
+        if end == total:
+            chosen.append(comp)
+            loads = loads + (left - taken) * scale
+            break
+        picked = np.partition(comp, end - start - 1)[: end - start]
+        chosen.append(picked)
+        now = np.bincount(picked % grid, minlength=grid).astype(dtype)
+        loads += now * scale
+        taken += now
+        keep = steps >= taken[owners]
+        owners, steps = owners[keep], steps[keep]
+        if tails is not None:
+            tails = tails[keep]
+    return int(loads.max()) // grid, chosen
 
 
-def _kmaj_p_lpt_lower_bound(sizes, *, grid: int, n_bulk: int, layout=None) -> int:
-    """A lower bound of the largest per-CTA group load of every order of a
-    work list (group counts ``sizes``, bulk prefix ``n_bulk``) whose bulk
-    items keep their positions under the static snake: the rounded-up mean
-    load, and each CTA's bulk load plus the smallest fill items its fill
-    slots can take (``layout``: :func:`_kmaj_p_fill_layout` of the list on
-    ``grid``, when the caller has it)."""
+def _kmaj_p_deal_permutation(count, n_bulk, first, owner, step, order, runs):
+    """The source index of every position of the list dealt by
+    :func:`_kmaj_p_deal` (``runs``: its selections): the sorted selection of
+    each run, in run order, gives the CTA of every deal index; a stable sort
+    by CTA gives each CTA's takes in deal order, which fill its slots in
+    processing order (``first``: :func:`_kmaj_p_fill_layout`)."""
 
-    sizes = torch.as_tensor(sizes, dtype=torch.int64)
-    if layout is None:
-        layout = _kmaj_p_fill_layout(sizes, grid=grid, n_bulk=n_bulk)
-    bulk_loads, fill_counts, _loads, _fill_slots = layout
-    smallest = torch.cat(
-        (torch.zeros(1, dtype=torch.int64), sizes[n_bulk:].sort().values.cumsum(0))
-    )
-    bound = -(-int(sizes.sum()) // grid)
-    return max(bound, int((bulk_loads + smallest[fill_counts]).max()))
+    grid = int(first.shape[0])
+    picks = np.concatenate([np.sort(run) for run in runs]) % grid
+    small = np.int16 if grid < 2**15 else np.int64
+    ranks = np.argsort(picks.astype(small), kind="stable")
+    items = ranks if order is None else order[ranks]
+    wave = first[owner] + step
+    position = wave * grid + np.where(wave % 2 == 0, owner, grid - 1 - owner)
+    source = np.empty(count, dtype=np.int64)
+    source[:n_bulk] = np.arange(n_bulk, dtype=np.int64)
+    source[position] = items + n_bulk
+    return source
 
 
-def _kmaj_p_order_work_lpt(work, *, num_sms: int, fill_groups: int):
-    """The Q-resident work list with its fill tail re-dealt for the
-    producer's static snake.  ``work`` is a bulk prefix of items of at least
+def _kmaj_p_lpt_order(sizes: np.ndarray, *, num_sms: int, fill_groups: int):
+    """The producer order of a Q-resident work list with group counts
+    ``sizes`` (int64), as the source index of every position, or None for the
+    input order.  The list is a bulk prefix of items of at least
     ``fill_groups`` groups followed by the smaller fill items.  The bulk items
     keep their positions; the fill items are dealt largest first into the
-    CTAs' remaining slots (:func:`_kmaj_p_deal_fill`, plain and projected),
-    and the deal with the smaller largest per-CTA group load is kept when it
-    is strictly below the input's, else the input order is.  A deal is not
-    computed once the kept order's largest load reaches
-    :func:`_kmaj_p_lpt_lower_bound` (no order can be strictly below it), so
-    the result is the same as with both deals computed.  The result is a
-    permutation of ``work`` (the same CSR, items and split slots), so every
-    partial row, and the combined output, is the same as under the input
-    order."""
+    CTAs' remaining slots of the static snake (:func:`_kmaj_p_deal`, plain
+    and projected), and the deal with the smaller largest per-CTA group load
+    is kept when it is strictly below the input's, else the input order is;
+    the projected deal is computed only when the plain one is above
+    :func:`_kmaj_p_lpt_lower_bound` (no order can be strictly below it), and
+    no deal when the input is at it.  The result is a permutation of the list
+    (the same CSR, items and split slots), so every partial row, and the
+    combined output, is the same as under the input order."""
 
-    count = len(work)
+    count = int(sizes.shape[0])
     if count == 0:
-        return list(work)
+        return None
     grid = max(1, min(count, int(num_sms)))
     fill_groups = int(fill_groups)
-    sizes = [int(group_count) for group_count, _entry in work]
-    n_bulk = sum(1 for size in sizes if size >= fill_groups)
-    if any(size < fill_groups for size in sizes[:n_bulk]):
+    n_bulk = int(np.count_nonzero(sizes >= fill_groups))
+    if n_bulk and int(sizes[:n_bulk].min()) < fill_groups:
         raise ValueError("the bulk items must be the prefix of the work list")
     if n_bulk == count:
-        return list(work)
-    sizes_t = torch.tensor(sizes, dtype=torch.int64)
-    layout = _kmaj_p_fill_layout(sizes_t, grid=grid, n_bulk=n_bulk)
-    best = list(work)
-    best_load = int(layout[2].max())
-    bound = _kmaj_p_lpt_lower_bound(sizes_t, grid=grid, n_bulk=n_bulk, layout=layout)
+        return None
+    layout = _kmaj_p_fill_layout(sizes, grid=grid, n_bulk=n_bulk)
+    bulk_loads, left, input_loads, first = layout
+    best_load = int(input_loads.max())
+    order, dealt = _kmaj_p_fill_order(sizes[n_bulk:])
+    smallest = _kmaj_p_smallest(dealt)
+    bound = _kmaj_p_lpt_lower_bound(
+        sizes, grid=grid, n_bulk=n_bulk, layout=layout, smallest=smallest
+    )
+    if best_load <= bound:
+        return None
+    setup = _kmaj_p_deal_setup(dealt, bulk_loads, left)
+    best = None
     for projected in (False, True):
         if best_load <= bound:
             break
-        dealt, load = _kmaj_p_deal_fill(
-            work, grid=grid, n_bulk=n_bulk, projected=projected, layout=layout
-        )
-        if load < best_load:
-            best, best_load = dealt, load
-    return best
+        peak, runs = _kmaj_p_deal(dealt, smallest, bulk_loads, left, setup, projected)
+        if peak < best_load:
+            best, best_load = runs, peak
+    if best is None:
+        return None
+    _dtype, owner, step, _runs = setup
+    return _kmaj_p_deal_permutation(count, n_bulk, first, owner, step, order, best)
+
+
+def _kmaj_p_deal_fill(work, *, grid: int, n_bulk: int, projected: bool, layout=None):
+    """One deal of :func:`_kmaj_p_deal` on a work list: the dealt list and its
+    largest per-CTA group load (``layout``: :func:`_kmaj_p_fill_layout` of the
+    list on ``grid``, when the caller has it)."""
+
+    count = len(work)
+    sizes = _kmaj_p_group_counts(work)
+    grid = max(1, int(grid))
+    if layout is None:
+        layout = _kmaj_p_fill_layout(sizes, grid=grid, n_bulk=n_bulk)
+    bulk_loads, left, _input_loads, first = layout
+    if int(left.sum()) != count - n_bulk:
+        raise AssertionError("the fill slots and the fill items do not match")
+    if count == n_bulk:
+        return list(work), int(bulk_loads.max())
+    order, dealt = _kmaj_p_fill_order(sizes[n_bulk:])
+    setup = _kmaj_p_deal_setup(dealt, bulk_loads, left)
+    peak, runs = _kmaj_p_deal(
+        dealt, _kmaj_p_smallest(dealt), bulk_loads, left, setup, bool(projected)
+    )
+    _dtype, owner, step, _runs = setup
+    source = _kmaj_p_deal_permutation(count, n_bulk, first, owner, step, order, runs)
+    return list(map(work.__getitem__, source.tolist())), peak
+
+
+def _kmaj_p_order_work_lpt(work, *, num_sms: int, fill_groups: int):
+    """:func:`_kmaj_p_lpt_order` on a work list: the list in producer order."""
+
+    source = _kmaj_p_lpt_order(
+        _kmaj_p_group_counts(work), num_sms=num_sms, fill_groups=fill_groups
+    )
+    if source is None:
+        return list(work)
+    return list(map(work.__getitem__, source.tolist()))
 
 
 def _build_kmaj_p_plan(
@@ -2969,10 +3111,10 @@ def _build_kmaj_p_plan(
     Q-resident order run unchanged over the whole-batch rows.  Whether the
     batch runs as the fused program (``plan["fused"]``,
     :func:`_use_kmaj_p_fused`) is decided on that list, whose length no order
-    changes; a fused batch keeps the Q-resident order, and every other batch
-    has the fill tail of its list re-dealt for the producer's static snake
-    (:func:`_kmaj_p_order_work_lpt`).  :func:`_kmaj_p_assign_requests` then
-    fills the ``batch`` / ``kv_block`` fields.  Like
+    changes.  :func:`_kmaj_p_assign_requests` fills the ``batch`` /
+    ``kv_block`` fields; a fused batch keeps the Q-resident order, and every
+    other batch has the fill tail of its rows re-dealt for the producer's
+    static snake (:func:`_kmaj_p_lpt_order`).  Like
     :func:`_build_long_prefill_plan` this reads the per-row counts to the host.
     """
 
@@ -3095,16 +3237,21 @@ def _build_kmaj_p_plan(
         fill_groups=fill_groups,
     )
     fused = _use_kmaj_p_fused(target=target, work_count=len(work), total_q=total_q)
-    if not fused:
-        work = _kmaj_p_order_work_lpt(
-            work, num_sms=int(num_sms), fill_groups=fill_groups
-        )
     work = _kmaj_p_assign_requests(work, row_base=row_base)
-    metadata = torch.tensor(
-        [entry for _group, entry in work], dtype=torch.int32, device=device
-    )
+    metadata = torch.tensor([entry for _group, entry in work], dtype=torch.int32)
+    if not fused:
+        # an item's group count is ceil(q_count / q_tokens_per_group), as the
+        # decomposition and the tail split check
+        sizes = metadata[:, 3].to(torch.int64) + (q_tokens_per_group - 1)
+        source = _kmaj_p_lpt_order(
+            (sizes // q_tokens_per_group).numpy(),
+            num_sms=int(num_sms),
+            fill_groups=fill_groups,
+        )
+        if source is not None:
+            metadata = metadata[torch.from_numpy(source)]
     return {
-        "scheduler_metadata": metadata,
+        "scheduler_metadata": metadata.to(device),
         "k2q_row_ptr": row_ptr,
         "k2q_qsplit_indices": qsplit,
         "split_counts": split_counts,
