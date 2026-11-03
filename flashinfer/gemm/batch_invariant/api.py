@@ -1072,6 +1072,10 @@ def _run_mx(
     else:
         ws = _check_workspace(workspace, C, M, N, a.device, cls)
         for t, what in (
+            (a, "A"),
+            (b_nk, "B"),
+            (sfa, "A's scales"),
+            (sfb, "B's scales"),
             (out, "the output"),
             *(((alpha, "alpha"),) if alpha is not None else ()),
         ):
@@ -1079,7 +1083,8 @@ def _run_mx(
                 raise unsupported(
                     cls,
                     f"{what} overlapping the workspace",
-                    "a workspace disjoint from the output and alpha (the partials are written before the fixup reads them)",
+                    "a workspace disjoint from the operands, their scales, the output and alpha (the partials are "
+                    "written there while the operands are read and before the fixup reads them)",
                 )
     ws = ws.permute(1, 2, 0)  # chunk-major storage (C, M, N) viewed as (M, N, C)
     kernel(a3, b3, sfa, sfb, ws)  # the unscaled body: raw fp32 partials
