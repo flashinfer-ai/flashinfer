@@ -2240,7 +2240,8 @@ class _RecordingLauncher:
 
     def __init__(self, arch: str, **values):
         self.arch = arch
-        self.values = values
+        # The call's PDL switch, as run_cake_dsv4 sets it: off unless given.
+        self.values = {"enable_pdl": False, **values}
         self.calls: list[tuple[str, dict]] = []
 
     def variant(self, name, *, grid, **overrides):
@@ -2730,6 +2731,77 @@ def test_fp8_h64_m64_programs_launch_one_cta_per_token(arch, route):
     cake._dispatch_route(route, L)
     assert L.calls == [
         (route, {"grid": (tokens, 1, 1), "total_work_items": tokens, **L.partials(1)})
+    ]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
+def test_calls_without_pdl_launch_the_pdl_free_twins(arch):
+    """SM103 routes the FP8 H128 persistent route's PDL-free twin to a program
+    of its own, which a launch of at least 384 rows without PDL runs; shorter
+    launches run the route.  SM100 routes the twin to the route's program and
+    SM107 does not route it, so both launch the route."""
+    from flashinfer.jit.cake_dsv4 import VARIANTS
+
+    assert {"fp8_h128_prefill_source_persistent"} == cake._NO_PDL_TWIN_ROUTES
+    assert cake._NO_PDL_TWIN_MIN_TOKENS == {"sm_103a": 384}
+    for route in sorted(cake._NO_PDL_TWIN_ROUTES):
+        twin = f"{route}_no_pdl"
+        assert (twin in VARIANTS[arch]) == (arch != "sm_107a")
+        own = arch == "sm_103a"
+        program = VARIANTS[arch][route]
+        assert (VARIANTS[arch].get(twin, program) != program) == own
+        for tokens in (128, 256, 383, 384, 386, 512, 4096):
+            expected = twin if own and tokens >= 384 else route
+            assert (
+                cake._pdl_variant(
+                    route, arch=arch, enable_pdl=False, num_query_tokens=tokens
+                )
+                == expected
+            )
+            assert (
+                cake._pdl_variant(
+                    route, arch=arch, enable_pdl=True, num_query_tokens=tokens
+                )
+                == route
+            )
+        if own:
+            spec = get_cake_dsv4_spec(twin, arch=arch)
+            assert ("launch", "enable_pdl") not in spec["arg_plan"]
+            pdl = get_cake_dsv4_spec(route, arch=arch)["arg_plan"]
+            assert spec["arg_plan"] == tuple(
+                pair for pair in pdl if pair != ("launch", "enable_pdl")
+            )
+    for other in ("fp8_lowhead_prefill", "fp8_h64_prefill_source_persistent_m64"):
+        assert (
+            cake._pdl_variant(other, arch=arch, enable_pdl=False, num_query_tokens=512)
+            == other
+        )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
+@pytest.mark.parametrize("tokens", [256, 386, 512])
+@pytest.mark.parametrize("enable_pdl", [False, True])
+def test_fp8_h128_persistent_launch_takes_the_twin_from_384_rows(
+    arch, tokens, enable_pdl
+):
+    route = "fp8_h128_prefill_source_persistent"
+    L = _RecordingLauncher(
+        arch,
+        num_query_tokens=tokens,
+        num_heads=128,
+        sparse_topk=260,
+        enable_pdl=enable_pdl,
+    )
+    cake._dispatch_route(route, L)
+    twin = arch == "sm_103a" and tokens >= 384 and not enable_pdl
+    program = f"{route}_no_pdl" if twin else route
+    assert L.calls == [
+        (
+            program,
+            {"grid": (tokens * 2, 1, 1), "total_work_items": tokens, **L.partials(1)},
+        )
     ]
 
 

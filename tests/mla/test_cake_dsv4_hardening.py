@@ -421,13 +421,28 @@ def test_cuda_graph_replay_matches_eager(h_q, dtype, s_q):
         pytest.param(64, BATCH, 4, id="h64-persistent"),
         pytest.param(64, 64, 4, id="h64-m64"),
         pytest.param(128, BATCH, 4, id="h128-persistent"),
+        # 64 requests of 6-12 tokens: 576 rows, the twin's range on SM103.
+        pytest.param(128, 64, 12, id="h128-persistent-twin"),
     ],
 )
-def test_enable_pdl_matches_and_waits_for_the_query_producer(h_q, batch, s_q):
+def test_enable_pdl_matches_and_waits_for_the_query_producer(
+    monkeypatch, h_q, batch, s_q
+):
     """FP8 programs launched as programmatic dependents: bitwise equal to the
-    plain launch, and inside a graph they read the query the kernel before them
-    writes (the copy that fills it in place)."""
+    plain launch (the H128 persistent route's PDL-free twin on SM103 from 384
+    rows), and inside a graph they read the query the kernel before them writes
+    (the copy that fills it in place)."""
     _skip_unless_cake_gpu()
+    import flashinfer.mla.cake_dsv4 as cake
+
+    launched: list = []
+    original = cake._prepare_variant
+
+    def spy(variant, **kwargs):
+        launched.append(variant)
+        return original(variant, **kwargs)
+
+    monkeypatch.setattr(cake, "_prepare_variant", spy)
     dtype = torch.float8_e4m3fn
     p, tc = _make_case(h_q, dtype, s_q, varlen=True, batch=batch)
     static = _Inputs(p, tc)
@@ -435,9 +450,15 @@ def test_enable_pdl_matches_and_waits_for_the_query_producer(h_q, batch, s_q):
     plain = _out_like(static, fill=0.0)
     pdl = _out_like(static, fill=0.0)
     static.run(out=plain, workspace=workspace)
+    plain_variants, launched[:] = list(launched), []
     static.run(out=pdl, workspace=workspace, enable_pdl=True)
     torch.cuda.synchronize()
     assert torch.equal(plain, pdl)
+    (route,) = set(launched)
+    sm103 = tuple(get_compute_capability(torch.device("cuda"))) == (10, 3)
+    rows = static.swa_indices.shape[0]
+    twin = sm103 and route in cake._NO_PDL_TWIN_ROUTES and rows >= 384
+    assert set(plain_variants) == {f"{route}_no_pdl" if twin else route}
 
     p2, tc2 = _make_case(h_q, dtype, s_q, varlen=True, seed=p.seed + 7_000, batch=batch)
     mutated = _Inputs(p2, tc2)

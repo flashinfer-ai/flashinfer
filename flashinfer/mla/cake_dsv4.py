@@ -1759,6 +1759,42 @@ def _int32_vector(
     return flat
 
 
+# The routes whose programs leave PDL to each call and may route a PDL-free
+# twin ``<route>_no_pdl``: the same kernel without its two griddepcontrol
+# instructions, which a call that does not ask for PDL launches instead
+# (without the attribute the grid starts after its predecessor completes, so
+# it reads what the PDL program reads after its wait).  SM103 routes the twin
+# to a program of its own; SM100 routes it to the route's program.
+_NO_PDL_TWIN_ROUTES = frozenset({"fp8_h128_prefill_source_persistent"})
+
+# The fewest query rows a launch needs to take the twin, per architecture (an
+# architecture not listed never takes it).  GB300 without PDL: the twin beat the
+# PDL program by 64-192 ns from 386 rows on (2 x 257-token prefill, 64 x 8
+# MTP) but trailed it by up to 64 ns at 256 rows (64 x 4 MTP).
+_NO_PDL_TWIN_MIN_TOKENS = {"sm_103a": 384}
+
+
+def _pdl_variant(
+    route: str, *, arch: str, enable_pdl: bool, num_query_tokens: int
+) -> str:
+    """The variant a launch of ``route`` over ``num_query_tokens`` rows runs:
+    its PDL-free twin when the call does not ask for PDL, the launch has at
+    least ``_NO_PDL_TWIN_MIN_TOKENS[arch]`` rows and ``arch`` routes the twin to
+    a program other than the route's, else ``route``."""
+    if enable_pdl or route not in _NO_PDL_TWIN_ROUTES:
+        return route
+    min_tokens = _NO_PDL_TWIN_MIN_TOKENS.get(arch)
+    if min_tokens is None or num_query_tokens < min_tokens:
+        return route
+    from ..jit.cake_dsv4 import VARIANTS
+
+    programs = VARIANTS.get(arch, {})
+    twin = f"{route}_no_pdl"
+    if programs.get(twin, programs.get(route)) == programs.get(route):
+        return route
+    return twin
+
+
 class _Launcher:
     """Per-call launch context: shared values plus per-variant overrides."""
 
@@ -1856,7 +1892,9 @@ def run_cake_dsv4(
     ``enable_pdl`` launches the programs that support it (the FP8 persistent,
     M64, low-head prefill and H64 cluster bodies) as programmatic dependents of the previous kernel on the
     stream; they wait for it before their first global read.  The other
-    programs launch without the attribute.
+    programs launch without the attribute.  Without ``enable_pdl`` the FP8
+    H128 persistent route launches its PDL-free twin on SM103 from 384 query
+    rows per launch (``_pdl_variant``).
 
     ``out=None`` allocates the output here, after the route is known, so the
     routes in ``_OUT_PHASE_BY_ROUTE`` get their measured-fast base phase;
@@ -2275,7 +2313,10 @@ def _dispatch_route(route: str, L: _Launcher) -> None:
         "fp8_h128_prefill_source_persistent_uniform",
     ):
         parts = L.partials(1)
-        L.run(L.variant(route, grid=(T * 2, 1, 1), total_work_items=T, **parts))
+        program = _pdl_variant(
+            route, arch=L.arch, enable_pdl=v["enable_pdl"], num_query_tokens=T
+        )
+        L.run(L.variant(program, grid=(T * 2, 1, 1), total_work_items=T, **parts))
         return
 
     if route in (
@@ -2287,7 +2328,10 @@ def _dispatch_route(route: str, L: _Launcher) -> None:
         # caller-owned workspace), grid = tokens.  Both M64 programs share the
         # kernel ABI; _fp8_h64_m64_program picks one by the item width.
         parts = L.partials(1)
-        L.run(L.variant(route, grid=(T, 1, 1), total_work_items=T, **parts))
+        program = _pdl_variant(
+            route, arch=L.arch, enable_pdl=v["enable_pdl"], num_query_tokens=T
+        )
+        L.run(L.variant(program, grid=(T, 1, 1), total_work_items=T, **parts))
         return
 
     if route in (
