@@ -172,10 +172,14 @@ whose two records disagree on a path (a cast after `glm_intra_raw`, or
 `param_acc` is a buffer of the workspace outside the arena (2 KiB per head
 with one replica, 16 KiB per head with 8), shared by the workspace's plan
 views.  `KdaWorkspace.bytes` is the arena alone, `param_acc_bytes` the
-accumulators, and `workspace_bytes` / `memory_report` count both.  The
-workspace allocates `param_acc` zeroed at its first `R1c` backward; a backward
-that stops between the two programs leaves it marked, and the next backward
-zeroes it before its GLM intra launch.
+accumulators, and `workspace_bytes` / `memory_report` count both.  A
+backward workspace of an `R1c` plan allocates `param_acc` zeroed with its
+arena (a per-call workspace at its call).  A backward that stops between the
+two programs leaves sums in it and marks the workspace, and so does a backward
+captured into a CUDA graph (its launches run at the replays).  The next
+backward outside a capture then zeroes the whole buffer before its GLM intra
+launch.  A graph captured earlier does not: after such an exception, run one
+backward outside the capture on the workspace before the next replay.
 
 | arch | raw gate backward (every path) |
 | --- | --- |

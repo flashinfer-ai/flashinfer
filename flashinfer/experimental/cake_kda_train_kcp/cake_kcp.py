@@ -3390,7 +3390,10 @@ class WorkspaceKcp:
     layout without the gate epilogue's ``dg_int`` / ``db_int``); the KCP pools do not depend on it.  A call in the
     other mode is refused with ``ValueError``.  A raw backward local arena of an ``R1c`` plan (``sm_100a`` /
     ``sm_103a``) also holds the rank's FP64 parameter-gradient accumulators (``cake_backend.KdaWorkspace.param_acc``,
-    shared by its plan views, zero between backwards); ``bytes`` counts them once."""
+    zero between backwards): one storage shared by its plan views, of the largest view's elements (a pack of more
+    heads than it holds grows it, which drops the cached graphs of the arena, :meth:`_param_acc_ready`; ``reserve``
+    sizes it for its contexts); ``bytes`` counts that storage once.  A raw backward zeroes the whole storage first
+    when an earlier one stopped before its cast, and so does a ``graph="replay"`` replay."""
 
     def __init__(
         self,
@@ -3601,12 +3604,30 @@ class WorkspaceKcp:
             )
             for ctx in local:
                 view = self._bind_local(ctx, H, dev, backward)
+                # an R1c plan's accumulators at this pack's size (the views share one storage)
+                self._param_acc_ready(view)
                 for path in (LOCAL_PATH_FWD, LOCAL_PATH_BWD):
                     if cake_kcp_plan.intra_writes_tables(view.plan, path):
                         _scratch_tables(view)
                         break
             self.local_view = None
         return self.bytes
+
+    def _param_acc_ready(self, view: Any) -> None:
+        """The ``R1c`` accumulators of the local arena sized for ``view`` (the arena or a plan view of it, bound to a
+        raw backward pack) and, outside a CUDA-graph capture, zero (``cake_backend.KdaWorkspace._param_acc_clean``: an
+        earlier backward that stopped before its cast, or a captured one, left the whole storage marked).  The views
+        share one storage of the largest view's elements; a view of more heads (or replicas) grows it and the
+        replaced storage goes back to the allocator, so the cached graphs pinning this arena, whose launches add into
+        that storage, are dropped first (:func:`_graph_release`, as when the arena is replaced).  Nothing on a plan
+        without an ``R1c`` pair."""
+        if view is None or not view.backward or view.param_acc_bytes == 0:
+            return
+        box = view._param_acc_box[0]
+        if box is not None and box.nbytes < view.param_acc_bytes:
+            _graph_release(self.local)
+        _ = view.param_acc
+        view._param_acc_clean()
 
     def _check_device(self, device: torch.device) -> None:
         if self.device is None:
@@ -3934,10 +3955,12 @@ class WorkspaceKcp:
         if self.local is not None:
             # the arena and the intra record's scratch table set where it writes one, its own and each plan view's
             counts = self.local.__dict__.get(TAIL_COUNTS_ATTR)
+            acc = self.local._param_acc_box[0]
             local = (
                 int(self.local.bytes)
-                # the R1c accumulators of a raw backward arena (outside it; one storage the views share)
-                + self.local.param_acc_bytes
+                # the R1c accumulators of a raw backward arena (outside it; one storage the views share, of the
+                # largest view's elements)
+                + max(self.local.param_acc_bytes, 0 if acc is None else int(acc.nbytes))
                 + _scratch_bytes(self.local.plan)
                 + self._views_scratch
                 + (0 if counts is None else counts.nbytes)
@@ -5488,7 +5511,7 @@ def _backward(call: CallKcp, saved: SavedKcp | None) -> None:
     if call.gate == "raw":
         if "param_acc" in (call.grads or {}):
             call.stage("param_finalize")
-            call.local._param_acc_dirty[0] = False  # the cast left param_acc zero
+            call.local._param_acc_end()  # the cast leaves param_acc zero
         else:
             call.stage("param_finalize", seg_cap=call.scratch.get("seg_cap"))
 
@@ -5871,9 +5894,10 @@ def _prepare(
         walk_geometry=opts.walk_geometry,
         host_trim=bool(opts.host_trim),
     )
-    if backward and gate == "raw" and workspace.local_view is not None:
-        # the R1c accumulators of the local arena, allocated (zero) here: outside a graph capture of the backward
-        _ = workspace.local_view.param_acc
+    if backward and gate == "raw":
+        # the R1c accumulators of the local arena, sized for this pack and zero here: outside a graph capture of the
+        # backward
+        workspace._param_acc_ready(workspace.local_view)
     if gp is None:
         ops = {"q": q, "k": k, "v": v, "g": g, "beta": beta}
     else:  # the raw records' operands: the raw view, its element strides, A_log, dt_bias [H * 128], lower_bound
@@ -6228,6 +6252,11 @@ def chunk_kda_bwd_kcp(
         if use_gate_in_kernel:
             # the key matched a call whose operands were checked: q's head axis is H
             _alert_r1c(q.device, int(q.shape[-2]))
+            # the graph's R1c launches add into the local arena's accumulators: zeroed first where an eager backward
+            # stopped before its cast (or a capture left them marked)
+            local = getattr(workspace, "local", None)
+            if local is not None:
+                local._param_acc_clean()
         _graph_replay("bwd", entry)
         grads, batched = entry.result
         return _shaped_grads(grads, batched, g, gate_args)
@@ -6329,8 +6358,9 @@ def _bwd_body(call: CallKcp, saved: SavedKcp | None) -> tuple[torch.Tensor, ...]
     local chunks, with its per-call scratch ``part2`` / ``ticket`` and ``seg_cap`` from
     ``cake_backend._raw_finalize_scratch``.  On ``sm_100a`` / ``sm_103a`` the ``R1c`` GLM intra program adds them in
     FP64 into the local arena's accumulators ``param_acc`` (``cake_backend.KdaWorkspace.param_acc``: zero before the
-    launch, an earlier aborted backward's leftovers zeroed first) and its cast rounds them once and zeroes them: no
-    per-call partials.  A rank without tokens launches nothing and returns zero parameter gradients."""
+    launch, an earlier aborted backward's leftovers zeroed first in the whole storage) and its cast rounds them once
+    and zeroes them: no per-call partials.  A rank without tokens launches nothing and returns zero parameter
+    gradients."""
     dt = call.backend.dtypes
     T, H = call.T_r, call.H
     call.grads = {
@@ -6344,12 +6374,9 @@ def _bwd_body(call: CallKcp, saved: SavedKcp | None) -> tuple[torch.Tensor, ...]
         if call.local is not None and T > 0:
             local = call.local
             if cake_backend._r1c_stripes(local.plan) is not None:
-                # the R1c pair: the local arena's FP64 accumulators (allocated by _prepare, outside any capture)
-                acc = local.param_acc
-                if local._param_acc_dirty[0]:
-                    acc.zero_()  # an earlier backward stopped before its cast
-                local._param_acc_dirty[0] = True  # cleared after the cast (_backward)
-                call.grads["param_acc"] = acc
+                # the R1c pair: the local arena's FP64 accumulators (sized and zeroed by _prepare, outside any
+                # capture), marked until the cast is enqueued (_backward)
+                call.grads["param_acc"] = local._param_acc_begin("chunk_kda_bwd_kcp")
             else:
                 nc_pad = int(local.plan.NC_pad)
                 for name in ("dA_part", "db_part"):

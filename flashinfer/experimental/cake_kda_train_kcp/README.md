@@ -545,6 +545,13 @@ dA_log, ddt_bias = reduce_gate_param_grads_kcp(ctx, dA_log_r, ddt_bias_r, **nd) 
   (the `R1c` accumulators included: 2 KiB per head with one replica, 16 KiB
   per head with 8);
   `kda_saved_bytes_kcp` and `kda_comm_bytes_kcp` do not depend on the mode.
+* The `R1c` accumulators are one buffer of the local arena, shared by its
+  plan views.  A pack of more heads than the buffer holds grows it before its
+  backward and drops the cached graphs of the arena, whose launches add into
+  the old buffer; `reserve` sizes it for its contexts, and `bytes` counts it
+  once.  A backward that stops between the GLM intra launches and the cast
+  leaves sums in it; the next backward, or a `graph="replay"` replay, zeroes
+  the whole buffer first.
 * The checkpoint hand-off does not engage in raw mode (its tape set is
   verified on the explicit gate only): a raw call keeps the light set under
   every `checkpoint_handoff` value and records no decision.

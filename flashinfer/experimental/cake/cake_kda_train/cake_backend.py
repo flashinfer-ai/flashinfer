@@ -243,6 +243,7 @@ import collections
 import contextlib
 import dataclasses
 import functools
+import inspect
 import math
 import os
 import re
@@ -2055,12 +2056,54 @@ def _param_acc_bytes(p: Plan) -> int:
     return 0 if stripes is None else 8 * stripes * int(p.H) * 2 * D
 
 
+# The rule kinds the raw GLM intra and param_finalize records may select on: the architecture, the head count and the
+# path, never a count of the problem's chunks, documents or CTAs (_r1c_alert_due).
+_R1C_RULE_KINDS = frozenset(
+    {
+        "always",
+        "otherwise",
+        "all_of",
+        "any_of",
+        "arch_in",
+        "path_in",
+        "heads_at_most",
+        "heads_above",
+        "heads_at_least",
+        "heads_below",
+    }
+)
+
+
+def _r1c_rule_kinds() -> set[str]:
+    """The rule kinds the select rules of the raw GLM intra and ``param_finalize`` records read (nested rules
+    included): the records whose choice decides between an ``R1c`` pair and the deterministic one."""
+    kinds: set[str] = set()
+    rules = [
+        cake_jit.MODULES[name]["select_rule"]
+        for stage in ("glm_intra", "param_finalize")
+        for name in cake_jit.records_of_stage(stage, "raw")
+    ]
+    while rules:
+        rule = rules.pop()
+        kinds.add(str(rule["kind"]))
+        rules.extend(rule.get("rules", ()))
+    return kinds
+
+
 def _r1c_alert_due(arch: str, H: int, sm_count: int) -> bool:
     """Whether a raw backward of ``H`` heads on ``arch`` runs an ``R1c`` pair (and so alerts under torch's
     deterministic algorithms, :func:`_alert_nondeterministic`): the selection of the plan of a one-chunk problem of
-    ``H`` heads.  The ``R1c`` records' rules read the architecture and the head count alone, so every problem of
-    ``H`` heads selects the same pair, and the context-parallel route's ranks, whose local problems differ, decide
-    alike (a decision one rank took alone could leave its peers waiting in a collective)."""
+    ``H`` heads.  The ``R1c`` records' rules read the architecture, the head count and the path alone
+    (:data:`_R1C_RULE_KINDS`; ``RuntimeError`` otherwise, raised alike on every rank), so every problem of ``H``
+    heads selects the same pair, and the context-parallel route's ranks, whose local problems differ, decide alike
+    (a decision one rank took alone could leave its peers waiting in a collective)."""
+    other = _r1c_rule_kinds() - _R1C_RULE_KINDS
+    if other:
+        raise RuntimeError(
+            f"the raw GLM intra / param_finalize records select on {sorted(other)}: the R1c alert decides per "
+            "architecture and head count, alike on every context-parallel rank, so their rules may read the "
+            f"architecture, the head count and the path alone ({sorted(_R1C_RULE_KINDS)})"
+        )
     return (
         _r1c_stripes(plan(BT, 1, int(H), int(sm_count), arch, gate="raw")) is not None
     )
@@ -2082,13 +2125,43 @@ def _alert_r1c(device: torch.device, H: int, entry: str) -> None:
         _alert_nondeterministic(entry)
 
 
+def _capturing(device: torch.device) -> bool:
+    """Whether the current CUDA stream captures a CUDA graph, for a workspace on ``device`` (never off CUDA)."""
+    return device.type == "cuda" and torch.cuda.is_current_stream_capturing()
+
+
+# this package's import path (a vendoring build's own)
+_MODULE_PACKAGE = __name__.rpartition(".")[0]
+
+
+def _caller_stacklevel() -> int:
+    """The ``stacklevel`` of the nearest frame outside flashinfer and this package, for a warning issued by the
+    function that calls this one: the caller of the entry point, through the facades, the autograd node and the
+    context-parallel route alike (2 when every frame up the stack is theirs)."""
+    frame = inspect.currentframe()
+    level = 0
+    while frame is not None:
+        parent = frame.f_back
+        level += 1
+        if parent is not None:
+            name = str(parent.f_globals.get("__name__", ""))
+            if not any(
+                name == root or name.startswith(root + ".")
+                for root in ("flashinfer", _MODULE_PACKAGE)
+            ):
+                return level
+        frame = parent
+    return 2
+
+
 def _alert_nondeterministic(entry: str) -> None:
     """PyTorch's alert for an operation without a deterministic implementation, when torch's deterministic
-    algorithms are enabled: a ``RuntimeError``, or a ``UserWarning`` under
-    ``torch.use_deterministic_algorithms(True, warn_only=True)``; nothing otherwise.  Called by the entry points
-    whose raw gate backward runs an ``R1c`` pair (:func:`_r1c_alert_due`: the unordered FP64 parameter-gradient
-    reduce on ``sm_100a`` / ``sm_103a``), before they allocate, launch or exchange anything.  The alert is raised
-    here, not through a private PyTorch hook (PyTorch exposes no public Python entry for it)."""
+    algorithms are enabled: a ``RuntimeError``, or a ``UserWarning`` (attributed to the nearest caller outside
+    flashinfer, :func:`_caller_stacklevel`) under ``torch.use_deterministic_algorithms(True, warn_only=True)``;
+    nothing otherwise.  Called by the entry points whose raw gate backward runs an ``R1c`` pair
+    (:func:`_r1c_alert_due`: the unordered FP64 parameter-gradient reduce on ``sm_100a`` / ``sm_103a``), before they
+    allocate, launch or exchange anything.  The alert is raised here, not through a private PyTorch hook (PyTorch
+    exposes no public Python entry for it)."""
     if not torch.are_deterministic_algorithms_enabled():
         return
     if torch.is_deterministic_algorithms_warn_only_enabled():
@@ -2096,7 +2169,8 @@ def _alert_nondeterministic(entry: str) -> None:
             f"{entry} does not have a deterministic implementation, but you set "
             "'torch.use_deterministic_algorithms(True, warn_only=True)'; "
             "flashinfer.cake_kda_det_train is the deterministic package",
-            stacklevel=3,
+            UserWarning,
+            stacklevel=_caller_stacklevel(),
         )
         return
     raise RuntimeError(
@@ -2231,7 +2305,8 @@ def memory_report(
     and the finalize's scratch (:func:`_raw_partials_bytes`, allocated by the backward outside the arena; 0 in
     ``"g"`` mode and on the ``R1c`` rows, :func:`_r1c_stripes`) and ``param_acc`` the ``R1c`` rows' FP64
     accumulators (:attr:`KdaWorkspace.param_acc_bytes`, held by the workspace outside the arena; 0 elsewhere), both
-    of which the backward totals include; the raw mode never engages the checkpoint hand-off, so
+    of which the backward totals include (``param_acc`` also ``fwd_total_bwd_arena``: a backward workspace holds the
+    accumulators while it serves the forwards); the raw mode never engages the checkpoint hand-off, so
     ``handoff_bytes`` and ``handoff_budget_bytes`` are 0 and ``handoff_bytes_rows`` ``None`` there."""
     if save_mode not in SAVE_MODES:
         raise ValueError(
@@ -2427,7 +2502,8 @@ def memory_report(
         + saved,  # a forward-only workspace
         "fwd_total_bwd_arena": arena_bwd_conf
         + out_f
-        + saved,  # the same workspace serving every boundary
+        + saved
+        + acc,  # the same workspace serving every boundary (its R1c accumulators live across the forwards)
         "bwd_total": arena_bwd_conf
         + out_b
         + partials
@@ -2751,12 +2827,17 @@ class KdaWorkspace:
 
     A raw-mode backward workspace whose plan selects an ``R1c`` pair (``sm_100a`` / ``sm_103a``,
     :func:`_r1c_stripes`) also holds :attr:`param_acc`, the FP64 accumulators of the parameter gradients (``[stripes,
-    H, 2, 128]``) outside the arena, shared by every view (:meth:`with_plan`, :meth:`batch_view`) like :attr:`eye`:
-    zero when first allocated, filled by the ``R1c`` GLM intra launches of one backward and zeroed again by its
-    cast.  :attr:`param_acc_bytes` is their size, so :func:`workspace_bytes` is :attr:`bytes` +
+    H, 2, 128]``) outside the arena, allocated zero with it and shared by every view (:meth:`with_plan`,
+    :meth:`batch_view`) like :attr:`eye`: filled by the ``R1c`` GLM intra launches of one backward and zeroed again
+    by its cast.  :attr:`param_acc_bytes` is their size, so :func:`workspace_bytes` is :attr:`bytes` +
     :attr:`param_acc_bytes`.  Two backwards in flight on one workspace (two streams) are not supported, for the
-    accumulators as for the arena; a backward that stops between its GLM intra launches and its cast (an exception)
-    leaves partial sums, which the next backward on the workspace zeroes first.
+    accumulators as for the arena.  A backward that stops between its GLM intra launches and its cast (an
+    exception) leaves partial sums, and a backward captured into a CUDA graph leaves the storage as it was (its
+    launches run at the graph's replays): either marks the workspace, and the next backward on it outside a capture
+    zeroes the whole storage first.  A graph captured earlier on the workspace does not: its replays add into
+    whatever the storage holds, so after such an exception run one backward outside the capture on the workspace
+    before replaying it (the context-parallel route's ``graph="replay"`` zeroes the storage itself before a
+    replay).
     """
 
     def __init__(
@@ -2846,9 +2927,9 @@ class KdaWorkspace:
         # view of this arena (with_plan, batch_view), since the flags the epochs stamp live in the shared eye
         self._eye_box: list[torch.Tensor | None] = [None]
         self._epoch: list[int] = [0]
-        # the R1c accumulators (param_acc, allocated zero by the first backward that reads them) and whether a backward
-        # added into them without its cast completing (the next one zeroes them first): one-entry lists, shared by every
-        # view of this arena like the eye
+        # the R1c accumulators (param_acc, allocated zero with the arena: below) and whether they may hold sums no
+        # cast has zeroed, a mark the next backward outside a capture clears by zeroing them first: one-entry lists,
+        # shared by every view of this arena like the eye
         self._param_acc_box: list[torch.Tensor | None] = [None]
         self._param_acc_dirty: list[bool] = [False]
         # the batched option's views of this arena per group geometry, and per doc_lengths its groups with their
@@ -2857,6 +2938,8 @@ class KdaWorkspace:
         self._batch_views: dict[tuple[int, int, int], KdaWorkspace] = {}
         self._doc_cache: dict[tuple[int, ...], _Packing] = {}
         self._doc_graphs: set[tuple[int, ...]] = set()
+        # an R1c plan's accumulators come with the workspace, not with its first backward (which may be captured)
+        _ = self.param_acc
 
     def _arena_size(
         self, plan: Plan, *, backward: bool, save_mode: str, fwd_layout: str
@@ -2932,22 +3015,55 @@ class KdaWorkspace:
     def param_acc(self) -> torch.Tensor | None:
         """The ``R1c`` accumulators of the parameter gradients, FP64 ``[stripes, H, 2, 128]`` (:func:`_r1c_stripes`;
         chunk ``c`` adds into replica ``c mod stripes``) outside the arena, ``None`` on a workspace whose plan selects
-        no ``R1c`` record (``"g"`` mode, ``sm_107a``) or that serves no backward.  Allocated zero on first use (the
-        per-call workspaces of the calls without one: per call, as :attr:`eye`) and shared by every view of this
-        arena: one storage of the largest view's elements, each view reading its own leading part (every element is
-        zero between backwards, so the views' shapes need not agree)."""
+        no ``R1c`` record (``"g"`` mode, ``sm_107a``) or that serves no backward.  Allocated zero with the workspace
+        (again by the first backward of a per-call workspace taken from the pool, as :attr:`eye`) and shared by every
+        view of this arena: one storage of the largest view's elements, each view reading its own leading part (every
+        element is zero between backwards, so the views' shapes need not agree; a view of more elements grows it).
+        A storage allocated under a CUDA-graph capture is filled only at the graph's replays, so it is allocated
+        unfilled and the workspace marked: its first backward zeroes it (:meth:`_param_acc_begin`)."""
         stripes = _r1c_stripes(self.plan) if self.backward else None
         if stripes is None:
             return None
         n = stripes * self.plan.H * 2 * D
         acc = self._param_acc_box[0]
         if acc is None or acc.numel() < n:
-            # a fresh zero storage (a smaller one in use by queued work goes back to the allocator in stream order)
-            acc = self._param_acc_box[0] = torch.zeros(
+            # a new storage (a smaller one in use by queued work goes back to the allocator in stream order)
+            capturing = _capturing(self.device)
+            acc = self._param_acc_box[0] = (torch.empty if capturing else torch.zeros)(
                 n, dtype=torch.float64, device=self.device
             )
-            self._param_acc_dirty[0] = False
+            self._param_acc_dirty[0] = capturing
         return acc[:n].view(stripes, self.plan.H, 2, D)
+
+    def _param_acc_begin(self, entry: str) -> torch.Tensor:
+        """:attr:`param_acc` for the ``R1c`` GLM intra launches of one backward (``RuntimeError`` where the workspace
+        holds none), zero: a marked workspace (:attr:`param_acc` docstring, :meth:`_param_acc_end`) zeroes the whole
+        storage first, every view's part (a view of another head count may have left sums past this view's part).
+        The workspace stays marked until the backward's cast is enqueued."""
+        acc = self.param_acc
+        if acc is None:
+            raise RuntimeError(f"{entry}: the workspace holds no R1c accumulators")
+        box = self._param_acc_box[0]
+        if self._param_acc_dirty[0] and box is not None:
+            box.zero_()
+        self._param_acc_dirty[0] = True
+        return acc
+
+    def _param_acc_end(self) -> None:
+        """After the cast of a backward is enqueued: the accumulators are zero again in stream order, so the mark is
+        cleared, but not under a CUDA-graph capture, whose launches run only at the graph's replays (the storage keeps
+        what it held until then, so the next backward outside a capture zeroes it first)."""
+        if not _capturing(self.device):
+            self._param_acc_dirty[0] = False
+
+    def _param_acc_clean(self) -> None:
+        """Outside a CUDA-graph capture, zero the whole storage of :attr:`param_acc` of a marked workspace and clear
+        the mark (before a graph replay, whose ``R1c`` launches add into the storage, or before a capture, so the
+        captured backward needs no fill of its own); nothing otherwise."""
+        box = self._param_acc_box[0]
+        if box is not None and self._param_acc_dirty[0] and not _capturing(self.device):
+            box.zero_()
+            self._param_acc_dirty[0] = False
 
     @property
     def param_acc_bytes(self) -> int:
@@ -5117,17 +5233,8 @@ def _backward(
             "ddt_bias": _alloc((H * D,), torch.float32, ws.device),
         }
         if r1c:
-            acc = ws.param_acc
-            if acc is None:  # an R1c plan always has them on a backward workspace
-                raise RuntimeError(
-                    "chunk_kda_bwd: the workspace holds no R1c accumulators"
-                )
-            if ws._param_acc_dirty[0]:
-                # an earlier backward stopped between its GLM intra launches and its cast: its partial sums go
-                acc.zero_()
-            # cleared by the cast (_param_finalize)
-            ws._param_acc_dirty[0] = True
-            raw_out["param_acc"] = acc
+            # the workspace's accumulators, zero (the mark this sets is cleared after the cast, _param_finalize)
+            raw_out["param_acc"] = ws._param_acc_begin("chunk_kda_bwd")
         else:
             raw_out["dA_part"] = _alloc((p.NC_pad, H, D, 2), torch.float32, ws.device)
             raw_out["db_part"] = _alloc((p.NC_pad, H, D, 2), torch.float32, ws.device)
@@ -5231,6 +5338,13 @@ def _backward(
             ws_b.views(
                 mode
             )  # every group's layout fits the arena, or ValueError before any launch
+            if gp is not None and _r1c_stripes(ws_b.plan) != _r1c_stripes(p):
+                # the groups add into the problem's accumulators (or partials) through its pair's records alone
+                raise RuntimeError(
+                    "chunk_kda_bwd: a document group's plan selects the parameter-gradient records of "
+                    f"{_r1c_stripes(ws_b.plan)} replicas, the problem's {_r1c_stripes(p)} (None: the "
+                    "deterministic pair); the groups share the problem's accumulators"
+                )
         _assert_doc_lengths(cu_seqlens, packing.lengths)
         # the groups build their own tables; their blocks of the saved states come by chain rank (from doc_lengths
         # on the host, :class:`_Packing`)
@@ -5353,7 +5467,7 @@ def _param_finalize(
             },
             path=path,
         )
-        ws._param_acc_dirty[0] = False
+        ws._param_acc_end()
         return
     seg_cap = _finalize_segments(raw_out["dA_part"].shape[0])
     if tuple(grid) != (H, seg_cap, 1):

@@ -1809,8 +1809,14 @@ def test_raw_plans_are_the_deterministic_raw_plans() -> None:
                     det[key] for key in DET_L2N_REPORT_KEYS[1:]
                 ), tag
                 det = {k: v for k, v in det.items() if k not in DET_L2N_REPORT_KEYS}
-                # the R1c rows: param_acc in place of the per-call partials, in both backward totals
-                moved = ("bwd_partials", "bwd_total", "replay_total")
+                # the R1c rows: param_acc in place of the per-call partials, in both backward totals, and held by
+                # the backward workspace across its forwards
+                moved = (
+                    "bwd_partials",
+                    "bwd_total",
+                    "replay_total",
+                    "fwd_total_bwd_arena",
+                )
                 assert {key: nd[key] for key in det if key not in moved} == {
                     key: value for key, value in det.items() if key not in moved
                 }, tag
@@ -1821,6 +1827,8 @@ def test_raw_plans_are_the_deterministic_raw_plans() -> None:
                     assert nd[key] == det[key] - det["bwd_partials"] + (
                         acc if acc else det["bwd_partials"]
                     ), (*tag, key)
+                fwd_total = det["fwd_total_bwd_arena"] + acc
+                assert nd["fwd_total_bwd_arena"] == fwd_total, tag
                 assert nd["handoff_bytes"] == nd["handoff_budget_bytes"] == 0
                 assert nd["handoff_bytes_rows"] is None
                 g_report = cake_backend.memory_report(S, N, heads, save_mode, **q)
@@ -1897,9 +1905,10 @@ def test_r1c_rows_and_the_alert_helper() -> None:
     """The R1c decision is a function of (architecture, H) alone: every problem of a raw plan selects the pair of
     :func:`_r1c_glm` (``_r1c_stripes``: its replica count; ``_param_acc_bytes``: ``8 * stripes * H * 2 * 128``),
     ``_r1c_alert_due`` agrees with it for any SM count, and the g mode never selects one.  The alert helper raises
-    PyTorch's ``RuntimeError`` under ``torch.use_deterministic_algorithms(True)``, warns (``UserWarning``) with
-    ``warn_only=True`` and does nothing otherwise; both name the deterministic package.  The backward's gate
-    (``_alert_r1c``) reads no device for a tensor off CUDA: a CPU call goes on to its device check."""
+    PyTorch's ``RuntimeError`` under ``torch.use_deterministic_algorithms(True)``, warns (``UserWarning``,
+    attributed to the caller outside flashinfer: here this file) with ``warn_only=True`` and does nothing
+    otherwise; both name the deterministic package.  The backward's gate (``_alert_r1c``) reads no device for a
+    tensor off CUDA: a CPU call goes on to its device check."""
     rows = 0
     for arch in ARCHES:
         for h in (1, 2, 4, 8, 16, 31, 32, 33, 64, 128):
@@ -1954,8 +1963,112 @@ def test_r1c_rows_and_the_alert_helper() -> None:
             match=r"flashinfer\.cake_kda_det_train is the deterministic package",
         ):
             cake_backend._alert_nondeterministic(entry)
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            cake_backend._alert_nondeterministic(entry)
+        assert [os.path.realpath(w.filename) for w in caught] == [
+            os.path.realpath(__file__)
+        ], [(w.filename, w.lineno) for w in caught]
     finally:
         torch.use_deterministic_algorithms(saved_mode[0], warn_only=saved_mode[1])
+
+
+def test_r1c_alert_refuses_rules_beyond_the_arch_heads_and_path(monkeypatch) -> None:
+    """The raw GLM intra and ``param_finalize`` records select on the architecture, the head count and the path
+    alone, so the R1c decision (and its alert, alike on every context-parallel rank) holds for every problem of
+    ``H`` heads; a rule that reads anything else (here the document count) makes ``_r1c_alert_due`` raise
+    ``RuntimeError`` instead of deciding per rank."""
+    kinds = cake_backend._r1c_rule_kinds()
+    assert {"arch_in", "heads_below", "heads_at_least", "path_in"} <= kinds
+    assert kinds <= cake_backend._R1C_RULE_KINDS
+    for arch in ARCHES:
+        assert cake_backend._r1c_alert_due(arch, 4, 148) is (
+            _r1c_glm(arch, 4) is not None
+        )
+    name = "glm_intra_v20c"
+    record = dict(cake_jit.MODULES[name])
+    record["select_rule"] = {
+        "kind": "all_of",
+        "rules": [record["select_rule"], {"kind": "docs_above", "min": 1}],
+    }
+    monkeypatch.setitem(cake_jit.MODULES, name, record)
+    with pytest.raises(RuntimeError, match="docs_above"):
+        cake_backend._r1c_alert_due("sm_100a", 4, 148)
+
+
+def _cpu_acc_workspace(p) -> KdaWorkspace:
+    """A backward workspace of plan ``p`` on the CPU with the accumulator state alone (the constructor reads a CUDA
+    device): what ``param_acc`` and the backward's mark logic read."""
+    ws = KdaWorkspace.__new__(KdaWorkspace)
+    ws.plan, ws.backward, ws.device = p, True, torch.device("cpu")
+    ws._param_acc_box, ws._param_acc_dirty = [None], [False]
+    return ws
+
+
+def test_param_acc_is_one_storage_zeroed_whole_and_capture_aware(monkeypatch) -> None:
+    """The R1c accumulators of a workspace and its views of other head counts (the context-parallel route's plan
+    views) are one storage of the largest view's elements: a view of more elements grows it (a fresh zero storage).
+    A backward that stopped before its cast leaves the workspace marked, and the next backward of any view zeroes
+    the whole storage, not only its own part.  Under a CUDA-graph capture (``_capturing`` forced) a new storage is
+    marked (its fill would run only at the replays), the mark survives the cast, and ``_param_acc_clean`` waits
+    for the end of the capture; outside one it zeroes a marked storage and clears the mark.  A plan without the R1c
+    pair has no accumulators: its backward is refused."""
+    arch, sm = "sm_100a", 148
+    small = cake_backend.plan(640, 2, 4, sm, arch, gate="raw")
+    big = cake_backend.plan(640, 2, 64, sm, arch, gate="raw")
+    n_small = cake_backend._r1c_stripes(small) * 4 * 2 * D
+    n_big = cake_backend._r1c_stripes(big) * 64 * 2 * D
+    assert 0 < n_small < n_big
+    ws = _cpu_acc_workspace(small)
+    acc = ws.param_acc
+    assert acc.shape == (1, 4, 2, D) and acc.dtype == torch.float64
+    assert ws._param_acc_box[0].numel() == n_small and not ws._param_acc_dirty[0]
+    view = ws._view(big)
+    acc_big = view.param_acc
+    box = ws._param_acc_box[0]
+    assert box is view._param_acc_box[0] and box.numel() == n_big
+    assert int((box == 0).sum()) == n_big and not ws._param_acc_dirty[0]
+    assert acc_big.shape == (8, 64, 2, D)
+    # the big view's backward adds everywhere and stops before its cast
+    view._param_acc_begin("test").fill_(1.0)
+    assert ws._param_acc_dirty[0] is True
+    # the small workspace's next backward zeroes the whole storage, past its own part
+    ws._param_acc_begin("test")
+    assert int((box == 0).sum()) == n_big
+    ws._param_acc_end()
+    assert ws._param_acc_dirty[0] is False
+    # a captured backward: the mark survives its cast until a backward or a clean outside the capture
+    monkeypatch.setattr(cake_backend, "_capturing", lambda device: True)
+    view._param_acc_begin("test")
+    view._param_acc_end()
+    assert view._param_acc_dirty[0] is True
+    box.fill_(2.0)  # what the storage may hold until the graph's replays run
+    view._param_acc_clean()
+    assert int((box == 2.0).sum()) == n_big and view._param_acc_dirty[0] is True
+    monkeypatch.setattr(cake_backend, "_capturing", lambda device: False)
+    ws._param_acc_clean()
+    assert int((box == 0).sum()) == n_big and ws._param_acc_dirty[0] is False
+    ws._param_acc_clean()  # nothing to do on an unmarked workspace
+    assert ws._param_acc_dirty[0] is False
+    # a storage allocated under a capture is marked, and the first backward outside one zeroes it
+    fresh = _cpu_acc_workspace(small)
+    monkeypatch.setattr(cake_backend, "_capturing", lambda device: True)
+    _ = fresh.param_acc
+    assert fresh._param_acc_dirty[0] is True
+    fresh._param_acc_box[0].fill_(3.0)
+    monkeypatch.setattr(cake_backend, "_capturing", lambda device: False)
+    acc = fresh._param_acc_begin("test")
+    assert int((acc == 0).sum()) == n_small
+    fresh._param_acc_end()
+    assert fresh._param_acc_dirty[0] is False
+    for p in (
+        cake_backend.plan(640, 2, 4, sm, arch),
+        cake_backend.plan(640, 2, 4, sm, "sm_107a", gate="raw"),
+    ):
+        none = _cpu_acc_workspace(p)
+        assert none.param_acc is None
+        with pytest.raises(RuntimeError, match="no R1c accumulators"):
+            none._param_acc_begin("test")
 
 
 def test_every_stage_selects_the_expected_record_and_grid() -> None:
@@ -8743,6 +8856,25 @@ def _raw_bits_equal(a: torch.Tensor, b: torch.Tensor) -> bool:
     return torch.equal(a.contiguous().view(view), b.contiguous().view(view))
 
 
+def _bits_equal_counted(a: torch.Tensor, b: torch.Tensor) -> bool:
+    """:func:`_raw_bits_equal` with the count explicit: the elements whose bit patterns agree are counted, and the
+    compare holds only when that count is the element count and above zero (two empty tensors do not compare
+    equal)."""
+    if a.dtype != b.dtype or a.shape != b.shape:
+        return False
+    view = {1: torch.uint8, 2: torch.int16, 4: torch.int32, 8: torch.int64}[
+        a.element_size()
+    ]
+    equal = int((a.contiguous().view(view) == b.contiguous().view(view)).sum().item())
+    return equal == a.numel() > 0
+
+
+def _check_bits_counted(got, reference: dict, names, tag=None) -> None:
+    """:func:`_check_bits` by :func:`_bits_equal_counted`."""
+    for name, t in zip(names, got, strict=True):
+        assert _bits_equal_counted(t, reference[name]), (tag, name)
+
+
 def _nan_alloc(shape_, dtype, dev) -> torch.Tensor:
     """The backend's ``_alloc`` with floating-point tensors NaN-filled (integer tensors zero-filled)."""
     if dtype.is_floating_point:
@@ -9475,7 +9607,7 @@ def _rg_param_check(got: dict, reference: dict, tag=None) -> None:
     r1c = reference.get(R1C_KEY)
     if r1c is None:
         for name in R1C_PARAMS:
-            assert _bits_equal(got[name], reference[name]), (tag, name)
+            assert _bits_equal_counted(got[name], reference[name]), (tag, name)
         return
     _r1c_param_check(got, r1c, tag=tag)
 
@@ -9558,7 +9690,7 @@ def _rg_check(got, reference: dict, tag=None) -> None:
     ``ddt_bias`` within the R1c bound on an R1c row (:func:`_rg_param_check`)."""
     got = list(got)
     assert len(got) == len(RAW_RETURN_NAMES), tag
-    _check_bits(got[:5], reference, RAW_RETURN_NAMES[:5], tag=tag)
+    _check_bits_counted(got[:5], reference, RAW_RETURN_NAMES[:5], tag=tag)
     _rg_param_check(
         dict(zip(RAW_RETURN_NAMES[5:], got[5:], strict=True)), reference, tag
     )
@@ -9590,7 +9722,7 @@ def _rg_leaf_check(leaves, reference: dict, tag=None) -> None:
     """The leaves' gradients (:data:`RAW_LEAF_GRADS` order) as :func:`_rg_check` holds a backward's results."""
     grads = [leaf.grad for leaf in leaves]
     assert len(grads) == len(RAW_LEAF_GRADS), tag
-    _check_bits(grads[:5], reference, RAW_LEAF_GRADS[:5], tag=tag)
+    _check_bits_counted(grads[:5], reference, RAW_LEAF_GRADS[:5], tag=tag)
     _rg_param_check(
         dict(zip(RAW_LEAF_GRADS[5:], grads[5:], strict=True)), reference, tag
     )
@@ -9690,7 +9822,7 @@ def test_raw_gate_matches_the_exact_reference_and_the_deterministic_raw_mode(
 
 
 @pytest.mark.parametrize("shape", SHAPES[6:10] + SHAPES[11:13], ids=_shape_id)
-def test_raw_gate_paths_are_bitwise_the_deterministic_raw_mode(
+def test_raw_gate_paths_match_the_deterministic_raw_mode(
     device, manifest, shape
 ) -> None:
     """On one call's inputs every path gives the deterministic package's raw-mode results bit for bit: repeats, the
@@ -9757,7 +9889,7 @@ def test_raw_gate_paths_are_bitwise_the_deterministic_raw_mode(
 
 
 @pytest.mark.parametrize(("num_docs", "heads"), STATE_SHAPES, ids=["n1-h1", "n2-h2"])
-def test_raw_gate_saved_states_are_bitwise_the_deterministic_raw_mode(
+def test_raw_gate_saved_states_match_the_deterministic_raw_mode(
     device, manifest, num_docs, heads
 ) -> None:
     """The segmented rows that save the segment-boundary states (``light_states``) in raw mode: the gradients from
@@ -9802,7 +9934,7 @@ def test_raw_gate_saved_states_are_bitwise_the_deterministic_raw_mode(
 
 
 @pytest.mark.parametrize("shape", [((63, 1, 65), 2), ((129, 63), 16)], ids=_shape_id)
-def test_raw_gate_autograd_and_checkpoint_are_bitwise_the_deterministic_raw_mode(
+def test_raw_gate_autograd_and_checkpoint_match_the_deterministic_raw_mode(
     device, manifest, monkeypatch, shape
 ) -> None:
     """The autograd entry gives the leaves the deterministic package's raw-mode gradients (``dg`` to the raw gate,
@@ -9959,7 +10091,7 @@ def test_raw_gate_autograd_and_checkpoint_are_bitwise_the_deterministic_raw_mode
         o.backward(dout)
 
 
-def test_raw_gate_strided_views_are_bitwise_the_deterministic_raw_mode(
+def test_raw_gate_strided_views_match_the_deterministic_raw_mode(
     device, manifest
 ) -> None:
     """The raw gate as a column slice of a fused projection (strides ``(F, 128, 1)``) and as a head-interleaved split
@@ -10216,7 +10348,7 @@ RAW_BATCHED_ROWS = [
 
 
 @pytest.mark.parametrize("shape", RAW_BATCHED_ROWS, ids=_shape_id)
-def test_raw_gate_lean_and_batched_arenas_are_bitwise_the_deterministic_raw_mode(
+def test_raw_gate_lean_and_batched_arenas_match_the_deterministic_raw_mode(
     device, manifest, shape
 ) -> None:
     """Lean workspaces of one to four tail passes (each range's tail writes its slice of the per-chunk partials, or
@@ -10478,7 +10610,7 @@ def test_raw_gate_r1c_repeat_spread(device, manifest, monkeypatch, heads) -> Non
         )
         assert acc.numel() * 8 == acc_bytes and not bool(acc.view(torch.int64).any())
     out, saved = _rg_fwd(inputs, workspace=ws)
-    assert _bits_equal(out, ref_out)
+    assert _bits_equal_counted(out, ref_out)
     released: list = []
     original_release = cake_backend._entry_release
 
@@ -10509,11 +10641,11 @@ def test_raw_gate_r1c_repeat_spread(device, manifest, monkeypatch, heads) -> Non
             assert released == ([None] * 8 if glm is None else [False] * 8), released
         for run in runs[1:]:
             for name in RAW_RETURN_NAMES[:5]:
-                assert _bits_equal(run[name], runs[0][name]), (label, name)
+                assert _bits_equal_counted(run[name], runs[0][name]), (label, name)
         if glm is None:
             for run in runs[1:]:
                 for name in R1C_PARAMS:
-                    assert _bits_equal(run[name], runs[0][name]), (label, name)
+                    assert _bits_equal_counted(run[name], runs[0][name]), (label, name)
             continue
         differ, spread = {}, {}
         for name in R1C_PARAMS:
@@ -10621,7 +10753,7 @@ def test_raw_gate_r1c_alerts_under_torch_deterministic_mode(device, manifest) ->
         try:
             torch.use_deterministic_algorithms(False)
             out, saved = _rg_fwd(inputs, workspace=ws)
-            assert launched and _bits_equal(out, ref_out)
+            assert launched and _bits_equal_counted(out, ref_out)
             _, g_saved = chunk_kda_fwd(*gq)
             torch.cuda.synchronize(device)
             launched.clear()
@@ -10641,6 +10773,10 @@ def test_raw_gate_r1c_alerts_under_torch_deterministic_mode(device, manifest) ->
             ours = [w for w in caught if alert in str(w.message)]
             assert len(ours) == (1 if alerts else 0), [str(w.message) for w in caught]
             assert all(w.category is UserWarning for w in ours)
+            # attributed to the caller outside flashinfer (_rg_bwd, in this file)
+            assert all(
+                os.path.realpath(w.filename) == os.path.realpath(__file__) for w in ours
+            ), [(w.filename, w.lineno) for w in ours]
             assert launched
             seen += len(ours)
             _rg_check(got, ref, tag=(arch, heads, "torch deterministic"))
