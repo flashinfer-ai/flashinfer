@@ -765,6 +765,38 @@ dispatch + combine around the fc12 or cutlass grouped GEMM, all FP8 input,
 512 DeepEP+fc12 1459 / 1204 (1.21x), 1024 DeepEP+fc12 2155 / 1872 (1.15x),
 2048 DeepEP+fc12 3816 / 2930 (1.30x), 4096 DeepEP+fc12 7009 / 4820 (1.45x).
 
+### 8-32768 sweep and the single-node check (2026-11-03, dlcluster 2 x 8 H100)
+
+Every power of two from 8 to 32768 tokens per rank, internode EP16 against
+the six split baselines, and one node of eight H100 (no GIN) before
+(a192faac9, the parent of the first GIN commit) and after the GIN work,
+with the same bench and nodes.  CSVs and an HTML report:
+`benchmark_data/20261103_ep16_internode_vs_baselines/` (local).
+
+* Single node: per_tensor is faster or equal in every bucket (-0.4% to
+  -33%).  Blockwise lost only 256: +39%, from the 1x128-scale kernel sync
+  (1d22e7465), which made the M128N32 ping-pong row illegal and moved 256 to
+  the swap-AB M256N32 row; 128 / 512 were slow on their rows as well.  The
+  EP8 1024 row (non-swap M64N256, cga 2x1, tail split) wins all three (two
+  rounds on each of two nodes): 128 -23%, 256 -31%, 512 -28%, so
+  `EP8_OVERRIDES` takes it there.  With it blockwise is faster or equal
+  everywhere (-1% to -30%; 16384 +0.4%, within the runs' spread).
+* EP16 rows: 32 takes the 16-token row (swap-AB M256N16 cga 1x1; the M256N8
+  row ran 910 us between 715 and 761 at 16 / 64): -19.5%; 8192 / 16384 take
+  the 512-4096 row: -4.2% / -39.8% (16384's row returned tokens with
+  reuse_dispatch_warps, so the early return was off and the whole return
+  stayed in the tail).
+* 32768 tokens per rank does not fit an 80 GB H100 at sixteen ranks: the
+  mega kernel sizes its receive pool for the worst case (every token of the
+  world on one rank, 73.7 GiB), and the baselines run out too (NCCL-EP HT +
+  CUTLASS already at 16384).
+
+Final internode EP16 (max-rank median µs, mega mean of two runs; best
+baseline / mega): 8 688 (1.08x LL+cutlass), 16 714 (1.14x), 32 740 (1.23x
+DeepEP+cutlass), 64 767 (1.17x), 128 799 (1.20x), 256 872 (1.21x), 512 1214
+(1.19x DeepEP+fc12), 1024 1875 (1.16x), 2048 2934 (1.30x), 4096 4812
+(1.46x), 8192 8488 (1.61x), 16384 16498 (1.78x DeepEP+cutlass).
+
 Internode levers left:
 
 1. **Return put under GEMM load** — the put overlaps the GEMM but runs at

@@ -240,6 +240,14 @@ _TUNED_NUM_TOPK = 6
 # two rounds: pt 256 -26%, pt 1024 -11%, bw 1024 -4%, bw 4096 -13%.  Blockwise
 # wants weight multicast (cga 2,1,1) with the one-wave group; per-tensor 1024
 # takes the four-rank 2048 row.  Other eight-rank buckets were within noise.
+# Blockwise 128 / 256 / 512 on one node of eight H100 (2026-11-03, two rounds
+# on each of two nodes) take the 1024 row too: -23% / -31% against the
+# swap-AB M256N16 / M256N32 rows, which re-read every expert's weights per
+# token tile (16 / 32 rows per expert; the M128N32 ping-pong row 256 ran
+# before the 1x128 scale sync is no longer legal and the M256 row lost 39% to
+# it), -28% against the M64N256 CGA1x1 row at 512.
+_EP8_BW_ROW = _config(swap_ab=False, pingpong=False, tile=(64, 256, 128), cga=(2, 1, 1),
+                      tail_split_pairs=True)
 EP8_OVERRIDES = {
     "per_tensor": {
         256: _config(swap_ab=True, pingpong=True, tile=(128, 32, 128), cga=(1, 2, 1),
@@ -249,6 +257,9 @@ EP8_OVERRIDES = {
                       token_back="reuse_dispatch_warps"),
     },
     "blockwise": {
+        128: _EP8_BW_ROW,
+        256: _EP8_BW_ROW,
+        512: _EP8_BW_ROW,
         1024: _config(swap_ab=False, pingpong=False, tile=(64, 256, 128), cga=(2, 1, 1),
                       tail_split_pairs=True),
         4096: _config(swap_ab=False, pingpong=False, tile=(64, 256, 128), cga=(2, 1, 1),
@@ -263,18 +274,26 @@ EP8_OVERRIDES = {
 # weights once per token tile (1487-1513 -> 782-791 us, 1569-1605 -> 859-891 us).
 # 512-4096 take the eight-rank row (cga 2x1, tail split, one-wave group):
 # -29% / -6% / -7% / -3..-4%.  8 / 64 measured within noise; per_tensor and
-# the other buckets were not measured.
+# the other buckets were not measured.  32 (dlcluster 2026-11-03, two rounds)
+# takes the 16-token row: the swap-AB M256N8 CGA1x1 row ran 910 us against
+# 715 / 761 at 16 / 64 tokens, the M256N16 row 732 us (-19.5%).  8192 / 16384
+# take the 512-4096 row: -4.2% / -39.8% (16384's four-rank row returns tokens
+# with reuse_dispatch_warps, which keeps the early return off).  32768 does
+# not fit an 80 GB GPU at sixteen ranks (worst-case pool), so it keeps its row.
 _EP16_BW_SMALL = HEURISTIC_CONFIGS["blockwise"][1024]
 _EP16_BW_LARGE = EP8_OVERRIDES["blockwise"][1024]
 EP16_OVERRIDES = {
     "per_tensor": {},
     "blockwise": {
+        32: HEURISTIC_CONFIGS["blockwise"][16],
         128: _EP16_BW_SMALL,
         256: _EP16_BW_SMALL,
         512: _EP16_BW_LARGE,
         1024: _EP16_BW_LARGE,
         2048: _EP16_BW_LARGE,
         4096: _EP16_BW_LARGE,
+        8192: _EP16_BW_LARGE,
+        16384: _EP16_BW_LARGE,
     },
 }
 

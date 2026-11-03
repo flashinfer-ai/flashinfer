@@ -204,7 +204,8 @@ not picked them up):
   (`TokenInPullTokenBackPush.kernel_tail_reduce_warps`), and
   `token_comm_hook_kernel_tail` / `kernel_tail` skip those warps, so the
   reduce is no longer compiled for the 48-register dispatch group.
-  `heuristic_config.EP16_OVERRIDES` (blockwise 128-4096) and
+  `heuristic_config.EP16_OVERRIDES` (blockwise 128-4096; 32 and 8192 / 16384
+  added 2026-11-03, with `EP8_OVERRIDES` blockwise 128-512) and
   `_RANK_OVERRIDES`.  Measurements in [TUNING.md](TUNING.md).  Not in the
   drop tree.
 - Internode early return (2026-11-02; GIN + non-swap + epi_warps +
