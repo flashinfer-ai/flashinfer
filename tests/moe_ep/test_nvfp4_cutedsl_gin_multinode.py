@@ -339,6 +339,7 @@ def test_nvfp4_gin_public_graph_replay(quantize_input, partial, monkeypatch, tmp
     """Capture the public staging/kernel/reduce path and adjacent GPU work."""
     bootstrap = _bootstrap()
     from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
+        nvfp4_mega_launch_thunk,
         nvfp4_quantize_per_block_16,
     )
 
@@ -383,7 +384,13 @@ def test_nvfp4_gin_public_graph_replay(quantize_input, partial, monkeypatch, tmp
         monkeypatch.setattr(mega, "compiled", tracked)
         layer.forward(static)  # Prepare the instrumented callable outside capture.
         torch.cuda.synchronize()
-        for split in (False, True):
+        for mode in ("forward", "split", "prepared"):
+            prepared = None
+            if mode == "prepared":
+                weights = layer._get_transformed_weights()
+                prepared = nvfp4_mega_launch_thunk(
+                    weights[0], weights[1], layer._workspace
+                )
             stream = torch.cuda.Stream()
             stream.wait_stream(torch.cuda.current_stream())
             graph = torch.cuda.CUDAGraph()
@@ -395,7 +402,11 @@ def test_nvfp4_gin_public_graph_replay(quantize_input, partial, monkeypatch, tmp
                     topk_ids=static.topk_ids,
                     topk_weights=static.topk_weights,
                 )
-                if split:
+                if prepared is not None:
+                    layer.stage_inputs(t)
+                    prepared()
+                    y = layer._workspace.output_activation[:n]
+                elif mode == "split":
                     layer.stage_inputs(t)
                     y = layer.compute_staged(output=None)
                 else:
@@ -454,7 +465,7 @@ def test_nvfp4_gin_public_graph_replay(quantize_input, partial, monkeypatch, tmp
         assert torch.equal(outputs[0], expected)
         print(
             f"[rank {bootstrap.rank}] GIN_GRAPH_PASS packed={not quantize_input} "
-            f"tokens={n} graphs=2 replays=24 mega=1 reduce=1",
+            f"tokens={n} graphs=3 replays=36 mega=1 reduce=1",
             flush=True,
         )
     except BaseException:

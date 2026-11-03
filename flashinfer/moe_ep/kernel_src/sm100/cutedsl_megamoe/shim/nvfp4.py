@@ -483,7 +483,6 @@ class MegaMoENvfp4Frontend:
         inputs: MegaMoENvfp4Inputs,
         *,
         num_tokens: Optional[int] = None,
-        _bind_stream_at_launch: bool = False,
     ) -> Callable[[], None]:
         """Zero-arg launcher with args prebuilt (compiles if needed).
 
@@ -550,10 +549,9 @@ class MegaMoENvfp4Frontend:
                 except Exception as exc:
                     error = f"{type(exc).__name__}: {exc}"
                 self._gin_agree(error, "launch")
-                if _bind_stream_at_launch:
-                    runtime_kwargs["stream"] = cuda.CUstream(
-                        torch.cuda.current_stream().cuda_stream
-                    )
+                runtime_kwargs["stream"] = cuda.CUstream(
+                    torch.cuda.current_stream().cuda_stream
+                )
                 inner()
 
         return thunk
@@ -1940,13 +1938,17 @@ def nvfp4_mega_launch_thunk(
     """Prebuilt zero-arg NVFP4 mega launcher for steady-state timing loops.
 
     Tester-parity timed region (``tester/solver.py perf_run``): the returned
-    thunk is a bare compiled-kernel launch -- args prebuilt once, no per-call
-    Python, no workspace reset (the kernel tail-cleans), no sync, no output
-    copy. The reduced output lands in ``symm_buffer.output_activation``;
+    thunk uses prebuilt args, no workspace reset (the kernel tail-cleans),
+    no device sync and no output copy. The reduced output lands in
+    ``symm_buffer.output_activation``;
     custom-finalize sessions expose per-route output through the frontend's
     ``custom_finalize_workspace()`` instead.
     Compiles on this call if needed.  Rebuild the thunk after knob/clamp
     changes or buffer destruction.
+
+    GIN thunks use the current execution/capture stream and perform CPU
+    agreement at invocation. Prepare them outside capture and retain their
+    session for the graph lifetime. Graph replay executes only GPU work.
     """
     if symm_buffer._destroyed:
         raise RuntimeError("symm_buffer.destroy() was already called.")

@@ -440,8 +440,8 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         quantize_input: bool,
     ) -> None:
         num_tokens = t.hidden_states.shape[0]
-        # GIN validates metadata and route values collectively on every public
-        # forward/staging call before the core's local checks. Other backends
+        # GIN validates eagerly on every public call; capture checks metadata
+        # only and requires valid route values on every replay. Other backends
         # run validate_forward() only for the first forward of a
         # workspace (later forwards are gated on a stable input signature that
         # does not cover this optional tensor).  Presence and metadata of the
@@ -597,7 +597,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         mega = fe._mega
         # GIN preparation is collective. A stream change on only one rank
         # must not create a local cache miss and a different collective order.
-        # Its eager-only thunk binds the current stream at execution instead.
+        # Its session thunk binds the current stream at execution/capture.
         stream = (
             None if fe.config.internode else torch.cuda.current_stream().cuda_stream
         )
@@ -627,10 +627,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             inputs = self._mega_inputs(workspace, transformed_weights)
             # Full validation happens inside make_launch_thunk's
             # _prepare_launch_inputs (run()'s slow-path validator).
-            if fe.config.internode:
-                thunk = fe.make_launch_thunk(inputs, _bind_stream_at_launch=True)
-            else:
-                thunk = fe.make_launch_thunk(inputs)
+            thunk = fe.make_launch_thunk(inputs)
             mega = fe._mega
             assert mega is not None and mega.compiled is not None
             key = (key[0], key[1], id(mega.compiled), stream)
@@ -687,8 +684,8 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             self._autotune_pending = False
         # Steady-state launch thunk: nvfp4_mega_moe re-validates, re-resolves
         # the clamp, and rebuilds the 12-field inputs bundle on every call.
-        # Build once per (workspace, weights, compiled-session, STREAM) and
-        # reuse. The stream is part of the key because the thunk's launch
+        # Build once per workspace, weights and compiled session. Off thunks
+        # also key on STREAM because their launch
         # kwargs bind it at build time — a graph capture runs on a capture
         # stream and must get its own thunk or the kernel launch escapes the
         # graph. A knobs/activation change nulls the compiled session,
