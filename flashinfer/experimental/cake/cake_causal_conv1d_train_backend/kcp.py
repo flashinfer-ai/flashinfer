@@ -605,6 +605,22 @@ def _bwd_grid(
     return grid
 
 
+def _ordinary_launch(cooperative: Any, entry: str) -> None:
+    """Validate ``cooperative`` of a call: ``None`` or ``False`` (the main backward is one ordinary launch);
+    ``ValueError`` for ``True``, ``TypeError`` for a non-``bool``."""
+    if cooperative is None:
+        return
+    if not isinstance(cooperative, bool):
+        raise TypeError(
+            f"{entry}: cooperative must be None or a bool, got {type(cooperative).__name__}"
+        )
+    if cooperative:
+        raise ValueError(
+            f"{entry}: cooperative=True applies to deterministic=True only; the non-deterministic main backward "
+            "is one ordinary launch (pass cooperative=None or False)"
+        )
+
+
 def _reserve(value: Any, entry: str) -> int:
     """``bwd_reserve_sms`` of a call: ``None`` -> ``RESERVE_DEFAULT``; else a non-negative ``int`` (``TypeError`` for a
     ``bool`` or a non-``int``, ``ValueError`` below zero)."""
@@ -1609,6 +1625,7 @@ def cake_causal_conv1d_kcp(
     *,
     graph: Optional[str] = None,
     recompute_handle: Optional[Any] = None,
+    cooperative: Optional[bool] = None,
     deterministic: bool = True,
     bwd_reserve_sms: Optional[int] = None,
 ) -> torch.Tensor:
@@ -1646,6 +1663,10 @@ def cake_causal_conv1d_kcp(
         another rank's backward exchange and hangs or corrupts data; no check is made.  Never share one handle
         between two convolution calls (also not in nested regions), and never ``clear()`` or reuse a handle while a
         backward that needs it is pending.
+    cooperative : bool, optional
+        The deterministic package's launch-form keyword, accepted so the dispatching facade takes one parameter
+        list in both modes.  The main backward here is always one ordinary launch, so ``None`` (default) and
+        ``False`` mean the same; ``True`` raises ``ValueError`` and a non-``bool`` ``TypeError``.
     deterministic : bool
         Must be ``False`` (``ValueError`` otherwise): the numerical mode of this package.  Under
         ``torch.use_deterministic_algorithms(True)`` the backward raises (or warns with ``warn_only=True``).
@@ -1668,6 +1689,7 @@ def cake_causal_conv1d_kcp(
     """
 
     _require_nondeterministic(deterministic, "cake_causal_conv1d_kcp")
+    _ordinary_launch(cooperative, "cake_causal_conv1d_kcp")
     reserve = _reserve(bwd_reserve_sms, "cake_causal_conv1d_kcp")
     _reserve_fits(reserve, x_local, "cake_causal_conv1d_kcp")
     _graph_mode(graph)  # validate on the caller's frame
@@ -2064,6 +2086,7 @@ def cake_causal_conv1d_multi_kcp(
     *,
     graph: Optional[str] = None,
     recompute_handle: Optional[Any] = None,
+    cooperative: Optional[bool] = None,
     deterministic: bool = True,
     bwd_reserve_sms: Optional[int] = None,
 ) -> tuple[torch.Tensor, ...]:
@@ -2095,6 +2118,8 @@ def cake_causal_conv1d_multi_kcp(
         created outside the outermost checkpoint region; refused with ``graph="replay"`` and inside a CUDA-graph
         capture; every rank passes one or none).  The handle may also carry the ``"kda"`` entry of the layer's
         recurrence; a handle's ``"conv"`` entry serves either one multi call or one single call, never both.
+    cooperative : bool, optional
+        As in :func:`cake_causal_conv1d_kcp` (``None`` or ``False``).
     deterministic : bool
         Must be ``False`` (``ValueError`` otherwise).
     bwd_reserve_sms : int, optional
@@ -2107,6 +2132,7 @@ def cake_causal_conv1d_multi_kcp(
     """
 
     _require_nondeterministic(deterministic, "cake_causal_conv1d_multi_kcp")
+    _ordinary_launch(cooperative, "cake_causal_conv1d_multi_kcp")
     reserve = _reserve(bwd_reserve_sms, "cake_causal_conv1d_multi_kcp")
     _graph_mode(graph)
     xs, weights, _ = _multi_operands(xs, weights, None)
