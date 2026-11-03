@@ -1155,6 +1155,7 @@ class MSAIcpLayerGraphs:
         self._graphs.clear()
         self._seen.clear()
         self._staging.clear()
+        self._pool = None
 
     def _staging_for(self, index_q: torch.Tensor) -> torch.Tensor:
         key = (tuple(index_q.shape), tuple(index_q.stride()), index_q.dtype)
@@ -1173,6 +1174,9 @@ class MSAIcpLayerGraphs:
         """``body``'s launches captured on a side stream into a new graph."""
         if self._stream is None:
             self._stream = torch.cuda.Stream(device=self.device_index)
+        if self._pool is None:
+            # One private memory pool shared by the live graphs; torch frees
+            # it with the last of them, so a new one follows a full eviction.
             self._pool = torch.cuda.graph_pool_handle()
         graph = torch.cuda.CUDAGraph()
         current = torch.cuda.current_stream(self.device_index)
@@ -1196,6 +1200,8 @@ class MSAIcpLayerGraphs:
         while len(self._graphs) >= self.max_keys:
             self._graphs.popitem(last=False)
             self.stats["evicted_keys"] += 1
+        if not any(self._graphs.values()):
+            self._pool = None
         graphs = self._graphs[step_key] = {}
         return graphs
 
