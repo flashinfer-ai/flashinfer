@@ -15,6 +15,8 @@
  */
 #pragma once
 
+#include <math_constants.h>
+
 #include <cstdint>
 #include <cub/cub.cuh>
 
@@ -22,11 +24,11 @@ namespace flashinfer {
 namespace sampling {
 
 struct SamplingBoundaryMass {
-  double above, total;
+  double above;
   uint32_t equal_count;
 
   __device__ SamplingBoundaryMass operator+(const SamplingBoundaryMass& rhs) const {
-    return {above + rhs.above, total + rhs.total, equal_count + rhs.equal_count};
+    return {above + rhs.above, equal_count + rhs.equal_count};
   }
 };
 
@@ -39,17 +41,25 @@ __device__ __forceinline__ SamplingBoundaryMass GetSamplingBoundaryMass(const DT
   using Reduce = cub::BlockReduce<SamplingBoundaryMass, BLOCK_THREADS>;
   __shared__ typename Reduce::TempStorage temporary;
   __shared__ SamplingBoundaryMass result;
-  SamplingBoundaryMass local{0, 0, 0};
+  SamplingBoundaryMass local{0, 0};
   for (uint32_t i = threadIdx.x; i < size; i += BLOCK_THREADS) {
     const float value = row[i];
     local.above += value > boundary ? double(value) : 0;
-    local.total += double(value);
     local.equal_count += value == boundary;
   }
   const auto reduced = Reduce(temporary).Sum(local);
   if (threadIdx.x == 0) result = reduced;
   __syncthreads();
   return result;
+}
+
+// Conservative error allowance for a nonnegative float sum: at most one
+// sequential addition per lane item, plus the block reduction and comparison.
+template <uint32_t BLOCK_THREADS>
+__device__ __forceinline__ float SamplingMassError(float mass, uint32_t size) {
+  const float nu = (float((size + BLOCK_THREADS - 1) / BLOCK_THREADS) + 32.f) * 0x1p-24f;
+  // Convert the usual true-sum error bound to one using the computed mass.
+  return nu < 0.5f ? mass * (nu / (1.f - 2.f * nu)) : CUDART_INF_F;
 }
 
 __device__ __forceinline__ uint32_t SamplingBoundaryQuota(double target, double above,
@@ -65,11 +75,38 @@ __device__ __forceinline__ uint32_t SamplingBoundaryQuota(double target, double 
 // Return the exclusive original-index limit for the first `take` matching items.
 // Tiles follow index order, unlike a scan of thread-strided per-thread totals.
 // Callers skip this scan when the complete boundary group can be retained.
-template <uint32_t BLOCK_THREADS, typename IsTie>
+template <uint32_t BLOCK_THREADS, bool BISECT = false, typename IsTie>
 __device__ __forceinline__ uint32_t FindSamplingTieIndexLimit(uint32_t size, uint32_t take,
                                                               IsTie is_tie,
                                                               uint32_t index_base = 0) {
   if (take == 0) return index_base;
+  if constexpr (BISECT) {
+    // AIR scans global memory over a whole vocabulary. Count successively
+    // smaller contiguous halves, then scan only the final tile; this avoids
+    // one block-wide prefix scan per vocabulary tile on sparse bf16 ties.
+    using Reduce = cub::BlockReduce<uint32_t, BLOCK_THREADS>;
+    __shared__ typename Reduce::TempStorage reduce;
+    __shared__ uint32_t left_count;
+    uint32_t low = 0, high = size;
+    while (high - low > BLOCK_THREADS) {
+      const uint32_t middle = low + (high - low) / 2;
+      uint32_t local = 0;
+      for (uint32_t i = low + threadIdx.x; i < middle; i += BLOCK_THREADS) local += is_tie(i);
+      const uint32_t count = Reduce(reduce).Sum(local);
+      if (threadIdx.x == 0) left_count = count;
+      __syncthreads();
+      const uint32_t total = left_count;
+      __syncthreads();
+      if (take <= total) {
+        high = middle;
+      } else {
+        low = middle;
+        take -= total;
+      }
+    }
+    return FindSamplingTieIndexLimit<BLOCK_THREADS>(
+        high - low, take, [is_tie, low](uint32_t i) { return is_tie(low + i); }, index_base + low);
+  }
   using Scan = cub::BlockScan<uint32_t, BLOCK_THREADS>;
   __shared__ typename Scan::TempStorage scan;
   __shared__ uint32_t limit;

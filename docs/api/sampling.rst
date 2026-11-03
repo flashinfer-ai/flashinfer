@@ -25,6 +25,11 @@ The convention applies to sampling, renormalization, masking, and both
 ``filter_apply_order`` paths, independently of ``deterministic``. The two filter
 orders retain their existing intermediate normalization semantics.
 
+For probability inputs, top-p compares cumulative input probabilities directly
+with ``top_p``; it does not multiply the threshold by the input row sum. Supply
+nonnegative, normalized probabilities. As before, ``top_p >= 1`` disables top-p
+filtering. Exact-boundary comparisons use the represented input values.
+
 .. seealso::
 
   For efficient Top-K selection (without sampling), see :ref:`apitopk` which provides

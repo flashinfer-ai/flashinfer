@@ -30,7 +30,7 @@ def _renorm_reference(probs, *, k=None, p=None):
     if p is not None:
         p = torch.as_tensor(p, dtype=torch.float32, device=probs.device).reshape(-1, 1)
         before = sorted_probs.cumsum(-1) - sorted_probs
-        keep &= before < p.double() * sorted_probs.sum(-1, keepdim=True)
+        keep &= (before < p.double()) | (p >= 1)
     selected = torch.where(keep, sorted_probs, 0)
     selected /= selected.sum(-1, keepdim=True)
     return torch.zeros_like(selected).scatter(1, order, selected).to(probs.dtype)
@@ -139,6 +139,119 @@ def test_boundary_sampling_matches_renorm_distribution(mode, deterministic):
     torch.testing.assert_close(
         counts.float() / counts.sum(), expected[0], rtol=0, atol=0.015
     )
+
+
+@pytest.mark.parametrize("vocab_size", [4, 4096])
+@pytest.mark.parametrize("deterministic", [False, True])
+@pytest.mark.parametrize(
+    "values,p",
+    [([0.5, 0.2, 0.2], 0.52), ([0.5, 0.2, 0.19], 0.52), ([0.5, 0.3, 0.1], 0.55)],
+)
+def test_top_p_uses_absolute_threshold_with_and_without_ties(
+    vocab_size, deterministic, values, p
+):
+    # Cover both the small-vocab search and AIR. The sum differs from one
+    # intentionally: a tied boundary must not change the threshold definition.
+    probs = torch.zeros((1, vocab_size), device="cuda")
+    probs[0, :3] = torch.tensor(values, device="cuda")
+    expected = _renorm_reference(probs, p=p)
+    actual = flashinfer.sampling.top_p_renorm_probs(probs, p)
+    assert torch.equal(actual > 0, expected > 0)
+    torch.testing.assert_close(actual, expected)
+    indices = torch.zeros(8192, dtype=torch.int64, device="cuda")
+    for mode in ("top_p", "joint"):
+        if mode == "top_p":
+            samples = flashinfer.sampling.top_p_sampling_from_probs(
+                probs, p, indices=indices, deterministic=deterministic, seed=42
+            )
+        else:
+            samples = flashinfer.sampling.top_k_top_p_sampling_from_probs(
+                probs,
+                2,
+                p,
+                indices=indices,
+                filter_apply_order="joint",
+                deterministic=deterministic,
+                seed=42,
+            )
+        counts = samples.bincount(minlength=vocab_size).float() / indices.numel()
+        assert not counts[2:].any()
+        torch.testing.assert_close(counts, expected[0], rtol=0, atol=0.025)
+
+
+@pytest.mark.parametrize("deterministic", [False, True])
+@pytest.mark.parametrize("mode", ["top_k", "top_p", "joint"])
+def test_whole_tied_groups_before_boundary_keep_sampling_distribution(
+    mode, deterministic
+):
+    probs = torch.tensor(
+        [[0.5, 0.125, 0.125, 0.0625, 0.0625, 0.0625, 0.0625, 0]],
+        device="cuda",
+        dtype=torch.bfloat16,
+    ).float()
+    expected = _renorm_reference(probs, k=5, p=0.875)
+    indices = torch.zeros(8192, dtype=torch.int32, device="cuda")
+    kwargs = dict(indices=indices, deterministic=deterministic, seed=19)
+    if mode == "top_k":
+        samples = flashinfer.sampling.top_k_sampling_from_probs(probs, 5, **kwargs)
+    elif mode == "top_p":
+        samples = flashinfer.sampling.top_p_sampling_from_probs(probs, 0.875, **kwargs)
+    else:
+        samples = flashinfer.sampling.top_k_top_p_sampling_from_probs(
+            probs, 5, 0.875, filter_apply_order="joint", **kwargs
+        )
+    counts = samples.bincount(minlength=8).float() / indices.numel()
+    assert not counts[5:].any()
+    torch.testing.assert_close(counts, expected[0], rtol=0, atol=0.025)
+
+
+@pytest.mark.parametrize("deterministic", [False, True])
+@pytest.mark.parametrize("indices_dtype", [torch.int32, torch.int64])
+def test_rejection_kernels_launch_across_vector_widths(deterministic, indices_dtype):
+    # Exercise public fp32 vector widths and promoted fp16/bf16 inputs. On
+    # SM90/SM100 these small rows still use the 1024-thread launch budget.
+    for vocab in (257, 258, 260, 264, 272):
+        for dtype in (torch.float32, torch.float16, torch.bfloat16):
+            probs = torch.full((1, vocab), 1 / vocab, device="cuda", dtype=dtype)
+            indices = torch.zeros(16, device="cuda", dtype=indices_dtype)
+            kwargs = dict(indices=indices, deterministic=deterministic, seed=7)
+            outputs = (
+                flashinfer.sampling.top_k_sampling_from_probs(probs, 1, **kwargs),
+                flashinfer.sampling.top_p_sampling_from_probs(
+                    probs, 0.25 / vocab, **kwargs
+                ),
+                flashinfer.sampling.top_k_top_p_sampling_from_probs(
+                    probs, 1, 0.99, filter_apply_order="joint", **kwargs
+                ),
+            )
+            torch.cuda.synchronize()
+            for output in outputs:
+                assert output.dtype == indices_dtype
+                assert (output == 0).all()
+
+
+@pytest.mark.parametrize("is_deterministic", [False, True])
+@pytest.mark.parametrize("p", [0.625, 0.8125, 1.0])
+def test_air_sparse_boundary_ties_cross_index_halves(p, is_deterministic):
+    probs = torch.zeros((1, 131072), device="cuda")
+    probs[0, 0] = 0.5625
+    positions = torch.tensor(
+        [3, 1023, 1024, 65535, 65536, 65537, 131071], device="cuda"
+    )
+    probs[0, positions] = 0.0625
+    expected = _renorm_reference(probs, p=p)
+    actual = flashinfer.sampling.top_p_renorm_probs(probs, p, is_deterministic)
+    assert torch.equal(actual > 0, expected > 0)
+    torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize("vocab_size", [4, 4096])
+def test_top_p_one_keeps_all_tokens_despite_row_sum_roundoff(vocab_size):
+    probs = torch.zeros((1, vocab_size), device="cuda")
+    probs[0, :3] = torch.tensor([0.5, 0.5, 2**-20], device="cuda")
+    actual = flashinfer.sampling.top_p_renorm_probs(probs, 1.0)
+    assert torch.equal(actual > 0, probs > 0)
+    torch.testing.assert_close(actual, probs / probs.sum(-1, keepdim=True))
 
 
 @pytest.mark.parametrize("order", ["joint", "top_k_first"])

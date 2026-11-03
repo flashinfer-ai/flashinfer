@@ -53,6 +53,12 @@ def _runner(name, deterministic, top_k, top_p):
         return lambda p: s.top_k_top_p_sampling_from_probs(
             p, top_k, top_p, filter_apply_order="top_k_first", **kwargs
         )
+    if name == "top_p_renorm":
+        return lambda p: s.top_p_renorm_probs(p, top_p)
+    if name == "top_k_renorm":
+        return lambda p: s.top_k_renorm_probs(p, top_k)
+    if name == "top_k_mask":
+        return lambda p: s.top_k_mask_logits(p, top_k)
     raise ValueError(name)
 
 
@@ -73,6 +79,7 @@ def main():
     )
     parser.add_argument("--repeat-iters", type=int, default=40)
     parser.add_argument("--both-deterministic", action="store_true")
+    parser.add_argument("--deterministic", choices=("true", "false"), default="true")
     parser.add_argument("--cuda-graph", action="store_true")
     args = parser.parse_args()
     args.out.parent.mkdir(parents=True, exist_ok=True)
@@ -128,10 +135,25 @@ def main():
                 assert row.numel() == probs[0].unique().numel()
             elif distribution == "uniform":
                 probs = torch.full((batch, args.vocab), 1 / args.vocab, device="cuda")
+            elif distribution == "bf16_derived":
+                # Keep probabilities rounded to bf16, as in serving pipelines
+                # that promote stored bf16 probabilities back to fp32. Record
+                # the resulting sum drift; do not erase ties by re-softmaxing.
+                logits = torch.randn(
+                    (batch, args.vocab), device="cuda", generator=generator
+                )
+                probs = logits.softmax(-1).bfloat16().float()
             else:
                 raise ValueError(distribution)
             input_hash = hashlib.sha256(probs.cpu().numpy().tobytes()).hexdigest()
-            for deterministic in [True, False] if args.both_deterministic else [True]:
+            row_sum = probs.double().sum(-1)
+            unique_values = probs[0].unique().numel()
+            deterministic_modes = (
+                [True, False]
+                if args.both_deterministic
+                else [args.deterministic == "true"]
+            )
+            for deterministic in deterministic_modes:
                 for routine in args.routines:
                     run = _runner(routine, deterministic, args.top_k, args.top_p)
                     samples = run(probs)
@@ -145,7 +167,7 @@ def main():
                         "path": str(binary),
                         "sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
                     }
-                    if routine == "top_k_first":
+                    if routine in ("top_k_first", "top_k_mask", "top_k_renorm"):
                         from flashinfer.jit.topk import gen_topk_module
 
                         topk_spec = gen_topk_module()
@@ -183,6 +205,9 @@ def main():
                             top_p=args.top_p,
                             deterministic=deterministic,
                             input_sha256=input_hash,
+                            row_sum_min=row_sum.min().item(),
+                            row_sum_max=row_sum.max().item(),
+                            first_row_unique_values=unique_values,
                             median_us=1000 * statistics.median(times),
                             min_us=1000 * min(times),
                             max_us=1000 * max(times),

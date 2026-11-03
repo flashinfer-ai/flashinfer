@@ -106,6 +106,7 @@ constexpr BlockReduceAlgorithm REDUCE_ALGO = BLOCK_REDUCE_WARP_REDUCTIONS;
 // unconstrained register allocation (avoids a B300/H100 register-spill
 // regression). When SM107 is mapped to sm_100f at JIT time, this gate is
 // inactive; that path inherits sm_100 register counts which already fit.
+// The three rejection entry points below always declare their launch bounds.
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1070)
 #define FLASHINFER_SAMPLING_LAUNCH_BOUNDS(block_threads) __launch_bounds__(block_threads)
 #else
@@ -919,20 +920,20 @@ __device__ __noinline__ int ResolveSamplingBoundary(
     SamplingTempStorage<BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM>& storage) {
   double mass_above = above, target = p;
   if constexpr (TOP_P) {
-    if (equal_count == d) {
-      mass_above = 0;
-      target = double(p) * double(pivot) * d;
-    } else {
-      const auto mass = GetSamplingBoundaryMass<BLOCK_THREADS>(row, d, pivot);
-      mass_above = mass.above;
-      target = double(p) * mass.total;
+    if (p < 1.f) {
+      if (equal_count == d) {
+        mass_above = 0;
+      } else {
+        const auto mass = GetSamplingBoundaryMass<BLOCK_THREADS>(row, d, pivot);
+        mass_above = mass.above;
+      }
     }
   }
-  if ((TOP_K && greater_count >= k) || (TOP_P && mass_above >= target)) return -1;
+  if ((TOP_K && greater_count >= k) || (TOP_P && p < 1.f && mass_above >= target)) return -1;
   uint32_t take = equal_count;
   if constexpr (TOP_K) take = min(take, k - greater_count);
   if constexpr (TOP_P) {
-    take = min(take, SamplingBoundaryQuota(target, mass_above, pivot, equal_count));
+    if (p < 1.f) take = min(take, SamplingBoundaryQuota(target, mass_above, pivot, equal_count));
   }
   if (take == equal_count) return sampled_id;
   const uint32_t limit =
@@ -1037,11 +1038,29 @@ __device__ __forceinline__ void RejectionSamplingFromProb(
     // Top-k only needs the equality count for an otherwise accepted pivot.
     // Top-p also needs it to recheck the cumulative mass at tied boundaries.
     if constexpr (TOP_P) equal = reduce_equal();
-    const bool value_accepted = (!TOP_K || stats.count < k) && (!TOP_P || stats.value < p);
+    const bool value_accepted =
+        (!TOP_K || stats.count < k) && (!TOP_P || p >= 1.f || stats.value < p);
     if constexpr (!TOP_P) {
       if (value_accepted) equal = reduce_equal();
     }
-    if (equal > 1) {
+    // A tie is cheap unless the requested prefix cuts through its group.
+    // Use a conservative float-sum allowance; ambiguous top-p comparisons,
+    // including unique pivots, are rechecked against the same absolute p.
+    bool resolve_boundary =
+        TOP_K && equal > 1 && stats.count < k && uint32_t(stats.count) + equal > k;
+    if constexpr (TOP_P) {
+      if (p < 1.f) {
+        const float group_mass = pivot_0 * equal;
+        const float error = SamplingMassError<BLOCK_THREADS>(stats.value + group_mass, d);
+        if (stats.value - error >= p) {
+          low = pivot_0;
+          q = stats.value;
+          continue;
+        }
+        resolve_boundary |= stats.value + group_mass + error >= p;
+      }
+    }
+    if (resolve_boundary) {
       const int result = ResolveSamplingBoundary<TOP_K, TOP_P, BLOCK_THREADS, SCAN_ALGORITHM,
                                                  REDUCE_ALGORITHM, VEC_SIZE, DETERMINISTIC>(
           probs + row_idx * d, d, pivot_0, stats.value, stats.count, equal, k, p, sampled_id, state,
@@ -1064,7 +1083,7 @@ __device__ __forceinline__ void RejectionSamplingFromProb(
     if (value_accepted) break;
     if constexpr (TOP_K) {
       const auto midpoint = reduce_pivot(local_1);
-      if (midpoint.count < k && (!TOP_P || midpoint.value < p)) {
+      if (midpoint.count < k && (!TOP_P || p >= 1.f || midpoint.value < p)) {
         low = pivot_0;
         high = pivot_1;
         q = stats.value;
@@ -1085,10 +1104,12 @@ __device__ __forceinline__ void RejectionSamplingFromProb(
   }
 }
 
+// These rejection kernels launch 1024 threads on SM90/SM100 too. Their launch
+// bounds must cover every architecture, including the cold boundary resolver.
 template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE, bool DETERMINISTIC,
           typename DType, typename IdType>
-__global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void TopKSamplingFromProbKernel(
+__global__ __launch_bounds__(BLOCK_THREADS) void TopKSamplingFromProbKernel(
     DType* probs, IdType* output, bool* valid, IdType* indices, IdType* top_k_arr,
     uint32_t top_k_val, uint32_t d, uint64_t* seed_arr, uint64_t seed_val, uint64_t* offset_arr,
     uint64_t offset_val, uint32_t seed_stride, uint32_t offset_stride) {
@@ -1101,7 +1122,7 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void TopKSamplingFro
 template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE, bool DETERMINISTIC,
           typename DType, typename IdType>
-__global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void TopPSamplingFromProbKernel(
+__global__ __launch_bounds__(BLOCK_THREADS) void TopPSamplingFromProbKernel(
     DType* probs, IdType* output, bool* valid, IdType* indices, float* top_p_arr, float top_p_val,
     uint32_t d, uint64_t* seed_arr, uint64_t seed_val, uint64_t* offset_arr, uint64_t offset_val,
     uint32_t seed_stride, uint32_t offset_stride) {
@@ -1212,7 +1233,7 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void MinPSamplingFro
 template <uint32_t BLOCK_THREADS, BlockScanAlgorithm SCAN_ALGORITHM,
           BlockReduceAlgorithm REDUCE_ALGORITHM, uint32_t VEC_SIZE, bool DETERMINISTIC,
           typename DType, typename IdType>
-__global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void TopKTopPSamplingFromProbKernel(
+__global__ __launch_bounds__(BLOCK_THREADS) void TopKTopPSamplingFromProbKernel(
     DType* probs, IdType* top_k_arr, float* top_p_arr, IdType* output, bool* valid, IdType* indices,
     IdType top_k_val, float top_p_val, uint32_t d, uint64_t* seed_arr, uint64_t seed_val,
     uint64_t* offset_arr, uint64_t offset_val, uint32_t seed_stride, uint32_t offset_stride) {
@@ -2143,8 +2164,7 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void TopPRenormProbK
 
   const float boundary = min_gt_low;
   const auto group = GetSamplingBoundaryMass<BLOCK_THREADS>(probs + row_idx * d, d, boundary);
-  const uint32_t take =
-      SamplingBoundaryQuota(double(p) * group.total, group.above, boundary, group.equal_count);
+  const uint32_t take = SamplingBoundaryQuota(double(p), group.above, boundary, group.equal_count);
   uint32_t tie_index_limit = UINT32_MAX;
   if (take < group.equal_count) {
     tie_index_limit = FindSamplingTieIndexLimit<BLOCK_THREADS>(
