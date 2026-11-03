@@ -757,7 +757,10 @@ def _dist_main(argv: Sequence[str]) -> int:
             torch.cuda.synchronize()
             res[arm] = (hp, hd)
         for layer in range(layers):
-            exp = base.prefill_expect(pcases[layer], lay, fast=False, with_global=False)
+            # the slow oracle for layer 0, the suite's validated fast reference after it
+            exp = base.prefill_expect(
+                pcases[layer], lay, fast=layer > 0, with_global=False
+            )
             (cs, co, csc), (ss, so, ssc) = res["call"][0][layer], res["step"][0][layer]
             what = f"rank {rank} mixed layer {layer}"
             base.assert_words(cs.cpu(), exp.carriers[rank], what + " per-call carrier")
