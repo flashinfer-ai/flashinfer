@@ -104,6 +104,19 @@ cuuint64_t Stride(int64_t value, const char* descriptor) {
   return static_cast<cuuint64_t>(value);
 }
 
+void ZeroRegion(const TensorView& t, const DLDevice& dev, cudaStream_t stream) {
+  if (t.numel() == 0) return;
+  TVM_FFI_CHECK(t.device().device_type == kDLCUDA && t.device().device_id == dev.device_id, ValueError)
+      << KERNEL_NAME << ": 'zero_region' must be a CUDA tensor on device " << dev.device_id;
+  check_contiguous(t, "zero_region");
+  const DLDataType dtype = t.dtype();
+  const int64_t bits = static_cast<int64_t>(dtype.bits) * dtype.lanes;
+  TVM_FFI_CHECK(bits % 8 == 0, ValueError)
+      << KERNEL_NAME << ": 'zero_region' must hold whole bytes per element, got " << bits << " bits";
+  CheckCuda(cudaMemsetAsync(DataPtr(t), 0, static_cast<size_t>(t.numel() * (bits / 8)), stream),
+            "cudaMemsetAsync of 'zero_region'");
+}
+
 CUtensorMap EncodeTma_Q(const TensorView& t) {
   TVM_FFI_CHECK(t.ndim() >= 2, ValueError)
       << KERNEL_NAME << ": descriptor 'Q' takes a source of at least 2 dims, got " << t.ndim();
@@ -204,7 +217,7 @@ CUtensorMap EncodeTma_W(const TensorView& t) {
   return map;
 }
 
-void Run(TensorView a_Q, TensorView a_K, TensorView a_W, TensorView a_cu_seqlens_q, TensorView a_cu_seqlens_k, TensorView a_q_offsets, TensorView a_Indices, TensorView a_Scores, TensorView a_Cand, int64_t a_num_segments, int64_t a_top_k, int64_t a_ratio, int64_t a_has_offsets, int64_t a_cand_cap, int64_t a_first_cap, int64_t a_sample_tiles_max, int64_t a_sample_shift_permille, int64_t a_far_sample, int64_t a_check_period, int64_t a_grid_ctas, double a_softmax_scale, int64_t a_n_split, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
+void Run(TensorView a_Q, TensorView a_K, TensorView a_W, TensorView a_cu_seqlens_q, TensorView a_cu_seqlens_k, TensorView a_q_offsets, TensorView a_Indices, TensorView a_Scores, TensorView a_Cand, int64_t a_num_segments, int64_t a_top_k, int64_t a_ratio, int64_t a_has_offsets, int64_t a_cand_cap, int64_t a_first_cap, int64_t a_sample_tiles_max, int64_t a_sample_shift_permille, int64_t a_far_sample, int64_t a_check_period, int64_t a_grid_ctas, double a_softmax_scale, int64_t a_n_split, TensorView a_zero_region, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
   DLDevice dev = a_Q.device();
   tvm::ffi::CUDADeviceGuard device_guard(dev.device_id);
   check_cuda_tensor(a_Q, "Q");
@@ -330,6 +343,7 @@ void Run(TensorView a_Q, TensorView a_K, TensorView a_W, TensorView a_cu_seqlens
   attrs[1].val.clusterSchedulingPolicyPreference = cudaClusterSchedulingPolicySpread;
   config.attrs = attrs;
   config.numAttrs = 2;
+  ZeroRegion(a_zero_region, dev, stream);
   CheckCuda(cudaLaunchKernelExC(&config, reinterpret_cast<const void*>(CAKE_KERNEL_SYMBOL), kernel_args),
             "cudaLaunchKernelExC");
 }
