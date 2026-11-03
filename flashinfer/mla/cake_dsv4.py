@@ -1763,28 +1763,44 @@ def _int32_vector(
 # twin ``<route>_no_pdl``: the same kernel without its two griddepcontrol
 # instructions, which a call that does not ask for PDL launches instead
 # (without the attribute the grid starts after its predecessor completes, so
-# it reads what the PDL program reads after its wait).  SM103 routes the twin
-# to a program of its own; SM100 routes it to the route's program.
+# it reads what the PDL program reads after its wait).  SM100 and SM103 route
+# the twin to programs of their own.
 _NO_PDL_TWIN_ROUTES = frozenset({"fp8_h128_prefill_source_persistent"})
 
-# The fewest query rows a launch needs to take the twin, per architecture (an
-# architecture not listed never takes it).  GB300 without PDL: the twin beat the
-# PDL program by 64-192 ns from 386 rows on (2 x 257-token prefill, 64 x 8
-# MTP) but trailed it by up to 64 ns at 256 rows (64 x 4 MTP).
+# The fewest query rows a launch needs to take the twin, per architecture.
+# GB300 without PDL: the twin beat the PDL program by 64-192 ns from 386 rows
+# on (2 x 257-token prefill, 64 x 8 MTP) but trailed it by up to 64 ns at 256
+# rows (64 x 4 MTP).
 _NO_PDL_TWIN_MIN_TOKENS = {"sm_103a": 384}
+
+# The fewest query tokens the call's longest request needs for its launches to
+# take the twin, per architecture.  B200 without PDL: the twin led the PDL
+# program by 32-128 ns (median 64 ns) on 2 x 257-token prefill launches but
+# tied or trailed it by up to 32 ns on 2- to 8-token MTP launches.
+_NO_PDL_TWIN_MIN_QUERY_LEN = {"sm_100a": 257}
 
 
 def _pdl_variant(
-    route: str, *, arch: str, enable_pdl: bool, num_query_tokens: int
+    route: str,
+    *,
+    arch: str,
+    enable_pdl: bool,
+    num_query_tokens: int,
+    max_q_len: int,
 ) -> str:
-    """The variant a launch of ``route`` over ``num_query_tokens`` rows runs:
-    its PDL-free twin when the call does not ask for PDL, the launch has at
-    least ``_NO_PDL_TWIN_MIN_TOKENS[arch]`` rows and ``arch`` routes the twin to
-    a program other than the route's, else ``route``."""
+    """The variant a launch of ``route`` over ``num_query_tokens`` rows of a
+    call whose longest request has ``max_q_len`` tokens runs: its PDL-free twin
+    when the call does not ask for PDL, ``arch`` has a floor in
+    ``_NO_PDL_TWIN_MIN_TOKENS`` or ``_NO_PDL_TWIN_MIN_QUERY_LEN``, the launch
+    meets each floor ``arch`` has and ``arch`` routes the twin to a program
+    other than the route's, else ``route``."""
     if enable_pdl or route not in _NO_PDL_TWIN_ROUTES:
         return route
     min_tokens = _NO_PDL_TWIN_MIN_TOKENS.get(arch)
-    if min_tokens is None or num_query_tokens < min_tokens:
+    min_q_len = _NO_PDL_TWIN_MIN_QUERY_LEN.get(arch)
+    if min_tokens is None and min_q_len is None:
+        return route
+    if num_query_tokens < (min_tokens or 0) or max_q_len < (min_q_len or 0):
         return route
     from ..jit.cake_dsv4 import VARIANTS
 
@@ -1894,7 +1910,8 @@ def run_cake_dsv4(
     stream; they wait for it before their first global read.  The other
     programs launch without the attribute.  Without ``enable_pdl`` the FP8
     H128 persistent route launches its PDL-free twin on SM103 from 384 query
-    rows per launch (``_pdl_variant``).
+    rows per launch and on SM100 when the longest request has at least 257
+    query tokens (``_pdl_variant``).
 
     ``out=None`` allocates the output here, after the route is known, so the
     routes in ``_OUT_PHASE_BY_ROUTE`` get their measured-fast base phase;
@@ -2314,7 +2331,11 @@ def _dispatch_route(route: str, L: _Launcher) -> None:
     ):
         parts = L.partials(1)
         program = _pdl_variant(
-            route, arch=L.arch, enable_pdl=v["enable_pdl"], num_query_tokens=T
+            route,
+            arch=L.arch,
+            enable_pdl=v["enable_pdl"],
+            num_query_tokens=T,
+            max_q_len=v["max_q_len"],
         )
         L.run(L.variant(program, grid=(T * 2, 1, 1), total_work_items=T, **parts))
         return
@@ -2329,7 +2350,11 @@ def _dispatch_route(route: str, L: _Launcher) -> None:
         # kernel ABI; _fp8_h64_m64_program picks one by the item width.
         parts = L.partials(1)
         program = _pdl_variant(
-            route, arch=L.arch, enable_pdl=v["enable_pdl"], num_query_tokens=T
+            route,
+            arch=L.arch,
+            enable_pdl=v["enable_pdl"],
+            num_query_tokens=T,
+            max_q_len=v["max_q_len"],
         )
         L.run(L.variant(program, grid=(T, 1, 1), total_work_items=T, **parts))
         return

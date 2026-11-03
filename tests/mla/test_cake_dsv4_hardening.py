@@ -423,6 +423,8 @@ def test_cuda_graph_replay_matches_eager(h_q, dtype, s_q):
         pytest.param(128, BATCH, 4, id="h128-persistent"),
         # 64 requests of 6-12 tokens: 576 rows, the twin's range on SM103.
         pytest.param(128, 64, 12, id="h128-persistent-twin"),
+        # 2 requests of up to 257 tokens: the twin's range on SM100.
+        pytest.param(128, 2, 257, id="h128-persistent-prefill"),
     ],
 )
 def test_enable_pdl_matches_and_waits_for_the_query_producer(
@@ -430,8 +432,8 @@ def test_enable_pdl_matches_and_waits_for_the_query_producer(
 ):
     """FP8 programs launched as programmatic dependents: bitwise equal to the
     plain launch (the H128 persistent route's PDL-free twin on SM103 from 384
-    rows), and inside a graph they read the query the kernel before them writes
-    (the copy that fills it in place)."""
+    rows, on SM100 from a 257-token request), and inside a graph they read the
+    query the kernel before them writes (the copy that fills it in place)."""
     _skip_unless_cake_gpu()
     import flashinfer.mla.cake_dsv4 as cake
 
@@ -455,9 +457,12 @@ def test_enable_pdl_matches_and_waits_for_the_query_producer(
     torch.cuda.synchronize()
     assert torch.equal(plain, pdl)
     (route,) = set(launched)
-    sm103 = tuple(get_compute_capability(torch.device("cuda"))) == (10, 3)
+    capability = tuple(get_compute_capability(torch.device("cuda")))
     rows = static.swa_indices.shape[0]
-    twin = sm103 and route in cake._NO_PDL_TWIN_ROUTES and rows >= 384
+    twin = route in cake._NO_PDL_TWIN_ROUTES and (
+        (capability == (10, 3) and rows >= 384)
+        or (capability == (10, 0) and static.max_q_len >= 257)
+    )
     assert set(plain_variants) == {f"{route}_no_pdl" if twin else route}
 
     p2, tc2 = _make_case(h_q, dtype, s_q, varlen=True, seed=p.seed + 7_000, batch=batch)
