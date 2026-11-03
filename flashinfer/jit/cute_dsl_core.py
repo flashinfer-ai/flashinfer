@@ -109,6 +109,12 @@ class JitSpecCuteDsl(JitSpec):
     One instance represents a single compiled kernel (nvcc specs represent a
     whole module); instances of the same op family share a module directory
     and its module-level ``meta.json``.
+
+    ``enable_tvm_ffi`` states how ``compile_fn`` compiles: True for a
+    ``cute.compile(..., options="--enable-tvm-ffi")`` kernel, exported and
+    reloaded as a TVM-FFI function; False for a kernel compiled without it,
+    exported as a plain object file and reloaded as a CuTe-DSL compiled
+    function that takes the same arguments as the in-process one.
     """
 
     toolchain = "cute_dsl"
@@ -119,10 +125,13 @@ class JitSpecCuteDsl(JitSpec):
         kernel_name: str,
         compile_fn: Callable[[], Any],
         source_sha256: str,
+        *,
+        enable_tvm_ffi: bool = True,
     ):
         self.module_name = module_name
         self.kernel_name = sanitize_symbol_name(kernel_name)
         self.compile_fn = compile_fn
+        self.enable_tvm_ffi = enable_tvm_ffi
         self.module_dir_name = sanitize_symbol_name(
             f"{module_name}_{_get_compile_arch()}_cute_dsl"
         )
@@ -130,11 +139,14 @@ class JitSpecCuteDsl(JitSpec):
         self.module_dir = jit_env.FLASHINFER_JIT_DIR / self.module_dir_name
         self.object_path = self.module_dir / f"{self.kernel_name}.o"
         self.symbol = f"{module_name}_{self.kernel_name}"
-        self.expected_meta = {
+        self.expected_meta: dict[str, Any] = {
             "arch": _get_compile_arch(),
             "cute_dsl_version": _get_cute_dsl_version(),
             "source_sha256": source_sha256,
         }
+        if not enable_tvm_ffi:
+            # The two export formats must never share a module directory.
+            self.expected_meta["tvm_ffi"] = False
         # Set by build(): the freshly compiled in-process kernel, returned by
         # load() so a build is never followed by a redundant JITLink reload.
         self._compiled_kernel: Optional[Any] = None
@@ -262,17 +274,28 @@ class JitSpecCuteDsl(JitSpec):
     def _load_from_disk(self) -> Any:
         import cutlass.cute as cute
 
-        module = cute.runtime.load_module(str(self.object_path), enable_tvm_ffi=True)
+        module = cute.runtime.load_module(
+            str(self.object_path), enable_tvm_ffi=self.enable_tvm_ffi
+        )
         return getattr(module, self.symbol)
+
+    def _export_object(self, object_path: Path) -> None:
+        """Write the compiled kernel's object file to ``object_path``."""
+        if self.enable_tvm_ffi:
+            self._compiled_kernel.export_to_c(
+                str(object_path), function_name=self.symbol
+            )
+            return
+        # Without TVM-FFI only the object file is written: export_to_c would
+        # also generate a C header, which needs every argument annotated.
+        object_path.write_bytes(self._compiled_kernel.dump_to_object(self.symbol))
 
     def _export(self) -> None:
         self.module_dir.mkdir(parents=True, exist_ok=True)
         tmp_object_path = self.object_path.with_suffix(f".o.tmp.{os.getpid()}")
         tmp_meta_path = self.meta_path.with_suffix(f".json.tmp.{os.getpid()}")
         try:
-            self._compiled_kernel.export_to_c(
-                str(tmp_object_path), function_name=self.symbol
-            )
+            self._export_object(tmp_object_path)
             os.replace(tmp_object_path, self.object_path)
             # meta.json is the module's commit marker: written after the
             # object file is in place so a crash never leaves a loadable
@@ -302,6 +325,8 @@ def build_and_load_cute_dsl_kernel(
     kernel_name: str,
     compile_fn: Callable[[], Any],
     extra_key_files: Sequence[str] = (),
+    *,
+    enable_tvm_ffi: bool = True,
 ) -> Any:
     """Compile a CuTe-DSL kernel with a persistent on-disk cache.
 
@@ -317,17 +342,21 @@ def build_and_load_cute_dsl_kernel(
     kernel_name : str
         Specialization name of the kernel.
     compile_fn : Callable[[], Any]
-        Zero-argument closure performing the
-        ``cute.compile(..., options="--enable-tvm-ffi")`` call.
+        Zero-argument closure performing the ``cute.compile`` call, with
+        ``options="--enable-tvm-ffi"`` unless ``enable_tvm_ffi`` is False.
     extra_key_files : Sequence[str]
         Source files whose content participates in cache invalidation.
         Shared by all kernels of the module; a change wipes and lazily
         rebuilds the whole module directory.
+    enable_tvm_ffi : bool
+        Whether ``compile_fn`` compiles with TVM-FFI (see
+        :class:`JitSpecCuteDsl`).
 
     Returns
     -------
-    A TVM-FFI callable taking the same positional arguments as the
-    compiled kernel.
+    A callable taking the same positional arguments as the compiled kernel:
+    a TVM-FFI function, or with ``enable_tvm_ffi=False`` a CuTe-DSL compiled
+    function.
     """
     if cute_dsl_cache_disabled():
         return compile_fn()
@@ -344,5 +373,11 @@ def build_and_load_cute_dsl_kernel(
         )
         return compile_fn()
 
-    spec = JitSpecCuteDsl(module_name, kernel_name, compile_fn, source_sha256)
+    spec = JitSpecCuteDsl(
+        module_name,
+        kernel_name,
+        compile_fn,
+        source_sha256,
+        enable_tvm_ffi=enable_tvm_ffi,
+    )
     return spec.build_and_load()
