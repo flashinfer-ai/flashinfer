@@ -146,7 +146,7 @@ def test_batch_prefill_invalid_fixed_cta_tile_q():
 
     workspace_buffer = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device="cuda:0")
     wrapper = BatchPrefillWithPagedKVCacheWrapper(workspace_buffer, "NHD")
-    with pytest.raises(ValueError, match="fixed_cta_tile_q should be one of"):
+    with pytest.raises(ValueError, match="fixed_cta_tile_q should be an integer in"):
         wrapper.plan(
             q_indptr,
             kv_indptr,

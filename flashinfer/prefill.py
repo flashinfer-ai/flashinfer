@@ -93,6 +93,8 @@ from .utils import (
     TensorLayout,
     _check_block_tables_shape,
     _check_cached_qkv_data_type,
+    _check_fixed_cta_tile_q_backend,
+    _freeze_fixed_cta_tile_q,
     _validate_fixed_cta_tile_q,
     _check_kv_layout,
     _check_pos_encoding_mode,
@@ -1989,6 +1991,7 @@ def _eagle_verify_fp8kv_sm90_plan_eligibility(
     use_fp16_qk_reduction: bool,
     batch_size: int,
     device: torch.device,
+    fixed_cta_tile_q: int = -1,
 ) -> Optional[str]:
     """Plan-time guard. Returns None when the plan describes the supported
     verify problem, ``"not_verify_route:..."`` when the call is not a verify
@@ -1997,6 +2000,10 @@ def _eagle_verify_fp8kv_sm90_plan_eligibility(
     shapes -> device so the first two groups run GPU-free."""
     if backend != "fa2":
         return "not_verify_route:backend"
+    if fixed_cta_tile_q != -1:
+        # The caller pinned the FA2 query tile (batch invariance); the
+        # specialized kernel has its own tiling and would silently drop it.
+        return "not_verify_route:fixed_cta_tile_q"
     if forwarded_uniform_q_len != _EAGLE_VERIFY_FP8KV_SM90_QO_LEN:
         return "not_verify_route:uniform_q_len"
     if not has_custom_mask:
@@ -2201,6 +2208,7 @@ def _eagle_verify_fp8kv_sm90_prepare(
     batch_size: int,
     qo_indptr_host: Optional[torch.Tensor] = None,
     packed_mask_bytes: int = 0,
+    fixed_cta_tile_q: int = -1,
 ) -> None:
     """Plan-time half of the dispatch: decide eligibility, JIT-build the module
     (first time in the process), assert the host-side contract of the device
@@ -2239,6 +2247,7 @@ def _eagle_verify_fp8kv_sm90_prepare(
             use_fp16_qk_reduction,
             batch_size,
             wrapper.device,
+            fixed_cta_tile_q=fixed_cta_tile_q,
         )
     except Exception as exc:  # a guard failure must never break the stock path
         reason = f"guard_error:{type(exc).__name__}: {exc}"[:300]
@@ -3363,14 +3372,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         ... )
         >>> wrapper.plan(...)
         """
-        if fixed_cta_tile_q is not None and self._requested_backend not in (
-            "auto",
-            "fa2",
-        ):
-            raise ValueError(
-                "fixed_cta_tile_q is only supported for the fa2 backend, "
-                f'got backend={self._requested_backend!r}; set backend="fa2" explicitly.'
-            )
+        _check_fixed_cta_tile_q_backend(fixed_cta_tile_q, self._requested_backend)
         if self._backend == "cute-dsl-prims":
             qo_indptr_host = qo_indptr.to("cpu")
             if seq_lens is None:
@@ -3480,7 +3482,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
         if self._jit_module is not None:
             module = self._jit_module
         else:
-            if backend == "auto":
+            if backend == "auto" and fixed_cta_tile_q != -1:
+                # A fixed query tile is an FA2 planner option: pin auto to FA2.
+                backend = "fa2"
+            elif backend == "auto":
                 backend = determine_attention_backend(
                     self.device,
                     PosEncodingMode[pos_encoding_mode].value,
@@ -3488,10 +3493,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
                     use_custom_mask,
                     q_data_type,
                     kv_data_type,
-                )
-            if fixed_cta_tile_q != -1 and backend != "fa2":
-                raise ValueError(
-                    "fixed_cta_tile_q is only supported for the fa2 backend"
                 )
             if backend == "cudnn":
                 raise NotImplementedError(
@@ -3727,8 +3728,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
             Supported tiles are ``16``, ``64``, and ``128`` for VO < 256; ``16`` and
             ``64`` for 256 <= VO < 512; and ``16`` and ``32`` for VO >= 512.
             QK >= 512 with VO < 512 supports only ``16``.
-            Requires ``backend="fa2"`` (and ``use_tensor_cores=True`` for decode).
-            On Hopper, set ``backend="fa2"`` explicitly: ``backend="auto"`` can select FA3.
+            Requires the ``fa2`` backend (and ``use_tensor_cores=True`` for decode);
+            ``backend="auto"`` selects FA2 when this is set. Tile ``16`` is rejected
+            at plan time when its smallest KV step does not fit shared memory.
+            Under CUDA graphs, every plan of a wrapper must pass the same value.
             For batch invariance, also use ``disable_split_kv=True`` or a fixed split size.
         Note
         ----
@@ -3742,14 +3745,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
 
         The :meth:`plan` method cannot be used in Cuda Graph or in ``torch.compile``.
         """
-        if fixed_cta_tile_q is not None and self._requested_backend not in (
-            "auto",
-            "fa2",
-        ):
-            raise ValueError(
-                "fixed_cta_tile_q is only supported for the fa2 backend, "
-                f'got backend={self._requested_backend!r}; set backend="fa2" explicitly.'
-            )
+        _check_fixed_cta_tile_q_backend(fixed_cta_tile_q, self._requested_backend)
         _check_workspace_buffer_alignment(
             self._float_workspace_buffer, "float_workspace_buffer"
         )
@@ -3843,6 +3839,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         fixed_cta_tile_q = _validate_fixed_cta_tile_q(
             fixed_cta_tile_q, head_dim_vo, head_dim_qk
         )
+        _freeze_fixed_cta_tile_q(self, fixed_cta_tile_q)
 
         batch_size = len(qo_indptr) - 1
         self._batch_size = batch_size
@@ -3899,7 +3896,14 @@ class BatchPrefillWithPagedKVCacheWrapper:
             self._max_kv_len = max_sequence_kv
 
         # Per-token/head scales already pin FA2; preserve that plan-time choice.
+        # A fixed query tile is an FA2 planner option, so it pins FA2 as well.
         if (
+            self._requested_backend == "auto"
+            and self._jit_module is None
+            and fixed_cta_tile_q != -1
+        ):
+            self._backend = "fa2"
+        elif (
             self._requested_backend == "auto"
             and self._jit_module is None
             and not use_token_head_sf
@@ -3960,12 +3964,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 )
             ):
                 self._backend = "cudnn"
-
-        if fixed_cta_tile_q != -1 and self._backend != "fa2":
-            raise ValueError(
-                "fixed_cta_tile_q is only supported for the fa2 backend, "
-                f'got backend={self._backend!r}; set backend="fa2" explicitly.'
-            )
 
         self._cudnn_paged_bounds = None
         if self._requested_backend == "auto" and self._backend == "cudnn":
@@ -4340,6 +4338,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                         if packed_custom_mask is not None
                         else 0
                     ),
+                    fixed_cta_tile_q=fixed_cta_tile_q,
                 )
 
         self._causal = causal
@@ -5885,8 +5884,10 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             Supported tiles are ``16``, ``64``, and ``128`` for VO < 256; ``16`` and
             ``64`` for 256 <= VO < 512; and ``16`` and ``32`` for VO >= 512.
             QK >= 512 with VO < 512 supports only ``16``.
-            Requires ``backend="fa2"`` (and ``use_tensor_cores=True`` for decode).
-            On Hopper, set ``backend="fa2"`` explicitly: ``backend="auto"`` can select FA3.
+            Requires the ``fa2`` backend (and ``use_tensor_cores=True`` for decode);
+            ``backend="auto"`` selects FA2 when this is set. Tile ``16`` is rejected
+            at plan time when its smallest KV step does not fit shared memory.
+            Under CUDA graphs, every plan of a wrapper must pass the same value.
             For batch invariance, also use ``disable_split_kv=True`` or a fixed split size.
         seq_lens: Optional[torch.Tensor]
             Only used by the cudnn backend. A 1D int32 tensor with the kv sequence length
@@ -5933,14 +5934,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
 
         The :meth:`plan` method cannot be used in Cuda Graph or in ``torch.compile``.
         """
-        if fixed_cta_tile_q is not None and self._requested_backend not in (
-            "auto",
-            "fa2",
-        ):
-            raise ValueError(
-                "fixed_cta_tile_q is only supported for the fa2 backend, "
-                f'got backend={self._requested_backend!r}; set backend="fa2" explicitly.'
-            )
+        _check_fixed_cta_tile_q_backend(fixed_cta_tile_q, self._requested_backend)
         q_data_type = canonicalize_torch_dtype(q_data_type)
         if kv_data_type is None:
             kv_data_type = q_data_type
@@ -5955,6 +5949,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         fixed_cta_tile_q = _validate_fixed_cta_tile_q(
             fixed_cta_tile_q, head_dim_vo, head_dim_qk
         )
+        _freeze_fixed_cta_tile_q(self, fixed_cta_tile_q)
         if logits_soft_cap is None:
             logits_soft_cap = 0.0
         self._head_dim_qk = head_dim_qk
@@ -6368,8 +6363,11 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             self._cached_module = self._jit_module
         else:
             # use_token_head_sf pins the backend to fa2 (validation block above), so
-            # skip auto-resolution/upgrades that would override it.
-            if self._requested_backend == "auto" and not use_token_head_sf:
+            # skip auto-resolution/upgrades that would override it. A fixed query
+            # tile is an FA2 planner option and pins FA2 the same way.
+            if self._requested_backend == "auto" and fixed_cta_tile_q != -1:
+                self._backend = "fa2"
+            elif self._requested_backend == "auto" and not use_token_head_sf:
                 self._backend = determine_attention_backend(
                     self.device,
                     PosEncodingMode[pos_encoding_mode].value,
@@ -6477,11 +6475,6 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     )
                     if upgraded is not None:
                         self._backend = upgraded
-            if fixed_cta_tile_q != -1 and self._backend != "fa2":
-                raise ValueError(
-                    f"fixed_cta_tile_q is only supported for the fa2 backend, "
-                    f"got backend={self._backend!r}"
-                )
 
             get_module_args = (
                 q_data_type,

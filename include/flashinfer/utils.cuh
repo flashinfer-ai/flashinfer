@@ -408,6 +408,21 @@ inline void DebugPrintCUDAArray(T* device_ptr, size_t size, std::string prefix =
   std::cout << std::endl;
 }
 
+// Whether the 1x4 warp layout (cta_tile_q=16) of a non-split head (QK, VO < 512)
+// fits this GPU: one Q tile (assumed 2-byte Q) plus a single NUM_MMA_KV step of
+// K+V (16 rows x 4 KV warps x kv_dtype_bytes) against
+// cudaDevAttrMaxSharedMemoryPerBlockOptin. See FA2DetermineCtaTileQ.
+inline bool FA2CtaTileQ16FitsSmem(uint32_t head_dim_qk, uint32_t head_dim_vo,
+                                  uint32_t kv_dtype_bytes) {
+  int dev_id = 0, max_smem_per_block_optin = 0;
+  cudaGetDevice(&dev_id);
+  cudaDeviceGetAttribute(&max_smem_per_block_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin,
+                         dev_id);
+  const uint32_t q_tile_smem = 16 * head_dim_qk * 2;
+  const uint32_t kv_step_smem_1x4 = (head_dim_qk + head_dim_vo) * 16 * 4 * kv_dtype_bytes;
+  return q_tile_smem + kv_step_smem_1x4 <= (uint32_t)max_smem_per_block_optin;
+}
+
 inline uint32_t FA2DetermineCtaTileQ(int64_t avg_packed_qo_len, uint32_t head_dim,
                                      uint32_t head_dim_qk = 0, uint32_t kv_dtype_bytes = 2) {
   // head_dim is the VO dim at the batch-prefill call sites; head_dim_qk (when
@@ -470,16 +485,7 @@ inline uint32_t FA2DetermineCtaTileQ(int64_t avg_packed_qo_len, uint32_t head_di
         // overestimates 1-byte (FP8/FP4) KV by 2x and can demote a working
         // configuration to cta_tile_q=64 (a performance change, not a
         // correctness one).
-        int dev_id = 0, max_smem_per_block_optin = 0;
-        cudaGetDevice(&dev_id);
-        cudaDeviceGetAttribute(&max_smem_per_block_optin, cudaDevAttrMaxSharedMemoryPerBlockOptin,
-                               dev_id);
-        const uint32_t q_tile_smem = 16 * qk * 2;
-        const uint32_t kv_step_smem_1x4 = (qk + head_dim) * 16 * 4 * kv_dtype_bytes;
-        if (q_tile_smem + kv_step_smem_1x4 > (uint32_t)max_smem_per_block_optin) {
-          return 64;
-        }
-        return 16;
+        return FA2CtaTileQ16FitsSmem(qk, head_dim, kv_dtype_bytes) ? 16 : 64;
       }
     } else {
       // NOTE(Zihao): not enough shared memory on Turing for 1x4 warp layout

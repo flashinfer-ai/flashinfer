@@ -73,6 +73,8 @@ from .utils import (
     TensorLayout,
     _check_block_tables_shape,
     _check_cached_qkv_data_type,
+    _check_fixed_cta_tile_q_backend,
+    _freeze_fixed_cta_tile_q,
     _validate_fixed_cta_tile_q,
     _check_kv_layout,
     _check_pos_encoding_mode,
@@ -1688,10 +1690,14 @@ class BatchDecodeWithPagedKVCacheWrapper:
         declared_kv_len: Optional[int] = None,
         fixed_split_size: Optional[int] = None,
         disable_split_kv: bool = False,
+        fixed_cta_tile_q: Optional[int] = None,
     ) -> bool:
         # Both plan() and workspace_size() must select the same backend.
         # A caller-provided JIT module must not be replaced by auto routing.
         if self._requested_backend != "auto" or self._jit_module is not None:
+            return False
+        # A fixed query tile is an FA2 planner option: auto stays on FA2.
+        if fixed_cta_tile_q is not None and fixed_cta_tile_q != -1:
             return False
         # Under CUDA graphs the auto-built block table is captured at its first
         # width and cannot grow (_plan_cudnn raises when a later plan crosses
@@ -1897,14 +1903,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         ... )
         >>> wrapper.plan(...)
         """
-        if fixed_cta_tile_q is not None and self._requested_backend not in (
-            "auto",
-            "fa2",
-        ):
-            raise ValueError(
-                "fixed_cta_tile_q is only supported for the fa2 backend, "
-                f'got backend={self._requested_backend!r}; set backend="fa2" explicitly.'
-            )
+        _check_fixed_cta_tile_q_backend(fixed_cta_tile_q, self._requested_backend)
         _check_workspace_buffer_alignment(
             self._float_workspace_buffer, "float_workspace_buffer"
         )
@@ -1947,6 +1946,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             declared_kv_len=declared_kv_len,
             fixed_split_size=fixed_split_size,
             disable_split_kv=disable_split_kv,
+            fixed_cta_tile_q=fixed_cta_tile_q,
         ):
             backend = "cudnn"
         if backend in ("cute-dsl", "trtllm-gen", "cudnn"):
@@ -2045,7 +2045,10 @@ class BatchDecodeWithPagedKVCacheWrapper:
             if self._jit_module is not None:
                 module = self._jit_module
             else:
-                if backend == "auto":
+                if self._requested_backend == "auto" and fixed_cta_tile_q != -1:
+                    # A fixed query tile is an FA2 planner option: pin auto to FA2.
+                    backend = "fa2"
+                elif backend == "auto":
                     if {
                         torch.float8_e4m3fn,
                         torch.float8_e5m2,
@@ -2064,10 +2067,6 @@ class BatchDecodeWithPagedKVCacheWrapper:
                     raise NotImplementedError(
                         "q_len_per_req > 1 is currently only supported on the "
                         "fa2 tensor-core backend."
-                    )
-                if fixed_cta_tile_q != -1 and backend != "fa2":
-                    raise ValueError(
-                        "fixed_cta_tile_q is only supported for the fa2 backend"
                     )
                 module = get_batch_prefill_module(
                     backend,
@@ -2262,8 +2261,10 @@ class BatchDecodeWithPagedKVCacheWrapper:
             Supported tiles are ``16``, ``64``, and ``128`` for VO < 256; ``16`` and
             ``64`` for 256 <= VO < 512; and ``16`` and ``32`` for VO >= 512.
             QK >= 512 with VO < 512 supports only ``16``.
-            Requires ``backend="fa2"`` (and ``use_tensor_cores=True`` for decode).
-            On Hopper, set ``backend="fa2"`` explicitly: ``backend="auto"`` can select FA3.
+            Requires the ``fa2`` backend (and ``use_tensor_cores=True`` for decode);
+            ``backend="auto"`` selects FA2 when this is set. Tile ``16`` is rejected
+            at plan time when its smallest KV step does not fit shared memory.
+            Under CUDA graphs, every plan of a wrapper must pass the same value.
             For batch invariance, also use ``disable_split_kv=True`` or a fixed split size.
         Note
         ----
@@ -2344,14 +2345,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
         fixed_cta_tile_q: Optional[int] = None,
     ) -> None:
         """Shared plan() implementation for the paged-decode wrapper across backends."""
-        if fixed_cta_tile_q is not None and self._requested_backend not in (
-            "auto",
-            "fa2",
-        ):
-            raise ValueError(
-                "fixed_cta_tile_q is only supported for the fa2 backend, "
-                f'got backend={self._requested_backend!r}; set backend="fa2" explicitly.'
-            )
+        _check_fixed_cta_tile_q_backend(fixed_cta_tile_q, self._requested_backend)
         _check_workspace_buffer_alignment(
             self._float_workspace_buffer, "float_workspace_buffer"
         )
@@ -2438,6 +2432,15 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 )
         self._use_token_head_sf = use_token_head_sf
 
+        # Settle the query tile before any CUDA-graph buffer is overwritten, so a
+        # rejected replan leaves the captured state intact.
+        if fixed_cta_tile_q is not None and not self.use_tensor_cores:
+            raise ValueError(
+                "fixed_cta_tile_q is only supported by tensor core decode for now."
+            )
+        fixed_cta_tile_q = _validate_fixed_cta_tile_q(fixed_cta_tile_q, head_dim)
+        _freeze_fixed_cta_tile_q(self, fixed_cta_tile_q)
+
         # backend="auto" may resolve to cudnn; decided per plan() so that the
         # q_len_per_req / buffer checks below already know the path.
         self._cudnn_auto = self._auto_prefers_cudnn(
@@ -2459,9 +2462,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
             else block_tables.shape[1] * page_size,
             fixed_split_size=fixed_split_size,
             disable_split_kv=disable_split_kv,
+            fixed_cta_tile_q=fixed_cta_tile_q,
         )
-        if fixed_cta_tile_q is not None and self._uses_cudnn:
-            raise ValueError("fixed_cta_tile_q is only supported for the fa2 backend")
         if self.is_cuda_graph_enabled:
             # The resolved backend is part of the frozen CUDA-graph shape: a
             # captured graph replays the kernels it was captured with, and
@@ -2557,13 +2559,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
             raise ValueError(
                 "fixed_split_size is only supported by tensor core decode for now."
             )
-        if fixed_cta_tile_q is not None and not self.use_tensor_cores:
-            raise ValueError(
-                "fixed_cta_tile_q is only supported by tensor core decode for now."
-            )
         if fixed_split_size is None:
             fixed_split_size = -1
-        fixed_cta_tile_q = _validate_fixed_cta_tile_q(fixed_cta_tile_q, head_dim)
 
         self._cached_q_data_type = q_data_type
         self._cached_kv_data_type = kv_data_type
@@ -2849,7 +2846,10 @@ class BatchDecodeWithPagedKVCacheWrapper:
             if self._jit_module is not None:
                 self._cached_module = self._jit_module
             else:
-                if self._backend == "auto":
+                if self._requested_backend == "auto" and fixed_cta_tile_q != -1:
+                    # A fixed query tile is an FA2 planner option: pin auto to FA2.
+                    self._backend = "fa2"
+                elif self._backend == "auto":
                     if {
                         torch.float8_e4m3fn,
                         torch.float8_e5m2,
@@ -2890,11 +2890,6 @@ class BatchDecodeWithPagedKVCacheWrapper:
                         "for single-token requests with an e4m3 KV cache, bfloat16 "
                         "output, head_dim 256, no RoPE or soft cap, and 1, 2, 4 or 8 "
                         "query heads per KV head."
-                    )
-                if fixed_cta_tile_q != -1 and self._backend != "fa2":
-                    raise ValueError(
-                        f"fixed_cta_tile_q is only supported for the fa2 backend, "
-                        f"got backend={self._backend!r}"
                     )
                 self._cached_module = get_batch_prefill_module(
                     self._backend,
@@ -5781,11 +5776,10 @@ def fast_decode_plan(
         if fixed_split_size is None:
             fixed_split_size = -1
         fixed_cta_tile_q = _validate_fixed_cta_tile_q(fixed_cta_tile_q, head_dim)
-        if fixed_cta_tile_q != -1 and self._backend != "fa2":
-            raise ValueError(
-                f"fixed_cta_tile_q is only supported for the fa2 backend, "
-                f"got backend={self._backend!r}"
-            )
+        # The cached module comes from the previous plan(), whose resolved backend
+        # cannot be switched here.
+        _check_fixed_cta_tile_q_backend(fixed_cta_tile_q, self._backend)
+        _freeze_fixed_cta_tile_q(self, fixed_cta_tile_q)
 
     if self.is_cuda_graph_enabled:
         if batch_size != self._fixed_batch_size:
@@ -5851,7 +5845,7 @@ def fast_decode_plan(
             kv_lens_arr_host = get_seq_lens(indptr_host, last_page_len_host, page_size)
 
             try:
-                # FA2 takes the split controls, fixed tile, and uniform-query hints.
+                # Make sure we pass exactly 22 arguments for fa2 backend and 16 arguments for fa3 backend
                 args = [
                     self._float_workspace_buffer,
                     self._int_workspace_buffer,

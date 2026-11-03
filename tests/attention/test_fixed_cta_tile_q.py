@@ -152,6 +152,83 @@ def test_fixed_tile_overrides_uniform_cuda_graph(tile, wrapper_kind):
     )
     wrapper.plan(*args, **kwargs)
     assert wrapper._plan_info[3] == tile
+    # A captured run() keeps the kernel of its planned tile.
+    for other in (None, 64 if tile != 64 else 16):
+        with pytest.raises(ValueError, match="frozen cudagraph shape"):
+            wrapper.plan(*args, **{**kwargs, "fixed_cta_tile_q": other})
+    wrapper.plan(*args, **kwargs)
+
+
+@pytest.mark.parametrize("wrapper_kind", ["paged", "ragged", "decode"])
+def test_fixed_tile_pins_auto_to_fa2(wrapper_kind):
+    """backend="auto" must not resolve to FA3/cuDNN/CUTLASS once a tile is fixed."""
+    batch_size, page_size, tile = 4, 16, 64
+    indptr = torch.arange(batch_size + 1, dtype=torch.int32)
+    workspace = torch.empty(32 * 1024 * 1024, device="cuda", dtype=torch.uint8)
+    common = dict(disable_split_kv=True, fixed_cta_tile_q=tile)
+    if wrapper_kind == "decode":
+        wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+            workspace, backend="auto", use_tensor_cores=True
+        )
+        last_page_len = torch.full((batch_size,), page_size, dtype=torch.int32)
+        indices = torch.arange(batch_size, device="cuda", dtype=torch.int32)
+        wrapper.plan(indptr, indices, last_page_len, 8, 4, 128, page_size, **common)
+        assert wrapper.resolved_backend == "fa2"
+    elif wrapper_kind == "paged":
+        wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+            workspace, backend="auto"
+        )
+        qo_indptr = indptr * 128
+        last_page_len = torch.full((batch_size,), page_size, dtype=torch.int32)
+        page_indptr = indptr * 8
+        indices = torch.arange(batch_size * 8, device="cuda", dtype=torch.int32)
+        wrapper.plan(
+            qo_indptr,
+            page_indptr,
+            indices,
+            last_page_len,
+            8,
+            4,
+            128,
+            page_size,
+            causal=True,
+            **common,
+        )
+        assert wrapper._backend == "fa2"
+    else:
+        wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+            workspace, backend="auto"
+        )
+        qo_indptr = indptr * 128
+        wrapper.plan(qo_indptr, qo_indptr, 8, 4, 128, causal=True, **common)
+        assert wrapper._backend == "fa2"
+    assert wrapper._plan_info[3] == tile
+
+
+def test_fixed_tile_16_rejected_when_smem_too_small():
+    """Tile 16 that cannot fit one KV step must fail at plan, not at run."""
+    head_dim_qk, head_dim_vo = 448, 256
+    # Mirrors FA2CtaTileQ16FitsSmem with a 2-byte Q and KV.
+    needed = 16 * head_dim_qk * 2 + (head_dim_qk + head_dim_vo) * 16 * 4 * 2
+    optin = torch.cuda.get_device_properties(0).shared_memory_per_block_optin
+    if needed <= optin:
+        pytest.skip(f"tile 16 fits this GPU ({needed} <= {optin} bytes)")
+    wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+        torch.empty(32 * 1024 * 1024, device="cuda", dtype=torch.uint8), backend="fa2"
+    )
+    indptr = torch.tensor([0, 16], dtype=torch.int32)
+    # FLASHINFER_ERROR from the native planner surfaces as RuntimeError.
+    with pytest.raises(RuntimeError, match="does not fit this GPU.s shared memory"):
+        wrapper.plan(
+            indptr,
+            indptr,
+            4,
+            4,
+            head_dim_qk,
+            head_dim_vo=head_dim_vo,
+            q_data_type=torch.float16,
+            fixed_cta_tile_q=16,
+        )
 
 
 @pytest.mark.parametrize(

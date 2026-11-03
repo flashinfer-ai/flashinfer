@@ -19,6 +19,7 @@ import os
 import logging
 import functools
 import math
+import operator
 from ctypes import byref
 from enum import Enum
 from functools import lru_cache
@@ -208,10 +209,17 @@ def _validate_fixed_cta_tile_q(
     """
     if fixed_cta_tile_q is None:
         return -1
-    if type(fixed_cta_tile_q) is not int or fixed_cta_tile_q not in (16, 32, 64, 128):
+    # Accept integer-like values (numpy / torch integers) but not bool or float.
+    tile = None
+    if not isinstance(fixed_cta_tile_q, bool):
+        with contextlib.suppress(TypeError):
+            tile = operator.index(fixed_cta_tile_q)
+    if tile not in (16, 32, 64, 128):
         raise ValueError(
-            f"fixed_cta_tile_q should be one of {{16, 32, 64, 128}}, got {fixed_cta_tile_q}"
+            "fixed_cta_tile_q should be an integer in {16, 32, 64, 128}, "
+            f"got {fixed_cta_tile_q!r} ({type(fixed_cta_tile_q).__name__})"
         )
+    fixed_cta_tile_q = tile
     qk = head_dim if head_dim_qk is None else head_dim_qk
     supported: tuple[int, ...]
     if head_dim >= 512:
@@ -228,6 +236,45 @@ def _validate_fixed_cta_tile_q(
             f"and head_dim_qk={qk}; supported tiles are {supported}"
         )
     return fixed_cta_tile_q
+
+
+def _check_fixed_cta_tile_q_backend(
+    fixed_cta_tile_q: Optional[int], backend: str
+) -> None:
+    """Reject a fixed query tile for a backend other than FA2.
+
+    ``fixed_cta_tile_q`` may be the raw argument (``None``) or the validated value
+    (``-1``). ``"auto"`` is accepted: the wrappers pin it to FA2 when a tile is fixed.
+    """
+    if fixed_cta_tile_q is not None and fixed_cta_tile_q != -1:
+        if backend not in ("auto", "fa2"):
+            raise ValueError(
+                "fixed_cta_tile_q is only supported for the fa2 backend, "
+                f"got backend={backend!r}"
+            )
+
+
+def _freeze_fixed_cta_tile_q(wrapper, fixed_cta_tile_q: int) -> None:
+    """Keep the validated query tile constant across CUDA-graph plans.
+
+    A captured run() replays the kernel instantiated for the tile of the plan it
+    was captured with, so a replan with another tile would pair that kernel with
+    metadata tiled for a different CTA_TILE_Q.
+    """
+    if not wrapper.is_cuda_graph_enabled:
+        return
+    frozen = getattr(wrapper, "_frozen_fixed_cta_tile_q", None)
+    if frozen is not None and frozen != fixed_cta_tile_q:
+
+        def show(tile: int) -> str:
+            return "None" if tile == -1 else str(tile)
+
+        raise ValueError(
+            "fixed_cta_tile_q is part of the frozen cudagraph shape: this wrapper "
+            f"was planned with {show(frozen)}, got {show(fixed_cta_tile_q)}. "
+            "Use a separate wrapper per fixed_cta_tile_q."
+        )
+    wrapper._frozen_fixed_cta_tile_q = fixed_cta_tile_q
 
 
 def is_float8(x: torch.Tensor) -> bool:

@@ -14,6 +14,8 @@
 """Validate query tiles without importing FlashInfer's CUDA dependencies."""
 
 import ast
+import contextlib
+import operator
 from pathlib import Path
 from typing import Optional
 
@@ -31,7 +33,11 @@ def validate():
         if isinstance(node, ast.FunctionDef)
         and node.name == "_validate_fixed_cta_tile_q"
     )
-    namespace = {"Optional": Optional}
+    namespace = {
+        "Optional": Optional,
+        "contextlib": contextlib,
+        "operator": operator,
+    }
     exec(
         compile(ast.Module(body=[function], type_ignores=[]), str(path), "exec"),
         namespace,
@@ -67,7 +73,7 @@ def test_fixed_tile_head_dimensions(validate, qk, vo, supported, tile):
 @pytest.mark.cpu_only
 @pytest.mark.parametrize("tile", [-1, 0, 1, 48, 256, True, 16.0, "64"])
 def test_invalid_fixed_tile(validate, tile):
-    with pytest.raises(ValueError, match="fixed_cta_tile_q should be one of"):
+    with pytest.raises(ValueError, match="fixed_cta_tile_q should be an integer in"):
         validate(tile, 128)
 
 
@@ -76,3 +82,10 @@ def test_invalid_fixed_tile(validate, tile):
 def test_fixed_tile_default(validate, head_dim):
     assert validate(None, head_dim) == -1
     assert validate(16, head_dim) == 16
+
+
+@pytest.mark.cpu_only
+def test_fixed_tile_integer_like(validate):
+    np = pytest.importorskip("numpy")
+    tile = validate(np.int64(64), 128)
+    assert tile == 64 and type(tile) is int

@@ -620,6 +620,17 @@ inline auto PrefillSplitQOKVIndptr(IdType* qo_indptr_h, IdType* kv_indptr_h,
               << " is not supported with head_dim=" << head_dim << " and head_dim_qk=" << qk;
       FLASHINFER_ERROR(err_msg.str());
     }
+    // The automatic heuristic falls back to 64 when the 1x4 layout's smallest
+    // KV step does not fit shared memory; a fixed 16 would otherwise only fail
+    // at run time in the kernel dispatcher.
+    if (fixed_cta_tile_q == 16 && head_dim < 512 && qk < 512 &&
+        !FA2CtaTileQ16FitsSmem(qk, head_dim, kv_dtype_bytes)) {
+      std::ostringstream err_msg;
+      err_msg << "fixed_cta_tile_q=16 does not fit this GPU's shared memory with head_dim="
+              << head_dim << ", head_dim_qk=" << qk << " and " << kv_dtype_bytes
+              << "-byte KV; use fixed_cta_tile_q=64";
+      FLASHINFER_ERROR(err_msg.str());
+    }
     cta_tile_q = fixed_cta_tile_q;
   } else if (enable_cuda_graph) {
     if (uniform_q_len > 0) {

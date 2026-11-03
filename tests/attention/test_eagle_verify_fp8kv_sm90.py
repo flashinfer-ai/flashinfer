@@ -78,6 +78,7 @@ def test_plan_guard_rejects_non_verify_plans_silently():
         dict(forwarded_uniform_q_len=5),
         dict(has_custom_mask=False),
         dict(backend="fa3"),
+        dict(fixed_cta_tile_q=16),
     ):
         reason = _eagle_verify_fp8kv_sm90_plan_eligibility(**_plan_kwargs(**overrides))
         assert reason is not None and reason.startswith("not_verify_route:"), overrides
