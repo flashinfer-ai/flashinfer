@@ -509,7 +509,9 @@ def _p2_group_ok(ctx, HV: int, group, W: int, device: torch.device) -> bool:
     return bool(flag.item())
 
 
-def _p2_full_flags(saved_pass, info, flags, *, ring: bool, prefix: str = "", **extra) -> None:
+def _p2_full_flags(
+    saved_pass, info, flags, *, ring: bool, prefix: str = "", **extra
+) -> None:
     """The forced ``P = 2`` forms without ``save_transfer`` under NaN-filled allocations: ``save_mode="full"`` against
     the light form at ``P = 2`` (bitwise, ``M_seg`` held at ``P = 2``), over a2a and, where the partition allows it,
     over the ring (and the ring's light form bitwise the a2a's)."""
