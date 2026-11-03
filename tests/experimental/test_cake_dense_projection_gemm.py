@@ -25,6 +25,7 @@ limitations under the License.
 
 import ast
 import contextlib
+import dataclasses
 import inspect
 import json
 import re
@@ -1782,9 +1783,10 @@ def test_k2_planner_plans_the_stream_k_router(monkeypatch):
 
 def test_k2_planner_plans_the_head_tail_router(monkeypatch):
     """A head/tail verdict (``"H0.5x4"`` on sm_107a, set here for hidden 4096, 5120 and 6144; sm_100a / sm_103a at
-    hidden 5120) runs the head/tail program: ``router_fp32_gemm_atomic_nn_t_ht_c3_nreg`` with
-    the partition's ``head_spans`` / ``head_steps``, which the launch passes to the program; without that template
-    registered the row runs the deterministic program."""
+    hidden 5120) runs the head/tail program of the architecture: ``router_fp32_gemm_atomic_nn_t_ht_c3_nreg`` (on
+    sm_103a ``router_fp32_gemm_ts_r6p6_atomic_nn_t_ht_c2_nreg``) with the partition's ``head_spans`` /
+    ``head_steps``, which the launch passes to the program; without that template registered the row runs the
+    deterministic program."""
     arch, T, N = "sm_107a", 16231, 256
     kw = dict(arch=arch, sm_count=216)
     for hidden in (4096, 5120, 6144):
@@ -1860,8 +1862,17 @@ def test_k2_planner_plans_the_head_tail_router(monkeypatch):
             G.t(), X4, torch.zeros(N, 4096), arch=arch, sm_count=sms
         )
         assert plan is None and "planner" in reason
-    # sm_100a / sm_103a, hidden 5120: three tail units per pair (76 head + 228 tail units on 152 SMs)
-    for gb in ("sm_100a", "sm_103a"):
+    # sm_100a / sm_103a, hidden 5120: three tail units per pair (76 head + 228 tail units on 152 SMs); sm_103a runs
+    # the head/tail program with the A parts in tensor memory, and the deterministic program while this checkout does
+    # not register it
+    ts = "router_fp32_gemm_ts_r6p6_atomic_nn_t_ht_c2_nreg"
+    templates = cake_backend.ROUTER_HEAD_TAIL_TEMPLATES
+    assert templates == {"sm_103a": ts}
+    for gb, template in (
+        ("sm_100a", "router_fp32_gemm_atomic_nn_t_ht_c3_nreg"),
+        ("sm_103a", ts),
+    ):
+        assert cake_backend.router_head_tail_template(gb) == template
         monkeypatch.setitem(cake_jit.KERNELS, gb, {})
         _register(
             monkeypatch,
@@ -1870,16 +1881,87 @@ def test_k2_planner_plans_the_head_tail_router(monkeypatch):
             "router_fp32_gemm_atomic_nn_t",
             "router_fp32_gemm_atomic_nn_t_ht_c3_nreg",
         )
+        if gb == "sm_103a":
+            plan, reason = cake_backend.plan_atomic_router(
+                G.t(), X5, torch.zeros(N, 5120), arch=gb, sm_count=152
+            )
+            assert plan is None and reason == f"{ts} is not registered for sm_103a"
+            _register(monkeypatch, gb, ts)
         plan, _ = cake_backend.plan_atomic_router(
             G.t(), X5, torch.zeros(N, 5120), arch=gb, sm_count=152
         )
         assert (plan.template, plan.units, plan.head_spans, plan.head_steps) == (
-            "router_fp32_gemm_atomic_nn_t_ht_c3_nreg",
+            template,
             304,
             38,
             20 * 254,
         )
         assert plan.grid == (608, 1, 1) and plan.part_tiles
+
+
+#: The SM counts of the parts the router tables were measured on (GB200 / GB300: 148 and 152; R200: 208, 212, 216).
+ROUTER_SM_FACTS = (148, 152, 208, 212, 216)
+
+
+def test_k2_head_tail_program_of_each_architecture_and_sm_count():
+    """With this checkout's registry and router tables, on every architecture and the SM counts of the measured parts,
+    the weight gradient (256 experts, hidden 4096 / 5120 / 6144, token counts at and around the windows) runs the
+    head/tail program with the A parts in tensor memory exactly on sm_103a with 152 SMs, hidden 5120 and 16172 to
+    32768 tokens (the sm_103a head/tail window of ``ROUTER_RULES``); every other head/tail plan runs
+    ``router_fp32_gemm_atomic_nn_t_ht_c3_nreg``, and both carry the planner's partition.  The program is registered
+    for sm_103a only."""
+    ts = cake_backend.ROUTER_HEAD_TAIL_TEMPLATES["sm_103a"]
+    c3 = "router_fp32_gemm_atomic_nn_t" + cake_backend.ROUTER_HEAD_TAIL_SUFFIX
+    assert [a for a, table in cake_jit.KERNELS.items() if ts in table] == ["sm_103a"]
+    assert cake_jit.MODULES[cake_jit.select_module("sm_103a", ts)]["arches"] == [
+        "sm_103a"
+    ]
+    N, seen = 256, {}
+    for arch in cake_jit.ARCHES:
+        for sms in ROUTER_SM_FACTS:
+            for hidden in (4096, 5120, 6144):
+                out = torch.empty(N, hidden)
+                for T in (8192, 10240, 16171, 16172, 16231, 16384, 16385, 32768, 32769):
+                    # stride-0 views of the gradient [T, N] and the activations [T, hidden]: the layout classes of
+                    # G.t() and X without their memory
+                    G = torch.empty(1, N).expand(T, N)
+                    X = torch.empty(1, hidden).expand(T, hidden)
+                    plan, _ = cake_backend.plan_atomic_router(
+                        G.t(), X, out, arch=arch, sm_count=sms
+                    )
+                    in_window = (
+                        arch == "sm_103a"
+                        and sms == 152
+                        and hidden == 5120
+                        and 16172 <= T <= 32768
+                    )
+                    if plan is None or not plan.head_spans:
+                        assert not in_window, (arch, sms, hidden, T)
+                        continue
+                    assert plan.template == (ts if in_window else c3), (
+                        arch,
+                        sms,
+                        hidden,
+                        T,
+                    )
+                    assert (
+                        plan.units,
+                        plan.head_spans,
+                        plan.head_steps,
+                    ) == cake_backend.router_partition(
+                        "nn_t", arch=arch, M=hidden, N=N, K=T, sm_count=sms
+                    )
+                    key = (arch, sms, plan.template)
+                    seen[key] = seen.get(key, 0) + 1
+    # 16172, 16231, 16384, 16385 and 32768 tokens
+    assert seen.pop(("sm_103a", 152, ts)) == 5
+    assert seen and all(template == c3 for _, _, template in seen)
+    assert {(arch, sms) for arch, sms, _ in seen} == {
+        ("sm_100a", 152),
+        ("sm_107a", 208),
+        ("sm_107a", 212),
+        ("sm_107a", 216),
+    }
 
 
 def test_k2_values_feed_every_registered_router_program():
@@ -1911,6 +1993,20 @@ def test_k2_values_feed_every_registered_router_program():
                 "grid_y",
                 "grid_z",
             ]
+        if (
+            cake_jit.MODULES[name]["template"]
+            in cake_backend.ROUTER_HEAD_TAIL_TEMPLATES.values()
+        ):
+            # the head/tail program with the A parts in tensor memory also takes the launch flag (0 here)
+            assert [a for _, a in plan_args][-6:] == [
+                "head_spans",
+                "head_steps",
+                "enable_pdl",
+                "grid_x",
+                "grid_y",
+                "grid_z",
+            ]
+            assert arguments[-4] == 0
 
 
 def test_k2_out_fill_is_one_driver_memset_with_a_zero_fallback(monkeypatch):
@@ -2650,8 +2746,10 @@ def test_registered_templates_are_the_ones_the_planners_name():
         "router_fp32_gemm_atomic_nn_t",
         "router_fp32_gemm_atomic_nn_t" + cake_backend.ROUTER_HEAD_TAIL_SUFFIX,
     }
-    for table in cake_jit.KERNELS.values():
-        assert set(table) <= wanted, sorted(set(table) - wanted)
+    for arch, table in cake_jit.KERNELS.items():
+        assert set(table) <= wanted | {cake_backend.router_head_tail_template(arch)}, (
+            sorted(set(table) - wanted)
+        )
 
 
 def test_no_det_token_in_generated_names_and_no_negated_token_in_the_package():
@@ -3380,6 +3478,66 @@ def _top8_rows_differ(out, ref, tie_ulps=16):
     got_top = torch.topk(out.double(), 8, dim=1).indices.sort(dim=1).values
     differ = (got_top != ref_top).any(dim=1) & ~tie
     return int(differ.sum()), int(tie.sum())
+
+
+@pytest.mark.parametrize("T", [16172, 16231, 32768])
+def test_gpu_router_tmem_head_tail_program_on_152_sm_sm_103a(T):
+    """On a 152-SM sm_103a part the default plan of the hidden-5120 weight gradient in its head/tail window runs the
+    head/tail program with the A parts in tensor memory (``ROUTER_HEAD_TAIL_TEMPLATES``) and meets the gate of
+    :func:`test_gpu_router_d11_gate` over ``RERUNS`` launches into a NaN-poisoned ``out``: finite, within the
+    reordering bound of the K-order sum of the deterministic program's one-split partials of its segments, relative
+    Frobenius error against FP64 at most ``ROUTER_REL_FRO_MAX``.  On whole tiles (one unit per tile) it stores the bits
+    of the three-chunk-buffer head/tail program at the same partition, which are the deterministic program's one-split
+    result.  Skips on any other device."""
+    device, arch = _atomic_device_or_skip()
+    sm_count = det_backend.device_facts(device).sm_count
+    if arch != "sm_103a" or sm_count != 152:
+        pytest.skip(f"needs a 152-SM sm_103a part, got {arch} with {sm_count} SMs")
+    ts = cake_backend.ROUTER_HEAD_TAIL_TEMPLATES["sm_103a"]
+    c3 = "router_fp32_gemm_atomic_nn_t" + cake_backend.ROUTER_HEAD_TAIL_SUFFIX
+    _require_template(arch, ts)
+    _require_template(arch, c3)
+    X, W, G = _router_inputs(T, device, SEED + 30, K=5120)
+    A, B, out = _router_case("wgrad", X, W, G)
+    plan, reason = cake_backend.plan_atomic_router(
+        A, B, out, arch=arch, sm_count=sm_count
+    )
+    assert plan is not None and plan.template == ts and plan.head_spans > 0, reason
+    prepared = cake_backend.prepare_router_fp32_gemm(A, B, out, deterministic=False)
+    assert isinstance(prepared, cake_backend.PreparedAtomicRouterGemm)
+    assert prepared.plan == plan
+    assert prepared.module_name == cake_jit.select_module(arch, ts)
+    ref = A.double() @ B.double()
+    expected, bound = _router_segment_reference(A, B, plan)
+    expected, bound = expected.t(), bound.t()
+    _assert_ran(prepared.launch, prepared.module_name)
+    worst = 0.0
+    for i in range(RERUNS):
+        out.fill_(float("nan"))
+        prepared.launch()
+        torch.cuda.synchronize()
+        assert bool(torch.isfinite(out).all()), i
+        worst = max(worst, _rel_fro(out, ref))
+        assert bool(((out.double() - expected.double()).abs() <= bound).all()), i
+    assert worst <= ROUTER_REL_FRO_MAX, worst
+    # whole tiles: no part tile, no fill of out, one segment per tile
+    whole = dataclasses.replace(plan, units=plan.tiles, head_spans=0, head_steps=0)
+    assert not whole.part_tiles and whole.reproducible
+    stores = {}
+    for template in (ts, c3):
+        stores[template] = torch.full_like(out, float("nan"))
+        launch = cake_backend._prepare_atomic_k2(
+            dataclasses.replace(whole, template=template),
+            A,
+            B,
+            stores[template],
+            arch,
+        )
+        launch.launch()
+        torch.cuda.synchronize()
+    det_out = torch.empty_like(out)
+    cake_backend.router_fp32_gemm(A, B, det_out, splits=1)
+    assert torch.equal(stores[ts], stores[c3]) and torch.equal(stores[ts], det_out)
 
 
 def test_gpu_router_entry_points_reach_the_stream_k_program(router_rule):
