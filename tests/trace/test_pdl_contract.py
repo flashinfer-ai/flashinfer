@@ -289,7 +289,7 @@ class _Call:
         self._initial = {
             p: v.clone() for p, v in self.inputs.items() if isinstance(v, torch.Tensor)
         }
-        self.result = spec.api(**self.inputs, **case.variant)
+        self()
         if spec.out_param is not None and self.inputs.get(spec.out_param) is None:
             self.inputs[spec.out_param] = self.result
         self.written = [self.inputs[p] for p in spec.written_params()]
