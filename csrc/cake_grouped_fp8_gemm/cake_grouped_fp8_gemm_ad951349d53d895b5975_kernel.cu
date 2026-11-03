@@ -47,31 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 264
-#define TMEM_ACCUM_OFFSET 0
-#define TMEM_TMEM_SFB_OFFSET 256
-#define TMEM_TMEM_SFA_OFFSET 260
-#define NUM_TMA_PIPE_STAGES 8
-#define NUM_MAINLOOP_PIPE_STAGES 2
-#define NUM_EPI_TMA_PIPE_STAGES 3
-#define SMEM_EPI_STAGING_OFF 1024
-#define SMEM_EPI_STAGING_STAGE_BYTES 4096
-#define SMEM_EPI_STAGING_STRIDE 4096
-#define SMEM_SMEM_B_OFF 13312
-#define SMEM_SMEM_B_STAGE_BYTES 16384
-#define SMEM_SMEM_B_STRIDE 25600
-#define SMEM_SMEM_A_OFF 29696
-#define SMEM_SMEM_A_STAGE_BYTES 8192
-#define SMEM_SMEM_A_STRIDE 25600
-#define SMEM_SMEM_SFA_OFF 37888
-#define SMEM_SMEM_SFA_STAGE_BYTES 512
-#define SMEM_SMEM_SFA_STRIDE 25600
-#define SMEM_SMEM_SFB_OFF 38400
-#define SMEM_SMEM_SFB_STAGE_BYTES 512
-#define SMEM_SMEM_SFB_STRIDE 25600
-#define SMEM_TOTAL 218112
-#define THREADS 256
 #define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
@@ -234,7 +209,7 @@ __device__ __forceinline__ void tma_store_2d(
 extern "C" {
 
 __global__ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) __cluster_dims__(2,1,1) void
-kernel_cake_grouped_fp8_gemm_9bfa8c96c5191f51e2b8(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap A32, const __grid_constant__ CUtensorMap A64, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap C_tma, const __grid_constant__ CUtensorMap SFA_packed, const __grid_constant__ CUtensorMap SFB_packed, int* __restrict__ m_indices, unsigned int shape_m, unsigned int shape_n, unsigned int k_tiles, unsigned int sf_cols)
+kernel_cake_grouped_fp8_gemm_ad951349d53d895b5975(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap A32, const __grid_constant__ CUtensorMap A64, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap C_tma, const __grid_constant__ CUtensorMap SFA_packed, const __grid_constant__ CUtensorMap SFB_packed, int* __restrict__ m_indices, unsigned int shape_m, unsigned int shape_n, unsigned int k_tiles, unsigned int sf_cols)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -267,7 +242,7 @@ kernel_cake_grouped_fp8_gemm_9bfa8c96c5191f51e2b8(const __grid_constant__ CUtens
     int cta_rank;
     asm volatile("mov.b32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
 
-    // Kernel setup ops
+    // Prologue
     __nv_bfloat16* epi_staging = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
     const int epi_staging_addr = smem + 1024;
     uint8_t* smem_b = reinterpret_cast<uint8_t*>(smem_raw + 13312);
@@ -278,6 +253,8 @@ kernel_cake_grouped_fp8_gemm_9bfa8c96c5191f51e2b8(const __grid_constant__ CUtens
     const int smem_sfa_addr = smem + 37888;
     unsigned int* smem_sfb = reinterpret_cast<unsigned int*>(smem_raw + 38400);
     const int smem_sfb_addr = smem + 38400;
+
+    // Kernel setup ops
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&A))) : "memory");
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&A32))) : "memory");
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&A64))) : "memory");
@@ -286,8 +263,7 @@ kernel_cake_grouped_fp8_gemm_9bfa8c96c5191f51e2b8(const __grid_constant__ CUtens
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&SFB_packed))) : "memory");
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&C_tma))) : "memory");
 
-    // Mbarrier init (7 pipeline groups, 0 ordered-sequence groups, 37 barriers)
-    // Mbarriers at smem_raw[0..296)
+    // Mbarrier init (37 barriers at smem_raw[0..296))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -343,7 +319,7 @@ kernel_cake_grouped_fp8_gemm_9bfa8c96c5191f51e2b8(const __grid_constant__ CUtens
     }
 
     __syncwarp();
-    asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
+    asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
     asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
 
     // TMEM alloc (512 columns, 264 used)
@@ -358,12 +334,10 @@ kernel_cake_grouped_fp8_gemm_9bfa8c96c5191f51e2b8(const __grid_constant__ CUtens
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
-
-    // Kernel post-init ops
-    const int tmem_accum = taddr;
-    const int tmem_tmem_sfb = taddr + 256;
-    const int tmem_tmem_sfa = taddr + 260;
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_accum = taddr;
+    const unsigned int tmem_tmem_sfb = taddr + 256;
+    const unsigned int tmem_tmem_sfa = taddr + 260;
 
     // ---- Role: load ----
     if (warp == 0) {
