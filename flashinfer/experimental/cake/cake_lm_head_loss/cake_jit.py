@@ -373,6 +373,24 @@ _ARG_PLANS: dict[str, list[list[str]]] = {
         ["grid", "grid_y"],
         ["grid", "grid_z"],
     ],
+    "gemm_dw_cast_dcnt_tma": [
+        ["tma_buffer", "A"],
+        ["tma_buffer", "B"],
+        ["tma_buffer", "C"],
+        ["buffer", "STATS_OUT"],
+        ["parameter", "M"],
+        ["parameter", "m_tiles"],
+        ["parameter", "k_iters"],
+        ["parameter", "first_chunk"],
+        ["tma_buffer", "WS"],
+        ["parameter", "ldc"],
+        ["parameter", "group_m"],
+        ["parameter", "group_n"],
+        ["buffer", "CNT"],
+        ["grid", "grid_x"],
+        ["grid", "grid_y"],
+        ["grid", "grid_z"],
+    ],
     "zero_dlogp_partition": [
         ["buffer", "labels"],
         ["buffer", "dlogp"],
@@ -855,6 +873,14 @@ _REGISTRY: dict[str, dict[str, Any]] = {
                 1,
                 1,
             ],
+            "gemm_dw_cast_bf16_tma_dcnt": [
+                "b1e91ee98fdb0aa397ff",
+                "gemm_dw_cast_dcnt_tma",
+                "b224_c2",
+                "max(1, m_tiles//2*(ldc//512))*4",
+                1,
+                1,
+            ],
             "gemm_dw_cast_f32": [
                 "482c931ebbf9454ad2a9",
                 "gemm_logits",
@@ -1311,6 +1337,14 @@ _REGISTRY: dict[str, dict[str, Any]] = {
             "gemm_dw_cast_bf16_tma": [
                 "09ef1e4bd18f200203e8",
                 "gemm_dx_2",
+                "b224_c2",
+                "max(1, m_tiles//2*(ldc//512))*4",
+                1,
+                1,
+            ],
+            "gemm_dw_cast_bf16_tma_dcnt": [
+                "b1e91ee98fdb0aa397ff",
+                "gemm_dw_cast_dcnt_tma",
                 "b224_c2",
                 "max(1, m_tiles//2*(ldc//512))*4",
                 1,
@@ -2020,6 +2054,7 @@ STAGES = (
     "gemm_dw_cast_bf16",
     "gemm_dw_cast_bf16_dcnt",
     "gemm_dw_cast_bf16_tma",
+    "gemm_dw_cast_bf16_tma_dcnt",
     "gemm_dw_cast_f32",
     "gemm_dw_cast_f32_gn",
     "scale_cast_bf16",
@@ -2044,7 +2079,7 @@ STAGES = (
 # ``_dcnt`` the form bounded by the device count of the chunk's live rows (the
 # log-probability backward's zero-gradient row skip: the dz arm, the K-sliced dX
 # reductions but the swapped tile, the weight-gradient accumulate and bf16 fused
-# cast; ``cake_backend.DCNT_BASES``).  The
+# cast, the latter's TMA form too; ``cake_backend.DCNT_BASES``).  The
 # call geometry (``H`` / ``V``) and the rules' numeric outputs -- the slice
 # count, the raster height ``group_m``, the block width ``group_n`` -- are
 # launch scalars of these kernels (``cake_backend.gemm_scalars``), so one

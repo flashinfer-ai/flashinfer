@@ -661,7 +661,7 @@ _FP8_RUNTIME_ROUTE_ROWS = [
     ("sm100a", "g4_q64", 256, 64, 1024, 32, 8, 4, False),
     ("sm100a", "g4_q128", 256, 128, 1024, 32, 8, 4, False),
     ("sm100a", "g8_q64", 256, 64, 1024, 32, 4, 8, True),
-    ("sm100a", "g8_q128", 256, 128, 1024, 32, 4, 8, False),
+    ("sm100a", "g8_q128", 256, 128, 1024, 32, 4, 8, True),
     ("sm100a", "g1_q32_b64", 64, 32, 1024, 32, 32, 1, False),
     ("sm100a", "g1_q32_b128", 128, 32, 1024, 32, 32, 1, False),
     ("sm100a", "g2_q32_b64", 64, 32, 1024, 32, 16, 2, True),
@@ -685,6 +685,19 @@ _FP8_RUNTIME_ROUTE_ROWS = [
     ("sm100a", "g16_q16", 256, 16, 1024, 32, 2, 16, False),
     ("sm100a", "g32_q16", 256, 16, 1024, 32, 1, 32, False),
 ]  # fmt: skip
+# Calls the sm100a rule of many query rows at long query lengths covers, over
+# caches of at least :data:`_CONTEXT_FP8_RUNTIME_ROWS_KV` keys (timed B200 with
+# five seeded memory layouts: the runtime-size program ran faster back to
+# back at the power limit on every row, ``g8_q128`` above among them).
+_FP8_RUNTIME_ROWS_KV_ROUTE_ROWS = [
+    ("sm100a", "kv_g8_q128_k4096", 256, 128, 4096, 32, 4, 8, True),
+    ("sm100a", "kv_g8_q256_k16384", 128, 256, 16384, 32, 4, 8, True),
+    ("sm100a", "kv_g8_q2048_k4096", 16, 2048, 4096, 32, 4, 8, True),
+    ("sm100a", "kv_g8_h64_q128_k4096", 128, 128, 4096, 64, 8, 8, True),
+    ("sm100a", "kv_g4_q256_k4096", 128, 256, 4096, 32, 8, 4, True),
+    ("sm100a", "kv_g2_q512_k4096", 64, 512, 4096, 32, 16, 2, True),
+    ("sm100a", "kv_g1_q1024_k4096", 32, 1024, 4096, 32, 32, 1, True),
+]  # fmt: skip
 
 
 @pytest.mark.parametrize(
@@ -699,8 +712,11 @@ _FP8_RUNTIME_ROUTE_ROWS = [
         "pack_g",
         "serves",
     ),
-    _FP8_RUNTIME_ROUTE_ROWS,
-    ids=[f"{row[0]}-{row[1]}" for row in _FP8_RUNTIME_ROUTE_ROWS],
+    _FP8_RUNTIME_ROUTE_ROWS + _FP8_RUNTIME_ROWS_KV_ROUTE_ROWS,
+    ids=[
+        f"{row[0]}-{row[1]}"
+        for row in _FP8_RUNTIME_ROUTE_ROWS + _FP8_RUNTIME_ROWS_KV_ROUTE_ROWS
+    ],
 )
 def test_cake_fmha_context_fp8_runtime_route(
     monkeypatch,
@@ -763,6 +779,69 @@ def test_cake_fmha_context_fp8_runtime_route(
             target, batch, max_q, max_kv, num_q_heads, num_kv_heads, pack_g
         )
         assert route.program is None and route.pack_g == pack_g
+
+
+# sm100a FP8 calls of one query head per KV head whose query tokens fit one
+# stage and that the runtime-size program serves: (batch, max_q_len,
+# max_kv_len, heads, page size, the route's program).  From
+# :data:`_CONTEXT_FP8_RUNTIME_ONE_STAGE_TILES` tiles (timed B200 with five
+# seeded memory layouts: the one-stage program ran faster cold and back to
+# back on every such row) the one-stage program of pack 1; below them the
+# runtime-size program.
+_FP8_RUNTIME_ONE_STAGE_ROUTE_ROWS = [
+    (20, 4, 4096, 32, 64, "RUNTIME_PACK1_PAGE64_Q1"),
+    (24, 128, 2048, 32, 64, "RUNTIME_PACK1_PAGE64_Q1"),
+    (32, 4, 8192, 32, 64, "RUNTIME_PACK1_PAGE64_Q1"),
+    (32, 128, 8192, 32, 64, "RUNTIME_PACK1_PAGE64_Q1"),
+    (32, 4, 4096, 32, 16, "RUNTIME_PACK1_Q1"),
+    (48, 32, 4096, 32, 64, "RUNTIME_PACK1_PAGE64_Q1"),
+    (64, 4, 2048, 16, 64, "RUNTIME_PACK1_PAGE64_Q1"),
+    (16, 4, 2048, 64, 64, "RUNTIME_PACK1_PAGE64_Q1"),
+    (19, 4, 4096, 32, 64, "RUNTIME_PACK1_PAGE64"),
+    (19, 4, 4096, 32, 16, "RUNTIME_PACK1"),
+]  # fmt: skip
+
+
+@pytest.mark.parametrize(
+    ("batch", "max_q", "max_kv", "heads", "page_size", "program"),
+    _FP8_RUNTIME_ONE_STAGE_ROUTE_ROWS,
+    ids=[
+        f"b{r[0]}_q{r[1]}_k{r[2]}_h{r[3]}_p{r[4]}"
+        for r in _FP8_RUNTIME_ONE_STAGE_ROUTE_ROWS
+    ],
+)
+def test_cake_fmha_context_fp8_runtime_one_stage_route(
+    monkeypatch, batch, max_q, max_kv, heads, page_size, program
+) -> None:
+    """A pack-1 call of one query head per KV head that the runtime-size
+    program serves takes the one-stage program of pack 1 from the target's
+    tiles on, else the runtime-size program."""
+
+    target = "sm100a"
+    assert cake_api._context_pack_g(max_q, max_kv, heads, heads) == 1
+    assert cake_api._context_fp8_runtime_serves(
+        target, batch, max_q, max_kv, heads, heads, 1
+    )
+    one_stage = program.endswith("_Q1")
+    assert (
+        cake_api._context_fp8_runtime_one_stage(target, batch, max_q, heads, heads, 1)
+        is one_stage
+    )
+    assert (
+        cake_api._context_fp8_power_one_stage(
+            target, batch, max_q, max_kv, heads, heads, 1
+        )
+        is one_stage
+    )
+    monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: target)
+    row = ("context_fp8", batch, max_q, max_kv, heads, heads, page_size, True, None)
+    route = cake_api.select_cake_fmha_context_route(
+        torch.device("meta"), **_context_kwargs(row, device="meta")
+    )
+    assert route is not None and route.program == program, route
+    assert route.pack_g == 1
+    if one_stage:
+        assert route.num_m_blocks == 1
 
 
 @pytest.mark.parametrize("target", ("sm100a", "sm103a"))

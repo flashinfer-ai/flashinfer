@@ -26,6 +26,7 @@ import torch
 
 from flashinfer.mla import trtllm_batch_decode_sparse_mla_dsv4
 from flashinfer.mla.cake_dsv4 import (
+    _route,
     cake_dsv4_workspace_layout,
     cake_dsv4_workspace_requirement,
     cake_dsv4_workspace_reset,
@@ -677,6 +678,7 @@ class _Case:
         out: Optional[torch.Tensor] = None,
         backend: str = "cake",
         float_scales: bool = False,
+        enable_pdl: bool = False,
     ) -> torch.Tensor:
         result = trtllm_batch_decode_sparse_mla_dsv4(
             query=self.query,
@@ -693,7 +695,7 @@ class _Case:
             kv_layout="HND",
             cum_seq_lens_q=self.cum_seq_lens_q,
             max_q_len=self.max_q_len if self.ragged else None,
-            enable_pdl=False,
+            enable_pdl=enable_pdl,
             backend=backend,
         )
         return result.reshape(-1, self.num_heads, 512)
@@ -1419,6 +1421,45 @@ def test_sglang_swa_only_convention(h_q, form, tail):
     assert bool((case.sparse_topk_lens == SWA_WINDOW).all())
     assert case.sparse_indices.shape[1] == SWA_WINDOW
     _assert_poison_inert(case, _workspace_128mib(), float_scales=True)
+
+
+@pytest.mark.parametrize("form", ["decode", "mtp-dense"])
+def test_enable_pdl_lowhead_prefill_matches_and_waits_for_the_query_producer(form):
+    """The SWA-only FP8/H64 rows of one wave run the low-head prefill program; as
+    a programmatic dependent it is bitwise equal to the plain launch and, inside
+    a graph, reads the query the copy right before it writes."""
+    _skip_unless_cake_gpu()
+    case = _sglang_case(64, form, compressed=False, tail="minus_one")
+    route = _route(
+        dtype=case.dtype,
+        num_heads=case.num_heads,
+        max_q_len=case.max_q_len,
+        ragged=case.ragged,
+        sparse_topk=SWA_WINDOW,
+        batch_size=case.batch_size,
+        compressed_page_size=int(case.compressed_kv_cache.shape[-2]),
+        num_query_tokens=case.rows,
+        sm_count=torch.cuda.get_device_properties(0).multi_processor_count,
+    )
+    assert route == "fp8_lowhead_prefill", route
+    workspace = _workspace_128mib()
+    plain = case.run(workspace=workspace, out=case.nan_out(), float_scales=True)
+    pdl = case.run(
+        workspace=workspace, out=case.nan_out(), float_scales=True, enable_pdl=True
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(plain, pdl)
+
+    source = case.query.clone()
+    case.query.zero_()
+    out = case.nan_out()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        case.query.copy_(source)
+        case.run(workspace=workspace, out=out, float_scales=True, enable_pdl=True)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(out.reshape(plain.shape), plain)
 
 
 @pytest.mark.parametrize("h_q", _SGLANG_HEADS)
