@@ -154,7 +154,8 @@ __global__ void CsfExpandKernel(CsfExpandParams p, uint8_t* __restrict__ out) {
     for (int i = threadIdx.x; i < static_cast<int>(blockIdx.x); i += blockDim.x) {
       skip |= p.experts[i] == id;
     }
-    expert = id - p.expert_offset;
+    // Compared first, as id - expert_offset can overflow.
+    expert = id < p.expert_offset ? -1 : id - p.expert_offset;
     if (__syncthreads_or(skip || expert < 0 || expert >= p.num_experts)) return;
   }
   const int slabs = p.rows / kSlabRows, cols = p.cols, tile_words = p.tile_words;
