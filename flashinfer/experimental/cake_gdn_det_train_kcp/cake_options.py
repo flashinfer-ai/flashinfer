@@ -145,11 +145,11 @@ TEST_KNOBS: dict[str, tuple[Any, ...] | None] = {
     "fwdh_vh": (
         64,
         128,
-    ),  # force the #2 form (K1 L8A_DECISION rule otherwise: 64 iff n_walk * HV <= sm_count)
+    ),  # force the #2 form (rule otherwise: cake_kcp.fwdh_vh)
     "dhu_vh": (
         64,
         128,
-    ),  # force the #7 form (rule otherwise: 64 iff n_walk * HV * 2 <= 4 * sm_count)
+    ),  # force the #7 form (rule otherwise: cake_kcp.dhu_vh)
     "record_qk": (
         False,
         True,
