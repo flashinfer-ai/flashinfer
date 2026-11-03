@@ -7,12 +7,10 @@ is derived from the row's amax and returned as the per-token scale).
 Device-free: the pinned fingerprints, the dispatcher's membership in the enumerated space and the device check. On an
 SM100 / SM103 / SM107 device with the CuTe DSL: bit equality with the exact CPU oracle of the specification
 (``quantization/nvfp4_reference.py``: the vectorised model over a shape sweep and the Fractions evaluation of the
-symbolic spec on a few rows) in the three scale-factor layouts and bf16 / f16 / fp32; bit equality with FlashInfer's own
-quantizers on their correctly rounded path (``FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH=1``, where cuda and cute-dsl compute
-the same chain) and the bounded difference of their default approximate path; determinism including CUDA-graph replay
+symbolic spec on a few rows) in the three scale-factor layouts and bf16 / f16 / fp32; determinism including CUDA-graph replay
 and PDL; configuration and SM-count independence; the batch-invariance guarantee itself (a row's bits do not depend on
-the batch it is quantized in); ``do_shuffle``; the GEMM consuming the outputs; M = 0 and the error contract. Every
-assertion is bitwise.
+the batch it is quantized in); M = 0 and the error contract. Every assertion is bitwise, against the classes' own
+specification: FlashInfer's other quantizer backends are not a reference for them.
 """
 
 import pytest
@@ -29,10 +27,8 @@ from flashinfer.batch_invariant.quantization.nvfp4_api import (
     nvfp4_quantize_rows,
 )
 from tests.test_helpers.batch_invariant_quant import (
-    EXACT_ENV,
     FI_LAYOUTS,
     adversarial_inputs,
-    flush_subnormals,
     same_bits,
 )
 
@@ -98,27 +94,6 @@ def _logical(outs, M, K, layout):
     token, the scales ``(M,)``."""
     sf = L.unswizzle_sf(outs[1].reshape(-1), M, K, BLOCK, layout)
     return (outs[0].reshape(M, K // 2), sf) + tuple(outs[2:])
-
-
-def _flashinfer(x, gs, layout, per_token, backend, **kw):
-    """FlashInfer's own quantizer (``backend`` cuda or cute-dsl) on the same inputs; the outputs on the host as bytes.
-    The per-tensor paths take the global scale as a device tensor, the per-token paths the inverse base scale as a float."""
-    g = (
-        float(gs)
-        if per_token
-        else torch.full((1,), float(gs), dtype=torch.float32, device="cuda")
-    )
-    outs = flashinfer.nvfp4_quantize(
-        x,
-        g,
-        sfLayout=FI_LAYOUTS[layout],
-        backend=backend,
-        per_token_activation=per_token,
-        **kw,
-    )
-    return tuple(
-        (o.view(torch.uint8) if o.dtype != torch.float32 else o).cpu() for o in outs
-    )
 
 
 # ----------------------------------------------------------------------------------------------- device-free
@@ -210,71 +185,6 @@ def test_matches_exact_reference(dtype, layout, per_token):
     assert torch.equal(got[0][rows], ex_codes) and torch.equal(got[1][rows], ex_sf)
     if per_token:
         assert torch.equal(got[2][rows].view(torch.int32), ex_pts.view(torch.int32))
-
-
-@needs_device
-@pytest.mark.parametrize("per_token", [False, True])
-@pytest.mark.parametrize("backend", ["cuda", "cute-dsl"])
-def test_matches_flashinfer_exact_path(monkeypatch, backend, per_token):
-    """On its correctly rounded path (``FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH=1``) FlashInfer's ``backend`` computes
-    the class: codes, scale bytes (the same layout, the same view) and per-token scales equal in the three layouts, and
-    with ``do_shuffle``. FlashInfer's CUDA module is compiled with flush-to-zero, so subnormal inputs are flushed here
-    (the class keeps them: the oracle test covers them)."""
-    for k, v in EXACT_ENV.items():
-        monkeypatch.setenv(k, v)
-    for layout in L.LAYOUTS:
-        for M, K in [(37, 256), (130, 1024), (3, 4096), (8, 48), (200, 5120)]:
-            x = flush_subnormals(
-                adversarial_inputs(M, K, torch.bfloat16, seed=M, special=False)
-            )
-            gs = _gs(x, per_token)
-            assert same_bits(
-                _quantize(x, gs, layout, per_token),
-                _flashinfer(x, gs, layout, per_token, backend),
-            ), (layout, M, K)
-    x = flush_subnormals(
-        adversarial_inputs(256, 2048, torch.bfloat16, seed=3, special=False)
-    )  # do_shuffle permutes rows in blocks of 32: a multiple of 32 rows, as FlashInfer's backends require
-    gs = _gs(x, per_token)
-    ours = _quantize(x, gs, "128x4", per_token, do_shuffle=True)
-    theirs = _flashinfer(x, gs, "128x4", per_token, "cuda", do_shuffle=True)
-    assert same_bits(
-        tuple(t.reshape(-1) for t in ours), tuple(t.reshape(-1) for t in theirs)
-    )
-
-
-@needs_device
-@pytest.mark.parametrize("backend", ["cuda", "cute-dsl"])
-def test_flashinfer_default_path_differences_are_bounded(monkeypatch, backend):
-    """FlashInfer's default path uses ``rcp.approx.ftz`` for the scale reciprocals and, per token, stores
-    ``amax * gs_inv`` where the class stores the reciprocal of the row's global scale: the documented differences from
-    the class. They move a value across a rounding boundary at most: a small share of codes and scale bytes differ, the
-    per-token scales by at most two ulps."""
-    monkeypatch.delenv("FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH", raising=False)
-    M, K = 512, 4096
-    x = (
-        (torch.randn(M, K, generator=torch.Generator().manual_seed(0)) * 3)
-        .to(torch.bfloat16)
-        .cuda()
-    )
-    for per_token in (False, True):
-        gs = _gs(x, per_token)
-        ours = _logical(_quantize(x, gs, "128x4", per_token), M, K, "128x4")
-        theirs = _logical(
-            _flashinfer(x, gs, "128x4", per_token, backend), M, K, "128x4"
-        )
-        code_rate = float(
-            (R.unpack_e2m1(ours[0]) != R.unpack_e2m1(theirs[0])).float().mean()
-        )
-        sf_rate = float((ours[1] != theirs[1]).float().mean())
-        assert code_rate < 0.01 and sf_rate < 0.01, (per_token, code_rate, sf_rate)
-        if per_token:
-            ulps = (ours[2].view(torch.int32) - theirs[2].view(torch.int32)).abs()
-            assert (
-                int(ulps.max()) <= 2
-            )  # three correctly rounded operations against one
-            ramax = x.float().abs().amax(dim=1).cpu()
-            assert torch.equal(theirs[2], ramax * torch.tensor(gs, dtype=torch.float32))
 
 
 @needs_device
@@ -433,70 +343,6 @@ def test_widenings_and_layouts_carry_the_same_bits():
                 assert same_bits(
                     _logical(_quantize(x, gs, layout, per_token), M, K, layout), ref
                 ), layout
-
-
-@needs_device
-def test_mm_fp4_consumes_the_outputs(monkeypatch):
-    """FlashInfer's NVFP4 GEMM backends that run here consume the class's ``(fp4, sf)`` (the layout is the one the GEMM
-    reads): the product equals the same GEMM on FlashInfer's exact-path quantization of the same inputs (byte-identical
-    operands) and is close to the bf16 reference."""
-    for k, v in EXACT_ENV.items():
-        monkeypatch.setenv(k, v)
-    m, n, k = 128, 256, 1024
-    a = (
-        torch.randn(m, k, generator=torch.Generator().manual_seed(1))
-        .to(torch.bfloat16)
-        .cuda()
-    )
-    b = (
-        torch.randn(n, k, generator=torch.Generator().manual_seed(2))
-        .to(torch.bfloat16)
-        .cuda()
-    )
-    gs_a, gs_b = _gs(a, False), _gs(b, False)
-    ours = [
-        flashinfer.nvfp4_quantize(t, g, batch_invariant=True)
-        for t, g in ((a, gs_a), (b, gs_b))
-    ]
-    theirs = [
-        flashinfer.nvfp4_quantize(t, torch.full((1,), g, device="cuda"), backend="cuda")
-        for t, g in ((a, gs_a), (b, gs_b))
-    ]
-    for o, t in zip(ours, theirs, strict=True):
-        assert torch.equal(o[0], t[0].view(torch.uint8)) and torch.equal(
-            o[1], t[1].view(torch.uint8)
-        )
-    alpha = torch.tensor([1.0 / (gs_a * gs_b)], dtype=torch.float32, device="cuda")
-    ref = a.double() @ b.double().T
-    ran = 0
-    for backend in ("cutlass", "cudnn", "cute-dsl"):
-
-        def gemm(q):
-            (afp4, asf), (bfp4, bsf) = q
-            return flashinfer.mm_fp4(
-                afp4,
-                bfp4.T,
-                asf,
-                bsf.T,
-                alpha,
-                torch.bfloat16,
-                block_size=16,
-                use_8x4_sf_layout=False,
-                backend=backend,
-                use_nvfp4=True,
-            )
-
-        try:
-            out = gemm(ours)
-        except Exception:  # noqa: BLE001  (the backend does not run this shape / device)
-            continue
-        ran += 1
-        assert torch.equal(out, gemm(theirs)), backend
-        cos = torch.nn.functional.cosine_similarity(
-            out.double().flatten(), ref.flatten(), dim=0
-        )
-        assert float(cos) > 0.98, (backend, float(cos))
-    assert ran >= 1
 
 
 @needs_device

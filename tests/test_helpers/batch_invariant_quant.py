@@ -11,15 +11,13 @@ FI_LAYOUTS = {
     "8x4": SfLayout.layout_8x4,
     "linear": SfLayout.layout_linear,
 }
-#: FlashInfer's NVFP4 quantizers on their correctly rounded path (exact division instead of ``rcp.approx.ftz``).
-EXACT_ENV = {"FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH": "1"}
 
 
 def varied_inputs(M, K, dtype, seed=0):
     """Inputs that exercise a quantizer broadly rather than typically: magnitudes spread over about 40 binades (12 for
     f16) with random signs, 1 % of the elements scaled up as outliers, 1 % exact +0 and 1 % exact -0. Every value is
-    finite and normal in binary32, and every block of 16 keeps an amax far above the smallest representable scale, so
-    the inputs stay inside the regime where FlashInfer's own quantizers agree with the classes."""
+    finite and normal in binary32, and every block of 16 keeps an amax far above the smallest representable scale (no
+    tiny-block corner)."""
     g = torch.Generator(device="cpu").manual_seed(seed)
     e = (torch.rand(M, K, generator=g) * 2 - 1) * (
         20.0 if dtype != torch.float16 else 6.0
@@ -42,7 +40,7 @@ def adversarial_inputs(M, K, dtype, seed=0, special=True, block=16):
     """``varied_inputs`` plus the corners of the recipes: near-cancelling pairs, subnormal elements (bf16 / fp32) and, when
     the batch has at least 8 rows, an all-zero row, a row with one all-zero block, a block of -0, a row of tiny values
     whose scale rounds to the smallest scale byte, infinities, and the dtype's maximum. For the exact CPU oracle (which
-    pins what the class computes there); FlashInfer's own quantizers differ from the classes at some of these corners."""
+    pins what the class computes there)."""
     g = torch.Generator(device="cpu").manual_seed(seed)
     x = varied_inputs(M, K, dtype, seed).float().cpu()
     pairs = torch.rand(M, K // 2, generator=g) < 0.15
@@ -69,13 +67,6 @@ def adversarial_inputs(M, K, dtype, seed=0, special=True, block=16):
     x = x.to(dtype)
     assert not torch.isnan(x).any()
     return x.cuda()
-
-
-def flush_subnormals(x: torch.Tensor) -> torch.Tensor:
-    """Zero the elements below the smallest normal binary32 (|x| < 2^-126), keeping the sign: FlashInfer's CUDA quantizer
-    module is compiled with flush-to-zero, so this is the input class on which its exact path reproduces the classes."""
-    tiny = (x.float().abs() < 2.0**-126) & (x != 0)
-    return torch.where(tiny, torch.sign(x.float()).to(x.dtype) * 0, x)
 
 
 def same_bits(a, b) -> bool:

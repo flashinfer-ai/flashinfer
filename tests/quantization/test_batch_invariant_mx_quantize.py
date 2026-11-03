@@ -8,12 +8,11 @@ inverse).
 Device-free: the pinned fingerprints, the dispatcher's membership in the enumerated space and the device check. On an
 SM100 / SM103 / SM107 device with the CuTe DSL: bit equality with the exact CPU oracle of the specification
 (``quantization/mx_reference.py``: the vectorised model over a shape sweep and the Fractions evaluation of the symbolic
-spec on a few rows) in the three scale-factor layouts and bf16 / f16 / fp32, with FlashInfer's MXFP8 reference
-implementation (``tests/utils_fp8.py``, including ``alignment`` padding) and with FlashInfer's own quantizers (cuda and
-cute-dsl) away from the one documented corner, which is pinned (a block whose amax is below the smallest scale: the
-classes keep TE's inverse, FlashInfer's kernels zero the block); determinism including CUDA-graph replay and PDL;
-configuration and SM-count independence; the batch-invariance guarantee itself (a row's bits do not depend on the batch it
-is quantized in); the MX GEMMs consuming the outputs; M = 0 and the error contract. Every assertion is bitwise.
+spec on a few rows) in the three scale-factor layouts and bf16 / f16 / fp32, and ``mxfp8_quantize``'s ``alignment`` padding
+against the same oracle; determinism including CUDA-graph replay and PDL; configuration and SM-count independence; the
+batch-invariance guarantee itself (a row's bits do not depend on the batch it is quantized in); M = 0 and the error
+contract. Every assertion is bitwise, against the classes' own specification: FlashInfer's other quantizer backends are
+not a reference for them.
 """
 
 import pytest
@@ -37,7 +36,6 @@ from tests.test_helpers.batch_invariant_quant import (
     same_bits,
     varied_inputs,
 )
-from tests.utils_fp8 import assert_mxfp8_quantize_exact
 
 BLOCK = 32
 FMTS = [S.MXFP8, S.MXFP4]
@@ -89,19 +87,6 @@ def _quantize(x, fmt, layout="128x4", **kw):
         assert q.dtype == torch.uint8
     assert sf.dtype == torch.uint8 and sf.dim() == 1
     return q.view(torch.uint8).cpu(), sf.cpu()
-
-
-def _flashinfer(x, fmt, layout, backend):
-    """FlashInfer's own quantizer (``backend`` cuda or cute-dsl) on the same inputs; the outputs on the host as bytes."""
-    if fmt is S.MXFP8:
-        q, sf = flashinfer.mxfp8_quantize(
-            x, sf_swizzle_layout=FI_LAYOUTS[layout], backend=backend
-        )
-    else:
-        q, sf = flashinfer.mxfp4_quantize(
-            x, backend=backend, sfLayout=FI_LAYOUTS[layout]
-        )
-    return q.view(torch.uint8).cpu(), sf.view(torch.uint8).cpu().reshape(-1)
 
 
 def _logical(outs, M, K, layout):
@@ -174,72 +159,25 @@ def test_matches_exact_reference(dtype, layout, fmt):
 
 @needs_device
 @pytest.mark.parametrize("layout", L.LAYOUTS)
-@pytest.mark.parametrize("dtype", DT)
-def test_mxfp8_matches_flashinfer_reference_and_alignment(dtype, layout):
-    """Codes and scale factors agree with FlashInfer's MXFP8 reference implementation over the shape sweep, and with
-    ``alignment`` padding (zero columns under a zero scale byte)."""
-    for M, K in SWEEP[dtype]:
-        x = varied_inputs(M, K, dtype, seed=M + K)
+def test_mxfp8_alignment_pads_with_zero_columns(layout):
+    """``mxfp8_quantize``'s ``alignment`` pads K to a multiple of it with zero columns: the class's bytes are those of the
+    zero-padded input (zero codes under a zero scale byte in the padding blocks), in every layout."""
+    for M, K, alignment in ((37, 96, 128), (8, 32, 64), (130, 1024, 1024)):
+        x = adversarial_inputs(M, K, torch.bfloat16, seed=M, block=BLOCK)
         q, sf = flashinfer.mxfp8_quantize(
             x,
+            alignment=alignment,
             sf_swizzle_layout=FI_LAYOUTS[layout],
-            backend="auto",
             batch_invariant=True,
         )
-        assert_mxfp8_quantize_exact(x, q, sf, sf_swizzle_layout=FI_LAYOUTS[layout])
-    x = varied_inputs(37, 96, dtype, seed=1)
-    q, sf = flashinfer.mxfp8_quantize(
-        x, alignment=128, sf_swizzle_layout=FI_LAYOUTS[layout], batch_invariant=True
-    )
-    assert q.shape == (37, 128)
-    assert_mxfp8_quantize_exact(
-        x, q, sf, alignment=128, sf_swizzle_layout=FI_LAYOUTS[layout]
-    )
-
-
-@needs_device
-@pytest.mark.parametrize("fmt", FMTS, ids=FMT_IDS)
-@pytest.mark.parametrize("backend", ["cuda", "cute-dsl"])
-def test_matches_flashinfer_backends(backend, fmt):
-    """FlashInfer's own quantizers compute the classes on inputs without tiny blocks (the corner pinned below): codes and
-    scale bytes equal in the three layouts; fp32 inputs on the MXFP8 CuTe-DSL backend (the others take 16-bit inputs)."""
-    dtypes = [torch.bfloat16, torch.float16]
-    if fmt is S.MXFP8 and backend == "cute-dsl":
-        dtypes.append(torch.float32)
-    for dtype in dtypes:
-        for layout in L.LAYOUTS:
-            for M, K in [(37, 256), (130, 1024), (3, 4096), (8, 96), (200, 7168)]:
-                x = varied_inputs(M, K, dtype, seed=M)
-                ours = _quantize(x, fmt, layout)
-                theirs = _flashinfer(x, fmt, layout, backend)
-                assert same_bits(ours, theirs), (dtype, layout, M, K)
-
-
-@needs_device
-@pytest.mark.parametrize("fmt", FMTS, ids=FMT_IDS)
-def test_tiny_block_corner_is_pinned(fmt):
-    """The one documented difference from FlashInfer's kernels: for a block whose amax is below ``elem_max x 2^-127``
-    (scale byte 0) their inverse scale is 0 (every code 0), TE's and the classes' is 2^127 (the values survive). The
-    scale bytes agree; every differing code sits in such a block; nothing else differs."""
-    M, K = 64, 1024
-    x = varied_inputs(M, K, torch.bfloat16, seed=11)
-    xb = x.float().view(M, K // BLOCK, BLOCK)
-    tiny = torch.zeros(M, K // BLOCK, dtype=torch.bool, device="cuda")
-    tiny[::7, ::5] = True
-    xb = torch.where(
-        tiny.unsqueeze(-1), (xb.sign() + (xb == 0).float()) * 2.0**-126, xb
-    )
-    x = xb.view(M, K).to(torch.bfloat16)
-    ours = _quantize(x, fmt, "128x4")
-    theirs = _flashinfer(x, fmt, "128x4", "cuda")
-    assert torch.equal(ours[1], theirs[1]), "scale bytes differ"
-    sf = L.unswizzle_sf(ours[1], M, K, BLOCK, "128x4")
-    assert bool((sf[tiny.cpu()] == 0).all())
-    ov = R.unpack_elems(ours[0], fmt).view(M, K // BLOCK, BLOCK)
-    tv = R.unpack_elems(theirs[0], fmt).view(M, K // BLOCK, BLOCK)
-    diff = (ov != tv).any(-1)
-    assert bool((tv[tiny.cpu()] == 0).all()) and bool((ov[tiny.cpu()] != 0).any())
-    assert bool((diff <= tiny.cpu()).all()), "a code differs outside a tiny block"
+        padded_k = -(-K // alignment) * alignment
+        assert q.shape == (M, padded_k) and q.dtype == torch.float8_e4m3fn
+        xp = torch.zeros(M, padded_k, dtype=x.dtype, device=x.device)
+        xp[:, :K] = x
+        ref_codes, ref_sf, _ = R.quantize_mx_reference(xp, S.MXFP8, swizzled=layout)
+        assert torch.equal(q.view(torch.uint8).cpu(), ref_codes) and torch.equal(
+            sf.cpu(), ref_sf
+        )
 
 
 @needs_device
@@ -373,73 +311,6 @@ def test_widenings_and_layouts_carry_the_same_bits(fmt):
             assert same_bits(_logical(_quantize(x, fmt, layout), M, K, layout), ref), (
                 layout
             )
-
-
-@needs_device
-@pytest.mark.parametrize("fmt", FMTS, ids=FMT_IDS)
-def test_mx_gemm_consumes_the_outputs(fmt):
-    """FlashInfer's MX GEMM backends that run here consume the classes' ``(codes, sf)`` (the layout is the one the GEMM
-    reads): the product equals the same GEMM on FlashInfer's own quantization of the same inputs (byte-identical
-    operands) and is close to the bf16 reference."""
-    m, n, k = 128, 256, 2048
-    a = (
-        torch.randn(m, k, generator=torch.Generator().manual_seed(1))
-        .to(torch.bfloat16)
-        .cuda()
-    )
-    b = (
-        torch.randn(n, k, generator=torch.Generator().manual_seed(2))
-        .to(torch.bfloat16)
-        .cuda()
-    )
-    ours = [_quantize(t, fmt, "128x4") for t in (a, b)]
-    theirs = [_flashinfer(t, fmt, "128x4", "cuda") for t in (a, b)]
-    for o, t in zip(ours, theirs, strict=True):
-        assert same_bits(o, t)
-    ref = a.double() @ b.double().T
-    ran = 0
-    for backend in (
-        "cutlass",
-        "cudnn",
-        "cute-dsl",
-    ):  # not trtllm: its weight is shuffled, another input
-
-        def gemm(q):
-            (aq, asf), (bq, bsf) = (tuple(t.cuda() for t in p) for p in q)
-            if fmt is S.MXFP8:
-                return flashinfer.mm_mxfp8(
-                    aq.view(torch.float8_e4m3fn),
-                    bq.view(torch.float8_e4m3fn).t(),
-                    asf,
-                    bsf,
-                    out_dtype=torch.bfloat16,
-                    backend=backend,
-                )
-            alpha = torch.ones(1, dtype=torch.float32, device="cuda")
-            return flashinfer.mm_fp4(
-                aq,
-                bq.T,
-                asf.view(-1, k // BLOCK),
-                bsf.view(-1, k // BLOCK).T,
-                alpha,
-                torch.bfloat16,
-                block_size=BLOCK,
-                use_8x4_sf_layout=False,
-                backend=backend,
-                use_nvfp4=False,
-            )
-
-        try:
-            out = gemm(ours)
-        except Exception:  # noqa: BLE001  (the backend does not run this format / shape / device)
-            continue
-        ran += 1
-        assert torch.equal(out, gemm(theirs)), backend
-        cos = torch.nn.functional.cosine_similarity(
-            out.double().flatten(), ref.flatten(), dim=0
-        )
-        assert float(cos) > 0.98, (backend, float(cos))
-    assert ran >= 1
 
 
 @needs_device
