@@ -31,6 +31,12 @@ point that validates, selects the backend, and hands off to this package.
   `@flashinfer_experimental_api` function, or passing `backend="<name>"` to a
   stable API. Both warn once (`ExperimentalWarning`).
 - **Never** eagerly import this package from `flashinfer/__init__.py`.
+- Resolve kernel sources through `flashinfer/experimental/_sources.py`
+  (`package_csrc_dir(__file__)` for the package's own `csrc/`,
+  `shared_csrc_dir()` / `shared_include_dirs()` for programs under
+  `csrc/experimental`), never `Path(__file__).parent / "csrc"` or
+  `FLASHINFER_CSRC_DIR` directly: release wheels ship without these sources
+  and users fetch them with `flashinfer download-experimental-sources`.
 - Autotuning inherits the gate because it tunes over the filtered candidate
   list. Trace-apply is out of scope: experimental backends need not support
   trace.

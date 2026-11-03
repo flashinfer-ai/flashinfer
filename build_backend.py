@@ -15,6 +15,7 @@ limitations under the License.
 """
 
 import base64
+import calendar
 import csv
 import hashlib
 import io
@@ -23,6 +24,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tarfile
 import time
 import zipfile
 from contextlib import contextmanager
@@ -1208,7 +1210,12 @@ def build_sdist(sdist_directory, config_settings=None):
 # (flashinfer/experimental/README.md), and PyPI caps flashinfer-python files at
 # 100 MB. The Python modules, build.json manifests and route catalogs stay, so
 # `import flashinfer` is unchanged and an experimental kernel load fails on
-# first use; the marker file below says why and where the sources are.
+# first use; the marker file below says why and where the sources are. The
+# dropped entries are written to `<dist>-<version>-experimental-sources.tar.xz`
+# next to the wheel (release.yml uploads it as a release asset) and the marker
+# records its name and SHA-256, which `flashinfer download-experimental-sources`
+# (flashinfer/experimental/_sources.py) verifies before unpacking it into the
+# user's cache, where the experimental loaders then find the sources.
 _EXPERIMENTAL_SOURCES_FLAG = "FLASHINFER_WHEEL_EXCLUDE_EXPERIMENTAL_SOURCES"
 _EXPERIMENTAL_SOURCES_MARKER = "flashinfer/experimental/KERNEL_SOURCES_EXCLUDED.txt"
 _EXPERIMENTAL_SOURCES_RE = re.compile(
@@ -1228,16 +1235,31 @@ _THIRD_PARTY_KEEP = (
     "flashinfer/data/cccl/libcudacxx/include/",
     "flashinfer/data/cccl/thrust/thrust/",
 )
+# The marker names the tarball of the dropped files and its SHA-256; the two
+# `key: value` lines at the end are what flashinfer.experimental._sources parses.
 _EXPERIMENTAL_SOURCES_MARKER_TEXT = """\
 This wheel was built with FLASHINFER_WHEEL_EXCLUDE_EXPERIMENTAL_SOURCES=1: the
 generated kernel sources of the experimental packages (flashinfer/experimental/*/csrc
 and csrc/experimental) are not included, so that the release wheel stays under
 PyPI's per-file size limit. Experimental APIs import normally but raise when they
-first try to compile a kernel. To use them, install a nightly wheel from
-https://flashinfer.ai/whl or install from source:
-    pip install git+https://github.com/flashinfer-ai/flashinfer.git@<tag>
-See flashinfer/experimental/README.md and flashinfer-ai/flashinfer#7977.
+first try to compile a kernel. The dropped files are in the tarball named below,
+an asset of this version's GitHub release; to use experimental features, fetch,
+verify and unpack it with
+
+    flashinfer download-experimental-sources
+
+(or pass a copy of the tarball with --file on a host without network access; the
+command prints where it unpacks, and `flashinfer show-config` reports the state).
+Nightly wheels from https://flashinfer.ai/whl and source installs
+(pip install git+https://github.com/flashinfer-ai/flashinfer.git@<tag>) include
+the sources. See flashinfer/experimental/README.md and flashinfer-ai/flashinfer#7977.
+
+tarball: {tarball}
+sha256: {sha256}
 """
+# First member of that tarball: `<sha256>  <path>` per file (sha256sum -c format),
+# read by flashinfer.experimental._sources to verify an unpacked tree.
+_EXPERIMENTAL_SOURCES_MANIFEST = "EXPERIMENTAL_SOURCES_MANIFEST.txt"
 
 
 def _wheel_entry_dropped(name: str, exclude_experimental: bool) -> bool:
@@ -1253,6 +1275,52 @@ def _record_hash(data: bytes) -> str:
     return "sha256=" + base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
 
 
+def _experimental_sources_tarball_path(wheel_path: Path) -> Path:
+    """``<dist>-<version>-experimental-sources.tar.xz`` beside the wheel."""
+    distribution, version = wheel_path.name.split("-")[:2]
+    return wheel_path.with_name(f"{distribution}-{version}-experimental-sources.tar.xz")
+
+
+def _write_experimental_sources_tarball(
+    path: Path, entries: list[tuple[zipfile.ZipInfo, bytes]], version: str
+) -> str:
+    """Write the dropped wheel entries to ``path`` and return the file's SHA-256.
+
+    Members keep their wheel paths, so the tarball unpacks to the wheel layout;
+    the manifest comes first. The output is a function of the entries alone
+    (name order, the zip entries' timestamps, fixed mode and ownership), so two
+    builds of one wheel give one tarball.
+    """
+    entries = sorted(entries, key=lambda item: item[0].filename)
+    manifest = io.StringIO()
+    manifest.write(
+        f"# flashinfer-python {version}: experimental kernel sources left out of the release wheel\n"
+    )
+    manifest.write(
+        f"# sha256sum -c {_EXPERIMENTAL_SOURCES_MANIFEST} verifies an unpacked copy\n"
+    )
+    for info, data in entries:
+        manifest.write(f"{hashlib.sha256(data).hexdigest()}  {info.filename}\n")
+    members = [
+        (
+            _EXPERIMENTAL_SOURCES_MANIFEST,
+            manifest.getvalue().encode("utf-8"),
+            entries[0][0].date_time,
+        ),
+        *((info.filename, data, info.date_time) for info, data in entries),
+    ]
+    with tarfile.open(path, "w:xz") as tar:
+        for name, data, date_time in members:
+            member = tarfile.TarInfo(name)
+            member.size = len(data)
+            member.mtime = calendar.timegm((*date_time, 0, 0, 0))
+            member.mode = 0o644
+            member.uid = member.gid = 0
+            member.uname = member.gname = ""
+            tar.addfile(member, io.BytesIO(data))
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
 def _slim_wheel(wheel_path: Path) -> dict[str, int]:
     """Rewrite ``wheel_path`` in place: drop the entries described above and
     re-deflate the rest at level 9, regenerating RECORD. Returns counters."""
@@ -1261,6 +1329,8 @@ def _slim_wheel(wheel_path: Path) -> dict[str, int]:
     stats = {"dropped_entries": 0, "dropped_bytes": 0}
     buf = io.BytesIO()
     record_name = None
+    existing_marker = None
+    experimental: list[tuple[zipfile.ZipInfo, bytes]] = []
     with (
         zipfile.ZipFile(wheel_path) as src,
         zipfile.ZipFile(
@@ -1286,22 +1356,36 @@ def _slim_wheel(wheel_path: Path) -> dict[str, int]:
                 record_info = info
                 continue
             if name == _EXPERIMENTAL_SOURCES_MARKER:
-                # Regenerated below when the flag is set; never duplicated.
+                # Rewritten below when this pass drops sources; kept verbatim when a
+                # second pass finds nothing left to drop (its tarball already exists).
+                existing_marker = src.read(info)
                 continue
             if _wheel_entry_dropped(name, exclude_experimental):
                 stats["dropped_entries"] += 1
                 stats["dropped_bytes"] += info.compress_size
+                if _EXPERIMENTAL_SOURCES_RE.match(name):
+                    experimental.append((info, src.read(info)))
                 continue
             put(info, src.read(info))
         if record_name is None:
             raise RuntimeError(f"{wheel_path} has no .dist-info/RECORD")
-        if exclude_experimental:
+        marker_text = existing_marker
+        if exclude_experimental and experimental:
+            tarball = _experimental_sources_tarball_path(wheel_path)
+            sha256 = _write_experimental_sources_tarball(
+                tarball, experimental, wheel_path.name.split("-")[1]
+            )
+            stats["tarball_bytes"] = tarball.stat().st_size
+            marker_text = _EXPERIMENTAL_SOURCES_MARKER_TEXT.format(
+                tarball=tarball.name, sha256=sha256
+            ).encode("utf-8")
+        if exclude_experimental and marker_text is not None:
             marker = zipfile.ZipInfo(
                 _EXPERIMENTAL_SOURCES_MARKER, date_time=record_info.date_time
             )
             marker.external_attr = record_info.external_attr
             marker.create_system = record_info.create_system
-            put(marker, _EXPERIMENTAL_SOURCES_MARKER_TEXT.encode("utf-8"))
+            put(marker, marker_text)
         text = io.StringIO()
         writer = csv.writer(text, delimiter=",", quotechar='"', lineterminator="\n")
         for row in records:
@@ -1317,7 +1401,13 @@ def _slim_wheel(wheel_path: Path) -> dict[str, int]:
     print(
         f"[flashinfer build] wheel post-processing: {before:,} -> {after:,} bytes; "
         f"dropped {stats['dropped_entries']} entries ({stats['dropped_bytes']:,} compressed bytes); "
-        f"experimental kernel sources {'excluded' if exclude_experimental else 'kept'}",
+        f"experimental kernel sources {'excluded' if exclude_experimental else 'kept'}"
+        + (
+            f"; wrote {_experimental_sources_tarball_path(wheel_path).name} "
+            f"({stats['tarball_bytes']:,} bytes)"
+            if "tarball_bytes" in stats
+            else ""
+        ),
         file=sys.stderr,
     )
     stats["before"] = before

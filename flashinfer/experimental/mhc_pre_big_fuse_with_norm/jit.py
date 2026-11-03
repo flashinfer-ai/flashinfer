@@ -16,9 +16,8 @@ limitations under the License.
 
 # JIT specification of the SM100-family mHC pre big-fuse + RMSNorm cluster kernel.
 
-from pathlib import Path
-
 from ...jit.core import JitSpec, current_compilation_context, gen_jit_spec
+from .._sources import package_csrc_dir
 
 
 def gen_mhc_pre_big_fuse_with_norm_module() -> JitSpec:
@@ -29,10 +28,10 @@ def gen_mhc_pre_big_fuse_with_norm_module() -> JitSpec:
     module is compiled WITHOUT ``-use_fast_math``: fast-math would turn ``expf`` into
     ``__expf``, flush denormals in every fp32 operation and make divisions approximate.
     """
-    root = Path(__file__).resolve().parent
+    csrc = package_csrc_dir(__file__)
     return gen_jit_spec(
         "mhc_pre_big_fuse_with_norm_sm10x",
-        [root / "csrc" / "mhc_pre_big_fuse_with_norm_cluster.cu"],
+        [csrc / "mhc_pre_big_fuse_with_norm_cluster.cu"],
         extra_cuda_cflags=current_compilation_context.get_nvcc_flags_list(
             supported_major_versions=[10],
         ),

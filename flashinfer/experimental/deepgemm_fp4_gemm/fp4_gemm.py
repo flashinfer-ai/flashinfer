@@ -743,16 +743,18 @@ def jit_spec(arch: str, name: str):
     """JIT spec of one shared program compiled with ``arch``'s exact flags (the arch is in the spec name)."""
     from flashinfer.jit import env
     from flashinfer.jit.core import gen_jit_spec
+    from flashinfer.experimental._sources import shared_csrc_dir, shared_include_dirs
 
+    root = shared_csrc_dir()
     record = PROGRAMS[name]
     if arch not in record["arches"]:
         raise RuntimeError(f"program {name} is not exported for {arch}")
     return gen_jit_spec(
         name=f"{name}_{arch}",
-        sources=[env.FLASHINFER_CSRC_DIR / source for source in record["sources"]],
+        sources=[root / source for source in record["sources"]],
         extra_cuda_cflags=[*_nvcc_flags(arch), *record["compile_flags"]],
         extra_ldflags=["-lcuda"],
-        extra_include_paths=[env.FLASHINFER_CSRC_DIR, env.FLASHINFER_INCLUDE_DIR],
+        extra_include_paths=[*shared_include_dirs(), env.FLASHINFER_INCLUDE_DIR],
         use_fast_math=False,
     )
 

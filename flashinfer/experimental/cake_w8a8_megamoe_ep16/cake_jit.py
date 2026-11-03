@@ -35,6 +35,7 @@ from typing import Any
 from ...compilation_context import CompilationContext
 from ...jit import env as jit_env
 from ...jit.core import JitSpec, gen_jit_spec, logger, sm103a_nvcc_flags
+from .._sources import package_csrc_dir
 
 MODULE_PREFIX = "cake_w8a8_megamoe_ep16"
 TARGET_CAPABILITY = (10, 3)
@@ -58,10 +59,12 @@ def default_csrc_dir() -> Path:
     """Directory holding the generated kernels, bindings and manifest.
 
     ``csrc/cake_w8a8_megamoe_ep16/`` beside this module when present, else
-    ``csrc/`` itself (both layouts are shipped as package data).
+    ``csrc/`` itself (both layouts are shipped as package data). A release
+    wheel ships neither; its user fetches them with
+    ``flashinfer download-experimental-sources`` (``flashinfer.experimental._sources``).
     """
 
-    package_sources = Path(__file__).resolve().parent / "csrc"
+    package_sources = package_csrc_dir(__file__)
     nested = package_sources / MODULE_PREFIX
     if nested.is_dir():
         return nested

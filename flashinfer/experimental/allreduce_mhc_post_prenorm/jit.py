@@ -19,11 +19,9 @@ limitations under the License.
 
 from __future__ import annotations
 
-from pathlib import Path
-
 from ...jit.core import JitSpec, current_compilation_context, gen_jit_spec
+from .._sources import package_csrc_dir
 
-_CSRC = Path(__file__).resolve().parent / "csrc"
 _SOURCES = ("allreduce_mhc_post_prenorm_jit_binding.cu",)
 
 
@@ -36,11 +34,12 @@ def gen_allreduce_mhc_post_prenorm_module() -> JitSpec:
     nvcc_flags = current_compilation_context.get_nvcc_flags_list(
         supported_major_versions=[10]
     )
+    csrc = package_csrc_dir(__file__)
     return gen_jit_spec(
         "allreduce_mhc_post_prenorm",
-        [_CSRC / name for name in _SOURCES],
+        [csrc / name for name in _SOURCES],
         extra_cuda_cflags=nvcc_flags,
-        extra_include_paths=[_CSRC],
+        extra_include_paths=[csrc],
         # Numerics-preserving build: no fast math, so every fp32 add and reduction of the
         # epilogue keeps IEEE denormals and rounds like the unfused path (no .ftz in SASS).
         use_fast_math=False,

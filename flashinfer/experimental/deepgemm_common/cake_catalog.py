@@ -292,7 +292,12 @@ class Catalog:
         """
         from flashinfer.jit import env
         from flashinfer.jit.core import gen_jit_spec
+        from flashinfer.experimental._sources import (
+            shared_csrc_dir,
+            shared_include_dirs,
+        )
 
+        root = shared_csrc_dir()
         record = self.program(arch, name)
         definitions = self.definitions(arch, name, definitions or {})
         suffix = "".join(
@@ -300,10 +305,7 @@ class Catalog:
         )
         return gen_jit_spec(
             name=jit_spec_name(name, arch) + suffix,
-            sources=[
-                env.FLASHINFER_CSRC_DIR / p.removeprefix("csrc/")
-                for p in record["sources"]
-            ],
+            sources=[root / p.removeprefix("csrc/") for p in record["sources"]],
             extra_cuda_cflags=[
                 *nvcc_flags(arch),
                 *self.compile_flags(record, arch),
@@ -311,7 +313,7 @@ class Catalog:
                 "--device-entity-has-hidden-visibility=false",
             ],
             extra_ldflags=["-lcuda"],
-            extra_include_paths=[env.FLASHINFER_CSRC_DIR, env.FLASHINFER_INCLUDE_DIR],
+            extra_include_paths=[*shared_include_dirs(), env.FLASHINFER_INCLUDE_DIR],
             use_fast_math=False,  # only the recorded compile flags select math modes
         )
 

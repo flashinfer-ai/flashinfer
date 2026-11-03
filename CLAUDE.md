@@ -22,6 +22,7 @@ FlashInfer is a GPU kernel library for LLM serving that uses **JIT (Just-In-Time
 | Dump environment report (bug reports) | `python -m flashinfer.collect_env` (or `flashinfer collect-env [--json]`) |
 | Install pre-commit hooks | `pre-commit install` |
 | Clear JIT cache | `rm -rf ~/.cache/flashinfer/` |
+| Fetch the experimental kernel sources a PyPI release wheel leaves out | `flashinfer download-experimental-sources` |
 | Inspect devcontainer compiler cache | `sccache --show-stats` |
 | Enable API logging (basic) | `export FLASHINFER_LOGLEVEL=1` |
 | Enable API logging (detailed) | `export FLASHINFER_LOGLEVEL=3` |
@@ -675,7 +676,10 @@ needs no environment variable (both warn once). Only automatic selection is
 gated: `backend="auto"` skips backends marked `@experimental_backend` unless
 `FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS=1`. Experimental code is JIT-only
 (never registered in `flashinfer/aot.py`) and tested under
-`tests/experimental/`.
+`tests/experimental/`. Release wheels ship without the experimental kernel
+sources, so every experimental loader resolves them through
+`flashinfer/experimental/_sources.py` (`package_csrc_dir`, `shared_csrc_dir`);
+`flashinfer download-experimental-sources` fetches them for release-wheel users.
 
 → **When working under `flashinfer/experimental/`, follow
 [`flashinfer/experimental/CLAUDE.md`](flashinfer/experimental/CLAUDE.md); the
@@ -862,7 +866,8 @@ match what the code uses today; values are strings unless noted.
 | `FLASHINFER_CAKE_LM_HEAD_LOSS_BINDING_CACHE` | `1` | `flashinfer/chunked_lm_head.py` | Read once when `flashinfer.chunked_lm_head` is imported and applied through `cake_backend.BINDING_CACHE.configure` when the wrapper first reaches the backend (the first call of either entry point; the non-deterministic package `flashinfer.experimental.cake.cake_lm_head_loss` gets the same settings on its first `deterministic=False` call): `0` disables the per-process LRU cache of compiled bindings. Direct users of the package call `configure` themselves. |
 | `FLASHINFER_CAKE_LM_HEAD_LOSS_BINDING_CACHE_CAPACITY` | `64` | `flashinfer/chunked_lm_head.py` | Capacity of that binding cache, read once at the same import (a value that is not a positive integer raises `ValueError`; unset or blank keeps the default) and applied through `configure` on the same first use. |
 | `FLASHINFER_JIT_CACHE_PROVIDER_ARCHS` | required | `flashinfer-jit-cache/build_backend.py` | Space-separated provider architectures added to a shim wheel's exact `Requires-Dist` metadata. |
-| `FLASHINFER_WHEEL_EXCLUDE_EXPERIMENTAL_SOURCES` | unset | `build_backend.py` (`_slim_wheel`) | `1` leaves the experimental packages' generated kernel sources (`flashinfer/experimental/*/csrc/**`, `csrc/experimental/**`) out of the built `flashinfer-python` wheel and adds `flashinfer/experimental/KERNEL_SOURCES_EXCLUDED.txt`; the release workflow sets it so the PyPI wheel stays under PyPI's 100 MB file limit (#7977). Nightlies and source installs keep the sources. Experimental APIs still import; their first kernel load raises. Independent of the flag, every built wheel is re-deflated at level 9 and the vendored 3rdparty trees outside the header directories are dropped. |
+| `FLASHINFER_WHEEL_EXCLUDE_EXPERIMENTAL_SOURCES` | unset | `build_backend.py` (`_slim_wheel`) | `1` leaves the experimental packages' generated kernel sources (`flashinfer/experimental/*/csrc/**`, `csrc/experimental/**`) out of the built `flashinfer-python` wheel, writes them to `<dist>-<version>-experimental-sources.tar.xz` beside the wheel (first member `EXPERIMENTAL_SOURCES_MANIFEST.txt`, `sha256sum -c` format) and adds `flashinfer/experimental/KERNEL_SOURCES_EXCLUDED.txt`, whose `tarball:` / `sha256:` lines pin that file; the release workflow sets it so the PyPI wheel stays under PyPI's 100 MB file limit (#7977) and uploads the tarball as a release asset. Nightlies and source installs keep the sources. Experimental APIs still import; their first kernel load raises `ExperimentalSourcesNotFound` until `flashinfer download-experimental-sources` has unpacked the tarball. Independent of the flag, every built wheel is re-deflated at level 9 and the vendored 3rdparty trees outside the header directories are dropped. |
+| `FLASHINFER_EXPERIMENTAL_SOURCES_DIR` | `FLASHINFER_CACHE_DIR/experimental-sources/<version>` | `flashinfer/experimental/_sources.py` | Directory holding the unpacked experimental-sources tarball of a release wheel: where `flashinfer download-experimental-sources` unpacks and where the experimental loaders look when a package's own `csrc/` (or `csrc/experimental/`) is absent. The default is version-keyed inside the cache (`FLASHINFER_WORKSPACE_BASE` moves it with the rest); set this only to serve the sources from another place, such as a shared read-only mount an administrator unpacked by hand (`tar -xJf <tarball> -C <dir>`), while JIT outputs stay node-local. |
 | `FLASHINFER_JIT_CACHE_PROVIDER_ARCH` | required | `flashinfer-jit-cache-provider/package_config.py` | Select exactly one architecture, such as `9.0a` or `sm120f`, when building a binary provider wheel. |
 
 Release/nightly JIT-cache provider builds run sccache in server-side mode and
@@ -1102,7 +1107,7 @@ for every provider and its shim when producing CUDA-specific or nightly wheels.
   - `csrc` → `flashinfer/data/csrc`
   - `include` → `flashinfer/data/include`
 - **Version**: Generated in `flashinfer/_build_meta.py` from `version.txt`
-- **Wheel post-processing**: `build_backend.build_wheel` rewrites the finished wheel (`_slim_wheel`): level-9 deflate, the vendored 3rdparty Python trees that `packages.find` sweeps in are dropped, and with `FLASHINFER_WHEEL_EXCLUDE_EXPERIMENTAL_SOURCES=1` (release workflow only) the experimental kernel sources are left out; RECORD is regenerated. Covered by `tests/cpu/test_build_backend_slim_wheel.py`.
+- **Wheel post-processing**: `build_backend.build_wheel` rewrites the finished wheel (`_slim_wheel`): level-9 deflate, the vendored 3rdparty Python trees that `packages.find` sweeps in are dropped, and with `FLASHINFER_WHEEL_EXCLUDE_EXPERIMENTAL_SOURCES=1` (release workflow only) the experimental kernel sources are left out and written to `<dist>-<version>-experimental-sources.tar.xz` beside the wheel, pinned by name and SHA-256 in the wheel's `flashinfer/experimental/KERNEL_SOURCES_EXCLUDED.txt`; RECORD is regenerated. Covered by `tests/cpu/test_build_backend_slim_wheel.py` and `tests/cpu/test_experimental_sources.py`.
 
 ## External Integrations
 

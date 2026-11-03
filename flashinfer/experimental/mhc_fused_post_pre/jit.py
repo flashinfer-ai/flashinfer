@@ -16,11 +16,8 @@ limitations under the License.
 
 # JIT specification of the fused mHC post -> pre (+ input RMSNorm) SM103 kernels.
 
-from pathlib import Path
-
 from ...jit.core import JitSpec, gen_jit_spec, sm103a_nvcc_flags
-
-_CSRC_DIR = Path(__file__).resolve().parent / "csrc"
+from .._sources import package_csrc_dir
 
 
 def gen_mhc_fused_post_pre_module() -> JitSpec:
@@ -30,14 +27,15 @@ def gen_mhc_fused_post_pre_module() -> JitSpec:
     argument, and the regime kernels (decode, stream, short-stream, crossover,
     long-stream) are all compiled into it.
     """
+    csrc = package_csrc_dir(__file__)
     return gen_jit_spec(
         "mhc_fused_post_pre_sm103",
         [
-            _CSRC_DIR / "mhc_fused_post_pre.cu",
-            _CSRC_DIR / "mhc_fused_post_pre_decode_stream.cu",
-            _CSRC_DIR / "mhc_fused_post_pre_short_stream.cu",
-            _CSRC_DIR / "mhc_fused_post_pre_crossover.cu",
-            _CSRC_DIR / "mhc_fused_post_pre_long_stream.cu",
+            csrc / "mhc_fused_post_pre.cu",
+            csrc / "mhc_fused_post_pre_decode_stream.cu",
+            csrc / "mhc_fused_post_pre_short_stream.cu",
+            csrc / "mhc_fused_post_pre_crossover.cu",
+            csrc / "mhc_fused_post_pre_long_stream.cu",
         ],
         # Thread-block clusters of 16 CTAs, TMA, setmaxnreg and packed f32x2 FMA:
         # architecture-specific SM103 code only.

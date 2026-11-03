@@ -1175,3 +1175,48 @@ def test_export_compile_commands_no_modules(monkeypatch, tmp_path):
     assert "No modules found" in out
     # File should not be created when no modules exist
     assert not output_file.exists()
+
+
+def test_download_experimental_sources_cmd_mocked(monkeypatch, tmp_path):
+    """The command hands its options to flashinfer.experimental._sources and reports the result."""
+    from flashinfer.experimental import _sources
+
+    calls = {}
+
+    def fake_install(**kwargs):
+        calls.update(kwargs)
+        return _sources.InstallResult(
+            tmp_path / "root", 3, "https://example.invalid/x.tar.xz"
+        )
+
+    monkeypatch.setattr(_sources, "install_sources", fake_install)
+    out = _test_cmd_helper(["download-experimental-sources", "--force"])
+    _assert_output_contains_all(
+        out, "Installed 3 experimental kernel source files", str(tmp_path / "root")
+    )
+    assert calls["force"] is True
+    assert calls["tarball"] is None and calls["url"] is None
+
+    def already(**kwargs):
+        return _sources.InstallResult(
+            tmp_path / "root", 3, str(tmp_path / "root"), already_installed=True
+        )
+
+    monkeypatch.setattr(_sources, "install_sources", already)
+    out = _test_cmd_helper(["download-experimental-sources"])
+    _assert_output_contains_all(out, "already installed", "--force")
+
+
+def test_download_experimental_sources_cmd_reports_errors(monkeypatch):
+    from click.testing import CliRunner
+
+    from flashinfer.__main__ import cli
+    from flashinfer.experimental import _sources
+
+    def fail(**kwargs):
+        raise _sources.SourcesError("the installed wheel ships its sources")
+
+    monkeypatch.setattr(_sources, "install_sources", fail)
+    result = CliRunner().invoke(cli, ["download-experimental-sources"])
+    assert result.exit_code != 0
+    assert "the installed wheel ships its sources" in result.output

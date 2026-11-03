@@ -23,6 +23,7 @@ from typing import Any
 
 from ...jit import env as jit_env
 from ...jit.core import gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
+from .._sources import package_csrc_dir
 
 # Explicit target-owned registration of the generated programs of the
 # Kimi-K3 TP12 fused LatentMoE communication tail (SM100 / SM103, twelve
@@ -561,7 +562,7 @@ def _header_dirs():
 @functools.cache
 def gen_cake_kimi_k3_tp12_tail_module(name: str):
     record = MODULES[name]
-    root = Path(__file__).resolve().parent / "csrc"
+    root = package_csrc_dir(__file__)
     sources = [root / relative for relative in record["sources"]]
     return gen_jit_spec(
         name=f"{name}_" + record["closure_sha256"][:20],

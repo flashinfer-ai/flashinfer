@@ -2369,7 +2369,9 @@ def load_program(name, arch, num_sms, defines):
         sm103a_nvcc_flags,
         sm107a_nvcc_flags,
     )
+    from flashinfer.experimental._sources import shared_csrc_dir, shared_include_dirs
 
+    root = shared_csrc_dir()
     record = PROGRAMS[name]
     arch_flags = {
         "sm_100a": sm100a_nvcc_flags,
@@ -2383,10 +2385,7 @@ def load_program(name, arch, num_sms, defines):
         name="_".join(
             [name, arch, *(f"{key.lower()}{value}" for key, value in values)]
         ),
-        sources=[
-            env.FLASHINFER_CSRC_DIR / path.removeprefix("csrc/")
-            for path in record["sources"]
-        ],
+        sources=[root / path.removeprefix("csrc/") for path in record["sources"]],
         extra_cuda_cflags=[
             *arch_flags,
             *record_compile_flags(record),
@@ -2396,8 +2395,8 @@ def load_program(name, arch, num_sms, defines):
         ],
         extra_ldflags=["-lcuda"],
         extra_include_paths=[
-            env.FLASHINFER_CSRC_DIR / GENERATED_ROOT.removeprefix("csrc/"),
-            env.FLASHINFER_CSRC_DIR,
+            root / GENERATED_ROOT.removeprefix("csrc/"),
+            *shared_include_dirs(),
             env.FLASHINFER_INCLUDE_DIR,
         ],
         use_fast_math=False,

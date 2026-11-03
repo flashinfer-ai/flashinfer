@@ -1,6 +1,8 @@
 """The wheel post-processing of build_backend: level-9 re-deflate, dropping the
 vendored 3rdparty Python trees, and the release-only exclusion of experimental
-kernel sources (flashinfer-ai/flashinfer#7977)."""
+kernel sources (flashinfer-ai/flashinfer#7977) into a tarball beside the wheel
+that `flashinfer download-experimental-sources` fetches (its install side is
+covered by tests/cpu/test_experimental_sources.py)."""
 
 import base64
 import csv
@@ -8,6 +10,7 @@ import hashlib
 import importlib.util
 import io
 import sys
+import tarfile
 import zipfile
 from pathlib import Path
 
@@ -60,11 +63,22 @@ def _record_hash(data: bytes) -> str:
     )
 
 
-def _write_wheel(path: Path) -> None:
+# The experimental entries the release switch drops (and writes to the tarball).
+EXPERIMENTAL = sorted(
+    n
+    for n in FILES
+    if n.startswith(
+        ("flashinfer/experimental/foo/csrc/", "flashinfer/data/csrc/experimental/")
+    )
+)
+TARBALL_NAME = "flashinfer_python-0.0.0-experimental-sources.tar.xz"
+
+
+def _write_wheel(path: Path, date_time=(2026, 1, 2, 3, 4, 6)) -> None:
     with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         rows = []
         for name, data in FILES.items():
-            zf.writestr(name, data)
+            zf.writestr(zipfile.ZipInfo(name, date_time=date_time), data)
             rows.append((name, _record_hash(data), str(len(data))))
         rows.append((f"{DIST_INFO}/RECORD", "", ""))
         text = io.StringIO()
@@ -129,6 +143,8 @@ def test_default_keeps_kernel_sources_and_drops_vendored_python(
     assert "flashinfer/data/csrc/norm/rmsnorm.cu" in names
     assert build_backend._EXPERIMENTAL_SOURCES_MARKER not in names
     assert stats["dropped_entries"] == 3
+    # and no tarball of excluded sources is written
+    assert not list(tmp_path.glob("*experimental-sources*"))
     # every entry is deflated and the content is unchanged
     for name, info in _entries(wheel).items():
         assert info.compress_type == zipfile.ZIP_DEFLATED, name
@@ -163,8 +179,33 @@ def test_release_switch_drops_experimental_kernel_sources(
     assert (
         build_backend._EXPERIMENTAL_SOURCES_FLAG in marker
         and "flashinfer.ai/whl" in marker
+        and "flashinfer download-experimental-sources" in marker
     )
     assert stats["dropped_entries"] == 6
+    # the dropped experimental entries (not the 3rdparty ones) went to a tarball
+    # beside the wheel, which the marker pins by name and SHA-256
+    tarball = tmp_path / TARBALL_NAME
+    assert tarball.is_file()
+    assert stats["tarball_bytes"] == tarball.stat().st_size
+    assert f"tarball: {TARBALL_NAME}\n" in marker
+    assert f"sha256: {hashlib.sha256(tarball.read_bytes()).hexdigest()}\n" in marker
+    with tarfile.open(tarball, "r:xz") as tar:
+        members = tar.getmembers()
+        assert [m.name for m in members] == [
+            build_backend._EXPERIMENTAL_SOURCES_MANIFEST,
+            *EXPERIMENTAL,
+        ]
+        for m in members:
+            assert m.isfile() and (m.mode, m.uid, m.gid) == (0o644, 0, 0), m.name
+        for name in EXPERIMENTAL:
+            assert tar.extractfile(name).read() == FILES[name]
+        manifest = tar.extractfile(build_backend._EXPERIMENTAL_SOURCES_MANIFEST).read()
+    lines = [
+        line for line in manifest.decode().splitlines() if not line.startswith("#")
+    ]
+    assert lines == [
+        f"{hashlib.sha256(FILES[n]).hexdigest()}  {n}" for n in EXPERIMENTAL
+    ]
 
 
 def test_slimming_is_idempotent(tmp_path, monkeypatch, build_backend):
@@ -173,12 +214,36 @@ def test_slimming_is_idempotent(tmp_path, monkeypatch, build_backend):
     _write_wheel(wheel)
     build_backend._slim_wheel(wheel)
     first = wheel.read_bytes()
+    tarball = tmp_path / TARBALL_NAME
+    first_tarball = tarball.read_bytes()
     second_stats = build_backend._slim_wheel(wheel)
     assert second_stats["dropped_entries"] == 0
+    assert "tarball_bytes" not in second_stats
     with zipfile.ZipFile(io.BytesIO(first)) as zf:
         first_names = set(zf.namelist())
+        first_marker = zf.read(build_backend._EXPERIMENTAL_SOURCES_MARKER)
     assert set(_entries(wheel)) == first_names
     _check_record(wheel)
+    # the second pass has nothing to put in a tarball: the marker and the tarball
+    # of the first pass are kept as they are
+    with zipfile.ZipFile(wheel) as zf:
+        assert zf.read(build_backend._EXPERIMENTAL_SOURCES_MARKER) == first_marker
+    assert tarball.read_bytes() == first_tarball
+
+
+def test_tarball_is_a_function_of_the_dropped_entries(
+    tmp_path, monkeypatch, build_backend
+):
+    monkeypatch.setenv(build_backend._EXPERIMENTAL_SOURCES_FLAG, "1")
+    tarballs = []
+    for build in ("one", "two"):
+        directory = tmp_path / build
+        directory.mkdir()
+        wheel = directory / "flashinfer_python-0.0.0-py3-none-any.whl"
+        _write_wheel(wheel)
+        build_backend._slim_wheel(wheel)
+        tarballs.append((directory / TARBALL_NAME).read_bytes())
+    assert tarballs[0] == tarballs[1]
 
 
 def test_entry_rules(build_backend):
