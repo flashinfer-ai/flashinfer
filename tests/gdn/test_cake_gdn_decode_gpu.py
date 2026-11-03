@@ -966,9 +966,10 @@ def _launch_bf16_serving(
     )
 
 
-# B 1 / 31: small band (mid4 on sm_107a); 32 .. 64: the large band (the TMA-state
-# hqsplit_tma3 body on sm_107a, the large body elsewhere).
-@pytest.mark.parametrize("batch_size", [1, 31, 32, 34, 35, 37, 64])
+# B 1 / 20: small band (mid4 on sm_107a); 21 / 31: the upper small band (the TMA-state
+# hqsplit_tma3 body on sm_107a, the small body elsewhere); 32 .. 64: the large band (the
+# TMA-state hqsplit_tma3 body on sm_107a, the large body elsewhere).
+@pytest.mark.parametrize("batch_size", [1, 20, 21, 31, 32, 34, 35, 37, 64])
 def test_exported_decode_matches_torch_on_caller_stream(batch_size: int) -> None:
     tensors = _make_inputs(batch_size)
     initial_state = tensors["state"].clone()
@@ -1090,13 +1091,14 @@ def test_tma_state_decode_refuses_a_misaligned_state_before_launch() -> None:
     torch.testing.assert_close(tensors["state"], expected_state, atol=1e-3, rtol=1e-3)
 
 
-# B 32: formerly the tilev32_x2 twin; B 64: formerly the hqsplit twin.
+# B 21: formerly the mid4_rc_kq128 twin; B 32: formerly the tilev32_x2 twin; B 64:
+# formerly the hqsplit twin.
 @pytest.mark.parametrize("backend", ["cake_gdn", "auto"])
-@pytest.mark.parametrize("batch_size", [32, 64])
+@pytest.mark.parametrize("batch_size", [21, 32, 64])
 def test_public_decode_refuses_a_misaligned_state_and_runs_an_aligned_one_on_tma(
     batch_size: int, backend: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # No sm_107a large-band record runs a state whose base is not 16-byte aligned: the
+    # No sm_107a record from 21 rows on runs a state whose base is not 16-byte aligned: the
     # pointer twins it replaces move the state with 16-byte vector loads and stores (a
     # misaligned-address fault), and the TMA-state record needs an aligned tensor-map
     # base.  Through the public API the misaligned call is refused before launch with
@@ -1689,7 +1691,7 @@ def test_public_cake_gdn_fp32_mtp_verify_is_cuda_graph_safe():
     )
 
 
-@pytest.mark.parametrize("batch_size", (1, 32))
+@pytest.mark.parametrize("batch_size", (1, 24, 32))
 def test_public_cake_gdn_fp32_nontranspose_t1_matches_independent_recurrence_on_stream(
     batch_size,
 ):

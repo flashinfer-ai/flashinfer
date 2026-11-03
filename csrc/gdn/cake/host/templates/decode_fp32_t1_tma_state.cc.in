@@ -110,7 +110,7 @@ void Run(TensorView arg_q, TensorView arg_k, TensorView arg_v, TensorView arg_st
       << "out shape does not match the frozen FlashInfer GDN non-CP launch contract";
   TVM_FFI_CHECK(arg_state.ndim() == 4 && arg_state.size(0) == arg_q.size(0) && arg_state.size(1) == @HV@LL && arg_state.size(2) == 128LL && arg_state.size(3) == 128LL, ValueError)
       << "state shape does not match the frozen FlashInfer GDN non-CP launch contract";
-  TVM_FFI_CHECK(arg_q.size(0) > 0 && arg_q.size(0) >= 32 && grid_y == 1 && grid_z == 1 && grid_x == arg_q.size(0) * @CTAS_PER_BATCH_ROW@LL, ValueError)
+  TVM_FFI_CHECK(arg_q.size(0) > 0 && grid_y == 1 && grid_z == 1 && grid_x == arg_q.size(0) * @CTAS_PER_BATCH_ROW@LL, ValueError)
       << "nontranspose decode grid does not match batch and state heads";
   TVM_FFI_CHECK(arg_A_log.ndim() == 1 && arg_A_log.size(0) == @HV@LL && arg_dt_bias.ndim() == 1 && arg_dt_bias.size(0) == @HV@LL, ValueError)
       << "A_log/dt_bias shapes do not match num_v_heads";
