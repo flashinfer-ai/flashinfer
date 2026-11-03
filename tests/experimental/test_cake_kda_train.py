@@ -414,9 +414,12 @@ RECORD_ARCHES = {
     "dqkg_int_davq": ("sm_103a",),
 }
 # The deterministic package's records no cell of this package launches: the sm_107a rows from 16 heads (the only
-# rows of the builds with the L2 hints off) run the S1 pair on every backward path, and the raw forget-gate class
+# rows of the builds with the L2 hints off) run the S1 pair on every backward path, the raw forget-gate class
 # (gate "raw": the forward intra, backward prep and GLM intra programs that read the raw gate, and the backward's
-# A_log / dt_bias gradient finalize) runs only under use_gate_in_kernel=True, which this package refuses.
+# A_log / dt_bias gradient finalize) runs only under use_gate_in_kernel=True, and the in-kernel Q/K L2 norm's
+# records (#7817: its fused class, 7 g records with their 7 raw twins and the sm_103a forward intra form, the 2
+# GLM intra capture forms and the 3 programs of its fallback route) run only under use_qk_l2norm_in_kernel=True;
+# this package refuses both modes.
 DET_RECORDS_NOT_LAUNCHED = frozenset(
     (
         "dqkg_davq_nohint",
@@ -429,6 +432,26 @@ DET_RECORDS_NOT_LAUNCHED = frozenset(
         "bwd_prep_g8_noqg_nokb_raw",
         "glm_intra_raw",
         "param_finalize",
+        "fwd_intra_l2n",
+        "fwd_intra_v14_l2n",
+        "fwd_intra_v37_l2n",
+        "bwd_prep_g8_l2n",
+        "bwd_prep_g8_replay_l2n",
+        "bwd_prep_g8_noqg_l2n",
+        "bwd_prep_g8_noqg_nokb_l2n",
+        "glm_intra_l2n",
+        "fwd_intra_raw_l2n",
+        "fwd_intra_v14_raw_l2n",
+        "bwd_prep_g8_raw_l2n",
+        "bwd_prep_g8_replay_raw_l2n",
+        "bwd_prep_g8_noqg_raw_l2n",
+        "bwd_prep_g8_noqg_nokb_raw_l2n",
+        "glm_intra_raw_l2n",
+        "glm_intra_l2n_capture",
+        "glm_intra_raw_l2n_capture",
+        "qk_l2norm",
+        "qk_l2norm_apply",
+        "qk_pullback",
     )
 )
 # The checkpoint hand-off's intra twins, intra record -> twin: new programs that also write every gk row and the
@@ -441,10 +464,10 @@ TAPE_TWINS = {"wy_bwd": "wy_bwd_v9"}
 TAPE_WY_RECORDS = frozenset(TAPE_TWINS.values())
 # The logical names of the WY record's parameters the twin does not take: u and the operands only u reads.
 TAPE_WY_DROPPED = frozenset({"v", "beta", "u"})
-# The registry's size: the deterministic package's 75 records, less those, plus the seven S1 records, the hand-off
+# The registry's size: the deterministic package's 95 records, less those, plus the seven S1 records, the hand-off
 # twins and the tape WY twin.
 MODULE_COUNT = (
-    75 - len(DET_RECORDS_NOT_LAUNCHED) + 7 + len(TWIN_RECORDS) + len(TAPE_WY_RECORDS)
+    95 - len(DET_RECORDS_NOT_LAUNCHED) + 7 + len(TWIN_RECORDS) + len(TAPE_WY_RECORDS)
 )
 # The records of the segmented adjoint recurrence launch twice per stage (the carry between the passes); the
 # forward recurrence's passes are two stages (fwdh, fwdh_p3).
@@ -2606,14 +2629,19 @@ def test_saved_set_version_4_fields_and_the_autograd_extras() -> None:
         "u",
         "gate",
         "lower_bound",
+        "qk_rstd",
+        "qk_l2norm",
         "deterministic",
     ]
-    for name in ("h", "v_new", "seg_m", "hseg", "seg_state", "qg", "w", "u"):
+    for name in ("h", "v_new", "seg_m", "hseg", "seg_state", "qg", "w", "u", "qk_rstd"):
         assert KdaChunkSaved.__dataclass_fields__[name].default is None, name
     # the deterministic package's gate-mode fields (#7816), at its defaults: this package's forward writes the
     # explicit gate and its backward refuses a raw-mode set
     assert KdaChunkSaved.__dataclass_fields__["gate"].default == "g"
     assert KdaChunkSaved.__dataclass_fields__["lower_bound"].default is None
+    # the deterministic package's in-kernel Q/K L2 norm fields (#7817), at its defaults: this package's forward
+    # writes no reciprocal norms and the mode off, and its backward refuses a set with the mode on
+    assert KdaChunkSaved.__dataclass_fields__["qk_l2norm"].default is False
     # the mode of the forward that wrote the set: this package's forward writes False (the deterministic package's
     # sets have the same format, and the backward reads either)
     assert KdaChunkSaved.__dataclass_fields__["deterministic"].default is False
