@@ -163,8 +163,20 @@ class Sm107BlockScaledMoeConfig:
 
     kernel_variant: Literal["inference", "genphase"] = "inference"
     combine_dtype: Literal["bf16", "nvfp4", "mxfp8"] = "bf16"
+    shared_quant_kind: Literal["mxfp8_e4m3"] | None = None
 
     def __post_init__(self) -> None:
+        if self.shared_quant_kind is not None:
+            if (
+                self.shared_quant_kind != "mxfp8_e4m3"
+                or self.quant_kind != "mxfp4_mxfp8"
+                or self.combine_dtype != "bf16"
+                or self.reduce_topk_in_kernel
+                or self.activation != "swiglu"
+            ):
+                raise ValueError(
+                    "Shared experts require MXFP4/MXFP8, SwiGLU, separate BF16 combine."
+                )
         if self.quant_kind not in _KIND_TABLE:
             raise ValueError(f"unsupported quant_kind {self.quant_kind!r}.")
         if self.kernel_variant not in ("inference", "genphase"):
@@ -528,6 +540,7 @@ class Sm107BlockScaledSymmBuffer:
         if self.topk_idx.data_ptr() % 16 != 0:
             raise RuntimeError("routing index tensor must be 16-byte aligned.")
 
+        self._launch_key: Optional[tuple] = None
         self._allocate_execution_state()
         self._staged_tokens: Optional[int] = None
         self._destroyed = False
@@ -536,6 +549,36 @@ class Sm107BlockScaledSymmBuffer:
         self._routing_checks: dict[tuple, Any] = {}
         # Missing scalar bindings use the workspace's own tensors.
         self._bound_scalars: dict = {}
+        self._shared_weights: (
+            tuple[TransformedBlockScaledWeights, TransformedBlockScaledWeights] | None
+        ) = None
+
+    def bind_shared_weights(self, weights) -> None:
+        """Retain one prepared local shared expert across launches and tuning."""
+        if self.config.shared_quant_kind is None:
+            raise ValueError("This workspace does not enable a shared expert")
+        if weights is self._shared_weights:
+            return
+        from dataclasses import replace
+
+        cfg = replace(
+            self.config,
+            quant_kind="mxfp8_e4m3",
+            shared_quant_kind=None,
+            num_total_experts=1,
+            num_topk=1,
+            rank=0,
+            world_size=1,
+        )
+        fc1_shape, fc2_shape, fc1_sf, fc2_sf = _expected_weight_shapes(cfg)
+        _validate_weight_leg(
+            "shared fc1", weights[0], fc1_shape, fc1_sf, cfg, self.device
+        )
+        _validate_weight_leg(
+            "shared fc2", weights[1], fc2_shape, fc2_sf, cfg, self.device
+        )
+        self._shared_weights = weights
+        self._launch_key = None
 
     def _allocate_execution_state(self) -> None:
         """Allocate reduction buffers and scratch, then reset cached bindings.
@@ -600,7 +643,7 @@ class Sm107BlockScaledSymmBuffer:
         self._peer_offsets = peer_offsets
 
         self._compiled: Optional[Any] = None
-        self._launch_key: Optional[tuple] = None
+        self._launch_key = None
         self._launch_kwargs: Optional[dict] = None
         self._launch_weights: Optional[
             Tuple[TransformedBlockScaledWeights, TransformedBlockScaledWeights]
@@ -678,6 +721,11 @@ class Sm107BlockScaledSymmBuffer:
                 "topk_index_dtype": cutlass.Int32,
                 "max_tokens_per_rank": cfg.padded_tokens_per_rank,
                 "apply_topk_at_fc1": cfg.apply_routing_weights_before_fc2,
+                **(
+                    {"shared_quant_kind": cfg.shared_quant_kind}
+                    if cfg.shared_quant_kind
+                    else {}
+                ),
             }
         )
         impl_fields = {
@@ -781,6 +829,15 @@ class Sm107BlockScaledSymmBuffer:
             "shared_workspace": _to_cute_ptr(self.shared_workspace),
             "peer_rank_ptr_mapper_host": self._peer_mapper(),
             "stream": _cu_stream(stream),
+            **(
+                {
+                    "shared_weights": tuple(
+                        _to_cute(t) for pair in self._shared_weights for t in pair
+                    )
+                }
+                if self._shared_weights is not None
+                else {}
+            ),
             **{
                 name: _to_cute(self._scalar_tensor(name), assumed_align=4)
                 for name in _SCALAR_NAMES
@@ -800,10 +857,16 @@ class Sm107BlockScaledSymmBuffer:
 
         if self._destroyed:
             raise RuntimeError("cannot launch a destroyed SM107 workspace.")
+        if self.config.shared_quant_kind and self._shared_weights is None:
+            raise ValueError("Bind prepared shared weights before launching")
         if output is not None and (
             self.config.reduce_topk_in_kernel
             or output.ndim != 2
-            or not (0 < output.shape[0] <= self.config.max_tokens_per_rank)
+            or not (
+                (0 if self.config.shared_quant_kind else 1)
+                <= output.shape[0]
+                <= self.config.max_tokens_per_rank
+            )
             or output.shape[1] != self.config.hidden
             or output.dtype != torch.bfloat16
             or output.device != self.device
@@ -826,6 +889,11 @@ class Sm107BlockScaledSymmBuffer:
             transformed_l1[1].data_ptr(),
             transformed_l2[0].data_ptr(),
             transformed_l2[1].data_ptr(),
+            *(
+                (tensor.data_ptr() for pair in self._shared_weights for tensor in pair)
+                if self._shared_weights is not None
+                else ()
+            ),
             # Bound per-call scalars: a new tensor re-binds the launch arguments
             # (host-only, no recompile).
             *(
@@ -866,6 +934,11 @@ class Sm107BlockScaledSymmBuffer:
         """Compile on first use, then launch the fused mega kernel."""
         if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
             self._tuning_state.graph_captured = True
+        if self.config.shared_quant_kind and output is None:
+            live = self.staged_tokens()
+            if live is None:
+                raise ValueError("Stage live tokens before a shared-expert launch")
+            output = self.output_activation[:live]
         self.prepare(transformed_l1, transformed_l2, output=output)
         if self.config.reduce_topk_in_kernel:
             # red.add accumulation base: zero the output every launch.
@@ -940,6 +1013,7 @@ class Sm107BlockScaledSymmBuffer:
         self._routing_checks.clear()
         self._tuning_inputs = None
         self._bound_scalars = {}
+        self._shared_weights = None
         for name in ("x", "x_sf", "topk_weights"):
             comm.free_sym_tensor(getattr(self, name, None))
             setattr(self, name, None)
@@ -966,6 +1040,7 @@ def get_symm_buffer_for_sm107_block_scaled_mega_moe(
     quant_kind: Sm107QuantKind = "mxfp8_e4m3",
     kernel_variant: Literal["inference", "genphase"] = "inference",
     combine_dtype: Literal["bf16", "nvfp4", "mxfp8"] = "bf16",
+    shared_quant_kind: Literal["mxfp8_e4m3"] | None = None,
     mma_tiler_mnk: Optional[Tuple[int, int, int]] = None,
     cluster_shape_mn: Tuple[int, int] = (2, 1),
     fallback_cluster_shape_mn: Optional[Tuple[int, int]] = None,
@@ -1003,6 +1078,7 @@ def get_symm_buffer_for_sm107_block_scaled_mega_moe(
         quant_kind=quant_kind,
         kernel_variant=kernel_variant,
         combine_dtype=combine_dtype,
+        shared_quant_kind=shared_quant_kind,
         mma_tiler_mnk=mma_tiler_mnk,
         cluster_shape_mn=cluster_shape_mn,
         fallback_cluster_shape_mn=fallback_cluster_shape_mn,
@@ -1138,6 +1214,18 @@ def sm107_block_scaled_mega_moe(
     _validate_weight_leg(
         "fc2", transformed_l2, fc2_shape, fc2_sf, cfg, symm_buffer.device
     )
+
+    if cfg.shared_quant_kind:
+        direct = y is not None and y.is_contiguous() and y.data_ptr() % 16 == 0
+        target = (
+            y[:num_tokens] if direct else symm_buffer.output_activation[:num_tokens]
+        )
+        symm_buffer.launch(transformed_l1, transformed_l2, output=target)
+        if y is not None and not direct:
+            y[:num_tokens].copy_(target)
+        if sync:
+            torch.cuda.synchronize()
+        return target if y is None else None
 
     if (
         y is not None

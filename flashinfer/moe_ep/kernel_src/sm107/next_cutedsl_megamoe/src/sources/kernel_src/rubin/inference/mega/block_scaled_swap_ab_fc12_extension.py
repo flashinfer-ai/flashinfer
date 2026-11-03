@@ -35,6 +35,9 @@ class BlockScaledSwapAbFc12Extension:
     # Which expert holds each slot the scheduler enumerates. Absent when the
     # scheduler walks experts directly, in which case a slot is an expert.
     expert_remap: Optional[cute.Tensor] = None
+    shared_expert_idx: Optional[int] = None
+    shared_counter_offset: int = 0
+    shared_ready_counter_pointer: Optional[Pointer] = None
 
     def __post_init__(self) -> None:
         if self.sf_vec_size <= 0:
@@ -49,6 +52,8 @@ class BlockScaledSwapAbFc12Extension:
             values.extend(extract_mlir_values(self.fc1_ready_counter_pointer))
         if self.expert_remap is not None:
             values.extend(extract_mlir_values(self.expert_remap))
+        if self.shared_ready_counter_pointer is not None:
+            values.extend(extract_mlir_values(self.shared_ready_counter_pointer))
         return values
 
     def __new_from_mlir_values__(self, values: List[ir.Value]) -> "BlockScaledSwapAbFc12Extension":
@@ -67,6 +72,9 @@ class BlockScaledSwapAbFc12Extension:
             rebuild(self.fc1_ready_counter_pointer) if self.fc1_ready_counter_pointer is not None else None
         )
         expert_remap = rebuild(self.expert_remap) if self.expert_remap is not None else None
+        shared_ready_counter_pointer = (
+            rebuild(self.shared_ready_counter_pointer) if self.shared_ready_counter_pointer is not None else None
+        )
         if value_index != len(values):
             raise ValueError(
                 f"BlockScaledSwapAbFc12Extension MLIR value count mismatch: consumed {value_index}, got {len(values)}."
@@ -77,7 +85,16 @@ class BlockScaledSwapAbFc12Extension:
             fc2_spin_threshold=fc2_spin_threshold,
             fc1_ready_counter_pointer=fc1_ready_counter_pointer,
             expert_remap=expert_remap,
+            shared_expert_idx=self.shared_expert_idx,
+            shared_counter_offset=self.shared_counter_offset,
+            shared_ready_counter_pointer=shared_ready_counter_pointer,
         )
+
+    @cute.jit
+    def is_shared_tile(self, work_tile: SwapAbFc12WorkTileInfo):
+        if cutlass.const_expr(self.shared_expert_idx is None):
+            return cutlass.Boolean(False)
+        return work_tile.expert_idx == Int32(self.shared_expert_idx)
 
     @cute.jit
     def prepare_work_tile(self, work_tile: SwapAbFc12WorkTileInfo) -> SwapAbFc12WorkTileInfo:
@@ -92,16 +109,33 @@ class BlockScaledSwapAbFc12Extension:
         """
         phase_and_flags = work_tile.phase_and_flags
         expert_idx = work_tile.expert_idx
+        data_row = work_tile.cumulative_data_physical_row
+        sf_row = work_tile.cumulative_sf_physical_row
+        counter_base = work_tile.cumulative_token_block_count
+        is_shared = self.is_shared_tile(work_tile)
         if work_tile.is_valid_tile:
             # Inside the validity branch so a terminal tile keeps its sentinel.
             if cutlass.const_expr(self.expert_remap is not None):
-                expert_idx = self.expert_remap[work_tile.expert_idx]
-            counter_slot = work_tile.cumulative_token_block_count + work_tile.tile_n_idx
+                if not is_shared:
+                    expert_idx = self.expert_remap[work_tile.expert_idx]
+            if is_shared:
+                data_row = Int32(0)
+                sf_row = Int32(0)
+                counter_base = Int32(self.shared_counter_offset)
+            counter_slot = counter_base + work_tile.tile_n_idx
             is_fc1 = work_tile.phase == Int32(BlockPhase.Linear1)
             is_fc2 = work_tile.phase == Int32(BlockPhase.Linear2)
 
+            if cutlass.const_expr(self.shared_ready_counter_pointer is not None):
+                if is_fc1 and is_shared:
+                    counter_pointer = self.shared_ready_counter_pointer + work_tile.tile_n_idx
+                    peek_flag = Int32(0)
+                    if spin_peek(counter_pointer, lambda value: value >= work_tile.valid_tokens_in_cta_tile):
+                        peek_flag = Int32(peek_ready_bit)
+                    phase_and_flags = work_tile.phase_and_flags | peek_flag
+
             if cutlass.const_expr(self.fc1_ready_counter_pointer is not None):
-                if is_fc1:
+                if is_fc1 and not is_shared:
                     counter_pointer = self.fc1_ready_counter_pointer + counter_slot
                     peek_flag = Int32(0)
                     if spin_peek(counter_pointer, lambda value: value >= work_tile.valid_tokens_in_cta_tile):
@@ -119,9 +153,9 @@ class BlockScaledSwapAbFc12Extension:
             expert_idx=expert_idx,
             tile_m_idx=work_tile.tile_m_idx,
             tile_n_idx=work_tile.tile_n_idx,
-            cumulative_data_physical_row=work_tile.cumulative_data_physical_row,
-            cumulative_sf_physical_row=work_tile.cumulative_sf_physical_row,
-            cumulative_token_block_count=work_tile.cumulative_token_block_count,
+            cumulative_data_physical_row=data_row,
+            cumulative_sf_physical_row=sf_row,
+            cumulative_token_block_count=counter_base,
             valid_tokens_in_cta_tile=work_tile.valid_tokens_in_cta_tile,
             phase_and_flags=phase_and_flags,
         )
@@ -129,14 +163,22 @@ class BlockScaledSwapAbFc12Extension:
     @cute.jit
     def wait_for_input(self, work_tile: SwapAbFc12WorkTileInfo) -> None:
         """Wait until the current FC1 input tile is ready."""
+        if cutlass.const_expr(self.shared_ready_counter_pointer is not None):
+            if self.is_shared_tile(work_tile):
+                spin_wait(
+                    self.shared_ready_counter_pointer + work_tile.tile_n_idx,
+                    lambda value: value >= work_tile.valid_tokens_in_cta_tile,
+                    peek_status=work_tile.peek_ready,
+                )
         if cutlass.const_expr(self.fc1_ready_counter_pointer is not None):
-            counter_slot = work_tile.cumulative_token_block_count + work_tile.tile_n_idx
-            counter_pointer = self.fc1_ready_counter_pointer + counter_slot
-            spin_wait(
-                counter_pointer,
-                lambda value: value >= work_tile.valid_tokens_in_cta_tile,
-                peek_status=work_tile.peek_ready,
-            )
+            if not self.is_shared_tile(work_tile):
+                counter_slot = work_tile.cumulative_token_block_count + work_tile.tile_n_idx
+                counter_pointer = self.fc1_ready_counter_pointer + counter_slot
+                spin_wait(
+                    counter_pointer,
+                    lambda value: value >= work_tile.valid_tokens_in_cta_tile,
+                    peek_status=work_tile.peek_ready,
+                )
 
     @cute.jit
     def get_gmem_tensor(
@@ -144,6 +186,8 @@ class BlockScaledSwapAbFc12Extension:
     ) -> Tuple[cute.Tensor, Optional[Pointer]]:
         """Resolve one kernel tensor to its current expert/task-tile view."""
         expert_idx = work_tile.expert_idx
+        if self.is_shared_tile(work_tile):
+            expert_idx = Int32(0)
         data_token_offset = work_tile.cumulative_data_physical_row
         sf_token_offset = work_tile.cumulative_sf_physical_row
         shape = tensor.shape

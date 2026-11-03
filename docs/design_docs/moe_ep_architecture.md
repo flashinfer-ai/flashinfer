@@ -361,6 +361,28 @@ Automatic workspace handles own separate selection state. Later selection can
 replace a captured default workspace while its old storage remains available to
 existing graphs; captured explicit handles require a new handle.
 
+The Rubin MXFP4-weight/MXFP8-activation backend also accepts one replicated E4M3
+shared expert with `shared_expert=True`. Supply
+`Sm107PrequantizedMoEWeightsWithSharedExpert`, or provide a prepared
+`Sm107SharedMegaWeights(routed, shared)` through `MegaConfig.transformed_weights`.
+The shared expert uses the routed intermediate width, SwiGLU and clamp, with a
+unit contribution to each live local token. Its weights stay outside routed and
+EPLB expert slots; TP sharding and a separate shared gate are unsupported.
+
+Shared FC1 and SwiGLU retain FP32 values until MXFP8 quantization, without the
+intermediate BF16 stores of a separate shared MLP. Shared FC2 stores BF16, which
+the final reduction adds to the routed FP32 accumulator before rounding the sum
+to BF16. This is not bitwise equivalent to computing and adding two separate
+BF16 outputs.
+
+Shared execution supports inference and GenPhase with BF16 separate combine.
+Each variant retains its native tile and scheduling eligibility rules.
+`kernel_variant="auto"` compares both eligible variants. Warmup tuning scores the
+complete routed-plus-shared forward, and shared cache records are separate from
+routed-only records. `get_tuned_config()` preserves the shared setting. The offline
+CLI does not yet construct shared operands. Caller output and workspace-view
+behavior are unchanged, including empty ranks.
+
 Rubin automatic workspaces reuse their agreed configuration during ordinary
 eager execution, without selection collectives or cache lookups on each forward.
 Calling the layer inside an explicit tuning or replay context performs collective

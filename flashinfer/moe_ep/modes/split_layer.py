@@ -366,6 +366,9 @@ class MoEEpSplitLayer(nn.Module):
         self._fleet_params = fleet_params
         self._weights: Optional[MoEWeightPack] = weights
         self._fleet_knobs = list(fleet_knobs)
+        from ..backends.mega.kernel.sm107.shared_weights import validate_shared_backend
+
+        validate_shared_backend(weights, None)
         if isinstance(backend, SplitConfig):
             self._comm_backend = backend.comm
             self._kernel_config = backend.kernel

@@ -61,6 +61,7 @@ def sm107_candidates(
     *,
     allow_in_kernel_fc2_reduce: bool = False,
     kernel_variant: str = "inference",
+    shared_quant_kind: str | None = None,
 ) -> List[Dict[str, Any]]:
     """Default SM107 candidate knob dicts (tile x launch x epi x fc2-bulk).
 
@@ -86,6 +87,13 @@ def sm107_candidates(
         ((2, 1), None, ("grouped", None), "grid_stride"),
         ((4, 1), (2, 1), ("phase_interleave", None), "atomic_counter"),
     )
+    if shared_quant_kind is not None:
+        if (
+            shared_quant_kind != "mxfp8_e4m3"
+            or quant_kind != "mxfp4_mxfp8"
+            or allow_in_kernel_fc2_reduce
+        ):
+            raise ValueError("Unsupported shared-expert tuning configuration")
     if kernel_variant == "genphase":
         launches = (
             ((4, 1), None, ("grouped", None), "grid_stride"),
@@ -220,7 +228,11 @@ def _sweep_sm107_block_scaled_mega_moe(
     ensure_not_capturing("SM107 collective autotune sweep")
     cfg = symm_buffer.config
     candidates = (
-        sm107_candidates(cfg.quant_kind, kernel_variant=cfg.kernel_variant)
+        sm107_candidates(
+            cfg.quant_kind,
+            kernel_variant=cfg.kernel_variant,
+            shared_quant_kind=cfg.shared_quant_kind,
+        )
         if candidates is None
         else candidates
     )
@@ -300,6 +312,8 @@ def _sweep_sm107_block_scaled_mega_moe(
         # inside a kernel or have a failed CUDA context. The supervisor must
         # terminate the whole job, then retry a candidate in a fresh job.
         trial = Sm107BlockScaledSymmBuffer(trial_cfg)
+        if cfg.shared_quant_kind:
+            trial.bind_shared_weights(symm_buffer._shared_weights)
         trial.x.view(torch.uint8).copy_(symm_buffer.x.view(torch.uint8))
         trial.x_sf.view(torch.uint8).copy_(symm_buffer.x_sf.view(torch.uint8))
         trial.topk_idx.copy_(symm_buffer.topk_idx)

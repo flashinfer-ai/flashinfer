@@ -164,6 +164,10 @@ def prepare_auto_configuration(
     if not select:
         record_prepared(state, context)
         return
+    if workspace.config.shared_quant_kind:
+        from .shared_weights import bind_prepared_weights
+
+        weights = bind_prepared_weights(workspace, weights)
     from .....kernel_src.sm107.next_cutedsl_megamoe import (
         KNOB_KEYS,
         sm107_candidates,
@@ -175,6 +179,7 @@ def prepare_auto_configuration(
     candidates = sm107_candidates(
         cfg.quant_kind,
         kernel_variant=cfg.kernel_variant,
+        shared_quant_kind=cfg.shared_quant_kind,
         allow_in_kernel_fc2_reduce=backend._kernel_config.in_kernel_fc2_reduce
         and cfg.combine_dtype == "bf16",
     )

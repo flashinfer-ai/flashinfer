@@ -100,7 +100,9 @@ class RubinTuningProtocol:
         )
         self.candidates = (
             sm107_candidates(
-                self.cfg.quant_kind, kernel_variant=self.cfg.kernel_variant
+                self.cfg.quant_kind,
+                kernel_variant=self.cfg.kernel_variant,
+                shared_quant_kind=self.cfg.shared_quant_kind,
             )
             if candidates is None
             else candidates
@@ -145,6 +147,7 @@ class RubinTuningProtocol:
             situ_beta=cfg.situ_beta,
             situ_linear_beta=cfg.situ_linear_beta,
             gate_up_clamp=cfg.gate_up_clamp,
+            shared_quant_kind=cfg.shared_quant_kind,
         )
 
     def _contract(self):
@@ -154,6 +157,8 @@ class RubinTuningProtocol:
         config = dataclasses.asdict(self.cfg)
         for key in (*KNOB_KEYS, "rank", "max_tokens_per_rank"):
             config.pop(key, None)
+        if config.get("shared_quant_kind") is None:
+            config.pop("shared_quant_kind", None)
         device = None
         if torch.cuda.is_available():
             props = torch.cuda.get_device_properties(torch.cuda.current_device())

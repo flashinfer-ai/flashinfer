@@ -99,7 +99,12 @@ class _ForwardTrial:
 
     def launch(self, l1, l2):
         execution = self.execution
+        weights = (l1, l2)
+        if self.config.shared_quant_kind:
+            from .shared_weights import Sm107SharedMegaWeights
+
+            weights = Sm107SharedMegaWeights(weights, self.workspace._shared_weights)
         self.backend.stage_inputs(
             execution.tensors, self.workspace, quantize_input=execution.quantize_input
         )
-        self.backend.compute(self.workspace, (l1, l2), output=execution.output)
+        self.backend.compute(self.workspace, weights, output=execution.output)

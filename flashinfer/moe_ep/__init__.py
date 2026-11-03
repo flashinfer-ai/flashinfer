@@ -256,6 +256,10 @@ from .modes import (
     run_split_kernel,
 )
 from .tensors import MoEEpTensors
+from .backends.mega.kernel.sm107.shared_weights import (
+    Sm107PrequantizedMoEWeightsWithSharedExpert,
+    Sm107SharedMegaWeights,
+)
 from .weights import (
     MoEWeightPack,
     PrequantizedMoEWeights,
@@ -326,6 +330,8 @@ __all__ = [
     "MoEEpTensors",
     "MoEWeightPack",
     "PrequantizedMoEWeights",
+    "Sm107PrequantizedMoEWeightsWithSharedExpert",
+    "Sm107SharedMegaWeights",
     "UnquantizedMoEWeights",
     "Sm100_Bf16_Mxfp8_Bf16_Cutedsl_MegaMoeConfig",
     "Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig",

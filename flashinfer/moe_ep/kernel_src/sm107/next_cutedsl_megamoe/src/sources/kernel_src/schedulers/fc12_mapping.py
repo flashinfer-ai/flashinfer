@@ -319,6 +319,7 @@ class Fc12TaskMappingState:
         cursor_state: _Fc12TaskCursorState,
         num_fc1_intermediate_blocks,
         num_fc2_hidden_blocks,
+        shared_token_count: Optional[Int32] = None,
     ) -> None:
         self.expert_count = expert_count
         self.mapping_cta_tile_shape_mnk = mapping_cta_tile_shape_mnk
@@ -332,6 +333,7 @@ class Fc12TaskMappingState:
         self.cursor_state = cursor_state
         self.num_fc1_intermediate_blocks = num_fc1_intermediate_blocks
         self.num_fc2_hidden_blocks = num_fc2_hidden_blocks
+        self.shared_token_count = shared_token_count
 
     @property
     def mapping_cluster_tile_m(self) -> int:
@@ -348,6 +350,8 @@ class Fc12TaskMappingState:
             values.extend(extract_mlir_values(self.num_fc1_intermediate_blocks))
         if isinstance(self.num_fc2_hidden_blocks, Int32):
             values.extend(extract_mlir_values(self.num_fc2_hidden_blocks))
+        if self.shared_token_count is not None:
+            values.extend(extract_mlir_values(self.shared_token_count))
         return values
 
     def __new_from_mlir_values__(self, values: List[ir.Value]) -> "Fc12TaskMappingState":
@@ -388,6 +392,9 @@ class Fc12TaskMappingState:
                 if isinstance(self.num_fc2_hidden_blocks, Int32)
                 else self.num_fc2_hidden_blocks
             ),
+            shared_token_count=(
+                rebuild(self.shared_token_count) if self.shared_token_count is not None else None
+            ),
         )
         if value_index != len(values):
             raise ValueError(
@@ -410,8 +417,15 @@ def create_fc12_task_mapping_state(
     is_swap_ab: bool,
     expert_token_sizes: Optional[cute.Tensor],
     expert_token_prefix_sum: Optional[cute.Tensor],
+    shared_token_count: Optional[Int32] = None,
 ) -> Fc12TaskMappingState:
     """Create the register-resident state for one CTA's FC12 mapper."""
+    if cutlass.const_expr(shared_token_count is not None):
+        if cutlass.const_expr(not is_swap_ab or expert_token_sizes is None):
+            raise ValueError("Shared tasks require swap-AB mapping with routed token sizes.")
+        # The final task index is local work, not an entry in the routed sizes array.
+        expert_count = expert_count + 1
+        shared_token_count = Int32(shared_token_count)
     cursor_state = _Fc12TaskCursorState(
         current_group_first_expert=Int32(0),
         current_group_last_expert_exclusive=Int32(0),
@@ -448,6 +462,7 @@ def create_fc12_task_mapping_state(
         cursor_state=cursor_state,
         num_fc1_intermediate_blocks=num_fc1_intermediate_blocks,
         num_fc2_hidden_blocks=num_fc2_hidden_blocks,
+        shared_token_count=shared_token_count,
     )
 
 
@@ -479,8 +494,14 @@ def _load_expert_batch_metrics(
     expert_idx = batch_base + lane_idx
     token_count = Int32(0)
     if cutlass.const_expr(mapping_state.expert_token_sizes is not None):
-        if expert_idx < mapping_state.expert_count:
+        routed_expert_count = mapping_state.expert_count
+        if cutlass.const_expr(mapping_state.shared_token_count is not None):
+            routed_expert_count = routed_expert_count - 1
+        if expert_idx < routed_expert_count:
             token_count = mapping_state.expert_token_sizes[expert_idx]
+        if cutlass.const_expr(mapping_state.shared_token_count is not None):
+            if expert_idx == routed_expert_count:
+                token_count = mapping_state.shared_token_count
     else:
         prefix_end = Int32(0)
         if expert_idx < mapping_state.expert_count:
@@ -920,6 +941,7 @@ class PhaseInterleavedFc12MappingState:
         num_fc1_intermediate_blocks: int,
         num_fc2_hidden_blocks: int,
         dfc1_m_group: int = 1,
+        shared_token_count: Optional[Int32] = None,
     ) -> None:
         if type(dfc1_m_group) is not int or dfc1_m_group not in (1, 16):
             raise ValueError("dfc1_m_group must be 1 or 16")
@@ -936,6 +958,7 @@ class PhaseInterleavedFc12MappingState:
         self.fc2_cursor = fc2_cursor
         self.num_fc1_intermediate_blocks = num_fc1_intermediate_blocks
         self.num_fc2_hidden_blocks = num_fc2_hidden_blocks
+        self.shared_token_count = shared_token_count
         self.fc2_claims_per_token_block = num_fc2_hidden_blocks
         if fc2_cursor.blocks_per_token_block != self.fc2_claims_per_token_block:
             raise ValueError(
@@ -953,6 +976,8 @@ class PhaseInterleavedFc12MappingState:
         values.extend(extract_mlir_values(token_counts))
         for field in (self.fc1_cursor, self.fc2_cursor):
             values.extend(extract_mlir_values(field))
+        if self.shared_token_count is not None:
+            values.extend(extract_mlir_values(self.shared_token_count))
         return values
 
     def __new_from_mlir_values__(self, values: List[ir.Value]) -> "PhaseInterleavedFc12MappingState":
@@ -985,6 +1010,9 @@ class PhaseInterleavedFc12MappingState:
             num_fc1_intermediate_blocks=self.num_fc1_intermediate_blocks,
             num_fc2_hidden_blocks=self.num_fc2_hidden_blocks,
             dfc1_m_group=self.dfc1_m_group,
+            shared_token_count=(
+                rebuild(self.shared_token_count) if self.shared_token_count is not None else None
+            ),
         )
         if value_index != len(values):
             raise ValueError(
@@ -1022,8 +1050,14 @@ def create_phase_interleaved_fc12_mapping_state(
     expert_token_sizes: Optional[cute.Tensor],
     expert_token_prefix_sum: Optional[cute.Tensor],
     dfc1_m_group: int = 1,
+    shared_token_count: Optional[Int32] = None,
 ) -> PhaseInterleavedFc12MappingState:
     """Create independent monotonic mapping cursors for the FC1 and FC2 streams."""
+    if cutlass.const_expr(shared_token_count is not None):
+        if cutlass.const_expr(not is_swap_ab or expert_token_sizes is None):
+            raise ValueError("Shared tasks require swap-AB mapping with routed token sizes.")
+        expert_count = expert_count + 1
+        shared_token_count = Int32(shared_token_count)
     mapping_cluster_tile_n = mapping_cluster_shape_mn[1] * mapping_cta_tile_shape_mnk[1]
     num_fc1_intermediate_blocks = (intermediate_gateup_size + mapping_cluster_tile_n - 1) // mapping_cluster_tile_n
     num_fc2_hidden_blocks = (hidden_size + mapping_cluster_tile_n - 1) // mapping_cluster_tile_n
@@ -1042,6 +1076,7 @@ def create_phase_interleaved_fc12_mapping_state(
         num_fc1_intermediate_blocks=num_fc1_intermediate_blocks,
         num_fc2_hidden_blocks=num_fc2_hidden_blocks,
         dfc1_m_group=dfc1_m_group,
+        shared_token_count=shared_token_count,
     )
 
 
@@ -1061,7 +1096,14 @@ def _advance_phase_cursor(
     cursor.expert_idx = cursor.expert_idx + Int32(1)
     token_count = Int32(0)
     if cutlass.const_expr(mapping_state.expert_token_sizes is not None):
-        token_count = mapping_state.expert_token_sizes[cursor.expert_idx]
+        if cutlass.const_expr(mapping_state.shared_token_count is not None):
+            # The final task is local shared work, outside the routed count array.
+            if cursor.expert_idx == Int32(mapping_state.expert_count - 1):
+                token_count = mapping_state.shared_token_count
+            else:
+                token_count = mapping_state.expert_token_sizes[cursor.expert_idx]
+        else:
+            token_count = mapping_state.expert_token_sizes[cursor.expert_idx]
     else:
         prefix_end = mapping_state.expert_token_prefix_sum[cursor.expert_idx]
         prefix_begin = Int32(0)
