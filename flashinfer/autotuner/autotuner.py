@@ -1004,22 +1004,26 @@ def autotune(
     out during profiling (``get_valid_tactics``).  If a tactic still fails at
     runtime the error is caught, a warning is logged, and that tactic is
     skipped.  At inference time, ``map_to_tuning_buckets`` maps the runtime
-    size to the nearest profiled bucket, so an unsupported raw size never
-    reaches the kernel directly.
+    size to its tuning bucket, so an unsupported raw size never reaches the
+    kernel directly.
 
-    **Round-up beyond the largest bucket** -- When ``round_up=True`` and the
-    runtime size exceeds every bucket, the value is clamped to the largest
-    bucket (see :func:`~flashinfer.fused_moe.utils.round_to_nearest_bucket`).
+    **Round-up beyond the largest bucket** -- When ``round_up=True`` is used
+    without ``tuning_buckets`` and the runtime size exceeds every bucket, the
+    value is clamped to the largest bucket (see
+    :func:`~flashinfer.fused_moe.utils.round_to_nearest_bucket`).
 
     **Nested / sequential contexts** -- Overrides are managed on a per-thread
     stack.  A nested ``autotune()`` pushes its overrides; on exit the outer
     context's values are restored.  Sequential contexts are fully independent.
-    Different buckets produce different cache keys, so entries never collide.
+    With ``tuning_buckets``, cache keys come from each op's own mapper, so
+    bucket lists whose sizes map to the same op bucket share one entry.
 
-    **Using both parameters together** is fully supported:
-    ``autotune(tuning_buckets=(100, 300, 600), round_up=True)`` profiles
-    at 100, 300, and 600 and rounds runtime sizes *up* to the nearest of
-    those buckets at inference time.
+    **Using both parameters together** -- ``round_up`` has no effect when
+    ``tuning_buckets`` is given.  For
+    ``autotune(tuning_buckets=(100, 300, 600), round_up=True)``, profiling runs
+    at 100, 300, and 600, and each op's own mapper decides which bucket a
+    runtime size uses.  A size whose op bucket is not in the list finds no
+    tuned entry inside the context and uses the default tactic.
 
     Examples::
 
@@ -1035,7 +1039,7 @@ def autotune(
         with autotune(False, cache="my_configs.json", round_up=True):
             model(inputs)
 
-        # Combine custom buckets with round-up
+        # round_up has no effect together with tuning_buckets
         with autotune(True, tuning_buckets=(100, 300, 600), round_up=True):
             model(inputs)  # profiles at 100, 300, 600
 
@@ -2159,7 +2163,8 @@ class AutoTuner:
         """Return the currently effective ``map_to_tuning_buckets`` callable.
 
         Reflects any active ``autotune(tuning_buckets=..., round_up=...)``
-        overrides on the current thread.  When no override is active,
+        overrides on the current thread.  With ``tuning_buckets`` this is the
+        op's own mapper.  When no override is active,
         returns
         ``tuning_config.dynamic_tensor_specs[spec_idx].map_to_tuning_buckets``
         unchanged.
