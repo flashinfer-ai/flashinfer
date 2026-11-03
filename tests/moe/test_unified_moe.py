@@ -2782,6 +2782,7 @@ def _compute_ref(act_pack, tensors, shape, activation=None, wrong_formula=False)
 
 
 @cute_dsl_sm100_required
+@pytest.mark.usefixtures("observe_swap_ab_mma_plans")
 @pytest.mark.parametrize("swap_ab", [False, True])
 @pytest.mark.parametrize(
     "quant",
