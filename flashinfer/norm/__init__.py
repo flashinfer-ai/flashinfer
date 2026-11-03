@@ -244,7 +244,9 @@ def _use_cuda_norm(device: torch.device) -> bool:
     # (handles mixed-architecture hosts where device 0 != target device)
     if _dsl_captured_arch is not None:
         captured_arch = _dsl_captured_arch()
-        if captured_arch is not None and not _is_arch_compatible(captured_arch, device_cap):
+        if captured_arch is not None and not _is_arch_compatible(
+            captured_arch, device_cap
+        ):
             # DSL compiled for a different architecture; fall back to CUDA JIT
             return True
 
