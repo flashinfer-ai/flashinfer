@@ -1460,6 +1460,15 @@ def test_lamport_row_geometry():
         row(index.LAMPORT_FORMAT_MXFP8, 2880, 8)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="loads the kernel module")
+def test_lamport_kernels_built():
+    """The module carries the kernels on every architecture MOE_A2A_LAMPORT_COMPILE
+    names, so the multi-rank tests run there instead of skipping."""
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("the Lamport kernels are not built for this GPU")
+    assert one_sided.get_nvlink_one_sided_alltoall_module().moe_a2a_lamport_available()
+
+
 class _FakeModule:
     def __init__(self, available=True):
         self.available = available
