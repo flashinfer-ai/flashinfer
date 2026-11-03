@@ -402,6 +402,10 @@ class GemmSpec:
     ):
         self.K, self.out_fmt, self.chunks, self.in_fmt = K, out_fmt, chunks, in_fmt
         self.scaled = is_scaled(in_fmt)
+        if bias and in_fmt != "bf16":
+            raise ValueError(
+                f"the biased chain exists for the bf16 class only (mm_bf16's bias); no kernel implements it for {in_fmt!r}"
+            )
         self.bias = bias
         self.alg = alg or TermAlgebra()
 
@@ -429,7 +433,8 @@ def spec_fingerprint(
     """The identifier of the class for one weight: the term encodes ceil(K / step) opaque steps; the raw K (hence the
     zero-filled tail of the last step), the chunk count, the formats, the chain and the bias flag are part of the
     specification too, so they enter the identifier (``-bias`` in the tag; without a bias the identifier is the
-    unbiased class's, unchanged)."""
+    unbiased class's, unchanged). The biased variant exists for the bf16 class only; ``bias=True`` with another format
+    raises."""
     s = GemmSpec(K, out_fmt, chunks=chunks, in_fmt=in_fmt, bias=bias)
     tag = f"gemm-{in_fmt.replace('_', '-')}-" + (
         "kfold" if chunks == 1 else f"kchunk{chunks}"
