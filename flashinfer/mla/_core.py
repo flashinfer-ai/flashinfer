@@ -2054,10 +2054,12 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         ``cum_seq_lens_q``.
     enable_pdl : Optional[bool]
         Whether to enable Programmatic Dependent Launch. Used by the
-        TRTLLM-GEN path and, on SM120/SM121, by ``backend="cake"`` with
+        TRTLLM-GEN path; on SM100/SM103 by ``backend="cake"`` for its FP8
+        persistent and M64 programs (the other BF16 / FP8 programs launch
+        without it); and on SM120/SM121 by ``backend="cake"`` with
         ``kv_cache_format="fp8_dsv41_fp4_ca"`` (its split merge is launched as a
-        programmatic dependent of the decode grid; ``None`` follows the device
-        default). The NVFP4 Cake family rejects ``True``.
+        programmatic dependent of the decode grid). ``None`` follows the device
+        default. The NVFP4 Cake family rejects ``True``.
     swa_topk_lens : Optional[torch.Tensor]
         Active SWA segment lengths, shape ``[sum_q]`` INT32. On SM120/SM121
         these are sparse-segment lengths. HCA requires them as its per-row
@@ -2383,14 +2385,17 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     # On SM120/SM121, backend="cake" selects the Cake NVFP4 sparse-MLA decode,
     # which shares the SM120 "sparse" call surface (swa_topk_lens, dual cache).
     cake_sm120 = backend == "cake" and _is_sm120_family(query.device)
-    if backend == "cake":
-        # The DeepSeek-V4.1 mixed-cache Cake family launches its split merge as a
-        # programmatic dependent of the decode grid (None = device default); the
-        # NVFP4 Cake family has no PDL launch option.
-        if not (cake_sm120 and kv_cache_format == "fp8_dsv41_fp4_ca"):
-            if enable_pdl:
-                raise ValueError("backend='cake' does not support enable_pdl")
-            enable_pdl = False
+    if backend == "cake" and kv_cache_format == "nvfp4":
+        # The NVFP4 Cake family has no PDL launch option.  The DeepSeek-V4.1
+        # mixed-cache family launches its split merge as a programmatic
+        # dependent of the decode grid, and the SM100/SM103 BF16 / FP8 programs
+        # that support it launch as programmatic dependents (None = device
+        # default for both).
+        if enable_pdl:
+            raise ValueError(
+                "backend='cake' with kv_cache_format='nvfp4' does not support enable_pdl"
+            )
+        enable_pdl = False
     elif enable_pdl is None:
         enable_pdl = device_support_pdl(query.device)
     if isinstance(bmm1_scale, torch.Tensor):
@@ -2641,6 +2646,7 @@ def trtllm_batch_decode_sparse_mla_dsv4(
             seq_lens=seq_lens,
             backend="cake",
             out_shape=tuple(expected_out_shape),
+            enable_pdl=bool(enable_pdl),
         )
 
     primary_kv_cache = compressed_kv_cache

@@ -906,6 +906,9 @@ _SCALAR_VALUE_NAMES = frozenset(
     }
 )
 _GRID_NAMES = ("grid_x", "grid_y", "grid_z")
+# The per-call launch argument of the programs that leave programmatic dependent
+# launch to each call (``["launch", "enable_pdl"]`` in their plan, 0 or 1).
+_LAUNCH_NAMES = ("enable_pdl",)
 # Producers whose generated ABI reads request boundaries from cum_seq_lens_q
 # only; run_cake_dsv4 synthesizes the dense offsets for them.
 _RAGGED_ONLY_ROUTES = frozenset(
@@ -982,6 +985,8 @@ def is_bindable_arg(kind: str, name: str) -> bool:
         return canonical in _SCALAR_VALUE_NAMES
     if kind == "grid":
         return name in _GRID_NAMES
+    if kind == "launch":
+        return name in _LAUNCH_NAMES
     return False
 
 
@@ -999,6 +1004,12 @@ def _bind_argument(
                 f"CAKE DSv4 {variant} has an unknown grid argument: {name}"
             )
         return grid[name]
+    if kind == "launch":
+        if name not in _LAUNCH_NAMES:
+            raise ValueError(
+                f"CAKE DSv4 {variant} has an unknown launch argument: {name}"
+            )
+        return int(bool(values.get(name, False)))
     if kind not in ("buffer", "tma_buffer", "parameter"):
         raise ValueError(
             f"CAKE DSv4 {variant} has an unknown argument kind {kind!r} for {name}"
@@ -1765,8 +1776,14 @@ def run_cake_dsv4(
     extra_sparse_topk_lens: Optional[torch.Tensor] = None,
     sparse_topk_lens_offset: int = 0,
     out_shape: Optional[tuple[int, ...]] = None,
+    enable_pdl: bool = False,
 ) -> torch.Tensor:
     """Launch the CAKE DSv4 route for flattened ``query [rows, num_heads, 512]``.
+
+    ``enable_pdl`` launches the programs that support it (the FP8 persistent
+    and M64 bodies) as programmatic dependents of the previous kernel on the
+    stream; they wait for it before their first global read.  The other
+    programs launch without the attribute.
 
     ``out=None`` allocates the output here, after the route is known, so the
     routes in ``_OUT_PHASE_BY_ROUTE`` get their measured-fast base phase;
@@ -1927,6 +1944,7 @@ def run_cake_dsv4(
         "ragged_query": int(ragged),
         "num_splits": 1,
         "total_work_items": num_query_tokens,
+        "enable_pdl": bool(enable_pdl),
     }
     plan = _route_plan(
         route,
