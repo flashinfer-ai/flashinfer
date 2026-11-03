@@ -2567,6 +2567,9 @@ class TestCuteDslFusedMoeFunctional:
                 hidden_size=hidden_size,
                 intermediate_size=intermediate_size,
             )
+            assert weights.get("gated_weight_group_size") == (
+                (16 if swap_ab else 64) if gated else None
+            )
             tensors = dict(
                 x=x,
                 x_sf=x_sf.view(torch.uint8).reshape(num_tokens, hidden_size // 32),
@@ -3018,8 +3021,11 @@ class TestCuteDslFusedMoeFunctional:
             raise ValueError(f"Unsupported test quant_mode {quant_mode!r}")
 
     @pytest.mark.parametrize("quant_mode", _MOE_QUANT_MODES)
-    def test_with_autotune(self, quant_mode: str):
+    @pytest.mark.parametrize("swap_ab", [False, True])
+    def test_with_autotune(self, quant_mode: str, swap_ab: bool):
         """Test functional API with autotune context."""
+        if swap_ab and is_sm107():
+            pytest.skip("swap_ab requires Blackwell SM100 or SM103")
         if is_sm107() and quant_mode == "w4a4":
             pytest.skip(
                 "Rubin (SM107) cute-dsl MoE kernels do not implement custom "
@@ -3027,6 +3033,7 @@ class TestCuteDslFusedMoeFunctional:
             )
         from flashinfer import autotune
         from flashinfer import cute_dsl_fused_moe
+        from flashinfer.autotuner import AutoTuner
 
         num_tokens, hidden_size, intermediate_size = 256, 256, 512
         num_experts, top_k = 256, 2
@@ -3038,9 +3045,11 @@ class TestCuteDslFusedMoeFunctional:
             num_experts=num_experts,
             num_local_experts=num_experts,
             top_k=top_k,
+            swap_ab=swap_ab,
         )
         api_inputs, _ = _prepare_moe_quant_mode_inputs(tensors, quant_mode)
 
+        AutoTuner.get().clear_cache()
         with autotune(True):
             result = cute_dsl_fused_moe(
                 token_selected_experts=tensors["token_selected_experts"],
@@ -3057,8 +3066,11 @@ class TestCuteDslFusedMoeFunctional:
                 swiglu_alpha=1.702,
                 swiglu_beta=1.0,
                 swiglu_limit=7.0,
-                use_fused_finalize=_use_fused_finalize_for_quant_mode(quant_mode),
+                use_fused_finalize=_use_fused_finalize_for_quant_mode(
+                    quant_mode, swap_ab
+                ),
                 quant_mode=quant_mode,
+                swap_ab=swap_ab,
                 **api_inputs,
             )
 
@@ -3068,6 +3080,7 @@ class TestCuteDslFusedMoeFunctional:
         if quant_mode == "w4a16":
             reference = split_w4a16_reference_from_tensors(
                 tensors,
+                swap_ab=swap_ab,
                 swiglu_alpha=1.702,
                 swiglu_beta=1.0,
                 swiglu_limit=7.0,

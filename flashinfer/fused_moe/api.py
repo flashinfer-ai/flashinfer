@@ -2575,6 +2575,8 @@ class CuteDslConfig:
     The underlying CuteDSL kernel throws at launch on SM120/SM121/SM130.
     ``swap_ab=True`` selects the Blackwell activations-on-B implementation and
     its 16-row gated weight layout. Prepare weights with the same option.
+    ``prepare_weights`` is static: even when called through a config instance,
+    pass ``swap_ab=True`` explicitly to select that layout.
     W4A16 always uses activations on B; False selects its in-kernel transpose
     for compatibility with the original 64-row layout.
     """
@@ -3466,6 +3468,14 @@ class MoEConfig:
         # Not in check_support(): MoELayer swallows its exceptions to filter
         # backends, so errors raised there surface as "no backend available".
         self._validate_fused_shared_experts()
+        if (
+            len({c.swap_ab for c in self.backend if isinstance(c, CuteDslConfig)}) > 1
+            and self.activation.is_gated
+        ):
+            raise ValueError(
+                "Mixed CuteDslConfig swap_ab modes need separate gated weight "
+                "views; use a separate MoELayer for each mode."
+            )
 
     def _validate_fused_shared_experts(self) -> None:
         s = self.experts.num_fused_shared_experts
@@ -3807,8 +3817,8 @@ class MoEWeightPack:
     ``get_view(key)``.
 
     Holding multiple materializations is intentional — that's the memory cost
-    the user pays for cross-backend autotune.  Each view is the exact kwargs
-    dict that runner's ``forward`` expects for weight-side arguments.
+    the user pays for cross-backend autotune.  Each view contains the weight
+    tensors and layout metadata consumed by its runner.
 
     Every ``XxxConfig.prepare_weights`` takes the same canonical source
     layout: ``w1`` is ``[E, 2I, H]`` for gated activations with rows in
@@ -3817,14 +3827,14 @@ class MoEWeightPack:
     want ``[gate, up]`` swap halves inside their prepare helper.
     """
 
-    native_views: Dict[str, Dict[str, Tensor]] = field(default_factory=dict)
+    native_views: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
-    def prepare_for(self, backend_key: str, view: Dict[str, Tensor]) -> None:
+    def prepare_for(self, backend_key: str, view: Dict[str, Any]) -> None:
         """Register a backend-native weight view.  Caller owns the quantization
         / swizzle / layout conversion — this method just stores the result."""
         self.native_views[backend_key] = view
 
-    def get_view(self, backend_key: str) -> Dict[str, Tensor]:
+    def get_view(self, backend_key: str) -> Dict[str, Any]:
         if backend_key not in self.native_views:
             raise KeyError(
                 f"Weights not prepared for backend {backend_key!r}. "

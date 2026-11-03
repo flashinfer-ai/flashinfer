@@ -5262,6 +5262,16 @@ class CuteDslRunner(MoERunner):
                 f"{type(self.config.activation).__name__}; prepare the view with "
                 "the same typed activation."
             )
+        if self.config.activation.is_gated:
+            expected_group_size = 16 if self.swap_ab else 64
+            # Unannotated manual views use the original 64-row API contract.
+            group_size = v.get("gated_weight_group_size", 64)
+            if group_size != expected_group_size:
+                raise ValueError(
+                    f"CuteDslRunner: gated_weight_group_size={group_size} does "
+                    f"not match swap_ab={self.swap_ab}; prepare the weight view "
+                    "with the same swap_ab option."
+                )
 
         pair = self.config.quant.pair
         use_per_token_activation = bool(self.config.quant.per_token_scale)

@@ -2520,6 +2520,7 @@ def _interleave_linear_and_gate(
     return x
 
 
+@flashinfer_api
 def interleave_cute_dsl_moe_weights(
     weight: torch.Tensor, block_scales: torch.Tensor, swap_ab: bool = False
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -2528,8 +2529,9 @@ def interleave_cute_dsl_moe_weights(
     Inputs have shape ``[experts, 2 * intermediate_size, packed_k]`` and
     ``[experts, 2 * intermediate_size, scale_k]``, with contiguous ``[up, gate]``
     halves. ``swap_ab`` must match the execution API: False uses 64-row groups;
-    True uses 16-row groups on SM100/SM103. Use this before scale swizzling
-    and MMA-layout conversion, once per checkpoint load.
+    True uses 16-row groups for SM100/SM103. CPU and CUDA tensors are supported.
+    Use this before scale swizzling and MMA-layout conversion, once per
+    checkpoint load.
 
     Returns tensors with the same shapes and dtypes. This only permutes rows;
     it does not requantize weights or change global/input scales. It applies to
@@ -2543,7 +2545,9 @@ def interleave_cute_dsl_moe_weights(
         )
     if weight.device != block_scales.device:
         raise ValueError("Weights and block scales must be on the same device")
-    group_size = _cute_dsl_gated_weight_group_size(weight.device, swap_ab)
+    if not isinstance(swap_ab, bool):
+        raise TypeError("swap_ab must be a bool")
+    group_size = 16 if swap_ab else 64
     if weight.shape[1] % (2 * group_size):
         raise ValueError(f"Each up/gate half must have a multiple of {group_size} rows")
     return (
@@ -2564,7 +2568,7 @@ def prepare_cute_dsl_weights(
     device: Optional[torch.device] = None,
     nvfp4_4over6: Optional[NVFP44Over6Config] = None,
     swap_ab: bool = False,
-) -> Dict[str, torch.Tensor]:
+) -> Dict[str, Union[torch.Tensor, int]]:
     """Build the CuteDSL ``cute_dsl`` weight view.
 
     Gemm1 weights get the linear/gate interleave only for gated activations;
@@ -2598,7 +2602,8 @@ def prepare_cute_dsl_weights(
     dict
         Keys expected by ``CuteDslRunner.pack_inputs``: ``w1_weight``,
         ``w1_weight_sf``, ``w1_alpha``, ``fc2_input_scale``, ``w2_weight``,
-        ``w2_weight_sf``, ``w2_alpha``.
+        ``w2_weight_sf``, ``w2_alpha``. Gated views also record
+        ``gated_weight_group_size`` for layout validation.
     """
     from ..cute_dsl.utils import convert_sf_to_mma_layout
     from ..fp4_quantization import fp4_quantize
@@ -2680,7 +2685,7 @@ def prepare_cute_dsl_weights(
     )
 
     ones = torch.ones(num_local_experts, device=device, dtype=torch.float32)
-    view = {
+    view: Dict[str, Union[torch.Tensor, int]] = {
         "w1_weight": w1_weight,
         "w1_weight_sf": w1_weight_sf,
         "w1_alpha": ones,
@@ -2688,6 +2693,8 @@ def prepare_cute_dsl_weights(
         "w2_weight_sf": w2_weight_sf,
         "w2_alpha": ones,
     }
+    if activation.is_gated:
+        view["gated_weight_group_size"] = group_size
     if not (is_mxfp4 or is_mxfp8):
         # A pinned recipe fixes the GEMM2-input scale to 1 / (6 * e4m3_max).
         # w2_bf16 is passed for its device only.

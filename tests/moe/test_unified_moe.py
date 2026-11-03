@@ -1346,6 +1346,43 @@ class TestExpressiveness:
         )
         assert any(isinstance(c, CuteDslConfig) for c in cfg.backend)
 
+    @pytest.mark.parametrize("activation", (SwiGLU(), ReLU2()))
+    def test_cutedsl_mixed_layout_candidates(self, activation):
+        kwargs = dict(
+            routing=RoutingConfig(num_experts=8, top_k=2),
+            quant=QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
+            experts=ExpertConfig(intermediate_size=128),
+            activation=activation,
+            backend=BackendOptions((CuteDslConfig(), CuteDslConfig(swap_ab=True))),
+        )
+        if activation.is_gated:
+            with pytest.raises(ValueError, match="separate gated weight views"):
+                MoEConfig(**kwargs)
+        else:
+            assert len(MoEConfig(**kwargs).backend) == 2
+
+    @pytest.mark.parametrize("swap_ab", (False, True))
+    def test_cutedsl_weight_interleave_on_cpu(self, swap_ab):
+        from flashinfer.fused_moe import interleave_cute_dsl_moe_weights
+
+        rows = torch.arange(256, dtype=torch.int32)
+        weight = rows.to(torch.uint8).view(1, 256, 1).expand(2, 256, 4).clone()
+        scales = rows.float().view(1, 256, 1).expand(2, 256, 2).clone()
+        group_size = 16 if swap_ab else 64
+        order = torch.tensor(
+            [
+                row
+                for start in range(0, 128, group_size)
+                for half in (0, 128)
+                for row in range(start + half, start + half + group_size)
+            ]
+        )
+        actual_weight, actual_scales = interleave_cute_dsl_moe_weights(
+            weight, scales, swap_ab=swap_ab
+        )
+        torch.testing.assert_close(actual_weight, weight[:, order], atol=0, rtol=0)
+        torch.testing.assert_close(actual_scales, scales[:, order], atol=0, rtol=0)
+
     def test_expert_parallel(self):
         """Config with expert parallelism (EP)."""
         cfg = MoEConfig(
@@ -1642,10 +1679,24 @@ class TestMoERunnerSupport:
         with pytest.raises(ValueError, match="GEMM1 rows"):
             runner.pack_inputs(act, weights)
 
-    def test_cute_dsl_mxfp4_pack_uses_unpacked_mxfp8_and_no_fc2_scale(self):
+    @pytest.mark.parametrize(
+        "swap_ab,group_size,valid",
+        (
+            (False, None, True),
+            (False, 64, True),
+            (False, 16, False),
+            (True, None, False),
+            (True, 64, False),
+            (True, 16, True),
+        ),
+    )
+    def test_cute_dsl_mxfp4_pack_uses_unpacked_mxfp8_and_no_fc2_scale(
+        self, swap_ab, group_size, valid
+    ):
         runner = CuteDslRunner.__new__(CuteDslRunner)
         runner.config = self._nvfp4_swiglu(
-            quant=QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8)
+            quant=QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8),
+            backend=BackendOptions((CuteDslConfig(swap_ab=swap_ab),)),
         )
         runner._built = True
         runner._inner = SimpleNamespace(top_k=2)
@@ -1662,12 +1713,18 @@ class TestMoERunnerSupport:
                 "w2_alpha": torch.ones(32),
             },
         )
+        if group_size is not None:
+            weights.get_view("cute_dsl")["gated_weight_group_size"] = group_size
         act = MoEActivationPack(
             hidden_states_q=torch.empty(4, 128, dtype=torch.float8_e4m3fn),
             hidden_states_scale=torch.empty(4, 4, dtype=torch.uint8),
             topk_ids=torch.zeros(4, 2, dtype=torch.int32),
             topk_weights=torch.ones(4, 2, dtype=torch.float32),
         )
+        if not valid:
+            with pytest.raises(ValueError, match="gated_weight_group_size"):
+                runner.pack_inputs(act, weights)
+            return
         packed = runner.pack_inputs(act, weights)
         assert packed[0].shape == (4, 128)
         assert packed[1].shape == (4, 4)
@@ -2701,6 +2758,8 @@ def _make_packs_and_config(
             "w2_alpha": tensors["w2_alpha"],
         },
     )
+    if activation.is_gated and swap_ab:
+        weight_pack.get_view("cute_dsl")["gated_weight_group_size"] = 16
     # CuteDSL W4A16 is NVFP4×BF16; TRTLLM W4A16 is MXFP4×BF16, so this helper
     # only prepares the TRTLLM view for pairs that runner actually accepts.
     if quant.pair != (QuantFormat.NVFP4, QuantFormat.BF16):
