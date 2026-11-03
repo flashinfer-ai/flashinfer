@@ -963,6 +963,14 @@ ROUTER_RULES_BY_SM: dict[
 #: The template suffix of the weight gradient's head/tail program (``router_fp32_gemm_atomic_nn_t`` + suffix): the
 #: head/tail partition on three TMEM chunk buffers, with register reallocation between its warpgroups.
 ROUTER_HEAD_TAIL_SUFFIX = "_ht_c3_nreg"
+#: The weight gradient's head/tail program of an architecture that runs another one than
+#: ``router_fp32_gemm_atomic_nn_t`` + :data:`ROUTER_HEAD_TAIL_SUFFIX`: on ``sm_103a``, the head/tail program with the
+#: BF16 parts of ``A`` in tensor memory (the same products, accumulators, partition and part segments; two TMEM chunk
+#: buffers, six slots of raw ``A`` tiles and six of ``B`` parts in shared memory).  ``sm_103a`` takes a head/tail
+#: partition only in the hidden 5120 window of :data:`ROUTER_RULES` on 152 SMs, where it was measured.
+ROUTER_HEAD_TAIL_TEMPLATES: dict[str, str] = {
+    "sm_103a": "router_fp32_gemm_ts_r6p6_atomic_nn_t_ht_c2_nreg",
+}
 _ROUTER_HEAD_TAIL_SPEC = re.compile(r"H(\d+(?:\.\d+)?)x(\d+)(?:p(\d+))?")
 #: The forward's largest explicit split count: an element of the forward takes at most two partials, so a forward
 #: recomputed under activation checkpointing repeats bit for bit (``0 + a + b == 0 + b + a``).
@@ -1048,6 +1056,14 @@ def router_head_pairs(spec: Union[str, int, None]) -> Optional[int]:
         if match and match.group(3) is not None:
             return int(match.group(3))
     return None
+
+
+def router_head_tail_template(arch: str) -> str:
+    """The template of the weight gradient's head/tail program on ``arch``: :data:`ROUTER_HEAD_TAIL_TEMPLATES`, else
+    ``router_fp32_gemm_atomic_nn_t`` + :data:`ROUTER_HEAD_TAIL_SUFFIX`."""
+    return ROUTER_HEAD_TAIL_TEMPLATES.get(
+        arch, cake_jit.TEMPLATE_PREFIXES[1] + "nn_t" + ROUTER_HEAD_TAIL_SUFFIX
+    )
 
 
 def router_partition_of(
@@ -1338,7 +1354,7 @@ def plan_atomic_router(
     the deterministic path, which serves or refuses it as that package does), a template this checkout does not
     register for ``arch``, or the planner (:func:`router_partition`).  An explicit ``splits`` (``1`` included) runs
     this package's program when the view and the registry allow it; a head/tail partition runs the head/tail program
-    (``router_fp32_gemm_atomic_nn_t`` + :data:`ROUTER_HEAD_TAIL_SUFFIX`)."""
+    of the architecture (:func:`router_head_tail_template`)."""
     if (
         A.dtype != torch.float32
         or B.dtype != torch.float32
@@ -1392,7 +1408,7 @@ def plan_atomic_router(
         return None, "the planner keeps the row on the deterministic program"
     units, head_spans, head_steps = partition
     if head_spans:
-        template += ROUTER_HEAD_TAIL_SUFFIX
+        template = router_head_tail_template(arch)
         if template not in cake_jit.KERNELS.get(arch, {}):
             return None, f"{template} is not registered for {arch}"
     m_tiles, n_tiles, k_iters = _router_grid(M_eff, N_eff, K)
@@ -1591,7 +1607,7 @@ def _k2_values(
 ) -> dict[str, Any]:
     """The keyword arguments of a K2 launch of this package (ordered by the program's argument plan): ``out`` is
     passed twice, as the store pointer and as the reduce-add map ``D``; ``head_spans`` / ``head_steps`` are read by the
-    head/tail program only; ``enable_pdl`` is the launch's PDL flag (0 or 1)."""
+    head/tail programs only; ``enable_pdl`` is the launch's PDL flag (0 or 1)."""
     return dict(
         A=A,
         B=parts,
