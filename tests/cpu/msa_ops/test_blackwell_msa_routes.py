@@ -18,6 +18,7 @@ is one the dispatcher derives from its inputs, and the input-derived
 predicates select exactly the registered programs.
 """
 
+import random
 import threading
 import types
 from unittest import mock
@@ -1371,6 +1372,69 @@ def test_persistent_work_order_redeals_the_fill_tail_only():
     assert backend._kmaj_p_order_work_lpt([], num_sms=4, fill_groups=8) == []
     with pytest.raises(ValueError, match="bulk"):
         backend._kmaj_p_order_work_lpt(work[3:] + work[:3], num_sms=4, fill_groups=8)
+
+
+def _scan_deal_fill(work, *, grid, n_bulk, projected):
+    # the deal as a scan of the grid per fill item (the specification the
+    # run-sorted form must reproduce item for item)
+    out, loads, fill_slots = list(work), [0] * grid, []
+    for bid, positions in enumerate(backend._kmaj_p_snake_positions(len(work), grid)):
+        fill_slots.append([pos for pos in positions if pos >= n_bulk])
+        loads[bid] = sum(work[pos][0] for pos in positions if pos < n_bulk)
+    order = sorted(range(n_bulk, len(work)), key=lambda index: -work[index][0])
+    sizes = [work[index][0] for index in order]
+    tail_sums = [sum(sizes[start:]) for start in range(len(sizes) + 1)]
+    for dealt, index in enumerate(order):
+        remaining = len(sizes) - dealt - 1
+        keys = []
+        for bid in range(grid):
+            if fill_slots[bid]:
+                forced = min(len(fill_slots[bid]) - 1, remaining)
+                tail = tail_sums[len(sizes) - forced] if forced else 0
+                load = loads[bid] + (sizes[dealt] + tail if projected else 0)
+                keys.append((load, bid))
+        bid = min(keys)[1]
+        out[fill_slots[bid].pop(0)] = work[index]
+        loads[bid] += sizes[dealt]
+    return out, max(loads)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("num_sms", [1, 2, 7, 148, 152])
+@pytest.mark.parametrize("fill_groups", [2, 8, 128])
+@pytest.mark.parametrize("seed", range(6))
+def test_persistent_work_order_deal_matches_the_grid_scan(num_sms, fill_groups, seed):
+    # the run-sorted deal places every fill item where the scan of the grid
+    # does, the lower bound is below every order, and the order the plan keeps
+    # is the one of the two deals computed unconditionally (fill_groups 2: one
+    # run of equal fill items)
+    rng = random.Random(100000 * fill_groups + 1000 * num_sms + seed)
+    n_bulk = rng.randrange(0, 3 * num_sms + 2)
+    n_fill = rng.randrange(1, 6 * num_sms + 8)
+    work = [
+        (rng.randrange(fill_groups, 3 * fill_groups), ("bulk", i))
+        for i in range(n_bulk)
+    ]
+    work += [(rng.randrange(1, fill_groups), ("fill", i)) for i in range(n_fill)]
+    grid = max(1, min(len(work), num_sms))
+    sizes = [size for size, _entry in work]
+    bound = backend._kmaj_p_lpt_lower_bound(sizes, grid=grid, n_bulk=n_bulk)
+    input_load = max(backend._kmaj_p_snake_group_loads(work, num_sms=num_sms))
+    assert bound <= input_load
+    best, best_load = list(work), input_load
+    for projected in (False, True):
+        dealt, load = backend._kmaj_p_deal_fill(
+            work, grid=grid, n_bulk=n_bulk, projected=projected
+        )
+        assert (dealt, load) == _scan_deal_fill(
+            work, grid=grid, n_bulk=n_bulk, projected=projected
+        )
+        assert max(backend._kmaj_p_snake_group_loads(dealt, num_sms=num_sms)) == load
+        assert bound <= load
+        if load < best_load:
+            best, best_load = dealt, load
+    out = backend._kmaj_p_order_work_lpt(work, num_sms=num_sms, fill_groups=fill_groups)
+    assert out == best
 
 
 @pytest.mark.cpu_only
