@@ -126,6 +126,34 @@ SHAPE_ROWS = {
         "context_bf16", 4, 2048, 2048, 40, 8, 16, True,
         {"sm100a": "RUNTIME_PACK5", "sm103a": "RUNTIME_PACK5"},
     ),
+    # JIT packs 5 and 7: the runtime-size program of that pack (sm103a, at most
+    # 128 keys: the default-ring program).
+    "fp8_b8_q32_k1024_g5_page16": (
+        "context_fp8", 8, 32, 1024, 40, 8, 16, True,
+        {"sm100a": "RUNTIME_PACK5", "sm103a": "RUNTIME_PACK5_PX"},
+    ),
+    "fp8_b4_q100_k2048_g7": (
+        "context_fp8", 4, 100, 2048, 28, 4, 64, True,
+        {"sm100a": "RUNTIME_PACK7_PAGE64", "sm103a": "RUNTIME_PACK7_PAGE64_PX"},
+    ),
+    "fp8_b4_q16_k128_g5": (
+        "context_fp8", 4, 16, 128, 20, 4, 64, True,
+        {"sm100a": "RUNTIME_PACK5_PAGE64", "sm103a": "RUNTIME_PACK5_PAGE64"},
+    ),
+    # JIT packs 6, 12 and 16 where the dividing pack runs more tile work: the
+    # runtime-size program of that pack.
+    "fp8_b8_q32_k1024_g6_page16": (
+        "context_fp8", 8, 32, 1024, 30, 5, 16, True,
+        {"sm100a": "RUNTIME_PACK6", "sm103a": "RUNTIME_PACK6_PX"},
+    ),
+    "fp8_b4_q8_k2048_g12": (
+        "context_fp8", 4, 8, 2048, 48, 4, 64, True,
+        {"sm100a": "RUNTIME_PACK12_PAGE64", "sm103a": "RUNTIME_PACK12_PAGE64_PX"},
+    ),
+    "fp8_b4_q4_k1024_g16_page16": (
+        "context_fp8", 4, 4, 1024, 32, 2, 16, True,
+        {"sm100a": "RUNTIME_PACK16", "sm103a": "RUNTIME_PACK16_PX"},
+    ),
 }  # fmt: skip
 # The device-scale program of a host-scale one; a runtime-size program serves
 # both scale forms itself.
@@ -605,8 +633,16 @@ def test_cake_fmha_context_bf16_calls_outside_the_exact_programs_take_the_runtim
 # back-to-back processes with an A/A band; a shape within 2 % of it counts as
 # a win only when it also wins under five seeded memory layouts.  The route
 # gives every measured loss to the JIT module, and every measured win but
-# three to the runtime-size program (sm100a ``g4_q4`` under the sm100a stream
-# rule, ``e_g5_causal`` on both targets under the tile-work rule).
+# one to the runtime-size program (sm100a ``g4_q4`` under the sm100a stream
+# rule).  The rows of JIT packs 7 and 5, and those of JIT packs 6 and 16 whose
+# dividing pack runs more tile work than the JIT pack (``g6_q4``, ``g6_q32``,
+# ``g6_q64``, ``g16_q4``, ``g16_q16``), take the runtime-size program of the
+# JIT pack (timed against the JIT module the same way), but where the sm100a
+# power rule keeps the JIT module (``g5_q192``, ``g7_q192``: the own packs keep
+# the rule over every cache), and on sm100a over caches of more than 8192 keys
+# with more than 64 (request, KV head) streams (``own_*_k16384``: median wins
+# of 1 .. 3 % whose slowest round fell inside the A/A band in some of ten
+# seeded memory layouts).
 _FP8_RUNTIME_ROUTE_ROWS = [
     ("sm103a", "g1_q4", 256, 4, 1024, 32, 32, 1, True),
     ("sm103a", "g1_q32", 256, 32, 1024, 32, 32, 1, True),
@@ -620,19 +656,19 @@ _FP8_RUNTIME_ROUTE_ROWS = [
     ("sm103a", "g4_q4", 256, 4, 1024, 32, 8, 4, True),
     ("sm103a", "g4_q32", 256, 32, 1024, 32, 8, 4, True),
     ("sm103a", "g4_q256", 16, 256, 2048, 32, 8, 4, True),
-    ("sm103a", "g5_q4", 256, 4, 1024, 30, 6, 5, False),
-    ("sm103a", "g5_q32", 256, 32, 1024, 30, 6, 5, False),
+    ("sm103a", "g5_q4", 256, 4, 1024, 30, 6, 5, True),
+    ("sm103a", "g5_q32", 256, 32, 1024, 30, 6, 5, True),
     ("sm103a", "g5_q256", 16, 256, 2048, 30, 6, 1, True),
-    ("sm103a", "g6_q4", 256, 4, 1024, 30, 5, 6, False),
-    ("sm103a", "g6_q32", 256, 32, 1024, 30, 5, 6, False),
+    ("sm103a", "g6_q4", 256, 4, 1024, 30, 5, 6, True),
+    ("sm103a", "g6_q32", 256, 32, 1024, 30, 5, 6, True),
     ("sm103a", "g6_q256", 16, 256, 2048, 30, 5, 1, True),
-    ("sm103a", "g7_q4", 256, 4, 1024, 28, 4, 7, False),
-    ("sm103a", "g7_q32", 256, 32, 1024, 28, 4, 7, False),
+    ("sm103a", "g7_q4", 256, 4, 1024, 28, 4, 7, True),
+    ("sm103a", "g7_q32", 256, 32, 1024, 28, 4, 7, True),
     ("sm103a", "g7_q256", 16, 256, 2048, 28, 4, 1, True),
     ("sm103a", "g8_q4", 256, 4, 1024, 32, 4, 8, True),
     ("sm103a", "g8_q32", 256, 32, 1024, 32, 4, 8, True),
     ("sm103a", "g8_q256", 16, 256, 2048, 32, 4, 8, True),
-    ("sm103a", "g16_q4", 256, 4, 1024, 32, 2, 16, False),
+    ("sm103a", "g16_q4", 256, 4, 1024, 32, 2, 16, True),
     ("sm103a", "g16_q32", 256, 32, 1024, 32, 2, 16, True),
     ("sm103a", "g16_q256", 16, 256, 2048, 32, 2, 16, True),
     ("sm103a", "g32_q4", 256, 4, 1024, 32, 1, 32, False),
@@ -651,7 +687,7 @@ _FP8_RUNTIME_ROUTE_ROWS = [
     ("sm103a", "s_b32_q128_g8", 32, 128, 4096, 32, 4, 8, True),
     ("sm103a", "n_q1_b255_p64", 255, 1, 1024, 32, 4, 8, True),
     ("sm103a", "n_g8_h64_q32_b3", 3, 32, 2000, 64, 8, 8, True),
-    ("sm103a", "e_g5_causal", 2, 200, 700, 10, 2, 5, False),
+    ("sm103a", "e_g5_causal", 2, 200, 700, 10, 2, 5, True),
     ("sm103a", "n_g4_q8_b6", 6, 8, 1024, 16, 4, 4, True),
     ("sm103a", "n_q300_b2_p16", 2, 300, 1500, 32, 4, 8, True),
     ("sm103a", "e_tail_h64", 1, 1000, 1333, 64, 8, 8, True),
@@ -665,15 +701,15 @@ _FP8_RUNTIME_ROUTE_ROWS = [
     ("sm103a", "g8_q128", 256, 128, 1024, 32, 4, 8, True),
     ("sm103a", "g3_q64", 256, 64, 1024, 30, 10, 3, False),
     ("sm103a", "g3_q128", 256, 128, 1024, 30, 10, 3, False),
-    ("sm103a", "g5_q64", 256, 64, 1024, 30, 6, 5, False),
-    ("sm103a", "g5_q128", 256, 128, 1024, 30, 6, 5, False),
-    ("sm103a", "g5_q192", 256, 192, 1024, 30, 6, 5, False),
-    ("sm103a", "g6_q64", 256, 64, 1024, 30, 5, 6, False),
+    ("sm103a", "g5_q64", 256, 64, 1024, 30, 6, 5, True),
+    ("sm103a", "g5_q128", 256, 128, 1024, 30, 6, 5, True),
+    ("sm103a", "g5_q192", 256, 192, 1024, 30, 6, 5, True),
+    ("sm103a", "g6_q64", 256, 64, 1024, 30, 5, 6, True),
     ("sm103a", "g6_q128", 256, 128, 1024, 30, 5, 6, True),
-    ("sm103a", "g7_q64", 256, 64, 1024, 28, 4, 7, False),
-    ("sm103a", "g7_q128", 256, 128, 1024, 28, 4, 7, False),
-    ("sm103a", "g7_q192", 256, 192, 1024, 28, 4, 7, False),
-    ("sm103a", "g16_q16", 256, 16, 1024, 32, 2, 16, False),
+    ("sm103a", "g7_q64", 256, 64, 1024, 28, 4, 7, True),
+    ("sm103a", "g7_q128", 256, 128, 1024, 28, 4, 7, True),
+    ("sm103a", "g7_q192", 256, 192, 1024, 28, 4, 7, True),
+    ("sm103a", "g16_q16", 256, 16, 1024, 32, 2, 16, True),
     ("sm103a", "g32_q16", 256, 16, 1024, 32, 1, 32, False),
     ("sm100a", "g1_q4", 256, 4, 1024, 32, 32, 1, False),
     ("sm100a", "g1_q32", 256, 32, 1024, 32, 32, 1, False),
@@ -687,19 +723,19 @@ _FP8_RUNTIME_ROUTE_ROWS = [
     ("sm100a", "g4_q4", 256, 4, 1024, 32, 8, 4, False),
     ("sm100a", "g4_q32", 256, 32, 1024, 32, 8, 4, False),
     ("sm100a", "g4_q256", 16, 256, 2048, 32, 8, 4, True),
-    ("sm100a", "g5_q4", 256, 4, 1024, 30, 6, 5, False),
-    ("sm100a", "g5_q32", 256, 32, 1024, 30, 6, 5, False),
+    ("sm100a", "g5_q4", 256, 4, 1024, 30, 6, 5, True),
+    ("sm100a", "g5_q32", 256, 32, 1024, 30, 6, 5, True),
     ("sm100a", "g5_q256", 16, 256, 2048, 30, 6, 1, True),
-    ("sm100a", "g6_q4", 256, 4, 1024, 30, 5, 6, False),
-    ("sm100a", "g6_q32", 256, 32, 1024, 30, 5, 6, False),
+    ("sm100a", "g6_q4", 256, 4, 1024, 30, 5, 6, True),
+    ("sm100a", "g6_q32", 256, 32, 1024, 30, 5, 6, True),
     ("sm100a", "g6_q256", 16, 256, 2048, 30, 5, 1, True),
-    ("sm100a", "g7_q4", 256, 4, 1024, 28, 4, 7, False),
-    ("sm100a", "g7_q32", 256, 32, 1024, 28, 4, 7, False),
+    ("sm100a", "g7_q4", 256, 4, 1024, 28, 4, 7, True),
+    ("sm100a", "g7_q32", 256, 32, 1024, 28, 4, 7, True),
     ("sm100a", "g7_q256", 16, 256, 2048, 28, 4, 1, True),
     ("sm100a", "g8_q4", 256, 4, 1024, 32, 4, 8, True),
     ("sm100a", "g8_q32", 256, 32, 1024, 32, 4, 8, True),
     ("sm100a", "g8_q256", 16, 256, 2048, 32, 4, 8, True),
-    ("sm100a", "g16_q4", 256, 4, 1024, 32, 2, 16, False),
+    ("sm100a", "g16_q4", 256, 4, 1024, 32, 2, 16, True),
     ("sm100a", "g16_q32", 256, 32, 1024, 32, 2, 16, True),
     ("sm100a", "g16_q256", 16, 256, 2048, 32, 2, 16, True),
     ("sm100a", "g32_q4", 256, 4, 1024, 32, 1, 32, False),
@@ -718,7 +754,7 @@ _FP8_RUNTIME_ROUTE_ROWS = [
     ("sm100a", "s_b32_q128_g8", 32, 128, 4096, 32, 4, 8, True),
     ("sm100a", "n_q1_b255_p64", 255, 1, 1024, 32, 4, 8, True),
     ("sm100a", "n_g8_h64_q32_b3", 3, 32, 2000, 64, 8, 8, True),
-    ("sm100a", "e_g5_causal", 2, 200, 700, 10, 2, 5, False),
+    ("sm100a", "e_g5_causal", 2, 200, 700, 10, 2, 5, True),
     ("sm100a", "n_g4_q8_b6", 6, 8, 1024, 16, 4, 4, True),
     ("sm100a", "n_q300_b2_p16", 2, 300, 1500, 32, 4, 8, True),
     ("sm100a", "e_tail_h64", 1, 1000, 1333, 64, 8, 8, True),
@@ -742,15 +778,25 @@ _FP8_RUNTIME_ROUTE_ROWS = [
     ("sm100a", "g4_q128_b128", 128, 128, 1024, 32, 8, 4, True),
     ("sm100a", "g3_q64", 256, 64, 1024, 30, 10, 3, False),
     ("sm100a", "g3_q128", 256, 128, 1024, 30, 10, 3, False),
-    ("sm100a", "g5_q64", 256, 64, 1024, 30, 6, 5, False),
-    ("sm100a", "g5_q128", 256, 128, 1024, 30, 6, 5, False),
+    ("sm100a", "g5_q64", 256, 64, 1024, 30, 6, 5, True),
+    ("sm100a", "g5_q128", 256, 128, 1024, 30, 6, 5, True),
     ("sm100a", "g5_q192", 256, 192, 1024, 30, 6, 5, False),
-    ("sm100a", "g6_q64", 256, 64, 1024, 30, 5, 6, False),
+    ("sm100a", "g6_q64", 256, 64, 1024, 30, 5, 6, True),
     ("sm100a", "g6_q128", 256, 128, 1024, 30, 5, 6, True),
-    ("sm100a", "g7_q64", 256, 64, 1024, 28, 4, 7, False),
-    ("sm100a", "g7_q128", 256, 128, 1024, 28, 4, 7, False),
+    ("sm100a", "g7_q64", 256, 64, 1024, 28, 4, 7, True),
+    ("sm100a", "g7_q128", 256, 128, 1024, 28, 4, 7, True),
     ("sm100a", "g7_q192", 256, 192, 1024, 28, 4, 7, False),
-    ("sm100a", "g16_q16", 256, 16, 1024, 32, 2, 16, False),
+    ("sm100a", "own_g5_q2048_k1024", 128, 2048, 1024, 40, 8, 5, False),
+    ("sm100a", "own_g7_q1024_k1024", 256, 1024, 1024, 28, 4, 7, False),
+    ("sm100a", "own_g5_q1_k16384", 128, 1, 16384, 40, 8, 5, False),
+    ("sm100a", "own_g5_q128_k16384", 32, 128, 16384, 40, 8, 5, False),
+    ("sm100a", "own_g7_q128_k16384", 128, 128, 16384, 28, 4, 7, False),
+    ("sm100a", "own_g5_q128_k16384_s64", 8, 128, 16384, 40, 8, 5, True),
+    ("sm100a", "own_g5_q1_k8192", 128, 1, 8192, 40, 8, 5, True),
+    ("sm100a", "own_g7_q128_k8192", 128, 128, 8192, 28, 4, 7, True),
+    ("sm103a", "own_g5_q1_k16384", 128, 1, 16384, 40, 8, 5, True),
+    ("sm103a", "own_g7_q128_k16384", 128, 128, 16384, 28, 4, 7, True),
+    ("sm100a", "g16_q16", 256, 16, 1024, 32, 2, 16, True),
     ("sm100a", "g32_q16", 256, 16, 1024, 32, 1, 32, False),
 ]  # fmt: skip
 # Calls the sm100a rule of many query rows at long query lengths covers, over
@@ -801,7 +847,9 @@ def test_cake_fmha_context_fp8_runtime_route(
     """The row's JIT pack, the predicate's route and the route selection
     takes for a causal FP8 call of the row's shape with 16-token pages (no
     exact route): the runtime-size program of the largest shipped pack
-    dividing the JIT pack, or the JIT module."""
+    dividing the JIT pack, or of the JIT pack where that one runs more tile
+    work and the JIT pack is a pack of ``_CONTEXT_FP8_RUNTIME_OWN_PACKS``, or
+    the JIT module."""
 
     assert cake_api._context_pack_g(max_q, max_kv, num_q_heads, num_kv_heads) == pack_g
     assert (
@@ -827,8 +875,12 @@ def test_cake_fmha_context_fp8_runtime_route(
     )
     assert route is not None and route.component == "context_fp8"
     if serves:
-        pack = cake_api._context_fp8_runtime_pack(pack_g)
-        assert pack_g % pack == 0 and pack in (1, 2, 4, 8)
+        pack = cake_api._context_fp8_runtime_route_pack(
+            max_q, max_kv, num_q_heads, pack_g
+        )
+        own = cake_api._CONTEXT_FP8_RUNTIME_OWN_PACKS
+        assert pack is not None and pack_g % pack == 0 and pack in (1, 2, 4, 8, *own)
+        assert pack in (pack_g, cake_api._context_fp8_runtime_pack(pack_g))
         assert route.program == f"RUNTIME_PACK{pack}{_RUNTIME_SUFFIX[target]}"
         assert route.pack_g == pack
     elif (
@@ -939,6 +991,59 @@ def test_cake_fmha_context_fp8_exact_routes_come_first(monkeypatch, target) -> N
         assert route.num_m_blocks == -(-33 // (2 * (128 // pack)))
 
 
+# Calls of JIT packs 7 and 5, and of JIT packs 6, 12 and 16 whose dividing pack
+# runs more tile work: (num_q_heads, num_kv_heads, JIT pack, batch, max_q_len,
+# max_kv_len, page size).
+_FP8_OWN_PACK_ROWS = [
+    (40, 8, 5, 2, 32, 1024, 16),
+    (10, 2, 5, 4, 128, 4096, 64),
+    (5, 1, 5, 1, 1, 16384, 16),
+    (20, 4, 5, 4, 16, 128, 64),
+    (28, 4, 7, 8, 8, 1024, 64),
+    (7, 1, 7, 2, 100, 300, 16),
+    (28, 4, 7, 1, 4, 100, 16),
+    (30, 5, 6, 8, 32, 1024, 16),
+    (12, 2, 6, 2, 4, 4096, 64),
+    (48, 4, 12, 4, 8, 2048, 64),
+    (12, 1, 12, 4, 1, 4096, 16),
+    (32, 2, 16, 4, 4, 1024, 16),
+    (16, 1, 16, 2, 16, 100, 64),
+]
+
+
+@pytest.mark.parametrize("target", ("sm100a", "sm103a"))
+def test_cake_fmha_context_fp8_own_pack_routes(monkeypatch, target) -> None:
+    """A call whose JIT pack is 7 or 5, or 6, 12 or 16 where the dividing pack
+    runs more tile work, takes the runtime-size program of that pack and its
+    two-stage tiles, never a split-KV or one-stage program (sm103a: of at most
+    128 keys, the default-ring program); the dividing rule is unchanged."""
+
+    assert cake_api._CONTEXT_FP8_RUNTIME_OWN_PACKS == (7, 5, 6, 12, 16)
+    for pack_g, pack in (
+        (7, 1), (5, 1), (6, 2), (12, 4), (16, 8), (14, 2), (10, 2), (15, 1), (20, 4), (35, 1),
+    ):  # fmt: skip
+        assert cake_api._context_fp8_runtime_pack(pack_g) == pack, pack_g
+    monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: target)
+    monkeypatch.setattr(
+        cake_api, "_context_split_sm_count", lambda device: _SM_COUNT[target]
+    )
+    for hq, hkv, pack, batch, max_q, max_kv, page in _FP8_OWN_PACK_ROWS:
+        assert cake_api._context_pack_g(max_q, max_kv, hq, hkv) == pack
+        assert cake_api._context_fp8_runtime_route_pack(max_q, max_kv, hq, pack) == pack
+        program = f"RUNTIME_PACK{pack}" + ("_PAGE64" if page == 64 else "")
+        if target == "sm103a" and max_kv > 128:
+            program += "_PX"
+        shape = ("context_fp8", batch, max_q, max_kv, hq, hkv, page, True, None)
+        for device_scales in (False, True):
+            route = cake_api.select_cake_fmha_context_route(
+                torch.device("meta"),
+                **_context_kwargs(shape, device_scales=device_scales, device="meta"),
+            )
+            assert route is not None and route.program == program, (shape, route)
+            assert route.pack_g == pack
+            assert route.num_m_blocks == -(-max_q // (2 * (128 // pack)))
+
+
 @pytest.mark.parametrize("target", ("sm100a", "sm103a"))
 def test_cake_fmha_context_fp8_short_kv_routes(monkeypatch, target) -> None:
     """A launch of at most the keys of its exact, runtime-size or one-stage
@@ -1007,16 +1112,19 @@ _SM_COUNT = {"sm100a": 148, "sm103a": 152}
 
 
 def test_cake_fmha_context_fp8_split_routes_mirror_the_runtime_routes() -> None:
-    """Every runtime-size program has the split-KV program of its pack and page
-    size on the same targets, and the only other split-KV program is the
-    sm100a two-split build of the pack-1 page-64 one."""
+    """Every runtime-size program but those of the packs that serve only their
+    own JIT pack (7 and 5) has the split-KV program of its pack and page size
+    on the same targets, and the only other split-KV program is the sm100a
+    two-split build of the pack-1 page-64 one."""
 
     runtime = cake_api._CONTEXT_FP8_RUNTIME_ROUTES
+    own = cake_api._CONTEXT_FP8_RUNTIME_OWN_PACKS
     assert set(cake_api._CONTEXT_FP8_SPLIT_ROUTES) == set(runtime)
     for target, routes in runtime.items():
         assert cake_api._CONTEXT_FP8_SPLIT_ROUTES[target] == {
             key: "RUNTIME_SK" + identifier.removeprefix("RUNTIME").removesuffix("_PX")
             for key, identifier in routes.items()
+            if key[0] not in own
         }
     assert cake_api._CONTEXT_FP8_TWO_SPLIT_ROUTES == {
         "sm100a": {"RUNTIME_SK_PACK1_PAGE64": "RUNTIME_SK_PACK1_PAGE64_S2"}
@@ -1538,17 +1646,20 @@ def test_cake_fmha_context_fp8_split_route_without_a_runtime_pack_plan(
 
 
 def test_cake_fmha_context_fp8_one_stage_routes_mirror_the_runtime_routes() -> None:
-    """Every runtime-size program has the one-stage program of its pack and
-    page size on the same targets (the same schedule and P placement with one
+    """Every runtime-size program but those of packs 7 and 5 has the one-stage
+    program of its pack and page size on the same targets (the same schedule and P placement with one
     query stage per tile); the only other one-stage programs are the
     multi-wave builds of those programs without the short-KV chain and the
     sm100a one-wave builds of the every-page-size ones with it."""
 
     runtime = cake_api._CONTEXT_FP8_RUNTIME_ROUTES
+    own = cake_api._CONTEXT_FP8_RUNTIME_OWN_PACKS
     assert set(cake_api._CONTEXT_FP8_ONE_STAGE_ROUTES) == set(runtime)
     for target, routes in runtime.items():
         assert cake_api._CONTEXT_FP8_ONE_STAGE_ROUTES[target] == {
-            key: identifier + "_Q1" for key, identifier in routes.items()
+            key: identifier + "_Q1"
+            for key, identifier in routes.items()
+            if key[0] not in own
         }
     assert frozenset(_ONE_STAGE_PACK) == cake_api._CONTEXT_FP8_ONE_STAGE_PROGRAMS
     assert not cake_api._CONTEXT_FP8_ONE_STAGE_PROGRAMS & set(_RUNTIME_PACK)
@@ -3588,6 +3699,13 @@ def test_cake_context_fp8_hd256_jit_route_runs_a_partial_l2_section(
         # q - kv = 32 (m + 1)).
         ("context_fp8", "B256", (32, 4), (32,) * 4, (1024, 0, 17, 0), 64),
         ("context_nvfp4", "Q511", (32, 4), (511,) * 4, (2047, 0, 479, 255), 16),
+        # The runtime-size programs of JIT packs 5, 7, 6, 12 and 16 (two query
+        # stages of 128 // pack tokens per tile).
+        ("context_fp8", "RUNTIME_PACK5", (40, 8), (32,) * 4, (1024, 0, 17, 0), 16),
+        ("context_fp8", "RUNTIME_PACK7_PAGE64", (28, 4), (100,) * 4, (2048, 0, 99, 0), 64),
+        ("context_fp8", "RUNTIME_PACK6", (30, 5), (32,) * 4, (1024, 0, 17, 0), 16),
+        ("context_fp8", "RUNTIME_PACK12_PAGE64", (48, 4), (8,) * 4, (2048, 0, 7, 0), 64),
+        ("context_fp8", "RUNTIME_PACK16", (32, 2), (4,) * 4, (1024, 0, 3, 0), 16),
     ],
 )  # fmt: skip
 def test_cake_context_quantized_program_and_jit_route_agree_on_rows_without_keys(
@@ -3603,6 +3721,8 @@ def test_cake_context_quantized_program_and_jit_route_agree_on_rows_without_keys
     target = cake_api._cake_fmha_target(torch.device("cuda"))
     if program == "B256":
         program = _FP8_EXACT[target]
+    elif program.startswith("RUNTIME_PACK"):
+        program += _RUNTIME_SUFFIX[target]
     else:
         program = f"{program}_SM{_TARGET_ARCH[target][3:].upper()}"
     case = _jit_route_batch(component, heads, q_lens, kv_lens, page_size)
@@ -3726,6 +3846,12 @@ BITWISE_ROWS = {
     "bf16_b4_q64_k1024_g4_page64": ("bf16_b4_q64_k1024_g4_page64", 4, 64),
     "bf16_b2_q256_k2048_g1_page1024": ("bf16_b2_q256_k2048_g1_page1024", 2, 256),
     "bf16_b4_q2048_k2048_g5": ("bf16_b4_q2048_k2048_g5", 4, 2048),
+    "fp8_b8_q32_k1024_g5_page16": ("fp8_b8_q32_k1024_g5_page16", 8, 32),
+    "fp8_b4_q100_k2048_g7": ("fp8_b4_q100_k2048_g7", 4, 100),
+    "fp8_b4_q16_k128_g5": ("fp8_b4_q16_k128_g5", 4, 16),
+    "fp8_b8_q32_k1024_g6_page16": ("fp8_b8_q32_k1024_g6_page16", 8, 32),
+    "fp8_b4_q8_k2048_g12": ("fp8_b4_q8_k2048_g12", 4, 8),
+    "fp8_b4_q4_k1024_g16_page16": ("fp8_b4_q4_k1024_g16_page16", 4, 4),
     **WIDENED_ROWS,
 }
 _SCALES = {"context_bf16": (128**-0.5, 1.0)}
@@ -3940,6 +4066,11 @@ def test_cake_context_programs_match_the_jit_route_with_fewer_keys_than_queries(
         ("bf16_b128_q64_k2048", 3, 64),
         ("fp8_b256_q32_k1024", 3, 32),
         ("fp8_b64_q32_k1024_g4", 3, 32),
+        ("fp8_b8_q32_k1024_g5_page16", 3, 32),
+        ("fp8_b4_q100_k2048_g7", 3, 100),
+        ("fp8_b8_q32_k1024_g6_page16", 3, 32),
+        ("fp8_b4_q8_k2048_g12", 3, 8),
+        ("fp8_b4_q4_k1024_g16_page16", 3, 4),
     ],
 )
 def test_cake_context_program_launch_invariances_are_bitwise(
