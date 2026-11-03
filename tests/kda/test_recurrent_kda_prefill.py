@@ -6386,14 +6386,27 @@ def test_small_bh_indexed_state_pool_matches_compact_state(
     )
 
 
-def test_small_bh_indexed_state_slot_beyond_int32_element_offset(small_bh_device):
+@pytest.mark.parametrize(
+    ("row_stride", "slot"),
+    (
+        # The row stride itself does not fit in int32.
+        pytest.param(2**31 + 128 * 128, 1, id="large_pitch"),
+        # The row stride fits in int32 but slot * stride does not: the common
+        # serving-arena shape of a small pitch and a large slot index.
+        pytest.param(128 * 128 + 64, 131072, id="large_slot_index"),
+    ),
+)
+def test_small_bh_indexed_state_slot_beyond_int32_element_offset(
+    small_bh_device, row_stride, slot
+):
     """A pool slot more than 2**31 elements from the pool base is addressed
     with a 64-bit offset instead of wrapping."""
 
     num_heads = 1
     slot_numel = num_heads * 128 * 128
-    row_stride = 2**31 + slot_numel
-    required_bytes = (row_stride + slot_numel) * torch.bfloat16.itemsize
+    assert slot * row_stride >= 2**31
+    storage_numel = slot * row_stride + slot_numel
+    required_bytes = storage_numel * torch.bfloat16.itemsize
     free_bytes, _ = torch.cuda.mem_get_info(small_bh_device)
     if free_bytes < required_bytes + (1 << 30):
         pytest.skip("needs about 5 GiB of free GPU memory")
@@ -6410,12 +6423,12 @@ def test_small_bh_indexed_state_slot_beyond_int32_element_offset(small_bh_device
         backend="small-bh",
     )
 
-    storage = torch.zeros(
-        row_stride + slot_numel, dtype=torch.bfloat16, device=small_bh_device
+    storage = torch.zeros(storage_numel, dtype=torch.bfloat16, device=small_bh_device)
+    pool = storage.as_strided(
+        (slot + 1, num_heads, 128, 128), (row_stride, 128 * 128, 128, 1)
     )
-    pool = storage.as_strided((2, num_heads, 128, 128), (row_stride, 128 * 128, 128, 1))
-    pool[1].copy_(state_seed[0])
-    state_indices = torch.tensor([1], dtype=torch.int32, device=small_bh_device)
+    pool[slot].copy_(state_seed[0])
+    state_indices = torch.tensor([slot], dtype=torch.int32, device=small_bh_device)
     indexed_output, _ = recurrent_kda(
         **_strict_prefill_kwargs({**inputs, "initial_state": pool}),
         ssm_state_indices=state_indices,
@@ -6426,8 +6439,10 @@ def test_small_bh_indexed_state_slot_beyond_int32_element_offset(small_bh_device
     torch.cuda.synchronize(small_bh_device)
 
     assert torch.equal(indexed_output, compact_output)
-    assert torch.equal(pool[1], compact_final[0])
-    assert not pool[0].any()
+    assert torch.equal(pool[slot], compact_final[0])
+    # Only the selected slot may change; a wrapped offset would land elsewhere.
+    pool[slot].zero_()
+    assert not storage.any()
 
 
 @pytest.mark.parametrize("packed", [False, True])

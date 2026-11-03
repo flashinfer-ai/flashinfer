@@ -275,10 +275,11 @@ def recurrent_kda(
             If ``None``, zero-initialized. Updated in-place. For
             batched spec decode without ``cu_seqlens``, ``N`` is the packed
             checkpoint-slot count ``B * (1 + num_spec_tokens)`` when
-            ``ssm_state_indices`` is omitted. For eligible frozen prefill with
-            ``ssm_state_indices``, this is a state pool
-            ``[N_pool, H, 128, 128]`` whose inner slots are contiguous;
-            padding between pool slots is allowed.
+            ``ssm_state_indices`` is omitted. For eligible frozen prefill and
+            ``backend="small-bh"`` prefill with ``ssm_state_indices``, this is
+            a state pool ``[N_pool, H, 128, 128]`` whose inner slots are
+            contiguous; padding between pool slots is allowed. The small-BH
+            pool must be bfloat16.
         output_final_state (bool):
             Whether to return the final state. Default: ``False``.
         use_qk_l2norm_in_kernel (bool):
@@ -310,7 +311,11 @@ def recurrent_kda(
             ``[N, 1+S]`` int32 for spec decode (``num_spec_tokens`` must also
             be set). Eligible frozen packed prefill and ``backend="small-bh"``
             prefill accept contiguous CUDA int32 ``[N_seq]`` indices and update
-            the selected ``initial_state`` pool slots directly.
+            the selected ``initial_state`` pool slots directly. For
+            ``backend="small-bh"``, every index must be a unique slot in
+            ``[0, N_pool)``: the kernel addresses the pool with the raw index,
+            so a negative padding index reads and writes outside the pool, and
+            a repeated index makes sequences race on one slot.
         num_spec_tokens (Optional[int]):
             Number of speculative tokens (S). When set, processes 1+S tokens in
             a single fused kernel launch. Must be >= 1.
