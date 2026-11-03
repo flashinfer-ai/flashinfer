@@ -33,7 +33,7 @@ void csf_encode_exceptions(TensorView scales, TensorView fixed, TensorView row_o
 
 void csf_expand(TensorView fixed, TensorView exceptions, TensorView exc_offsets,
                 Optional<TensorView> token_selected_experts, TensorView out, int64_t layout,
-                bool swap_row_halves);
+                bool swap_row_halves, int64_t local_expert_offset);
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(packbits, packbits);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(segment_packbits, segment_packbits);

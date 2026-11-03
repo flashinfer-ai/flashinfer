@@ -163,15 +163,21 @@ def check_routed(out, ref, poison, routed):
 
 
 @pytest.mark.parametrize("swap_row_halves", [False, True])
-def test_expand_csf_scales_routed(swap_row_halves):
+@pytest.mark.parametrize("local_expert_offset", [0, 16])
+def test_expand_csf_scales_routed(swap_row_halves, local_expert_offset):
     scales = random_scales(np.random.default_rng(2), (16, 256, 40))
     csf = encode_csf_scales(scales)
     ref = swizzle_128x4_ref(swap_halves(scales) if swap_row_halves else scales)
-    # Repeated experts and ids outside [0, 16).
+    # Repeated experts and ids outside [0, 16), shifted to global ids.
     ids = torch.tensor([[3, 7], [7, 15], [3, 0], [-1, 16]], dtype=torch.int32).cuda()
     out = torch.full_like(ref, 0xAB)
     expand_csf_scales(
-        csf, out, ids, layout=SfLayout.layout_128x4, swap_row_halves=swap_row_halves
+        csf,
+        out,
+        ids + local_expert_offset,
+        layout=SfLayout.layout_128x4,
+        swap_row_halves=swap_row_halves,
+        local_expert_offset=local_expert_offset,
     )
     check_routed(out, ref, 0xAB, {0, 3, 7, 15})
 

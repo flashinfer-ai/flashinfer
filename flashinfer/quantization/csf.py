@@ -117,6 +117,7 @@ def expand_csf_scales(
     token_selected_experts: Optional[torch.Tensor] = None,
     layout: SfLayout = SfLayout.layout_linear,
     swap_row_halves: bool = False,
+    local_expert_offset: int = 0,
 ) -> torch.Tensor:
     r"""Expand CSF block scales into a scale buffer, one matrix per expert.
 
@@ -136,7 +137,8 @@ def expand_csf_scales(
     token_selected_experts : Optional[torch.Tensor]
         Contiguous int32 expert ids of any shape, such as the ``[num_tokens, top_k]`` routing
         of a fused MoE call. Only these experts are expanded and the rest of ``out`` keeps its
-        bytes; ids outside ``[0, num_experts)`` are skipped. ``None`` expands every expert.
+        bytes; ids outside ``[local_expert_offset, local_expert_offset + num_experts)`` are
+        skipped. ``None`` expands every expert.
         An expert named more than once is expanded once: in each 128-row tile, every id is
         compared with all the ids before it, so ``N`` ids take ``O(N^2)`` comparisons per tile.
         ``None`` costs the same for any routing. Pass ids only for small routings; with 512
@@ -146,6 +148,10 @@ def expand_csf_scales(
     swap_row_halves : bool
         Swap the two halves of each matrix's rows, e.g. to turn ``[w1; w3]`` checkpoint
         order into the ``[w3; w1]`` order of the fused MoE kernels. Needs ``rows % 32 == 0``.
+    local_expert_offset : int
+        The id in ``token_selected_experts`` of ``csf``'s first expert. Under expert
+        parallelism the routing holds global ids while ``csf`` holds this rank's experts, so
+        pass the global id of this rank's first expert.
 
     Returns
     -------
@@ -163,5 +169,6 @@ def expand_csf_scales(
             out.view(torch.uint8),
             int(layout),
             swap_row_halves,
+            local_expert_offset,
         )
     return out

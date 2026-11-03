@@ -115,6 +115,8 @@ struct CsfExpandParams {
   const int32_t* exc_offsets;
   // Routed expert ids, or null to expand every expert.
   const int32_t* experts;
+  // The routed id of expert 0.
+  int expert_offset;
   int num_experts;
   int rows, cols;
   // Columns of the destination: the padded columns for 128x4; at least `cols`.
@@ -147,11 +149,12 @@ __global__ void CsfExpandKernel(CsfExpandParams p, uint8_t* __restrict__ out) {
   if (p.experts != nullptr) {
     // Each routed expert is expanded once, by the first slot naming it. The earlier slots load
     // alongside this one.
-    expert = p.experts[blockIdx.x];
+    const int id = p.experts[blockIdx.x];
     bool skip = false;
     for (int i = threadIdx.x; i < static_cast<int>(blockIdx.x); i += blockDim.x) {
-      skip |= p.experts[i] == expert;
+      skip |= p.experts[i] == id;
     }
+    expert = id - p.expert_offset;
     if (__syncthreads_or(skip || expert < 0 || expert >= p.num_experts)) return;
   }
   const int slabs = p.rows / kSlabRows, cols = p.cols, tile_words = p.tile_words;
@@ -339,7 +342,7 @@ void csf_encode_exceptions(TensorView scales, TensorView fixed, TensorView row_o
 
 void csf_expand(TensorView fixed, TensorView exceptions, TensorView exc_offsets,
                 Optional<TensorView> token_selected_experts, TensorView out, int64_t layout,
-                bool swap_row_halves) {
+                bool swap_row_halves, int64_t local_expert_offset) {
   CHECK_INPUT_AND_TYPE(fixed, dl_uint8);
   CHECK_INPUT_AND_TYPE(exceptions, dl_uint32);
   CHECK_INPUT_AND_TYPE(exc_offsets, dl_int32);
@@ -391,7 +394,10 @@ void csf_expand(TensorView fixed, TensorView exceptions, TensorView exc_offsets,
     TensorView experts = token_selected_experts.value();
     CHECK_INPUT_AND_TYPE(experts, dl_int32);
     CHECK_DEVICE(experts, fixed);
+    TVM_FFI_ICHECK(local_expert_offset >= 0 && local_expert_offset <= INT32_MAX)
+        << "local_expert_offset must fit in int32, got " << local_expert_offset;
     p.experts = static_cast<const int32_t*>(experts.data_ptr());
+    p.expert_offset = static_cast<int>(local_expert_offset);
     num_items = experts.numel();
   }
   if (num_items == 0 || num_experts == 0 || rows == 0) return;
