@@ -130,10 +130,11 @@ TOKEN_GRADS = (
 PARAM_GRADS = ("dA_log", "ddt_bias")  # raw gate mode: this rank's partial sums
 ACC_GATE = 1.10  # relative L2 error of KCP / single-rank against the FP64 reference
 # Cluster gate hook (flag-off identity against the base of this change): the omitted-keyword snapshot is written to
-# $KCP_L2N_FLAG_OFF_CAPTURE (run there on the base commit with this file copied onto it) and compared with
-# $KCP_L2N_FLAG_OFF_BASELINE (run here); the GPU row uses the same variables with the suffixes ".gpu.json" / ".gpu.pt".
-ENV_CAPTURE = "KCP_L2N_FLAG_OFF_CAPTURE"
-ENV_BASELINE = "KCP_L2N_FLAG_OFF_BASELINE"
+# $ND_KCP_L2N_FLAG_OFF_CAPTURE (run there on the base commit with this file copied onto it) and compared with
+# $ND_KCP_L2N_FLAG_OFF_BASELINE (run here); the GPU row uses the same variables with the suffixes ".gpu.json" /
+# ".gpu.pt".  The names are this package's own, apart from the deterministic package's KCP_L2N_FLAG_OFF_* pair.
+ENV_CAPTURE = "ND_KCP_L2N_FLAG_OFF_CAPTURE"
+ENV_BASELINE = "ND_KCP_L2N_FLAG_OFF_BASELINE"
 GRAPH_EVENTS = [
     ["eager", "eager"],
     ["capture", "eager"],
@@ -713,9 +714,9 @@ def test_l2n_flag_off_identity() -> None:
 
 
 def test_l2n_flag_off_snapshot_matches_the_base() -> None:
-    """Cluster gate hook: flag-off identity against the base of this change.  ``KCP_L2N_FLAG_OFF_CAPTURE=<path>``
+    """Cluster gate hook: flag-off identity against the base of this change.  ``ND_KCP_L2N_FLAG_OFF_CAPTURE=<path>``
     writes the omitted-keyword snapshot (:func:`_snapshot` uses only names the base has: run this test there with this
-    file copied onto the base checkout); ``KCP_L2N_FLAG_OFF_BASELINE=<path>`` compares this head's snapshot with it.
+    file copied onto the base checkout); ``ND_KCP_L2N_FLAG_OFF_BASELINE=<path>`` compares this head's snapshot with it.
     Skipped without either."""
     capture, baseline = os.environ.get(ENV_CAPTURE), os.environ.get(ENV_BASELINE)
     if not capture and not baseline:
@@ -2997,7 +2998,7 @@ RECORD_KEYS = ("sequence", "n_launches", "n_collectives", "n_walks", "n_merges",
 def test_gpu_l2n_flag_off_identity_w1() -> None:
     """On one device, the omitted keyword and an explicit ``False`` give bitwise the same outputs and gradients, the
     same saved-set tensors (member, shape, strides, dtype, in order), flags and meta, and the same launch inventory
-    (sequence and counters); with ``KCP_L2N_FLAG_OFF_CAPTURE`` / ``_BASELINE`` the omitted form's record (suffix
+    (sequence and counters); with ``ND_KCP_L2N_FLAG_OFF_CAPTURE`` / ``_BASELINE`` the omitted form's record (suffix
     ``.gpu.json``) and its outputs (``.gpu.pt``) are written on the base or compared with it."""
     _skip_unless_runnable(1, gate=None)
     device = torch.device("cuda", torch.cuda.current_device())
