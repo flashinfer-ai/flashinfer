@@ -69,12 +69,13 @@ backend are experimental: no compatibility guarantee.
   gradient are bitwise those of the deterministic package.  On `sm_107a` the
   per-rank parameter partial sums are bitwise too; on `sm_100a` / `sm_103a`
   they come from the `R1c` pairs (an unordered FP64 sum rounded once to FP32)
-  and can differ by about one FP32 ulp from run to run (below).  The in-kernel q / k
-  L2 norm (`use_qk_l2norm_in_kernel=True`, #7817) is not available here: the
-  entry points, `kda_workspace_bytes_kcp` and `kda_saved_bytes_kcp` raise
-  `ValueError` for it, naming `deterministic=True`.  Its off value
-  (`use_qk_l2norm_in_kernel=False`) is accepted, so a call that spells it out
-  runs unchanged.
+  and can differ by about one FP32 ulp from run to run (below).
+* The in-kernel q / k L2 norm (`use_qk_l2norm_in_kernel=True`, #7817) runs on
+  this package too ("In-kernel Q / K L2 norm" below): the rank's local stages
+  take the single-rank package's records of the mode, copies of the
+  deterministic programs (no `S1` row runs in this mode, in either gate mode),
+  so every output, the saved rstd and every gradient are bitwise those of the
+  deterministic package.
 
 ### Names
 
@@ -572,6 +573,84 @@ dA_log, ddt_bias = reduce_gate_param_grads_kcp(ctx, dA_log_r, ddt_bias_r, **nd) 
   the duration of the call) and the two parameter gradients; a rank without
   tokens returns zero parameter gradients.
 
+In-kernel Q / K L2 norm on the KCP route (issue #7817): the three KDA entry
+points, `WorkspaceKcp` and the workspace and saved byte queries take the
+keyword-only `use_qk_l2norm_in_kernel=False`.  With `True` the local stages
+normalize `q` and `k` per token and per 128-channel head (FP32 sum of squares,
+`r = 1 / sqrt(ss + 1e-6)`, `x_hat = bf16(x * r)`; `v` is not normalized) and
+the GLM intra programs fuse the FP32 pullback into the BF16 `dq` / `dk`, so
+`q_local` / `k_local` are the rank's raw rows and the gradients are theirs.
+
+```python
+nd = dict(deterministic=False)
+ws = WorkspaceKcp(use_qk_l2norm_in_kernel=True)                   # the workspace's mode, fixed
+out_local, saved = chunk_kda_fwd_kcp(q_raw, k_raw, v_local, g_local, beta_local, ctx,
+                                     workspace=ws, use_qk_l2norm_in_kernel=True, **nd)
+dq_raw, dk_raw, dv, dbeta, dg = chunk_kda_bwd_kcp(
+    q_raw, k_raw, v_local, g_local, beta_local, ctx, dout_local, saved=saved, workspace=ws,
+    use_qk_l2norm_in_kernel=True, **nd)
+```
+
+* `q_raw` / `k_raw` may be strided views, such as columns of a packed
+  projection or convolution output `[S_local, (2 H + HV) * 128]`: innermost
+  stride 1, head stride 128 elements, token stride a multiple of 8 elements
+  and at least `H * 128` (no overlapping rows), base address 16-byte aligned
+  (the single-rank rule).  They are never copied; any other view raises
+  `ValueError`.  Without the flag `q` / `k` must stay contiguous.  `v` keeps
+  its rules.  Every rank checks the metadata (shape, dtype, device, the three
+  strides), a rank with zero or one token too, so all ranks refuse a view
+  alike.  The base-address alignment is the one per-rank check: it is a
+  property of each rank's own storage, checked where the rank has tokens.
+* The normalization is token-local: the halo, the context, the KCP programs,
+  every collective and its byte count are those of the flag-off route.
+* The local stages run the single-rank package's records of the mode, copies
+  of the deterministic package's programs; its plan selects no `S1` pair in
+  the mode.  Every output, the saved rstd and every gradient are bitwise
+  those of `chunk_kda_det_fwd_kcp` / `chunk_kda_det_bwd_kcp` on the same rank,
+  in both gate modes (`use_gate_in_kernel=True` combines with the flag).
+* The saved set keeps the raw `q` / `k` (the caller's tensors) and adds the
+  FP32 rstd `SavedKcp.qk_rstd` `[2, S_local, H]` (plane 0 q, plane 1 k;
+  empty on a rank without tokens): `kda_saved_bytes_kcp(...,
+  use_qk_l2norm_in_kernel=True)` is `8 * S_local * H` bytes more.  The
+  normalized q / k are never saved: the backward rebuilds them bitwise from
+  the raw rows and the rstd, and a checkpoint recompute writes its rstd
+  afresh, so a recompute handle's entry and bytes do not change.  The
+  backward keeps the rebuilt rows in its local arena, in the bytes of two
+  internal buffers that it moves into the bytes of its own outputs (dq / dk
+  and the gate gradient) until the GLM intra program writes those, so it
+  needs no memory beyond the flag-off backward's.  Where an output is too
+  small for its buffer (more than `2 * S_local` internal rows; in raw gate
+  mode more than `S_local` for the gate gradient), that row set takes a
+  per-call buffer (`256 * S_local * H` bytes each) instead.
+* The mode is fixed per workspace (the replay local arena of that mode;
+  `local_arena="lean"` is refused with it), recorded in the saved set
+  (`SavedKcp.qk_l2norm`), the graph validity key and a recompute handle's
+  fingerprint; a call, a saved set or a recompute of the other mode is
+  refused with `ValueError`.  `spec3_probe` is refused with the flag.
+* The checkpoint hand-off does not engage with the flag (its tape set is
+  verified without the norm): such a call keeps the light set under every
+  `checkpoint_handoff` value and records no decision.
+* With `use_qk_l2norm_in_kernel=False` (the default) every launch, saved
+  tensor, key, fingerprint and byte is unchanged.
+* The local programs of the mode are the single-rank backend's (its plan mode
+  `l2n="fused"`: the first q / k reader normalizes, the GLM intra program
+  pulls back; a saved-mode backward reads the saved rstd).  Until the
+  single-rank registry selects a record of the mode for every such stage of
+  the forward and replay paths over a fixed grid of problem sizes (at most
+  and above 256 documents, few and many heads, the architecture's SM
+  counts), each delivered and exported for the device's architecture, with
+  exactly one normalizing first reader on the replay, and its forward and
+  replay layouts carry the normalized slot views `qn_int` / `kn_int`, a
+  call, a `WorkspaceKcp` and the byte queries with the flag on raise
+  `NotImplementedError` before any workspace build, plan, launch or
+  collective.  The check reads rank-independent inputs only (the
+  architecture of the context's device, the registry's selection over that
+  grid and its exports, the flags and gate mode, the static layout tables),
+  so every rank, one without tokens or with a misaligned view too, raises
+  the same error with the same message.  The saved byte query takes the
+  call's `use_gate_in_kernel` for this check.  With the flag off the byte
+  queries make no CUDA call for it.
+
 The segment plan splits every fragment into `P` segments: above the 256-chunk
 chain cap the equal-segment wave rule on ranks with at most three fragments,
 below it on one-fragment ranks the
@@ -653,6 +732,10 @@ the keywords, the workspace and its byte query, the saved set, the reduction
 helper, the local stages' records; multi-GPU rows against the single-rank raw
 path, the FP64 reference and, bitwise, the deterministic package's raw KCP
 route),
+`tests/experimental/test_cake_kda_train_kcp_l2n.py` (the in-kernel Q / K L2
+norm: the keywords, the strided views, the workspace, the byte queries and
+the saved set; multi-GPU rows against the single-rank path, the FP64
+reference and, bitwise, the deterministic package's KCP route in the mode),
 `_fsdp_walk.py`, `_shared_ws.py` and `_upload.py`; benchmark
 `benchmarks/bench_cake_kda_train_kcp.py` (`torchrun`, one process per
 rank; the deterministic and the non-deterministic package interleaved).
