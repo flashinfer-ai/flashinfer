@@ -2262,6 +2262,17 @@ def test_l2n_local_stage_values_cover_the_records(H, arch, sm, gate, form) -> No
         for s, r in on_l:
             if s == "backend" and (s, r) not in off_l:
                 assert own(r), (kind, r)
+        if kind.startswith("bwd"):
+            # the prep is the plan's, or its saved-rstd twin where the launch reads the saved rstd
+            prep = plans[form].record("bwd_prep", cake_kcp.LOCAL_PATH_BWD)
+            if kind == "bwd_saved" and form == "fused":
+                prep = cake_kcp_plan.saved_rstd_record(prep, arch)
+            ran = {
+                r
+                for s, r in on_l
+                if s == "backend" and mod(s, r)["stage"] == "bwd_prep"
+            }
+            assert ran == {prep}, (kind, ran)
         if form == "fallback":
             names = [r for s, r, _g, _v in res if s == "backend"]
             first_qk = "qk_l2norm_apply" if kind == "bwd_saved" else "qk_l2norm"
@@ -2270,6 +2281,89 @@ def test_l2n_local_stage_values_cover_the_records(H, arch, sm, gate, form) -> No
                 i = names.index("qk_pullback")
                 assert "_l2n_capture" in names[i - 1], names
                 assert names[i + 1 :] == (["param_finalize"] if gate == "raw" else [])
+
+
+SAVED_RSTD_BASE = "bwd_prep_g8_replay_l2n"
+SAVED_RSTD_TWIN = "bwd_prep_g8_replay_saved_l2n"
+
+
+@pytest.mark.parametrize("arch", ("sm_100a", "sm_103a", "sm_107a", None))
+def test_l2n_saved_rstd_record(arch, monkeypatch, request) -> None:
+    """:func:`cake_kcp_plan.saved_rstd_record`: the replay prep runs its saved-rstd twin on sm_100a / sm_103a (the
+    twin's architectures, each with a ``build.json`` library) and stays itself on sm_107a and without an
+    architecture; every other record is its own.  The twin is kept only while the registry has it as an ``_l2n``
+    twin of the same stage delivered for the architecture with a library: each condition alone keeps the record
+    (the per-process cache cleared around each changed registry)."""
+    pick = cake_kcp_plan.saved_rstd_record
+    request.addfinalizer(pick.cache_clear)
+
+    def fresh(record: str) -> str:
+        pick.cache_clear()
+        return pick(record, arch)
+
+    assert cake_kcp_plan.SAVED_RSTD_TWINS == {SAVED_RSTD_BASE: SAVED_RSTD_TWIN}
+    ships = arch in ("sm_100a", "sm_103a")
+    want = SAVED_RSTD_TWIN if ships else SAVED_RSTD_BASE
+    assert fresh(SAVED_RSTD_BASE) == want
+    for other in (SAVED_RSTD_TWIN, "bwd_prep_g8_noqg_l2n", "glm_intra_l2n"):
+        assert fresh(other) == other
+    if not ships:
+        return
+    entry = cake_jit.MODULES[SAVED_RSTD_TWIN]
+    others = [a for a in entry["arches"] if a != arch]
+    for change in (
+        {"l2n": ["off", "fused"]},
+        {"stage": "fwd_intra"},
+        {"arches": others},
+    ):
+        with monkeypatch.context() as m:
+            m.setitem(cake_jit.MODULES, SAVED_RSTD_TWIN, {**entry, **change})
+            assert fresh(SAVED_RSTD_BASE) == SAVED_RSTD_BASE, change
+    with monkeypatch.context() as m:
+        m.delitem(cake_jit.MODULES, SAVED_RSTD_TWIN)
+        assert fresh(SAVED_RSTD_BASE) == SAVED_RSTD_BASE
+    lib = cake_jit.library_name(SAVED_RSTD_TWIN, arch)
+    libs = {k: v for k, v in cake_build.libraries_by_name().items() if k != lib}
+    with monkeypatch.context() as m:
+        m.setattr(cake_build, "libraries_by_name", lambda: libs)
+        assert fresh(SAVED_RSTD_BASE) == SAVED_RSTD_BASE
+    assert fresh(SAVED_RSTD_BASE) == SAVED_RSTD_TWIN  # the registry and build restored
+
+
+@pytest.mark.parametrize("host_trim", (0, 1))
+@pytest.mark.parametrize("arch", ("sm_100a", "sm_103a", "sm_107a"))
+def test_l2n_saved_read_launch_runs_the_twin(arch, host_trim, monkeypatch) -> None:
+    """:meth:`cake_kcp.KernelBackend._launch`: a launch that reads the saved rstd (``read_rstd = 1``) runs
+    :func:`cake_kcp_plan.saved_rstd_record` of its record, through the arena's launcher and through the trimmed host
+    path alike, and the call keeps ``(record, twin)`` for its launch record; ``read_rstd = 0``, no ``read_rstd`` and
+    any other record run as selected and keep nothing."""
+    launched: list = []
+
+    def launcher(record, values, *, grid, device_index) -> None:
+        launched.append(record)
+
+    if host_trim:
+        monkeypatch.setattr(
+            cake_kcp, "_launch_record_trim", lambda local, record, grid, values: launched.append(record)
+        )  # fmt: skip
+        # the arena's own launcher selects the trimmed path
+        launcher = cake_jit.run_module
+    twin = cake_kcp_plan.saved_rstd_record(SAVED_RSTD_BASE, arch)
+    assert (twin == SAVED_RSTD_TWIN) == (arch != "sm_107a")
+    cases = (
+        (SAVED_RSTD_BASE, {"read_rstd": 1}, twin),
+        (SAVED_RSTD_BASE, {"read_rstd": 0}, SAVED_RSTD_BASE),
+        (SAVED_RSTD_BASE, {}, SAVED_RSTD_BASE),
+        ("bwd_prep_g8_noqg_l2n", {"read_rstd": 1}, "bwd_prep_g8_noqg_l2n"),
+    )
+    for record, values, expect in cases:
+        local = types.SimpleNamespace(arch=arch, launcher=launcher, device_index=0)
+        call = types.SimpleNamespace(local=local, host_trim=host_trim, scratch={})
+        launched.clear()
+        cake_kcp.KernelBackend._launch(call, record, (1, 1, 1), values)
+        assert launched == [expect], (record, values)
+        kept = (record, expect) if expect != record else None
+        assert call.scratch.get("l2n_twin") == kept, (record, values)
 
 
 L2N_ROW_CASES = [c for c in LOCAL_RECORD_CASES if c[0] == 4]
@@ -2771,6 +2865,8 @@ def _run_rank(
     flags["first_reader_rstd"] = T == 0 or (
         tuple(rec_f["l2n_rstd"]) == (0, 1) and tuple(rec_b["l2n_rstd"]) == (1, 0)
     )
+    # the record whose saved-rstd twin the saved-mode backward ran (the twin's bits are checked by saved_eq_replay)
+    reported["saved_rstd_twin"] = rec_b.get("l2n_twin")
     rep, saved_rep, _ = saved_pass()
     flags["rstd_repeat_bitwise"] = _bits_equal(saved_rep.qk_rstd, rstd)
     del saved_rep
