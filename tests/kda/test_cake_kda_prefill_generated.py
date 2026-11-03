@@ -286,8 +286,10 @@ GATHERED_INDEX_ARGS = [
 def test_generated_plans_bind_from_the_shipped_plans():
     """The launch classes bind by the shipped plan's names: a generated plan
     must name a subset of them, tensors as tensors and scalars as scalars,
-    except the window-index arguments the affine composite binds itself."""
+    except the window-index arguments the affine composite binds itself and
+    the arguments every launch binds itself (``RUNTIME_BOUND_ARGS``)."""
     composite_bound = {name for _kind, name in GATHERED_INDEX_ARGS}
+    runtime_bound = {name: kind for kind, name in runtime.RUNTIME_BOUND_ARGS}
     for arch in registry.ARCHES:
         folds = {
             *registry._RENDERED_FOLD_ROUTES[arch].values(),
@@ -317,6 +319,9 @@ def test_generated_plans_bind_from_the_shipped_plans():
                 if program in folds and name in composite_bound:
                     continue
                 where = (arch, module, program, name)
+                if name in runtime_bound:
+                    assert kind == runtime_bound[name], where
+                    continue
                 assert name in shipped, where
                 assert (kind in TENSOR_KINDS) == (shipped[name] in TENSOR_KINDS), where
                 assert (kind == "parameter") == (shipped[name] == "parameter"), where

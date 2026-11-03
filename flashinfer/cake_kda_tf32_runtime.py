@@ -4657,6 +4657,22 @@ class FlashKDABlackwellBF16FusedLaunch:
                 initial_state_f32=initial_state_f32_pointer,
                 final_state_f32=final_state_f32_pointer,
             )
+            # A program built with final_state_warp_tma (or the turnover program
+            # a bin-mix launch falls back to) stores the final state through a
+            # tensor map of the caller's [N_or_pool, H, 128, 128] FP32 final
+            # state; without a final state the map covers one unused panel.
+            if _takes_final_state_tma(self.module) or (
+                self.work_bin_mix and _takes_final_state_tma(bin_mix_fallback[0])
+            ):
+                self.args["final_state_f32_tma"] = (
+                    final_state
+                    if final_state is not None
+                    else torch.empty(
+                        (1, 1, HEAD_DIM, HEAD_DIM),
+                        dtype=torch.float32,
+                        device=q.device,
+                    )
+                )
         if self.work_bin_mix:
             # The give ring (chunk_state) and its ready words (zero_workspace):
             # the owner zeroes each word it takes, so the program leaves every
@@ -5492,6 +5508,18 @@ def _affine_window_table(
         if merge_final_positions is not None:
             table[window][3] = merge_final_positions[seq]
     return [value for row in table for value in row]
+
+
+# Arguments a launch binds itself for the generated programs whose plans name
+# them (no shipped module plan does): the tensor map of the caller's FP32
+# final state that a program built with final_state_warp_tma stores through.
+RUNTIME_BOUND_ARGS = (("tma_buffer", "final_state_f32_tma"),)
+
+
+def _takes_final_state_tma(module) -> bool:
+    """``module`` stores the FP32 final state through ``final_state_f32_tma``."""
+    plan = getattr(module, "_arg_plan", ())
+    return any(name == RUNTIME_BOUND_ARGS[0][1] for _kind, name in plan)
 
 
 def _gathers_window_indices(launch) -> bool:
