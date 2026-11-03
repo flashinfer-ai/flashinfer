@@ -291,3 +291,42 @@ and warns about object-collective overhead:
 https://github.com/pytorch/pytorch/blob/main/docs/source/distributed.md.
 This supports API selection only; installed-container execution O24 is the
 compatibility evidence. No documentation example timing is used as a baseline.
+
+- **O25, measured/PT3:** job 3577900, theia0122, EP1/EP2, 40 samples/group
+  from two alternating rounds. Original versus existing non-GIN entry raw
+  medians: EP1 T64 warm 95.74→84.53 us, cold 105.44→96.19 us;
+  T1024 warm 142.32→130.00 us, cold 146.50→135.84 us. EP2 T64 warm
+  115.89→105.26 us, cold 125.22→109.23 us; T1024 warm 163.14→150.94 us,
+  cold 170.03→157.26 us. Exact output checks pass. Most five-call fused
+  profiles remain close; EP2 T64 also changes by about 5 us. This supports
+  the entry-point intervention; it does not attribute every microsecond to
+  host marshalling. PH4 is supported within this diagnostic scope.
+- The off candidate selects the donor's existing launch_without_gin only
+  when persistent finalize and per-token FC1 scaling are disabled. Those FI
+  extensions retain their original entry; no vendor device source is edited.
+  The disabled persistent num_valid_tokens keyword is omitted from the lean
+  entry's host ABI. On keeps its original entry unchanged.
+- **PT5, planned:** final F_BASE versus optimized off, EP1/EP2/EP4, T64/T1024,
+  five alternating rounds, 5 warmups/20 calls, same cold/warm protocols and
+  predeclared 5%/baseline-CV gate. All primary calls run with --skip-profiles;
+  separate --profile-only workers run after the complete primary matrix on
+  each allocation. This avoids interleaving profiling with later primary
+  rounds without asserting profiling caused the old noise. API entry/module
+  assertions forbid next. Retained finalize/cache/graph tests follow.
+
+- **O26/PT4 completed:** 3577960 on theia0151/theia0248, all three legacy
+  providers resident and turns serialized. 2400 primary critical-rank samples
+  (24 groups ×100) across separate standard/conditioned protocols, all bitwise
+  checks pass. Standard warm public full: before 6155.76 us → host candidate
+  2208.60 us; cold 6147.29→2202.81 us. Per-call agreement counts fall 5→3.
+  Before and after PTX AND cubin SHA-256 match exactly on rank 0 (all-rank
+  equivalence still to audit), establishing no device-binary change there.
+  Standard donor warm raw 361.95 us versus after 349.68 us, but baseline
+  round CV 6.89% makes that no-regression gate inconclusive. Cold raw
+  377.73→363.44 us with baseline CV4.92% passes the 5% gate. Conditioned
+  results are separate: donor raw warm359.63/cold346.56, after314.78/326.21 us;
+  donor dispersion remains >5%. A device-state/launch/runtime contribution is
+  supported by different timings for identical before/after binaries, but its
+  exact mechanism remains unresolved. This does not erase O18's old regression.
+  The complete strong protocol/math plus public correctness suite passes
+  15 tests on each of four ranks, with original tolerances retained.

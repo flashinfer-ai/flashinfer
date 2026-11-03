@@ -783,7 +783,12 @@ class MegaMoENvfp4Frontend:
         if c.enable_iket:
             compile_kwargs["options"] = "iket"
 
-        mega.compiled = cute.compile(kernel, **compile_kwargs)
+        # Optional GIN arguments still cost Python argument binding even when
+        # the device compiler folds them away. Keep the ordinary off entry's
+        # launch ABI lean, as the fixed legacy donor runner does. FI-only
+        # persistent/token-scale arguments retain the full qualified entry.
+        target = kernel.launch_without_gin if self._uses_non_gin_entry() else kernel
+        mega.compiled = cute.compile(target, **compile_kwargs)
         self._mega_key = key
         self._mega = mega
         return self._mega
@@ -1106,6 +1111,14 @@ class MegaMoENvfp4Frontend:
             )
         return cute_tensor
 
+    def _uses_non_gin_entry(self) -> bool:
+        c = self.config
+        return (
+            not c.internode
+            and not c.use_persistent_finalize_kernel
+            and not c.enable_fc1_activation_per_token_scale
+        )
+
     def _build_mega_runtime_kwargs(
         self,
         inputs: MegaMoENvfp4Inputs,
@@ -1218,6 +1231,8 @@ class MegaMoENvfp4Frontend:
             kwargs["fc1_activation_per_token_scale"] = self._to_cute(
                 inputs.fc1_activation_per_token_scale, assumed_align=4
             )
+        if self._uses_non_gin_entry():
+            kwargs.pop("num_valid_tokens")
         return kwargs
 
     @staticmethod

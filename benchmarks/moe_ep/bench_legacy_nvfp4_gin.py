@@ -394,6 +394,9 @@ def main():
     parser.add_argument("--warmups", type=int, default=5)
     parser.add_argument("--prepare", action="store_true")
     parser.add_argument("--smoke", action="store_true")
+    profiles = parser.add_mutually_exclusive_group()
+    profiles.add_argument("--skip-profiles", action="store_true")
+    profiles.add_argument("--profile-only", action="store_true")
     args = parser.parse_args()
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     dist.init_process_group(backend="cpu:gloo,cuda:nccl")
@@ -423,7 +426,13 @@ def main():
         assert args.mode == "on"
     folder = (
         args.root
-        / ("smoke" if args.smoke else "measurements")
+        / (
+            "smoke"
+            if args.smoke
+            else "profiles"
+            if args.profile_only
+            else "measurements"
+        )
         / args.mode
         / f"ep{world}"
         / f"round-{args.round}"
@@ -453,6 +462,8 @@ def main():
         clocks_before=gpu_clock(),
         protocol="eager; synchronous per-call; host Gloo rendezvous outside each timed sample",
         cache_flush_bytes=512 * 1024 * 1024,
+        profile_only=args.profile_only,
+        skip_profiles=args.skip_profiles,
         source_commit=os.environ.get("BENCH_SOURCE_COMMIT"),
         script_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
         cases=[],
@@ -477,7 +488,12 @@ def main():
             if args.mode == "off":
                 path = args.root / "fixtures" / f"off-ep{world}-t{tokens}-rank{rank}.pt"
                 path.parent.mkdir(parents=True, exist_ok=True)
-                if args.impl == "base" and args.round == 0 and not args.smoke:
+                if (
+                    args.impl == "base"
+                    and args.round == 0
+                    and not args.smoke
+                    and not args.profile_only
+                ):
                     torch.save(adapter["first"].cpu(), path)
                 if not args.smoke:
                     expected = torch.load(path, weights_only=True)
@@ -496,7 +512,9 @@ def main():
                 json.dumps(manifest, indent=2)
             )
             for cache in ("warm", "cold"):
-                for scope in ("raw_pipeline", "full_operator"):
+                for scope in (
+                    () if args.profile_only else ("raw_pipeline", "full_operator")
+                ):
                     launch = (
                         adapter["raw"] if scope == "raw_pipeline" else adapter["full"]
                     )
@@ -547,10 +565,13 @@ def main():
                         f"[perf] rank={rank} impl={args.impl} ep={world} t={tokens} round={args.round} {cache}/{scope} PASS",
                         flush=True,
                     )
-                if args.round == 0 and not args.smoke:
+                if (
+                    args.profile_only or args.round == 0 and not args.skip_profiles
+                ) and not args.smoke:
                     case.setdefault("profiles", {})[cache] = profile_raw(
                         adapter, evict, cache, Path(str(prefix) + f"-t{tokens}")
                     )
+                    check_output(adapter["output"](), expected)
             adapter["close"]()
             barrier()
             case["complete"] = True

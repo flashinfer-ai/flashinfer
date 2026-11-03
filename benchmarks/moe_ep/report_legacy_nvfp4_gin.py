@@ -35,25 +35,39 @@ def main():
     parser.add_argument("--on-root", type=Path)
     parser.add_argument("--ep4-root", type=Path)
     parser.add_argument("--require-complete", action="store_true")
+    parser.add_argument("--off-only", action="store_true")
     args = parser.parse_args()
     grouped = defaultdict(list)
     manifests = []
     flattened = []
     incomplete = []
 
-    def source_paths(pattern):
-        for mode, run_root in [("off", args.root), ("on", args.on_root or args.root)]:
-            for path in (run_root / "measurements" / mode).glob(pattern):
+    def source_paths(pattern, *, profiles=False):
+        runs = [("off", args.root)]
+        if not args.off_only:
+            runs.append(("on", args.on_root or args.root))
+        for mode, run_root in runs:
+            subtree = (
+                "profiles"
+                if profiles and (run_root / "profiles" / mode).is_dir()
+                else "measurements"
+            )
+            directory = run_root / subtree / mode
+            for path in directory.glob(pattern):
                 if (
                     mode == "off"
                     and args.ep4_root
-                    and path.relative_to(run_root / "measurements" / mode).parts[0]
-                    == "ep4"
+                    and path.relative_to(directory).parts[0] == "ep4"
                 ):
                     continue
                 yield path
         if args.ep4_root:
-            yield from (args.ep4_root / "measurements" / "off").glob(
+            subtree = (
+                "profiles"
+                if profiles and (args.ep4_root / "profiles" / "off").is_dir()
+                else "measurements"
+            )
+            yield from (args.ep4_root / subtree / "off").glob(
                 pattern.replace("ep*", "ep4")
             )
 
@@ -186,11 +200,22 @@ def main():
             )
         )
     profile_groups = defaultdict(list)
-    for path in sorted(source_paths("ep*/round-0/*/rank-*-manifest.json")):
+    profile_manifest_paths = []
+    for path in sorted(
+        source_paths("ep*/round-0/*/rank-*-manifest.json", profiles=True)
+    ):
         meta = json.loads(path.read_text())
         if not meta.get("complete"):
             continue
+        profile_manifest_paths.append(str(path.resolve()))
         for case in meta["cases"]:
+            assert case["validation"] == "bitwise PASS"
+            assert (
+                case["payload"]
+                == identities[
+                    (meta["mode"], meta["world"], case["tokens"], meta["rank"])
+                ][0][1]
+            )
             for cache, profile in case.get("profiles", {}).items():
                 mega = [
                     event["duration_us"]
@@ -246,6 +271,7 @@ def main():
         comparisons=comparisons,
         payload_checks=payload_checks,
         profiles=profiles,
+        profile_manifest_paths=profile_manifest_paths,
         incomplete_manifests=incomplete,
         manifests=manifests,
         all_rank_manifest_paths=all_rank_paths,
@@ -273,19 +299,21 @@ def main():
     )
     if args.require_complete:
         assert not incomplete, incomplete
-        assert len(manifests) == 40, len(manifests)
-        assert len(all_rank_manifests) == 110, len(all_rank_manifests)
-        assert len(results) == 56 and all(row["complete"] for row in results), (
-            "Incomplete primary matrix"
+        assert len(manifests) == (30 if args.off_only else 40), len(manifests)
+        assert len(all_rank_manifests) == (70 if args.off_only else 110), len(
+            all_rank_manifests
         )
-        assert len(comparisons) == 28, len(comparisons)
-        assert len(flattened) == 5600, len(flattened)
-        assert len(payload_checks) == 18 and all(
+        assert len(results) == (48 if args.off_only else 56) and all(
+            row["complete"] for row in results
+        ), "Incomplete primary matrix"
+        assert len(comparisons) == (24 if args.off_only else 28), len(comparisons)
+        assert len(flattened) == (4800 if args.off_only else 5600), len(flattened)
+        assert len(payload_checks) == (14 if args.off_only else 18) and all(
             row["records"] == 10 for row in payload_checks
         )
-        assert len(profiles) == 28 and all(row["valid"] for row in profiles), (
-            "Incomplete profiler matrix"
-        )
+        assert len(profiles) == (24 if args.off_only else 28) and all(
+            row["valid"] for row in profiles
+        ), "Incomplete profiler matrix"
         assert all(
             case["validation"] == "bitwise PASS"
             for meta in all_rank_manifests
