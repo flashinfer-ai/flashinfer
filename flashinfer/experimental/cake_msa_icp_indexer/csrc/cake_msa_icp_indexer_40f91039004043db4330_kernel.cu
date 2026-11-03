@@ -78,7 +78,7 @@ kernel_cake_msa_icp_indexer_40f91039004043db4330(float* __restrict__ scores, int
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     unsigned int* slab_k = reinterpret_cast<unsigned int*>(smem_raw + 0);
     const int slab_k_addr = smem + 0;
     int* slab_c = reinterpret_cast<int*>(smem_raw + 1024);
@@ -1769,7 +1769,7 @@ kernel_cake_msa_icp_indexer_40f91039004043db4330(float* __restrict__ scores, int
             }
             unsigned int _shfl_sync_2 = __shfl_sync(0xFFFFFFFF, pr_gen, 0);
             pr_gen = _shfl_sync_2;
-            unsigned long long* pr_row64 = reinterpret_cast<unsigned long long*>(pr_peer) + (pr_row * 32);
+            unsigned long long* pr_row64 = reinterpret_cast<unsigned long long*>(pr_peer) + pr_row * 32;
             unsigned long long pr_tag = (unsigned long long)pr_gen << 32;
             if (lane_1 < 16) {
                 asm volatile("st.relaxed.sys.u64 [%0], %1;" :: "l"(reinterpret_cast<unsigned long long*>(pr_row64 + lane_1)), "l"(static_cast<unsigned long long>(pr_tag | (unsigned long long)(unsigned int)raw)) : "memory");
@@ -1780,7 +1780,7 @@ kernel_cake_msa_icp_indexer_40f91039004043db4330(float* __restrict__ scores, int
                 pr_gen_at[0] = (int)pr_gen;
             }
         } else {
-            int* pr_row32 = reinterpret_cast<int*>(pr_peer) + (pr_row * 33);
+            int* pr_row32 = reinterpret_cast<int*>(pr_peer) + pr_row * 33;
             if (lane_1 == 0) {
                 int pr_spins = 0;
                 int pr_rd0;

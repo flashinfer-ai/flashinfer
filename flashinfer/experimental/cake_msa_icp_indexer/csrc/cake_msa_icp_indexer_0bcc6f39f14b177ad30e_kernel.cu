@@ -72,7 +72,7 @@ kernel_cake_msa_icp_indexer_0bcc6f39f14b177ad30e(int* __restrict__ recv, int* __
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     unsigned int* ranked = reinterpret_cast<unsigned int*>(smem_raw + 0);
     const int ranked_addr = smem + 0;
 

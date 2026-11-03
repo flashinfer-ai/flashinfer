@@ -76,7 +76,7 @@ kernel_cake_msa_icp_indexer_ac5c91cff6971cf6860f(unsigned long long* __restrict_
         asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     }
     if (t < total_q) {
-        unsigned long long* lists = pool + ((long long)(t * num_heads + h) * pool_row_stride);
+        unsigned long long* lists = pool + (long long)(t * num_heads + h) * pool_row_stride;
         unsigned long long R[16];
         unsigned long long B[16];
         R[0] = 0;
@@ -96,7 +96,7 @@ kernel_cake_msa_icp_indexer_ac5c91cff6971cf6860f(unsigned long long* __restrict_
         R[14] = 0;
         R[15] = 0;
         if (lane_1 < splits) {
-            float* ll_src = reinterpret_cast<float*>(lists + ((long long)lane_1 * 16));
+            float* ll_src = reinterpret_cast<float*>(lists + (long long)lane_1 * 16);
             float ll_f[32];
             {
                 float4 _v4 = *reinterpret_cast<const float4*>(ll_src + 0);
@@ -269,7 +269,7 @@ kernel_cake_msa_icp_indexer_ac5c91cff6971cf6860f(unsigned long long* __restrict_
         }
         int s_m_0 = lane_1 + 32;
         if (s_m_0 < splits) {
-            float* ll_src_1 = reinterpret_cast<float*>(lists + ((long long)s_m_0 * 16));
+            float* ll_src_1 = reinterpret_cast<float*>(lists + (long long)s_m_0 * 16);
             float ll_f_1[32];
             {
                 float4 _v4 = *reinterpret_cast<const float4*>(ll_src_1 + 0);
@@ -602,7 +602,7 @@ kernel_cake_msa_icp_indexer_ac5c91cff6971cf6860f(unsigned long long* __restrict_
         }
         int s_m_1 = lane_1 + 64;
         if (s_m_1 < splits) {
-            float* ll_src_2 = reinterpret_cast<float*>(lists + ((long long)s_m_1 * 16));
+            float* ll_src_2 = reinterpret_cast<float*>(lists + (long long)s_m_1 * 16);
             float ll_f_2[32];
             {
                 float4 _v4 = *reinterpret_cast<const float4*>(ll_src_2 + 0);
@@ -935,7 +935,7 @@ kernel_cake_msa_icp_indexer_ac5c91cff6971cf6860f(unsigned long long* __restrict_
         }
         int s_m_2 = lane_1 + 96;
         if (s_m_2 < splits) {
-            float* ll_src_3 = reinterpret_cast<float*>(lists + ((long long)s_m_2 * 16));
+            float* ll_src_3 = reinterpret_cast<float*>(lists + (long long)s_m_2 * 16);
             float ll_f_3[32];
             {
                 float4 _v4 = *reinterpret_cast<const float4*>(ll_src_3 + 0);
@@ -2531,7 +2531,7 @@ kernel_cake_msa_icp_indexer_ac5c91cff6971cf6860f(unsigned long long* __restrict_
             }
             unsigned int _shfl_sync_160 = __shfl_sync(0xFFFFFFFF, pr_gen, 0);
             pr_gen = _shfl_sync_160;
-            unsigned long long* pr_row64 = reinterpret_cast<unsigned long long*>(pr_peer) + (pr_row * 32);
+            unsigned long long* pr_row64 = reinterpret_cast<unsigned long long*>(pr_peer) + pr_row * 32;
             unsigned long long pr_tag = (unsigned long long)pr_gen << 32;
             if (lane_1 < 16) {
                 asm volatile("st.relaxed.sys.u64 [%0], %1;" :: "l"(reinterpret_cast<unsigned long long*>(pr_row64 + pos)), "l"(static_cast<unsigned long long>(pr_tag | (unsigned long long)(unsigned int)bits)) : "memory");
@@ -2542,7 +2542,7 @@ kernel_cake_msa_icp_indexer_ac5c91cff6971cf6860f(unsigned long long* __restrict_
                 pr_gen_at[0] = (int)pr_gen;
             }
         } else {
-            int* pr_row32 = reinterpret_cast<int*>(pr_peer) + (pr_row * 33);
+            int* pr_row32 = reinterpret_cast<int*>(pr_peer) + pr_row * 33;
             if (lane_1 == 0) {
                 int pr_spins = 0;
                 int pr_rd0;

@@ -51,7 +51,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 
 extern "C" {
 
-__global__ __launch_bounds__(128) void
+__global__ __launch_bounds__(32) void
 kernel_cake_msa_icp_indexer_85b489b9fb92bc54df6c(unsigned long long* __restrict__ pool, int* __restrict__ qo_indptr, long long* __restrict__ work_info, long long* __restrict__ work_range, int* __restrict__ carrier, int total_q, int batch, int num_ctas, long long pool_piece_stride, long long carrier_stride_h, long long carrier_stride_t)
 {
     const int tid = threadIdx.x;
@@ -68,98 +68,138 @@ kernel_cake_msa_icp_indexer_85b489b9fb92bc54df6c(unsigned long long* __restrict_
     asm volatile("griddepcontrol.wait;" ::: "memory");
 
     // === Task calls (declaration order) ===
-    int sub = (int)warp;
     int lane_1 = (int)lane;
-    int t = (int)blockIdx.x * 4 + sub;
-    int h = (int)blockIdx.y;
+    int h = lane_1 >> 3;
+    int sl = lane_1 & 7;
+    int t = (int)blockIdx.x * 4 + (int)blockIdx.y + (int)warp;
     if (t < total_q) {
-        unsigned long long R[16];
-        unsigned long long B[16];
+        unsigned long long R[2];
         R[0] = 0;
         R[1] = 0;
-        R[2] = 0;
-        R[3] = 0;
-        R[4] = 0;
-        R[5] = 0;
-        R[6] = 0;
-        R[7] = 0;
-        R[8] = 0;
-        R[9] = 0;
-        R[10] = 0;
-        R[11] = 0;
-        R[12] = 0;
-        R[13] = 0;
-        R[14] = 0;
-        R[15] = 0;
-        int cl_rng[2];
-        cl_rng[0] = 0;
-        cl_rng[1] = batch + 1;
-        if (cl_rng[0] < cl_rng[1]) {
-            int cl_step_0 = (cl_rng[1] - cl_rng[0] + 31) / 32;
-            int cl_p_0 = cl_rng[0] + lane_1 * cl_step_0;
-            int cl_ok_0 = 0;
-            if (cl_p_0 < cl_rng[1]) {
-                cl_ok_0 = (int)(qo_indptr[cl_p_0] <= t);
+        int small = (int)(batch < 32 && num_ctas <= 256);
+        int qv = 0;
+        long long WR[8];
+        WR[0] = 0;
+        WR[1] = 0;
+        WR[2] = 0;
+        WR[3] = 0;
+        WR[4] = 0;
+        WR[5] = 0;
+        WR[6] = 0;
+        WR[7] = 0;
+        if (small != 0) {
+            if (lane_1 <= batch) {
+                qv = qo_indptr[lane_1];
             }
-            unsigned int nw_vote = __ballot_sync(0xFFFFFFFF, cl_ok_0 != 0);
-            int nw_cnt = (int)(unsigned int)__popc(nw_vote);
-            int nw_lo = ((nw_cnt > 0) ? cl_rng[0] + (nw_cnt - 1) * cl_step_0 + 1 : cl_rng[0]);
-            int _min_0 = ((cl_rng[0] + nw_cnt * cl_step_0) < (cl_rng[1]) ? (cl_rng[0] + nw_cnt * cl_step_0) : (cl_rng[1]));
-            int nw_hi = ((nw_cnt > 0) ? _min_0 : cl_rng[0]);
-            cl_rng[0] = nw_lo;
-            cl_rng[1] = nw_hi;
-        }
-        if (cl_rng[0] < cl_rng[1]) {
-            int cl_step_1 = (cl_rng[1] - cl_rng[0] + 31) / 32;
-            int cl_p_1 = cl_rng[0] + lane_1 * cl_step_1;
-            int cl_ok_1 = 0;
-            if (cl_p_1 < cl_rng[1]) {
-                cl_ok_1 = (int)(qo_indptr[cl_p_1] <= t);
+            if (lane_1 < num_ctas) {
+                WR[0] = work_range[lane_1];
             }
-            unsigned int nw_vote_1 = __ballot_sync(0xFFFFFFFF, cl_ok_1 != 0);
-            int nw_cnt_1 = (int)(unsigned int)__popc(nw_vote_1);
-            int nw_lo_1 = ((nw_cnt_1 > 0) ? cl_rng[0] + (nw_cnt_1 - 1) * cl_step_1 + 1 : cl_rng[0]);
-            int _min_1 = ((cl_rng[0] + nw_cnt_1 * cl_step_1) < (cl_rng[1]) ? (cl_rng[0] + nw_cnt_1 * cl_step_1) : (cl_rng[1]));
-            int nw_hi_1 = ((nw_cnt_1 > 0) ? _min_1 : cl_rng[0]);
-            cl_rng[0] = nw_lo_1;
-            cl_rng[1] = nw_hi_1;
-        }
-        if (cl_rng[0] < cl_rng[1]) {
-            int cl_step_2 = (cl_rng[1] - cl_rng[0] + 31) / 32;
-            int cl_p_2 = cl_rng[0] + lane_1 * cl_step_2;
-            int cl_ok_2 = 0;
-            if (cl_p_2 < cl_rng[1]) {
-                cl_ok_2 = (int)(qo_indptr[cl_p_2] <= t);
+            if (32 + lane_1 < num_ctas) {
+                WR[1] = work_range[32 + lane_1];
             }
-            unsigned int nw_vote_2 = __ballot_sync(0xFFFFFFFF, cl_ok_2 != 0);
-            int nw_cnt_2 = (int)(unsigned int)__popc(nw_vote_2);
-            int nw_lo_2 = ((nw_cnt_2 > 0) ? cl_rng[0] + (nw_cnt_2 - 1) * cl_step_2 + 1 : cl_rng[0]);
-            int _min_2 = ((cl_rng[0] + nw_cnt_2 * cl_step_2) < (cl_rng[1]) ? (cl_rng[0] + nw_cnt_2 * cl_step_2) : (cl_rng[1]));
-            int nw_hi_2 = ((nw_cnt_2 > 0) ? _min_2 : cl_rng[0]);
-            cl_rng[0] = nw_lo_2;
-            cl_rng[1] = nw_hi_2;
-        }
-        if (cl_rng[0] < cl_rng[1]) {
-            int cl_step_3 = (cl_rng[1] - cl_rng[0] + 31) / 32;
-            int cl_p_3 = cl_rng[0] + lane_1 * cl_step_3;
-            int cl_ok_3 = 0;
-            if (cl_p_3 < cl_rng[1]) {
-                cl_ok_3 = (int)(qo_indptr[cl_p_3] <= t);
+            if (64 + lane_1 < num_ctas) {
+                WR[2] = work_range[64 + lane_1];
             }
-            unsigned int nw_vote_3 = __ballot_sync(0xFFFFFFFF, cl_ok_3 != 0);
-            int nw_cnt_3 = (int)(unsigned int)__popc(nw_vote_3);
-            int nw_lo_3 = ((nw_cnt_3 > 0) ? cl_rng[0] + (nw_cnt_3 - 1) * cl_step_3 + 1 : cl_rng[0]);
-            int _min_3 = ((cl_rng[0] + nw_cnt_3 * cl_step_3) < (cl_rng[1]) ? (cl_rng[0] + nw_cnt_3 * cl_step_3) : (cl_rng[1]));
-            int nw_hi_3 = ((nw_cnt_3 > 0) ? _min_3 : cl_rng[0]);
-            cl_rng[0] = nw_lo_3;
-            cl_rng[1] = nw_hi_3;
+            if (96 + lane_1 < num_ctas) {
+                WR[3] = work_range[96 + lane_1];
+            }
+            if (128 + lane_1 < num_ctas) {
+                WR[4] = work_range[128 + lane_1];
+            }
+            if (160 + lane_1 < num_ctas) {
+                WR[5] = work_range[160 + lane_1];
+            }
+            if (192 + lane_1 < num_ctas) {
+                WR[6] = work_range[192 + lane_1];
+            }
+            if (224 + lane_1 < num_ctas) {
+                WR[7] = work_range[224 + lane_1];
+            }
         }
-        int cl_res = cl_rng[0];
-        int n_le = cl_res;
+        int n_le = 0;
+        if (small != 0) {
+            unsigned int _warp_vote_0 = __ballot_sync(0xFFFFFFFF, lane_1 <= batch && qv <= t);
+            n_le = (int)(unsigned int)__popc(_warp_vote_0);
+        } else {
+            int cl_rng[2];
+            cl_rng[0] = 0;
+            cl_rng[1] = batch + 1;
+            if (cl_rng[0] < cl_rng[1]) {
+                int cl_step_0 = (cl_rng[1] - cl_rng[0] + 31) / 32;
+                int cl_p_0 = cl_rng[0] + lane_1 * cl_step_0;
+                int cl_ok_0 = 0;
+                if (cl_p_0 < cl_rng[1]) {
+                    cl_ok_0 = (int)(qo_indptr[cl_p_0] <= t);
+                }
+                unsigned int nw_vote = __ballot_sync(0xFFFFFFFF, cl_ok_0 != 0);
+                int nw_cnt = (int)(unsigned int)__popc(nw_vote);
+                int nw_lo = ((nw_cnt > 0) ? cl_rng[0] + (nw_cnt - 1) * cl_step_0 + 1 : cl_rng[0]);
+                int _min_1 = ((cl_rng[0] + nw_cnt * cl_step_0) < (cl_rng[1]) ? (cl_rng[0] + nw_cnt * cl_step_0) : (cl_rng[1]));
+                int nw_hi = ((nw_cnt > 0) ? _min_1 : cl_rng[0]);
+                cl_rng[0] = nw_lo;
+                cl_rng[1] = nw_hi;
+            }
+            if (cl_rng[0] < cl_rng[1]) {
+                int cl_step_1 = (cl_rng[1] - cl_rng[0] + 31) / 32;
+                int cl_p_1 = cl_rng[0] + lane_1 * cl_step_1;
+                int cl_ok_1 = 0;
+                if (cl_p_1 < cl_rng[1]) {
+                    cl_ok_1 = (int)(qo_indptr[cl_p_1] <= t);
+                }
+                unsigned int nw_vote_1 = __ballot_sync(0xFFFFFFFF, cl_ok_1 != 0);
+                int nw_cnt_1 = (int)(unsigned int)__popc(nw_vote_1);
+                int nw_lo_1 = ((nw_cnt_1 > 0) ? cl_rng[0] + (nw_cnt_1 - 1) * cl_step_1 + 1 : cl_rng[0]);
+                int _min_2 = ((cl_rng[0] + nw_cnt_1 * cl_step_1) < (cl_rng[1]) ? (cl_rng[0] + nw_cnt_1 * cl_step_1) : (cl_rng[1]));
+                int nw_hi_1 = ((nw_cnt_1 > 0) ? _min_2 : cl_rng[0]);
+                cl_rng[0] = nw_lo_1;
+                cl_rng[1] = nw_hi_1;
+            }
+            if (cl_rng[0] < cl_rng[1]) {
+                int cl_step_2 = (cl_rng[1] - cl_rng[0] + 31) / 32;
+                int cl_p_2 = cl_rng[0] + lane_1 * cl_step_2;
+                int cl_ok_2 = 0;
+                if (cl_p_2 < cl_rng[1]) {
+                    cl_ok_2 = (int)(qo_indptr[cl_p_2] <= t);
+                }
+                unsigned int nw_vote_2 = __ballot_sync(0xFFFFFFFF, cl_ok_2 != 0);
+                int nw_cnt_2 = (int)(unsigned int)__popc(nw_vote_2);
+                int nw_lo_2 = ((nw_cnt_2 > 0) ? cl_rng[0] + (nw_cnt_2 - 1) * cl_step_2 + 1 : cl_rng[0]);
+                int _min_3 = ((cl_rng[0] + nw_cnt_2 * cl_step_2) < (cl_rng[1]) ? (cl_rng[0] + nw_cnt_2 * cl_step_2) : (cl_rng[1]));
+                int nw_hi_2 = ((nw_cnt_2 > 0) ? _min_3 : cl_rng[0]);
+                cl_rng[0] = nw_lo_2;
+                cl_rng[1] = nw_hi_2;
+            }
+            if (cl_rng[0] < cl_rng[1]) {
+                int cl_step_3 = (cl_rng[1] - cl_rng[0] + 31) / 32;
+                int cl_p_3 = cl_rng[0] + lane_1 * cl_step_3;
+                int cl_ok_3 = 0;
+                if (cl_p_3 < cl_rng[1]) {
+                    cl_ok_3 = (int)(qo_indptr[cl_p_3] <= t);
+                }
+                unsigned int nw_vote_3 = __ballot_sync(0xFFFFFFFF, cl_ok_3 != 0);
+                int nw_cnt_3 = (int)(unsigned int)__popc(nw_vote_3);
+                int nw_lo_3 = ((nw_cnt_3 > 0) ? cl_rng[0] + (nw_cnt_3 - 1) * cl_step_3 + 1 : cl_rng[0]);
+                int _min_4 = ((cl_rng[0] + nw_cnt_3 * cl_step_3) < (cl_rng[1]) ? (cl_rng[0] + nw_cnt_3 * cl_step_3) : (cl_rng[1]));
+                int nw_hi_3 = ((nw_cnt_3 > 0) ? _min_4 : cl_rng[0]);
+                cl_rng[0] = nw_lo_3;
+                cl_rng[1] = nw_hi_3;
+            }
+            int cl_res = cl_rng[0];
+            n_le = cl_res;
+        }
         if (n_le > 0 && n_le <= batch) {
             int b = n_le - 1;
-            int seg0 = *qo_indptr;
-            int seg_b = qo_indptr[b];
+            int seg0 = 0;
+            int seg_b = 0;
+            if (small != 0) {
+                int _shfl_sync_5 = __shfl_sync(0xFFFFFFFF, qv, 0);
+                seg0 = _shfl_sync_5;
+                int _shfl_sync_6 = __shfl_sync(0xFFFFFFFF, qv, b);
+                seg_b = _shfl_sync_6;
+            } else {
+                seg0 = *qo_indptr;
+                seg_b = qo_indptr[b];
+            }
             int rs = t - seg_b;
             int it = rs >> 6;
             int r = rs & 63;
@@ -183,8 +223,8 @@ kernel_cake_msa_icp_indexer_85b489b9fb92bc54df6c(unsigned long long* __restrict_
                 unsigned int nw_vote_4 = __ballot_sync(0xFFFFFFFF, cp_ok_0 != 0);
                 int nw_cnt_4 = (int)(unsigned int)__popc(nw_vote_4);
                 int nw_lo_4 = ((nw_cnt_4 > 0) ? cp_rng[0] + (nw_cnt_4 - 1) * cp_step_0 + 1 : cp_rng[0]);
-                int _min_4 = ((cp_rng[0] + nw_cnt_4 * cp_step_0) < (cp_rng[1]) ? (cp_rng[0] + nw_cnt_4 * cp_step_0) : (cp_rng[1]));
-                int nw_hi_4 = ((nw_cnt_4 > 0) ? _min_4 : cp_rng[0]);
+                int _min_7 = ((cp_rng[0] + nw_cnt_4 * cp_step_0) < (cp_rng[1]) ? (cp_rng[0] + nw_cnt_4 * cp_step_0) : (cp_rng[1]));
+                int nw_hi_4 = ((nw_cnt_4 > 0) ? _min_7 : cp_rng[0]);
                 cp_rng[0] = nw_lo_4;
                 cp_rng[1] = nw_hi_4;
             }
@@ -199,8 +239,8 @@ kernel_cake_msa_icp_indexer_85b489b9fb92bc54df6c(unsigned long long* __restrict_
                 unsigned int nw_vote_5 = __ballot_sync(0xFFFFFFFF, cp_ok_1 != 0);
                 int nw_cnt_5 = (int)(unsigned int)__popc(nw_vote_5);
                 int nw_lo_5 = ((nw_cnt_5 > 0) ? cp_rng[0] + (nw_cnt_5 - 1) * cp_step_1 + 1 : cp_rng[0]);
-                int _min_5 = ((cp_rng[0] + nw_cnt_5 * cp_step_1) < (cp_rng[1]) ? (cp_rng[0] + nw_cnt_5 * cp_step_1) : (cp_rng[1]));
-                int nw_hi_5 = ((nw_cnt_5 > 0) ? _min_5 : cp_rng[0]);
+                int _min_8 = ((cp_rng[0] + nw_cnt_5 * cp_step_1) < (cp_rng[1]) ? (cp_rng[0] + nw_cnt_5 * cp_step_1) : (cp_rng[1]));
+                int nw_hi_5 = ((nw_cnt_5 > 0) ? _min_8 : cp_rng[0]);
                 cp_rng[0] = nw_lo_5;
                 cp_rng[1] = nw_hi_5;
             }
@@ -215,8 +255,8 @@ kernel_cake_msa_icp_indexer_85b489b9fb92bc54df6c(unsigned long long* __restrict_
                 unsigned int nw_vote_6 = __ballot_sync(0xFFFFFFFF, cp_ok_2 != 0);
                 int nw_cnt_6 = (int)(unsigned int)__popc(nw_vote_6);
                 int nw_lo_6 = ((nw_cnt_6 > 0) ? cp_rng[0] + (nw_cnt_6 - 1) * cp_step_2 + 1 : cp_rng[0]);
-                int _min_6 = ((cp_rng[0] + nw_cnt_6 * cp_step_2) < (cp_rng[1]) ? (cp_rng[0] + nw_cnt_6 * cp_step_2) : (cp_rng[1]));
-                int nw_hi_6 = ((nw_cnt_6 > 0) ? _min_6 : cp_rng[0]);
+                int _min_9 = ((cp_rng[0] + nw_cnt_6 * cp_step_2) < (cp_rng[1]) ? (cp_rng[0] + nw_cnt_6 * cp_step_2) : (cp_rng[1]));
+                int nw_hi_6 = ((nw_cnt_6 > 0) ? _min_9 : cp_rng[0]);
                 cp_rng[0] = nw_lo_6;
                 cp_rng[1] = nw_hi_6;
             }
@@ -231,8 +271,8 @@ kernel_cake_msa_icp_indexer_85b489b9fb92bc54df6c(unsigned long long* __restrict_
                 unsigned int nw_vote_7 = __ballot_sync(0xFFFFFFFF, cp_ok_3 != 0);
                 int nw_cnt_7 = (int)(unsigned int)__popc(nw_vote_7);
                 int nw_lo_7 = ((nw_cnt_7 > 0) ? cp_rng[0] + (nw_cnt_7 - 1) * cp_step_3 + 1 : cp_rng[0]);
-                int _min_7 = ((cp_rng[0] + nw_cnt_7 * cp_step_3) < (cp_rng[1]) ? (cp_rng[0] + nw_cnt_7 * cp_step_3) : (cp_rng[1]));
-                int nw_hi_7 = ((nw_cnt_7 > 0) ? _min_7 : cp_rng[0]);
+                int _min_10 = ((cp_rng[0] + nw_cnt_7 * cp_step_3) < (cp_rng[1]) ? (cp_rng[0] + nw_cnt_7 * cp_step_3) : (cp_rng[1]));
+                int nw_hi_7 = ((nw_cnt_7 > 0) ? _min_10 : cp_rng[0]);
                 cp_rng[0] = nw_lo_7;
                 cp_rng[1] = nw_hi_7;
             }
@@ -244,1898 +284,2741 @@ kernel_cake_msa_icp_indexer_85b489b9fb92bc54df6c(unsigned long long* __restrict_
                 prev = work_info[j - 1] >> 32;
             }
             int cj = (int)((wi >> 32) - prev);
-            int cp_rng_0[2];
-            cp_rng_0[0] = 0;
-            cp_rng_0[1] = num_ctas;
-            if (cp_rng_0[0] < cp_rng_0[1]) {
-                int cp_step_4 = (cp_rng_0[1] - cp_rng_0[0] + 31) / 32;
-                int cp_p_4 = cp_rng_0[0] + lane_1 * cp_step_4;
-                int cp_ok_4 = 0;
-                if (cp_p_4 < cp_rng_0[1]) {
-                    long long cp_v_4 = work_range[cp_p_4];
-                    cp_ok_4 = (int)(((cp_v_4 & 65535) << 16 | cp_v_4 >> 32 & 65535) <= (long long)j << 16);
-                }
-                unsigned int nw_vote_8 = __ballot_sync(0xFFFFFFFF, cp_ok_4 != 0);
-                int nw_cnt_8 = (int)(unsigned int)__popc(nw_vote_8);
-                int nw_lo_8 = ((nw_cnt_8 > 0) ? cp_rng_0[0] + (nw_cnt_8 - 1) * cp_step_4 + 1 : cp_rng_0[0]);
-                int _min_8 = ((cp_rng_0[0] + nw_cnt_8 * cp_step_4) < (cp_rng_0[1]) ? (cp_rng_0[0] + nw_cnt_8 * cp_step_4) : (cp_rng_0[1]));
-                int nw_hi_8 = ((nw_cnt_8 > 0) ? _min_8 : cp_rng_0[0]);
-                cp_rng_0[0] = nw_lo_8;
-                cp_rng_0[1] = nw_hi_8;
-            }
-            if (cp_rng_0[0] < cp_rng_0[1]) {
-                int cp_step_5 = (cp_rng_0[1] - cp_rng_0[0] + 31) / 32;
-                int cp_p_5 = cp_rng_0[0] + lane_1 * cp_step_5;
-                int cp_ok_5 = 0;
-                if (cp_p_5 < cp_rng_0[1]) {
-                    long long cp_v_5 = work_range[cp_p_5];
-                    cp_ok_5 = (int)(((cp_v_5 & 65535) << 16 | cp_v_5 >> 32 & 65535) <= (long long)j << 16);
-                }
-                unsigned int nw_vote_9 = __ballot_sync(0xFFFFFFFF, cp_ok_5 != 0);
-                int nw_cnt_9 = (int)(unsigned int)__popc(nw_vote_9);
-                int nw_lo_9 = ((nw_cnt_9 > 0) ? cp_rng_0[0] + (nw_cnt_9 - 1) * cp_step_5 + 1 : cp_rng_0[0]);
-                int _min_9 = ((cp_rng_0[0] + nw_cnt_9 * cp_step_5) < (cp_rng_0[1]) ? (cp_rng_0[0] + nw_cnt_9 * cp_step_5) : (cp_rng_0[1]));
-                int nw_hi_9 = ((nw_cnt_9 > 0) ? _min_9 : cp_rng_0[0]);
-                cp_rng_0[0] = nw_lo_9;
-                cp_rng_0[1] = nw_hi_9;
-            }
-            if (cp_rng_0[0] < cp_rng_0[1]) {
-                int cp_step_6 = (cp_rng_0[1] - cp_rng_0[0] + 31) / 32;
-                int cp_p_6 = cp_rng_0[0] + lane_1 * cp_step_6;
-                int cp_ok_6 = 0;
-                if (cp_p_6 < cp_rng_0[1]) {
-                    long long cp_v_6 = work_range[cp_p_6];
-                    cp_ok_6 = (int)(((cp_v_6 & 65535) << 16 | cp_v_6 >> 32 & 65535) <= (long long)j << 16);
-                }
-                unsigned int nw_vote_10 = __ballot_sync(0xFFFFFFFF, cp_ok_6 != 0);
-                int nw_cnt_10 = (int)(unsigned int)__popc(nw_vote_10);
-                int nw_lo_10 = ((nw_cnt_10 > 0) ? cp_rng_0[0] + (nw_cnt_10 - 1) * cp_step_6 + 1 : cp_rng_0[0]);
-                int _min_10 = ((cp_rng_0[0] + nw_cnt_10 * cp_step_6) < (cp_rng_0[1]) ? (cp_rng_0[0] + nw_cnt_10 * cp_step_6) : (cp_rng_0[1]));
-                int nw_hi_10 = ((nw_cnt_10 > 0) ? _min_10 : cp_rng_0[0]);
-                cp_rng_0[0] = nw_lo_10;
-                cp_rng_0[1] = nw_hi_10;
-            }
-            if (cp_rng_0[0] < cp_rng_0[1]) {
-                int cp_step_7 = (cp_rng_0[1] - cp_rng_0[0] + 31) / 32;
-                int cp_p_7 = cp_rng_0[0] + lane_1 * cp_step_7;
-                int cp_ok_7 = 0;
-                if (cp_p_7 < cp_rng_0[1]) {
-                    long long cp_v_7 = work_range[cp_p_7];
-                    cp_ok_7 = (int)(((cp_v_7 & 65535) << 16 | cp_v_7 >> 32 & 65535) <= (long long)j << 16);
-                }
-                unsigned int nw_vote_11 = __ballot_sync(0xFFFFFFFF, cp_ok_7 != 0);
-                int nw_cnt_11 = (int)(unsigned int)__popc(nw_vote_11);
-                int nw_lo_11 = ((nw_cnt_11 > 0) ? cp_rng_0[0] + (nw_cnt_11 - 1) * cp_step_7 + 1 : cp_rng_0[0]);
-                int _min_11 = ((cp_rng_0[0] + nw_cnt_11 * cp_step_7) < (cp_rng_0[1]) ? (cp_rng_0[0] + nw_cnt_11 * cp_step_7) : (cp_rng_0[1]));
-                int nw_hi_11 = ((nw_cnt_11 > 0) ? _min_11 : cp_rng_0[0]);
-                cp_rng_0[0] = nw_lo_11;
-                cp_rng_0[1] = nw_hi_11;
-            }
-            int cp_res_0 = cp_rng_0[0];
-            int s_first = cp_res_0 - 1;
             long long before_next = (long long)j << 16 | 65535;
-            int cp_rng_1[2];
-            cp_rng_1[0] = s_first;
-            cp_rng_1[1] = s_first + (num_ctas - s_first);
-            if (cp_rng_1[0] < cp_rng_1[1]) {
-                int cp_step_8 = (cp_rng_1[1] - cp_rng_1[0] + 31) / 32;
-                int cp_p_8 = cp_rng_1[0] + lane_1 * cp_step_8;
-                int cp_ok_8 = 0;
-                if (cp_p_8 < cp_rng_1[1]) {
-                    long long cp_v_8 = work_range[cp_p_8];
-                    cp_ok_8 = (int)(((cp_v_8 & 65535) << 16 | cp_v_8 >> 32 & 65535) <= before_next);
+            int first_count = 0;
+            int last_count = 0;
+            if (small != 0) {
+                int wr_in_0 = (int)(lane_1 < num_ctas);
+                long long wr_p_0 = (WR[0] & 65535) << 16 | WR[0] >> 32 & 65535;
+                unsigned int _warp_vote_11 = __ballot_sync(0xFFFFFFFF, wr_in_0 != 0 && wr_p_0 <= (long long)j << 16);
+                first_count = first_count + (int)(unsigned int)__popc(_warp_vote_11);
+                unsigned int _warp_vote_12 = __ballot_sync(0xFFFFFFFF, wr_in_0 != 0 && wr_p_0 <= before_next);
+                last_count = last_count + (int)(unsigned int)__popc(_warp_vote_12);
+                int wr_in_1 = (int)(32 + lane_1 < num_ctas);
+                long long wr_p_1 = (WR[1] & 65535) << 16 | WR[1] >> 32 & 65535;
+                unsigned int _warp_vote_13 = __ballot_sync(0xFFFFFFFF, wr_in_1 != 0 && wr_p_1 <= (long long)j << 16);
+                first_count = first_count + (int)(unsigned int)__popc(_warp_vote_13);
+                unsigned int _warp_vote_14 = __ballot_sync(0xFFFFFFFF, wr_in_1 != 0 && wr_p_1 <= before_next);
+                last_count = last_count + (int)(unsigned int)__popc(_warp_vote_14);
+                int wr_in_2 = (int)(64 + lane_1 < num_ctas);
+                long long wr_p_2 = (WR[2] & 65535) << 16 | WR[2] >> 32 & 65535;
+                unsigned int _warp_vote_15 = __ballot_sync(0xFFFFFFFF, wr_in_2 != 0 && wr_p_2 <= (long long)j << 16);
+                first_count = first_count + (int)(unsigned int)__popc(_warp_vote_15);
+                unsigned int _warp_vote_16 = __ballot_sync(0xFFFFFFFF, wr_in_2 != 0 && wr_p_2 <= before_next);
+                last_count = last_count + (int)(unsigned int)__popc(_warp_vote_16);
+                int wr_in_3 = (int)(96 + lane_1 < num_ctas);
+                long long wr_p_3 = (WR[3] & 65535) << 16 | WR[3] >> 32 & 65535;
+                unsigned int _warp_vote_17 = __ballot_sync(0xFFFFFFFF, wr_in_3 != 0 && wr_p_3 <= (long long)j << 16);
+                first_count = first_count + (int)(unsigned int)__popc(_warp_vote_17);
+                unsigned int _warp_vote_18 = __ballot_sync(0xFFFFFFFF, wr_in_3 != 0 && wr_p_3 <= before_next);
+                last_count = last_count + (int)(unsigned int)__popc(_warp_vote_18);
+                int wr_in_4 = (int)(128 + lane_1 < num_ctas);
+                long long wr_p_4 = (WR[4] & 65535) << 16 | WR[4] >> 32 & 65535;
+                unsigned int _warp_vote_19 = __ballot_sync(0xFFFFFFFF, wr_in_4 != 0 && wr_p_4 <= (long long)j << 16);
+                first_count = first_count + (int)(unsigned int)__popc(_warp_vote_19);
+                unsigned int _warp_vote_20 = __ballot_sync(0xFFFFFFFF, wr_in_4 != 0 && wr_p_4 <= before_next);
+                last_count = last_count + (int)(unsigned int)__popc(_warp_vote_20);
+                int wr_in_5 = (int)(160 + lane_1 < num_ctas);
+                long long wr_p_5 = (WR[5] & 65535) << 16 | WR[5] >> 32 & 65535;
+                unsigned int _warp_vote_21 = __ballot_sync(0xFFFFFFFF, wr_in_5 != 0 && wr_p_5 <= (long long)j << 16);
+                first_count = first_count + (int)(unsigned int)__popc(_warp_vote_21);
+                unsigned int _warp_vote_22 = __ballot_sync(0xFFFFFFFF, wr_in_5 != 0 && wr_p_5 <= before_next);
+                last_count = last_count + (int)(unsigned int)__popc(_warp_vote_22);
+                int wr_in_6 = (int)(192 + lane_1 < num_ctas);
+                long long wr_p_6 = (WR[6] & 65535) << 16 | WR[6] >> 32 & 65535;
+                unsigned int _warp_vote_23 = __ballot_sync(0xFFFFFFFF, wr_in_6 != 0 && wr_p_6 <= (long long)j << 16);
+                first_count = first_count + (int)(unsigned int)__popc(_warp_vote_23);
+                unsigned int _warp_vote_24 = __ballot_sync(0xFFFFFFFF, wr_in_6 != 0 && wr_p_6 <= before_next);
+                last_count = last_count + (int)(unsigned int)__popc(_warp_vote_24);
+                int wr_in_7 = (int)(224 + lane_1 < num_ctas);
+                long long wr_p_7 = (WR[7] & 65535) << 16 | WR[7] >> 32 & 65535;
+                unsigned int _warp_vote_25 = __ballot_sync(0xFFFFFFFF, wr_in_7 != 0 && wr_p_7 <= (long long)j << 16);
+                first_count = first_count + (int)(unsigned int)__popc(_warp_vote_25);
+                unsigned int _warp_vote_26 = __ballot_sync(0xFFFFFFFF, wr_in_7 != 0 && wr_p_7 <= before_next);
+                last_count = last_count + (int)(unsigned int)__popc(_warp_vote_26);
+            } else {
+                int cp_rng_0[2];
+                cp_rng_0[0] = 0;
+                cp_rng_0[1] = num_ctas;
+                if (cp_rng_0[0] < cp_rng_0[1]) {
+                    int cp_step_4 = (cp_rng_0[1] - cp_rng_0[0] + 31) / 32;
+                    int cp_p_4 = cp_rng_0[0] + lane_1 * cp_step_4;
+                    int cp_ok_4 = 0;
+                    if (cp_p_4 < cp_rng_0[1]) {
+                        long long cp_v_4 = work_range[cp_p_4];
+                        cp_ok_4 = (int)(((cp_v_4 & 65535) << 16 | cp_v_4 >> 32 & 65535) <= (long long)j << 16);
+                    }
+                    unsigned int nw_vote_8 = __ballot_sync(0xFFFFFFFF, cp_ok_4 != 0);
+                    int nw_cnt_8 = (int)(unsigned int)__popc(nw_vote_8);
+                    int nw_lo_8 = ((nw_cnt_8 > 0) ? cp_rng_0[0] + (nw_cnt_8 - 1) * cp_step_4 + 1 : cp_rng_0[0]);
+                    int _min_27 = ((cp_rng_0[0] + nw_cnt_8 * cp_step_4) < (cp_rng_0[1]) ? (cp_rng_0[0] + nw_cnt_8 * cp_step_4) : (cp_rng_0[1]));
+                    int nw_hi_8 = ((nw_cnt_8 > 0) ? _min_27 : cp_rng_0[0]);
+                    cp_rng_0[0] = nw_lo_8;
+                    cp_rng_0[1] = nw_hi_8;
                 }
-                unsigned int nw_vote_12 = __ballot_sync(0xFFFFFFFF, cp_ok_8 != 0);
-                int nw_cnt_12 = (int)(unsigned int)__popc(nw_vote_12);
-                int nw_lo_12 = ((nw_cnt_12 > 0) ? cp_rng_1[0] + (nw_cnt_12 - 1) * cp_step_8 + 1 : cp_rng_1[0]);
-                int _min_12 = ((cp_rng_1[0] + nw_cnt_12 * cp_step_8) < (cp_rng_1[1]) ? (cp_rng_1[0] + nw_cnt_12 * cp_step_8) : (cp_rng_1[1]));
-                int nw_hi_12 = ((nw_cnt_12 > 0) ? _min_12 : cp_rng_1[0]);
-                cp_rng_1[0] = nw_lo_12;
-                cp_rng_1[1] = nw_hi_12;
-            }
-            if (cp_rng_1[0] < cp_rng_1[1]) {
-                int cp_step_9 = (cp_rng_1[1] - cp_rng_1[0] + 31) / 32;
-                int cp_p_9 = cp_rng_1[0] + lane_1 * cp_step_9;
-                int cp_ok_9 = 0;
-                if (cp_p_9 < cp_rng_1[1]) {
-                    long long cp_v_9 = work_range[cp_p_9];
-                    cp_ok_9 = (int)(((cp_v_9 & 65535) << 16 | cp_v_9 >> 32 & 65535) <= before_next);
+                if (cp_rng_0[0] < cp_rng_0[1]) {
+                    int cp_step_5 = (cp_rng_0[1] - cp_rng_0[0] + 31) / 32;
+                    int cp_p_5 = cp_rng_0[0] + lane_1 * cp_step_5;
+                    int cp_ok_5 = 0;
+                    if (cp_p_5 < cp_rng_0[1]) {
+                        long long cp_v_5 = work_range[cp_p_5];
+                        cp_ok_5 = (int)(((cp_v_5 & 65535) << 16 | cp_v_5 >> 32 & 65535) <= (long long)j << 16);
+                    }
+                    unsigned int nw_vote_9 = __ballot_sync(0xFFFFFFFF, cp_ok_5 != 0);
+                    int nw_cnt_9 = (int)(unsigned int)__popc(nw_vote_9);
+                    int nw_lo_9 = ((nw_cnt_9 > 0) ? cp_rng_0[0] + (nw_cnt_9 - 1) * cp_step_5 + 1 : cp_rng_0[0]);
+                    int _min_28 = ((cp_rng_0[0] + nw_cnt_9 * cp_step_5) < (cp_rng_0[1]) ? (cp_rng_0[0] + nw_cnt_9 * cp_step_5) : (cp_rng_0[1]));
+                    int nw_hi_9 = ((nw_cnt_9 > 0) ? _min_28 : cp_rng_0[0]);
+                    cp_rng_0[0] = nw_lo_9;
+                    cp_rng_0[1] = nw_hi_9;
                 }
-                unsigned int nw_vote_13 = __ballot_sync(0xFFFFFFFF, cp_ok_9 != 0);
-                int nw_cnt_13 = (int)(unsigned int)__popc(nw_vote_13);
-                int nw_lo_13 = ((nw_cnt_13 > 0) ? cp_rng_1[0] + (nw_cnt_13 - 1) * cp_step_9 + 1 : cp_rng_1[0]);
-                int _min_13 = ((cp_rng_1[0] + nw_cnt_13 * cp_step_9) < (cp_rng_1[1]) ? (cp_rng_1[0] + nw_cnt_13 * cp_step_9) : (cp_rng_1[1]));
-                int nw_hi_13 = ((nw_cnt_13 > 0) ? _min_13 : cp_rng_1[0]);
-                cp_rng_1[0] = nw_lo_13;
-                cp_rng_1[1] = nw_hi_13;
-            }
-            if (cp_rng_1[0] < cp_rng_1[1]) {
-                int cp_step_10 = (cp_rng_1[1] - cp_rng_1[0] + 31) / 32;
-                int cp_p_10 = cp_rng_1[0] + lane_1 * cp_step_10;
-                int cp_ok_10 = 0;
-                if (cp_p_10 < cp_rng_1[1]) {
-                    long long cp_v_10 = work_range[cp_p_10];
-                    cp_ok_10 = (int)(((cp_v_10 & 65535) << 16 | cp_v_10 >> 32 & 65535) <= before_next);
+                if (cp_rng_0[0] < cp_rng_0[1]) {
+                    int cp_step_6 = (cp_rng_0[1] - cp_rng_0[0] + 31) / 32;
+                    int cp_p_6 = cp_rng_0[0] + lane_1 * cp_step_6;
+                    int cp_ok_6 = 0;
+                    if (cp_p_6 < cp_rng_0[1]) {
+                        long long cp_v_6 = work_range[cp_p_6];
+                        cp_ok_6 = (int)(((cp_v_6 & 65535) << 16 | cp_v_6 >> 32 & 65535) <= (long long)j << 16);
+                    }
+                    unsigned int nw_vote_10 = __ballot_sync(0xFFFFFFFF, cp_ok_6 != 0);
+                    int nw_cnt_10 = (int)(unsigned int)__popc(nw_vote_10);
+                    int nw_lo_10 = ((nw_cnt_10 > 0) ? cp_rng_0[0] + (nw_cnt_10 - 1) * cp_step_6 + 1 : cp_rng_0[0]);
+                    int _min_29 = ((cp_rng_0[0] + nw_cnt_10 * cp_step_6) < (cp_rng_0[1]) ? (cp_rng_0[0] + nw_cnt_10 * cp_step_6) : (cp_rng_0[1]));
+                    int nw_hi_10 = ((nw_cnt_10 > 0) ? _min_29 : cp_rng_0[0]);
+                    cp_rng_0[0] = nw_lo_10;
+                    cp_rng_0[1] = nw_hi_10;
                 }
-                unsigned int nw_vote_14 = __ballot_sync(0xFFFFFFFF, cp_ok_10 != 0);
-                int nw_cnt_14 = (int)(unsigned int)__popc(nw_vote_14);
-                int nw_lo_14 = ((nw_cnt_14 > 0) ? cp_rng_1[0] + (nw_cnt_14 - 1) * cp_step_10 + 1 : cp_rng_1[0]);
-                int _min_14 = ((cp_rng_1[0] + nw_cnt_14 * cp_step_10) < (cp_rng_1[1]) ? (cp_rng_1[0] + nw_cnt_14 * cp_step_10) : (cp_rng_1[1]));
-                int nw_hi_14 = ((nw_cnt_14 > 0) ? _min_14 : cp_rng_1[0]);
-                cp_rng_1[0] = nw_lo_14;
-                cp_rng_1[1] = nw_hi_14;
-            }
-            if (cp_rng_1[0] < cp_rng_1[1]) {
-                int cp_step_11 = (cp_rng_1[1] - cp_rng_1[0] + 31) / 32;
-                int cp_p_11 = cp_rng_1[0] + lane_1 * cp_step_11;
-                int cp_ok_11 = 0;
-                if (cp_p_11 < cp_rng_1[1]) {
-                    long long cp_v_11 = work_range[cp_p_11];
-                    cp_ok_11 = (int)(((cp_v_11 & 65535) << 16 | cp_v_11 >> 32 & 65535) <= before_next);
+                if (cp_rng_0[0] < cp_rng_0[1]) {
+                    int cp_step_7 = (cp_rng_0[1] - cp_rng_0[0] + 31) / 32;
+                    int cp_p_7 = cp_rng_0[0] + lane_1 * cp_step_7;
+                    int cp_ok_7 = 0;
+                    if (cp_p_7 < cp_rng_0[1]) {
+                        long long cp_v_7 = work_range[cp_p_7];
+                        cp_ok_7 = (int)(((cp_v_7 & 65535) << 16 | cp_v_7 >> 32 & 65535) <= (long long)j << 16);
+                    }
+                    unsigned int nw_vote_11 = __ballot_sync(0xFFFFFFFF, cp_ok_7 != 0);
+                    int nw_cnt_11 = (int)(unsigned int)__popc(nw_vote_11);
+                    int nw_lo_11 = ((nw_cnt_11 > 0) ? cp_rng_0[0] + (nw_cnt_11 - 1) * cp_step_7 + 1 : cp_rng_0[0]);
+                    int _min_30 = ((cp_rng_0[0] + nw_cnt_11 * cp_step_7) < (cp_rng_0[1]) ? (cp_rng_0[0] + nw_cnt_11 * cp_step_7) : (cp_rng_0[1]));
+                    int nw_hi_11 = ((nw_cnt_11 > 0) ? _min_30 : cp_rng_0[0]);
+                    cp_rng_0[0] = nw_lo_11;
+                    cp_rng_0[1] = nw_hi_11;
                 }
-                unsigned int nw_vote_15 = __ballot_sync(0xFFFFFFFF, cp_ok_11 != 0);
-                int nw_cnt_15 = (int)(unsigned int)__popc(nw_vote_15);
-                int nw_lo_15 = ((nw_cnt_15 > 0) ? cp_rng_1[0] + (nw_cnt_15 - 1) * cp_step_11 + 1 : cp_rng_1[0]);
-                int _min_15 = ((cp_rng_1[0] + nw_cnt_15 * cp_step_11) < (cp_rng_1[1]) ? (cp_rng_1[0] + nw_cnt_15 * cp_step_11) : (cp_rng_1[1]));
-                int nw_hi_15 = ((nw_cnt_15 > 0) ? _min_15 : cp_rng_1[0]);
-                cp_rng_1[0] = nw_lo_15;
-                cp_rng_1[1] = nw_hi_15;
+                int cp_res_0 = cp_rng_0[0];
+                first_count = cp_res_0;
+                int cp_rng_1[2];
+                cp_rng_1[0] = cp_res_0 - 1;
+                cp_rng_1[1] = cp_res_0 - 1 + (num_ctas - (cp_res_0 - 1));
+                if (cp_rng_1[0] < cp_rng_1[1]) {
+                    int cp_step_8 = (cp_rng_1[1] - cp_rng_1[0] + 31) / 32;
+                    int cp_p_8 = cp_rng_1[0] + lane_1 * cp_step_8;
+                    int cp_ok_8 = 0;
+                    if (cp_p_8 < cp_rng_1[1]) {
+                        long long cp_v_8 = work_range[cp_p_8];
+                        cp_ok_8 = (int)(((cp_v_8 & 65535) << 16 | cp_v_8 >> 32 & 65535) <= before_next);
+                    }
+                    unsigned int nw_vote_12 = __ballot_sync(0xFFFFFFFF, cp_ok_8 != 0);
+                    int nw_cnt_12 = (int)(unsigned int)__popc(nw_vote_12);
+                    int nw_lo_12 = ((nw_cnt_12 > 0) ? cp_rng_1[0] + (nw_cnt_12 - 1) * cp_step_8 + 1 : cp_rng_1[0]);
+                    int _min_31 = ((cp_rng_1[0] + nw_cnt_12 * cp_step_8) < (cp_rng_1[1]) ? (cp_rng_1[0] + nw_cnt_12 * cp_step_8) : (cp_rng_1[1]));
+                    int nw_hi_12 = ((nw_cnt_12 > 0) ? _min_31 : cp_rng_1[0]);
+                    cp_rng_1[0] = nw_lo_12;
+                    cp_rng_1[1] = nw_hi_12;
+                }
+                if (cp_rng_1[0] < cp_rng_1[1]) {
+                    int cp_step_9 = (cp_rng_1[1] - cp_rng_1[0] + 31) / 32;
+                    int cp_p_9 = cp_rng_1[0] + lane_1 * cp_step_9;
+                    int cp_ok_9 = 0;
+                    if (cp_p_9 < cp_rng_1[1]) {
+                        long long cp_v_9 = work_range[cp_p_9];
+                        cp_ok_9 = (int)(((cp_v_9 & 65535) << 16 | cp_v_9 >> 32 & 65535) <= before_next);
+                    }
+                    unsigned int nw_vote_13 = __ballot_sync(0xFFFFFFFF, cp_ok_9 != 0);
+                    int nw_cnt_13 = (int)(unsigned int)__popc(nw_vote_13);
+                    int nw_lo_13 = ((nw_cnt_13 > 0) ? cp_rng_1[0] + (nw_cnt_13 - 1) * cp_step_9 + 1 : cp_rng_1[0]);
+                    int _min_32 = ((cp_rng_1[0] + nw_cnt_13 * cp_step_9) < (cp_rng_1[1]) ? (cp_rng_1[0] + nw_cnt_13 * cp_step_9) : (cp_rng_1[1]));
+                    int nw_hi_13 = ((nw_cnt_13 > 0) ? _min_32 : cp_rng_1[0]);
+                    cp_rng_1[0] = nw_lo_13;
+                    cp_rng_1[1] = nw_hi_13;
+                }
+                if (cp_rng_1[0] < cp_rng_1[1]) {
+                    int cp_step_10 = (cp_rng_1[1] - cp_rng_1[0] + 31) / 32;
+                    int cp_p_10 = cp_rng_1[0] + lane_1 * cp_step_10;
+                    int cp_ok_10 = 0;
+                    if (cp_p_10 < cp_rng_1[1]) {
+                        long long cp_v_10 = work_range[cp_p_10];
+                        cp_ok_10 = (int)(((cp_v_10 & 65535) << 16 | cp_v_10 >> 32 & 65535) <= before_next);
+                    }
+                    unsigned int nw_vote_14 = __ballot_sync(0xFFFFFFFF, cp_ok_10 != 0);
+                    int nw_cnt_14 = (int)(unsigned int)__popc(nw_vote_14);
+                    int nw_lo_14 = ((nw_cnt_14 > 0) ? cp_rng_1[0] + (nw_cnt_14 - 1) * cp_step_10 + 1 : cp_rng_1[0]);
+                    int _min_33 = ((cp_rng_1[0] + nw_cnt_14 * cp_step_10) < (cp_rng_1[1]) ? (cp_rng_1[0] + nw_cnt_14 * cp_step_10) : (cp_rng_1[1]));
+                    int nw_hi_14 = ((nw_cnt_14 > 0) ? _min_33 : cp_rng_1[0]);
+                    cp_rng_1[0] = nw_lo_14;
+                    cp_rng_1[1] = nw_hi_14;
+                }
+                if (cp_rng_1[0] < cp_rng_1[1]) {
+                    int cp_step_11 = (cp_rng_1[1] - cp_rng_1[0] + 31) / 32;
+                    int cp_p_11 = cp_rng_1[0] + lane_1 * cp_step_11;
+                    int cp_ok_11 = 0;
+                    if (cp_p_11 < cp_rng_1[1]) {
+                        long long cp_v_11 = work_range[cp_p_11];
+                        cp_ok_11 = (int)(((cp_v_11 & 65535) << 16 | cp_v_11 >> 32 & 65535) <= before_next);
+                    }
+                    unsigned int nw_vote_15 = __ballot_sync(0xFFFFFFFF, cp_ok_11 != 0);
+                    int nw_cnt_15 = (int)(unsigned int)__popc(nw_vote_15);
+                    int nw_lo_15 = ((nw_cnt_15 > 0) ? cp_rng_1[0] + (nw_cnt_15 - 1) * cp_step_11 + 1 : cp_rng_1[0]);
+                    int _min_34 = ((cp_rng_1[0] + nw_cnt_15 * cp_step_11) < (cp_rng_1[1]) ? (cp_rng_1[0] + nw_cnt_15 * cp_step_11) : (cp_rng_1[1]));
+                    int nw_hi_15 = ((nw_cnt_15 > 0) ? _min_34 : cp_rng_1[0]);
+                    cp_rng_1[0] = nw_lo_15;
+                    cp_rng_1[1] = nw_hi_15;
+                }
+                int cp_res_1 = cp_rng_1[0];
+                last_count = cp_res_1;
             }
-            int cp_res_1 = cp_rng_1[0];
-            int s_last = cp_res_1 - 1;
+            int s_first = first_count - 1;
+            int s_last = last_count - 1;
             int npieces = s_last + 1 - s_first;
-            int width = 1;
-            width = ((width < npieces) ? width * 2 : width);
-            width = ((width < npieces) ? width * 2 : width);
-            width = ((width < npieces) ? width * 2 : width);
-            width = ((width < npieces) ? width * 2 : width);
-            width = ((width < npieces) ? width * 2 : width);
-            long long row_off = (long long)(r * 4 + h) * 16;
-            int q0 = lane_1 & width - 1;
-            if (q0 < npieces) {
-                R[0] = 0;
-                R[1] = 0;
-                R[2] = 0;
-                R[3] = 0;
-                R[4] = 0;
-                R[5] = 0;
-                R[6] = 0;
-                R[7] = 0;
-                R[8] = 0;
-                R[9] = 0;
-                R[10] = 0;
-                R[11] = 0;
-                R[12] = 0;
-                R[13] = 0;
-                R[14] = 0;
-                R[15] = 0;
-                long long lp_wr = work_range[s_first + q0];
-                int lp_cb = (((int)(lp_wr & 65535) == j) ? (int)(lp_wr >> 32 & 65535) : 0);
-                int lp_ce = (((int)(lp_wr >> 16 & 65535) == j) ? (int)(lp_wr >> 48 & 65535) : cj);
-                if (lp_ce > lp_cb) {
-                    float* lp_src = reinterpret_cast<float*>(pool + ((long long)(s_first + q0 + j) * pool_piece_stride + row_off));
-                    float lp_f[32];
-                    {
-                        float4 _v4 = *reinterpret_cast<const float4*>(lp_src + 0);
-                        lp_f[0 + 0] = _v4.x;
-                        lp_f[0 + 1] = _v4.y;
-                        lp_f[0 + 2] = _v4.z;
-                        lp_f[0 + 3] = _v4.w;
+            long long row_dir = (long long)(r * 4 + h) * 16 + (long long)(2 * sl);
+            long long row_rev = (long long)(r * 4 + h) * 16 + (long long)(14 - 2 * sl);
+            if (npieces > 16) {
+                unsigned long long RL[16];
+                unsigned long long BL[16];
+                unsigned long long BN[16];
+                RL[0] = 0;
+                RL[1] = 0;
+                RL[2] = 0;
+                RL[3] = 0;
+                RL[4] = 0;
+                RL[5] = 0;
+                RL[6] = 0;
+                RL[7] = 0;
+                RL[8] = 0;
+                RL[9] = 0;
+                RL[10] = 0;
+                RL[11] = 0;
+                RL[12] = 0;
+                RL[13] = 0;
+                RL[14] = 0;
+                RL[15] = 0;
+                long long row_all = (long long)(r * 4 + h) * 16;
+                unsigned long long top1 = 0;
+                unsigned long long top2 = 0;
+                #pragma unroll 1
+                for (int g0 = 0; g0 < npieces; g0 += 256) {
+                    unsigned int mine = 0;
+                    int ws_0 = s_first + g0 + lane_1;
+                    long long ww_0 = work_range[((ws_0 <= s_last) ? ws_0 : s_last)];
+                    int w_cb_0 = (((int)(ww_0 & 65535) == j) ? (int)(ww_0 >> 32 & 65535) : 0);
+                    int w_hi_0 = (int)(ww_0 >> 16 & 65535);
+                    int w_ce_0 = ((w_hi_0 == j) ? (int)(ww_0 >> 48 & 65535) : cj);
+                    unsigned int w_m_0 = __ballot_sync(0xFFFFFFFF, ws_0 <= s_last && w_ce_0 > w_cb_0);
+                    mine = mine | (w_m_0 >> (unsigned int)sl & 1) << 0;
+                    mine = mine | (w_m_0 >> (unsigned int)(sl + 8) & 1) << 1;
+                    mine = mine | (w_m_0 >> (unsigned int)(sl + 16) & 1) << 2;
+                    mine = mine | (w_m_0 >> (unsigned int)(sl + 24) & 1) << 3;
+                    int ws_1 = s_first + g0 + 32 + lane_1;
+                    long long ww_1 = work_range[((ws_1 <= s_last) ? ws_1 : s_last)];
+                    int w_cb_1 = (((int)(ww_1 & 65535) == j) ? (int)(ww_1 >> 32 & 65535) : 0);
+                    int w_hi_1 = (int)(ww_1 >> 16 & 65535);
+                    int w_ce_1 = ((w_hi_1 == j) ? (int)(ww_1 >> 48 & 65535) : cj);
+                    unsigned int w_m_1 = __ballot_sync(0xFFFFFFFF, ws_1 <= s_last && w_ce_1 > w_cb_1);
+                    mine = mine | (w_m_1 >> (unsigned int)sl & 1) << 4;
+                    mine = mine | (w_m_1 >> (unsigned int)(sl + 8) & 1) << 5;
+                    mine = mine | (w_m_1 >> (unsigned int)(sl + 16) & 1) << 6;
+                    mine = mine | (w_m_1 >> (unsigned int)(sl + 24) & 1) << 7;
+                    int ws_2 = s_first + g0 + 64 + lane_1;
+                    long long ww_2 = work_range[((ws_2 <= s_last) ? ws_2 : s_last)];
+                    int w_cb_2 = (((int)(ww_2 & 65535) == j) ? (int)(ww_2 >> 32 & 65535) : 0);
+                    int w_hi_2 = (int)(ww_2 >> 16 & 65535);
+                    int w_ce_2 = ((w_hi_2 == j) ? (int)(ww_2 >> 48 & 65535) : cj);
+                    unsigned int w_m_2 = __ballot_sync(0xFFFFFFFF, ws_2 <= s_last && w_ce_2 > w_cb_2);
+                    mine = mine | (w_m_2 >> (unsigned int)sl & 1) << 8;
+                    mine = mine | (w_m_2 >> (unsigned int)(sl + 8) & 1) << 9;
+                    mine = mine | (w_m_2 >> (unsigned int)(sl + 16) & 1) << 10;
+                    mine = mine | (w_m_2 >> (unsigned int)(sl + 24) & 1) << 11;
+                    int ws_3 = s_first + g0 + 96 + lane_1;
+                    long long ww_3 = work_range[((ws_3 <= s_last) ? ws_3 : s_last)];
+                    int w_cb_3 = (((int)(ww_3 & 65535) == j) ? (int)(ww_3 >> 32 & 65535) : 0);
+                    int w_hi_3 = (int)(ww_3 >> 16 & 65535);
+                    int w_ce_3 = ((w_hi_3 == j) ? (int)(ww_3 >> 48 & 65535) : cj);
+                    unsigned int w_m_3 = __ballot_sync(0xFFFFFFFF, ws_3 <= s_last && w_ce_3 > w_cb_3);
+                    mine = mine | (w_m_3 >> (unsigned int)sl & 1) << 12;
+                    mine = mine | (w_m_3 >> (unsigned int)(sl + 8) & 1) << 13;
+                    mine = mine | (w_m_3 >> (unsigned int)(sl + 16) & 1) << 14;
+                    mine = mine | (w_m_3 >> (unsigned int)(sl + 24) & 1) << 15;
+                    int ws_4 = s_first + g0 + 128 + lane_1;
+                    long long ww_4 = work_range[((ws_4 <= s_last) ? ws_4 : s_last)];
+                    int w_cb_4 = (((int)(ww_4 & 65535) == j) ? (int)(ww_4 >> 32 & 65535) : 0);
+                    int w_hi_4 = (int)(ww_4 >> 16 & 65535);
+                    int w_ce_4 = ((w_hi_4 == j) ? (int)(ww_4 >> 48 & 65535) : cj);
+                    unsigned int w_m_4 = __ballot_sync(0xFFFFFFFF, ws_4 <= s_last && w_ce_4 > w_cb_4);
+                    mine = mine | (w_m_4 >> (unsigned int)sl & 1) << 16;
+                    mine = mine | (w_m_4 >> (unsigned int)(sl + 8) & 1) << 17;
+                    mine = mine | (w_m_4 >> (unsigned int)(sl + 16) & 1) << 18;
+                    mine = mine | (w_m_4 >> (unsigned int)(sl + 24) & 1) << 19;
+                    int ws_5 = s_first + g0 + 160 + lane_1;
+                    long long ww_5 = work_range[((ws_5 <= s_last) ? ws_5 : s_last)];
+                    int w_cb_5 = (((int)(ww_5 & 65535) == j) ? (int)(ww_5 >> 32 & 65535) : 0);
+                    int w_hi_5 = (int)(ww_5 >> 16 & 65535);
+                    int w_ce_5 = ((w_hi_5 == j) ? (int)(ww_5 >> 48 & 65535) : cj);
+                    unsigned int w_m_5 = __ballot_sync(0xFFFFFFFF, ws_5 <= s_last && w_ce_5 > w_cb_5);
+                    mine = mine | (w_m_5 >> (unsigned int)sl & 1) << 20;
+                    mine = mine | (w_m_5 >> (unsigned int)(sl + 8) & 1) << 21;
+                    mine = mine | (w_m_5 >> (unsigned int)(sl + 16) & 1) << 22;
+                    mine = mine | (w_m_5 >> (unsigned int)(sl + 24) & 1) << 23;
+                    int ws_6 = s_first + g0 + 192 + lane_1;
+                    long long ww_6 = work_range[((ws_6 <= s_last) ? ws_6 : s_last)];
+                    int w_cb_6 = (((int)(ww_6 & 65535) == j) ? (int)(ww_6 >> 32 & 65535) : 0);
+                    int w_hi_6 = (int)(ww_6 >> 16 & 65535);
+                    int w_ce_6 = ((w_hi_6 == j) ? (int)(ww_6 >> 48 & 65535) : cj);
+                    unsigned int w_m_6 = __ballot_sync(0xFFFFFFFF, ws_6 <= s_last && w_ce_6 > w_cb_6);
+                    mine = mine | (w_m_6 >> (unsigned int)sl & 1) << 24;
+                    mine = mine | (w_m_6 >> (unsigned int)(sl + 8) & 1) << 25;
+                    mine = mine | (w_m_6 >> (unsigned int)(sl + 16) & 1) << 26;
+                    mine = mine | (w_m_6 >> (unsigned int)(sl + 24) & 1) << 27;
+                    int ws_7 = s_first + g0 + 224 + lane_1;
+                    long long ww_7 = work_range[((ws_7 <= s_last) ? ws_7 : s_last)];
+                    int w_cb_7 = (((int)(ww_7 & 65535) == j) ? (int)(ww_7 >> 32 & 65535) : 0);
+                    int w_hi_7 = (int)(ww_7 >> 16 & 65535);
+                    int w_ce_7 = ((w_hi_7 == j) ? (int)(ww_7 >> 48 & 65535) : cj);
+                    unsigned int w_m_7 = __ballot_sync(0xFFFFFFFF, ws_7 <= s_last && w_ce_7 > w_cb_7);
+                    mine = mine | (w_m_7 >> (unsigned int)sl & 1) << 28;
+                    mine = mine | (w_m_7 >> (unsigned int)(sl + 8) & 1) << 29;
+                    mine = mine | (w_m_7 >> (unsigned int)(sl + 16) & 1) << 30;
+                    mine = mine | (w_m_7 >> (unsigned int)(sl + 24) & 1) << 31;
+                    unsigned int pf = mine;
+                    int n_pf = (int)(unsigned int)__popc(pf);
+                    #pragma unroll 1
+                    for (int _pi = 0; _pi < n_pf; _pi++) {
+                        int pb;
+                        asm volatile("bfind.u32 %0, %1;" : "=r"(pb) : "r"(pf));
+                        pf = pf & ~(1 << (unsigned int)pb);
+                        int p_s = s_first + g0 + 32 * (pb >> 2) + 8 * (pb & 3) + sl;
+                        asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(pool + ((long long)(p_s + j) * pool_piece_stride + row_all))));
                     }
-                    {
-                        float4 _v4 = *reinterpret_cast<const float4*>(lp_src + 4);
-                        lp_f[4 + 0] = _v4.x;
-                        lp_f[4 + 1] = _v4.y;
-                        lp_f[4 + 2] = _v4.z;
-                        lp_f[4 + 3] = _v4.w;
+                    if (g0 < npieces) {
+                        if ((mine >> 0 & 1) != 0) {
+                            int k_s_0 = s_first + g0 + sl;
+                            unsigned long long k_0_0 = pool[(long long)(k_s_0 + j) * pool_piece_stride + row_all];
+                            unsigned long long k_lo_0 = ((top1 < k_0_0) ? top1 : k_0_0);
+                            top2 = ((top2 > k_lo_0) ? top2 : k_lo_0);
+                            top1 = ((top1 > k_0_0) ? top1 : k_0_0);
+                        }
+                        if ((mine >> 1 & 1) != 0) {
+                            int k_s_1 = s_first + g0 + 8 + sl;
+                            unsigned long long k_0_1 = pool[(long long)(k_s_1 + j) * pool_piece_stride + row_all];
+                            unsigned long long k_lo_1 = ((top1 < k_0_1) ? top1 : k_0_1);
+                            top2 = ((top2 > k_lo_1) ? top2 : k_lo_1);
+                            top1 = ((top1 > k_0_1) ? top1 : k_0_1);
+                        }
+                        if ((mine >> 2 & 1) != 0) {
+                            int k_s_2 = s_first + g0 + 16 + sl;
+                            unsigned long long k_0_2 = pool[(long long)(k_s_2 + j) * pool_piece_stride + row_all];
+                            unsigned long long k_lo_2 = ((top1 < k_0_2) ? top1 : k_0_2);
+                            top2 = ((top2 > k_lo_2) ? top2 : k_lo_2);
+                            top1 = ((top1 > k_0_2) ? top1 : k_0_2);
+                        }
+                        if ((mine >> 3 & 1) != 0) {
+                            int k_s_3 = s_first + g0 + 24 + sl;
+                            unsigned long long k_0_3 = pool[(long long)(k_s_3 + j) * pool_piece_stride + row_all];
+                            unsigned long long k_lo_3 = ((top1 < k_0_3) ? top1 : k_0_3);
+                            top2 = ((top2 > k_lo_3) ? top2 : k_lo_3);
+                            top1 = ((top1 > k_0_3) ? top1 : k_0_3);
+                        }
                     }
-                    {
-                        float4 _v4 = *reinterpret_cast<const float4*>(lp_src + 8);
-                        lp_f[8 + 0] = _v4.x;
-                        lp_f[8 + 1] = _v4.y;
-                        lp_f[8 + 2] = _v4.z;
-                        lp_f[8 + 3] = _v4.w;
+                    if (g0 + 32 < npieces) {
+                        if ((mine >> 4 & 1) != 0) {
+                            int k_s_4 = s_first + g0 + 32 + sl;
+                            unsigned long long k_0_4 = pool[(long long)(k_s_4 + j) * pool_piece_stride + row_all];
+                            unsigned long long k_lo_4 = ((top1 < k_0_4) ? top1 : k_0_4);
+                            top2 = ((top2 > k_lo_4) ? top2 : k_lo_4);
+                            top1 = ((top1 > k_0_4) ? top1 : k_0_4);
+                        }
+                        if ((mine >> 5 & 1) != 0) {
+                            int k_s_5 = s_first + g0 + 32 + 8 + sl;
+                            unsigned long long k_0_5 = pool[(long long)(k_s_5 + j) * pool_piece_stride + row_all];
+                            unsigned long long k_lo_5 = ((top1 < k_0_5) ? top1 : k_0_5);
+                            top2 = ((top2 > k_lo_5) ? top2 : k_lo_5);
+                            top1 = ((top1 > k_0_5) ? top1 : k_0_5);
+                        }
+                        if ((mine >> 6 & 1) != 0) {
+                            int k_s_6 = s_first + g0 + 32 + 16 + sl;
+                            unsigned long long k_0_6 = pool[(long long)(k_s_6 + j) * pool_piece_stride + row_all];
+                            unsigned long long k_lo_6 = ((top1 < k_0_6) ? top1 : k_0_6);
+                            top2 = ((top2 > k_lo_6) ? top2 : k_lo_6);
+                            top1 = ((top1 > k_0_6) ? top1 : k_0_6);
+                        }
+                        if ((mine >> 7 & 1) != 0) {
+                            int k_s_7 = s_first + g0 + 32 + 24 + sl;
+                            unsigned long long k_0_7 = pool[(long long)(k_s_7 + j) * pool_piece_stride + row_all];
+                            unsigned long long k_lo_7 = ((top1 < k_0_7) ? top1 : k_0_7);
+                            top2 = ((top2 > k_lo_7) ? top2 : k_lo_7);
+                            top1 = ((top1 > k_0_7) ? top1 : k_0_7);
+                        }
                     }
-                    {
-                        float4 _v4 = *reinterpret_cast<const float4*>(lp_src + 12);
-                        lp_f[12 + 0] = _v4.x;
-                        lp_f[12 + 1] = _v4.y;
-                        lp_f[12 + 2] = _v4.z;
-                        lp_f[12 + 3] = _v4.w;
+                    if (g0 + 64 < npieces) {
+                        if ((mine >> 8 & 1) != 0) {
+                            int k_s_8 = s_first + g0 + 64 + sl;
+                            unsigned long long k_0_8 = pool[(long long)(k_s_8 + j) * pool_piece_stride + row_all];
+                            unsigned long long k_lo_8 = ((top1 < k_0_8) ? top1 : k_0_8);
+                            top2 = ((top2 > k_lo_8) ? top2 : k_lo_8);
+                            top1 = ((top1 > k_0_8) ? top1 : k_0_8);
+                        }
+                        if ((mine >> 9 & 1) != 0) {
+                            int k_s_9 = s_first + g0 + 64 + 8 + sl;
+                            unsigned long long k_0_9 = pool[(long long)(k_s_9 + j) * pool_piece_stride + row_all];
+                            unsigned long long k_lo_9 = ((top1 < k_0_9) ? top1 : k_0_9);
+                            top2 = ((top2 > k_lo_9) ? top2 : k_lo_9);
+                            top1 = ((top1 > k_0_9) ? top1 : k_0_9);
+                        }
+                        if ((mine >> 10 & 1) != 0) {
+                            int k_s_10 = s_first + g0 + 64 + 16 + sl;
+                            unsigned long long k_0_10 = pool[(long long)(k_s_10 + j) * pool_piece_stride + row_all];
+                            unsigned long long k_lo_10 = ((top1 < k_0_10) ? top1 : k_0_10);
+                            top2 = ((top2 > k_lo_10) ? top2 : k_lo_10);
+                            top1 = ((top1 > k_0_10) ? top1 : k_0_10);
+                        }
+                        if ((mine >> 11 & 1) != 0) {
+                            int k_s_11 = s_first + g0 + 64 + 24 + sl;
+                            unsigned long long k_0_11 = pool[(long long)(k_s_11 + j) * pool_piece_stride + row_all];
+                            unsigned long long k_lo_11 = ((top1 < k_0_11) ? top1 : k_0_11);
+                            top2 = ((top2 > k_lo_11) ? top2 : k_lo_11);
+                            top1 = ((top1 > k_0_11) ? top1 : k_0_11);
+                        }
                     }
-                    {
-                        float4 _v4 = *reinterpret_cast<const float4*>(lp_src + 16);
-                        lp_f[16 + 0] = _v4.x;
-                        lp_f[16 + 1] = _v4.y;
-                        lp_f[16 + 2] = _v4.z;
-                        lp_f[16 + 3] = _v4.w;
+                    if (g0 + 96 < npieces) {
+                        if ((mine >> 12 & 1) != 0) {
+                            int k_s_12 = s_first + g0 + 96 + sl;
+                            unsigned long long k_0_12 = pool[(long long)(k_s_12 + j) * pool_piece_stride + row_all];
+                            unsigned long long k_lo_12 = ((top1 < k_0_12) ? top1 : k_0_12);
+                            top2 = ((top2 > k_lo_12) ? top2 : k_lo_12);
+                            top1 = ((top1 > k_0_12) ? top1 : k_0_12);
+                        }
+                        if ((mine >> 13 & 1) != 0) {
+                            int k_s_13 = s_first + g0 + 96 + 8 + sl;
+                            unsigned long long k_0_13 = pool[(long long)(k_s_13 + j) * pool_piece_stride + row_all];
+                            unsigned long long k_lo_13 = ((top1 < k_0_13) ? top1 : k_0_13);
+                            top2 = ((top2 > k_lo_13) ? top2 : k_lo_13);
+                            top1 = ((top1 > k_0_13) ? top1 : k_0_13);
+                        }
+                        if ((mine >> 14 & 1) != 0) {
+                            int k_s_14 = s_first + g0 + 96 + 16 + sl;
+                            unsigned long long k_0_14 = pool[(long long)(k_s_14 + j) * pool_piece_stride + row_all];
+                            unsigned long long k_lo_14 = ((top1 < k_0_14) ? top1 : k_0_14);
+                            top2 = ((top2 > k_lo_14) ? top2 : k_lo_14);
+                            top1 = ((top1 > k_0_14) ? top1 : k_0_14);
+                        }
+                        if ((mine >> 15 & 1) != 0) {
+                            int k_s_15 = s_first + g0 + 96 + 24 + sl;
+                            unsigned long long k_0_15 = pool[(long long)(k_s_15 + j) * pool_piece_stride + row_all];
+                            unsigned long long k_lo_15 = ((top1 < k_0_15) ? top1 : k_0_15);
+                            top2 = ((top2 > k_lo_15) ? top2 : k_lo_15);
+                            top1 = ((top1 > k_0_15) ? top1 : k_0_15);
+                        }
                     }
-                    {
-                        float4 _v4 = *reinterpret_cast<const float4*>(lp_src + 20);
-                        lp_f[20 + 0] = _v4.x;
-                        lp_f[20 + 1] = _v4.y;
-                        lp_f[20 + 2] = _v4.z;
-                        lp_f[20 + 3] = _v4.w;
+                    if (g0 + 128 < npieces) {
+                        if ((mine >> 16 & 1) != 0) {
+                            int k_s_16 = s_first + g0 + 128 + sl;
+                            unsigned long long k_0_16 = pool[(long long)(k_s_16 + j) * pool_piece_stride + row_all];
+                            unsigned long long k_lo_16 = ((top1 < k_0_16) ? top1 : k_0_16);
+                            top2 = ((top2 > k_lo_16) ? top2 : k_lo_16);
+                            top1 = ((top1 > k_0_16) ? top1 : k_0_16);
+                        }
+                        if ((mine >> 17 & 1) != 0) {
+                            int k_s_17 = s_first + g0 + 128 + 8 + sl;
+                            unsigned long long k_0_17 = pool[(long long)(k_s_17 + j) * pool_piece_stride + row_all];
+                            unsigned long long k_lo_17 = ((top1 < k_0_17) ? top1 : k_0_17);
+                            top2 = ((top2 > k_lo_17) ? top2 : k_lo_17);
+                            top1 = ((top1 > k_0_17) ? top1 : k_0_17);
+                        }
+                        if ((mine >> 18 & 1) != 0) {
+                            int k_s_18 = s_first + g0 + 128 + 16 + sl;
+                            unsigned long long k_0_18 = pool[(long long)(k_s_18 + j) * pool_piece_stride + row_all];
+                            unsigned long long k_lo_18 = ((top1 < k_0_18) ? top1 : k_0_18);
+                            top2 = ((top2 > k_lo_18) ? top2 : k_lo_18);
+                            top1 = ((top1 > k_0_18) ? top1 : k_0_18);
+                        }
+                        if ((mine >> 19 & 1) != 0) {
+                            int k_s_19 = s_first + g0 + 128 + 24 + sl;
+                            unsigned long long k_0_19 = pool[(long long)(k_s_19 + j) * pool_piece_stride + row_all];
+                            unsigned long long k_lo_19 = ((top1 < k_0_19) ? top1 : k_0_19);
+                            top2 = ((top2 > k_lo_19) ? top2 : k_lo_19);
+                            top1 = ((top1 > k_0_19) ? top1 : k_0_19);
+                        }
                     }
-                    {
-                        float4 _v4 = *reinterpret_cast<const float4*>(lp_src + 24);
-                        lp_f[24 + 0] = _v4.x;
-                        lp_f[24 + 1] = _v4.y;
-                        lp_f[24 + 2] = _v4.z;
-                        lp_f[24 + 3] = _v4.w;
+                    if (g0 + 160 < npieces) {
+                        if ((mine >> 20 & 1) != 0) {
+                            int k_s_20 = s_first + g0 + 160 + sl;
+                            unsigned long long k_0_20 = pool[(long long)(k_s_20 + j) * pool_piece_stride + row_all];
+                            unsigned long long k_lo_20 = ((top1 < k_0_20) ? top1 : k_0_20);
+                            top2 = ((top2 > k_lo_20) ? top2 : k_lo_20);
+                            top1 = ((top1 > k_0_20) ? top1 : k_0_20);
+                        }
+                        if ((mine >> 21 & 1) != 0) {
+                            int k_s_21 = s_first + g0 + 160 + 8 + sl;
+                            unsigned long long k_0_21 = pool[(long long)(k_s_21 + j) * pool_piece_stride + row_all];
+                            unsigned long long k_lo_21 = ((top1 < k_0_21) ? top1 : k_0_21);
+                            top2 = ((top2 > k_lo_21) ? top2 : k_lo_21);
+                            top1 = ((top1 > k_0_21) ? top1 : k_0_21);
+                        }
+                        if ((mine >> 22 & 1) != 0) {
+                            int k_s_22 = s_first + g0 + 160 + 16 + sl;
+                            unsigned long long k_0_22 = pool[(long long)(k_s_22 + j) * pool_piece_stride + row_all];
+                            unsigned long long k_lo_22 = ((top1 < k_0_22) ? top1 : k_0_22);
+                            top2 = ((top2 > k_lo_22) ? top2 : k_lo_22);
+                            top1 = ((top1 > k_0_22) ? top1 : k_0_22);
+                        }
+                        if ((mine >> 23 & 1) != 0) {
+                            int k_s_23 = s_first + g0 + 160 + 24 + sl;
+                            unsigned long long k_0_23 = pool[(long long)(k_s_23 + j) * pool_piece_stride + row_all];
+                            unsigned long long k_lo_23 = ((top1 < k_0_23) ? top1 : k_0_23);
+                            top2 = ((top2 > k_lo_23) ? top2 : k_lo_23);
+                            top1 = ((top1 > k_0_23) ? top1 : k_0_23);
+                        }
                     }
-                    {
-                        float4 _v4 = *reinterpret_cast<const float4*>(lp_src + 28);
-                        lp_f[28 + 0] = _v4.x;
-                        lp_f[28 + 1] = _v4.y;
-                        lp_f[28 + 2] = _v4.z;
-                        lp_f[28 + 3] = _v4.w;
+                    if (g0 + 192 < npieces) {
+                        if ((mine >> 24 & 1) != 0) {
+                            int k_s_24 = s_first + g0 + 192 + sl;
+                            unsigned long long k_0_24 = pool[(long long)(k_s_24 + j) * pool_piece_stride + row_all];
+                            unsigned long long k_lo_24 = ((top1 < k_0_24) ? top1 : k_0_24);
+                            top2 = ((top2 > k_lo_24) ? top2 : k_lo_24);
+                            top1 = ((top1 > k_0_24) ? top1 : k_0_24);
+                        }
+                        if ((mine >> 25 & 1) != 0) {
+                            int k_s_25 = s_first + g0 + 192 + 8 + sl;
+                            unsigned long long k_0_25 = pool[(long long)(k_s_25 + j) * pool_piece_stride + row_all];
+                            unsigned long long k_lo_25 = ((top1 < k_0_25) ? top1 : k_0_25);
+                            top2 = ((top2 > k_lo_25) ? top2 : k_lo_25);
+                            top1 = ((top1 > k_0_25) ? top1 : k_0_25);
+                        }
+                        if ((mine >> 26 & 1) != 0) {
+                            int k_s_26 = s_first + g0 + 192 + 16 + sl;
+                            unsigned long long k_0_26 = pool[(long long)(k_s_26 + j) * pool_piece_stride + row_all];
+                            unsigned long long k_lo_26 = ((top1 < k_0_26) ? top1 : k_0_26);
+                            top2 = ((top2 > k_lo_26) ? top2 : k_lo_26);
+                            top1 = ((top1 > k_0_26) ? top1 : k_0_26);
+                        }
+                        if ((mine >> 27 & 1) != 0) {
+                            int k_s_27 = s_first + g0 + 192 + 24 + sl;
+                            unsigned long long k_0_27 = pool[(long long)(k_s_27 + j) * pool_piece_stride + row_all];
+                            unsigned long long k_lo_27 = ((top1 < k_0_27) ? top1 : k_0_27);
+                            top2 = ((top2 > k_lo_27) ? top2 : k_lo_27);
+                            top1 = ((top1 > k_0_27) ? top1 : k_0_27);
+                        }
                     }
-                    unsigned int lp_lo_0 = 0;
-                    unsigned int lp_hi_0 = 0;
-                    float _bit_cast_src_24 = lp_f[0];
-                    lp_lo_0 = reinterpret_cast<unsigned int*>(&_bit_cast_src_24)[0];
-                    float _bit_cast_src_25 = lp_f[1];
-                    lp_hi_0 = reinterpret_cast<unsigned int*>(&_bit_cast_src_25)[0];
-                    R[0] = (unsigned long long)lp_hi_0 << 32 | (unsigned long long)lp_lo_0;
-                    unsigned int lp_lo_1 = 0;
-                    unsigned int lp_hi_1 = 0;
-                    float _bit_cast_src_26 = lp_f[2];
-                    lp_lo_1 = reinterpret_cast<unsigned int*>(&_bit_cast_src_26)[0];
-                    float _bit_cast_src_27 = lp_f[3];
-                    lp_hi_1 = reinterpret_cast<unsigned int*>(&_bit_cast_src_27)[0];
-                    R[1] = (unsigned long long)lp_hi_1 << 32 | (unsigned long long)lp_lo_1;
-                    unsigned int lp_lo_2 = 0;
-                    unsigned int lp_hi_2 = 0;
-                    float _bit_cast_src_28 = lp_f[4];
-                    lp_lo_2 = reinterpret_cast<unsigned int*>(&_bit_cast_src_28)[0];
-                    float _bit_cast_src_29 = lp_f[5];
-                    lp_hi_2 = reinterpret_cast<unsigned int*>(&_bit_cast_src_29)[0];
-                    R[2] = (unsigned long long)lp_hi_2 << 32 | (unsigned long long)lp_lo_2;
-                    unsigned int lp_lo_3 = 0;
-                    unsigned int lp_hi_3 = 0;
-                    float _bit_cast_src_30 = lp_f[6];
-                    lp_lo_3 = reinterpret_cast<unsigned int*>(&_bit_cast_src_30)[0];
-                    float _bit_cast_src_31 = lp_f[7];
-                    lp_hi_3 = reinterpret_cast<unsigned int*>(&_bit_cast_src_31)[0];
-                    R[3] = (unsigned long long)lp_hi_3 << 32 | (unsigned long long)lp_lo_3;
-                    unsigned int lp_lo_4 = 0;
-                    unsigned int lp_hi_4 = 0;
-                    float _bit_cast_src_32 = lp_f[8];
-                    lp_lo_4 = reinterpret_cast<unsigned int*>(&_bit_cast_src_32)[0];
-                    float _bit_cast_src_33 = lp_f[9];
-                    lp_hi_4 = reinterpret_cast<unsigned int*>(&_bit_cast_src_33)[0];
-                    R[4] = (unsigned long long)lp_hi_4 << 32 | (unsigned long long)lp_lo_4;
-                    unsigned int lp_lo_5 = 0;
-                    unsigned int lp_hi_5 = 0;
-                    float _bit_cast_src_34 = lp_f[10];
-                    lp_lo_5 = reinterpret_cast<unsigned int*>(&_bit_cast_src_34)[0];
-                    float _bit_cast_src_35 = lp_f[11];
-                    lp_hi_5 = reinterpret_cast<unsigned int*>(&_bit_cast_src_35)[0];
-                    R[5] = (unsigned long long)lp_hi_5 << 32 | (unsigned long long)lp_lo_5;
-                    unsigned int lp_lo_6 = 0;
-                    unsigned int lp_hi_6 = 0;
-                    float _bit_cast_src_36 = lp_f[12];
-                    lp_lo_6 = reinterpret_cast<unsigned int*>(&_bit_cast_src_36)[0];
-                    float _bit_cast_src_37 = lp_f[13];
-                    lp_hi_6 = reinterpret_cast<unsigned int*>(&_bit_cast_src_37)[0];
-                    R[6] = (unsigned long long)lp_hi_6 << 32 | (unsigned long long)lp_lo_6;
-                    unsigned int lp_lo_7 = 0;
-                    unsigned int lp_hi_7 = 0;
-                    float _bit_cast_src_38 = lp_f[14];
-                    lp_lo_7 = reinterpret_cast<unsigned int*>(&_bit_cast_src_38)[0];
-                    float _bit_cast_src_39 = lp_f[15];
-                    lp_hi_7 = reinterpret_cast<unsigned int*>(&_bit_cast_src_39)[0];
-                    R[7] = (unsigned long long)lp_hi_7 << 32 | (unsigned long long)lp_lo_7;
-                    unsigned int lp_lo_8 = 0;
-                    unsigned int lp_hi_8 = 0;
-                    float _bit_cast_src_40 = lp_f[16];
-                    lp_lo_8 = reinterpret_cast<unsigned int*>(&_bit_cast_src_40)[0];
-                    float _bit_cast_src_41 = lp_f[17];
-                    lp_hi_8 = reinterpret_cast<unsigned int*>(&_bit_cast_src_41)[0];
-                    R[8] = (unsigned long long)lp_hi_8 << 32 | (unsigned long long)lp_lo_8;
-                    unsigned int lp_lo_9 = 0;
-                    unsigned int lp_hi_9 = 0;
-                    float _bit_cast_src_42 = lp_f[18];
-                    lp_lo_9 = reinterpret_cast<unsigned int*>(&_bit_cast_src_42)[0];
-                    float _bit_cast_src_43 = lp_f[19];
-                    lp_hi_9 = reinterpret_cast<unsigned int*>(&_bit_cast_src_43)[0];
-                    R[9] = (unsigned long long)lp_hi_9 << 32 | (unsigned long long)lp_lo_9;
-                    unsigned int lp_lo_10 = 0;
-                    unsigned int lp_hi_10 = 0;
-                    float _bit_cast_src_44 = lp_f[20];
-                    lp_lo_10 = reinterpret_cast<unsigned int*>(&_bit_cast_src_44)[0];
-                    float _bit_cast_src_45 = lp_f[21];
-                    lp_hi_10 = reinterpret_cast<unsigned int*>(&_bit_cast_src_45)[0];
-                    R[10] = (unsigned long long)lp_hi_10 << 32 | (unsigned long long)lp_lo_10;
-                    unsigned int lp_lo_11 = 0;
-                    unsigned int lp_hi_11 = 0;
-                    float _bit_cast_src_46 = lp_f[22];
-                    lp_lo_11 = reinterpret_cast<unsigned int*>(&_bit_cast_src_46)[0];
-                    float _bit_cast_src_47 = lp_f[23];
-                    lp_hi_11 = reinterpret_cast<unsigned int*>(&_bit_cast_src_47)[0];
-                    R[11] = (unsigned long long)lp_hi_11 << 32 | (unsigned long long)lp_lo_11;
-                    unsigned int lp_lo_12 = 0;
-                    unsigned int lp_hi_12 = 0;
-                    float _bit_cast_src_48 = lp_f[24];
-                    lp_lo_12 = reinterpret_cast<unsigned int*>(&_bit_cast_src_48)[0];
-                    float _bit_cast_src_49 = lp_f[25];
-                    lp_hi_12 = reinterpret_cast<unsigned int*>(&_bit_cast_src_49)[0];
-                    R[12] = (unsigned long long)lp_hi_12 << 32 | (unsigned long long)lp_lo_12;
-                    unsigned int lp_lo_13 = 0;
-                    unsigned int lp_hi_13 = 0;
-                    float _bit_cast_src_50 = lp_f[26];
-                    lp_lo_13 = reinterpret_cast<unsigned int*>(&_bit_cast_src_50)[0];
-                    float _bit_cast_src_51 = lp_f[27];
-                    lp_hi_13 = reinterpret_cast<unsigned int*>(&_bit_cast_src_51)[0];
-                    R[13] = (unsigned long long)lp_hi_13 << 32 | (unsigned long long)lp_lo_13;
-                    unsigned int lp_lo_14 = 0;
-                    unsigned int lp_hi_14 = 0;
-                    float _bit_cast_src_52 = lp_f[28];
-                    lp_lo_14 = reinterpret_cast<unsigned int*>(&_bit_cast_src_52)[0];
-                    float _bit_cast_src_53 = lp_f[29];
-                    lp_hi_14 = reinterpret_cast<unsigned int*>(&_bit_cast_src_53)[0];
-                    R[14] = (unsigned long long)lp_hi_14 << 32 | (unsigned long long)lp_lo_14;
-                    unsigned int lp_lo_15 = 0;
-                    unsigned int lp_hi_15 = 0;
-                    float _bit_cast_src_54 = lp_f[30];
-                    lp_lo_15 = reinterpret_cast<unsigned int*>(&_bit_cast_src_54)[0];
-                    float _bit_cast_src_55 = lp_f[31];
-                    lp_hi_15 = reinterpret_cast<unsigned int*>(&_bit_cast_src_55)[0];
-                    R[15] = (unsigned long long)lp_hi_15 << 32 | (unsigned long long)lp_lo_15;
+                    if (g0 + 224 < npieces) {
+                        if ((mine >> 28 & 1) != 0) {
+                            int k_s_28 = s_first + g0 + 224 + sl;
+                            unsigned long long k_0_28 = pool[(long long)(k_s_28 + j) * pool_piece_stride + row_all];
+                            unsigned long long k_lo_28 = ((top1 < k_0_28) ? top1 : k_0_28);
+                            top2 = ((top2 > k_lo_28) ? top2 : k_lo_28);
+                            top1 = ((top1 > k_0_28) ? top1 : k_0_28);
+                        }
+                        if ((mine >> 29 & 1) != 0) {
+                            int k_s_29 = s_first + g0 + 224 + 8 + sl;
+                            unsigned long long k_0_29 = pool[(long long)(k_s_29 + j) * pool_piece_stride + row_all];
+                            unsigned long long k_lo_29 = ((top1 < k_0_29) ? top1 : k_0_29);
+                            top2 = ((top2 > k_lo_29) ? top2 : k_lo_29);
+                            top1 = ((top1 > k_0_29) ? top1 : k_0_29);
+                        }
+                        if ((mine >> 30 & 1) != 0) {
+                            int k_s_30 = s_first + g0 + 224 + 16 + sl;
+                            unsigned long long k_0_30 = pool[(long long)(k_s_30 + j) * pool_piece_stride + row_all];
+                            unsigned long long k_lo_30 = ((top1 < k_0_30) ? top1 : k_0_30);
+                            top2 = ((top2 > k_lo_30) ? top2 : k_lo_30);
+                            top1 = ((top1 > k_0_30) ? top1 : k_0_30);
+                        }
+                        if ((mine >> 31 & 1) != 0) {
+                            int k_s_31 = s_first + g0 + 224 + 24 + sl;
+                            unsigned long long k_0_31 = pool[(long long)(k_s_31 + j) * pool_piece_stride + row_all];
+                            unsigned long long k_lo_31 = ((top1 < k_0_31) ? top1 : k_0_31);
+                            top2 = ((top2 > k_lo_31) ? top2 : k_lo_31);
+                            top1 = ((top1 > k_0_31) ? top1 : k_0_31);
+                        }
+                    }
+                    unsigned long long tau = top2;
+                    unsigned int t_lo_0 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)tau, 1);
+                    unsigned int t_hi_0 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(tau >> 32), 1);
+                    unsigned long long t_o_0 = (unsigned long long)t_hi_0 << 32 | (unsigned long long)t_lo_0;
+                    tau = ((tau < t_o_0) ? tau : t_o_0);
+                    unsigned int t_lo_1 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)tau, 2);
+                    unsigned int t_hi_1 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(tau >> 32), 2);
+                    unsigned long long t_o_1 = (unsigned long long)t_hi_1 << 32 | (unsigned long long)t_lo_1;
+                    tau = ((tau < t_o_1) ? tau : t_o_1);
+                    unsigned int t_lo_2 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)tau, 4);
+                    unsigned int t_hi_2 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(tau >> 32), 4);
+                    unsigned long long t_o_2 = (unsigned long long)t_hi_2 << 32 | (unsigned long long)t_lo_2;
+                    tau = ((tau < t_o_2) ? tau : t_o_2);
+                    unsigned int keep = 0;
+                    if (g0 < npieces) {
+                        if ((mine >> 0 & 1) != 0) {
+                            int c_s_0 = s_first + g0 + sl;
+                            unsigned long long c_0_0 = pool[(long long)(c_s_0 + j) * pool_piece_stride + row_all];
+                            if (c_0_0 >= tau) {
+                                keep = keep | 1 << 0;
+                            }
+                        }
+                        if ((mine >> 1 & 1) != 0) {
+                            int c_s_1 = s_first + g0 + 8 + sl;
+                            unsigned long long c_0_1 = pool[(long long)(c_s_1 + j) * pool_piece_stride + row_all];
+                            if (c_0_1 >= tau) {
+                                keep = keep | 1 << 1;
+                            }
+                        }
+                        if ((mine >> 2 & 1) != 0) {
+                            int c_s_2 = s_first + g0 + 16 + sl;
+                            unsigned long long c_0_2 = pool[(long long)(c_s_2 + j) * pool_piece_stride + row_all];
+                            if (c_0_2 >= tau) {
+                                keep = keep | 1 << 2;
+                            }
+                        }
+                        if ((mine >> 3 & 1) != 0) {
+                            int c_s_3 = s_first + g0 + 24 + sl;
+                            unsigned long long c_0_3 = pool[(long long)(c_s_3 + j) * pool_piece_stride + row_all];
+                            if (c_0_3 >= tau) {
+                                keep = keep | 1 << 3;
+                            }
+                        }
+                    }
+                    if (g0 + 32 < npieces) {
+                        if ((mine >> 4 & 1) != 0) {
+                            int c_s_4 = s_first + g0 + 32 + sl;
+                            unsigned long long c_0_4 = pool[(long long)(c_s_4 + j) * pool_piece_stride + row_all];
+                            if (c_0_4 >= tau) {
+                                keep = keep | 1 << 4;
+                            }
+                        }
+                        if ((mine >> 5 & 1) != 0) {
+                            int c_s_5 = s_first + g0 + 32 + 8 + sl;
+                            unsigned long long c_0_5 = pool[(long long)(c_s_5 + j) * pool_piece_stride + row_all];
+                            if (c_0_5 >= tau) {
+                                keep = keep | 1 << 5;
+                            }
+                        }
+                        if ((mine >> 6 & 1) != 0) {
+                            int c_s_6 = s_first + g0 + 32 + 16 + sl;
+                            unsigned long long c_0_6 = pool[(long long)(c_s_6 + j) * pool_piece_stride + row_all];
+                            if (c_0_6 >= tau) {
+                                keep = keep | 1 << 6;
+                            }
+                        }
+                        if ((mine >> 7 & 1) != 0) {
+                            int c_s_7 = s_first + g0 + 32 + 24 + sl;
+                            unsigned long long c_0_7 = pool[(long long)(c_s_7 + j) * pool_piece_stride + row_all];
+                            if (c_0_7 >= tau) {
+                                keep = keep | 1 << 7;
+                            }
+                        }
+                    }
+                    if (g0 + 64 < npieces) {
+                        if ((mine >> 8 & 1) != 0) {
+                            int c_s_8 = s_first + g0 + 64 + sl;
+                            unsigned long long c_0_8 = pool[(long long)(c_s_8 + j) * pool_piece_stride + row_all];
+                            if (c_0_8 >= tau) {
+                                keep = keep | 1 << 8;
+                            }
+                        }
+                        if ((mine >> 9 & 1) != 0) {
+                            int c_s_9 = s_first + g0 + 64 + 8 + sl;
+                            unsigned long long c_0_9 = pool[(long long)(c_s_9 + j) * pool_piece_stride + row_all];
+                            if (c_0_9 >= tau) {
+                                keep = keep | 1 << 9;
+                            }
+                        }
+                        if ((mine >> 10 & 1) != 0) {
+                            int c_s_10 = s_first + g0 + 64 + 16 + sl;
+                            unsigned long long c_0_10 = pool[(long long)(c_s_10 + j) * pool_piece_stride + row_all];
+                            if (c_0_10 >= tau) {
+                                keep = keep | 1 << 10;
+                            }
+                        }
+                        if ((mine >> 11 & 1) != 0) {
+                            int c_s_11 = s_first + g0 + 64 + 24 + sl;
+                            unsigned long long c_0_11 = pool[(long long)(c_s_11 + j) * pool_piece_stride + row_all];
+                            if (c_0_11 >= tau) {
+                                keep = keep | 1 << 11;
+                            }
+                        }
+                    }
+                    if (g0 + 96 < npieces) {
+                        if ((mine >> 12 & 1) != 0) {
+                            int c_s_12 = s_first + g0 + 96 + sl;
+                            unsigned long long c_0_12 = pool[(long long)(c_s_12 + j) * pool_piece_stride + row_all];
+                            if (c_0_12 >= tau) {
+                                keep = keep | 1 << 12;
+                            }
+                        }
+                        if ((mine >> 13 & 1) != 0) {
+                            int c_s_13 = s_first + g0 + 96 + 8 + sl;
+                            unsigned long long c_0_13 = pool[(long long)(c_s_13 + j) * pool_piece_stride + row_all];
+                            if (c_0_13 >= tau) {
+                                keep = keep | 1 << 13;
+                            }
+                        }
+                        if ((mine >> 14 & 1) != 0) {
+                            int c_s_14 = s_first + g0 + 96 + 16 + sl;
+                            unsigned long long c_0_14 = pool[(long long)(c_s_14 + j) * pool_piece_stride + row_all];
+                            if (c_0_14 >= tau) {
+                                keep = keep | 1 << 14;
+                            }
+                        }
+                        if ((mine >> 15 & 1) != 0) {
+                            int c_s_15 = s_first + g0 + 96 + 24 + sl;
+                            unsigned long long c_0_15 = pool[(long long)(c_s_15 + j) * pool_piece_stride + row_all];
+                            if (c_0_15 >= tau) {
+                                keep = keep | 1 << 15;
+                            }
+                        }
+                    }
+                    if (g0 + 128 < npieces) {
+                        if ((mine >> 16 & 1) != 0) {
+                            int c_s_16 = s_first + g0 + 128 + sl;
+                            unsigned long long c_0_16 = pool[(long long)(c_s_16 + j) * pool_piece_stride + row_all];
+                            if (c_0_16 >= tau) {
+                                keep = keep | 1 << 16;
+                            }
+                        }
+                        if ((mine >> 17 & 1) != 0) {
+                            int c_s_17 = s_first + g0 + 128 + 8 + sl;
+                            unsigned long long c_0_17 = pool[(long long)(c_s_17 + j) * pool_piece_stride + row_all];
+                            if (c_0_17 >= tau) {
+                                keep = keep | 1 << 17;
+                            }
+                        }
+                        if ((mine >> 18 & 1) != 0) {
+                            int c_s_18 = s_first + g0 + 128 + 16 + sl;
+                            unsigned long long c_0_18 = pool[(long long)(c_s_18 + j) * pool_piece_stride + row_all];
+                            if (c_0_18 >= tau) {
+                                keep = keep | 1 << 18;
+                            }
+                        }
+                        if ((mine >> 19 & 1) != 0) {
+                            int c_s_19 = s_first + g0 + 128 + 24 + sl;
+                            unsigned long long c_0_19 = pool[(long long)(c_s_19 + j) * pool_piece_stride + row_all];
+                            if (c_0_19 >= tau) {
+                                keep = keep | 1 << 19;
+                            }
+                        }
+                    }
+                    if (g0 + 160 < npieces) {
+                        if ((mine >> 20 & 1) != 0) {
+                            int c_s_20 = s_first + g0 + 160 + sl;
+                            unsigned long long c_0_20 = pool[(long long)(c_s_20 + j) * pool_piece_stride + row_all];
+                            if (c_0_20 >= tau) {
+                                keep = keep | 1 << 20;
+                            }
+                        }
+                        if ((mine >> 21 & 1) != 0) {
+                            int c_s_21 = s_first + g0 + 160 + 8 + sl;
+                            unsigned long long c_0_21 = pool[(long long)(c_s_21 + j) * pool_piece_stride + row_all];
+                            if (c_0_21 >= tau) {
+                                keep = keep | 1 << 21;
+                            }
+                        }
+                        if ((mine >> 22 & 1) != 0) {
+                            int c_s_22 = s_first + g0 + 160 + 16 + sl;
+                            unsigned long long c_0_22 = pool[(long long)(c_s_22 + j) * pool_piece_stride + row_all];
+                            if (c_0_22 >= tau) {
+                                keep = keep | 1 << 22;
+                            }
+                        }
+                        if ((mine >> 23 & 1) != 0) {
+                            int c_s_23 = s_first + g0 + 160 + 24 + sl;
+                            unsigned long long c_0_23 = pool[(long long)(c_s_23 + j) * pool_piece_stride + row_all];
+                            if (c_0_23 >= tau) {
+                                keep = keep | 1 << 23;
+                            }
+                        }
+                    }
+                    if (g0 + 192 < npieces) {
+                        if ((mine >> 24 & 1) != 0) {
+                            int c_s_24 = s_first + g0 + 192 + sl;
+                            unsigned long long c_0_24 = pool[(long long)(c_s_24 + j) * pool_piece_stride + row_all];
+                            if (c_0_24 >= tau) {
+                                keep = keep | 1 << 24;
+                            }
+                        }
+                        if ((mine >> 25 & 1) != 0) {
+                            int c_s_25 = s_first + g0 + 192 + 8 + sl;
+                            unsigned long long c_0_25 = pool[(long long)(c_s_25 + j) * pool_piece_stride + row_all];
+                            if (c_0_25 >= tau) {
+                                keep = keep | 1 << 25;
+                            }
+                        }
+                        if ((mine >> 26 & 1) != 0) {
+                            int c_s_26 = s_first + g0 + 192 + 16 + sl;
+                            unsigned long long c_0_26 = pool[(long long)(c_s_26 + j) * pool_piece_stride + row_all];
+                            if (c_0_26 >= tau) {
+                                keep = keep | 1 << 26;
+                            }
+                        }
+                        if ((mine >> 27 & 1) != 0) {
+                            int c_s_27 = s_first + g0 + 192 + 24 + sl;
+                            unsigned long long c_0_27 = pool[(long long)(c_s_27 + j) * pool_piece_stride + row_all];
+                            if (c_0_27 >= tau) {
+                                keep = keep | 1 << 27;
+                            }
+                        }
+                    }
+                    if (g0 + 224 < npieces) {
+                        if ((mine >> 28 & 1) != 0) {
+                            int c_s_28 = s_first + g0 + 224 + sl;
+                            unsigned long long c_0_28 = pool[(long long)(c_s_28 + j) * pool_piece_stride + row_all];
+                            if (c_0_28 >= tau) {
+                                keep = keep | 1 << 28;
+                            }
+                        }
+                        if ((mine >> 29 & 1) != 0) {
+                            int c_s_29 = s_first + g0 + 224 + 8 + sl;
+                            unsigned long long c_0_29 = pool[(long long)(c_s_29 + j) * pool_piece_stride + row_all];
+                            if (c_0_29 >= tau) {
+                                keep = keep | 1 << 29;
+                            }
+                        }
+                        if ((mine >> 30 & 1) != 0) {
+                            int c_s_30 = s_first + g0 + 224 + 16 + sl;
+                            unsigned long long c_0_30 = pool[(long long)(c_s_30 + j) * pool_piece_stride + row_all];
+                            if (c_0_30 >= tau) {
+                                keep = keep | 1 << 30;
+                            }
+                        }
+                        if ((mine >> 31 & 1) != 0) {
+                            int c_s_31 = s_first + g0 + 224 + 24 + sl;
+                            unsigned long long c_0_31 = pool[(long long)(c_s_31 + j) * pool_piece_stride + row_all];
+                            if (c_0_31 >= tau) {
+                                keep = keep | 1 << 31;
+                            }
+                        }
+                    }
+                    mine = keep;
+                    int n_cells = (int)(unsigned int)__popc(mine);
+                    if (n_cells > 0) {
+                        int nb;
+                        asm volatile("bfind.u32 %0, %1;" : "=r"(nb) : "r"(mine));
+                        mine = mine & ~(1 << (unsigned int)nb);
+                        float* ll_src = reinterpret_cast<float*>(pool + ((long long)(s_first + g0 + 32 * (nb >> 2) + 8 * (nb & 3) + sl + j) * pool_piece_stride + row_all));
+                        float ll_f[32];
+                        {
+                            float4 _v4 = *reinterpret_cast<const float4*>(ll_src + 0);
+                            ll_f[0 + 0] = _v4.x;
+                            ll_f[0 + 1] = _v4.y;
+                            ll_f[0 + 2] = _v4.z;
+                            ll_f[0 + 3] = _v4.w;
+                        }
+                        {
+                            float4 _v4 = *reinterpret_cast<const float4*>(ll_src + 4);
+                            ll_f[4 + 0] = _v4.x;
+                            ll_f[4 + 1] = _v4.y;
+                            ll_f[4 + 2] = _v4.z;
+                            ll_f[4 + 3] = _v4.w;
+                        }
+                        {
+                            float4 _v4 = *reinterpret_cast<const float4*>(ll_src + 8);
+                            ll_f[8 + 0] = _v4.x;
+                            ll_f[8 + 1] = _v4.y;
+                            ll_f[8 + 2] = _v4.z;
+                            ll_f[8 + 3] = _v4.w;
+                        }
+                        {
+                            float4 _v4 = *reinterpret_cast<const float4*>(ll_src + 12);
+                            ll_f[12 + 0] = _v4.x;
+                            ll_f[12 + 1] = _v4.y;
+                            ll_f[12 + 2] = _v4.z;
+                            ll_f[12 + 3] = _v4.w;
+                        }
+                        {
+                            float4 _v4 = *reinterpret_cast<const float4*>(ll_src + 16);
+                            ll_f[16 + 0] = _v4.x;
+                            ll_f[16 + 1] = _v4.y;
+                            ll_f[16 + 2] = _v4.z;
+                            ll_f[16 + 3] = _v4.w;
+                        }
+                        {
+                            float4 _v4 = *reinterpret_cast<const float4*>(ll_src + 20);
+                            ll_f[20 + 0] = _v4.x;
+                            ll_f[20 + 1] = _v4.y;
+                            ll_f[20 + 2] = _v4.z;
+                            ll_f[20 + 3] = _v4.w;
+                        }
+                        {
+                            float4 _v4 = *reinterpret_cast<const float4*>(ll_src + 24);
+                            ll_f[24 + 0] = _v4.x;
+                            ll_f[24 + 1] = _v4.y;
+                            ll_f[24 + 2] = _v4.z;
+                            ll_f[24 + 3] = _v4.w;
+                        }
+                        {
+                            float4 _v4 = *reinterpret_cast<const float4*>(ll_src + 28);
+                            ll_f[28 + 0] = _v4.x;
+                            ll_f[28 + 1] = _v4.y;
+                            ll_f[28 + 2] = _v4.z;
+                            ll_f[28 + 3] = _v4.w;
+                        }
+                        unsigned int ll_lo_0 = 0;
+                        unsigned int ll_hi_0 = 0;
+                        float _bit_cast_src_43 = ll_f[0];
+                        ll_lo_0 = reinterpret_cast<unsigned int*>(&_bit_cast_src_43)[0];
+                        float _bit_cast_src_44 = ll_f[1];
+                        ll_hi_0 = reinterpret_cast<unsigned int*>(&_bit_cast_src_44)[0];
+                        BN[0] = (unsigned long long)ll_hi_0 << 32 | (unsigned long long)ll_lo_0;
+                        unsigned int ll_lo_1 = 0;
+                        unsigned int ll_hi_1 = 0;
+                        float _bit_cast_src_45 = ll_f[2];
+                        ll_lo_1 = reinterpret_cast<unsigned int*>(&_bit_cast_src_45)[0];
+                        float _bit_cast_src_46 = ll_f[3];
+                        ll_hi_1 = reinterpret_cast<unsigned int*>(&_bit_cast_src_46)[0];
+                        BN[1] = (unsigned long long)ll_hi_1 << 32 | (unsigned long long)ll_lo_1;
+                        unsigned int ll_lo_2 = 0;
+                        unsigned int ll_hi_2 = 0;
+                        float _bit_cast_src_47 = ll_f[4];
+                        ll_lo_2 = reinterpret_cast<unsigned int*>(&_bit_cast_src_47)[0];
+                        float _bit_cast_src_48 = ll_f[5];
+                        ll_hi_2 = reinterpret_cast<unsigned int*>(&_bit_cast_src_48)[0];
+                        BN[2] = (unsigned long long)ll_hi_2 << 32 | (unsigned long long)ll_lo_2;
+                        unsigned int ll_lo_3 = 0;
+                        unsigned int ll_hi_3 = 0;
+                        float _bit_cast_src_49 = ll_f[6];
+                        ll_lo_3 = reinterpret_cast<unsigned int*>(&_bit_cast_src_49)[0];
+                        float _bit_cast_src_50 = ll_f[7];
+                        ll_hi_3 = reinterpret_cast<unsigned int*>(&_bit_cast_src_50)[0];
+                        BN[3] = (unsigned long long)ll_hi_3 << 32 | (unsigned long long)ll_lo_3;
+                        unsigned int ll_lo_4 = 0;
+                        unsigned int ll_hi_4 = 0;
+                        float _bit_cast_src_51 = ll_f[8];
+                        ll_lo_4 = reinterpret_cast<unsigned int*>(&_bit_cast_src_51)[0];
+                        float _bit_cast_src_52 = ll_f[9];
+                        ll_hi_4 = reinterpret_cast<unsigned int*>(&_bit_cast_src_52)[0];
+                        BN[4] = (unsigned long long)ll_hi_4 << 32 | (unsigned long long)ll_lo_4;
+                        unsigned int ll_lo_5 = 0;
+                        unsigned int ll_hi_5 = 0;
+                        float _bit_cast_src_53 = ll_f[10];
+                        ll_lo_5 = reinterpret_cast<unsigned int*>(&_bit_cast_src_53)[0];
+                        float _bit_cast_src_54 = ll_f[11];
+                        ll_hi_5 = reinterpret_cast<unsigned int*>(&_bit_cast_src_54)[0];
+                        BN[5] = (unsigned long long)ll_hi_5 << 32 | (unsigned long long)ll_lo_5;
+                        unsigned int ll_lo_6 = 0;
+                        unsigned int ll_hi_6 = 0;
+                        float _bit_cast_src_55 = ll_f[12];
+                        ll_lo_6 = reinterpret_cast<unsigned int*>(&_bit_cast_src_55)[0];
+                        float _bit_cast_src_56 = ll_f[13];
+                        ll_hi_6 = reinterpret_cast<unsigned int*>(&_bit_cast_src_56)[0];
+                        BN[6] = (unsigned long long)ll_hi_6 << 32 | (unsigned long long)ll_lo_6;
+                        unsigned int ll_lo_7 = 0;
+                        unsigned int ll_hi_7 = 0;
+                        float _bit_cast_src_57 = ll_f[14];
+                        ll_lo_7 = reinterpret_cast<unsigned int*>(&_bit_cast_src_57)[0];
+                        float _bit_cast_src_58 = ll_f[15];
+                        ll_hi_7 = reinterpret_cast<unsigned int*>(&_bit_cast_src_58)[0];
+                        BN[7] = (unsigned long long)ll_hi_7 << 32 | (unsigned long long)ll_lo_7;
+                        unsigned int ll_lo_8 = 0;
+                        unsigned int ll_hi_8 = 0;
+                        float _bit_cast_src_59 = ll_f[16];
+                        ll_lo_8 = reinterpret_cast<unsigned int*>(&_bit_cast_src_59)[0];
+                        float _bit_cast_src_60 = ll_f[17];
+                        ll_hi_8 = reinterpret_cast<unsigned int*>(&_bit_cast_src_60)[0];
+                        BN[8] = (unsigned long long)ll_hi_8 << 32 | (unsigned long long)ll_lo_8;
+                        unsigned int ll_lo_9 = 0;
+                        unsigned int ll_hi_9 = 0;
+                        float _bit_cast_src_61 = ll_f[18];
+                        ll_lo_9 = reinterpret_cast<unsigned int*>(&_bit_cast_src_61)[0];
+                        float _bit_cast_src_62 = ll_f[19];
+                        ll_hi_9 = reinterpret_cast<unsigned int*>(&_bit_cast_src_62)[0];
+                        BN[9] = (unsigned long long)ll_hi_9 << 32 | (unsigned long long)ll_lo_9;
+                        unsigned int ll_lo_10 = 0;
+                        unsigned int ll_hi_10 = 0;
+                        float _bit_cast_src_63 = ll_f[20];
+                        ll_lo_10 = reinterpret_cast<unsigned int*>(&_bit_cast_src_63)[0];
+                        float _bit_cast_src_64 = ll_f[21];
+                        ll_hi_10 = reinterpret_cast<unsigned int*>(&_bit_cast_src_64)[0];
+                        BN[10] = (unsigned long long)ll_hi_10 << 32 | (unsigned long long)ll_lo_10;
+                        unsigned int ll_lo_11 = 0;
+                        unsigned int ll_hi_11 = 0;
+                        float _bit_cast_src_65 = ll_f[22];
+                        ll_lo_11 = reinterpret_cast<unsigned int*>(&_bit_cast_src_65)[0];
+                        float _bit_cast_src_66 = ll_f[23];
+                        ll_hi_11 = reinterpret_cast<unsigned int*>(&_bit_cast_src_66)[0];
+                        BN[11] = (unsigned long long)ll_hi_11 << 32 | (unsigned long long)ll_lo_11;
+                        unsigned int ll_lo_12 = 0;
+                        unsigned int ll_hi_12 = 0;
+                        float _bit_cast_src_67 = ll_f[24];
+                        ll_lo_12 = reinterpret_cast<unsigned int*>(&_bit_cast_src_67)[0];
+                        float _bit_cast_src_68 = ll_f[25];
+                        ll_hi_12 = reinterpret_cast<unsigned int*>(&_bit_cast_src_68)[0];
+                        BN[12] = (unsigned long long)ll_hi_12 << 32 | (unsigned long long)ll_lo_12;
+                        unsigned int ll_lo_13 = 0;
+                        unsigned int ll_hi_13 = 0;
+                        float _bit_cast_src_69 = ll_f[26];
+                        ll_lo_13 = reinterpret_cast<unsigned int*>(&_bit_cast_src_69)[0];
+                        float _bit_cast_src_70 = ll_f[27];
+                        ll_hi_13 = reinterpret_cast<unsigned int*>(&_bit_cast_src_70)[0];
+                        BN[13] = (unsigned long long)ll_hi_13 << 32 | (unsigned long long)ll_lo_13;
+                        unsigned int ll_lo_14 = 0;
+                        unsigned int ll_hi_14 = 0;
+                        float _bit_cast_src_71 = ll_f[28];
+                        ll_lo_14 = reinterpret_cast<unsigned int*>(&_bit_cast_src_71)[0];
+                        float _bit_cast_src_72 = ll_f[29];
+                        ll_hi_14 = reinterpret_cast<unsigned int*>(&_bit_cast_src_72)[0];
+                        BN[14] = (unsigned long long)ll_hi_14 << 32 | (unsigned long long)ll_lo_14;
+                        unsigned int ll_lo_15 = 0;
+                        unsigned int ll_hi_15 = 0;
+                        float _bit_cast_src_73 = ll_f[30];
+                        ll_lo_15 = reinterpret_cast<unsigned int*>(&_bit_cast_src_73)[0];
+                        float _bit_cast_src_74 = ll_f[31];
+                        ll_hi_15 = reinterpret_cast<unsigned int*>(&_bit_cast_src_74)[0];
+                        BN[15] = (unsigned long long)ll_hi_15 << 32 | (unsigned long long)ll_lo_15;
+                        #pragma unroll 1
+                        for (int mi = 0; mi < n_cells; mi++) {
+                            BL[0] = BN[0];
+                            BL[1] = BN[1];
+                            BL[2] = BN[2];
+                            BL[3] = BN[3];
+                            BL[4] = BN[4];
+                            BL[5] = BN[5];
+                            BL[6] = BN[6];
+                            BL[7] = BN[7];
+                            BL[8] = BN[8];
+                            BL[9] = BN[9];
+                            BL[10] = BN[10];
+                            BL[11] = BN[11];
+                            BL[12] = BN[12];
+                            BL[13] = BN[13];
+                            BL[14] = BN[14];
+                            BL[15] = BN[15];
+                            if (mi + 1 < n_cells) {
+                                int mb;
+                                asm volatile("bfind.u32 %0, %1;" : "=r"(mb) : "r"(mine));
+                                mine = mine & ~(1 << (unsigned int)mb);
+                                float* ll_src_0 = reinterpret_cast<float*>(pool + ((long long)(s_first + g0 + 32 * (mb >> 2) + 8 * (mb & 3) + sl + j) * pool_piece_stride + row_all));
+                                float ll_f_0[32];
+                                {
+                                    float4 _v4 = *reinterpret_cast<const float4*>(ll_src_0 + 0);
+                                    ll_f_0[0 + 0] = _v4.x;
+                                    ll_f_0[0 + 1] = _v4.y;
+                                    ll_f_0[0 + 2] = _v4.z;
+                                    ll_f_0[0 + 3] = _v4.w;
+                                }
+                                {
+                                    float4 _v4 = *reinterpret_cast<const float4*>(ll_src_0 + 4);
+                                    ll_f_0[4 + 0] = _v4.x;
+                                    ll_f_0[4 + 1] = _v4.y;
+                                    ll_f_0[4 + 2] = _v4.z;
+                                    ll_f_0[4 + 3] = _v4.w;
+                                }
+                                {
+                                    float4 _v4 = *reinterpret_cast<const float4*>(ll_src_0 + 8);
+                                    ll_f_0[8 + 0] = _v4.x;
+                                    ll_f_0[8 + 1] = _v4.y;
+                                    ll_f_0[8 + 2] = _v4.z;
+                                    ll_f_0[8 + 3] = _v4.w;
+                                }
+                                {
+                                    float4 _v4 = *reinterpret_cast<const float4*>(ll_src_0 + 12);
+                                    ll_f_0[12 + 0] = _v4.x;
+                                    ll_f_0[12 + 1] = _v4.y;
+                                    ll_f_0[12 + 2] = _v4.z;
+                                    ll_f_0[12 + 3] = _v4.w;
+                                }
+                                {
+                                    float4 _v4 = *reinterpret_cast<const float4*>(ll_src_0 + 16);
+                                    ll_f_0[16 + 0] = _v4.x;
+                                    ll_f_0[16 + 1] = _v4.y;
+                                    ll_f_0[16 + 2] = _v4.z;
+                                    ll_f_0[16 + 3] = _v4.w;
+                                }
+                                {
+                                    float4 _v4 = *reinterpret_cast<const float4*>(ll_src_0 + 20);
+                                    ll_f_0[20 + 0] = _v4.x;
+                                    ll_f_0[20 + 1] = _v4.y;
+                                    ll_f_0[20 + 2] = _v4.z;
+                                    ll_f_0[20 + 3] = _v4.w;
+                                }
+                                {
+                                    float4 _v4 = *reinterpret_cast<const float4*>(ll_src_0 + 24);
+                                    ll_f_0[24 + 0] = _v4.x;
+                                    ll_f_0[24 + 1] = _v4.y;
+                                    ll_f_0[24 + 2] = _v4.z;
+                                    ll_f_0[24 + 3] = _v4.w;
+                                }
+                                {
+                                    float4 _v4 = *reinterpret_cast<const float4*>(ll_src_0 + 28);
+                                    ll_f_0[28 + 0] = _v4.x;
+                                    ll_f_0[28 + 1] = _v4.y;
+                                    ll_f_0[28 + 2] = _v4.z;
+                                    ll_f_0[28 + 3] = _v4.w;
+                                }
+                                unsigned int ll_lo_16 = 0;
+                                unsigned int ll_hi_16 = 0;
+                                float _bit_cast_src_83 = ll_f_0[0];
+                                ll_lo_16 = reinterpret_cast<unsigned int*>(&_bit_cast_src_83)[0];
+                                float _bit_cast_src_84 = ll_f_0[1];
+                                ll_hi_16 = reinterpret_cast<unsigned int*>(&_bit_cast_src_84)[0];
+                                BN[0] = (unsigned long long)ll_hi_16 << 32 | (unsigned long long)ll_lo_16;
+                                unsigned int ll_lo_17 = 0;
+                                unsigned int ll_hi_17 = 0;
+                                float _bit_cast_src_85 = ll_f_0[2];
+                                ll_lo_17 = reinterpret_cast<unsigned int*>(&_bit_cast_src_85)[0];
+                                float _bit_cast_src_86 = ll_f_0[3];
+                                ll_hi_17 = reinterpret_cast<unsigned int*>(&_bit_cast_src_86)[0];
+                                BN[1] = (unsigned long long)ll_hi_17 << 32 | (unsigned long long)ll_lo_17;
+                                unsigned int ll_lo_18 = 0;
+                                unsigned int ll_hi_18 = 0;
+                                float _bit_cast_src_87 = ll_f_0[4];
+                                ll_lo_18 = reinterpret_cast<unsigned int*>(&_bit_cast_src_87)[0];
+                                float _bit_cast_src_88 = ll_f_0[5];
+                                ll_hi_18 = reinterpret_cast<unsigned int*>(&_bit_cast_src_88)[0];
+                                BN[2] = (unsigned long long)ll_hi_18 << 32 | (unsigned long long)ll_lo_18;
+                                unsigned int ll_lo_19 = 0;
+                                unsigned int ll_hi_19 = 0;
+                                float _bit_cast_src_89 = ll_f_0[6];
+                                ll_lo_19 = reinterpret_cast<unsigned int*>(&_bit_cast_src_89)[0];
+                                float _bit_cast_src_90 = ll_f_0[7];
+                                ll_hi_19 = reinterpret_cast<unsigned int*>(&_bit_cast_src_90)[0];
+                                BN[3] = (unsigned long long)ll_hi_19 << 32 | (unsigned long long)ll_lo_19;
+                                unsigned int ll_lo_20 = 0;
+                                unsigned int ll_hi_20 = 0;
+                                float _bit_cast_src_91 = ll_f_0[8];
+                                ll_lo_20 = reinterpret_cast<unsigned int*>(&_bit_cast_src_91)[0];
+                                float _bit_cast_src_92 = ll_f_0[9];
+                                ll_hi_20 = reinterpret_cast<unsigned int*>(&_bit_cast_src_92)[0];
+                                BN[4] = (unsigned long long)ll_hi_20 << 32 | (unsigned long long)ll_lo_20;
+                                unsigned int ll_lo_21 = 0;
+                                unsigned int ll_hi_21 = 0;
+                                float _bit_cast_src_93 = ll_f_0[10];
+                                ll_lo_21 = reinterpret_cast<unsigned int*>(&_bit_cast_src_93)[0];
+                                float _bit_cast_src_94 = ll_f_0[11];
+                                ll_hi_21 = reinterpret_cast<unsigned int*>(&_bit_cast_src_94)[0];
+                                BN[5] = (unsigned long long)ll_hi_21 << 32 | (unsigned long long)ll_lo_21;
+                                unsigned int ll_lo_22 = 0;
+                                unsigned int ll_hi_22 = 0;
+                                float _bit_cast_src_95 = ll_f_0[12];
+                                ll_lo_22 = reinterpret_cast<unsigned int*>(&_bit_cast_src_95)[0];
+                                float _bit_cast_src_96 = ll_f_0[13];
+                                ll_hi_22 = reinterpret_cast<unsigned int*>(&_bit_cast_src_96)[0];
+                                BN[6] = (unsigned long long)ll_hi_22 << 32 | (unsigned long long)ll_lo_22;
+                                unsigned int ll_lo_23 = 0;
+                                unsigned int ll_hi_23 = 0;
+                                float _bit_cast_src_97 = ll_f_0[14];
+                                ll_lo_23 = reinterpret_cast<unsigned int*>(&_bit_cast_src_97)[0];
+                                float _bit_cast_src_98 = ll_f_0[15];
+                                ll_hi_23 = reinterpret_cast<unsigned int*>(&_bit_cast_src_98)[0];
+                                BN[7] = (unsigned long long)ll_hi_23 << 32 | (unsigned long long)ll_lo_23;
+                                unsigned int ll_lo_24 = 0;
+                                unsigned int ll_hi_24 = 0;
+                                float _bit_cast_src_99 = ll_f_0[16];
+                                ll_lo_24 = reinterpret_cast<unsigned int*>(&_bit_cast_src_99)[0];
+                                float _bit_cast_src_100 = ll_f_0[17];
+                                ll_hi_24 = reinterpret_cast<unsigned int*>(&_bit_cast_src_100)[0];
+                                BN[8] = (unsigned long long)ll_hi_24 << 32 | (unsigned long long)ll_lo_24;
+                                unsigned int ll_lo_25 = 0;
+                                unsigned int ll_hi_25 = 0;
+                                float _bit_cast_src_101 = ll_f_0[18];
+                                ll_lo_25 = reinterpret_cast<unsigned int*>(&_bit_cast_src_101)[0];
+                                float _bit_cast_src_102 = ll_f_0[19];
+                                ll_hi_25 = reinterpret_cast<unsigned int*>(&_bit_cast_src_102)[0];
+                                BN[9] = (unsigned long long)ll_hi_25 << 32 | (unsigned long long)ll_lo_25;
+                                unsigned int ll_lo_26 = 0;
+                                unsigned int ll_hi_26 = 0;
+                                float _bit_cast_src_103 = ll_f_0[20];
+                                ll_lo_26 = reinterpret_cast<unsigned int*>(&_bit_cast_src_103)[0];
+                                float _bit_cast_src_104 = ll_f_0[21];
+                                ll_hi_26 = reinterpret_cast<unsigned int*>(&_bit_cast_src_104)[0];
+                                BN[10] = (unsigned long long)ll_hi_26 << 32 | (unsigned long long)ll_lo_26;
+                                unsigned int ll_lo_27 = 0;
+                                unsigned int ll_hi_27 = 0;
+                                float _bit_cast_src_105 = ll_f_0[22];
+                                ll_lo_27 = reinterpret_cast<unsigned int*>(&_bit_cast_src_105)[0];
+                                float _bit_cast_src_106 = ll_f_0[23];
+                                ll_hi_27 = reinterpret_cast<unsigned int*>(&_bit_cast_src_106)[0];
+                                BN[11] = (unsigned long long)ll_hi_27 << 32 | (unsigned long long)ll_lo_27;
+                                unsigned int ll_lo_28 = 0;
+                                unsigned int ll_hi_28 = 0;
+                                float _bit_cast_src_107 = ll_f_0[24];
+                                ll_lo_28 = reinterpret_cast<unsigned int*>(&_bit_cast_src_107)[0];
+                                float _bit_cast_src_108 = ll_f_0[25];
+                                ll_hi_28 = reinterpret_cast<unsigned int*>(&_bit_cast_src_108)[0];
+                                BN[12] = (unsigned long long)ll_hi_28 << 32 | (unsigned long long)ll_lo_28;
+                                unsigned int ll_lo_29 = 0;
+                                unsigned int ll_hi_29 = 0;
+                                float _bit_cast_src_109 = ll_f_0[26];
+                                ll_lo_29 = reinterpret_cast<unsigned int*>(&_bit_cast_src_109)[0];
+                                float _bit_cast_src_110 = ll_f_0[27];
+                                ll_hi_29 = reinterpret_cast<unsigned int*>(&_bit_cast_src_110)[0];
+                                BN[13] = (unsigned long long)ll_hi_29 << 32 | (unsigned long long)ll_lo_29;
+                                unsigned int ll_lo_30 = 0;
+                                unsigned int ll_hi_30 = 0;
+                                float _bit_cast_src_111 = ll_f_0[28];
+                                ll_lo_30 = reinterpret_cast<unsigned int*>(&_bit_cast_src_111)[0];
+                                float _bit_cast_src_112 = ll_f_0[29];
+                                ll_hi_30 = reinterpret_cast<unsigned int*>(&_bit_cast_src_112)[0];
+                                BN[14] = (unsigned long long)ll_hi_30 << 32 | (unsigned long long)ll_lo_30;
+                                unsigned int ll_lo_31 = 0;
+                                unsigned int ll_hi_31 = 0;
+                                float _bit_cast_src_113 = ll_f_0[30];
+                                ll_lo_31 = reinterpret_cast<unsigned int*>(&_bit_cast_src_113)[0];
+                                float _bit_cast_src_114 = ll_f_0[31];
+                                ll_hi_31 = reinterpret_cast<unsigned int*>(&_bit_cast_src_114)[0];
+                                BN[15] = (unsigned long long)ll_hi_31 << 32 | (unsigned long long)ll_lo_31;
+                            }
+                            unsigned long long l16_m_0 = BL[15];
+                            RL[0] = ((RL[0] > l16_m_0) ? RL[0] : l16_m_0);
+                            unsigned long long l16_m_1 = BL[14];
+                            RL[1] = ((RL[1] > l16_m_1) ? RL[1] : l16_m_1);
+                            unsigned long long l16_m_2 = BL[13];
+                            RL[2] = ((RL[2] > l16_m_2) ? RL[2] : l16_m_2);
+                            unsigned long long l16_m_3 = BL[12];
+                            RL[3] = ((RL[3] > l16_m_3) ? RL[3] : l16_m_3);
+                            unsigned long long l16_m_4 = BL[11];
+                            RL[4] = ((RL[4] > l16_m_4) ? RL[4] : l16_m_4);
+                            unsigned long long l16_m_5 = BL[10];
+                            RL[5] = ((RL[5] > l16_m_5) ? RL[5] : l16_m_5);
+                            unsigned long long l16_m_6 = BL[9];
+                            RL[6] = ((RL[6] > l16_m_6) ? RL[6] : l16_m_6);
+                            unsigned long long l16_m_7 = BL[8];
+                            RL[7] = ((RL[7] > l16_m_7) ? RL[7] : l16_m_7);
+                            unsigned long long l16_m_8 = BL[7];
+                            RL[8] = ((RL[8] > l16_m_8) ? RL[8] : l16_m_8);
+                            unsigned long long l16_m_9 = BL[6];
+                            RL[9] = ((RL[9] > l16_m_9) ? RL[9] : l16_m_9);
+                            unsigned long long l16_m_10 = BL[5];
+                            RL[10] = ((RL[10] > l16_m_10) ? RL[10] : l16_m_10);
+                            unsigned long long l16_m_11 = BL[4];
+                            RL[11] = ((RL[11] > l16_m_11) ? RL[11] : l16_m_11);
+                            unsigned long long l16_m_12 = BL[3];
+                            RL[12] = ((RL[12] > l16_m_12) ? RL[12] : l16_m_12);
+                            unsigned long long l16_m_13 = BL[2];
+                            RL[13] = ((RL[13] > l16_m_13) ? RL[13] : l16_m_13);
+                            unsigned long long l16_m_14 = BL[1];
+                            RL[14] = ((RL[14] > l16_m_14) ? RL[14] : l16_m_14);
+                            unsigned long long l16_m_15 = BL[0];
+                            RL[15] = ((RL[15] > l16_m_15) ? RL[15] : l16_m_15);
+                            unsigned long long l16_a_0 = RL[0];
+                            unsigned long long l16_b_0 = RL[8];
+                            RL[0] = ((l16_a_0 > l16_b_0) ? l16_a_0 : l16_b_0);
+                            RL[8] = ((l16_a_0 > l16_b_0) ? l16_b_0 : l16_a_0);
+                            unsigned long long l16_a_1 = RL[1];
+                            unsigned long long l16_b_1 = RL[9];
+                            RL[1] = ((l16_a_1 > l16_b_1) ? l16_a_1 : l16_b_1);
+                            RL[9] = ((l16_a_1 > l16_b_1) ? l16_b_1 : l16_a_1);
+                            unsigned long long l16_a_2 = RL[2];
+                            unsigned long long l16_b_2 = RL[10];
+                            RL[2] = ((l16_a_2 > l16_b_2) ? l16_a_2 : l16_b_2);
+                            RL[10] = ((l16_a_2 > l16_b_2) ? l16_b_2 : l16_a_2);
+                            unsigned long long l16_a_3 = RL[3];
+                            unsigned long long l16_b_3 = RL[11];
+                            RL[3] = ((l16_a_3 > l16_b_3) ? l16_a_3 : l16_b_3);
+                            RL[11] = ((l16_a_3 > l16_b_3) ? l16_b_3 : l16_a_3);
+                            unsigned long long l16_a_4 = RL[4];
+                            unsigned long long l16_b_4 = RL[12];
+                            RL[4] = ((l16_a_4 > l16_b_4) ? l16_a_4 : l16_b_4);
+                            RL[12] = ((l16_a_4 > l16_b_4) ? l16_b_4 : l16_a_4);
+                            unsigned long long l16_a_5 = RL[5];
+                            unsigned long long l16_b_5 = RL[13];
+                            RL[5] = ((l16_a_5 > l16_b_5) ? l16_a_5 : l16_b_5);
+                            RL[13] = ((l16_a_5 > l16_b_5) ? l16_b_5 : l16_a_5);
+                            unsigned long long l16_a_6 = RL[6];
+                            unsigned long long l16_b_6 = RL[14];
+                            RL[6] = ((l16_a_6 > l16_b_6) ? l16_a_6 : l16_b_6);
+                            RL[14] = ((l16_a_6 > l16_b_6) ? l16_b_6 : l16_a_6);
+                            unsigned long long l16_a_7 = RL[7];
+                            unsigned long long l16_b_7 = RL[15];
+                            RL[7] = ((l16_a_7 > l16_b_7) ? l16_a_7 : l16_b_7);
+                            RL[15] = ((l16_a_7 > l16_b_7) ? l16_b_7 : l16_a_7);
+                            unsigned long long l16_a_8 = RL[0];
+                            unsigned long long l16_b_8 = RL[4];
+                            RL[0] = ((l16_a_8 > l16_b_8) ? l16_a_8 : l16_b_8);
+                            RL[4] = ((l16_a_8 > l16_b_8) ? l16_b_8 : l16_a_8);
+                            unsigned long long l16_a_9 = RL[1];
+                            unsigned long long l16_b_9 = RL[5];
+                            RL[1] = ((l16_a_9 > l16_b_9) ? l16_a_9 : l16_b_9);
+                            RL[5] = ((l16_a_9 > l16_b_9) ? l16_b_9 : l16_a_9);
+                            unsigned long long l16_a_10 = RL[2];
+                            unsigned long long l16_b_10 = RL[6];
+                            RL[2] = ((l16_a_10 > l16_b_10) ? l16_a_10 : l16_b_10);
+                            RL[6] = ((l16_a_10 > l16_b_10) ? l16_b_10 : l16_a_10);
+                            unsigned long long l16_a_11 = RL[3];
+                            unsigned long long l16_b_11 = RL[7];
+                            RL[3] = ((l16_a_11 > l16_b_11) ? l16_a_11 : l16_b_11);
+                            RL[7] = ((l16_a_11 > l16_b_11) ? l16_b_11 : l16_a_11);
+                            unsigned long long l16_a_12 = RL[8];
+                            unsigned long long l16_b_12 = RL[12];
+                            RL[8] = ((l16_a_12 > l16_b_12) ? l16_a_12 : l16_b_12);
+                            RL[12] = ((l16_a_12 > l16_b_12) ? l16_b_12 : l16_a_12);
+                            unsigned long long l16_a_13 = RL[9];
+                            unsigned long long l16_b_13 = RL[13];
+                            RL[9] = ((l16_a_13 > l16_b_13) ? l16_a_13 : l16_b_13);
+                            RL[13] = ((l16_a_13 > l16_b_13) ? l16_b_13 : l16_a_13);
+                            unsigned long long l16_a_14 = RL[10];
+                            unsigned long long l16_b_14 = RL[14];
+                            RL[10] = ((l16_a_14 > l16_b_14) ? l16_a_14 : l16_b_14);
+                            RL[14] = ((l16_a_14 > l16_b_14) ? l16_b_14 : l16_a_14);
+                            unsigned long long l16_a_15 = RL[11];
+                            unsigned long long l16_b_15 = RL[15];
+                            RL[11] = ((l16_a_15 > l16_b_15) ? l16_a_15 : l16_b_15);
+                            RL[15] = ((l16_a_15 > l16_b_15) ? l16_b_15 : l16_a_15);
+                            unsigned long long l16_a_16 = RL[0];
+                            unsigned long long l16_b_16 = RL[2];
+                            RL[0] = ((l16_a_16 > l16_b_16) ? l16_a_16 : l16_b_16);
+                            RL[2] = ((l16_a_16 > l16_b_16) ? l16_b_16 : l16_a_16);
+                            unsigned long long l16_a_17 = RL[1];
+                            unsigned long long l16_b_17 = RL[3];
+                            RL[1] = ((l16_a_17 > l16_b_17) ? l16_a_17 : l16_b_17);
+                            RL[3] = ((l16_a_17 > l16_b_17) ? l16_b_17 : l16_a_17);
+                            unsigned long long l16_a_18 = RL[4];
+                            unsigned long long l16_b_18 = RL[6];
+                            RL[4] = ((l16_a_18 > l16_b_18) ? l16_a_18 : l16_b_18);
+                            RL[6] = ((l16_a_18 > l16_b_18) ? l16_b_18 : l16_a_18);
+                            unsigned long long l16_a_19 = RL[5];
+                            unsigned long long l16_b_19 = RL[7];
+                            RL[5] = ((l16_a_19 > l16_b_19) ? l16_a_19 : l16_b_19);
+                            RL[7] = ((l16_a_19 > l16_b_19) ? l16_b_19 : l16_a_19);
+                            unsigned long long l16_a_20 = RL[8];
+                            unsigned long long l16_b_20 = RL[10];
+                            RL[8] = ((l16_a_20 > l16_b_20) ? l16_a_20 : l16_b_20);
+                            RL[10] = ((l16_a_20 > l16_b_20) ? l16_b_20 : l16_a_20);
+                            unsigned long long l16_a_21 = RL[9];
+                            unsigned long long l16_b_21 = RL[11];
+                            RL[9] = ((l16_a_21 > l16_b_21) ? l16_a_21 : l16_b_21);
+                            RL[11] = ((l16_a_21 > l16_b_21) ? l16_b_21 : l16_a_21);
+                            unsigned long long l16_a_22 = RL[12];
+                            unsigned long long l16_b_22 = RL[14];
+                            RL[12] = ((l16_a_22 > l16_b_22) ? l16_a_22 : l16_b_22);
+                            RL[14] = ((l16_a_22 > l16_b_22) ? l16_b_22 : l16_a_22);
+                            unsigned long long l16_a_23 = RL[13];
+                            unsigned long long l16_b_23 = RL[15];
+                            RL[13] = ((l16_a_23 > l16_b_23) ? l16_a_23 : l16_b_23);
+                            RL[15] = ((l16_a_23 > l16_b_23) ? l16_b_23 : l16_a_23);
+                            unsigned long long l16_a_24 = RL[0];
+                            unsigned long long l16_b_24 = RL[1];
+                            RL[0] = ((l16_a_24 > l16_b_24) ? l16_a_24 : l16_b_24);
+                            RL[1] = ((l16_a_24 > l16_b_24) ? l16_b_24 : l16_a_24);
+                            unsigned long long l16_a_25 = RL[2];
+                            unsigned long long l16_b_25 = RL[3];
+                            RL[2] = ((l16_a_25 > l16_b_25) ? l16_a_25 : l16_b_25);
+                            RL[3] = ((l16_a_25 > l16_b_25) ? l16_b_25 : l16_a_25);
+                            unsigned long long l16_a_26 = RL[4];
+                            unsigned long long l16_b_26 = RL[5];
+                            RL[4] = ((l16_a_26 > l16_b_26) ? l16_a_26 : l16_b_26);
+                            RL[5] = ((l16_a_26 > l16_b_26) ? l16_b_26 : l16_a_26);
+                            unsigned long long l16_a_27 = RL[6];
+                            unsigned long long l16_b_27 = RL[7];
+                            RL[6] = ((l16_a_27 > l16_b_27) ? l16_a_27 : l16_b_27);
+                            RL[7] = ((l16_a_27 > l16_b_27) ? l16_b_27 : l16_a_27);
+                            unsigned long long l16_a_28 = RL[8];
+                            unsigned long long l16_b_28 = RL[9];
+                            RL[8] = ((l16_a_28 > l16_b_28) ? l16_a_28 : l16_b_28);
+                            RL[9] = ((l16_a_28 > l16_b_28) ? l16_b_28 : l16_a_28);
+                            unsigned long long l16_a_29 = RL[10];
+                            unsigned long long l16_b_29 = RL[11];
+                            RL[10] = ((l16_a_29 > l16_b_29) ? l16_a_29 : l16_b_29);
+                            RL[11] = ((l16_a_29 > l16_b_29) ? l16_b_29 : l16_a_29);
+                            unsigned long long l16_a_30 = RL[12];
+                            unsigned long long l16_b_30 = RL[13];
+                            RL[12] = ((l16_a_30 > l16_b_30) ? l16_a_30 : l16_b_30);
+                            RL[13] = ((l16_a_30 > l16_b_30) ? l16_b_30 : l16_a_30);
+                            unsigned long long l16_a_31 = RL[14];
+                            unsigned long long l16_b_31 = RL[15];
+                            RL[14] = ((l16_a_31 > l16_b_31) ? l16_a_31 : l16_b_31);
+                            RL[15] = ((l16_a_31 > l16_b_31) ? l16_b_31 : l16_a_31);
+                        }
+                    }
                 }
-            }
-            #pragma unroll 1
-            for (int k = 1; k < (npieces + 31) / 32; k++) {
-                int sk = s_first + lane_1 + 32 * k;
-                if (sk <= s_last) {
-                    B[0] = 0;
-                    B[1] = 0;
-                    B[2] = 0;
-                    B[3] = 0;
-                    B[4] = 0;
-                    B[5] = 0;
-                    B[6] = 0;
-                    B[7] = 0;
-                    B[8] = 0;
-                    B[9] = 0;
-                    B[10] = 0;
-                    B[11] = 0;
-                    B[12] = 0;
-                    B[13] = 0;
-                    B[14] = 0;
-                    B[15] = 0;
-                    long long lp_wr_1 = work_range[sk];
-                    int lp_cb_1 = (((int)(lp_wr_1 & 65535) == j) ? (int)(lp_wr_1 >> 32 & 65535) : 0);
-                    int lp_ce_1 = (((int)(lp_wr_1 >> 16 & 65535) == j) ? (int)(lp_wr_1 >> 48 & 65535) : cj);
-                    if (lp_ce_1 > lp_cb_1) {
-                        float* lp_src_1 = reinterpret_cast<float*>(pool + ((long long)(sk + j) * pool_piece_stride + row_off));
-                        float lp_f_1[32];
-                        {
-                            float4 _v4 = *reinterpret_cast<const float4*>(lp_src_1 + 0);
-                            lp_f_1[0 + 0] = _v4.x;
-                            lp_f_1[0 + 1] = _v4.y;
-                            lp_f_1[0 + 2] = _v4.z;
-                            lp_f_1[0 + 3] = _v4.w;
-                        }
-                        {
-                            float4 _v4 = *reinterpret_cast<const float4*>(lp_src_1 + 4);
-                            lp_f_1[4 + 0] = _v4.x;
-                            lp_f_1[4 + 1] = _v4.y;
-                            lp_f_1[4 + 2] = _v4.z;
-                            lp_f_1[4 + 3] = _v4.w;
-                        }
-                        {
-                            float4 _v4 = *reinterpret_cast<const float4*>(lp_src_1 + 8);
-                            lp_f_1[8 + 0] = _v4.x;
-                            lp_f_1[8 + 1] = _v4.y;
-                            lp_f_1[8 + 2] = _v4.z;
-                            lp_f_1[8 + 3] = _v4.w;
-                        }
-                        {
-                            float4 _v4 = *reinterpret_cast<const float4*>(lp_src_1 + 12);
-                            lp_f_1[12 + 0] = _v4.x;
-                            lp_f_1[12 + 1] = _v4.y;
-                            lp_f_1[12 + 2] = _v4.z;
-                            lp_f_1[12 + 3] = _v4.w;
-                        }
-                        {
-                            float4 _v4 = *reinterpret_cast<const float4*>(lp_src_1 + 16);
-                            lp_f_1[16 + 0] = _v4.x;
-                            lp_f_1[16 + 1] = _v4.y;
-                            lp_f_1[16 + 2] = _v4.z;
-                            lp_f_1[16 + 3] = _v4.w;
-                        }
-                        {
-                            float4 _v4 = *reinterpret_cast<const float4*>(lp_src_1 + 20);
-                            lp_f_1[20 + 0] = _v4.x;
-                            lp_f_1[20 + 1] = _v4.y;
-                            lp_f_1[20 + 2] = _v4.z;
-                            lp_f_1[20 + 3] = _v4.w;
-                        }
-                        {
-                            float4 _v4 = *reinterpret_cast<const float4*>(lp_src_1 + 24);
-                            lp_f_1[24 + 0] = _v4.x;
-                            lp_f_1[24 + 1] = _v4.y;
-                            lp_f_1[24 + 2] = _v4.z;
-                            lp_f_1[24 + 3] = _v4.w;
-                        }
-                        {
-                            float4 _v4 = *reinterpret_cast<const float4*>(lp_src_1 + 28);
-                            lp_f_1[28 + 0] = _v4.x;
-                            lp_f_1[28 + 1] = _v4.y;
-                            lp_f_1[28 + 2] = _v4.z;
-                            lp_f_1[28 + 3] = _v4.w;
-                        }
-                        unsigned int lp_lo_16 = 0;
-                        unsigned int lp_hi_16 = 0;
-                        float _bit_cast_src_64 = lp_f_1[0];
-                        lp_lo_16 = reinterpret_cast<unsigned int*>(&_bit_cast_src_64)[0];
-                        float _bit_cast_src_65 = lp_f_1[1];
-                        lp_hi_16 = reinterpret_cast<unsigned int*>(&_bit_cast_src_65)[0];
-                        B[0] = (unsigned long long)lp_hi_16 << 32 | (unsigned long long)lp_lo_16;
-                        unsigned int lp_lo_17 = 0;
-                        unsigned int lp_hi_17 = 0;
-                        float _bit_cast_src_66 = lp_f_1[2];
-                        lp_lo_17 = reinterpret_cast<unsigned int*>(&_bit_cast_src_66)[0];
-                        float _bit_cast_src_67 = lp_f_1[3];
-                        lp_hi_17 = reinterpret_cast<unsigned int*>(&_bit_cast_src_67)[0];
-                        B[1] = (unsigned long long)lp_hi_17 << 32 | (unsigned long long)lp_lo_17;
-                        unsigned int lp_lo_18 = 0;
-                        unsigned int lp_hi_18 = 0;
-                        float _bit_cast_src_68 = lp_f_1[4];
-                        lp_lo_18 = reinterpret_cast<unsigned int*>(&_bit_cast_src_68)[0];
-                        float _bit_cast_src_69 = lp_f_1[5];
-                        lp_hi_18 = reinterpret_cast<unsigned int*>(&_bit_cast_src_69)[0];
-                        B[2] = (unsigned long long)lp_hi_18 << 32 | (unsigned long long)lp_lo_18;
-                        unsigned int lp_lo_19 = 0;
-                        unsigned int lp_hi_19 = 0;
-                        float _bit_cast_src_70 = lp_f_1[6];
-                        lp_lo_19 = reinterpret_cast<unsigned int*>(&_bit_cast_src_70)[0];
-                        float _bit_cast_src_71 = lp_f_1[7];
-                        lp_hi_19 = reinterpret_cast<unsigned int*>(&_bit_cast_src_71)[0];
-                        B[3] = (unsigned long long)lp_hi_19 << 32 | (unsigned long long)lp_lo_19;
-                        unsigned int lp_lo_20 = 0;
-                        unsigned int lp_hi_20 = 0;
-                        float _bit_cast_src_72 = lp_f_1[8];
-                        lp_lo_20 = reinterpret_cast<unsigned int*>(&_bit_cast_src_72)[0];
-                        float _bit_cast_src_73 = lp_f_1[9];
-                        lp_hi_20 = reinterpret_cast<unsigned int*>(&_bit_cast_src_73)[0];
-                        B[4] = (unsigned long long)lp_hi_20 << 32 | (unsigned long long)lp_lo_20;
-                        unsigned int lp_lo_21 = 0;
-                        unsigned int lp_hi_21 = 0;
-                        float _bit_cast_src_74 = lp_f_1[10];
-                        lp_lo_21 = reinterpret_cast<unsigned int*>(&_bit_cast_src_74)[0];
-                        float _bit_cast_src_75 = lp_f_1[11];
-                        lp_hi_21 = reinterpret_cast<unsigned int*>(&_bit_cast_src_75)[0];
-                        B[5] = (unsigned long long)lp_hi_21 << 32 | (unsigned long long)lp_lo_21;
-                        unsigned int lp_lo_22 = 0;
-                        unsigned int lp_hi_22 = 0;
-                        float _bit_cast_src_76 = lp_f_1[12];
-                        lp_lo_22 = reinterpret_cast<unsigned int*>(&_bit_cast_src_76)[0];
-                        float _bit_cast_src_77 = lp_f_1[13];
-                        lp_hi_22 = reinterpret_cast<unsigned int*>(&_bit_cast_src_77)[0];
-                        B[6] = (unsigned long long)lp_hi_22 << 32 | (unsigned long long)lp_lo_22;
-                        unsigned int lp_lo_23 = 0;
-                        unsigned int lp_hi_23 = 0;
-                        float _bit_cast_src_78 = lp_f_1[14];
-                        lp_lo_23 = reinterpret_cast<unsigned int*>(&_bit_cast_src_78)[0];
-                        float _bit_cast_src_79 = lp_f_1[15];
-                        lp_hi_23 = reinterpret_cast<unsigned int*>(&_bit_cast_src_79)[0];
-                        B[7] = (unsigned long long)lp_hi_23 << 32 | (unsigned long long)lp_lo_23;
-                        unsigned int lp_lo_24 = 0;
-                        unsigned int lp_hi_24 = 0;
-                        float _bit_cast_src_80 = lp_f_1[16];
-                        lp_lo_24 = reinterpret_cast<unsigned int*>(&_bit_cast_src_80)[0];
-                        float _bit_cast_src_81 = lp_f_1[17];
-                        lp_hi_24 = reinterpret_cast<unsigned int*>(&_bit_cast_src_81)[0];
-                        B[8] = (unsigned long long)lp_hi_24 << 32 | (unsigned long long)lp_lo_24;
-                        unsigned int lp_lo_25 = 0;
-                        unsigned int lp_hi_25 = 0;
-                        float _bit_cast_src_82 = lp_f_1[18];
-                        lp_lo_25 = reinterpret_cast<unsigned int*>(&_bit_cast_src_82)[0];
-                        float _bit_cast_src_83 = lp_f_1[19];
-                        lp_hi_25 = reinterpret_cast<unsigned int*>(&_bit_cast_src_83)[0];
-                        B[9] = (unsigned long long)lp_hi_25 << 32 | (unsigned long long)lp_lo_25;
-                        unsigned int lp_lo_26 = 0;
-                        unsigned int lp_hi_26 = 0;
-                        float _bit_cast_src_84 = lp_f_1[20];
-                        lp_lo_26 = reinterpret_cast<unsigned int*>(&_bit_cast_src_84)[0];
-                        float _bit_cast_src_85 = lp_f_1[21];
-                        lp_hi_26 = reinterpret_cast<unsigned int*>(&_bit_cast_src_85)[0];
-                        B[10] = (unsigned long long)lp_hi_26 << 32 | (unsigned long long)lp_lo_26;
-                        unsigned int lp_lo_27 = 0;
-                        unsigned int lp_hi_27 = 0;
-                        float _bit_cast_src_86 = lp_f_1[22];
-                        lp_lo_27 = reinterpret_cast<unsigned int*>(&_bit_cast_src_86)[0];
-                        float _bit_cast_src_87 = lp_f_1[23];
-                        lp_hi_27 = reinterpret_cast<unsigned int*>(&_bit_cast_src_87)[0];
-                        B[11] = (unsigned long long)lp_hi_27 << 32 | (unsigned long long)lp_lo_27;
-                        unsigned int lp_lo_28 = 0;
-                        unsigned int lp_hi_28 = 0;
-                        float _bit_cast_src_88 = lp_f_1[24];
-                        lp_lo_28 = reinterpret_cast<unsigned int*>(&_bit_cast_src_88)[0];
-                        float _bit_cast_src_89 = lp_f_1[25];
-                        lp_hi_28 = reinterpret_cast<unsigned int*>(&_bit_cast_src_89)[0];
-                        B[12] = (unsigned long long)lp_hi_28 << 32 | (unsigned long long)lp_lo_28;
-                        unsigned int lp_lo_29 = 0;
-                        unsigned int lp_hi_29 = 0;
-                        float _bit_cast_src_90 = lp_f_1[26];
-                        lp_lo_29 = reinterpret_cast<unsigned int*>(&_bit_cast_src_90)[0];
-                        float _bit_cast_src_91 = lp_f_1[27];
-                        lp_hi_29 = reinterpret_cast<unsigned int*>(&_bit_cast_src_91)[0];
-                        B[13] = (unsigned long long)lp_hi_29 << 32 | (unsigned long long)lp_lo_29;
-                        unsigned int lp_lo_30 = 0;
-                        unsigned int lp_hi_30 = 0;
-                        float _bit_cast_src_92 = lp_f_1[28];
-                        lp_lo_30 = reinterpret_cast<unsigned int*>(&_bit_cast_src_92)[0];
-                        float _bit_cast_src_93 = lp_f_1[29];
-                        lp_hi_30 = reinterpret_cast<unsigned int*>(&_bit_cast_src_93)[0];
-                        B[14] = (unsigned long long)lp_hi_30 << 32 | (unsigned long long)lp_lo_30;
-                        unsigned int lp_lo_31 = 0;
-                        unsigned int lp_hi_31 = 0;
-                        float _bit_cast_src_94 = lp_f_1[30];
-                        lp_lo_31 = reinterpret_cast<unsigned int*>(&_bit_cast_src_94)[0];
-                        float _bit_cast_src_95 = lp_f_1[31];
-                        lp_hi_31 = reinterpret_cast<unsigned int*>(&_bit_cast_src_95)[0];
-                        B[15] = (unsigned long long)lp_hi_31 << 32 | (unsigned long long)lp_lo_31;
-                    }
-                    unsigned long long l16_m_0 = B[15];
-                    R[0] = ((R[0] > l16_m_0) ? R[0] : l16_m_0);
-                    unsigned long long l16_m_1 = B[14];
-                    R[1] = ((R[1] > l16_m_1) ? R[1] : l16_m_1);
-                    unsigned long long l16_m_2 = B[13];
-                    R[2] = ((R[2] > l16_m_2) ? R[2] : l16_m_2);
-                    unsigned long long l16_m_3 = B[12];
-                    R[3] = ((R[3] > l16_m_3) ? R[3] : l16_m_3);
-                    unsigned long long l16_m_4 = B[11];
-                    R[4] = ((R[4] > l16_m_4) ? R[4] : l16_m_4);
-                    unsigned long long l16_m_5 = B[10];
-                    R[5] = ((R[5] > l16_m_5) ? R[5] : l16_m_5);
-                    unsigned long long l16_m_6 = B[9];
-                    R[6] = ((R[6] > l16_m_6) ? R[6] : l16_m_6);
-                    unsigned long long l16_m_7 = B[8];
-                    R[7] = ((R[7] > l16_m_7) ? R[7] : l16_m_7);
-                    unsigned long long l16_m_8 = B[7];
-                    R[8] = ((R[8] > l16_m_8) ? R[8] : l16_m_8);
-                    unsigned long long l16_m_9 = B[6];
-                    R[9] = ((R[9] > l16_m_9) ? R[9] : l16_m_9);
-                    unsigned long long l16_m_10 = B[5];
-                    R[10] = ((R[10] > l16_m_10) ? R[10] : l16_m_10);
-                    unsigned long long l16_m_11 = B[4];
-                    R[11] = ((R[11] > l16_m_11) ? R[11] : l16_m_11);
-                    unsigned long long l16_m_12 = B[3];
-                    R[12] = ((R[12] > l16_m_12) ? R[12] : l16_m_12);
-                    unsigned long long l16_m_13 = B[2];
-                    R[13] = ((R[13] > l16_m_13) ? R[13] : l16_m_13);
-                    unsigned long long l16_m_14 = B[1];
-                    R[14] = ((R[14] > l16_m_14) ? R[14] : l16_m_14);
-                    unsigned long long l16_m_15 = B[0];
-                    R[15] = ((R[15] > l16_m_15) ? R[15] : l16_m_15);
-                    unsigned long long l16_a_0 = R[0];
-                    unsigned long long l16_b_0 = R[8];
-                    R[0] = ((l16_a_0 > l16_b_0) ? l16_a_0 : l16_b_0);
-                    R[8] = ((l16_a_0 > l16_b_0) ? l16_b_0 : l16_a_0);
-                    unsigned long long l16_a_1 = R[1];
-                    unsigned long long l16_b_1 = R[9];
-                    R[1] = ((l16_a_1 > l16_b_1) ? l16_a_1 : l16_b_1);
-                    R[9] = ((l16_a_1 > l16_b_1) ? l16_b_1 : l16_a_1);
-                    unsigned long long l16_a_2 = R[2];
-                    unsigned long long l16_b_2 = R[10];
-                    R[2] = ((l16_a_2 > l16_b_2) ? l16_a_2 : l16_b_2);
-                    R[10] = ((l16_a_2 > l16_b_2) ? l16_b_2 : l16_a_2);
-                    unsigned long long l16_a_3 = R[3];
-                    unsigned long long l16_b_3 = R[11];
-                    R[3] = ((l16_a_3 > l16_b_3) ? l16_a_3 : l16_b_3);
-                    R[11] = ((l16_a_3 > l16_b_3) ? l16_b_3 : l16_a_3);
-                    unsigned long long l16_a_4 = R[4];
-                    unsigned long long l16_b_4 = R[12];
-                    R[4] = ((l16_a_4 > l16_b_4) ? l16_a_4 : l16_b_4);
-                    R[12] = ((l16_a_4 > l16_b_4) ? l16_b_4 : l16_a_4);
-                    unsigned long long l16_a_5 = R[5];
-                    unsigned long long l16_b_5 = R[13];
-                    R[5] = ((l16_a_5 > l16_b_5) ? l16_a_5 : l16_b_5);
-                    R[13] = ((l16_a_5 > l16_b_5) ? l16_b_5 : l16_a_5);
-                    unsigned long long l16_a_6 = R[6];
-                    unsigned long long l16_b_6 = R[14];
-                    R[6] = ((l16_a_6 > l16_b_6) ? l16_a_6 : l16_b_6);
-                    R[14] = ((l16_a_6 > l16_b_6) ? l16_b_6 : l16_a_6);
-                    unsigned long long l16_a_7 = R[7];
-                    unsigned long long l16_b_7 = R[15];
-                    R[7] = ((l16_a_7 > l16_b_7) ? l16_a_7 : l16_b_7);
-                    R[15] = ((l16_a_7 > l16_b_7) ? l16_b_7 : l16_a_7);
-                    unsigned long long l16_a_8 = R[0];
-                    unsigned long long l16_b_8 = R[4];
-                    R[0] = ((l16_a_8 > l16_b_8) ? l16_a_8 : l16_b_8);
-                    R[4] = ((l16_a_8 > l16_b_8) ? l16_b_8 : l16_a_8);
-                    unsigned long long l16_a_9 = R[1];
-                    unsigned long long l16_b_9 = R[5];
-                    R[1] = ((l16_a_9 > l16_b_9) ? l16_a_9 : l16_b_9);
-                    R[5] = ((l16_a_9 > l16_b_9) ? l16_b_9 : l16_a_9);
-                    unsigned long long l16_a_10 = R[2];
-                    unsigned long long l16_b_10 = R[6];
-                    R[2] = ((l16_a_10 > l16_b_10) ? l16_a_10 : l16_b_10);
-                    R[6] = ((l16_a_10 > l16_b_10) ? l16_b_10 : l16_a_10);
-                    unsigned long long l16_a_11 = R[3];
-                    unsigned long long l16_b_11 = R[7];
-                    R[3] = ((l16_a_11 > l16_b_11) ? l16_a_11 : l16_b_11);
-                    R[7] = ((l16_a_11 > l16_b_11) ? l16_b_11 : l16_a_11);
-                    unsigned long long l16_a_12 = R[8];
-                    unsigned long long l16_b_12 = R[12];
-                    R[8] = ((l16_a_12 > l16_b_12) ? l16_a_12 : l16_b_12);
-                    R[12] = ((l16_a_12 > l16_b_12) ? l16_b_12 : l16_a_12);
-                    unsigned long long l16_a_13 = R[9];
-                    unsigned long long l16_b_13 = R[13];
-                    R[9] = ((l16_a_13 > l16_b_13) ? l16_a_13 : l16_b_13);
-                    R[13] = ((l16_a_13 > l16_b_13) ? l16_b_13 : l16_a_13);
-                    unsigned long long l16_a_14 = R[10];
-                    unsigned long long l16_b_14 = R[14];
-                    R[10] = ((l16_a_14 > l16_b_14) ? l16_a_14 : l16_b_14);
-                    R[14] = ((l16_a_14 > l16_b_14) ? l16_b_14 : l16_a_14);
-                    unsigned long long l16_a_15 = R[11];
-                    unsigned long long l16_b_15 = R[15];
-                    R[11] = ((l16_a_15 > l16_b_15) ? l16_a_15 : l16_b_15);
-                    R[15] = ((l16_a_15 > l16_b_15) ? l16_b_15 : l16_a_15);
-                    unsigned long long l16_a_16 = R[0];
-                    unsigned long long l16_b_16 = R[2];
-                    R[0] = ((l16_a_16 > l16_b_16) ? l16_a_16 : l16_b_16);
-                    R[2] = ((l16_a_16 > l16_b_16) ? l16_b_16 : l16_a_16);
-                    unsigned long long l16_a_17 = R[1];
-                    unsigned long long l16_b_17 = R[3];
-                    R[1] = ((l16_a_17 > l16_b_17) ? l16_a_17 : l16_b_17);
-                    R[3] = ((l16_a_17 > l16_b_17) ? l16_b_17 : l16_a_17);
-                    unsigned long long l16_a_18 = R[4];
-                    unsigned long long l16_b_18 = R[6];
-                    R[4] = ((l16_a_18 > l16_b_18) ? l16_a_18 : l16_b_18);
-                    R[6] = ((l16_a_18 > l16_b_18) ? l16_b_18 : l16_a_18);
-                    unsigned long long l16_a_19 = R[5];
-                    unsigned long long l16_b_19 = R[7];
-                    R[5] = ((l16_a_19 > l16_b_19) ? l16_a_19 : l16_b_19);
-                    R[7] = ((l16_a_19 > l16_b_19) ? l16_b_19 : l16_a_19);
-                    unsigned long long l16_a_20 = R[8];
-                    unsigned long long l16_b_20 = R[10];
-                    R[8] = ((l16_a_20 > l16_b_20) ? l16_a_20 : l16_b_20);
-                    R[10] = ((l16_a_20 > l16_b_20) ? l16_b_20 : l16_a_20);
-                    unsigned long long l16_a_21 = R[9];
-                    unsigned long long l16_b_21 = R[11];
-                    R[9] = ((l16_a_21 > l16_b_21) ? l16_a_21 : l16_b_21);
-                    R[11] = ((l16_a_21 > l16_b_21) ? l16_b_21 : l16_a_21);
-                    unsigned long long l16_a_22 = R[12];
-                    unsigned long long l16_b_22 = R[14];
-                    R[12] = ((l16_a_22 > l16_b_22) ? l16_a_22 : l16_b_22);
-                    R[14] = ((l16_a_22 > l16_b_22) ? l16_b_22 : l16_a_22);
-                    unsigned long long l16_a_23 = R[13];
-                    unsigned long long l16_b_23 = R[15];
-                    R[13] = ((l16_a_23 > l16_b_23) ? l16_a_23 : l16_b_23);
-                    R[15] = ((l16_a_23 > l16_b_23) ? l16_b_23 : l16_a_23);
-                    unsigned long long l16_a_24 = R[0];
-                    unsigned long long l16_b_24 = R[1];
-                    R[0] = ((l16_a_24 > l16_b_24) ? l16_a_24 : l16_b_24);
-                    R[1] = ((l16_a_24 > l16_b_24) ? l16_b_24 : l16_a_24);
-                    unsigned long long l16_a_25 = R[2];
-                    unsigned long long l16_b_25 = R[3];
-                    R[2] = ((l16_a_25 > l16_b_25) ? l16_a_25 : l16_b_25);
-                    R[3] = ((l16_a_25 > l16_b_25) ? l16_b_25 : l16_a_25);
-                    unsigned long long l16_a_26 = R[4];
-                    unsigned long long l16_b_26 = R[5];
-                    R[4] = ((l16_a_26 > l16_b_26) ? l16_a_26 : l16_b_26);
-                    R[5] = ((l16_a_26 > l16_b_26) ? l16_b_26 : l16_a_26);
-                    unsigned long long l16_a_27 = R[6];
-                    unsigned long long l16_b_27 = R[7];
-                    R[6] = ((l16_a_27 > l16_b_27) ? l16_a_27 : l16_b_27);
-                    R[7] = ((l16_a_27 > l16_b_27) ? l16_b_27 : l16_a_27);
-                    unsigned long long l16_a_28 = R[8];
-                    unsigned long long l16_b_28 = R[9];
-                    R[8] = ((l16_a_28 > l16_b_28) ? l16_a_28 : l16_b_28);
-                    R[9] = ((l16_a_28 > l16_b_28) ? l16_b_28 : l16_a_28);
-                    unsigned long long l16_a_29 = R[10];
-                    unsigned long long l16_b_29 = R[11];
-                    R[10] = ((l16_a_29 > l16_b_29) ? l16_a_29 : l16_b_29);
-                    R[11] = ((l16_a_29 > l16_b_29) ? l16_b_29 : l16_a_29);
-                    unsigned long long l16_a_30 = R[12];
-                    unsigned long long l16_b_30 = R[13];
-                    R[12] = ((l16_a_30 > l16_b_30) ? l16_a_30 : l16_b_30);
-                    R[13] = ((l16_a_30 > l16_b_30) ? l16_b_30 : l16_a_30);
-                    unsigned long long l16_a_31 = R[14];
-                    unsigned long long l16_b_31 = R[15];
-                    R[14] = ((l16_a_31 > l16_b_31) ? l16_a_31 : l16_b_31);
-                    R[15] = ((l16_a_31 > l16_b_31) ? l16_b_31 : l16_a_31);
-                }
-            }
-            if (1 < width) {
-                unsigned long long x_v_0 = R[0];
+                unsigned long long x_v_0 = RL[0];
                 unsigned int x_lo_0 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_0, 1);
                 unsigned int x_hi_0 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_0 >> 32), 1);
-                B[0] = (unsigned long long)x_hi_0 << 32 | (unsigned long long)x_lo_0;
-                unsigned long long x_v_1 = R[1];
+                BL[0] = (unsigned long long)x_hi_0 << 32 | (unsigned long long)x_lo_0;
+                unsigned long long x_v_1 = RL[1];
                 unsigned int x_lo_1 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_1, 1);
                 unsigned int x_hi_1 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_1 >> 32), 1);
-                B[1] = (unsigned long long)x_hi_1 << 32 | (unsigned long long)x_lo_1;
-                unsigned long long x_v_2 = R[2];
+                BL[1] = (unsigned long long)x_hi_1 << 32 | (unsigned long long)x_lo_1;
+                unsigned long long x_v_2 = RL[2];
                 unsigned int x_lo_2 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_2, 1);
                 unsigned int x_hi_2 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_2 >> 32), 1);
-                B[2] = (unsigned long long)x_hi_2 << 32 | (unsigned long long)x_lo_2;
-                unsigned long long x_v_3 = R[3];
+                BL[2] = (unsigned long long)x_hi_2 << 32 | (unsigned long long)x_lo_2;
+                unsigned long long x_v_3 = RL[3];
                 unsigned int x_lo_3 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_3, 1);
                 unsigned int x_hi_3 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_3 >> 32), 1);
-                B[3] = (unsigned long long)x_hi_3 << 32 | (unsigned long long)x_lo_3;
-                unsigned long long x_v_4 = R[4];
+                BL[3] = (unsigned long long)x_hi_3 << 32 | (unsigned long long)x_lo_3;
+                unsigned long long x_v_4 = RL[4];
                 unsigned int x_lo_4 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_4, 1);
                 unsigned int x_hi_4 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_4 >> 32), 1);
-                B[4] = (unsigned long long)x_hi_4 << 32 | (unsigned long long)x_lo_4;
-                unsigned long long x_v_5 = R[5];
+                BL[4] = (unsigned long long)x_hi_4 << 32 | (unsigned long long)x_lo_4;
+                unsigned long long x_v_5 = RL[5];
                 unsigned int x_lo_5 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_5, 1);
                 unsigned int x_hi_5 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_5 >> 32), 1);
-                B[5] = (unsigned long long)x_hi_5 << 32 | (unsigned long long)x_lo_5;
-                unsigned long long x_v_6 = R[6];
+                BL[5] = (unsigned long long)x_hi_5 << 32 | (unsigned long long)x_lo_5;
+                unsigned long long x_v_6 = RL[6];
                 unsigned int x_lo_6 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_6, 1);
                 unsigned int x_hi_6 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_6 >> 32), 1);
-                B[6] = (unsigned long long)x_hi_6 << 32 | (unsigned long long)x_lo_6;
-                unsigned long long x_v_7 = R[7];
+                BL[6] = (unsigned long long)x_hi_6 << 32 | (unsigned long long)x_lo_6;
+                unsigned long long x_v_7 = RL[7];
                 unsigned int x_lo_7 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_7, 1);
                 unsigned int x_hi_7 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_7 >> 32), 1);
-                B[7] = (unsigned long long)x_hi_7 << 32 | (unsigned long long)x_lo_7;
-                unsigned long long x_v_8 = R[8];
+                BL[7] = (unsigned long long)x_hi_7 << 32 | (unsigned long long)x_lo_7;
+                unsigned long long x_v_8 = RL[8];
                 unsigned int x_lo_8 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_8, 1);
                 unsigned int x_hi_8 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_8 >> 32), 1);
-                B[8] = (unsigned long long)x_hi_8 << 32 | (unsigned long long)x_lo_8;
-                unsigned long long x_v_9 = R[9];
+                BL[8] = (unsigned long long)x_hi_8 << 32 | (unsigned long long)x_lo_8;
+                unsigned long long x_v_9 = RL[9];
                 unsigned int x_lo_9 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_9, 1);
                 unsigned int x_hi_9 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_9 >> 32), 1);
-                B[9] = (unsigned long long)x_hi_9 << 32 | (unsigned long long)x_lo_9;
-                unsigned long long x_v_10 = R[10];
+                BL[9] = (unsigned long long)x_hi_9 << 32 | (unsigned long long)x_lo_9;
+                unsigned long long x_v_10 = RL[10];
                 unsigned int x_lo_10 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_10, 1);
                 unsigned int x_hi_10 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_10 >> 32), 1);
-                B[10] = (unsigned long long)x_hi_10 << 32 | (unsigned long long)x_lo_10;
-                unsigned long long x_v_11 = R[11];
+                BL[10] = (unsigned long long)x_hi_10 << 32 | (unsigned long long)x_lo_10;
+                unsigned long long x_v_11 = RL[11];
                 unsigned int x_lo_11 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_11, 1);
                 unsigned int x_hi_11 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_11 >> 32), 1);
-                B[11] = (unsigned long long)x_hi_11 << 32 | (unsigned long long)x_lo_11;
-                unsigned long long x_v_12 = R[12];
+                BL[11] = (unsigned long long)x_hi_11 << 32 | (unsigned long long)x_lo_11;
+                unsigned long long x_v_12 = RL[12];
                 unsigned int x_lo_12 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_12, 1);
                 unsigned int x_hi_12 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_12 >> 32), 1);
-                B[12] = (unsigned long long)x_hi_12 << 32 | (unsigned long long)x_lo_12;
-                unsigned long long x_v_13 = R[13];
+                BL[12] = (unsigned long long)x_hi_12 << 32 | (unsigned long long)x_lo_12;
+                unsigned long long x_v_13 = RL[13];
                 unsigned int x_lo_13 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_13, 1);
                 unsigned int x_hi_13 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_13 >> 32), 1);
-                B[13] = (unsigned long long)x_hi_13 << 32 | (unsigned long long)x_lo_13;
-                unsigned long long x_v_14 = R[14];
+                BL[13] = (unsigned long long)x_hi_13 << 32 | (unsigned long long)x_lo_13;
+                unsigned long long x_v_14 = RL[14];
                 unsigned int x_lo_14 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_14, 1);
                 unsigned int x_hi_14 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_14 >> 32), 1);
-                B[14] = (unsigned long long)x_hi_14 << 32 | (unsigned long long)x_lo_14;
-                unsigned long long x_v_15 = R[15];
+                BL[14] = (unsigned long long)x_hi_14 << 32 | (unsigned long long)x_lo_14;
+                unsigned long long x_v_15 = RL[15];
                 unsigned int x_lo_15 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_15, 1);
                 unsigned int x_hi_15 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_15 >> 32), 1);
-                B[15] = (unsigned long long)x_hi_15 << 32 | (unsigned long long)x_lo_15;
-                unsigned long long l16_m_16 = B[15];
-                R[0] = ((R[0] > l16_m_16) ? R[0] : l16_m_16);
-                unsigned long long l16_m_17 = B[14];
-                R[1] = ((R[1] > l16_m_17) ? R[1] : l16_m_17);
-                unsigned long long l16_m_18 = B[13];
-                R[2] = ((R[2] > l16_m_18) ? R[2] : l16_m_18);
-                unsigned long long l16_m_19 = B[12];
-                R[3] = ((R[3] > l16_m_19) ? R[3] : l16_m_19);
-                unsigned long long l16_m_20 = B[11];
-                R[4] = ((R[4] > l16_m_20) ? R[4] : l16_m_20);
-                unsigned long long l16_m_21 = B[10];
-                R[5] = ((R[5] > l16_m_21) ? R[5] : l16_m_21);
-                unsigned long long l16_m_22 = B[9];
-                R[6] = ((R[6] > l16_m_22) ? R[6] : l16_m_22);
-                unsigned long long l16_m_23 = B[8];
-                R[7] = ((R[7] > l16_m_23) ? R[7] : l16_m_23);
-                unsigned long long l16_m_24 = B[7];
-                R[8] = ((R[8] > l16_m_24) ? R[8] : l16_m_24);
-                unsigned long long l16_m_25 = B[6];
-                R[9] = ((R[9] > l16_m_25) ? R[9] : l16_m_25);
-                unsigned long long l16_m_26 = B[5];
-                R[10] = ((R[10] > l16_m_26) ? R[10] : l16_m_26);
-                unsigned long long l16_m_27 = B[4];
-                R[11] = ((R[11] > l16_m_27) ? R[11] : l16_m_27);
-                unsigned long long l16_m_28 = B[3];
-                R[12] = ((R[12] > l16_m_28) ? R[12] : l16_m_28);
-                unsigned long long l16_m_29 = B[2];
-                R[13] = ((R[13] > l16_m_29) ? R[13] : l16_m_29);
-                unsigned long long l16_m_30 = B[1];
-                R[14] = ((R[14] > l16_m_30) ? R[14] : l16_m_30);
-                unsigned long long l16_m_31 = B[0];
-                R[15] = ((R[15] > l16_m_31) ? R[15] : l16_m_31);
-                unsigned long long l16_a_32 = R[0];
-                unsigned long long l16_b_32 = R[8];
-                R[0] = ((l16_a_32 > l16_b_32) ? l16_a_32 : l16_b_32);
-                R[8] = ((l16_a_32 > l16_b_32) ? l16_b_32 : l16_a_32);
-                unsigned long long l16_a_33 = R[1];
-                unsigned long long l16_b_33 = R[9];
-                R[1] = ((l16_a_33 > l16_b_33) ? l16_a_33 : l16_b_33);
-                R[9] = ((l16_a_33 > l16_b_33) ? l16_b_33 : l16_a_33);
-                unsigned long long l16_a_34 = R[2];
-                unsigned long long l16_b_34 = R[10];
-                R[2] = ((l16_a_34 > l16_b_34) ? l16_a_34 : l16_b_34);
-                R[10] = ((l16_a_34 > l16_b_34) ? l16_b_34 : l16_a_34);
-                unsigned long long l16_a_35 = R[3];
-                unsigned long long l16_b_35 = R[11];
-                R[3] = ((l16_a_35 > l16_b_35) ? l16_a_35 : l16_b_35);
-                R[11] = ((l16_a_35 > l16_b_35) ? l16_b_35 : l16_a_35);
-                unsigned long long l16_a_36 = R[4];
-                unsigned long long l16_b_36 = R[12];
-                R[4] = ((l16_a_36 > l16_b_36) ? l16_a_36 : l16_b_36);
-                R[12] = ((l16_a_36 > l16_b_36) ? l16_b_36 : l16_a_36);
-                unsigned long long l16_a_37 = R[5];
-                unsigned long long l16_b_37 = R[13];
-                R[5] = ((l16_a_37 > l16_b_37) ? l16_a_37 : l16_b_37);
-                R[13] = ((l16_a_37 > l16_b_37) ? l16_b_37 : l16_a_37);
-                unsigned long long l16_a_38 = R[6];
-                unsigned long long l16_b_38 = R[14];
-                R[6] = ((l16_a_38 > l16_b_38) ? l16_a_38 : l16_b_38);
-                R[14] = ((l16_a_38 > l16_b_38) ? l16_b_38 : l16_a_38);
-                unsigned long long l16_a_39 = R[7];
-                unsigned long long l16_b_39 = R[15];
-                R[7] = ((l16_a_39 > l16_b_39) ? l16_a_39 : l16_b_39);
-                R[15] = ((l16_a_39 > l16_b_39) ? l16_b_39 : l16_a_39);
-                unsigned long long l16_a_40 = R[0];
-                unsigned long long l16_b_40 = R[4];
-                R[0] = ((l16_a_40 > l16_b_40) ? l16_a_40 : l16_b_40);
-                R[4] = ((l16_a_40 > l16_b_40) ? l16_b_40 : l16_a_40);
-                unsigned long long l16_a_41 = R[1];
-                unsigned long long l16_b_41 = R[5];
-                R[1] = ((l16_a_41 > l16_b_41) ? l16_a_41 : l16_b_41);
-                R[5] = ((l16_a_41 > l16_b_41) ? l16_b_41 : l16_a_41);
-                unsigned long long l16_a_42 = R[2];
-                unsigned long long l16_b_42 = R[6];
-                R[2] = ((l16_a_42 > l16_b_42) ? l16_a_42 : l16_b_42);
-                R[6] = ((l16_a_42 > l16_b_42) ? l16_b_42 : l16_a_42);
-                unsigned long long l16_a_43 = R[3];
-                unsigned long long l16_b_43 = R[7];
-                R[3] = ((l16_a_43 > l16_b_43) ? l16_a_43 : l16_b_43);
-                R[7] = ((l16_a_43 > l16_b_43) ? l16_b_43 : l16_a_43);
-                unsigned long long l16_a_44 = R[8];
-                unsigned long long l16_b_44 = R[12];
-                R[8] = ((l16_a_44 > l16_b_44) ? l16_a_44 : l16_b_44);
-                R[12] = ((l16_a_44 > l16_b_44) ? l16_b_44 : l16_a_44);
-                unsigned long long l16_a_45 = R[9];
-                unsigned long long l16_b_45 = R[13];
-                R[9] = ((l16_a_45 > l16_b_45) ? l16_a_45 : l16_b_45);
-                R[13] = ((l16_a_45 > l16_b_45) ? l16_b_45 : l16_a_45);
-                unsigned long long l16_a_46 = R[10];
-                unsigned long long l16_b_46 = R[14];
-                R[10] = ((l16_a_46 > l16_b_46) ? l16_a_46 : l16_b_46);
-                R[14] = ((l16_a_46 > l16_b_46) ? l16_b_46 : l16_a_46);
-                unsigned long long l16_a_47 = R[11];
-                unsigned long long l16_b_47 = R[15];
-                R[11] = ((l16_a_47 > l16_b_47) ? l16_a_47 : l16_b_47);
-                R[15] = ((l16_a_47 > l16_b_47) ? l16_b_47 : l16_a_47);
-                unsigned long long l16_a_48 = R[0];
-                unsigned long long l16_b_48 = R[2];
-                R[0] = ((l16_a_48 > l16_b_48) ? l16_a_48 : l16_b_48);
-                R[2] = ((l16_a_48 > l16_b_48) ? l16_b_48 : l16_a_48);
-                unsigned long long l16_a_49 = R[1];
-                unsigned long long l16_b_49 = R[3];
-                R[1] = ((l16_a_49 > l16_b_49) ? l16_a_49 : l16_b_49);
-                R[3] = ((l16_a_49 > l16_b_49) ? l16_b_49 : l16_a_49);
-                unsigned long long l16_a_50 = R[4];
-                unsigned long long l16_b_50 = R[6];
-                R[4] = ((l16_a_50 > l16_b_50) ? l16_a_50 : l16_b_50);
-                R[6] = ((l16_a_50 > l16_b_50) ? l16_b_50 : l16_a_50);
-                unsigned long long l16_a_51 = R[5];
-                unsigned long long l16_b_51 = R[7];
-                R[5] = ((l16_a_51 > l16_b_51) ? l16_a_51 : l16_b_51);
-                R[7] = ((l16_a_51 > l16_b_51) ? l16_b_51 : l16_a_51);
-                unsigned long long l16_a_52 = R[8];
-                unsigned long long l16_b_52 = R[10];
-                R[8] = ((l16_a_52 > l16_b_52) ? l16_a_52 : l16_b_52);
-                R[10] = ((l16_a_52 > l16_b_52) ? l16_b_52 : l16_a_52);
-                unsigned long long l16_a_53 = R[9];
-                unsigned long long l16_b_53 = R[11];
-                R[9] = ((l16_a_53 > l16_b_53) ? l16_a_53 : l16_b_53);
-                R[11] = ((l16_a_53 > l16_b_53) ? l16_b_53 : l16_a_53);
-                unsigned long long l16_a_54 = R[12];
-                unsigned long long l16_b_54 = R[14];
-                R[12] = ((l16_a_54 > l16_b_54) ? l16_a_54 : l16_b_54);
-                R[14] = ((l16_a_54 > l16_b_54) ? l16_b_54 : l16_a_54);
-                unsigned long long l16_a_55 = R[13];
-                unsigned long long l16_b_55 = R[15];
-                R[13] = ((l16_a_55 > l16_b_55) ? l16_a_55 : l16_b_55);
-                R[15] = ((l16_a_55 > l16_b_55) ? l16_b_55 : l16_a_55);
-                unsigned long long l16_a_56 = R[0];
-                unsigned long long l16_b_56 = R[1];
-                R[0] = ((l16_a_56 > l16_b_56) ? l16_a_56 : l16_b_56);
-                R[1] = ((l16_a_56 > l16_b_56) ? l16_b_56 : l16_a_56);
-                unsigned long long l16_a_57 = R[2];
-                unsigned long long l16_b_57 = R[3];
-                R[2] = ((l16_a_57 > l16_b_57) ? l16_a_57 : l16_b_57);
-                R[3] = ((l16_a_57 > l16_b_57) ? l16_b_57 : l16_a_57);
-                unsigned long long l16_a_58 = R[4];
-                unsigned long long l16_b_58 = R[5];
-                R[4] = ((l16_a_58 > l16_b_58) ? l16_a_58 : l16_b_58);
-                R[5] = ((l16_a_58 > l16_b_58) ? l16_b_58 : l16_a_58);
-                unsigned long long l16_a_59 = R[6];
-                unsigned long long l16_b_59 = R[7];
-                R[6] = ((l16_a_59 > l16_b_59) ? l16_a_59 : l16_b_59);
-                R[7] = ((l16_a_59 > l16_b_59) ? l16_b_59 : l16_a_59);
-                unsigned long long l16_a_60 = R[8];
-                unsigned long long l16_b_60 = R[9];
-                R[8] = ((l16_a_60 > l16_b_60) ? l16_a_60 : l16_b_60);
-                R[9] = ((l16_a_60 > l16_b_60) ? l16_b_60 : l16_a_60);
-                unsigned long long l16_a_61 = R[10];
-                unsigned long long l16_b_61 = R[11];
-                R[10] = ((l16_a_61 > l16_b_61) ? l16_a_61 : l16_b_61);
-                R[11] = ((l16_a_61 > l16_b_61) ? l16_b_61 : l16_a_61);
-                unsigned long long l16_a_62 = R[12];
-                unsigned long long l16_b_62 = R[13];
-                R[12] = ((l16_a_62 > l16_b_62) ? l16_a_62 : l16_b_62);
-                R[13] = ((l16_a_62 > l16_b_62) ? l16_b_62 : l16_a_62);
-                unsigned long long l16_a_63 = R[14];
-                unsigned long long l16_b_63 = R[15];
-                R[14] = ((l16_a_63 > l16_b_63) ? l16_a_63 : l16_b_63);
-                R[15] = ((l16_a_63 > l16_b_63) ? l16_b_63 : l16_a_63);
-            }
-            if (2 < width) {
-                unsigned long long x_v_16 = R[0];
+                BL[15] = (unsigned long long)x_hi_15 << 32 | (unsigned long long)x_lo_15;
+                unsigned long long l16_m_16 = BL[15];
+                RL[0] = ((RL[0] > l16_m_16) ? RL[0] : l16_m_16);
+                unsigned long long l16_m_17 = BL[14];
+                RL[1] = ((RL[1] > l16_m_17) ? RL[1] : l16_m_17);
+                unsigned long long l16_m_18 = BL[13];
+                RL[2] = ((RL[2] > l16_m_18) ? RL[2] : l16_m_18);
+                unsigned long long l16_m_19 = BL[12];
+                RL[3] = ((RL[3] > l16_m_19) ? RL[3] : l16_m_19);
+                unsigned long long l16_m_20 = BL[11];
+                RL[4] = ((RL[4] > l16_m_20) ? RL[4] : l16_m_20);
+                unsigned long long l16_m_21 = BL[10];
+                RL[5] = ((RL[5] > l16_m_21) ? RL[5] : l16_m_21);
+                unsigned long long l16_m_22 = BL[9];
+                RL[6] = ((RL[6] > l16_m_22) ? RL[6] : l16_m_22);
+                unsigned long long l16_m_23 = BL[8];
+                RL[7] = ((RL[7] > l16_m_23) ? RL[7] : l16_m_23);
+                unsigned long long l16_m_24 = BL[7];
+                RL[8] = ((RL[8] > l16_m_24) ? RL[8] : l16_m_24);
+                unsigned long long l16_m_25 = BL[6];
+                RL[9] = ((RL[9] > l16_m_25) ? RL[9] : l16_m_25);
+                unsigned long long l16_m_26 = BL[5];
+                RL[10] = ((RL[10] > l16_m_26) ? RL[10] : l16_m_26);
+                unsigned long long l16_m_27 = BL[4];
+                RL[11] = ((RL[11] > l16_m_27) ? RL[11] : l16_m_27);
+                unsigned long long l16_m_28 = BL[3];
+                RL[12] = ((RL[12] > l16_m_28) ? RL[12] : l16_m_28);
+                unsigned long long l16_m_29 = BL[2];
+                RL[13] = ((RL[13] > l16_m_29) ? RL[13] : l16_m_29);
+                unsigned long long l16_m_30 = BL[1];
+                RL[14] = ((RL[14] > l16_m_30) ? RL[14] : l16_m_30);
+                unsigned long long l16_m_31 = BL[0];
+                RL[15] = ((RL[15] > l16_m_31) ? RL[15] : l16_m_31);
+                unsigned long long l16_a_32 = RL[0];
+                unsigned long long l16_b_32 = RL[8];
+                RL[0] = ((l16_a_32 > l16_b_32) ? l16_a_32 : l16_b_32);
+                RL[8] = ((l16_a_32 > l16_b_32) ? l16_b_32 : l16_a_32);
+                unsigned long long l16_a_33 = RL[1];
+                unsigned long long l16_b_33 = RL[9];
+                RL[1] = ((l16_a_33 > l16_b_33) ? l16_a_33 : l16_b_33);
+                RL[9] = ((l16_a_33 > l16_b_33) ? l16_b_33 : l16_a_33);
+                unsigned long long l16_a_34 = RL[2];
+                unsigned long long l16_b_34 = RL[10];
+                RL[2] = ((l16_a_34 > l16_b_34) ? l16_a_34 : l16_b_34);
+                RL[10] = ((l16_a_34 > l16_b_34) ? l16_b_34 : l16_a_34);
+                unsigned long long l16_a_35 = RL[3];
+                unsigned long long l16_b_35 = RL[11];
+                RL[3] = ((l16_a_35 > l16_b_35) ? l16_a_35 : l16_b_35);
+                RL[11] = ((l16_a_35 > l16_b_35) ? l16_b_35 : l16_a_35);
+                unsigned long long l16_a_36 = RL[4];
+                unsigned long long l16_b_36 = RL[12];
+                RL[4] = ((l16_a_36 > l16_b_36) ? l16_a_36 : l16_b_36);
+                RL[12] = ((l16_a_36 > l16_b_36) ? l16_b_36 : l16_a_36);
+                unsigned long long l16_a_37 = RL[5];
+                unsigned long long l16_b_37 = RL[13];
+                RL[5] = ((l16_a_37 > l16_b_37) ? l16_a_37 : l16_b_37);
+                RL[13] = ((l16_a_37 > l16_b_37) ? l16_b_37 : l16_a_37);
+                unsigned long long l16_a_38 = RL[6];
+                unsigned long long l16_b_38 = RL[14];
+                RL[6] = ((l16_a_38 > l16_b_38) ? l16_a_38 : l16_b_38);
+                RL[14] = ((l16_a_38 > l16_b_38) ? l16_b_38 : l16_a_38);
+                unsigned long long l16_a_39 = RL[7];
+                unsigned long long l16_b_39 = RL[15];
+                RL[7] = ((l16_a_39 > l16_b_39) ? l16_a_39 : l16_b_39);
+                RL[15] = ((l16_a_39 > l16_b_39) ? l16_b_39 : l16_a_39);
+                unsigned long long l16_a_40 = RL[0];
+                unsigned long long l16_b_40 = RL[4];
+                RL[0] = ((l16_a_40 > l16_b_40) ? l16_a_40 : l16_b_40);
+                RL[4] = ((l16_a_40 > l16_b_40) ? l16_b_40 : l16_a_40);
+                unsigned long long l16_a_41 = RL[1];
+                unsigned long long l16_b_41 = RL[5];
+                RL[1] = ((l16_a_41 > l16_b_41) ? l16_a_41 : l16_b_41);
+                RL[5] = ((l16_a_41 > l16_b_41) ? l16_b_41 : l16_a_41);
+                unsigned long long l16_a_42 = RL[2];
+                unsigned long long l16_b_42 = RL[6];
+                RL[2] = ((l16_a_42 > l16_b_42) ? l16_a_42 : l16_b_42);
+                RL[6] = ((l16_a_42 > l16_b_42) ? l16_b_42 : l16_a_42);
+                unsigned long long l16_a_43 = RL[3];
+                unsigned long long l16_b_43 = RL[7];
+                RL[3] = ((l16_a_43 > l16_b_43) ? l16_a_43 : l16_b_43);
+                RL[7] = ((l16_a_43 > l16_b_43) ? l16_b_43 : l16_a_43);
+                unsigned long long l16_a_44 = RL[8];
+                unsigned long long l16_b_44 = RL[12];
+                RL[8] = ((l16_a_44 > l16_b_44) ? l16_a_44 : l16_b_44);
+                RL[12] = ((l16_a_44 > l16_b_44) ? l16_b_44 : l16_a_44);
+                unsigned long long l16_a_45 = RL[9];
+                unsigned long long l16_b_45 = RL[13];
+                RL[9] = ((l16_a_45 > l16_b_45) ? l16_a_45 : l16_b_45);
+                RL[13] = ((l16_a_45 > l16_b_45) ? l16_b_45 : l16_a_45);
+                unsigned long long l16_a_46 = RL[10];
+                unsigned long long l16_b_46 = RL[14];
+                RL[10] = ((l16_a_46 > l16_b_46) ? l16_a_46 : l16_b_46);
+                RL[14] = ((l16_a_46 > l16_b_46) ? l16_b_46 : l16_a_46);
+                unsigned long long l16_a_47 = RL[11];
+                unsigned long long l16_b_47 = RL[15];
+                RL[11] = ((l16_a_47 > l16_b_47) ? l16_a_47 : l16_b_47);
+                RL[15] = ((l16_a_47 > l16_b_47) ? l16_b_47 : l16_a_47);
+                unsigned long long l16_a_48 = RL[0];
+                unsigned long long l16_b_48 = RL[2];
+                RL[0] = ((l16_a_48 > l16_b_48) ? l16_a_48 : l16_b_48);
+                RL[2] = ((l16_a_48 > l16_b_48) ? l16_b_48 : l16_a_48);
+                unsigned long long l16_a_49 = RL[1];
+                unsigned long long l16_b_49 = RL[3];
+                RL[1] = ((l16_a_49 > l16_b_49) ? l16_a_49 : l16_b_49);
+                RL[3] = ((l16_a_49 > l16_b_49) ? l16_b_49 : l16_a_49);
+                unsigned long long l16_a_50 = RL[4];
+                unsigned long long l16_b_50 = RL[6];
+                RL[4] = ((l16_a_50 > l16_b_50) ? l16_a_50 : l16_b_50);
+                RL[6] = ((l16_a_50 > l16_b_50) ? l16_b_50 : l16_a_50);
+                unsigned long long l16_a_51 = RL[5];
+                unsigned long long l16_b_51 = RL[7];
+                RL[5] = ((l16_a_51 > l16_b_51) ? l16_a_51 : l16_b_51);
+                RL[7] = ((l16_a_51 > l16_b_51) ? l16_b_51 : l16_a_51);
+                unsigned long long l16_a_52 = RL[8];
+                unsigned long long l16_b_52 = RL[10];
+                RL[8] = ((l16_a_52 > l16_b_52) ? l16_a_52 : l16_b_52);
+                RL[10] = ((l16_a_52 > l16_b_52) ? l16_b_52 : l16_a_52);
+                unsigned long long l16_a_53 = RL[9];
+                unsigned long long l16_b_53 = RL[11];
+                RL[9] = ((l16_a_53 > l16_b_53) ? l16_a_53 : l16_b_53);
+                RL[11] = ((l16_a_53 > l16_b_53) ? l16_b_53 : l16_a_53);
+                unsigned long long l16_a_54 = RL[12];
+                unsigned long long l16_b_54 = RL[14];
+                RL[12] = ((l16_a_54 > l16_b_54) ? l16_a_54 : l16_b_54);
+                RL[14] = ((l16_a_54 > l16_b_54) ? l16_b_54 : l16_a_54);
+                unsigned long long l16_a_55 = RL[13];
+                unsigned long long l16_b_55 = RL[15];
+                RL[13] = ((l16_a_55 > l16_b_55) ? l16_a_55 : l16_b_55);
+                RL[15] = ((l16_a_55 > l16_b_55) ? l16_b_55 : l16_a_55);
+                unsigned long long l16_a_56 = RL[0];
+                unsigned long long l16_b_56 = RL[1];
+                RL[0] = ((l16_a_56 > l16_b_56) ? l16_a_56 : l16_b_56);
+                RL[1] = ((l16_a_56 > l16_b_56) ? l16_b_56 : l16_a_56);
+                unsigned long long l16_a_57 = RL[2];
+                unsigned long long l16_b_57 = RL[3];
+                RL[2] = ((l16_a_57 > l16_b_57) ? l16_a_57 : l16_b_57);
+                RL[3] = ((l16_a_57 > l16_b_57) ? l16_b_57 : l16_a_57);
+                unsigned long long l16_a_58 = RL[4];
+                unsigned long long l16_b_58 = RL[5];
+                RL[4] = ((l16_a_58 > l16_b_58) ? l16_a_58 : l16_b_58);
+                RL[5] = ((l16_a_58 > l16_b_58) ? l16_b_58 : l16_a_58);
+                unsigned long long l16_a_59 = RL[6];
+                unsigned long long l16_b_59 = RL[7];
+                RL[6] = ((l16_a_59 > l16_b_59) ? l16_a_59 : l16_b_59);
+                RL[7] = ((l16_a_59 > l16_b_59) ? l16_b_59 : l16_a_59);
+                unsigned long long l16_a_60 = RL[8];
+                unsigned long long l16_b_60 = RL[9];
+                RL[8] = ((l16_a_60 > l16_b_60) ? l16_a_60 : l16_b_60);
+                RL[9] = ((l16_a_60 > l16_b_60) ? l16_b_60 : l16_a_60);
+                unsigned long long l16_a_61 = RL[10];
+                unsigned long long l16_b_61 = RL[11];
+                RL[10] = ((l16_a_61 > l16_b_61) ? l16_a_61 : l16_b_61);
+                RL[11] = ((l16_a_61 > l16_b_61) ? l16_b_61 : l16_a_61);
+                unsigned long long l16_a_62 = RL[12];
+                unsigned long long l16_b_62 = RL[13];
+                RL[12] = ((l16_a_62 > l16_b_62) ? l16_a_62 : l16_b_62);
+                RL[13] = ((l16_a_62 > l16_b_62) ? l16_b_62 : l16_a_62);
+                unsigned long long l16_a_63 = RL[14];
+                unsigned long long l16_b_63 = RL[15];
+                RL[14] = ((l16_a_63 > l16_b_63) ? l16_a_63 : l16_b_63);
+                RL[15] = ((l16_a_63 > l16_b_63) ? l16_b_63 : l16_a_63);
+                unsigned long long x_v_16 = RL[0];
                 unsigned int x_lo_16 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_16, 2);
                 unsigned int x_hi_16 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_16 >> 32), 2);
-                B[0] = (unsigned long long)x_hi_16 << 32 | (unsigned long long)x_lo_16;
-                unsigned long long x_v_17 = R[1];
+                BL[0] = (unsigned long long)x_hi_16 << 32 | (unsigned long long)x_lo_16;
+                unsigned long long x_v_17 = RL[1];
                 unsigned int x_lo_17 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_17, 2);
                 unsigned int x_hi_17 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_17 >> 32), 2);
-                B[1] = (unsigned long long)x_hi_17 << 32 | (unsigned long long)x_lo_17;
-                unsigned long long x_v_18 = R[2];
+                BL[1] = (unsigned long long)x_hi_17 << 32 | (unsigned long long)x_lo_17;
+                unsigned long long x_v_18 = RL[2];
                 unsigned int x_lo_18 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_18, 2);
                 unsigned int x_hi_18 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_18 >> 32), 2);
-                B[2] = (unsigned long long)x_hi_18 << 32 | (unsigned long long)x_lo_18;
-                unsigned long long x_v_19 = R[3];
+                BL[2] = (unsigned long long)x_hi_18 << 32 | (unsigned long long)x_lo_18;
+                unsigned long long x_v_19 = RL[3];
                 unsigned int x_lo_19 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_19, 2);
                 unsigned int x_hi_19 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_19 >> 32), 2);
-                B[3] = (unsigned long long)x_hi_19 << 32 | (unsigned long long)x_lo_19;
-                unsigned long long x_v_20 = R[4];
+                BL[3] = (unsigned long long)x_hi_19 << 32 | (unsigned long long)x_lo_19;
+                unsigned long long x_v_20 = RL[4];
                 unsigned int x_lo_20 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_20, 2);
                 unsigned int x_hi_20 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_20 >> 32), 2);
-                B[4] = (unsigned long long)x_hi_20 << 32 | (unsigned long long)x_lo_20;
-                unsigned long long x_v_21 = R[5];
+                BL[4] = (unsigned long long)x_hi_20 << 32 | (unsigned long long)x_lo_20;
+                unsigned long long x_v_21 = RL[5];
                 unsigned int x_lo_21 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_21, 2);
                 unsigned int x_hi_21 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_21 >> 32), 2);
-                B[5] = (unsigned long long)x_hi_21 << 32 | (unsigned long long)x_lo_21;
-                unsigned long long x_v_22 = R[6];
+                BL[5] = (unsigned long long)x_hi_21 << 32 | (unsigned long long)x_lo_21;
+                unsigned long long x_v_22 = RL[6];
                 unsigned int x_lo_22 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_22, 2);
                 unsigned int x_hi_22 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_22 >> 32), 2);
-                B[6] = (unsigned long long)x_hi_22 << 32 | (unsigned long long)x_lo_22;
-                unsigned long long x_v_23 = R[7];
+                BL[6] = (unsigned long long)x_hi_22 << 32 | (unsigned long long)x_lo_22;
+                unsigned long long x_v_23 = RL[7];
                 unsigned int x_lo_23 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_23, 2);
                 unsigned int x_hi_23 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_23 >> 32), 2);
-                B[7] = (unsigned long long)x_hi_23 << 32 | (unsigned long long)x_lo_23;
-                unsigned long long x_v_24 = R[8];
+                BL[7] = (unsigned long long)x_hi_23 << 32 | (unsigned long long)x_lo_23;
+                unsigned long long x_v_24 = RL[8];
                 unsigned int x_lo_24 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_24, 2);
                 unsigned int x_hi_24 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_24 >> 32), 2);
-                B[8] = (unsigned long long)x_hi_24 << 32 | (unsigned long long)x_lo_24;
-                unsigned long long x_v_25 = R[9];
+                BL[8] = (unsigned long long)x_hi_24 << 32 | (unsigned long long)x_lo_24;
+                unsigned long long x_v_25 = RL[9];
                 unsigned int x_lo_25 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_25, 2);
                 unsigned int x_hi_25 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_25 >> 32), 2);
-                B[9] = (unsigned long long)x_hi_25 << 32 | (unsigned long long)x_lo_25;
-                unsigned long long x_v_26 = R[10];
+                BL[9] = (unsigned long long)x_hi_25 << 32 | (unsigned long long)x_lo_25;
+                unsigned long long x_v_26 = RL[10];
                 unsigned int x_lo_26 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_26, 2);
                 unsigned int x_hi_26 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_26 >> 32), 2);
-                B[10] = (unsigned long long)x_hi_26 << 32 | (unsigned long long)x_lo_26;
-                unsigned long long x_v_27 = R[11];
+                BL[10] = (unsigned long long)x_hi_26 << 32 | (unsigned long long)x_lo_26;
+                unsigned long long x_v_27 = RL[11];
                 unsigned int x_lo_27 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_27, 2);
                 unsigned int x_hi_27 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_27 >> 32), 2);
-                B[11] = (unsigned long long)x_hi_27 << 32 | (unsigned long long)x_lo_27;
-                unsigned long long x_v_28 = R[12];
+                BL[11] = (unsigned long long)x_hi_27 << 32 | (unsigned long long)x_lo_27;
+                unsigned long long x_v_28 = RL[12];
                 unsigned int x_lo_28 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_28, 2);
                 unsigned int x_hi_28 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_28 >> 32), 2);
-                B[12] = (unsigned long long)x_hi_28 << 32 | (unsigned long long)x_lo_28;
-                unsigned long long x_v_29 = R[13];
+                BL[12] = (unsigned long long)x_hi_28 << 32 | (unsigned long long)x_lo_28;
+                unsigned long long x_v_29 = RL[13];
                 unsigned int x_lo_29 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_29, 2);
                 unsigned int x_hi_29 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_29 >> 32), 2);
-                B[13] = (unsigned long long)x_hi_29 << 32 | (unsigned long long)x_lo_29;
-                unsigned long long x_v_30 = R[14];
+                BL[13] = (unsigned long long)x_hi_29 << 32 | (unsigned long long)x_lo_29;
+                unsigned long long x_v_30 = RL[14];
                 unsigned int x_lo_30 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_30, 2);
                 unsigned int x_hi_30 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_30 >> 32), 2);
-                B[14] = (unsigned long long)x_hi_30 << 32 | (unsigned long long)x_lo_30;
-                unsigned long long x_v_31 = R[15];
+                BL[14] = (unsigned long long)x_hi_30 << 32 | (unsigned long long)x_lo_30;
+                unsigned long long x_v_31 = RL[15];
                 unsigned int x_lo_31 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_31, 2);
                 unsigned int x_hi_31 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_31 >> 32), 2);
-                B[15] = (unsigned long long)x_hi_31 << 32 | (unsigned long long)x_lo_31;
-                unsigned long long l16_m_32 = B[15];
-                R[0] = ((R[0] > l16_m_32) ? R[0] : l16_m_32);
-                unsigned long long l16_m_33 = B[14];
-                R[1] = ((R[1] > l16_m_33) ? R[1] : l16_m_33);
-                unsigned long long l16_m_34 = B[13];
-                R[2] = ((R[2] > l16_m_34) ? R[2] : l16_m_34);
-                unsigned long long l16_m_35 = B[12];
-                R[3] = ((R[3] > l16_m_35) ? R[3] : l16_m_35);
-                unsigned long long l16_m_36 = B[11];
-                R[4] = ((R[4] > l16_m_36) ? R[4] : l16_m_36);
-                unsigned long long l16_m_37 = B[10];
-                R[5] = ((R[5] > l16_m_37) ? R[5] : l16_m_37);
-                unsigned long long l16_m_38 = B[9];
-                R[6] = ((R[6] > l16_m_38) ? R[6] : l16_m_38);
-                unsigned long long l16_m_39 = B[8];
-                R[7] = ((R[7] > l16_m_39) ? R[7] : l16_m_39);
-                unsigned long long l16_m_40 = B[7];
-                R[8] = ((R[8] > l16_m_40) ? R[8] : l16_m_40);
-                unsigned long long l16_m_41 = B[6];
-                R[9] = ((R[9] > l16_m_41) ? R[9] : l16_m_41);
-                unsigned long long l16_m_42 = B[5];
-                R[10] = ((R[10] > l16_m_42) ? R[10] : l16_m_42);
-                unsigned long long l16_m_43 = B[4];
-                R[11] = ((R[11] > l16_m_43) ? R[11] : l16_m_43);
-                unsigned long long l16_m_44 = B[3];
-                R[12] = ((R[12] > l16_m_44) ? R[12] : l16_m_44);
-                unsigned long long l16_m_45 = B[2];
-                R[13] = ((R[13] > l16_m_45) ? R[13] : l16_m_45);
-                unsigned long long l16_m_46 = B[1];
-                R[14] = ((R[14] > l16_m_46) ? R[14] : l16_m_46);
-                unsigned long long l16_m_47 = B[0];
-                R[15] = ((R[15] > l16_m_47) ? R[15] : l16_m_47);
-                unsigned long long l16_a_64 = R[0];
-                unsigned long long l16_b_64 = R[8];
-                R[0] = ((l16_a_64 > l16_b_64) ? l16_a_64 : l16_b_64);
-                R[8] = ((l16_a_64 > l16_b_64) ? l16_b_64 : l16_a_64);
-                unsigned long long l16_a_65 = R[1];
-                unsigned long long l16_b_65 = R[9];
-                R[1] = ((l16_a_65 > l16_b_65) ? l16_a_65 : l16_b_65);
-                R[9] = ((l16_a_65 > l16_b_65) ? l16_b_65 : l16_a_65);
-                unsigned long long l16_a_66 = R[2];
-                unsigned long long l16_b_66 = R[10];
-                R[2] = ((l16_a_66 > l16_b_66) ? l16_a_66 : l16_b_66);
-                R[10] = ((l16_a_66 > l16_b_66) ? l16_b_66 : l16_a_66);
-                unsigned long long l16_a_67 = R[3];
-                unsigned long long l16_b_67 = R[11];
-                R[3] = ((l16_a_67 > l16_b_67) ? l16_a_67 : l16_b_67);
-                R[11] = ((l16_a_67 > l16_b_67) ? l16_b_67 : l16_a_67);
-                unsigned long long l16_a_68 = R[4];
-                unsigned long long l16_b_68 = R[12];
-                R[4] = ((l16_a_68 > l16_b_68) ? l16_a_68 : l16_b_68);
-                R[12] = ((l16_a_68 > l16_b_68) ? l16_b_68 : l16_a_68);
-                unsigned long long l16_a_69 = R[5];
-                unsigned long long l16_b_69 = R[13];
-                R[5] = ((l16_a_69 > l16_b_69) ? l16_a_69 : l16_b_69);
-                R[13] = ((l16_a_69 > l16_b_69) ? l16_b_69 : l16_a_69);
-                unsigned long long l16_a_70 = R[6];
-                unsigned long long l16_b_70 = R[14];
-                R[6] = ((l16_a_70 > l16_b_70) ? l16_a_70 : l16_b_70);
-                R[14] = ((l16_a_70 > l16_b_70) ? l16_b_70 : l16_a_70);
-                unsigned long long l16_a_71 = R[7];
-                unsigned long long l16_b_71 = R[15];
-                R[7] = ((l16_a_71 > l16_b_71) ? l16_a_71 : l16_b_71);
-                R[15] = ((l16_a_71 > l16_b_71) ? l16_b_71 : l16_a_71);
-                unsigned long long l16_a_72 = R[0];
-                unsigned long long l16_b_72 = R[4];
-                R[0] = ((l16_a_72 > l16_b_72) ? l16_a_72 : l16_b_72);
-                R[4] = ((l16_a_72 > l16_b_72) ? l16_b_72 : l16_a_72);
-                unsigned long long l16_a_73 = R[1];
-                unsigned long long l16_b_73 = R[5];
-                R[1] = ((l16_a_73 > l16_b_73) ? l16_a_73 : l16_b_73);
-                R[5] = ((l16_a_73 > l16_b_73) ? l16_b_73 : l16_a_73);
-                unsigned long long l16_a_74 = R[2];
-                unsigned long long l16_b_74 = R[6];
-                R[2] = ((l16_a_74 > l16_b_74) ? l16_a_74 : l16_b_74);
-                R[6] = ((l16_a_74 > l16_b_74) ? l16_b_74 : l16_a_74);
-                unsigned long long l16_a_75 = R[3];
-                unsigned long long l16_b_75 = R[7];
-                R[3] = ((l16_a_75 > l16_b_75) ? l16_a_75 : l16_b_75);
-                R[7] = ((l16_a_75 > l16_b_75) ? l16_b_75 : l16_a_75);
-                unsigned long long l16_a_76 = R[8];
-                unsigned long long l16_b_76 = R[12];
-                R[8] = ((l16_a_76 > l16_b_76) ? l16_a_76 : l16_b_76);
-                R[12] = ((l16_a_76 > l16_b_76) ? l16_b_76 : l16_a_76);
-                unsigned long long l16_a_77 = R[9];
-                unsigned long long l16_b_77 = R[13];
-                R[9] = ((l16_a_77 > l16_b_77) ? l16_a_77 : l16_b_77);
-                R[13] = ((l16_a_77 > l16_b_77) ? l16_b_77 : l16_a_77);
-                unsigned long long l16_a_78 = R[10];
-                unsigned long long l16_b_78 = R[14];
-                R[10] = ((l16_a_78 > l16_b_78) ? l16_a_78 : l16_b_78);
-                R[14] = ((l16_a_78 > l16_b_78) ? l16_b_78 : l16_a_78);
-                unsigned long long l16_a_79 = R[11];
-                unsigned long long l16_b_79 = R[15];
-                R[11] = ((l16_a_79 > l16_b_79) ? l16_a_79 : l16_b_79);
-                R[15] = ((l16_a_79 > l16_b_79) ? l16_b_79 : l16_a_79);
-                unsigned long long l16_a_80 = R[0];
-                unsigned long long l16_b_80 = R[2];
-                R[0] = ((l16_a_80 > l16_b_80) ? l16_a_80 : l16_b_80);
-                R[2] = ((l16_a_80 > l16_b_80) ? l16_b_80 : l16_a_80);
-                unsigned long long l16_a_81 = R[1];
-                unsigned long long l16_b_81 = R[3];
-                R[1] = ((l16_a_81 > l16_b_81) ? l16_a_81 : l16_b_81);
-                R[3] = ((l16_a_81 > l16_b_81) ? l16_b_81 : l16_a_81);
-                unsigned long long l16_a_82 = R[4];
-                unsigned long long l16_b_82 = R[6];
-                R[4] = ((l16_a_82 > l16_b_82) ? l16_a_82 : l16_b_82);
-                R[6] = ((l16_a_82 > l16_b_82) ? l16_b_82 : l16_a_82);
-                unsigned long long l16_a_83 = R[5];
-                unsigned long long l16_b_83 = R[7];
-                R[5] = ((l16_a_83 > l16_b_83) ? l16_a_83 : l16_b_83);
-                R[7] = ((l16_a_83 > l16_b_83) ? l16_b_83 : l16_a_83);
-                unsigned long long l16_a_84 = R[8];
-                unsigned long long l16_b_84 = R[10];
-                R[8] = ((l16_a_84 > l16_b_84) ? l16_a_84 : l16_b_84);
-                R[10] = ((l16_a_84 > l16_b_84) ? l16_b_84 : l16_a_84);
-                unsigned long long l16_a_85 = R[9];
-                unsigned long long l16_b_85 = R[11];
-                R[9] = ((l16_a_85 > l16_b_85) ? l16_a_85 : l16_b_85);
-                R[11] = ((l16_a_85 > l16_b_85) ? l16_b_85 : l16_a_85);
-                unsigned long long l16_a_86 = R[12];
-                unsigned long long l16_b_86 = R[14];
-                R[12] = ((l16_a_86 > l16_b_86) ? l16_a_86 : l16_b_86);
-                R[14] = ((l16_a_86 > l16_b_86) ? l16_b_86 : l16_a_86);
-                unsigned long long l16_a_87 = R[13];
-                unsigned long long l16_b_87 = R[15];
-                R[13] = ((l16_a_87 > l16_b_87) ? l16_a_87 : l16_b_87);
-                R[15] = ((l16_a_87 > l16_b_87) ? l16_b_87 : l16_a_87);
-                unsigned long long l16_a_88 = R[0];
-                unsigned long long l16_b_88 = R[1];
-                R[0] = ((l16_a_88 > l16_b_88) ? l16_a_88 : l16_b_88);
-                R[1] = ((l16_a_88 > l16_b_88) ? l16_b_88 : l16_a_88);
-                unsigned long long l16_a_89 = R[2];
-                unsigned long long l16_b_89 = R[3];
-                R[2] = ((l16_a_89 > l16_b_89) ? l16_a_89 : l16_b_89);
-                R[3] = ((l16_a_89 > l16_b_89) ? l16_b_89 : l16_a_89);
-                unsigned long long l16_a_90 = R[4];
-                unsigned long long l16_b_90 = R[5];
-                R[4] = ((l16_a_90 > l16_b_90) ? l16_a_90 : l16_b_90);
-                R[5] = ((l16_a_90 > l16_b_90) ? l16_b_90 : l16_a_90);
-                unsigned long long l16_a_91 = R[6];
-                unsigned long long l16_b_91 = R[7];
-                R[6] = ((l16_a_91 > l16_b_91) ? l16_a_91 : l16_b_91);
-                R[7] = ((l16_a_91 > l16_b_91) ? l16_b_91 : l16_a_91);
-                unsigned long long l16_a_92 = R[8];
-                unsigned long long l16_b_92 = R[9];
-                R[8] = ((l16_a_92 > l16_b_92) ? l16_a_92 : l16_b_92);
-                R[9] = ((l16_a_92 > l16_b_92) ? l16_b_92 : l16_a_92);
-                unsigned long long l16_a_93 = R[10];
-                unsigned long long l16_b_93 = R[11];
-                R[10] = ((l16_a_93 > l16_b_93) ? l16_a_93 : l16_b_93);
-                R[11] = ((l16_a_93 > l16_b_93) ? l16_b_93 : l16_a_93);
-                unsigned long long l16_a_94 = R[12];
-                unsigned long long l16_b_94 = R[13];
-                R[12] = ((l16_a_94 > l16_b_94) ? l16_a_94 : l16_b_94);
-                R[13] = ((l16_a_94 > l16_b_94) ? l16_b_94 : l16_a_94);
-                unsigned long long l16_a_95 = R[14];
-                unsigned long long l16_b_95 = R[15];
-                R[14] = ((l16_a_95 > l16_b_95) ? l16_a_95 : l16_b_95);
-                R[15] = ((l16_a_95 > l16_b_95) ? l16_b_95 : l16_a_95);
-            }
-            if (4 < width) {
-                unsigned long long x_v_32 = R[0];
+                BL[15] = (unsigned long long)x_hi_31 << 32 | (unsigned long long)x_lo_31;
+                unsigned long long l16_m_32 = BL[15];
+                RL[0] = ((RL[0] > l16_m_32) ? RL[0] : l16_m_32);
+                unsigned long long l16_m_33 = BL[14];
+                RL[1] = ((RL[1] > l16_m_33) ? RL[1] : l16_m_33);
+                unsigned long long l16_m_34 = BL[13];
+                RL[2] = ((RL[2] > l16_m_34) ? RL[2] : l16_m_34);
+                unsigned long long l16_m_35 = BL[12];
+                RL[3] = ((RL[3] > l16_m_35) ? RL[3] : l16_m_35);
+                unsigned long long l16_m_36 = BL[11];
+                RL[4] = ((RL[4] > l16_m_36) ? RL[4] : l16_m_36);
+                unsigned long long l16_m_37 = BL[10];
+                RL[5] = ((RL[5] > l16_m_37) ? RL[5] : l16_m_37);
+                unsigned long long l16_m_38 = BL[9];
+                RL[6] = ((RL[6] > l16_m_38) ? RL[6] : l16_m_38);
+                unsigned long long l16_m_39 = BL[8];
+                RL[7] = ((RL[7] > l16_m_39) ? RL[7] : l16_m_39);
+                unsigned long long l16_m_40 = BL[7];
+                RL[8] = ((RL[8] > l16_m_40) ? RL[8] : l16_m_40);
+                unsigned long long l16_m_41 = BL[6];
+                RL[9] = ((RL[9] > l16_m_41) ? RL[9] : l16_m_41);
+                unsigned long long l16_m_42 = BL[5];
+                RL[10] = ((RL[10] > l16_m_42) ? RL[10] : l16_m_42);
+                unsigned long long l16_m_43 = BL[4];
+                RL[11] = ((RL[11] > l16_m_43) ? RL[11] : l16_m_43);
+                unsigned long long l16_m_44 = BL[3];
+                RL[12] = ((RL[12] > l16_m_44) ? RL[12] : l16_m_44);
+                unsigned long long l16_m_45 = BL[2];
+                RL[13] = ((RL[13] > l16_m_45) ? RL[13] : l16_m_45);
+                unsigned long long l16_m_46 = BL[1];
+                RL[14] = ((RL[14] > l16_m_46) ? RL[14] : l16_m_46);
+                unsigned long long l16_m_47 = BL[0];
+                RL[15] = ((RL[15] > l16_m_47) ? RL[15] : l16_m_47);
+                unsigned long long l16_a_64 = RL[0];
+                unsigned long long l16_b_64 = RL[8];
+                RL[0] = ((l16_a_64 > l16_b_64) ? l16_a_64 : l16_b_64);
+                RL[8] = ((l16_a_64 > l16_b_64) ? l16_b_64 : l16_a_64);
+                unsigned long long l16_a_65 = RL[1];
+                unsigned long long l16_b_65 = RL[9];
+                RL[1] = ((l16_a_65 > l16_b_65) ? l16_a_65 : l16_b_65);
+                RL[9] = ((l16_a_65 > l16_b_65) ? l16_b_65 : l16_a_65);
+                unsigned long long l16_a_66 = RL[2];
+                unsigned long long l16_b_66 = RL[10];
+                RL[2] = ((l16_a_66 > l16_b_66) ? l16_a_66 : l16_b_66);
+                RL[10] = ((l16_a_66 > l16_b_66) ? l16_b_66 : l16_a_66);
+                unsigned long long l16_a_67 = RL[3];
+                unsigned long long l16_b_67 = RL[11];
+                RL[3] = ((l16_a_67 > l16_b_67) ? l16_a_67 : l16_b_67);
+                RL[11] = ((l16_a_67 > l16_b_67) ? l16_b_67 : l16_a_67);
+                unsigned long long l16_a_68 = RL[4];
+                unsigned long long l16_b_68 = RL[12];
+                RL[4] = ((l16_a_68 > l16_b_68) ? l16_a_68 : l16_b_68);
+                RL[12] = ((l16_a_68 > l16_b_68) ? l16_b_68 : l16_a_68);
+                unsigned long long l16_a_69 = RL[5];
+                unsigned long long l16_b_69 = RL[13];
+                RL[5] = ((l16_a_69 > l16_b_69) ? l16_a_69 : l16_b_69);
+                RL[13] = ((l16_a_69 > l16_b_69) ? l16_b_69 : l16_a_69);
+                unsigned long long l16_a_70 = RL[6];
+                unsigned long long l16_b_70 = RL[14];
+                RL[6] = ((l16_a_70 > l16_b_70) ? l16_a_70 : l16_b_70);
+                RL[14] = ((l16_a_70 > l16_b_70) ? l16_b_70 : l16_a_70);
+                unsigned long long l16_a_71 = RL[7];
+                unsigned long long l16_b_71 = RL[15];
+                RL[7] = ((l16_a_71 > l16_b_71) ? l16_a_71 : l16_b_71);
+                RL[15] = ((l16_a_71 > l16_b_71) ? l16_b_71 : l16_a_71);
+                unsigned long long l16_a_72 = RL[0];
+                unsigned long long l16_b_72 = RL[4];
+                RL[0] = ((l16_a_72 > l16_b_72) ? l16_a_72 : l16_b_72);
+                RL[4] = ((l16_a_72 > l16_b_72) ? l16_b_72 : l16_a_72);
+                unsigned long long l16_a_73 = RL[1];
+                unsigned long long l16_b_73 = RL[5];
+                RL[1] = ((l16_a_73 > l16_b_73) ? l16_a_73 : l16_b_73);
+                RL[5] = ((l16_a_73 > l16_b_73) ? l16_b_73 : l16_a_73);
+                unsigned long long l16_a_74 = RL[2];
+                unsigned long long l16_b_74 = RL[6];
+                RL[2] = ((l16_a_74 > l16_b_74) ? l16_a_74 : l16_b_74);
+                RL[6] = ((l16_a_74 > l16_b_74) ? l16_b_74 : l16_a_74);
+                unsigned long long l16_a_75 = RL[3];
+                unsigned long long l16_b_75 = RL[7];
+                RL[3] = ((l16_a_75 > l16_b_75) ? l16_a_75 : l16_b_75);
+                RL[7] = ((l16_a_75 > l16_b_75) ? l16_b_75 : l16_a_75);
+                unsigned long long l16_a_76 = RL[8];
+                unsigned long long l16_b_76 = RL[12];
+                RL[8] = ((l16_a_76 > l16_b_76) ? l16_a_76 : l16_b_76);
+                RL[12] = ((l16_a_76 > l16_b_76) ? l16_b_76 : l16_a_76);
+                unsigned long long l16_a_77 = RL[9];
+                unsigned long long l16_b_77 = RL[13];
+                RL[9] = ((l16_a_77 > l16_b_77) ? l16_a_77 : l16_b_77);
+                RL[13] = ((l16_a_77 > l16_b_77) ? l16_b_77 : l16_a_77);
+                unsigned long long l16_a_78 = RL[10];
+                unsigned long long l16_b_78 = RL[14];
+                RL[10] = ((l16_a_78 > l16_b_78) ? l16_a_78 : l16_b_78);
+                RL[14] = ((l16_a_78 > l16_b_78) ? l16_b_78 : l16_a_78);
+                unsigned long long l16_a_79 = RL[11];
+                unsigned long long l16_b_79 = RL[15];
+                RL[11] = ((l16_a_79 > l16_b_79) ? l16_a_79 : l16_b_79);
+                RL[15] = ((l16_a_79 > l16_b_79) ? l16_b_79 : l16_a_79);
+                unsigned long long l16_a_80 = RL[0];
+                unsigned long long l16_b_80 = RL[2];
+                RL[0] = ((l16_a_80 > l16_b_80) ? l16_a_80 : l16_b_80);
+                RL[2] = ((l16_a_80 > l16_b_80) ? l16_b_80 : l16_a_80);
+                unsigned long long l16_a_81 = RL[1];
+                unsigned long long l16_b_81 = RL[3];
+                RL[1] = ((l16_a_81 > l16_b_81) ? l16_a_81 : l16_b_81);
+                RL[3] = ((l16_a_81 > l16_b_81) ? l16_b_81 : l16_a_81);
+                unsigned long long l16_a_82 = RL[4];
+                unsigned long long l16_b_82 = RL[6];
+                RL[4] = ((l16_a_82 > l16_b_82) ? l16_a_82 : l16_b_82);
+                RL[6] = ((l16_a_82 > l16_b_82) ? l16_b_82 : l16_a_82);
+                unsigned long long l16_a_83 = RL[5];
+                unsigned long long l16_b_83 = RL[7];
+                RL[5] = ((l16_a_83 > l16_b_83) ? l16_a_83 : l16_b_83);
+                RL[7] = ((l16_a_83 > l16_b_83) ? l16_b_83 : l16_a_83);
+                unsigned long long l16_a_84 = RL[8];
+                unsigned long long l16_b_84 = RL[10];
+                RL[8] = ((l16_a_84 > l16_b_84) ? l16_a_84 : l16_b_84);
+                RL[10] = ((l16_a_84 > l16_b_84) ? l16_b_84 : l16_a_84);
+                unsigned long long l16_a_85 = RL[9];
+                unsigned long long l16_b_85 = RL[11];
+                RL[9] = ((l16_a_85 > l16_b_85) ? l16_a_85 : l16_b_85);
+                RL[11] = ((l16_a_85 > l16_b_85) ? l16_b_85 : l16_a_85);
+                unsigned long long l16_a_86 = RL[12];
+                unsigned long long l16_b_86 = RL[14];
+                RL[12] = ((l16_a_86 > l16_b_86) ? l16_a_86 : l16_b_86);
+                RL[14] = ((l16_a_86 > l16_b_86) ? l16_b_86 : l16_a_86);
+                unsigned long long l16_a_87 = RL[13];
+                unsigned long long l16_b_87 = RL[15];
+                RL[13] = ((l16_a_87 > l16_b_87) ? l16_a_87 : l16_b_87);
+                RL[15] = ((l16_a_87 > l16_b_87) ? l16_b_87 : l16_a_87);
+                unsigned long long l16_a_88 = RL[0];
+                unsigned long long l16_b_88 = RL[1];
+                RL[0] = ((l16_a_88 > l16_b_88) ? l16_a_88 : l16_b_88);
+                RL[1] = ((l16_a_88 > l16_b_88) ? l16_b_88 : l16_a_88);
+                unsigned long long l16_a_89 = RL[2];
+                unsigned long long l16_b_89 = RL[3];
+                RL[2] = ((l16_a_89 > l16_b_89) ? l16_a_89 : l16_b_89);
+                RL[3] = ((l16_a_89 > l16_b_89) ? l16_b_89 : l16_a_89);
+                unsigned long long l16_a_90 = RL[4];
+                unsigned long long l16_b_90 = RL[5];
+                RL[4] = ((l16_a_90 > l16_b_90) ? l16_a_90 : l16_b_90);
+                RL[5] = ((l16_a_90 > l16_b_90) ? l16_b_90 : l16_a_90);
+                unsigned long long l16_a_91 = RL[6];
+                unsigned long long l16_b_91 = RL[7];
+                RL[6] = ((l16_a_91 > l16_b_91) ? l16_a_91 : l16_b_91);
+                RL[7] = ((l16_a_91 > l16_b_91) ? l16_b_91 : l16_a_91);
+                unsigned long long l16_a_92 = RL[8];
+                unsigned long long l16_b_92 = RL[9];
+                RL[8] = ((l16_a_92 > l16_b_92) ? l16_a_92 : l16_b_92);
+                RL[9] = ((l16_a_92 > l16_b_92) ? l16_b_92 : l16_a_92);
+                unsigned long long l16_a_93 = RL[10];
+                unsigned long long l16_b_93 = RL[11];
+                RL[10] = ((l16_a_93 > l16_b_93) ? l16_a_93 : l16_b_93);
+                RL[11] = ((l16_a_93 > l16_b_93) ? l16_b_93 : l16_a_93);
+                unsigned long long l16_a_94 = RL[12];
+                unsigned long long l16_b_94 = RL[13];
+                RL[12] = ((l16_a_94 > l16_b_94) ? l16_a_94 : l16_b_94);
+                RL[13] = ((l16_a_94 > l16_b_94) ? l16_b_94 : l16_a_94);
+                unsigned long long l16_a_95 = RL[14];
+                unsigned long long l16_b_95 = RL[15];
+                RL[14] = ((l16_a_95 > l16_b_95) ? l16_a_95 : l16_b_95);
+                RL[15] = ((l16_a_95 > l16_b_95) ? l16_b_95 : l16_a_95);
+                unsigned long long x_v_32 = RL[0];
                 unsigned int x_lo_32 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_32, 4);
                 unsigned int x_hi_32 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_32 >> 32), 4);
-                B[0] = (unsigned long long)x_hi_32 << 32 | (unsigned long long)x_lo_32;
-                unsigned long long x_v_33 = R[1];
+                BL[0] = (unsigned long long)x_hi_32 << 32 | (unsigned long long)x_lo_32;
+                unsigned long long x_v_33 = RL[1];
                 unsigned int x_lo_33 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_33, 4);
                 unsigned int x_hi_33 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_33 >> 32), 4);
-                B[1] = (unsigned long long)x_hi_33 << 32 | (unsigned long long)x_lo_33;
-                unsigned long long x_v_34 = R[2];
+                BL[1] = (unsigned long long)x_hi_33 << 32 | (unsigned long long)x_lo_33;
+                unsigned long long x_v_34 = RL[2];
                 unsigned int x_lo_34 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_34, 4);
                 unsigned int x_hi_34 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_34 >> 32), 4);
-                B[2] = (unsigned long long)x_hi_34 << 32 | (unsigned long long)x_lo_34;
-                unsigned long long x_v_35 = R[3];
+                BL[2] = (unsigned long long)x_hi_34 << 32 | (unsigned long long)x_lo_34;
+                unsigned long long x_v_35 = RL[3];
                 unsigned int x_lo_35 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_35, 4);
                 unsigned int x_hi_35 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_35 >> 32), 4);
-                B[3] = (unsigned long long)x_hi_35 << 32 | (unsigned long long)x_lo_35;
-                unsigned long long x_v_36 = R[4];
+                BL[3] = (unsigned long long)x_hi_35 << 32 | (unsigned long long)x_lo_35;
+                unsigned long long x_v_36 = RL[4];
                 unsigned int x_lo_36 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_36, 4);
                 unsigned int x_hi_36 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_36 >> 32), 4);
-                B[4] = (unsigned long long)x_hi_36 << 32 | (unsigned long long)x_lo_36;
-                unsigned long long x_v_37 = R[5];
+                BL[4] = (unsigned long long)x_hi_36 << 32 | (unsigned long long)x_lo_36;
+                unsigned long long x_v_37 = RL[5];
                 unsigned int x_lo_37 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_37, 4);
                 unsigned int x_hi_37 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_37 >> 32), 4);
-                B[5] = (unsigned long long)x_hi_37 << 32 | (unsigned long long)x_lo_37;
-                unsigned long long x_v_38 = R[6];
+                BL[5] = (unsigned long long)x_hi_37 << 32 | (unsigned long long)x_lo_37;
+                unsigned long long x_v_38 = RL[6];
                 unsigned int x_lo_38 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_38, 4);
                 unsigned int x_hi_38 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_38 >> 32), 4);
-                B[6] = (unsigned long long)x_hi_38 << 32 | (unsigned long long)x_lo_38;
-                unsigned long long x_v_39 = R[7];
+                BL[6] = (unsigned long long)x_hi_38 << 32 | (unsigned long long)x_lo_38;
+                unsigned long long x_v_39 = RL[7];
                 unsigned int x_lo_39 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_39, 4);
                 unsigned int x_hi_39 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_39 >> 32), 4);
-                B[7] = (unsigned long long)x_hi_39 << 32 | (unsigned long long)x_lo_39;
-                unsigned long long x_v_40 = R[8];
+                BL[7] = (unsigned long long)x_hi_39 << 32 | (unsigned long long)x_lo_39;
+                unsigned long long x_v_40 = RL[8];
                 unsigned int x_lo_40 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_40, 4);
                 unsigned int x_hi_40 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_40 >> 32), 4);
-                B[8] = (unsigned long long)x_hi_40 << 32 | (unsigned long long)x_lo_40;
-                unsigned long long x_v_41 = R[9];
+                BL[8] = (unsigned long long)x_hi_40 << 32 | (unsigned long long)x_lo_40;
+                unsigned long long x_v_41 = RL[9];
                 unsigned int x_lo_41 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_41, 4);
                 unsigned int x_hi_41 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_41 >> 32), 4);
-                B[9] = (unsigned long long)x_hi_41 << 32 | (unsigned long long)x_lo_41;
-                unsigned long long x_v_42 = R[10];
+                BL[9] = (unsigned long long)x_hi_41 << 32 | (unsigned long long)x_lo_41;
+                unsigned long long x_v_42 = RL[10];
                 unsigned int x_lo_42 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_42, 4);
                 unsigned int x_hi_42 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_42 >> 32), 4);
-                B[10] = (unsigned long long)x_hi_42 << 32 | (unsigned long long)x_lo_42;
-                unsigned long long x_v_43 = R[11];
+                BL[10] = (unsigned long long)x_hi_42 << 32 | (unsigned long long)x_lo_42;
+                unsigned long long x_v_43 = RL[11];
                 unsigned int x_lo_43 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_43, 4);
                 unsigned int x_hi_43 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_43 >> 32), 4);
-                B[11] = (unsigned long long)x_hi_43 << 32 | (unsigned long long)x_lo_43;
-                unsigned long long x_v_44 = R[12];
+                BL[11] = (unsigned long long)x_hi_43 << 32 | (unsigned long long)x_lo_43;
+                unsigned long long x_v_44 = RL[12];
                 unsigned int x_lo_44 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_44, 4);
                 unsigned int x_hi_44 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_44 >> 32), 4);
-                B[12] = (unsigned long long)x_hi_44 << 32 | (unsigned long long)x_lo_44;
-                unsigned long long x_v_45 = R[13];
+                BL[12] = (unsigned long long)x_hi_44 << 32 | (unsigned long long)x_lo_44;
+                unsigned long long x_v_45 = RL[13];
                 unsigned int x_lo_45 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_45, 4);
                 unsigned int x_hi_45 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_45 >> 32), 4);
-                B[13] = (unsigned long long)x_hi_45 << 32 | (unsigned long long)x_lo_45;
-                unsigned long long x_v_46 = R[14];
+                BL[13] = (unsigned long long)x_hi_45 << 32 | (unsigned long long)x_lo_45;
+                unsigned long long x_v_46 = RL[14];
                 unsigned int x_lo_46 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_46, 4);
                 unsigned int x_hi_46 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_46 >> 32), 4);
-                B[14] = (unsigned long long)x_hi_46 << 32 | (unsigned long long)x_lo_46;
-                unsigned long long x_v_47 = R[15];
+                BL[14] = (unsigned long long)x_hi_46 << 32 | (unsigned long long)x_lo_46;
+                unsigned long long x_v_47 = RL[15];
                 unsigned int x_lo_47 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_47, 4);
                 unsigned int x_hi_47 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_47 >> 32), 4);
-                B[15] = (unsigned long long)x_hi_47 << 32 | (unsigned long long)x_lo_47;
-                unsigned long long l16_m_48 = B[15];
-                R[0] = ((R[0] > l16_m_48) ? R[0] : l16_m_48);
-                unsigned long long l16_m_49 = B[14];
-                R[1] = ((R[1] > l16_m_49) ? R[1] : l16_m_49);
-                unsigned long long l16_m_50 = B[13];
-                R[2] = ((R[2] > l16_m_50) ? R[2] : l16_m_50);
-                unsigned long long l16_m_51 = B[12];
-                R[3] = ((R[3] > l16_m_51) ? R[3] : l16_m_51);
-                unsigned long long l16_m_52 = B[11];
-                R[4] = ((R[4] > l16_m_52) ? R[4] : l16_m_52);
-                unsigned long long l16_m_53 = B[10];
-                R[5] = ((R[5] > l16_m_53) ? R[5] : l16_m_53);
-                unsigned long long l16_m_54 = B[9];
-                R[6] = ((R[6] > l16_m_54) ? R[6] : l16_m_54);
-                unsigned long long l16_m_55 = B[8];
-                R[7] = ((R[7] > l16_m_55) ? R[7] : l16_m_55);
-                unsigned long long l16_m_56 = B[7];
-                R[8] = ((R[8] > l16_m_56) ? R[8] : l16_m_56);
-                unsigned long long l16_m_57 = B[6];
-                R[9] = ((R[9] > l16_m_57) ? R[9] : l16_m_57);
-                unsigned long long l16_m_58 = B[5];
-                R[10] = ((R[10] > l16_m_58) ? R[10] : l16_m_58);
-                unsigned long long l16_m_59 = B[4];
-                R[11] = ((R[11] > l16_m_59) ? R[11] : l16_m_59);
-                unsigned long long l16_m_60 = B[3];
-                R[12] = ((R[12] > l16_m_60) ? R[12] : l16_m_60);
-                unsigned long long l16_m_61 = B[2];
-                R[13] = ((R[13] > l16_m_61) ? R[13] : l16_m_61);
-                unsigned long long l16_m_62 = B[1];
-                R[14] = ((R[14] > l16_m_62) ? R[14] : l16_m_62);
-                unsigned long long l16_m_63 = B[0];
-                R[15] = ((R[15] > l16_m_63) ? R[15] : l16_m_63);
-                unsigned long long l16_a_96 = R[0];
-                unsigned long long l16_b_96 = R[8];
-                R[0] = ((l16_a_96 > l16_b_96) ? l16_a_96 : l16_b_96);
-                R[8] = ((l16_a_96 > l16_b_96) ? l16_b_96 : l16_a_96);
-                unsigned long long l16_a_97 = R[1];
-                unsigned long long l16_b_97 = R[9];
-                R[1] = ((l16_a_97 > l16_b_97) ? l16_a_97 : l16_b_97);
-                R[9] = ((l16_a_97 > l16_b_97) ? l16_b_97 : l16_a_97);
-                unsigned long long l16_a_98 = R[2];
-                unsigned long long l16_b_98 = R[10];
-                R[2] = ((l16_a_98 > l16_b_98) ? l16_a_98 : l16_b_98);
-                R[10] = ((l16_a_98 > l16_b_98) ? l16_b_98 : l16_a_98);
-                unsigned long long l16_a_99 = R[3];
-                unsigned long long l16_b_99 = R[11];
-                R[3] = ((l16_a_99 > l16_b_99) ? l16_a_99 : l16_b_99);
-                R[11] = ((l16_a_99 > l16_b_99) ? l16_b_99 : l16_a_99);
-                unsigned long long l16_a_100 = R[4];
-                unsigned long long l16_b_100 = R[12];
-                R[4] = ((l16_a_100 > l16_b_100) ? l16_a_100 : l16_b_100);
-                R[12] = ((l16_a_100 > l16_b_100) ? l16_b_100 : l16_a_100);
-                unsigned long long l16_a_101 = R[5];
-                unsigned long long l16_b_101 = R[13];
-                R[5] = ((l16_a_101 > l16_b_101) ? l16_a_101 : l16_b_101);
-                R[13] = ((l16_a_101 > l16_b_101) ? l16_b_101 : l16_a_101);
-                unsigned long long l16_a_102 = R[6];
-                unsigned long long l16_b_102 = R[14];
-                R[6] = ((l16_a_102 > l16_b_102) ? l16_a_102 : l16_b_102);
-                R[14] = ((l16_a_102 > l16_b_102) ? l16_b_102 : l16_a_102);
-                unsigned long long l16_a_103 = R[7];
-                unsigned long long l16_b_103 = R[15];
-                R[7] = ((l16_a_103 > l16_b_103) ? l16_a_103 : l16_b_103);
-                R[15] = ((l16_a_103 > l16_b_103) ? l16_b_103 : l16_a_103);
-                unsigned long long l16_a_104 = R[0];
-                unsigned long long l16_b_104 = R[4];
-                R[0] = ((l16_a_104 > l16_b_104) ? l16_a_104 : l16_b_104);
-                R[4] = ((l16_a_104 > l16_b_104) ? l16_b_104 : l16_a_104);
-                unsigned long long l16_a_105 = R[1];
-                unsigned long long l16_b_105 = R[5];
-                R[1] = ((l16_a_105 > l16_b_105) ? l16_a_105 : l16_b_105);
-                R[5] = ((l16_a_105 > l16_b_105) ? l16_b_105 : l16_a_105);
-                unsigned long long l16_a_106 = R[2];
-                unsigned long long l16_b_106 = R[6];
-                R[2] = ((l16_a_106 > l16_b_106) ? l16_a_106 : l16_b_106);
-                R[6] = ((l16_a_106 > l16_b_106) ? l16_b_106 : l16_a_106);
-                unsigned long long l16_a_107 = R[3];
-                unsigned long long l16_b_107 = R[7];
-                R[3] = ((l16_a_107 > l16_b_107) ? l16_a_107 : l16_b_107);
-                R[7] = ((l16_a_107 > l16_b_107) ? l16_b_107 : l16_a_107);
-                unsigned long long l16_a_108 = R[8];
-                unsigned long long l16_b_108 = R[12];
-                R[8] = ((l16_a_108 > l16_b_108) ? l16_a_108 : l16_b_108);
-                R[12] = ((l16_a_108 > l16_b_108) ? l16_b_108 : l16_a_108);
-                unsigned long long l16_a_109 = R[9];
-                unsigned long long l16_b_109 = R[13];
-                R[9] = ((l16_a_109 > l16_b_109) ? l16_a_109 : l16_b_109);
-                R[13] = ((l16_a_109 > l16_b_109) ? l16_b_109 : l16_a_109);
-                unsigned long long l16_a_110 = R[10];
-                unsigned long long l16_b_110 = R[14];
-                R[10] = ((l16_a_110 > l16_b_110) ? l16_a_110 : l16_b_110);
-                R[14] = ((l16_a_110 > l16_b_110) ? l16_b_110 : l16_a_110);
-                unsigned long long l16_a_111 = R[11];
-                unsigned long long l16_b_111 = R[15];
-                R[11] = ((l16_a_111 > l16_b_111) ? l16_a_111 : l16_b_111);
-                R[15] = ((l16_a_111 > l16_b_111) ? l16_b_111 : l16_a_111);
-                unsigned long long l16_a_112 = R[0];
-                unsigned long long l16_b_112 = R[2];
-                R[0] = ((l16_a_112 > l16_b_112) ? l16_a_112 : l16_b_112);
-                R[2] = ((l16_a_112 > l16_b_112) ? l16_b_112 : l16_a_112);
-                unsigned long long l16_a_113 = R[1];
-                unsigned long long l16_b_113 = R[3];
-                R[1] = ((l16_a_113 > l16_b_113) ? l16_a_113 : l16_b_113);
-                R[3] = ((l16_a_113 > l16_b_113) ? l16_b_113 : l16_a_113);
-                unsigned long long l16_a_114 = R[4];
-                unsigned long long l16_b_114 = R[6];
-                R[4] = ((l16_a_114 > l16_b_114) ? l16_a_114 : l16_b_114);
-                R[6] = ((l16_a_114 > l16_b_114) ? l16_b_114 : l16_a_114);
-                unsigned long long l16_a_115 = R[5];
-                unsigned long long l16_b_115 = R[7];
-                R[5] = ((l16_a_115 > l16_b_115) ? l16_a_115 : l16_b_115);
-                R[7] = ((l16_a_115 > l16_b_115) ? l16_b_115 : l16_a_115);
-                unsigned long long l16_a_116 = R[8];
-                unsigned long long l16_b_116 = R[10];
-                R[8] = ((l16_a_116 > l16_b_116) ? l16_a_116 : l16_b_116);
-                R[10] = ((l16_a_116 > l16_b_116) ? l16_b_116 : l16_a_116);
-                unsigned long long l16_a_117 = R[9];
-                unsigned long long l16_b_117 = R[11];
-                R[9] = ((l16_a_117 > l16_b_117) ? l16_a_117 : l16_b_117);
-                R[11] = ((l16_a_117 > l16_b_117) ? l16_b_117 : l16_a_117);
-                unsigned long long l16_a_118 = R[12];
-                unsigned long long l16_b_118 = R[14];
-                R[12] = ((l16_a_118 > l16_b_118) ? l16_a_118 : l16_b_118);
-                R[14] = ((l16_a_118 > l16_b_118) ? l16_b_118 : l16_a_118);
-                unsigned long long l16_a_119 = R[13];
-                unsigned long long l16_b_119 = R[15];
-                R[13] = ((l16_a_119 > l16_b_119) ? l16_a_119 : l16_b_119);
-                R[15] = ((l16_a_119 > l16_b_119) ? l16_b_119 : l16_a_119);
-                unsigned long long l16_a_120 = R[0];
-                unsigned long long l16_b_120 = R[1];
-                R[0] = ((l16_a_120 > l16_b_120) ? l16_a_120 : l16_b_120);
-                R[1] = ((l16_a_120 > l16_b_120) ? l16_b_120 : l16_a_120);
-                unsigned long long l16_a_121 = R[2];
-                unsigned long long l16_b_121 = R[3];
-                R[2] = ((l16_a_121 > l16_b_121) ? l16_a_121 : l16_b_121);
-                R[3] = ((l16_a_121 > l16_b_121) ? l16_b_121 : l16_a_121);
-                unsigned long long l16_a_122 = R[4];
-                unsigned long long l16_b_122 = R[5];
-                R[4] = ((l16_a_122 > l16_b_122) ? l16_a_122 : l16_b_122);
-                R[5] = ((l16_a_122 > l16_b_122) ? l16_b_122 : l16_a_122);
-                unsigned long long l16_a_123 = R[6];
-                unsigned long long l16_b_123 = R[7];
-                R[6] = ((l16_a_123 > l16_b_123) ? l16_a_123 : l16_b_123);
-                R[7] = ((l16_a_123 > l16_b_123) ? l16_b_123 : l16_a_123);
-                unsigned long long l16_a_124 = R[8];
-                unsigned long long l16_b_124 = R[9];
-                R[8] = ((l16_a_124 > l16_b_124) ? l16_a_124 : l16_b_124);
-                R[9] = ((l16_a_124 > l16_b_124) ? l16_b_124 : l16_a_124);
-                unsigned long long l16_a_125 = R[10];
-                unsigned long long l16_b_125 = R[11];
-                R[10] = ((l16_a_125 > l16_b_125) ? l16_a_125 : l16_b_125);
-                R[11] = ((l16_a_125 > l16_b_125) ? l16_b_125 : l16_a_125);
-                unsigned long long l16_a_126 = R[12];
-                unsigned long long l16_b_126 = R[13];
-                R[12] = ((l16_a_126 > l16_b_126) ? l16_a_126 : l16_b_126);
-                R[13] = ((l16_a_126 > l16_b_126) ? l16_b_126 : l16_a_126);
-                unsigned long long l16_a_127 = R[14];
-                unsigned long long l16_b_127 = R[15];
-                R[14] = ((l16_a_127 > l16_b_127) ? l16_a_127 : l16_b_127);
-                R[15] = ((l16_a_127 > l16_b_127) ? l16_b_127 : l16_a_127);
-            }
-            if (8 < width) {
-                unsigned long long x_v_48 = R[0];
-                unsigned int x_lo_48 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_48, 8);
-                unsigned int x_hi_48 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_48 >> 32), 8);
-                B[0] = (unsigned long long)x_hi_48 << 32 | (unsigned long long)x_lo_48;
-                unsigned long long x_v_49 = R[1];
-                unsigned int x_lo_49 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_49, 8);
-                unsigned int x_hi_49 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_49 >> 32), 8);
-                B[1] = (unsigned long long)x_hi_49 << 32 | (unsigned long long)x_lo_49;
-                unsigned long long x_v_50 = R[2];
-                unsigned int x_lo_50 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_50, 8);
-                unsigned int x_hi_50 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_50 >> 32), 8);
-                B[2] = (unsigned long long)x_hi_50 << 32 | (unsigned long long)x_lo_50;
-                unsigned long long x_v_51 = R[3];
-                unsigned int x_lo_51 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_51, 8);
-                unsigned int x_hi_51 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_51 >> 32), 8);
-                B[3] = (unsigned long long)x_hi_51 << 32 | (unsigned long long)x_lo_51;
-                unsigned long long x_v_52 = R[4];
-                unsigned int x_lo_52 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_52, 8);
-                unsigned int x_hi_52 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_52 >> 32), 8);
-                B[4] = (unsigned long long)x_hi_52 << 32 | (unsigned long long)x_lo_52;
-                unsigned long long x_v_53 = R[5];
-                unsigned int x_lo_53 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_53, 8);
-                unsigned int x_hi_53 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_53 >> 32), 8);
-                B[5] = (unsigned long long)x_hi_53 << 32 | (unsigned long long)x_lo_53;
-                unsigned long long x_v_54 = R[6];
-                unsigned int x_lo_54 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_54, 8);
-                unsigned int x_hi_54 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_54 >> 32), 8);
-                B[6] = (unsigned long long)x_hi_54 << 32 | (unsigned long long)x_lo_54;
-                unsigned long long x_v_55 = R[7];
-                unsigned int x_lo_55 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_55, 8);
-                unsigned int x_hi_55 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_55 >> 32), 8);
-                B[7] = (unsigned long long)x_hi_55 << 32 | (unsigned long long)x_lo_55;
-                unsigned long long x_v_56 = R[8];
-                unsigned int x_lo_56 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_56, 8);
-                unsigned int x_hi_56 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_56 >> 32), 8);
-                B[8] = (unsigned long long)x_hi_56 << 32 | (unsigned long long)x_lo_56;
-                unsigned long long x_v_57 = R[9];
-                unsigned int x_lo_57 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_57, 8);
-                unsigned int x_hi_57 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_57 >> 32), 8);
-                B[9] = (unsigned long long)x_hi_57 << 32 | (unsigned long long)x_lo_57;
-                unsigned long long x_v_58 = R[10];
-                unsigned int x_lo_58 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_58, 8);
-                unsigned int x_hi_58 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_58 >> 32), 8);
-                B[10] = (unsigned long long)x_hi_58 << 32 | (unsigned long long)x_lo_58;
-                unsigned long long x_v_59 = R[11];
-                unsigned int x_lo_59 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_59, 8);
-                unsigned int x_hi_59 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_59 >> 32), 8);
-                B[11] = (unsigned long long)x_hi_59 << 32 | (unsigned long long)x_lo_59;
-                unsigned long long x_v_60 = R[12];
-                unsigned int x_lo_60 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_60, 8);
-                unsigned int x_hi_60 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_60 >> 32), 8);
-                B[12] = (unsigned long long)x_hi_60 << 32 | (unsigned long long)x_lo_60;
-                unsigned long long x_v_61 = R[13];
-                unsigned int x_lo_61 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_61, 8);
-                unsigned int x_hi_61 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_61 >> 32), 8);
-                B[13] = (unsigned long long)x_hi_61 << 32 | (unsigned long long)x_lo_61;
-                unsigned long long x_v_62 = R[14];
-                unsigned int x_lo_62 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_62, 8);
-                unsigned int x_hi_62 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_62 >> 32), 8);
-                B[14] = (unsigned long long)x_hi_62 << 32 | (unsigned long long)x_lo_62;
-                unsigned long long x_v_63 = R[15];
-                unsigned int x_lo_63 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_63, 8);
-                unsigned int x_hi_63 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_63 >> 32), 8);
-                B[15] = (unsigned long long)x_hi_63 << 32 | (unsigned long long)x_lo_63;
-                unsigned long long l16_m_64 = B[15];
-                R[0] = ((R[0] > l16_m_64) ? R[0] : l16_m_64);
-                unsigned long long l16_m_65 = B[14];
-                R[1] = ((R[1] > l16_m_65) ? R[1] : l16_m_65);
-                unsigned long long l16_m_66 = B[13];
-                R[2] = ((R[2] > l16_m_66) ? R[2] : l16_m_66);
-                unsigned long long l16_m_67 = B[12];
-                R[3] = ((R[3] > l16_m_67) ? R[3] : l16_m_67);
-                unsigned long long l16_m_68 = B[11];
-                R[4] = ((R[4] > l16_m_68) ? R[4] : l16_m_68);
-                unsigned long long l16_m_69 = B[10];
-                R[5] = ((R[5] > l16_m_69) ? R[5] : l16_m_69);
-                unsigned long long l16_m_70 = B[9];
-                R[6] = ((R[6] > l16_m_70) ? R[6] : l16_m_70);
-                unsigned long long l16_m_71 = B[8];
-                R[7] = ((R[7] > l16_m_71) ? R[7] : l16_m_71);
-                unsigned long long l16_m_72 = B[7];
-                R[8] = ((R[8] > l16_m_72) ? R[8] : l16_m_72);
-                unsigned long long l16_m_73 = B[6];
-                R[9] = ((R[9] > l16_m_73) ? R[9] : l16_m_73);
-                unsigned long long l16_m_74 = B[5];
-                R[10] = ((R[10] > l16_m_74) ? R[10] : l16_m_74);
-                unsigned long long l16_m_75 = B[4];
-                R[11] = ((R[11] > l16_m_75) ? R[11] : l16_m_75);
-                unsigned long long l16_m_76 = B[3];
-                R[12] = ((R[12] > l16_m_76) ? R[12] : l16_m_76);
-                unsigned long long l16_m_77 = B[2];
-                R[13] = ((R[13] > l16_m_77) ? R[13] : l16_m_77);
-                unsigned long long l16_m_78 = B[1];
-                R[14] = ((R[14] > l16_m_78) ? R[14] : l16_m_78);
-                unsigned long long l16_m_79 = B[0];
-                R[15] = ((R[15] > l16_m_79) ? R[15] : l16_m_79);
-                unsigned long long l16_a_128 = R[0];
-                unsigned long long l16_b_128 = R[8];
-                R[0] = ((l16_a_128 > l16_b_128) ? l16_a_128 : l16_b_128);
-                R[8] = ((l16_a_128 > l16_b_128) ? l16_b_128 : l16_a_128);
-                unsigned long long l16_a_129 = R[1];
-                unsigned long long l16_b_129 = R[9];
-                R[1] = ((l16_a_129 > l16_b_129) ? l16_a_129 : l16_b_129);
-                R[9] = ((l16_a_129 > l16_b_129) ? l16_b_129 : l16_a_129);
-                unsigned long long l16_a_130 = R[2];
-                unsigned long long l16_b_130 = R[10];
-                R[2] = ((l16_a_130 > l16_b_130) ? l16_a_130 : l16_b_130);
-                R[10] = ((l16_a_130 > l16_b_130) ? l16_b_130 : l16_a_130);
-                unsigned long long l16_a_131 = R[3];
-                unsigned long long l16_b_131 = R[11];
-                R[3] = ((l16_a_131 > l16_b_131) ? l16_a_131 : l16_b_131);
-                R[11] = ((l16_a_131 > l16_b_131) ? l16_b_131 : l16_a_131);
-                unsigned long long l16_a_132 = R[4];
-                unsigned long long l16_b_132 = R[12];
-                R[4] = ((l16_a_132 > l16_b_132) ? l16_a_132 : l16_b_132);
-                R[12] = ((l16_a_132 > l16_b_132) ? l16_b_132 : l16_a_132);
-                unsigned long long l16_a_133 = R[5];
-                unsigned long long l16_b_133 = R[13];
-                R[5] = ((l16_a_133 > l16_b_133) ? l16_a_133 : l16_b_133);
-                R[13] = ((l16_a_133 > l16_b_133) ? l16_b_133 : l16_a_133);
-                unsigned long long l16_a_134 = R[6];
-                unsigned long long l16_b_134 = R[14];
-                R[6] = ((l16_a_134 > l16_b_134) ? l16_a_134 : l16_b_134);
-                R[14] = ((l16_a_134 > l16_b_134) ? l16_b_134 : l16_a_134);
-                unsigned long long l16_a_135 = R[7];
-                unsigned long long l16_b_135 = R[15];
-                R[7] = ((l16_a_135 > l16_b_135) ? l16_a_135 : l16_b_135);
-                R[15] = ((l16_a_135 > l16_b_135) ? l16_b_135 : l16_a_135);
-                unsigned long long l16_a_136 = R[0];
-                unsigned long long l16_b_136 = R[4];
-                R[0] = ((l16_a_136 > l16_b_136) ? l16_a_136 : l16_b_136);
-                R[4] = ((l16_a_136 > l16_b_136) ? l16_b_136 : l16_a_136);
-                unsigned long long l16_a_137 = R[1];
-                unsigned long long l16_b_137 = R[5];
-                R[1] = ((l16_a_137 > l16_b_137) ? l16_a_137 : l16_b_137);
-                R[5] = ((l16_a_137 > l16_b_137) ? l16_b_137 : l16_a_137);
-                unsigned long long l16_a_138 = R[2];
-                unsigned long long l16_b_138 = R[6];
-                R[2] = ((l16_a_138 > l16_b_138) ? l16_a_138 : l16_b_138);
-                R[6] = ((l16_a_138 > l16_b_138) ? l16_b_138 : l16_a_138);
-                unsigned long long l16_a_139 = R[3];
-                unsigned long long l16_b_139 = R[7];
-                R[3] = ((l16_a_139 > l16_b_139) ? l16_a_139 : l16_b_139);
-                R[7] = ((l16_a_139 > l16_b_139) ? l16_b_139 : l16_a_139);
-                unsigned long long l16_a_140 = R[8];
-                unsigned long long l16_b_140 = R[12];
-                R[8] = ((l16_a_140 > l16_b_140) ? l16_a_140 : l16_b_140);
-                R[12] = ((l16_a_140 > l16_b_140) ? l16_b_140 : l16_a_140);
-                unsigned long long l16_a_141 = R[9];
-                unsigned long long l16_b_141 = R[13];
-                R[9] = ((l16_a_141 > l16_b_141) ? l16_a_141 : l16_b_141);
-                R[13] = ((l16_a_141 > l16_b_141) ? l16_b_141 : l16_a_141);
-                unsigned long long l16_a_142 = R[10];
-                unsigned long long l16_b_142 = R[14];
-                R[10] = ((l16_a_142 > l16_b_142) ? l16_a_142 : l16_b_142);
-                R[14] = ((l16_a_142 > l16_b_142) ? l16_b_142 : l16_a_142);
-                unsigned long long l16_a_143 = R[11];
-                unsigned long long l16_b_143 = R[15];
-                R[11] = ((l16_a_143 > l16_b_143) ? l16_a_143 : l16_b_143);
-                R[15] = ((l16_a_143 > l16_b_143) ? l16_b_143 : l16_a_143);
-                unsigned long long l16_a_144 = R[0];
-                unsigned long long l16_b_144 = R[2];
-                R[0] = ((l16_a_144 > l16_b_144) ? l16_a_144 : l16_b_144);
-                R[2] = ((l16_a_144 > l16_b_144) ? l16_b_144 : l16_a_144);
-                unsigned long long l16_a_145 = R[1];
-                unsigned long long l16_b_145 = R[3];
-                R[1] = ((l16_a_145 > l16_b_145) ? l16_a_145 : l16_b_145);
-                R[3] = ((l16_a_145 > l16_b_145) ? l16_b_145 : l16_a_145);
-                unsigned long long l16_a_146 = R[4];
-                unsigned long long l16_b_146 = R[6];
-                R[4] = ((l16_a_146 > l16_b_146) ? l16_a_146 : l16_b_146);
-                R[6] = ((l16_a_146 > l16_b_146) ? l16_b_146 : l16_a_146);
-                unsigned long long l16_a_147 = R[5];
-                unsigned long long l16_b_147 = R[7];
-                R[5] = ((l16_a_147 > l16_b_147) ? l16_a_147 : l16_b_147);
-                R[7] = ((l16_a_147 > l16_b_147) ? l16_b_147 : l16_a_147);
-                unsigned long long l16_a_148 = R[8];
-                unsigned long long l16_b_148 = R[10];
-                R[8] = ((l16_a_148 > l16_b_148) ? l16_a_148 : l16_b_148);
-                R[10] = ((l16_a_148 > l16_b_148) ? l16_b_148 : l16_a_148);
-                unsigned long long l16_a_149 = R[9];
-                unsigned long long l16_b_149 = R[11];
-                R[9] = ((l16_a_149 > l16_b_149) ? l16_a_149 : l16_b_149);
-                R[11] = ((l16_a_149 > l16_b_149) ? l16_b_149 : l16_a_149);
-                unsigned long long l16_a_150 = R[12];
-                unsigned long long l16_b_150 = R[14];
-                R[12] = ((l16_a_150 > l16_b_150) ? l16_a_150 : l16_b_150);
-                R[14] = ((l16_a_150 > l16_b_150) ? l16_b_150 : l16_a_150);
-                unsigned long long l16_a_151 = R[13];
-                unsigned long long l16_b_151 = R[15];
-                R[13] = ((l16_a_151 > l16_b_151) ? l16_a_151 : l16_b_151);
-                R[15] = ((l16_a_151 > l16_b_151) ? l16_b_151 : l16_a_151);
-                unsigned long long l16_a_152 = R[0];
-                unsigned long long l16_b_152 = R[1];
-                R[0] = ((l16_a_152 > l16_b_152) ? l16_a_152 : l16_b_152);
-                R[1] = ((l16_a_152 > l16_b_152) ? l16_b_152 : l16_a_152);
-                unsigned long long l16_a_153 = R[2];
-                unsigned long long l16_b_153 = R[3];
-                R[2] = ((l16_a_153 > l16_b_153) ? l16_a_153 : l16_b_153);
-                R[3] = ((l16_a_153 > l16_b_153) ? l16_b_153 : l16_a_153);
-                unsigned long long l16_a_154 = R[4];
-                unsigned long long l16_b_154 = R[5];
-                R[4] = ((l16_a_154 > l16_b_154) ? l16_a_154 : l16_b_154);
-                R[5] = ((l16_a_154 > l16_b_154) ? l16_b_154 : l16_a_154);
-                unsigned long long l16_a_155 = R[6];
-                unsigned long long l16_b_155 = R[7];
-                R[6] = ((l16_a_155 > l16_b_155) ? l16_a_155 : l16_b_155);
-                R[7] = ((l16_a_155 > l16_b_155) ? l16_b_155 : l16_a_155);
-                unsigned long long l16_a_156 = R[8];
-                unsigned long long l16_b_156 = R[9];
-                R[8] = ((l16_a_156 > l16_b_156) ? l16_a_156 : l16_b_156);
-                R[9] = ((l16_a_156 > l16_b_156) ? l16_b_156 : l16_a_156);
-                unsigned long long l16_a_157 = R[10];
-                unsigned long long l16_b_157 = R[11];
-                R[10] = ((l16_a_157 > l16_b_157) ? l16_a_157 : l16_b_157);
-                R[11] = ((l16_a_157 > l16_b_157) ? l16_b_157 : l16_a_157);
-                unsigned long long l16_a_158 = R[12];
-                unsigned long long l16_b_158 = R[13];
-                R[12] = ((l16_a_158 > l16_b_158) ? l16_a_158 : l16_b_158);
-                R[13] = ((l16_a_158 > l16_b_158) ? l16_b_158 : l16_a_158);
-                unsigned long long l16_a_159 = R[14];
-                unsigned long long l16_b_159 = R[15];
-                R[14] = ((l16_a_159 > l16_b_159) ? l16_a_159 : l16_b_159);
-                R[15] = ((l16_a_159 > l16_b_159) ? l16_b_159 : l16_a_159);
-            }
-            if (16 < width) {
-                unsigned long long x_v_64 = R[0];
-                unsigned int x_lo_64 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_64, 16);
-                unsigned int x_hi_64 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_64 >> 32), 16);
-                B[0] = (unsigned long long)x_hi_64 << 32 | (unsigned long long)x_lo_64;
-                unsigned long long x_v_65 = R[1];
-                unsigned int x_lo_65 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_65, 16);
-                unsigned int x_hi_65 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_65 >> 32), 16);
-                B[1] = (unsigned long long)x_hi_65 << 32 | (unsigned long long)x_lo_65;
-                unsigned long long x_v_66 = R[2];
-                unsigned int x_lo_66 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_66, 16);
-                unsigned int x_hi_66 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_66 >> 32), 16);
-                B[2] = (unsigned long long)x_hi_66 << 32 | (unsigned long long)x_lo_66;
-                unsigned long long x_v_67 = R[3];
-                unsigned int x_lo_67 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_67, 16);
-                unsigned int x_hi_67 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_67 >> 32), 16);
-                B[3] = (unsigned long long)x_hi_67 << 32 | (unsigned long long)x_lo_67;
-                unsigned long long x_v_68 = R[4];
-                unsigned int x_lo_68 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_68, 16);
-                unsigned int x_hi_68 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_68 >> 32), 16);
-                B[4] = (unsigned long long)x_hi_68 << 32 | (unsigned long long)x_lo_68;
-                unsigned long long x_v_69 = R[5];
-                unsigned int x_lo_69 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_69, 16);
-                unsigned int x_hi_69 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_69 >> 32), 16);
-                B[5] = (unsigned long long)x_hi_69 << 32 | (unsigned long long)x_lo_69;
-                unsigned long long x_v_70 = R[6];
-                unsigned int x_lo_70 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_70, 16);
-                unsigned int x_hi_70 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_70 >> 32), 16);
-                B[6] = (unsigned long long)x_hi_70 << 32 | (unsigned long long)x_lo_70;
-                unsigned long long x_v_71 = R[7];
-                unsigned int x_lo_71 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_71, 16);
-                unsigned int x_hi_71 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_71 >> 32), 16);
-                B[7] = (unsigned long long)x_hi_71 << 32 | (unsigned long long)x_lo_71;
-                unsigned long long x_v_72 = R[8];
-                unsigned int x_lo_72 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_72, 16);
-                unsigned int x_hi_72 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_72 >> 32), 16);
-                B[8] = (unsigned long long)x_hi_72 << 32 | (unsigned long long)x_lo_72;
-                unsigned long long x_v_73 = R[9];
-                unsigned int x_lo_73 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_73, 16);
-                unsigned int x_hi_73 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_73 >> 32), 16);
-                B[9] = (unsigned long long)x_hi_73 << 32 | (unsigned long long)x_lo_73;
-                unsigned long long x_v_74 = R[10];
-                unsigned int x_lo_74 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_74, 16);
-                unsigned int x_hi_74 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_74 >> 32), 16);
-                B[10] = (unsigned long long)x_hi_74 << 32 | (unsigned long long)x_lo_74;
-                unsigned long long x_v_75 = R[11];
-                unsigned int x_lo_75 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_75, 16);
-                unsigned int x_hi_75 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_75 >> 32), 16);
-                B[11] = (unsigned long long)x_hi_75 << 32 | (unsigned long long)x_lo_75;
-                unsigned long long x_v_76 = R[12];
-                unsigned int x_lo_76 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_76, 16);
-                unsigned int x_hi_76 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_76 >> 32), 16);
-                B[12] = (unsigned long long)x_hi_76 << 32 | (unsigned long long)x_lo_76;
-                unsigned long long x_v_77 = R[13];
-                unsigned int x_lo_77 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_77, 16);
-                unsigned int x_hi_77 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_77 >> 32), 16);
-                B[13] = (unsigned long long)x_hi_77 << 32 | (unsigned long long)x_lo_77;
-                unsigned long long x_v_78 = R[14];
-                unsigned int x_lo_78 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_78, 16);
-                unsigned int x_hi_78 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_78 >> 32), 16);
-                B[14] = (unsigned long long)x_hi_78 << 32 | (unsigned long long)x_lo_78;
-                unsigned long long x_v_79 = R[15];
-                unsigned int x_lo_79 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)x_v_79, 16);
-                unsigned int x_hi_79 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(x_v_79 >> 32), 16);
-                B[15] = (unsigned long long)x_hi_79 << 32 | (unsigned long long)x_lo_79;
-                unsigned long long l16_m_80 = B[15];
-                R[0] = ((R[0] > l16_m_80) ? R[0] : l16_m_80);
-                unsigned long long l16_m_81 = B[14];
-                R[1] = ((R[1] > l16_m_81) ? R[1] : l16_m_81);
-                unsigned long long l16_m_82 = B[13];
-                R[2] = ((R[2] > l16_m_82) ? R[2] : l16_m_82);
-                unsigned long long l16_m_83 = B[12];
-                R[3] = ((R[3] > l16_m_83) ? R[3] : l16_m_83);
-                unsigned long long l16_m_84 = B[11];
-                R[4] = ((R[4] > l16_m_84) ? R[4] : l16_m_84);
-                unsigned long long l16_m_85 = B[10];
-                R[5] = ((R[5] > l16_m_85) ? R[5] : l16_m_85);
-                unsigned long long l16_m_86 = B[9];
-                R[6] = ((R[6] > l16_m_86) ? R[6] : l16_m_86);
-                unsigned long long l16_m_87 = B[8];
-                R[7] = ((R[7] > l16_m_87) ? R[7] : l16_m_87);
-                unsigned long long l16_m_88 = B[7];
-                R[8] = ((R[8] > l16_m_88) ? R[8] : l16_m_88);
-                unsigned long long l16_m_89 = B[6];
-                R[9] = ((R[9] > l16_m_89) ? R[9] : l16_m_89);
-                unsigned long long l16_m_90 = B[5];
-                R[10] = ((R[10] > l16_m_90) ? R[10] : l16_m_90);
-                unsigned long long l16_m_91 = B[4];
-                R[11] = ((R[11] > l16_m_91) ? R[11] : l16_m_91);
-                unsigned long long l16_m_92 = B[3];
-                R[12] = ((R[12] > l16_m_92) ? R[12] : l16_m_92);
-                unsigned long long l16_m_93 = B[2];
-                R[13] = ((R[13] > l16_m_93) ? R[13] : l16_m_93);
-                unsigned long long l16_m_94 = B[1];
-                R[14] = ((R[14] > l16_m_94) ? R[14] : l16_m_94);
-                unsigned long long l16_m_95 = B[0];
-                R[15] = ((R[15] > l16_m_95) ? R[15] : l16_m_95);
-                unsigned long long l16_a_160 = R[0];
-                unsigned long long l16_b_160 = R[8];
-                R[0] = ((l16_a_160 > l16_b_160) ? l16_a_160 : l16_b_160);
-                R[8] = ((l16_a_160 > l16_b_160) ? l16_b_160 : l16_a_160);
-                unsigned long long l16_a_161 = R[1];
-                unsigned long long l16_b_161 = R[9];
-                R[1] = ((l16_a_161 > l16_b_161) ? l16_a_161 : l16_b_161);
-                R[9] = ((l16_a_161 > l16_b_161) ? l16_b_161 : l16_a_161);
-                unsigned long long l16_a_162 = R[2];
-                unsigned long long l16_b_162 = R[10];
-                R[2] = ((l16_a_162 > l16_b_162) ? l16_a_162 : l16_b_162);
-                R[10] = ((l16_a_162 > l16_b_162) ? l16_b_162 : l16_a_162);
-                unsigned long long l16_a_163 = R[3];
-                unsigned long long l16_b_163 = R[11];
-                R[3] = ((l16_a_163 > l16_b_163) ? l16_a_163 : l16_b_163);
-                R[11] = ((l16_a_163 > l16_b_163) ? l16_b_163 : l16_a_163);
-                unsigned long long l16_a_164 = R[4];
-                unsigned long long l16_b_164 = R[12];
-                R[4] = ((l16_a_164 > l16_b_164) ? l16_a_164 : l16_b_164);
-                R[12] = ((l16_a_164 > l16_b_164) ? l16_b_164 : l16_a_164);
-                unsigned long long l16_a_165 = R[5];
-                unsigned long long l16_b_165 = R[13];
-                R[5] = ((l16_a_165 > l16_b_165) ? l16_a_165 : l16_b_165);
-                R[13] = ((l16_a_165 > l16_b_165) ? l16_b_165 : l16_a_165);
-                unsigned long long l16_a_166 = R[6];
-                unsigned long long l16_b_166 = R[14];
-                R[6] = ((l16_a_166 > l16_b_166) ? l16_a_166 : l16_b_166);
-                R[14] = ((l16_a_166 > l16_b_166) ? l16_b_166 : l16_a_166);
-                unsigned long long l16_a_167 = R[7];
-                unsigned long long l16_b_167 = R[15];
-                R[7] = ((l16_a_167 > l16_b_167) ? l16_a_167 : l16_b_167);
-                R[15] = ((l16_a_167 > l16_b_167) ? l16_b_167 : l16_a_167);
-                unsigned long long l16_a_168 = R[0];
-                unsigned long long l16_b_168 = R[4];
-                R[0] = ((l16_a_168 > l16_b_168) ? l16_a_168 : l16_b_168);
-                R[4] = ((l16_a_168 > l16_b_168) ? l16_b_168 : l16_a_168);
-                unsigned long long l16_a_169 = R[1];
-                unsigned long long l16_b_169 = R[5];
-                R[1] = ((l16_a_169 > l16_b_169) ? l16_a_169 : l16_b_169);
-                R[5] = ((l16_a_169 > l16_b_169) ? l16_b_169 : l16_a_169);
-                unsigned long long l16_a_170 = R[2];
-                unsigned long long l16_b_170 = R[6];
-                R[2] = ((l16_a_170 > l16_b_170) ? l16_a_170 : l16_b_170);
-                R[6] = ((l16_a_170 > l16_b_170) ? l16_b_170 : l16_a_170);
-                unsigned long long l16_a_171 = R[3];
-                unsigned long long l16_b_171 = R[7];
-                R[3] = ((l16_a_171 > l16_b_171) ? l16_a_171 : l16_b_171);
-                R[7] = ((l16_a_171 > l16_b_171) ? l16_b_171 : l16_a_171);
-                unsigned long long l16_a_172 = R[8];
-                unsigned long long l16_b_172 = R[12];
-                R[8] = ((l16_a_172 > l16_b_172) ? l16_a_172 : l16_b_172);
-                R[12] = ((l16_a_172 > l16_b_172) ? l16_b_172 : l16_a_172);
-                unsigned long long l16_a_173 = R[9];
-                unsigned long long l16_b_173 = R[13];
-                R[9] = ((l16_a_173 > l16_b_173) ? l16_a_173 : l16_b_173);
-                R[13] = ((l16_a_173 > l16_b_173) ? l16_b_173 : l16_a_173);
-                unsigned long long l16_a_174 = R[10];
-                unsigned long long l16_b_174 = R[14];
-                R[10] = ((l16_a_174 > l16_b_174) ? l16_a_174 : l16_b_174);
-                R[14] = ((l16_a_174 > l16_b_174) ? l16_b_174 : l16_a_174);
-                unsigned long long l16_a_175 = R[11];
-                unsigned long long l16_b_175 = R[15];
-                R[11] = ((l16_a_175 > l16_b_175) ? l16_a_175 : l16_b_175);
-                R[15] = ((l16_a_175 > l16_b_175) ? l16_b_175 : l16_a_175);
-                unsigned long long l16_a_176 = R[0];
-                unsigned long long l16_b_176 = R[2];
-                R[0] = ((l16_a_176 > l16_b_176) ? l16_a_176 : l16_b_176);
-                R[2] = ((l16_a_176 > l16_b_176) ? l16_b_176 : l16_a_176);
-                unsigned long long l16_a_177 = R[1];
-                unsigned long long l16_b_177 = R[3];
-                R[1] = ((l16_a_177 > l16_b_177) ? l16_a_177 : l16_b_177);
-                R[3] = ((l16_a_177 > l16_b_177) ? l16_b_177 : l16_a_177);
-                unsigned long long l16_a_178 = R[4];
-                unsigned long long l16_b_178 = R[6];
-                R[4] = ((l16_a_178 > l16_b_178) ? l16_a_178 : l16_b_178);
-                R[6] = ((l16_a_178 > l16_b_178) ? l16_b_178 : l16_a_178);
-                unsigned long long l16_a_179 = R[5];
-                unsigned long long l16_b_179 = R[7];
-                R[5] = ((l16_a_179 > l16_b_179) ? l16_a_179 : l16_b_179);
-                R[7] = ((l16_a_179 > l16_b_179) ? l16_b_179 : l16_a_179);
-                unsigned long long l16_a_180 = R[8];
-                unsigned long long l16_b_180 = R[10];
-                R[8] = ((l16_a_180 > l16_b_180) ? l16_a_180 : l16_b_180);
-                R[10] = ((l16_a_180 > l16_b_180) ? l16_b_180 : l16_a_180);
-                unsigned long long l16_a_181 = R[9];
-                unsigned long long l16_b_181 = R[11];
-                R[9] = ((l16_a_181 > l16_b_181) ? l16_a_181 : l16_b_181);
-                R[11] = ((l16_a_181 > l16_b_181) ? l16_b_181 : l16_a_181);
-                unsigned long long l16_a_182 = R[12];
-                unsigned long long l16_b_182 = R[14];
-                R[12] = ((l16_a_182 > l16_b_182) ? l16_a_182 : l16_b_182);
-                R[14] = ((l16_a_182 > l16_b_182) ? l16_b_182 : l16_a_182);
-                unsigned long long l16_a_183 = R[13];
-                unsigned long long l16_b_183 = R[15];
-                R[13] = ((l16_a_183 > l16_b_183) ? l16_a_183 : l16_b_183);
-                R[15] = ((l16_a_183 > l16_b_183) ? l16_b_183 : l16_a_183);
-                unsigned long long l16_a_184 = R[0];
-                unsigned long long l16_b_184 = R[1];
-                R[0] = ((l16_a_184 > l16_b_184) ? l16_a_184 : l16_b_184);
-                R[1] = ((l16_a_184 > l16_b_184) ? l16_b_184 : l16_a_184);
-                unsigned long long l16_a_185 = R[2];
-                unsigned long long l16_b_185 = R[3];
-                R[2] = ((l16_a_185 > l16_b_185) ? l16_a_185 : l16_b_185);
-                R[3] = ((l16_a_185 > l16_b_185) ? l16_b_185 : l16_a_185);
-                unsigned long long l16_a_186 = R[4];
-                unsigned long long l16_b_186 = R[5];
-                R[4] = ((l16_a_186 > l16_b_186) ? l16_a_186 : l16_b_186);
-                R[5] = ((l16_a_186 > l16_b_186) ? l16_b_186 : l16_a_186);
-                unsigned long long l16_a_187 = R[6];
-                unsigned long long l16_b_187 = R[7];
-                R[6] = ((l16_a_187 > l16_b_187) ? l16_a_187 : l16_b_187);
-                R[7] = ((l16_a_187 > l16_b_187) ? l16_b_187 : l16_a_187);
-                unsigned long long l16_a_188 = R[8];
-                unsigned long long l16_b_188 = R[9];
-                R[8] = ((l16_a_188 > l16_b_188) ? l16_a_188 : l16_b_188);
-                R[9] = ((l16_a_188 > l16_b_188) ? l16_b_188 : l16_a_188);
-                unsigned long long l16_a_189 = R[10];
-                unsigned long long l16_b_189 = R[11];
-                R[10] = ((l16_a_189 > l16_b_189) ? l16_a_189 : l16_b_189);
-                R[11] = ((l16_a_189 > l16_b_189) ? l16_b_189 : l16_a_189);
-                unsigned long long l16_a_190 = R[12];
-                unsigned long long l16_b_190 = R[13];
-                R[12] = ((l16_a_190 > l16_b_190) ? l16_a_190 : l16_b_190);
-                R[13] = ((l16_a_190 > l16_b_190) ? l16_b_190 : l16_a_190);
-                unsigned long long l16_a_191 = R[14];
-                unsigned long long l16_b_191 = R[15];
-                R[14] = ((l16_a_191 > l16_b_191) ? l16_a_191 : l16_b_191);
-                R[15] = ((l16_a_191 > l16_b_191) ? l16_b_191 : l16_a_191);
+                BL[15] = (unsigned long long)x_hi_47 << 32 | (unsigned long long)x_lo_47;
+                unsigned long long l16_m_48 = BL[15];
+                RL[0] = ((RL[0] > l16_m_48) ? RL[0] : l16_m_48);
+                unsigned long long l16_m_49 = BL[14];
+                RL[1] = ((RL[1] > l16_m_49) ? RL[1] : l16_m_49);
+                unsigned long long l16_m_50 = BL[13];
+                RL[2] = ((RL[2] > l16_m_50) ? RL[2] : l16_m_50);
+                unsigned long long l16_m_51 = BL[12];
+                RL[3] = ((RL[3] > l16_m_51) ? RL[3] : l16_m_51);
+                unsigned long long l16_m_52 = BL[11];
+                RL[4] = ((RL[4] > l16_m_52) ? RL[4] : l16_m_52);
+                unsigned long long l16_m_53 = BL[10];
+                RL[5] = ((RL[5] > l16_m_53) ? RL[5] : l16_m_53);
+                unsigned long long l16_m_54 = BL[9];
+                RL[6] = ((RL[6] > l16_m_54) ? RL[6] : l16_m_54);
+                unsigned long long l16_m_55 = BL[8];
+                RL[7] = ((RL[7] > l16_m_55) ? RL[7] : l16_m_55);
+                unsigned long long l16_m_56 = BL[7];
+                RL[8] = ((RL[8] > l16_m_56) ? RL[8] : l16_m_56);
+                unsigned long long l16_m_57 = BL[6];
+                RL[9] = ((RL[9] > l16_m_57) ? RL[9] : l16_m_57);
+                unsigned long long l16_m_58 = BL[5];
+                RL[10] = ((RL[10] > l16_m_58) ? RL[10] : l16_m_58);
+                unsigned long long l16_m_59 = BL[4];
+                RL[11] = ((RL[11] > l16_m_59) ? RL[11] : l16_m_59);
+                unsigned long long l16_m_60 = BL[3];
+                RL[12] = ((RL[12] > l16_m_60) ? RL[12] : l16_m_60);
+                unsigned long long l16_m_61 = BL[2];
+                RL[13] = ((RL[13] > l16_m_61) ? RL[13] : l16_m_61);
+                unsigned long long l16_m_62 = BL[1];
+                RL[14] = ((RL[14] > l16_m_62) ? RL[14] : l16_m_62);
+                unsigned long long l16_m_63 = BL[0];
+                RL[15] = ((RL[15] > l16_m_63) ? RL[15] : l16_m_63);
+                unsigned long long l16_a_96 = RL[0];
+                unsigned long long l16_b_96 = RL[8];
+                RL[0] = ((l16_a_96 > l16_b_96) ? l16_a_96 : l16_b_96);
+                RL[8] = ((l16_a_96 > l16_b_96) ? l16_b_96 : l16_a_96);
+                unsigned long long l16_a_97 = RL[1];
+                unsigned long long l16_b_97 = RL[9];
+                RL[1] = ((l16_a_97 > l16_b_97) ? l16_a_97 : l16_b_97);
+                RL[9] = ((l16_a_97 > l16_b_97) ? l16_b_97 : l16_a_97);
+                unsigned long long l16_a_98 = RL[2];
+                unsigned long long l16_b_98 = RL[10];
+                RL[2] = ((l16_a_98 > l16_b_98) ? l16_a_98 : l16_b_98);
+                RL[10] = ((l16_a_98 > l16_b_98) ? l16_b_98 : l16_a_98);
+                unsigned long long l16_a_99 = RL[3];
+                unsigned long long l16_b_99 = RL[11];
+                RL[3] = ((l16_a_99 > l16_b_99) ? l16_a_99 : l16_b_99);
+                RL[11] = ((l16_a_99 > l16_b_99) ? l16_b_99 : l16_a_99);
+                unsigned long long l16_a_100 = RL[4];
+                unsigned long long l16_b_100 = RL[12];
+                RL[4] = ((l16_a_100 > l16_b_100) ? l16_a_100 : l16_b_100);
+                RL[12] = ((l16_a_100 > l16_b_100) ? l16_b_100 : l16_a_100);
+                unsigned long long l16_a_101 = RL[5];
+                unsigned long long l16_b_101 = RL[13];
+                RL[5] = ((l16_a_101 > l16_b_101) ? l16_a_101 : l16_b_101);
+                RL[13] = ((l16_a_101 > l16_b_101) ? l16_b_101 : l16_a_101);
+                unsigned long long l16_a_102 = RL[6];
+                unsigned long long l16_b_102 = RL[14];
+                RL[6] = ((l16_a_102 > l16_b_102) ? l16_a_102 : l16_b_102);
+                RL[14] = ((l16_a_102 > l16_b_102) ? l16_b_102 : l16_a_102);
+                unsigned long long l16_a_103 = RL[7];
+                unsigned long long l16_b_103 = RL[15];
+                RL[7] = ((l16_a_103 > l16_b_103) ? l16_a_103 : l16_b_103);
+                RL[15] = ((l16_a_103 > l16_b_103) ? l16_b_103 : l16_a_103);
+                unsigned long long l16_a_104 = RL[0];
+                unsigned long long l16_b_104 = RL[4];
+                RL[0] = ((l16_a_104 > l16_b_104) ? l16_a_104 : l16_b_104);
+                RL[4] = ((l16_a_104 > l16_b_104) ? l16_b_104 : l16_a_104);
+                unsigned long long l16_a_105 = RL[1];
+                unsigned long long l16_b_105 = RL[5];
+                RL[1] = ((l16_a_105 > l16_b_105) ? l16_a_105 : l16_b_105);
+                RL[5] = ((l16_a_105 > l16_b_105) ? l16_b_105 : l16_a_105);
+                unsigned long long l16_a_106 = RL[2];
+                unsigned long long l16_b_106 = RL[6];
+                RL[2] = ((l16_a_106 > l16_b_106) ? l16_a_106 : l16_b_106);
+                RL[6] = ((l16_a_106 > l16_b_106) ? l16_b_106 : l16_a_106);
+                unsigned long long l16_a_107 = RL[3];
+                unsigned long long l16_b_107 = RL[7];
+                RL[3] = ((l16_a_107 > l16_b_107) ? l16_a_107 : l16_b_107);
+                RL[7] = ((l16_a_107 > l16_b_107) ? l16_b_107 : l16_a_107);
+                unsigned long long l16_a_108 = RL[8];
+                unsigned long long l16_b_108 = RL[12];
+                RL[8] = ((l16_a_108 > l16_b_108) ? l16_a_108 : l16_b_108);
+                RL[12] = ((l16_a_108 > l16_b_108) ? l16_b_108 : l16_a_108);
+                unsigned long long l16_a_109 = RL[9];
+                unsigned long long l16_b_109 = RL[13];
+                RL[9] = ((l16_a_109 > l16_b_109) ? l16_a_109 : l16_b_109);
+                RL[13] = ((l16_a_109 > l16_b_109) ? l16_b_109 : l16_a_109);
+                unsigned long long l16_a_110 = RL[10];
+                unsigned long long l16_b_110 = RL[14];
+                RL[10] = ((l16_a_110 > l16_b_110) ? l16_a_110 : l16_b_110);
+                RL[14] = ((l16_a_110 > l16_b_110) ? l16_b_110 : l16_a_110);
+                unsigned long long l16_a_111 = RL[11];
+                unsigned long long l16_b_111 = RL[15];
+                RL[11] = ((l16_a_111 > l16_b_111) ? l16_a_111 : l16_b_111);
+                RL[15] = ((l16_a_111 > l16_b_111) ? l16_b_111 : l16_a_111);
+                unsigned long long l16_a_112 = RL[0];
+                unsigned long long l16_b_112 = RL[2];
+                RL[0] = ((l16_a_112 > l16_b_112) ? l16_a_112 : l16_b_112);
+                RL[2] = ((l16_a_112 > l16_b_112) ? l16_b_112 : l16_a_112);
+                unsigned long long l16_a_113 = RL[1];
+                unsigned long long l16_b_113 = RL[3];
+                RL[1] = ((l16_a_113 > l16_b_113) ? l16_a_113 : l16_b_113);
+                RL[3] = ((l16_a_113 > l16_b_113) ? l16_b_113 : l16_a_113);
+                unsigned long long l16_a_114 = RL[4];
+                unsigned long long l16_b_114 = RL[6];
+                RL[4] = ((l16_a_114 > l16_b_114) ? l16_a_114 : l16_b_114);
+                RL[6] = ((l16_a_114 > l16_b_114) ? l16_b_114 : l16_a_114);
+                unsigned long long l16_a_115 = RL[5];
+                unsigned long long l16_b_115 = RL[7];
+                RL[5] = ((l16_a_115 > l16_b_115) ? l16_a_115 : l16_b_115);
+                RL[7] = ((l16_a_115 > l16_b_115) ? l16_b_115 : l16_a_115);
+                unsigned long long l16_a_116 = RL[8];
+                unsigned long long l16_b_116 = RL[10];
+                RL[8] = ((l16_a_116 > l16_b_116) ? l16_a_116 : l16_b_116);
+                RL[10] = ((l16_a_116 > l16_b_116) ? l16_b_116 : l16_a_116);
+                unsigned long long l16_a_117 = RL[9];
+                unsigned long long l16_b_117 = RL[11];
+                RL[9] = ((l16_a_117 > l16_b_117) ? l16_a_117 : l16_b_117);
+                RL[11] = ((l16_a_117 > l16_b_117) ? l16_b_117 : l16_a_117);
+                unsigned long long l16_a_118 = RL[12];
+                unsigned long long l16_b_118 = RL[14];
+                RL[12] = ((l16_a_118 > l16_b_118) ? l16_a_118 : l16_b_118);
+                RL[14] = ((l16_a_118 > l16_b_118) ? l16_b_118 : l16_a_118);
+                unsigned long long l16_a_119 = RL[13];
+                unsigned long long l16_b_119 = RL[15];
+                RL[13] = ((l16_a_119 > l16_b_119) ? l16_a_119 : l16_b_119);
+                RL[15] = ((l16_a_119 > l16_b_119) ? l16_b_119 : l16_a_119);
+                unsigned long long l16_a_120 = RL[0];
+                unsigned long long l16_b_120 = RL[1];
+                RL[0] = ((l16_a_120 > l16_b_120) ? l16_a_120 : l16_b_120);
+                RL[1] = ((l16_a_120 > l16_b_120) ? l16_b_120 : l16_a_120);
+                unsigned long long l16_a_121 = RL[2];
+                unsigned long long l16_b_121 = RL[3];
+                RL[2] = ((l16_a_121 > l16_b_121) ? l16_a_121 : l16_b_121);
+                RL[3] = ((l16_a_121 > l16_b_121) ? l16_b_121 : l16_a_121);
+                unsigned long long l16_a_122 = RL[4];
+                unsigned long long l16_b_122 = RL[5];
+                RL[4] = ((l16_a_122 > l16_b_122) ? l16_a_122 : l16_b_122);
+                RL[5] = ((l16_a_122 > l16_b_122) ? l16_b_122 : l16_a_122);
+                unsigned long long l16_a_123 = RL[6];
+                unsigned long long l16_b_123 = RL[7];
+                RL[6] = ((l16_a_123 > l16_b_123) ? l16_a_123 : l16_b_123);
+                RL[7] = ((l16_a_123 > l16_b_123) ? l16_b_123 : l16_a_123);
+                unsigned long long l16_a_124 = RL[8];
+                unsigned long long l16_b_124 = RL[9];
+                RL[8] = ((l16_a_124 > l16_b_124) ? l16_a_124 : l16_b_124);
+                RL[9] = ((l16_a_124 > l16_b_124) ? l16_b_124 : l16_a_124);
+                unsigned long long l16_a_125 = RL[10];
+                unsigned long long l16_b_125 = RL[11];
+                RL[10] = ((l16_a_125 > l16_b_125) ? l16_a_125 : l16_b_125);
+                RL[11] = ((l16_a_125 > l16_b_125) ? l16_b_125 : l16_a_125);
+                unsigned long long l16_a_126 = RL[12];
+                unsigned long long l16_b_126 = RL[13];
+                RL[12] = ((l16_a_126 > l16_b_126) ? l16_a_126 : l16_b_126);
+                RL[13] = ((l16_a_126 > l16_b_126) ? l16_b_126 : l16_a_126);
+                unsigned long long l16_a_127 = RL[14];
+                unsigned long long l16_b_127 = RL[15];
+                RL[14] = ((l16_a_127 > l16_b_127) ? l16_a_127 : l16_b_127);
+                RL[15] = ((l16_a_127 > l16_b_127) ? l16_b_127 : l16_a_127);
+                R[0] = ((sl == 0) ? RL[0] : R[0]);
+                R[1] = ((sl == 0) ? RL[1] : R[1]);
+                R[0] = ((sl == 1) ? RL[2] : R[0]);
+                R[1] = ((sl == 1) ? RL[3] : R[1]);
+                R[0] = ((sl == 2) ? RL[4] : R[0]);
+                R[1] = ((sl == 2) ? RL[5] : R[1]);
+                R[0] = ((sl == 3) ? RL[6] : R[0]);
+                R[1] = ((sl == 3) ? RL[7] : R[1]);
+                R[0] = ((sl == 4) ? RL[8] : R[0]);
+                R[1] = ((sl == 4) ? RL[9] : R[1]);
+                R[0] = ((sl == 5) ? RL[10] : R[0]);
+                R[1] = ((sl == 5) ? RL[11] : R[1]);
+                R[0] = ((sl == 6) ? RL[12] : R[0]);
+                R[1] = ((sl == 6) ? RL[13] : R[1]);
+                R[0] = ((sl == 7) ? RL[14] : R[0]);
+                R[1] = ((sl == 7) ? RL[15] : R[1]);
+            } else {
+                unsigned long long A1[2];
+                unsigned long long A2[2];
+                unsigned long long A3[2];
+                unsigned long long L0[2];
+                unsigned long long L1[2];
+                unsigned long long L2[2];
+                unsigned long long L3[2];
+                int C[4];
+                A1[0] = 0;
+                A2[0] = 0;
+                A3[0] = 0;
+                A1[1] = 0;
+                A2[1] = 0;
+                A3[1] = 0;
+                int used = 0;
+                #pragma unroll 1
+                for (int c0 = 0; c0 < npieces; c0 += 32) {
+                    int cs = s_first + c0 + lane_1;
+                    long long cw = work_range[((cs <= s_last) ? cs : s_last)];
+                    int c_cb = (((int)(cw & 65535) == j) ? (int)(cw >> 32 & 65535) : 0);
+                    int c_ce = (((int)(cw >> 16 & 65535) == j) ? (int)(cw >> 48 & 65535) : cj);
+                    unsigned int mask = __ballot_sync(0xFFFFFFFF, cs <= s_last && c_ce > c_cb);
+                    int n_steps = ((int)(unsigned int)__popc(mask) + 4 - 1 >> 2);
+                    #pragma unroll 1
+                    for (int _st = 0; _st < n_steps; _st++) {
+                        int taken = 0;
+                        C[0] = s_first;
+                        if (mask != 0) {
+                            int bt_0;
+                            asm volatile("bfind.u32 %0, %1;" : "=r"(bt_0) : "r"(mask));
+                            C[0] = s_first + c0 + bt_0;
+                            mask = mask & ~(1 << (unsigned int)bt_0);
+                            taken = taken + 1;
+                        }
+                        C[1] = s_first;
+                        if (mask != 0) {
+                            int bt_1;
+                            asm volatile("bfind.u32 %0, %1;" : "=r"(bt_1) : "r"(mask));
+                            C[1] = s_first + c0 + bt_1;
+                            mask = mask & ~(1 << (unsigned int)bt_1);
+                            taken = taken + 1;
+                        }
+                        C[2] = s_first;
+                        if (mask != 0) {
+                            int bt_2;
+                            asm volatile("bfind.u32 %0, %1;" : "=r"(bt_2) : "r"(mask));
+                            C[2] = s_first + c0 + bt_2;
+                            mask = mask & ~(1 << (unsigned int)bt_2);
+                            taken = taken + 1;
+                        }
+                        C[3] = s_first;
+                        if (mask != 0) {
+                            int bt_3;
+                            asm volatile("bfind.u32 %0, %1;" : "=r"(bt_3) : "r"(mask));
+                            C[3] = s_first + c0 + bt_3;
+                            mask = mask & ~(1 << (unsigned int)bt_3);
+                            taken = taken + 1;
+                        }
+                        if (0 < taken) {
+                            if (0 < used) {
+                                float* lk_src = reinterpret_cast<float*>(pool + ((long long)(C[0] + j) * pool_piece_stride + row_rev));
+                                float lk_f[4];
+                                {
+                                    float4 _v4 = *reinterpret_cast<const float4*>(lk_src + 0);
+                                    lk_f[0 + 0] = _v4.x;
+                                    lk_f[0 + 1] = _v4.y;
+                                    lk_f[0 + 2] = _v4.z;
+                                    lk_f[0 + 3] = _v4.w;
+                                }
+                                unsigned int lk_lo_0 = 0;
+                                unsigned int lk_hi_0 = 0;
+                                float _bit_cast_src_116 = lk_f[0];
+                                lk_lo_0 = reinterpret_cast<unsigned int*>(&_bit_cast_src_116)[0];
+                                float _bit_cast_src_117 = lk_f[1];
+                                lk_hi_0 = reinterpret_cast<unsigned int*>(&_bit_cast_src_117)[0];
+                                L0[0] = (unsigned long long)lk_hi_0 << 32 | (unsigned long long)lk_lo_0;
+                                unsigned int lk_lo_1 = 0;
+                                unsigned int lk_hi_1 = 0;
+                                float _bit_cast_src_118 = lk_f[2];
+                                lk_lo_1 = reinterpret_cast<unsigned int*>(&_bit_cast_src_118)[0];
+                                float _bit_cast_src_119 = lk_f[3];
+                                lk_hi_1 = reinterpret_cast<unsigned int*>(&_bit_cast_src_119)[0];
+                                L0[1] = (unsigned long long)lk_hi_1 << 32 | (unsigned long long)lk_lo_1;
+                            } else {
+                                float* lk_src_1 = reinterpret_cast<float*>(pool + ((long long)(C[0] + j) * pool_piece_stride + row_dir));
+                                float lk_f_1[4];
+                                {
+                                    float4 _v4 = *reinterpret_cast<const float4*>(lk_src_1 + 0);
+                                    lk_f_1[0 + 0] = _v4.x;
+                                    lk_f_1[0 + 1] = _v4.y;
+                                    lk_f_1[0 + 2] = _v4.z;
+                                    lk_f_1[0 + 3] = _v4.w;
+                                }
+                                unsigned int lk_lo_2 = 0;
+                                unsigned int lk_hi_2 = 0;
+                                float _bit_cast_src_121 = lk_f_1[0];
+                                lk_lo_2 = reinterpret_cast<unsigned int*>(&_bit_cast_src_121)[0];
+                                float _bit_cast_src_122 = lk_f_1[1];
+                                lk_hi_2 = reinterpret_cast<unsigned int*>(&_bit_cast_src_122)[0];
+                                R[0] = (unsigned long long)lk_hi_2 << 32 | (unsigned long long)lk_lo_2;
+                                unsigned int lk_lo_3 = 0;
+                                unsigned int lk_hi_3 = 0;
+                                float _bit_cast_src_123 = lk_f_1[2];
+                                lk_lo_3 = reinterpret_cast<unsigned int*>(&_bit_cast_src_123)[0];
+                                float _bit_cast_src_124 = lk_f_1[3];
+                                lk_hi_3 = reinterpret_cast<unsigned int*>(&_bit_cast_src_124)[0];
+                                R[1] = (unsigned long long)lk_hi_3 << 32 | (unsigned long long)lk_lo_3;
+                            }
+                        }
+                        if (1 < taken) {
+                            if (1 < used) {
+                                float* lk_src_2 = reinterpret_cast<float*>(pool + ((long long)(C[1] + j) * pool_piece_stride + row_rev));
+                                float lk_f_2[4];
+                                {
+                                    float4 _v4 = *reinterpret_cast<const float4*>(lk_src_2 + 0);
+                                    lk_f_2[0 + 0] = _v4.x;
+                                    lk_f_2[0 + 1] = _v4.y;
+                                    lk_f_2[0 + 2] = _v4.z;
+                                    lk_f_2[0 + 3] = _v4.w;
+                                }
+                                unsigned int lk_lo_4 = 0;
+                                unsigned int lk_hi_4 = 0;
+                                float _bit_cast_src_126 = lk_f_2[0];
+                                lk_lo_4 = reinterpret_cast<unsigned int*>(&_bit_cast_src_126)[0];
+                                float _bit_cast_src_127 = lk_f_2[1];
+                                lk_hi_4 = reinterpret_cast<unsigned int*>(&_bit_cast_src_127)[0];
+                                L1[0] = (unsigned long long)lk_hi_4 << 32 | (unsigned long long)lk_lo_4;
+                                unsigned int lk_lo_5 = 0;
+                                unsigned int lk_hi_5 = 0;
+                                float _bit_cast_src_128 = lk_f_2[2];
+                                lk_lo_5 = reinterpret_cast<unsigned int*>(&_bit_cast_src_128)[0];
+                                float _bit_cast_src_129 = lk_f_2[3];
+                                lk_hi_5 = reinterpret_cast<unsigned int*>(&_bit_cast_src_129)[0];
+                                L1[1] = (unsigned long long)lk_hi_5 << 32 | (unsigned long long)lk_lo_5;
+                            } else {
+                                float* lk_src_3 = reinterpret_cast<float*>(pool + ((long long)(C[1] + j) * pool_piece_stride + row_dir));
+                                float lk_f_3[4];
+                                {
+                                    float4 _v4 = *reinterpret_cast<const float4*>(lk_src_3 + 0);
+                                    lk_f_3[0 + 0] = _v4.x;
+                                    lk_f_3[0 + 1] = _v4.y;
+                                    lk_f_3[0 + 2] = _v4.z;
+                                    lk_f_3[0 + 3] = _v4.w;
+                                }
+                                unsigned int lk_lo_6 = 0;
+                                unsigned int lk_hi_6 = 0;
+                                float _bit_cast_src_131 = lk_f_3[0];
+                                lk_lo_6 = reinterpret_cast<unsigned int*>(&_bit_cast_src_131)[0];
+                                float _bit_cast_src_132 = lk_f_3[1];
+                                lk_hi_6 = reinterpret_cast<unsigned int*>(&_bit_cast_src_132)[0];
+                                A1[0] = (unsigned long long)lk_hi_6 << 32 | (unsigned long long)lk_lo_6;
+                                unsigned int lk_lo_7 = 0;
+                                unsigned int lk_hi_7 = 0;
+                                float _bit_cast_src_133 = lk_f_3[2];
+                                lk_lo_7 = reinterpret_cast<unsigned int*>(&_bit_cast_src_133)[0];
+                                float _bit_cast_src_134 = lk_f_3[3];
+                                lk_hi_7 = reinterpret_cast<unsigned int*>(&_bit_cast_src_134)[0];
+                                A1[1] = (unsigned long long)lk_hi_7 << 32 | (unsigned long long)lk_lo_7;
+                            }
+                        }
+                        if (2 < taken) {
+                            if (2 < used) {
+                                float* lk_src_4 = reinterpret_cast<float*>(pool + ((long long)(C[2] + j) * pool_piece_stride + row_rev));
+                                float lk_f_4[4];
+                                {
+                                    float4 _v4 = *reinterpret_cast<const float4*>(lk_src_4 + 0);
+                                    lk_f_4[0 + 0] = _v4.x;
+                                    lk_f_4[0 + 1] = _v4.y;
+                                    lk_f_4[0 + 2] = _v4.z;
+                                    lk_f_4[0 + 3] = _v4.w;
+                                }
+                                unsigned int lk_lo_8 = 0;
+                                unsigned int lk_hi_8 = 0;
+                                float _bit_cast_src_136 = lk_f_4[0];
+                                lk_lo_8 = reinterpret_cast<unsigned int*>(&_bit_cast_src_136)[0];
+                                float _bit_cast_src_137 = lk_f_4[1];
+                                lk_hi_8 = reinterpret_cast<unsigned int*>(&_bit_cast_src_137)[0];
+                                L2[0] = (unsigned long long)lk_hi_8 << 32 | (unsigned long long)lk_lo_8;
+                                unsigned int lk_lo_9 = 0;
+                                unsigned int lk_hi_9 = 0;
+                                float _bit_cast_src_138 = lk_f_4[2];
+                                lk_lo_9 = reinterpret_cast<unsigned int*>(&_bit_cast_src_138)[0];
+                                float _bit_cast_src_139 = lk_f_4[3];
+                                lk_hi_9 = reinterpret_cast<unsigned int*>(&_bit_cast_src_139)[0];
+                                L2[1] = (unsigned long long)lk_hi_9 << 32 | (unsigned long long)lk_lo_9;
+                            } else {
+                                float* lk_src_5 = reinterpret_cast<float*>(pool + ((long long)(C[2] + j) * pool_piece_stride + row_dir));
+                                float lk_f_5[4];
+                                {
+                                    float4 _v4 = *reinterpret_cast<const float4*>(lk_src_5 + 0);
+                                    lk_f_5[0 + 0] = _v4.x;
+                                    lk_f_5[0 + 1] = _v4.y;
+                                    lk_f_5[0 + 2] = _v4.z;
+                                    lk_f_5[0 + 3] = _v4.w;
+                                }
+                                unsigned int lk_lo_10 = 0;
+                                unsigned int lk_hi_10 = 0;
+                                float _bit_cast_src_141 = lk_f_5[0];
+                                lk_lo_10 = reinterpret_cast<unsigned int*>(&_bit_cast_src_141)[0];
+                                float _bit_cast_src_142 = lk_f_5[1];
+                                lk_hi_10 = reinterpret_cast<unsigned int*>(&_bit_cast_src_142)[0];
+                                A2[0] = (unsigned long long)lk_hi_10 << 32 | (unsigned long long)lk_lo_10;
+                                unsigned int lk_lo_11 = 0;
+                                unsigned int lk_hi_11 = 0;
+                                float _bit_cast_src_143 = lk_f_5[2];
+                                lk_lo_11 = reinterpret_cast<unsigned int*>(&_bit_cast_src_143)[0];
+                                float _bit_cast_src_144 = lk_f_5[3];
+                                lk_hi_11 = reinterpret_cast<unsigned int*>(&_bit_cast_src_144)[0];
+                                A2[1] = (unsigned long long)lk_hi_11 << 32 | (unsigned long long)lk_lo_11;
+                            }
+                        }
+                        if (3 < taken) {
+                            if (3 < used) {
+                                float* lk_src_6 = reinterpret_cast<float*>(pool + ((long long)(C[3] + j) * pool_piece_stride + row_rev));
+                                float lk_f_6[4];
+                                {
+                                    float4 _v4 = *reinterpret_cast<const float4*>(lk_src_6 + 0);
+                                    lk_f_6[0 + 0] = _v4.x;
+                                    lk_f_6[0 + 1] = _v4.y;
+                                    lk_f_6[0 + 2] = _v4.z;
+                                    lk_f_6[0 + 3] = _v4.w;
+                                }
+                                unsigned int lk_lo_12 = 0;
+                                unsigned int lk_hi_12 = 0;
+                                float _bit_cast_src_146 = lk_f_6[0];
+                                lk_lo_12 = reinterpret_cast<unsigned int*>(&_bit_cast_src_146)[0];
+                                float _bit_cast_src_147 = lk_f_6[1];
+                                lk_hi_12 = reinterpret_cast<unsigned int*>(&_bit_cast_src_147)[0];
+                                L3[0] = (unsigned long long)lk_hi_12 << 32 | (unsigned long long)lk_lo_12;
+                                unsigned int lk_lo_13 = 0;
+                                unsigned int lk_hi_13 = 0;
+                                float _bit_cast_src_148 = lk_f_6[2];
+                                lk_lo_13 = reinterpret_cast<unsigned int*>(&_bit_cast_src_148)[0];
+                                float _bit_cast_src_149 = lk_f_6[3];
+                                lk_hi_13 = reinterpret_cast<unsigned int*>(&_bit_cast_src_149)[0];
+                                L3[1] = (unsigned long long)lk_hi_13 << 32 | (unsigned long long)lk_lo_13;
+                            } else {
+                                float* lk_src_7 = reinterpret_cast<float*>(pool + ((long long)(C[3] + j) * pool_piece_stride + row_dir));
+                                float lk_f_7[4];
+                                {
+                                    float4 _v4 = *reinterpret_cast<const float4*>(lk_src_7 + 0);
+                                    lk_f_7[0 + 0] = _v4.x;
+                                    lk_f_7[0 + 1] = _v4.y;
+                                    lk_f_7[0 + 2] = _v4.z;
+                                    lk_f_7[0 + 3] = _v4.w;
+                                }
+                                unsigned int lk_lo_14 = 0;
+                                unsigned int lk_hi_14 = 0;
+                                float _bit_cast_src_151 = lk_f_7[0];
+                                lk_lo_14 = reinterpret_cast<unsigned int*>(&_bit_cast_src_151)[0];
+                                float _bit_cast_src_152 = lk_f_7[1];
+                                lk_hi_14 = reinterpret_cast<unsigned int*>(&_bit_cast_src_152)[0];
+                                A3[0] = (unsigned long long)lk_hi_14 << 32 | (unsigned long long)lk_lo_14;
+                                unsigned int lk_lo_15 = 0;
+                                unsigned int lk_hi_15 = 0;
+                                float _bit_cast_src_153 = lk_f_7[2];
+                                lk_lo_15 = reinterpret_cast<unsigned int*>(&_bit_cast_src_153)[0];
+                                float _bit_cast_src_154 = lk_f_7[3];
+                                lk_hi_15 = reinterpret_cast<unsigned int*>(&_bit_cast_src_154)[0];
+                                A3[1] = (unsigned long long)lk_hi_15 << 32 | (unsigned long long)lk_lo_15;
+                            }
+                        }
+                        if (0 < taken && 0 < used) {
+                            R[0] = ((R[0] > L0[1]) ? R[0] : L0[1]);
+                            R[1] = ((R[1] > L0[0]) ? R[1] : L0[0]);
+                            unsigned long long hm_x_0 = R[0];
+                            unsigned int hm_lo_0 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)hm_x_0, 4);
+                            unsigned int hm_hi_0 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(hm_x_0 >> 32), 4);
+                            unsigned long long hm_o_0 = (unsigned long long)hm_hi_0 << 32 | (unsigned long long)hm_lo_0;
+                            unsigned long long hm_max_0 = ((hm_x_0 > hm_o_0) ? hm_x_0 : hm_o_0);
+                            unsigned long long hm_min_0 = ((hm_x_0 > hm_o_0) ? hm_o_0 : hm_x_0);
+                            R[0] = (((sl & 4) == 0) ? hm_max_0 : hm_min_0);
+                            unsigned long long hm_x_1 = R[1];
+                            unsigned int hm_lo_1 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)hm_x_1, 4);
+                            unsigned int hm_hi_1 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(hm_x_1 >> 32), 4);
+                            unsigned long long hm_o_1 = (unsigned long long)hm_hi_1 << 32 | (unsigned long long)hm_lo_1;
+                            unsigned long long hm_max_1 = ((hm_x_1 > hm_o_1) ? hm_x_1 : hm_o_1);
+                            unsigned long long hm_min_1 = ((hm_x_1 > hm_o_1) ? hm_o_1 : hm_x_1);
+                            R[1] = (((sl & 4) == 0) ? hm_max_1 : hm_min_1);
+                            unsigned long long hm_x_2 = R[0];
+                            unsigned int hm_lo_2 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)hm_x_2, 2);
+                            unsigned int hm_hi_2 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(hm_x_2 >> 32), 2);
+                            unsigned long long hm_o_2 = (unsigned long long)hm_hi_2 << 32 | (unsigned long long)hm_lo_2;
+                            unsigned long long hm_max_2 = ((hm_x_2 > hm_o_2) ? hm_x_2 : hm_o_2);
+                            unsigned long long hm_min_2 = ((hm_x_2 > hm_o_2) ? hm_o_2 : hm_x_2);
+                            R[0] = (((sl & 2) == 0) ? hm_max_2 : hm_min_2);
+                            unsigned long long hm_x_3 = R[1];
+                            unsigned int hm_lo_3 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)hm_x_3, 2);
+                            unsigned int hm_hi_3 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(hm_x_3 >> 32), 2);
+                            unsigned long long hm_o_3 = (unsigned long long)hm_hi_3 << 32 | (unsigned long long)hm_lo_3;
+                            unsigned long long hm_max_3 = ((hm_x_3 > hm_o_3) ? hm_x_3 : hm_o_3);
+                            unsigned long long hm_min_3 = ((hm_x_3 > hm_o_3) ? hm_o_3 : hm_x_3);
+                            R[1] = (((sl & 2) == 0) ? hm_max_3 : hm_min_3);
+                            unsigned long long hm_x_4 = R[0];
+                            unsigned int hm_lo_4 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)hm_x_4, 1);
+                            unsigned int hm_hi_4 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(hm_x_4 >> 32), 1);
+                            unsigned long long hm_o_4 = (unsigned long long)hm_hi_4 << 32 | (unsigned long long)hm_lo_4;
+                            unsigned long long hm_max_4 = ((hm_x_4 > hm_o_4) ? hm_x_4 : hm_o_4);
+                            unsigned long long hm_min_4 = ((hm_x_4 > hm_o_4) ? hm_o_4 : hm_x_4);
+                            R[0] = (((sl & 1) == 0) ? hm_max_4 : hm_min_4);
+                            unsigned long long hm_x_5 = R[1];
+                            unsigned int hm_lo_5 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)hm_x_5, 1);
+                            unsigned int hm_hi_5 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(hm_x_5 >> 32), 1);
+                            unsigned long long hm_o_5 = (unsigned long long)hm_hi_5 << 32 | (unsigned long long)hm_lo_5;
+                            unsigned long long hm_max_5 = ((hm_x_5 > hm_o_5) ? hm_x_5 : hm_o_5);
+                            unsigned long long hm_min_5 = ((hm_x_5 > hm_o_5) ? hm_o_5 : hm_x_5);
+                            R[1] = (((sl & 1) == 0) ? hm_max_5 : hm_min_5);
+                            unsigned long long hm_a = R[0];
+                            unsigned long long hm_b = R[1];
+                            R[0] = ((hm_a > hm_b) ? hm_a : hm_b);
+                            R[1] = ((hm_a > hm_b) ? hm_b : hm_a);
+                        }
+                        if (1 < taken && 1 < used) {
+                            A1[0] = ((A1[0] > L1[1]) ? A1[0] : L1[1]);
+                            A1[1] = ((A1[1] > L1[0]) ? A1[1] : L1[0]);
+                            unsigned long long hm_x_6 = A1[0];
+                            unsigned int hm_lo_6 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)hm_x_6, 4);
+                            unsigned int hm_hi_6 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(hm_x_6 >> 32), 4);
+                            unsigned long long hm_o_6 = (unsigned long long)hm_hi_6 << 32 | (unsigned long long)hm_lo_6;
+                            unsigned long long hm_max_6 = ((hm_x_6 > hm_o_6) ? hm_x_6 : hm_o_6);
+                            unsigned long long hm_min_6 = ((hm_x_6 > hm_o_6) ? hm_o_6 : hm_x_6);
+                            A1[0] = (((sl & 4) == 0) ? hm_max_6 : hm_min_6);
+                            unsigned long long hm_x_7 = A1[1];
+                            unsigned int hm_lo_7 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)hm_x_7, 4);
+                            unsigned int hm_hi_7 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(hm_x_7 >> 32), 4);
+                            unsigned long long hm_o_7 = (unsigned long long)hm_hi_7 << 32 | (unsigned long long)hm_lo_7;
+                            unsigned long long hm_max_7 = ((hm_x_7 > hm_o_7) ? hm_x_7 : hm_o_7);
+                            unsigned long long hm_min_7 = ((hm_x_7 > hm_o_7) ? hm_o_7 : hm_x_7);
+                            A1[1] = (((sl & 4) == 0) ? hm_max_7 : hm_min_7);
+                            unsigned long long hm_x_8 = A1[0];
+                            unsigned int hm_lo_8 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)hm_x_8, 2);
+                            unsigned int hm_hi_8 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(hm_x_8 >> 32), 2);
+                            unsigned long long hm_o_8 = (unsigned long long)hm_hi_8 << 32 | (unsigned long long)hm_lo_8;
+                            unsigned long long hm_max_8 = ((hm_x_8 > hm_o_8) ? hm_x_8 : hm_o_8);
+                            unsigned long long hm_min_8 = ((hm_x_8 > hm_o_8) ? hm_o_8 : hm_x_8);
+                            A1[0] = (((sl & 2) == 0) ? hm_max_8 : hm_min_8);
+                            unsigned long long hm_x_9 = A1[1];
+                            unsigned int hm_lo_9 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)hm_x_9, 2);
+                            unsigned int hm_hi_9 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(hm_x_9 >> 32), 2);
+                            unsigned long long hm_o_9 = (unsigned long long)hm_hi_9 << 32 | (unsigned long long)hm_lo_9;
+                            unsigned long long hm_max_9 = ((hm_x_9 > hm_o_9) ? hm_x_9 : hm_o_9);
+                            unsigned long long hm_min_9 = ((hm_x_9 > hm_o_9) ? hm_o_9 : hm_x_9);
+                            A1[1] = (((sl & 2) == 0) ? hm_max_9 : hm_min_9);
+                            unsigned long long hm_x_10 = A1[0];
+                            unsigned int hm_lo_10 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)hm_x_10, 1);
+                            unsigned int hm_hi_10 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(hm_x_10 >> 32), 1);
+                            unsigned long long hm_o_10 = (unsigned long long)hm_hi_10 << 32 | (unsigned long long)hm_lo_10;
+                            unsigned long long hm_max_10 = ((hm_x_10 > hm_o_10) ? hm_x_10 : hm_o_10);
+                            unsigned long long hm_min_10 = ((hm_x_10 > hm_o_10) ? hm_o_10 : hm_x_10);
+                            A1[0] = (((sl & 1) == 0) ? hm_max_10 : hm_min_10);
+                            unsigned long long hm_x_11 = A1[1];
+                            unsigned int hm_lo_11 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)hm_x_11, 1);
+                            unsigned int hm_hi_11 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(hm_x_11 >> 32), 1);
+                            unsigned long long hm_o_11 = (unsigned long long)hm_hi_11 << 32 | (unsigned long long)hm_lo_11;
+                            unsigned long long hm_max_11 = ((hm_x_11 > hm_o_11) ? hm_x_11 : hm_o_11);
+                            unsigned long long hm_min_11 = ((hm_x_11 > hm_o_11) ? hm_o_11 : hm_x_11);
+                            A1[1] = (((sl & 1) == 0) ? hm_max_11 : hm_min_11);
+                            unsigned long long hm_a_1 = A1[0];
+                            unsigned long long hm_b_1 = A1[1];
+                            A1[0] = ((hm_a_1 > hm_b_1) ? hm_a_1 : hm_b_1);
+                            A1[1] = ((hm_a_1 > hm_b_1) ? hm_b_1 : hm_a_1);
+                        }
+                        if (2 < taken && 2 < used) {
+                            A2[0] = ((A2[0] > L2[1]) ? A2[0] : L2[1]);
+                            A2[1] = ((A2[1] > L2[0]) ? A2[1] : L2[0]);
+                            unsigned long long hm_x_12 = A2[0];
+                            unsigned int hm_lo_12 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)hm_x_12, 4);
+                            unsigned int hm_hi_12 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(hm_x_12 >> 32), 4);
+                            unsigned long long hm_o_12 = (unsigned long long)hm_hi_12 << 32 | (unsigned long long)hm_lo_12;
+                            unsigned long long hm_max_12 = ((hm_x_12 > hm_o_12) ? hm_x_12 : hm_o_12);
+                            unsigned long long hm_min_12 = ((hm_x_12 > hm_o_12) ? hm_o_12 : hm_x_12);
+                            A2[0] = (((sl & 4) == 0) ? hm_max_12 : hm_min_12);
+                            unsigned long long hm_x_13 = A2[1];
+                            unsigned int hm_lo_13 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)hm_x_13, 4);
+                            unsigned int hm_hi_13 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(hm_x_13 >> 32), 4);
+                            unsigned long long hm_o_13 = (unsigned long long)hm_hi_13 << 32 | (unsigned long long)hm_lo_13;
+                            unsigned long long hm_max_13 = ((hm_x_13 > hm_o_13) ? hm_x_13 : hm_o_13);
+                            unsigned long long hm_min_13 = ((hm_x_13 > hm_o_13) ? hm_o_13 : hm_x_13);
+                            A2[1] = (((sl & 4) == 0) ? hm_max_13 : hm_min_13);
+                            unsigned long long hm_x_14 = A2[0];
+                            unsigned int hm_lo_14 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)hm_x_14, 2);
+                            unsigned int hm_hi_14 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(hm_x_14 >> 32), 2);
+                            unsigned long long hm_o_14 = (unsigned long long)hm_hi_14 << 32 | (unsigned long long)hm_lo_14;
+                            unsigned long long hm_max_14 = ((hm_x_14 > hm_o_14) ? hm_x_14 : hm_o_14);
+                            unsigned long long hm_min_14 = ((hm_x_14 > hm_o_14) ? hm_o_14 : hm_x_14);
+                            A2[0] = (((sl & 2) == 0) ? hm_max_14 : hm_min_14);
+                            unsigned long long hm_x_15 = A2[1];
+                            unsigned int hm_lo_15 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)hm_x_15, 2);
+                            unsigned int hm_hi_15 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(hm_x_15 >> 32), 2);
+                            unsigned long long hm_o_15 = (unsigned long long)hm_hi_15 << 32 | (unsigned long long)hm_lo_15;
+                            unsigned long long hm_max_15 = ((hm_x_15 > hm_o_15) ? hm_x_15 : hm_o_15);
+                            unsigned long long hm_min_15 = ((hm_x_15 > hm_o_15) ? hm_o_15 : hm_x_15);
+                            A2[1] = (((sl & 2) == 0) ? hm_max_15 : hm_min_15);
+                            unsigned long long hm_x_16 = A2[0];
+                            unsigned int hm_lo_16 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)hm_x_16, 1);
+                            unsigned int hm_hi_16 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(hm_x_16 >> 32), 1);
+                            unsigned long long hm_o_16 = (unsigned long long)hm_hi_16 << 32 | (unsigned long long)hm_lo_16;
+                            unsigned long long hm_max_16 = ((hm_x_16 > hm_o_16) ? hm_x_16 : hm_o_16);
+                            unsigned long long hm_min_16 = ((hm_x_16 > hm_o_16) ? hm_o_16 : hm_x_16);
+                            A2[0] = (((sl & 1) == 0) ? hm_max_16 : hm_min_16);
+                            unsigned long long hm_x_17 = A2[1];
+                            unsigned int hm_lo_17 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)hm_x_17, 1);
+                            unsigned int hm_hi_17 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(hm_x_17 >> 32), 1);
+                            unsigned long long hm_o_17 = (unsigned long long)hm_hi_17 << 32 | (unsigned long long)hm_lo_17;
+                            unsigned long long hm_max_17 = ((hm_x_17 > hm_o_17) ? hm_x_17 : hm_o_17);
+                            unsigned long long hm_min_17 = ((hm_x_17 > hm_o_17) ? hm_o_17 : hm_x_17);
+                            A2[1] = (((sl & 1) == 0) ? hm_max_17 : hm_min_17);
+                            unsigned long long hm_a_2 = A2[0];
+                            unsigned long long hm_b_2 = A2[1];
+                            A2[0] = ((hm_a_2 > hm_b_2) ? hm_a_2 : hm_b_2);
+                            A2[1] = ((hm_a_2 > hm_b_2) ? hm_b_2 : hm_a_2);
+                        }
+                        if (3 < taken && 3 < used) {
+                            A3[0] = ((A3[0] > L3[1]) ? A3[0] : L3[1]);
+                            A3[1] = ((A3[1] > L3[0]) ? A3[1] : L3[0]);
+                            unsigned long long hm_x_18 = A3[0];
+                            unsigned int hm_lo_18 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)hm_x_18, 4);
+                            unsigned int hm_hi_18 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(hm_x_18 >> 32), 4);
+                            unsigned long long hm_o_18 = (unsigned long long)hm_hi_18 << 32 | (unsigned long long)hm_lo_18;
+                            unsigned long long hm_max_18 = ((hm_x_18 > hm_o_18) ? hm_x_18 : hm_o_18);
+                            unsigned long long hm_min_18 = ((hm_x_18 > hm_o_18) ? hm_o_18 : hm_x_18);
+                            A3[0] = (((sl & 4) == 0) ? hm_max_18 : hm_min_18);
+                            unsigned long long hm_x_19 = A3[1];
+                            unsigned int hm_lo_19 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)hm_x_19, 4);
+                            unsigned int hm_hi_19 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(hm_x_19 >> 32), 4);
+                            unsigned long long hm_o_19 = (unsigned long long)hm_hi_19 << 32 | (unsigned long long)hm_lo_19;
+                            unsigned long long hm_max_19 = ((hm_x_19 > hm_o_19) ? hm_x_19 : hm_o_19);
+                            unsigned long long hm_min_19 = ((hm_x_19 > hm_o_19) ? hm_o_19 : hm_x_19);
+                            A3[1] = (((sl & 4) == 0) ? hm_max_19 : hm_min_19);
+                            unsigned long long hm_x_20 = A3[0];
+                            unsigned int hm_lo_20 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)hm_x_20, 2);
+                            unsigned int hm_hi_20 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(hm_x_20 >> 32), 2);
+                            unsigned long long hm_o_20 = (unsigned long long)hm_hi_20 << 32 | (unsigned long long)hm_lo_20;
+                            unsigned long long hm_max_20 = ((hm_x_20 > hm_o_20) ? hm_x_20 : hm_o_20);
+                            unsigned long long hm_min_20 = ((hm_x_20 > hm_o_20) ? hm_o_20 : hm_x_20);
+                            A3[0] = (((sl & 2) == 0) ? hm_max_20 : hm_min_20);
+                            unsigned long long hm_x_21 = A3[1];
+                            unsigned int hm_lo_21 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)hm_x_21, 2);
+                            unsigned int hm_hi_21 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(hm_x_21 >> 32), 2);
+                            unsigned long long hm_o_21 = (unsigned long long)hm_hi_21 << 32 | (unsigned long long)hm_lo_21;
+                            unsigned long long hm_max_21 = ((hm_x_21 > hm_o_21) ? hm_x_21 : hm_o_21);
+                            unsigned long long hm_min_21 = ((hm_x_21 > hm_o_21) ? hm_o_21 : hm_x_21);
+                            A3[1] = (((sl & 2) == 0) ? hm_max_21 : hm_min_21);
+                            unsigned long long hm_x_22 = A3[0];
+                            unsigned int hm_lo_22 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)hm_x_22, 1);
+                            unsigned int hm_hi_22 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(hm_x_22 >> 32), 1);
+                            unsigned long long hm_o_22 = (unsigned long long)hm_hi_22 << 32 | (unsigned long long)hm_lo_22;
+                            unsigned long long hm_max_22 = ((hm_x_22 > hm_o_22) ? hm_x_22 : hm_o_22);
+                            unsigned long long hm_min_22 = ((hm_x_22 > hm_o_22) ? hm_o_22 : hm_x_22);
+                            A3[0] = (((sl & 1) == 0) ? hm_max_22 : hm_min_22);
+                            unsigned long long hm_x_23 = A3[1];
+                            unsigned int hm_lo_23 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)hm_x_23, 1);
+                            unsigned int hm_hi_23 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(hm_x_23 >> 32), 1);
+                            unsigned long long hm_o_23 = (unsigned long long)hm_hi_23 << 32 | (unsigned long long)hm_lo_23;
+                            unsigned long long hm_max_23 = ((hm_x_23 > hm_o_23) ? hm_x_23 : hm_o_23);
+                            unsigned long long hm_min_23 = ((hm_x_23 > hm_o_23) ? hm_o_23 : hm_x_23);
+                            A3[1] = (((sl & 1) == 0) ? hm_max_23 : hm_min_23);
+                            unsigned long long hm_a_3 = A3[0];
+                            unsigned long long hm_b_3 = A3[1];
+                            A3[0] = ((hm_a_3 > hm_b_3) ? hm_a_3 : hm_b_3);
+                            A3[1] = ((hm_a_3 > hm_b_3) ? hm_b_3 : hm_a_3);
+                        }
+                        used = ((used > taken) ? used : taken);
+                    }
+                }
+                if (used > 1) {
+                    unsigned long long hr_x_0 = A1[0];
+                    unsigned int hr_lo_0 = __shfl_sync(0xFFFFFFFF, (unsigned int)hr_x_0, 7 - sl, 8);
+                    unsigned int hr_hi_0 = __shfl_sync(0xFFFFFFFF, (unsigned int)(hr_x_0 >> 32), 7 - sl, 8);
+                    L0[0] = (unsigned long long)hr_hi_0 << 32 | (unsigned long long)hr_lo_0;
+                    unsigned long long hr_x_1 = A1[1];
+                    unsigned int hr_lo_1 = __shfl_sync(0xFFFFFFFF, (unsigned int)hr_x_1, 7 - sl, 8);
+                    unsigned int hr_hi_1 = __shfl_sync(0xFFFFFFFF, (unsigned int)(hr_x_1 >> 32), 7 - sl, 8);
+                    L0[1] = (unsigned long long)hr_hi_1 << 32 | (unsigned long long)hr_lo_1;
+                    R[0] = ((R[0] > L0[1]) ? R[0] : L0[1]);
+                    R[1] = ((R[1] > L0[0]) ? R[1] : L0[0]);
+                    unsigned long long hm_x_24 = R[0];
+                    unsigned int hm_lo_24 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)hm_x_24, 4);
+                    unsigned int hm_hi_24 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(hm_x_24 >> 32), 4);
+                    unsigned long long hm_o_24 = (unsigned long long)hm_hi_24 << 32 | (unsigned long long)hm_lo_24;
+                    unsigned long long hm_max_24 = ((hm_x_24 > hm_o_24) ? hm_x_24 : hm_o_24);
+                    unsigned long long hm_min_24 = ((hm_x_24 > hm_o_24) ? hm_o_24 : hm_x_24);
+                    R[0] = (((sl & 4) == 0) ? hm_max_24 : hm_min_24);
+                    unsigned long long hm_x_25 = R[1];
+                    unsigned int hm_lo_25 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)hm_x_25, 4);
+                    unsigned int hm_hi_25 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(hm_x_25 >> 32), 4);
+                    unsigned long long hm_o_25 = (unsigned long long)hm_hi_25 << 32 | (unsigned long long)hm_lo_25;
+                    unsigned long long hm_max_25 = ((hm_x_25 > hm_o_25) ? hm_x_25 : hm_o_25);
+                    unsigned long long hm_min_25 = ((hm_x_25 > hm_o_25) ? hm_o_25 : hm_x_25);
+                    R[1] = (((sl & 4) == 0) ? hm_max_25 : hm_min_25);
+                    unsigned long long hm_x_26 = R[0];
+                    unsigned int hm_lo_26 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)hm_x_26, 2);
+                    unsigned int hm_hi_26 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(hm_x_26 >> 32), 2);
+                    unsigned long long hm_o_26 = (unsigned long long)hm_hi_26 << 32 | (unsigned long long)hm_lo_26;
+                    unsigned long long hm_max_26 = ((hm_x_26 > hm_o_26) ? hm_x_26 : hm_o_26);
+                    unsigned long long hm_min_26 = ((hm_x_26 > hm_o_26) ? hm_o_26 : hm_x_26);
+                    R[0] = (((sl & 2) == 0) ? hm_max_26 : hm_min_26);
+                    unsigned long long hm_x_27 = R[1];
+                    unsigned int hm_lo_27 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)hm_x_27, 2);
+                    unsigned int hm_hi_27 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(hm_x_27 >> 32), 2);
+                    unsigned long long hm_o_27 = (unsigned long long)hm_hi_27 << 32 | (unsigned long long)hm_lo_27;
+                    unsigned long long hm_max_27 = ((hm_x_27 > hm_o_27) ? hm_x_27 : hm_o_27);
+                    unsigned long long hm_min_27 = ((hm_x_27 > hm_o_27) ? hm_o_27 : hm_x_27);
+                    R[1] = (((sl & 2) == 0) ? hm_max_27 : hm_min_27);
+                    unsigned long long hm_x_28 = R[0];
+                    unsigned int hm_lo_28 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)hm_x_28, 1);
+                    unsigned int hm_hi_28 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(hm_x_28 >> 32), 1);
+                    unsigned long long hm_o_28 = (unsigned long long)hm_hi_28 << 32 | (unsigned long long)hm_lo_28;
+                    unsigned long long hm_max_28 = ((hm_x_28 > hm_o_28) ? hm_x_28 : hm_o_28);
+                    unsigned long long hm_min_28 = ((hm_x_28 > hm_o_28) ? hm_o_28 : hm_x_28);
+                    R[0] = (((sl & 1) == 0) ? hm_max_28 : hm_min_28);
+                    unsigned long long hm_x_29 = R[1];
+                    unsigned int hm_lo_29 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)hm_x_29, 1);
+                    unsigned int hm_hi_29 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(hm_x_29 >> 32), 1);
+                    unsigned long long hm_o_29 = (unsigned long long)hm_hi_29 << 32 | (unsigned long long)hm_lo_29;
+                    unsigned long long hm_max_29 = ((hm_x_29 > hm_o_29) ? hm_x_29 : hm_o_29);
+                    unsigned long long hm_min_29 = ((hm_x_29 > hm_o_29) ? hm_o_29 : hm_x_29);
+                    R[1] = (((sl & 1) == 0) ? hm_max_29 : hm_min_29);
+                    unsigned long long hm_a_4 = R[0];
+                    unsigned long long hm_b_4 = R[1];
+                    R[0] = ((hm_a_4 > hm_b_4) ? hm_a_4 : hm_b_4);
+                    R[1] = ((hm_a_4 > hm_b_4) ? hm_b_4 : hm_a_4);
+                }
+                if (used > 3) {
+                    unsigned long long hr_x_2 = A3[0];
+                    unsigned int hr_lo_2 = __shfl_sync(0xFFFFFFFF, (unsigned int)hr_x_2, 7 - sl, 8);
+                    unsigned int hr_hi_2 = __shfl_sync(0xFFFFFFFF, (unsigned int)(hr_x_2 >> 32), 7 - sl, 8);
+                    L0[0] = (unsigned long long)hr_hi_2 << 32 | (unsigned long long)hr_lo_2;
+                    unsigned long long hr_x_3 = A3[1];
+                    unsigned int hr_lo_3 = __shfl_sync(0xFFFFFFFF, (unsigned int)hr_x_3, 7 - sl, 8);
+                    unsigned int hr_hi_3 = __shfl_sync(0xFFFFFFFF, (unsigned int)(hr_x_3 >> 32), 7 - sl, 8);
+                    L0[1] = (unsigned long long)hr_hi_3 << 32 | (unsigned long long)hr_lo_3;
+                    A2[0] = ((A2[0] > L0[1]) ? A2[0] : L0[1]);
+                    A2[1] = ((A2[1] > L0[0]) ? A2[1] : L0[0]);
+                    unsigned long long hm_x_30 = A2[0];
+                    unsigned int hm_lo_30 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)hm_x_30, 4);
+                    unsigned int hm_hi_30 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(hm_x_30 >> 32), 4);
+                    unsigned long long hm_o_30 = (unsigned long long)hm_hi_30 << 32 | (unsigned long long)hm_lo_30;
+                    unsigned long long hm_max_30 = ((hm_x_30 > hm_o_30) ? hm_x_30 : hm_o_30);
+                    unsigned long long hm_min_30 = ((hm_x_30 > hm_o_30) ? hm_o_30 : hm_x_30);
+                    A2[0] = (((sl & 4) == 0) ? hm_max_30 : hm_min_30);
+                    unsigned long long hm_x_31 = A2[1];
+                    unsigned int hm_lo_31 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)hm_x_31, 4);
+                    unsigned int hm_hi_31 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(hm_x_31 >> 32), 4);
+                    unsigned long long hm_o_31 = (unsigned long long)hm_hi_31 << 32 | (unsigned long long)hm_lo_31;
+                    unsigned long long hm_max_31 = ((hm_x_31 > hm_o_31) ? hm_x_31 : hm_o_31);
+                    unsigned long long hm_min_31 = ((hm_x_31 > hm_o_31) ? hm_o_31 : hm_x_31);
+                    A2[1] = (((sl & 4) == 0) ? hm_max_31 : hm_min_31);
+                    unsigned long long hm_x_32 = A2[0];
+                    unsigned int hm_lo_32 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)hm_x_32, 2);
+                    unsigned int hm_hi_32 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(hm_x_32 >> 32), 2);
+                    unsigned long long hm_o_32 = (unsigned long long)hm_hi_32 << 32 | (unsigned long long)hm_lo_32;
+                    unsigned long long hm_max_32 = ((hm_x_32 > hm_o_32) ? hm_x_32 : hm_o_32);
+                    unsigned long long hm_min_32 = ((hm_x_32 > hm_o_32) ? hm_o_32 : hm_x_32);
+                    A2[0] = (((sl & 2) == 0) ? hm_max_32 : hm_min_32);
+                    unsigned long long hm_x_33 = A2[1];
+                    unsigned int hm_lo_33 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)hm_x_33, 2);
+                    unsigned int hm_hi_33 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(hm_x_33 >> 32), 2);
+                    unsigned long long hm_o_33 = (unsigned long long)hm_hi_33 << 32 | (unsigned long long)hm_lo_33;
+                    unsigned long long hm_max_33 = ((hm_x_33 > hm_o_33) ? hm_x_33 : hm_o_33);
+                    unsigned long long hm_min_33 = ((hm_x_33 > hm_o_33) ? hm_o_33 : hm_x_33);
+                    A2[1] = (((sl & 2) == 0) ? hm_max_33 : hm_min_33);
+                    unsigned long long hm_x_34 = A2[0];
+                    unsigned int hm_lo_34 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)hm_x_34, 1);
+                    unsigned int hm_hi_34 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(hm_x_34 >> 32), 1);
+                    unsigned long long hm_o_34 = (unsigned long long)hm_hi_34 << 32 | (unsigned long long)hm_lo_34;
+                    unsigned long long hm_max_34 = ((hm_x_34 > hm_o_34) ? hm_x_34 : hm_o_34);
+                    unsigned long long hm_min_34 = ((hm_x_34 > hm_o_34) ? hm_o_34 : hm_x_34);
+                    A2[0] = (((sl & 1) == 0) ? hm_max_34 : hm_min_34);
+                    unsigned long long hm_x_35 = A2[1];
+                    unsigned int hm_lo_35 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)hm_x_35, 1);
+                    unsigned int hm_hi_35 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(hm_x_35 >> 32), 1);
+                    unsigned long long hm_o_35 = (unsigned long long)hm_hi_35 << 32 | (unsigned long long)hm_lo_35;
+                    unsigned long long hm_max_35 = ((hm_x_35 > hm_o_35) ? hm_x_35 : hm_o_35);
+                    unsigned long long hm_min_35 = ((hm_x_35 > hm_o_35) ? hm_o_35 : hm_x_35);
+                    A2[1] = (((sl & 1) == 0) ? hm_max_35 : hm_min_35);
+                    unsigned long long hm_a_5 = A2[0];
+                    unsigned long long hm_b_5 = A2[1];
+                    A2[0] = ((hm_a_5 > hm_b_5) ? hm_a_5 : hm_b_5);
+                    A2[1] = ((hm_a_5 > hm_b_5) ? hm_b_5 : hm_a_5);
+                }
+                if (used > 2) {
+                    unsigned long long hr_x_4 = A2[0];
+                    unsigned int hr_lo_4 = __shfl_sync(0xFFFFFFFF, (unsigned int)hr_x_4, 7 - sl, 8);
+                    unsigned int hr_hi_4 = __shfl_sync(0xFFFFFFFF, (unsigned int)(hr_x_4 >> 32), 7 - sl, 8);
+                    L0[0] = (unsigned long long)hr_hi_4 << 32 | (unsigned long long)hr_lo_4;
+                    unsigned long long hr_x_5 = A2[1];
+                    unsigned int hr_lo_5 = __shfl_sync(0xFFFFFFFF, (unsigned int)hr_x_5, 7 - sl, 8);
+                    unsigned int hr_hi_5 = __shfl_sync(0xFFFFFFFF, (unsigned int)(hr_x_5 >> 32), 7 - sl, 8);
+                    L0[1] = (unsigned long long)hr_hi_5 << 32 | (unsigned long long)hr_lo_5;
+                    R[0] = ((R[0] > L0[1]) ? R[0] : L0[1]);
+                    R[1] = ((R[1] > L0[0]) ? R[1] : L0[0]);
+                    unsigned long long hm_x_36 = R[0];
+                    unsigned int hm_lo_36 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)hm_x_36, 4);
+                    unsigned int hm_hi_36 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(hm_x_36 >> 32), 4);
+                    unsigned long long hm_o_36 = (unsigned long long)hm_hi_36 << 32 | (unsigned long long)hm_lo_36;
+                    unsigned long long hm_max_36 = ((hm_x_36 > hm_o_36) ? hm_x_36 : hm_o_36);
+                    unsigned long long hm_min_36 = ((hm_x_36 > hm_o_36) ? hm_o_36 : hm_x_36);
+                    R[0] = (((sl & 4) == 0) ? hm_max_36 : hm_min_36);
+                    unsigned long long hm_x_37 = R[1];
+                    unsigned int hm_lo_37 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)hm_x_37, 4);
+                    unsigned int hm_hi_37 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(hm_x_37 >> 32), 4);
+                    unsigned long long hm_o_37 = (unsigned long long)hm_hi_37 << 32 | (unsigned long long)hm_lo_37;
+                    unsigned long long hm_max_37 = ((hm_x_37 > hm_o_37) ? hm_x_37 : hm_o_37);
+                    unsigned long long hm_min_37 = ((hm_x_37 > hm_o_37) ? hm_o_37 : hm_x_37);
+                    R[1] = (((sl & 4) == 0) ? hm_max_37 : hm_min_37);
+                    unsigned long long hm_x_38 = R[0];
+                    unsigned int hm_lo_38 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)hm_x_38, 2);
+                    unsigned int hm_hi_38 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(hm_x_38 >> 32), 2);
+                    unsigned long long hm_o_38 = (unsigned long long)hm_hi_38 << 32 | (unsigned long long)hm_lo_38;
+                    unsigned long long hm_max_38 = ((hm_x_38 > hm_o_38) ? hm_x_38 : hm_o_38);
+                    unsigned long long hm_min_38 = ((hm_x_38 > hm_o_38) ? hm_o_38 : hm_x_38);
+                    R[0] = (((sl & 2) == 0) ? hm_max_38 : hm_min_38);
+                    unsigned long long hm_x_39 = R[1];
+                    unsigned int hm_lo_39 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)hm_x_39, 2);
+                    unsigned int hm_hi_39 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(hm_x_39 >> 32), 2);
+                    unsigned long long hm_o_39 = (unsigned long long)hm_hi_39 << 32 | (unsigned long long)hm_lo_39;
+                    unsigned long long hm_max_39 = ((hm_x_39 > hm_o_39) ? hm_x_39 : hm_o_39);
+                    unsigned long long hm_min_39 = ((hm_x_39 > hm_o_39) ? hm_o_39 : hm_x_39);
+                    R[1] = (((sl & 2) == 0) ? hm_max_39 : hm_min_39);
+                    unsigned long long hm_x_40 = R[0];
+                    unsigned int hm_lo_40 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)hm_x_40, 1);
+                    unsigned int hm_hi_40 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(hm_x_40 >> 32), 1);
+                    unsigned long long hm_o_40 = (unsigned long long)hm_hi_40 << 32 | (unsigned long long)hm_lo_40;
+                    unsigned long long hm_max_40 = ((hm_x_40 > hm_o_40) ? hm_x_40 : hm_o_40);
+                    unsigned long long hm_min_40 = ((hm_x_40 > hm_o_40) ? hm_o_40 : hm_x_40);
+                    R[0] = (((sl & 1) == 0) ? hm_max_40 : hm_min_40);
+                    unsigned long long hm_x_41 = R[1];
+                    unsigned int hm_lo_41 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)hm_x_41, 1);
+                    unsigned int hm_hi_41 = __shfl_xor_sync(0xFFFFFFFF, (unsigned int)(hm_x_41 >> 32), 1);
+                    unsigned long long hm_o_41 = (unsigned long long)hm_hi_41 << 32 | (unsigned long long)hm_lo_41;
+                    unsigned long long hm_max_41 = ((hm_x_41 > hm_o_41) ? hm_x_41 : hm_o_41);
+                    unsigned long long hm_min_41 = ((hm_x_41 > hm_o_41) ? hm_o_41 : hm_x_41);
+                    R[1] = (((sl & 1) == 0) ? hm_max_41 : hm_min_41);
+                    unsigned long long hm_a_6 = R[0];
+                    unsigned long long hm_b_6 = R[1];
+                    R[0] = ((hm_a_6 > hm_b_6) ? hm_a_6 : hm_b_6);
+                    R[1] = ((hm_a_6 > hm_b_6) ? hm_b_6 : hm_a_6);
+                }
             }
         }
         asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
-        unsigned long long mine = R[0];
-        mine = ((lane_1 == 1) ? R[1] : mine);
-        mine = ((lane_1 == 2) ? R[2] : mine);
-        mine = ((lane_1 == 3) ? R[3] : mine);
-        mine = ((lane_1 == 4) ? R[4] : mine);
-        mine = ((lane_1 == 5) ? R[5] : mine);
-        mine = ((lane_1 == 6) ? R[6] : mine);
-        mine = ((lane_1 == 7) ? R[7] : mine);
-        mine = ((lane_1 == 8) ? R[8] : mine);
-        mine = ((lane_1 == 9) ? R[9] : mine);
-        mine = ((lane_1 == 10) ? R[10] : mine);
-        mine = ((lane_1 == 11) ? R[11] : mine);
-        mine = ((lane_1 == 12) ? R[12] : mine);
-        mine = ((lane_1 == 13) ? R[13] : mine);
-        mine = ((lane_1 == 14) ? R[14] : mine);
-        mine = ((lane_1 == 15) ? R[15] : mine);
-        int pad = (int)(mine == 0);
-        int g_me = ((pad == 0) ? 2147483647 - (int)(mine & 2147483647) : 2147483647);
-        int pos = 0;
-        int g_i_0 = ((R[0] != 0) ? 2147483647 - (int)(R[0] & 2147483647) : 2147483647);
-        pos = pos + (int)(g_i_0 < g_me || g_i_0 == g_me && lane_1 > 0);
-        int g_i_1 = ((R[1] != 0) ? 2147483647 - (int)(R[1] & 2147483647) : 2147483647);
-        pos = pos + (int)(g_i_1 < g_me || g_i_1 == g_me && lane_1 > 1);
-        int g_i_2 = ((R[2] != 0) ? 2147483647 - (int)(R[2] & 2147483647) : 2147483647);
-        pos = pos + (int)(g_i_2 < g_me || g_i_2 == g_me && lane_1 > 2);
-        int g_i_3 = ((R[3] != 0) ? 2147483647 - (int)(R[3] & 2147483647) : 2147483647);
-        pos = pos + (int)(g_i_3 < g_me || g_i_3 == g_me && lane_1 > 3);
-        int g_i_4 = ((R[4] != 0) ? 2147483647 - (int)(R[4] & 2147483647) : 2147483647);
-        pos = pos + (int)(g_i_4 < g_me || g_i_4 == g_me && lane_1 > 4);
-        int g_i_5 = ((R[5] != 0) ? 2147483647 - (int)(R[5] & 2147483647) : 2147483647);
-        pos = pos + (int)(g_i_5 < g_me || g_i_5 == g_me && lane_1 > 5);
-        int g_i_6 = ((R[6] != 0) ? 2147483647 - (int)(R[6] & 2147483647) : 2147483647);
-        pos = pos + (int)(g_i_6 < g_me || g_i_6 == g_me && lane_1 > 6);
-        int g_i_7 = ((R[7] != 0) ? 2147483647 - (int)(R[7] & 2147483647) : 2147483647);
-        pos = pos + (int)(g_i_7 < g_me || g_i_7 == g_me && lane_1 > 7);
-        int g_i_8 = ((R[8] != 0) ? 2147483647 - (int)(R[8] & 2147483647) : 2147483647);
-        pos = pos + (int)(g_i_8 < g_me || g_i_8 == g_me && lane_1 > 8);
-        int g_i_9 = ((R[9] != 0) ? 2147483647 - (int)(R[9] & 2147483647) : 2147483647);
-        pos = pos + (int)(g_i_9 < g_me || g_i_9 == g_me && lane_1 > 9);
-        int g_i_10 = ((R[10] != 0) ? 2147483647 - (int)(R[10] & 2147483647) : 2147483647);
-        pos = pos + (int)(g_i_10 < g_me || g_i_10 == g_me && lane_1 > 10);
-        int g_i_11 = ((R[11] != 0) ? 2147483647 - (int)(R[11] & 2147483647) : 2147483647);
-        pos = pos + (int)(g_i_11 < g_me || g_i_11 == g_me && lane_1 > 11);
-        int g_i_12 = ((R[12] != 0) ? 2147483647 - (int)(R[12] & 2147483647) : 2147483647);
-        pos = pos + (int)(g_i_12 < g_me || g_i_12 == g_me && lane_1 > 12);
-        int g_i_13 = ((R[13] != 0) ? 2147483647 - (int)(R[13] & 2147483647) : 2147483647);
-        pos = pos + (int)(g_i_13 < g_me || g_i_13 == g_me && lane_1 > 13);
-        int g_i_14 = ((R[14] != 0) ? 2147483647 - (int)(R[14] & 2147483647) : 2147483647);
-        pos = pos + (int)(g_i_14 < g_me || g_i_14 == g_me && lane_1 > 14);
-        int g_i_15 = ((R[15] != 0) ? 2147483647 - (int)(R[15] & 2147483647) : 2147483647);
-        pos = pos + (int)(g_i_15 < g_me || g_i_15 == g_me && lane_1 > 15);
-        unsigned int o32 = (unsigned int)(mine >> 31);
-        unsigned int ob = ((o32 >= 2147483648u) ? o32 ^ 2147483648u : ~o32);
-        int bits = ((pad == 0) ? (int)ob : -8388608);
-        int gid = ((pad == 0) ? g_me : -1);
+        int g[2];
+        int pos[2];
+        g[0] = ((R[0] != 0) ? 2147483647 - (int)(R[0] & 2147483647) : 2147483647);
+        pos[0] = 0;
+        g[1] = ((R[1] != 0) ? 2147483647 - (int)(R[1] & 2147483647) : 2147483647);
+        pos[1] = 0;
+        int g_i_0 = __shfl_sync(0xFFFFFFFF, g[0], 0, 8);
+        pos[0] = pos[0] + (int)(g_i_0 < g[0] || g_i_0 == g[0] && 2 * sl > 0);
+        pos[1] = pos[1] + (int)(g_i_0 < g[1] || g_i_0 == g[1] && 2 * sl + 1 > 0);
+        int g_i_1 = __shfl_sync(0xFFFFFFFF, g[1], 0, 8);
+        pos[0] = pos[0] + (int)(g_i_1 < g[0] || g_i_1 == g[0] && 2 * sl > 1);
+        pos[1] = pos[1] + (int)(g_i_1 < g[1] || g_i_1 == g[1] && 2 * sl + 1 > 1);
+        int g_i_2 = __shfl_sync(0xFFFFFFFF, g[0], 1, 8);
+        pos[0] = pos[0] + (int)(g_i_2 < g[0] || g_i_2 == g[0] && 2 * sl > 2);
+        pos[1] = pos[1] + (int)(g_i_2 < g[1] || g_i_2 == g[1] && 2 * sl + 1 > 2);
+        int g_i_3 = __shfl_sync(0xFFFFFFFF, g[1], 1, 8);
+        pos[0] = pos[0] + (int)(g_i_3 < g[0] || g_i_3 == g[0] && 2 * sl > 3);
+        pos[1] = pos[1] + (int)(g_i_3 < g[1] || g_i_3 == g[1] && 2 * sl + 1 > 3);
+        int g_i_4 = __shfl_sync(0xFFFFFFFF, g[0], 2, 8);
+        pos[0] = pos[0] + (int)(g_i_4 < g[0] || g_i_4 == g[0] && 2 * sl > 4);
+        pos[1] = pos[1] + (int)(g_i_4 < g[1] || g_i_4 == g[1] && 2 * sl + 1 > 4);
+        int g_i_5 = __shfl_sync(0xFFFFFFFF, g[1], 2, 8);
+        pos[0] = pos[0] + (int)(g_i_5 < g[0] || g_i_5 == g[0] && 2 * sl > 5);
+        pos[1] = pos[1] + (int)(g_i_5 < g[1] || g_i_5 == g[1] && 2 * sl + 1 > 5);
+        int g_i_6 = __shfl_sync(0xFFFFFFFF, g[0], 3, 8);
+        pos[0] = pos[0] + (int)(g_i_6 < g[0] || g_i_6 == g[0] && 2 * sl > 6);
+        pos[1] = pos[1] + (int)(g_i_6 < g[1] || g_i_6 == g[1] && 2 * sl + 1 > 6);
+        int g_i_7 = __shfl_sync(0xFFFFFFFF, g[1], 3, 8);
+        pos[0] = pos[0] + (int)(g_i_7 < g[0] || g_i_7 == g[0] && 2 * sl > 7);
+        pos[1] = pos[1] + (int)(g_i_7 < g[1] || g_i_7 == g[1] && 2 * sl + 1 > 7);
+        int g_i_8 = __shfl_sync(0xFFFFFFFF, g[0], 4, 8);
+        pos[0] = pos[0] + (int)(g_i_8 < g[0] || g_i_8 == g[0] && 2 * sl > 8);
+        pos[1] = pos[1] + (int)(g_i_8 < g[1] || g_i_8 == g[1] && 2 * sl + 1 > 8);
+        int g_i_9 = __shfl_sync(0xFFFFFFFF, g[1], 4, 8);
+        pos[0] = pos[0] + (int)(g_i_9 < g[0] || g_i_9 == g[0] && 2 * sl > 9);
+        pos[1] = pos[1] + (int)(g_i_9 < g[1] || g_i_9 == g[1] && 2 * sl + 1 > 9);
+        int g_i_10 = __shfl_sync(0xFFFFFFFF, g[0], 5, 8);
+        pos[0] = pos[0] + (int)(g_i_10 < g[0] || g_i_10 == g[0] && 2 * sl > 10);
+        pos[1] = pos[1] + (int)(g_i_10 < g[1] || g_i_10 == g[1] && 2 * sl + 1 > 10);
+        int g_i_11 = __shfl_sync(0xFFFFFFFF, g[1], 5, 8);
+        pos[0] = pos[0] + (int)(g_i_11 < g[0] || g_i_11 == g[0] && 2 * sl > 11);
+        pos[1] = pos[1] + (int)(g_i_11 < g[1] || g_i_11 == g[1] && 2 * sl + 1 > 11);
+        int g_i_12 = __shfl_sync(0xFFFFFFFF, g[0], 6, 8);
+        pos[0] = pos[0] + (int)(g_i_12 < g[0] || g_i_12 == g[0] && 2 * sl > 12);
+        pos[1] = pos[1] + (int)(g_i_12 < g[1] || g_i_12 == g[1] && 2 * sl + 1 > 12);
+        int g_i_13 = __shfl_sync(0xFFFFFFFF, g[1], 6, 8);
+        pos[0] = pos[0] + (int)(g_i_13 < g[0] || g_i_13 == g[0] && 2 * sl > 13);
+        pos[1] = pos[1] + (int)(g_i_13 < g[1] || g_i_13 == g[1] && 2 * sl + 1 > 13);
+        int g_i_14 = __shfl_sync(0xFFFFFFFF, g[0], 7, 8);
+        pos[0] = pos[0] + (int)(g_i_14 < g[0] || g_i_14 == g[0] && 2 * sl > 14);
+        pos[1] = pos[1] + (int)(g_i_14 < g[1] || g_i_14 == g[1] && 2 * sl + 1 > 14);
+        int g_i_15 = __shfl_sync(0xFFFFFFFF, g[1], 7, 8);
+        pos[0] = pos[0] + (int)(g_i_15 < g[0] || g_i_15 == g[0] && 2 * sl > 15);
+        pos[1] = pos[1] + (int)(g_i_15 < g[1] || g_i_15 == g[1] && 2 * sl + 1 > 15);
         int* crow = carrier + ((long long)h * carrier_stride_h + (long long)t * carrier_stride_t);
-        if (lane_1 < 16) {
-            crow[pos] = bits;
-            crow[16 + pos] = gid;
-        }
+        unsigned int o32_0 = (unsigned int)(R[0] >> 31);
+        unsigned int ob_0 = ((o32_0 >= 2147483648u) ? o32_0 ^ 2147483648u : ~o32_0);
+        crow[pos[0]] = ((R[0] != 0) ? (int)ob_0 : -8388608);
+        crow[16 + pos[0]] = ((R[0] != 0) ? g[0] : -1);
+        unsigned int o32_1 = (unsigned int)(R[1] >> 31);
+        unsigned int ob_1 = ((o32_1 >= 2147483648u) ? o32_1 ^ 2147483648u : ~o32_1);
+        crow[pos[1]] = ((R[1] != 0) ? (int)ob_1 : -8388608);
+        crow[16 + pos[1]] = ((R[1] != 0) ? g[1] : -1);
         __syncwarp();
-        if (lane_1 == 0) {
+        if (sl == 0) {
             crow[32] = 1;
         }
     }

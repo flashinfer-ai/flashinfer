@@ -78,7 +78,7 @@ kernel_cake_msa_icp_indexer_c52df55290af4f4eb793(float* __restrict__ scores, int
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     unsigned int* slab_k = reinterpret_cast<unsigned int*>(smem_raw + 0);
     const int slab_k_addr = smem + 0;
     int* slab_c = reinterpret_cast<int*>(smem_raw + 1024);

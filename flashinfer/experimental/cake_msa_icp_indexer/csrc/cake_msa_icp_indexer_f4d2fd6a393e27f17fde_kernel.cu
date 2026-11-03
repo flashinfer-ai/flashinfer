@@ -169,7 +169,7 @@ __device__ __forceinline__ void tma_2d_gmem2smem(
 
 __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
     uint32_t result;
-    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xffffffff;"
+    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xFFFFFFFF;"
         : "=r"(result) : "r"(val));
     return result;
 }
@@ -205,14 +205,15 @@ kernel_cake_msa_icp_indexer_f4d2fd6a393e27f17fde(const __grid_constant__ CUtenso
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     uint8_t* smem_q = reinterpret_cast<uint8_t*>(smem_raw + 1024);
     const int smem_q_addr = smem + 1024;
     uint8_t* smem_k = reinterpret_cast<uint8_t*>(smem_raw + 66560);
     const int smem_k_addr = smem + 66560;
+    unsigned long long* sbuf = reinterpret_cast<unsigned long long*>(smem_raw + 197632);
+    const int sbuf_addr = smem + 197632;
 
-    // Mbarrier init (6 pipeline groups, 0 ordered-sequence groups, 24 barriers)
-    // Mbarriers at smem_raw[0..192)
+    // Mbarrier init (24 barriers at smem_raw[0..192))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -268,14 +269,14 @@ kernel_cake_msa_icp_indexer_f4d2fd6a393e27f17fde(const __grid_constant__ CUtenso
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_acc = taddr;
+    const unsigned int tq_0 = taddr + 256;
+    const unsigned int tq_1 = taddr + 288;
+    const unsigned int tq_2 = taddr + 320;
+    const unsigned int tq_3 = taddr + 352;
 
     // Kernel post-init ops
-    const int tmem_acc = taddr;
-    const int tq_0 = taddr + 256;
-    const int tq_1 = taddr + 288;
-    const int tq_2 = taddr + 320;
-    const int tq_3 = taddr + 352;
     asm volatile("griddepcontrol.wait;" ::: "memory");
 
     // ---- Role: epi ----
@@ -298,6 +299,7 @@ kernel_cake_msa_icp_indexer_f4d2fd6a393e27f17fde(const __grid_constant__ CUtenso
             if (compact == 0) {
                 wcols = 2;
             }
+            int te = warp * 32 + lane_1;
             int lpc_n = ((force_begin > own) ? (force_begin - 1 - own >> 1) + 1 : 0);
             int lfb = lpc_n;
             unsigned long long top[16];
@@ -349,14 +351,6 @@ kernel_cake_msa_icp_indexer_f4d2fd6a393e27f17fde(const __grid_constant__ CUtenso
                     top[13] = 0;
                     top[14] = 0;
                     top[15] = 0;
-                    buf[0] = 0;
-                    buf[1] = 0;
-                    buf[2] = 0;
-                    buf[3] = 0;
-                    buf[4] = 0;
-                    buf[5] = 0;
-                    buf[6] = 0;
-                    buf[7] = 0;
                     cnt = 0;
                     int use_stage = 0;
                     int windows[2];
@@ -401,6 +395,9 @@ kernel_cake_msa_icp_indexer_f4d2fd6a393e27f17fde(const __grid_constant__ CUtenso
                                 unsigned int tile_addr_0 = taddr + lane_base + (unsigned int)wg * 128;
                                 float vg_0[64];
                                 float mrun_0 = -CUDART_INF_F;
+                                int pl_0 = kt_0 + 1 - 1;
+                                int nvl_0 = ((u_0 - 256 * pl_0 - 128 * rank) > (0) ? (u_0 - 256 * pl_0 - 128 * rank) : (0));
+                                int partial_0 = __any_sync(0xFFFFFFFF, nvl_0 < 128);
                                 float pm_0 = -CUDART_INF_F;
                                 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1000)
                                 #error "TmemLoadRed requires tcgen05.ld.red support (sm_103/sm_101-sm_110 family), not sm_100"
@@ -411,138 +408,140 @@ kernel_cake_msa_icp_indexer_f4d2fd6a393e27f17fde(const __grid_constant__ CUtenso
                                     : "=f"(vg_0[0]), "=f"(vg_0[1]), "=f"(vg_0[2]), "=f"(vg_0[3]), "=f"(vg_0[4]), "=f"(vg_0[5]), "=f"(vg_0[6]), "=f"(vg_0[7]), "=f"(vg_0[8]), "=f"(vg_0[9]), "=f"(vg_0[10]), "=f"(vg_0[11]), "=f"(vg_0[12]), "=f"(vg_0[13]), "=f"(vg_0[14]), "=f"(vg_0[15]), "=f"(vg_0[16]), "=f"(vg_0[17]), "=f"(vg_0[18]), "=f"(vg_0[19]), "=f"(vg_0[20]), "=f"(vg_0[21]), "=f"(vg_0[22]), "=f"(vg_0[23]), "=f"(vg_0[24]), "=f"(vg_0[25]), "=f"(vg_0[26]), "=f"(vg_0[27]), "=f"(vg_0[28]), "=f"(vg_0[29]), "=f"(vg_0[30]), "=f"(vg_0[31]), "=f"(vg_0[32]), "=f"(vg_0[33]), "=f"(vg_0[34]), "=f"(vg_0[35]), "=f"(vg_0[36]), "=f"(vg_0[37]), "=f"(vg_0[38]), "=f"(vg_0[39]), "=f"(vg_0[40]), "=f"(vg_0[41]), "=f"(vg_0[42]), "=f"(vg_0[43]), "=f"(vg_0[44]), "=f"(vg_0[45]), "=f"(vg_0[46]), "=f"(vg_0[47]), "=f"(vg_0[48]), "=f"(vg_0[49]), "=f"(vg_0[50]), "=f"(vg_0[51]), "=f"(vg_0[52]), "=f"(vg_0[53]), "=f"(vg_0[54]), "=f"(vg_0[55]), "=f"(vg_0[56]), "=f"(vg_0[57]), "=f"(vg_0[58]), "=f"(vg_0[59]), "=f"(vg_0[60]), "=f"(vg_0[61]), "=f"(vg_0[62]), "=f"(vg_0[63]), "=f"(pm_0)
                                     : "r"(tile_addr_0 + 0));
                                 asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
-                                int p_0 = kt_0;
-                                int nvis_0 = ((u_0 - 256 * p_0 - 128 * rank) > (0) ? (u_0 - 256 * p_0 - 128 * rank) : (0));
                                 float mp_0 = -CUDART_INF_F;
-                                int masked_0 = 1;
                                 mp_0 = pm_0;
-                                int _warp_vote_6 = __any_sync(0xFFFFFFFF, nvis_0 < 64);
-                                masked_0 = _warp_vote_6;
-                                if (masked_0 != 0) {
-                                    mp_0 = -CUDART_INF_F;
-                                    int _warp_vote_7 = __any_sync(0xFFFFFFFF, nvis_0 < 32);
-                                    if (_warp_vote_7 != 0) {
-                                        uint32_t _thresh_mask_8;
-                                        {
-                                            int _lim_9 = nvis_0;
-                                            if (_lim_9 <= 0) { _thresh_mask_8 = 0u; }
-                                            else if (_lim_9 >= 32) { _thresh_mask_8 = 0xFFFFFFFFu; }
-                                            else {
-                                                asm volatile("{"
-                                                    ".reg .u32 t;\n\t"
-                                                    "shl.b32 t, 1, %1;\n\t"
-                                                    "add.u32 %0, t, -1;\n\t"
-                                                    "}" : "=r"(_thresh_mask_8) : "r"(_lim_9));
+                                if (partial_0 != 0) {
+                                    int p_0 = kt_0;
+                                    int nvis_0 = ((u_0 - 256 * p_0 - 128 * rank) > (0) ? (u_0 - 256 * p_0 - 128 * rank) : (0));
+                                    int masked_0 = 1;
+                                    int _warp_vote_6 = __any_sync(0xFFFFFFFF, nvis_0 < 64);
+                                    masked_0 = _warp_vote_6;
+                                    if (masked_0 != 0) {
+                                        mp_0 = -CUDART_INF_F;
+                                        int _warp_vote_7 = __any_sync(0xFFFFFFFF, nvis_0 < 32);
+                                        if (_warp_vote_7 != 0) {
+                                            uint32_t _thresh_mask_8;
+                                            {
+                                                int _lim_9 = nvis_0;
+                                                if (_lim_9 <= 0) { _thresh_mask_8 = 0u; }
+                                                else if (_lim_9 >= 32) { _thresh_mask_8 = 0xFFFFFFFFu; }
+                                                else {
+                                                    asm volatile("{"
+                                                        ".reg .u32 t;\n\t"
+                                                        "shl.b32 t, 1, %1;\n\t"
+                                                        "add.u32 %0, t, -1;\n\t"
+                                                        "}" : "=r"(_thresh_mask_8) : "r"(_lim_9));
+                                                }
                                             }
+                                            if (!(_thresh_mask_8 & (1u << 0))) vg_0[0] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_8 & (1u << 1))) vg_0[1] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_8 & (1u << 2))) vg_0[2] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_8 & (1u << 3))) vg_0[3] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_8 & (1u << 4))) vg_0[4] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_8 & (1u << 5))) vg_0[5] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_8 & (1u << 6))) vg_0[6] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_8 & (1u << 7))) vg_0[7] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_8 & (1u << 8))) vg_0[8] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_8 & (1u << 9))) vg_0[9] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_8 & (1u << 10))) vg_0[10] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_8 & (1u << 11))) vg_0[11] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_8 & (1u << 12))) vg_0[12] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_8 & (1u << 13))) vg_0[13] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_8 & (1u << 14))) vg_0[14] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_8 & (1u << 15))) vg_0[15] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_8 & (1u << 16))) vg_0[16] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_8 & (1u << 17))) vg_0[17] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_8 & (1u << 18))) vg_0[18] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_8 & (1u << 19))) vg_0[19] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_8 & (1u << 20))) vg_0[20] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_8 & (1u << 21))) vg_0[21] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_8 & (1u << 22))) vg_0[22] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_8 & (1u << 23))) vg_0[23] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_8 & (1u << 24))) vg_0[24] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_8 & (1u << 25))) vg_0[25] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_8 & (1u << 26))) vg_0[26] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_8 & (1u << 27))) vg_0[27] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_8 & (1u << 28))) vg_0[28] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_8 & (1u << 29))) vg_0[29] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_8 & (1u << 30))) vg_0[30] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_8 & (1u << 31))) vg_0[31] = -CUDART_INF_F;
                                         }
-                                        if (!(_thresh_mask_8 & (1u << 0))) vg_0[0] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_8 & (1u << 1))) vg_0[1] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_8 & (1u << 2))) vg_0[2] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_8 & (1u << 3))) vg_0[3] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_8 & (1u << 4))) vg_0[4] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_8 & (1u << 5))) vg_0[5] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_8 & (1u << 6))) vg_0[6] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_8 & (1u << 7))) vg_0[7] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_8 & (1u << 8))) vg_0[8] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_8 & (1u << 9))) vg_0[9] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_8 & (1u << 10))) vg_0[10] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_8 & (1u << 11))) vg_0[11] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_8 & (1u << 12))) vg_0[12] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_8 & (1u << 13))) vg_0[13] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_8 & (1u << 14))) vg_0[14] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_8 & (1u << 15))) vg_0[15] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_8 & (1u << 16))) vg_0[16] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_8 & (1u << 17))) vg_0[17] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_8 & (1u << 18))) vg_0[18] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_8 & (1u << 19))) vg_0[19] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_8 & (1u << 20))) vg_0[20] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_8 & (1u << 21))) vg_0[21] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_8 & (1u << 22))) vg_0[22] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_8 & (1u << 23))) vg_0[23] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_8 & (1u << 24))) vg_0[24] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_8 & (1u << 25))) vg_0[25] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_8 & (1u << 26))) vg_0[26] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_8 & (1u << 27))) vg_0[27] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_8 & (1u << 28))) vg_0[28] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_8 & (1u << 29))) vg_0[29] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_8 & (1u << 30))) vg_0[30] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_8 & (1u << 31))) vg_0[31] = -CUDART_INF_F;
-                                    }
-                                    float part_0 = -CUDART_INF_F;
-                                    float2 _reg_reduce_max2_11 = {-CUDART_INF_F, -CUDART_INF_F};
-                                    _reg_reduce_max2_11.x = max_noftz(_reg_reduce_max2_11.x, max_noftz(vg_0[0], vg_0[1]));
-                                    _reg_reduce_max2_11.y = max_noftz(_reg_reduce_max2_11.y, max_noftz(vg_0[2], vg_0[3]));
-                                    _reg_reduce_max2_11.x = max_noftz(_reg_reduce_max2_11.x, max_noftz(vg_0[4], vg_0[5]));
-                                    _reg_reduce_max2_11.y = max_noftz(_reg_reduce_max2_11.y, max_noftz(vg_0[6], vg_0[7]));
-                                    _reg_reduce_max2_11.x = max_noftz(_reg_reduce_max2_11.x, max_noftz(vg_0[8], vg_0[9]));
-                                    _reg_reduce_max2_11.y = max_noftz(_reg_reduce_max2_11.y, max_noftz(vg_0[10], vg_0[11]));
-                                    _reg_reduce_max2_11.x = max_noftz(_reg_reduce_max2_11.x, max_noftz(vg_0[12], vg_0[13]));
-                                    _reg_reduce_max2_11.y = max_noftz(_reg_reduce_max2_11.y, max_noftz(vg_0[14], vg_0[15]));
-                                    _reg_reduce_max2_11.x = max_noftz(_reg_reduce_max2_11.x, max_noftz(vg_0[16], vg_0[17]));
-                                    _reg_reduce_max2_11.y = max_noftz(_reg_reduce_max2_11.y, max_noftz(vg_0[18], vg_0[19]));
-                                    _reg_reduce_max2_11.x = max_noftz(_reg_reduce_max2_11.x, max_noftz(vg_0[20], vg_0[21]));
-                                    _reg_reduce_max2_11.y = max_noftz(_reg_reduce_max2_11.y, max_noftz(vg_0[22], vg_0[23]));
-                                    _reg_reduce_max2_11.x = max_noftz(_reg_reduce_max2_11.x, max_noftz(vg_0[24], vg_0[25]));
-                                    _reg_reduce_max2_11.y = max_noftz(_reg_reduce_max2_11.y, max_noftz(vg_0[26], vg_0[27]));
-                                    _reg_reduce_max2_11.x = max_noftz(_reg_reduce_max2_11.x, max_noftz(vg_0[28], vg_0[29]));
-                                    _reg_reduce_max2_11.y = max_noftz(_reg_reduce_max2_11.y, max_noftz(vg_0[30], vg_0[31]));
-                                    float _reg_array_reduce_10 = row_max_reduce(_reg_reduce_max2_11);
-                                    part_0 = _reg_array_reduce_10;
-                                    mp_0 = fmaxf(mp_0, part_0);
-                                    int _warp_vote_12 = __any_sync(0xFFFFFFFF, nvis_0 < 64);
-                                    if (_warp_vote_12 != 0) {
-                                        uint32_t _thresh_mask_13;
-                                        {
-                                            int _lim_14 = nvis_0 - 32;
-                                            if (_lim_14 <= 0) { _thresh_mask_13 = 0u; }
-                                            else if (_lim_14 >= 32) { _thresh_mask_13 = 0xFFFFFFFFu; }
-                                            else {
-                                                asm volatile("{"
-                                                    ".reg .u32 t;\n\t"
-                                                    "shl.b32 t, 1, %1;\n\t"
-                                                    "add.u32 %0, t, -1;\n\t"
-                                                    "}" : "=r"(_thresh_mask_13) : "r"(_lim_14));
+                                        float part_0 = -CUDART_INF_F;
+                                        float2 _reg_reduce_max2_11 = {-CUDART_INF_F, -CUDART_INF_F};
+                                        _reg_reduce_max2_11.x = max_noftz(_reg_reduce_max2_11.x, max_noftz(vg_0[0], vg_0[1]));
+                                        _reg_reduce_max2_11.y = max_noftz(_reg_reduce_max2_11.y, max_noftz(vg_0[2], vg_0[3]));
+                                        _reg_reduce_max2_11.x = max_noftz(_reg_reduce_max2_11.x, max_noftz(vg_0[4], vg_0[5]));
+                                        _reg_reduce_max2_11.y = max_noftz(_reg_reduce_max2_11.y, max_noftz(vg_0[6], vg_0[7]));
+                                        _reg_reduce_max2_11.x = max_noftz(_reg_reduce_max2_11.x, max_noftz(vg_0[8], vg_0[9]));
+                                        _reg_reduce_max2_11.y = max_noftz(_reg_reduce_max2_11.y, max_noftz(vg_0[10], vg_0[11]));
+                                        _reg_reduce_max2_11.x = max_noftz(_reg_reduce_max2_11.x, max_noftz(vg_0[12], vg_0[13]));
+                                        _reg_reduce_max2_11.y = max_noftz(_reg_reduce_max2_11.y, max_noftz(vg_0[14], vg_0[15]));
+                                        _reg_reduce_max2_11.x = max_noftz(_reg_reduce_max2_11.x, max_noftz(vg_0[16], vg_0[17]));
+                                        _reg_reduce_max2_11.y = max_noftz(_reg_reduce_max2_11.y, max_noftz(vg_0[18], vg_0[19]));
+                                        _reg_reduce_max2_11.x = max_noftz(_reg_reduce_max2_11.x, max_noftz(vg_0[20], vg_0[21]));
+                                        _reg_reduce_max2_11.y = max_noftz(_reg_reduce_max2_11.y, max_noftz(vg_0[22], vg_0[23]));
+                                        _reg_reduce_max2_11.x = max_noftz(_reg_reduce_max2_11.x, max_noftz(vg_0[24], vg_0[25]));
+                                        _reg_reduce_max2_11.y = max_noftz(_reg_reduce_max2_11.y, max_noftz(vg_0[26], vg_0[27]));
+                                        _reg_reduce_max2_11.x = max_noftz(_reg_reduce_max2_11.x, max_noftz(vg_0[28], vg_0[29]));
+                                        _reg_reduce_max2_11.y = max_noftz(_reg_reduce_max2_11.y, max_noftz(vg_0[30], vg_0[31]));
+                                        float _reg_array_reduce_10 = row_max_reduce(_reg_reduce_max2_11);
+                                        part_0 = _reg_array_reduce_10;
+                                        mp_0 = fmaxf(mp_0, part_0);
+                                        int _warp_vote_12 = __any_sync(0xFFFFFFFF, nvis_0 < 64);
+                                        if (_warp_vote_12 != 0) {
+                                            uint32_t _thresh_mask_13;
+                                            {
+                                                int _lim_14 = nvis_0 - 32;
+                                                if (_lim_14 <= 0) { _thresh_mask_13 = 0u; }
+                                                else if (_lim_14 >= 32) { _thresh_mask_13 = 0xFFFFFFFFu; }
+                                                else {
+                                                    asm volatile("{"
+                                                        ".reg .u32 t;\n\t"
+                                                        "shl.b32 t, 1, %1;\n\t"
+                                                        "add.u32 %0, t, -1;\n\t"
+                                                        "}" : "=r"(_thresh_mask_13) : "r"(_lim_14));
+                                                }
                                             }
+                                            if (!(_thresh_mask_13 & (1u << 0))) vg_0[32] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_13 & (1u << 1))) vg_0[33] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_13 & (1u << 2))) vg_0[34] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_13 & (1u << 3))) vg_0[35] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_13 & (1u << 4))) vg_0[36] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_13 & (1u << 5))) vg_0[37] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_13 & (1u << 6))) vg_0[38] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_13 & (1u << 7))) vg_0[39] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_13 & (1u << 8))) vg_0[40] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_13 & (1u << 9))) vg_0[41] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_13 & (1u << 10))) vg_0[42] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_13 & (1u << 11))) vg_0[43] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_13 & (1u << 12))) vg_0[44] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_13 & (1u << 13))) vg_0[45] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_13 & (1u << 14))) vg_0[46] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_13 & (1u << 15))) vg_0[47] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_13 & (1u << 16))) vg_0[48] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_13 & (1u << 17))) vg_0[49] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_13 & (1u << 18))) vg_0[50] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_13 & (1u << 19))) vg_0[51] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_13 & (1u << 20))) vg_0[52] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_13 & (1u << 21))) vg_0[53] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_13 & (1u << 22))) vg_0[54] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_13 & (1u << 23))) vg_0[55] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_13 & (1u << 24))) vg_0[56] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_13 & (1u << 25))) vg_0[57] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_13 & (1u << 26))) vg_0[58] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_13 & (1u << 27))) vg_0[59] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_13 & (1u << 28))) vg_0[60] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_13 & (1u << 29))) vg_0[61] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_13 & (1u << 30))) vg_0[62] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_13 & (1u << 31))) vg_0[63] = -CUDART_INF_F;
                                         }
-                                        if (!(_thresh_mask_13 & (1u << 0))) vg_0[32] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_13 & (1u << 1))) vg_0[33] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_13 & (1u << 2))) vg_0[34] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_13 & (1u << 3))) vg_0[35] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_13 & (1u << 4))) vg_0[36] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_13 & (1u << 5))) vg_0[37] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_13 & (1u << 6))) vg_0[38] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_13 & (1u << 7))) vg_0[39] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_13 & (1u << 8))) vg_0[40] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_13 & (1u << 9))) vg_0[41] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_13 & (1u << 10))) vg_0[42] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_13 & (1u << 11))) vg_0[43] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_13 & (1u << 12))) vg_0[44] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_13 & (1u << 13))) vg_0[45] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_13 & (1u << 14))) vg_0[46] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_13 & (1u << 15))) vg_0[47] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_13 & (1u << 16))) vg_0[48] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_13 & (1u << 17))) vg_0[49] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_13 & (1u << 18))) vg_0[50] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_13 & (1u << 19))) vg_0[51] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_13 & (1u << 20))) vg_0[52] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_13 & (1u << 21))) vg_0[53] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_13 & (1u << 22))) vg_0[54] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_13 & (1u << 23))) vg_0[55] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_13 & (1u << 24))) vg_0[56] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_13 & (1u << 25))) vg_0[57] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_13 & (1u << 26))) vg_0[58] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_13 & (1u << 27))) vg_0[59] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_13 & (1u << 28))) vg_0[60] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_13 & (1u << 29))) vg_0[61] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_13 & (1u << 30))) vg_0[62] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_13 & (1u << 31))) vg_0[63] = -CUDART_INF_F;
+                                        float part_1 = -CUDART_INF_F;
+                                        float2 _reg_reduce_max2_16 = {-CUDART_INF_F, -CUDART_INF_F};
+                                        row_max_x32_accum(&vg_0[(32) + 0], _reg_reduce_max2_16);
+                                        float _reg_array_reduce_15 = row_max_reduce(_reg_reduce_max2_16);
+                                        part_1 = _reg_array_reduce_15;
+                                        mp_0 = fmaxf(mp_0, part_1);
                                     }
-                                    float part_1 = -CUDART_INF_F;
-                                    float2 _reg_reduce_max2_16 = {-CUDART_INF_F, -CUDART_INF_F};
-                                    row_max_x32_accum(&vg_0[(32) + 0], _reg_reduce_max2_16);
-                                    float _reg_array_reduce_15 = row_max_reduce(_reg_reduce_max2_16);
-                                    part_1 = _reg_array_reduce_15;
-                                    mp_0 = fmaxf(mp_0, part_1);
                                 }
                                 mrun_0 = mp_0;
                                 float pm_1 = -CUDART_INF_F;
@@ -558,173 +557,237 @@ kernel_cake_msa_icp_indexer_f4d2fd6a393e27f17fde(const __grid_constant__ CUtenso
                                 asm volatile("tcgen05.fence::before_thread_sync;");
                                 mbarrier_arrive(acc_empty_addr + (wg) * 8);
                                 _phase_acc_full ^= 1;
-                                int p_1 = kt_0;
-                                int nvis_1 = ((u_0 - 256 * p_1 - 128 * rank) > (0) ? (u_0 - 256 * p_1 - 128 * rank) : (0));
                                 float mp_1 = -CUDART_INF_F;
-                                int masked_1 = 1;
                                 mp_1 = pm_1;
-                                int _warp_vote_17 = __any_sync(0xFFFFFFFF, nvis_1 < 128);
-                                masked_1 = _warp_vote_17;
-                                if (masked_1 != 0) {
-                                    mp_1 = -CUDART_INF_F;
-                                    int _warp_vote_18 = __any_sync(0xFFFFFFFF, nvis_1 < 96);
-                                    if (_warp_vote_18 != 0) {
-                                        uint32_t _thresh_mask_19;
-                                        {
-                                            int _lim_20 = nvis_1 - 64;
-                                            if (_lim_20 <= 0) { _thresh_mask_19 = 0u; }
-                                            else if (_lim_20 >= 32) { _thresh_mask_19 = 0xFFFFFFFFu; }
-                                            else {
-                                                asm volatile("{"
-                                                    ".reg .u32 t;\n\t"
-                                                    "shl.b32 t, 1, %1;\n\t"
-                                                    "add.u32 %0, t, -1;\n\t"
-                                                    "}" : "=r"(_thresh_mask_19) : "r"(_lim_20));
+                                if (partial_0 != 0) {
+                                    int p_1 = kt_0;
+                                    int nvis_1 = ((u_0 - 256 * p_1 - 128 * rank) > (0) ? (u_0 - 256 * p_1 - 128 * rank) : (0));
+                                    int masked_1 = 1;
+                                    int _warp_vote_17 = __any_sync(0xFFFFFFFF, nvis_1 < 128);
+                                    masked_1 = _warp_vote_17;
+                                    if (masked_1 != 0) {
+                                        mp_1 = -CUDART_INF_F;
+                                        int _warp_vote_18 = __any_sync(0xFFFFFFFF, nvis_1 < 96);
+                                        if (_warp_vote_18 != 0) {
+                                            uint32_t _thresh_mask_19;
+                                            {
+                                                int _lim_20 = nvis_1 - 64;
+                                                if (_lim_20 <= 0) { _thresh_mask_19 = 0u; }
+                                                else if (_lim_20 >= 32) { _thresh_mask_19 = 0xFFFFFFFFu; }
+                                                else {
+                                                    asm volatile("{"
+                                                        ".reg .u32 t;\n\t"
+                                                        "shl.b32 t, 1, %1;\n\t"
+                                                        "add.u32 %0, t, -1;\n\t"
+                                                        "}" : "=r"(_thresh_mask_19) : "r"(_lim_20));
+                                                }
                                             }
+                                            if (!(_thresh_mask_19 & (1u << 0))) vg_0[0] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_19 & (1u << 1))) vg_0[1] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_19 & (1u << 2))) vg_0[2] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_19 & (1u << 3))) vg_0[3] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_19 & (1u << 4))) vg_0[4] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_19 & (1u << 5))) vg_0[5] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_19 & (1u << 6))) vg_0[6] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_19 & (1u << 7))) vg_0[7] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_19 & (1u << 8))) vg_0[8] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_19 & (1u << 9))) vg_0[9] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_19 & (1u << 10))) vg_0[10] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_19 & (1u << 11))) vg_0[11] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_19 & (1u << 12))) vg_0[12] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_19 & (1u << 13))) vg_0[13] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_19 & (1u << 14))) vg_0[14] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_19 & (1u << 15))) vg_0[15] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_19 & (1u << 16))) vg_0[16] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_19 & (1u << 17))) vg_0[17] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_19 & (1u << 18))) vg_0[18] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_19 & (1u << 19))) vg_0[19] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_19 & (1u << 20))) vg_0[20] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_19 & (1u << 21))) vg_0[21] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_19 & (1u << 22))) vg_0[22] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_19 & (1u << 23))) vg_0[23] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_19 & (1u << 24))) vg_0[24] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_19 & (1u << 25))) vg_0[25] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_19 & (1u << 26))) vg_0[26] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_19 & (1u << 27))) vg_0[27] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_19 & (1u << 28))) vg_0[28] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_19 & (1u << 29))) vg_0[29] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_19 & (1u << 30))) vg_0[30] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_19 & (1u << 31))) vg_0[31] = -CUDART_INF_F;
                                         }
-                                        if (!(_thresh_mask_19 & (1u << 0))) vg_0[0] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_19 & (1u << 1))) vg_0[1] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_19 & (1u << 2))) vg_0[2] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_19 & (1u << 3))) vg_0[3] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_19 & (1u << 4))) vg_0[4] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_19 & (1u << 5))) vg_0[5] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_19 & (1u << 6))) vg_0[6] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_19 & (1u << 7))) vg_0[7] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_19 & (1u << 8))) vg_0[8] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_19 & (1u << 9))) vg_0[9] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_19 & (1u << 10))) vg_0[10] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_19 & (1u << 11))) vg_0[11] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_19 & (1u << 12))) vg_0[12] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_19 & (1u << 13))) vg_0[13] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_19 & (1u << 14))) vg_0[14] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_19 & (1u << 15))) vg_0[15] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_19 & (1u << 16))) vg_0[16] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_19 & (1u << 17))) vg_0[17] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_19 & (1u << 18))) vg_0[18] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_19 & (1u << 19))) vg_0[19] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_19 & (1u << 20))) vg_0[20] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_19 & (1u << 21))) vg_0[21] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_19 & (1u << 22))) vg_0[22] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_19 & (1u << 23))) vg_0[23] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_19 & (1u << 24))) vg_0[24] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_19 & (1u << 25))) vg_0[25] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_19 & (1u << 26))) vg_0[26] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_19 & (1u << 27))) vg_0[27] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_19 & (1u << 28))) vg_0[28] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_19 & (1u << 29))) vg_0[29] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_19 & (1u << 30))) vg_0[30] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_19 & (1u << 31))) vg_0[31] = -CUDART_INF_F;
-                                    }
-                                    float part_2 = -CUDART_INF_F;
-                                    float2 _reg_reduce_max2_22 = {-CUDART_INF_F, -CUDART_INF_F};
-                                    _reg_reduce_max2_22.x = max_noftz(_reg_reduce_max2_22.x, max_noftz(vg_0[0], vg_0[1]));
-                                    _reg_reduce_max2_22.y = max_noftz(_reg_reduce_max2_22.y, max_noftz(vg_0[2], vg_0[3]));
-                                    _reg_reduce_max2_22.x = max_noftz(_reg_reduce_max2_22.x, max_noftz(vg_0[4], vg_0[5]));
-                                    _reg_reduce_max2_22.y = max_noftz(_reg_reduce_max2_22.y, max_noftz(vg_0[6], vg_0[7]));
-                                    _reg_reduce_max2_22.x = max_noftz(_reg_reduce_max2_22.x, max_noftz(vg_0[8], vg_0[9]));
-                                    _reg_reduce_max2_22.y = max_noftz(_reg_reduce_max2_22.y, max_noftz(vg_0[10], vg_0[11]));
-                                    _reg_reduce_max2_22.x = max_noftz(_reg_reduce_max2_22.x, max_noftz(vg_0[12], vg_0[13]));
-                                    _reg_reduce_max2_22.y = max_noftz(_reg_reduce_max2_22.y, max_noftz(vg_0[14], vg_0[15]));
-                                    _reg_reduce_max2_22.x = max_noftz(_reg_reduce_max2_22.x, max_noftz(vg_0[16], vg_0[17]));
-                                    _reg_reduce_max2_22.y = max_noftz(_reg_reduce_max2_22.y, max_noftz(vg_0[18], vg_0[19]));
-                                    _reg_reduce_max2_22.x = max_noftz(_reg_reduce_max2_22.x, max_noftz(vg_0[20], vg_0[21]));
-                                    _reg_reduce_max2_22.y = max_noftz(_reg_reduce_max2_22.y, max_noftz(vg_0[22], vg_0[23]));
-                                    _reg_reduce_max2_22.x = max_noftz(_reg_reduce_max2_22.x, max_noftz(vg_0[24], vg_0[25]));
-                                    _reg_reduce_max2_22.y = max_noftz(_reg_reduce_max2_22.y, max_noftz(vg_0[26], vg_0[27]));
-                                    _reg_reduce_max2_22.x = max_noftz(_reg_reduce_max2_22.x, max_noftz(vg_0[28], vg_0[29]));
-                                    _reg_reduce_max2_22.y = max_noftz(_reg_reduce_max2_22.y, max_noftz(vg_0[30], vg_0[31]));
-                                    float _reg_array_reduce_21 = row_max_reduce(_reg_reduce_max2_22);
-                                    part_2 = _reg_array_reduce_21;
-                                    mp_1 = fmaxf(mp_1, part_2);
-                                    int _warp_vote_23 = __any_sync(0xFFFFFFFF, nvis_1 < 128);
-                                    if (_warp_vote_23 != 0) {
-                                        uint32_t _thresh_mask_24;
-                                        {
-                                            int _lim_25 = nvis_1 - 64 - 32;
-                                            if (_lim_25 <= 0) { _thresh_mask_24 = 0u; }
-                                            else if (_lim_25 >= 32) { _thresh_mask_24 = 0xFFFFFFFFu; }
-                                            else {
-                                                asm volatile("{"
-                                                    ".reg .u32 t;\n\t"
-                                                    "shl.b32 t, 1, %1;\n\t"
-                                                    "add.u32 %0, t, -1;\n\t"
-                                                    "}" : "=r"(_thresh_mask_24) : "r"(_lim_25));
+                                        float part_2 = -CUDART_INF_F;
+                                        float2 _reg_reduce_max2_22 = {-CUDART_INF_F, -CUDART_INF_F};
+                                        _reg_reduce_max2_22.x = max_noftz(_reg_reduce_max2_22.x, max_noftz(vg_0[0], vg_0[1]));
+                                        _reg_reduce_max2_22.y = max_noftz(_reg_reduce_max2_22.y, max_noftz(vg_0[2], vg_0[3]));
+                                        _reg_reduce_max2_22.x = max_noftz(_reg_reduce_max2_22.x, max_noftz(vg_0[4], vg_0[5]));
+                                        _reg_reduce_max2_22.y = max_noftz(_reg_reduce_max2_22.y, max_noftz(vg_0[6], vg_0[7]));
+                                        _reg_reduce_max2_22.x = max_noftz(_reg_reduce_max2_22.x, max_noftz(vg_0[8], vg_0[9]));
+                                        _reg_reduce_max2_22.y = max_noftz(_reg_reduce_max2_22.y, max_noftz(vg_0[10], vg_0[11]));
+                                        _reg_reduce_max2_22.x = max_noftz(_reg_reduce_max2_22.x, max_noftz(vg_0[12], vg_0[13]));
+                                        _reg_reduce_max2_22.y = max_noftz(_reg_reduce_max2_22.y, max_noftz(vg_0[14], vg_0[15]));
+                                        _reg_reduce_max2_22.x = max_noftz(_reg_reduce_max2_22.x, max_noftz(vg_0[16], vg_0[17]));
+                                        _reg_reduce_max2_22.y = max_noftz(_reg_reduce_max2_22.y, max_noftz(vg_0[18], vg_0[19]));
+                                        _reg_reduce_max2_22.x = max_noftz(_reg_reduce_max2_22.x, max_noftz(vg_0[20], vg_0[21]));
+                                        _reg_reduce_max2_22.y = max_noftz(_reg_reduce_max2_22.y, max_noftz(vg_0[22], vg_0[23]));
+                                        _reg_reduce_max2_22.x = max_noftz(_reg_reduce_max2_22.x, max_noftz(vg_0[24], vg_0[25]));
+                                        _reg_reduce_max2_22.y = max_noftz(_reg_reduce_max2_22.y, max_noftz(vg_0[26], vg_0[27]));
+                                        _reg_reduce_max2_22.x = max_noftz(_reg_reduce_max2_22.x, max_noftz(vg_0[28], vg_0[29]));
+                                        _reg_reduce_max2_22.y = max_noftz(_reg_reduce_max2_22.y, max_noftz(vg_0[30], vg_0[31]));
+                                        float _reg_array_reduce_21 = row_max_reduce(_reg_reduce_max2_22);
+                                        part_2 = _reg_array_reduce_21;
+                                        mp_1 = fmaxf(mp_1, part_2);
+                                        int _warp_vote_23 = __any_sync(0xFFFFFFFF, nvis_1 < 128);
+                                        if (_warp_vote_23 != 0) {
+                                            uint32_t _thresh_mask_24;
+                                            {
+                                                int _lim_25 = nvis_1 - 64 - 32;
+                                                if (_lim_25 <= 0) { _thresh_mask_24 = 0u; }
+                                                else if (_lim_25 >= 32) { _thresh_mask_24 = 0xFFFFFFFFu; }
+                                                else {
+                                                    asm volatile("{"
+                                                        ".reg .u32 t;\n\t"
+                                                        "shl.b32 t, 1, %1;\n\t"
+                                                        "add.u32 %0, t, -1;\n\t"
+                                                        "}" : "=r"(_thresh_mask_24) : "r"(_lim_25));
+                                                }
                                             }
+                                            if (!(_thresh_mask_24 & (1u << 0))) vg_0[32] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_24 & (1u << 1))) vg_0[33] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_24 & (1u << 2))) vg_0[34] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_24 & (1u << 3))) vg_0[35] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_24 & (1u << 4))) vg_0[36] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_24 & (1u << 5))) vg_0[37] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_24 & (1u << 6))) vg_0[38] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_24 & (1u << 7))) vg_0[39] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_24 & (1u << 8))) vg_0[40] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_24 & (1u << 9))) vg_0[41] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_24 & (1u << 10))) vg_0[42] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_24 & (1u << 11))) vg_0[43] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_24 & (1u << 12))) vg_0[44] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_24 & (1u << 13))) vg_0[45] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_24 & (1u << 14))) vg_0[46] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_24 & (1u << 15))) vg_0[47] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_24 & (1u << 16))) vg_0[48] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_24 & (1u << 17))) vg_0[49] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_24 & (1u << 18))) vg_0[50] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_24 & (1u << 19))) vg_0[51] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_24 & (1u << 20))) vg_0[52] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_24 & (1u << 21))) vg_0[53] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_24 & (1u << 22))) vg_0[54] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_24 & (1u << 23))) vg_0[55] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_24 & (1u << 24))) vg_0[56] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_24 & (1u << 25))) vg_0[57] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_24 & (1u << 26))) vg_0[58] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_24 & (1u << 27))) vg_0[59] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_24 & (1u << 28))) vg_0[60] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_24 & (1u << 29))) vg_0[61] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_24 & (1u << 30))) vg_0[62] = -CUDART_INF_F;
+                                            if (!(_thresh_mask_24 & (1u << 31))) vg_0[63] = -CUDART_INF_F;
                                         }
-                                        if (!(_thresh_mask_24 & (1u << 0))) vg_0[32] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_24 & (1u << 1))) vg_0[33] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_24 & (1u << 2))) vg_0[34] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_24 & (1u << 3))) vg_0[35] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_24 & (1u << 4))) vg_0[36] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_24 & (1u << 5))) vg_0[37] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_24 & (1u << 6))) vg_0[38] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_24 & (1u << 7))) vg_0[39] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_24 & (1u << 8))) vg_0[40] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_24 & (1u << 9))) vg_0[41] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_24 & (1u << 10))) vg_0[42] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_24 & (1u << 11))) vg_0[43] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_24 & (1u << 12))) vg_0[44] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_24 & (1u << 13))) vg_0[45] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_24 & (1u << 14))) vg_0[46] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_24 & (1u << 15))) vg_0[47] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_24 & (1u << 16))) vg_0[48] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_24 & (1u << 17))) vg_0[49] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_24 & (1u << 18))) vg_0[50] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_24 & (1u << 19))) vg_0[51] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_24 & (1u << 20))) vg_0[52] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_24 & (1u << 21))) vg_0[53] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_24 & (1u << 22))) vg_0[54] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_24 & (1u << 23))) vg_0[55] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_24 & (1u << 24))) vg_0[56] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_24 & (1u << 25))) vg_0[57] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_24 & (1u << 26))) vg_0[58] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_24 & (1u << 27))) vg_0[59] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_24 & (1u << 28))) vg_0[60] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_24 & (1u << 29))) vg_0[61] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_24 & (1u << 30))) vg_0[62] = -CUDART_INF_F;
-                                        if (!(_thresh_mask_24 & (1u << 31))) vg_0[63] = -CUDART_INF_F;
+                                        float part_3 = -CUDART_INF_F;
+                                        float2 _reg_reduce_max2_27 = {-CUDART_INF_F, -CUDART_INF_F};
+                                        row_max_x32_accum(&vg_0[(32) + 0], _reg_reduce_max2_27);
+                                        float _reg_array_reduce_26 = row_max_reduce(_reg_reduce_max2_27);
+                                        part_3 = _reg_array_reduce_26;
+                                        mp_1 = fmaxf(mp_1, part_3);
                                     }
-                                    float part_3 = -CUDART_INF_F;
-                                    float2 _reg_reduce_max2_27 = {-CUDART_INF_F, -CUDART_INF_F};
-                                    row_max_x32_accum(&vg_0[(32) + 0], _reg_reduce_max2_27);
-                                    float _reg_array_reduce_26 = row_max_reduce(_reg_reduce_max2_27);
-                                    part_3 = _reg_array_reduce_26;
-                                    mp_1 = fmaxf(mp_1, part_3);
                                 }
                                 mrun_0 = fmaxf(mrun_0, mp_1);
-                                if (mrun_0 != mrun_0) {
-                                    mrun_0 = -CUDART_INF_F;
+                                float pmx_0 = mrun_0;
+                                if (pmx_0 != pmx_0) {
+                                    pmx_0 = -CUDART_INF_F;
                                 }
-                                mrun_0 = ((mrun_0 == 0.0f) ? 0.0f : mrun_0);
-                                need = 0;
-                                cand = 0;
-                                if (p_1 < lc_0) {
-                                    gid = 2 * p_1 + own;
-                                    forced = 0;
-                                    if (p_1 < lfb || p_1 >= fe_0) {
-                                        forced = 1;
+                                pmx_0 = ((pmx_0 == 0.0f) ? 0.0f : pmx_0);
+                                int pf_0 = kt_0;
+                                int plain_0 = 0;
+                                if (pf_0 + 1 <= lc_0) {
+                                    if (pf_0 >= lfb && pf_0 + 1 <= fe_0) {
+                                        plain_0 = 1;
                                     }
-                                    mb = reinterpret_cast<unsigned int*>(&mrun_0)[0];
+                                }
+                                int all_plain_0 = __all_sync(0xFFFFFFFF, plain_0 != 0);
+                                if (all_plain_0 != 0) {
+                                    gid = 2 * pf_0 + own;
+                                    mb = reinterpret_cast<unsigned int*>(&pmx_0)[0];
                                     ok = (((mb & 2147483648u) != 0) ? ~mb : mb | 2147483648u);
-                                    cand = forced << 63 | (unsigned long long)ok << 31 | (unsigned long long)(2147483647 - gid);
+                                    cand = (unsigned long long)ok << 31 | (unsigned long long)(2147483647 - gid);
                                     if (cand > top[15]) {
-                                        need = 1;
+                                        sbuf[cnt * 256 + te] = cand;
+                                        cnt = cnt + 1;
                                     }
                                 }
-                                int _warp_vote_28 = __any_sync(0xFFFFFFFF, need != 0);
-                                if (_warp_vote_28 != 0) {
-                                    buf[0] = ((need != 0 && cnt == 0) ? cand : buf[0]);
-                                    buf[1] = ((need != 0 && cnt == 1) ? cand : buf[1]);
-                                    buf[2] = ((need != 0 && cnt == 2) ? cand : buf[2]);
-                                    buf[3] = ((need != 0 && cnt == 3) ? cand : buf[3]);
-                                    buf[4] = ((need != 0 && cnt == 4) ? cand : buf[4]);
-                                    buf[5] = ((need != 0 && cnt == 5) ? cand : buf[5]);
-                                    buf[6] = ((need != 0 && cnt == 6) ? cand : buf[6]);
-                                    buf[7] = ((need != 0 && cnt == 7) ? cand : buf[7]);
-                                    cnt = cnt + need;
+                                if (all_plain_0 == 0) {
+                                    int p_2 = kt_0;
+                                    need = 0;
+                                    cand = 0;
+                                    if (p_2 < lc_0) {
+                                        gid = 2 * p_2 + own;
+                                        forced = 0;
+                                        if (p_2 < lfb || p_2 >= fe_0) {
+                                            forced = 1;
+                                        }
+                                        mb = reinterpret_cast<unsigned int*>(&pmx_0)[0];
+                                        ok = (((mb & 2147483648u) != 0) ? ~mb : mb | 2147483648u);
+                                        cand = forced << 63 | (unsigned long long)ok << 31 | (unsigned long long)(2147483647 - gid);
+                                        if (cand > top[15]) {
+                                            need = 1;
+                                        }
+                                    }
+                                    if (need != 0) {
+                                        sbuf[cnt * 256 + te] = cand;
+                                        cnt = cnt + 1;
+                                    }
                                 }
-                                int _warp_vote_29 = __any_sync(0xFFFFFFFF, cnt > 7);
-                                if (_warp_vote_29 != 0) {
+                                int _warp_vote_28 = __any_sync(0xFFFFFFFF, cnt > 15);
+                                if (_warp_vote_28 != 0) {
+                                    unsigned long long y0_0 = sbuf[te];
+                                    buf[0] = ((0 < cnt) ? y0_0 : 0);
+                                    unsigned long long y0_1 = sbuf[256 + te];
+                                    buf[1] = ((1 < cnt) ? y0_1 : 0);
+                                    unsigned long long y0_2 = sbuf[512 + te];
+                                    buf[2] = ((2 < cnt) ? y0_2 : 0);
+                                    unsigned long long y0_3 = sbuf[768 + te];
+                                    buf[3] = ((3 < cnt) ? y0_3 : 0);
+                                    unsigned long long y0_4 = sbuf[1024 + te];
+                                    buf[4] = ((4 < cnt) ? y0_4 : 0);
+                                    unsigned long long y0_5 = sbuf[1280 + te];
+                                    buf[5] = ((5 < cnt) ? y0_5 : 0);
+                                    unsigned long long y0_6 = sbuf[1536 + te];
+                                    buf[6] = ((6 < cnt) ? y0_6 : 0);
+                                    unsigned long long y0_7 = sbuf[1792 + te];
+                                    buf[7] = ((7 < cnt) ? y0_7 : 0);
+                                    if (8 < cnt) {
+                                        unsigned long long y1_0 = sbuf[2048 + te];
+                                        sbuf[te] = y1_0;
+                                    }
+                                    if (9 < cnt) {
+                                        unsigned long long y1_1 = sbuf[2304 + te];
+                                        sbuf[256 + te] = y1_1;
+                                    }
+                                    if (10 < cnt) {
+                                        unsigned long long y1_2 = sbuf[2560 + te];
+                                        sbuf[512 + te] = y1_2;
+                                    }
+                                    if (11 < cnt) {
+                                        unsigned long long y1_3 = sbuf[2816 + te];
+                                        sbuf[768 + te] = y1_3;
+                                    }
+                                    if (12 < cnt) {
+                                        unsigned long long y1_4 = sbuf[3072 + te];
+                                        sbuf[1024 + te] = y1_4;
+                                    }
+                                    if (13 < cnt) {
+                                        unsigned long long y1_5 = sbuf[3328 + te];
+                                        sbuf[1280 + te] = y1_5;
+                                    }
+                                    if (14 < cnt) {
+                                        unsigned long long y1_6 = sbuf[3584 + te];
+                                        sbuf[1536 + te] = y1_6;
+                                    }
+                                    if (15 < cnt) {
+                                        unsigned long long y1_7 = sbuf[3840 + te];
+                                        sbuf[1792 + te] = y1_7;
+                                    }
                                     unsigned long long x = buf[0];
                                     unsigned long long y = buf[1];
                                     buf[0] = ((y > x) ? y : x);
@@ -945,249 +1008,287 @@ kernel_cake_msa_icp_indexer_f4d2fd6a393e27f17fde(const __grid_constant__ CUtenso
                                     unsigned long long y_57 = top[15];
                                     top[14] = ((y_57 > x_49) ? y_57 : x_49);
                                     top[15] = ((y_57 > x_49) ? x_49 : y_57);
-                                    buf[0] = 0;
-                                    buf[1] = 0;
-                                    buf[2] = 0;
-                                    buf[3] = 0;
-                                    buf[4] = 0;
-                                    buf[5] = 0;
-                                    buf[6] = 0;
-                                    buf[7] = 0;
-                                    cnt = 0;
+                                    int _max_29 = ((cnt - 8) > (0) ? (cnt - 8) : (0));
+                                    cnt = _max_29;
                                 }
                             }
                         }
                     }
-                    int _warp_vote_30 = __any_sync(0xFFFFFFFF, cnt != 0);
-                    if (_warp_vote_30 != 0) {
-                        unsigned long long x_50 = buf[0];
-                        unsigned long long y_58 = buf[1];
-                        buf[0] = ((y_58 > x_50) ? y_58 : x_50);
-                        buf[1] = ((y_58 > x_50) ? x_50 : y_58);
-                        unsigned long long x_50_1 = buf[2];
-                        unsigned long long y_58_1 = buf[3];
-                        buf[2] = ((y_58_1 > x_50_1) ? y_58_1 : x_50_1);
-                        buf[3] = ((y_58_1 > x_50_1) ? x_50_1 : y_58_1);
-                        unsigned long long x_51 = buf[4];
-                        unsigned long long y_59 = buf[5];
-                        buf[4] = ((y_59 > x_51) ? y_59 : x_51);
-                        buf[5] = ((y_59 > x_51) ? x_51 : y_59);
-                        unsigned long long x_52 = buf[6];
-                        unsigned long long y_60 = buf[7];
-                        buf[6] = ((y_60 > x_52) ? y_60 : x_52);
-                        buf[7] = ((y_60 > x_52) ? x_52 : y_60);
-                        unsigned long long x_53 = buf[0];
-                        unsigned long long y_61 = buf[2];
-                        buf[0] = ((y_61 > x_53) ? y_61 : x_53);
-                        buf[2] = ((y_61 > x_53) ? x_53 : y_61);
-                        unsigned long long x_54 = buf[1];
-                        unsigned long long y_62 = buf[3];
-                        buf[1] = ((y_62 > x_54) ? y_62 : x_54);
-                        buf[3] = ((y_62 > x_54) ? x_54 : y_62);
-                        unsigned long long x_55 = buf[4];
-                        unsigned long long y_63 = buf[6];
-                        buf[4] = ((y_63 > x_55) ? y_63 : x_55);
-                        buf[6] = ((y_63 > x_55) ? x_55 : y_63);
-                        unsigned long long x_56 = buf[5];
-                        unsigned long long y_64 = buf[7];
-                        buf[5] = ((y_64 > x_56) ? y_64 : x_56);
-                        buf[7] = ((y_64 > x_56) ? x_56 : y_64);
-                        unsigned long long x_57 = buf[1];
-                        unsigned long long y_65 = buf[2];
-                        buf[1] = ((y_65 > x_57) ? y_65 : x_57);
-                        buf[2] = ((y_65 > x_57) ? x_57 : y_65);
-                        unsigned long long x_58 = buf[5];
-                        unsigned long long y_66 = buf[6];
-                        buf[5] = ((y_66 > x_58) ? y_66 : x_58);
-                        buf[6] = ((y_66 > x_58) ? x_58 : y_66);
-                        unsigned long long x_59 = buf[0];
-                        unsigned long long y_67 = buf[4];
-                        buf[0] = ((y_67 > x_59) ? y_67 : x_59);
-                        buf[4] = ((y_67 > x_59) ? x_59 : y_67);
-                        unsigned long long x_60 = buf[1];
-                        unsigned long long y_68 = buf[5];
-                        buf[1] = ((y_68 > x_60) ? y_68 : x_60);
-                        buf[5] = ((y_68 > x_60) ? x_60 : y_68);
-                        unsigned long long x_61 = buf[2];
-                        unsigned long long y_69 = buf[6];
-                        buf[2] = ((y_69 > x_61) ? y_69 : x_61);
-                        buf[6] = ((y_69 > x_61) ? x_61 : y_69);
-                        unsigned long long x_62 = buf[3];
-                        unsigned long long y_70 = buf[7];
-                        buf[3] = ((y_70 > x_62) ? y_70 : x_62);
-                        buf[7] = ((y_70 > x_62) ? x_62 : y_70);
-                        unsigned long long x_63 = buf[2];
-                        unsigned long long y_71 = buf[4];
-                        buf[2] = ((y_71 > x_63) ? y_71 : x_63);
-                        buf[4] = ((y_71 > x_63) ? x_63 : y_71);
-                        unsigned long long x_64 = buf[3];
-                        unsigned long long y_72 = buf[5];
-                        buf[3] = ((y_72 > x_64) ? y_72 : x_64);
-                        buf[5] = ((y_72 > x_64) ? x_64 : y_72);
-                        unsigned long long x_65 = buf[1];
-                        unsigned long long y_73 = buf[2];
-                        buf[1] = ((y_73 > x_65) ? y_73 : x_65);
-                        buf[2] = ((y_73 > x_65) ? x_65 : y_73);
-                        unsigned long long x_66 = buf[3];
-                        unsigned long long y_74 = buf[4];
-                        buf[3] = ((y_74 > x_66) ? y_74 : x_66);
-                        buf[4] = ((y_74 > x_66) ? x_66 : y_74);
-                        unsigned long long x_67 = buf[5];
-                        unsigned long long y_75 = buf[6];
-                        buf[5] = ((y_75 > x_67) ? y_75 : x_67);
-                        buf[6] = ((y_75 > x_67) ? x_67 : y_75);
-                        unsigned long long y_76 = buf[0];
-                        top[15] = ((y_76 > top[15]) ? y_76 : top[15]);
-                        unsigned long long y_77 = buf[1];
-                        top[14] = ((y_77 > top[14]) ? y_77 : top[14]);
-                        unsigned long long y_78 = buf[2];
-                        top[13] = ((y_78 > top[13]) ? y_78 : top[13]);
-                        unsigned long long y_79 = buf[3];
-                        top[12] = ((y_79 > top[12]) ? y_79 : top[12]);
-                        unsigned long long y_80 = buf[4];
-                        top[11] = ((y_80 > top[11]) ? y_80 : top[11]);
-                        unsigned long long y_81 = buf[5];
-                        top[10] = ((y_81 > top[10]) ? y_81 : top[10]);
-                        unsigned long long y_82 = buf[6];
-                        top[9] = ((y_82 > top[9]) ? y_82 : top[9]);
-                        unsigned long long y_83 = buf[7];
-                        top[8] = ((y_83 > top[8]) ? y_83 : top[8]);
-                        unsigned long long x_68 = top[0];
-                        unsigned long long y_84 = top[8];
-                        top[0] = ((y_84 > x_68) ? y_84 : x_68);
-                        top[8] = ((y_84 > x_68) ? x_68 : y_84);
-                        unsigned long long x_69 = top[1];
-                        unsigned long long y_85 = top[9];
-                        top[1] = ((y_85 > x_69) ? y_85 : x_69);
-                        top[9] = ((y_85 > x_69) ? x_69 : y_85);
-                        unsigned long long x_70 = top[2];
-                        unsigned long long y_86 = top[10];
-                        top[2] = ((y_86 > x_70) ? y_86 : x_70);
-                        top[10] = ((y_86 > x_70) ? x_70 : y_86);
-                        unsigned long long x_71 = top[3];
-                        unsigned long long y_87 = top[11];
-                        top[3] = ((y_87 > x_71) ? y_87 : x_71);
-                        top[11] = ((y_87 > x_71) ? x_71 : y_87);
-                        unsigned long long x_72 = top[4];
-                        unsigned long long y_88 = top[12];
-                        top[4] = ((y_88 > x_72) ? y_88 : x_72);
-                        top[12] = ((y_88 > x_72) ? x_72 : y_88);
-                        unsigned long long x_73 = top[5];
-                        unsigned long long y_89 = top[13];
-                        top[5] = ((y_89 > x_73) ? y_89 : x_73);
-                        top[13] = ((y_89 > x_73) ? x_73 : y_89);
-                        unsigned long long x_74 = top[6];
-                        unsigned long long y_90 = top[14];
-                        top[6] = ((y_90 > x_74) ? y_90 : x_74);
-                        top[14] = ((y_90 > x_74) ? x_74 : y_90);
-                        unsigned long long x_75 = top[7];
-                        unsigned long long y_91 = top[15];
-                        top[7] = ((y_91 > x_75) ? y_91 : x_75);
-                        top[15] = ((y_91 > x_75) ? x_75 : y_91);
-                        unsigned long long x_76 = top[0];
-                        unsigned long long y_92 = top[4];
-                        top[0] = ((y_92 > x_76) ? y_92 : x_76);
-                        top[4] = ((y_92 > x_76) ? x_76 : y_92);
-                        unsigned long long x_77 = top[1];
-                        unsigned long long y_93 = top[5];
-                        top[1] = ((y_93 > x_77) ? y_93 : x_77);
-                        top[5] = ((y_93 > x_77) ? x_77 : y_93);
-                        unsigned long long x_78 = top[2];
-                        unsigned long long y_94 = top[6];
-                        top[2] = ((y_94 > x_78) ? y_94 : x_78);
-                        top[6] = ((y_94 > x_78) ? x_78 : y_94);
-                        unsigned long long x_79 = top[3];
-                        unsigned long long y_95 = top[7];
-                        top[3] = ((y_95 > x_79) ? y_95 : x_79);
-                        top[7] = ((y_95 > x_79) ? x_79 : y_95);
-                        unsigned long long x_80 = top[8];
-                        unsigned long long y_96 = top[12];
-                        top[8] = ((y_96 > x_80) ? y_96 : x_80);
-                        top[12] = ((y_96 > x_80) ? x_80 : y_96);
-                        unsigned long long x_81 = top[9];
-                        unsigned long long y_97 = top[13];
-                        top[9] = ((y_97 > x_81) ? y_97 : x_81);
-                        top[13] = ((y_97 > x_81) ? x_81 : y_97);
-                        unsigned long long x_82 = top[10];
-                        unsigned long long y_98 = top[14];
-                        top[10] = ((y_98 > x_82) ? y_98 : x_82);
-                        top[14] = ((y_98 > x_82) ? x_82 : y_98);
-                        unsigned long long x_83 = top[11];
-                        unsigned long long y_99 = top[15];
-                        top[11] = ((y_99 > x_83) ? y_99 : x_83);
-                        top[15] = ((y_99 > x_83) ? x_83 : y_99);
-                        unsigned long long x_84 = top[0];
-                        unsigned long long y_100 = top[2];
-                        top[0] = ((y_100 > x_84) ? y_100 : x_84);
-                        top[2] = ((y_100 > x_84) ? x_84 : y_100);
-                        unsigned long long x_85 = top[1];
-                        unsigned long long y_101 = top[3];
-                        top[1] = ((y_101 > x_85) ? y_101 : x_85);
-                        top[3] = ((y_101 > x_85) ? x_85 : y_101);
-                        unsigned long long x_86 = top[4];
-                        unsigned long long y_102 = top[6];
-                        top[4] = ((y_102 > x_86) ? y_102 : x_86);
-                        top[6] = ((y_102 > x_86) ? x_86 : y_102);
-                        unsigned long long x_87 = top[5];
-                        unsigned long long y_103 = top[7];
-                        top[5] = ((y_103 > x_87) ? y_103 : x_87);
-                        top[7] = ((y_103 > x_87) ? x_87 : y_103);
-                        unsigned long long x_88 = top[8];
-                        unsigned long long y_104 = top[10];
-                        top[8] = ((y_104 > x_88) ? y_104 : x_88);
-                        top[10] = ((y_104 > x_88) ? x_88 : y_104);
-                        unsigned long long x_89 = top[9];
-                        unsigned long long y_105 = top[11];
-                        top[9] = ((y_105 > x_89) ? y_105 : x_89);
-                        top[11] = ((y_105 > x_89) ? x_89 : y_105);
-                        unsigned long long x_90 = top[12];
-                        unsigned long long y_106 = top[14];
-                        top[12] = ((y_106 > x_90) ? y_106 : x_90);
-                        top[14] = ((y_106 > x_90) ? x_90 : y_106);
-                        unsigned long long x_91 = top[13];
-                        unsigned long long y_107 = top[15];
-                        top[13] = ((y_107 > x_91) ? y_107 : x_91);
-                        top[15] = ((y_107 > x_91) ? x_91 : y_107);
-                        unsigned long long x_92 = top[0];
-                        unsigned long long y_108 = top[1];
-                        top[0] = ((y_108 > x_92) ? y_108 : x_92);
-                        top[1] = ((y_108 > x_92) ? x_92 : y_108);
-                        unsigned long long x_93 = top[2];
-                        unsigned long long y_109 = top[3];
-                        top[2] = ((y_109 > x_93) ? y_109 : x_93);
-                        top[3] = ((y_109 > x_93) ? x_93 : y_109);
-                        unsigned long long x_94 = top[4];
-                        unsigned long long y_110 = top[5];
-                        top[4] = ((y_110 > x_94) ? y_110 : x_94);
-                        top[5] = ((y_110 > x_94) ? x_94 : y_110);
-                        unsigned long long x_95 = top[6];
-                        unsigned long long y_111 = top[7];
-                        top[6] = ((y_111 > x_95) ? y_111 : x_95);
-                        top[7] = ((y_111 > x_95) ? x_95 : y_111);
-                        unsigned long long x_96 = top[8];
-                        unsigned long long y_112 = top[9];
-                        top[8] = ((y_112 > x_96) ? y_112 : x_96);
-                        top[9] = ((y_112 > x_96) ? x_96 : y_112);
-                        unsigned long long x_97 = top[10];
-                        unsigned long long y_113 = top[11];
-                        top[10] = ((y_113 > x_97) ? y_113 : x_97);
-                        top[11] = ((y_113 > x_97) ? x_97 : y_113);
-                        unsigned long long x_98 = top[12];
-                        unsigned long long y_114 = top[13];
-                        top[12] = ((y_114 > x_98) ? y_114 : x_98);
-                        top[13] = ((y_114 > x_98) ? x_98 : y_114);
-                        unsigned long long x_99 = top[14];
-                        unsigned long long y_115 = top[15];
-                        top[14] = ((y_115 > x_99) ? y_115 : x_99);
-                        top[15] = ((y_115 > x_99) ? x_99 : y_115);
-                        buf[0] = 0;
-                        buf[1] = 0;
-                        buf[2] = 0;
-                        buf[3] = 0;
-                        buf[4] = 0;
-                        buf[5] = 0;
-                        buf[6] = 0;
-                        buf[7] = 0;
+                    #pragma unroll 1
+                    for (int fl = 0; fl < 2; fl++) {
+                        int _warp_vote_30 = __any_sync(0xFFFFFFFF, cnt != 0);
+                        if (_warp_vote_30 != 0) {
+                            unsigned long long y0_8 = sbuf[te];
+                            buf[0] = ((0 < cnt) ? y0_8 : 0);
+                            unsigned long long y0_9 = sbuf[256 + te];
+                            buf[1] = ((1 < cnt) ? y0_9 : 0);
+                            unsigned long long y0_10 = sbuf[512 + te];
+                            buf[2] = ((2 < cnt) ? y0_10 : 0);
+                            unsigned long long y0_11 = sbuf[768 + te];
+                            buf[3] = ((3 < cnt) ? y0_11 : 0);
+                            unsigned long long y0_12 = sbuf[1024 + te];
+                            buf[4] = ((4 < cnt) ? y0_12 : 0);
+                            unsigned long long y0_13 = sbuf[1280 + te];
+                            buf[5] = ((5 < cnt) ? y0_13 : 0);
+                            unsigned long long y0_14 = sbuf[1536 + te];
+                            buf[6] = ((6 < cnt) ? y0_14 : 0);
+                            unsigned long long y0_15 = sbuf[1792 + te];
+                            buf[7] = ((7 < cnt) ? y0_15 : 0);
+                            if (8 < cnt) {
+                                unsigned long long y1_8 = sbuf[2048 + te];
+                                sbuf[te] = y1_8;
+                            }
+                            if (9 < cnt) {
+                                unsigned long long y1_9 = sbuf[2304 + te];
+                                sbuf[256 + te] = y1_9;
+                            }
+                            if (10 < cnt) {
+                                unsigned long long y1_10 = sbuf[2560 + te];
+                                sbuf[512 + te] = y1_10;
+                            }
+                            if (11 < cnt) {
+                                unsigned long long y1_11 = sbuf[2816 + te];
+                                sbuf[768 + te] = y1_11;
+                            }
+                            if (12 < cnt) {
+                                unsigned long long y1_12 = sbuf[3072 + te];
+                                sbuf[1024 + te] = y1_12;
+                            }
+                            if (13 < cnt) {
+                                unsigned long long y1_13 = sbuf[3328 + te];
+                                sbuf[1280 + te] = y1_13;
+                            }
+                            if (14 < cnt) {
+                                unsigned long long y1_14 = sbuf[3584 + te];
+                                sbuf[1536 + te] = y1_14;
+                            }
+                            if (15 < cnt) {
+                                unsigned long long y1_15 = sbuf[3840 + te];
+                                sbuf[1792 + te] = y1_15;
+                            }
+                            unsigned long long x_50 = buf[0];
+                            unsigned long long y_58 = buf[1];
+                            buf[0] = ((y_58 > x_50) ? y_58 : x_50);
+                            buf[1] = ((y_58 > x_50) ? x_50 : y_58);
+                            unsigned long long x_50_1 = buf[2];
+                            unsigned long long y_58_1 = buf[3];
+                            buf[2] = ((y_58_1 > x_50_1) ? y_58_1 : x_50_1);
+                            buf[3] = ((y_58_1 > x_50_1) ? x_50_1 : y_58_1);
+                            unsigned long long x_51 = buf[4];
+                            unsigned long long y_59 = buf[5];
+                            buf[4] = ((y_59 > x_51) ? y_59 : x_51);
+                            buf[5] = ((y_59 > x_51) ? x_51 : y_59);
+                            unsigned long long x_52 = buf[6];
+                            unsigned long long y_60 = buf[7];
+                            buf[6] = ((y_60 > x_52) ? y_60 : x_52);
+                            buf[7] = ((y_60 > x_52) ? x_52 : y_60);
+                            unsigned long long x_53 = buf[0];
+                            unsigned long long y_61 = buf[2];
+                            buf[0] = ((y_61 > x_53) ? y_61 : x_53);
+                            buf[2] = ((y_61 > x_53) ? x_53 : y_61);
+                            unsigned long long x_54 = buf[1];
+                            unsigned long long y_62 = buf[3];
+                            buf[1] = ((y_62 > x_54) ? y_62 : x_54);
+                            buf[3] = ((y_62 > x_54) ? x_54 : y_62);
+                            unsigned long long x_55 = buf[4];
+                            unsigned long long y_63 = buf[6];
+                            buf[4] = ((y_63 > x_55) ? y_63 : x_55);
+                            buf[6] = ((y_63 > x_55) ? x_55 : y_63);
+                            unsigned long long x_56 = buf[5];
+                            unsigned long long y_64 = buf[7];
+                            buf[5] = ((y_64 > x_56) ? y_64 : x_56);
+                            buf[7] = ((y_64 > x_56) ? x_56 : y_64);
+                            unsigned long long x_57 = buf[1];
+                            unsigned long long y_65 = buf[2];
+                            buf[1] = ((y_65 > x_57) ? y_65 : x_57);
+                            buf[2] = ((y_65 > x_57) ? x_57 : y_65);
+                            unsigned long long x_58 = buf[5];
+                            unsigned long long y_66 = buf[6];
+                            buf[5] = ((y_66 > x_58) ? y_66 : x_58);
+                            buf[6] = ((y_66 > x_58) ? x_58 : y_66);
+                            unsigned long long x_59 = buf[0];
+                            unsigned long long y_67 = buf[4];
+                            buf[0] = ((y_67 > x_59) ? y_67 : x_59);
+                            buf[4] = ((y_67 > x_59) ? x_59 : y_67);
+                            unsigned long long x_60 = buf[1];
+                            unsigned long long y_68 = buf[5];
+                            buf[1] = ((y_68 > x_60) ? y_68 : x_60);
+                            buf[5] = ((y_68 > x_60) ? x_60 : y_68);
+                            unsigned long long x_61 = buf[2];
+                            unsigned long long y_69 = buf[6];
+                            buf[2] = ((y_69 > x_61) ? y_69 : x_61);
+                            buf[6] = ((y_69 > x_61) ? x_61 : y_69);
+                            unsigned long long x_62 = buf[3];
+                            unsigned long long y_70 = buf[7];
+                            buf[3] = ((y_70 > x_62) ? y_70 : x_62);
+                            buf[7] = ((y_70 > x_62) ? x_62 : y_70);
+                            unsigned long long x_63 = buf[2];
+                            unsigned long long y_71 = buf[4];
+                            buf[2] = ((y_71 > x_63) ? y_71 : x_63);
+                            buf[4] = ((y_71 > x_63) ? x_63 : y_71);
+                            unsigned long long x_64 = buf[3];
+                            unsigned long long y_72 = buf[5];
+                            buf[3] = ((y_72 > x_64) ? y_72 : x_64);
+                            buf[5] = ((y_72 > x_64) ? x_64 : y_72);
+                            unsigned long long x_65 = buf[1];
+                            unsigned long long y_73 = buf[2];
+                            buf[1] = ((y_73 > x_65) ? y_73 : x_65);
+                            buf[2] = ((y_73 > x_65) ? x_65 : y_73);
+                            unsigned long long x_66 = buf[3];
+                            unsigned long long y_74 = buf[4];
+                            buf[3] = ((y_74 > x_66) ? y_74 : x_66);
+                            buf[4] = ((y_74 > x_66) ? x_66 : y_74);
+                            unsigned long long x_67 = buf[5];
+                            unsigned long long y_75 = buf[6];
+                            buf[5] = ((y_75 > x_67) ? y_75 : x_67);
+                            buf[6] = ((y_75 > x_67) ? x_67 : y_75);
+                            unsigned long long y_76 = buf[0];
+                            top[15] = ((y_76 > top[15]) ? y_76 : top[15]);
+                            unsigned long long y_77 = buf[1];
+                            top[14] = ((y_77 > top[14]) ? y_77 : top[14]);
+                            unsigned long long y_78 = buf[2];
+                            top[13] = ((y_78 > top[13]) ? y_78 : top[13]);
+                            unsigned long long y_79 = buf[3];
+                            top[12] = ((y_79 > top[12]) ? y_79 : top[12]);
+                            unsigned long long y_80 = buf[4];
+                            top[11] = ((y_80 > top[11]) ? y_80 : top[11]);
+                            unsigned long long y_81 = buf[5];
+                            top[10] = ((y_81 > top[10]) ? y_81 : top[10]);
+                            unsigned long long y_82 = buf[6];
+                            top[9] = ((y_82 > top[9]) ? y_82 : top[9]);
+                            unsigned long long y_83 = buf[7];
+                            top[8] = ((y_83 > top[8]) ? y_83 : top[8]);
+                            unsigned long long x_68 = top[0];
+                            unsigned long long y_84 = top[8];
+                            top[0] = ((y_84 > x_68) ? y_84 : x_68);
+                            top[8] = ((y_84 > x_68) ? x_68 : y_84);
+                            unsigned long long x_69 = top[1];
+                            unsigned long long y_85 = top[9];
+                            top[1] = ((y_85 > x_69) ? y_85 : x_69);
+                            top[9] = ((y_85 > x_69) ? x_69 : y_85);
+                            unsigned long long x_70 = top[2];
+                            unsigned long long y_86 = top[10];
+                            top[2] = ((y_86 > x_70) ? y_86 : x_70);
+                            top[10] = ((y_86 > x_70) ? x_70 : y_86);
+                            unsigned long long x_71 = top[3];
+                            unsigned long long y_87 = top[11];
+                            top[3] = ((y_87 > x_71) ? y_87 : x_71);
+                            top[11] = ((y_87 > x_71) ? x_71 : y_87);
+                            unsigned long long x_72 = top[4];
+                            unsigned long long y_88 = top[12];
+                            top[4] = ((y_88 > x_72) ? y_88 : x_72);
+                            top[12] = ((y_88 > x_72) ? x_72 : y_88);
+                            unsigned long long x_73 = top[5];
+                            unsigned long long y_89 = top[13];
+                            top[5] = ((y_89 > x_73) ? y_89 : x_73);
+                            top[13] = ((y_89 > x_73) ? x_73 : y_89);
+                            unsigned long long x_74 = top[6];
+                            unsigned long long y_90 = top[14];
+                            top[6] = ((y_90 > x_74) ? y_90 : x_74);
+                            top[14] = ((y_90 > x_74) ? x_74 : y_90);
+                            unsigned long long x_75 = top[7];
+                            unsigned long long y_91 = top[15];
+                            top[7] = ((y_91 > x_75) ? y_91 : x_75);
+                            top[15] = ((y_91 > x_75) ? x_75 : y_91);
+                            unsigned long long x_76 = top[0];
+                            unsigned long long y_92 = top[4];
+                            top[0] = ((y_92 > x_76) ? y_92 : x_76);
+                            top[4] = ((y_92 > x_76) ? x_76 : y_92);
+                            unsigned long long x_77 = top[1];
+                            unsigned long long y_93 = top[5];
+                            top[1] = ((y_93 > x_77) ? y_93 : x_77);
+                            top[5] = ((y_93 > x_77) ? x_77 : y_93);
+                            unsigned long long x_78 = top[2];
+                            unsigned long long y_94 = top[6];
+                            top[2] = ((y_94 > x_78) ? y_94 : x_78);
+                            top[6] = ((y_94 > x_78) ? x_78 : y_94);
+                            unsigned long long x_79 = top[3];
+                            unsigned long long y_95 = top[7];
+                            top[3] = ((y_95 > x_79) ? y_95 : x_79);
+                            top[7] = ((y_95 > x_79) ? x_79 : y_95);
+                            unsigned long long x_80 = top[8];
+                            unsigned long long y_96 = top[12];
+                            top[8] = ((y_96 > x_80) ? y_96 : x_80);
+                            top[12] = ((y_96 > x_80) ? x_80 : y_96);
+                            unsigned long long x_81 = top[9];
+                            unsigned long long y_97 = top[13];
+                            top[9] = ((y_97 > x_81) ? y_97 : x_81);
+                            top[13] = ((y_97 > x_81) ? x_81 : y_97);
+                            unsigned long long x_82 = top[10];
+                            unsigned long long y_98 = top[14];
+                            top[10] = ((y_98 > x_82) ? y_98 : x_82);
+                            top[14] = ((y_98 > x_82) ? x_82 : y_98);
+                            unsigned long long x_83 = top[11];
+                            unsigned long long y_99 = top[15];
+                            top[11] = ((y_99 > x_83) ? y_99 : x_83);
+                            top[15] = ((y_99 > x_83) ? x_83 : y_99);
+                            unsigned long long x_84 = top[0];
+                            unsigned long long y_100 = top[2];
+                            top[0] = ((y_100 > x_84) ? y_100 : x_84);
+                            top[2] = ((y_100 > x_84) ? x_84 : y_100);
+                            unsigned long long x_85 = top[1];
+                            unsigned long long y_101 = top[3];
+                            top[1] = ((y_101 > x_85) ? y_101 : x_85);
+                            top[3] = ((y_101 > x_85) ? x_85 : y_101);
+                            unsigned long long x_86 = top[4];
+                            unsigned long long y_102 = top[6];
+                            top[4] = ((y_102 > x_86) ? y_102 : x_86);
+                            top[6] = ((y_102 > x_86) ? x_86 : y_102);
+                            unsigned long long x_87 = top[5];
+                            unsigned long long y_103 = top[7];
+                            top[5] = ((y_103 > x_87) ? y_103 : x_87);
+                            top[7] = ((y_103 > x_87) ? x_87 : y_103);
+                            unsigned long long x_88 = top[8];
+                            unsigned long long y_104 = top[10];
+                            top[8] = ((y_104 > x_88) ? y_104 : x_88);
+                            top[10] = ((y_104 > x_88) ? x_88 : y_104);
+                            unsigned long long x_89 = top[9];
+                            unsigned long long y_105 = top[11];
+                            top[9] = ((y_105 > x_89) ? y_105 : x_89);
+                            top[11] = ((y_105 > x_89) ? x_89 : y_105);
+                            unsigned long long x_90 = top[12];
+                            unsigned long long y_106 = top[14];
+                            top[12] = ((y_106 > x_90) ? y_106 : x_90);
+                            top[14] = ((y_106 > x_90) ? x_90 : y_106);
+                            unsigned long long x_91 = top[13];
+                            unsigned long long y_107 = top[15];
+                            top[13] = ((y_107 > x_91) ? y_107 : x_91);
+                            top[15] = ((y_107 > x_91) ? x_91 : y_107);
+                            unsigned long long x_92 = top[0];
+                            unsigned long long y_108 = top[1];
+                            top[0] = ((y_108 > x_92) ? y_108 : x_92);
+                            top[1] = ((y_108 > x_92) ? x_92 : y_108);
+                            unsigned long long x_93 = top[2];
+                            unsigned long long y_109 = top[3];
+                            top[2] = ((y_109 > x_93) ? y_109 : x_93);
+                            top[3] = ((y_109 > x_93) ? x_93 : y_109);
+                            unsigned long long x_94 = top[4];
+                            unsigned long long y_110 = top[5];
+                            top[4] = ((y_110 > x_94) ? y_110 : x_94);
+                            top[5] = ((y_110 > x_94) ? x_94 : y_110);
+                            unsigned long long x_95 = top[6];
+                            unsigned long long y_111 = top[7];
+                            top[6] = ((y_111 > x_95) ? y_111 : x_95);
+                            top[7] = ((y_111 > x_95) ? x_95 : y_111);
+                            unsigned long long x_96 = top[8];
+                            unsigned long long y_112 = top[9];
+                            top[8] = ((y_112 > x_96) ? y_112 : x_96);
+                            top[9] = ((y_112 > x_96) ? x_96 : y_112);
+                            unsigned long long x_97 = top[10];
+                            unsigned long long y_113 = top[11];
+                            top[10] = ((y_113 > x_97) ? y_113 : x_97);
+                            top[11] = ((y_113 > x_97) ? x_97 : y_113);
+                            unsigned long long x_98 = top[12];
+                            unsigned long long y_114 = top[13];
+                            top[12] = ((y_114 > x_98) ? y_114 : x_98);
+                            top[13] = ((y_114 > x_98) ? x_98 : y_114);
+                            unsigned long long x_99 = top[14];
+                            unsigned long long y_115 = top[15];
+                            top[14] = ((y_115 > x_99) ? y_115 : x_99);
+                            top[15] = ((y_115 > x_99) ? x_99 : y_115);
+                            int _max_31 = ((cnt - 8) > (0) ? (cnt - 8) : (0));
+                            cnt = _max_31;
+                        }
                     }
                     if (live_0 != 0) {
                         long long dst = (long long)((int)blockIdx.x + j) * pool_piece_stride + (long long)((wg * 128 + lrow) * 16);

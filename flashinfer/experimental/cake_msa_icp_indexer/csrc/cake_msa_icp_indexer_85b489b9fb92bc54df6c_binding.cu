@@ -99,7 +99,7 @@ void Run(TensorView a_pool, TensorView a_qo_indptr, TensorView a_work_info, Tens
   void* kernel_args[] = {&v_pool, &v_qo_indptr, &v_work_info, &v_work_range, &v_carrier, &v_total_q, &v_batch, &v_num_ctas, &v_pool_piece_stride, &v_carrier_stride_h, &v_carrier_stride_t};
   cudaLaunchConfig_t config{};
   config.gridDim = dim3(static_cast<unsigned>(grid_x), static_cast<unsigned>(grid_y), static_cast<unsigned>(grid_z));
-  config.blockDim = dim3(128, 1, 1);
+  config.blockDim = dim3(32, 1, 1);
   config.dynamicSmemBytes = 0;
   config.stream = stream;
   cudaLaunchAttribute attrs[1] = {};
