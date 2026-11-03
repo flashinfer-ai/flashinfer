@@ -12,6 +12,15 @@ from flashinfer.mla.cake_dsv4 import (
     resolve_cake_dsv4_sparse_metadata,
 )
 
+# The SM count the routing tests assume (B200 / B300).
+_SM_COUNT = 148
+
+
+@pytest.fixture(autouse=True)
+def _cpu_sm_count(monkeypatch):
+    """The host reads the device's SM count; these CPU tests route as on a 148-SM part."""
+    monkeypatch.setattr(cake, "_device_sm_count", lambda device: _SM_COUNT)
+
 
 # Both cache layouts and sink settings retain the same physical selection.
 def _canonical_query_tokens(batch_size: int, max_q_len: int, ragged: bool) -> int:
@@ -122,11 +131,19 @@ def _canonical_query_tokens(batch_size: int, max_q_len: int, ragged: bool) -> in
             id="case-07",
         ),
         pytest.param(
-            torch.float8_e4m3fn, 64, 3, 5, True, 260, 2, "fp8_lowhead_h64", id="case-08"
+            torch.float8_e4m3fn,
+            64,
+            3,
+            5,
+            True,
+            260,
+            2,
+            "fp8_h64_prefill_source_persistent_m64_multi_tile",
+            id="case-08",
         ),
-        # FP8/H64 rows admitted to the persistent body with >= 128
-        # tokens (dense 2 x 64) run the single-CTA M64 program; 127 tokens keep
-        # the FP8/H128 persistent program.
+        # FP8/H64 decode rows whose two-CTA-per-token grid exceeds the SM
+        # count (2 x 64 and 127 tokens on 148 SMs) run the single-CTA M64
+        # program; 74 tokens keep the FP8/H128 persistent program.
         pytest.param(
             torch.float8_e4m3fn,
             64,
@@ -146,8 +163,19 @@ def _canonical_query_tokens(batch_size: int, max_q_len: int, ragged: bool) -> in
             False,
             260,
             2,
-            "fp8_h128_prefill_source_persistent_uniform",
+            "fp8_h64_prefill_source_persistent_m64_multi_tile",
             id="w14-h64-w260-127tok",
+        ),
+        pytest.param(
+            torch.float8_e4m3fn,
+            64,
+            1,
+            74,
+            False,
+            260,
+            2,
+            "fp8_h128_prefill_source_persistent_uniform",
+            id="w14-h64-w260-74tok",
         ),
         pytest.param(
             torch.float8_e4m3fn,
@@ -172,7 +200,15 @@ def _canonical_query_tokens(batch_size: int, max_q_len: int, ragged: bool) -> in
             id="case-10",
         ),
         pytest.param(
-            torch.float8_e4m3fn, 64, 3, 5, True, 260, 2, "fp8_lowhead_h64", id="case-11"
+            torch.float8_e4m3fn,
+            64,
+            3,
+            5,
+            True,
+            260,
+            2,
+            "fp8_h64_prefill_source_persistent_m64_multi_tile",
+            id="case-11",
         ),
         pytest.param(
             torch.bfloat16,
@@ -1091,6 +1127,7 @@ def test_cake_dsv4_semantic_routes(
         sparse_topk=sparse_topk,
         compressed_page_size=page_size,
         num_query_tokens=_canonical_query_tokens(batch_size, max_q_len, ragged),
+        sm_count=_SM_COUNT,
     )
     if expected is ValueError:
         # Shapes without an exported kernel are rejected before any launch.
@@ -1132,6 +1169,7 @@ def test_bf16_h128_swa_and_topk4x_rows_use_the_persistent_prefill_body_from_64_t
         sparse_topk=sparse_topk,
         compressed_page_size=page_size,
         num_query_tokens=num_query_tokens,
+        sm_count=_SM_COUNT,
     )
     if expected is ValueError:
         with pytest.raises(ValueError, match="has no BF16 H128 kernel"):
@@ -1170,6 +1208,7 @@ def test_fp8_h128_rows_all_use_the_persistent_body(
             sparse_topk=sparse_topk,
             compressed_page_size=page_size,
             num_query_tokens=num_query_tokens,
+            sm_count=_SM_COUNT,
         )
         == expected
     )
@@ -1204,6 +1243,7 @@ def test_bf16_h64_compressed_rows_use_the_prefill_body_from_24_tokens(
             sparse_topk=sparse_topk,
             compressed_page_size=page_size,
             num_query_tokens=num_query_tokens,
+            sm_count=_SM_COUNT,
         )
         == expected
     )
@@ -1246,6 +1286,7 @@ def test_fp8_prefill_keeps_batch_and_cache_layout_predicates(
             sparse_topk=640 if num_heads == 64 else 1152,
             compressed_page_size=page_size,
             num_query_tokens=batch_size * 257,
+            sm_count=_SM_COUNT,
         )
         == expected
     )
@@ -2341,6 +2382,7 @@ def test_every_route_result_has_a_registered_kernel(monkeypatch, arch):
                             batch_size=batch_size,
                             compressed_page_size=page_size,
                             num_query_tokens=tokens,
+                            sm_count=_SM_COUNT,
                         )
                     except ValueError:
                         rejected += 1
@@ -2443,7 +2485,12 @@ def test_bf16_h128_prefill_launches_the_snake_body_for_tail_majority_rows(
             640,
             "fp8_h128_prefill_source_persistent_uniform",
         ),  # W5: 12 tokens, 5 tiles
-        (12, 2, 260, "fp8_lowhead_h64"),  # W5: 12 tokens, 2 tiles keep the cluster body
+        (
+            12,
+            2,
+            260,
+            "fp8_h64_prefill_source_persistent_m64_multi_tile",
+        ),  # 12 tokens, 2 tiles: the M64 body beats the H64 cluster body
         (16, 64, 640, "fp8_h128_prefill_source_persistent_uniform"),  # hardening-000018
         (64, 64, 640, "fp8_h128_prefill_source_persistent_uniform"),  # hardening-000030
         (
@@ -2464,7 +2511,13 @@ def test_bf16_h128_prefill_launches_the_snake_body_for_tail_majority_rows(
             128,
             "fp8_lowhead_prefill",
         ),  # hardening-000020: SWA producer < 128 tokens
-        (127, None, 128, "fp8_lowhead_prefill"),  # SWA producer below 128 tokens
+        (
+            74,
+            None,
+            128,
+            "fp8_lowhead_prefill",
+        ),  # SWA producer while 2 x tokens fit the SMs
+        (75, None, 128, "fp8_h64_prefill_source_persistent_m64"),  # second wave: M64
         (
             128,
             None,
@@ -2492,9 +2545,45 @@ def test_fp8_h64_rows_follow_the_persistent_body_rule(
             sparse_topk=sparse_topk,
             compressed_page_size=page_size,
             num_query_tokens=num_query_tokens,
+            sm_count=_SM_COUNT,
         )
         == expected
     )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("sm_count", [148, 152, 160])
+@pytest.mark.parametrize(
+    "sparse_topk,page_size,below",
+    [
+        (128, None, "fp8_lowhead_prefill"),
+        (640, 64, "fp8_h128_prefill_source_persistent_uniform"),
+        (204, 2, "fp8_h64_prefill_source_persistent_m64_multi_tile"),
+    ],
+)
+def test_fp8_h64_decode_rows_take_the_m64_body_once_two_ctas_per_token_exceed_the_sms(
+    sm_count, sparse_topk, page_size, below
+):
+    """The rule follows the device: ``2 * tokens > sm_count`` selects the M64 body."""
+    m64 = cake._fp8_h64_m64_program(sparse_topk)
+
+    def route(tokens):
+        return _route(
+            dtype=torch.float8_e4m3fn,
+            num_heads=64,
+            batch_size=tokens // 4 + 1,
+            max_q_len=4,
+            ragged=True,
+            sparse_topk=sparse_topk,
+            compressed_page_size=page_size,
+            num_query_tokens=tokens,
+            sm_count=sm_count,
+        )
+
+    assert route(sm_count // 2) == below
+    assert route(sm_count // 2 + 1) == m64
+    for tokens in (108, 120):
+        assert route(tokens) == m64
 
 
 @pytest.mark.cpu_only
@@ -2527,6 +2616,7 @@ def test_fp8_h64_m64_program_is_selected_by_the_item_width(
             sparse_topk=sparse_topk,
             compressed_page_size=page_size,
             num_query_tokens=num_query_tokens,
+            sm_count=_SM_COUNT,
         )
         == expected
     )
@@ -2810,6 +2900,7 @@ def test_workspace_requirement_is_exact_per_route():
         dtype=torch.bfloat16,
         num_heads=64,
         num_query_tokens=12,
+        sm_count=_SM_COUNT,
         sparse_topk=128,
         compressed_page_size=256,
         max_q_len=5,
@@ -2826,6 +2917,7 @@ def test_workspace_requirement_is_exact_per_route():
         dtype=torch.float8_e4m3fn,
         num_heads=128,
         num_query_tokens=1024,
+        sm_count=_SM_COUNT,
         sparse_topk=128,
         compressed_page_size=256,
         max_q_len=1,
@@ -2845,6 +2937,7 @@ def test_workspace_requirement_is_exact_per_route():
         dtype=torch.bfloat16,
         num_heads=32,
         num_query_tokens=4096,
+        sm_count=_SM_COUNT,
         sparse_topk=260,
         compressed_page_size=2,
         max_q_len=1,
@@ -2864,6 +2957,7 @@ def test_workspace_requirement_is_exact_per_route():
         dtype=torch.bfloat16,
         num_heads=32,
         num_query_tokens=20000,
+        sm_count=_SM_COUNT,
         sparse_topk=260,
         compressed_page_size=2,
         max_q_len=1,
@@ -2877,6 +2971,7 @@ def test_workspace_requirement_is_exact_per_route():
             dtype=torch.bfloat16,
             num_heads=16,
             num_query_tokens=4,
+            sm_count=_SM_COUNT,
             sparse_topk=260,
             compressed_page_size=2,
             max_q_len=1,
@@ -2906,6 +3001,7 @@ def test_route_plan_matches_the_dispatcher(monkeypatch, arch):
                             batch_size=batch_size,
                             compressed_page_size=page_size,
                             num_query_tokens=tokens,
+                            sm_count=_SM_COUNT,
                         )
                     except ValueError:
                         continue

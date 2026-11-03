@@ -126,6 +126,22 @@ def kind_slots(arch: str, route: str) -> dict[str, int]:
     return slots
 
 
+def tokown_slots(capacity: dict[str, int]) -> tuple[int, dict[str, int]]:
+    """The persistent program's slot count and the capacity each of its records ``capacity`` (name -> agreed
+    co-residency: CTAs, clusters for a cluster build) launches at.  The slots are agreed over the one-CTA-per-slot
+    records alone, ``min(TOKOWN_MAX_CTAS, their capacities)``, and each of them launches at the slots; a cluster
+    build (one slot = one cluster of ``launch.cluster[0]`` CTAs) is held to the slots and to its own capacity, so it
+    never lowers the slots, the workspace or the grid of another record."""
+    single = [
+        name for name in capacity if cake_jit.MODULES[name]["launch"]["cluster"][0] == 1
+    ]
+    slots = min([TOKOWN_MAX_CTAS, *(capacity[name] for name in single)])
+    return slots, {
+        name: slots if name in single else min(slots, capacity[name])
+        for name in capacity
+    }
+
+
 @dataclass
 class _KindWorkspace:
     """One program kind's share of the group's workspace."""
@@ -250,9 +266,10 @@ class CakeTpMoeFinalize:
             name for name in names if cake_jit.MODULES[name]["program"] == "tokown"
         ]
         if tokown:
-            slots["tokown"] = min(TOKOWN_MAX_CTAS, *(capacity[name] for name in tokown))
-            for name in tokown:
-                capacity[name] = slots["tokown"]
+            slots["tokown"], agreed = tokown_slots(
+                {name: capacity[name] for name in tokown}
+            )
+            capacity.update(agreed)
         kinds, total = cls._layout(names, slots)
         buffer = None
         try:

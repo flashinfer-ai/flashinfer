@@ -40,73 +40,6 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
-#define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 128
-#define TMEM_TMEM_S0_OFFSET 0
-#define TMEM_TMEM_S1_OFFSET 8
-#define TMEM_TMEM_STATS0_OFFSET 16
-#define TMEM_TMEM_STATS1_OFFSET 48
-#define TMEM_TMEM_O0_OFFSET 80
-#define TMEM_TMEM_O1_OFFSET 88
-#if __CUDA_ARCH__ == 1030
-#define NUM_KV_PIPE_STAGES 6
-#else
-#define NUM_KV_PIPE_STAGES 4
-#endif
-#define SMEM_SMEM_CORR0_OFF 1024
-#define SMEM_SMEM_CORR0_STAGE_BYTES 64
-#define SMEM_SMEM_CORR0_STRIDE 64
-#define SMEM_SMEM_CORR1_OFF 1088
-#define SMEM_SMEM_CORR1_STAGE_BYTES 64
-#define SMEM_SMEM_CORR1_STRIDE 64
-#define SMEM_SMEM_EXCH0_OFF 1152
-#define SMEM_SMEM_EXCH0_STAGE_BYTES 256
-#define SMEM_SMEM_EXCH0_STRIDE 256
-#define SMEM_SMEM_EXCH1_OFF 1408
-#define SMEM_SMEM_EXCH1_STAGE_BYTES 256
-#define SMEM_SMEM_EXCH1_STRIDE 256
-#define SMEM_SMEM_EXCH0_U32_OFF 1152
-#define SMEM_SMEM_EXCH0_U32_STAGE_BYTES 256
-#define SMEM_SMEM_EXCH0_U32_STRIDE 256
-#define SMEM_SMEM_EXCH1_U32_OFF 1408
-#define SMEM_SMEM_EXCH1_U32_STAGE_BYTES 256
-#define SMEM_SMEM_EXCH1_U32_STRIDE 256
-#define SMEM_SMEM_QT_OFF 1664
-#define SMEM_SMEM_QT_STAGE_BYTES 2048
-#define SMEM_SMEM_QT_STRIDE 2048
-#define SMEM_SMEM_KV_OFF 6144
-#define SMEM_SMEM_KV_STAGE_BYTES 32768
-#define SMEM_SMEM_KV_STRIDE 32768
-#define SMEM_SMEM_V_OFF 6144
-#define SMEM_SMEM_V_STAGE_BYTES 32768
-#define SMEM_SMEM_V_STRIDE 32768
-#if __CUDA_ARCH__ == 1030
-#define SMEM_SMEM_P0_OFF 202752
-#else
-#define SMEM_SMEM_P0_OFF 137216
-#endif
-#define SMEM_SMEM_P0_STAGE_BYTES 2048
-#define SMEM_SMEM_P0_STRIDE 2048
-#if __CUDA_ARCH__ == 1030
-#define SMEM_SMEM_P1_OFF 206848
-#else
-#define SMEM_SMEM_P1_OFF 141312
-#endif
-#define SMEM_SMEM_P1_STAGE_BYTES 2048
-#define SMEM_SMEM_P1_STRIDE 2048
-#if __CUDA_ARCH__ == 1030
-#define SMEM_SMEM_SK_FLAG_OFF 208896
-#else
-#define SMEM_SMEM_SK_FLAG_OFF 143360
-#endif
-#define SMEM_SMEM_SK_FLAG_STAGE_BYTES 16
-#define SMEM_SMEM_SK_FLAG_STRIDE 16
-#if __CUDA_ARCH__ == 1030
-#define SMEM_TOTAL 210944
-#else
-#define SMEM_TOTAL 145408
-#endif
-#define THREADS 512
 #define BLOCK_N 128
 #define HEAD_DIM 128
 #define TILE_Q 8
@@ -116,6 +49,7 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #else
 #define NUM_KV_STAGES 4
 #endif
+#define TMEM_NCOLS 128
 #define BATCH_SIZE 128
 #define NUM_Q_HEADS 32
 #define NUM_KV_HEADS 4
@@ -407,6 +341,14 @@ kernel_cake_fmha_decode_bf16_4a8ccd779ab91c5d2cb5(const __grid_constant__ CUtens
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&Qt))) : "memory");
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&K))) : "memory");
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&V))) : "memory");
+    if (warp == 13) {
+        if (elect_sync()) {
+            #pragma unroll
+            for (int line = 0; line < (BATCH_SIZE * 4 + 127) / 128; line++) {
+                asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(causal_seqlens_kv_global + (line * 32))));
+            }
+        }
+    }
 
 #if __CUDA_ARCH__ == 1030
     // Mbarrier init (17 pipeline groups, 0 ordered-sequence groups, 28 barriers)
@@ -646,7 +588,7 @@ kernel_cake_fmha_decode_bf16_4a8ccd779ab91c5d2cb5(const __grid_constant__ CUtens
                     causal_prefix = kv_len_b - Q_LEN;
                 }
                 int global_q_pos = causal_prefix + q_row_idx;
-                int visible_local_keys = global_q_pos + 1;
+                int visible_local_keys = ((global_q_pos + 1) < (kv_len_b) ? (global_q_pos + 1) : (kv_len_b));
                 int win_start = 0;
                 int num_n_blocks_total_0 = (max_local_seq_len + BLOCK_N - 1) / BLOCK_N;
                 int cta_n_blocks_1 = num_n_blocks_total_0 + num_n_blocks_total_0 % 2;
@@ -1004,7 +946,7 @@ kernel_cake_fmha_decode_bf16_4a8ccd779ab91c5d2cb5(const __grid_constant__ CUtens
                     causal_prefix_1 = kv_len_b_1 - Q_LEN;
                 }
                 int global_q_pos_1 = causal_prefix_1 + q_row_idx_1;
-                int visible_local_keys_1 = global_q_pos_1 + 1;
+                int visible_local_keys_1 = ((global_q_pos_1 + 1) < (kv_len_b_1) ? (global_q_pos_1 + 1) : (kv_len_b_1));
                 int win_start_1 = 0;
                 int num_n_blocks_total_0_1 = (max_local_seq_len + BLOCK_N - 1) / BLOCK_N;
                 int cta_n_blocks_1_1 = num_n_blocks_total_0_1 + num_n_blocks_total_0_1 % 2;
@@ -1363,7 +1305,7 @@ kernel_cake_fmha_decode_bf16_4a8ccd779ab91c5d2cb5(const __grid_constant__ CUtens
                     causal_prefix_2 = kv_len_b_2 - Q_LEN;
                 }
                 int global_q_pos_2 = causal_prefix_2 + q_row_idx_2;
-                int visible_local_keys_2 = global_q_pos_2 + 1;
+                int visible_local_keys_2 = ((global_q_pos_2 + 1) < (kv_len_b_2) ? (global_q_pos_2 + 1) : (kv_len_b_2));
                 int win_start_2 = 0;
                 int num_n_blocks_total_0_2 = (max_local_seq_len + BLOCK_N - 1) / BLOCK_N;
                 int cta_n_blocks_1_2 = num_n_blocks_total_0_2 + num_n_blocks_total_0_2 % 2;
@@ -1906,7 +1848,7 @@ kernel_cake_fmha_decode_bf16_4a8ccd779ab91c5d2cb5(const __grid_constant__ CUtens
                     causal_prefix_3 = kv_len_b_3 - Q_LEN;
                 }
                 int global_q_pos_3 = causal_prefix_3 + q_row_idx_3;
-                int visible_local_keys_3 = global_q_pos_3 + 1;
+                int visible_local_keys_3 = ((global_q_pos_3 + 1) < (kv_len_b_3) ? (global_q_pos_3 + 1) : (kv_len_b_3));
                 int win_start_3 = 0;
                 int num_n_blocks_total_0_3 = (max_local_seq_len + BLOCK_N - 1) / BLOCK_N;
                 int cta_n_blocks_1_3 = num_n_blocks_total_0_3 + num_n_blocks_total_0_3 % 2;
@@ -2009,6 +1951,13 @@ kernel_cake_fmha_decode_bf16_4a8ccd779ab91c5d2cb5(const __grid_constant__ CUtens
                             pg_v_la[0 + 2] = _ivld_1.z;
                             pg_v_la[0 + 3] = _ivld_1.w;
                         }
+                        int keys_left = visible_local_keys_3 - vpg_base_la * 16;
+                        #pragma unroll
+                        for (int j = 0; j < 4; j++) {
+                            if (j * 16 >= keys_left) {
+                                pg_v_la[j] = 1073741824;
+                            }
+                        }
                         int pg_nk_la[4];
                         {
                             const int4* _ivptr_2 = reinterpret_cast<const int4*>(page_table + pt_base_la + npg_base_la);
@@ -2100,6 +2049,13 @@ kernel_cake_fmha_decode_bf16_4a8ccd779ab91c5d2cb5(const __grid_constant__ CUtens
                             tpg_v_la[0 + 1] = _ivld_3.y;
                             tpg_v_la[0 + 2] = _ivld_3.z;
                             tpg_v_la[0 + 3] = _ivld_3.w;
+                        }
+                        int keys_left_1 = visible_local_keys_3 - tvpg_base_la * 16;
+                        #pragma unroll
+                        for (int j_1 = 0; j_1 < 4; j_1++) {
+                            if (j_1 * 16 >= keys_left_1) {
+                                tpg_v_la[j_1] = 1073741824;
+                            }
                         }
 #if __CUDA_ARCH__ == 1030
                         int _stage_kv_empty_2 = (int)((unsigned int)tail_ni_la % 6);
@@ -2193,7 +2149,7 @@ kernel_cake_fmha_decode_bf16_4a8ccd779ab91c5d2cb5(const __grid_constant__ CUtens
                     causal_prefix_4 = kv_len_b_4 - Q_LEN;
                 }
                 int global_q_pos_4 = causal_prefix_4 + q_row_idx_4;
-                int visible_local_keys_4 = global_q_pos_4 + 1;
+                int visible_local_keys_4 = ((global_q_pos_4 + 1) < (kv_len_b_4) ? (global_q_pos_4 + 1) : (kv_len_b_4));
                 int win_start_4 = 0;
                 int num_n_blocks_total_0_4 = (max_local_seq_len + BLOCK_N - 1) / BLOCK_N;
                 int cta_n_blocks_1_4 = num_n_blocks_total_0_4 + num_n_blocks_total_0_4 % 2;
@@ -2303,6 +2259,13 @@ kernel_cake_fmha_decode_bf16_4a8ccd779ab91c5d2cb5(const __grid_constant__ CUtens
                             pg_v[0 + 2] = _ivld_1.z;
                             pg_v[0 + 3] = _ivld_1.w;
                         }
+                        int keys_left_2 = visible_local_keys_4 - (vpg_base + 4) * 16;
+                        #pragma unroll
+                        for (int j_2 = 0; j_2 < 4; j_2++) {
+                            if (j_2 * 16 >= keys_left_2) {
+                                pg_v[j_2] = 1073741824;
+                            }
+                        }
                         int pg_nk[4];
                         {
                             const int4* _ivptr_2 = reinterpret_cast<const int4*>(page_table + pt_base + npg_base + 4);
@@ -2396,6 +2359,13 @@ kernel_cake_fmha_decode_bf16_4a8ccd779ab91c5d2cb5(const __grid_constant__ CUtens
                             tpg_v[0 + 1] = _ivld_3.y;
                             tpg_v[0 + 2] = _ivld_3.z;
                             tpg_v[0 + 3] = _ivld_3.w;
+                        }
+                        int keys_left_3 = visible_local_keys_4 - (tvpg_base + 4) * 16;
+                        #pragma unroll
+                        for (int j_3 = 0; j_3 < 4; j_3++) {
+                            if (j_3 * 16 >= keys_left_3) {
+                                tpg_v[j_3] = 1073741824;
+                            }
                         }
 #if __CUDA_ARCH__ == 1030
                         int _stage_kv_empty_5 = (int)((unsigned int)tail_ni % 6);

@@ -1408,6 +1408,39 @@ def test_dense_route_table_is_catalog_driven():
     assert not _runtime.dense_route_available(32, 0, 4096)
 
 
+@pytest.mark.parametrize("queries", [1030, 1027])
+def test_fp8_mqa_logits_row_ranges(queries, monkeypatch):
+    """A 32-head call whose logits pass ``MAX_LAUNCH_LOGITS`` runs one launch per
+    range of query rows (the last range re-anchored to end at Q) with the same bits
+    as one launch, and a plan over that many logits is refused."""
+    _skip_unless_exported()
+    keys, heads = 4096, 32
+    arch = _runtime.device_arch(torch.device("cuda"))
+    if not _runtime.dense_route_available(heads, queries, keys, arch=arch):
+        pytest.skip(
+            f"catalog has no admitted route for H={heads}, Q={queries}, K={keys} on {arch}"
+        )
+    from flashinfer.dense_mqa import fp8_mqa_logits
+
+    torch.manual_seed(5)
+    q = torch.randn(queries, heads, 128, device="cuda").to(torch.float8_e4m3fn)
+    kv = torch.randn(keys, 128, device="cuda").to(torch.float8_e4m3fn)
+    scales = torch.rand(keys, device="cuda") + 0.5
+    weights = torch.randn(queries, heads, device="cuda")
+    ke = torch.arange(keys - queries + 1, keys + 1, device="cuda", dtype=torch.int32)
+    ks = torch.clamp(ke - 1000, min=0)
+    whole = fp8_mqa_logits(q, (kv, scales), weights, ks, ke).clone()
+    # 256 rows of logits per launch: five ranges, the last one short.
+    monkeypatch.setattr(
+        _runtime, "MAX_LAUNCH_LOGITS", 256 * _runtime.logits_stride(keys)
+    )
+    split = fp8_mqa_logits(q, (kv, scales), weights, ks, ke)
+    torch.cuda.synchronize()
+    assert torch.equal(split, whole)
+    with pytest.raises(ValueError, match="row ranges"):
+        _runtime.DenseMqaPlan("fp8", q, kv, weights, ks, ke, kv_scales=scales)
+
+
 @pytest.mark.parametrize(
     "queries,keys,heads",
     [
