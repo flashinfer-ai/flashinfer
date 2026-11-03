@@ -1895,6 +1895,23 @@ class MlaDecodeTs(Nvfp4KVConfig):
     ) -> None:
         """MLA decode TS kernel: persistent tile-scheduled execution."""
         seq_len_q = self.seq_len_q if self.fixed_seqlen else max_q_len
+        # PDL bookend. This predicate is verbatim the use_pdl= launch attribute
+        # of this grid (use_one_wave_reducer_pdl), so the two halves cannot
+        # drift. The LAUNCH_DEPENDENTS half is already published by the MMA warp
+        # at retirement; the WAIT half was missing, so the grid could read
+        # predecessor-written metadata -- the sparse top-k lengths bound below,
+        # and cache_seqs via the task manager -- before that write completed.
+        # The acquire sits at body entry, positionally as in the 1CTA sibling,
+        # because the sparse arm's first statement already binds live top-k
+        # lengths, and both arms of the later early-exit test are then covered
+        # by position instead of by enumerating the reads under each one. On
+        # the dense arm this forgoes the overlap of SMEM/mbarrier/TMEM setup
+        # that an acquire placed just before the task manager would keep; the
+        # single dominating acquire is preferred over that overlap, and
+        # splitting the two sites is a measured change on its own.
+        use_pdl_bookend = acc_o is not None and not self.is_persistent
+        if cutlass.const_expr(use_pdl_bookend):
+            prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
         if cutlass.const_expr(self.direct_sparse):
             from ..helpers.sparse_indices import bind_sparse_kv_indices
 
@@ -2454,7 +2471,7 @@ class MlaDecodeTs(Nvfp4KVConfig):
             )
             # Each producer CTA publishes completion only after its paired
             # TMEM lifetime and all scheduled output work have retired.
-            if cutlass.const_expr(acc_o is not None and not self.is_persistent):
+            if cutlass.const_expr(use_pdl_bookend):
                 if prims.elect_sync():
                     prims.griddepcontrol(kind=prims.GridDepAction.LAUNCH_DEPENDENTS)
 
