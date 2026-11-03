@@ -272,10 +272,7 @@ def _get_cache_buf(
 
 
 _stream_cache_buf: Dict[Tuple[str, torch.device, int], torch.Tensor] = {}
-# These buffers outlive any one call, so they must not land in a private pool
-# active when they are first allocated (CUDA graph capture, torch.compile
-# cudagraph trees), which only allows tensors it tracks. A MemPool belongs to
-# the device it was created on, hence one per device.
+# Per-device private pools keep these long-lived buffers out of CUDA graph pools.
 _stream_cache_mem_pools: Dict[int, torch.cuda.MemPool] = {}
 
 
