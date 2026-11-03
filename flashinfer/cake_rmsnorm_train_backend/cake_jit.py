@@ -4435,7 +4435,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "sum_bytes": 49152,
         },
     },
-    # sm_100a H1536 f32 weight: (32768, inf] above T 32768 for dw accuracy (the det pair's worst dw error exceeds the FP32 eager reference's at T 33280 on B200, 0.6840 against 0.6219 of the per-element budget); backward time 0.942-0.965x the det pair's from T 32769 to 36864 in two timing sessions, FI bench ratio < 1 against the det pair in both sessions above T 36864 (B200)
+    # sm_100a H1536 f32 weight: (32768, inf] above T 32768 for dw accuracy (the det pair's worst dw error exceeds the FP32 eager reference's at T 33280 on B200, 0.6840 against 0.6219 of the per-element budget); backward time 0.941-0.965x the det pair's at T 32769, 33280, 34816 and 36864 in two timing sessions, FI bench ratio < 1 against the det pair in both sessions above T 36864 (B200)
     "cake_rmsnorm_train_4b6981c10fd40a9d8aec": {
         "arches": [
             "sm_100a",
@@ -5128,7 +5128,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "sum_bytes": 65536,
         },
     },
-    # sm_103a H256 bf16 weight: (4608, 5120] backward time 1.036-1.120x the det pair's at 5112 and 5120 rows in both timing sessions (GB300); above 5120 rows the deterministic package's pairs run, except from 93184 to 139264 rows, where the twosum single kernel runs
+    # sm_103a H256 bf16 weight: (4608, 5120] backward time 1.036-1.120x the det pair's at 5112 and 5120 rows in both timing sessions (GB300); above 5120 rows det pairs run, except from 93184 to 139264 rows, where the twosum single kernel runs
     "cake_rmsnorm_train_195c4317b51bb4ea1137__4608_5120": {
         "arches": [
             "sm_103a",
@@ -5161,7 +5161,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "sum_bytes": 4096,
         },
     },
-    # sm_103a H256 f32 weight: (4608, 5120] backward time 1.031-1.095x the det pair's at 5112 and 5120 rows in both timing sessions (GB300); above 5120 rows the deterministic package's pairs run, except from 93184 to 139264 rows, where the twosum single kernel runs
+    # sm_103a H256 f32 weight: (4608, 5120] backward time 1.031-1.095x the det pair's at 5112 and 5120 rows in both timing sessions (GB300); above 5120 rows det pairs run, except from 93184 to 139264 rows, where the twosum single kernel runs
     "cake_rmsnorm_train_8de0131445eed6eeabb7__4608_5120": {
         "arches": [
             "sm_103a",
@@ -5557,7 +5557,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "sum_bytes": 0,
         },
     },
-    # sm_107a H256 bf16 weight: (3584, 36864] backward time 0.893-0.937x the det pair's at 16384 rows, 0.981-1.075x at 4096, 24576, 32768 and 32772 rows, 1.025-1.142x at 6144 and 6400 rows; 4 to 14 timing sessions per row count (R200, 212 and 216 SMs)
+    # sm_107a H256 bf16 weight: (3584, 36864] backward time 0.893-0.937x the det pair's at 16384 rows, 0.981-1.072x at 4096, 24576, 32768 and 32772 rows, 1.025-1.142x at 6144 and 6400 rows; 4 to 10 timing sessions per row count (R200, 212 SMs)
     "cake_rmsnorm_train_195c4317b51bb4ea1137__3584_36864": {
         "arches": [
             "sm_107a",
@@ -5590,7 +5590,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "sum_bytes": 4096,
         },
     },
-    # sm_107a H256 f32 weight: (1536, 36864] for dw accuracy (the det pair's worst dw error exceeds the FP32 eager reference's at 2048 rows (512 tokens of 4 heads) on R200 with 212 SMs, 0.1435 against 0.1158 of the per-element budget); backward time 1.102-1.165x the det pair's at 1537, 2560 and 3584 rows in two timing sessions (R200, 212 SMs), 0.883-0.929x at 16384 rows, 0.975-1.024x at 24576 rows, 1.008-1.120x at 4096, 6144, 6400, 32768 and 32772 rows; 4 to 8 timing sessions per row count (R200, 212 and 216 SMs)
+    # sm_107a H256 f32 weight: (1536, 36864] above 1536 rows for dw accuracy (the det pair's worst dw error exceeds the FP32 eager reference's at 2048 rows (512 tokens of 4 heads) on R200 with 212 SMs, 0.1435 against 0.1158 of the per-element budget); backward time 1.102-1.165x the det pair's at 1537, 2560 and 3584 rows in two timing sessions, and 0.883-0.929x at 16384 rows, 0.975-1.024x at 24576 rows and 1.008-1.120x at 4096, 6144, 6400, 32768 and 32772 rows in 4 to 6 timing sessions per row count (R200, 212 SMs)
     "cake_rmsnorm_train_8de0131445eed6eeabb7__1536_36864": {
         "arches": [
             "sm_107a",
@@ -5623,7 +5623,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "sum_bytes": 4096,
         },
     },
-    # sm_107a H6144 residual bf16 weight: (7168, inf] backward time 0.964-0.988x the det pair's at T 14928, 16384, 32768 and 65536 in both timing sessions on R200 with 216 SMs, 1.044-1.073x in all four with 212 SMs
+    # sm_107a H6144 residual bf16 weight: (7168, inf] backward time 1.044-1.073x the det pair's at T 14928, 16384, 32768 and 65536 in all four timing sessions (R200, 212 SMs)
     "cake_rmsnorm_train_87d2866c1ea3bcc08b13": {
         "arches": [
             "sm_107a",
@@ -5656,7 +5656,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "sum_bytes": 196608,
         },
     },
-    # sm_107a H6144 residual f32 weight: (7168, inf] backward time 0.963-0.988x the det pair's at T 14928, 16384, 32768 and 65536 in both timing sessions on R200 with 216 SMs, 1.044-1.071x in all four with 212 SMs
+    # sm_107a H6144 residual f32 weight: (7168, inf] backward time 1.044-1.071x the det pair's at T 14928, 16384, 32768 and 65536 in all four timing sessions (R200, 212 SMs)
     "cake_rmsnorm_train_647589443d4915ca8fde": {
         "arches": [
             "sm_107a",
@@ -5689,7 +5689,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "sum_bytes": 196608,
         },
     },
-    # sm_107a H6144 residual bf16 weight: (448, 3584] backward time 1.009-1.046x the det pair's at T 1024 on R200 with 212 SMs (four timing sessions) and 0.989-1.005x with 216 SMs (two)
+    # sm_107a H6144 residual bf16 weight: (448, 3584] backward time 1.009-1.046x the det pair's at T 1024 in four timing sessions (R200, 212 SMs)
     "cake_rmsnorm_train_864e84f3d874f850c091__448_3584": {
         "arches": [
             "sm_107a",
@@ -5722,7 +5722,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "sum_bytes": 0,
         },
     },
-    # sm_107a H6144 residual f32 weight: (448, 3584] backward time 1.039-1.050x the det pair's at T 1024 on R200 with 212 SMs (four timing sessions) and 0.991-1.003x with 216 SMs (two)
+    # sm_107a H6144 residual f32 weight: (448, 3584] backward time 1.039-1.050x the det pair's at T 1024 in four timing sessions (R200, 212 SMs)
     "cake_rmsnorm_train_71d36617003ab7742a77__448_3584": {
         "arches": [
             "sm_107a",
@@ -6151,7 +6151,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "sum_bytes": 196608,
         },
     },
-    # sm_107a H6144 f32 weight: (30720, inf] above T 30720 for dw accuracy (the det pair's worst dw element reaches 0.867 of the per-element budget at T 30784 on R200 with 212 SMs and exceeds the budget at T 31040 (1.057 of it) and 32768 with 212 SMs and at T 34816 with 216 SMs; its worst dw error also exceeds the FP32 eager reference's at T 30784)
+    # sm_107a H6144 f32 weight: (28672, inf] above T 28672 for dw accuracy (the det pair's worst dw error exceeds the FP32 eager reference's at T 29184 on R200 with 216 SMs, 0.8224 against 0.8121 of the per-element budget; its worst dw element reaches 0.867 of the budget at T 30784 on R200 with 212 SMs and exceeds the budget at T 31040 (1.057 of it) and 32768 with 212 SMs and at T 34816 with 216 SMs)
     "cake_rmsnorm_train_e77387f14390ba486055": {
         "arches": [
             "sm_107a",
@@ -6174,7 +6174,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "library": "cake_rmsnorm_train_e77387f14390ba486055",
         "role": "bwd_main_w32",
         "select_rule": {
-            "above": 30720,
+            "above": 28672,
             "at_most": None,
             "kind": "rows_between",
         },
@@ -6646,7 +6646,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "sum_bytes": 32768,
         },
     },
-    # sm_103a H256 bf16 weight: (93184, 139264] for dw accuracy against the pair of 40960 to 93184 rows (one cut for both weight dtypes: that pair's FP32-weight form, the same dw computation, reaches 0.9807 of the per-element budget at 93696 rows (3904 tokens of 24 heads, worst of 60 inputs of each of three families) and 0.8554 at 100352 rows on GB300; its BF16-weight form reaches 0.9475 at 126976 rows and 0.8692 at 122880 rows on GB300, worst of 200 inputs of each of three families); from 99840 rows the deterministic package runs another pair, whose worst dw element stays within 0.353 of the budget at the sampled row counts up to 139264 rows (worst of 200 inputs of each of three families); twosum: exact per-thread dw sums
+    # sm_103a H256 bf16 weight: (93184, 139264] for dw accuracy against the pair of 40960 to 93184 rows (one cut for both weight dtypes: that pair's FP32-weight form, the same dw computation, reaches 0.9807 of the per-element budget at 93696 rows (3904 tokens of 24 heads, worst of 60 inputs of each of three families) and 0.8554 at 100352 rows on GB300; its BF16-weight form reaches 0.9475 at 126976 rows and 0.8692 at 122880 rows on GB300, worst of 200 inputs of each of three families); from 99840 rows the deterministic package runs another main kernel, and the worst dw element of the pair this package runs with it from 139264 rows stays within 0.353 of the budget at the sampled row counts up to 139264 rows (worst of 200 inputs of each of three families); twosum: exact per-thread dw sums
     "cake_rmsnorm_train_172a47a15d4c1a76c061__93184_139264": {
         "arches": [
             "sm_103a",
@@ -6679,7 +6679,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "sum_bytes": 4096,
         },
     },
-    # sm_103a H256 f32 weight: (93184, 139264] for dw accuracy against the pair of 40960 to 93184 rows (that pair's worst dw element reaches 0.9807 of the per-element budget at 93696 rows (3904 tokens of 24 heads, worst of 60 inputs of each of three families) and, worst of 200 inputs of each of three families, 0.8554 at 100352 rows and 0.9362 at 135168 rows on GB300; its BF16-weight form, the same dw computation, reaches 0.9475 at 126976 rows); from 99840 rows the deterministic package runs another pair, whose worst dw element stays within 0.373 of the budget at the sampled row counts up to 139264 rows (worst of 200 inputs of each of three families); twosum: exact per-thread dw sums
+    # sm_103a H256 f32 weight: (93184, 139264] for dw accuracy against the pair of 40960 to 93184 rows (that pair's worst dw element reaches 0.9807 of the per-element budget at 93696 rows (3904 tokens of 24 heads, worst of 60 inputs of each of three families) and, worst of 200 inputs of each of three families, 0.8554 at 100352 rows and 0.9362 at 135168 rows on GB300; its BF16-weight form, the same dw computation, reaches 0.9475 at 126976 rows); from 99840 rows the deterministic package runs another main kernel, and the worst dw element of the pair this package runs with it from 139264 rows stays within 0.373 of the budget at the sampled row counts up to 139264 rows (worst of 200 inputs of each of three families); twosum: exact per-thread dw sums
     "cake_rmsnorm_train_7c2aa4b429538da06a2a__93184_139264": {
         "arches": [
             "sm_103a",
@@ -6710,6 +6710,864 @@ MODULES: dict[str, dict[str, Any]] = {
             "counters": 2,
             "kind": "claim_sum_f64",
             "sum_bytes": 4096,
+        },
+    },
+    # sm_107a H4096 f32 weight: (0, 256] for dw accuracy (the det pair's worst dw error exceeds the FP32 eager reference's at T 64 on R200 with 216 SMs, 0.0256 against 0.0233 of the per-element budget)
+    "cake_rmsnorm_train_a1f537fc94bde175bb3c__0_256": {
+        "arches": [
+            "sm_107a",
+        ],
+        "grid_rule": {
+            "ctas_per_sm": 2,
+            "grid_factor": 2,
+            "kind": "claimed_chunks",
+            "launch_bound_ctas_per_sm": 2,
+            "max_halving": 5,
+            "rows_per_issue": 1,
+            "tail_div": 12,
+        },
+        "hidden": 4096,
+        "kernel": "cake_rmsnorm_train_a1f537fc94bde175bb3c",
+        "launch": {
+            "cooperative": False,
+            "use_pdl": False,
+        },
+        "library": "cake_rmsnorm_train_a1f537fc94bde175bb3c",
+        "role": "bwd_main_w32",
+        "select_rule": {
+            "above": 0,
+            "at_most": 256,
+            "kind": "rows_between",
+        },
+        "workspace_rule": {
+            "counters": 2,
+            "kind": "claim_sum_f64",
+            "sum_bytes": 131072,
+        },
+    },
+    # sm_100a H1536 bf16 weight: (0, 14] for dw accuracy at small T (the det pair's median dw error over the sampled inputs exceeds the FP32 eager reference's at T 14 on B200, 0.0048 against 0.0047 of the per-element budget)
+    "cake_rmsnorm_train_ae610afdf77ff6714a5b__0_14": {
+        "arches": [
+            "sm_100a",
+        ],
+        "grid_rule": {
+            "ctas_per_sm": 2,
+            "grid_factor": 2,
+            "kind": "claimed_chunks",
+            "launch_bound_ctas_per_sm": 2,
+            "max_halving": 5,
+            "rows_per_issue": 2,
+            "tail_div": 12,
+        },
+        "hidden": 1536,
+        "kernel": "cake_rmsnorm_train_ae610afdf77ff6714a5b",
+        "launch": {
+            "cooperative": False,
+            "use_pdl": False,
+        },
+        "library": "cake_rmsnorm_train_ae610afdf77ff6714a5b",
+        "role": "bwd_main",
+        "select_rule": {
+            "above": 0,
+            "at_most": 14,
+            "kind": "rows_between",
+        },
+        "workspace_rule": {
+            "counters": 2,
+            "kind": "claim_sum_f64",
+            "sum_bytes": 49152,
+        },
+    },
+    # sm_100a H512 bf16 weight: (0, 26] for dw accuracy at small T (the det pair's median dw error over the sampled inputs exceeds the FP32 eager reference's at T 26 on B200, 0.0062 against 0.0061 of the per-element budget)
+    "cake_rmsnorm_train_d0bde38aa443d42a5f04__0_26": {
+        "arches": [
+            "sm_100a",
+        ],
+        "grid_rule": {
+            "ctas_per_sm": 2,
+            "grid_factor": 2,
+            "kind": "claimed_chunks",
+            "launch_bound_ctas_per_sm": 2,
+            "max_halving": 5,
+            "rows_per_issue": 8,
+            "tail_div": 12,
+        },
+        "hidden": 512,
+        "kernel": "cake_rmsnorm_train_d0bde38aa443d42a5f04",
+        "launch": {
+            "cooperative": False,
+            "use_pdl": False,
+        },
+        "library": "cake_rmsnorm_train_d0bde38aa443d42a5f04",
+        "role": "bwd_main",
+        "select_rule": {
+            "above": 0,
+            "at_most": 26,
+            "kind": "rows_between",
+        },
+        "workspace_rule": {
+            "counters": 2,
+            "kind": "claim_sum_f64",
+            "sum_bytes": 16384,
+        },
+    },
+    # sm_100a H1536 f32 weight: (0, 64] for dw accuracy at small T (the det pair's worst dw error exceeds the FP32 eager reference's at T 64 on B200, 0.0227 against 0.0203 of the per-element budget)
+    "cake_rmsnorm_train_4b6981c10fd40a9d8aec__0_64": {
+        "arches": [
+            "sm_100a",
+        ],
+        "grid_rule": {
+            "ctas_per_sm": 2,
+            "grid_factor": 2,
+            "kind": "claimed_chunks",
+            "launch_bound_ctas_per_sm": 2,
+            "max_halving": 5,
+            "rows_per_issue": 2,
+            "tail_div": 12,
+        },
+        "hidden": 1536,
+        "kernel": "cake_rmsnorm_train_4b6981c10fd40a9d8aec",
+        "launch": {
+            "cooperative": False,
+            "use_pdl": False,
+        },
+        "library": "cake_rmsnorm_train_4b6981c10fd40a9d8aec",
+        "role": "bwd_main_w32",
+        "select_rule": {
+            "above": 0,
+            "at_most": 64,
+            "kind": "rows_between",
+        },
+        "workspace_rule": {
+            "counters": 2,
+            "kind": "claim_sum_f64",
+            "sum_bytes": 49152,
+        },
+    },
+    # sm_100a H5120 f32 weight: (0, 22] for dw accuracy at small T (the det pair's worst dw error exceeds the FP32 eager reference's at T 22 on B200, 0.0134 against 0.0130 of the per-element budget)
+    "cake_rmsnorm_train_de8f6091077dc7ac5947__0_22": {
+        "arches": [
+            "sm_100a",
+        ],
+        "grid_rule": {
+            "ctas_per_sm": 1,
+            "grid_factor": 1,
+            "kind": "claimed_chunks",
+            "launch_bound_ctas_per_sm": 1,
+            "max_halving": 5,
+            "rows_per_issue": 1,
+            "tail_div": 12,
+        },
+        "hidden": 5120,
+        "kernel": "cake_rmsnorm_train_de8f6091077dc7ac5947",
+        "launch": {
+            "cooperative": False,
+            "use_pdl": False,
+        },
+        "library": "cake_rmsnorm_train_de8f6091077dc7ac5947",
+        "role": "bwd_main_w32",
+        "select_rule": {
+            "above": 0,
+            "at_most": 22,
+            "kind": "rows_between",
+        },
+        "workspace_rule": {
+            "counters": 2,
+            "kind": "claim_sum_f64",
+            "sum_bytes": 163840,
+        },
+    },
+    # sm_103a H1536 bf16 weight: (0, 14] for dw accuracy at small T (the det pair's median dw error over the sampled inputs exceeds the FP32 eager reference's at T 14 on GB300, 0.0048 against 0.0047 of the per-element budget); twosum: exact per-thread dw sums
+    "cake_rmsnorm_train_327bfeb4ab8fefc2731d__0_14": {
+        "arches": [
+            "sm_103a",
+        ],
+        "grid_rule": {
+            "ctas_per_sm": 2,
+            "grid_factor": 2,
+            "kind": "claimed_chunks",
+            "launch_bound_ctas_per_sm": 2,
+            "max_halving": 5,
+            "rows_per_issue": 2,
+            "tail_div": 12,
+        },
+        "hidden": 1536,
+        "kernel": "cake_rmsnorm_train_327bfeb4ab8fefc2731d",
+        "launch": {
+            "cooperative": False,
+            "use_pdl": False,
+        },
+        "library": "cake_rmsnorm_train_327bfeb4ab8fefc2731d",
+        "role": "bwd_main",
+        "select_rule": {
+            "above": 0,
+            "at_most": 14,
+            "kind": "rows_between",
+        },
+        "workspace_rule": {
+            "counters": 2,
+            "kind": "claim_sum_f64",
+            "sum_bytes": 49152,
+        },
+    },
+    # sm_103a H2048 bf16 weight: (0, 12] for dw accuracy at small T (the det pair's median dw error over the sampled inputs exceeds the FP32 eager reference's at T 12 on GB300, 0.0047 against 0.0045 of the per-element budget); twosum: exact per-thread dw sums
+    "cake_rmsnorm_train_8bd89a4c834f80db8a34__0_12": {
+        "arches": [
+            "sm_103a",
+        ],
+        "grid_rule": {
+            "ctas_per_sm": 2,
+            "grid_factor": 2,
+            "kind": "claimed_chunks",
+            "launch_bound_ctas_per_sm": 2,
+            "max_halving": 5,
+            "rows_per_issue": 2,
+            "tail_div": 12,
+        },
+        "hidden": 2048,
+        "kernel": "cake_rmsnorm_train_8bd89a4c834f80db8a34",
+        "launch": {
+            "cooperative": False,
+            "use_pdl": False,
+        },
+        "library": "cake_rmsnorm_train_8bd89a4c834f80db8a34",
+        "role": "bwd_main",
+        "select_rule": {
+            "above": 0,
+            "at_most": 12,
+            "kind": "rows_between",
+        },
+        "workspace_rule": {
+            "counters": 2,
+            "kind": "claim_sum_f64",
+            "sum_bytes": 32768,
+        },
+    },
+    # sm_103a H256 bf16 weight: (0, 1080] for dw accuracy at small T (the det pair's worst dw error exceeds the FP32 eager reference's at 1080 rows (45 tokens of 24 heads) on GB300, 0.0735 against 0.0728 of the per-element budget)
+    "cake_rmsnorm_train_195c4317b51bb4ea1137__0_1080": {
+        "arches": [
+            "sm_103a",
+        ],
+        "grid_rule": {
+            "ctas_per_sm": 2,
+            "grid_factor": 2,
+            "kind": "claimed_chunks",
+            "launch_bound_ctas_per_sm": 2,
+            "max_halving": 5,
+            "rows_per_issue": 8,
+            "tail_div": 12,
+        },
+        "hidden": 256,
+        "kernel": "cake_rmsnorm_train_195c4317b51bb4ea1137",
+        "launch": {
+            "cooperative": False,
+            "use_pdl": False,
+        },
+        "library": "cake_rmsnorm_train_195c4317b51bb4ea1137",
+        "role": "bwd_main",
+        "select_rule": {
+            "above": 0,
+            "at_most": 1080,
+            "kind": "rows_between",
+        },
+        "workspace_rule": {
+            "counters": 2,
+            "kind": "claim_sum_f64",
+            "sum_bytes": 4096,
+        },
+    },
+    # sm_103a H5120 bf16 weight: (0, 22] for dw accuracy at small T (the det pair's worst dw error exceeds the FP32 eager reference's at T 22 on GB300, 0.0134 against 0.0119 of the per-element budget)
+    "cake_rmsnorm_train_080e0a6c3b18e9bad790__0_22": {
+        "arches": [
+            "sm_103a",
+        ],
+        "grid_rule": {
+            "ctas_per_sm": 1,
+            "grid_factor": 1,
+            "kind": "claimed_chunks",
+            "launch_bound_ctas_per_sm": 1,
+            "max_halving": 5,
+            "rows_per_issue": 1,
+            "tail_div": 12,
+        },
+        "hidden": 5120,
+        "kernel": "cake_rmsnorm_train_080e0a6c3b18e9bad790",
+        "launch": {
+            "cooperative": False,
+            "use_pdl": False,
+        },
+        "library": "cake_rmsnorm_train_080e0a6c3b18e9bad790",
+        "role": "bwd_main",
+        "select_rule": {
+            "above": 0,
+            "at_most": 22,
+            "kind": "rows_between",
+        },
+        "workspace_rule": {
+            "counters": 1,
+            "kind": "claim_sum_f64",
+            "sum_bytes": 0,
+        },
+    },
+    # sm_103a H1536 f32 weight: (0, 64] for dw accuracy at small T (the det pair's worst dw error exceeds the FP32 eager reference's at T 64 on GB300, 0.0227 against 0.0203 of the per-element budget); twosum: exact per-thread dw sums
+    "cake_rmsnorm_train_963a7ca8d03f78bbe6f9__0_64": {
+        "arches": [
+            "sm_103a",
+        ],
+        "grid_rule": {
+            "ctas_per_sm": 2,
+            "grid_factor": 2,
+            "kind": "claimed_chunks",
+            "launch_bound_ctas_per_sm": 2,
+            "max_halving": 5,
+            "rows_per_issue": 2,
+            "tail_div": 12,
+        },
+        "hidden": 1536,
+        "kernel": "cake_rmsnorm_train_963a7ca8d03f78bbe6f9",
+        "launch": {
+            "cooperative": False,
+            "use_pdl": False,
+        },
+        "library": "cake_rmsnorm_train_963a7ca8d03f78bbe6f9",
+        "role": "bwd_main_w32",
+        "select_rule": {
+            "above": 0,
+            "at_most": 64,
+            "kind": "rows_between",
+        },
+        "workspace_rule": {
+            "counters": 2,
+            "kind": "claim_sum_f64",
+            "sum_bytes": 49152,
+        },
+    },
+    # sm_103a H2048 f32 weight: (0, 42] for dw accuracy at small T (the det pair's worst dw error exceeds the FP32 eager reference's at T 26 on GB300, 0.0152 against 0.0134 of the per-element budget, and at T 42 in the kernel-tests harness, 0.0205 against 0.0189); twosum: exact per-thread dw sums
+    "cake_rmsnorm_train_88c6c6b2af1922f4c1a9__0_42": {
+        "arches": [
+            "sm_103a",
+        ],
+        "grid_rule": {
+            "ctas_per_sm": 2,
+            "grid_factor": 2,
+            "kind": "claimed_chunks",
+            "launch_bound_ctas_per_sm": 2,
+            "max_halving": 5,
+            "rows_per_issue": 2,
+            "tail_div": 12,
+        },
+        "hidden": 2048,
+        "kernel": "cake_rmsnorm_train_88c6c6b2af1922f4c1a9",
+        "launch": {
+            "cooperative": False,
+            "use_pdl": False,
+        },
+        "library": "cake_rmsnorm_train_88c6c6b2af1922f4c1a9",
+        "role": "bwd_main_w32",
+        "select_rule": {
+            "above": 0,
+            "at_most": 42,
+            "kind": "rows_between",
+        },
+        "workspace_rule": {
+            "counters": 2,
+            "kind": "claim_sum_f64",
+            "sum_bytes": 32768,
+        },
+    },
+    # sm_103a H256 f32 weight: (0, 1080] for dw accuracy at small T (the det pair's worst dw error exceeds the FP32 eager reference's at 1080 rows (45 tokens of 24 heads) on GB300, 0.0735 against 0.0728 of the per-element budget)
+    "cake_rmsnorm_train_8de0131445eed6eeabb7__0_1080": {
+        "arches": [
+            "sm_103a",
+        ],
+        "grid_rule": {
+            "ctas_per_sm": 2,
+            "grid_factor": 2,
+            "kind": "claimed_chunks",
+            "launch_bound_ctas_per_sm": 2,
+            "max_halving": 5,
+            "rows_per_issue": 8,
+            "tail_div": 12,
+        },
+        "hidden": 256,
+        "kernel": "cake_rmsnorm_train_8de0131445eed6eeabb7",
+        "launch": {
+            "cooperative": False,
+            "use_pdl": False,
+        },
+        "library": "cake_rmsnorm_train_8de0131445eed6eeabb7",
+        "role": "bwd_main_w32",
+        "select_rule": {
+            "above": 0,
+            "at_most": 1080,
+            "kind": "rows_between",
+        },
+        "workspace_rule": {
+            "counters": 2,
+            "kind": "claim_sum_f64",
+            "sum_bytes": 4096,
+        },
+    },
+    # sm_103a H4096 f32 weight: (0, 15] for dw accuracy at small T (the det pair's worst dw error exceeds the FP32 eager reference's at T 15 on GB300, 0.0105 against 0.0092 of the per-element budget); twosum: exact per-thread dw sums
+    "cake_rmsnorm_train_131a495c5897206b6874__0_15": {
+        "arches": [
+            "sm_103a",
+        ],
+        "grid_rule": {
+            "ctas_per_sm": 2,
+            "grid_factor": 2,
+            "kind": "claimed_chunks",
+            "launch_bound_ctas_per_sm": 2,
+            "max_halving": 5,
+            "rows_per_issue": 1,
+            "tail_div": 12,
+        },
+        "hidden": 4096,
+        "kernel": "cake_rmsnorm_train_131a495c5897206b6874",
+        "launch": {
+            "cooperative": False,
+            "use_pdl": False,
+        },
+        "library": "cake_rmsnorm_train_131a495c5897206b6874",
+        "role": "bwd_main_w32",
+        "select_rule": {
+            "above": 0,
+            "at_most": 15,
+            "kind": "rows_between",
+        },
+        "workspace_rule": {
+            "counters": 2,
+            "kind": "claim_sum_f64",
+            "sum_bytes": 65536,
+        },
+    },
+    # sm_103a H5120 f32 weight: (0, 22] for dw accuracy at small T (the det pair's worst dw error exceeds the FP32 eager reference's at T 22 on GB300, 0.0134 against 0.0130 of the per-element budget); twosum: exact per-thread dw sums
+    "cake_rmsnorm_train_f165933caadda3434828__0_22": {
+        "arches": [
+            "sm_103a",
+        ],
+        "grid_rule": {
+            "ctas_per_sm": 1,
+            "grid_factor": 1,
+            "kind": "claimed_chunks",
+            "launch_bound_ctas_per_sm": 1,
+            "max_halving": 5,
+            "rows_per_issue": 1,
+            "tail_div": 12,
+        },
+        "hidden": 5120,
+        "kernel": "cake_rmsnorm_train_f165933caadda3434828",
+        "launch": {
+            "cooperative": False,
+            "use_pdl": False,
+        },
+        "library": "cake_rmsnorm_train_f165933caadda3434828",
+        "role": "bwd_main_w32",
+        "select_rule": {
+            "above": 0,
+            "at_most": 22,
+            "kind": "rows_between",
+        },
+        "workspace_rule": {
+            "counters": 2,
+            "kind": "claim_sum_f64",
+            "sum_bytes": 81920,
+        },
+    },
+    # sm_103a H6144 f32 weight: (0, 20] for dw accuracy at small T (the det pair's worst dw error exceeds the FP32 eager reference's at T 20 on GB300, 0.0147 against 0.0138 of the per-element budget)
+    "cake_rmsnorm_train_b3e6531e46667901ab91__0_20": {
+        "arches": [
+            "sm_103a",
+        ],
+        "grid_rule": {
+            "ctas_per_sm": 1,
+            "grid_factor": 1,
+            "kind": "claimed_chunks",
+            "launch_bound_ctas_per_sm": 1,
+            "max_halving": 5,
+            "rows_per_issue": 1,
+            "tail_div": 12,
+        },
+        "hidden": 6144,
+        "kernel": "cake_rmsnorm_train_b3e6531e46667901ab91",
+        "launch": {
+            "cooperative": False,
+            "use_pdl": False,
+        },
+        "library": "cake_rmsnorm_train_b3e6531e46667901ab91",
+        "role": "bwd_main_w32",
+        "select_rule": {
+            "above": 0,
+            "at_most": 20,
+            "kind": "rows_between",
+        },
+        "workspace_rule": {
+            "counters": 1,
+            "kind": "claim_sum_f64",
+            "sum_bytes": 0,
+        },
+    },
+    # sm_103a H6144 residual f32 weight: (0, 6] for dw accuracy at small T (the det pair's worst dw error exceeds the FP32 eager reference's at T 6 on GB300, 0.0067 against 0.0063 of the per-element budget)
+    "cake_rmsnorm_train_71d36617003ab7742a77__0_6": {
+        "arches": [
+            "sm_103a",
+        ],
+        "grid_rule": {
+            "ctas_per_sm": 1,
+            "grid_factor": 1,
+            "kind": "claimed_chunks",
+            "launch_bound_ctas_per_sm": 1,
+            "max_halving": 5,
+            "rows_per_issue": 1,
+            "tail_div": 12,
+        },
+        "hidden": 6144,
+        "kernel": "cake_rmsnorm_train_71d36617003ab7742a77",
+        "launch": {
+            "cooperative": False,
+            "use_pdl": False,
+        },
+        "library": "cake_rmsnorm_train_71d36617003ab7742a77",
+        "role": "bwd_main_w32_residual",
+        "select_rule": {
+            "above": 0,
+            "at_most": 6,
+            "kind": "rows_between",
+        },
+        "workspace_rule": {
+            "counters": 1,
+            "kind": "claim_sum_f64",
+            "sum_bytes": 0,
+        },
+    },
+    # sm_107a H1536 bf16 weight: (0, 14] for dw accuracy at small T (the det pair's median dw error over the sampled inputs exceeds the FP32 eager reference's at T 14 on R200 with 212 SMs, 0.0048 against 0.0047 of the per-element budget)
+    "cake_rmsnorm_train_3f75f4a81f2fb8269389__0_14": {
+        "arches": [
+            "sm_107a",
+        ],
+        "grid_rule": {
+            "ctas_per_sm": 2,
+            "grid_factor": 2,
+            "kind": "claimed_chunks",
+            "launch_bound_ctas_per_sm": 2,
+            "max_halving": 5,
+            "rows_per_issue": 2,
+            "tail_div": 12,
+        },
+        "hidden": 1536,
+        "kernel": "cake_rmsnorm_train_3f75f4a81f2fb8269389",
+        "launch": {
+            "cooperative": False,
+            "use_pdl": False,
+        },
+        "library": "cake_rmsnorm_train_3f75f4a81f2fb8269389",
+        "role": "bwd_main",
+        "select_rule": {
+            "above": 0,
+            "at_most": 14,
+            "kind": "rows_between",
+        },
+        "workspace_rule": {
+            "counters": 2,
+            "kind": "claim_sum_f64",
+            "sum_bytes": 49152,
+        },
+    },
+    # sm_107a H2048 bf16 weight: (0, 6] for dw accuracy at small T (the det pair's median dw error over the sampled inputs exceeds the FP32 eager reference's at T 6 on R200 with 212 SMs, 0.0028 against 0.0027 of the per-element budget); twosum: exact per-thread dw sums
+    "cake_rmsnorm_train_1a3df5ac020055477581__0_6": {
+        "arches": [
+            "sm_107a",
+        ],
+        "grid_rule": {
+            "ctas_per_sm": 2,
+            "grid_factor": 2,
+            "kind": "claimed_chunks",
+            "launch_bound_ctas_per_sm": 2,
+            "max_halving": 5,
+            "rows_per_issue": 2,
+            "tail_div": 12,
+        },
+        "hidden": 2048,
+        "kernel": "cake_rmsnorm_train_1a3df5ac020055477581",
+        "launch": {
+            "cooperative": False,
+            "use_pdl": False,
+        },
+        "library": "cake_rmsnorm_train_1a3df5ac020055477581",
+        "role": "bwd_main",
+        "select_rule": {
+            "above": 0,
+            "at_most": 6,
+            "kind": "rows_between",
+        },
+        "workspace_rule": {
+            "counters": 2,
+            "kind": "claim_sum_f64",
+            "sum_bytes": 65536,
+        },
+    },
+    # sm_107a H256 bf16 weight: (0, 1056] for dw accuracy at small T (the det pair's worst dw error exceeds the FP32 eager reference's at 1056 rows (44 tokens of 24 heads) on R200 with 212 SMs, 0.0871 against 0.0657 of the per-element budget)
+    "cake_rmsnorm_train_195c4317b51bb4ea1137__0_1056": {
+        "arches": [
+            "sm_107a",
+        ],
+        "grid_rule": {
+            "ctas_per_sm": 2,
+            "grid_factor": 2,
+            "kind": "claimed_chunks",
+            "launch_bound_ctas_per_sm": 2,
+            "max_halving": 5,
+            "rows_per_issue": 8,
+            "tail_div": 12,
+        },
+        "hidden": 256,
+        "kernel": "cake_rmsnorm_train_195c4317b51bb4ea1137",
+        "launch": {
+            "cooperative": False,
+            "use_pdl": False,
+        },
+        "library": "cake_rmsnorm_train_195c4317b51bb4ea1137",
+        "role": "bwd_main",
+        "select_rule": {
+            "above": 0,
+            "at_most": 1056,
+            "kind": "rows_between",
+        },
+        "workspace_rule": {
+            "counters": 2,
+            "kind": "claim_sum_f64",
+            "sum_bytes": 4096,
+        },
+    },
+    # sm_107a H4096 bf16 weight: (0, 6] for dw accuracy at small T (the det pair's median dw error over the sampled inputs exceeds the FP32 eager reference's at T 6 on R200 with 212 SMs, 0.0031 against 0.0030 of the per-element budget)
+    "cake_rmsnorm_train_f11a86167db4f8e9a5da__0_6": {
+        "arches": [
+            "sm_107a",
+        ],
+        "grid_rule": {
+            "ctas_per_sm": 2,
+            "grid_factor": 2,
+            "kind": "claimed_chunks",
+            "launch_bound_ctas_per_sm": 2,
+            "max_halving": 5,
+            "rows_per_issue": 1,
+            "tail_div": 12,
+        },
+        "hidden": 4096,
+        "kernel": "cake_rmsnorm_train_f11a86167db4f8e9a5da",
+        "launch": {
+            "cooperative": False,
+            "use_pdl": False,
+        },
+        "library": "cake_rmsnorm_train_f11a86167db4f8e9a5da",
+        "role": "bwd_main",
+        "select_rule": {
+            "above": 0,
+            "at_most": 6,
+            "kind": "rows_between",
+        },
+        "workspace_rule": {
+            "counters": 2,
+            "kind": "claim_sum_f64",
+            "sum_bytes": 131072,
+        },
+    },
+    # sm_107a H1536 f32 weight: (0, 64] for dw accuracy at small T (the det pair's worst dw error exceeds the FP32 eager reference's at T 64 on R200 with 212 SMs, 0.0227 against 0.0203 of the per-element budget)
+    "cake_rmsnorm_train_7c0dd63f0b011049603e__0_64": {
+        "arches": [
+            "sm_107a",
+        ],
+        "grid_rule": {
+            "ctas_per_sm": 2,
+            "grid_factor": 2,
+            "kind": "claimed_chunks",
+            "launch_bound_ctas_per_sm": 2,
+            "max_halving": 5,
+            "rows_per_issue": 2,
+            "tail_div": 12,
+        },
+        "hidden": 1536,
+        "kernel": "cake_rmsnorm_train_7c0dd63f0b011049603e",
+        "launch": {
+            "cooperative": False,
+            "use_pdl": False,
+        },
+        "library": "cake_rmsnorm_train_7c0dd63f0b011049603e",
+        "role": "bwd_main_w32",
+        "select_rule": {
+            "above": 0,
+            "at_most": 64,
+            "kind": "rows_between",
+        },
+        "workspace_rule": {
+            "counters": 2,
+            "kind": "claim_sum_f64",
+            "sum_bytes": 49152,
+        },
+    },
+    # sm_107a H2048 f32 weight: (0, 127] for dw accuracy at small T (the det pair's worst dw error exceeds the FP32 eager reference's at T 127 on R200 with 212 SMs, 0.0339 against 0.0304 of the per-element budget); twosum: exact per-thread dw sums
+    "cake_rmsnorm_train_810989bdea464df479ce__0_127": {
+        "arches": [
+            "sm_107a",
+        ],
+        "grid_rule": {
+            "ctas_per_sm": 2,
+            "grid_factor": 2,
+            "kind": "claimed_chunks",
+            "launch_bound_ctas_per_sm": 2,
+            "max_halving": 5,
+            "rows_per_issue": 2,
+            "tail_div": 12,
+        },
+        "hidden": 2048,
+        "kernel": "cake_rmsnorm_train_810989bdea464df479ce",
+        "launch": {
+            "cooperative": False,
+            "use_pdl": False,
+        },
+        "library": "cake_rmsnorm_train_810989bdea464df479ce",
+        "role": "bwd_main_w32",
+        "select_rule": {
+            "above": 0,
+            "at_most": 127,
+            "kind": "rows_between",
+        },
+        "workspace_rule": {
+            "counters": 2,
+            "kind": "claim_sum_f64",
+            "sum_bytes": 65536,
+        },
+    },
+    # sm_107a H256 f32 weight: (0, 1296] for dw accuracy at small T (the det pair's worst dw error exceeds the FP32 eager reference's at 1296 rows (54 tokens of 24 heads) on R200 with 212 SMs, 0.0772 against 0.0742 of the per-element budget)
+    "cake_rmsnorm_train_8de0131445eed6eeabb7__0_1296": {
+        "arches": [
+            "sm_107a",
+        ],
+        "grid_rule": {
+            "ctas_per_sm": 2,
+            "grid_factor": 2,
+            "kind": "claimed_chunks",
+            "launch_bound_ctas_per_sm": 2,
+            "max_halving": 5,
+            "rows_per_issue": 8,
+            "tail_div": 12,
+        },
+        "hidden": 256,
+        "kernel": "cake_rmsnorm_train_8de0131445eed6eeabb7",
+        "launch": {
+            "cooperative": False,
+            "use_pdl": False,
+        },
+        "library": "cake_rmsnorm_train_8de0131445eed6eeabb7",
+        "role": "bwd_main_w32",
+        "select_rule": {
+            "above": 0,
+            "at_most": 1296,
+            "kind": "rows_between",
+        },
+        "workspace_rule": {
+            "counters": 2,
+            "kind": "claim_sum_f64",
+            "sum_bytes": 4096,
+        },
+    },
+    # sm_107a H512 f32 weight: (0, 229] for dw accuracy at small T (the det pair's worst dw error exceeds the FP32 eager reference's at T 229 on R200 with 212 SMs, 0.0461 against 0.0384 of the per-element budget)
+    "cake_rmsnorm_train_fd08c6f436eb6071fa22__0_229": {
+        "arches": [
+            "sm_107a",
+        ],
+        "grid_rule": {
+            "ctas_per_sm": 2,
+            "grid_factor": 2,
+            "kind": "claimed_chunks",
+            "launch_bound_ctas_per_sm": 2,
+            "max_halving": 5,
+            "rows_per_issue": 8,
+            "tail_div": 12,
+        },
+        "hidden": 512,
+        "kernel": "cake_rmsnorm_train_fd08c6f436eb6071fa22",
+        "launch": {
+            "cooperative": False,
+            "use_pdl": False,
+        },
+        "library": "cake_rmsnorm_train_fd08c6f436eb6071fa22",
+        "role": "bwd_main_w32",
+        "select_rule": {
+            "above": 0,
+            "at_most": 229,
+            "kind": "rows_between",
+        },
+        "workspace_rule": {
+            "counters": 2,
+            "kind": "claim_sum_f64",
+            "sum_bytes": 16384,
+        },
+    },
+    # sm_107a H6144 f32 weight: (0, 20] for dw accuracy at small T (the det pair's worst dw error exceeds the FP32 eager reference's at T 20 on R200 with 212 SMs, 0.0147 against 0.0138 of the per-element budget)
+    "cake_rmsnorm_train_e77387f14390ba486055__0_20": {
+        "arches": [
+            "sm_107a",
+        ],
+        "grid_rule": {
+            "ctas_per_sm": 1,
+            "grid_factor": 1,
+            "kind": "claimed_chunks",
+            "launch_bound_ctas_per_sm": 1,
+            "max_halving": 5,
+            "rows_per_issue": 1,
+            "tail_div": 12,
+        },
+        "hidden": 6144,
+        "kernel": "cake_rmsnorm_train_e77387f14390ba486055",
+        "launch": {
+            "cooperative": False,
+            "use_pdl": False,
+        },
+        "library": "cake_rmsnorm_train_e77387f14390ba486055",
+        "role": "bwd_main_w32",
+        "select_rule": {
+            "above": 0,
+            "at_most": 20,
+            "kind": "rows_between",
+        },
+        "workspace_rule": {
+            "counters": 2,
+            "kind": "claim_sum_f64",
+            "sum_bytes": 196608,
+        },
+    },
+    # sm_107a H6144 residual f32 weight: (0, 3] for dw accuracy at small T (the det pair's worst dw error exceeds the FP32 eager reference's at T 3 on R200 with 212 SMs, 0.0041 against 0.0034 of the per-element budget)
+    "cake_rmsnorm_train_71d36617003ab7742a77__0_3": {
+        "arches": [
+            "sm_107a",
+        ],
+        "grid_rule": {
+            "ctas_per_sm": 1,
+            "grid_factor": 1,
+            "kind": "claimed_chunks",
+            "launch_bound_ctas_per_sm": 1,
+            "max_halving": 5,
+            "rows_per_issue": 1,
+            "tail_div": 12,
+        },
+        "hidden": 6144,
+        "kernel": "cake_rmsnorm_train_71d36617003ab7742a77",
+        "launch": {
+            "cooperative": False,
+            "use_pdl": False,
+        },
+        "library": "cake_rmsnorm_train_71d36617003ab7742a77",
+        "role": "bwd_main_w32_residual",
+        "select_rule": {
+            "above": 0,
+            "at_most": 3,
+            "kind": "rows_between",
+        },
+        "workspace_rule": {
+            "counters": 1,
+            "kind": "claim_sum_f64",
+            "sum_bytes": 0,
         },
     },
     # sm_107a H5120 bf16 weight: the FP64-row form above T 49152 for dw accuracy (the compensated det pair, from T 19968, reaches 0.867 of the per-element budget at T 53248 on R200 with 216 SMs, above the 0.85 margin; both weight dtypes switch at T 49152)
@@ -6778,9 +7636,75 @@ MODULES: dict[str, dict[str, Any]] = {
             "sum_bytes": 163840,
         },
     },
+    # sm_107a H5120 bf16 weight: (0, 18] for dw accuracy at small T (the det pair's worst dw error exceeds the FP32 eager reference's at T 15 on R200 with 212 SMs, 0.0120 against 0.0114 of the per-element budget, and at T 18 in the kernel-tests harness, 0.0136 against 0.0134)
+    "cake_rmsnorm_train_f94f8c33e2c9c8e89fc3__0_18": {
+        "arches": [
+            "sm_107a",
+        ],
+        "grid_rule": {
+            "ctas_per_sm": 1,
+            "grid_factor": 1,
+            "kind": "claimed_chunks",
+            "launch_bound_ctas_per_sm": 1,
+            "max_halving": 5,
+            "rows_per_issue": 1,
+            "tail_div": 12,
+        },
+        "hidden": 5120,
+        "kernel": "cake_rmsnorm_train_f94f8c33e2c9c8e89fc3",
+        "launch": {
+            "cooperative": False,
+            "use_pdl": False,
+        },
+        "library": "cake_rmsnorm_train_f94f8c33e2c9c8e89fc3",
+        "role": "bwd_main",
+        "select_rule": {
+            "above": 0,
+            "at_most": 18,
+            "kind": "rows_between",
+        },
+        "workspace_rule": {
+            "counters": 2,
+            "kind": "claim_sum_f64",
+            "sum_bytes": 163840,
+        },
+    },
+    # sm_107a H5120 f32 weight: (0, 13] for dw accuracy at small T (the det pair's worst dw error exceeds the FP32 eager reference's at T 13 on R200 with 212 SMs, 0.0127 against 0.0113 of the per-element budget)
+    "cake_rmsnorm_train_dd795e849940a49d0d29__0_13": {
+        "arches": [
+            "sm_107a",
+        ],
+        "grid_rule": {
+            "ctas_per_sm": 1,
+            "grid_factor": 1,
+            "kind": "claimed_chunks",
+            "launch_bound_ctas_per_sm": 1,
+            "max_halving": 5,
+            "rows_per_issue": 1,
+            "tail_div": 12,
+        },
+        "hidden": 5120,
+        "kernel": "cake_rmsnorm_train_dd795e849940a49d0d29",
+        "launch": {
+            "cooperative": False,
+            "use_pdl": False,
+        },
+        "library": "cake_rmsnorm_train_dd795e849940a49d0d29",
+        "role": "bwd_main_w32",
+        "select_rule": {
+            "above": 0,
+            "at_most": 13,
+            "kind": "rows_between",
+        },
+        "workspace_rule": {
+            "counters": 2,
+            "kind": "claim_sum_f64",
+            "sum_bytes": 163840,
+        },
+    },
     # The deterministic package's backward pairs (main kernel, then its dw reduce), renamed
     # into this package, for the windows the routes run them in.
-    "cake_rmsnorm_train_7dc29629ff21625607f8": {
+    "cake_rmsnorm_train_7dc29629ff21625607f8__14_1024": {
         "arches": [
             "sm_100a",
             "sm_103a",
@@ -6803,7 +7727,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "library": "cake_rmsnorm_train_7dc29629ff21625607f8",
         "role": "bwd_small",
         "select_rule": {
-            "above": 0,
+            "above": 14,
             "at_most": 1024,
             "kind": "rows_between",
         },
@@ -6906,7 +7830,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "chunk_partials",
         },
     },
-    "cake_rmsnorm_train_9b727c2c9933b2ca6724": {
+    "cake_rmsnorm_train_9b727c2c9933b2ca6724__14_1024": {
         "arches": [
             "sm_100a",
             "sm_103a",
@@ -6924,7 +7848,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "library": "cake_rmsnorm_train_9b727c2c9933b2ca6724",
         "role": "bwd_reduce",
         "select_rule": {
-            "above": 0,
+            "above": 14,
             "at_most": 1024,
             "kind": "rows_between",
         },
@@ -7000,7 +7924,7 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "workspace_rule": None,
     },
-    "cake_rmsnorm_train_baff9ecbafe7de1e6030": {
+    "cake_rmsnorm_train_baff9ecbafe7de1e6030__64_1024": {
         "arches": [
             "sm_100a",
             "sm_103a",
@@ -7023,7 +7947,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "library": "cake_rmsnorm_train_baff9ecbafe7de1e6030",
         "role": "bwd_small_w32",
         "select_rule": {
-            "above": 0,
+            "above": 64,
             "at_most": 1024,
             "kind": "rows_between",
         },
@@ -7094,6 +8018,30 @@ MODULES: dict[str, dict[str, Any]] = {
             "counters": 48,
             "kind": "chunk_partials",
         },
+    },
+    "cake_rmsnorm_train_9b727c2c9933b2ca6724__64_1024": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "grid_rule": {
+            "ctas": 48,
+            "kind": "fixed",
+        },
+        "hidden": 1536,
+        "kernel": "cake_rmsnorm_train_9b727c2c9933b2ca6724",
+        "launch": {
+            "cooperative": False,
+            "use_pdl": True,
+        },
+        "library": "cake_rmsnorm_train_9b727c2c9933b2ca6724",
+        "role": "bwd_reduce",
+        "select_rule": {
+            "above": 64,
+            "at_most": 1024,
+            "kind": "rows_between",
+        },
+        "workspace_rule": None,
     },
     "cake_rmsnorm_train_caf6978ed0a17fbf65b9__336_3072": {
         "arches": [
@@ -7762,10 +8710,9 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "workspace_rule": None,
     },
-    "cake_rmsnorm_train_09601d42628de24f6f87": {
+    "cake_rmsnorm_train_09601d42628de24f6f87__26_1024": {
         "arches": [
             "sm_100a",
-            "sm_103a",
         ],
         "grid_rule": {
             "ctas_per_sm": 1,
@@ -7785,7 +8732,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "library": "cake_rmsnorm_train_09601d42628de24f6f87",
         "role": "bwd_small",
         "select_rule": {
-            "above": 0,
+            "above": 26,
             "at_most": 1024,
             "kind": "rows_between",
         },
@@ -7825,10 +8772,9 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "chunk_partials",
         },
     },
-    "cake_rmsnorm_train_7097069b8eea6ba44d5a": {
+    "cake_rmsnorm_train_7097069b8eea6ba44d5a__26_1024": {
         "arches": [
             "sm_100a",
-            "sm_103a",
         ],
         "grid_rule": {
             "ctas": 16,
@@ -7843,7 +8789,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "library": "cake_rmsnorm_train_7097069b8eea6ba44d5a",
         "role": "bwd_reduce",
         "select_rule": {
-            "above": 0,
+            "above": 26,
             "at_most": 1024,
             "kind": "rows_between",
         },
@@ -8036,7 +8982,7 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "workspace_rule": None,
     },
-    "cake_rmsnorm_train_6042554b427634669739": {
+    "cake_rmsnorm_train_6042554b427634669739__22_256": {
         "arches": [
             "sm_100a",
         ],
@@ -8058,7 +9004,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "library": "cake_rmsnorm_train_6042554b427634669739",
         "role": "bwd_small_w32",
         "select_rule": {
-            "above": 0,
+            "above": 22,
             "at_most": 256,
             "kind": "rows_between",
         },
@@ -8129,7 +9075,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "chunk_partials",
         },
     },
-    "cake_rmsnorm_train_c5831b29d17867842e5f": {
+    "cake_rmsnorm_train_c5831b29d17867842e5f__22_256": {
         "arches": [
             "sm_100a",
         ],
@@ -8146,7 +9092,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "library": "cake_rmsnorm_train_c5831b29d17867842e5f",
         "role": "bwd_reduce",
         "select_rule": {
-            "above": 0,
+            "above": 22,
             "at_most": 256,
             "kind": "rows_between",
         },
@@ -8615,7 +9561,7 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "workspace_rule": None,
     },
-    "cake_rmsnorm_train_caf6978ed0a17fbf65b9": {
+    "cake_rmsnorm_train_caf6978ed0a17fbf65b9__12_3072": {
         "arches": [
             "sm_103a",
         ],
@@ -8637,7 +9583,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "library": "cake_rmsnorm_train_caf6978ed0a17fbf65b9",
         "role": "bwd_small",
         "select_rule": {
-            "above": 0,
+            "above": 12,
             "at_most": 3072,
             "kind": "rows_between",
         },
@@ -8739,7 +9685,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "chunk_partials",
         },
     },
-    "cake_rmsnorm_train_880768a0a264e04dbfb5": {
+    "cake_rmsnorm_train_880768a0a264e04dbfb5__12_3072": {
         "arches": [
             "sm_103a",
         ],
@@ -8756,7 +9702,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "library": "cake_rmsnorm_train_880768a0a264e04dbfb5",
         "role": "bwd_reduce",
         "select_rule": {
-            "above": 0,
+            "above": 12,
             "at_most": 3072,
             "kind": "rows_between",
         },
@@ -8831,7 +9777,7 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "workspace_rule": None,
     },
-    "cake_rmsnorm_train_07f9f2fbea7163639c27": {
+    "cake_rmsnorm_train_07f9f2fbea7163639c27__42_3072": {
         "arches": [
             "sm_103a",
         ],
@@ -8853,7 +9799,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "library": "cake_rmsnorm_train_07f9f2fbea7163639c27",
         "role": "bwd_small_w32",
         "select_rule": {
-            "above": 0,
+            "above": 42,
             "at_most": 3072,
             "kind": "rows_between",
         },
@@ -8955,7 +9901,30 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "chunk_partials",
         },
     },
-    "cake_rmsnorm_train_5450d39836b26cfd3256__0_4608": {
+    "cake_rmsnorm_train_880768a0a264e04dbfb5__42_3072": {
+        "arches": [
+            "sm_103a",
+        ],
+        "grid_rule": {
+            "ctas": 32,
+            "kind": "fixed",
+        },
+        "hidden": 2048,
+        "kernel": "cake_rmsnorm_train_880768a0a264e04dbfb5",
+        "launch": {
+            "cooperative": False,
+            "use_pdl": True,
+        },
+        "library": "cake_rmsnorm_train_880768a0a264e04dbfb5",
+        "role": "bwd_reduce",
+        "select_rule": {
+            "above": 42,
+            "at_most": 3072,
+            "kind": "rows_between",
+        },
+        "workspace_rule": None,
+    },
+    "cake_rmsnorm_train_5450d39836b26cfd3256__1080_4608": {
         "arches": [
             "sm_103a",
         ],
@@ -8977,7 +9946,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "library": "cake_rmsnorm_train_5450d39836b26cfd3256",
         "role": "bwd_main",
         "select_rule": {
-            "above": 0,
+            "above": 1080,
             "at_most": 4608,
             "kind": "rows_between",
         },
@@ -8986,7 +9955,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "chunk_partials",
         },
     },
-    "cake_rmsnorm_train_72138dce40d43da44aaf__0_4608": {
+    "cake_rmsnorm_train_72138dce40d43da44aaf__1080_4608": {
         "arches": [
             "sm_103a",
         ],
@@ -9003,7 +9972,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "library": "cake_rmsnorm_train_72138dce40d43da44aaf",
         "role": "bwd_reduce",
         "select_rule": {
-            "above": 0,
+            "above": 1080,
             "at_most": 4608,
             "kind": "rows_between",
         },
@@ -9280,7 +10249,7 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "workspace_rule": None,
     },
-    "cake_rmsnorm_train_5e0c6208d4b426f79faa__0_4608": {
+    "cake_rmsnorm_train_5e0c6208d4b426f79faa__1080_4608": {
         "arches": [
             "sm_103a",
         ],
@@ -9302,7 +10271,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "library": "cake_rmsnorm_train_5e0c6208d4b426f79faa",
         "role": "bwd_main_w32",
         "select_rule": {
-            "above": 0,
+            "above": 1080,
             "at_most": 4608,
             "kind": "rows_between",
         },
@@ -9683,7 +10652,7 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "workspace_rule": None,
     },
-    "cake_rmsnorm_train_3fd77c8ce97e8a523abb": {
+    "cake_rmsnorm_train_3fd77c8ce97e8a523abb__15_256": {
         "arches": [
             "sm_103a",
         ],
@@ -9705,7 +10674,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "library": "cake_rmsnorm_train_3fd77c8ce97e8a523abb",
         "role": "bwd_small_w32",
         "select_rule": {
-            "above": 0,
+            "above": 15,
             "at_most": 256,
             "kind": "rows_between",
         },
@@ -9807,6 +10776,29 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "chunk_partials",
         },
     },
+    "cake_rmsnorm_train_5d75ea5f3c25579af496__15_256": {
+        "arches": [
+            "sm_103a",
+        ],
+        "grid_rule": {
+            "ctas": 128,
+            "kind": "fixed",
+        },
+        "hidden": 4096,
+        "kernel": "cake_rmsnorm_train_5d75ea5f3c25579af496",
+        "launch": {
+            "cooperative": False,
+            "use_pdl": True,
+        },
+        "library": "cake_rmsnorm_train_5d75ea5f3c25579af496",
+        "role": "bwd_reduce",
+        "select_rule": {
+            "above": 15,
+            "at_most": 256,
+            "kind": "rows_between",
+        },
+        "workspace_rule": None,
+    },
     "cake_rmsnorm_train_fcbfa14d591a9babfd26__4096_9216": {
         "arches": [
             "sm_103a",
@@ -9829,6 +10821,37 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "rows_between",
         },
         "workspace_rule": None,
+    },
+    "cake_rmsnorm_train_09601d42628de24f6f87": {
+        "arches": [
+            "sm_103a",
+        ],
+        "grid_rule": {
+            "ctas_per_sm": 1,
+            "grid_factor": 2,
+            "kind": "claimed_chunks",
+            "launch_bound_ctas_per_sm": 1,
+            "max_halving": 5,
+            "rows_per_issue": 8,
+            "tail_div": 12,
+        },
+        "hidden": 512,
+        "kernel": "cake_rmsnorm_train_09601d42628de24f6f87",
+        "launch": {
+            "cooperative": False,
+            "use_pdl": False,
+        },
+        "library": "cake_rmsnorm_train_09601d42628de24f6f87",
+        "role": "bwd_small",
+        "select_rule": {
+            "above": 0,
+            "at_most": 1024,
+            "kind": "rows_between",
+        },
+        "workspace_rule": {
+            "counters": 16,
+            "kind": "chunk_partials",
+        },
     },
     "cake_rmsnorm_train_8e7f4d811e55a351a22e": {
         "arches": [
@@ -9922,6 +10945,29 @@ MODULES: dict[str, dict[str, Any]] = {
             "counters": 16,
             "kind": "chunk_partials",
         },
+    },
+    "cake_rmsnorm_train_7097069b8eea6ba44d5a": {
+        "arches": [
+            "sm_103a",
+        ],
+        "grid_rule": {
+            "ctas": 16,
+            "kind": "fixed",
+        },
+        "hidden": 512,
+        "kernel": "cake_rmsnorm_train_7097069b8eea6ba44d5a",
+        "launch": {
+            "cooperative": False,
+            "use_pdl": True,
+        },
+        "library": "cake_rmsnorm_train_7097069b8eea6ba44d5a",
+        "role": "bwd_reduce",
+        "select_rule": {
+            "above": 0,
+            "at_most": 1024,
+            "kind": "rows_between",
+        },
+        "workspace_rule": None,
     },
     "cake_rmsnorm_train_7097069b8eea6ba44d5a__1024_4096": {
         "arches": [
@@ -10077,7 +11123,7 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "workspace_rule": None,
     },
-    "cake_rmsnorm_train_2fc4932fbde0bc848b32__0_320": {
+    "cake_rmsnorm_train_2fc4932fbde0bc848b32__22_320": {
         "arches": [
             "sm_103a",
         ],
@@ -10099,7 +11145,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "library": "cake_rmsnorm_train_2fc4932fbde0bc848b32",
         "role": "bwd_main",
         "select_rule": {
-            "above": 0,
+            "above": 22,
             "at_most": 320,
             "kind": "rows_between",
         },
@@ -10170,7 +11216,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "chunk_partials",
         },
     },
-    "cake_rmsnorm_train_c5831b29d17867842e5f__0_320": {
+    "cake_rmsnorm_train_c5831b29d17867842e5f__22_320": {
         "arches": [
             "sm_103a",
         ],
@@ -10187,7 +11233,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "library": "cake_rmsnorm_train_c5831b29d17867842e5f",
         "role": "bwd_reduce",
         "select_rule": {
-            "above": 0,
+            "above": 22,
             "at_most": 320,
             "kind": "rows_between",
         },
@@ -10239,7 +11285,7 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "workspace_rule": None,
     },
-    "cake_rmsnorm_train_79811a76205d7d7dd197": {
+    "cake_rmsnorm_train_79811a76205d7d7dd197__22_5120": {
         "arches": [
             "sm_103a",
         ],
@@ -10261,7 +11307,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "library": "cake_rmsnorm_train_79811a76205d7d7dd197",
         "role": "bwd_main_w32",
         "select_rule": {
-            "above": 0,
+            "above": 22,
             "at_most": 5120,
             "kind": "rows_between",
         },
@@ -10301,7 +11347,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "chunk_partials",
         },
     },
-    "cake_rmsnorm_train_c5831b29d17867842e5f__0_5120": {
+    "cake_rmsnorm_train_c5831b29d17867842e5f__22_5120": {
         "arches": [
             "sm_103a",
         ],
@@ -10318,7 +11364,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "library": "cake_rmsnorm_train_c5831b29d17867842e5f",
         "role": "bwd_reduce",
         "select_rule": {
-            "above": 0,
+            "above": 22,
             "at_most": 5120,
             "kind": "rows_between",
         },
@@ -10486,7 +11532,7 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "workspace_rule": None,
     },
-    "cake_rmsnorm_train_41b80b6af97974feb181__0_320": {
+    "cake_rmsnorm_train_41b80b6af97974feb181__20_320": {
         "arches": [
             "sm_103a",
         ],
@@ -10508,7 +11554,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "library": "cake_rmsnorm_train_41b80b6af97974feb181",
         "role": "bwd_small_w32",
         "select_rule": {
-            "above": 0,
+            "above": 20,
             "at_most": 320,
             "kind": "rows_between",
         },
@@ -10579,7 +11625,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "chunk_partials",
         },
     },
-    "cake_rmsnorm_train_5f5cdc5151e3c0620bcd__0_320": {
+    "cake_rmsnorm_train_5f5cdc5151e3c0620bcd__20_320": {
         "arches": [
             "sm_103a",
         ],
@@ -10596,7 +11642,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "library": "cake_rmsnorm_train_5f5cdc5151e3c0620bcd",
         "role": "bwd_reduce",
         "select_rule": {
-            "above": 0,
+            "above": 20,
             "at_most": 320,
             "kind": "rows_between",
         },
@@ -10710,7 +11756,7 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "workspace_rule": None,
     },
-    "cake_rmsnorm_train_56f988dde54db37f09d9__0_320": {
+    "cake_rmsnorm_train_56f988dde54db37f09d9__6_320": {
         "arches": [
             "sm_103a",
         ],
@@ -10732,7 +11778,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "library": "cake_rmsnorm_train_56f988dde54db37f09d9",
         "role": "bwd_main_w32_residual",
         "select_rule": {
-            "above": 0,
+            "above": 6,
             "at_most": 320,
             "kind": "rows_between",
         },
@@ -10803,7 +11849,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "chunk_partials",
         },
     },
-    "cake_rmsnorm_train_2e8d2128a33361628509__0_320": {
+    "cake_rmsnorm_train_2e8d2128a33361628509__6_320": {
         "arches": [
             "sm_103a",
         ],
@@ -10820,7 +11866,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "library": "cake_rmsnorm_train_2e8d2128a33361628509",
         "role": "bwd_reduce",
         "select_rule": {
-            "above": 0,
+            "above": 6,
             "at_most": 320,
             "kind": "rows_between",
         },
@@ -10849,7 +11895,7 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "workspace_rule": None,
     },
-    "cake_rmsnorm_train_7dc29629ff21625607f8__107": {
+    "cake_rmsnorm_train_7dc29629ff21625607f8__14_1024_107": {
         "arches": [
             "sm_107a",
         ],
@@ -10871,7 +11917,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "library": "cake_rmsnorm_train_7dc29629ff21625607f8",
         "role": "bwd_small",
         "select_rule": {
-            "above": 0,
+            "above": 14,
             "at_most": 1024,
             "kind": "rows_between",
         },
@@ -10942,7 +11988,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "chunk_partials",
         },
     },
-    "cake_rmsnorm_train_628248febbdfe17c3325": {
+    "cake_rmsnorm_train_628248febbdfe17c3325__14_1024": {
         "arches": [
             "sm_107a",
         ],
@@ -10959,7 +12005,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "library": "cake_rmsnorm_train_628248febbdfe17c3325",
         "role": "bwd_reduce",
         "select_rule": {
-            "above": 0,
+            "above": 14,
             "at_most": 1024,
             "kind": "rows_between",
         },
@@ -11011,7 +12057,7 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "workspace_rule": None,
     },
-    "cake_rmsnorm_train_baff9ecbafe7de1e6030__107": {
+    "cake_rmsnorm_train_baff9ecbafe7de1e6030__64_1024_107": {
         "arches": [
             "sm_107a",
         ],
@@ -11033,7 +12079,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "library": "cake_rmsnorm_train_baff9ecbafe7de1e6030",
         "role": "bwd_small_w32",
         "select_rule": {
-            "above": 0,
+            "above": 64,
             "at_most": 1024,
             "kind": "rows_between",
         },
@@ -11104,7 +12150,30 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "chunk_partials",
         },
     },
-    "cake_rmsnorm_train_84efa2af7907877dfb56": {
+    "cake_rmsnorm_train_628248febbdfe17c3325__64_1024": {
+        "arches": [
+            "sm_107a",
+        ],
+        "grid_rule": {
+            "ctas": 48,
+            "kind": "fixed",
+        },
+        "hidden": 1536,
+        "kernel": "cake_rmsnorm_train_628248febbdfe17c3325",
+        "launch": {
+            "cooperative": False,
+            "use_pdl": True,
+        },
+        "library": "cake_rmsnorm_train_628248febbdfe17c3325",
+        "role": "bwd_reduce",
+        "select_rule": {
+            "above": 64,
+            "at_most": 1024,
+            "kind": "rows_between",
+        },
+        "workspace_rule": None,
+    },
+    "cake_rmsnorm_train_84efa2af7907877dfb56__6_256": {
         "arches": [
             "sm_107a",
         ],
@@ -11126,7 +12195,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "library": "cake_rmsnorm_train_84efa2af7907877dfb56",
         "role": "bwd_main",
         "select_rule": {
-            "above": 0,
+            "above": 6,
             "at_most": 256,
             "kind": "rows_between",
         },
@@ -11228,7 +12297,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "chunk_partials",
         },
     },
-    "cake_rmsnorm_train_520453292492bd2725be": {
+    "cake_rmsnorm_train_520453292492bd2725be__6_256": {
         "arches": [
             "sm_107a",
         ],
@@ -11245,7 +12314,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "library": "cake_rmsnorm_train_520453292492bd2725be",
         "role": "bwd_reduce",
         "select_rule": {
-            "above": 0,
+            "above": 6,
             "at_most": 256,
             "kind": "rows_between",
         },
@@ -11320,7 +12389,7 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "workspace_rule": None,
     },
-    "cake_rmsnorm_train_6b13aa49e0c0414d9041": {
+    "cake_rmsnorm_train_6b13aa49e0c0414d9041__127_256": {
         "arches": [
             "sm_107a",
         ],
@@ -11342,7 +12411,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "library": "cake_rmsnorm_train_6b13aa49e0c0414d9041",
         "role": "bwd_main_w32",
         "select_rule": {
-            "above": 0,
+            "above": 127,
             "at_most": 256,
             "kind": "rows_between",
         },
@@ -11444,7 +12513,30 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "chunk_partials",
         },
     },
-    "cake_rmsnorm_train_5450d39836b26cfd3256__0_3584": {
+    "cake_rmsnorm_train_520453292492bd2725be__127_256": {
+        "arches": [
+            "sm_107a",
+        ],
+        "grid_rule": {
+            "ctas": 64,
+            "kind": "fixed",
+        },
+        "hidden": 2048,
+        "kernel": "cake_rmsnorm_train_520453292492bd2725be",
+        "launch": {
+            "cooperative": False,
+            "use_pdl": True,
+        },
+        "library": "cake_rmsnorm_train_520453292492bd2725be",
+        "role": "bwd_reduce",
+        "select_rule": {
+            "above": 127,
+            "at_most": 256,
+            "kind": "rows_between",
+        },
+        "workspace_rule": None,
+    },
+    "cake_rmsnorm_train_5450d39836b26cfd3256__1056_3584": {
         "arches": [
             "sm_107a",
         ],
@@ -11466,7 +12558,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "library": "cake_rmsnorm_train_5450d39836b26cfd3256",
         "role": "bwd_main",
         "select_rule": {
-            "above": 0,
+            "above": 1056,
             "at_most": 3584,
             "kind": "rows_between",
         },
@@ -11475,7 +12567,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "chunk_partials",
         },
     },
-    "cake_rmsnorm_train_312bbe084eac69d858c4__0_3584": {
+    "cake_rmsnorm_train_312bbe084eac69d858c4__1056_3584": {
         "arches": [
             "sm_107a",
         ],
@@ -11492,13 +12584,13 @@ MODULES: dict[str, dict[str, Any]] = {
         "library": "cake_rmsnorm_train_312bbe084eac69d858c4",
         "role": "bwd_reduce",
         "select_rule": {
-            "above": 0,
+            "above": 1056,
             "at_most": 3584,
             "kind": "rows_between",
         },
         "workspace_rule": None,
     },
-    "cake_rmsnorm_train_5e0c6208d4b426f79faa__0_1536": {
+    "cake_rmsnorm_train_5e0c6208d4b426f79faa__1296_1536": {
         "arches": [
             "sm_107a",
         ],
@@ -11520,7 +12612,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "library": "cake_rmsnorm_train_5e0c6208d4b426f79faa",
         "role": "bwd_main_w32",
         "select_rule": {
-            "above": 0,
+            "above": 1296,
             "at_most": 1536,
             "kind": "rows_between",
         },
@@ -11529,7 +12621,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "chunk_partials",
         },
     },
-    "cake_rmsnorm_train_312bbe084eac69d858c4__0_1536": {
+    "cake_rmsnorm_train_312bbe084eac69d858c4__1296_1536": {
         "arches": [
             "sm_107a",
         ],
@@ -11546,13 +12638,13 @@ MODULES: dict[str, dict[str, Any]] = {
         "library": "cake_rmsnorm_train_312bbe084eac69d858c4",
         "role": "bwd_reduce",
         "select_rule": {
-            "above": 0,
+            "above": 1296,
             "at_most": 1536,
             "kind": "rows_between",
         },
         "workspace_rule": None,
     },
-    "cake_rmsnorm_train_0da5dd4b80ad9b5426ce": {
+    "cake_rmsnorm_train_0da5dd4b80ad9b5426ce__6_256": {
         "arches": [
             "sm_107a",
         ],
@@ -11574,7 +12666,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "library": "cake_rmsnorm_train_0da5dd4b80ad9b5426ce",
         "role": "bwd_small",
         "select_rule": {
-            "above": 0,
+            "above": 6,
             "at_most": 256,
             "kind": "rows_between",
         },
@@ -11676,7 +12768,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "chunk_partials",
         },
     },
-    "cake_rmsnorm_train_69bf6e104bb48b6b74bf": {
+    "cake_rmsnorm_train_69bf6e104bb48b6b74bf__6_256": {
         "arches": [
             "sm_107a",
         ],
@@ -11693,7 +12785,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "library": "cake_rmsnorm_train_69bf6e104bb48b6b74bf",
         "role": "bwd_reduce",
         "select_rule": {
-            "above": 0,
+            "above": 6,
             "at_most": 256,
             "kind": "rows_between",
         },
@@ -11767,37 +12859,6 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "rows_between",
         },
         "workspace_rule": None,
-    },
-    "cake_rmsnorm_train_0c0fa63d0ff2cdc484a4": {
-        "arches": [
-            "sm_107a",
-        ],
-        "grid_rule": {
-            "ctas_per_sm": 1,
-            "grid_factor": 2,
-            "kind": "claimed_chunks",
-            "launch_bound_ctas_per_sm": 1,
-            "max_halving": 5,
-            "rows_per_issue": 2,
-            "tail_div": 12,
-        },
-        "hidden": 4096,
-        "kernel": "cake_rmsnorm_train_0c0fa63d0ff2cdc484a4",
-        "launch": {
-            "cooperative": False,
-            "use_pdl": False,
-        },
-        "library": "cake_rmsnorm_train_0c0fa63d0ff2cdc484a4",
-        "role": "bwd_small_w32",
-        "select_rule": {
-            "above": 0,
-            "at_most": 256,
-            "kind": "rows_between",
-        },
-        "workspace_rule": {
-            "counters": 128,
-            "kind": "chunk_partials",
-        },
     },
     "cake_rmsnorm_train_dc439f8335327e482025": {
         "arches": [
@@ -12131,7 +13192,7 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "workspace_rule": None,
     },
-    "cake_rmsnorm_train_b841d64bbcaefff5ce7b": {
+    "cake_rmsnorm_train_b841d64bbcaefff5ce7b__229_1024": {
         "arches": [
             "sm_107a",
         ],
@@ -12153,7 +13214,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "library": "cake_rmsnorm_train_b841d64bbcaefff5ce7b",
         "role": "bwd_main_w32",
         "select_rule": {
-            "above": 0,
+            "above": 229,
             "at_most": 1024,
             "kind": "rows_between",
         },
@@ -12224,7 +13285,30 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "chunk_partials",
         },
     },
-    "cake_rmsnorm_train_838c077df3a6d35d55b7": {
+    "cake_rmsnorm_train_f94861c36a14eb75e39c__229_1024": {
+        "arches": [
+            "sm_107a",
+        ],
+        "grid_rule": {
+            "ctas": 16,
+            "kind": "fixed",
+        },
+        "hidden": 512,
+        "kernel": "cake_rmsnorm_train_f94861c36a14eb75e39c",
+        "launch": {
+            "cooperative": False,
+            "use_pdl": True,
+        },
+        "library": "cake_rmsnorm_train_f94861c36a14eb75e39c",
+        "role": "bwd_reduce",
+        "select_rule": {
+            "above": 229,
+            "at_most": 1024,
+            "kind": "rows_between",
+        },
+        "workspace_rule": None,
+    },
+    "cake_rmsnorm_train_838c077df3a6d35d55b7__18_4096": {
         "arches": [
             "sm_107a",
         ],
@@ -12246,7 +13330,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "library": "cake_rmsnorm_train_838c077df3a6d35d55b7",
         "role": "bwd_small",
         "select_rule": {
-            "above": 0,
+            "above": 18,
             "at_most": 4096,
             "kind": "rows_between",
         },
@@ -12317,7 +13401,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "chunk_partials",
         },
     },
-    "cake_rmsnorm_train_2af4cf2f58ba58f78099": {
+    "cake_rmsnorm_train_2af4cf2f58ba58f78099__18_4096": {
         "arches": [
             "sm_107a",
         ],
@@ -12334,7 +13418,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "library": "cake_rmsnorm_train_2af4cf2f58ba58f78099",
         "role": "bwd_reduce",
         "select_rule": {
-            "above": 0,
+            "above": 18,
             "at_most": 4096,
             "kind": "rows_between",
         },
@@ -12386,7 +13470,7 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "workspace_rule": None,
     },
-    "cake_rmsnorm_train_cd612de56c0985bb4caa": {
+    "cake_rmsnorm_train_cd612de56c0985bb4caa__13_4096": {
         "arches": [
             "sm_107a",
         ],
@@ -12408,7 +13492,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "library": "cake_rmsnorm_train_cd612de56c0985bb4caa",
         "role": "bwd_small_w32",
         "select_rule": {
-            "above": 0,
+            "above": 13,
             "at_most": 4096,
             "kind": "rows_between",
         },
@@ -12479,6 +13563,29 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "chunk_partials",
         },
     },
+    "cake_rmsnorm_train_2af4cf2f58ba58f78099__13_4096": {
+        "arches": [
+            "sm_107a",
+        ],
+        "grid_rule": {
+            "ctas": 160,
+            "kind": "fixed",
+        },
+        "hidden": 5120,
+        "kernel": "cake_rmsnorm_train_2af4cf2f58ba58f78099",
+        "launch": {
+            "cooperative": False,
+            "use_pdl": True,
+        },
+        "library": "cake_rmsnorm_train_2af4cf2f58ba58f78099",
+        "role": "bwd_reduce",
+        "select_rule": {
+            "above": 13,
+            "at_most": 4096,
+            "kind": "rows_between",
+        },
+        "workspace_rule": None,
+    },
     "cake_rmsnorm_train_5d292172df772adb17ae__0_30720": {
         "arches": [
             "sm_107a",
@@ -12533,7 +13640,7 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "workspace_rule": None,
     },
-    "cake_rmsnorm_train_7d2f6707bfa3d2cd60bb__0_30720": {
+    "cake_rmsnorm_train_7d2f6707bfa3d2cd60bb__20_28672": {
         "arches": [
             "sm_107a",
         ],
@@ -12555,14 +13662,37 @@ MODULES: dict[str, dict[str, Any]] = {
         "library": "cake_rmsnorm_train_7d2f6707bfa3d2cd60bb",
         "role": "bwd_main_w32",
         "select_rule": {
-            "above": 0,
-            "at_most": 30720,
+            "above": 20,
+            "at_most": 28672,
             "kind": "rows_between",
         },
         "workspace_rule": {
             "counters": 192,
             "kind": "chunk_partials",
         },
+    },
+    "cake_rmsnorm_train_fb3f2a96e954f0e241bc__20_28672": {
+        "arches": [
+            "sm_107a",
+        ],
+        "grid_rule": {
+            "ctas": 192,
+            "kind": "fixed",
+        },
+        "hidden": 6144,
+        "kernel": "cake_rmsnorm_train_fb3f2a96e954f0e241bc",
+        "launch": {
+            "cooperative": False,
+            "use_pdl": True,
+        },
+        "library": "cake_rmsnorm_train_fb3f2a96e954f0e241bc",
+        "role": "bwd_reduce",
+        "select_rule": {
+            "above": 20,
+            "at_most": 28672,
+            "kind": "rows_between",
+        },
+        "workspace_rule": None,
     },
     "cake_rmsnorm_train_0dcdc563be377247044e__0_448": {
         "arches": [
@@ -12672,7 +13802,7 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "workspace_rule": None,
     },
-    "cake_rmsnorm_train_56f988dde54db37f09d9__0_448": {
+    "cake_rmsnorm_train_56f988dde54db37f09d9__3_448": {
         "arches": [
             "sm_107a",
         ],
@@ -12694,7 +13824,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "library": "cake_rmsnorm_train_56f988dde54db37f09d9",
         "role": "bwd_main_w32_residual",
         "select_rule": {
-            "above": 0,
+            "above": 3,
             "at_most": 448,
             "kind": "rows_between",
         },
@@ -12733,6 +13863,29 @@ MODULES: dict[str, dict[str, Any]] = {
             "counters": 96,
             "kind": "chunk_partials",
         },
+    },
+    "cake_rmsnorm_train_60bfcb24560bbae612c3__3_448": {
+        "arches": [
+            "sm_107a",
+        ],
+        "grid_rule": {
+            "ctas": 96,
+            "kind": "fixed",
+        },
+        "hidden": 6144,
+        "kernel": "cake_rmsnorm_train_60bfcb24560bbae612c3",
+        "launch": {
+            "cooperative": False,
+            "use_pdl": True,
+        },
+        "library": "cake_rmsnorm_train_60bfcb24560bbae612c3",
+        "role": "bwd_reduce",
+        "select_rule": {
+            "above": 3,
+            "at_most": 448,
+            "kind": "rows_between",
+        },
+        "workspace_rule": None,
     },
 }
 
@@ -12845,10 +13998,11 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_rmsnorm_train_7c2aa4b429538da06a2a",
         ],
         "bwd_h512": [
-            "cake_rmsnorm_train_09601d42628de24f6f87",
+            "cake_rmsnorm_train_d0bde38aa443d42a5f04__0_26",
+            "cake_rmsnorm_train_09601d42628de24f6f87__26_1024",
             "cake_rmsnorm_train_123db0b2f7fb38cfab03__1024_1280",
             "cake_rmsnorm_train_d0bde38aa443d42a5f04",
-            "cake_rmsnorm_train_7097069b8eea6ba44d5a",
+            "cake_rmsnorm_train_7097069b8eea6ba44d5a__26_1024",
             "cake_rmsnorm_train_fef03ce50a792c8704bd__1024_1280",
         ],
         "bwd_w32_h512": [
@@ -12857,22 +14011,24 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_rmsnorm_train_7097069b8eea6ba44d5a__0_960",
         ],
         "bwd_h1536": [
-            "cake_rmsnorm_train_7dc29629ff21625607f8",
+            "cake_rmsnorm_train_ae610afdf77ff6714a5b__0_14",
+            "cake_rmsnorm_train_7dc29629ff21625607f8__14_1024",
             "cake_rmsnorm_train_c1a9efdf06c3087b4efe",
             "cake_rmsnorm_train_21c8bb55c8d672b63952",
             "cake_rmsnorm_train_b457c4d134e44476dc6f__32768_36864",
             "cake_rmsnorm_train_ae610afdf77ff6714a5b",
-            "cake_rmsnorm_train_9b727c2c9933b2ca6724",
+            "cake_rmsnorm_train_9b727c2c9933b2ca6724__14_1024",
             "cake_rmsnorm_train_1863320f3158d35eead6",
             "cake_rmsnorm_train_1863320f3158d35eead6__4096_32768",
             "cake_rmsnorm_train_9b727c2c9933b2ca6724__32768_36864",
         ],
         "bwd_w32_h1536": [
-            "cake_rmsnorm_train_baff9ecbafe7de1e6030",
+            "cake_rmsnorm_train_4b6981c10fd40a9d8aec__0_64",
+            "cake_rmsnorm_train_baff9ecbafe7de1e6030__64_1024",
             "cake_rmsnorm_train_17d9cdfd157ba4b86c2b",
             "cake_rmsnorm_train_4bf450b6af0314ed03be",
             "cake_rmsnorm_train_4b6981c10fd40a9d8aec",
-            "cake_rmsnorm_train_9b727c2c9933b2ca6724",
+            "cake_rmsnorm_train_9b727c2c9933b2ca6724__64_1024",
             "cake_rmsnorm_train_1863320f3158d35eead6",
             "cake_rmsnorm_train_1863320f3158d35eead6__4096_32768",
         ],
@@ -12934,11 +14090,12 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_rmsnorm_train_c5831b29d17867842e5f__6144_65536",
         ],
         "bwd_w32_h5120": [
-            "cake_rmsnorm_train_6042554b427634669739",
+            "cake_rmsnorm_train_de8f6091077dc7ac5947__0_22",
+            "cake_rmsnorm_train_6042554b427634669739__22_256",
             "cake_rmsnorm_train_40227b2a2b2122628d58",
             "cake_rmsnorm_train_9479b1298a1b19d4d996__6144_65536",
             "cake_rmsnorm_train_de8f6091077dc7ac5947",
-            "cake_rmsnorm_train_c5831b29d17867842e5f",
+            "cake_rmsnorm_train_c5831b29d17867842e5f__22_256",
             "cake_rmsnorm_train_c5831b29d17867842e5f__256_6144",
             "cake_rmsnorm_train_c5831b29d17867842e5f__6144_65536",
         ],
@@ -13066,7 +14223,8 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_rmsnorm_train_6325c474ad9955a319e9",
         ],
         "bwd_h256": [
-            "cake_rmsnorm_train_5450d39836b26cfd3256__0_4608",
+            "cake_rmsnorm_train_195c4317b51bb4ea1137__0_1080",
+            "cake_rmsnorm_train_5450d39836b26cfd3256__1080_4608",
             "cake_rmsnorm_train_195c4317b51bb4ea1137__4608_5120",
             "cake_rmsnorm_train_a385ae1681a2c078344e__5120_12288",
             "cake_rmsnorm_train_af005462cd6a301f31c4__12288_40960",
@@ -13074,7 +14232,7 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_rmsnorm_train_172a47a15d4c1a76c061__93184_139264",
             "cake_rmsnorm_train_0291949ba535c646c3a8__139264_1572864",
             "cake_rmsnorm_train_c18297d75c0d424978fd",
-            "cake_rmsnorm_train_72138dce40d43da44aaf__0_4608",
+            "cake_rmsnorm_train_72138dce40d43da44aaf__1080_4608",
             "cake_rmsnorm_train_72138dce40d43da44aaf__5120_12288",
             "cake_rmsnorm_train_72138dce40d43da44aaf__12288_40960",
             "cake_rmsnorm_train_72138dce40d43da44aaf__40960_93184",
@@ -13082,7 +14240,8 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_rmsnorm_train_e73321cec89d33336ea1",
         ],
         "bwd_w32_h256": [
-            "cake_rmsnorm_train_5e0c6208d4b426f79faa__0_4608",
+            "cake_rmsnorm_train_8de0131445eed6eeabb7__0_1080",
+            "cake_rmsnorm_train_5e0c6208d4b426f79faa__1080_4608",
             "cake_rmsnorm_train_8de0131445eed6eeabb7__4608_5120",
             "cake_rmsnorm_train_420788e663a2c3a810f6__5120_12288",
             "cake_rmsnorm_train_b7d9577ff884de98ea06__12288_40960",
@@ -13090,7 +14249,7 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_rmsnorm_train_7c2aa4b429538da06a2a__93184_139264",
             "cake_rmsnorm_train_89505762fa1cbf33cb8f__139264_1572864",
             "cake_rmsnorm_train_f788ef57163552825d27",
-            "cake_rmsnorm_train_72138dce40d43da44aaf__0_4608",
+            "cake_rmsnorm_train_72138dce40d43da44aaf__1080_4608",
             "cake_rmsnorm_train_72138dce40d43da44aaf__5120_12288",
             "cake_rmsnorm_train_72138dce40d43da44aaf__12288_40960",
             "cake_rmsnorm_train_72138dce40d43da44aaf__40960_93184",
@@ -13116,52 +14275,56 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_rmsnorm_train_122721bd6b4650866553",
         ],
         "bwd_h1536": [
-            "cake_rmsnorm_train_7dc29629ff21625607f8",
+            "cake_rmsnorm_train_327bfeb4ab8fefc2731d__0_14",
+            "cake_rmsnorm_train_7dc29629ff21625607f8__14_1024",
             "cake_rmsnorm_train_c1a9efdf06c3087b4efe",
             "cake_rmsnorm_train_1df7db17277d363b5168",
             "cake_rmsnorm_train_4df08ce51fb01ba1193f",
             "cake_rmsnorm_train_f522f5b8d4343d96ca04__15566_46592",
             "cake_rmsnorm_train_327bfeb4ab8fefc2731d",
-            "cake_rmsnorm_train_9b727c2c9933b2ca6724",
+            "cake_rmsnorm_train_9b727c2c9933b2ca6724__14_1024",
             "cake_rmsnorm_train_1863320f3158d35eead6",
             "cake_rmsnorm_train_9b727c2c9933b2ca6724__4096_14928",
             "cake_rmsnorm_train_1863320f3158d35eead6__14928_15566",
             "cake_rmsnorm_train_1863320f3158d35eead6__15566_46592",
         ],
         "bwd_w32_h1536": [
-            "cake_rmsnorm_train_baff9ecbafe7de1e6030",
+            "cake_rmsnorm_train_963a7ca8d03f78bbe6f9__0_64",
+            "cake_rmsnorm_train_baff9ecbafe7de1e6030__64_1024",
             "cake_rmsnorm_train_17d9cdfd157ba4b86c2b",
             "cake_rmsnorm_train_a99e2b380514c4d86d60",
             "cake_rmsnorm_train_7a72e97bd6cb4dc0efc2",
             "cake_rmsnorm_train_109f19bb177c8f20cadc__15566_37888",
             "cake_rmsnorm_train_963a7ca8d03f78bbe6f9",
-            "cake_rmsnorm_train_9b727c2c9933b2ca6724",
+            "cake_rmsnorm_train_9b727c2c9933b2ca6724__64_1024",
             "cake_rmsnorm_train_1863320f3158d35eead6",
             "cake_rmsnorm_train_9b727c2c9933b2ca6724__4096_14928",
             "cake_rmsnorm_train_1863320f3158d35eead6__14928_15566",
             "cake_rmsnorm_train_1863320f3158d35eead6__15566_37888",
         ],
         "bwd_h2048": [
-            "cake_rmsnorm_train_caf6978ed0a17fbf65b9",
+            "cake_rmsnorm_train_8bd89a4c834f80db8a34__0_12",
+            "cake_rmsnorm_train_caf6978ed0a17fbf65b9__12_3072",
             "cake_rmsnorm_train_9ac8d21e46a658e7913f",
             "cake_rmsnorm_train_caf6978ed0a17fbf65b9__large",
             "cake_rmsnorm_train_caf6978ed0a17fbf65b9__16384_32768",
             "cake_rmsnorm_train_302f64db6abe79e5259e__32768_61952",
             "cake_rmsnorm_train_8bd89a4c834f80db8a34",
-            "cake_rmsnorm_train_880768a0a264e04dbfb5",
+            "cake_rmsnorm_train_880768a0a264e04dbfb5__12_3072",
             "cake_rmsnorm_train_880768a0a264e04dbfb5__3072_4096",
             "cake_rmsnorm_train_d0960be986e58f449f50",
             "cake_rmsnorm_train_596b457aaba073f8d69f",
             "cake_rmsnorm_train_d0960be986e58f449f50__32768_61952",
         ],
         "bwd_w32_h2048": [
-            "cake_rmsnorm_train_07f9f2fbea7163639c27",
+            "cake_rmsnorm_train_88c6c6b2af1922f4c1a9__0_42",
+            "cake_rmsnorm_train_07f9f2fbea7163639c27__42_3072",
             "cake_rmsnorm_train_d96a14fe8882bbd9ec2e",
             "cake_rmsnorm_train_07f9f2fbea7163639c27__large",
             "cake_rmsnorm_train_07f9f2fbea7163639c27__16384_32768",
             "cake_rmsnorm_train_e98cb156abfe1666c76f__32768_61952",
             "cake_rmsnorm_train_88c6c6b2af1922f4c1a9",
-            "cake_rmsnorm_train_880768a0a264e04dbfb5",
+            "cake_rmsnorm_train_880768a0a264e04dbfb5__42_3072",
             "cake_rmsnorm_train_880768a0a264e04dbfb5__3072_4096",
             "cake_rmsnorm_train_d0960be986e58f449f50",
             "cake_rmsnorm_train_596b457aaba073f8d69f",
@@ -13179,31 +14342,34 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_rmsnorm_train_fcbfa14d591a9babfd26__4096_50176",
         ],
         "bwd_w32_h4096": [
-            "cake_rmsnorm_train_3fd77c8ce97e8a523abb",
+            "cake_rmsnorm_train_131a495c5897206b6874__0_15",
+            "cake_rmsnorm_train_3fd77c8ce97e8a523abb__15_256",
             "cake_rmsnorm_train_16545056022785f2a7d8",
             "cake_rmsnorm_train_78c26a53e83c9803bcbf",
             "cake_rmsnorm_train_626aed743358c27513f1__4096_9216",
             "cake_rmsnorm_train_131a495c5897206b6874",
-            "cake_rmsnorm_train_5d75ea5f3c25579af496",
+            "cake_rmsnorm_train_5d75ea5f3c25579af496__15_256",
             "cake_rmsnorm_train_5d75ea5f3c25579af496__256_1024",
             "cake_rmsnorm_train_5d75ea5f3c25579af496__1024_4096",
             "cake_rmsnorm_train_fcbfa14d591a9babfd26__4096_9216",
         ],
         "bwd_h5120": [
-            "cake_rmsnorm_train_2fc4932fbde0bc848b32__0_320",
+            "cake_rmsnorm_train_080e0a6c3b18e9bad790__0_22",
+            "cake_rmsnorm_train_2fc4932fbde0bc848b32__22_320",
             "cake_rmsnorm_train_080e0a6c3b18e9bad790__320_896",
             "cake_rmsnorm_train_2fc4932fbde0bc848b32__896_5120",
             "cake_rmsnorm_train_7ffb443a63a92ab6b0e0__5120_61952",
             "cake_rmsnorm_train_9e4c0825df92af02074f",
-            "cake_rmsnorm_train_c5831b29d17867842e5f__0_320",
+            "cake_rmsnorm_train_c5831b29d17867842e5f__22_320",
             "cake_rmsnorm_train_c5831b29d17867842e5f__896_5120",
             "cake_rmsnorm_train_c5831b29d17867842e5f__5120_61952",
         ],
         "bwd_w32_h5120": [
-            "cake_rmsnorm_train_79811a76205d7d7dd197",
+            "cake_rmsnorm_train_f165933caadda3434828__0_22",
+            "cake_rmsnorm_train_79811a76205d7d7dd197__22_5120",
             "cake_rmsnorm_train_f9f7d4cd75ef91cc8374__5120_61952",
             "cake_rmsnorm_train_f165933caadda3434828",
-            "cake_rmsnorm_train_c5831b29d17867842e5f__0_5120",
+            "cake_rmsnorm_train_c5831b29d17867842e5f__22_5120",
             "cake_rmsnorm_train_c5831b29d17867842e5f__5120_61952",
         ],
         "bwd_h6144": [
@@ -13227,24 +14393,26 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_rmsnorm_train_2e8d2128a33361628509__4608_5632",
         ],
         "bwd_w32_h6144": [
-            "cake_rmsnorm_train_41b80b6af97974feb181__0_320",
+            "cake_rmsnorm_train_b3e6531e46667901ab91__0_20",
+            "cake_rmsnorm_train_41b80b6af97974feb181__20_320",
             "cake_rmsnorm_train_b3e6531e46667901ab91__320_1152",
             "cake_rmsnorm_train_41b80b6af97974feb181__1152_4096",
             "cake_rmsnorm_train_9a8c0396edd85d4d545e__4096_49152",
             "cake_rmsnorm_train_4f9a76e68671f213ab7c",
-            "cake_rmsnorm_train_5f5cdc5151e3c0620bcd__0_320",
+            "cake_rmsnorm_train_5f5cdc5151e3c0620bcd__20_320",
             "cake_rmsnorm_train_5f5cdc5151e3c0620bcd__1152_4096_0_4096",
             "cake_rmsnorm_train_5f5cdc5151e3c0620bcd__4096_49152",
         ],
         "bwd_w32_residual_h6144": [
-            "cake_rmsnorm_train_56f988dde54db37f09d9__0_320",
+            "cake_rmsnorm_train_71d36617003ab7742a77__0_6",
+            "cake_rmsnorm_train_56f988dde54db37f09d9__6_320",
             "cake_rmsnorm_train_71d36617003ab7742a77__320_2304",
             "cake_rmsnorm_train_56f988dde54db37f09d9__2304_3584",
             "cake_rmsnorm_train_3c390339fa8c82311a0a",
             "cake_rmsnorm_train_56f988dde54db37f09d9__4608_5632",
             "cake_rmsnorm_train_3c390339fa8c82311a0a__5632_15872",
             "cake_rmsnorm_train_56c46a201c168050aa60",
-            "cake_rmsnorm_train_2e8d2128a33361628509__0_320",
+            "cake_rmsnorm_train_2e8d2128a33361628509__6_320",
             "cake_rmsnorm_train_2e8d2128a33361628509__2304_3584",
             "cake_rmsnorm_train_2e8d2128a33361628509__4608_5632",
         ],
@@ -13349,16 +14517,18 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_rmsnorm_train_6325c474ad9955a319e9",
         ],
         "bwd_h256": [
-            "cake_rmsnorm_train_5450d39836b26cfd3256__0_3584",
+            "cake_rmsnorm_train_195c4317b51bb4ea1137__0_1056",
+            "cake_rmsnorm_train_5450d39836b26cfd3256__1056_3584",
             "cake_rmsnorm_train_195c4317b51bb4ea1137__3584_36864",
             "cake_rmsnorm_train_172a47a15d4c1a76c061__36864_inf",
-            "cake_rmsnorm_train_312bbe084eac69d858c4__0_3584",
+            "cake_rmsnorm_train_312bbe084eac69d858c4__1056_3584",
         ],
         "bwd_w32_h256": [
-            "cake_rmsnorm_train_5e0c6208d4b426f79faa__0_1536",
+            "cake_rmsnorm_train_8de0131445eed6eeabb7__0_1296",
+            "cake_rmsnorm_train_5e0c6208d4b426f79faa__1296_1536",
             "cake_rmsnorm_train_8de0131445eed6eeabb7__1536_36864",
             "cake_rmsnorm_train_7c2aa4b429538da06a2a__36864_inf",
-            "cake_rmsnorm_train_312bbe084eac69d858c4__0_1536",
+            "cake_rmsnorm_train_312bbe084eac69d858c4__1296_1536",
         ],
         "bwd_h512": [
             "cake_rmsnorm_train_3feed5026e1156d2fba2",
@@ -13371,91 +14541,98 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_rmsnorm_train_8f032213ba6eeb5d959f__16384_inf",
         ],
         "bwd_w32_h512": [
-            "cake_rmsnorm_train_b841d64bbcaefff5ce7b",
+            "cake_rmsnorm_train_fd08c6f436eb6071fa22__0_229",
+            "cake_rmsnorm_train_b841d64bbcaefff5ce7b__229_1024",
             "cake_rmsnorm_train_fd08c6f436eb6071fa22__1024_4096",
             "cake_rmsnorm_train_383f709cd5c4fadd9436",
             "cake_rmsnorm_train_03efa681eb38f59b00c2",
-            "cake_rmsnorm_train_f94861c36a14eb75e39c",
+            "cake_rmsnorm_train_f94861c36a14eb75e39c__229_1024",
             "cake_rmsnorm_train_8f032213ba6eeb5d959f",
             "cake_rmsnorm_train_8f032213ba6eeb5d959f__16384_inf",
         ],
         "bwd_h1536": [
-            "cake_rmsnorm_train_7dc29629ff21625607f8__107",
+            "cake_rmsnorm_train_3f75f4a81f2fb8269389__0_14",
+            "cake_rmsnorm_train_7dc29629ff21625607f8__14_1024_107",
             "cake_rmsnorm_train_6a428da2227972ae18ae",
             "cake_rmsnorm_train_56d26996239835327501__16384_53248",
             "cake_rmsnorm_train_3f75f4a81f2fb8269389",
-            "cake_rmsnorm_train_628248febbdfe17c3325",
+            "cake_rmsnorm_train_628248febbdfe17c3325__14_1024",
             "cake_rmsnorm_train_db5c0b673c516bd0295d",
             "cake_rmsnorm_train_db5c0b673c516bd0295d__16384_53248",
         ],
         "bwd_w32_h1536": [
-            "cake_rmsnorm_train_baff9ecbafe7de1e6030__107",
+            "cake_rmsnorm_train_7c0dd63f0b011049603e__0_64",
+            "cake_rmsnorm_train_baff9ecbafe7de1e6030__64_1024_107",
             "cake_rmsnorm_train_e63beae98c236ce26335",
             "cake_rmsnorm_train_de8e07d4cb312b06dbc4__16384_53248",
             "cake_rmsnorm_train_7c0dd63f0b011049603e",
-            "cake_rmsnorm_train_628248febbdfe17c3325",
+            "cake_rmsnorm_train_628248febbdfe17c3325__64_1024",
             "cake_rmsnorm_train_db5c0b673c516bd0295d",
             "cake_rmsnorm_train_db5c0b673c516bd0295d__16384_53248",
         ],
         "bwd_h2048": [
-            "cake_rmsnorm_train_84efa2af7907877dfb56",
+            "cake_rmsnorm_train_1a3df5ac020055477581__0_6",
+            "cake_rmsnorm_train_84efa2af7907877dfb56__6_256",
             "cake_rmsnorm_train_845cdcd8145ada631461__256_1024",
             "cake_rmsnorm_train_81c3d8ab0a482e3af043",
             "cake_rmsnorm_train_845cdcd8145ada631461__16384_50176",
             "cake_rmsnorm_train_1a3df5ac020055477581",
-            "cake_rmsnorm_train_520453292492bd2725be",
+            "cake_rmsnorm_train_520453292492bd2725be__6_256",
             "cake_rmsnorm_train_271082c56c222bf10d77",
             "cake_rmsnorm_train_c4d8be677fa70b841877",
             "cake_rmsnorm_train_c4d8be677fa70b841877__16384_50176",
         ],
         "bwd_w32_h2048": [
-            "cake_rmsnorm_train_6b13aa49e0c0414d9041",
+            "cake_rmsnorm_train_810989bdea464df479ce__0_127",
+            "cake_rmsnorm_train_6b13aa49e0c0414d9041__127_256",
             "cake_rmsnorm_train_838a9a4054731f7942af__256_1024",
             "cake_rmsnorm_train_9e5ec75a15ac2bff0e4b",
             "cake_rmsnorm_train_838a9a4054731f7942af__16384_50176",
             "cake_rmsnorm_train_810989bdea464df479ce",
-            "cake_rmsnorm_train_520453292492bd2725be",
+            "cake_rmsnorm_train_520453292492bd2725be__127_256",
             "cake_rmsnorm_train_271082c56c222bf10d77",
             "cake_rmsnorm_train_c4d8be677fa70b841877",
             "cake_rmsnorm_train_c4d8be677fa70b841877__16384_50176",
         ],
         "bwd_h4096": [
-            "cake_rmsnorm_train_0da5dd4b80ad9b5426ce",
+            "cake_rmsnorm_train_f11a86167db4f8e9a5da__0_6",
+            "cake_rmsnorm_train_0da5dd4b80ad9b5426ce__6_256",
             "cake_rmsnorm_train_a647fccc3d9fa9134733",
             "cake_rmsnorm_train_d41a514f5210e9adc39f",
             "cake_rmsnorm_train_ee4a9053bb25b8d49fcf__4096_36864",
             "cake_rmsnorm_train_f11a86167db4f8e9a5da",
-            "cake_rmsnorm_train_69bf6e104bb48b6b74bf",
+            "cake_rmsnorm_train_69bf6e104bb48b6b74bf__6_256",
             "cake_rmsnorm_train_69bf6e104bb48b6b74bf__256_1024",
             "cake_rmsnorm_train_2030d80884deb8abcf7b",
             "cake_rmsnorm_train_10e24516314c244771f4__4096_36864",
         ],
         "bwd_w32_h4096": [
-            "cake_rmsnorm_train_0c0fa63d0ff2cdc484a4",
+            "cake_rmsnorm_train_a1f537fc94bde175bb3c__0_256",
             "cake_rmsnorm_train_dc439f8335327e482025",
             "cake_rmsnorm_train_b08633208e60b8ce94fd",
             "cake_rmsnorm_train_0f1859b9fe9e47668a1c__4096_24064",
             "cake_rmsnorm_train_a1f537fc94bde175bb3c",
-            "cake_rmsnorm_train_69bf6e104bb48b6b74bf",
             "cake_rmsnorm_train_69bf6e104bb48b6b74bf__256_1024",
             "cake_rmsnorm_train_2030d80884deb8abcf7b",
             "cake_rmsnorm_train_10e24516314c244771f4__4096_24064",
         ],
         "bwd_h5120": [
-            "cake_rmsnorm_train_838c077df3a6d35d55b7",
+            "cake_rmsnorm_train_f94f8c33e2c9c8e89fc3__0_18",
+            "cake_rmsnorm_train_838c077df3a6d35d55b7__18_4096",
             "cake_rmsnorm_train_6816fb80e97380f1bcbc",
             "cake_rmsnorm_train_b8b0913b40f035f43b76__19968_49152",
             "cake_rmsnorm_train_f94f8c33e2c9c8e89fc3",
-            "cake_rmsnorm_train_2af4cf2f58ba58f78099",
+            "cake_rmsnorm_train_2af4cf2f58ba58f78099__18_4096",
             "cake_rmsnorm_train_2af4cf2f58ba58f78099__4096_19968",
             "cake_rmsnorm_train_2af4cf2f58ba58f78099__19968_49152",
         ],
         "bwd_w32_h5120": [
-            "cake_rmsnorm_train_cd612de56c0985bb4caa",
+            "cake_rmsnorm_train_dd795e849940a49d0d29__0_13",
+            "cake_rmsnorm_train_cd612de56c0985bb4caa__13_4096",
             "cake_rmsnorm_train_468cc4d1b8128187b4b3",
             "cake_rmsnorm_train_7b9e10b21b75d4615135__19968_49152",
             "cake_rmsnorm_train_dd795e849940a49d0d29",
-            "cake_rmsnorm_train_2af4cf2f58ba58f78099",
+            "cake_rmsnorm_train_2af4cf2f58ba58f78099__13_4096",
             "cake_rmsnorm_train_2af4cf2f58ba58f78099__4096_19968",
             "cake_rmsnorm_train_2af4cf2f58ba58f78099__19968_49152",
         ],
@@ -13473,16 +14650,18 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_rmsnorm_train_60bfcb24560bbae612c3__3584_7168",
         ],
         "bwd_w32_h6144": [
-            "cake_rmsnorm_train_7d2f6707bfa3d2cd60bb__0_30720",
+            "cake_rmsnorm_train_e77387f14390ba486055__0_20",
+            "cake_rmsnorm_train_7d2f6707bfa3d2cd60bb__20_28672",
             "cake_rmsnorm_train_e77387f14390ba486055",
-            "cake_rmsnorm_train_fb3f2a96e954f0e241bc__0_30720",
+            "cake_rmsnorm_train_fb3f2a96e954f0e241bc__20_28672",
         ],
         "bwd_w32_residual_h6144": [
-            "cake_rmsnorm_train_56f988dde54db37f09d9__0_448",
+            "cake_rmsnorm_train_71d36617003ab7742a77__0_3",
+            "cake_rmsnorm_train_56f988dde54db37f09d9__3_448",
             "cake_rmsnorm_train_71d36617003ab7742a77__448_3584",
             "cake_rmsnorm_train_56f988dde54db37f09d9__3584_7168",
             "cake_rmsnorm_train_647589443d4915ca8fde",
-            "cake_rmsnorm_train_60bfcb24560bbae612c3__0_448",
+            "cake_rmsnorm_train_60bfcb24560bbae612c3__3_448",
             "cake_rmsnorm_train_60bfcb24560bbae612c3__3584_7168",
         ],
     },

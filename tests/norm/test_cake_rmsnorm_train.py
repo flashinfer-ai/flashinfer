@@ -711,9 +711,9 @@ def _program_id(name: str) -> str:
 # claims.  The claim holds where the det package selects that module; elsewhere
 # the single is compared only.
 DX_BITWISE_WITH = {
-    # sm_100a H512 row (1280, inf); det module at T 16385
+    # sm_100a H512 row (0, 26] and (1280, inf); det module at T 16385
     "cake_rmsnorm_train_d0bde38aa443d42a5f04": "cake_rmsnorm_det_train_ad1a5a3c5f88e3d10036",
-    # sm_100a H1536 row (36864, inf); det module at T 65536
+    # sm_100a H1536 row (0, 14] and (36864, inf); det module at T 65536
     "cake_rmsnorm_train_ae610afdf77ff6714a5b": "cake_rmsnorm_det_train_b457c4d134e44476dc6f",
     # sm_100a H2048 column (0, 336]; det module at T 257
     "cake_rmsnorm_train_64e6aa82bb2c6d4ea978": "cake_rmsnorm_det_train_caf6978ed0a17fbf65b9",
@@ -865,13 +865,15 @@ def test_repeated_launches_against_fp64_and_det(
     )
 
 
-# H5120: the backward runs the plain det pair up to H5120_PLAIN_EDGE (with
-# BF16 weight a single kernel up to T 896 on sm_100a and from T 320 to 896 on
-# sm_103a), the deterministic package's compensated det pair (compensated
-# per-chunk dw sums) from there up to H5120_ACCURACY_EDGE, and the
-# FP64-accumulating single kernel (on sm_103a its twosum form) above it.  The
-# plain edge is the deterministic package's own switch to its compensated
-# pair.  The accuracy edge is T 65536, the top of the qualified range, on
+# H5120: the backward runs the plain det pair up to H5120_PLAIN_EDGE, the
+# deterministic package's compensated det pair (compensated per-chunk dw sums)
+# from there up to H5120_ACCURACY_EDGE, and the FP64-accumulating single kernel
+# (on sm_103a its twosum form) above it; a single kernel also runs from T 1 up
+# to T 22 with FP32 weight on sm_100a and with both weight dtypes on sm_103a,
+# up to T 18 (BF16 weight) and 13 (FP32 weight) on sm_107a, and with BF16
+# weight up to T 896 on sm_100a and from T 320 to 896 on sm_103a.  The plain
+# edge is the deterministic package's own switch to its compensated pair.  The
+# accuracy edge is T 65536, the top of the qualified range, on
 # sm_100a, T 61952 on sm_103a and T 49152 on sm_107a, for both weight dtypes:
 # on GB300 the compensated pair's worst dw element reaches 0.888 of its budget
 # at T 62464 (FP32 weight; the two weight dtypes' compensated pairs compute
@@ -889,7 +891,7 @@ def test_repeated_launches_against_fp64_and_det(
 # <= 0.245 up to T 5120, compensated pair <= 0.739 up to T 61952, twosum
 # single <= 0.0006 at the sampled T from 61953 to 81920; R200 plain pair
 # <= 0.499 (216 SMs) and <= 0.545 (212 SMs) up to T 19968, compensated pair up
-# to T 49152 <= 0.737 (both weights) on 212 SMs, <= 0.759 (BF16 weight) and
+# to T 49152 <= 0.825 (both weights) on 212 SMs, <= 0.759 (BF16 weight) and
 # <= 0.787 (FP32 weight) on 216 SMs (<= 0.818 at T 49152 over 200 inputs of
 # each of three families, both weights), single <= 0.703 (BF16 weight) and
 # <= 0.633 (FP32 weight) at the sampled T from 49152 to 65537 (212 SMs;
