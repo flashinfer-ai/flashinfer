@@ -388,8 +388,7 @@ def test_each_supported_architecture_has_its_record_and_libraries():
     """The supported compute capabilities name exactly the architectures of the registry's records (``(10, 7)``
     only with an ``sm_107a`` record), ``build.json`` builds exactly those architectures, and every registered stage
     of each record has its ``<library>_<arch>`` entry.  The ``sm_107a`` record registers the ``sm_103a`` record's
-    stages and programs but the zero-gradient row skip's (the ``_dcnt`` forms and the partition kernel), which
-    ``sm_107a`` does not build: its log-probability backward never runs the skip."""
+    stages and programs, the zero-gradient row skip's (the ``_dcnt`` forms and the partition kernel) included."""
     assert cake_backend.SUPPORTED_COMPUTE_CAPABILITIES == {
         (10, 0): "sm_100a",
         (10, 3): "sm_103a",
@@ -417,16 +416,12 @@ def test_each_supported_architecture_has_its_record_and_libraries():
                 stage,
             )
     sm107, sm103 = by_arch["sm_107a"], by_arch["sm_103a"]
-    skip_stages = {
-        stage
-        for stage in cake_jit.registered_stages(sm103)
-        if stage.endswith("_dcnt") or stage == cake_backend.ZERO_DLOGP_PARTITION_STAGE
-    }
-    assert cake_backend.LOGPROB_DZ_DCNT_STAGE in skip_stages
-    assert cake_backend.ZERO_DLOGP_PARTITION_STAGE in skip_stages
-    assert cake_jit.registered_stages(sm107) == tuple(
-        stage for stage in cake_jit.registered_stages(sm103) if stage not in skip_stages
-    )
+    for name in (sm103, sm107):
+        assert cake_backend.LOGPROB_DZ_DCNT_STAGE in cake_jit.registered_stages(name)
+        assert cake_backend.ZERO_DLOGP_PARTITION_STAGE in cake_jit.registered_stages(
+            name
+        )
+    assert cake_jit.registered_stages(sm107) == cake_jit.registered_stages(sm103)
     for stage in cake_jit.registered_stages(sm107):
         assert (
             cake_jit.MODULES[sm107][stage]["library"]
@@ -6625,8 +6620,8 @@ def _logprob_call(inp, C=4096, *, package="nd"):
 
 def _has_zero_dlogp_skip():
     """Whether this device's record registers the zero-gradient row skip: the counted dz arm
-    (``LOGPROB_DZ_DCNT_STAGE``) and the partition kernel (``ZERO_DLOGP_PARTITION_STAGE``); the ``sm_107a`` record
-    has neither."""
+    (``LOGPROB_DZ_DCNT_STAGE``) and the partition kernel (``ZERO_DLOGP_PARTITION_STAGE``); every shipped record
+    (``sm_100a``, ``sm_103a``, ``sm_107a``) has both."""
     module_name, _record = cake_backend.record_for(CUDA)
     stages = cake_jit.registered_stages(module_name)
     return (
@@ -6637,7 +6632,7 @@ def _has_zero_dlogp_skip():
 
 def _require_zero_dlogp_skip():
     """Skip a test of the skip itself on a device whose record does not register it
-    (:func:`test_device_zero_dlogp_skip_is_off_without_the_counted_forms` covers that record)."""
+    (:func:`test_device_zero_dlogp_skip_is_off_without_the_counted_forms` covers such a record)."""
     _require_program(entry="logprob")
     if not _has_zero_dlogp_skip():
         pytest.skip(
@@ -6986,7 +6981,7 @@ def test_plan_runs_the_counted_forms():
     # 12000 rows: three chunks, the last of 3808 rows (above the TMA fused cast's last-chunk bound)
     problem = _keep_problem(12000, 6144, 154880, 4096, entry="logprob")
     counted = 0
-    for arch in ("sm_100a", "sm_103a"):
+    for arch in ("sm_100a", "sm_103a", "sm_107a"):
         kw = dict(common, arch=arch)
         plain = cake_backend.make_plan(problem, valid_rows=12000, **kw)
         plan = cake_backend.make_plan(problem, valid_rows=12000, dcnt=True, **kw)
@@ -7252,15 +7247,18 @@ def test_device_zero_dlogp_plan_without_counted_forms_runs_the_shipped_backward(
 def test_device_zero_dlogp_skip_is_off_without_the_counted_forms(
     glm_weight, monkeypatch
 ):
-    """On a record that registers no zero-gradient row skip (``sm_107a``: no counted forms, no partition kernel) a
+    """On a record that registers no zero-gradient row skip (no counted forms, no partition kernel; every shipped
+    record registers them, so the device's record is read here as one without them: its ``_skip_record`` entry) a
     backward that would be eligible elsewhere (floor 0, compacted, the dz arm) is not eligible and runs the shipped
     backward: no partition, binding (first call) and from the remembered binding (second call); every remembered plan
     without counted forms; the same ``logp`` and ``dW`` bits as the backward with the skip off, ``dX`` within its
     unordered K-slice reduction, the zero rows' ``dX`` zeros."""
     _require_program(entry="logprob")
-    if _has_zero_dlogp_skip():
-        pytest.skip("this device's record registers the zero-gradient row skip")
-    _module_name, record = cake_backend.record_for(CUDA)
+    module_name, record = cake_backend.record_for(CUDA)
+    device = CUDA.index if CUDA.index is not None else torch.cuda.current_device()
+    monkeypatch.setattr(
+        cake_backend, "_SKIP_RECORDS", {device: (module_name, record, False, False)}
+    )
     base = _device_inputs(8117, "ce", W=glm_weight)
     zero = _zero_dlogp_set(base, ("random", 0.3))
     inp = _with_zero_dlogp(base, zero, negative_zero=False)
@@ -7291,7 +7289,7 @@ def test_device_zero_dlogp_skip_is_off_without_the_counted_forms(
         )
         assert dx_diff <= scale * 2**-7, (dx_diff, scale)
     print(
-        f"\nzero-dlogp skip on {record['arch']}: off (no counted forms, no partition kernel); "
+        f"\nzero-dlogp skip on {record['arch']} (record read without it): off; "
         f"{len(plans)} remembered backward plan(s), none counted"
     )
 
@@ -7357,9 +7355,10 @@ def test_device_zero_dlogp_short_last_chunk_cast_bits_without_zero_rows(
     """Without zero-gradient rows (z = 0) a two-chunk backward under the skip gives the bits of the backward without
     it: the partition runs, every row stays live, and ``dW`` and ``logp`` are bitwise those of the skip-off run.  One
     ignored row makes the call compacted (the skip needs the forward's row index).  A last chunk of 650 or 1792 valid
-    rows (``dw_cast_tma_rule`` holds) casts through the TMA cast's counted form ``gemm_dw_cast_bf16_tma_dcnt``; 1793
-    rows (one row above the rule's bound, the negative control) takes the counted per-thread cast, as the plan without
-    the skip takes the per-thread cast."""
+    rows (``dw_cast_tma_rule`` holds on an architecture of ``DW_CAST_TMA_MAX_ROWS``) casts through the TMA cast's
+    counted form ``gemm_dw_cast_bf16_tma_dcnt``; 1793 rows (one row above the rule's bound, the negative control) and
+    every last chunk on an architecture without the rule (``sm_107a``) take the counted per-thread cast, as the plan
+    without the skip takes the per-thread cast."""
     _require_zero_dlogp_skip()
     module_name, record = cake_backend.record_for(CUDA)
     rows = cake_backend.DEFAULT_CHUNK_SIZE + last
@@ -7393,7 +7392,8 @@ def test_device_zero_dlogp_short_last_chunk_cast_bits_without_zero_rows(
     assert skip_plan.dcnt and not shipped.dcnt
     assert skip_plan.num_chunks == 2 and skip_plan.chunks[-1][1] == last
     tma = cake_backend.dw_cast_tma_rule(2, last, record["arch"])
-    assert tma == (last <= cake_backend.DW_CAST_TMA_MAX_ROWS[record["arch"]])
+    bound = cake_backend.DW_CAST_TMA_MAX_ROWS.get(record["arch"])
+    assert tma == (bound is not None and last <= bound)
     assert shipped.dw_cast_stage == (
         "gemm_dw_cast_bf16_tma" if tma else "gemm_dw_cast_bf16"
     )
