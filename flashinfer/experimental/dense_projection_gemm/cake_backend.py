@@ -1505,7 +1505,7 @@ def _k2_runs_without_verdict(geometry: _K2Geometry, index: int) -> bool:
 def _k2_key(
     index: int,
     stream: int,
-    splits: Optional[int],
+    split_pdl: tuple[Optional[int], int],
     A: torch.Tensor,
     B: torch.Tensor,
     out: torch.Tensor,
@@ -1513,12 +1513,13 @@ def _k2_key(
     out_ptr: int,
 ) -> tuple:
     """The convenience key of a K2 call (the deterministic package's ``convenience_key(index, stream, ("k2",
-    splits), A, B, out)``) from its :func:`_k2_geometry` and ``out``'s data pointer, read once."""
+    (splits, pdl)), A, B, out)``) from its :func:`_k2_geometry` and ``out``'s data pointer, read once; the PDL
+    flag is part of the key because it is bound into the argument lists."""
     sa, sb, so, a_st, b_st, (da, db, do) = geometry
     return (
         int(index),
         int(stream),
-        ("k2", splits),
+        ("k2", split_pdl),
         (tuple(sa), a_st, da, A.storage_offset(), A.data_ptr() & 15),
         (tuple(sb), b_st, db, B.storage_offset(), B.data_ptr() & 15),
         (tuple(so), out.stride(), do, out.storage_offset(), out_ptr & 15),
