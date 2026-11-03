@@ -1400,6 +1400,53 @@ def test_l2n_checkpoint_handoff_takes_no_decision(capable) -> None:
     assert decided == [mode for mode in modes for _ in range(2)]
 
 
+def test_l2n_handoff_is_refused_by_the_node_and_the_saved_bytes() -> None:
+    """The hand-off does not engage with the flag on, also where the decision is the caller's: the autograd node
+    (:class:`cake_kcp.ChunkKDAFunctionKcp` applied directly with ``handoff=True``) raises ``ValueError`` before any
+    forward, with or without a recompute handle, and the saved-bytes query raises ``ValueError`` for
+    ``checkpoint_handoff=True`` on a rank with tokens and on one without, before the capability check.  The same
+    calls with the flag off reach the hand-off's forward and its bytes (the refusals are not vacuous)."""
+    H = 4
+    ctx = _cpu_ctx()
+    args = _args(_cpu_ops(ctx, H), ctx)
+    # scale, save_mode, boundary_mode, workspace, options
+    head = (None, "light", "saved", None, {})
+    # use_gate_in_kernel, A_log, dt_bias, lower_bound
+    gate = (False, None, None, None)
+    reached: list = []
+
+    def stop(*_a, **_k):
+        reached.append(_a)
+        raise _Stop
+
+    def refused(*_a, **_k):
+        raise AssertionError("the capability check ran before the refusal")
+
+    refusal = "does not engage with use_qk_l2norm_in_kernel=True"
+    apply = cake_kcp.ChunkKDAFunctionKcp.apply
+    with pytest.MonkeyPatch.context() as m:
+        for name in ("_fwd_tape", "_fwd_handle", "chunk_kda_fwd_kcp", "_fwd_body"):
+            m.setattr(cake_kcp, name, stop)
+        for handle in (None, cake_kcp.RecomputeHandleKcp()):
+            with pytest.raises(ValueError, match=refusal):
+                apply(*args, *head, handle, True, *gate, True)
+            assert reached == [], handle
+        with pytest.raises(_Stop):
+            apply(*args, *head, None, True, *gate, False)
+        assert len(reached) == 1
+    saved_bytes = cake_kcp_plan.kda_saved_bytes_kcp
+    ctxs = [_cpu_ctx(rank=0), _cpu_zero_ctx(1)]
+    assert int(ctxs[0].T_r) > 0 and int(ctxs[1].T_r) == 0
+    with pytest.MonkeyPatch.context() as m:
+        m.setattr(cake_kcp_plan, "require_qk_l2norm", refused)
+        for c in ctxs:
+            with pytest.raises(ValueError, match="checkpoint_handoff=True"):
+                saved_bytes(c, H=H, checkpoint_handoff=True, **L2N)
+            hb = cake_kcp_plan.kda_handoff_bytes_kcp(c, H=H)
+            light = saved_bytes(c, H=H, saved_carry=False)
+            assert saved_bytes(c, H=H, checkpoint_handoff=True, **OFF) == light + hb
+
+
 # --------------------------------------------------------------------------- CPU rows: the values and the stage order
 
 
