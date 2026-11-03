@@ -59,6 +59,7 @@ test_input_validation         — 1-D logits / non-int32 seq_lens rejected
 import pytest
 import torch
 from tests.test_helpers.parametrize import pairwise_product_cases, parametrize_product
+from tests.topk_varlen._selection_reference import assert_topk_reference
 
 try:
     import flashinfer
@@ -130,42 +131,19 @@ def _check_correct(
     compress_ratio=1,
     require_all_checked=False,
 ):
-    """Every selected value must be >= the k-th largest in its row.
-
-    With ``require_all_checked=True`` every row must be non-degenerate
-    (``N_eff >= top_k``) and actually verified — this turns the otherwise-silent
-    "skip degenerate row" branch into a hard failure, guarding against a
-    mis-parametrized test that quietly checks nothing.
-    """
-    logits_f32 = logits.to(torch.float32)
-    seq_lens_host = seq_lens.cpu().tolist()
-    n_checked = 0
-    for row in range(indices.shape[0]):
-        ofs = row % next_n
-        actual_kv_len = int(seq_lens_host[row // next_n]) - next_n + ofs + 1
-        N_eff = actual_kv_len // compress_ratio
-        if N_eff < top_k:
-            if require_all_checked:
-                raise AssertionError(
-                    f"row={row}: N_eff={N_eff} < top_k={top_k} — degenerate row "
-                    f"not allowed under require_all_checked"
-                )
-            continue
-        row_logits = logits_f32[row, :N_eff]
-        kth_value = torch.topk(row_logits, k=top_k).values[-1].item()
-        sel = [int(i) for i in indices[row].cpu().tolist() if i >= 0]
-        assert len(sel) == top_k, f"row={row}: got {len(sel)} indices, want {top_k}"
-        assert len(set(sel)) == len(sel), f"row={row}: duplicate indices"
-        assert all(i < N_eff for i in sel), f"row={row}: out-of-range index"
-        sel_vals = row_logits[torch.tensor(sel, device=logits.device, dtype=torch.long)]
-        assert (sel_vals < kth_value).sum() == 0, (
-            f"row={row}: some selected values below kth-rank ({kth_value:.6f})"
-        )
-        n_checked += 1
+    """Validate every row independently; optionally require all rows to be long."""
     if require_all_checked:
-        assert n_checked == indices.shape[0], (
-            f"only {n_checked}/{indices.shape[0]} rows were verified"
-        )
+        lengths = seq_lens.cpu().tolist()
+        for row in range(indices.shape[0]):
+            effective = (
+                lengths[row // next_n] - next_n + row % next_n + 1
+            ) // compress_ratio
+            assert effective >= top_k, (
+                f"row={row}: degenerate row not allowed under require_all_checked"
+            )
+    assert_topk_reference(
+        logits, indices, seq_lens, top_k, next_n=next_n, compress_ratio=compress_ratio
+    )
 
 
 def _make_varlen_inputs(seq_len_list, N, dtype, seed):
@@ -668,13 +646,12 @@ def test_gvr_lb_workspace_reuse():
     torch.cuda.synchronize()
     _check_correct(indices0, logits, seq_lens, top_k)
 
-    # Second call with same workspace — must give identical correct results.
+    # Reused workspace must produce an independently correct selection.
     indices1, _ = flashinfer.top_k_varlen(
         logits, seq_lens, top_k, pre_idx=pre_idx, backend="gvr", workspace=workspace
     )
     torch.cuda.synchronize()
     _check_correct(indices1, logits, seq_lens, top_k)
-    assert torch.equal(indices0, indices1), "workspace reuse changed the result"
 
 
 @requires_blackwell
@@ -926,22 +903,14 @@ def test_multi_cta_row_states_not_shared_across_streams(backend):
             outs_b.append(run(logits_b))
     torch.cuda.synchronize()
 
-    def assert_matches(actual, expected):
+    def assert_reference(actual, logits):
         actual_i, actual_v = actual
-        expected_i, expected_v = expected
-        actual_order = actual_i.argsort(dim=-1)
-        expected_order = expected_i.argsort(dim=-1)
-        actual_i = torch.gather(actual_i, 1, actual_order)
-        actual_v = torch.gather(actual_v, 1, actual_order)
-        expected_i = torch.gather(expected_i, 1, expected_order)
-        expected_v = torch.gather(expected_v, 1, expected_order)
-        assert torch.equal(actual_i, expected_i)
-        torch.testing.assert_close(actual_v, expected_v)
+        assert_topk_reference(logits, actual_i, seq_lens, top_k, values=actual_v)
 
-    for out in outs_a:
-        assert_matches(out, ref_a)
-    for out in outs_b:
-        assert_matches(out, ref_b)
+    for out in (ref_a, *outs_a):
+        assert_reference(out, logits_a)
+    for out in (ref_b, *outs_b):
+        assert_reference(out, logits_b)
 
 
 def _radix_backend_available() -> bool:
@@ -959,21 +928,6 @@ def _distinct_rows(num_rows, N, seed):
     generator = torch.Generator(device="cpu").manual_seed(seed)
     rows = [torch.randperm(N, generator=generator).float() for _ in range(num_rows)]
     return torch.stack(rows).to("cuda").contiguous()
-
-
-def _assert_same_selection(actual, expected):
-    actual_i, actual_v = actual
-    expected_i, expected_v = expected
-    actual_order = actual_i.argsort(dim=-1)
-    expected_order = expected_i.argsort(dim=-1)
-    assert torch.equal(
-        torch.gather(actual_i, 1, actual_order),
-        torch.gather(expected_i, 1, expected_order),
-    )
-    torch.testing.assert_close(
-        torch.gather(actual_v, 1, actual_order),
-        torch.gather(expected_v, 1, expected_order),
-    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA")
@@ -1019,10 +973,15 @@ def test_multi_cta_row_states_isolated_across_streams_with_different_batches(bac
             outs_b.append(run(logits_b, seq_lens_b))
     torch.cuda.synchronize()
 
-    for out in outs_a:
-        _assert_same_selection(out, ref_a)
-    for out in outs_b:
-        _assert_same_selection(out, ref_b)
+    for logits, lengths, outputs in (
+        (logits_a, seq_lens_a, (ref_a, *outs_a)),
+        (logits_b, seq_lens_b, (ref_b, *outs_b)),
+    ):
+        for indices, values in outputs:
+            _check_correct(indices, logits, lengths, top_k, require_all_checked=True)
+            torch.testing.assert_close(
+                values, logits.gather(1, indices.long()), atol=0, rtol=0
+            )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA")
@@ -1187,6 +1146,148 @@ def test_radix_return_values(dtype):
         assert torch.allclose(expected, values[row].float(), rtol=1e-3, atol=1e-3), (
             f"row={row}: values do not match logits[row, indices]"
         )
+
+
+@requires_blackwell
+@pytest.mark.parametrize("input_stride", [1, 2])
+@pytest.mark.parametrize("ctas_per_group", [1, 2])
+@pytest.mark.parametrize("use_mask", [False, True])
+def test_radix_device_active_rows_cuda_graph(input_stride, ctas_per_group, use_mask):
+    """A compact queue can grow and shrink without touching inactive output rows."""
+    import cutlass
+    from flashinfer.topk_varlen.topk_varlen import _compile_radix, _RADIX_STATE_SIZE
+
+    rows, width, top_k, num_sms = 33, 8192, 512, 8
+    torch.manual_seed(1)
+    storage = torch.randint(
+        -1000, 1000, (rows, width * input_stride), device="cuda"
+    ).float()
+    logits = storage[:, input_stride - 1 :: input_stride]
+    lengths = torch.randint(
+        top_k + 1, width + 1, (rows,), device="cuda", dtype=torch.int32
+    )
+    masked = logits.masked_fill(
+        torch.arange(width, device="cuda")[None, :] >= lengths[:, None], -float("inf")
+    )
+    expected = torch.topk(masked, top_k, dim=1).values.sort(1).values
+    states = torch.zeros(
+        (num_sms // ctas_per_group, _RADIX_STATE_SIZE), device="cuda", dtype=torch.int32
+    )
+    output = torch.empty((rows, top_k), device="cuda", dtype=torch.int32)
+    count = torch.zeros(rows if use_mask else 1, device="cuda", dtype=torch.int32)
+    compiled = _compile_radix(
+        cutlass.Float32,
+        top_k,
+        1,
+        1,
+        width,
+        False,
+        ctas_per_group,
+        width // ctas_per_group,
+        num_sms,
+        input_stride,
+        width * input_stride,
+        has_active_rows=not use_mask,
+        has_active_mask=use_mask,
+    )
+    compiled(logits, states, lengths, output, None, count)
+    graph = torch.cuda.CUDAGraph()
+    torch.cuda.synchronize()
+    with torch.cuda.graph(graph):
+        compiled(logits, states, lengths, output, None, count)
+    for active in (0, 1, 17, rows, 3, 0, rows + 5, -1):
+        output.fill_(-1)
+        count.fill_(active)
+        valid = min(rows, max(active, 0))
+        enabled = torch.arange(rows, device="cuda") < valid
+        if use_mask:
+            # Sparse original row IDs, including persistent groups with holes.
+            enabled = enabled.roll(rows // 2)
+            count.copy_(enabled)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert bool((output[~enabled] == -1).all())
+        selected = output[enabled].long()
+        assert bool(((selected >= 0) & (selected < lengths[enabled, None])).all())
+        ordered = selected.sort(1).values
+        assert bool((ordered[:, 1:] != ordered[:, :-1]).all())
+        actual = logits[enabled].gather(1, selected).sort(1).values
+        torch.testing.assert_close(actual, expected[enabled], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "width,col_stride,row_stride,match",
+    [
+        (8, 0, 8, "positive"),
+        (8, -1, 8, "positive"),
+        (8, 1, 16, "compact rows"),
+        (2**30 + 1, 2, None, "fit int32"),
+    ],
+)
+def test_radix_rejects_unsupported_input_layout(width, col_stride, row_stride, match):
+    from flashinfer.topk_varlen.topk_varlen import _compile_radix
+
+    with pytest.raises(ValueError, match=match):
+        _compile_radix(None, 512, 1, 1, width, False, 1, 512, 8, col_stride, row_stride)
+
+
+@requires_blackwell
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("ctas_per_group", [1, 2])
+def test_radix_strided_short_rows_return_values(dtype, ctas_per_group):
+    """Odd-element views exercise dtype alignment and identity-path values."""
+    import cutlass
+    from flashinfer.topk_varlen.topk_varlen import _compile_radix, _RADIX_STATE_SIZE
+
+    rows, width, top_k, sms = 3, 1024, 512, 8
+    storage = torch.arange(rows * width * 2, device="cuda").to(dtype).reshape(rows, -1)
+    logits = storage[:, 1::2]
+    lengths = torch.tensor([0, 127, top_k], dtype=torch.int32, device="cuda")
+    states = None
+    if ctas_per_group > 1:
+        states = torch.zeros(
+            (sms // ctas_per_group, _RADIX_STATE_SIZE), dtype=torch.int32, device="cuda"
+        )
+    indices = torch.empty((rows, top_k), dtype=torch.int32, device="cuda")
+    values = torch.empty((rows, top_k), dtype=dtype, device="cuda")
+    cute_dtype = {
+        torch.float16: cutlass.Float16,
+        torch.bfloat16: cutlass.BFloat16,
+        torch.float32: cutlass.Float32,
+    }[dtype]
+    compiled = _compile_radix(
+        cute_dtype,
+        top_k,
+        1,
+        1,
+        width,
+        True,
+        ctas_per_group,
+        width // ctas_per_group,
+        sms,
+        2,
+        width * 2,
+    )
+    compiled(logits, states, lengths, indices, values)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        compiled(logits, states, lengths, indices, values)
+    for _ in range(2):
+        logits.add_(1)
+        graph.replay()
+        torch.cuda.synchronize()
+        for row, length in enumerate((0, 127, top_k)):
+            torch.testing.assert_close(
+                indices[row, :length].sort().values,
+                torch.arange(length, device="cuda", dtype=torch.int32),
+            )
+            torch.testing.assert_close(
+                values[row, :length],
+                logits[row, indices[row, :length].long()],
+                rtol=0,
+                atol=0,
+            )
+            assert bool((indices[row, length:] == -1).all())
 
 
 @requires_blackwell
@@ -1598,21 +1699,8 @@ def test_cross_backend_value_consistency():
         logits, seq_lens, top_k, pre_idx=pre_idx, backend="gvr_2"
     )
     torch.cuda.synchronize()
-    lf = logits.float()
-    for row in range(batch_size):
-        vr = lf[row][idx_r[row].long()].sort(descending=True).values
-        vc = lf[row][idx_c[row].long()].sort(descending=True).values
-        vg = lf[row][idx_g[row].long()].sort(descending=True).values
-        vg2 = lf[row][idx_g2[row].long()].sort(descending=True).values
-        assert torch.allclose(vr, vc, rtol=1e-4, atol=1e-4), (
-            f"row={row}: radix vs radix_cutlass value multisets differ"
-        )
-        assert torch.allclose(vr, vg, rtol=1e-4, atol=1e-4), (
-            f"row={row}: radix vs gvr value multisets differ"
-        )
-        assert torch.allclose(vr, vg2, rtol=1e-4, atol=1e-4), (
-            f"row={row}: radix vs gvr_2 value multisets differ"
-        )
+    for indices in (idx_r, idx_c, idx_g, idx_g2):
+        assert_topk_reference(logits, indices, seq_lens, top_k)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA")

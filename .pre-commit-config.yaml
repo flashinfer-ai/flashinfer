@@ -14,7 +14,9 @@
 # Note the pre-commit hooks shoule only be used for formatting, but not for linting.
 # For linting consider using CI.
 # These manifest-authenticated generated sources must remain byte-exact.
-files: ^(?!(?:flashinfer/moe_ep/kernel_src/blackwell_bf16_rank_major/src/|csrc/cake_fmha/))
+# The indexer-throwaway v2 snapshot is sealed by VENDOR_MANIFEST.json and has
+# focused device tests; keep compiler-lowered source forms stable during syncs.
+files: ^(?!(?:flashinfer/moe_ep/kernel_src/blackwell_bf16_rank_major/src/|csrc/cake_fmha/|flashinfer/experimental/attn_scores/kernels/indexer_topk_v2/))
 
 # The kernel_src */src trees (and the manifest-sealed cake_sm90_bf16_megamoe_* GEMM
 # sources of moe_ep/kernel_src/sm90/cake_bf16_megamoe) and blackwell_msa CUDA snapshots are generated or

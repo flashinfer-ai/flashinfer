@@ -11,10 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Tests for fp8_paged_mqa_logits and fp4_paged_mqa_logits.
+"""Tests for stable paged FP8/FP4 MQA scoring.
 
 Reference implementations are adapted from TRT-LLM test scripts.
 """
+
+from __future__ import annotations
+
 
 import pytest
 import contextlib
@@ -22,6 +25,7 @@ import os
 import shutil
 import subprocess
 import sys
+import functools
 
 import torch
 
@@ -72,6 +76,159 @@ def _skip_sm107_unsupported_kernel_tests(request):
 # ──────────────────────────────────────────────────────────────────────────────
 # Helpers: FP8
 # ──────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "epi_dtype,acc_dtype,output_dtype",
+    [
+        (torch.float32, torch.float32, torch.float32),
+        (torch.float32, torch.float16, torch.float16),
+        (torch.float16, torch.float32, torch.float32),
+        (torch.float16, torch.float16, torch.float16),
+    ],
+)
+def test_fp8_math_mode_finite_and_fp16_policy(epi_dtype, acc_dtype, output_dtype):
+    """Mode alternation retains FP16 policy and separate ordinary cache entries."""
+    from flashinfer import fp8_paged_mqa_logits
+    from flashinfer.attn_scores.attn_scores import _cached_compile_fp8_kernel
+
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("requires SM100-class GPU")
+    torch.manual_seed(13)
+    q = torch.randint(-2, 3, (1, 2, 64, 128), device="cuda").to(torch.float8_e4m3fn)
+    kv = torch.randint(-2, 3, (2, 128, 128), device="cuda").to(torch.float8_e4m3fn)
+    scale = torch.full((2, 128), 0.5, device="cuda")
+    weights = torch.randint(-2, 3, (2, 64), device="cuda").float()
+    table = torch.tensor([[1, 0]], device="cuda", dtype=torch.int32)
+    lengths = torch.tensor([255], device="cuda", dtype=torch.int32)
+    fused = _make_fused_kv_fp8(kv, scale, 128, 128)
+    reference = _ref_fp8_paged_mqa_logits(
+        q, kv, scale, weights, lengths, table, 256, 128, out_dtype=epi_dtype
+    ).to(output_dtype)
+    with pytest.raises(ValueError, match="math_mode"):
+        fp8_paged_mqa_logits(
+            q, fused, weights, table, lengths, 256, math_mode="invalid"
+        )
+    _cached_compile_fp8_kernel.cache_clear()
+    outputs = []
+    cache_states = []
+    for mode in ("relu_fast", "relu_strict", "relu_fast"):
+        outputs.append(
+            fp8_paged_mqa_logits(
+                q,
+                fused,
+                weights,
+                table,
+                lengths,
+                256,
+                epi_dtype=epi_dtype,
+                acc_dtype=acc_dtype,
+                output_dtype=output_dtype,
+                math_mode=mode,
+            ).clone()
+        )
+        cache_states.append(_cached_compile_fp8_kernel.cache_info())
+    torch.cuda.synchronize()
+    # The public scorer deliberately leaves future/padded columns unspecified.
+    valid = _valid_causal_mask(lengths, 2, 256, "cuda")
+    for output in outputs:
+        torch.testing.assert_close(output[valid], reference[valid], atol=0, rtol=0)
+    assert torch.equal(outputs[0][valid], outputs[2][valid])
+    if epi_dtype == torch.float16:
+        assert torch.equal(outputs[0][valid], outputs[1][valid])
+    assert [state.currsize for state in cache_states] == [1, 2, 2]
+    assert [state.misses for state in cache_states] == [1, 2, 2]
+    assert cache_states[2].hits == cache_states[1].hits + 1
+    default_kwargs = dict(
+        epi_dtype=epi_dtype, acc_dtype=acc_dtype, output_dtype=output_dtype
+    )
+    default_output = fp8_paged_mqa_logits(
+        q, fused, weights, table, lengths, 256, **default_kwargs
+    ).clone()
+    assert _cached_compile_fp8_kernel.cache_info().hits == cache_states[-1].hits + 1
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = fp8_paged_mqa_logits(
+            q, fused, weights, table, lengths, 256, **default_kwargs
+        )
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(default_output[valid], outputs[1][valid], atol=0, rtol=0)
+    torch.testing.assert_close(captured[valid], outputs[1][valid], atol=0, rtol=0)
+
+
+def test_fp8_math_mode_rejects_before_cuda_work():
+    from flashinfer import fp8_paged_mqa_logits
+    from flashinfer.attn_scores.attn_scores import precompile_paged_mqa_logits
+
+    for invalid in ("auto", "", None, 1):
+        with pytest.raises(ValueError, match="math_mode"):
+            # Isolate API-body validation from the independent device-capability
+            # decorator: all-None tensors intentionally have no capability.
+            fp8_paged_mqa_logits(
+                None,
+                None,
+                None,
+                None,
+                None,
+                128,
+                math_mode=invalid,
+                skip_check=True,
+            )
+        with pytest.raises(ValueError, match="math_mode"):
+            precompile_paged_mqa_logits(math_mode=invalid)
+
+
+@pytest.mark.parametrize("case", ["negative_infinity", "nan_weight", "tiny_scale"])
+def test_fp8_math_mode_exceptional_values(case):
+    """Observe the documented fast recipe, not a strict-equivalence promise."""
+    from flashinfer import fp8_paged_mqa_logits
+
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("requires SM100-class GPU")
+    q = torch.zeros((1, 1, 64, 128), device="cuda")
+    kv = torch.ones((1, 128, 128), device="cuda")
+    weights = torch.zeros((1, 64), device="cuda")
+    q[0, 0, 0, 0] = 1
+    weights[0, 0] = 1
+    scale = torch.ones((1, 128), device="cuda")
+    acc_dtype = torch.float32
+    if case == "negative_infinity":
+        q[0, 0, 0, :] = -448
+        kv.fill_(448)
+        acc_dtype = torch.float16
+    elif case == "nan_weight":
+        weights[0, 0] = float("nan")
+    else:
+        scale.fill_(torch.finfo(torch.float32).tiny * torch.finfo(torch.float32).eps)
+    q = q.to(torch.float8_e4m3fn)
+    fused = _make_fused_kv_fp8(kv.to(torch.float8_e4m3fn), scale, 128, 128)
+    table = torch.zeros((1, 1), device="cuda", dtype=torch.int32)
+    lengths = torch.tensor([128], device="cuda", dtype=torch.int32)
+    outputs = {}
+    for mode in ("relu_fast", "relu_strict", None):
+        outputs[mode] = fp8_paged_mqa_logits(
+            q,
+            fused,
+            weights,
+            table,
+            lengths,
+            128,
+            acc_dtype=acc_dtype,
+            **({} if mode is None else {"math_mode": mode}),
+        ).clone()
+    torch.cuda.synchronize()
+    if case == "negative_infinity":
+        assert torch.isnan(outputs["relu_fast"]).all()
+        assert (outputs["relu_strict"] == 0).all()
+    elif case == "nan_weight":
+        assert all(torch.isnan(output).all() for output in outputs.values())
+    else:
+        assert (outputs["relu_fast"] == 0).all()
+        torch.testing.assert_close(outputs["relu_strict"], scale, atol=0, rtol=0)
+    torch.testing.assert_close(
+        outputs[None], outputs["relu_strict"], atol=0, rtol=0, equal_nan=True
+    )
 
 
 def _ceil_to_ue8m0_fp(x: torch.Tensor) -> torch.Tensor:
@@ -418,6 +575,8 @@ def test_fp8_paged_mqa_logits(batch_size, next_n, avg_ctx, block_size, output_dt
     )
     kv_fused = _make_fused_kv_fp8(kv_fp8, kv_scale, block_size, head_dim)
 
+    # The call below keeps the default FP32 accumulator and epilogue. Only
+    # the final store is converted, even when output_dtype is FP16.
     ref = _ref_fp8_paged_mqa_logits(
         q_fp8,
         kv_fp8,
@@ -427,8 +586,8 @@ def test_fp8_paged_mqa_logits(batch_size, next_n, avg_ctx, block_size, output_dt
         block_tables,
         max_seq_len,
         block_size,
-        out_dtype=output_dtype,
-    )
+        out_dtype=torch.float32,
+    ).to(output_dtype)
 
     out = fp8_paged_mqa_logits(
         q_fp8,
@@ -477,6 +636,90 @@ def test_fp8_paged_mqa_logits(batch_size, next_n, avg_ctx, block_size, output_dt
 
     diff = _calc_cosine_diff(out_clean, ref_clean)
     assert diff < 0.02, f"cosine diff {diff:.3e} too large"
+
+
+@pytest.mark.parametrize("num_heads", [8, 64])
+@pytest.mark.parametrize("early_tmem_copy", [False, True])
+@pytest.mark.parametrize("remove_kv_wait", [False, True])
+def test_fp8_scale_reads_precede_stage_reuse(
+    monkeypatch, num_heads, early_tmem_copy, remove_kv_wait
+):
+    if not is_sm100a_supported(torch.device("cuda")):
+        pytest.skip("FP8 paged MQA logits requires SM100a")
+
+    from flashinfer.attn_scores import attn_scores as scores
+    from flashinfer.attn_scores import kernels
+
+    monkeypatch.setenv("FLASHINFER_CUTE_DSL_DISABLE_CACHE", "1")
+    monkeypatch.setattr(scores, "_cached_num_sms", lambda _device: 4)
+    monkeypatch.setattr(
+        kernels,
+        "FP8MQALogitsKernel",
+        functools.partial(
+            kernels.FP8MQALogitsKernel,
+            early_tmem_copy=early_tmem_copy,
+            remove_kv_wait_in_epilogue=remove_kv_wait,
+        ),
+    )
+    scores._cached_compile_fp8_kernel.cache_clear()
+    try:
+        batch_size, next_n, head_dim, block_size, kv_rows = 7, 2, 128, 128, 32768
+        device = "cuda"
+        q = torch.ones((batch_size, next_n, num_heads, head_dim), device=device).to(
+            torch.float8_e4m3fn
+        )
+        kv = torch.ones(
+            (kv_rows // block_size, block_size, head_dim), device=device
+        ).to(torch.float8_e4m3fn)
+        # Distinct stage scales make premature TMA reuse observable in logits.
+        scales = torch.pow(
+            2.0, (torch.arange(kv_rows, device=device) // block_size) % 7 - 3
+        ).reshape(-1, block_size)
+        fused = _make_fused_kv_fp8(kv, scales, block_size, head_dim)
+        weights = torch.ones((batch_size * next_n, num_heads), device=device)
+        context_lens = kv_rows - 129 * torch.arange(
+            batch_size, dtype=torch.int32, device=device
+        )
+        block_table = (
+            torch.arange(kv_rows // block_size, dtype=torch.int32, device=device)[
+                None, :
+            ]
+            + 17 * torch.arange(batch_size, dtype=torch.int32, device=device)[:, None]
+        ) % (kv_rows // block_size)
+        expected = (
+            scales[block_table.long()].reshape(batch_size, kv_rows)
+            * head_dim
+            * num_heads
+        ).repeat_interleave(next_n, dim=0)
+        ends = (
+            context_lens.repeat_interleave(next_n)
+            - next_n
+            + torch.arange(batch_size * next_n, device=device) % next_n
+        )
+        valid = torch.arange(kv_rows, device=device)[None, :] <= ends[:, None]
+        out = torch.empty_like(expected)
+
+        def run():
+            return scores.fp8_paged_mqa_logits(
+                q,
+                fused,
+                weights,
+                block_table,
+                context_lens,
+                kv_rows,
+                out=out,
+            )
+
+        run()
+        torch.testing.assert_close(out[valid], expected[valid], rtol=0, atol=0)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run()
+        for _ in range(5):
+            graph.replay()
+            torch.testing.assert_close(out[valid], expected[valid], rtol=0, atol=0)
+    finally:
+        scores._cached_compile_fp8_kernel.cache_clear()
 
 
 @pytest.mark.parametrize("next_n", [1, 2])
@@ -2981,44 +3224,52 @@ def test_validate_inputs_rejects_out_of_pool_block_index(monkeypatch):
 
 
 def test_output_span_32bit_guard():
-    """Outputs spanning >= 2^31 elements are rejected before allocation.
+    """FP8 store width is span-derived; FP4 uses an Int32 span limit."""
+    from flashinfer.attn_scores.attn_scores import _fp8_output_index_bits
 
-    The kernels carry output store offsets (row * stride + col) as 32-bit
-    integers; past 2^31 elements the offset wraps negative and stores land far
-    outside the buffer -- silent device-memory corruption. The guard fires
-    before the output is allocated, so this test never touches the ~8 GB the
-    rejected shape implies.
-    """
-    if not is_sm100a_supported(torch.device("cuda")):
-        pytest.skip("paged MQA logits requires an SM100-class GPU (SM100/SM103/SM107)")
+    assert _fp8_output_index_bits(2, 2**30 - 256, None, 4) == 32
+    assert _fp8_output_index_bits(2, 2**30, None, 4) == 64
+    assert _fp8_output_index_bits(8192, 1048576, None, 4) == 64
+    assert _fp8_output_index_bits(0, 256, None, 4) == 32
 
-    from flashinfer import fp8_paged_mqa_logits
-
-    device = "cuda"
-    H, D, block_size = 64, 128, 64
-    B, max_len = 8192, 262_145  # 8192 rows x 262_400 padded cols > 2^31
-    cl = torch.full((B,), 64, dtype=torch.int32, device=device)
-    cols = ((max_len + 127) // 128 * 128) // block_size
-    bt = torch.zeros((B, cols), dtype=torch.int32, device=device)
-    w = torch.zeros(B, H, device=device, dtype=torch.float32)
-    kv = torch.zeros(1, block_size, 1, D + 4, dtype=torch.uint8, device=device)
-    q = torch.zeros(B, 1, H, D, device=device).to(torch.float8_e4m3fn)
-
-    with pytest.raises(ValueError, match="32-bit"):
-        fp8_paged_mqa_logits(q, kv, w, bt, cl, max_len)
-
-    # The guard also accounts for a caller out= whose row stride exceeds the
-    # padded width (a view into a wider arena). A real tensor with a
-    # 2^31-spanning stride would itself need 8 GB, so the branch is pinned at
-    # the helper level with a small real tensor and a large row count.
+    # Pin pitched-span arithmetic without allocating a multi-gigabyte buffer.
     from flashinfer.attn_scores.attn_scores import _validate_output_addressable
 
-    arena_row = torch.empty((2, 4096), device=device, dtype=torch.float32)
-    _validate_output_addressable(2, 256, arena_row, "fp8_paged_mqa_logits")  # fine
+    arena_row = torch.empty((2, 4096), dtype=torch.float32)
+    assert _fp8_output_index_bits(2, 256, arena_row, 4) == 32
+    assert _fp8_output_index_bits(2**19, 256, arena_row, 4) == 64
     with pytest.raises(ValueError, match="32-bit"):
         # rows * stride(0) = 2^19 * 4096 = 2^31: the stride, not the padded
         # width, is what overflows.
-        _validate_output_addressable(2**19, 256, arena_row, "fp8_paged_mqa_logits")
+        _validate_output_addressable(2**19, 256, arena_row, "fp4_paged_mqa_logits")
+    for rows, columns in ((2**31, 256), (1, 2**31), (-1, 256), (1, -1)):
+        with pytest.raises(ValueError, match="logical output"):
+            _fp8_output_index_bits(rows, columns, None, 4)
+    with pytest.raises(ValueError, match="byte span"):
+        _fp8_output_index_bits(2**31 - 1, 2**31 - 1, None, 4)
+    assert _fp8_output_index_bits(2**31 - 1, 2**31 - 1, None, 2) == 64
+
+
+@pytest.mark.parametrize("index_bits", [32, 64])
+@pytest.mark.parametrize("output_dtype", [torch.float32, torch.float16])
+def test_fp8_output_offset_width_lowering(monkeypatch, index_bits, output_dtype):
+    """Compile both offset widths on small planes with the existing FP32 oracle.
+
+    Small output planes exercise both offset types without large allocations;
+    accesses beyond the Int32 boundary are not exercised here.
+    """
+    from flashinfer.attn_scores import attn_scores as api
+
+    actual_choice = api._fp8_output_index_bits
+
+    def force_width(*args):
+        assert actual_choice(*args) == 32
+        return index_bits
+
+    monkeypatch.setattr(api, "_fp8_output_index_bits", force_width)
+    test_fp8_paged_mqa_logits(2, 2, 384, 128, output_dtype)
+    if output_dtype == torch.float32:
+        test_out_layout_rejected()
 
 
 def test_fp4_split_graph_replay_across_split_boundary():
@@ -3473,6 +3724,7 @@ def test_precompile_targets_the_requested_device():
 
     from flashinfer import precompile_paged_mqa_logits
     from flashinfer.attn_scores.attn_scores import (
+        _COMPUTE_BLOCK_KV,
         _cached_compile_fp8_kernel,
         _cached_gpu_arch,
         _cached_num_sms,
@@ -3495,7 +3747,11 @@ def test_precompile_targets_the_requested_device():
     precompile_paged_mqa_logits(device=torch.device("cuda", target), variants=("fp8",))
 
     hits = _cached_compile_fp8_kernel.cache_info().hits
-    _cached_compile_fp8_kernel(64, 64, 128, 1, sms, f32, f32, f32, 1, None, arch)
+    # Same positional call shape as precompile and the launch path:
+    # functools.cache keys on the literal arguments, defaults included.
+    shape = (64, 64, 128, 1, sms, f32, f32, f32, 1, None)
+    tail = (32, "relu_strict", _COMPUTE_BLOCK_KV, False, None, None)
+    _cached_compile_fp8_kernel(*shape, arch, *tail)
     assert _cached_compile_fp8_kernel.cache_info().hits == hits + 1, (
         f"precompile(device=cuda:{target}) produced no entry for "
         f"(num_sms={sms}, arch={arch})"
@@ -3507,9 +3763,7 @@ def test_precompile_targets_the_requested_device():
     # miss is what we are asserting, not the compile result.
     with contextlib.suppress(Exception):
         other_arch = "sm_90a" if arch != "sm_90a" else "sm_80"
-        _cached_compile_fp8_kernel(
-            64, 64, 128, 1, sms, f32, f32, f32, 1, None, other_arch
-        )
+        _cached_compile_fp8_kernel(*shape, other_arch, *tail)
     assert _cached_compile_fp8_kernel.cache_info().misses > misses, (
         "a different arch reused the cache entry -- arch is not in the key"
     )

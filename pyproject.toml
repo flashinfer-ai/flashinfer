@@ -82,6 +82,7 @@ exclude = [
 "flashinfer.data.cccl" = "3rdparty/cccl"
 
 [tool.setuptools.package-data]
+"flashinfer.experimental.attn_scores.kernels.indexer_topk_v2" = ["README.md", "VENDOR_MANIFEST.json", "LICENSE"]
 "flashinfer.experimental.b12x.comm.roce" = ["*.c"]
 "flashinfer.experimental.b12x.loader" = ["*.c", "*.h"]
 # Cake-exported packages (flashinfer-ai/flashinfer#6553): the generated csrc tree plus the
@@ -268,6 +269,8 @@ exclude = [
   "flashinfer-jit-cache/",
   # CUTLASS DSL kernel bodies are compiler-lowered rather than ordinary Python.
   "flashinfer/attention/prims_ts/kernels/",
+  # Sealed indexer-throwaway CuTe DSL snapshot; the paged adapter stays checked.
+  "flashinfer/experimental/attn_scores/kernels/indexer_topk_v2/",
   "3rdparty/",
   "flashinfer/data/cutlass/",
   "flashinfer/cute_dsl/attention/fmha/fmha.py",
@@ -316,6 +319,7 @@ exclude = [
 [tool.ruff]
 # Ruff infers the target from project.requires-python.
 extend-exclude = [
+  "flashinfer/experimental/attn_scores/kernels/indexer_topk_v2/",
   "flashinfer/fused_moe/backends/cudnn_frost/artifacts/*/sources/",
   "flashinfer/cute_dsl/attention/fmha/fmha.py",
   "flashinfer/cute_dsl/attention/fmha/fmha_blockscaled.py",

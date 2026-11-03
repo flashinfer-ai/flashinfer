@@ -886,7 +886,30 @@ def _compile_radix(
     ctas_per_group,
     chunk_size,
     num_sms,
+    input_col_stride=1,
+    input_row_stride=None,
+    has_active_rows=False,
+    has_active_mask=False,
 ):
+    """Compile a radix specialization for compact or column-strided rows.
+
+    ``input_col_stride`` and ``input_row_stride`` count input elements, not
+    bytes. Unit-column inputs must have compact rows; strided inputs require
+    only dtype alignment. Column offsets must fit signed int32 arithmetic.
+    ``has_active_rows`` accepts a device scalar queue length; ``has_active_mask``
+    accepts a device int32 mask indexed by original row. They are exclusive,
+    and either leaves inactive output rows untouched across graph replays.
+    """
+    if input_col_stride <= 0:
+        raise ValueError("radix input column stride must be positive")
+    if input_row_stride is None:
+        input_row_stride = N * input_col_stride
+    if input_col_stride == 1 and input_row_stride != N:
+        raise ValueError("unit-column radix inputs must have compact rows")
+    if N <= 0 or (N - 1) * input_col_stride >= 2**31:
+        raise ValueError("radix input column offsets must fit int32")
+    if has_active_rows and has_active_mask:
+        raise ValueError("active row count and mask are mutually exclusive")
     # N (vocab size) is static: it feeds the fake input tensor's column extent so
     # the kernel is specialized per vocab width. chunk_size (the per-CTA SMEM
     # span) is passed explicitly — computed once by _radix_get_chunk_config so
@@ -905,6 +928,7 @@ def _compile_radix(
         compress_ratio=compress_ratio,
         ctas_per_group=ctas_per_group,
         num_sms=num_sms,
+        input_col_stride=input_col_stride,
     )
     sym_groups = cute.sym_int()  # number of requests (= num_rows // next_n)
     sym_n = N  # static vocab width
@@ -915,21 +939,52 @@ def _compile_radix(
     kernel_name = (
         f"{dtype_name}_topk{top_k}_nextn{next_n}_cr{compress_ratio}"
         f"_N{N}_rv{int(return_output_values)}_cta{ctas_per_group}_chunk{chunk_size}_sms{num_sms}"
+        f"_is{input_col_stride}_irs{input_row_stride}"
     )
+    if has_active_rows:
+        kernel_name += "_active"
+    if has_active_mask:
+        kernel_name += "_masked"
 
     def _compile_fn():
+        if input_col_stride == 1:
+            input_fake = cute.runtime.make_fake_compact_tensor(
+                cute_dtype,
+                (sym_rows, sym_n),
+                stride_order=(1, 0),
+                assumed_align=16,
+            )
+        else:
+            input_fake = cute.runtime.make_fake_tensor(
+                cute_dtype,
+                (sym_rows, sym_n),
+                stride=(input_row_stride, input_col_stride),
+                assumed_align=cute_dtype.width // 8,
+            )
+        active_args = (
+            {
+                "active_rows": cute.runtime.make_fake_compact_tensor(
+                    cutlass.Int32, (1,), stride_order=(0,)
+                )
+            }
+            if has_active_rows
+            else {}
+        )
+        entry = kernel.with_active_rows if has_active_rows else kernel
+        if has_active_mask:
+            active_args["active_mask"] = cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32, (sym_rows,), stride_order=(0,)
+            )
+            entry = kernel.with_active_mask
         return cute.compile(
-            kernel,
-            cute.runtime.make_fake_compact_tensor(
-                cute_dtype, (sym_rows, sym_n), stride_order=(1, 0), assumed_align=16
-            ),
-            # The single-CTA kernel guards every row_states access with
-            # const_expr(ctas_per_group > 1) and compiles them away, so it takes
-            # no row_states tensor, like the absent output_values below.
+            entry,
+            input_fake,
+            # Single-CTA state accesses compile away. Ordinary calls omit the
+            # buffer; device-active entry points retain their bound tensor ABI.
             cute.runtime.make_fake_compact_tensor(
                 cutlass.Int32, (max_num_groups, _RADIX_STATE_SIZE), stride_order=(1, 0)
             )
-            if ctas_per_group > 1
+            if ctas_per_group > 1 or has_active_rows or has_active_mask
             else None,
             cute.runtime.make_fake_compact_tensor(
                 cutlass.Int32, (sym_groups,), stride_order=(0,)
@@ -943,6 +998,7 @@ def _compile_radix(
             if return_output_values
             else None,
             stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+            **active_args,
             options="--enable-tvm-ffi",
         )
 

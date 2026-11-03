@@ -1,0 +1,158 @@
+{
+  "name": "fp8_paged_mqa_topk_H8_D128_ps64_k512",
+  "description": "Exact causal full FP8 paged MQA scores plus GVR-v2 TopK512, TopK1024 or TopK2048.",
+  "op_type": "paged_mqa_topk",
+  "tags": [
+    "fi_api:flashinfer.attn_scores.selective_logits.FP8PagedMQATopKWrapper.run",
+    "status:verified",
+    "arch:sm100",
+    "stage:score-to-topk"
+  ],
+  "axes": {
+    "total_q": {
+      "type": "var",
+      "description": "Total query rows across the ragged batch."
+    },
+    "batch_size": {
+      "type": "var",
+      "description": "Number of requests."
+    },
+    "batch_plus_one": {
+      "type": "var",
+      "description": "Length of each ragged prefix tensor."
+    },
+    "num_heads": {
+      "type": "const",
+      "value": 8,
+      "description": "Scoring heads."
+    },
+    "head_dim": {
+      "type": "const",
+      "value": 128,
+      "description": "Head dimension."
+    },
+    "num_pages": {
+      "type": "var",
+      "description": "Physical paged-KV pool size."
+    },
+    "page_size": {
+      "type": "const",
+      "value": 64,
+      "description": "Tokens per physical KV page."
+    },
+    "num_kv_heads": {
+      "type": "const",
+      "value": 1,
+      "description": "KV heads (MQA => 1)."
+    },
+    "block_row_bytes": {
+      "type": "const",
+      "value": 132,
+      "description": "Fused KV row bytes (head_dim + 4)."
+    },
+    "max_pages_per_request": {
+      "type": "var",
+      "description": "Padded page-table width."
+    },
+    "max_kv_len": {
+      "type": "var",
+      "description": "Maximum logical KV length."
+    },
+    "top_k": {
+      "type": "const",
+      "value": 512,
+      "description": "Selected indices per query row."
+    }
+  },
+  "constraints": [
+    "num_kv_heads == 1",
+    "block_row_bytes == head_dim + 4",
+    "batch_plus_one == batch_size + 1",
+    "top_k in (512, 1024, 2048)"
+  ],
+  "inputs": {
+    "q": {
+      "shape": [
+        "total_q",
+        "num_heads",
+        "head_dim"
+      ],
+      "dtype": "float8_e4m3fn",
+      "description": "Contiguous FP8 E4M3 queries."
+    },
+    "kv_fused": {
+      "shape": [
+        "num_pages",
+        "page_size",
+        "num_kv_heads",
+        "block_row_bytes"
+      ],
+      "dtype": "uint8",
+      "description": "Fused paged FP8 KV and per-token FP32 scales."
+    },
+    "weights": {
+      "shape": [
+        "total_q",
+        "num_heads"
+      ],
+      "dtype": "float32",
+      "description": "Per-query head weights."
+    },
+    "block_table": {
+      "shape": [
+        "batch_size",
+        "max_pages_per_request"
+      ],
+      "dtype": "int32",
+      "optional": true,
+      "description": "Logical-to-physical KV page mapping."
+    },
+    "qo_indptr": {
+      "shape": [
+        "batch_plus_one"
+      ],
+      "dtype": "int32",
+      "optional": true,
+      "description": "Plan-owned ragged query prefix sums."
+    },
+    "kv_indptr": {
+      "shape": [
+        "batch_plus_one"
+      ],
+      "dtype": "int32",
+      "optional": true,
+      "description": "Plan-owned ragged KV prefix sums."
+    },
+    "top_k": {
+      "shape": null,
+      "dtype": "int32",
+      "optional": true,
+      "description": "Plan-owned TopK width."
+    },
+    "math_mode": {
+      "shape": null,
+      "dtype": "string",
+      "optional": true,
+      "description": "Constructor-owned FP8 ReLU policy."
+    },
+    "max_kv_len": {
+      "shape": null,
+      "dtype": "int32",
+      "optional": true,
+      "description": "Largest plan-owned KV length."
+    }
+  },
+  "outputs": {
+    "indices": {
+      "shape": [
+        "total_q",
+        "top_k"
+      ],
+      "dtype": "int32",
+      "description": "Request-local exact causal TopK indices."
+    }
+  },
+  "reference": "from __future__ import annotations\nimport math\nimport torch\nimport torch.nn.functional as F\n\n# ----- reference dependencies -----\ndef _selective_topk_row_scores(\n    q, kv_fused, weights, qo_indptr, kv_indptr, block_table, math_mode=\"relu_strict\"\n):\n    \"\"\"Return request-local causal score rows for the selective TopK reference.\"\"\"\n    num_blocks, block_size, _one, row_bytes = kv_fused.shape\n    head_dim = row_bytes - 4\n    flat = kv_fused.reshape(num_blocks, -1)\n    kv_fp8 = (\n        flat[:, : block_size * head_dim]\n        .reshape(num_blocks, block_size, head_dim)\n        .view(torch.float8_e4m3fn)\n    )\n    scales = (\n        flat[:, block_size * head_dim :]\n        .contiguous()\n        .view(torch.float32)\n        .reshape(num_blocks, block_size)\n    )\n\n    rows = []\n    q_prefix = qo_indptr.tolist()\n    kv_prefix = kv_indptr.tolist()\n    for request in range(len(q_prefix) - 1):\n        q_begin, q_end = q_prefix[request : request + 2]\n        kv_begin, kv_end = kv_prefix[request : request + 2]\n        q_len = q_end - q_begin\n        kv_len = kv_end - kv_begin\n        page_count = (kv_len + block_size - 1) // block_size\n        page_ids = block_table[request, :page_count].long()\n        request_kv = kv_fp8[page_ids].reshape(-1, head_dim)[:kv_len].float()\n        request_scales = scales[page_ids].reshape(-1)[:kv_len]\n        for local_q, row in enumerate(range(q_begin, q_end)):\n            row_end = kv_len - q_len + local_q + 1\n            per_head = torch.matmul(q[row].float(), request_kv[:row_end].T)\n            if math_mode == \"relu_fast\":\n                activated = per_head + per_head.abs()\n                scale = request_scales[:row_end] * 0.5\n            elif math_mode == \"relu_strict\":\n                activated = torch.relu(per_head)\n                scale = request_scales[:row_end]\n            else:\n                raise ValueError(\"unknown FP8 math_mode\")\n            score = (activated * weights[row].float().unsqueeze(1)).sum(dim=0)\n            rows.append(score * scale)\n    return rows\n\n# ----- reference -----\n@torch.no_grad()\ndef _fp8_paged_mqa_selective_topk_reference(\n    q,\n    kv_fused,\n    weights,\n    block_table,\n    qo_indptr=None,\n    kv_indptr=None,\n    top_k=512,\n    math_mode=\"relu_strict\",\n    **_unused,\n):\n    \"\"\"Compute exact request-local causal TopK indices with a PyTorch oracle.\"\"\"\n    if qo_indptr is None or kv_indptr is None:\n        raise ValueError(\n            \"selective TopK reference requires plan-owned qo_indptr and kv_indptr\"\n        )\n    score_rows = _selective_topk_row_scores(\n        q, kv_fused, weights, qo_indptr, kv_indptr, block_table, math_mode\n    )\n    selected = torch.full((q.shape[0], top_k), -1, dtype=torch.int32, device=q.device)\n    for row, scores in enumerate(score_rows):\n        count = min(top_k, scores.numel())\n        selected[row, :count] = torch.topk(\n            scores, count, largest=True, sorted=False\n        ).indices.to(torch.int32)\n    return selected\n",
+  "check": "def _fp8_paged_mqa_selective_topk_check(\n    reference_outputs,\n    actual_outputs,\n    *,\n    q=None,\n    kv_fused=None,\n    weights=None,\n    block_table=None,\n    qo_indptr=None,\n    kv_indptr=None,\n    top_k=512,\n    math_mode=\"relu_strict\",\n    rtol=2e-2,\n    atol=2e-2,\n    **_unused,\n):\n    \"\"\"Validate bounds, uniqueness, padding, and tie-aware TopK membership.\"\"\"\n    actual = actual_outputs[0] if isinstance(actual_outputs, list) else actual_outputs\n    reference = (\n        reference_outputs[0]\n        if isinstance(reference_outputs, list)\n        else reference_outputs\n    )\n    if actual.shape != reference.shape:\n        return False\n    if any(\n        value is None\n        for value in (q, kv_fused, weights, block_table, qo_indptr, kv_indptr)\n    ):\n        return torch.equal(actual, reference)\n\n    score_rows = _selective_topk_row_scores(\n        q, kv_fused, weights, qo_indptr, kv_indptr, block_table, math_mode\n    )\n    for row, scores in enumerate(score_rows):\n        valid_count = min(top_k, scores.numel())\n        indices = actual[row, :valid_count].long()\n        if (indices < 0).any() or (indices >= scores.numel()).any():\n            return False\n        if torch.unique(indices).numel() != valid_count:\n            return False\n        if scores.numel() < top_k:\n            if not torch.equal(\n                torch.sort(indices).values,\n                torch.arange(scores.numel(), device=indices.device),\n            ):\n                return False\n            if not bool((actual[row, valid_count:] == -1).all()):\n                return False\n            continue\n        kth = torch.topk(scores, top_k).values[-1]\n        tolerance = atol + rtol * kth.abs()\n        if (scores[indices] < kth - tolerance).any():\n            return False\n    return True\n",
+  "init": "from __future__ import annotations\nimport math\nimport torch\n\n# ----- shared init helpers -----\n# Copyright (c) 2025 by FlashInfer team.\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#   http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\n\n\"\"\"Shared helpers used by ``TraceTemplate.init`` functions.\n\nThis module contains the small set of input-construction patterns that\nrecur across many templates (paged-KV cache index arrays, ragged indptr,\nRoPE pos_ids and cos/sin caches, sampling probs). Each helper is short and\ndocumented; init functions in ``templates/<category>.py`` call into here so\nthe per-template init bodies stay focused on shape/dtype, not boilerplate.\n\nThe full source of this module is **inlined into every dumped JSON's\n``\"init\"`` field** by ``flashinfer/trace/template.py:_render_init_source``,\nso downstream consumers don't need flashinfer installed to re-run the init\nsnippets.\n\"\"\"\n\n\nfrom typing import Optional, Tuple\n\nimport torch\n\n\ndef make_paged_kv_indices(\n    batch_size: int,\n    num_pages_per_seq: int,\n    page_size: int,\n    *,\n    device: str = \"cuda\",\n) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:\n    \"\"\"Return ``(kv_indptr, kv_indices, kv_last_page_len)`` for a uniform batch.\n\n    Every sequence is assigned exactly ``num_pages_per_seq`` pages, fully\n    populated (last-page length == page_size).\n\n    Invariants\n    ----------\n    - ``kv_indptr.shape == (batch_size + 1,)``, dtype int32, monotonic, [0]=0.\n    - ``kv_indices == arange(0, batch_size * num_pages_per_seq)``, int32.\n    - ``kv_last_page_len == full(batch_size, page_size)``, int32.\n    \"\"\"\n    total_pages = batch_size * num_pages_per_seq\n    kv_indptr = (\n        torch.arange(batch_size + 1, dtype=torch.int32, device=device)\n        * num_pages_per_seq\n    )\n    kv_indices = torch.arange(total_pages, dtype=torch.int32, device=device)\n    kv_last_page_len = torch.full(\n        (batch_size,), page_size, dtype=torch.int32, device=device\n    )\n    return kv_indptr, kv_indices, kv_last_page_len\n\n\ndef make_ragged_indptr(\n    seg_lens,\n    *,\n    device: str = \"cuda\",\n    dtype: torch.dtype = torch.int32,\n) -> torch.Tensor:\n    \"\"\"Return cumulative-sum ``indptr`` of length ``len(seg_lens)+1``.\n\n    ``seg_lens`` may be a list / tuple / 1-D tensor of segment lengths.\n    \"\"\"\n    if isinstance(seg_lens, torch.Tensor):\n        lens = seg_lens.to(device=device, dtype=dtype)\n    else:\n        lens = torch.tensor(list(seg_lens), dtype=dtype, device=device)\n    indptr = torch.zeros(lens.numel() + 1, dtype=dtype, device=device)\n    indptr[1:] = torch.cumsum(lens, dim=0).to(dtype)\n    return indptr\n\n\ndef make_uniform_qo_indptr(\n    batch_size: int,\n    qo_len: int,\n    *,\n    device: str = \"cuda\",\n) -> torch.Tensor:\n    \"\"\"Return ``[0, qo_len, 2*qo_len, ..., batch_size*qo_len]`` int32.\"\"\"\n    return torch.arange(batch_size + 1, dtype=torch.int32, device=device) * qo_len\n\n\ndef make_pos_ids(\n    nnz: int,\n    max_seq_len: Optional[int] = None,\n    *,\n    device: str = \"cuda\",\n) -> torch.Tensor:\n    \"\"\"Return ``[0, 1, ..., nnz-1] (% max_seq_len)`` as int32 on ``device``.\n\n    If ``max_seq_len`` is None, no wrapping is applied.\n    \"\"\"\n    pos = torch.arange(nnz, dtype=torch.int32, device=device)\n    if max_seq_len is not None:\n        pos = pos % max_seq_len\n    return pos\n\n\ndef make_rope_cos_sin_cache(\n    max_seq_len: int,\n    rope_dim: int,\n    *,\n    base: float = 1e4,\n    device: str = \"cuda\",\n    dtype: torch.dtype = torch.float32,\n) -> torch.Tensor:\n    \"\"\"Return concatenated ``[cos | sin]`` cache of shape ``[max_seq_len, rope_dim]``.\"\"\"\n    t = torch.arange(max_seq_len, dtype=torch.float32, device=device)\n    inv = 1.0 / (\n        base\n        ** (torch.arange(0, rope_dim, 2, dtype=torch.float32, device=device) / rope_dim)\n    )\n    freqs = t.unsqueeze(-1) * inv.unsqueeze(0)\n    cache = torch.cat([torch.cos(freqs), torch.sin(freqs)], dim=-1)\n    return cache.to(dtype)\n\n\ndef make_probs(\n    batch_size: int,\n    vocab_size: int,\n    *,\n    device: str = \"cuda\",\n    dtype: torch.dtype = torch.float32,\n) -> torch.Tensor:\n    \"\"\"Return a ``[batch_size, vocab_size]`` probability distribution.\n\n    Uses ``softmax(randn(...))`` so each row sums to 1.0. This mirrors the\n    pattern used throughout ``tests/utils/test_sampling.py``.\n    \"\"\"\n    return torch.softmax(\n        torch.randn(batch_size, vocab_size, dtype=torch.float32, device=device),\n        dim=-1,\n    ).to(dtype)\n\n\ndef make_logits(\n    batch_size: int,\n    vocab_size: int,\n    *,\n    device: str = \"cuda\",\n    dtype: torch.dtype = torch.float32,\n) -> torch.Tensor:\n    \"\"\"Return ``randn(batch_size, vocab_size)`` logits.\"\"\"\n    return torch.randn(batch_size, vocab_size, dtype=dtype, device=device)\n\n\ndef fp8_safe_randn(\n    *shape: int,\n    scale: float = 0.1,\n    device: str = \"cuda\",\n    dtype: torch.dtype = torch.bfloat16,\n) -> torch.Tensor:\n    \"\"\"``randn(*shape) * scale`` \u2014 keeps values in the FP8/FP4 representable range.\n\n    Tests for fp8/fp4 paths typically multiply ``randn`` by 0.1 to avoid\n    saturation when quantizing. Use this helper to mirror that convention.\n    \"\"\"\n    return (torch.randn(*shape, dtype=dtype, device=device) * scale).to(dtype)\n\n\ndef per_tensor_fp8_quantize(\n    x: torch.Tensor,\n    *,\n    fp8_dtype: torch.dtype = torch.float8_e4m3fn,\n) -> Tuple[torch.Tensor, torch.Tensor]:\n    \"\"\"Per-tensor FP8 quantization, mirroring ``tests/utils_fp8.py:to_float8``.\n\n    Returns ``(x_fp8, inv_scale)`` where ``inv_scale`` is the dequant\n    multiplier (``float \u2248 fp8 * inv_scale``).\n    \"\"\"\n    finfo = torch.finfo(fp8_dtype)\n    amax = x.abs().amax().clamp(min=1e-12)\n    scale = finfo.max / amax\n    x_q = (x.float() * scale).clamp(min=finfo.min, max=finfo.max).to(fp8_dtype)\n    return x_q, scale.float().reciprocal()\n\n\ndef fp8_block_quant_1d(\n    x_bf16: torch.Tensor,\n    block: int = 128,\n) -> Tuple[torch.Tensor, torch.Tensor]:\n    \"\"\"Quantize ``[T, H]`` activations into FP8 with per-``(token, block)``\n    column-block scales. Returns ``(x_fp8, scales)`` where\n    ``scales`` has shape ``[T, H // block]``.\n\n    Mirrors ``_fp8_block_quant_1d`` in\n    ``tests/moe/test_dpsk_fused_moe_fp8.py``.\n    \"\"\"\n    assert x_bf16.dim() == 2\n    T, H = x_bf16.shape\n    assert H % block == 0\n    nb = H // block\n    finfo = torch.finfo(torch.float8_e4m3fn)\n    max_fp8 = finfo.max\n    x_f32 = x_bf16.to(torch.float32)\n    x_fp8 = torch.empty((T, H), dtype=torch.float8_e4m3fn, device=x_bf16.device)\n    scales = torch.empty((T, nb), dtype=torch.float32, device=x_bf16.device)\n    for j in range(nb):\n        sl = slice(j * block, (j + 1) * block)\n        blk = x_f32[:, sl]\n        amax = torch.amax(torch.abs(blk), dim=1)\n        s = torch.where(amax > 0, amax / max_fp8, torch.ones_like(amax))\n        x_fp8[:, sl] = (blk / s.unsqueeze(1)).to(torch.float8_e4m3fn)\n        scales[:, j] = s\n    return x_fp8, scales\n\n\ndef fp8_block_quant_2d(\n    w_bf16: torch.Tensor,\n    block: int = 128,\n) -> Tuple[torch.Tensor, torch.Tensor]:\n    \"\"\"Quantize weights ``[..., R, C]`` with 2-D ``block \u00d7 block`` scales.\n\n    Returns ``(w_fp8, scales)`` where ``scales`` has shape\n    ``[..., R // block, C // block]``. Mirrors ``_fp8_block_quant_2d`` in\n    ``tests/moe/test_dpsk_fused_moe_fp8.py``.\n    \"\"\"\n    assert w_bf16.dim() >= 2\n    *prefix, R, C = w_bf16.shape\n    assert R % block == 0 and C % block == 0\n    nb_r, nb_c = R // block, C // block\n    finfo = torch.finfo(torch.float8_e4m3fn)\n    max_fp8 = finfo.max\n    w_f32 = w_bf16.to(torch.float32).contiguous()\n    prefix_ndim = len(prefix)\n    reshaped = w_f32.reshape(*prefix, nb_r, block, nb_c, block)\n    permute_dims = tuple(range(prefix_ndim)) + (\n        prefix_ndim,\n        prefix_ndim + 2,\n        prefix_ndim + 1,\n        prefix_ndim + 3,\n    )\n    blocks = reshaped.permute(permute_dims).contiguous()\n    amax = torch.amax(torch.abs(blocks), dim=(-1, -2))\n    scales = torch.where(\n        amax > 0, amax / max_fp8, torch.ones_like(amax, dtype=torch.float32)\n    )\n    q_blocks = (blocks / scales.unsqueeze(-1).unsqueeze(-1)).to(torch.float8_e4m3fn)\n    inv_permute = [0] * (prefix_ndim + 4)\n    for i, p in enumerate(permute_dims):\n        inv_permute[p] = i\n    w_fp8 = q_blocks.permute(*inv_permute).reshape(*prefix, R, C).contiguous()\n    return w_fp8, scales\n\n\n__all__ = [\n    \"make_paged_kv_indices\",\n    \"make_ragged_indptr\",\n    \"make_uniform_qo_indptr\",\n    \"make_pos_ids\",\n    \"make_rope_cos_sin_cache\",\n    \"make_probs\",\n    \"make_logits\",\n    \"fp8_safe_randn\",\n    \"per_tensor_fp8_quantize\",\n    \"fp8_block_quant_1d\",\n    \"fp8_block_quant_2d\",\n]\n\n# ----- init dependencies -----\ndef _make_paged_block_table(seq_lens, block_size, device):\n    \"\"\"Random paged block table + total block count for a batch of seq_lens.\n\n    Natural width -- ceil(max(seq_lens) / block_size), one entry per KV block a\n    request occupies, i.e. the table a paged-KV serving stack already keeps.  The\n    kernels predicate every block-table read on the row's own block count, so no\n    padding columns are needed; a shorter row's trailing entries (zeros here) are\n    never read.\"\"\"\n    n_blk = (seq_lens + block_size - 1) // block_size\n    total = int(n_blk.sum().item()) + seq_lens.shape[0] * 2\n    max_blk = int(n_blk.max().item())\n    block_tables = torch.zeros(\n        (seq_lens.shape[0], max_blk), dtype=torch.int32, device=device\n    )\n    pool = torch.randperm(total, device=device, dtype=torch.int32)\n    off = 0\n    for i, nb in enumerate(n_blk.tolist()):\n        block_tables[i, :nb] = pool[off : off + nb]\n        off += nb\n    return block_tables, total\n\ndef _pack_fused_kv_fp8(kv_fp8, kv_scales, block_size, head_dim):\n    \"\"\"Pack fp8 KV + per-token fp32 scales into the fused layout used by the kernel:\n    per physical block = [all KV bytes (block_size*D)] [all scale bytes (block_size*4)].\"\"\"\n    num_blocks = kv_fp8.shape[0]\n    scale_offset = block_size * head_dim\n    fused = torch.zeros(\n        num_blocks,\n        block_size * (head_dim + 4),\n        dtype=torch.uint8,\n        device=kv_fp8.device,\n    )\n    for blk in range(num_blocks):\n        fused[blk, :scale_offset] = kv_fp8[blk].view(torch.uint8).reshape(-1)\n        fused[blk, scale_offset:] = (\n            kv_scales[blk].float().contiguous().view(torch.uint8).reshape(-1)\n        )\n    return fused.view(num_blocks, block_size, 1, head_dim + 4)\n\n# ----- init -----\ndef _fp8_paged_mqa_selective_topk_init(\n    *,\n    total_q: int = 16,\n    batch_size: int = 1,\n    num_heads: int = 8,\n    head_dim: int = 128,\n    page_size: int = 64,\n    max_kv_len: int = 8192,\n    top_k: int = 512,\n    num_pages: int = 0,\n    max_pages_per_request: int = 0,\n    batch_plus_one: int = 0,\n    num_kv_heads: int = 1,\n    block_row_bytes: int = 0,\n    device: str = \"cuda\",\n    seed: int = 0,\n):\n    \"\"\"Build a full FP8 score-to-TopK wrapper invocation.\"\"\"\n    del num_pages, max_pages_per_request, batch_plus_one, block_row_bytes\n    if num_kv_heads != 1:\n        raise ValueError(\"selective FP8 MQA trace requires num_kv_heads=1\")\n    if total_q < batch_size or max_kv_len < (total_q + batch_size - 1) // batch_size:\n        raise ValueError(\"trace shape requires at least one causal KV row per query\")\n\n    torch.manual_seed(seed)\n    base = total_q // batch_size\n    remainder = total_q % batch_size\n    q_lengths = [base + (request < remainder) for request in range(batch_size)]\n    q_prefix = [0]\n    for length in q_lengths:\n        q_prefix.append(q_prefix[-1] + length)\n    qo_indptr = torch.tensor(q_prefix, dtype=torch.int32, device=device)\n    kv_indptr = (\n        torch.arange(batch_size + 1, dtype=torch.int32, device=device) * max_kv_len\n    )\n    context_lens = torch.full(\n        (batch_size,), max_kv_len, dtype=torch.int32, device=device\n    )\n    block_table, physical_pages = _make_paged_block_table(\n        context_lens, page_size, device\n    )\n    q = (torch.randn(total_q, num_heads, head_dim, device=device) * 0.1).to(\n        torch.float8_e4m3fn\n    )\n    kv = (torch.randn(physical_pages, page_size, head_dim, device=device) * 0.1).to(\n        torch.float8_e4m3fn\n    )\n    scales = torch.rand(\n        physical_pages, page_size, dtype=torch.float32, device=device\n    ).add_(0.5)\n    kv_fused = _pack_fused_kv_fp8(kv, scales, page_size, head_dim)\n    weights = torch.randn(total_q, num_heads, dtype=torch.float32, device=device)\n    return {\n        \"constructor\": {\n            \"strategy\": \"full\",\n            \"num_heads\": num_heads,\n            \"head_dim\": head_dim,\n            \"page_size\": page_size,\n            \"top_k\": top_k,\n            \"max_context_length\": max_kv_len,\n            \"max_chunk_size\": total_q,\n            \"max_batch_size\": batch_size,\n            \"kv_layout\": kv_fused,\n        },\n        \"plan\": {\n            \"qo_indptr\": qo_indptr,\n            \"kv_indptr\": kv_indptr,\n            \"block_table\": block_table,\n            \"num_query_rows\": total_q,\n        },\n        \"run\": {\n            \"q\": q,\n            \"kv_fused\": kv_fused,\n            \"weights\": weights,\n        },\n    }\n"
+}

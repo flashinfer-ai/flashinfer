@@ -70,7 +70,7 @@ Epilogue dtype flows (--acc_dtype / --epi_dtype):
   Default: --acc_dtype fp32 --epi_dtype fp32 --output_dtype fp32
 """
 
-from typing import Tuple
+from typing import Any, Tuple
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -86,9 +86,27 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
+from .._fp8_mqa_constants import _EPI_UNROLL
+from .._math_policy import _MathMode, _validate_math_mode
+
 # CuTe DSL CUDA 13 validates rounding modes as string literals. The string
 # form is also accepted by older wrappers, so keep it version-independent.
 _RND_RN = "rn"
+
+
+@dsl_user_op
+def abs_f32(a: cutlass.Float32, *, loc=None, ip=None) -> cutlass.Float32:
+    """Keep the packed fast-ReLU absolute operand visible to code generation."""
+    return cutlass.Float32(
+        llvm.inline_asm(
+            cutlass.Float32.mlir_type,
+            [cutlass.Float32(a).ir_value(loc=loc, ip=ip)],
+            "abs.f32 $0, $1;",
+            "=f,f",
+            loc=loc,
+            ip=ip,
+        )
+    )
 
 
 @dsl_user_op
@@ -108,26 +126,6 @@ def relu_f32(a: cutlass.Float32, *, loc=None, ip=None) -> cutlass.Float32:
             ip=ip,
         )
     )
-
-
-# Epilogue FMA unroll. NUM_W_IN_REG is the split point between the register
-# and SMEM weight paths, both unrolled this wide, so it must stay a multiple
-# of it -- otherwise the two paths stop tiling the subtile and the epilogue
-# reads past it. Mirrors _EPI_SUBTILE_UNROLL in attn_scores.py, which applies
-# the same granularity to num_heads // num_epi_subtiles.
-_EPI_UNROLL = 4
-# Default register budget per math thread for the epilogue weight cache. 160
-# is the largest footprint the per-slot policy below requests at the shape
-# the kernel was tuned for (num_heads=64, next_n=4), so it leaves every
-# num_heads=64 configuration unchanged. The constructor's w_cache_regs
-# overrides it so the API's internal per-shape policy can lower it where the
-# default spills: at num_heads=32, next_n=6 the default caches 24 weights per
-# slot (144 registers) and Nsight Compute shows ~12k local loads / ~8k local
-# stores per launch; 96 registers (16 per slot) removes every spill and runs
-# 8-15% (B200) / 11-35% (Rubin) faster; next_n=5, 7 and 8 spill the same way
-# under the default and gain up to 24%, 9% and 29% on B200 (37% on Rubin at
-# 8).  See _fp8_epilogue_policy in attn_scores.py for the measured table.
-_MAX_W_CACHE_REGS = 160
 
 
 @dsl_user_op
@@ -237,6 +235,20 @@ def add_f16x2(
     )
 
 
+# Default register budget per math thread for the epilogue weight cache. 160
+# is the largest footprint the per-slot policy in the engine requests at the shape
+# the kernel was tuned for (num_heads=64, next_n=4), so it leaves every
+# num_heads=64 configuration unchanged. The constructor's w_cache_regs
+# overrides it so the API's internal per-shape policy can lower it where the
+# default spills: at num_heads=32, next_n=6 the default caches 24 weights per
+# slot (144 registers) and Nsight Compute shows ~12k local loads / ~8k local
+# stores per launch; 96 registers (16 per slot) removes every spill and runs
+# 8-15% (B200) / 11-35% (Rubin) faster; next_n=5, 7 and 8 spill the same way
+# under the default and gain up to 24%, 9% and 29% on B200 (37% on Rubin at
+# 8).  See _fp8_epilogue_policy in attn_scores.py for the measured table.
+_MAX_W_CACHE_REGS = 160
+
+
 def _arch_major_minor(arch: str) -> "tuple[int, int]":
     """Parse a codegen arch string (``"sm_107a"``, ``"sm_100f"``, ``"sm_100"``)
     into its compute-capability ``(major, minor)`` pair, e.g. ``(10, 7)``."""
@@ -265,7 +277,2185 @@ def _is_rubin_arch(arch: str) -> bool:
     return major == 10 and minor >= 7
 
 
-class FP8MQALogitsKernel:
+class _FP8MQALayoutMixin:
+    head_dim: int
+    mma_tiler_mn: tuple[int, int]
+    cluster_shape_mn: tuple[int, int]
+    num_kv_stages: int
+    num_q_stages: int
+    num_groups: int
+    num_umma_stages: int
+
+    def _setup_mma_layout(self, tiled_mma, a_dtype, b_dtype):
+        mma_inst_shape_k = cute.size(tiled_mma.shape_mnk, mode=[2])  # 32
+
+        # Full-K: tile K = head_dim (128), 1 TMA per block
+        mma_inst_tile_k = self.head_dim // mma_inst_shape_k  # 4
+        full_k = mma_inst_shape_k * mma_inst_tile_k  # 128
+        self.mma_tiler = (
+            self.mma_tiler_mn[0],
+            self.mma_tiler_mn[1],
+            full_k,
+        )
+
+        self.cta_tile_shape_mnk = (
+            self.mma_tiler[0] // cute.size(tiled_mma.thr_id.shape),
+            self.mma_tiler[1],
+            self.mma_tiler[2],
+        )
+        self.cluster_layout_vmnk = cute.tiled_divide(
+            cute.make_layout((*self.cluster_shape_mn, 1)),
+            (tiled_mma.thr_id.shape,),
+        )
+        self.epi_tile = self.cta_tile_shape_mnk[:2]
+
+        # Each KV stage per group holds the full compute tile.
+        self.a_smem_layout_staged = sm100_utils.make_smem_layout_a(
+            tiled_mma,
+            self.mma_tiler,
+            a_dtype,
+            self.num_kv_stages,
+        )
+        # Each Q stage holds full [N, head_dim].
+        self.b_smem_layout_staged = sm100_utils.make_smem_layout_b(
+            tiled_mma,
+            self.mma_tiler,
+            b_dtype,
+            self.num_q_stages,
+        )
+
+        acc_shape = tiled_mma.partition_shape_C(self.mma_tiler[:2])
+        tCtAcc_fake = tiled_mma.make_fragment_C(acc_shape)
+        self.num_tmem_alloc_cols = utils.get_num_tmem_alloc_cols(tCtAcc_fake)
+        self.num_tmem_alloc_cols_total = (
+            self.num_tmem_alloc_cols * self.num_groups * self.num_umma_stages
+        )
+        return tiled_mma
+
+
+class _FP8MQAEngineMixin(_FP8MQALayoutMixin):
+    """Shared TMA, UMMA, math/TMEM and selective store-role lifecycles.
+
+    Ordinary and selective kernels retain their own construction, storage and
+    launch interfaces. Compile-time policies preserve their distinct geometry,
+    warp roles, numerical reductions and output publication.
+    State declarations are annotation-only; each kernel populates configuration,
+    MMA layout and TMA transfer sizes before launch.
+    """
+
+    # Ordinary-only metadata flag; selective subclasses retain their own ABI.
+    explicit_query_bounds: bool = False
+    a_dtype: Any
+    _math_mode: _MathMode
+    acc_dtype: Any
+    b_dtype: Any
+    N: int
+    block_kv: int
+    early_tmem_copy: bool
+    epi_dtype: Any
+    next_n: int
+    num_blocks_per_mma: int
+    num_epi_subtiles: int
+    num_heads: int
+    num_kv_scale_tma_bytes: int
+    num_math_threads: int
+    num_math_warps: int
+    num_q_tma_bytes: int
+    output_dtype: Any
+    phys_block_kv: int
+    remove_kv_wait_in_epilogue: bool
+    smem_pad_bytes: int
+    use_flat_logits_view: bool
+    output_index_bits: int
+    use_paired_pipeline_polls: bool
+    use_two_level_task_loop: bool
+    w_cache_regs: int
+
+    # Request-tiled consumers supply these pure policies. Ordinary roles
+    # compile out their calls and retain their own reduction/view policy.
+    _request_math_fragment: Any
+    _make_math_tmem_copy_and_partition: Any
+
+    _engine_relu_f32 = staticmethod(relu_f32)
+
+    @cute.jit
+    def _wait_for_tmem(self, tmem):
+        """Ordinary roles retain the allocator's synchronization policy."""
+        tmem.wait_for_alloc()
+
+    @property
+    def math_mode(self) -> _MathMode:
+        """Constructor-fixed FP32 epilogue policy; FP16 arithmetic is unchanged."""
+        return self._math_mode
+
+    @cute.jit
+    def _release_kv_after_scale_use(self, kv_pipeline, kv_cons_state):
+        """Release the KV generation at its consumer's final scale-use site."""
+        # Ordinary scale loads precede this arrival in program order; the
+        # producer waits for the arrival before reusing the shared stage.
+        kv_pipeline.consumer_release(kv_cons_state)
+        kv_cons_state.advance()
+        return kv_cons_state
+
+    @cute.jit
+    def _lookup_fp8_page(
+        self,
+        mBlockTable,
+        mSamplePages,
+        request,
+        page,
+        internal_sample: cutlass.Constexpr,
+    ):
+        """Pure guarded-ingress adapter; callers own page-tail eligibility.
+
+        An internal sample page is a logical index into the original table,
+        never a physical ID to clamp. Keep the existing missing-slot fallback
+        and leave invalid live metadata to the existing host validation.
+        """
+        if cutlass.const_expr(internal_sample):
+            logical_page = cutlass.Int32(0)
+            if page < mSamplePages.shape[1]:
+                logical_page = cutlass.Int32(mSamplePages[(request, page)])
+            page = logical_page
+        return mBlockTable[(request, page)]
+
+    @cute.jit
+    def _accumulate_fp32_heads(self, acc, acc_base, weights, weight_coords, sums):
+        """Pure four-head reduction step; no pipeline or stage transitions.
+
+        The consumer binds its existing ReLU implementation statically. The
+        caller retains row/head mapping and final summation association.
+        """
+        if cutlass.const_expr(self.math_mode == "relu_fast"):
+            # Compensated once in _math_scale_value, never in a publisher.
+            # Explicit FP32 conversion also preserves FP16-acc/FP32-epi support.
+            v0 = cutlass.Float32(acc[acc_base])
+            v1 = cutlass.Float32(acc[acc_base + 1])
+            v2 = cutlass.Float32(acc[acc_base + 2])
+            v3 = cutlass.Float32(acc[acc_base + 3])
+            a0, a1 = cute.arch.add_packed_f32x2((v0, v1), (abs_f32(v0), abs_f32(v1)))
+            a2, a3 = cute.arch.add_packed_f32x2((v2, v3), (abs_f32(v2), abs_f32(v3)))
+        else:
+            # relu as one FMNMX per head (`max.NaN.f32`): exact and range-safe for
+            # every finite accumulator (the (x + |x|) / 2 form it replaces overflowed
+            # for x >= 2^127, reachable through unbounded scales / weights), NaN-
+            # propagating like the scalar max, one instruction per head. Weights are
+            # applied unscaled. Ported from DKG MR !27837, range-safe form.
+            a0 = self._engine_relu_f32(acc[acc_base])
+            a1 = self._engine_relu_f32(acc[acc_base + 1])
+            a2 = self._engine_relu_f32(acc[acc_base + 2])
+            a3 = self._engine_relu_f32(acc[acc_base + 3])
+        w0 = weights[weight_coords[0]]
+        w1 = weights[weight_coords[1]]
+        w2 = weights[weight_coords[2]]
+        w3 = weights[weight_coords[3]]
+        s0x, s0y = cute.arch.fma_packed_f32x2(
+            (a0, a1), (w0, w1), (sums[0], sums[1]), rnd=_RND_RN
+        )
+        s1x, s1y = cute.arch.fma_packed_f32x2(
+            (a2, a3), (w2, w3), (sums[2], sums[3]), rnd=_RND_RN
+        )
+        return s0x, s0y, s1x, s1y
+
+    @cute.jit
+    def _issue_paged_kv_tile(
+        self,
+        kv_pipeline,
+        kv_prod_state,
+        phys_blks,
+        tma_atom_a,
+        tAgA,
+        tAsA,
+        tma_atom_s,
+        tSgS,
+        tSsS,
+        a_mcast_mask,
+    ):
+        """Own one merged KV/scale producer generation after guarded ingress.
+
+        Physical IDs are resolved by the consumer's ingress policy before this
+        call. Acquiring and advancing the ring remain execution-engine work;
+        the page adapter cannot change stage ownership.
+        """
+        kv_pipeline.producer_acquire(kv_prod_state)
+        bar = kv_pipeline.producer_get_barrier(kv_prod_state)
+        stage = kv_prod_state.index
+        for i in cutlass.range_constexpr(self.num_blocks_per_mma):
+            cute.copy(
+                tma_atom_a,
+                tAgA[(None, 0, 0, phys_blks[i])],
+                tAsA[(None, i, stage)],
+                tma_bar_ptr=bar,
+                mcast_mask=a_mcast_mask,
+            )
+            cute.copy(
+                tma_atom_s,
+                tSgS[(None, 0, phys_blks[i])],
+                tSsS[(None, i, stage)],
+                tma_bar_ptr=bar,
+            )
+        kv_prod_state.advance()
+        return kv_prod_state
+
+    @cute.jit
+    def _issue_umma_group(
+        self,
+        tiled_mma,
+        tCrA,
+        tCrB,
+        tCtAcc_base,
+        q_stage,
+        kv_pipeline,
+        kv_cons_state,
+        umma_pipeline,
+        umma_prod_state,
+        paired_poll: cutlass.Constexpr,
+    ):
+        """Issue one group; math, not UMMA, owns the KV-stage release.
+
+        The caller owns Q readiness and task traversal. In the existing single
+        producer SAMPLE policy it calls this twice, group0 then group1, before
+        advancing the task. Ordinary retains independent producer roles and
+        plain waits. Keep all KV/UMMA generation transitions explicit here.
+        """
+        if cutlass.const_expr(paired_poll):
+            kv_ready = kv_pipeline.consumer_try_wait(kv_cons_state)
+            umma_empty = umma_pipeline.producer_try_acquire(umma_prod_state)
+            kv_pipeline.consumer_wait(kv_cons_state, kv_ready)
+            umma_pipeline.producer_acquire(umma_prod_state, umma_empty)
+        else:
+            kv_pipeline.consumer_wait(kv_cons_state)
+            umma_pipeline.producer_acquire(umma_prod_state)
+        tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
+        kv_stage = kv_cons_state.index
+        tCtAcc = tCtAcc_base[(None, None, None, umma_prod_state.index)]
+        for k_block in cutlass.range_constexpr(cute.size(tCrA.shape[2])):
+            cute.gemm(
+                tiled_mma,
+                tCtAcc,
+                tCrA[None, None, k_block, kv_stage],
+                tCrB[None, None, k_block, q_stage],
+                tCtAcc,
+            )
+            tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+        # No consumer_release here: the math role still needs shared scales.
+        kv_cons_state.advance()
+        umma_pipeline.producer_commit(umma_prod_state)
+        umma_prod_state.advance()
+        # Atom.set mutates trait IR too. Return/rebind the MMA as a plain local
+        # so staged loops/branches carry it explicitly, just like ring states.
+        return tiled_mma, kv_cons_state, umma_prod_state
+
+    @cute.jit
+    def _run_umma_role(
+        self,
+        mContextLens,
+        batch_size,
+        block_kv_val,
+        end_q_idx,
+        end_kv_idx,
+        next_q_idx,
+        next_kv_idx,
+        next_num_kv,
+        q_idx,
+        has_work,
+        is_leader_cta,
+        q_pipeline,
+        q_cons_state,
+        kv_pipeline_0,
+        kv_cons_state_0,
+        umma_pipeline_0,
+        umma_prod_state_0,
+        tCrA_0,
+        tCrB,
+        tiled_mma,
+        tmem,
+        tCtAcc_fake_staged,
+        group_0_offset,
+        paired_poll: cutlass.Constexpr,
+        serial_pair: cutlass.Constexpr,
+        tCrA_1=None,
+        kv_pipeline_1=None,
+        kv_cons_state_1=None,
+        umma_pipeline_1=None,
+        umma_prod_state_1=None,
+        group_1_offset=0,
+    ):
+        """Own one producer role's Q generations, task cursor and UMMA rings.
+
+        Ordinary calls once per independent producer warp. SAMPLE calls once
+        with serial_pair, committing group 0 before group 1 on the same Q
+        stage. Register budgeting and initial state placement remain in the
+        entry wrapper; all states die at the end of this complete role.
+        """
+        self._wait_for_tmem(tmem)
+        tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
+        tCtAcc_base_0 = cute.make_tensor(
+            tmem_ptr + group_0_offset, tCtAcc_fake_staged.layout
+        )
+        if cutlass.const_expr(serial_pair):
+            tCtAcc_base_1 = cute.make_tensor(
+                tmem_ptr + group_1_offset, tCtAcc_fake_staged.layout
+            )
+
+        if is_leader_cta:
+            q_stage = cutlass.Int32(0)
+            while has_work:
+                q_idx_old = q_idx
+                q_idx = next_q_idx
+                kv_idx = next_kv_idx
+                num_kv = next_num_kv
+
+                # Q visibility is independent of KV TMA completion. Math owns
+                # the Q release; each producer only observes its generation.
+                # In particular, ordinary warp 11 receives only KV1 from TMA
+                # warp 9: KV1 readiness cannot certify Q SMEM visibility.
+                if q_idx != q_idx_old:
+                    if q_idx_old < batch_size:
+                        q_cons_state.advance()
+                    q_pipeline.consumer_wait(q_cons_state)
+                    q_stage = q_cons_state.index
+
+                # Explicit MMA SSA propagation also crosses this role helper:
+                # a mutated trait must not escape into a sibling DSL region.
+                # UMMA remains unconditional for the aligned KV pair: an OOB
+                # half computes padding data, whose output eligibility is
+                # still controlled by the unchanged math epilogue.
+                tiled_mma, kv_cons_state_0, umma_prod_state_0 = self._issue_umma_group(
+                    tiled_mma,
+                    tCrA_0,
+                    tCrB,
+                    tCtAcc_base_0,
+                    q_stage,
+                    kv_pipeline_0,
+                    kv_cons_state_0,
+                    umma_pipeline_0,
+                    umma_prod_state_0,
+                    paired_poll,
+                )
+                if cutlass.const_expr(serial_pair):
+                    tiled_mma, kv_cons_state_1, umma_prod_state_1 = (
+                        self._issue_umma_group(
+                            tiled_mma,
+                            tCrA_1,
+                            tCrB,
+                            tCtAcc_base_1,
+                            q_stage,
+                            kv_pipeline_1,
+                            kv_cons_state_1,
+                            umma_pipeline_1,
+                            umma_prod_state_1,
+                            paired_poll,
+                        )
+                    )
+
+                next_kv_idx = kv_idx + 2
+                if next_kv_idx >= num_kv:
+                    next_q_idx = q_idx + 1
+                    next_kv_idx = 0
+                    if next_q_idx < batch_size:
+                        next_num_kv = (
+                            mContextLens[next_q_idx] + block_kv_val - 1
+                        ) // block_kv_val
+                    # Keep the exact CTA boundary reachable while skipping
+                    # empty rows; SAMPLE lengths count sampled slots here.
+                    while (
+                        (next_num_kv == 0)
+                        & (next_q_idx < batch_size)
+                        & ((next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx))
+                    ):
+                        next_q_idx = next_q_idx + 1
+                        if next_q_idx < batch_size:
+                            next_num_kv = (
+                                mContextLens[next_q_idx] + block_kv_val - 1
+                            ) // block_kv_val
+                has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
+        if cutlass.const_expr(serial_pair):
+            return (
+                tiled_mma,
+                q_cons_state,
+                kv_cons_state_0,
+                umma_prod_state_0,
+                kv_cons_state_1,
+                umma_prod_state_1,
+            )
+        else:
+            return tiled_mma, q_cons_state, kv_cons_state_0, umma_prod_state_0
+
+    @cute.jit
+    def _tma_q_source_views(
+        self,
+        q_idx,
+        request_tiled: cutlass.Constexpr,
+        mTileMeta,
+        mB_nkl,
+        mW_tma,
+        thr_mma,
+        sQ,
+        sW,
+        tma_atom_b,
+        tma_atom_w,
+        tBgB,
+        tWgW,
+    ):
+        """Select ingress views only; the role owns Q/W barrier transitions."""
+        if cutlass.const_expr(request_tiled):
+            query_start = mTileMeta[(q_idx, 0)]
+            shifted_b = cute.domain_offset((query_start * self.num_heads, 0, 0), mB_nkl)
+            shifted_gB = cute.local_tile(
+                shifted_b,
+                cute.slice_(self.mma_tiler, (0, None, None)),
+                (None, None, None),
+            )
+            shifted_tCgB = thr_mma.partition_B(shifted_gB)
+            _, shifted_tBgB = cpasync.tma_partition(
+                tma_atom_b,
+                0,
+                cute.make_layout(1),
+                cute.group_modes(sQ, 0, 3),
+                cute.group_modes(shifted_tCgB, 0, 3),
+            )
+            shifted_w = cute.domain_offset((query_start, 0), mW_tma)
+            shifted_gW = cute.local_tile(
+                shifted_w, (self.next_n, self.num_heads), (None, None)
+            )
+            _, shifted_tWgW = cpasync.tma_partition(
+                tma_atom_w,
+                0,
+                cute.make_layout(1),
+                cute.group_modes(sW, 0, 2),
+                cute.group_modes(shifted_gW, 0, 2),
+            )
+            return shifted_tBgB[(None, 0, 0, 0)], shifted_tWgW[(None, 0, 0)]
+        else:
+            return tBgB[(None, 0, q_idx)], tWgW[(None, q_idx)]
+
+    @cute.jit
+    def _run_tma_role(
+        self,
+        mContextLens,
+        batch_size,
+        block_kv_val,
+        end_q_idx,
+        end_kv_idx,
+        next_q_idx,
+        next_kv_idx,
+        next_num_kv,
+        q_idx,
+        has_work,
+        tidx,
+        kv_pipeline,
+        kv_prod_state,
+        mBlockTable,
+        mSamplePages,
+        mTileMeta,
+        tma_atom_a,
+        tAgA,
+        tAsA,
+        tma_atom_s,
+        tSgS,
+        tSsS,
+        a_mcast_mask,
+        group: cutlass.Constexpr,
+        owns_q: cutlass.Constexpr,
+        request_tiled: cutlass.Constexpr,
+        guarded_first_q: cutlass.Constexpr,
+        guarded_prefetch: cutlass.Constexpr,
+        sample_internal: cutlass.Constexpr,
+        q_pipeline=None,
+        q_prod_state=None,
+        mB_nkl=None,
+        mW_tma=None,
+        thr_mma=None,
+        sQ=None,
+        sW=None,
+        tma_atom_b=None,
+        tma_atom_w=None,
+        tBgB=None,
+        tWgW=None,
+        tBsB=None,
+        tWsW=None,
+        b_mcast_mask=None,
+    ):
+        """Own a paged TMA role's task/Q lookahead, cache and producer rings.
+
+        Entry wrappers retain register budgeting and initial state placement.
+        Group 1 statically has no Q/view access. Ordinary keeps unconditional
+        first-Q and column-only page guards; SAMPLE guards idle Q and tiles.
+        """
+        lane_idx = tidx % 32
+        cached_blks = [cutlass.Int32(0) for _ in range(self.num_blocks_per_mma)]
+        kv_blk_ptr = cutlass.Int32(32)
+
+        if cutlass.const_expr(owns_q):
+            initial_q = True
+            if cutlass.const_expr(guarded_first_q):
+                initial_q = has_work
+            # Idle SAMPLE CTAs have no valid packed query tile: construct
+            # neither its metadata-derived view nor its transaction there.
+            if initial_q:
+                q_pipeline.producer_acquire(q_prod_state)
+                q_bar = q_pipeline.producer_get_barrier(q_prod_state)
+                q_source, w_source = self._tma_q_source_views(
+                    next_q_idx,
+                    request_tiled,
+                    mTileMeta,
+                    mB_nkl,
+                    mW_tma,
+                    thr_mma,
+                    sQ,
+                    sW,
+                    tma_atom_b,
+                    tma_atom_w,
+                    tBgB,
+                    tWgW,
+                )
+                cute.copy(
+                    tma_atom_b,
+                    q_source,
+                    tBsB[(None, q_prod_state.index)],
+                    tma_bar_ptr=q_bar,
+                    mcast_mask=b_mcast_mask,
+                )
+                cute.copy(
+                    tma_atom_w,
+                    w_source,
+                    tWsW[(None, q_prod_state.index)],
+                    tma_bar_ptr=q_bar,
+                )
+                q_prod_state.advance()
+
+        while has_work:
+            q_idx_old = q_idx
+            q_idx = next_q_idx
+            kv_idx = next_kv_idx
+            num_kv = next_num_kv
+            if q_idx != q_idx_old:
+                kv_blk_ptr = cutlass.Int32(32)
+                if cutlass.const_expr(owns_q):
+                    prefetch_next = q_idx + 1
+                    # Task traversal skips zero rows. Lookahead must stage
+                    # the SAME next live Q/W; staging a skipped row silently
+                    # gives its successor wrong logits without a barrier hang.
+                    peek_ctx = cutlass.Int32(1)
+                    if prefetch_next < end_q_idx:
+                        peek_ctx = mContextLens[prefetch_next]
+                    while (peek_ctx == 0) & (prefetch_next < end_q_idx):
+                        prefetch_next = prefetch_next + 1
+                        if prefetch_next < end_q_idx:
+                            peek_ctx = mContextLens[prefetch_next]
+                        else:
+                            peek_ctx = cutlass.Int32(1)
+                    if (prefetch_next < end_q_idx) | (
+                        (prefetch_next == end_q_idx) & (end_kv_idx > 0)
+                    ):
+                        q_pipeline.producer_acquire(q_prod_state)
+                        q_bar = q_pipeline.producer_get_barrier(q_prod_state)
+                        q_source, w_source = self._tma_q_source_views(
+                            prefetch_next,
+                            request_tiled,
+                            mTileMeta,
+                            mB_nkl,
+                            mW_tma,
+                            thr_mma,
+                            sQ,
+                            sW,
+                            tma_atom_b,
+                            tma_atom_w,
+                            tBgB,
+                            tWgW,
+                        )
+                        # Q and weights share the original transaction barrier
+                        # and stage; there is no separate producer commit/tail.
+                        cute.copy(
+                            tma_atom_b,
+                            q_source,
+                            tBsB[(None, q_prod_state.index)],
+                            tma_bar_ptr=q_bar,
+                            mcast_mask=b_mcast_mask,
+                        )
+                        cute.copy(
+                            tma_atom_w,
+                            w_source,
+                            tWsW[(None, q_prod_state.index)],
+                            tma_bar_ptr=q_bar,
+                        )
+                        q_prod_state.advance()
+
+            # Each role owns a 32-lane page cache, reset on Q change or after
+            # 32 compute tiles. Shuffle the current column before issuing TMA.
+            if kv_blk_ptr == 32:
+                kv_blk_ptr = cutlass.Int32(0)
+                prefetch_kv = kv_idx + group + lane_idx * 2
+                if cutlass.const_expr(guarded_prefetch):
+                    if prefetch_kv < num_kv:
+                        page_table_row = q_idx
+                        if cutlass.const_expr(request_tiled):
+                            page_table_row = mTileMeta[(q_idx, 1)]
+                        num_phys_row = (
+                            mContextLens[q_idx] + self.phys_block_kv - 1
+                        ) // self.phys_block_kv
+                        for i in cutlass.range_constexpr(self.num_blocks_per_mma):
+                            cached_blks[i] = cutlass.Int32(0)
+                            col = prefetch_kv * self.num_blocks_per_mma + i
+                            # Guard BEFORE sample indirection/table lookup.
+                            if col < num_phys_row:
+                                cached_blks[i] = self._lookup_fp8_page(
+                                    mBlockTable,
+                                    mSamplePages,
+                                    page_table_row,
+                                    col,
+                                    sample_internal,
+                                )
+                    else:
+                        for i in cutlass.range_constexpr(self.num_blocks_per_mma):
+                            cached_blks[i] = cutlass.Int32(0)
+                else:
+                    # Natural-width tables guarantee only ceil(ctx/page)
+                    # columns, not a whole compute tile. Tail-predicate each
+                    # column before lookup; padding uses safe physical page0
+                    # and the unchanged epilogue excludes positions >=ctx.
+                    num_phys_row = (
+                        mContextLens[q_idx] + self.phys_block_kv - 1
+                    ) // self.phys_block_kv
+                    for i in cutlass.range_constexpr(self.num_blocks_per_mma):
+                        col = prefetch_kv * self.num_blocks_per_mma + i
+                        blk = cutlass.Int32(0)
+                        if col < num_phys_row:
+                            blk = self._lookup_fp8_page(
+                                mBlockTable, mSamplePages, q_idx, col, sample_internal
+                            )
+                        cached_blks[i] = blk
+            phys_blks = [cutlass.Int32(0)] * self.num_blocks_per_mma
+            for i in cutlass.range_constexpr(self.num_blocks_per_mma):
+                phys_blks[i] = cute.arch.shuffle_sync(cached_blks[i], kv_blk_ptr)
+            kv_blk_ptr = kv_blk_ptr + 1
+            kv_prod_state = self._issue_paged_kv_tile(
+                kv_pipeline,
+                kv_prod_state,
+                phys_blks,
+                tma_atom_a,
+                tAgA,
+                tAsA,
+                tma_atom_s,
+                tSgS,
+                tSsS,
+                a_mcast_mask,
+            )
+
+            next_kv_idx = kv_idx + 2
+            if next_kv_idx >= num_kv:
+                next_q_idx = q_idx + 1
+                next_kv_idx = 0
+                if next_q_idx < batch_size:
+                    next_num_kv = (
+                        mContextLens[next_q_idx] + block_kv_val - 1
+                    ) // block_kv_val
+                # Stop at the exact CTA end pair when skipping empty rows;
+                # otherwise the end coordinate could become unreachable.
+                while (
+                    (next_num_kv == 0)
+                    & (next_q_idx < batch_size)
+                    & ((next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx))
+                ):
+                    next_q_idx = next_q_idx + 1
+                    if next_q_idx < batch_size:
+                        next_num_kv = (
+                            mContextLens[next_q_idx] + block_kv_val - 1
+                        ) // block_kv_val
+            has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
+        if cutlass.const_expr(owns_q):
+            return q_prod_state, kv_prod_state
+        else:
+            return kv_prod_state
+
+    @cute.jit
+    def _ordinary_math_fragment(
+        self,
+        acc_vec,
+        sums,
+        t: cutlass.Constexpr,
+        i: cutlass.Constexpr,
+        subtile_n: cutlass.Constexpr,
+        NUM_W_IN_REG: cutlass.Constexpr,
+        num_heads: cutlass.Constexpr,
+        w_cache,
+        sW,
+        q_stage_local,
+    ):
+        """Pure per-row arithmetic; the consumer owns every stage lifetime."""
+        if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
+            ps0, ps1 = sums
+            packed_zero = pack_f16x2(Float16(0.0), Float16(0.0))
+        else:
+            s0x, s0y, s1x, s1y = sums
+        # Reg-path: weights from registers
+        reg_h_end = min(subtile_n, max(0, NUM_W_IN_REG - i * subtile_n))
+        for h in cutlass.range_constexpr(0, reg_h_end, 4):
+            n0 = h
+            h_g = i * subtile_n + h
+            if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
+                pa01 = pack_f16x2(
+                    Float16(acc_vec[n0]),
+                    Float16(acc_vec[n0 + 1]),
+                )
+                pa23 = pack_f16x2(
+                    Float16(acc_vec[n0 + 2]),
+                    Float16(acc_vec[n0 + 3]),
+                )
+                pa01 = max_f16x2(pa01, packed_zero)
+                pa23 = max_f16x2(pa23, packed_zero)
+                r0 = t * NUM_W_IN_REG + h_g
+                pw01 = pack_f16x2(w_cache[r0], w_cache[r0 + 1])
+                pw23 = pack_f16x2(w_cache[r0 + 2], w_cache[r0 + 3])
+                ps0 = fma_f16x2(pa01, pw01, ps0)
+                ps1 = fma_f16x2(pa23, pw23, ps1)
+            else:
+                # Strict uses range-safe NaN-aware max.
+                # Fast opts into packed x+abs(x), compensated once in the
+                # common scale helper; its doubled intermediates may overflow.
+                # Neither mode rescales weights or changes FMA association.
+                r0 = t * NUM_W_IN_REG + h_g
+                s0x, s0y, s1x, s1y = self._accumulate_fp32_heads(
+                    acc_vec,
+                    n0,
+                    w_cache,
+                    (r0, r0 + 1, r0 + 2, r0 + 3),
+                    (s0x, s0y, s1x, s1y),
+                )
+        # SMEM-path: weights from shared mem
+        smem_h_start = max(0, NUM_W_IN_REG - i * subtile_n)
+        for h in cutlass.range_constexpr(smem_h_start, subtile_n, 4):
+            n0 = h
+            h_g = i * subtile_n + h
+            if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
+                pa01 = pack_f16x2(
+                    Float16(acc_vec[n0]),
+                    Float16(acc_vec[n0 + 1]),
+                )
+                pa23 = pack_f16x2(
+                    Float16(acc_vec[n0 + 2]),
+                    Float16(acc_vec[n0 + 3]),
+                )
+                pa01 = max_f16x2(pa01, packed_zero)
+                pa23 = max_f16x2(pa23, packed_zero)
+                pw01 = pack_f16x2(
+                    sW[(t * num_heads + h_g, q_stage_local)],
+                    sW[(t * num_heads + h_g + 1, q_stage_local)],
+                )
+                pw23 = pack_f16x2(
+                    sW[(t * num_heads + h_g + 2, q_stage_local)],
+                    sW[(t * num_heads + h_g + 3, q_stage_local)],
+                )
+                ps0 = fma_f16x2(pa01, pw01, ps0)
+                ps1 = fma_f16x2(pa23, pw23, ps1)
+            else:
+                # Keep the same selected FP32 policy on the shared-weight
+                # path as the register-weight path above. The common scale
+                # helper owns fast-mode compensation, never this reduction.
+                s0x, s0y, s1x, s1y = self._accumulate_fp32_heads(
+                    acc_vec,
+                    n0,
+                    sW,
+                    (
+                        (
+                            t * num_heads + h_g,
+                            q_stage_local,
+                        ),
+                        (
+                            t * num_heads + h_g + 1,
+                            q_stage_local,
+                        ),
+                        (
+                            t * num_heads + h_g + 2,
+                            q_stage_local,
+                        ),
+                        (
+                            t * num_heads + h_g + 3,
+                            q_stage_local,
+                        ),
+                    ),
+                    (s0x, s0y, s1x, s1y),
+                )
+        if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
+            return ps0, ps1
+        else:
+            return s0x, s0y, s1x, s1y
+
+    @cute.jit
+    def _store_ordinary_math_result(
+        self,
+        sums,
+        scale_val,
+        output_view,
+        out_row_off,
+        logits_stride0,
+        q_idx,
+        t: cutlass.Constexpr,
+        next_n: cutlass.Constexpr,
+        kv_pos,
+        store_out_row_base=None,
+        store_q_valid=None,
+        store_row_ends=None,
+    ):
+        """Keep the ordinary final association, scale conversion and store."""
+        if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
+            ps0, ps1 = sums
+        else:
+            s0x, s0y, s1x, s1y = sums
+        if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
+            ps_sum = add_f16x2(ps0, ps1)
+            sum_lo, sum_hi = unpack_f16x2(ps_sum)
+            result_t = sum_lo + sum_hi
+        else:
+            result_t = s0x + s0y + s1x + s1y
+        if cutlass.const_expr(self.explicit_query_bounds):
+            # Metadata row: real output base, valid count, exact physical ends.
+            # Padded Q/weights are real allocated lanes; they never publish rows.
+            if t < store_q_valid:
+                out_row = store_out_row_base + t
+                value = self.output_dtype(result_t * scale_val)
+                if kv_pos >= store_row_ends[t]:
+                    value = self.output_dtype(-float("inf"))
+                if cutlass.const_expr(self.use_flat_logits_view):
+                    out_off = out_row_off + t * logits_stride0 + kv_pos
+                    output_view[out_off] = value
+                else:
+                    output_view[(out_row, kv_pos)] = value
+        else:
+            if cutlass.const_expr(self.use_flat_logits_view):
+                out_off_t = out_row_off + t * logits_stride0 + kv_pos
+                if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
+                    output_view[out_off_t] = self.output_dtype(
+                        result_t * Float16(scale_val)
+                    )
+                else:
+                    output_view[out_off_t] = self.output_dtype(result_t * scale_val)
+            else:
+                out_row = q_idx * next_n + t
+                if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
+                    output_view[(out_row, kv_pos)] = self.output_dtype(
+                        result_t * Float16(scale_val)
+                    )
+                else:
+                    output_view[(out_row, kv_pos)] = self.output_dtype(
+                        result_t * scale_val
+                    )
+
+    @cute.jit
+    def _math_scale_value(
+        self, sScales, m_coord, stage, group, request_tiled: cutlass.Constexpr
+    ):
+        if cutlass.const_expr(request_tiled):
+            scale = sScales[(m_coord, stage, group)]
+        else:
+            scale = sScales[(m_coord, stage)]
+        # Fast FP32 ReLU doubles each value before weighted accumulation.
+        # Compensate exactly once here across ordinary and all selective modes.
+        # FP16 epilogues keep their original max/FMA/scale-cast arithmetic.
+        if cutlass.const_expr(
+            self.epi_dtype == cutlass.Float32 and self.math_mode == "relu_fast"
+        ):
+            scale = scale * cutlass.Float32(0.5)
+        return scale
+
+    @cute.jit
+    def _load_math_fragment(
+        self,
+        tiled_copy,
+        partition,
+        fragment,
+        index: cutlass.Constexpr,
+        last: cutlass.Constexpr,
+        umma_pipeline,
+        umma_cons_state,
+        prefetched: cutlass.Constexpr = False,
+    ):
+        if cutlass.const_expr(index > 0):
+            if cutlass.const_expr(not prefetched):
+                cute.copy(tiled_copy, partition[(None, None, None, 0, index)], fragment)
+            cute.arch.fence_view_async_tmem_load()
+        # Release only after the last LDTM + fence, before loading its
+        # register fragment. The producer may reuse TMEM after that fence.
+        if cutlass.const_expr(last):
+            umma_pipeline.consumer_release(umma_cons_state)
+            umma_cons_state.advance()
+        acc_vec = fragment.load()
+        if cutlass.const_expr(prefetched and not last):
+            # Candidate score-plane policy overlaps the next LDTM with this
+            # fragment's arithmetic, after materializing its current SSA value.
+            cute.copy(tiled_copy, partition[(None, None, None, 0, index + 1)], fragment)
+        return acc_vec, umma_cons_state
+
+    @cute.jit
+    def _consume_math_task(
+        self,
+        q_idx,
+        kv_idx,
+        q_stage_local,
+        group,
+        block_kv_val,
+        m_coord,
+        tCtAcc_base,
+        tiled_copy,
+        thr_copy,
+        tTR_tAcc_base,
+        tTR_rAcc,
+        epi_sub_mn,
+        kv_pipeline,
+        kv_cons_state,
+        umma_pipeline,
+        umma_cons_state,
+        sScales,
+        w_cache,
+        NUM_W_IN_REG: cutlass.Constexpr,
+        sW,
+        output_view,
+        logits_stride0,
+        out_row_off,
+        mIndexCounts,
+        mTileMeta,
+        mPolicyValues,
+        store_out_row_base,
+        store_q_valid,
+        store_causal_base,
+        store_row_starts,
+        store_row_ends,
+        request_tiled: cutlass.Constexpr,
+        paired_polls: cutlass.Constexpr,
+        score_plane: cutlass.Constexpr = False,
+        sStoreScores=None,
+        store_stage=None,
+    ):
+        """Own one generation; request geometry is not sample-page indirection."""
+        next_n = cutlass.const_expr(self.next_n)
+        num_heads = cutlass.const_expr(self.num_heads)
+        num_epi_subtiles = cutlass.const_expr(self.num_epi_subtiles)
+        kv_pos = (kv_idx + group) * block_kv_val + m_coord
+        if cutlass.const_expr(self.remove_kv_wait_in_epilogue):
+            # UMMA completion gives transitive visibility of matching KV.
+            umma_pipeline.consumer_wait(umma_cons_state)
+        elif cutlass.const_expr(paired_polls):
+            # Keep both probes adjacent; their original tokens reach waits.
+            kv_ready = kv_pipeline.consumer_try_wait(kv_cons_state)
+            umma_ready = umma_pipeline.consumer_try_wait(umma_cons_state)
+            kv_pipeline.consumer_wait(kv_cons_state, kv_ready)
+            scale_val = self._math_scale_value(
+                sScales, m_coord, kv_cons_state.index, group, request_tiled
+            )
+            umma_pipeline.consumer_wait(umma_cons_state, umma_ready)
+        else:
+            kv_pipeline.consumer_wait(kv_cons_state)
+            scale_val = self._math_scale_value(
+                sScales, m_coord, kv_cons_state.index, group, request_tiled
+            )
+            umma_pipeline.consumer_wait(umma_cons_state)
+        if cutlass.const_expr(request_tiled):
+            partition = tTR_tAcc_base[
+                (None, None, None, None, None, umma_cons_state.index)
+            ]
+        else:
+            tCtAcc = tCtAcc_base[(None, None, None, umma_cons_state.index)]
+            tAcc = tCtAcc[((None, None), 0, 0)]
+            partition = thr_copy.partition_S(cute.flat_divide(tAcc, epi_sub_mn))
+        if cutlass.const_expr(self.early_tmem_copy):
+            cute.copy(tiled_copy, partition[(None, None, None, 0, 0)], tTR_rAcc)
+            if cutlass.const_expr(self.remove_kv_wait_in_epilogue):
+                scale_val = self._math_scale_value(
+                    sScales, m_coord, kv_cons_state.index, group, request_tiled
+                )
+            if cutlass.const_expr(not request_tiled):
+                # Order scale LDS before producer reuse; early-copy policy
+                # keeps first LDTM ahead of this shared fence/release.
+                kv_cons_state = self._release_kv_after_scale_use(
+                    kv_pipeline, kv_cons_state
+                )
+            cute.arch.fence_view_async_tmem_load()
+        else:
+            if cutlass.const_expr(self.remove_kv_wait_in_epilogue):
+                scale_val = self._math_scale_value(
+                    sScales, m_coord, kv_cons_state.index, group, request_tiled
+                )
+            if cutlass.const_expr(not request_tiled):
+                # Default ordinary policy releases after scale LDS BEFORE
+                # the first LDTM; request-tiled modes retain the late boundary.
+                kv_cons_state = self._release_kv_after_scale_use(
+                    kv_pipeline, kv_cons_state
+                )
+            cute.copy(tiled_copy, partition[(None, None, None, 0, 0)], tTR_rAcc)
+            cute.arch.fence_view_async_tmem_load()
+        sums: Any
+        if cutlass.const_expr(request_tiled):
+            if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
+                packed_zero = pack_f16x2(Float16(0.0), Float16(0.0))
+                sums = (packed_zero, packed_zero)
+            else:
+                sums = (
+                    cutlass.Float32(0.0),
+                    cutlass.Float32(0.0),
+                    cutlass.Float32(0.0),
+                    cutlass.Float32(0.0),
+                )
+            subtile_n = cutlass.const_expr(self.N // num_epi_subtiles)
+            for epi_subtile in cutlass.range_constexpr(num_epi_subtiles):
+                acc_vec, umma_cons_state = self._load_math_fragment(
+                    tiled_copy,
+                    partition,
+                    tTR_rAcc,
+                    epi_subtile,
+                    epi_subtile == num_epi_subtiles - 1,
+                    umma_pipeline,
+                    umma_cons_state,
+                    score_plane,
+                )
+                sums = self._request_math_fragment(
+                    acc_vec,
+                    sums,
+                    epi_subtile * subtile_n,
+                    subtile_n,
+                    next_n,
+                    num_epi_subtiles,
+                    num_heads,
+                    NUM_W_IN_REG,
+                    w_cache,
+                    sW,
+                    q_stage_local,
+                    output_view,
+                    mIndexCounts,
+                    mTileMeta,
+                    mPolicyValues,
+                    q_idx,
+                    store_out_row_base,
+                    store_q_valid,
+                    store_causal_base,
+                    store_row_starts,
+                    store_row_ends,
+                    kv_pos,
+                    cutlass.Boolean(True),
+                    m_coord,
+                    kv_pos,
+                    scale_val,
+                    score_plane,
+                    sStoreScores,
+                    store_stage,
+                    group,
+                )
+            # All flattened subtiles/output stores still consume scale_val.
+            # Releasing at the first load lets TMA overwrite a live generation.
+            kv_cons_state = self._release_kv_after_scale_use(kv_pipeline, kv_cons_state)
+        else:
+            subtile_n = cutlass.const_expr(num_heads // num_epi_subtiles)
+            if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
+                packed_zero = pack_f16x2(Float16(0.0), Float16(0.0))
+            for t in cutlass.range_constexpr(next_n):
+                if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
+                    sums = (packed_zero, packed_zero)
+                else:
+                    sums = (
+                        cutlass.Float32(0.0),
+                        cutlass.Float32(0.0),
+                        cutlass.Float32(0.0),
+                        cutlass.Float32(0.0),
+                    )
+                for i in cutlass.range_constexpr(num_epi_subtiles):
+                    acc_vec, umma_cons_state = self._load_math_fragment(
+                        tiled_copy,
+                        partition,
+                        tTR_rAcc,
+                        t * num_epi_subtiles + i,
+                        t == next_n - 1 and i == num_epi_subtiles - 1,
+                        umma_pipeline,
+                        umma_cons_state,
+                    )
+                    sums = self._ordinary_math_fragment(
+                        acc_vec,
+                        sums,
+                        t,
+                        i,
+                        subtile_n,
+                        NUM_W_IN_REG,
+                        num_heads,
+                        w_cache,
+                        sW,
+                        q_stage_local,
+                    )
+                self._store_ordinary_math_result(
+                    sums,
+                    scale_val,
+                    output_view,
+                    out_row_off,
+                    logits_stride0,
+                    q_idx,
+                    t,
+                    next_n,
+                    kv_pos,
+                    store_out_row_base,
+                    store_q_valid,
+                    store_row_ends,
+                )
+        return kv_cons_state, umma_cons_state
+
+    @cute.jit
+    def _run_math_consumer(
+        self,
+        mContextLens,
+        batch_size,
+        block_kv_val,
+        end_q_idx,
+        end_kv_idx,
+        next_q_idx,
+        next_kv_idx,
+        next_num_kv,
+        q_idx,
+        has_work,
+        group,
+        tCtAcc_base,
+        copy_atom_t2r,
+        epi_sub_mn,
+        local_tidx,
+        cC,
+        q_pipeline,
+        q_cons_state,
+        kv_pipeline,
+        kv_cons_state,
+        umma_pipeline,
+        umma_cons_state,
+        sScales,
+        sW,
+        mLogits,
+        request_tiled: cutlass.Constexpr,
+        cache_regs: cutlass.Constexpr,
+        two_level: cutlass.Constexpr,
+        paired_polls: cutlass.Constexpr,
+        mIndexCounts=None,
+        mTileMeta=None,
+        mPolicyValues=None,
+        score_plane: cutlass.Constexpr = False,
+        sStoreScores=None,
+        store_pipeline=None,
+    ):
+        """Common Q/task owner; request-tiled stays flat, ordinary gated."""
+        next_n = cutlass.const_expr(self.next_n)
+        num_heads = cutlass.const_expr(self.num_heads)
+        if cutlass.const_expr(score_plane):
+            store_prod_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Producer, 2
+            )
+        if cutlass.const_expr(request_tiled):
+            tiled_copy, tTR_tAcc_base, tTR_cC, tTR_rAcc = (
+                self._make_math_tmem_copy_and_partition(
+                    tCtAcc_base, epi_sub_mn, copy_atom_t2r, local_tidx, cC
+                )
+            )
+            thr_copy = None
+        else:
+            tAcc_ref = tCtAcc_base[(None, None, None, 0)][((None, None), 0, 0)]
+            tAcc_ref_epi = cute.flat_divide(tAcc_ref, epi_sub_mn)
+            tiled_copy = tcgen05.make_tmem_copy(
+                copy_atom_t2r, tAcc_ref_epi[(None, None, 0, 0)]
+            )
+            thr_copy = tiled_copy.get_slice(local_tidx)
+            tTR_cC = thr_copy.partition_D(cC)
+            tTR_rAcc = cute.make_fragment_like(tTR_cC, self.acc_dtype)
+            tTR_tAcc_base = None
+        m_coord = tTR_cC[0][0]
+        if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
+            MAX_NUM_W_IN_REG = 64 if next_n <= 3 else 48
+            MAX_W_CACHE_ELEMS = 2 * cache_regs
+        else:
+            MAX_NUM_W_IN_REG = 64 if next_n == 1 else 40 if next_n >= 4 else 52
+            MAX_W_CACHE_ELEMS = cache_regs
+        # Bound total per-row cache footprint as well as per-slot head count.
+        # One constexpr expression keeps range_constexpr bounds static.
+        NUM_W_IN_REG = max(
+            _EPI_UNROLL,
+            min(
+                MAX_NUM_W_IN_REG,
+                num_heads,
+                ((MAX_W_CACHE_ELEMS // next_n) // _EPI_UNROLL) * _EPI_UNROLL,
+            ),
+        )
+        if cutlass.const_expr(score_plane and self.N <= 128):
+            # Preserve the candidate role-local full cache for tuned N<=128;
+            # wider legal tiles keep the same bounded per-row cache above.
+            NUM_W_IN_REG = num_heads
+        assert NUM_W_IN_REG % _EPI_UNROLL == 0
+        if cutlass.const_expr(request_tiled):
+            w_cache = cute.make_rmem_tensor(
+                cute.make_layout((next_n, NUM_W_IN_REG), stride=(NUM_W_IN_REG, 1)),
+                self.epi_dtype,
+            )
+        else:
+            w_cache = cute.make_rmem_tensor(NUM_W_IN_REG * next_n, self.epi_dtype)
+        q_stage_local = cutlass.Int32(0)
+        if cutlass.const_expr(request_tiled):
+            store_out_row_base = cutlass.Int32(0)
+            store_q_valid = cutlass.Int32(0)
+            store_causal_base = cutlass.Int32(0)
+            if cutlass.const_expr(not score_plane):
+                store_row_starts = cute.make_rmem_tensor(next_n, cutlass.Int32)
+                store_row_ends = cute.make_rmem_tensor(next_n, cutlass.Int32)
+            else:
+                store_row_starts = None
+                store_row_ends = None
+            output_view = mLogits
+            logits_stride0 = 0
+            out_row_off = 0
+        else:
+            if cutlass.const_expr(self.explicit_query_bounds):
+                store_out_row_base = cutlass.Int32(0)
+                store_q_valid = cutlass.Int32(0)
+                store_row_ends = cute.make_rmem_tensor(next_n, cutlass.Int32)
+            else:
+                store_out_row_base = None
+                store_q_valid = None
+                store_row_ends = None
+            store_causal_base = None
+            store_row_starts = None
+            if cutlass.const_expr(self.use_flat_logits_view):
+                # Flat logits view + carried row offset: the store address
+                # is base + out_row*stride0 + kv_pos, but out_row only
+                # changes on q-change. Recomputing the row term there (cold
+                # path) leaves the hot path a single add -- the wide-multiply
+                # address chain otherwise re-materializes every task because
+                # the while-loop control flow hides the invariance.
+                # Gated off on Rubin (sm_107): there the backend schedules the
+                # UMMA consumer-release late in the math loop, throttling the
+                # MMA pipe per KV tile -- regresses, growing with ctx.
+                # Pass only the selected output_view to the store helper:
+                # referencing mLogits from the untraced arm changes loop-region
+                # captures (and the SASS schedule), even without changing the
+                # selected store. Keep that tensor out of the gated store body.
+                # Size by pitched span (rows * stride0), not visible width:
+                # stores cover aligned padding past max_context_len, and the
+                # host allocates the full pitch.
+                output_offset_dtype = cutlass.Int32
+                if cutlass.const_expr(self.output_index_bits == 64):
+                    output_offset_dtype = cutlass.Int64
+                logits_stride0 = output_offset_dtype(mLogits.layout.stride[0])
+                output_view = cute.make_tensor(
+                    mLogits.iterator,
+                    cute.make_layout(
+                        output_offset_dtype(cute.size(mLogits, mode=[0]))
+                        * logits_stride0
+                    ),
+                )
+                out_row_off = output_offset_dtype(0)
+            else:
+                output_view = mLogits
+                logits_stride0 = 0
+                out_row_off = 0
+        while has_work:
+            q_idx_old = q_idx
+            q_idx = next_q_idx
+            kv_idx = next_kv_idx
+            num_kv = next_num_kv
+            if cutlass.const_expr(score_plane):
+                # Acquire before retiring/waiting Q, matching the existing
+                # score-plane generation and avoiding a hidden policy release.
+                store_pipeline.producer_acquire(store_prod_state)
+            if q_idx != q_idx_old:
+                if q_idx_old < batch_size:
+                    q_pipeline.consumer_release(q_cons_state)
+                    q_cons_state.advance()
+                q_pipeline.consumer_wait(q_cons_state)
+                q_stage_local = q_cons_state.index
+                if cutlass.const_expr(request_tiled):
+                    store_out_row_base = mTileMeta[(q_idx, 0)]
+                    store_q_valid = mTileMeta[(q_idx, 2)]
+                    store_causal_base = mTileMeta[(q_idx, 3)]
+                    if cutlass.const_expr(not score_plane):
+                        for row in cutlass.range_constexpr(next_n):
+                            store_row_starts[row] = mTileMeta[(q_idx, 4 + row)]
+                            store_row_ends[row] = mTileMeta[(q_idx, 4 + next_n + row)]
+                elif cutlass.const_expr(self.explicit_query_bounds):
+                    # One metadata snapshot serves every KV task for this Q
+                    # group. Keep row-base multiplication off the hot store.
+                    store_out_row_base = mTileMeta[(q_idx, 0)]
+                    store_q_valid = mTileMeta[(q_idx, 1)]
+                    for row in cutlass.range_constexpr(next_n):
+                        store_row_ends[row] = mTileMeta[(q_idx, 2 + row)]
+                    if cutlass.const_expr(self.use_flat_logits_view):
+                        out_row_off = (
+                            output_offset_dtype(store_out_row_base) * logits_stride0
+                        )
+                elif cutlass.const_expr(self.use_flat_logits_view):
+                    # Promote before either product; widening an already
+                    # wrapped Int32 row term cannot recover its address.
+                    out_row_off = (output_offset_dtype(q_idx) * next_n) * logits_stride0
+                for t_i in cutlass.range_constexpr(next_n):
+                    for w_j in cutlass.range_constexpr(NUM_W_IN_REG):
+                        if cutlass.const_expr(request_tiled):
+                            w_cache[(t_i, w_j)] = sW[(t_i, w_j, q_stage_local)]
+                        else:
+                            w_cache[t_i * NUM_W_IN_REG + w_j] = sW[
+                                (t_i * num_heads + w_j, q_stage_local)
+                            ]
+            if cutlass.const_expr(request_tiled):
+                store_stage = None
+                if cutlass.const_expr(score_plane):
+                    store_stage = store_prod_state.index
+                kv_cons_state, umma_cons_state = self._consume_math_task(
+                    q_idx,
+                    kv_idx,
+                    q_stage_local,
+                    group,
+                    block_kv_val,
+                    m_coord,
+                    tCtAcc_base,
+                    tiled_copy,
+                    thr_copy,
+                    tTR_tAcc_base,
+                    tTR_rAcc,
+                    epi_sub_mn,
+                    kv_pipeline,
+                    kv_cons_state,
+                    umma_pipeline,
+                    umma_cons_state,
+                    sScales,
+                    w_cache,
+                    NUM_W_IN_REG,
+                    sW,
+                    output_view,
+                    logits_stride0,
+                    out_row_off,
+                    mIndexCounts,
+                    mTileMeta,
+                    mPolicyValues,
+                    store_out_row_base,
+                    store_q_valid,
+                    store_causal_base,
+                    store_row_starts,
+                    store_row_ends,
+                    request_tiled,
+                    paired_polls,
+                    score_plane,
+                    sStoreScores,
+                    store_stage,
+                )
+                if cutlass.const_expr(score_plane):
+                    # The task's final shared fence covers its scale uses and
+                    # every score-plane store. No shared data is written
+                    # between that fence and this generation's publication.
+                    store_pipeline.producer_commit(store_prod_state)
+                    store_prod_state.advance()
+                kv_idx = kv_idx + 2
+            else:
+                # Inner hot KV loop within this Q: the cold Q-change weight
+                # preload and Q-rollover context reload previously sat inline
+                # in the flat loop, costing taken-branch fetch bubbles on each
+                # hot iteration. Replay exactly the original task sequence:
+                # process (q, kv); advance kv by W; roll over to (q+1, 0) when
+                # kv >= num_kv; stop at the exact (end_q, end_kv) pair.
+                # Truth table after kv += W (W = NUM_MATH_WG):
+                #   kv < num_kv, (q, kv) != end -> True: more KV in this Q
+                #   kv < num_kv, (q, kv) == end -> False: global end mid-Q
+                #   kv >= num_kv, any          -> False: outer rollover next
+                # The first iteration is unconditional: the outer loop starts
+                # only when the committed (q, kv) differs from the end pair.
+                # Gate use_two_level_task_loop=False (Rubin next_n >= 4 auto):
+                # forcing kv_go=False after the body makes this single-trip,
+                # restoring the original per-task Q-change check without a
+                # duplicate skeleton. SAMPLE above stays a flat task loop.
+                kv_go = cutlass.Boolean(True)
+                while kv_go:
+                    kv_cons_state, umma_cons_state = self._consume_math_task(
+                        q_idx,
+                        kv_idx,
+                        q_stage_local,
+                        group,
+                        block_kv_val,
+                        m_coord,
+                        tCtAcc_base,
+                        tiled_copy,
+                        thr_copy,
+                        tTR_tAcc_base,
+                        tTR_rAcc,
+                        epi_sub_mn,
+                        kv_pipeline,
+                        kv_cons_state,
+                        umma_pipeline,
+                        umma_cons_state,
+                        sScales,
+                        w_cache,
+                        NUM_W_IN_REG,
+                        sW,
+                        output_view,
+                        logits_stride0,
+                        out_row_off,
+                        mIndexCounts,
+                        mTileMeta,
+                        mPolicyValues,
+                        store_out_row_base,
+                        store_q_valid,
+                        store_causal_base,
+                        store_row_starts,
+                        store_row_ends,
+                        request_tiled,
+                        paired_polls,
+                    )
+                    kv_idx = kv_idx + 2
+                    kv_go = (kv_idx < num_kv) & (
+                        (q_idx != end_q_idx) | (kv_idx != end_kv_idx)
+                    )
+                    if cutlass.const_expr(not two_level):
+                        kv_go = cutlass.Boolean(False)
+            if kv_idx >= num_kv:
+                next_q_idx = q_idx + 1
+                next_kv_idx = 0
+                if next_q_idx < batch_size:
+                    next_num_kv = (
+                        mContextLens[next_q_idx] + block_kv_val - 1
+                    ) // block_kv_val
+                # Every role skips the same zero rows without crossing its
+                # exact CTA end pair or reading context past batch_size.
+                while (
+                    (next_num_kv == 0)
+                    & (next_q_idx < batch_size)
+                    & ((next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx))
+                ):
+                    next_q_idx = next_q_idx + 1
+                    if next_q_idx < batch_size:
+                        next_num_kv = (
+                            mContextLens[next_q_idx] + block_kv_val - 1
+                        ) // block_kv_val
+            else:
+                next_q_idx = q_idx
+                next_kv_idx = kv_idx
+            has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
+        if q_idx < batch_size:
+            q_pipeline.consumer_release(q_cons_state)
+            q_cons_state.advance()
+        if cutlass.const_expr(score_plane):
+            store_pipeline.producer_tail(store_prod_state)
+            # Carry the new mutable state across the outer helper boundary,
+            # like the existing Q/KV/UMMA states, rather than leaking an alias.
+            return q_cons_state, kv_cons_state, umma_cons_state, store_prod_state
+        return q_cons_state, kv_cons_state, umma_cons_state
+
+    @cute.jit
+    def _run_math_role(
+        self,
+        mContextLens,
+        batch_size,
+        block_kv_val,
+        end_q_idx,
+        end_kv_idx,
+        next_q_idx,
+        next_kv_idx,
+        next_num_kv,
+        q_idx,
+        has_work,
+        tidx,
+        warpgroup_idx,
+        tmem,
+        num_tmem_alloc_cols_total,
+        tCtAcc_fake_staged,
+        group_offset,
+        epi_sub_mn,
+        copy_atom_t2r,
+        mLogits,
+        sW,
+        q_pipeline,
+        q_cons_state,
+        kv_pipeline_0,
+        umma_pipeline_0,
+        sScales_0,
+        request_tiled: cutlass.Constexpr,
+        cache_regs: cutlass.Constexpr,
+        kv_cons_state_0=None,
+        umma_cons_state_0=None,
+        kv_pipeline_1=None,
+        umma_pipeline_1=None,
+        sScales_1=None,
+        kv_cons_state_1=None,
+        umma_cons_state_1=None,
+        mIndexCounts=None,
+        mTileMeta=None,
+        mPolicyValues=None,
+        score_plane: cutlass.Constexpr = False,
+        sStoreScores=None,
+        store_pipeline=None,
+    ):
+        """One TMEM allocation/consumer/permit/free owner with static sinks."""
+        tmem.allocate(num_tmem_alloc_cols_total)
+        self._wait_for_tmem(tmem)
+        tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
+        if cutlass.const_expr(request_tiled):
+            math_tmem_ptr = tmem_ptr + warpgroup_idx * group_offset
+            if cutlass.const_expr(self.acc_dtype == Float16):
+                # Dynamic group selection retains whole-panel align8 for
+                # packed-half LDTM; ordinary retains its static plane views.
+                math_tmem_ptr = cute.make_ptr(
+                    self.acc_dtype,
+                    math_tmem_ptr.toint(),
+                    cute.AddressSpace.tmem,
+                    assumed_align=8,
+                )
+            tCtAcc_base = cute.make_tensor(math_tmem_ptr, tCtAcc_fake_staged.layout)
+            local_tidx = tidx % 128
+            cC = cute.make_identity_tensor(epi_sub_mn)
+            kv_cons_state_0 = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Consumer, self.num_kv_stages
+            )
+            umma_cons_state_0 = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Consumer, self.num_umma_stages
+            )
+            math_states = self._run_math_consumer(
+                mContextLens,
+                batch_size,
+                block_kv_val,
+                end_q_idx,
+                end_kv_idx,
+                next_q_idx,
+                next_kv_idx,
+                next_num_kv,
+                q_idx,
+                has_work,
+                warpgroup_idx,
+                tCtAcc_base,
+                copy_atom_t2r,
+                epi_sub_mn,
+                local_tidx,
+                cC,
+                q_pipeline,
+                q_cons_state,
+                kv_pipeline_0,
+                kv_cons_state_0,
+                umma_pipeline_0,
+                umma_cons_state_0,
+                sScales_0,
+                sW,
+                mLogits,
+                True,
+                cache_regs,
+                False,
+                True,
+                mIndexCounts,
+                mTileMeta,
+                mPolicyValues,
+                score_plane,
+                sStoreScores,
+                store_pipeline,
+            )
+            if cutlass.const_expr(score_plane):
+                (
+                    q_cons_state,
+                    kv_cons_state_0,
+                    umma_cons_state_0,
+                    store_prod_state,
+                ) = math_states
+            else:
+                q_cons_state, kv_cons_state_0, umma_cons_state_0 = math_states
+        else:
+            tCtAcc_base_0 = cute.make_tensor(tmem_ptr, tCtAcc_fake_staged.layout)
+            tCtAcc_base_1 = cute.make_tensor(
+                tmem_ptr + group_offset, tCtAcc_fake_staged.layout
+            )
+            local_tidx = tidx % 128
+            cC = cute.make_identity_tensor(epi_sub_mn)
+            if warpgroup_idx == 0:
+                q_cons_state, kv_cons_state_0, umma_cons_state_0 = (
+                    self._run_math_consumer(
+                        mContextLens,
+                        batch_size,
+                        block_kv_val,
+                        end_q_idx,
+                        end_kv_idx,
+                        next_q_idx,
+                        next_kv_idx,
+                        next_num_kv,
+                        q_idx,
+                        has_work,
+                        0,
+                        tCtAcc_base_0,
+                        copy_atom_t2r,
+                        epi_sub_mn,
+                        local_tidx,
+                        cC,
+                        q_pipeline,
+                        q_cons_state,
+                        kv_pipeline_0,
+                        kv_cons_state_0,
+                        umma_pipeline_0,
+                        umma_cons_state_0,
+                        sScales_0,
+                        sW,
+                        mLogits,
+                        False,
+                        cache_regs,
+                        self.use_two_level_task_loop,
+                        self.use_paired_pipeline_polls,
+                        mTileMeta=mTileMeta,
+                    )
+                )
+            else:
+                q_cons_state, kv_cons_state_1, umma_cons_state_1 = (
+                    self._run_math_consumer(
+                        mContextLens,
+                        batch_size,
+                        block_kv_val,
+                        end_q_idx,
+                        end_kv_idx,
+                        next_q_idx,
+                        next_kv_idx,
+                        next_num_kv,
+                        q_idx,
+                        has_work,
+                        1,
+                        tCtAcc_base_1,
+                        copy_atom_t2r,
+                        epi_sub_mn,
+                        local_tidx,
+                        cC,
+                        q_pipeline,
+                        q_cons_state,
+                        kv_pipeline_1,
+                        kv_cons_state_1,
+                        umma_pipeline_1,
+                        umma_cons_state_1,
+                        sScales_1,
+                        sW,
+                        mLogits,
+                        False,
+                        cache_regs,
+                        self.use_two_level_task_loop,
+                        self.use_paired_pipeline_polls,
+                        mTileMeta=mTileMeta,
+                    )
+                )
+        if cutlass.const_expr(request_tiled):
+            # All math warps must finish their TMEM reads before its allocation
+            # is returned; the final task can differ between warp groups.
+            pipeline.NamedBarrier(
+                barrier_id=2, num_threads=self.num_math_threads
+            ).arrive_and_wait()
+        tmem.relinquish_alloc_permit()
+        if cutlass.const_expr(request_tiled):
+            tmem.free(tmem_ptr)
+            if cutlass.const_expr(score_plane):
+                return (
+                    q_cons_state,
+                    kv_cons_state_0,
+                    umma_cons_state_0,
+                    store_prod_state,
+                )
+            return q_cons_state, kv_cons_state_0, umma_cons_state_0
+        else:
+            tmem.free(tmem_ptr, num_tmem_alloc_cols_total)
+            return (
+                q_cons_state,
+                kv_cons_state_0,
+                umma_cons_state_0,
+                kv_cons_state_1,
+                umma_cons_state_1,
+            )
+
+    @cute.jit
+    def _run_store_role(
+        self,
+        NUM_MATH_WG,
+        NUM_STORE_WARPS,
+        batch_size,
+        block_kv_val,
+        end_kv_idx,
+        end_q_idx,
+        has_work,
+        mContextLens,
+        mIndexCounts,
+        mLogits,
+        mPolicyValues,
+        mTileMeta,
+        next_kv_idx,
+        next_n,
+        next_num_kv,
+        next_q_idx,
+        q_idx,
+        sStoreScores_0,
+        sStoreScores_1,
+        store_pipeline_0,
+        store_pipeline_1,
+    ):
+        """Run one segmented candidate publisher warp."""
+        if cutlass.const_expr(self.has_store_warp):
+            cute.arch.setmaxregister_increase(self.store_wg_registers)
+            store_cons_state_0 = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Consumer, 2
+            )
+            store_cons_state_1 = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Consumer, 2
+            )
+            store_logits_addr = self._store_uniform_i64(mLogits.iterator.toint())
+            store_logits_stride = self._store_uniform_i64(mLogits.layout.stride[0])
+            store_warp = cute.arch.make_warp_uniform(
+                cute.arch.warp_idx() - cutlass.Int32(12)
+            )
+            store_lane = cute.arch.lane_idx()
+            lane_private_segment_base = store_lane * cutlass.Int32(
+                self.num_count_segments // 32
+            )
+            num_q_groups = (next_n + NUM_STORE_WARPS - 1) // NUM_STORE_WARPS
+            num_lane_cursors = (
+                self.split_kv
+                if cutlass.const_expr(self.split_kv > 1)
+                else self.num_count_segments // 32
+            )
+            num_private_cursors = (
+                num_lane_cursors
+                if cutlass.const_expr(self.count_segment_span == 1)
+                else 1
+                if cutlass.const_expr(self.count_segment_span == 128)
+                else 4
+            )
+            private_cursors = [
+                [cutlass.Int32(0) for _ in range(num_private_cursors)]
+                for _ in range(num_q_groups)
+            ]
+            cursor_q_idx = cutlass.Int32(-1)
+            cached_out_row_base = cutlass.Int32(0)
+            cached_q_valid = cutlass.Int32(0)
+            cached_causal_base = cutlass.Int32(0)
+            cached_row_logits_addrs = [cutlass.Int64(0) for _ in range(num_q_groups)]
+            cached_row_logical_ends = [cutlass.Int32(0) for _ in range(num_q_groups)]
+            if cutlass.const_expr(not self.candidate_uses_causal_bounds):
+                cached_row_logical_starts = [
+                    cutlass.Int32(0) for _ in range(num_q_groups)
+                ]
+            cached_thresholds = [cutlass.Float32(0.0) for _ in range(num_q_groups)]
+
+            while has_work:
+                q_idx = next_q_idx
+                kv_idx = next_kv_idx
+                num_kv = next_num_kv
+
+                if q_idx != cursor_q_idx:
+                    cached_out_row_base = mTileMeta[(q_idx, 0)]
+                    cached_q_valid = mTileMeta[(q_idx, 2)]
+                    cached_causal_base = mTileMeta[(q_idx, 3)]
+                    for q_group in cutlass.range_constexpr(num_q_groups):
+                        row = store_warp + q_group * NUM_STORE_WARPS
+                        if row < cached_q_valid:
+                            out_row = cached_out_row_base + row
+                            cached_row_logits_addrs[q_group] = (
+                                store_logits_addr
+                                + cutlass.Int64(
+                                    cutlass.Uint64(cutlass.Uint32(out_row))
+                                    * cutlass.Uint64(store_logits_stride)
+                                )
+                                * cutlass.Int64(8)
+                            )
+                            if cutlass.const_expr(self.candidate_uses_causal_bounds):
+                                cached_row_logical_ends[q_group] = (
+                                    cached_causal_base + row + 1
+                                )
+                            else:
+                                # Explicit metadata has no causal-base origin;
+                                # each row owns its own inclusive/exclusive bounds.
+                                cached_row_logical_starts[q_group] = mTileMeta[
+                                    (q_idx, 4 + row)
+                                ]
+                                cached_row_logical_ends[q_group] = mTileMeta[
+                                    (q_idx, 4 + next_n + row)
+                                ]
+                            cached_thresholds[q_group] = self._store_policy_f32(
+                                mPolicyValues[out_row]
+                            )
+                        for cursor_idx in cutlass.range_constexpr(num_private_cursors):
+                            private_cursors[q_group][cursor_idx] = cutlass.Int32(0)
+                    cursor_q_idx = q_idx
+
+                out_row_base = cached_out_row_base
+                q_valid = cached_q_valid
+                kv_base = store_lane * 4
+                logical_base_0 = kv_idx * block_kv_val + kv_base
+                logical_base_1 = (kv_idx + 1) * block_kv_val + kv_base
+                split_idx = cutlass.Int32(0)
+                split_end_kv = num_kv
+                if cutlass.const_expr(self.split_kv > 1):
+                    num_kv_pairs = (num_kv + NUM_MATH_WG - 1) // NUM_MATH_WG
+                    active_splits = min(num_kv_pairs, cutlass.Int32(self.split_kv))
+                    kv_pair_idx = kv_idx // NUM_MATH_WG
+                    split_idx = (kv_pair_idx * active_splits) // num_kv_pairs
+                    split_end_pair = cute.ceil_div(
+                        (split_idx + 1) * num_kv_pairs, active_splits
+                    )
+                    split_end_kv = min(split_end_pair * NUM_MATH_WG, num_kv)
+                store_ready_0 = store_pipeline_0.consumer_try_wait(store_cons_state_0)
+                store_ready_1 = store_pipeline_1.consumer_try_wait(store_cons_state_1)
+                store_pipeline_0.consumer_wait(store_cons_state_0, store_ready_0)
+                if store_warp >= q_valid:
+                    store_pipeline_1.consumer_wait(store_cons_state_1, store_ready_1)
+                # Row ends span causal_base+1 .. causal_base+q_valid, so with
+                # an odd tile block count a short final block leaves early
+                # rows ending inside the previous pair. Bound every pair
+                # that reaches past the first row's end, not only the last.
+                needs_bounds = (q_valid < num_q_groups * NUM_STORE_WARPS) | (
+                    (kv_idx + NUM_MATH_WG) * block_kv_val > cached_causal_base + 1
+                )
+                if cutlass.const_expr(not self.candidate_uses_causal_bounds):
+                    needs_bounds = cutlass.Boolean(True)
+                if needs_bounds:
+                    # Peel partial-Q tiles and pairs crossing a causal row end
+                    # so the steady-state path carries no row/logical predicates.
+                    # Explicit bounds can cut any interior tile, not just tails.
+                    for q_group in cutlass.range_constexpr(num_q_groups):
+                        row = store_warp + q_group * NUM_STORE_WARPS
+                        if (
+                            cutlass.const_expr(next_n >= NUM_STORE_WARPS)
+                            or row < q_valid
+                        ):
+                            row_logits_addr = cached_row_logits_addrs[q_group]
+                            row_logical_end = cached_row_logical_ends[q_group]
+                            row_logical_start = cutlass.Int32(0)
+                            if cutlass.const_expr(
+                                not self.candidate_uses_causal_bounds
+                            ):
+                                row_logical_start = cached_row_logical_starts[q_group]
+                            threshold = cached_thresholds[q_group]
+                            # Tail warps still consume/release both score stages,
+                            # but their rounded row slots have no score storage.
+                            # Keep the logical row for publication predicates.
+                            score_row = min(row, max(q_valid - 1, cutlass.Int32(0)))
+                            scores_0 = self._store_load_v4(
+                                sStoreScores_0,
+                                score_row,
+                                kv_base,
+                                store_cons_state_0.index,
+                            )
+                            if cutlass.const_expr(q_group == 0):
+                                if store_warp < q_valid:
+                                    store_pipeline_1.consumer_wait(
+                                        store_cons_state_1, store_ready_1
+                                    )
+                            scores_1 = self._store_load_v4(
+                                sStoreScores_1,
+                                score_row,
+                                kv_base,
+                                store_cons_state_1.index,
+                            )
+                            if cutlass.const_expr(
+                                next_n >= NUM_STORE_WARPS
+                                and q_group == num_q_groups - 1
+                            ):
+                                # Both score planes are now warp-local registers;
+                                # let the math warpgroups reuse their SMEM stages
+                                # while this final row group is compacted.
+                                store_pipeline_0.consumer_release(store_cons_state_0)
+                                store_cons_state_0.advance()
+                                store_pipeline_1.consumer_release(store_cons_state_1)
+                                store_cons_state_1.advance()
+                            if cutlass.const_expr(self.count_segment_span == 1):
+                                if cutlass.const_expr(self.split_kv > 1):
+                                    split_cursor = private_cursors[q_group][0]
+                                    for candidate_split in cutlass.range_constexpr(
+                                        1, self.split_kv
+                                    ):
+                                        if split_idx == candidate_split:
+                                            split_cursor = private_cursors[q_group][
+                                                candidate_split
+                                            ]
+                                    split_segment = split_idx * 32 + store_lane
+                                    for vec_idx in cutlass.range_constexpr(4):
+                                        split_cursor = (
+                                            self._store_candidate_lane_row_pair(  # type: ignore[attr-defined]
+                                                row_logits_addr,
+                                                q_valid,
+                                                row,
+                                                row_logical_end,
+                                                row_logical_start,
+                                                logical_base_0 + vec_idx,
+                                                logical_base_1 + vec_idx,
+                                                threshold,
+                                                split_cursor,
+                                                split_segment,
+                                                scores_0[vec_idx],
+                                                scores_1[vec_idx],
+                                            )
+                                        )
+                                    for candidate_split in cutlass.range_constexpr(
+                                        self.split_kv
+                                    ):
+                                        if split_idx == candidate_split:
+                                            private_cursors[q_group][
+                                                candidate_split
+                                            ] = split_cursor
+                                else:
+                                    for vec_idx in cutlass.range_constexpr(4):
+                                        cursor_idx = (
+                                            0
+                                            if cutlass.const_expr(
+                                                self.num_count_segments == 32
+                                            )
+                                            else vec_idx // 2
+                                            if cutlass.const_expr(
+                                                self.num_count_segments == 64
+                                            )
+                                            else vec_idx
+                                        )
+                                        private_cursors[q_group][cursor_idx] = (
+                                            self._store_candidate_lane_row_pair(  # type: ignore[attr-defined]
+                                                row_logits_addr,
+                                                q_valid,
+                                                row,
+                                                row_logical_end,
+                                                row_logical_start,
+                                                logical_base_0 + vec_idx,
+                                                logical_base_1 + vec_idx,
+                                                threshold,
+                                                private_cursors[q_group][cursor_idx],
+                                                lane_private_segment_base + cursor_idx,
+                                                scores_0[vec_idx],
+                                                scores_1[vec_idx],
+                                            )
+                                        )
+                            elif cutlass.const_expr(self.count_segment_span == 128):
+                                pooled_cursor = private_cursors[q_group][0]
+                                for vec_idx in cutlass.range_constexpr(4):
+                                    pooled_cursor = self._store_candidate_warp_row_pair(  # type: ignore[attr-defined]
+                                        row_logits_addr,
+                                        q_valid,
+                                        row,
+                                        row_logical_end,
+                                        row_logical_start,
+                                        logical_base_0 + vec_idx,
+                                        logical_base_1 + vec_idx,
+                                        threshold,
+                                        pooled_cursor,
+                                        split_idx,
+                                        scores_0[vec_idx],
+                                        scores_1[vec_idx],
+                                    )
+                                private_cursors[q_group][0] = pooled_cursor
+                            else:
+                                for vec_idx in cutlass.range_constexpr(4):
+                                    private_cursors[q_group][vec_idx] = (
+                                        self._store_candidate_warp_row_pair(  # type: ignore[attr-defined]
+                                            row_logits_addr,
+                                            q_valid,
+                                            row,
+                                            row_logical_end,
+                                            row_logical_start,
+                                            logical_base_0 + vec_idx,
+                                            logical_base_1 + vec_idx,
+                                            threshold,
+                                            private_cursors[q_group][vec_idx],
+                                            split_idx * 4 + vec_idx,
+                                            scores_0[vec_idx],
+                                            scores_1[vec_idx],
+                                        )
+                                    )
+                else:
+                    for q_group in cutlass.range_constexpr(num_q_groups):
+                        row = store_warp + q_group * NUM_STORE_WARPS
+                        row_logits_addr = cached_row_logits_addrs[q_group]
+                        threshold = cached_thresholds[q_group]
+                        scores_0 = self._store_load_v4(
+                            sStoreScores_0,
+                            row,
+                            kv_base,
+                            store_cons_state_0.index,
+                        )
+                        if cutlass.const_expr(q_group == 0):
+                            store_pipeline_1.consumer_wait(
+                                store_cons_state_1, store_ready_1
+                            )
+                        scores_1 = self._store_load_v4(
+                            sStoreScores_1,
+                            row,
+                            kv_base,
+                            store_cons_state_1.index,
+                        )
+                        if cutlass.const_expr(
+                            next_n >= NUM_STORE_WARPS and q_group == num_q_groups - 1
+                        ):
+                            # Both score planes are now warp-local registers;
+                            # let the math warpgroups reuse their SMEM stages
+                            # while this final row group is compacted.
+                            store_pipeline_0.consumer_release(store_cons_state_0)
+                            store_cons_state_0.advance()
+                            store_pipeline_1.consumer_release(store_cons_state_1)
+                            store_cons_state_1.advance()
+                        if cutlass.const_expr(self.count_segment_span == 1):
+                            if cutlass.const_expr(self.split_kv > 1):
+                                split_cursor = private_cursors[q_group][0]
+                                for candidate_split in cutlass.range_constexpr(
+                                    1, self.split_kv
+                                ):
+                                    if split_idx == candidate_split:
+                                        split_cursor = private_cursors[q_group][
+                                            candidate_split
+                                        ]
+                                split_segment = split_idx * 32 + store_lane
+                                for vec_idx in cutlass.range_constexpr(4):
+                                    split_cursor = (
+                                        self._store_candidate_lane_row_pair_full(  # type: ignore[attr-defined]
+                                            row_logits_addr,
+                                            logical_base_0 + vec_idx,
+                                            logical_base_1 + vec_idx,
+                                            threshold,
+                                            split_cursor,
+                                            split_segment,
+                                            scores_0[vec_idx],
+                                            scores_1[vec_idx],
+                                        )
+                                    )
+                                for candidate_split in cutlass.range_constexpr(
+                                    self.split_kv
+                                ):
+                                    if split_idx == candidate_split:
+                                        private_cursors[q_group][candidate_split] = (
+                                            split_cursor
+                                        )
+                            else:
+                                for vec_idx in cutlass.range_constexpr(4):
+                                    cursor_idx = (
+                                        0
+                                        if cutlass.const_expr(
+                                            self.num_count_segments == 32
+                                        )
+                                        else vec_idx // 2
+                                        if cutlass.const_expr(
+                                            self.num_count_segments == 64
+                                        )
+                                        else vec_idx
+                                    )
+                                    private_cursors[q_group][cursor_idx] = (
+                                        self._store_candidate_lane_row_pair_full(  # type: ignore[attr-defined]
+                                            row_logits_addr,
+                                            logical_base_0 + vec_idx,
+                                            logical_base_1 + vec_idx,
+                                            threshold,
+                                            private_cursors[q_group][cursor_idx],
+                                            lane_private_segment_base + cursor_idx,
+                                            scores_0[vec_idx],
+                                            scores_1[vec_idx],
+                                        )
+                                    )
+                        elif cutlass.const_expr(self.count_segment_span == 128):
+                            pooled_cursor = private_cursors[q_group][0]
+                            for vec_idx in cutlass.range_constexpr(4):
+                                pooled_cursor = (
+                                    self._store_candidate_warp_row_pair_full(  # type: ignore[attr-defined]
+                                        row_logits_addr,
+                                        logical_base_0 + vec_idx,
+                                        logical_base_1 + vec_idx,
+                                        threshold,
+                                        pooled_cursor,
+                                        split_idx,
+                                        scores_0[vec_idx],
+                                        scores_1[vec_idx],
+                                    )
+                                )
+                            private_cursors[q_group][0] = pooled_cursor
+                        else:
+                            for vec_idx in cutlass.range_constexpr(4):
+                                private_cursors[q_group][vec_idx] = (
+                                    self._store_candidate_warp_row_pair_full(  # type: ignore[attr-defined]
+                                        row_logits_addr,
+                                        logical_base_0 + vec_idx,
+                                        logical_base_1 + vec_idx,
+                                        threshold,
+                                        private_cursors[q_group][vec_idx],
+                                        split_idx * 4 + vec_idx,
+                                        scores_0[vec_idx],
+                                        scores_1[vec_idx],
+                                    )
+                                )
+
+                publish_split = kv_idx + NUM_MATH_WG >= num_kv
+                if cutlass.const_expr(self.split_kv > 1):
+                    publish_split = kv_idx + NUM_MATH_WG >= split_end_kv
+                if publish_split:
+                    for q_group in cutlass.range_constexpr(num_q_groups):
+                        row = store_warp + q_group * NUM_STORE_WARPS
+                        if cutlass.const_expr(self.count_segment_span == 1):
+                            publish_count = row < q_valid
+                        else:
+                            publish_count = (store_lane == 0) & (row < q_valid)
+                        if publish_count:
+                            out_row = out_row_base + row
+                            if cutlass.const_expr(self.count_segment_span == 1):
+                                if cutlass.const_expr(self.split_kv > 1):
+                                    for candidate_split in cutlass.range_constexpr(
+                                        self.split_kv
+                                    ):
+                                        if split_idx == candidate_split:
+                                            mIndexCounts[
+                                                (
+                                                    out_row,
+                                                    candidate_split * 32
+                                                    + store_lane
+                                                    + 1,
+                                                )
+                                            ] = private_cursors[q_group][
+                                                candidate_split
+                                            ]
+                                else:
+                                    num_lane_segments = (
+                                        1
+                                        if cutlass.const_expr(
+                                            self.num_count_segments == 32
+                                        )
+                                        else 2
+                                        if cutlass.const_expr(
+                                            self.num_count_segments == 64
+                                        )
+                                        else 4
+                                    )
+                                    for vec_idx in cutlass.range_constexpr(
+                                        num_lane_segments
+                                    ):
+                                        mIndexCounts[
+                                            (
+                                                out_row,
+                                                lane_private_segment_base + vec_idx + 1,
+                                            )
+                                        ] = private_cursors[q_group][vec_idx]
+                            elif cutlass.const_expr(self.count_segment_span == 128):
+                                mIndexCounts[(out_row, split_idx + 1)] = (
+                                    private_cursors[q_group][0]
+                                )
+                            else:
+                                for vec_idx in cutlass.range_constexpr(4):
+                                    mIndexCounts[
+                                        (out_row, split_idx * 4 + vec_idx + 1)
+                                    ] = private_cursors[q_group][vec_idx]
+                        if cutlass.const_expr(self.count_segment_span == 128):
+                            private_cursors[q_group][0] = cutlass.Int32(0)
+                        elif cutlass.const_expr(self.count_segment_span != 1):
+                            # The cursor is warp-uniform state. Every lane must
+                            # reset it before this persistent CTA accepts a new
+                            # split work item; lane 0 alone publishes the count.
+                            for vec_idx in cutlass.range_constexpr(4):
+                                private_cursors[q_group][vec_idx] = cutlass.Int32(0)
+                if cutlass.const_expr(next_n < NUM_STORE_WARPS):
+                    store_pipeline_0.consumer_release(store_cons_state_0)
+                    store_cons_state_0.advance()
+                    store_pipeline_1.consumer_release(store_cons_state_1)
+                    store_cons_state_1.advance()
+
+                next_kv_idx = kv_idx + NUM_MATH_WG
+                if next_kv_idx >= num_kv:
+                    next_q_idx = q_idx + 1
+                    next_kv_idx = 0
+                    if next_q_idx < batch_size:
+                        next_num_kv = (
+                            mContextLens[next_q_idx] + block_kv_val - 1
+                        ) // block_kv_val
+                    while (
+                        (next_num_kv == 0)
+                        & (next_q_idx < batch_size)
+                        & ((next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx))
+                    ):
+                        next_q_idx = next_q_idx + 1
+                        if next_q_idx < batch_size:
+                            next_num_kv = (
+                                mContextLens[next_q_idx] + block_kv_val - 1
+                            ) // block_kv_val
+                has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
+
+
+class FP8MQALogitsKernel(_FP8MQAEngineMixin):
     """FP8 paged MQA logits kernel for Blackwell (SM100/SM103) and Rubin (SM107).
 
     Each CTA processes a range of (q_idx, kv_split) pairs.
@@ -296,7 +2486,36 @@ class FP8MQALogitsKernel:
         w_cache_regs=None,
         *,
         arch: str,
+        output_index_bits: int = 32,
+        math_mode: str = "relu_strict",
+        explicit_query_bounds: bool = False,
+        num_q_stages: int | None = None,
+        num_kv_stages: int | None = None,
     ):
+        for stages in (num_q_stages, num_kv_stages):
+            if stages is not None and (type(stages) is not int or stages not in (2, 3)):
+                raise ValueError("explicit Q/KV stages must be 2 or 3")
+        if (num_q_stages is not None or num_kv_stages is not None) and (
+            max_kv_pipeline or max_umma_pipeline
+        ):
+            raise ValueError("explicit SMEM stages prohibit automatic pipeline sizing")
+        if type(explicit_query_bounds) is not bool:
+            raise TypeError("explicit_query_bounds must be bool")
+        if explicit_query_bounds and (
+            block_kv != 128
+            or not 8 <= num_heads * next_n <= 256
+            or (num_heads * next_n) % 8
+        ):
+            raise ValueError("explicit query geometry requires CG1 M128 and legal N")
+        self.explicit_query_bounds = explicit_query_bounds
+        if explicit_query_bounds and (
+            epi_dtype != cutlass.Float32
+            or acc_dtype != cutlass.Float32
+            or output_dtype != cutlass.Float32
+            or math_mode != "relu_strict"
+        ):
+            raise ValueError("explicit query bounds require strict all-FP32 math")
+        self._math_mode = _validate_math_mode(math_mode)
         # arch is the cute.compile --gpu-arch target (e.g. "sm_100a"), passed
         # explicitly and required: __init__ runs before compilation installs
         # the target, so a DSL arch query here would silently read the ambient
@@ -312,6 +2531,9 @@ class FP8MQALogitsKernel:
                 f"w_cache_regs must be a positive register count; got {w_cache_regs}"
             )
         self.w_cache_regs = _MAX_W_CACHE_REGS if w_cache_regs is None else w_cache_regs
+        if output_index_bits not in (32, 64):
+            raise ValueError("output_index_bits must be 32 or 64")
+        self.output_index_bits = output_index_bits
         self.block_kv = block_kv
         self.phys_block_kv = phys_block_kv
         self.num_blocks_per_mma = block_kv // phys_block_kv
@@ -375,7 +2597,7 @@ class FP8MQALogitsKernel:
         self.tma_warp_base = 8
         self.umma_warp_base = 10
 
-        self.num_q_stages = 3  # 3 stages for Q pipelining across batch sequences
+        self.num_q_stages = 3 if num_q_stages is None else num_q_stages
 
         # TMEM columns available on the compile target: each group needs N
         # columns per UMMA stage, so max_umma_stages = TMEM_COLS // (2 * N).
@@ -409,7 +2631,7 @@ class FP8MQALogitsKernel:
             qw_total = qw_per_stage * self.num_q_stages
             self.num_kv_stages = (SMEM_BUDGET - qw_total) // kv_scale_per_stage
         else:
-            self.num_kv_stages = 3
+            self.num_kv_stages = 3 if num_kv_stages is None else num_kv_stages
 
         # Pad SMEM to push sW/sScales into sub-partition 1 (>= 128KB),
         # avoiding sub-bank conflicts with UMMA reading sKV.
@@ -449,51 +2671,7 @@ class FP8MQALogitsKernel:
             self.cta_group,
             self.mma_tiler_mn,
         )
-        mma_inst_shape_k = cute.size(tiled_mma.shape_mnk, mode=[2])  # 32
-
-        # Full-K: tile K = head_dim (128), 1 TMA per block
-        mma_inst_tile_k = self.head_dim // mma_inst_shape_k  # 4
-        full_k = mma_inst_shape_k * mma_inst_tile_k  # 128
-        self.mma_tiler = (
-            self.mma_tiler_mn[0],
-            self.mma_tiler_mn[1],
-            full_k,
-        )
-
-        self.cta_tile_shape_mnk = (
-            self.mma_tiler[0] // cute.size(tiled_mma.thr_id.shape),
-            self.mma_tiler[1],
-            self.mma_tiler[2],
-        )
-        self.cluster_layout_vmnk = cute.tiled_divide(
-            cute.make_layout((*self.cluster_shape_mn, 1)),
-            (tiled_mma.thr_id.shape,),
-        )
-        self.epi_tile = self.cta_tile_shape_mnk[:2]
-
-        # KV SMEM: 3 stages per group, each stage holds full [128, 128]
-        self.a_smem_layout_staged = sm100_utils.make_smem_layout_a(
-            tiled_mma,
-            self.mma_tiler,
-            a_dtype,
-            self.num_kv_stages,
-        )
-        # Q SMEM: 1 stage, holds full [N, 128]
-        self.b_smem_layout_staged = sm100_utils.make_smem_layout_b(
-            tiled_mma,
-            self.mma_tiler,
-            b_dtype,
-            self.num_q_stages,
-        )
-
-        acc_shape = tiled_mma.partition_shape_C(self.mma_tiler[:2])
-        tCtAcc_fake = tiled_mma.make_fragment_C(acc_shape)
-        self.num_tmem_alloc_cols = utils.get_num_tmem_alloc_cols(tCtAcc_fake)
-        self.num_tmem_alloc_cols_total = (
-            self.num_tmem_alloc_cols * self.num_groups * self.num_umma_stages
-        )
-
-        return tiled_mma
+        return self._setup_mma_layout(tiled_mma, a_dtype, b_dtype)
 
     @cute.jit
     def __call__(
@@ -508,7 +2686,12 @@ class FP8MQALogitsKernel:
         num_phys_blocks: cutlass.Int32,
         batch_size: cutlass.Int32,
         stream: cuda.CUstream,
+        query_metadata=None,
     ):
+        if cutlass.const_expr(
+            self.explicit_query_bounds != (query_metadata is not None)
+        ):
+            raise ValueError("explicit query metadata ABI mismatch")
         # Derive KV and Scale views from fused buffer using CuTE ops.
         # Fused layout per physical block: [KV data (phys_block_kv*head_dim)] [Scales (phys_block_kv*4)]
         phys_block_kv = self.phys_block_kv
@@ -659,6 +2842,7 @@ class FP8MQALogitsKernel:
             block_table,
             context_lens,
             schedule_meta,
+            query_metadata,
             batch_size,
             self.cluster_layout_vmnk,
             self.a_smem_layout_staged,
@@ -691,6 +2875,7 @@ class FP8MQALogitsKernel:
         mBlockTable: cute.Tensor,  # [batch_size, max_blocks_per_seq]
         mContextLens: cute.Tensor,  # [batch_size]
         mScheduleMeta: cute.Tensor,  # [num_sms+1, 2] int32
+        mQueryMetadata,
         batch_size: cutlass.Int32,
         cluster_layout_vmnk: cute.Layout,
         a_smem_layout_staged: cute.ComposedLayout,
@@ -729,8 +2914,6 @@ class FP8MQALogitsKernel:
         # ~200-cycle L2 latency overlaps with subsequent prologue setup
         # (SMEM alloc, TMA partition, MMA fragment creation, etc.)
         NUM_MATH_WG = 2  # kNumMathWarpGroups
-        NUM_BLOCKS_PER_MMA = self.num_blocks_per_mma
-        PHYS_BLOCK_KV = self.phys_block_kv
         sm_idx = bidz
         start_q = mScheduleMeta[(sm_idx, 0)]
         start_kv_half = mScheduleMeta[(sm_idx, 1)]
@@ -748,15 +2931,14 @@ class FP8MQALogitsKernel:
 
         block_kv_val = self.block_kv
         num_heads = self.num_heads
-        next_n = self.next_n
         num_epi_subtiles = self.num_epi_subtiles
 
         # === Pipelines ===
         prod_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
 
-        # Q pipeline: TMA producer → Math consumer (8 math warps)
+        # Q pipeline: TMA producer -> Math consumer (8 math warps)
         # PipelineTmaAsync: consumer_release uses is_signalling_thread
-        # (lane 0 per warp). 8 math warps × 1 lane-0 = 8 arrives.
+        # (lane 0 per warp). 8 math warps * 1 lane-0 = 8 arrives.
         q_cons_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, 8)
         q_pipeline = pipeline.PipelineTmaAsync.create(
             barrier_storage=storage.q_mbar.data_ptr(),
@@ -785,7 +2967,7 @@ class FP8MQALogitsKernel:
             pipeline.PipelineUserType.Consumer, self.num_q_stages
         )
 
-        # Merged KV+Scale pipelines (per-group, 3 stages each)
+        # Merged KV+Scale pipelines use the configured per-group ring size.
         # Like DeepGEMM: KV data and scales share one barrier.
         # TMA loads both under one barrier. Math is consumer (releases).
         # UMMA also waits on this barrier (for KV GEMM) but does NOT release.
@@ -871,7 +3053,7 @@ class FP8MQALogitsKernel:
             pipeline.PipelineUserType.Consumer, self.num_umma_stages
         )
 
-        # TMEM — only Math warps (8×32=256) + UMMA warps (2×32=64) = 320 threads
+        # TMEM -- only Math warps (8*32=256) + UMMA warps (2*32=64) = 320 threads
         # TMA warps do NOT participate, so they can start TMA loads earlier.
         # Math warp 0 is the allocator (like fp16_gemm_3's epilogue warp 0),
         # because math warps are the last TMEM consumers (epilogue reads).
@@ -938,7 +3120,7 @@ class FP8MQALogitsKernel:
         )
 
         # Partition KV (A): fmha_decode_paged pattern.
-        # SMEM view is ((tile), num_sub_blocks, stages) — built in __call__.
+        # SMEM view is ((tile), num_sub_blocks, stages) -- built in __call__.
         # Use .outer (plain layout); swizzle is captured by sKV_0's iterator.
         # GMEM: local_tile by (phys, head), then group first 2 modes into tile.
         thr_mma = tiled_mma.get_slice(mma_tile_coord_v)
@@ -983,7 +3165,7 @@ class FP8MQALogitsKernel:
         )
         tBgB = tBgB[(None, 0, None, None)]  # [tma, K, L]
 
-        # Partition Weights: standalone TMA, [N, batch_size] → [N] per stage
+        # Partition Weights: standalone TMA, [N, batch_size] -> [N] per stage
         w_cta_layout = cute.make_layout((1,))
         tWsW, tWgW = cpasync.tma_partition(
             tma_atom_w,
@@ -1025,7 +3207,7 @@ class FP8MQALogitsKernel:
         acc_shape = tiled_mma.partition_shape_C(self.mma_tiler[:2])
 
         # Staged acc (fp16_gemm_3 pattern): append UMMA stage dim
-        # shape: (*acc_shape, STAGE) — dynamic index on last dim reduces rank
+        # shape: (*acc_shape, STAGE) -- dynamic index on last dim reduces rank
         us = self.num_umma_stages
         cols = self.num_tmem_alloc_cols
         acc_shape_staged = cute.append(acc_shape, us)
@@ -1051,7 +3233,7 @@ class FP8MQALogitsKernel:
         # Consumers of the early schedule-metadata loads, placed at their
         # real use site. Known codegen limitation (not worked around):
         # the compiler does not keep these global loads and their
-        # consumers apart — regardless of source
+        # consumers apart -- regardless of source
         # placement, the clamp+add+shift chain is hoisted right after its
         # load, exposing the two L2 round-trips instead of hiding them
         # under the independent mbarrier-init work. ptxas trades exposed
@@ -1095,179 +3277,51 @@ class FP8MQALogitsKernel:
             q_idx = batch_size  # sentinel: no previous batch
             has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
 
-            lane_idx = tidx % 32
-
-            # Block table prefetch: 32 lanes cache block indices,
-            # distributed via shuffle. Each lane holds num_blocks_per_mma
-            # physical block indices per compute tile. (DeepGEMM L233-244)
-            cached_blks = [cutlass.Int32(0) for _ in range(NUM_BLOCKS_PER_MMA)]
-            kv_blk_ptr = cutlass.Int32(32)  # force prefetch on first use
-
-            # Prefetch first Q before loop (like DeepGEMM line 203-204)
-            q_pipeline.producer_acquire(q_prod_state)
-            q_bar = q_pipeline.producer_get_barrier(q_prod_state)
-            cute.copy(
+            (q_prod_state, kv_prod_state_0) = self._run_tma_role(
+                mContextLens,
+                batch_size,
+                block_kv_val,
+                end_q_idx,
+                end_kv_idx,
+                next_q_idx,
+                next_kv_idx,
+                next_num_kv,
+                q_idx,
+                has_work,
+                tidx,
+                kv_pipeline_0,
+                kv_prod_state_0,
+                mBlockTable,
+                mBlockTable,
+                mBlockTable,
+                tma_atom_a,
+                tAgA_0,
+                tAsA_0,
+                tma_atom_s,
+                tSgS_0,
+                tSsS_0,
+                a_mcast_mask,
+                0,
+                True,
+                False,
+                False,
+                False,
+                False,
+                q_pipeline,
+                q_prod_state,
+                mB_nkl,
+                mW_tma,
+                thr_mma,
+                sQ,
+                sW,
                 tma_atom_b,
-                tBgB[(None, 0, next_q_idx)],
-                tBsB[(None, q_prod_state.index)],
-                tma_bar_ptr=q_bar,
-                mcast_mask=b_mcast_mask,
-            )
-            cute.copy(
                 tma_atom_w,
-                tWgW[(None, next_q_idx)],
-                tWsW[(None, q_prod_state.index)],
-                tma_bar_ptr=q_bar,
+                tBgB,
+                tWgW,
+                tBsB,
+                tWsW,
+                b_mcast_mask,
             )
-            q_prod_state.advance()
-
-            while has_work:
-                # fetch_next_task: commit next → current
-                q_idx_old = q_idx
-                q_idx = next_q_idx
-                kv_idx = next_kv_idx
-                num_kv = next_num_kv
-
-                # Q prefetch: when batch changes, load Q for NEXT batch
-                if q_idx != q_idx_old:
-                    kv_blk_ptr = cutlass.Int32(32)  # force re-prefetch
-                    prefetch_next = q_idx + 1
-                    # The task-advance blocks below skip zero-length rows, so
-                    # this lookahead must land on the SAME row the consumers
-                    # will visit next. Prefetching a raw q_idx+1 that the
-                    # iterators skip pushes the skipped row's Q/W into the
-                    # pipeline, and the row after the gap then consumes it --
-                    # silently wrong logits. Stage counts still match, so it
-                    # does not hang, which is why only an interspersed-zero
-                    # case exposes it (a trailing zero is masked by the
-                    # prefetch_next < end_q_idx guard below).
-                    peek_ctx = cutlass.Int32(1)  # nonzero => do not skip
-                    if prefetch_next < end_q_idx:
-                        peek_ctx = mContextLens[prefetch_next]
-                    while (peek_ctx == 0) & (prefetch_next < end_q_idx):
-                        prefetch_next = prefetch_next + 1
-                        if prefetch_next < end_q_idx:
-                            peek_ctx = mContextLens[prefetch_next]
-                        else:
-                            peek_ctx = cutlass.Int32(1)
-                    if prefetch_next < end_q_idx:
-                        q_pipeline.producer_acquire(q_prod_state)
-                        q_bar = q_pipeline.producer_get_barrier(q_prod_state)
-                        cute.copy(
-                            tma_atom_b,
-                            tBgB[(None, 0, prefetch_next)],
-                            tBsB[(None, q_prod_state.index)],
-                            tma_bar_ptr=q_bar,
-                            mcast_mask=b_mcast_mask,
-                        )
-                        cute.copy(
-                            tma_atom_w,
-                            tWgW[(None, prefetch_next)],
-                            tWsW[(None, q_prod_state.index)],
-                            tma_bar_ptr=q_bar,
-                        )
-                        q_prod_state.advance()
-                    elif prefetch_next == end_q_idx:
-                        if end_kv_idx > 0:
-                            q_pipeline.producer_acquire(q_prod_state)
-                            q_bar = q_pipeline.producer_get_barrier(q_prod_state)
-                            cute.copy(
-                                tma_atom_b,
-                                tBgB[(None, 0, prefetch_next)],
-                                tBsB[(None, q_prod_state.index)],
-                                tma_bar_ptr=q_bar,
-                                mcast_mask=b_mcast_mask,
-                            )
-                            cute.copy(
-                                tma_atom_w,
-                                tWgW[(None, prefetch_next)],
-                                tWsW[(None, q_prod_state.index)],
-                                tma_bar_ptr=q_bar,
-                            )
-                            q_prod_state.advance()
-
-                # Block table prefetch for group 0 (like DeepGEMM L233-241).
-                # Each lane loads num_blocks_per_mma physical block indices
-                # for one compute tile (kv_idx counts compute tiles).
-                #
-                # Tail-predicated per COLUMN, not per tile: the table is only
-                # guaranteed ceil(ctx / phys_block_kv) columns wide (the
-                # natural serving-stack width), while a compute tile spans
-                # NUM_BLOCKS_PER_MMA columns, so the last tile of a row whose
-                # length is not a multiple of block_kv would otherwise read
-                # past the row -- the next row's entries, or past the
-                # allocation on the last row (memcheck: 4-byte over-read).
-                # Columns beyond the row's blocks only feed positions >= ctx,
-                # which the epilogue masks, so block 0 (always in the pool)
-                # stands in, as it already does for lanes past the last tile.
-                # Cost: one warp-uniform, L2-hot Int32 load per re-prefetch
-                # (every 32 tiles or at a row change) and a compare per column.
-                if kv_blk_ptr == 32:
-                    kv_blk_ptr = cutlass.Int32(0)
-                    prefetch_kv = kv_idx + lane_idx * NUM_MATH_WG
-                    num_phys_row = (
-                        mContextLens[q_idx] + PHYS_BLOCK_KV - 1
-                    ) // PHYS_BLOCK_KV
-                    for i in cutlass.range_constexpr(NUM_BLOCKS_PER_MMA):
-                        col = prefetch_kv * NUM_BLOCKS_PER_MMA + i
-                        blk = cutlass.Int32(0)
-                        if col < num_phys_row:
-                            blk = mBlockTable[(q_idx, col)]
-                        cached_blks[i] = blk
-
-                # Get block indices via shuffle before barrier (like DeepGEMM L244)
-                phys_blks = [cutlass.Int32(0)] * NUM_BLOCKS_PER_MMA
-                for i in cutlass.range_constexpr(NUM_BLOCKS_PER_MMA):
-                    phys_blks[i] = cute.arch.shuffle_sync(cached_blks[i], kv_blk_ptr)
-                kv_blk_ptr = kv_blk_ptr + 1
-
-                # Load KV + Scale for group 0: num_blocks_per_mma TMAs per tile.
-                kv_pipeline_0.producer_acquire(kv_prod_state_0)
-                bar = kv_pipeline_0.producer_get_barrier(kv_prod_state_0)
-                stage = kv_prod_state_0.index
-                for i in cutlass.range_constexpr(NUM_BLOCKS_PER_MMA):
-                    cute.copy(
-                        tma_atom_a,
-                        tAgA_0[(None, 0, 0, phys_blks[i])],
-                        tAsA_0[(None, i, stage)],
-                        tma_bar_ptr=bar,
-                        mcast_mask=a_mcast_mask,
-                    )
-                    cute.copy(
-                        tma_atom_s,
-                        tSgS_0[(None, 0, phys_blks[i])],
-                        tSsS_0[(None, i, stage)],
-                        tma_bar_ptr=bar,
-                    )
-                kv_prod_state_0.advance()
-
-                # Advance: inline fetch_next_task
-                next_kv_idx = kv_idx + NUM_MATH_WG
-                if next_kv_idx >= num_kv:
-                    next_q_idx = q_idx + 1
-                    next_kv_idx = 0
-                    if next_q_idx < batch_size:
-                        next_num_kv = (
-                            mContextLens[next_q_idx] + block_kv_val - 1
-                        ) // block_kv_val
-                    # Zero-length rows get no scheduled work, but the exact-
-                    # coordinate termination below would still step onto them and
-                    # run a full pipeline turn (TMA + UMMA + epilogue). Skip them,
-                    # stopping at this CTA's end boundary so that boundary stays
-                    # reachable -- overshooting it would make the loop unable to
-                    # terminate. Every warp role runs this identical traversal.
-                    while (
-                        (next_num_kv == 0)
-                        & (next_q_idx < batch_size)
-                        & ((next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx))
-                    ):
-                        next_q_idx = next_q_idx + 1
-                        if next_q_idx < batch_size:
-                            next_num_kv = (
-                                mContextLens[next_q_idx] + block_kv_val - 1
-                            ) // block_kv_val
-                # Update while-loop condition
-                has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
 
         elif is_tma_warp_1:
             # TMA warp 1: loads KV + Scale for group 1 only
@@ -1282,91 +3336,37 @@ class FP8MQALogitsKernel:
             q_idx = batch_size  # sentinel: no previous batch
             has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
 
-            lane_idx = tidx % 32
-
-            # Block table prefetch for group 1
-            cached_blks = [cutlass.Int32(0) for _ in range(NUM_BLOCKS_PER_MMA)]
-            kv_blk_ptr = cutlass.Int32(32)  # force prefetch on first use
-
-            while has_work:
-                # fetch_next_task: commit next → current
-                q_idx_old = q_idx
-                q_idx = next_q_idx
-                kv_idx = next_kv_idx
-                num_kv = next_num_kv
-
-                # New q_idx → force block table re-prefetch
-                if q_idx != q_idx_old:
-                    kv_blk_ptr = cutlass.Int32(32)
-
-                # Block table prefetch for group 1 (like DeepGEMM L233-241);
-                # tail-predicated per column exactly like group 0 above.
-                if kv_blk_ptr == 32:
-                    kv_blk_ptr = cutlass.Int32(0)
-                    prefetch_kv = kv_idx + 1 + lane_idx * NUM_MATH_WG
-                    num_phys_row = (
-                        mContextLens[q_idx] + PHYS_BLOCK_KV - 1
-                    ) // PHYS_BLOCK_KV
-                    for i in cutlass.range_constexpr(NUM_BLOCKS_PER_MMA):
-                        col = prefetch_kv * NUM_BLOCKS_PER_MMA + i
-                        blk = cutlass.Int32(0)
-                        if col < num_phys_row:
-                            blk = mBlockTable[(q_idx, col)]
-                        cached_blks[i] = blk
-
-                # Get block indices via shuffle before barrier (like DeepGEMM L244)
-                phys_blks = [cutlass.Int32(0)] * NUM_BLOCKS_PER_MMA
-                for i in cutlass.range_constexpr(NUM_BLOCKS_PER_MMA):
-                    phys_blks[i] = cute.arch.shuffle_sync(cached_blks[i], kv_blk_ptr)
-                kv_blk_ptr = kv_blk_ptr + 1
-
-                # Load KV + Scale for group 1: num_blocks_per_mma TMAs per tile.
-                kv_pipeline_1.producer_acquire(kv_prod_state_1)
-                bar = kv_pipeline_1.producer_get_barrier(kv_prod_state_1)
-                stage = kv_prod_state_1.index
-                for i in cutlass.range_constexpr(NUM_BLOCKS_PER_MMA):
-                    cute.copy(
-                        tma_atom_a,
-                        tAgA_1[(None, 0, 0, phys_blks[i])],
-                        tAsA_1[(None, i, stage)],
-                        tma_bar_ptr=bar,
-                        mcast_mask=a_mcast_mask,
-                    )
-                    cute.copy(
-                        tma_atom_s,
-                        tSgS_1[(None, 0, phys_blks[i])],
-                        tSsS_1[(None, i, stage)],
-                        tma_bar_ptr=bar,
-                    )
-                kv_prod_state_1.advance()
-
-                # Advance: inline fetch_next_task
-                next_kv_idx = kv_idx + NUM_MATH_WG
-                if next_kv_idx >= num_kv:
-                    next_q_idx = q_idx + 1
-                    next_kv_idx = 0
-                    if next_q_idx < batch_size:
-                        next_num_kv = (
-                            mContextLens[next_q_idx] + block_kv_val - 1
-                        ) // block_kv_val
-                    # Zero-length rows get no scheduled work, but the exact-
-                    # coordinate termination below would still step onto them and
-                    # run a full pipeline turn (TMA + UMMA + epilogue). Skip them,
-                    # stopping at this CTA's end boundary so that boundary stays
-                    # reachable -- overshooting it would make the loop unable to
-                    # terminate. Every warp role runs this identical traversal.
-                    while (
-                        (next_num_kv == 0)
-                        & (next_q_idx < batch_size)
-                        & ((next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx))
-                    ):
-                        next_q_idx = next_q_idx + 1
-                        if next_q_idx < batch_size:
-                            next_num_kv = (
-                                mContextLens[next_q_idx] + block_kv_val - 1
-                            ) // block_kv_val
-                # Update while-loop condition
-                has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
+            kv_prod_state_1 = self._run_tma_role(
+                mContextLens,
+                batch_size,
+                block_kv_val,
+                end_q_idx,
+                end_kv_idx,
+                next_q_idx,
+                next_kv_idx,
+                next_num_kv,
+                q_idx,
+                has_work,
+                tidx,
+                kv_pipeline_1,
+                kv_prod_state_1,
+                mBlockTable,
+                mBlockTable,
+                mBlockTable,
+                tma_atom_a,
+                tAgA_1,
+                tAsA_1,
+                tma_atom_s,
+                tSgS_1,
+                tSsS_1,
+                a_mcast_mask,
+                1,
+                False,
+                False,
+                False,
+                False,
+                False,
+            )
 
         elif is_umma_warp_0:
             # UMMA warp for group 0
@@ -1384,90 +3384,40 @@ class FP8MQALogitsKernel:
             q_idx = batch_size  # sentinel: no previous batch
             has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
 
-            # TMEM: wait for math warp 0's allocation, retrieve pointer
-            tmem.wait_for_alloc()
-            tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
-            tCtAcc_base_0 = cute.make_tensor(tmem_ptr, tCtAcc_fake_staged.layout)
-            tCtAcc_base_1 = cute.make_tensor(
-                tmem_ptr + cols_per_group, tCtAcc_fake_staged.layout
+            # Each ordinary producer independently observes Q visibility.
+            tiled_mma, q_cons_state_umma_0, kv_cons_state_umma_0, umma_prod_state_0 = (
+                self._run_umma_role(
+                    mContextLens,
+                    batch_size,
+                    block_kv_val,
+                    end_q_idx,
+                    end_kv_idx,
+                    next_q_idx,
+                    next_kv_idx,
+                    next_num_kv,
+                    q_idx,
+                    has_work,
+                    is_leader_cta,
+                    q_pipeline,
+                    q_cons_state_umma_0,
+                    kv_pipeline_0,
+                    kv_cons_state_umma_0,
+                    umma_pipeline_0,
+                    umma_prod_state_0,
+                    tCrA_0,
+                    tCrB,
+                    tiled_mma,
+                    tmem,
+                    tCtAcc_fake_staged,
+                    0,
+                    False,
+                    False,
+                )
             )
-
-            if is_leader_cta:
-                num_k_blocks = cute.size(tCrA_0.shape[2])
-                q_stage_0 = cutlass.Int32(0)
-
-                while has_work:
-                    # fetch_next_task: commit next → current
-                    q_idx_old = q_idx
-                    q_idx = next_q_idx
-                    kv_idx = next_kv_idx
-                    num_kv = next_num_kv
-
-                    # Wait for Q pipeline when batch changes
-                    if q_idx != q_idx_old:
-                        if q_idx_old < batch_size:
-                            q_cons_state_umma_0.advance()
-                        q_pipeline.consumer_wait(q_cons_state_umma_0)
-                        q_stage_0 = q_cons_state_umma_0.index
-
-                    # Process KV block for group 0 (kv_idx + 0)
-                    # Unconditional UMMA (like DeepGEMM): OOB iterations
-                    # compute on garbage data; results written to aligned
-                    # padding region in logits buffer.
-                    # Wait KV first, then TMEM empty (like DeepGEMM)
-                    kv_pipeline_0.consumer_wait(kv_cons_state_umma_0)
-                    umma_pipeline_0.producer_acquire(umma_prod_state_0)
-                    tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
-                    kv_stage = kv_cons_state_umma_0.index
-                    tCtAcc_0 = tCtAcc_base_0[
-                        (None, None, None, umma_prod_state_0.index)
-                    ]
-                    for k_block in cutlass.range_constexpr(num_k_blocks):
-                        cute.gemm(
-                            tiled_mma,
-                            tCtAcc_0,
-                            tCrA_0[None, None, k_block, kv_stage],
-                            tCrB[None, None, k_block, q_stage_0],
-                            tCtAcc_0,
-                        )
-                        tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
-                    # No consumer_release here — Math WG 0 releases
-                    kv_cons_state_umma_0.advance()
-
-                    umma_pipeline_0.producer_commit(umma_prod_state_0)
-                    umma_prod_state_0.advance()
-
-                    # Advance: inline fetch_next_task
-                    next_kv_idx = kv_idx + NUM_MATH_WG
-                    if next_kv_idx >= num_kv:
-                        next_q_idx = q_idx + 1
-                        next_kv_idx = 0
-                        if next_q_idx < batch_size:
-                            next_num_kv = (
-                                mContextLens[next_q_idx] + block_kv_val - 1
-                            ) // block_kv_val
-                        # Zero-length rows get no scheduled work, but the exact-
-                        # coordinate termination below would still step onto them and
-                        # run a full pipeline turn (TMA + UMMA + epilogue). Skip them,
-                        # stopping at this CTA's end boundary so that boundary stays
-                        # reachable -- overshooting it would make the loop unable to
-                        # terminate. Every warp role runs this identical traversal.
-                        while (
-                            (next_num_kv == 0)
-                            & (next_q_idx < batch_size)
-                            & ((next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx))
-                        ):
-                            next_q_idx = next_q_idx + 1
-                            if next_q_idx < batch_size:
-                                next_num_kv = (
-                                    mContextLens[next_q_idx] + block_kv_val - 1
-                                ) // block_kv_val
-                    # Update while-loop condition
-                    has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
 
         elif is_umma_warp_1:
             # UMMA warp for group 1
-            # Explicitly waits on Q pipeline — critical because TMA warp 1
+            # Explicitly waits on Q pipeline -- critical because TMA warp 1
             # only loads KV1, not Q. Without this wait, UMMA warp 1 can
             # start GEMM before TMA warp 0 finishes loading Q into SMEM.
             cute.arch.warpgroup_reg_dealloc(24)
@@ -1480,84 +3430,36 @@ class FP8MQALogitsKernel:
             q_idx = batch_size  # sentinel: no previous batch
             has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
 
-            # TMEM: wait for umma_warp_0's allocation, retrieve pointer
-            tmem.wait_for_alloc()
-            tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
-            tCtAcc_base_0 = cute.make_tensor(tmem_ptr, tCtAcc_fake_staged.layout)
-            tCtAcc_base_1 = cute.make_tensor(
-                tmem_ptr + cols_per_group, tCtAcc_fake_staged.layout
+            # Each ordinary producer independently observes Q visibility.
+            tiled_mma, q_cons_state_umma_1, kv_cons_state_umma_1, umma_prod_state_1 = (
+                self._run_umma_role(
+                    mContextLens,
+                    batch_size,
+                    block_kv_val,
+                    end_q_idx,
+                    end_kv_idx,
+                    next_q_idx,
+                    next_kv_idx,
+                    next_num_kv,
+                    q_idx,
+                    has_work,
+                    is_leader_cta,
+                    q_pipeline,
+                    q_cons_state_umma_1,
+                    kv_pipeline_1,
+                    kv_cons_state_umma_1,
+                    umma_pipeline_1,
+                    umma_prod_state_1,
+                    tCrA_1,
+                    tCrB,
+                    tiled_mma,
+                    tmem,
+                    tCtAcc_fake_staged,
+                    cols_per_group,
+                    False,
+                    False,
+                )
             )
-
-            if is_leader_cta:
-                num_k_blocks_1 = cute.size(tCrA_1.shape[2])
-                q_stage_1 = cutlass.Int32(0)
-
-                while has_work:
-                    # fetch_next_task: commit next → current
-                    q_idx_old = q_idx
-                    q_idx = next_q_idx
-                    kv_idx = next_kv_idx
-                    num_kv = next_num_kv
-
-                    # Wait for Q pipeline when batch changes
-                    if q_idx != q_idx_old:
-                        if q_idx_old < batch_size:
-                            q_cons_state_umma_1.advance()
-                        q_pipeline.consumer_wait(q_cons_state_umma_1)
-                        q_stage_1 = q_cons_state_umma_1.index
-
-                    # Process KV block for group 1 (kv_idx + 1)
-                    # Unconditional UMMA (like DeepGEMM)
-                    # Wait KV first, then TMEM empty (like DeepGEMM)
-                    kv_pipeline_1.consumer_wait(kv_cons_state_umma_1)
-                    umma_pipeline_1.producer_acquire(umma_prod_state_1)
-                    tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
-                    kv_stage_1 = kv_cons_state_umma_1.index
-                    tCtAcc_1 = tCtAcc_base_1[
-                        (None, None, None, umma_prod_state_1.index)
-                    ]
-                    for k_block in cutlass.range_constexpr(num_k_blocks_1):
-                        cute.gemm(
-                            tiled_mma,
-                            tCtAcc_1,
-                            tCrA_1[None, None, k_block, kv_stage_1],
-                            tCrB[None, None, k_block, q_stage_1],
-                            tCtAcc_1,
-                        )
-                        tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
-                    # No consumer_release here — Math WG 1 releases
-                    kv_cons_state_umma_1.advance()
-
-                    umma_pipeline_1.producer_commit(umma_prod_state_1)
-                    umma_prod_state_1.advance()
-
-                    # Advance: inline fetch_next_task
-                    next_kv_idx = kv_idx + NUM_MATH_WG
-                    if next_kv_idx >= num_kv:
-                        next_q_idx = q_idx + 1
-                        next_kv_idx = 0
-                        if next_q_idx < batch_size:
-                            next_num_kv = (
-                                mContextLens[next_q_idx] + block_kv_val - 1
-                            ) // block_kv_val
-                        # Zero-length rows get no scheduled work, but the exact-
-                        # coordinate termination below would still step onto them and
-                        # run a full pipeline turn (TMA + UMMA + epilogue). Skip them,
-                        # stopping at this CTA's end boundary so that boundary stays
-                        # reachable -- overshooting it would make the loop unable to
-                        # terminate. Every warp role runs this identical traversal.
-                        while (
-                            (next_num_kv == 0)
-                            & (next_q_idx < batch_size)
-                            & ((next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx))
-                        ):
-                            next_q_idx = next_q_idx + 1
-                            if next_q_idx < batch_size:
-                                next_num_kv = (
-                                    mContextLens[next_q_idx] + block_kv_val - 1
-                                ) // block_kv_val
-                    # Update while-loop condition
-                    has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
 
         elif is_math_warp:
             cute.arch.warpgroup_reg_alloc(240)
@@ -1572,861 +3474,49 @@ class FP8MQALogitsKernel:
             q_idx = batch_size  # sentinel: no previous batch
             has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
 
-            # TMEM: math warp 0 is the allocator; all math warps wait + retrieve
-            tmem.allocate(num_tmem_alloc_cols_total)
-            tmem.wait_for_alloc()
-            tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
-            tCtAcc_base_0 = cute.make_tensor(tmem_ptr, tCtAcc_fake_staged.layout)
-            tCtAcc_base_1 = cute.make_tensor(
-                tmem_ptr + cols_per_group, tCtAcc_fake_staged.layout
+            (
+                q_cons_state,
+                kv_cons_state_math_0,
+                umma_cons_state_0,
+                kv_cons_state_math_1,
+                umma_cons_state_1,
+            ) = self._run_math_role(
+                mContextLens,
+                batch_size,
+                block_kv_val,
+                end_q_idx,
+                end_kv_idx,
+                next_q_idx,
+                next_kv_idx,
+                next_num_kv,
+                q_idx,
+                has_work,
+                tidx,
+                warpgroup_idx,
+                tmem,
+                num_tmem_alloc_cols_total,
+                tCtAcc_fake_staged,
+                cols_per_group,
+                epi_sub_mn,
+                copy_atom_t2r,
+                mLogits,
+                sW,
+                q_pipeline,
+                q_cons_state,
+                kv_pipeline_0,
+                umma_pipeline_0,
+                sScales_0,
+                False,
+                self.w_cache_regs,
+                kv_cons_state_math_0,
+                umma_cons_state_0,
+                kv_pipeline_1,
+                umma_pipeline_1,
+                sScales_1,
+                kv_cons_state_math_1,
+                umma_cons_state_1,
+                mTileMeta=mQueryMetadata,
             )
-
-            local_tidx = tidx % 128
-            cC = cute.make_identity_tensor(epi_sub_mn)
-
-            if warpgroup_idx == 0:
-                # Math WG 0: process group 0
-                # Reference setup (stage 0) for m_coord
-                # flat_divide by sub-tile to get sub-tile partitions
-                tAcc_0_ref = tCtAcc_base_0[(None, None, None, 0)][((None, None), 0, 0)]
-                tAcc_0_ref_epi = cute.flat_divide(tAcc_0_ref, epi_sub_mn)
-                tiled_copy_ref_0 = tcgen05.make_tmem_copy(
-                    copy_atom_t2r, tAcc_0_ref_epi[(None, None, 0, 0)]
-                )
-                thr_copy_ref_0 = tiled_copy_ref_0.get_slice(local_tidx)
-                tTR_cC = thr_copy_ref_0.partition_D(cC)
-                m_coord = tTR_cC[0][0]
-
-                tTR_rAcc = cute.make_fragment_like(tTR_cC, self.acc_dtype)
-
-                # Weight register cache: only first NUM_W_IN_REG
-                # per next_n slot (like DeepGEMM min(52, kNumHeads)).
-                # Remaining weights read from SMEM in epilogue.
-                # FP16 weights use half the regs, so we can fit
-                # all heads for next_n <= 3.
-                if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
-                    MAX_NUM_W_IN_REG = 64 if next_n <= 3 else 48
-                    # FP16 weights pack two per register.
-                    MAX_W_CACHE_ELEMS = 2 * self.w_cache_regs
-                else:
-                    MAX_NUM_W_IN_REG = 64 if next_n == 1 else 40 if next_n >= 4 else 52
-                    MAX_W_CACHE_ELEMS = self.w_cache_regs
-                # MAX_NUM_W_IN_REG caps the per-slot count, but the register
-                # footprint is the product NUM_W_IN_REG * next_n. Whenever
-                # num_heads <= MAX_NUM_W_IN_REG the per-slot cap never binds,
-                # and the footprint grows to num_heads * next_n == N, which the
-                # API admits up to 256 -- past the register file. Bound the
-                # product too. Must stay a single constexpr expression: a
-                # staged `if` here makes NUM_W_IN_REG a runtime value and the
-                # range_constexpr loops below fail to compile.
-                NUM_W_IN_REG = max(
-                    _EPI_UNROLL,
-                    min(
-                        MAX_NUM_W_IN_REG,
-                        num_heads,
-                        ((MAX_W_CACHE_ELEMS // next_n) // _EPI_UNROLL) * _EPI_UNROLL,
-                    ),
-                )
-                assert NUM_W_IN_REG % _EPI_UNROLL == 0
-                w_cache = cute.make_rmem_tensor(NUM_W_IN_REG * next_n, self.epi_dtype)
-                q_stage_local = cutlass.Int32(0)
-
-                # Flat logits view + carried row offset: the store address
-                # is base + out_row*stride0 + kv_pos, but out_row only
-                # changes on q-change. Recomputing the row term there (cold
-                # path) leaves the hot path a single add — the wide-multiply
-                # address chain otherwise re-materializes every task because
-                # the while-loop control flow hides the invariance.
-                # Gated off on Rubin (sm_107): there the backend schedules the
-                # UMMA consumer-release late in the math loop, throttling the
-                # MMA pipe per KV tile — regresses, growing with ctx.
-                # The 2D alias below keeps `mLogits` itself out of the gated
-                # store code: referencing a defined tensor from the untraced
-                # arm changes the loop-region captures (and the SASS schedule
-                # with it), while an undefined name is dropped harmlessly.
-                if cutlass.const_expr(self.use_flat_logits_view):
-                    logits_stride0 = cutlass.Int32(mLogits.layout.stride[0])
-                    # Sized by the pitched span (rows * stride0), not the
-                    # visible width: stores also cover the aligned padding
-                    # past max_context_len (host allocates the full pitch).
-                    mLogits_flat = cute.make_tensor(
-                        mLogits.iterator,
-                        cute.make_layout(cute.size(mLogits, mode=[0]) * logits_stride0),
-                    )
-                    out_row_off = cutlass.Int32(0)
-                else:
-                    mLogits_2d = mLogits
-
-                while has_work:
-                    # fetch_next_task: commit next → current
-                    q_idx_old = q_idx
-                    q_idx = next_q_idx
-                    kv_idx = next_kv_idx
-                    num_kv = next_num_kv
-
-                    # Q pipeline consumer: wait for Q+Weights SMEM
-                    if q_idx != q_idx_old:
-                        if q_idx_old < batch_size:
-                            q_pipeline.consumer_release(q_cons_state)
-                            q_cons_state.advance()
-                        q_pipeline.consumer_wait(q_cons_state)
-                        q_stage_local = q_cons_state.index
-                        if cutlass.const_expr(self.use_flat_logits_view):
-                            out_row_off = (q_idx * next_n) * logits_stride0
-                        # Preload first NUM_W_IN_REG weights per slot
-                        for t_i in cutlass.range_constexpr(next_n):
-                            for w_j in cutlass.range_constexpr(NUM_W_IN_REG):
-                                w_cache[t_i * NUM_W_IN_REG + w_j] = sW[
-                                    (t_i * num_heads + w_j, q_stage_local)
-                                ]
-                    # ---- inner: hot kv loop within this q ----
-                    # Two-level restructure: the two cold blocks (q-change
-                    # weight preload above, q-rollover ctx reload below) execute
-                    # rarely but sat inline in the single flat loop, costing
-                    # taken-branch fetch bubbles on every hot iteration. The
-                    # inner loop below replays exactly the original task sequence:
-                    #   original: process (q, kv); next_kv = kv + W;
-                    #             roll over to (q+1, 0) if next_kv >= num_kv;
-                    #             stop when (next_q, next_kv) == (end_q, end_kv).
-                    # Truth table for kv_go after processing (q, kv) and advancing
-                    # kv += W (W = NUM_MATH_WG):
-                    #   kv <  num_kv, (q, kv) != end -> True  (more kv in this q)
-                    #   kv <  num_kv, (q, kv) == end -> False (global end mid-q)
-                    #   kv >= num_kv, any            -> False (q exhausted; outer
-                    #                                          rollover runs next)
-                    # First iteration is unconditional, matching the original: the
-                    # outer while is only entered when the committed (q, kv) != end.
-                    # Gate (use_two_level_task_loop=False, Rubin nn>=4 auto):
-                    # forcing kv_go False after the body degenerates the inner
-                    # loop to a single trip, restoring the original flat loop
-                    # (per-task q-change check) without duplicating the skeleton.
-                    kv_go = cutlass.Boolean(True)
-                    while kv_go:
-                        # Process KV block for group 0 (kv_idx + 0)
-                        # Unconditional Math (like DeepGEMM): OOB results
-                        # written to aligned padding region in logits buffer.
-                        kv_pos = kv_idx * block_kv_val + m_coord
-
-                        if cutlass.const_expr(self.remove_kv_wait_in_epilogue):
-                            # Skip KV wait, rely on UMMA barrier's
-                            # transitive visibility.
-                            umma_pipeline_0.consumer_wait(umma_cons_state_0)
-                        elif cutlass.const_expr(self.use_paired_pipeline_polls):
-                            # Issue both barrier polls back-to-back so their
-                            # mbarrier round-trips overlap instead of running
-                            # serially; each blocking wait below short-circuits
-                            # when its poll already saw the barrier flipped.
-                            kv_ready_0 = kv_pipeline_0.consumer_try_wait(
-                                kv_cons_state_math_0
-                            )
-                            umma_ready_0 = umma_pipeline_0.consumer_try_wait(
-                                umma_cons_state_0
-                            )
-                            kv_pipeline_0.consumer_wait(
-                                kv_cons_state_math_0, kv_ready_0
-                            )
-                            sc_stage_0 = kv_cons_state_math_0.index
-                            scale_val = sScales_0[(m_coord, sc_stage_0)]
-                            umma_pipeline_0.consumer_wait(
-                                umma_cons_state_0, umma_ready_0
-                            )
-                        else:
-                            # Gated (Rubin nn>=4 auto): plain waits, KV first to
-                            # overlap the scale SMEM load with UMMA computation.
-                            kv_pipeline_0.consumer_wait(kv_cons_state_math_0)
-                            sc_stage_0 = kv_cons_state_math_0.index
-                            scale_val = sScales_0[(m_coord, sc_stage_0)]
-                            umma_pipeline_0.consumer_wait(umma_cons_state_0)
-
-                        # --- TMEM sub-tile setup ---
-                        # flat_divide accumulator by sub-tile shape;
-                        # partition once, then loop over sub-tiles.
-                        tCtAcc_c0 = tCtAcc_base_0[
-                            (None, None, None, umma_cons_state_0.index)
-                        ]
-                        tAcc_c0 = tCtAcc_c0[((None, None), 0, 0)]
-                        tAcc_c0_epi = cute.flat_divide(tAcc_c0, epi_sub_mn)
-                        # Every UMMA stage shares the staged-fragment layout and
-                        # differs only in TMEM base address, so the pre-loop
-                        # tiled copy / thread slice partition every stage;
-                        # rebuilding them per task re-derives loop-invariant
-                        # copy descriptors inside the hot loop.
-                        tTR_0 = thr_copy_ref_0.partition_S(tAcc_c0_epi)
-
-                        # --- First sub-tile LDTM + KV release ---
-                        if cutlass.const_expr(self.early_tmem_copy):
-                            # Issue first sub-tile LDTM early
-                            cute.copy(
-                                tiled_copy_ref_0,
-                                tTR_0[(None, None, None, 0, 0)],
-                                tTR_rAcc,
-                            )
-                            # Scale LDS + KV release fill latency
-                            if cutlass.const_expr(self.remove_kv_wait_in_epilogue):
-                                sc_stage_0 = kv_cons_state_math_0.index
-                                scale_val = sScales_0[(m_coord, sc_stage_0)]
-                            kv_pipeline_0.consumer_release(kv_cons_state_math_0)
-                            kv_cons_state_math_0.advance()
-                            cute.arch.fence_view_async_tmem_load()
-                        else:
-                            # Default: scale LDS + KV release first
-                            if cutlass.const_expr(self.remove_kv_wait_in_epilogue):
-                                sc_stage_0 = kv_cons_state_math_0.index
-                                scale_val = sScales_0[(m_coord, sc_stage_0)]
-                            kv_pipeline_0.consumer_release(kv_cons_state_math_0)
-                            kv_cons_state_math_0.advance()
-                            cute.copy(
-                                tiled_copy_ref_0,
-                                tTR_0[(None, None, None, 0, 0)],
-                                tTR_rAcc,
-                            )
-                            cute.arch.fence_view_async_tmem_load()
-
-                        # --- Sub-tile compute loop ---
-                        # Each sub-tile: LDTM.xN → fence → load →
-                        # ReLU+FMA. Breaks FMA chain (16→4 per chunk)
-                        # and interleaves LDTM with FP32 compute to
-                        # reduce ShadowPipeThrottle.
-                        # Sub-tiles are within each t-slot (num_heads
-                        # // num_epi_subtiles wide). flat_divide yields
-                        # next_n * num_epi_subtiles sub-tiles total;
-                        # global index = t * num_epi_subtiles + i.
-                        subtile_n = num_heads // num_epi_subtiles
-                        if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
-                            packed_zero = pack_f16x2(Float16(0.0), Float16(0.0))
-                        for t in cutlass.range_constexpr(next_n):
-                            if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
-                                ps0 = packed_zero
-                                ps1 = packed_zero
-                            else:
-                                s0x = cutlass.Float32(0.0)
-                                s0y = cutlass.Float32(0.0)
-                                s1x = cutlass.Float32(0.0)
-                                s1y = cutlass.Float32(0.0)
-                            for i in cutlass.range_constexpr(num_epi_subtiles):
-                                # LDTM for sub-tiles 1..N-1
-                                # (sub-tile 0 handled above)
-                                if t > 0 or i > 0:
-                                    cute.copy(
-                                        tiled_copy_ref_0,
-                                        tTR_0[
-                                            (
-                                                None,
-                                                None,
-                                                None,
-                                                0,
-                                                t * num_epi_subtiles + i,
-                                            )
-                                        ],
-                                        tTR_rAcc,
-                                    )
-                                    cute.arch.fence_view_async_tmem_load()
-                                # Release UMMA after last LDTM+fence
-                                if t == next_n - 1 and i == num_epi_subtiles - 1:
-                                    umma_pipeline_0.consumer_release(umma_cons_state_0)
-                                    umma_cons_state_0.advance()
-                                acc_vec = tTR_rAcc.load()
-                                # Reg-path: weights from registers
-                                reg_h_end = min(
-                                    subtile_n, max(0, NUM_W_IN_REG - i * subtile_n)
-                                )
-                                for h in cutlass.range_constexpr(0, reg_h_end, 4):
-                                    n0 = h
-                                    h_g = i * subtile_n + h
-                                    if cutlass.const_expr(
-                                        self.epi_dtype == cutlass.Float16
-                                    ):
-                                        pa01 = pack_f16x2(
-                                            Float16(acc_vec[n0]),
-                                            Float16(acc_vec[n0 + 1]),
-                                        )
-                                        pa23 = pack_f16x2(
-                                            Float16(acc_vec[n0 + 2]),
-                                            Float16(acc_vec[n0 + 3]),
-                                        )
-                                        pa01 = max_f16x2(pa01, packed_zero)
-                                        pa23 = max_f16x2(pa23, packed_zero)
-                                        r0 = t * NUM_W_IN_REG + h_g
-                                        pw01 = pack_f16x2(w_cache[r0], w_cache[r0 + 1])
-                                        pw23 = pack_f16x2(
-                                            w_cache[r0 + 2], w_cache[r0 + 3]
-                                        )
-                                        ps0 = fma_f16x2(pa01, pw01, ps0)
-                                        ps1 = fma_f16x2(pa23, pw23, ps1)
-                                    else:
-                                        # relu as one FMNMX per head (`max.NaN.f32`): exact and range-safe for
-                                        # every finite accumulator (the (x + |x|) / 2 form it replaces overflowed
-                                        # for x >= 2^127, reachable through unbounded scales / weights), NaN-
-                                        # propagating like the scalar max, one instruction per head. Weights are
-                                        # applied unscaled. Ported from DKG MR !27837, range-safe form.
-                                        a0 = relu_f32(acc_vec[n0])
-                                        a1 = relu_f32(acc_vec[n0 + 1])
-                                        a2 = relu_f32(acc_vec[n0 + 2])
-                                        a3 = relu_f32(acc_vec[n0 + 3])
-                                        r0 = t * NUM_W_IN_REG + h_g
-                                        w0 = w_cache[r0]
-                                        w1 = w_cache[r0 + 1]
-                                        w2 = w_cache[r0 + 2]
-                                        w3 = w_cache[r0 + 3]
-                                        s0x, s0y = cute.arch.fma_packed_f32x2(
-                                            (a0, a1), (w0, w1), (s0x, s0y), rnd=_RND_RN
-                                        )
-                                        s1x, s1y = cute.arch.fma_packed_f32x2(
-                                            (a2, a3), (w2, w3), (s1x, s1y), rnd=_RND_RN
-                                        )
-                                # SMEM-path: weights from shared mem
-                                smem_h_start = max(0, NUM_W_IN_REG - i * subtile_n)
-                                for h in cutlass.range_constexpr(
-                                    smem_h_start, subtile_n, 4
-                                ):
-                                    n0 = h
-                                    h_g = i * subtile_n + h
-                                    if cutlass.const_expr(
-                                        self.epi_dtype == cutlass.Float16
-                                    ):
-                                        pa01 = pack_f16x2(
-                                            Float16(acc_vec[n0]),
-                                            Float16(acc_vec[n0 + 1]),
-                                        )
-                                        pa23 = pack_f16x2(
-                                            Float16(acc_vec[n0 + 2]),
-                                            Float16(acc_vec[n0 + 3]),
-                                        )
-                                        pa01 = max_f16x2(pa01, packed_zero)
-                                        pa23 = max_f16x2(pa23, packed_zero)
-                                        pw01 = pack_f16x2(
-                                            sW[(t * num_heads + h_g, q_stage_local)],
-                                            sW[
-                                                (t * num_heads + h_g + 1, q_stage_local)
-                                            ],
-                                        )
-                                        pw23 = pack_f16x2(
-                                            sW[
-                                                (t * num_heads + h_g + 2, q_stage_local)
-                                            ],
-                                            sW[
-                                                (t * num_heads + h_g + 3, q_stage_local)
-                                            ],
-                                        )
-                                        ps0 = fma_f16x2(pa01, pw01, ps0)
-                                        ps1 = fma_f16x2(pa23, pw23, ps1)
-                                    else:
-                                        # relu as one FMNMX per head (`max.NaN.f32`): exact and range-safe for
-                                        # every finite accumulator (the (x + |x|) / 2 form it replaces overflowed
-                                        # for x >= 2^127, reachable through unbounded scales / weights), NaN-
-                                        # propagating like the scalar max, one instruction per head. Weights are
-                                        # applied unscaled. Ported from DKG MR !27837, range-safe form.
-                                        a0 = relu_f32(acc_vec[n0])
-                                        a1 = relu_f32(acc_vec[n0 + 1])
-                                        a2 = relu_f32(acc_vec[n0 + 2])
-                                        a3 = relu_f32(acc_vec[n0 + 3])
-                                        w0 = sW[(t * num_heads + h_g, q_stage_local)]
-                                        w1 = sW[
-                                            (t * num_heads + h_g + 1, q_stage_local)
-                                        ]
-                                        w2 = sW[
-                                            (t * num_heads + h_g + 2, q_stage_local)
-                                        ]
-                                        w3 = sW[
-                                            (t * num_heads + h_g + 3, q_stage_local)
-                                        ]
-                                        s0x, s0y = cute.arch.fma_packed_f32x2(
-                                            (a0, a1), (w0, w1), (s0x, s0y), rnd=_RND_RN
-                                        )
-                                        s1x, s1y = cute.arch.fma_packed_f32x2(
-                                            (a2, a3), (w2, w3), (s1x, s1y), rnd=_RND_RN
-                                        )
-                            if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
-                                ps_sum = add_f16x2(ps0, ps1)
-                                sum_lo, sum_hi = unpack_f16x2(ps_sum)
-                                result_t = sum_lo + sum_hi
-                            else:
-                                result_t = s0x + s0y + s1x + s1y
-                            if cutlass.const_expr(self.use_flat_logits_view):
-                                out_off_t = out_row_off + t * logits_stride0 + kv_pos
-                                if cutlass.const_expr(
-                                    self.epi_dtype == cutlass.Float16
-                                ):
-                                    mLogits_flat[out_off_t] = self.output_dtype(
-                                        result_t * Float16(scale_val)
-                                    )
-                                else:
-                                    mLogits_flat[out_off_t] = self.output_dtype(
-                                        result_t * scale_val
-                                    )
-                            else:
-                                out_row = q_idx * next_n + t
-                                if cutlass.const_expr(
-                                    self.epi_dtype == cutlass.Float16
-                                ):
-                                    mLogits_2d[(out_row, kv_pos)] = self.output_dtype(
-                                        result_t * Float16(scale_val)
-                                    )
-                                else:
-                                    mLogits_2d[(out_row, kv_pos)] = self.output_dtype(
-                                        result_t * scale_val
-                                    )
-                        # Advance within this q
-                        kv_idx = kv_idx + NUM_MATH_WG
-                        kv_go = (kv_idx < num_kv) & (
-                            (q_idx != end_q_idx) | (kv_idx != end_kv_idx)
-                        )
-                        if cutlass.const_expr(not self.use_two_level_task_loop):
-                            kv_go = cutlass.Boolean(False)
-
-                    # ---- outer: rollover ----
-                    if kv_idx >= num_kv:
-                        # Inner loop exhausted this q's kv range: advance to the
-                        # next q (same as the original rollover path).
-                        next_q_idx = q_idx + 1
-                        next_kv_idx = 0
-                        if next_q_idx < batch_size:
-                            next_num_kv = (
-                                mContextLens[next_q_idx] + block_kv_val - 1
-                            ) // block_kv_val
-                        # Zero-length rows get no scheduled work, but the exact-
-                        # coordinate termination below would still step onto them and
-                        # run a full pipeline turn (TMA + UMMA + epilogue). Skip them,
-                        # stopping at this CTA's end boundary so that boundary stays
-                        # reachable -- overshooting it would make the loop unable to
-                        # terminate. Every warp role runs this identical traversal.
-                        while (
-                            (next_num_kv == 0)
-                            & (next_q_idx < batch_size)
-                            & ((next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx))
-                        ):
-                            next_q_idx = next_q_idx + 1
-                            if next_q_idx < batch_size:
-                                next_num_kv = (
-                                    mContextLens[next_q_idx] + block_kv_val - 1
-                                ) // block_kv_val
-                    else:
-                        # Global end hit mid-q: next == (q_idx, kv_idx) == end,
-                        # so has_work goes False below. kv_idx was already
-                        # advanced past the last processed task in the inner
-                        # loop, so this matches the original's next_kv_idx.
-                        next_q_idx = q_idx
-                        next_kv_idx = kv_idx
-                    # Update while-loop condition
-                    has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
-
-                # Release last Q stage (WG 0)
-                if q_idx < batch_size:
-                    q_pipeline.consumer_release(q_cons_state)
-                    q_cons_state.advance()
-
-            else:
-                # Math WG 1: process group 1
-                tAcc_1_ref = tCtAcc_base_1[(None, None, None, 0)][((None, None), 0, 0)]
-                tAcc_1_ref_epi = cute.flat_divide(tAcc_1_ref, epi_sub_mn)
-                tiled_copy_ref_1 = tcgen05.make_tmem_copy(
-                    copy_atom_t2r, tAcc_1_ref_epi[(None, None, 0, 0)]
-                )
-                thr_copy_ref_1 = tiled_copy_ref_1.get_slice(local_tidx)
-                tTR_cC = thr_copy_ref_1.partition_D(cC)
-                m_coord = tTR_cC[0][0]
-
-                tTR_rAcc = cute.make_fragment_like(tTR_cC, self.acc_dtype)
-
-                # Weight register cache: only first NUM_W_IN_REG
-                # per next_n slot (like DeepGEMM min(52, kNumHeads)).
-                # FP16 weights use half the regs, so we can fit
-                # all heads for next_n <= 3.
-                if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
-                    MAX_NUM_W_IN_REG = 64 if next_n <= 3 else 48
-                    # FP16 weights pack two per register.
-                    MAX_W_CACHE_ELEMS = 2 * self.w_cache_regs
-                else:
-                    MAX_NUM_W_IN_REG = 64 if next_n == 1 else 40 if next_n >= 4 else 52
-                    MAX_W_CACHE_ELEMS = self.w_cache_regs
-                # MAX_NUM_W_IN_REG caps the per-slot count, but the register
-                # footprint is the product NUM_W_IN_REG * next_n. Whenever
-                # num_heads <= MAX_NUM_W_IN_REG the per-slot cap never binds,
-                # and the footprint grows to num_heads * next_n == N, which the
-                # API admits up to 256 -- past the register file. Bound the
-                # product too. Must stay a single constexpr expression: a
-                # staged `if` here makes NUM_W_IN_REG a runtime value and the
-                # range_constexpr loops below fail to compile.
-                NUM_W_IN_REG = max(
-                    _EPI_UNROLL,
-                    min(
-                        MAX_NUM_W_IN_REG,
-                        num_heads,
-                        ((MAX_W_CACHE_ELEMS // next_n) // _EPI_UNROLL) * _EPI_UNROLL,
-                    ),
-                )
-                assert NUM_W_IN_REG % _EPI_UNROLL == 0
-                w_cache = cute.make_rmem_tensor(NUM_W_IN_REG * next_n, self.epi_dtype)
-                q_stage_local = cutlass.Int32(0)
-
-                # Flat logits view + carried row offset (see Math WG 0).
-                # Gated off on Rubin (sm_107): there the backend schedules the
-                # UMMA consumer-release late in the math loop, throttling the
-                # MMA pipe per KV tile — regresses, growing with ctx.
-                # The 2D alias below keeps `mLogits` itself out of the gated
-                # store code: referencing a defined tensor from the untraced
-                # arm changes the loop-region captures (and the SASS schedule
-                # with it), while an undefined name is dropped harmlessly.
-                if cutlass.const_expr(self.use_flat_logits_view):
-                    logits_stride0 = cutlass.Int32(mLogits.layout.stride[0])
-                    # Sized by the pitched span (rows * stride0), not the
-                    # visible width: stores also cover the aligned padding
-                    # past max_context_len (host allocates the full pitch).
-                    mLogits_flat = cute.make_tensor(
-                        mLogits.iterator,
-                        cute.make_layout(cute.size(mLogits, mode=[0]) * logits_stride0),
-                    )
-                    out_row_off = cutlass.Int32(0)
-                else:
-                    mLogits_2d = mLogits
-
-                while has_work:
-                    # fetch_next_task: commit next → current
-                    q_idx_old = q_idx
-                    q_idx = next_q_idx
-                    kv_idx = next_kv_idx
-                    num_kv = next_num_kv
-
-                    # Q pipeline consumer: wait for Q+Weights SMEM
-                    if q_idx != q_idx_old:
-                        if q_idx_old < batch_size:
-                            q_pipeline.consumer_release(q_cons_state)
-                            q_cons_state.advance()
-                        q_pipeline.consumer_wait(q_cons_state)
-                        q_stage_local = q_cons_state.index
-                        if cutlass.const_expr(self.use_flat_logits_view):
-                            out_row_off = (q_idx * next_n) * logits_stride0
-                        # Preload first NUM_W_IN_REG weights per slot
-                        for t_i in cutlass.range_constexpr(next_n):
-                            for w_j in cutlass.range_constexpr(NUM_W_IN_REG):
-                                w_cache[t_i * NUM_W_IN_REG + w_j] = sW[
-                                    (t_i * num_heads + w_j, q_stage_local)
-                                ]
-                    # ---- inner: hot kv loop within this q ----
-                    # Two-level restructure: the two cold blocks (q-change
-                    # weight preload above, q-rollover ctx reload below) execute
-                    # rarely but sat inline in the single flat loop, costing
-                    # taken-branch fetch bubbles on every hot iteration. The
-                    # inner loop below replays exactly the original task sequence:
-                    #   original: process (q, kv); next_kv = kv + W;
-                    #             roll over to (q+1, 0) if next_kv >= num_kv;
-                    #             stop when (next_q, next_kv) == (end_q, end_kv).
-                    # Truth table for kv_go after processing (q, kv) and advancing
-                    # kv += W (W = NUM_MATH_WG):
-                    #   kv <  num_kv, (q, kv) != end -> True  (more kv in this q)
-                    #   kv <  num_kv, (q, kv) == end -> False (global end mid-q)
-                    #   kv >= num_kv, any            -> False (q exhausted; outer
-                    #                                          rollover runs next)
-                    # First iteration is unconditional, matching the original: the
-                    # outer while is only entered when the committed (q, kv) != end.
-                    # Gate (use_two_level_task_loop=False, Rubin nn>=4 auto):
-                    # forcing kv_go False after the body degenerates the inner
-                    # loop to a single trip, restoring the original flat loop
-                    # (per-task q-change check) without duplicating the skeleton.
-                    kv_go = cutlass.Boolean(True)
-                    while kv_go:
-                        # Process KV block for group 1 (kv_idx + 1)
-                        # Unconditional Math (like DeepGEMM)
-                        kv_idx_1 = kv_idx + 1
-
-                        kv_pos = kv_idx_1 * block_kv_val + m_coord
-
-                        if cutlass.const_expr(self.remove_kv_wait_in_epilogue):
-                            # Skip KV wait, rely on UMMA barrier's
-                            # transitive visibility.
-                            umma_pipeline_1.consumer_wait(umma_cons_state_1)
-                        elif cutlass.const_expr(self.use_paired_pipeline_polls):
-                            # Issue both barrier polls back-to-back so their
-                            # mbarrier round-trips overlap instead of running
-                            # serially; each blocking wait below short-circuits
-                            # when its poll already saw the barrier flipped.
-                            kv_ready_1 = kv_pipeline_1.consumer_try_wait(
-                                kv_cons_state_math_1
-                            )
-                            umma_ready_1 = umma_pipeline_1.consumer_try_wait(
-                                umma_cons_state_1
-                            )
-                            kv_pipeline_1.consumer_wait(
-                                kv_cons_state_math_1, kv_ready_1
-                            )
-                            sc_stage_1 = kv_cons_state_math_1.index
-                            scale_val = sScales_1[(m_coord, sc_stage_1)]
-                            umma_pipeline_1.consumer_wait(
-                                umma_cons_state_1, umma_ready_1
-                            )
-                        else:
-                            # Gated (Rubin nn>=4 auto): plain waits, KV first to
-                            # overlap the scale SMEM load with UMMA computation.
-                            kv_pipeline_1.consumer_wait(kv_cons_state_math_1)
-                            sc_stage_1 = kv_cons_state_math_1.index
-                            scale_val = sScales_1[(m_coord, sc_stage_1)]
-                            umma_pipeline_1.consumer_wait(umma_cons_state_1)
-
-                        # --- TMEM sub-tile setup (WG1) ---
-                        tCtAcc_c1 = tCtAcc_base_1[
-                            (None, None, None, umma_cons_state_1.index)
-                        ]
-                        tAcc_c1 = tCtAcc_c1[((None, None), 0, 0)]
-                        tAcc_c1_epi = cute.flat_divide(tAcc_c1, epi_sub_mn)
-                        # Every UMMA stage shares the staged-fragment layout and
-                        # differs only in TMEM base address, so the pre-loop
-                        # tiled copy / thread slice partition every stage;
-                        # rebuilding them per task re-derives loop-invariant
-                        # copy descriptors inside the hot loop.
-                        tTR_1 = thr_copy_ref_1.partition_S(tAcc_c1_epi)
-
-                        # --- First sub-tile LDTM + KV release (WG1) ---
-                        if cutlass.const_expr(self.early_tmem_copy):
-                            cute.copy(
-                                tiled_copy_ref_1,
-                                tTR_1[(None, None, None, 0, 0)],
-                                tTR_rAcc,
-                            )
-                            if cutlass.const_expr(self.remove_kv_wait_in_epilogue):
-                                sc_stage_1 = kv_cons_state_math_1.index
-                                scale_val = sScales_1[(m_coord, sc_stage_1)]
-                            kv_pipeline_1.consumer_release(kv_cons_state_math_1)
-                            kv_cons_state_math_1.advance()
-                            cute.arch.fence_view_async_tmem_load()
-                        else:
-                            if cutlass.const_expr(self.remove_kv_wait_in_epilogue):
-                                sc_stage_1 = kv_cons_state_math_1.index
-                                scale_val = sScales_1[(m_coord, sc_stage_1)]
-                            kv_pipeline_1.consumer_release(kv_cons_state_math_1)
-                            kv_cons_state_math_1.advance()
-                            cute.copy(
-                                tiled_copy_ref_1,
-                                tTR_1[(None, None, None, 0, 0)],
-                                tTR_rAcc,
-                            )
-                            cute.arch.fence_view_async_tmem_load()
-
-                        # --- Sub-tile compute loop (WG1) ---
-                        subtile_n = num_heads // num_epi_subtiles
-                        if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
-                            packed_zero = pack_f16x2(Float16(0.0), Float16(0.0))
-                        for t in cutlass.range_constexpr(next_n):
-                            if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
-                                ps0 = packed_zero
-                                ps1 = packed_zero
-                            else:
-                                s0x = cutlass.Float32(0.0)
-                                s0y = cutlass.Float32(0.0)
-                                s1x = cutlass.Float32(0.0)
-                                s1y = cutlass.Float32(0.0)
-                            for i in cutlass.range_constexpr(num_epi_subtiles):
-                                if t > 0 or i > 0:
-                                    cute.copy(
-                                        tiled_copy_ref_1,
-                                        tTR_1[
-                                            (
-                                                None,
-                                                None,
-                                                None,
-                                                0,
-                                                t * num_epi_subtiles + i,
-                                            )
-                                        ],
-                                        tTR_rAcc,
-                                    )
-                                    cute.arch.fence_view_async_tmem_load()
-                                if t == next_n - 1 and i == num_epi_subtiles - 1:
-                                    umma_pipeline_1.consumer_release(umma_cons_state_1)
-                                    umma_cons_state_1.advance()
-                                acc_vec = tTR_rAcc.load()
-                                # Reg-path
-                                reg_h_end = min(
-                                    subtile_n, max(0, NUM_W_IN_REG - i * subtile_n)
-                                )
-                                for h in cutlass.range_constexpr(0, reg_h_end, 4):
-                                    n0 = h
-                                    h_g = i * subtile_n + h
-                                    if cutlass.const_expr(
-                                        self.epi_dtype == cutlass.Float16
-                                    ):
-                                        pa01 = pack_f16x2(
-                                            Float16(acc_vec[n0]),
-                                            Float16(acc_vec[n0 + 1]),
-                                        )
-                                        pa23 = pack_f16x2(
-                                            Float16(acc_vec[n0 + 2]),
-                                            Float16(acc_vec[n0 + 3]),
-                                        )
-                                        pa01 = max_f16x2(pa01, packed_zero)
-                                        pa23 = max_f16x2(pa23, packed_zero)
-                                        r0 = t * NUM_W_IN_REG + h_g
-                                        pw01 = pack_f16x2(w_cache[r0], w_cache[r0 + 1])
-                                        pw23 = pack_f16x2(
-                                            w_cache[r0 + 2], w_cache[r0 + 3]
-                                        )
-                                        ps0 = fma_f16x2(pa01, pw01, ps0)
-                                        ps1 = fma_f16x2(pa23, pw23, ps1)
-                                    else:
-                                        # relu as one FMNMX per head (`max.NaN.f32`): exact and range-safe for
-                                        # every finite accumulator (the (x + |x|) / 2 form it replaces overflowed
-                                        # for x >= 2^127, reachable through unbounded scales / weights), NaN-
-                                        # propagating like the scalar max, one instruction per head. Weights are
-                                        # applied unscaled. Ported from DKG MR !27837, range-safe form.
-                                        a0 = relu_f32(acc_vec[n0])
-                                        a1 = relu_f32(acc_vec[n0 + 1])
-                                        a2 = relu_f32(acc_vec[n0 + 2])
-                                        a3 = relu_f32(acc_vec[n0 + 3])
-                                        r0 = t * NUM_W_IN_REG + h_g
-                                        w0 = w_cache[r0]
-                                        w1 = w_cache[r0 + 1]
-                                        w2 = w_cache[r0 + 2]
-                                        w3 = w_cache[r0 + 3]
-                                        s0x, s0y = cute.arch.fma_packed_f32x2(
-                                            (a0, a1), (w0, w1), (s0x, s0y), rnd=_RND_RN
-                                        )
-                                        s1x, s1y = cute.arch.fma_packed_f32x2(
-                                            (a2, a3), (w2, w3), (s1x, s1y), rnd=_RND_RN
-                                        )
-                                # SMEM-path
-                                smem_h_start = max(0, NUM_W_IN_REG - i * subtile_n)
-                                for h in cutlass.range_constexpr(
-                                    smem_h_start, subtile_n, 4
-                                ):
-                                    n0 = h
-                                    h_g = i * subtile_n + h
-                                    if cutlass.const_expr(
-                                        self.epi_dtype == cutlass.Float16
-                                    ):
-                                        pa01 = pack_f16x2(
-                                            Float16(acc_vec[n0]),
-                                            Float16(acc_vec[n0 + 1]),
-                                        )
-                                        pa23 = pack_f16x2(
-                                            Float16(acc_vec[n0 + 2]),
-                                            Float16(acc_vec[n0 + 3]),
-                                        )
-                                        pa01 = max_f16x2(pa01, packed_zero)
-                                        pa23 = max_f16x2(pa23, packed_zero)
-                                        pw01 = pack_f16x2(
-                                            sW[(t * num_heads + h_g, q_stage_local)],
-                                            sW[
-                                                (t * num_heads + h_g + 1, q_stage_local)
-                                            ],
-                                        )
-                                        pw23 = pack_f16x2(
-                                            sW[
-                                                (t * num_heads + h_g + 2, q_stage_local)
-                                            ],
-                                            sW[
-                                                (t * num_heads + h_g + 3, q_stage_local)
-                                            ],
-                                        )
-                                        ps0 = fma_f16x2(pa01, pw01, ps0)
-                                        ps1 = fma_f16x2(pa23, pw23, ps1)
-                                    else:
-                                        # relu as one FMNMX per head (`max.NaN.f32`): exact and range-safe for
-                                        # every finite accumulator (the (x + |x|) / 2 form it replaces overflowed
-                                        # for x >= 2^127, reachable through unbounded scales / weights), NaN-
-                                        # propagating like the scalar max, one instruction per head. Weights are
-                                        # applied unscaled. Ported from DKG MR !27837, range-safe form.
-                                        a0 = relu_f32(acc_vec[n0])
-                                        a1 = relu_f32(acc_vec[n0 + 1])
-                                        a2 = relu_f32(acc_vec[n0 + 2])
-                                        a3 = relu_f32(acc_vec[n0 + 3])
-                                        w0 = sW[(t * num_heads + h_g, q_stage_local)]
-                                        w1 = sW[
-                                            (t * num_heads + h_g + 1, q_stage_local)
-                                        ]
-                                        w2 = sW[
-                                            (t * num_heads + h_g + 2, q_stage_local)
-                                        ]
-                                        w3 = sW[
-                                            (t * num_heads + h_g + 3, q_stage_local)
-                                        ]
-                                        s0x, s0y = cute.arch.fma_packed_f32x2(
-                                            (a0, a1), (w0, w1), (s0x, s0y), rnd=_RND_RN
-                                        )
-                                        s1x, s1y = cute.arch.fma_packed_f32x2(
-                                            (a2, a3), (w2, w3), (s1x, s1y), rnd=_RND_RN
-                                        )
-                            if cutlass.const_expr(self.epi_dtype == cutlass.Float16):
-                                ps_sum = add_f16x2(ps0, ps1)
-                                sum_lo, sum_hi = unpack_f16x2(ps_sum)
-                                result_t = sum_lo + sum_hi
-                            else:
-                                result_t = s0x + s0y + s1x + s1y
-                            if cutlass.const_expr(self.use_flat_logits_view):
-                                out_off_t = out_row_off + t * logits_stride0 + kv_pos
-                                if cutlass.const_expr(
-                                    self.epi_dtype == cutlass.Float16
-                                ):
-                                    mLogits_flat[out_off_t] = self.output_dtype(
-                                        result_t * Float16(scale_val)
-                                    )
-                                else:
-                                    mLogits_flat[out_off_t] = self.output_dtype(
-                                        result_t * scale_val
-                                    )
-                            else:
-                                out_row = q_idx * next_n + t
-                                if cutlass.const_expr(
-                                    self.epi_dtype == cutlass.Float16
-                                ):
-                                    mLogits_2d[(out_row, kv_pos)] = self.output_dtype(
-                                        result_t * Float16(scale_val)
-                                    )
-                                else:
-                                    mLogits_2d[(out_row, kv_pos)] = self.output_dtype(
-                                        result_t * scale_val
-                                    )
-                        # Advance within this q
-                        kv_idx = kv_idx + NUM_MATH_WG
-                        kv_go = (kv_idx < num_kv) & (
-                            (q_idx != end_q_idx) | (kv_idx != end_kv_idx)
-                        )
-                        if cutlass.const_expr(not self.use_two_level_task_loop):
-                            kv_go = cutlass.Boolean(False)
-
-                    # ---- outer: rollover ----
-                    if kv_idx >= num_kv:
-                        # Inner loop exhausted this q's kv range: advance to the
-                        # next q (same as the original rollover path).
-                        next_q_idx = q_idx + 1
-                        next_kv_idx = 0
-                        if next_q_idx < batch_size:
-                            next_num_kv = (
-                                mContextLens[next_q_idx] + block_kv_val - 1
-                            ) // block_kv_val
-                        # Zero-length rows get no scheduled work, but the exact-
-                        # coordinate termination below would still step onto them and
-                        # run a full pipeline turn (TMA + UMMA + epilogue). Skip them,
-                        # stopping at this CTA's end boundary so that boundary stays
-                        # reachable -- overshooting it would make the loop unable to
-                        # terminate. Every warp role runs this identical traversal.
-                        while (
-                            (next_num_kv == 0)
-                            & (next_q_idx < batch_size)
-                            & ((next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx))
-                        ):
-                            next_q_idx = next_q_idx + 1
-                            if next_q_idx < batch_size:
-                                next_num_kv = (
-                                    mContextLens[next_q_idx] + block_kv_val - 1
-                                ) // block_kv_val
-                    else:
-                        # Global end hit mid-q: next == (q_idx, kv_idx) == end,
-                        # so has_work goes False below. kv_idx was already
-                        # advanced past the last processed task in the inner
-                        # loop, so this matches the original's next_kv_idx.
-                        next_q_idx = q_idx
-                        next_kv_idx = kv_idx
-                    # Update while-loop condition
-                    has_work = (next_q_idx != end_q_idx) | (next_kv_idx != end_kv_idx)
-
-                # Release last Q stage (WG 1)
-                if q_idx < batch_size:
-                    q_pipeline.consumer_release(q_cons_state)
-                    q_cons_state.advance()
-
-            # TMEM dealloc: math warps are allocator + last consumer
-            tmem.relinquish_alloc_permit()
-            # Static column count, mirroring the fp4 kernel (DKG d9adb3cfa77).
-            tmem.free(tmem_ptr, num_tmem_alloc_cols_total)
 
         else:
             cute.arch.warpgroup_reg_dealloc(24)

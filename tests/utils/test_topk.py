@@ -104,6 +104,28 @@ def _cached_row_states_buffer(device: torch.device):
     return flashinfer_utils._stream_cache_buf.get(key)
 
 
+def _assert_distinct_fp32_selection(logits, result, k, *, offsets=None):
+    """Check each distinct-score concurrency result against independent FP32 TopK."""
+    assert logits.dtype == torch.float32
+    if isinstance(result, tuple):
+        values, indices = result
+    else:
+        values, indices = None, result
+    local = indices.long()
+    if offsets is not None:
+        local = local - offsets[:, None]
+    expected = logits.float().topk(k, dim=-1).indices
+    torch.testing.assert_close(
+        local.sort(dim=-1).values, expected.sort(dim=-1).values, atol=0, rtol=0
+    )
+    if values is not None:
+        # Tuple callers explicitly request sorted=True; index order is unspecified.
+        assert torch.all(values[:, :-1] >= values[:, 1:])
+        torch.testing.assert_close(
+            values.float(), logits.float().gather(1, local), atol=0, rtol=0
+        )
+
+
 def _top_k_case_id(case):
     batch_size, vocab_size, k, dtype, tie_break = case
     dtype_name = str(dtype).removeprefix("torch.")
@@ -301,12 +323,11 @@ def test_multi_cta_row_states_not_shared_across_streams(api_kind, set_topk_algo)
     ``row_states`` holds the kernel's inter-CTA synchronization state. It used to
     come from a per-device cached buffer, so two launches racing on different
     streams corrupted each other's reduction (flashinfer-ai/flashinfer#3618). It
-    is now allocated per call from the stream-ordered caching allocator, so every
-    launch gets a disjoint buffer.
+    is now cached per stream; graph captures own their scratch separately.
 
     This interleaves launches on two streams without syncing between them, so the
     sequences actually overlap on the device, and checks every result against a
-    per-stream reference. Distinct (descending vs. ascending) inputs ensure a
+    independent FP32 reference. Distinct (descending vs. ascending) inputs ensure a
     shared/raced buffer would corrupt at least one stream.
     """
     set_topk_algo("multi_cta")
@@ -349,12 +370,7 @@ def test_multi_cta_row_states_not_shared_across_streams(api_kind, set_topk_algo)
             offsets=offsets,
         )
 
-    def equal(x, y):
-        if isinstance(x, tuple):
-            return all(torch.equal(a, b) for a, b in zip(x, y, strict=True))
-        return torch.equal(x, y)
-
-    # Per-stream references on the default stream; this also triggers the JIT
+    # Warmup outputs on the default stream; this also triggers the JIT
     # compile so the concurrent loop below does not compile on a side stream.
     ref_a = run(logits_a)
     ref_b = run(logits_b)
@@ -372,10 +388,14 @@ def test_multi_cta_row_states_not_shared_across_streams(api_kind, set_topk_algo)
             outs_b.append(run(logits_b))
     torch.cuda.synchronize()
 
-    for out in outs_a:
-        assert equal(out, ref_a)
-    for out in outs_b:
-        assert equal(out, ref_b)
+    offsets = (
+        torch.arange(batch_size, device=device) * vocab_size
+        if api_kind == "ragged"
+        else None
+    )
+    for logits, outputs in ((logits_a, (ref_a, *outs_a)), (logits_b, (ref_b, *outs_b))):
+        for out in outputs:
+            _assert_distinct_fp32_selection(logits, out, k, offsets=offsets)
 
 
 def test_multi_cta_row_states_not_shared_across_graphs(set_topk_algo):
@@ -386,10 +406,14 @@ def test_multi_cta_row_states_not_shared_across_graphs(set_topk_algo):
         batch_size, vocab_size, torch.device("cuda")
     )
     logits_b = logits_a.flip(-1).contiguous()
-    references = [torch.topk(logits, k, dim=-1) for logits in (logits_a, logits_b)]
-    for logits in (logits_a, logits_b):
+    inputs = (logits_a, logits_b)
+    warmups = [
         flashinfer.top_k(logits, k, sorted=True, deterministic=True)
+        for logits in inputs
+    ]
     torch.cuda.synchronize()
+    for logits, result in zip(inputs, warmups, strict=True):
+        _assert_distinct_fp32_selection(logits, result, k)
 
     graphs, outputs, streams = [], [], []
     for logits in (logits_a, logits_b):
@@ -406,27 +430,23 @@ def test_multi_cta_row_states_not_shared_across_graphs(set_topk_algo):
         streams.append(stream)
     torch.cuda.synchronize()
 
-    for graph, stream, results, reference in zip(
-        graphs, streams, outputs, references, strict=True
+    for graph, stream, results, logits in zip(
+        graphs, streams, outputs, inputs, strict=True
     ):
         with torch.cuda.stream(stream):
             graph.replay()
         torch.cuda.synchronize()
         for result in results:
-            assert all(
-                torch.equal(a, b) for a, b in zip(result, reference, strict=True)
-            )
+            _assert_distinct_fp32_selection(logits, result, k)
 
     for _ in range(16):
         for graph, stream in zip(graphs, streams, strict=True):
             with torch.cuda.stream(stream):
                 graph.replay()
         torch.cuda.synchronize()
-        for results, reference in zip(outputs, references, strict=True):
+        for results, logits in zip(outputs, inputs, strict=True):
             for result in results:
-                assert all(
-                    torch.equal(a, b) for a, b in zip(result, reference, strict=True)
-                )
+                _assert_distinct_fp32_selection(logits, result, k)
 
 
 @pytest.mark.parametrize("api_kind", ["top_k", "page_table", "ragged"])
@@ -454,11 +474,6 @@ def test_multi_cta_row_states_isolated_across_streams_with_different_row_counts(
             return flashinfer.top_k(logits, k, sorted=True, deterministic=True)
         return _run_transform(logits, k, api_kind, deterministic=True)
 
-    def equal(x, y):
-        if isinstance(x, tuple):
-            return all(torch.equal(a, b) for a, b in zip(x, y, strict=True))
-        return torch.equal(x, y)
-
     ref_a = run(logits_a)
     ref_b = run(logits_b)
     torch.cuda.synchronize()
@@ -473,10 +488,9 @@ def test_multi_cta_row_states_isolated_across_streams_with_different_row_counts(
             outs_b.append(run(logits_b))
     torch.cuda.synchronize()
 
-    for out in outs_a:
-        assert equal(out, ref_a)
-    for out in outs_b:
-        assert equal(out, ref_b)
+    for logits, outputs in ((logits_a, (ref_a, *outs_a)), (logits_b, (ref_b, *outs_b))):
+        for out in outputs:
+            _assert_distinct_fp32_selection(logits, out, k)
 
     with torch.cuda.stream(stream_a):
         buf_a = _cached_row_states_buffer(logits_a.device)
@@ -516,8 +530,7 @@ def test_multi_cta_reuses_row_states_buffer_on_one_stream_across_regimes(
             values, indices = flashinfer.top_k(
                 logits, k, sorted=True, deterministic=deterministic
             )
-            torch.testing.assert_close(values, logits[:, :k])
-            assert torch.equal(indices, expected_indices)
+            _assert_distinct_fp32_selection(logits, (values, indices), k)
         else:
             output = _run_transform(logits, k, api_kind, deterministic=deterministic)
             _assert_unordered_indices_match(output, expected_indices.to(torch.int32))
@@ -542,15 +555,15 @@ def test_multi_cta_row_states_graph_replay_isolated_from_eager_stream(set_topk_a
     batch_size, vocab_size, k = 16, 262144, 512
     logits_graph = _build_strictly_descending_logits(batch_size, vocab_size, device)
     logits_eager = logits_graph.flip(-1).contiguous()
-    ref_graph = torch.topk(logits_graph, k, dim=-1)
-    ref_eager = torch.topk(logits_eager, k, dim=-1)
 
     def run(logits):
         return flashinfer.top_k(logits, k, sorted=True, deterministic=True)
 
-    run(logits_graph)
-    run(logits_eager)
+    warm_graph = run(logits_graph)
+    warm_eager = run(logits_eager)
     torch.cuda.synchronize()
+    _assert_distinct_fp32_selection(logits_graph, warm_graph, k)
+    _assert_distinct_fp32_selection(logits_eager, warm_eager, k)
 
     graph_stream = torch.cuda.Stream()
     graph = torch.cuda.CUDAGraph()
@@ -560,18 +573,16 @@ def test_multi_cta_row_states_graph_replay_isolated_from_eager_stream(set_topk_a
     torch.cuda.synchronize()
 
     eager_stream = torch.cuda.Stream()
-    eager_outs = []
     for _ in range(16):
         with torch.cuda.stream(graph_stream):
             graph.replay()
         with torch.cuda.stream(eager_stream):
-            eager_outs.extend(run(logits_eager) for _ in range(8))
-    torch.cuda.synchronize()
-
-    for out in graph_outs:
-        assert all(torch.equal(a, b) for a, b in zip(out, ref_graph, strict=True))
-    for out in eager_outs:
-        assert all(torch.equal(a, b) for a, b in zip(out, ref_eager, strict=True))
+            eager_outs = [run(logits_eager) for _ in range(8)]
+        torch.cuda.synchronize()
+        for out in graph_outs:
+            _assert_distinct_fp32_selection(logits_graph, out, k)
+        for out in eager_outs:
+            _assert_distinct_fp32_selection(logits_eager, out, k)
 
 
 @pytest.mark.parametrize("k", [256, 1024, 2048])

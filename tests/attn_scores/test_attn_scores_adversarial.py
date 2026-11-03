@@ -292,14 +292,15 @@ def test_adv_degenerate_values_fp8(mode):
 # D2) fp32 relu epilogue at the float range boundary
 # ─────────────────────────────────────────────────────────────────────────────
 # The public API bounds neither the weights nor the KV / UE8M0 scales, so a
-# valid call can put a head's score x in [2^127, 2^128) or a weight at
-# FLT_MAX. relu must not widen the finite range: relu(x) = (x + |x|) / 2 with
+# valid strict-mode call can put a head's score x in [2^127, 2^128) or a weight at
+# FLT_MAX. Strict relu must not widen the finite range: relu(x) = (x + |x|) / 2 with
 # the /2 folded into the weights or the store scale overflowed both cases.
 # Expected values are exact (all products are powers of two times small
 # integers), so the checks are tight.
 
 
-def test_adv_fp8_relu_weight_boundary():
+@pytest.mark.parametrize("math_mode", ["relu_fast", "relu_strict"])
+def test_adv_fp8_relu_weight_boundary(math_mode):
     """One head: dot score 1, weight FLT_MAX, KV scale 0.5 -> FLT_MAX / 2, finite."""
     _skip_if_no_paged_mqa_support()
     from flashinfer import fp8_paged_mqa_logits
@@ -321,8 +322,13 @@ def test_adv_fp8_relu_weight_boundary():
     ref = _ref_fp8_paged_mqa_logits(
         q, kv_fp8, scale, weights, cl, block_tables, max_ml, block_size
     )
-    out = fp8_paged_mqa_logits(q, kv_fused, weights, block_tables, cl, max_ml)
+    out = fp8_paged_mqa_logits(
+        q, kv_fused, weights, block_tables, cl, max_ml, math_mode=math_mode
+    )
     valid = _valid_causal_mask(cl, next_n, max_ml, DEVICE)
+    if math_mode == "relu_fast":
+        assert torch.isposinf(out[valid]).all()
+        return
     assert torch.isfinite(out.float()[valid]).all(), "FLT_MAX weight overflowed"
     torch.testing.assert_close(
         out.float()[valid], ref.float()[valid], rtol=1e-6, atol=0
@@ -356,7 +362,9 @@ def test_adv_fp8_relu_exponent_boundary():
     ref = _ref_fp8_paged_mqa_logits(
         q, kv_fp8, scale, weights, cl, block_tables, max_ml, block_size
     )
-    out = fp8_paged_mqa_logits(q, kv_fused, weights, block_tables, cl, max_ml)
+    out = fp8_paged_mqa_logits(
+        q, kv_fused, weights, block_tables, cl, max_ml, math_mode="relu_strict"
+    )
     valid = _valid_causal_mask(cl, next_n, max_ml, DEVICE)
     x = 448.0 * 448.0 * D * 2.0**103
     assert 2.0**127 < x < 2.0**128

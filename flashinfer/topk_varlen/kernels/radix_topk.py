@@ -190,6 +190,7 @@ class SinglePassMultiCTARadixTopKKernel:
         num_copy_bits: int = 256,
         ctas_per_group: int = 1,
         num_sms: int = 148,
+        input_col_stride: int = 1,
     ):
         self.dtype = dtype
         self.chunk_size = chunk_size
@@ -199,6 +200,7 @@ class SinglePassMultiCTARadixTopKKernel:
         self.ctas_per_group = ctas_per_group
         self.num_sms = num_sms
         self.num_copy_bits = num_copy_bits
+        self.input_col_stride = input_col_stride
 
         # Radix config
         self.radix = 256
@@ -293,8 +295,14 @@ class SinglePassMultiCTARadixTopKKernel:
         Thread layout: thread t handles every (num_threads)-th vector in the
         aligned region (coalesced warp access).
         """
-        vec_size = cutlass.const_expr(self.vec_size)
         num_threads = cutlass.const_expr(self.num_threads)
+        if cutlass.const_expr(self.input_col_stride != 1):
+            for j in range(tidx, actual_chunk_size, num_threads):
+                shared_ordered[j] = self.to_ordered(input_row[chunk_start + j])
+            cute.arch.barrier()
+            return cutlass.Int32(0), cutlass.Int32(0), actual_chunk_size
+
+        vec_size = cutlass.const_expr(self.vec_size)
         # align_bytes and elem_bytes are compile-time Python ints
         align_bytes = self.num_copy_bits // 8
         elem_bytes = self.dtype.width // 8
@@ -1082,6 +1090,8 @@ class SinglePassMultiCTARadixTopKKernel:
         seqlen: cute.Tensor,
         output_indices: cute.Tensor,
         output_values: cute.Tensor,
+        active_rows: cute.Tensor = None,
+        active_mask: cute.Tensor = None,
     ):
         """Main single-pass multi-CTA radix top-k kernel.
 
@@ -1105,6 +1115,10 @@ class SinglePassMultiCTARadixTopKKernel:
         num_rows = input_data.shape[0]
 
         griddepcontrol_wait()
+        if cutlass.const_expr(active_rows is not None):
+            # Compact queues retain capacity-sized storage across graph replays.
+            # Read their current length only after upstream writes are complete.
+            num_rows = min(num_rows, max(active_rows[0], cutlass.Int32(0)))
 
         # ---- Shared memory allocation ----
         smem = SmemAllocator()
@@ -1144,7 +1158,7 @@ class SinglePassMultiCTARadixTopKKernel:
         )
 
         # ---- Persistent loop: round-robin over rows ----
-        row_idx = group_id
+        row_idx = self._next_active_row(group_id, num_rows, num_groups, active_mask)
         barrier_phase = cutlass.Int32(0)
 
         # Multi-CTA only: global state pointer (compiled away for single-CTA)
@@ -1413,7 +1427,9 @@ class SinglePassMultiCTARadixTopKKernel:
                     )
 
             # Advance to next row (round-robin).
-            row_idx = row_idx + num_groups
+            row_idx = self._next_active_row(
+                row_idx + num_groups, num_rows, num_groups, active_mask
+            )
             if cutlass.const_expr(ctas_per_group > 1):
                 iter_var = iter_var + cutlass.Int32(1)
 
@@ -1436,6 +1452,20 @@ class SinglePassMultiCTARadixTopKKernel:
     # Host-side launcher
     # ------------------------------------------------------------------
     @cute.jit
+    def _next_active_row(self, row, rows, step, active_mask):
+        # All CTAs in a group read the same immutable mask after the PDL wait.
+        # Skipped rows leave outputs untouched; callers must not consume them.
+        if cutlass.const_expr(active_mask is not None):
+            searching = row < rows
+            while searching:
+                if active_mask[row] != 0:
+                    searching = False
+                else:
+                    row = row + step
+                    searching = row < rows
+        return row
+
+    @cute.jit
     def __call__(
         self,
         input_data: cute.Tensor,
@@ -1444,6 +1474,66 @@ class SinglePassMultiCTARadixTopKKernel:
         output_indices: cute.Tensor,
         output_values: cute.Tensor,
         stream,
+    ):
+        self.with_active_rows(
+            input_data, row_states, seqlen, output_indices, output_values, None, stream
+        )
+
+    @cute.jit
+    def with_active_mask(
+        self,
+        input_data,
+        row_states,
+        seqlen,
+        output_indices,
+        output_values,
+        active_mask,
+        stream,
+    ):
+        self._launch(
+            input_data,
+            row_states,
+            seqlen,
+            output_indices,
+            output_values,
+            None,
+            stream,
+            active_mask,
+        )
+
+    @cute.jit
+    def with_active_rows(
+        self,
+        input_data,
+        row_states,
+        seqlen,
+        output_indices,
+        output_values,
+        active_rows,
+        stream,
+    ):
+        self._launch(
+            input_data,
+            row_states,
+            seqlen,
+            output_indices,
+            output_values,
+            active_rows,
+            stream,
+            None,
+        )
+
+    @cute.jit
+    def _launch(
+        self,
+        input_data: cute.Tensor,
+        row_states: cute.Tensor,
+        seqlen: cute.Tensor,
+        output_indices: cute.Tensor,
+        output_values: cute.Tensor,
+        active_rows: cute.Tensor,
+        stream,
+        active_mask: cute.Tensor = None,
     ):
         num_rows = input_data.shape[0]
         ctas_per_group = cutlass.const_expr(self.ctas_per_group)
@@ -1456,6 +1546,8 @@ class SinglePassMultiCTARadixTopKKernel:
             seqlen,
             output_indices,
             output_values,
+            active_rows,
+            active_mask,
         ).launch(
             grid=(total_ctas, 1, 1),
             block=(self.num_threads, 1, 1),

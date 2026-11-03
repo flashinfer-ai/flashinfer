@@ -135,6 +135,8 @@ from .attn_scores import (
 )
 from .attn_scores import fp4_paged_mqa_logits as fp4_paged_mqa_logits
 from .attn_scores import fp8_paged_mqa_logits as fp8_paged_mqa_logits
+from .attn_scores import FP8PagedMQATopKWrapper as FP8PagedMQATopKWrapper
+from .attn_scores import FP8MQATopKWrapper as FP8MQATopKWrapper
 from .attn_scores import precompile_paged_mqa_logits as precompile_paged_mqa_logits
 from .fused_moe import (
     cutlass_fused_moe,

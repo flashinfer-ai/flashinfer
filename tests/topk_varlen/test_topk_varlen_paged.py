@@ -29,6 +29,8 @@ the API admission rules.
 import pytest
 import torch
 
+from tests.topk_varlen._selection_reference import assert_topk_reference
+
 try:
     import flashinfer
     from flashinfer.topk_varlen.kernels import gvr2_topk_host as _host
@@ -70,22 +72,6 @@ def _page_table(batch, ncols, page_size, seed):
     return pt.contiguous()
 
 
-def _expected(local, pt, next_n, page_size):
-    """Page-table transform of window-local indices (pads stay -1)."""
-    rows = local.shape[0]
-    shift = page_size.bit_length() - 1
-    req = (torch.arange(rows, device=_DEV) // next_n).unsqueeze(1)
-    l64 = local.to(torch.int64)
-    phys = (pt.to(torch.int64)[req, (l64 >> shift).clamp_min(0)] << shift) | (
-        l64 & (page_size - 1)
-    )
-    return torch.where(local >= 0, phys.to(torch.int32), local)
-
-
-def _same_rows(a, b):
-    return torch.equal(torch.sort(a, dim=1).values, torch.sort(b, dim=1).values)
-
-
 def _mixed_lens(batch, ncols, top_k, next_n, seed):
     gen = torch.Generator(device=_DEV).manual_seed(seed)
     lens = torch.randint(top_k + 1, ncols + 1, (batch,), generator=gen, device=_DEV)
@@ -102,6 +88,7 @@ def _run_pair(lg, lens, top_k, pt, page_size, next_n=1, cr=1):
     loc, _ = flashinfer.top_k_varlen(
         lg, lens, top_k, next_n=next_n, compress_ratio=cr, backend="gvr_2"
     )
+    assert_topk_reference(lg, loc, lens, top_k, next_n=next_n, compress_ratio=cr)
     pg, _ = flashinfer.top_k_varlen(
         lg,
         lens,
@@ -113,6 +100,16 @@ def _run_pair(lg, lens, top_k, pt, page_size, next_n=1, cr=1):
         page_size=page_size,
     )
     torch.cuda.synchronize()
+    assert_topk_reference(
+        lg,
+        pg,
+        lens,
+        top_k,
+        next_n=next_n,
+        compress_ratio=cr,
+        page_table=pt,
+        page_size=page_size,
+    )
     return loc, pg
 
 
@@ -130,8 +127,7 @@ def test_paged_matches_transformed_local(top_k, shape):
     lens = _mixed_lens(rows, ncols, top_k, 1, seed=rows + ncols)
     pt = _page_table(rows, ncols, page_size, seed=7)
     loc, pg = _run_pair(lg, lens, top_k, pt, page_size)
-    assert torch.equal(pg < 0, loc < 0) or _same_rows(pg < 0, loc < 0)
-    assert _same_rows(pg, _expected(loc, pt, 1, page_size))
+    assert torch.equal(pg < 0, loc < 0)
 
 
 @requires_gvr2
@@ -151,8 +147,7 @@ def test_paged_page_sizes(page_size):
     lg = torch.randn((rows, ncols), dtype=torch.float32, device=_DEV)
     lens = _mixed_lens(rows, ncols, top_k, 1, seed=3)
     pt = _page_table(rows, ncols, page_size, seed=11)
-    loc, pg = _run_pair(lg, lens, top_k, pt, page_size)
-    assert _same_rows(pg, _expected(loc, pt, 1, page_size))
+    _run_pair(lg, lens, top_k, pt, page_size)
 
 
 @requires_gvr2
@@ -163,8 +158,7 @@ def test_paged_next_n_shares_the_request_table():
     lg = torch.randn((rows, ncols), dtype=torch.float32, device=_DEV)
     lens = _mixed_lens(batch, ncols, top_k, next_n, seed=5)
     pt = _page_table(batch, ncols, 64, seed=13)
-    loc, pg = _run_pair(lg, lens, top_k, pt, 64, next_n=next_n)
-    assert _same_rows(pg, _expected(loc, pt, next_n, 64))
+    _run_pair(lg, lens, top_k, pt, 64, next_n=next_n)
 
 
 @requires_gvr2
@@ -177,8 +171,7 @@ def test_paged_compressed_columns():
         (top_k + 1) * cr, ncols * cr + 1, (rows,), generator=gen, device=_DEV
     ).to(torch.int32)
     pt = _page_table(rows, ncols, 64, seed=17)
-    loc, pg = _run_pair(lg, lens, top_k, pt, 64, cr=cr)
-    assert _same_rows(pg, _expected(loc, pt, 1, 64))
+    _run_pair(lg, lens, top_k, pt, 64, cr=cr)
 
 
 @requires_gvr2
@@ -204,8 +197,8 @@ def test_paged_reference_engine_parity():
         page_size=64,
     )
     torch.cuda.synchronize()
-    # both are exact top-k of the same rows through the same injective table
-    assert _same_rows(o1, o2)
+    for indices in (o1, o2):
+        assert_topk_reference(lg, indices, lens, top_k, page_table=pt, page_size=64)
 
 
 @requires_gvr2
@@ -228,6 +221,7 @@ def test_paged_warmup_and_cuda_graph_replay():
             page_size=page_size,
         )
     torch.cuda.synchronize()
+    assert_topk_reference(lg, out, lens, top_k, page_table=pt, page_size=page_size)
     g = torch.cuda.CUDAGraph()
     s.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(s), torch.cuda.graph(g, stream=s):
@@ -249,7 +243,8 @@ def test_paged_warmup_and_cuda_graph_replay():
     torch.cuda.synchronize()
     loc, _ = flashinfer.top_k_varlen(lg, lens, top_k, backend="gvr_2")
     torch.cuda.synchronize()
-    assert _same_rows(out, _expected(loc, pt, 1, page_size))
+    assert_topk_reference(lg, loc, lens, top_k)
+    assert_topk_reference(lg, out, lens, top_k, page_table=pt, page_size=page_size)
 
 
 def test_paged_api_validation():
@@ -285,7 +280,8 @@ def test_paged_api_validation():
     out_none, _ = flashinfer.top_k_varlen(lg, lens, k, page_table=pt1)
     out_one, _ = flashinfer.top_k_varlen(lg, lens, k, page_table=pt1, page_size=1)
     torch.cuda.synchronize()
-    assert _same_rows(out_none, out_one)
+    for indices in (out_none, out_one):
+        assert_topk_reference(lg, indices, lens, k, page_table=pt1, page_size=1)
     # mode conflicts are refused by the API body with a ValueError, under auto
     # and an explicit gvr_2 alike (the checker admits the call for that)
     for kw in (
@@ -333,16 +329,8 @@ def test_paged_on_non_current_device():
     )
     torch.cuda.synchronize(other)
     assert pg.device == other and loc.device == other
-    shift = page_size.bit_length() - 1
-    l64 = loc.to(torch.int64)
-    phys = (
-        pt.to(torch.int64)[
-            torch.arange(rows, device=other).unsqueeze(1), (l64 >> shift).clamp_min(0)
-        ]
-        << shift
-    ) | (l64 & (page_size - 1))
-    expected = torch.where(loc >= 0, phys.to(torch.int32), loc)
-    assert torch.equal(torch.sort(pg, dim=1).values, torch.sort(expected, dim=1).values)
+    assert_topk_reference(lg, loc, lens, top_k)
+    assert_topk_reference(lg, pg, lens, top_k, page_table=pt, page_size=page_size)
 
 
 def test_paged_boundary_ties_tie_aware_check():
