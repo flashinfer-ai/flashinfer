@@ -233,6 +233,7 @@ class BlackwellFusedFc12Scheduler(SchedulerBase):
         smem_base: cute.Pointer,
         device_workspace: DeviceWorkspace,
         is_fallback_cluster: Optional[Boolean] = None,
+        shared_token_count: Optional[Int32] = None,
     ) -> None:
         """Initialize all FC12 scheduler state rooted for one CTA lifetime."""
         if cutlass.const_expr((expert_token_sizes is None) == (expert_token_prefix_sum is None)):
@@ -277,6 +278,7 @@ class BlackwellFusedFc12Scheduler(SchedulerBase):
             is_swap_ab=self.is_swap_ab,
             expert_token_sizes=expert_token_sizes,
             expert_token_prefix_sum=expert_token_prefix_sum,
+            shared_token_count=shared_token_count,
         )
 
         self._task_mapping_state = task_mapping_state
@@ -625,6 +627,7 @@ class PhaseInterleavedFc12Scheduler(SchedulerBase):
         smem_base: cute.Pointer,
         device_workspace: DeviceWorkspace,
         is_fallback_cluster: Optional[Boolean] = None,
+        shared_token_count: Optional[Int32] = None,
     ) -> None:
         """Initialize phase-local mapping, cadence, and counter state."""
         if cutlass.const_expr((expert_token_sizes is None) == (expert_token_prefix_sum is None)):
@@ -649,6 +652,7 @@ class PhaseInterleavedFc12Scheduler(SchedulerBase):
             expert_token_sizes=expert_token_sizes,
             expert_token_prefix_sum=expert_token_prefix_sum,
             dfc1_m_group=self.dfc1_m_group,
+            shared_token_count=shared_token_count,
         )
         self._control_state = _PhaseInterleaveControlState(
             prologue_remaining=Int32(self.fc1_prologue_tiles),

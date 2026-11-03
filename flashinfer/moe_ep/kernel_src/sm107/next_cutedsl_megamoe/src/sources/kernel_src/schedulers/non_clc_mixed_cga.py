@@ -172,7 +172,8 @@ class NonClcMixedCgaSchedulerWorker:
                 device_workspace.register(
                     self.fallback_group_token_region,
                     cutlass.Int64,
-                    (self.config.fallback_cluster_count,),
+                    # Preferred clusters may also launch as fallback clusters.
+                    (self.config.launch_cluster_cnt_merge_as_preferred * self.config.split_factor,),
                     buffer_space="local",
                     reset="tail_reset",
                 )

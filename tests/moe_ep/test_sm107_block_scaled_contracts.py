@@ -192,6 +192,12 @@ def test_mxfp4_w4a4_cli_preserves_forward_contract(monkeypatch, variant, early):
     monkeypatch.setattr(forward_tuning, "ForwardExecution", execution)
     monkeypatch.setattr(package, "resolve_knobs", resolve)
     monkeypatch.setattr(package, "sm107_schedule_candidates", lambda *a, **k: [{}])
+
+    def gather_candidates(results, value, *, group):
+        assert group is backend.ep_comm_group
+        results[:] = [value, None]
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", gather_candidates)
     finish = mock.Mock(return_value={"fc2_use_bulk": True})
     monkeypatch.setattr(tuning, "finish_sweep", finish)
 
@@ -204,7 +210,7 @@ def test_mxfp4_w4a4_cli_preserves_forward_contract(monkeypatch, variant, early):
     assert resolve.call_args.kwargs["kernel_variant"] == variant
     assert resolve.call_args.kwargs["apply_routing_weights_before_fc2"] is early
     assert execution.call_args.kwargs["quantize_input"] is True
-    backend._allocate_workspace.return_value.destroy.assert_called_once()
+    backend.destroy.assert_called_once_with(backend._allocate_workspace.return_value)
 
 
 def test_mxfp4_weight_ingestion_rejects_nvfp4_scales():
@@ -303,6 +309,7 @@ def test_router_vector_tail_has_allocated_storage(capacity, topk):
 
 def _workspace():
     ws = object.__new__(Sm107BlockScaledSymmBuffer)
+    ws._shared_weights = None
     ws.config = _config()
     ws.device = torch.device("cpu")
     ws._destroyed = False

@@ -122,6 +122,11 @@ class MoEEpMegaLayer(nn.Module):
         self._mega_config = backend
         self._megakernel_config = backend.megakernel
 
+        from ..backends.mega.kernel.sm107.shared_weights import validate_shared_backend
+
+        validate_shared_backend(weights, backend.megakernel)
+        validate_shared_backend(backend.transformed_weights, backend.megakernel)
+
         ensure_moe_ep_cuda_device(bootstrap)
 
         self._kernel = create_mega_kernel(self._megakernel_config)

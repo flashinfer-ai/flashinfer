@@ -46,6 +46,7 @@ _KEY_FIELDS = (
     "situ_beta",
     "situ_linear_beta",
     "gate_up_clamp",
+    "shared_quant_kind",
 )
 
 
@@ -134,6 +135,7 @@ def _matching_entries(
     situ_beta: Optional[float] = None,
     situ_linear_beta: Optional[float] = None,
     gate_up_clamp: Optional[float] = None,
+    shared_quant_kind: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Return records with a compatible numerical and execution contract."""
     if entries is None:
@@ -148,6 +150,7 @@ def _matching_entries(
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,
         gate_up_clamp=gate_up_clamp,
+        shared_quant_kind=shared_quant_kind,
         device=_device_key(device),
         dtype=dtype,
         world_size=world_size,
@@ -197,6 +200,7 @@ def lookup_record(
     situ_beta: Optional[float] = None,
     situ_linear_beta: Optional[float] = None,
     gate_up_clamp: Optional[float] = None,
+    shared_quant_kind: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     from flashinfer.moe_ep.core.tuning import select_token_entries
 
@@ -218,6 +222,7 @@ def lookup_record(
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,
         gate_up_clamp=gate_up_clamp,
+        shared_quant_kind=shared_quant_kind,
     )
     matches = select_token_entries(matches, max_tokens, live_tokens)
     if not matches:
@@ -259,6 +264,7 @@ def make_record(
     situ_beta: Optional[float] = None,
     situ_linear_beta: Optional[float] = None,
     gate_up_clamp: Optional[float] = None,
+    shared_quant_kind: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Build a tuning record shared by FlashInfer and the MegaMoE file."""
     if knobs.get("reduce_topk_in_kernel", False) and not allow_nondeterministic:
@@ -278,6 +284,7 @@ def make_record(
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,
         gate_up_clamp=gate_up_clamp,
+        shared_quant_kind=shared_quant_kind,
         device=_device_key(device),
         dtype=dtype,
         world_size=world_size,
@@ -352,6 +359,7 @@ def default_knobs(
     quant_kind: str = "nvfp4",
     kernel_variant: str = "inference",
     combine_dtype: str = "bf16",
+    shared_quant_kind: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Built-in SM107 configurations for cache misses.
 
@@ -365,6 +373,12 @@ def default_knobs(
     NVFP4 combine disables the peer-facing bulk store, which cannot send FP4.
     Returns a fresh dict each call.
     """
+    if shared_quant_kind is not None and (
+        shared_quant_kind != "mxfp8_e4m3"
+        or quant_kind != "mxfp4_mxfp8"
+        or combine_dtype != "bf16"
+    ):
+        raise ValueError("Unsupported shared-expert heuristic configuration")
     if kernel_variant == "genphase":
         if combine_dtype != "bf16":
             raise ValueError("GenPhase requires BF16 combine.")
@@ -417,6 +431,7 @@ def resolve_knobs(
     situ_beta: Optional[float] = None,
     situ_linear_beta: Optional[float] = None,
     gate_up_clamp: Optional[float] = None,
+    shared_quant_kind: Optional[str] = None,
 ) -> Tuple[Dict[str, Any], str]:
     """Pure-lookup knob resolution: cache hit, else the built-in heuristic.
 
@@ -439,6 +454,7 @@ def resolve_knobs(
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,
         gate_up_clamp=gate_up_clamp,
+        shared_quant_kind=shared_quant_kind,
     )
     if cached is not None:
         return cached, "cache"
@@ -447,6 +463,7 @@ def resolve_knobs(
         quant_kind=dtype,
         kernel_variant=kernel_variant,
         combine_dtype=combine_dtype,
+        shared_quant_kind=shared_quant_kind,
     ), "heuristic"
 
 

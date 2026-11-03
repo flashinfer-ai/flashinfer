@@ -189,6 +189,10 @@ def tune_one(
     args, rank: int, world_size: int, max_tokens: int, quant_kind: str
 ) -> dict:
     """Generate one CLI workload and tune its fixed or automatic variants."""
+    if getattr(args, "shared_expert", False):
+        raise ValueError(
+            "Shared-expert CLI inputs are not implemented; tune the prepared layer"
+        )
     import torch
 
     live_tokens = args.live_tokens if args.live_tokens is not None else max_tokens
@@ -416,6 +420,10 @@ def _tune_variants(
 
 def run_tuning(args, quant_kind: str) -> int:
     """Initialize the runtime and tune each token-capacity bucket."""
+    if getattr(args, "shared_expert", False):
+        raise ValueError(
+            "Shared-expert CLI inputs are not implemented; tune the prepared layer"
+        )
     import torch
     from flashinfer.autotuner import AutoTuner
     from flashinfer import autotune_v2

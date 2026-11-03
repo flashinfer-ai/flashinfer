@@ -53,6 +53,9 @@ def make_workspace_config(
             situ_linear_beta=k.situ_linear_beta,
             apply_routing_weights_before_fc2=k.apply_routing_weights_before_fc2,
             max_sm_count=k.max_sm_count,
+            shared_quant_kind="mxfp8_e4m3"
+            if getattr(k, "shared_expert", False)
+            else None,
             **tuning,
         )
     except (TypeError, ValueError) as exc:
