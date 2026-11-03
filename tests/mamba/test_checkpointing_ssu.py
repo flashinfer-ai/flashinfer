@@ -561,7 +561,7 @@ def test_two_kernel_matches_monolithic(tmp_path, request):
         rs = ring_start.clone()
         pnat = torch.full((cache_size,), k, device=device, dtype=torch.int32)
         if strided_trackers:
-            rs, pnat = _strided_column(rs), _strided_column(pnat)
+            rs, pnat = _strided_trackers(rs, pnat)
         checkpointing_ssu(
             st,
             xc,
@@ -5352,17 +5352,21 @@ def _pad_outer(t, pad):
     return full.narrow(1, 0, shape[1])
 
 
-def _strided_column(t, stride=3):
-    """Return a 1-D view of `t` with stride `stride` (>= 3): column 0 of a
-    (len(t), stride) buffer, as for trackers stored inside a larger per-slot
-    page.  Columns 1 and 2 hold `t` rolled by 1 and -1, so a kernel that
-    ignores the stride reads wrong but in-range values for the other slots.
-    The remaining columns are left uninitialized."""
-    full = torch.empty(t.numel(), stride, device=t.device, dtype=t.dtype)
-    full[:, 0] = t
-    full[:, 1] = t.roll(1)
-    full[:, 2] = t.roll(-1)
-    return full[:, 0]
+def _strided_trackers(ring_start, prev_num_accepted, stride=3):
+    """Return the trackers as columns 0 and 1 of one buffer with row stride
+    `stride` (>= 3), as for trackers inside a per-slot cache page.  Only the
+    span the views touch is allocated.  Its first elements are prefilled with an
+    in-range value, so a kernel that ignores the stride reads wrong but valid
+    trackers for the other slots."""
+    n = ring_start.numel()
+    buf = torch.empty(
+        (n - 1) * stride + 2, dtype=ring_start.dtype, device=ring_start.device
+    )
+    buf[: min(buf.numel(), 2 * n + 2)].fill_(1)
+    rows = buf.as_strided((n, 2), (stride, 1))
+    rows[:, 0] = ring_start
+    rows[:, 1] = prev_num_accepted
+    return rows[:, 0], rows[:, 1]
 
 
 # Slot 3 * stride > 2**31: an int32 tracker index computation overflows.
@@ -5420,10 +5424,12 @@ def test_checkpointing_ssu_noncontig(state_dtype, varlen, two_kernel, tracker_st
         cu_seqlens = None
     cache_size = batch
     total_tokens = sum(seq_lens)
-    # Two (cache_size, tracker_stride) int32 tracker buffers (24 GiB when large).
-    tracker_bytes = 2 * cache_size * tracker_stride * 4
+    # One int32 buffer spanning both tracker views (about 9 GiB when large).
+    tracker_bytes = ((cache_size - 1) * tracker_stride + 2) * 4
     if torch.cuda.mem_get_info()[0] < tracker_bytes + (4 << 30):
-        pytest.skip(f"needs {tracker_bytes / 2**30:.0f} GiB free for tracker buffers")
+        pytest.skip(
+            f"needs {tracker_bytes / 2**30:.0f} GiB free for the tracker buffer"
+        )
 
     is_quantized = state_dtype in (torch.int8, torch.float8_e4m3fn)
     quant_max = 127.0 if state_dtype == torch.int8 else 448.0
@@ -5580,8 +5586,7 @@ def test_checkpointing_ssu_noncontig(state_dtype, varlen, two_kernel, tracker_st
     # Cache writes: the _nc views alias the padded storage so written rows
     # persist there.  Compare via .contiguous() at the end.  (The views
     # already hold the contig data — _pad_inner copies it.)
-    ring_start_nc = _strided_column(ring_start, tracker_stride)
-    pt_test = _strided_column(prev_tokens, tracker_stride)
+    ring_start_nc, pt_test = _strided_trackers(ring_start, prev_tokens, tracker_stride)
     assert ring_start_nc.stride(0) == pt_test.stride(0) == tracker_stride
 
     checkpointing_ssu(
@@ -5657,6 +5662,9 @@ def test_checkpointing_ssu_noncontig(state_dtype, varlen, two_kernel, tracker_st
         atol=0,
         msg=f"dt_cache mismatch (varlen={varlen})",
     )
+    # The large-stride buffer is ~9 GiB: release it instead of keeping it cached.
+    del ring_start_nc, pt_test
+    torch.cuda.empty_cache()
 
 
 # ────────────────────────────────────────────────────────────────────────────
