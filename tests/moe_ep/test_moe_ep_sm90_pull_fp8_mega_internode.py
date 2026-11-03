@@ -414,32 +414,44 @@ def _run_internode(
 
 
 @pytest.mark.parametrize(
-    "fp8_scale_mode,swap_ab,token_back_mode",
+    "fp8_scale_mode,swap_ab,token_back_mode,max_tokens",
     [
-        ("per_tensor", True, None),
-        ("per_tensor", True, "reuse_dispatch_warps"),
-        ("per_tensor", False, None),
-        ("blockwise", True, None),
-        ("blockwise", False, "reuse_dispatch_warps"),
+        ("per_tensor", True, None, 64),
+        ("per_tensor", True, "reuse_dispatch_warps", 64),
+        ("per_tensor", False, None, 64),
+        ("blockwise", True, None, 64),
+        ("blockwise", False, "reuse_dispatch_warps", 64),
+        # 1024 tokens per rank: the non-swap epi_warps early return.
+        ("blockwise", False, "epi_warps", 1024),
     ],
 )
-def test_moe_ep_sm90_pull_fp8_mega_internode(fp8_scale_mode, swap_ab, token_back_mode):
+def test_moe_ep_sm90_pull_fp8_mega_internode(
+    fp8_scale_mode, swap_ab, token_back_mode, max_tokens
+):
     _run_internode(
         fp8_scale_mode=fp8_scale_mode,
         swap_ab=swap_ab,
         token_back_mode=token_back_mode,
+        max_tokens=max_tokens,
+        token_counts=(max_tokens, max_tokens * 3 // 4, max_tokens),
     )
 
 
 @pytest.mark.parametrize(
-    "swap_ab,mma_tiler_mnk", [(True, (256, 32, 128)), (False, (64, 128, 128))]
+    "swap_ab,mma_tiler_mnk,tokens",
+    [
+        (True, (256, 32, 128), 64),
+        (False, (64, 128, 128), 64),
+        (False, (64, 128, 128), 1024),
+    ],
 )
 def test_moe_ep_sm90_pull_fp8_internode_kernel_layout(
-    monkeypatch, swap_ab, mma_tiler_mnk
+    monkeypatch, swap_ab, mma_tiler_mnk, tokens
 ):
     """Host side, no launch: the internode kernel builds from the shim config,
     and the per-origin token counts sit in the counter prefix kernel_tail
-    zeroes before the next launch."""
+    zeroes before the next launch.  From 1024 tokens per rank the non-swap
+    epi_warps layout takes the early return."""
     from types import SimpleNamespace
 
     import cutlass.utils as cutlass_utils
@@ -455,7 +467,7 @@ def test_moe_ep_sm90_pull_fp8_internode_kernel_layout(
     config = pkg.MegaMoEHopperFp8Config(
         rank=0,
         world_size=8,
-        num_tokens_per_rank=64,
+        num_tokens_per_rank=tokens,
         num_topk=4,
         num_total_experts=16,
         hidden=1024,
@@ -469,7 +481,13 @@ def test_moe_ep_sm90_pull_fp8_internode_kernel_layout(
     names = [spec.name for spec in kernel._local_region_specs]
     # Data buffers start at l1_token_buffer; everything before it is reset.
     assert names.index("gin_token_count") < names.index("l1_token_buffer")
-    # The epilogue warps run the node reduce from their own branch.
+    # The epilogue warps run the node reduce from their own branch, or, with
+    # the early return, the dispatch warps reduce during the deferred local FC2.
     comm = kernel.token_comm
     assert comm.num_tail_reduce_warps == len(kernel.epilogue_warp_id)
-    assert comm.tail_reduce_in_epilogue
+    assert comm.early_return == (not swap_ab and tokens >= 1024)
+    assert comm.tail_reduce_in_epilogue == (not comm.early_return)
+    if comm.early_return:
+        assert kernel.sched_defer_local_fc2
+        for region in ("gin_seg1_done", "gin_ret_chunk_done"):
+            assert names.index(region) < names.index("l1_token_buffer")

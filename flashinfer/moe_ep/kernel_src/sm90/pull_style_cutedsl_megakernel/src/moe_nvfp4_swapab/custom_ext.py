@@ -11,7 +11,7 @@ from cutlass.cutlass_dsl import Int32, extract_mlir_values, new_from_mlir_values
 from cutlass._mlir import ir
 
 from cutlass.utils.blockscaled_layout import tile_atom_to_shape_SF
-from .fc1_fc2_fuse_sched import BlockPhase, TailSplitBit
+from .fc1_fc2_fuse_sched import BlockPhase, LateSegmentBit, TailSplitBit
 from .moe_utils import rewrite_tensor_shape, spin_wait
 from .moe_persistent_scheduler import MoESchedExtension, MoEWorkTileInfo
 
@@ -199,6 +199,12 @@ class GluMxFp8WorkTileInfo(MoEWorkTileInfo):
     @property
     def peek_ready(self):
         return ((self.phase_and_peek >> Int32(PhaseBits)) & Int32(1)) != Int32(0)
+
+    @property
+    def is_late_segment(self):
+        """Slot 7 bit 18: a tile of the deferred node-local FC2 segment
+        (``defer_local_fc2`` in ``fc1_fc2_fuse_sched``)."""
+        return (self.phase_and_peek & Int32(LateSegmentBit)) != Int32(0)
 
     @property
     def valid_tokens_in_cta_tile(self) -> Int32:

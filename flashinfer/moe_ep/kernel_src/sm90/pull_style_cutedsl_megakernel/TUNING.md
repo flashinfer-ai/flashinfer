@@ -668,25 +668,57 @@ Where the time goes now (`--stamps`, slowest rank, µs): kernel 873 / 1875 /
 85, GEMM done 746 / 1505 / 4045 (fastest rank 687 / 1312 / 3896), node
 reduce 17 / 27 / 91, return put 96 / 329 / 1231 (line rate, ~45 GB/s).
 
+### Early return (2026-11-02, dlcluster 2 x 8 H100)
+
+The proxied origins' FC2 was the last segment of the schedule, so the
+return put was a pure tail (17% of the kernel at 1024 tokens, 23% at 4096).
+From 1024 tokens per rank the non-swap epi_warps layout now returns the
+node partials while the GEMM still runs:
+
+* the segment-major schedule defers the node-local blocks' FC2 to a third
+  segment (`defer_local_fc2`: local FC1, remote FC1 + FC2, local FC2);
+  those tiles carry `LateSegmentBit`;
+* every epilogue warp counts itself in `gin_seg1_done` (after a
+  system-scope fence) before its first deferred tile; CTA 0's dispatch warp
+  waits for the whole rank and bumps every node rank's monotonic
+  `gin_seg1_flag`; at `ranks_per_node * (epoch + 1)` every landing row of
+  this rank is final;
+* the dispatch warps of CTAs 1.. reduce the proxied tokens chunk by chunk
+  (one hit-mask read per token, 512-byte row segments through a 4-stage
+  bulk-copy ring in SMEM, the same FP32 sums as before) and count each
+  chunk; CTA 0 posts one return put per chunk (8 chunks of >= 128 rows,
+  the last put carrying the remaining RET increments);
+* `kernel_tail` keeps B1 / B2 and only waits for the RET signal.
+
+NEW vs the previous commit on the same nodes (two interleaved rounds,
+max-rank median µs): 1024 1992 -> 1879 (-5.7%), 2048 3349 -> 3095 (-7.6%),
+4096 5832 -> 5236 (-10.2%); 8-512 tokens unchanged (+-1%, early return
+off).  Below 1024 the return is too short to pay for the deferred FC2's
+lost L2 reuse of the FC1 output (it measured +1.6 / +3.2 / +2.5% at 128 /
+256 / 512).  At 4096 (IKET + stamps) the node's remote-origin FC2 ends at
+~3.5 ms, bounded by the pull (one dispatch warp per CTA, ~115 GB/s, done at
+~1.6 ms) that seg 1 waits for; the reduce of 8 chunks takes ~600 µs (the
+first version, one topk-index load per 512-byte unit, took ~950 µs), but
+the put now overlaps the GEMM and runs at ~36 GB/s instead of the ~47 GB/s
+it reaches alone, so the kernel still ends ~1.6 ms after seg 1.
+
 Internode levers left:
 
-1. **Overlap the return put** — the proxied origins' FC2 is the last
-   segment of the schedule, so the put is a pure tail (17% of the kernel
-   at 1024, 23% at 4096).  Ordering seg0 FC1, seg1 FC1, seg1 FC2, seg0 FC2
-   and running the reduce + return on the dispatch warp during seg0 FC2
-   would hide up to the seg0 FC2 time (~1/6 of the GEMM, ~13% at 256-4096
-   if the reduce keeps up).  The 48-register dispatch warp needs bulk-copy
-   loads (one LDG row in flight reaches ~130 GB/s, slower than the put),
-   seg1 FC2 completion needs a per-rank count and a node barrier of its
-   own, and the scheduler a third segment.
+1. **Return put under GEMM load** — the put overlaps the deferred FC2 but
+   slows to ~36 GB/s there (the NIC's reads of GPU memory compete with the
+   GEMM's L2 / HBM traffic); the rest of the gap to line rate is the last
+   chunk's reduce and post.
 2. **Rank skew before B1** — the slowest local rank finishes the GEMM
    150-190 µs after the fastest at 1024 / 4096: with 24 experts of 256 ± 16
    rows (1024 tokens) the per-rank 64-row tile count already spreads ~7%
    max/mean, before any clock difference between GPUs.
-3. **Pull-paced FC1 start** — at 1024 tokens IKET shows the TMA-A warps
-   waiting ~100 µs per CTA for node-local rows in the first ~200 µs: one
-   active dispatch warp per CTA pulls ~100 GB/s, about the first group's
-   FC1 appetite.
+3. **Pull bandwidth** — one active dispatch warp per CTA pulls ~100-115
+   GB/s.  At 1024 tokens IKET shows the TMA-A warps waiting ~100 µs per CTA
+   for node-local rows in the first ~200 µs, and with the early return the
+   pull end bounds how early the remote-origin FC2 can finish.
+4. **group_hint at 1024 / 4096** — re-swept on dlcluster (None = one wave,
+   132, 198, 264, two rounds): the one-wave group of the EP8 row stays best
+   (1985-1991 / 5830-5836 µs against 1996-2121 / 5868-6170).
 
 ## Next levers
 

@@ -207,6 +207,16 @@ not picked them up):
   `heuristic_config.EP16_OVERRIDES` (blockwise 128-4096) and
   `_RANK_OVERRIDES`.  Measurements in [TUNING.md](TUNING.md).  Not in the
   drop tree.
+- Internode early return (2026-11-02; GIN + non-swap + epi_warps +
+  max_tokens_per_rank >= 1024): `fc1_fc2_fuse_sched.py` `defer_local_fc2`
+  (third segment, `LateSegmentBit`, `custom_ext.py` `is_late_segment`),
+  `epilogue_fp8.py` `seg1_done_signal`, `token_comm.py`
+  `_gin_early_return` / `_gin_early_reduce` / `_gin_return_chunks` /
+  `_gin_wait_return` (dispatch warp after the pull; `ret_mbar` /
+  `ret_buffer` SMEM), `megamoe_kernel_fp8.py` regions `gin_seg1_done`,
+  `gin_ret_chunk_done` (zeroed prefix) and `gin_seg1_flag` (shared,
+  monotonic), `kernel_fp8_glu_fc12.py` `sched_defer_local_fc2`.  Not in the
+  drop tree.
 
 ## Layout
 

@@ -449,6 +449,19 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
             fc2_publishes_split_tail = token_cluster * ((hidden_tiles + 1) // 2)
             cta_tile_tokens = self.cluster_tile_tokens // token_cluster
 
+        # Internode early return: the node-local blocks' FC2 runs last and the
+        # dispatch warps reduce and return the node partials meanwhile
+        # (non-swap epi_warps layouts).  Below 1024 tokens per rank the return
+        # is too short to repay the deferred FC2's lost L2 reuse.
+        early_return = (
+            self.enable_nccl_gin
+            and not token_back_by_dispatch
+            and not is_swap_ab
+            and self.max_tokens_per_rank >= 1024
+            and TokenInPullTokenBackPush.early_return_eligible(
+                hidden=self.hidden, active_dispatch_warps=active_dispatch_warps
+            )
+        )
         self.token_comm = TokenInPullTokenBackPush(
             world_size=self.world_size,
             combine_format=self.combine_format,
@@ -493,6 +506,8 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
                 len(self.epilogue_warp_id) if self.enable_nccl_gin else 0
             ),
             deterministic_slots=self.deterministic,
+            early_return=early_return,
+            num_seg1_signal_warps=len(self.epilogue_warp_id) if early_return else 0,
         )
         self.dedup_dispatch = dedup_dispatch
         if self.enable_nccl_gin:
@@ -501,6 +516,7 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
             # remote rows (those land after the RDMA payload).
             self.sched_local_source_begin = self.token_comm.node_rank_base
             self.sched_local_source_count = self.token_comm.ranks_per_node
+            self.sched_defer_local_fc2 = self.token_comm.early_return
 
         # Region layout (same call drives both get_workspace_sizes() and the
         # __call__ partition).
@@ -550,6 +566,14 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
             + _round_up(expert_count_bytes, 16)
             + _round_up(pull_buffer_bytes, 128)
         )
+        if self.token_comm.early_return:
+            # ret_mbar[Int64, stages] + ret_buffer of the early return's reduce
+            # (plus up to 128 B of padding before the 128-byte-aligned buffer).
+            total += (
+                _round_up(self.token_comm.gin_reduce_stages * 8, 16)
+                + _round_up(self.token_comm.ret_buffer_bytes(), 128)
+                + 128
+            )
         if self.token_back_standalone:
             total += (
                 _round_up(_DispatchWarpCount * 8, 16)
@@ -693,6 +717,20 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
                     16,
                 )
             )
+            if self.token_comm.early_return:
+                # Epilogue warps done with the earlier segments, and per
+                # (slot, token chunk) the reducers done with the chunk.
+                counter_specs.append(
+                    _RegionSpec("gin_seg1_done", cutlass.Int32, (1,), 16)
+                )
+                counter_specs.append(
+                    _RegionSpec(
+                        "gin_ret_chunk_done",
+                        cutlass.Int32,
+                        (self.num_remote_slots * self.token_comm.gin_ret_chunks,),
+                        16,
+                    )
+                )
 
         if self.dedup_dispatch:
             # (src_rank, src_token) -> carrier pool row rendezvous, one u64
@@ -926,6 +964,12 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
                 # Monotonic per-launch flags: payload of slot s landed here
                 # (read by this node's owners).  Never reset.
                 _RegionSpec("gin_payload_flag", cutlass.Int32, (slots,), 16),
+            ]
+            if self.token_comm.early_return:
+                # Early return: +1 per node rank whose earlier segments are
+                # stored (monotonic, never reset).
+                specs.append(_RegionSpec("gin_seg1_flag", cutlass.Int32, (1,), 16))
+            specs += [
                 # Stage 1 landing planes (RDMA destination, then LSA source).
                 _RegionSpec(
                     "gin_recv_topk_idx", cutlass.Int64,
@@ -1180,6 +1224,11 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
         """
         cluster_size = self.cluster_shape_mn[0] * self.cluster_shape_mn[1]
         sm_count = max_active_clusters * cluster_size
+        if cutlass.const_expr(self.token_comm.early_return and sm_count < 2):
+            raise ValueError(
+                "the internode early return reduces on CTAs 1.. while CTA 0 "
+                f"posts the return puts; it needs >= 2 CTAs, got sm_count={sm_count}."
+            )
         peer_rank_ptr_mapper = peer_rank_ptr_mapper_host.make_device_obj()
 
         pool_token_capacity = self.pool_token_capacity
@@ -1385,6 +1434,14 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
                 gin_token_count=self._view_local(local_workspace, "gin_token_count"),
                 gin_epoch=self._view_local(local_workspace, "gin_epoch"),
             )
+            if cutlass.const_expr(self.token_comm.early_return):
+                gin_views.update(
+                    gin_seg1_done=self._view_local(local_workspace, "gin_seg1_done"),
+                    gin_seg1_flag=self._view_shared(shared_workspace, "gin_seg1_flag"),
+                    gin_ret_chunk_done=self._view_local(
+                        local_workspace, "gin_ret_chunk_done",
+                    ),
+                )
 
         token_comm_args = ExtractedTokenCommArgs(
             input_token_buffer=activation,

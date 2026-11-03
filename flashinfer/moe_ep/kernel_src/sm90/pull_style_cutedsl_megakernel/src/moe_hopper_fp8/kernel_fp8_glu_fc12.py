@@ -67,6 +67,9 @@ class Sm90SwigluFp8Fc12Kernel:
     # set by the internode MegaMoE subclass); 0 = expert-major walk.
     sched_local_source_begin = 0
     sched_local_source_count = 0
+    # Segment-major: run the node-local blocks' FC2 last (internode early
+    # return, set by the MegaMoE subclass).
+    sched_defer_local_fc2 = False
     _setmaxnreg_max = 256
     _setmaxnreg_granularity = 8
     _sm90_cta_register_budget = 65536
@@ -552,6 +555,8 @@ class Sm90SwigluFp8Fc12Kernel:
         )
         _epi_common["fc1_store_offload"] = self.fc1_store_offload
         _epi_common["fc1_early_done_publish"] = self.fc1_early_done_publish
+        if self.sched_defer_local_fc2:
+            _epi_common["seg1_done_signal"] = True
         self.epilogue = self._make_epilogue(_epi_common)
 
         if self.num_sched_stages is None:
@@ -2752,6 +2757,7 @@ class Sm90SwigluFp8Fc12Kernel:
             expert_source_counts=expert_source_counts,
             local_source_begin=self.sched_local_source_begin,
             local_source_count=self.sched_local_source_count,
+            defer_local_fc2=self.sched_defer_local_fc2,
         )
         grid = sched_params.get_grid_shape(max_active_clusters)
         epilogue_fc2_output = (

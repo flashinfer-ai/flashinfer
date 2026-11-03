@@ -106,6 +106,7 @@ class Fp8GluEpilogue:
         fc2_store_pipeline_stages: int = 1,
         fc1_store_offload: bool = False,
         fc1_early_done_publish: bool = False,
+        seg1_done_signal: bool = False,
         epi_flag_batch: Union[int, Tuple[int, int]] = 1,
         pingpong: bool = False,
         generate_c: bool = False,
@@ -249,6 +250,11 @@ class Fp8GluEpilogue:
         # _store_buffer_stages slots (its per-WG smem share).
         self._fc1_store_offload = fc1_store_offload
         self._early_fc1_pub = fc1_early_done_publish
+        # Internode early return (deferred local FC2): every epilogue warp
+        # counts itself in ``gin_seg1_done`` once all FC2 rows it stored for
+        # the earlier segments (the remote origins' rows among them) are
+        # system-visible.
+        self._seg1_done_signal = seg1_done_signal
         self._store_buffer_stages = max(
             fc1_store_pipeline_stages, fc2_store_pipeline_stages,
         )
@@ -1925,8 +1931,16 @@ class Fp8GluEpilogue:
         else:
             math_wg_order_state = ab_consumer_state.clone()
             epi_wg_order_state = ab_consumer_state.clone()
+        seg1_signaled = cutlass.Int32(0)
 
         while work_tile_info.is_valid_tile:
+            if cutlass.const_expr(self._seg1_done_signal):
+                # Tiles arrive in schedule order: before the first deferred
+                # local FC2 tile, every earlier-segment tile is done.
+                if seg1_signaled == cutlass.Int32(0):
+                    if work_tile_info.is_late_segment:
+                        self._signal_seg1_done(token_comm_args)
+                        seg1_signaled = cutlass.Int32(1)
             # Outer task-tile range, emitted by local warp 0 of each epilogue
             # warpgroup. It starts
             # before expert-scale setup and contains the representative WGMMA
@@ -2481,3 +2495,20 @@ class Fp8GluEpilogue:
         flag_tracker.fire()
         if _iket_active:
             iket.range_pop()
+        if cutlass.const_expr(self._seg1_done_signal):
+            # No deferred local FC2 tile reached this warp.
+            if seg1_signaled == cutlass.Int32(0):
+                self._signal_seg1_done(token_comm_args)
+
+    @cute.jit
+    def _signal_seg1_done(self, token_comm_args):
+        """Count this warp in ``gin_seg1_done`` after its stores are system-visible."""
+        cute.arch.fence_acq_rel_sys()
+        cute.arch.sync_warp()
+        if cute.arch.lane_idx() == cutlass.Int32(0):
+            cute.arch.atomic_add(
+                token_comm_args.gin_seg1_done.iterator,
+                cutlass.Int32(1),
+                sem="relaxed",
+                scope="gpu",
+            )
