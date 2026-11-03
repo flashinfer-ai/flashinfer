@@ -669,6 +669,36 @@ def test_l2n_plans_need_l2n_records(arch: str) -> None:
         cake_backend.plan(256, 1, 2, 148, arch, l2n="on")
 
 
+@pytest.mark.parametrize("arch", list(cake_jit.ARCHES))
+def test_fallback_replay_counts_no_qk_apply(arch: str) -> None:
+    """The fallback plan selects a ``qk_apply`` record on the replay path too (the KCP's local backward plans on
+    that path), but the replay normalizes q / k with ``qk_l2norm`` and never launches ``qk_apply``: the replay's
+    stages and launch count leave it out, while the saved-set paths keep it and launch no ``qk_l2norm``."""
+    try:
+        cake_backend.plan(256, 1, 2, 148, arch, l2n="fallback")
+    except ValueError:
+        pytest.skip(f"this build ships no fallback records for {arch}")
+    for S, N, H in ((256, 1, 2), (5000, 3, 16), (64 * 40, 300, 64)):
+        p = cake_backend.plan(S, N, H, 148, arch, l2n="fallback")
+        assert p.dispatched("qk_apply", "replay") and p.dispatched(
+            "qk_l2norm", "replay"
+        )
+        selected = {s for s, r in p.records["replay"].items() if r is not None}
+        assert set(p.stages("replay")) == selected - {"qk_apply"}
+        assert "qk_l2norm" in p.stages("replay") and "qk_pullback" in p.stages("replay")
+        for path in ("light", "tape"):
+            assert "qk_apply" in p.stages(path) and "qk_l2norm" not in p.stages(path)
+        try:
+            fused = cake_backend.plan(S, N, H, 148, arch, l2n="fused")
+        except ValueError:
+            continue
+        # the fused class runs the same stages but the token-local ones: the fallback replay adds exactly the
+        # normalize and the pullback launches
+        assert p.launch_count("replay") == fused.launch_count("replay") + p.launches(
+            "qk_l2norm", "replay"
+        ) + p.launches("qk_pullback", "replay")
+
+
 # ---------------------------------------------------------------------------------------------------------------
 # device rows (skip without an exported device or without the l2n records of its architecture)
 
@@ -1036,6 +1066,42 @@ def test_l2n_fused_equals_the_fallback_route(shape) -> None:
         assert _bits(a).equal(_bits(b))
     for a, b in zip(_bwd(inputs, None), _bwd(inputs, None, workspace=ws), strict=True):
         assert _bits(a).equal(_bits(b)), "replay"
+
+
+@pytest.mark.parametrize(
+    "shape", SHAPES_L2N[1:3], ids=lambda s: f"{len(s[0])}docs-S{sum(s[0])}-H{s[1]}"
+)
+def test_l2n_fallback_launch_counts_are_the_launches(shape) -> None:
+    """On the fallback route ``Plan.launch_count`` is the number of programs each backward launches: the saved-set
+    backward applies the saved rstd (``qk_apply``), the replay recomputes it (``qk_l2norm``) and launches no
+    ``qk_apply`` although its plan selects one."""
+    device = _l2n_device("fallback")
+    lengths, H = shape
+    inputs = _l2n_inputs(lengths, H, device)
+    S, N = sum(lengths), len(lengths)
+    launched: list[str] = []
+
+    def recording(name, values, *, grid, device_index):
+        launched.append(name)
+        cake_jit.run_module(name, values, grid=grid, device_index=device_index)
+
+    ws = cake_backend.KdaDetWorkspace.for_problem(
+        S, N, H, device, launcher=recording, l2n="fallback"
+    )
+    p = ws.plan
+    _, saved = _fwd(inputs, workspace=ws)
+    launched.clear()
+    _bwd(inputs, saved, workspace=ws)
+    torch.cuda.synchronize(device)
+    assert len(launched) == p.launch_count("bwd")
+    assert p.record("qk_apply", p.light_path) in launched
+    launched.clear()
+    _bwd(inputs, None, workspace=ws)
+    torch.cuda.synchronize(device)
+    assert len(launched) == p.launch_count("replay")
+    assert p.dispatched("qk_apply", "replay")
+    assert p.record("qk_apply", "replay") not in launched
+    assert p.record("qk_l2norm", "replay") in launched
 
 
 @pytest.mark.parametrize("raw_gate", [False, True], ids=["g", "raw"])

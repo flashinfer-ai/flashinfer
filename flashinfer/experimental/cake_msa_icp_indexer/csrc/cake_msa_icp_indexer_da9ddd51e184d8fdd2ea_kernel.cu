@@ -174,7 +174,7 @@ __device__ __forceinline__ void tma_2d_gmem2smem(
 
 __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
     uint32_t result;
-    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xffffffff;"
+    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xFFFFFFFF;"
         : "=r"(result) : "r"(val));
     return result;
 }
@@ -210,7 +210,7 @@ kernel_cake_msa_icp_indexer_da9ddd51e184d8fdd2ea(const __grid_constant__ CUtenso
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     uint8_t* smem_q = reinterpret_cast<uint8_t*>(smem_raw + 1024);
     const int smem_q_addr = smem + 1024;
     uint8_t* smem_k = reinterpret_cast<uint8_t*>(smem_raw + 17408);
@@ -218,8 +218,7 @@ kernel_cake_msa_icp_indexer_da9ddd51e184d8fdd2ea(const __grid_constant__ CUtenso
     unsigned long long* lists = reinterpret_cast<unsigned long long*>(smem_raw + 1024);
     const int lists_addr = smem + 1024;
 
-    // Mbarrier init (6 pipeline groups, 0 ordered-sequence groups, 34 barriers)
-    // Mbarriers at smem_raw[0..272)
+    // Mbarrier init (34 barriers at smem_raw[0..272))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -284,10 +283,8 @@ kernel_cake_msa_icp_indexer_da9ddd51e184d8fdd2ea(const __grid_constant__ CUtenso
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
-
-    // Kernel post-init ops
-    const int tmem_acc = taddr;
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_acc = taddr;
 
     // ---- Role: epi ----
     if (warp <= 3) {

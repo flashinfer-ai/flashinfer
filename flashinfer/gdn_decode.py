@@ -1411,6 +1411,11 @@ def gated_delta_rule_mtp(
         speculative-decoding flows where each draft token needs its own pool
         slot.  Constraints: ``T >= 2``, ``disable_state_update=False``,
         mutually exclusive with ``intermediate_states_buffer``.
+        Every entry must be a valid in-range pool slot: unlike
+        ``initial_state_indices`` / ``output_state_indices``, per-token
+        scatter indices carry NO negative-padding promise — a negative or
+        out-of-range entry writes outside the pool.  Pad whole requests
+        through a negative ``initial_state_indices`` entry instead.
         Default: ``None``.
     disable_state_update : bool, optional
         If ``True``, the initial state is not updated.  Currently defaults

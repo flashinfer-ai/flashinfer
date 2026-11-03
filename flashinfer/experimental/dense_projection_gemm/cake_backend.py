@@ -925,14 +925,19 @@ ROUTER_RULES: dict[
     # then the head/tail program with one head unit per CTA pair over half of the steps and three tail units per pair
     # ("H0.5x3", 76 head and 228 tail units on 152 SMs; windows measured at 10240 and 12288 (sm_100a), 16172, 16231,
     # 16384 and 32768 tokens; more than 3 % slower next to a resident kernel at 8192 tokens on sm_100a, at 10240 and
-    # 12288 on sm_103a).
+    # 12288 on sm_103a; a later sm_103a measurement passed at 10240 on two parts, between misses at 8192 and 12288, so
+    # 10240 was not added).
     # Hidden 4096 on sm_100a: 44 head units, one per CTA pair left next to a kernel holding 32 SMs, each a pair's
     # whole share of the steps, then five tail units per pair ("H1x5p44"; measured at 10240, 12288, 16172, 16231 and
     # 16384 tokens; more than 3 % slower next to a resident kernel at 8192 tokens and, launched before it, at 32768).
-    # Hidden 4096 on sm_103a keeps the deterministic plan: "H1x4p44" (four tail units) was up to 7.6 % slower than
-    # that plan at 16172 to 16384 tokens when launched before a kernel holding SMs on another stream.  Hidden 6144
-    # keeps the deterministic plan: on sm_100a no partition was faster in every run in CUDA graphs; on sm_103a the
-    # closest one ("H1x5p44", x0.973-0.983 alone) left the backward pass (input and weight gradient) no faster.
+    # Hidden 4096 on sm_103a: "H1x4p44" (44 head units, then four tail units per CTA pair) from 20480 to 49152 tokens
+    # (measured at 20480, 24576, 32768 and 49152 tokens, each on four or five parts); up to 7 % slower than the
+    # deterministic plan next to a resident kernel at 8192 to 16384 tokens, and at 65536 the checkpointed step (two
+    # forwards and the backward pass) was up to 1.4 % slower.  Hidden 6144 on sm_103a: "H1x5p44" from 16172 to 20480
+    # tokens (measured at 16172, 16231, 16384 and 20480 tokens, each on four parts); up to 7.8 % slower next to a
+    # resident kernel at 8192 to 12288 tokens, the backward pass (input and weight gradient) no faster at 24576 and up
+    # to 2.3 % slower at 32768.  Hidden 6144 on sm_100a keeps the deterministic plan: no partition was faster in every
+    # run in CUDA graphs.
     # sm_107a: hidden 5120 "H0.5x4" (four tail units, 108 head and 432 tail units on 216 SMs; measured on two parts at
     # 16172, 16231 and 16384 tokens); hidden 4096 and 6144 keep the deterministic plan: at 4096 "H0.5x4" was up to
     # 7 % slower than that plan when a kernel holding 16 SMs on another stream started during it (the kernel takes SMs
@@ -940,9 +945,9 @@ ROUTER_RULES: dict[
     ("sm_100a", "nn_t", 4096, 256): ((10240, 16384, "H1x5p44"),),
     ("sm_100a", "nn_t", 5120, 256): ((1, 128, "waves"), (10240, 32768, "H0.5x3")),
     ("sm_100a", "nn_t", 6144, 256): None,
-    ("sm_103a", "nn_t", 4096, 256): None,
+    ("sm_103a", "nn_t", 4096, 256): ((20480, 49152, "H1x4p44"),),
     ("sm_103a", "nn_t", 5120, 256): ((1, 192, "waves"), (16172, 32768, "H0.5x3")),
-    ("sm_103a", "nn_t", 6144, 256): None,
+    ("sm_103a", "nn_t", 6144, 256): ((16172, 20480, "H1x5p44"),),
     ("sm_107a", "nn_t", 4096, 256): None,
     ("sm_107a", "nn_t", 5120, 256): ((16172, 16384, "H0.5x4"),),
     ("sm_107a", "nn_t", 6144, 256): None,
@@ -958,8 +963,12 @@ ROUTER_SM_COUNT: dict[str, int] = {"sm_100a": 152, "sm_103a": 152, "sm_107a": 21
 #: count under the same rule, in two jobs on different parts).  Such a part takes the table of its own SM count only:
 #: a row without an entry in it, and every token count outside its windows, runs the deterministic program.
 #: The sm_107a tables were measured on 208-SM and 212-SM R200 parts at 16172 to 16384 tokens: hidden 5120 takes
-#: "H0.5x4" there (104 head and 416 tail units on 208 SMs, 106 and 424 on 212); hidden 4096 and 6144 and the forward
-#: keep the deterministic plan, as on 216 SMs.
+#: "H0.5x4" there (104 head and 416 tail units on 208 SMs, 106 and 424 on 212).  On 212 SMs hidden 6144 takes "H0.5x4"
+#: too, a window that holds only with the head/tail program of :data:`ROUTER_HEAD_TAIL_TEMPLATES_BY_SM` (with
+#: ``router_fp32_gemm_atomic_nn_t_ht_c3_nreg`` it was up to 9.2 % slower than the deterministic plan next to a resident
+#: kernel).  Hidden 4096 keeps the deterministic plan on both SM counts (on 212 SMs "H0.5x4" with the tensor-memory
+#: program was up to 6.2 % slower next to a resident kernel), as do hidden 6144 on 208 SMs and the forward, as on
+#: 216 SMs.
 # fmt: off
 ROUTER_RULES_BY_SM: dict[
     tuple[str, int],
@@ -975,7 +984,7 @@ ROUTER_RULES_BY_SM: dict[
         ("sm_107a", "kk", 4096, 256): None, ("sm_107a", "kk", 5120, 256): None, ("sm_107a", "kk", 6144, 256): None,
         ("sm_107a", "nn_t", 4096, 256): None,
         ("sm_107a", "nn_t", 5120, 256): ((16172, 16384, "H0.5x4"),),
-        ("sm_107a", "nn_t", 6144, 256): None,
+        ("sm_107a", "nn_t", 6144, 256): ((16172, 16384, "H0.5x4"),),
     }),
 })
 # fmt: on
@@ -986,9 +995,18 @@ ROUTER_HEAD_TAIL_SUFFIX = "_ht_c3_nreg"
 #: ``router_fp32_gemm_atomic_nn_t`` + :data:`ROUTER_HEAD_TAIL_SUFFIX`: on ``sm_103a``, the head/tail program with the
 #: BF16 parts of ``A`` in tensor memory (the same products, accumulators, partition and part segments; two TMEM chunk
 #: buffers, six slots of raw ``A`` tiles and six of ``B`` parts in shared memory).  ``sm_103a`` takes a head/tail
-#: partition only in the hidden 5120 window of :data:`ROUTER_RULES` on 152 SMs, where it was measured.
+#: partition only in the windows of :data:`ROUTER_RULES` on 152 SMs, where it was measured.
 ROUTER_HEAD_TAIL_TEMPLATES: dict[str, str] = {
     "sm_103a": "router_fp32_gemm_ts_r6p6_atomic_nn_t_ht_c2_nreg",
+}
+#: The weight gradient's head/tail program of the parts of an architecture with exactly ``sm_count`` SMs where it is
+#: not the architecture's (:data:`ROUTER_HEAD_TAIL_TEMPLATES`), ``(arch, sm_count) -> template``: on 212-SM ``sm_107a``
+#: parts, the head/tail program with the BF16 parts of ``A`` in tensor memory, which serves the hidden 5120 and 6144
+#: windows of that SM count's table in :data:`ROUTER_RULES_BY_SM` (measured on 212-SM R200 parts at 16172, 16231 and
+#: 16384 tokens, four parts in two nodes).  208-SM and 216-SM ``sm_107a`` parts keep
+#: ``router_fp32_gemm_atomic_nn_t`` + :data:`ROUTER_HEAD_TAIL_SUFFIX` (the other program was not measured there).
+ROUTER_HEAD_TAIL_TEMPLATES_BY_SM: dict[tuple[str, int], str] = {
+    ("sm_107a", 212): "router_fp32_gemm_ts_r6p6_atomic_nn_t_ht_c2_nreg",
 }
 _ROUTER_HEAD_TAIL_SPEC = re.compile(r"H(\d+(?:\.\d+)?)x(\d+)(?:p(\d+))?")
 #: The forward's largest explicit split count: an element of the forward takes at most two partials, so a forward
@@ -1077,9 +1095,15 @@ def router_head_pairs(spec: Union[str, int, None]) -> Optional[int]:
     return None
 
 
-def router_head_tail_template(arch: str) -> str:
-    """The template of the weight gradient's head/tail program on ``arch``: :data:`ROUTER_HEAD_TAIL_TEMPLATES`, else
-    ``router_fp32_gemm_atomic_nn_t`` + :data:`ROUTER_HEAD_TAIL_SUFFIX`."""
+def router_head_tail_template(arch: str, sm_count: Optional[int] = None) -> str:
+    """The template of the weight gradient's head/tail program on ``arch`` (on a device of ``sm_count`` SMs):
+    :data:`ROUTER_HEAD_TAIL_TEMPLATES_BY_SM` for exactly ``(arch, sm_count)``, else
+    :data:`ROUTER_HEAD_TAIL_TEMPLATES`, else ``router_fp32_gemm_atomic_nn_t`` + :data:`ROUTER_HEAD_TAIL_SUFFIX`
+    (``sm_count`` ``None``: the architecture's program)."""
+    if sm_count is not None:
+        template = ROUTER_HEAD_TAIL_TEMPLATES_BY_SM.get((arch, int(sm_count)))
+        if template is not None:
+            return template
     return ROUTER_HEAD_TAIL_TEMPLATES.get(
         arch, cake_jit.TEMPLATE_PREFIXES[1] + "nn_t" + ROUTER_HEAD_TAIL_SUFFIX
     )
@@ -1373,7 +1397,7 @@ def plan_atomic_router(
     the deterministic path, which serves or refuses it as that package does), a template this checkout does not
     register for ``arch``, or the planner (:func:`router_partition`).  An explicit ``splits`` (``1`` included) runs
     this package's program when the view and the registry allow it; a head/tail partition runs the head/tail program
-    of the architecture (:func:`router_head_tail_template`)."""
+    of the architecture on a device of ``sm_count`` SMs (:func:`router_head_tail_template`)."""
     if (
         A.dtype != torch.float32
         or B.dtype != torch.float32
@@ -1427,7 +1451,7 @@ def plan_atomic_router(
         return None, "the planner keeps the row on the deterministic program"
     units, head_spans, head_steps = partition
     if head_spans:
-        template = router_head_tail_template(arch)
+        template = router_head_tail_template(arch, sm_count)
         if template not in cake_jit.KERNELS.get(arch, {}):
             return None, f"{template} is not registered for {arch}"
     m_tiles, n_tiles, k_iters = _router_grid(M_eff, N_eff, K)
