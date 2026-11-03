@@ -1854,7 +1854,7 @@ def run_cake_dsv4(
     """Launch the CAKE DSv4 route for flattened ``query [rows, num_heads, 512]``.
 
     ``enable_pdl`` launches the programs that support it (the FP8 persistent,
-    M64 and low-head prefill bodies) as programmatic dependents of the previous kernel on the
+    M64, low-head prefill and H64 cluster bodies) as programmatic dependents of the previous kernel on the
     stream; they wait for it before their first global read.  The other
     programs launch without the attribute.
 

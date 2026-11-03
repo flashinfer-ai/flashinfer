@@ -1462,6 +1462,47 @@ def test_enable_pdl_lowhead_prefill_matches_and_waits_for_the_query_producer(for
     assert torch.equal(out.reshape(plain.shape), plain)
 
 
+def test_enable_pdl_h64_cluster_body_matches_and_waits_for_the_query_producer(
+    monkeypatch,
+):
+    """12 FP8/H64 tokens of sparse_topk 260 run the H64 cluster program on
+    SM100/SM103; as a programmatic dependent it is bitwise equal to the plain
+    launch and, inside a graph, reads the query the copy right before it writes."""
+    _skip_unless_cake_gpu()
+    calls = _count_dispatches(monkeypatch)
+    case = _build_case(
+        num_heads=64,
+        dtype=torch.float8_e4m3fn,
+        seq_lens=[_LONG_SEQ + 37 * i for i in range(3)],
+        q_lens=[5, 4, 3],
+        layout="ragged",
+        compressed_width=132,
+        compressed_page=2,
+    )
+    workspace = _workspace_128mib()
+    plain = case.run(workspace=workspace, out=case.nan_out(), float_scales=True)
+    torch.cuda.synchronize()
+    assert {route for route, _ in calls} == {"fp8_lowhead_h64"}, calls
+    pdl = case.run(
+        workspace=workspace, out=case.nan_out(), float_scales=True, enable_pdl=True
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(plain.view(torch.int16), pdl.view(torch.int16))
+
+    source = case.query.clone()
+    case.query.zero_()
+    out = case.nan_out()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        case.query.copy_(source)
+        case.run(workspace=workspace, out=out, float_scales=True, enable_pdl=True)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(
+        out.reshape(plain.shape).view(torch.int16), plain.view(torch.int16)
+    )
+
+
 @pytest.mark.parametrize("h_q", _SGLANG_HEADS)
 @pytest.mark.parametrize("form", ["decode", "mtp-flat", "prefill"])
 def test_sglang_compressed_c4_convention(h_q, form):

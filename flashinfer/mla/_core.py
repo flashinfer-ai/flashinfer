@@ -2058,8 +2058,9 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     enable_pdl : Optional[bool]
         Whether to enable Programmatic Dependent Launch. Used by the
         TRTLLM-GEN path; on SM100/SM103/SM107 by ``backend="cake"`` for its
-        FP8 persistent, M64 and low-head prefill programs (the other BF16 /
-        FP8 programs launch without it); and on SM120/SM121 by ``backend="cake"`` with
+        FP8 persistent, M64 and low-head prefill programs and, on SM100/SM103,
+        its FP8 H64 cluster program (the other BF16 / FP8 programs launch
+        without it); and on SM120/SM121 by ``backend="cake"`` with
         ``kv_cache_format="fp8_dsv41_fp4_ca"`` (its split merge is launched as a
         programmatic dependent of the decode grid). ``None`` follows the device
         default. The NVFP4 Cake family rejects ``True``.
