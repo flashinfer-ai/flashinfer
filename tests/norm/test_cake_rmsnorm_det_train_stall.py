@@ -288,10 +288,10 @@ CARVEOUT_MAX_SHARED = 100
 # The calls that need a whole SM, with BF16 and FP32 weights alike (the facade's
 # per-architecture list): arch -> (kind, hidden, residual, above), every window
 # of the route above ``above`` tokens.  On sm_100a / sm_103a the residual
-# route's column-task window (at most 6 tokens) starts beside the side CTA.
+# route's column-task window (at most 32 tokens) starts beside the side CTA.
 WHOLE_SM = {
-    "sm_100a": (("bwd", 6144, True, 6),),
-    "sm_103a": (("bwd", 6144, True, 6),),
+    "sm_100a": (("bwd", 6144, True, 32),),
+    "sm_103a": (("bwd", 6144, True, 32),),
     "sm_107a": (
         ("bwd", 6144, True, 0),
         ("bwd", 1536, False, 1024),
