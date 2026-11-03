@@ -426,6 +426,7 @@ void csf_expand(TensorView fixed, TensorView exceptions, TensorView exc_offsets,
     TVM_FFI_THROW(ValueError) << "csf_expand supports up to " << max_cols
                               << " columns on this device, got " << cols;
   }
+  ffi::CUDADeviceGuard device_guard(fixed.device().device_id);
   const cudaStream_t stream = get_stream(fixed.device());
   uint8_t* dst = static_cast<uint8_t*>(out.data_ptr());
   if (dest == Dest::kSwizzled128x4) {
