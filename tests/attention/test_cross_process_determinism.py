@@ -159,10 +159,6 @@ def _run_child(workload: str, backend: str, warm: bool) -> str:
     return proc.stdout.strip().splitlines()[-1]
 
 
-def _cudnn_prefill_available() -> bool:
-    return _cudnn_supports_direct_seqlens(DTYPE)
-
-
 def _skip_unless_supported(workload: str, backend: str) -> None:
     device = torch.device("cuda")
     if backend == "fa3" and not is_sm90a_supported(device):
@@ -172,7 +168,7 @@ def _skip_unless_supported(workload: str, backend: str) -> None:
     ):
         pytest.skip("cutlass ragged prefill requires SM100a or SM110a")
     if backend == "cudnn":
-        if workload == "ragged_prefill" and not _cudnn_prefill_available():
+        if workload == "ragged_prefill" and not _cudnn_supports_direct_seqlens(DTYPE):
             pytest.skip(
                 "cuDNN ragged prefill needs cuDNN 9.24+ and cudnn-frontend 1.25+"
             )
