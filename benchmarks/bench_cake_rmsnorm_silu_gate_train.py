@@ -14,42 +14,41 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 Benchmark of the Cake SiLU-gated RMSNorm training kernels
-(``RMSNorm(x) * w * SiLU(z)`` over ``[T, H, 128]``) against the training-side
-comparators: the flash-linear-attention Triton function ``rms_norm_gated``
-(the kernel of its ``FusedRMSNormGated`` module, ``activation="swish"``, when
-installed), ``torch.compile`` (inductor) of the FP32 formula and eager autograd
-of the same formula.
+(``RMSNorm(x) * w * SiLU(z)`` over ``[T, H, 128]``) with the opt-in
+non-deterministic weight gradient (``deterministic=False``: one backward kernel
+whose last CTA finishes the FP64 weight-gradient sum) against the same entry
+points with the deterministic default (``deterministic=True``: the
+deterministic package's backward kernel and its fixed-order weight-gradient
+reduction).
 
-Every row times, on identical generated inputs:
+Every row times, for both modes, on identical generated inputs:
 
-- ``fwd``: one forward call as training runs it (autograd recording);
-- ``bwd``: one backward call (the weight-gradient reduction and its final cast
-  included; for the autograd comparators the time of forward plus backward
-  less the forward);
-- ``2fwd+bwd``: the activation-checkpointed step, ``2 * fwd + bwd``;
-- ``ckpt``: the same step measured: ``torch.utils.checkpoint(...,
-  use_reentrant=False)`` of the forward, then the backward (which replays it).
+- ``fwd``: one forward call (preallocated output);
+- ``bwd``: one backward call into a BF16 weight gradient, the final weight
+  gradient included (the deterministic reduction kernel, or the last CTA of
+  the non-deterministic kernel), with a preallocated caller workspace;
+- ``ckpt``: the activation-checkpointed step through autograd,
+  ``torch.utils.checkpoint(cake_rmsnorm_silu_gate, ..., use_reentrant=False)``
+  then the backward (which replays the forward): ``2 * fwd + bwd`` measured.
 
 Timing uses CUPTI kernel activity with a cold L2
-(``flashinfer.testing.bench_gpu_time(enable_cupti=True)``); a comparator of
-several kernels reports the sum of their GPU time, copies and initializations
-included.  Memory columns report the bytes autograd saves for the backward
-(``saved``) and the peak allocation of one forward plus backward beyond the
-inputs and gradients (``peak``); the Cake rows also report the backward's
-workspace (``workspace``), the FP32 weight-gradient partials it allocates per
-call unless the caller passes one.  Each comparator's outputs are checked
-against the Cake outputs (largest absolute difference of ``y``, ``dx``, ``dz``,
-``dw``).
-
-``--side-stream`` adds, for the Cake kernels, the event-timed median of seven
-forward and seven backward calls beside a one-thread kernel resident on
-another stream over the median of seven calls alone (alternating), the
-concurrent-launch measurement of issue #7038.
+(``flashinfer.testing.bench_gpu_time(enable_cupti=True)``); each stage reports
+the median and, as its variation, the samples' minimum, maximum and coefficient
+of variation; ``speedup`` is the deterministic median over the
+non-deterministic one.  Memory columns report the bytes autograd keeps for the backward
+(``saved``, retained between forward and backward), the peak allocation of one
+autograd forward plus backward beyond the inputs (``peak``, outputs included),
+the backward's temporary allocation with preallocated outputs and no caller
+workspace (``temp``) and the caller workspace of each mode (``workspace``).
+Output columns check the non-deterministic results against the deterministic
+ones: ``dx`` and ``dz`` bitwise, ``dw`` as the largest distance in BF16 units
+in the last place, and the number of distinct ``dw`` bit patterns over
+``--repeats`` backward calls.
 
 Example::
 
     python benchmarks/bench_cake_rmsnorm_silu_gate_train.py --tokens 30193 32737 32388 --heads 48
-    python benchmarks/bench_cake_rmsnorm_silu_gate_train.py --side-stream --json out.json
+    python benchmarks/bench_cake_rmsnorm_silu_gate_train.py --json out.json
 """
 
 from __future__ import annotations
@@ -68,80 +67,32 @@ from flashinfer.cake_rmsnorm_silu_gate_train import (
     cake_rmsnorm_silu_gate_train_backward_workspace,
     cake_rmsnorm_silu_gate_train_backward_workspace_bytes,
     cake_rmsnorm_silu_gate_train_forward,
+    is_cake_rmsnorm_silu_gate_train_supported,
 )
 from flashinfer.testing import bench_gpu_time
 
 D = 128
-# The side-stream measurement: a one-thread kernel resident for about 5 ms,
-# started after a 1M-cycle sleep on the main stream (issue #7038's repro).
-SIDE_SLEEP_CYCLES = 10_000_000
-PRE_SLEEP_CYCLES = 1_000_000
-SIDE_RUNS = 7
+MODES = (("deterministic", True), ("nondeterministic", False))
+STAGES = ("fwd", "bwd", "ckpt")
+# The issue's token counts and a spread around them, then small and irregular ones.
+TOKENS = (30193, 32737, 32388, 30000, 33000, 1, 7, 129, 1031, 4097)
 
 
-def _time(fn: Callable[[], object]) -> float:
-    """Median GPU time (ms) of ``fn`` over its kernels, cold L2, CUPTI."""
+def _stats(fn: Callable[[], object]) -> dict:
+    """Median, minimum, maximum (ms) and coefficient of variation of the GPU
+    time of ``fn``'s kernels, CUPTI, cold L2."""
 
-    return float(
-        statistics.median(bench_gpu_time(fn, enable_cupti=True, cold_l2_cache=True))
-    )
-
-
-def _event_ms(call: Callable[[], object], side: Optional[torch.cuda.Stream]) -> float:
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    torch.cuda.synchronize()
-    if side is not None:
-        with torch.cuda.stream(side):
-            torch.cuda._sleep(SIDE_SLEEP_CYCLES)
-    torch.cuda._sleep(PRE_SLEEP_CYCLES)
-    start.record()
-    call()
-    end.record()
-    torch.cuda.synchronize()
-    return start.elapsed_time(end)
-
-
-def _beside_resident(call: Callable[[], object]) -> dict:
-    """Median ms of ``call`` alone and beside a resident side-stream kernel."""
-
-    side = torch.cuda.Stream()
-    for _ in range(3):
-        _event_ms(call, None)
-    alone, busy = [], []
-    for _ in range(SIDE_RUNS):
-        alone.append(_event_ms(call, None))
-        busy.append(_event_ms(call, side))
-    alone_ms, busy_ms = statistics.median(alone), statistics.median(busy)
-    return {"alone_ms": alone_ms, "busy_ms": busy_ms, "ratio": busy_ms / alone_ms}
-
-
-def _formula(x, z, w, eps):
-    xf, zf, wf = x.float(), z.float(), w.float()
-    rstd = torch.rsqrt(xf.square().mean(dim=-1, keepdim=True) + eps)
-    return (((xf * rstd) * wf) * torch.nn.functional.silu(zf)).to(x.dtype)
-
-
-def _comparators(eps: float) -> dict[str, Callable]:
-    """name -> ``f(x, z, w)``, a differentiable forward."""
-
-    found: dict[str, Callable] = {
-        "cake": lambda x, z, w: cake_rmsnorm_silu_gate(x, z, w, eps),
+    samples = [
+        float(t) for t in bench_gpu_time(fn, enable_cupti=True, cold_l2_cache=True)
+    ]
+    mean = statistics.fmean(samples)
+    return {
+        "ms": statistics.median(samples),
+        "min_ms": min(samples),
+        "max_ms": max(samples),
+        "cv": statistics.pstdev(samples) / mean if mean > 0 else 0.0,
+        "n": len(samples),
     }
-    try:
-        from fla.modules.fused_norm_gate import rms_norm_gated
-
-        # The functional form takes ``w`` itself, so the weight gradient flows
-        # back to the caller's tensor (a module would hold its own parameter).
-        found["fla_triton"] = lambda x, z, w: rms_norm_gated(
-            x, z, w, None, "swish", eps=eps
-        )
-    except Exception as exc:  # noqa: BLE001
-        print(f"# flash-linear-attention unavailable: {type(exc).__name__}: {exc}")
-    compiled = torch.compile(lambda x, z, w: _formula(x, z, w, eps), dynamic=False)
-    found["torch_compile"] = compiled
-    found["eager"] = lambda x, z, w: _formula(x, z, w, eps)
-    return found
 
 
 def _inputs(T: int, H: int, seed: int):
@@ -167,154 +118,201 @@ def _saved_bytes(fn, x, z, w) -> int:
     return total
 
 
-def bench_row(
-    T: int,
-    H: int,
-    eps: float,
-    comparators: dict[str, Callable],
-    seed: int,
-    side_stream: bool = False,
-) -> dict:
+def _peak_bytes(call: Callable[[], object]) -> int:
+    """Peak allocation of ``call`` beyond what is allocated before it."""
+
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    base = torch.cuda.memory_allocated()
+    out = call()
+    torch.cuda.synchronize()
+    peak = torch.cuda.max_memory_allocated() - base
+    del out
+    return peak
+
+
+def _ordered(bf16: torch.Tensor) -> torch.Tensor:
+    """BF16 bit patterns as integers in the order of their values (+0 = -0)."""
+
+    bits = bf16.view(torch.int16).to(torch.int32)
+    return torch.where(bits < 0, -(bits & 0x7FFF), bits)
+
+
+def bench_row(T: int, H: int, eps: float, seed: int, repeats: int) -> dict:
     x, z, w, dy = _inputs(T, H, seed)
-    result: dict = {"T": T, "H": H, "eps": eps, "rows": T * H}
-    reference = None
-    for name, fn in comparators.items():
+    rows = T * H
+    result: dict = {"T": T, "H": H, "rows": rows, "eps": eps, "modes": {}}
+    outputs = {}
+    for name, deterministic in MODES:
+        y = torch.empty_like(x)
+        dx, dz = torch.empty_like(x), torch.empty_like(x)
+        dw = torch.empty(D, dtype=torch.bfloat16, device=x.device)
+        ws = cake_rmsnorm_silu_gate_train_backward_workspace(
+            rows, x.device, deterministic=deterministic
+        )
+
+        def fwd(y=y, deterministic=deterministic):
+            return cake_rmsnorm_silu_gate_train_forward(
+                x, z, w, eps, out=y, deterministic=deterministic
+            )
+
+        def bwd(dx=dx, dz=dz, dw=dw, ws=ws, deterministic=deterministic):
+            return cake_rmsnorm_silu_gate_train_backward(
+                dy,
+                x,
+                z,
+                w,
+                eps,
+                grad_x=dx,
+                grad_z=dz,
+                grad_weight=dw,
+                workspace=ws,
+                deterministic=deterministic,
+            )
+
+        def bwd_no_workspace(dx=dx, dz=dz, dw=dw, deterministic=deterministic):
+            return cake_rmsnorm_silu_gate_train_backward(
+                dy,
+                x,
+                z,
+                w,
+                eps,
+                grad_x=dx,
+                grad_z=dz,
+                grad_weight=dw,
+                deterministic=deterministic,
+            )
+
+        def layer(xa, za, wa, deterministic=deterministic):
+            return cake_rmsnorm_silu_gate(xa, za, wa, eps, deterministic=deterministic)
+
         xa, za, wa = (t.detach().requires_grad_(True) for t in (x, z, w))
 
-        def train_fwd():
-            return fn(xa, za, wa)
-
-        def train_fwd_bwd():
-            y = fn(xa, za, wa)
-            return torch.autograd.grad(y, (xa, za, wa), dy)
-
-        def train_ckpt():
-            y = torch.utils.checkpoint.checkpoint(fn, xa, za, wa, use_reentrant=False)
-            return torch.autograd.grad(y, (xa, za, wa), dy)
-
-        # Outputs (and warm-up / compilation) before timing.
-        y = train_fwd()
-        grads = torch.autograd.grad(y, (xa, za, wa), dy)
-        outs = (y.detach(), *grads)
-        if reference is None:
-            reference = outs
-        diff = [
-            float((a.float() - b.float()).abs().max())
-            for a, b in zip(outs, reference, strict=True)
-        ]
-        row: dict = {
-            "max_abs_diff_vs_cake": dict(
-                zip(("y", "dx", "dz", "dw"), diff, strict=True)
+        def step(xa=xa, za=za, wa=wa, layer=layer):
+            yc = torch.utils.checkpoint.checkpoint(
+                layer, xa, za, wa, use_reentrant=False
             )
+            return torch.autograd.grad(yc, (xa, za, wa), dy)
+
+        def fwd_bwd(xa=xa, za=za, wa=wa, layer=layer):
+            return torch.autograd.grad(layer(xa, za, wa), (xa, za, wa), dy)
+
+        # Outputs (and module loading) before timing.
+        fwd()
+        bwd()
+        step()
+        torch.cuda.synchronize()
+        outputs[name] = (y.clone(), dx.clone(), dz.clone(), dw.clone())
+        patterns = set()
+        for _ in range(repeats):
+            bwd()
+            patterns.add(bytes(dw.view(torch.uint8).cpu().numpy()))
+        entry: dict = {
+            "fwd": _stats(fwd),
+            "bwd": _stats(bwd),
+            "ckpt": _stats(step),
+            "saved_bytes": _saved_bytes(layer, x, z, w),
+            "peak_bytes": _peak_bytes(fwd_bwd),
+            "temp_bytes": _peak_bytes(bwd_no_workspace),
+            "workspace_bytes": cake_rmsnorm_silu_gate_train_backward_workspace_bytes(
+                rows, x.device, deterministic=deterministic
+            ),
+            "dw_patterns": len(patterns),
+            "repeats": repeats,
         }
-        if name == "cake":
-            fwd_ms = _time(lambda: cake_rmsnorm_silu_gate_train_forward(x, z, w, eps))
-            bwd_ms = _time(
-                lambda: cake_rmsnorm_silu_gate_train_backward(dy, x, z, w, eps)
-            )
-        else:
-            fwd_ms = _time(train_fwd)
-            bwd_ms = _time(train_fwd_bwd) - fwd_ms
-        row.update(fwd_ms=fwd_ms, bwd_ms=bwd_ms, total_ms=2 * fwd_ms + bwd_ms)
-        train_ckpt()
-        row["ckpt_ms"] = _time(train_ckpt)
-        row["saved_bytes"] = _saved_bytes(fn, x, z, w)
-        torch.cuda.synchronize()
-        torch.cuda.reset_peak_memory_stats()
-        base = torch.cuda.memory_allocated()
-        y = fn(xa, za, wa)
-        grads = torch.autograd.grad(y, (xa, za, wa), dy)
-        torch.cuda.synchronize()
-        row["peak_bytes"] = torch.cuda.max_memory_allocated() - base
-        del y, grads
-        result[name] = row
-    cake = result["cake"]
-    cake["workspace_bytes"] = cake_rmsnorm_silu_gate_train_backward_workspace_bytes(
-        T * H, x.device
+        result["modes"][name] = entry
+        del ws
+        torch.cuda.empty_cache()
+    # The non-deterministic outputs against the deterministic ones.
+    reference, candidate = outputs["deterministic"], outputs["nondeterministic"]
+    result["y_bitwise_equal"] = bool(torch.equal(reference[0], candidate[0]))
+    result["dx_bitwise_equal"] = bool(torch.equal(reference[1], candidate[1]))
+    result["dz_bitwise_equal"] = bool(torch.equal(reference[2], candidate[2]))
+    result["dw_max_ulps_apart"] = int(
+        (_ordered(reference[3]) - _ordered(candidate[3])).abs().max().item()
     )
-    if side_stream:
-        y = torch.empty_like(x)
-        ws = cake_rmsnorm_silu_gate_train_backward_workspace(T * H, x.device)
-        cake["side_stream"] = {
-            "fwd": _beside_resident(
-                lambda: cake_rmsnorm_silu_gate_train_forward(x, z, w, eps, out=y)
-            ),
-            "bwd": _beside_resident(
-                lambda: cake_rmsnorm_silu_gate_train_backward(
-                    dy, x, z, w, eps, workspace=ws
-                )
-            ),
-        }
-    nbytes_fwd = 3 * T * H * D * 2
-    nbytes_bwd = 5 * T * H * D * 2
-    result["cake"]["fwd_gbs"] = nbytes_fwd / result["cake"]["fwd_ms"] / 1e6
-    result["cake"]["bwd_gbs"] = nbytes_bwd / result["cake"]["bwd_ms"] / 1e6
+    # deterministic GPU time over non-deterministic GPU time
+    for stage in STAGES:
+        result[f"{stage}_speedup"] = (
+            result["modes"]["deterministic"][stage]["ms"]
+            / result["modes"]["nondeterministic"][stage]["ms"]
+        )
     return result
 
 
-def _format(result: dict, names) -> list[str]:
+def _format(result: dict) -> list[str]:
+    head = f"T={result['T']:>6} H={result['H']:>3}"
     lines = []
-    cake = result["cake"]["total_ms"]
-    for name in names:
-        row = result[name]
-        lines.append(
-            f"T={result['T']:>6} H={result['H']:>3} {name:>13}: fwd {row['fwd_ms'] * 1e3:9.1f} us  "
-            f"bwd {row['bwd_ms'] * 1e3:9.1f} us  2fwd+bwd {row['total_ms'] * 1e3:9.1f} us  "
-            f"ckpt {row['ckpt_ms'] * 1e3:9.1f} us  x{row['total_ms'] / cake:5.2f} of cake  "
-            f"saved {row['saved_bytes'] / 2**20:8.1f} MiB  peak {row['peak_bytes'] / 2**20:8.1f} MiB"
-        )
-        if "workspace_bytes" in row:
-            lines[-1] += f"  workspace {row['workspace_bytes'] / 2**10:8.1f} KiB"
-        for stage, side in row.get("side_stream", {}).items():
-            lines.append(
-                f"T={result['T']:>6} H={result['H']:>3} {name:>13}: {stage} beside a resident kernel "
-                f"{side['busy_ms'] * 1e3:9.1f} us vs {side['alone_ms'] * 1e3:9.1f} us alone (x{side['ratio']:5.3f})"
+    for stage in STAGES:
+        cells = []
+        for name, _ in MODES:
+            s = result["modes"][name][stage]
+            cells.append(
+                f"{name} {s['ms'] * 1e3:9.1f} us "
+                f"[{s['min_ms'] * 1e3:8.1f}, {s['max_ms'] * 1e3:8.1f}] cv {s['cv'] * 100:4.1f}%"
             )
+        lines.append(
+            f"{head} {stage:4s} | "
+            + " | ".join(cells)
+            + f" | speedup x{result[f'{stage}_speedup']:5.2f}"
+        )
+    for name, _ in MODES:
+        m = result["modes"][name]
+        lines.append(
+            f"{head} mem  | {name:16s} saved {m['saved_bytes'] / 2**20:8.1f} MiB  "
+            f"peak {m['peak_bytes'] / 2**20:8.1f} MiB  temp {m['temp_bytes'] / 2**10:9.1f} KiB  "
+            f"workspace {m['workspace_bytes'] / 2**10:9.1f} KiB  "
+            f"dw patterns {m['dw_patterns']}/{m['repeats']}"
+        )
+    lines.append(
+        f"{head} out  | y/dx/dz bitwise equal: {result['y_bitwise_equal']}/"
+        f"{result['dx_bitwise_equal']}/{result['dz_bitwise_equal']}  "
+        f"dw at most {result['dw_max_ulps_apart']} BF16 ulp apart"
+    )
     return lines
 
 
 def main(argv: Optional[list[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[1])
-    parser.add_argument(
-        "--tokens",
-        type=int,
-        nargs="+",
-        default=[30193, 32737, 32388, 1024, 8192, 65536],
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
+    parser.add_argument("--tokens", type=int, nargs="+", default=list(TOKENS))
     parser.add_argument("--heads", type=int, nargs="+", default=[48])
     parser.add_argument("--eps", type=float, default=1e-6)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
-        "--only", nargs="*", default=None, help="comparators to run (cake always runs)"
-    )
-    parser.add_argument(
-        "--side-stream",
-        action="store_true",
-        help="also time the Cake kernels beside a resident kernel",
+        "--repeats",
+        type=int,
+        default=20,
+        help="backward calls per mode whose dw bit patterns are counted",
     )
     parser.add_argument("--json", default=None)
     args = parser.parse_args(argv)
-    comparators = _comparators(args.eps)
-    if args.only:
-        comparators = {
-            k: v for k, v in comparators.items() if k == "cake" or k in args.only
-        }
-    device = torch.cuda.get_device_properties(0)
+    device = torch.device("cuda", torch.cuda.current_device())
+    if not is_cake_rmsnorm_silu_gate_train_supported(device, deterministic=False):
+        raise SystemExit(
+            "cake_rmsnorm_silu_gate_train(deterministic=False) has no exported route on this device"
+        )
+    torch.use_deterministic_algorithms(False)
+    props = torch.cuda.get_device_properties(device)
     print(
-        f"# {device.name}, sm_{device.major}{device.minor}, CUDA {torch.version.cuda}, torch {torch.__version__}"
+        f"# {props.name}, sm_{props.major}{props.minor}, {props.multi_processor_count} SMs, "
+        f"CUDA {torch.version.cuda}, torch {torch.__version__}"
     )
     results = []
     for H in args.heads:
         for T in args.tokens:
-            result = bench_row(T, H, args.eps, comparators, args.seed, args.side_stream)
+            result = bench_row(T, H, args.eps, args.seed, args.repeats)
             results.append(result)
-            for line in _format(result, comparators):
+            for line in _format(result):
                 print(line, flush=True)
     if args.json:
         with open(args.json, "w") as fh:
             json.dump(
                 {
-                    "device": device.name,
+                    "device": props.name,
+                    "capability": [props.major, props.minor],
+                    "sm_count": props.multi_processor_count,
                     "cuda": torch.version.cuda,
                     "torch": torch.__version__,
                     "rows": results,

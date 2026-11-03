@@ -13,7 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-The bytes of a KCP saved set (``cake_kda_train.cake_kcp.KcpSaved``) that its forward writes, for bitwise compares of
+The bytes of a KCP saved set (``cake_kda_det_train_kcp.cake_kcp.SavedDetKcp``) that its forward writes, for bitwise compares of
 two saved sets.  ``S_in``, ``c1_recv`` and ``M_seg`` are written whole.  The carry plane (``P > 1``) is a fresh
 uninitialized tensor of ``n_frag (P - 1)`` slots (``+ max(n_in, n_out)`` extra slots under the fused walks) of ``H``
 [128, 128] tiles each, and the forward's carry merges write only

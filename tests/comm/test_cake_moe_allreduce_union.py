@@ -57,9 +57,17 @@ def test_every_route_names_a_kernel_of_its_world_size_and_dtype() -> None:
         for name in names:
             kernel = union.KERNELS[name]
             assert kernel.dtype == dtype and kernel.world_size == world_size
-            # One 7168-wide token is covered by 896 threads: four 224-thread
-            # CTAs in a cluster, or one 896-thread CTA.
-            assert kernel.block * kernel.cluster == 896 and kernel.cluster in {1, 4}
+            # One 7168-wide token is covered by 896 threads: four CTAs of 224
+            # work threads in a cluster, or one 896-thread CTA.  A kernel with
+            # role threads (a fence warp beside the work warps) adds them to
+            # its block; the launcher holds the rest of the block to the token.
+            work = kernel.block - kernel.role_threads
+            assert work * kernel.cluster == 896
+            assert (kernel.cluster, kernel.block, kernel.role_threads) in {
+                (4, 224, 0),
+                (4, 256, 32),
+                (1, 896, 0),
+            }
         used |= set(names)
         assert route.persistent_ctas_per_sm >= 1
         if route.cooperative:
@@ -185,7 +193,8 @@ def test_exported_architectures_are_sm100_and_sm103() -> None:
         # token count per class outside its rules, and the reviewed token counts
         # of the S7 exact-shape decisions (kept rows at their specialization,
         # dropped rows at their class program).
-        ("sm_100a", 2, "bfloat16", False, 1, 8, "lat_t1"),
+        ("sm_100a", 2, "bfloat16", False, 1, 8, "lat_t1f"),
+        ("sm_100a", 2, "bfloat16", False, 2, 8, "lat_t1"),
         ("sm_100a", 2, "bfloat16", False, 32, 8, "lat_t1"),
         ("sm_100a", 2, "bfloat16", False, 96, 16, "lat_b4"),
         ("sm_100a", 2, "bfloat16", False, 192, 8, "lat_late_b5"),
@@ -210,7 +219,8 @@ def test_exported_architectures_are_sm100_and_sm103() -> None:
         ("sm_100a", 2, "float16", True, 512, 8, "wide_mlp"),
         ("sm_100a", 2, "float16", True, 1536, 16, "lat_late_b5"),
         ("sm_100a", 2, "float16", True, 2048, 16, "lat_late_b5"),
-        ("sm_100a", 4, "bfloat16", False, 1, 8, "lat_t1"),
+        ("sm_100a", 4, "bfloat16", False, 1, 8, "lat_t1f"),
+        ("sm_100a", 4, "bfloat16", False, 2, 8, "lat_t1"),
         ("sm_100a", 4, "bfloat16", False, 32, 8, "lat_t1"),
         ("sm_100a", 4, "bfloat16", False, 96, 16, "two_shot_b4"),
         ("sm_100a", 4, "bfloat16", False, 128, 16, "two_shot_b4"),
@@ -238,7 +248,8 @@ def test_exported_architectures_are_sm100_and_sm103() -> None:
         ("sm_100a", 4, "float16", True, 512, 8, "wide_mlp"),
         ("sm_100a", 4, "float16", True, 1536, 16, "two_shot_b5"),
         ("sm_100a", 4, "float16", True, 2048, 16, "two_shot_b5"),
-        ("sm_100a", 8, "bfloat16", False, 1, 8, "lat_t1"),
+        ("sm_100a", 8, "bfloat16", False, 1, 8, "lat_t1f"),
+        ("sm_100a", 8, "bfloat16", False, 2, 8, "lat_t1"),
         ("sm_100a", 8, "bfloat16", False, 32, 8, "lat_t1"),
         ("sm_100a", 8, "bfloat16", False, 96, 16, "two_shot_il_b4"),
         ("sm_100a", 8, "bfloat16", False, 128, 16, "two_shot_il_b4"),
@@ -265,7 +276,8 @@ def test_exported_architectures_are_sm100_and_sm103() -> None:
         ("sm_100a", 8, "float16", True, 512, 8, "generic"),
         ("sm_100a", 8, "float16", True, 1536, 16, "two_shot_b5"),
         ("sm_100a", 8, "float16", True, 2048, 16, "two_shot_b5"),
-        ("sm_103a", 2, "bfloat16", False, 1, 8, "lat_t1"),
+        ("sm_103a", 2, "bfloat16", False, 1, 8, "lat_t1f"),
+        ("sm_103a", 2, "bfloat16", False, 2, 8, "lat_t1"),
         ("sm_103a", 2, "bfloat16", False, 32, 8, "lat_t1"),
         ("sm_103a", 2, "bfloat16", False, 96, 16, "lat_b4"),
         ("sm_103a", 2, "bfloat16", False, 192, 8, "lat_late_b5"),
@@ -291,7 +303,8 @@ def test_exported_architectures_are_sm100_and_sm103() -> None:
         ("sm_103a", 2, "float16", True, 512, 8, "generic"),
         ("sm_103a", 2, "float16", True, 1536, 16, "lat_late_b5"),
         ("sm_103a", 2, "float16", True, 2048, 16, "lat_late_b5"),
-        ("sm_103a", 4, "bfloat16", False, 1, 8, "lat_t1"),
+        ("sm_103a", 4, "bfloat16", False, 1, 8, "lat_t1f"),
+        ("sm_103a", 4, "bfloat16", False, 2, 8, "lat_t1"),
         ("sm_103a", 4, "bfloat16", False, 32, 8, "lat_t1"),
         ("sm_103a", 4, "bfloat16", False, 96, 16, "two_shot_b4"),
         ("sm_103a", 4, "bfloat16", False, 192, 8, "two_shot_b4"),
@@ -319,7 +332,8 @@ def test_exported_architectures_are_sm100_and_sm103() -> None:
         ("sm_103a", 4, "float16", True, 512, 8, "wide_mlp"),
         ("sm_103a", 4, "float16", True, 1536, 16, "two_shot_b5"),
         ("sm_103a", 4, "float16", True, 2048, 16, "two_shot_b5"),
-        ("sm_103a", 8, "bfloat16", False, 1, 8, "lat_t1"),
+        ("sm_103a", 8, "bfloat16", False, 1, 8, "lat_t1f"),
+        ("sm_103a", 8, "bfloat16", False, 2, 8, "lat_t1"),
         ("sm_103a", 8, "bfloat16", False, 32, 8, "lat_t1"),
         ("sm_103a", 8, "bfloat16", False, 96, 16, "two_shot_il_b4"),
         ("sm_103a", 8, "bfloat16", False, 128, 16, "two_shot_il_b4"),
@@ -458,6 +472,8 @@ def test_compile_flags_bind_the_launcher_to_one_kernel_per_architecture() -> Non
         assert f"-DCAKE_UNION_WORLD_SIZE={kernel.world_size}" in defines
         assert f"-DCAKE_UNION_BLOCK={kernel.block}" in defines
         assert f"-DCAKE_UNION_CLUSTER={kernel.cluster}" in defines
+        role = f"-DCAKE_UNION_ROLE_THREADS={kernel.role_threads}"
+        assert (role in defines) == bool(kernel.role_threads)
         ctype = "__half" if kernel.dtype == "float16" else "__nv_bfloat16"
         assert f"-DCAKE_UNION_DTYPE={ctype}" in defines
     name = next(iter(union.KERNELS))

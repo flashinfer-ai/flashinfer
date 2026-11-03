@@ -262,6 +262,85 @@ def test_alphamoe_fused_router_routed_512_band_edges(num_tokens, top_k, block_m)
 
 
 @requires_router_gpu
+@pytest.mark.parametrize("top_k,block_m", [(10, 8), (10, 16), (16, 8), (16, 16)])
+@pytest.mark.parametrize("num_tokens", [64, 100, 200, 256])
+def test_alphamoe_fused_router_routed_512_top_k_10_vs_16(num_tokens, top_k, block_m):
+    # From 33 to 256 tokens, routed 512-expert calls up to top_k 10 and above it
+    # take different entries.
+    torch.manual_seed(29011 + num_tokens * 17 + top_k + block_m)
+    logits = torch.randn(num_tokens, 512, device="cuda", dtype=torch.float32)
+    plan = alphamoe_fused_router(logits, top_k=top_k, block_m=block_m)
+    _assert_plan(logits, plan, top_k=top_k, block_m=block_m, has_shared_expert=False)
+
+
+@requires_router_gpu
+@pytest.mark.parametrize("block_m", [8, 16])
+@pytest.mark.parametrize("num_tokens", [2999, 3000, 12000, 32768])
+def test_alphamoe_fused_router_routed_512_large_top_k_16(num_tokens, block_m):
+    # Large-grid routed 512-expert calls at top_k 16 with block_m 8 and 16, on both
+    # sides of 3000 tokens and at the batched-rebase sizes.
+    torch.manual_seed(29012 + num_tokens + block_m)
+    logits = torch.randn(num_tokens, 512, device="cuda", dtype=torch.float32)
+    plan = alphamoe_fused_router(logits, top_k=16, block_m=block_m)
+    _assert_plan(logits, plan, top_k=16, block_m=block_m, has_shared_expert=False)
+
+
+@requires_router_gpu
+@pytest.mark.parametrize("top_k,block_m", [(8, 16), (10, 8)])
+@pytest.mark.parametrize("num_tokens", [11999, 12000, 16383, 16384, 32767, 32768])
+def test_alphamoe_fused_router_routed_512_large_grid_sizes(num_tokens, top_k, block_m):
+    # The large routed 512-expert grid changes its build at 12000, 16384 and 32768
+    # tokens, depending on the architecture. Each pair of cases sits on both sides
+    # of one size.
+    torch.manual_seed(29013 + num_tokens + top_k)
+    logits = torch.randn(num_tokens, 512, device="cuda", dtype=torch.float32)
+    plan = alphamoe_fused_router(logits, top_k=top_k, block_m=block_m)
+    _assert_plan(logits, plan, top_k=top_k, block_m=block_m, has_shared_expert=False)
+
+
+@requires_router_gpu
+@pytest.mark.parametrize("top_k,block_m", [(8, 16), (10, 8)])
+@pytest.mark.parametrize("num_tokens", [32, 100, 200, 400, 4096, 16384])
+def test_alphamoe_fused_router_routed_512_nan_and_neg_inf_logits(
+    num_tokens, top_k, block_m
+):
+    # Routed 512-expert calls at top_k 8 to 10 rank a NaN logit as +inf, the lower
+    # expert ID first among equal ones, and a row with a selected NaN gets NaN
+    # weights. A -inf logit ranks below every finite one. Each row keeps at least
+    # top_k finite logits, so no -inf logit is selected.
+    torch.manual_seed(29014 + num_tokens + top_k)
+    logits = torch.randn(num_tokens, 512, device="cuda", dtype=torch.float32)
+    # Row 1: three NaN logits.
+    logits[1, [300, 37, 5]] = float("nan")
+    # Row 2: -inf in the first half of the experts and a NaN in the last one.
+    logits[2, :256] = float("-inf")
+    logits[2, 511] = float("nan")
+    # Row 3: -inf everywhere except 2 * top_k experts spread over the row.
+    finite = torch.arange(2 * top_k, device="cuda") * 25 + 3
+    row = torch.full((512,), float("-inf"), device="cuda", dtype=torch.float32)
+    row[finite] = logits[3, finite]
+    logits[3] = row
+    # Row 4: -inf at the top_k largest logits.
+    logits[4, torch.topk(logits[4], top_k).indices] = float("-inf")
+    plan = alphamoe_fused_router(logits, top_k=top_k, block_m=block_m)
+
+    rank_key = torch.where(
+        torch.isnan(logits), torch.full_like(logits, float("inf")), logits
+    )
+    ref_ids = torch.argsort(rank_key, dim=-1, descending=True, stable=True)[:, :top_k]
+    ref_weights = torch.softmax(torch.gather(logits, 1, ref_ids), dim=-1)
+    ref_ids = ref_ids.to(torch.int32)
+    has_nan = torch.isnan(logits).any(dim=-1)
+    assert has_nan.tolist()[:5] == [False, True, True, False, False]
+    torch.testing.assert_close(plan.topk_ids, ref_ids, rtol=0, atol=0)
+    assert torch.all(torch.isnan(plan.topk_weights[has_nan]))
+    torch.testing.assert_close(
+        plan.topk_weights[~has_nan], ref_weights[~has_nan], rtol=3e-4, atol=3e-4
+    )
+    _assert_aligned_plan(plan, ref_ids, num_experts=512, block_m=block_m)
+
+
+@requires_router_gpu
 @pytest.mark.parametrize("num_tokens", [8, 32, 128, 512, 1024])
 def test_alphamoe_fused_router_routed_512_cuda_graph_replay(num_tokens):
     # One case per routed 512-expert entry at top_k 8: one CTA, the 4- and

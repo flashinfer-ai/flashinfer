@@ -698,6 +698,9 @@ def gen_all_modules(
     has_cake_megamoe_topk_reduce_sm103a = sm_capabilities.get(
         "cake_megamoe_topk_reduce_sm103a", False
     )
+    has_cake_megamoe_topk_reduce_sm107a = sm_capabilities.get(
+        "cake_megamoe_topk_reduce_sm107a", False
+    )
     has_cake_selective_state_update_sm100a = sm_capabilities.get(
         "cake_selective_state_update_sm100a", False
     )
@@ -946,6 +949,8 @@ def gen_all_modules(
             jit_specs.append(gen_cake_megamoe_topk_reduce_module("sm_100a"))
         if has_cake_megamoe_topk_reduce_sm103a:
             jit_specs.append(gen_cake_megamoe_topk_reduce_module("sm_103a"))
+        if has_cake_megamoe_topk_reduce_sm107a:
+            jit_specs.append(gen_cake_megamoe_topk_reduce_module("sm_107a"))
         # Cake selective state update: every program instantiation a route of the architecture selects
         # (the four-CTA residency schedule of the paired row-major program has an sm_100a band only).
         if has_cake_selective_state_update_sm100a:
@@ -1154,7 +1159,7 @@ def gen_all_modules(
             gen_sampling_module(),
             gen_topk_module(),
         ]
-        if has_sm100 or has_sm103:
+        if has_sm100 or has_sm103 or has_sm107:
             jit_specs.append(gen_blackwell_softmax_module())
         # Cake radix sampling: one fatbin over every 9.x-12.x target (clusters + DSM only).
         if any(
@@ -1582,6 +1587,10 @@ def detect_sm_capabilities():
         "cake_megamoe_topk_reduce_sm103a": (
             (10, "3a") in compilation_context.TARGET_CUDA_ARCHS
             and cuda_version >= Version("12.9")
+        ),
+        "cake_megamoe_topk_reduce_sm107a": (
+            (10, "7a") in compilation_context.TARGET_CUDA_ARCHS
+            and cuda_version >= Version("13.0")
         ),
         "cake_selective_state_update_sm100a": (
             (10, "0a") in compilation_context.TARGET_CUDA_ARCHS

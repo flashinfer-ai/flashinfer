@@ -73,23 +73,27 @@ configurations raise during preparation instead of falling back.
 Fused FP8 Row-wise GEMM + All-Reduce
 ------------------------------------
 
-``fp8_rowwise_gemm_allreduce`` computes, for a four-rank NCCL process group on
-one SM100 node, ``Y = sum_r (A_r @ W_r.T) * (a_scale_r[:, None] * w_scale_r[None, :])``
-with the per-rank FP8 (e4m3) operands ``A_r`` of shape ``[M, K_l]`` and ``W_r``
-of shape ``[N, K_l]``, fp32 row and column scales applied before the cross-rank
-sum, and a bfloat16 result ``[M, N]`` on every rank. ``backend="cake"`` (the
-only backend; ``"auto"`` selects it) runs one fused kernel per call: the GEMM
-epilogue stores each owned tile's bf16 partial into this rank's output and
-publishes every other tile's partial into the chunk owner's symmetric receive
-slot, the owner sums the four partials in fixed rank order and broadcasts the
-result, so no separate all-reduce kernel or collective runs.
-Operands are contiguous CUDA tensors with ``N`` a positive multiple of 256,
-``K_l`` a positive multiple of 128, any positive ``M`` with ``M * N <= 2**30``,
-and the process's torch symmetric-memory backend being the default ``CUDA``
-backend or ``NVSHMEM`` (the Cake backend never selects one itself). The
-symmetric workspace of a group grows to the largest ``M`` seen; that growth is
-the only collective after the first call. Unsupported requests raise instead
-of silently falling back.
+``fp8_rowwise_gemm_allreduce`` computes, for an NCCL process group of two,
+four or eight ranks on one node, ``Y = sum_r (A_r @ W_r.T) * (a_scale_r[:, None]
+* w_scale_r[None, :])`` with the per-rank FP8 (e4m3) operands ``A_r`` of shape
+``[M, K_l]`` and ``W_r`` of shape ``[N, K_l]``, fp32 row and column scales
+applied before the cross-rank sum, and a bfloat16 result ``[M, N]`` on every
+rank. ``backend="cake"`` (the only backend; ``"auto"`` selects it) runs one
+fused kernel per call: the GEMM epilogue stores each owned tile's bf16 partial
+into this rank's output and publishes every other tile's partial into the
+chunk owner's symmetric receive slot, the owner sums the partials in fixed
+rank order and broadcasts the result (through the NVLink multicast address on
+the eight-rank Blackwell carrier), so no separate all-reduce kernel or
+collective runs. The delivered architectures and world sizes are recorded in
+the loader's route tables (``flashinfer.jit.cake_fp8_rowwise_gemm_allreduce``);
+a device or group outside them raises instead of falling back.
+Operands are contiguous CUDA tensors with ``N`` a positive multiple of the
+delivered route's column tile (256 on SM100), ``K_l`` a
+positive multiple of 128, any positive ``M`` with ``M * N <= 2**30``, and the
+process's torch symmetric-memory backend being the default ``CUDA`` backend or
+``NVSHMEM`` (the Cake backend never selects one itself). The symmetric
+workspace of a group grows to the largest ``M`` seen; that growth is the only
+collective after the first call.
 
 ``prepare_fp8_rowwise_gemm_allreduce`` binds the process group, ``N``, ``K_l``
 and a row capacity ``max_rows`` (default: the rows of the sample input) once,
@@ -789,10 +793,11 @@ once per destination run of its tile table (the first launch carrying the
 folded rendezvous); on SM90 a call with at most 4096 rows per rank publishes one
 readiness word per destination, a call with at least 16384 rows per rank runs the
 persistent producer grid over every SM (no reserved SMs), and the per-destination
-launch gate is off; on SM107 every gate is off.  One cell differs from these
+launch gate is off; SM107 has no per-architecture gate.  Three cells differ from these
 per-architecture tables (``cake_qkv_exchange_plan.SHAPE_GATE_DEFAULT_BY_ARCH_WORLD``):
-a group of 8 ranks on SM90 publishes one readiness word per destination for
-every row count (``words_capacity_small_m = all``).  A fourth gate,
+a group of 8 ranks on SM90 and groups of 2 and 4 ranks on SM107 publish one
+readiness word per destination for every row count
+(``words_capacity_small_m = all``).  A fourth gate,
 ``pair_off_large_m``, is off on every architecture: switched on
 (``pair_off_large_m=N``) it runs a 256-column call with at least ``N`` rows per
 rank on the single-CTA producer instead of the 2-CTA pair tile (the tile order
@@ -803,7 +808,8 @@ naming the gate -- and is refused on SM90, which builds no pair tile.  The
 environment variable ``FLASHINFER_QKV_EXCHANGE_SHAPE_GATES`` (``auto`` / ``off`` /
 ``words_capacity_small_m=N|all,reserved_sms_large_m=N,per_dest_large_m=N,pair_off_large_m=N``)
 overrides them per session, rank-uniformly (``words_capacity_small_m=4096`` on
-SM90 with 8 ranks restores the previous plan); ``describe()`` reports the resolved
+SM90 with 8 ranks and ``words_capacity_small_m=0`` on SM107 restore the previous
+plans); ``describe()`` reports the resolved
 build (``producer_variant``), scale (``group_m_scale``) and gates
 (``shape_gates``) with their sources, and every prepared row's verdict
 (``prepared_row_plans``, including its ``reserved_sms``).  The first three gates

@@ -479,9 +479,8 @@ kernel_cake_kda_prefill_1e06c9977a863d78a20d(float* __restrict__ split_state, __
                 }
                 if (warp == 0) {
                     if (elect_sync()) {
-                        unsigned int fill_slot = ((map_slot + 1 < 2) ? map_slot + 1 : (unsigned int)0);
-                        mbarrier_arrive_expect_tx(map_full_addr + (fill_slot) * 8, 32768);
-                        cp_async_bulk_gmem2smem(smem_m_addr + fill_slot * 32768, reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(map_state_bf16) + ((unsigned long long)((part * num_heads + task) * 16384) * (unsigned long long)2)), 32768, map_full_addr + (fill_slot) * 8);
+                        mbarrier_arrive_expect_tx(map_full_addr + (((map_slot + 1 < 2) ? map_slot + 1 : (unsigned int)0)) * 8, 32768);
+                        cp_async_bulk_gmem2smem(smem_m_addr + ((map_slot + 1 < 2) ? map_slot + 1 : (unsigned int)0) * 32768, reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(map_state_bf16) + ((unsigned long long)((part * num_heads + task) * 16384) * (unsigned long long)2)), 32768, map_full_addr + (((map_slot + 1 < 2) ? map_slot + 1 : (unsigned int)0)) * 8);
                     }
                 }
             }

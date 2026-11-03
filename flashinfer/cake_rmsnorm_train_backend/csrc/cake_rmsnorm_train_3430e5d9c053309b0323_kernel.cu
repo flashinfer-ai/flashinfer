@@ -48,7 +48,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 }
 
 #define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
 #define THREADS 64
 #define ROWS_PER_CTA 2
 #define GROUP_THREADS 32

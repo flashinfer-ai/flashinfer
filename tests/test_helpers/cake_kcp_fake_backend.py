@@ -47,7 +47,7 @@ from tests.test_helpers import cake_kda_kcp_reference as rk
 from tests.test_helpers import cake_kda_kcp_shapes as kcp_shapes
 from tests.test_helpers.cake_package import cake_package
 
-kp = cake_package("cake_kda_train", "cake_kcp_plan")
+kp = cake_package("cake_kda_det_train_kcp", "cake_kcp_plan")
 
 F64 = torch.float64
 D = kp.HEAD_DIM
@@ -172,7 +172,7 @@ def build_ranks(
                 ]
                 for r in range(W)
             ]
-        part = kp.kcp_partition(
+        part = kp.partition_det_kcp(
             torch.tensor(cu, dtype=torch.int64), W, fragments=fragments
         )
     else:
@@ -189,11 +189,13 @@ def build_ranks(
                 cuts = [kcp_shapes.doc_cuts_D(sub, W, i) for i in range(len(docs))]
             else:
                 cuts = cut_points
-        part = kp.kcp_partition(
+        part = kp.partition_det_kcp(
             torch.tensor(cu, dtype=torch.int64), W, layout=name, cut_points=cuts
         )
     ctxs = [
-        kp.build_kcp_context(part, None, r, "cpu", conv_kernel_size, sm_count=sm_count)
+        kp.build_context_det_kcp(
+            part, None, r, "cpu", conv_kernel_size, sm_count=sm_count
+        )
         for r in range(W)
     ]
     params = kcp_inputs.head_params(row, H)

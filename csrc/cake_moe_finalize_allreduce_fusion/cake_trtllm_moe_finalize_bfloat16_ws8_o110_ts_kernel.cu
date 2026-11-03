@@ -41,7 +41,6 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #include <cuda_fp8.h>
 
 #define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
 #define SMEM_REDUCE_SMEM_OFF 0
 #define SMEM_REDUCE_SMEM_STAGE_BYTES 132
 #define SMEM_REDUCE_SMEM_STRIDE 132
@@ -764,8 +763,8 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_ts(__nv_bfloat16* __restrict__
                         : "r"(_sysv_poll_group_0[8 + _pair]));
                 }
                 #pragma unroll
-                for (int j_14 = 0; j_14 < 8; j_14++) {
-                    sum_value[j_14] = sum_value[j_14] + unpack_bf16_5[j_14];
+                for (int j_0 = 0; j_0 < 8; j_0++) {
+                    sum_value[j_0] = sum_value[j_0] + unpack_bf16_5[j_0];
                 }
                 unsigned int scaled_f16_4_1[4];
                 #pragma unroll
@@ -795,8 +794,8 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_ts(__nv_bfloat16* __restrict__
                         : "r"(_sysv_poll_group_0[12 + _pair]));
                 }
                 #pragma unroll
-                for (int j_15 = 0; j_15 < 8; j_15++) {
-                    sum_value[j_15] = sum_value[j_15] + unpack_bf16_6[j_15];
+                for (int j_1_1 = 0; j_1_1 < 8; j_1_1++) {
+                    sum_value[j_1_1] = sum_value[j_1_1] + unpack_bf16_6[j_1_1];
                 }
                 unsigned int scaled_f16_5_1[4];
                 #pragma unroll
@@ -842,8 +841,8 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_ts(__nv_bfloat16* __restrict__
                         : "r"(_sysv_poll_group_1[_pair]));
                 }
                 #pragma unroll
-                for (int j_16 = 0; j_16 < 8; j_16++) {
-                    sum_value[j_16] = sum_value[j_16] + unpack_bf16_7[j_16];
+                for (int j_14 = 0; j_14 < 8; j_14++) {
+                    sum_value[j_14] = sum_value[j_14] + unpack_bf16_7[j_14];
                 }
                 unsigned int scaled_f16_6_1[4];
                 #pragma unroll
@@ -873,8 +872,8 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_ts(__nv_bfloat16* __restrict__
                         : "r"(_sysv_poll_group_1[4 + _pair]));
                 }
                 #pragma unroll
-                for (int j_17 = 0; j_17 < 8; j_17++) {
-                    sum_value[j_17] = sum_value[j_17] + unpack_bf16_8[j_17];
+                for (int j_2_1 = 0; j_2_1 < 8; j_2_1++) {
+                    sum_value[j_2_1] = sum_value[j_2_1] + unpack_bf16_8[j_2_1];
                 }
                 unsigned int scaled_f16_7_1[4];
                 #pragma unroll
@@ -904,8 +903,8 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_ts(__nv_bfloat16* __restrict__
                         : "r"(_sysv_poll_group_1[8 + _pair]));
                 }
                 #pragma unroll
-                for (int j_18 = 0; j_18 < 8; j_18++) {
-                    sum_value[j_18] = sum_value[j_18] + unpack_bf16_9[j_18];
+                for (int j_3_1 = 0; j_3_1 < 8; j_3_1++) {
+                    sum_value[j_3_1] = sum_value[j_3_1] + unpack_bf16_9[j_3_1];
                 }
                 unsigned int scaled_f16_8[4];
                 #pragma unroll
@@ -935,8 +934,8 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_ts(__nv_bfloat16* __restrict__
                         : "r"(_sysv_poll_group_1[12 + _pair]));
                 }
                 #pragma unroll
-                for (int j_19 = 0; j_19 < 8; j_19++) {
-                    sum_value[j_19] = sum_value[j_19] + unpack_bf16_10[j_19];
+                for (int j_4_1 = 0; j_4_1 < 8; j_4_1++) {
+                    sum_value[j_4_1] = sum_value[j_4_1] + unpack_bf16_10[j_4_1];
                 }
                 unsigned int scaled_f16_9[4];
                 #pragma unroll
@@ -1106,8 +1105,8 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_ts(__nv_bfloat16* __restrict__
                 }
             }
             #pragma unroll
-            for (int j_20 = 0; j_20 < 8; j_20++) {
-                _vec_load_17[j_20] = _vec_load_17[j_20] + sum_value_1[j_20];
+            for (int j_15 = 0; j_15 < 8; j_15++) {
+                _vec_load_17[j_15] = _vec_load_17[j_15] + sum_value_1[j_15];
             }
             unsigned int scaled_f16_10[4];
             #pragma unroll
@@ -1149,8 +1148,8 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_ts(__nv_bfloat16* __restrict__
             reinterpret_cast<int4*>(residual_out + elem)[0] = reinterpret_cast<int4*>(_packed_0)[0];
             float square_sum = 0.0f;
             #pragma unroll
-            for (int j_21 = 0; j_21 < 8; j_21++) {
-                square_sum = __fmaf_rn(_vec_load_17[j_21], _vec_load_17[j_21], square_sum);
+            for (int j_16 = 0; j_16 < 8; j_16++) {
+                square_sum = __fmaf_rn(_vec_load_17[j_16], _vec_load_17[j_16], square_sum);
             }
             float _warp_reduce_20 = square_sum;
             #pragma unroll
@@ -1241,8 +1240,8 @@ kernel_cake_trtllm_moe_finalize_bfloat16_ws8_o110_ts(__nv_bfloat16* __restrict__
             float rstd = rsqrtf(cluster_sum / 7168.0f + epsilon);
             float norm_value[8];
             #pragma unroll
-            for (int j_22 = 0; j_22 < 8; j_22++) {
-                norm_value[j_22] = _vec_load_17[j_22] * rstd * (_vec_load_18[j_22] + weight_bias);
+            for (int j_17 = 0; j_17 < 8; j_17++) {
+                norm_value[j_17] = _vec_load_17[j_17] * rstd * (_vec_load_18[j_17] + weight_bias);
             }
             unsigned int scaled_f16_10_1[4];
             #pragma unroll

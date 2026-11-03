@@ -92,6 +92,10 @@ TVM_FFI_EMBED_CUBIN_FROM_BYTES(alphamoe_cake_large_routed_e512_rb_cps_sm_100a,
                                alphamoe_cake_large_routed_e512_rb_cps_sm_100a_image);
 TVM_FFI_EMBED_CUBIN_FROM_BYTES(alphamoe_cake_large_tail_e512_sm_100a,
                                alphamoe_cake_large_tail_e512_sm_100a_image);
+TVM_FFI_EMBED_CUBIN_FROM_BYTES(alphamoe_cake_small_routed_e512_c16_hr_sm_100a,
+                               alphamoe_cake_small_routed_e512_c16_hr_sm_100a_image);
+TVM_FFI_EMBED_CUBIN_FROM_BYTES(alphamoe_cake_large_routed_e512_rb_os_cps_pf_sm_100a,
+                               alphamoe_cake_large_routed_e512_rb_os_cps_pf_sm_100a_image);
 #endif
 #if defined(FLASHINFER_ALPHAMOE_SM_103A)
 TVM_FFI_EMBED_CUBIN_FROM_BYTES(alphamoe_cake_small_routed_e512_c4_sm_103a,
@@ -124,6 +128,10 @@ TVM_FFI_EMBED_CUBIN_FROM_BYTES(alphamoe_cake_large_routed_e512_rb_cps_sm_103a,
                                alphamoe_cake_large_routed_e512_rb_cps_sm_103a_image);
 TVM_FFI_EMBED_CUBIN_FROM_BYTES(alphamoe_cake_large_tail_e512_sm_103a,
                                alphamoe_cake_large_tail_e512_sm_103a_image);
+TVM_FFI_EMBED_CUBIN_FROM_BYTES(alphamoe_cake_small_routed_e512_c16_hr_sm_103a,
+                               alphamoe_cake_small_routed_e512_c16_hr_sm_103a_image);
+TVM_FFI_EMBED_CUBIN_FROM_BYTES(alphamoe_cake_large_routed_e512_rb_os_cps_pf_sm_103a,
+                               alphamoe_cake_large_routed_e512_rb_os_cps_pf_sm_103a_image);
 #endif
 namespace alphamoe_router_large_generated {
 constexpr int kThreads = 256;
@@ -224,6 +232,15 @@ namespace alphamoe_router_cake_large_tail_e512_generated {
 constexpr int kThreads = 256;
 constexpr int kSmemTotal = 4224;
 }  // namespace alphamoe_router_cake_large_tail_e512_generated
+namespace alphamoe_router_cake_small_routed_e512_c16_hr_generated {
+constexpr int kThreads = 256;
+constexpr int kSmemTotal = 22912;
+constexpr unsigned int kCluster = 16;
+}  // namespace alphamoe_router_cake_small_routed_e512_c16_hr_generated
+namespace alphamoe_router_cake_large_routed_e512_rb_os_cps_pf_generated {
+constexpr int kThreads = 1024;
+constexpr int kSmemTotal = 20608;
+}  // namespace alphamoe_router_cake_large_routed_e512_rb_os_cps_pf_generated
 
 namespace flashinfer {
 namespace alphamoe_fused_router {
@@ -481,10 +498,15 @@ inline int64_t MaxRouteBlocks(int64_t m, int64_t top_k, int64_t num_experts, int
 // and 256 experts, one token per warp. Up to 12000 tokens, the large grid's one-token entry serves
 // the calls its grid has a warp for, one token per warp. From 129 to 512 tokens, block_m 4 (and
 // block_m 5 above 256 tokens) takes a medium entry built for that block_m. From 3000 tokens at
-// top_k 8 to 10, the large entries run one 1024-thread CTA per SM (cta_per_sm); on sm_103a the
-// batched-rebase one also stages each warp's routes in shared memory. Behind the large entries
-// runs the 512-expert tail, whose CTAs leave the padding rows of one expert to one warp.
-using RoutedE512Kernels = std::array<tvm::ffi::CubinKernel*, 15>;
+// top_k 8 to 10, and at any top_k with block_m up to 8, the large entries run one 1024-thread CTA
+// per SM (cta_per_sm) whose warps first warm their first token's logits in L2 (entry_prefetch);
+// the batched-rebase ones also stage each warp's routes in shared memory (owner_stage) from 12000
+// tokens on sm_103a and from 32768 on sm_100a, and on sm_103a an owner_stage one prefetches only
+// from 16384 tokens and at block_m up to 8. At top_k up to 10, the 16-CTA clusters compare a
+// candidate's key with the second 16 candidate keys only when there are more than 16 candidates
+// (half_read). Behind the large entries runs the 512-expert tail, whose CTAs leave one expert's
+// padding rows to one warp.
+using RoutedE512Kernels = std::array<tvm::ffi::CubinKernel*, 17>;
 
 inline RoutedE512Kernels GetRoutedE512Kernels(int minor) {
 #if defined(FLASHINFER_ALPHAMOE_SM_100A)
@@ -514,7 +536,7 @@ inline RoutedE512Kernels GetRoutedE512Kernels(int minor) {
         "kernel_alpha_moe_fused_router_medium_e512_threshold_split_start_rs12");
     static auto cluster_c16_w16 = TVM_FFI_EMBED_CUBIN_GET_KERNEL(
         alphamoe_cake_cluster_routed_c16_w16_sm_100a,
-        "kernel_alpha_moe_fused_router_cluster_c16_w16_threshold_acq");
+        "kernel_alpha_moe_fused_router_cluster_c16_w16_threshold_acq_half_read");
     static auto large_ot =
         TVM_FFI_EMBED_CUBIN_GET_KERNEL(alphamoe_cake_large_routed_e512_ot_sm_100a,
                                        "kernel_alpha_moe_fused_router_e512_threshold_one_token");
@@ -524,18 +546,25 @@ inline RoutedE512Kernels GetRoutedE512Kernels(int minor) {
     static auto medium_bm5 =
         TVM_FFI_EMBED_CUBIN_GET_KERNEL(alphamoe_cake_medium_routed_e512_bm5_sm_100a,
                                        "kernel_alpha_moe_fused_router_medium_e512_threshold_bm5");
-    static auto large_cps =
-        TVM_FFI_EMBED_CUBIN_GET_KERNEL(alphamoe_cake_large_routed_e512_cps_sm_100a,
-                                       "kernel_alpha_moe_fused_router_e512_threshold_cta_per_sm");
+    static auto large_cps = TVM_FFI_EMBED_CUBIN_GET_KERNEL(
+        alphamoe_cake_large_routed_e512_cps_sm_100a,
+        "kernel_alpha_moe_fused_router_e512_threshold_cta_per_sm_entry_prefetch");
     static auto large_rb_cps = TVM_FFI_EMBED_CUBIN_GET_KERNEL(
         alphamoe_cake_large_routed_e512_rb_cps_sm_100a,
         "kernel_alpha_moe_fused_router_e512_threshold_rebase_batch_cta_per_sm");
     static auto large_tail = TVM_FFI_EMBED_CUBIN_GET_KERNEL(
         alphamoe_cake_large_tail_e512_sm_100a,
         "kernel_alpha_moe_fused_router_large_tail_e512_idle_padding");
-    return {&small_c4,   &small_c16,  &medium,     &large,           &large_rb,
-            &split_e256, &split_e288, &split_e384, &cluster_c16_w16, &large_ot,
-            &medium_bm4, &medium_bm5, &large_cps,  &large_rb_cps,    &large_tail};
+    static auto small_c16_hr = TVM_FFI_EMBED_CUBIN_GET_KERNEL(
+        alphamoe_cake_small_routed_e512_c16_hr_sm_100a,
+        "kernel_alpha_moe_fused_router_cluster_c16_w8_threshold_half_read");
+    static auto large_rb_os_cps_pf = TVM_FFI_EMBED_CUBIN_GET_KERNEL(
+        alphamoe_cake_large_routed_e512_rb_os_cps_pf_sm_100a,
+        "kernel_alpha_moe_fused_router_e512_threshold_rebase_batch_owner_stage_entry_prefetch");
+    return {&small_c4,     &small_c16,         &medium,     &large,           &large_rb,
+            &split_e256,   &split_e288,        &split_e384, &cluster_c16_w16, &large_ot,
+            &medium_bm4,   &medium_bm5,        &large_cps,  &large_rb_cps,    &large_tail,
+            &small_c16_hr, &large_rb_os_cps_pf};
   }
 #endif
 #if defined(FLASHINFER_ALPHAMOE_SM_103A)
@@ -565,7 +594,7 @@ inline RoutedE512Kernels GetRoutedE512Kernels(int minor) {
         "kernel_alpha_moe_fused_router_medium_e512_threshold_split_start_rs12");
     static auto cluster_c16_w16 = TVM_FFI_EMBED_CUBIN_GET_KERNEL(
         alphamoe_cake_cluster_routed_c16_w16_sm_103a,
-        "kernel_alpha_moe_fused_router_cluster_c16_w16_threshold_acq");
+        "kernel_alpha_moe_fused_router_cluster_c16_w16_threshold_acq_half_read");
     static auto large_ot =
         TVM_FFI_EMBED_CUBIN_GET_KERNEL(alphamoe_cake_large_routed_e512_ot_sm_103a,
                                        "kernel_alpha_moe_fused_router_e512_threshold_one_token");
@@ -575,18 +604,25 @@ inline RoutedE512Kernels GetRoutedE512Kernels(int minor) {
     static auto medium_bm5 =
         TVM_FFI_EMBED_CUBIN_GET_KERNEL(alphamoe_cake_medium_routed_e512_bm5_sm_103a,
                                        "kernel_alpha_moe_fused_router_medium_e512_threshold_bm5");
-    static auto large_cps =
-        TVM_FFI_EMBED_CUBIN_GET_KERNEL(alphamoe_cake_large_routed_e512_cps_sm_103a,
-                                       "kernel_alpha_moe_fused_router_e512_threshold_cta_per_sm");
+    static auto large_cps = TVM_FFI_EMBED_CUBIN_GET_KERNEL(
+        alphamoe_cake_large_routed_e512_cps_sm_103a,
+        "kernel_alpha_moe_fused_router_e512_threshold_cta_per_sm_entry_prefetch");
     static auto large_rb_cps = TVM_FFI_EMBED_CUBIN_GET_KERNEL(
         alphamoe_cake_large_routed_e512_rb_cps_sm_103a,
         "kernel_alpha_moe_fused_router_e512_threshold_rebase_batch_cta_per_sm");
     static auto large_tail = TVM_FFI_EMBED_CUBIN_GET_KERNEL(
         alphamoe_cake_large_tail_e512_sm_103a,
         "kernel_alpha_moe_fused_router_large_tail_e512_idle_padding");
-    return {&small_c4,   &small_c16,  &medium,     &large,           &large_rb,
-            &split_e256, &split_e288, &split_e384, &cluster_c16_w16, &large_ot,
-            &medium_bm4, &medium_bm5, &large_cps,  &large_rb_cps,    &large_tail};
+    static auto small_c16_hr = TVM_FFI_EMBED_CUBIN_GET_KERNEL(
+        alphamoe_cake_small_routed_e512_c16_hr_sm_103a,
+        "kernel_alpha_moe_fused_router_cluster_c16_w8_threshold_half_read");
+    static auto large_rb_os_cps_pf = TVM_FFI_EMBED_CUBIN_GET_KERNEL(
+        alphamoe_cake_large_routed_e512_rb_os_cps_pf_sm_103a,
+        "kernel_alpha_moe_fused_router_e512_threshold_rebase_batch_owner_stage_entry_prefetch");
+    return {&small_c4,     &small_c16,         &medium,     &large,           &large_rb,
+            &split_e256,   &split_e288,        &split_e384, &cluster_c16_w16, &large_ot,
+            &medium_bm4,   &medium_bm5,        &large_cps,  &large_rb_cps,    &large_tail,
+            &small_c16_hr, &large_rb_os_cps_pf};
   }
 #endif
   TVM_FFI_THROW(RuntimeError) << "AlphaMoE router was not built for this CUDA device";
@@ -609,6 +645,12 @@ struct RoutedE512Config {
   std::array<int, 2> medium_bm_active_blocks_per_sm{};
   // The large grid's cta_per_sm entries, without and with the batched rebase (kernels 12 and 13).
   std::array<int, 2> large_cps_active_blocks_per_sm{};
+  // The token counts from which a batched-rebase cta_per_sm launch stages each warp's routes in
+  // shared memory (owner_stage) and from which an owner_stage launch warms its first rows in L2
+  // (entry_prefetch), and the largest block_m at which it does, set per architecture.
+  int64_t owner_stage_min_m = 0;
+  int64_t owner_stage_prefetch_min_m = 0;
+  int64_t owner_stage_prefetch_max_block_m = 0;
 };
 
 inline int ActiveBlocksPerSm(tvm::ffi::CubinKernel* kernel, int threads, int smem) {
@@ -721,8 +763,48 @@ inline RoutedE512Config GetRoutedE512Config(int32_t device_id) {
   config.large_ot_active_blocks_per_sm = large_ot_active;
   config.medium_bm_active_blocks_per_sm = {medium_bm4_active, medium_bm5_active};
   config.large_cps_active_blocks_per_sm = {large_cps_active, large_rb_cps_active};
+  // owner_stage from 12000 tokens (every batched-rebase cta_per_sm launch) on sm_103a and from
+  // 32768 on sm_100a; an owner_stage launch prefetches from 16384 tokens at block_m up to 8 on
+  // sm_103a and always on sm_100a. The rb_cps unit matches: sm_100a's build prefetches, sm_103a's
+  // is owner_stage.
+  config.owner_stage_min_m = minor == 3 ? 12000 : 32768;
+  config.owner_stage_prefetch_min_m = minor == 3 ? 16384 : 0;
+  config.owner_stage_prefetch_max_block_m = minor == 3 ? 8 : std::numeric_limits<int64_t>::max();
   cache.emplace(device_id, config);
   return config;
+}
+
+// The half_read 16-CTA cluster (kernel 15) and the owner_stage entry_prefetch grid (kernel 16) are
+// set up, and their modules loaded, on their first launch rather than with the entries above: a
+// process that never takes their paths keeps the other entries' modules, and the medium grids'
+// code, as without them.
+inline int LateEntryOccupancy(int32_t device_id, const RoutedE512Config& config, int kernel) {
+  static std::mutex mutex;
+  static std::unordered_map<int64_t, int> cache;
+  std::lock_guard<std::mutex> lock(mutex);
+  const int64_t key = static_cast<int64_t>(device_id) * 32 + kernel;
+  const auto cached = cache.find(key);
+  if (cached != cache.end()) return cached->second;
+  int value = 0;
+  if (kernel == 15) {
+    // The 16-CTA cluster is above the portable cluster size of 8.
+    CUdevice device = 0;
+    CheckCudaDriver(cuDeviceGet(&device, device_id));
+    CheckCudaDriver(
+        cuKernelSetAttribute(CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED, 1,
+                             reinterpret_cast<CUkernel>(config.kernels[15]->GetHandle()), device));
+    value = ActiveClusters(config.kernels[15],
+                           alphamoe_router_cake_small_routed_e512_c16_hr_generated::kCluster,
+                           alphamoe_router_cake_small_routed_e512_c16_hr_generated::kThreads,
+                           alphamoe_router_cake_small_routed_e512_c16_hr_generated::kSmemTotal);
+  } else {
+    value = ActiveBlocksPerSm(
+        config.kernels[16], alphamoe_router_cake_large_routed_e512_rb_os_cps_pf_generated::kThreads,
+        alphamoe_router_cake_large_routed_e512_rb_os_cps_pf_generated::kSmemTotal);
+    TVM_FFI_ICHECK(value > 0) << "AlphaMoE routed 512-expert-build entries have zero occupancy";
+  }
+  cache.emplace(key, value);
+  return value;
 }
 
 inline void LaunchClusterRouterKernel(tvm::ffi::CubinKernel& kernel, unsigned int cluster,
@@ -753,11 +835,22 @@ inline bool LaunchRoutedE512(int32_t device_id, const RouterLaunchConfig& base, 
         alphamoe_router_cake_small_routed_e512_c4_generated::kThreads,
         alphamoe_router_cake_small_routed_e512_c4_generated::kSmemTotal, stream, args);
   } else if (m <= 128) {
-    if (config.small_c16_active_clusters == 0) return false;
-    LaunchClusterRouterKernel(
-        *config.kernels[1], alphamoe_router_cake_small_routed_e512_c16_generated::kCluster,
-        alphamoe_router_cake_small_routed_e512_c16_generated::kThreads,
-        alphamoe_router_cake_small_routed_e512_c16_generated::kSmemTotal, stream, args);
+    // At top_k up to 10, the half_read build.
+    const bool half_read = top_k <= 10;
+    const int clusters =
+        half_read ? LateEntryOccupancy(device_id, config, 15) : config.small_c16_active_clusters;
+    if (clusters == 0) return false;
+    if (half_read) {
+      LaunchClusterRouterKernel(
+          *config.kernels[15], alphamoe_router_cake_small_routed_e512_c16_hr_generated::kCluster,
+          alphamoe_router_cake_small_routed_e512_c16_hr_generated::kThreads,
+          alphamoe_router_cake_small_routed_e512_c16_hr_generated::kSmemTotal, stream, args);
+    } else {
+      LaunchClusterRouterKernel(
+          *config.kernels[1], alphamoe_router_cake_small_routed_e512_c16_generated::kCluster,
+          alphamoe_router_cake_small_routed_e512_c16_generated::kThreads,
+          alphamoe_router_cake_small_routed_e512_c16_generated::kSmemTotal, stream, args);
+    }
   } else if (m <= 512) {
     // Run sends 128 < m <= 512 here at top_k 8 to 10. block_m 4, and block_m 5 above 256 tokens
     // (128 < m <= 256 at block_m 5 is the 16-warp cluster's), take the entry built for it.
@@ -786,8 +879,19 @@ inline bool LaunchRoutedE512(int32_t device_id, const RouterLaunchConfig& base, 
   } else {
     // From 12000 tokens the rb entries: each warp rebases its routes' IDs in batches.
     const bool rebase_batch = m >= 12000;
-    // From 3000 tokens at top_k 8 to 10, the cta_per_sm entries: one 1024-thread CTA per SM.
-    const bool cta_per_sm = m >= 3000 && top_k >= 8 && top_k <= 10;
+    // From 3000 tokens at top_k 8 to 10, or at any top_k with block_m up to 8, the cta_per_sm
+    // entries: one 1024-thread CTA per SM. A batched-rebase one stages each warp's routes in shared
+    // memory (owner_stage) from the device's owner_stage_min_m tokens, and each warms its first
+    // rows in L2 (entry_prefetch) unless owner_stage below owner_stage_prefetch_min_m tokens or
+    // above owner_stage_prefetch_max_block_m in block_m.
+    const bool cta_per_sm = m >= 3000 && ((top_k >= 8 && top_k <= 10) || block_m <= 8);
+    const bool owner_stage = cta_per_sm && rebase_batch && m >= config.owner_stage_min_m;
+    const bool entry_prefetch =
+        cta_per_sm && !(owner_stage && (m < config.owner_stage_prefetch_min_m ||
+                                        block_m > config.owner_stage_prefetch_max_block_m));
+    // The cta_per_sm entry (kernels 12, 13 and 16): cps (entry_prefetch), rb_cps (sm_100a's
+    // entry_prefetch build, sm_103a's owner_stage build) or rb_os_cps_pf (both).
+    const int cta_per_sm_entry = owner_stage && entry_prefetch ? 2 : rebase_batch ? 1 : 0;
     const int64_t full_wave_grid =
         (((m + 3) / 4 + base.sm_count - 1) / base.sm_count) * base.sm_count;
     const auto large_grid_x = [&](int active) {
@@ -804,7 +908,9 @@ inline bool LaunchRoutedE512(int32_t device_id, const RouterLaunchConfig& base, 
     const bool one_token = m < 3000 && m <= one_token_grid_x * 8;
     const int64_t grid_x =
         one_token    ? one_token_grid_x
-        : cta_per_sm ? large_grid_x(config.large_cps_active_blocks_per_sm[rebase_batch ? 1 : 0])
+        : cta_per_sm ? large_grid_x(cta_per_sm_entry == 2
+                                        ? LateEntryOccupancy(device_id, config, 16)
+                                        : config.large_cps_active_blocks_per_sm[cta_per_sm_entry])
                      : default_grid_x;
     if (one_token) {
       LaunchRouterKernel(*config.kernels[9], static_cast<unsigned int>(grid_x),
@@ -812,7 +918,13 @@ inline bool LaunchRoutedE512(int32_t device_id, const RouterLaunchConfig& base, 
                          alphamoe_router_cake_large_routed_e512_ot_generated::kSmemTotal, true,
                          stream, args);
     } else if (cta_per_sm) {
-      if (rebase_batch) {
+      if (cta_per_sm_entry == 2) {
+        LaunchRouterKernel(
+            *config.kernels[16], static_cast<unsigned int>(grid_x),
+            alphamoe_router_cake_large_routed_e512_rb_os_cps_pf_generated::kThreads,
+            alphamoe_router_cake_large_routed_e512_rb_os_cps_pf_generated::kSmemTotal, true, stream,
+            args);
+      } else if (cta_per_sm_entry == 1) {
         LaunchRouterKernel(*config.kernels[13], static_cast<unsigned int>(grid_x),
                            alphamoe_router_cake_large_routed_e512_rb_cps_generated::kThreads,
                            alphamoe_router_cake_large_routed_e512_rb_cps_generated::kSmemTotal,
@@ -1020,9 +1132,9 @@ void Run(TensorView logits, TensorView topk_weights, TensorView topk_ids,
   // Routed 512-expert calls: the cluster plan for 8 < M <= 128 at every top_k; the threshold
   // searches from top_k 8, below which the route-by-route selection is faster, the medium one
   // (128 < M <= 512) up to top_k 10; M <= 32 runs as one 4-CTA cluster; the large grid (M > 512)
-  // takes its batched-rebase build from 12000 tokens and, at top_k 8 to 10 from 3000 tokens, one
-  // 1024-thread CTA per SM. Routed 256, 257 and 384-expert calls with 128 < M <= 512 and top_k
-  // 8 to 10 take the split-start medium entry sized to the expert count.
+  // takes its batched-rebase build from 12000 tokens and, from 3000 tokens at top_k 8 to 10 or
+  // block_m up to 8, one 1024-thread CTA per SM. Routed 256, 257 and 384-expert calls with
+  // 128 < M <= 512 and top_k 8 to 10 take the split-start medium entry sized to the expert count.
   // First, routed 512, 384, 257 and 256-expert calls with 128 < M <= 256, top_k 8 to 10 and
   // block_m 5, 8 or 16 (8 or 16 at 256 experts) run as one cluster of 16 CTAs of 16 warps.
   // These cake_ entries rank a NaN logit as +inf, the lower expert ID first among equal ones, so

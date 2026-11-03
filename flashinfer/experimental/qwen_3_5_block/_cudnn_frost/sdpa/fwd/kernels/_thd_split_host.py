@@ -224,6 +224,7 @@ def compile_host(
     gate_slots=False,
     thd_origin_specs=None,
     paged_v_hnd=None,
+    kv_dtype=None,
 ):
     """Specialize one common pointer host; extents and strides stay dynamic."""
     if lse_kind not in ("head", "token"):
@@ -236,8 +237,8 @@ def compile_host(
     return _compile_cached(
         host if paged_v_hnd is None else host_independent_kv,
         P(storage_dtype),
-        P(storage_dtype),
-        P(storage_dtype),
+        P(storage_dtype if kv_dtype is None else kv_dtype),
+        P(storage_dtype if kv_dtype is None else kv_dtype),
         P(storage_dtype),
         P(cutlass.Float32, 4) if has_lse else None,
         P(cutlass.Float32),

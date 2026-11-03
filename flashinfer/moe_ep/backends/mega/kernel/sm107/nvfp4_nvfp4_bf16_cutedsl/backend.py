@@ -52,6 +52,14 @@ class Sm107Nvfp4BlockScaledMegaKernelBackend(MegaKernelBackend):
         super().__init__(config)
         self._kernel_config = config
 
+    @classmethod
+    def create(cls, config):
+        if config.kernel_variant == "auto":
+            from ..variant_selection import RubinVariantBackend
+
+            return RubinVariantBackend(config, cls)
+        return cls(config)
+
     def coordinate_workspace_replacement(
         self, workspace: Sm107BlockScaledSymmBuffer
     ) -> bool:
@@ -246,6 +254,8 @@ class Sm107Nvfp4BlockScaledMegaKernelBackend(MegaKernelBackend):
         self, t: "MoEEpTensors", workspace: Any, *, quantize_input: bool
     ) -> None:
         """Stage NVFP4 inputs, fusing eligible route checks with quantization."""
+        if self._kernel_config.knobs == "auto":
+            workspace._tuning_inputs = (t, quantize_input)
         self._stage_scalars(t, workspace)
         if quantize_input:
             staged = stage_mega_moe_inputs(

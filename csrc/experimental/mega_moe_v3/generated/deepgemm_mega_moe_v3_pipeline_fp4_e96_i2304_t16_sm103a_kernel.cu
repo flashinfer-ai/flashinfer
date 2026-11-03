@@ -741,7 +741,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t16_sm103a(int* __restrict__ 
             unsigned int _xsf_load_3[4];
             unsigned int _xsf_load_4[4];
             {
-                uint4 _uv4_0 = *reinterpret_cast<const uint4*>(x_sf + (unsigned int)(0 + lane * 4) + 0);
+                uint4 _uv4_0 = *reinterpret_cast<const uint4*>(x_sf + (unsigned int)(lane * 4) + 0);
                 _xsf_load_0[0 + 0] = _uv4_0.x;
                 _xsf_load_0[0 + 1] = _uv4_0.y;
                 _xsf_load_0[0 + 2] = _uv4_0.z;
@@ -775,7 +775,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t16_sm103a(int* __restrict__ 
                 _xsf_load_4[0 + 2] = _uv4_4.z;
                 _xsf_load_4[0 + 3] = _uv4_4.w;
             }
-            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(smem_xsf_addr + (unsigned int)(0 + lane * 16)), "r"(_xsf_load_0[0]), "r"(_xsf_load_0[1]), "r"(_xsf_load_0[2]), "r"(_xsf_load_0[3]) : "memory");
+            asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(smem_xsf_addr + (unsigned int)(lane * 16)), "r"(_xsf_load_0[0]), "r"(_xsf_load_0[1]), "r"(_xsf_load_0[2]), "r"(_xsf_load_0[3]) : "memory");
             asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(smem_xsf_addr + (unsigned int)(512 + lane * 16)), "r"(_xsf_load_1[0]), "r"(_xsf_load_1[1]), "r"(_xsf_load_1[2]), "r"(_xsf_load_1[3]) : "memory");
             asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(smem_xsf_addr + (unsigned int)(1024 + lane * 16)), "r"(_xsf_load_2[0]), "r"(_xsf_load_2[1]), "r"(_xsf_load_2[2]), "r"(_xsf_load_2[3]) : "memory");
             asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(smem_xsf_addr + (unsigned int)(1536 + lane * 16)), "r"(_xsf_load_3[0]), "r"(_xsf_load_3[1]), "r"(_xsf_load_3[2]), "r"(_xsf_load_3[3]) : "memory");
@@ -991,7 +991,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t16_sm103a(int* __restrict__ 
                     if (direct_hit_0 != 0) {
                         int _find_first_set_4 = __ffs(direct_hit_0);
                         unsigned int direct_lane_0 = _find_first_set_4 - 1;
-                        direct_expert = 0 + direct_lane_0;
+                        direct_expert = direct_lane_0;
                         if (direct_phase == 2) {
                             unsigned int _shfl_sync_5 = __shfl_sync(0xFFFFFFFF, counts[0], direct_lane_0);
                             direct_valid = _shfl_sync_5;
@@ -1132,8 +1132,8 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t16_sm103a(int* __restrict__ 
                 if (task_4[0] == 1) {
                     unsigned int direct_routed = 0;
                     if (lane < 16) {
-                        int direct_route_0 = topk_idx_i32[(lane * 6 + 0) * 2] - local_expert_offset;
-                        float direct_rw_0 = topk_weights[lane * 6 + 0];
+                        int direct_route_0 = topk_idx_i32[lane * 6 * 2] - local_expert_offset;
+                        float direct_rw_0 = topk_weights[lane * 6];
                         if (direct_routed == 0 && (unsigned int)direct_route_0 == task_4[1]) {
                             direct_routed = 1;
                             pre_weight = direct_rw_0;
@@ -1564,7 +1564,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t16_sm103a(int* __restrict__ 
                     }
                     unsigned int routed = __ballot_sync(0xFFFFFFFF, stored_row >= 0);
                     unsigned int row_0 = __shfl_sync(0xFFFFFFFF, (unsigned int)stored_row, 0);
-                    if ((routed >> 0 & 1) != 0) {
+                    if ((routed & 1) != 0) {
                         {
                             const uint4* _vptr_24 = reinterpret_cast<const uint4*>(expert_output + ((unsigned long long)row_0 * 5120 + lane_off) + 0);
                             uint4* _vdst_24 = reinterpret_cast<uint4*>(&values[0]);
@@ -1637,7 +1637,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e96_i2304_t16_sm103a(int* __restrict__ 
                     reduced[5] = 0.0f;
                     reduced[6] = 0.0f;
                     reduced[7] = 0.0f;
-                    if ((routed >> 0 & 1) != 0) {
+                    if ((routed & 1) != 0) {
                         float _bf16x2_add_f32_0[2];
                         asm volatile(
                             "{\n\t"

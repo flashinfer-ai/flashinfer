@@ -1558,6 +1558,37 @@ def gemm_ars_cell_conflicts(
     return conflicts
 
 
+GEMM_TNS_SUFFIX = "_tns"  # round 12 H (lever TNS): the tail N split form of the 256-wide static grid-stride 128-K TMA-store program (table key ``gemm_tns`` beside ``gemm_gs``; right after _gs; the same launch, the last wave's leftover pair tiles run as 128-column halves)
+GEMM_TNS_ARCHES = (
+    "sm_100a",
+)  # round 12 H (lever TNS): the architectures the tail N split program is built for
+
+
+def _entry_gemm_tns(entry: dict[str, Any]) -> bool:
+    """The ``gemm_tns`` key of a table cell (0 / 1; round 12 H, lever TNS): whether the cell's static grid-stride
+    launches (``gemm_gs``) take the tail N split ``_gs_tns`` program."""
+    return _entry_flag(entry, "gemm_tns")
+
+
+def gemm_tns_cell_conflicts(entry: Optional[dict[str, Any]], arch: str) -> list[str]:
+    """Round 12 H (lever TNS): what keeps a ``gemm_tns`` 1 cell from naming a program -- the form is the plain
+    256-wide ``_gs`` program with the last wave's leftover pair tiles split into 128-column halves (``gemm_gs`` 1,
+    ``gemm_bn`` 256, no ``gemm_ars``, the 32-row raster group, an architecture of ``GEMM_TNS_ARCHES``)."""
+    entry = entry or {}
+    conflicts = []
+    if not _entry_gemm_gs(entry):
+        conflicts.append("gemm_gs")
+    if int(entry.get("gemm_bn", BLOCK_N)) != BLOCK_N:
+        conflicts.append("gemm_bn")
+    if _entry_gemm_ars(entry):
+        conflicts.append("gemm_ars")
+    if int(entry.get("gemm_gm", GEMM_GROUP_M)) != GEMM_GROUP_M:
+        conflicts.append("gemm_gm")
+    if arch not in GEMM_TNS_ARCHES:
+        conflicts.append("arch")
+    return conflicts
+
+
 def _entry_gemm_rstaged_pf(entry: dict[str, Any]) -> bool:
     """The ``gemm_rstaged_pf`` key of a table cell (0 / 1; round 12, lever RPF): whether the cell's
     staged-register launches take the cell's ``gemm_pf`` weight prefetch too (the TMA-store launches always do); a cell
@@ -2684,6 +2715,16 @@ def required_kernel_keys(arch: str, sm_count: int) -> tuple[str, ...]:
                         f"instance (the A-resident form is the 256-wide _gs program at K <= {GEMM_ARS_MAX_K}; got {entry})"
                     )
                 gssfx += GEMM_ARS_SUFFIX
+            # round 12 H (lever TNS): a ``gemm_tns`` row segment's grid-stride launches take the tail N split ``_gs_tns``
+            # program (the token right after ``_gs``); the plain ``_gs`` program is then launched by no row of the segment
+            if _entry_gemm_tns(entry):
+                conflicts = gemm_tns_cell_conflicts(entry, arch)
+                if conflicts:
+                    raise ValueError(
+                        f"decode table cell {key} carries gemm_tns together with {conflicts}, which names no GEMM "
+                        f"instance (the tail N split form is the 256-wide _gs program on {GEMM_TNS_ARCHES}; got {entry})"
+                    )
+                gssfx += GEMM_TNS_SUFFIX
             if gemm_bn_wide(gbn):
                 # round 10 (S3): the 384-wide pair-tile programs of the epilogues the cell's rows launch -- always the
                 # ``_k128`` form, never with stage / stream-K / prefetch tokens (a cell naming one is refused, as in the
@@ -3636,11 +3677,23 @@ def route_plan(
                     f"{prepared.num_k_iters} carries gemm_ars together with {conflicts}, which names no GEMM instance "
                     f"(the A-resident form is the 256-wide _gs program at K <= {GEMM_ARS_MAX_K})"
                 )
+        # round 12 H (lever TNS): a ``gemm_tns`` row's grid-stride launch takes the tail N split ``_gs_tns`` program
+        # (the same launch; the 256-wide _gs program on GEMM_TNS_ARCHES, a cell naming it elsewhere is refused)
+        tns = bool(gs_pairs) and _entry_gemm_tns(gentry)
+        if tns:
+            conflicts = gemm_tns_cell_conflicts(gentry, arch)
+            if conflicts:
+                raise ValueError(
+                    f"{arch}: decode table cell of M={M} n_tiles128={prepared.n_tiles128} num_k_iters="
+                    f"{prepared.num_k_iters} carries gemm_tns together with {conflicts}, which names no GEMM instance "
+                    f"(the tail N split form is the 256-wide _gs program on {GEMM_TNS_ARCHES})"
+                )
         if gs_pairs:
             # the _gs form of the plain _k128 / _n192_k128 stems first (the token takes the _cs<S> / _st slot, after _k128), then
             # as today, so a missing program falls back at the same geometry onto a registered program (a gemm_gs cell carries
             # no stage / stream-K / prefetch / _pdlb / _st key: the candidates below are the plain forms); round 12: the
-            # ``_gs_ars`` form of a ``gemm_ars`` cell before its ``_gs`` form
+            # ``_gs_ars`` form of a ``gemm_ars`` cell before its ``_gs`` form; round 12 H: the ``_gs_tns`` form of a
+            # ``gemm_tns`` row before its ``_gs`` form
             stems = [
                 v
                 for s, pf, bn in stems
@@ -3648,6 +3701,11 @@ def route_plan(
                     (
                         ((_gs_stem(s) + GEMM_ARS_SUFFIX, pf, bn),)
                         if ars and _gs_eligible(s) and bn == BLOCK_N
+                        else ()
+                    )
+                    + (
+                        ((_gs_stem(s) + GEMM_TNS_SUFFIX, pf, bn),)
+                        if tns and _gs_eligible(s) and bn == BLOCK_N
                         else ()
                     )
                     + (((_gs_stem(s), pf, bn),) if _gs_eligible(s) else ())
@@ -3754,8 +3812,12 @@ def route_plan(
         )[
             0
         ].endswith(
-            (GEMM_GS_SUFFIX, GEMM_GS_SUFFIX + GEMM_ARS_SUFFIX)
-        )  # the launched program's form (a fallback may have dropped the _gs token; round 11 T6; round 12: _gs_ars)
+            (
+                GEMM_GS_SUFFIX,
+                GEMM_GS_SUFFIX + GEMM_ARS_SUFFIX,
+                GEMM_GS_SUFFIX + GEMM_TNS_SUFFIX,
+            )
+        )  # the launched program's form (a fallback may have dropped the _gs token; round 11 T6; round 12: _gs_ars, _gs_tns)
         ggs_pairs = (
             _gs_pairs(sm_count, _m_tiles(M), gemm_n_tiles(prepared, gbn)) if ggs else 0
         )  # P' at the launched program's bn (grid 2 P' CTAs, the sk_pairs scalar)

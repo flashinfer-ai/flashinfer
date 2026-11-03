@@ -180,6 +180,52 @@ def test_w1_launch_view_hands_the_expert_map_the_logical_rows_under_the_padded_p
     assert same.shape == b1.shape and same.is_contiguous()
 
 
+@pytest.mark.parametrize(
+    ("num_sms", "experts", "global_experts", "logical", "physical", "rows"),
+    [
+        # The validated routes: 152-SM E384 tensor-parallel rank routes.
+        (152, 384, 384, 576, 640, 1152),
+        (152, 384, 384, 288, 384, 640),
+        # Every other route binds the whole tensor.
+        (152, 384, 384, 608, 640, 1280),
+        (152, 384, 384, 320, 384, 768),
+        (152, 384, 384, 544, 640, 1280),
+        (152, 384, 384, 2304, 2304, 4608),
+        (152, 48, 384, 2240, 2304, 4608),
+        (152, 96, 384, 2208, 2304, 4608),
+        (148, 48, 384, 2240, 2304, 4608),
+        (148, 384, 384, 576, 640, 1280),
+        (148, 384, 384, 288, 384, 768),
+        (152, 192, 384, 576, 640, 1280),
+    ],
+)
+def test_sfb1_launch_view_drops_the_padded_row_blocks_on_the_validated_routes(
+    num_sms, experts, global_experts, logical, physical, rows
+):
+    """On a route of ``SFB1_VIEW_ROUTES`` the FC1 scale map ends with the last
+    128-row block that holds a logical gate / up row (a strided view, no
+    copy); every other route takes the whole tensor."""
+    torch = pytest.importorskip("torch")
+    groups = 2 * 40
+    sfb1 = torch.arange(groups * 2 * physical, dtype=torch.int32).view(
+        groups, 2 * physical
+    )
+    view = preparation.sfb1_launch_view(
+        sfb1,
+        logical,
+        num_sms=num_sms,
+        num_experts=experts,
+        num_global_experts=global_experts,
+    )
+    applied = (num_sms, experts, global_experts, physical, logical)
+    assert (applied in preparation.SFB1_VIEW_ROUTES) == (rows != 2 * physical)
+    assert view.shape == (groups, rows)
+    assert view.stride() == (2 * physical, 1)
+    assert view.data_ptr() == sfb1.data_ptr()
+    assert view.is_contiguous() == (rows == 2 * physical)
+    assert torch.equal(view, sfb1[:, :rows])
+
+
 def test_dispatch_reference_filters_the_window_and_keeps_the_tile_lists():
     torch = pytest.importorskip("torch")
     ids = torch.tensor([[0, 95, 96, 191, 383, -1], [96, 96, 97, -1, 300, 5]])

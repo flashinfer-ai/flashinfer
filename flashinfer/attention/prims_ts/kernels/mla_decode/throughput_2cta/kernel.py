@@ -58,7 +58,7 @@ from .config import (
     MlaDecodeConfig,
     make_mla_decode_config,
 )
-from ..helpers.constants import LOG2_E, MAX_MLA_SPLITS_KV, TMEM_DEALLOC_MBAR_THREADS
+from ..helpers.constants import LOG2_E, TMEM_DEALLOC_MBAR_THREADS
 from ..helpers.mask import MaskType, mask_visible_k_length, normalize_mask_type
 from ..helpers.query import (
     FlatQueryTileLayout,
@@ -165,7 +165,7 @@ def build_mla_decode_task_manager(
     tidx=None,
     # GMEM output tensors
     output=None,
-    atten_sinks=None,
+    attention_sinks=None,
     lse_in_natural_log=False,
     output_quant=None,
     output_quant_args=None,
@@ -482,7 +482,7 @@ def build_mla_decode_task_manager(
         smem_q_rope=smem_q_rope_arr,
         smem_p=smem_p_arr,
         smem_exchange=None,  # Set at runtime
-        softmax_scale_log2=None,  # Set at runtime
+        scale_softmax_log2=None,  # Set at runtime
         cache_seqs=cache_seqs,
         cu_seqlens_q=cu_seqlens_q,
         split_kv=split_kv,
@@ -530,14 +530,14 @@ def build_mla_decode_task_manager(
         partial_lse=acc_lse,
         tmem_o_ref=tmem_o,
         tmem_corr_ref=tmem_corr,
-        atten_sinks=atten_sinks,
+        attention_sinks=attention_sinks,
         lse_in_natural_log=lse_in_natural_log,
         output_quant=output_quant,
         output_quant_args=output_quant_args,
         smem_o=smem_o,
         tma_o_desc=tma_o_desc,
         output_scale=None,  # set at runtime
-        softmax_scale_log2=None,  # set at runtime
+        scale_softmax_log2=None,  # set at runtime
         smem_exchange=None,  # set at runtime
         split_kv=None,  # set at runtime
         cu_seqlens_q=cu_seqlens_q,
@@ -879,6 +879,8 @@ class MlaDecodeTs(Nvfp4KVConfig):
             block_split_kvs, softmax_scale, output_scale, stream)
     """
 
+    lse_base_on_e = False
+
     def __init__(
         self,
         acc_dtype=None,
@@ -891,6 +893,7 @@ class MlaDecodeTs(Nvfp4KVConfig):
         is_var_seq=False,
         is_var_split_kv=False,
         static_split_kv=None,
+        split_kv_capacity: int | None = None,
         static_seq_len_k=None,
         qkv_dtype="bf16",
         out_dtype="bf16",
@@ -900,6 +903,7 @@ class MlaDecodeTs(Nvfp4KVConfig):
         batch_size=1,
         mask_type: MaskType | str = MaskType.CAUSAL,
         softmax_rescale_threshold_log2: float = 0.0,
+        fixed_seqlen: bool = False,
     ):
         """
         Parameters
@@ -950,6 +954,9 @@ class MlaDecodeTs(Nvfp4KVConfig):
         softmax_rescale_threshold_log2 : float, optional
             Compile-time skip-correction threshold in log2 units. ``0.0``
             (default) keeps the exact online-softmax rescale.
+        fixed_seqlen : bool, optional
+            ``False`` (default) makes the query lengths runtime launch
+            operands; ``True`` compiles for the exact static ``seq_len_q``.
         """
         import cutlass as _cutlass
 
@@ -969,16 +976,26 @@ class MlaDecodeTs(Nvfp4KVConfig):
         self.is_var_split_kv = is_var_split_kv
         self.static_split_kv = static_split_kv
         self.reduction_split_capacity = (
-            static_split_kv if static_split_kv is not None else MAX_MLA_SPLITS_KV
+            split_kv_capacity
+            if split_kv_capacity is not None
+            else static_split_kv
+            if static_split_kv is not None
+            else max_active_clusters * 2
         )
-        if not 1 <= self.reduction_split_capacity <= MAX_MLA_SPLITS_KV:
-            raise ValueError(f"static_split_kv must be in [1, {MAX_MLA_SPLITS_KV}]")
+        if self.reduction_split_capacity < 1:
+            raise ValueError("split_kv_capacity must be positive")
+        if (
+            static_split_kv is not None
+            and not 1 <= static_split_kv <= self.reduction_split_capacity
+        ):
+            raise ValueError("static_split_kv exceeds split_kv_capacity")
         self.static_seq_len_k = static_seq_len_k
         self.qkv_dtype = qkv_dtype
         self.out_dtype = out_dtype
         self.rope_dim = rope_dim
         self.num_heads = num_heads
         self.seq_len_q = seq_len_q
+        self.fixed_seqlen = fixed_seqlen
         if isinstance(batch_size, bool) or not isinstance(batch_size, int):
             raise TypeError("batch_size must be an integer")
         if batch_size <= 0:
@@ -1015,8 +1032,7 @@ class MlaDecodeTs(Nvfp4KVConfig):
         self.use_parallel_reduction = False
         self._parallel_reduction_shape_is_eligible = (
             not is_var_split_kv
-            and static_split_kv is not None
-            and 2 <= static_split_kv <= 128
+            and self.reduction_split_capacity >= 2
             and mma_qk_tiler_mn[0] == 128
             and acc_dtype == _cutlass.Float32
             and lse_dtype == _cutlass.Float32
@@ -1042,6 +1058,7 @@ class MlaDecodeTs(Nvfp4KVConfig):
         return (
             self.acc_dtype,
             self.lse_dtype,
+            self.lse_base_on_e,
             self.mma_qk_tiler_mn,
             self.mma_pv_tiler_mn,
             self.max_active_clusters,
@@ -1055,22 +1072,23 @@ class MlaDecodeTs(Nvfp4KVConfig):
             self.out_dtype,
             self.rope_dim,
             self.num_heads,
-            self.seq_len_q,
+            self.seq_len_q if self.fixed_seqlen else None,
             self.mask_type,
             self.softmax_rescale_threshold_log2,
             self.reduction_split_capacity,
-            self.query_tile_layout,
-            self.num_q_tiles,
-            self.tail_q_rows,
+            self.query_tile_layout if self.fixed_seqlen else None,
+            self.num_q_tiles if self.fixed_seqlen else None,
+            self.tail_q_rows if self.fixed_seqlen else None,
             self._parallel_reduction_shape_is_eligible,
             self.use_parallel_reduction,
             self._reduction_topology(),
             self.fuse_sparse_reduction,
             self.fuse_sparse_epilogue,
             self.output_quant,
+            self.fixed_seqlen,
             self.direct_sparse,
             self.assume_valid_prefix,
-            self.direct_sparse_capacities,
+            tuple(int(x > 0) for x in self.direct_sparse_capacities),
             self.sparse_gather_warps,
             self.sparse_kv_stages,
             self.sparse_uniform_pages,
@@ -1079,7 +1097,9 @@ class MlaDecodeTs(Nvfp4KVConfig):
             self.extra_kv_cache_format,
         )
 
-    def _configure_parallel_reduction_topology(self) -> None:
+    def _configure_parallel_reduction_topology(
+        self, policy_splits: int | None = None
+    ) -> None:
         """Refresh reducer topology after any host-side launch-shape update."""
 
         self.parallel_reduction_topology = None
@@ -1099,9 +1119,11 @@ class MlaDecodeTs(Nvfp4KVConfig):
 
         if not self._parallel_reduction_shape_is_eligible:
             return
-        assert self.static_split_kv is not None
+        policy_splits = (
+            self.reduction_split_capacity if policy_splits is None else policy_splits
+        )
         topology = make_q128_wave_limited_parallel_reduction_topology(
-            self.static_split_kv,
+            policy_splits,
             logical_rows=(self.num_heads * self.seq_len_q * self.batch_size),
             physical_sm_count=self.max_active_clusters * 2,
             max_cluster_size=8,
@@ -1114,27 +1136,27 @@ class MlaDecodeTs(Nvfp4KVConfig):
         # physical row. Padded M128 tails and intermediate split counts retain
         # the compact reference grid; high split counts may use clusters.
         use_small_split_g1 = (
-            self.static_split_kv <= 16
+            policy_splits <= 16
             and topology is not None
             and topology.cluster_size == 1
             and parallel_g1_grid_has_no_padded_rows
             and should_use_q128_g1_parallel_reducer(
                 batch_size=self.batch_size,
                 physical_rows_per_batch=(physical_tile_rows * num_query_tiles),
-                producer_ctas=(
-                    self.batch_size * num_query_tiles * self.static_split_kv * 2
-                ),
+                producer_ctas=(self.batch_size * num_query_tiles * policy_splits * 2),
                 reference_rows_per_cta=REDUCTION_ROWS_PER_CTA,
                 physical_sm_count=self.max_active_clusters * 2,
             )
         )
         use_high_split_cluster = (
-            self.static_split_kv > 32
-            and topology is not None
-            and topology.cluster_size > 1
+            policy_splits > 32 and topology is not None and topology.cluster_size > 1
         )
-        if use_small_split_g1 or use_high_split_cluster:
-            self.parallel_reduction_topology = topology
+        if topology is not None and (use_small_split_g1 or use_high_split_cluster):
+            self.parallel_reduction_topology = (
+                make_balanced_parallel_reduction_topology(
+                    self.reduction_split_capacity, cluster_size=topology.cluster_size
+                )
+            )
             self.use_parallel_reduction = True
 
     def _make_config(self):
@@ -1151,6 +1173,7 @@ class MlaDecodeTs(Nvfp4KVConfig):
             is_var_seq=self.is_var_seq,
             is_var_split_kv=self.is_var_split_kv,
             mask_type=self.mask_type,
+            lse_base_on_e=self.lse_base_on_e,
             sparse_gather_warps=self.sparse_gather_warps,
             sparse_kv_stages=self.sparse_kv_stages,
             cache_uniform_sparse_pages=self.sparse_uniform_pages,
@@ -1197,8 +1220,10 @@ class MlaDecodeTs(Nvfp4KVConfig):
         output_scale: cutlass.Float32,
         stream: object,
         output_quant_args=None,
+        max_q_len: cutlass.Int32 = 0,
     ):
         """Execute the MLA decode TS kernel."""
+        seq_len_q = self.seq_len_q if self.fixed_seqlen else max_q_len
         if cutlass.const_expr(self.fuse_sparse_reduction):
             if cutlass.const_expr(
                 self.is_persistent
@@ -1227,7 +1252,9 @@ class MlaDecodeTs(Nvfp4KVConfig):
                 )
         cfg = self._make_config()
         physical_tile_rows = self.mma_qk_tiler_mn[0]
-        num_query_tiles = self.num_q_tiles
+        num_query_tiles = (
+            seq_len_q * self.num_heads + self.mma_qk_tiler_mn[0] - 1
+        ) // self.mma_qk_tiler_mn[0]
         # Fixed public tensors retain [H,D,SQ,B]/[H,SQ,B]; variable-Q tensors
         # compact batches into [H,D,totalQ]/[H,totalQ]. The scheduler/workspace
         # use physical flat-query tile coordinates, while resources map
@@ -1270,19 +1297,20 @@ class MlaDecodeTs(Nvfp4KVConfig):
                 o.stride[3] == o.shape[2] * o.stride[2],
                 "o must be compact from the query axis into the batch axis",
             )
-        runtime_assert(
-            lse.stride[0] == 1,
-            "lse must have a contiguous head axis",
-        )
-        runtime_assert(
-            lse.stride[1] == lse.shape[0] * lse.stride[0],
-            "lse must be compact from the head axis into the query axis",
-        )
-        if cutlass.const_expr(cu_seqlens_q is None):
+        if cutlass.const_expr(lse is not None):
             runtime_assert(
-                lse.stride[2] == lse.shape[1] * lse.stride[1],
-                "lse must be compact from the query axis into the batch axis",
+                lse.stride[0] == 1,
+                "lse must have a contiguous head axis",
             )
+            runtime_assert(
+                lse.stride[1] == lse.shape[0] * lse.stride[0],
+                "lse must be compact from the head axis into the query axis",
+            )
+            if cutlass.const_expr(cu_seqlens_q is None):
+                runtime_assert(
+                    lse.stride[2] == lse.shape[1] * lse.stride[1],
+                    "lse must be compact from the query axis into the batch axis",
+                )
 
         def _flatten_query_rows_for_tma(t):
             """Expose logical ``(SQ, H)`` as one bounded TMA row dimension."""
@@ -1313,6 +1341,7 @@ class MlaDecodeTs(Nvfp4KVConfig):
                 q_latent_tma,
                 box_dims=(cfg.mma_qk_tiler[2], cfg.mma_qk_tiler[0] // 2),
                 ragged_dim=1,
+                use_blackwell_tma_oob_workaround=True,
                 stride_order=(0, 1),
                 swizzle=cuda.TensorMapSwizzle.s128b,
                 l2_promotion=cuda.TensorMapL2Promotion.l2_128b,
@@ -1339,6 +1368,7 @@ class MlaDecodeTs(Nvfp4KVConfig):
                         cfg.mma_qk_rope_tiler[0] // 2,
                     ),
                     ragged_dim=1,
+                    use_blackwell_tma_oob_workaround=True,
                     stride_order=(0, 1),
                     swizzle=q_rope_swizzle,
                     l2_promotion=cuda.TensorMapL2Promotion.l2_128b,
@@ -1542,12 +1572,18 @@ class MlaDecodeTs(Nvfp4KVConfig):
                 l2_promotion=cuda.TensorMapL2Promotion.l2_128b,
             )
 
-        softmax_scale_log2 = softmax_scale * LOG2_E
+        scale_softmax_log2 = softmax_scale * LOG2_E
 
         kernel_split_kv = (
             Int32(self.static_split_kv)
             if cutlass.const_expr(self.static_split_kv is not None)
             else split_kv
+        )
+
+        runtime_assert(kernel_split_kv >= Int32(1), "split count must be positive")
+        runtime_assert(
+            kernel_split_kv <= Int32(self.reduction_split_capacity),
+            "split count exceeds prepared capacity",
         )
 
         # Compute grid
@@ -1621,7 +1657,7 @@ class MlaDecodeTs(Nvfp4KVConfig):
             cache_seqs,
             cu_seqlens_q,
             block_split_kvs,
-            softmax_scale_log2,
+            scale_softmax_log2,
             output_scale,
             tile_sched_params,
             clc_tile_sched_params,
@@ -1630,6 +1666,7 @@ class MlaDecodeTs(Nvfp4KVConfig):
             tma_desc_extra_v,
             tma_desc_sparse_rope,
             tma_desc_sparse_extra_rope,
+            max_q_len,
         ).launch(
             grid=grid,
             block=[cfg.threads_per_cta, 1, 1],
@@ -1655,6 +1692,10 @@ class MlaDecodeTs(Nvfp4KVConfig):
                     cu_seqlens_q,
                     block_split_kvs,
                     output_quant_args,
+                    split_divisor=tile_sched_params.split_kv_fdd
+                    if self.static_split_kv is None and not self.is_var_split_kv
+                    else None,
+                    max_q_len=max_q_len,
                 ).launch(
                     grid=(
                         (
@@ -1675,33 +1716,152 @@ class MlaDecodeTs(Nvfp4KVConfig):
                     use_pdl=use_one_wave_reducer_pdl,
                 )
             else:
-                logical_query_rows = self.num_heads * self.seq_len_q
-                self.reduction_kernel(
-                    o,
-                    lse,
-                    acc_o,
-                    acc_lse,
-                    kernel_split_kv,
-                    cache_seqs,
-                    cu_seqlens_q,
-                    block_split_kvs,
-                ).launch(
-                    grid=(
-                        ceil_div(logical_query_rows, REDUCTION_ROWS_PER_CTA),
-                        1,
-                        batch_size,
-                    ),
-                    block=[REDUCTION_ROWS_PER_CTA * REDUCTION_THREADS_PER_ROW, 1, 1],
-                    smem=(
-                        REDUCTION_ROWS_PER_CTA
-                        * self.reduction_split_capacity
-                        * self.lse_dtype.width
-                        // 8
-                    ),
-                    stream=stream,
-                    min_blocks_per_mp=2,
-                    use_pdl=use_one_wave_reducer_pdl,
-                )
+                logical_query_rows = self.num_heads * seq_len_q
+                if cutlass.const_expr(
+                    self.reduction_split_capacity > 4
+                    and self.static_split_kv is None
+                    and not self.is_var_split_kv
+                ):
+                    # Allocation capacity is independent of the active split
+                    # prefix. Keep the existing S2/S4 reducer schedules and their
+                    # small scale rings; all three entrypoints live
+                    # in one cached module and retain runtime workspace strides.
+                    if kernel_split_kv <= Int32(2):
+                        self.reduction_kernel(
+                            o,
+                            lse,
+                            acc_o,
+                            acc_lse,
+                            kernel_split_kv,
+                            cache_seqs,
+                            cu_seqlens_q,
+                            block_split_kvs,
+                            split_divisor=tile_sched_params.split_kv_fdd
+                            if self.static_split_kv is None and not self.is_var_split_kv
+                            else None,
+                            max_q_len=max_q_len,
+                            local_split_capacity=2,
+                        ).launch(
+                            grid=(
+                                ceil_div(logical_query_rows, REDUCTION_ROWS_PER_CTA),
+                                1,
+                                batch_size,
+                            ),
+                            block=[
+                                REDUCTION_ROWS_PER_CTA * REDUCTION_THREADS_PER_ROW,
+                                1,
+                                1,
+                            ],
+                            smem=(
+                                REDUCTION_ROWS_PER_CTA * 2 * self.lse_dtype.width // 8
+                            ),
+                            stream=stream,
+                            min_blocks_per_mp=2,
+                            use_pdl=use_one_wave_reducer_pdl,
+                        )
+                    elif kernel_split_kv <= Int32(4):
+                        self.reduction_kernel(
+                            o,
+                            lse,
+                            acc_o,
+                            acc_lse,
+                            kernel_split_kv,
+                            cache_seqs,
+                            cu_seqlens_q,
+                            block_split_kvs,
+                            split_divisor=tile_sched_params.split_kv_fdd
+                            if self.static_split_kv is None and not self.is_var_split_kv
+                            else None,
+                            max_q_len=max_q_len,
+                            local_split_capacity=4,
+                        ).launch(
+                            grid=(
+                                ceil_div(logical_query_rows, REDUCTION_ROWS_PER_CTA),
+                                1,
+                                batch_size,
+                            ),
+                            block=[
+                                REDUCTION_ROWS_PER_CTA * REDUCTION_THREADS_PER_ROW,
+                                1,
+                                1,
+                            ],
+                            smem=(
+                                REDUCTION_ROWS_PER_CTA * 4 * self.lse_dtype.width // 8
+                            ),
+                            stream=stream,
+                            min_blocks_per_mp=2,
+                            use_pdl=use_one_wave_reducer_pdl,
+                        )
+                    else:
+                        self.reduction_kernel(
+                            o,
+                            lse,
+                            acc_o,
+                            acc_lse,
+                            kernel_split_kv,
+                            cache_seqs,
+                            cu_seqlens_q,
+                            block_split_kvs,
+                            split_divisor=tile_sched_params.split_kv_fdd
+                            if self.static_split_kv is None and not self.is_var_split_kv
+                            else None,
+                            max_q_len=max_q_len,
+                        ).launch(
+                            grid=(
+                                ceil_div(logical_query_rows, REDUCTION_ROWS_PER_CTA),
+                                1,
+                                batch_size,
+                            ),
+                            block=[
+                                REDUCTION_ROWS_PER_CTA * REDUCTION_THREADS_PER_ROW,
+                                1,
+                                1,
+                            ],
+                            smem=(
+                                REDUCTION_ROWS_PER_CTA
+                                * self.reduction_split_capacity
+                                * self.lse_dtype.width
+                                // 8
+                            ),
+                            stream=stream,
+                            min_blocks_per_mp=2,
+                            use_pdl=use_one_wave_reducer_pdl,
+                        )
+                else:
+                    self.reduction_kernel(
+                        o,
+                        lse,
+                        acc_o,
+                        acc_lse,
+                        kernel_split_kv,
+                        cache_seqs,
+                        cu_seqlens_q,
+                        block_split_kvs,
+                        split_divisor=tile_sched_params.split_kv_fdd
+                        if self.static_split_kv is None and not self.is_var_split_kv
+                        else None,
+                        max_q_len=max_q_len,
+                    ).launch(
+                        grid=(
+                            ceil_div(logical_query_rows, REDUCTION_ROWS_PER_CTA),
+                            1,
+                            batch_size,
+                        ),
+                        block=[
+                            REDUCTION_ROWS_PER_CTA * REDUCTION_THREADS_PER_ROW,
+                            1,
+                            1,
+                        ],
+                        smem=(
+                            REDUCTION_ROWS_PER_CTA
+                            * self.reduction_split_capacity
+                            * self.lse_dtype.width
+                            // 8
+                        ),
+                        stream=stream,
+                        min_blocks_per_mp=2,
+                        use_pdl=use_one_wave_reducer_pdl,
+                    )
 
     @cute.kernel
     def split_kv_kernel(
@@ -1722,7 +1882,7 @@ class MlaDecodeTs(Nvfp4KVConfig):
         cache_seqs: cute.Tensor,
         cu_seqlens_q: cute.Tensor | None,
         block_split_kvs: object,
-        softmax_scale_log2: cutlass.Float32,
+        scale_softmax_log2: cutlass.Float32,
         output_scale: cutlass.Float32,
         tile_sched_params: MLAStaticTileSchedulerParams,
         clc_tile_sched_params: object,
@@ -1731,22 +1891,18 @@ class MlaDecodeTs(Nvfp4KVConfig):
         tma_desc_extra_v: cutlass.GridConstant[cuda.TensorMap] = None,
         tma_desc_sparse_rope: cutlass.GridConstant[cuda.TensorMap] = None,
         tma_desc_sparse_extra_rope: cutlass.GridConstant[cuda.TensorMap] = None,
+        max_q_len: cutlass.Int32 = 0,
     ) -> None:
         """MLA decode TS kernel: persistent tile-scheduled execution."""
+        seq_len_q = self.seq_len_q if self.fixed_seqlen else max_q_len
         if cutlass.const_expr(self.direct_sparse):
             from ..helpers.sparse_indices import bind_sparse_kv_indices
 
             si, ci, sl, cl, sinks, ks = block_split_kvs
-            capacity = cutlass.const_expr(
-                max(
-                    256,
-                    (
-                        (self.direct_sparse_capacities[0] + 127) // 128
-                        + (self.direct_sparse_capacities[1] + 127) // 128
-                    )
-                    * 128,
-                )
-            )
+            capacity = ((Int32(si.shape[-1]) + 127) // 128) * 128
+            if cutlass.const_expr(self.direct_sparse_capacities[1] > 0):
+                capacity = capacity + ((Int32(ci.shape[-1]) + 127) // 128) * 128
+            capacity = cute.math.max(Int32(256), capacity)
             request = None
             if cutlass.const_expr(not self.is_persistent):
                 _, row = divmod_constexpr_power_of_two_or_fdd(
@@ -1767,7 +1923,9 @@ class MlaDecodeTs(Nvfp4KVConfig):
                 primary_tensor_scale=ks if self.kv_cache_format == "fp8" else None,
             )
         cfg = self._make_config()
-        num_query_tiles = self.num_q_tiles
+        num_query_tiles = (
+            seq_len_q * self.num_heads + self.mma_qk_tiler_mn[0] - 1
+        ) // self.mma_qk_tiler_mn[0]
         use_clc_dynamic = self.is_persistent and not cfg.is_fp8_qkv()
         tiled_mma_qk = None
         if cutlass.const_expr(cfg.is_fp8_qkv()):
@@ -2010,25 +2168,26 @@ class MlaDecodeTs(Nvfp4KVConfig):
             _, q_len = query_batch_bounds(
                 cu_seqlens_q,
                 tile_batch_idx,
-                self.seq_len_q,
+                seq_len_q,
             )
             query_tile_has_rows = runtime_flat_query_tile_has_rows(
                 tile_seq_q_idx,
                 self.mma_qk_tiler_mn[0],
                 self.num_heads,
-                self.seq_len_q,
+                seq_len_q,
                 cu_seqlens_q,
                 tile_batch_idx,
             )
             if cutlass.const_expr(
-                cfg.mask_type == MaskType.CAUSAL.value and self.seq_len_q > 1
+                cfg.mask_type == MaskType.CAUSAL.value
+                and (not self.fixed_seqlen or self.seq_len_q > 1)
             ):
                 _, _, logical_q_idx, _, _ = flat_query_row_state(
                     Int32(self.mma_qk_tiler_mn[0] - 1),
                     tile_seq_q_idx,
                     self.mma_qk_tiler_mn[0],
                     self.num_heads,
-                    self.seq_len_q,
+                    seq_len_q,
                     cu_seqlens_q,
                     tile_batch_idx,
                 )
@@ -2057,6 +2216,9 @@ class MlaDecodeTs(Nvfp4KVConfig):
                 k_tile_total,
                 split_kv_cap,
                 tile_split_kv_idx,
+                split_divisor=tile_sched_params.split_kv_fdd
+                if self.static_split_kv is None and not self.is_var_split_kv
+                else None,
             )
             exit_early = k_tile_count <= Int32(0)
             if cutlass.const_expr(self.is_persistent):
@@ -2143,7 +2305,7 @@ class MlaDecodeTs(Nvfp4KVConfig):
                 static_seq_len_k=self.static_seq_len_k,
                 cu_seqlens_q=cu_seqlens_q,
                 logical_num_heads_q=self.num_heads,
-                logical_seq_len_q=self.seq_len_q,
+                logical_seq_len_q=seq_len_q,
                 static_problem_shape_b=None,
                 static_problem_shape_s=num_query_tiles,
                 use_clc_dynamic=use_clc_dynamic,
@@ -2176,7 +2338,7 @@ class MlaDecodeTs(Nvfp4KVConfig):
                 blk_coord=blk_coord,
                 tidx=tidx,
                 output=o,
-                atten_sinks=sinks if self.fuse_sparse_epilogue else None,
+                attention_sinks=sinks if self.fuse_sparse_epilogue else None,
                 lse_in_natural_log=self.fuse_sparse_epilogue,
                 output_quant=self.output_quant if self.fuse_sparse_epilogue else None,
                 output_quant_args=output_quant_args,
@@ -2191,7 +2353,7 @@ class MlaDecodeTs(Nvfp4KVConfig):
                 cu_seqlens_q=cu_seqlens_q,
                 split_kv=max_split_kv,
                 logical_num_heads_q=self.num_heads,
-                logical_seq_len_q=self.seq_len_q,
+                logical_seq_len_q=seq_len_q,
                 tiled_mma_qk=tiled_mma_qk,
             )
 
@@ -2254,7 +2416,7 @@ class MlaDecodeTs(Nvfp4KVConfig):
             named_res["tmem_corr"].tmem_base_addr = tmem_base_addr
 
             # Set runtime params on TmemS (softmax)
-            named_res["tmem_s"].softmax_scale_log2 = softmax_scale_log2
+            named_res["tmem_s"].scale_softmax_log2 = scale_softmax_log2
             named_res["tmem_corr"].page_offsets = page_offsets
             named_res["tmem_corr"].score_resource = named_res["tmem_s"]
             named_res["gmem_o"].page_offsets = page_offsets
@@ -2266,7 +2428,7 @@ class MlaDecodeTs(Nvfp4KVConfig):
 
             # Set runtime params on GmemO (epilogue)
             named_res["gmem_o"].output_scale = output_scale
-            named_res["gmem_o"].softmax_scale_log2 = softmax_scale_log2
+            named_res["gmem_o"].scale_softmax_log2 = scale_softmax_log2
             named_res["gmem_o"].smem_exchange = epilogue_exchange_arr.data_ptr().toint(
                 Int32
             )
@@ -2307,6 +2469,7 @@ class MlaDecodeTs(Nvfp4KVConfig):
         workspace: cute.Tensor,
     ):
         """Construct acc_o and acc_lse tensors from the workspace buffer."""
+        # Allocation is SM-bounded; live tensors use the runtime split stride.
         acc_o, acc_lse = None, None
         if cutlass.const_expr(workspace is not None):
             # Workspace strides are aligned to 256 bits, expressed in Float16
@@ -2347,8 +2510,12 @@ class MlaDecodeTs(Nvfp4KVConfig):
         cache_seqs: cute.Tensor,
         cu_seqlens_q: cute.Tensor | None,
         block_split_kvs: cute.Tensor,
+        split_divisor=None,
+        max_q_len: cutlass.Int32 = 0,
+        local_split_capacity: cutlass.Constexpr[int] = 0,
     ):
         """Dispatch the throughput 2CTA split-KV reduction body."""
+        seq_len_q = self.seq_len_q if self.fixed_seqlen else max_q_len
         cfg = make_mla_decode_config(
             mma_qk_tiler_mn=self.mma_qk_tiler_mn,
             mma_pv_tiler_mn=self.mma_pv_tiler_mn,
@@ -2357,6 +2524,7 @@ class MlaDecodeTs(Nvfp4KVConfig):
             qkv_dtype=self.qkv_dtype,
             o_dtype=self.out_dtype,
             mask_type=self.mask_type,
+            lse_base_on_e=self.lse_base_on_e,
         )
         if cutlass.const_expr(not self.is_persistent):
             prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
@@ -2371,8 +2539,12 @@ class MlaDecodeTs(Nvfp4KVConfig):
             cu_seqlens_q,
             block_split_kvs,
             cfg,
-            self.reduction_split_capacity,
+            local_split_capacity
+            if local_split_capacity > 0
+            else self.reduction_split_capacity,
             REDUCTION_ROWS_PER_CTA,
+            split_divisor=split_divisor,
+            runtime_seq_len_q=seq_len_q,
         )
 
     @cute.kernel
@@ -2387,8 +2559,11 @@ class MlaDecodeTs(Nvfp4KVConfig):
         cu_seqlens_q: cute.Tensor | None,
         block_split_kvs: object,
         output_quant_args=None,
+        split_divisor=None,
+        max_q_len: cutlass.Int32 = 0,
     ):
         """Dispatch the high-split fixed-D512 cluster reducer."""
+        seq_len_q = self.seq_len_q if self.fixed_seqlen else max_q_len
 
         cfg = make_mla_decode_config(
             mma_qk_tiler_mn=self.mma_qk_tiler_mn,
@@ -2398,17 +2573,18 @@ class MlaDecodeTs(Nvfp4KVConfig):
             qkv_dtype=self.qkv_dtype,
             o_dtype=self.out_dtype,
             mask_type=self.mask_type,
+            lse_base_on_e=self.lse_base_on_e,
         )
         if cutlass.const_expr(not self.is_persistent):
             prims.griddepcontrol(kind=prims.GridDepAction.WAIT)
-        atten_sinks = None
+        attention_sinks = None
         if cutlass.const_expr(self.fuse_sparse_reduction):
-            atten_sinks = block_split_kvs[4]
+            attention_sinks = block_split_kvs[4]
             block_split_kvs = None
         topology = self._reduction_topology()
         run_parallel_reduction_kernel(
             self.num_heads,
-            self.seq_len_q,
+            seq_len_q,
             self.is_var_split_kv,
             output,
             lse,
@@ -2422,8 +2598,9 @@ class MlaDecodeTs(Nvfp4KVConfig):
             topology.actual_splits,
             topology.cluster_size,
             topology.slots_per_rank,
-            atten_sinks,
+            attention_sinks,
             self.fuse_sparse_reduction,
             self.output_quant,
             output_quant_args,
+            split_divisor=split_divisor,
         )

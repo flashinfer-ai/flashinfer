@@ -48,7 +48,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 }
 
 #define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
 #define THREADS 32
 #define LAUNCH_MIN_BLOCKS 1
 
@@ -75,7 +74,7 @@ kernel_cake_warp_decode_b13a3c739fad28717595(__nv_bfloat16* __restrict__ route_o
     int route_base = token * 10;
     float weights[10];
     if (feature < M && token < num_tokens) {
-        weights[0] = (float)route_weights[route_base + 0];
+        weights[0] = (float)route_weights[route_base];
         weights[1] = (float)route_weights[route_base + 1];
         weights[2] = (float)route_weights[route_base + 2];
         weights[3] = (float)route_weights[route_base + 3];
@@ -89,7 +88,7 @@ kernel_cake_warp_decode_b13a3c739fad28717595(__nv_bfloat16* __restrict__ route_o
     asm volatile("griddepcontrol.wait;" ::: "memory");
     if (feature < M && token < num_tokens) {
         __nv_bfloat16 partials[10];
-        partials[0] = route_outputs[(route_base + 0) * route_stride + feature];
+        partials[0] = route_outputs[route_base * route_stride + feature];
         partials[1] = route_outputs[(route_base + 1) * route_stride + feature];
         partials[2] = route_outputs[(route_base + 2) * route_stride + feature];
         partials[3] = route_outputs[(route_base + 3) * route_stride + feature];

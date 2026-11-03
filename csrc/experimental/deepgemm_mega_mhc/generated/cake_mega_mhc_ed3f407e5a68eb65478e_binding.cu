@@ -388,8 +388,6 @@ void Run(TensorView a_residual_map, TensorView a_x_map, TensorView a_fnp_map, Te
       << KERNEL_NAME << ": requires (num_splits <= 64)";
   TVM_FFI_CHECK((a_num_ctas >= 1LL), ValueError)
       << KERNEL_NAME << ": requires (num_ctas >= 1)";
-  TVM_FFI_CHECK((CheckedMul(a_num_ctas, 64LL) >= a_num_tokens), ValueError)
-      << KERNEL_NAME << ": requires ((num_ctas * 64) >= num_tokens)";
   TVM_FFI_CHECK((a_num_sinkhorn_iters >= 1LL), ValueError)
       << KERNEL_NAME << ": requires (num_sinkhorn_iters >= 1)";
   TVM_FFI_CHECK((a_fp8_sf_ue8m0 <= 1LL), ValueError)

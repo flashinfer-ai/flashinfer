@@ -846,15 +846,15 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t4_sm103a(int* __restrict__ t
         { // load_b_main
             asm volatile("griddepcontrol.wait;" ::: "memory");
             asm volatile("barrier.sync 11, 256;" ::: "memory");
-            int direct_w_0 = 0 + lane;
+            int direct_w_0 = lane;
             if (direct_w_0 < 40) {
-                smem_xsf[0 + direct_w_0] = x_sf[0 + direct_w_0];
+                smem_xsf[direct_w_0] = x_sf[direct_w_0];
             }
             int direct_w_1 = 32 + lane;
             if (direct_w_1 < 40) {
-                smem_xsf[0 + direct_w_1] = x_sf[0 + direct_w_1];
+                smem_xsf[direct_w_1] = x_sf[direct_w_1];
             }
-            int direct_w_2 = 0 + lane;
+            int direct_w_2 = lane;
             if (direct_w_2 < 40) {
                 smem_xsf[40 + direct_w_2] = x_sf[40 + direct_w_2];
             }
@@ -862,7 +862,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t4_sm103a(int* __restrict__ t
             if (direct_w_3 < 40) {
                 smem_xsf[40 + direct_w_3] = x_sf[40 + direct_w_3];
             }
-            int direct_w_4 = 0 + lane;
+            int direct_w_4 = lane;
             if (direct_w_4 < 40) {
                 smem_xsf[80 + direct_w_4] = x_sf[80 + direct_w_4];
             }
@@ -870,7 +870,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t4_sm103a(int* __restrict__ t
             if (direct_w_5 < 40) {
                 smem_xsf[80 + direct_w_5] = x_sf[80 + direct_w_5];
             }
-            int direct_w_6 = 0 + lane;
+            int direct_w_6 = lane;
             if (direct_w_6 < 40) {
                 smem_xsf[120 + direct_w_6] = x_sf[120 + direct_w_6];
             }
@@ -1162,7 +1162,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t4_sm103a(int* __restrict__ t
                     if (direct_hit_0 != 0) {
                         int _find_first_set_13 = __ffs(direct_hit_0);
                         unsigned int direct_lane_0 = _find_first_set_13 - 1;
-                        direct_expert = 0 + direct_lane_0;
+                        direct_expert = direct_lane_0;
                         if (direct_phase == 2) {
                             unsigned int _shfl_sync_14 = __shfl_sync(0xFFFFFFFF, counts[0], direct_lane_0);
                             direct_valid = _shfl_sync_14;
@@ -1420,8 +1420,8 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t4_sm103a(int* __restrict__ t
                 if (task_4[0] == 1) {
                     unsigned int direct_routed = 0;
                     if (lane < 4) {
-                        int direct_route_0 = topk_idx_i32[(lane * 6 + 0) * 2] - local_expert_offset;
-                        float direct_rw_0 = topk_weights[lane * 6 + 0];
+                        int direct_route_0 = topk_idx_i32[lane * 6 * 2] - local_expert_offset;
+                        float direct_rw_0 = topk_weights[lane * 6];
                         if (direct_routed == 0 && (unsigned int)direct_route_0 == task_4[1]) {
                             direct_routed = 1;
                             pre_weight = direct_rw_0;
@@ -1969,7 +1969,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t4_sm103a(int* __restrict__ t
                     }
                     unsigned int routed = __ballot_sync(0xFFFFFFFF, stored_row >= 0);
                     unsigned int row_0 = __shfl_sync(0xFFFFFFFF, (unsigned int)stored_row, 0);
-                    if ((routed >> 0 & 1) != 0) {
+                    if ((routed & 1) != 0) {
                         {
                             const uint4* _vptr_24 = reinterpret_cast<const uint4*>(expert_output + ((unsigned long long)row_0 * 5120 + lane_off) + 0);
                             uint4* _vdst_24 = reinterpret_cast<uint4*>(&values[0]);
@@ -2042,7 +2042,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t4_sm103a(int* __restrict__ t
                     reduced[5] = 0.0f;
                     reduced[6] = 0.0f;
                     reduced[7] = 0.0f;
-                    if ((routed >> 0 & 1) != 0) {
+                    if ((routed & 1) != 0) {
                         float _bf16x2_add_f32_0[2];
                         asm volatile(
                             "{\n\t"

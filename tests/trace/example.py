@@ -141,6 +141,7 @@ rmsnorm_quant_h7168.json
 silu_and_mul_h16384.json
 silu_and_mul_mxfp8_experts_quantize_k8192.json
 silu_and_mul_nvfp4_quantize_k16384.json
+single_head_paged_mqa_logits_page_size64_dim128.json
 token_sparse_kv_indices_top_k2048_lists2.json
 top_k_sampling_v128256.json
 top_k_top_p_sampling_v128256.json
@@ -2791,30 +2792,33 @@ for _pts_semantic_PS in (32, 4):
         )
 
         _pts_wrapper = _PrimTSDecodeWrapper(kv_layout="HND")
-        _pts_wrapper.plan(
-            _pts_q.device,
-            _pts_B,
-            _pts_Hq,
-            _pts_Hkv,
-            _pts_D,
-            _pts_semantic_PS,
-            _pts_SK,
-            max_seq_len_q=_pts_SQ,
-            packed_query=False,
-            q_data_type=_pts_q.dtype,
-            k_data_type=_pts_k.dtype,
-            v_data_type=_pts_v.dtype,
-            o_data_type=torch.bfloat16,
-            mask_type="causal",
-            workspace_buffer=_pts_workspace,
-            storage_page_size=_pts_PS,
-        )
-        _pts_wrapper.run(
-            _pts_q,
-            _pts_cache,
-            _pts_seq_lens,
-            _pts_block_tables,
-        )
+        for _pts_plan_seq_lens in (None, [_pts_SK] * _pts_B):
+            _pts_wrapper.plan(
+                _pts_q.device,
+                _pts_B,
+                _pts_Hq,
+                _pts_Hkv,
+                _pts_D,
+                _pts_semantic_PS,
+                _pts_SK,
+                max_q_len=_pts_SQ,
+                packed_query=False,
+                q_dtype=_pts_q.dtype,
+                k_dtype=_pts_k.dtype,
+                v_dtype=_pts_v.dtype,
+                out_dtype=torch.bfloat16,
+                mask_type="causal",
+                workspace_buffer=_pts_workspace,
+                storage_page_size=_pts_PS,
+                seq_lens_kv=_pts_plan_seq_lens,
+            )
+            _pts_wrapper.run(
+                _pts_q,
+                _pts_cache,
+                None if _pts_plan_seq_lens is not None else _pts_seq_lens,
+                _pts_block_tables,
+            )
+
 
 # PrimTS MLA decode: the same causal SQ4 contract through all three public
 # surfaces (SM100/SM103 only).
@@ -2872,7 +2876,7 @@ with contextlib.suppress(Exception):
         _pmla_KPE,
         _pmla_PS,
         _pmla_SK,
-        max_seq_len_q=_pmla_SQ,
+        max_q_len=_pmla_SQ,
         q_dtype=_pmla_q.dtype,
         kv_dtype=_pmla_cache.dtype,
         out_dtype=torch.bfloat16,
@@ -2889,7 +2893,7 @@ with contextlib.suppress(Exception):
         max_kv_len=_pmla_SK,
         kv_lora_rank=_pmla_CKV,
         qk_rope_head_dim=_pmla_KPE,
-        max_seq_len_q=_pmla_SQ,
+        max_q_len=_pmla_SQ,
         mask_type="causal",
     )
 
@@ -2902,11 +2906,11 @@ with contextlib.suppress(Exception):
         _pmla_KPE,
         _pmla_PS,
         _pmla_SK,
-        max_seq_len_q=_pmla_SQ,
+        max_q_len=_pmla_SQ,
         packed_query=False,
-        q_data_type=_pmla_q.dtype,
-        kv_data_type=_pmla_cache.dtype,
-        o_data_type=torch.bfloat16,
+        q_dtype=_pmla_q.dtype,
+        kv_dtype=_pmla_cache.dtype,
+        out_dtype=torch.bfloat16,
         mask_type="causal",
         workspace_buffer=_pmla_workspace,
     )
@@ -3480,4 +3484,17 @@ group_union_masks.fi_trace(
     union_sizes=torch.empty(2, dtype=torch.int32),
     mask=torch.empty(8, 256, dtype=torch.int32),
     num_keys=16384,
+)
+
+# ── Single-head paged MQA logits ──────────────────────────────────────────────
+from flashinfer.attn_scores import single_head_paged_mqa_logits
+
+single_head_paged_mqa_logits.fi_trace(
+    save_dir=SAVE_DIR,
+    query=torch.empty(8, 128, dtype=torch.bfloat16),
+    key_cache=torch.empty(64, 64, 128, dtype=torch.bfloat16),
+    block_table=torch.empty(4, 16, dtype=torch.int32),
+    context_lengths=torch.empty(4, dtype=torch.int32),
+    requests=torch.arange(4, dtype=torch.int32),
+    scores=torch.empty(8, 1024),
 )

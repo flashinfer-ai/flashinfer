@@ -34,8 +34,19 @@ GRID = [
     ),  # a page off the powers of two: legal for the block, not for the paged scorer's shift
     (dict(index_list_form="per_row"), 4, 16, True),
     (dict(index_list_form="shared"), 1, 16, False),
-    (dict(index_cache_dtype=torch.float8_e4m3fn), 1, 16, False),
+    (
+        dict(index_cache_dtype=torch.float8_e4m3fn),
+        1,
+        16,
+        True,
+    ),  # the e4m3 compressed-key cache: served since the 4c8e24355 re-vendor
     (dict(index_cache_dtype=torch.bfloat16), 1, 16, True),
+    (
+        dict(index_compress_rounding="hf"),
+        4,
+        16,
+        True,
+    ),  # the indexer writers' rounding convention: a geometry field, served
     # the TP 2 / TP 4 shards: the declaration admits them, the probe declines them by name -- their slabs (N 7296 / 4224) are off
     # the capture-safe small-M projection route (`proj_slab_route`, decided at the part's SM count; mocked to 204 below)
     (dict(num_qo_heads=12, num_kv_heads=1), 1, 16, False),
@@ -44,6 +55,92 @@ GRID = [
     (dict(top_k=516), 1, 16, False),
     (dict(rope_dim=128), 1, 16, True),
     (dict(rope_dim=32), 1, 16, False),
+]
+
+
+# the extend / prefill forms' cells: (geometry overrides, batch, T, page, max_pages, cap): served
+EXTEND_GRID = [
+    (
+        dict(),
+        1,
+        17,
+        16,
+        32,
+        4,
+        True,
+    ),  # past the decode scorer's envelope: the EXTEND step serves it
+    (dict(), 1, 128, 16, 32, 4, True),  # the small-M route's last row count
+    (dict(), 2, 64, 32, 16, 8, True),  # batch 2 x 64 = 128 rows, page 32, cap 8
+    (
+        dict(index_cache_dtype=torch.float8_e4m3fn),
+        1,
+        64,
+        16,
+        32,
+        4,
+        True,
+    ),  # the e4m3 cache on the extend form
+    (dict(index_compress_rounding="hf"), 1, 20, 16, 32, 4, True),
+    (
+        dict(),
+        1,
+        129,
+        16,
+        32,
+        4,
+        True,
+    ),  # past 128 rows: the band slab takes the GEMM engine's baseline tile on the JIT route (the 6b21be0e0 pin; no projection rows bound)
+    (dict(), 2, 65, 16, 32, 4, True),  # 130 rows at batch 2: served the same way
+    (dict(), 1, 512, 16, 32, 4, True),  # the T 512 prefill chunk
+    (
+        dict(),
+        1,
+        2048,
+        16,
+        128,
+        4,
+        True,
+    ),  # the T 2048 chunk (the table's reach 2048 met with equality)
+    (dict(), 4, 512, 16, 160, 4, True),  # batch 4 x T 512 = 2048 rows
+    (
+        dict(),
+        32,
+        2048,
+        16,
+        128,
+        4,
+        False,
+    ),  # 65,536 rows in ONE run: past the compressor's launch-grid bound at this pin (the FlashInfer-side `indexer_extend_grid_rows` row; the vendored declaration itself admits the shape)
+    (
+        dict(),
+        1,
+        65535,
+        16,
+        4096,
+        4,
+        True,
+    ),  # the launch-grid bound met with equality: served (the chunk within the table's reach 4096 x 16 = 65,536 tokens)
+    (dict(), 1, 16, 48, 32, 4, False),  # a page off the powers of two
+    (dict(), 1, 16, 16, 32, 2, False),  # the ring floor: cap >= 3
+    (
+        dict(),
+        1,
+        129,
+        16,
+        8,
+        4,
+        False,
+    ),  # a chunk longer than the table's reach (8 x 16 = 128 tokens): the FE's own decline stays
+    (dict(index_list_form="shared"), 1, 20, 16, 32, 4, False),
+    (
+        dict(num_qo_heads=12, num_kv_heads=1),
+        1,
+        20,
+        16,
+        32,
+        4,
+        False,
+    ),  # the TP 2 shard: proj_slab_route
 ]
 
 
@@ -93,13 +190,72 @@ def _declare(geometry, q_len, page, batch=2, **knobs):
         fuse_gate=True,
         fuse_prepare=True,
         sample_index_kv_cache=torch.zeros(
-            9, rows, 1, geometry.index_head_dim, dtype=dt
+            9,
+            rows,
+            1,
+            geometry.index_head_dim,
+            dtype=geometry.resolved_index_cache_dtype,
         ),
         sample_index_state_cache=torch.zeros(
             b + 1, cap, 1, geometry.index_head_dim, dtype=dt
         ),
         sample_index_state_block_table=torch.zeros(b, 1, dtype=torch.int32),
         rope_position_tables_only=True,
+        **knobs,
+    )
+
+
+def _declare_extend(geometry, q_len, page, batch=1, max_pages=32, cap=4, **knobs):
+    """The vendored declaration ``api.prepare`` builds for the extend / prefill forms (host tensors; no device, nothing compiled): the
+    ``"extend"`` pin, the stack's ring slots, the per-token tables, ``fuse_prepare`` None, the ring of ``cap`` rows, the cache in the
+    geometry's dtype."""
+    from flashinfer.experimental.qwen_3_5_block._cudnn_frost.gated_attention_block import (
+        GatedAttentionBlockFwd as Fwd,
+    )
+
+    g = geometry.frost()
+    dt, d, dm, hq, hkv = (
+        torch.bfloat16,
+        geometry.head_dim,
+        geometry.d_model,
+        geometry.num_qo_heads,
+        geometry.num_kv_heads,
+    )
+    mk = lambda *shape, dtype=dt: torch.empty(*shape, dtype=dtype)  # noqa: E731
+    b = int(batch)
+    rows = max(page // geometry.block_size, 1)
+    return Fwd(
+        mk(b, q_len, dm),
+        mk(g.n_qkvg, dm),
+        torch.ones(d, dtype=dt),
+        torch.ones(d, dtype=dt),
+        mk(b, q_len, geometry.rope_dim),
+        mk(b, q_len, geometry.rope_dim),
+        mk(dm, hq * d),
+        mk(b, q_len, dm),
+        g,
+        paged_kv_page_size=page,
+        kv_source="paged",
+        sample_k_cache=torch.zeros(9, hkv, page, d, dtype=dt),
+        sample_v_cache=torch.zeros(9, hkv, page, d, dtype=dt),
+        sample_block_table=torch.zeros(b, int(max_pages), dtype=torch.int32),
+        fuse_norm_rope=False,
+        fuse_gate=True,
+        fuse_prepare=None,
+        sample_index_kv_cache=torch.zeros(
+            9,
+            rows,
+            1,
+            geometry.index_head_dim,
+            dtype=geometry.resolved_index_cache_dtype,
+        ),
+        sample_index_state_cache=torch.zeros(
+            b + 1, cap, 1, geometry.index_head_dim, dtype=dt
+        ),
+        sample_index_state_block_table=torch.zeros(b, 1, dtype=torch.int32),
+        index_state_slot_mapping_present=True,
+        rope_position_tables_only=False,
+        index_select_form="extend",
         **knobs,
     )
 
@@ -261,6 +417,34 @@ def test_vendored_rule_tripwire_passes_and_fires_on_a_drift_of_every_mirrored_co
         == ("sparse_d256_f16", "sparse_lean_d256_f16")
     )
     assert facts["sparse_tile_lean_default_cc107"] is True
+    # the EXTEND step's rows (the 4c8e24355 pin): the envelope's four fields and the tree's own constants behind them, one spelling
+    assert (
+        facts["index_select_forms"]
+        == facts["index_select_forms_tree"]
+        == support.INDEX_SELECT_FORMS
+        == ("auto", "decode", "extend")
+    )
+    assert (
+        facts["index_extend_ring_rows_min"] == support.INDEX_EXTEND_RING_ROWS_MIN == 3
+        and facts["index_extend_ring_rows_min_is_the_ring_extra"] is True
+    )
+    assert (
+        facts["index_extend_select_budget_bytes"]
+        == facts["index_extend_select_budget_bytes_tree"]
+        == support.INDEX_EXTEND_SELECT_BUDGET_BYTES
+        == 512 << 20
+    )
+    assert (
+        facts["index_compress_roundings"]
+        == facts["index_compress_roundings_tree"]
+        == support.INDEX_COMPRESS_ROUNDINGS
+        == ("single", "hf")
+    )
+    assert (
+        facts["index_compress_rounding_default_tree"]
+        == support.INDEX_COMPRESS_ROUNDING_DEFAULT
+        == "single"
+    )
     # the bound's unit as behaviour: the rule's reading over (batch, q_len) cells at cc 10.7 / top_k 512 / two KV heads -- True iff
     # batch x 2 <= 4 whatever the step width (the 7301fad21 pin's B x H_kv x q_len count read (1, 3) / (1, 4) / (2, 4) False)
     assert (
@@ -290,6 +474,26 @@ def test_vendored_rule_tripwire_passes_and_fires_on_a_drift_of_every_mirrored_co
             "DECLINE_KEYS",
             support.DECLINE_KEYS + ("indexer_moved_row",),
             "indexer_moved_row",
+        ),
+        # the EXTEND step's rows: the step forms, the ring floor (and its one spelling with the ring's extra rows), the select budget,
+        # the rounding conventions -- a re-vendor that moves any of them fails here before it advertises a stale rule
+        ("INDEX_SELECT_FORMS", ("auto", "decode"), "index_select_forms"),
+        ("INDEX_EXTEND_RING_ROWS_MIN", 4, "index_extend_ring_rows_min"),
+        (
+            "INDEX_EXTEND_SELECT_BUDGET_BYTES",
+            1 << 20,
+            "index_extend_select_budget_bytes",
+        ),
+        ("INDEX_COMPRESS_ROUNDINGS", ("single",), "index_compress_roundings"),
+        (
+            "INDEX_COMPRESS_ROUNDING_DEFAULT",
+            "hf",
+            "index_compress_rounding_default_tree",
+        ),
+        (
+            "DECLINE_KEYS",
+            support.DECLINE_KEYS + ("indexer_extend_moved_row",),
+            "indexer_extend_moved_row",
         ),
         # the sparse core's body knob (the lean decode tile): the vocabulary, the kernel_template names, the AUTO placement bound
         ("SPARSE_TILE_FORMS", ("auto", "lean"), "sparse_tile_forms"),
@@ -323,6 +527,26 @@ def test_vendored_rule_tripwire_passes_and_fires_on_a_drift_of_every_mirrored_co
             setattr(support, name, keep)
             support.check_vendored_rules.cache_clear()
     assert support.check_vendored_rules()["index_query_rows_max"] == 64
+    # the lift's premise (the 6b21be0e0 pin): the band slab names a JIT tile past the small-M route at every served SM count -- a tree whose
+    # resolver loses the large-M rule (planted: the rule declines every shape) fires the tripwire by name instead of putting a chunk past
+    # 128 rows on the graph route the vendored root refuses
+    from flashinfer.experimental.qwen_3_5_block._cudnn_frost.gated_attention_block.kernels import (
+        proj_gemm,
+    )
+
+    assert facts["band_slab_jit_tile_past_small_m"] == (True,) * 6
+    keep_rule = proj_gemm.large_m_tile_config
+    try:
+        proj_gemm.large_m_tile_config = lambda *a, **k: None
+        support.check_vendored_rules.cache_clear()
+        with pytest.raises(RuntimeError, match="band_slab_jit_tile_past_small_m"):
+            support.check_vendored_rules()
+    finally:
+        proj_gemm.large_m_tile_config = keep_rule
+        support.check_vendored_rules.cache_clear()
+    assert (
+        support.check_vendored_rules()["band_slab_jit_tile_past_small_m"] == (True,) * 6
+    )
 
 
 @pytest.mark.parametrize("over, q_len, page, served", GRID)
@@ -334,10 +558,10 @@ def test_probe_verdict_matches_the_vendored_declaration(over, q_len, page, serve
     from flashinfer.qwen_3_8_block import qwen_3_8_block_support
 
     g = _geometry(**over)
-    # the light gate of prepare (what runs before any vendored code)
+    # the light gate of prepare (what runs before any vendored code; the declaration below is made at batch 2)
     light_ok, why = True, None
     try:
-        impl._light_decode_gates(g, page, q_len, None, None)
+        impl._light_decode_gates(g, page, q_len, None, None, batch_size=2)
     except NotImplementedError as exc:
         light_ok, why = False, str(exc)
     # the vendored declaration on host tensors (outside the mocks: the vendored device probe short-circuits on a CPU host); the typed
@@ -367,6 +591,61 @@ def test_probe_verdict_matches_the_vendored_declaration(over, q_len, page, serve
         )
 
 
+@pytest.mark.parametrize(
+    "over, batch, q_len, page, max_pages, cap, served", EXTEND_GRID
+)
+def test_extend_probe_verdict_matches_the_vendored_declaration(
+    over, batch, q_len, page, max_pages, cap, served
+):
+    """On the extend grid: the probe's extend record (capability mocked to Rubin) + the extend light gates (the page sizes; the launch-grid
+    bound of one run, 65,535 rows at this pin -- the only FlashInfer-side rows bound since the 6b21be0e0 pin, which the vendored declaration
+    does not know) + the vendored EXTEND declaration (``index_select_form="extend"``, the ring slots, the per-token tables, the ring of ``cap`` rows) agree
+    on the verdict; a declined cell names its reason through the gate, the light gates or the vendored row (``indexer_extend_ring_rows`` /
+    ``indexer_extend_chunk_rows``)."""
+    pytest.importorskip("cutlass")
+    from flashinfer.experimental.qwen_3_8_block import api as impl
+    from flashinfer.qwen_3_8_block import qwen_3_8_block_support
+
+    g = _geometry(**over)
+    light_ok, why = True, None
+    try:
+        impl._light_extend_gates(
+            g, "extend", page, None, None, None, batch_size=batch, q_len_per_req=q_len
+        )
+        impl._check_extend_chunk_rows("extend", q_len, max_pages, page)
+    except (NotImplementedError, ValueError) as exc:
+        light_ok, why = False, f"{type(exc).__name__}: {exc}"
+    decl_ok = True
+    if g.unsupported_reason() is None:
+        try:
+            blk = _declare_extend(
+                g, q_len, page, batch=batch, max_pages=max_pages, cap=cap
+            )
+            blk._check_declaration()
+            assert blk.indexer_extend and blk.index_select_form_resolved == "extend"
+        except (ValueError, NotImplementedError) as exc:
+            decl_ok, why = False, f"{type(exc).__name__}: {exc}"
+    with _rubin():
+        sup = qwen_3_8_block_support(torch.device("cuda", 0), g)
+    if not sup.cutedsl_ok:
+        from flashinfer.experimental.qwen_3_8_block import support
+
+        pytest.skip(
+            f"the installed CuTe DSL does not serve the block: {support.cutedsl_reason()}"
+        )
+    geometry_ok = sup.extend.served and sup.prefill.served
+    assert sup.extend.served == sup.decode.served == sup.prefill.served, (
+        "the three forms are one vendored form: served together"
+    )
+    if served:
+        assert geometry_ok and light_ok and decl_ok, (sup.reason, why)
+    else:
+        assert not (geometry_ok and light_ok and decl_ok), (sup.reason, why)
+        assert (sup.reason is not None) or (why is not None), (
+            "a declined cell names its reason somewhere"
+        )
+
+
 def test_every_errors_table_key_is_a_decline_row_and_the_texts_are_the_envelope_s():
     """The README's Errors table keys are present in ``decode.declines`` (the tripwire checks them too), and the probe hands the FE texts
     through verbatim: the one spelling for the probe and the plan-time refusal."""
@@ -385,14 +664,56 @@ def test_every_errors_table_key_is_a_decline_row_and_the_texts_are_the_envelope_
         env = GatedAttentionBlockFwd.serving_envelope(
             g.frost(), torch.bfloat16, torch.device("cuda", 0), device_cc=(10, 7)
         ).decode
-    assert sup.served and sup.forms == ("decode",)
+    assert sup.served and sup.forms == ("prefill", "extend", "decode")
     for key in support.DECLINE_KEYS:
         assert (
             key in sup.decode.declines and sup.decode.declines[key] == env.declines[key]
         ), key
+        assert (
+            sup.extend.declines[key] == sup.prefill.declines[key] == env.declines[key]
+        ), key
     assert "selects per row" in sup.decode.declines["indexer_shared_list"]
-    assert "e4m3 read arm" in sup.decode.declines["indexer_e4m3_cache"]
+    assert (
+        "indexer_e4m3_cache" not in sup.decode.declines
+    )  # the e4m3 cache is served: the FlashInfer-side row retired
     assert "in-kernel dequant arm" in sup.decode.declines["indexer_e4m3_pool"]
+    # the five extend rows verbatim off the envelope (one spelling: the vendored declaration raises these texts)
+    for key, token in (
+        (
+            "indexer_extend_fuse_prepare",
+            "the T-row chunk's ring read and its tail write live in two launches",
+        ),
+        ("indexer_extend_ring_slots", "the extend step takes the stack's ring slots"),
+        (
+            "indexer_extend_rope_tables_only",
+            "the extend step is always unfused and its query norm reads the per-token",
+        ),
+        ("indexer_extend_ring_rows", "at least block_size - 1 = 3 ring rows"),
+        ("indexer_extend_chunk_rows", "a chunk longer than the table's reach"),
+    ):
+        assert (
+            token in sup.extend.declines[key]
+            and sup.extend.declines[key] == env.declines[key]
+        ), key
+    # ONE decline table for the three forms: the vendored rows + the FlashInfer-side launch-grid row of one run at this pin on EVERY
+    # record (`indexer_extend_grid_rows`: 65,535 rows -- the vendored indexer's query compress of the decode AND the extend step launches
+    # with the run's row count as a CUDA grid dimension; not an envelope row, so not among DECLINE_KEYS, which the tripwire reads off the
+    # envelope); the previous pin's projection bound (`extend_proj_slab_rows` -- the band slab rides the JIT route at every row count)
+    # stays retired with its vocabulary
+    grid = support.EXTEND_GRID_ROWS_KEY
+    assert grid == "indexer_extend_grid_rows" and grid not in support.DECLINE_KEYS
+    assert sup.extend.declines == sup.prefill.declines == sup.decode.declines
+    assert grid in sup.decode.declines and grid not in env.declines
+    assert set(sup.decode.declines) == set(env.declines) | {grid}
+    assert (
+        sup.extend.declines[grid] == support.extend_rows_grid_text()
+        and "65535" in sup.extend.declines[grid]
+    )
+    assert sup.extend_rows_grid_max == support.EXTEND_ROWS_GRID_MAX == 65535
+    assert "extend_proj_slab_rows" not in sup.extend.declines
+    assert not hasattr(support, "EXTEND_ROWS_MAX") and not hasattr(
+        support, "EXTEND_ROWS_KEY"
+    )
     assert (
         sup.index_query_rows_max == env.index_query_rows_max == 64
         and sup.fuse_prepare_default == env.fuse_prepare_default
@@ -414,6 +735,46 @@ def test_every_errors_table_key_is_a_decline_row_and_the_texts_are_the_envelope_
     )
 
 
+def test_decode_light_gate_declines_past_the_launch_grid_bound_the_vendored_declaration_admits():
+    """The decode grid cell of the launch-grid bound: batch 4096 x ``q_len`` 16 = 65,536 rows in ONE decode run -- the DECODE step's query
+    compress shares the extend step's launch (the run's row count as a CUDA grid dimension) -- is the light gate's typed decline
+    (``qwen_3_8_block (decode): ...`` naming the bound, the rows and the remedy), while the vendored declaration on host tensors admits the
+    shape (the bound is this entry's, not the tree's); 4095 x 16 passes the gate; the probe (capability mocked to Rubin) carries the row on
+    the decode record too, with the same text as the extend / prefill records."""
+    pytest.importorskip("cutlass")
+    from flashinfer.experimental.qwen_3_8_block import api as impl
+    from flashinfer.experimental.qwen_3_8_block import support
+    from flashinfer.qwen_3_8_block import qwen_3_8_block_support
+
+    g = _geometry()
+    impl._light_decode_gates(g, 16, 16, None, None, "auto", batch_size=4095)
+    with pytest.raises(NotImplementedError, match="65535") as info:
+        impl._light_decode_gates(g, 16, 16, None, None, "auto", batch_size=4096)
+    msg = str(info.value)
+    assert msg.startswith("qwen_3_8_block (decode):"), msg
+    assert (
+        "= 65536 rows" in msg
+        and "several decode steps" in msg
+        and "smaller batch" in msg
+    ), msg
+    blk = _declare(g, 16, 16, batch=4096)
+    blk._check_declaration()
+    assert not blk.indexer_extend and blk.index_select_form_resolved == "decode"
+    with _rubin():
+        sup = qwen_3_8_block_support(torch.device("cuda", 0), g)
+    if not sup.cutedsl_ok:
+        pytest.skip(
+            f"the installed CuTe DSL does not serve the block: {support.cutedsl_reason()}"
+        )
+    grid = support.EXTEND_GRID_ROWS_KEY
+    assert sup.served and grid in sup.decode.declines
+    assert (
+        sup.decode.declines[grid]
+        == sup.extend.declines[grid]
+        == support.extend_rows_grid_text()
+    )
+
+
 def test_probe_declines_up_front_on_every_device():
     """The gate's own rows (the indexer geometry, the list form, the cache dtype, d_model, rope_dim) are declined on any device, named,
     before any vendored code; the prefill / extend forms are refused by the plan-time gate with the follow-up named."""
@@ -422,7 +783,7 @@ def test_probe_declines_up_front_on_every_device():
 
     for over, token in (
         (dict(index_list_form="shared"), "selects per row"),
-        (dict(index_cache_dtype=torch.float8_e4m3fn), "e4m3"),
+        (dict(index_cache_dtype=torch.float16), "index_cache_dtype=torch.float16"),
         (dict(index_head_dim=64), "index_head_dim=64"),
         (dict(block_size=8), "block_size=8"),
         (dict(top_k=6), "top_k=6"),
@@ -431,12 +792,20 @@ def test_probe_declines_up_front_on_every_device():
     ):
         sup = qwen_3_8_block_support(torch.device("cpu"), _geometry(**over))
         assert not sup.served and token in sup.reason, (over, sup.reason)
-        assert sup.decode.reason == sup.reason
-    for form in ("prefill", "extend"):
-        with pytest.raises(NotImplementedError, match="later cuDNN Frontend PR"):
+        assert (
+            sup.decode.reason == sup.reason == sup.extend.reason == sup.prefill.reason
+        )
+    # every form passes the one geometry gate and is refused by the DEVICE on a CPU host (the forms are served together)
+    for form in ("prefill", "extend", "decode"):
+        with pytest.raises(NotImplementedError, match="SM107") as info:
             support.require_served(
                 torch.device("cpu"), _geometry(), torch.bfloat16, form
             )
+        assert str(info.value).startswith(f"qwen_3_8_block ({form}):")
+    with pytest.raises(ValueError, match="form must be one of"):
+        support.require_served(
+            torch.device("cpu"), _geometry(), torch.bfloat16, "chunk"
+        )
 
 
 # --------------------------------------------------------------------------- on the GPU
@@ -464,25 +833,26 @@ def test_declined_geometry_is_typed_before_any_vendored_code(monkeypatch):
     case = Qsa38PagedCase(_geometry(), (64,), 1, page_size=16, seed=5)
     for over, token in (
         (dict(index_list_form="shared"), "selects per row"),
-        (dict(index_cache_dtype=torch.float8_e4m3fn), "e4m3"),
+        (dict(index_cache_dtype=torch.float16), "index_cache_dtype=torch.float16"),
     ):
         g = _geometry(**over)
         sup = qwen_3_8_block_support(torch.device("cuda", 0), g)
         assert not sup.served and token in sup.reason
-        with pytest.raises(NotImplementedError, match=token) as info:
-            prepare_qwen_3_8_block_bf16(
-                "decode",
-                geometry=g,
-                device="cuda",
-                weights=case.weights38,
-                w_o=case.w_o,
-                kv_cache=case.kv_cache,
-                page_size=16,
-                batch_size=1,
-                block_table=case.block_table,
-                **case.plan_args(),
-            )
-        assert str(info.value).startswith("qwen_3_8_block (decode):")
+        for form in ("decode", "extend", "prefill"):
+            with pytest.raises(NotImplementedError, match=token) as info:
+                prepare_qwen_3_8_block_bf16(
+                    form,
+                    geometry=g,
+                    device="cuda",
+                    weights=case.weights38,
+                    w_o=case.w_o,
+                    kv_cache=case.kv_cache,
+                    page_size=16,
+                    batch_size=1,
+                    block_table=case.block_table,
+                    **case.plan_args(),
+                )
+            assert str(info.value).startswith(f"qwen_3_8_block ({form}):")
     common = dict(
         geometry=_geometry(),
         device="cuda",
@@ -508,8 +878,50 @@ def test_declined_geometry_is_typed_before_any_vendored_code(monkeypatch):
             **common,
             **case.plan_args(),
         )
+    # the decode form past the launch-grid bound of one run (batch 4096 x q_len 16 = 65,536 rows): typed, named, before any vendored code
+    with pytest.raises(NotImplementedError, match="65535") as info:
+        prepare_qwen_3_8_block_bf16(
+            "decode",
+            page_size=16,
+            q_len_per_req=16,
+            **dict(common, batch_size=4096),
+            **case.plan_args(),
+        )
+    assert str(info.value).startswith(
+        "qwen_3_8_block (decode):"
+    ) and "= 65536 rows" in str(info.value)
+    # the extend / prefill forms' light gates before any vendored code: the page sizes, the e4m3 pool (no projection rows bound: a chunk past
+    # 128 rows is served through the band slab's large-M tile, test_extend.py's ladder), the launch-grid bound of one run
+    past_grid = dict(common, batch_size=32)
     for form in ("prefill", "extend"):
-        with pytest.raises(NotImplementedError, match="later cuDNN Frontend PR"):
+        # one run past the launch-grid bound (65,535 rows at this pin): typed, named, before any vendored code -- and before the block
+        # table sample is read (its single row never speaks)
+        with pytest.raises(NotImplementedError, match="65535") as info:
             prepare_qwen_3_8_block_bf16(
-                form, page_size=16, **common, **case.plan_args()
+                form, page_size=16, q_len_per_req=2048, **past_grid, **case.plan_args()
+            )
+        assert str(info.value).startswith(
+            f"qwen_3_8_block ({form}):"
+        ) and "= 65536 rows" in str(info.value)
+        with pytest.raises(NotImplementedError, match="page_size must be one of"):
+            prepare_qwen_3_8_block_bf16(
+                form, page_size=48, q_len_per_req=16, **common, **case.plan_args()
+            )
+        with pytest.raises(NotImplementedError, match="e4m3 pool"):
+            prepare_qwen_3_8_block_bf16(
+                form,
+                page_size=16,
+                q_len_per_req=16,
+                kv_cache_dtype=torch.float8_e4m3fn,
+                **common,
+                **case.plan_args(),
+            )
+        with pytest.raises(ValueError, match="sparse_tile_form must be one of"):
+            prepare_qwen_3_8_block_bf16(
+                form,
+                page_size=16,
+                q_len_per_req=16,
+                sparse_tile_form="fast",
+                **common,
+                **case.plan_args(),
             )

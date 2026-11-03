@@ -22,7 +22,11 @@ bin's state over in the background, which work-binned launches of short tasks
 take instead of the work-binned program, and
 ``_RENDERED_M64_OWNER_HELPER_ROUTES`` the M64 value-split programs whose helper
 CTAs prepare a task's chunks for its two value-half owners, which long
-cooperative launches take instead of the pair-share or routed program.
+cooperative launches take instead of the pair-share or routed program, and
+``_RENDERED_WORK_BIN_MIX_ROUTES`` the bin-mix builds of the turnover programs,
+which turnover launches whose bin table the bin-mix rule admits take
+cooperatively instead of the turnover program on the ``WORK_BIN_MIX_ARCHES``
+parts.
 
 The CPU checks hold both tables to the units, to the shipped argument plans and
 to the factory lookup. The GPU checks run the prepared BF16 prefill on the
@@ -34,7 +38,10 @@ program and against the selection without work bins; hold a work-binned launch
 of short tasks to the turnover build (bit for bit the work-binned launch, with
 and without checkpoint rows, on both sides of the part's chunk limit); replay
 the routed launch from a CUDA graph (a turnover launch among the rows); and
-rebind it through a plan-cache hit.
+rebind it through a plan-cache hit.  An admitted bin-mix launch matches its
+turnover launch bit for bit, a bin-mix launch the driver refuses runs the
+turnover build instead, and on another part the same launches keep the
+turnover build.
 
 A program that takes tensor maps encodes them once per preparation into a host
 buffer (``("workspace", "tensor_maps")`` in its plan); the checks hold every
@@ -203,6 +210,21 @@ def test_routes_point_shipped_modules_at_generated_programs():
             assert program in registry._RENDERED_MODULES, (arch, program)
             assert arch in registry._RENDERED_MODULES[program]["arches"]
             routed.add(program)
+    assert set(registry._RENDERED_WORK_BIN_MIX_ROUTES) == set(registry.ARCHES)
+    for arch, modules in registry._RENDERED_WORK_BIN_MIX_ROUTES.items():
+        # A bin-mix build ships only where the runtime launches it.
+        assert not modules or arch in runtime.WORK_BIN_MIX_ARCHES, arch
+        for module, program in modules.items():
+            # Every turnover launch the bin-mix rule does not admit keeps the
+            # module's turnover program.
+            assert module in registry._RENDERED_WORK_BIN_TURN_ROUTES[arch], (
+                arch,
+                module,
+            )
+            assert program != registry._RENDERED_WORK_BIN_TURN_ROUTES[arch][module]
+            assert program in registry._RENDERED_MODULES, (arch, program)
+            assert arch in registry._RENDERED_MODULES[program]["arches"]
+            routed.add(program)
     assert routed == set(GENERATED)
 
 
@@ -233,11 +255,29 @@ def test_generated_record_is_lean_and_names_its_units(name):
     assert "TVM_FFI_DLL_EXPORT_TYPED_FUNC(run," in binding
 
 
+# The affine fold and map-fold mains read the caller's window indices: their
+# plans add these arguments after the main body's, and the affine composite
+# (``FlashKDABlackwellAffineSplitLaunch``) binds them itself.
+GATHERED_INDEX_ARGS = [
+    ["buffer", "window_table"],
+    ["parameter", "state_indices_i64"],
+    ["buffer", "gathered_row_starts"],
+    ["buffer", "gathered_final_offsets"],
+    ["parameter", "final_slot_stride"],
+]
+
+
 @requires_programs
 def test_generated_plans_bind_from_the_shipped_plans():
     """The launch classes bind by the shipped plan's names: a generated plan
-    must name a subset of them, tensors as tensors and scalars as scalars."""
+    must name a subset of them, tensors as tensors and scalars as scalars,
+    except the window-index arguments the affine composite binds itself."""
+    composite_bound = {name for _kind, name in GATHERED_INDEX_ARGS}
     for arch in registry.ARCHES:
+        folds = {
+            *registry._RENDERED_FOLD_ROUTES[arch].values(),
+            *registry._RENDERED_MAP_FOLD_ROUTES[arch].values(),
+        }
         routes = [
             *registry._RENDERED_ROUTES[arch].items(),
             *registry._RENDERED_MERGE_ROUTES[arch].items(),
@@ -249,6 +289,7 @@ def test_generated_plans_bind_from_the_shipped_plans():
             *registry._RENDERED_PAIR_SHARE_ROUTES[arch].items(),
             *registry._RENDERED_WORK_BIN_TURN_ROUTES[arch].items(),
             *registry._RENDERED_M64_OWNER_HELPER_ROUTES[arch].items(),
+            *registry._RENDERED_WORK_BIN_MIX_ROUTES[arch].items(),
         ]
         for module, program in routes:
             shipped = {
@@ -256,6 +297,8 @@ def test_generated_plans_bind_from_the_shipped_plans():
             }
             for kind, name in registry._RENDERED_MODULES[program]["arg_plan"]:
                 if kind in ("grid", "workspace"):
+                    continue
+                if program in folds and name in composite_bound:
                     continue
                 where = (arch, module, program, name)
                 assert name in shipped, where
@@ -624,6 +667,13 @@ def test_merging_correction_builds_reduce_into_the_composite():
             )
 
 
+def _with_gathered_indices(plan):
+    """``plan`` with the window-index arguments before its workspace entries."""
+    body = [entry for entry in plan if entry[0] not in ("workspace", "grid")]
+    rest = [entry for entry in plan if entry[0] in ("workspace", "grid")]
+    return [*body, *GATHERED_INDEX_ARGS, *rest]
+
+
 FOLD_MODULES = ("cake_kda_bf16_15be1db8a50ee4d9fd16",)
 FOLD_BARRIER = re.compile(r"\bfold_p_ready_addr\b")
 
@@ -633,7 +683,8 @@ def test_pair_map_fold_builds_take_the_main_bodys_plan():
     """The affine apply route's main module has a pair-map fold build
     (``_RENDERED_FOLD_ROUTES``): a generated program of its own, never the
     module's routed program, with the routed program's argument plan (the
-    composite binds the pair maps to the plan's ``tape_e`` / ``norm_inv_out``)."""
+    composite binds the pair maps to the plan's ``tape_e`` / ``norm_inv_out``)
+    and the window-index arguments after it."""
     assert set(registry._RENDERED_FOLD_ROUTES) == set(registry.ARCHES)
     for arch, folding in registry._RENDERED_FOLD_ROUTES.items():
         assert sorted(folding) == list(FOLD_MODULES), arch
@@ -642,7 +693,9 @@ def test_pair_map_fold_builds_take_the_main_bodys_plan():
             assert name in GENERATED and name != routed, (arch, module)
             record = registry._RENDERED_MODULES[name]
             assert arch in record["arches"]
-            assert record["arg_plan"] == registry._RENDERED_MODULES[routed]["arg_plan"]
+            assert record["arg_plan"] == _with_gathered_indices(
+                registry._RENDERED_MODULES[routed]["arg_plan"]
+            )
             plan = {slot for _, slot in record["arg_plan"]}
             assert {"tape_e", "norm_inv_out"} <= plan, name
             text = (ROOT / record["sources"][0]).read_text()
@@ -663,7 +716,8 @@ def test_chain_map_fold_builds_take_the_main_bodys_plan():
     """The chain route's main modules have map-fold builds
     (``_RENDERED_MAP_FOLD_ROUTES``): generated programs of their own, never the
     module's routed program, with the routed program's argument plan (the
-    composite binds the map states to the plan's ``tape_e``)."""
+    composite binds the map states to the plan's ``tape_e``) and the
+    window-index arguments after it."""
     assert set(registry._RENDERED_MAP_FOLD_ROUTES) == set(registry.ARCHES)
     for arch, folding in registry._RENDERED_MAP_FOLD_ROUTES.items():
         assert sorted(folding) == list(MAP_FOLD_MODULES), arch
@@ -672,7 +726,9 @@ def test_chain_map_fold_builds_take_the_main_bodys_plan():
             assert name in GENERATED and name != routed, (arch, module)
             record = registry._RENDERED_MODULES[name]
             assert arch in record["arches"]
-            assert record["arg_plan"] == registry._RENDERED_MODULES[routed]["arg_plan"]
+            assert record["arg_plan"] == _with_gathered_indices(
+                registry._RENDERED_MODULES[routed]["arg_plan"]
+            )
             assert "tape_e" in {slot for _, slot in record["arg_plan"]}, name
             text = (ROOT / record["sources"][0]).read_text()
             assert MAP_FOLD_BARRIER.search(text), name
@@ -1039,6 +1095,7 @@ def unrouted(monkeypatch):
             "_RENDERED_PAIR_SHARE_ROUTES",
             "_RENDERED_WORK_BIN_TURN_ROUTES",
             "_RENDERED_M64_OWNER_HELPER_ROUTES",
+            "_RENDERED_WORK_BIN_MIX_ROUTES",
         ):
             monkeypatch.setattr(registry, table, {arch: {} for arch in registry.ARCHES})
 
@@ -1067,10 +1124,12 @@ def test_serving_rows_match_the_fp32_reference(
 
     # Work bins only change which CTA runs a task: without them the launch takes
     # the module's one-task-per-CTA program and matches bit for bit.  The
-    # turnover programs are built with work bins too (and a launch takes one
-    # only where the module has a work-binned program).
-    work_bin_programs = set(registry._RENDERED_WORK_BIN_ROUTES[arch].values()) | set(
-        registry._RENDERED_WORK_BIN_TURN_ROUTES[arch].values()
+    # turnover and bin-mix programs are built with work bins too (and a launch
+    # takes one only where the module has a work-binned program).
+    work_bin_programs = (
+        set(registry._RENDERED_WORK_BIN_ROUTES[arch].values())
+        | set(registry._RENDERED_WORK_BIN_TURN_ROUTES[arch].values())
+        | set(registry._RENDERED_WORK_BIN_MIX_ROUTES[arch].values())
     )
     if loaded & work_bin_programs:
         with monkeypatch.context() as patch:
@@ -1314,8 +1373,11 @@ def _assert_turnover_schedule(turn, plain, expect):
 
 # Work-binned short launches on a 148-SM sm_100a and a 152-SM sm_103a part
 # (``test_turnover_rows_take_the_route_on_both_parts``).
+# Turnover launches the bin-mix rule does not admit (those take the bin-mix
+# build: BIN_MIX_ROWS): 16 x 32 tokens at 12 heads pairs a two-chunk bin with
+# a one-chunk bin, d = 1 gives g = 0, so the launch keeps the turnover build.
 TURNOVER_ROWS = [
-    pytest.param([64] * 16, 12, id="bs16x64-h12"),
+    pytest.param([32] * 16, 12, id="bs16x32-h12"),
     pytest.param([64] * 64, 16, id="bs64x64-h16"),
     pytest.param([17, 64, 65, 127, 128, 200, 255, 96] * 4, 12, id="mixed32-h12"),
     pytest.param([1, 33, 64, 96] * 12, 16, id="short-mixed-h16"),
@@ -1374,6 +1436,156 @@ def test_turnover_launch_is_bitwise_the_work_binned_launch(
     _assert_bitwise(got, want, "turnover vs work-binned")
     _assert_bitwise(turn.run(), want, "turnover after the work-binned launch")
     _assert_bitwise(plain.run(), got, "work-binned repeat")
+
+
+# Unbounded work-binned short launches whose turnover bin table the bin-mix
+# rule admits on a 148-SM sm_100a and a 152-SM sm_103a part: bins of one and
+# two tasks, every two-task bin paired with a one-task bin it gives chunks to.
+# They take the bin-mix build on the WORK_BIN_MIX_ARCHES parts and keep the
+# turnover build on the others.  The third value says whether the plan passes
+# the span check of the WORK_BIN_MIX_SPAN_ARCHES parts: mixed16-h12 gives
+# single chunks to helpers with longer tasks than the owner's shorter task, so
+# it keeps the turnover build there.
+BIN_MIX_ROWS = [
+    pytest.param([64] * 16, 12, True, id="bs16x64-h12"),
+    pytest.param([128] * 16, 12, True, id="bs16x128-h12"),
+    pytest.param([256] * 16, 12, True, id="bs16x256-h12"),
+    pytest.param([256, 224, 192, 160] * 4, 12, False, id="mixed16-h12"),
+]
+
+
+def _takes_bin_mix(span_ok):
+    arch = registry.device_arch()
+    if arch not in runtime.WORK_BIN_MIX_ARCHES:
+        return False
+    return span_ok or arch not in runtime.WORK_BIN_MIX_SPAN_ARCHES
+
+
+def _bin_mix_programs():
+    arch = registry.device_arch()
+    if arch not in runtime.WORK_BIN_MIX_ARCHES:
+        pytest.skip(
+            f"{arch} launches keep the turnover build "
+            "(test_bin_mix_rows_keep_the_turnover_build_elsewhere)"
+        )
+    programs = set(registry._RENDERED_WORK_BIN_MIX_ROUTES[arch].values())
+    assert programs, f"the loader names no bin-mix build on {arch}"
+    return programs
+
+
+def _without_bin_mix(patch):
+    patch.setattr(
+        registry,
+        "_RENDERED_WORK_BIN_MIX_ROUTES",
+        {arch: {} for arch in registry.ARCHES},
+    )
+
+
+@requires_blackwell
+@pytest.mark.parametrize("rows", [True, False], ids=["rows", "no-rows"])
+@pytest.mark.parametrize("lengths,heads,span_ok", BIN_MIX_ROWS)
+def test_bin_mix_launch_is_bitwise_the_turnover_launch(
+    lengths, heads, span_ok, rows, monkeypatch
+):
+    """A turnover launch whose bin table the bin-mix rule admits takes the
+    bin-mix build: a one-task bin prepares the last chunks of its paired
+    two-task bin after its own task and hands them over through the ring.  Its
+    schedule is the turnover launch's with ``_bin_mix`` added, and that one the
+    work-binned launch's with ``_turnover`` added.  Bit for bit the turnover
+    launch and the work-binned launch, with and without checkpoint rows,
+    launch after launch (the owners leave every ready word zero), in either
+    order."""
+    mix = _bin_mix_programs()
+    if not _takes_bin_mix(span_ok):
+        pytest.skip(
+            f"{registry.device_arch()} keeps the turnover build for this row "
+            "(test_bin_mix_rows_keep_the_turnover_build_elsewhere)"
+        )
+    d = _inputs(lengths, heads)
+    mixed = _Call(d, None, rows=rows)
+    schedule = str(mixed.prepared.schedule)
+    assert schedule.endswith("_turnover_bin_mix"), schedule
+    assert _modules(mixed.prepared) & mix
+    with monkeypatch.context() as patch:
+        _without_bin_mix(patch)
+        turned = _Call(d, None, rows=rows)
+    with monkeypatch.context() as patch:
+        _without_turnover(patch)
+        plain = _Call(d, None, rows=rows)
+    assert str(turned.prepared.schedule) + "_bin_mix" == schedule
+    _assert_turnover_schedule(turned, plain, True)
+    assert not _modules(turned.prepared) & mix
+    assert not _modules(plain.prepared) & mix
+    got = mixed.run()
+    want = turned.run()
+    _assert_bitwise(got, want, "bin-mix vs turnover")
+    _assert_bitwise(got, plain.run(), "bin-mix vs work-binned")
+    _assert_bitwise(mixed.run(), want, "bin-mix after the other launches")
+    _assert_bitwise(turned.run(), got, "turnover repeat")
+
+
+@requires_blackwell
+@pytest.mark.parametrize("rows", [True, False], ids=["rows", "no-rows"])
+@pytest.mark.parametrize("lengths,heads,span_ok", BIN_MIX_ROWS)
+def test_bin_mix_rows_keep_the_turnover_build_elsewhere(
+    lengths, heads, span_ok, rows, monkeypatch
+):
+    """On a part outside ``WORK_BIN_MIX_ARCHES``, or on a
+    ``WORK_BIN_MIX_SPAN_ARCHES`` part for a plan that fails the span check, a
+    turnover launch whose bin table the bin-mix rule admits keeps the
+    turnover build: no bin-mix program, the work-binned launch's schedule with
+    ``_turnover`` added, and bit for bit the work-binned launch."""
+    arch = registry.device_arch()
+    if _takes_bin_mix(span_ok):
+        pytest.skip(
+            f"{arch} takes the bin-mix build "
+            "(test_bin_mix_launch_is_bitwise_the_turnover_launch)"
+        )
+    d = _inputs(lengths, heads)
+    turned = _Call(d, None, rows=rows)
+    assert str(turned.prepared.schedule).endswith("_turnover"), str(
+        turned.prepared.schedule
+    )
+    assert not _modules(turned.prepared) & set(
+        registry._RENDERED_WORK_BIN_MIX_ROUTES[arch].values()
+    )
+    with monkeypatch.context() as patch:
+        _without_turnover(patch)
+        plain = _Call(d, None, rows=rows)
+    _assert_turnover_schedule(turned, plain, True)
+    got = turned.run()
+    _assert_bitwise(got, plain.run(), "turnover vs work-binned")
+    _assert_bitwise(turned.run(), got, "turnover repeat")
+
+
+@requires_blackwell
+def test_refused_bin_mix_launch_runs_its_turnover_build(monkeypatch):
+    """A cooperative grid the device cannot hold (the work-bin table built for
+    twice the part's SMs, one bin per CTA): the driver refuses the bin-mix
+    launch, the plan switches for good to its turnover build with that build's
+    own bindings and matches it bit for bit, and later CUDA work is
+    unaffected."""
+    mix = _bin_mix_programs()
+    lengths, heads = [128] * 32, 12
+    sm_count = 2 * _sm_count()
+    monkeypatch.setattr(runtime, "_device_sm_count", lambda device: sm_count)
+    d = _inputs(lengths, heads)
+    refused = _Call(d, None)
+    schedule = str(refused.prepared.schedule)
+    assert schedule.endswith("_turnover_bin_mix"), schedule
+    assert _modules(refused.prepared) & mix
+    result = refused.run()
+    assert not _modules(refused.prepared) & mix
+    probe = torch.zeros(1024, device="cuda")
+    probe.add_(1)
+    torch.cuda.synchronize()
+    assert float(probe.sum()) == 1024.0
+    _assert_bitwise(refused.run(), result, "fallback repeat")
+    with monkeypatch.context() as patch:
+        _without_bin_mix(patch)
+        turned = _Call(d, None)
+    assert str(turned.prepared.schedule) == schedule.removesuffix("_bin_mix")
+    _assert_bitwise(result, turned.run(), "refused bin-mix vs its turnover build")
 
 
 def _bounded_turnover_expected(lengths, heads):

@@ -109,6 +109,7 @@ from flashinfer.experimental.qwen_3_5_block._cudnn_frost.sdpa.bwd.config_sm100 i
 
 __all__ = [
     "TemplateParams",
+    "TemplateParamsFp8",
     "CfgBwdD256",
     "BufferElems",
     "TmemLayout",
@@ -369,6 +370,14 @@ class TemplateParams(_BwdTemplateParams):
     datapath_2x2_profile: int = 0
 
 
+@dataclass(frozen=True)
+class TemplateParamsFp8(TemplateParams):
+    """Per-tensor FP8 geometry; legacy D256 records keep their original identity."""
+
+    head_dim_qk: int = 256
+    head_dim_v: int = 256
+
+
 def bpe(dtype: int) -> int:
     """Bytes per storage element: FP8 codes 1, BF16 / FP16 2, the output-only DTYPE_FP32 4."""
     if dtype == DTYPE_FP32:
@@ -576,6 +585,11 @@ class CfgBwdD256:
     # S_q % 128 != 0 and lets a 0xFF Q-side SF pad byte (E8M0 NaN) reach BMM2 (dV NaN on every kv row).
     MASK_Q_PAD: int = 0
 
+    @property
+    def dO_DV_SWZ_BYTES(self) -> int:
+        """The transposed dV consumer sees only its CTA's value columns."""
+        return min(self.dO_SWZ_BYTES, (self.TILE_O // self.CTA_MMA) * self.BPE)
+
 
 # Every MXFP8-only Cfg field that must read 0 on the f16 / per-tensor fp8 bodies (IS_MXFP8 first, so a message names it).
 _MXFP8_ZERO_FIELDS = (
@@ -701,6 +715,10 @@ class BufferElems:
     # field stays so an SMEM-gather twin can re-add the row without moving the others.
     rcpGatherElems: int = 0
 
+    @property
+    def SMEM_LAYOUT_dO_SG1(self) -> int:
+        return _SWZ_ENUM[self.STRIDE_BYTE_OFFSET_dO_SG1 // 8]
+
 
 _SWZ_ENUM = {128: 2, 64: 4, 32: 6}
 
@@ -715,7 +733,7 @@ def buffer_elems(cfg: CfgBwdD256) -> BufferElems:
     tma_qk_iters = (cfg.TILE_K * cfg.BPE) // cfg.Q_SWZ_BYTES
     tma_vo_iters = (cfg.TILE_O * cfg.BPE) // cfg.dO_SWZ_BYTES
     tma_qk_sg1_iters = ((cfg.TILE_K // cfg.CTA_MMA) * cfg.BPE) // cfg.Q_SWZ_BYTES
-    tma_vo_sg1_iters = ((cfg.TILE_O // cfg.CTA_MMA) * cfg.BPE) // cfg.dO_SWZ_BYTES
+    tma_vo_sg1_iters = ((cfg.TILE_O // cfg.CTA_MMA) * cfg.BPE) // cfg.dO_DV_SWZ_BYTES
     dv_d_block = cfg.dV_SWZ_BYTES // cfg.BPE_O
     p_tma_iters = (cfg.TILE_N * cfg.BPE_DS) // cfg.dS_SWZ_BYTES
     p_d_block = cfg.TILE_N // p_tma_iters
@@ -772,8 +790,8 @@ def buffer_elems(cfg: CfgBwdD256) -> BufferElems:
         STRIDE_BYTE_OFFSET_dV=8 * cfg.dV_SWZ_BYTES,
         LEADING_BYTE_OFFSET_Q_SG1=cfg.TILE_N * cfg.Q_SWZ_BYTES,
         STRIDE_BYTE_OFFSET_Q_SG1=8 * cfg.Q_SWZ_BYTES,
-        LEADING_BYTE_OFFSET_dO_SG1=cfg.TILE_N * cfg.dO_SWZ_BYTES,
-        STRIDE_BYTE_OFFSET_dO_SG1=8 * cfg.dO_SWZ_BYTES,
+        LEADING_BYTE_OFFSET_dO_SG1=cfg.TILE_N * cfg.dO_DV_SWZ_BYTES,
+        STRIDE_BYTE_OFFSET_dO_SG1=8 * cfg.dO_DV_SWZ_BYTES,
         SMEM_LAYOUT_Q=_SWZ_ENUM[cfg.Q_SWZ_BYTES],
         SMEM_LAYOUT_dO=_SWZ_ENUM[cfg.dO_SWZ_BYTES],
         SMEM_LAYOUT_K=_SWZ_ENUM[cfg.K_SWZ_BYTES],
@@ -1423,8 +1441,8 @@ def _validate_cfg_d256_bwd(cfg: CfgBwdD256, flavor: str) -> None:
         [
             (cfg.TILE_M == 128 and cfg.TILE_N == 128, f"{flavor}: TILE_M = TILE_N = 128 (kv rows per CTA, q cols per q-tile)"),
             (
-                cfg.TILE_K == 256 and cfg.TILE_O == 256,
-                f"{flavor}: d_qk = d_v = 256 (got TILE_K={cfg.TILE_K}, TILE_O={cfg.TILE_O}); the body is exact-d, no envelope",
+                (cfg.TILE_K, cfg.TILE_O) == (256, 256) or (cfg.IS_FP8 and not cfg.IS_MXFP8 and (cfg.TILE_K, cfg.TILE_O) == (192, 128)),
+                f"{flavor}: d_qk = d_v = 256, or per-tensor FP8 192/128 (got TILE_K={cfg.TILE_K}, TILE_O={cfg.TILE_O}); the body is exact-d, no envelope",
             ),
             (cfg.CGA_M == 2 and cfg.CGA_N == 1 and cfg.CTA_MMA == 2, f"{flavor}: single cga2 sub-group (CGA_M=2, CGA_N=1, CTA_MMA=2) only"),
             (cfg.TILES_Q == 1, f"{flavor}: TILES_Q == 1"),
@@ -1508,8 +1526,8 @@ def _validate_cfg_d256_bwd(cfg: CfgBwdD256, flavor: str) -> None:
                         f"per-Q-head dV_true partial, rounded once by the fold); got {cfg.DTYPE_O}",
                     ),
                     (
-                        cfg.STAGES_TMEM_P == 2 and tm.P_OFF + cfg.STAGES_TMEM_P * tm.P_COLS == tm.TOTAL_COLS,
-                        f"{flavor}: the fp8 P ring is exactly 2 stages of {tm.P_COLS} cols filling TMEM [{tm.P_OFF}, {tm.TOTAL_COLS}) (got STAGES_TMEM_P={cfg.STAGES_TMEM_P}); "
+                        cfg.STAGES_TMEM_P == 2 and tm.P_OFF + cfg.STAGES_TMEM_P * tm.P_COLS <= tm.TOTAL_COLS,
+                        f"{flavor}: the fp8 P ring is exactly 2 stages of {tm.P_COLS} cols contained in TMEM [{tm.P_OFF}, {tm.TOTAL_COLS}) (got STAGES_TMEM_P={cfg.STAGES_TMEM_P}); "
                         f"the body indexes P_OFF + slot*P_COLS by the mb_p_ready PipelineState, so a deeper ring reads past the allocation and a shallower one breaks "
                         f"the 'store P[i+1] before dSoftmax[i]' overlap the missing p_empty relies on",
                     ),
@@ -1586,8 +1604,8 @@ def _validate_cfg_d256_bwd(cfg: CfgBwdD256, flavor: str) -> None:
                 f"{flavor}: TMEM must be S | dP | dV back to back from column 0",
             ),
             (
-                tm.S_COLS + tm.dP_COLS + tm.dV_COLS + _tmem_tail_cols(cfg, tm) == tm.TOTAL_COLS,
-                f"{flavor}: TMEM column map must sum to {TMEM_TOTAL_COLS}: S {tm.S_COLS} + dP {tm.dP_COLS} + dV {tm.dV_COLS} + {_tmem_tail_desc(cfg, tm)}",
+                tm.S_COLS + tm.dP_COLS + tm.dV_COLS + _tmem_tail_cols(cfg, tm) + (128 if (cfg.TILE_K, cfg.TILE_O) == (192, 128) else 0) == tm.TOTAL_COLS,
+                f"{flavor}: TMEM column map plus any unused D192 tail must sum to {TMEM_TOTAL_COLS}: S {tm.S_COLS} + dP {tm.dP_COLS} + dV {tm.dV_COLS} + {_tmem_tail_desc(cfg, tm)}",
             ),
             (
                 tm.P_COLS == (cfg.TILE_N * cfg.BPE) // 4,
@@ -1599,8 +1617,9 @@ def _validate_cfg_d256_bwd(cfg: CfgBwdD256, flavor: str) -> None:
     _check(
         [
             (
-                cfg.Q_SWZ_BYTES == 128 and cfg.K_SWZ_BYTES == 128 and cfg.dO_SWZ_BYTES == 128 and cfg.V_SWZ_BYTES == 128,
-                f"{flavor}: Q/K/dO/V swizzle must be 128 B (d=256 rows are 256 B fp8 / 512 B f16, and the bodies' subtile walks derive from 128)",
+                (cfg.Q_SWZ_BYTES, cfg.K_SWZ_BYTES, cfg.dO_SWZ_BYTES, cfg.V_SWZ_BYTES)
+                == ((64, 64, 128, 128) if (cfg.TILE_K, cfg.TILE_O) == (192, 128) else (128,) * 4),
+                f"{flavor}: Q/K/dO/V swizzle must be 128 B for D256; native FP8 D192 uses 64 B Q/K and 128 B dO/V, with a separate per-CTA dO swizzle for dV",
             ),
             (
                 cfg.P_SWZ_BYTES == cfg.dS_SWZ_BYTES == 128,
@@ -1908,7 +1927,13 @@ def make_cfg_d256_bwd(params: _BwdTemplateParams, dtype_family: str) -> CfgBwdD2
     # IS_FP8 = E4M3 payloads = the fp8-CLASS pipeline (K64 + k_dim=1, 3-deep rings, the lookahead MMA order): the
     # per-tensor fp8 body AND the MXFP8 one.
     is_fp8 = dtype_family in (FAMILY_FP8, FAMILY_MXFP8)
-    tile_m, tile_n, tile_k, tile_o = 128, 128, 256, 256
+    head_dims = (getattr(params, "head_dim_qk", 256), getattr(params, "head_dim_v", 256))
+    allowed = ((256, 256), (192, 128)) if dtype_family == FAMILY_FP8 else ((256, 256),)
+    if any(not isinstance(d, int) for d in head_dims) or head_dims not in allowed:
+        raise ValueError(f"{flavor}: native head dimensions must be one of {allowed}; got {head_dims}")
+    tile_m, tile_n = 128, 128
+    tile_k, tile_o = head_dims
+    operand_swizzle = 64 if head_dims == (192, 128) else 128
     cta_mma = 2  # the single cga2 pair: every collective MMA and every cga2 tensor TMA spans both CTAs
     ds_sf_policy = getattr(params, "ds_sf_policy", -1)
     if is_mxfp8:
@@ -2002,9 +2027,9 @@ def make_cfg_d256_bwd(params: _BwdTemplateParams, dtype_family: str) -> CfgBwdD2
         CGA_M=cta_mma,
         CGA_N=1,
         CTA_MMA=cta_mma,
-        Q_SWZ_BYTES=128,
+        Q_SWZ_BYTES=operand_swizzle,
         dO_SWZ_BYTES=128,
-        K_SWZ_BYTES=128,
+        K_SWZ_BYTES=operand_swizzle,
         V_SWZ_BYTES=128,
         P_SWZ_BYTES=128,
         dS_SWZ_BYTES=128,

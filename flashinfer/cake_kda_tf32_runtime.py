@@ -213,6 +213,35 @@ M64_OWNER_HELPER_WORD_STRIDE = 3
 # the measured sweep); 36 tasks is the largest count measured.
 M64_OWNER_HELPER_MIN_SEQ_LEN: tuple[tuple[int, ...], ...] = ((36, 1024),)
 M64_OWNER_HELPER_MIN_SEQ_LEN_GB300: tuple[tuple[int, ...], ...] = ((36, 1024),)
+# The bin-mix build of a work-bin turnover program (see _work_bin_mix_plan):
+# the work-bin table of a launch with more tasks than SMs leaves bins of two
+# tasks beside bins of one, and the two-task bins set the span.  Each two-task
+# bin (owner) pairs in order with a one-task bin (helper); the helper prepares
+# the owner's last ``give`` 32-token chunks after its own task and hands each
+# through WORK_BIN_MIX_SLOTS ring slots of WORK_BIN_MIX_SLOT_ELEMENTS BF16
+# elements per owner and one ready word per slot, which the owner zeroes as it
+# takes the chunk.  The plan holds four words per bin after the bin table,
+# then WORK_BIN_MIX_MAGIC.  With ``d`` the pair's chunk difference,
+# give = min(WORK_BIN_MIX_MAX_GIVE, d // 2 + d // 8, owner chunks - 1), and a
+# pair below one chunk keeps its bins whole.  Measured on B200 and GB300 with
+# 16 sequences of 64 to 256 tokens and 12 heads (two-task bins of 4 to 16
+# chunks); 32-token sequences (d = 1) keep the turnover build.
+WORK_BIN_MIX_MAGIC = 0x58313221
+# Architectures whose admitted launches take the bin-mix build.
+WORK_BIN_MIX_ARCHES = ("sm_100a", "sm_103a")
+# Architectures where the rule also requires the plan to shorten the launch's
+# longest bin.  A give costs the helper more than the chunk it saves the owner,
+# so on a 152-SM sm_103a part two kinds of admitted launches ran up to 6.2 %
+# slower than the turnover build: a plan that leaves the longest bin as long as
+# before (every give counted as one chunk on its helper), and a single-chunk
+# give to a helper whose own task has more chunks than the owner's shorter
+# task.  Both keep the turnover build there.  In paired timings of 190
+# admitted launches (8 to 16 heads, two parts) the other 115 ran 0.7 to 11 %
+# faster with the bin-mix build.
+WORK_BIN_MIX_SPAN_ARCHES = ("sm_103a",)
+WORK_BIN_MIX_MAX_GIVE = 8
+WORK_BIN_MIX_SLOTS = 8
+WORK_BIN_MIX_SLOT_ELEMENTS = 16384
 # Architectures whose one-wave BF16 grid sweep selected the M64 value split over
 # every direct M128 tile (see _should_use_bf16_one_wave_dvsplit).
 BF16_ONE_WAVE_DVSPLIT_ARCHES = ("sm_100a", "sm_103a")
@@ -907,11 +936,49 @@ def _ffi_arguments(arguments) -> tuple:
     )
 
 
+def _ffi_arguments_reusing(owner, site, arguments) -> tuple:
+    """:func:`_ffi_arguments` that keeps the export of every unchanged tensor.
+
+    A plan-cache rebind replaces only the views of the moved inputs; every
+    other argument of a rebuilt record is the same tensor object at the same
+    address as in the record it replaces.  Such a tensor reuses its previous
+    tvm-ffi export (same data pointer, shape, strides and dtype); only the
+    tensors that moved go through :func:`_ffi_arguments` again.  ``owner``
+    keeps the last export of each record ``site`` until that site is rebuilt.
+    """
+    import torch
+
+    memo = owner.__dict__.setdefault("_ffi_export_memo", {})
+    previous = memo.get(site, ())
+    exported = list(arguments)
+    kept: list = [None] * len(exported)
+    fresh = []
+    for position, value in enumerate(exported):
+        if not isinstance(value, torch.Tensor):
+            continue
+        pointer = value.data_ptr()
+        prior = previous[position] if position < len(previous) else None
+        if prior is not None and prior[0] is value and prior[1] == pointer:
+            exported[position] = prior[2]
+            kept[position] = prior
+        else:
+            fresh.append((position, value, pointer))
+    if fresh:
+        converted = _ffi_arguments([value for _, value, _ in fresh])
+        for (position, value, pointer), ffi_value in zip(fresh, converted, strict=True):
+            exported[position] = ffi_value
+            kept[position] = (value, pointer, ffi_value)
+    memo[site] = tuple(kept)
+    return tuple(exported)
+
+
 def _prepared_kernel_record(module, grid, bindings) -> tuple:
     """(native entry, positional arguments) of one ``PreparedKernel.launch``."""
     if not module._ready:
         raise RuntimeError("TMA descriptors must be initialized during preparation")
-    return module._call, _ffi_arguments(module._arguments(grid, bindings))
+    return module._call, _ffi_arguments_reusing(
+        module, None, module._arguments(grid, bindings)
+    )
 
 
 def _run_launch_records(records) -> None:
@@ -1317,6 +1384,7 @@ _COOPERATIVE_REFUSALS = (
     "CUDA_ERROR_COOPERATIVE_LAUNCH_TOO_LARGE",
 )
 _M64_OWNER_HELPER_REFUSAL_WARNED = False
+_WORK_BIN_MIX_REFUSAL_WARNED = False
 
 
 def _cooperative_launch_refused(error: BaseException) -> bool:
@@ -1388,6 +1456,95 @@ def _work_bin_turnover_factory(name, *args, **kwargs):
     if program is None:
         return _factory(name, *args, **kwargs)
     return _kda_registry.PreparedKernel(program, detect_gpu_arch())
+
+
+def _work_bin_mix_program(program, gpu_arch: str):
+    """The ``_RENDERED_WORK_BIN_MIX_ROUTES`` build beside the work-bin turnover
+    build ``program`` (``_RENDERED_WORK_BIN_TURN_ROUTES``), or ``None``; always
+    ``None`` on an architecture outside ``WORK_BIN_MIX_ARCHES``."""
+    if program is None or gpu_arch not in WORK_BIN_MIX_ARCHES:
+        return None
+    mix = getattr(_kda_registry, "_RENDERED_WORK_BIN_MIX_ROUTES", {}).get(gpu_arch, {})
+    if not mix:
+        return None
+    turn = _kda_registry._RENDERED_WORK_BIN_TURN_ROUTES.get(gpu_arch, {})
+    for module, turnover in turn.items():
+        if turnover == program and module in mix:
+            return mix[module]
+    return None
+
+
+@cache
+def _work_bin_mix_plan(
+    table: tuple[int, ...],
+    num_bins: int,
+    seq_lens: tuple[int, ...],
+    num_heads: int,
+    shorten_span: bool = False,
+) -> Optional[tuple[int, ...]]:
+    """The bin-mix plan words of a work-bin table, or ``None`` to keep the
+    turnover build.
+
+    ``table`` is a ``_make_direct_work_bins`` table of 32-token chunks.  The
+    rule takes it only when every bin holds one or two tasks, some hold two,
+    and the one-task bins are at least as many as the two-task bins.  The
+    two-task bins (owners) pair in order with the one-task bins (helpers);
+    with ``d`` the owner's chunks minus the helper's, the owner gives
+    ``g = min(WORK_BIN_MIX_MAX_GIVE, d // 2 + d // 8, owner chunks - 1)``
+    chunks and keeps ``tf`` = owner chunks - ``g``: owner words
+    ``(g, tf, 0, 0)``, helper words ``(-g, owner, helper chunks, tf)``.  A
+    pair with ``g < 1`` keeps zero words, and a table without a pair that
+    gives keeps the turnover build.  With ``shorten_span`` (the parts of
+    ``WORK_BIN_MIX_SPAN_ARCHES``) the plan must also shorten the longest bin,
+    each give counted as one chunk on its helper, and no single-chunk give
+    may go to a helper whose task has more chunks than the owner's shorter
+    task; otherwise the launch keeps the turnover build.  The words follow
+    the table, four per bin, then ``WORK_BIN_MIX_MAGIC``.
+    """
+    if num_bins < 2 or len(table) != num_bins + 1 + len(seq_lens) * num_heads:
+        return None
+    chunks = [(length + BF16_M128_CHUNK - 1) // BF16_M128_CHUNK for length in seq_lens]
+    tasks = [table[table[index] : table[index + 1]] for index in range(num_bins)]
+    owners = [index for index, bin_tasks in enumerate(tasks) if len(bin_tasks) == 2]
+    helpers = [index for index, bin_tasks in enumerate(tasks) if len(bin_tasks) == 1]
+    if (
+        not owners
+        or len(owners) + len(helpers) != num_bins
+        or len(helpers) < len(owners)
+    ):
+        return None
+    loads = [
+        sum(chunks[task // num_heads] for task in bin_tasks) for bin_tasks in tasks
+    ]
+    words = [0] * (4 * num_bins)
+    gives = []
+    for owner, helper in zip(owners, helpers, strict=False):
+        difference = loads[owner] - loads[helper]
+        give = min(
+            WORK_BIN_MIX_MAX_GIVE,
+            difference // 2 + difference // 8,
+            loads[owner] - 1,
+        )
+        if give < 1:
+            continue
+        keep = loads[owner] - give
+        words[4 * owner : 4 * owner + 4] = [give, keep, 0, 0]
+        words[4 * helper : 4 * helper + 4] = [-give, owner, loads[helper], keep]
+        gives.append((owner, helper, give))
+    if not gives:
+        return None
+    if shorten_span:
+        after = list(loads)
+        for owner, helper, give in gives:
+            after[owner] -= give
+            after[helper] += give
+        if max(after) >= max(loads):
+            return None
+        for owner, helper, give in gives:
+            shorter = min(chunks[task // num_heads] for task in tasks[owner])
+            if give == 1 and loads[helper] > shorter:
+                return None
+    return (*words, WORK_BIN_MIX_MAGIC)
 
 
 def _work_bin_turnover_route(
@@ -2590,6 +2747,9 @@ class FlashKDABlackwellBF16FusedLaunch:
     #: Helper CTAs per task of the M64 owner/helper build the plan launches
     #: (0: another program).
     m64_owner_helpers = 0
+    #: Whether the plan launches the bin-mix build of its turnover program
+    #: (``_work_bin_mix_plan``; False: another program).
+    work_bin_mix = False
 
     def _build_body(
         self,
@@ -4037,6 +4197,7 @@ class FlashKDABlackwellBF16FusedLaunch:
         self.early_n32_state_pack = use_early_n32_state_pack
         self.ir = self.module.schedule
         num_work_bins = 0
+        bin_mix_plan = None
         if getattr(self.module, "work_bins", False):
             # A body built with work bins reads its bin table through seq_order
             # and runs one CTA per bin.
@@ -4058,8 +4219,24 @@ class FlashKDABlackwellBF16FusedLaunch:
                     else {}
                 ),
             )
+            # A turnover launch whose bins the bin-mix rule admits takes the
+            # module's bin-mix build: its plan words follow the table.
+            bin_mix_program = (
+                _work_bin_mix_program(getattr(self.module, "name", None), gpu_arch)
+                if uses_default_fused_m128 and not use_direct_m128_n16
+                else None
+            )
+            if bin_mix_program is not None:
+                bin_mix_plan = _work_bin_mix_plan(
+                    tuple(work_bin_table),
+                    num_work_bins,
+                    seq_lens,
+                    num_heads,
+                    gpu_arch in WORK_BIN_MIX_SPAN_ARCHES,
+                )
             work_bin_upload = _upload_int32_batch(
-                q.device, {"seq_order": list(work_bin_table)}
+                q.device,
+                {"seq_order": list(work_bin_table) + list(bin_mix_plan or ())},
             )
             self._work_bin_host = work_bin_upload["_host_pinned"]
             seq_order = work_bin_upload["seq_order"]
@@ -4146,6 +4323,19 @@ class FlashKDABlackwellBF16FusedLaunch:
                 _kda_registry._RENDERED_WORK_BIN_TURN_ROUTES.get(gpu_arch, {}).values()
             ):
                 self.schedule += "_turnover"
+            if bin_mix_plan is not None:
+                # The bin-mix build runs the same bins on the same grid; a
+                # refused cooperative launch takes the turnover program
+                # (_fall_back_from_work_bin_mix).
+                bin_mix_fallback = (self.module, self.grid, self.schedule)
+                bin_mix_module = _kda_registry.PreparedKernel(bin_mix_program, gpu_arch)
+                self._qkv_carrier_names[id(bin_mix_module)] = (
+                    self._qkv_carrier_names.get(id(self.module), ())
+                )
+                self.module = bin_mix_module
+                self.ir = bin_mix_module.schedule
+                self.schedule += "_bin_mix"
+                self.work_bin_mix = True
         self.owner_helpers = (
             owner_helpers if getattr(self.module, "owner_helper", False) else 0
         )
@@ -4286,6 +4476,32 @@ class FlashKDABlackwellBF16FusedLaunch:
             self.args.update(
                 initial_state_f32=initial_state_f32_pointer,
                 final_state_f32=final_state_f32_pointer,
+            )
+        if self.work_bin_mix:
+            # The give ring (chunk_state) and its ready words (zero_workspace):
+            # the owner zeroes each word it takes, so the program leaves every
+            # word zero and one zeroed allocation serves every launch of the
+            # plan.  The turnover program keeps its own bindings and reads the
+            # table alone.
+            self._work_bin_mix_fallback = (
+                *bin_mix_fallback,
+                {
+                    "chunk_state": self.args["chunk_state"],
+                    "zero_workspace": self.args["zero_workspace"],
+                    "seq_order": seq_order[: len(work_bin_table)],
+                },
+            )
+            self.args.update(
+                chunk_state=torch.empty(
+                    num_work_bins * WORK_BIN_MIX_SLOTS * WORK_BIN_MIX_SLOT_ELEMENTS,
+                    dtype=torch.bfloat16,
+                    device=q.device,
+                ),
+                zero_workspace=torch.zeros(
+                    num_work_bins * WORK_BIN_MIX_SLOTS,
+                    dtype=torch.uint32,
+                    device=q.device,
+                ),
             )
         if self.owner_helpers:
             # The packet ring (chunk_state) and its two word arrays: the ready
@@ -4518,6 +4734,8 @@ class FlashKDABlackwellBF16FusedLaunch:
         records.append(
             self._m64_owner_helper_record()
             if self.m64_owner_helpers
+            else self._work_bin_mix_record()
+            if self.work_bin_mix
             else _prepared_kernel_record(self.module, self.grid, self.args)
         )
         return records
@@ -4566,6 +4784,53 @@ class FlashKDABlackwellBF16FusedLaunch:
             logger.warning(
                 "KDA prefill: the device refused a cooperative M64 owner/helper "
                 "launch; the plan runs %s instead",
+                schedule,
+            )
+
+    def _work_bin_mix_record(self) -> tuple:
+        """The launch record of the bin-mix build.
+
+        A helper bin's chunks reach their owner through the ring while both
+        CTAs run, so the build is launched cooperatively.  The first refused
+        launch switches the plan for good to the turnover program
+        (_fall_back_from_work_bin_mix) and launches that instead; a refused
+        launch leaves the ring words untouched.
+        """
+        call, arguments = _prepared_kernel_record(self.module, self.grid, self.args)
+
+        def launch(*packed):
+            if self.work_bin_mix:
+                try:
+                    call(*packed)
+                    return
+                except RuntimeError as error:
+                    if not _cooperative_launch_refused(error):
+                        raise
+                self._fall_back_from_work_bin_mix()
+            _run_launch_records(
+                (_prepared_kernel_record(self.module, self.grid, self.args),)
+            )
+
+        return launch, arguments
+
+    def _fall_back_from_work_bin_mix(self) -> None:
+        """Switch the plan to the turnover program of its bins."""
+        global _WORK_BIN_MIX_REFUSAL_WARNED
+        module, grid, schedule, bindings = self._work_bin_mix_fallback
+        _clear_cuda_launch_error()
+        self.args.update(bindings)
+        self.module, self.grid, self.schedule = module, grid, schedule
+        self.ir = module.schedule
+        self.work_bin_mix = False
+        module.prepare(grid=grid, **self.args)
+        self.__dict__.pop("_launch_records", None)
+        if not _WORK_BIN_MIX_REFUSAL_WARNED:
+            _WORK_BIN_MIX_REFUSAL_WARNED = True
+            from flashinfer.jit.core import logger
+
+            logger.warning(
+                "KDA prefill: the device refused a cooperative bin-mix launch; "
+                "the plan runs %s instead",
                 schedule,
             )
 
@@ -5025,6 +5290,36 @@ def _affine_window_row_starts(
     return seq_ids, local_rows
 
 
+def _affine_window_table(
+    num_parts, first_parts, part_seq_ids, part_local_rows, merge_final_positions
+):
+    """The gathered-index main body's window table: four int64 per window.
+
+    Window ``w``: the sequence whose caller state index is its pool slot (-1:
+    the window starts no sequence), the row-table entry and the rows before the
+    window that make its checkpoint row start (with rows in place the caller's
+    entry of its sequence and its local rows; otherwise the main windows' own
+    row offsets, entry ``w``), and the position of its sequence's final pool
+    offset on the merging route (-1 elsewhere).
+    """
+    table = [[-1, w, 0, -1] for w in range(num_parts)]
+    if part_seq_ids is not None:
+        for w in range(num_parts):
+            table[w][1] = part_seq_ids[w]
+            table[w][2] = part_local_rows[w]
+    for seq, window in enumerate(first_parts):
+        table[window][0] = seq
+        if merge_final_positions is not None:
+            table[window][3] = merge_final_positions[seq]
+    return [value for row in table for value in row]
+
+
+def _gathers_window_indices(launch) -> bool:
+    """``launch``'s body reads the window indices from caller tensors (``window_table``)."""
+    plan = getattr(getattr(launch, "module", None), "_arg_plan", ())
+    return any(name == "window_table" for _kind, name in plan)
+
+
 class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
     """PR #4779 split-sequence affine prefix over direct-M128 windows.
 
@@ -5356,6 +5651,13 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
             host_i64["merge_final_positions"] = [
                 end - 2 if end >= 2 else num_parts - 1 for end in part_offsets[1:]
             ]
+        host_i64["window_table"] = _affine_window_table(
+            num_parts,
+            host_i64["first_parts"],
+            host_i64.get("part_seq_ids"),
+            host_i64.get("part_local_rows"),
+            host_i64.get("merge_final_positions"),
+        )
         uploaded_i32 = _upload_int_batch(q.device, host_i32, torch.int32)
         uploaded_i64 = _upload_int_batch(q.device, host_i64, torch.int64)
         if self._correction_merge:
@@ -5538,6 +5840,37 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
             state_slot_stride=initial_state.stride(0),
             use_state_indices=1,
         )
+        # A gathered-index main body reads each window's pool slot and row
+        # start from the caller's state indices and row table through the
+        # window table, and publishes the row starts and merge offsets the
+        # later passes read: the composite then launches no index gather
+        # (the chain route without the merging correction keeps it for the
+        # epilogue's int64 indices).
+        self._gathered_indices = _gathers_window_indices(self._main)
+        self._index_gather_launched = not (
+            self._gathered_indices and (self._apply_route or self._correction_merge)
+        )
+        if self._gathered_indices:
+            rows_in_place = state_checkpoints is not None and self._checkpoint_in_place
+            published = torch.empty((num_parts,), dtype=torch.int64, device=q.device)
+            self._main.args.update(
+                state_indices_addr=state_indices.data_ptr(),
+                state_indices_i64=int(state_indices.dtype == torch.int64),
+                window_table=uploaded_i64["window_table"],
+                gathered_row_starts=self._part_row_starts
+                if rows_in_place
+                else published,
+                gathered_final_offsets=self._merge_final_offsets
+                if self._correction_merge
+                else published,
+                final_slot_stride=int(final_state.stride(0)),
+            )
+            if rows_in_place:
+                self._main.args["checkpoint_cu_starts_addr"] = (
+                    self._checkpoint_start.data_ptr()
+                )
+            self._main.__dict__.pop("_launch_records", None)
+            self.schedule += "_gathered_indices"
         self._main.args["initial_state_f32"] = self._initial_pool_pointer
         if self._chain_map_fold:
             # The map-fold build writes every tail window's BF16 map state
@@ -5914,10 +6247,13 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
 
         Runs on the first launch, after a plan-cache rebind (which drops the
         records) and on a hit under CUDA-graph capture (which marks the
-        composite stale).  Every descriptor re-encode is enqueued right before
-        the first kernel that reads it, and a deferred map/correction rebind is
-        applied while the first chain kernel runs.  Later calls fire the
-        stored records back to back with no host work between two launches.
+        composite stale).  Every part's descriptors are re-encoded and every
+        record is built, the main part's first, before the first record fires:
+        the host work of a rebind then precedes the call's first kernel instead
+        of holding the GPU idle between the index gather and the main kernel.
+        Every descriptor re-encode still precedes, on the stream, the first
+        kernel that reads it.  Later calls fire the stored records back to back
+        with no host work between two launches.
         """
         if self._descriptors_stale:
             # A plan-cache hit under CUDA-graph capture marks the composite;
@@ -5932,38 +6268,41 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
             self._apply_descriptors_stale = bool(self._apply_route)
             self._apply_prefix_stale = bool(self._apply_route)
             self._descriptors_stale = False
+        main_records = _settled_launch_records(self._main)
+        # The map/correction rebinds of a plan-cache hit were deferred past the
+        # main part's settle; apply them before their records are built.
+        flush_deferred_rebind(self)
         map_first = self._map_first
-        if map_first:
-            # The map is the first chain kernel: its rebind lands before it.
-            flush_deferred_rebind(self)
         records: list = []
+        add = records.extend
 
-        def fire(part) -> None:
-            _run_launch_records(part)
-            records.extend(part)
-
-        fire(
+        add(
             [
                 (destination.copy_, (source,))
                 for destination, source in self._affine_input_refreshes
             ]
         )
         if map_first:
-            fire(self._map_records())
-        if self._correction_merge:
+            add(self._map_records())
+        if not self._index_gather_launched:
+            # The gathered-index main body reads the caller's indices itself.
+            pass
+        elif self._correction_merge:
             # The index gather also places each sequence's pool offset at the
             # correction window that ends it.
-            fire(
+            add(
                 [
                     (
                         self._fused_epilogue.index_prep_merge,
-                        _ffi_arguments(
+                        _ffi_arguments_reusing(
+                            self,
+                            "index_prep_merge",
                             (
                                 *self._index_prep_arguments(),
                                 self._merge_final_positions,
                                 self._merge_final_offsets,
                                 self._fused_epilogue.pool_slot_stride,
-                            )
+                            ),
                         ),
                     )
                 ]
@@ -5972,26 +6311,25 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
             # One kernel gathers every per-call index the parts consume
             # (window state indices, in-place row starts, the int64 state
             # indices of the epilogue).
-            fire(
+            add(
                 [
                     (
                         self._fused_epilogue.index_prep,
-                        _ffi_arguments(self._index_prep_arguments()),
+                        _ffi_arguments_reusing(
+                            self, "index_prep", self._index_prep_arguments()
+                        ),
                     )
                 ]
             )
         else:
-            fire([(self._gather_indices_with_torch, ())])
-        fire(_settled_launch_records(self._main))
-        # The map/correction rebinds of a plan-cache hit were deferred past
-        # the first chain kernel; apply them while it runs.
-        flush_deferred_rebind(self)
+            add([(self._gather_indices_with_torch, ())])
+        add(main_records)
         if self._fused_epilogue is None and not self._apply_route:
             # The int64 index copy is only consumed by the final-state
             # scatter, so it follows the first chain kernel.
-            fire([(self._state_indices_long.copy_, (self._state_indices,))])
+            add([(self._state_indices_long.copy_, (self._state_indices,))])
         if not map_first:
-            fire(self._map_records())
+            add(self._map_records())
         scan_grid = (
             self._num_sequences
             * int(self._main_final.shape[1])
@@ -5999,7 +6337,7 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
             1,
             1,
         )
-        fire(
+        add(
             [
                 _prepared_kernel_record(
                     self._scan_module, scan_grid, self._scan_bindings()
@@ -6007,7 +6345,7 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
             ]
         )
         if self._use_output_projection:
-            fire(
+            add(
                 [
                     _prepared_kernel_record(
                         self._projection_module,
@@ -6017,7 +6355,7 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
                 ]
             )
         elif self._apply_route:
-            fire(
+            add(
                 [
                     _prepared_kernel_record(
                         self._apply_module, self._apply_grid, self._apply_bindings()
@@ -6025,21 +6363,24 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
                 ]
             )
         else:
-            fire(_settled_launch_records(self._correction))
+            add(_settled_launch_records(self._correction))
         if not self._apply_route and not self._correction_merge:
             # The apply route's scan kernel wrote the final states into the
             # pool and the row-0 carries into the checkpoint rows.
             if self._fused_epilogue is not None:
-                fire(
+                add(
                     [
                         (
                             self._fused_epilogue.run,
-                            _ffi_arguments(self._fused_epilogue_arguments()),
+                            _ffi_arguments_reusing(
+                                self, "epilogue", self._fused_epilogue_arguments()
+                            ),
                         )
                     ]
                 )
             else:
-                fire([(self._torch_epilogue, ())])
+                add([(self._torch_epilogue, ())])
+        _run_launch_records(records)
         self._launch_records = tuple(records)
 
     def _map_records(self) -> list:
