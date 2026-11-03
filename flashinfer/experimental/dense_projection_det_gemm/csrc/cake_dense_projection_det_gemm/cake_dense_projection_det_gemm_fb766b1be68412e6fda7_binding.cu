@@ -233,7 +233,7 @@ CUtensorMap EncodeTma_OUT16(const TensorView& t) {
   return map;
 }
 
-void Run(TensorView a_A, TensorView a_B, TensorView a_OUT32, TensorView a_OUT16, TensorView a_out, TensorView a_out32, TensorView a_ws, TensorView a_counters, int64_t a_M, int64_t a_N, int64_t a_m_tiles, int64_t a_n_tiles, int64_t a_group_m, int64_t a_promo_code, int64_t a_k_iters, int64_t a_ldo, int64_t a_out_l, int64_t a_num_cluster_tiles, int64_t a_num_l, int64_t a_num_full, int64_t a_iters_per_unit, int64_t a_sk_iters, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
+void Run(TensorView a_A, TensorView a_B, TensorView a_OUT32, TensorView a_OUT16, TensorView a_out, TensorView a_out32, TensorView a_ws, TensorView a_counters, int64_t a_M, int64_t a_N, int64_t a_m_tiles, int64_t a_n_tiles, int64_t a_group_m, int64_t a_promo_code, int64_t a_k_iters, int64_t a_ldo, int64_t a_out_l, int64_t a_num_cluster_tiles, int64_t a_num_l, int64_t a_num_full, int64_t a_iters_per_unit, int64_t a_sk_iters, int64_t a_enable_pdl, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
   DLDevice dev = a_A.device();
   tvm::ffi::CUDADeviceGuard device_guard(dev.device_id);
   check_cuda_tensor(a_A, "A");
@@ -347,6 +347,8 @@ void Run(TensorView a_A, TensorView a_B, TensorView a_OUT32, TensorView a_OUT16,
       << KERNEL_NAME << ": requires (((num_cluster_tiles - num_full) * iters_per_unit) <= 2147483647)";
   TVM_FFI_CHECK(((CheckedSub(a_num_cluster_tiles, a_num_full) == 0LL) || (CheckedMul(2LL, a_iters_per_unit) >= a_k_iters)), ValueError)
       << KERNEL_NAME << ": requires (((num_cluster_tiles - num_full) == 0) || ((2 * iters_per_unit) >= k_iters))";
+  TVM_FFI_CHECK(a_enable_pdl == 0LL || a_enable_pdl == 1LL, ValueError)
+      << KERNEL_NAME << ": 'enable_pdl' = " << a_enable_pdl << " is not 0 or 1";
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
       << KERNEL_NAME << ": the grid (" << grid_x << ", " << grid_y << ", " << grid_z << ") must be positive";
   TVM_FFI_CHECK(grid_x <= 2147483647 && grid_y <= 65535 && grid_z <= 65535, ValueError)
@@ -393,15 +395,21 @@ void Run(TensorView a_A, TensorView a_B, TensorView a_OUT32, TensorView a_OUT16,
   config.blockDim = dim3(320, 1, 1);
   config.dynamicSmemBytes = 222336;
   config.stream = stream;
-  cudaLaunchAttribute attrs[2] = {};
+  cudaLaunchAttribute attrs[3] = {};
   attrs[0].id = cudaLaunchAttributeClusterDimension;
   attrs[0].val.clusterDim.x = 2;
   attrs[0].val.clusterDim.y = 1;
   attrs[0].val.clusterDim.z = 1;
   attrs[1].id = cudaLaunchAttributeClusterSchedulingPolicyPreference;
   attrs[1].val.clusterSchedulingPolicyPreference = cudaClusterSchedulingPolicySpread;
+  int n = 2;
+  if (a_enable_pdl) {
+    attrs[n].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[n].val.programmaticStreamSerializationAllowed = 1;
+    ++n;
+  }
   config.attrs = attrs;
-  config.numAttrs = 2;
+  config.numAttrs = n;
   CheckCuda(cudaLaunchKernelExC(&config, reinterpret_cast<const void*>(kernel_cake_dense_projection_det_gemm_fb766b1be68412e6fda7), kernel_args),
             "cudaLaunchKernelExC");
 }

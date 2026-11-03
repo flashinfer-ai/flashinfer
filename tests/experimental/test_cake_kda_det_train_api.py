@@ -112,6 +112,7 @@ def test_entry_points_forward_every_keyword(monkeypatch: pytest.MonkeyPatch) -> 
                 "A_log": None,
                 "dt_bias": None,
                 "lower_bound": None,
+                "use_qk_l2norm_in_kernel": False,
             },
         ),
         (
@@ -127,6 +128,7 @@ def test_entry_points_forward_every_keyword(monkeypatch: pytest.MonkeyPatch) -> 
                 "A_log": None,
                 "dt_bias": None,
                 "lower_bound": None,
+                "use_qk_l2norm_in_kernel": False,
             },
         ),
         (
@@ -142,6 +144,7 @@ def test_entry_points_forward_every_keyword(monkeypatch: pytest.MonkeyPatch) -> 
                 "A_log": None,
                 "dt_bias": None,
                 "lower_bound": None,
+                "use_qk_l2norm_in_kernel": False,
             },
         ),
     ]
@@ -296,6 +299,7 @@ def test_signatures_keep_the_contracts_keywords() -> None:
         "A_log",
         "dt_bias",
         "lower_bound",
+        "use_qk_l2norm_in_kernel",
     ]
     bwd = inspect.signature(det_api.chunk_kda_det_bwd).parameters
     assert list(bwd) == [
@@ -315,6 +319,7 @@ def test_signatures_keep_the_contracts_keywords() -> None:
         "A_log",
         "dt_bias",
         "lower_bound",
+        "use_qk_l2norm_in_kernel",
     ]
     for name in (
         "scale",
@@ -327,6 +332,7 @@ def test_signatures_keep_the_contracts_keywords() -> None:
         "A_log",
         "dt_bias",
         "lower_bound",
+        "use_qk_l2norm_in_kernel",
     ):
         assert fwd[name].kind is inspect.Parameter.KEYWORD_ONLY
     for name in (
@@ -339,10 +345,11 @@ def test_signatures_keep_the_contracts_keywords() -> None:
         "A_log",
         "dt_bias",
         "lower_bound",
+        "use_qk_l2norm_in_kernel",
     ):
         assert bwd[name].kind is inspect.Parameter.KEYWORD_ONLY
     autograd = inspect.signature(det_api.chunk_kda_det).parameters
-    assert list(autograd)[-9:] == [
+    assert list(autograd)[-10:] == [
         "scale",
         "workspace",
         "save_mode",
@@ -352,12 +359,19 @@ def test_signatures_keep_the_contracts_keywords() -> None:
         "A_log",
         "dt_bias",
         "lower_bound",
+        "use_qk_l2norm_in_kernel",
     ]
-    for name in ("use_gate_in_kernel", "A_log", "dt_bias", "lower_bound"):
+    for name in (
+        "use_gate_in_kernel",
+        "A_log",
+        "dt_bias",
+        "lower_bound",
+        "use_qk_l2norm_in_kernel",
+    ):
         assert autograd[name].kind is inspect.Parameter.KEYWORD_ONLY
-    assert fwd["use_gate_in_kernel"].default is False
-    assert bwd["use_gate_in_kernel"].default is False
-    assert autograd["use_gate_in_kernel"].default is False
+    for params in (fwd, bwd, autograd):
+        assert params["use_gate_in_kernel"].default is False
+        assert params["use_qk_l2norm_in_kernel"].default is False
     factory = inspect.signature(det_api.kda_det_train_arena).parameters
     assert list(factory) == [
         "lean",
@@ -366,12 +380,61 @@ def test_signatures_keep_the_contracts_keywords() -> None:
         "max_docs_per_batch",
     ] and all(p.kind is inspect.Parameter.KEYWORD_ONLY for p in factory.values())
     ws = inspect.signature(det_api.kda_det_train_workspace).parameters
-    assert list(ws)[-3:] == ["arena", "doc_lengths", "use_gate_in_kernel"]
+    assert list(ws)[-4:] == [
+        "arena",
+        "doc_lengths",
+        "use_gate_in_kernel",
+        "use_qk_l2norm_in_kernel",
+    ]
     nbytes = inspect.signature(det_api.kda_det_train_workspace_bytes).parameters
-    assert list(nbytes)[-3:] == ["arena", "doc_lengths", "use_gate_in_kernel"]
-    for params in (ws, nbytes):
-        assert params["use_gate_in_kernel"].kind is inspect.Parameter.KEYWORD_ONLY
-        assert params["use_gate_in_kernel"].default is False
+    assert list(nbytes)[-4:] == [
+        "arena",
+        "doc_lengths",
+        "use_gate_in_kernel",
+        "use_qk_l2norm_in_kernel",
+    ]
+    saved_q = inspect.signature(det_api.kda_det_train_saved_bytes).parameters
+    for params in (ws, nbytes, saved_q):
+        for name in ("use_gate_in_kernel", "use_qk_l2norm_in_kernel"):
+            if name in params:
+                assert params[name].kind is inspect.Parameter.KEYWORD_ONLY
+                assert params[name].default is False
+    assert "use_qk_l2norm_in_kernel" in saved_q
+
+
+def test_qk_l2norm_mode_is_forwarded_to_the_byte_queries_and_the_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = []
+
+    def recorder(name):
+        def fake(*args, **kwargs):
+            calls.append((name, kwargs.get("l2n")))
+            return name
+
+        return fake
+
+    monkeypatch.setattr(cake_backend, "workspace_bytes", recorder("bytes"))
+    monkeypatch.setattr(cake_backend, "saved_bytes", recorder("saved"))
+    monkeypatch.setattr(
+        cake_backend.KdaDetWorkspace, "for_problem", recorder("workspace")
+    )
+    for flag in (False, True):
+        det_api.kda_det_train_workspace_bytes(
+            1, 1, 1, sm_count=148, use_qk_l2norm_in_kernel=flag
+        )
+        det_api.kda_det_train_saved_bytes(1, 1, use_qk_l2norm_in_kernel=flag)
+        det_api.kda_det_train_workspace(1, 1, 1, "cuda", use_qk_l2norm_in_kernel=flag)
+    assert calls == [
+        ("bytes", "off"),
+        ("saved", "off"),
+        ("workspace", "off"),
+        ("bytes", "fused"),
+        ("saved", "fused"),
+        ("workspace", "fused"),
+    ]
+    with pytest.raises(ValueError, match="use_qk_l2norm_in_kernel must be a bool"):
+        det_api.kda_det_train_saved_bytes(1, 1, use_qk_l2norm_in_kernel=1)
 
 
 def test_public_entries_run_the_backend() -> None:

@@ -971,3 +971,177 @@ def test_device_keep_logits_on_both_routes_is_the_plain_call(monkeypatch):
             ), (deterministic, tuning)
             assert bool(torch.isfinite(kept["dX"].float()).all())
             assert torch.all(kept["dX"][~inp.valid] == 0)
+
+
+# ---------------------------------------------------------------------------
+# Temperature of the log-probability entry with ``deterministic=False``
+# ---------------------------------------------------------------------------
+
+
+def test_false_temperature_reaches_the_non_deterministic_temperature_entry(recorders):
+    """``deterministic=False`` with a temperature (a per-token tensor, a scalar) calls the package's
+    ``chunked_lm_head_logprob_temperature`` -- the opt-in module's for ``memory_mode`` / ``num_valid_rows`` -- with
+    ``temperature`` / ``check_temperature`` unchanged (a tensor as the same object) and every other keyword of the
+    call without one; ``None`` and the scalars whose FP32 value is 1.0 call the entry without a temperature, with
+    neither keyword; a bool is a ``ValueError``; ``chunked_lm_head_preload(temperature=True)`` passes it to the
+    opt-in module's ``preload``.  The deterministic bodies are not called."""
+    bodies, fake = recorders
+    X, W, labels = _host_call()
+    tau = torch.full((4,), 0.7)
+    public.chunked_lm_head_logprob(X, W, labels, deterministic=False)
+    ((_, plain),) = fake["backend"].recorders["chunked_lm_head_logprob"].calls
+    calls = fake["backend"].chunked_lm_head_logprob_temperature.calls
+    for value, check in ((tau, True), (0.7, False), (2, False)):
+        calls.clear()
+        public.chunked_lm_head_logprob(
+            X,
+            W,
+            labels,
+            deterministic=False,
+            temperature=value,
+            check_temperature=check,
+        )
+        ((args, kw),) = calls
+        assert args == (X, W, labels)
+        assert kw["temperature"] is value and kw["check_temperature"] is check
+        assert {k: v for k, v in kw.items() if "temperature" not in k} == plain
+    for opt in (
+        dict(memory_mode="budget"),
+        dict(memory_mode="fast"),
+        dict(num_valid_rows=3),
+    ):
+        recorder = fake["opt_in"].chunked_lm_head_logprob_temperature
+        recorder.calls.clear()
+        public.chunked_lm_head_logprob(
+            X,
+            W,
+            labels,
+            deterministic=False,
+            temperature=tau,
+            check_temperature=True,
+            **opt,
+        )
+        ((_, kw),) = recorder.calls
+        assert kw["temperature"] is tau and kw["check_temperature"] is True, opt
+        assert kw["deterministic"] is False, opt
+        assert all(kw[k] == v for k, v in opt.items()), opt
+    for value in (None, 1.0, 1, 1.0 + 1e-9):
+        fake["backend"].recorders["chunked_lm_head_logprob"].calls.clear()
+        calls.clear()
+        public.chunked_lm_head_logprob(
+            X, W, labels, deterministic=False, temperature=value, check_temperature=True
+        )
+        ((_, kw),) = fake["backend"].recorders["chunked_lm_head_logprob"].calls
+        assert kw == plain and not calls, value
+    with pytest.raises(ValueError, match="not a bool"):
+        public.chunked_lm_head_logprob(
+            X, W, labels, deterministic=False, temperature=True
+        )
+    preload = fake["opt_in"].preload
+    preload.calls.clear()
+    public.chunked_lm_head_preload("cuda:0", deterministic=False, temperature=True)
+    public.chunked_lm_head_preload("cuda:0", deterministic=False)
+    assert preload.calls == [
+        (("cuda:0",), {"temperature": True}),
+        (("cuda:0",), {}),
+    ]
+    assert not any(b.calls for b in bodies.values())
+
+
+def test_false_temperature_refuses_keep_logits():
+    """With ``deterministic=False`` and ``memory_mode="keep_logits"`` the public entry passes a temperature to the
+    package's opt-in temperature entry, which rejects a scalar other than 1.0 and a per-token tensor with a
+    ``ValueError`` before any launch."""
+    inp = make_inputs(
+        37,
+        seed=SEED + 37,
+        H=H_HOST,
+        V=V_HOST,
+        device=torch.device("cpu"),
+        ignore_frac=0.2,
+        temperature="hetero",
+    )
+    for temperature in (0.5, inp.temperature):
+        with pytest.raises(ValueError, match="takes no temperature"):
+            public.chunked_lm_head_logprob(
+                inp.X,
+                inp.W,
+                inp.labels,
+                chunk_size=16,
+                memory_mode="keep_logits",
+                temperature=temperature,
+                deterministic=False,
+            )
+
+
+def test_device_false_temperature_through_the_public_entry():
+    """Through the public entry on the generated program with ``deterministic=False``: a heterogeneous per-token
+    temperature and a scalar give the bits (integer views; one dX slice pinned) of the package's temperature entry
+    with the same argument, ``temperature=1.0`` the bits of the call without the keyword; with the default dX slices
+    ``logp`` / ``dW`` are the deterministic entry's bits with the same temperature;
+    ``chunked_lm_head_preload(deterministic=False, temperature=True)`` loads the temperature forms and a call after it
+    gives the same bits."""
+    _require_device()
+    nd = importlib.import_module(
+        "flashinfer.experimental.cake.cake_lm_head_loss.cake_backend"
+    )
+    name, _ = nd.record_for(torch.device("cuda"))
+    if not set(nd.TEMPERATURE_STAGES) <= set(
+        nd.registered_stages_with_temperature(name)
+    ):
+        pytest.skip("the registered program has no temperature forms")
+    inp = make_inputs(
+        4097, seed=SEED + 4097, device="cuda", ignore_frac=0.05, temperature="hetero"
+    )
+    one = dict(gemm_tuning={"dx": {"k_slices": 1}})
+
+    def run(fn, **kw):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            out = _logprob_step(fn, inp, chunk_size=4096, backend="cake", **kw)
+        torch.cuda.synchronize()
+        return out
+
+    def same(a, b, case, keys=("logp", "dX", "dW")):
+        for key in keys:
+            assert torch.equal(_bits(a[key]), _bits(b[key])), (case, key)
+
+    nd_kw = dict(deterministic=False)
+    for value in (inp.temperature, 0.7):
+        same(
+            run(public.chunked_lm_head_logprob, temperature=value, **one, **nd_kw),
+            run(
+                nd.chunked_lm_head_logprob_temperature,
+                temperature=value,
+                **one,
+                **nd_kw,
+            ),
+            type(value).__name__,
+        )
+        same(
+            run(public.chunked_lm_head_logprob, temperature=value, **nd_kw),
+            run(public.chunked_lm_head_logprob, temperature=value),
+            ("vs deterministic", type(value).__name__),
+            keys=("logp", "dW"),
+        )
+    plain = run(public.chunked_lm_head_logprob, **one, **nd_kw)
+    same(
+        plain,
+        run(public.chunked_lm_head_logprob, temperature=1.0, **one, **nd_kw),
+        "one",
+    )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        public.chunked_lm_head_preload(deterministic=False, temperature=True)
+    same(
+        run(
+            nd.chunked_lm_head_logprob_temperature,
+            temperature=inp.temperature,
+            **one,
+            **nd_kw,
+        ),
+        run(
+            public.chunked_lm_head_logprob, temperature=inp.temperature, **one, **nd_kw
+        ),
+        "after preload",
+    )

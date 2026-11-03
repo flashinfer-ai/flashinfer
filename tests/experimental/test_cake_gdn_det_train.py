@@ -35,9 +35,11 @@ graph capture and one side stream per caller stream), the launches on the
 caller's stream (one and two streams) and from cached entries, the two preps, ``q`` / ``k`` off the tensor maps' 16-byte
 alignment (the plain prep), and an equal-length batch against the same sequences packed; and the input contract: every
 rejected input raises before the first launch, a host tensor at the low-level entries reaches the binding's device
-check, and the device route does not synchronize.  The wavefront pair (``dhu_tc2_wavefront`` / ``tail_g2_bf16_wavefront``): its chunk
-order and its rule per architecture without a device; on a device the pair against the separate launches with the
-adjoint workspaces poisoned (serial, with an empty sequence, and a split pass 2), repeated calls, the shipped rule on
+check, and the device route does not synchronize.  The wavefront pair (``dhu_tc2_wavefront`` / ``tail_g2_bf16_wavefront``,
+the split pass 2 of more CTAs than SMs on ``dhu_tc2_wavefront_split``): its chunk order and its rule per architecture
+(and the scan it picks) without a device; on a device the pair against the separate launches with the adjoint
+workspaces poisoned (serial, with an empty sequence, a split pass 2, and one of more CTAs than SMs on
+``dhu_tc2_wavefront_split``), repeated calls, the shipped rule on
 the device's architecture (serial plans, and split pass 2s below and above the split side's work floor), the rows the
 rule leaves alone launching exactly what the rule turned off launches, a CUDA graph capture (the separate launches),
 accumulated gradients, strided views and a checkpointed call.  The
@@ -352,7 +354,7 @@ def test_former_names_are_aliases_of_the_det_names() -> None:
 
 
 def test_registry_records_are_well_formed() -> None:
-    assert len(cake_jit.STAGES) == 34 and len(set(cake_jit.STAGES)) == 34
+    assert len(cake_jit.STAGES) == 35 and len(set(cake_jit.STAGES)) == 35
     assert set(cake_chain.LAUNCH_ARGS) == set(cake_jit.STAGES)
     for arch in ARCHES:
         for stage in cake_jit.STAGES:
@@ -377,8 +379,16 @@ def test_registry_records_are_well_formed() -> None:
         params = cake_backend.parameters(name)
         assert sorted(params) == sorted(cake_chain.LAUNCH_ARGS[rec["stage"]]), name
         libraries.add(rec["library"])
-    # one program per record: a kernel swap renames exactly the records it touches
-    assert len(libraries) == len(cake_jit.MODULES)
+    # one program per record: a kernel swap renames exactly the records it touches; the one shared library is the
+    # sm_107a scan of the split pass 2's pair, which is that architecture's dhu_tc2_wavefront program
+    shared = cake_jit.MODULES["dhu_tc2_wavefront_split_sm_107a"]
+    assert shared["arches"] == ["sm_107a"]
+    assert shared["library"] == cake_jit.MODULES["dhu_tc2_wavefront"]["library"]
+    assert "sm_107a" in cake_jit.MODULES["dhu_tc2_wavefront"]["arches"]
+    split = cake_jit.MODULES["dhu_tc2_wavefront_split"]
+    assert split["arches"] == ["sm_100a", "sm_103a"]
+    assert split["library"] != cake_jit.MODULES["dhu_tc2_wavefront"]["library"]
+    assert len(libraries) == len(cake_jit.MODULES) - 1
 
 
 def test_scan_records_carry_the_planner_constants() -> None:
@@ -1222,9 +1232,13 @@ TWO_STREAM_FORMS = {
 
 
 def _adjoint_two_streams(form: str, heads: tuple[int, int]) -> bool:
-    """Whether the adjoint ``dhu_tc2`` runs as two groups on a grouped table: a serial plan beside ``tail_g2``, the
-    pass 2 of a split plan beside ``tail_g3``; the other pairings keep the adjoint on the caller's stream."""
-    return (form, heads[1] // heads[0]) in (("serial", 2), ("split", 3))
+    """Whether the adjoint ``dhu_tc2`` runs as two groups on a grouped table on this device: a serial plan beside
+    ``tail_g2`` (beside ``tail_g3`` too on the architectures of ``TWO_STREAM_SERIAL_G3_ARCHS``), the pass 2 of a split
+    plan beside ``tail_g3``; the other pairings keep the adjoint on the caller's stream."""
+    arch = cake_backend.device_arch(torch.cuda.current_device())
+    serial = (2, 3) if arch in cake_chain.TWO_STREAM_SERIAL_G3_ARCHS else (2,)
+    group = heads[1] // heads[0]
+    return (form == "serial" and group in serial) or (form, group) == ("split", 3)
 
 
 @pytest.mark.parametrize("save_state", [True, False], ids=["saved", "recompute"])
@@ -1256,8 +1270,8 @@ def test_two_streams_match_one_stream(
         runs.append(_run(inputs, seq_lens, initial_state=h0, output_final_state=True, dht=dht, streams=streams,
                          lpt=lpt, save_state=save_state, **STREAM_PINS))  # fmt: skip
         side = [stage for stage, stream in launches[start:] if stream != main]
-        # the side stream: wy_tc and fwd_ho of the forward's group A, dhu_tc2 of the adjoint's group B beside tail_g2
-        # of group A (beside tail_g3 a serial adjoint scan runs one launch on the caller's stream)
+        # the side stream: wy_tc and fwd_ho of the forward's group A, dhu_tc2 of the adjoint's group B beside the
+        # fused tail of group A (beside tail_g3 off TWO_STREAM_SERIAL_G3_ARCHS one launch on the caller's stream)
         expected = ["wy_tc", "fwd_ho"] + (
             ["dhu_tc2"] if _adjoint_two_streams("serial", heads) else []
         )
@@ -1672,6 +1686,9 @@ def test_equal_length_batch_matches_the_packed_layout(preps, device) -> None:
 # --------------------------------------------------------------------------- the wavefront pair
 
 WAVEFRONT_PAIR = ("dhu_tc2_wavefront", "tail_g2_bf16_wavefront")
+# the split pass 2 of more CTAs than SMs: the pair's scan with the elected release
+WAVEFRONT_SPLIT_PAIR = ("dhu_tc2_wavefront_split", "tail_g2_bf16_wavefront")
+WAVEFRONT_STAGES = set(WAVEFRONT_PAIR) | set(WAVEFRONT_SPLIT_PAIR)
 # a serial plan with the adjoint scan on dhu_tc2
 WAVEFRONT_PINS = {"segment_chunks": 0, "dhu_scan": "tc"}
 
@@ -1721,9 +1738,9 @@ def test_wavefront_order_follows_the_scan() -> None:
 
 
 # (sequences, HV, adjoint segment chunks) -> whether the table's side of the rule holds on (sm_100a 148 SMs, sm_103a
-# 152, sm_107a 212 / 216): 2 x segments x HV <= SMs, and on sm_100a HV >= 32; on sm_100a also a split adjoint plan of
-# more than SMs pass-2 CTAs (segments x HV) at any HV with tokens x HV >= 3 x 2^17; never on sm_107a (not in
-# WAVEFRONT_ARCHS)
+# 152, sm_107a 212 / 216): 2 x segments x HV <= SMs, and on sm_100a HV >= 32 (scan dhu_tc2_wavefront); on sm_100a and
+# sm_103a also a split adjoint plan of more than SMs pass-2 CTAs (segments x HV) at any HV with tokens x HV >= 3 x 2^17
+# (scan dhu_tc2_wavefront_split); never on sm_107a (not in WAVEFRONT_ARCHS)
 WAVEFRONT_TABLE_ROWS = {
     "r01_4x4096_hv16": ((4096,) * 4, 16, 0, (False, True, False, False)),
     "r07_1x16384_hv16": ((16384,), 16, 0, (False, True, False, False)),
@@ -1731,16 +1748,20 @@ WAVEFRONT_TABLE_ROWS = {
     "r03_8x4096_hv16": ((4096,) * 8, 16, 0, (False, False, False, False)),
     "3x4096_hv32": ((4096,) * 3, 32, 0, (False, False, False, False)),
     # split: 13 segments x HV 16 = 208 pass-2 CTAs, 30100 tokens x 16 = 481600 (above the work floor)
-    "r04_7x4.3k_hv16_split46": ((4199, 2781, 4282, 4448, 4723, 5804, 3863), 16, 46, (True, False, False, False)),
+    "r04_7x4.3k_hv16_split46": ((4199, 2781, 4282, 4448, 4723, 5804, 3863), 16, 46, (True, True, False, False)),
+    # split: 19 x 16 = 304 CTAs (the sm_103a plan of the same layout)
+    "r04_7x4.3k_hv16_split31": ((4199, 2781, 4282, 4448, 4723, 5804, 3863), 16, 31, (True, True, False, False)),
     # split: 13 x 16 = 208 CTAs, 12750 tokens x 16 = 204000 (below the work floor: host-bound)
     "r02_3x4.25k_hv16_split17": ((5406, 3448, 3896), 16, 17, (False, False, False, False)),
     # split: 12 x 32 = 384 CTAs at the work floor (12288 x 32) and one chunk below it (12224 x 32)
-    "1x12288_hv32_split16": ((12288,), 32, 16, (True, False, False, False)),
+    "1x12288_hv32_split16": ((12288,), 32, 16, (True, True, False, False)),
     "1x12224_hv32_split16": ((12224,), 32, 16, (False, False, False, False)),
     # split: 4 x 16 = 64 CTAs (sm_100a: below the SMs and HV < 32)
     "1x16384_hv16_split64": ((16384,), 16, 64, (False, True, False, False)),
     # split: 8 x 32 = 256 CTAs
-    "1x16384_hv32_split32": ((16384,), 32, 32, (True, False, False, False)),
+    "1x16384_hv32_split32": ((16384,), 32, 32, (True, True, False, False)),
+    # split: 7 x 32 = 224 CTAs (the sm_103a plan of r10)
+    "r10_1x16384_hv32_split37": ((16384,), 32, 37, (True, True, False, False)),
     # split: 2 x 32 = 64 CTAs, at most half of every device's SMs
     "1x16384_hv32_split128": ((16384,), 32, 128, (True, True, False, False)),
 }  # fmt: skip
@@ -1756,7 +1777,7 @@ WAVEFRONT_DEVICES = (
 def test_wavefront_rule_per_architecture(row, monkeypatch) -> None:
     assert cake_chain.WAVEFRONT_ARCHS == ("sm_100a", "sm_103a")
     assert cake_chain.WAVEFRONT_MIN_V_HEADS == {"sm_100a": 32}
-    assert cake_chain.WAVEFRONT_SPLIT_ARCHS == ("sm_100a",)
+    assert cake_chain.WAVEFRONT_SPLIT_ARCHS == ("sm_100a", "sm_103a")
     assert cake_chain.WAVEFRONT_SPLIT_MIN_TOKEN_HEADS == 393216
     assert cake_chain.wavefront_engaged(4, 8, 148)
     assert not cake_chain.wavefront_engaged(10, 8, 148)
@@ -1765,6 +1786,9 @@ def test_wavefront_rule_per_architecture(row, monkeypatch) -> None:
     assert cake_chain.wavefront_split_engaged(12, 32, 148, 12288)
     assert not cake_chain.wavefront_split_engaged(12, 32, 148, 12287)
     assert not cake_chain.wavefront_split_engaged(13, 16, 148, 12750)
+    assert cake_chain.wavefront_split_engaged(7, 32, 152, 16384)
+    assert cake_chain.wavefront_split_engaged(19, 16, 152, 30100)
+    assert not cake_chain.wavefront_split_engaged(4, 32, 152, 16384)
     assert not cake_chain.wavefront_split_engaged(37, 4, 148, 1 << 20)
     assert not cake_chain.wavefront_split_engaged(4, 16, 148, 1 << 20)
     seq_lens, num_v_heads, segment_chunks, want = WAVEFRONT_TABLE_ROWS[row]
@@ -1779,10 +1803,17 @@ def test_wavefront_rule_per_architecture(row, monkeypatch) -> None:
         monkeypatch.setattr(
             cake_chain, "_device_props", lambda _index, n=sm_count: (n, 232448, 10)
         )
-        got.append(cake_chain._wavefront_table(meta, num_v_heads, 0))
+        scan = cake_chain._wavefront_table(meta, num_v_heads, 0)
+        got.append(scan is not None)
+        # the split side (more pass-2 CTAs than SMs) runs the elected-release scan, the occupancy side the other
+        rounds = meta.bwd_segments.num_segments * num_v_heads > sm_count
+        assert scan in (
+            None,
+            "dhu_tc2_wavefront_split" if rounds else "dhu_tc2_wavefront",
+        ), (row, arch, scan)
         # the device route has no host layout: never
         device_meta = dataclasses.replace(meta, seq_lens=None)
-        assert not cake_chain._wavefront_table(device_meta, num_v_heads, 0)
+        assert cake_chain._wavefront_table(device_meta, num_v_heads, 0) is None
     assert tuple(got) == want, (row, got)
 
 
@@ -1798,24 +1829,31 @@ def _poison_adjoint_workspaces(device) -> int:
     return count
 
 
-# (layout, pins): a serial plan on dhu_tc2 (also with an empty sequence) and a split (64, 1) plan with its pass 2 on
-# dhu_tc2, value-head group of two, BF16 beta: 4 / 4 / 10 segments x HV 4 take at most half of any exported device
+# (layout, pins, heads, scan): a serial plan on dhu_tc2 (also with an empty sequence) and a split (64, 1) plan with its
+# pass 2 on dhu_tc2, value-head group of two, BF16 beta: 4 / 4 / 10 segments x HV 4 take at most half of any exported
+# device (dhu_tc2_wavefront); a split pass 2 of 50 segments x HV 32 = 1600 CTAs over 12477 tokens (more CTAs than
+# SMs, above the work floor: dhu_tc2_wavefront_split, on the architectures of WAVEFRONT_SPLIT_ARCHS)
 WAVEFRONT_ROWS = {
-    "serial": ((300, 77, 640, 1000), WAVEFRONT_PINS),
-    "serial-empty": ((300, 0, 1000, 77), WAVEFRONT_PINS),
-    "split": (
-        (1500, 77, 640),
-        {"scan_config": (64, 1), "segment_chunks": 4, "dhu_scan": "tc"},
-    ),
-}
+    "serial": ((300, 77, 640, 1000), WAVEFRONT_PINS, (2, 4), "dhu_tc2_wavefront"),
+    "serial-empty": ((300, 0, 1000, 77), WAVEFRONT_PINS, (2, 4), "dhu_tc2_wavefront"),
+    "split": ((1500, 77, 640), {"scan_config": (64, 1), "segment_chunks": 4, "dhu_scan": "tc"}, (2, 4),
+              "dhu_tc2_wavefront"),
+    "split-rounds": ((6000, 77, 6400), {"scan_config": (64, 1), "segment_chunks": 4, "dhu_scan": "tc"}, (16, 32),
+                     "dhu_tc2_wavefront_split"),
+}  # fmt: skip
 
 
 @pytest.mark.parametrize("row", sorted(WAVEFRONT_ROWS))
 def test_wavefront_pair_matches_the_plain_launches(row, device, monkeypatch) -> None:
     # the pair against the separate dhu_tc2 / tail_g2_bf16 launches, with the initial state, its gradient, the final
     # state and its gradient: bitwise, also with dh / dv2 poisoned between calls; the tail on the side stream
-    seq_lens, pins = WAVEFRONT_ROWS[row]
-    heads = (2, 4)
+    seq_lens, pins, heads, scan = WAVEFRONT_ROWS[row]
+    arch = cake_backend.device_arch(cake_chain._device_index(device))
+    if (
+        scan == "dhu_tc2_wavefront_split"
+        and arch not in cake_chain.WAVEFRONT_SPLIT_ARCHS
+    ):
+        pytest.skip(f"the split side of the rule does not run on {arch}")
     inputs = _inputs(seq_lens, heads, torch.bfloat16, device, seed=401)
     gen = torch.Generator().manual_seed(409)
     h0 = (
@@ -1829,7 +1867,7 @@ def test_wavefront_pair_matches_the_plain_launches(row, device, monkeypatch) -> 
     _wavefront_rule(monkeypatch, off=True)
     stages = _record_launches(monkeypatch)
     plain = _run(inputs, seq_lens, **kwargs)
-    assert not set(WAVEFRONT_PAIR) & set(stages) and "dhu_tc2" in stages, stages
+    assert not WAVEFRONT_STAGES & set(stages) and "dhu_tc2" in stages, stages
     _wavefront_rule(monkeypatch)
     main = torch.cuda.current_stream(device).cuda_stream
     launches = _record_streams(monkeypatch)
@@ -1839,19 +1877,19 @@ def test_wavefront_pair_matches_the_plain_launches(row, device, monkeypatch) -> 
         start = len(launches)
         got = _run(inputs, seq_lens, **kwargs)
         mine = [s for s, _ in launches[start:]]
-        assert (
-            mine.count("dhu_tc2_wavefront") == 1
-            and mine.count("tail_g2_bf16_wavefront") == 1
-        ), mine
-        assert not {"dhu_tc2", "tail_g2_bf16"} & set(mine), mine
+        assert mine.count(scan) == 1 and mine.count("tail_g2_bf16_wavefront") == 1, mine
+        assert not (
+            {"dhu_tc2", "tail_g2_bf16"}
+            | WAVEFRONT_STAGES - {scan, "tail_g2_bf16_wavefront"}
+        ) & set(mine), mine
         side = [s for s, stream in launches[start:] if stream != main]
         assert side == ["tail_g2_bf16_wavefront"], launches[start:]
         _assert_bitwise(got, plain, names)
 
 
 def test_wavefront_pair_repeats_bitwise(device, monkeypatch) -> None:
-    seq_lens, pins = WAVEFRONT_ROWS["serial"]
-    inputs = _inputs(seq_lens, (2, 4), torch.bfloat16, device, seed=419)
+    seq_lens, pins, heads, _scan = WAVEFRONT_ROWS["serial"]
+    inputs = _inputs(seq_lens, heads, torch.bfloat16, device, seed=419)
     _wavefront_rule(monkeypatch, off=True)
     want = _run(inputs, seq_lens, **pins)
     _wavefront_rule(monkeypatch)
@@ -1866,22 +1904,22 @@ def test_wavefront_pair_repeats_bitwise(device, monkeypatch) -> None:
 # sm_100a and sm_103a.  A split (64, 1) plan with its pass 2 on dhu_tc2 (24 + 2 + 10 chunks in segments of 4 = 10
 # segments): HV 4 (40 CTAs, below the SMs) engages on sm_103a only; HV 32 (320 CTAs, more than the SMs) nowhere, as
 # 2217 tokens x 32 stay below the split side's work floor; over 94 + 2 + 100 chunks (50 segments, 1600 CTAs; 12477
-# tokens x 32, above the floor) on sm_100a only.  sm_107a never
+# tokens x 32, above the floor) on sm_100a and sm_103a, on dhu_tc2_wavefront_split.  sm_107a never
 WAVEFRONT_SPLIT_PINS = {"scan_config": (64, 1), "segment_chunks": 4, "dhu_scan": "tc"}
 WAVEFRONT_DEFAULT_ROWS = {
-    "hv4": ((300, 77, 640), (2, 4), WAVEFRONT_PINS, ("sm_103a",)),
-    "hv32": ((300, 640), (16, 32), WAVEFRONT_PINS, ("sm_100a", "sm_103a")),
-    "split-hv4": ((1500, 77, 640), (2, 4), WAVEFRONT_SPLIT_PINS, ("sm_103a",)),
-    "split-hv32-small": ((1500, 77, 640), (16, 32), WAVEFRONT_SPLIT_PINS, ()),
-    "split-hv32": ((6000, 77, 6400), (16, 32), WAVEFRONT_SPLIT_PINS, ("sm_100a",)),
-}
+    "hv4": ((300, 77, 640), (2, 4), WAVEFRONT_PINS, ("sm_103a",), WAVEFRONT_PAIR),
+    "hv32": ((300, 640), (16, 32), WAVEFRONT_PINS, ("sm_100a", "sm_103a"), WAVEFRONT_PAIR),
+    "split-hv4": ((1500, 77, 640), (2, 4), WAVEFRONT_SPLIT_PINS, ("sm_103a",), WAVEFRONT_PAIR),
+    "split-hv32-small": ((1500, 77, 640), (16, 32), WAVEFRONT_SPLIT_PINS, (), WAVEFRONT_PAIR),
+    "split-hv32": ((6000, 77, 6400), (16, 32), WAVEFRONT_SPLIT_PINS, ("sm_100a", "sm_103a"), WAVEFRONT_SPLIT_PAIR),
+}  # fmt: skip
 
 
 @pytest.mark.parametrize("row", sorted(WAVEFRONT_DEFAULT_ROWS))
 def test_wavefront_shipped_rule_on_the_device(row, device, monkeypatch) -> None:
     # engaged: the pair replaces the separate launches with the same bits; not engaged: exactly the launches (stages,
     # grids, argument shapes, strides and scalars) of the rule turned off
-    seq_lens, heads, pins, arches = WAVEFRONT_DEFAULT_ROWS[row]
+    seq_lens, heads, pins, arches, pair = WAVEFRONT_DEFAULT_ROWS[row]
     arch = cake_backend.device_arch(cake_chain._device_index(device))
     engaged = arch in arches
     monkeypatch.setattr(cake_chain, "_META_FRONT", {})
@@ -1889,10 +1927,12 @@ def test_wavefront_shipped_rule_on_the_device(row, device, monkeypatch) -> None:
     calls = _record_calls(monkeypatch)
     got = _run(inputs, seq_lens, **pins)
     n = len(calls)
-    assert (set(WAVEFRONT_PAIR) <= {c[0] for c in calls}) is engaged, (arch, row)
+    stages = {c[0] for c in calls[:n]}
+    assert (set(pair) <= stages) is engaged, (arch, row)
+    assert not (WAVEFRONT_STAGES - set(pair)) & stages, (arch, row)
     _wavefront_rule(monkeypatch, off=True)
     off = _run(inputs, seq_lens, **pins)
-    assert not set(WAVEFRONT_PAIR) & {c[0] for c in calls[n:]}
+    assert not WAVEFRONT_STAGES & {c[0] for c in calls[n:]}
     if not engaged:
         assert calls[:n] == calls[n:], (arch, row)
     _assert_bitwise(got, off, OUTPUT_NAMES)
@@ -1925,15 +1965,15 @@ def test_wavefront_rule_keeps_the_other_launches(row, device, monkeypatch) -> No
     _wavefront_rule(monkeypatch, off=True)
     off = _run(inputs, seq_lens, route=route, **pins)
     assert calls[:n] == calls[n:], row
-    assert not set(WAVEFRONT_PAIR) & {c[0] for c in calls}, row
+    assert not WAVEFRONT_STAGES & {c[0] for c in calls}, row
     _assert_bitwise(default, off, OUTPUT_NAMES)
 
 
 def test_wavefront_pair_under_cuda_graph_capture(device, monkeypatch) -> None:
     # a graph does not order its branches: the capture records the separate launches; its replays equal the eager
     # calls (which run the pair) bitwise
-    seq_lens, pins = WAVEFRONT_ROWS["serial"]
-    inputs = _inputs(seq_lens, (2, 4), torch.bfloat16, device, seed=431)
+    seq_lens, pins, heads, _scan = WAVEFRONT_ROWS["serial"]
+    inputs = _inputs(seq_lens, heads, torch.bfloat16, device, seed=431)
     _wavefront_rule(monkeypatch)
     stages = _record_launches(monkeypatch)
     eager = _run(inputs, seq_lens, **pins)
@@ -1967,7 +2007,7 @@ def test_wavefront_pair_under_cuda_graph_capture(device, monkeypatch) -> None:
     with torch.cuda.graph(graph):
         o = step()
     captured = stages[start:]
-    assert not set(WAVEFRONT_PAIR) & set(captured), captured
+    assert not WAVEFRONT_STAGES & set(captured), captured
     assert {"dhu_tc2", "tail_g2_bf16"} <= set(captured), captured
     for _ in range(3):
         graph.replay()
@@ -2246,8 +2286,8 @@ def test_head_pairs_dispatch_the_fused_tail(pair, device, monkeypatch) -> None:
 def test_head_pairs_run_the_two_stream_tail(pair, form, device, monkeypatch) -> None:
     # HV = 3 H with the planner on few SMs: the pass 2 of a split plan on dhu_tc2 runs as two groups, the side stream
     # scanning group B while the caller's stream runs tail_g3 of group A; a serial tcgen05 adjoint scan, grouped on the
-    # table, keeps one launch on the caller's stream; the outputs pass the FP64 gate and equal the one-stream call
-    # bitwise
+    # table, does the same on the architectures of TWO_STREAM_SERIAL_G3_ARCHS and elsewhere keeps one launch on the
+    # caller's stream; the outputs pass the FP64 gate and equal the one-stream call bitwise
     heads, beta_dtype = pair
     num_v_heads = heads[1]
     if form == "serial":
@@ -2265,7 +2305,7 @@ def test_head_pairs_run_the_two_stream_tail(pair, form, device, monkeypatch) -> 
     two = _run(inputs, PAIR_LAYOUT, streams=2, **pins)
     stages = [stage for stage, _stream in launches]
     side = [stage for stage, stream in launches if stream != main]
-    if form == "split":
+    if _adjoint_two_streams(form, heads):
         assert side.count("dhu_tc2") == 1 and tail not in side, launches
         assert stages.count("dhu_tc2") == 2 and stages.count(tail) == 2, stages
     else:
@@ -2546,8 +2586,8 @@ def test_forward_backward_beside_a_resident_side_stream_kernel(row, device, monk
         side_stages = [stage for stage, stream in launches if stream != main]
         grouped = _adjoint_two_streams("split", heads)
         # beside tail_g2_bf16 the pass 2 of more CTAs than SMs (64 x 4 = 256) may run as the wavefront pair (the
-        # rule's split side), its tail on the side stream
-        pair = set(WAVEFRONT_PAIR) <= {stage for stage, _stream in launches}
+        # rule's split side, on dhu_tc2_wavefront_split), its tail on the side stream
+        pair = set(WAVEFRONT_SPLIT_PAIR) <= {stage for stage, _stream in launches}
         assert not (grouped and pair), launches
         assert side_stages == (
             ["dhu_tc2"] if grouped else ["tail_g2_bf16_wavefront"] if pair else []

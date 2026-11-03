@@ -37,9 +37,12 @@ and :func:`route_key` (the same in both packages):
   (``P <= 32`` token chunks; the chunk sizes are the host rule's per token
   count and device, so the low-order bits can also differ from the
   deterministic ``dfn``), and the FP32 reduction flushes subnormal addends and
-  results to zero.  ``dX``, ``dscale`` and ``dbase`` are bitwise the
-  deterministic values, and so are the forward, the statistics replay and
-  ``backward_prepare`` (copies of the deterministic programs).
+  results to zero.  ``dX`` is bitwise the deterministic value, and so are the
+  forward, the statistics replay and ``backward_prepare`` (copies of the
+  deterministic programs).  ``dscale`` and ``dbase`` are bitwise the
+  deterministic package's per-CTA reduction, which is its result except at
+  hidden 4096 above 14927 tokens on sm_100a and sm_103a: there it sums them
+  over 8-token group rows, so their low-order bits can differ.
 * With ``torch.use_deterministic_algorithms(True)``, ``deterministic=False``
   runs the deterministic package and warns once per process
   (``UserWarning``).  The non-deterministic package itself never falls back:
@@ -571,9 +574,11 @@ def cake_mhc_train_backward_finish(
         ``P <= 32`` FP32 roundings of the fixed-order sum of its per-chunk
         partials; the chunk sizes are the host rule's per token count and
         device, so the low-order bits can also differ from the deterministic
-        ``dfn``; ``dX``, ``dscale``, ``dbase`` bitwise the deterministic
-        values; ``accumulate=True`` adds onto the caller's values the same
-        way).  Under
+        ``dfn``; ``dX`` bitwise the deterministic value; ``dscale``, ``dbase``
+        bitwise the deterministic per-CTA reduction, whose low-order bits can
+        differ from the deterministic result at hidden 4096 above 14927 tokens
+        on sm_100a and sm_103a (group rows there); ``accumulate=True`` adds
+        onto the caller's values the same way).  Under
         ``torch.use_deterministic_algorithms(True)`` a ``False`` call runs the
         deterministic backward (one warning per process); a caller workspace
         too small for its layout is then replaced by a private companion buffer
