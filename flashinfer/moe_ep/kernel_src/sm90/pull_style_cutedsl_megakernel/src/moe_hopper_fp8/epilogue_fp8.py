@@ -106,7 +106,7 @@ class Fp8GluEpilogue:
         fc2_store_pipeline_stages: int = 1,
         fc1_store_offload: bool = False,
         fc1_early_done_publish: bool = False,
-        seg1_done_signal: bool = False,
+        seg1_done_signals: int = 0,
         epi_flag_batch: Union[int, Tuple[int, int]] = 1,
         pingpong: bool = False,
         generate_c: bool = False,
@@ -251,10 +251,14 @@ class Fp8GluEpilogue:
         self._fc1_store_offload = fc1_store_offload
         self._early_fc1_pub = fc1_early_done_publish
         # Internode early return (deferred local FC2): every epilogue warp
-        # counts itself in ``gin_seg1_done`` once all FC2 rows it stored for
-        # the earlier segments (the remote origins' rows among them) are
-        # system-visible.
-        self._seg1_done_signal = seg1_done_signal
+        # counts itself in ``gin_seg1_done`` once per return phase, as soon
+        # as all FC2 rows it stored for the segments of that phase (the
+        # remote origins' rows among them) are system-visible.
+        if not 0 <= seg1_done_signals <= 2:
+            raise ValueError(
+                f"seg1_done_signals must be 0, 1 or 2, got {seg1_done_signals}."
+            )
+        self._seg1_done_signals = int(seg1_done_signals)
         self._store_buffer_stages = max(
             fc1_store_pipeline_stages, fc2_store_pipeline_stages,
         )
@@ -1934,13 +1938,13 @@ class Fp8GluEpilogue:
         seg1_signaled = cutlass.Int32(0)
 
         while work_tile_info.is_valid_tile:
-            if cutlass.const_expr(self._seg1_done_signal):
-                # Tiles arrive in schedule order: before the first deferred
-                # local FC2 tile, every earlier-segment tile is done.
-                if seg1_signaled == cutlass.Int32(0):
-                    if work_tile_info.is_late_segment:
-                        self._signal_seg1_done(token_comm_args)
-                        seg1_signaled = cutlass.Int32(1)
+            if cutlass.const_expr(self._seg1_done_signals > 0):
+                # Tiles arrive in schedule order: before the first tile of
+                # signal level L, every tile of a lower level is done.
+                level = work_tile_info.segment_level
+                if level > seg1_signaled:
+                    self._signal_seg1_done(token_comm_args, seg1_signaled, level)
+                    seg1_signaled = level
             # Outer task-tile range, emitted by local warp 0 of each epilogue
             # warpgroup. It starts
             # before expert-scale setup and contains the representative WGMMA
@@ -2495,20 +2499,36 @@ class Fp8GluEpilogue:
         flag_tracker.fire()
         if _iket_active:
             iket.range_pop()
-        if cutlass.const_expr(self._seg1_done_signal):
-            # No deferred local FC2 tile reached this warp.
-            if seg1_signaled == cutlass.Int32(0):
-                self._signal_seg1_done(token_comm_args)
+        if cutlass.const_expr(self._seg1_done_signals > 0):
+            # The phases whose later-level tiles never reached this warp.
+            if seg1_signaled < cutlass.Int32(self._seg1_done_signals):
+                self._signal_seg1_done(
+                    token_comm_args,
+                    seg1_signaled,
+                    cutlass.Int32(self._seg1_done_signals),
+                )
 
     @cute.jit
-    def _signal_seg1_done(self, token_comm_args):
-        """Count this warp in ``gin_seg1_done`` after its stores are system-visible."""
+    def _signal_seg1_done(self, token_comm_args, from_level, to_level):
+        """Count this warp as past return phases ``[from_level, to_level)`` in
+        ``gin_seg1_done`` after its stores are system-visible.
+
+        ``gin_seg1_done`` keeps one 16-bit count per return phase (phase p in
+        bits 16p..16p+15; ``_gin_early_return`` waits on each field), so a
+        warp that skips a level still counts in every phase it passed.  With
+        at most two phases, ``x + (x >> 1) * 0xFFFF`` sets fields ``[0, x)``.
+        """
         cute.arch.fence_acq_rel_sys()
         cute.arch.sync_warp()
         if cute.arch.lane_idx() == cutlass.Int32(0):
+            delta = (
+                to_level + (to_level >> cutlass.Int32(1)) * cutlass.Int32(0xFFFF)
+            ) - (
+                from_level + (from_level >> cutlass.Int32(1)) * cutlass.Int32(0xFFFF)
+            )
             cute.arch.atomic_add(
                 token_comm_args.gin_seg1_done.iterator,
-                cutlass.Int32(1),
+                delta,
                 sem="relaxed",
                 scope="gpu",
             )

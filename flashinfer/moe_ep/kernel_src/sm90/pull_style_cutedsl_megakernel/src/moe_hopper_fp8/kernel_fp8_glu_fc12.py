@@ -68,8 +68,14 @@ class Sm90SwigluFp8Fc12Kernel:
     sched_local_source_begin = 0
     sched_local_source_count = 0
     # Segment-major: run the node-local blocks' FC2 last (internode early
-    # return, set by the MegaMoE subclass).
+    # return, set by the MegaMoE subclass), and with it the local FC1 of the
+    # experts from sched_seg0_fc1_experts on (None: all local FC1 first).
+    # sched_ret_phases = 2 runs the remote origins' even tokens' blocks
+    # before their odd ones (sched_num_sources = world size).
     sched_defer_local_fc2 = False
+    sched_seg0_fc1_experts = None
+    sched_ret_phases = 1
+    sched_num_sources = 0
     _setmaxnreg_max = 256
     _setmaxnreg_granularity = 8
     _sm90_cta_register_budget = 65536
@@ -556,7 +562,7 @@ class Sm90SwigluFp8Fc12Kernel:
         _epi_common["fc1_store_offload"] = self.fc1_store_offload
         _epi_common["fc1_early_done_publish"] = self.fc1_early_done_publish
         if self.sched_defer_local_fc2:
-            _epi_common["seg1_done_signal"] = True
+            _epi_common["seg1_done_signals"] = self.sched_ret_phases
         self.epilogue = self._make_epilogue(_epi_common)
 
         if self.num_sched_stages is None:
@@ -2758,6 +2764,9 @@ class Sm90SwigluFp8Fc12Kernel:
             local_source_begin=self.sched_local_source_begin,
             local_source_count=self.sched_local_source_count,
             defer_local_fc2=self.sched_defer_local_fc2,
+            seg0_fc1_experts=self.sched_seg0_fc1_experts,
+            ret_phases=self.sched_ret_phases,
+            num_sources=self.sched_num_sources,
         )
         grid = sched_params.get_grid_shape(max_active_clusters)
         epilogue_fc2_output = (

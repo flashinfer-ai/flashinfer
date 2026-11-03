@@ -192,6 +192,7 @@ _PHASES = {
     12: "pull done",
     13: "ER node seg1 done",
     14: "ER reduce/puts done",
+    15: "ER node odd phase done",
     20: "tail entry (GEMM done)",
     21: "B1",
     22: "node reduce",

@@ -6,9 +6,11 @@ Runs after the fused kernel on the same stream.  For every token of this rank:
   rank's node (written by this node's expert owners) are accumulated in
   ascending ``k``;
 * then, in ascending node order, the one BF16 partial each remote node returned
-  through its rail peer (``remote_partial[slot][t]``, already the FP32 sum of
-  that node's slots rounded to BF16 once) is added for every remote node the
-  token hits;
+  through its rail peer (``remote_partial[slot][row(t)]``, already the FP32 sum
+  of that node's slots rounded to BF16 once) is added for every remote node
+  the token hits; with two return phases the even tokens' partials fill the
+  first ``ceil(T/2)`` rows and the odd ones the rest
+  (``row(t) = (t % 2) * ceil(T/2) + t // 2``), otherwise ``row(t) = t``;
 * the FP32 accumulator is rounded to BF16 once.
 
 This is the fixed reduction tree of the internode design (invariant I11): with
@@ -42,6 +44,7 @@ class InternodeTopkReduce:
         num_nodes: int,
         my_node: int,
         max_tokens_per_rank: int,
+        ret_phases: int = 1,
     ) -> None:
         self.hidden = int(hidden)
         self.num_topk = int(num_topk)
@@ -52,6 +55,10 @@ class InternodeTopkReduce:
         self.my_node = int(my_node)
         self.max_tokens_per_rank = int(max_tokens_per_rank)
         self.hidden_tiles = self.hidden // self._hidden_per_thread
+        if ret_phases not in (1, 2):
+            raise ValueError(f"ret_phases must be 1 or 2, got {ret_phases}.")
+        self.ret_phases = int(ret_phases)
+        self.phase_rows = (self.max_tokens_per_rank + self.ret_phases - 1) // self.ret_phases
 
     @cute.jit
     def __call__(
@@ -134,6 +141,9 @@ class InternodeTopkReduce:
                         acc[i] = acc[i] + Float32(term[i])
 
             # One partial per remote node, ascending node order.
+            ret_row = token_idx
+            if cutlass.const_expr(self.ret_phases == 2):
+                ret_row = (token_idx % Int32(2)) * Int32(self.phase_rows) + token_idx // Int32(2)
             for node in cutlass.range_constexpr(num_nodes):
                 if cutlass.const_expr(node != my_node):
                     slot: cutlass.Constexpr[int] = node if node < my_node else node - 1
@@ -143,7 +153,7 @@ class InternodeTopkReduce:
                             hits = hits + Int32(1)
                     if hits > Int32(0):
                         src = cute.zipped_divide(
-                            remote_partial[slot, token_idx, None], (hpt,),
+                            remote_partial[slot, ret_row, None], (hpt,),
                         )[(None,), (hidden_tile_idx,)]
                         term = cute.make_rmem_tensor((hpt,), cutlass.BFloat16)
                         cute.copy(load_atom, self._aligned(src), term)

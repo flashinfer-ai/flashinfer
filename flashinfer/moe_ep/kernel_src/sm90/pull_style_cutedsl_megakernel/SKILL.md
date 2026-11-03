@@ -209,14 +209,19 @@ not picked them up):
   drop tree.
 - Internode early return (2026-11-02; GIN + non-swap + epi_warps +
   max_tokens_per_rank >= 1024): `fc1_fc2_fuse_sched.py` `defer_local_fc2`
-  (third segment, `LateSegmentBit`, `custom_ext.py` `is_late_segment`),
-  `epilogue_fp8.py` `seg1_done_signal`, `token_comm.py`
-  `_gin_early_return` / `_gin_early_reduce` / `_gin_return_chunks` /
-  `_gin_wait_return` (dispatch warp after the pull; `ret_mbar` /
-  `ret_buffer` SMEM), `megamoe_kernel_fp8.py` regions `gin_seg1_done`,
-  `gin_ret_chunk_done` (zeroed prefix) and `gin_seg1_flag` (shared,
-  monotonic), `kernel_fp8_glu_fc12.py` `sched_defer_local_fc2`.  Not in the
-  drop tree.
+  (deferred last segment; work-tile signal level in bits 18-19,
+  `custom_ext.py` `segment_level`), `epilogue_fp8.py` `seg1_done_signals`,
+  `token_comm.py` `_gin_early_return` / `_gin_early_reduce` /
+  `_gin_return_chunks` / `_gin_wait_return` (dispatch warp after the pull;
+  `ret_mbar` / `ret_buffer` SMEM), `megamoe_kernel_fp8.py` regions
+  `gin_seg1_done`, `gin_ret_chunk_done` (zeroed prefix) and `gin_seg1_flag`
+  (shared, monotonic), `kernel_fp8_glu_fc12.py` `sched_defer_local_fc2`.
+  From 2048 tokens two return phases (2026-11-03, `ret_phases`): even /
+  odd remote tokens (`dispatch_prep_gin` `odd_count_group`, counts
+  `total | even << 32`, three pull passes, scheduler `_segment_blocks`,
+  `gin_seg1_done` 16-bit count per phase, phase-major return rows read by
+  `InternodeTopkReduce`), plus `sched_seg0_fc1_experts` (2/3 of the experts'
+  local FC1 ahead of the remote blocks).  Not in the drop tree.
 
 ## Layout
 

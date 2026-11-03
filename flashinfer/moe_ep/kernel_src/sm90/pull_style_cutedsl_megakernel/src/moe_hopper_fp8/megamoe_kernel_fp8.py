@@ -462,6 +462,12 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
                 hidden=self.hidden, active_dispatch_warps=active_dispatch_warps
             )
         )
+        # From 2048 tokens per rank the early return runs in two phases: the
+        # remote origins' even tokens are computed, reduced and returned
+        # while their odd tokens are still computed.  Splitting the remote
+        # blocks costs weight reuse in the remote GEMM, which the earlier
+        # return only repays from 2048 tokens (1024: +2.7%).
+        ret_phases = 2 if early_return and self.max_tokens_per_rank >= 2048 else 1
         self.token_comm = TokenInPullTokenBackPush(
             world_size=self.world_size,
             combine_format=self.combine_format,
@@ -508,6 +514,7 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
             deterministic_slots=self.deterministic,
             early_return=early_return,
             num_seg1_signal_warps=len(self.epilogue_warp_id) if early_return else 0,
+            ret_phases=ret_phases,
         )
         self.dedup_dispatch = dedup_dispatch
         if self.enable_nccl_gin:
@@ -517,6 +524,16 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
             self.sched_local_source_begin = self.token_comm.node_rank_base
             self.sched_local_source_count = self.token_comm.ranks_per_node
             self.sched_defer_local_fc2 = self.token_comm.early_return
+            self.sched_ret_phases = self.token_comm.ret_phases
+            self.sched_num_sources = self.world_size
+            if self.token_comm.ret_phases == 2:
+                # Only the first two thirds of the experts run their local FC1
+                # ahead of the remote blocks (enough to cover the remote rows'
+                # arrival); the rest joins the deferred local segment, so the
+                # remote blocks, and with them both returns, start earlier.
+                self.sched_seg0_fc1_experts = max(
+                    1, round(self.num_experts_per_rank * 2 / 3)
+                )
 
         # Region layout (same call drives both get_workspace_sizes() and the
         # __call__ partition).
@@ -668,8 +685,12 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
                 "expert_send_count",
                 cutlass.Int64,
                 # One reservation set per source this rank prepares: its own
-                # tokens, plus (internode) every remote origin it proxies.
-                (num_total_experts * (1 + self.num_remote_slots),),
+                # tokens, plus (internode) every remote origin it proxies,
+                # once per return phase (even / odd tokens).
+                (
+                    num_total_experts
+                    * (1 + self.num_remote_slots * self.token_comm.ret_phases),
+                ),
                 16,
             ),
             _RegionSpec(
@@ -718,8 +739,9 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
                 )
             )
             if self.token_comm.early_return:
-                # Epilogue warps done with the earlier segments, and per
-                # (slot, token chunk) the reducers done with the chunk.
+                # Epilogue warps done with the earlier segments (one 16-bit
+                # count per return phase), and per (slot, token chunk) the
+                # reducers done with the chunk.
                 counter_specs.append(
                     _RegionSpec("gin_seg1_done", cutlass.Int32, (1,), 16)
                 )
@@ -1229,6 +1251,15 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
                 "the internode early return reduces on CTAs 1.. while CTA 0 "
                 f"posts the return puts; it needs >= 2 CTAs, got sm_count={sm_count}."
             )
+        if cutlass.const_expr(
+            self.token_comm.early_return
+            and sm_count * self.token_comm.num_seg1_signal_warps >= 1 << 16
+        ):
+            raise ValueError(
+                "gin_seg1_done counts the epilogue warps of each return phase in "
+                f"16 bits; sm_count={sm_count} x "
+                f"{self.token_comm.num_seg1_signal_warps} warps does not fit."
+            )
         peer_rank_ptr_mapper = peer_rank_ptr_mapper_host.make_device_obj()
 
         pool_token_capacity = self.pool_token_capacity
@@ -1534,6 +1565,7 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
                 num_nodes=self.num_nodes,
                 my_node=self.local_rank // self.ranks_per_node,
                 max_tokens_per_rank=self.max_tokens_per_rank,
+                ret_phases=self.token_comm.ret_phases,
             )(
                 combine_target,
                 topk_idx,

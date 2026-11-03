@@ -677,7 +677,8 @@ node partials while the GEMM still runs:
 
 * the segment-major schedule defers the node-local blocks' FC2 to a third
   segment (`defer_local_fc2`: local FC1, remote FC1 + FC2, local FC2);
-  those tiles carry `LateSegmentBit`;
+  those tiles carry signal level 1 (work-tile bits 18-19,
+  `custom_ext.py` `segment_level`);
 * every epilogue warp counts itself in `gin_seg1_done` (after a
   system-scope fence) before its first deferred tile; CTA 0's dispatch warp
   waits for the whole rank and bumps every node rank's monotonic
@@ -702,21 +703,88 @@ first version, one topk-index load per 512-byte unit, took ~950 µs), but
 the put now overlaps the GEMM and runs at ~36 GB/s instead of the ~47 GB/s
 it reaches alone, so the kernel still ends ~1.6 ms after seg 1.
 
+### Two return phases (2026-11-03, dlcluster 2 x 8 H100)
+
+From 2048 tokens per rank the early return runs in two phases
+(`ret_phases`): every remote origin's even tokens are computed, reduced and
+returned while its odd tokens are still computed.
+
+* proxy prep: odd tokens reserve in their own `expert_send_count` set and
+  fill each (expert, source) slot list from its end, so the even tokens
+  stay a dense prefix; the published count is `total | even << 32`;
+* the pull runs three passes (node-local rows, remote rows up to the first
+  cluster block past the even rows, the rest); the scheduler splits the
+  remote blocks at the same boundary (`_segment_blocks`): segment 1 holds
+  the even rows (and the straddling block), segment 2 the rest, and the
+  deferred local segment becomes segment 3 (signal levels 0 / 1 / 2);
+* `gin_seg1_done` keeps one 16-bit count per phase (a warp that skips a
+  level counts in every phase it passed; a single counter let phase 0 fire
+  while slower warps still stored phase-0 rows); per phase CTA 0 bumps the
+  flag to `ranks_per_node * (2 * epoch + p + 1)`, CTAs 1.. reduce the
+  phase's tokens and CTA 0 posts its 4 chunks;
+* return rows are phase-major (token t in row `(t % 2) * ceil(T / 2) +
+  t // 2`), which `InternodeTopkReduce` reads back;
+* only the first two thirds of the experts run their local FC1 ahead of the
+  remote blocks (`seg0_fc1_experts`; enough to cover the remote rows'
+  arrival); the rest joins the deferred segment, so both returns start
+  earlier.
+
+Two interleaved rounds on viking-prod-234 / 239 (max-rank median µs; the
+rounds agree within 0.3%):
+
+| config                     | 1024         | 2048         | 4096         |
+|----------------------------|--------------|--------------|--------------|
+| one phase (previous)       | 1880         | 3077         | 5185         |
+| two phases                 | 1930 (+2.7%) | 3011 (-2.2%) | 4987 (-3.8%) |
+| local FC1 split 2/3        | 1891 (+0.6%) | 3027 (-1.6%) | 5095 (-1.7%) |
+| two phases + split 2/3     | 1956 (+4.0%) | 2930 (-4.8%) | 4828 (-6.9%) |
+| two phases + split 1/2     | 1949 (+3.6%) | 2963 (-3.7%) | 4960 (-4.3%) |
+
+Adopted: two phases + the 2/3 split from 2048 tokens; 1024 keeps one phase
+(an expert's ~128 remote rows fill about one 128-row cluster block there,
+so segment 2 is nearly empty and the split only adds cost).  IKET at 4096
+(rank 0, one phase -> two phases): the wait after the GEMM drops from
+~1050 µs to ~430 µs, but each expert's remote blocks are now split over two
+segments and its weights are read twice: FC1 tasks +7%, FC2 tasks +17%
+(16.6 -> 19.4 µs), FC2's `fc1_done` spin x2.3, and the GEMM ends ~415 µs
+later (4054 -> 4469 µs).  From the first return put (~2.9 ms) the NIC is
+busy to the end at ~30 GB/s, so more phases would buy little: the tail is
+bound by the return put's throughput under GEMM load.
+
+Final, NEW vs the previous commit on the same nodes (two interleaved rounds,
+max-rank median µs): 8-512 tokens within +-1% (8 689/688, 64 760/762, 128
+801/803, 256 881/873, 512 1204/1203), 1024 1872/1889 (-0.9%, one phase),
+2048 2930/3093 (-5.3%), 4096 4820/5210 (-7.5%).  `--stamps` at 4096 (rank
+0, µs): even phase final 2621, odd 3688, GEMM done 4520, RET landed 4717,
+tail done 4723 -- ~200 µs after the GEMM instead of ~1 ms.
+
+Against the split baselines on the same nodes (DeepEP / NCCL-EP LL / HT
+dispatch + combine around the fc12 or cutlass grouped GEMM, all FP8 input,
+`--check` passing), best baseline / mega: 8 LL+cutlass 745 / 689 (1.08x),
+64 LL+cutlass 889 / 760 (1.17x), 256 DeepEP+cutlass 1103 / 881 (1.25x),
+512 DeepEP+fc12 1459 / 1204 (1.21x), 1024 DeepEP+fc12 2155 / 1872 (1.15x),
+2048 DeepEP+fc12 3816 / 2930 (1.30x), 4096 DeepEP+fc12 7009 / 4820 (1.45x).
+
 Internode levers left:
 
-1. **Return put under GEMM load** — the put overlaps the deferred FC2 but
-   slows to ~36 GB/s there (the NIC's reads of GPU memory compete with the
-   GEMM's L2 / HBM traffic); the rest of the gap to line rate is the last
-   chunk's reduce and post.
-2. **Rank skew before B1** — the slowest local rank finishes the GEMM
+1. **Return put under GEMM load** — the put overlaps the GEMM but runs at
+   ~22-30 GB/s there (one phase: ~13 MB of 58 MB leave before the GEMM
+   ends at 4096 tokens; the NIC's reads of GPU memory compete with the
+   GEMM's HBM traffic, which re-reads each expert's weights per token
+   block); alone it reaches ~47 GB/s.
+2. **Weight reuse across the remote segments** — two return phases read
+   each expert's remote-block weights twice (see above); an order that
+   keeps the weights of the experts at the segment boundary in L2, or a
+   token-fast order inside the remote segments, would recover part of it.
+3. **Rank skew before B1** — the slowest local rank finishes the GEMM
    150-190 µs after the fastest at 1024 / 4096: with 24 experts of 256 ± 16
    rows (1024 tokens) the per-rank 64-row tile count already spreads ~7%
    max/mean, before any clock difference between GPUs.
-3. **Pull bandwidth** — one active dispatch warp per CTA pulls ~100-115
+4. **Pull bandwidth** — one active dispatch warp per CTA pulls ~100-115
    GB/s.  At 1024 tokens IKET shows the TMA-A warps waiting ~100 µs per CTA
    for node-local rows in the first ~200 µs, and with the early return the
    pull end bounds how early the remote-origin FC2 can finish.
-4. **group_hint at 1024 / 4096** — re-swept on dlcluster (None = one wave,
+5. **group_hint at 1024 / 4096** — re-swept on dlcluster (None = one wave,
    132, 198, 264, two rounds): the one-wave group of the EP8 row stays best
    (1985-1991 / 5830-5836 µs against 1996-2121 / 5868-6170).
 

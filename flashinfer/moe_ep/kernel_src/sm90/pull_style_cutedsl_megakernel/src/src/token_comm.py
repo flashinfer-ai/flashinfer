@@ -517,11 +517,20 @@ class TokenInPullTokenBackPush:
         # node partials while the local FC2 still runs.
         early_return: bool = False,
         num_seg1_signal_warps: int = 0,
+        # Early return in two phases (``_gin_early_return``): each remote
+        # origin's even tokens are computed, reduced and returned while its
+        # odd tokens are still computed.  1 = one phase.
+        ret_phases: int = 1,
     ) -> None:
         self.world_size = world_size
         self.num_tail_reduce_warps = int(num_tail_reduce_warps)
         self.early_return = bool(early_return)
         self.num_seg1_signal_warps = int(num_seg1_signal_warps)
+        self.ret_phases = int(ret_phases)
+        if self.ret_phases not in (1, 2):
+            raise ValueError(f"ret_phases must be 1 or 2, got {ret_phases}.")
+        if self.ret_phases == 2 and not self.early_return:
+            raise ValueError("ret_phases=2 needs early_return.")
         self._init_internode(
             ranks_per_node=ranks_per_node,
             enable_nccl_gin=enable_nccl_gin,
@@ -654,6 +663,9 @@ class TokenInPullTokenBackPush:
         self.smem_expert_count_slots = num_total_experts * (
             active_dispatch_warps if self.deterministic_slots else 1
         )
+        if self.ret_phases == 2:
+            # Proxy prep: a second row of node-expert cursors for odd tokens.
+            self.smem_expert_count_slots += self.node_expert_count
         # SMEM pull-buffer slots.  By default every physical dispatch warp
         # owns a hidden_bytes slot even when it is idle; with
         # compact_pull_buffer only the active warps get a slot (the idle warps
@@ -918,8 +930,14 @@ class TokenInPullTokenBackPush:
         # Return puts per slot and launch (the receiver waits for this many
         # RET increments): the early return posts up to this many token
         # chunks of at least gin_ret_min_chunk_rows rows (a put costs ~10 us
-        # to post); the last put adds the chunks it did not send.
+        # to post), split evenly over the return phases; the last put of a
+        # phase adds that phase's chunks it did not send.
         self.gin_ret_chunks = 8 if self.early_return else 1
+        if self.gin_ret_chunks % self.ret_phases != 0:
+            raise ValueError(
+                f"gin_ret_chunks={self.gin_ret_chunks} must split evenly over "
+                f"ret_phases={self.ret_phases} (the receiver waits for their sum)."
+            )
         self.gin_ret_min_chunk_rows = 128
         # Developer-only progress stamps (MEGA_GIN_DEBUG_ADDR = device-visible
         # pinned host address); baked in at trace time, off by default.
@@ -945,6 +963,14 @@ class TokenInPullTokenBackPush:
                     sem="relaxed",
                     scope="sys",
                 )
+
+    def _odd_count_group(self, slot: int) -> Optional[int]:
+        """``expert_send_count`` set of remote slot ``slot``'s odd tokens
+        (two return phases), after the ``1 + num_remote_slots`` sets of the
+        own tokens and the even (or all) proxied tokens; None otherwise."""
+        if self.ret_phases == 1:
+            return None
+        return 1 + self.num_remote_slots + slot
 
     @staticmethod
     def internode_signal_count(num_nodes: int) -> int:
@@ -1673,6 +1699,7 @@ class TokenInPullTokenBackPush:
         num_sms,
         count_group: cutlass.Constexpr[int] = 0,
         token_count_ptr=None,
+        odd_count_group: cutlass.Constexpr[Optional[int]] = None,
     ):
         """Internode (NCCL GIN) dispatch prep: histogram, reserve and publish
         the (token, topk) slots of one source.  The single-node path uses
@@ -1688,6 +1715,10 @@ class TokenInPullTokenBackPush:
         Internode: only experts of this node are handled (owners on other
         nodes are reached through their own rail peer), and
         ``token_count_ptr`` receives ``max(valid token) + 1``.
+
+        ``odd_count_group`` (two return phases): odd tokens reserve in that
+        counter set and fill the source's slot list from its end
+        (``max_slot - 1 - slot``), so even tokens stay a dense prefix.
         """
         node_filter: cutlass.Constexpr[bool] = self.enable_nccl_gin
         expert_lo: cutlass.Constexpr[int] = (
@@ -1697,10 +1728,17 @@ class TokenInPullTokenBackPush:
             self.node_expert_count if node_filter else self.num_total_experts
         )
         count_base: cutlass.Constexpr[int] = count_group * self.num_total_experts
+        split: cutlass.Constexpr[bool] = odd_count_group is not None
+        # SMEM cursor of an odd token's expert: a second row after the
+        # num_total_experts even-token cursors (node experts only).
+        odd_smem_offset: cutlass.Constexpr[int] = self.num_total_experts - expert_lo
+        smem_cursors: cutlass.Constexpr[int] = self.num_total_experts + (
+            expert_cnt if split else 0
+        )
         thread_idx_in_dispatch = Int32(warp_idx * self.warp_threads + lane_idx)
         smem_count_ptr = token_comm_storage.smem_expert_count.data_ptr()
         i = thread_idx_in_dispatch
-        while i < Int32(self.num_total_experts):
+        while i < Int32(smem_cursors):
             (smem_count_ptr + i).store(Int32(0))
             i = i + Int32(self.active_dispatch_threads)
         cute.arch.barrier(
@@ -1738,8 +1776,13 @@ class TokenInPullTokenBackPush:
                             expert_cnt
                         ) and expert_id >= Int32(expert_lo)
                     if in_range:
+                        cursor = expert_id
+                        if cutlass.const_expr(split):
+                            cursor = cursor + (token_global & Int32(1)) * Int32(
+                                odd_smem_offset
+                            )
                         cute.arch.atomic_add(
-                            smem_count_ptr + expert_id,
+                            smem_count_ptr + cursor,
                             Int32(1),
                             sem="relaxed",
                             scope="cta",
@@ -1779,6 +1822,17 @@ class TokenInPullTokenBackPush:
                 )
                 base_slot = Int32(old_packed & Int64(0xFFFFFFFF))
                 (slot_ptr).store(base_slot)
+                if cutlass.const_expr(split):
+                    odd_ptr = slot_ptr + Int32(odd_smem_offset)
+                    odd_count = (odd_ptr).load()
+                    odd_packed = cute.arch.atomic_add(
+                        expert_send_count.iterator
+                        + (expert_id + Int32(odd_count_group * self.num_total_experts)),
+                        (Int64(1) << Int64(32)) | (Int64(odd_count) & Int64(0xFFFFFFFF)),
+                        sem="relaxed",
+                        scope="gpu",
+                    )
+                    (odd_ptr).store(Int32(odd_packed & Int64(0xFFFFFFFF)))
         cute.arch.barrier(
             barrier_id=self.dispatch_intra_cta_bar_id,
             number_of_threads=self.active_dispatch_threads,
@@ -1803,14 +1857,22 @@ class TokenInPullTokenBackPush:
                     if cutlass.const_expr(node_filter):
                         dst_rank = dst_rank - Int32(self.node_rank_base)
                     local_expert = expert_id % Int32(self.num_experts_per_rank)
+                    MAX_SLOT_C: cutlass.Constexpr[int] = num_tokens * self.num_topk
+                    cursor = expert_id
+                    odd = Int32(0)
+                    if cutlass.const_expr(split):
+                        odd = token_global & Int32(1)
+                        cursor = cursor + odd * Int32(odd_smem_offset)
                     slot = cute.arch.atomic_add(
-                        smem_count_ptr + expert_id,
+                        smem_count_ptr + cursor,
                         Int32(1),
                         sem="relaxed",
                         scope="cta",
                     )
+                    if cutlass.const_expr(split):
+                        # Odd tokens fill the list from its end.
+                        slot = slot + odd * (Int32(MAX_SLOT_C - 1) - Int32(2) * slot)
                     token_topk_word = Int32(token_global * self.num_topk + topk_slot)
-                    MAX_SLOT_C: cutlass.Constexpr[int] = num_tokens * self.num_topk
                     elem_off = (
                         (local_expert * Int32(self.world_size) + Int32(local_rank))
                         * Int32(MAX_SLOT_C)
@@ -1928,8 +1990,14 @@ class TokenInPullTokenBackPush:
         *,
         count_group: cutlass.Constexpr[int],
         src_index,
+        odd_count_group: cutlass.Constexpr[Optional[int]] = None,
     ):
-        """Publish one source's per-expert counts to this node's expert owners."""
+        """Publish one source's per-expert counts to this node's expert owners.
+
+        With ``odd_count_group`` the published word is ``total | even << 32``
+        (the even tokens' rows lead the source's slot list; the odd ones
+        trail from its end).
+        """
         for offset in cutlass.range_constexpr(
             0, self.node_expert_count, self.active_dispatch_threads,
         ):
@@ -1949,6 +2017,19 @@ class TokenInPullTokenBackPush:
                     scope="gpu",
                 )
                 token_count_u32 = Int32(status_u64 & Int64(0xFFFFFFFF))
+                count_word = Int64(token_count_u32)
+                if cutlass.const_expr(odd_count_group is not None):
+                    odd_status = cute.arch.load(
+                        expert_send_count.iterator
+                        + (expert_id + Int32(odd_count_group * self.num_total_experts)),
+                        Int64,
+                        sem="relaxed",
+                        scope="gpu",
+                    )
+                    count_word = (Int64(token_count_u32) << Int64(32)) | (
+                        (status_u64 + odd_status) & Int64(0xFFFFFFFF)
+                    )
+                    status_u64 = status_u64 + odd_status
                 erc_peer_addr = peer_rank_ptr_mapper.map(
                     expert_recv_count.iterator.toint(),
                     dst_rank,
@@ -1957,7 +2038,7 @@ class TokenInPullTokenBackPush:
                          + dst_local_expert) * Int32(8)
                     ),
                 )
-                stg_b64_raw(erc_peer_addr, Int64(token_count_u32))
+                stg_b64_raw(erc_peer_addr, count_word)
                 ercs_peer_addr = peer_rank_ptr_mapper.map(
                     expert_recv_count_sum.iterator.toint(),
                     dst_rank,
@@ -2062,6 +2143,7 @@ class TokenInPullTokenBackPush:
                 num_sms=num_sms,
                 count_group=1 + s,
                 token_count_ptr=args.gin_token_count.iterator + (1 + s),
+                odd_count_group=self._odd_count_group(s),
             )
 
         self._dbg(sm_idx, 6, warp_idx, lane_idx)
@@ -2085,6 +2167,7 @@ class TokenInPullTokenBackPush:
                     src_index=Int32(
                         src_node * self.ranks_per_node + self.local_rank_in_node
                     ),
+                    odd_count_group=self._odd_count_group(s),
                 )
             cute.arch.fence_acq_rel_sys()
         cute.arch.barrier(
@@ -2335,7 +2418,12 @@ class TokenInPullTokenBackPush:
             lane_is_node_source = lane_node == Int32(self.my_node)
             lane_is_remote_source = lane_node != Int32(self.my_node)
 
-        num_passes: cutlass.Constexpr[int] = 2 if gin else 1
+        # Two return phases: the remote pass splits at the first cluster
+        # block boundary past the even tokens' rows, so the scheduler's
+        # first remote segment never waits for the second pass.
+        phases: cutlass.Constexpr[int] = self.ret_phases
+        max_slot: cutlass.Constexpr[int] = self.max_tokens_per_rank * self.num_topk
+        num_passes: cutlass.Constexpr[int] = 1 + phases if gin else 1
         for pull_pass in cutlass.range_constexpr(num_passes):
             if cutlass.const_expr(gin and pull_pass == 1):
                 self._dbg(sm_idx, 9, warp_idx, lane_idx)
@@ -2350,6 +2438,9 @@ class TokenInPullTokenBackPush:
             expert_sf_pool_block_offset = Int32(0)
             stored_rank_count_lane = Int32(0)
             node_source_total = Int32(0)
+            even_lane = Int32(0)
+            even_total = Int32(0)
+            pass1_end = Int32(0)
             token_idx = sm_idx * Int32(self.active_dispatch_warps) + warp_idx
 
             while current_expert_idx < Int32(self.num_experts_per_rank):
@@ -2396,12 +2487,16 @@ class TokenInPullTokenBackPush:
 
                 if current_expert_idx < Int32(self.num_experts_per_rank):
                     if old_expert_idx != current_expert_idx:
+                        packed_count_lane = Int64(0)
                         if lane_idx < Int32(self.world_size):
-                            stored_rank_count_lane = Int32(
+                            packed_count_lane = Int64(
                                 expert_recv_count[lane_idx, current_expert_idx]
                             )
-                        else:
-                            stored_rank_count_lane = Int32(0)
+                        # Low word: the source's rows; high word (two return
+                        # phases, remote sources): its even tokens' rows.
+                        stored_rank_count_lane = Int32(
+                            packed_count_lane & Int64(0xFFFFFFFF)
+                        )
                         if cutlass.const_expr(gin):
                             node_lane_count = Int32(0)
                             if lane_is_node_source:
@@ -2409,25 +2504,56 @@ class TokenInPullTokenBackPush:
                             node_source_total = Int32(
                                 cute.arch.warp_redux_sync(node_lane_count, "add")
                             )
+                            if cutlass.const_expr(phases == 2):
+                                even_lane = Int32(packed_count_lane >> Int64(32))
+                                even_total = Int32(
+                                    cute.arch.warp_redux_sync(even_lane, "add")
+                                )
+                                tile_rows = Int32(self.cluster_tile_tokens)
+                                pass1_end = (
+                                    (node_source_total + even_total + tile_rows - Int32(1))
+                                    // tile_rows
+                                ) * tile_rows
+                                pass1_end = cutlass.min(
+                                    pass1_end, expert_end_idx - expert_start_idx
+                                )
 
                     token_idx_in_expert = token_idx - expert_start_idx
                     slot_idx = token_idx_in_expert
                     offset = Int32(0)
                     remaining_lane = stored_rank_count_lane
                     do_row = Boolean(True)
+                    odd_row = Boolean(False)
                     if cutlass.const_expr(gin):
                         # Node sources own rows [0, I_e) of the expert, remote
                         # origins rows [I_e, total); each phase round-robins
-                        # over its own source lanes only.
+                        # over its own source lanes only.  Two return phases:
+                        # the remote rows of even tokens lead, odd ones trail.
                         in_remote_rows = token_idx_in_expert >= node_source_total
                         if cutlass.const_expr(pull_pass == 0):
                             do_row = token_idx_in_expert < node_source_total
-                        else:
+                        elif cutlass.const_expr(phases == 1):
                             do_row = token_idx_in_expert >= node_source_total
+                        elif cutlass.const_expr(pull_pass == 1):
+                            do_row = (
+                                token_idx_in_expert >= node_source_total
+                                and token_idx_in_expert < pass1_end
+                            )
+                        else:
+                            do_row = token_idx_in_expert >= pass1_end
                         if in_remote_rows:
                             slot_idx = token_idx_in_expert - node_source_total
                             if lane_is_node_source:
                                 remaining_lane = Int32(0)
+                            if cutlass.const_expr(phases == 2):
+                                # Node lanes carry no even count: both
+                                # selections below stay 0 for them.
+                                odd_row = slot_idx >= even_total
+                                if odd_row:
+                                    slot_idx = slot_idx - even_total
+                                    remaining_lane = remaining_lane - even_lane
+                                else:
+                                    remaining_lane = even_lane
                         else:
                             if lane_is_remote_source:
                                 remaining_lane = Int32(0)
@@ -2476,6 +2602,12 @@ class TokenInPullTokenBackPush:
                             _iket.range_pop()  # Pull.ChooseToken
                             _iket.range_push("Pull.TMA_NVLink_Roundtrip")
 
+                        if cutlass.const_expr(phases == 2):
+                            # Odd tokens fill the source's list from its end.
+                            if odd_row:
+                                token_idx_in_rank = (
+                                    Int32(max_slot - 1) - token_idx_in_rank
+                                )
                         src_token_topk = Uint32(
                             src_token_topk_idx[
                                 current_expert_idx,
@@ -3954,14 +4086,29 @@ class TokenInPullTokenBackPush:
         cute.arch.sync_warp()
 
     @cute.jit
-    def _gin_ret_chunking(self, n_s):
-        """``(rows per chunk, chunk count)`` of a slot holding ``n_s`` tokens."""
-        n_chunks: cutlass.Constexpr[int] = self.gin_ret_chunks
-        rows_per_chunk = (n_s + Int32(n_chunks - 1)) // Int32(n_chunks)
+    def _gin_ret_chunking(self, n_rows):
+        """``(rows per chunk, chunk count)`` of ``n_rows`` return rows of one
+        slot and phase."""
+        n_chunks: cutlass.Constexpr[int] = self.gin_ret_chunks // self.ret_phases
+        rows_per_chunk = (n_rows + Int32(n_chunks - 1)) // Int32(n_chunks)
         if rows_per_chunk < Int32(self.gin_ret_min_chunk_rows):
             rows_per_chunk = Int32(self.gin_ret_min_chunk_rows)
-        num_chunks = (n_s + rows_per_chunk - Int32(1)) // rows_per_chunk
+        num_chunks = (n_rows + rows_per_chunk - Int32(1)) // rows_per_chunk
         return rows_per_chunk, num_chunks
+
+    @property
+    def gin_ret_phase_rows(self) -> int:
+        """Return-buffer rows reserved per phase: phase ``p`` holds token
+        ``ret_phases * i + p`` in row ``p * gin_ret_phase_rows + i``."""
+        return (self.max_tokens_per_rank + self.ret_phases - 1) // self.ret_phases
+
+    @cute.jit
+    def _gin_phase_rows(self, n_s, phase: cutlass.Constexpr[int]):
+        """Tokens of phase ``phase`` among the first ``n_s`` tokens."""
+        rows = n_s
+        if cutlass.const_expr(self.ret_phases == 2):
+            rows = (n_s + Int32(1 - phase)) // Int32(2)
+        return rows
 
     @cute.jit
     def _gin_early_return(self, token_comm_storage, token_comm_args, cta_linear_id, lane_idx):
@@ -3970,62 +4117,83 @@ class TokenInPullTokenBackPush:
         The scheduler runs the node-local blocks' FC2 last (``defer_local_fc2``),
         and every epilogue warp counts itself in ``gin_seg1_done`` once its
         earlier-segment tiles are stored, so the remote origins' landing rows
-        are final while the local FC2 still runs:
+        are final while the local FC2 still runs.  Per return phase ``p``
+        (``ret_phases``; with two, the remote origins' even tokens are
+        scheduled, and returned, before their odd ones):
 
-        1. CTA 0 waits for all of this rank's epilogue warps, then bumps the
-           ``gin_seg1_flag`` of every node rank (system-scope release); every
-           CTA waits for its rank's flag to reach ``ranks_per_node * (epoch+1)``
+        1. CTA 0 waits until all of this rank's epilogue warps have counted
+           phase ``p`` (16-bit field ``p`` of ``gin_seg1_done``; a warp that
+           skips a level counts in every phase it passed), then bumps the
+           ``gin_seg1_flag`` of every node rank
+           (system-scope release); every CTA waits for its rank's flag to
+           reach ``ranks_per_node * (epoch * ret_phases + p + 1)``
            (monotonic, never reset).
-        2. CTAs 1.. reduce the node partials chunk by chunk (``_gin_early_reduce``).
+        2. CTAs 1.. reduce the phase's node partials chunk by chunk
+           (``_gin_early_reduce``).
         3. CTA 0 posts each chunk's return put once the grid has reduced it.
         """
         args = token_comm_args
         iket_er = cta_linear_id < Int32(3)
-        if iket_er:
-            _iket.range_push("ER.Wait")
         epoch = Int32(
             cute.arch.load(args.gin_epoch.iterator, Int32, sem="relaxed", scope="gpu")
         )
-        if cta_linear_id == Int32(0):
-            if lane_idx == Int32(0):
-                target = Int32(args.sm_count * self.num_seg1_signal_warps)
-                while cute.arch.load(
-                    args.gin_seg1_done.iterator, Int32, sem="acquire", scope="gpu"
-                ) < target:
-                    _nanosleep(Int32(100))
-                # The thread that acquired the count releases to every peer.
-                for peer in cutlass.range_constexpr(self.ranks_per_node):
-                    flag_addr = args.peer_rank_ptr_mapper.map(
-                        args.gin_seg1_flag.iterator.toint(), Int32(peer), Int64(0)
-                    )
-                    red_add_release_sys_s32_raw(flag_addr, Int32(1))
-            cute.arch.sync_warp()
-        if lane_idx == Int32(0):
-            flag_target = (epoch + Int32(1)) * Int32(self.ranks_per_node)
-            # Wrap-safe: the flag and the epoch wrap modulo 2^32.
-            while Int32(
-                cute.arch.load(
-                    args.gin_seg1_flag.iterator, Int32, sem="acquire", scope="sys"
-                )
-                - flag_target
-            ) < Int32(0):
-                _nanosleep(Int32(200))
-        cute.arch.sync_warp()
-        # The landing rows are read by bulk copies (async proxy).
-        cute.arch.fence_proxy("async.global")
-        self._dbg(cta_linear_id, 13, Int32(0), lane_idx)
-        if iket_er:
-            _iket.range_pop()
-        if cta_linear_id == Int32(0):
+        mbar_parity = Int32(0)
+        stage = Int32(0)
+        for phase in cutlass.range_constexpr(self.ret_phases):
             if iket_er:
-                _iket.range_push("ER.Issue")
-            self._gin_return_chunks(args, lane_idx)
+                _iket.range_push("ER.Wait")
+            if cta_linear_id == Int32(0):
+                if lane_idx == Int32(0):
+                    # 16-bit field ``phase`` of gin_seg1_done: the epilogue
+                    # warps past this phase (see _signal_seg1_done).
+                    target = Int32(args.sm_count * self.num_seg1_signal_warps)
+                    while (
+                        (
+                            cute.arch.load(
+                                args.gin_seg1_done.iterator, Int32,
+                                sem="acquire", scope="gpu",
+                            )
+                            >> Int32(16 * phase)
+                        )
+                        & Int32(0xFFFF)
+                    ) < target:
+                        _nanosleep(Int32(100))
+                    # The thread that acquired the count releases to every peer.
+                    for peer in cutlass.range_constexpr(self.ranks_per_node):
+                        flag_addr = args.peer_rank_ptr_mapper.map(
+                            args.gin_seg1_flag.iterator.toint(), Int32(peer), Int64(0)
+                        )
+                        red_add_release_sys_s32_raw(flag_addr, Int32(1))
+                cute.arch.sync_warp()
+            if lane_idx == Int32(0):
+                flag_target = (
+                    epoch * Int32(self.ret_phases) + Int32(phase + 1)
+                ) * Int32(self.ranks_per_node)
+                # Wrap-safe: the flag and the epoch wrap modulo 2^32.
+                while Int32(
+                    cute.arch.load(
+                        args.gin_seg1_flag.iterator, Int32, sem="acquire", scope="sys"
+                    )
+                    - flag_target
+                ) < Int32(0):
+                    _nanosleep(Int32(200))
+            cute.arch.sync_warp()
+            # The landing rows are read by bulk copies (async proxy).
+            cute.arch.fence_proxy("async.global")
+            self._dbg(cta_linear_id, 13 if phase == 0 else 15, Int32(0), lane_idx)
             if iket_er:
                 _iket.range_pop()
-        else:
-            self._gin_early_reduce(
-                token_comm_storage, args, cta_linear_id - Int32(1), lane_idx, iket_er,
-            )
+            if cta_linear_id == Int32(0):
+                if iket_er:
+                    _iket.range_push("ER.Issue")
+                self._gin_return_chunks(args, lane_idx, phase)
+                if iket_er:
+                    _iket.range_pop()
+            else:
+                mbar_parity, stage = self._gin_early_reduce(
+                    token_comm_storage, args, cta_linear_id - Int32(1), lane_idx,
+                    iket_er, phase, mbar_parity, stage,
+                )
         self._dbg(cta_linear_id, 14, Int32(0), lane_idx)
 
     @cute.jit
@@ -4072,9 +4240,10 @@ class TokenInPullTokenBackPush:
 
     @cute.jit
     def _gin_early_reduce_unit(
-        self, args, s: cutlass.Constexpr[int], t, seg, hits, stage_ptr, lane_idx,
+        self, args, s: cutlass.Constexpr[int], out_row, seg, hits, stage_ptr, lane_idx,
     ):
-        """Sum a staged segment in ascending k (FP32, one BF16 round), store it."""
+        """Sum a staged segment in ascending k (FP32, one BF16 round), store it
+        to return-buffer row ``out_row`` of slot ``s``."""
         t_max: cutlass.Constexpr[int] = self.max_tokens_per_rank
         num_topk: cutlass.Constexpr[int] = self.num_topk
         row_bytes: cutlass.Constexpr[int] = self.hidden * 2
@@ -4093,7 +4262,7 @@ class TokenInPullTokenBackPush:
                 acc[2 * q + 1] = acc[2 * q + 1] + hi
         stg_b128_raw(
             args.gin_reduce_buf.iterator.toint()
-            + (Int64(s * t_max) + Int64(t)) * Int64(row_bytes)
+            + (Int64(s * t_max) + Int64(out_row)) * Int64(row_bytes)
             + Int64(seg) * Int64(seg_bytes)
             + Int64(lane_idx) * Int64(16),
             f32x2_to_bf16x2(acc[0], acc[1]),
@@ -4105,18 +4274,22 @@ class TokenInPullTokenBackPush:
     @cute.jit
     def _gin_early_reduce(
         self, token_comm_storage, token_comm_args, reducer_idx, lane_idx, iket_er,
+        phase: cutlass.Constexpr[int], mbar_parity, stage,
     ):
-        """Node reduce on one 48-register dispatch warp per CTA (CTAs 1..).
+        """Node reduce of return phase ``phase`` on one 48-register dispatch
+        warp per CTA (CTAs 1..).
 
         The reducers share the tokens of one token chunk at a time; a token's
         hit mask is read once, then its row is reduced in 512-byte segments
         through a ring of bulk-copy stages in ``ret_buffer``.  Each finished
         chunk is counted in ``gin_ret_chunk_done`` after a system-scope fence
-        (the NIC reads the partials).
+        (the NIC reads the partials).  The ring's mbarriers are initialized
+        once; ``mbar_parity`` / ``stage`` carry their state across return phases.
         """
         args = token_comm_args
         num_slots: cutlass.Constexpr[int] = self.num_remote_slots
         n_chunks: cutlass.Constexpr[int] = self.gin_ret_chunks
+        phase_chunks: cutlass.Constexpr[int] = n_chunks // self.ret_phases
         row_bytes: cutlass.Constexpr[int] = self.hidden * 2
         seg_bytes: cutlass.Constexpr[int] = self.gin_reduce_seg_bytes
         segs: cutlass.Constexpr[int] = row_bytes // seg_bytes
@@ -4125,13 +4298,12 @@ class TokenInPullTokenBackPush:
         reducers = Int32(args.sm_count - 1)
         buf = token_comm_storage.ret_buffer.data_ptr()
         mbar = token_comm_storage.ret_mbar.data_ptr()
-        if lane_idx == Int32(0):
-            for st in cutlass.range_constexpr(stages):
-                cute.arch.mbarrier_init(mbar + st, 1)
-        cute.arch.mbarrier_init_fence()
-        cute.arch.sync_warp()
-        phases = Int32(0)
-        stage = Int32(0)
+        if cutlass.const_expr(phase == 0):
+            if lane_idx == Int32(0):
+                for st in cutlass.range_constexpr(stages):
+                    cute.arch.mbarrier_init(mbar + st, 1)
+            cute.arch.mbarrier_init_fence()
+            cute.arch.sync_warp()
         for s in cutlass.range_constexpr(num_slots):
             n_s = Int32(
                 cute.arch.load(
@@ -4139,18 +4311,22 @@ class TokenInPullTokenBackPush:
                     sem="relaxed", scope="gpu",
                 )
             )
-            rows_per_chunk, num_chunks = self._gin_ret_chunking(n_s)
+            n_rows = self._gin_phase_rows(n_s, phase)
+            rows_per_chunk, num_chunks = self._gin_ret_chunking(n_rows)
             chunk = Int32(0)
             while chunk < num_chunks:
                 if iket_er:
                     _iket.range_push("ER.Chunk")
-                t_begin = chunk * rows_per_chunk
-                rows = n_s - t_begin
+                r_begin = chunk * rows_per_chunk
+                rows = n_rows - r_begin
                 if rows > rows_per_chunk:
                     rows = rows_per_chunk
                 tok = reducer_idx
                 while tok < rows:
-                    t = t_begin + tok
+                    # Return row r of this phase holds token ret_phases*r + phase.
+                    r = r_begin + tok
+                    t = r * Int32(self.ret_phases) + Int32(phase)
+                    out_row = Int32(phase * self.gin_ret_phase_rows) + r
                     mask = self._gin_hit_mask(args, s, t, lane_idx)
                     if mask != Int32(0):
                         hits = Int32(cute.arch.popc(mask))
@@ -4177,11 +4353,11 @@ class TokenInPullTokenBackPush:
                                     mbar + ahead_stage, lane_idx,
                                 )
                             cute.arch.mbarrier_wait(
-                                mbar + stage, (phases >> stage) & Int32(1)
+                                mbar + stage, (mbar_parity >> stage) & Int32(1)
                             )
-                            phases = phases ^ (Int32(1) << stage)
+                            mbar_parity = mbar_parity ^ (Int32(1) << stage)
                             self._gin_early_reduce_unit(
-                                args, s, t, seg, hits,
+                                args, s, out_row, seg, hits,
                                 buf + stage * Int32(stage_bytes), lane_idx,
                             )
                             # Every lane has read the stage before it is refilled.
@@ -4196,7 +4372,7 @@ class TokenInPullTokenBackPush:
                 if lane_idx == Int32(0):
                     cute.arch.atomic_add(
                         args.gin_ret_chunk_done.iterator
-                        + (Int32(s * n_chunks) + chunk),
+                        + (Int32(s * n_chunks + phase * phase_chunks) + chunk),
                         Int32(1),
                         sem="relaxed",
                         scope="gpu",
@@ -4204,24 +4380,28 @@ class TokenInPullTokenBackPush:
                 if iket_er:
                     _iket.range_pop()
                 chunk = chunk + Int32(1)
+        return mbar_parity, stage
 
     @cute.jit
-    def _gin_return_chunks(self, token_comm_args, lane_idx):
-        """C5 on CTA0's dispatch warp: one return put per reduced token chunk.
+    def _gin_return_chunks(self, token_comm_args, lane_idx, phase: cutlass.Constexpr[int]):
+        """C5 on CTA0's dispatch warp: one return put per reduced token chunk
+        of return phase ``phase``.
 
         Lane ``s`` serves slot ``s``.  Chunk ``c`` leaves once every reducer
         (the dispatch warps of CTAs 1..) counted it in ``gin_ret_chunk_done``;
-        the last put (or, without tokens, a lone signal) adds the chunks that
-        were not sent, keeping the per-launch RET increment at
-        ``gin_ret_chunks``.
+        the phase's last put (or, without tokens, a lone signal) adds the
+        phase's chunks that were not sent, keeping the per-launch RET
+        increment at ``gin_ret_chunks``.
         """
         from nccl.core.device import cute as nccl_cute
 
         args = token_comm_args
         num_slots: cutlass.Constexpr[int] = self.num_remote_slots
         n_chunks: cutlass.Constexpr[int] = self.gin_ret_chunks
+        phase_chunks: cutlass.Constexpr[int] = n_chunks // self.ret_phases
         t_max: cutlass.Constexpr[int] = self.max_tokens_per_rank
         row_bytes: cutlass.Constexpr[int] = self.hidden * 2
+        phase_base: cutlass.Constexpr[int] = phase * self.gin_ret_phase_rows * row_bytes
         if lane_idx < Int32(num_slots):
             slot = lane_idx
             n_s = Int32(
@@ -4230,7 +4410,8 @@ class TokenInPullTokenBackPush:
                     sem="relaxed", scope="gpu",
                 )
             )
-            rows_per_chunk, num_chunks = self._gin_ret_chunking(n_s)
+            n_rows = self._gin_phase_rows(n_s, phase)
+            rows_per_chunk, num_chunks = self._gin_ret_chunking(n_rows)
             gin = self._gin()
             win = args.gin_window
             team = self._team_rail_value
@@ -4241,29 +4422,29 @@ class TokenInPullTokenBackPush:
             reducers = Int32(args.sm_count - 1)
             src_base = args.gin_reduce_buf.iterator.toint() + Int64(slot) * Int64(
                 t_max * row_bytes
-            )
+            ) + Int64(phase_base)
             dst_base = args.gin_remote_partial.iterator.toint() + Int64(
                 my_slot
-            ) * Int64(t_max * row_bytes)
+            ) * Int64(t_max * row_bytes) + Int64(phase_base)
             if num_chunks == Int32(0):
                 gin.signal(
                     team, dst_node, True, ret_signal, _GIN_SIGNAL_OP_ADD,
-                    Int64(n_chunks), coop,
+                    Int64(phase_chunks), coop,
                 )
             chunk = Int32(0)
             while chunk < num_chunks:
                 done_ptr = args.gin_ret_chunk_done.iterator + (
-                    slot * Int32(n_chunks) + chunk
+                    slot * Int32(n_chunks) + Int32(phase * phase_chunks) + chunk
                 )
                 while cute.arch.load(done_ptr, Int32, sem="acquire", scope="gpu") < reducers:
                     pass
                 t_begin = chunk * rows_per_chunk
-                rows = n_s - t_begin
+                rows = n_rows - t_begin
                 if rows > rows_per_chunk:
                     rows = rows_per_chunk
                 increment = Int64(1)
                 if chunk + Int32(1) == num_chunks:
-                    increment = Int64(Int32(n_chunks) - chunk)
+                    increment = Int64(Int32(phase_chunks) - chunk)
                 offset = Int64(t_begin) * Int64(row_bytes)
                 nbytes = rows * Int32(row_bytes)
                 gin.put(

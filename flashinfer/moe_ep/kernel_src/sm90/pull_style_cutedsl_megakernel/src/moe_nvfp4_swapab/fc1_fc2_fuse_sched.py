@@ -56,10 +56,13 @@ class BlockPhase(IntEnum):
 # WorkTileInfo.phase_and_peek bit 17: tail-split pair task (both CTAs share the
 # token tile, weights are not multicast).  Bit 16 = PeekReadyBit, low 16 = phase.
 TailSplitBit = 1 << 17
-# Bit 18: a tile of the deferred node-local FC2 segment (``defer_local_fc2``);
-# every tile a CTA receives before its first such tile belongs to an earlier
-# segment.
-LateSegmentBit = 1 << 18
+# Bits 18-19 (``defer_local_fc2``): the early-return signal level of a tile,
+# ``max(segment - 1, 0)`` -- 0 for the node-local FC1 and the first remote
+# segment, then +1 per later segment, the deferred node-local segment last.
+# Every tile a CTA receives before its first tile of level L belongs to a
+# segment of a lower level.
+SegmentLevelShift = 18
+SegmentLevelMask = 3
 
 
 @cute.jit
@@ -131,9 +134,10 @@ class _FusedFc12SchedState:
         current_this_expert_token_cnt: Int32,
         current_work_linear_tile_idx: Int32,
         # Segment-major order (internode): segment 0 walks every expert's
-        # node-local full token blocks, segment 1 the remaining blocks;
-        # ``current_segment_block_begin`` is the current expert's first
-        # cluster token block of the current segment.
+        # node-local full token blocks, segment 1 the remaining blocks (with
+        # two return phases, segments 1 and 2 split them; see
+        # ``last_segment``); ``current_segment_block_begin`` is the current
+        # expert's first cluster token block of the current segment.
         current_segment: Int32,
         current_segment_block_begin: Int32,
     ):
@@ -331,6 +335,17 @@ class MoEFusedFc12SchedulerParams(MoESchedulerParamsBase):
         # segment (local FC1, then remote FC1 + FC2, then local FC2), so the
         # FC2 rows of remote origins are final while local FC2 still runs.
         defer_local_fc2: bool = False,
+        # With defer_local_fc2: only the first this-many experts run their
+        # local FC1 in segment 0 (enough to cover the remote rows' arrival);
+        # the rest runs in the deferred segment.  None keeps all of it in
+        # segment 0.
+        seg0_fc1_experts: Optional[int] = None,
+        # With defer_local_fc2: 2 splits the remote blocks into two segments,
+        # the remote origins' even tokens first (their rows lead every remote
+        # source's pool rows; the count's high word, summed over the
+        # ``num_sources`` sources, gives their extent), then the odd ones.
+        ret_phases: int = 1,
+        num_sources: int = 0,
         # Within one expert, iterate the token blocks fastest (default: the
         # weight blocks fastest).  Token-fast keeps all token blocks of an
         # expert on the same weight tile at the same time, so a weight tile is
@@ -411,6 +426,15 @@ class MoEFusedFc12SchedulerParams(MoESchedulerParamsBase):
         if defer_local_fc2 and expert_source_counts is None:
             raise ValueError("defer_local_fc2 needs the segment-major order")
         self.defer_local_fc2 = bool(defer_local_fc2)
+        if seg0_fc1_experts is not None and not defer_local_fc2:
+            raise ValueError("seg0_fc1_experts needs defer_local_fc2")
+        self.seg0_fc1_experts = seg0_fc1_experts
+        if ret_phases not in (1, 2):
+            raise ValueError(f"ret_phases must be 1 or 2, got {ret_phases}")
+        if ret_phases == 2 and (not defer_local_fc2 or num_sources <= 0):
+            raise ValueError("ret_phases=2 needs defer_local_fc2 and num_sources")
+        self.ret_phases = int(ret_phases)
+        self.num_sources = int(num_sources)
 
     @property
     def segmented(self) -> bool:
@@ -418,8 +442,10 @@ class MoEFusedFc12SchedulerParams(MoESchedulerParamsBase):
 
     @property
     def last_segment(self) -> int:
-        """Index of the final segment of the segment-major walk."""
-        return 2 if self.defer_local_fc2 else 1
+        """Index of the final segment of the segment-major walk: the node-local
+        FC1 (0), ``ret_phases`` remote segments, then the deferred node-local
+        segment with ``defer_local_fc2``."""
+        return 1 + self.ret_phases if self.defer_local_fc2 else 1
 
     def get_scheduler_type(self) -> type:
         return MoEFusedFc12PersistentTileScheduler
@@ -490,6 +516,9 @@ class MoEFusedFc12SchedulerParams(MoESchedulerParamsBase):
         result.local_source_begin = self.local_source_begin
         result.local_source_count = self.local_source_count
         result.defer_local_fc2 = self.defer_local_fc2
+        result.seg0_fc1_experts = self.seg0_fc1_experts
+        result.ret_phases = self.ret_phases
+        result.num_sources = self.num_sources
         result.fc1_token_fast = self.fc1_token_fast
         result.fc2_token_fast = self.fc2_token_fast
 
@@ -1065,18 +1094,21 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
 
     @dsl_user_op
     @cute.jit
-    def _local_full_blocks(
+    def _segment_blocks(
         self,
         expert_idx,
         *,
         loc: Optional[ir.Location] = None,
         ip: Optional[ir.InsertionPoint] = None,
-    ) -> Int32:
-        """Cluster token blocks of ``expert_idx`` holding only node-local rows.
+    ):
+        """Segment boundaries of ``expert_idx`` in cluster token blocks.
 
         The pull fills an expert's pool rows source by source, node-local
-        sources first, so its first ``floor(local_rows / cluster_tile_m)``
-        blocks never wait for remote rows.
+        sources first, so its first ``local_blocks = floor(local_rows /
+        cluster_tile_m)`` blocks never wait for remote rows.  With two return
+        phases the remote origins' even tokens' rows follow, and the first
+        remote segment ends at ``even_end_blocks``, the first block boundary
+        past them (0 with one phase).
         """
         params = self.params
         local_rows = Int32(0)
@@ -1085,7 +1117,22 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
                 Int64(params.expert_source_counts[params.local_source_begin + j, expert_idx])
                 & Int64(0xFFFFFFFF)
             )
-        return local_rows // Int32(params.cluster_tile_m)
+        local_blocks = local_rows // Int32(params.cluster_tile_m)
+        even_end_blocks = Int32(0)
+        if cutlass.const_expr(params.ret_phases == 2):
+            local_end: cutlass.Constexpr[int] = (
+                params.local_source_begin + params.local_source_count
+            )
+            even_rows = Int32(0)
+            for j in cutlass.range_constexpr(params.num_sources):
+                if cutlass.const_expr(j < params.local_source_begin or j >= local_end):
+                    even_rows = even_rows + Int32(
+                        Int64(params.expert_source_counts[j, expert_idx]) >> Int64(32)
+                    )
+            even_end_blocks = (
+                local_rows + even_rows + Int32(params.cluster_tile_m - 1)
+            ) // Int32(params.cluster_tile_m)
+        return local_blocks, even_end_blocks
 
     @dsl_user_op
     @cute.jit
@@ -1093,8 +1140,10 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
         self,
         token_count,
         local_blocks,
+        even_end_blocks,
         num_weight_blocks,
         is_fc1: cutlass.Constexpr[bool],
+        expert_idx,
         *,
         loc: Optional[ir.Location] = None,
         ip: Optional[ir.InsertionPoint] = None,
@@ -1102,8 +1151,12 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
         """Tasks one expert contributes to one phase of the current segment.
 
         Segment 0 holds the node-local full blocks, segment 1 the rest; with
-        ``defer_local_fc2`` segment 0 is FC1-only and segment 2 carries the
-        node-local blocks' FC2.
+        ``defer_local_fc2`` segment 0 is FC1-only (the first
+        ``seg0_fc1_experts`` experts) and the last segment carries the rest of
+        the node-local blocks' FC1 and all their FC2.  With two return phases
+        segment 1 stops at ``even_end_blocks`` and segment 2 takes the
+        remaining blocks (the expert's tail block is segment 1's only when the
+        even tokens reach it).
         """
         params = self.params
         tiles = fc12_expert_phase_tiles(
@@ -1116,17 +1169,31 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
         if cutlass.const_expr(params.segmented):
             local_tiles = local_blocks * num_weight_blocks
             segment = self._fused_state.current_segment
+            remote_tiles = tiles - local_tiles
+            first_remote_tiles = remote_tiles
+            if cutlass.const_expr(params.ret_phases == 2):
+                total_blocks = (
+                    token_count + Int32(params.cluster_tile_m - 1)
+                ) // Int32(params.cluster_tile_m)
+                if even_end_blocks < total_blocks:
+                    first_remote_tiles = (even_end_blocks - local_blocks) * num_weight_blocks
+            tiles = local_tiles
+            if cutlass.const_expr(params.defer_local_fc2):
+                # Local FC2 runs in the last segment; local FC1 in segment 0,
+                # or in the last segment past the first seg0_fc1_experts experts.
+                in_phase_segment = Int32(params.last_segment)
+                if cutlass.const_expr(is_fc1):
+                    in_phase_segment = Int32(0)
+                    if cutlass.const_expr(params.seg0_fc1_experts is not None):
+                        if expert_idx >= Int32(params.seg0_fc1_experts):
+                            in_phase_segment = Int32(params.last_segment)
+                if segment != in_phase_segment:
+                    tiles = Int32(0)
             if segment == Int32(1):
-                tiles = tiles - local_tiles
-            else:
-                tiles = local_tiles
-                if cutlass.const_expr(params.defer_local_fc2):
-                    # Local FC1 runs in segment 0 and local FC2 in segment 2.
-                    in_phase_segment = Int32(2)
-                    if cutlass.const_expr(is_fc1):
-                        in_phase_segment = Int32(0)
-                    if segment != in_phase_segment:
-                        tiles = Int32(0)
+                tiles = first_remote_tiles
+            if cutlass.const_expr(params.ret_phases == 2):
+                if segment == Int32(2):
+                    tiles = remote_tiles - first_remote_tiles
         return tiles
 
     @dsl_user_op
@@ -1194,15 +1261,23 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
         ) // Int32(cluster_tile_m)
 
         local_blocks = Int32(0)
+        even_end_blocks = Int32(0)
         if cutlass.const_expr(params.segmented):
-            local_blocks = self._local_full_blocks(state.current_expert_idx)
-            # Branch-free: state fields are not carried out of a dynamic if.
-            # Only segment 1 starts past the local blocks (s * (2 - s) is 1
-            # for s == 1 and 0 for segments 0 and 2).
-            segment = state.current_segment
-            state.current_segment_block_begin = (
-                local_blocks * segment * (Int32(2) - segment)
+            local_blocks, even_end_blocks = self._segment_blocks(
+                state.current_expert_idx
             )
+            # Segment 1 starts past the local blocks, segment 2 (two return
+            # phases) past the even tokens' blocks; the node-local segments
+            # start at block 0.  The state field is set outside the dynamic
+            # ifs (state fields are not carried out of them).
+            segment = state.current_segment
+            block_begin = Int32(0)
+            if segment == Int32(1):
+                block_begin = local_blocks
+            if cutlass.const_expr(params.ret_phases == 2):
+                if segment == Int32(2):
+                    block_begin = even_end_blocks
+            state.current_segment_block_begin = block_begin
 
         # --- Step 3: slide expert_tile_start / expert_tile_end.
         state.current_expert_tile_start = state.current_expert_tile_end
@@ -1212,15 +1287,19 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
             tiles_in_expert = self._segment_phase_tiles(
                 this_expert_token_cnt,
                 local_blocks,
+                even_end_blocks,
                 self._num_fc1_intermediate_blocks,
                 True,
+                state.current_expert_idx,
             )
         else:
             tiles_in_expert = self._segment_phase_tiles(
                 this_expert_token_cnt,
                 local_blocks,
+                even_end_blocks,
                 self._num_fc2_hidden_blocks,
                 False,
+                state.current_expert_idx,
             )
         state.current_expert_tile_end = (
             state.current_expert_tile_start + tiles_in_expert
@@ -1349,19 +1428,24 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
                     ip=ip,
                 )
             local_blocks_e = Int32(0)
+            even_end_blocks_e = Int32(0)
             if cutlass.const_expr(params.segmented):
-                local_blocks_e = self._local_full_blocks(expert_cursor)
+                local_blocks_e, even_end_blocks_e = self._segment_blocks(expert_cursor)
             cumulative_fc1 = cumulative_fc1 + self._segment_phase_tiles(
                 token_count_e,
                 local_blocks_e,
+                even_end_blocks_e,
                 self._num_fc1_intermediate_blocks,
                 True,
+                expert_cursor,
             )
             cumulative_fc2 = cumulative_fc2 + self._segment_phase_tiles(
                 token_count_e,
                 local_blocks_e,
+                even_end_blocks_e,
                 self._num_fc2_hidden_blocks,
                 False,
+                expert_cursor,
             )
             expert_cursor = expert_cursor + Int32(1)
 
@@ -1516,10 +1600,9 @@ class MoEFusedFc12PersistentTileScheduler(MoESchedulerBase):
                 valid_tokens_in_cta_tile = Int32(0)
         phase_and_split = state.current_phase | split_bit
         if const_expr(params.segmented and params.defer_local_fc2):
-            # Segment 2 (deferred local FC2) -> LateSegmentBit.
-            phase_and_split = phase_and_split | (
-                (state.current_segment >> Int32(1)) * Int32(LateSegmentBit)
-            )
+            # Early-return signal level max(segment - 1, 0) in bits 18-19.
+            level = cutlass.max(state.current_segment - Int32(1), Int32(0))
+            phase_and_split = phase_and_split | (level << Int32(SegmentLevelShift))
 
         # Swap scheduler-internal M/N back to GEMM-domain M/N on output.
         if const_expr(params.is_swap_ab):
