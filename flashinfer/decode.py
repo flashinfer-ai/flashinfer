@@ -85,10 +85,12 @@ from .utils import (
     _get_range_buf,
     _unpack_paged_kv_cache,
     canonicalize_torch_dtype,
+    check_kv_split_backend,
     determine_attention_backend,
     device_support_pdl,
     get_device_sm_count,
     is_float8,
+    pins_kv_split,
     register_custom_op,
     register_fake_op,
     ceil_div,
@@ -1494,7 +1496,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
             ``nvidia-cutlass-dsl`` 4.7.0 or newer, above the 4.6.2 the packages' dependency
             metadata admit), and callers that pin fa2's KV split (``fixed_split_size`` /
             ``disable_split_kv``, the batch-invariance controls) keep fa2 wherever it can
-            serve the rows. ``resolved_backend`` reports the choice after :meth:`plan`.
+            serve the rows, also where ``auto`` would otherwise take fa3 for FP8 decode;
+            an explicit ``fa3`` raises ``ValueError`` with either control set.
+            ``resolved_backend`` reports the choice after :meth:`plan`.
             ``FLASHINFER_DECODE_AUTO_CUDNN=0`` keeps fa2, ``=1`` applies the rule on an older
             frontend too. Under CUDA graphs (``use_cuda_graph=True``) ``auto`` takes ``cudnn``
             only when :meth:`plan` receives a caller-owned ``block_tables`` (the auto-built
@@ -2023,7 +2027,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 module = self._jit_module
             else:
                 if backend == "auto":
-                    if {
+                    if not pins_kv_split(fixed_split_size, disable_split_kv) and {
                         torch.float8_e4m3fn,
                         torch.float8_e5m2,
                     } & {q_data_type, kv_data_type}:
@@ -2037,6 +2041,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                         )
                     else:
                         backend = "fa2"
+                check_kv_split_backend(backend, fixed_split_size, disable_split_kv)
                 if q_len_per_req > 1 and backend == "fa3":
                     raise NotImplementedError(
                         "q_len_per_req > 1 is currently only supported on the "
@@ -2793,7 +2798,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 self._cached_module = self._jit_module
             else:
                 if self._backend == "auto":
-                    if {
+                    if not pins_kv_split(fixed_split_size, disable_split_kv) and {
                         torch.float8_e4m3fn,
                         torch.float8_e5m2,
                     } & {q_data_type, kv_data_type}:
@@ -2809,6 +2814,9 @@ class BatchDecodeWithPagedKVCacheWrapper:
                         )
                     else:
                         self._backend = "fa2"
+                check_kv_split_backend(
+                    self._backend, fixed_split_size, disable_split_kv
+                )
                 if q_len_per_req > 1 and self._backend == "fa3":
                     raise NotImplementedError(
                         "q_len_per_req > 1 is currently only supported on the "
@@ -5744,6 +5752,9 @@ def fast_decode_plan(
         # Here we set fixed_split_size to -1 to avoid the assertion error in flashinfer's plan function
         if fixed_split_size is None:
             fixed_split_size = -1
+        check_kv_split_backend(
+            getattr(self, "_backend", None), fixed_split_size, disable_split_kv
+        )
 
     if self.is_cuda_graph_enabled:
         if batch_size != self._fixed_batch_size:
