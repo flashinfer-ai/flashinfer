@@ -1319,6 +1319,13 @@ def test_k1_sm107a_token_counts_of_the_deterministic_rules():
 #: parts of 216 SMs or more: their one-split program met the FP32 error budget on every seed at 40960 tokens and
 #: missed it from 45056 tokens up.
 K1_SM107A_FP32_BUDGET_TOKENS = 40961
+#: Those rows ``(d_in, d_out)`` and their one-split programs ``(block_n, splits)`` below that token count.
+K1_SM107A_WIDE_FP32_ROWS = {
+    (4096, 512): (128, 1),
+    (4096, 1024): (256, 1),
+    (5120, 512): (128, 1),
+    (5120, 1024): (256, 1),
+}
 
 
 def test_k1_sm107a_wide_fp32_rows_at_large_token_counts():
@@ -1330,12 +1337,7 @@ def test_k1_sm107a_wide_fp32_rows_at_large_token_counts():
     program at these token counts as before; the other entries of these rows lie in that window.  No other sm_107a
     row has such a range, and sm_100a / sm_103a have no verdict for these rows."""
     T0 = K1_SM107A_FP32_BUDGET_TOKENS
-    rows = {
-        (4096, 512): (128, 1),
-        (4096, 1024): (256, 1),
-        (5120, 512): (128, 1),
-        (5120, 1024): (256, 1),
-    }
+    rows = K1_SM107A_WIDE_FP32_ROWS
     excluded = cake_backend.K1_SPLIT_RULE_EXCLUDED_TOKENS
     open_ranges = {
         key
@@ -2908,6 +2910,39 @@ def test_k1_convenience_calls_cache_their_bindings(monkeypatch):
     ((_, atomic),) = cake_backend._K1_ATOMIC_CACHE.items()
     assert atomic.plan is not None and atomic.plan.splits == 2 and atomic.k1 is not None
     assert atomic.det_plan is None and atomic.arena is not None
+
+
+def test_k1_sm107a_wide_fp32_rows_bind_per_token_count(monkeypatch):
+    """The convenience path keys a K1 call by the geometry of its views, the token count included, and plans each key
+    at the part's SM count: on a 216-SM ``sm_107a`` part the weight gradient of each row of
+    ``K1_SM107A_WIDE_FP32_ROWS`` binds its one-split program one token below ``K1_SM107A_FP32_BUDGET_TOKENS`` and
+    the deterministic package's plan at that token count and at 65536 tokens, after the smaller token count's entry
+    is cached."""
+    arch, T0 = "sm_107a", K1_SM107A_FP32_BUDGET_TOKENS
+    entry_fn = _cpu_k1_launches(monkeypatch, arch)
+    facts = det_backend.DeviceFacts(
+        index=0, arch=arch, sm_count=216, l2_bytes=126 << 20
+    )
+    monkeypatch.setattr(det_backend, "device_facts", lambda device=None: facts)
+    monkeypatch.setattr(cake_backend, "_k1_index", lambda *views: 0)
+    bf16 = torch.bfloat16
+    for (d_in, d_out), choice in K1_SM107A_WIDE_FP32_ROWS.items():
+        cake_backend._K1_ATOMIC_CACHE.clear()
+        entry_fn.calls.clear()
+        out = torch.empty(d_out, d_in)
+        for T in (T0 - 1, T0, 65536):
+            G, X = torch.empty(T, d_out, dtype=bf16), torch.empty(T, d_in, dtype=bf16)
+            assert cake_backend.projection_wgrad(G, X, out, deterministic=False) is out
+            entry = next(reversed(cake_backend._K1_ATOMIC_CACHE.values()))
+            where = (d_in, d_out, T)
+            assert entry.k1 is not None, where
+            if T < T0:
+                assert entry.det_plan is None, where
+                assert (entry.plan.block_n, entry.plan.splits) == choice, where
+            else:
+                assert entry.plan is None and entry.det_plan is not None, where
+        assert len(cake_backend._K1_ATOMIC_CACHE) == 3
+        assert len(entry_fn.calls) == 3
 
 
 def test_k1_swapped_small_token_forward_stays_on_the_deterministic_call(monkeypatch):
