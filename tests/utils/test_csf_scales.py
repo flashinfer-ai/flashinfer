@@ -18,8 +18,13 @@ import numpy as np
 import pytest
 import torch
 
-from flashinfer.quantization import SfLayout, encode_csf_scales, expand_csf_scales
-from flashinfer.utils import round_up
+from flashinfer.quantization import (
+    SfLayout,
+    block_scale_interleave,
+    encode_csf_scales,
+    expand_csf_scales,
+)
+from flashinfer.utils import get_compute_capability, round_up
 
 
 def encode_ref(scales: np.ndarray):
@@ -129,7 +134,8 @@ def swizzle_128x4_ref(scales: torch.Tensor):
 
 
 @pytest.mark.parametrize(
-    "num_matrices,rows,cols", [(3, 32, 2), (2, 256, 40), (4, 384, 10), (2, 160, 20)]
+    "num_matrices,rows,cols",
+    [(3, 32, 2), (2, 256, 40), (4, 384, 10), (2, 160, 20), (2, 256, 448)],
 )
 @pytest.mark.parametrize("swap_row_halves", [False, True])
 def test_expand_csf_scales_layouts(num_matrices, rows, cols, swap_row_halves):
@@ -146,6 +152,8 @@ def test_expand_csf_scales_layouts(num_matrices, rows, cols, swap_row_halves):
         out = torch.full_like(ref, 0x5A)
         expand_csf_scales(csf, out, layout=layout, swap_row_halves=swap_row_halves)
         assert torch.equal(out, ref), layout
+    if get_compute_capability(out.device)[0] >= 9:  # block_scale_interleave needs SM90+
+        assert torch.equal(out, block_scale_interleave(scales).view_as(out))
 
 
 def test_expand_csf_scales_no_rows():
