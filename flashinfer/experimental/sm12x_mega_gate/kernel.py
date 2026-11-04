@@ -23,8 +23,9 @@ Warp roles (DeepGEMM's TMA / MMA / gate split):
   128-token blocks, a 32x64 accumulator tile per warp): per token block, the
   mainloop, the partial-logit stores and the arrival at the block's score barrier;
   then straight on to the next block. When a CTA ranks more tokens of a block than
-  it has gate warps (wide blocks), they rank tokens of the CTA's last block with the
-  gate warps once their own work is done (nothing overlaps that block's gate work).
+  it has gate warps (wide blocks, or smaller blocks over few CTAs), they rank tokens
+  of the CTA's last block with the gate warps once their own work is done (nothing
+  overlaps that block's gate work).
 - 1 TMA producer warp.
 - gate warps (4 or 8, per schedule): once all L logical CTAs of a block have arrived, every logical
   CTA ranks a share of its tokens (DeepGEMM's order: token ``gate_warp * L +
@@ -855,7 +856,7 @@ class Sm12xMegaGateKernel:
         exchange_physical: cute.Tensor,
     ):
         """Every logical CTA of a block ranks a share of its tokens: one warp per token, or,
-        with a cooperative gate (at most one token per CTA), every gate warp on its token."""
+        with a cooperative gate (at most 3 tokens per CTA), every gate warp on its tokens."""
         lane = cute.arch.lane_idx()
         (
             lane_bias,

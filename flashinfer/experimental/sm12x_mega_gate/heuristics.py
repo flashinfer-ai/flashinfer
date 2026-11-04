@@ -6,13 +6,15 @@
 
 As in DeepGEMM, a token block is computed by ``L = num_expert_groups *
 num_split_k`` logical CTAs (128 experts and one K slice each) and the grid holds
-``num_sms // L`` worker groups of L CTAs that stride over the token blocks. The
-token block grows with the token count so that a call has about four blocks
-(``select_block_tokens``); the split-K factor is then the argmin of a cost model
-of one CTA's critical path (``estimated_us``). Both were derived from every
-candidate schedule measured on the target board, the 110-SM RTX PRO 5000
-(K=5120, E=384, top-6): over 21 token counts from 1 to 16384 the pick is 0.7%
-slower than the measured best on average and 2.9% at worst. Shapes the model
+``num_sms // L`` worker groups of L CTAs that stride over the token blocks. Up to
+512 tokens the token block grows with the token count so that a call has about
+four blocks (``select_block_tokens``) and the split-K factor is the argmin of a
+cost model of one CTA's critical path (``estimated_us``); above, the model picks
+a 96- or 128-token block and the split together. The model was fitted on
+schedules measured on the target board, the 110-SM RTX PRO 5000 (K=5120, E=384,
+top-6); against every schedule measured there since (53 token counts from 1 to
+16384, medians over buffer placements) its pick is 0.4% slower than the best on
+average and 4.7% at worst (280 tokens, from the block rule). Shapes the model
 misranks (K=4096, E=256) take a measured split per token range and the smallest
 block holding the tokens in one wave (``MEASURED_SPLITS``). Deterministic
 requests never split K, which keeps every token's logits independent of the
@@ -103,7 +105,8 @@ def mma_warps_rank(
 ) -> bool:
     """Whether the MMA warps rank tokens of the CTA's last block with the gate warps:
     without a cooperative gate, when a CTA ranks more tokens of a block than it has gate
-    warps (wide blocks). Nothing overlaps that block's gate work, and the MMA warps have
+    warps (wide blocks, or smaller blocks over few CTAs, e.g. deterministic calls of
+    65-512 tokens). Nothing overlaps that block's gate work, and the MMA warps have
     nothing left to do."""
     return not cooperative and ceil_div(block_tokens, num_logical_ctas) > num_gate_warps
 
@@ -123,9 +126,11 @@ WIDE_BLOCK_TOKENS = (96, 128)
 
 # Cost model of one CTA's critical path, in microseconds, fitted (non-negative least
 # squares, relative error) on the schedules measured within 15% of the best of their token
-# count (16-128 token blocks, every split, 1-16384 tokens) on the 110-SM RTX PRO 5000.
-# With the cooperative gate of up to 3 tokens per CTA: 0.7% slower than the measured best
-# on average over 26 token counts, 3.9% at worst (320 tokens, the block rule).
+# count (16-128 token blocks, every split, 1-16384 tokens) on the 110-SM RTX PRO 5000
+# (K=5120, E=384). With the block rule and the wide-block model below, its picks are 0.4%
+# slower than the best measured schedule on average and 4.7% at worst (280 tokens, from
+# the block rule) over 53 token counts from 1 to 16384 measured after the fit (medians
+# over 5 buffer placements).
 COST_PER_TILE_ROW = 0.0017247
 """Per K block and staged tile row (weight rows + token rows): the load side."""
 COST_PER_MMA_TOKEN = 0.0040045
@@ -159,13 +164,13 @@ WIDE_COST_PER_TAIL_TOKEN_SPLIT = 0.9614
 # thousand tokens the fastest schedule holds every token in one wave of worker groups, with
 # the smallest block that does so at its split (``one_wave_block_tokens``); which split wins
 # (a shorter K loop against more CTAs and a larger block per CTA) is a near-tie the model,
-# fitted with 384 experts, gets wrong by up to 22% with 256. The entries are the fastest
-# one-wave split at 44 measured token counts (the median over 15 buffer placements: a
+# fitted with 384 experts, gets wrong by up to 28% with 256. The entries are the fastest
+# one-wave split at 44 token counts up to 3584 (the median over 15 buffer placements: a
 # schedule's time moves by up to 10% with the DRAM placement of its buffers), merged where
-# a split stays within 3% of the best. Against every schedule measured at 43 token counts
-# up to 3072 they are 0.1% slower than the best on average and 3.2% at worst (the cost
-# model: 5.3% and 22%). Above the last bound the best schedules take several waves and the
-# cost model picks.
+# a split stays within 3% of the best. Against every schedule measured at the 43 of those
+# token counts up to 3072 they are 0.1% slower than the best on average and 1.7% at worst
+# (the cost model alone: 5.7% and 28%). Above the last bound the best schedules take
+# several waves and the cost model picks.
 MEASURED_SPLITS: dict[tuple[int, int, int], tuple[tuple[int, int], ...]] = {
     # DeepSeek-V4-Flash on the 110-SM RTX PRO 5000 (V4.1-Flash, 5120 x 384, is the
     # model's own fit: 0.4% from the best on average there).

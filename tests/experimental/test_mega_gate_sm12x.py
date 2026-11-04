@@ -64,6 +64,7 @@ def _skip_unless_sm120():
 # ----------------------------------------------------------------- CPU only
 
 
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("num_sms", [48, 110, 170, 188])
 @pytest.mark.parametrize("deterministic", [False, True])
 def test_schedule_invariants(num_sms, deterministic):
@@ -119,6 +120,7 @@ def test_schedule_invariants(num_sms, deterministic):
                 assert 1 <= workers <= config.num_token_blocks(num_tokens)
 
 
+@pytest.mark.cpu_only
 def test_measured_splits_take_the_smallest_one_wave_block():
     for (num_sms, hidden, num_experts), ranges in heuristics.MEASURED_SPLITS.items():
         num_groups = -(-num_experts // heuristics.EXPERTS_PER_CTA)
@@ -146,6 +148,7 @@ def test_measured_splits_take_the_smallest_one_wave_block():
             bound = max_tokens
 
 
+@pytest.mark.cpu_only
 def test_num_sms_is_sm12x_only():
     x = torch.zeros((1, 64), dtype=torch.bfloat16)
     weight = torch.zeros((8, 64), dtype=torch.bfloat16)
@@ -308,6 +311,7 @@ def _run_case(
     config=None,
     num_sms=None,
     fixed_routing=None,
+    deterministic=False,
 ):
     x, weight, bias = _make_inputs(num_tokens, hidden, num_experts, seed=seed)
     if not with_bias:
@@ -316,14 +320,17 @@ def _run_case(
     mapping, counts = (
         _physical_map(num_logical, num_logical, replicas) if physical else (None, None)
     )
+    masks = torch.Generator(device="cuda").manual_seed(seed + 2)
     mask = None
     if with_mask:
-        mask = torch.rand(num_tokens, device="cuda") >= 0.25
+        mask = torch.rand(num_tokens, device="cuda", generator=masks) >= 0.25
         mask[0] = True
     image_bias = image_token_mask = None
     if with_image_bias:
-        image_bias = torch.randn(num_experts, dtype=torch.float32, device="cuda")
-        image_token_mask = torch.rand(num_tokens, device="cuda") < 0.5
+        image_bias = torch.randn(
+            num_experts, dtype=torch.float32, device="cuda", generator=masks
+        )
+        image_token_mask = torch.rand(num_tokens, device="cuda", generator=masks) < 0.5
     logical = torch.empty((num_tokens, num_topk), dtype=torch.int64, device="cuda")
     fixed = given = None
     if fixed_routing is not None:  # "some" (every third token) or "all"
@@ -359,6 +366,7 @@ def _run_case(
         ep_rank=ep_rank,
         **({} if num_sms is None else {"num_sms": num_sms}),
         **({} if fixed is None else {"fix_routing_mask": fixed}),
+        deterministic=deterministic,
     )
     indices, weights = plan.run()
     torch.cuda.synchronize()
@@ -425,7 +433,7 @@ def test_production_shape(num_tokens, physical):
 
 
 @pytest.mark.parametrize(
-    "num_tokens", [1, 6, 40, 120, 240, 280, 800, 960, 1120, 4096, 8192]
+    "num_tokens", [1, 6, 40, 120, 240, 280, 448, 576, 800, 960, 1120, 4096, 8192]
 )
 @pytest.mark.parametrize(
     "physical,with_mask", [(False, False), (True, True)], ids=["plain", "mapped-masked"]
@@ -574,8 +582,16 @@ def test_pdl_launch_follows_the_token_producer(num_tokens):
     """Under PDL the gate may start while the kernel writing its tokens finishes: every
     run must see that kernel's tokens, and PDL must not change the result."""
     _skip_unless_sm120()
+    from flashinfer.norm import rmsnorm
+
     x, weight, bias = _make_inputs(num_tokens, 5120, 384, seed=3)
     source = x.clone()
+    norm_weight = torch.randn(
+        5120,
+        dtype=torch.bfloat16,
+        device="cuda",
+        generator=torch.Generator(device="cuda").manual_seed(4),
+    )
     plans = {
         pdl: prepare_mega_gate(x, weight, 6, bias=bias, enable_pdl=pdl)
         for pdl in (False, True)
@@ -583,30 +599,46 @@ def test_pdl_launch_follows_the_token_producer(num_tokens):
     assert plans[True].route["enable_pdl"] and not plans[False].route["enable_pdl"]
     for step in range(4):
         rolled = source.roll(step * 7, dims=1)
-        x.copy_(rolled)  # the producer kernel right before the PDL launch
+        # The producer launches its dependents early (PDL), so the gate starts while
+        # the tokens are still being written.
+        rmsnorm(rolled, norm_weight, out=x, enable_pdl=True)
         indices, weights = (t.clone() for t in plans[True].run())
-        x.copy_(rolled)
+        rmsnorm(rolled, norm_weight, out=x, enable_pdl=False)
         expected = plans[False].run()
         torch.cuda.synchronize()
         assert torch.equal(indices, expected[0])
         assert torch.equal(weights, expected[1])
 
 
-def test_deterministic_is_batch_invariant():
+@pytest.mark.parametrize("shape", [PRODUCTION, V4_FLASH], ids=["E384", "E256"])
+def test_deterministic_is_batch_invariant(shape):
+    """Every token routes bitwise identically whatever the call's token count."""
     _skip_unless_sm120()
-    x, weight, bias = _make_inputs(4096, 5120, 384, seed=1)
-    reference = None
-    for num_tokens in (1, 16, 17, 300, 1024, 4096):
+    x, weight, bias = _make_inputs(4096, shape["hidden"], shape["num_experts"], seed=1)
+    full = prepare_mega_gate(x, weight, 6, bias=bias, deterministic=True)
+    reference = [t.clone() for t in full.run()]
+    for num_tokens in (1, 16, 17, 300, 512, 1024):
         plan = prepare_mega_gate(
             x[:num_tokens], weight, 6, bias=bias, deterministic=True
         )
         assert plan.route["num_split_k"] == 1
         indices, weights = plan.run()
         torch.cuda.synchronize()
-        if reference is None:
-            reference = indices[:1].clone(), weights[:1].clone()
-        assert torch.equal(indices[:1], reference[0])
-        assert torch.equal(weights[:1], reference[1])
+        assert torch.equal(indices, reference[0][:num_tokens])
+        assert torch.equal(weights, reference[1][:num_tokens])
+
+
+@pytest.mark.parametrize("num_tokens", [1, 17, 300, 512, 1024])
+@pytest.mark.parametrize(
+    "shape,num_shared", [(PRODUCTION, 1), (V4_FLASH, 0)], ids=["E384", "E256"]
+)
+def test_deterministic_matches_reference(num_tokens, shape, num_shared):
+    """Deterministic schedules (no split-K): 64-token blocks of 193-512 tokens rank the
+    last block with the MMA warps too."""
+    _skip_unless_sm120()
+    _run_case(
+        num_tokens, **shape, num_shared=num_shared, with_mask=True, deterministic=True
+    )
 
 
 def test_graph_replay_with_changed_inputs_on_a_side_stream():

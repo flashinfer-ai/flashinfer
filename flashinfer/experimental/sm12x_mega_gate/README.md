@@ -10,9 +10,14 @@ returns a plan; `plan.run()` launches on the current PyTorch stream and returns
 `(expert_indices, weights)`: int64 `[M,topk+shared]` physical expert ids and
 FP32 weights scaled by `routed_scaling_factor`.
 
-Status: SM120 (`sm_120a`), validated and tuned on an RTX PRO 5000 Blackwell
-(110 SMs). SM121 (GB10) runs the same instructions but is not enabled until it
-is validated: add `(12, 1): "sm_121a"` to `_ARCHES` in `mega_gate.py`.
+Status: experimental. `prepare_mega_gate` is an `@flashinfer_experimental_api`:
+calling it is the opt-in (it warns once with `ExperimentalWarning`; no
+environment variable is involved), and on compute capability 12.x it always
+selects this backend. SM120 (`sm_120a`) is validated and tuned on an RTX PRO
+5000 Blackwell (110 SMs). SM121 (GB10) runs the same instructions but is not
+enabled until it is validated (its calls raise): add `(12, 1): "sm_121a"` to
+`_ARCHES` in `mega_gate.py`. The kernel is a port of DeepGEMM's
+`sm100_bf16_mega_gate`; `DEEPGEMM_NOTICE.txt` carries DeepGEMM's MIT notice.
 
 ## Design
 
@@ -24,7 +29,7 @@ producer warp through a multi-stage mbarrier pipeline and `ldmatrix`
 - **Swap-AB.** The weight is the MMA A operand (128 experts per CTA) and the
   tokens the B operand, so decode-sized token counts pad only up to the 8-wide
   MMA N granularity.
-- **Decomposition.** A token block of 16/32/48/64 tokens is computed by
+- **Decomposition.** A token block of 16, 32, 48, 64, 96 or 128 tokens is computed by
   `L = ceil(E/128) * split_k` logical CTAs; each writes the FP32 partial logits
   of its experts and K slice to `scratch[token blocks, split_k, block tokens, aligned E]`.
   The grid is persistent: `num_sms // L` worker groups of L CTAs (at most one
@@ -39,9 +44,11 @@ producer warp through a multi-stage mbarrier pipeline and `ldmatrix`
   (token, 128-expert wave) item goes to one gate warp (its split-K loads and
   transcendentals), is posted sorted to shared memory, and a selector warp per
   token merges the waves; this takes 4 gate warps for one token and 8 for more,
-  and the exchange costs a pipeline stage at 48- and 64-token blocks. With wide
-  blocks a CTA ranks up to 43 tokens of a block on 4 gate warps: the MMA warps
-  join them on the CTA's last block, whose gate work nothing else overlaps.
+  and the exchange costs a pipeline stage at 48- and 64-token blocks. When a CTA
+  ranks more tokens of a block than it has gate warps (with wide blocks up to 43
+  tokens on 4 gate warps; also smaller blocks over few CTAs, e.g. deterministic
+  calls of 65-512 tokens), the MMA warps join them on the CTA's last block, whose
+  gate work nothing else overlaps.
 - **Score barrier.** One 128 B line per token block in `score_barriers`: an
   arrival counter (`red.release.gpu` by the MMA warps, `ld.acquire.gpu` polls by
   one gate lane) and a waiter counter. Every CTA that waited counts itself after
@@ -69,24 +76,31 @@ producer warp through a multi-stage mbarrier pipeline and `ldmatrix`
   (each weight tile then serves more tokens: 5-11% faster from 768 tokens). The
   split-K, and above 512 tokens the block, minimize a cost model of one CTA's
   critical path, with separate coefficients for wide blocks, fitted on measured
-  schedules of the 110-SM board (0.5% slower than the measured best on average
-  over 21 token counts, 3.9% at worst at 320 tokens, from the block rule).
-  The model is fitted with 384 experts; with 256 (DeepSeek-V4-Flash, K=4096) it
-  misranks the near-tied one-wave schedules by up to 22%, so that shape takes a
-  measured split per token range up to 3072 tokens and the smallest block that
-  holds the tokens in one wave (`MEASURED_SPLITS`: 0.1% from the best on average,
-  3.2% at worst). Timings for these fits are medians over buffer placements: the
-  same schedule moves by up to 10% with the DRAM placement of its buffers.
+  schedules of the 110-SM board with 384 experts (against every schedule
+  measured since at 53 token counts from 1 to 16384: 0.4% slower than the best
+  on average, 4.7% at worst at 280 tokens, from the block rule). With 256 experts
+  (DeepSeek-V4-Flash, K=4096) the model misranks the near-tied one-wave
+  schedules by up to 28%, so that shape takes a measured split per token range
+  up to 3072 tokens and the smallest block that holds the tokens in one wave
+  (`MEASURED_SPLITS`: 0.1% from the best on average, 1.7% at worst). These
+  timings are medians over buffer placements: the same schedule moves by up to
+  10% with the DRAM placement of its buffers.
 
 Compared to the SM100 programs this backend also accepts other hidden sizes
 (multiples of 64), 1..1024 experts, top-k up to 32 slots, no bias, token masks
-and image bias. Fixed routing (`fix_routing_mask`, e.g. hash-routed layers) takes
-the flagged tokens' logical experts from `unmapped_topk_idx` instead of the top-k
-and weights them from their unbiased scores, as DeepGEMM does. Random routing
-(`force_random`) is not implemented yet and raises `NotImplementedError`.
-`num_sms` caps the SMs the kernel uses, leaving the rest to kernels that run at
-the same time (communication overlapped with the gate): decode-size calls use
-16-90 CTAs and barely notice a cap down to 64 SMs.
+and image bias. Fixed routing (`fix_routing_mask`, e.g. hash-routed layers)
+takes the flagged tokens' logical experts from `unmapped_topk_idx` instead of
+the top-k and weights them from their unbiased scores, as DeepGEMM does. Random
+routing (`force_random`) is not implemented yet and raises
+`NotImplementedError`. `num_sms` caps the SMs the kernel uses, leaving the rest
+to kernels that run at the same time (communication overlapped with the gate):
+uncapped, calls of up to 256 tokens use 30-96 CTAs (5120 x 384) or 32-96 (4096
+x 256); capped at 64 SMs they take up to 1.1 us longer (4096 x 256, 1-240
+tokens) or 1.9 us (5120 x 384 at 140 tokens; 1 token unchanged). A worker
+group's CTAs wait for each other, so they must be resident together: launching
+under an SM budget smaller than one group (30 or 32 CTAs at decode sizes, e.g.
+a green context or an MPS partition), or next to a kernel that holds SMs while
+waiting on the gate, hangs.
 
 Plans launch with programmatic dependent launch by default (`enable_pdl`): the
 tokens, maps and workspace are read only after `griddepcontrol.wait`, so the

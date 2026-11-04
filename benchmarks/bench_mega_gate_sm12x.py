@@ -14,11 +14,15 @@ reported as well. The unfused time is the sum of its two kernels' times, as they
 run back to back in a CUDA graph: timing the pair as one call would also count
 the CPU launch gap before the Triton kernel. Timing uses a cold L2 between
 iterations (every layer has its own gate weight), with CUPTI under ``--cupti``
-(cupti-python >= 13) and CUDA events otherwise.
+(cupti-python >= 13) and CUDA events otherwise. ``--fixed-routing`` flags every
+token in ``fix_routing_mask`` (hash-routed layers): the fused call then takes
+the given logical experts of each token instead of ranking them (the baseline
+still ranks).
 
 Usage::
 
     python benchmarks/bench_mega_gate_sm12x.py [--cupti] [--tokens 1 16 128 ...]
+        [--hidden 4096 --num-experts 256] [--fixed-routing] [--num-sms 64]
 """
 
 import argparse
@@ -104,6 +108,11 @@ def main():
     )
     parser.add_argument("--no-baseline", action="store_true")
     parser.add_argument(
+        "--fixed-routing",
+        action="store_true",
+        help="flag every token in fix_routing_mask, with random given experts",
+    )
+    parser.add_argument(
         "--num-sms",
         type=int,
         default=None,
@@ -115,7 +124,8 @@ def main():
     print(
         f"{props.name} (sm_{props.major}{props.minor}, {props.multi_processor_count} SMs) "
         f"K={args.hidden} E={args.num_experts} top-k={args.num_topk} "
-        f"deterministic={args.deterministic} timer={'CUPTI' if args.cupti else 'CUDA events'}"
+        f"deterministic={args.deterministic} fixed_routing={args.fixed_routing} "
+        f"timer={'CUPTI' if args.cupti else 'CUDA events'}"
     )
     route_topk = None if args.no_baseline else load_triton_route_topk()
     header = (
@@ -130,6 +140,15 @@ def main():
         logical = torch.empty(
             (num_tokens, args.num_topk), dtype=torch.int64, device="cuda"
         )
+        fixed = {}
+        if args.fixed_routing:
+            gen = torch.Generator(device="cuda").manual_seed(1)
+            logical = torch.randint(
+                0, args.num_experts, logical.shape, device="cuda", generator=gen
+            )
+            fixed["fix_routing_mask"] = torch.ones(
+                num_tokens, dtype=torch.bool, device="cuda"
+            )
         plan = prepare_mega_gate(
             x,
             weight,
@@ -141,6 +160,7 @@ def main():
             routed_scaling_factor=args.scale,
             deterministic=args.deterministic,
             enable_pdl=args.pdl,
+            **fixed,
             **({} if args.num_sms is None else {"num_sms": args.num_sms}),
         )
         fused = median_us(plan.run, args.cupti)

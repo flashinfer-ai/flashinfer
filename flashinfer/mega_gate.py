@@ -42,7 +42,10 @@ def prepare_mega_gate(
     MegaGatePlan); SM120 runs a CuTe DSL backend that also takes other K/E/top-k
     and no bias (see MegaGateSm12xPlan). Both document their optional metadata
     and reusable workspace layouts. ``num_sms`` (SM12x only) caps the SMs the
-    kernel uses, for kernels that run at the same time.
+    kernel uses, for kernels that run at the same time. Both backends make the
+    CTAs of one call wait for each other: launch them where they can all be
+    resident (not under a smaller SM partition, nor next to a kernel that holds
+    SMs while it waits for the gate's outputs).
     """
     import torch
 

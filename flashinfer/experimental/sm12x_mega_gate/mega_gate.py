@@ -203,9 +203,9 @@ class MegaGateSm12xPlan:
     over the top-k and scaled by routed_scaling_factor, weight 1 on shared slots,
     index -1 and weight 0 for masked tokens. Deterministic mode never splits K.
     Tokens flagged in fix_routing_mask (bool[M]) skip the top-k and take the logical
-    experts already in their unmapped_topk_idx row (required, read then written
-    back unchanged), weighted from their unbiased scores; force_random is not
-    supported.
+    experts already in their unmapped_topk_idx row (required; read before the row is
+    written back, with ids clamped into [0, E) and masked tokens set to -1), weighted
+    from their unbiased scores; force_random is not supported.
 
     Optional scratch (FP32 split-K partial logits) and score_barriers
     (uint64[token blocks,16] arrival counters, zeroed once before first use; the
@@ -276,6 +276,8 @@ class MegaGateSm12xPlan:
         E, wk = weight.shape
         if wk != K or not x.is_contiguous() or not weight.is_contiguous():
             raise ValueError("x and weight must be contiguous and share K")
+        if weight.device != x.device:
+            raise ValueError("x and weight must be on the same device")
         if K <= 0 or K % BLOCK_K:
             raise ValueError(
                 f"the hidden size must be a positive multiple of {BLOCK_K}"
@@ -375,10 +377,12 @@ class MegaGateSm12xPlan:
             unmapped_topk_idx.dtype != torch.int64
             or tuple(unmapped_topk_idx.shape) != (M, num_topk)
             or unmapped_topk_idx.stride(1) != 1
+            or (M > 1 and unmapped_topk_idx.stride(0) < num_topk)
             or unmapped_topk_idx.device != device
         ):
             raise ValueError(
-                "unmapped_topk_idx must be int64[M,topk] with unit column stride"
+                "unmapped_topk_idx must be int64[M,topk] with unit column stride "
+                "and rows that do not overlap"
             )
 
         config = (
@@ -406,6 +410,7 @@ class MegaGateSm12xPlan:
         if scratch is None:
             scratch = torch.empty(scratch_shape, dtype=torch.float32, device=device)
         check(scratch, "scratch", torch.float32, scratch_shape)
+        check_vector_aligned(scratch, "scratch")
         barrier_shape = (config.num_token_blocks(M), SCORE_BARRIER_WORDS)
         if score_barriers is None:
             score_barriers = torch.zeros(
