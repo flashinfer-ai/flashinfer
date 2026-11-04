@@ -169,9 +169,9 @@ def test_expand_csf_scales_too_wide():
     with pytest.raises(ValueError, match="supports up to") as e:
         expand_csf_scales(csf, out)
     check_encode(np.zeros((1, 32, 32), np.uint8))  # no CUDA error left behind
-    # The widest matrix the device accepts expands.
+    # A full 128-row tile at the widest width the device accepts expands.
     cols = int(str(e.value).split("up to ")[1].split()[0])
-    scales = random_scales(np.random.default_rng(cols), (1, 16, cols))
+    scales = random_scales(np.random.default_rng(cols), (1, 128, cols))
     out = torch.empty_like(scales)
     expand_csf_scales(encode_csf_scales(scales), out)
     assert torch.equal(out, scales)
