@@ -24,7 +24,8 @@ what stays exact is structural (zero gradients, collective counts, byte counts, 
   with zero mismatches; the accuracy rows (regimes A1-A4) by the per-(row, CP, tensor) budgets of the deterministic
   package's ``cake_gdn_det_train_kcp_g1_budgets.json`` (rel-RMS <= budget and max-abs <= budget + one storage ulp of
   |ref| at the worst element).  No budget is derived from this package's output.
-* every arm (repeat, saved / replay, light / full, autograd / explicit, checkpoint / direct with its kept-tape and
+* every arm (repeat, saved / replay, light / full, the full form's split twin (test knob ``fused_o_tape=0``; each full
+  forward's launch log names the walk it ran), autograd / explicit, checkpoint / direct with its kept-tape and
   recompute-handle forms, ``save_transfer``, ring / a2a, strided / contiguous, CUDA-graph replay) within the FP64
   budgets on its own and, against its partner arm, within the same budget constants; ``.backward()`` twice: half the
   accumulated gradient against the FP64 gradient; ``save_mode="full"`` with ``save_transfer=False`` (a2a and, where
@@ -1467,6 +1468,7 @@ def _kept_record(T_r: int) -> dict:
         "kcp_fwdh_offset",
         "kcp_fwdh_tape",
         "kcp_fwdh_out",
+        "kcp_fwdh_out_tape",
         "fwd_o",
     }
     first_local = next(
@@ -1597,7 +1599,38 @@ def _run_rank(
     for i in range(1, N_REPEAT):
         arm(f"run{i}", saved_pass(), res, "run0")
     arm("replay", saved_pass(boundary_mode="replay"), res, "run0")
-    arm("full", saved_pass(save_mode="full"), res, "run0")
+    res_full = saved_pass(save_mode="full")
+    full_fwd = dict(kcp.LAST_CALL["fwd"])
+    arm("full", res_full, res, "run0")
+    # the full forward writes its output and the saved h / v_new tapes in one walk per launch list
+    # (kcp_fwdh_out_tape) where the registry ships it for this architecture; test knob fused_o_tape = 0 is the
+    # split form (the tape walk, then #5): within the budgets of the shipped form, bitwise recorded, each forward's
+    # launch log and fwd_o evidence naming the form it ran (a rank without tokens runs neither walk)
+    res_full_split = saved_pass(save_mode="full", test_knobs={"fused_o_tape": 0})
+    split_fwd = dict(kcp.LAST_CALL["fwd"])
+    arm("full_split", res_full_split, res_full, "full")
+    full_arch = (
+        None if backend == "fake" else _mod("cake_backend").device_arch(device.index)
+    )
+    fused_tape = int(q.shape[0]) > 0 and kcp.fused_o_tape_shipped(full_arch)
+    full_seq, split_seq = list(full_fwd["sequence"]), list(split_fwd["sequence"])
+    info["full_fused_tape"] = {
+        "expected": bool(fused_tape),
+        "fwd_o": full_fwd.get("fwd_o"),
+        "split_fwd_o": split_fwd.get("fwd_o"),
+        "bitwise_vs_split": _bitwise(res_full, res_full_split),
+    }
+    want_fwd_o = "fused_tape" if fused_tape else "launched"
+    full_ok = (
+        full_fwd.get("fwd_o") == want_fwd_o
+        and ("kcp_fwdh_out_tape" in full_seq) == fused_tape
+        and ("fwd_o" in full_seq) == (not fused_tape)
+    )
+    split_ok = "kcp_fwdh_out_tape" not in split_seq
+    flags["full_forward_runs_the_tape_and_output_walk"] = bool(
+        (int(q.shape[0]) == 0 or full_ok) and split_ok
+    )
+    del res_full, res_full_split
     res_auto = autograd_pass(False)
     arm("autograd", res_auto, res, "run0")
     res_ckpt = autograd_pass(True)

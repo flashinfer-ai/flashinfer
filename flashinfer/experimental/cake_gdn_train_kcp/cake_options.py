@@ -79,7 +79,8 @@ Public fields (defaults are the shipped behaviour)::
                                             saved set gains the FP32 r of q and k ([2, T_r, H_qk]) and the gradient is
                                             the exact derivative at the stored point; the backward needs the same value
     test_knobs      None | dict             private levers (schedule, fused_walks, cols_rule, debug_sequence,
-                                            record_states, record_qk, p_rule, fwdh_vh, dhu_vh, walk_pair, fused_o) and the names of the
+                                            record_states, record_qk, p_rule, fwdh_vh, dhu_vh, walk_pair, fused_o,
+                                            fused_o_tape) and the names of the
                                             test-only values above;
                                             keyword argument only, never an environment variable
 """
@@ -163,6 +164,10 @@ TEST_KNOBS: dict[str, tuple[Any, ...] | None] = {
     # 1 (shipped) = a forward whose h / v_new tapes have no reader runs the output walk kcp_fwdh_out (#2 with #5 folded
     # in, no tape written) wherever the registry ships its records (cake_kcp._fuse_o); 0 = the tape walk, then #5
     "fused_o": (0, 1),
+    # 1 (shipped) = a save_mode="full" forward that keeps its saved set and launches #5 runs the tape-and-output walk
+    # kcp_fwdh_out_tape (the output walk that also writes the saved h / v_new tapes) wherever the registry ships its
+    # records (cake_kcp._fuse_o_tape); 0 = the tape walk, then #5.  Light forwards (fused_o) are unaffected
+    "fused_o_tape": (0, 1),
 }
 TEST_KNOB_DEFAULTS: dict[str, Any] = {
     "schedule": SCHEDULE_DEFAULT,
@@ -177,6 +182,7 @@ TEST_KNOB_DEFAULTS: dict[str, Any] = {
     "record_qk": False,
     "walk_pair": None,
     "fused_o": 1,
+    "fused_o_tape": 1,
 }
 
 
