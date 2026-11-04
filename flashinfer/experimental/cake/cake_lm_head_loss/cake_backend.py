@@ -2927,30 +2927,95 @@ def set_zero_weight_min_rows(rows: int) -> int:
 # The smallest log-probability backward (rows of its chunk loop) that runs the zero-gradient row skip
 # (:func:`set_zero_dlogp_min_rows`, no environment variable; ``None`` = never).  The skip orders the rows on the device
 # (one partition launch per call, no host synchronization) at the start of the backward, where the GPU waits for the
-# host; a backward of one default chunk is too short to repay that host time, so the default floor is one row above
-# one default chunk and a smaller call keeps the shipped backward.
+# host.  The generic floor is one row above one default chunk: a smaller call keeps the shipped backward on an
+# architecture without a floor of its own (:data:`ZERO_DLOGP_MIN_ROWS_BY_ARCH`).
 ZERO_DLOGP_MIN_ROWS_DEFAULT: Optional[int] = DEFAULT_CHUNK_SIZE + 1
-_ZERO_DLOGP_MIN_ROWS: dict[str, Optional[int]] = {"rows": ZERO_DLOGP_MIN_ROWS_DEFAULT}
+# Per-architecture default floors (valid rows); an architecture not listed uses :data:`ZERO_DLOGP_MIN_ROWS_DEFAULT`.
+# Timed on FlashInfer PR #8687 at its commit 6ab51864 (PyTorch 2.14.1+cu130, nvcc 13.4), plain and temperature
+# log-probability, cooled and after an idle gap, against the same head with the skip off: ratio = time without the
+# skip / time with it, with its CI95.
+# B200 (sm_100a), floor 1946 valid rows (T = 2048 with 5 % ignored rows): with no zero-gradient row, of the backward,
+# step and checkpointed step of 1946 and 3891 valid rows none is slower under the timing rule (CI95 below
+# 1 - max(1 %, A/A)); the lowest point ratio is 0.984 [0.974, 0.996] (temperature backward, 1946 valid rows, cooled).
+# GB300 (sm_103a), floor 3891 valid rows (T = 4096): at 3891 valid rows none is slower under the timing rule; the
+# lowest point ratio is 0.989 [0.985, 0.994] (temperature backward, cooled).  At 1946 valid rows the GB300
+# temperature backward with no zero-gradient row has point ratio 0.981 [0.978, 0.990] (the CI95 crosses the band
+# edge) and 0.984 on each of two clusters alone (each CI95 below the band, fewer steps than the rule needs), so the
+# GB300 floor is 3891.  With 16.6 % zero-gradient rows the step at the shipped floors is 4.6 % to 10.6 % faster on
+# B200 (1946 and 3891 valid rows) and 8.8 % to 9.5 % faster on GB300 (3891 valid rows), each faster under the timing
+# rule.  sm_107a keeps the generic floor until measured.
+ZERO_DLOGP_MIN_ROWS_BY_ARCH: dict[str, int] = {"sm_100a": 1946, "sm_103a": 3891}
 
 
-def zero_dlogp_min_rows() -> Optional[int]:
+class _ArchDefaultFloor:
+    """The type of :data:`ZERO_DLOGP_MIN_ROWS_ARCH_DEFAULT`, one object per process: a copy, a deep copy and a pickle
+    round trip give that object back, and :func:`set_zero_dlogp_min_rows` stores it for any value of this type."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "ZERO_DLOGP_MIN_ROWS_ARCH_DEFAULT"
+
+    def __reduce__(self) -> str:
+        return "ZERO_DLOGP_MIN_ROWS_ARCH_DEFAULT"
+
+    def __copy__(self) -> "_ArchDefaultFloor":
+        return ZERO_DLOGP_MIN_ROWS_ARCH_DEFAULT
+
+    def __deepcopy__(self, memo: dict) -> "_ArchDefaultFloor":
+        return ZERO_DLOGP_MIN_ROWS_ARCH_DEFAULT
+
+
+# The floor setting "no override" (:func:`set_zero_dlogp_min_rows`): each device uses its architecture's default floor.
+# ``set_zero_dlogp_min_rows`` returns it when no override was set, and passing it back restores that state.
+ZERO_DLOGP_MIN_ROWS_ARCH_DEFAULT = _ArchDefaultFloor()
+_ZERO_DLOGP_MIN_ROWS: dict[str, Any] = {"rows": ZERO_DLOGP_MIN_ROWS_ARCH_DEFAULT}
+# Per CUDA device index: its architecture tag (:func:`arch_for`; ``""`` when unsupported), resolved once per device.
+_ZERO_DLOGP_ARCH: dict[int, str] = {}
+
+
+def zero_dlogp_min_rows(device: Optional[int] = None) -> Optional[int]:
     """The smallest log-probability backward (rows of its chunk loop) that runs the zero-gradient row skip, ``None`` =
-    never (:func:`set_zero_dlogp_min_rows`; default :data:`ZERO_DLOGP_MIN_ROWS_DEFAULT`)."""
-    return _ZERO_DLOGP_MIN_ROWS["rows"]
+    never: the override of :func:`set_zero_dlogp_min_rows` when one is set, else the default floor -- of CUDA device
+    index ``device`` (its architecture's, :data:`ZERO_DLOGP_MIN_ROWS_BY_ARCH`), or the generic
+    :data:`ZERO_DLOGP_MIN_ROWS_DEFAULT` without a device."""
+    rows = _ZERO_DLOGP_MIN_ROWS["rows"]
+    if rows is not ZERO_DLOGP_MIN_ROWS_ARCH_DEFAULT:
+        return rows
+    if device is None:
+        return ZERO_DLOGP_MIN_ROWS_DEFAULT
+    arch = _ZERO_DLOGP_ARCH.get(device)
+    if arch is None:
+        arch = _ZERO_DLOGP_ARCH.setdefault(
+            device, arch_for(torch.device("cuda", device)) or ""
+        )
+    return ZERO_DLOGP_MIN_ROWS_BY_ARCH.get(arch, ZERO_DLOGP_MIN_ROWS_DEFAULT)
 
 
-def set_zero_dlogp_min_rows(rows: Optional[int]) -> Optional[int]:
-    """Set the smallest log-probability backward (rows of its chunk loop) that runs the zero-gradient row skip for the
-    following calls of this process (``0``: every eligible call; ``None``: never) and return the previous value.  Read
-    once per call; the binding key holds whether a call runs it."""
-    if rows is not None and (
-        isinstance(rows, bool) or int(rows) != rows or int(rows) < 0
+def set_zero_dlogp_min_rows(
+    rows: Union[Optional[int], _ArchDefaultFloor],
+) -> Union[Optional[int], _ArchDefaultFloor]:
+    """Set the smallest log-probability backward (rows of its chunk loop) that runs the zero-gradient row skip on every
+    architecture for the following calls of this process (``0``: every eligible call; ``None``: never;
+    :data:`ZERO_DLOGP_MIN_ROWS_ARCH_DEFAULT`: no override, each architecture's default floor; any value of its type, a
+    copy or an unpickled one included, stores that object) and return the previous setting, which passed back restores
+    it exactly.  Read once per call; the binding key holds whether a call runs it."""
+    if (
+        rows is not None
+        and not isinstance(rows, _ArchDefaultFloor)
+        and (isinstance(rows, bool) or int(rows) != rows or int(rows) < 0)
     ):
         raise ValueError(
-            f"zero-dlogp min rows must be None or a non-negative integer, got {rows!r}"
+            "zero-dlogp min rows must be None, a non-negative integer or ZERO_DLOGP_MIN_ROWS_ARCH_DEFAULT, "
+            f"got {rows!r}"
         )
     previous = _ZERO_DLOGP_MIN_ROWS["rows"]
-    _ZERO_DLOGP_MIN_ROWS["rows"] = None if rows is None else int(rows)
+    if rows is None:
+        _ZERO_DLOGP_MIN_ROWS["rows"] = None
+    elif isinstance(rows, _ArchDefaultFloor):
+        _ZERO_DLOGP_MIN_ROWS["rows"] = ZERO_DLOGP_MIN_ROWS_ARCH_DEFAULT
+    else:
+        _ZERO_DLOGP_MIN_ROWS["rows"] = int(rows)
     return previous
 
 
@@ -7620,6 +7685,49 @@ def check_kept_logits(plan: Plan, logits) -> tuple:
 # cache that holds the bindings takes no lock and skips a step whose entry another thread removed (:class:`BindingCache`).
 _OWNED_VALUES = ("workspace", "tma_descriptor_workspace")
 
+# The per-call scratch slots of a remembered binding (:meth:`_Binding._scratch`): the row vectors ``d`` / ``term`` and
+# the loss cells ``loss_acc`` / ``loss``.  A binding allocates per call only the slots its launch sequence binds
+# (:func:`_scratch_slots`): the log-probability forward binds ``d`` and ``term`` (``row_finalize``), its backward none
+# of them, the loss entry's forward all four.
+_SCRATCH_SLOTS = ("d", "term", "loss_acc", "loss")
+
+
+class _ReadRecorder(dict):
+    """A copy of a call's host values that records the names read from it (``t[name]`` / ``t.get(name)``)."""
+
+    def __init__(self, values: dict[str, Any]):
+        super().__init__(values)
+        self.read: set[str] = set()
+
+    def __getitem__(self, name):
+        self.read.add(name)
+        return super().__getitem__(name)
+
+    def get(self, name, default=None):
+        self.read.add(name)
+        return super().get(name, default)
+
+
+def _scratch_slots(
+    slot_values: Callable[..., dict[str, Any]],
+    keys: tuple,
+    t: dict[str, Any],
+    plan: Plan,
+    returned: tuple = (),
+) -> tuple[str, ...]:
+    """The scratch slots (:data:`_SCRATCH_SLOTS`, in that order) the launch sequence ``keys`` binds -- every name its
+    per-call host values read (``slot_values``: :func:`_slot_values` or its temperature form, which the binding's
+    launches and host steps take per call) -- plus ``returned`` (the slots the call returns).  Replayed once per binding
+    on the runner's own tensors (:meth:`_Binding.from_runner`); a replay that fails keeps every slot."""
+    recorder = _ReadRecorder(t)
+    try:
+        for key in keys:
+            slot_values(key[0], recorder, plan, key[1])
+    except Exception:  # fail safe: the shipped allocation of every slot
+        return _SCRATCH_SLOTS
+    read = recorder.read | set(returned)
+    return tuple(name for name in _SCRATCH_SLOTS if name in read)
+
 
 @dataclass
 class _Binding:
@@ -7649,6 +7757,10 @@ class _Binding:
     owned_bytes: int = 0
     layout: dict = field(default_factory=dict, repr=False)
     memory: dict = field(default_factory=dict, repr=False)
+    # the scratch slots (:data:`_SCRATCH_SLOTS`) a forward / backward call allocates: the ones its sequence binds or
+    # returns (:func:`_scratch_slots`)
+    forward_scratch: tuple = _SCRATCH_SLOTS
+    backward_scratch: tuple = _SCRATCH_SLOTS
 
     @classmethod
     def from_runner(
@@ -7700,6 +7812,7 @@ class _Binding:
             (i for i, key in enumerate(early) if _reads_labels(key[0])), len(early)
         )
         forward_late = tuple(key for key in forward_order if key not in early)
+        forward_run, backward_run = _unfilled(forward_order), _unfilled(backward_order)
         return cls(
             plan=plan,
             device=t["X"].device,
@@ -7714,14 +7827,23 @@ class _Binding:
             forward_early=early[:split],
             forward_early_labels=early[split:],
             forward_late=forward_late,
-            forward_run=_unfilled(forward_order),
-            backward_run=_unfilled(backward_order),
+            forward_run=forward_run,
+            backward_run=backward_run,
             forward_late_run=_unfilled(forward_late),
             fill_rows=plan.dx_fill_rows,
             owned=owned,
             owned_bytes=sum(v.numel() * v.element_size() for v in owned.values()),
             layout=runner.layout,
             memory=memory,
+            # the loss entry's forward returns the finished-loss cell
+            forward_scratch=_scratch_slots(
+                _slot_values,
+                forward_run,
+                t,
+                plan,
+                ("loss",) if plan.problem.entry == "loss" else (),
+            ),
+            backward_scratch=_scratch_slots(_slot_values, backward_run, t, plan),
         )
 
     def holds_no_tensor(self) -> bool:
@@ -7737,12 +7859,15 @@ class _Binding:
         hidden: Optional[_HiddenCount] = None,
         *,
         chunk_buffers: bool = True,
+        backward: bool = False,
     ) -> None:
         """Per-call temporaries from the caching allocator into ``t`` (the runner's regions, minus the owned ones);
         with ``hidden`` the chunk buffers are the prologue's (chunk 0's logits / statistics / gathered rows already in
         them, ``min(chunk, T)`` rows) -- the entry points check that a hidden-count plan gets its prologue.
         ``chunk_buffers=False``: the chunk buffers are already bound (:meth:`_chunk_buffers`, the early launch of
-        :meth:`forward`) and the rest is allocated."""
+        :meth:`forward`) and the rest is allocated.  Of the scratch slots (:data:`_SCRATCH_SLOTS`) only the ones the
+        call's sequence binds or returns: ``backward`` selects the backward's (:attr:`backward_scratch`), else the
+        forward's (:attr:`forward_scratch`)."""
         p = self.plan.problem
         rows = self.layout["logits"][1] // (p.vocab * 2)
         if chunk_buffers and hidden is not None:
@@ -7756,10 +7881,15 @@ class _Binding:
                 dtype=torch.float32,
                 device=self.device,
             )
-        t["d"] = torch.empty((rows,), dtype=torch.float32, device=self.device)
-        t["term"] = torch.empty((rows,), dtype=torch.float32, device=self.device)
-        t["loss_acc"] = torch.empty((1,), dtype=torch.float64, device=self.device)
-        t["loss"] = torch.empty((1,), dtype=torch.float32, device=self.device)
+        scratch = self.backward_scratch if backward else self.forward_scratch
+        if "d" in scratch:
+            t["d"] = torch.empty((rows,), dtype=torch.float32, device=self.device)
+        if "term" in scratch:
+            t["term"] = torch.empty((rows,), dtype=torch.float32, device=self.device)
+        if "loss_acc" in scratch:
+            t["loss_acc"] = torch.empty((1,), dtype=torch.float64, device=self.device)
+        if "loss" in scratch:
+            t["loss"] = torch.empty((1,), dtype=torch.float32, device=self.device)
         t.update(
             _device_constants(self.device_index)
         )  # constant cells: no per-call fill launches
@@ -7969,7 +8099,7 @@ class _Binding:
             if fill_side and plan.need_dx
             else None
         )
-        self._scratch(t, hidden)
+        self._scratch(t, hidden, backward=True)
         if plan.need_dx:
             if join is None:
                 t["dx_acc"] = _filled_dx_acc(T, H, self.fill_rows, self.device)
@@ -8063,6 +8193,7 @@ class _TemperatureBinding(_Binding):
             len(early),
         )
         forward_late = tuple(key for key in forward_order if key not in early)
+        forward_run, backward_run = _unfilled(forward_order), _unfilled(backward_order)
         return (cls if tau else _Binding)(
             plan=plan,
             device=t["X"].device,
@@ -8077,14 +8208,22 @@ class _TemperatureBinding(_Binding):
             forward_early=early[:split],
             forward_early_labels=early[split:],
             forward_late=forward_late,
-            forward_run=_unfilled(forward_order),
-            backward_run=_unfilled(backward_order),
+            forward_run=forward_run,
+            backward_run=backward_run,
             forward_late_run=_unfilled(forward_late),
             fill_rows=plan.dx_fill_rows,
             owned=owned,
             owned_bytes=sum(v.numel() * v.element_size() for v in owned.values()),
             layout=runner.layout,
             memory=memory,
+            forward_scratch=_scratch_slots(
+                slot_values,
+                forward_run,
+                t,
+                plan,
+                ("loss",) if plan.problem.entry == "loss" else (),
+            ),
+            backward_scratch=_scratch_slots(slot_values, backward_run, t, plan),
         )
 
     # the rows of the call in progress, per thread (set and cleared around the inherited sequence)
@@ -8309,7 +8448,7 @@ class _KeptBinding(_Binding):
         )
         if plan.compact:
             t["x_c"] = torch.empty((rows, H), dtype=torch.bfloat16, device=self.device)
-        self._scratch(t, chunk_buffers=False)
+        self._scratch(t, chunk_buffers=False, backward=True)
         t["logits_keep"] = logits
         if plan.need_dx:
             if join is None:
@@ -8521,8 +8660,17 @@ class _TemperatureResultState:
     temperature_rows: Optional[torch.Tensor] = None
 
 
+class _ProblemResultState:
+    """The validated :class:`Problem` of a log-probability forward (``problem``, without the temperature form): its
+    autograd backward takes it back (:func:`backward_logprob`'s ``_problem``) instead of validating the same ``X``,
+    ``W`` and ``labels`` again.  A plain base class like :class:`_TemperatureResultState`: a typed class default
+    (``None``), not a dataclass field."""
+
+    problem: Optional[Problem] = None
+
+
 @dataclass
-class ForwardResult(_TemperatureResultState):
+class ForwardResult(_TemperatureResultState, _ProblemResultState):
     loss: Optional[torch.Tensor]  # FP32 [] (loss entry)
     logp: (
         torch.Tensor
@@ -9593,7 +9741,7 @@ def forward_logprob(
         tuning=tuning,
         lbl=lbl,
     )
-    return ForwardResult(
+    result = ForwardResult(
         loss=None,
         logp=scatter_rows(logp, row_index, T),
         lse=lse,
@@ -9602,6 +9750,8 @@ def forward_logprob(
         row_index=row_index,
         num_rows=T,
     )
+    result.problem = problem
+    return result
 
 
 def _forward_logprob_rows(
@@ -9677,6 +9827,22 @@ def _forward_logprob_rows(
     return logp, lse, runner.memory
 
 
+def _dlogp_rows(dlogp: torch.Tensor, T: int) -> torch.Tensor:
+    """The incoming ``dlogp`` as the FP32 contiguous ``[T]`` tensor a log-probability backward binds
+    (``dlogp.detach().reshape(T).to(torch.float32).contiguous()``): ``dlogp`` itself when it already is one and needs
+    no detach (the autograd backward's gradient of the FP32 ``[T]`` ``logp``), without those four host calls ahead of
+    the backward's first launch."""
+    if (
+        dlogp.dtype == torch.float32
+        and dlogp.dim() == 1
+        and dlogp.shape[0] == T
+        and not dlogp.requires_grad
+        and dlogp.is_contiguous()
+    ):
+        return dlogp
+    return dlogp.detach().reshape(T).to(torch.float32).contiguous()
+
+
 def _zero_dlogp_skip(
     device: torch.device,
     row_index: Optional[torch.Tensor],
@@ -9690,22 +9856,22 @@ def _zero_dlogp_skip(
     with the ``dz`` arm and, when it produces ``dX``, the fused dX finalize (which writes the skipped rows' exact zeros),
     on a record that registers the counted dz arm (:data:`LOGPROB_DZ_DCNT_STAGE`) and the partition kernel
     (:data:`ZERO_DLOGP_PARTITION_STAGE`).  An eligible call runs the skip when its plan has the counted forms
-    (:attr:`Plan.dcnt`), and the backward without it otherwise."""
-    floor = zero_dlogp_min_rows()
+    (:attr:`Plan.dcnt`), and the backward without it otherwise.  The floor is the device's
+    (:func:`zero_dlogp_min_rows` of its index: the override, else its architecture's default)."""
     if (
-        floor is None
-        or row_index is None
-        or int(row_index.numel()) < floor
+        row_index is None
         or backend != "cake"
         or not dz_arm
         or (need_dx and not fused_dx)
         or device.type != "cuda"
     ):
         return False
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    floor = zero_dlogp_min_rows(index)
+    if floor is None or int(row_index.numel()) < floor:
+        return False
     # the device's record and its stages, resolved once per device (:func:`_skip_record`)
-    return _skip_record(
-        device.index if device.index is not None else torch.cuda.current_device()
-    )[3]
+    return _skip_record(index)[3]
 
 
 def backward_logprob(
@@ -9728,6 +9894,7 @@ def backward_logprob(
     gemm_tuning: Optional[dict[str, dict[str, Any]]] = None,
     logprob_dz: Optional[bool] = None,
     row_index: Any = _RECOUNT,
+    _problem: Optional[Problem] = None,
 ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Backward of the log-probability entry: recompute each chunk's logits, ``dz = dlogp_t *
     (1[v = y_t] - softmax)`` (ignored rows zero), then ``dX`` (BF16) and ``dW`` (BF16) through
@@ -9754,16 +9921,24 @@ def backward_logprob(
     capturable).  The rows of a zero ``dlogp`` get exact-zero ``dX`` rows and add nothing to ``dW``; ``dX`` of every
     other row is the same; ``dW`` sums the same nonzero products over the live rows in the new row order (FP32).  The
     call's plan decides: a plan whose chunks take a form without a counted one (an explicitly pinned swapped dX tile or
-    weight-gradient TMA epilogue) runs the backward without the skip, rows in the forward's order."""
+    weight-gradient TMA epilogue) runs the backward without the skip, rows in the forward's order.
+
+    ``_problem`` (internal, the autograd Function's): the forward's validated :class:`Problem` of these same ``X``,
+    ``W`` and ``labels`` (:attr:`ForwardResult.problem`, passed only when no saved-tensor hooks could have unpacked
+    another ``X``), taken instead of validating them again."""
     if backend not in BACKENDS:
         raise ValueError(f"backend must be one of {BACKENDS}")
-    problem = validate_lm_head_inputs(
-        X,
-        W,
-        labels,
-        chunk_size=chunk_size,
-        deterministic=deterministic,
-        entry="logprob",
+    problem = (
+        _problem
+        if _problem is not None
+        else validate_lm_head_inputs(
+            X,
+            W,
+            labels,
+            chunk_size=chunk_size,
+            deterministic=deterministic,
+            entry="logprob",
+        )
     )
     if need_dx or need_dw:
         _alert_nondeterministic("backward_logprob")
@@ -9824,7 +9999,7 @@ def backward_logprob(
             else None,
         )
     _check_output(lse, "lse", (rows,), torch.float32)
-    dlogp = dlogp.detach().reshape(T).to(torch.float32).contiguous()
+    dlogp = _dlogp_rows(dlogp, T)
     cache = BINDING_CACHE
     key = None
     valid_count = None if row_index is None else rows
@@ -9964,6 +10139,8 @@ def forward_logprob_temperature(
         deterministic=deterministic,
         entry="logprob",
     )
+    # the validated problem without the temperature form (:attr:`ForwardResult.problem`)
+    checked = problem
     tau = _resolve_temperature(
         temperature, problem.num_rows, X.device, check=check_temperature
     )
@@ -10059,6 +10236,7 @@ def forward_logprob_temperature(
                 num_rows=T,
             )
             result.temperature_rows = tau_rows
+            result.problem = checked
             return result
     runner = prepare_lm_head_loss_temperature(
         X,
@@ -10105,6 +10283,7 @@ def forward_logprob_temperature(
         num_rows=T,
     )
     result.temperature_rows = tau_rows
+    result.problem = checked
     return result
 
 
@@ -10131,6 +10310,7 @@ def backward_logprob_temperature(
     temperature=None,
     check_temperature: bool = False,
     temperature_rows: Optional[torch.Tensor] = None,
+    _problem: Optional[Problem] = None,
 ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
     """:func:`backward_logprob` with a temperature (:func:`_backward_logprob` is the path without one).  Backward
     of the log-probability entry: recompute each chunk's logits, ``dz = dlogp_t *
@@ -10168,16 +10348,21 @@ def backward_logprob_temperature(
     the same as without the skip; ``dW`` sums the live rows in the new row order (FP32), so its bits may differ when a
     row is zero.  The skip needs the temperature itself: the call's ``temperature``, or with ``temperature_rows`` the
     forward's resolved temperature (the autograd Function passes both); ``temperature_rows`` alone runs the backward
-    without the skip."""
+    without the skip.  ``_problem`` (internal) as in :func:`backward_logprob`: the forward's validated problem without
+    the temperature form."""
     if backend not in BACKENDS:
         raise ValueError(f"backend must be one of {BACKENDS}")
-    problem = validate_lm_head_inputs(
-        X,
-        W,
-        labels,
-        chunk_size=chunk_size,
-        deterministic=deterministic,
-        entry="logprob",
+    problem = (
+        _problem
+        if _problem is not None
+        else validate_lm_head_inputs(
+            X,
+            W,
+            labels,
+            chunk_size=chunk_size,
+            deterministic=deterministic,
+            entry="logprob",
+        )
     )
     if need_dx or need_dw:
         _alert_nondeterministic("backward_logprob_temperature")
@@ -10218,6 +10403,7 @@ def backward_logprob_temperature(
             gemm_tuning=gemm_tuning,
             logprob_dz=logprob_dz,
             row_index=row_index,
+            _problem=problem,
         )
     problem = _with_temperature(problem)
     stream_mode = dw_stream_mode(dw_stream)
@@ -10616,7 +10802,7 @@ def backward_logprob_keep(
             else None,
         )
     _check_output(lse, "lse", (rows,), torch.float32)
-    dlogp = dlogp.detach().reshape(T).to(torch.float32).contiguous()
+    dlogp = _dlogp_rows(dlogp, T)
     fuse = bool(need_dw and _resolve_fuse(fuse_dw_cast))
     dx_cast = not (fused_dx and row_index is not None)
     cache = BINDING_CACHE
@@ -10780,6 +10966,14 @@ _TOP_SAVED_HOOKS = (
     if _TOP_SAVED_HOOKS_C is not None
     else (lambda ignore_is_tracing: None)
 )
+
+
+def _saved_problem(result: ForwardResult) -> Optional[Problem]:
+    """The forward's validated problem for its autograd backward (:attr:`ForwardResult.problem`), or ``None`` when
+    saved-tensor hooks are active (``torch.utils.checkpoint``, ``save_on_cpu``, offloading): those may unpack an ``X``
+    of another stride or alignment, so the backward validates what it gets.  Without hooks the backward gets back the
+    tensors the forward validated."""
+    return result.problem if _TOP_SAVED_HOOKS(False) is None else None
 
 
 def _nested_code(cls, name: str) -> Optional[types.CodeType]:
@@ -11376,6 +11570,7 @@ class ChunkedLmHeadLogprobFunction(torch.autograd.Function):
         ctx.set_materialize_grads(False)
         # the valid-row index rides along: the backward plans its chunks without counting the rows again
         ctx.save_for_backward(X, W, labels, result.lse, result.row_index)
+        ctx.problem = _saved_problem(result)
         ctx.chunk_size, ctx.deterministic, ctx.backend, ctx.compact = (
             chunk_size,
             deterministic,
@@ -11415,6 +11610,7 @@ class ChunkedLmHeadLogprobFunction(torch.autograd.Function):
             gemm_tuning=ctx.gemm_tuning,
             logprob_dz=ctx.logprob_dz,
             row_index=row_index,
+            _problem=ctx.problem,
         )
         return (dx, dw) + (None,) * 12
 
@@ -11510,6 +11706,7 @@ class ChunkedLmHeadLogprobTemperatureFunction(torch.autograd.Function):
         ctx.temperature_scalar = (
             tau.value if tau is not None and tau.kind == "scalar" else None
         )
+        ctx.problem = _saved_problem(result)
         ctx.chunk_size, ctx.deterministic, ctx.backend, ctx.compact = (
             chunk_size,
             deterministic,
@@ -11559,6 +11756,7 @@ class ChunkedLmHeadLogprobTemperatureFunction(torch.autograd.Function):
             row_index=row_index,
             temperature=tau if tau_rows is not None else None,
             temperature_rows=tau_rows,
+            _problem=ctx.problem,
         )
         return (dx, dw) + (None,) * 14
 
