@@ -1119,11 +1119,18 @@ def _ensure_jit_submodules() -> None:
             f"[flashinfer] Initializing 3rdparty/{name} submodule...",
             flush=True,
         )
-        subprocess.run(
-            ["git", "submodule", "update", "--init", f"3rdparty/{name}"],
-            cwd=_root,
-            check=True,
-        )
+        try:
+            subprocess.run(
+                ["git", "submodule", "update", "--init", f"3rdparty/{name}"],
+                cwd=_root,
+                check=True,
+                timeout=300,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                f"Timed out initializing 3rdparty/{name}. "
+                "Check Git remote access and retry."
+            ) from exc
 
 
 def _create_data_dir(use_symlinks=True):
