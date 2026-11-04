@@ -2092,3 +2092,103 @@ def test_uniform_fp8_prefill_outside_its_box_is_declined(change):
         _invoke_attention(
             inputs, None, msa_sparse_attention, msa_sparse_decode_attention
         )
+
+
+# Inside the box the program converts the E4M3 Q to BF16 in its Q ingress (an
+# exact conversion) and otherwise runs as the BF16-Q program over the same FP8
+# cache (route prefill_union:bfloat16:float8_e4m3fn:paged:gqa0:any), so every
+# output equals, bit for bit, the call on ``q.to(torch.bfloat16)``.  Q is
+# scaled by 8 (exact in E4M3) so that the logits spread (standard deviation
+# about 0.9): the reference LSE of a zero Q then lies outside the LSE
+# tolerance, so the reference check sees Q as well.
+@pytest.mark.parametrize(
+    ("kv_len", "use_workspace", "cuda_graph", "temperature_scale", "seed"),
+    [
+        (97, True, False, 0.7, 103),
+        (128, False, False, 1.0, 107),
+        (1, True, True, 1.0, 109),
+        (128, True, True, 0.7, 113),
+    ],
+    ids=[
+        "kv97-temperature",
+        "kv128-no-workspace",
+        "kv1-graph",
+        "kv128-graph-temperature",
+    ],
+)
+def test_uniform_fp8_prefill_box_is_the_bf16_q_call_bitwise(
+    kv_len, use_workspace, cuda_graph, temperature_scale, seed
+):
+    device = _require_supported_gpu()
+    from flashinfer.msa_ops import (
+        MSASparseAttentionWorkspace,
+        msa_sparse_attention,
+        msa_sparse_decode_attention,
+    )
+
+    case = _attention_case(
+        "sparse_prefill",
+        q_dtype=_FP8,
+        kv_dtype=_FP8,
+        kv_layout="paged",
+        q_lens=[1],
+        kv_lens=[kv_len],
+        num_q_heads=64,
+        num_kv_heads=4,
+        topk=16,
+        causal=True,
+        seed=seed,
+        return_temperature_lse=temperature_scale != 1.0,
+        lse_temperature_scale=temperature_scale,
+    )
+    inputs = _make_attention_inputs(case, device)
+    inputs["q"].copy_((inputs["q"].float() * 8.0).to(inputs["q"].dtype))
+
+    def new_workspace() -> Any:
+        if not use_workspace:
+            return None
+        return MSASparseAttentionWorkspace(device=device)
+
+    def run(call_inputs: dict[str, Any], workspace: Any) -> tuple[torch.Tensor, ...]:
+        return _invoke_attention(
+            call_inputs,
+            workspace,
+            msa_sparse_attention,
+            msa_sparse_decode_attention,
+        )
+
+    if cuda_graph:
+        # A workspace that took part in a capture is not reused eagerly.
+        captured_workspace = new_workspace()
+        stream = torch.cuda.Stream(device=device)
+        stream.wait_stream(torch.cuda.current_stream(device))
+        with torch.cuda.stream(stream):
+            for _ in range(3):
+                run(inputs, captured_workspace)
+        stream.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            captured = run(inputs, captured_workspace)
+        # FP8 tensors have no in-place CUDA arithmetic: perturb in float, store back.
+        inputs["q"].copy_((inputs["q"].float() * 0.5 + 0.125).to(inputs["q"].dtype))
+        with torch.cuda.stream(stream):
+            graph.replay()
+        stream.synchronize()
+        actual = tuple(t.clone() for t in captured)
+    else:
+        actual = tuple(t.clone() for t in run(inputs, new_workspace()))
+    upcast = run({**inputs, "q": inputs["q"].to(torch.bfloat16)}, new_workspace())
+    torch.cuda.synchronize()
+    assert actual[0].dtype == torch.bfloat16
+    _assert_bitwise(actual, upcast)
+
+    expected = _reference_attention(inputs)
+    torch.testing.assert_close(actual[0], expected[0], atol=0.1, rtol=0.1)
+    _assert_lse_close(actual[1], expected[1])
+    if temperature_scale != 1.0:
+        _assert_lse_close(actual[2], expected[2])
+    # the reference check sees Q: a zero Q moves the reference LSE outside
+    # the LSE tolerance
+    zero_q = (inputs["q"].float() * 0.0).to(inputs["q"].dtype)
+    blind = _reference_attention({**inputs, "q": zero_q})
+    assert not torch.allclose(blind[1], expected[1], atol=0.05, rtol=0.01)
