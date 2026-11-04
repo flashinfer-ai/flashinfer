@@ -1004,7 +1004,7 @@ _CONTEXT_FP8_RUNTIME_ROUTES: dict[str, dict[tuple[int, int | None], str]] = {
 # pack (:func:`_context_pack_g`) is its own.  Per target, ``(pack_g,
 # page_size)`` names the program (``None``: every page size 16 .. 1024).  The
 # host consults them only for a causal call without LSE or sink that no exact
-# route serves.
+# route serves, except the calls of :data:`_CONTEXT_BF16_RUNTIME_POW2_Q`.
 _CONTEXT_BF16_RUNTIME_ROUTES: dict[str, dict[tuple[int, int | None], str]] = {
     "sm100a": {
         (16, None): "RUNTIME_PACK16",
@@ -1029,6 +1029,16 @@ _CONTEXT_BF16_RUNTIME_ROUTES: dict[str, dict[tuple[int, int | None], str]] = {
         (1, None): "RUNTIME_PACK1",
     },
 }
+# Per target, ``(queries, keys)``: a causal BF16 call without LSE or sink at a
+# JIT pack above 1 whose ``max_q_len`` is a power of two of at least
+# ``queries``, over at least ``keys`` cache keys, keeps the JIT module.  The
+# JIT module, compiled for the call's sizes, runs a power-of-two query length
+# faster than its neighbours; there the runtime-size program ran slower than
+# it beyond the A/A band (B200, 10 layouts, batch x queries x keys at 32 query
+# and 4 KV heads: 1 x 8192 x 14336 .. 24576, 2 and 4 x 8192 x 16384, 1 x 16384
+# x 16384; also packs 2, 4 and 16 at 8192 queries and pack 16 at 4096 and
+# 16384), while 8064, 8320, 12288 and 24576 queries ran faster on the program.
+_CONTEXT_BF16_RUNTIME_POW2_Q: dict[str, tuple[int, int]] = {"sm100a": (4096, 14336)}
 # Short sm103a launches keep each stage's P tile in its own S columns: the
 # program an exact, runtime-size or (every page size) one-stage route names
 # maps to the same schedule and arguments with the default P placement, for
@@ -7356,9 +7366,24 @@ def select_cake_fmha_context_route(
                 total_bh = batch_size * (num_q_heads // pack)
                 l2_swizzle = 8 if total_bh % 8 == 0 else 1
         # A BF16 call no exact route serves: the runtime-size program of its
-        # JIT pack and page size (the same tile work as the JIT module).
+        # JIT pack and page size (the same tile work as the JIT module), but
+        # not for the power-of-two query lengths of
+        # :data:`_CONTEXT_BF16_RUNTIME_POW2_Q`.
         runtime_bf16 = _CONTEXT_BF16_RUNTIME_ROUTES.get(target)
-        if program is None and component == "context_bf16" and runtime_bf16:
+        pow2_q = _CONTEXT_BF16_RUNTIME_POW2_Q.get(target)
+        jit_pow2 = (
+            pow2_q is not None
+            and pack_g > 1
+            and max_q_len >= pow2_q[0]
+            and max_q_len & (max_q_len - 1) == 0
+            and max_kv_len >= pow2_q[1]
+        )
+        if (
+            program is None
+            and component == "context_bf16"
+            and runtime_bf16
+            and not jit_pow2
+        ):
             program = runtime_bf16.get((pack_g, page_size)) or runtime_bf16.get(
                 (pack_g, None)
             )

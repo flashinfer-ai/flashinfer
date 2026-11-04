@@ -55,9 +55,9 @@
     }
   },
   "generator": {
-    "cake_revision": "433416df9e68bc09d99f392f96097445bc71a54f",
+    "cake_revision": "209b9d8037c8357665faa3c279e4de76762ca448",
     "cuda": "13.4.92",
-    "rendered_at": "2026-11-03T19:28:48Z"
+    "rendered_at": "2026-11-04T03:23:49Z"
   },
   "libraries": [
     {
@@ -2371,7 +2371,7 @@
     },
     {
       "arch": "sm_107a",
-      "closure_sha256": "d207aee88e860d110575b4951c80f5bb31c080ac6f71aa8c67b4cc70d9b91748",
+      "closure_sha256": "3ab7cd14e4016f2bfb75fb83c7a948954c31f9dc2e13033419d49f1bda7c5417",
       "entry": "run",
       "gencode": "-gencode=arch=compute_107a,code=sm_107a",
       "min_cuda": "13.4",
@@ -2384,7 +2384,7 @@
       "path": "aot/cake_mok_recompute_mxfp8_clamped_sm_107a.so",
       "sha256": {
         "csrc/sm_100a/cake_mok_recompute_mxfp8_binding.cu": "5319f3aa32cc1662858c6c335cafa34efbcd18213621748b8b7ed1317fce7f4f",
-        "csrc/sm_107a/cake_mok_recompute_mxfp8_clamped.cu": "be039afa50b703d399dc0364f973d2460569166516a8ca59a3c2e361834c8bb0"
+        "csrc/sm_107a/cake_mok_recompute_mxfp8_clamped.cu": "5283c7171945706186363281a744d2a2f9117f1f40ece20c581413b9b2c0ebce"
       },
       "sources": [
         "csrc/sm_107a/cake_mok_recompute_mxfp8_clamped.cu",
@@ -2437,7 +2437,7 @@
     },
     {
       "arch": "sm_107a",
-      "closure_sha256": "62dfacca794f380042a8c6790483497c1ea79de184c0067ff99927153c010af8",
+      "closure_sha256": "4dbb19a7351b46d095ae492efa1309930f8cdd8748047796f8f2facbc98f6348",
       "entry": "run",
       "gencode": "-gencode=arch=compute_107a,code=sm_107a",
       "min_cuda": "13.4",
@@ -2450,7 +2450,7 @@
       "path": "aot/cake_mok_recompute_mxfp8_sm_107a.so",
       "sha256": {
         "csrc/sm_100a/cake_mok_recompute_mxfp8_binding.cu": "5319f3aa32cc1662858c6c335cafa34efbcd18213621748b8b7ed1317fce7f4f",
-        "csrc/sm_107a/cake_mok_recompute_mxfp8.cu": "3f32ae4d885b3b024179bfe61c148641235028c9d746fa59cca994455244b4ef"
+        "csrc/sm_107a/cake_mok_recompute_mxfp8.cu": "08a2ece5ef1ca9badae4fce2cc8f1f194b8c49fe114be1839175150657ca7850"
       },
       "sources": [
         "csrc/sm_107a/cake_mok_recompute_mxfp8.cu",

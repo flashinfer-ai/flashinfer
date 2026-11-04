@@ -210,8 +210,12 @@ The packed GDN training routes come in four combinations:
 * Host launch path: the record, grid and merge columns of a launch are
   resolved once per launch key and kept with the context's tables; each
   forward or backward body, eager or captured, binds the caller's current
-  stream for tvm-ffi once (`tvm_ffi.use_torch_stream()`), and a launch enters
-  its own context only outside such a body or after a stream switch inside it.
+  stream for tvm-ffi once (`tvm_ffi.use_raw_stream` with that stream's device
+  and raw handle: the stream `tvm_ffi.use_torch_stream()` binds), and a launch
+  enters its own context only outside such a body or after a stream switch
+  inside it.  The registry's answers (in-kernel L2 norm and fused-output
+  records), the chunk table's token count and the validated options of an
+  `options` dict are derived once and reused.
   The static launch arguments of a plan (the pool tables' kernel addressing,
   the walk, index and merge-chain device tables, the split lists) are derived
   once and kept with the same tables; a call without `workspace=` takes the
