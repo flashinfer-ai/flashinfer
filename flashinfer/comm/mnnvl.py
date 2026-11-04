@@ -42,7 +42,7 @@ except ImportError:
         ) from e
 
 from ..cuda_utils import checkCudaErrors
-from .dlpack_utils import create_dlpack_capsule, pack_strided_memory
+from .dlpack_utils import pack_strided_memory
 from .mapping import Mapping
 
 from .abstractions import CommBackend
@@ -73,7 +73,7 @@ def round_up(val: int, gran: int) -> int:
 def create_tensor_from_cuda_memory(
     ptr: int, shape: tuple, dtype: torch.dtype, device_id: int
 ) -> torch.Tensor:
-    r"""Wrap a CUDA memory allocation as a PyTorch tensor via DLPack.
+    r"""Wrap caller-owned CUDA memory as a non-owning PyTorch tensor.
 
     Parameters
     ----------
@@ -99,16 +99,9 @@ def create_tensor_from_cuda_memory(
     # Get element size in bytes
     element_size = torch.tensor([], dtype=dtype).element_size()
 
-    # Create DLPack capsule for contiguous memory (stride = element_size, num_segments = numel)
-    capsule_wrapper = create_dlpack_capsule(
+    tensor = pack_strided_memory(
         ptr, element_size, element_size, numel, dtype, device_id
     )
-
-    # Convert to tensor and reshape
-    tensor = torch.utils.dlpack.from_dlpack(capsule_wrapper.capsule)
-    tensor._capsule_wrapper = capsule_wrapper  # Keep reference to prevent GC
-
-    # Reshape to desired shape
     return tensor.view(shape)
 
 
@@ -368,8 +361,10 @@ class MnnvlMemory:  # type: ignore[no-redef]
             ),
         )
 
+        allocation_prop = MnnvlMemory.get_allocation_prop(dev_id, handle_type)
         madesc = cuda.CUmemAccessDesc()
-        madesc.location = MnnvlMemory.get_allocation_prop(dev_id, handle_type).location
+        # .location views allocation_prop; keep it alive until the descriptor copies it.
+        madesc.location = allocation_prop.location
         madesc.flags = cuda.CUmemAccess_flags.CU_MEM_ACCESS_FLAGS_PROT_READWRITE
         for i, mem_handle in enumerate(mem_handles):
             rank_ptr = start_address + rank_stride * i + address_offset
