@@ -22,6 +22,16 @@ try:
 except ImportError:  # the PyTorch path below quantizes the same bytes
     triton = None
 
+gluon = None
+if triton is not None:
+    try:  # Gluon with linear layouts (Triton >= 3.5); else the Triton dual kernel
+        from triton.experimental import gluon
+        from triton.experimental.gluon import language as gl
+
+        gl.DistributedLinearLayout  # noqa: B018
+    except (ImportError, AttributeError):
+        gluon = None
+
 _BLOCK = 32
 # The FP32 ``1 / 448`` factor of the recipe.
 _SCALE_FACTOR = 0.002232142857
@@ -221,8 +231,195 @@ if triton is not None:
         tl.store(scale_t_ptr + tile_base_t + scale_rows, tl.trans(byte_t).to(tl.uint8))
 
 
-def _quantize_both_triton(matrices):
-    """Both layouts of contiguous ``[E, M, N]`` matrices in one kernel launch."""
+if gluon is not None:
+
+    @gluon.jit
+    def _nan_max(a, b):
+        return gl.maximum(a, b, propagate_nan=tl.PropagateNan.ALL)
+
+    @gluon.jit
+    def _gl_block_bytes(amax, scale_factor):
+        """:func:`_block_bytes` in Gluon."""
+        scale = amax * scale_factor
+        scale = gl.where(scale != scale, scale, gl.maximum(scale, 1e-12))
+        bits = scale.to(gl.int32, bitcast=True)
+        byte = ((bits >> 23) & 0xFF) + ((bits & 0x7FFFFF) != 0).to(gl.int32)
+        byte = gl.minimum(byte, 254)
+        return byte, ((254 - byte) << 23).to(gl.float32, bitcast=True)
+
+    @gluon.jit
+    def _gl_quantize_tile(
+        tensors,
+        expert,
+        row_tile,
+        col_tile,
+        scale_factor,
+        M: gl.constexpr,
+        N: gl.constexpr,
+        LAYOUTS: gl.constexpr,
+    ):
+        """Both layouts of one 128 x 128 tile of a contiguous ``[E, M, N]`` matrix,
+        byte for byte those of :func:`_quantize_tile_both_kernel`.
+
+        The tile is viewed as ``[4, 32, 4, 32]`` (row = ``rb * 32 + rr``, column =
+        ``kb * 32 + cc``), so every 32-element block of either layout lies along
+        one axis, held in registers and lanes of one warp: both block maxima are
+        warp shuffles and no tile goes through shared memory. ``TILE`` loads 8
+        consecutive columns per thread and stores the E4M3 tile with 8-byte
+        vectors; ``TILE_T`` owns the same elements with 4 consecutive rows first,
+        so the transposed tile is stored with 4-byte vectors. Only the 512-byte
+        scale tiles of each layout are regrouped through shared memory
+        (``SCALES`` / ``SCALES_T``) into 4-byte stores. The NaN-propagating block
+        maximum equals the explicit NaN check of the Triton kernel, and the
+        saturating E4M3 conversion equals its +-448 clamp. ``tensors`` holds the
+        source, data, scales, data_t and scales_t pointers; ``LAYOUTS`` holds
+        ``TILE``, ``TILE_T``, ``SCALES`` and ``SCALES_T`` of :func:`_gluon_layouts`.
+        """
+        x_ptr, data_ptr, scale_ptr, data_t_ptr, scale_t_ptr = tensors
+        TILE: gl.constexpr = LAYOUTS[0]
+        TILE_T: gl.constexpr = LAYOUTS[1]
+        SCALES: gl.constexpr = LAYOUTS[2]
+        SCALES_T: gl.constexpr = LAYOUTS[3]
+        L3: gl.constexpr = gl.SliceLayout(3, TILE)
+        L2: gl.constexpr = gl.SliceLayout(2, L3)
+        rb = gl.arange(0, 4, layout=gl.SliceLayout(1, L2))[:, None, None, None]
+        rr = gl.arange(0, 32, layout=gl.SliceLayout(0, L2))[None, :, None, None]
+        kb = gl.arange(0, 4, layout=gl.SliceLayout(0, gl.SliceLayout(1, L3)))
+        kb = kb[None, None, :, None]
+        L1: gl.constexpr = gl.SliceLayout(1, gl.SliceLayout(2, TILE))
+        cc = gl.arange(0, 32, layout=gl.SliceLayout(0, L1))[None, None, None, :]
+        row = rb * 32 + rr
+        col = kb * 32 + cc
+        # in-tile offsets stay int32 (128 * max(M, N) < 2**31); the corners are int64
+        source = expert * (M * N) + (row_tile * 128) * N + col_tile * 128
+        offsets = row * N + col
+        values = gl.load(x_ptr + source + offsets).to(gl.float32)
+        magnitude = gl.abs(values)
+
+        # x: 32-element blocks along N (axis 3).
+        byte, inverse = _gl_block_bytes(gl.reduce(magnitude, 3, _nan_max), scale_factor)
+        data = (values * inverse[:, :, :, None]).to(gl.float8e4nv)
+        gl.store(data_ptr + source + offsets, data)
+        # x.transpose(-1, -2): 32-element blocks along M (axis 1).
+        byte_t, inverse_t = _gl_block_bytes(
+            gl.reduce(magnitude, 1, _nan_max), scale_factor
+        )
+        data_t = (values * inverse_t[:, None, :, :]).to(gl.float8e4nv)
+        target_t = expert * (M * N) + (col_tile * 128) * M + row_tile * 128
+        offsets_t = gl.convert_layout(col * M + row, TILE_T)
+        gl.store(data_t_ptr + target_t + offsets_t, gl.convert_layout(data_t, TILE_T))
+
+        # Scale tiles: byte (row % 32) * 16 + (row // 32) * 4 + column block.
+        S2: gl.constexpr = gl.SliceLayout(2, SCALES)
+        s_rb = gl.arange(0, 4, layout=gl.SliceLayout(1, S2))[:, None, None]
+        s_rr = gl.arange(0, 32, layout=gl.SliceLayout(0, S2))[None, :, None]
+        s_kb = gl.arange(0, 4, layout=gl.SliceLayout(0, gl.SliceLayout(1, SCALES)))
+        tile_base = ((expert * (M // 128) + row_tile) * (N // 128) + col_tile) * 512
+        gl.store(
+            scale_ptr + tile_base + (s_rr * 16 + s_rb * 4 + s_kb[None, None, :]),
+            gl.convert_layout(byte.to(gl.uint8), SCALES),
+        )
+        T2: gl.constexpr = gl.SliceLayout(2, SCALES_T)
+        t_rb = gl.arange(0, 4, layout=gl.SliceLayout(1, T2))[:, None, None]
+        t_kb = gl.arange(0, 4, layout=gl.SliceLayout(0, T2))[None, :, None]
+        t_cc = gl.arange(0, 32, layout=gl.SliceLayout(0, gl.SliceLayout(1, SCALES_T)))
+        tile_base_t = ((expert * (N // 128) + col_tile) * (M // 128) + row_tile) * 512
+        gl.store(
+            scale_t_ptr + tile_base_t + (t_cc[None, None, :] * 16 + t_kb * 4 + t_rb),
+            gl.convert_layout(byte_t.to(gl.uint8), SCALES_T),
+        )
+
+    @gluon.jit
+    def _quantize_both_gluon_kernel(
+        gate,
+        up,
+        down,
+        scale_factor,
+        E: gl.constexpr,
+        M: gl.constexpr,
+        N: gl.constexpr,
+        ROUTED: gl.constexpr,
+        LAYOUTS: gl.constexpr,
+    ):
+        """Both layouts of ``gate`` (``[E, M, N]``), or with ``ROUTED`` of ``gate``
+        and ``up`` (``[E, M, N]``) and ``down`` (``[E, N, M]``) in one launch: one
+        program per 128 x 128 tile over a flat grid of 1 or 3 matrices. Each
+        matrix argument is a (source, data, scales, data_t, scales_t) tuple."""
+        tiles: gl.constexpr = (M // 128) * (N // 128)
+        tile = gl.program_id(0)
+        expert = (tile // tiles % E).to(gl.int64)
+        local = tile % tiles
+        matrix = tile // (E * tiles)
+        if ROUTED and matrix == 2:  # down: row tiles of N, column tiles of M
+            row_tile, col_tile = local // (M // 128), local % (M // 128)
+            _gl_quantize_tile(
+                down, expert, row_tile, col_tile, scale_factor, N, M, LAYOUTS
+            )
+        else:
+            row_tile, col_tile = local // (N // 128), local % (N // 128)
+            if ROUTED and matrix == 1:
+                _gl_quantize_tile(
+                    up, expert, row_tile, col_tile, scale_factor, M, N, LAYOUTS
+                )
+            else:
+                _gl_quantize_tile(
+                    gate, expert, row_tile, col_tile, scale_factor, M, N, LAYOUTS
+                )
+
+    # 16 warps, one 32 x 32 block pair (rb, kb) per warp: 0.143 ms vs 0.156 ms (8)
+    # / 0.173 ms (4) per [36, 2048, 4096] on VR200 (Triton dual kernel: 0.364 ms).
+    _GLUON_WARPS = 16
+
+    @functools.cache
+    def _gluon_layouts():
+        """``[rb, rr, kb, cc]`` tile layouts (registers, lanes, warps) and the two
+        ``[4, 32, 4]`` scale-tile layouts."""
+        rb, rr, kb, cc = [[1 if i == d else 0 for i in range(4)] for d in range(4)]
+
+        def basis(axis, value):
+            return [value * a for a in axis]
+
+        columns = [basis(cc, 1), basis(cc, 2), basis(cc, 4)]
+        rows = [basis(rr, 1), basis(rr, 2)]
+        lanes = [basis(cc, 8), basis(cc, 16), basis(rr, 4), basis(rr, 8), basis(rr, 16)]
+        warps = [basis(rb, 1), basis(rb, 2), basis(kb, 1), basis(kb, 2)]
+        shape = [4, 32, 4, 32]
+        tile, tile_t = (
+            gl.DistributedLinearLayout(
+                reg_bases=registers,
+                lane_bases=lanes,
+                warp_bases=warps,
+                block_bases=[],
+                shape=shape,
+            )
+            for registers in (columns + rows, rows + columns)
+        )
+        # [rb, rr, kb] bytes, registers kb then rb: ``rr * 16 + rb * 4 + kb``
+        # [rb, kb, cc] bytes, registers rb then kb: ``cc * 16 + kb * 4 + rb``
+        idle = [[0, 0, 0]] * 4
+        scales = gl.DistributedLinearLayout(
+            reg_bases=[[0, 0, 1], [0, 0, 2], [1, 0, 0], [2, 0, 0]],
+            lane_bases=[[0, 1 << i, 0] for i in range(5)],
+            warp_bases=idle,
+            block_bases=[],
+            shape=[4, 32, 4],
+        )
+        scales_t = gl.DistributedLinearLayout(
+            reg_bases=[[1, 0, 0], [2, 0, 0], [0, 1, 0], [0, 2, 0]],
+            lane_bases=[[0, 0, 1 << i] for i in range(5)],
+            warp_bases=idle,
+            block_bases=[],
+            shape=[4, 4, 32],
+        )
+        return tile, tile_t, scales, scales_t
+
+
+def _gluon_fits(matrices):
+    """The Gluon kernel keeps in-tile offsets in int32."""
+    return gluon is not None and 128 * max(matrices.shape[-2:]) < 2**31
+
+
+def _alloc_both(matrices):
     experts, rows, cols = matrices.shape
     options = dict(device=matrices.device)
     data = torch.empty((experts, rows, cols), dtype=torch.float8_e4m3fn, **options)
@@ -233,6 +430,36 @@ def _quantize_both_triton(matrices):
     scales_t = torch.empty(
         (experts * cols // 128, rows // 128, 32, 16), dtype=torch.uint8, **options
     )
+    return data, scales, data_t, scales_t
+
+
+def _quantize_both_gluon(*matrices):
+    """Both layouts of contiguous ``[E, M, N]`` matrices (or of routed gate, up
+    ``[E, M, N]`` and down ``[E, N, M]``) in one Gluon launch."""
+    experts, rows, cols = matrices[0].shape
+    outputs = [_alloc_both(m) for m in matrices]
+    args = [(m, *out) for m, out in zip(matrices, outputs, strict=True)]
+    args += args[:1] * (3 - len(args))  # unused slots of the single-matrix form
+    grid = (len(matrices) * experts * (rows // 128) * (cols // 128),)
+    _quantize_both_gluon_kernel[grid](
+        *args,
+        _SCALE_FACTOR,
+        experts,
+        rows,
+        cols,
+        len(matrices) == 3,
+        _gluon_layouts(),
+        num_warps=_GLUON_WARPS,
+    )
+    return outputs
+
+
+def _quantize_both_triton(matrices):
+    """Both layouts of contiguous ``[E, M, N]`` matrices in one kernel launch."""
+    if _gluon_fits(matrices):
+        return _quantize_both_gluon(matrices)[0]
+    experts, rows, cols = matrices.shape
+    data, scales, data_t, scales_t = _alloc_both(matrices)
     grid = (experts * (rows // 128), cols // 128)
     _quantize_tile_both_kernel[grid](
         matrices,
@@ -287,9 +514,10 @@ def mxfp8_quantize(x, return_normal=True, return_transposed=True):
     ``[E * M // 128, N // 128, 32, 16]``; the transposed pair quantizes
     ``x.transpose(-1, -2)`` the same way. M and N must be multiples of 128.
     Contiguous CUDA tensors that request both layouts are quantized by one
-    Triton kernel that reads each tile once; a single layout (or a
-    non-contiguous input) uses one Triton kernel per layout. Without Triton
-    (or off CUDA) PyTorch operations produce the same bytes.
+    Gluon (or, without Gluon, Triton) kernel that reads each tile once; a
+    single layout (or a non-contiguous input) uses one Triton kernel per
+    layout. Without Triton (or off CUDA) PyTorch operations produce the same
+    bytes.
     """
     if not isinstance(x, torch.Tensor) or x.dtype != torch.bfloat16:
         raise ValueError("x must be a BF16 tensor")
@@ -334,9 +562,19 @@ def quantize_routed_weights(gate, up, down):
         or down.shape != (gate.shape[0], gate.shape[2], gate.shape[1])
     ):
         raise ValueError("Expected gate/up [E, I, H] and down [E, H, I] weights")
-    q_gate = mxfp8_quantize(gate)
-    q_up = mxfp8_quantize(up)
-    q_down = mxfp8_quantize(down)
+    weights = (gate, up, down)
+    if _gluon_fits(gate) and all(
+        w.dtype == torch.bfloat16
+        and w.is_cuda
+        and w.is_contiguous()
+        and w.numel() > 0
+        and w.shape[1] % 128 == 0
+        and w.shape[2] % 128 == 0
+        for w in weights
+    ):  # all three matrices in one launch
+        q_gate, q_up, q_down = _quantize_both_gluon(*weights)
+    else:
+        q_gate, q_up, q_down = (mxfp8_quantize(w) for w in weights)
     forward = ((q_gate[0], q_gate[1]), (q_up[0], q_up[1]), (q_down[0], q_down[1]))
     backward = (q_gate, q_up, (q_down[2], q_down[3]))
     return forward, backward
