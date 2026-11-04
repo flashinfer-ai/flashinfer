@@ -863,7 +863,11 @@ def test_nvfp4_gin_relay_requires_gin():
         epi_flag_batch=(1, 4),
         group_hint=2**29,
     )
-    kernel, _ = pkg.MegaMoENvfp4Frontend(config)._construct_kernel()
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim import (
+        MegaMoENvfp4Frontend,
+    )
+
+    kernel, _ = MegaMoENvfp4Frontend(config)._construct_kernel()
     assert kernel.enable_nccl_gin and kernel.enable_internode_relay
     with pytest.raises(
         ValueError, match="internode=True requires enable_nccl_gin=True"
