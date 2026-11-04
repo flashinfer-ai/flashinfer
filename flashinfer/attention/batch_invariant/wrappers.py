@@ -246,9 +246,12 @@ class BatchInvariantAttention:
         if D == 64 and self.kind != "decode":
             from dataclasses import replace
 
-            config = replace(
-                config, softmax_wgs=2, q2=True
-            )  # the paired placement (two Q tiles per CTA) at D = 64: same bits, faster prefill
+            from .swaps.operands import arch_smem_cap
+
+            # the paired placement (two Q tiles per CTA, one per softmax warpgroup): same bits, faster prefill. Its two Q tiles and the
+            # smem O_m leave room for a 4-slot K / V ring on 328 KB parts (SM107) and a 3-slot ring on 228 KB parts (SM100 / SM103)
+            slots = 4 if arch_smem_cap() >= (300 << 10) else 3
+            config = replace(config, softmax_wgs=2, q2=True, kv_slots=slots)
         last = kv_last_page_len if self.kind != "ragged" else None
         try:
             planned = engine.plan_attention(
