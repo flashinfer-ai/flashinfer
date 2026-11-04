@@ -47,16 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define SMEM_RING_OFF 1024
-#define SMEM_RING_STAGE_BYTES 196608
-#define SMEM_RING_STRIDE 196608
-#define SMEM_PARTIALS_OFF 197632
-#define SMEM_PARTIALS_STAGE_BYTES 256
-#define SMEM_PARTIALS_STRIDE 256
-#define SMEM_TOTAL 197888
-#define THREADS 288
-
 #include <math_constants.h>
 
 __device__ __forceinline__ uint32_t elect_sync() {
@@ -148,14 +138,13 @@ kernel_cake_rmsnorm_train_e7f4221a7c26b9dfdd23(__nv_bfloat16* __restrict__ x, __
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     uint8_t* ring = reinterpret_cast<uint8_t*>(smem_raw + 1024);
     const int ring_addr = smem + 1024;
     float* partials = reinterpret_cast<float*>(smem_raw + 197632);
     const int partials_addr = smem + 197632;
 
-    // Mbarrier init (2 pipeline groups, 0 ordered-sequence groups, 8 barriers)
-    // Mbarriers at smem_raw[0..64)
+    // Mbarrier init (8 barriers at smem_raw[0..64))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();

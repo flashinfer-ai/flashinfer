@@ -137,14 +137,13 @@ kernel_cake_gdn_det_train_5d2ba03d72acd81e852f(const __grid_constant__ CUtensorM
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     __nv_bfloat16* s_q = reinterpret_cast<__nv_bfloat16*>(smem_raw + 0);
     const int s_q_addr = smem + 0;
     __nv_bfloat16* s_k = reinterpret_cast<__nv_bfloat16*>(smem_raw + 16384);
     const int s_k_addr = smem + 16384;
 
-    // Mbarrier init (1 pipeline groups, 0 ordered-sequence groups, 1 barriers)
-    // Mbarriers at smem_raw[32768..32776)
+    // Mbarrier init (1 barriers at smem_raw[32768..32776))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();

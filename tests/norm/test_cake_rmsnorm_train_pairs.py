@@ -279,8 +279,15 @@ def _check_family_layout(arch: str, hidden: int, residual: bool, sms: int) -> in
                         layout["total_bytes"]
                         >= layout["partial_offset"] + layout["partial_bytes"]
                     )
+                # a column-task single (no FP64 sums) runs its ``col_tasks`` tickets
+                # beside the chunks; no other record spells them
+                tasks = rule.get("col_tasks", 0)
+                column = single and record["workspace_rule"]["sum_bytes"] == 0
+                assert column == ("col_tasks" in rule), (name, rule)
+                if column:
+                    assert tasks > 0 and hidden % tasks == 0, (name, tasks)
                 grid = loader.launch_grid(record, rows, device_index=0)
-                assert grid == (min(slots, len(table)), 1, 1)
+                assert grid == (min(slots, len(table) + tasks), 1, 1)
     return singles
 
 
