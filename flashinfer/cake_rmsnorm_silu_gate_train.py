@@ -25,7 +25,8 @@ shared by every token and head)::
 
 The backward recomputes the statistics and the gate from ``x`` and ``z`` and
 returns BF16 ``dx`` and ``dz`` and the weight gradient summed over every token
-and head, rounded once into BF16 or FP32.  The autograd functions save only
+and head, its FP64 sum rounded to FP32 (and that to BF16 for a BF16 weight
+gradient: FP64 -> FP32 -> BF16).  The autograd functions save only
 their inputs, which keeps ``torch.utils.checkpoint(..., use_reentrant=False)``
 free of FP32 temporaries.  No call synchronizes the host or the device; ``T``
 and ``H`` are runtime values.
@@ -55,16 +56,29 @@ dispatches on it here:
   blocks adds its runs across its warps in FP32 and converts once: at most 16
   FP32 roundings a term either way), and add their FP64 column sums into FP64
   accumulators with atomics; the CTA that arrives last
-  rounds the sum once into the weight gradient.  Which blocks each CTA claims,
-  and so the rows of each FP32 run, and the order of the FP64 additions depend
-  on scheduling: the weight gradient can differ between calls, always within
-  the deterministic backward's error bound ``|dw64| * 2^-7 + sum|terms| *
-  2^-20`` per column (``dw64`` the exact sum of the ``terms``).  Up to 256
-  rows the backward is one thread-block cluster of 16 CTAs
-  with the same row arithmetic, which adds the CTAs' FP32 partials of each
-  column in a fixed order in FP64 and rounds once: there the weight gradient
-  is the same bits on every call, within the same bound, and no workspace is
-  used.  That
+  rounds the sum into the weight gradient (FP64 -> FP32 -> BF16 for BF16).
+  Which blocks each CTA claims, and so the rows of each FP32 run, and the
+  order of the FP64 additions depend on scheduling: the weight gradient can
+  differ between calls, always within the deterministic backward's error
+  bound ``|dw64| * 2^-7 + sum|terms| * 2^-20`` per column (``dw64`` the exact
+  sum of the ``terms``) when the gate ``silu(z)``, the terms and the column
+  sums are FP32 normal numbers or zero.  FP32 underflows gradually: a
+  subnormal gate, term or sum is rounded to a multiple of ``2^-149``, an
+  error that a later product scales (by ``|dy|`` for the gate, by
+  ``|x * rstd| <= sqrt(128)`` for ``dy * silu(z)``), so with subnormal values
+  the weight gradient of either package can lie outside that bound (by up to
+  about ``(1 + |x * rstd|) * 2^-150`` per row when only ``dy * silu(z)`` and
+  the terms underflow), and a weight gradient below the smallest normal
+  number of its dtype is rounded to a multiple of the dtype's smallest
+  subnormal (``2^-133`` for BF16, ``2^-149`` for FP32).  An infinite
+  ``grad_out`` makes its columns' weight gradient infinite or ``NaN``:
+  ``NaN`` where the infinite term is in the last row and the last row block
+  is partial (its padding rows reread that row and multiply it by zero), as
+  in the deterministic backward.  Up to 256 rows the backward is one
+  thread-block cluster of 16 CTAs with the same row arithmetic, which adds
+  the CTAs' FP32 partials of each column in a fixed order in FP64 and rounds
+  the sum the same way: there the weight gradient is the same bits on every
+  call, within the same bound, and no workspace is used.  That
   package's entry points take ``deterministic=False`` only (any other value is
   a ``ValueError``).
 * ``deterministic=False`` while ``torch.use_deterministic_algorithms(True)`` is
@@ -488,11 +502,12 @@ def cake_rmsnorm_silu_gate_train_backward(
         Preallocated BF16 outputs of ``x``'s shape.
     grad_weight : torch.Tensor, optional
         A BF16 or FP32 ``[128]`` tensor that receives the weight gradient
-        (rounded once into its dtype).  Without it a new BF16 tensor is returned.
+        (the FP64 sum rounded to FP32, and to BF16 from there for a BF16
+        tensor).  Without it a new BF16 tensor is returned.
     accumulate_grad_weight : bool
-        Add the gradient to ``grad_weight``'s current value before the one
-        rounding (needs ``grad_weight``).  A call with no rows leaves the
-        accumulator as it is.
+        Add the gradient to ``grad_weight``'s current value before the
+        rounding (in FP64; needs ``grad_weight``).  A call with no rows leaves
+        the accumulator as it is.
     compute_grad_weight : bool
         ``False`` skips the weight-gradient reduction and returns ``None`` for
         it; the non-deterministic kernel then touches neither ``grad_weight``
@@ -517,8 +532,9 @@ def cake_rmsnorm_silu_gate_train_backward(
         ``True`` (default) runs the deterministic package's backward
         (:func:`flashinfer.cake_rmsnorm_silu_gate_det_train.cake_rmsnorm_silu_gate_det_train_backward`)
         with these arguments: ``dw`` accumulated in FP32 per CTA chunk and in
-        FP64 over the chunks in an order fixed by the row count, rounded once,
-        so repeated calls return the same bits.  ``False`` runs one kernel of
+        FP64 over the chunks in an order fixed by the row count, rounded to
+        FP32 (and to BF16 from there for BF16), so repeated calls return the
+        same bits.  ``False`` runs one kernel of
         the non-deterministic package: the same ``dx`` and ``dz`` bits, and each
         CTA sums the rows of the blocks it takes (its own block when the grid
         has a CTA for every block, else the chunks it claims) in FP32 runs of
@@ -526,12 +542,14 @@ def cake_rmsnorm_silu_gate_train_backward(
         across its warps in FP32 and converts once: at most 16 FP32 roundings
         a term either way) and adds its FP64 column sums into FP64
         accumulators with atomics; the CTA that
-        arrives last rounds the sum once into ``dw`` (adding ``grad_weight``'s
+        arrives last rounds the sum into ``dw`` (adding ``grad_weight``'s
         value first when accumulating).  The claimed blocks, and so the FP32
         runs, and the order of the FP64 additions depend on scheduling: ``dw``
         can differ between calls, always within the deterministic backward's
-        error bound ``|dw64| * 2^-7 + sum|terms| * 2^-20`` per column.  Up
-        to 256 rows one cluster of 16 CTAs runs instead: the
+        error bound ``|dw64| * 2^-7 + sum|terms| * 2^-20`` per column while the
+        gate, the terms and the sums are FP32 normal numbers or zero (subnormal
+        values and infinities: see the module documentation).  Up to 256 rows
+        one cluster of 16 CTAs runs instead: the
         CTAs' FP32 partials of a column are added in a fixed order in FP64, so
         ``dw`` is the same bits on every call (within the same bound), and the
         workspace is not used.

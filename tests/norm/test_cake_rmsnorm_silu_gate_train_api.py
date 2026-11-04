@@ -46,7 +46,11 @@ its errors, its autograd node), ``deterministic=False`` the standalone backend
   budget of the deterministic ``dw``, on every repeat; so are they for
   one-head inputs of several layouts past the start of each module that warms
   packed rows in L2, which launch with the packed-rows test passing exactly
-  when their rows follow one another.
+  when their rows follow one another; and for weight gradients in the
+  subnormal range (identical rows whose FP32 terms underflow) on the short,
+  the mid and the long backward: ``dx`` and ``dz`` the deterministic bits, a
+  BF16 ``dw`` the deterministic ``dw``'s bits, and every ``dw`` within the
+  budget widened by the underflow allowance the package documents.
 
 The numerical contract of the non-deterministic kernels against the FP64
 reference is ``test_cake_rmsnorm_silu_gate_train.py``'s; its data generators,
@@ -1667,3 +1671,74 @@ def test_one_head_inputs_match_the_flat_rows_and_the_deterministic_package(
             heads = [v for k, v in strides.items() if k.endswith("_head")]
             assert heads and all(v == D for v in heads), (layout, strides)
             assert _packed(strides) == packed, (layout, strides)
+
+
+# Identical rows whose weight-gradient terms ``dy * silu(z) * x * rstd`` are
+# below FP32's smallest subnormal, 2^-149 (``x`` 1, ``z`` 2^-133, the smallest
+# BF16 subnormal, so ``silu(z)`` is 2^-134 exactly; ``dy`` 2^-16 .. 2^-14 by
+# column): each term rounds to 0 or 2^-149 in FP32, the same in every row, so
+# the error grows with the rows.  Rows routed to the short, the mid and the long
+# backward on every architecture.
+SUBNORMAL_SHAPES = [
+    pytest.param(16, 1, id="short-16x1"),
+    pytest.param(4096, 1, id="mid-4096x1"),
+    pytest.param(8192, 32, id="long-8192x32"),
+]
+
+
+def _underflowing_rows(T: int, H: int) -> tuple[torch.Tensor, ...]:
+    device = torch.device("cuda")
+    col = torch.arange(D, device=device, dtype=torch.float64)
+    x = torch.ones(T, H, D, device=device).bfloat16()
+    z = torch.full((T, H, D), 2.0**-133, device=device).bfloat16()
+    scale = torch.where(
+        col < 64, 2.0**-16 * (1 + col / 64), 2.0**-15 * (1 + (col - 64) / 64)
+    )
+    dy = scale.float().bfloat16().view(1, 1, D).expand(T, H, D).contiguous()
+    w = torch.ones(D, device=device).bfloat16()
+    return x, z, w, dy
+
+
+@requires_device
+@pytest.mark.parametrize(
+    "dw_dtype", [torch.bfloat16, torch.float32], ids=["bf16", "f32"]
+)
+@pytest.mark.parametrize("T,H", SUBNORMAL_SHAPES)
+def test_subnormal_weight_gradient_matches_the_deterministic_package(
+    T, H, dw_dtype, determinism_setting
+) -> None:
+    """Weight gradients in the subnormal range, where the documented budget
+    ``|dw64| * 2^-7 + sum|terms| * 2^-20`` (for FP32 normal gates, terms and
+    sums) does not hold for either package: ``dx`` and ``dz`` are the
+    deterministic package's bits, a BF16 ``dw`` the deterministic ``dw``'s
+    bits, and every ``dw`` lies within that budget widened by the documented
+    underflow allowance, ``(1 + |x * rstd|) * 2^-150`` per row plus half the
+    dtype's smallest subnormal, on every repeat, with the workspace zero."""
+    x, z, w, dy = _underflowing_rows(T, H)
+    rows = T * H
+    dx_d, dz_d, dw_d = det_backward(
+        dy, x, z, w, EPS, grad_weight=torch.empty(D, dtype=dw_dtype, device=x.device)
+    )
+    xd, zd = x.double(), z.double()
+    n = xd * torch.rsqrt(xd.square().mean(-1, keepdim=True) + EPS)
+    terms = (dy.double() * zd * torch.sigmoid(zd) * n).reshape(rows, D)
+    dw64 = terms.sum(0)
+    smallest = 2.0**-133 if dw_dtype == torch.bfloat16 else 2.0**-149
+    allowance = (1 + n.abs().max().item()) * rows * 2.0**-150 + smallest / 2
+    budget = dw64.abs() * suite.BF16_RTOL + terms.abs().sum(0) * suite.DW_MAG_TOL
+    assert bool(((dw_d.double() - dw64).abs() > budget).any()), (
+        "the inputs no longer leave the normal-range budget"
+    )
+    ws = nd_workspace(rows, x.device)
+    for _ in range(suite.REPEATS):
+        dw = torch.empty(D, dtype=dw_dtype, device=x.device)
+        dx, dz, _ = nd_backward(dy, x, z, w, EPS, grad_weight=dw, workspace=ws)
+        assert torch.equal(dx, dx_d), "dx"
+        assert torch.equal(dz, dz_d), "dz"
+        if dw_dtype == torch.bfloat16:
+            assert torch.equal(dw.view(torch.int16), dw_d.view(torch.int16)), "dw bits"
+        excess = (dw.double() - dw64).abs() - budget - allowance
+        assert not bool((excess > 0).any()), (
+            f"dw beyond the floored budget by {excess.max().item():.3e}"
+        )
+        assert not bool(ws.any()), "the workspace is not zero"
