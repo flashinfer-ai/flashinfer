@@ -379,6 +379,45 @@ def test_balanced_route_matches_the_reference_and_the_forced_program(
 
 
 @requires_gpu
+@pytest.mark.parametrize(
+    "mb,nb,counts",
+    [
+        (1, 256, [8]),  # 8 tiles, the smallest balanced grid
+        (2, 256, [7, 7]),
+        (2, 256, [16, 16]),
+        (3, 64, [7] * 3),
+        (19, 256, [5 + (3 * row) % 5 for row in range(19)]),  # ragged, about one wave
+    ],
+)
+def test_sub_wave_balanced_route_matches_the_reference_and_the_forced_program(
+    mb, nb, counts
+):
+    device = torch.device("cuda")
+    heads = 8
+    seq_q, seq_kv = mb * BLOCK, nb * BLOCK
+    mask = _shared_mask(heads, mb, nb, counts, device, seed=mb)
+    q, k, v = _inputs(seq_q, seq_kv, heads, device, seed=7)
+    wrapper = BlockSparseAttentionWrapper(
+        torch.empty((1,), dtype=torch.uint8, device=device), backend="cake"
+    )
+    _plan(wrapper, mask, heads, seq_q, seq_kv)
+    plan = wrapper._cake_vsa_plan
+    assert plan["blk64_balanced"] is not None
+
+    output, lse = wrapper.run(q, k, v, return_lse=True)
+    torch.cuda.synchronize()
+    assert _counters_are_zero(plan["blk64_balanced"]["queue_counters"])
+
+    forced_output, forced_lse = _forced(plan, q, k, v, True)
+    assert torch.equal(output, forced_output)
+    assert torch.equal(lse, forced_lse)
+
+    reference, reference_lse = _dense_reference(q, k, v, mask)
+    torch.testing.assert_close(output, reference, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(lse, reference_lse, atol=1e-2, rtol=1e-2)
+
+
+@requires_gpu
 def test_graph_replays_equal_eager_and_reset_the_counter():
     device = torch.device("cuda")
     heads, seq = 8, 4096
