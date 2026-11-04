@@ -209,7 +209,7 @@ __device__ __forceinline__ void tma_store_2d(
 extern "C" {
 
 __global__ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) __cluster_dims__(2,1,1) void
-kernel_cake_grouped_fp8_gemm_ad951349d53d895b5975(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap A32, const __grid_constant__ CUtensorMap A64, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap C_tma, const __grid_constant__ CUtensorMap SFA_packed, const __grid_constant__ CUtensorMap SFB_packed, int* __restrict__ m_indices, unsigned int shape_m, unsigned int shape_n, unsigned int k_tiles, unsigned int sf_cols)
+kernel_cake_grouped_fp8_gemm_c8362befbf3dfd399943(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap A32, const __grid_constant__ CUtensorMap A64, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap C_tma, const __grid_constant__ CUtensorMap SFA_packed, const __grid_constant__ CUtensorMap SFB_packed, int* __restrict__ m_indices, unsigned int shape_m, unsigned int shape_n, unsigned int k_tiles, unsigned int sf_cols)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -372,22 +372,24 @@ kernel_cake_grouped_fp8_gemm_ad951349d53d895b5975(const __grid_constant__ CUtens
                     es = -1;
                 }
                 unsigned int next_pair = pair + num_workers;
-                if (next_pair < total_pairs) {
-                    unsigned int grid_np_0 = shape_n / 256;
-                    unsigned int m_blocks_1 = (shape_m + 64 - 1) / 64;
-                    unsigned int pairs_per_l2_0 = m_blocks_1 * 8;
-                    unsigned int n_l2_limit_0 = (unsigned int)8;
-                    unsigned int l2_group_0 = next_pair / pairs_per_l2_0;
-                    unsigned int first_np_0 = l2_group_0 * 8;
-                    unsigned int in_l2_0 = next_pair % pairs_per_l2_0;
-                    unsigned int remaining_np_0 = grid_np_0 - first_np_0;
-                    unsigned int n_in_l2_0 = ((remaining_np_0 > n_l2_limit_0) ? n_l2_limit_0 : remaining_np_0);
-                    unsigned int m_block_0 = in_l2_0 / n_in_l2_0;
-                    unsigned int n_pair_0 = first_np_0 + in_l2_0 % n_in_l2_0;
-                    unsigned int off_m_0 = m_block_0 * 64;
-                    unsigned int off_n_0 = (n_pair_0 * 2 + (unsigned int)cta_rank) * 128;
-                    if (off_m_0 < shape_m) { asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(m_indices + off_m_0))); }
-                    if (off_m_0 + 32 < shape_m) { asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(m_indices + (off_m_0 + 32)))); }
+                if (e0 < 0) {
+                    if (next_pair < total_pairs) {
+                        unsigned int grid_np_0 = shape_n / 256;
+                        unsigned int m_blocks_1 = (shape_m + 64 - 1) / 64;
+                        unsigned int pairs_per_l2_0 = m_blocks_1 * 8;
+                        unsigned int n_l2_limit_0 = (unsigned int)8;
+                        unsigned int l2_group_0 = next_pair / pairs_per_l2_0;
+                        unsigned int first_np_0 = l2_group_0 * 8;
+                        unsigned int in_l2_0 = next_pair % pairs_per_l2_0;
+                        unsigned int remaining_np_0 = grid_np_0 - first_np_0;
+                        unsigned int n_in_l2_0 = ((remaining_np_0 > n_l2_limit_0) ? n_l2_limit_0 : remaining_np_0);
+                        unsigned int m_block_0 = in_l2_0 / n_in_l2_0;
+                        unsigned int n_pair_0 = first_np_0 + in_l2_0 % n_in_l2_0;
+                        unsigned int off_m_0 = m_block_0 * 64;
+                        unsigned int off_n_0 = (n_pair_0 * 2 + (unsigned int)cta_rank) * 128;
+                        if (off_m_0 < shape_m) { asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(m_indices + off_m_0))); }
+                        if (off_m_0 + 32 < shape_m) { asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(m_indices + (off_m_0 + 32)))); }
+                    }
                 }
                 unsigned int nsub = (unsigned int)0;
                 unsigned int runs = (unsigned int)0;
@@ -443,6 +445,25 @@ kernel_cake_grouped_fp8_gemm_ad951349d53d895b5975(const __grid_constant__ CUtens
                         }
                         load_stage += 1;
                         if (load_stage == 8) { load_stage = 0; _phase_tma_free ^= 1; }
+                        if (_run == 0 && iter_k == 0) {
+                            if (next_pair < total_pairs) {
+                                unsigned int grid_np_1 = shape_n / 256;
+                                unsigned int m_blocks_2 = (shape_m + 64 - 1) / 64;
+                                unsigned int pairs_per_l2_1 = m_blocks_2 * 8;
+                                unsigned int n_l2_limit_1 = (unsigned int)8;
+                                unsigned int l2_group_1 = next_pair / pairs_per_l2_1;
+                                unsigned int first_np_1 = l2_group_1 * 8;
+                                unsigned int in_l2_1 = next_pair % pairs_per_l2_1;
+                                unsigned int remaining_np_1 = grid_np_1 - first_np_1;
+                                unsigned int n_in_l2_1 = ((remaining_np_1 > n_l2_limit_1) ? n_l2_limit_1 : remaining_np_1);
+                                unsigned int m_block_1 = in_l2_1 / n_in_l2_1;
+                                unsigned int n_pair_1 = first_np_1 + in_l2_1 % n_in_l2_1;
+                                unsigned int off_m_1 = m_block_1 * 64;
+                                unsigned int off_n_1 = (n_pair_1 * 2 + (unsigned int)cta_rank) * 128;
+                                if (off_m_1 < shape_m) { asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(m_indices + off_m_1))); }
+                                if (off_m_1 + 32 < shape_m) { asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(m_indices + (off_m_1 + 32)))); }
+                            }
+                        }
                     }
                 }
             }
@@ -461,28 +482,28 @@ kernel_cake_grouped_fp8_gemm_ad951349d53d895b5975(const __grid_constant__ CUtens
             unsigned int epi_stage = 0;
             unsigned int num_workers_1 = (unsigned int)num_clusters;
             unsigned int worker_idx_1 = (unsigned int)cluster_id;
-            unsigned int m_blocks_2 = (shape_m + 64 - 1) / 64;
-            unsigned int total_pairs_1 = m_blocks_2 * (shape_n / 256);
+            unsigned int m_blocks_3 = (shape_m + 64 - 1) / 64;
+            unsigned int total_pairs_1 = m_blocks_3 * (shape_n / 256);
             unsigned int _phase_epilogue_done = 1;
             unsigned int _phase_tma_full = 0;
             #pragma unroll 1
             for (unsigned int pair_1 = worker_idx_1; pair_1 < total_pairs_1; pair_1 += num_workers_1) {
-                unsigned int grid_np_1 = shape_n / 256;
-                unsigned int m_blocks_3 = (shape_m + 64 - 1) / 64;
-                unsigned int pairs_per_l2_1 = m_blocks_3 * 8;
-                unsigned int n_l2_limit_1 = (unsigned int)8;
-                unsigned int l2_group_1 = pair_1 / pairs_per_l2_1;
-                unsigned int first_np_1 = l2_group_1 * 8;
-                unsigned int in_l2_1 = pair_1 % pairs_per_l2_1;
-                unsigned int remaining_np_1 = grid_np_1 - first_np_1;
-                unsigned int n_in_l2_1 = ((remaining_np_1 > n_l2_limit_1) ? n_l2_limit_1 : remaining_np_1);
-                unsigned int m_block_1 = in_l2_1 / n_in_l2_1;
-                unsigned int n_pair_1 = first_np_1 + in_l2_1 % n_in_l2_1;
-                unsigned int off_m_1 = m_block_1 * 64;
-                unsigned int off_n_1 = (n_pair_1 * 2 + (unsigned int)cta_rank) * 128;
+                unsigned int grid_np_2 = shape_n / 256;
+                unsigned int m_blocks_4 = (shape_m + 64 - 1) / 64;
+                unsigned int pairs_per_l2_2 = m_blocks_4 * 8;
+                unsigned int n_l2_limit_2 = (unsigned int)8;
+                unsigned int l2_group_2 = pair_1 / pairs_per_l2_2;
+                unsigned int first_np_2 = l2_group_2 * 8;
+                unsigned int in_l2_2 = pair_1 % pairs_per_l2_2;
+                unsigned int remaining_np_2 = grid_np_2 - first_np_2;
+                unsigned int n_in_l2_2 = ((remaining_np_2 > n_l2_limit_2) ? n_l2_limit_2 : remaining_np_2);
+                unsigned int m_block_2 = in_l2_2 / n_in_l2_2;
+                unsigned int n_pair_2 = first_np_2 + in_l2_2 % n_in_l2_2;
+                unsigned int off_m_2 = m_block_2 * 64;
+                unsigned int off_n_2 = (n_pair_2 * 2 + (unsigned int)cta_rank) * 128;
                 unsigned int last_row_1 = shape_m - 1;
-                int e0_1 = m_indices[off_m_1];
-                unsigned int srow_1 = off_m_1 + 32;
+                int e0_1 = m_indices[off_m_2];
+                unsigned int srow_1 = off_m_2 + 32;
                 unsigned int srow_safe_1 = ((srow_1 < shape_m) ? srow_1 : last_row_1);
                 int es_1 = m_indices[srow_safe_1];
                 if (srow_1 >= shape_m) {
@@ -589,27 +610,27 @@ kernel_cake_grouped_fp8_gemm_ad951349d53d895b5975(const __grid_constant__ CUtens
             unsigned int transpose_stage = 0;
             unsigned int num_workers_2 = (unsigned int)num_clusters;
             unsigned int worker_idx_2 = (unsigned int)cluster_id;
-            unsigned int m_blocks_4 = (shape_m + 64 - 1) / 64;
-            unsigned int total_pairs_2 = m_blocks_4 * (shape_n / 256);
+            unsigned int m_blocks_5 = (shape_m + 64 - 1) / 64;
+            unsigned int total_pairs_2 = m_blocks_5 * (shape_n / 256);
             unsigned int _phase_sf_full = 0;
             #pragma unroll 1
             for (unsigned int pair_2 = worker_idx_2; pair_2 < total_pairs_2; pair_2 += num_workers_2) {
-                unsigned int grid_np_2 = shape_n / 256;
-                unsigned int m_blocks_2_1 = (shape_m + 64 - 1) / 64;
-                unsigned int pairs_per_l2_2 = m_blocks_2_1 * 8;
-                unsigned int n_l2_limit_2 = (unsigned int)8;
-                unsigned int l2_group_2 = pair_2 / pairs_per_l2_2;
-                unsigned int first_np_2 = l2_group_2 * 8;
-                unsigned int in_l2_2 = pair_2 % pairs_per_l2_2;
-                unsigned int remaining_np_2 = grid_np_2 - first_np_2;
-                unsigned int n_in_l2_2 = ((remaining_np_2 > n_l2_limit_2) ? n_l2_limit_2 : remaining_np_2);
-                unsigned int m_block_2 = in_l2_2 / n_in_l2_2;
-                unsigned int n_pair_2 = first_np_2 + in_l2_2 % n_in_l2_2;
-                unsigned int off_m_2 = m_block_2 * 64;
-                unsigned int off_n_2 = (n_pair_2 * 2 + (unsigned int)cta_rank) * 128;
+                unsigned int grid_np_3 = shape_n / 256;
+                unsigned int m_blocks_3_1 = (shape_m + 64 - 1) / 64;
+                unsigned int pairs_per_l2_3 = m_blocks_3_1 * 8;
+                unsigned int n_l2_limit_3 = (unsigned int)8;
+                unsigned int l2_group_3 = pair_2 / pairs_per_l2_3;
+                unsigned int first_np_3 = l2_group_3 * 8;
+                unsigned int in_l2_3 = pair_2 % pairs_per_l2_3;
+                unsigned int remaining_np_3 = grid_np_3 - first_np_3;
+                unsigned int n_in_l2_3 = ((remaining_np_3 > n_l2_limit_3) ? n_l2_limit_3 : remaining_np_3);
+                unsigned int m_block_3 = in_l2_3 / n_in_l2_3;
+                unsigned int n_pair_3 = first_np_3 + in_l2_3 % n_in_l2_3;
+                unsigned int off_m_3 = m_block_3 * 64;
+                unsigned int off_n_3 = (n_pair_3 * 2 + (unsigned int)cta_rank) * 128;
                 unsigned int last_row_2 = shape_m - 1;
-                int e0_2 = m_indices[off_m_2];
-                unsigned int srow_2 = off_m_2 + 32;
+                int e0_2 = m_indices[off_m_3];
+                unsigned int srow_2 = off_m_3 + 32;
                 unsigned int srow_safe_2 = ((srow_2 < shape_m) ? srow_2 : last_row_2);
                 int es_2 = m_indices[srow_safe_2];
                 if (srow_2 >= shape_m) {
@@ -676,27 +697,27 @@ kernel_cake_grouped_fp8_gemm_ad951349d53d895b5975(const __grid_constant__ CUtens
             const int epi_warp = warp % 4;
             unsigned int num_workers_3 = (unsigned int)num_clusters;
             unsigned int worker_idx_3 = (unsigned int)cluster_id;
-            unsigned int m_blocks_5 = (shape_m + 64 - 1) / 64;
-            unsigned int total_pairs_3 = m_blocks_5 * (shape_n / 256);
+            unsigned int m_blocks_6 = (shape_m + 64 - 1) / 64;
+            unsigned int total_pairs_3 = m_blocks_6 * (shape_n / 256);
             unsigned int _phase_mainloop_done = 0;
             #pragma unroll 1
             for (unsigned int pair_3 = worker_idx_3; pair_3 < total_pairs_3; pair_3 += num_workers_3) {
-                unsigned int grid_np_3 = shape_n / 256;
-                unsigned int m_blocks_4_1 = (shape_m + 64 - 1) / 64;
-                unsigned int pairs_per_l2_3 = m_blocks_4_1 * 8;
-                unsigned int n_l2_limit_3 = (unsigned int)8;
-                unsigned int l2_group_3 = pair_3 / pairs_per_l2_3;
-                unsigned int first_np_3 = l2_group_3 * 8;
-                unsigned int in_l2_3 = pair_3 % pairs_per_l2_3;
-                unsigned int remaining_np_3 = grid_np_3 - first_np_3;
-                unsigned int n_in_l2_3 = ((remaining_np_3 > n_l2_limit_3) ? n_l2_limit_3 : remaining_np_3);
-                unsigned int m_block_3 = in_l2_3 / n_in_l2_3;
-                unsigned int n_pair_3 = first_np_3 + in_l2_3 % n_in_l2_3;
-                unsigned int off_m_3 = m_block_3 * 64;
-                unsigned int off_n_3 = (n_pair_3 * 2 + (unsigned int)cta_rank) * 128;
+                unsigned int grid_np_4 = shape_n / 256;
+                unsigned int m_blocks_5_1 = (shape_m + 64 - 1) / 64;
+                unsigned int pairs_per_l2_4 = m_blocks_5_1 * 8;
+                unsigned int n_l2_limit_4 = (unsigned int)8;
+                unsigned int l2_group_4 = pair_3 / pairs_per_l2_4;
+                unsigned int first_np_4 = l2_group_4 * 8;
+                unsigned int in_l2_4 = pair_3 % pairs_per_l2_4;
+                unsigned int remaining_np_4 = grid_np_4 - first_np_4;
+                unsigned int n_in_l2_4 = ((remaining_np_4 > n_l2_limit_4) ? n_l2_limit_4 : remaining_np_4);
+                unsigned int m_block_4 = in_l2_4 / n_in_l2_4;
+                unsigned int n_pair_4 = first_np_4 + in_l2_4 % n_in_l2_4;
+                unsigned int off_m_4 = m_block_4 * 64;
+                unsigned int off_n_4 = (n_pair_4 * 2 + (unsigned int)cta_rank) * 128;
                 unsigned int last_row_3 = shape_m - 1;
-                int e0_3 = m_indices[off_m_3];
-                unsigned int srow_3 = off_m_3 + 32;
+                int e0_3 = m_indices[off_m_4];
+                unsigned int srow_3 = off_m_4 + 32;
                 unsigned int srow_safe_3 = ((srow_3 < shape_m) ? srow_3 : last_row_3);
                 int es_3 = m_indices[srow_safe_3];
                 if (srow_3 >= shape_m) {
@@ -715,7 +736,7 @@ kernel_cake_grouped_fp8_gemm_ad951349d53d895b5975(const __grid_constant__ CUtens
                 for (unsigned int _run_3 = 0; _run_3 < runs_3; _run_3++) {
                     mbarrier_wait(mainloop_done_addr + (epi_stage_1) * 8, _phase_mainloop_done);
                     unsigned int num_strips = nsub_3 * 2;
-                    unsigned int row_base = off_m_3 + (unsigned int)0;
+                    unsigned int row_base = off_m_4 + (unsigned int)0;
                     int tmem_base = taddr + (unsigned int)((int)epi_stage_1 * 128) + (unsigned int)(epi_warp * 32 << 16);
                     #pragma unroll 1
                     for (unsigned int strip = 0; strip < num_strips; strip++) {
@@ -761,8 +782,8 @@ kernel_cake_grouped_fp8_gemm_ad951349d53d895b5975(const __grid_constant__ CUtens
                         asm volatile("barrier.sync 15, 128;" ::: "memory");
                         if (warp == 4) {
                             if (elect_sync()) {
-                                tma_store_2d((&C_tma), off_n_3, row_base + (unsigned int)col_strip, stage_base);
-                                tma_store_2d((&C_tma), off_n_3 + 64, row_base + (unsigned int)col_strip, stage_base + 2048);
+                                tma_store_2d((&C_tma), off_n_4, row_base + (unsigned int)col_strip, stage_base);
+                                tma_store_2d((&C_tma), off_n_4 + 64, row_base + (unsigned int)col_strip, stage_base + 2048);
                                 asm volatile("cp.async.bulk.commit_group;");
                             }
                         }
