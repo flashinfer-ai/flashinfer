@@ -407,8 +407,14 @@ class CublasGemmConfig(_GemmBackendConfig):
 #: absent (SM89 / SM90), cuDNN last. trtllm is not a default candidate because
 #: it needs a second (shuffled) copy of the weights; cute-dsl is not one
 #: because its autotune compiles every tactic. Name either explicitly.
+#: ``BackendOptions.candidates`` is annotated with the MoE backend-config union
+#: (the shared vocabulary still lives in ``fused_moe.api``, see the design doc's
+#: decision log); the cast keeps mypy quiet until that home is settled.
 DEFAULT_GEMM_BACKENDS = BackendOptions(
-    candidates=(CutlassGemmConfig(), CublasGemmConfig(), CudnnGemmConfig())
+    candidates=cast(
+        Tuple[Any, ...],
+        (CutlassGemmConfig(), CublasGemmConfig(), CudnnGemmConfig()),
+    )
 )
 
 GemmBackendConfigType = _GemmBackendConfig
