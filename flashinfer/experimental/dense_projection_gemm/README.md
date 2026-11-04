@@ -105,7 +105,7 @@ of `"waves"` (the deterministic plan's last wave below 80 % full).  The measured
 |---|---|---|---|
 | `sm_100a` (>= 148 SMs) | `4096 -> 32, 48, 64`; `5120 -> 32, 48, 64`; `6144 -> 32`: (64, 2).  `4096 -> 128`: deterministic (measured, missed) | deterministic (4 splits) | 256 experts, in the token windows of the last table: on 152 SMs hidden 4096 `"H1x5p44"` and hidden 5120 `"H0.5x3"`; hidden 5120 `"waves"` on every SM count where it applies.  Every other token count and SM count, and hidden 6144: deterministic (6 splits) |
 | `sm_103a` (>= 148 SMs) | `4096 -> 32`; `5120 -> 32, 48, 64`; `6144 -> 32`: (64, 2); `4096 -> 48` (>= 152 SMs): (64, 2); `5120 -> 128`, `6144 -> 128`: (128, 2).  `4096 -> 64`, `4096 -> 128`: deterministic (measured, missed) | deterministic (4 splits) | 256 experts, in the token windows of the last table: on 152 SMs hidden 4096 `"H1x4p44"`, hidden 5120 `"H0.5x3"` and hidden 6144 `"H1x5p44"` (the head/tail program with the BF16 parts of `A` in tensor memory); hidden 5120 `"waves"` on every SM count where it applies.  Every other token count and SM count: deterministic (6 splits) |
-| `sm_107a` (>= 216 SMs) | `4096 -> 32` BF16 (64, 4), FP32 (64, 3); `4096 -> 48` FP32 (64, 3); `4096 -> 64` FP32 (64, 3); `5120 -> 32` (64, 3); `5120 -> 48`, `5120 -> 64` FP32 (64, 3); `6144 -> 32` (64, 3); `8192 -> 128` (128, 2); `4096 -> 512` FP32 (128, 1) `p = 1`; `5120 -> 512` FP32 (128, 1) `p = 1`; `4096 -> 1024` FP32 (256, 1) `p = 1` (on exactly 216 SMs at 16172 to 16384 tokens: (192, 1) `p = 1`, the row-major-store program, 176 CTAs); `5120 -> 1024` (256, 1) `p = 1`, except the token counts of the `sm_107a` K1 token table.  `4096 -> 64` BF16, `4096 -> 128`, `4096 -> 512` BF16, `4096 -> 4096` FP32: deterministic (measured, missed) | deterministic (4 splits) | 256 experts, in the token window of the last table: on 216 SMs hidden 5120 `"H0.5x4"` (the head/tail program).  Every other token count and SM count, and hidden 4096 / 6144: deterministic (6 splits): at 4096 `"H0.5x4"` loses next to a kernel holding 16 SMs that starts during it, at 6144 it leaves the backward pass no faster |
+| `sm_107a` (>= 216 SMs) | `4096 -> 32` BF16 (64, 4), FP32 (64, 3); `4096 -> 48` FP32 (64, 3); `4096 -> 64` FP32 (64, 3); `5120 -> 32` (64, 3); `5120 -> 48`, `5120 -> 64` FP32 (64, 3); `6144 -> 32` (64, 3); `8192 -> 128` (128, 2); `4096 -> 512` FP32 (128, 1) `p = 1`; `5120 -> 512` FP32 (128, 1) `p = 1`; `4096 -> 1024` FP32 (256, 1) `p = 1` (on exactly 216 SMs at 16172 to 16384 tokens: (192, 1) `p = 1`, the row-major-store program, 176 CTAs); `5120 -> 1024` (256, 1) `p = 1`, except the token counts of the `sm_107a` K1 token table (the four FP32 rows with one split: from 40961 tokens up).  `4096 -> 64` BF16, `4096 -> 128`, `4096 -> 512` BF16, `4096 -> 4096` FP32: deterministic (measured, missed) | deterministic (4 splits) | 256 experts, in the token window of the last table: on 216 SMs hidden 5120 `"H0.5x4"` (the head/tail program).  Every other token count and SM count, and hidden 4096 / 6144: deterministic (6 splits): at 4096 `"H0.5x4"` loses next to a kernel holding 16 SMs that starts during it, at 6144 it leaves the backward pass no faster |
 | `sm_107a` (208 SMs, 16172 to 16384 tokens) | `4096 -> 32, 48, 64`, `5120 -> 32, 48, 64` FP32: (64, 3); `4096 -> 512`, `5120 -> 512` FP32 (128, 1) `p = 1`; `4096 -> 1024`, `5120 -> 1024` FP32: (256, 1) `p = 1`; except the token counts of the `sm_107a` K1 token table.  `4096 -> 32, 64` BF16, `5120 -> 32` BF16, `6144 -> 32`: deterministic (no verdict: its stream-K program did not complete next to a resident kernel); `4096 -> 512` BF16, `5120 -> 1024` BF16, `4096 -> 4096` FP32, `8192 -> 128`: deterministic (measured, missed) | deterministic (4 splits) | 256 experts, hidden 5120 at 16172 to 16384 tokens: `"H0.5x4"` (the head/tail program).  Every other token count, and hidden 4096 / 6144: deterministic (6 splits): next to a resident kernel the head/tail program missed at both hidden sizes on the parts at full SM clock |
 | `sm_107a` (212 SMs, 16172 to 16384 tokens) | `4096 -> 32, 48, 64` FP32 (64, 3); `5120 -> 32, 48, 64` FP32 (64, 3); `8192 -> 128` (128, 2); `4096 -> 512`, `5120 -> 512` FP32 (128, 1) `p = 1`; `4096 -> 1024` FP32: (192, 1) `p = 1` (row-major-store program, 176 CTAs); `5120 -> 1024` FP32: (256, 1) `p = 1`; except the token counts of the `sm_107a` K1 token table.  `4096 -> 32, 64` BF16, `5120 -> 32` BF16, `6144 -> 32`: deterministic (no verdict, as on 208 SMs); `4096 -> 512` BF16, `4096 -> 4096` FP32: deterministic (measured, missed; `4096 -> 4096` FP32 against the deterministic package's 160-wide tiles of the row); `5120 -> 1024` BF16: deterministic (1.3 to 2.5 % faster here, missed on 208 SMs) | deterministic (4 splits) | 256 experts, hidden 5120 and 6144 at 16172 to 16384 tokens: `"H0.5x4"` (the head/tail program with the BF16 parts of `A` in tensor memory, `ROUTER_HEAD_TAIL_TEMPLATES_BY_SM`).  Every other token count, and hidden 4096: deterministic (6 splits): next to a resident kernel `"H0.5x4"` missed at hidden 4096 with both head/tail programs, and at hidden 6144 with the three-chunk-buffer program |
 
@@ -163,26 +163,26 @@ slower there: BF16 output at 1024 tokens on `sm_103a` `4096 -> 48`, `6144 -> 32`
 | `4096 -> 32` | -- | -- | 16231 |
 | `4096 -> 48` | 16231; 16384 | -- | 16231; 16384 |
 | `4096 -> 64` | 16231; 16384 | -- | 16231; 16384 |
-| `4096 -> 512` | 16231; 16384 | 16231; 16384 | 16231; 16384 |
-| `4096 -> 1024` | 16231 | 16231 | 16231 |
+| `4096 -> 512` | 16231; 16384 | 16231; 16384 | 16231; 16384; 40961 and up§ |
+| `4096 -> 1024` | 16231 | 16231 | 16231; 40961 and up§ |
 | `5120 -> 32` | -- | -- | -- |
 | `5120 -> 48` | 16231; 16384 | 16231 | 16231; 16384 |
 | `5120 -> 64` | 16231 | 16231 | 16231; 16384 |
-| `5120 -> 512` | -- | 16231; 16384 | -- |
-| `5120 -> 1024` | -- | -- | -- |
+| `5120 -> 512` | -- | 16231; 16384 | 40961 and up§ |
+| `5120 -> 1024` | -- | -- | 40961 and up§ |
 | `5120 -> 1024` BF16 | -- | -- | 16231 |
 
 *Table: the K1 token counts that run the deterministic program on `sm_107a` parts (`K1_SPLIT_RULE_EXCLUDED_TOKENS`;
-`--`: none).  They are token counts of the deterministic package's `sm_107a` rules for single token counts (16231 and
-16384 tokens; `4096 -> 1024` at 16231 only), which give the row a faster deterministic plan there; every other token
-count keeps the row's verdict.  On 212 SMs `4096 -> 4096` FP32 runs the deterministic program at every token count
-(`K1_SPLIT_RULES_BY_SM`): the deterministic package's rule for that row holds at every token count.  On 208, 212 and 216
-SMs the rows were measured at 16172, 16231 and 16384 tokens against those plans: 15 paired groups of 20 steps per row
-and token count with the L2 cache flushed before every launch, in a long-lived process per GPU and in a fresh process
-per row, in both arm orders, eager launches and CUDA graph replays, next to a kernel holding 8, 16 or 32 SMs in both
-launch orders, with the backward pass and the checkpointed step timed (9 paired groups); 212 SMs: eight parts in two
-nodes (`4096 -> 1024`: sixteen parts in five nodes), 208 SMs: two parts (`5120 -> 1024`: three), 216 SMs: two parts.  A
-measured token count runs the deterministic program where the row's program failed the K1 rule above in some run, or
+`--`: none).  Unmarked ones are token counts of the deterministic package's `sm_107a` rules for single token counts
+(16231 and 16384 tokens; `4096 -> 1024` at 16231 only), which give the row a faster deterministic plan there; every
+other token count keeps the row's verdict.  On 212 SMs `4096 -> 4096` FP32 runs the deterministic program at every token
+count (`K1_SPLIT_RULES_BY_SM`): the deterministic package's rule for that row holds at every token count.  On 208, 212
+and 216 SMs the rows were measured at 16172, 16231 and 16384 tokens against those plans: 15 paired groups of 20 steps
+per row and token count with the L2 cache flushed before every launch, in a long-lived process per GPU and in a fresh
+process per row, in both arm orders, eager launches and CUDA graph replays, next to a kernel holding 8, 16 or 32 SMs in
+both launch orders, with the backward pass and the checkpointed step timed (9 paired groups); 212 SMs: eight parts in
+two nodes (`4096 -> 1024`: sixteen parts in five nodes), 208 SMs: two parts (`5120 -> 1024`: three), 216 SMs: two parts.
+A measured token count runs the deterministic program where the row's program failed the K1 rule above in some run, or
 left the backward pass or the checkpointed step more than 1.3 % slower than the deterministic program (ratio of the
 medians over the runs, or median of the paired ratios, in eager launches or in graph replays).  `4096 -> 1024` on 212
 SMs and `5120 -> 1024` on 208 SMs were measured twice; the rule takes the runs of both measurements together.  On 216
@@ -190,7 +190,19 @@ SMs the 192-wide row-major program of `4096 -> 1024` FP32 (the 216-SM override) 
 the 256-wide tiles and the deterministic plan: faster than both at 16172 and 16384 tokens in every run, not faster than
 the deterministic package's 16231-token plan, which that token count keeps.  The 216-SM entry of `5120 -> 1024` BF16
 (16231 tokens) is not a token count of those rules: the deterministic plan there is the row's plan at every token count,
-and the row's program left the backward pass 1.5 % slower in eager launches (ratio of the medians over the runs).*
+and the row's program left the backward pass 1.5 % slower in eager launches (ratio of the medians over the runs).
+Marked §: entries of their own, not from the rules above.  On parts of at least 216 SMs these FP32 rows run the
+deterministic program from 40961 tokens up because their one-split program's FP64 relative Frobenius error exceeds the
+deterministic package's FP32 error budget (5e-5) on every seed there.  That program adds the whole token reduction of an
+output in one chain, and its error grows about linearly with the token count.  Measured with the 216-SM plan on 212-SM
+R200 parts (the same program and accumulation order as on 216 SMs; the error does not depend on the SM count) against an
+FP64 reference, each row on two parts, 5 seeds, at 32768, 36864, 40960, 45056, 49152, 57344, 65536 and 131072 tokens:
+within the budget on every seed up to 40960 tokens, above it on every seed from 45056 tokens up (7.6e-5 at 65536 tokens
+and 1.5e-4 at 131072; the deterministic program: 3.8e-5 and 7.6e-5).  The token counts between 40960 and 45056 run the
+deterministic program too (not measured), and the range has no upper bound: the error keeps growing with the token
+count.  The deterministic program is slower there: at 65536 tokens on a 212-SM part it takes 1.81 (`4096 -> 512`), 1.05
+(`4096 -> 1024`), 1.72 (`5120 -> 512`) and 1.02 (`5120 -> 1024`) times the one-split program's time (CUDA graph replays)
+and leaves the backward pass or the checkpointed step up to 51.7, 4.8, 41.5 and 3.9 % slower.*
 
 `"waves"` (`router_waves`) launches whole waves of the device's CTA pairs (`pairs = sm_count // 2`): `c * pairs`
 units with `c = max(2, round(tiles * k_iters / (68 * pairs))) + 1`, and only where the deterministic plan's six
