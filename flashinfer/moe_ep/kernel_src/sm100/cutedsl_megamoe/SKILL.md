@@ -79,6 +79,11 @@ and NCCL imports lazy in that module and preserve all existing FI device
 patches. `src/src/nccl_gin_layout.py` is a byte-identical donor helper. Preserve
 the documented token-back generation-race correction until upstream absorbs
 it; numerical and performance acceptance status lives in the design document.
+`internode=False` is the default master gate: off eager/graph calls must not
+enter GIN preflight or session creation, and must ignore GIN-only topology.
+This subset port adds no non-GIN
+features. Do not reintroduce the explicit `f4cvt_use_manual` option or `_f4man`
+tag into this GIN-only subset; keep FI's existing FP4 environment control intact.
 GIN graphs require collective eager warmup with the same shape bucket before
 capture. Keep resources live and streams ordered; metadata/mode errors are
 agreed over CPU control during capture, while replay runs no host checks.

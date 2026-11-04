@@ -24,6 +24,16 @@
 会被拒绝。on 模式不会推断 `ranks_per_node`，省略或保留 `None` 会被拒绝；
 off 模式不使用该参数。本 PR 没有改变 next provider 的实现或默认选择策略。
 
+`internode` 是本次port的总开关，默认关闭，在创建配置/layer时选择。
+`False` 走FI原有intranode路径，忽略GIN专用的`ranks_per_node`，
+不进入GIN预检、协商或session创建；
+`True` 才进入新增GIN路径，并要求relay和NCCL GIN同时启用。
+不在已存活的session/Graph上原地切换开关。
+
+本次只移植GIN功能：撤回新增但未接线的`f4cvt_use_manual`显式参数、diagnostic字段
+和`_f4man`命名token。非GIN的FP4 decoder继续由既有`MEGA_F4CVT_USE_MANUAL`
+环境变量控制，其转换/归约算法保持FI基线；GIN仍仅使用BF16 reduce。
+
 ### 1.1 当前开放范围
 
 | 项目 | 必须满足的配置 |
@@ -251,23 +261,32 @@ activation、singleton TMA 以及 BF16/MXFP8 兼容行为保留。VENDOR 列出�
 | Host contracts | 22 项：arena/wire、LSA offsets、集体错误、控制组复用/PG 重建、构建清理与清理失败升级 |
 | 固定 N2R2 强 oracle | 每 rank 24 次 exact protocol 调用，全作业合计 96 项 transport/L1 byte 检查；包含 partial/empty rank、sparse holes 与 NaN invalid scores |
 | 独立 math | 原容差不变；最大 relative L2 为 `0.0026485608`，阈值 `0.02` |
-| 公共/强测试 | 每 rank 38 项通过，无 skips；包含原24项Graph/oracle/lifetime检查与新增14项bucket、初始化capture、分配失败清理/重建检查 |
-| NCCL-only 默认组 | 每 rank 19 项通过，包含新增14项错误路径；确认只在capture外创建一次CPU/Gloo控制组并复用 |
-| 当前 off 兼容性 | 每 rank 6 项通过：4 项 finalizer、1 项 workspace/cache/graph、1 项 legacy public graph replay |
+| 公共/强测试 | 每 rank 40 项通过，无 skips；包含原38项及relay配置限制、缓存非空时新权重绑定的capture-ready拒绝/恢复 |
+| NCCL-only 默认组 | 每 rank 21 项通过，包含新增review用例；确认只在capture外创建一次CPU/Gloo控制组并复用 |
+| 当前 off 兼容性 | 每 rank 10 项通过：原6项、2项FP4环境变量数值/PTX检查、2项禁用GIN入口的off eager/Graph隔离检查（默认及残留GIN拓扑参数） |
 
-当前错误协议修复source为`6a32476ae`，job`3594770`在GB200 `lyris0144/0238`
-上COMPLETED，exit0：先独立通过14项新增错误路径/rank，再通过上表38+19+6项/rank。
+当前source为`a0ff9eb5e`。GB200任务`3595270`（N2R2，`lyris0120/0129`）
+COMPLETED，exit0：先通过2项新review用例/rank，再通过40项strong/public及21项NCCL-only/rank。
+任务`3595271`（N1R4，`lyris0131`）COMPLETED，exit0：10项off检查/rank通过。
+两次运行源码相同，100个Python文件哈希与最终runtime一致。默认off测试将GIN预检和session
+入口替换为调用即失败，仍完成eager/Graph；原FP4环境变量两种分支均通过16种code的bitwise
+归约和PTX指令检查。非GIN reducer的5个核心方法AST与固定FI基线一致。
+本轮原始文件只调整GIN构造限制及撤回无效接口，未改非GIN转换/归约算法；不新增性能结论。
+
+此前错误协议修复source为`6a32476ae`，job`3594770`在GB200 `lyris0144/0238`
+上COMPLETED，exit0：先独立通过14项新增错误路径/rank，再通过当时38+19+6项/rank。
 分配失败通过单rank注入`torch.OutOfMemoryError`模拟，没有实际耗尽显存；检查view、routes、
 output和最后epilogue四处失败后的window/device-comm/comm/root/views清理与session重建。
 清理失败的全rank致命升级由CPU contract覆盖，不注入破坏性NCCL设备故障。
-99个Python源码哈希与该次运行一致，device文件未变；本轮不重跑性能，5节保留各历史source/范围。
+该次99个Python源码哈希与运行一致，未改device文件；5节保留各历史source/计时范围。
 
 此前 Graph runtime source 为 `3bb3a307b`，job `3578913` 在两台 GB200/SM100
 上 COMPLETED，exit0（CUDA13.3、Torch2.13dev、DSL4.6.2、NCCL2.30.7、driver580.196）。
 每种 Graph case 比较三份 Graph、12组变化输入，共36次 replay/rank；覆盖实际
 capture stream、输出污染、上游 clone 和下游 GPU 运算，profiler 断言 mega/reducer
 各一次。预初始化后的裸 compiled-call 实验 `3578784` 也通过每 rank16次 replay；
-它使用旧接收 worktree，其17个 device 文件与本 PR 一致，不代表原生 donor 的验收。
+它使用旧接收worktree，其17个device文件与当时接收版本`8cea9b3d2`一致；
+不代表原生donor验收，也不表示与当前构造/接口调整后的源码逐字一致。
 
 后续 `19bd994fd`/`613421079` 仅增强测试：再连续排队12次 replay，并在每次
 replay 前污染 staged activation/SF/routes/weights 和输出，排除复用 eager 遗留输入的
