@@ -56,8 +56,8 @@ Every entry point takes the keyword-only argument ``deterministic: bool = True``
   Every other operation -- the K1 forward and input gradient, the BF16x3 split -- runs the deterministic programs in
   both modes: it has no cross-CTA reduction to relax.  On the convenience path a call of ``deterministic=False`` that
   runs a deterministic program (the K1 forward and input gradient, a K2 row without a verdict) launches it through a
-  binding of this package (the deterministic package's plan, programs and reduction: the same bits, fewer host
-  operations per call).
+  binding of this package (the deterministic package's plan and programs, and the reduction of its split-K partials in
+  the deterministic package's order by this package's program: the same bits, fewer host operations per call).
 * With ``torch.use_deterministic_algorithms(True)`` an explicit ``deterministic=False`` raises ``RuntimeError``; with
   ``warn_only=True`` it warns and runs the deterministic path (:func:`_resolve_deterministic`).  The default does not
   consult the PyTorch setting: it is deterministic already.
@@ -2617,9 +2617,10 @@ def _atomic_k2(
 # (:func:`_k2_row_without_verdict`, kept per device and view geometry until a router table changes,
 # :func:`_router_memo`; not planned here), a forward without a split count while no router table gives the forward a
 # verdict, the input gradient outside its SIMT windows -- runs it through a binding of this package
-# (:func:`_launch_cached_splitk_k2`, cache ``_K2_SPLITK_CACHE``): the deterministic package's plan, programs and
-# ``torch.sum`` of the split-K partials, so its bits, with this package's arena for the stack and the partials.  A K2
-# entry binds its argument lists once
+# (:func:`_launch_cached_splitk_k2`, cache ``_K2_SPLITK_CACHE``): the deterministic package's plan and programs, and
+# the split-K partials reduced in the order of that package's ``torch.sum`` (by this package's partial sum where it
+# serves the launch, :func:`_partials_sum_serves`), so its bits, with this package's arena for the stack and the
+# partials.  A K2 entry binds its argument lists once
 # (:class:`_K2Binding`: the plan's values in the program's order, the arena's BF16x3 stack -- and the deterministic
 # program's partials -- carved and converted once per arena growth), so a call passes only the caller's views (an
 # entry point's own tensors when they are the launch views, :func:`_launch_views`; torch tensors, each converted in
@@ -2641,7 +2642,7 @@ _ATOMIC_ARENA_KINDS: dict[str, tuple[torch.dtype, bool]] = {
     # K2 fp32 scratch of the torch-chain split
     "k2_split_scratch": (torch.float32, False),
     # the split-K partials ``[splits, rows, cols]`` of the deterministic K2 program (:func:`_launch_cached_splitk_k2`),
-    # written by the program and reduced by ``torch.sum`` right after it on the same stream
+    # written by the program and reduced right after it on the same stream (:func:`_launch_splitk_k2_binding`)
     "k2_splitk_partials": (torch.float32, False),
     # the stream-K partial slabs of the deterministic K1 program (:func:`_plan_det_k1`; no state between launches)
     "k1_det_ws": (torch.float32, False),
@@ -2725,6 +2726,66 @@ _K2_PARTS_ARG = _Arg("parts")
 #: The split-K partials of the deterministic K2 program, bound with the stack (:meth:`_K2Binding.carve`).
 _K2_PARTIALS_ARG = _Arg("partials")
 
+#: The template of this package's partial sum: ``out[r, c] = sum_s partials[s, r, c]`` over the deterministic K2
+#: program's split-K partials ``[splits, rows, cols]`` (contiguous) into an FP32 ``out [rows, cols]`` with unit inner
+#: stride and row stride ``ldo``, in one fixed order: four FP32 accumulators start at ``+0``, partial ``s`` is added to
+#: accumulator ``s % 4`` in ascending ``s``, and the result is ``((a0 + a1) + a2) + a3`` (each add one
+#: round-to-nearest FP32 add; for at most four splits ``((w0 + w1) + w2) + w3`` and then ``+ 0.0``).  This is the order
+#: of the deterministic package's ``torch.sum(partials, 0, out=out)`` on these launches: PyTorch's CUDA reduction over
+#: the outer dimension of a contiguous tensor gives each thread whole outputs and adds their values into four
+#: accumulators combined left to right, and spreads one output's values over several threads only from sixteen values
+#: per thread on.  Both agree bit for bit -- signed zeros, NaN, infinities, subnormals and overflow included -- and the
+#: sum is one more launch in the bound launch chain instead of a PyTorch operator.  The tests check the program against
+#: ``torch.sum`` and against the written order on every split count it serves.
+PARTIALS_SUM_TEMPLATE = cake_jit.TEMPLATE_PREFIXES[5]
+#: The split counts the partial sum serves (its kernel requires two to eight; the deterministic router planner issues
+#: four for the forward and six for the weight gradient).
+PARTIALS_SUM_SPLITS = range(2, 9)
+#: Threads per CTA of the partial sum and the ``out`` columns each thread sums (a flat grid over the rows' column
+#: quads).
+_PARTIALS_SUM_THREADS, _PARTIALS_SUM_COLUMNS = 256, 4
+
+
+def _partials_sum_serves(partials_shape: tuple[int, ...], out: torch.Tensor) -> bool:
+    """Whether this package's partial sum reduces the deterministic K2 program's split-K partials ``partials_shape``
+    (``[splits, rows, cols]``) into ``out``: a split count of :data:`PARTIALS_SUM_SPLITS`, two outputs or more (a
+    single output is a full reduction, which PyTorch orders otherwise) and ``out`` an FP32 ``[rows, cols]`` view with
+    unit inner stride and a row stride of ``cols`` or more.  Any other launch keeps the deterministic package's
+    ``torch.sum``: the choice is made when the launch is planned, and a failing launch raises its error."""
+    splits, rows, cols = (int(d) for d in partials_shape)
+    return (
+        splits in PARTIALS_SUM_SPLITS
+        and rows * cols >= 2
+        and out.dtype == torch.float32
+        and tuple(out.shape) == (rows, cols)
+        and out.stride(1) == 1
+        and out.stride(0) >= cols
+    )
+
+
+def _partials_sum_binding(
+    arch: str, partials_shape: tuple[int, ...], out: torch.Tensor, pdl: int
+) -> tuple[Callable[..., Any], list]:
+    """``(entry, argument template)`` of the partial sum of a deterministic K2 launch whose partials are
+    ``partials_shape`` (:func:`_partials_sum_serves`): this package's program of :data:`PARTIALS_SUM_TEMPLATE` on
+    ``arch`` with the PDL flag ``pdl`` (it waits for the program that writes the partials before its first load), the
+    partials as :data:`_K2_PARTIALS_ARG` (bound with the stack) and ``out`` per call (the slot of ``out32``)."""
+    splits, rows, cols = (int(d) for d in partials_shape)
+    module_name = cake_jit.select_module(arch, PARTIALS_SUM_TEMPLATE)
+    quads = -(-cols // _PARTIALS_SUM_COLUMNS)
+    grid = (-(-(rows * quads) // _PARTIALS_SUM_THREADS), 1, 1)
+    values = dict(
+        ws=_K2_PARTIALS_ARG,
+        out=_K2_CALL_ARGS[1],
+        splits=splits,
+        rows=rows,
+        cols=cols,
+        ldo=int(out.stride(0)),
+        enable_pdl=int(pdl),
+    )
+    entry, arg_plan = _atomic_entry(module_name, grid, arch)
+    return entry, _order_atomic_arguments(module_name, arg_plan, values, grid)
+
 
 def _arg_slots(template: list) -> tuple[tuple[int, int], ...]:
     """``(position, index into _K2_CALL_ARGS)`` of every per-call argument of a bound template."""
@@ -2741,7 +2802,9 @@ class _K2Binding:
     (``partials_shape``, carved as ``workspace``) -- carved and converted once per arena growth (``version``) and the
     caller's views left as ``slots``; the geometry of the zero fill of ``out`` (rows, columns, row pitch in bytes;
     ``None`` without part tiles).  Without ``stack`` (the SIMT program, which reads the fp32 operands in place) the
-    kernel's list is bound with no stack and no split."""
+    kernel's list is bound with no stack and no split.  ``sum_template`` is the argument list of the partial sum that
+    reduces the partials into ``out`` (:func:`_partials_sum_binding`; ``None``: ``torch.sum`` does), bound with the
+    partials."""
 
     kernel_template: list
     split_template: Optional[list]
@@ -2758,6 +2821,9 @@ class _K2Binding:
     kernel_slots: tuple[tuple[int, int], ...] = ()
     split_args: list = field(default_factory=list)
     split_slots: tuple[tuple[int, int], ...] = ()
+    sum_template: Optional[list] = None
+    sum_args: list = field(default_factory=list)
+    sum_slots: tuple[tuple[int, int], ...] = ()
 
     def carve(self, arena: "_AtomicArena", torch_chain: bool) -> None:
         """Carve the BF16x3 stack (and the torch chain's fp32 scratch) out of ``arena`` and bind the stack into the
@@ -2785,6 +2851,11 @@ class _K2Binding:
             )
             partials = tvm_ffi.from_dlpack(self.workspace, require_contiguous=False)
             args = [partials if a is _K2_PARTIALS_ARG else a for a in args]
+            if self.sum_template is not None:
+                self.sum_args = [
+                    partials if a is _K2_PARTIALS_ARG else a for a in self.sum_template
+                ]
+                self.sum_slots = _arg_slots(self.sum_args)
         self.kernel_args = args
         self.kernel_slots = _arg_slots(self.kernel_args)
         if self.split_template is not None:
@@ -2806,6 +2877,14 @@ class _K2Binding:
         for i, k in self.split_slots:
             split[i] = views[k]
         return kernel, split
+
+    def sum_arguments(self, views: tuple) -> list:
+        """The partial sum's argument list of one call: the bound list with the call's ``out`` (the ``out32`` view of
+        ``views``) in place."""
+        partial_sum = self.sum_args.copy()
+        for i, k in self.sum_slots:
+            partial_sum[i] = views[k]
+        return partial_sum
 
 
 #: How a per-call view of a bound K1 launch is rebuilt from the call's tensor (:class:`_K1Binding`): the tensor
@@ -3669,14 +3748,16 @@ _K2_SPLITK_CACHE: "OrderedDict[tuple, Any]" = OrderedDict()
 @dataclass
 class _CachedSplitK2:
     """A planned launch of the deterministic K2 program on this package's convenience path: the deterministic
-    package's plan, its program's and fused split's entries, the arena of the (device, stream) and the bound
-    arguments (``k2``; ``None``: the call goes to the deterministic package's convenience path)."""
+    package's plan, its program's and fused split's entries, the arena of the (device, stream), the bound arguments
+    (``k2``; ``None``: the call goes to the deterministic package's convenience path) and the entry of the partial sum
+    (``sum_entry``; ``None``: one split, or ``torch.sum`` reduces the partials)."""
 
     plan: Any
     entry: Optional[Callable[..., Any]] = field(default=None, repr=False)
     arena: Optional[_AtomicArena] = field(default=None, repr=False)
     k2: Optional[_K2Binding] = field(default=None, repr=False)
     split_entry: Optional[Callable[..., Any]] = field(default=None, repr=False)
+    sum_entry: Optional[Callable[..., Any]] = field(default=None, repr=False)
 
 
 def _plan_splitk_k2(
@@ -3691,7 +3772,8 @@ def _plan_splitk_k2(
     """Plan the deterministic K2 program for a key of :func:`_launch_cached_splitk_k2` (under ``_ATOMIC_PLAN_LOCK``):
     the deterministic package's planner and fail-closed view check (its errors), its program and fused split bound in
     the deterministic package's argument order with the PDL flag ``pdl`` (0 or 1), the BF16x3 stack, the torch
-    chain's scratch and the split-K partials in this package's arena.  The views :func:`_k2_views` rebuilds per call must be the deterministic package's (else
+    chain's scratch and the split-K partials in this package's arena, and the partial sum of several splits where it
+    serves the launch (:func:`_partials_sum_serves`, :func:`_partials_sum_binding`).  The views :func:`_k2_views` rebuilds per call must be the deterministic package's (else
     the entry calls that package's convenience path)."""
     det = deterministic_backend()
     device = out.device
@@ -3736,8 +3818,12 @@ def _plan_splitk_k2(
     arena.require("k2_stack", 3 * n)
     if split_module is None:
         arena.require("k2_split_scratch", n)
+    sum_fn: Optional[Callable[..., Any]] = None
+    sum_template: Optional[list] = None
     if partials_shape is not None:
         arena.require("k2_splitk_partials", math.prod(partials_shape))
+        if _partials_sum_serves(partials_shape, out):
+            sum_fn, sum_template = _partials_sum_binding(arch, partials_shape, out, pdl)
     binding = _K2Binding(
         kernel_template=list(template),
         split_template=None if split_template is None else list(split_template),
@@ -3745,9 +3831,15 @@ def _plan_splitk_k2(
         fill=None,
         out_contiguous=out.is_contiguous(),
         partials_shape=partials_shape,
+        sum_template=sum_template,
     )
     return _CachedSplitK2(
-        plan=plan, entry=fn, arena=arena, k2=binding, split_entry=split_fn
+        plan=plan,
+        entry=fn,
+        arena=arena,
+        k2=binding,
+        split_entry=split_fn,
+        sum_entry=sum_fn,
     )
 
 
@@ -3761,8 +3853,8 @@ def _launch_cached_splitk_k2(
     pdl: int,
     views: Optional[tuple] = None,
 ) -> torch.Tensor:
-    """The deterministic package's K2 GEMM ``out = A @ B`` (its plan, programs and fixed-order ``torch.sum`` of the
-    split-K partials: its bits) on this package's convenience path: planned once per key (:func:`_plan_splitk_k2`), then
+    """The deterministic package's K2 GEMM ``out = A @ B`` (its plan and programs, and the split-K partials summed in
+    the order of its ``torch.sum``: its bits) on this package's convenience path: planned once per key (:func:`_plan_splitk_k2`), then
     the bound launch (:func:`_launch_splitk_k2_binding`) -- the caller's views passed per call, the stack and the
     partials converted once per arena growth (:class:`_K2Binding`).  The split, the program and the reduction share
     the arena and hold its lock, as the deterministic package's convenience path does.  ``index`` / ``geometry`` are
@@ -3802,30 +3894,33 @@ def _launch_splitk_k2_binding(
     stream: int,
 ) -> None:
     """Launch a bound deterministic K2 program (:func:`_plan_splitk_k2`) into ``out`` on the raw ``stream`` of device
-    ``index`` with the call's launch views ``a_view`` / ``split_src``: the split, the program and the deterministic
-    package's fixed-order ``torch.sum`` of the split-K partials under the arena's lock, the stack and the partials
-    carved again if the arena grew.  The call's views go to the FFI calls as torch tensors (each converted there,
-    once)."""
+    ``index`` with the call's launch views ``a_view`` / ``split_src``: the split, the program and the reduction of
+    its split-K partials under the arena's lock, the stack and the partials carved again if the arena grew.  The
+    partials are reduced by this package's partial sum right after the program, in the same launch chain, where it
+    serves the launch (``entry.sum_entry``), else by the deterministic package's ``torch.sum``: the same order, so the
+    same bits.  The call's views go to the FFI calls as torch tensors (each converted there, once)."""
     bound, fn, arena = entry.k2, entry.entry, entry.arena
     assert bound is not None and fn is not None and arena is not None
-    split_fn = entry.split_entry
+    split_fn, sum_fn = entry.split_entry, entry.sum_entry
     with arena.lock:
         if bound.version != arena.version:
             bound.carve(arena, split_fn is None)
         if split_fn is None:
             det.split_fp32_to_bf16x3_det_(split_src, bound.parts, bound.resid)
         out32: Any = None
-        if bound.partials_shape is None:  # one split: the program stores into ``out``
+        if bound.partials_shape is None or sum_fn is not None:
+            # one split: the program stores into ``out``; several: the partial sum does
             out32 = out if bound.out_contiguous else det.flat_alias(out)
-        arguments, split_arguments = bound.arguments(
-            (a_view, out32, None, None if split_fn is None else split_src)
-        )
+        views = (a_view, out32, None, None if split_fn is None else split_src)
+        arguments, split_arguments = bound.arguments(views)
         with _k2_stream_context(det, arena, index, stream):
             if split_fn is not None and split_arguments is not None:
                 split_fn(*split_arguments)
             fn(*arguments)
-        if bound.workspace is not None:
-            # the deterministic package's fixed-order reduction of the partials (its overload and kernel)
+            if sum_fn is not None:
+                sum_fn(*bound.sum_arguments(views))
+        if sum_fn is None and bound.workspace is not None:
+            # the deterministic package's reduction of the partials (its overload and kernel)
             torch.sum(bound.workspace, 0, out=out)
 
 
