@@ -392,17 +392,19 @@ def _run(
     b3 = b_nk.as_strided(
         (N, Kc, C), (b_nk.stride(0), b_nk.stride(1), Kc * b_nk.stride(1))
     )
+    # the output may not overlap what the chain reads while it writes the output: the scales and the bias, read by the
+    # epilogue of a direct store and by the fixup of the workspace split alike
+    for t, what in (
+        *((sc, "a scale") for sc in scales),
+        *(((bias, "the bias"),) if bias is not None else ()),
+    ):
+        if _overlaps(out, t):
+            raise unsupported(
+                cls,
+                f"the output overlapping {what}",
+                "an output disjoint from the scales and the bias (they are read while the output is written)",
+            )
     if direct:
-        for t, what in (
-            *((sc, "a scale") for sc in scales),
-            *(((bias, "the bias"),) if bias is not None else ()),
-        ):
-            if _overlaps(out, t):
-                raise unsupported(
-                    cls,
-                    f"the output overlapping {what}",
-                    "an output disjoint from the scales and the bias (they are read while the output is written)",
-                )
         c3 = out.as_strided((M, N, 1), (out.stride(0), 1, N))
         kernel(a3, b3, c3, *extra)  # the chain in the epilogue
         return out
