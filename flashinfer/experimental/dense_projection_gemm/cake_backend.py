@@ -478,12 +478,14 @@ K1_SPLIT_RULE_EXCLUDED_TOKENS: dict[
 #: 25 % either way between the two programs at the same relative Frobenius error; there the split program fails where
 #: the median over a row's measured token counts and seeds (10 seeds per token count) of its ratio to the deterministic
 #: program's exceeds 1.02, or where one seed's ratio exceeds 1.30.  A token count between two consecutive measured
-#: entries is an entry too.  Entries without an upper bound: sm_103a ``4096 -> 32`` (BF16 and FP32) and sm_100a
-#: ``4096 -> 64`` FP32 from 65536 tokens up: above 65536 tokens the split program's output differs from the
-#: deterministic program's where the token count spans an odd number of 64-token blocks (65537, 65538, 65600 and 65665
-#: tokens: an FP32 relative Frobenius error 2.1 to 2.3 % above on every seed, a BF16 budget ratio 1.305 times the
-#: deterministic program's for one seed) and is the deterministic program's bits where it spans an even number (65601,
-#: 98304 and 131072 tokens).  Unmeasured token counts keep the verdict.
+#: entries is an entry too.  Entries without an upper bound: sm_103a ``4096 -> 32`` and sm_100a ``4096 -> 64`` (BF16
+#: and FP32) from 65536 tokens up: above 65536 tokens the split program's output differs from the deterministic
+#: program's where the token count spans an odd number of 64-token blocks (65537, 65538, 65600 and 65665 tokens: an FP32
+#: relative Frobenius error 2.1 to 2.3 % above on every seed, a BF16 budget ratio 1.305 times the deterministic
+#: program's for one seed; sm_100a BF16 at 12 odd counts from 65600 to 98240 tokens, 10 seeds each: up to 1.65 times)
+#: and is the deterministic program's bits where it spans an even number (65601 to 131072 tokens), where it does not
+#: make the backward pass or the checkpointed step 1 % faster (sm_100a: the backward pass up to 3.5 % slower).
+#: Unmeasured token counts keep the verdict.
 # fmt: off
 K1_SPLIT_RULE_EXCLUDED_TOKENS_BY_SM: dict[
     tuple[str, int],
@@ -492,7 +494,7 @@ K1_SPLIT_RULE_EXCLUDED_TOKENS_BY_SM: dict[
     ("sm_100a", 148): {
         ("sm_100a", 1, 4096, 48, "bf16"): ((512, 512),),
         ("sm_100a", 1, 4096, 48, "f32"): ((512, 512),),
-        ("sm_100a", 1, 4096, 64, "bf16"): ((512, 512), (65536, 65536)),
+        ("sm_100a", 1, 4096, 64, "bf16"): ((512, 512), (65536, None)),
         ("sm_100a", 1, 4096, 64, "f32"): ((512, 512), (65536, None)),
         ("sm_100a", 1, 5120, 48, "bf16"): ((512, 2048),),
         ("sm_100a", 1, 5120, 48, "f32"): ((512, 512),),

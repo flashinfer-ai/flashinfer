@@ -196,7 +196,7 @@ kernel_cake_gdn_train_68f80b7d8e094ebad01b_kcp(const __grid_constant__ CUtensorM
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     __nv_bfloat16* w_panel = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
     const int w_panel_addr = smem + 1024;
     __nv_bfloat16* k_panel = reinterpret_cast<__nv_bfloat16*>(smem_raw + 33792);
@@ -224,8 +224,7 @@ kernel_cake_gdn_train_68f80b7d8e094ebad01b_kcp(const __grid_constant__ CUtensorM
     __nv_bfloat16* aqk_op = reinterpret_cast<__nv_bfloat16*>(smem_raw + 107520);
     const int aqk_op_addr = smem + 107520;
 
-    // Mbarrier init (12 pipeline groups, 0 ordered-sequence groups, 14 barriers)
-    // Mbarriers at smem_raw[0..112)
+    // Mbarrier init (14 barriers at smem_raw[0..112))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -276,13 +275,11 @@ kernel_cake_gdn_train_68f80b7d8e094ebad01b_kcp(const __grid_constant__ CUtensorM
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
-
-    // Kernel post-init ops
-    const int tmem_acc_h = taddr;
-    const int tmem_acc_vp = taddr + 64;
-    const int tmem_acc_qh = taddr + 128;
-    const int tmem_acc_av = taddr + 192;
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_acc_h = taddr;
+    const unsigned int tmem_acc_vp = taddr + 64;
+    const unsigned int tmem_acc_qh = taddr + 128;
+    const unsigned int tmem_acc_av = taddr + 192;
 
     // ---- Role: compute ----
     if (warp <= 3) {

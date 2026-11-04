@@ -1353,7 +1353,7 @@ def test_k1_212_sm_range_overrides():
 K1_148_EXCLUDED_TOKENS = {
     ("sm_100a", 4096, 48, "bf16"): ((512, 512),),
     ("sm_100a", 4096, 48, "f32"): ((512, 512),),
-    ("sm_100a", 4096, 64, "bf16"): ((512, 512), (65536, 65536)),
+    ("sm_100a", 4096, 64, "bf16"): ((512, 512), (65536, None)),
     ("sm_100a", 4096, 64, "f32"): ((512, 512), (65536, None)),
     ("sm_100a", 5120, 48, "bf16"): ((512, 2048),),
     ("sm_100a", 5120, 48, "f32"): ((512, 512),),
@@ -1442,6 +1442,21 @@ def test_k1_exact_sm_count_exclusions(monkeypatch):
                 assert hi is None or hi in K1_148_MEASURED_TOKENS, key
                 assert without[(key, 148, lo)] is not None, key
                 assert with_table[(key, 148, lo)] is None, key
+
+
+def test_k1_148_comb_rows_run_det_from_65536():
+    """The 148-SM rows ``4096 -> 64`` (``sm_100a``) and ``4096 -> 32`` (``sm_103a``), BF16 and FP32, run the
+    deterministic program from 65536 tokens up, at odd (65537, 65600, 67520) and even (65601, 67584, 98304, 131072)
+    numbers of 64-token blocks, the split program one token below; parts of 152 SMs keep the split program above
+    65536 tokens."""
+    for arch, N in (("sm_100a", 64), ("sm_103a", 32)):
+        for f32 in (False, True):
+            kw = dict(arch=arch, L=1, M=4096, N=N, out_f32=f32)
+            assert cake_backend.k1_plan(K=65535, sm_count=148, **kw) == (64, 2)
+            for T in (65536, 65537, 65600, 65601, 67520, 67584, 98304, 131072):
+                assert cake_backend.k1_plan(K=T, sm_count=148, **kw) is None, (kw, T)
+            for T in (67520, 67584):
+                assert cake_backend.k1_plan(K=T, sm_count=152, **kw) == (64, 2), (kw, T)
 
 
 #: The 216-SM entries of :data:`K1_SPLIT_RULE_EXCLUDED_TOKENS` at single measured token counts outside 16172 to 16384
@@ -7025,9 +7040,9 @@ def _k1_token_range_edges(arch, sm_count):
 
 def _k1_exact_sm_count_edges(arch, sm_count):
     """``(key, choice, T, want)`` for every row of the part's table in :data:`K1_SPLIT_RULE_EXCLUDED_TOKENS_BY_SM`
-    (exactly ``sm_count``): the first and the last token count of each range (65537 for a range without an upper bound;
-    ``want`` ``None``: the deterministic program) and one token outside it (``want``: the row's :data:`K1_SPLIT_RULES`
-    verdict); ``choice`` is the planner's."""
+    (exactly ``sm_count``): the first and the last token count of each range (65537, 67520 and 67584 -- an odd and an
+    even number of 64-token blocks -- for a range without an upper bound; ``want`` ``None``: the deterministic program)
+    and one token outside it (``want``: the row's :data:`K1_SPLIT_RULES` verdict); ``choice`` is the planner's."""
     rows = cake_backend.K1_SPLIT_RULE_EXCLUDED_TOKENS_BY_SM.get((arch, sm_count), {})
     cases = []
     for key, spans in sorted(rows.items()):
@@ -7037,7 +7052,7 @@ def _k1_exact_sm_count_edges(arch, sm_count):
             lo <= T and (hi is None or hi >= T) for lo, hi in spans
         )
         for lo, hi in spans:
-            ends = {lo, 65537 if hi is None else hi}
+            ends = {lo} | ({65537, 67520, 67584} if hi is None else {hi})
             for T in sorted(ends | {lo - 1} | (set() if hi is None else {hi + 1})):
                 plan = cake_backend.k1_plan(
                     arch=arch,

@@ -8993,6 +8993,49 @@ def _argument_plan(name: str) -> tuple[tuple[str | None, int], ...]:
     return tuple(plan)
 
 
+@functools.cache
+def _ffi_entry(name: str, device_index: int) -> Any:
+    """The FFI entry of record ``name`` loaded for CUDA device
+    ``device_index``'s architecture (:func:`load`), looked up once."""
+    module = load(name, device_arch(device_index))
+    return getattr(module, MODULES[name]["ffi_entry"])
+
+
+@functools.cache
+def _raw_stream_getter() -> Any:
+    """``torch._C._cuda_getCurrentRawStream``: the handle of a device's
+    current torch stream as an integer, without constructing a ``Stream``
+    object; or the ``torch.cuda`` form on a torch build without it."""
+    import torch
+
+    getter = getattr(torch._C, "_cuda_getCurrentRawStream", None)
+    if getter is not None:
+        return getter
+
+    def fallback(device_index: int) -> int:
+        return torch.cuda.current_stream(device_index).cuda_stream
+
+    return fallback
+
+
+_FFI_DEVICES: dict[int, Any] = {}
+
+
+def _stream_context() -> Any:
+    """The tvm-ffi environment-stream context of torch's current stream on
+    the current CUDA device (a CUDA graph's capture stream during capture),
+    the stream ``tvm_ffi.use_torch_stream()`` enters, without building a
+    ``torch.cuda.Stream`` and parsing a device string on every launch (the
+    FFI device is kept per index)."""
+    import torch
+
+    index = torch.cuda.current_device()
+    device = _FFI_DEVICES.get(index)
+    if device is None:
+        device = _FFI_DEVICES[index] = tvm_ffi.device(f"cuda:{index}")
+    return tvm_ffi.use_raw_stream(device, _raw_stream_getter()(index))
+
+
 def run_module(
     name: str,
     values: dict[str, Any],
@@ -9007,7 +9050,6 @@ def run_module(
     vocabulary and ``grid`` is the plan's launch grid (:func:`launch_grid`).
     The kernel runs on the current torch stream of the device.
     """
-    record = MODULES[name]
     args = []
     for logical_name, axis in _argument_plan(name):
         if logical_name is None:
@@ -9019,9 +9061,9 @@ def run_module(
                 raise ValueError(
                     f"record {name} needs logical argument {logical_name!r}"
                 ) from None
-    module = load(name, device_arch(device_index))
-    with tvm_ffi.use_torch_stream():
-        getattr(module, record["ffi_entry"])(*args)
+    entry = _ffi_entry(name, device_index)
+    with _stream_context():
+        entry(*args)
 
 
 __all__ = [
