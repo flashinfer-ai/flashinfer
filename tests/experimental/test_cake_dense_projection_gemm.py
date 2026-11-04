@@ -3501,9 +3501,10 @@ def test_k1_convenience_calls_cache_their_bindings(monkeypatch):
 
 def test_k1_entry_points_go_from_their_key_to_the_bound_launch(monkeypatch):
     """Once a key is bound, the K1 entry points with ``deterministic=False`` launch it straight from the key
-    (``_k1_cached_launch``): neither ``_det_k1`` nor ``_atomic_k1`` runs, and the launch gets the arguments the first
-    call's did. An ``out`` of the same geometry is the same key and launches into itself; another geometry is another
-    key and takes the planning path. Each thread makes the stream context of a (device, stream) once and reuses it."""
+    (``_k1_cached_launch``): neither ``_det_k1`` nor ``_atomic_k1`` runs, and the launch gets the arguments their
+    launch of the key gets. An ``out`` of the same geometry is the same key and launches into itself; another geometry
+    is another key and takes the planning path. Each thread makes the stream context of a (device, stream) once and
+    reuses it."""
     entry_fn = _cpu_k1_launches(monkeypatch, "sm_103a")
     monkeypatch.setattr(cake_backend, "_k1_index", lambda *views: 0)
     made = []
@@ -3540,18 +3541,24 @@ def test_k1_entry_points_go_from_their_key_to_the_bound_launch(monkeypatch):
             for a in args
         ]
 
+    # the first round plans and grows the arena; the second takes the planning path's cached launches
     calls()
-    first = [spelled(args) for args, _ in entry_fn.calls]
-    assert len(first) == 3 and len(made) == 1
+    cached_launch = cake_backend._k1_cached_launch
+    monkeypatch.setattr(cake_backend, "_k1_cached_launch", lambda *args: False)
+    entry_fn.calls.clear()
+    calls()
+    planned = [spelled(args) for args, _ in entry_fn.calls]
+    assert len(planned) == 3 and len(made) == 1
 
     def planning_path(*args, **kwargs):
         raise AssertionError("planning path")
 
+    monkeypatch.setattr(cake_backend, "_k1_cached_launch", cached_launch)
     monkeypatch.setattr(cake_backend, "_det_k1", planning_path)
     monkeypatch.setattr(cake_backend, "_atomic_k1", planning_path)
     entry_fn.calls.clear()
     calls()
-    assert [spelled(args) for args, _ in entry_fn.calls] == first
+    assert [spelled(args) for args, _ in entry_fn.calls] == planned
     assert len(made) == 1
     other = torch.empty_like(out_f)
     assert cake_backend.projection_forward(X, W, other, deterministic=False) is other
