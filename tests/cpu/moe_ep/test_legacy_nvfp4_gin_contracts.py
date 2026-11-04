@@ -4,8 +4,9 @@
 
 Can run without the GPU package via unittest discovery. Loading the two leaf
 modules is deliberate: it tests their no-Torch/no-NCCL import contract without
-changing normal pytest collection or replacing any GPU dependency with a stub.
-The normal repository conftest still requires a full FlashInfer environment.
+changing normal pytest collection. Resource failure tests use host doubles for
+CUDA/NCCL; they do not validate device execution. The normal repository
+conftest still requires a full FlashInfer environment.
 """
 
 import importlib.util
@@ -381,6 +382,168 @@ class ConstructionTests(unittest.TestCase):
         self.assertEqual(len({message for _, message, _, _ in results}), 1)
         self.assertIn("rank 1: ValueError", results[0][1])
         self.assertIn("capture", results[0][1])
+
+
+class SessionInitializationTests(unittest.TestCase):
+    def run_world(self, *, fail_cleanup=False, fail_control=False):
+        """Exercise the real factory with host doubles for CUDA/NCCL resources."""
+        world = _ControlWorld(4)
+        local = threading.local()
+        calls = [[] for _ in range(4)]
+        sessions = [None] * 4
+        dist = ModuleType("torch.distributed")
+        dist.group = SimpleNamespace(WORLD=world.world)
+        dist.is_available = dist.is_initialized = lambda: True
+        dist.get_rank = lambda group=None: local.rank
+        dist.get_world_size = lambda group=None: 4
+
+        def gather(output, report, *, group):
+            calls[local.rank].append(report[1])
+            if fail_control and report[1] == "lsa-peer-mapping-cleanup":
+                raise OSError("injected cleanup agreement failure")
+            world.rank(local.rank).all_gather_object(output, report, group=group)
+
+        def broadcast(payload, **kwargs):
+            reports = [None] * 4
+            world.rank(local.rank).all_gather_object(
+                reports, payload[0], group=world.world
+            )
+            payload[0] = reports[0]
+
+        dist.all_gather_object = gather
+        dist.broadcast_object_list = broadcast
+        torch = ModuleType("torch")
+        torch.distributed = dist
+        torch.uint8 = object()
+        torch.device = lambda *args: args
+        torch.cuda = SimpleNamespace(
+            is_available=lambda: True,
+            is_current_stream_capturing=lambda: False,
+            current_device=lambda: local.rank,
+            synchronize=lambda device: calls[local.rank].append("drain"),
+        )
+
+        def make_comm(*args):
+            rank = local.rank
+
+            def close():
+                calls[rank].append("comm")
+                if fail_cleanup and rank == 2:
+                    raise RuntimeError("injected close failure")
+
+            def peer_pointer(peer):
+                if rank == 1:
+                    raise RuntimeError("injected LSA mapping failure")
+                return 1024 + peer * 128
+
+            return SimpleNamespace(
+                close=close,
+                device_api_support=True,
+                railed_gin_type="GPI",
+                n_lsa_teams=2,
+                create_dev_comm=lambda requirements: SimpleNamespace(
+                    ptr=1, destroy=lambda: calls[rank].append("device")
+                ),
+                register_window=lambda *args: SimpleNamespace(
+                    handle=1,
+                    get_peer_device_pointer=peer_pointer,
+                    close=lambda: calls[rank].append("window"),
+                ),
+            )
+
+        core = ModuleType("nccl.core")
+        core.Communicator = SimpleNamespace(init=make_comm)
+        core.NCCLDevCommRequirements = lambda **kwargs: kwargs
+        core.NcclGinConnectionType = SimpleNamespace(RAIL=1)
+        core.UniqueId = SimpleNamespace(from_bytes=lambda value: value)
+        core.WindowFlag = SimpleNamespace(COLL_SYMMETRIC=1)
+        core.get_unique_id = lambda: b"shared-uid"
+        interop = ModuleType("nccl.core.interop.torch")
+        interop.empty = lambda *args, **kwargs: SimpleNamespace(
+            zero_=lambda: None, data_ptr=lambda: 1024
+        )
+        session_type = gin.GinSession
+
+        def make_session(**kwargs):
+            session = sessions[local.rank] = session_type(**kwargs)
+            return session
+
+        def run(rank):
+            local.rank = rank
+            try:
+                gin.create_gin_session(
+                    rank=rank,
+                    world_size=4,
+                    ranks_per_node=2,
+                    device=rank,
+                    layout=gin.build_gin_arena_layout(
+                        transport_bytes=128,
+                        num_tokens=1,
+                        hidden=64,
+                        num_topk=4,
+                        shared_workspace_bytes=128,
+                    ),
+                    signal_count=1,
+                    signature=("init",),
+                )
+            except Exception as exc:
+                return exc
+            self.fail("rank-local LSA failure must reject initialization")
+
+        with (
+            patch.dict(
+                sys.modules,
+                {
+                    "torch": torch,
+                    "torch.distributed": dist,
+                    "nccl.core": core,
+                    "nccl.core.interop.torch": interop,
+                },
+            ),
+            patch.object(gin, "require_gin_apis", return_value=None),
+            patch.object(gin, "GinSession", side_effect=make_session),
+            ThreadPoolExecutor(max_workers=4) as executor,
+        ):
+            errors = list(executor.map(run, range(4)))
+        return errors, calls, sessions
+
+    def test_init_rejection_cleans_all_ranks_and_preserves_recoverable_error(self):
+        errors, calls, sessions = self.run_world()
+        self.assertEqual({type(error) for error in errors}, {gin.GinPreflightError})
+        self.assertEqual(len({str(error) for error in errors}), 1)
+        self.assertIn(
+            "rank 1: RuntimeError: injected LSA mapping failure", str(errors[0])
+        )
+        for trace, session in zip(calls, sessions, strict=True):
+            self.assertEqual(
+                trace[-5:],
+                ["drain", "window", "device", "comm", "lsa-peer-mapping-cleanup"],
+            )
+            self.assertTrue(session._closed)
+            self.assertIsNone(session.root)
+
+    def test_init_cleanup_failure_is_fatal_on_every_rank(self):
+        count = len(gin._failed_sessions)
+        try:
+            errors, calls, sessions = self.run_world(fail_cleanup=True)
+            self.assertEqual({type(error) for error in errors}, {gin.GinFatalError})
+            for error, trace in zip(errors, calls, strict=True):
+                self.assertIn(
+                    "rank 2: RuntimeError: injected close failure", str(error.__cause__)
+                )
+                self.assertEqual(trace[-1], "lsa-peer-mapping-cleanup")
+            self.assertIsNotNone(sessions[2].root)
+            self.assertIn(sessions[2], gin._failed_sessions)
+            self.assertTrue(
+                all(session._closed for i, session in enumerate(sessions) if i != 2)
+            )
+        finally:
+            del gin._failed_sessions[count:]
+
+    def test_init_cleanup_control_failure_is_fatal_on_every_rank(self):
+        errors, _, sessions = self.run_world(fail_control=True)
+        self.assertEqual({type(error) for error in errors}, {gin.GinFatalError})
+        self.assertTrue(all(session._closed for session in sessions))
 
 
 class LifecycleTests(unittest.TestCase):

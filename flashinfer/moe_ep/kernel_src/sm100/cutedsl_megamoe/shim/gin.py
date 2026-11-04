@@ -598,13 +598,23 @@ def create_gin_session(
                 raise GinFatalError(
                     f"GIN {phase} failed; terminate all ranks and do not reuse this session."
                 ) from exc
+            cleanup_error = None
             try:
                 session.close()
-            except Exception as cleanup_error:
+            except Exception as cleanup_exc:
+                cleanup_error = f"{type(cleanup_exc).__name__}: {cleanup_exc}"
                 _failed_sessions.append(session)
+            try:
+                collective_gin_preflight(
+                    dist,
+                    signature=agreed_signature,
+                    local_error=cleanup_error,
+                    phase=f"{phase}-cleanup",
+                )
+            except Exception as cleanup_exc:
                 raise GinFatalError(
                     "GIN cleanup failed; terminate all ranks."
-                ) from cleanup_error
+                ) from cleanup_exc
             raise
         return result
 

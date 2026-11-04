@@ -258,20 +258,25 @@ activation、singleton TMA 以及 BF16/MXFP8 兼容行为保留。VENDOR 列出�
 
 | 验证层 | 已完成结果 |
 | --- | --- |
-| Host contracts | 22 项：arena/wire、LSA offsets、集体错误、控制组复用/PG 重建、构建清理与清理失败升级 |
+| Host contracts | 25 项：arena/wire、LSA offsets、集体错误、控制组复用/PG 重建、session/workspace 构建清理与清理失败升级 |
 | 固定 N2R2 强 oracle | 每 rank 24 次 exact protocol 调用，全作业合计 96 项 transport/L1 byte 检查；包含 partial/empty rank、sparse holes 与 NaN invalid scores |
 | 独立 math | 原容差不变；最大 relative L2 为 `0.0026485608`，阈值 `0.02` |
 | 公共/强测试 | 每 rank 40 项通过，无 skips；包含原38项及relay配置限制、缓存非空时新权重绑定的capture-ready拒绝/恢复 |
 | NCCL-only 默认组 | 每 rank 21 项通过，包含新增review用例；确认只在capture外创建一次CPU/Gloo控制组并复用 |
 | 当前 off 兼容性 | 每 rank 10 项通过：原6项、2项FP4环境变量数值/PTX检查、2项禁用GIN入口的off eager/Graph隔离检查（默认及残留GIN拓扑参数） |
 
-当前source为`a0ff9eb5e`。GB200任务`3595270`（N2R2，`lyris0120/0129`）
+下列GPU验收source为`a0ff9eb5e`。GB200任务`3595270`（N2R2，`lyris0120/0129`）
 COMPLETED，exit0：先通过2项新review用例/rank，再通过40项strong/public及21项NCCL-only/rank。
 任务`3595271`（N1R4，`lyris0131`）COMPLETED，exit0：10项off检查/rank通过。
-两次运行源码相同，100个Python文件哈希与最终runtime一致。默认off测试将GIN预检和session
+两次运行源码相同，100个Python文件哈希与该次验收source一致。默认off测试将GIN预检和session
 入口替换为调用即失败，仍完成eager/Graph；原FP4环境变量两种分支均通过16种code的bitwise
 归约和PTX指令检查。非GIN reducer的5个核心方法AST与固定FI基线一致。
 本轮原始文件只调整GIN构造限制及撤回无效接口，未改非GIN转换/归约算法；不新增性能结论。
+
+后续session初始化清理修复通过25项CPU契约：初始化本地步骤共同拒绝后，所有rank
+清理并再次协商；任一清理失败或清理协商失败均升级为`GinFatalError`。新增3项测试
+调用实际factory，以host doubles注入LSA mapping、清理和控制面失败；修复前均失败，
+修复后均通过。本次未重跑CUDA/NCCL多节点测试，上述GPU记录保留原source。
 
 此前错误协议修复source为`6a32476ae`，job`3594770`在GB200 `lyris0144/0238`
 上COMPLETED，exit0：先独立通过14项新增错误路径/rank，再通过当时38+19+6项/rank。
