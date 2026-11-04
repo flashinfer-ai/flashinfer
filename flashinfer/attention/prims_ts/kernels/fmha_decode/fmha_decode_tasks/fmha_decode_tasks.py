@@ -51,13 +51,13 @@ from cutlass.experimental.task_scheduling.schedule_builder import (
 )
 from cutlass.experimental.task_scheduling.task import Task
 
-from ...sage.modes import SageScoreScaling
-from ..stage import FmhaStage
-from ..task_compat import task_context_kwargs
-from .direct_sparse_metadata import DirectSparseMetadataView
-from .direct_sparse_metadata import HeadIndexedMetadataView
-from .fmha_decode_config import FmhaDecodeConfig
-from .fmha_decode_constants import (
+from ....sage.modes import SageScoreScaling
+from ...stage import FmhaStage
+from ...task_compat import task_context_kwargs
+from ..direct_sparse_metadata import DirectSparseMetadataView
+from ..direct_sparse_metadata import HeadIndexedMetadataView
+from ..fmha_decode_config import FmhaDecodeConfig
+from ..fmha_decode_constants import (
     KV_INST0,
     KV_INST1,
     KV_KIND_K,
@@ -65,7 +65,7 @@ from .fmha_decode_constants import (
 )
 from cutlass.utils.static_persistent_tile_scheduler import WorkTileInfo
 
-from .fmha_decode_resources.helpers_common import (
+from ..fmha_decode_resources.helpers_common import (
     split_kv_grid_coord,
     UniformQueryOffsets,
     _assume_nonnegative_i32,
@@ -73,7 +73,7 @@ from .fmha_decode_resources.helpers_common import (
     _q_seq_bounds,
     _warp_broadcast_i32,
 )
-from .fmha_decode_resources.helpers_kv_tile_idx import (
+from ..fmha_decode_resources.helpers_kv_tile_idx import (
     _runtime_last_valid_page_idx,
     _runtime_configured_local_kv_tiles,
     _runtime_total_kv_tiles,
@@ -1599,18 +1599,24 @@ def create_page_offsets_task_split_kv(
         _page_offsets_produce(smem_page_offsets_k, "load_k0", FmhaStage.Head)
         if membership_lifetime is not None:
             membership_lifetime.commit()
-        _page_offsets_produce(smem_page_offsets_k, "load_k1", FmhaStage.Head)
+        if cfg.num_insts_kv != 1:
+            _page_offsets_produce(smem_page_offsets_k, "load_k1", FmhaStage.Head)
 
         # LOOP: mirror LoadTask's cross-resource consumption order exactly.
         with domain_loop(0, domain, 1, unroll=1):
-            _page_offsets_produce(smem_page_offsets_v, "load_v0", FmhaStage.Loop)
+            if not cfg.uses_dual_kv_transform:
+                _page_offsets_produce(smem_page_offsets_v, "load_v0", FmhaStage.Loop)
             _page_offsets_produce(smem_page_offsets_k, "load_k0", FmhaStage.Loop)
-            _page_offsets_produce(smem_page_offsets_v, "load_v1", FmhaStage.Loop)
-            _page_offsets_produce(smem_page_offsets_k, "load_k1", FmhaStage.Loop)
+            if cfg.uses_dual_kv_transform:
+                _page_offsets_produce(smem_page_offsets_v, "load_v0", FmhaStage.Loop)
+            if cfg.num_insts_kv != 1:
+                _page_offsets_produce(smem_page_offsets_v, "load_v1", FmhaStage.Loop)
+                _page_offsets_produce(smem_page_offsets_k, "load_k1", FmhaStage.Loop)
 
         # TAIL: drain V0/V1 through distinct page-offset stages.
         _page_offsets_produce(smem_page_offsets_v, "load_v0", FmhaStage.Tail)
-        _page_offsets_produce(smem_page_offsets_v, "load_v1", FmhaStage.Tail)
+        if cfg.num_insts_kv != 1:
+            _page_offsets_produce(smem_page_offsets_v, "load_v1", FmhaStage.Tail)
 
     @_schedule_with_optional_resources
     def page_offsets_schedule(
@@ -1813,6 +1819,7 @@ def create_load_task_split_kv(
                 "load_v1",
             ),
         )
+        active_instances = active_instances[: cfg.num_insts_kv]
         # Preserve the original full-resource lowering order while allowing a
         # per-instance task to omit the other stream's resources.
         for resource in (smem_k0, smem_k1, smem_v0, smem_v1):
@@ -1921,18 +1928,16 @@ def create_load_task_split_kv(
                 if smem_k is None:
                     continue
                 assert smem_v is not None
-                load_tile(
-                    smem_v,
-                    load_v,
-                    smem_page_offsets_v_local,
-                    FmhaStage.Loop,
-                )
+                if not cfg.uses_dual_kv_transform:
+                    load_tile(smem_v, load_v, smem_page_offsets_v_local, FmhaStage.Loop)
                 route = _resolve_and_store_sparse_route(
                     sparse_kv_metadata, FmhaStage.Loop, prefetch_by_label[load_k]
                 )
                 load_tile(smem_k, load_k, smem_page_offsets_k, FmhaStage.Loop)
                 _publish_sparse_softmax_route(sparse_softmax_metadata, route)
                 _publish_k_scales(sage_k_scales_by_label[load_k], route, FmhaStage.Loop)
+                if cfg.uses_dual_kv_transform:
+                    load_tile(smem_v, load_v, smem_page_offsets_v_local, FmhaStage.Loop)
                 prefetch_by_label[load_k] = _prefetch_sparse_route(
                     sparse_kv_metadata, "next_loop"
                 )
@@ -3282,9 +3287,12 @@ def _softmax_schedule_body(
         if cutlass.const_expr(releases_sage_stage_after_max):
             # The scores came back dequantized; the P pass reads no words.
             sage_k_scales.release()
-        if cutlass.const_expr(not cfg.use_keeps_mma_ab or not cfg.uses_tmem_p):
+        if cutlass.const_expr(
+            (not cfg.use_keeps_mma_ab or not cfg.uses_tmem_p)
+            and not cfg.streams_scores_in_q32_bands
+        ):
             # ConsRelease: free S once the scores are in registers unless
-            # a Keeps TMEM-P operand still aliases the consumed columns.
+            # a Keeps TMEM-P operand or streamed Swaps P pass still reads them.
             tmem_s.release()
         # Publish old/new max before the P path so correction can observe
         # the same stats order as the decode pipeline.
@@ -3343,9 +3351,12 @@ def _softmax_schedule_body(
                     tmem_softmax_order.release_softmax1()
                 else:
                     tmem_softmax_order.release_softmax0()
-        if cutlass.const_expr(cfg.use_keeps_mma_ab and cfg.uses_tmem_p):
-            # TMEM-P has consumed the aliased S columns, so the next QK
-            # wave can now overwrite S.
+        if cutlass.const_expr(
+            (cfg.use_keeps_mma_ab and cfg.uses_tmem_p)
+            or cfg.streams_scores_in_q32_bands
+        ):
+            # P has consumed the retained S columns, so the next QK wave
+            # can now overwrite them.
             tmem_s.release()
         if cutlass.const_expr(use_sage and not releases_sage_stage_after_max):
             # ConsRelease: both passes have read this tile's ``sfK`` words.
