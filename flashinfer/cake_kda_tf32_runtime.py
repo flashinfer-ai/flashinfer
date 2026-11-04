@@ -255,6 +255,16 @@ WORK_BIN_MIX_SPAN_ARCHES = ("sm_103a",)
 WORK_BIN_MIX_MAX_GIVE = 8
 WORK_BIN_MIX_SLOTS = 8
 WORK_BIN_MIX_SLOT_ELEMENTS = 16384
+# The bin-mix launches that take their module's long-task bin-mix build where
+# the loader names one (``_RENDERED_WORK_BIN_MIX_LONG_ROUTES``, see
+# _work_bin_mix_long_program): more than this many 32-token chunks in the
+# longest task.  That build stores each task's final state with per-warp TMA
+# boxes and binds a tensor map of the final state on every call.  Measured on
+# a 148-SM sm_100a: bin-mix launches whose longest task has 87 to 256 tokens
+# gain with it; launches of tasks of at most 64 tokens do not (one launch of
+# 16 sequences of 1 to 64 tokens at 12 heads ran 0.5 % slower).  Every other
+# bin-mix launch keeps the bin-mix build (the stock store there).
+BF16_WORK_BIN_MIX_LONG_TASK_CHUNKS = 2
 # Helper-pool build of the bin-mix build (``_RENDERED_WORK_BIN_POOL_ROUTES``):
 # every bin holding one long task is an owner that gives its last ``give``
 # chunks, and a helper bin serves up to WORK_BIN_POOL_MAX_PIECES owners, one
@@ -1569,6 +1579,28 @@ def _work_bin_turn_short_program(
     for module, turnover in turn.items():
         if turnover == program and module in short:
             return short[module]
+    return None
+
+
+def _work_bin_mix_long_program(program, gpu_arch: str, seq_lens):
+    """The ``_RENDERED_WORK_BIN_MIX_LONG_ROUTES`` build beside the bin-mix
+    build ``program`` (``_RENDERED_WORK_BIN_MIX_ROUTES``) for a bin-mix launch
+    of ``seq_lens``, or ``None``: ``None`` on an architecture whose table is
+    empty (no further work) and for a launch whose longest task has at most
+    ``BF16_WORK_BIN_MIX_LONG_TASK_CHUNKS`` chunks."""
+    if program is None:
+        return None
+    routes = getattr(_kda_registry, "_RENDERED_WORK_BIN_MIX_LONG_ROUTES", {}).get(
+        gpu_arch, {}
+    )
+    if not routes:
+        return None
+    if max(seq_lens) <= BF16_WORK_BIN_MIX_LONG_TASK_CHUNKS * BF16_M128_CHUNK:
+        return None
+    mix = _kda_registry._RENDERED_WORK_BIN_MIX_ROUTES.get(gpu_arch, {})
+    for module, mixed in mix.items():
+        if mixed == program and module in routes:
+            return routes[module]
     return None
 
 
@@ -4475,6 +4507,16 @@ class FlashKDABlackwellBF16FusedLaunch:
             if bin_pool_plan is not None:
                 bin_mix_program = bin_pool_program
                 bin_mix_plan = bin_pool_plan
+            elif bin_mix_plan is not None:
+                # A bin-mix launch whose longest task is longer than
+                # BF16_WORK_BIN_MIX_LONG_TASK_CHUNKS chunks takes the module's
+                # long-task bin-mix build where the loader names one: the same
+                # bins, plan words and bits with the per-warp TMA final-state
+                # store.
+                bin_mix_program = (
+                    _work_bin_mix_long_program(bin_mix_program, gpu_arch, seq_lens)
+                    or bin_mix_program
+                )
             # A turnover launch of short tasks with many tasks per SM that
             # takes neither build takes the module's short-task turnover build
             # where the loader names one: the same bins, table and bits with

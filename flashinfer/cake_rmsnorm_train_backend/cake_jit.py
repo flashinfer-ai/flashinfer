@@ -5137,8 +5137,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "sum_bytes": 65536,
         },
     },
-    # sm_103a H5120 bf16 weight: (61952, inf] above T 61952 for dw accuracy (both weight dtypes switch at T 61952: the FP32-weight route's compensated det pair, the same dw computation, reaches 0.888 of the per-element budget at T 62464 on GB300); twosum: exact per-thread dw sums
-    "cake_rmsnorm_train_9e4c0825df92af02074f": {
+    # sm_103a H5120 bf16 weight: (61952, inf] above T 61952 for dw accuracy (both weight dtypes switch at T 61952: the FP32-weight route's compensated det pair, the same dw computation, reaches 0.888 of the per-element budget at T 62464 on GB300); kblock pipe single (FP32 sums of 8-row blocks kept as FP32 TwoSum pairs): worst dw element 0.588 of the budget at the sampled T from 61953 to 131072 on GB300 (3 x 60 inputs, kernel and torch rstd); its FP32-weight twin, the same dw computation, 0.688 at 73 sampled T from 61953 to 131072, 1.16 times the twosum single's speed in the FI bench (GB300, 4 sessions)
+    "cake_rmsnorm_train_b523a764b029e5ca1aaf": {
         "arches": [
             "sm_103a",
         ],
@@ -5152,12 +5152,12 @@ MODULES: dict[str, dict[str, Any]] = {
             "tail_div": 12,
         },
         "hidden": 5120,
-        "kernel": "cake_rmsnorm_train_9e4c0825df92af02074f",
+        "kernel": "cake_rmsnorm_train_b523a764b029e5ca1aaf",
         "launch": {
             "cooperative": False,
             "use_pdl": False,
         },
-        "library": "cake_rmsnorm_train_9e4c0825df92af02074f",
+        "library": "cake_rmsnorm_train_b523a764b029e5ca1aaf",
         "role": "bwd_main",
         "select_rule": {
             "above": 61952,
@@ -5170,8 +5170,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "sum_bytes": 81920,
         },
     },
-    # sm_103a H5120 f32 weight: (61952, inf] above T 61952 for dw accuracy (the compensated det pair, from T 5120, reaches 0.888 of the per-element budget at T 62464 on GB300); twosum: exact per-thread dw sums
-    "cake_rmsnorm_train_f165933caadda3434828": {
+    # sm_103a H5120 f32 weight: (61952, inf] above T 61952 for dw accuracy (the compensated det pair, from T 5120, reaches 0.888 of the per-element budget at T 62464 on GB300); kblock pipe single (FP32 sums of 8-row blocks kept as FP32 TwoSum pairs): worst dw element 0.688 of the budget at 73 sampled T from 61953 to 131072 on GB300 (3 x 60 inputs per T, kernel and torch rstd), at most the FP32 eager reference's, 1.18 times the twosum single's speed in the FI bench (GB300, 4 sessions)
+    "cake_rmsnorm_train_90598c14b4e396f5c8b0": {
         "arches": [
             "sm_103a",
         ],
@@ -5185,12 +5185,12 @@ MODULES: dict[str, dict[str, Any]] = {
             "tail_div": 12,
         },
         "hidden": 5120,
-        "kernel": "cake_rmsnorm_train_f165933caadda3434828",
+        "kernel": "cake_rmsnorm_train_90598c14b4e396f5c8b0",
         "launch": {
             "cooperative": False,
             "use_pdl": False,
         },
-        "library": "cake_rmsnorm_train_f165933caadda3434828",
+        "library": "cake_rmsnorm_train_90598c14b4e396f5c8b0",
         "role": "bwd_main_w32",
         "select_rule": {
             "above": 61952,
@@ -6019,8 +6019,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "sum_bytes": 49152,
         },
     },
-    # sm_103a H4096 bf16 weight: (50176, inf] above T 50176 for dw accuracy (the det pair's worst dw element exceeds the per-element budget at T 50688 on GB300, 1.032 of it, and reaches 0.989 of it at T 57856); twosum: exact per-thread dw sums
-    "cake_rmsnorm_train_8c8bebecc5b08454b6a0": {
+    # sm_103a H4096 bf16 weight: (50176, inf] above T 50176 for dw accuracy (the det pair's worst dw element exceeds the per-element budget at T 50688 on GB300, 1.032 of it, and reaches 0.989 of it at T 57856); kblock pipe single (FP32 sums of 8-row blocks kept as FP32 TwoSum pairs): worst dw element 0.608 of the budget at the sampled T from 61953 to 131072 on GB300 (3 x 60 inputs, kernel and torch rstd); its FP32-weight twin, the same dw computation, 0.670 at 71 sampled T from 9217 to 131072, 1.01 times the twosum single's speed in the FI bench (GB300, 4 sessions)
+    "cake_rmsnorm_train_8250eb924d925c0db0d9": {
         "arches": [
             "sm_103a",
         ],
@@ -6034,12 +6034,12 @@ MODULES: dict[str, dict[str, Any]] = {
             "tail_div": 12,
         },
         "hidden": 4096,
-        "kernel": "cake_rmsnorm_train_8c8bebecc5b08454b6a0",
+        "kernel": "cake_rmsnorm_train_8250eb924d925c0db0d9",
         "launch": {
             "cooperative": False,
             "use_pdl": False,
         },
-        "library": "cake_rmsnorm_train_8c8bebecc5b08454b6a0",
+        "library": "cake_rmsnorm_train_8250eb924d925c0db0d9",
         "role": "bwd_main",
         "select_rule": {
             "above": 50176,
@@ -6250,8 +6250,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "sum_bytes": 196608,
         },
     },
-    # sm_103a H4096 f32 weight: (9216, inf] above T 9216 for dw accuracy (over inputs 0-59 at the forward's rstd the det pair's worst error exceeds the FP32 eager reference's at T 9728 on GB300, 0.3383 against 0.3332, and at T 24576, 0.6127 against 0.6017); twosum: exact per-thread dw sums
-    "cake_rmsnorm_train_131a495c5897206b6874": {
+    # sm_103a H4096 f32 weight: (9216, inf] above T 9216 for dw accuracy (over inputs 0-59 at the forward's rstd the det pair's worst error exceeds the FP32 eager reference's at T 9728 on GB300, 0.3383 against 0.3332, and at T 24576, 0.6127 against 0.6017); kblock pipe single (FP32 sums of 8-row blocks kept as FP32 TwoSum pairs): worst dw element 0.670 of the budget at 71 sampled T from 9217 to 131072 on GB300 (3 x 60 inputs per T, kernel and torch rstd), at most the FP32 eager reference's, 1.01 to 1.07 times the twosum single's speed in the FI bench (GB300, 4 sessions)
+    "cake_rmsnorm_train_2911faf7a786144495a6": {
         "arches": [
             "sm_103a",
         ],
@@ -6265,12 +6265,12 @@ MODULES: dict[str, dict[str, Any]] = {
             "tail_div": 12,
         },
         "hidden": 4096,
-        "kernel": "cake_rmsnorm_train_131a495c5897206b6874",
+        "kernel": "cake_rmsnorm_train_2911faf7a786144495a6",
         "launch": {
             "cooperative": False,
             "use_pdl": False,
         },
-        "library": "cake_rmsnorm_train_131a495c5897206b6874",
+        "library": "cake_rmsnorm_train_2911faf7a786144495a6",
         "role": "bwd_main_w32",
         "select_rule": {
             "above": 9216,
@@ -7836,8 +7836,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "sum_bytes": 16384,
         },
     },
-    # sm_107a H5120 bf16 weight: the FP64-row form above T 49152 for dw accuracy (the compensated det pair, from T 19968, reaches 0.867 of the per-element budget at T 53248 on R200 with 216 SMs, above the 0.85 margin; both weight dtypes switch at T 49152)
-    "cake_rmsnorm_train_f94f8c33e2c9c8e89fc3": {
+    # sm_107a H5120 bf16 weight: (49152, inf] above T 49152, where the det pair stops; kblock pipe single (FP32 sums of 8-row blocks kept as FP32 TwoSum pairs in registers): worst dw element 0.807 of the budget at 265 sampled T from 49153 to 131072 on R200 (212 SMs, 3 x 60 inputs per T, kernel and torch rstd), 1.74 to 1.87 times the FP64-row single's speed in the FI bench (R200, 4 sessions)
+    "cake_rmsnorm_train_56634f53e6456b34f76f": {
         "arches": [
             "sm_107a",
         ],
@@ -7851,12 +7851,12 @@ MODULES: dict[str, dict[str, Any]] = {
             "tail_div": 12,
         },
         "hidden": 5120,
-        "kernel": "cake_rmsnorm_train_f94f8c33e2c9c8e89fc3",
+        "kernel": "cake_rmsnorm_train_56634f53e6456b34f76f",
         "launch": {
             "cooperative": False,
             "use_pdl": False,
         },
-        "library": "cake_rmsnorm_train_f94f8c33e2c9c8e89fc3",
+        "library": "cake_rmsnorm_train_56634f53e6456b34f76f",
         "role": "bwd_main",
         "select_rule": {
             "above": 49152,
@@ -7869,8 +7869,8 @@ MODULES: dict[str, dict[str, Any]] = {
             "sum_bytes": 163840,
         },
     },
-    # sm_107a H5120 f32 weight: the FP64-row form above T 49152 for dw accuracy (the compensated det pair, from T 19968, reaches 0.905 of the per-element budget at T 57344 on R200 with 216 SMs, above the 0.85 margin; both weight dtypes switch at T 49152)
-    "cake_rmsnorm_train_dd795e849940a49d0d29": {
+    # sm_107a H5120 f32 weight: (49152, inf] above T 49152, where the det pair stops; kblock pipe single (FP32 sums of 8-row blocks kept as FP32 TwoSum pairs in registers): worst dw element 0.719 of the budget at 265 sampled T from 49153 to 131072 on R200 (212 SMs, 3 x 60 inputs per T, kernel and torch rstd), at most the FP32 eager reference's, 1.66 to 1.78 times the FP64-row single's speed in the FI bench (R200, 4 sessions)
+    "cake_rmsnorm_train_6cedccdf3a58f23f260f": {
         "arches": [
             "sm_107a",
         ],
@@ -7884,12 +7884,12 @@ MODULES: dict[str, dict[str, Any]] = {
             "tail_div": 12,
         },
         "hidden": 5120,
-        "kernel": "cake_rmsnorm_train_dd795e849940a49d0d29",
+        "kernel": "cake_rmsnorm_train_6cedccdf3a58f23f260f",
         "launch": {
             "cooperative": False,
             "use_pdl": False,
         },
-        "library": "cake_rmsnorm_train_dd795e849940a49d0d29",
+        "library": "cake_rmsnorm_train_6cedccdf3a58f23f260f",
         "role": "bwd_main_w32",
         "select_rule": {
             "above": 49152,
@@ -14623,7 +14623,7 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_rmsnorm_train_ad2bb26ea5916baef963",
             "cake_rmsnorm_train_24643edc7e1143da24e0",
             "cake_rmsnorm_train_35a0b0ca6b2060313255__4096_50176",
-            "cake_rmsnorm_train_8c8bebecc5b08454b6a0",
+            "cake_rmsnorm_train_8250eb924d925c0db0d9",
             "cake_rmsnorm_train_5d75ea5f3c25579af496__3_256",
             "cake_rmsnorm_train_5d75ea5f3c25579af496__256_1024",
             "cake_rmsnorm_train_5d75ea5f3c25579af496__1024_4096",
@@ -14635,7 +14635,7 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_rmsnorm_train_16545056022785f2a7d8",
             "cake_rmsnorm_train_78c26a53e83c9803bcbf",
             "cake_rmsnorm_train_626aed743358c27513f1__4096_9216",
-            "cake_rmsnorm_train_131a495c5897206b6874",
+            "cake_rmsnorm_train_2911faf7a786144495a6",
             "cake_rmsnorm_train_5d75ea5f3c25579af496__15_256",
             "cake_rmsnorm_train_5d75ea5f3c25579af496__256_1024",
             "cake_rmsnorm_train_5d75ea5f3c25579af496__1024_4096",
@@ -14645,7 +14645,7 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_rmsnorm_train_080e0a6c3b18e9bad790__0_22",
             "cake_rmsnorm_train_2fc4932fbde0bc848b32__22_5120",
             "cake_rmsnorm_train_7ffb443a63a92ab6b0e0__5120_61952",
-            "cake_rmsnorm_train_9e4c0825df92af02074f",
+            "cake_rmsnorm_train_b523a764b029e5ca1aaf",
             "cake_rmsnorm_train_c5831b29d17867842e5f__22_5120",
             "cake_rmsnorm_train_c5831b29d17867842e5f__5120_61952",
         ],
@@ -14653,7 +14653,7 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_rmsnorm_train_f165933caadda3434828__0_22",
             "cake_rmsnorm_train_79811a76205d7d7dd197__22_5120",
             "cake_rmsnorm_train_f9f7d4cd75ef91cc8374__5120_61952",
-            "cake_rmsnorm_train_f165933caadda3434828",
+            "cake_rmsnorm_train_90598c14b4e396f5c8b0",
             "cake_rmsnorm_train_c5831b29d17867842e5f__22_5120",
             "cake_rmsnorm_train_c5831b29d17867842e5f__5120_61952",
         ],
@@ -14908,7 +14908,7 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_rmsnorm_train_838c077df3a6d35d55b7__18_4096",
             "cake_rmsnorm_train_6816fb80e97380f1bcbc",
             "cake_rmsnorm_train_b8b0913b40f035f43b76__19968_49152",
-            "cake_rmsnorm_train_f94f8c33e2c9c8e89fc3",
+            "cake_rmsnorm_train_56634f53e6456b34f76f",
             "cake_rmsnorm_train_2af4cf2f58ba58f78099__18_4096",
             "cake_rmsnorm_train_2af4cf2f58ba58f78099__4096_19968",
             "cake_rmsnorm_train_2af4cf2f58ba58f78099__19968_49152",
@@ -14918,7 +14918,7 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_rmsnorm_train_cd612de56c0985bb4caa__13_4096",
             "cake_rmsnorm_train_468cc4d1b8128187b4b3",
             "cake_rmsnorm_train_7b9e10b21b75d4615135__19968_49152",
-            "cake_rmsnorm_train_dd795e849940a49d0d29",
+            "cake_rmsnorm_train_6cedccdf3a58f23f260f",
             "cake_rmsnorm_train_2af4cf2f58ba58f78099__13_4096",
             "cake_rmsnorm_train_2af4cf2f58ba58f78099__4096_19968",
             "cake_rmsnorm_train_2af4cf2f58ba58f78099__19968_49152",

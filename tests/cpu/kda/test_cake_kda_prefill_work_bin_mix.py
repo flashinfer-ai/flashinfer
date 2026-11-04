@@ -16,7 +16,11 @@ architecture of ``WORK_BIN_MIX_SPAN_ARCHES`` the plan must also shorten the
 launch's longest bin and give no single chunk to a helper with a longer task
 than the owner's shorter task.  Every other launch, and every launch on
 another architecture, keeps the turnover build unchanged.  A launch the driver refuses as a too large cooperative grid
-switches the plan for good to the turnover build with its own bindings.
+switches the plan for good to the turnover build with its own bindings.  A
+bin-mix launch whose longest task is longer than
+``BF16_WORK_BIN_MIX_LONG_TASK_CHUNKS`` chunks takes the module's long-task
+bin-mix build (``_RENDERED_WORK_BIN_MIX_LONG_ROUTES``) where the loader names
+one, with the same plan words.
 
 The device queries are stubbed (SM100a / SM103a, 148 or 152 SMs), the tensors
 live on the meta device and the loader's ``PreparedKernel`` is a recording
@@ -41,6 +45,7 @@ CHECKPOINT_EVERY = 64
 MAGIC = 0x58313221
 BIN_MIX = "cake_kda_prefill_000000000000000b1a11"
 SHORT_TURN = "cake_kda_prefill_00000000000000005407"
+LONG_MIX = "cake_kda_prefill_00000000000000010a11"
 REFUSED = RuntimeError(
     f"kernel_{BIN_MIX}: cudaLaunchKernelExC failed: too many blocks in cooperative launch"
 )
@@ -114,10 +119,14 @@ SM103A_REFUSED_ROWS = [
 SM103A_SPAN_REFUSED_ROWS = SM103A_REFUSED_ROWS + [
     pytest.param([256, 224, 192, 160] * 4, 12, id="mixed16-h12"),
 ]
-# The loader's turnover tables, before any test stubs them.
+# The loader's turnover and bin-mix tables, before any test stubs them.
 TURN = {
     arch: dict(routes)
     for arch, routes in registry._RENDERED_WORK_BIN_TURN_ROUTES.items()
+}
+MIX = {
+    arch: dict(routes)
+    for arch, routes in registry._RENDERED_WORK_BIN_MIX_ROUTES.items()
 }
 
 
@@ -341,13 +350,55 @@ def test_shipped_loader_names_the_unbounded_direct_short_task_build():
         )
 
 
+def test_long_task_program_lookup(monkeypatch):
+    # The long-task bin-mix build beside a bin-mix build, for a bin-mix launch
+    # whose longest task has more than BF16_WORK_BIN_MIX_LONG_TASK_CHUNKS
+    # chunks.
+    arch = "sm_100a"
+    module = next(iter(TURN[arch]))
+    assert runtime.BF16_WORK_BIN_MIX_LONG_TASK_CHUNKS == 2
+    lookup = runtime._work_bin_mix_long_program
+    monkeypatch.setattr(
+        registry, "_RENDERED_WORK_BIN_MIX_ROUTES", {arch: {module: BIN_MIX}}
+    )
+    monkeypatch.setattr(registry, "_RENDERED_WORK_BIN_MIX_LONG_ROUTES", {arch: {}})
+    assert lookup(BIN_MIX, arch, [128] * 16) is None
+    monkeypatch.setattr(
+        registry, "_RENDERED_WORK_BIN_MIX_LONG_ROUTES", {arch: {module: LONG_MIX}}
+    )
+    assert lookup(BIN_MIX, arch, [65] + [64] * 15) == LONG_MIX
+    assert lookup(BIN_MIX, arch, [128] * 16) == LONG_MIX
+    assert lookup(BIN_MIX, arch, [1, 33, 64] * 6) is None
+    assert lookup(BIN_MIX, arch, [64] * 16) is None
+    assert lookup(module, arch, [128] * 16) is None
+    assert lookup(None, arch, [128] * 16) is None
+    assert lookup(BIN_MIX, "sm_103a", [128] * 16) is None
+
+
+def test_shipped_loader_names_the_unbounded_direct_long_task_build():
+    # One long-task bin-mix build, on sm_100a alone: the sm_103a bin-mix build
+    # of the same module, shipping for both architectures, beside the sm_100a
+    # bin-mix build.
+    routes = registry._RENDERED_WORK_BIN_MIX_LONG_ROUTES
+    assert set(routes) == {"sm_100a", "sm_103a"} and routes["sm_103a"] == {}
+    assert len(routes["sm_100a"]) == 1
+    for module, program in routes["sm_100a"].items():
+        assert module in MIX["sm_100a"] and program != MIX["sm_100a"][module]
+        assert program == MIX["sm_103a"][module]
+        assert registry._RENDERED_MODULES[program]["arches"] == ["sm_100a", "sm_103a"]
+        lookup = runtime._work_bin_mix_long_program
+        assert lookup(MIX["sm_100a"][module], "sm_100a", [128] * 16) == program
+        assert lookup(MIX["sm_100a"][module], "sm_100a", [64] * 16) is None
+
+
 def test_shipped_loader_names_the_unbounded_direct_bin_mix_build():
     # One bin-mix build on each architecture of WORK_BIN_MIX_ARCHES, beside
     # the turnover build of the same module, registered like every generated
     # program; none on another architecture.  A module's bin-mix build is one
     # program for every architecture or a build of its own per architecture
-    # (the sm_103a DIR build takes the per-warp TMA final-state store); each
-    # program ships for exactly the architectures whose routes name it.
+    # (the sm_100a DIR build keeps the stock final-state store); each program
+    # ships for exactly the architectures whose bin-mix or long-task routes
+    # name it.
     routes = registry._RENDERED_WORK_BIN_MIX_ROUTES
     assert set(routes) == {"sm_100a", "sm_103a"}
     routed: dict[str, set[str]] = {}
@@ -363,6 +414,9 @@ def test_shipped_loader_names_the_unbounded_direct_bin_mix_build():
             assert arch in shipped, (arch, program)
             routed.setdefault(program, set()).add(arch)
             assert runtime._work_bin_mix_program(TURN[arch][module], arch) == program
+    for arch, by_module in registry._RENDERED_WORK_BIN_MIX_LONG_ROUTES.items():
+        for program in by_module.values():
+            routed.setdefault(program, set()).add(arch)
     for program, arches in routed.items():
         assert set(registry._RENDERED_MODULES[program]["arches"]) == arches, program
 
@@ -385,11 +439,13 @@ class _Kernel:
         self.name = name
         self.arch = arch
         short_turn = registry._RENDERED_WORK_BIN_TURN_SHORT_ROUTES.get(arch, {})
+        long_task = registry._RENDERED_WORK_BIN_MIX_LONG_ROUTES.get(arch, {})
         self.work_bins = (
             name in registry._RENDERED_WORK_BIN_ROUTES.get(arch, {}).values()
             or name in registry._RENDERED_WORK_BIN_TURN_ROUTES.get(arch, {}).values()
             or name in registry._RENDERED_WORK_BIN_MIX_ROUTES.get(arch, {}).values()
             or name in short_turn.values()
+            or name in long_task.values()
         )
         self._ready = False
         self.prepared = []
@@ -474,7 +530,9 @@ def planner(monkeypatch):
     monkeypatch.setattr(_Kernel, "refuse", {})
     part.uploads = uploads
 
-    def configure(arch, *, mix=True):
+    def configure(arch, *, mix=True, long_task=False):
+        # The bin-mix table names BIN_MIX (``mix``); the long-task table names
+        # LONG_MIX beside it on this architecture (``long_task``) or nothing.
         part.arch = arch
         part.capability = dict((a, c) for a, c, _ in PARTS)[arch]
         part.sm_count = dict((a, n) for a, _, n in PARTS)[arch]
@@ -485,6 +543,12 @@ def planner(monkeypatch):
             registry,
             "_RENDERED_WORK_BIN_MIX_ROUTES",
             {"sm_100a": {}, "sm_103a": {}, arch: routes},
+        )
+        long_routes = {module: LONG_MIX for module in TURN[arch]} if long_task else {}
+        monkeypatch.setattr(
+            registry,
+            "_RENDERED_WORK_BIN_MIX_LONG_ROUTES",
+            {"sm_100a": {}, "sm_103a": {}, arch: long_routes},
         )
         uploads.clear()
         _Kernel.made.clear()
@@ -763,6 +827,53 @@ def test_admitted_launch_keeps_the_bin_mix_build_over_the_short_task_build(
     assert plan.work_bin_mix and plan.module.name == BIN_MIX
     assert plan._work_bin_mix_fallback[0].name in TURN["sm_100a"].values()
     assert SHORT_TURN not in {kernel.name for kernel in _Kernel.made}
+
+
+@pytest.mark.parametrize(
+    ("lengths", "takes_long"),
+    [
+        ([64] * 16, False),
+        ([96] * 16, True),
+        ([128] * 16, True),
+        ([256] * 16, True),
+        ([256, 224, 192, 160] * 4, True),
+    ],
+    ids=["bs16x64", "bs16x96", "bs16x128", "bs16x256", "mixed16"],
+)
+def test_long_task_launch_takes_the_long_task_build(planner, lengths, takes_long):
+    # A bin-mix launch on a 148-SM sm_100a part with the long-task table
+    # naming LONG_MIX: a launch whose longest task has more than two chunks
+    # takes it (the bin-mix launch's grid, plan words and turnover fallback);
+    # a launch of tasks of at most two chunks keeps the bin-mix build and
+    # builds nothing else.  With the long-task table empty every launch keeps
+    # the bin-mix build.
+    for long_task in (True, False):
+        planner.configure("sm_100a", long_task=long_task)
+        plan = _launch(_prepare(lengths, 12))
+        table, bins, after = _launch_table(planner, lengths, 12)
+        words = runtime._work_bin_mix_plan(table, bins, tuple(lengths), 12)
+        assert words is not None and after == words, lengths
+        assert plan.work_bin_mix and plan.schedule.endswith("_turnover_bin_mix")
+        assert plan.grid == (bins, 1, 1)
+        assert plan._work_bin_mix_fallback[0].name in TURN["sm_100a"].values()
+        made = {kernel.name for kernel in _Kernel.made}
+        if long_task and takes_long:
+            assert plan.module.name == LONG_MIX and BIN_MIX not in made
+        else:
+            assert plan.module.name == BIN_MIX and LONG_MIX not in made
+
+
+def test_admitted_pool_launch_keeps_the_pool_build_over_the_long_task_build(planner):
+    # A launch the helper-pool rule admits takes the helper-pool build, never
+    # the long-task bin-mix build.
+    planner.configure("sm_100a", long_task=True)
+    module = next(iter(TURN["sm_100a"]))
+    pool = registry._RENDERED_WORK_BIN_POOL_ROUTES["sm_100a"].get(module)
+    if pool is None:
+        pytest.skip("the loader names no helper-pool build on sm_100a")
+    plan = _launch(_prepare([1024, 64] * 8, 12))
+    assert plan.work_bin_mix and plan.module.name == pool
+    assert LONG_MIX not in {kernel.name for kernel in _Kernel.made}
 
 
 def test_t32_runs_the_turnover_build(planner):
