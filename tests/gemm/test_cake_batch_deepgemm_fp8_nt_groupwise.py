@@ -353,7 +353,10 @@ def test_out_of_band_problems_raise():
         2, 256, 256, 256, seed=930, device=device
     )
     assert (256, 256) not in SUPPORTED_NK
-    assert supported_nk("sm_107a") < SUPPORTED_NK and supported_nk("sm_100a") == SUPPORTED_NK
+    assert (
+        supported_nk("sm_107a") < SUPPORTED_NK
+        and supported_nk("sm_100a") == SUPPORTED_NK
+    )
     with pytest.raises(ValueError, match=r"\(N, K\)"):
         batch_deepgemm_fp8_nt_groupwise(
             a, b, a_scale, b_scale, masked_m, expected_m, backend="cake"
