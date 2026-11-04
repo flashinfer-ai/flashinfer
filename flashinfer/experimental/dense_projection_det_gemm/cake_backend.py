@@ -1572,6 +1572,12 @@ ROW_RULES: dict[tuple, dict] = {
     #      the row's plan without it, measured on GB200 against that plan ----
     ('sm_100a', False, True, False, False, False, 5120, 17408, 16231): {"cta_rows": 256, "ovl": True, "htail": True, "cgrp": True, "group_m": 12, "epi": 'tma', "slots": 1},
     ('sm_100a', False, True, False, False, False, 5120, 17408, 16384): {"cta_rows": 256, "ovl": True, "htail": True, "cgrp": True, "group_m": 12, "epi": 'tma', "slots": 1},
+    # ---- sm_100a: the GB T-exact rules of round 5 - the 12288 -> 4096 forward at T 16231 / 16384 (the ragged rule's
+    #      overlapped half-tail program with the column-grouped raster in 8-column-tile groups), with the bf16 tiles
+    #      through the one-slot TMA store and the per-tile K partitions of the row's plan without them, measured on
+    #      GB200 against that plan ----
+    ('sm_100a', False, False, False, False, False, 4096, 12288, 16231): {"cta_rows": 256, "ovl": True, "htail": True, "cgrp": True, "group_m": 8, "epi": 'tma', "slots": 1},
+    ('sm_100a', False, False, False, False, False, 4096, 12288, 16384): {"cta_rows": 256, "ovl": True, "htail": True, "cgrp": True, "group_m": 8, "epi": 'tma', "slots": 1},
     # ---- sm_103a: the shapes tranche - forward / input gradient / weight gradient rows at K 4096 - 17408 and N 32 - 17408,
     #      measured with this package's planner against cuBLAS on GB300 at T 16172 - 16384 (see the test table
     #      MEASURED_SHAPE_ROWS); a row whose measured choice equals the planner's default carries no rule ----
