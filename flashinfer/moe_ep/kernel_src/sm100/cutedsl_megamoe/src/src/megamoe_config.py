@@ -15,18 +15,20 @@ runner already exposes as a CLI argument (``group_hint``, ``epi_flag_batch``):
   (timing probes, IKET range budget, fan-out skips, ...); the second group
   only changes host behaviour of the runner.
 
-The kernel modules read these objects and nothing else: no ``os.environ`` is
-consulted at import or construction time in ``pre_unification/comm/token_comm.py``,
+The migrated GIN controls use these objects. FlashInfer's existing non-GIN
+FP4 reducer still selects its decoder through ``MEGA_F4CVT_USE_MANUAL``;
+that legacy environment-controlled path is outside this port. No ``os.environ``
+is consulted at import or construction time in ``pre_unification/comm/token_comm.py``,
 ``pre_unification/moe_nvfp4_swapab/megamoe_kernel.py``, ``pre_unification/moe_nvfp4_swapab/kernel_fc12.py``,
 ``pre_unification/moe_nvfp4_swapab/topk_reduce.py`` or ``common/pipeline_timing.py``. The
 runner builds the config from its CLI arguments and parses the diagnostic
 ``MEGA_*`` environment variables once, through
 :meth:`MegaMoEDiagnostics.from_env`.
 
-The compiled-kernel cache key is derived from the config through
-:meth:`MegaMoEConfig.name_suffix`: every codegen-relevant option that differs
-from its default contributes one token, in a fixed order, so two kernels with
-the same name are the same code.
+GIN configuration contributes to the compiled-kernel name through
+:meth:`MegaMoEConfig.name_suffix`: non-default migrated codegen options add
+ordered tokens. This does not replace FlashInfer's pre-existing non-GIN
+FP4 decoder environment selection or its compilation lifecycle.
 
 This module imports neither torch nor cutlass; it is usable on a login node.
 """
@@ -110,9 +112,6 @@ class MegaMoEDiagnostics:
     * ``use_ncu``: pad the NVLink barrier cycle and reset the monotonic
       arrival signals so Nsight Compute can replay one launch
       (``MEGA_USE_NCU``).
-    * ``f4cvt_use_manual``: manual LUT/PRMT FP4 decode in the tail reduce
-      instead of the hardware ``cvt`` path; both are bit-exact
-      (``MEGA_F4CVT_USE_MANUAL``).
     * ``diag_stage1_flush``: after SM0 posted the Stage 1 range puts its relay
       warps flush the GIN context, so the ``push_flush`` sub-envelope measures
       post-to-landed time on the sender's clock; a timing perturbation, not a
@@ -131,7 +130,6 @@ class MegaMoEDiagnostics:
     diag_fanout_skip: int = 0
     fc2_done_gpu_scope: bool = False
     use_ncu: bool = False
-    f4cvt_use_manual: bool = False
     diag_stage1_flush: bool = False
 
     cuda_event_only: bool = False
@@ -205,7 +203,6 @@ class MegaMoEDiagnostics:
             diag_fanout_skip=int(skip_text),
             fc2_done_gpu_scope=_env_flag(env, "MEGA_FC2_DONE_GPU_SCOPE"),
             use_ncu=_env_flag(env, "MEGA_USE_NCU"),
-            f4cvt_use_manual=_env_flag(env, "MEGA_F4CVT_USE_MANUAL"),
             diag_stage1_flush=_env_flag(env, "MEGA_DIAG_STAGE1_FLUSH"),
             cuda_event_only=_env_flag(env, "MEGA_CUDA_EVENT_ONLY"),
             lifecycle_trace=_env_flag(env, "MEGA_LIFECYCLE_TRACE"),
@@ -233,8 +230,6 @@ class MegaMoEDiagnostics:
                 tokens.append("prod")
         if self.use_ncu:
             tokens.append("_ncu")
-        if self.f4cvt_use_manual:
-            tokens.append("_f4man")
         if self.diag_stage1_flush:
             tokens.append("_dsf1")
         return "".join(tokens)
@@ -296,7 +291,7 @@ class MegaMoEConfig:
         Order: ``_treg{N}``, ``_tmach{M}``, ``_tailreduce``, the experimental
         tokens (``_es1``, ``_sfs1``), then the diagnostics tokens (``_ptim``,
         ``_fctl1``, ``_dfs{n}``, ``_fdg1``, ``_iket`` / ``_iketprod``, ``_ncu``,
-        ``_f4man``, ``_dsf1``).
+        ``_dsf1``).
         ``token_back_atomic_batch`` is a runtime batch of the atomic scheduler
         (not codegen) and has no token.
         """

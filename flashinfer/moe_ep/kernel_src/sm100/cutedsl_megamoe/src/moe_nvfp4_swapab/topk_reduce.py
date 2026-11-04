@@ -265,7 +265,6 @@ class TopkReduce:
         ranks_per_node: int = 1,
         num_experts_per_rank: int = 1,
         combine_slot_indexed: bool = False,
-        f4cvt_use_manual: bool = False,
     ) -> None:
         self.hidden = int(hidden)
         self.num_topk = int(num_topk)
@@ -275,7 +274,6 @@ class TopkReduce:
         self.ranks_per_node = ranks_per_node
         self.num_experts_per_rank = num_experts_per_rank
         self.combine_slot_indexed = combine_slot_indexed
-        self.f4cvt_use_manual = f4cvt_use_manual
         if num_remote_nodes:
             if persistent or combine_format.is_quantized:
                 raise ValueError("GIN ordered reduce requires static BF16 combine.")

@@ -797,3 +797,91 @@ def test_nvfp4_gin_workspace_allocation_failure_cleanup(allocation, monkeypatch)
     # Every rank can create another registered session after coordinated cleanup.
     workspace = nvfp4.get_symm_buffer_for_mega_moe(**_gin_factory_args(bootstrap))
     workspace.destroy()
+
+
+def test_nvfp4_gin_capture_ready_miss_with_nonempty_cache(monkeypatch):
+    """Reject an unwarmed weight binding after the coarse warm-cache gate."""
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.gin import (
+        GinPreflightError,
+    )
+
+    bootstrap = _bootstrap()
+    layer = _layer(bootstrap)
+    inputs = _inputs(bootstrap.rank, 0, "balanced")
+    expected = layer.forward(inputs).clone()
+    original_weights = layer._transformed
+    assert layer._kernel._thunk_states
+    if bootstrap.rank == 1:
+        layer._transformed = tuple(
+            tuple(tensor.clone() for tensor in weight) for weight in original_weights
+        )
+    torch.cuda.synchronize()
+    phases = []
+    frontend = layer._workspace._frontend
+    original_agree = frontend._gin_agree
+
+    def agree(error, phase):
+        phases.append(phase)
+        return original_agree(error, phase)
+
+    graph = torch.cuda.CUDAGraph()
+    with monkeypatch.context() as patch:
+        patch.setattr(frontend, "_gin_agree", agree)
+        with (
+            pytest.raises(GinPreflightError, match="requires a prepared launch"),
+            torch.cuda.graph(graph),
+        ):
+            layer.forward(inputs)
+    assert phases == ["capture-ready"]
+    assert layer._kernel._thunk_states  # The existing warm binding was retained.
+    layer._transformed = original_weights
+    actual = layer.forward(inputs)
+    torch.cuda.synchronize()
+    assert torch.equal(actual, expected)
+    del graph
+    layer.destroy()
+
+
+def test_nvfp4_gin_relay_requires_gin():
+    """Reject the unsupported raw relay-only combination before lowering."""
+    from flashinfer.moe_ep.kernel_src.sm100 import cutedsl_megamoe as pkg
+
+    import cutlass
+
+    bootstrap = _bootstrap()
+    config = pkg.MegaMoENvfp4Config(
+        rank=bootstrap.rank,
+        world_size=4,
+        num_tokens_per_rank=32,
+        num_topk=4,
+        num_total_experts=48,
+        hidden=7168,
+        intermediate=3072,
+        internode=True,
+        ranks_per_node=2,
+        token_back_mode="reuse_dispatch_warps",
+        epi_flag_batch=(1, 4),
+        group_hint=2**29,
+    )
+    kernel, _ = pkg.MegaMoENvfp4Frontend(config)._construct_kernel()
+    assert kernel.enable_nccl_gin and kernel.enable_internode_relay
+    with pytest.raises(
+        ValueError, match="internode=True requires enable_nccl_gin=True"
+    ):
+        type(kernel)(
+            mma_tiler_mnk=config.mma_tiler_mnk,
+            cluster_shape_mnk=config.cluster_shape_mnk,
+            use_2cta_instrs=config.use_2cta_instrs,
+            group_hint=2**29,
+            token_padding_block=128,
+            sf_padding_block=4,
+            world_size=4,
+            num_topk=4,
+            max_tokens_per_rank=32,
+            hidden=7168,
+            fc2_output_dtype=cutlass.BFloat16,
+            ranks_per_node=2,
+            internode=True,
+            enable_internode_relay=True,
+            enable_nccl_gin=False,
+        )

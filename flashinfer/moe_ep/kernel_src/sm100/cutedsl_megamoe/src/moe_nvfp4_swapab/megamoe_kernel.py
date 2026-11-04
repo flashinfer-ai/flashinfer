@@ -201,7 +201,7 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
         # Master switch of every internode (multi-node) code path. False (the default) is the
         # NVLink-domain megakernel of main: no relay warps, no GIN, one logical node, the
         # historical MMA loop and FC2 publish batch; the internode knobs below must stay at
-        # their defaults. True opts in and requires enable_internode_relay=True.
+        # their defaults. True opts in and requires relay and NCCL GIN together.
         internode: bool = False,
         combine_format: CombineFormat = CombineFormat.parse("bf16"),
         non_ubulk_fc2_store: bool = True,
@@ -250,6 +250,8 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
             ranks_per_node = world_size
         elif not enable_internode_relay:
             raise ValueError("internode=True requires enable_internode_relay=True")
+        elif not enable_nccl_gin:
+            raise ValueError("internode=True requires enable_nccl_gin=True")
         if epi_flag_batch is None:
             epi_flag_batch = (1, 4) if self.internode else (1, 1)
         # The combine wire format drives the fc2 epilogue encoder, token_comm
@@ -595,7 +597,6 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
                 ranks_per_node=self.ranks_per_node,
                 num_experts_per_rank=self.num_experts_per_rank,
                 combine_slot_indexed=True,
-                f4cvt_use_manual=config.diagnostics.f4cvt_use_manual,
             )
         # Region layout (same call drives both get_workspace_sizes() and
         # the __call__ partition).
@@ -2447,7 +2448,6 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
                 ranks_per_node=self.ranks_per_node,
                 num_experts_per_rank=self.num_experts_per_rank,
                 combine_slot_indexed=self.enable_nccl_gin,
-                f4cvt_use_manual=self.config.diagnostics.f4cvt_use_manual,
             )
             if cutlass.const_expr(self.enable_nccl_gin):
                 reduce(combine_target, combine_sf, output_activation, score, stream,
