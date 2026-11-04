@@ -308,3 +308,32 @@ inefficiency. Nine bitwise tests, memcheck and synccheck pass. The existing
 CUTLASS async-copy racecheck issue remains, including in v22, so the default
 remains v6. See workspace `results/direct/prefill_cute_ncu_opt/README.md` for
 per-change measurements, rejected experiments, final profile and validation.
+
+## Public FP8 prefill integration
+
+`prefill.cuh` is the v22-derived implementation used by the native FlashInfer
+prefill dispatcher for DSV4.1 inline FP8 caches and FP8 compute. Footer caches,
+mixed FP4 extra caches and BF16 compute retain their existing implementations.
+`prefill<true>` fuses Q RoPE and inverse-RoPE/output quantization;
+`prefill<false>` accepts already-rotated BF16 Q and writes BF16 context.
+Both specialize at compile time, preserve runtime lengths/indices on graph
+replay and honor the public LSE stride and base multiplier.
+
+Public-module measurements (RTX PRO 6000, Q4096, KV16384, compressed KV8192,
+H64, D512, SWA128 + top512, 24 alternating CUDA-graph samples):
+
+- Integrated mega: 1.8563 ms.
+- Standalone v22 in the same run: 1.8541 ms.
+- Integrated non-fused core plus separate prologue/epilogue: 2.4279 ms.
+
+The CUDA activity trace confirms one `prefill<true>` launch for mega and three
+launches for the non-fused pipeline. Independent FP64 relative L2 is 0.03349,
+maximum LSE error 0.04706 (unchanged 0.07 / 0.06 gates). Eight public-API cases
+cover heads 8/16/32/64, CP ranks 0/3, two requests, changed positions and lengths
+under replay, empty rows and invalid indices. See
+`tests/attention/test_sparse_mla_sm120_cute_prefill_integration.py`.
+
+The inherited async-copy racecheck reports are **still unresolved**. This
+integration is a development-branch substitution requested for continued work,
+not a claim of racecheck-clean production readiness. Workspace artifacts are
+under `results/direct/prefill_integrated/`.

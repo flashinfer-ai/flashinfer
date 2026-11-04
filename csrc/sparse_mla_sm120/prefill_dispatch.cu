@@ -3,6 +3,7 @@
 #include <flashinfer/attention/sparse_mla_sm120/execution/prefill_launch.cuh>
 
 #include "attention_dispatch.h"
+#include <flashinfer/attention/sparse_mla_sm120/kernels/cute_prefill/prefill.cuh>
 
 namespace flashinfer::sparse_mla_sm120 {
 
@@ -23,13 +24,40 @@ PrefillLaunchResult dispatch_prefill(const execution::AttentionParams& p,
       return launch(std::integral_constant<ModelType, ModelType::DSV4_1_INLINE>{});
     return launch(std::integral_constant<ModelType, ModelType::DSV4_1>{});
   }
+  // Inline FP8 rows are flat; retain the existing routes for footer/mixed caches
+  // and requests that explicitly require BF16 QK arithmetic.
+  if (mt == ModelType::DSV4_1_INLINE && !m.extra_fp4 &&
+      plan.numeric == execution::NumericRoute::FP8 &&
+      m.indices_stride == size_t(m.topk) &&
+      (!m.extra_topk || m.extra_indices_stride == size_t(m.extra_topk))) {
+    using namespace cute_prefill::integrated;
+    Params a{};
+    a.q = p.q; a.kv = p.kv; a.extra_kv = p.extra_kv;
+    a.indices = p.indices; a.extra_indices = p.extra_indices;
+    a.lengths = p.topk_length; a.extra_lengths = p.extra_topk_length;
+    a.positions = p.mega.positions; a.cos_sin = p.mega.cos_sin;
+    a.sink = p.attn_sink; a.output = p.mega.output; a.scales = p.mega.scales;
+    a.bf16_output = p.output; a.lse = p.out_lse;
+    a.tokens = m.tokens; a.heads = m.heads; a.topk = m.topk; a.extra_topk = m.extra_topk;
+    a.kv_stride = m.row_stride_bytes; a.extra_stride = m.extra_row_stride_bytes;
+    a.sm_scale = p.sm_scale; a.lse_stride = m.lse_stride; a.lse_scale = p.lse_scale;
+    auto launch = [&](auto fused) -> PrefillLaunchResult {
+      constexpr bool Mega = decltype(fused)::value;
+      static bool configured[32] = {};
+      auto status = configure_dynamic_smem_per_device(prefill<Mega>, sizeof(Shared), configured);
+      if (!status.supported || status.error != cudaSuccess) return status;
+      prefill<Mega><<<m.tokens * ((m.heads + 31) / 32), 384, sizeof(Shared), stream>>>(a);
+      return {cudaGetLastError(), "CuTe sparse prefill"};
+    };
+    return p.mega.output ? launch(std::true_type{}) : launch(std::false_type{});
+  }
   PrefillColdParams cold{p.sm_scale,          m.tokens,
                          m.page_stride_bytes, m.extra_page_stride_bytes,
                          m.lse_stride,        m.topk,
                          m.extra_topk,        p.attn_sink,
                          p.topk_length,       p.extra_topk_length,
                          p.extra_kv,          p.extra_indices,
-                         m.extra_page_size,   m.page_size};
+                         m.extra_page_size,   m.page_size, {}, {}};
   cold.lse_scale = p.lse_scale;
   cold.mega = p.mega;
   if (cache_format_info(mt).inline_scale) {
