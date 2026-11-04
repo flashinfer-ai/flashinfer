@@ -425,8 +425,9 @@ RECORD_ARCHES = {
 # The deterministic package's records no cell of this package launches: the sm_107a rows from 16 heads (the only
 # rows of the builds with the L2 hints off) run the S1 pair on every backward path of the g mode (their programs ship
 # as the raw class's, RAW_DQKG), and the in-kernel Q/K L2 norm's records (#7817: its fused class, 7 g records with
-# their 7 raw twins and the sm_103a forward intra and GLM intra forms, the 2 GLM intra capture forms and the 3
-# programs of its fallback route) run only under use_qk_l2norm_in_kernel=True, which this package refuses.
+# their 7 raw twins, the sm_103a forward intra and GLM intra forms and the replay prep's saved-rstd twin, the 2 GLM
+# intra capture forms and the 3 programs of its fallback route) run only under use_qk_l2norm_in_kernel=True, which
+# this package refuses.
 DET_RECORDS_NOT_LAUNCHED = frozenset(
     (
         "dqkg_davq_nohint",
@@ -436,6 +437,7 @@ DET_RECORDS_NOT_LAUNCHED = frozenset(
         "fwd_intra_v37_l2n",
         "bwd_prep_g8_l2n",
         "bwd_prep_g8_replay_l2n",
+        "bwd_prep_g8_replay_saved_l2n",  # the replay prep's saved-rstd twin
         "bwd_prep_g8_noqg_l2n",
         "bwd_prep_g8_noqg_nokb_l2n",
         "glm_intra_l2n",
@@ -482,10 +484,10 @@ TAPE_TWINS = {"wy_bwd": "wy_bwd_v9"}
 TAPE_WY_RECORDS = frozenset(TAPE_TWINS.values())
 # The logical names of the WY record's parameters the twin does not take: u and the operands only u reads.
 TAPE_WY_DROPPED = frozenset({"v", "beta", "u"})
-# The registry's size: the deterministic package's 96 records, less those, plus the seven S1 records, the hand-off
+# The registry's size: the deterministic package's 97 records, less those, plus the seven S1 records, the hand-off
 # twins, the tape WY twin and the fused gradient's raw class.
 MODULE_COUNT = (
-    96
+    97
     - len(DET_RECORDS_NOT_LAUNCHED)
     + 7
     + len(TWIN_RECORDS)
