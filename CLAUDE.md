@@ -325,6 +325,9 @@ For graph-mode ragged wrappers, stage both mask lengths into owned storage from
 the first cuDNN plan, even when both are inferred. Replan with fresh caller
 tensors and alternate Q-only, KV-only, both and omitted lengths while replaying
 the same capture; checking only the latest eager run misses stale bindings.
+For qualified cumulative-mask paths, prefix-sum the valid lengths in `plan()`
+into separate owned buffers; physical indptrs still locate storage. Refresh both
+mask representations after eligibility changes so old captures remain valid.
 
 FA2 captures also bind CPU-generated scheduling metadata, including output and
 merge prefixes. Updating only Q/KV indptr tensors after switching to cuDNN leaves

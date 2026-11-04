@@ -42,6 +42,7 @@ from .cudnn.prefill import (
     _cudnn_single_token_gqa_ragged_stats_broken,
     _cudnn_supports_direct_seqlens,
     _cudnn_supports_paged_auto,
+    _cudnn_prefill_prefers_cumulative_lengths,
     CudnnPrefillGraph,
     _PrefillMetadata,
     _CudnnPrefillPlan,
@@ -5639,6 +5640,16 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         self._cudnn_cpu_indptr_buffers: list[Optional[torch.Tensor]] = [None, None]
         self._cudnn_mask_buffers: Optional[tuple[torch.Tensor, ...]] = None
         self._cudnn_mask_buffers_flat: tuple[torch.Tensor, ...] = ()
+        self._cudnn_mask_prefix_buffers: Optional[tuple[torch.Tensor, ...]] = None
+
+    def _allocate_cudnn_mask_prefix_buffers(self, batch_size):
+        # cuDNN declares 16-byte pointer alignment. Pad each row to 128 bytes
+        # so both logical prefixes remain aligned for every batch size.
+        prefix_size = batch_size + 1
+        row_stride = ((prefix_size + 31) // 32) * 32
+        return torch.zeros((2, row_stride), dtype=torch.int32, device=self.device)[
+            :, :prefix_size
+        ].unbind(0)
 
     def _stage_cudnn_indptr(self, source, index, non_blocking):
         if source.device.type != "cpu":
@@ -6443,14 +6454,37 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     self._backend, *get_module_args
                 )
 
+        use_cudnn_mask_prefixes = (
+            self._backend == "cudnn"
+            and _cudnn_prefill_prefers_cumulative_lengths(
+                self.device,
+                q_data_type,
+                kv_data_type,
+                o_data_type,
+                num_qo_heads,
+                num_kv_heads,
+                head_dim_qk,
+                head_dim_vo,
+                self._max_token_per_sequence
+                if self._max_token_per_sequence is not None
+                else max_qo_len,
+                causal=causal,
+            )
+        )
         if (
-            self._backend == "cudnn" and self.is_cuda_graph_enabled
+            self._backend == "cudnn"
+            and (self.is_cuda_graph_enabled or use_cudnn_mask_prefixes)
         ) or self._cudnn_mask_buffers is not None:
             # Captures retain both mask pointers, including an inferred side.
             # Start with the same representation when neither length is given,
             # so later explicit/default transitions can update the old graph.
             # Refresh even after auto switches away: that capture is still live.
-            if self._cudnn_mask_buffers is None:
+            if (
+                self._cudnn_mask_buffers is None
+                or self._cudnn_mask_buffers_flat[0].numel() != batch_size
+            ):
+                # Graph-mode batch size is fixed by the constructor; ordinary
+                # eager wrappers can resize both representations on replan.
                 self._cudnn_mask_buffers_flat = torch.empty(
                     (2, batch_size), dtype=torch.int32, device=self.device
                 ).unbind(0)
@@ -6458,6 +6492,10 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     buffer.view(batch_size, 1, 1, 1)
                     for buffer in self._cudnn_mask_buffers_flat
                 )
+                if self._cudnn_mask_prefix_buffers is not None:
+                    self._cudnn_mask_prefix_buffers = (
+                        self._allocate_cudnn_mask_prefix_buffers(batch_size)
+                    )
             q_mask = qo_len_arr if seq_lens_q is None else seq_lens_q
             kv_mask = kv_len_arr if seq_lens is None else seq_lens
             if q_mask.ndim not in (1, 4):
@@ -6480,6 +6518,20 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             )
             if self._backend == "cudnn":
                 self._seq_lens_q, self._seq_lens_kv = self._cudnn_mask_buffers
+            if use_cudnn_mask_prefixes or self._cudnn_mask_prefix_buffers is not None:
+                if self._cudnn_mask_prefix_buffers is None:
+                    self._cudnn_mask_prefix_buffers = (
+                        self._allocate_cudnn_mask_prefix_buffers(batch_size)
+                    )
+                # These are valid-length prefixes, not physical row origins.
+                # Refresh both representations even after eligibility/provider
+                # changes: older CUDA graphs can still retain either pointer.
+                for lengths, prefix in zip(
+                    self._cudnn_mask_buffers_flat,
+                    self._cudnn_mask_prefix_buffers,
+                    strict=True,
+                ):
+                    torch.cumsum(lengths, 0, dtype=torch.int32, out=prefix[1:])
 
         if self._backend == "cudnn":
             if (
@@ -6546,6 +6598,12 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 ).resolve_from_plan(
                     q_data_type, num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo
                 )
+                if use_cudnn_mask_prefixes:
+                    metadata.cu_seq_lens_q, metadata.cu_seq_lens_kv = (
+                        self._cudnn_mask_prefix_buffers
+                    )
+                    metadata.actual_seq_lens_q = None
+                    metadata.actual_seq_lens_kv = None
                 self._cudnn_lse_unservable = not (
                     metadata.bind_single_token_stats_unragged(
                         total_num_rows, num_qo_heads, num_kv_heads
@@ -7178,10 +7236,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     "zero-length requests. Use backend='auto', which routes these "
                     "steps to another backend, or return_lse=False"
                 )
-            # The caller's token-unit indptrs go straight to cuDNN (mask +
-            # ragged offsets, scaled in-engine); no per-call conversion kernels.
-            # actual_seq_lens_q/kv are optional: the direct path derives them
-            # from the indptrs. The stats ragged offset makes cuDNN write the
+            # Token-unit physical indptrs and valid-length masks are separate
+            # cuDNN operands; plan() stages any needed mask prefixes, so run()
+            # launches no conversion kernels. The stats ragged offset writes
             # LSE packed as [total_tokens, num_qo_heads], the wrapper's contract.
             if self._seq_lens_q is not None and self._seq_lens_q.dim() == 1:
                 self._seq_lens_q = self._seq_lens_q.reshape(-1, 1, 1, 1)
