@@ -51,8 +51,8 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 
 extern "C" {
 
-__global__ __launch_bounds__(32) void
-kernel_cake_msa_icp_indexer_c814d9c38454ed640f71(int* __restrict__ recv, int* __restrict__ num_valid_pages, int* __restrict__ output, int* __restrict__ errors, int* __restrict__ expected, int recv_stride_src, int recv_stride_h, int recv_stride_t, int out_stride_t, int out_stride_h, int capacity, int num_tokens, int world, int tagged, int prefill, int init_blocks, int local_blocks, int spin_limit)
+__global__ __launch_bounds__(128) void
+kernel_cake_msa_icp_indexer_5a530c36a00b387eb420(int* __restrict__ recv, int* __restrict__ num_valid_pages, int* __restrict__ output, int* __restrict__ errors, int* __restrict__ expected, int recv_stride_src, int recv_stride_h, int recv_stride_t, int out_stride_t, int out_stride_h, int capacity, int num_tokens, int world, int tagged, int prefill, int init_blocks, int local_blocks, int spin_limit)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -81,9 +81,9 @@ kernel_cake_msa_icp_indexer_c814d9c38454ed640f71(int* __restrict__ recv, int* __
 
     // === Task calls (declaration order) ===
     int lane_1 = (int)lane;
-    int t = (int)blockIdx.x + (int)warp;
+    int t = (int)blockIdx.x * 4 + (int)warp;
     int h = (int)blockIdx.y;
-    int mode = ((tagged != 0) ? 2 : 1);
+    int mode = 0;
     if (mode == 2) {
         asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     }
@@ -101,7 +101,7 @@ kernel_cake_msa_icp_indexer_c814d9c38454ed640f71(int* __restrict__ recv, int* __
             unsigned int sb[1];
             int ib[1];
             int nv = 0;
-            int early = 1;
+            int early = (int)(mode != 1);
             if (early != 0) {
                 nv = num_valid_pages[t];
             }
@@ -111,58 +111,8 @@ kernel_cake_msa_icp_indexer_c814d9c38454ed640f71(int* __restrict__ recv, int* __
             long long base_0 = row + src_0 * (long long)recv_stride_src;
             long long word_0 = base_0 + (long long)(lane_1 & 15);
             long long word64_0 = (base_0 >> 1) + (long long)(lane_1 & 15);
-            if (mode == 1) {
-                long long ready_0 = base_0 + 32;
-                int ready_ld_0;
-                asm volatile("ld.acquire.sys.global.s32 %0, [%1];" : "=r"(ready_ld_0) : "l"(reinterpret_cast<int*>(recv + ready_0)) : "memory");
-                int seen_0 = ready_ld_0;
-                int spins_0 = 1;
-                unsigned int pend_0 = __ballot_sync(0xFFFFFFFF, seen_0 != 1);
-                while (pend_0 != 0 && spins_0 < spin_limit) {
-                    if (seen_0 != 1) {
-                        int ready_ld2_0;
-                        asm volatile("ld.acquire.sys.global.s32 %0, [%1];" : "=r"(ready_ld2_0) : "l"(reinterpret_cast<int*>(recv + ready_0)) : "memory");
-                        seen_0 = ready_ld2_0;
-                    }
-                    unsigned int _warp_vote_0 = __ballot_sync(0xFFFFFFFF, seen_0 != 1);
-                    pend_0 = _warp_vote_0;
-                    spins_0 = spins_0 + 1;
-                }
-                late = late | (int)(seen_0 != 1);
-                int32_t score_ld_0;
-                asm volatile("ld.relaxed.sys.s32 %0, [%1];" : "=r"(score_ld_0) : "l"(recv + word_0) : "memory");
-                int32_t id_ld_0;
-                asm volatile("ld.relaxed.sys.s32 %0, [%1];" : "=r"(id_ld_0) : "l"(recv + (word_0 + 16)) : "memory");
-                sb[0] = (unsigned int)score_ld_0;
-                ib[0] = id_ld_0;
-            } else {
-                uint64_t score_w_0;
-                asm volatile("ld.relaxed.sys.u64 %0, [%1];" : "=l"(score_w_0) : "l"(recv64 + word64_0) : "memory");
-                uint64_t id_w_0;
-                asm volatile("ld.relaxed.sys.u64 %0, [%1];" : "=l"(id_w_0) : "l"(recv64 + (word64_0 + 16)) : "memory");
-                unsigned long long sw_0 = score_w_0;
-                unsigned long long iw_0 = id_w_0;
-                int spins_t_0 = 1;
-                int miss_t_0 = (int)((unsigned int)(sw_0 >> 32) != gen || (unsigned int)(iw_0 >> 32) != gen);
-                unsigned int pend_t_0 = __ballot_sync(0xFFFFFFFF, miss_t_0 != 0);
-                while (pend_t_0 != 0 && spins_t_0 < spin_limit) {
-                    if (miss_t_0 != 0) {
-                        uint64_t score_w2_0;
-                        asm volatile("ld.relaxed.sys.u64 %0, [%1];" : "=l"(score_w2_0) : "l"(recv64 + word64_0) : "memory");
-                        uint64_t id_w2_0;
-                        asm volatile("ld.relaxed.sys.u64 %0, [%1];" : "=l"(id_w2_0) : "l"(recv64 + (word64_0 + 16)) : "memory");
-                        sw_0 = score_w2_0;
-                        iw_0 = id_w2_0;
-                        miss_t_0 = (int)((unsigned int)(sw_0 >> 32) != gen || (unsigned int)(iw_0 >> 32) != gen);
-                    }
-                    unsigned int _warp_vote_1 = __ballot_sync(0xFFFFFFFF, miss_t_0 != 0);
-                    pend_t_0 = _warp_vote_1;
-                    spins_t_0 = spins_t_0 + 1;
-                }
-                late = late | miss_t_0;
-                sb[0] = (unsigned int)sw_0;
-                ib[0] = (int)(unsigned int)iw_0;
-            }
+            sb[0] = (unsigned int)recv[word_0];
+            ib[0] = recv[word_0 + 16];
             int pending = late;
             unsigned int stalled = __ballot_sync(0xFFFFFFFF, pending != 0);
             if (stalled != 0) {
@@ -478,8 +428,8 @@ kernel_cake_msa_icp_indexer_c814d9c38454ed640f71(int* __restrict__ recv, int* __
             int taken = 0;
             int sel_0 = pick[0];
             unsigned int chosen_0 = __ballot_sync(0xFFFFFFFF, sel_0 != 0);
-            int _rank_in_mask_2 = (int)__popc(chosen_0 & ((1u << (unsigned int)lane) - 1u));
-            int pos_0 = taken + (int)_rank_in_mask_2;
+            int _rank_in_mask_0 = (int)__popc(chosen_0 & ((1u << (unsigned int)lane) - 1u));
+            int pos_0 = taken + (int)_rank_in_mask_0;
             if (sel_0 != 0) {
                 output[dst + (long long)pos_0] = li[0];
             }
@@ -516,7 +466,7 @@ kernel_cake_msa_icp_indexer_c814d9c38454ed640f71(int* __restrict__ recv, int* __
             unsigned int sb_1[2];
             int ib_1[2];
             int nv_1 = 0;
-            int early_1 = 1;
+            int early_1 = (int)(mode != 1);
             if (early_1 != 0) {
                 nv_1 = num_valid_pages[t];
             }
@@ -526,114 +476,14 @@ kernel_cake_msa_icp_indexer_c814d9c38454ed640f71(int* __restrict__ recv, int* __
             long long base_1 = row_1 + src_1 * (long long)recv_stride_src;
             long long word_1 = base_1 + (long long)(lane_1 & 15);
             long long word64_1 = (base_1 >> 1) + (long long)(lane_1 & 15);
-            if (mode == 1) {
-                long long ready_1 = base_1 + 32;
-                int ready_ld_1;
-                asm volatile("ld.acquire.sys.global.s32 %0, [%1];" : "=r"(ready_ld_1) : "l"(reinterpret_cast<int*>(recv + ready_1)) : "memory");
-                int seen_1 = ready_ld_1;
-                int spins_1 = 1;
-                unsigned int pend_1 = __ballot_sync(0xFFFFFFFF, seen_1 != 1);
-                while (pend_1 != 0 && spins_1 < spin_limit) {
-                    if (seen_1 != 1) {
-                        int ready_ld2_1;
-                        asm volatile("ld.acquire.sys.global.s32 %0, [%1];" : "=r"(ready_ld2_1) : "l"(reinterpret_cast<int*>(recv + ready_1)) : "memory");
-                        seen_1 = ready_ld2_1;
-                    }
-                    unsigned int _warp_vote_3 = __ballot_sync(0xFFFFFFFF, seen_1 != 1);
-                    pend_1 = _warp_vote_3;
-                    spins_1 = spins_1 + 1;
-                }
-                late_1 = late_1 | (int)(seen_1 != 1);
-                int32_t score_ld_1;
-                asm volatile("ld.relaxed.sys.s32 %0, [%1];" : "=r"(score_ld_1) : "l"(recv + word_1) : "memory");
-                int32_t id_ld_1;
-                asm volatile("ld.relaxed.sys.s32 %0, [%1];" : "=r"(id_ld_1) : "l"(recv + (word_1 + 16)) : "memory");
-                sb_1[0] = (unsigned int)score_ld_1;
-                ib_1[0] = id_ld_1;
-            } else {
-                uint64_t score_w_1;
-                asm volatile("ld.relaxed.sys.u64 %0, [%1];" : "=l"(score_w_1) : "l"(recv64_1 + word64_1) : "memory");
-                uint64_t id_w_1;
-                asm volatile("ld.relaxed.sys.u64 %0, [%1];" : "=l"(id_w_1) : "l"(recv64_1 + (word64_1 + 16)) : "memory");
-                unsigned long long sw_1 = score_w_1;
-                unsigned long long iw_1 = id_w_1;
-                int spins_t_1 = 1;
-                int miss_t_1 = (int)((unsigned int)(sw_1 >> 32) != gen_1 || (unsigned int)(iw_1 >> 32) != gen_1);
-                unsigned int pend_t_1 = __ballot_sync(0xFFFFFFFF, miss_t_1 != 0);
-                while (pend_t_1 != 0 && spins_t_1 < spin_limit) {
-                    if (miss_t_1 != 0) {
-                        uint64_t score_w2_1;
-                        asm volatile("ld.relaxed.sys.u64 %0, [%1];" : "=l"(score_w2_1) : "l"(recv64_1 + word64_1) : "memory");
-                        uint64_t id_w2_1;
-                        asm volatile("ld.relaxed.sys.u64 %0, [%1];" : "=l"(id_w2_1) : "l"(recv64_1 + (word64_1 + 16)) : "memory");
-                        sw_1 = score_w2_1;
-                        iw_1 = id_w2_1;
-                        miss_t_1 = (int)((unsigned int)(sw_1 >> 32) != gen_1 || (unsigned int)(iw_1 >> 32) != gen_1);
-                    }
-                    unsigned int _warp_vote_4 = __ballot_sync(0xFFFFFFFF, miss_t_1 != 0);
-                    pend_t_1 = _warp_vote_4;
-                    spins_t_1 = spins_t_1 + 1;
-                }
-                late_1 = late_1 | miss_t_1;
-                sb_1[0] = (unsigned int)sw_1;
-                ib_1[0] = (int)(unsigned int)iw_1;
-            }
+            sb_1[0] = (unsigned int)recv[word_1];
+            ib_1[0] = recv[word_1 + 16];
             long long src_2 = (long long)(2 + (lane_1 >> 4));
             long long base_2 = row_1 + src_2 * (long long)recv_stride_src;
             long long word_2 = base_2 + (long long)(lane_1 & 15);
             long long word64_2 = (base_2 >> 1) + (long long)(lane_1 & 15);
-            if (mode == 1) {
-                long long ready_2 = base_2 + 32;
-                int ready_ld_2;
-                asm volatile("ld.acquire.sys.global.s32 %0, [%1];" : "=r"(ready_ld_2) : "l"(reinterpret_cast<int*>(recv + ready_2)) : "memory");
-                int seen_2 = ready_ld_2;
-                int spins_2 = 1;
-                unsigned int pend_2 = __ballot_sync(0xFFFFFFFF, seen_2 != 1);
-                while (pend_2 != 0 && spins_2 < spin_limit) {
-                    if (seen_2 != 1) {
-                        int ready_ld2_2;
-                        asm volatile("ld.acquire.sys.global.s32 %0, [%1];" : "=r"(ready_ld2_2) : "l"(reinterpret_cast<int*>(recv + ready_2)) : "memory");
-                        seen_2 = ready_ld2_2;
-                    }
-                    unsigned int _warp_vote_5 = __ballot_sync(0xFFFFFFFF, seen_2 != 1);
-                    pend_2 = _warp_vote_5;
-                    spins_2 = spins_2 + 1;
-                }
-                late_1 = late_1 | (int)(seen_2 != 1);
-                int32_t score_ld_2;
-                asm volatile("ld.relaxed.sys.s32 %0, [%1];" : "=r"(score_ld_2) : "l"(recv + word_2) : "memory");
-                int32_t id_ld_2;
-                asm volatile("ld.relaxed.sys.s32 %0, [%1];" : "=r"(id_ld_2) : "l"(recv + (word_2 + 16)) : "memory");
-                sb_1[1] = (unsigned int)score_ld_2;
-                ib_1[1] = id_ld_2;
-            } else {
-                uint64_t score_w_2;
-                asm volatile("ld.relaxed.sys.u64 %0, [%1];" : "=l"(score_w_2) : "l"(recv64_1 + word64_2) : "memory");
-                uint64_t id_w_2;
-                asm volatile("ld.relaxed.sys.u64 %0, [%1];" : "=l"(id_w_2) : "l"(recv64_1 + (word64_2 + 16)) : "memory");
-                unsigned long long sw_2 = score_w_2;
-                unsigned long long iw_2 = id_w_2;
-                int spins_t_2 = 1;
-                int miss_t_2 = (int)((unsigned int)(sw_2 >> 32) != gen_1 || (unsigned int)(iw_2 >> 32) != gen_1);
-                unsigned int pend_t_2 = __ballot_sync(0xFFFFFFFF, miss_t_2 != 0);
-                while (pend_t_2 != 0 && spins_t_2 < spin_limit) {
-                    if (miss_t_2 != 0) {
-                        uint64_t score_w2_2;
-                        asm volatile("ld.relaxed.sys.u64 %0, [%1];" : "=l"(score_w2_2) : "l"(recv64_1 + word64_2) : "memory");
-                        uint64_t id_w2_2;
-                        asm volatile("ld.relaxed.sys.u64 %0, [%1];" : "=l"(id_w2_2) : "l"(recv64_1 + (word64_2 + 16)) : "memory");
-                        sw_2 = score_w2_2;
-                        iw_2 = id_w2_2;
-                        miss_t_2 = (int)((unsigned int)(sw_2 >> 32) != gen_1 || (unsigned int)(iw_2 >> 32) != gen_1);
-                    }
-                    unsigned int _warp_vote_6 = __ballot_sync(0xFFFFFFFF, miss_t_2 != 0);
-                    pend_t_2 = _warp_vote_6;
-                    spins_t_2 = spins_t_2 + 1;
-                }
-                late_1 = late_1 | miss_t_2;
-                sb_1[1] = (unsigned int)sw_2;
-                ib_1[1] = (int)(unsigned int)iw_2;
-            }
+            sb_1[1] = (unsigned int)recv[word_2];
+            ib_1[1] = recv[word_2 + 16];
             int pending_1 = late_1;
             unsigned int stalled_1 = __ballot_sync(0xFFFFFFFF, pending_1 != 0);
             if (stalled_1 != 0) {
@@ -1446,16 +1296,16 @@ kernel_cake_msa_icp_indexer_c814d9c38454ed640f71(int* __restrict__ recv, int* __
             int taken_1 = 0;
             int sel_1 = pick_1[0];
             unsigned int chosen_1 = __ballot_sync(0xFFFFFFFF, sel_1 != 0);
-            int _rank_in_mask_7 = (int)__popc(chosen_1 & ((1u << (unsigned int)lane) - 1u));
-            int pos_1 = taken_1 + (int)_rank_in_mask_7;
+            int _rank_in_mask_1 = (int)__popc(chosen_1 & ((1u << (unsigned int)lane) - 1u));
+            int pos_1 = taken_1 + (int)_rank_in_mask_1;
             if (sel_1 != 0) {
                 output[dst_1 + (long long)pos_1] = li_1[0];
             }
             taken_1 = taken_1 + (int)(unsigned int)__popc(chosen_1);
             int sel_2 = pick_1[1];
             unsigned int chosen_2 = __ballot_sync(0xFFFFFFFF, sel_2 != 0);
-            int _rank_in_mask_8 = (int)__popc(chosen_2 & ((1u << (unsigned int)lane) - 1u));
-            int pos_2 = taken_1 + (int)_rank_in_mask_8;
+            int _rank_in_mask_2 = (int)__popc(chosen_2 & ((1u << (unsigned int)lane) - 1u));
+            int pos_2 = taken_1 + (int)_rank_in_mask_2;
             if (sel_2 != 0) {
                 output[dst_1 + (long long)pos_2] = li_1[1];
             }

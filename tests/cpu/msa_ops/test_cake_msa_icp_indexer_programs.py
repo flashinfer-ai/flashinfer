@@ -70,6 +70,7 @@ REQUIRED_ROLES = (
     "merge",
     "merge_legacy",
     "merge_prefill",
+    "merge_tagged",
 )
 # The fused decode chain ships as one unit (DESIGN O-4): both roles or neither.
 FUSED_ROLES = ("decode_topk", "topk16_publish")
@@ -558,6 +559,7 @@ def test_records_are_well_formed() -> None:
         "merge": ("tokens_per_cta_by_head",),
         "merge_legacy": ("tokens_per_cta_by_head",),
         "merge_prefill": ("tokens_per_cta_by_head",),
+        "merge_tagged": ("tokens_per_cta_by_head",),
         "prefill_list_carrier": ("tokens_per_cta_by_head",),
         "plan": cake_jit.GRID_RULES,
     }
@@ -794,6 +796,10 @@ def _drive_every_role(arch: str) -> None:
         _call(msa_ops.msa_icp_merge_candidates, merge_args(tp, prefill=True))
         # legacy decode merges of 8+ tokens take the one-token-per-CTA program
         _call(msa_ops.msa_icp_merge_candidates, merge_args(tp, t=9, cap=9))
+        # the facade's tagged decode merge polls first (merge_tagged)
+        cb.merge_candidates(
+            **merge_args(tp, tagged=True), enable_pdl=True, _poll_first=True
+        )
 
 
 @pytest.mark.parametrize("arch", ARCHES)
@@ -1770,8 +1776,12 @@ def test_facade_decode_defaults_to_plane_and_select_publish(
     t = a["index_q"].shape[0]
     bases = comm.tagged_recv_bases if tagged else comm.recv_bases
     plan.decode(*inputs, **kwargs)
-    # T = 8 tokens: a legacy merge takes merge_legacy (one token per CTA)
-    merge_role = "merge" if tagged or t < cb.LEGACY_MERGE_MIN_TOKENS else "merge_legacy"
+    # T = 8 tokens: a legacy merge takes merge_legacy (one token per CTA); a
+    # tagged one the merge that polls first at world 4 and merge at world 2
+    if tagged:
+        merge_role = "merge_tagged" if world == 4 else "merge"
+    else:
+        merge_role = "merge" if t < cb.LEGACY_MERGE_MIN_TOKENS else "merge_legacy"
     assert fake.roles() == ["decode_plane", "select_publish", merge_role]
     plane, publish, merge = fake
     assert all(launch.enable_pdl for launch in fake)
@@ -1842,7 +1852,9 @@ def test_facade_decode_takes_the_fused_chain_by_rule(
             )
         ]
         kwargs = dict(comm=comm, slot=1, tagged=tagged, decode_query_len=4)
-        merge = cb.merge_role(prefill=False, tagged=tagged, num_tokens=t)
+        merge = cb.merge_role(
+            prefill=False, tagged=tagged, num_tokens=t, poll_first=world == 4
+        )
         fake.clear()
         plan.decode(*inputs, scores, output, **kwargs)
         fused = rule is not None and batch >= rule
@@ -2158,7 +2170,8 @@ def test_merge_routes_wide_legacy_decode_merges_to_merge_legacy(
     """Prefill carrier merges run the prefill program ``merge_prefill``; legacy
     decode merges of at least 8 tokens run the one-token-per-CTA
     ``merge_legacy`` program; tagged rows and fewer tokens run ``merge`` (4
-    tokens per CTA).  Same launch arguments either way."""
+    tokens per CTA).  Same launch arguments either way.  Only the facade's
+    decode chain (``poll_first``) picks ``merge_tagged`` for tagged rows."""
     assert cb.LEGACY_MERGE_MIN_TOKENS == 8
     world = 2
     a = merge_args(
@@ -2184,6 +2197,13 @@ def test_merge_routes_wide_legacy_decode_merges_to_merge_legacy(
         prefill=mode == "prefill", tagged=mode == "tagged", num_tokens=t
     )
     assert role == want
+    polled = cb.merge_role(
+        prefill=mode == "prefill",
+        tagged=mode == "tagged",
+        num_tokens=t,
+        poll_first=True,
+    )
+    assert polled == ("merge_tagged" if mode == "tagged" else want)
     assert launch.grid_args == {"tokens": t, "heads": H // world}
     assert launch.values["num_tokens"] == t
     assert launch.values["tagged"] == int(mode == "tagged")
@@ -2196,14 +2216,14 @@ def test_merge_programs_launch_one_or_four_tokens_per_cta(
     monkeypatch, arch: str
 ) -> None:
     """With the exported records: ``merge_legacy`` launches (T, hpr) CTAs,
-    ``merge`` and ``merge_prefill`` (ceil(T / 4), hpr)."""
+    ``merge``, ``merge_prefill`` and ``merge_tagged`` (ceil(T / 4), hpr)."""
     fake = _intercept(monkeypatch, arch, real_registry=True)
     rules = {
         name: record["grid_rule"]
         for name, record in cake_jit.MODULES.items()
-        if record["role"] in ("merge", "merge_legacy", "merge_prefill")
+        if record["role"] in ("merge", "merge_legacy", "merge_prefill", "merge_tagged")
     }
-    assert sorted(r["rows"] for r in rules.values()) == [1, 4, 4], rules
+    assert sorted(r["rows"] for r in rules.values()) == [1, 4, 4, 4], rules
     for mode, t, want_x in (
         ("legacy", 9, 9),
         ("legacy", 7, 2),
