@@ -599,7 +599,9 @@ def test_k2_routes(monkeypatch):
         )
         is atomic.result
     )
-    assert atomic.calls[4][1]["splits"] == 1 and atomic.calls[4][1]["enable_pdl"] is None
+    assert (
+        atomic.calls[4][1]["splits"] == 1 and atomic.calls[4][1]["enable_pdl"] is None
+    )
     assert (
         cake_backend.router_fp32_gemm(X, W.t(), torch.zeros(T, N), deterministic=False)
         is atomic.result
@@ -2423,7 +2425,9 @@ def test_k2_planner_plans_the_simt_input_gradient(monkeypatch):
     assert plan is None and "router weight's rows" in reason
     # an expert count not a multiple of 4 (a row with a window forced for it): the deterministic program
     monkeypatch.setitem(
-        cake_backend.ROUTER_RULES, (arch, "kn", hidden, 254), ((1, 128, "simt_n64m32s4"),)
+        cake_backend.ROUTER_RULES,
+        (arch, "kn", hidden, 254),
+        ((1, 128, "simt_n64m32s4"),),
     )
     G3, W3 = torch.zeros(64, E)[:, :254], torch.zeros(254, hidden)
     plan, reason = cake_backend.plan_atomic_router(G3, W3, out, **kw)
@@ -2844,7 +2848,21 @@ def test_k2_values_feed_every_registered_router_program():
             "A", "B", "out", "M", "N", "K", "lda", "ldb", "ldo", "enable_pdl",
             "grid_x", "grid_y", "grid_z",
         ]  # fmt: skip
-        assert arguments == ["g", "w", "o", 231, 5120, 256, 260, 5124, 5128, 0, 80, 8, 1]
+        assert arguments == [
+            "g",
+            "w",
+            "o",
+            231,
+            5120,
+            256,
+            260,
+            5124,
+            5128,
+            0,
+            80,
+            8,
+            1,
+        ]
     names = [
         n
         for n, r in cake_jit.MODULES.items()
@@ -5929,9 +5947,7 @@ def test_gpu_router_dgrad_simt_program_waits_for_an_early_producer(router_rule):
     router_rule("dgrad", Y, W, _simt_spec(tile))
     want_y = det_backend.router_det_forward(X, W, enable_pdl=False)
     want_dx = torch.empty_like(dX)
-    cake_backend.router_dgrad(
-        want_y, W, want_dx, deterministic=False, enable_pdl=False
-    )
+    cake_backend.router_dgrad(want_y, W, want_dx, deterministic=False, enable_pdl=False)
     torch.cuda.synchronize()
     assert _rel_fro(want_dx, want_y.double() @ W.double()) <= ROUTER_REL_FRO_MAX
     want_dw = torch.empty_like(dW)
@@ -5975,7 +5991,9 @@ def test_gpu_router_input_gradient_windows_run_at_their_edges():
         if rule_arch != arch or layout != "kn" or not isinstance(rule, tuple):
             continue
         last = max(hi for _, hi, _ in rule)
-        edges = {1, 17, last + 1} | {lo for lo, _, _ in rule} | {hi for _, hi, _ in rule}
+        edges = (
+            {1, 17, last + 1} | {lo for lo, _, _ in rule} | {hi for _, hi, _ in rule}
+        )
         for T in sorted(edges):
             X, W, G = _router_inputs(T, device, SEED + 143 + T, K=hidden)
             spec = next((s for lo, hi, s in rule if lo <= T <= hi), None)
@@ -6014,9 +6032,13 @@ def test_gpu_router_input_gradient_windows_run_at_their_edges():
                 prepared.module_name,
             )
             ran += 1
-    print(f"ROUTER_DGRAD_WINDOW_EDGES {arch} sm_count={sm_count}: {ran} token counts ran")
+    print(
+        f"ROUTER_DGRAD_WINDOW_EDGES {arch} sm_count={sm_count}: {ran} token counts ran"
+    )
     if not ran:
-        pytest.skip(f"no input-gradient SIMT window of {arch} applies on {sm_count} SMs")
+        pytest.skip(
+            f"no input-gradient SIMT window of {arch} applies on {sm_count} SMs"
+        )
 
 
 def test_gpu_router_entry_points_reach_the_stream_k_program(router_rule):

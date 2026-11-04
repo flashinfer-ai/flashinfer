@@ -1142,7 +1142,9 @@ def router_simt_template(tile: tuple[int, int, int], layout: str = "nn_t") -> st
     if layout == "kn":
         return f"{cake_jit.TEMPLATE_PREFIXES[4]}m{tile_m}n{tile_n}s{slices}"
     if layout != "nn_t":
-        raise ValueError(f"router_simt_template: no SIMT program of the {layout!r} class")
+        raise ValueError(
+            f"router_simt_template: no SIMT program of the {layout!r} class"
+        )
     return f"{cake_jit.TEMPLATE_PREFIXES[3]}n{tile_n}m{tile_m}s{slices}"
 
 
@@ -1612,7 +1614,10 @@ def plan_atomic_router(
             "",
         )
     if layout == "kn":
-        return None, "the kn class runs the deterministic program outside its SIMT windows"
+        return (
+            None,
+            "the kn class runs the deterministic program outside its SIMT windows",
+        )
     template = cake_jit.TEMPLATE_PREFIXES[1] + ("nn_t" if swapped else "kk")
     if template not in cake_jit.KERNELS.get(arch, {}):
         return None, f"{template} is not registered for {arch}"
