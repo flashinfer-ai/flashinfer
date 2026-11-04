@@ -1184,8 +1184,10 @@ def test_k1_212_sm_token_ranges():
     """On 212-SM sm_107a parts the rows of :data:`K1_SPLIT_RULES_BY_SM_TOKEN_RANGES` take their 212-SM verdict at
     every token count of their ranges (both ends and the measured token counts inside), except a token count of
     :data:`K1_SPLIT_RULE_EXCLUDED_TOKENS` for the part, and run the deterministic program one token outside a range
-    and at every measured token count outside the ranges and the window.  Every range starts and ends at a measured
-    token count, lies inside 512 to 65536 tokens and belongs to a row with a program on that part.  Another SM count
+    and at every measured token count outside the ranges and the window (except the two-split ranges of
+    :data:`K1_SPLIT_EVEN_BLOCK_RANGES_BY_SM` at an even number of K blocks: ``test_k1_212_sm_even_block_ranges``).
+    Every range starts and ends at a measured token count, lies inside 512 to 65536 tokens and belongs to a row with
+    a program on that part.  Another SM count
     (208, 210, 216, 217) and every other row keep their routing: 208 SMs and the other 212-SM rows run the
     deterministic program outside the window, 216 SMs and up decide by :data:`K1_SPLIT_RULES`."""
     table = cake_backend.K1_SPLIT_RULES_BY_SM_TOKEN_RANGES
@@ -1232,8 +1234,10 @@ def test_k1_212_sm_token_ranges():
                 if first <= T <= last or any(a <= T <= b for a, b in spans):
                     continue
                 assert p(key, 212, T) is None, (key, T)
+        even = K1_212_EVEN_BLOCK_RANGES.get((key[2], key[3], key[4]), ())
         for T in K1_212_MEASURED_TOKENS:
-            if T not in held and not first <= T <= last:
+            two_split = _k1_blocks(T) % 2 == 0 and any(a <= T <= b for a, b, _ in even)
+            if T not in held and not first <= T <= last and not two_split:
                 assert p(key, 212, T) is None, (key, T)
         for T in (131072, 511):
             assert p(key, 212, T) is None, (key, T)
@@ -1347,6 +1351,155 @@ def test_k1_212_sm_range_overrides():
     assert by_sm[key] is None
     for T in (12289, 16172, 16231, 16384, 32768, 65536):
         assert p(key, 212, T) is None, T
+
+
+#: The ranges of :data:`K1_SPLIT_EVEN_BLOCK_RANGES_BY_SM` on 212-SM sm_107a parts, ``(d_in, d_out, out_dtype) ->
+#: ((min_tokens, max_tokens, (block_n, num_splits)), ...)``: two splits of the row's 212-SM tile width at a token count
+#: that spans an even number of 64-token K blocks.
+K1_212_EVEN_BLOCK_RANGES = {
+    (4096, 512, "f32"): ((1024, 8192, (128, 2)), (32768, 65536, (128, 2))),
+    (4096, 1024, "f32"): ((2048, 8192, (192, 2)), (32768, 65536, (192, 2))),
+    (5120, 512, "f32"): ((1024, 8192, (128, 2)), (32768, 65536, (128, 2))),
+    (5120, 1024, "f32"): ((1024, 8192, (256, 2)),),
+}
+#: The measured token counts of those rows: 512 to 65536 tokens and the window's 16231 and 16384.
+K1_212_EVEN_BLOCK_MEASURED_TOKENS = (
+    512,
+    1024,
+    2048,
+    4096,
+    8192,
+    16231,
+    16384,
+    32768,
+    65536,
+)
+
+
+def _k1_blocks(T):
+    """The 64-token K blocks a token count spans."""
+    return -(-int(T) // 64)
+
+
+def test_k1_212_sm_even_block_ranges(monkeypatch):
+    """On 212-SM sm_107a parts a token count of a range of :data:`K1_SPLIT_EVEN_BLOCK_RANGES_BY_SM` that spans an even
+    number of 64-token K blocks runs that range's program (two splits of the row's 212-SM tile width), except a token
+    count of :data:`K1_SPLIT_RULE_EXCLUDED_TOKENS` for the part; one that spans an odd number (1025, 8193, 40961), and
+    every token count outside the ranges, keeps the plan the part has without the table.  A range starts and ends at a
+    measured token count with an even block count, lies inside 1024 to 65536 tokens, outside the window and outside the
+    row's ranges in :data:`K1_SPLIT_RULES_BY_SM_TOKEN_RANGES` and :data:`K1_SPLIT_RANGE_OVERRIDES_BY_SM`.  208, 210,
+    211, 213, 216 and 217 SMs plan every row and token count as without the table."""
+    table = cake_backend.K1_SPLIT_EVEN_BLOCK_RANGES_BY_SM
+    assert set(table) == {("sm_107a", 212)}
+    rows = table[("sm_107a", 212)]
+    assert {(k[2], k[3], k[4]) for k in rows} == set(K1_212_EVEN_BLOCK_RANGES)
+    by_sm = cake_backend.K1_SPLIT_RULES_BY_SM[("sm_107a", 212)]
+    token_ranges = cake_backend.K1_SPLIT_RULES_BY_SM_TOKEN_RANGES[("sm_107a", 212)]
+    overrides = cake_backend.K1_SPLIT_RANGE_OVERRIDES_BY_SM.get(("sm_107a", 212), {})
+    excluded = cake_backend.K1_SPLIT_RULE_EXCLUDED_TOKENS
+    first, last = cake_backend.K1_SPLIT_RULES_BY_SM_TOKENS
+
+    def cut(key, sm_count, T):
+        floor = cake_backend.K1_MIN_SM_COUNT["sm_107a"]
+        return any(
+            (sm_count >= sms if sms >= floor else sm_count == sms)
+            and lo <= T
+            and (hi is None or hi >= T)
+            for sms, lo, hi in excluded.get(key, ())
+        )
+
+    def p(M, N, T, sm_count=212):
+        return cake_backend.k1_plan(
+            arch="sm_107a", L=1, M=M, N=N, K=T, out_f32=True, sm_count=sm_count
+        )
+
+    for key, spans in rows.items():
+        assert key[0] == "sm_107a" and key[1] == 1 and key[4] == "f32", key
+        want = K1_212_EVEN_BLOCK_RANGES[(key[2], key[3], key[4])]
+        assert tuple(spans) == want, key
+        verdict = by_sm[key]
+        assert verdict is not None, key
+        for (_a, b, _v), (c, _d, _w) in zip(spans, spans[1:], strict=False):
+            assert b < c, key
+        for lo, hi, choice in spans:
+            assert lo in K1_212_EVEN_BLOCK_MEASURED_TOKENS, key
+            assert hi in K1_212_EVEN_BLOCK_MEASURED_TOKENS, key
+            assert 1024 <= lo <= hi <= 65536, key
+            assert _k1_blocks(lo) % 2 == 0 and _k1_blocks(hi) % 2 == 0, key
+            assert hi < first or lo > last, key
+            own = token_ranges.get(key, ())
+            assert not any(a <= hi and lo <= b for a, b in own), key
+            over = overrides.get(key, ())
+            assert not any(a <= hi and lo <= b for a, b, _ in over), key
+            assert tuple(choice) == (verdict[0], 2), key
+    # an odd number of K blocks inside a range (17, 129 and 641 blocks) runs the deterministic program, an even number
+    # (16, 94 and 1024 blocks) the two-split program
+    for M, N in ((4096, 512), (5120, 512)):
+        for T in (1025, 8193, 40961):
+            assert p(M, N, T) is None, (M, N, T)
+        for T in (1024, 6000, 65536):
+            assert p(M, N, T) == (128, 2), (M, N, T)
+    for T in (1024, 1025, 2049, 8193, 40961):
+        assert p(4096, 1024, T) is None, T
+    for T in (2048, 6000, 65536):
+        assert p(4096, 1024, T) == (192, 2), T
+    for T in (1025, 8193, 32768, 65536):
+        assert p(5120, 1024, T) is None, T
+    for T in (1024, 6000, 8192):
+        assert p(5120, 1024, T) == (256, 2), T
+    # outside the ranges (an even number of blocks each) the rows keep their 212-SM routing: the one-split program at
+    # 512 tokens (K1_SPLIT_RULES_BY_SM_TOKEN_RANGES), the deterministic program elsewhere outside the window
+    for M, N, _ in K1_212_EVEN_BLOCK_RANGES:
+        assert p(M, N, 512) == tuple(by_sm[("sm_107a", 1, M, N, "f32")]), (M, N)
+        for T in (8320, 12000, 32640, 65664, 131072):
+            assert p(M, N, T) is None, (M, N, T)
+        # 208 and 216 SMs: the deterministic program and the 216-SM one-split verdict
+        rule = tuple(cake_backend.K1_SPLIT_RULES[("sm_107a", 1, M, N, "f32")])
+        for T in (1024, 6000, 8192, 32768):
+            assert p(M, N, T, sm_count=208) is None, (M, N, T)
+            assert p(M, N, T, sm_count=216) == rule, (M, N, T)
+
+    sms_list = (208, 210, 211, 212, 213, 216, 217)
+    Ts = {
+        T + d
+        for T in K1_212_EVEN_BLOCK_MEASURED_TOKENS + (6000, 12000, 40961, 131072)
+        for d in (-1, 0, 1)
+    }
+    for spans in rows.values():
+        for lo, hi, _ in spans:
+            Ts |= {lo + 63, lo + 64, lo + 65, hi - 64, hi - 63, (lo + hi) // 2}
+
+    def plans():
+        out = {}
+        for key in rows:
+            _, L, M, N, dt = key
+            for sm_count in sms_list:
+                for T in sorted(Ts):
+                    out[(key, sm_count, T)] = cake_backend.k1_plan(
+                        arch="sm_107a",
+                        L=L,
+                        M=M,
+                        N=N,
+                        K=T,
+                        out_f32=dt == "f32",
+                        sm_count=sm_count,
+                    )
+        return out
+
+    with_table = plans()
+    monkeypatch.setattr(cake_backend, "K1_SPLIT_EVEN_BLOCK_RANGES_BY_SM", {})
+    without = plans()
+    routed = 0
+    for (key, sm_count, T), plan in with_table.items():
+        held = [tuple(v) for lo, hi, v in rows[key] if lo <= T <= hi]
+        two_split = sm_count == 212 and bool(held) and _k1_blocks(T) % 2 == 0
+        if two_split and not cut(key, sm_count, T):
+            assert plan == held[0], (key, T)
+            assert without[(key, sm_count, T)] is None, (key, T)
+            routed += 1
+        else:
+            assert plan == without[(key, sm_count, T)], (key, sm_count, T)
+    assert routed
 
 
 #: The 148-SM entries of :data:`K1_SPLIT_RULE_EXCLUDED_TOKENS_BY_SM`, ``(arch, d_in, d_out, out_dtype) -> ranges``.
@@ -1558,8 +1711,9 @@ def test_k1_216_sm_override_holds_only_at_its_sm_count_and_token_counts(
     tokens (:data:`K1_SPLIT_OVERRIDES_BY_SM`), except at 16231 tokens (its 216-SM entry of
     :data:`K1_SPLIT_RULE_EXCLUDED_TOKENS`: the deterministic program); one token outside that window and on 217 SMs
     it keeps its :data:`K1_SPLIT_RULES` verdict (256-wide tiles at one split), on 215 SMs (no table) it runs the
-    deterministic program, and on 212 SMs its own table decides.  On 216 SMs the launch is the row-major-store
-    program's: 88 tiles, 176 CTAs."""
+    deterministic program, and on 212 SMs its own tables decide (the two-split program of
+    :data:`K1_SPLIT_EVEN_BLOCK_RANGES_BY_SM` at an even K-block count inside its ranges, else the deterministic
+    program).  On 216 SMs the launch is the row-major-store program's: 88 tiles, 176 CTAs."""
     arch, d_in, d_out = "sm_107a", 4096, 1024
     key = (arch, 1, d_in, d_out, "f32")
     overrides = cake_backend.K1_SPLIT_OVERRIDES_BY_SM
@@ -1579,10 +1733,12 @@ def test_k1_216_sm_override_holds_only_at_its_sm_count_and_token_counts(
     # 16231 tokens: the deterministic program from 216 SMs up and on 208 / 212 SMs
     for sms in (208, 212, 215, 216, 217, 280):
         assert plan(sms, 16231) is None, sms
+    even_212 = K1_212_EVEN_BLOCK_RANGES[(d_in, d_out, "f32")]
     for T in (1024, 8192, 16171, 16385, 32768):
         assert plan(216, T) == (256, 1), T
         assert plan(217, T) == (256, 1), T
-        assert plan(212, T) is None, T
+        want = [v for lo, hi, v in even_212 if lo <= T <= hi and _k1_blocks(T) % 2 == 0]
+        assert plan(212, T) == (want[0] if want else None), T
     # every other row and token count on 216 SMs: the record verdict; BF16 4096 -> 1024 has none
     assert (
         cake_backend.k1_plan(
@@ -1712,7 +1868,9 @@ def test_k1_sm107a_wide_fp32_rows_at_large_token_counts():
     ``K1_SM107A_FP32_BUDGET_TOKENS`` up, with no upper bound, these rows run the deterministic program on parts of 216
     SMs or more (their entries in :data:`K1_SPLIT_RULE_EXCLUDED_TOKENS`) and keep their one-split program one token
     below.  The 208-SM and 212-SM tables hold only at 16172 to 16384 tokens, so those parts run the deterministic
-    program at these token counts as before; the other entries of these rows lie in that window.  No other sm_107a
+    program at these token counts as before, except the 212-SM two-split ranges at an even number of 64-token K blocks
+    (``K1_212_EVEN_BLOCK_RANGES``: 32768, 40960 and 65536 tokens of three of the rows); the other entries of these
+    rows lie in that window.  No other sm_107a
     row has such a range, and sm_100a / sm_103a have no verdict for these rows."""
     T0 = K1_SM107A_FP32_BUDGET_TOKENS
     rows = K1_SM107A_WIDE_FP32_ROWS
@@ -1740,9 +1898,16 @@ def test_k1_sm107a_wide_fp32_rows_at_large_token_counts():
                 assert p(M, N, sms, T) == choice, (M, N, sms, T)
             for T in (T0, 45056, 65536, 65537, 131072):
                 assert p(M, N, sms, T) is None, (M, N, sms, T)
+        even = K1_212_EVEN_BLOCK_RANGES[(M, N, "f32")]
         for sms in (208, 212, 215):
             for T in (32768, T0 - 1, T0, 65536, 131072):
-                assert p(M, N, sms, T) is None, (M, N, sms, T)
+                held = [
+                    tuple(v)
+                    for lo, hi, v in even
+                    if sms == 212 and lo <= T <= hi and _k1_blocks(T) % 2 == 0
+                ]
+                want = held[0] if held else None
+                assert p(M, N, sms, T) == want, (M, N, sms, T)
         for arch, sms in (("sm_100a", 148), ("sm_100a", 152), ("sm_103a", 152)):
             assert (arch, 1, M, N, "f32") not in cake_backend.K1_SPLIT_RULES
             for T in (T0 - 1, T0, 65536):
@@ -4046,6 +4211,49 @@ def test_k1_212_sm_range_overrides_bind_per_token_count(monkeypatch):
         assert len(entry_fn.calls) == len(cases)
 
 
+def test_k1_212_sm_even_block_ranges_bind_per_token_count(monkeypatch):
+    """The convenience path plans each token count of a K1 call at the part's SM count, so the ranges of
+    :data:`K1_SPLIT_EVEN_BLOCK_RANGES_BY_SM` hold there too: on a 212-SM ``sm_107a`` part the weight gradient of each
+    row of ``K1_212_EVEN_BLOCK_RANGES`` binds that range's two-split program at its first and last token count, and
+    the deterministic package's plan one token outside it and one token past its first token count (an odd number of
+    64-token K blocks), each token count its own cache entry."""
+    arch = "sm_107a"
+    entry_fn = _cpu_k1_launches(monkeypatch, arch)
+    facts = det_backend.DeviceFacts(
+        index=0, arch=arch, sm_count=212, l2_bytes=126 << 20
+    )
+    monkeypatch.setattr(det_backend, "device_facts", lambda device=None: facts)
+    monkeypatch.setattr(cake_backend, "_k1_index", lambda *views: 0)
+    bf16 = torch.bfloat16
+    for (d_in, d_out, dt), spans in K1_212_EVEN_BLOCK_RANGES.items():
+        cake_backend._K1_ATOMIC_CACHE.clear()
+        entry_fn.calls.clear()
+        out = torch.empty(d_out, d_in, dtype=torch.float32 if dt == "f32" else bf16)
+        cases = []
+        for lo, hi, choice in spans:
+            assert _k1_blocks(lo + 1) % 2 == 1, (d_in, d_out, lo)
+            cases += [(lo, tuple(choice)), (hi, tuple(choice)), (lo + 1, None)]
+            cases += [
+                (T, None)
+                for T in (lo - 1, hi + 1)
+                if not any(a <= T <= b for a, b, _ in spans)
+            ]
+        cases = sorted(set(cases))
+        for T, choice in cases:
+            G, X = torch.empty(T, d_out, dtype=bf16), torch.empty(T, d_in, dtype=bf16)
+            assert cake_backend.projection_wgrad(G, X, out, deterministic=False) is out
+            entry = next(reversed(cake_backend._K1_ATOMIC_CACHE.values()))
+            where = (d_in, d_out, dt, T)
+            assert entry.k1 is not None, where
+            if choice is not None:
+                assert entry.det_plan is None, where
+                assert (entry.plan.block_n, entry.plan.splits) == choice, where
+            else:
+                assert entry.plan is None and entry.det_plan is not None, where
+        assert len(cake_backend._K1_ATOMIC_CACHE) == len(cases)
+        assert len(entry_fn.calls) == len(cases)
+
+
 def test_k1_exact_sm_count_exclusions_bind_per_token_count(monkeypatch):
     """The convenience path plans each token count of a K1 call at the part's SM count, so the entries of
     :data:`K1_SPLIT_RULE_EXCLUDED_TOKENS_BY_SM` hold there too: on a 148-SM part the weight gradient of each row of
@@ -5553,6 +5761,7 @@ def k1_rule(monkeypatch):
         monkeypatch.setattr(cake_backend, "K1_SPLIT_OVERRIDES_BY_SM", {})
         monkeypatch.setattr(cake_backend, "K1_SPLIT_RULE_EXCLUDED_TOKENS_BY_SM", {})
         monkeypatch.setattr(cake_backend, "K1_SPLIT_RANGE_OVERRIDES_BY_SM", {})
+        monkeypatch.setattr(cake_backend, "K1_SPLIT_EVEN_BLOCK_RANGES_BY_SM", {})
         cake_backend.clear_convenience_caches()
         return cake_backend.atomic_k1_template(block_n, f32)
 
@@ -6901,23 +7110,31 @@ def test_gpu_k1_sm_count_overrides_through_the_convenience_binding():
 
 
 def _k1_token_range_edges(arch, sm_count):
-    """``(key, choice, T, want)`` for every row of the part's ranges in :data:`K1_SPLIT_RULES_BY_SM_TOKEN_RANGES` and
-    :data:`K1_SPLIT_RANGE_OVERRIDES_BY_SM`: the first and the last token count of each range (``want``: the program of
-    the part's table, or of the override range) and one token outside it where neither the window nor another range of
-    the row holds (``want`` ``None``: the deterministic program); ``choice`` is the planner's."""
+    """``(key, choice, T, want)`` for every row of the part's ranges in :data:`K1_SPLIT_RULES_BY_SM_TOKEN_RANGES`,
+    :data:`K1_SPLIT_RANGE_OVERRIDES_BY_SM` and :data:`K1_SPLIT_EVEN_BLOCK_RANGES_BY_SM`: the first and the last token
+    count of each range (``want``: the program of the part's table, or of the override or two-split range) and one
+    token outside it where neither the window nor another range of the row holds (``want`` ``None``: the
+    deterministic program), and one token past the first token count of a two-split range (an odd number of 64-token K
+    blocks: ``want`` ``None``); ``choice`` is the planner's."""
     first, last = cake_backend.K1_SPLIT_RULES_BY_SM_TOKENS
     part = (arch, sm_count)
     rows = cake_backend.K1_SPLIT_RULES_BY_SM_TOKEN_RANGES.get(part, {})
     over = cake_backend.K1_SPLIT_RANGE_OVERRIDES_BY_SM.get(part, {})
+    even = cake_backend.K1_SPLIT_EVEN_BLOCK_RANGES_BY_SM.get(part, {})
     table = cake_backend.K1_SPLIT_RULES_BY_SM.get(part, {})
     cases = []
-    for key in sorted(set(rows) | set(over)):
+    for key in sorted(set(rows) | set(over) | set(even)):
         _, L, M, N, dt = key
-        spans = [(lo, hi, table[key]) for lo, hi in rows.get(key, ())]
-        spans += [(lo, hi, v) for lo, hi, v in over.get(key, ())]
-        for lo, hi, _ in spans:
-            for T in sorted({lo, hi, lo - 1, hi + 1}):
-                held = [v for a, b, v in spans if a <= T <= b]
+        spans = [(lo, hi, table[key], False) for lo, hi in rows.get(key, ())]
+        spans += [(lo, hi, v, False) for lo, hi, v in over.get(key, ())]
+        spans += [(lo, hi, v, True) for lo, hi, v in even.get(key, ())]
+        for lo, hi, _, parity in spans:
+            for T in sorted({lo, hi, lo - 1, hi + 1} | ({lo + 1} if parity else set())):
+                held = [
+                    v
+                    for a, b, v, par in spans
+                    if a <= T <= b and not (par and _k1_blocks(T) % 2)
+                ]
                 if not held and first <= T <= last:
                     continue
                 plan = cake_backend.k1_plan(
@@ -6964,11 +7181,13 @@ def _k1_exact_sm_count_edges(arch, sm_count):
 
 def test_gpu_k1_sm_count_token_ranges_run_at_their_edges():
     """Unforced (``deterministic=False``, no split count), on a part of exactly the SM count of a table of
-    :data:`K1_SPLIT_RULES_BY_SM_TOKEN_RANGES` or :data:`K1_SPLIT_RANGE_OVERRIDES_BY_SM` (``sm_107a``: 212 SMs): at the
-    first and the last token count of every range of a row the prepared launch runs the program of the part's table
-    in :data:`K1_SPLIT_RULES_BY_SM` (of the range, for an override range) and meets the deterministic package's FP64
-    budget (:func:`_k1_check_or_as_det`); one token outside a range (and outside the window) the row runs the
-    deterministic program, with the deterministic package's bits.  On a part of exactly the SM count of a table of
+    :data:`K1_SPLIT_RULES_BY_SM_TOKEN_RANGES`, :data:`K1_SPLIT_RANGE_OVERRIDES_BY_SM` or
+    :data:`K1_SPLIT_EVEN_BLOCK_RANGES_BY_SM` (``sm_107a``: 212 SMs): at the first and the last token count of every
+    range of a row the prepared launch runs the program of the part's table in :data:`K1_SPLIT_RULES_BY_SM` (of the
+    range, for an override or two-split range) and meets the deterministic package's FP64 budget
+    (:func:`_k1_check_or_as_det`); one token outside a range (and outside the window), and one token past the first
+    token count of a two-split range (an odd number of K blocks), the row runs the deterministic program, with the
+    deterministic package's bits.  On a part of exactly the SM count of a table of
     :data:`K1_SPLIT_RULE_EXCLUDED_TOKENS_BY_SM` (148-SM ``sm_100a`` / ``sm_103a`` parts) the reverse: the deterministic
     program with its bits at both ends of a range, the row's program one token outside it.  A part of any other SM
     count skips."""
@@ -7011,11 +7230,12 @@ def test_gpu_k1_sm_count_token_ranges_run_at_their_edges():
 
 def test_gpu_k1_sm_count_token_ranges_through_the_convenience_binding():
     """Unforced (``deterministic=False``, no split count), on a part of exactly the SM count of a table of
-    :data:`K1_SPLIT_RULES_BY_SM_TOKEN_RANGES` or :data:`K1_SPLIT_RANGE_OVERRIDES_BY_SM` (``sm_107a``: 212 SMs): the
-    convenience path binds the part's program (the range's, for an override range) at the first and the last token
-    count of every range of a row (its :data:`_K1_ATOMIC_CACHE` entry) and gives the
-    bits of the prepared launch where at most two partials meet (the FP64 budget otherwise), the tickets zero after;
-    one token outside a range it binds the deterministic package's plan.  On a part of exactly the SM count of a table
+    :data:`K1_SPLIT_RULES_BY_SM_TOKEN_RANGES`, :data:`K1_SPLIT_RANGE_OVERRIDES_BY_SM` or
+    :data:`K1_SPLIT_EVEN_BLOCK_RANGES_BY_SM` (``sm_107a``: 212 SMs): the convenience path binds the part's program
+    (the range's, for an override or two-split range) at the first and the last token count of every range of a row
+    (its :data:`_K1_ATOMIC_CACHE` entry) and gives the bits of the prepared launch where at most two partials meet (the
+    FP64 budget otherwise), the tickets zero after; one token outside a range, and one token past the first token count
+    of a two-split range, it binds the deterministic package's plan.  On a part of exactly the SM count of a table
     of :data:`K1_SPLIT_RULE_EXCLUDED_TOKENS_BY_SM` the reverse.  A part of any other SM count skips."""
     device, arch = _atomic_device_or_skip()
     sm_count = det_backend.device_facts(device).sm_count
