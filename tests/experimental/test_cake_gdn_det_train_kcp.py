@@ -4135,17 +4135,21 @@ def test_workspace_layout_of_a_forward_without_a_saved_set(segments) -> None:
 
 
 def _ckpt_autograd_region(
-    kcp, ctx, ops, *, ckpt: bool, later_saver: bool, **opts
+    kcp, ctx, ops, *, ckpt: bool, later_saver: bool, handle=None, **opts
 ) -> tuple[dict[str, torch.Tensor], torch.Tensor | None]:
     """``out`` and the gradients of a region that ends with the GDN call (``later_saver=False``) or continues with an
     operation that saves tensors for its backward (a scaling by a leaf, ``later_saver=True``), directly or under a
-    non-reentrant checkpoint; the leaf's gradient comes beside the result."""
+    non-reentrant checkpoint (``handle``: the GDN call's ``recompute_handle``); the leaf's gradient comes beside the
+    result."""
     leaves = [
         ops[n].detach().clone().requires_grad_(True)
         for n in ("q", "k", "v", "g", "beta")
     ]
     scale = torch.full((), 1.5, dtype=torch.bfloat16, requires_grad=True)
     o = {"backend": "fake", **opts}
+    if handle is not None:
+        assert ckpt, "a recompute handle needs the checkpoint"
+        o["recompute_handle"] = handle
 
     def fn(q, k, v, g, beta):
         out = kcp.chunk_gdn_det_kcp(q, k, v, g, beta, ctx, **o)
@@ -4809,10 +4813,14 @@ def test_fused_output_walk_reproduces_the_split_forward(monkeypatch, knobs) -> N
 def test_fused_output_walk_under_checkpoints_and_handles(segments) -> None:
     """One rank (no exchange), P = 1 / 2: direct autograd, non-reentrant checkpoints of a region the GDN node closes and
     of one with a later saver under every ``reuse_recompute_tapes`` form (the mixed case: a fused first forward, a
-    split hand-off recompute with ``True``), the recompute handle, ``save_mode="full"`` and the replay boundary: out
-    and every gradient equal bitwise with the shipped options and with ``fused_o=0``; the first forward of a light
-    region is fused, a hand-off or a full / replay-boundary forward never is, and no kept entry is left."""
+    split hand-off recompute with ``True``), the recompute handle with a later saver (its recompute writes the output
+    the saver reads: the ``S_in`` branch's tape walks run fused), ``save_mode="full"`` and the replay boundary: out
+    and every gradient equal bitwise with the shipped options and with ``fused_o=0`` (the handle form: and the direct
+    pass); the first forward of a light region is fused, a recompute is fused exactly when it launches #5 without a
+    hand-off (the frame proof is read on a verified torch only), a hand-off or a full / replay-boundary forward never
+    is, and no kept entry is left."""
     kcp, ctx, ops = _ckpt_setup()
+    opt = _package("cake_options")
     base = {"segments": segments}
     forms = [
         ("direct", dict(ckpt=False, later_saver=False)),
@@ -4829,10 +4837,14 @@ def test_fused_output_walk_under_checkpoints_and_handles(segments) -> None:
             "replay_boundary",
             dict(ckpt=False, later_saver=False, boundary_mode="replay"),
         ),
+        ("handle_later", dict(ckpt=True, later_saver=True, handle=True)),
     ]
     for name, form in forms:
         got = {}
         for fused in (1, 0):
+            run = dict(form)
+            if run.pop("handle", False):
+                run["handle"] = kcp.RecomputeHandleDetKcp()
             seen: list[str] = []
             previous = kcp._BACKENDS.get("fake")
 
@@ -4845,12 +4857,13 @@ def test_fused_output_walk_under_checkpoints_and_handles(segments) -> None:
             kcp._BACKENDS["fake"] = Recording()
             try:
                 res, scale_grad = _ckpt_autograd_region(
-                    kcp, ctx, ops, **form, **base, test_knobs={"fused_o": fused}
+                    kcp, ctx, ops, **run, **base, test_knobs={"fused_o": fused}
                 )
             finally:
                 kcp._BACKENDS["fake"] = previous
-            got[fused] = (res, scale_grad, seen)
-        (r1, s1, seen1), (r0, s0, seen0) = got[1], got[0]
+            # the last forward's record: the recompute's under a checkpoint
+            got[fused] = (res, scale_grad, seen, dict(kcp.LAST_CALL["fwd"]))
+        (r1, s1, seen1, rec1), (r0, s0, seen0, rec0) = got[1], got[0]
         for n in ("out",) + CKPT_GRADS:
             assert torch.equal(r1[n], r0[n]), (name, n)
         assert (s1 is None and s0 is None) or torch.equal(s1, s0), name
@@ -4862,14 +4875,33 @@ def test_fused_output_walk_under_checkpoints_and_handles(segments) -> None:
         assert "kcp_fwdh_out" not in seen0, name
         if light:
             # the first forward is fused (one #5 fewer); a recompute that launches #5 without a hand-off is fused too
-            assert seen0.count("fwd_o") - seen1.count("fwd_o") >= 1, (
-                name,
-                seen0,
-                seen1,
+            # (one more): it launches #5 unless the frame proof finds its output dead (a closing node, verified torch),
+            # and it hands its tapes off with True, or with "auto" when the frame proof keeps them (_auto_hand_off)
+            reuse = form.get("reuse_recompute_tapes", opt.REUSE_RECOMPUTE_TAPES_DEFAULT)
+            later = form["later_saver"]
+            hand_off = reuse is True or (
+                reuse == "auto" and not later and _auto_hand_off(kcp)
             )
+            recompute_fused = (
+                form["ckpt"] and (later or not _verified_torch(kcp)) and not hand_off
+            )
+            assert seen0.count("fwd_o") - seen1.count("fwd_o") == (
+                2 if recompute_fused else 1
+            ), (name, recompute_fused, seen0, seen1)
             assert seen1.count("fwd_o") + seen1.count("kcp_fwdh_out") >= 1, name
         else:
             assert seen1 == seen0, name  # no forward of these forms fuses
+        if "handle" in form:
+            # the recompute read S_in from the handle and its walks wrote the output the later saver consumes
+            direct, direct_scale = _ckpt_autograd_region(
+                kcp, ctx, ops, ckpt=False, later_saver=True, save_transfer=False, **base
+            )
+            for n in ("out",) + CKPT_GRADS:
+                assert torch.equal(r1[n], direct[n]), (name, n)
+            assert torch.equal(s1, direct_scale), name
+            assert rec1["recompute_handle"] == rec0["recompute_handle"] == "replay"
+            assert (rec1["fwd_o"], rec0["fwd_o"]) == ("fused", "launched"), name
+            assert rec1["P"] == segments, name
         assert kcp.kept_registry_size() == 0, name
 
 
