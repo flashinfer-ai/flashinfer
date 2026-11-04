@@ -439,16 +439,19 @@ def test_split_layer_quantizes_tokens_before_dispatch(backend, quant_pair, prims
         if not is_prims_ts_available():
             pytest.skip("Prims-TS needs nvidia-cutlass-dsl with cutlass.experimental")
     candidate = _split_candidate(quant_pair, prims_ts)
-    major, minor = torch.cuda.get_device_capability()
-    if not candidate.supported(major * 10 + minor):
-        pytest.skip(f"{type(candidate).__name__} does not support SM{major}{minor}")
-    if (
-        isinstance(candidate, CuteDslConfig)
-        and quant_pair == ("MXFP4", "MXFP8")
-        and (major, minor) == (10, 7)
-    ):
-        pytest.skip("CuTe-DSL W4A8 does not support SM107")
     rank, world_size = _init_dist()
+    capabilities = [None] * world_size
+    dist.all_gather_object(capabilities, torch.cuda.get_device_capability())
+    # Every rank must skip together before constructing communication buffers.
+    for major, minor in capabilities:
+        if not candidate.supported(major * 10 + minor):
+            pytest.skip(f"{type(candidate).__name__} does not support SM{major}{minor}")
+        if (
+            isinstance(candidate, CuteDslConfig)
+            and quant_pair == ("MXFP4", "MXFP8")
+            and (major, minor) == (10, 7)
+        ):
+            pytest.skip("CuTe-DSL W4A8 does not support SM107")
     _backend_config(backend)
     num_tokens, hidden, intermediate = 16, 1024, 512
     num_experts = 4 * world_size
