@@ -676,7 +676,7 @@ def get_sampling_module():
         maybe_top_k_arr: Optional[torch.Tensor],
         top_k_val: int,
         row_states_buffer: torch.Tensor,
-        is_deterministic: bool = True,
+        is_deterministic: bool = False,
     ) -> torch.Tensor:
         # Support FP32, FP16, BF16
         assert probs.dtype in [torch.float32, torch.float16, torch.bfloat16], (
@@ -700,7 +700,7 @@ def get_sampling_module():
         maybe_top_k_arr: Optional[torch.Tensor],
         top_k_val: int,
         row_states_buffer: torch.Tensor,
-        is_deterministic: bool = True,
+        is_deterministic: bool = False,
     ) -> torch.Tensor:
         return torch.empty_like(probs)
 
@@ -2230,7 +2230,7 @@ top_p_renorm_prob = top_p_renorm_probs
 def top_k_renorm_probs(
     probs: torch.Tensor,
     top_k: Union[torch.Tensor, int],
-    is_deterministic: bool = True,
+    is_deterministic: bool = False,
 ) -> torch.Tensor:
     r"""Fused GPU kernel for renormalizing probabilities by top-k thresholding.
 
@@ -2254,7 +2254,7 @@ def top_k_renorm_probs(
         order and repeated calls on identical input can differ in the last bit.
         The deterministic path costs nothing measurable (0.99x to 1.01x of the
         float path at 32K to 152K vocabularies, batch 1 to 1024, on B200 and
-        H100). Default is True since v0.7.3; pass False for the previous behaviour.
+        H100). Default is False.
 
     Returns
     -------
