@@ -240,6 +240,18 @@ def test_routes_point_shipped_modules_at_generated_programs():
             assert program in registry._RENDERED_MODULES, (arch, program)
             assert arch in registry._RENDERED_MODULES[program]["arches"]
             routed.add(program)
+    assert set(registry._RENDERED_WORK_BIN_TURN_SHORT_ROUTES) == set(registry.ARCHES)
+    for arch, modules in registry._RENDERED_WORK_BIN_TURN_SHORT_ROUTES.items():
+        for module, program in modules.items():
+            # Every other turnover launch keeps the module's turnover program.
+            assert module in registry._RENDERED_WORK_BIN_TURN_ROUTES[arch], (
+                arch,
+                module,
+            )
+            assert program != registry._RENDERED_WORK_BIN_TURN_ROUTES[arch][module]
+            assert program in registry._RENDERED_MODULES, (arch, program)
+            assert arch in registry._RENDERED_MODULES[program]["arches"]
+            routed.add(program)
     assert routed == set(GENERATED)
 
 
@@ -308,6 +320,7 @@ def test_generated_plans_bind_from_the_shipped_plans():
             *registry._RENDERED_M64_OWNER_HELPER_ROUTES[arch].items(),
             *registry._RENDERED_WORK_BIN_MIX_ROUTES[arch].items(),
             *registry._RENDERED_WORK_BIN_POOL_ROUTES[arch].items(),
+            *registry._RENDERED_WORK_BIN_TURN_SHORT_ROUTES[arch].items(),
         ]
         for module, program in routes:
             shipped = {
@@ -1118,6 +1131,7 @@ def unrouted(monkeypatch):
             "_RENDERED_M64_OWNER_HELPER_ROUTES",
             "_RENDERED_WORK_BIN_MIX_ROUTES",
             "_RENDERED_WORK_BIN_POOL_ROUTES",
+            "_RENDERED_WORK_BIN_TURN_SHORT_ROUTES",
         ):
             monkeypatch.setattr(registry, table, {arch: {} for arch in registry.ARCHES})
 
@@ -1164,6 +1178,7 @@ def test_serving_rows_match_the_fp32_reference(
         | set(registry._RENDERED_WORK_BIN_TURN_ROUTES[arch].values())
         | set(registry._RENDERED_WORK_BIN_MIX_ROUTES[arch].values())
         | set(registry._RENDERED_WORK_BIN_POOL_ROUTES[arch].values())
+        | set(registry._RENDERED_WORK_BIN_TURN_SHORT_ROUTES[arch].values())
     )
     if loaded & work_bin_programs:
         with monkeypatch.context() as patch:
@@ -1365,14 +1380,26 @@ def _turnover_chunk_limit():
 
 
 def _turn_programs():
-    return set(registry._RENDERED_WORK_BIN_TURN_ROUTES[registry.device_arch()].values())
-
-
-def _turn_of():
-    """Work-binned program -> its turnover build, for the turn table's modules."""
+    """The turnover builds, with the short-task ones."""
     arch = registry.device_arch()
+    return set(registry._RENDERED_WORK_BIN_TURN_ROUTES[arch].values()) | set(
+        registry._RENDERED_WORK_BIN_TURN_SHORT_ROUTES[arch].values()
+    )
+
+
+def _turn_of(lengths=None, heads=None):
+    """Work-binned program -> its turnover build, for the turn table's modules;
+    for a launch of ``lengths`` at ``heads`` heads in the short-task scope
+    (``runtime._work_bin_turn_short_scope``), the short-task build where the
+    loader names one."""
+    arch = registry.device_arch()
+    short = {}
+    if lengths is not None and runtime._work_bin_turn_short_scope(
+        lengths, heads, _sm_count()
+    ):
+        short = registry._RENDERED_WORK_BIN_TURN_SHORT_ROUTES[arch]
     return {
-        registry._RENDERED_WORK_BIN_ROUTES[arch][module]: program
+        registry._RENDERED_WORK_BIN_ROUTES[arch][module]: short.get(module, program)
         for module, program in registry._RENDERED_WORK_BIN_TURN_ROUTES[arch].items()
     }
 
@@ -1395,7 +1422,7 @@ def _assert_turnover_schedule(turn, plain, expect):
     plain_schedule = str(plain.prepared.schedule)
     plain_programs = _modules(plain.prepared)
     if expect:
-        turn_of = _turn_of()
+        turn_of = _turn_of(turn.d["lengths"], turn.d["heads"])
         assert plain_programs & set(turn_of), plain_schedule
         assert schedule.count("_turnover") == 1, schedule
         assert schedule.replace("_turnover", "", 1) == plain_schedule

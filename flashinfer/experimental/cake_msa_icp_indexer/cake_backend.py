@@ -523,7 +523,7 @@ def fused_prefill(arch: str, page_size: int, world_size: int) -> bool:
 # per-window loss against the faster path (kernel time, CUDA Graph replay,
 # cold L2).  Both paths write the same carrier rows.
 SHORT_PREFILL_MAX_TOKENS: dict[tuple[str, int, int], int] = {
-    ("sm_100a", 128, 2): 512,
+    ("sm_100a", 128, 2): 384,
     ("sm_100a", 128, 4): 512,
     ("sm_100a", 256, 2): 1024,
     ("sm_100a", 256, 4): 512,

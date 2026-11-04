@@ -22,7 +22,9 @@ recurrence of the same operands and with one another.  Per row and rank the test
   for every tensor;
 * bitwise (G3): repeat; saved == replay (``boundary_mode``); ``save_mode`` light == full; autograd == explicit;
   ``torch.utils.checkpoint(use_reentrant=False)`` == direct; ``save_transfer`` True == False; ring == a2a where the
-  partition allows the ring; strided packed-QKV views == contiguous operands (``layout`` tma and copy; under tma the
+  partition allows the ring; ``save_mode="full"`` with ``save_transfer=False`` (a2a and, where allowed, ring) == the
+  light form with every package allocation filled with NaN bytes, at the plan's ``P`` and at the forced ``P = 2``
+  (``segments=2``, where every rank's fragments take it; the full saved set holds ``M_seg`` there); strided packed-QKV views == contiguous operands (``layout`` tma and copy; under tma the
   backward writes one packed dQKV row, and ``packed_qkv_views_det_kcp`` hands it to a packed leaf without a concatenation;
   plain ``split`` views of the leaf, direct and checkpointed, keep torch's split backward and their hooks, issue #8367);
   ``.backward()`` twice accumulates exactly twice the gradient;
@@ -457,6 +459,79 @@ def _packed_views(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
 
 def _eq(a: dict, b: dict, names=TENSORS) -> bool:
     return all(torch.equal(a[n], b[n]) for n in names)
+
+
+@contextlib.contextmanager
+def _nan_allocations():
+    """Every tensor the package allocates (its ``_alloc``: outputs, saved set, pools, tapes) is filled with NaN
+    bytes while the block runs: a program that reads a plane no program of the call wrote gives non-finite results
+    instead of the bytes a previous call left in the caching allocator."""
+    real = kcp._alloc
+
+    def nan_alloc(shape, dtype, device):
+        t = real(shape, dtype, device)
+        if t.numel():
+            t.view(-1).view(torch.uint8).fill_(0xFF)
+        return t
+
+    kcp._alloc = nan_alloc
+    try:
+        yield
+    finally:
+        kcp._alloc = real
+
+
+def _m_seg_rule(saved) -> dict:
+    """The ``M_seg`` record of a ``save_mode="full"`` saved set: present exactly at ``P > 1`` (the full backward runs no
+    transfer walk, so its merges read the saved ``M_seg^T`` plane)."""
+    if saved is None:
+        return {"ok": False, "P": None, "m_seg_bytes": None}
+    m = saved.M_seg
+    ok = (m is not None) == (int(saved.P) > 1) and saved.save_mode == "full"
+    return {
+        "ok": bool(ok),
+        "P": int(saved.P),
+        "m_seg_bytes": None if m is None else int(m.numel() * m.element_size()),
+    }
+
+
+def _p2_group_ok(ctx, HV: int, group, W: int, device: torch.device) -> bool:
+    """Every rank's fragments take the segments override ``P = 2`` (the longest fragment of each rank has at least
+    two chunks).  Many rows plan ``P = 1``; the forced ``P = 2`` forms put the full backward's read of the saved
+    ``M_seg^T`` plane on them.  A group decision (MIN over the ranks): every rank runs the same calls."""
+    try:
+        ok = int(ctx.heads(HV, P=2).P) == 2
+    except ValueError:
+        ok = False
+    flag = torch.tensor([1 if ok else 0], dtype=torch.int32, device=device)
+    if W > 1:
+        dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=group)
+    return bool(flag.item())
+
+
+def _p2_full_flags(
+    saved_pass, info, flags, *, ring: bool, prefix: str = "", **extra
+) -> None:
+    """The forced ``P = 2`` forms without ``save_transfer`` under NaN-filled allocations: ``save_mode="full"`` against
+    the light form at ``P = 2`` (bitwise, ``M_seg`` held at ``P = 2``), over a2a and, where the partition allows it,
+    over the ring (and the ring's light form bitwise the a2a's)."""
+    o = {"segments": 2, "save_transfer": False, **extra}
+    light = {}
+    for name, ex in (("p2_full_no_transfer_eq", "a2a"), ("p2_full_ring_eq", "ring")):
+        if ex == "ring" and not ring:
+            continue
+        with _nan_allocations():
+            res_full = saved_pass(save_mode="full", exchange=ex, **o)
+            light[ex] = saved_pass(exchange=ex, **o)
+        rule = _m_seg_rule(res_full["saved"])
+        info[prefix + name] = rule
+        flags[prefix + name] = (
+            _eq(res_full, light[ex]) and rule["ok"] and rule["P"] == 2
+        )
+        del res_full
+    if ring:
+        flags[prefix + "p2_ring_eq_a2a"] = _eq(light["ring"], light["a2a"])
+    del light
 
 
 def _plain_split_pass(buf, g, beta, dout, call, H_qk: int, HV: int, *, ckpt: bool):
@@ -1190,6 +1265,21 @@ def _run_rank(
     flags["ring_eq_a2a"] = (not ring_eligible) or _eq(
         res_recompute, saved_pass(exchange="ring", save_transfer=False)
     )
+    # save_mode="full" without save_transfer (the keyword, or the ring exchange, which needs it): the full backward
+    # runs no transfer walk, so at P > 1 its merges read the saved M_seg^T plane; on NaN-filled allocations a read of
+    # an unwritten plane cannot pass on the bytes the forward left in the caching allocator
+    with _nan_allocations():
+        flags["full_no_transfer_eq"] = _eq(
+            res, saved_pass(save_mode="full", save_transfer=False)
+        )
+        flags["full_ring_eq_a2a"] = (not ring_eligible) or _eq(
+            res, saved_pass(save_mode="full", exchange="ring", save_transfer=False)
+        )
+    # many rows plan P = 1: the same full / ring + full forms again at the forced P = 2 (segments override, where every
+    # rank's fragments take it), against the light form at P = 2
+    info["p2_eligible"] = _p2_group_ok(ctx, HV, group, W, device)
+    if info["p2_eligible"]:
+        _p2_full_flags(saved_pass, info, flags, ring=ring_eligible)
     res_host = saved_pass(group_reduce="host")
     info["host_reduce_eq_fused"] = _eq(
         res, res_host
@@ -2675,6 +2765,30 @@ def _run_rank_l2n(
     if W > 1 and int(ctx.n_d_max) - 1 <= kcp.RING_MAX_HOPS:
         flags["l2n_ring_eq_a2a"] = _eq(
             res, saved_pass(exchange="ring", save_transfer=False, **L2N)
+        )
+    # save_mode="full" without save_transfer (the keyword, or the ring exchange) on NaN-filled allocations, as in the
+    # norm-off row: at P > 1 the full backward's merges read the saved M_seg^T plane
+    with _nan_allocations():
+        flags["l2n_full_no_transfer_eq"] = _eq(
+            res, saved_pass(save_mode="full", save_transfer=False, **L2N)
+        )
+        if W > 1 and int(ctx.n_d_max) - 1 <= kcp.RING_MAX_HOPS:
+            flags["l2n_full_ring_eq_a2a"] = _eq(
+                res,
+                saved_pass(
+                    save_mode="full", exchange="ring", save_transfer=False, **L2N
+                ),
+            )
+    # the forced P = 2 forms (see _run_rank)
+    info["p2_eligible"] = _p2_group_ok(ctx, HV, group, W, device)
+    if info["p2_eligible"]:
+        _p2_full_flags(
+            saved_pass,
+            info,
+            flags,
+            ring=W > 1 and int(ctx.n_d_max) - 1 <= kcp.RING_MAX_HOPS,
+            prefix="l2n_",
+            **L2N,
         )
     res_host = saved_pass(group_reduce="host", **L2N)
     info["l2n_host_eq_fused"] = _eq(

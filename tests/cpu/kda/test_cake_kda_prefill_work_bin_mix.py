@@ -40,6 +40,7 @@ HEAD_DIM = 128
 CHECKPOINT_EVERY = 64
 MAGIC = 0x58313221
 BIN_MIX = "cake_kda_prefill_000000000000000b1a11"
+SHORT_TURN = "cake_kda_prefill_00000000000000005407"
 REFUSED = RuntimeError(
     f"kernel_{BIN_MIX}: cudaLaunchKernelExC failed: too many blocks in cooperative launch"
 )
@@ -294,6 +295,52 @@ def test_program_lookup_on_sm103a(monkeypatch):
     assert runtime._work_bin_mix_program(program, "sm_100a") is None
 
 
+def test_short_task_scope_and_program_lookup(monkeypatch):
+    # The short-task turnover build beside a turnover build, for a launch of at
+    # most BF16_WORK_BIN_TURNOVER_SHORT_TASK_CHUNKS chunks per task with at
+    # least BF16_WORK_BIN_TURNOVER_SHORT_MIN_TASKS_PER_SM tasks per SM.
+    arch = "sm_100a"
+    module, program = _turnover_pair(arch)
+    assert runtime.BF16_WORK_BIN_TURNOVER_SHORT_TASK_CHUNKS == 2
+    assert runtime.BF16_WORK_BIN_TURNOVER_SHORT_MIN_TASKS_PER_SM == 4
+    scope = runtime._work_bin_turn_short_scope
+    assert scope([64] * 64, 12, 148) and scope([64] * 64, 16, 148)
+    assert scope([1, 33, 64] * 17, 12, 148) and scope([64] * 50, 12, 148)
+    assert not scope([64] * 49, 12, 148) and not scope([64] * 16, 16, 148)
+    assert not scope([65] + [64] * 63, 12, 148) and not scope([96] * 64, 12, 148)
+    monkeypatch.setattr(registry, "_RENDERED_WORK_BIN_TURN_SHORT_ROUTES", {arch: {}})
+    lookup = runtime._work_bin_turn_short_program
+    assert lookup(program, arch, [64] * 64, 12, 148) is None
+    monkeypatch.setattr(
+        registry, "_RENDERED_WORK_BIN_TURN_SHORT_ROUTES", {arch: {module: SHORT_TURN}}
+    )
+    assert lookup(program, arch, [64] * 64, 12, 148) == SHORT_TURN
+    assert lookup(program, arch, [64] * 16, 12, 148) is None
+    assert lookup(program, arch, [96] * 64, 12, 148) is None
+    assert lookup(module, arch, [64] * 64, 12, 148) is None
+    assert lookup(None, arch, [64] * 64, 12, 148) is None
+    assert lookup(program, "sm_103a", [64] * 64, 12, 148) is None
+
+
+def test_shipped_loader_names_the_unbounded_direct_short_task_build():
+    # One short-task turnover build, on sm_100a alone: the sm_103a turnover
+    # build of the same module, shipping for both architectures, beside the
+    # sm_100a turnover build.
+    routes = registry._RENDERED_WORK_BIN_TURN_SHORT_ROUTES
+    assert set(routes) == {"sm_100a", "sm_103a"} and routes["sm_103a"] == {}
+    assert len(routes["sm_100a"]) == 1
+    for module, program in routes["sm_100a"].items():
+        assert module in TURN["sm_100a"] and program != TURN["sm_100a"][module]
+        assert program == TURN["sm_103a"][module]
+        assert registry._RENDERED_MODULES[program]["arches"] == ["sm_100a", "sm_103a"]
+        assert (
+            runtime._work_bin_turn_short_program(
+                TURN["sm_100a"][module], "sm_100a", [64] * 64, 12, 148
+            )
+            == program
+        )
+
+
 def test_shipped_loader_names_the_unbounded_direct_bin_mix_build():
     # One bin-mix build on each architecture of WORK_BIN_MIX_ARCHES, beside
     # the turnover build of the same module, registered like every generated
@@ -337,10 +384,12 @@ class _Kernel:
     def __init__(self, name, arch):
         self.name = name
         self.arch = arch
+        short_turn = registry._RENDERED_WORK_BIN_TURN_SHORT_ROUTES.get(arch, {})
         self.work_bins = (
             name in registry._RENDERED_WORK_BIN_ROUTES.get(arch, {}).values()
             or name in registry._RENDERED_WORK_BIN_TURN_ROUTES.get(arch, {}).values()
             or name in registry._RENDERED_WORK_BIN_MIX_ROUTES.get(arch, {}).values()
+            or name in short_turn.values()
         )
         self._ready = False
         self.prepared = []
@@ -660,6 +709,60 @@ def test_sm103a_refused_row_takes_the_build_on_sm100a(planner):
     assert plan.work_bin_mix, plan.schedule
     assert plan.module.name == BIN_MIX
     assert plan.schedule.endswith("_turnover_bin_mix"), plan.schedule
+
+
+@pytest.mark.parametrize(
+    ("tokens", "count", "takes_short"),
+    [(32, 64, True), (64, 64, True), (64, 16, False), (96, 64, False)],
+    ids=["BS64xT32", "BS64xT64", "BS16xT64", "BS64xT96"],
+)
+def test_short_task_launch_takes_the_short_task_build(
+    planner, monkeypatch, tokens, count, takes_short
+):
+    # A turnover launch that takes no bin-mix build: on sm_100a a launch of at
+    # most two chunks per task with at least four tasks per SM takes the
+    # short-task build (same grid, table and schedule); every other launch,
+    # and every launch on sm_103a, keeps the turnover build and builds nothing
+    # else.
+    for arch in ("sm_100a", "sm_103a"):
+        planner.configure(arch, mix=False)
+        monkeypatch.setattr(
+            registry,
+            "_RENDERED_WORK_BIN_TURN_SHORT_ROUTES",
+            {
+                "sm_100a": {module: SHORT_TURN for module in TURN["sm_100a"]},
+                "sm_103a": {},
+            },
+        )
+        plan = _launch(_prepare([tokens] * count, 12))
+        assert not plan.work_bin_mix
+        assert plan.schedule.endswith("_turnover"), plan.schedule
+        sm_count = dict((a, n) for a, _, n in PARTS)[arch]
+        table, bins = _table([tokens] * count, 12, sm_count)
+        assert plan.grid == (bins, 1, 1)
+        assert _seq_order_upload(planner, bins) == list(table)
+        if takes_short and arch == "sm_100a":
+            assert plan.module.name == SHORT_TURN, (arch, tokens, count)
+        else:
+            assert plan.module.name in TURN[arch].values(), (arch, tokens, count)
+            assert SHORT_TURN not in {kernel.name for kernel in _Kernel.made}
+
+
+def test_admitted_launch_keeps_the_bin_mix_build_over_the_short_task_build(
+    planner, monkeypatch
+):
+    # A launch the bin-mix rule admits takes the bin-mix build; its fallback is
+    # the turnover build, never the short-task build.
+    planner.configure("sm_100a")
+    monkeypatch.setattr(
+        registry,
+        "_RENDERED_WORK_BIN_TURN_SHORT_ROUTES",
+        {"sm_100a": {module: SHORT_TURN for module in TURN["sm_100a"]}, "sm_103a": {}},
+    )
+    plan = _launch(_prepare([256] * 16, 12))
+    assert plan.work_bin_mix and plan.module.name == BIN_MIX
+    assert plan._work_bin_mix_fallback[0].name in TURN["sm_100a"].values()
+    assert SHORT_TURN not in {kernel.name for kernel in _Kernel.made}
 
 
 def test_t32_runs_the_turnover_build(planner):

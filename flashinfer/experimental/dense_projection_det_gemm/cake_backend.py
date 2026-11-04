@@ -1242,7 +1242,7 @@ def swap_small_m(L: int, M: int, N: int, transposed_out: bool) -> bool:
 # token count out (M = None for forward / input gradients, K = None for weight gradients), and an exact key names
 # one token count (the 216-SM tranche's sm_107a T-exact weight-gradient rules at K = 16231 and 16384; the GB
 # T-exact forward / input-gradient rules of sm_100a and sm_103a at M = 16172, 16231 or 16384; the GB T-exact
-# weight-gradient rules of sm_100a and sm_103a at K = 16231 or 16384).
+# weight-gradient rules of sm_100a and sm_103a at K = 16172, 16231 or 16384).
 # The round-2 to round-33 rules mirror the former launcher's row table; the shapes tranche below them (sm_100a and
 # sm_103a) was measured with this package's planner and extends it per architecture (three round-33 sm_100a keys were
 # re-measured and re-valued there).  An architecture-wide default (``ARCH_RULE_DEFAULTS``, round 33) sits under every rule
@@ -1559,6 +1559,18 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_100a', False, True, False, False, False, 2048, 16384, 16231): {"cta_rows": 256, "sk_parts": 2, "ovl": True, "htail": True, "cgrp": True, "group_m": 16},
     ('sm_100a', True, True, False, False, False, 17408, 16231, 5120): {"cta_rows": 256, "htail": True, "epi": 'tma', "slots": 1, "group_m": 12},
     ('sm_100a', True, True, False, False, False, 17408, 16384, 5120): {"cta_rows": 256, "htail": True, "epi": 'tma', "slots": 1, "group_m": 12},
+    # ---- sm_100a: the GB T-exact rules of round 3 - the indexer_q 2048 -> 4096 weight gradient at T 16172 / 16231
+    #      in its direct orientation: the ragged rule's synchronised two-partial stream-K program with its
+    #      bf16 tiles through the one-slot TMA store, with the per-tile K partitions of the row's plan without it,
+    #      measured on GB200 against that plan ----
+    ('sm_100a', True, True, False, False, False, 2048, 16172, 4096): {"cta_rows": 256, "sk_sync": True, "sk_sync_m": 62, "sk_slab": 2, "epi": 'tma', "slots": 1},
+    ('sm_100a', True, True, False, False, False, 2048, 16231, 4096): {"cta_rows": 256, "sk_sync": True, "sk_sync_m": 62, "sk_slab": 2, "epi": 'tma', "slots": 1},
+    # ---- sm_100a: the GB T-exact rules of round 4 - the 5120 -> 17408 input gradient at T 16231 / 16384 (the
+    #      overlapped half-tail program with the column-grouped raster in 12-column-tile groups, in place of the ragged
+    #      rule's row-half program), with the bf16 tiles through the one-slot TMA store and the per-tile K partitions of
+    #      the row's plan without it, measured on GB200 against that plan ----
+    ('sm_100a', False, True, False, False, False, 5120, 17408, 16231): {"cta_rows": 256, "ovl": True, "htail": True, "cgrp": True, "group_m": 12, "epi": 'tma', "slots": 1},
+    ('sm_100a', False, True, False, False, False, 5120, 17408, 16384): {"cta_rows": 256, "ovl": True, "htail": True, "cgrp": True, "group_m": 12, "epi": 'tma', "slots": 1},
     # ---- sm_103a: the shapes tranche - forward / input gradient / weight gradient rows at K 4096 - 17408 and N 32 - 17408,
     #      measured with this package's planner against cuBLAS on GB300 at T 16172 - 16384 (see the test table
     #      MEASURED_SHAPE_ROWS); a row whose measured choice equals the planner's default carries no rule ----
@@ -1680,6 +1692,12 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_103a', True, True, False, False, False, 5120, 16384, 17408): {"cta_rows": 256, "htail": True, "epi": 'tma', "slots": 1, "group_m": 12},
     ('sm_103a', True, True, False, False, False, 17408, 16231, 5120): {"cta_rows": 256, "htail": True, "epi": 'tma', "slots": 1, "group_m": 12},
     ('sm_103a', True, True, False, False, False, 17408, 16384, 5120): {"cta_rows": 256, "htail": True, "epi": 'tma', "slots": 1, "group_m": 12},
+    # ---- sm_103a: the GB T-exact rules of round 3 - the indexer_q 2048 -> 4096 weight gradient at T 16172 / 16231
+    #      in its direct orientation: the synchronised two-partial stream-K program of the sm_100a ragged rule
+    #      (which this row inherits) with its bf16 tiles through the one-slot TMA store, with the per-tile K
+    #      partitions of the row's plan without it, measured on GB300 against that plan ----
+    ('sm_103a', True, True, False, False, False, 2048, 16172, 4096): {"cta_rows": 256, "sk_sync": True, "sk_sync_m": 62, "sk_slab": 2, "epi": 'tma', "slots": 1},
+    ('sm_103a', True, True, False, False, False, 2048, 16231, 4096): {"cta_rows": 256, "sk_sync": True, "sk_sync_m": 62, "sk_slab": 2, "epi": 'tma', "slots": 1},
 }
 # fmt: on
 
@@ -2401,7 +2419,15 @@ def plan_dense_projection_det_gemm(
     waves (74 pairs of a 148-SM part: the 4096 x 4096 weight gradient's 152 tiles are 2.05 waves against 1.73, the
     4096 x 1024 row's 76 tiles 1.03 against 0.86) the rule's BLOCK_N yields to the default tile; the rule's other knobs
     stay, a caller-forced ``block_n`` is never touched, and the plan is the launcher's wherever the fit is exact or both
-    tiles need the same waves (152 and 160 SMs)."""
+    tiles need the same waves (152 and 160 SMs).
+
+    A third FlashInfer-only deviation, the synchronised TMA-store gate (:func:`_serves`): the synchronised stream-K
+    programs that store their bf16 tiles through the TMA store (``_tma<slots>_sks``) were generated for measured
+    rows whose rule names ``epi="tma"``; a ragged synchronised row whose short K (``K_TMA_BF16``) turns the bf16
+    epilogue default to the TMA store plans the same symbol unmeasured, so the registry does not serve it there and
+    the row runs the registry fallback above (as before those programs were generated); a caller-forced ``epi``
+    is served, and the fp32-output programs (``_f32_tma<slots>_sks``: the TMA store by default at every K) are
+    served as before."""
     _caller_knobs: dict[str, Any] = dict(
         transposed_out=transposed_out,
         sk=sk,
@@ -3072,7 +3098,7 @@ def plan_dense_projection_det_gemm(
         wave_fallback=wave_fallback,
     )
     check_stream_k_plan(plan, arch)
-    if _fallback and plan.template not in KERNELS.get(arch, {}):
+    if _fallback and not _serves(arch, plan, _caller_knobs["epi"], _use_rules):
         # nearest registered plan: drop the swap first (keeps the measured rule), then the rule, then both
         for allow_swap, use_rules in ((False, True), (True, False), (False, False)):
             if (allow_swap, use_rules) == (_allow_swap, _use_rules):
@@ -3090,7 +3116,7 @@ def plan_dense_projection_det_gemm(
                 _use_rules=use_rules,
                 **_caller_knobs,
             )
-            if candidate[0].template in KERNELS.get(arch, {}):
+            if _serves(arch, candidate[0], _caller_knobs["epi"], use_rules):
                 return candidate
         # last resort: the nearest registered knob variant of the same layout / output kind (every knob set
         # computes the same GEMM; only the tile walk and the store path differ): the hand-ordered variants first
@@ -3138,12 +3164,47 @@ def plan_dense_projection_det_gemm(
                     )
                 except ValueError:
                     continue  # a knob the row cannot take (e.g. epi="tma" with a transposed store)
-                if candidate[0].template in KERNELS.get(arch, {}):
+                if _serves(arch, candidate[0], merged.get("epi"), False):
                     return (
                         dataclasses.replace(candidate[0], knob_fallback=True),
                         *candidate[1:],
                     )
     return plan, a_desc, b_desc, O3
+
+
+def _serves(arch: str, plan, caller_epi: Optional[str], use_rules: bool) -> bool:
+    """Whether the registry of ``arch`` serves ``plan`` as planned (FlashInfer-only, see
+    ``plan_dense_projection_det_gemm``): its program is generated, and a synchronised stream-K plan that stores its
+    bf16 tiles through the TMA store (``_tma<slots>_sks``) has its epilogue named by the caller (``caller_epi``) or by
+    the row's rule (``use_rules``: the merged row rule; else the architecture default).  Those bf16 programs were
+    generated for the measured T-exact rows whose rule names ``epi="tma"``; a ragged row whose short K
+    (``K_TMA_BF16``) turns the bf16 epilogue default to the TMA store plans the same symbol unmeasured and keeps the
+    registry fallback.  The fp32-output programs (``_f32_tma<slots>_sks``) take the TMA store by default at every K
+    and are served as before."""
+    if plan.template not in KERNELS.get(arch, {}):
+        return False
+    if (
+        not (plan.sk_sync and plan.epi == "tma")
+        or plan.out_f32
+        or caller_epi is not None
+    ):
+        return True
+    rule = (
+        row_rule(
+            arch,
+            plan.a_mn,
+            plan.b_mn,
+            plan.out_f32,
+            plan.transposed_out,
+            plan.L > 1,
+            plan.N,
+            plan.K,
+            plan.M,
+        )
+        if use_rules
+        else ARCH_RULE_DEFAULTS.get(arch, {})
+    )
+    return "epi" in rule
 
 
 # Knob variants the registry fallback tries, nearest first (see ``plan_dense_projection_det_gemm``): the plain TMA L2

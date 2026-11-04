@@ -42,7 +42,7 @@ two decodes loading the first item of their unit in the kernel setup, which
 item pair; the combine's is
 ``reduce_general``, a combine that reads the first pair of splits of a row
 from its top loads, which ``select_reduce_record`` picks for plans of more
-than two splits per row, and ``reduce_two_splits``, an SM100 combine without
+than two splits per row, and ``reduce_two_splits``, a combine without
 the per-row split-count load, which ``select_reduce_record`` picks for short
 plans whose rows of two splits form one contiguous range, launched over that
 range alone (its grid rule's rows are the range's, its row arguments offset
@@ -823,6 +823,7 @@ MODULES: dict[str, dict[str, Any]] = {
     "reduce_two_splits": {
         "arches": [
             "sm_100a",
+            "sm_103a",
         ],
         "arg_plan": [
             ["buffer", "o"],
