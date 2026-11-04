@@ -8428,6 +8428,19 @@ def tcgen05_chain_load_qstate_output_tmem(
 
 
 @cute.jit
+def zero_chain_v_tail(v_stage, lane, valid_rows, input_dtype: cutlass.Constexpr):
+    """Exclude non-finite packed neighbours before V enters the MMA."""
+    if valid_rows < cutlass.Int32(BT):
+        zero = input_dtype(0.0)
+        zeros = cutlass.Vector.from_elements((zero,) * 8, input_dtype)
+        for row in cutlass.range_constexpr(BT):
+            if (row >= valid_rows) & (lane < DV_HALF // 8):
+                idx = raw_f16_s128_smem_index(row, lane * 8)
+                (v_stage.data_ptr() + idx).store(zeros, alignment=16)
+        prims.bar_warp_sync(cute.arch.FULL_MASK)
+
+
+@cute.jit
 def tma_chain_stage_load_inputs(
     tma_desc_kd: cutlass.GridConstant[cuda.TensorMap],
     tma_desc_w: cutlass.GridConstant[cuda.TensorMap],
@@ -8856,6 +8869,7 @@ def kernel_chain_dv2(
         wait_mbar_slot = cutlass.Int32(0)
         ready_stage = cutlass.Int32(0)
         tma_phase = cutlass.Int32(0)
+        ready_chunk = cutlass.Int32(0)
         for chunk in cutlass.range(num_chunks, unroll=1):
             ws_chunk = chunk_base + chunk
             ws_row_start = ws_chunk * cutlass.Int32(BT)
@@ -8894,6 +8908,13 @@ def kernel_chain_dv2(
                     wait_mbar_slot, 1, K2_TMA_MBAR_STAGE_COUNT
                 )
                 tma_phase = tma_phase ^ wait_wrapped
+                zero_chain_v_tail(
+                    v_raw_smem.subview(ready_stage * V_TILE_ELEMS),
+                    lane,
+                    seqlen - ready_chunk * cutlass.Int32(BT),
+                    input_dtype,
+                )
+                ready_chunk += cutlass.Int32(1)
                 raw_ready_arrive(raw_ready_mbar.subview(ready_stage))
                 ready_stage, _ = advance_ring_stage(ready_stage, 1, K2_RAW_STAGE_COUNT)
             raw_stage, raw_wrapped = advance_ring_stage(
@@ -8913,6 +8934,13 @@ def kernel_chain_dv2(
                 wait_mbar_slot, 1, K2_TMA_MBAR_STAGE_COUNT
             )
             tma_phase = tma_phase ^ wait_wrapped
+            zero_chain_v_tail(
+                v_raw_smem.subview(ready_stage * V_TILE_ELEMS),
+                lane,
+                seqlen - ready_chunk * cutlass.Int32(BT),
+                input_dtype,
+            )
+            ready_chunk += cutlass.Int32(1)
             raw_ready_arrive(raw_ready_mbar.subview(ready_stage))
             ready_stage, _ = advance_ring_stage(ready_stage, 1, K2_RAW_STAGE_COUNT)
 
