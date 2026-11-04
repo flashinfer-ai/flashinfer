@@ -1470,3 +1470,306 @@ def test_full_backward_without_save_transfer_matches_light_on_poisoned_memory(
         assert kcp.LAST_CALL["bwd"]["tapes_source"] == "saved", i
         for n in light:
             assert torch.equal(full[n], light[n]), (i, n)
+
+
+# --------------------------------------------------------------------------- checkpoint under graph="replay"
+# torch.utils.checkpoint(use_reentrant=False) of one GDN layer with graph="replay" on a caller-held workspace: the
+# recompute decides its tape hand-off and its output program before the CUDA-graph lookup (both are part of its graph
+# key), so the captured step replays the eager checkpoint step's programs: no #1 and no tape walk in the backward.
+
+
+class _LaterSaver(torch.autograd.Function):
+    """A later saver of the checkpointed region: torch's recompute runs in its backward, which first runs ``hook()``
+    (a call on the GDN layer's workspace between the recompute and the GDN backward)."""
+
+    hook = None
+
+    @staticmethod
+    def forward(fctx, x):
+        fctx.save_for_backward(x)
+        return x.clone()
+
+    @staticmethod
+    def backward(fctx, gy):
+        (_,) = fctx.saved_tensors
+        if _LaterSaver.hook is not None:
+            _LaterSaver.hook()
+        return gy
+
+
+def _ckpt_steps(
+    kcp, ctx, inputs, device, *, steps, ws=None, later=False, hooks=None, **kw
+):
+    """``steps`` checkpointed steps of one layer on one caller-held workspace (``ws``, default a new one) with
+    pointer-stable operands: per step the out and the five gradients (cloned at once: a replay returns the graph's
+    static tensors), the records of the original forward, torch's recompute and the backward, and
+    ``GRAPH_STATS["reset"]`` after the step.  ``later``: a :class:`_LaterSaver` closes the region; ``hooks[i]``: its
+    backward hook in step ``i``."""
+    from torch.utils.checkpoint import checkpoint
+
+    ws = kcp.WorkspaceKcp() if ws is None else ws
+    base = [inputs[n].to(device) for n in OPERANDS]
+    dout = inputs["dout"].to(device)
+    results, records, resets = [], [], []
+    kcp.graph_cache_clear()
+    try:
+        for i in range(steps):
+            leaves = [t.detach().requires_grad_(True) for t in base]
+
+            def fn(*a):
+                out = gdn_api.chunk_gdn_kcp(
+                    *a, ctx, workspace=ws, deterministic=False, **kw
+                )
+                return _LaterSaver.apply(out) if later else out
+
+            _LaterSaver.hook = (hooks or {}).get(i)
+            try:
+                out = checkpoint(fn, *leaves, use_reentrant=False)
+                fwd = dict(kcp.LAST_CALL["fwd"])
+                res = {"out": out.detach()[0].clone()}
+                out.backward(dout)
+            finally:
+                _LaterSaver.hook = None
+            res.update(
+                {
+                    n: lf.grad.detach()[0].clone()
+                    for n, lf in zip(GRAD_NAMES, leaves, strict=True)
+                }
+            )
+            records.append(
+                (fwd, dict(kcp.LAST_CALL["fwd"]), dict(kcp.LAST_CALL["bwd"]))
+            )
+            resets.append(kcp.GRAPH_STATS["reset"])
+            results.append(res)
+            del out, leaves
+        torch.cuda.synchronize(device)
+    finally:
+        kcp.graph_cache_clear()
+    return results, records, resets
+
+
+def _launches(step_records) -> list:
+    """The launch inventory of one step: (record, grid) of every launch of the original forward, the recompute and
+    the backward, in issue order."""
+    return [(r, tuple(g)) for rec in step_records for r, g in rec["records"]]
+
+
+@pytest.mark.parametrize("l2n", [False, True], ids=["raw", "l2n"])
+@pytest.mark.parametrize(
+    ("lengths", "heads"),
+    [((300, 777), (2, 6)), ((2048 + 37, 1000), (16, 48))],
+    ids=["2x6", "16x48"],
+)
+def test_graph_replay_checkpoint_replays_the_eager_checkpoint_programs(
+    device, lengths, heads, l2n, monkeypatch
+) -> None:
+    """Checkpointed steps under ``graph="replay"`` (default ``reuse_recompute_tapes`` / ``recompute_output``) reach a
+    steady state in which the original forward, the recompute and the backward all replay captured graphs, no entry is
+    reset and every step's launch inventory is the eager checkpoint step's -- on a verified torch #1 runs twice (not
+    three times: the backward binds the recompute's tapes and launches no #1 or tape walk) and the registry sees one
+    put / take / release per step and no stale entry.  ``reuse_recompute_tapes=False`` (the previous graph form)
+    replays #1 in the backward.  Out and the five gradients are the same bits as the eager step's and the previous
+    form's in every step.  The size rule of ``"auto"`` is set to 0 rows (the recompute decides at these sizes)."""
+    kcp = pytest.importorskip("flashinfer.experimental.cake_gdn_train_kcp.cake_kcp")
+    if l2n and not kcp.l2n_records_shipped():
+        pytest.skip("the in-kernel L2 norm programs are not rendered")
+    _size_rule_at(kcp, monkeypatch, 0)
+    H, HV = heads
+    cu = _cu(lengths)
+    inputs = make_inputs(cu, H, HV)
+    ctx = _local_context(cu, device)
+    kw = {"use_qk_l2norm_in_kernel": True} if l2n else {}
+    steps = 6
+    eager, eager_rec, _ = _ckpt_steps(kcp, ctx, inputs, device, steps=steps, **kw)
+    kept_before, stale_before = dict(kcp.KEPT_STATS), dict(kcp.KEPT_STALE_STATS)
+    graph, graph_rec, resets = _ckpt_steps(
+        kcp, ctx, inputs, device, steps=steps, graph="replay", **kw
+    )
+    kept_delta = {k: kcp.KEPT_STATS[k] - kept_before[k] for k in kept_before}
+    stale_delta = {k: kcp.KEPT_STALE_STATS[k] - stale_before[k] for k in stale_before}
+    previous, previous_rec, _ = _ckpt_steps(
+        kcp,
+        ctx,
+        inputs,
+        device,
+        steps=steps,
+        graph="replay",
+        reuse_recompute_tapes=False,
+        **kw,
+    )
+    events = [tuple(r["graph_event"] for r in rec) for rec in graph_rec]
+    assert events[-3:] == [("replay", "replay", "replay")] * 3, events
+    assert resets[-1] == resets[-3], resets  # the steady state resets no entry
+    assert [tuple(r["graph_event"] for r in rec) for rec in previous_rec][-1] == (
+        "replay",
+        "replay",
+        "replay",
+    )
+    for i in range(steps):
+        assert _launches(graph_rec[i]) == _launches(eager_rec[i]), i
+        for n in TENSORS:
+            assert torch.equal(graph[i][n], eager[i][n]), (i, n)
+            assert torch.equal(graph[i][n], previous[i][n]), (i, n)
+    prep = "fwd_prep_l2n" if l2n else "fwd_prep"
+
+    def n_prep(rec) -> int:
+        return sum(1 for r, _ in _launches(rec) if r.startswith(prep))
+
+    assert n_prep(previous_rec[-1]) == 3
+    assert stale_delta == {k: 0 for k in stale_delta}, stale_delta
+    assert kcp.kept_registry_size() == 0
+    if kcp.torch_release_verified():
+        assert n_prep(graph_rec[-1]) == 2, _launches(graph_rec[-1])
+        assert graph_rec[-1][2]["tapes_source"] == "kept"
+        assert graph_rec[-1][1]["hand_off"] is True
+        assert graph_rec[-1][1]["fwd_o"] == "skipped"
+        assert (
+            kept_delta["put"] == kept_delta["take"] == kept_delta["released"] == steps
+        )
+        assert kept_delta["miss"] == 0, kept_delta
+    else:
+        assert n_prep(graph_rec[-1]) == 3
+
+
+def _size_rule_at(kcp, monkeypatch, rows: int) -> None:
+    """The size rule of ``reuse_recompute_tapes="auto"`` under ``graph="replay"`` at ``rows`` on every architecture
+    (``cake_kcp.GRAPH_RECOMPUTE_MIN_ROWS`` and its default), with an empty architecture cache."""
+    table = {arch: rows for arch in kcp.GRAPH_RECOMPUTE_MIN_ROWS}
+    monkeypatch.setattr(kcp, "GRAPH_RECOMPUTE_MIN_ROWS", table)
+    monkeypatch.setattr(kcp, "GRAPH_RECOMPUTE_MIN_ROWS_DEFAULT", rows)
+    monkeypatch.setattr(kcp, "_GRAPH_RECOMPUTE_ARCH", {})
+
+
+@pytest.mark.parametrize("l2n", [False, True], ids=["raw", "l2n"])
+def test_graph_replay_auto_below_the_size_rule_replays_the_original_forward_graph(
+    device, l2n, monkeypatch
+) -> None:
+    """``reuse_recompute_tapes="auto"`` under ``graph="replay"`` with the size rule above this rank's ``T_r * HV``
+    (``GRAPH_RECOMPUTE_MIN_ROWS``): torch's recompute looks up the original forward's key (the same cache entry in
+    every step; the hand-off form, the rule at 0 rows, has its own) and, once the step is steady, replays that graph
+    (the same launches as the original forward, reasons ``"small"``); the backward replays #1 and the tape walk (three
+    prep launches, no entry put).  Out and the five gradients are the bits of the eager step, of
+    ``reuse_recompute_tapes=False`` and of the hand-off form in every step."""
+    kcp = pytest.importorskip("flashinfer.experimental.cake_gdn_train_kcp.cake_kcp")
+    if l2n and not kcp.l2n_records_shipped():
+        pytest.skip("the in-kernel L2 norm programs are not rendered")
+    H, HV = 2, 6
+    cu = _cu((300, 777))
+    inputs = make_inputs(cu, H, HV)
+    ctx = _local_context(cu, device)
+    kw = {"use_qk_l2norm_in_kernel": True} if l2n else {}
+    steps = 6
+    entries: list = []
+    original_entry = kcp._graph_entry
+
+    def spy_entry(kind, *args):
+        e = original_entry(kind, *args)
+        if kind == "fwd":
+            entries.append(e)
+        return e
+
+    monkeypatch.setattr(kcp, "_graph_entry", spy_entry)
+    _size_rule_at(kcp, monkeypatch, cu[-1] * HV + 1)
+    eager, _, _ = _ckpt_steps(kcp, ctx, inputs, device, steps=steps, **kw)
+    entries.clear()
+    kept_before = dict(kcp.KEPT_STATS)
+    small, small_rec, resets = _ckpt_steps(
+        kcp, ctx, inputs, device, steps=steps, graph="replay", **kw
+    )
+    small_pairs = [entries[2 * i : 2 * i + 2] for i in range(steps)]
+    kept_delta = {k: kcp.KEPT_STATS[k] - kept_before[k] for k in kept_before}
+    previous, _, _ = _ckpt_steps(
+        kcp,
+        ctx,
+        inputs,
+        device,
+        steps=steps,
+        graph="replay",
+        reuse_recompute_tapes=False,
+        **kw,
+    )
+    _size_rule_at(kcp, monkeypatch, 0)
+    entries.clear()
+    handed, _, _ = _ckpt_steps(
+        kcp, ctx, inputs, device, steps=steps, graph="replay", **kw
+    )
+    handed_pairs = [entries[2 * i : 2 * i + 2] for i in range(steps)]
+    events = [tuple(r["graph_event"] for r in rec) for rec in small_rec]
+    assert events[-3:] == [("replay", "replay", "replay")] * 3, events
+    assert resets[-1] == resets[-3], resets
+    assert all(len(p) == 2 and p[0] is p[1] for p in small_pairs), small_pairs
+    if kcp.torch_release_verified():
+        assert all(p[0] is not p[1] for p in handed_pairs[-3:])
+    prep = "fwd_prep_l2n" if l2n else "fwd_prep"
+    for original, recompute, backward in small_rec[-3:]:
+        assert recompute["records"] == original["records"]
+        assert recompute["hand_off"] is False, recompute
+        assert recompute["hand_off_reason"] == recompute["fwd_o_reason"] == "small"
+        assert backward["tapes_source"] == "replay"
+    rec = small_rec[-1]
+    assert sum(1 for r, _ in _launches(rec) if r.startswith(prep)) == 3
+    assert kept_delta["put"] == kept_delta["take"] == 0, kept_delta
+    assert kcp.kept_registry_size() == 0
+    for i in range(steps):
+        for n in TENSORS:
+            assert torch.equal(small[i][n], eager[i][n]), (i, n)
+            assert torch.equal(small[i][n], previous[i][n]), (i, n)
+            assert torch.equal(small[i][n], handed[i][n]), (i, n)
+
+
+def test_graph_replay_kept_tapes_are_refused_after_another_call_on_the_workspace(
+    device,
+) -> None:
+    """``graph="replay"``, ``reuse_recompute_tapes=True`` and a later saver: once the step replays, three consecutive
+    steps run an explicit forward of OTHER operands on the same workspace in the later saver's backward -- between the
+    recompute (whose kept tapes are the arena's own) and the GDN backward.  Each of them finds the entry stale
+    (``KEPT_STALE_STATS["calls"]``) and the GDN backward replays #1 and the tape walk instead of binding the rewritten
+    tapes, while that backward's own graph goes eager -> capture -> replay (the last hooked step replays it); every
+    step's out and gradients are the bits of step 0, and the next step binds the kept tapes again."""
+    kcp = pytest.importorskip("flashinfer.experimental.cake_gdn_train_kcp.cake_kcp")
+    H, HV = 2, 6
+    cu = _cu((300, 777))
+    inputs = make_inputs(cu, H, HV)
+    seeded = make_inputs(cu, H, HV, seed=7)
+    other = {n: seeded[n].to(device) for n in OPERANDS}
+    ctx = _local_context(cu, device)
+    ws = kcp.WorkspaceKcp()
+    calls: list[str] = []
+
+    def hook():
+        calls.append("explicit forward")
+        kcp.chunk_gdn_fwd_kcp(
+            *(other[n] for n in OPERANDS),
+            ctx,
+            workspace=ws,
+            graph="replay",
+            deterministic=False,
+        )
+
+    steps, hooked = 8, (4, 5, 6)
+    stale_before = dict(kcp.KEPT_STALE_STATS)
+    results, records, _ = _ckpt_steps(
+        kcp,
+        ctx,
+        inputs,
+        device,
+        steps=steps,
+        ws=ws,
+        later=True,
+        hooks=dict.fromkeys(hooked, hook),
+        graph="replay",
+        reuse_recompute_tapes=True,
+    )
+    sources = [rec[2]["tapes_source"] for rec in records]
+    events = [rec[2]["graph_event"] for rec in records]
+    assert calls == ["explicit forward"] * len(hooked)
+    last_clean = records[hooked[0] - 1][2]
+    assert last_clean["graph_event"] == "replay", last_clean
+    assert [sources[i] for i in hooked] == ["replay"] * len(hooked), sources
+    assert [events[i] for i in hooked] == ["eager", "capture", "replay"], events
+    assert sources[hooked[0] - 1] == sources[hooked[-1] + 1] == "kept", sources
+    assert kcp.KEPT_STALE_STATS["calls"] - stale_before["calls"] == len(hooked)
+    for i in range(steps):
+        for n in TENSORS:
+            assert torch.equal(results[i][n], results[0][n]), (i, n)
+    assert kcp.kept_registry_size() == 0

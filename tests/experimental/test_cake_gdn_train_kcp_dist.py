@@ -26,8 +26,10 @@ what stays exact is structural (zero gradients, collective counts, byte counts, 
   |ref| at the worst element).  No budget is derived from this package's output.
 * every arm (repeat, saved / replay, light / full, the full form's split twin (test knob ``fused_o_tape=0``; each full
   forward's launch log names the walk it ran), autograd / explicit, checkpoint / direct with its kept-tape and
-  recompute-handle forms, ``save_transfer``, ring / a2a, strided / contiguous, CUDA-graph replay) within the FP64
-  budgets on its own and, against its partner arm, within the same budget constants; ``.backward()`` twice: half the
+  recompute-handle forms, ``save_transfer``, ring / a2a, strided / contiguous, CUDA-graph replay, and the
+  checkpointed CUDA-graph replay steps of the recompute's tape hand-off: the shipped ``"auto"``, ``"auto"`` with the
+  size rule between the ranks, ``True``) within the FP64 budgets on its own and, against its partner arm, within the
+  same budget constants; ``.backward()`` twice: half the
   accumulated gradient against the FP64 gradient; ``save_mode="full"`` with ``save_transfer=False`` (a2a and, where
   the partition allows it, ring) runs with every package allocation filled with NaN bytes, and its saved set carries
   ``M_seg`` exactly at ``P > 1`` (the full backward's merges read that plane; it runs no transfer walk); the rows plan
@@ -2237,6 +2239,119 @@ def _run_rank(
     del g_res, g_cmp
     info["graph"] = graph_info
     flags["graph_capture"] = bool(graph_ok)
+    # graph="replay" + torch.utils.checkpoint (the recompute's tape hand-off): five checkpointed steps per arm on a
+    # caller-held workspace with the same leaves -- the shipped "auto" (this architecture's size rule), "auto" with
+    # the size rule set to the group's largest token x value-head rows (where the ranks' rows differ: the ranks below
+    # it replay the original forward's graph while the others capture the hand-off form, one group mixing both forms)
+    # and True.  Per rank every step's recompute decision and backward form are the expected ones (gated on every
+    # backend); the last step replays the forward and the backward graphs (gated with the capture on the kernel
+    # backend); the last step's out and gradients are within the budgets against FP64 and run0.
+    from torch.utils.checkpoint import checkpoint
+
+    ckpt_graph: dict[str, object] = {}
+    rows_by_rank = [part.rank_tokens(r) * HV for r in range(W)]
+    rows_here = T_r_here * HV
+    verified = kcp.torch_release_verified()
+    rule_arch = kcp._graph_recompute_arch(kcp.get_backend(backend), device)
+    rule_table = dict(kcp.GRAPH_RECOMPUTE_MIN_ROWS)
+    rule_default = kcp.GRAPH_RECOMPUTE_MIN_ROWS_DEFAULT
+    split_rule = max(rows_by_rank) if min(rows_by_rank) < max(rows_by_rank) else None
+    ckpt_graph["rows_by_rank"] = rows_by_rank
+    ckpt_graph["arch"] = rule_arch
+    forms_ok = capture_ok = True
+    for name, reuse, rule in (
+        ("auto", "auto", None),
+        ("auto_split", "auto", split_rule),
+        ("kept", True, None),
+    ):
+        if name == "auto_split" and rule is None:
+            ckpt_graph[name] = "not run: every rank holds the same rows"
+            continue
+        g_res = None
+        try:
+            if rule is not None:
+                for a_ in kcp.GRAPH_RECOMPUTE_MIN_ROWS:
+                    kcp.GRAPH_RECOMPUTE_MIN_ROWS[a_] = rule
+                kcp.GRAPH_RECOMPUTE_MIN_ROWS_DEFAULT = rule
+            eff = kcp.GRAPH_RECOMPUTE_MIN_ROWS.get(
+                rule_arch, kcp.GRAPH_RECOMPUTE_MIN_ROWS_DEFAULT
+            )
+            if reuse == "auto" and rows_here < eff:
+                expect = (False, "small", "replay")
+            elif T_r_here == 0:
+                expect = (False, "off", "replay")
+            elif reuse is True:
+                expect = (True, "always", "kept")
+            elif verified:
+                expect = (True, "dead", "kept")
+            else:  # no frame proof on this torch: the replay form (its reason names the torch build)
+                expect = (False, None, "replay")
+            kcp.graph_cache_clear()
+            wsg = kcp.WorkspaceKcp()
+            leaves = [
+                x.detach().clone().requires_grad_(True) for x in (q, k, v, g, beta)
+            ]
+            o = {**base, "graph": "replay", "reuse_recompute_tapes": reuse}
+
+            def fn(*a, o=o, wsg=wsg):
+                return kcp.chunk_gdn_kcp(
+                    *a, ctx, workspace=wsg, deterministic=False, **o
+                )
+
+            steps: list[list] = []
+            for _ in range(5):
+                for lf in leaves:
+                    lf.grad = None
+                out = checkpoint(fn, *leaves, use_reentrant=False)
+                out.backward(dout)
+                f_, b_ = kcp.LAST_CALL["fwd"], kcp.LAST_CALL["bwd"]
+                steps.append(
+                    [
+                        str(f_["graph_event"]),
+                        str(b_["graph_event"]),
+                        bool(f_.get("hand_off")),
+                        f_.get("hand_off_reason"),
+                        b_.get("tapes_source"),
+                    ]
+                )
+            g_res = {
+                "out": out.detach().clone(),
+                **{n: lf.grad.clone() for n, lf in zip(GRADS, leaves, strict=True)},
+            }
+            forms = all(
+                (st[2], st[4]) == (expect[0], expect[2])
+                and (expect[1] is None or st[3] == expect[1])
+                for st in steps
+            )
+            replayed = steps[-1][0] == steps[-1][1] == "replay"
+            ckpt_graph[name] = {
+                "rule": eff,
+                "expect": list(expect),
+                "steps": steps,
+                "forms_ok": forms,
+            }
+            forms_ok &= forms
+            capture_ok &= replayed
+            torch.cuda.synchronize(device)
+        except Exception as exc:  # noqa: BLE001 - recorded; the gates decide below
+            ckpt_graph[name] = f"{type(exc).__name__}: {str(exc)[:300]}"
+            forms_ok = capture_ok = False
+            g_res = None
+        finally:
+            kcp.GRAPH_RECOMPUTE_MIN_ROWS.clear()
+            kcp.GRAPH_RECOMPUTE_MIN_ROWS.update(rule_table)
+            kcp.GRAPH_RECOMPUTE_MIN_ROWS_DEFAULT = rule_default
+            kcp.graph_cache_clear()
+        g_cmp = (
+            g_res
+            if g_res is not None
+            else {n: torch.zeros_like(res[n]) for n in TENSORS}
+        )
+        arm(f"graph_ckpt_{name}", g_cmp, res, "run0", gate=kernels)
+        del g_res, g_cmp
+    info["graph_ckpt"] = ckpt_graph
+    flags["graph_ckpt_forms"] = bool(forms_ok)
+    flags["graph_ckpt_capture"] = bool(capture_ok)
     # #7038: the backward's time with a resident one-thread kernel on a side stream, over its time alone
     ratio = _side_stream_ratio(
         lambda: kcp.chunk_gdn_bwd_kcp(
@@ -2411,7 +2526,7 @@ def _run_rank(
         flag_list,
         verdicts,
         backend=backend,
-        kernel_only={"graph_capture"},
+        kernel_only={"graph_capture", "graph_ckpt_capture"},
         info_only={"side_stream_ratio"},
     )
     report["metrics"] = {n: verdicts.get(f"fp64:run0:{n}") for n in TENSORS}

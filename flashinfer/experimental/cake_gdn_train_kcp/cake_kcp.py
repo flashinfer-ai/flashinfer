@@ -86,7 +86,16 @@ the forward tapes of torch's recompute (the forward re-run inside
 tapes, below ``_graph_task_id`` / ``_KeptTapes``).  With
 ``recompute_output="auto"`` (default) that recompute leaves its #5 out when
 torch's checkpoint frame proves its output dead (below
-``_recompute_output_dead``).
+``_recompute_output_dead``).  Under ``graph="replay"`` both decisions are part
+of the recompute's CUDA-graph key and the kept tapes are the workspace arena's
+own (below ``_kept_stale``), so a captured checkpoint step launches the eager
+step's programs -- from ``GRAPH_RECOMPUTE_MIN_ROWS`` token x value-head rows per
+rank under the default ``"auto"``; a smaller recompute decides nothing and
+replays the original forward's graph, #5 included (``fwd_o_reason`` ``"small"``;
+the size rule, below ``_fwd_entry``).  The kept tapes add no memory there; the
+recompute's hand-off graph holds its own static results like every graph key
+(a saved set and, when #5 launches in it -- ``recompute_output="always"``, or
+``True`` with a later saver -- a full output per checkpointed layer).
 
 Tapes (padded rows ``R = 64 * NC_pad``; token ``t`` of chunk ``c`` sits in row
 ``64 c + (t - chunk_bos[c])``): ``w, u, v_new, do_g, dv_intra`` BF16
@@ -741,8 +750,8 @@ FWD_TAPES_ARENA_AFTER_FUSED: tuple[str, ...] = tuple(
 
 
 # ----------------------------------------------------------------------------------------------------------------
-# Checkpoint-aware light backward (keyword ``reuse_recompute_tapes``: ``True`` = the shipped default, ``False`` under
-# graph="replay"; ``"auto"`` = kept tapes only when the node closes the checkpointed region, see _fwd_body)
+# Checkpoint-aware light backward (keyword ``reuse_recompute_tapes``: ``"auto"`` = the shipped default, kept tapes
+# only when the node closes the checkpointed region, see _fwd_decision; ``True`` = always; ``False`` = the replay form)
 #
 # ``torch.utils.checkpoint(use_reentrant=False)`` re-runs the checkpointed forward inside ``.backward()``: in the
 # unpack hook of the first saved tensor a backward node reads, synchronously, under the autograd engine's graph task
@@ -769,6 +778,17 @@ FWD_TAPES_ARENA_AFTER_FUSED: tuple[str, ...] = tuple(
 # The detection is the private binding
 # ``torch._C._current_graph_task_id`` (checked once: present, returns an int); without it the option is a no-op
 # (today's path).  No tensor content is read anywhere: the key holds the task id and data pointers only.
+# Under ``graph="replay"`` (the arena hand-off) nothing is unbound: a captured graph bakes the arena's addresses and
+# an unbound tape would reset every captured key of the workspace.  The kept tapes are the arena's own tensors (the
+# workspace keeps them alive; the entry holds references only), and the entry is stamped with the workspace and its
+# call count (``WorkspaceKcp.calls``: every forward / backward entry on a caller-held workspace adds one -- eager,
+# captured or replayed) and the launch stream right after the hand-off forward.  A backward binds the entry only
+# while that workspace has made no call since, still binds those very tensors and the backward runs on the same stream
+# (:func:`_kept_stale`); anything in between -- another layer's forward or backward, an eager call on the same
+# workspace, a user's ``ensure`` -- makes it stale and the backward runs the replay (same bits).  The recompute's
+# hand-off and #5 decisions are part of its CUDA-graph key (:func:`_fwd_entry`), so the recompute captures its own
+# graph (the hand-off form) beside the original forward's, and the kept backward its own graph beside the replay
+# form's (the hand-off's layout is part of the backward's key, :func:`_kept_key_part`).
 
 _GRAPH_TASK_ID_BINDING = getattr(torch._C, "_current_graph_task_id", None)
 _GRAPH_TASK_ID_USABLE: bool | None = None
@@ -943,7 +963,9 @@ def _handle_lookup(handle: Any) -> dict[str, Any] | None:
 # off, another torch.  The decision never rests on ``_graph_task_id() != -1`` alone: a graph task also hosts the
 # reentrant checkpoint's re-run and forwards inside backward hooks, whose outputs are live.  Only the autograd node's
 # forward (:class:`ChunkGDNFunctionKcp`, the one that saves exactly those tensors right after) may skip;
-# :func:`chunk_gdn_fwd_kcp` and a captured graph (``graph="replay"``) never do.  No tensor content is read.
+# :func:`chunk_gdn_fwd_kcp` never does, and under ``graph="replay"`` the proof is read only inside a backward pass
+# (``_graph_task_id() != -1``), before the CUDA-graph lookup: the decision is part of the recompute's graph key, so a
+# graph that left #5 out is replayed only by a forward whose proof holds again.  No tensor content is read.
 
 # torch RELEASES the frame proof was verified on, compared through torch_release(): the local build tag is not part
 # of the identity (the proof reads torch/utils/checkpoint.py, the same file in every CUDA build of a release)
@@ -1027,9 +1049,12 @@ class _KeptTapes:
     the ten :data:`FWD_TAPES` as fresh tensors, the ``stage_m`` plane when the saved set carries no ``M_seg``, the
     arena geometry they were produced at and the graph task id.  ``qk``: with ``use_qk_l2norm_in_kernel`` the
     normalized rows ``qn`` / ``kn`` the recompute's #1_l2n wrote (:data:`QK_TAPES`, unbound from the arena like the
-    tapes), so the backward runs no ``qk_apply``; empty without the norm."""
+    tapes), so the backward runs no ``qk_apply``; empty without the norm.  ``ws`` / ``calls`` / ``stream``: ``None``
+    for the eager hand-off (fresh tensors the entry owns); under ``graph="replay"`` (the arena hand-off) the workspace
+    whose arena holds the tapes, its call count and the launch stream right after the hand-off forward
+    (:func:`_kept_stale`)."""
 
-    __slots__ = ("tapes", "stage_m", "geometry", "gid", "qk")
+    __slots__ = ("tapes", "stage_m", "geometry", "gid", "qk", "ws", "calls", "stream")
 
     def __init__(
         self,
@@ -1038,17 +1063,121 @@ class _KeptTapes:
         geometry: tuple[int, int, int, int] | None,
         gid: int,
         qk: dict[str, torch.Tensor] | None = None,
+        ws: Any = None,
     ) -> None:
         self.tapes = tapes
         self.stage_m = stage_m
         self.geometry = geometry
         self.gid = int(gid)
         self.qk = {} if qk is None else qk
+        self.ws = ws
+        self.calls: int | None = None
+        self.stream: int | None = None
 
     def clear(self) -> None:
         self.tapes = {}
         self.stage_m = None
         self.qk = {}
+        self.ws = None
+
+
+def _launch_stream(device: torch.device | None) -> int:
+    """The launch stream of ``device`` (torch's current stream of the current CUDA device, the one the launch glue
+    binds; ``0`` off CUDA): the arena hand-off's stamp."""
+    if device is None or device.type != "cuda":
+        return 0
+    index = torch.cuda.current_device()
+    return (
+        int(_RAW_STREAM(index))
+        if _RAW_STREAM is not None
+        else int(torch.cuda.current_stream(index).cuda_stream)
+    )
+
+
+def _kept_stamped(kept: _KeptTapes) -> _KeptTapes:
+    """A fresh arena hand-off entry on the tensors of ``kept`` (the hand-off forward's own entry), stamped with this
+    backward pass's task id, the workspace's call count and the launch stream now (right after the hand-off forward of
+    this call)."""
+    out = _KeptTapes(
+        dict(kept.tapes),
+        kept.stage_m,
+        kept.geometry,
+        _graph_task_id(),
+        dict(kept.qk),
+        ws=kept.ws,
+    )
+    out.calls = int(kept.ws.calls)
+    out.stream = _launch_stream(kept.ws.device)
+    return out
+
+
+class _KeptLayout:
+    """An arena hand-off as a captured hand-off forward's cached result keeps it (the template of every replay's
+    entry): the workspace, the arena names of the tapes and the ``qn`` / ``kn`` rows, the ``stage_m`` plane's length
+    and the geometry -- no tensor, so the graph cache pins no arena buffer after the workspace drops it.
+    :func:`_kept_rebound` binds the arena's tensors again at each replay (which found the arena signature of the
+    capture: the very buffers the captured graph wrote)."""
+
+    __slots__ = ("names", "qk", "stage_m", "geometry", "ws")
+
+    def __init__(self, kept: _KeptTapes) -> None:
+        self.names = tuple(kept.tapes)
+        self.qk = tuple(kept.qk)
+        self.stage_m = None if kept.stage_m is None else int(kept.stage_m.numel())
+        self.geometry = kept.geometry
+        self.ws = kept.ws
+
+
+def _kept_rebound(layout: _KeptLayout) -> _KeptTapes | None:
+    """A fresh arena hand-off entry of ``layout`` on the arena's current tensors, stamped as :func:`_kept_stamped`
+    stamps; ``None`` (no hand-off: the backward runs the replay form) when the arena binds a name no longer."""
+    ws = layout.ws
+    arena = ws._tapes
+    tapes = {n: arena.get(TAPE_ALIASES.get(n, n)) for n in layout.names}
+    qk = {n: arena.get(TAPE_ALIASES.get(n, n)) for n in layout.qk}
+    stage_m = None
+    if layout.stage_m is not None:
+        pool = ws._pools.get("stage_m")
+        if pool is None or pool.numel() < layout.stage_m:
+            return None
+        stage_m = pool if pool.numel() == layout.stage_m else pool[: layout.stage_m]
+    if any(t is None for t in (*tapes.values(), *qk.values())):
+        return None
+    out = _KeptTapes(tapes, stage_m, layout.geometry, _graph_task_id(), qk, ws=ws)
+    out.calls = int(ws.calls)
+    out.stream = _launch_stream(ws.device)
+    return out
+
+
+KEPT_STALE_STATS: dict[str, int] = {
+    "calls": 0,  # arena hand-offs refused: the workspace made a call between the hand-off forward and the backward
+    "arena": 0,  # ... the arena no longer binds the kept tensors (re-grown, released or re-bound)
+    "stream": 0,  # ... the backward runs on another stream than the hand-off forward
+}
+
+
+def _kept_stale(entry: _KeptTapes) -> str | None:
+    """Why an arena hand-off (``graph="replay"``) can no longer stand in for the replay, ``None`` while it can: the
+    workspace that holds the tapes made no call since the hand-off forward (its call count is the stamp), its arena
+    still binds the very kept tensors (and the ``stage_m`` pool its plane), and the backward launches on the stream
+    the forward did.  An eager hand-off (``ws`` ``None``: fresh tensors the entry owns) is never stale.  Host
+    metadata only (identities, counters, the stream handle)."""
+    ws = entry.ws
+    if ws is None:
+        return None
+    if entry.calls is None or ws.calls != entry.calls:
+        return "calls"
+    tapes = ws._tapes
+    for name, t in (*entry.tapes.items(), *entry.qk.items()):
+        if tapes.get(TAPE_ALIASES.get(name, name)) is not t:
+            return "arena"
+    if entry.stage_m is not None:
+        pool = ws._pools.get("stage_m")
+        if pool is None or pool.data_ptr() != entry.stage_m.data_ptr():
+            return "arena"
+    if entry.stream != _launch_stream(ws.device):
+        return "stream"
+    return None
 
 
 _KEPT: dict[tuple, _KeptTapes] = {}
@@ -1133,7 +1262,15 @@ def _kept_task_end(key: tuple) -> None:
 
 
 def _kept_take(key: tuple) -> _KeptTapes | None:
+    """The entry of ``key`` for the backward that binds it (``None``: the replay runs).  A stale arena hand-off
+    (:func:`_kept_stale`) is dropped and counted as a miss (``KEPT_STALE_STATS`` says why)."""
     entry = _KEPT.pop(key, None)
+    if entry is not None:
+        stale = _kept_stale(entry)
+        if stale is not None:
+            entry.clear()
+            KEPT_STALE_STATS[stale] += 1
+            entry = None
     KEPT_STATS["take" if entry is not None else "miss"] += 1
     return entry
 
@@ -2901,6 +3038,9 @@ class WorkspaceKcp:
         # site -> (the ticket tensor, its slot view): the views of the slots in use, made once per ticket tensor
         self._ticket_views: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
         self.geometry: tuple[int, int, int, int] | None = None  # (R, NC_pad, HV, T)
+        # forward / backward entries made on this caller-held workspace (eager, captured or replayed): the stamp of an
+        # arena hand-off under graph="replay" (:func:`_kept_stale`)
+        self.calls = 0
         # the Q / K head count of the in-kernel L2 norm tapes (QK_TAPES / QK_RSTD: [T, H_qk, ...]); the last ensure()'s
         self.qk_heads: int | None = None
         if ctx is not None:
@@ -4042,10 +4182,10 @@ def _record(kind: str, call: CallKcp) -> None:
         # | "fused_tape" (kcp_fwdh_out_tape: save_mode="full", the saved tapes and the output in the same walks)
         "fwd_o_reason": call.scratch.get(
             "fwd_o_reason"
-        ),  # forward: "always" | "dead" | "not_executable" | why the frame proof did not hold (the decision, recorded on every rank)
+        ),  # forward: "always" | "dead" | "not_executable" | why the frame proof did not hold (the decision, recorded on every rank) | "small" (graph="replay", the size rule)
         "hand_off_reason": call.scratch.get(
             "hand_off_reason"
-        ),  # forward: "always" (True) | "off" | "not_executable" | the frame reason under "auto" ("dead" = kept)
+        ),  # forward: "always" (True) | "off" | "not_executable" | the frame reason under "auto" ("dead" = kept) | "small" (graph="replay": the recompute below GRAPH_RECOMPUTE_MIN_ROWS, no decision)
         "recompute_handle": call.scratch.get(
             "recompute_handle"
         ),  # forward: None | "capture" (stored S_in in the handle) | "replay" (S_in from the handle, no exchange)
@@ -4921,7 +5061,9 @@ def _kept_release(call: CallKcp, kept: _KeptTapes) -> None:
     none of that name at the same geometry -- a caller-held workspace ends a kept backward as a forward leaves it,
     so the next checkpointed forward allocates nothing but its output (#7039, caller-workspace form) -- and the
     others are freed here, with the handed-over ``stage_m`` plane and the handed-over ``qn`` / ``kn`` (already
-    unbound from the call after #8 with the norm's other buffers; a forward leaves no norm row in the arena)."""
+    unbound from the call after #8 with the norm's other buffers; a forward leaves no norm row in the arena).  An arena
+    hand-off (``graph="replay"``) changes no binding: its tapes never left the arena (``adopt_tape`` finds them bound)
+    and only the entry's references go."""
     leaves = (
         FWD_TAPES_ARENA_AFTER_FUSED
         if _fuse_o_enabled(call)
@@ -5142,7 +5284,12 @@ GRAPH_STATS: dict[str, int] = {
     "fallback": 0,
     "reset": 0,
 }
-GRAPH_CACHE_MAX = 64  # keys kept per process; the oldest entry goes when a new key arrives beyond this
+# Keys kept per process, least recently used first out when a new key arrives beyond this.  A checkpointed layer holds
+# three keys (the original forward, torch's recompute in its hand-off form, the kept backward; two below the size rule
+# GRAPH_RECOMPUTE_MIN_ROWS, where the recompute replays the original forward's graph), so 256 keeps 85 such
+# layers; each captured graph holds its own memory pool with its static results (out, the saved set, the gradients)
+# besides the workspace arena, released with the entry (or by ``graph_cache_clear()``).
+GRAPH_CACHE_MAX = 256
 
 
 class _GraphEntry:
@@ -5160,6 +5307,7 @@ class _GraphEntry:
         "digest",
         "arena",
         "reset",
+        "used",
     )
 
     def __init__(self, key: tuple, pins: tuple) -> None:
@@ -5177,6 +5325,8 @@ class _GraphEntry:
         self.reset: str | None = (
             None  # why the last replay candidate ran eagerly instead
         )
+        # the key's last use (the cache drops the least recently used first)
+        self.used = next(_GRAPH_USES)
 
     def replayable(self, ws: Any) -> bool:
         """The graph exists and the arena it baked is intact; otherwise the entry is reset (an eager call follows,
@@ -5193,6 +5343,8 @@ class _GraphEntry:
 
 
 _GRAPHS: dict[tuple, _GraphEntry] = {}
+# the use order of the cached keys (one hash of the key per lookup: a hit stamps its entry instead of re-inserting)
+_GRAPH_USES = iter(range((1 << 63) - 1))
 
 
 def _sig(t: Any) -> tuple:
@@ -5244,9 +5396,16 @@ def _graph_entry(
     e = _GRAPHS.get(key)
     if e is None:
         while len(_GRAPHS) >= GRAPH_CACHE_MAX:
-            del _GRAPHS[next(iter(_GRAPHS))]
+            # the least recently used key first out
+            del _GRAPHS[min(_GRAPHS.values(), key=_graph_use).key]
         e = _GRAPHS[key] = _GraphEntry(key, (ctx, ws, backend))
+    else:
+        e.used = next(_GRAPH_USES)  # a hit makes the key the most recently used
     return e
+
+
+def _graph_use(e: _GraphEntry) -> int:
+    return e.used
 
 
 def _graph_capture(kind: str, entry: _GraphEntry, call: CallKcp, body: Any) -> Any:
@@ -5418,6 +5577,7 @@ def _prepare(
         backward=backward,
         packed_grads=packed_grads,
     )
+    call.scratch["workspace"] = "per_call" if per_call else "caller"
     backend.begin_call(call)
     return call, batched
 
@@ -5539,22 +5699,64 @@ def _fwd_entry(
     hand_off: bool,
     autograd_node: bool = False,
     executable: bool = True,
+    small: bool = False,
     boundary: dict[str, Any] | None = None,
     handle_mode: str | None = None,
 ) -> tuple[torch.Tensor, SavedKcp | None]:
     """:func:`chunk_gdn_fwd_kcp` with validated options.  ``boundary``: the recompute handle's entry of this
     layer (the recompute of a forward that stored it): ``S_in`` comes from it and nothing is exchanged.  ``hand_off``: the autograd Function's forward runs inside
     a graph task with ``reuse_recompute_tapes`` -- the light saved set then carries the forward tapes (``saved.kept``)
-    for the backward of that task (never with a captured graph, a replay boundary, ``save_mode="full"`` or
-    ``T_r = 0``).  ``autograd_node``: the caller is :class:`ChunkGDNFunctionKcp` (the one forward whose recompute may
-    leave #5 out under ``recompute_output="auto"``); ``executable``: that Function's ``apply`` creates a node and
-    packs its saved tensors (grad mode on and an operand requiring grad) -- ``False`` launches #5 unconditionally."""
+    for the backward of that task (never with a replay boundary, ``save_mode="full"`` or ``T_r = 0``; under
+    ``graph="replay"`` the arena hand-off, :func:`_kept_stale`).  ``autograd_node``: the caller is
+    :class:`ChunkGDNFunctionKcp` (the one forward whose recompute may leave #5 out under ``recompute_output="auto"``);
+    ``executable``: that Function's ``apply`` creates a node and packs its saved tensors (grad mode on and an operand
+    requiring grad) -- ``False`` launches #5 unconditionally.  Under ``graph="replay"`` the autograd node's forward
+    inside a backward pass (torch's recompute) decides the hand-off and #5 before the CUDA-graph lookup
+    (:func:`_fwd_decision`): a decision other than (no hand-off, #5 launched) is part of the key, so the hand-off form
+    is captured and replayed as its own graph.  Under the size rule of ``reuse_recompute_tapes="auto"``
+    (:data:`GRAPH_RECOMPUTE_MIN_ROWS`, a caller-held workspace; ``small``, decided by the Function's forward) no
+    forward of the node decides: torch's recompute looks up the original forward's key and runs its form (no hand-off,
+    #5 launched; the reasons read ``"small"``)."""
+    # with reuse_recompute_tapes the request is the Function's graph-task test (read once, there)
+    in_task = bool(hand_off) if opts.reuse_recompute_tapes else None
     save = bool(save_for_backward) and opts.boundary_mode == "saved"
-    hand_off = (
-        bool(hand_off) and save and opts.save_mode == "light" and opts.graph == "off"
-    )
+    hand_off = bool(hand_off) and save and opts.save_mode == "light"
     entry = None
+    decision = None
+    # the size rule of reuse_recompute_tapes="auto" (GRAPH_RECOMPUTE_MIN_ROWS), decided once by the Function's
+    # forward: below it no forward of the node decides -- torch's recompute keys and replays the original forward's
+    # graph (no frame read, no hand-off)
+    small = bool(small) and autograd_node
     if opts.graph != "off":
+        if isinstance(workspace, WorkspaceKcp):
+            workspace.calls += 1
+            if (
+                autograd_node
+                and not small
+                and (in_task if in_task is not None else _graph_task_id() != -1)
+            ):
+                T_r = int(ctx.T_r)
+                HV = int(v.shape[-2])
+                P = workspace.tables(
+                    ctx,
+                    HV,
+                    fused_walks=int(opts.knob("fused_walks")),
+                    P=None if opts.segments is None else int(opts.segments),
+                ).P
+                decision = _fwd_decision(
+                    _saved_count_of(
+                        opts, P, T_r, bool(opts.use_qk_l2norm_in_kernel), save
+                    ),
+                    hand_off=hand_off and T_r > 0,
+                    autograd_node=autograd_node,
+                    executable=executable,
+                    opts=opts,
+                )
+        flags = (
+            (save,)
+            if decision is None or (not decision[0] and decision[2])
+            else (save, decision[0], decision[2])
+        )
         entry = _graph_entry(
             "fwd",
             ctx,
@@ -5563,12 +5765,23 @@ def _fwd_entry(
             opts,
             scale,
             (q, k, v, g, beta),
-            (save,),
+            flags,
         )
+    elif isinstance(workspace, WorkspaceKcp):
+        workspace.calls += 1
     if entry is not None and entry.replayable(workspace):
         _graph_replay("fwd", entry)
         out, saved, batched = entry.result
-        return _ranked(out.detach(), batched), saved
+        if decision is not None:
+            # the reasons of this call's decision (the key fixes the decision, the capture's record its reasons)
+            LAST_CALL["fwd"].update(
+                hand_off_reason=decision[1], fwd_o_reason=decision[3]
+            )
+        elif small:
+            LAST_CALL["fwd"].update(hand_off_reason="small", fwd_o_reason="small")
+        if saved is None or saved.kept is None:
+            return _ranked(out.detach(), batched), saved
+        return _ranked(out.detach(), batched), _with_stamped_kept(saved)
     call, batched = _prepare(
         q,
         k,
@@ -5582,6 +5795,10 @@ def _fwd_entry(
         backward=False,
         fresh_pools=_fwd_fresh_pools(opts, save),
     )
+    if small:
+        # the size rule's form for the eager run and the capture under the original forward's key: no hand-off, #5
+        # launched, no frame read
+        decision = (False, "small", True, "small", _saved_count(call, save))
     if entry is not None and entry.seen > 0 and entry.disabled is None:
         res = _graph_capture(
             "fwd",
@@ -5592,13 +5809,16 @@ def _fwd_entry(
                 _fwd_body,
                 call,
                 save=save,
+                hand_off=hand_off and call.T_r > 0,
                 autograd_node=autograd_node,
                 executable=executable,
+                decision=decision,
             ),
         )
         if res is not None:
-            entry.result = (res[0], res[1], batched)
-            return _ranked(res[0].detach(), batched), res[1]
+            # a hand-off form keeps its kept set's layout as the template of every replay's stamped entry
+            entry.result = (res[0], _kept_template(res[1]), batched)
+            return _ranked(res[0].detach(), batched), _with_stamped_kept(res[1])
         call, batched = _prepare(
             q,
             k,
@@ -5653,12 +5873,43 @@ def _fwd_entry(
         autograd_node=autograd_node,
         executable=executable,
         s_in=s_in,
+        decision=decision,
     )
     _record("fwd", call)
     if opts.graph != "off":
         _graph_eager("fwd", entry)
     call.backend.end_call(call)
-    return _ranked(out, batched), saved
+    return _ranked(out, batched), _with_stamped_kept(saved)
+
+
+def _with_stamped_kept(saved: SavedKcp | None) -> SavedKcp | None:
+    """``saved`` with a freshly stamped arena hand-off when it carries one -- :func:`_kept_stamped` of the hand-off
+    forward's entry, or :func:`_kept_rebound` of a replayed graph's template layout (:func:`_kept_template`) --; else
+    ``saved`` as it is (no hand-off, or the eager hand-off whose fresh tensors the entry owns).  A shallow copy with the
+    one field set (frozen dataclass, hence ``object.__setattr__``): the template stays as it is."""
+    kept = None if saved is None else saved.kept
+    if kept is None or kept.ws is None:
+        return saved
+    out = object.__new__(SavedKcp)
+    out.__dict__.update(saved.__dict__)
+    object.__setattr__(
+        out,
+        "kept",
+        _kept_rebound(kept) if type(kept) is _KeptLayout else _kept_stamped(kept),
+    )
+    return out
+
+
+def _kept_template(saved: SavedKcp | None) -> SavedKcp | None:
+    """The saved set a captured forward caches as the template of its replays: an arena hand-off's entry becomes its
+    :class:`_KeptLayout` (no tensor of the arena stays referenced by the graph cache); else ``saved`` as it is."""
+    kept = None if saved is None else saved.kept
+    if kept is None or kept.ws is None:
+        return saved
+    out = object.__new__(SavedKcp)
+    out.__dict__.update(saved.__dict__)
+    object.__setattr__(out, "kept", _KeptLayout(kept))
+    return out
 
 
 def _saved_count(call: CallKcp, save: bool) -> int:
@@ -5667,19 +5918,133 @@ def _saved_count(call: CallKcp, save: bool) -> int:
     ``save_transfer`` or ``save_mode="full"`` at ``P > 1``; the saved tapes of the ``save_mode`` when the rank holds
     tokens; ``qk_rstd`` with ``use_qk_l2norm_in_kernel``) -- known before
     the forward runs, so the frame proof can decide a hand-off (``reuse_recompute_tapes="auto"``)."""
+    return _saved_count_of(call.opts, call.tb.P, call.T_r, call.l2n, save)
+
+
+def _saved_count_of(opts: OptionsKcp, P: int, T_r: int, l2n: bool, save: bool) -> int:
+    """:func:`_saved_count` from the options, the plan's ``P``, the rank's ``T_r`` and the norm flag (before a call
+    exists: the CUDA-graph lookup of a recompute, :func:`_fwd_entry`)."""
     if not save:
         return _SAVED_OPERANDS
-    opts, tb = call.opts, call.tb
     n = (
         1
         + (1 if opts.save_transfer else 0)
-        + (1 if _saves_m_seg(opts.save_mode, opts.save_transfer, tb.P) else 0)
+        + (1 if _saves_m_seg(opts.save_mode, opts.save_transfer, P) else 0)
     )
-    if call.T_r > 0:
+    if T_r > 0:
         n += len(saved_tapes(opts.save_mode))
-    if call.l2n:  # qk_rstd, at T_r = 0 too (an empty [2, 0, H_qk] tensor: the flags agree across ranks)
+    if l2n:  # qk_rstd, at T_r = 0 too (an empty [2, 0, H_qk] tensor: the flags agree across ranks)
         n += 1
     return _SAVED_OPERANDS + n
+
+
+# The size rule of ``reuse_recompute_tapes="auto"`` under ``graph="replay"`` (a caller-held workspace): a checkpoint
+# recompute decides the hand-off and #5 only when the rank holds at least this many token x value-head rows
+# (``T_r * HV``), per architecture of the device.  The node's forward reads the rule once, and only inside a backward
+# pass (where a hand-off can follow).  Below it no forward of the node decides -- no checkpoint-frame read, no arena
+# hand-off to stamp and check -- the recompute replays the original forward's graph
+# (the output walk, #5 inside) and its backward replays #1 and the tape walk.  On a small rank the checkpointed graph
+# step is host-bound: the hand-off form launches less GPU work (one B200, 8192 tokens, (2, 6) heads: 356 instead of
+# 451 us of kernels) but adds host time per layer and step (the frame read, the stamp, the backward's checks: about
+# 48 us there), and the step ends later.  Crossover of one checkpointed layer (CUDA events per step, both forms in one
+# process, five rounds): one B200 previous / hand-off 0.953 at 49152 rows, 1.016 / 1.039 / 1.09 at 61440 / 73728 /
+# 86016 rows; one GB300 1.013 at 49152 rows, 1.10 at 73728 rows, 1.07-1.13 at 98304 rows; one R200 (208 SMs) 1.07 at
+# 49152 rows (the benchmark's checkpointed graph step, L2 flushed).  ``True`` / ``False`` and ``graph="off"`` decide
+# at every size.
+GRAPH_RECOMPUTE_MIN_ROWS: dict[str, int] = {
+    "sm_100a": 61440,
+    "sm_103a": 0,
+    "sm_107a": 0,
+}
+# any other device (the fake backend's CPU emulation included)
+GRAPH_RECOMPUTE_MIN_ROWS_DEFAULT = 61440
+# the architecture of each (backend name, device index) the size rule has read (index -1: a CPU tensor)
+_GRAPH_RECOMPUTE_ARCH: dict[tuple[str, int], str | None] = {}
+
+
+def _graph_recompute_arch(backend: Any, device: torch.device) -> str | None:
+    """The architecture the size rule reads: the kernel backend's exported architecture of the CUDA device, ``None``
+    for any other backend or device."""
+    if not (isinstance(backend, KernelBackend) and device.type == "cuda"):
+        return None
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    return backend.launcher().device_arch(index)
+
+
+def _graph_recompute_small(
+    opts: OptionsKcp, v: torch.Tensor, T_r: int, HV: int
+) -> bool:
+    """Whether a forward of ``v``'s device under ``graph="replay"`` falls under the size rule:
+    ``reuse_recompute_tapes="auto"`` and fewer ``T_r * HV`` rows than :data:`GRAPH_RECOMPUTE_MIN_ROWS` of the
+    device's architecture (read once per backend name and device index: the check runs in every graph-mode
+    recompute)."""
+    if opts.reuse_recompute_tapes != "auto":
+        return False
+    key = (opts.backend, v.get_device())
+    try:
+        arch = _GRAPH_RECOMPUTE_ARCH[key]
+    except KeyError:
+        arch = _GRAPH_RECOMPUTE_ARCH[key] = _graph_recompute_arch(
+            get_backend(opts.backend), v.device
+        )
+    return T_r * HV < GRAPH_RECOMPUTE_MIN_ROWS.get(
+        arch, GRAPH_RECOMPUTE_MIN_ROWS_DEFAULT
+    )
+
+
+def _reads_frame(opts: OptionsKcp) -> bool:
+    """Whether a forward reads torch's checkpoint frame for its hand-off / #5 decision: always with ``graph="off"``;
+    with ``graph="replay"`` only inside a backward pass (torch's recompute runs there; the decision is part of the
+    recompute's CUDA-graph key)."""
+    return opts.graph == "off" or _graph_task_id() != -1
+
+
+def _fwd_decision(
+    n_saved: int,
+    *,
+    hand_off: bool,
+    autograd_node: bool,
+    executable: bool,
+    opts: OptionsKcp,
+) -> tuple[bool, str, bool, str, int]:
+    """``(hand_off, hand_off_reason, launch, fwd_o_reason, n_saved)`` of a forward whose Function saves ``n_saved``
+    tensors: ``hand_off`` (the requested hand-off, ``reuse_recompute_tapes``) and the launch of #5
+    (``recompute_output``), from one read of torch's checkpoint frame per saved count (:func:`_recompute_output_dead`);
+    counts the #5 decision in ``RECOMPUTE_OUTPUT_STATS``."""
+    proof: dict[
+        int, tuple[bool, str]
+    ] = {}  # the checkpoint-frame proof, read once per saved count
+
+    def frame_proof(n: int) -> tuple[bool, str]:
+        if n not in proof:
+            proof[n] = _recompute_output_dead(n)
+        return proof[n]
+
+    reads = _reads_frame(opts)
+    hand_off_reason = "always" if hand_off else "off"
+    if hand_off and opts.reuse_recompute_tapes == "auto":
+        # keep the tapes only when this node closes the checkpointed region (the frame proof of
+        # recompute_output="auto"): then its backward is the region's first and the kept tapes die before any other
+        # backward runs.  With a later saver in the region (an output projection, an MLP) the kept set would live
+        # through those operations' backward and raise the region's backward peak by the full tape set, so the
+        # replay form is taken there; every unreadable state (another torch release, early stop off, user hooks, a
+        # non-executable node) is the replay form as well.
+        if not (autograd_node and executable and reads):
+            hand_off, hand_off_reason = False, "not_executable"
+        else:
+            hand_off, hand_off_reason = frame_proof(n_saved)
+    launch, reason = True, "always"
+    if autograd_node and opts.recompute_output == "auto" and reads:
+        if not executable:
+            # autograd creates no node and packs nothing: the holders still waiting are a later op's
+            reason = "not_executable"
+        else:
+            # the Function saves the five operands and saved.tensors() right after this forward returns
+            dead, reason = frame_proof(n_saved)
+            launch = not dead
+            if reason in _RECOMPUTE_FRAME_REASONS:
+                RECOMPUTE_OUTPUT_STATS["skipped" if dead else "launched"] += 1
+    return hand_off, hand_off_reason, launch, reason, int(n_saved)
 
 
 def _fwd_body(
@@ -5690,58 +6055,38 @@ def _fwd_body(
     autograd_node: bool = False,
     executable: bool = True,
     s_in: torch.Tensor | None = None,
+    decision: tuple[bool, str, bool, str, int] | None = None,
 ) -> tuple[torch.Tensor, SavedKcp | None]:
     """The forward's allocations and launches (eagerly or inside a capture): the sequence, ``out`` and #5, the saved
     set.  ``hand_off``: the ten forward tapes (and the ``stage_m`` plane when the saved set carries no ``M_seg``;
     with the norm also ``qn`` / ``kn``) leave the arena as the saved set's ``kept`` hand-off instead of being dropped
-    (``reuse_recompute_tapes``).
-    ``autograd_node`` with ``recompute_output="auto"`` (eager only): #5 is left out when the forward is torch's
+    (``reuse_recompute_tapes``); under ``graph="replay"`` they stay bound in the arena and the hand-off references
+    them (the arena hand-off, :func:`_kept_stale`).
+    ``autograd_node`` with ``recompute_output="auto"``: #5 is left out when the forward is torch's
     checkpoint recompute whose output nothing reads (:func:`_recompute_output_dead`; ``out`` is allocated as ever,
     never written) -- only for an ``executable`` node (the one that packs the saved tensors the proof counts); a
-    non-executable one launches with the static reason ``not_executable``."""
-    proof: dict[
-        int, tuple[bool, str]
-    ] = {}  # the checkpoint-frame proof, read once per saved count
-
-    def frame_proof(n_saved: int) -> tuple[bool, str]:
-        if n_saved not in proof:
-            proof[n_saved] = _recompute_output_dead(n_saved)
-        return proof[n_saved]
-
-    hand_off_reason = "always" if hand_off else "off"
-    if hand_off and call.opts.reuse_recompute_tapes == "auto":
-        # keep the tapes only when this node closes the checkpointed region (the frame proof of
-        # recompute_output="auto"): then its backward is the region's first and the kept tapes die before any other
-        # backward runs.  With a later saver in the region (an output projection, an MLP) the kept set would live
-        # through those operations' backward and raise the region's backward peak by the full tape set, so the
-        # replay form is taken there; every unreadable state (another torch release, early stop off, user hooks, a
-        # non-executable node) is the replay form as well.
-        if not (autograd_node and executable and call.opts.graph == "off"):
-            hand_off, hand_off_reason = False, "not_executable"
-        else:
-            hand_off, hand_off_reason = frame_proof(_saved_count(call, save))
-    call.scratch["hand_off_reason"] = hand_off_reason
-    if hand_off:
-        _kept_evict_all()  # one live entry: the previous set is freed before this forward materialises its own
+    non-executable one launches with the static reason ``not_executable``.  ``decision``: the
+    :func:`_fwd_decision` the CUDA-graph lookup already made for this call (``graph="replay"``); else made here."""
     # #5's decision comes before the forward, which folds #5 into its tape walks when it launches (``fuse_o`` /
     # ``fuse_o_tape``): the frame proof reads the count the Function saves after this forward (memoised per count;
     # this forward packs nothing), asserted against the saved set below
     n_saved = _saved_count(call, save)
-    launch, reason = True, "always"
-    if (
-        autograd_node
-        and call.opts.recompute_output == "auto"
-        and call.opts.graph == "off"
-    ):
-        if not executable:
-            # autograd creates no node and packs nothing: the holders still waiting are a later op's
-            reason = "not_executable"
-        else:
-            # the Function saves the five operands and saved.tensors() right after this forward returns
-            dead, reason = frame_proof(n_saved)
-            launch = not dead
-            if reason in _RECOMPUTE_FRAME_REASONS:
-                RECOMPUTE_OUTPUT_STATS["skipped" if dead else "launched"] += 1
+    if decision is None:
+        decision = _fwd_decision(
+            n_saved,
+            hand_off=hand_off,
+            autograd_node=autograd_node,
+            executable=executable,
+            opts=call.opts,
+        )
+    hand_off, hand_off_reason, launch, reason, decided = decision
+    if decided != n_saved:
+        raise RuntimeError(
+            f"the CUDA-graph lookup decided for {decided} saved tensors, the call saves {n_saved}"
+        )
+    call.scratch["hand_off_reason"] = hand_off_reason
+    if hand_off:
+        _kept_evict_all()  # one live entry: the previous set is freed before this forward materialises its own
     fuse_o = _fuse_o(call, launch=launch, hand_off=hand_off)
     # a save_mode="full" forward with its saved set writes the saved h / v_new tapes and o in the same walks instead
     fuse_o_tape = _fuse_o_tape(call, launch=launch, save=save)
@@ -5771,6 +6116,13 @@ def _fwd_body(
             # the tape walks were kn's last readers (a hand-off forward hands kn over with its tapes)
             call.release_tapes(("kn",))
         call.release_pools(FWD_DEAD_POOLS)
+    if not launch and not fuse_o and call.opts.graph != "off" and call.out is None:
+        # graph="replay": the recompute's dead output (no program writes it, torch discards it) would be a static
+        # buffer of the captured graph for as long as the graph lives -- [T_r, HV, 128] BF16 beside the original
+        # forward's -- so it is a broadcast view of one element instead (same shape, dtype and device)
+        call.out = _alloc((1, 1, 1), call.backend.dtypes["out"], call.device).expand(
+            call.T_r, call.HV, D
+        )
     call.output()  # a fused forward's output walks wrote it; else allocated here, after the releases, for #5
     saved = _saved_set(call) if save else None
     if _SAVED_OPERANDS + (len(saved.tensors()) if saved is not None else 0) != n_saved:
@@ -5794,16 +6146,22 @@ def _fwd_body(
     if hand_off:
         # with the norm the rows #1_l2n wrote go along: the backward binds them instead of running qk_apply
         qk = {n: call.tape(n) for n in QK_TAPES} if call.l2n else {}
+        # the arena hand-off: graph="replay" on a caller-held workspace (the one a captured graph bakes); a per-call
+        # workspace is never captured and dies with the call, so its tapes are handed over as in an eager call
+        arena = call.opts.graph != "off" and call.scratch.get("workspace") == "caller"
         kept = _KeptTapes(
             {n: call.tape(n) for n in FWD_TAPES},
             stage_m,
             call.ws.geometry,
             _graph_task_id(),
             qk,
+            ws=call.ws if arena else None,
         )
-        # unbound: a later forward on this workspace cannot overwrite the kept tensors
-        for n in (*FWD_TAPES, *qk):
-            call.ws.release_tape(n)
+        if not arena:
+            # unbound: a later forward on this workspace cannot overwrite the kept tensors (the arena hand-off of
+            # graph="replay" keeps them bound -- a captured graph bakes their addresses -- and is stamped instead)
+            for n in (*FWD_TAPES, *qk):
+                call.ws.release_tape(n)
     if saved is not None and kept is not None:
         saved = dataclasses.replace(saved, kept=kept)
     return call.out, saved
@@ -5933,9 +6291,9 @@ def _check_saved(saved: SavedKcp, call: CallKcp) -> None:
     kept: _KeptTapes | None = saved.kept
     # the recompute forward's ten tapes of this geometry (+ the stage_m plane without a saved M_seg)
     if kept is not None:
-        if saved.save_mode != "light" or opts.graph != "off" or call.T_r == 0:
+        if saved.save_mode != "light" or call.T_r == 0:
             raise ValueError(
-                "saved: kept recompute tapes apply to the light saved-context backward with graph='off' and T_r > 0"
+                "saved: kept recompute tapes apply to the light saved-context backward with T_r > 0"
             )
         if kept.geometry != call.ws.geometry:
             raise ValueError(
@@ -6052,8 +6410,17 @@ def _bwd_entry(
     """:func:`chunk_gdn_bwd_kcp` with validated options and mode.  ``packed_grads``: ``dq`` / ``dk`` / ``dv`` may be
     the head views of one packed row when ``q`` / ``k`` / ``v`` are (:func:`_alloc_grads`); part of the graph key."""
     entry = None
+    if isinstance(workspace, WorkspaceKcp):
+        workspace.calls += 1
     if opts.graph != "off":
-        kept = () if saved is None else saved.tensors()
+        held = () if saved is None else saved.tensors()
+        # the kept recompute tapes are part of the key: their backward is its own graph (no #1, no tape walk), and a
+        # replay binds the very tensors the capture did (:func:`_kept_key_part`)
+        handed, hand = (
+            ((), ())
+            if saved is None or saved.kept is None
+            else _kept_key_part(saved.kept, workspace)
+        )
         entry = _graph_entry(
             "bwd",
             ctx,
@@ -6061,11 +6428,15 @@ def _bwd_entry(
             get_backend(opts.backend),
             opts,
             scale,
-            (q, k, v, g, beta, dout, *kept),
-            (saved is not None, packed_grads),
+            (q, k, v, g, beta, dout, *held, *handed),
+            (saved is not None, packed_grads) + hand,
         )
     if entry is not None and entry.replayable(workspace):
         _graph_replay("bwd", entry)
+        if saved is not None and saved.kept is not None:
+            # the captured backward read the kept tapes (#8 was their last reader): the entry is consumed
+            saved.kept.clear()
+            KEPT_STATS["released"] += 1
         grads, batched = entry.result
         return tuple(_ranked(t.detach(), batched) for t in grads)
     call, batched = _prepare(
@@ -6087,12 +6458,15 @@ def _bwd_entry(
     if saved is not None:
         _check_saved(saved, call)
     if entry is not None and entry.seen > 0 and entry.disabled is None:
+        kept_fields = _kept_fields(None if saved is None else saved.kept)
         res = _graph_capture(
             "bwd", entry, call, lambda: _in_launch_scope(call, _bwd_body, call, saved)
         )
         if res is not None:
             entry.result = (res, batched)
             return tuple(_ranked(t.detach(), batched) for t in res)
+        # a capture that failed after the body's #8 released the kept set: the eager form binds it again
+        _kept_restore(saved.kept if saved is not None else None, kept_fields)
         call, batched = _prepare(
             q,
             k,
@@ -6117,6 +6491,67 @@ def _bwd_entry(
         _graph_eager("bwd", entry)
     call.backend.end_call(call)
     return tuple(_ranked(t, batched) for t in grads)
+
+
+def _kept_fields(kept: _KeptTapes | None) -> tuple | None:
+    """The fields of ``kept`` that its release (:func:`_kept_release`) clears, and the release count, before a
+    backward capture (:func:`_kept_restore`); ``None`` without a kept set."""
+    if kept is None:
+        return None
+    return (
+        dict(kept.tapes),
+        kept.stage_m,
+        dict(kept.qk),
+        kept.ws,
+        KEPT_STATS["released"],
+    )
+
+
+def _kept_restore(kept: _KeptTapes | None, fields: tuple | None) -> None:
+    """``kept`` as :func:`_kept_fields` found it, after a capture that ran the body (its #8 released the kept set)
+    and failed: the eager form that follows binds and releases it once."""
+    if kept is None or fields is None:
+        return
+    kept.tapes, kept.stage_m, kept.qk, kept.ws, KEPT_STATS["released"] = fields
+
+
+def _kept_tensors(kept: _KeptTapes | None) -> tuple[torch.Tensor, ...]:
+    """The tensors of a kept hand-off in a fixed order (the ten :data:`FWD_TAPES`, the ``stage_m`` plane, ``qn`` /
+    ``kn``): the backward's CUDA-graph key part of a kept set other than the arena hand-off just taken
+    (:func:`_kept_key_part`); ``()`` without one."""
+    if kept is None:
+        return ()
+    out = [kept.tapes[n] for n in FWD_TAPES if n in kept.tapes]
+    if kept.stage_m is not None:
+        out.append(kept.stage_m)
+    out.extend(kept.qk[n] for n in QK_TAPES if n in kept.qk)
+    return tuple(out)
+
+
+def _kept_layout(kept: _KeptTapes) -> tuple:
+    """The backward's CUDA-graph key flags of an arena hand-off (:func:`_kept_stale`): the hand-off flag, the arena
+    geometry the tapes were produced at and which optional tensors it carries (the ``stage_m`` plane, the ``qn`` /
+    ``kn`` rows) -- the tensors themselves are the arena's, pinned by the arena signature of the capture."""
+    return (True, kept.geometry, kept.stage_m is not None, tuple(kept.qk))
+
+
+def _kept_key_part(
+    kept: _KeptTapes | None, workspace: Any
+) -> tuple[tuple[torch.Tensor, ...], tuple]:
+    """``(tensors, flags)`` a kept set adds to the backward's CUDA-graph key.  The arena hand-off this backward just
+    took on ``workspace`` (stamped at the workspace's call before the backward's own, which :func:`_bwd_entry` has
+    counted) adds its layout only (:func:`_kept_layout`): the take checked that its tensors are the arena's own
+    (:func:`_kept_stale`) and a replay requires the arena signature of the capture (:meth:`_GraphEntry.replayable`).
+    Any other kept set adds its tensors (:func:`_kept_tensors`) and the flag ``True``; none adds nothing."""
+    if (
+        kept is not None
+        and kept.ws is not None
+        and kept.ws is workspace
+        and kept.calls == workspace.calls - 1
+    ):
+        return (), _kept_layout(kept)
+    handed = _kept_tensors(kept)
+    return handed, ((True,) if handed else ())
 
 
 def _alloc_grads(call: CallKcp) -> None:
@@ -6206,7 +6641,18 @@ class ChunkGDNFunctionKcp(torch.autograd.Function):
         packed_grads=True,
     ):
         boundary = None if handle is None else _handle_lookup(handle)
+        # the graph task (the hand-off's condition), not read where no hand-off can follow (reuse_recompute_tapes=False)
         gid = _graph_task_id() if opts.reuse_recompute_tapes else -1
+        # the size rule of "auto" (graph="replay" on a caller-held workspace, the CUDA-graph path), decided once and
+        # only where a hand-off could follow (torch's recompute, inside a backward pass); below it no hand-off
+        small = (
+            gid != -1
+            and opts.graph != "off"
+            and isinstance(workspace, WorkspaceKcp)
+            and _graph_recompute_small(opts, v, int(ctx.T_r), v.size(-2))
+        )
+        if small:
+            gid = -1
         out, saved = _fwd_entry(
             q,
             k,
@@ -6221,6 +6667,7 @@ class ChunkGDNFunctionKcp(torch.autograd.Function):
             hand_off=gid != -1,
             autograd_node=True,
             executable=bool(executable),
+            small=small,
             boundary=boundary,
             handle_mode=None
             if handle is None
@@ -6281,11 +6728,13 @@ class ChunkGDNFunctionKcp(torch.autograd.Function):
             object.__setattr__(saved, "release_in_backward", True)
         # the set above holds the only Python references to the saved tensors
         del tensors
+        # under "auto" an empty registry has no entry for this node (no graph task to read, no key to build: a direct
+        # backward, or a recompute that did not hand off)
         if (
             saved is not None
             and opts.reuse_recompute_tapes
             and saved.save_mode == "light"
-            and opts.graph == "off"
+            and (opts.reuse_recompute_tapes is True or _KEPT)
         ):
             gid = _graph_task_id()
             kept = None
@@ -6300,7 +6749,8 @@ class ChunkGDNFunctionKcp(torch.autograd.Function):
                     else None
                 )
             if kept is not None:
-                saved = dataclasses.replace(saved, kept=kept)
+                # this backward's own saved set (built above): set in place, frozen dataclass
+                object.__setattr__(saved, "kept", kept)
         if not dout.is_contiguous():
             dout = dout.contiguous()
         dq, dk, dv, dbeta, dg = _bwd_entry(
@@ -6604,6 +7054,7 @@ __all__ = [
     "FWD_DEAD_POOLS",
     "FWD_TAPES_ARENA_AFTER_FWD",
     "FWD_TAPES_ARENA_AFTER_FUSED",
+    "KEPT_STALE_STATS",
     "KEPT_STATS",
     "L2N_PROGRAMS",
     "L2N_SIBLING_OF",
