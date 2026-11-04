@@ -1705,6 +1705,12 @@ ROW_RULES: dict[tuple, dict] = {
     #      partitions of the row's plan without it, measured on GB300 against that plan ----
     ('sm_103a', True, True, False, False, False, 2048, 16172, 4096): {"cta_rows": 256, "sk_sync": True, "sk_sync_m": 62, "sk_slab": 2, "epi": 'tma', "slots": 1},
     ('sm_103a', True, True, False, False, False, 2048, 16231, 4096): {"cta_rows": 256, "sk_sync": True, "sk_sync_m": 62, "sk_slab": 2, "epi": 'tma', "slots": 1},
+    # ---- sm_103a: the GB T-exact rules of round 4 - the 5120 -> 17408 input gradient at T 16231 / 16384 (the
+    #      overlapped half-tail program with the column-grouped raster in 12-column-tile groups, in place of the ragged
+    #      rule's row-half program), with the bf16 tiles through the one-slot TMA store and the per-tile K partitions of
+    #      the row's plan without it, measured on GB300 against that plan ----
+    ('sm_103a', False, True, False, False, False, 5120, 17408, 16231): {"cta_rows": 256, "ovl": True, "htail": True, "cgrp": True, "group_m": 12, "epi": 'tma', "slots": 1},
+    ('sm_103a', False, True, False, False, False, 5120, 17408, 16384): {"cta_rows": 256, "ovl": True, "htail": True, "cgrp": True, "group_m": 12, "epi": 'tma', "slots": 1},
 }
 # fmt: on
 
