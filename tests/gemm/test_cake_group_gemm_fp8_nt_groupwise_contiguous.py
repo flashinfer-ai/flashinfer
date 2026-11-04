@@ -2050,6 +2050,25 @@ BLOCK_SCALED_SMALL_CASES = [
         {"sm_100a": BS_SWAP_C1_ROUTE},
         id="c1_sm100_n384_single_run",
     ),
+    # The table layouts: 896 rows at alignment 64 (not in
+    # BS_SWAP_SM100_SMALL_KEEP: 28 * 8 = 224 one-CTA tiles on 148 SMs) and
+    # 768 rows at alignment 32 (in BS_SWAP_SM103_SMALL_ADMIT: 24 * 8 = 192 tiles).
+    pytest.param(
+        [40, 77, 0, 3, 100, 1, 65, 30],
+        1024,
+        512,
+        64,
+        {"sm_100a": BS_SWAP_C1_ROUTE},
+        id="c1_sm100_m896_a64_k512",
+    ),
+    pytest.param(
+        [130, 0, 7, 61, 96, 33, 1, 100],
+        1024,
+        256,
+        32,
+        {"sm_103a": BS_SWAP_C1_ROUTE},
+        id="c1_sm103_m768_a32_k256",
+    ),
 ]
 
 
