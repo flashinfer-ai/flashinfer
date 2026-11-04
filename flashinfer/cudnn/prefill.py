@@ -870,7 +870,14 @@ if CUDNN_AVAILABLE:
             # is normalised to None upstream.
             mask_kwargs = {}
             if window_left is not None:
-                mask_kwargs["diagonal_band_left_bound"] = window_left + 1
+                # sdpa_fp8 exposes the same band as `left_bound`.
+                window_key = (
+                    "left_bound"
+                    if cudnn_q_data_type
+                    in (cudnn.data_type.FP8_E4M3, cudnn.data_type.FP8_E5M2)
+                    else "diagonal_band_left_bound"
+                )
+                mask_kwargs[window_key] = window_left + 1
                 mask_kwargs["diagonal_alignment"] = (
                     cudnn.diagonal_alignment.BOTTOM_RIGHT
                 )

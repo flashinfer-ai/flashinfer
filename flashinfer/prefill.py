@@ -5501,9 +5501,11 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             ``fmha_v2`` for large-sequence MHA on SM120, and on SM100a ``cudnn`` (when the
             installed cuDNN can consume token-unit indptrs directly, see
             :func:`~flashinfer.cudnn.prefill._cudnn_supports_direct_seqlens`) or else
-            ``cutlass`` on SM100a/SM110a, for the head dims those kernels serve, when no
-            sliding window, logits soft cap, custom mask or multi-item-scoring pointer is in
-            play -- neither path accepts those, so ``auto`` stays on ``fa2`` for them.
+            ``cutlass`` on SM100a/SM110a, for the head dims those kernels serve.
+            Sliding windows and attention sinks are supported by the eligible ``cudnn``
+            path, but exclude ``cutlass``. RoPE, logits soft caps, custom masks and
+            multi-item-scoring pointers exclude both upgrades, so ``auto`` stays on
+            ``fa2`` for them.
             Otherwise ``fa2``.
             The ``cudnn`` backend takes ``qo_indptr``/``kv_indptr`` in the same **token**
             units as every other backend, whether selected explicitly or via ``auto``.
