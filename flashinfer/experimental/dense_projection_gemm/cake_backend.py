@@ -1114,11 +1114,12 @@ ROUTER_RULES: dict[
     ("sm_107a", "nn_t", 4096, 256): None,
     ("sm_107a", "nn_t", 5120, 256): ((16172, 16384, "H0.5x4"),),
     ("sm_107a", "nn_t", 6144, 256): None,
-    # the input gradient, measured on 152-SM GB200 (sm_100a) parts at 64, 128 and 192 tokens (and 224 and 256 at
-    # hidden 4096): the SIMT program with the 32 x 64 tile in four slices (128 threads, one CTA per 32 tokens and 64
-    # hidden columns) up to 128 tokens at hidden 4096 and 5120 and up to 64 at hidden 6144; next to a resident kernel
-    # it was more than 3 % slower than the deterministic program from 192 tokens (from 128 at hidden 6144).  sm_103a and
-    # 216-SM sm_107a parts keep the deterministic program (not measured)
+    # the input gradient, measured on 152-SM GB200 (sm_100a) parts at 1, 17, 32, 64, 96 and 128 tokens at hidden 4096
+    # and 5120 and at 1, 17, 32 and 64 tokens at hidden 6144 (outside the windows: at 192 tokens, at 224 and 256 at
+    # hidden 4096 and at 128 at hidden 6144): the SIMT program with the 32 x 64 tile in four slices (128 threads, one
+    # CTA per 32 tokens and 64 hidden columns) up to 128 tokens at hidden 4096 and 5120 and up to 64 at hidden 6144;
+    # next to a resident kernel it was more than 3 % slower than the deterministic program from 192 tokens (from 128 at
+    # hidden 6144).  sm_103a and 216-SM sm_107a parts keep the deterministic program (not measured)
     ("sm_100a", "kn", 4096, 256): ((1, 128, "simt_n64m32s4"),),
     ("sm_100a", "kn", 5120, 256): ((1, 128, "simt_n64m32s4"),),
     ("sm_100a", "kn", 6144, 256): ((1, 64, "simt_n64m32s4"),),
@@ -1147,7 +1148,8 @@ ROUTER_SM_COUNT: dict[str, int] = {"sm_100a": 152, "sm_103a": 152, "sm_107a": 21
 #: the input gradient takes the SIMT program with the 32 x 64 tile in eight slices up to 64 tokens and the 64 x 64
 #: tile in four slices from 65 to 128 tokens at hidden 4096 and 5120 (256 threads each; measured at 64, 128 and 192
 #: tokens: from 192 tokens, from 128 at hidden 6144, more than 3 % slower than the deterministic program next to a
-#: resident kernel), up to 64 tokens at hidden 6144.
+#: resident kernel; the windows start at 1 token as on 152-SM sm_100a parts, measured there at 1, 17 and 32 tokens),
+#: up to 64 tokens at hidden 6144.
 # fmt: off
 ROUTER_RULES_BY_SM: dict[
     tuple[str, int],
