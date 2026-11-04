@@ -1308,6 +1308,7 @@ def test_sm107a_registers_the_fp8_decode_route_only():
     assert set(_ARCH_REGISTRATIONS["sm_107a"]["variants"]) == {
         "fp8_h128_prefill_source_persistent",
         "fp8_h128_prefill_source_persistent_uniform",
+        "fp8_h128_prefill_source_persistent_uniform_k64",
         "fp8_h64_prefill_source_persistent_m64",
         "fp8_h64_prefill_source_persistent_m64_multi_tile",
         "fp8_lowhead_prefill",
@@ -2815,6 +2816,64 @@ def test_fp8_h128_persistent_launch_takes_the_twin_at_its_floors(
         arch == "sm_100a" and max_q_len >= 257
     )
     program = f"{route}_no_pdl" if takes and not enable_pdl else route
+    assert L.calls == [
+        (
+            program,
+            {"grid": (tokens * 2, 1, 1), "total_work_items": tokens, **L.partials(1)},
+        )
+    ]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
+def test_sm107a_launches_take_the_k64_sibling_from_its_floor(arch):
+    """SM107 routes the FP8 H128 uniform-gather route's K=64 sibling to a
+    program of its own, with the route's arguments, and runs it on launches of
+    at least 48 rows; SM100 and SM103 route the sibling to the route's program
+    and launch the route."""
+    from flashinfer.jit.cake_dsv4 import VARIANTS
+
+    assert {"fp8_h128_prefill_source_persistent_uniform"} == cake._K64_SIBLING_ROUTES
+    assert cake._K64_SIBLING_MIN_TOKENS == {"sm_107a": 48}
+    for route in sorted(cake._K64_SIBLING_ROUTES):
+        sibling = f"{route}_k64"
+        own = arch == "sm_107a"
+        assert (VARIANTS[arch][sibling] != VARIANTS[arch][route]) == own
+        for tokens in (1, 8, 32, 47, 48, 64, 96, 127):
+            expected = sibling if own and tokens >= 48 else route
+            assert (
+                cake._k64_variant(route, arch=arch, num_query_tokens=tokens) == expected
+            ), tokens
+        assert (
+            get_cake_dsv4_spec(sibling, arch=arch)["arg_plan"]
+            == get_cake_dsv4_spec(route, arch=arch)["arg_plan"]
+        )
+    for other in (
+        "fp8_h128_prefill_source_persistent",
+        "fp8_h64_prefill_source_persistent_m64",
+        "fp8_lowhead_prefill",
+    ):
+        assert cake._k64_variant(other, arch=arch, num_query_tokens=64) == other
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
+@pytest.mark.parametrize("tokens", [8, 47, 48, 127])
+@pytest.mark.parametrize("enable_pdl", [False, True])
+def test_fp8_h128_uniform_launch_takes_the_k64_sibling_at_its_floor(
+    arch, tokens, enable_pdl
+):
+    route = "fp8_h128_prefill_source_persistent_uniform"
+    L = _RecordingLauncher(
+        arch,
+        num_query_tokens=tokens,
+        num_heads=128,
+        sparse_topk=1152,
+        max_q_len=4,
+        enable_pdl=enable_pdl,
+    )
+    cake._dispatch_route(route, L)
+    program = f"{route}_k64" if arch == "sm_107a" and tokens >= 48 else route
     assert L.calls == [
         (
             program,

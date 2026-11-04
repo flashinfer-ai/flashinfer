@@ -103,7 +103,8 @@ with a successor in its document chain), ``N_in`` / ``N_out`` the group totals,
   the same shape) in the forward's tape walk and in every backward phase of
   the replay and ``save_mode="full"`` forms (and in the kept form's recompute
   forward, which hands them to its backward with the tapes: there they are
-  hand-off tensors, ``bwd.kept_tapes``, not workspace), plus the arena
+  hand-off tensors, ``bwd.kept_tapes``, not workspace; under ``graph="replay"``
+  the arena's own rows), plus the arena
   ``qk_rstd`` in the backward forms that re-run #1
   (the light replay of a saved set and the replay of a call without one; the
   ``save_mode="full"`` and kept-tape backwards read the saved one) and at #1 of
@@ -173,16 +174,9 @@ def _flag(value: bool, name: str) -> bool:
     return value
 
 
-def _kept_form(reuse_recompute_tapes: bool | str | None, graph: str = "off") -> bool:
+def _kept_form(reuse_recompute_tapes: bool | str | None) -> bool:
     """Whether the workspace terms are the kept-tape backward's (``True``; ``None`` = the package default) or the
-    replay form's (``False``; ``"auto"`` = the bound of both forms, the replay's).  Under ``graph="replay"`` the
-    default is ``False`` and ``True`` / ``"auto"`` are refused, as the call's options do."""
-    if graph != "off":
-        if reuse_recompute_tapes is None or reuse_recompute_tapes is False:
-            return False
-        raise ValueError(
-            f"reuse_recompute_tapes={reuse_recompute_tapes!r} needs graph='off' (a captured graph keeps no tapes)"
-        )
+    replay form's (``False``; ``"auto"`` = the bound of both forms, the replay's), under either ``graph`` mode."""
     value = (
         REUSE_RECOMPUTE_TAPES_DEFAULT
         if reuse_recompute_tapes is None
@@ -580,11 +574,20 @@ def gdn_workspace_layout_kcp(
       saved set) with, under the norm, ``qn`` / ``kn`` and the arena ``qk_rstd`` of a forward without a saved set;
       ``backward`` (``bwd.phase.graph``) is every backward pool, the ten light tapes (none with ``save_mode="full"``
       and a saved set), every backward tape and, under the norm, ``qn`` / ``kn`` and the arena ``qk_rstd`` where
-      the backward re-runs #1.
+      the backward re-runs #1.  The kept-tape form there (``True``: the checkpoint recompute's arena hand-off,
+      ``cake_kcp._kept_stale``) keeps its tapes, the ``stage_m`` plane and the norm's rows bound in the arena, so
+      its terms are the replay form's without the arena ``qk_rstd`` (the backward re-runs no #1) and
+      ``bwd.kept_tapes`` is 0; its recompute forward binds no more than the backward that follows: ``True`` gives
+      that form's figures exactly.  ``"auto"`` (and the default) gives the replay form's figures at every size, an
+      upper bound of the call: equal when the call takes the replay form (below the size rule,
+      ``cake_kcp.GRAPH_RECOMPUTE_MIN_ROWS``, or with a later operation of the checkpointed region that saves a
+      tensor), larger by the backward's arena ``qk_rstd`` (with the norm; else equal) when it keeps the tapes.
     * ``use_qk_l2norm_in_kernel``: ``qn`` / ``kn`` in both forward moments, in every backward phase of the replay
       and ``save_mode="full"`` forms (``qk_apply`` writes them there) and in the kept form's recompute forward, which
-      hands them over with the ten tapes: in the kept-tape backward they are hand-off tensors (``bwd.kept_tapes``,
-      ``bwd.qn`` / ``bwd.kn`` 0); ``fwd.qk_rstd`` (the arena ``r``) at #1 of a forward without a saved set;
+      hands them over with the ten tapes: in the kept-tape backward under ``graph="off"`` they are hand-off tensors
+      (``bwd.kept_tapes``, ``bwd.qn`` / ``bwd.kn`` 0); under ``graph="replay"`` the arena hand-off keeps them as arena
+      rows (``bwd.qn`` / ``bwd.kn`` at full size, ``bwd.kept_tapes`` 0); ``fwd.qk_rstd`` (the arena ``r``) at #1 of a
+      forward without a saved set;
       ``bwd.qk_rstd`` where the backward re-runs #1 (the light replay of a saved set, a backward without one).
     """
     H_qk, HV = _check(H_qk, HV)
@@ -598,7 +601,7 @@ def gdn_workspace_layout_kcp(
     if fused_walks not in (0, 1):
         raise ValueError(f"fused_walks must be 0 or 1, got {fused_walks!r}")
     eager = graph == "off"
-    kept_form = _kept_form(reuse_recompute_tapes, graph)
+    kept_form = _kept_form(reuse_recompute_tapes)
     # the plan's split tables (they do not depend on P) and its segment count
     hp = ctx.heads(HV)
     P = _segments(ctx, hp.P, P)
@@ -616,6 +619,9 @@ def gdn_workspace_layout_kcp(
     # the kept-tape backward exists for the light form with a saved set only (the runtime hands off only from a
     # forward that saves: cake_kcp._fwd_entry / _fwd_body)
     kept = kept_form and keep and not full
+    # the eager hand-off: the kept tapes leave the arena (fresh tensors outside the workspace); under graph="replay"
+    # they are the arena's own tapes, bound through the backward (cake_kcp._kept_stale: the arena hand-off)
+    handed = kept and eager
     # the shipped forward folds #5 into its tape walks (cake_kcp._fuse_o_enabled with test knob fused_o = 1)
     fused = save_mode == "light" and saved and _fwdh_out_shipped()
     # a2a collectives run when a fragment of the group crosses a rank (cake_kcp._forward: tb.N_out)
@@ -628,9 +634,10 @@ def gdn_workspace_layout_kcp(
     plane = (ctx.n_frag * P * HV * STATE_TILE_BYTES) if P > 1 else 0
     fwd_staging = plane + (0 if (keep and (save_transfer or full)) else plane)
     # the kept form's recompute forward hands its stage_m plane over without save_transfer (cake_kcp._fwd_body,
-    # _saved_fresh_pools): that backward sizes stage_b only, the plane is a hand-off tensor until #8 (bwd.kept_tapes)
-    bwd_staging = plane + (0 if (keep and (save_transfer or full or kept)) else plane)
-    kept_stage_m = plane if (kept and not save_transfer) else 0
+    # _saved_fresh_pools): that backward sizes stage_b only, the plane is a hand-off tensor until #8 (bwd.kept_tapes);
+    # the arena hand-off (graph="replay") keeps it in the arena's stage_m pool
+    bwd_staging = plane + (0 if (keep and (save_transfer or full or handed)) else plane)
+    kept_stage_m = plane if (handed and not save_transfer) else 0
     # P > 1: the carry plane holds n_frag (P - 1) segment states and, with the fused walks (the shipped form; the
     # fused_walks test knob of the call), max(n_in, n_out) slots for the S_in / dS_out copies (one index range shared
     # by the crossing-in and crossing-out slots); the c1 send pool also holds the M_f^T tiles of the crossing-out
@@ -744,7 +751,7 @@ def gdn_workspace_layout_kcp(
     bwd_fwd_tapes_end: dict[str, int]
     if full:
         bwd_fwd_tapes, bwd_fwd_tapes_end = {}, {}
-    elif kept:
+    elif handed:
         bwd_fwd_tapes = {}
         bwd_fwd_tapes_end = {
             k: light_tapes[k]
@@ -769,10 +776,10 @@ def gdn_workspace_layout_kcp(
     # kept form binds the recompute forward's hand-off rows (outside the workspace, bwd.kept_tapes) -- and the arena r
     # where #1 is re-run (the full / kept forms read the saved r)
     replays_prep = not (full or kept)
-    kept_qk = qk_sum if kept else 0
+    kept_qk = qk_sum if handed else 0
     bwd_l2n = (
         {
-            **{k: 0 if kept else v for k, v in qk_rows.items()},
+            **{k: 0 if handed else v for k, v in qk_rows.items()},
             "qk_rstd": T_r * H_qk * QK_RSTD_BYTES if replays_prep else 0,
         }
         if l2n
@@ -850,7 +857,7 @@ def gdn_workspace_layout_kcp(
         out.update({f"bwd.{k}": v for k, v in bwd.items()})
         # the hand-off tensors: the ten forward tapes, with the norm also qn / kn, at P > 1 without save_transfer the
         # recompute forward's M_seg^T plane
-        out["bwd.kept_tapes"] = light_sum + kept_qk + kept_stage_m if kept else 0
+        out["bwd.kept_tapes"] = light_sum + kept_qk + kept_stage_m if handed else 0
         out.update({f"bwd.phase.{k}": v for k, v in phases.items()})
     out["forward"] = max(fwd_moments.values())
     out["forward_split"] = max(split_moments.values())
@@ -867,7 +874,7 @@ def gdn_workspace_layout_kcp(
             )
             + out["bwd.kept_tapes"]
         )
-        if (backward and kept)
+        if (backward and handed)
         else out["backward"]
     )
     out["workspace"] = max(out["forward"], out["backward"])
