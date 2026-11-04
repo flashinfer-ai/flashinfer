@@ -304,7 +304,11 @@
       "launch": {
         "grid": "(sm_count, 1, 1): one persistent CTA per multiprocessor of the launch device",
         "max_requests": 1024,
-        "shared_mem_bytes": 160768,
+        "shared_mem_bytes": {
+          "0": 177152,
+          "1": 160768,
+          "2": 160768
+        },
         "threads": 384
       },
       "profile": {
@@ -900,7 +904,6 @@
     },
     "dcp_spec_bf16_fp8_balanced": {
       "binding_source": "bindings/cake_fmha_dcp_spec_bf16_fp8_balanced_binding.cu",
-      "dynamic_shared_memory_bytes": 160768,
       "launch_binding": "cake_fmha_launch_dcp_spec_bf16_fp8_balanced",
       "parameters": [
         {
@@ -1016,6 +1019,7 @@
       "source_family": [
         {
           "defines": {
+            "DYNAMIC_SMEM_BYTES": 177152,
             "N_ROWS": 32,
             "Q_BOX_TOKENS": 8
           },
@@ -1024,12 +1028,13 @@
             "program": 0
           },
           "sources": {
-            "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel.cu",
-            "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel.cu"
+            "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/cake_fmha_dcp_spec_bf16_fp8_balanced_program0_n32.cu",
+            "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/cake_fmha_dcp_spec_bf16_fp8_balanced_program0_n32.cu"
           }
         },
         {
           "defines": {
+            "DYNAMIC_SMEM_BYTES": 177152,
             "N_ROWS": 64,
             "Q_BOX_TOKENS": 8
           },
@@ -1038,12 +1043,13 @@
             "program": 0
           },
           "sources": {
-            "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel.cu",
-            "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel.cu"
+            "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/cake_fmha_dcp_spec_bf16_fp8_balanced_program0_n64.cu",
+            "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/cake_fmha_dcp_spec_bf16_fp8_balanced_program0_n64.cu"
           }
         },
         {
           "defines": {
+            "DYNAMIC_SMEM_BYTES": 160768,
             "N_ROWS": 32,
             "Q_BOX_TOKENS": 8
           },
@@ -1058,6 +1064,7 @@
         },
         {
           "defines": {
+            "DYNAMIC_SMEM_BYTES": 160768,
             "N_ROWS": 64,
             "Q_BOX_TOKENS": 8
           },
@@ -1072,6 +1079,7 @@
         },
         {
           "defines": {
+            "DYNAMIC_SMEM_BYTES": 160768,
             "N_ROWS": 32,
             "Q_BOX_TOKENS": 8
           },
@@ -1086,6 +1094,7 @@
         },
         {
           "defines": {
+            "DYNAMIC_SMEM_BYTES": 160768,
             "N_ROWS": 64,
             "Q_BOX_TOKENS": 8
           },
