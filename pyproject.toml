@@ -57,7 +57,7 @@ skip = ["build", "3rdparty", "dist", ".venv"]
 
 [tool.setuptools]
 include-package-data = false
-py-modules = ["build_backend", "build_utils"]
+py-modules = ["build_backend", "build_utils", "_flashinfer_filelock"]
 
 [tool.setuptools.dynamic]
 version = { attr = "flashinfer._build_meta.__version__" }
