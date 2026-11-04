@@ -62,8 +62,8 @@ Packed QKV (#7817): under ``layout="tma"`` the backward of strided packed views 
 call); plain ``split`` views of the leaf, direct and checkpointed, get three contiguous gradients and keep torch's
 split backward and their hooks and ``retain_grad`` (issue #8367; within the same budgets).  ``test_l2n_rows`` / ``test_l2n_layer_checkpoint_rows``: the in-kernel Q / K L2 norm
 (``use_qk_l2norm_in_kernel=True``) on raw rows, every form within the FP64 budgets of the norm-off rows and of its
-partner, the deterministic package with the norm within the same constants, the token-local program outputs exact
-(see the block comment before ``V1_LIBRARIES``).
+partner, the deterministic package with the norm within the same constants, the token-local program outputs exact,
+and ``save_mode="light_akk"`` against the light form (see the block comment before ``V1_LIBRARIES``).
 
 Two launch forms: ``torch.multiprocessing.spawn`` (``pytest`` on a node with >= ``W`` GPUs) and one process per Slurm
 task (``SLURM_PROCID`` / ``SLURM_NTASKS``: the WORLD group is initialised once per process, every row runs on a
@@ -3797,7 +3797,16 @@ def test_layer_checkpoint_rows(row: Row, slurm) -> None:
 # * packed QKV views with the norm: within the budgets of the contiguous call; the backward writes one packed dQKV
 #   row and ``packed_qkv_views_kcp`` hands it to the packed leaf without a concatenation;
 # * memory: no ``qn`` / ``kn`` / ``qk_rstd`` in the arena after a forward or a backward; the bytes a forward retains
-#   with the norm == without + ``8 T_r H_qk`` (the saved r); saved bytes on - off == the query's ``qk_rstd`` term.
+#   with the norm == without + ``8 T_r H_qk`` (the saved r); saved bytes on - off == the query's ``qk_rstd`` term;
+# * ``save_mode="light_akk"`` (the light set plus #1_l2n's ``Akk`` tape; the light replay runs ``fwd_prep_replay_l2n``,
+#   #1_l2n reading that tape): within the FP64 budgets and against the light form in every form (a2a / ring,
+#   ``save_transfer`` on / off, the plan's ``P`` and the forced ``P = 2``, autograd, checkpoint, CUDA-graph replay
+#   steps on the light steps' workspace); exact: the launch census (the backward's ``fwd_prep_l2n`` becomes the
+#   replay, once per light replay; the forward is light's), the saved ``Akk`` bytes (``128 R HV``, the byte query's
+#   difference), the checkpoint saving as ``"light"``, and on the kernel backend every form under NaN-filled
+#   allocations within the budgets of the light form of the same options, with the replay run; whether the two
+#   forms' bits agree (and whether the light form repeats its own) is recorded as data, not gated (the package
+#   has no bitwise contract).
 #
 # The rows skip with a clear reason while the registry does not ship the three records (the kernel backend refuses
 # the option then); ``KCP_TEST_BACKEND=fake`` runs them on the torch emulation.
@@ -4209,6 +4218,106 @@ def _run_rank_l2n(
             ring=W > 1 and int(ctx.n_d_max) - 1 <= kcp.RING_MAX_HOPS,
             **L2N,
         )
+    # (a2) save_mode="light_akk": the light set plus #1_l2n's BF16 Akk tape, whose light replay runs
+    # fwd_prep_replay_l2n (#1_l2n reading that tape).  Every form within the FP64 budgets and against its light
+    # partner; the launch census (the backward's fwd_prep_l2n becomes the replay, once per light replay; the forward
+    # is light's), the saved Akk bytes (128 R HV, the byte query's difference); on the kernel backend each form under
+    # NaN-filled allocations within the budgets of the light form of the same options (the arm below), the replay
+    # run gated, the bits against light and light's own repeat recorded as data only; autograd (the saved set
+    # through save_for_backward) and a non-reentrant checkpoint (the mode saves as "light" there).
+    akk_replay = kcp.AKK_REPLAY_OF["fwd_prep_l2n"]
+    akk_info: dict[str, object] = {"shipped": bool(jit.records_of_program(akk_replay))}
+    if not kernels or akk_info["shipped"]:
+        res_akk = saved_pass(save_mode="light_akk", **L2N)
+        arm("light_akk", res_akk, res, "run0")
+        lb, ab = res["bwd"], res_akk["bwd"]
+        n_l2n = lb["sequence"].count("fwd_prep_l2n")
+        flags["light_akk_census"] = bool(
+            res_akk["fwd"]["sequence"] == res["fwd"]["sequence"]
+            and ab["sequence"]
+            == [akk_replay if p_ == "fwd_prep_l2n" else p_ for p_ in lb["sequence"]]
+            and ab["sequence"].count(akk_replay) == n_l2n
+            and "fwd_prep_l2n" not in ab["sequence"]
+            and (T_r == 0 or (n_l2n >= 1 and ab["akk_source"] == "saved"))
+        )
+        replay_records = set(jit.records_of_program(akk_replay)) if kernels else set()
+        if kernels:
+            flags["light_akk_replay_records"] = sum(
+                r_ in replay_records for r_, _g in ab["records"]
+            ) == ab["sequence"].count(akk_replay) and [
+                g_ for _r, g_ in ab["records"]
+            ] == [g_ for _r, g_ in lb["records"]]
+        tape = int(ctx.R) * HV * 128
+        q_light = int(
+            gb.gdn_saved_bytes_kcp(ctx, H_qk=H_qk, HV=HV, with_conv=False, **L2N)
+        )
+        q_akk = int(
+            gb.gdn_saved_bytes_kcp(
+                ctx, H_qk=H_qk, HV=HV, save_mode="light_akk", with_conv=False, **L2N
+            )
+        )
+        flags["light_akk_saved_bytes"] = (
+            int(res_akk["saved"].bytes) - int(res["saved"].bytes)
+            == tape
+            == q_akk - q_light
+        )
+        akk_info["census"] = {
+            "light_bwd": list(lb["sequence"]),
+            "light_akk_bwd": list(ab["sequence"]),
+            "akk_source": ab["akk_source"],
+        }
+        akk_info["saved_bytes"] = {
+            "light": int(res["saved"].bytes),
+            "light_akk": int(res_akk["saved"].bytes),
+            "tape": tape,
+            "query_difference": q_akk - q_light,
+        }
+        del res_akk
+        if kernels:
+            forms = [("akk", {}), ("akk_no_save_transfer", {"save_transfer": False})]
+            if info["p2_eligible"]:
+                forms += [
+                    ("p2_akk", {"segments": 2}),
+                    (
+                        "p2_akk_no_save_transfer",
+                        {"segments": 2, "save_transfer": False},
+                    ),
+                ]
+            if W > 1 and int(ctx.n_d_max) - 1 <= kcp.RING_MAX_HOPS:
+                forms.append(("ring_akk", {"exchange": "ring", "save_transfer": False}))
+            for name, opts in forms:
+                o = {**opts, **L2N}
+                lt = _nan_allocations_pass(lambda o=o: saved_pass(**o))
+                lt2 = _nan_allocations_pass(lambda o=o: saved_pass(**o))
+                ak = _nan_allocations_pass(
+                    lambda o=o: saved_pass(save_mode="light_akk", **o)
+                )
+                arm(f"{name}_light", lt)
+                arm(f"{name}_light_akk", ak, lt, f"{name}_light")
+                repeat, bits = _bitwise(lt2, lt), _bitwise(ak, lt)
+                akk_info[name] = {
+                    "P": None if ak["saved"] is None else int(ak["saved"].P),
+                    "bitwise_vs_light": bits,
+                    "light_repeat_bitwise": repeat,
+                    "akk_source": ak["bwd"]["akk_source"],
+                }
+                flags[f"{name}_replay_ran"] = (
+                    T_r == 0 or ak["bwd"]["akk_source"] == "saved"
+                )
+                del lt, lt2, ak
+        res_aa = autograd_pass(False, save_mode="light_akk", **L2N)
+        flags["light_akk_autograd_replay_ran"] = (
+            T_r == 0 or kcp.LAST_CALL["bwd"]["akk_source"] == "saved"
+        )
+        arm("light_akk_autograd", res_aa, res_auto, "autograd")
+        res_ck = autograd_pass(True, save_mode="light_akk", **L2N)
+        flags["light_akk_ckpt_saves_light"] = (
+            kcp.LAST_CALL["bwd"]["save_mode"] == "light"
+            and akk_replay not in kcp.LAST_CALL["bwd"]["sequence"]
+        )
+        arm("light_akk_ckpt", res_ck, res_auto, "autograd")
+        del res_aa, res_ck
+    info["light_akk"] = akk_info
     res_host = saved_pass(group_reduce="host", **L2N)
     arm(
         "host_reduce", res_host, res, "run0", gate=False
@@ -4456,6 +4565,85 @@ def _run_rank_l2n(
     flags["l2n_graph_capture"] = bool(graph_ok)
     del g_res, g_cmp
 
+    # (e2) the same four steps with save_mode="light_akk" on the same workspace (its arena holds the light steps'
+    # tapes): the fourth replays both graphs and launches the replay in place of fwd_prep_l2n; within the budgets
+    akk_graph: dict[str, object] = {}
+    a_res = None
+    akk_graph_ok = (
+        True  # the replay not rendered (kernel backend): nothing of the mode runs
+    )
+    if not kernels or akk_info["shipped"]:
+        try:
+            kcp.graph_cache_clear()
+            events, sources = [], []
+            for _ in range(4):
+                out_g, saved_g = kcp.chunk_gdn_fwd_kcp(
+                    q,
+                    k,
+                    v,
+                    g,
+                    beta,
+                    ctx,
+                    workspace=ws,
+                    graph="replay",
+                    save_mode="light_akk",
+                    deterministic=False,
+                    **base,
+                    **L2N,
+                )
+                grads_g = kcp.chunk_gdn_bwd_kcp(
+                    q,
+                    k,
+                    v,
+                    g,
+                    beta,
+                    ctx,
+                    dout,
+                    saved=saved_g,
+                    workspace=ws,
+                    graph="replay",
+                    save_mode="light_akk",
+                    deterministic=False,
+                    **base,
+                    **L2N,
+                )
+                a_res = {
+                    "out": out_g.clone(),
+                    **{
+                        n: t.clone()
+                        for n, t in zip(
+                            ("dq", "dk", "dv", "dbeta", "dg"), grads_g, strict=True
+                        )
+                    },
+                }
+                events.append(
+                    [
+                        str(kcp.LAST_CALL["fwd"]["graph_event"]),
+                        str(kcp.LAST_CALL["bwd"]["graph_event"]),
+                    ]
+                )
+                sources.append(kcp.LAST_CALL["bwd"].get("akk_source"))
+            akk_graph["events"], akk_graph["akk_source"] = events, sources
+            akk_graph_ok = events[-1] == ["replay", "replay"] and (
+                T_r == 0 or all(src == "saved" for src in sources)
+            )
+            torch.cuda.synchronize(device)
+            kcp.graph_cache_clear()
+        except Exception as exc:  # noqa: BLE001 - recorded; the gate decides
+            akk_graph["error"] = f"{type(exc).__name__}: {str(exc)[:300]}"
+            akk_graph_ok = False
+            a_res = None
+            kcp.graph_cache_clear()
+        a_cmp = (
+            a_res
+            if a_res is not None
+            else {n: torch.zeros_like(res[n]) for n in TENSORS}
+        )
+        arm("graph_replay_light_akk", a_cmp, res, "run0", gate=kernels)
+        del a_res, a_cmp
+    info["graph_light_akk"] = akk_graph
+    flags["l2n_graph_capture_light_akk"] = bool(akk_graph_ok)
+
     # (f) memory: nothing of the norm in the arena after a forward / a backward; retained after a forward = off + r
     wsm = kcp.WorkspaceKcp()
     bad = {*kcp.QK_TAPES, kcp.QK_RSTD}
@@ -4568,7 +4756,13 @@ def _run_rank_l2n(
                 keys.append(key)
     # a rank without tokens has no rows to compare: the token-local flags exist on the ranks with tokens only
     padded = [{key: fl.get(key, True) for key in keys} for fl in flag_list]
-    _fold(report, padded, verdicts, backend=backend, kernel_only={"l2n_graph_capture"})
+    _fold(
+        report,
+        padded,
+        verdicts,
+        backend=backend,
+        kernel_only={"l2n_graph_capture", "l2n_graph_capture_light_akk"},
+    )
     report["metrics"] = {n: verdicts.get(f"fp64:run0:{n}") for n in TENSORS}
     report["repeats"] = _worst_of_runs(verdicts, N_REPEAT)
     for n in TENSORS:

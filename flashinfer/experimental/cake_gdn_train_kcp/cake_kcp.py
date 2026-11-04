@@ -78,8 +78,14 @@ the saved ``S_in`` -- no exchange, no transfer walk, no merge, no #5.
 ``boundary_mode="replay"`` keeps nothing and the backward re-runs the whole
 forward exchange.  Every saved tensor travels through
 ``ctx.save_for_backward`` only, so ``torch.utils.checkpoint(use_reentrant=False)``
-retains nothing after a checkpointed forward (#7039).  The three modes are
-bitwise identical by construction (the same programs on the same bits).
+retains nothing after a checkpointed forward (#7039).  The opt-in
+``save_mode="light_akk"`` (``use_qk_l2norm_in_kernel`` only) is ``"light"``
+plus #1's BF16 ``Akk`` tape: its light replay runs ``fwd_prep_replay_l2n``,
+#1_l2n reading that tape instead of forming it (no ``K K^T`` Gram, no block
+inverse), every other output bit for bit #1_l2n's.  Under
+``torch.utils.checkpoint(use_reentrant=False)`` it saves as ``"light"``
+(:func:`_checkpoint_opts`).  The modes are bitwise identical by construction
+(the same programs on the same bits).
 With ``reuse_recompute_tapes`` the light backward of such a checkpoint binds
 the forward tapes of torch's recompute (the forward re-run inside
 ``.backward()``) instead of replaying #1 and the tape walk itself (the kept
@@ -179,10 +185,15 @@ PROGRAMS = (
     "fwd_prep_l2n",  # #1 with the in-kernel Q / K L2 norm: qn / kn / rstd first, then #1's body on qn / kn
     "bwd_dqkg_l2n",  # #8 on qn / kn with the norm's pullback before the BF16 rounding of dq / dk (group_reduce = 1)
     "qk_apply",  # qn = bf16(q * r), kn likewise, from the saved rstd (backward of save_mode="full")
+    "fwd_prep_replay_l2n",  # #1_l2n reading the forward's saved Akk tape (light replay of save_mode="light_akk")
 )
 # The in-kernel Q / K L2 norm programs (``use_qk_l2norm_in_kernel``): #1 and #8 run as their ``_l2n`` siblings, and
 # ``qk_apply`` rebuilds ``qn`` / ``kn`` where the backward has no #1 replay and no kept hand-off (save_mode="full").
 L2N_PROGRAMS = ("fwd_prep_l2n", "bwd_dqkg_l2n", "qk_apply")
+# The solve-free light replay of #1_l2n (``save_mode="light_akk"``): this package's own local program (no det twin; a
+# chunk-local #1 form, so its library carries no ``_kcp``), launched in place of ``fwd_prep_l2n`` by the light replay
+# of a saved set that keeps the forward's Akk tape (:data:`AKK_REPLAY_OF`).
+AKK_REPLAY_PROGRAMS = ("fwd_prep_replay_l2n",)
 LOCAL_PROGRAMS = (
     "fwd_prep",
     "fwd_o",
@@ -190,6 +201,7 @@ LOCAL_PROGRAMS = (
     "bwd_dqkg",
     "gate_epilogue",
     *L2N_PROGRAMS,
+    *AKK_REPLAY_PROGRAMS,
 )
 WALK_PROGRAMS = (
     "kcp_fwdh_offset",
@@ -217,6 +229,7 @@ TART_MODULE_OF = {
     "fwd_prep_l2n": "gdn_chunk_det_train_fwd_prep_l2n_v1",
     "bwd_dqkg_l2n": "gdn_chunk_det_train_bwd_dqkg_l2n_v1",
     "qk_apply": "gdn_chunk_det_train_qk_apply_v1",
+    "fwd_prep_replay_l2n": "gdn_chunk_train_fwd_prep_replay_l2n_v1",  # this package's own (no det twin)
 }
 # Registry record names (``cake_jit.MODULES`` / ``TEST_MODULES``): ``<program>[_<variant>]`` -- the merge records
 # ``kcp_affine_merge_c8`` / ``_c16`` by ``ncols`` / ``cols_per_cta``; the transfer walk's test-only programs
@@ -487,6 +500,10 @@ PROGRAM_ARGS["qk_apply"] = (
 )
 # the norm-off program each sibling replaces (the launch site: its ticket slot, its place in the sequence)
 L2N_SIBLING_OF = {"fwd_prep": "fwd_prep_l2n", "bwd_dqkg": "bwd_dqkg_l2n"}
+# The solve-free replay: #1_l2n's arguments, ``akk`` read (the saved tape) instead of written
+PROGRAM_ARGS["fwd_prep_replay_l2n"] = PROGRAM_ARGS["fwd_prep_l2n"]
+# the program the light replay of an AKK_SAVE_MODES set launches in place of #1_l2n
+AKK_REPLAY_OF = {"fwd_prep_l2n": "fwd_prep_replay_l2n"}
 # Every host argument is a registry logical name since the registry follows the frozen kernel ABIs (K4 ABI: #8 takes
 # ``group_reduce`` / ``dq_part`` / ``dk_part`` / the token strides; #6 ``do_tstride``; the persistent programs
 # ``num_seqs``).  ``PROVISIONAL_ARGS`` names the values a registry may not bind yet: the persistent programs'
@@ -731,11 +748,22 @@ HOST_REDUCE_TAPES = (
 # of the #1 outputs in ``"light"`` would be dead at the backward's peak (measured: 6,339 B/token at HV = 48 live twice),
 # so ``LIGHT_TAPES`` is empty; a non-empty tuple here saves those tapes for a backward that reads them instead.
 LIGHT_TAPES: tuple[str, ...] = ()
+# ``save_mode="light_akk"`` (:data:`AKK_SAVE_MODES`, ``use_qk_l2norm_in_kernel`` only): the light set plus #1's BF16
+# ``Akk`` tape (``[R, HV, 64]``, R * HV * 128 bytes).  The forward writes it into a fresh saved tensor (it leaves the
+# arena with FWD_DEAD_AFTER_PREP otherwise); the light replay binds it and runs ``fwd_prep_replay_l2n`` -- #1_l2n
+# without the K K^T Gram, the block inverse and the Akk stores, reading the tape into the WY operand tile -- whose
+# other outputs are #1_l2n's bit for bit.  Opt-in only: the tape is live from the forward to the backward.
+AKK_SAVE_MODES: tuple[str, ...] = _opt.SAVE_MODES_AKK
+AKK_TAPES: tuple[str, ...] = ("akk",)
+# The save modes whose forward keeps no h / v_new tape (the output walk, :func:`_fuse_o_enabled`)
+LIGHT_FORWARD_SAVE_MODES: tuple[str, ...] = ("light", *AKK_SAVE_MODES)
 
 
 def saved_tapes(save_mode: str) -> tuple[str, ...]:
     """The tape names a saved set of ``save_mode`` carries (in :data:`FWD_TAPES` order)."""
-    return FWD_TAPES if save_mode == "full" else LIGHT_TAPES
+    if save_mode == "full":
+        return FWD_TAPES
+    return AKK_TAPES if save_mode in AKK_SAVE_MODES else LIGHT_TAPES
 
 
 # Forward tapes an eager forward leaves bound in the workspace arena (#5 reads them; the others go at
@@ -3841,7 +3869,11 @@ class CallKcp:
         (on ``qn`` / ``kn``) and applies the pullback in :meth:`host_group_reduce`."""
         if self.T_r == 0:
             return
-        if name not in LOCAL_PROGRAMS or name in L2N_SIBLING_OF.values():
+        if (
+            name not in LOCAL_PROGRAMS
+            or name in L2N_SIBLING_OF.values()
+            or name in AKK_REPLAY_OF.values()
+        ):
             raise ValueError(f"{name} is not a local program")
         if name == "qk_apply" and not self.l2n:
             raise ValueError("qk_apply runs with use_qk_l2norm_in_kernel only")
@@ -3849,6 +3881,10 @@ class CallKcp:
         if self.l2n and name in L2N_SIBLING_OF:
             if name == "fwd_prep" or self.opts.group_reduce != "host":
                 program = L2N_SIBLING_OF[name]
+        if program in AKK_REPLAY_OF and self.scratch.get("akk_source") == "saved":
+            # the light replay of an AKK_SAVE_MODES set: #1_l2n without the block inverse, reading the forward's Akk
+            # tape (bound in self.tapes by _backward) instead of writing it -- every other output bit for bit #1_l2n's
+            program = AKK_REPLAY_OF[program]
         self.counters["locals"] += 1
         o, NC = self.ops, int(self.ctx.NC)
         args = self._local_common()
@@ -3869,7 +3905,7 @@ class CallKcp:
                 qscale=self.tape("qscale"),
                 gamma=self.tape("gamma"),
             )
-            if program == "fwd_prep_l2n":
+            if program == "fwd_prep_l2n" or program in AKK_REPLAY_PROGRAMS:
                 rstd = self.rstd_out()
                 args.update(
                     qn=self.tape("qn"),
@@ -4194,6 +4230,9 @@ def _record(kind: str, call: CallKcp) -> None:
         # "replay" (the light replay's #1_l2n), "kept" (the recompute forward's #1_l2n, handed over with the kept
         # tapes) or "qk_apply" (save_mode="full"); None without the norm
         "qk_source": call.scratch.get("qk_source"),
+        # backward: "saved" when the light replay read the forward's Akk tape (save_mode="light_akk",
+        # fwd_prep_replay_l2n); None otherwise (#1 formed it, or no #1 ran)
+        "akk_source": call.scratch.get("akk_source"),
         # the r #1_l2n wrote (forward: "fresh" = the saved set's tensor, "arena") / the pullback read (backward:
         # "saved", "arena" in the replay mode); None without the norm
         "rstd_source": call.scratch.get("rstd_source"),
@@ -4570,13 +4609,14 @@ def _walk_pair_enabled(
 
 def _fuse_o_enabled(call: CallKcp) -> bool:
     """Whether this call's forwards fold #5 into their tape walks where the tapes have no reader: test knob
-    ``fused_o`` = 1 (shipped), ``save_mode="light"`` and ``boundary_mode="saved"`` (no saved tape, no replayed
-    forward exchange), and the registry ships the output walk in both forms for the device's architecture
+    ``fused_o`` = 1 (shipped), a save mode whose forward keeps no h / v_new tape (:data:`LIGHT_FORWARD_SAVE_MODES`:
+    ``"light"``, ``"light_akk"``) and ``boundary_mode="saved"`` (no saved h / v_new tape, no replayed forward
+    exchange), and the registry ships the output walk in both forms for the device's architecture
     (:func:`fused_o_shipped`; the fake backend emulates any shipped record)."""
     opts = call.opts
     if int(opts.knob("fused_o")) != 1:
         return False
-    if opts.save_mode != "light" or opts.boundary_mode != "saved":
+    if opts.save_mode not in LIGHT_FORWARD_SAVE_MODES or opts.boundary_mode != "saved":
         return False
     return fused_o_shipped(_call_arch(call))
 
@@ -5132,6 +5172,12 @@ def _backward(call: CallKcp, saved: SavedKcp | None) -> None:
                     call.tapes[name] = kept.qk[name]
                 call.scratch["qk_source"] = "kept"
         else:  # light replay: #1 again (gamma / g_cum / akk included) + the #2 tape walk from the saved S_in
+            if saved.save_mode in AKK_SAVE_MODES and saved.tapes is not None:
+                # "light_akk": the forward's Akk tape, bound before the replay, so #1_l2n runs as the solve-free
+                # fwd_prep_replay_l2n (CallKcp.local) and reads it (None only at T_r = 0)
+                for name in AKK_TAPES:
+                    call.tapes[name] = saved.tape(name)
+                call.scratch["akk_source"] = "saved"
             _replay_tapes(call, saved)
             call.scratch["tapes_source"] = "replay"
             if call.l2n:
@@ -6606,6 +6652,41 @@ def _bwd_body(call: CallKcp, saved: SavedKcp | None) -> tuple[torch.Tensor, ...]
 # autograd
 
 
+def _in_checkpoint() -> bool:
+    """Whether this forward runs under ``torch.utils.checkpoint(use_reentrant=False)``: the top saved-tensors hook pair
+    is a checkpoint-internal one -- the original forward's pack hook and the recompute's alike (the hook stack torch
+    reads for the tensors this node saves).  ``False`` when the binding is absent (then both forwards see ``False``)."""
+    try:
+        top = torch._C._autograd._top_saved_tensors_default_hooks(False)
+    except Exception:  # noqa: BLE001 - no hook-stack binding: an ordinary forward
+        return False
+    return top is not None and bool(getattr(top[0], "_checkpoint_internal", False))
+
+
+# (id(opts), save mode) -> (opts, its twin with that save mode): the checkpoint form of a call's options, made once
+_CHECKPOINT_TWINS: dict[tuple[int, str], tuple[OptionsKcp, OptionsKcp]] = {}
+CHECKPOINT_TWINS_MAX = 64
+
+
+def _checkpoint_opts(opts: OptionsKcp) -> OptionsKcp:
+    """The options a forward of :class:`ChunkGDNFunctionKcp` saves under: ``opts`` itself, except under
+    ``torch.utils.checkpoint(use_reentrant=False)`` (:func:`_in_checkpoint`), where an opt-in light save mode
+    (:data:`AKK_SAVE_MODES`) saves as ``"light"``: the checkpoint keeps no tape from the original forward, its
+    recompute runs inside the backward (where the kept hand-off of ``reuse_recompute_tapes`` applies to ``"light"``),
+    and the original forward and the recompute decide alike (they must save the same tensors).  ``"full"`` saves as it
+    is."""
+    if opts.save_mode not in AKK_SAVE_MODES or not _in_checkpoint():
+        return opts
+    hit = _CHECKPOINT_TWINS.get((id(opts), "light"))
+    if hit is not None and hit[0] is opts:
+        return hit[1]
+    if len(_CHECKPOINT_TWINS) >= CHECKPOINT_TWINS_MAX:
+        _CHECKPOINT_TWINS.clear()
+    twin = dataclasses.replace(opts, save_mode="light")
+    _CHECKPOINT_TWINS[(id(opts), "light")] = (opts, twin)
+    return twin
+
+
 class ChunkGDNFunctionKcp(torch.autograd.Function):
     """:func:`chunk_gdn_kcp` as an autograd node: the forward keeps the inputs and the saved set (saved mode) or the
     inputs only (replay mode) through ``save_for_backward`` -- nothing else holds a tensor (#7039); the backward runs
@@ -6641,6 +6722,9 @@ class ChunkGDNFunctionKcp(torch.autograd.Function):
         packed_grads=True,
     ):
         boundary = None if handle is None else _handle_lookup(handle)
+        # under a non-reentrant checkpoint the opt-in light save modes save as "light" (the original forward and the
+        # recompute alike; _checkpoint_opts); the backward reads the options of the set it gets (fctx.kcp)
+        opts = _checkpoint_opts(opts)
         # the graph task (the hand-off's condition), not read where no hand-off can follow (reuse_recompute_tapes=False)
         gid = _graph_task_id() if opts.reuse_recompute_tapes else -1
         # the size rule of "auto" (graph="replay" on a caller-held workspace, the CUDA-graph path), decided once and
@@ -7059,6 +7143,11 @@ __all__ = [
     "L2N_PROGRAMS",
     "L2N_SIBLING_OF",
     "LIGHT_TAPES",
+    "AKK_REPLAY_OF",
+    "AKK_REPLAY_PROGRAMS",
+    "AKK_SAVE_MODES",
+    "AKK_TAPES",
+    "LIGHT_FORWARD_SAVE_MODES",
     "HANDLE_KEY",
     "TAPE_ALIASES",
     "LOCAL_PROGRAMS",
