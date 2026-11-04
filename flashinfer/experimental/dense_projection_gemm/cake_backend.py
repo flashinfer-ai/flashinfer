@@ -993,9 +993,11 @@ def _verdicts_changed() -> None:
 class _VerdictTable(dict):
     """A ``dict`` of measured verdicts that counts its changes in :data:`_VERDICT_GENERATION` (an item set or deleted,
     the table updated, popped or cleared).  :data:`ROUTER_RULES`, :data:`ROUTER_RULES_BY_SM` and each table it holds
-    are such tables, so the convenience path keeps what it reads from them (:func:`_router_memo`) until one changes;
-    a table bound in their place that is not one is read on every call.  A copy (``dict(table)``) is a plain
-    ``dict``."""
+    are such tables, so the convenience path keeps what it reads from them (:func:`_router_memo`) and the K2 launches
+    it plans under them (:data:`_K2_ATOMIC_CACHE`, :data:`_K2_ENTRY_CACHE`) until one changes; a table bound in their
+    place that is not one is read on every call.  The other planner tables (the K1 tables, :data:`ROUTER_SM_COUNT`,
+    the head/tail templates, the deterministic package's) are read when a key is planned: a cached key keeps its plan
+    until :func:`clear_convenience_caches`.  A copy (``dict(table)``) is a plain ``dict``."""
 
     __slots__ = ()
 
@@ -1923,10 +1925,13 @@ def _router_memo() -> _RouterMemo:
     return memo
 
 
-def _k2_runs_without_verdict(geometry: _K2Geometry, index: int) -> bool:
+def _k2_runs_without_verdict(
+    geometry: _K2Geometry, index: int, memo: Optional[_RouterMemo] = None
+) -> bool:
     """:func:`_k2_geometry_without_verdict` of a call's :func:`_k2_geometry` on CUDA device ``index`` (its
-    architecture and SM count), kept in the :class:`_RouterMemo` of the tables bound now."""
-    memo = _router_memo()
+    architecture and SM count), kept in ``memo`` (default: the :class:`_RouterMemo` of the tables bound now)."""
+    if memo is None:
+        memo = _router_memo()
     key = (index, geometry)
     without = memo.without_verdict.get(key)
     if without is None:
@@ -2801,7 +2806,9 @@ class _CachedAtomic:
     """A planned launch of the convenience path: the plan (``None``: the row runs the deterministic program), the
     program entry and argument plan, the arena of its (device, stream) and, for K2, the fused split's module with its
     entry and argument plan, and the bound arguments (:class:`_K2Binding`; K1: :class:`_K1Binding`, of the
-    deterministic program -- its plan ``det_plan`` -- when ``plan`` is ``None``)."""
+    deterministic program -- its plan ``det_plan`` -- when ``plan`` is ``None``).  ``memo``: the router-table memo
+    (:func:`_router_memo`) a K2 launch without a caller's split count was planned under, ``None`` with one (its plan
+    reads no router table); a call under another memo plans the key again."""
 
     plan: Any
     arch: str = ""
@@ -2815,6 +2822,7 @@ class _CachedAtomic:
     k2: Optional[_K2Binding] = field(default=None, repr=False)
     k1: Optional[_K1Binding] = field(default=None, repr=False)
     det_plan: Any = field(default=None, repr=False)
+    memo: Any = field(default=None, repr=False)
 
 
 def _release_atomic_entry(
@@ -3378,11 +3386,13 @@ def _plan_atomic_k2(
     index: int,
     stream: int,
     pdl: int,
+    memo: Optional[_RouterMemo] = None,
 ) -> _CachedAtomic:
     """Plan this package's K2 program for a key of :func:`_launch_cached_atomic_k2` (under ``_ATOMIC_PLAN_LOCK``):
     :func:`plan_atomic_router` on the device's architecture and SM count (``plan=None``: the planner keeps the row on
     the deterministic program), the program's and fused split's entries, the BF16x3 stack in the arena of (device
-    ``index``, raw ``stream``) and the argument lists bound with the PDL flag ``pdl`` (0 or 1)."""
+    ``index``, raw ``stream``) and the argument lists bound with the PDL flag ``pdl`` (0 or 1); ``memo`` is the
+    router-table memo the call read (``None`` with a caller's split count)."""
     det = deterministic_backend()
     device = out.device
     arch = det.require_arch(device)
@@ -3395,7 +3405,7 @@ def _plan_atomic_k2(
         splits=splits,
     )
     if plan is None:
-        return _CachedAtomic(plan=None, arch=arch)
+        return _CachedAtomic(plan=None, arch=arch, memo=memo)
     _, split_src = _k2_views(A, B, plan)
     if plan.simt is not None:
         # the SIMT program: no stack, no split; the arena holds the stream context its launches enter
@@ -3411,6 +3421,7 @@ def _plan_atomic_k2(
             k2=_k2_binding(
                 plan, out, split_src, module_name, arg_plan, None, None, pdl
             ),
+            memo=memo,
         )
     split_module = det._fused_split_for(arch, split_src)
     arena = _atomic_arena_for(index, stream, device)
@@ -3450,6 +3461,7 @@ def _plan_atomic_k2(
         split_entry=split_fn,
         split_arg_plan=split_arg_plan,
         k2=binding,
+        memo=memo,
     )
 
 
@@ -3525,13 +3537,16 @@ def _launch_cached_atomic_k2(
 ) -> torch.Tensor:
     """The convenience path of this package's K2 GEMM: a row without a verdict (no ``splits``) and a binding the
     planner keeps on the deterministic program run that program (:func:`_launch_cached_splitk_k2`); ``views`` are an
-    entry point's own launch views (:func:`_launch_views`)."""
+    entry point's own launch views (:func:`_launch_views`).  A key without ``splits`` is planned again after a router
+    table changed (its launch keeps the :func:`_router_memo` it was planned under)."""
     det = deterministic_backend()
     # the call's geometry is read once (one call per tensor attribute) for the checks and the key below
     index = _k2_index(A, B, out)
     geometry = _k2_geometry(A, B, out)
     pdl = int(det.pdl_enabled(enable_pdl, index))
-    if splits is None and _k2_runs_without_verdict(geometry, index):
+    # a call without a split count reads the router tables (their memo); with one, its plan reads none
+    memo = None if splits is not None else _router_memo()
+    if memo is not None and _k2_runs_without_verdict(geometry, index, memo):
         # a row without a verdict runs the deterministic program, without planning (or caching) the key here
         return _launch_cached_splitk_k2(A, B, out, None, index, geometry, pdl, views)
     stream = det._current_raw_stream(index)
@@ -3539,14 +3554,14 @@ def _launch_cached_atomic_k2(
     # the PDL flag is bound into the argument lists: a key per flag
     key = _k2_key(index, stream, (splits, pdl), A, B, out, geometry, out_ptr)
     entry = det._cache_get(_K2_ATOMIC_CACHE, key)
-    if entry is None:
+    if entry is None or entry.memo is not memo:
         with _ATOMIC_PLAN_LOCK:
             entry = det._cache_get(_K2_ATOMIC_CACHE, key)
-            if entry is None:
+            if entry is None or entry.memo is not memo:
                 entry = _cache_insert(
                     _K2_ATOMIC_CACHE,
                     key,
-                    _plan_atomic_k2(A, B, out, splits, index, stream, pdl),
+                    _plan_atomic_k2(A, B, out, splits, index, stream, pdl, memo),
                 )
     plan = entry.plan
     if plan is None:
@@ -3798,8 +3813,9 @@ def _plan_k2_entry(
     verdict (:func:`_k2_runs_without_verdict`) and a row the planner keeps on the deterministic program run the
     deterministic program (the input gradient: one split), the others this package's program -- and that path's
     cached launch of the route (looked up in, or planned into, :data:`_K2_SPLITK_CACHE` / :data:`_K2_ATOMIC_CACHE`
-    under the same key).  A launch that is not bound, or whose plan does not take the entry point's tensors as its
-    views, leaves the call to the entry point's own path."""
+    under the same key; a launch of this package without a split count planned under other router tables is planned
+    again).  A launch that is not bound, or whose plan does not take the entry point's tensors as its views, leaves
+    the call to the entry point's own path."""
     det = deterministic_backend()
     A, B, flags = _k2_entry_operands(op, P, Q)
     geometry = _k2_geometry(A, B, out)
@@ -3814,14 +3830,16 @@ def _plan_k2_entry(
     if (
         route is not None
         and route != "det"
-        and not (splits is None and _k2_runs_without_verdict(geometry, index))
+        and not (splits is None and _k2_runs_without_verdict(geometry, index, memo))
     ):
+        # the memo of the launch's plan, as _launch_cached_atomic_k2 keeps it (none with a split count)
+        planned = memo if splits is None else None
         cached = det._cache_get(_K2_ATOMIC_CACHE, key)
-        if cached is None:
+        if cached is None or cached.memo is not planned:
             cached = _cache_insert(
                 _K2_ATOMIC_CACHE,
                 key,
-                _plan_atomic_k2(A, B, out, splits, index, stream, pdl),
+                _plan_atomic_k2(A, B, out, splits, index, stream, pdl, planned),
             )
         if cached.plan is not None:
             launch, atomic = cached, True

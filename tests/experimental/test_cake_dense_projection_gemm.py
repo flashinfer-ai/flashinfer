@@ -4896,6 +4896,111 @@ def test_router_entry_cache_keys_and_routes_again(monkeypatch):
     assert not cache and not cake_backend._ATOMIC_ARENAS
 
 
+# Router verdicts changed at run time, op -> (arch, SM count, tokens, hidden, first verdict, second verdict): the
+# forward on 152-SM sm_100a (one unit per tile, then two), the input gradient on 212-SM sm_107a (the part's own table
+# in ROUTER_RULES_BY_SM: the 32 x 64 SIMT tile in eight slices, then the 64 x 64 tile in four), the weight gradient on
+# 152-SM sm_100a (the 64 x 64 SIMT tile, then the stream-K "pairs" partition)
+# fmt: off
+ROUTER_VERDICT_CHANGES = {
+    "fwd": ("sm_100a", 152, 64, 5120, "S1", "S2"),
+    "dgrad": ("sm_107a", 212, 64, 5120, ((1, 64, "simt_n64m32s8"),), ((1, 64, "simt_n64m64s4"),)),
+    "wgrad": ("sm_100a", 152, 64, 5120, ((1, 256, "simt_n64m64s2"),), ((1, 256, "pairs"),)),
+}
+# fmt: on
+
+
+@pytest.mark.parametrize("tracked", [True, False], ids=["verdict_tables", "dicts"])
+@pytest.mark.parametrize("path", ["entry_point", "router_fp32_gemm"])
+@pytest.mark.parametrize("op", sorted(ROUTER_VERDICT_CHANGES))
+def test_router_verdict_changed_at_run_time_plans_the_launch_again(
+    monkeypatch, op, path, tracked
+):
+    """A router verdict changed between two calls of the same tensors: the next call runs the launch the planner gives
+    under the new verdict, not the cached launch of the old one -- through the router entry point (its
+    ``_K2_ENTRY_CACHE`` entry and the ``_K2_ATOMIC_CACHE`` launch under it) and through ``router_fp32_gemm``
+    (``_K2_ATOMIC_CACHE``); while no table changes, a call takes its cached launch.  With the router tables rebound to
+    plain dicts (read on every call) a change is seen at the next call too.  A launch with an explicit split count
+    reads no router table: it is kept across a change."""
+    arch, sm_count, T, H, first, second = ROUTER_VERDICT_CHANGES[op]
+    entry_fn, _ = _cpu_k2_launches(monkeypatch, arch)
+    facts = det_backend.DeviceFacts(
+        index=0, arch=arch, sm_count=sm_count, l2_bytes=126 << 20
+    )
+    monkeypatch.setattr(det_backend, "device_facts", lambda device=None: facts)
+    if not tracked:
+        monkeypatch.setattr(
+            cake_backend, "ROUTER_RULES", dict(cake_backend.ROUTER_RULES)
+        )
+        monkeypatch.setattr(
+            cake_backend,
+            "ROUTER_RULES_BY_SM",
+            {part: dict(t) for part, t in cake_backend.ROUTER_RULES_BY_SM.items()},
+        )
+    table, measured = cake_backend.router_rules(arch, sm_count)
+    assert measured
+    key = (arch, {"fwd": "kk", "dgrad": "kn", "wgrad": "nn_t"}[op], H, 256)
+    X, W, G = torch.empty(T, H), torch.empty(256, H), torch.empty(T, 256)
+    A, B, out = {
+        "fwd": (X, W.t(), torch.empty(T, 256)),
+        "dgrad": (G, W, torch.empty(T, H)),
+        "wgrad": (G.t(), X, torch.empty(256, H)),
+    }[op]
+    entry_point = {
+        "fwd": lambda: cake_backend.router_forward(X, W, out, deterministic=False),
+        "dgrad": lambda: cake_backend.router_dgrad(G, W, out, deterministic=False),
+        "wgrad": lambda: cake_backend.router_wgrad(G, X, out, deterministic=False),
+    }[op]
+
+    def call():
+        """The cached launch a call ran, after checking that it launched."""
+        n = len(entry_fn.calls)
+        if path == "router_fp32_gemm":
+            assert cake_backend.router_fp32_gemm(A, B, out, deterministic=False) is out
+        else:
+            assert entry_point() is out
+        assert len(entry_fn.calls) > n
+        ((_, launch),) = cake_backend._K2_ATOMIC_CACHE.items()
+        if path == "entry_point" and tracked:
+            ((_, entry),) = cake_backend._K2_ENTRY_CACHE.items()
+            assert entry.atomic and entry.launch is launch
+        else:  # router_fp32_gemm, or an entry point while a router table is a plain dict
+            assert not cake_backend._K2_ENTRY_CACHE
+        return launch
+
+    plans = []
+    for verdict in (first, second, first):
+        monkeypatch.setitem(table, key, verdict)
+        launch = call()
+        want, _ = cake_backend.plan_atomic_router(
+            A, B, out, arch=arch, sm_count=sm_count
+        )
+        assert want is not None and launch.plan == want, verdict
+        again = call()
+        # kept while no table changes; a plain dict is read on every call
+        assert (again is launch) == tracked and again.plan == want
+        plans.append(want)
+    assert plans[0] != plans[1] and plans[2] == plans[0]
+    if path == "router_fp32_gemm" and op != "dgrad":
+
+        def with_splits():
+            assert (
+                cake_backend.router_fp32_gemm(A, B, out, splits=2, deterministic=False)
+                is out
+            )
+            (kept,) = [
+                e for k, e in cake_backend._K2_ATOMIC_CACHE.items() if k[2][1][0] == 2
+            ]
+            return kept
+
+        kept = with_splits()
+        assert kept.memo is None and kept.plan is not None
+        monkeypatch.setitem(table, key, second)
+        monkeypatch.setattr(
+            cake_backend, "_plan_atomic_k2", lambda *args: pytest.fail("planned again")
+        )
+        assert with_splits() is kept
+
+
 def test_router_entry_without_a_bound_launch_takes_the_entry_points_path(monkeypatch):
     """A key whose launch is not bound, or whose plan does not take the entry point's tensors as its launch views,
     is kept without a launch: its calls take the entry point's own path (without planning the key again), and a plan
@@ -7189,6 +7294,49 @@ def test_gpu_router_verdicts_set_at_run_time_are_seen(monkeypatch):
     table[keys["wgrad"]] = None
     for _ in range(2):
         assert torch.equal(fwd(), want_fwd) and torch.equal(wgrad(), want_wgrad)
+
+
+def test_gpu_router_verdict_changed_at_run_time_runs_the_new_program(monkeypatch):
+    """A weight-gradient verdict changed from one program to another between calls of the same tensors: the next call
+    -- through ``router_wgrad`` and through ``router_fp32_gemm`` -- runs the program the planner gives under the new
+    verdict (the stream-K ``"pairs"`` partition, then a SIMT tile this checkout registers for the architecture, else
+    two units per tile), within the router budget, without clearing a cache."""
+    device, arch = _atomic_device_or_skip()
+    sm_count = det_backend.device_facts(device).sm_count
+    table, _ = cake_backend.router_rules(arch, sm_count)
+    if table is cake_backend.ROUTER_RULES:
+        # a verdict of ROUTER_RULES applies on this device whatever its SM count
+        monkeypatch.setitem(cake_backend.ROUTER_SM_COUNT, arch, sm_count)
+    hidden, T = 6144, 1000
+    X, _, G = _router_inputs(T, device, SEED + 28, K=hidden)
+    A, B = G.t(), X
+    ref = A.double() @ B.double()
+    out = torch.empty(256, hidden, device=device)
+    simt = next(
+        (
+            t
+            for t in SIMT_TILES
+            if cake_backend.router_simt_template(t) in cake_jit.KERNELS[arch]
+        ),
+        None,
+    )
+    calls = (
+        lambda: cake_backend.router_wgrad(G, X, out, deterministic=False),
+        lambda: cake_backend.router_fp32_gemm(A, B, out, deterministic=False),
+    )
+    cake_backend.clear_convenience_caches()
+    plans = []
+    for spec in ("pairs", "S2" if simt is None else _simt_spec(simt)):
+        monkeypatch.setitem(table, (arch, "nn_t", hidden, 256), ((1, T, spec),))
+        plan = cake_backend.plan_router_fp32_gemm(A, B, out, deterministic=False)
+        assert isinstance(plan, cake_backend.AtomicRouterPlan), spec
+        for call in calls:
+            _assert_ran(call, cake_jit.select_module(arch, plan.template))
+            assert _rel_fro(call(), ref) <= ROUTER_REL_FRO_MAX, spec
+        cached = [e.plan for e in cake_backend._K2_ATOMIC_CACHE.values()]
+        assert cached and all(p == plan for p in cached), spec
+        plans.append(plan)
+    assert plans[0] != plans[1]
 
 
 def test_gpu_router_deterministic_program_through_the_binding():
