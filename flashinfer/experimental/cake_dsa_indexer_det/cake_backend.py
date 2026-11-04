@@ -66,6 +66,26 @@ Contract (the issue text is authoritative)
   operator returns with the output structure intact and no loop bound depends
   on a score value, so the kernels cannot hang.
 
+FP8 form (opt-in, selected by the input dtype)
+----------------------------------------------
+* ``q [T, 32, 128]`` and ``k [Tkv, 128]`` float8_e4m3fn (the same layout
+  rules; a row stride that is a multiple of 16 bytes), ``k_scale [Tkv]`` FP32
+  per-key scales (contiguous, same device), ``w [T, 32]`` FP32 carrying every
+  other scale (the query scale, the softmax scale and the head weights);
+  ``softmax_scale`` must be ``None`` (the programs take 1.0).  Mixed q / k
+  dtypes and float8_e5m2 are rejected; a BF16 call takes no ``k_scale``.
+* Score ``s[t, j] = k_scale[j] * sum_h w[t, h] * relu(sum_d q[t, h, d] * k[j,
+  d])``: the e4m3 products are exact and accumulate in FP32 on the tensor
+  cores, four K = 32 steps on sm_100a / sm_103a (the order of DeepGEMM's
+  ``fp8_mqa_logits``, whose logits these programs reproduce bit for bit) and
+  two K = 64 steps on sm_107a (which can differ from DeepGEMM's logit in the
+  last bits); the head sum and the ``k_scale[j]`` product are FP32.
+* Selection, visibility, outputs and the workspace bound follow the BF16
+  contract; every FP8 program of one architecture computes the same ids and
+  score bits, so the dispatched program never changes a result.  FP8 results
+  are not BF16 results, and sm_107a results can differ from sm_100a / sm_103a
+  results in the last bits.
+
 Every allocation happens in :func:`prepare_dsa_indexer_det_topk`; the returned
 runner launches with no CUDA allocation and no host synchronization, so a
 runner (or a CUDA graph capturing it) replays for new values written into the
@@ -101,12 +121,18 @@ from .cake_jit import (
     load_program,
 )
 from .cake_policy import (
+    BF16,
+    FP8,
     MERGE_KEY,
     SAMPLE_SHIFT_PERMILLE_BOUNDS,
     TICKET_TAIL_BYTES,
     DispatchPolicy,
     ProgramChoice,
     finalize_grid,
+    fp8_policy_record,
+    fp8_scan_programs,
+    scan_key_form,
+    select_fp8_program,
     select_program,
     ticket_static_path,
 )
@@ -123,6 +149,9 @@ SUPPORTED_COMPUTE_CAPABILITIES = {
     (10, 3): "sm_103a",
     (10, 7): "sm_107a",
 }
+# The q / k dtype of each input form (``cake_policy.FORMS``): BF16 is the default, FP8 the opt-in form.
+FORM_DTYPES = {BF16: torch.bfloat16, FP8: torch.float8_e4m3fn}
+_DTYPE_NAMES = {BF16: "bfloat16", FP8: "float8_e4m3fn"}
 
 # Host binding profile: the keyword set of the generated kernels (the names
 # below are what the host provides; a kernel's argument plan selects from
@@ -135,13 +164,14 @@ SUPPORTED_COMPUTE_CAPABILITIES = {
 # a scan program draws its work units from where its registry record lists the
 # architecture in ``ticket_arg_arches``; every other scan program takes it and
 # never reads it.  ``K_scale`` (scan only, right before ``TicketWord``) is the
-# per-key FP32 scale vector of an FP8 form; every program here is BF16 and
-# never reads it, so the host passes a never-dereferenced placeholder.
+# per-key FP32 scale vector of the FP8 form: the caller's ``k_scale`` for an
+# FP8 program; a BF16 program never reads it, so the host passes it a
+# never-dereferenced placeholder.
 ABI_CONTRACT = "dsa_indexer_v5"
 SUPPORTED_ABIS = (ABI_CONTRACT,)
 CONTRACT_TENSORS = (
-    "Q",  # q viewed as [T * 32, 128] (TMA source)
-    "K",  # k [Tkv, 128], any row stride that is a multiple of 8 elements (TMA source)
+    "Q",  # q viewed as [T * 32, 128] (TMA source; the FP8 form's e4m3 bytes as uint8)
+    "K",  # k [Tkv, 128], any row stride that is a multiple of 16 bytes (TMA source; the FP8 form's e4m3 bytes as uint8)
     "W",  # w [T, 32] fp32 (TMA source)
     "cu_seqlens_q",
     "cu_seqlens_k",
@@ -152,7 +182,7 @@ CONTRACT_TENSORS = (
     "Staging",  # the split staging [T, n_split, top_k] behind the candidate buffers (merge stage only)
     "zero_region",  # the scan's caller-owned ticket tail, zeroed by its binding before the launch, or an empty view
     "TicketWord",  # the scan's 16-byte ticket block (uint32 view): its own, or a zeroed placeholder it never reads
-    "K_scale",  # an FP8 form's per-key FP32 scales: a never-dereferenced float32 placeholder (BF16 programs only)
+    "K_scale",  # the FP8 form's per-key FP32 scales k_scale [Tkv]; a never-dereferenced float32 placeholder for a BF16 program
 )
 SCAN_SCALARS = (
     "num_segments",
@@ -227,6 +257,16 @@ def default_softmax_scale() -> float:
     return HEAD_DIM**-0.5
 
 
+def form_for(dtype: torch.dtype) -> str:
+    """The input form (``FORM_DTYPES``) of a q / k dtype: ``"bf16"`` for bfloat16, ``"fp8"`` for float8_e4m3fn."""
+    for form, form_dtype in FORM_DTYPES.items():
+        if dtype == form_dtype:
+            return form
+    raise ValueError(
+        f"dtype must be torch.bfloat16 or torch.float8_e4m3fn, got {dtype}"
+    )
+
+
 def registry_abi() -> str:
     if ABI not in SUPPORTED_ABIS:
         raise NotImplementedError(
@@ -235,27 +275,50 @@ def registry_abi() -> str:
     return ABI
 
 
+def policy_for(arch: str, form: str = BF16) -> DispatchPolicy:
+    """The dispatch policy of the input form ``form`` on ``arch``: the registry's ``POLICY`` record (BF16), or for the
+    FP8 form that record with ``cake_policy.FP8_POLICY_OVERRIDES`` (``fp8_policy_record``).  The registry is immutable
+    for the life of the process, so a record is validated once per architecture and form; an architecture without
+    programs of the form raises on every call."""
+    return _policy_for(arch, form)
+
+
 @functools.cache
-def policy_for(arch: str) -> DispatchPolicy:
-    """The dispatch policy registered for ``arch``: the registry record is immutable for the life of the process, so
-    it is validated once per architecture; an architecture without programs raises on every call."""
+def _policy_for(arch: str, form: str) -> DispatchPolicy:
     record = POLICY.get(arch)
     if record is None:
         raise NotImplementedError(
             f"The generated DSA indexer top-k programs for {arch} are not registered in this checkout "
             f"(registered: {sorted(POLICY)}; see {TRACKING_ISSUE})"
         )
+    if form == FP8:
+        if not fp8_programs_for(arch):
+            raise NotImplementedError(
+                f"The generated float8_e4m3fn DSA indexer top-k programs for {arch} are not registered in this "
+                f"checkout (see {TRACKING_ISSUE})"
+            )
+        record = fp8_policy_record(arch, record)
+    elif form != BF16:
+        raise ValueError(f"form must be one of {tuple(FORM_DTYPES)}, got {form!r}")
     return DispatchPolicy.from_record(record)
 
 
 @functools.cache
-def ticket_tail_skips(arch: str) -> Optional[frozenset]:
-    """None when ``arch`` is not a ticket architecture (``TICKET_TAIL_ARCHES``); else the physical scan kinds of its
-    record's ``static_scan_kinds``, whose programs keep the static enumeration and get no ticket tail.  Fixed for the
-    life of the process (like ``policy_for``), so a call decides its tail with one lookup and one set test."""
+def fp8_programs_for(arch: str) -> dict:
+    """The FP8 scan programs ``arch`` registers (``cake_policy.fp8_scan_programs``), indexed once per architecture;
+    empty where the registry has none."""
+    return fp8_scan_programs(PROGRAM_KEYS.get(arch, {}))
+
+
+@functools.cache
+def ticket_tail_skips(arch: str, form: str = BF16) -> Optional[frozenset]:
+    """None when ``arch`` is not a ticket architecture (``TICKET_TAIL_ARCHES``); else the physical scan kinds of the
+    ``static_scan_kinds`` of the form's record (``policy_for``), whose programs keep the static enumeration and get no
+    ticket tail.  Fixed for the life of the process (like ``policy_for``), so a call decides its tail with one lookup
+    and one set test."""
     if arch not in TICKET_TAIL_ARCHES:
         return None
-    return frozenset(policy_for(arch).static_scan_kinds)
+    return frozenset(policy_for(arch, form).static_scan_kinds)
 
 
 @functools.cache
@@ -283,8 +346,12 @@ def program_for(arch: str, key: str) -> str:
     return name
 
 
-def generated_program_available(device: Optional[torch.device] = None) -> bool:
-    """True when this checkout registers programs for ``device`` under the host binding profile this module binds."""
+def generated_program_available(
+    device: Optional[torch.device] = None, dtype: torch.dtype = torch.bfloat16
+) -> bool:
+    """True when this checkout registers programs for ``device`` under the host binding profile this module binds;
+    ``dtype``: the q / k dtype of the input form (``torch.float8_e4m3fn``: the FP8 form's scan programs)."""
+    form = form_for(dtype)
     arch = arch_for(device)
     if (
         arch is None
@@ -294,8 +361,13 @@ def generated_program_available(device: Optional[torch.device] = None) -> bool:
     ):
         return False
     keys = PROGRAM_KEYS[arch]
+    scan = (
+        bool(fp8_programs_for(arch))
+        if form == FP8
+        else any(k.startswith("scan:") for k in keys)
+    )
     return (
-        any(k.startswith("scan:") for k in keys)
+        scan
         and MERGE_KEY in keys
         and any(k.startswith(("finalize:", "finalize_rank:")) for k in keys)
     )
@@ -395,25 +467,29 @@ def validate_dsa_indexer_det_inputs(
     ratio: int,
     max_seqlen_q: Optional[int] = None,
     max_seqlen_k: Optional[int] = None,
+    k_scale: Optional[torch.Tensor] = None,
 ) -> tuple[int, int, int]:
     """Check the contract's shapes, dtypes, strides, alignment and scalars; return ``(T, Tkv, S)``.
 
-    Shape and dtype rules are checked before the device rule so that host
-    tensors exercise them in CPU-only tests.  No host synchronization: the
-    segment boundaries are not read.
+    The q dtype selects the input form (``form_for``): bfloat16 q / k, or
+    float8_e4m3fn q / k with ``k_scale`` (FP32 ``[Tkv]``, contiguous).  Shape
+    and dtype rules are checked before the device rule so that host tensors
+    exercise them in CPU-only tests.  No host synchronization: the segment
+    boundaries are not read.
     """
     if q.ndim != 3 or tuple(q.shape[1:]) != (NUM_HEADS, HEAD_DIM):
         raise ValueError(
             f"q must be [T, {NUM_HEADS}, {HEAD_DIM}], got {tuple(q.shape)}"
         )
-    if q.dtype != torch.bfloat16:
-        raise ValueError(f"q must be bfloat16, got {q.dtype}")
+    if q.dtype not in (torch.bfloat16, torch.float8_e4m3fn):
+        raise ValueError(f"q must be bfloat16 or float8_e4m3fn, got {q.dtype}")
+    form = form_for(q.dtype)
     if not q.is_contiguous():
         raise ValueError("q must be contiguous")
     if k.ndim != 2 or k.shape[1] != HEAD_DIM:
         raise ValueError(f"k must be [Tkv, {HEAD_DIM}], got {tuple(k.shape)}")
-    if k.dtype != torch.bfloat16:
-        raise ValueError(f"k must be bfloat16, got {k.dtype}")
+    if k.dtype != q.dtype:
+        raise ValueError(f"k must be {_DTYPE_NAMES[form]}, got {k.dtype}")
     if (
         k.stride(1) != 1
         or k.stride(0) < HEAD_DIM
@@ -423,6 +499,21 @@ def validate_dsa_indexer_det_inputs(
             f"k needs a unit inner stride and a row stride >= {HEAD_DIM} elements that is a multiple of "
             f"{TMA_ALIGNMENT_BYTES // k.element_size()} elements, got strides {tuple(k.stride())}"
         )
+    if form == BF16 and k_scale is not None:
+        raise ValueError(
+            "k_scale is the per-key scale of float8_e4m3fn keys; bfloat16 q / k take none"
+        )
+    if form == FP8:
+        if k_scale is None:
+            raise ValueError("float8_e4m3fn q / k need k_scale (float32 [Tkv])")
+        if tuple(k_scale.shape) != (int(k.shape[0]),):
+            raise ValueError(
+                f"k_scale must be [Tkv = {int(k.shape[0])}], got {tuple(k_scale.shape)}"
+            )
+        if k_scale.dtype != torch.float32:
+            raise ValueError(f"k_scale must be float32, got {k_scale.dtype}")
+        if not k_scale.is_contiguous():
+            raise ValueError("k_scale must be contiguous")
     T = int(q.shape[0])
     if tuple(w.shape) != (T, NUM_HEADS):
         raise ValueError(f"w must be [T = {T}, {NUM_HEADS}], got {tuple(w.shape)}")
@@ -470,8 +561,10 @@ def validate_dsa_indexer_det_inputs(
     device = q.device
     if device.type != "cuda":
         raise ValueError("inputs must be CUDA tensors")
-    tensors = [k, w, cu_seqlens_q, cu_seqlens_k] + (
-        [q_causal_offsets] if q_causal_offsets is not None else []
+    tensors = (
+        [k, w, cu_seqlens_q, cu_seqlens_k]
+        + ([q_causal_offsets] if q_causal_offsets is not None else [])
+        + ([k_scale] if k_scale is not None else [])
     )
     if any(t.device != device for t in tensors):
         raise ValueError("Expected all tensors on one CUDA device")
@@ -561,6 +654,7 @@ def plan_dsa_indexer_det_topk(
     finalize_threads: Optional[int] = None,
     max_seqlen_k: Optional[int] = None,
     outputs_aligned: bool = True,
+    dtype: torch.dtype = torch.bfloat16,
 ) -> ProgramChoice:
     """The host dispatch of a call from host-known integers (no tensor is read).
 
@@ -571,19 +665,23 @@ def plan_dsa_indexer_det_topk(
     the ``indices`` / ``scores`` addresses are multiples of the policy's
     ``rank_bulk_align_bytes``; the staged rank finalize's bulk row I/O (lever FRB)
     is dispatched only then, else its plain twin program (same results).
+    ``dtype``: the q / k dtype (``torch.float8_e4m3fn``: the FP8 form, whose
+    programs ``cake_policy.select_fp8_program`` picks under the architecture's
+    FP8 record; ``NotImplementedError`` where none is registered).
     """
     _check_int("num_queries", num_queries, 0)
     _check_int("num_keys", num_keys, 0)
     _check_int("num_segments", num_segments, 0)
     _check_int("top_k", top_k, 1, MAX_TOP_K)
     _check_int("ratio", ratio, 1)
+    form = form_for(dtype)
     if arch is None:
         arch = arch_for(device)
         if arch is None:
             raise ValueError(
                 "DSA indexer top-k requires compute capability 10.0, 10.3 or 10.7"
             )
-    policy = policy_for(arch)
+    policy = policy_for(arch, form)
     if grid_ctas is not None:
         grid = _check_int("grid_ctas", grid_ctas, 1)
     elif num_sms is not None:
@@ -608,8 +706,7 @@ def plan_dsa_indexer_det_topk(
         _check_int("finalize_threads", finalize_threads, 1)
     if max_seqlen_k is not None:
         _check_max_seqlen_k(max_seqlen_k, int(num_keys), int(num_segments))
-    return select_program(
-        policy,
+    call = dict(
         num_queries=int(num_queries),
         num_keys=int(num_keys),
         num_segments=int(num_segments),
@@ -626,6 +723,9 @@ def plan_dsa_indexer_det_topk(
         outputs_aligned=bool(outputs_aligned),
         scan_keys=PROGRAM_KEYS.get(arch, {}),
     )
+    if form == FP8:
+        return select_fp8_program(policy, fp8_programs=fp8_programs_for(arch), **call)
+    return select_program(policy, **call)
 
 
 def dsa_indexer_det_workspace_size(
@@ -640,6 +740,7 @@ def dsa_indexer_det_workspace_size(
     grid_ctas: Optional[int] = None,
     num_sms: Optional[int] = None,
     candidate_multiplier: Optional[int] = None,
+    dtype: torch.dtype = torch.bfloat16,
 ) -> int:
     """Explicit workspace bound in bytes of one call's geometry on ``device``.
 
@@ -654,7 +755,9 @@ def dsa_indexer_det_workspace_size(
     ``l6_solo_unsampled_max_queries``, ``split_wave_scope`` or ``wide_pair_snake_only`` gives a call with the
     sampled first threshold off (``sample_tiles_max=0``) another unit
     geometry, pair or split than the sampled default, the larger of the two
-    plans.
+    plans.  ``dtype`` is the q / k dtype: the FP8 form
+    (``torch.float8_e4m3fn``) dispatches its own programs, so its bound may
+    differ from the BF16 one of the same geometry.
     """
     return max(
         int(
@@ -670,6 +773,7 @@ def dsa_indexer_det_workspace_size(
                 num_sms=num_sms,
                 candidate_multiplier=candidate_multiplier,
                 sample_tiles_max=sample_tiles_max,
+                dtype=dtype,
             ).workspace_bytes
         )
         for sample_tiles_max in (None, 0)
@@ -914,6 +1018,11 @@ class DSAIndexerDetRunner:
     def top_k(self) -> int:
         return self.choice.top_k
 
+    @property
+    def form(self) -> str:
+        """The input form of the bound q / k (``"bf16"`` or ``"fp8"``), read from the dispatched scan key."""
+        return scan_key_form(self.choice.scan_key)
+
     def run(self) -> tuple[torch.Tensor, torch.Tensor]:
         with _ffi_stream_context(self.device_index):
             launches = self.launches
@@ -981,14 +1090,21 @@ def _prepare_runner(
     finalize_threads: Optional[int] = None,
     backend: str = "cake",
     one_shot: bool = False,
+    k_scale: Optional[torch.Tensor] = None,
 ) -> DSAIndexerDetRunner:
     """:func:`prepare_dsa_indexer_det_topk`; ``one_shot``: the runner runs once (the eager entry), so a scan program
     that reads its ``TicketWord`` draws from the first bytes of the workspace's tail, which its scan binding zeroes,
     instead of a block of its own."""
     if backend != "cake":
         raise ValueError("DSA indexer top-k supports backend='cake'")
+    fp8 = q.dtype == torch.float8_e4m3fn
     if softmax_scale is None:
-        softmax_scale = default_softmax_scale()
+        # the FP8 programs take 1.0: every scale but k_scale is folded into w
+        softmax_scale = 1.0 if fp8 else default_softmax_scale()
+    elif fp8:
+        raise ValueError(
+            "float8_e4m3fn q / k take softmax_scale=None: fold the softmax scale into w"
+        )
     num_queries, num_keys, num_segments = validate_dsa_indexer_det_inputs(
         q,
         k,
@@ -1001,7 +1117,9 @@ def _prepare_runner(
         ratio,
         max_seqlen_q,
         max_seqlen_k,
+        k_scale,
     )
+    form = form_for(q.dtype)
     device = q.device
     for name, tensor in (
         ("workspace_buffer", workspace_buffer),
@@ -1022,7 +1140,7 @@ def _prepare_runner(
     # lever FRB: the staged rank finalize's bulk row I/O needs output addresses on the policy's 16-B granule; caller-owned
     # outputs may be arbitrary views (the plain twin program is registered alongside), the backend's own allocations are aligned
     outputs_aligned = _outputs_aligned(
-        (indices, scores), policy_for(arch).rank_bulk_align_bytes
+        (indices, scores), policy_for(arch, form).rank_bulk_align_bytes
     )
     choice = plan_dsa_indexer_det_topk(
         num_queries,
@@ -1041,6 +1159,7 @@ def _prepare_runner(
         finalize_threads=finalize_threads,
         max_seqlen_k=max_seqlen_k,
         outputs_aligned=outputs_aligned,
+        dtype=q.dtype,
     )
     # every program of the call must be registered before anything is allocated (fail closed by name)
     fin_role = choice.finalize_role
@@ -1054,7 +1173,7 @@ def _prepare_runner(
     # the ticket-tail decision (see the comment where the tail is passed) is host arithmetic only: it is made here,
     # before the call's first device operation, so an eager call does not hold the stream for it
     tail_at, tail_static, drawing, reads_word = -1, False, False, False
-    tail_skips = ticket_tail_skips(arch)
+    tail_skips = ticket_tail_skips(arch, form)
     if (
         num_queries > 0
         and num_keys > 0
@@ -1082,8 +1201,11 @@ def _prepare_runner(
     cand = flat[:workspace_bytes].view(torch.int64)
 
     t: dict[str, torch.Tensor] = {
-        "Q": q.view(num_queries * NUM_HEADS, HEAD_DIM),
-        "K": k,
+        # the FP8 form's e4m3 bytes reach the binding as uint8 views of the same storage
+        "Q": (q.view(torch.uint8) if fp8 else q).view(
+            num_queries * NUM_HEADS, HEAD_DIM
+        ),
+        "K": k.view(torch.uint8) if fp8 else k,
         "W": w,
         "cu_seqlens_q": cu_seqlens_q,
         "cu_seqlens_k": cu_seqlens_k,
@@ -1091,8 +1213,8 @@ def _prepare_runner(
         "q_offsets": q_causal_offsets
         if q_causal_offsets is not None
         else _offsets_placeholder(device_index),
-        # only an FP8 form reads the per-key scales; every program here is BF16
-        "K_scale": _unread_placeholder(device_index, torch.float32),
+        # only the FP8 programs read the per-key scales; a BF16 program gets the device's never-dereferenced placeholder
+        "K_scale": k_scale if fp8 else _unread_placeholder(device_index, torch.float32),
         "Indices": indices
         if indices is not None
         else torch.empty((num_queries, int(top_k)), dtype=torch.int32, device=device),
@@ -1255,6 +1377,7 @@ def prepare_dsa_indexer_det_topk(
     far_sample: Optional[int] = None,
     finalize_threads: Optional[int] = None,
     backend: str = "cake",
+    k_scale: Optional[torch.Tensor] = None,
 ) -> DSAIndexerDetRunner:
     """Validate one binding, decide its programs and prepare its launches.
 
@@ -1287,6 +1410,13 @@ def prepare_dsa_indexer_det_topk(
     bitwise identical for every admissible value.  ``T == 0`` returns a runner
     whose launches are empty; a call without keys (``Tkv == 0``) fills the
     outputs with padding instead of launching.
+
+    FP8 form: float8_e4m3fn ``q`` / ``k`` with ``k_scale`` (FP32 ``[Tkv]``)
+    and ``softmax_scale=None``; the runner binds ``k_scale`` with ``q`` / ``k``
+    (new scale values written into it are read by the next run).  The
+    dispatched programs are the architecture's FP8 programs
+    (``plan_dsa_indexer_det_topk(..., dtype=torch.float8_e4m3fn)``);
+    ``NotImplementedError`` where none is registered.
     """
     return _prepare_runner(
         q,
@@ -1311,6 +1441,7 @@ def prepare_dsa_indexer_det_topk(
         far_sample=far_sample,
         finalize_threads=finalize_threads,
         backend=backend,
+        k_scale=k_scale,
     )
 
 
@@ -1338,6 +1469,7 @@ def dsa_indexer_det_topk(
     far_sample: Optional[int] = None,
     finalize_threads: Optional[int] = None,
     backend: str = "cake",
+    k_scale: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Eager entry point: prepare a binding and run it once; returns ``(indices, scores)``.
 
@@ -1376,6 +1508,7 @@ def dsa_indexer_det_topk(
         finalize_threads=finalize_threads,
         backend=backend,
         one_shot=True,
+        k_scale=k_scale,
     )
     return runner.run()
 
@@ -1400,6 +1533,7 @@ __all__ = [
     "ZERO_SIGN_POLICIES",
     "DSAIndexerDetRunner",
     "DispatchPolicy",
+    "FORM_DTYPES",
     "ProgramChoice",
     "arch_for",
     "bind_program",
@@ -1407,6 +1541,8 @@ __all__ = [
     "dsa_indexer_det_topk",
     "dsa_indexer_det_workspace_size",
     "effective_offsets",
+    "form_for",
+    "fp8_programs_for",
     "generated_program_available",
     "plan_dsa_indexer_det_topk",
     "policy_for",
