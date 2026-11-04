@@ -349,6 +349,7 @@ def plan_record(prepared):
         record.update(
             block_n=p.block_n,
             splits=p.splits,
+            chains=p.chains,
             out_t=p.out_t,
             tiles=p.tiles,
             swapped=p.swapped,
