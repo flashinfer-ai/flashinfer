@@ -198,22 +198,21 @@ def test_enumerated_fields(field, values) -> None:
             make_options(**{field: bad})
 
 
-def test_reuse_recompute_tapes_defaults_to_auto_never_captured() -> None:
+def test_reuse_recompute_tapes_defaults_to_auto_in_both_graph_modes() -> None:
     """The checkpoint-aware light backward is a keyword-only switch -- ``"auto"`` (the shipped default: the tapes are
-    kept only when the node closes the checkpointed region), ``True`` (always) or ``False`` (the replay form); under
-    ``graph="replay"`` the default resolves to ``False`` -- part of the options key (so of the CUDA-graph key), typed,
-    and refused with ``graph="replay"`` (a captured graph bakes the arena addresses of its tapes; the kept tapes are
-    fresh tensors handed from the recompute forward to the backward)."""
+    kept only when the node closes the checkpointed region), ``True`` (always) or ``False`` (the replay form) -- part
+    of the options key (so of the CUDA-graph key) and typed; ``graph="replay"`` has the same default and accepts every
+    value (the kept tapes are then the workspace arena's own: ``cake_kcp._kept_stale``)."""
     assert "reuse_recompute_tapes" in opt.OPTION_NAMES
     # the shipped default is this one constant (and this line) -- every other test names the state it exercises
     assert opt.REUSE_RECOMPUTE_TAPES_DEFAULT == "auto"
     assert make_options().reuse_recompute_tapes == opt.REUSE_RECOMPUTE_TAPES_DEFAULT
-    # None = the shipped default; under graph="replay" (the one mode that excludes the kept tapes) it is False
+    # None = the shipped default, under graph="replay" too
     assert make_options(reuse_recompute_tapes=None).reuse_recompute_tapes == "auto"
-    assert make_options(graph="replay").reuse_recompute_tapes is False
+    assert make_options(graph="replay").reuse_recompute_tapes == "auto"
     both = make_options(reuse_recompute_tapes=None, graph="replay")
-    assert both.reuse_recompute_tapes is False
-    assert OptionsKcp(graph="replay").reuse_recompute_tapes is False
+    assert both.reuse_recompute_tapes == "auto"
+    assert OptionsKcp(graph="replay").reuse_recompute_tapes == "auto"
     assert make_options(graph="replay").key() != make_options().key()
     on = make_options(reuse_recompute_tapes=True)
     off = make_options(reuse_recompute_tapes=False)
@@ -223,10 +222,9 @@ def test_reuse_recompute_tapes_defaults_to_auto_never_captured() -> None:
     assert from_instance.reuse_recompute_tapes is True
     with pytest.raises(TypeError):
         make_options(reuse_recompute_tapes=1)
-    with pytest.raises(ValueError, match="graph"):
-        make_options(reuse_recompute_tapes=True, graph="replay")
-    with pytest.raises(ValueError, match="graph"):
-        make_options(reuse_recompute_tapes="auto", graph="replay")
+    for value in (True, False, "auto"):
+        o = make_options(reuse_recompute_tapes=value, graph="replay")
+        assert o.reuse_recompute_tapes == value and o.graph == "replay"
     # the other modes accept the switch (it has no effect there: documented as a no-op)
     for extra in (
         {"boundary_mode": "replay"},
@@ -248,7 +246,7 @@ def test_recompute_output_is_a_two_value_keyword_switch_defaulting_to_auto() -> 
     """``recompute_output`` -- whether the recompute of a checkpointed forward launches its dead output program -- is a
     keyword-only field of the options (so part of the CUDA-graph key), ``"auto"`` by default (the frame-proof skip),
     ``"always"`` the unconditional launch; anything else is refused.  It is independent of the kept-tape switch and
-    of the graph mode (a captured graph never skips, the option value stays ``"auto"``)."""
+    of the graph mode (under ``graph="replay"`` the recompute's decision is part of its CUDA-graph key)."""
     assert "recompute_output" in opt.OPTION_NAMES
     assert opt.RECOMPUTE_OUTPUTS == ("auto", "always")
     assert opt.RECOMPUTE_OUTPUT_DEFAULT == "auto"
