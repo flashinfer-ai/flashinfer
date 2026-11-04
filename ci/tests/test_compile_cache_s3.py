@@ -292,6 +292,22 @@ class CompileCacheS3ScriptTest(S3LayerTestBase):
         self.assertEqual((dest / "triton/B/kernel.cubin").read_text(), "src")
         self.assertTrue((src / "triton/B/kernel.cubin").exists())
 
+    @unittest.skipIf(os.geteuid() == 0, "root ignores directory permissions")
+    def test_merge_reports_a_failed_copy(self):
+        src, dest = self.root / "src", self.root / "dest"
+        cute_module(src, "norm", ["k1"])
+        # dest cannot gain the cached_ops directory, as on a full disk.
+        locked = dest / Path(JIT).parent
+        locked.mkdir(parents=True)
+        locked.chmod(0o555)
+        self.addCleanup(locked.chmod, 0o755)
+        result = subprocess.run(
+            ["bash", str(S3_SCRIPT), "merge", str(src), str(dest)],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+
     def test_invalid_image_or_lane_is_skipped(self):
         for image, lane in (
             (IMAGE, "../escape"),
@@ -398,6 +414,30 @@ class CompileCacheS3IntegrationTest(S3LayerTestBase):
         out, _ = self.run_job()
         self.assertIn("unchanged", out)
 
+    def entrypoint(self, s3_tree, seed, private):
+        # The real entrypoint finds compile_cache_s3.sh beside itself.
+        docker_dir = self.root / "docker"
+        docker_dir.mkdir(exist_ok=True)
+        for name in ("compile_cache_entrypoint.sh", "compile_cache_s3.sh"):
+            shutil.copy(REPO_ROOT / "ci" / name, docker_dir / name)
+        ran = self.root / "ran"
+        result = subprocess.run(
+            [
+                "bash",
+                str(docker_dir / "compile_cache_entrypoint.sh"),
+                seed,
+                private,
+                "touch",
+                ran,
+            ],
+            env={**os.environ, "COMPILE_CACHE_S3_TREE": str(s3_tree)},
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(ran.exists())
+        return result.stdout + result.stderr
+
     def test_entrypoint_prefers_s3_and_fills_gaps_from_the_seed(self):
         s3_tree, seed, private = (self.root / n for n in ("s3", "seed", "private"))
         cute_module(s3_tree, "gemm", ["k1"])
@@ -406,28 +446,28 @@ class CompileCacheS3IntegrationTest(S3LayerTestBase):
         )
         cute_module(seed, "norm", ["k1"])
         private.mkdir()
-        # The real entrypoint finds compile_cache_s3.sh beside itself.
-        docker_dir = self.root / "docker"
-        docker_dir.mkdir()
-        for name in ("compile_cache_entrypoint.sh", "compile_cache_s3.sh"):
-            shutil.copy(REPO_ROOT / "ci" / name, docker_dir / name)
-        result = subprocess.run(
-            [
-                "bash",
-                str(docker_dir / "compile_cache_entrypoint.sh"),
-                seed,
-                private,
-                "true",
-            ],
-            env={**os.environ, "COMPILE_CACHE_S3_TREE": str(s3_tree)},
-            capture_output=True,
-            text=True,
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
+        self.entrypoint(s3_tree, seed, private)
         gemm = private / JIT / "gemm_sm90a_cute_dsl"
         self.assertEqual(json.loads((gemm / "meta.json").read_text()), META)
         self.assertFalse((gemm / "k2.o").exists())
         self.assertTrue((private / JIT / "norm_sm90a_cute_dsl/k1.o").exists())
+
+    @unittest.skipIf(os.geteuid() == 0, "root ignores directory permissions")
+    def test_entrypoint_runs_cold_after_a_failed_copy(self):
+        s3_tree, seed, private = (self.root / n for n in ("s3", "seed", "private"))
+        cute_module(s3_tree, "gemm", ["k1"])
+        cute_module(s3_tree, "norm", ["k1"])
+        # One module cannot be written, as on a full disk: the copy stops
+        # midway, and nothing it copied may stay behind.
+        locked = private / JIT / "norm_sm90a_cute_dsl"
+        locked.mkdir(parents=True)
+        locked.chmod(0o555)
+        self.addCleanup(lambda: locked.exists() and locked.chmod(0o755))
+        out = self.entrypoint(s3_tree, seed, private)
+        self.assertIn("running without it", out)
+        self.assertIn("Size of each compile cache source", out)
+        self.assertIn(f"Space at {private}", out)
+        self.assertEqual(list(private.iterdir()), [])
 
 
 if __name__ == "__main__":

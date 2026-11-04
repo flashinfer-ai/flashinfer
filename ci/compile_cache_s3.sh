@@ -43,6 +43,8 @@
 # cache. Never nvcc modules, tuning results or generated sources.
 #
 # Every failure only warns: the job then continues from the cache it has.
+# merge alone also exits non-zero when a copy fails, so that its caller can
+# drop a cache it left half-copied.
 
 set -uo pipefail
 
@@ -124,7 +126,10 @@ fetch() {
             ;;
         304) echo "Shared compile cache unchanged since this runner fetched it: ${url}" ;;
         403 | 404)
-            echo "No shared compile cache at ${url}"
+            # Without s3:ListBucket a missing object is a 403 too, so either
+            # one ends the mirror; this job uploads nothing, so a denied read
+            # costs only the cache. The code tells a reader which happened.
+            echo "No shared compile cache at ${url} (HTTP ${code})"
             rm -rf "${mirror:?}/tree" "${mirror:?}/etag"
             ;;
         *) warn "download of ${url} failed (HTTP ${code:-none}); continuing without it" ;;
@@ -167,11 +172,12 @@ restore() {
 }
 
 merge() {
-    local src=$1 dest=$2 rel
+    local src=$1 dest=$2 rel status=0
     [ -d "${src}" ] || return 0
     while IFS= read -r -d '' rel; do
         if [ ! -e "${dest}/${rel}" ]; then
-            mkdir -p "$(dirname "${dest}/${rel}")" && cp -a "${src}/${rel}" "${dest}/${rel}"
+            mkdir -p "$(dirname "${dest}/${rel}")" && cp -a "${src}/${rel}" "${dest}/${rel}" \
+                || status=1
         elif cmp -s "${src}/${rel}/meta.json" "${dest}/${rel}/meta.json"; then
             # -n keeps every existing file; its exit status differs between
             # coreutils versions when something is skipped.
@@ -180,7 +186,8 @@ merge() {
     done < <(cd "${src}" && find . -path '*/cached_ops/*_cute_dsl' -type d -prune -print0)
     tar -C "${src}" --exclude='*/cached_ops/*_cute_dsl' -cf - . \
         | tar -C "${dest}" --skip-old-files -xf - \
-        || warn "cannot merge ${src} into ${dest}"
+        || { warn "cannot merge ${src} into ${dest}"; status=1; }
+    return "${status}"
 }
 
 # pack <dir> <tarball> <unit>...: the unit files (see list_files; paths are
@@ -281,4 +288,6 @@ case "${1:-}:$#" in
         ;;
 esac
 "$@"
+status=$?
+[ "$1" = merge ] && exit "${status}"
 exit 0

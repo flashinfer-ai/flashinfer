@@ -54,7 +54,10 @@ are read anonymously over HTTPS.
   private tree first, then merges the seed over it: a CuTe-DSL module absent
   from the private tree is copied whole, one present gets missing objects only
   when both `meta.json` files are identical, and other artifacts are copied
-  only when missing. Mirrors of images unused for a week are evicted.
+  only when missing. If either copy fails (typically a full disk), the
+  entrypoint prints the sources' sizes and the free space, empties the private
+  tree so no module is left half-copied, and runs the job cold. Mirrors of
+  images unused for a week are evicted.
 - Writers are `read-write` jobs with `CI_COMPILE_CACHE_WRITER_DIR` set: scheduled
   runs on main once the `COMPILE_CACHE_S3_ROLE_ARN` repository variable names the
   upload role. Each compiles in a new directory (a fresh path per job) on top of
