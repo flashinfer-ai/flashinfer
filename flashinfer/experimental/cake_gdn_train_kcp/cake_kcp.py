@@ -87,7 +87,11 @@ of the recompute's CUDA-graph key and the kept tapes are the workspace arena's
 own (below ``_kept_stale``), so a captured checkpoint step launches the eager
 step's programs -- from ``GRAPH_RECOMPUTE_MIN_ROWS`` token x value-head rows per
 rank under the default ``"auto"``; a smaller recompute decides nothing and
-replays the original forward's graph (the size rule, below ``_fwd_entry``).
+replays the original forward's graph, #5 included (``fwd_o_reason`` ``"small"``;
+the size rule, below ``_fwd_entry``).  The kept tapes add no memory there; the
+recompute's hand-off graph holds its own static results like every graph key
+(a saved set and, when #5 launches in it -- ``recompute_output="always"``, or
+``True`` with a later saver -- a full output per checkpointed layer).
 
 Tapes (padded rows ``R = 64 * NC_pad``; token ``t`` of chunk ``c`` sits in row
 ``64 c + (t - chunk_bos[c])``): ``w, u, v_new, do_g, dv_intra`` BF16

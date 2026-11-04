@@ -55,8 +55,12 @@ Public fields (defaults are the shipped behaviour)::
                                             form.
                                             None = the default ("auto", with graph="off" and graph="replay" alike);
                                             with graph="replay" the kept tapes are the workspace arena's own tapes
-                                            (a captured graph bakes their addresses), valid only while no other call
-                                            has used that workspace since the recompute (else the replay form runs);
+                                            (a captured graph bakes their addresses, so they add no memory), valid
+                                            only while no other call has used that workspace since the recompute
+                                            (else the replay form runs); the recompute's own hand-off graph holds its
+                                            static results like every graph key (one more saved set per checkpointed
+                                            layer and, when that recompute launches #5 -- recompute_output="always",
+                                            or True with a later saver -- a full static output, T_r * HV * 256 bytes);
                                             a forward outside a backward pass, the direct autograd path and every
                                             other mode are unchanged; one kept set is live at a time, so in a
                                             segment of several layers only the last one skips the replay; under
@@ -74,6 +78,10 @@ Public fields (defaults are the shipped behaviour)::
                                             follows or early stop is off (LAST_CALL["fwd"]["fwd_o_reason"] says
                                             why); never skipped outside the autograd node or, with graph="replay",
                                             outside a backward pass (the decision is part of the CUDA-graph key);
+                                            with graph="replay" on a caller-held workspace and
+                                            reuse_recompute_tapes="auto", a rank below GRAPH_RECOMPUTE_MIN_ROWS
+                                            (cake_kcp) decides nothing and launches #5 (reason "small"), while an
+                                            explicit True / False reads the proof at every size;
                                             "always" = the unconditional launch
     backend         "kernels" | "fake"      the exported programs, or the torch emulation of the same ABI (tests)
     segments        None | int              segments per fragment (P): None = the context's plan; an int overrides it

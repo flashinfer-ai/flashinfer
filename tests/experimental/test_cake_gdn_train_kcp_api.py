@@ -1340,8 +1340,10 @@ def test_facade_maps_the_replay_auto_tape_option_onto_the_deterministic_default(
     """``OptionsKcp(graph="replay")`` (``reuse_recompute_tapes`` defaults to ``"auto"``) on the deterministic route --
     the default ``deterministic=True``, and ``deterministic=False`` under ``torch.use_deterministic_algorithms(True)``
     -- reaches the twin with ``reuse_recompute_tapes=None`` on every compute entry, which the twin's ``make_options``
-    resolves to its own default (``False`` under replay) and accepts; an explicit ``True`` passes on and the twin
-    refuses it; ``graph="off"`` passes ``"auto"`` on unchanged; the non-deterministic route gets the instance."""
+    resolves to its own default (``False`` under replay) and accepts; so does ``OptionsKcp()`` (``graph="off"``) with
+    ``graph="replay"`` as the call's keyword (``chunk_gdn_kcp``) or knob (the two explicit entries), which the twin
+    applies on top of the mapping; an explicit ``True`` passes on and the twin refuses it; under ``graph="off"`` the
+    ``None`` resolves to the twin's ``"auto"``; the non-deterministic route gets the instance."""
     facade = importlib.import_module(FACADE)
     det_opt = importlib.import_module(f"{DET_PACKAGE}.cake_options")
     seen = _route_recorders(monkeypatch)
@@ -1383,8 +1385,29 @@ def test_facade_maps_the_replay_auto_tape_option_onto_the_deterministic_default(
                     det_opt.make_options(got)
                 call(options=off, **kw)
                 got = seen[-1][1]["options"]
-                assert got["reuse_recompute_tapes"] == "auto", (entry, got)
+                assert got["graph"] == "off", (entry, got)
+                assert got["reuse_recompute_tapes"] is None, (entry, got)
                 assert det_opt.make_options(got).reuse_recompute_tapes == "auto"
+                # the instance says graph="off", the call's keyword / knob says "replay"
+                seen.clear()
+                assert call(options=OptionsKcp(), graph="replay", **kw).startswith(
+                    "det:"
+                ), (entry, kw)
+                got, sent = seen[-1][1]["options"], seen[-1][1]
+                assert sent.get("graph") == "replay", (entry, kw, sent)
+                assert got["graph"] == "off", (entry, got)
+                assert got["reuse_recompute_tapes"] is None, (entry, kw, got)
+                assert (
+                    det_opt.make_options(got, graph="replay").reuse_recompute_tapes
+                    is False
+                ), (entry, kw)
+                call(
+                    options=OptionsKcp(reuse_recompute_tapes=True), graph="replay", **kw
+                )
+                got = seen[-1][1]["options"]
+                assert got["reuse_recompute_tapes"] is True, (entry, got)
+                with pytest.raises(ValueError, match="needs graph='off'"):
+                    det_opt.make_options(got, graph="replay")
     torch.use_deterministic_algorithms(False)
     for entry, call in calls.items():
         assert call(options=replay, deterministic=False) == f"nondet:{entry}"

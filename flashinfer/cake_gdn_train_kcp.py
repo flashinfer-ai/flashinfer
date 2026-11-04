@@ -34,9 +34,10 @@ The mode is never stored in the context: a context, a partition and the byte
 queries of either route describe the same plan.  A saved set is read only by
 the backward of the route that produced it, and an options instance is
 converted to the routed package's options type (mappings and keywords work for
-both; on the deterministic route an ``OptionsKcp`` with ``graph="replay"`` and
-the default ``reuse_recompute_tapes="auto"`` takes that route's own default,
-``False`` under replay).  Thin experimental entry points: the partition / context plan, the host
+both; on the deterministic route an ``OptionsKcp`` with the default
+``reuse_recompute_tapes="auto"`` takes that route's own default for the call's
+final ``graph``: ``False`` under replay, whether replay comes from the instance,
+the ``graph`` keyword or a knob).  Thin experimental entry points: the partition / context plan, the host
 orchestration, the saved set, the autograd Function and the generated kernels
 live in the routed package; this module forwards every keyword.  Every switch
 is a keyword argument; no environment variable is read.
@@ -135,9 +136,10 @@ def _options_for(det: bool, options: Any) -> Any:
     """``options`` for the routed package: an options instance of the other route becomes the mapping of its fields
     (the routed package validates it); a mapping, ``None`` or the routed package's own instance pass through.  Both
     routes take every field, ``use_qk_l2norm_in_kernel`` included.  On the deterministic route a non-deterministic
-    instance whose ``reuse_recompute_tapes`` is the default ``"auto"`` under CUDA-graph replay (``graph`` not
-    ``"off"``) maps that field to ``None``: the deterministic package resolves it to its own default (``False`` under
-    replay), while an explicit ``True`` passes and is refused there."""
+    instance whose ``reuse_recompute_tapes`` is the default ``"auto"`` maps that field to ``None`` whatever its own
+    ``graph`` field says: the deterministic package resolves it to its own default with the call's final ``graph``
+    (the instance's, the ``graph`` keyword's or a knob's): ``"auto"`` under ``"off"``, ``False`` under replay.  An
+    explicit ``True`` passes and is refused there under replay."""
     if options is None or isinstance(options, dict):
         return options
     own = _det().OptionsDetKcp if det else _pkg().OptionsKcp
@@ -146,7 +148,6 @@ def _options_for(det: bool, options: Any) -> Any:
     fields = {f.name: getattr(options, f.name) for f in dataclasses.fields(options)}
     if (
         det
-        and fields.get("graph", "off") != "off"
         and isinstance(fields.get("reuse_recompute_tapes"), str)
         and fields["reuse_recompute_tapes"] == "auto"
     ):
@@ -439,11 +440,14 @@ def chunk_gdn_kcp(
     memory; ``True`` always keeps them, ``False`` never (the replay form).  One kept set is
     live at a time: in a checkpoint segment holding several GDN layers only the last layer skips the replay (the
     earlier layers replay as before).  On the deterministic route it is not available with ``graph="replay"`` (the
-    default resolves to ``False`` and an explicit ``True`` / ``"auto"`` is refused); on the non-deterministic route a
-    caller-held workspace keeps its own tapes under ``graph="replay"`` and the backward binds them only while the
-    workspace made no other call in between (else the replay form); there ``"auto"`` decides only from
-    ``cake_kcp.GRAPH_RECOMPUTE_MIN_ROWS`` token x value-head rows per rank (a smaller recompute replays the original
-    forward's graph: its host-bound step gains nothing from the hand-off).
+    default resolves to ``False``, so does an ``OptionsKcp``'s default ``"auto"``, and an explicit ``True`` /
+    ``"auto"`` is refused); on the non-deterministic route a caller-held workspace keeps its own tapes under
+    ``graph="replay"`` and the backward binds them only while the workspace made no other call in between (else the
+    replay form); the kept tapes add no memory there, while the recompute's own hand-off graph holds its static
+    results like every graph key (one more saved set per checkpointed layer and, when that recompute launches the
+    output program -- ``recompute_output="always"``, or ``True`` with a later saver -- a full static output); there
+    ``"auto"`` decides only from ``cake_kcp.GRAPH_RECOMPUTE_MIN_ROWS`` token x value-head rows per rank (a smaller
+    recompute replays the original forward's graph: its host-bound step gains nothing from the hand-off).
 
     ``recompute_output`` (keyword-only, ``"auto"`` default | ``"always"``): torch's recompute of a checkpointed
     forward returns nothing, so when this node is the last operation of the checkpointed region that saves a tensor,
@@ -452,9 +456,11 @@ def chunk_gdn_kcp(
     early stop is on, and the torch release -- ``torch.__version__`` without its local ``+cuNNN`` build tag -- is one
     of the package's verified releases, ``cake_kcp.RECOMPUTE_OUTPUT_TORCH_VERSIONS``) and launches it as before in every other state -- a later operation
     of the region that saves the output (another layer, a norm), a reentrant checkpoint, a forward outside a
-    recompute, a non-executable node, another torch build (``cake_kcp.LAST_CALL["fwd"]["fwd_o_reason"]`` records the
-    decision and its reason).  The gradients and the retained bytes are unchanged either way; ``"always"`` is the
-    unconditional launch.
+    recompute, a non-executable node, another torch build, and under ``graph="replay"`` with the default
+    ``reuse_recompute_tapes="auto"`` a rank below ``cake_kcp.GRAPH_RECOMPUTE_MIN_ROWS`` (reason ``"small"``; an
+    explicit ``True`` / ``False`` reads the proof at every size) (``cake_kcp.LAST_CALL["fwd"]["fwd_o_reason"]``
+    records the decision and its reason).  The gradients and the retained bytes are unchanged either way;
+    ``"always"`` is the unconditional launch.
 
     ``recompute_handle`` (keyword-only, default ``None``; a :class:`RecomputeHandleKcp`): the checkpoint recompute
     of this forward runs without cross-rank communication.  The original forward exchanges as always and stores

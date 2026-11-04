@@ -5539,7 +5539,14 @@ def test_graph_replay_kept_backward_keys_the_arena_hand_off_by_its_layout(
     assert layout is not None and f_kept == f_replay + layout, (f_kept, layout)
     assert layout[2] == (segments > 1 and not save_transfer), layout
     assert layout[3] == (tuple(kcp.QK_TAPES) if l2n else ()), layout
-    # the key part of other kept sets (:func:`_kept_key_part`; the backward counts its own call before it)
+
+
+def test_kept_key_part_keys_only_the_hand_off_just_taken_by_its_layout() -> None:
+    """:func:`_kept_key_part` (no frame proof needed, so on every torch): the arena hand-off just taken on this
+    workspace keys by its layout only; an arena set of another workspace, a stamp from an earlier call and the eager
+    hand-off's own tensors key by their tensors; no kept set adds nothing (the backward counts its own call before
+    it)."""
+    kcp, _ctx, ops = _ckpt_setup()
     ws, other = kcp.WorkspaceKcp(), kcp.WorkspaceKcp()
     t = ops["q"]
     arena = kcp._KeptTapes({"w": t}, None, (1, 2, 3, 4), 0, ws=ws)
@@ -5854,8 +5861,6 @@ def test_graph_replay_kept_backward_capture_failing_after_its_body_runs_the_kept
     and out and the gradients are the bits of the eager step.  CPU captures: the forwards' succeed
     (:func:`_fake_captures`), every backward capture runs its body and then fails."""
     kcp, ctx, ops = _ckpt_setup()
-    if not _verified_torch(kcp):
-        pytest.skip("no hand-off without the frame proof on this torch")
     captured = _fake_captures(kcp, monkeypatch)
     fake_capture = kcp._graph_capture
     failed: list = []
@@ -5905,8 +5910,6 @@ def test_graph_replay_cached_hand_off_holds_no_arena_tensor(monkeypatch) -> None
     import weakref
 
     kcp, ctx, ops = _ckpt_setup()
-    if not _verified_torch(kcp):
-        pytest.skip("no hand-off without the frame proof on this torch")
     captured = _fake_captures(kcp, monkeypatch)
     ws = kcp.WorkspaceKcp()
     step = _same_leaf_steps(
@@ -6353,6 +6356,10 @@ class _ThreadDist:
         recv = [int(x) for x in output_split_sizes]
         assert len(send) == len(recv) == self.world, (rank, send, recv)
         chunks = [c.clone() for c in torch.split(input, send)]
+        recording = getattr(self.local, "recording", None)
+        # a capture of _fake_captures_threaded: its replays re-issue this collective
+        if recording is not None:
+            recording.append((output, input.clone(), recv, send))
         with self.cond:
             self.deposits.setdefault(seq, {})[rank] = chunks
             self.cond.notify_all()
@@ -6777,6 +6784,194 @@ def test_workspace_reused_across_steps_binds_the_graph_replay_figure(
                 # the forward peaks at its ensure, the previous backward's h / v_new still bound
                 assert fwd == graph["backward"] - bwd_only, (r, steps[r], graph)
                 assert fwd > eager["forward"], (r, steps[r])
+
+
+class _ThreadLastCall(dict):
+    """``cake_kcp.LAST_CALL`` per rank thread: the package only subscripts the module dict, which the rank threads of
+    :func:`_run_threaded` would otherwise share, so each thread reads and writes its own records."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._local = threading.local()
+
+    def _own(self) -> dict:
+        own = getattr(self._local, "records", None)
+        if own is None:
+            own = self._local.records = {}
+        return own
+
+    def __getitem__(self, kind):
+        return self._own()[kind]
+
+    def __setitem__(self, kind, record) -> None:
+        self._own()[kind] = record
+
+
+class _CollectiveGraph(_FakeGraph):
+    """CPU stand-in for a captured graph of one rank thread.  NCCL collectives are captured per rank, so its replay
+    re-issues, in order, the collectives its capture issued -- the capture's payloads into the same receive buffers
+    (every step of a test using it runs the same operands) -- and runs nothing else."""
+
+    def __init__(self, comm, issued: list) -> None:
+        super().__init__()
+        self.comm, self.issued = comm, issued
+
+    def replay(self) -> None:
+        super().replay()
+        for output, payload, recv, send in self.issued:
+            self.comm.all_to_all_single(
+                output, payload, output_split_sizes=recv, input_split_sizes=send
+            )
+
+
+def _fake_captures_threaded(kcp, monkeypatch) -> list:
+    """:func:`_fake_captures` for the rank threads of :func:`_run_threaded`: the capture records the collectives its
+    body issued on the calling rank's thread and the entry keeps a :class:`_CollectiveGraph` of them, so a rank that
+    replays a graph meets its peers' eager or captured collectives in the same order.  Returns the
+    ``(rank, kind, entry)`` triples captured."""
+    captured: list = []
+    lock = threading.Lock()
+
+    def capture(kind, entry, call, body):
+        comm = kcp.dist
+        comm.local.recording = []
+        try:
+            result = body()
+        finally:
+            issued, comm.local.recording = comm.local.recording, None
+        kcp._record(kind, call)
+        kcp.LAST_CALL[kind].update(graph_event="capture", graph_key=entry.digest)
+        entry.record = dict(kcp.LAST_CALL[kind])
+        entry.graph = _CollectiveGraph(comm, issued)
+        entry.arena = kcp._arena_sig(call.ws)
+        entry.seen += 1
+        kcp.GRAPH_STATS["capture"] += 1
+        call.backend.end_call(call)
+        with lock:
+            captured.append((comm.local.rank, kind, entry))
+        return result
+
+    monkeypatch.setattr(kcp, "_graph_capture", capture)
+    return captured
+
+
+# two ranks, document 3 crossing: rank 0 holds 1517 tokens (9102 token x value-head rows at HV = 6), rank 1 holds 429
+# (2574 rows); a size rule between them puts rank 1 under it
+XR_FRAGMENTS = [
+    [(0, 0, 100), (1, 0, 640), (2, 0, 77), (3, 0, 700)],
+    [(3, 700, 300), (4, 0, 129)],
+]
+XR_RULE = 6000
+
+
+@pytest.mark.parametrize("l2n", [False, True])
+def test_graph_replay_checkpoint_group_with_one_rank_under_the_size_rule(
+    l2n, monkeypatch
+) -> None:
+    """``graph="replay"``, ``torch.utils.checkpoint(use_reentrant=False)``, the default ``reuse_recompute_tapes="auto"``
+    on two ranks (one crossing fragment, ``P = 2``, ``save_transfer=False``) with the size rule between the ranks'
+    token x value-head rows: per rank and step the recompute of rank 0 decides (on a verified torch the hand-off,
+    reason ``"dead"``, and the kept backward; elsewhere the replay form) and captures its own form, while rank 1 falls
+    under the rule (no hand-off, reasons ``"small"``, the replay-form backward) and replays the original forward's
+    graph -- one group mixing the two forms.  Five checkpointed steps on caller-held workspaces with the same leaves
+    (CPU captures whose replays re-issue their collectives, :func:`_fake_captures_threaded`); the last step replays
+    every graph on both ranks.  Out and the five gradients of every rank and step are the bits of
+    ``reuse_recompute_tapes=False`` (every rank the replay form) and of ``graph="off"``."""
+    kcp = _package("cake_kcp")
+    H_qk, HV = CKPT_HEADS
+    part = gp.partition_kcp(
+        torch.tensor(CKPT_CU, dtype=torch.int64), 2, fragments=XR_FRAGMENTS
+    )
+    ctxs = [
+        gp.build_context_kcp(part, None, r, CPU, 4, sm_count=SM_COUNT) for r in range(2)
+    ]
+    rows = [int(c.T_r) * HV for c in ctxs]
+    assert rows[1] < XR_RULE <= rows[0], rows
+    assert part.fragment(0, 3).length + part.fragment(1, 0).length == 1000
+    _size_rule_at(kcp, monkeypatch, XR_RULE)
+    monkeypatch.setattr(kcp, "LAST_CALL", _ThreadLastCall())
+    captured = _fake_captures_threaded(kcp, monkeypatch)
+    ops = _inputs(CKPT_CU, H_qk, HV)
+    base = dict(backend="fake", segments=2, save_transfer=False)
+    if l2n:
+        base["use_qk_l2norm_in_kernel"] = True
+    n_steps = 5
+
+    def run(**o) -> tuple[list, list]:
+        kcp.graph_cache_clear()
+        first = len(captured)
+
+        def rank_fn(r, comm):
+            from torch.utils.checkpoint import checkpoint
+
+            loc = fake.slice_local(ops, part, r)
+            leaves = [loc[n].detach().clone().requires_grad_(True) for n in LEAVES]
+            ws = kcp.WorkspaceKcp()
+            steps = []
+            for _ in range(n_steps):
+                for lf in leaves:
+                    lf.grad = None
+                out = checkpoint(
+                    lambda *a: kcp.chunk_gdn_kcp(
+                        *a, ctxs[r], workspace=ws, **base, **o, deterministic=False
+                    ),
+                    *leaves,
+                    use_reentrant=False,
+                )
+                out.backward(loc["dout"])
+                res = {
+                    "out": out.detach().clone(),
+                    **{
+                        n: lf.grad.clone()
+                        for n, lf in zip(CKPT_GRADS, leaves, strict=True)
+                    },
+                }
+                steps.append(
+                    (res, dict(kcp.LAST_CALL["fwd"]), dict(kcp.LAST_CALL["bwd"]))
+                )
+            return steps
+
+        per_rank = _run_threaded(kcp, 2, rank_fn, monkeypatch)
+        return per_rank, captured[first:]
+
+    auto, auto_captured = run(graph="replay")
+    replay_form, _ = run(graph="replay", reuse_recompute_tapes=False)
+    eager, _ = run()
+    kcp.graph_cache_clear()
+    verified = _verified_torch(kcp)
+    for i in range(n_steps):
+        (_, f0, b0), (_, f1, b1) = auto[0][i], auto[1][i]
+        # rank 1 under the size rule: no decision, the original forward's form, the replay-form backward
+        assert f1["hand_off"] is False, (i, f1)
+        assert f1["hand_off_reason"] == f1["fwd_o_reason"] == "small", (i, f1)
+        assert b1["tapes_source"] == "replay", (i, b1)
+        # rank 0 decides from the frame: the hand-off and the kept backward on a verified torch
+        assert f0["hand_off_reason"] == _frame_reason(kcp, "dead"), (i, f0)
+        assert f0["hand_off"] is verified, (i, f0)
+        assert b0["tapes_source"] == ("kept" if verified else "replay"), (i, b0)
+    for r in range(2):
+        _, f, b = auto[r][-1]
+        assert f["graph_event"] == b["graph_event"] == "replay", (r, f, b)
+    # the captured forward keys: rank 0's recompute its own (hand-off) key on a verified torch, rank 1 only the
+    # original forward's
+    fwd_flags = [
+        {
+            tuple(e.key[6])
+            for rank, kind, e in auto_captured
+            if rank == r and kind == "fwd"
+        }
+        for r in range(2)
+    ]
+    assert fwd_flags[1] == {(True,)}, fwd_flags
+    assert fwd_flags[0] == (
+        {(True,), (True, True, False)} if verified else {(True,)}
+    ), fwd_flags
+    for r in range(2):
+        for i in range(n_steps):
+            for n in ("out",) + CKPT_GRADS:
+                a = auto[r][i][0][n]
+                assert torch.equal(a, replay_form[r][i][0][n]), (r, i, n)
+                assert torch.equal(a, eager[r][i][0][n]), (r, i, n)
 
 
 @pytest.mark.parametrize(

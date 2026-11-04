@@ -583,8 +583,10 @@ def gdn_workspace_layout_kcp(
       tensor), larger by the backward's arena ``qk_rstd`` (with the norm; else equal) when it keeps the tapes.
     * ``use_qk_l2norm_in_kernel``: ``qn`` / ``kn`` in both forward moments, in every backward phase of the replay
       and ``save_mode="full"`` forms (``qk_apply`` writes them there) and in the kept form's recompute forward, which
-      hands them over with the ten tapes: in the kept-tape backward they are hand-off tensors (``bwd.kept_tapes``,
-      ``bwd.qn`` / ``bwd.kn`` 0); ``fwd.qk_rstd`` (the arena ``r``) at #1 of a forward without a saved set;
+      hands them over with the ten tapes: in the kept-tape backward under ``graph="off"`` they are hand-off tensors
+      (``bwd.kept_tapes``, ``bwd.qn`` / ``bwd.kn`` 0); under ``graph="replay"`` the arena hand-off keeps them as arena
+      rows (``bwd.qn`` / ``bwd.kn`` at full size, ``bwd.kept_tapes`` 0); ``fwd.qk_rstd`` (the arena ``r``) at #1 of a
+      forward without a saved set;
       ``bwd.qk_rstd`` where the backward re-runs #1 (the light replay of a saved set, a backward without one).
     """
     H_qk, HV = _check(H_qk, HV)
