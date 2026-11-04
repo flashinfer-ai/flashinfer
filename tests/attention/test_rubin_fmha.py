@@ -392,6 +392,201 @@ def test_batch_graph_repartitions_queries(causal):
         assert_outputs(out, lse, *reference(q, k, v, q_lens, kv_lens, causal))
 
 
+@pytest.mark.parametrize("new_kv_total", [64, 192], ids=["shrink", "grow"])
+@pytest.mark.parametrize("capture_first", [False, True], ids=["before", "after"])
+def test_batch_graph_kv_total_is_fixed(new_kv_total, capture_first):
+    q_lens, kv_lens = [3, 5], [64, 64]
+    q, k, v = inputs(q_lens, kv_lens)
+    attn, q_ptr, kv_ptr = batch_wrapper(q_lens, kv_lens, causal=True, graph=True)
+    original_q_ptr, original_kv_ptr = q_ptr.clone(), kv_ptr.clone()
+    out = torch.empty((*q.shape[:2], 128), device=q.device, dtype=torch.bfloat16)
+    lse = torch.empty(q.shape[:2], device=q.device)
+    call = functools.partial(
+        attn.run,
+        q,
+        k,
+        v,
+        out=out,
+        lse=lse,
+        return_lse=True,
+        q_scale=SCALE_Q,
+        k_scale=SCALE_K,
+        v_scale=SCALE_V,
+        o_scale=SCALE_O,
+    )
+
+    def capture():
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            call()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream):
+                call()
+        torch.cuda.current_stream().wait_stream(stream)
+        return graph
+
+    def replan(new_q_lens, new_kv_lens):
+        attn.plan(
+            indptr(new_q_lens),
+            indptr(new_kv_lens),
+            HEADS,
+            HEADS,
+            192,
+            head_dim_vo=128,
+            causal=True,
+            q_data_type=torch.float8_e4m3fn,
+            kv_data_type=torch.float8_e4m3fn,
+            o_data_type=torch.bfloat16,
+        )
+
+    graph = capture() if capture_first else None
+    # Reject shrinking before capture too: otherwise shrink/capture/grow could
+    # satisfy an initial-capacity bound but exceed the captured K/V descriptors.
+    # If rejection is missing, stop here rather than replay unsafe metadata.
+    with pytest.raises(ValueError, match="(?i)(fixed|total.*KV|KV.*total)"):
+        replan([5, 3], [0, new_kv_total])
+    torch.testing.assert_close(q_ptr, original_q_ptr)
+    torch.testing.assert_close(kv_ptr, original_kv_ptr)
+    out.fill_(19)
+    lse.fill_(19)
+    call()
+    assert_outputs(out, lse, *reference(q, k, v, q_lens, kv_lens, True))
+    if graph is None:
+        graph = capture()
+    out.fill_(19)
+    lse.fill_(19)
+    graph.replay()
+    assert_outputs(out, lse, *reference(q, k, v, q_lens, kv_lens, True))
+
+    # Fixed storage still permits redistributing both query and KV sequences.
+    q_lens, kv_lens = [5, 3], [0, 128]
+    replan(q_lens, kv_lens)
+    out.fill_(19)
+    lse.fill_(19)
+    graph.replay()
+    assert_outputs(out, lse, *reference(q, k, v, q_lens, kv_lens, True))
+
+
+@pytest.mark.parametrize("kv_len", [0, 17])
+def test_batch_strided_output_rejected_without_writes(kv_len):
+    q_lens, kv_lens = [17], [kv_len]
+    q, k, v = inputs(q_lens, kv_lens)
+    attn, _, _ = batch_wrapper(q_lens, kv_lens, causal=False)
+    backing = torch.full(
+        (q.shape[0], HEADS, 256), 19.0, device=q.device, dtype=torch.bfloat16
+    )
+    out = backing[..., ::2]
+    lse = torch.full(q.shape[:2], 19.0, device=q.device)
+    original_inputs = [tensor.view(torch.uint8).clone() for tensor in (q, k, v)]
+    # The backing also accommodates compact stores, keeping a missing guard
+    # observable without an out-of-bounds write in the active-KV case.
+    with pytest.raises(ValueError, match="contiguous.*out|out.*contiguous"):
+        attn.run(q, k, v, out=out, lse=lse, return_lse=True)
+    torch.testing.assert_close(backing, torch.full_like(backing, 19.0))
+    torch.testing.assert_close(lse, torch.full_like(lse, 19.0))
+    for tensor, original in zip((q, k, v), original_inputs, strict=True):
+        assert torch.equal(tensor.view(torch.uint8), original)
+
+
+@pytest.mark.parametrize(
+    "destination,source,lse_layout",
+    [
+        ("out", "q", "NH"),
+        ("out", "k", "NH"),
+        ("out", "v", "NH"),
+        ("lse", "q", "NH"),
+        ("lse", "k", "NH"),
+        ("lse", "v", "NH"),
+        ("lse", "out", "NH"),
+        ("lse", "q", "HN"),
+        ("lse", "out", "HN"),
+    ],
+)
+def test_batch_output_alias_rejected_before_neutralization(
+    destination, source, lse_layout
+):
+    # Both sequences are inactive, but Q, K and V all have nonempty storage.
+    # Missing validation can only neutralize output; it cannot launch a kernel
+    # that races aliased input and output accesses.
+    q_lens, kv_lens = [3, 0], [0, 8]
+    q, k, v = inputs(q_lens, kv_lens)
+    attn, _, _ = batch_wrapper(q_lens, kv_lens, causal=False)
+    lse_shape = q.shape[:2] if lse_layout == "NH" else (q.shape[1], q.shape[0])
+    tensors = dict(
+        q=q,
+        k=k,
+        v=v,
+        out=torch.full(
+            (*q.shape[:2], 128), 19.0, device=q.device, dtype=torch.bfloat16
+        ),
+        lse=torch.full(lse_shape, 19.0, device=q.device),
+    )
+    backing = torch.full(
+        (max(tensors[source].nbytes, tensors[destination].nbytes),),
+        19,
+        dtype=torch.uint8,
+        device=q.device,
+    )
+    for name in (source, destination):
+        tensor = tensors[name]
+        tensors[name] = backing[: tensor.nbytes].view(tensor.dtype).view(tensor.shape)
+    originals = {
+        name: tensor.view(torch.uint8).clone() for name, tensor in tensors.items()
+    }
+    original_backing = backing.clone()
+    with pytest.raises(ValueError, match="overlap"):
+        attn.run(**tensors, return_lse=True, lse_layout=lse_layout)
+    assert torch.equal(backing, original_backing)
+    for name, tensor in tensors.items():
+        assert torch.equal(tensor.view(torch.uint8), originals[name])
+
+
+def test_batch_disjoint_views_of_shared_storage():
+    q_lens, kv_lens = [3], [17]
+    q, k, v = inputs(q_lens, kv_lens)
+    tensors = [
+        q,
+        k,
+        v,
+        torch.empty((*q.shape[:2], 128), device=q.device, dtype=torch.bfloat16),
+        torch.empty(q.shape[:2], device=q.device),
+    ]
+    backing = torch.empty(
+        sum(tensor.nbytes for tensor in tensors), dtype=torch.uint8, device=q.device
+    )
+    offset = 0
+    shared = []
+    for tensor in tensors:
+        view = (
+            backing[offset : offset + tensor.nbytes]
+            .view(tensor.dtype)
+            .view(tensor.shape)
+        )
+        shared.append(view)
+        offset += tensor.nbytes
+    for destination, source in zip(shared[:3], (q, k, v), strict=True):
+        destination.copy_(source)
+    q, k, v, out, lse = shared
+    out.fill_(float("nan"))
+    lse.fill_(float("nan"))
+    attn, _, _ = batch_wrapper(q_lens, kv_lens, causal=False)
+    result = attn.run(
+        q,
+        k,
+        v,
+        out=out,
+        lse=lse,
+        return_lse=True,
+        q_scale=SCALE_Q,
+        k_scale=SCALE_K,
+        v_scale=SCALE_V,
+        o_scale=SCALE_O,
+    )
+    assert result[0] is out and result[1] is lse
+    assert_outputs(out, lse, *reference(q, k, v, q_lens, kv_lens, False))
+
+
 @pytest.mark.parametrize("kv_len", [0, 17])
 def test_batch_strided_lse_rejected_without_writes(kv_len):
     q_lens, kv_lens = [17], [kv_len]

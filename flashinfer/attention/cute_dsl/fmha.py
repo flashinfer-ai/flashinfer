@@ -405,6 +405,11 @@ def cute_dsl_fmha_ragged_prefill(
     backend : str
         ``cute-dsl`` uses ordinary dispatch. ``cute-dsl-rubin`` explicitly
         selects SM107 E4M3 D192/V128 equal-head attention with BF16 output.
+        Rubin requires contiguous Q/K/V and outputs; outputs must not overlap
+        inputs or one another. Zero-KV sequences are skipped: the caller must
+        initialize their output rows to zero and LSE rows to negative infinity.
+        :class:`~flashinfer.prefill.BatchPrefillWithRaggedKVCacheWrapper` handles
+        this initialization.
     """
     total_q, H_q, D = q.shape
     total_kv, H_k, _ = k.shape
@@ -425,6 +430,7 @@ def cute_dsl_fmha_ragged_prefill(
             k,
             v,
             o,
+            lse=lse,
             is_causal=is_causal,
             window_left=window_left,
             window_right=window_right,

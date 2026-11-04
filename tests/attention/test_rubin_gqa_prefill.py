@@ -923,6 +923,46 @@ def test_public_grouped_lengths_rejected(sm107, q_lens, kv_lens, causal):
         )
 
 
+@pytest.mark.parametrize("ratio", [1, 2], ids=["equal", "grouped"])
+@pytest.mark.parametrize(
+    "o_data_type",
+    [None, torch.bfloat16, torch.uint8, torch.float8_e4m3fn],
+    ids=["omitted", "bf16", "uint8", "fp8"],
+)
+def test_public_output_dtype(sm107, ratio, o_data_type):
+    q, k, v = inputs(batch=1, q_len=17, kv_len=129, ratio=ratio)
+    attn = BatchPrefillWithRaggedKVCacheWrapper(
+        torch.empty(8 * 1024 * 1024, dtype=torch.uint8, device=q.device),
+        backend="cute-dsl-rubin",
+    )
+    params = dict(
+        qo_indptr=torch.tensor([0, 17], dtype=torch.int32),
+        kv_indptr=torch.tensor([0, 129], dtype=torch.int32),
+        num_qo_heads=q.shape[2],
+        num_kv_heads=k.shape[2],
+        head_dim_qk=192,
+        head_dim_vo=128,
+        q_data_type=torch.float8_e4m3fn,
+        kv_data_type=torch.float8_e4m3fn,
+    )
+    if o_data_type is not None:
+        params["o_data_type"] = o_data_type
+    if o_data_type in (torch.uint8, torch.float8_e4m3fn):
+        with pytest.raises(ValueError, match="(?i)(BF16|bfloat16)"):
+            attn.plan(**params)
+        return
+    attn.plan(**params)
+    out, lse = attn.run(
+        q.flatten(0, 1), k.flatten(0, 1), v.flatten(0, 1), return_lse=True
+    )
+    assert out.dtype == torch.bfloat16
+    assert_outputs(
+        out.view(*q.shape[:-1], 128),
+        lse.view(q.shape[:-1]),
+        *reference(q, k, v),
+    )
+
+
 @pytest.mark.parametrize(
     "option,value",
     [

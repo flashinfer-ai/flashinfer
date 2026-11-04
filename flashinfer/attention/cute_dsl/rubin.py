@@ -21,12 +21,36 @@ import torch
 from ...utils import check_shape_dtype_device, get_compute_capability
 
 
+def _validate_rubin_outputs(q, k, v, out, lse=None, lse_out=None) -> None:
+    """Check contiguous output byte ranges before any output writes."""
+    from .rubin_gqa import _overlaps
+
+    outputs = [("out", out)]
+    if lse is not None:
+        outputs.append(("lse", lse))
+    if lse_out is not None:
+        outputs.append(("lse_out", lse_out))
+    for name, tensor in outputs:
+        if not tensor.is_contiguous():
+            raise ValueError(f"Rubin prefill requires contiguous {name}")
+    # Inputs are already validated as contiguous by both callers. Empty
+    # tensors occupy no bytes, even when their pointer lies inside another view.
+    for i, (_, output) in enumerate(outputs):
+        if not output.numel():
+            continue
+        if any(t.numel() and _overlaps(output, t) for t in (q, k, v)):
+            raise ValueError("Rubin prefill output tensors must not overlap inputs")
+        if any(t.numel() and _overlaps(output, t) for _, t in outputs[:i]):
+            raise ValueError("Rubin prefill output tensors must not overlap each other")
+
+
 def _validate_rubin_fmha(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     out: torch.Tensor,
     *,
+    lse: Optional[torch.Tensor] = None,
     is_causal: bool,
     window_left: int,
     window_right: int = -1,
@@ -50,6 +74,9 @@ def _validate_rubin_fmha(
         )
     if any(t.device != q.device for t in (k, v, out)):
         raise ValueError("Rubin FMHA requires Q/K/V and output on the same device")
+    if any(not t.is_contiguous() for t in (q, k, v)):
+        raise ValueError("Rubin FMHA requires contiguous Q/K/V")
+    _validate_rubin_outputs(q, k, v, out, lse)
     if (
         window_left != -1
         or (window_right != -1 and not (is_causal and window_right == 0))
@@ -181,11 +208,10 @@ class RubinPrefillPlan:
             raise ValueError(
                 "Rubin prefill requires head_dim_qk=192 and head_dim_vo=128"
             )
-        effective_o_dtype = torch.bfloat16 if o_dtype.itemsize == 1 else o_dtype
         if (
             q_dtype != torch.float8_e4m3fn
             or kv_dtype != torch.float8_e4m3fn
-            or effective_o_dtype != torch.bfloat16
+            or o_dtype != torch.bfloat16
         ):
             raise ValueError("Rubin prefill requires E4M3 Q/K/V and BF16 output")
         if kv_layout != "NHD":
@@ -321,6 +347,7 @@ class RubinPrefillPlan:
         out: torch.Tensor,
         *,
         lse: Optional[torch.Tensor],
+        lse_out: Optional[torch.Tensor],
         enable_pdl: bool,
         q_scale: Optional[float],
         k_scale: Optional[float],
@@ -340,8 +367,6 @@ class RubinPrefillPlan:
             raise NotImplementedError(
                 "Rubin prefill does not accept custom run arguments"
             )
-        if lse is not None and not lse.is_contiguous():
-            raise ValueError("Rubin prefill requires contiguous lse")
         for name, tensor, shape in (
             ("q", q, (self.total_q_len, self.num_qo_heads, 192)),
             ("k", k, (self.total_kv_len, self.num_kv_heads, 192)),
@@ -352,6 +377,9 @@ class RubinPrefillPlan:
             )
             if not tensor.is_contiguous():
                 raise ValueError(f"Rubin prefill requires contiguous {name}")
+        # Include the caller's HN destination, which is filled after the kernel
+        # runs into an internal NH LSE buffer.
+        _validate_rubin_outputs(q, k, v, out, lse, lse_out)
         if self.is_grouped:
             from .rubin_gqa import _run_rubin_gqa_prefill
 

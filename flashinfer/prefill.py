@@ -5602,9 +5602,11 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         jit_args : Optional[List[Any]]
             If provided, the wrapper will use the provided arguments to create the JIT module,
             otherwise, the wrapper will use default attention implementation.
+            Ignored by ``cute-dsl``, ``cute-dsl-rubin`` and ``cute-dsl-prims``.
 
         jit_kwargs : Optional[Dict[str, Any]]
             The keyword arguments to create the JIT module, defaults to None.
+            Ignored by ``cute-dsl``, ``cute-dsl-rubin`` and ``cute-dsl-prims``.
 
         variant_owns_mask : bool
             If ``True``, the attention variant supplied through ``jit_args`` computes the
@@ -5900,6 +5902,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         o_data_type : Optional[Union[str, torch.dtype]]
             The data type of the output tensor. If None, will be set to :attr:`q_data_type`.
             For FP8 inputs, this should typically be set to torch.float16 or torch.bfloat16.
+            ``cute-dsl-rubin`` defaults to torch.bfloat16 and requires torch.bfloat16
+            when this argument is provided explicitly.
         non_blocking : bool
             Whether to copy the input tensors to the device asynchronously, defaults to ``True``.
         prefix_len_ptr :Optional[torch.Tensor]
@@ -5978,8 +5982,15 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         and keep both indptr buffers unchanged for the graph's lifetime.
         Replanning with the same batch size, lengths, head counts, mask and
         effective softmax scale reuses the existing plan. Changing this
-        configuration requires a new wrapper, even before capture. Equal-head
-        plans retain support for changing ragged lengths.
+        configuration requires a new wrapper, even before capture.
+
+        Equal-head Rubin CUDA-graph plans allow ragged lengths to change within
+        the fixed batch size and initial query capacity, but require the same
+        total KV length on every replan, even before capture. Changing the total
+        KV length requires a new wrapper. Before capture, run an eager warmup
+        with the same device, head count, mask and LSE presence and at least one
+        sequence with positive query and KV lengths. An all-inactive eager run
+        skips kernel compilation and does not warm up the capture configuration.
 
         The :meth:`plan` method cannot be used in Cuda Graph or in ``torch.compile``.
         """
@@ -5988,7 +5999,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             kv_data_type = q_data_type
         kv_data_type = canonicalize_torch_dtype(kv_data_type)
         if o_data_type is None:
-            o_data_type = q_data_type
+            o_data_type = (
+                torch.bfloat16 if self._backend == "cute-dsl-rubin" else q_data_type
+            )
         o_data_type = canonicalize_torch_dtype(o_data_type)
         if head_dim_vo is None:
             head_dim_vo = head_dim_qk
@@ -6114,6 +6127,11 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     sm_scale=sm_scale,
                 )
                 return
+            if int(kv_indptr_host[-1]) != current_plan.total_kv_len:
+                raise ValueError(
+                    "Rubin FMHA CUDA-graph plans require a fixed total KV length; "
+                    "create a new wrapper to change the total KV length."
+                )
         batch_size = len(qo_indptr) - 1
         if len(kv_indptr) != batch_size + 1:
             raise ValueError(
@@ -6910,8 +6928,10 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         q : torch.Tensor
             The query tensor, shape: ``[qo_indptr[-1], num_qo_heads, head_dim_qk]``.
             ``cute-dsl-rubin`` prefill requires contiguous Q/K/V, output
-            and LSE. Tensors may be replaced between ordinary :meth:`run`
-            calls; captured graphs retain the storage used during capture.
+            and LSE. Output and LSE must not overlap Q/K/V or each other;
+            disjoint views of the same allocation are allowed. Tensors may be
+            replaced between ordinary :meth:`run` calls; captured graphs retain
+            the storage used during capture.
         k : torch.Tensor
             The key tensor, shape: ``[kv_indptr[-1], num_kv_heads, head_dim_qk]``
         v : torch.Tensor
@@ -7155,6 +7175,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 v,
                 out,
                 lse=lse if return_lse else None,
+                lse_out=lse_out,
                 enable_pdl=enable_pdl,
                 q_scale=q_scale,
                 k_scale=k_scale,
