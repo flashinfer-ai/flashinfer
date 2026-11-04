@@ -3178,9 +3178,11 @@ def test_round33_rules_plan_like_the_cake_launcher(T):
     # T-exact forward / input-gradient rules add 8 sm_100a and 8 sm_103a keys (test_gb_t_exact_rules_plan_their_programs);
     # their round 2 adds 4 sm_100a and 6 sm_103a keys (the q_b input gradient: test_gb_t_exact_rules_plan_their_programs;
     # the 17408 x 5120 weight gradients: test_gb_t_exact_wgrad_rules_plan_their_programs); their round 3 adds
-    # 2 sm_100a and 2 sm_103a keys (the indexer_q weight gradient: test_gb_t_exact_sks_wgrad_rules_plan_their_programs)
-    assert len(ROW_RULES) == 109 + 79 + 86 + 1 + 6 + 26 + 34 + 16 + 10 + 4
-    assert sum(k[0] == "sm_100a" for k in ROW_RULES) == 51 + 79 + 8 + 4 + 2
+    # 2 sm_100a and 2 sm_103a keys (the indexer_q weight gradient: test_gb_t_exact_sks_wgrad_rules_plan_their_programs);
+    # their round 4 adds 2 sm_100a keys (the 5120 -> 17408 input gradient:
+    # test_gb_t_exact_rules_plan_their_programs)
+    assert len(ROW_RULES) == 109 + 79 + 86 + 1 + 6 + 26 + 34 + 16 + 10 + 4 + 2
+    assert sum(k[0] == "sm_100a" for k in ROW_RULES) == 51 + 79 + 8 + 4 + 2 + 2
     assert sum(k[0] == "sm_107a" for k in ROW_RULES) == 58 + 6 + 26 + 34
     assert sum(k[0] == "sm_103a" for k in ROW_RULES) == 86 + 1 + 8 + 6 + 2
     assert ARCH_RULE_DEFAULTS == {
@@ -6636,7 +6638,8 @@ def test_registry_fallback_decodes_the_nearest_generated_program(monkeypatch):
 # measurement selected).  Generated from the measurement records of the tranche; the rule of each key (or, for a row
 # whose choice is the planner's default, the default) must plan exactly this program.  The (key, T) pairs the GB T-exact
 # rules re-measured (the sm_100a 4096 -> 48 input gradient and 4096 -> 512 forward, the sm_103a 4096 -> 512 and
-# 5120 -> 512 forwards, at T 16231 / 16384) name their T-exact key and its program.
+# 5120 -> 512 forwards, at T 16231 / 16384; round 4: the 5120 -> 17408 input gradient) name their T-exact key and its
+# program.
 # ---------------------------------------------------------------------------
 # fmt: off
 MEASURED_SHAPE_ROWS = (
@@ -6714,8 +6717,8 @@ MEASURED_SHAPE_ROWS = (
     (('sm_100a', False, True, False, False, False, 5120, 1024, None), 16384, 152, 'dense_proj_det_gemm_kn_n256_tma1_w8'),
     (('sm_100a', False, True, False, False, False, 5120, 5120, None), 16231, 152, 'dense_proj_det_gemm_kn_n256_cg_pro15'),
     (('sm_100a', False, True, False, False, False, 5120, 5120, None), 16384, 152, 'dense_proj_det_gemm_kn_n256_cg_pro15'),
-    (('sm_100a', False, True, False, False, False, 5120, 17408, None), 16231, 152, 'dense_proj_det_gemm_kn_n256_m256_ht_or_pro7'),
-    (('sm_100a', False, True, False, False, False, 5120, 17408, None), 16384, 152, 'dense_proj_det_gemm_kn_n256_m256_ht_or_pro7'),
+    (('sm_100a', False, True, False, False, False, 5120, 17408, 16231), 16231, 152, 'dense_proj_det_gemm_kn_n256_m256_ov_ht_tma1_cg_pro7'),
+    (('sm_100a', False, True, False, False, False, 5120, 17408, 16384), 16384, 152, 'dense_proj_det_gemm_kn_n256_m256_ov_ht_tma1_cg_pro7'),
     (('sm_100a', False, True, False, False, False, 8192, 128, None), 16231, 152, 'dense_proj_det_gemm_kn_n256_tma2_pd2_pro15'),
     (('sm_100a', False, True, False, False, False, 8192, 128, None), 16384, 152, 'dense_proj_det_gemm_kn_n256_tma2_pd2_pro15'),
     (('sm_100a', False, True, False, False, False, 12288, 4096, None), 16231, 152, 'dense_proj_det_gemm_kn_n256_cg_pro15'),
@@ -8197,10 +8200,12 @@ def test_eight_warp_form_rules_plan_their_programs(arch, T, monkeypatch):
         ), key
 
 
-# The GB T-exact forward / input-gradient rules: (arch, B MN-major, N, K) -> (the two T of the exact keys, the program).
+# The GB T-exact forward / input-gradient rules: (arch, B MN-major, N, K) -> (the T of the exact keys, the program).
 # Each key applies at its T alone and plans the per-tile K partitions of the row's plan without it (whole K per output
 # tile on both), so every output is bitwise equal to that plan's.  Round 2 adds the q_b 2048 x 16384 input gradient (the
-# ragged rule's overlapped half-tail program with the column-grouped raster).
+# ragged rule's overlapped half-tail program with the column-grouped raster); round 4 adds the 5120 -> 17408 input
+# gradient (the overlapped half-tail program with the column-grouped raster in place of the ragged rule's row-half
+# program), with the bf16 tiles through the one-slot TMA store.
 GB_T_EXACT_ROWS = {
     ("sm_100a", True, 2048, 16384): (
         (16172, 16231),
@@ -8242,6 +8247,10 @@ GB_T_EXACT_ROWS = {
         (16172, 16231),
         "dense_proj_det_gemm_kn_n256_m256_ov_ht_cg_pro7",
     ),
+    ("sm_100a", True, 5120, 17408): (
+        (16231, 16384),
+        "dense_proj_det_gemm_kn_n256_m256_ov_ht_tma1_cg_pro7",
+    ),
 }
 GB_T_EXACT_KEYS = sorted(
     (arch, False, b_mn, False, False, False, N, K, T)
@@ -8267,7 +8276,9 @@ def test_gb_t_exact_rules_plan_their_programs(arch, monkeypatch):
     """The GB T-exact rules (sm_100a: the 4096 -> 48 input gradient with the eight-warp ``w8r`` program, the
     4096 -> 512 forward, the 6144 x 2048 input gradient and the shared_down forward with the half-tail column-grouped
     program; sm_103a: the 4096 -> 512 and 5120 -> 512 forwards and the same 6144 x 2048 rows, restated from sm_100a;
-    round 2 on both: the q_b 2048 x 16384 input gradient with the column-grouped raster at the rule's raster group)
+    round 2 on both: the q_b 2048 x 16384 input gradient with the column-grouped raster at the rule's raster group;
+    round 4 on sm_100a: the 5120 -> 17408 input gradient with the overlapped half-tail program through the one-slot
+    TMA store)
     plan their program at their T on every SM count of the architecture's parts, with whole K per output tile like
     the row's plan without the key; one token more or less plans that plan.  The sm_103a 4096 -> 48 input gradient
     keeps its own ragged rule (an architecture's own rule wins over its parent's T-exact key)."""
