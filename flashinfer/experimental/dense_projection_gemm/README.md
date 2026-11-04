@@ -79,7 +79,9 @@ table (the 212-SM K1 token-range table below), except those token counts; the ro
 `K1_SPLIT_RANGE_OVERRIDES_BY_SM` run that table's program at its token ranges (the same table), and those of
 `K1_SPLIT_EVEN_BLOCK_RANGES_BY_SM` at its token ranges where the token count spans an even number of 64-token K blocks
 (the same table on 212 SMs, `4096 -> 128` FP32 included; on 152-SM `sm_100a` / `sm_103a` parts the 152-SM two-split
-table below).
+table below).  Before all of these, the rows of `K1_CHAIN_RANGES_BY_SM` run the one-split program of several
+accumulation chains at that table's token ranges on parts of exactly its SM count, at both block parities (the K1
+accumulation-chain table below).
 The router verdicts hold only inside token windows (`ROUTER_RULES`; the last table below) and pass a stricter rule:
 measured in one long-lived process and in a fresh process per token count, and no more than 3 % slower than the
 deterministic plan next to such a kernel both in the same launch order and with the router partition launched before
@@ -112,6 +114,7 @@ it.  The measured parts have 148 and 152 SMs (`sm_100a` /
 | `K1_SPLIT_RANGE_OVERRIDES_BY_SM` | `(arch, sm_count)`, then a key of that part's table in `K1_SPLIT_RULES_BY_SM` | `((min_tokens, max_tokens, (block_n, num_splits)), ...)`: on a part of exactly `sm_count` SMs below the row's floor, a token count from `min_tokens` to `max_tokens` runs that program, except the token counts of `K1_SPLIT_RULE_EXCLUDED_TOKENS`; a range lies outside `K1_SPLIT_RULES_BY_SM_TOKENS` and the row's `K1_SPLIT_RULES_BY_SM_TOKEN_RANGES` (`sm_107a`: 212 SMs, the 212-SM K1 token-range table below) |
 | `K1_SPLIT_EVEN_BLOCK_RANGES_BY_SM` | `(arch, sm_count)`, then a key as in `K1_SPLIT_RULES` (below the row's floor: a key of that part's table in `K1_SPLIT_RULES_BY_SM`) | `((min_tokens, max_tokens, (block_n, num_splits)), ...)`: on a part of exactly `sm_count` SMs, below the row's floor or at or above it, a token count from `min_tokens` to `max_tokens` that spans an even number of 64-token K blocks (`ceil(T / 64)` even) runs that program, except the token counts of `K1_SPLIT_RULE_EXCLUDED_TOKENS`; an odd number keeps the routing of the tables above; a range lies outside `K1_SPLIT_RULES_BY_SM_TOKENS` and the row's ranges in `K1_SPLIT_RULES_BY_SM_TOKEN_RANGES` and `K1_SPLIT_RANGE_OVERRIDES_BY_SM` (`sm_107a`: 212 SMs, the two-split rows of the 212-SM K1 token-range table below, `4096 -> 128` FP32 without a verdict in the part's table of `K1_SPLIT_RULES_BY_SM`; `sm_100a` / `sm_103a`: 152 SMs, the 152-SM two-split table below) |
 | `K1_SPLIT_OVERRIDES_BY_SM` | `(arch, sm_count)` | verdicts (keys and values as in `K1_SPLIT_RULES`) that replace a row's `K1_SPLIT_RULES` verdict on parts of exactly `sm_count` SMs at or above the row's floor, at the token counts of `K1_SPLIT_RULES_BY_SM_TOKENS` only, except the token counts of `K1_SPLIT_RULE_EXCLUDED_TOKENS`; every other token count and SM count keeps the `K1_SPLIT_RULES` verdict (no entry) |
+| `K1_CHAIN_RANGES_BY_SM` | `(arch, sm_count)`, then a key of `K1_SPLIT_RULES` | `((min_tokens, max_tokens, (block_n, chains)), ...)`: on a part of exactly `sm_count` SMs, a token count from `min_tokens` to `max_tokens` runs this package's one-split program of that tile width with that many accumulation chains (`k1_chain_plan`; the chain counts this package ships are `K1_CHAINS_CHOICES`), before every table above, `K1_SPLIT_EVEN_BLOCK_RANGES_BY_SM` included (`sm_107a`: 212 and 216 SMs, the K1 accumulation-chain table below) |
 | `ROUTER_RULES` | `(arch, layout, hidden, experts)`: `layout` `"kk"` (forward, `hidden = K`), `"nn_t"` (weight gradient, `hidden` = the launch's `M`) or `"kn"` (input gradient, `hidden` = the launch's `N`), `experts` = the launch's `N` (`K` of the input gradient) | `None` (the deterministic program), token windows `((min_tokens, max_tokens, spec), ...)` (the spec of the window that holds the token count -- `K` of the weight gradient, `M` of the forward and of the input gradient; every other token count: the deterministic program) or a spec alone (every token count: a plan a test or a measurement forces).  A spec is `"waves"`, `"H<f>x<k>"`, `"H<f>x<k>p<h>"`, `"forward"`, `"pairs"`, `"tiles"`, `"S<n>"`, a unit count (this package's stream-K program) or `"simt_n<tile_n>m<tile_m>s<slices>"` (the exact-FP32 SIMT program of the row's layout, `router_simt`; the only spec of an input-gradient row) |
 | `ROUTER_SM_COUNT` | `arch` | the SM count of the router verdicts of the architecture (`sm_100a` / `sm_103a`: 152, `sm_107a`: 216); a device with any other SM count runs the deterministic program, except in a `"waves"` window (the condition of `router_waves`; below a SIMT window too) or with a table of its own in `ROUTER_RULES_BY_SM` |
 | `ROUTER_RULES_BY_SM` | `(arch, sm_count)` | the router verdicts of the parts with exactly `sm_count` SMs (keys and values as in `ROUTER_RULES`; `router_rules` picks the table of a device); such a part takes its own table only: a row without an entry, and every token count outside its windows, runs the deterministic program (`sm_107a`: 208 and 212 SMs) |
@@ -132,8 +135,10 @@ BF16 (192 CTAs) and `4096 -> 4096` FP32 (216 CTAs) miss next to a kernel holding
 (`sm_103a`; `sm_107a` BF16) and `4096 -> 48` on 148-SM `sm_103a` parts are not faster than the deterministic plan in
 every run.  The `sm_107a` one-split rows store whole tiles: they win where the deterministic package's `sm_107a` program
 of the row is slower (the FP32 ones up to 960 tokens only: from 961 tokens up their FP64 error is about twice the
-deterministic program's, the `sm_107a` K1 token table).  Every K1 choice also needs `num_splits * 64 <= T + 63` (shorter
-token counts run the deterministic program); the token counts of the K1 token tables below run the deterministic program
+deterministic program's, the `sm_107a` K1 token table; on 212-SM and 216-SM parts these FP32 rows run three
+accumulation chains at one split at the ranges of the K1 accumulation-chain table).  Every K1 choice also needs
+`num_splits * 64 <= T + 63` (shorter token counts run the deterministic program); the token counts of the K1 token
+tables below run the deterministic program
 (`sm_100a` / `sm_103a`: parts of 152 SMs or more, and parts of exactly 148 SMs; `sm_107a`: 208, 212 and 216 SMs); the
 208-SM and 212-SM choices hold only at 16172 to 16384 tokens (`K1_SPLIT_RULES_BY_SM_TOKENS`), and the 212-SM choices
 of the rows of the 212-SM K1 token-range table also at its ranges.*
@@ -413,6 +418,33 @@ against the first there (1.9 to 4.4 %).  On 212 SMs
 `4096 -> 1024` FP32 keeps the 192-wide program at 512 tokens: the 256-wide program is 15 % faster alone and leaves the
 backward pass 4 to 6 % faster, but the checkpointed step 0.2 to 1.2 % slower in graph replays (median of the paired
 ratios, ratio of the medians).*
+
+| K1 row `d_in -> d_out`, FP32 out | 212 SMs: `(block_n, chains)`, token ranges | 216 SMs: `(block_n, chains)`, token ranges |
+|---|---|---|
+| `4096 -> 512` | (128, 3): 960 to 16172; 32768 to 40961 | (128, 3): 961 to 16172; 32768 to 40961 |
+| `4096 -> 1024` | (192, 3): 960 to 16172; 32768 to 40961 | (192, 3): 961 to 16172; 32768 to 40961 |
+| `5120 -> 512` | (128, 3): 960 to 16172; 32768 to 40961 | (128, 3): 961 to 40961 |
+| `5120 -> 1024` | (256, 3): 960 to 40961 | (256, 3): 961 to 16384; 40961 |
+
+*Table: the K1 accumulation-chain table (`K1_CHAIN_RANGES_BY_SM`): token ranges at which these rows run the one-split
+program of three accumulation chains (templates `dense_proj_gemm_atomic_nn_n128_f32_t_c3`,
+`dense_proj_gemm_atomic_nn_n256_f32_t_c3`, `dense_proj_gemm_atomic_nn_n192_f32_c3`) on parts of exactly that SM count,
+in place of the tables above, the 212-SM two-split ranges included: at the even block counts of those ranges both
+programs were timed at (1024 to 8192 and 32768 to 40960 tokens) three chains ran the weight gradient 7 to 52 % and the
+checkpointed step 2 to 21 % faster than two splits (medians, eager launches and graph replays).  The program cuts each
+tile's K blocks into three contiguous chains, each summed from an `init` MMA in an accumulator of its own, and its
+epilogue adds them once, in order: no workspace and the same bits on every run.  Its FP64 relative Frobenius error was
+0.31 to 0.73 times the deterministic program's on every seed (5 seeds on a 212-SM R200 part at 960, 961, 1024, 2048,
+4096, 8192, 16172, 16231, 16384, 32768 and 40961 tokens, even and odd block counts), where the one-chain program's is
+2.0 to 2.3 times.  The ranges follow the rule and the construction of the 212-SM K1 token-range table (the K1 rule in
+every run, the backward pass and the checkpointed step no more than 1.3 % slower than the deterministic program by the
+ratio of the medians over the runs and the median of the paired ratios, eager launches and graph replays).  212 SMs:
+measured in two jobs on four parts of one node each (one launch layout and row order per part), at 960, 4096, 16172,
+16384, 32768 and 40961 tokens and at 960, 1024, 2048, 4096, 4097, 8192, 16172, 16384, 32768, 32769, 40960 and 40961
+tokens; `4096 -> 1024` left the checkpointed step 1.7 % slower at 16384 tokens in one of them.  216 SMs: measured at
+960, 961, 1024, 2048, 4096, 8192, 16172, 16231, 16384, 32768 and 40961 tokens on one part (two row orders); up to 960
+tokens these rows keep their one-chain program, whose error equals the deterministic program's there.  Token counts
+outside the ranges keep the routing of the tables above.*
 
 `"waves"` (`router_waves`) launches whole waves of the device's CTA pairs (`pairs = sm_count // 2`): `c * pairs`
 units with `c = max(2, round(tiles * k_iters / (68 * pairs))) + 1`, and only where the deterministic plan's six
