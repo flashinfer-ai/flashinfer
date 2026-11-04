@@ -27,8 +27,9 @@ and record scalars of every hidden size on its boards of record
 (``RULES_BOARDS``) and token counts of record (``RULES_T_VALUES``):
 
 * the program set is the deterministic set without its column-slab
-  (``bwd_slab__*``) and final-reduction (``bwd_reduce__*``) records and its
-  token owner's group-row forms, renamed and otherwise equal field for field
+  (``bwd_slab__*``) and final-reduction (``bwd_reduce__*``) records, its
+  token owner's group-row forms and its activation-checkpoint carry (role
+  ``fn_split_carry``), renamed and otherwise equal field for field
   (a per-CTA token owner may select by the ``R`` regimes of its program where
   the deterministic record names that program), plus the programs of this
   package: at hidden 4096 ``cake_mhc_train_fn_split_atomic__tv128_dep`` on
@@ -259,6 +260,10 @@ LPT_FIRES_HIDDEN = (
 # splits, whose libraries the forward does not share, have no copy either).
 DROPPED = (DET_PREFIX + "bwd_slab__", DET_PREFIX + "bwd_reduce__")
 DROPPED_ROLES = ("bwd_slab", "bwd_reduce")
+# The deterministic activation-checkpoint carry, which this package does not copy either (its checkpointed backward
+# keeps its atomic fn split): the role of the dual-layout fn split the carry launches, and the carry's table and rules.
+CARRY_ROLES = ("fn_split_carry",)
+CARRY_RULES = ("FN_SPLIT_CARRY", "fn_split_carry", "carried_modules")
 # The deterministic group-row forms, which this package does not copy either (its column slab folds the token owner's
 # per-CTA partials): the token-owner records whose program ends in GROUP_ROWS (the reduction's "_trows" forms go with
 # the dropped reduction), the per-size table and rule that select them (BWD_ROW_BANDS, bwd_group_rows) and the host-plan
@@ -551,13 +556,15 @@ def test_program_set_is_the_deterministic_set_without_slab_reduce_and_backward_s
     None
 ):
     """``MODULES`` = every deterministic record of every hidden size but ``bwd_slab__*`` / ``bwd_reduce__*``, the
-    backward fn splits and the token owner's group-row forms (``DET_GROUP_ROWS``) under the ``cake_mhc_train_`` prefix
+    backward fn splits, the checkpoint carry's records (``CARRY_ROLES``) and the token owner's group-row forms
+    (``DET_GROUP_ROWS``) under the ``cake_mhc_train_`` prefix
     (the record equal field for field after the rename: arches, hidden size, build knobs, launch, arguments, rules;
     a token-owner record whose deterministic rule names its program through ``bwd_token_program`` may select by the
     ``R`` regimes of that program instead, ``chunk_rows_band``: the same calls on its architectures, which have no
     token-count band, outside the group-row bands) plus the programs of this package (``ATOMIC``); the dropped records
-    are exactly the deterministic column-slab and reduction roles, and the backward fn splits and the group-row token
-    owners are the only other records without a copy (no record of this package names a group-row program)."""
+    are exactly the deterministic column-slab and reduction roles, and the backward fn splits, the carry records and
+    the group-row token owners are the only other records without a copy (no record of this package names a
+    group-row program or has a carry role, and the carry's table and rules, ``CARRY_RULES``, have no copy)."""
     assert tuple(det.HIDDEN_SIZES) == HIDDEN_SIZES
     assert {record["hidden"] for record in DET_MODULES.values()} == set(HIDDEN_SIZES)
     assert DET_MODULES == det.MODULES
@@ -572,12 +579,15 @@ def test_program_set_is_the_deterministic_set_without_slab_reduce_and_backward_s
         name for name in DET_MODULES if _det_role(name) == "fn_split_bwd"
     }
     assert backward_splits and not backward_splits & dropped
+    carries = {name for name in DET_MODULES if _det_role(name) in CARRY_ROLES}
+    assert carries and not carries & dropped
     assert {_det_role(name) for name in DET_GROUP_ROWS} <= {"bwd_token"}
     copied = {
         _renamed(name): name
         for name in DET_MODULES
         if name not in dropped
         and name not in backward_splits
+        and name not in carries
         and name not in DET_GROUP_ROWS
     }
     assert all(name.startswith(ND_PREFIX) for name in copied)
@@ -585,6 +595,11 @@ def test_program_set_is_the_deterministic_set_without_slab_reduce_and_backward_s
     expected = set(copied) | set(ATOMIC)
     assert set(nd.MODULES) == expected, sorted(set(nd.MODULES) ^ expected)
     assert not [name for name in nd.MODULES if GROUP_ROWS in name]
+    assert not [
+        name for name, record in nd.MODULES.items() if record["role"] in CARRY_ROLES
+    ]
+    for name in CARRY_RULES:
+        assert hasattr(det, name) and not hasattr(nd, name), name
     for name, det_name in copied.items():
         record, reference = nd.MODULES[name], _renamed(det.MODULES[det_name])
         rule = reference["select_rule"]
@@ -925,6 +940,46 @@ def test_selection_is_the_deterministic_selection_but_bwd_finish(
                     ], (what, shipped)
                 else:
                     assert shipped == per_cta, (what, shipped)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("arch", "sm"), (*det.RULES_BOARDS, ("sm_100a", 152), ("sm_103a", 148))
+)
+def test_x_hint_band_edges_follow_the_deterministic_rule(arch: str, sm: int) -> None:
+    """On both sides of every edge of the deterministic ``FWD_MAP_XNRM`` bands (the token counts where the mapping
+    pass runs its program's ``_xn`` form, whose X loads carry the L2 hint EVICT_NORMAL: at hidden 4096 on sm_100a /
+    sm_103a, none on sm_107a or at 5120 / 7168), on the boards of record, GB200 (sm_100a with 152 SMs) and B300
+    (sm_103a with 148 SMs), at every hidden size of the architecture: ``fwd_map_program`` is the deterministic
+    program, an ``_xn`` form exactly inside a band of the size, and ``fwd_prepare`` / ``fwd_recompute`` select the
+    renamed deterministic records, whose mapping-pass record runs an ``_xn`` library exactly there."""
+    assert nd.FWD_MAP_XNRM == det.FWD_MAP_XNRM
+    edges = {
+        t
+        for hidden in HIDDEN_SIZES
+        for bands in det._tab("FWD_MAP_XNRM", hidden).values()
+        for above, at_most in bands
+        for t in (above, above + 1, at_most, at_most + 1)
+    }
+    assert edges
+    for hidden in _arch_sizes(arch):
+        bands = det._tab("FWD_MAP_XNRM", hidden)[arch]
+        for T in sorted(t for t in edges if t > 0):
+            what = (arch, sm, hidden, T)
+            inside = any(above < T <= at_most for above, at_most in bands)
+            program = nd.fwd_map_program(T, sm, arch, hidden)
+            assert program == det.fwd_map_program(T, sm, arch, hidden), what
+            assert program.endswith("_xn") == inside, (what, program)
+            for kind in ("fwd_prepare", "fwd_recompute"):
+                names = nd.selected_modules(arch, hidden, kind, rows=T, sm_count=sm)
+                det_names = det.selected_modules(
+                    arch, hidden, kind, rows=T, sm_count=sm
+                )
+                assert names == tuple(_renamed(n) for n in det_names), (what, kind)
+                maps = [n for n in names if nd.MODULES[n]["role"] == "fwd_map"]
+                assert maps and all(
+                    nd.MODULES[n]["library"].endswith("_xn") == inside for n in maps
+                ), (what, kind, maps)
 
 
 def _possible_programs(arch: str, hidden: int) -> set[str]:
@@ -1554,7 +1609,7 @@ _SHARED_TABLES = (
     "GSTATS_COLS", "TOKP_COLS", "DZP_COLS", "PARAM_COLS", "TICKET_WORDS", "STATS_LAYOUT", "GSTATS_LAYOUT",
     "TOKP_LAYOUT", "PARAM_LAYOUT", "RULES_SM_COUNTS", "RULES_BOARDS", "RULES_T_VALUES", "PK_BANDS",
     "FN_SPLIT_PROGRAM", "FN_SPLIT_GRID", "FWD_MAP_PRODUCTION", "FWD_MAP_BANDS", "FWD_MAP_FIT", "FWD_MAP_CLAIM",
-    "FWD_COEF_REGIMES", "BWD_TOKEN_PROGRAM", "BWD_TOKEN_REGIMES", "BWD_TOKEN_BANDS", "K5_GRID_BANDS",
+    "FWD_MAP_XNRM", "FWD_COEF_REGIMES", "BWD_TOKEN_PROGRAM", "BWD_TOKEN_REGIMES", "BWD_TOKEN_BANDS", "K5_GRID_BANDS",
     "K5_FORM_BANDS", "K5_FORM_ROWS", "FWD_FINISH_PROGRAM", "FWD_FINISH_ROWS", "FWD_FINISH_COL_SPLIT", "K3_TILING",
     "K6_CTAS_PER_SM", "PDL_PATHS", "SELECT_RULE_KINDS", "RUN_TIME_ITERS_ROLES",
 )  # fmt: skip
@@ -2735,8 +2790,9 @@ def test_route_glue_and_supported_hidden_sizes() -> None:
 @pytest.mark.cpu_only
 def test_library_names_and_record_scalars() -> None:
     """``library_name`` is ``<library>_<arch>`` on the record's architectures and a ``RuntimeError`` elsewhere;
-    ``RECORD_SCALARS`` is the deterministic table of every hidden size renamed without the backward fn splits (the
-    forward fn split of each size ``want_t = 0``; the atomic fn splits take no ``want_t``)."""
+    ``RECORD_SCALARS`` is the deterministic table of every hidden size renamed without the backward fn splits and the
+    checkpoint carry's records, ``CARRY_ROLES`` (the forward fn split of each size ``want_t = 0``; the atomic fn
+    splits take no ``want_t``)."""
     for name, record in nd.MODULES.items():
         for arch in det.ARCHES:
             if arch in record["arches"]:
@@ -2747,7 +2803,7 @@ def test_library_names_and_record_scalars() -> None:
     assert {
         _renamed(name): scalars
         for name, scalars in DET_RECORD_SCALARS.items()
-        if _det_role(name) != "fn_split_bwd"
+        if _det_role(name) not in ("fn_split_bwd", *CARRY_ROLES)
     } == nd.RECORD_SCALARS
     assert {
         ND_PREFIX + "fn_split" + _suffix(hidden): {"want_t": 0}
