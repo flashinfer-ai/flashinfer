@@ -5,6 +5,10 @@
 :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError` for everything the class does not cover (nothing falls back), and the
 engine (``engine.plan_attention`` / ``engine.run_attention``) runs the kernels. One class per head dim: a token's output bits depend on
 its KV position, its head and the window alone, so the three wrappers compute the same bits for the same token.
+
+CUDA graphs: capture ``run()`` after ``plan()``; a replay reproduces the planned batch (the descriptor table and the launch grid are
+the plan's), and a new ``plan()`` needs a new capture. The wrappers' ``use_cuda_graph=True`` contract (``plan()`` refreshes the
+metadata a captured graph reads) is not offered: there is no device-side planner, so it raises.
 """
 
 from __future__ import annotations
@@ -16,7 +20,7 @@ import torch
 
 from ...batch_invariant.support import check_device, unsupported
 from . import engine
-from .spec import HEAD_DIMS
+from .spec import HEAD_DIMS, scale_log2
 
 CLASS = "attention.bf16"
 #: The compute capabilities the class is stated and tested for: SM100 (B200), SM103 (B300), SM107 (Rubin).
@@ -41,8 +45,15 @@ class BatchInvariantAttention:
         kind: str,
         backend: str,
         jit_args,
+        use_cuda_graph: bool = False,
     ) -> None:
         assert kind in ("decode", "prefill", "ragged"), kind
+        if use_cuda_graph:
+            raise unsupported(
+                CLASS,
+                "use_cuda_graph=True with batch_invariant=True",
+                "capturing run() after plan(): a replay reproduces the planned batch, a new plan() needs a new capture",
+            )
         if backend != "auto":
             raise unsupported(
                 CLASS,
@@ -58,16 +69,11 @@ class BatchInvariantAttention:
         if kv_layout not in ("NHD", "HND"):
             raise unsupported(CLASS, f"kv_layout {kv_layout!r}", '"NHD" or "HND"')
         check_device(float_workspace_buffer.device, CLASS, ATTENTION_ARCHS)
-        if float_workspace_buffer.data_ptr() % 16:
-            raise unsupported(
-                CLASS,
-                "a float workspace buffer that is not 16-byte aligned",
-                "a 16-byte-aligned workspace",
-            )
         self.kind = kind
         self.kv_layout = kv_layout
         self.device = float_workspace_buffer.device
         self.workspace = float_workspace_buffer
+        self.reset_workspace(float_workspace_buffer)
         self._planned: Optional[engine._Planned] = None
         self._config: Optional[engine.AttnConfig] = None
         self._kv_indptr: Optional[torch.Tensor] = None
@@ -77,6 +83,23 @@ class BatchInvariantAttention:
         self._total_q = 0
         self._heads: Tuple[int, int, int] = (0, 0, 0)
         self._page = 1
+
+    def reset_workspace(self, float_workspace_buffer: torch.Tensor) -> None:
+        """The wrappers' ``reset_workspace_buffer``: the next ``plan()`` sizes its split-KV partials in this buffer (the current plan
+        keeps the buffer it was built in)."""
+        if float_workspace_buffer.device != self.device:
+            raise unsupported(
+                CLASS,
+                f"a float workspace buffer on {float_workspace_buffer.device}",
+                f"a workspace on the wrapper's device {self.device}",
+            )
+        if float_workspace_buffer.data_ptr() % 16:
+            raise unsupported(
+                CLASS,
+                "a float workspace buffer that is not 16-byte aligned",
+                "a 16-byte-aligned workspace",
+            )
+        self.workspace = float_workspace_buffer
 
     # ------------------------------------------------------------------ plan
     def plan(
@@ -120,11 +143,15 @@ class BatchInvariantAttention:
                 f"head_dim_vo {head_dim_vo} with head_dim_qk {D}",
                 "equal query and value head dims",
             )
-        if num_kv_heads <= 0 or num_qo_heads % num_kv_heads:
+        if (
+            num_kv_heads <= 0
+            or num_qo_heads < num_kv_heads
+            or num_qo_heads % num_kv_heads
+        ):
             raise unsupported(
                 CLASS,
                 f"{num_qo_heads} query heads over {num_kv_heads} KV heads",
-                "num_qo_heads a multiple of num_kv_heads",
+                "num_qo_heads a positive multiple of num_kv_heads",
             )
         g = num_qo_heads // num_kv_heads
         if g > 128:
@@ -192,8 +219,19 @@ class BatchInvariantAttention:
                 f"window_left {window_left}",
                 "window_left >= 0, or -1 for no window",
             )
-        if sm_scale is not None and not (float(sm_scale) > 0.0):
-            raise unsupported(CLASS, f"sm_scale {sm_scale}", "a positive sm_scale")
+        if sm_scale is not None:
+            ok = math.isfinite(float(sm_scale)) and float(sm_scale) > 0.0
+            if ok:
+                try:
+                    scale_log2(float(sm_scale))
+                except OverflowError:
+                    ok = False
+            if not ok:
+                raise unsupported(
+                    CLASS,
+                    f"sm_scale {sm_scale}",
+                    "a positive finite sm_scale whose log2 scale is a binary32 number",
+                )
         if self.kind == "decode":
             if q_len_per_req < 1:
                 raise unsupported(
@@ -203,7 +241,7 @@ class BatchInvariantAttention:
                 )
             batch = int(kv_indptr.numel()) - 1
             qo_indptr = torch.arange(
-                0, batch + 1, dtype=torch.int32, device=kv_indptr.device
+                0, batch + 1, dtype=torch.int32, device=self.device
             ) * int(q_len_per_req)
         else:
             if qo_indptr is None:
@@ -218,10 +256,9 @@ class BatchInvariantAttention:
                 f"{qo_host.numel() - 1} query requests over {kv_indptr_host.numel() - 1} KV requests",
                 "one KV range per request",
             )
+        kv_spans = kv_indptr_host[1:] - kv_indptr_host[:-1]  # tokens (ragged) or pages
         if self.kind == "ragged":
-            last_host = torch.ones(
-                max(0, kv_indptr_host.numel() - 1), dtype=torch.int64
-            )
+            kv_lens = kv_spans.tolist()
         else:
             if kv_last_page_len is None or kv_indices is None:
                 raise unsupported(
@@ -230,12 +267,30 @@ class BatchInvariantAttention:
                     "the paged KV CSR triple",
                 )
             last_host = kv_last_page_len.to("cpu", non_blocking=False).to(torch.int64)
-        kv_lens = (
-            torch.clamp(kv_indptr_host[1:] - kv_indptr_host[:-1] - 1, min=0) * page_size
-            + last_host
-        ).tolist()
+            if last_host.numel() != kv_spans.numel():
+                raise unsupported(
+                    CLASS,
+                    f"kv_last_page_len of {last_host.numel()} entries for {kv_spans.numel()} requests",
+                    "one last-page length per request",
+                )
+            if bool(((last_host < 0) | (last_host > page_size)).any()):
+                raise unsupported(
+                    CLASS,
+                    "a kv_last_page_len outside 0..page_size",
+                    f"last-page lengths in 0..{page_size}",
+                )
+            # a request without pages has no keys, whatever its last-page entry (the planner's rule)
+            kv_lens = torch.where(
+                kv_spans > 0, (kv_spans - 1) * page_size + last_host, 0
+            ).tolist()
         q_lens = (qo_host[1:] - qo_host[:-1]).tolist()
         for i, (ql, kl) in enumerate(zip(q_lens, kv_lens, strict=True)):
+            if ql < 0 or kl < 0:
+                raise unsupported(
+                    CLASS,
+                    f"request {i} with a decreasing qo_indptr / kv_indptr",
+                    "non-decreasing offsets",
+                )
             if ql > kl:
                 raise unsupported(
                     CLASS,
@@ -250,7 +305,7 @@ class BatchInvariantAttention:
 
             # the paired placement (two Q tiles per CTA, one per softmax warpgroup): same bits, faster prefill. Its two Q tiles and the
             # smem O_m leave room for a 4-slot K / V ring on 328 KB parts (SM107) and a 3-slot ring on 228 KB parts (SM100 / SM103)
-            slots = 4 if arch_smem_cap() >= (300 << 10) else 3
+            slots = 4 if arch_smem_cap(self.device) >= (300 << 10) else 3
             config = replace(config, softmax_wgs=2, q2=True, kv_slots=slots)
         last = kv_last_page_len if self.kind != "ragged" else None
         try:
@@ -297,9 +352,14 @@ class BatchInvariantAttention:
                 ) from None
         self._planned = planned
         self._config = config
-        self._kv_indptr = kv_indptr.contiguous()
+        # the kernels read the page table on the device as int32 (CPU metadata, as the other wrappers accept, is staged here)
+        self._kv_indptr = kv_indptr.to(
+            device=self.device, dtype=torch.int32, non_blocking=non_blocking
+        ).contiguous()
         self._kv_indices = (
-            kv_indices.contiguous()
+            kv_indices.to(
+                device=self.device, dtype=torch.int32, non_blocking=non_blocking
+            ).contiguous()
             if kv_indices is not None
             else torch.zeros(1, dtype=torch.int32, device=self.device)
         )
@@ -325,9 +385,17 @@ class BatchInvariantAttention:
         kv_cache_sf=None,
         skip_softmax_threshold_scale_factor=None,
         enable_pdl: Optional[bool] = None,
+        use_fp16_softmax: Optional[bool] = None,
+        uses_spcompress: Optional[bool] = None,
     ) -> torch.Tensor:
         if self._planned is None:
             raise RuntimeError("plan() must be called before run()")
+        if use_fp16_softmax or uses_spcompress:
+            raise unsupported(
+                CLASS,
+                "use_fp16_softmax / uses_spcompress",
+                "the fp32 softmax of the class",
+            )
         if return_lse or lse is not None:
             raise unsupported(
                 CLASS,
@@ -371,6 +439,37 @@ class BatchInvariantAttention:
             raise unsupported(
                 CLASS, f"dtypes ({q.dtype}, {k.dtype}, {v.dtype})", "bf16 q, k and v"
             )
+        if (
+            q.device != self.device
+            or k.device != self.device
+            or v.device != self.device
+        ):
+            raise unsupported(
+                CLASS,
+                f"q / k / v on ({q.device}, {k.device}, {v.device})",
+                f"tensors on the wrapper's device {self.device}",
+            )
+        # the planned page size and head count are what the descriptor table and the KV lengths were built for: a cache of
+        # another geometry would be read as live keys with no error from the kernel
+        nhd = self.kv_layout == "NHD"
+        for name, t in (("k", k), ("v", v)):
+            if self.kind == "ragged":
+                ok = t.dim() == 3 and (
+                    tuple(t.shape[1:]) == (Hkv, D)
+                    if nhd
+                    else (t.shape[0] == Hkv and t.shape[2] == D)
+                )
+                want = f"(total_kv, {Hkv}, {D})" if nhd else f"({Hkv}, total_kv, {D})"
+            else:
+                inner = (self._page, Hkv, D) if nhd else (Hkv, self._page, D)
+                ok = t.dim() == 4 and tuple(t.shape[1:]) == inner
+                want = f"(num_pages, {', '.join(map(str, inner))})"
+            if not ok:
+                raise unsupported(
+                    CLASS,
+                    f"{name} of shape {tuple(t.shape)} at run()",
+                    f"the planned {self.kv_layout} geometry {want}",
+                )
         if not q.is_contiguous():
             q = q.contiguous()
         if out is None:

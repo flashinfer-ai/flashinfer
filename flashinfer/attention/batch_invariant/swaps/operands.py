@@ -131,18 +131,18 @@ def shared_storage_struct(
     return cute.struct(type("SharedStorage", (), {"__annotations__": fields}))
 
 
-def arch_smem_cap() -> int:
-    """The dynamic shared memory one CTA may allocate on the compile target of the current device: the DSL's per-architecture table
-    (328 KB on sm_107, 228 KB on sm_100 / sm_103; the CUDA device attribute under-reports sm_107), ``SMEM_CAP`` when the target is
-    not in the table."""
+def arch_smem_cap(device=None) -> int:
+    """The dynamic shared memory one CTA may allocate on the compile target of ``device`` (default: the current device): the DSL's
+    per-architecture table (328 KB on sm_107, 228 KB on sm_100 / sm_103; the CUDA device attribute under-reports sm_107),
+    ``SMEM_CAP`` when the target is not in the table."""
     import torch
 
     from ....cute_dsl.availability import cute_dsl_compile_arch
     from ....utils import get_compute_capability
 
-    major, minor = get_compute_capability(
-        torch.device("cuda", torch.cuda.current_device())
-    )
+    if device is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    major, minor = get_compute_capability(torch.device(device))
     arch = cute_dsl_compile_arch(int(major), int(minor))  # "sm_107a", "sm_100f", ...
     key = "sm_" + arch[3:].rstrip("af")
     try:

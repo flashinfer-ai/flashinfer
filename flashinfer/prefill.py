@@ -2835,6 +2835,47 @@ def _blackwell_ragged_auto_upgrade(
     return None
 
 
+def _check_batch_invariant_plan_args(
+    prefix_len_ptr,
+    token_pos_in_items_ptr,
+    token_pos_in_items_len,
+    max_item_len_ptr,
+    seq_lens,
+    seq_lens_q,
+    **offsets,
+) -> None:
+    """The prefill ``plan()`` arguments the batch-invariant class does not take: refused with the class's typed error before the
+    delegate plans (the class derives every length from ``qo_indptr`` and the KV indptr, and masks causally)."""
+    from .batch_invariant.support import unsupported
+
+    if (
+        prefix_len_ptr is not None
+        or token_pos_in_items_ptr is not None
+        or max_item_len_ptr is not None
+        or token_pos_in_items_len
+    ):
+        raise unsupported(
+            "attention.bf16",
+            "multi-item scoring (prefix_len_ptr / token_pos_in_items_ptr / max_item_len_ptr)",
+            "the causal mask with an optional sliding window",
+        )
+    if seq_lens is not None or seq_lens_q is not None:
+        raise unsupported(
+            "attention.bf16",
+            "seq_lens / seq_lens_q",
+            "the lengths of qo_indptr and the KV indptr",
+        )
+    for name, value in offsets.items():
+        if value is not None:
+            raise unsupported(
+                "attention.bf16",
+                name,
+                "the paged KV CSR triple"
+                if name == "block_tables"
+                else "the offsets of qo_indptr / kv_indptr",
+            )
+
+
 class BatchPrefillWithPagedKVCacheWrapper:
     r"""Wrapper class for prefill/append attention with a paged KV cache for a batch of
     requests.
@@ -3079,7 +3120,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
             from .attention.batch_invariant.wrappers import BatchInvariantAttention
 
             self._batch_invariant = BatchInvariantAttention(
-                float_workspace_buffer, kv_layout, "prefill", backend, jit_args
+                float_workspace_buffer,
+                kv_layout,
+                "prefill",
+                backend,
+                jit_args,
+                use_cuda_graph=use_cuda_graph,
             )
 
         self._cute_dsl_wrapper = None
@@ -3239,6 +3285,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
             float_workspace_buffer, "float_workspace_buffer"
         )
         _check_workspace_buffer_alignment(int_workspace_buffer, "int_workspace_buffer")
+        if self._batch_invariant is not None:
+            self._batch_invariant.reset_workspace(float_workspace_buffer)
         self._float_workspace_buffer = float_workspace_buffer
         self._cudnn_prepared = None
         self._cudnn_prepared_cache.clear()
@@ -3811,6 +3859,15 @@ class BatchPrefillWithPagedKVCacheWrapper:
             o_data_type = q_data_type
         o_data_type = canonicalize_torch_dtype(o_data_type)
         if self._batch_invariant is not None:
+            _check_batch_invariant_plan_args(
+                prefix_len_ptr,
+                token_pos_in_items_ptr,
+                token_pos_in_items_len,
+                max_item_len_ptr,
+                seq_lens,
+                seq_lens_q,
+                block_tables=block_tables,
+            )
             self._batch_invariant.plan(
                 qo_indptr=qo_indptr,
                 kv_indptr=paged_kv_indptr,
@@ -4869,6 +4926,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         if enable_pdl is None:
             enable_pdl = device_support_pdl(q.device)
         k_cache, v_cache = _unpack_paged_kv_cache(paged_kv_cache, self._kv_layout)
+        check_lse_base(lse_base)
+        check_lse_layout(lse_layout)
         if self._batch_invariant is not None:
             return self._batch_invariant.run(
                 q,
@@ -4883,9 +4942,9 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 kv_cache_sf=kv_cache_sf,
                 skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
                 enable_pdl=enable_pdl,
+                use_fp16_softmax=use_fp16_softmax,
+                uses_spcompress=uses_spcompress,
             )
-        check_lse_base(lse_base)
-        check_lse_layout(lse_layout)
         _check_cached_qkv_data_type(
             q, k_cache, self._cached_q_data_type, self._cached_kv_data_type
         )
@@ -5739,7 +5798,12 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             from .attention.batch_invariant.wrappers import BatchInvariantAttention
 
             self._batch_invariant = BatchInvariantAttention(
-                float_workspace_buffer, kv_layout, "ragged", backend, jit_args
+                float_workspace_buffer,
+                kv_layout,
+                "ragged",
+                backend,
+                jit_args,
+                use_cuda_graph=use_cuda_graph,
             )
 
         self._cute_dsl_wrapper = None
@@ -5857,6 +5921,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             The new int workspace buffer, the device of the new int workspace buffer should
             be the same as the device of the input tensors.
         """
+        if self._batch_invariant is not None:
+            self._batch_invariant.reset_workspace(float_workspace_buffer)
         self._float_workspace_buffer = float_workspace_buffer
         self._cudnn_prepared = None
         self._cudnn_prepared_cache.clear()
@@ -6096,6 +6162,16 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             )
         o_data_type = canonicalize_torch_dtype(o_data_type)
         if self._batch_invariant is not None:
+            _check_batch_invariant_plan_args(
+                prefix_len_ptr,
+                token_pos_in_items_ptr,
+                token_pos_in_items_len,
+                max_item_len_ptr,
+                seq_lens,
+                seq_lens_q,
+                v_indptr=v_indptr,
+                o_indptr=o_indptr,
+            )
             self._batch_invariant.plan(
                 qo_indptr=qo_indptr,
                 kv_indptr=kv_indptr,
@@ -7141,6 +7217,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         """
         if enable_pdl is None:
             enable_pdl = device_support_pdl(q.device)
+        check_lse_base(lse_base)
+        check_lse_layout(lse_layout)
         if self._batch_invariant is not None:
             return self._batch_invariant.run(
                 q,
@@ -7156,8 +7234,6 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 skip_softmax_threshold_scale_factor=None,
                 enable_pdl=enable_pdl,
             )
-        check_lse_base(lse_base)
-        check_lse_layout(lse_layout)
         _check_cached_qkv_data_type(
             q, k, self._cached_q_data_type, self._cached_kv_data_type
         )

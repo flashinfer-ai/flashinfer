@@ -64,6 +64,17 @@ ATTN_CASES = [
     ("a5", 128, 16, 32, 33, 5, 1, 2),
     ("a6", 256, 16, 32, 40, -1, 0, 0),
     ("a7", 256, 16, 32, 33, 5, 1, 2),
+    (
+        "a8",
+        64,
+        16,
+        32,
+        100,
+        0,
+        0,
+        0,
+    ),  # the window starts past the first chunks: chunks 0-2 absent, key 100 alone visible
+    ("a9", 64, 32, 64, 40, -1, 0, 0),  # two PV slices per tile (T = 2 x MMA_K)
 ]
 ATTN_HEAD_DIMS = (64, 128, 256)
 

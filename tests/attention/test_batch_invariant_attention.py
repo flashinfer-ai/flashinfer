@@ -631,27 +631,44 @@ def test_sm_count_and_grid_do_not_change_bits():
 
 
 @needs_device
-def test_config_agreement():
+@pytest.mark.parametrize("D", [64, 128, 256])
+def test_config_agreement(D):
     """R3: every member of the configuration space (ring depth, unit kind, softmax warpgroups, fold placement, small-unit body)
-    gives the same bits."""
-    from flashinfer.attention.batch_invariant import engine
+    gives the same bits as the wrapper's pick; at D = 64 the paired placement too (two Q tiles per CTA), on a batch large enough
+    to be paired. The whole space at D = 128 / 256 (108 / 36 points); every 7th point of the 252 at D = 64 (each distinct kernel
+    is a compile)."""
+    from dataclasses import replace
 
-    pr = Problem([256, 1, 1000, 1], [3000, 2500, 1000, 5000], 32, 8, 128, 16, seed=8)
+    from flashinfer.attention.batch_invariant import engine
+    from flashinfer.attention.batch_invariant.swaps.operands import arch_smem_cap
+
+    if D == 64:
+        pr = Problem([2048, 2048, 1], [4096, 3000, 1000], 32, 8, D, 16, seed=8)
+    else:
+        pr = Problem([256, 1, 1000, 1], [3000, 2500, 1000, 5000], 32, 8, D, 16, seed=8)
     ref = bits(run_paged_prefill(pr))
-    for cfg in engine.all_valid_configs(128)[::7]:
+    space = engine.all_valid_configs(D)
+    cfgs = list(space[::7] if D == 64 else space)
+    if D == 64:
+        two = replace(engine.default_config(D=D), softmax_wgs=2, q2=True)
+        rings = (2, 3) + ((4,) if arch_smem_cap(pr.device) >= (300 << 10) else ())
+        cfgs += [replace(two, kv_slots=s) for s in rings]
+    for cfg in cfgs:
         planned = engine.plan_attention(
             pr.qo_indptr,
             pr.kv_indptr,
             pr.kv_last,
             32,
             8,
-            128,
+            D,
             16,
             -1,
             cfg,
             None,
             pr.device,
         )
+        if cfg.q2:
+            assert planned.plan.num_launch is not None, (cfg, planned.plan.num_units)
         out = engine.run_attention(
             planned,
             pr.q,
@@ -659,7 +676,7 @@ def test_config_agreement():
             pr.v_nhd,
             pr.kv_indptr,
             pr.kv_indices,
-            1.0 / math.sqrt(128),
+            1.0 / math.sqrt(D),
             -1,
             "NHD",
             None,
@@ -768,13 +785,113 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
     with pytest.raises(bi.BatchInvariantUnsupportedError):
         w.run(pr.q, pr.cache("NHD"), k_scale=2.0)
     with pytest.raises(bi.BatchInvariantUnsupportedError):
+        w.run(pr.q, pr.cache("NHD"), use_fp16_softmax=True)
+    k, v = pr.cache("NHD")
+    with pytest.raises(
+        bi.BatchInvariantUnsupportedError
+    ):  # a cache of another page size than the planned 16
+        w.run(pr.q, (k[:, :8], v[:, :8]))
+    with pytest.raises(bi.BatchInvariantUnsupportedError):
         flashinfer.BatchPrefillWithPagedKVCacheWrapper(
             ws, "NHD", backend="cute-dsl", batch_invariant=True
         )
+    with pytest.raises(bi.BatchInvariantUnsupportedError):
+        flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+            ws, "NHD", use_cuda_graph=True, batch_invariant=True
+        )
+    # plan() arguments outside the class: typed errors before any plan
+    for bad in (
+        dict(num_qo_heads=0, num_kv_heads=8),
+        dict(sm_scale=float("inf")),
+        dict(sm_scale=3e38),
+        dict(seq_lens=torch.tensor([700], dtype=torch.int32, device=pr.device)),
+        dict(prefix_len_ptr=torch.zeros(1, dtype=torch.int32, device=pr.device)),
+    ):
+        args = dict(num_qo_heads=32, num_kv_heads=8, causal=True, **kw)
+        args.update(bad)
+        with pytest.raises(bi.BatchInvariantUnsupportedError):
+            w.plan(
+                pr.qo_indptr,
+                pr.kv_indptr,
+                pr.kv_indices,
+                pr.kv_last,
+                head_dim_qk=128,
+                page_size=16,
+                **args,
+            )
+    rag = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+        ws, "NHD", batch_invariant=True
+    )
+    with pytest.raises(
+        bi.BatchInvariantUnsupportedError
+    ):  # a request with a query token and no keys
+        rag.plan(
+            torch.tensor([0, 1], dtype=torch.int32, device=pr.device),
+            torch.tensor([0, 0], dtype=torch.int32, device=pr.device),
+            32,
+            8,
+            128,
+            causal=True,
+            **kw,
+        )
+    with pytest.raises(bi.BatchInvariantUnsupportedError):
+        rag.plan(
+            pr.qo_indptr,
+            pr.kv_indptr_rag,
+            32,
+            8,
+            128,
+            causal=True,
+            v_indptr=pr.kv_indptr_rag,
+            **kw,
+        )
+    dec = flashinfer.BatchDecodeWithPagedKVCacheWrapper(ws, "NHD", batch_invariant=True)
+    with pytest.raises(bi.BatchInvariantUnsupportedError):
+        dec.plan(
+            pr.kv_indptr,
+            pr.kv_indices,
+            pr.kv_last,
+            32,
+            8,
+            128,
+            16,
+            q_len_per_req=2,
+            is_causal=False,
+            **kw,
+        )
+    # page-table metadata on the CPU is staged to the device (as the other wrappers accept)
+    ref = bits(run_paged_prefill(pr))
+    w.plan(
+        pr.qo_indptr.cpu(),
+        pr.kv_indptr.cpu(),
+        pr.kv_indices.cpu(),
+        pr.kv_last.cpu(),
+        32,
+        8,
+        128,
+        16,
+        causal=True,
+        **kw,
+    )
+    assert torch.equal(bits(w.run(pr.q, pr.cache("NHD"))), ref)
     # a workspace too small for the split-KV partials plans fused units instead (every chunk of a request in one CTA): the same bits
-    # as the split plan of a large workspace (R3), and no partials at all
+    # as the split plan of a large workspace (R3), and no partials at all; reset_workspace_buffer reaches the delegate, so the next
+    # plan() in a large buffer splits again
     tiny = torch.empty(4096, dtype=torch.uint8, device=pr.device)
     big = Problem([1] * 4, [32768] * 4, 32, 8, 128, 16, seed=11)
     out_big, _ = run_decode(big)
     out_tiny, _ = run_decode(big, ws=tiny)
     assert torch.equal(bits(out_big), bits(out_tiny))
+    dec = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        tiny, "NHD", batch_invariant=True
+    )
+    plan_kw = dict(q_data_type=torch.bfloat16, kv_data_type=torch.bfloat16)
+    dec.plan(big.kv_indptr, big.kv_indices, big.kv_last, 32, 8, 128, 16, **plan_kw)
+    assert dec._batch_invariant._config.split_policy == "fused"
+    dec.reset_workspace_buffer(
+        ws, torch.empty(8 << 20, dtype=torch.uint8, device=pr.device)
+    )
+    dec.plan(big.kv_indptr, big.kv_indices, big.kv_last, 32, 8, 128, 16, **plan_kw)
+    assert dec._batch_invariant._config.split_policy == "auto"
+    q_last = big.q[[int(big.qo_indptr[i + 1]) - 1 for i in range(4)]].contiguous()
+    assert torch.equal(bits(dec.run(q_last, big.cache("NHD"))), bits(out_big))

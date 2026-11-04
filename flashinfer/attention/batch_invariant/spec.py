@@ -39,6 +39,7 @@ from ...batch_invariant.fp_interface.term import Term, TermAlgebra
 
 TILE_KEYS = 128  # T: keys per KV tile (the N extent of one QK^T MMA tile)
 MMA_K = 16  # bf16 K extent of one tcgen05.mma step (shared with the GEMM)
+FLT_MAX = 3.4028234663852886e38  # the largest binary32 number
 MMA_OP = _GEMM_MMA_OP  # "mma_bf16_k16": the same opaque instruction family as the GEMM
 HEAD_DIMS = (
     64,
@@ -83,8 +84,14 @@ def d_steps(D: int) -> int:
 
 def scale_log2(sm_scale: float) -> float:
     """``c = fp32(sm_scale * log2(e))``: formed on the host in double precision and rounded ONCE to
-    binary32; the kernel and the CPU model receive exactly this value (and ``-c``)."""
-    return to_f32(float(sm_scale) * (1.0 / math.log(2.0)))
+    binary32; the kernel and the CPU model receive exactly this value (and ``-c``). ``OverflowError`` when the product is not a
+    binary32 number (``struct.pack`` returns ``inf`` for it on some CPython versions and raises on others)."""
+    c = float(sm_scale) * (1.0 / math.log(2.0))
+    if not abs(c) <= FLT_MAX:
+        raise OverflowError(
+            f"sm_scale {sm_scale}: sm_scale * log2(e) is outside the binary32 range"
+        )
+    return to_f32(c)
 
 
 # ----------------------------------------------------------------------------- the row and its tiles
@@ -92,11 +99,10 @@ def scale_log2(sm_scale: float) -> float:
 
 @dataclass(frozen=True)
 class RowSpec:
-    """One logical row: query position ``p`` (0-based, absolute in the KV sequence), head ``h``, and
-    its visible keys ``[lo, L)`` with ``L = p + 1`` (causal) and ``lo = max(0, p - window_left)``."""
+    """One logical row: query position ``p`` (0-based, absolute in the KV sequence) and its visible keys ``[lo, L)`` with
+    ``L = p + 1`` (causal) and ``lo = max(0, p - window_left)``; ``row`` names the row (query token and head) in the leaf terms."""
 
     p: int
-    h: int = 0
     window_left: int = -1
     row: int = 0  # the row's identity in the leaf terms (query token / head index)
 

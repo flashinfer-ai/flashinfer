@@ -51,6 +51,22 @@ def check_supported(D: int, Hq: int, Hkv: int, page: int) -> None:
         raise ValueError(f"page_size {page}: supported page sizes are {PAGE_SIZES}")
 
 
+def check_sm_scale(sm_scale: float) -> float:
+    """``scale_log2(sm_scale)`` for a positive, finite ``sm_scale`` whose log2 scale is a binary32 number; ``ValueError`` otherwise
+    (the kernel forms every exp2 argument with this constant)."""
+    s = float(sm_scale)
+    if not (math.isfinite(s) and s > 0.0):
+        raise ValueError(
+            f"sm_scale {sm_scale}: the class takes a positive finite scale"
+        )
+    try:
+        return scale_log2(s)
+    except OverflowError:
+        raise ValueError(
+            f"sm_scale {sm_scale}: sm_scale * log2(e) is outside the binary32 range"
+        ) from None
+
+
 def valid_kv_slots(D: int = 128) -> tuple:
     """The ring depths of the FMHA body at head dim ``D``: ``2 .. 512 / D`` (``blocks.operands.max_kv_slots``: 128 KB of K/V in
     flight at every D), i.e. 2..8 at D = 64, 2..4 at D = 128, {2} at D = 256."""
@@ -258,6 +274,11 @@ class _Planned:
         self.plan, self.desc, self.groups, self.ws = plan, desc, groups, ws
         self.scratch = scratch  # the per-CTA O_m scratch (D = 256)
         self.ragged = False  # the packed-token KV layout (set by plan_attention)
+        # what the descriptor table was built for; run_attention refuses anything else (the table holds one unit per KV head
+        # and per Q tile, the configuration decides pairing and the unit body)
+        self.heads: Optional[tuple] = None  # (Hq, Hkv)
+        self.window_left: Optional[int] = None
+        self.config: Optional[AttnConfig] = None
         self.fixup_groups = (
             fixup_groups if fixup_groups is not None else groups
         )  # the groups the fixup kernel folds (the FMHA body folds the others in-kernel)
@@ -283,12 +304,12 @@ def plan_attention(
     """``sm_count`` (default: the device's) only steers the ``auto`` unit-kind choice (I10: a launch
     parameter, never a quantity that reaches the bits). ``ragged``: the K / V are packed along the token dimension (``kv_indptr``
     holds token offsets, ``kv_last_page_len`` is ignored): planned as page size 1, run through the ragged producer."""
-    config = config or default_config(D=D)
     if ragged:
         page = 1
         kv_last_page_len = torch.ones(max(0, kv_indptr.numel() - 1), dtype=torch.int32)
-    assert config.well_formed(D), (config, D)
     check_supported(D, Hq, Hkv, page)
+    config = config or default_config(D=D)
+    assert config.well_formed(D), (config, D)
     device = device or qo_indptr.device
     sm = (
         sm_count
@@ -366,6 +387,9 @@ def plan_attention(
         torch.zeros(max(1, len(plan.groups)), dtype=torch.int32, device=device),
     )
     planned.ragged = ragged
+    planned.heads = (int(Hq), int(Hkv))
+    planned.window_left = int(window_left)
+    planned.config = config
     return planned
 
 
@@ -388,10 +412,20 @@ def run_attention(
     from .spec import TILE_KEYS
 
     total_q, Hq, D = q.shape
-    config = config or default_config(D=D)
+    if config is None:
+        config = planned.config or default_config(D=D)
+    elif planned.config is not None and config != planned.config:
+        raise ValueError(
+            f"run_attention with {config.describe()} over a plan built for {planned.config.describe()}: the descriptor table is "
+            "specific to the configuration (pairing, unit body); plan with the same configuration"
+        )
     assert bool(getattr(planned, "ragged", False)) == bool(ragged), (
         "plan_attention and run_attention must agree on ragged"
     )
+    if planned.window_left is not None and int(window_left) != planned.window_left:
+        raise ValueError(
+            f"window_left {window_left} at run_attention over a plan built for window_left {planned.window_left}"
+        )
     if ragged:
         # the packed K / V: (total_kv, Hkv, D) under NHD, (Hkv, total_kv, D) under HND; the kernel is compiled at page = T
         page = TILE_KEYS
@@ -407,6 +441,11 @@ def run_attention(
             _kv_view(k_cache, kv_layout, Hkv, page, D),
             _kv_view(v_cache, kv_layout, Hkv, page, D),
         )
+    if planned.heads is not None and (int(Hq), int(Hkv)) != planned.heads:
+        raise ValueError(
+            f"{Hq} query heads over {Hkv} KV heads at run_attention over a plan built for {planned.heads[0]} over "
+            f"{planned.heads[1]} (one unit per KV head: the table does not cover other head counts)"
+        )
     g = Hq // Hkv
     assert (
         q.dtype == torch.bfloat16
@@ -414,13 +453,10 @@ def run_attention(
         and v_cache.dtype == torch.bfloat16
     )
     assert q.is_contiguous(), "Q must be a packed (total_q, Hq, D) tensor"
-    assert sm_scale > 0.0, (
-        "sm_scale must be positive (the class forms exp2 arguments with it)"
-    )
     if out is None:
         out = torch.empty_like(q)
     assert out.shape == q.shape and out.dtype == torch.bfloat16 and out.is_contiguous()
-    c = scale_log2(sm_scale)
+    c = check_sm_scale(sm_scale)
     plan = planned.plan
     assert plan.g == g
     q_view = q.permute(2, 1, 0)  # (D, Hq, total_q)

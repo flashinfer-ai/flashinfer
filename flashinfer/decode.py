@@ -1659,7 +1659,12 @@ class BatchDecodeWithPagedKVCacheWrapper:
             from .attention.batch_invariant.wrappers import BatchInvariantAttention
 
             self._batch_invariant = BatchInvariantAttention(
-                float_workspace_buffer, kv_layout, "decode", backend, jit_args
+                float_workspace_buffer,
+                kv_layout,
+                "decode",
+                backend,
+                jit_args,
+                use_cuda_graph=use_cuda_graph,
             )
 
         self._cute_dsl_wrapper = None
@@ -1794,6 +1799,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
             float_workspace_buffer, "float_workspace_buffer"
         )
         _check_workspace_buffer_alignment(int_workspace_buffer, "int_workspace_buffer")
+        if self._batch_invariant is not None:
+            self._batch_invariant.reset_workspace(float_workspace_buffer)
         self._cudnn_prepared = None
         self._float_workspace_buffer = float_workspace_buffer
         self._int_workspace_buffer = int_workspace_buffer
@@ -2334,6 +2341,31 @@ class BatchDecodeWithPagedKVCacheWrapper:
         )
 
         if self._batch_invariant is not None:
+            from .batch_invariant.support import unsupported
+
+            # the class's own checks run in the delegate; the arguments it does not take are refused here, before the plan
+            if window_right != 0:
+                raise unsupported(
+                    "attention.bf16",
+                    f"window_right {window_right}",
+                    "window_right 0 (causal)",
+                )
+            if seq_lens is not None:
+                raise unsupported(
+                    "attention.bf16",
+                    "seq_lens",
+                    "the KV lengths of the page table (indptr / last_page_len)",
+                )
+            if block_tables is not None:
+                raise unsupported(
+                    "attention.bf16", "block_tables", "the paged KV CSR triple"
+                )
+            if is_causal is not None and is_causal != (q_len_per_req > 1):
+                raise unsupported(
+                    "attention.bf16",
+                    f"is_causal={is_causal} with q_len_per_req={q_len_per_req}",
+                    "the bottom-right causal mask (is_causal follows q_len_per_req > 1)",
+                )
             self._batch_invariant.plan(
                 qo_indptr=None,
                 kv_indptr=indptr,
@@ -2360,14 +2392,6 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 rope_scale=rope_scale,
                 rope_theta=rope_theta,
             )
-            if window_right != 0:
-                from .batch_invariant.support import unsupported
-
-                raise unsupported(
-                    "attention.bf16",
-                    f"window_right {window_right}",
-                    "window_right 0 (causal)",
-                )
             self._batch_size = len(indptr) - 1
             self._num_qo_heads = num_qo_heads
             self._num_kv_heads = num_kv_heads
@@ -3334,6 +3358,11 @@ class BatchDecodeWithPagedKVCacheWrapper:
             enable_pdl = device_support_pdl(q.device)
         k_cache, v_cache = _unpack_paged_kv_cache(paged_kv_cache, self._kv_layout)
         if self._batch_invariant is not None:
+            if q_len_per_req is not None and q_len_per_req != self._q_len_per_req:
+                raise ValueError(
+                    f"q_len_per_req={q_len_per_req} at run() but plan() used "
+                    f"{self._q_len_per_req}; re-plan with the matching q_len_per_req."
+                )
             return self._batch_invariant.run(
                 q,
                 k_cache,
