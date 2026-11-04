@@ -380,14 +380,18 @@ def test_registry_records_are_well_formed() -> None:
         assert sorted(params) == sorted(cake_chain.LAUNCH_ARGS[rec["stage"]]), name
         libraries.add(rec["library"])
     # one program per record: a kernel swap renames exactly the records it touches; the one shared library is the
-    # sm_107a scan of the split pass 2's pair, which is that architecture's dhu_tc2_wavefront program
+    # sm_107a scan of the split pass 2's pair, which is the sm_100a / sm_103a dhu_tc2_wavefront program
+    wavefront = cake_jit.MODULES["dhu_tc2_wavefront"]
+    assert wavefront["arches"] == ["sm_100a", "sm_103a"]
     shared = cake_jit.MODULES["dhu_tc2_wavefront_split_sm_107a"]
     assert shared["arches"] == ["sm_107a"]
-    assert shared["library"] == cake_jit.MODULES["dhu_tc2_wavefront"]["library"]
-    assert "sm_107a" in cake_jit.MODULES["dhu_tc2_wavefront"]["arches"]
+    assert shared["library"] == wavefront["library"]
     split = cake_jit.MODULES["dhu_tc2_wavefront_split"]
     assert split["arches"] == ["sm_100a", "sm_103a"]
-    assert split["library"] != cake_jit.MODULES["dhu_tc2_wavefront"]["library"]
+    # the sm_107a scan of the pair: a program of its own (the release in batches of eight chunks)
+    eight = cake_jit.MODULES["dhu_tc2_wavefront_sm_107a"]
+    assert eight["stage"] == "dhu_tc2_wavefront" and eight["arches"] == ["sm_107a"]
+    assert len({wavefront["library"], split["library"], eight["library"]}) == 3
     assert len(libraries) == len(cake_jit.MODULES) - 1
 
 
@@ -1740,13 +1744,13 @@ def test_wavefront_order_follows_the_scan() -> None:
 # (sequences, HV, adjoint segment chunks) -> whether the table's side of the rule holds on (sm_100a 148 SMs, sm_103a
 # 152, sm_107a 212 / 216): 2 x segments x HV <= SMs, and on sm_100a HV >= 32 (scan dhu_tc2_wavefront); on sm_100a and
 # sm_103a also a split adjoint plan of more than SMs pass-2 CTAs (segments x HV) at any HV with tokens x HV >= 3 x 2^17
-# (scan dhu_tc2_wavefront_split); never on sm_107a (not in WAVEFRONT_ARCHS)
+# (scan dhu_tc2_wavefront_split); on sm_107a only the first side (not in WAVEFRONT_SPLIT_ARCHS)
 WAVEFRONT_TABLE_ROWS = {
-    "r01_4x4096_hv16": ((4096,) * 4, 16, 0, (False, True, False, False)),
-    "r07_1x16384_hv16": ((16384,), 16, 0, (False, True, False, False)),
-    "r10_1x16384_hv32": ((16384,), 32, 0, (True, True, False, False)),
+    "r01_4x4096_hv16": ((4096,) * 4, 16, 0, (False, True, True, True)),
+    "r07_1x16384_hv16": ((16384,), 16, 0, (False, True, True, True)),
+    "r10_1x16384_hv32": ((16384,), 32, 0, (True, True, True, True)),
     "r03_8x4096_hv16": ((4096,) * 8, 16, 0, (False, False, False, False)),
-    "3x4096_hv32": ((4096,) * 3, 32, 0, (False, False, False, False)),
+    "3x4096_hv32": ((4096,) * 3, 32, 0, (False, False, True, True)),
     # split: 13 segments x HV 16 = 208 pass-2 CTAs, 30100 tokens x 16 = 481600 (above the work floor)
     "r04_7x4.3k_hv16_split46": ((4199, 2781, 4282, 4448, 4723, 5804, 3863), 16, 46, (True, True, False, False)),
     # split: 19 x 16 = 304 CTAs (the sm_103a plan of the same layout)
@@ -1757,13 +1761,13 @@ WAVEFRONT_TABLE_ROWS = {
     "1x12288_hv32_split16": ((12288,), 32, 16, (True, True, False, False)),
     "1x12224_hv32_split16": ((12224,), 32, 16, (False, False, False, False)),
     # split: 4 x 16 = 64 CTAs (sm_100a: below the SMs and HV < 32)
-    "1x16384_hv16_split64": ((16384,), 16, 64, (False, True, False, False)),
+    "1x16384_hv16_split64": ((16384,), 16, 64, (False, True, True, True)),
     # split: 8 x 32 = 256 CTAs
     "1x16384_hv32_split32": ((16384,), 32, 32, (True, True, False, False)),
     # split: 7 x 32 = 224 CTAs (the sm_103a plan of r10)
     "r10_1x16384_hv32_split37": ((16384,), 32, 37, (True, True, False, False)),
     # split: 2 x 32 = 64 CTAs, at most half of every device's SMs
-    "1x16384_hv32_split128": ((16384,), 32, 128, (True, True, False, False)),
+    "1x16384_hv32_split128": ((16384,), 32, 128, (True, True, True, True)),
 }  # fmt: skip
 WAVEFRONT_DEVICES = (
     ("sm_100a", 148),
@@ -1775,13 +1779,15 @@ WAVEFRONT_DEVICES = (
 
 @pytest.mark.parametrize("row", sorted(WAVEFRONT_TABLE_ROWS))
 def test_wavefront_rule_per_architecture(row, monkeypatch) -> None:
-    assert cake_chain.WAVEFRONT_ARCHS == ("sm_100a", "sm_103a")
+    assert cake_chain.WAVEFRONT_ARCHS == ("sm_100a", "sm_103a", "sm_107a")
     assert cake_chain.WAVEFRONT_MIN_V_HEADS == {"sm_100a": 32}
     assert cake_chain.WAVEFRONT_SPLIT_ARCHS == ("sm_100a", "sm_103a")
     assert cake_chain.WAVEFRONT_SPLIT_MIN_TOKEN_HEADS == 393216
     assert cake_chain.wavefront_engaged(4, 8, 148)
     assert not cake_chain.wavefront_engaged(10, 8, 148)
     assert not cake_chain.wavefront_engaged(38, 2, 148)
+    assert cake_chain.wavefront_engaged(3, 32, 212)
+    assert not cake_chain.wavefront_engaged(4, 32, 216)
     assert cake_chain.wavefront_split_engaged(13, 16, 148, 30100)
     assert cake_chain.wavefront_split_engaged(12, 32, 148, 12288)
     assert not cake_chain.wavefront_split_engaged(12, 32, 148, 12287)
@@ -1904,12 +1910,13 @@ def test_wavefront_pair_repeats_bitwise(device, monkeypatch) -> None:
 # sm_100a and sm_103a.  A split (64, 1) plan with its pass 2 on dhu_tc2 (24 + 2 + 10 chunks in segments of 4 = 10
 # segments): HV 4 (40 CTAs, below the SMs) engages on sm_103a only; HV 32 (320 CTAs, more than the SMs) nowhere, as
 # 2217 tokens x 32 stay below the split side's work floor; over 94 + 2 + 100 chunks (50 segments, 1600 CTAs; 12477
-# tokens x 32, above the floor) on sm_100a and sm_103a, on dhu_tc2_wavefront_split.  sm_107a never
+# tokens x 32, above the floor) on sm_100a and sm_103a, on dhu_tc2_wavefront_split.  sm_107a (208 to 216 SMs) engages
+# every scan of at most half its SMs (HV 4 and HV 32 serial, HV 4 split) and no split pass 2 of more CTAs than SMs
 WAVEFRONT_SPLIT_PINS = {"scan_config": (64, 1), "segment_chunks": 4, "dhu_scan": "tc"}
 WAVEFRONT_DEFAULT_ROWS = {
-    "hv4": ((300, 77, 640), (2, 4), WAVEFRONT_PINS, ("sm_103a",), WAVEFRONT_PAIR),
-    "hv32": ((300, 640), (16, 32), WAVEFRONT_PINS, ("sm_100a", "sm_103a"), WAVEFRONT_PAIR),
-    "split-hv4": ((1500, 77, 640), (2, 4), WAVEFRONT_SPLIT_PINS, ("sm_103a",), WAVEFRONT_PAIR),
+    "hv4": ((300, 77, 640), (2, 4), WAVEFRONT_PINS, ("sm_103a", "sm_107a"), WAVEFRONT_PAIR),
+    "hv32": ((300, 640), (16, 32), WAVEFRONT_PINS, ("sm_100a", "sm_103a", "sm_107a"), WAVEFRONT_PAIR),
+    "split-hv4": ((1500, 77, 640), (2, 4), WAVEFRONT_SPLIT_PINS, ("sm_103a", "sm_107a"), WAVEFRONT_PAIR),
     "split-hv32-small": ((1500, 77, 640), (16, 32), WAVEFRONT_SPLIT_PINS, (), WAVEFRONT_PAIR),
     "split-hv32": ((6000, 77, 6400), (16, 32), WAVEFRONT_SPLIT_PINS, ("sm_100a", "sm_103a"), WAVEFRONT_SPLIT_PAIR),
 }  # fmt: skip

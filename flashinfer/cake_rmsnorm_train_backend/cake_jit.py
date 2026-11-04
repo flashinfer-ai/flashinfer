@@ -4540,6 +4540,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_100a",
         ],
         "grid_rule": {
+            "col_tasks": 64,
             "ctas_per_sm": 2,
             "grid_factor": 2,
             "kind": "claimed_chunks",
@@ -4573,6 +4574,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_100a",
         ],
         "grid_rule": {
+            "col_tasks": 64,
             "ctas_per_sm": 2,
             "grid_factor": 2,
             "kind": "claimed_chunks",
@@ -4606,6 +4608,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_100a",
         ],
         "grid_rule": {
+            "col_tasks": 128,
             "ctas_per_sm": 2,
             "grid_factor": 2,
             "kind": "claimed_chunks",
@@ -4639,6 +4642,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_100a",
         ],
         "grid_rule": {
+            "col_tasks": 128,
             "ctas_per_sm": 2,
             "grid_factor": 2,
             "kind": "claimed_chunks",
@@ -4672,6 +4676,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_100a",
         ],
         "grid_rule": {
+            "col_tasks": 80,
             "ctas_per_sm": 1,
             "grid_factor": 1,
             "kind": "claimed_chunks",
@@ -4705,6 +4710,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_100a",
         ],
         "grid_rule": {
+            "col_tasks": 96,
             "ctas_per_sm": 1,
             "grid_factor": 1,
             "kind": "claimed_chunks",
@@ -4738,6 +4744,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_100a",
         ],
         "grid_rule": {
+            "col_tasks": 96,
             "ctas_per_sm": 1,
             "grid_factor": 1,
             "kind": "claimed_chunks",
@@ -4771,6 +4778,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_100a",
         ],
         "grid_rule": {
+            "col_tasks": 96,
             "ctas_per_sm": 1,
             "grid_factor": 1,
             "kind": "claimed_chunks",
@@ -4804,6 +4812,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_100a",
         ],
         "grid_rule": {
+            "col_tasks": 96,
             "ctas_per_sm": 1,
             "grid_factor": 1,
             "kind": "claimed_chunks",
@@ -5392,78 +5401,12 @@ MODULES: dict[str, dict[str, Any]] = {
             "sum_bytes": 98304,
         },
     },
-    # sm_103a H5120 bf16 weight: (320, 896] backward time 1.033-1.087x the det pair's at T 512 and 640 in all four timing sessions (GB300)
-    "cake_rmsnorm_train_080e0a6c3b18e9bad790__320_896": {
+    "cake_rmsnorm_train_b3e6531e46667901ab91__320_448": {
         "arches": [
             "sm_103a",
         ],
         "grid_rule": {
-            "ctas_per_sm": 1,
-            "grid_factor": 1,
-            "kind": "claimed_chunks",
-            "launch_bound_ctas_per_sm": 1,
-            "max_halving": 5,
-            "rows_per_issue": 1,
-            "tail_div": 12,
-        },
-        "hidden": 5120,
-        "kernel": "cake_rmsnorm_train_080e0a6c3b18e9bad790",
-        "launch": {
-            "cooperative": False,
-            "use_pdl": False,
-        },
-        "library": "cake_rmsnorm_train_080e0a6c3b18e9bad790",
-        "role": "bwd_main",
-        "select_rule": {
-            "above": 320,
-            "at_most": 896,
-            "kind": "rows_between",
-        },
-        "workspace_rule": {
-            "counters": 1,
-            "kind": "claim_sum_f64",
-            "sum_bytes": 0,
-        },
-    },
-    # sm_103a H6144 bf16 weight: (448, 1152] backward time 1.029-1.043x the det pair's at T 1024 in all four timing sessions (GB300)
-    "cake_rmsnorm_train_44508df7dab2ab688f85__448_1152": {
-        "arches": [
-            "sm_103a",
-        ],
-        "grid_rule": {
-            "ctas_per_sm": 1,
-            "grid_factor": 1,
-            "kind": "claimed_chunks",
-            "launch_bound_ctas_per_sm": 1,
-            "max_halving": 5,
-            "rows_per_issue": 1,
-            "tail_div": 12,
-        },
-        "hidden": 6144,
-        "kernel": "cake_rmsnorm_train_44508df7dab2ab688f85",
-        "launch": {
-            "cooperative": False,
-            "use_pdl": False,
-        },
-        "library": "cake_rmsnorm_train_44508df7dab2ab688f85",
-        "role": "bwd_main",
-        "select_rule": {
-            "above": 448,
-            "at_most": 1152,
-            "kind": "rows_between",
-        },
-        "workspace_rule": {
-            "counters": 1,
-            "kind": "claim_sum_f64",
-            "sum_bytes": 0,
-        },
-    },
-    # sm_103a H6144 f32 weight: (320, 1152] backward time 0.997-1.003x the det pair's at T 1024 over four timing sessions (GB300)
-    "cake_rmsnorm_train_b3e6531e46667901ab91__320_1152": {
-        "arches": [
-            "sm_103a",
-        ],
-        "grid_rule": {
+            "col_tasks": 96,
             "ctas_per_sm": 1,
             "grid_factor": 1,
             "kind": "claimed_chunks",
@@ -5482,7 +5425,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "role": "bwd_main_w32",
         "select_rule": {
             "above": 320,
-            "at_most": 1152,
+            "at_most": 448,
             "kind": "rows_between",
         },
         "workspace_rule": {
@@ -5497,6 +5440,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_103a",
         ],
         "grid_rule": {
+            "col_tasks": 96,
             "ctas_per_sm": 1,
             "grid_factor": 1,
             "kind": "claimed_chunks",
@@ -5530,6 +5474,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_103a",
         ],
         "grid_rule": {
+            "col_tasks": 96,
             "ctas_per_sm": 1,
             "grid_factor": 1,
             "kind": "claimed_chunks",
@@ -5695,6 +5640,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_107a",
         ],
         "grid_rule": {
+            "col_tasks": 96,
             "ctas_per_sm": 1,
             "grid_factor": 1,
             "kind": "claimed_chunks",
@@ -5728,6 +5674,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_107a",
         ],
         "grid_rule": {
+            "col_tasks": 96,
             "ctas_per_sm": 1,
             "grid_factor": 1,
             "kind": "claimed_chunks",
@@ -6982,6 +6929,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_103a",
         ],
         "grid_rule": {
+            "col_tasks": 80,
             "ctas_per_sm": 1,
             "grid_factor": 1,
             "kind": "claimed_chunks",
@@ -7180,6 +7128,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_103a",
         ],
         "grid_rule": {
+            "col_tasks": 96,
             "ctas_per_sm": 1,
             "grid_factor": 1,
             "kind": "claimed_chunks",
@@ -7213,6 +7162,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_103a",
         ],
         "grid_rule": {
+            "col_tasks": 96,
             "ctas_per_sm": 1,
             "grid_factor": 1,
             "kind": "claimed_chunks",
@@ -7543,6 +7493,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_107a",
         ],
         "grid_rule": {
+            "col_tasks": 96,
             "ctas_per_sm": 1,
             "grid_factor": 1,
             "kind": "claimed_chunks",
@@ -7609,6 +7560,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_103a",
         ],
         "grid_rule": {
+            "col_tasks": 96,
             "ctas_per_sm": 1,
             "grid_factor": 1,
             "kind": "claimed_chunks",
@@ -7675,6 +7627,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "sm_107a",
         ],
         "grid_rule": {
+            "col_tasks": 96,
             "ctas_per_sm": 1,
             "grid_factor": 1,
             "kind": "claimed_chunks",
@@ -11387,7 +11340,7 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "workspace_rule": None,
     },
-    "cake_rmsnorm_train_2fc4932fbde0bc848b32__22_320": {
+    "cake_rmsnorm_train_2fc4932fbde0bc848b32__22_5120": {
         "arches": [
             "sm_103a",
         ],
@@ -11410,37 +11363,6 @@ MODULES: dict[str, dict[str, Any]] = {
         "role": "bwd_main",
         "select_rule": {
             "above": 22,
-            "at_most": 320,
-            "kind": "rows_between",
-        },
-        "workspace_rule": {
-            "counters": 128,
-            "kind": "chunk_partials",
-        },
-    },
-    "cake_rmsnorm_train_2fc4932fbde0bc848b32__896_5120": {
-        "arches": [
-            "sm_103a",
-        ],
-        "grid_rule": {
-            "ctas_per_sm": 1,
-            "grid_factor": 2,
-            "kind": "claimed_chunks",
-            "launch_bound_ctas_per_sm": 1,
-            "max_halving": 2,
-            "rows_per_issue": 1,
-            "tail_div": 4,
-        },
-        "hidden": 5120,
-        "kernel": "cake_rmsnorm_train_2fc4932fbde0bc848b32",
-        "launch": {
-            "cooperative": False,
-            "use_pdl": False,
-        },
-        "library": "cake_rmsnorm_train_2fc4932fbde0bc848b32",
-        "role": "bwd_main",
-        "select_rule": {
-            "above": 896,
             "at_most": 5120,
             "kind": "rows_between",
         },
@@ -11479,52 +11401,6 @@ MODULES: dict[str, dict[str, Any]] = {
             "counters": 128,
             "kind": "chunk_partials",
         },
-    },
-    "cake_rmsnorm_train_c5831b29d17867842e5f__22_320": {
-        "arches": [
-            "sm_103a",
-        ],
-        "grid_rule": {
-            "ctas": 160,
-            "kind": "fixed",
-        },
-        "hidden": 5120,
-        "kernel": "cake_rmsnorm_train_c5831b29d17867842e5f",
-        "launch": {
-            "cooperative": False,
-            "use_pdl": True,
-        },
-        "library": "cake_rmsnorm_train_c5831b29d17867842e5f",
-        "role": "bwd_reduce",
-        "select_rule": {
-            "above": 22,
-            "at_most": 320,
-            "kind": "rows_between",
-        },
-        "workspace_rule": None,
-    },
-    "cake_rmsnorm_train_c5831b29d17867842e5f__896_5120": {
-        "arches": [
-            "sm_103a",
-        ],
-        "grid_rule": {
-            "ctas": 160,
-            "kind": "fixed",
-        },
-        "hidden": 5120,
-        "kernel": "cake_rmsnorm_train_c5831b29d17867842e5f",
-        "launch": {
-            "cooperative": False,
-            "use_pdl": True,
-        },
-        "library": "cake_rmsnorm_train_c5831b29d17867842e5f",
-        "role": "bwd_reduce",
-        "select_rule": {
-            "above": 896,
-            "at_most": 5120,
-            "kind": "rows_between",
-        },
-        "workspace_rule": None,
     },
     "cake_rmsnorm_train_c5831b29d17867842e5f__5120_61952": {
         "arches": [
@@ -11634,7 +11510,7 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "workspace_rule": None,
     },
-    "cake_rmsnorm_train_5c804aed7ad14b99e1d0__3_448": {
+    "cake_rmsnorm_train_5c804aed7ad14b99e1d0__3_4096": {
         "arches": [
             "sm_103a",
         ],
@@ -11657,37 +11533,6 @@ MODULES: dict[str, dict[str, Any]] = {
         "role": "bwd_small",
         "select_rule": {
             "above": 3,
-            "at_most": 448,
-            "kind": "rows_between",
-        },
-        "workspace_rule": {
-            "counters": 192,
-            "kind": "chunk_partials",
-        },
-    },
-    "cake_rmsnorm_train_5c804aed7ad14b99e1d0__1152_4096_103": {
-        "arches": [
-            "sm_103a",
-        ],
-        "grid_rule": {
-            "ctas_per_sm": 1,
-            "grid_factor": 2,
-            "kind": "claimed_chunks",
-            "launch_bound_ctas_per_sm": 1,
-            "max_halving": 5,
-            "rows_per_issue": 1,
-            "tail_div": 12,
-        },
-        "hidden": 6144,
-        "kernel": "cake_rmsnorm_train_5c804aed7ad14b99e1d0",
-        "launch": {
-            "cooperative": False,
-            "use_pdl": False,
-        },
-        "library": "cake_rmsnorm_train_5c804aed7ad14b99e1d0",
-        "role": "bwd_small",
-        "select_rule": {
-            "above": 1152,
             "at_most": 4096,
             "kind": "rows_between",
         },
@@ -11727,7 +11572,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "chunk_partials",
         },
     },
-    "cake_rmsnorm_train_5f5cdc5151e3c0620bcd__3_448": {
+    "cake_rmsnorm_train_5f5cdc5151e3c0620bcd__3_4096": {
         "arches": [
             "sm_103a",
         ],
@@ -11745,12 +11590,12 @@ MODULES: dict[str, dict[str, Any]] = {
         "role": "bwd_reduce",
         "select_rule": {
             "above": 3,
-            "at_most": 448,
+            "at_most": 4096,
             "kind": "rows_between",
         },
         "workspace_rule": None,
     },
-    "cake_rmsnorm_train_5f5cdc5151e3c0620bcd__1152_4096_0_4096": {
+    "cake_rmsnorm_train_5f5cdc5151e3c0620bcd__448_4096": {
         "arches": [
             "sm_103a",
         ],
@@ -11767,7 +11612,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "library": "cake_rmsnorm_train_5f5cdc5151e3c0620bcd",
         "role": "bwd_reduce",
         "select_rule": {
-            "above": 1152,
+            "above": 448,
             "at_most": 4096,
             "kind": "rows_between",
         },
@@ -11827,7 +11672,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "kind": "chunk_partials",
         },
     },
-    "cake_rmsnorm_train_41b80b6af97974feb181__1152_4096": {
+    "cake_rmsnorm_train_41b80b6af97974feb181__448_4096": {
         "arches": [
             "sm_103a",
         ],
@@ -11849,7 +11694,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "library": "cake_rmsnorm_train_41b80b6af97974feb181",
         "role": "bwd_small_w32",
         "select_rule": {
-            "above": 1152,
+            "above": 448,
             "at_most": 4096,
             "kind": "rows_between",
         },
@@ -14600,13 +14445,10 @@ ROUTES: dict[str, dict[str, list[str]]] = {
         ],
         "bwd_h5120": [
             "cake_rmsnorm_train_080e0a6c3b18e9bad790__0_22",
-            "cake_rmsnorm_train_2fc4932fbde0bc848b32__22_320",
-            "cake_rmsnorm_train_080e0a6c3b18e9bad790__320_896",
-            "cake_rmsnorm_train_2fc4932fbde0bc848b32__896_5120",
+            "cake_rmsnorm_train_2fc4932fbde0bc848b32__22_5120",
             "cake_rmsnorm_train_7ffb443a63a92ab6b0e0__5120_61952",
             "cake_rmsnorm_train_9e4c0825df92af02074f",
-            "cake_rmsnorm_train_c5831b29d17867842e5f__22_320",
-            "cake_rmsnorm_train_c5831b29d17867842e5f__896_5120",
+            "cake_rmsnorm_train_c5831b29d17867842e5f__22_5120",
             "cake_rmsnorm_train_c5831b29d17867842e5f__5120_61952",
         ],
         "bwd_w32_h5120": [
@@ -14619,13 +14461,10 @@ ROUTES: dict[str, dict[str, list[str]]] = {
         ],
         "bwd_h6144": [
             "cake_rmsnorm_train_44508df7dab2ab688f85__0_3",
-            "cake_rmsnorm_train_5c804aed7ad14b99e1d0__3_448",
-            "cake_rmsnorm_train_44508df7dab2ab688f85__448_1152",
-            "cake_rmsnorm_train_5c804aed7ad14b99e1d0__1152_4096_103",
+            "cake_rmsnorm_train_5c804aed7ad14b99e1d0__3_4096",
             "cake_rmsnorm_train_322574af704b51aef0bb__4096_49152",
             "cake_rmsnorm_train_582b2a20f9be648af8ec",
-            "cake_rmsnorm_train_5f5cdc5151e3c0620bcd__3_448",
-            "cake_rmsnorm_train_5f5cdc5151e3c0620bcd__1152_4096_0_4096",
+            "cake_rmsnorm_train_5f5cdc5151e3c0620bcd__3_4096",
             "cake_rmsnorm_train_5f5cdc5151e3c0620bcd__4096_49152",
         ],
         "bwd_residual_h6144": [
@@ -14641,12 +14480,12 @@ ROUTES: dict[str, dict[str, list[str]]] = {
         "bwd_w32_h6144": [
             "cake_rmsnorm_train_b3e6531e46667901ab91__0_20",
             "cake_rmsnorm_train_41b80b6af97974feb181__20_320",
-            "cake_rmsnorm_train_b3e6531e46667901ab91__320_1152",
-            "cake_rmsnorm_train_41b80b6af97974feb181__1152_4096",
+            "cake_rmsnorm_train_b3e6531e46667901ab91__320_448",
+            "cake_rmsnorm_train_41b80b6af97974feb181__448_4096",
             "cake_rmsnorm_train_9a8c0396edd85d4d545e__4096_49152",
             "cake_rmsnorm_train_4f9a76e68671f213ab7c",
             "cake_rmsnorm_train_5f5cdc5151e3c0620bcd__20_320",
-            "cake_rmsnorm_train_5f5cdc5151e3c0620bcd__1152_4096_0_4096",
+            "cake_rmsnorm_train_5f5cdc5151e3c0620bcd__448_4096",
             "cake_rmsnorm_train_5f5cdc5151e3c0620bcd__4096_49152",
         ],
         "bwd_w32_residual_h6144": [
@@ -15387,7 +15226,10 @@ def launch_grid(
     ctas_per_sm * SM count`` persistent CTAs claim the chunks of the table of
     :func:`chunk_rounds` (``rows_per_issue`` rows per pipeline step of the
     kernel, under the taper its record spells: :func:`chunk_taper`), so the
-    grid is ``min(slots, n_chunks)``; the launch is a plain
+    grid is ``min(slots, n_chunks)``; a column-task kernel's rule spells its
+    ``col_tasks`` (``H / col`` column tasks, tickets beside the chunks), so its
+    grid is ``min(slots, n_chunks + col_tasks)`` and a small ``T`` runs every
+    task at once.  The launch is a plain
     one -- no co-residency is required -- and ``ctas_per_sm`` is the production
     grid factor capped at the launch bound the kernel declares.  ``rows`` must
     be positive; the public API returns empty outputs for zero rows without
@@ -15413,7 +15255,8 @@ def launch_grid(
         slots = int(rule["ctas_per_sm"]) * sm_count(device_index)
         grid_x = min(
             slots,
-            n_chunks(rows, slots, int(rule["rows_per_issue"]), *chunk_taper(rule)),
+            n_chunks(rows, slots, int(rule["rows_per_issue"]), *chunk_taper(rule))
+            + int(rule.get("col_tasks", 0)),
         )
     else:
         raise ValueError(f"unknown Cake RMSNorm training grid rule: {kind!r}")

@@ -656,7 +656,8 @@ def test_cake_fmha_context_bf16_calls_outside_the_exact_programs_take_the_runtim
 ) -> None:
     """A causal BF16 call without LSE or sink that no exact route serves runs
     the runtime-size program of its JIT pack (:func:`_context_pack_g`), where
-    the target ships one, else the JIT module."""
+    the target ships one and the call is not one of the power-of-two query
+    lengths it leaves to the JIT module, else the JIT module."""
 
     monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: target)
     kwargs = _context_kwargs(row, device="meta")
@@ -670,9 +671,81 @@ def test_cake_fmha_context_bf16_calls_outside_the_exact_programs_take_the_runtim
         kwargs["query"].shape[1],
         kwargs["key_cache"].shape[1],
     )
-    expected = cake_api._CONTEXT_BF16_RUNTIME_ROUTES[target].get((pack, None))
+    expected = _bf16_runtime_program(target, kwargs)
     assert route.program == expected, (row, mutation, route)
     assert route.pack_g == pack
+
+
+def _bf16_runtime_program(target, kwargs):
+    """The runtime-size program a causal BF16 call without LSE or sink
+    (``select_cake_fmha_context_route`` inputs) takes when no exact route
+    serves it: its JIT pack's program unless the target leaves its power-of-two
+    query length to the JIT module (:data:`_CONTEXT_BF16_RUNTIME_POW2_Q`), else
+    ``None`` (the JIT module)."""
+
+    q_len, kv_len = kwargs["max_q_len"], kwargs["max_kv_len"]
+    heads = kwargs["query"].shape[1]
+    pack = cake_api._context_pack_g(q_len, kv_len, heads, kwargs["key_cache"].shape[1])
+    pow2_q = cake_api._CONTEXT_BF16_RUNTIME_POW2_Q.get(target)
+    if (
+        pow2_q is not None
+        and pack > 1
+        and q_len >= pow2_q[0]
+        and q_len & (q_len - 1) == 0
+        and kv_len >= pow2_q[1]
+    ):
+        return None
+    return cake_api._CONTEXT_BF16_RUNTIME_ROUTES[target].get((pack, None))
+
+
+# Causal BF16 calls without LSE or sink on either side of the power-of-two
+# query lengths sm100a leaves to the JIT module
+# (:data:`_CONTEXT_BF16_RUNTIME_POW2_Q`): (batch, max_q_len, max_kv_len,
+# num_q_heads, num_kv_heads, served by the runtime-size program on sm100a).
+# sm103a leaves none of them.
+_BF16_POW2_Q_ROWS = [
+    (1, 8192, 16384, 32, 4, False),
+    (4, 8192, 16384, 32, 4, False),
+    (1, 8192, 14336, 32, 4, False),
+    (1, 16384, 16384, 32, 4, False),
+    (1, 4096, 16384, 64, 4, False),
+    (1, 8064, 16384, 32, 4, True),
+    (1, 8320, 16384, 32, 4, True),
+    (1, 12288, 16384, 32, 4, True),
+    (1, 24576, 24576, 32, 4, True),
+    (1, 8192, 12288, 32, 4, True),
+    (1, 2048, 16384, 32, 4, True),
+    (1, 8192, 16384, 32, 32, True),
+]
+
+
+@pytest.mark.parametrize("target", ("sm100a", "sm103a"))
+@pytest.mark.parametrize("row", _BF16_POW2_Q_ROWS)
+def test_cake_fmha_context_bf16_pow2_query_lengths_keep_the_jit(
+    monkeypatch, target, row
+) -> None:
+    """A causal BF16 call without LSE or sink at a JIT pack above 1 whose
+    query length is a power of two the target leaves to the JIT module keeps
+    the JIT module; every other call takes the runtime-size program of its
+    pack."""
+
+    batch, q_len, kv_len, hq, hkv, served = row
+    served = served or target != "sm100a"
+    monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: target)
+    pack = cake_api._context_pack_g(q_len, kv_len, hq, hkv)
+    kwargs = _context_kwargs(
+        ("context_bf16", batch, q_len, kv_len, hq, hkv, 16, True, None),
+        device="meta",
+    )
+    assert (_bf16_runtime_program(target, kwargs) is not None) == served, row
+    route = cake_api.select_cake_fmha_context_route(torch.device("meta"), **kwargs)
+    assert route is not None and route.exact_profile is None, row
+    assert route.pack_g == pack
+    table = cake_api._CONTEXT_BF16_RUNTIME_ROUTES[target]
+    assert route.program == (table[(pack, None)] if served else None), (
+        row,
+        route.program,
+    )
 
 
 @pytest.mark.parametrize("target", ("sm100a", "sm103a"))

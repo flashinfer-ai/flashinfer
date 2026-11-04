@@ -1450,8 +1450,8 @@ def _saved_formula(ctx, H_qk, HV, save_mode, boundary_mode, save_transfer, C) ->
         total += ctx.n_in * s_pad
         if save_transfer:
             total += ctx.N_out * 2 * hp.Hg_pad_by_rank[ctx.rank] * gp.STATE_TILE_BYTES
-            if hp.P > 1:
-                total += (hp.P - 1) * ctx.n_frag * s
+        if (save_transfer or save_mode == "full") and hp.P > 1:
+            total += hp.P * ctx.n_frag * s
     if (
         save_mode == "full"
     ):  # every forward tape: h, v_new / w / u, Aqk / Akk, gamma, gcum / rowscale / qscale
@@ -2802,6 +2802,85 @@ def test_backward_forgets_its_own_saved_set_at_the_last_reader() -> None:
     )
 
 
+@pytest.mark.parametrize("use_qk_l2norm_in_kernel", (False, True))
+def test_full_backward_without_save_transfer_reads_no_unwritten_plane(
+    monkeypatch, use_qk_l2norm_in_kernel
+) -> None:
+    """``save_mode="full"`` with ``save_transfer=False`` at ``P > 1`` (also the only form of ``exchange="ring"``): the
+    backward's merges read the forward's ``M_seg^T`` plane (``stage_m``), which the full backward does not rebuild (no
+    transfer walk), so the saved set carries it as ``M_seg`` and the backward binds it.  Every tensor the package
+    allocates is filled with NaN bytes: an unwritten read shows up as a non-finite result.  The full form gives the
+    light form's bits (the fake backend is deterministic) on a ``None``, a fresh and a shared workspace (twice) and
+    under a non-reentrant checkpoint; the byte query counts ``M_seg``; a full saved set without it is refused."""
+    kcp = _package("cake_kcp")
+    real_alloc = kcp._alloc
+
+    def nan_alloc(shape, dtype, device):
+        t = real_alloc(shape, dtype, device)
+        if t.numel():
+            t.view(-1).view(torch.uint8).fill_(0xFF)
+        return t
+
+    monkeypatch.setattr(kcp, "_alloc", nan_alloc)
+    cu = [0, 100, 740, 817, 1817, 1946]
+    H_qk, HV = 2, 6
+    part = gp.partition_kcp(torch.tensor(cu, dtype=torch.int64), 1, "contiguous")
+    ctx = gp.build_context_kcp(part, None, 0, CPU)
+    ops = _inputs(cu, H_qk, HV)
+    base = {
+        "segments": 2,
+        "save_transfer": False,
+        "use_qk_l2norm_in_kernel": use_qk_l2norm_in_kernel,
+    }
+    args = (ops["q"], ops["k"], ops["v"], ops["g"], ops["beta"], ctx)
+    _, saved = kcp.chunk_gdn_fwd_kcp(
+        *args, backend="fake", save_mode="full", deterministic=False, **base
+    )
+    assert saved is not None and saved.P == 2 and saved.c1_recv is None
+    assert saved.M_seg is not None and torch.isfinite(saved.M_seg).all()
+    m_seg_bytes = gb.gdn_saved_layout_kcp(
+        ctx,
+        H_qk=H_qk,
+        HV=HV,
+        save_mode="full",
+        save_transfer=False,
+        P=2,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+    )["M_seg"]
+    # the query counts the saved plane itself: NSEG = n_frag P states
+    assert m_seg_bytes == 2 * ctx.n_frag * HV * gp.STATE_TILE_BYTES
+    assert m_seg_bytes == saved.M_seg.numel() * saved.M_seg.element_size()
+    # an older full saved set without M_seg would read an unwritten plane: refused
+    with pytest.raises(ValueError, match="needs M_seg"):
+        kcp.chunk_gdn_bwd_kcp(
+            *args,
+            ops["dout"],
+            saved=dataclasses.replace(saved, M_seg=None),
+            backend="fake",
+            save_mode="full",
+            deterministic=False,
+            **base,
+        )
+    light = _ckpt_autograd(kcp, ctx, ops, ckpt=False, **base)
+    for n, t in light.items():
+        assert torch.isfinite(t.float()).all(), ("light", n)
+    shared = kcp.WorkspaceKcp()
+    arms = (
+        (None, False),
+        (kcp.WorkspaceKcp(), False),
+        (shared, False),
+        (shared, False),
+        (None, True),
+    )
+    for i, (ws, ckpt) in enumerate(arms):
+        full = _ckpt_autograd(
+            kcp, ctx, ops, ckpt=ckpt, workspace=ws, save_mode="full", **base
+        )
+        assert kcp.LAST_CALL["bwd"]["tapes_source"] == "saved", i
+        for n in light:
+            assert torch.equal(full[n], light[n]), (i, n)
+
+
 def test_transpose_tiles_scratch_is_bitwise_the_temporary_form() -> None:
     """R2-L1 1a: the ``M_f -> M_f^T`` scatter with the gather in a caller scratch (the carry plane during the
     summaries) writes the same bytes as the fresh-temporary form and leaves the gathered tiles in the scratch.  Exact:
@@ -3508,15 +3587,24 @@ def _frame_delta(kcp, skipped: int, launched: int) -> dict[str, int]:
     return {"skipped": 0, "launched": 0}
 
 
-def _dead_decision(kcp) -> str:
-    """What a recompute whose output is dead records on this build: ``skipped`` on a verified torch, else ``launched``."""
-    return "skipped" if _verified_torch(kcp) else "launched"
+def _auto_hand_off(kcp) -> bool:
+    """Whether the shipped ``reuse_recompute_tapes="auto"`` hands the recompute's tapes to the backward when the node
+    closes the segment: the frame proof is read on a verified torch only; elsewhere every recompute takes the replay
+    form (no hand-off, no kept entry)."""
+    return _verified_torch(kcp)
 
 
-def _fwd_o_after_recompute(kcp) -> list[bool]:
+def _dead_decision(kcp, hand_off: bool = True) -> str:
+    """What a recompute whose output is dead records on this build: ``skipped`` on a verified torch; elsewhere the
+    recompute writes the output, as :func:`_wrote` gives for a forward with or without the hand-off (``launched``
+    with the hand-off of ``reuse_recompute_tapes=True``)."""
+    return "skipped" if _verified_torch(kcp) else _wrote(kcp, hand_off)
+
+
+def _fwd_o_after_recompute(kcp, hand_off: bool = True) -> list[bool]:
     """``fwd_o`` hand-off flags of one original forward and one recompute whose output is dead: the original's only on
-    a verified torch, the recompute's too elsewhere."""
-    return [False] if _verified_torch(kcp) else [False, True]
+    a verified torch, the recompute's too elsewhere (``hand_off``: whether that recompute hands its tapes off)."""
+    return [False] if _verified_torch(kcp) else [False, hand_off]
 
 
 def _skip_delta(kcp, before: dict[str, int]) -> dict[str, int]:
@@ -3537,12 +3625,15 @@ def test_recompute_output_skipped_once_when_the_node_closes_the_segment() -> Non
     the kept-tape accounting is unchanged, and the
     skip does not rest on the kept tapes (the replay form skips too).  A later op of the segment that saves nothing
     (``.sum()``) keeps the skip: torch's early stop ends the recompute right after this node's tensors are re-saved,
-    before that op runs.  On a torch build outside the verified set every recompute launches #5 instead (reason
-    ``torch_version``, counters untouched) and the same budget checks hold."""
+    before that op runs.  On a torch build outside the verified set every recompute writes the output instead (reason
+    ``torch_version``, counters untouched): the shipped ``reuse_recompute_tapes="auto"`` takes the replay form
+    there, so the recompute hands nothing off, puts no kept entry and writes the output as a plain forward; the same
+    budget checks hold."""
     kcp, ctx, ops = _ckpt_setup()
     from torch.utils.checkpoint import checkpoint
 
-    fwd_o, decision = _fwd_o_after_recompute(kcp), _dead_decision(kcp)
+    hand = _auto_hand_off(kcp)
+    fwd_o, decision = _fwd_o_after_recompute(kcp, hand), _dead_decision(kcp, hand)
     reason, delta = _frame_reason(kcp, "dead"), _frame_delta(kcp, 1, 0)
 
     direct = _ckpt_autograd(kcp, ctx, ops, ckpt=False, segments=2)
@@ -3566,23 +3657,23 @@ def test_recompute_output_skipped_once_when_the_node_closes_the_segment() -> Non
         always = _ckpt_autograd(
             kcp, ctx, ops, ckpt=True, segments=2, recompute_output="always"
         )
-        assert _launches(seen, "fwd_prep") == [False, True]
-        assert _o_writes(seen) == [False, True]
-        assert kcp.LAST_CALL["fwd"]["fwd_o"] == "launched"
+        assert _launches(seen, "fwd_prep") == [False, hand]
+        assert _o_writes(seen) == [False, hand]
+        assert kcp.LAST_CALL["fwd"]["fwd_o"] == _wrote(kcp, hand)
         assert kcp.LAST_CALL["fwd"]["fwd_o_reason"] == "always"
         seen.clear()
         before, kept_before = dict(kcp.RECOMPUTE_OUTPUT_STATS), dict(kcp.KEPT_STATS)
         auto = _ckpt_autograd(kcp, ctx, ops, ckpt=True, segments=2)
-        assert _launches(seen, "fwd_prep") == [False, True]
+        assert _launches(seen, "fwd_prep") == [False, hand]
         assert _o_writes(seen) == fwd_o
         assert kcp.LAST_CALL["fwd"]["fwd_o"] == decision
         assert kcp.LAST_CALL["fwd"]["fwd_o_reason"] == reason
         assert _skip_delta(kcp, before) == delta
         assert _stats_delta(kcp, kept_before) == {
-            "put": 1,
-            "take": 1,
+            "put": int(hand),
+            "take": int(hand),
             "miss": 0,
-            "released": 1,
+            "released": int(hand),
             "callback": 0,
             "evicted": 0,
         }
@@ -3620,6 +3711,7 @@ def test_recompute_output_skipped_once_when_the_node_closes_the_segment() -> Non
 # The recompute_output tests below pin reuse_recompute_tapes=True: they check the output program's gate under the
 # kept-tape form (the recompute launches #1 and hands the tapes off); the shipped default "auto" takes the replay form
 # in several of these scenarios (a later saver, a failed frame proof), which the reuse_recompute_tapes tests cover.
+# The untaken-node test runs the default "auto" (its hand-off holds on a verified torch only: _auto_hand_off).
 def test_recompute_output_launched_when_a_later_op_of_the_segment_saves_the_output() -> (
     None
 ):
@@ -3735,10 +3827,14 @@ def test_recompute_output_with_an_untaken_node_and_a_second_backward() -> None:
     """(a) The segment is recomputed for another saved tensor while the GDN node itself is not in the backward: the
     node is still the segment's last saver, so #5 is left out, and the kept-tape accounting is the shipped one (the
     untaken entry goes at the task's end).  (b) ``retain_graph`` and a second ``.backward()``: two recomputes, two
-    skips, two kept entries put and taken, gradients within the budget of twice the FP64 gradient."""
+    skips, two kept entries put and taken, gradients within the budget of twice the FP64 gradient.  Both parts run
+    the shipped ``reuse_recompute_tapes="auto"``: on a torch build outside the verified set it takes the replay form
+    (no kept entry is put, taken or dropped), the recompute writes the output as a plain forward and the counters
+    stay."""
     kcp, ctx, ops = _ckpt_setup()
     from torch.utils.checkpoint import checkpoint
 
+    hand = int(_auto_hand_off(kcp))  # kept entries per recompute
     leaves = _ckpt_leaves(ops)
     a = torch.randn(3, requires_grad=True)
 
@@ -3751,14 +3847,14 @@ def test_recompute_output_with_an_untaken_node_and_a_second_backward() -> None:
     before, kept_before = dict(kcp.RECOMPUTE_OUTPUT_STATS), dict(kcp.KEPT_STATS)
     b.sum().backward()
     assert a.grad is not None and all(lf.grad is None for lf in leaves)
-    assert kcp.LAST_CALL["fwd"]["fwd_o"] == _dead_decision(kcp)
+    assert kcp.LAST_CALL["fwd"]["fwd_o"] == _dead_decision(kcp, bool(hand))
     assert _skip_delta(kcp, before) == _frame_delta(kcp, 1, 0)
     assert _stats_delta(kcp, kept_before) == {
-        "put": 1,
+        "put": hand,
         "take": 0,
         "miss": 0,
         "released": 0,
-        "callback": 1,
+        "callback": hand,
         "evicted": 0,
     }
     assert kcp.kept_registry_size() == 0
@@ -3769,10 +3865,10 @@ def test_recompute_output_with_an_untaken_node_and_a_second_backward() -> None:
     _assert_accumulated(twice, direct, "two recomputes", _ckpt_reference())
     assert _skip_delta(kcp, before) == _frame_delta(kcp, 2, 0)
     assert _stats_delta(kcp, kept_before) == {
-        "put": 2,
-        "take": 2,
+        "put": 2 * hand,
+        "take": 2 * hand,
         "miss": 0,
-        "released": 2,
+        "released": 2 * hand,
         "callback": 0,
         "evicted": 0,
     }

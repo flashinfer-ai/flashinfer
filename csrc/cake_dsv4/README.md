@@ -7,9 +7,12 @@ the NVFP4 decode family (`run_cake_dsv4_nvfp4`; see the host module docstring).
 Select the backend explicitly; `backend="auto"` keeps the architecture-based
 selection. `enable_pdl` launches the FP8 persistent and M64 programs as
 programmatic dependents (they wait for the previous grid before their first
-global read and trigger their own dependents right after); the other BF16 / FP8
-programs launch without it, and the NVFP4 family rejects it. The TRTLLM-GEN
-RopeQuant epilogue is not supported.
+global read and trigger their own dependents right after); without it, the
+H128 persistent program's `_no_pdl` twin, the same kernel without the two
+`griddepcontrol` instructions, runs on SM103 launches of at least 384 query rows
+and on SM100 calls whose longest request has at least 257 query tokens.
+The other BF16 / FP8 programs launch without it, and the NVFP4 family rejects
+it. The TRTLLM-GEN RopeQuant epilogue is not supported.
 
 ```python
 from flashinfer.mla import (

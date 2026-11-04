@@ -267,6 +267,71 @@ def msa_icp_topk_select_prefill(
 
 
 @flashinfer_experimental_api(feature=_FEATURE)
+def msa_icp_prefill_score_select(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    block_table: torch.Tensor,
+    plan,
+    num_valid_pages: torch.Tensor,
+    pool: torch.Tensor,
+    carrier: torch.Tensor,
+    *,
+    rank: int,
+    tp: int = 2,
+    compact: bool = False,
+    force_begin_blocks: int = 0,
+    force_end_blocks: int = 0,
+    enable_pdl: bool = False,
+    backend: str = "cake",
+) -> None:
+    r"""Fused prefill scorer and Top16 select of one query chunk: the carrier
+    rows equal those of :func:`msa_icp_index_score_sharded` followed by
+    :func:`msa_icp_topk_select_prefill` (``index_scale`` / ``index_offset`` of
+    the layout), without the FP32 score rows.
+
+    The list scorer keeps, for every (CTA, plan item) cell, each query row's
+    16 best candidates as sorted 64-bit keys in ``pool``; the list-to-carrier
+    merge folds the lists of a (token, head) row into its carrier row.
+
+    Parameters
+    ----------
+    q, k, block_table, plan, rank, tp : as in :func:`msa_icp_index_score_sharded`.
+    num_valid_pages : torch.Tensor
+        int32 ``[T]``: the token's global B128 block count (0 for padding rows).
+    pool : torch.Tensor
+        Contiguous 16-byte aligned uint8 scratch of at least
+        :func:`msa_icp_prefill_pool_bytes` bytes for the plan's window; never
+        needs zeroing, and one pool serves every chunk and layer.
+    carrier : torch.Tensor
+        int32 ``[4, T, 33]``, unit last stride (a token slice of a larger
+        head-major buffer is allowed); every row ``t < T`` is written.
+    compact : bool
+        Must be ``True`` exactly for P256 shards (one column per local page).
+    force_begin_blocks, force_end_blocks : int
+        As in :func:`msa_icp_topk_select_prefill`; sum at most 16.
+    enable_pdl : bool
+        Launch both kernels with programmatic dependent launch.
+    backend : str
+        Only ``"cake"``.
+    """
+    _cake(backend).prefill_score_select(
+        q,
+        k,
+        block_table,
+        plan,
+        num_valid_pages,
+        pool,
+        carrier,
+        rank=rank,
+        tp=tp,
+        compact=compact,
+        force_begin_blocks=force_begin_blocks,
+        force_end_blocks=force_end_blocks,
+        enable_pdl=enable_pdl,
+    )
+
+
+@flashinfer_experimental_api(feature=_FEATURE)
 def msa_icp_decode_index_score_sharded(
     index_q: torch.Tensor,
     index_k: torch.Tensor,
@@ -568,6 +633,18 @@ def msa_icp_decode_pool_bytes(*, max_decode_tokens: int, num_heads: int = 4) -> 
     )
 
 
+def msa_icp_prefill_pool_bytes(
+    *, total_q: int, batch: int, device: torch.device, num_heads: int = 4
+) -> int:
+    r"""Bytes of the fused prefill path's ``pool`` for a query window of at
+    most ``total_q`` tokens in ``batch`` segments on ``device``: one 32 KiB
+    piece per (scorer CTA, plan item) cell, ``ceil(total_q / 64) + batch - 1
+    + num_sms - 1`` pieces."""
+    return _cake("cake").prefill_pool_bytes(
+        total_q=total_q, batch=batch, device=device, num_heads=num_heads
+    )
+
+
 def msa_icp_comm_layout(world_size: int, heads_per_rank: int, capacity: int) -> dict:
     r"""Layout of the caller's decode receive storage.
 
@@ -622,9 +699,15 @@ def prepare_msa_icp_indexer(
       requests (compute capability 10.7 at P128 TP2 and TP4: 8; ``None`` elsewhere);
     * ``prefill_window_plan(window, ...)`` once per query window and step,
       ``prefill_local(query, index_k, block_table, window_plan, score_scratch,
-      num_valid_pages, carrier_view)`` per query chunk, the caller's one
-      exchange per layer, then ``prefill_merge(received, num_valid_pages,
-      output)``.
+      num_valid_pages, carrier_view, *, pool=None)`` per query chunk, the
+      caller's one exchange per layer, then ``prefill_merge(received,
+      num_valid_pages, output)``.  With ``pool`` (uint8 of
+      ``plan.prefill_pool_shape()``, caller-owned) ``prefill_local`` runs the
+      fused list scorer and list-to-carrier merge of
+      :func:`msa_icp_prefill_score_select` instead (``score_scratch`` may be
+      ``None``; windows of ``plan.prefill_window_tokens()`` tokens);
+      ``plan.fused_prefill`` tells whether that path is the serving default
+      for the layout (``False`` everywhere for now).
 
     ``comm`` holds the receive storage views and counters laid out by
     :func:`msa_icp_comm_layout` (``recv``, ``tagged_recv``, ``recv_bases``,
