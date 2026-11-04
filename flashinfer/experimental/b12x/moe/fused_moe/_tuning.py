@@ -623,6 +623,8 @@ def _materialize_tuning(query, device, choice):
         raise ValueError("compact W4A8 micro requires BF16 activations")
     if config.backend == "micro" and not _policy_micro_supported(effective_query):
         raise ValueError("micro MoE does not support this concrete query")
+    if config.backend == "micro" and query.deterministic_output:
+        raise ValueError("micro MoE has no deterministic combine")
     if config.backend == "dynamic":
         if (
             effective_query.quant_mode in {"w6a8_mx", "w8a8_mx"}
