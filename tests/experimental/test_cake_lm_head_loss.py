@@ -7891,7 +7891,7 @@ def test_device_zero_dlogp_short_last_chunk_cast_bits_without_zero_rows(
     )
 
 
-def test_device_zero_dlogp_default_floor_is_one_row_above_a_chunk(
+def test_device_zero_dlogp_generic_floor_is_one_row_above_a_chunk(
     glm_weight, monkeypatch
 ):
     """The default floor is one row above a default 4096-row chunk: a backward of 4096 valid rows runs without the skip,

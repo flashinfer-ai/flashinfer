@@ -395,11 +395,11 @@ either way.
 
 Default floors (`ZERO_DLOGP_MIN_ROWS_BY_ARCH`, valid rows of one call):
 
-| architecture | floor | measured reason |
+| architecture | floor | chosen from |
 | --- | --- | --- |
-| sm_100a (B200) | 1946 (T = 2048 with 5 % ignored rows) | a one-chunk backward repays the partition launch: with no zero-gradient row no backward, step or checkpointed step of 1946 or 3891 valid rows reads slower than without the skip, and with 16.6 % zero-gradient rows the step is faster |
-| sm_103a (GB300) | 3891 (T = 4096 with 5 % ignored rows) | at 1946 valid rows with no zero-gradient row the temperature backward reads 1.6 % slower than without the skip (the CI below the band on each of two clusters); at 3891 valid rows nothing reads slower |
-| any other (sm_107a included) | 4097 (`ZERO_DLOGP_MIN_ROWS_DEFAULT`) | not measured below one default chunk |
+| sm_100a (B200) | 1946 (T = 2048 with 5 % ignored rows) | timing on B200 at 1946 and 3891 valid rows |
+| sm_103a (GB300) | 3891 (T = 4096 with 5 % ignored rows) | timing on GB300 at 1946 and 3891 valid rows |
+| any other (sm_107a included) | 4097 (`ZERO_DLOGP_MIN_ROWS_DEFAULT`) | not timed below one default chunk |
 
 The per-architecture floors put one-chunk backwards from the floor (1946 valid
 rows on sm_100a, 3891 on sm_103a) to 4096 valid rows on the skip, which the

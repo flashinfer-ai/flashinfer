@@ -2931,13 +2931,18 @@ def set_zero_weight_min_rows(rows: int) -> int:
 # architecture without a floor of its own (:data:`ZERO_DLOGP_MIN_ROWS_BY_ARCH`).
 ZERO_DLOGP_MIN_ROWS_DEFAULT: Optional[int] = DEFAULT_CHUNK_SIZE + 1
 # Per-architecture default floors (valid rows); an architecture not listed uses :data:`ZERO_DLOGP_MIN_ROWS_DEFAULT`.
-# On B200 (sm_100a) a one-chunk call repays the partition's host time from 1946 valid rows on (T = 2048 with 5 %
-# ignored rows): with no zero-gradient row no backward, step or checkpointed step of 1946 or 3891 valid rows reads
-# slower than the call without the skip (plain and temperature log-probability, cooled and after an idle gap), and
-# with 16.6 % zero-gradient rows the step is 3.2 % to 10.9 % faster (the CI above the band) at 1946 and 3891 valid
-# rows on B200 and GB300.  On GB300 (sm_103a) the temperature backward of 1946 valid rows with no zero-gradient row
-# reads 1.6 % slower than the call without the skip (the CI below the band on each of two clusters) and nothing
-# reads slower at 3891 valid rows (T = 4096), so its floor is 3891.  sm_107a keeps the generic floor until measured.
+# Timed at head 6ab51864 (PyTorch 2.14.1+cu130, nvcc 13.4), plain and temperature log-probability, cooled and after
+# an idle gap, against the same head with the skip off: ratio = time without the skip / time with it, with its CI95.
+# B200 (sm_100a), floor 1946 valid rows (T = 2048 with 5 % ignored rows): with no zero-gradient row, of the backward,
+# step and checkpointed step of 1946 and 3891 valid rows none is slower under the timing rule (CI95 below
+# 1 - max(1 %, A/A)); the lowest point ratio is 0.984 [0.974, 0.996] (temperature backward, 1946 valid rows, cooled).
+# GB300 (sm_103a), floor 3891 valid rows (T = 4096): at 3891 valid rows none is slower under the timing rule; the
+# lowest point ratio is 0.989 [0.985, 0.994] (temperature backward, cooled).  At 1946 valid rows the GB300
+# temperature backward with no zero-gradient row has point ratio 0.981 [0.978, 0.990] (the CI95 crosses the band
+# edge) and 0.984 on each of two clusters alone (each CI95 below the band, fewer steps than the rule needs), so the
+# GB300 floor is 3891.  With 16.6 % zero-gradient rows the step at the shipped floors is 4.6 % to 10.6 % faster on
+# B200 (1946 and 3891 valid rows) and 8.8 % to 9.5 % faster on GB300 (3891 valid rows), each faster under the timing
+# rule.  sm_107a keeps the generic floor until measured.
 ZERO_DLOGP_MIN_ROWS_BY_ARCH: dict[str, int] = {"sm_100a": 1946, "sm_103a": 3891}
 
 
