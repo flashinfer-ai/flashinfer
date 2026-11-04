@@ -907,10 +907,12 @@ ROUTER_RULES: dict[
     ("sm_103a", "kk", 4096, 256): None, ("sm_103a", "kk", 5120, 256): None, ("sm_103a", "kk", 6144, 256): None,
     ("sm_107a", "kk", 4096, 256): None, ("sm_107a", "kk", 5120, 256): None, ("sm_107a", "kk", 6144, 256): None,
     # the weight gradient, measured on 152-SM GB200 (sm_100a) / GB300 (sm_103a) and 216-SM R200 (sm_107a) parts.
-    # Few tokens on sm_100a: the SIMT program from 1 to 256 tokens (measured at 64, 128, 192 and 256 tokens, alone, in
-    # the backward pass and in the checkpointed step), the 128 x 64 tile at hidden 4096 (128 CTAs of 256 threads, one
-    # wave on 152 SMs), the 64 x 64 tile at hidden 5120 and 6144 (320 and 384 CTAs of 128 threads; the 128 x 64 tile
-    # gives 160 and 192 CTAs there, more than one per SM, and was 20 to 26 % slower alone).
+    # Few tokens on sm_100a: the SIMT program (measured at 64, 128, 192, 224 and 256 tokens, alone, in the backward
+    # pass and in the checkpointed step), the 128 x 64 tile from 1 to 224 tokens at hidden 4096 (128 CTAs of 256
+    # threads, one wave on 152 SMs; at 256 tokens it was 6 to 12 % slower than the deterministic plan in CUDA graphs
+    # next to a resident kernel holding 32 SMs, which leaves 120 SMs for its 128 CTAs), the 64 x 64 tile from 1 to 256
+    # tokens at hidden 5120 and 6144 (320 and 384 CTAs of 128 threads; the 128 x 64 tile gives 160 and 192 CTAs
+    # there, more than one per SM, and was 20 to 26 % slower alone).
     # Hidden 5120: "waves" at few tokens (faster than the deterministic plan at 64 and 128 tokens, and on sm_103a at
     # 192; more than 3 % slower than it next to a resident kernel at every measured count from 224 to 10240 tokens;
     # on 152-SM sm_100a parts the SIMT window before it takes these token counts),
@@ -934,7 +936,7 @@ ROUTER_RULES: dict[
     # 16172, 16231 and 16384 tokens); hidden 4096 and 6144 keep the deterministic plan: at 4096 "H0.5x4" was up to
     # 7 % slower than that plan when a kernel holding 16 SMs on another stream started during it (the kernel takes SMs
     # the head spans wait for), at 6144 it left the backward pass no faster
-    ("sm_100a", "nn_t", 4096, 256): ((1, 256, "simt_n128m64s2"), (10240, 16384, "H1x5p44")),
+    ("sm_100a", "nn_t", 4096, 256): ((1, 224, "simt_n128m64s2"), (10240, 16384, "H1x5p44")),
     ("sm_100a", "nn_t", 5120, 256): ((1, 256, "simt_n64m64s2"), (1, 128, "waves"), (10240, 32768, "H0.5x3")),
     ("sm_100a", "nn_t", 6144, 256): ((1, 256, "simt_n64m64s2"),),
     ("sm_103a", "nn_t", 4096, 256): ((20480, 49152, "H1x4p44"),),
@@ -960,8 +962,10 @@ ROUTER_SM_COUNT: dict[str, int] = {"sm_100a": 152, "sm_103a": 152, "sm_107a": 21
 #: ``router_fp32_gemm_atomic_nn_t_ht_c3_nreg`` it was up to 9.2 % slower than the deterministic plan next to a resident
 #: kernel).  Hidden 4096 keeps the deterministic plan on both SM counts (on 212 SMs "H0.5x4" with the tensor-memory
 #: program was up to 6.2 % slower next to a resident kernel), as do hidden 6144 on 208 SMs and the forward, as on
-#: 216 SMs.  On 212 SMs every hidden size takes the SIMT program with the 128 x 64 tile from 1 to 256 tokens
-#: (measured at 64, 128, 192 and 256 tokens on 212-SM R200 parts; 128, 160 and 192 CTAs of 256 threads, one wave).
+#: 216 SMs.  On 212 SMs every hidden size takes the SIMT program with the 128 x 64 tile, from 1 to 256 tokens at
+#: hidden 4096 and 5120 and from 1 to 192 tokens at hidden 6144 (measured at 64, 128, 192 and 256 tokens on 212-SM
+#: R200 parts; 128, 160 and 192 CTAs of 256 threads, one wave; at hidden 6144 and 256 tokens it was up to 12 % slower
+#: than the deterministic plan next to a resident kernel holding 32 SMs, which leaves 180 SMs for its 192 CTAs).
 # fmt: off
 ROUTER_RULES_BY_SM: dict[
     tuple[str, int],
@@ -977,7 +981,7 @@ ROUTER_RULES_BY_SM: dict[
         ("sm_107a", "kk", 4096, 256): None, ("sm_107a", "kk", 5120, 256): None, ("sm_107a", "kk", 6144, 256): None,
         ("sm_107a", "nn_t", 4096, 256): ((1, 256, "simt_n128m64s2"),),
         ("sm_107a", "nn_t", 5120, 256): ((1, 256, "simt_n128m64s2"), (16172, 16384, "H0.5x4")),
-        ("sm_107a", "nn_t", 6144, 256): ((1, 256, "simt_n128m64s2"), (16172, 16384, "H0.5x4")),
+        ("sm_107a", "nn_t", 6144, 256): ((1, 192, "simt_n128m64s2"), (16172, 16384, "H0.5x4")),
     }),
 })
 # fmt: on
