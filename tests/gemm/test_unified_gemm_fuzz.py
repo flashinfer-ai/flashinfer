@@ -282,17 +282,8 @@ def _run_mm_mxfp8(a, b, out, backend, cfg):
 
 
 def _mxfp8_quantize_bmm_operand(x):
-    # The folded 3D quantize is only per-batch separable when rows % 128 == 0 (#3604).
-    if x.shape[0] == 1 or x.shape[1] % 128 == 0:
-        return mxfp8_quantize(
-            x, True
-        )  # is_sf_swizzled_layout=True (values identical to linear)
-    quantized = [mxfp8_quantize(x_i, True) for x_i in x.unbind()]
-    rows_pad = (x.shape[1] + 127) // 128 * 128
-    return (
-        torch.stack([q for q, _ in quantized]),
-        torch.stack([s for _, s in quantized]).view(x.shape[0], rows_pad, -1),
-    )
+    # Per-batch [b, rows_pad, k_pad] scale; the folded 1D layout is only valid when rows % 128 == 0 (#3604).
+    return mxfp8_quantize(x, True, rank_preserving=True)
 
 
 def _run_mxfp8_bmm(a, b, out, backend, cfg):

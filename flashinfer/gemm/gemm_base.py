@@ -4936,8 +4936,8 @@ def _check_bmm_mxfp8_scale_shape(
                     "F8_128x4 swizzled block per batch), but got "
                     f"{scale.numel()}. mxfp8_quantize on a 3D tensor pads the "
                     "folded batch*rows, which is only per-batch separable when "
-                    "rows is a multiple of 128; quantize each batch separately "
-                    f"and stack the scales into {expected_shape}."
+                    "rows is a multiple of 128; pass rank_preserving=True to "
+                    f"mxfp8_quantize to get the per-batch {expected_shape} scale."
                 )
         else:
             raise ValueError(
@@ -13221,10 +13221,10 @@ def bmm_mxfp8(
         Scale tensor for A, uint8 (fp8 e8m0 format), in the F8_128x4 swizzled
         layout with one ``[round_up(m, 128), round_up(k, 128) // 32]`` block
         per batch: either a 3D ``[b, round_up(m, 128), round_up(k, 128) // 32]``
-        tensor or that buffer flattened to 1D. ``mxfp8_quantize(A)`` on the 3D
-        ``A`` pads the folded ``b * m`` rows instead, which matches this layout
-        only when ``m % 128 == 0``; otherwise quantize each batch separately and
-        ``torch.stack`` the scales.
+        tensor or that buffer flattened to 1D, as returned by
+        ``mxfp8_quantize(A, rank_preserving=True)``. The default
+        ``mxfp8_quantize(A)`` pads the folded ``b * m`` rows instead, which
+        matches this layout only when ``m % 128 == 0``.
 
     B_scale: torch.Tensor
         Scale tensor for B, uint8 (fp8 e8m0 format), in the same per-batch

@@ -119,12 +119,7 @@ def test_bmm_mxfp8(b, m, n, k, is_sf_swizzled_layout, backend, auto_tuning):
 
 
 def _mxfp8_quantize_per_batch(x):
-    """One F8_128x4 swizzled scale block per batch, stacked to [b, rows_pad, k_pad]."""
-    quantized = [mxfp8_quantize(x_i, True) for x_i in x.unbind()]
-    rows_pad = (x.shape[1] + 127) // 128 * 128
-    x_q = torch.stack([q for q, _ in quantized])
-    scale = torch.stack([s for _, s in quantized]).view(x.shape[0], rows_pad, -1)
-    return x_q, scale
+    return mxfp8_quantize(x, True, rank_preserving=True)
 
 
 def _per_batch_cos_sim(res, reference):
