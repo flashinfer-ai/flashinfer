@@ -8595,8 +8595,17 @@ class _TemperatureResultState:
     temperature_rows: Optional[torch.Tensor] = None
 
 
+class _ProblemResultState:
+    """The validated :class:`Problem` of a log-probability forward (``problem``, without the temperature form): its
+    autograd backward takes it back (:func:`backward_logprob`'s ``_problem``) instead of validating the same ``X``,
+    ``W`` and ``labels`` again.  A plain base class like :class:`_TemperatureResultState`: a typed class default
+    (``None``), not a dataclass field."""
+
+    problem: Optional[Problem] = None
+
+
 @dataclass
-class ForwardResult(_TemperatureResultState):
+class ForwardResult(_TemperatureResultState, _ProblemResultState):
     loss: Optional[torch.Tensor]  # FP32 [] (loss entry)
     logp: (
         torch.Tensor
@@ -9667,7 +9676,7 @@ def forward_logprob(
         tuning=tuning,
         lbl=lbl,
     )
-    return ForwardResult(
+    result = ForwardResult(
         loss=None,
         logp=scatter_rows(logp, row_index, T),
         lse=lse,
@@ -9676,6 +9685,8 @@ def forward_logprob(
         row_index=row_index,
         num_rows=T,
     )
+    result.problem = problem
+    return result
 
 
 def _forward_logprob_rows(
@@ -9751,6 +9762,22 @@ def _forward_logprob_rows(
     return logp, lse, runner.memory
 
 
+def _dlogp_rows(dlogp: torch.Tensor, T: int) -> torch.Tensor:
+    """The incoming ``dlogp`` as the FP32 contiguous ``[T]`` tensor a log-probability backward binds
+    (``dlogp.detach().reshape(T).to(torch.float32).contiguous()``): ``dlogp`` itself when it already is one and needs
+    no detach (the autograd backward's gradient of the FP32 ``[T]`` ``logp``), without those four host calls ahead of
+    the backward's first launch."""
+    if (
+        dlogp.dtype == torch.float32
+        and dlogp.dim() == 1
+        and dlogp.shape[0] == T
+        and not dlogp.requires_grad
+        and dlogp.is_contiguous()
+    ):
+        return dlogp
+    return dlogp.detach().reshape(T).to(torch.float32).contiguous()
+
+
 def _zero_dlogp_skip(
     device: torch.device,
     row_index: Optional[torch.Tensor],
@@ -9802,6 +9829,7 @@ def backward_logprob(
     gemm_tuning: Optional[dict[str, dict[str, Any]]] = None,
     logprob_dz: Optional[bool] = None,
     row_index: Any = _RECOUNT,
+    _problem: Optional[Problem] = None,
 ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Backward of the log-probability entry: recompute each chunk's logits, ``dz = dlogp_t *
     (1[v = y_t] - softmax)`` (ignored rows zero), then ``dX`` (BF16) and ``dW`` (BF16) through
@@ -9828,16 +9856,24 @@ def backward_logprob(
     capturable).  The rows of a zero ``dlogp`` get exact-zero ``dX`` rows and add nothing to ``dW``; ``dX`` of every
     other row is the same; ``dW`` sums the same nonzero products over the live rows in the new row order (FP32).  The
     call's plan decides: a plan whose chunks take a form without a counted one (an explicitly pinned swapped dX tile or
-    weight-gradient TMA epilogue) runs the backward without the skip, rows in the forward's order."""
+    weight-gradient TMA epilogue) runs the backward without the skip, rows in the forward's order.
+
+    ``_problem`` (internal, the autograd Function's): the forward's validated :class:`Problem` of these same ``X``,
+    ``W`` and ``labels`` (:attr:`ForwardResult.problem`, passed only when no saved-tensor hooks could have unpacked
+    another ``X``), taken instead of validating them again."""
     if backend not in BACKENDS:
         raise ValueError(f"backend must be one of {BACKENDS}")
-    problem = validate_lm_head_inputs(
-        X,
-        W,
-        labels,
-        chunk_size=chunk_size,
-        deterministic=deterministic,
-        entry="logprob",
+    problem = (
+        _problem
+        if _problem is not None
+        else validate_lm_head_inputs(
+            X,
+            W,
+            labels,
+            chunk_size=chunk_size,
+            deterministic=deterministic,
+            entry="logprob",
+        )
     )
     if need_dx or need_dw:
         _alert_nondeterministic("backward_logprob")
@@ -9898,7 +9934,7 @@ def backward_logprob(
             else None,
         )
     _check_output(lse, "lse", (rows,), torch.float32)
-    dlogp = dlogp.detach().reshape(T).to(torch.float32).contiguous()
+    dlogp = _dlogp_rows(dlogp, T)
     cache = BINDING_CACHE
     key = None
     valid_count = None if row_index is None else rows
@@ -10038,6 +10074,8 @@ def forward_logprob_temperature(
         deterministic=deterministic,
         entry="logprob",
     )
+    # the validated problem without the temperature form (:attr:`ForwardResult.problem`)
+    checked = problem
     tau = _resolve_temperature(
         temperature, problem.num_rows, X.device, check=check_temperature
     )
@@ -10133,6 +10171,7 @@ def forward_logprob_temperature(
                 num_rows=T,
             )
             result.temperature_rows = tau_rows
+            result.problem = checked
             return result
     runner = prepare_lm_head_loss_temperature(
         X,
@@ -10179,6 +10218,7 @@ def forward_logprob_temperature(
         num_rows=T,
     )
     result.temperature_rows = tau_rows
+    result.problem = checked
     return result
 
 
@@ -10205,6 +10245,7 @@ def backward_logprob_temperature(
     temperature=None,
     check_temperature: bool = False,
     temperature_rows: Optional[torch.Tensor] = None,
+    _problem: Optional[Problem] = None,
 ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
     """:func:`backward_logprob` with a temperature (:func:`_backward_logprob` is the path without one).  Backward
     of the log-probability entry: recompute each chunk's logits, ``dz = dlogp_t *
@@ -10242,16 +10283,21 @@ def backward_logprob_temperature(
     the same as without the skip; ``dW`` sums the live rows in the new row order (FP32), so its bits may differ when a
     row is zero.  The skip needs the temperature itself: the call's ``temperature``, or with ``temperature_rows`` the
     forward's resolved temperature (the autograd Function passes both); ``temperature_rows`` alone runs the backward
-    without the skip."""
+    without the skip.  ``_problem`` (internal) as in :func:`backward_logprob`: the forward's validated problem without
+    the temperature form."""
     if backend not in BACKENDS:
         raise ValueError(f"backend must be one of {BACKENDS}")
-    problem = validate_lm_head_inputs(
-        X,
-        W,
-        labels,
-        chunk_size=chunk_size,
-        deterministic=deterministic,
-        entry="logprob",
+    problem = (
+        _problem
+        if _problem is not None
+        else validate_lm_head_inputs(
+            X,
+            W,
+            labels,
+            chunk_size=chunk_size,
+            deterministic=deterministic,
+            entry="logprob",
+        )
     )
     if need_dx or need_dw:
         _alert_nondeterministic("backward_logprob_temperature")
@@ -10292,6 +10338,7 @@ def backward_logprob_temperature(
             gemm_tuning=gemm_tuning,
             logprob_dz=logprob_dz,
             row_index=row_index,
+            _problem=problem,
         )
     problem = _with_temperature(problem)
     stream_mode = dw_stream_mode(dw_stream)
@@ -10690,7 +10737,7 @@ def backward_logprob_keep(
             else None,
         )
     _check_output(lse, "lse", (rows,), torch.float32)
-    dlogp = dlogp.detach().reshape(T).to(torch.float32).contiguous()
+    dlogp = _dlogp_rows(dlogp, T)
     fuse = bool(need_dw and _resolve_fuse(fuse_dw_cast))
     dx_cast = not (fused_dx and row_index is not None)
     cache = BINDING_CACHE
@@ -10854,6 +10901,14 @@ _TOP_SAVED_HOOKS = (
     if _TOP_SAVED_HOOKS_C is not None
     else (lambda ignore_is_tracing: None)
 )
+
+
+def _saved_problem(result: ForwardResult) -> Optional[Problem]:
+    """The forward's validated problem for its autograd backward (:attr:`ForwardResult.problem`), or ``None`` when
+    saved-tensor hooks are active (``torch.utils.checkpoint``, ``save_on_cpu``, offloading): those may unpack an ``X``
+    of another stride or alignment, so the backward validates what it gets.  Without hooks the backward gets back the
+    tensors the forward validated."""
+    return result.problem if _TOP_SAVED_HOOKS(False) is None else None
 
 
 def _nested_code(cls, name: str) -> Optional[types.CodeType]:
@@ -11450,6 +11505,7 @@ class ChunkedLmHeadLogprobFunction(torch.autograd.Function):
         ctx.set_materialize_grads(False)
         # the valid-row index rides along: the backward plans its chunks without counting the rows again
         ctx.save_for_backward(X, W, labels, result.lse, result.row_index)
+        ctx.problem = _saved_problem(result)
         ctx.chunk_size, ctx.deterministic, ctx.backend, ctx.compact = (
             chunk_size,
             deterministic,
@@ -11489,6 +11545,7 @@ class ChunkedLmHeadLogprobFunction(torch.autograd.Function):
             gemm_tuning=ctx.gemm_tuning,
             logprob_dz=ctx.logprob_dz,
             row_index=row_index,
+            _problem=ctx.problem,
         )
         return (dx, dw) + (None,) * 12
 
@@ -11584,6 +11641,7 @@ class ChunkedLmHeadLogprobTemperatureFunction(torch.autograd.Function):
         ctx.temperature_scalar = (
             tau.value if tau is not None and tau.kind == "scalar" else None
         )
+        ctx.problem = _saved_problem(result)
         ctx.chunk_size, ctx.deterministic, ctx.backend, ctx.compact = (
             chunk_size,
             deterministic,
@@ -11633,6 +11691,7 @@ class ChunkedLmHeadLogprobTemperatureFunction(torch.autograd.Function):
             row_index=row_index,
             temperature=tau if tau_rows is not None else None,
             temperature_rows=tau_rows,
+            _problem=ctx.problem,
         )
         return (dx, dw) + (None,) * 14
 
