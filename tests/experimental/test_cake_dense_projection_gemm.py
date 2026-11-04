@@ -1616,7 +1616,6 @@ def test_k1_152_sm_even_block_ranges(monkeypatch):
     assert routed
 
 
-
 #: The range of :data:`K1_SPLIT_EVEN_BLOCK_RANGES_BY_SM` of the FP32 row ``4096 -> 128`` on 212-SM sm_107a parts (no
 #: verdict in :data:`K1_SPLIT_RULES` or in the part's table of :data:`K1_SPLIT_RULES_BY_SM`): two splits of 64-wide
 #: tiles at a token count that spans an even number of 64-token K blocks.
