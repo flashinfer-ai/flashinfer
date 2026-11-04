@@ -2399,8 +2399,10 @@ def _atomic_k2(
 # small-token program (with its PDL flag and ``weights_static``) stays on that package's call.  A K1 entry binds its
 # argument list once (:class:`_K1Binding`: the plan's values in the program's order with the PDL flag -- a key per
 # flag --, the constant dummies converted once, the workspace converted once per arena growth),
-# so a call rebuilds and converts only its views (each the caller's tensor, its ``unsqueeze(0)`` or one strided view,
-# checked against the planner's views when bound).  A K2 call of ``deterministic=False`` that runs the
+# so a call rebuilds only its views (each the caller's tensor, its ``unsqueeze(0)`` or one strided view, checked
+# against the planner's views when bound; passed as torch tensors, each converted in the FFI call) and enters its
+# thread's stream context of the (device, stream), made once; the projection entry points go from their key straight
+# to the bound launch when it is cached (:func:`_k1_cached_launch`).  A K2 call of ``deterministic=False`` that runs the
 # deterministic program -- a row the planner keeps on it, a call without a split count whose row has no verdict
 # (:func:`_k2_row_without_verdict`, kept per device and view geometry until a router table changes,
 # :func:`_router_memo`; not planned here), a forward without a split count while no router table gives the forward a
@@ -2781,22 +2783,64 @@ def _launch_k1_binding(
 ) -> None:
     """Launch a bound K1 program on the raw ``stream`` of device ``index`` (``det``: the deterministic package's
     ``cake_backend``, for its stream context): the bound argument list with the views of the call's tensors
-    ``sources`` in place (rebuilt and converted here), after binding the arena's workspace again if the arena grew."""
+    ``sources`` in place (rebuilt here; torch tensors, each converted in the FFI call), after binding the arena's
+    workspace again if the arena grew, in the thread's stream context of the (device, stream)
+    (:func:`_k1_stream_context`)."""
     if arena is not None and bound.version != arena.version:
         with arena.lock:
             if bound.version != arena.version:
                 bound.carve(arena)
     args = bound.args.copy()
-    fd = tvm_ffi.from_dlpack
     for i, s, recipe, shape, strides in bound.views:
         t = sources[s]
         if recipe == _K1_VIEW_UNSQUEEZE:
             t = t.unsqueeze(0)
         elif recipe == _K1_VIEW_STRIDED:
             t = t.as_strided(shape, strides)
-        args[i] = fd(t, require_contiguous=False)
-    with det._ffi_stream_context(index, stream):
+        args[i] = t
+    with _k1_stream_context(det, index, stream):
         fn(*args)
+
+
+#: The tvm-ffi stream context of every (thread, device index, raw stream) a K1 launch of this package ran on, made by
+#: the first launch: a context keeps the stream it replaced while it is entered, so a thread enters only its own.
+_K1_STREAM_CONTEXTS: dict[tuple[int, int, int], Any] = {}
+
+
+def _k1_stream_context(det: ModuleType, index: int, stream: int) -> Any:
+    """The calling thread's tvm-ffi stream context of (device ``index``, raw ``stream``)
+    (:data:`_K1_STREAM_CONTEXTS`)."""
+    key = (threading.get_ident(), index, stream)
+    context = _K1_STREAM_CONTEXTS.get(key)
+    if context is None:
+        context = _K1_STREAM_CONTEXTS[key] = det._ffi_stream_context(index, stream)
+    return context
+
+
+def _k1_cached_launch(
+    cache: "OrderedDict[tuple, Any]",
+    head: tuple,
+    tail: tuple,
+    sources: tuple,
+    enable_pdl: Optional[bool],
+) -> bool:
+    """A projection entry point's call of ``deterministic=False`` when its key is cached and bound: the key the entry
+    point's own path builds for the tensors ``sources`` (``(A, B, out)`` of that path) in ``cache`` --
+    :data:`_K1_DET_CACHE` (:func:`_det_k1`, flags ``(*head, pdl, *tail)`` = ``(flags, pdl, weights_static)``) or
+    :data:`_K1_ATOMIC_CACHE` (:func:`_launch_cached_atomic_k1`) -- and its bound launch, without the path's call
+    layers.  ``False`` (nothing launched) when the tensors are not on one CUDA device or the key is not cached and
+    bound: the entry point's own path then plans, launches or raises."""
+    index = _k1_index(*sources)
+    if index < 0:
+        return False
+    det = deterministic_backend()
+    stream = det._current_raw_stream(index)
+    pdl = int(det.pdl_enabled(enable_pdl, index))
+    entry = det._cache_get(cache, _k1_key(index, stream, (*head, pdl, *tail), *sources))
+    if entry is None or entry.k1 is None or entry.entry is None:
+        return False
+    _launch_k1_binding(det, entry.entry, entry.k1, entry.arena, sources, index, stream)
+    return True
 
 
 #: The arena kinds of the workspace markers of a bound K1 launch: this package's split slots and tickets, and the
@@ -2852,6 +2896,11 @@ def _bind_atomic_k1(
 #: The cached bindings of the deterministic K1 program on this package's convenience path (keys of :func:`_k1_key`
 #: over the entry point's tensors).
 _K1_DET_CACHE: "OrderedDict[tuple, Any]" = OrderedDict()
+#: The leading and trailing key flags of :func:`_det_k1` for the projection forward and input gradient (the PDL flag
+#: goes between them), as :func:`_k1_cached_launch` reads them.
+_K1_FWD_HEAD = (("fwd",),)
+_K1_DGRAD_HEAD = (("dgrad",),)
+_K1_NOT_STATIC = (False,)
 
 
 @dataclass
@@ -3758,6 +3807,7 @@ def _drop_convenience_entries() -> None:
         _K2_SPLITK_CACHE.clear()
         _K2_ENTRY_CACHE.clear()
         _ATOMIC_ARENAS.clear()
+        _K1_STREAM_CONTEXTS.clear()
         _ROUTER_MEMO = _RouterMemo(-1, None, None, False, True)
 
 
@@ -3967,6 +4017,10 @@ def projection_forward(
     if out is None:
         out = torch.empty(X.shape[0], W.shape[0], device=X.device, dtype=torch.bfloat16)
     o = out
+    if _k1_cached_launch(
+        _K1_DET_CACHE, _K1_FWD_HEAD, _K1_NOT_STATIC, (X, W, o), enable_pdl
+    ):
+        return o
     return _det_k1(
         (X, W, o),
         ("fwd",),
@@ -4000,6 +4054,10 @@ def projection_dgrad(
             dtype=out_dtype or torch.bfloat16,
         )
     o = out
+    if _k1_cached_launch(
+        _K1_DET_CACHE, _K1_DGRAD_HEAD, _K1_NOT_STATIC, (G, W, o), enable_pdl
+    ):
+        return o
     return _det_k1(
         (G, W, o),
         ("dgrad",),
@@ -4076,9 +4134,20 @@ def projection_wgrad(
             device=G.device,
             dtype=out_dtype or torch.bfloat16,
         )
+    A = X.t()
+    # the key flags of _launch_cached_atomic_k1 for this call: ("k1", transposed_out, own items, det_knobs) + pdl +
+    # (weights_static,)
+    if _k1_cached_launch(
+        _K1_ATOMIC_CACHE,
+        ("k1", True, (), (sk, cta_rows)),
+        _K1_NOT_STATIC,
+        (A, G, out),
+        enable_pdl,
+    ):
+        return out
     return _atomic_k1(
         "launch",
-        X.t(),
+        A,
         G,
         out,
         transposed_out=True,
