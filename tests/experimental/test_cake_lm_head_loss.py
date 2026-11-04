@@ -7372,8 +7372,9 @@ def test_device_zero_dlogp_one_chunk_backward_cuda_graph(
     glm_weight, monkeypatch, tau, warm, slices
 ):
     """A one-chunk log-probability backward under the zero-gradient row skip (plain and with a distinct per-token
-    temperature) captured in a CUDA graph through its remembered binding -- after one warm-up the captured call is the
-    binding's first call, after two a later call -- replays with other ``dlogp`` values written into the captured input
+    temperature) captured in a CUDA graph through its remembered binding -- the first warm-up call (the runner's) makes
+    and remembers the binding, so the captured call is the binding's first remembered call after one warm-up and its
+    second after two -- replays with other ``dlogp`` values written into the captured input
     (other zero rows and live counts, none, a single live row and every row zero) and gives the eager backward's bits
     on those values: ``dW`` bitwise; ``dX`` bitwise with one dX slice pinned and, with the default slices (an
     unordered split-K reduction), exact ``+0`` on the zero and ignored rows and the eager values within the reduction
@@ -7534,7 +7535,9 @@ def test_device_binding_scratch_slots_cover_every_launch(glm_weight, T, case):
     sequences bind or return: the log-probability forward ``d`` and ``term`` (``row_finalize``), its backward none,
     the loss entry's forward all four.  Every launch and host step of a binding's forward / backward sequence finds
     every value it binds when only that sequence's scratch slots are present, and the remembered calls give the first
-    call's bits."""
+    call's bits.  The log-probability cases set the zero-gradient row skip's floor: ``logprob_skip`` runs it (``0``),
+    ``logprob`` and ``logprob_tau`` run the shipped backward (``None``) on every architecture -- on sm_100a / sm_103a
+    the default floor (1946 valid rows) would put both sizes on the skip."""
     _require_program(entry="loss" if case.startswith("loss") else "logprob")
     objective = "policy" if case == "loss_policy" else "ce"
     inp = _device_inputs(T, objective, W=glm_weight)
@@ -7550,7 +7553,7 @@ def test_device_binding_scratch_slots_cover_every_launch(glm_weight, T, case):
     kw = dict(entry=entry, backend="cake", **_TAU_ONE)
     cake_backend.BINDING_CACHE.clear()
     with contextlib.ExitStack() as stack:
-        if floor is not None:
+        if entry == "logprob":
             stack.enter_context(_zero_dlogp_floor(floor))
         runs = [_run(inp, 4096, **kw) for _ in range(3)]
     for run in runs[1:]:
@@ -7586,6 +7589,13 @@ def test_device_binding_scratch_slots_cover_every_launch(glm_weight, T, case):
         checked[kind] += 1
     assert checked["fwd"] >= 1, (case, checked)
     assert entry == "loss" or checked["bwd"] >= 1, (case, checked)
+    if entry == "logprob":
+        skip = {
+            bool(b.plan.dcnt)
+            for k, b in cake_backend.BINDING_CACHE._bindings.items()
+            if k[0] == "bwd"
+        }
+        assert skip == {floor == 0}, (case, skip)
 
 
 def test_device_zero_dlogp_default_floor_per_architecture(glm_weight, monkeypatch):
