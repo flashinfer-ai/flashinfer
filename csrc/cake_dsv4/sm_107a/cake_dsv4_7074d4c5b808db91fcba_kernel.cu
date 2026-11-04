@@ -342,18 +342,18 @@ kernel_cake_dsv4_7074d4c5b808db91fcba(const __grid_constant__ CUtensorMap tmap_q
     const int smem_p_addr = smem + 197632;
     __nv_bfloat16* smem_epi = reinterpret_cast<__nv_bfloat16*>(smem_raw + 230400);
     const int smem_epi_addr = smem + 230400;
-    int* smem_index = reinterpret_cast<int*>(smem_raw + 246784);
-    const int smem_index_addr = smem + 246784;
-    float* smem_peer_max = reinterpret_cast<float*>(smem_raw + 252928);
-    const int smem_peer_max_addr = smem + 252928;
-    float* smem_acc_scale = reinterpret_cast<float*>(smem_raw + 253952);
-    const int smem_acc_scale_addr = smem + 253952;
-    float* smem_peer_sum = reinterpret_cast<float*>(smem_raw + 254976);
-    const int smem_peer_sum_addr = smem + 254976;
-    float* smem_row_total = reinterpret_cast<float*>(smem_raw + 255488);
-    const int smem_row_total_addr = smem + 255488;
-    unsigned int* work_response = reinterpret_cast<unsigned int*>(smem_raw + 256000);
-    const int work_response_addr = smem + 256000;
+    int* smem_index = reinterpret_cast<int*>(smem_raw + 263168);
+    const int smem_index_addr = smem + 263168;
+    float* smem_peer_max = reinterpret_cast<float*>(smem_raw + 269312);
+    const int smem_peer_max_addr = smem + 269312;
+    float* smem_acc_scale = reinterpret_cast<float*>(smem_raw + 270336);
+    const int smem_acc_scale_addr = smem + 270336;
+    float* smem_peer_sum = reinterpret_cast<float*>(smem_raw + 271360);
+    const int smem_peer_sum_addr = smem + 271360;
+    float* smem_row_total = reinterpret_cast<float*>(smem_raw + 271872);
+    const int smem_row_total_addr = smem + 271872;
+    unsigned int* work_response = reinterpret_cast<unsigned int*>(smem_raw + 272384);
+    const int work_response_addr = smem + 272384;
 
     // Mbarrier init (52 barriers at smem_raw[0..416))
 
@@ -1316,8 +1316,13 @@ kernel_cake_dsv4_7074d4c5b808db91fcba(const __grid_constant__ CUtensorMap tmap_q
                     tmem_ld_x16(&epi_ring[0], o_tmem);
                     #pragma unroll 1
                     for (int box = 0; box < 4; box++) {
+                        int epi_box_base = epi_stage_base + (box & 1) * 16384;
                         if (elect_sync()) {
-                            asm volatile("cp.async.bulk.wait_group.read 0;");
+                            if (box == 0) {
+                                asm volatile("cp.async.bulk.wait_group.read 0;");
+                            } else if (box >= 2) {
+                                asm volatile("cp.async.bulk.wait_group.read 1;");
+                            }
                         }
                         __syncwarp();
                         asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
@@ -1336,9 +1341,9 @@ kernel_cake_dsv4_7074d4c5b808db91fcba(const __grid_constant__ CUtensorMap tmap_q
                             epi_packed_0[_lp] = *(uint32_t*)&_bf2;
                         }
                         int epi_col_0 = 0;
-                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((epi_stage_base + (lane * 128 + epi_col_0 ^ (lane * 128 + epi_col_0 >> 7 & 7) << 4))), "r"(epi_packed_0[0]), "r"(epi_packed_0[1]), "r"(epi_packed_0[2]), "r"(epi_packed_0[3]) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((epi_box_base + (lane * 128 + epi_col_0 ^ (lane * 128 + epi_col_0 >> 7 & 7) << 4))), "r"(epi_packed_0[0]), "r"(epi_packed_0[1]), "r"(epi_packed_0[2]), "r"(epi_packed_0[3]) : "memory");
                         int epi_col_1 = 16;
-                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((epi_stage_base + (lane * 128 + epi_col_1 ^ (lane * 128 + epi_col_1 >> 7 & 7) << 4))), "r"(epi_packed_0[4]), "r"(epi_packed_0[5]), "r"(epi_packed_0[6]), "r"(epi_packed_0[7]) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((epi_box_base + (lane * 128 + epi_col_1 ^ (lane * 128 + epi_col_1 >> 7 & 7) << 4))), "r"(epi_packed_0[4]), "r"(epi_packed_0[5]), "r"(epi_packed_0[6]), "r"(epi_packed_0[7]) : "memory");
                         asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
                         if (box * 4 + 1 + 1 < 16) {
                             tmem_ld_x16(&epi_ring[0], o_tmem + (box * 64 + 32));
@@ -1355,9 +1360,9 @@ kernel_cake_dsv4_7074d4c5b808db91fcba(const __grid_constant__ CUtensorMap tmap_q
                             epi_packed_1[_lp] = *(uint32_t*)&_bf2;
                         }
                         int epi_col_2 = 32;
-                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((epi_stage_base + (lane * 128 + epi_col_2 ^ (lane * 128 + epi_col_2 >> 7 & 7) << 4))), "r"(epi_packed_1[0]), "r"(epi_packed_1[1]), "r"(epi_packed_1[2]), "r"(epi_packed_1[3]) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((epi_box_base + (lane * 128 + epi_col_2 ^ (lane * 128 + epi_col_2 >> 7 & 7) << 4))), "r"(epi_packed_1[0]), "r"(epi_packed_1[1]), "r"(epi_packed_1[2]), "r"(epi_packed_1[3]) : "memory");
                         int epi_col_3 = 48;
-                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((epi_stage_base + (lane * 128 + epi_col_3 ^ (lane * 128 + epi_col_3 >> 7 & 7) << 4))), "r"(epi_packed_1[4]), "r"(epi_packed_1[5]), "r"(epi_packed_1[6]), "r"(epi_packed_1[7]) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((epi_box_base + (lane * 128 + epi_col_3 ^ (lane * 128 + epi_col_3 >> 7 & 7) << 4))), "r"(epi_packed_1[4]), "r"(epi_packed_1[5]), "r"(epi_packed_1[6]), "r"(epi_packed_1[7]) : "memory");
                         asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
                         if (box * 4 + 2 + 1 < 16) {
                             tmem_ld_x16(&epi_ring[16], o_tmem + (box * 64 + 48));
@@ -1374,9 +1379,9 @@ kernel_cake_dsv4_7074d4c5b808db91fcba(const __grid_constant__ CUtensorMap tmap_q
                             epi_packed_2[_lp] = *(uint32_t*)&_bf2;
                         }
                         int epi_col_4 = 64;
-                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((epi_stage_base + (lane * 128 + epi_col_4 ^ (lane * 128 + epi_col_4 >> 7 & 7) << 4))), "r"(epi_packed_2[0]), "r"(epi_packed_2[1]), "r"(epi_packed_2[2]), "r"(epi_packed_2[3]) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((epi_box_base + (lane * 128 + epi_col_4 ^ (lane * 128 + epi_col_4 >> 7 & 7) << 4))), "r"(epi_packed_2[0]), "r"(epi_packed_2[1]), "r"(epi_packed_2[2]), "r"(epi_packed_2[3]) : "memory");
                         int epi_col_5 = 80;
-                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((epi_stage_base + (lane * 128 + epi_col_5 ^ (lane * 128 + epi_col_5 >> 7 & 7) << 4))), "r"(epi_packed_2[4]), "r"(epi_packed_2[5]), "r"(epi_packed_2[6]), "r"(epi_packed_2[7]) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((epi_box_base + (lane * 128 + epi_col_5 ^ (lane * 128 + epi_col_5 >> 7 & 7) << 4))), "r"(epi_packed_2[4]), "r"(epi_packed_2[5]), "r"(epi_packed_2[6]), "r"(epi_packed_2[7]) : "memory");
                         asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
                         if (box == 1) {
                             int _parity_o_full_1 = (int)((unsigned int)correction_tile_cursor % 2) ^ 1;
@@ -1403,16 +1408,16 @@ kernel_cake_dsv4_7074d4c5b808db91fcba(const __grid_constant__ CUtensorMap tmap_q
                             epi_packed_3[_lp] = *(uint32_t*)&_bf2;
                         }
                         int epi_col_6 = 96;
-                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((epi_stage_base + (lane * 128 + epi_col_6 ^ (lane * 128 + epi_col_6 >> 7 & 7) << 4))), "r"(epi_packed_3[0]), "r"(epi_packed_3[1]), "r"(epi_packed_3[2]), "r"(epi_packed_3[3]) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((epi_box_base + (lane * 128 + epi_col_6 ^ (lane * 128 + epi_col_6 >> 7 & 7) << 4))), "r"(epi_packed_3[0]), "r"(epi_packed_3[1]), "r"(epi_packed_3[2]), "r"(epi_packed_3[3]) : "memory");
                         int epi_col_7 = 112;
-                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((epi_stage_base + (lane * 128 + epi_col_7 ^ (lane * 128 + epi_col_7 >> 7 & 7) << 4))), "r"(epi_packed_3[4]), "r"(epi_packed_3[5]), "r"(epi_packed_3[6]), "r"(epi_packed_3[7]) : "memory");
+                        asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((epi_box_base + (lane * 128 + epi_col_7 ^ (lane * 128 + epi_col_7 >> 7 & 7) << 4))), "r"(epi_packed_3[4]), "r"(epi_packed_3[5]), "r"(epi_packed_3[6]), "r"(epi_packed_3[7]) : "memory");
                         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                         asm volatile("tcgen05.fence::before_thread_sync;");
                         __syncwarp();
                         asm volatile("tcgen05.fence::after_thread_sync;");
                         if (epi_head0 < num_heads) {
                             if (elect_sync()) {
-                                tma_store_3d((&tmap_o), 0, query_1 * num_heads + epi_head0, cta_rank_2 * 4 + box, epi_stage_base);
+                                tma_store_3d((&tmap_o), 0, query_1 * num_heads + epi_head0, cta_rank_2 * 4 + box, epi_box_base);
                                 asm volatile("cp.async.bulk.commit_group;");
                             }
                         }
