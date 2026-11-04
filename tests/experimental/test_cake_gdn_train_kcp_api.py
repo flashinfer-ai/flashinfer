@@ -1339,7 +1339,16 @@ def test_facade_under_torch_deterministic_mode_takes_the_twin_and_warns_once(
 def test_facade_default_route_returns_the_twins_objects() -> None:
     """Without the recorders: the facade's default route builds the twin's partition / context
     (``PartitionDetKcp`` / ``ContextDetKcp``), ``deterministic=False`` this package's; both describe the same plan
-    (partition tables, byte queries)."""
+    (partition tables, segment plan, the comm byte query, the saved byte query at the default options on this
+    ``P = 1`` pack, and at ``P = 2`` with either ``save_mode`` and ``save_transfer``: both count ``M_seg`` as ``P
+    n_frag s`` with ``save_transfer`` or ``save_mode="full"``).  The saved queries differ (until the twin adopts this
+    package's rule, pinned here) under ``boundary_mode="replay"`` with ``save_mode="full"``: this package keeps no
+    tape (a replay boundary saves nothing) where the twin counts the ten full-mode tapes.  The workspace query is
+    not compared: on a rank with crossing fragments this package's counts pools the twin's query leaves out (the
+    ``M_f^T`` tiles and the fused walks' carry slots at ``P > 1``, the larger b1 split form, the forward exchange
+    pools of a saved backward on a caller-held workspace), and its ``graph`` / ``save_for_backward`` /
+    ``fused_walks`` keywords are this package's only: through the facade they need ``deterministic=False`` (the
+    default route raises ``TypeError``)."""
     facade = importlib.import_module(FACADE)
     det_pkg = importlib.import_module(DET_PACKAGE)
     pkg = _mod()
@@ -1356,14 +1365,59 @@ def test_facade_default_route_returns_the_twins_objects() -> None:
         )
         assert isinstance(det_ctx, det_pkg.ContextDetKcp)
         assert isinstance(ctx, pkg.ContextKcp)
-        for query in (
-            "gdn_comm_bytes_kcp",
-            "gdn_saved_bytes_kcp",
-            "gdn_workspace_bytes_kcp",
-        ):
+        det_hp, hp = det_ctx.heads(6), ctx.heads(6)
+        assert (det_hp.P, det_hp.NSEG) == (hp.P, hp.NSEG), rank
+        for query in ("gdn_comm_bytes_kcp", "gdn_saved_bytes_kcp"):
             det_value = getattr(facade, query)(det_ctx, H_qk=2, HV=6)
             value = getattr(facade, query)(ctx, H_qk=2, HV=6, deterministic=False)
             assert det_value == value, (rank, query)
+        # the saved-query difference of today (the twin keeps its rule until it adopts this one)
+        full_tapes = sum(
+            v
+            for k, v in _mod("cake_bytes")
+            .gdn_saved_layout_kcp(ctx, H_qk=2, HV=6, save_mode="full")
+            .items()
+            if k not in ("S_in", "c1_recv", "M_seg", "hist")
+        )
+        assert full_tapes > 0
+        replay_full = dict(H_qk=2, HV=6, save_mode="full", boundary_mode="replay")
+        assert (
+            facade.gdn_saved_bytes_kcp(det_ctx, **replay_full)
+            - facade.gdn_saved_bytes_kcp(ctx, **replay_full, deterministic=False)
+            == full_tapes
+        ), rank
+        # the M_seg rule at P > 1 is shared (P n_frag s with save_transfer or save_mode="full")
+        assert ctx.n_frag > 0
+        for kw in (
+            {},
+            {"save_transfer": False},
+            {"save_mode": "full"},
+            {"save_mode": "full", "save_transfer": False},
+        ):
+            det_value = facade.gdn_saved_bytes_kcp(det_ctx, H_qk=2, HV=6, P=2, **kw)
+            value = facade.gdn_saved_bytes_kcp(
+                ctx, H_qk=2, HV=6, P=2, deterministic=False, **kw
+            )
+            assert det_value == value, (rank, kw)
+        # this package's workspace keywords: the non-deterministic route only
+        for kw in (
+            {"graph": "replay"},
+            {"save_for_backward": False},
+            {"fused_walks": 0, "P": 2, "backward": False},
+        ):
+            assert facade.gdn_workspace_bytes_kcp(
+                ctx, H_qk=2, HV=6, deterministic=False, **kw
+            ) == pkg.gdn_workspace_bytes_kcp(ctx, H_qk=2, HV=6, **kw), (rank, kw)
+            with pytest.raises(TypeError, match=next(iter(kw))):
+                facade.gdn_workspace_bytes_kcp(det_ctx, H_qk=2, HV=6, **kw)
+        # the facade passes fused_walks=0 on: at P = 2 its forward has no carry slots for the crossing fragments
+        assert max(ctx.n_in, ctx.n_out) > 0
+        split_walks = facade.gdn_workspace_bytes_kcp(
+            ctx, H_qk=2, HV=6, deterministic=False, fused_walks=0, P=2, backward=False
+        )
+        fused = pkg.gdn_workspace_bytes_kcp(ctx, H_qk=2, HV=6, P=2, backward=False)
+        state = 6 * _mod("cake_bytes").STATE_TILE_BYTES
+        assert fused - split_walks == max(ctx.n_in, ctx.n_out) * state, rank
 
 
 def test_the_context_holds_no_mode() -> None:

@@ -619,7 +619,7 @@ one program, the two passes of the segmented walk; `bwd_prep_g8_noqg` and
 `bwd_prep_g8_noqg_nokb` are two keyword forms of one kernel, and the four
 raw prep records four keyword forms of another; the records shipped
 on some of the architectures only are `glm_intra_v14`, `glm_intra_v18`, `glm_intra`,
-`gate_epilogue`, `fwd_intra_v37_l2n` and the two `_nohint` records (`sm_107a`); `wy_bwd` and `wy_fwd_rows`
+`gate_epilogue`, `fwd_intra_v37_l2n`, `glm_intra_v30_l2n` and the two `_nohint` records (`sm_107a`); `wy_bwd` and `wy_fwd_rows`
 are one program, the WY representation from the saved `Akk` on the backward
 and on the saving forward's overlap and paired serial rows; `fwdh_p3_o_ov`,
 `fwdh_p3_o_ov_id` and their `_rows` twins are the only programs launched with
