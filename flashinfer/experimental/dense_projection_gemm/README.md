@@ -203,7 +203,7 @@ output at 512 tokens on `6144 -> 32`, at 2048 on `5120 -> 64`, at 8192 on `5120 
 | K1 row `d_in -> d_out` (FP32 out unless marked BF16) | 208 SMs | 212 SMs | 216 SMs |
 |---|---|---|---|
 | `4096 -> 32` | -- | -- | 16231 |
-| `4096 -> 32` BF16 | -- | -- | 512¶; 8192¶ |
+| `4096 -> 32` BF16 | -- | -- | 512¶ |
 | `4096 -> 48` | 16231; 16384 | -- | 512¶; 16231; 16384 |
 | `4096 -> 64` | 16231; 16384 | -- | 512¶; 16231; 16384 |
 | `4096 -> 512` | 16231; 16384 | 16231; 16384 | 16231; 16384; 40961 and up§ |
@@ -214,7 +214,7 @@ output at 512 tokens on `6144 -> 32`, at 2048 on `5120 -> 64`, at 8192 on `5120 
 | `5120 -> 64` | 16231 | 16231 | 512¶; 16231; 16384 |
 | `5120 -> 512` | -- | 16231; 16384 | 40961 and up§ |
 | `5120 -> 1024` | -- | -- | 40961 and up§ |
-| `5120 -> 1024` BF16 | -- | -- | 16231; 65536¶ |
+| `5120 -> 1024` BF16 | -- | -- | 16231 |
 | `6144 -> 32` BF16 | -- | -- | 512¶ |
 | `8192 -> 128`, BF16 and FP32 | -- | -- | 512¶; 65536¶ |
 
@@ -256,8 +256,9 @@ the K1 rule in some run and the deterministic program leaves the backward pass a
 1.3 % slower on both parts (the worst of the ratio of the medians and the median of the paired ratios, eager launches
 and graph replays: the rule of the `sm_100a` / `sm_103a` entries); the neighbouring token counts were not measured and
 keep the verdict.  Measured points that failed but keep the verdict, because the deterministic program makes the
-backward pass or the checkpointed step more than 1.3 % slower there: BF16 output at 32768 tokens on `4096 -> 32` and
-`5120 -> 1024`, FP32 output at 512 tokens on `4096 -> 32` and `6144 -> 32`.*
+backward pass or the checkpointed step more than 1.3 % slower there on a part: BF16 output at 8192 tokens on
+`4096 -> 32`, at 32768 tokens on `4096 -> 32` and `5120 -> 1024`, at 65536 tokens on `5120 -> 1024`; FP32 output at
+512 tokens on `4096 -> 32` and `6144 -> 32`.*
 
 | K1 row `d_in -> d_out` (FP32 out unless marked BF16) | 212 SMs: token ranges besides 16172 to 16384 | measured token counts outside them |
 |---|---|---|

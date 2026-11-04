@@ -368,7 +368,7 @@ K1_RULE_MIN_SM_COUNT: dict[tuple[str, int, int, int, str], int] = {
 #: deterministic package's sm_107a rules for one token count (16231 and 16384 tokens; 16231 only for ``4096 -> 1024``),
 #: which give the row a faster deterministic plan there, and 16231 tokens of ``5120 -> 1024`` BF16 on 216 SMs (measured
 #: in the same runs; the deterministic plan there is the row's plan at every token count).  The other single 216-SM
-#: token counts (512, 8192 and 65536) come from a re-measurement of chosen points at 512, 8192, 32768 and 65536 tokens
+#: token counts (512 and 65536) come from a re-measurement of chosen points at 512, 8192, 32768 and 65536 tokens
 #: on two 216-SM parts per point under the rule of the sm_100a / sm_103a entries (the protocol is in the sm_107a K1
 #: token table of the README); their neighbouring token counts were not measured.  On 208, 212 and 216 SMs the window
 #: entries come from a re-measurement at 16172, 16231 and 16384 tokens against those plans (the protocol is in the
@@ -420,7 +420,7 @@ K1_SPLIT_RULE_EXCLUDED_TOKENS: dict[
     ("sm_103a", 1, 6144, 32, "f32"): ((152, 512, 512),),
     ("sm_103a", 1, 6144, 128, "bf16"): ((152, 512, 8192),),
     ("sm_103a", 1, 6144, 128, "f32"): ((152, 512, 8192),),
-    ("sm_107a", 1, 4096, 32, "bf16"): ((216, 512, 512), (216, 8192, 8192)),
+    ("sm_107a", 1, 4096, 32, "bf16"): ((216, 512, 512),),
     ("sm_107a", 1, 4096, 32, "f32"): ((216, 16231, 16231),),
     ("sm_107a", 1, 4096, 48, "f32"): (
         (208, 16231, 16231), (208, 16384, 16384), (216, 512, 512), (216, 16231, 16231),
@@ -448,7 +448,7 @@ K1_SPLIT_RULE_EXCLUDED_TOKENS: dict[
         (216, 16384, 16384),
     ),
     ("sm_107a", 1, 5120, 512, "f32"): ((212, 16231, 16231), (212, 16384, 16384), (216, 40961, None)),
-    ("sm_107a", 1, 5120, 1024, "bf16"): ((216, 16231, 16231), (216, 65536, 65536)),
+    ("sm_107a", 1, 5120, 1024, "bf16"): ((216, 16231, 16231),),
     ("sm_107a", 1, 5120, 1024, "f32"): ((216, 40961, None),),
     ("sm_107a", 1, 6144, 32, "bf16"): ((216, 512, 512),),
     ("sm_107a", 1, 8192, 128, "bf16"): ((216, 512, 512), (216, 65536, 65536)),

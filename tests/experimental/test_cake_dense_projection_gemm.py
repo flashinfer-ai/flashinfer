@@ -1447,14 +1447,13 @@ def test_k1_exact_sm_count_exclusions(monkeypatch):
 #: The 216-SM entries of :data:`K1_SPLIT_RULE_EXCLUDED_TOKENS` at single measured token counts outside 16172 to 16384
 #: tokens, ``key -> token counts``: from 216 SMs up these rows run the deterministic program there.
 K1_216_SINGLE_TOKENS = {
-    ("sm_107a", 1, 4096, 32, "bf16"): (512, 8192),
+    ("sm_107a", 1, 4096, 32, "bf16"): (512,),
     ("sm_107a", 1, 4096, 48, "f32"): (512,),
     ("sm_107a", 1, 4096, 64, "f32"): (512,),
     ("sm_107a", 1, 5120, 32, "bf16"): (512,),
     ("sm_107a", 1, 5120, 32, "f32"): (512,),
     ("sm_107a", 1, 5120, 48, "f32"): (512,),
     ("sm_107a", 1, 5120, 64, "f32"): (512,),
-    ("sm_107a", 1, 5120, 1024, "bf16"): (65536,),
     ("sm_107a", 1, 6144, 32, "bf16"): (512,),
     ("sm_107a", 1, 8192, 128, "bf16"): (512, 65536),
     ("sm_107a", 1, 8192, 128, "f32"): (512, 65536),
