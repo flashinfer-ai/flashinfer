@@ -686,6 +686,16 @@ def test_every_stage_binds_the_public_argument_plan():
         ), name
 
 
+# The 8/1 pdl builds whose SM100 library takes the CTA cap in its own binding: the
+# prefill builds (two preload rounds, 256-bit loads, with and without the
+# pre-rotation sum of squares).  Their SM103 libraries and every other library
+# compile the shared binding.
+_SM100_CAPPED = (
+    "hq8_hkv1_lookup_rounds2_wide_f32_loads1_pdl",
+    "hq8_hkv1_lookup_rounds2_wide_f32_loads1_pre_rot_ss1_pdl",
+)
+
+
 def test_registry_records_reference_the_build_manifest():
     """Every ``MODULES`` record names its ``build.json`` library and nothing to compile.
 
@@ -712,6 +722,28 @@ def test_registry_records_reference_the_build_manifest():
         ), name
         knobs = record["knobs"]
         assert set(knobs) == set(loader.KNOB_KEYS), name
+        pdl = record["knobs"]["pdl"]
+        assert record["launch"]["use_pdl"] is pdl, name
+        assert name.endswith(loader.PDL_SUFFIX) == pdl, name
+        kernel_text = (PACKAGE_DIR / f"csrc/{record['library']}_kernel.cu").read_text()
+        binding_text = (
+            PACKAGE_DIR / f"csrc/{record['library']}_binding.cu"
+        ).read_text()
+        # A pdl build waits on the preceding grid and launches with the PDL
+        # attribute; a plain build does neither.
+        assert ("ProgrammaticStreamSerialization" in binding_text) == pdl, name
+        if pdl:
+            plain = loader.MODULES[name.removesuffix(loader.PDL_SUFFIX)]
+            assert record["arches"] == [
+                arch for arch in plain["arches"] if arch in loader.PDL_POLICY["arches"]
+            ], name
+            assert {**record["knobs"], "pdl": False} == plain["knobs"], name
+            assert record["arg_plan"] == plain["arg_plan"], name
+            assert record["grid_rule"] == plain["grid_rule"], name
+            assert "griddepcontrol.wait" in kernel_text, name
+            assert "griddepcontrol.launch_dependents" not in kernel_text, name
+        else:
+            assert "griddepcontrol" not in kernel_text, name
         heads = (int(knobs["num_q_heads"]), int(knobs["num_kv_heads"]))
         assert heads in loader.SUPPORTED_HEADS, name
         assert name.startswith(f"hq{heads[0]}_hkv{heads[1]}"), name
@@ -735,9 +767,13 @@ def test_registry_records_reference_the_build_manifest():
             entry = libraries[library]
             assert entry["arch"] == arch
             assert entry["entry"] == "run"
+            # The capped 8/1 prefill pdl builds compile their own SM100 binding.
+            own = name in _SM100_CAPPED and arch == "sm_100a"
             assert entry["sources"] == [
                 f"csrc/{record['library']}_kernel.cu",
-                f"csrc/{record['library']}_binding.cu",
+                f"csrc/{record['library']}_{arch}_binding.cu"
+                if own
+                else f"csrc/{record['library']}_binding.cu",
             ]
             assert set(entry["sha256"]) == set(entry["sources"])
             for source in entry["sources"]:
@@ -753,6 +789,72 @@ def test_registry_records_reference_the_build_manifest():
         }
         assert set(loader.stages_for(arch)) == shipped
         assert shipped, arch
+
+
+def test_the_capped_builds_ship_their_own_sm100_binding():
+    """The capped builds' SM100 binding is the shared binding plus the CTA cap: it
+    adds lines only (``CtaCap`` of the SM count and the grid, the occupancy-sized
+    dynamic shared memory, the ``cta_cap`` export) and launches as the shared
+    binding does; no other file ships an architecture's own binding."""
+    own_files = sorted(
+        path.name for path in (PACKAGE_DIR / "csrc").glob("*_sm_*_binding.cu")
+    )
+    libraries = [loader.MODULES[name]["library"] for name in _SM100_CAPPED]
+    assert own_files == sorted(f"{lib}_sm_100a_binding.cu" for lib in libraries)
+    for name, library in zip(_SM100_CAPPED, libraries, strict=True):
+        assert loader.MODULES[name]["arches"] == ["sm_100a", "sm_103a"], name
+        shared = (PACKAGE_DIR / f"csrc/{library}_binding.cu").read_text()
+        own = (PACKAGE_DIR / f"csrc/{library}_sm_100a_binding.cu").read_text()
+        assert "CtaCap" not in shared and "max_ctas_per_sm" not in shared, name
+        for spelled in (
+            "int64_t CtaCap(int64_t sms, int64_t ctas) {",
+            "case 148:",
+            "case 152:",
+            "cudaDevAttrMultiProcessorCount",
+            "config.dynamicSmemBytes = CtaCapSmemBytes(dev.device_id, cap);",
+            f"TVM_FFI_DLL_EXPORT_TYPED_FUNC(cta_cap, cake_binding_kernel_{library}::CtaCap);",
+            "cudaLaunchAttributeProgrammaticStreamSerialization",
+        ):
+            assert spelled in own, (name, spelled)
+        remaining = iter(own.splitlines())
+        assert all(
+            any(line == other for other in remaining) for line in shared.splitlines()
+        ), name
+
+
+# (SM count, grid CTAs) -> the CTA cap the SM100 binding of a capped build takes:
+# the CTAs per SM, rounded up, inside B200's [152, 296] and GB200's [140, 144],
+# at every edge and one CTA beyond it; any other SM count takes none.
+_SM100_CAPS = {
+    (148, 139): 0,
+    (148, 140): 0,
+    (148, 148): 0,
+    (148, 149): 0,
+    (148, 151): 0,
+    (148, 152): 2,
+    (148, 296): 2,
+    (148, 297): 0,
+    (152, 139): 0,
+    (152, 140): 1,
+    (152, 144): 1,
+    (152, 145): 0,
+    (152, 152): 0,
+    (152, 264): 0,
+    (152, 305): 0,
+    (132, 140): 0,
+    (144, 144): 0,
+    (160, 152): 0,
+    (148, 0): 0,
+}
+
+
+@pytest.mark.parametrize("name", _SM100_CAPPED)
+@pytest.mark.parametrize("sms_ctas", list(_SM100_CAPS), ids=str)
+def test_the_sm100_binding_cta_cap_table(name, sms_ctas):
+    if _arch() != "sm_100a":
+        pytest.skip("the CTA cap is an SM100 library's")
+    module = loader.load(name, "sm_100a")
+    assert int(module.cta_cap(*sms_ctas)) == _SM100_CAPS[sms_ctas]
 
 
 def test_stage_policy_table_is_well_formed():
@@ -975,6 +1077,95 @@ def test_stage_policy_rejects_unsupported_heads():
         loader.stage_for(
             16, 2, arch="sm_100a", num_rows=1, num_requests=1, page_size=64, num_sms=148
         )
+
+
+# ----------------------------------------------------------------------------------------------
+# Programmatic dependent launch (CPU): ``enable_pdl`` takes a pdl build on SM100 /
+# SM103 except where ``PDL_POLICY`` keeps the plain build: the selected stage's, or
+# for 8/1 decode with two clearing units per warp below 1792 clearing CTAs of at
+# most 8 units per request (pages of at most 64 entries) the build with one unit
+# per warp, except at 512 requests; ``enable_pdl=False`` is the plain selection.
+
+_U2 = "hq8_hkv1_vsub3_d_u2_lookup_rounds0_single_weight1_pt_window1"
+_U1_PDL = "hq8_hkv1_vsub3_d_lookup_rounds0_single_weight1_pdl"
+_PDL_TABLE: dict[tuple[str, int, int, int, int, int], bool | str] = {
+    # (arch, Hq, Hkv, num_rows, num_requests, page_size) -> the pdl build is taken
+    # (True), the plain build is (False), or that pdl build is
+    ("sm_90a", 8, 1, 32, 32, 64): False,
+    ("sm_90a", 64, 8, 32, 32, 64): False,
+    ("sm_100a", 8, 1, 32, 32, 64): True,
+    ("sm_103a", 8, 1, 32, 32, 64): True,
+    ("sm_100a", 8, 1, 511, 511, 64): True,
+    ("sm_100a", 8, 1, 512, 512, 64): False,
+    ("sm_103a", 8, 1, 513, 513, 64): _U1_PDL,
+    ("sm_103a", 8, 1, 547, 547, 64): _U1_PDL,
+    ("sm_103a", 8, 1, 548, 548, 64): _U1_PDL,
+    ("sm_100a", 8, 1, 895, 895, 64): _U1_PDL,
+    ("sm_103a", 8, 1, 896, 896, 64): True,
+    ("sm_100a", 8, 1, 959, 959, 64): True,
+    ("sm_100a", 8, 1, 1024, 1024, 64): True,
+    ("sm_100a", 8, 1, 1024, 512, 64): True,
+    ("sm_103a", 8, 1, 1024, 1024, 32): _U1_PDL,
+    ("sm_100a", 8, 1, 1792, 1792, 32): True,
+    ("sm_100a", 8, 1, 3000, 3000, 16): _U1_PDL,
+    ("sm_103a", 8, 1, 384, 384, 128): True,
+    ("sm_100a", 8, 1, 512, 512, 128): False,
+    ("sm_100a", 8, 1, 8192, 1, 64): True,
+    ("sm_100a", 64, 8, 599, 599, 64): True,
+    ("sm_103a", 64, 8, 600, 600, 64): False,
+    ("sm_100a", 64, 8, 1024, 1, 64): False,
+    ("sm_103a", 64, 8, 128, 1, 64): True,
+}
+
+
+def test_pdl_policy_table_is_well_formed():
+    policy = loader.PDL_POLICY
+    assert set(policy) == {"arches", "constants", "rule", "version"}
+    assert tuple(policy["arches"]) == ("sm_100a", "sm_103a")
+    assert loader.PDL_SUFFIX == "_pdl" and loader.KNOB_KEYS[-1] == "pdl"
+
+
+@pytest.mark.parametrize("key,expected", list(_PDL_TABLE.items()))
+def test_enable_pdl_takes_the_pdl_build_where_the_policy_admits_it(key, expected):
+    arch, hq, hkv, rows, reqs, page = key
+    problem = dict(
+        arch=arch, num_rows=rows, num_requests=reqs, page_size=page, num_sms=148
+    )
+    plain = loader.stage_for(hq, hkv, **problem)
+    assert loader.stage_for(hq, hkv, enable_pdl=False, **problem) == plain
+    assert not plain.endswith(loader.PDL_SUFFIX)
+    chosen = loader.stage_for(hq, hkv, enable_pdl=True, **problem)
+    if isinstance(expected, str):
+        assert plain == _U2 and chosen == expected
+    else:
+        assert chosen == (plain + loader.PDL_SUFFIX if expected else plain)
+    assert chosen in loader.stages_for(arch)
+    assert loader.pdl_enabled(hq, hkv, **problem) is (expected is not False)
+
+
+@pytest.mark.parametrize("arch", loader.ARCHES)
+def test_enable_pdl_only_selects_shipped_builds(arch):
+    shipped = set(loader.stages_for(arch))
+    for hq, hkv in loader.SUPPORTED_HEADS:
+        for page in (16, 32, 64, 128):
+            for reqs in (1, 8, 32, 128, 256, 257, 512, 530, 548, 896, 1024, 1792):
+                for rows in sorted({reqs, 1, 128, 599, 600, 4096}):
+                    for sms in (132, 148, 152):
+                        problem = dict(
+                            arch=arch,
+                            num_rows=rows,
+                            num_requests=reqs,
+                            page_size=page,
+                            num_sms=sms,
+                        )
+                        plain = loader.stage_for(hq, hkv, **problem)
+                        chosen = loader.stage_for(hq, hkv, enable_pdl=True, **problem)
+                        assert chosen in shipped, (arch, hq, hkv, rows, reqs, chosen)
+                        assert chosen in (plain, plain + loader.PDL_SUFFIX) or (
+                            plain == _U2 and chosen == _U1_PDL
+                        ), (arch, hq, hkv, rows, reqs, page, plain, chosen)
+                        if arch == "sm_90a":
+                            assert chosen == plain
 
 
 # Points where the w20 condition (the clearing grid fits beside the row CTAs)

@@ -48,7 +48,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 }
 
 #define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
 #define THREADS 128
 #define QUANT_UNITS 4
 #define SF_TILE_BYTES 512
@@ -168,14 +167,14 @@ kernel_cake_kimi_k3_fp8_projection_13ded8d274d83fd3756f(__nv_bfloat16* __restric
             for (int _lr = 1; _lr < 8; _lr++) {
                 absmax = max_noftz(absmax, mags[_lr]);
             }
-            float o1 = __shfl_xor_sync(0xFFFFFFFF, absmax, 1);
-            absmax = fmaxf(absmax, o1);
-            float o2 = __shfl_xor_sync(0xFFFFFFFF, absmax, 2);
-            absmax = fmaxf(absmax, o2);
-            float o4 = __shfl_xor_sync(0xFFFFFFFF, absmax, 4);
-            absmax = fmaxf(absmax, o4);
-            float o8 = __shfl_xor_sync(0xFFFFFFFF, absmax, 8);
-            absmax = fmaxf(absmax, o8);
+            float other_0 = __shfl_xor_sync(0xFFFFFFFF, absmax, 1);
+            absmax = fmaxf(absmax, other_0);
+            float other_1 = __shfl_xor_sync(0xFFFFFFFF, absmax, 2);
+            absmax = fmaxf(absmax, other_1);
+            float other_2 = __shfl_xor_sync(0xFFFFFFFF, absmax, 4);
+            absmax = fmaxf(absmax, other_2);
+            float other_3 = __shfl_xor_sync(0xFFFFFFFF, absmax, 8);
+            absmax = fmaxf(absmax, other_3);
             absmax = fmaxf(absmax, 1e-04f);
             float scale = absmax / 448.0f;
             unsigned int scale_bits = __as_u32(scale);
@@ -283,14 +282,14 @@ kernel_cake_kimi_k3_fp8_projection_13ded8d274d83fd3756f(__nv_bfloat16* __restric
             for (int _lr = 1; _lr < 8; _lr++) {
                 absmax_1 = max_noftz(absmax_1, mags_1[_lr]);
             }
-            float o1_1 = __shfl_xor_sync(0xFFFFFFFF, absmax_1, 1);
-            absmax_1 = fmaxf(absmax_1, o1_1);
-            float o2_1 = __shfl_xor_sync(0xFFFFFFFF, absmax_1, 2);
-            absmax_1 = fmaxf(absmax_1, o2_1);
-            float o4_1 = __shfl_xor_sync(0xFFFFFFFF, absmax_1, 4);
-            absmax_1 = fmaxf(absmax_1, o4_1);
-            float o8_1 = __shfl_xor_sync(0xFFFFFFFF, absmax_1, 8);
-            absmax_1 = fmaxf(absmax_1, o8_1);
+            float other_4 = __shfl_xor_sync(0xFFFFFFFF, absmax_1, 1);
+            absmax_1 = fmaxf(absmax_1, other_4);
+            float other_5 = __shfl_xor_sync(0xFFFFFFFF, absmax_1, 2);
+            absmax_1 = fmaxf(absmax_1, other_5);
+            float other_6 = __shfl_xor_sync(0xFFFFFFFF, absmax_1, 4);
+            absmax_1 = fmaxf(absmax_1, other_6);
+            float other_7 = __shfl_xor_sync(0xFFFFFFFF, absmax_1, 8);
+            absmax_1 = fmaxf(absmax_1, other_7);
             absmax_1 = fmaxf(absmax_1, 1e-04f);
             float scale_1 = absmax_1 / 448.0f;
             unsigned int scale_bits_1 = __as_u32(scale_1);

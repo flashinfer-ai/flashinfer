@@ -36,8 +36,10 @@ the expert-aligned route plan consumed by grouped MoE GEMMs in **one launch**:
   token count (a single CTA for one token -- at `block_m = 16` a second
   program of that kernel which loads the bias and the logits in the read-only
   form --, otherwise one cluster of `num_tokens` CTAs -- 2, 4, 8 or 16 --
-  exchanging the selected ids through distributed shared memory; these are the
-  only kernels bound to their exact token count), one cluster of 16 CTAs of
+  exchanging the selected ids through distributed shared memory, with a second
+  program of the two-token kernel on SM100 at `block_m = 8` that ranks its
+  winners from a certified window; these are the only kernels bound to their
+  exact token count), one cluster of 16 CTAs of
   two row groups each for every other
   count up to 32 (the 32-token cell, so 3 or 17 tokens take it; three kernels
   serve it: `LCG`, which waits for its cluster at entry, `LCG_LW`, which waits

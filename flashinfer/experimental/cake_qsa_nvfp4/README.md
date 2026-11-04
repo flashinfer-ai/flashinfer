@@ -16,8 +16,8 @@ architecture that program serves.
 
 Both the API and the backend are experimental: no compatibility guarantee.
 The public entry's `backend="auto"` (its default) selects this package on
-every compute capability it exports a library for (capability-exact: 12.1 is
-not included); the feature does not participate in autotuning or
+every compute capability above 9.0 it exports a library for (capability-exact:
+12.1 is not included); the feature does not participate in autotuning or
 trace-apply. Its libraries are loaded prebuilt from `aot/` when the package
 ships them and JIT-built by FlashInfer from `build.json` otherwise (see
 "Layout of this package"). Toolkit requirement: CUDA 12.8 or newer
@@ -35,9 +35,9 @@ out = qsa_sparse_paged_attention(
 )
 ```
 
-`backend="auto"` (the default) runs this package on every exported compute
-capability (8.x, 9.0, 10.0, 10.3, 10.7, 12.0) and the existing implementation on any other
-device, which then reports it as unsupported; `"cake"` selects this package and `"default"` the existing
+`backend="auto"` (the default) runs this package on the exported compute
+capabilities above 9.0 (10.0, 10.3, 10.7, 12.0) and the existing implementation on 8.x
+and 9.0 and on any other device, which it then reports as unsupported; `"cake"` selects this package and `"default"` the existing
 implementation explicitly; any other value raises `ValueError`. This package's
 results agree with the existing implementation within the test suites'
 tolerances but are not bit-identical to it: callers that need the existing

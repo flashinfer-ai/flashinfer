@@ -505,13 +505,13 @@ kernel_cake_mega_mhc_41024b807c02040677b3(const __grid_constant__ CUtensorMap re
                                     "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                                     " [%0], [%1, {%2, %3, %4}], [%5], %6;"
                                     :: "r"(residual_addr + stage * 32768), "l"((&residual_map)), "r"(hidden), "r"(fast_div_q * 64), "r"(0),
-                                       "r"(full_io_addr + (stage) * 8), "l"(io_policy) : "memory");
+                                       "r"(full_io_addr + (seq % 3) * 8), "l"(io_policy) : "memory");
                                 asm volatile(
                                     "cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                                     " [%0], [%1, {%2, %3}], [%4], %5;"
                                     :: "r"(x_addr + stage * 8192), "l"((&x_map)), "r"(hidden), "r"(fast_div_q * 64),
-                                       "r"(full_io_addr + (stage) * 8), "l"(io_policy) : "memory");
-                                mbarrier_arrive_expect_tx(full_io_addr + (stage) * 8, 40960);
+                                       "r"(full_io_addr + (seq % 3) * 8), "l"(io_policy) : "memory");
+                                mbarrier_arrive_expect_tx(full_io_addr + (seq % 3) * 8, 40960);
                             } else {
                                 unsigned int stage_1 = seq % 2;
                                 unsigned int _stage_empty_fn = seq % 2;
@@ -521,23 +521,23 @@ kernel_cake_mega_mhc_41024b807c02040677b3(const __grid_constant__ CUtensorMap re
                                     "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                                     " [%0], [%1, {%2, %3, %4}], [%5], %6;"
                                     :: "r"(fn_addr + stage_1 * 36864), "l"((&fnp_map)), "r"(hidden), "r"(0), "r"(0),
-                                       "r"(full_fn_addr + (stage_1) * 8), "l"(0x14F0000000000000ULL) : "memory");
+                                       "r"(full_fn_addr + (seq % 2) * 8), "l"(0x14F0000000000000ULL) : "memory");
                                 asm volatile(
                                     "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                                     " [%0], [%1, {%2, %3, %4}], [%5], %6;"
                                     :: "r"(fn_addr + stage_1 * 36864 + 9216), "l"((&fnp_map)), "r"(hidden + 4096), "r"(0), "r"(0),
-                                       "r"(full_fn_addr + (stage_1) * 8), "l"(0x14F0000000000000ULL) : "memory");
+                                       "r"(full_fn_addr + (seq % 2) * 8), "l"(0x14F0000000000000ULL) : "memory");
                                 asm volatile(
                                     "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                                     " [%0], [%1, {%2, %3, %4}], [%5], %6;"
                                     :: "r"(fn_addr + stage_1 * 36864 + 18432), "l"((&fnp_map)), "r"(hidden + 8192), "r"(0), "r"(0),
-                                       "r"(full_fn_addr + (stage_1) * 8), "l"(0x14F0000000000000ULL) : "memory");
+                                       "r"(full_fn_addr + (seq % 2) * 8), "l"(0x14F0000000000000ULL) : "memory");
                                 asm volatile(
                                     "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                                     " [%0], [%1, {%2, %3, %4}], [%5], %6;"
                                     :: "r"(fn_addr + stage_1 * 36864 + 27648), "l"((&fnp_map)), "r"(hidden + 12288), "r"(0), "r"(0),
-                                       "r"(full_fn_addr + (stage_1) * 8), "l"(0x14F0000000000000ULL) : "memory");
-                                mbarrier_arrive_expect_tx(full_fn_addr + (stage_1) * 8, 36864);
+                                       "r"(full_fn_addr + (seq % 2) * 8), "l"(0x14F0000000000000ULL) : "memory");
+                                mbarrier_arrive_expect_tx(full_fn_addr + (seq % 2) * 8, 36864);
                             }
                             seq += 1;
                         }
@@ -639,7 +639,7 @@ kernel_cake_mega_mhc_41024b807c02040677b3(const __grid_constant__ CUtensorMap re
                         int _mma_b_lo_49_3 = make_warp_uniform((((fn_pieces_addr) >> 4) & 0x3FFF) + (fstage * 12 + 9) * 192);
                         mma_ts_step((tmem_acc_big + (cstage_2_0 * 48)), (unsigned int)tmem_a_tmem + (astage_1_0 * 32 + 24), _mma_b_lo_49_3, 0x40004040, 67503248, 1);
 #endif
-                        elect_commit(empty_a_addr + (astage_1_0) * 8);
+                        elect_commit(empty_a_addr + (aseq % 4) * 8);
                         aseq += 1;
                         unsigned int astage_1_1 = aseq % 4;
                         unsigned int _stage_full_a_1 = aseq % 4;
@@ -713,9 +713,9 @@ kernel_cake_mega_mhc_41024b807c02040677b3(const __grid_constant__ CUtensorMap re
                         int _mma_b_lo_49_7 = make_warp_uniform((((fn_pieces_addr + 32) >> 4) & 0x3FFF) + (fstage * 12 + 9) * 192);
                         mma_ts_step((tmem_acc_big + (cstage_2_0 * 48 + 24)), (unsigned int)tmem_a_tmem + (astage_1_1 * 32 + 24), _mma_b_lo_49_7, 0x40004040, 67503248, 1);
 #endif
-                        elect_commit(empty_a_addr + (astage_1_1) * 8);
+                        elect_commit(empty_a_addr + (aseq % 4) * 8);
                         aseq += 1;
-                        elect_commit(big_full_addr + (cstage_2_0) * 8);
+                        elect_commit(big_full_addr + (cseq % 2) * 8);
                         cseq += 1;
                         unsigned int cstage_2_1 = cseq % 2;
                         unsigned int _stage_big_empty_1 = cseq % 2;
@@ -793,7 +793,7 @@ kernel_cake_mega_mhc_41024b807c02040677b3(const __grid_constant__ CUtensorMap re
                         int _mma_b_lo_49_11 = make_warp_uniform((((fn_pieces_addr + 64) >> 4) & 0x3FFF) + (fstage * 12 + 9) * 192);
                         mma_ts_step((tmem_acc_big + (cstage_2_1 * 48)), (unsigned int)tmem_a_tmem + (astage_1_2 * 32 + 24), _mma_b_lo_49_11, 0x40004040, 67503248, 1);
 #endif
-                        elect_commit(empty_a_addr + (astage_1_2) * 8);
+                        elect_commit(empty_a_addr + (aseq % 4) * 8);
                         aseq += 1;
                         unsigned int astage_1_3 = aseq % 4;
                         unsigned int _stage_full_a_3 = aseq % 4;
@@ -867,14 +867,14 @@ kernel_cake_mega_mhc_41024b807c02040677b3(const __grid_constant__ CUtensorMap re
                         int _mma_b_lo_49_15 = make_warp_uniform((((fn_pieces_addr + 96) >> 4) & 0x3FFF) + (fstage * 12 + 9) * 192);
                         mma_ts_step((tmem_acc_big + (cstage_2_1 * 48 + 24)), (unsigned int)tmem_a_tmem + (astage_1_3 * 32 + 24), _mma_b_lo_49_15, 0x40004040, 67503248, 1);
 #endif
-                        elect_commit(empty_a_addr + (astage_1_3) * 8);
+                        elect_commit(empty_a_addr + (aseq % 4) * 8);
                         aseq += 1;
-                        elect_commit(big_full_addr + (cstage_2_1) * 8);
+                        elect_commit(big_full_addr + (cseq % 2) * 8);
                         cseq += 1;
-                        elect_commit(empty_fn_addr + (fstage) * 8);
+                        elect_commit(empty_fn_addr + (fseq % 2) * 8);
                         fseq += 1;
                     }
-                    elect_commit(small_full_addr + (ustage) * 8);
+                    elect_commit(small_full_addr + (useq % 2) * 8);
                     useq += 1;
                 }
             } else {
@@ -928,7 +928,7 @@ kernel_cake_mega_mhc_41024b807c02040677b3(const __grid_constant__ CUtensorMap re
                             } else {
                                 asm volatile("cp.async.bulk.wait_group 0;");
                             }
-                            mbarrier_arrive(empty_io_addr + (stage_2) * 8);
+                            mbarrier_arrive(empty_io_addr + (io_seq % 3) * 8);
                         }
                         if (prefetch != 0) {
                             coeff_seq += 1;
@@ -1003,7 +1003,7 @@ kernel_cake_mega_mhc_41024b807c02040677b3(const __grid_constant__ CUtensorMap re
                 __syncwarp();
                 if (elect_sync()) {
                     asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                    mbarrier_arrive(empty_coeff_addr + (coeff_stage) * 8);
+                    mbarrier_arrive(empty_coeff_addr + (coeff_seq_1 % 2) * 8);
                 }
                 coeff_seq_1 += 1;
                 float hc_acc[2];
@@ -1026,15 +1026,15 @@ kernel_cake_mega_mhc_41024b807c02040677b3(const __grid_constant__ CUtensorMap re
                     unsigned int word = residual_pairs[io_stage * 8192 + offset];
                     rv[0] = __uint_as_float(word << 16);
                     rv[1] = __uint_as_float(word & 4294901760u);
-                    unsigned int word_0 = residual_pairs[io_stage * 8192 + 2048 + offset];
-                    rv[2] = __uint_as_float(word_0 << 16);
-                    rv[3] = __uint_as_float(word_0 & 4294901760u);
-                    unsigned int word_1 = residual_pairs[io_stage * 8192 + 4096 + offset];
-                    rv[4] = __uint_as_float(word_1 << 16);
-                    rv[5] = __uint_as_float(word_1 & 4294901760u);
-                    unsigned int word_2 = residual_pairs[io_stage * 8192 + 6144 + offset];
-                    rv[6] = __uint_as_float(word_2 << 16);
-                    rv[7] = __uint_as_float(word_2 & 4294901760u);
+                    unsigned int word_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_0 = residual_pairs[io_stage * 8192 + 2048 + offset];
+                    rv[2] = __uint_as_float(word_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_0 << 16);
+                    rv[3] = __uint_as_float(word_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_0 & 4294901760u);
+                    unsigned int word_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_1 = residual_pairs[io_stage * 8192 + 4096 + offset];
+                    rv[4] = __uint_as_float(word_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_1 << 16);
+                    rv[5] = __uint_as_float(word_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_1 & 4294901760u);
+                    unsigned int word_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_2 = residual_pairs[io_stage * 8192 + 6144 + offset];
+                    rv[6] = __uint_as_float(word_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_2 << 16);
+                    rv[7] = __uint_as_float(word_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_2 & 4294901760u);
                     float sq[2];
                     sq[0] = 0.0f;
                     sq[1] = 0.0f;
@@ -1458,7 +1458,7 @@ kernel_cake_mega_mhc_41024b807c02040677b3(const __grid_constant__ CUtensorMap re
                         :: "r"((unsigned int)tmem_a_tmem + ast * 32), "r"(*reinterpret_cast<const uint32_t*>(&words[0])), "r"(*reinterpret_cast<const uint32_t*>(&words[1])), "r"(*reinterpret_cast<const uint32_t*>(&words[2])), "r"(*reinterpret_cast<const uint32_t*>(&words[3])), "r"(*reinterpret_cast<const uint32_t*>(&words[4])), "r"(*reinterpret_cast<const uint32_t*>(&words[5])), "r"(*reinterpret_cast<const uint32_t*>(&words[6])), "r"(*reinterpret_cast<const uint32_t*>(&words[7])), "r"(*reinterpret_cast<const uint32_t*>(&words[8])), "r"(*reinterpret_cast<const uint32_t*>(&words[9])), "r"(*reinterpret_cast<const uint32_t*>(&words[10])), "r"(*reinterpret_cast<const uint32_t*>(&words[11])), "r"(*reinterpret_cast<const uint32_t*>(&words[12])), "r"(*reinterpret_cast<const uint32_t*>(&words[13])), "r"(*reinterpret_cast<const uint32_t*>(&words[14])), "r"(*reinterpret_cast<const uint32_t*>(&words[15])));
                     asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                     asm volatile("tcgen05.fence::before_thread_sync;");
-                    mbarrier_arrive(full_a_addr + (ast) * 8);
+                    mbarrier_arrive(full_a_addr + (a_seq % 4) * 8);
                     a_seq += 2;
                     unsigned int words_169[16];
                     unsigned int offset_170 = offs[4];
@@ -1900,12 +1900,12 @@ kernel_cake_mega_mhc_41024b807c02040677b3(const __grid_constant__ CUtensorMap re
                         :: "r"((unsigned int)tmem_a_tmem + ast_350 * 32), "r"(*reinterpret_cast<const uint32_t*>(&words_169[0])), "r"(*reinterpret_cast<const uint32_t*>(&words_169[1])), "r"(*reinterpret_cast<const uint32_t*>(&words_169[2])), "r"(*reinterpret_cast<const uint32_t*>(&words_169[3])), "r"(*reinterpret_cast<const uint32_t*>(&words_169[4])), "r"(*reinterpret_cast<const uint32_t*>(&words_169[5])), "r"(*reinterpret_cast<const uint32_t*>(&words_169[6])), "r"(*reinterpret_cast<const uint32_t*>(&words_169[7])), "r"(*reinterpret_cast<const uint32_t*>(&words_169[8])), "r"(*reinterpret_cast<const uint32_t*>(&words_169[9])), "r"(*reinterpret_cast<const uint32_t*>(&words_169[10])), "r"(*reinterpret_cast<const uint32_t*>(&words_169[11])), "r"(*reinterpret_cast<const uint32_t*>(&words_169[12])), "r"(*reinterpret_cast<const uint32_t*>(&words_169[13])), "r"(*reinterpret_cast<const uint32_t*>(&words_169[14])), "r"(*reinterpret_cast<const uint32_t*>(&words_169[15])));
                     asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                     asm volatile("tcgen05.fence::before_thread_sync;");
-                    mbarrier_arrive(full_a_addr + (ast_350) * 8);
+                    mbarrier_arrive(full_a_addr + (a_seq % 4) * 8);
                     a_seq += 2;
                     __syncwarp();
                     if (elect_sync()) {
                         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                        mbarrier_arrive(store_ready_addr + (io_stage) * 8);
+                        mbarrier_arrive(store_ready_addr + (io_seq_1 % 3) * 8);
                     }
                     io_seq_1 += 1;
                 }
@@ -2041,7 +2041,7 @@ kernel_cake_mega_mhc_41024b807c02040677b3(const __grid_constant__ CUtensorMap re
                     asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
                     asm volatile("tcgen05.fence::before_thread_sync;");
                     if (elect_sync()) {
-                        mbarrier_arrive(big_empty_addr + (cstage) * 8);
+                        mbarrier_arrive(big_empty_addr + (cseq_1 % 2) * 8);
                     }
                     float sub_8;
 #if __CUDA_ARCH__ == 1070
@@ -2372,7 +2372,7 @@ kernel_cake_mega_mhc_41024b807c02040677b3(const __grid_constant__ CUtensorMap re
                 asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
                 asm volatile("tcgen05.fence::before_thread_sync;");
                 if (elect_sync()) {
-                    mbarrier_arrive(small_empty_addr + (ustage_1) * 8);
+                    mbarrier_arrive(small_empty_addr + (seq_1 % 2) * 8);
                 }
 #if __CUDA_ARCH__ == 1070
                 float sub_19;
@@ -10828,9 +10828,9 @@ kernel_cake_mega_mhc_41024b807c02040677b3(const __grid_constant__ CUtensorMap re
                 float values[8];
                 float _shfl_0 = __shfl_sync(0xFFFFFFFF, coeff_1, 0);
                 if (pack < 2) {
-                    unsigned int word_3 = early[pack * 16];
-                    float lo = __uint_as_float(word_3 << 16);
-                    float hi = __uint_as_float(word_3 & 4294901760u);
+                    unsigned int word_1 = early[pack * 16];
+                    float lo = __uint_as_float(word_1 << 16);
+                    float hi = __uint_as_float(word_1 & 4294901760u);
 #if __CUDA_ARCH__ == 1070
                     float2 _f32x2_mul_a_72 = make_float2(_shfl_0, _shfl_0);
                     float2 _f32x2_mul_b_73 = make_float2(lo, hi);
@@ -10846,60 +10846,60 @@ kernel_cake_mega_mhc_41024b807c02040677b3(const __grid_constant__ CUtensorMap re
 #endif
                     values[0] = pair_2.x;
                     values[1] = pair_2.y;
-                    unsigned int word_0_1 = early[pack * 16 + 1];
-                    float lo_1 = __uint_as_float(word_0_1 << 16);
-                    float hi_2 = __uint_as_float(word_0_1 & 4294901760u);
+                    unsigned int word_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_0 = early[pack * 16 + 1];
+                    float lo_r_0 = __uint_as_float(word_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_0 << 16);
+                    float hi_r_0 = __uint_as_float(word_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_0 & 4294901760u);
 #if __CUDA_ARCH__ == 1070
                     float2 _f32x2_mul_a_74 = make_float2(_shfl_0, _shfl_0);
-                    float2 _f32x2_mul_b_75 = make_float2(lo_1, hi_2);
+                    float2 _f32x2_mul_b_75 = make_float2(lo_r_0, hi_r_0);
 #else
                     float2 _f32x2_mul_a_216 = make_float2(_shfl_0, _shfl_0);
-                    float2 _f32x2_mul_b_217 = make_float2(lo_1, hi_2);
+                    float2 _f32x2_mul_b_217 = make_float2(lo_r_0, hi_r_0);
 #endif
-                    float2 pair_3;
+                    float2 pair_r_0;
 #if __CUDA_ARCH__ == 1070
-                    asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&pair_3) : "l"(*(const unsigned long long*)&_f32x2_mul_a_74), "l"(*(const unsigned long long*)&_f32x2_mul_b_75));
+                    asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&pair_r_0) : "l"(*(const unsigned long long*)&_f32x2_mul_a_74), "l"(*(const unsigned long long*)&_f32x2_mul_b_75));
 #else
-                    asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&pair_3) : "l"(*(const unsigned long long*)&_f32x2_mul_a_216), "l"(*(const unsigned long long*)&_f32x2_mul_b_217));
+                    asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&pair_r_0) : "l"(*(const unsigned long long*)&_f32x2_mul_a_216), "l"(*(const unsigned long long*)&_f32x2_mul_b_217));
 #endif
-                    values[2] = pair_3.x;
-                    values[3] = pair_3.y;
-                    unsigned int word_4 = early[pack * 16 + 2];
-                    float lo_5 = __uint_as_float(word_4 << 16);
-                    float hi_6 = __uint_as_float(word_4 & 4294901760u);
+                    values[2] = pair_r_0.x;
+                    values[3] = pair_r_0.y;
+                    unsigned int word_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_1 = early[pack * 16 + 2];
+                    float lo_r_1 = __uint_as_float(word_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_1 << 16);
+                    float hi_r_1 = __uint_as_float(word_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_1 & 4294901760u);
 #if __CUDA_ARCH__ == 1070
                     float2 _f32x2_mul_a_76 = make_float2(_shfl_0, _shfl_0);
-                    float2 _f32x2_mul_b_77 = make_float2(lo_5, hi_6);
+                    float2 _f32x2_mul_b_77 = make_float2(lo_r_1, hi_r_1);
 #else
                     float2 _f32x2_mul_a_218 = make_float2(_shfl_0, _shfl_0);
-                    float2 _f32x2_mul_b_219 = make_float2(lo_5, hi_6);
+                    float2 _f32x2_mul_b_219 = make_float2(lo_r_1, hi_r_1);
 #endif
-                    float2 pair_7;
+                    float2 pair_r_1;
 #if __CUDA_ARCH__ == 1070
-                    asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&pair_7) : "l"(*(const unsigned long long*)&_f32x2_mul_a_76), "l"(*(const unsigned long long*)&_f32x2_mul_b_77));
+                    asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&pair_r_1) : "l"(*(const unsigned long long*)&_f32x2_mul_a_76), "l"(*(const unsigned long long*)&_f32x2_mul_b_77));
 #else
-                    asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&pair_7) : "l"(*(const unsigned long long*)&_f32x2_mul_a_218), "l"(*(const unsigned long long*)&_f32x2_mul_b_219));
+                    asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&pair_r_1) : "l"(*(const unsigned long long*)&_f32x2_mul_a_218), "l"(*(const unsigned long long*)&_f32x2_mul_b_219));
 #endif
-                    values[4] = pair_7.x;
-                    values[5] = pair_7.y;
-                    unsigned int word_8 = early[pack * 16 + 3];
-                    float lo_9 = __uint_as_float(word_8 << 16);
-                    float hi_10 = __uint_as_float(word_8 & 4294901760u);
+                    values[4] = pair_r_1.x;
+                    values[5] = pair_r_1.y;
+                    unsigned int word_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_2 = early[pack * 16 + 3];
+                    float lo_r_2 = __uint_as_float(word_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_2 << 16);
+                    float hi_r_2 = __uint_as_float(word_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_2 & 4294901760u);
 #if __CUDA_ARCH__ == 1070
                     float2 _f32x2_mul_a_78 = make_float2(_shfl_0, _shfl_0);
-                    float2 _f32x2_mul_b_79 = make_float2(lo_9, hi_10);
+                    float2 _f32x2_mul_b_79 = make_float2(lo_r_2, hi_r_2);
 #else
                     float2 _f32x2_mul_a_220 = make_float2(_shfl_0, _shfl_0);
-                    float2 _f32x2_mul_b_221 = make_float2(lo_9, hi_10);
+                    float2 _f32x2_mul_b_221 = make_float2(lo_r_2, hi_r_2);
 #endif
-                    float2 pair_11;
+                    float2 pair_r_2;
 #if __CUDA_ARCH__ == 1070
-                    asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&pair_11) : "l"(*(const unsigned long long*)&_f32x2_mul_a_78), "l"(*(const unsigned long long*)&_f32x2_mul_b_79));
+                    asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&pair_r_2) : "l"(*(const unsigned long long*)&_f32x2_mul_a_78), "l"(*(const unsigned long long*)&_f32x2_mul_b_79));
 #else
-                    asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&pair_11) : "l"(*(const unsigned long long*)&_f32x2_mul_a_220), "l"(*(const unsigned long long*)&_f32x2_mul_b_221));
+                    asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&pair_r_2) : "l"(*(const unsigned long long*)&_f32x2_mul_a_220), "l"(*(const unsigned long long*)&_f32x2_mul_b_221));
 #endif
-                    values[6] = pair_11.x;
-                    values[7] = pair_11.y;
+                    values[6] = pair_r_2.x;
+                    values[7] = pair_r_2.y;
                 } else {
 #if __CUDA_ARCH__ == 1070
                     float _vec_load_26[8];
@@ -10943,14 +10943,14 @@ kernel_cake_mega_mhc_41024b807c02040677b3(const __grid_constant__ CUtensorMap re
                     float2 _f32x2_mul_a_223 = make_float2(_shfl_0, _shfl_0);
                     float2 _f32x2_mul_b_224 = make_float2(_vec_load_52[0], _vec_load_52[1]);
 #endif
-                    float2 pair_4;
+                    float2 pair_3;
 #if __CUDA_ARCH__ == 1070
-                    asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&pair_4) : "l"(*(const unsigned long long*)&_f32x2_mul_a_81), "l"(*(const unsigned long long*)&_f32x2_mul_b_82));
+                    asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&pair_3) : "l"(*(const unsigned long long*)&_f32x2_mul_a_81), "l"(*(const unsigned long long*)&_f32x2_mul_b_82));
 #else
-                    asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&pair_4) : "l"(*(const unsigned long long*)&_f32x2_mul_a_223), "l"(*(const unsigned long long*)&_f32x2_mul_b_224));
+                    asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&pair_3) : "l"(*(const unsigned long long*)&_f32x2_mul_a_223), "l"(*(const unsigned long long*)&_f32x2_mul_b_224));
 #endif
-                    values[0] = pair_4.x;
-                    values[1] = pair_4.y;
+                    values[0] = pair_3.x;
+                    values[1] = pair_3.y;
 #if __CUDA_ARCH__ == 1070
                     float2 _f32x2_mul_a_83 = make_float2(_shfl_0, _shfl_0);
                     float2 _f32x2_mul_b_84 = make_float2(_vec_load_26[2], _vec_load_26[3]);
@@ -10958,14 +10958,14 @@ kernel_cake_mega_mhc_41024b807c02040677b3(const __grid_constant__ CUtensorMap re
                     float2 _f32x2_mul_a_225 = make_float2(_shfl_0, _shfl_0);
                     float2 _f32x2_mul_b_226 = make_float2(_vec_load_52[2], _vec_load_52[3]);
 #endif
-                    float2 pair_0;
+                    float2 pair_r_r_0;
 #if __CUDA_ARCH__ == 1070
-                    asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&pair_0) : "l"(*(const unsigned long long*)&_f32x2_mul_a_83), "l"(*(const unsigned long long*)&_f32x2_mul_b_84));
+                    asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&pair_r_r_0) : "l"(*(const unsigned long long*)&_f32x2_mul_a_83), "l"(*(const unsigned long long*)&_f32x2_mul_b_84));
 #else
-                    asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&pair_0) : "l"(*(const unsigned long long*)&_f32x2_mul_a_225), "l"(*(const unsigned long long*)&_f32x2_mul_b_226));
+                    asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&pair_r_r_0) : "l"(*(const unsigned long long*)&_f32x2_mul_a_225), "l"(*(const unsigned long long*)&_f32x2_mul_b_226));
 #endif
-                    values[2] = pair_0.x;
-                    values[3] = pair_0.y;
+                    values[2] = pair_r_r_0.x;
+                    values[3] = pair_r_r_0.y;
 #if __CUDA_ARCH__ == 1070
                     float2 _f32x2_mul_a_85 = make_float2(_shfl_0, _shfl_0);
                     float2 _f32x2_mul_b_86 = make_float2(_vec_load_26[4], _vec_load_26[5]);
@@ -10973,14 +10973,14 @@ kernel_cake_mega_mhc_41024b807c02040677b3(const __grid_constant__ CUtensorMap re
                     float2 _f32x2_mul_a_227 = make_float2(_shfl_0, _shfl_0);
                     float2 _f32x2_mul_b_228 = make_float2(_vec_load_52[4], _vec_load_52[5]);
 #endif
-                    float2 pair_1_1;
+                    float2 pair_r_r_1;
 #if __CUDA_ARCH__ == 1070
-                    asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&pair_1_1) : "l"(*(const unsigned long long*)&_f32x2_mul_a_85), "l"(*(const unsigned long long*)&_f32x2_mul_b_86));
+                    asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&pair_r_r_1) : "l"(*(const unsigned long long*)&_f32x2_mul_a_85), "l"(*(const unsigned long long*)&_f32x2_mul_b_86));
 #else
-                    asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&pair_1_1) : "l"(*(const unsigned long long*)&_f32x2_mul_a_227), "l"(*(const unsigned long long*)&_f32x2_mul_b_228));
+                    asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&pair_r_r_1) : "l"(*(const unsigned long long*)&_f32x2_mul_a_227), "l"(*(const unsigned long long*)&_f32x2_mul_b_228));
 #endif
-                    values[4] = pair_1_1.x;
-                    values[5] = pair_1_1.y;
+                    values[4] = pair_r_r_1.x;
+                    values[5] = pair_r_r_1.y;
 #if __CUDA_ARCH__ == 1070
                     float2 _f32x2_mul_a_87 = make_float2(_shfl_0, _shfl_0);
                     float2 _f32x2_mul_b_88 = make_float2(_vec_load_26[6], _vec_load_26[7]);
@@ -10988,46 +10988,46 @@ kernel_cake_mega_mhc_41024b807c02040677b3(const __grid_constant__ CUtensorMap re
                     float2 _f32x2_mul_a_229 = make_float2(_shfl_0, _shfl_0);
                     float2 _f32x2_mul_b_230 = make_float2(_vec_load_52[6], _vec_load_52[7]);
 #endif
-                    float2 pair_2_1;
+                    float2 pair_r_r_2;
 #if __CUDA_ARCH__ == 1070
-                    asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&pair_2_1) : "l"(*(const unsigned long long*)&_f32x2_mul_a_87), "l"(*(const unsigned long long*)&_f32x2_mul_b_88));
+                    asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&pair_r_r_2) : "l"(*(const unsigned long long*)&_f32x2_mul_a_87), "l"(*(const unsigned long long*)&_f32x2_mul_b_88));
 #else
-                    asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&pair_2_1) : "l"(*(const unsigned long long*)&_f32x2_mul_a_229), "l"(*(const unsigned long long*)&_f32x2_mul_b_230));
+                    asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&pair_r_r_2) : "l"(*(const unsigned long long*)&_f32x2_mul_a_229), "l"(*(const unsigned long long*)&_f32x2_mul_b_230));
 #endif
-                    values[6] = pair_2_1.x;
-                    values[7] = pair_2_1.y;
+                    values[6] = pair_r_r_2.x;
+                    values[7] = pair_r_r_2.y;
                 }
-                float _shfl_1 = __shfl_sync(0xFFFFFFFF, coeff_1, 1);
+                float shfl_0 = __shfl_sync(0xFFFFFFFF, coeff_1, 1);
                 if (pack < 2) {
-                    unsigned int word_5 = early[pack * 16 + 4];
-                    float lo_2 = __uint_as_float(word_5 << 16);
-                    float hi_1 = __uint_as_float(word_5 & 4294901760u);
-                    float2 pair_6 = fma_f32x2_rn_noftz(make_float2(_shfl_1, _shfl_1), make_float2(lo_2, hi_1), make_float2(values[0], values[1]));
-                    values[0] = pair_6.x;
-                    values[1] = pair_6.y;
-                    unsigned int word_0_2 = early[pack * 16 + 4 + 1];
-                    float lo_1_1 = __uint_as_float(word_0_2 << 16);
-                    float hi_2_1 = __uint_as_float(word_0_2 & 4294901760u);
-                    float2 pair_3_1 = fma_f32x2_rn_noftz(make_float2(_shfl_1, _shfl_1), make_float2(lo_1_1, hi_2_1), make_float2(values[2], values[3]));
-                    values[2] = pair_3_1.x;
-                    values[3] = pair_3_1.y;
-                    unsigned int word_4_1 = early[pack * 16 + 4 + 2];
-                    float lo_5_1 = __uint_as_float(word_4_1 << 16);
-                    float hi_6_1 = __uint_as_float(word_4_1 & 4294901760u);
-                    float2 pair_7_1 = fma_f32x2_rn_noftz(make_float2(_shfl_1, _shfl_1), make_float2(lo_5_1, hi_6_1), make_float2(values[4], values[5]));
-                    values[4] = pair_7_1.x;
-                    values[5] = pair_7_1.y;
-                    unsigned int word_8_1 = early[pack * 16 + 4 + 3];
-                    float lo_9_1 = __uint_as_float(word_8_1 << 16);
-                    float hi_10_1 = __uint_as_float(word_8_1 & 4294901760u);
-                    float2 pair_11_1 = fma_f32x2_rn_noftz(make_float2(_shfl_1, _shfl_1), make_float2(lo_9_1, hi_10_1), make_float2(values[6], values[7]));
-                    values[6] = pair_11_1.x;
-                    values[7] = pair_11_1.y;
+                    unsigned int word_0 = early[pack * 16 + 4];
+                    float lo_0 = __uint_as_float(word_0 << 16);
+                    float hi_0 = __uint_as_float(word_0 & 4294901760u);
+                    float2 pair_0 = fma_f32x2_rn_noftz(make_float2(shfl_0, shfl_0), make_float2(lo_0, hi_0), make_float2(values[0], values[1]));
+                    values[0] = pair_0.x;
+                    values[1] = pair_0.y;
+                    unsigned int word_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_0 = early[pack * 16 + 4 + 1];
+                    float lo_r_r_0 = __uint_as_float(word_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_0 << 16);
+                    float hi_r_r_0 = __uint_as_float(word_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_0 & 4294901760u);
+                    float2 pair_r_r_r_0 = fma_f32x2_rn_noftz(make_float2(shfl_0, shfl_0), make_float2(lo_r_r_0, hi_r_r_0), make_float2(values[2], values[3]));
+                    values[2] = pair_r_r_r_0.x;
+                    values[3] = pair_r_r_r_0.y;
+                    unsigned int word_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_1 = early[pack * 16 + 4 + 2];
+                    float lo_r_r_1 = __uint_as_float(word_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_1 << 16);
+                    float hi_r_r_1 = __uint_as_float(word_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_1 & 4294901760u);
+                    float2 pair_r_r_r_1 = fma_f32x2_rn_noftz(make_float2(shfl_0, shfl_0), make_float2(lo_r_r_1, hi_r_r_1), make_float2(values[4], values[5]));
+                    values[4] = pair_r_r_r_1.x;
+                    values[5] = pair_r_r_r_1.y;
+                    unsigned int word_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_2 = early[pack * 16 + 4 + 3];
+                    float lo_r_r_2 = __uint_as_float(word_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_2 << 16);
+                    float hi_r_r_2 = __uint_as_float(word_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_2 & 4294901760u);
+                    float2 pair_r_r_r_2 = fma_f32x2_rn_noftz(make_float2(shfl_0, shfl_0), make_float2(lo_r_r_2, hi_r_r_2), make_float2(values[6], values[7]));
+                    values[6] = pair_r_r_r_2.x;
+                    values[7] = pair_r_r_r_2.y;
                 } else {
 #if __CUDA_ARCH__ == 1070
-                    float _vec_load_27[8];
+                    float vec_load_r_0[8];
 #else
-                    float _vec_load_53[8];
+                    float vec_load_r_r_0[8];
 #endif
                     {
 #if __CUDA_ARCH__ == 1070
@@ -11050,75 +11050,75 @@ kernel_cake_mega_mhc_41024b807c02040677b3(const __grid_constant__ CUtensorMap re
                             #pragma unroll
                             for (int _pair = 0; _pair < 4; _pair++) {
 #if __CUDA_ARCH__ == 1070
-                                (&_vec_load_27[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_89[_pair]) << 16);
-                                (&_vec_load_27[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_89[_pair]) & 0xffff0000u);
+                                (&vec_load_r_0[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_89[_pair]) << 16);
+                                (&vec_load_r_0[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_89[_pair]) & 0xffff0000u);
 #else
-                                (&_vec_load_53[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_231[_pair]) << 16);
-                                (&_vec_load_53[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_231[_pair]) & 0xffff0000u);
+                                (&vec_load_r_r_0[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_231[_pair]) << 16);
+                                (&vec_load_r_r_0[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_231[_pair]) & 0xffff0000u);
 #endif
                             }
                         }
                     }
 #if __CUDA_ARCH__ == 1070
-                    float2 pair_9 = fma_f32x2_rn_noftz(make_float2(_shfl_1, _shfl_1), make_float2(_vec_load_27[0], _vec_load_27[1]), make_float2(values[0], values[1]));
+                    float2 pair_1_1 = fma_f32x2_rn_noftz(make_float2(shfl_0, shfl_0), make_float2(vec_load_r_0[0], vec_load_r_0[1]), make_float2(values[0], values[1]));
 #else
-                    float2 pair_9 = fma_f32x2_rn_noftz(make_float2(_shfl_1, _shfl_1), make_float2(_vec_load_53[0], _vec_load_53[1]), make_float2(values[0], values[1]));
+                    float2 pair_1_1 = fma_f32x2_rn_noftz(make_float2(shfl_0, shfl_0), make_float2(vec_load_r_r_0[0], vec_load_r_r_0[1]), make_float2(values[0], values[1]));
 #endif
-                    values[0] = pair_9.x;
-                    values[1] = pair_9.y;
+                    values[0] = pair_1_1.x;
+                    values[1] = pair_1_1.y;
 #if __CUDA_ARCH__ == 1070
-                    float2 pair_0_1 = fma_f32x2_rn_noftz(make_float2(_shfl_1, _shfl_1), make_float2(_vec_load_27[2], _vec_load_27[3]), make_float2(values[2], values[3]));
+                    float2 pair_r_r_r_r_0 = fma_f32x2_rn_noftz(make_float2(shfl_0, shfl_0), make_float2(vec_load_r_0[2], vec_load_r_0[3]), make_float2(values[2], values[3]));
 #else
-                    float2 pair_0_1 = fma_f32x2_rn_noftz(make_float2(_shfl_1, _shfl_1), make_float2(_vec_load_53[2], _vec_load_53[3]), make_float2(values[2], values[3]));
+                    float2 pair_r_r_r_r_0 = fma_f32x2_rn_noftz(make_float2(shfl_0, shfl_0), make_float2(vec_load_r_r_0[2], vec_load_r_r_0[3]), make_float2(values[2], values[3]));
 #endif
-                    values[2] = pair_0_1.x;
-                    values[3] = pair_0_1.y;
+                    values[2] = pair_r_r_r_r_0.x;
+                    values[3] = pair_r_r_r_r_0.y;
 #if __CUDA_ARCH__ == 1070
-                    float2 pair_1_2 = fma_f32x2_rn_noftz(make_float2(_shfl_1, _shfl_1), make_float2(_vec_load_27[4], _vec_load_27[5]), make_float2(values[4], values[5]));
+                    float2 pair_r_r_r_r_1 = fma_f32x2_rn_noftz(make_float2(shfl_0, shfl_0), make_float2(vec_load_r_0[4], vec_load_r_0[5]), make_float2(values[4], values[5]));
 #else
-                    float2 pair_1_2 = fma_f32x2_rn_noftz(make_float2(_shfl_1, _shfl_1), make_float2(_vec_load_53[4], _vec_load_53[5]), make_float2(values[4], values[5]));
+                    float2 pair_r_r_r_r_1 = fma_f32x2_rn_noftz(make_float2(shfl_0, shfl_0), make_float2(vec_load_r_r_0[4], vec_load_r_r_0[5]), make_float2(values[4], values[5]));
 #endif
-                    values[4] = pair_1_2.x;
-                    values[5] = pair_1_2.y;
+                    values[4] = pair_r_r_r_r_1.x;
+                    values[5] = pair_r_r_r_r_1.y;
 #if __CUDA_ARCH__ == 1070
-                    float2 pair_2_2 = fma_f32x2_rn_noftz(make_float2(_shfl_1, _shfl_1), make_float2(_vec_load_27[6], _vec_load_27[7]), make_float2(values[6], values[7]));
+                    float2 pair_r_r_r_r_2 = fma_f32x2_rn_noftz(make_float2(shfl_0, shfl_0), make_float2(vec_load_r_0[6], vec_load_r_0[7]), make_float2(values[6], values[7]));
 #else
-                    float2 pair_2_2 = fma_f32x2_rn_noftz(make_float2(_shfl_1, _shfl_1), make_float2(_vec_load_53[6], _vec_load_53[7]), make_float2(values[6], values[7]));
+                    float2 pair_r_r_r_r_2 = fma_f32x2_rn_noftz(make_float2(shfl_0, shfl_0), make_float2(vec_load_r_r_0[6], vec_load_r_r_0[7]), make_float2(values[6], values[7]));
 #endif
-                    values[6] = pair_2_2.x;
-                    values[7] = pair_2_2.y;
+                    values[6] = pair_r_r_r_r_2.x;
+                    values[7] = pair_r_r_r_r_2.y;
                 }
-                float _shfl_2 = __shfl_sync(0xFFFFFFFF, coeff_1, 2);
+                float shfl_1 = __shfl_sync(0xFFFFFFFF, coeff_1, 2);
                 if (pack < 2) {
-                    unsigned int word_7 = early[pack * 16 + 8];
-                    float lo_3 = __uint_as_float(word_7 << 16);
-                    float hi_3 = __uint_as_float(word_7 & 4294901760u);
-                    float2 pair_10 = fma_f32x2_rn_noftz(make_float2(_shfl_2, _shfl_2), make_float2(lo_3, hi_3), make_float2(values[0], values[1]));
-                    values[0] = pair_10.x;
-                    values[1] = pair_10.y;
-                    unsigned int word_0_3 = early[pack * 16 + 8 + 1];
-                    float lo_1_2 = __uint_as_float(word_0_3 << 16);
-                    float hi_2_2 = __uint_as_float(word_0_3 & 4294901760u);
-                    float2 pair_3_2 = fma_f32x2_rn_noftz(make_float2(_shfl_2, _shfl_2), make_float2(lo_1_2, hi_2_2), make_float2(values[2], values[3]));
-                    values[2] = pair_3_2.x;
-                    values[3] = pair_3_2.y;
-                    unsigned int word_4_2 = early[pack * 16 + 8 + 2];
-                    float lo_5_2 = __uint_as_float(word_4_2 << 16);
-                    float hi_6_2 = __uint_as_float(word_4_2 & 4294901760u);
-                    float2 pair_7_2 = fma_f32x2_rn_noftz(make_float2(_shfl_2, _shfl_2), make_float2(lo_5_2, hi_6_2), make_float2(values[4], values[5]));
-                    values[4] = pair_7_2.x;
-                    values[5] = pair_7_2.y;
-                    unsigned int word_8_2 = early[pack * 16 + 8 + 3];
-                    float lo_9_2 = __uint_as_float(word_8_2 << 16);
-                    float hi_10_2 = __uint_as_float(word_8_2 & 4294901760u);
-                    float2 pair_11_2 = fma_f32x2_rn_noftz(make_float2(_shfl_2, _shfl_2), make_float2(lo_9_2, hi_10_2), make_float2(values[6], values[7]));
-                    values[6] = pair_11_2.x;
-                    values[7] = pair_11_2.y;
+                    unsigned int word_1_1 = early[pack * 16 + 8];
+                    float lo_1 = __uint_as_float(word_1_1 << 16);
+                    float hi_1 = __uint_as_float(word_1_1 & 4294901760u);
+                    float2 pair_2_1 = fma_f32x2_rn_noftz(make_float2(shfl_1, shfl_1), make_float2(lo_1, hi_1), make_float2(values[0], values[1]));
+                    values[0] = pair_2_1.x;
+                    values[1] = pair_2_1.y;
+                    unsigned int word_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_3 = early[pack * 16 + 8 + 1];
+                    float lo_r_r_3 = __uint_as_float(word_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_3 << 16);
+                    float hi_r_r_3 = __uint_as_float(word_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_3 & 4294901760u);
+                    float2 pair_r_r_r_3 = fma_f32x2_rn_noftz(make_float2(shfl_1, shfl_1), make_float2(lo_r_r_3, hi_r_r_3), make_float2(values[2], values[3]));
+                    values[2] = pair_r_r_r_3.x;
+                    values[3] = pair_r_r_r_3.y;
+                    unsigned int word_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_4 = early[pack * 16 + 8 + 2];
+                    float lo_r_r_4 = __uint_as_float(word_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_4 << 16);
+                    float hi_r_r_4 = __uint_as_float(word_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_4 & 4294901760u);
+                    float2 pair_r_r_r_4 = fma_f32x2_rn_noftz(make_float2(shfl_1, shfl_1), make_float2(lo_r_r_4, hi_r_r_4), make_float2(values[4], values[5]));
+                    values[4] = pair_r_r_r_4.x;
+                    values[5] = pair_r_r_r_4.y;
+                    unsigned int word_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_5 = early[pack * 16 + 8 + 3];
+                    float lo_r_r_5 = __uint_as_float(word_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_5 << 16);
+                    float hi_r_r_5 = __uint_as_float(word_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_5 & 4294901760u);
+                    float2 pair_r_r_r_5 = fma_f32x2_rn_noftz(make_float2(shfl_1, shfl_1), make_float2(lo_r_r_5, hi_r_r_5), make_float2(values[6], values[7]));
+                    values[6] = pair_r_r_r_5.x;
+                    values[7] = pair_r_r_r_5.y;
                 } else {
 #if __CUDA_ARCH__ == 1070
-                    float _vec_load_28[8];
+                    float vec_load_r_1[8];
 #else
-                    float _vec_load_54[8];
+                    float vec_load_r_r_1[8];
 #endif
                     {
 #if __CUDA_ARCH__ == 1070
@@ -11141,75 +11141,75 @@ kernel_cake_mega_mhc_41024b807c02040677b3(const __grid_constant__ CUtensorMap re
                             #pragma unroll
                             for (int _pair = 0; _pair < 4; _pair++) {
 #if __CUDA_ARCH__ == 1070
-                                (&_vec_load_28[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_90[_pair]) << 16);
-                                (&_vec_load_28[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_90[_pair]) & 0xffff0000u);
+                                (&vec_load_r_1[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_90[_pair]) << 16);
+                                (&vec_load_r_1[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_90[_pair]) & 0xffff0000u);
 #else
-                                (&_vec_load_54[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_232[_pair]) << 16);
-                                (&_vec_load_54[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_232[_pair]) & 0xffff0000u);
+                                (&vec_load_r_r_1[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_232[_pair]) << 16);
+                                (&vec_load_r_r_1[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_232[_pair]) & 0xffff0000u);
 #endif
                             }
                         }
                     }
 #if __CUDA_ARCH__ == 1070
-                    float2 pair_12 = fma_f32x2_rn_noftz(make_float2(_shfl_2, _shfl_2), make_float2(_vec_load_28[0], _vec_load_28[1]), make_float2(values[0], values[1]));
+                    float2 pair_3_1 = fma_f32x2_rn_noftz(make_float2(shfl_1, shfl_1), make_float2(vec_load_r_1[0], vec_load_r_1[1]), make_float2(values[0], values[1]));
 #else
-                    float2 pair_12 = fma_f32x2_rn_noftz(make_float2(_shfl_2, _shfl_2), make_float2(_vec_load_54[0], _vec_load_54[1]), make_float2(values[0], values[1]));
+                    float2 pair_3_1 = fma_f32x2_rn_noftz(make_float2(shfl_1, shfl_1), make_float2(vec_load_r_r_1[0], vec_load_r_r_1[1]), make_float2(values[0], values[1]));
 #endif
-                    values[0] = pair_12.x;
-                    values[1] = pair_12.y;
+                    values[0] = pair_3_1.x;
+                    values[1] = pair_3_1.y;
 #if __CUDA_ARCH__ == 1070
-                    float2 pair_0_2 = fma_f32x2_rn_noftz(make_float2(_shfl_2, _shfl_2), make_float2(_vec_load_28[2], _vec_load_28[3]), make_float2(values[2], values[3]));
+                    float2 pair_r_r_r_r_3 = fma_f32x2_rn_noftz(make_float2(shfl_1, shfl_1), make_float2(vec_load_r_1[2], vec_load_r_1[3]), make_float2(values[2], values[3]));
 #else
-                    float2 pair_0_2 = fma_f32x2_rn_noftz(make_float2(_shfl_2, _shfl_2), make_float2(_vec_load_54[2], _vec_load_54[3]), make_float2(values[2], values[3]));
+                    float2 pair_r_r_r_r_3 = fma_f32x2_rn_noftz(make_float2(shfl_1, shfl_1), make_float2(vec_load_r_r_1[2], vec_load_r_r_1[3]), make_float2(values[2], values[3]));
 #endif
-                    values[2] = pair_0_2.x;
-                    values[3] = pair_0_2.y;
+                    values[2] = pair_r_r_r_r_3.x;
+                    values[3] = pair_r_r_r_r_3.y;
 #if __CUDA_ARCH__ == 1070
-                    float2 pair_1_3 = fma_f32x2_rn_noftz(make_float2(_shfl_2, _shfl_2), make_float2(_vec_load_28[4], _vec_load_28[5]), make_float2(values[4], values[5]));
+                    float2 pair_r_r_r_r_4 = fma_f32x2_rn_noftz(make_float2(shfl_1, shfl_1), make_float2(vec_load_r_1[4], vec_load_r_1[5]), make_float2(values[4], values[5]));
 #else
-                    float2 pair_1_3 = fma_f32x2_rn_noftz(make_float2(_shfl_2, _shfl_2), make_float2(_vec_load_54[4], _vec_load_54[5]), make_float2(values[4], values[5]));
+                    float2 pair_r_r_r_r_4 = fma_f32x2_rn_noftz(make_float2(shfl_1, shfl_1), make_float2(vec_load_r_r_1[4], vec_load_r_r_1[5]), make_float2(values[4], values[5]));
 #endif
-                    values[4] = pair_1_3.x;
-                    values[5] = pair_1_3.y;
+                    values[4] = pair_r_r_r_r_4.x;
+                    values[5] = pair_r_r_r_r_4.y;
 #if __CUDA_ARCH__ == 1070
-                    float2 pair_2_3 = fma_f32x2_rn_noftz(make_float2(_shfl_2, _shfl_2), make_float2(_vec_load_28[6], _vec_load_28[7]), make_float2(values[6], values[7]));
+                    float2 pair_r_r_r_r_5 = fma_f32x2_rn_noftz(make_float2(shfl_1, shfl_1), make_float2(vec_load_r_1[6], vec_load_r_1[7]), make_float2(values[6], values[7]));
 #else
-                    float2 pair_2_3 = fma_f32x2_rn_noftz(make_float2(_shfl_2, _shfl_2), make_float2(_vec_load_54[6], _vec_load_54[7]), make_float2(values[6], values[7]));
+                    float2 pair_r_r_r_r_5 = fma_f32x2_rn_noftz(make_float2(shfl_1, shfl_1), make_float2(vec_load_r_r_1[6], vec_load_r_r_1[7]), make_float2(values[6], values[7]));
 #endif
-                    values[6] = pair_2_3.x;
-                    values[7] = pair_2_3.y;
+                    values[6] = pair_r_r_r_r_5.x;
+                    values[7] = pair_r_r_r_r_5.y;
                 }
-                float _shfl_3 = __shfl_sync(0xFFFFFFFF, coeff_1, 3);
+                float shfl_2 = __shfl_sync(0xFFFFFFFF, coeff_1, 3);
                 if (pack < 2) {
-                    unsigned int word_9 = early[pack * 16 + 12];
-                    float lo_4 = __uint_as_float(word_9 << 16);
-                    float hi_4 = __uint_as_float(word_9 & 4294901760u);
-                    float2 pair_13 = fma_f32x2_rn_noftz(make_float2(_shfl_3, _shfl_3), make_float2(lo_4, hi_4), make_float2(values[0], values[1]));
-                    values[0] = pair_13.x;
-                    values[1] = pair_13.y;
-                    unsigned int word_0_4 = early[pack * 16 + 12 + 1];
-                    float lo_1_3 = __uint_as_float(word_0_4 << 16);
-                    float hi_2_3 = __uint_as_float(word_0_4 & 4294901760u);
-                    float2 pair_3_3 = fma_f32x2_rn_noftz(make_float2(_shfl_3, _shfl_3), make_float2(lo_1_3, hi_2_3), make_float2(values[2], values[3]));
-                    values[2] = pair_3_3.x;
-                    values[3] = pair_3_3.y;
-                    unsigned int word_4_3 = early[pack * 16 + 12 + 2];
-                    float lo_5_3 = __uint_as_float(word_4_3 << 16);
-                    float hi_6_3 = __uint_as_float(word_4_3 & 4294901760u);
-                    float2 pair_7_3 = fma_f32x2_rn_noftz(make_float2(_shfl_3, _shfl_3), make_float2(lo_5_3, hi_6_3), make_float2(values[4], values[5]));
-                    values[4] = pair_7_3.x;
-                    values[5] = pair_7_3.y;
-                    unsigned int word_8_3 = early[pack * 16 + 12 + 3];
-                    float lo_9_3 = __uint_as_float(word_8_3 << 16);
-                    float hi_10_3 = __uint_as_float(word_8_3 & 4294901760u);
-                    float2 pair_11_3 = fma_f32x2_rn_noftz(make_float2(_shfl_3, _shfl_3), make_float2(lo_9_3, hi_10_3), make_float2(values[6], values[7]));
-                    values[6] = pair_11_3.x;
-                    values[7] = pair_11_3.y;
+                    unsigned int word_2 = early[pack * 16 + 12];
+                    float lo_2 = __uint_as_float(word_2 << 16);
+                    float hi_2 = __uint_as_float(word_2 & 4294901760u);
+                    float2 pair_4 = fma_f32x2_rn_noftz(make_float2(shfl_2, shfl_2), make_float2(lo_2, hi_2), make_float2(values[0], values[1]));
+                    values[0] = pair_4.x;
+                    values[1] = pair_4.y;
+                    unsigned int word_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_6 = early[pack * 16 + 12 + 1];
+                    float lo_r_r_6 = __uint_as_float(word_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_6 << 16);
+                    float hi_r_r_6 = __uint_as_float(word_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_6 & 4294901760u);
+                    float2 pair_r_r_r_6 = fma_f32x2_rn_noftz(make_float2(shfl_2, shfl_2), make_float2(lo_r_r_6, hi_r_r_6), make_float2(values[2], values[3]));
+                    values[2] = pair_r_r_r_6.x;
+                    values[3] = pair_r_r_r_6.y;
+                    unsigned int word_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_7 = early[pack * 16 + 12 + 2];
+                    float lo_r_r_7 = __uint_as_float(word_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_7 << 16);
+                    float hi_r_r_7 = __uint_as_float(word_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_7 & 4294901760u);
+                    float2 pair_r_r_r_7 = fma_f32x2_rn_noftz(make_float2(shfl_2, shfl_2), make_float2(lo_r_r_7, hi_r_r_7), make_float2(values[4], values[5]));
+                    values[4] = pair_r_r_r_7.x;
+                    values[5] = pair_r_r_r_7.y;
+                    unsigned int word_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_8 = early[pack * 16 + 12 + 3];
+                    float lo_r_r_8 = __uint_as_float(word_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_8 << 16);
+                    float hi_r_r_8 = __uint_as_float(word_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_r_8 & 4294901760u);
+                    float2 pair_r_r_r_8 = fma_f32x2_rn_noftz(make_float2(shfl_2, shfl_2), make_float2(lo_r_r_8, hi_r_r_8), make_float2(values[6], values[7]));
+                    values[6] = pair_r_r_r_8.x;
+                    values[7] = pair_r_r_r_8.y;
                 } else {
 #if __CUDA_ARCH__ == 1070
-                    float _vec_load_29[8];
+                    float vec_load_r_2[8];
 #else
-                    float _vec_load_55[8];
+                    float vec_load_r_r_2[8];
 #endif
                     {
 #if __CUDA_ARCH__ == 1070
@@ -11232,63 +11232,63 @@ kernel_cake_mega_mhc_41024b807c02040677b3(const __grid_constant__ CUtensorMap re
                             #pragma unroll
                             for (int _pair = 0; _pair < 4; _pair++) {
 #if __CUDA_ARCH__ == 1070
-                                (&_vec_load_29[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_91[_pair]) << 16);
-                                (&_vec_load_29[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_91[_pair]) & 0xffff0000u);
+                                (&vec_load_r_2[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_91[_pair]) << 16);
+                                (&vec_load_r_2[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_91[_pair]) & 0xffff0000u);
 #else
-                                (&_vec_load_55[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_233[_pair]) << 16);
-                                (&_vec_load_55[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_233[_pair]) & 0xffff0000u);
+                                (&vec_load_r_r_2[0 + _blk * 8 + _pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(_vpairs_233[_pair]) << 16);
+                                (&vec_load_r_r_2[0 + _blk * 8 + _pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(_vpairs_233[_pair]) & 0xffff0000u);
 #endif
                             }
                         }
                     }
 #if __CUDA_ARCH__ == 1070
-                    float2 pair_14 = fma_f32x2_rn_noftz(make_float2(_shfl_3, _shfl_3), make_float2(_vec_load_29[0], _vec_load_29[1]), make_float2(values[0], values[1]));
+                    float2 pair_5_1 = fma_f32x2_rn_noftz(make_float2(shfl_2, shfl_2), make_float2(vec_load_r_2[0], vec_load_r_2[1]), make_float2(values[0], values[1]));
 #else
-                    float2 pair_14 = fma_f32x2_rn_noftz(make_float2(_shfl_3, _shfl_3), make_float2(_vec_load_55[0], _vec_load_55[1]), make_float2(values[0], values[1]));
+                    float2 pair_5_1 = fma_f32x2_rn_noftz(make_float2(shfl_2, shfl_2), make_float2(vec_load_r_r_2[0], vec_load_r_r_2[1]), make_float2(values[0], values[1]));
 #endif
-                    values[0] = pair_14.x;
-                    values[1] = pair_14.y;
+                    values[0] = pair_5_1.x;
+                    values[1] = pair_5_1.y;
 #if __CUDA_ARCH__ == 1070
-                    float2 pair_0_3 = fma_f32x2_rn_noftz(make_float2(_shfl_3, _shfl_3), make_float2(_vec_load_29[2], _vec_load_29[3]), make_float2(values[2], values[3]));
+                    float2 pair_r_r_r_r_6 = fma_f32x2_rn_noftz(make_float2(shfl_2, shfl_2), make_float2(vec_load_r_2[2], vec_load_r_2[3]), make_float2(values[2], values[3]));
 #else
-                    float2 pair_0_3 = fma_f32x2_rn_noftz(make_float2(_shfl_3, _shfl_3), make_float2(_vec_load_55[2], _vec_load_55[3]), make_float2(values[2], values[3]));
+                    float2 pair_r_r_r_r_6 = fma_f32x2_rn_noftz(make_float2(shfl_2, shfl_2), make_float2(vec_load_r_r_2[2], vec_load_r_r_2[3]), make_float2(values[2], values[3]));
 #endif
-                    values[2] = pair_0_3.x;
-                    values[3] = pair_0_3.y;
+                    values[2] = pair_r_r_r_r_6.x;
+                    values[3] = pair_r_r_r_r_6.y;
 #if __CUDA_ARCH__ == 1070
-                    float2 pair_1_4 = fma_f32x2_rn_noftz(make_float2(_shfl_3, _shfl_3), make_float2(_vec_load_29[4], _vec_load_29[5]), make_float2(values[4], values[5]));
+                    float2 pair_r_r_r_r_7 = fma_f32x2_rn_noftz(make_float2(shfl_2, shfl_2), make_float2(vec_load_r_2[4], vec_load_r_2[5]), make_float2(values[4], values[5]));
 #else
-                    float2 pair_1_4 = fma_f32x2_rn_noftz(make_float2(_shfl_3, _shfl_3), make_float2(_vec_load_55[4], _vec_load_55[5]), make_float2(values[4], values[5]));
+                    float2 pair_r_r_r_r_7 = fma_f32x2_rn_noftz(make_float2(shfl_2, shfl_2), make_float2(vec_load_r_r_2[4], vec_load_r_r_2[5]), make_float2(values[4], values[5]));
 #endif
-                    values[4] = pair_1_4.x;
-                    values[5] = pair_1_4.y;
+                    values[4] = pair_r_r_r_r_7.x;
+                    values[5] = pair_r_r_r_r_7.y;
 #if __CUDA_ARCH__ == 1070
-                    float2 pair_2_4 = fma_f32x2_rn_noftz(make_float2(_shfl_3, _shfl_3), make_float2(_vec_load_29[6], _vec_load_29[7]), make_float2(values[6], values[7]));
+                    float2 pair_r_r_r_r_8 = fma_f32x2_rn_noftz(make_float2(shfl_2, shfl_2), make_float2(vec_load_r_2[6], vec_load_r_2[7]), make_float2(values[6], values[7]));
 #else
-                    float2 pair_2_4 = fma_f32x2_rn_noftz(make_float2(_shfl_3, _shfl_3), make_float2(_vec_load_55[6], _vec_load_55[7]), make_float2(values[6], values[7]));
+                    float2 pair_r_r_r_r_8 = fma_f32x2_rn_noftz(make_float2(shfl_2, shfl_2), make_float2(vec_load_r_r_2[6], vec_load_r_r_2[7]), make_float2(values[6], values[7]));
 #endif
-                    values[6] = pair_2_4.x;
-                    values[7] = pair_2_4.y;
+                    values[6] = pair_r_r_r_r_8.x;
+                    values[7] = pair_r_r_r_r_8.y;
                 }
                 float2 w_pair = make_float2(values[0], values[1]);
                 float2 squares_1 = fma_f32x2_rn_noftz(w_pair, w_pair, make_float2(sum0, sum1));
                 sum0 = squares_1.x;
                 sum1 = squares_1.y;
                 retained[pack * 4] = __as_u32(__float22bfloat162_rn(make_float2(values[0], values[1])));
-                float2 w_pair_0 = make_float2(values[2], values[3]);
-                float2 squares_1_1 = fma_f32x2_rn_noftz(w_pair_0, w_pair_0, make_float2(sum0, sum1));
-                sum0 = squares_1_1.x;
-                sum1 = squares_1_1.y;
+                float2 w_pair_r_0 = make_float2(values[2], values[3]);
+                float2 squares_r_r_r_r_r_r_r_r_r_0 = fma_f32x2_rn_noftz(w_pair_r_0, w_pair_r_0, make_float2(sum0, sum1));
+                sum0 = squares_r_r_r_r_r_r_r_r_r_0.x;
+                sum1 = squares_r_r_r_r_r_r_r_r_r_0.y;
                 retained[pack * 4 + 1] = __as_u32(__float22bfloat162_rn(make_float2(values[2], values[3])));
-                float2 w_pair_2 = make_float2(values[4], values[5]);
-                float2 squares_3 = fma_f32x2_rn_noftz(w_pair_2, w_pair_2, make_float2(sum0, sum1));
-                sum0 = squares_3.x;
-                sum1 = squares_3.y;
+                float2 w_pair_r_1 = make_float2(values[4], values[5]);
+                float2 squares_r_r_r_r_r_r_r_r_r_1 = fma_f32x2_rn_noftz(w_pair_r_1, w_pair_r_1, make_float2(sum0, sum1));
+                sum0 = squares_r_r_r_r_r_r_r_r_r_1.x;
+                sum1 = squares_r_r_r_r_r_r_r_r_r_1.y;
                 retained[pack * 4 + 2] = __as_u32(__float22bfloat162_rn(make_float2(values[4], values[5])));
-                float2 w_pair_4 = make_float2(values[6], values[7]);
-                float2 squares_5 = fma_f32x2_rn_noftz(w_pair_4, w_pair_4, make_float2(sum0, sum1));
-                sum0 = squares_5.x;
-                sum1 = squares_5.y;
+                float2 w_pair_r_2 = make_float2(values[6], values[7]);
+                float2 squares_r_r_r_r_r_r_r_r_r_2 = fma_f32x2_rn_noftz(w_pair_r_2, w_pair_r_2, make_float2(sum0, sum1));
+                sum0 = squares_r_r_r_r_r_r_r_r_r_2.x;
+                sum1 = squares_r_r_r_r_r_r_r_r_r_2.y;
                 retained[pack * 4 + 3] = __as_u32(__float22bfloat162_rn(make_float2(values[6], values[7])));
             }
 #if __CUDA_ARCH__ == 1070
@@ -11357,16 +11357,16 @@ kernel_cake_mega_mhc_41024b807c02040677b3(const __grid_constant__ CUtensorMap re
                 unsigned int normalized_words[4];
                 #pragma unroll
                 for (int j = 0; j < 4; j++) {
-                    unsigned int word_10 = retained[pack_1 * 4 + j];
-                    float lo_6 = __uint_as_float(word_10 << 16);
-                    float hi_5 = __uint_as_float(word_10 & 4294901760u);
+                    unsigned int word_3 = retained[pack_1 * 4 + j];
+                    float lo_3 = __uint_as_float(word_3 << 16);
+                    float hi_3 = __uint_as_float(word_3 & 4294901760u);
                     float weight_lo = __uint_as_float(weight_cache[j] << 16);
                     float weight_hi = __uint_as_float(weight_cache[j] & 4294901760u);
 #if __CUDA_ARCH__ == 1070
-                    float2 _f32x2_mul_a_100 = make_float2(lo_6, hi_5);
+                    float2 _f32x2_mul_a_100 = make_float2(lo_3, hi_3);
                     float2 _f32x2_mul_b_101 = make_float2(rstd, rstd);
 #else
-                    float2 _f32x2_mul_a_242 = make_float2(lo_6, hi_5);
+                    float2 _f32x2_mul_a_242 = make_float2(lo_3, hi_3);
                     float2 _f32x2_mul_b_243 = make_float2(rstd, rstd);
 #endif
                     float2 scaled;

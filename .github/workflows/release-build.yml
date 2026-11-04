@@ -30,6 +30,10 @@ on:
         description: 'Stop containers and wipe the workspace on self-hosted runners before each build'
         type: boolean
         default: false
+      exclude_experimental_sources:
+        description: 'Leave the experimental packages generated kernel sources out of the flashinfer-python wheel (release only; keeps it under the PyPI 100 MB file limit, flashinfer-ai/flashinfer#7977)'
+        type: boolean
+        default: false
       cubin_retry_window_seconds:
         description: 'FLASHINFER_CUBIN_RETRY_WINDOW_SECONDS for the cubin download'
         type: string
@@ -95,6 +99,7 @@ jobs:
       - name: Build flashinfer-python wheel and sdist
         env:
           FLASHINFER_DEV_RELEASE_SUFFIX: ${{ inputs.dev_suffix }}
+          FLASHINFER_WHEEL_EXCLUDE_EXPERIMENTAL_SOURCES: ${{ inputs.exclude_experimental_sources && '1' || '' }}
         run: |
           echo "Building flashinfer-python (dev suffix: '${FLASHINFER_DEV_RELEASE_SUFFIX}')..."
           echo "Git commit: $(git rev-parse HEAD)"

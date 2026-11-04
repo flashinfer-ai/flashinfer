@@ -1224,8 +1224,8 @@
             "program": 1
           },
           "sources": {
-            "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8_d256_balanced/kernel.cu",
-            "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_fp8_d256_balanced/kernel.cu"
+            "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8_d256_balanced/cake_fmha_dcp_spec_bf16_fp8_d256_balanced_program1_n32.cu",
+            "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_fp8_d256_balanced/cake_fmha_dcp_spec_bf16_fp8_d256_balanced_program1_n32.cu"
           }
         },
         {
@@ -1238,8 +1238,8 @@
             "program": 1
           },
           "sources": {
-            "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8_d256_balanced/kernel.cu",
-            "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_fp8_d256_balanced/kernel.cu"
+            "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8_d256_balanced/cake_fmha_dcp_spec_bf16_fp8_d256_balanced_program1_n64.cu",
+            "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_fp8_d256_balanced/cake_fmha_dcp_spec_bf16_fp8_d256_balanced_program1_n64.cu"
           }
         },
         {
@@ -1252,8 +1252,8 @@
             "program": 2
           },
           "sources": {
-            "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8_d256_balanced/kernel.cu",
-            "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_fp8_d256_balanced/kernel.cu"
+            "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8_d256_balanced/cake_fmha_dcp_spec_bf16_fp8_d256_balanced_program2_n32.cu",
+            "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_fp8_d256_balanced/cake_fmha_dcp_spec_bf16_fp8_d256_balanced_program2_n32.cu"
           }
         },
         {
@@ -1266,8 +1266,8 @@
             "program": 2
           },
           "sources": {
-            "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8_d256_balanced/kernel.cu",
-            "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_fp8_d256_balanced/kernel.cu"
+            "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8_d256_balanced/cake_fmha_dcp_spec_bf16_fp8_d256_balanced_program2_n64.cu",
+            "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_fp8_d256_balanced/cake_fmha_dcp_spec_bf16_fp8_d256_balanced_program2_n64.cu"
           }
         }
       ],

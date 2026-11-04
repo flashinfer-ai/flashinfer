@@ -64,9 +64,26 @@ def stage_mega_moe_inputs(
     if topk_weights.shape != topk_ids.shape:
         raise ValueError("topk_weights and topk_ids must have the same shape.")
 
-    if _use_fused_stage() and fused_quant_stage_supported(
-        hidden_states, quant_type="mxfp8"
+    mixed = kind == "mxfp4_mxfp8"
+    mixed_layout_supported = not mixed or (
+        hidden_states.is_cuda
+        and hidden_states.dtype == torch.bfloat16
+        and hidden_states.is_contiguous()
+        and topk_ids.shape[1] <= 128
+        and topk_ids.is_contiguous()
+        and topk_weights.is_contiguous()
+        and topk_ids.data_ptr() % 16 == 0
+        and topk_weights.data_ptr() % 16 == 0
+        and topk_weights.dtype in (torch.float16, torch.bfloat16, torch.float32)
+    )
+    if (
+        _use_fused_stage()
+        and mixed_layout_supported
+        and fused_quant_stage_supported(hidden_states, quant_type="mxfp8")
     ):
+        if mixed:
+            # Another staging path may have used this pooled workspace.
+            note_staged_tokens(topk_idx_out, x_fp8.shape[0])
         fused_quant_stage(
             hidden_states,
             topk_ids,
@@ -75,13 +92,19 @@ def stage_mega_moe_inputs(
             x_sf,
             topk_idx_out,
             topk_weights_out,
-            quant_type="mxfp8_e4m3" if kind == "mxfp4_mxfp8" else kind,
+            quant_type="mxfp8_e4m3" if mixed else kind,
+            mxfp8_normal_scales=mixed,
         )
         return
 
     data_dtype = _mxfp8_data_dtype(kind)
     activation_fp32 = hidden_states.to(torch.float32)
-    q, sf = mxfp8_quantize_per_block_32(activation_fp32, data_dtype)
+    if mixed:
+        from ......kernel_src.sm100.next_cutedsl_megamoe import quantize_mxfp8_block32
+
+        q, sf = quantize_mxfp8_block32(activation_fp32, data_dtype)
+    else:
+        q, sf = mxfp8_quantize_per_block_32(activation_fp32, data_dtype)
 
     hidden_sf_cols = ceil_div(hidden, Mxfp8BlockSize)
     hidden_sf_cols_padded = round_up(hidden_sf_cols, 4)
@@ -95,7 +118,9 @@ def stage_mega_moe_inputs(
     x_sf[:num_tokens].zero_()
     x_sf[:num_tokens, :hidden_sf_cols].view(torch.uint8).copy_(sf.view(torch.uint8))
     topk_idx_out[:num_tokens].copy_(topk_ids)
-    topk_weights_out[:num_tokens].copy_(topk_weights)
+    topk_weights_out[:num_tokens].copy_(
+        topk_weights.masked_fill(topk_ids == -1, 0) if mixed else topk_weights
+    )
 
     capacity = x_fp8.shape[0]
     if num_tokens < capacity:

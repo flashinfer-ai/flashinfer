@@ -25,6 +25,7 @@ from flashinfer.experimental.kimi_k3_fused_router.cake_backend import (
     ARM_L_MAX_TOKENS,
     ARM_L_MIN_GRID,
     ARM_LC1_NC,
+    ARM_LC2_CW,
     ARM_LC_TOKENS,
     ARM_LCG_CLUSTER,
     ARM_LCG_FAMILY,
@@ -341,17 +342,21 @@ def test_route_tables_cover_the_measured_cells():
         arms = {"L", "LC", "LC1_NC", "LCG_LW", "M", "Q4S", "Q4S_E16", "Q4SP", "GW"}
         # LPC serves sm_100a's 64-token cells, LP sm_103a's (64, 8) and (128, 8);
         # LCG serves sm_103a's (32, 8) cell (and sm_100a's counts up to 28 at
-        # block_m 16); LCG_LW_OWN sm_100a's (32, 16) cell from 29 tokens.
-        arms.update(("LP", "LCG") if arch == "sm_103a" else ("LPC", "LCG_LW_OWN"))
+        # block_m 16); LCG_LW_OWN sm_100a's (32, 16) cell from 29 tokens;
+        # LC2_CW sm_100a's (2, 8) cell.
+        arms.update(
+            ("LP", "LCG") if arch == "sm_103a" else ("LPC", "LCG_LW_OWN", "LC2_CW")
+        )
         assert set(table.values()) == arms
-    # The two tables differ in exactly three cells of the L family and in both
-    # 32-token cells (LCG_LW / LCG at block_m 8, LCG_LW_OWN / LCG_LW at 16).
+    # The two tables differ in exactly three cells of the L family, in both
+    # 32-token cells (LCG_LW / LCG at block_m 8, LCG_LW_OWN / LCG_LW at 16) and
+    # in the two-token cell at block_m 8 (LC2_CW / LC).
     differing = {
         key
         for key in SHAPE_ROUTES["sm_100a"]
         if SHAPE_ROUTES["sm_100a"][key] != SHAPE_ROUTES["sm_103a"][key]
     }
-    assert differing == {(32, 8), (32, 16), (64, 8), (64, 16), (128, 8)}
+    assert differing == {(2, 8), (32, 8), (32, 16), (64, 8), (64, 16), (128, 8)}
     assert ARM_LCG_FAMILY == ("LCG", "LCG_LW", "LCG_LW_OWN")
     assert CELL_LOW_ROUTES == {
         ("sm_100a", 32, 16): (28, "LCG"),
@@ -363,6 +368,13 @@ def test_route_tables_cover_the_measured_cells():
     assert ARM_LC1_NC == "LC1_NC"
     for arch in SHAPE_ROUTES:
         assert route_arm(arch, 1, 8) == "LC" and route_arm(arch, 1, 16) == "LC1_NC"
+    # Two tokens: LC2_CW (the certified-window rank) on SM100 at block_m 8, LC
+    # at block_m 16 and on SM103.
+    assert ARM_LC2_CW == "LC2_CW"
+    assert (
+        route_arm("sm_100a", 2, 8) == "LC2_CW" and route_arm("sm_100a", 2, 16) == "LC"
+    )
+    assert route_arm("sm_103a", 2, 8) == "LC" and route_arm("sm_103a", 2, 16) == "LC"
     assert route_arm("sm_100a", 32, 8) == "LCG_LW"
     assert route_arm("sm_100a", 32, 16) == "LCG_LW_OWN"
     assert route_arm("sm_100a", 29, 16) == "LCG_LW_OWN"
@@ -381,16 +393,23 @@ def test_route_tables_cover_the_measured_cells():
     assert route_arm("sm_103a", 128, 8) == "LP"
     for arch in SHAPE_ROUTES:
         # Arm LC serves exactly the LC row counts (one kernel per token count;
-        # one token at block_m 16 takes LC1_NC).
+        # one token at block_m 16 takes LC1_NC, two tokens at block_m 8 on SM100
+        # LC2_CW).
         assert set(ARM_LC_TOKENS) == {
             rows for (rows, _), arm in SHAPE_ROUTES[arch].items() if arm == "LC"
         }
         assert {
             cell for cell, arm in SHAPE_ROUTES[arch].items() if arm == ARM_LC1_NC
         } == {(1, 16)}
+        cw_cells = {(2, 8)} if arch == "sm_100a" else set()
+        assert {
+            cell for cell, arm in SHAPE_ROUTES[arch].items() if arm == ARM_LC2_CW
+        } == cw_cells
         for rows in ARM_LC_TOKENS:
             for bm in BLOCK_M_VALUES:
                 expected = ARM_LC1_NC if (rows, bm) == (1, 16) else "LC"
+                if (rows, bm) in cw_cells:
+                    expected = ARM_LC2_CW
                 assert route_arm(arch, rows, bm) == expected
         assert {
             rows for (rows, _), arm in SHAPE_ROUTES[arch].items() if arm in ARM_L_FAMILY
@@ -521,6 +540,12 @@ def test_launch_grid_rules(compute_capability, sm_count):
     for rows in (2, 3, 16):
         with pytest.raises(RuntimeError, match="exactly one token"):
             launch_grid(ARM_LC1_NC, rows, **kw)
+    # Arm LC2_CW: one cluster of two CTAs for exactly two tokens.
+    assert launch_grid(ARM_LC2_CW, 2, **kw) == 2
+    assert launch_grid(ARM_LC2_CW, 2, max_active_clusters=1, **kw) == 2
+    for rows in (1, 3, 4):
+        with pytest.raises(RuntimeError, match="exactly two tokens"):
+            launch_grid(ARM_LC2_CW, rows, **kw)
     # Arms LCG, LCG_LW and LCG_LW_OWN: one cluster of 16 CTAs for any count up
     # to 32.
     assert ARM_LCG_CLUSTER == 16 and ARM_LCG_MAX_TOKENS == 32
@@ -688,6 +713,7 @@ def test_launch_grid_refuses_missing_clusters(compute_capability):
         ("LC", 16),
         ("LC", 8),
         ("LC1_NC", 1),
+        ("LC2_CW", 2),
         ("LCG", 32),
         ("LCG", 3),
         ("LCG_LW", 32),
@@ -837,6 +863,7 @@ def test_capacity_rule_routes_q4s_cells():
         "LPC",
         "LC",
         "LC1_NC",
+        "LC2_CW",
         "LCG",
         "LCG_LW",
         "LCG_LW_OWN",
@@ -919,11 +946,13 @@ def test_registry_keys_are_dispatch_arms():
             assert record["num_tokens"] == (int(rows) if rows else None)
             assert arch in record["arches"]
             assert record["launch"]["cooperative"] == (
-                arm not in ("LC", ARM_LC1_NC) and arm not in ARM_LCG_FAMILY
+                arm not in ("LC", ARM_LC1_NC, ARM_LC2_CW) and arm not in ARM_LCG_FAMILY
             )
             cluster = record["launch"]["cluster"][0]
             if arm == "LC":
                 assert cluster == int(rows)
+            elif arm == ARM_LC2_CW:
+                assert cluster == 2
             elif arm in ARM_LCG_FAMILY:
                 assert cluster == ARM_LCG_CLUSTER
             elif arm in ARM_Q4S_FAMILY:

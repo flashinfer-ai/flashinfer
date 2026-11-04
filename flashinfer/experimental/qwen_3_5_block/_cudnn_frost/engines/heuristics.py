@@ -41,7 +41,7 @@ import logging
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .base import BaseEngine, PlanConfig, decline_types
-from .engine_ids import BACKEND_BLOCK_ENGINE_ID
+from .engine_ids import BACKEND_BLOCK_ENGINE_ID, LAST_RESORT_ENGINE_ID
 
 _LOG = logging.getLogger("cudnn.engines.heuristics")
 
@@ -51,8 +51,25 @@ the mode goes where this entry sits. :func:`_assemble` expands it; it never
 reaches ``graph.plans``. Compare by ``engine_id`` (``is_backend_block``)."""
 
 
+LAST_RESORT = PlanConfig(LAST_RESORT_ENGINE_ID)
+"""Placement marker: the family's proposals after it are tried only after every requested mode's backend entries (a
+correctness fallback for graphs the backend declines). :func:`_assemble` defers them; it never reaches ``graph.plans``."""
+
+
 def is_backend_block(cfg: PlanConfig) -> bool:
     return cfg.engine_id == BACKEND_BLOCK_ENGINE_ID
+
+
+def is_last_resort(cfg: PlanConfig) -> bool:
+    return cfg.engine_id == LAST_RESORT_ENGINE_ID
+
+
+def _split_last_resort(proposals: List[PlanConfig]) -> Tuple[List[PlanConfig], List[PlanConfig]]:
+    """(proposals before the LAST_RESORT marker, proposals after it); no marker: (all, [])."""
+    for i, p in enumerate(proposals):
+        if is_last_resort(p):
+            return proposals[:i], [q for q in proposals[i + 1 :] if not is_last_resort(q)]
+    return proposals, []
 
 
 def _place(proposals: List[PlanConfig], block: List[PlanConfig]) -> List[PlanConfig]:
@@ -146,19 +163,25 @@ def _assemble(modes: List[Any], recommend: Callable[[str], List[PlanConfig]], ba
 
     delegating = [c for c in backend_plans if c.mode is None]
     out: List[PlanConfig] = []
+    deferred: List[PlanConfig] = []  # after LAST_RESORT: behind every mode's backend block
     for mode in modes:
         if mode == cudnn.heur_mode.OPENSOURCE:
             # python-only + delegating: the marker must not pull native entries
             # into an OPENSOURCE block, and the delegating entry never leads
             # ours (below), so the marker is dropped here.
-            out += [p for p in recommend("A") if not is_backend_block(p)] + delegating
+            out += [p for p in recommend("A") if not (is_backend_block(p) or is_last_resort(p))] + delegating
         elif mode in (cudnn.heur_mode.A, cudnn.heur_mode.B):
-            out += _place(recommend("A"), delegating + [c for c in backend_plans if c.mode == mode])
+            head, tail = _split_last_resort(recommend("A"))
+            out += _place(head, delegating + [c for c in backend_plans if c.mode == mode])
+            deferred += tail
         elif mode == cudnn.heur_mode.FALLBACK:
-            out += _place(recommend("FALLBACK"), delegating + [c for c in backend_plans if c.mode == mode])
+            head, tail = _split_last_resort(recommend("FALLBACK"))
+            out += _place(head, delegating + [c for c in backend_plans if c.mode == mode])
+            deferred += tail
     # A delegate with no mode asked for it (the backend has engines but exposed
     # no plans) would otherwise be dropped.
     out += delegating
+    out += deferred
 
     seen, ranked = set(), []
     for cfg in out:
@@ -206,5 +229,5 @@ def rank(graph, engines: List[BaseEngine], backend_plans: List[PlanConfig], mode
 
         if is_python_engine(cfg.engine_id) and cfg.engine_id not in own:
             raise ValueError(f"heuristics for {family.name} returned python engine_id {cfg.engine_id}, which the family does not own or offer")
-        assert not is_backend_block(cfg), "the BACKEND marker must be expanded by _assemble, never ranked"
+        assert not (is_backend_block(cfg) or is_last_resort(cfg)), "placement markers must be expanded by _assemble, never ranked"
     return plans
