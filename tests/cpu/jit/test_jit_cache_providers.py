@@ -1083,3 +1083,137 @@ def test_get_aot_path_prefers_bundled_package_module(monkeypatch, tmp_path):
     )
 
     assert jit_env.get_aot_path("attention_module") == expected
+
+
+def _run_bounded_parallel(
+    tmp_path, concurrency, items, fail_item=None, ok_delay=0.3, launch_delay=False
+):
+    """Run the pool with a fake build that logs start/end and sleeps briefly."""
+    common_script = (
+        Path(__file__).resolve().parents[3] / "scripts" / "jit_cache_build_common.sh"
+    )
+    log = tmp_path / "events.log"
+    script = f"""
+set -eo pipefail
+source "{common_script}"
+# Time passes before each launch decision, as it does while a pool of long
+# builds runs: wait until the first item has exited, so one that fails at once
+# is already finished when the next launch is decided.
+eval "$(declare -f _reap_finished_items | sed '1s/_reap_finished_items/_reap_items_now/')"
+_reap_finished_items() {{
+  if {str(launch_delay).lower()} && (( ${{#pids[@]}} > 0 )); then
+    while kill -0 "${{pids[0]}}" 2>/dev/null; do sleep 0.01; done
+  fi
+  _reap_items_now
+}}
+fake_build() {{
+  echo "start $1" >> "{log}"
+  if [ "$1" = "{fail_item}" ]; then return 1; fi
+  sleep {ok_delay}
+  echo "end $1" >> "{log}"
+}}
+if run_bounded_parallel {concurrency} fake_build {" ".join(items)}; then
+  echo ok
+else
+  echo failed
+fi
+"""
+    result = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+    events = log.read_text().split("\n") if log.exists() else []
+    return result.stdout.strip(), [e for e in events if e]
+
+
+def _bash_supports_wait_n():
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            "(( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 3) ))",
+        ]
+    )
+    return result.returncode == 0
+
+
+@pytest.mark.cpu_only
+@pytest.mark.skipif(not _bash_supports_wait_n(), reason="needs bash >= 4.3")
+def test_run_bounded_parallel_limits_and_reuses_slots(tmp_path):
+    status, events = _run_bounded_parallel(tmp_path, 2, ["a", "b", "c", "d"])
+
+    assert status == "ok"
+    assert sorted(e for e in events if e.startswith("end")) == [
+        f"end {x}" for x in "abcd"
+    ]
+    running = peak = 0
+    for event in events:
+        running += 1 if event.startswith("start") else -1
+        peak = max(peak, running)
+    assert peak == 2
+
+
+@pytest.mark.cpu_only
+@pytest.mark.skipif(not _bash_supports_wait_n(), reason="needs bash >= 4.3")
+def test_run_bounded_parallel_stops_running_items_when_a_final_item_fails(tmp_path):
+    # Both items start at once, so the failure arrives in the drain phase.
+    status, events = _run_bounded_parallel(
+        tmp_path, 2, ["a", "b"], fail_item="b", ok_delay=3
+    )
+
+    assert status == "failed"
+    assert "end a" not in events
+
+
+@pytest.mark.cpu_only
+@pytest.mark.skipif(not _bash_supports_wait_n(), reason="needs bash >= 4.3")
+def test_run_bounded_parallel_reports_failure_and_stops_starting_items(tmp_path):
+    status, events = _run_bounded_parallel(tmp_path, 1, ["a", "b", "c"], fail_item="b")
+
+    assert status == "failed"
+    assert "start c" not in events
+
+
+@pytest.mark.cpu_only
+@pytest.mark.skipif(not _bash_supports_wait_n(), reason="needs bash >= 4.3")
+def test_run_bounded_parallel_does_not_start_items_after_a_finished_failure(tmp_path):
+    # The pool never fills, so nothing waits on the item that failed at once:
+    # only a check before each launch can notice it. The delay before each
+    # launch guarantees that item has exited by the next one.
+    status, events = _run_bounded_parallel(
+        tmp_path, 16, ["bad", "ok1", "ok2"], fail_item="bad", launch_delay=True
+    )
+
+    assert status == "failed"
+    assert events == ["start bad"]
+
+
+@pytest.mark.cpu_only
+def test_aot_script_overlaps_providers_in_private_package_copies():
+    text = (
+        Path(__file__).resolve().parents[3]
+        / "scripts"
+        / "task_test_jit_cache_package_build_import.sh"
+    ).read_text()
+    subprocess.run(
+        [
+            "bash",
+            "-n",
+            str(
+                Path(__file__).resolve().parents[3]
+                / "scripts"
+                / "task_test_jit_cache_package_build_import.sh"
+            ),
+        ],
+        check=True,
+    )
+    assert "run_bounded_parallel" in text
+    # Concurrent builds must not share the package dir `python -m build` writes to.
+    assert 'cp -a flashinfer-jit-cache-provider "${provider_dir}"' in text
+    # Reports are registered in the parent shell, not lost in the pool's subshells.
+    registration = text.split("PROVIDER_BUILD_STARTED_AT")[0]
+    assert "AOT_MEMORY_REPORT_FILES+=" in registration
+    # The loop that registers the reports must walk the providers that get built.
+    assert (
+        'for provider_architecture in "${PROVIDER_ARCHITECTURE_LIST[@]}"; do\n'
+        "    report_label="
+    ) in registration
+    assert "BUILD_ARCHITECTURE_LIST" not in text
+    assert "AOT_PROVIDER_CONCURRENCY > MAX_JOBS" in text

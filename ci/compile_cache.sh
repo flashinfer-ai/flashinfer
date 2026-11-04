@@ -5,9 +5,11 @@
 COMPILE_CACHE_VOLUMES=()
 COMPILE_CACHE_ENV=()
 COMPILE_CACHE_ENTRYPOINT=()
+COMPILE_CACHE_ENV_S3=()
 COMPILE_CACHE_IMAGE_DIR=""
 COMPILE_CACHE_PRIVATE_DIR=""
 COMPILE_CACHE_LOCKED=false
+COMPILE_CACHE_S3="${SCRIPT_DIR}/compile_cache_s3.sh"
 
 remove_cache_trees() {
     [ "$#" -gt 0 ] || return 0
@@ -68,7 +70,32 @@ prepare_compile_cache() {
     local image_key=${image_id#sha256:}
     local used_mb free_mb
     COMPILE_CACHE_IMAGE_DIR=${images}/${image_key}
-    if [[ ${mode} == read-write ]]; then
+    # The shared S3 layer (compile_cache_s3.sh), when the workflow selects a
+    # lane. Mirrors of other images go the way of stale seeds.
+    local s3_mirror=""
+    if [[ -n "${CI_COMPILE_CACHE_S3_URL:-}" && -n "${CI_COMPILE_CACHE_S3_LANE:-}" ]]; then
+        s3_mirror=${runner_dir}/s3/${image_key}/${CI_COMPILE_CACHE_S3_LANE//\//_}
+        local stale_mirrors=()
+        mapfile -d '' -t stale_mirrors < <(find "${runner_dir}/s3" -mindepth 1 -maxdepth 1 \
+            -type d ! -name "${image_key}" -mtime +7 -print0 2>/dev/null)
+        remove_cache_trees "${stale_mirrors[@]}" || true
+    fi
+    if [[ ${mode} == read-write && -n "${CI_COMPILE_CACHE_WRITER_DIR:-}" ]]; then
+        # An S3 writer bypasses the seed, which shares a host with pull request
+        # jobs: it compiles on top of the trusted tarball alone, in a fresh
+        # directory the workflow uploads after the job. Seeds stop growing
+        # once writers exist, so a frozen seed would only shadow newer modules
+        # and keep retired images on disk; the S3 mirror replaces them.
+        remove_cache_trees "${images}" || return 1
+        remove_cache_trees "${CI_COMPILE_CACHE_WRITER_DIR}" || return 1
+        mkdir -p "${CI_COMPILE_CACHE_WRITER_DIR}" || return 1
+        if [ -n "${s3_mirror}" ]; then
+            bash "${COMPILE_CACHE_S3}" restore "${CI_COMPILE_CACHE_S3_URL}" "${image_key}" \
+                "${CI_COMPILE_CACHE_S3_LANE}" "${CI_COMPILE_CACHE_WRITER_DIR}"
+        fi
+        COMPILE_CACHE_VOLUMES=(-v "${CI_COMPILE_CACHE_WRITER_DIR}:/compile-cache")
+        mode=s3-writer
+    elif [[ ${mode} == read-write ]]; then
         prune_compile_cache "${images}" || return 1
         local stale=()
         mapfile -d '' -t stale < <(find "${images}" -mindepth 1 -maxdepth 1 \
@@ -99,6 +126,15 @@ prepare_compile_cache() {
             fi
         fi
         COMPILE_CACHE_ENTRYPOINT=(bash /docker/compile_cache_entrypoint.sh /compile-cache-seed /compile-cache)
+        if [ -n "${s3_mirror}" ]; then
+            mkdir -p "${s3_mirror}" && touch "${runner_dir}/s3/${image_key}"
+            bash "${COMPILE_CACHE_S3}" fetch "${CI_COMPILE_CACHE_S3_URL}" "${image_key}" \
+                "${CI_COMPILE_CACHE_S3_LANE}" "${s3_mirror}"
+            if [ -d "${s3_mirror}/tree" ]; then
+                COMPILE_CACHE_VOLUMES+=(-v "${s3_mirror}/tree:/compile-cache-s3:ro")
+                COMPILE_CACHE_ENV_S3=(-e COMPILE_CACHE_S3_TREE=/compile-cache-s3)
+            fi
+        fi
     fi
     DOCKER_IMAGE_ID=${image_id}
     COMPILE_CACHE_ENV=(
@@ -106,6 +142,7 @@ prepare_compile_cache() {
         -e FLASHINFER_CUTE_DSL_STRICT_CACHE_KEY=1
         -e CUTE_DSL_CACHE_DIR=/tmp/cute-dsl-cache
         -e TRITON_CACHE_DIR=/compile-cache/triton
+        "${COMPILE_CACHE_ENV_S3[@]}"
     )
     echo "Compile cache: mode=${mode} runner=${runner_key} image=${image_id}"
 }
