@@ -289,6 +289,9 @@ Use `flashinfer.utils` functions to skip tests on unsupported GPU architectures:
 - `is_sm100f_supported()` - Blackwell feature-set (requires CUDA 12.9+)
 - `is_sm110a_supported()`, `is_sm120a_supported()`, `is_sm120f_supported()`, `is_sm121a_supported()`
 
+A call mode that replaces the backends and validates itself (e.g. `mm_bf16(..., batch_invariant=True)`) is
+exempted from backend selection with the decorator's `bypass=` predicate; see the add-cuda-kernel skill.
+
 **APIs decorated with `@backend_requirement`** also provide:
 - `api_name.is_compute_capability_supported(cc)` - e.g., `mm_fp4.is_compute_capability_supported(100)`
 - `api_name.is_backend_supported("backend")` - e.g., `mm_fp4.is_backend_supported("cudnn")`

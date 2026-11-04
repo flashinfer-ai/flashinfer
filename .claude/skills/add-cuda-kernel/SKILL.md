@@ -617,6 +617,23 @@ result = scale(x, 2.0)
 result = scale(x, 2.0, skip_check=True)
 ```
 
+#### `bypass` Predicate
+
+For a call mode that replaces the backends altogether and validates its own inputs, pass `bypass=`: a cheap
+predicate over the call's arguments. When it returns True the wrapper runs no requirement check, heuristic or
+capability lookup and calls the function directly (even under `backend="auto"`, where `skip_check` would still run
+the heuristic). `mm_bf16` uses it for `batch_invariant=True`:
+
+```python
+@backend_requirement(
+    {...},
+    common_check=_check_mm_bf16_problem_size,
+    heuristic_func=_heuristic_func_mm_bf16,
+    bypass=lambda *args, **kwargs: bool(kwargs.get("batch_invariant", False)),
+)
+def mm_bf16(a, b, ..., *, batch_invariant=False): ...
+```
+
 #### Check Function Requirements
 
 Check functions must:
