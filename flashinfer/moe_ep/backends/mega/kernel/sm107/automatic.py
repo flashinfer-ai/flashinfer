@@ -216,6 +216,7 @@ def ep_tuning_contract(backend, fleet_params):
         "gate_up_clamp": cfg.gate_up_clamp,
         "situ_beta": cfg.situ_beta,
         "situ_linear_beta": cfg.situ_linear_beta,
+        "per_token_activation": False,
     }
 
 

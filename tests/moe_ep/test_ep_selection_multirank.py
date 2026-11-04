@@ -418,7 +418,9 @@ def test_transport_constraints_are_checked_before_preparation(
 
 @pytest.mark.gpu_2
 @pytest.mark.arch_rubin
-@pytest.mark.parametrize("invalid", ["routing_dtype", "input_stride"])
+@pytest.mark.parametrize(
+    "invalid", ["routing_dtype", "input_stride", "zero_runtime_max"]
+)
 def test_rank_local_invalid_inputs_fail_before_dispatch(
     rubin_bootstrap,  # noqa: F811
     monkeypatch,
@@ -430,12 +432,20 @@ def test_rank_local_invalid_inputs_fail_before_dispatch(
     if bootstrap.rank == bootstrap.world_size - 1:
         if invalid == "routing_dtype":
             t = dataclasses.replace(t, topk_ids=t.topk_ids.float())
-        else:
+        elif invalid == "input_stride":
             hidden = torch.empty(
                 t.num_tokens, problem.HIDDEN * 2, device="cuda", dtype=torch.bfloat16
             )[:, ::2]
             hidden.copy_(t.hidden_states)
             t = dataclasses.replace(t, hidden_states=hidden)
+        else:
+            t = dataclasses.replace(
+                t,
+                hidden_states=t.hidden_states[:0],
+                topk_ids=t.topk_ids[:0],
+                topk_weights=t.topk_weights[:0],
+                runtime_max_tokens_per_rank=0,
+            )
     layer = moe_ep.MoEEpLayer(bootstrap, fleet, weights, backend=config)
     try:
         with (
@@ -445,4 +455,56 @@ def test_rank_local_invalid_inputs_fail_before_dispatch(
             layer.warmup(t)
         assert not layer._workspaces
     finally:
+        layer.destroy()
+
+
+@pytest.mark.gpu_2
+@pytest.mark.arch_rubin
+@pytest.mark.parametrize("stage", ["graph_state", "quantize", "compute"])
+def test_rank_local_split_preparation_failure(
+    rubin_bootstrap,  # noqa: F811
+    monkeypatch,
+    stage,
+):
+    from flashinfer.moe_ep.backends.split.kernel.fused_moe.backend import (
+        FusedMoeSplitKernelBackend,
+    )
+    from flashinfer.moe_ep.modes.split_layer import MoEEpSplitLayer
+
+    bootstrap = rubin_bootstrap
+    monkeypatch.setattr(problem, "INTERMEDIATE", 384)
+    fleet, weights, config, t, _ = inputs_and_config(bootstrap, forced=1)
+    targets = {
+        "graph_state": [(MoEEpSplitLayer, "create_graph_state")],
+        "quantize": [
+            (FusedMoeSplitKernelBackend, "pack_dispatch_payload"),
+            (FusedMoeSplitKernelBackend, "quantize_for_dispatch"),
+        ],
+        "compute": [(FusedMoeSplitKernelBackend, "compute")],
+    }[stage]
+
+    def inject_failure(owner, name):
+        original = getattr(owner, name)
+
+        def fail_one_rank(*args, **kwargs):
+            if stage == "graph_state":
+                result = original(*args, **kwargs)
+            if bootstrap.rank == bootstrap.world_size - 1:
+                raise RuntimeError(f"injected {stage} failure")
+            return result if stage == "graph_state" else original(*args, **kwargs)
+
+        monkeypatch.setattr(owner, name, fail_one_rank)
+
+    for owner, name in targets:
+        inject_failure(owner, name)
+    layer = moe_ep.MoEEpLayer(bootstrap, fleet, weights, backend=config)
+    try:
+        with (
+            autotune_v2(persistent_cache=False),
+            pytest.raises(RuntimeError, match=f"injected {stage} failure"),
+        ):
+            layer.warmup(t)
+        assert not layer._workspaces
+    finally:
+        torch.cuda.synchronize()
         layer.destroy()

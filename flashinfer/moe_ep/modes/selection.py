@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
+from contextlib import contextmanager
 
 import torch
 
@@ -86,6 +87,7 @@ def numerical_contract(config, prototype, fleet):
         "gate_up_clamp": clamp,
         "situ_beta": beta,
         "situ_linear_beta": linear,
+        "per_token_activation": bool(cfg.quant.per_token_scale),
     }
 
 
@@ -151,6 +153,13 @@ class MegaPlan:
         cfg = layer._kernel.ep_selected_config(layer._ensure_workspace())
         return {"kernel_variant": cfg.kernel_variant, "knobs": plain(cfg.knobs)}
 
+    def warmup(self, tensors):
+        layer = self.layer
+        Collective(layer._bootstrap).prepare(lambda: layer.stage_inputs(tensors))
+        return layer.compute_staged(
+            output=tensors.output if tensors.output is not None else self.output
+        )
+
     def destroy(self):
         self.layer.destroy()
 
@@ -171,8 +180,18 @@ class SplitPlan:
         self.choices = None
 
     def discover(self, tensors):
-        bound = dataclasses.replace(tensors, topk_weights=tensors.topk_weights.clone())
-        self.state = self.layer.create_graph_state(bound, out=self.output)
+        c = Collective(self.layer._bootstrap)
+        bound = c.prepare(
+            lambda: dataclasses.replace(
+                tensors, topk_weights=tensors.topk_weights.clone()
+            )
+        )
+        self.state = c.prepare(
+            lambda: self.layer.create_graph_state(bound, out=self.output),
+            optional=True,
+        )
+        if self.state is None:
+            raise NoEligibleCandidate("The split transport cannot prepare this profile")
 
         # Complete the transport round trip even though setup only needs its
         # received tensors. Some transports reset their state during combine.
@@ -185,8 +204,38 @@ class SplitPlan:
                 dtype=torch.bfloat16,
             )
 
-        self.layer._forward_prepared(tensors, self.state, compute=receive)
+        self._warmup(tensors, compute=receive)
         return self.context
+
+    @contextmanager
+    def _prepare_stage(self, stage):
+        if stage not in ("quantize", "compute"):
+            yield
+            return
+        failure = None
+        try:
+            yield
+        except Exception as exc:
+            failure = exc
+
+        def check():
+            if failure is not None:
+                raise failure
+
+        Collective(self.layer._bootstrap).prepare(check)
+
+    def _warmup(self, tensors, *, compute=None):
+        # Coordinate local packing and compute before dispatch and combine.
+        # Transport launch failures remain fatal; their peers may be blocked.
+        previous = self.layer.stage_hook
+        self.layer.stage_hook = self._prepare_stage
+        try:
+            return self.layer._forward_prepared(tensors, self.state, compute=compute)
+        finally:
+            self.layer.stage_hook = previous
+
+    def warmup(self, tensors):
+        return self._warmup(tensors)
 
     def enumerate(self):
         self.choices = self.layer._kernel.tuning_candidates(self.context)
@@ -313,6 +362,7 @@ class SplitProtocol:
                         lambda: plan.forward(self.tensors),
                         self.tensors.hidden_states.device,
                         self.settings,
+                        warmup=lambda: plan.warmup(self.tensors),
                     )
                 except CaptureUnsupported:
                     continue

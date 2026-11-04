@@ -8,6 +8,7 @@ import copy
 import dataclasses
 import os
 import weakref
+from contextlib import ExitStack
 from typing import Sequence
 
 import torch
@@ -142,12 +143,15 @@ class MoEEpAutoWorkspace:
         """Release all plan storage after its graphs have been retired."""
         if self._destroyed:
             return
-        for plan in [self._plan, *self._retained]:
-            if plan is not None:
-                plan.destroy()
-        self._plan = None
-        self._retained.clear()
-        self._destroyed = True
+        try:
+            with ExitStack() as cleanup:
+                for plan in reversed([self._plan, *self._retained]):
+                    if plan is not None:
+                        cleanup.callback(plan.destroy)
+        finally:
+            self._plan = None
+            self._retained.clear()
+            self._destroyed = True
 
 
 class MoEEpAutoLayer(nn.Module):
@@ -372,10 +376,12 @@ class MoEEpAutoLayer(nn.Module):
         if _aliases_input(t):
             raise ValueError("EP tuning output must not alias an input")
         if t.runtime_max_tokens_per_rank is not None and not (
-            t.num_tokens <= t.runtime_max_tokens_per_rank <= fleet.max_tokens_per_rank
+            max(t.num_tokens, 1)
+            <= t.runtime_max_tokens_per_rank
+            <= fleet.max_tokens_per_rank
         ):
             raise ValueError(
-                "runtime_max_tokens_per_rank must cover this batch within capacity"
+                "runtime_max_tokens_per_rank must be positive and cover this batch within capacity"
             )
 
     def create_workspace(
@@ -495,18 +501,24 @@ class MoEEpAutoLayer(nn.Module):
         """Release this layer after retiring every graph that references it."""
         if self._destroyed:
             return
-        for workspace in self._workspaces:
-            workspace.destroy()
-        for plan in self._failed_plans:
-            plan.destroy()
-        self._failed_plans.clear()
-        for prototype in self._prototypes.values():
-            prototype.destroy()
-        self._prototypes.clear()
-        if self._runtime is not None:
-            finalize_moe_ep_runtime(self._runtime)
+        try:
+            with ExitStack() as cleanup:
+                if self._runtime is not None:
+                    cleanup.callback(finalize_moe_ep_runtime, self._runtime)
+                for item in reversed(
+                    [
+                        *self._workspaces,
+                        *self._failed_plans,
+                        *self._prototypes.values(),
+                    ]
+                ):
+                    cleanup.callback(item.destroy)
+        finally:
+            self._workspaces.clear()
+            self._failed_plans.clear()
+            self._prototypes.clear()
             self._runtime = None
-        self._destroyed = True
+            self._destroyed = True
 
 
 class _OuterProtocol:
@@ -581,7 +593,10 @@ class _OuterProtocol:
                         plan.destroy()
                         return None
                     self.c.prepare(lambda: plan.prepare(selected))
-                    plan.forward(t)
+                    plan.warmup(t)
+            except NoEligibleCandidate:
+                plan.destroy()
+                return None
             except Exception:
                 self.layer._failed_plans.append(plan)
                 raise
@@ -711,6 +726,7 @@ class _OuterProtocol:
                                 lambda: trial.forward(self.tensors),
                                 self.tensors.hidden_states.device,
                                 settings,
+                                warmup=lambda: trial.warmup(self.tensors),
                             )
                         except CaptureUnsupported:
                             continue
