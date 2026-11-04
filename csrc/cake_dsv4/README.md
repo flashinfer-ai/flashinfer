@@ -3,8 +3,10 @@
 Generated device kernels and TVM-FFI launchers for SM100 / SM103 behind
 `trtllm_batch_decode_sparse_mla_dsv4(..., backend="cake")` for BF16 and FP8 E4M3
 inputs with head dimension 512 (BF16 output); `kv_cache_format="nvfp4"` selects
-the NVFP4 route (`run_cake_dsv4_nvfp4`: the decode family below 128 metadata
-rows, the prefill bodies from 128 rows on; see the host module docstring).
+the NVFP4 route (`run_cake_dsv4_nvfp4`: a BF16 query runs the decode family,
+below 128 metadata rows; a query packed to the NVFP4 row format, uint8
+`[..., heads, 384]` from `flashinfer.mla.cake_dsv4_nvfp4_pack_query`, runs the
+prefill bodies; see the host module docstring).
 Select the backend explicitly; `backend="auto"` keeps the architecture-based
 selection. `enable_pdl` launches the FP8 persistent and M64 programs as
 programmatic dependents (they wait for the previous grid before their first

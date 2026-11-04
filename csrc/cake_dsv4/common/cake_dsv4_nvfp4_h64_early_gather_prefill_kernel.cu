@@ -3076,4 +3076,3 @@ kernel_cake_dsv4_nvfp4_h64_early_gather_prefill(const __grid_constant__ CUtensor
 }
 
 } // extern "C"
-
