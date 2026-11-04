@@ -1412,7 +1412,10 @@ def test_k1_212_sm_even_block_ranges(monkeypatch):
     211, 213, 216 and 217 SMs plan every row and token count as without the table."""
     table = cake_backend.K1_SPLIT_EVEN_BLOCK_RANGES_BY_SM
     assert set(table) == {("sm_107a", 212)} | set(K1_152_EVEN_BLOCK_RANGES)
-    rows = table[("sm_107a", 212)]
+    # 4096 -> 128: test_k1_212_sm_4096_to_128_even_block_range
+    narrow = ("sm_107a", 1, 4096, 128, "f32")
+    rows = {k: v for k, v in table[("sm_107a", 212)].items() if k != narrow}
+    assert set(table[("sm_107a", 212)]) == set(rows) | {narrow}
     assert {(k[2], k[3], k[4]) for k in rows} == set(K1_212_EVEN_BLOCK_RANGES)
     by_sm = cake_backend.K1_SPLIT_RULES_BY_SM[("sm_107a", 212)]
     token_ranges = cake_backend.K1_SPLIT_RULES_BY_SM_TOKEN_RANGES[("sm_107a", 212)]
@@ -1610,6 +1613,77 @@ def test_k1_152_sm_even_block_ranges(monkeypatch):
             routed += 1
         else:
             assert plan is None, (arch, sms, T, f32)
+    assert routed
+
+
+
+#: The range of :data:`K1_SPLIT_EVEN_BLOCK_RANGES_BY_SM` of the FP32 row ``4096 -> 128`` on 212-SM sm_107a parts (no
+#: verdict in :data:`K1_SPLIT_RULES` or in the part's table of :data:`K1_SPLIT_RULES_BY_SM`): two splits of 64-wide
+#: tiles at a token count that spans an even number of 64-token K blocks.
+K1_212_4096_128_RANGE = ((1024, 7680, (64, 2)),)
+#: The measured token counts of that row on 212 SMs.
+K1_212_N128_TOKENS = (512, 768, 896, 1024, 2048, 4096, 6144, 6656, 7168, 7680)
+
+
+def test_k1_212_sm_4096_to_128_even_block_range(monkeypatch):
+    """On 212-SM sm_107a parts (below the SM-count floor) the FP32 row ``4096 -> 128``, which has no verdict in
+    :data:`K1_SPLIT_RULES` or in the part's table of :data:`K1_SPLIT_RULES_BY_SM`, runs two splits of 64-wide tiles at a
+    token count from 1024 to 7680 that spans an even number of 64-token K blocks.  An odd number (1025, 1088, 3000,
+    4160, 5000, 7615), a token count outside the range (512, 896, 1023, 7745, 8192, 16384), BF16, and every other SM
+    count (208, 210, 211, 213, 216, 217) run the deterministic program as without the table."""
+    key = ("sm_107a", 1, 4096, 128, "f32")
+    part = ("sm_107a", 212)
+    even = cake_backend.K1_SPLIT_EVEN_BLOCK_RANGES_BY_SM[part]
+    assert even[key] == K1_212_4096_128_RANGE
+    assert cake_backend.K1_SPLIT_RULES[key] is None
+    assert key not in cake_backend.K1_SPLIT_RULES_BY_SM[part]
+    assert key not in cake_backend.K1_SPLIT_RULES_BY_SM_TOKEN_RANGES.get(part, {})
+    assert key not in cake_backend.K1_SPLIT_RANGE_OVERRIDES_BY_SM.get(part, {})
+    first, last = cake_backend.K1_SPLIT_RULES_BY_SM_TOKENS
+    for lo, hi, choice in K1_212_4096_128_RANGE:
+        assert lo in K1_212_N128_TOKENS, key
+        assert hi in K1_212_N128_TOKENS, key
+        assert _k1_blocks(lo) % 2 == 0 and _k1_blocks(hi) % 2 == 0, key
+        assert hi < first or lo > last, key
+        assert tuple(choice) == (64, 2), key
+
+    def p(T, sm_count=212, out_f32=True):
+        return cake_backend.k1_plan(
+            arch="sm_107a", L=1, M=4096, N=128, K=T, out_f32=out_f32, sm_count=sm_count
+        )
+
+    for T in (1024, 1100, 2048, 3072, 4096, 6144, 6656, 7168, 7680):
+        assert p(T) == (64, 2), T
+    for T in (512, 896, 1023, 1025, 1088, 3000, 4160, 5000, 7615, 7745, 8192, 16384):
+        assert p(T) is None, T
+    for T in (1024, 4096, 7680):
+        assert p(T, out_f32=False) is None, T
+
+    sms_list = (208, 210, 211, 212, 213, 216, 217)
+    near = (-64, -1, 0, 1, 64)
+    Ts = {T + d for T in K1_212_N128_TOKENS for d in near}
+    Ts |= {8000, 8192, 12288, 16172, 16231, 16384, 65536}
+
+    def plans():
+        return {
+            (sms, T, f32): p(T, sm_count=sms, out_f32=f32)
+            for sms in sms_list
+            for T in Ts
+            for f32 in (False, True)
+        }
+
+    with_table = plans()
+    monkeypatch.setattr(cake_backend, "K1_SPLIT_EVEN_BLOCK_RANGES_BY_SM", {})
+    without = plans()
+    routed = 0
+    for (sms, T, f32), plan in with_table.items():
+        assert without[(sms, T, f32)] is None, (sms, T, f32)
+        held = [tuple(v) for lo, hi, v in K1_212_4096_128_RANGE if lo <= T <= hi]
+        if sms == 212 and f32 and held and _k1_blocks(T) % 2 == 0:
+            assert plan == held[0], T
+            routed += 1
+        else:
+            assert plan is None, (sms, T, f32)
     assert routed
 
 
