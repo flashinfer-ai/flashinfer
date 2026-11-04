@@ -47,59 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 256
-#define TMEM_ACC_DH_OFFSET 0
-#define TMEM_ACC_DV_OFFSET 128
-#define TMEM_ACC_P_OFFSET 128
-#define NUM_KG_PIPE_STAGES 1
-#define NUM_QD_PIPE_STAGES 1
-#define NUM_W_PIPE_STAGES 1
-#define NUM_ONE_STAGES 1
-#define SMEM_KG_PANEL_OFF 1024
-#define SMEM_KG_PANEL_STAGE_BYTES 8192
-#define SMEM_KG_PANEL_STRIDE 8192
-#define SMEM_QG_PANEL_OFF 17408
-#define SMEM_QG_PANEL_STAGE_BYTES 8192
-#define SMEM_QG_PANEL_STRIDE 8192
-#define SMEM_W_PANEL_OFF 33792
-#define SMEM_W_PANEL_STAGE_BYTES 8192
-#define SMEM_W_PANEL_STRIDE 8192
-#define SMEM_DO_PANEL_OFF 50176
-#define SMEM_DO_PANEL_STAGE_BYTES 8192
-#define SMEM_DO_PANEL_STRIDE 8192
-#define SMEM_KG_OP_OFF 1024
-#define SMEM_KG_OP_STAGE_BYTES 16384
-#define SMEM_KG_OP_STRIDE 16384
-#define SMEM_QG_MN_OFF 17408
-#define SMEM_QG_MN_STAGE_BYTES 16384
-#define SMEM_QG_MN_STRIDE 16384
-#define SMEM_W_MN_OFF 33792
-#define SMEM_W_MN_STAGE_BYTES 16384
-#define SMEM_W_MN_STRIDE 16384
-#define SMEM_DO_MN_OFF 50176
-#define SMEM_DO_MN_STAGE_BYTES 16384
-#define SMEM_DO_MN_STRIDE 16384
-#define SMEM_DHS_OFF 66560
-#define SMEM_DHS_STAGE_BYTES 32768
-#define SMEM_DHS_STRIDE 32768
-#define SMEM_DHS_MN_OFF 66560
-#define SMEM_DHS_MN_STAGE_BYTES 32768
-#define SMEM_DHS_MN_STRIDE 32768
-#define SMEM_BDV_OFF 99328
-#define SMEM_BDV_STAGE_BYTES 16384
-#define SMEM_BDV_STRIDE 16384
-#define SMEM_BDV_MN_OFF 99328
-#define SMEM_BDV_MN_STAGE_BYTES 16384
-#define SMEM_BDV_MN_STRIDE 16384
-#define SMEM_AQK_DST_OFF 99328
-#define SMEM_AQK_DST_STAGE_BYTES 8192
-#define SMEM_AQK_DST_STRIDE 8192
-#define SMEM_AQK_MN_OFF 99328
-#define SMEM_AQK_MN_STAGE_BYTES 8192
-#define SMEM_AQK_MN_STRIDE 8192
-#define SMEM_TOTAL 115712
-#define THREADS 192
 #define LAUNCH_MIN_BLOCKS 2
 
 #include <math_constants.h>
@@ -259,7 +206,7 @@ kernel_cake_kda_train_909a0aa57efb3f353972(const __grid_constant__ CUtensorMap k
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     __nv_bfloat16* kg_panel = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
     const int kg_panel_addr = smem + 1024;
     __nv_bfloat16* qg_panel = reinterpret_cast<__nv_bfloat16*>(smem_raw + 17408);
@@ -289,8 +236,7 @@ kernel_cake_kda_train_909a0aa57efb3f353972(const __grid_constant__ CUtensorMap k
     __nv_bfloat16* aqk_mn = reinterpret_cast<__nv_bfloat16*>(smem_raw + 99328);
     const int aqk_mn_addr = smem + 99328;
 
-    // Mbarrier init (14 pipeline groups, 0 ordered-sequence groups, 14 barriers)
-    // Mbarriers at smem_raw[0..112)
+    // Mbarrier init (14 barriers at smem_raw[0..112))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -345,12 +291,10 @@ kernel_cake_kda_train_909a0aa57efb3f353972(const __grid_constant__ CUtensorMap k
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
-
-    // Kernel post-init ops
-    const int tmem_acc_dh = taddr;
-    const int tmem_acc_dv = taddr + 128;
-    const int tmem_acc_p = taddr + 128;
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_acc_dh = taddr;
+    const unsigned int tmem_acc_dv = taddr + 128;
+    const unsigned int tmem_acc_p = taddr + 128;
 
     // ---- Role: compute ----
     if (warp <= 3) {

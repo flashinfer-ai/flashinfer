@@ -47,31 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define SMEM_WARP_TOT_OFF 0
-#define SMEM_WARP_TOT_STAGE_BYTES 32
-#define SMEM_WARP_TOT_STRIDE 32
-#define SMEM_BLK_OFF 32
-#define SMEM_BLK_STAGE_BYTES 4
-#define SMEM_BLK_STRIDE 4
-#define SMEM_STARTS_OFF 64
-#define SMEM_STARTS_STAGE_BYTES 1040
-#define SMEM_STARTS_STRIDE 1040
-#define SMEM_ORDER_T_OFF 1104
-#define SMEM_ORDER_T_STAGE_BYTES 1040
-#define SMEM_ORDER_T_STRIDE 1040
-#define SMEM_NSEG_T_OFF 2144
-#define SMEM_NSEG_T_STAGE_BYTES 1040
-#define SMEM_NSEG_T_STRIDE 1040
-#define SMEM_REM_T_OFF 3184
-#define SMEM_REM_T_STAGE_BYTES 1040
-#define SMEM_REM_T_STRIDE 1040
-#define SMEM_CS_T_OFF 4224
-#define SMEM_CS_T_STAGE_BYTES 1040
-#define SMEM_CS_T_STRIDE 1040
-#define SMEM_TOTAL 5376
-#define THREADS 256
-
 #include <math_constants.h>
 
 extern "C" {
@@ -97,7 +72,7 @@ kernel_cake_kda_det_train_19a25d3d4ec3afd6354e(int* __restrict__ cu_seqlens, int
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     int* warp_tot = reinterpret_cast<int*>(smem_raw + 0);
     const int warp_tot_addr = smem + 0;
     int* blk = reinterpret_cast<int*>(smem_raw + 32);

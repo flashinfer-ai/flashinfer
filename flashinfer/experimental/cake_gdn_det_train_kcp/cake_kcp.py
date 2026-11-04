@@ -460,25 +460,92 @@ DHU_PROGRAMS = ("kcp_dhu_offset", "kcp_dhu_tape")
 VH64_SUFFIX = "_vh64"
 
 
+# The architectures whose #7 tape walk takes the vh = 64 form at every load (measured faster per launch key there);
+# elsewhere (sm_107a) the tape walk keeps the two-wave rule of :func:`dhu_vh`.
+DHU_TAPE_VH64_ARCHES = ("sm_100a", "sm_103a")
+
+# The architectures where a long-chain #7 walk (:func:`walk_dhu_long_chain`: a segment of at least
+# ``DHU_LONG_CHAIN_MIN_CHUNKS`` chunks, and a two-CTA grid that ends later than the one-CTA grid) keeps the two-wave
+# rule of :func:`dhu_vh` for both forms (measured slower in the vh = 64 form there).
+DHU_LONG_CHAIN_ARCHES = ("sm_100a",)
+DHU_LONG_CHAIN_MIN_CHUNKS = 400
+
+
+def walk_vh64_fits(
+    chains: Sequence[tuple[int, int]], num_heads: int, sm_count: int
+) -> bool:
+    """Whether the two-CTA grid of a walk launch finishes within its longest chain: the LPT makespan
+    (:func:`cake_kcp_plan.lpt_makespan`) of ``2 * num_heads`` CTAs per segment over ``2 * sm_count`` slots (two
+    CTAs per SM) is at most the longest segment's chunk count.  ``chains`` = the launch's ``(chunks, count)``
+    multiset; plan integers only."""
+    chains = [(int(c), int(n)) for c, n in chains if int(c) > 0 and int(n) > 0]
+    if not chains or int(sm_count) <= 0:
+        return False
+    two = 2 * int(num_heads)
+    makespan = cake_kcp_plan.lpt_makespan(
+        [(c, two * n) for c, n in chains], 2 * int(sm_count)
+    )
+    return makespan <= max(c for c, _ in chains)
+
+
+def walk_dhu_long_chain(
+    chains: Sequence[tuple[int, int]], num_heads: int, sm_count: int
+) -> bool:
+    """Whether a #7 walk launch is a long-chain walk of :func:`dhu_vh`: its longest segment has at least
+    :data:`DHU_LONG_CHAIN_MIN_CHUNKS` chunks and the LPT makespan (:func:`cake_kcp_plan.lpt_makespan`) of its
+    two-CTA grid (``2 * num_heads`` CTAs per segment) over ``2 * sm_count`` slots is larger than the LPT makespan
+    of its one-CTA grid (``num_heads`` CTAs per segment) over the same slots.  ``chains`` = the launch's
+    ``(chunks, count)`` multiset; plan integers only."""
+    chains = [(int(c), int(n)) for c, n in chains if int(c) > 0 and int(n) > 0]
+    if not chains or int(sm_count) <= 0:
+        return False
+    if max(c for c, _ in chains) < DHU_LONG_CHAIN_MIN_CHUNKS:
+        return False
+    heads, slots = int(num_heads), 2 * int(sm_count)
+    two = cake_kcp_plan.lpt_makespan([(c, 2 * heads * n) for c, n in chains], slots)
+    one = cake_kcp_plan.lpt_makespan([(c, heads * n) for c, n in chains], slots)
+    return two > one
+
+
 def fwdh_vh(
-    n_walk: int, num_heads: int, sm_count: int, forced: int | None = None
+    n_walk: int,
+    num_heads: int,
+    sm_count: int,
+    forced: int | None = None,
+    fits: bool = False,
 ) -> int:
-    """The #2 form of one launch: ``64`` when ``n_walk * HV <= sm_count`` (the KCP one-wave regime), else ``128``;
-    ``forced`` (test knob ``fwdh_vh``) overrides the rule."""
+    """The #2 form of one launch: ``64`` when ``n_walk * HV <= sm_count`` (the KCP one-wave regime) or when ``fits``
+    (:func:`walk_vh64_fits` of the launch's chains: the two-CTA grid finishes within its longest chain), else
+    ``128``; ``forced`` (test knob ``fwdh_vh``) overrides the rule."""
     if forced is not None:
         return int(forced)
-    return 64 if int(n_walk) * int(num_heads) <= int(sm_count) else 128
+    return 64 if int(n_walk) * int(num_heads) <= int(sm_count) or fits else 128
 
 
 def dhu_vh(
-    n_walk: int, num_heads: int, sm_count: int, forced: int | None = None
+    n_walk: int,
+    num_heads: int,
+    sm_count: int,
+    forced: int | None = None,
+    *,
+    tape: bool = True,
+    arch: str | None = None,
+    long_chain: bool = False,
 ) -> int:
-    """The #7 form of one launch: ``64`` when the two-CTA grid ``n_walk * HV * 2`` fits two waves at two CTAs per
-    SM (``<= 4 * sm_count``; the half-width form measured never slower up to there), else ``128``; ``forced`` (test
-    knob ``dhu_vh``) overrides the rule."""
+    """The #7 form of one launch: ``64`` for the offset walk (``tape=False``) and for the tape walk on the
+    architectures of :data:`DHU_TAPE_VH64_ARCHES` (``arch`` ``None``, the fake backend, counts as one of them);
+    elsewhere the tape walk runs vh = 64 when its two-CTA grid ``n_walk * HV * 2`` fits two waves at two CTAs per
+    SM (``<= 4 * sm_count``), else ``128``.  On the architectures of :data:`DHU_LONG_CHAIN_ARCHES`, a long-chain
+    walk (``long_chain``: :func:`walk_dhu_long_chain` of the launch's chains) of either form takes that two-wave
+    rule too.  ``forced`` (test knob ``dhu_vh``) overrides the rule."""
     if forced is not None:
         return int(forced)
-    return 64 if int(n_walk) * int(num_heads) * 2 <= 4 * int(sm_count) else 128
+    two_wave = 64 if int(n_walk) * int(num_heads) * 2 <= 4 * int(sm_count) else 128
+    if long_chain and arch in DHU_LONG_CHAIN_ARCHES:
+        return two_wave
+    if not tape or arch is None or arch in DHU_TAPE_VH64_ARCHES:
+        return 64
+    return two_wave
 
 
 # The tape set (padded rows R = 64 * NC_pad; the frozen tape set of the design).
@@ -1305,6 +1372,7 @@ def resolve_launch(
             grid_args.get("num_heads", 0),
             args.get("_sm_count", 0),
             args.get("_fwdh_vh"),
+            bool(args.get("_vh64_fits")),
         )
     elif name in DHU_PROGRAMS:
         vh = dhu_vh(
@@ -1312,6 +1380,9 @@ def resolve_launch(
             grid_args.get("num_heads", 0),
             args.get("_sm_count", 0),
             args.get("_dhu_vh"),
+            tape=name == "kcp_dhu_tape",
+            arch=args.get("_arch"),
+            long_chain=bool(args.get("_dhu_long_chain")),
         )
     call = args.get("_call")
     jit = _registry()
@@ -1450,6 +1521,9 @@ class KernelBackend(Backend):
                 **args,
                 "_grid_args": {**grid_args, "arch": be.device_arch(device_index)},
             }
+        elif name in DHU_PROGRAMS:
+            # the #7 width rule reads the architecture (dhu_vh)
+            args = {**args, "_arch": be.device_arch(device_index)}
         record, values, grid, is_test = resolve_launch(
             name, args, cols_per_cta=self.cols_per_cta
         )
@@ -1675,6 +1749,9 @@ def _prefix(values) -> list[int]:
 # Tables of one (ctx, HV) problem, derived from the plan module's head plan (``ctx.heads(HV)``)
 
 
+MEMO_MAX = 4096  # entries of a plan's walk-form memo (_Tables.memo) before it is cleared and rebuilt on use
+
+
 class _Tables:
     """Everything the launch sequences read for one ``(ctx, HV)``: the segment plan, walk lists, the compact tile
     tables of every pool, the collective splits and the merge chains, derived once from ``cake_kcp_plan.ContextDetKcp``
@@ -1700,6 +1777,8 @@ class _Tables:
         self, ctx: Any, HV: int, *, fused_walks: int = 1, P: int | None = None
     ) -> None:
         self.ctx = ctx
+        # host decisions of this plan derived at their first use (the walk lists' vh = 64 chain clause, walk_fits)
+        self.memo: dict[tuple, Any] = {}
         self.H = H = int(HV)  # every pool, split and chain is per VALUE head
         self.fused_walks = int(
             fused_walks
@@ -2269,6 +2348,43 @@ class _Tables:
         if t is None or t.device != device:
             t = self.dev("seg_chunk_start", self.hp.seg_chunk_start, device)
         return t
+
+    def _memo_put(self, key: tuple, value: Any) -> Any:
+        # bound for callers that pass fresh tables per call; the plan's own are few
+        if len(self.memo) >= MEMO_MAX:
+            self.memo.clear()
+        self.memo[key] = value
+        return value
+
+    def walk_fits(self, walk: Sequence[int], sm_count: int) -> bool:
+        """:func:`walk_vh64_fits` of the walk list ``walk`` (its segments' chunk counts; keyed by its content like
+        :meth:`walk_table`)."""
+        key = ("fits", tuple(walk), int(sm_count))
+        hit = self.memo.get(key)
+        if hit is None:
+            hit = self._memo_put(
+                key, walk_vh64_fits(self._walk_chains(walk), self.H, sm_count)
+            )
+        return hit
+
+    def walk_long_chain(self, walk: Sequence[int], sm_count: int) -> bool:
+        """:func:`walk_dhu_long_chain` of the walk list ``walk`` (keyed by its content like :meth:`walk_fits`)."""
+        key = ("long_chain", tuple(walk), int(sm_count))
+        hit = self.memo.get(key)
+        if hit is None:
+            hit = self._memo_put(
+                key, walk_dhu_long_chain(self._walk_chains(walk), self.H, sm_count)
+            )
+        return hit
+
+    def _walk_chains(self, walk: Sequence[int]) -> list[tuple[int, int]]:
+        """The ``(chunks, count)`` multiset of the walk list's segments (host plan tuple ``seg_chunk_start``)."""
+        seg = self.hp.seg_chunk_start
+        chains: dict[int, int] = {}
+        for s in walk:
+            c = int(seg[int(s) + 1]) - int(seg[int(s)])
+            chains[c] = chains.get(c, 0) + 1
+        return list(chains.items())
 
     def device_tiles(self, tiles, device: torch.device) -> torch.Tensor:
         """The flat int64 device copy of a tile table ``[slot][h]``."""
@@ -3028,13 +3144,23 @@ class CallDetKcp:
             )
         else:
             raise ValueError(f"{name} is not a walk program")
+        n_walk = len(walk)
+        sm_count = int(getattr(self.ctx, "sm_count", 0) or 0)
+        fits = (
+            name in FWDH_PROGRAMS
+            and n_walk * self.HV > sm_count
+            and self.tb.walk_fits(walk, sm_count)
+        )  # the chain clause of fwdh_vh (only where the one-wave clause does not already pick vh = 64)
+        long_chain = name in DHU_PROGRAMS and self.tb.walk_long_chain(walk, sm_count)
         self.kernel(
             name,
-            len(walk) * self.HV,
-            _grid_args={"n_walk": len(walk), "num_heads": self.HV},
-            _sm_count=int(getattr(self.ctx, "sm_count", 0) or 0),
+            n_walk * self.HV,
+            _grid_args={"n_walk": n_walk, "num_heads": self.HV},
+            _sm_count=sm_count,
             _fwdh_vh=self.opts.knob("fwdh_vh"),
             _dhu_vh=self.opts.knob("dhu_vh"),
+            _vh64_fits=fits,
+            _dhu_long_chain=long_chain,
             **args,
         )
 

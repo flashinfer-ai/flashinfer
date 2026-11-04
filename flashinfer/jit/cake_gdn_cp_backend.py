@@ -736,6 +736,28 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
     },
+    "cake_gdn_cp_af618767e71e6ea8ff40": {
+        "sources": [
+            "gdn/gdn_cp/cake_gdn_cp_af618767e71e6ea8ff40_kernel.cu",
+            "gdn/gdn_cp/cake_gdn_cp_af618767e71e6ea8ff40_binding.cu",
+        ],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["tma_buffer", "K"],
+            ["buffer", "beta"],
+            ["buffer", "t"],
+            ["buffer", "cu_seqlens"],
+            ["buffer", "cu_seqlens_i64"],
+            ["parameter", "num_k_heads"],
+            ["parameter", "num_sab_heads"],
+            ["parameter", "total_t_blocks"],
+            ["parameter", "num_seqs"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "arches": ["sm_107a"],
+    },
     "cake_gdn_cp_b89a7ff12a25db400df8": {
         "sources": [
             "gdn/gdn_cp/cake_gdn_cp_b89a7ff12a25db400df8_kernel.cu",
@@ -1119,6 +1141,7 @@ KERNELS: dict[str, Any] = {
         "t_precompute": "cake_gdn_cp_ce1c179ef0e27da84479",
         "t_precompute_bf16": "cake_gdn_cp_306612b8c71d26cd1d83",
         "t_precompute_bf16_cu32": "cake_gdn_cp_d81377210e8e2b8b1f0b",
+        "t_precompute_cu32": "cake_gdn_cp_af618767e71e6ea8ff40",
     },
 }
 

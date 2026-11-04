@@ -43,159 +43,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 572
-#define TMEM_TMEM_SFA_OFFSET 512
-#define TMEM_TMEM_SFB_OFFSET 524
-#define TMEM_TMEM_SFB_HI_OFFSET 548
-#define TMEM_ACCUMULATOR_OFFSET 0
-#define NUM_SCHEDULE_PIPE_STAGES 1
-#define NUM_DRAIN_PIPE_0_STAGES 1
-#define NUM_DRAIN_PIPE_1_STAGES 1
-#define NUM_DRAIN_PIPE_2_STAGES 1
-#define NUM_DRAIN_PIPE_3_STAGES 1
-#define NUM_DRAIN_PIPE_4_STAGES 1
-#define NUM_DRAIN_PIPE_5_STAGES 1
-#define NUM_DRAIN_PIPE_6_STAGES 1
-#define NUM_DRAIN_PIPE_7_STAGES 1
-#define SMEM_A_SMEM_OFF 1024
-#define SMEM_A_SMEM_STAGE_BYTES 16384
-#define SMEM_A_SMEM_STRIDE 16384
-#define SMEM_B_SMEM_OFF 66560
-#define SMEM_B_SMEM_STAGE_BYTES 16384
-#define SMEM_B_SMEM_STRIDE 16384
-#define SMEM_B_HI_OFF 132096
-#define SMEM_B_HI_STAGE_BYTES 16384
-#define SMEM_B_HI_STRIDE 16384
-#define SMEM_D_SMEM_OFF 207872
-#define SMEM_D_SMEM_STAGE_BYTES 8192
-#define SMEM_D_SMEM_STRIDE 8192
-#define SMEM_GATE_SMEM_OFF 1024
-#define SMEM_GATE_SMEM_STAGE_BYTES 32768
-#define SMEM_GATE_SMEM_STRIDE 32768
-#define SMEM_UP_SMEM_OFF 99328
-#define SMEM_UP_SMEM_STAGE_BYTES 32768
-#define SMEM_UP_SMEM_STRIDE 32768
-#define SMEM_HIDDEN_SMEM_OFF 197632
-#define SMEM_HIDDEN_SMEM_STAGE_BYTES 32768
-#define SMEM_HIDDEN_SMEM_STRIDE 32768
-#define SMEM_FLAT_VIEW_OFF 197632
-#define SMEM_FLAT_VIEW_STAGE_BYTES 34816
-#define SMEM_FLAT_VIEW_STRIDE 34816
-#define SMEM_FLAT_VIEW_0_OFF 197632
-#define SMEM_FLAT_VIEW_0_STAGE_BYTES 34816
-#define SMEM_FLAT_VIEW_0_STRIDE 34816
-#define SMEM_FLAT_VIEW_1_OFF 1024
-#define SMEM_FLAT_VIEW_1_STAGE_BYTES 81920
-#define SMEM_FLAT_VIEW_1_STRIDE 81920
-#define SMEM_FLAT_VIEW_2_OFF 17408
-#define SMEM_FLAT_VIEW_2_STAGE_BYTES 66048
-#define SMEM_FLAT_VIEW_2_STRIDE 66048
-#define SMEM_FLAT_VIEW_3_OFF 99328
-#define SMEM_FLAT_VIEW_3_STAGE_BYTES 81920
-#define SMEM_FLAT_VIEW_3_STRIDE 81920
-#define SMEM_FLAT_VIEW_4_OFF 115712
-#define SMEM_FLAT_VIEW_4_STAGE_BYTES 66048
-#define SMEM_FLAT_VIEW_4_STRIDE 66048
-#define SMEM_FLAT_VIEW_5_OFF 1024
-#define SMEM_FLAT_VIEW_5_STAGE_BYTES 131072
-#define SMEM_FLAT_VIEW_5_STRIDE 131072
-#define SMEM_FLAT_VIEW_6_OFF 199680
-#define SMEM_FLAT_VIEW_6_STAGE_BYTES 512
-#define SMEM_FLAT_VIEW_6_STRIDE 512
-#define SMEM_SMEM_V15_OFF 1024
-#define SMEM_SMEM_V15_STAGE_BYTES 131072
-#define SMEM_SMEM_V15_STRIDE 131072
-#define SMEM_SMEM_V16_OFF 1280
-#define SMEM_SMEM_V16_STAGE_BYTES 130816
-#define SMEM_SMEM_V16_STRIDE 130816
-#define SMEM_SMEM_V17_OFF 1536
-#define SMEM_SMEM_V17_STAGE_BYTES 130560
-#define SMEM_SMEM_V17_STRIDE 130560
-#define SMEM_SMEM_V18_OFF 1792
-#define SMEM_SMEM_V18_STAGE_BYTES 130304
-#define SMEM_SMEM_V18_STRIDE 130304
-#define SMEM_SMEM_V19_OFF 132096
-#define SMEM_SMEM_V19_STAGE_BYTES 16384
-#define SMEM_SMEM_V19_STRIDE 16384
-#define SMEM_SMEM_V20_OFF 148480
-#define SMEM_SMEM_V20_STAGE_BYTES 16384
-#define SMEM_SMEM_V20_STRIDE 16384
-#define SMEM_SMEM_V21_OFF 164864
-#define SMEM_SMEM_V21_STAGE_BYTES 512
-#define SMEM_SMEM_V21_STRIDE 512
-#define SMEM_SMEM_V22_OFF 165376
-#define SMEM_SMEM_V22_STAGE_BYTES 512
-#define SMEM_SMEM_V22_STRIDE 512
-#define SMEM_SMEM_V23_OFF 165888
-#define SMEM_SMEM_V23_STAGE_BYTES 16384
-#define SMEM_SMEM_V23_STRIDE 16384
-#define SMEM_SMEM_V24_OFF 182272
-#define SMEM_SMEM_V24_STAGE_BYTES 16384
-#define SMEM_SMEM_V24_STRIDE 16384
-#define SMEM_SMEM_V25_OFF 198656
-#define SMEM_SMEM_V25_STAGE_BYTES 512
-#define SMEM_SMEM_V25_STRIDE 512
-#define SMEM_SMEM_V26_OFF 199168
-#define SMEM_SMEM_V26_STAGE_BYTES 512
-#define SMEM_SMEM_V26_STRIDE 512
-#define SMEM_SMEM_V27_OFF 1024
-#define SMEM_SMEM_V27_STAGE_BYTES 65536
-#define SMEM_SMEM_V27_STRIDE 65536
-#define SMEM_SMEM_V28_OFF 1280
-#define SMEM_SMEM_V28_STAGE_BYTES 65280
-#define SMEM_SMEM_V28_STRIDE 65280
-#define SMEM_SMEM_V29_OFF 66560
-#define SMEM_SMEM_V29_STAGE_BYTES 65536
-#define SMEM_SMEM_V29_STRIDE 65536
-#define SMEM_SMEM_V30_OFF 66816
-#define SMEM_SMEM_V30_STAGE_BYTES 65280
-#define SMEM_SMEM_V30_STRIDE 65280
-#define SMEM_SMEM_V31_OFF 1024
-#define SMEM_SMEM_V31_STAGE_BYTES 16384
-#define SMEM_SMEM_V31_STRIDE 16384
-#define SMEM_SMEM_V32_OFF 66560
-#define SMEM_SMEM_V32_STAGE_BYTES 16384
-#define SMEM_SMEM_V32_STRIDE 16384
-#define SMEM_SMEM_V33_OFF 132096
-#define SMEM_SMEM_V33_STAGE_BYTES 16384
-#define SMEM_SMEM_V33_STRIDE 16384
-#define SMEM_SMEM_V34_OFF 197632
-#define SMEM_SMEM_V34_STAGE_BYTES 512
-#define SMEM_SMEM_V34_STRIDE 512
-#define SMEM_SMEM_V35_OFF 199680
-#define SMEM_SMEM_V35_STAGE_BYTES 1024
-#define SMEM_SMEM_V35_STRIDE 1024
-#define SMEM_SMEM_V36_OFF 203776
-#define SMEM_SMEM_V36_STAGE_BYTES 1024
-#define SMEM_SMEM_V36_STRIDE 1024
-#define SMEM_SMEM_V37_OFF 1024
-#define SMEM_SMEM_V37_STAGE_BYTES 16384
-#define SMEM_SMEM_V37_STRIDE 16384
-#define SMEM_SMEM_V38_OFF 99328
-#define SMEM_SMEM_V38_STAGE_BYTES 16384
-#define SMEM_SMEM_V38_STRIDE 16384
-#define SMEM_SMEM_V39_OFF 197632
-#define SMEM_SMEM_V39_STAGE_BYTES 512
-#define SMEM_SMEM_V39_STRIDE 512
-#define SMEM_SMEM_V40_OFF 200704
-#define SMEM_SMEM_V40_STAGE_BYTES 1024
-#define SMEM_SMEM_V40_STRIDE 1024
-#define SMEM_SMEM_V41_OFF 207872
-#define SMEM_SMEM_V41_STAGE_BYTES 16384
-#define SMEM_SMEM_V41_STRIDE 16384
-#define SMEM_SMEM_V42_OFF 224256
-#define SMEM_SMEM_V42_STAGE_BYTES 4096
-#define SMEM_SMEM_V42_STRIDE 4096
-#define SMEM_SMEM_V43_OFF 228352
-#define SMEM_SMEM_V43_STAGE_BYTES 512
-#define SMEM_SMEM_V43_STRIDE 512
-#define SMEM_SMEM_V44_OFF 228864
-#define SMEM_SMEM_V44_STAGE_BYTES 512
-#define SMEM_SMEM_V44_STRIDE 512
-#define SMEM_TOTAL 232448
-#define THREADS 256
-#define CAKE_TMEM_HOLD_OFFSET 704
 #define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
@@ -443,7 +290,7 @@ kernel_cake_mok_recompute_mxfp8(const __grid_constant__ CUtensorMap x_shared, co
     int cta_rank;
     asm volatile("mov.b32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
 
-    // Kernel setup ops
+    // Prologue
     __nv_bfloat16* a_smem = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
     const int a_smem_addr = smem + 1024;
     __nv_bfloat16* b_smem = reinterpret_cast<__nv_bfloat16*>(smem_raw + 66560);
@@ -534,6 +381,8 @@ kernel_cake_mok_recompute_mxfp8(const __grid_constant__ CUtensorMap x_shared, co
     const int smem_v43_addr = smem + 228352;
     unsigned int* smem_v44 = reinterpret_cast<unsigned int*>(smem_raw + 228864);
     const int smem_v44_addr = smem + 228864;
+
+    // Kernel setup ops
     int tokens = num_tokens[0];
     int routed_tokens = ((tokens) < (macro_size) ? (tokens) : (macro_size));
     int shared_rows = local_tokens / 256;
@@ -553,8 +402,7 @@ kernel_cake_mok_recompute_mxfp8(const __grid_constant__ CUtensorMap x_shared, co
     }
     asm volatile("setmaxnreg.inc.sync.aligned.u32 256;");
 
-    // Mbarrier init (31 pipeline groups, 0 ordered-sequence groups, 48 barriers)
-    // Mbarriers at smem_raw[0..704)
+    // Mbarrier init (48 barriers at smem_raw[0..704))
 
     if (threadIdx.x == 0) {
         // swiglu_arrived: 3 barriers, init_count=1
@@ -665,14 +513,14 @@ kernel_cake_mok_recompute_mxfp8(const __grid_constant__ CUtensorMap x_shared, co
     asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_tmem_sfa = taddr + 512;
+    const unsigned int tmem_tmem_sfb = taddr + 524;
+    const unsigned int tmem_tmem_sfb_hi = taddr + 548;
+    const unsigned int tmem_accumulator = taddr;
 
     // Kernel post-init ops
-    const int tmem_tmem_sfa = taddr + 512;
-    const int tmem_tmem_sfb = taddr + 524;
-    const int tmem_tmem_sfb_hi = taddr + 548;
-    const int tmem_accumulator = taddr;
-    unsigned int taddr_1 = reinterpret_cast<const volatile unsigned int*>(reinterpret_cast<uint8_t*>(smem_raw) + CAKE_TMEM_HOLD_OFFSET)[0];
+    unsigned int taddr_1 = taddr;
     int cluster = bid / 2;
     int cta_rank_0 = cta_rank;
     int gemm_deep = 0;
@@ -708,7 +556,7 @@ kernel_cake_mok_recompute_mxfp8(const __grid_constant__ CUtensorMap x_shared, co
             }
             __syncthreads();
             if (peer >= 0) {
-                cp_async_bulk_gmem2smem(smem_v27_addr + (unsigned int)(tid * 256 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(reinterpret_cast<__nv_bfloat16*>(x_peers[peer])) + ((unsigned long long)((unsigned long long)(peer_token / topk) * (unsigned long long)hidden + (unsigned long long)(task % col_blocks * 512)) * (unsigned long long)2)), _min_0 * 2, dispatch_arrived_addr);
+                cp_async_bulk_gmem2smem(smem_v27_addr + (unsigned int)(tid * 256 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(reinterpret_cast<__nv_bfloat16*>(x_peers[peer])) + (unsigned long long)((unsigned long long)(peer_token / topk) * (unsigned long long)hidden + (unsigned long long)(task % col_blocks * 512)) * (unsigned long long)2), _min_0 * 2, dispatch_arrived_addr);
             } else if (tid < 128) {
                 #pragma unroll
                 for (int vec = 0; vec < 32; vec++) {
@@ -735,7 +583,7 @@ kernel_cake_mok_recompute_mxfp8(const __grid_constant__ CUtensorMap x_shared, co
                 }
                 __syncthreads();
                 if (peer_1 >= 0) {
-                    cp_async_bulk_gmem2smem(smem_v29_addr + (unsigned int)(tid * 256 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(reinterpret_cast<__nv_bfloat16*>(x_peers[peer_1])) + ((unsigned long long)((unsigned long long)(peer_token_1 / topk) * (unsigned long long)hidden + (unsigned long long)(col_block * 512) + 256) * (unsigned long long)2)), hi_cols * 2, dispatch_arrived_hi_addr);
+                    cp_async_bulk_gmem2smem(smem_v29_addr + (unsigned int)(tid * 256 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(reinterpret_cast<__nv_bfloat16*>(x_peers[peer_1])) + (unsigned long long)((unsigned long long)(peer_token_1 / topk) * (unsigned long long)hidden + (unsigned long long)(col_block * 512) + 256) * (unsigned long long)2), hi_cols * 2, dispatch_arrived_hi_addr);
                 } else if (tid < 128) {
                     #pragma unroll
                     for (int vec_1 = 0; vec_1 < 32; vec_1++) {
@@ -1238,7 +1086,7 @@ kernel_cake_mok_recompute_mxfp8(const __grid_constant__ CUtensorMap x_shared, co
                 }
                 __syncthreads();
                 if (peer_2 >= 0) {
-                    cp_async_bulk_gmem2smem(smem_v27_addr + (unsigned int)(tid * 256 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(reinterpret_cast<__nv_bfloat16*>(x_peers[peer_2])) + ((unsigned long long)((unsigned long long)(peer_token_2 / topk) * (unsigned long long)hidden + (unsigned long long)(next_task % col_blocks * 512)) * (unsigned long long)2)), _min_1 * 2, dispatch_arrived_addr);
+                    cp_async_bulk_gmem2smem(smem_v27_addr + (unsigned int)(tid * 256 * 2), reinterpret_cast<const void*>(reinterpret_cast<const uint8_t*>(reinterpret_cast<__nv_bfloat16*>(x_peers[peer_2])) + (unsigned long long)((unsigned long long)(peer_token_2 / topk) * (unsigned long long)hidden + (unsigned long long)(next_task % col_blocks * 512)) * (unsigned long long)2), _min_1 * 2, dispatch_arrived_addr);
                 } else if (tid < 128) {
                     #pragma unroll
                     for (int vec_2 = 0; vec_2 < 32; vec_2++) {
@@ -1768,7 +1616,7 @@ kernel_cake_mok_recompute_mxfp8(const __grid_constant__ CUtensorMap x_shared, co
                     if (task_1 >= mini_gate) {
                         gate_task = task_1 - mini_gate;
                     }
-                    int word0_1 = 0;
+                    int word0_2 = 0;
                     int word1_0 = 0;
                     int word2_0 = 0;
                     int first_block = mini * (mini_size / 256);
@@ -1777,11 +1625,11 @@ kernel_cake_mok_recompute_mxfp8(const __grid_constant__ CUtensorMap x_shared, co
                     uint32_t fast_div_r_1 = (uint32_t)((unsigned int)gate_task) - fast_div_q_1 * (uint32_t)(gate_col_blocks_div.divisor);
                     int block = first_block + (int)fast_div_q_1;
                     if (block < end_block) {
-                        word0_1 = counts[3 * experts + block];
-                        word1_0 = counts[experts + word0_1];
-                        word2_0 = counts[word0_1];
+                        word0_2 = counts[3 * experts + block];
+                        word1_0 = counts[experts + word0_2];
+                        word2_0 = counts[word0_2];
                     }
-                    word0 = word0_1;
+                    word0 = word0_2;
                     word1 = word1_0;
                     word2 = word2_0;
                 }
@@ -4381,10 +4229,9 @@ kernel_cake_mok_recompute_mxfp8(const __grid_constant__ CUtensorMap x_shared, co
                         int col_blocks_6 = intermediate / 128;
                         int num_tiles_1 = tokens / 128 * col_blocks_6;
                         int macro_row_offset_1 = 0;
-                        int first_tile_1 = (tile_word_1 - 2 * mini_gate) * 6 + cta_rank_0 * 3;
                         int global_mini_4 = tile_word_0;
                         int mini_tiles = mini_size / 128 * col_blocks_6;
-                        first_tile_1 = first_tile_1 + global_mini_4 * mini_tiles;
+                        int first_tile_1 = (tile_word_1 - 2 * mini_gate) * 6 + cta_rank_0 * 3 + global_mini_4 * mini_tiles;
                         int tile_end_1 = ((num_tiles_1) < ((global_mini_4 + 1) * mini_tiles) ? (num_tiles_1) : ((global_mini_4 + 1) * mini_tiles));
                         int macro_tiles_1 = macro_size / 128;
                         if (first_tile_1 < tile_end_1) {
@@ -4878,7 +4725,7 @@ kernel_cake_mok_recompute_mxfp8(const __grid_constant__ CUtensorMap x_shared, co
                         int tile_word_7 = 0;
                         int tile_word_8 = 0;
                         if (decoded_cluster < true_clusters) {
-                            int word0_2 = 0;
+                            int word0_1 = 0;
                             int word1_1 = 0;
                             int word2_1 = 0;
                             if (shared_tasks <= decoded_cluster - comm_clusters) {
@@ -4887,25 +4734,25 @@ kernel_cake_mok_recompute_mxfp8(const __grid_constant__ CUtensorMap x_shared, co
                                     if (task_0 >= mini_gate) {
                                         gate_task_1 = task_0 - mini_gate;
                                     }
-                                    int word0_2_1 = 0;
+                                    int word0_3 = 0;
                                     int word1_2 = 0;
-                                    int word2_1_1 = 0;
+                                    int word2_3 = 0;
                                     int first_block_3 = mini_2 * (mini_size / 256);
                                     int end_block_3 = ((first_block_3 + mini_size / 256) < (tokens / 256) ? (first_block_3 + mini_size / 256) : (tokens / 256));
                                     uint32_t fast_div_q_5 = (gate_col_blocks_div.divisor != 1) ? (__umulhi((uint32_t)((unsigned int)gate_task_1), gate_col_blocks_div.multiplier) >> gate_col_blocks_div.shift_right) : (uint32_t)((unsigned int)gate_task_1);
                                     uint32_t fast_div_r_5 = (uint32_t)((unsigned int)gate_task_1) - fast_div_q_5 * (uint32_t)(gate_col_blocks_div.divisor);
                                     int block_16 = first_block_3 + (int)fast_div_q_5;
                                     if (block_16 < end_block_3) {
-                                        word0_2_1 = counts[3 * experts + block_16];
-                                        word1_2 = counts[experts + word0_2_1];
-                                        word2_1_1 = counts[word0_2_1];
+                                        word0_3 = counts[3 * experts + block_16];
+                                        word1_2 = counts[experts + word0_3];
+                                        word2_3 = counts[word0_3];
                                     }
-                                    word0_2 = word0_2_1;
+                                    word0_1 = word0_3;
                                     word1_1 = word1_2;
-                                    word2_1 = word2_1_1;
+                                    word2_1 = word2_3;
                                 }
                             }
-                            tile_word_6 = word0_2;
+                            tile_word_6 = word0_1;
                             tile_word_7 = word1_1;
                             tile_word_8 = word2_1;
                         }
