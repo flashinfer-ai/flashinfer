@@ -16,8 +16,11 @@ limitations under the License.
 CUDA-graph capture of the entry points of the Cake four-stream mHC training
 package with the opt-in non-deterministic backward
 (``flashinfer.experimental.cake.cake_mhc_train_backend``, every entry point with
-``deterministic=False``; hidden 4096, 4 streams; SM100 / SM103 / SM107;
-FlashInfer issue #8068), in the form of ``test_cake_mhc_det_train_graphs.py``.
+``deterministic=False``; hidden 4096, 5120 and 7168, 4 streams; SM100 /
+SM103 at the three hidden sizes, SM107 at 4096; FlashInfer issue #8068), in the
+form of ``test_cake_mhc_det_train_graphs.py``.  Every case runs at each hidden
+size ``H`` the device's architecture routes (``W`` is ``[H, H]``, the
+workspaces are sized with ``hidden=H``); a size it does not route is skipped.
 
 One training iteration of a layer -- prepare, an external branch ``B = U @ W``
 (BF16, ``W`` fixed), finish, the loss and its backward -- is captured whole
@@ -48,12 +51,17 @@ per element (``P`` the chunk count of the column-slab pass, ``u = 2^-24``,
 each of three calls, each compared the same way with eager calls on the same
 values.  A captured ``backward_finish`` on a caller workspace sized for a
 larger token count, replayed with new inputs copied in place between eager
-calls at the larger count, closes the module.
+calls at the larger count, closes the module.  Where the deterministic
+``backward_finish`` runs its group-row forms (``BWD_ROW_BANDS``, which this
+package does not copy), its ``dscale`` / ``dbase`` reference is its per-CTA
+reduction's (:func:`_det_backward`).
 """
 
 from __future__ import annotations
 
+import contextlib
 import functools
+import gc
 
 import pytest
 import torch
@@ -69,7 +77,8 @@ det = cake_package("cake_mhc_det_train")
 det_loader = cake_package("cake_mhc_det_train", "cake_jit")
 
 SUPPORTED_CAPABILITIES = ((10, 0), (10, 3), (10, 7))
-STREAMS, HIDDEN, N, MAPPING_ROWS = 4, 4096, 16384, 24
+STREAMS, HIDDEN, MAPPING_ROWS = 4, 4096, 24
+HIDDEN_SIZES = (4096, 5120, 7168)
 RMS_EPS, HC_EPS, SINKHORN_ITERS = 1e-5, 1e-6, 20
 BLOCK_TOKENS = 8192
 SEED = 2032
@@ -121,6 +130,15 @@ def warmup_jit():
     yield
 
 
+@pytest.fixture(autouse=True)
+def collect_dead_graphs():
+    # torch skips its gc.collect() before a capture by default (TORCH_CUDAGRAPH_GC): an earlier test's dead CUDA graph
+    # that a cyclic collection destroys during a global-mode capture invalidates that capture.
+    gc.collect()
+    yield
+    gc.collect()
+
+
 def _arch() -> str:
     return loader.arch_for_capability(_capability())
 
@@ -129,11 +147,49 @@ def _sm_count() -> int:
     return loader.sm_count(_device().index)
 
 
-def _parts(T: int) -> int:
+@pytest.fixture(params=HIDDEN_SIZES, ids=lambda h: f"H{h}")
+def hidden(request) -> int:
+    """The hidden size of a case (every size of the package; skipped where the architecture has no route)."""
+    arch = _arch()
+    sizes = tuple(loader.supported_hidden_sizes(arch)) if arch else ()
+    if request.param not in sizes:
+        pytest.skip(
+            f"hidden {request.param} has no exported route on {arch} (exported hidden sizes: {sizes})"
+        )
+    return request.param
+
+
+def _parts(T: int, hidden: int = HIDDEN) -> int:
     """``P``: the chunk count of the column-slab pass, the number of partials each ``dfn`` element sums."""
-    parts = loader.host_plan(T, _sm_count(), _arch())["parts"]
-    assert 1 <= parts <= 32, (T, parts)
+    parts = loader.host_plan(T, _sm_count(), _arch(), hidden)["parts"]
+    assert 1 <= parts <= 32, (T, hidden, parts)
     return parts
+
+
+def _lpt_runs(T: int, hidden: int = HIDDEN) -> bool:
+    """Whether the column slab runs a two-size record of ``hidden`` (``lpt`` or its slab-fastest copy ``lpt_os``) at
+    ``T`` on this device (at hidden 5120 and 7168 only where the size's table calibrates the architecture)."""
+    program = loader.bwd_slab_atomic_program(T, _sm_count(), _arch(), hidden)
+    return program.startswith("lpt")
+
+
+def _slab_parts(T: int, hidden: int = HIDDEN) -> int:
+    """The chunk count the column slab launches: ``slab_plan``'s ``lpt_parts`` under ``lpt`` / ``lpt_os``, else
+    :func:`_parts`."""
+    if not _lpt_runs(T, hidden):
+        return _parts(T, hidden)
+    parts = loader.slab_plan(T, _sm_count(), _arch(), hidden)["lpt_parts"]
+    assert 1 <= parts <= 32, (T, hidden, parts)
+    return parts
+
+
+def _dfn_factor(T: int, hidden: int = HIDDEN) -> float:
+    """F of the dfn bound F u (|carried| + ABS_SLACK sum_t |dz'_t| |x_t|) at T (``test_cake_mhc_train.py``'s
+    ``_dfn_factor``, which derives it): 2 P where the column slab runs dynr or dynr_os (both sides sum the same
+    per-chunk partials), 2 max(P, P_k7) + 10 where it runs lpt or lpt_os (the partials are another partition's)."""
+    if not _lpt_runs(T, hidden):
+        return 2.0 * _parts(T, hidden)
+    return 2.0 * max(_slab_parts(T, hidden), _parts(T, hidden)) + 10.0
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -161,8 +217,8 @@ def _coefficients(z, scale, base, hc_eps: float = HC_EPS, iters: int = SINKHORN_
 
 def _dzp(i: dict) -> torch.Tensor:
     """The FP64 ``dz' = r dL/dz`` of the reference, ``[T, 24]``: ``dfn = dz'^T X_flat`` sums one product per token
-    (the backward of the coefficients alone, so no ``[T, 16384]`` autograd graph is held)."""
-    T = i["X"].shape[0]
+    (the backward of the coefficients alone, so no ``[T, 4H]`` autograd graph is held)."""
+    T, n = i["X"].shape[0], STREAMS * i["X"].shape[2]
     fn, scale, base = (i[k].double() for k in ("fn", "scale", "base"))
     blocks = [torch.zeros((0, MAPPING_ROWS), dtype=F64, device=_device())]
     for lo in range(0, T, BLOCK_TOKENS):
@@ -171,7 +227,7 @@ def _dzp(i: dict) -> torch.Tensor:
         dY = i["dY"][lo:hi].double()
         dU = i["dU"][lo:hi].double()
         B = i["B"][lo:hi].double()
-        u = X.reshape(hi - lo, N)
+        u = X.reshape(hi - lo, n)
         r = torch.rsqrt(u.square().mean(dim=-1, keepdim=True) + RMS_EPS)
         with torch.enable_grad():
             z = ((u * r) @ fn.T).requires_grad_(True)
@@ -190,15 +246,16 @@ def _dzp(i: dict) -> torch.Tensor:
 
 
 def _dfn_bound(i: dict) -> torch.Tensor:
-    """Per-element bound of ``|dfn_a - dfn_b|`` for two sums of the same ``P`` per-chunk partials in two orders:
-    ``2 P u * 1.02 sum_t |dz'_t| |x_t|`` (``test_cake_mhc_train.py``'s ``_dfn_bound``)."""
-    T = i["X"].shape[0]
+    """Per-element bound of ``|dfn_a - dfn_b|`` for two sums of per-chunk partials in two orders:
+    ``F u * 1.02 sum_t |dz'_t| |x_t|`` with ``F`` = :func:`_dfn_factor` (``test_cake_mhc_train.py``'s
+    ``_dfn_bound``)."""
+    T, hidden = i["X"].shape[0], i["X"].shape[2]
     dzp = _dzp(i).abs()
-    A = torch.zeros((MAPPING_ROWS, N), dtype=F64, device=_device())
+    A = torch.zeros((MAPPING_ROWS, STREAMS * hidden), dtype=F64, device=_device())
     for lo in range(0, T, BLOCK_TOKENS):
         hi = min(T, lo + BLOCK_TOKENS)
-        A += dzp[lo:hi].T @ i["X"][lo:hi].reshape(hi - lo, N).double().abs()
-    return 2.0 * _parts(T) * FP32_UNIT_ROUNDOFF * ABS_SLACK * A
+        A += dzp[lo:hi].T @ i["X"][lo:hi].reshape(hi - lo, -1).double().abs()
+    return _dfn_factor(T, hidden) * FP32_UNIT_ROUNDOFF * ABS_SLACK * A
 
 
 def _layer_bound(i: dict, W: torch.Tensor) -> torch.Tensor:
@@ -215,31 +272,35 @@ def _layer_bound(i: dict, W: torch.Tensor) -> torch.Tensor:
 # Inputs, steps and comparisons
 
 
-def _inputs(T: int, seed: int) -> dict:
+def _inputs(T: int, seed: int, hidden: int = HIDDEN) -> dict:
     g = torch.Generator(device=_device()).manual_seed(seed)
 
     def randn(*shape: int, dtype: torch.dtype = F32) -> torch.Tensor:
         return torch.randn(*shape, generator=g, device=_device(), dtype=F32).to(dtype)
 
     return {
-        "X": randn(T, STREAMS, HIDDEN, dtype=BF16),
-        "fn": (randn(MAPPING_ROWS, N) * 1e-2).contiguous(),
+        "X": randn(T, STREAMS, hidden, dtype=BF16),
+        "fn": (randn(MAPPING_ROWS, STREAMS * hidden) * 1e-2).contiguous(),
         "scale": 1.0 + 0.1 * randn(3),
         "base": 0.1 * randn(MAPPING_ROWS),
-        "W": (randn(HIDDEN, HIDDEN) / 64.0).to(BF16),
-        "dY": randn(T, STREAMS, HIDDEN, dtype=BF16),
+        "W": (randn(hidden, hidden) / 64.0).to(BF16),
+        "dY": randn(T, STREAMS, hidden, dtype=BF16),
         # the branch output and its gradient of the backward_finish-only capture
-        "B": randn(T, HIDDEN, dtype=BF16),
-        "dU": randn(T, HIDDEN, dtype=BF16),
+        "B": randn(T, hidden, dtype=BF16),
+        "dU": randn(T, hidden, dtype=BF16),
     }
 
 
-def _workspaces(T: int, caller_owned: bool):
+def _workspaces(T: int, caller_owned: bool, hidden: int = HIDDEN):
     if not caller_owned:
         return None, None
     return (
-        pkg.cake_mhc_train_forward_workspace(T, _device(), deterministic=False),
-        pkg.cake_mhc_train_backward_workspace(T, _device(), deterministic=False),
+        pkg.cake_mhc_train_forward_workspace(
+            T, _device(), hidden=hidden, deterministic=False
+        ),
+        pkg.cake_mhc_train_backward_workspace(
+            T, _device(), hidden=hidden, deterministic=False
+        ),
     )
 
 
@@ -363,12 +424,14 @@ def _poison(out: dict) -> None:
         v.detach().reshape(-1).view(torch.uint8).fill_(0xFF)
 
 
-def _poisoned_outputs(T: int) -> dict:
+def _poisoned_outputs(T: int, hidden: int = HIDDEN) -> dict:
     """Caller-provided outputs holding NaN in every element (what the kernels must overwrite)."""
     nan = float("nan")
     return {
-        "dX": torch.full((T, STREAMS, HIDDEN), nan, dtype=BF16, device=_device()),
-        "dfn": torch.full((MAPPING_ROWS, N), nan, dtype=F32, device=_device()),
+        "dX": torch.full((T, STREAMS, hidden), nan, dtype=BF16, device=_device()),
+        "dfn": torch.full(
+            (MAPPING_ROWS, STREAMS * hidden), nan, dtype=F32, device=_device()
+        ),
         "dscale": torch.full((3,), nan, dtype=F32, device=_device()),
         "dbase": torch.full((MAPPING_ROWS,), nan, dtype=F32, device=_device()),
     }
@@ -395,7 +458,10 @@ def _same_bits(a: torch.Tensor, b: torch.Tensor) -> bool:
 def _assert_dfn_within(
     got: torch.Tensor, want: torch.Tensor, bound: torch.Tensor, label: str
 ) -> None:
-    assert got.dtype == F32 and tuple(got.shape) == (MAPPING_ROWS, N), label
+    assert got.dtype == F32 and tuple(got.shape) == tuple(want.shape), label
+    assert tuple(got.shape) == tuple(bound.shape) and got.shape[0] == MAPPING_ROWS, (
+        label
+    )
     assert torch.isfinite(got).all(), f"{label}: non-finite dfn"
     diff = (got.double() - want.double()).abs()
     over = int((diff > bound).sum())
@@ -457,13 +523,13 @@ def _capture_and_replay(make, ws=None, what: str = "") -> list:
 
 @pytest.mark.parametrize("T", (1, 129, 2049))
 @pytest.mark.parametrize("caller_owned", (False, True))
-def test_direct_entry_points_capture(T: int, caller_owned: bool) -> None:
-    i = _inputs(T, seed=7046 + T)
-    wsf, wsb = _workspaces(T, caller_owned)
+def test_direct_entry_points_capture(T: int, caller_owned: bool, hidden: int) -> None:
+    i = _inputs(T, seed=7046 + T, hidden=hidden)
+    wsf, wsb = _workspaces(T, caller_owned, hidden)
     bound = _layer_bound(i, i["W"])
     eager = _eager(lambda: _direct_step(i, wsf, wsb))
     eager_det = _eager(lambda: _direct_step(i, None, None, deterministic=True))
-    what = f"direct T={T} caller_owned={caller_owned}"
+    what = f"direct T={T} H={hidden} caller_owned={caller_owned}"
     replays = _capture_and_replay(lambda: _direct_step(i, wsf, wsb), wsb, what)
     for r, got in enumerate(replays):
         _assert_matches(eager, got, bound, f"{what} replay {r} vs eager")
@@ -475,10 +541,10 @@ def test_direct_entry_points_capture(T: int, caller_owned: bool) -> None:
 @pytest.mark.parametrize("ckpt", (False, True))
 @pytest.mark.parametrize("caller_owned", (False, True))
 def test_autograd_iteration_capture(
-    T: int, save_stats: bool, ckpt: bool, caller_owned: bool
+    T: int, save_stats: bool, ckpt: bool, caller_owned: bool, hidden: int
 ) -> None:
-    i = _inputs(T, seed=7146 + T)
-    wsf, wsb = _workspaces(T, caller_owned)
+    i = _inputs(T, seed=7146 + T, hidden=hidden)
+    wsf, wsb = _workspaces(T, caller_owned, hidden)
     bound = _layer_bound(i, i["W"])
 
     def make(deterministic: bool = False):
@@ -490,7 +556,7 @@ def test_autograd_iteration_capture(
 
     eager = _eager(make)
     eager_det = _eager(lambda: make(deterministic=True))
-    what = f"autograd ckpt={ckpt} save_stats={save_stats} caller_owned={caller_owned} T={T}"
+    what = f"autograd ckpt={ckpt} save_stats={save_stats} caller_owned={caller_owned} T={T} H={hidden}"
     for r, got in enumerate(_capture_and_replay(make, wsb, what)):
         _assert_matches(eager, got, bound, f"{what} replay {r} vs eager")
         _assert_matches(eager_det, got, bound, f"{what} replay {r} vs deterministic")
@@ -499,8 +565,10 @@ def test_autograd_iteration_capture(
 @pytest.mark.parametrize("T", (129, 2049))
 @pytest.mark.parametrize("save_stats", (True, False))
 @pytest.mark.parametrize("ckpt", (False, True))
-def test_make_graphed_callables(T: int, save_stats: bool, ckpt: bool) -> None:
-    i = _inputs(T, seed=7246 + T)
+def test_make_graphed_callables(
+    T: int, save_stats: bool, ckpt: bool, hidden: int
+) -> None:
+    i = _inputs(T, seed=7246 + T, hidden=hidden)
 
     def forward(deterministic: bool):
         layer = _layer(i, None, None, save_stats, deterministic)
@@ -527,13 +595,11 @@ def test_make_graphed_callables(T: int, save_stats: bool, ckpt: bool) -> None:
     for r in range(REPLAYS):
         # New values of the same shapes on every call: a call whose graphs did
         # not replay would return the previous call's outputs and fail.
-        ir = _inputs(T, seed=7246 + T + 1000 * (r + 1))
+        ir = _inputs(T, seed=7246 + T + 1000 * (r + 1), hidden=hidden)
         bound = _layer_bound(ir, i["W"])  # the layer's W is the first draw's
         ref, ref_det = run(fwd, ir), run(fwd_det, ir)
         got = run(graphed, ir)
-        what = (
-            f"make_graphed_callables ckpt={ckpt} save_stats={save_stats} T={T} call {r}"
-        )
+        what = f"make_graphed_callables ckpt={ckpt} save_stats={save_stats} T={T} H={hidden} call {r}"
         _assert_matches(ref, got, bound, f"{what} vs eager")
         _assert_matches(ref_det, got, bound, f"{what} vs deterministic")
 
@@ -561,8 +627,45 @@ def _nd_backward(i: dict, prep: dict, **kwargs) -> dict:
     )
 
 
+def _clear_det_caches() -> None:
+    """Drop the deterministic package's cached host plans, workspace envelopes, layouts and route plans (each binds
+    the token-owner and reduction forms and the parameter region of its token count)."""
+    det_loader.host_plan.cache_clear()
+    det_loader.workspace_bytes_upto.cache_clear()
+    det._LAYOUTS.clear()
+    det._PLANS.clear()
+    det._FAST_ROUTES.clear()
+
+
+@contextlib.contextmanager
+def _det_per_cta():
+    """The deterministic package with its group-row forms off (``cake_jit.bwd_group_rows`` False at every call): the
+    per-CTA token owner and reduction whose ``dscale`` / ``dbase`` this package's column slab reproduces.  Its caches
+    are dropped on entry and on exit, also when the body fails (:func:`_clear_det_caches`)."""
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(det_loader, "bwd_group_rows", lambda *_args, **_kwargs: False)
+        _clear_det_caches()
+        try:
+            yield
+        finally:
+            patch.undo()
+            _clear_det_caches()
+
+
 def _det_backward(i: dict, prep: dict) -> dict:
-    return _backward(det.cake_mhc_det_train_backward_finish, i, prep)
+    """The deterministic backward (``test_cake_mhc_train.py``'s ``_det_backward``): where it runs its group-row forms
+    (``cake_jit.bwd_group_rows``), ``dscale`` and ``dbase`` are those of its per-CTA run (:func:`_det_per_cta`) on a
+    workspace of the per-CTA sizing; ``dX`` and ``dfn`` stay the shipped backward's."""
+    T, hidden = i["X"].shape[0], i["X"].shape[2]
+    out = _backward(det.cake_mhc_det_train_backward_finish, i, prep)
+    if det_loader.bwd_group_rows(T, _sm_count(), _arch(), hidden):
+        with _det_per_cta():
+            ws = det.cake_mhc_det_train_backward_workspace(T, _device(), hidden=hidden)
+            per_cta = _backward(
+                det.cake_mhc_det_train_backward_finish, i, prep, workspace=ws
+            )
+        out.update(dscale=per_cta["dscale"], dbase=per_cta["dbase"])
+    return out
 
 
 def _assert_exact_outputs(got: dict, want: dict, label: str) -> None:
@@ -573,17 +676,19 @@ def _assert_exact_outputs(got: dict, want: dict, label: str) -> None:
 @pytest.mark.parametrize(
     ("T", "t_ws"), ((129, 129), (2049, 2049), (2049, 16263), (1, 4096))
 )
-def test_cuda_graph_capture_and_replay(T: int, t_ws: int) -> None:
+def test_cuda_graph_capture_and_replay(T: int, t_ws: int, hidden: int) -> None:
     """A ``deterministic=False`` ``backward_finish`` with a caller workspace (sized for ``t_ws >= T``) and caller
     outputs, captured in a ``torch.cuda.CUDAGraph`` after a warm-up on a side stream, then replayed with new inputs
     copied in place (and, on a larger buffer, an eager call at ``t_ws`` on the same workspace before each replay):
     every replay leaves the ticket region zero and matches the eager deterministic and non-deterministic calls on the
     same inputs (``dX``, ``dscale``, ``dbase`` bitwise; ``dfn`` within the bound)."""
     dev = _device()
-    ws = pkg.cake_mhc_train_backward_workspace(t_ws, dev, deterministic=False)
-    static = _inputs(T, seed=SEED + 600)
+    ws = pkg.cake_mhc_train_backward_workspace(
+        t_ws, dev, hidden=hidden, deterministic=False
+    )
+    static = _inputs(T, seed=SEED + 600, hidden=hidden)
     sprep = _forward(static)
-    outs = _poisoned_outputs(T)
+    outs = _poisoned_outputs(T, hidden)
 
     def step() -> None:
         pkg.cake_mhc_train_backward_finish(
@@ -604,7 +709,7 @@ def test_cuda_graph_capture_and_replay(T: int, t_ws: int) -> None:
     torch.cuda.synchronize()
     big = None
     if t_ws > T:
-        bi = _inputs(t_ws, seed=SEED + 601)
+        bi = _inputs(t_ws, seed=SEED + 601, hidden=hidden)
         bprep = _forward(bi)
         big = {
             "i": bi,
@@ -613,7 +718,7 @@ def test_cuda_graph_capture_and_replay(T: int, t_ws: int) -> None:
             "bound": _dfn_bound(bi),
         }
     for r in range(REPLAYS):
-        new = _inputs(T, seed=SEED + 610 + r)
+        new = _inputs(T, seed=SEED + 610 + r, hidden=hidden)
         nprep = _forward(new)
         want = _snapshot(_det_backward(new, nprep))
         eager = _snapshot(_nd_backward(new, nprep))
@@ -622,7 +727,7 @@ def test_cuda_graph_capture_and_replay(T: int, t_ws: int) -> None:
             static[k].copy_(new[k])
         sprep["stats"].copy_(nprep["stats"])
         sprep["gstats"].copy_(nprep["gstats"])
-        what = f"replay {r} at T={T} on a workspace of T={t_ws}"
+        what = f"replay {r} at T={T} H={hidden} on a workspace of T={t_ws}"
         if big is not None:
             _poison_workspace(ws)
             got_big = _snapshot(_nd_backward(big["i"], big["prep"], workspace=ws))

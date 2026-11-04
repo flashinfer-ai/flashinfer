@@ -4256,8 +4256,9 @@ cute_dsl_fused_moe_trace = TraceTemplate(
             description=(
                 "GEMM1 activation type: ActivationType.Swiglu for gated "
                 "SwiGLU/OAI/SiTU, ActivationType.GegluTanh for "
-                "tanh-approximate GeGLU, or ActivationType.Relu2 for "
-                "non-gated ReLU^2. "
+                "tanh-approximate GeGLU, ActivationType.Relu2 for "
+                "non-gated ReLU^2, or ActivationType.ClampedRelu2 for "
+                "non-gated clamped ReLU^2. "
                 "Determines gemm1_out_size."
             ),
         ),
@@ -4285,6 +4286,15 @@ cute_dsl_fused_moe_trace = TraceTemplate(
             "float32",
             optional=True,
             description="Optional SiTU up-branch tanh-clamp beta.",
+        ),
+        "clamped_relu2_limit": Tensor(
+            ["one"],
+            dtype="float32",
+            optional=True,
+            description=(
+                "ClampedRelu2 limit L, read at runtime; required with "
+                "ActivationType.ClampedRelu2 only."
+            ),
         ),
     },
     outputs={
@@ -4344,6 +4354,12 @@ _cute_dsl_wrapper_inputs["situ_beta"] = Scalar(
 )
 _cute_dsl_wrapper_inputs["situ_linear_beta"] = Scalar(
     "float32",
+    optional=True,
+    description="Set at wrapper __init__, not passed to run().",
+)
+_cute_dsl_wrapper_inputs["clamped_relu2_limit"] = Tensor(
+    ["one"],
+    dtype="float32",
     optional=True,
     description="Set at wrapper __init__, not passed to run().",
 )

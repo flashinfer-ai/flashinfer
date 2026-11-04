@@ -71,15 +71,21 @@ def _check(condition: bool, message: str) -> None:
         raise ValueError(message)
 
 
-def _check_aligned(tensor: torch.Tensor, name: str, num_bytes: int) -> None:
-    # The kernel moves rows in num_bytes vectors: base and every outer stride must be aligned.
-    element_size = tensor.element_size()
-    _check(
-        tensor.stride(-1) == 1
-        and tensor.data_ptr() % num_bytes == 0
-        and all(s * element_size % num_bytes == 0 for s in tensor.stride()[:-1]),
-        f"{name} needs a contiguous last dim and {num_bytes}-byte aligned base and strides",
-    )
+def _check_aligned(
+    tensor: torch.Tensor, name: str, num_bytes: int, stride: tuple[int, ...]
+) -> None:
+    # The kernel moves rows in num_bytes vectors: base and every outer stride must be aligned,
+    # i.e. num_bytes divides the gcd of the base and the outer byte strides. stride is the
+    # tensor's strides, read once by the caller.
+    *outer, last = stride
+    if (
+        last != 1
+        or math.gcd(tensor.data_ptr(), tensor.element_size() * math.gcd(*outer))
+        % num_bytes
+    ):
+        raise ValueError(
+            f"{name} needs a contiguous last dim and {num_bytes}-byte aligned base and strides"
+        )
 
 
 def qsa_sparse_paged_attention(
@@ -101,7 +107,8 @@ def qsa_sparse_paged_attention(
     del (
         use_prefill_config
     )  # kept for the signature; the split rule does not depend on it
-    major = get_compute_capability(q.device)[0]
+    device = q.device
+    major = get_compute_capability(device)[0]
     if major not in (8, 9):
         raise RuntimeError(
             f"QSA sparse paged attention supports SM80 through SM90, got SM{major}x"
@@ -122,24 +129,27 @@ def qsa_sparse_paged_attention(
         "k_cache must hold head_dim / 2 packed bytes (uint8 is NVFP4; view an FP8 cache "
         "as float8_e4m3fn) or head_dim values",
     )
+    k_stride = k_cache.stride()
     _check(
         v_cache.shape == k_cache.shape
         and v_cache.dtype == k_cache.dtype
-        and v_cache.stride() == k_cache.stride(),
+        and v_cache.stride() == k_stride,
         "k_cache and v_cache must have the same dtype, shape and strides",
     )
     if nvfp4:
         sf_shape = (num_blocks, page_size, num_kv_heads, head_dim // 16)
-        _check(
+        if not (
             k_sf is not None
             and v_sf is not None
             and k_sf.dtype == torch.float8_e4m3fn
-            and tuple(k_sf.shape) == sf_shape
-            and v_sf.shape == k_sf.shape
+            and k_sf.shape == sf_shape
+            and v_sf.shape == sf_shape
             and v_sf.dtype == k_sf.dtype
-            and v_sf.stride() == k_sf.stride(),
-            f"k_sf and v_sf must be float8_e4m3fn views of shape {sf_shape} with the same strides",
-        )
+            and v_sf.stride() == k_sf.stride()
+        ):
+            raise ValueError(
+                f"k_sf and v_sf must be float8_e4m3fn views of shape {sf_shape} with the same strides"
+            )
     else:
         _check(k_sf is None and v_sf is None, "k_sf and v_sf are only taken with NVFP4")
     _check(num_blocks > 0 and page_size > 0, "k_cache must not be empty")
@@ -189,22 +199,21 @@ def qsa_sparse_paged_attention(
     tensors = (q, k_cache, v_cache, k_sf, v_sf, logical_indices, block_table)
     _check(
         all(
-            x is None or x.device == q.device
+            x is None or x.device == device
             for x in (*tensors, token_to_req, output_gate, out)
         ),
         "all tensors must be on the same device",
     )
-    _check_aligned(q, "q", 8)
-    for name, tensor in (
-        ("k_cache", k_cache),
-        ("v_cache", v_cache),
-        ("k_sf", k_sf),
-        ("v_sf", v_sf),
-        ("output_gate", output_gate),
-        ("out", out),
-    ):
-        if tensor is not None:
-            _check_aligned(tensor, name, 16)
+    # v_cache and v_sf share the dtype and strides of k_cache and k_sf.
+    _check_aligned(q, "q", 8, q.stride())
+    _check_aligned(k_cache, "k_cache", 16, k_stride)
+    _check_aligned(v_cache, "v_cache", 16, k_stride)
+    if nvfp4:
+        sf_stride = k_sf.stride()
+        _check_aligned(k_sf, "k_sf", 16, sf_stride)
+        _check_aligned(v_sf, "v_sf", 16, sf_stride)
+    _check_aligned(output_gate, "output_gate", 16, output_gate.stride())
+    _check_aligned(out, "out", 16, out.stride())
     if num_rows == 0:
         return out
 
@@ -214,17 +223,8 @@ def qsa_sparse_paged_attention(
         num_kv_heads,
         num_tiles,
         kv_format,
-        _resident_ctas(q.device.index, kv_format),
+        _resident_ctas(device.index, kv_format),
     )
-    if num_splits > 1:
-        partial_out = q.new_empty(
-            (num_splits, num_rows, num_qo_heads, head_dim), dtype=torch.float32
-        )
-        partial_lse = q.new_empty(
-            (num_splits, num_rows, num_qo_heads), dtype=torch.float32
-        )
-    else:
-        partial_out = partial_lse = out  # not read with a single split
     get_qsa_nvfp4_module().run(
         q,
         k_cache,
@@ -236,8 +236,6 @@ def qsa_sparse_paged_attention(
         token_to_req,
         output_gate,
         out,
-        partial_out,
-        partial_lse,
         float(k_scale) * math.log2(math.e) / math.sqrt(head_dim),
         float(v_scale),
         kv_format,

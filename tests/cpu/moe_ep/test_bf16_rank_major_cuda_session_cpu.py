@@ -81,7 +81,7 @@ def _manifest(module, source: bytes) -> dict:
         )
     return {
         "schema_version": 1,
-        "arch": "sm_100a",
+        "archs": ["sm_100a", "sm_107a"],
         "compile_flags": ["--use_fast_math"],
         "constraints": {
             "activation_dtype": "bfloat16",
@@ -231,7 +231,15 @@ def test_manifest_accepts_only_the_exact_host_contract(tmp_path, monkeypatch):
     ("mutation", "message"),
     (
         (lambda manifest: manifest.update(schema_version=2), "schema must be 1"),
-        (lambda manifest: manifest.update(arch="sm_103a"), "arch must be sm_100a"),
+        (lambda manifest: manifest.update(archs=["sm_100a"]), "archs must be"),
+        (
+            lambda manifest: manifest.update(archs=["sm_100a", "sm_103a"]),
+            "archs must be",
+        ),
+        (
+            lambda manifest: manifest.update(arch="sm_100a", archs=None),
+            "archs must be",
+        ),
         (
             lambda manifest: manifest.update(compile_flags=["-lineinfo"]),
             "compile flags",
@@ -357,6 +365,76 @@ def test_exact_session_coordinate_fails_cleanly_without_cuda(monkeypatch):
             num_experts=256,
             top_k=8,
         )
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("capability", "arch"), (((10, 0), "sm_100a"), ((10, 7), "sm_107a"))
+)
+def test_session_arch_follows_the_device_capability(capability, arch):
+    assert _session_module()._arch_for_capability(capability) == arch
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("capability", ((9, 0), (10, 3), (11, 0), (12, 0)))
+def test_session_rejects_unsupported_capability(capability):
+    with pytest.raises(RuntimeError, match="requires SM100 or SM107"):
+        _session_module()._arch_for_capability(capability)
+
+
+def _patch_compile_env(module, monkeypatch, tmp_path: Path, release: str):
+    """Fake nvcc: ``--version`` prints ``release``; a build writes the -o file."""
+    import flashinfer.jit.env as jit_env
+
+    nvcc = tmp_path / "bin" / "nvcc"
+    commands = []
+
+    def run(command, **kwargs):
+        commands.append(list(command))
+        if command[1:] == ["--version"]:
+            stdout = f"Cuda compilation tools, release {release}, V{release}.0\n"
+            return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+        Path(command[command.index("-o") + 1]).write_bytes(b"cubin")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(module, "_nvcc", lambda: nvcc)
+    monkeypatch.setattr(module.subprocess, "run", run)
+    monkeypatch.setattr(jit_env, "FLASHINFER_JIT_DIR", tmp_path / "jit")
+    return commands
+
+
+@pytest.mark.cpu_only
+def test_cubin_name_command_and_cache_key_carry_the_arch(tmp_path, monkeypatch):
+    module = _session_module()
+    manifest, source_path = _write_bundle(tmp_path, module)
+    commands = _patch_compile_env(module, monkeypatch, tmp_path, "13.4")
+
+    sm100 = module._compile_cubin(source_path, manifest, "sm_100a")
+    sm107 = module._compile_cubin(source_path, manifest, "sm_107a")
+
+    assert sm100.name == "blackwell_bf16_rank_major_sm_100a.cubin"
+    assert sm107.name == "blackwell_bf16_rank_major_sm_107a.cubin"
+    # A JIT directory shared by B200 and R200 nodes keeps one cubin per arch.
+    assert sm100.parent != sm107.parent
+    builds = [command for command in commands if "-cubin" in command]
+    assert [command[2] for command in builds] == ["-arch=sm_100a", "-arch=sm_107a"]
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(("release", "ok"), (("13.0", False), ("13.4", True)))
+def test_sm107a_build_requires_nvcc_13_4(tmp_path, monkeypatch, release, ok):
+    module = _session_module()
+    manifest, source_path = _write_bundle(tmp_path, module)
+    commands = _patch_compile_env(module, monkeypatch, tmp_path, release)
+
+    if ok:
+        module._compile_cubin(source_path, manifest, "sm_107a")
+    else:
+        with pytest.raises(RuntimeError, match=r"sm_107a needs nvcc 13\.4 or newer"):
+            module._compile_cubin(source_path, manifest, "sm_107a")
+        assert not any("-cubin" in command for command in commands)
+    # sm_100a keeps building with any nvcc that the source already required.
+    module._compile_cubin(source_path, manifest, "sm_100a")
 
 
 @pytest.mark.cpu_only

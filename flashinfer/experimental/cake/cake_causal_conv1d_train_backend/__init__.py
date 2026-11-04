@@ -68,8 +68,16 @@ Host design (the knobs are keywords; no environment variable):
   (``workspace=``, from :func:`cake_causal_conv1d_train_backward_workspace`,
   which returns it zeroed) serves every later backward call of one stream;
   when omitted the package keeps one zeroed buffer per (device, current
-  stream), grown as needed and never zeroed again, and inside a CUDA Graph
-  capture an omitted workspace is a fresh zeroed buffer of the call's own.
+  stream), grown as needed and never zeroed again.  Inside a CUDA Graph
+  capture with a nonzero CUDA capture id (``cudaStreamGetCaptureInfo``) an
+  omitted workspace is a zeroed buffer of that capture and stream: the
+  capture's first backward call on the stream zeroes it (one fill node) and
+  its later calls on that stream reuse it; a call that needs more bytes
+  zeroes a larger one (another fill node) that replaces it.  No eager call
+  and no other capture shares it.  The buffer stays alive after its graph is
+  freed, until a later capture on that stream replaces it.  When the capture
+  id is 0 (also when ``cuda.bindings`` is not importable), every captured
+  backward call allocates and zeroes a buffer of its own.
   Its size depends on ``C`` (and the route), not on ``S``.  Two backward
   launches that may run at once (two streams, two graphs replayed
   concurrently) need two buffers: never share one between them.
@@ -82,8 +90,23 @@ Host design (the knobs are keywords; no environment variable):
   wraps after that many CTAs), so ``dx`` keeps its bits and more CTAs add into
   the same accumulators.  The workspace does not grow with it (one accumulator
   set and one counter per channel tile, whatever the grid).
+- Backward grid beside a concurrent kernel (FlashInfer issue #8365): on the
+  ``bwd`` and ``bwd_fp32g`` routes at ``bwd_grid_mult`` 1, a launch of exactly
+  ``ctas_per_sm x SM count`` CTAs whose last channel-tile rank holds at least
+  ``ctas_per_sm`` CTAs launches ``ctas_per_sm`` fewer (:func:`_one_sm_trim`),
+  so a kernel on another stream that keeps one SM's shared memory does not
+  push the top CTAs, each with a whole token stream, into a second wave.
+  ``dx`` keeps its bits (the partition is read from ``gridDim.x``, as above).
 - The forward workspace (int32 token-chunk counters) follows the det
   package's rules.
+- Host plan: the first call of a row (architecture, route, ``C``, device,
+  ``bwd_grid_mult``) selects its program, splits ``C`` into channel tiles,
+  reads the row's ``TILE_OVERRIDES`` entry and sizes the grid
+  (``cake_jit.plan_row``); later calls of the row only compare ``S`` with the
+  override's token range (and size the grid where ``launch_grid`` trims it
+  by ``S``), so they launch the values a per-call plan gives.  A row whose
+  program selection reads ``S`` plans every call.  :func:`plan_cache_clear`
+  drops the rows.
 """
 
 from __future__ import annotations
@@ -141,6 +164,17 @@ _FORWARD_WORKSPACES: dict[tuple[int, int], torch.Tensor] = {}
 # ticket counters, grown as needed.  Every launch leaves its accumulators and
 # counters zero, so the stream's buffer serves every later backward call on it.
 _BACKWARD_WORKSPACES: dict[tuple[int, int], torch.Tensor] = {}
+# The backward workspaces of the calls that pass none inside a CUDA Graph capture:
+# (device index, capture stream handle) -> (CUDA capture id, zeroed uint8 buffer).
+# The capture's first such call on the stream zeroes the buffer (a fill node);
+# every launch leaves it zero and the stream orders the launches, so the later
+# calls of the same capture and stream reuse it.  A call that needs more bytes
+# zeroes a larger buffer (another fill node) that replaces the entry.  Another
+# capture (another id) replaces the entry with its own buffer; until then the
+# entry keeps the buffer alive, also after its graph is freed.  A call whose
+# capture id is 0 (no ``cuda.bindings``) adds no entry: it zeroes a buffer of
+# its own.
+_CAPTURE_WORKSPACES: dict[tuple[int, int], tuple[int, torch.Tensor]] = {}
 # The byte layout of a backward launch per accumulator rule, C and channel tile count (a pure function of them),
 # computed once: it is on the host path of every backward call before its launch.
 _LAYOUTS: dict[tuple, dict] = {}
@@ -153,6 +187,16 @@ _LAYOUTS: dict[tuple, dict] = {}
 # equality on every lookup); an entry only serves the workspace its weak reference still names, and the reference's
 # callback drops the entry when the workspace dies.
 _ACCUMULATOR_VIEWS: dict[int, tuple[weakref.ref, dict]] = {}
+# The host plan of each call row, planned by the row's first call: ``(arch, route kind, C, device index,
+# bwd_grid_mult) -> (cake_jit.RowPlan or None, {n_ch_tiles: the forward's counter words or the backward's accumulator
+# layout})``.  Selecting the route's program, splitting C into channel tiles, looking up the TILE_OVERRIDES row and
+# sizing the grid cost several us of host time in front of every launch; with the row's plan a call only compares
+# ``S`` with the override's token range (``cake_jit.row_launch``).  A row whose program selection reads ``S``
+# (``cake_jit.tokens_select``) holds ``None`` and plans every call.  At most ``_ROW_PLANS_MAX`` rows (then emptied);
+# :func:`plan_cache_clear` empties it (needed after a change of the registry tables, the SM count or the
+# architecture a device reports, which the rows were planned from).
+_ROW_PLANS: dict[tuple, tuple[Optional[_loader.RowPlan], dict]] = {}
+_ROW_PLANS_MAX = 1024
 # The torch dtype of each accumulator / counter dtype name of a workspace rule.
 _TORCH_DTYPES = {
     "float32": torch.float32,
@@ -476,6 +520,7 @@ def _launch(
     num_docs: int,
     *,
     device_index: int,
+    arch: str,
     bwd_grid_mult: int = 1,
 ) -> tuple[dict[str, int], tuple[int, int, int]]:
     """The kernel scalars and the grid of one launch of ``record`` (the host plan of ``cake_jit``).
@@ -487,7 +532,11 @@ def _launch(
     unwritten.  The caller launches this grid, so a call plans it once.  A
     backward ``bwd_grid_mult`` above 1 launches that many times the record's
     untrimmed grid (``launch_grid`` without the row), never trimmed to whole
-    channel-tile ranks; the scalars do not depend on the grid.
+    channel-tile ranks; the scalars do not depend on the grid.  A backward
+    record's plan takes the device's architecture ``arch`` and the record's
+    route, so a row of ``cake_jit.TILE_OVERRIDES`` runs its narrower channel
+    tiles.  At ``bwd_grid_mult`` 1 the grid is :func:`_one_sm_trim` of the
+    row's ``launch_grid``.
     """
 
     scalars = plan(
@@ -496,17 +545,142 @@ def _launch(
         num_docs,
         geometry=record["grid_rule"]["geometry"],
         role=record["role"],
+        arch=arch,
+        route=_loader.record_route(record, arch),
     )
     if bwd_grid_mult == 1:
-        grid = launch_grid(record, device_index=device_index, C=C, S=S)
+        grid = _one_sm_trim(
+            record,
+            scalars["n_ch_tiles"],
+            launch_grid(record, device_index=device_index, C=C, S=S),
+            device_index=device_index,
+            arch=arch,
+            bwd_grid_mult=1,
+        )
     else:
         grid = (launch_grid(record, device_index=device_index)[0] * bwd_grid_mult, 1, 1)
-    if scalars["n_ch_tiles"] > grid[0]:
+    _check_tiles(C, scalars["n_ch_tiles"], grid)
+    return scalars, grid
+
+
+# The backward routes whose single-wave grid gives up ``ctas_per_sm`` CTAs when its last channel-tile rank holds at
+# least that many (:func:`_one_sm_trim`, issue #8365); the other routes launch the grid of ``launch_grid``.
+_ONE_SM_TRIM_ROUTES: tuple[str, ...] = ("bwd", "bwd_fp32g")
+
+
+def _one_sm_trim(
+    record: dict,
+    n_ch_tiles: int,
+    grid: tuple[int, int, int],
+    *,
+    device_index: int,
+    arch: str,
+    bwd_grid_mult: int,
+) -> tuple[int, int, int]:
+    """``grid`` less ``ctas_per_sm`` CTAs for a backward of a route of ``_ONE_SM_TRIM_ROUTES`` at ``bwd_grid_mult``
+    1 when ``grid`` is the record's untrimmed single wave (``ctas_per_sm x SM count``, ``grid_mult`` 1) and its last
+    channel-tile rank holds at least ``ctas_per_sm`` CTAs (``grid % n_ch_tiles >= ctas_per_sm``); else ``grid``.
+    The grid then fits on one SM fewer: a kernel on another stream that keeps one SM's shared memory leaves the
+    launch one wave.  A grid ``launch_grid`` already trimmed to whole ranks is unchanged."""
+
+    rule = record["grid_rule"]
+    if (
+        bwd_grid_mult != 1
+        or rule["kind"] != "occupancy"
+        or _loader.grid_mult(record, arch) != 1
+        or _loader.record_route(record, arch) not in _ONE_SM_TRIM_ROUTES
+    ):
+        return grid
+    k = int(rule["ctas_per_sm"])
+    full = k * _loader.sm_count(device_index)
+    if int(grid[0]) != full or full % int(n_ch_tiles) < k:
+        return grid
+    return (full - k, int(grid[1]), int(grid[2]))
+
+
+def _check_tiles(C: int, n_ch_tiles: int, grid: tuple[int, int, int]) -> None:
+    """Refuse a launch whose ``grid`` has fewer CTAs than ``C``'s ``n_ch_tiles`` channel tiles (``ValueError``)."""
+
+    if n_ch_tiles > grid[0]:
         raise ValueError(
-            f"C={C} spans {scalars['n_ch_tiles']} channel tiles but the launch grid on this "
+            f"C={C} spans {n_ch_tiles} channel tiles but the launch grid on this "
             f"device is {grid[0]} CTAs; every channel tile needs a CTA"
         )
-    return scalars, grid
+
+
+def _route_needs(policy: Optional[str]) -> str:
+    """What a call needs, for the error of a route the architecture lacks: the forward's (``policy`` ``None``) or
+    the backward's."""
+
+    if policy is None:
+        return "this forward (bias / BF16 taps)"
+    return f"this backward (bias / BF16 taps or dweight / silu_grad_preactivation={policy!r})"
+
+
+def _call_plan(
+    arch: str,
+    kind: str,
+    S: int,
+    C: int,
+    num_docs: int,
+    *,
+    device_index: int,
+    policy: Optional[str] = None,
+    bwd_grid_mult: int = 1,
+) -> tuple[tuple[str, ...], dict, dict[str, int], tuple[int, int, int], dict]:
+    """``(names, record, scalars, grid, per_tiles)`` of one call of route ``kind``: the programs :func:`_route`
+    selects, the first one's record, the :data:`cake_jit.PLAN_SCALARS` and the grid :func:`_launch` plans (same
+    values, same errors), from the call's ``_ROW_PLANS`` row; ``per_tiles`` is the row's dict for the host values
+    of each channel tile count (empty and not kept for a row planned per call).  ``policy`` is the backward's
+    ``silu_grad_preactivation`` (``None`` for the forward) and only names the route in an error."""
+
+    key = (arch, kind, C, device_index, bwd_grid_mult)
+    hit = _ROW_PLANS.get(key)
+    if hit is None:
+        # A missing route or a registry error raises as in a per-call plan.
+        _route(arch, kind, needs=_route_needs(policy), C=C, S=S)
+        row = _loader.plan_row(
+            arch, kind, C, device_index=device_index, bwd_grid_mult=bwd_grid_mult
+        )
+        if len(_ROW_PLANS) >= _ROW_PLANS_MAX:
+            _ROW_PLANS.clear()
+        hit = _ROW_PLANS[key] = (row, {})
+    row, per_tiles = hit
+    if row is None:
+        names = _route(arch, kind, needs=_route_needs(policy), C=C, S=S)
+        record = _loader.MODULES[names[0]]
+        scalars, grid = _launch(
+            record,
+            S,
+            C,
+            num_docs,
+            device_index=device_index,
+            arch=arch,
+            bwd_grid_mult=bwd_grid_mult,
+        )
+        return names, record, _scalars(scalars), grid, {}
+    scalars, grid = _loader.row_launch(row, S, num_docs, device_index=device_index)
+    grid = _one_sm_trim(
+        row.record,
+        scalars["n_ch_tiles"],
+        grid,
+        device_index=device_index,
+        arch=arch,
+        bwd_grid_mult=bwd_grid_mult,
+    )
+    _check_tiles(C, scalars["n_ch_tiles"], grid)
+    return row.names, row.record, scalars, grid, per_tiles
+
+
+def plan_cache_clear() -> int:
+    """Drop the host plans of the single-rank calls (``_ROW_PLANS``), planned again by the next call of each row;
+    returns the number of rows dropped.  Call it after changing what the rows were planned from: the registry
+    tables of ``cake_jit`` (``MODULES``, ``ROUTES``, ``TILE_OVERRIDES``, the grid-trim tables), its
+    ``sm_count`` or ``device_arch``."""
+
+    n = len(_ROW_PLANS)
+    _ROW_PLANS.clear()
+    return n
 
 
 def _check_shape_args(S: int, C: int) -> tuple[int, int]:
@@ -629,6 +803,23 @@ def _current_stream_handle(device_index: int) -> int:
     if _CURRENT_RAW_STREAM is not None:
         return int(_CURRENT_RAW_STREAM(device_index))
     return int(torch.cuda.current_stream(device_index).cuda_stream)
+
+
+def _capture_id(stream: int) -> int:
+    """CUDA's id of the capture the raw stream ``stream`` takes part in; 0 when it is not capturing or when the CUDA
+    Python bindings are not importable (then every captured backward call zeroes a buffer of its own).  Two captures
+    have distinct ids even on the same stream."""
+
+    try:
+        from cuda.bindings import runtime as cudart
+    except ImportError:
+        return 0
+    info = cudart.cudaStreamGetCaptureInfo(stream)
+    if info[0] != cudart.cudaError_t.cudaSuccess:
+        return 0
+    if info[1] != cudart.cudaStreamCaptureStatus.cudaStreamCaptureStatusActive:
+        return 0
+    return int(info[2])
 
 
 def _forward_work(
@@ -777,16 +968,21 @@ def _backward_accumulators(
     A caller-owned ``workspace`` (1-D uint8, contiguous, 16-byte aligned, on
     ``device``, at least ``layout["total_bytes"]`` bytes, ZERO before its first
     launch: allocate it with :func:`cake_causal_conv1d_train_backward_workspace`)
-    is used as is.  Without one: inside a CUDA Graph capture a fresh zeroed
-    buffer (its zeroing is captured with the launch, so the graph shares no
-    accumulators with eager calls or other graphs); else the zeroed buffer this
+    is used as is.  Without one: inside a CUDA Graph capture with a nonzero
+    capture id the zeroed buffer of that capture and stream
+    (``_CAPTURE_WORKSPACES``: zeroed by the capture's first backward call on
+    the stream, so the graph shares no accumulators with eager calls or other
+    graphs, and reused by its later calls on the stream; a larger zeroed one,
+    another fill node, replaces it when it is too small); inside a capture with
+    capture id 0, a fresh zeroed buffer per call; else the zeroed buffer this
     module keeps for the device and the current stream, replaced by a larger
-    zeroed one when it is too small.  Every launch leaves the bytes it uses
-    zero, so a zeroed buffer stays zero whatever ``C`` or route the next call
-    has.  ``acc`` is a ``float32`` / ``float64`` view of ``layout["acc_elems"]``
-    words at offset 0, ``work`` a ``uint32`` view of ``layout["work_words"]``
-    counters at ``layout["work_offset"]``; both are built once per workspace and
-    layout (``_ACCUMULATOR_VIEWS``), except for the fresh buffer of a capture.
+    zeroed one when it is too small.
+    Every launch leaves the bytes it uses zero, so a zeroed buffer stays zero
+    whatever ``C`` or route the next call has.  ``acc`` is a ``float32`` /
+    ``float64`` view of ``layout["acc_elems"]`` words at offset 0, ``work`` a
+    ``uint32`` view of ``layout["work_words"]`` counters at
+    ``layout["work_offset"]``; both are built once per workspace and layout
+    (``_ACCUMULATOR_VIEWS``), except for the buffers of a capture.
     """
 
     nbytes = int(layout["total_bytes"])
@@ -808,8 +1004,21 @@ def _backward_accumulators(
                 "(a zeroed buffer)"
             )
     elif torch.cuda.is_current_stream_capturing():
-        # a fresh buffer of this capture: plain views, nothing cached
-        ws = torch.zeros(nbytes, dtype=torch.uint8, device=device)
+        # the buffer of this capture and stream: plain views, not cached per layout
+        stream = _current_stream_handle(device_index)
+        capture = _capture_id(stream)
+        held = _CAPTURE_WORKSPACES.get((device_index, stream))
+        if (
+            capture
+            and held is not None
+            and held[0] == capture
+            and held[1].numel() >= nbytes
+        ):
+            ws = held[1]
+        else:
+            ws = torch.zeros(nbytes, dtype=torch.uint8, device=device)
+            if capture:
+                _CAPTURE_WORKSPACES[(device_index, stream)] = (capture, ws)
         work_offset = int(layout["work_offset"])
         acc = ws[: int(layout["acc_bytes"])].view(_TORCH_DTYPES[layout["acc_dtype"]])
         work = ws[work_offset : work_offset + 4 * int(layout["work_words"])].view(
@@ -891,24 +1100,26 @@ def cake_causal_conv1d_train_forward(
     if S == 0:
         return y
     kind = forward_route(bias=b is not None, bf16_taps=w.dtype == torch.bfloat16)
-    names = _route(arch, kind, needs="this forward (bias / BF16 taps)", C=C, S=S)
     device_index = _device_index(device)
-    scalars, grid = _launch(
-        _loader.MODULES[names[0]], S, C, num_docs, device_index=device_index
+    names, _, scalars, grid, per_tiles = _call_plan(
+        arch, kind, S, C, num_docs, device_index=device_index
     )
     values: dict[str, object] = {
         "x": x_flat,
         "w": w,
         "cu": cu,
         "y": y.view(S, C),
-        **_scalars(scalars),
+        **scalars,
         "flags": _flags(w, b=b),
     }
     if b is not None:
         values["b"] = b
-    words = max(
-        counter_words(_loader.MODULES[name], scalars["n_ch_tiles"]) for name in names
-    )
+    n_ch_tiles = scalars["n_ch_tiles"]
+    words = per_tiles.get(n_ch_tiles)
+    if words is None:
+        words = per_tiles[n_ch_tiles] = max(
+            counter_words(_loader.MODULES[name], n_ch_tiles) for name in names
+        )
     work = _forward_work(workspace, words, device=device, device_index=device_index)
     if work is not None:
         values["work"] = work
@@ -959,8 +1170,11 @@ def cake_causal_conv1d_train_backward(
         ticket counters; every launch leaves it zero, so one buffer serves every
         later call of one stream; never share one between two launches that may
         run at once).  When omitted the package uses a zeroed buffer it keeps per
-        (device, current stream), or a fresh zeroed one inside a CUDA Graph
-        capture.
+        (device, current stream), or inside a CUDA Graph capture one zeroed
+        buffer per capture and stream, shared by the capture's backward calls
+        on that stream (one fill node, and another for a larger buffer when a
+        call needs more bytes).  With capture id 0 (also without
+        ``cuda.bindings``) each captured call zeroes a buffer of its own.
     dx, dweight, dbias : torch.Tensor, optional
         Preallocated outputs: BF16 of ``x``'s shape, ``[C, 4]`` and ``[C]``
         (FP32 or BF16 each; the parameter's dtype when omitted), contiguous.
@@ -1044,19 +1258,21 @@ def cake_causal_conv1d_train_backward(
         fp32_grad=policy == "fp32",
         bf16_taps_or_dweight=torch.bfloat16 in (w.dtype, dw_out.dtype),
     )
-    names = _route(
+    device_index = _device_index(device)
+    names, record, scalars, grid, per_tiles = _call_plan(
         arch,
         kind,
-        needs=f"this backward (bias / BF16 taps or dweight / silu_grad_preactivation={policy!r})",
-        C=C,
-        S=S,
+        S,
+        C,
+        num_docs,
+        device_index=device_index,
+        policy=policy,
+        bwd_grid_mult=bwd_grid_mult,
     )
-    record = _loader.MODULES[names[0]]
-    device_index = _device_index(device)
-    scalars, grid = _launch(
-        record, S, C, num_docs, device_index=device_index, bwd_grid_mult=bwd_grid_mult
-    )
-    layout = _accumulator_layout(record, C, scalars["n_ch_tiles"])
+    n_ch_tiles = scalars["n_ch_tiles"]
+    layout = per_tiles.get(n_ch_tiles)
+    if layout is None:
+        layout = per_tiles[n_ch_tiles] = _accumulator_layout(record, C, n_ch_tiles)
     acc, work = _backward_accumulators(
         workspace,
         layout,
@@ -1073,7 +1289,7 @@ def cake_causal_conv1d_train_backward(
         "dw": dw_out,
         "acc": acc,
         "work": work,
-        **_scalars(scalars),
+        **scalars,
         "flags": _flags(w, dw_out, b, db_out),
     }
     if b is not None:
@@ -1201,4 +1417,5 @@ __all__ = [
     "cake_causal_conv1d_train_forward_workspace",
     "cake_causal_conv1d_train_forward_workspace_bytes",
     "is_cake_causal_conv1d_train_supported",
+    "plan_cache_clear",
 ]

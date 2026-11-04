@@ -42,7 +42,7 @@ from ..trace.templates.gemm import (
     svdquant_linear_trace,
 )
 from ..utils import (
-    _get_cache_buf,
+    _get_stream_cache_buf,
     backend_requirement,
     device_support_pdl,
     get_compute_capability,
@@ -460,7 +460,6 @@ def _sm120_nvfp4_svdquant_unfused_runner(enable_pdl: bool):
         torch.bfloat16,
         True,
     )
-    workspace_buffers: dict[torch.device, torch.Tensor] = {}
 
     class Sm120Nvfp4SvdquantUnfusedRunner(TunableRunner):
         def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
@@ -471,14 +470,9 @@ def _sm120_nvfp4_svdquant_unfused_runner(enable_pdl: bool):
             m, k_packed = a.shape
             n = b.shape[0]
             sf_cols = k_packed * 2 // 16
-            workspace_buffer = workspace_buffers.get(a.device)
-            if workspace_buffer is None:
-                workspace_buffer = _get_cache_buf(
-                    "mm_fp4_workspace",
-                    DEFAULT_WORKSPACE_SIZE,
-                    a.device,
-                )
-                workspace_buffers[a.device] = workspace_buffer
+            workspace_buffer = _get_stream_cache_buf(
+                "mm_fp4_workspace", DEFAULT_WORKSPACE_SIZE, a.device
+            )
             return [
                 a,
                 b.T,
@@ -947,7 +941,7 @@ def mm_nvfp4_svdquant(
             enable_pdl,
         )
 
-    workspace_buffer = _get_cache_buf(
+    workspace_buffer = _get_stream_cache_buf(
         "nvfp4_svdquant_gemm_workspace", DEFAULT_WORKSPACE_SIZE, a.device
     )
 

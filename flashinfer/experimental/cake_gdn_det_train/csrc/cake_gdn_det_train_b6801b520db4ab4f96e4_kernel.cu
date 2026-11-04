@@ -47,40 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define SMEM_S_KN_OFF 0
-#define SMEM_S_KN_STAGE_BYTES 16384
-#define SMEM_S_KN_STRIDE 65536
-#define SMEM_S_QN_OFF 16384
-#define SMEM_S_QN_STAGE_BYTES 16384
-#define SMEM_S_QN_STRIDE 65536
-#define SMEM_S_W_OFF 32768
-#define SMEM_S_W_STAGE_BYTES 16384
-#define SMEM_S_W_STRIDE 65536
-#define SMEM_S_DO_OFF 49152
-#define SMEM_S_DO_STAGE_BYTES 8192
-#define SMEM_S_DO_STRIDE 65536
-#define SMEM_S_DVL_OFF 57344
-#define SMEM_S_DVL_STAGE_BYTES 8192
-#define SMEM_S_DVL_STRIDE 65536
-#define SMEM_S_G_OFF 131072
-#define SMEM_S_G_STAGE_BYTES 512
-#define SMEM_S_G_STRIDE 512
-#define SMEM_S_GAIN_OFF 131584
-#define SMEM_S_GAIN_STAGE_BYTES 512
-#define SMEM_S_GAIN_STRIDE 512
-#define SMEM_S_STAGE_OFF 132096
-#define SMEM_S_STAGE_STAGE_BYTES 16384
-#define SMEM_S_STAGE_STRIDE 16384
-#define SMEM_S_RED_OFF 148480
-#define SMEM_S_RED_STAGE_BYTES 32
-#define SMEM_S_RED_STRIDE 32
-#define SMEM_S_ST_OFF 149504
-#define SMEM_S_ST_STAGE_BYTES 8192
-#define SMEM_S_ST_STRIDE 8192
-#define SMEM_TOTAL 157696
-#define THREADS 128
-
 #include <math_constants.h>
 
 __device__ __forceinline__ float approx_exp2(float x) {

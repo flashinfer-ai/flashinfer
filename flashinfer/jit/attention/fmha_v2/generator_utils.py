@@ -3745,6 +3745,9 @@ extern uint32_t cubin_fmha_v2_flash_attention_fp16_64_128_S_q_paged_kv_128_sm80_
 
 
 def generate_files(specs_names: list[tuple[kernel_spec, str, str, str]]) -> None:
+    from flashinfer.jit import env as jit_env
+    from flashinfer.jit.cpp_ext import get_cccl_includes
+
     kfiles = []
     valid_specs_names = []
 
@@ -3793,6 +3796,9 @@ def generate_files(specs_names: list[tuple[kernel_spec, str, str, str]]) -> None
     else:
         cmd += ["-Xcompiler", "-Wno-enum-compare", "--std=c++17"]
     cmd += ["-o", "bin/print_traits.exe", "generated/print_kernel_traits.cu"]
+    # The trait headers include flashinfer/math.cuh, including vendored CCCL headers.
+    for include_dir in [*get_cccl_includes(), jit_env.FLASHINFER_INCLUDE_DIR]:
+        cmd.extend(["-I", str(include_dir.resolve())])
     if "CUDA_PATH" in os.environ:
         cmd[0] = os.environ["CUDA_PATH"] + "/bin/" + cmd[0]
     # print('Running command "{}" to build "bin/print_traits.exe":'.format(" ".join(cmd)))

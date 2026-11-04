@@ -44,8 +44,10 @@ Measures (on every rank; a row reports the slowest rank and the JSON keeps every
   ``cudaGetDevice``).  The exchange's NCCL kernels are in the span, so a rank's span includes its wait for its
   peers; a host-bound phase (the autograd host time above its kernels' time) also puts host gaps in it;
 * ``ahead_us``: the GPU time with the host enqueue hidden: after a barrier and an L2 flush, a spin kernel of the same
-  length on every rank runs while the host enqueues the phase behind it; CUDA events around the phase
-  (``ahead_late`` counts the samples whose enqueue outlasted the spin; 0 expected);
+  length on every rank runs while the host enqueues the phase behind it, then a one-element ``all_reduce`` on the
+  stream aligns the ranks (every rank's start event fires when that collective ends, so a rank's span does not count
+  how much earlier than its slowest peer its spin ended); CUDA events around the phase (``ahead_late`` counts the
+  samples whose enqueue outlasted the spin; 0 expected).  One spin length per round serves every arm and phase;
 * ``wall_us``: the synchronized wall time of one call (barrier, ``perf_counter``, the call, device synchronize; the
   slowest rank per sample, the halo exchange included) and ``host_us``: the time to enqueue it;
 * ``first`` / ``steady``: the first call of the phase after the packages' workspace caches are cleared (workspace
@@ -56,13 +58,16 @@ Measures (on every rank; a row reports the slowest rank and the JSON keeps every
 * ``halo``: per rank, the bytes one call sends and receives in each halo exchange (``ckpt`` runs the forward
   exchange twice).
 
-The timings interleave the modes: ``--rounds`` rounds, each timing every phase of both modes (det first in even
-rounds, nondet first in odd ones).  Each value is the median over the rounds of the round's value, with its
-``[min, max]`` over the rounds; ``speedup`` is ``det / nondet`` of the medians (above 1: the non-deterministic mode
-is faster), ``speedup_range`` the ``[min, max]`` of the per-round ratios.  A check per row on every rank (exit
-status 1 when it fails): the non-deterministic ``y`` and ``dx`` are bitwise the deterministic ones and each
-``dweight`` partial is within ``5e-2 + 1e-4 |det|`` of the deterministic partial.  Rank 0 prints the rows and writes
-``--json``.
+The timings interleave the modes: ``--rounds`` rounds, each timing every phase of both modes and of every baseline.
+The arm list is ``det``, ``nondet``, then the baselines that can run the row (``n`` arms).  Round ``i`` (from 0) runs
+it rotated left by ``i mod n`` arms and reversed when ``i // n`` is odd, so in every block of ``n`` rounds (rounds
+``k n`` to ``k n + n - 1``) each arm leads once and runs last once, for any ``n``; with ``n = 2`` the rounds are led
+by ``det``, ``nondet``, ``nondet``, ``det``, ...  Each row's ``round_orders`` lists the arm order of every round.
+Each value is the median over the rounds of the round's value, with its ``[min, max]`` over the rounds; ``speedup`` is
+``det / nondet`` of the medians (above 1: the non-deterministic mode is faster), ``speedup_range`` the ``[min, max]``
+of the per-round ratios.  A check per row on every rank (exit status 1 when it fails): the non-deterministic ``y`` and
+``dx`` are bitwise the deterministic ones and each ``dweight`` partial is within ``5e-2 + 1e-4 |det|`` of the
+deterministic partial.  Rank 0 prints the rows and writes ``--json``.
 
 Non-Cake context-parallel baselines (``--sota``, default ``all``; ``cake_causal_conv1d_baselines.py``):
 flash-linear-attention's ``causal_conv1d`` with its ``cp_context`` on the Triton (``fla_cp_triton``) and CUDA
@@ -131,7 +136,7 @@ LAYOUTS = ("contiguous", "zigzag", "zigzag_per_document")
 MODES = {"det": True, "nondet": False}
 PHASES = ("fwd", "bwd", "ckpt")
 KINDS = ("gpu", "ahead", "wall", "host")
-ROUNDS = 7
+ROUNDS = 21
 GPU_WARMUPS = 3
 GPU_SAMPLES = 10
 WALL_WARMUPS = 3
@@ -243,6 +248,7 @@ class _GpuAhead:
         self.flush = torch.empty(2 * l2_bytes, dtype=torch.int8, device=device)
         self.start = torch.cuda.Event(enable_timing=True)
         self.end = torch.cuda.Event(enable_timing=True)
+        self.align = torch.zeros(1, dtype=torch.float32, device=device)
         probe = 1_000_000
         spins = []
         for _ in range(3):
@@ -259,6 +265,10 @@ class _GpuAhead:
         dist.barrier()
         self.flush.zero_()
         torch.cuda._sleep(int(spin_ms * self.cycles_per_ms))
+        if dist.get_world_size() > 1:
+            # Stream-ordered: the start event fires on every rank when this collective ends, whatever the ranks' spin
+            # skew (barrier release, per-GPU clocks), which the span would otherwise count on the earlier ranks.
+            dist.all_reduce(self.align)
         self.start.record()
         t0 = time.perf_counter()
         fn()
@@ -267,13 +277,24 @@ class _GpuAhead:
         torch.cuda.synchronize(self.device)
         return self.start.elapsed_time(self.end), enqueue_ms
 
-    def __call__(self, fn: Callable[[], object]) -> tuple[float, int]:
-        """``(median_ms, late)`` of this rank: ``late`` counts the samples whose enqueue outlasted the spin."""
+    def spin_for(self, fns: list[Callable[[], object]]) -> float:
+        """The spin (ms) of a round: ``AHEAD_ENQUEUE_FACTOR`` times the longest enqueue of any of ``fns`` on any rank
+        while warming up (at least ``AHEAD_MIN_MS``), so every arm and phase of the round runs behind the same spin."""
 
-        enqueues = [self._sample(fn, AHEAD_MIN_MS)[1] for _ in range(AHEAD_WARMUPS)]
+        enqueues = [
+            self._sample(fn, AHEAD_MIN_MS)[1]
+            for fn in fns
+            for _ in range(AHEAD_WARMUPS)
+        ]
         (spin_ms,) = _max_over_ranks(
             [max(AHEAD_MIN_MS, AHEAD_ENQUEUE_FACTOR * max(enqueues))], self.device
         )
+        return spin_ms
+
+    def __call__(self, fn: Callable[[], object], spin_ms: float) -> tuple[float, int]:
+        """``(median_ms, late)`` of this rank behind a ``spin_ms`` spin: ``late`` counts the samples whose enqueue
+        outlasted the spin."""
+
         times, late = [], 0
         for _ in range(AHEAD_SAMPLES):
             elapsed, enqueue_ms = self._sample(fn, spin_ms)
@@ -615,6 +636,7 @@ def bench_row(
         "tokens_local": _gather(p.tokens_local),
         "halo": _gather(p.halo),
         "rounds": args.rounds,
+        "round_orders": [],
         "modes": {},
     }
     # One untimed pass per mode: the JIT loads and the first exchanges.
@@ -641,7 +663,7 @@ def bench_row(
                 }[phase]
                 entries[mode][f"{phase}_{when}"] = _probe(probe, device)
     sota_entries, sota_calls = _baselines(p, args, rank, world, device)
-    # Interleaved rounds: every phase of both modes and of every baseline per round, the order alternating.
+    # Interleaved rounds: every phase of both modes and of every baseline per round, in the balanced arm order below.
     timed = {mode: _calls(p, deterministic) for mode, deterministic in MODES.items()}
     for calls in timed.values():
         calls["record"]()
@@ -656,13 +678,23 @@ def bench_row(
         for mode in timed
     }
     late = {mode: 0 for mode in timed}
-    order = list(timed)
+    arms = list(timed)
     for index in range(args.rounds):
-        for mode in order if index % 2 == 0 else order[::-1]:
+        # The arm list rotated left by i % n arms, reversed when i // n is odd: each block of n rounds has
+        # every arm lead once and run last once (n = 2: det, nondet, nondet, det, ...).
+        shift = index % len(arms)
+        order = arms[shift:] + arms[:shift]
+        if (index // len(arms)) % 2:
+            order.reverse()
+        result["round_orders"].append(list(order))
+        spin_ms = ahead.spin_for(
+            [timed[mode][phase] for mode in order for phase in PHASES]
+        )
+        for mode in order:
             calls = timed[mode]
             for phase in PHASES:
                 gpu = _gpu_ms(calls[phase])
-                ahead_ms, ahead_late = ahead(calls[phase])
+                ahead_ms, ahead_late = ahead(calls[phase], spin_ms)
                 aheads = _gather(ahead_ms)
                 late[mode] += sum(_gather(ahead_late))
                 wall, host = _wall_ms(calls[phase], device)

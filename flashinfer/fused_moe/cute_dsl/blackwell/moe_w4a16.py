@@ -20,6 +20,7 @@ from flashinfer.fused_moe.cute_dsl.moe_utils import (
     get_max_num_permuted_tokens,
     moe_output_memset_inplace,
     moe_sort,
+    W4A16_CUTE_DSL_MOE_ACTIVATION_TYPES,
     normalize_cute_dsl_moe_activation_type,
     validate_cute_dsl_moe_situ_config,
 )
@@ -386,7 +387,9 @@ def launch_w4a16_moe(
     """Run BF16 activations against online-decoded NVFP4 expert weights."""
     top_k = int(token_selected_experts.size(1))
     intermediate_size = int(w2_weight.size(2)) * 2
-    activation_type, gated = normalize_cute_dsl_moe_activation_type(activation_type)
+    activation_type, gated = normalize_cute_dsl_moe_activation_type(
+        activation_type, W4A16_CUTE_DSL_MOE_ACTIVATION_TYPES, backend="W4A16"
+    )
     validate_cute_dsl_moe_situ_config(activation_type, situ_beta, situ_linear_beta)
     gemm1_output_size = intermediate_size * (2 if gated else 1)
     if int(w1_weight.size(1)) != gemm1_output_size:

@@ -41,7 +41,12 @@ reductions; the last CTA of each channel tile (a ticket on its ``work``
 counter) stores the rank-local FP32 ``dweight`` partial and zeroes the tile's
 accumulators and counter.  ``acc`` / ``work`` are the package's cached
 backward workspace of the device and current stream (zero before and after
-every launch; a fresh zeroed buffer inside a CUDA Graph capture).
+every launch; inside a CUDA Graph capture with a nonzero capture id one zeroed
+buffer per capture and stream, shared by the capture's backward calls on that
+stream, with another fill node when a call needs a larger buffer, and kept
+alive after its graph is freed until a later capture on that stream replaces
+it; with capture id 0, also without ``cuda.bindings``, each captured call
+zeroes a buffer of its own).
 
 Numerics: ``y`` and ``hist`` are the det KCP forward's bits; ``dx`` is the det
 KCP backward's bits (same per-thread FP32 steps, same tail fold, one BF16
@@ -73,6 +78,25 @@ kernel launches run as before with the same arguments on the same stream, so
 no bit changes; a replayed graph (``graph="replay"``) contains no host work.
 ``_set_test_knobs({"host_trim": 0})`` (with ``CAKE_KCP_TEST_KNOBS=1``) selects
 the previous host path for the A/B record.
+
+Backward grid beside a concurrent kernel (FlashInfer issue #8365): the main
+backward launches :func:`_bwd_grid`, ``ctas_per_sm x SM count`` CTAs less
+``ctas_per_sm`` when the last channel-tile rank of that grid holds at least
+``ctas_per_sm`` CTAs.  A kernel on another stream that keeps one SM's shared
+memory leaves room for ``ctas_per_sm`` fewer CTAs; with the full grid the top
+CTAs, each carrying a whole token stream, then run in a second wave.  The
+program derives its token streams and ticket count from ``gridDim``, so ``dx``
+keeps its bits and ``dweight`` sums the same terms in other partial sums.
+
+Opt-in SM reserve of the main backward (keyword ``bwd_reserve_sms``, default
+``None`` = ``RESERVE_DEFAULT`` = 0, the grid above): ``bwd_reserve_sms=K >= 1``
+launches the single-wave grid less ``K x ctas_per_sm`` CTAs, whatever the last
+channel-tile rank holds, so ``K`` SMs held by kernels of other streams leave the
+backward one wave.  It changes the launch grid only (same programs, ``dx``
+bitwise, ``dweight`` within the same budget); the host cache and graph keys hold
+``K``.  A multi-wave grid (``grid_mult`` > 1) launches unchanged.  On sm_107a
+``K >= 1`` raises ``ValueError`` (:data:`RESERVE_UNSUPPORTED`): there the reserved
+grid costs up to 1.055x the shipped grid unloaded (C 1024, 62585 tokens).
 
 Checkpoint recompute without the halo exchange (FlashInfer issues #7815 /
 #7818): with ``recompute_handle=`` (:class:`RecomputeHandleKcp`, or any object
@@ -449,6 +473,8 @@ HOST_TRIM_DEFAULT = (
     1  # shipped; 0 = the previous path, via _set_test_knobs({"host_trim": 0}) only
 )
 _TEST_KNOBS: dict[str, Any] = {"graph": "off", "host_trim": HOST_TRIM_DEFAULT}
+# The opt-in SM reserve of the main backward (keyword ``bwd_reserve_sms``): 0 = the grid of :func:`_bwd_grid`.
+RESERVE_DEFAULT = 0
 GRAPH_STATS: dict[str, int] = {"eager": 0, "capture": 0, "replay": 0, "fallback": 0}
 GRAPH_CACHE_MAX = 64
 LAST_CALL: dict[str, dict[str, Any]] = {}
@@ -549,6 +575,92 @@ def _launch_trim(
         getattr(module, entry)(*args)
 
 
+def _bwd_grid(
+    record: dict[str, Any],
+    n_ch_tiles: int,
+    device_index: int,
+    reserve: int = RESERVE_DEFAULT,
+) -> tuple[int, int, int]:
+    """The main backward program's launch grid (issue #8365): :func:`launch_grid` of ``record`` on the device, less
+    ``ctas_per_sm`` CTAs when that grid is a single wave (``grid_mult`` 1) whose last channel-tile rank holds at
+    least ``ctas_per_sm`` CTAs (``grid % n_ch_tiles >= ctas_per_sm``), so the grid fits on one SM fewer; any other
+    grid launches unchanged.  The trimmed grid keeps every channel tile's CTAs but one rank's worth at most.
+
+    ``reserve`` (``bwd_reserve_sms``) ``K >= 1``: a single-wave grid less ``K x ctas_per_sm`` CTAs (``ValueError``
+    when fewer CTAs than channel tiles remain); a multi-wave grid launches unchanged."""
+    grid = launch_grid(record, device_index=device_index)
+    rule = record["grid_rule"]
+    k = int(rule["ctas_per_sm"])
+    single_wave = int(rule["grid_mult"][_loader.device_arch(device_index)]) == 1
+    if reserve and single_wave:
+        reserved = grid[0] - int(reserve) * k
+        if reserved < max(1, int(n_ch_tiles)):
+            raise ValueError(
+                f"bwd_reserve_sms={reserve} leaves {reserved} CTAs of the backward grid {grid[0]}; "
+                f"{int(n_ch_tiles)} channel tiles need at least {max(1, int(n_ch_tiles))}"
+            )
+        return (reserved, grid[1], grid[2])
+    if single_wave and grid[0] % int(n_ch_tiles) >= k:
+        return (grid[0] - k, grid[1], grid[2])
+    return grid
+
+
+def _ordinary_launch(cooperative: Any, entry: str) -> None:
+    """Validate ``cooperative`` of a call: ``None`` or ``False`` (the main backward is one ordinary launch);
+    ``ValueError`` for ``True``, ``TypeError`` for a non-``bool``."""
+    if cooperative is None:
+        return
+    if not isinstance(cooperative, bool):
+        raise TypeError(
+            f"{entry}: cooperative must be None or a bool, got {type(cooperative).__name__}"
+        )
+    if cooperative:
+        raise ValueError(
+            f"{entry}: cooperative=True applies to deterministic=True only; the non-deterministic main backward "
+            "is one ordinary launch (pass cooperative=None or False)"
+        )
+
+
+def _reserve(value: Any, entry: str) -> int:
+    """``bwd_reserve_sms`` of a call: ``None`` -> ``RESERVE_DEFAULT``; else a non-negative ``int`` (``TypeError`` for a
+    ``bool`` or a non-``int``, ``ValueError`` below zero)."""
+    if value is None:
+        return RESERVE_DEFAULT
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(
+            f"{entry}: bwd_reserve_sms must be an int or None, got {type(value).__name__}"
+        )
+    if value < 0:
+        raise ValueError(f"{entry}: bwd_reserve_sms must be >= 0, got {value}")
+    return int(value)
+
+
+# Architectures where ``bwd_reserve_sms >= 1`` is refused, with the reason.
+RESERVE_UNSUPPORTED = {
+    "sm_107a": (
+        "the reserved backward grid costs up to 1.055x the shipped grid unloaded there "
+        "(C=1024, 62585 tokens), above the 1.040 limit of this opt-in"
+    ),
+}
+
+
+def _reserve_fits(reserve: int, x: Any, entry: str) -> None:
+    """``ValueError`` when ``reserve >= 1`` on an architecture of :data:`RESERVE_UNSUPPORTED`, or when ``reserve``
+    SMs are not fewer than the SMs of ``x``'s device (checked at the call, before the forward)."""
+    if reserve and isinstance(x, torch.Tensor) and x.is_cuda:
+        arch = _device_arch(x.device)
+        if arch in RESERVE_UNSUPPORTED:
+            raise ValueError(
+                f"{entry}: bwd_reserve_sms={reserve} is not supported on {arch}: "
+                f"{RESERVE_UNSUPPORTED[arch]}; pass bwd_reserve_sms=None"
+            )
+        sms = int(torch.cuda.get_device_properties(x.device).multi_processor_count)
+        if reserve >= sms:
+            raise ValueError(
+                f"{entry}: bwd_reserve_sms={reserve} must be smaller than the device's {sms} SMs"
+            )
+
+
 def _set_test_knobs(knobs: Optional[dict]) -> dict:
     """Set the module's private test knobs (``graph``: ``"off"`` shipped | ``"replay"``; ``host_trim``: ``1`` shipped =
     the trimmed host path of the eager call | ``0`` the previous host path); a knob
@@ -629,10 +741,15 @@ def _sig(t: Any) -> tuple:
 
 
 def _graph_entry(
-    kind: str, ctx: Any, tensors: tuple, mode: Optional[str] = None
+    kind: str,
+    ctx: Any,
+    tensors: tuple,
+    mode: Optional[str] = None,
+    extra: tuple = (),
 ) -> Optional[_GraphEntry]:
     """The cache entry of this call's validity key, or ``None`` when the call is never captured (mode off, no tokens);
-    ``mode`` = the effective graph mode (:func:`_graph_mode`), ``None`` = the knob."""
+    ``mode`` = the effective graph mode (:func:`_graph_mode`), ``None`` = the knob; ``extra`` = further host values
+    of the key (the backward's ``bwd_reserve_sms`` when not the default)."""
     if (
         (_TEST_KNOBS["graph"] if mode is None else mode) == "off"
         or int(getattr(ctx, "T_r", 0)) == 0
@@ -640,6 +757,8 @@ def _graph_entry(
     ):
         return None
     key = (kind, id(ctx), int(ctx.world_size), tuple(_sig(t) for t in tensors))
+    if extra:
+        key += tuple(extra)
     e = _GRAPHS.get(key)
     if e is None:
         while len(_GRAPHS) >= GRAPH_CACHE_MAX:
@@ -956,6 +1075,7 @@ def cake_causal_conv1d_backward_kcp(
     dweight: Optional[torch.Tensor] = None,
     graph: Optional[str] = None,
     deterministic: bool = True,
+    bwd_reserve_sms: Optional[int] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     r"""The KCP backward: ``dx`` of the rank's fragments (the halo contributions of the successor fragments folded in
     before the one BF16 rounding; the det KCP backward's bits) and the rank's FP32 ``dweight`` partial (summed across
@@ -969,10 +1089,24 @@ def cake_causal_conv1d_backward_kcp(
     ``torch.use_deterministic_algorithms(True)`` the call raises a ``RuntimeError`` (a ``UserWarning`` with
     ``warn_only=True``) before it launches or exchanges anything.  Preallocated outputs: ``dx`` BF16 of
     ``x_local``'s shape and ``dweight`` FP32 ``[C, 4]``, contiguous; ``dweight`` must be 16-byte aligned (one
-    16-byte store per channel; ``ValueError`` otherwise).
+    16-byte store per channel; ``ValueError`` otherwise).  ``bwd_reserve_sms`` (``None`` = ``RESERVE_DEFAULT``):
+    the main backward's grid gives up that many SMs (:func:`_bwd_grid`); the graph key holds it.  ``ValueError`` for
+    ``K >= 1`` on sm_107a (:data:`RESERVE_UNSUPPORTED`) or at the device's SM count or above.
     """
 
     _require_nondeterministic(deterministic, "cake_causal_conv1d_backward_kcp")
+    if bwd_reserve_sms is not None:
+        return _backward_kcp_given(
+            x_local,
+            weight,
+            ctx,
+            dy,
+            hist,
+            dx=dx,
+            dweight=dweight,
+            graph=graph,
+            bwd_reserve_sms=bwd_reserve_sms,
+        )
     _alert_nondeterministic("cake_causal_conv1d_backward_kcp")
     mode = _graph_mode(graph)
     if mode == "off":
@@ -989,6 +1123,48 @@ def cake_causal_conv1d_backward_kcp(
     )
 
 
+def _backward_kcp_given(
+    x_local: torch.Tensor,
+    weight: torch.Tensor,
+    ctx: Any,
+    dy: torch.Tensor,
+    hist: torch.Tensor,
+    *,
+    dx: Optional[torch.Tensor],
+    dweight: Optional[torch.Tensor],
+    graph: Optional[str],
+    bwd_reserve_sms: Any,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """:func:`cake_causal_conv1d_backward_kcp` with ``bwd_reserve_sms`` given: validated before anything runs, then
+    the backward on the grid of that reserve (0: the shipped grid)."""
+    reserve = _reserve(bwd_reserve_sms, "cake_causal_conv1d_backward_kcp")
+    _reserve_fits(reserve, x_local, "cake_causal_conv1d_backward_kcp")
+    _alert_nondeterministic("cake_causal_conv1d_backward_kcp")
+    mode = _graph_mode(graph)
+    if mode == "off":
+        return _kcp_backward(
+            x_local, weight, ctx, dy, hist, dx=dx, dweight=dweight, reserve=reserve
+        )
+    entry = _graph_entry(
+        "bwd",
+        ctx,
+        (x_local, weight, dy, hist, dx, dweight),
+        mode,
+        extra=(("reserve", reserve),) if reserve else (),
+    )
+    dx_out, dw_out = _graph_run(
+        "bwd",
+        entry,
+        lambda: _kcp_backward(
+            x_local, weight, ctx, dy, hist, dx=dx, dweight=dweight, reserve=reserve
+        ),
+        mode,
+    )
+    return (dx_out if dx is not None else dx_out.detach()), (
+        dw_out if dweight is not None else dw_out.detach()
+    )
+
+
 def _kcp_backward(
     x_local: torch.Tensor,
     weight: torch.Tensor,
@@ -998,6 +1174,7 @@ def _kcp_backward(
     *,
     dx: Optional[torch.Tensor] = None,
     dweight: Optional[torch.Tensor] = None,
+    reserve: int = RESERVE_DEFAULT,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """The backward's host flow (eagerly or inside a capture): see :func:`cake_causal_conv1d_backward_kcp`."""
 
@@ -1007,7 +1184,15 @@ def _kcp_backward(
     _wait_ready(ctx)
     if _TEST_KNOBS["host_trim"] == 1:
         return _kcp_backward_trim(
-            x, weight, ctx, dy, hist, dx=dx, dweight=dweight, device=device
+            x,
+            weight,
+            ctx,
+            dy,
+            hist,
+            dx=dx,
+            dweight=dweight,
+            device=device,
+            reserve=reserve,
         )
     arch = _device_arch(device)
     S, C, x_flat = _tokens(x, "x_local", device=device)
@@ -1125,7 +1310,14 @@ def _kcp_backward(
     if work is not None:
         work.wait()
     for name in names:
-        run_module(name, values, device_index=device_index)
+        run_module(
+            name,
+            values,
+            device_index=device_index,
+            grid=_bwd_grid(
+                _loader.MODULES[name], scalars["n_ch_tiles"], device_index, reserve
+            ),
+        )
     return dx_out, dw_out
 
 
@@ -1139,11 +1331,12 @@ def _bwd_host(
     dx: Optional[torch.Tensor],
     dweight: Optional[torch.Tensor],
     device: torch.device,
+    reserve: int = RESERVE_DEFAULT,
 ) -> tuple[Any, ...]:
     """The trimmed backward's operand checks, outputs and host-cache entry: ``(S, C, x_flat, w, dy_flat, hist_t,
-    dx_out, dw_out, entry)``.  The entry is cached per ``(ctx, S, C, device, cu_seqlens_local_cpu)``: the tables, the
-    head grid, the backward records, plan scalars, the accumulator layout, the loaded modules with their argument
-    plans."""
+    dx_out, dw_out, entry)``.  The entry is cached per ``(ctx, S, C, device, cu_seqlens_local_cpu, reserve)``: the
+    tables, the head grid, the backward records, plan scalars, the accumulator layout, the loaded modules with their
+    argument plans (grids for ``reserve``)."""
 
     S, C, x_flat = _tokens(x, "x_local", device=device)
     w = _weight(weight, C, device=device)
@@ -1169,7 +1362,10 @@ def _bwd_host(
         )
     )
     e = _host_cache_entry(
-        ctx, ("bwd", S, C, str(device), tuple(ctx.cu_seqlens_local_cpu))
+        ctx,
+        ("bwd", S, C, str(device), tuple(ctx.cu_seqlens_local_cpu), reserve)
+        if reserve
+        else ("bwd", S, C, str(device), tuple(ctx.cu_seqlens_local_cpu)),
     )
     if not e:
         arch = _device_arch(device)
@@ -1241,7 +1437,12 @@ def _bwd_host(
             e["launches"] = tuple(
                 _launch_plan(
                     name,
-                    launch_grid(_loader.MODULES[name], device_index=device_index),
+                    _bwd_grid(
+                        _loader.MODULES[name],
+                        scalars["n_ch_tiles"],
+                        device_index,
+                        reserve,
+                    ),
                     device_index,
                 )
                 for name in names
@@ -1343,12 +1544,21 @@ def _kcp_backward_trim(
     dx: Optional[torch.Tensor],
     dweight: Optional[torch.Tensor],
     device: torch.device,
+    reserve: int = RESERVE_DEFAULT,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Trimmed host path: :func:`_kcp_backward` with the context-derived host work cached (:func:`_bwd_host`); the
     operand checks, allocations, exchange, wait and launches are the untrimmed call's."""
 
     S, C, x_flat, w, dy_flat, hist_t, dx_out, dw_out, e = _bwd_host(
-        x, weight, ctx, dy, hist, dx=dx, dweight=dweight, device=device
+        x,
+        weight,
+        ctx,
+        dy,
+        hist,
+        dx=dx,
+        dweight=dweight,
+        device=device,
+        reserve=reserve,
     )
     dpre_head = _bwd_head(e, x_flat, w, dy_flat, hist_t, S=S, C=C, device=device)
     dpre_tail, work = _exchange(
@@ -1438,6 +1648,37 @@ class CakeCausalConv1dFunctionKcp(torch.autograd.Function):
         return dx, dweight, None, None, None, None
 
 
+class _CakeCausalConv1dReserveFunctionKcp(CakeCausalConv1dFunctionKcp):
+    """:class:`CakeCausalConv1dFunctionKcp` with the opt-in SM reserve of the main backward:
+    ``apply(x_local, weight, ctx, graph, handle, deterministic, reserve)``, ``reserve`` the caller's validated
+    ``bwd_reserve_sms >= 1`` (one more input, one more ``None`` gradient)."""
+
+    @staticmethod
+    def forward(fn_ctx, x_local, weight, ctx, graph, handle, deterministic, reserve):
+        fn_ctx.reserve = reserve
+        return CakeCausalConv1dFunctionKcp.forward(
+            fn_ctx, x_local, weight, ctx, graph, handle, deterministic
+        )
+
+    @staticmethod
+    def backward(fn_ctx, grad_y):
+        x_local, weight, hist = fn_ctx.saved_tensors
+        if grad_y is None:
+            grad_y = torch.zeros_like(x_local)
+        dy = grad_y.to(torch.bfloat16).contiguous()
+        dx, dweight = cake_causal_conv1d_backward_kcp(
+            x_local,
+            weight,
+            fn_ctx.kcp,
+            dy,
+            hist,
+            graph=fn_ctx.graph,
+            deterministic=False,
+            bwd_reserve_sms=fn_ctx.reserve,
+        )
+        return dx, dweight, None, None, None, None, None
+
+
 def cake_causal_conv1d_kcp(
     x_local: torch.Tensor,
     weight: torch.Tensor,
@@ -1445,7 +1686,9 @@ def cake_causal_conv1d_kcp(
     *,
     graph: Optional[str] = None,
     recompute_handle: Optional[Any] = None,
+    cooperative: Optional[bool] = None,
     deterministic: bool = True,
+    bwd_reserve_sms: Optional[int] = None,
 ) -> torch.Tensor:
     """Autograd-enabled KCP packed width-4 depthwise causal convolution + SiLU of the rank's fragments, with the
     non-deterministic main backward program (``deterministic=False`` required).
@@ -1481,9 +1724,21 @@ def cake_causal_conv1d_kcp(
         another rank's backward exchange and hangs or corrupts data; no check is made.  Never share one handle
         between two convolution calls (also not in nested regions), and never ``clear()`` or reuse a handle while a
         backward that needs it is pending.
+    cooperative : bool, optional
+        The deterministic package's launch-form keyword, accepted so the dispatching facade takes one parameter
+        list in both modes.  The main backward here is always one ordinary launch, so ``None`` (default) and
+        ``False`` mean the same; ``True`` raises ``ValueError`` and a non-``bool`` ``TypeError``.
     deterministic : bool
         Must be ``False`` (``ValueError`` otherwise): the numerical mode of this package.  Under
         ``torch.use_deterministic_algorithms(True)`` the backward raises (or warns with ``warn_only=True``).
+    bwd_reserve_sms : int, optional
+        ``None`` (default) = ``RESERVE_DEFAULT`` = 0: the backward grid of :func:`_bwd_grid`.  ``K >= 1``: the main
+        backward launches its single-wave grid less ``K x ctas_per_sm`` CTAs, so it stays one wave while kernels of
+        other streams hold up to ``K`` SMs; it costs the unloaded backward the work of ``K`` SMs.  ``y``, ``dx`` and
+        the exchanges are unchanged; ``dweight`` stays within the budget.  ``TypeError`` for a ``bool`` or a
+        non-``int``; ``ValueError`` below zero, at the device's SM count or above, or ``K >= 1`` on sm_107a
+        (:data:`RESERVE_UNSUPPORTED`: the reserved grid is outside the opt-in's unloaded-cost limit there).  The
+        ranks of a group may differ.
 
     Returns
     -------
@@ -1495,10 +1750,47 @@ def cake_causal_conv1d_kcp(
     """
 
     _require_nondeterministic(deterministic, "cake_causal_conv1d_kcp")
+    if cooperative is not None or bwd_reserve_sms is not None:
+        return _kcp_given(
+            x_local,
+            weight,
+            ctx,
+            graph=graph,
+            recompute_handle=recompute_handle,
+            cooperative=cooperative,
+            bwd_reserve_sms=bwd_reserve_sms,
+        )
     _graph_mode(graph)  # validate on the caller's frame
     if recompute_handle is not None:
         _handle_refusals(graph, recompute_handle)
     # Always six inputs: the backward returns six gradients.
+    return CakeCausalConv1dFunctionKcp.apply(
+        x_local, weight, ctx, graph, recompute_handle, False
+    )
+
+
+def _kcp_given(
+    x_local: torch.Tensor,
+    weight: torch.Tensor,
+    ctx: Any,
+    *,
+    graph: Optional[str],
+    recompute_handle: Optional[Any],
+    cooperative: Any,
+    bwd_reserve_sms: Any,
+) -> torch.Tensor:
+    """:func:`cake_causal_conv1d_kcp` with ``cooperative`` or ``bwd_reserve_sms`` given: both validated before
+    anything runs; a reserve of 1 or more runs :class:`_CakeCausalConv1dReserveFunctionKcp`."""
+    _ordinary_launch(cooperative, "cake_causal_conv1d_kcp")
+    reserve = _reserve(bwd_reserve_sms, "cake_causal_conv1d_kcp")
+    _reserve_fits(reserve, x_local, "cake_causal_conv1d_kcp")
+    _graph_mode(graph)  # validate on the caller's frame
+    if recompute_handle is not None:
+        _handle_refusals(graph, recompute_handle)
+    if reserve:
+        return _CakeCausalConv1dReserveFunctionKcp.apply(
+            x_local, weight, ctx, graph, recompute_handle, False, reserve
+        )
     return CakeCausalConv1dFunctionKcp.apply(
         x_local, weight, ctx, graph, recompute_handle, False
     )
@@ -1653,6 +1945,7 @@ def cake_causal_conv1d_multi_backward_kcp(
     dweights: Optional[Any] = None,
     graph: Optional[str] = None,
     deterministic: bool = True,
+    bwd_reserve_sms: Optional[int] = None,
 ) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
     r"""The KCP backward of several convolutions of one layer with one halo exchange: ``(dxs, dweights)``,
     ``cake_causal_conv1d_backward_kcp(xs[i], weights[i], ctx, dys[i], hists[i], deterministic=False)`` per tensor
@@ -1664,9 +1957,22 @@ def cake_causal_conv1d_multi_backward_kcp(
     this function once per layer, in the same order.  ``graph`` as in :func:`cake_causal_conv1d_backward_kcp`.
     ``deterministic`` must be ``False``; under torch's deterministic mode the call alerts like the single backward.
     ``dxs`` / ``dweights`` entries follow the single backward's output rules (``dweight`` 16-byte aligned).
+    ``bwd_reserve_sms`` as in :func:`cake_causal_conv1d_backward_kcp`, for every tensor's main backward.
     """
 
     _require_nondeterministic(deterministic, "cake_causal_conv1d_multi_backward_kcp")
+    if bwd_reserve_sms is not None:
+        return _multi_backward_kcp_given(
+            xs,
+            weights,
+            ctx,
+            dys,
+            hists,
+            dxs=dxs,
+            dweights=dweights,
+            graph=graph,
+            bwd_reserve_sms=bwd_reserve_sms,
+        )
     _alert_nondeterministic("cake_causal_conv1d_multi_backward_kcp")
     xs, weights, _ = _multi_operands(xs, weights, None)
     n = len(xs)
@@ -1700,6 +2006,67 @@ def cake_causal_conv1d_multi_backward_kcp(
     )
 
 
+def _multi_backward_kcp_given(
+    xs: Any,
+    weights: Any,
+    ctx: Any,
+    dys: Any,
+    hists: Any,
+    *,
+    dxs: Any,
+    dweights: Any,
+    graph: Optional[str],
+    bwd_reserve_sms: Any,
+) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
+    """:func:`cake_causal_conv1d_multi_backward_kcp` with ``bwd_reserve_sms`` given: validated before anything runs,
+    then every tensor's main backward on the grid of that reserve (0: the shipped grid)."""
+    reserve = _reserve(bwd_reserve_sms, "cake_causal_conv1d_multi_backward_kcp")
+    _reserve_fits(
+        reserve,
+        xs[0] if isinstance(xs, (list, tuple)) and xs else None,
+        "cake_causal_conv1d_multi_backward_kcp",
+    )
+    _alert_nondeterministic("cake_causal_conv1d_multi_backward_kcp")
+    xs, weights, _ = _multi_operands(xs, weights, None)
+    n = len(xs)
+    dys, hists = list(dys), list(hists)
+    dxs = [None] * n if dxs is None else list(dxs)
+    dweights = [None] * n if dweights is None else list(dweights)
+    if not (len(dys) == len(hists) == len(dxs) == len(dweights) == n):
+        raise ValueError(
+            f"dys, hists, dxs and dweights must hold one entry per convolution ({n})"
+        )
+    mode = _graph_mode(graph)
+    if mode == "off":
+        return _kcp_backward_multi(
+            xs, weights, ctx, dys, hists, dxs, dweights, reserve=reserve
+        )
+    entry = _graph_entry(
+        "bwd_multi",
+        ctx,
+        (*xs, *weights, *dys, *hists, *dxs, *dweights),
+        mode,
+        extra=(("reserve", reserve),) if reserve else (),
+    )
+    dx_out, dw_out = _graph_run(
+        "bwd_multi",
+        entry,
+        lambda: _kcp_backward_multi(
+            xs, weights, ctx, dys, hists, dxs, dweights, reserve=reserve
+        ),
+        mode,
+    )
+    return (
+        tuple(
+            d if o is not None else d.detach() for d, o in zip(dx_out, dxs, strict=True)
+        ),
+        tuple(
+            d if o is not None else d.detach()
+            for d, o in zip(dw_out, dweights, strict=True)
+        ),
+    )
+
+
 def _kcp_backward_multi(
     xs: list[torch.Tensor],
     weights: list[torch.Tensor],
@@ -1708,6 +2075,7 @@ def _kcp_backward_multi(
     hists: list[torch.Tensor],
     dxs: list[Optional[torch.Tensor]],
     dweights: list[Optional[torch.Tensor]],
+    reserve: int = RESERVE_DEFAULT,
 ) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
     """The multi backward's host flow (eagerly or inside a capture): see
     :func:`cake_causal_conv1d_multi_backward_kcp`."""
@@ -1715,7 +2083,7 @@ def _kcp_backward_multi(
     device = _require_tensor(xs[0], "xs[0]").device
     _wait_ready(ctx)
     calls = [
-        _bwd_host(x, w, ctx, dy, h, dx=dx, dweight=dw, device=device)
+        _bwd_host(x, w, ctx, dy, h, dx=dx, dweight=dw, device=device, reserve=reserve)
         for x, w, dy, h, dx, dw in zip(
             xs, weights, dys, hists, dxs, dweights, strict=True
         )
@@ -1850,6 +2218,40 @@ class CakeCausalConv1dMultiFunctionKcp(torch.autograd.Function):
         return (None, None, None, None, None, *dxs, *dweights)
 
 
+class _CakeCausalConv1dReserveMultiFunctionKcp(CakeCausalConv1dMultiFunctionKcp):
+    """:class:`CakeCausalConv1dMultiFunctionKcp` with the opt-in SM reserve of every main backward:
+    ``apply(reserve, ctx, graph, handle, deterministic, n, *xs, *weights)``, ``reserve`` the caller's validated
+    ``bwd_reserve_sms >= 1`` (one more input, one more ``None`` gradient)."""
+
+    @staticmethod
+    def forward(fn_ctx, reserve, ctx, graph, handle, deterministic, n, *tensors):
+        fn_ctx.reserve = reserve
+        return CakeCausalConv1dMultiFunctionKcp.forward(
+            fn_ctx, ctx, graph, handle, deterministic, n, *tensors
+        )
+
+    @staticmethod
+    def backward(fn_ctx, *grad_ys):
+        n = fn_ctx.n
+        saved = fn_ctx.saved_tensors
+        xs, weights, hists = saved[:n], saved[n : 2 * n], saved[2 * n :]
+        dys = [
+            (torch.zeros_like(x) if g is None else g).to(torch.bfloat16).contiguous()
+            for g, x in zip(grad_ys, xs, strict=True)
+        ]
+        dxs, dweights = cake_causal_conv1d_multi_backward_kcp(
+            xs,
+            weights,
+            fn_ctx.kcp,
+            dys,
+            hists,
+            graph=fn_ctx.graph,
+            deterministic=False,
+            bwd_reserve_sms=fn_ctx.reserve,
+        )
+        return (None, None, None, None, None, None, *dxs, *dweights)
+
+
 def cake_causal_conv1d_multi_kcp(
     xs: Any,
     weights: Any,
@@ -1857,7 +2259,9 @@ def cake_causal_conv1d_multi_kcp(
     *,
     graph: Optional[str] = None,
     recompute_handle: Optional[Any] = None,
+    cooperative: Optional[bool] = None,
     deterministic: bool = True,
+    bwd_reserve_sms: Optional[int] = None,
 ) -> tuple[torch.Tensor, ...]:
     """Autograd-enabled KCP convolutions of several tensors of one layer (for example its q, k and v) with one halo
     exchange per direction (``deterministic=False`` required).
@@ -1887,8 +2291,12 @@ def cake_causal_conv1d_multi_kcp(
         created outside the outermost checkpoint region; refused with ``graph="replay"`` and inside a CUDA-graph
         capture; every rank passes one or none).  The handle may also carry the ``"kda"`` entry of the layer's
         recurrence; a handle's ``"conv"`` entry serves either one multi call or one single call, never both.
+    cooperative : bool, optional
+        As in :func:`cake_causal_conv1d_kcp` (``None`` or ``False``).
     deterministic : bool
         Must be ``False`` (``ValueError`` otherwise).
+    bwd_reserve_sms : int, optional
+        As in :func:`cake_causal_conv1d_kcp`, for every tensor's main backward.
 
     Returns
     -------
@@ -1897,10 +2305,48 @@ def cake_causal_conv1d_multi_kcp(
     """
 
     _require_nondeterministic(deterministic, "cake_causal_conv1d_multi_kcp")
+    if cooperative is not None or bwd_reserve_sms is not None:
+        return _multi_kcp_given(
+            xs,
+            weights,
+            ctx,
+            graph=graph,
+            recompute_handle=recompute_handle,
+            cooperative=cooperative,
+            bwd_reserve_sms=bwd_reserve_sms,
+        )
     _graph_mode(graph)
     xs, weights, _ = _multi_operands(xs, weights, None)
     if recompute_handle is not None:
         _handle_refusals(graph, recompute_handle)
+    return CakeCausalConv1dMultiFunctionKcp.apply(
+        ctx, graph, recompute_handle, False, len(xs), *xs, *weights
+    )
+
+
+def _multi_kcp_given(
+    xs: Any,
+    weights: Any,
+    ctx: Any,
+    *,
+    graph: Optional[str],
+    recompute_handle: Optional[Any],
+    cooperative: Any,
+    bwd_reserve_sms: Any,
+) -> tuple[torch.Tensor, ...]:
+    """:func:`cake_causal_conv1d_multi_kcp` with ``cooperative`` or ``bwd_reserve_sms`` given: both validated before
+    anything runs; a reserve of 1 or more runs :class:`_CakeCausalConv1dReserveMultiFunctionKcp`."""
+    _ordinary_launch(cooperative, "cake_causal_conv1d_multi_kcp")
+    reserve = _reserve(bwd_reserve_sms, "cake_causal_conv1d_multi_kcp")
+    _graph_mode(graph)
+    xs, weights, _ = _multi_operands(xs, weights, None)
+    _reserve_fits(reserve, xs[0], "cake_causal_conv1d_multi_kcp")
+    if recompute_handle is not None:
+        _handle_refusals(graph, recompute_handle)
+    if reserve:
+        return _CakeCausalConv1dReserveMultiFunctionKcp.apply(
+            reserve, ctx, graph, recompute_handle, False, len(xs), *xs, *weights
+        )
     return CakeCausalConv1dMultiFunctionKcp.apply(
         ctx, graph, recompute_handle, False, len(xs), *xs, *weights
     )
@@ -1911,6 +2357,8 @@ __all__ = [
     "GRAPH_DEFAULT",
     "GRAPH_STATS",
     "HANDLE_KEY",
+    "RESERVE_DEFAULT",
+    "RESERVE_UNSUPPORTED",
     "RecomputeHandleKcp",
     "LAST_CALL",
     "graph_cache_clear",

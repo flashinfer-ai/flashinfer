@@ -546,7 +546,10 @@ def test_cake_fmha_decode_native_bf16_jit_selects_all_exact_manifest_members(
         for member in component["source_family"]
         if "BATCH_SIZE" in member["selector"]
     ]
-    assert len(exact_members) == 5
+    # The b128 retained-KV host-scale shape has no exact member: its generated
+    # source mis-indexed ragged and short-KV launches, so the generic member
+    # serves it.
+    assert len(exact_members) == 4
 
     selected_batches = set()
     csrc_dir = cake_jit.get_cake_fmha_csrc_dir()
@@ -729,8 +732,11 @@ def test_cake_fmha_decode_native_bf16_exact_sink_grid_matches_selector(
         "#if BATCH_SIZE == 256 && Q_LEN == 1 && NUM_Q_HEADS == 32 && "
         "NUM_KV_HEADS == 4 && \\\n"
         "    CAKE_FMHA_HAS_SINK == 1 && CAKE_FMHA_HAS_WINDOW == 0 && "
-        "CAKE_FMHA_USE_SCALE_PTR == 0"
+        "CAKE_FMHA_USE_SCALE_PTR == 0 && \\\n"
+        "    CAKE_FMHA_RETAIN_KV_L2 == 0"
     )
+    # Only the exact member (retain 0) takes the 3-D grid: the retained-KV
+    # sink member of the same shape strides its tiles over blockIdx.x.
     assert adapter.count(exact_guard) == 1
     exact_branch = adapter.split(exact_guard, 1)[1].split("#else", 1)[0]
     assert "grid_x = Q_LEN;" in exact_branch
@@ -1727,10 +1733,10 @@ def test_cake_fmha_exact_b128_members_serve_caller_lse_from_generic_member(
         enable_block_sparse_attention=False,
     )
     route = cake_api.select_cake_fmha_decode_route(query.device, **kwargs)
-    # The generated DEC_B128 program serves the 2048 launch; the 1024 launch
-    # (at most nine KV blocks) and the 4096 launch (a tensor bmm1 with a host
-    # bmm2) stay on the JIT member.
-    program = ("decode_bf16", "DEC_B128") if max_seq_len == 2048 else None
+    # The generated DEC_B128 program serves the 2048 launch and the short-KV
+    # 1024 launch (its table fits the kernels); the 4096 launch (a tensor bmm1
+    # with a host bmm2) stays on the JIT member.
+    program = ("decode_bf16", "DEC_B128") if max_seq_len <= 2048 else None
     assert route == cake_api.CakeFmhaDecodeRoute(
         target=target,
         batch_size=batch_size,
@@ -1769,9 +1775,19 @@ def test_cake_fmha_exact_b128_members_serve_caller_lse_from_generic_member(
     assert Path(lse_spec.sources[1]).name == "cake_fmha_decode_native_bf16_binding.cu"
     assert "-DBATCH_SIZE=128" in lse_spec.extra_cuda_cflags
     assert lse_spec.extra_cuda_cflags == spec.extra_cuda_cflags
-    assert Path(spec.sources[0]).name.startswith("batch_size128_")
-    assert lse_spec.name != spec.name
-    assert lse_spec.name.replace("_lse_", "_", 1) == spec.name
+    if retain_kv_l2 and not device_scale:
+        # No exact member at the retained-KV host-scale flags: the launch
+        # without LSE builds the generic member too.
+        assert Path(spec.sources[0]).name == "default.cu"
+    else:
+        assert Path(spec.sources[0]).name.startswith("batch_size128_")
+    if retain_kv_l2 and not device_scale:
+        # Both launches build the same generic module: its name only changes
+        # when a caller LSE bypasses an exact member.
+        assert lse_spec.name == spec.name
+    else:
+        assert lse_spec.name != spec.name
+        assert lse_spec.name.replace("_lse_", "_", 1) == spec.name
 
 
 def test_cake_fmha_exact_sink_no_lse_member_falls_back_for_caller_lse(

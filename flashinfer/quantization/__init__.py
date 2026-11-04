@@ -20,6 +20,7 @@ from ..jit.quantization import gen_quantization_module
 # Re-export FP8 quantization
 from .fp8_quantization import (
     mxfp8_quantize,
+    mxfp8_quantize_bshd,
     mxfp8_grouped_quantize,
     mxfp8_dequantize_host,
     per_token_group_quant_8bit,
@@ -89,6 +90,7 @@ __all__ = [
     "gen_quantization_module",
     # FP8
     "mxfp8_quantize",
+    "mxfp8_quantize_bshd",
     "mxfp8_grouped_quantize",
     "mxfp8_dequantize_host",
     "per_token_group_quant_8bit",

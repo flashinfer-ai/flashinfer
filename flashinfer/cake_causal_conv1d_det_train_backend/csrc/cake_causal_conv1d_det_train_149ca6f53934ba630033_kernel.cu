@@ -48,7 +48,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 }
 
 #define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
 #define SMEM_RED_OFF 1024
 #define SMEM_RED_STAGE_BYTES 20480
 #define SMEM_RED_STRIDE 20480
@@ -473,7 +472,7 @@ kernel_cake_causal_conv1d_det_train_149ca6f53934ba630033(__nv_bfloat16* __restri
                         }
                         #pragma unroll
                         for (int pv_h = 0; pv_h < 4; pv_h++) {
-                            float2 pv_p2 = add_f32x2_noftz(fma_f32x2_rn_noftz(make_float2(wr[8 * pv_h + 3], wr[8 * pv_h + 4 + 3]), make_float2(win[u % 4 * 8 + 2 * pv_h], win[u % 4 * 8 + 2 * pv_h + 1]), fma_f32x2_rn_noftz(make_float2(wr[8 * pv_h + 2], wr[8 * pv_h + 4 + 2]), make_float2(win[(u % 4 + 3) % 4 * 8 + 2 * pv_h], win[(u % 4 + 3) % 4 * 8 + 2 * pv_h + 1]), fma_f32x2_rn_noftz(make_float2(wr[8 * pv_h + 1], wr[8 * pv_h + 4 + 1]), make_float2(win[(u % 4 + 2) % 4 * 8 + 2 * pv_h], win[(u % 4 + 2) % 4 * 8 + 2 * pv_h + 1]), mul_f32x2_noftz(make_float2(wr[8 * pv_h + 0], wr[8 * pv_h + 4 + 0]), make_float2(win[(u % 4 + 1) % 4 * 8 + 2 * pv_h], win[(u % 4 + 1) % 4 * 8 + 2 * pv_h + 1]))))), make_float2(br[0 + 2 * pv_h], br[0 + 2 * pv_h + 1]));
+                            float2 pv_p2 = add_f32x2_noftz(fma_f32x2_rn_noftz(make_float2(wr[8 * pv_h + 3], wr[8 * pv_h + 4 + 3]), make_float2(win[u % 4 * 8 + 2 * pv_h], win[u % 4 * 8 + 2 * pv_h + 1]), fma_f32x2_rn_noftz(make_float2(wr[8 * pv_h + 2], wr[8 * pv_h + 4 + 2]), make_float2(win[(u % 4 + 3) % 4 * 8 + 2 * pv_h], win[(u % 4 + 3) % 4 * 8 + 2 * pv_h + 1]), fma_f32x2_rn_noftz(make_float2(wr[8 * pv_h + 1], wr[8 * pv_h + 4 + 1]), make_float2(win[(u % 4 + 2) % 4 * 8 + 2 * pv_h], win[(u % 4 + 2) % 4 * 8 + 2 * pv_h + 1]), mul_f32x2_noftz(make_float2(wr[8 * pv_h], wr[8 * pv_h + 4]), make_float2(win[(u % 4 + 1) % 4 * 8 + 2 * pv_h], win[(u % 4 + 1) % 4 * 8 + 2 * pv_h + 1]))))), make_float2(br[2 * pv_h], br[2 * pv_h + 1]));
                             float2 _f32x2_mul_b_12 = make_float2(-1.442695f, -1.442695f);
                             float2 pv_e2;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&pv_e2) : "l"(*(const unsigned long long*)&pv_p2), "l"(*(const unsigned long long*)&_f32x2_mul_b_12));
@@ -486,7 +485,7 @@ kernel_cake_causal_conv1d_det_train_149ca6f53934ba630033(__nv_bfloat16* __restri
                             float2 _f32x2_mul_b_17 = fma_f32x2_rn_noftz(pv_p2, sub_f32x2_noftz(make_float2(1.0f, 1.0f), pv_sg2), make_float2(1.0f, 1.0f));
                             float2 pv_g2;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&pv_g2) : "l"(*(const unsigned long long*)&pv_sg2), "l"(*(const unsigned long long*)&_f32x2_mul_b_17));
-                            float2 pv_d2 = fma_f32x2_rn_noftz(make_float2(dyf[0 + 2 * pv_h], dyf[0 + 2 * pv_h + 1]), pv_g2, make_float2(wr[32], wr[33]));
+                            float2 pv_d2 = fma_f32x2_rn_noftz(make_float2(dyf[2 * pv_h], dyf[2 * pv_h + 1]), pv_g2, make_float2(wr[32], wr[33]));
                             dp[2 * pv_h] = pv_d2.x;
                             dp[2 * pv_h + 1] = pv_d2.y;
                             #pragma unroll
@@ -495,7 +494,7 @@ kernel_cake_causal_conv1d_det_train_149ca6f53934ba630033(__nv_bfloat16* __restri
                                 acc[8 * pv_h + kk_1] = pv_a2.x;
                                 acc[8 * pv_h + 4 + kk_1] = pv_a2.y;
                             }
-                            float2 pv_b2 = add_f32x2_noftz(make_float2(accb[0 + 2 * pv_h], accb[0 + 2 * pv_h + 1]), pv_d2);
+                            float2 pv_b2 = add_f32x2_noftz(make_float2(accb[2 * pv_h], accb[2 * pv_h + 1]), pv_d2);
                             accb[2 * pv_h] = pv_b2.x;
                             accb[2 * pv_h + 1] = pv_b2.y;
                             #pragma unroll
@@ -560,7 +559,7 @@ kernel_cake_causal_conv1d_det_train_149ca6f53934ba630033(__nv_bfloat16* __restri
                         }
                         #pragma unroll
                         for (int pv_h_1 = 0; pv_h_1 < 4; pv_h_1++) {
-                            float2 pv_p2_1 = add_f32x2_noftz(fma_f32x2_rn_noftz(make_float2(wr[8 * pv_h_1 + 3], wr[8 * pv_h_1 + 4 + 3]), make_float2(win[u_1 % 4 * 8 + 2 * pv_h_1], win[u_1 % 4 * 8 + 2 * pv_h_1 + 1]), fma_f32x2_rn_noftz(make_float2(wr[8 * pv_h_1 + 2], wr[8 * pv_h_1 + 4 + 2]), make_float2(win[(u_1 % 4 + 3) % 4 * 8 + 2 * pv_h_1], win[(u_1 % 4 + 3) % 4 * 8 + 2 * pv_h_1 + 1]), fma_f32x2_rn_noftz(make_float2(wr[8 * pv_h_1 + 1], wr[8 * pv_h_1 + 4 + 1]), make_float2(win[(u_1 % 4 + 2) % 4 * 8 + 2 * pv_h_1], win[(u_1 % 4 + 2) % 4 * 8 + 2 * pv_h_1 + 1]), mul_f32x2_noftz(make_float2(wr[8 * pv_h_1 + 0], wr[8 * pv_h_1 + 4 + 0]), make_float2(win[(u_1 % 4 + 1) % 4 * 8 + 2 * pv_h_1], win[(u_1 % 4 + 1) % 4 * 8 + 2 * pv_h_1 + 1]))))), make_float2(br[0 + 2 * pv_h_1], br[0 + 2 * pv_h_1 + 1]));
+                            float2 pv_p2_1 = add_f32x2_noftz(fma_f32x2_rn_noftz(make_float2(wr[8 * pv_h_1 + 3], wr[8 * pv_h_1 + 4 + 3]), make_float2(win[u_1 % 4 * 8 + 2 * pv_h_1], win[u_1 % 4 * 8 + 2 * pv_h_1 + 1]), fma_f32x2_rn_noftz(make_float2(wr[8 * pv_h_1 + 2], wr[8 * pv_h_1 + 4 + 2]), make_float2(win[(u_1 % 4 + 3) % 4 * 8 + 2 * pv_h_1], win[(u_1 % 4 + 3) % 4 * 8 + 2 * pv_h_1 + 1]), fma_f32x2_rn_noftz(make_float2(wr[8 * pv_h_1 + 1], wr[8 * pv_h_1 + 4 + 1]), make_float2(win[(u_1 % 4 + 2) % 4 * 8 + 2 * pv_h_1], win[(u_1 % 4 + 2) % 4 * 8 + 2 * pv_h_1 + 1]), mul_f32x2_noftz(make_float2(wr[8 * pv_h_1], wr[8 * pv_h_1 + 4]), make_float2(win[(u_1 % 4 + 1) % 4 * 8 + 2 * pv_h_1], win[(u_1 % 4 + 1) % 4 * 8 + 2 * pv_h_1 + 1]))))), make_float2(br[2 * pv_h_1], br[2 * pv_h_1 + 1]));
                             float2 _f32x2_mul_b_21 = make_float2(-1.442695f, -1.442695f);
                             float2 pv_e2_1;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&pv_e2_1) : "l"(*(const unsigned long long*)&pv_p2_1), "l"(*(const unsigned long long*)&_f32x2_mul_b_21));
@@ -573,7 +572,7 @@ kernel_cake_causal_conv1d_det_train_149ca6f53934ba630033(__nv_bfloat16* __restri
                             float2 _f32x2_mul_b_26 = fma_f32x2_rn_noftz(pv_p2_1, sub_f32x2_noftz(make_float2(1.0f, 1.0f), pv_sg2_1), make_float2(1.0f, 1.0f));
                             float2 pv_g2_1;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&pv_g2_1) : "l"(*(const unsigned long long*)&pv_sg2_1), "l"(*(const unsigned long long*)&_f32x2_mul_b_26));
-                            float2 pv_d2_1 = fma_f32x2_rn_noftz(make_float2(dyf[0 + 2 * pv_h_1], dyf[0 + 2 * pv_h_1 + 1]), pv_g2_1, make_float2(wr[32], wr[33]));
+                            float2 pv_d2_1 = fma_f32x2_rn_noftz(make_float2(dyf[2 * pv_h_1], dyf[2 * pv_h_1 + 1]), pv_g2_1, make_float2(wr[32], wr[33]));
                             dp[2 * pv_h_1] = pv_d2_1.x;
                             dp[2 * pv_h_1 + 1] = pv_d2_1.y;
                             #pragma unroll
@@ -582,7 +581,7 @@ kernel_cake_causal_conv1d_det_train_149ca6f53934ba630033(__nv_bfloat16* __restri
                                 acc[8 * pv_h_1 + kk_3] = pv_a2_1.x;
                                 acc[8 * pv_h_1 + 4 + kk_3] = pv_a2_1.y;
                             }
-                            float2 pv_b2_1 = add_f32x2_noftz(make_float2(accb[0 + 2 * pv_h_1], accb[0 + 2 * pv_h_1 + 1]), pv_d2_1);
+                            float2 pv_b2_1 = add_f32x2_noftz(make_float2(accb[2 * pv_h_1], accb[2 * pv_h_1 + 1]), pv_d2_1);
                             accb[2 * pv_h_1] = pv_b2_1.x;
                             accb[2 * pv_h_1 + 1] = pv_b2_1.y;
                             #pragma unroll
@@ -709,7 +708,7 @@ kernel_cake_causal_conv1d_det_train_149ca6f53934ba630033(__nv_bfloat16* __restri
                                 if (tcur < t_end) {
                                     #pragma unroll
                                     for (int pv_h_2 = 0; pv_h_2 < 4; pv_h_2++) {
-                                        float2 pv_p2_2 = add_f32x2_noftz(fma_f32x2_rn_noftz(make_float2(wr[8 * pv_h_2 + 3], wr[8 * pv_h_2 + 4 + 3]), make_float2(win[u_2 % 4 * 8 + 2 * pv_h_2], win[u_2 % 4 * 8 + 2 * pv_h_2 + 1]), fma_f32x2_rn_noftz(make_float2(wr[8 * pv_h_2 + 2], wr[8 * pv_h_2 + 4 + 2]), make_float2(win[(u_2 % 4 + 3) % 4 * 8 + 2 * pv_h_2], win[(u_2 % 4 + 3) % 4 * 8 + 2 * pv_h_2 + 1]), fma_f32x2_rn_noftz(make_float2(wr[8 * pv_h_2 + 1], wr[8 * pv_h_2 + 4 + 1]), make_float2(win[(u_2 % 4 + 2) % 4 * 8 + 2 * pv_h_2], win[(u_2 % 4 + 2) % 4 * 8 + 2 * pv_h_2 + 1]), mul_f32x2_noftz(make_float2(wr[8 * pv_h_2 + 0], wr[8 * pv_h_2 + 4 + 0]), make_float2(win[(u_2 % 4 + 1) % 4 * 8 + 2 * pv_h_2], win[(u_2 % 4 + 1) % 4 * 8 + 2 * pv_h_2 + 1]))))), make_float2(br[0 + 2 * pv_h_2], br[0 + 2 * pv_h_2 + 1]));
+                                        float2 pv_p2_2 = add_f32x2_noftz(fma_f32x2_rn_noftz(make_float2(wr[8 * pv_h_2 + 3], wr[8 * pv_h_2 + 4 + 3]), make_float2(win[u_2 % 4 * 8 + 2 * pv_h_2], win[u_2 % 4 * 8 + 2 * pv_h_2 + 1]), fma_f32x2_rn_noftz(make_float2(wr[8 * pv_h_2 + 2], wr[8 * pv_h_2 + 4 + 2]), make_float2(win[(u_2 % 4 + 3) % 4 * 8 + 2 * pv_h_2], win[(u_2 % 4 + 3) % 4 * 8 + 2 * pv_h_2 + 1]), fma_f32x2_rn_noftz(make_float2(wr[8 * pv_h_2 + 1], wr[8 * pv_h_2 + 4 + 1]), make_float2(win[(u_2 % 4 + 2) % 4 * 8 + 2 * pv_h_2], win[(u_2 % 4 + 2) % 4 * 8 + 2 * pv_h_2 + 1]), mul_f32x2_noftz(make_float2(wr[8 * pv_h_2], wr[8 * pv_h_2 + 4]), make_float2(win[(u_2 % 4 + 1) % 4 * 8 + 2 * pv_h_2], win[(u_2 % 4 + 1) % 4 * 8 + 2 * pv_h_2 + 1]))))), make_float2(br[2 * pv_h_2], br[2 * pv_h_2 + 1]));
                                         float2 _f32x2_mul_b_30 = make_float2(-1.442695f, -1.442695f);
                                         float2 pv_e2_2;
                                         asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&pv_e2_2) : "l"(*(const unsigned long long*)&pv_p2_2), "l"(*(const unsigned long long*)&_f32x2_mul_b_30));
@@ -722,7 +721,7 @@ kernel_cake_causal_conv1d_det_train_149ca6f53934ba630033(__nv_bfloat16* __restri
                                         float2 _f32x2_mul_b_35 = fma_f32x2_rn_noftz(pv_p2_2, sub_f32x2_noftz(make_float2(1.0f, 1.0f), pv_sg2_2), make_float2(1.0f, 1.0f));
                                         float2 pv_g2_2;
                                         asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&pv_g2_2) : "l"(*(const unsigned long long*)&pv_sg2_2), "l"(*(const unsigned long long*)&_f32x2_mul_b_35));
-                                        float2 pv_d2_2 = fma_f32x2_rn_noftz(make_float2(dyf[0 + 2 * pv_h_2], dyf[0 + 2 * pv_h_2 + 1]), pv_g2_2, make_float2(wr[32], wr[33]));
+                                        float2 pv_d2_2 = fma_f32x2_rn_noftz(make_float2(dyf[2 * pv_h_2], dyf[2 * pv_h_2 + 1]), pv_g2_2, make_float2(wr[32], wr[33]));
                                         dp[2 * pv_h_2] = pv_d2_2.x;
                                         dp[2 * pv_h_2 + 1] = pv_d2_2.y;
                                         #pragma unroll
@@ -731,7 +730,7 @@ kernel_cake_causal_conv1d_det_train_149ca6f53934ba630033(__nv_bfloat16* __restri
                                             acc[8 * pv_h_2 + kk_5] = pv_a2_2.x;
                                             acc[8 * pv_h_2 + 4 + kk_5] = pv_a2_2.y;
                                         }
-                                        float2 pv_b2_2 = add_f32x2_noftz(make_float2(accb[0 + 2 * pv_h_2], accb[0 + 2 * pv_h_2 + 1]), pv_d2_2);
+                                        float2 pv_b2_2 = add_f32x2_noftz(make_float2(accb[2 * pv_h_2], accb[2 * pv_h_2 + 1]), pv_d2_2);
                                         accb[2 * pv_h_2] = pv_b2_2.x;
                                         accb[2 * pv_h_2 + 1] = pv_b2_2.y;
                                         #pragma unroll
@@ -749,7 +748,7 @@ kernel_cake_causal_conv1d_det_train_149ca6f53934ba630033(__nv_bfloat16* __restri
                                 } else {
                                     #pragma unroll
                                     for (int pv_h_3 = 0; pv_h_3 < 4; pv_h_3++) {
-                                        float2 pv_p2_3 = add_f32x2_noftz(fma_f32x2_rn_noftz(make_float2(wr[8 * pv_h_3 + 3], wr[8 * pv_h_3 + 4 + 3]), make_float2(win[u_2 % 4 * 8 + 2 * pv_h_3], win[u_2 % 4 * 8 + 2 * pv_h_3 + 1]), fma_f32x2_rn_noftz(make_float2(wr[8 * pv_h_3 + 2], wr[8 * pv_h_3 + 4 + 2]), make_float2(win[(u_2 % 4 + 3) % 4 * 8 + 2 * pv_h_3], win[(u_2 % 4 + 3) % 4 * 8 + 2 * pv_h_3 + 1]), fma_f32x2_rn_noftz(make_float2(wr[8 * pv_h_3 + 1], wr[8 * pv_h_3 + 4 + 1]), make_float2(win[(u_2 % 4 + 2) % 4 * 8 + 2 * pv_h_3], win[(u_2 % 4 + 2) % 4 * 8 + 2 * pv_h_3 + 1]), mul_f32x2_noftz(make_float2(wr[8 * pv_h_3 + 0], wr[8 * pv_h_3 + 4 + 0]), make_float2(win[(u_2 % 4 + 1) % 4 * 8 + 2 * pv_h_3], win[(u_2 % 4 + 1) % 4 * 8 + 2 * pv_h_3 + 1]))))), make_float2(br[0 + 2 * pv_h_3], br[0 + 2 * pv_h_3 + 1]));
+                                        float2 pv_p2_3 = add_f32x2_noftz(fma_f32x2_rn_noftz(make_float2(wr[8 * pv_h_3 + 3], wr[8 * pv_h_3 + 4 + 3]), make_float2(win[u_2 % 4 * 8 + 2 * pv_h_3], win[u_2 % 4 * 8 + 2 * pv_h_3 + 1]), fma_f32x2_rn_noftz(make_float2(wr[8 * pv_h_3 + 2], wr[8 * pv_h_3 + 4 + 2]), make_float2(win[(u_2 % 4 + 3) % 4 * 8 + 2 * pv_h_3], win[(u_2 % 4 + 3) % 4 * 8 + 2 * pv_h_3 + 1]), fma_f32x2_rn_noftz(make_float2(wr[8 * pv_h_3 + 1], wr[8 * pv_h_3 + 4 + 1]), make_float2(win[(u_2 % 4 + 2) % 4 * 8 + 2 * pv_h_3], win[(u_2 % 4 + 2) % 4 * 8 + 2 * pv_h_3 + 1]), mul_f32x2_noftz(make_float2(wr[8 * pv_h_3], wr[8 * pv_h_3 + 4]), make_float2(win[(u_2 % 4 + 1) % 4 * 8 + 2 * pv_h_3], win[(u_2 % 4 + 1) % 4 * 8 + 2 * pv_h_3 + 1]))))), make_float2(br[2 * pv_h_3], br[2 * pv_h_3 + 1]));
                                         float2 _f32x2_mul_b_37 = make_float2(-1.442695f, -1.442695f);
                                         float2 pv_e2_3;
                                         asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&pv_e2_3) : "l"(*(const unsigned long long*)&pv_p2_3), "l"(*(const unsigned long long*)&_f32x2_mul_b_37));
@@ -762,7 +761,7 @@ kernel_cake_causal_conv1d_det_train_149ca6f53934ba630033(__nv_bfloat16* __restri
                                         float2 _f32x2_mul_b_42 = fma_f32x2_rn_noftz(pv_p2_3, sub_f32x2_noftz(make_float2(1.0f, 1.0f), pv_sg2_3), make_float2(1.0f, 1.0f));
                                         float2 pv_g2_3;
                                         asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&pv_g2_3) : "l"(*(const unsigned long long*)&pv_sg2_3), "l"(*(const unsigned long long*)&_f32x2_mul_b_42));
-                                        float2 pv_d2_3 = fma_f32x2_rn_noftz(make_float2(dyf[0 + 2 * pv_h_3], dyf[0 + 2 * pv_h_3 + 1]), pv_g2_3, make_float2(wr[32], wr[33]));
+                                        float2 pv_d2_3 = fma_f32x2_rn_noftz(make_float2(dyf[2 * pv_h_3], dyf[2 * pv_h_3 + 1]), pv_g2_3, make_float2(wr[32], wr[33]));
                                         dp[2 * pv_h_3] = pv_d2_3.x;
                                         dp[2 * pv_h_3 + 1] = pv_d2_3.y;
                                         #pragma unroll
@@ -1103,7 +1102,7 @@ kernel_cake_causal_conv1d_det_train_149ca6f53934ba630033(__nv_bfloat16* __restri
                         }
                         #pragma unroll
                         for (int pv_h_4 = 0; pv_h_4 < 4; pv_h_4++) {
-                            float2 pv_p2_4 = add_f32x2_noftz(fma_f32x2_rn_noftz(make_float2(wr_1[8 * pv_h_4 + 3], wr_1[8 * pv_h_4 + 4 + 3]), make_float2(win_1[u_3 % 4 * 8 + 2 * pv_h_4], win_1[u_3 % 4 * 8 + 2 * pv_h_4 + 1]), fma_f32x2_rn_noftz(make_float2(wr_1[8 * pv_h_4 + 2], wr_1[8 * pv_h_4 + 4 + 2]), make_float2(win_1[(u_3 % 4 + 3) % 4 * 8 + 2 * pv_h_4], win_1[(u_3 % 4 + 3) % 4 * 8 + 2 * pv_h_4 + 1]), fma_f32x2_rn_noftz(make_float2(wr_1[8 * pv_h_4 + 1], wr_1[8 * pv_h_4 + 4 + 1]), make_float2(win_1[(u_3 % 4 + 2) % 4 * 8 + 2 * pv_h_4], win_1[(u_3 % 4 + 2) % 4 * 8 + 2 * pv_h_4 + 1]), mul_f32x2_noftz(make_float2(wr_1[8 * pv_h_4 + 0], wr_1[8 * pv_h_4 + 4 + 0]), make_float2(win_1[(u_3 % 4 + 1) % 4 * 8 + 2 * pv_h_4], win_1[(u_3 % 4 + 1) % 4 * 8 + 2 * pv_h_4 + 1]))))), make_float2(br_1[0 + 2 * pv_h_4], br_1[0 + 2 * pv_h_4 + 1]));
+                            float2 pv_p2_4 = add_f32x2_noftz(fma_f32x2_rn_noftz(make_float2(wr_1[8 * pv_h_4 + 3], wr_1[8 * pv_h_4 + 4 + 3]), make_float2(win_1[u_3 % 4 * 8 + 2 * pv_h_4], win_1[u_3 % 4 * 8 + 2 * pv_h_4 + 1]), fma_f32x2_rn_noftz(make_float2(wr_1[8 * pv_h_4 + 2], wr_1[8 * pv_h_4 + 4 + 2]), make_float2(win_1[(u_3 % 4 + 3) % 4 * 8 + 2 * pv_h_4], win_1[(u_3 % 4 + 3) % 4 * 8 + 2 * pv_h_4 + 1]), fma_f32x2_rn_noftz(make_float2(wr_1[8 * pv_h_4 + 1], wr_1[8 * pv_h_4 + 4 + 1]), make_float2(win_1[(u_3 % 4 + 2) % 4 * 8 + 2 * pv_h_4], win_1[(u_3 % 4 + 2) % 4 * 8 + 2 * pv_h_4 + 1]), mul_f32x2_noftz(make_float2(wr_1[8 * pv_h_4], wr_1[8 * pv_h_4 + 4]), make_float2(win_1[(u_3 % 4 + 1) % 4 * 8 + 2 * pv_h_4], win_1[(u_3 % 4 + 1) % 4 * 8 + 2 * pv_h_4 + 1]))))), make_float2(br_1[2 * pv_h_4], br_1[2 * pv_h_4 + 1]));
                             float2 _f32x2_mul_b_64 = make_float2(-1.442695f, -1.442695f);
                             float2 pv_e2_4;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&pv_e2_4) : "l"(*(const unsigned long long*)&pv_p2_4), "l"(*(const unsigned long long*)&_f32x2_mul_b_64));
@@ -1116,7 +1115,7 @@ kernel_cake_causal_conv1d_det_train_149ca6f53934ba630033(__nv_bfloat16* __restri
                             float2 _f32x2_mul_b_69 = fma_f32x2_rn_noftz(pv_p2_4, sub_f32x2_noftz(make_float2(1.0f, 1.0f), pv_sg2_4), make_float2(1.0f, 1.0f));
                             float2 pv_g2_4;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&pv_g2_4) : "l"(*(const unsigned long long*)&pv_sg2_4), "l"(*(const unsigned long long*)&_f32x2_mul_b_69));
-                            float2 pv_d2_4 = fma_f32x2_rn_noftz(make_float2(dyf_1[0 + 2 * pv_h_4], dyf_1[0 + 2 * pv_h_4 + 1]), pv_g2_4, make_float2(wr_1[32], wr_1[33]));
+                            float2 pv_d2_4 = fma_f32x2_rn_noftz(make_float2(dyf_1[2 * pv_h_4], dyf_1[2 * pv_h_4 + 1]), pv_g2_4, make_float2(wr_1[32], wr_1[33]));
                             dp_1[2 * pv_h_4] = pv_d2_4.x;
                             dp_1[2 * pv_h_4 + 1] = pv_d2_4.y;
                             #pragma unroll
@@ -1125,7 +1124,7 @@ kernel_cake_causal_conv1d_det_train_149ca6f53934ba630033(__nv_bfloat16* __restri
                                 acc[8 * pv_h_4 + kk_7] = pv_a2_3.x;
                                 acc[8 * pv_h_4 + 4 + kk_7] = pv_a2_3.y;
                             }
-                            float2 pv_b2_3 = add_f32x2_noftz(make_float2(accb[0 + 2 * pv_h_4], accb[0 + 2 * pv_h_4 + 1]), pv_d2_4);
+                            float2 pv_b2_3 = add_f32x2_noftz(make_float2(accb[2 * pv_h_4], accb[2 * pv_h_4 + 1]), pv_d2_4);
                             accb[2 * pv_h_4] = pv_b2_3.x;
                             accb[2 * pv_h_4 + 1] = pv_b2_3.y;
                             #pragma unroll
@@ -1190,7 +1189,7 @@ kernel_cake_causal_conv1d_det_train_149ca6f53934ba630033(__nv_bfloat16* __restri
                         }
                         #pragma unroll
                         for (int pv_h_5 = 0; pv_h_5 < 4; pv_h_5++) {
-                            float2 pv_p2_5 = add_f32x2_noftz(fma_f32x2_rn_noftz(make_float2(wr_1[8 * pv_h_5 + 3], wr_1[8 * pv_h_5 + 4 + 3]), make_float2(win_1[u_4 % 4 * 8 + 2 * pv_h_5], win_1[u_4 % 4 * 8 + 2 * pv_h_5 + 1]), fma_f32x2_rn_noftz(make_float2(wr_1[8 * pv_h_5 + 2], wr_1[8 * pv_h_5 + 4 + 2]), make_float2(win_1[(u_4 % 4 + 3) % 4 * 8 + 2 * pv_h_5], win_1[(u_4 % 4 + 3) % 4 * 8 + 2 * pv_h_5 + 1]), fma_f32x2_rn_noftz(make_float2(wr_1[8 * pv_h_5 + 1], wr_1[8 * pv_h_5 + 4 + 1]), make_float2(win_1[(u_4 % 4 + 2) % 4 * 8 + 2 * pv_h_5], win_1[(u_4 % 4 + 2) % 4 * 8 + 2 * pv_h_5 + 1]), mul_f32x2_noftz(make_float2(wr_1[8 * pv_h_5 + 0], wr_1[8 * pv_h_5 + 4 + 0]), make_float2(win_1[(u_4 % 4 + 1) % 4 * 8 + 2 * pv_h_5], win_1[(u_4 % 4 + 1) % 4 * 8 + 2 * pv_h_5 + 1]))))), make_float2(br_1[0 + 2 * pv_h_5], br_1[0 + 2 * pv_h_5 + 1]));
+                            float2 pv_p2_5 = add_f32x2_noftz(fma_f32x2_rn_noftz(make_float2(wr_1[8 * pv_h_5 + 3], wr_1[8 * pv_h_5 + 4 + 3]), make_float2(win_1[u_4 % 4 * 8 + 2 * pv_h_5], win_1[u_4 % 4 * 8 + 2 * pv_h_5 + 1]), fma_f32x2_rn_noftz(make_float2(wr_1[8 * pv_h_5 + 2], wr_1[8 * pv_h_5 + 4 + 2]), make_float2(win_1[(u_4 % 4 + 3) % 4 * 8 + 2 * pv_h_5], win_1[(u_4 % 4 + 3) % 4 * 8 + 2 * pv_h_5 + 1]), fma_f32x2_rn_noftz(make_float2(wr_1[8 * pv_h_5 + 1], wr_1[8 * pv_h_5 + 4 + 1]), make_float2(win_1[(u_4 % 4 + 2) % 4 * 8 + 2 * pv_h_5], win_1[(u_4 % 4 + 2) % 4 * 8 + 2 * pv_h_5 + 1]), mul_f32x2_noftz(make_float2(wr_1[8 * pv_h_5], wr_1[8 * pv_h_5 + 4]), make_float2(win_1[(u_4 % 4 + 1) % 4 * 8 + 2 * pv_h_5], win_1[(u_4 % 4 + 1) % 4 * 8 + 2 * pv_h_5 + 1]))))), make_float2(br_1[2 * pv_h_5], br_1[2 * pv_h_5 + 1]));
                             float2 _f32x2_mul_b_73 = make_float2(-1.442695f, -1.442695f);
                             float2 pv_e2_5;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&pv_e2_5) : "l"(*(const unsigned long long*)&pv_p2_5), "l"(*(const unsigned long long*)&_f32x2_mul_b_73));
@@ -1203,7 +1202,7 @@ kernel_cake_causal_conv1d_det_train_149ca6f53934ba630033(__nv_bfloat16* __restri
                             float2 _f32x2_mul_b_78 = fma_f32x2_rn_noftz(pv_p2_5, sub_f32x2_noftz(make_float2(1.0f, 1.0f), pv_sg2_5), make_float2(1.0f, 1.0f));
                             float2 pv_g2_5;
                             asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&pv_g2_5) : "l"(*(const unsigned long long*)&pv_sg2_5), "l"(*(const unsigned long long*)&_f32x2_mul_b_78));
-                            float2 pv_d2_5 = fma_f32x2_rn_noftz(make_float2(dyf_1[0 + 2 * pv_h_5], dyf_1[0 + 2 * pv_h_5 + 1]), pv_g2_5, make_float2(wr_1[32], wr_1[33]));
+                            float2 pv_d2_5 = fma_f32x2_rn_noftz(make_float2(dyf_1[2 * pv_h_5], dyf_1[2 * pv_h_5 + 1]), pv_g2_5, make_float2(wr_1[32], wr_1[33]));
                             dp_1[2 * pv_h_5] = pv_d2_5.x;
                             dp_1[2 * pv_h_5 + 1] = pv_d2_5.y;
                             #pragma unroll
@@ -1212,7 +1211,7 @@ kernel_cake_causal_conv1d_det_train_149ca6f53934ba630033(__nv_bfloat16* __restri
                                 acc[8 * pv_h_5 + kk_9] = pv_a2_4.x;
                                 acc[8 * pv_h_5 + 4 + kk_9] = pv_a2_4.y;
                             }
-                            float2 pv_b2_4 = add_f32x2_noftz(make_float2(accb[0 + 2 * pv_h_5], accb[0 + 2 * pv_h_5 + 1]), pv_d2_5);
+                            float2 pv_b2_4 = add_f32x2_noftz(make_float2(accb[2 * pv_h_5], accb[2 * pv_h_5 + 1]), pv_d2_5);
                             accb[2 * pv_h_5] = pv_b2_4.x;
                             accb[2 * pv_h_5 + 1] = pv_b2_4.y;
                             #pragma unroll
@@ -1339,7 +1338,7 @@ kernel_cake_causal_conv1d_det_train_149ca6f53934ba630033(__nv_bfloat16* __restri
                                 if (tcur_1 < t_end_1) {
                                     #pragma unroll
                                     for (int pv_h_6 = 0; pv_h_6 < 4; pv_h_6++) {
-                                        float2 pv_p2_6 = add_f32x2_noftz(fma_f32x2_rn_noftz(make_float2(wr_1[8 * pv_h_6 + 3], wr_1[8 * pv_h_6 + 4 + 3]), make_float2(win_1[u_5 % 4 * 8 + 2 * pv_h_6], win_1[u_5 % 4 * 8 + 2 * pv_h_6 + 1]), fma_f32x2_rn_noftz(make_float2(wr_1[8 * pv_h_6 + 2], wr_1[8 * pv_h_6 + 4 + 2]), make_float2(win_1[(u_5 % 4 + 3) % 4 * 8 + 2 * pv_h_6], win_1[(u_5 % 4 + 3) % 4 * 8 + 2 * pv_h_6 + 1]), fma_f32x2_rn_noftz(make_float2(wr_1[8 * pv_h_6 + 1], wr_1[8 * pv_h_6 + 4 + 1]), make_float2(win_1[(u_5 % 4 + 2) % 4 * 8 + 2 * pv_h_6], win_1[(u_5 % 4 + 2) % 4 * 8 + 2 * pv_h_6 + 1]), mul_f32x2_noftz(make_float2(wr_1[8 * pv_h_6 + 0], wr_1[8 * pv_h_6 + 4 + 0]), make_float2(win_1[(u_5 % 4 + 1) % 4 * 8 + 2 * pv_h_6], win_1[(u_5 % 4 + 1) % 4 * 8 + 2 * pv_h_6 + 1]))))), make_float2(br_1[0 + 2 * pv_h_6], br_1[0 + 2 * pv_h_6 + 1]));
+                                        float2 pv_p2_6 = add_f32x2_noftz(fma_f32x2_rn_noftz(make_float2(wr_1[8 * pv_h_6 + 3], wr_1[8 * pv_h_6 + 4 + 3]), make_float2(win_1[u_5 % 4 * 8 + 2 * pv_h_6], win_1[u_5 % 4 * 8 + 2 * pv_h_6 + 1]), fma_f32x2_rn_noftz(make_float2(wr_1[8 * pv_h_6 + 2], wr_1[8 * pv_h_6 + 4 + 2]), make_float2(win_1[(u_5 % 4 + 3) % 4 * 8 + 2 * pv_h_6], win_1[(u_5 % 4 + 3) % 4 * 8 + 2 * pv_h_6 + 1]), fma_f32x2_rn_noftz(make_float2(wr_1[8 * pv_h_6 + 1], wr_1[8 * pv_h_6 + 4 + 1]), make_float2(win_1[(u_5 % 4 + 2) % 4 * 8 + 2 * pv_h_6], win_1[(u_5 % 4 + 2) % 4 * 8 + 2 * pv_h_6 + 1]), mul_f32x2_noftz(make_float2(wr_1[8 * pv_h_6], wr_1[8 * pv_h_6 + 4]), make_float2(win_1[(u_5 % 4 + 1) % 4 * 8 + 2 * pv_h_6], win_1[(u_5 % 4 + 1) % 4 * 8 + 2 * pv_h_6 + 1]))))), make_float2(br_1[2 * pv_h_6], br_1[2 * pv_h_6 + 1]));
                                         float2 _f32x2_mul_b_82 = make_float2(-1.442695f, -1.442695f);
                                         float2 pv_e2_6;
                                         asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&pv_e2_6) : "l"(*(const unsigned long long*)&pv_p2_6), "l"(*(const unsigned long long*)&_f32x2_mul_b_82));
@@ -1352,7 +1351,7 @@ kernel_cake_causal_conv1d_det_train_149ca6f53934ba630033(__nv_bfloat16* __restri
                                         float2 _f32x2_mul_b_87 = fma_f32x2_rn_noftz(pv_p2_6, sub_f32x2_noftz(make_float2(1.0f, 1.0f), pv_sg2_6), make_float2(1.0f, 1.0f));
                                         float2 pv_g2_6;
                                         asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&pv_g2_6) : "l"(*(const unsigned long long*)&pv_sg2_6), "l"(*(const unsigned long long*)&_f32x2_mul_b_87));
-                                        float2 pv_d2_6 = fma_f32x2_rn_noftz(make_float2(dyf_1[0 + 2 * pv_h_6], dyf_1[0 + 2 * pv_h_6 + 1]), pv_g2_6, make_float2(wr_1[32], wr_1[33]));
+                                        float2 pv_d2_6 = fma_f32x2_rn_noftz(make_float2(dyf_1[2 * pv_h_6], dyf_1[2 * pv_h_6 + 1]), pv_g2_6, make_float2(wr_1[32], wr_1[33]));
                                         dp_1[2 * pv_h_6] = pv_d2_6.x;
                                         dp_1[2 * pv_h_6 + 1] = pv_d2_6.y;
                                         #pragma unroll
@@ -1361,7 +1360,7 @@ kernel_cake_causal_conv1d_det_train_149ca6f53934ba630033(__nv_bfloat16* __restri
                                             acc[8 * pv_h_6 + kk_11] = pv_a2_5.x;
                                             acc[8 * pv_h_6 + 4 + kk_11] = pv_a2_5.y;
                                         }
-                                        float2 pv_b2_5 = add_f32x2_noftz(make_float2(accb[0 + 2 * pv_h_6], accb[0 + 2 * pv_h_6 + 1]), pv_d2_6);
+                                        float2 pv_b2_5 = add_f32x2_noftz(make_float2(accb[2 * pv_h_6], accb[2 * pv_h_6 + 1]), pv_d2_6);
                                         accb[2 * pv_h_6] = pv_b2_5.x;
                                         accb[2 * pv_h_6 + 1] = pv_b2_5.y;
                                         #pragma unroll
@@ -1379,7 +1378,7 @@ kernel_cake_causal_conv1d_det_train_149ca6f53934ba630033(__nv_bfloat16* __restri
                                 } else {
                                     #pragma unroll
                                     for (int pv_h_7 = 0; pv_h_7 < 4; pv_h_7++) {
-                                        float2 pv_p2_7 = add_f32x2_noftz(fma_f32x2_rn_noftz(make_float2(wr_1[8 * pv_h_7 + 3], wr_1[8 * pv_h_7 + 4 + 3]), make_float2(win_1[u_5 % 4 * 8 + 2 * pv_h_7], win_1[u_5 % 4 * 8 + 2 * pv_h_7 + 1]), fma_f32x2_rn_noftz(make_float2(wr_1[8 * pv_h_7 + 2], wr_1[8 * pv_h_7 + 4 + 2]), make_float2(win_1[(u_5 % 4 + 3) % 4 * 8 + 2 * pv_h_7], win_1[(u_5 % 4 + 3) % 4 * 8 + 2 * pv_h_7 + 1]), fma_f32x2_rn_noftz(make_float2(wr_1[8 * pv_h_7 + 1], wr_1[8 * pv_h_7 + 4 + 1]), make_float2(win_1[(u_5 % 4 + 2) % 4 * 8 + 2 * pv_h_7], win_1[(u_5 % 4 + 2) % 4 * 8 + 2 * pv_h_7 + 1]), mul_f32x2_noftz(make_float2(wr_1[8 * pv_h_7 + 0], wr_1[8 * pv_h_7 + 4 + 0]), make_float2(win_1[(u_5 % 4 + 1) % 4 * 8 + 2 * pv_h_7], win_1[(u_5 % 4 + 1) % 4 * 8 + 2 * pv_h_7 + 1]))))), make_float2(br_1[0 + 2 * pv_h_7], br_1[0 + 2 * pv_h_7 + 1]));
+                                        float2 pv_p2_7 = add_f32x2_noftz(fma_f32x2_rn_noftz(make_float2(wr_1[8 * pv_h_7 + 3], wr_1[8 * pv_h_7 + 4 + 3]), make_float2(win_1[u_5 % 4 * 8 + 2 * pv_h_7], win_1[u_5 % 4 * 8 + 2 * pv_h_7 + 1]), fma_f32x2_rn_noftz(make_float2(wr_1[8 * pv_h_7 + 2], wr_1[8 * pv_h_7 + 4 + 2]), make_float2(win_1[(u_5 % 4 + 3) % 4 * 8 + 2 * pv_h_7], win_1[(u_5 % 4 + 3) % 4 * 8 + 2 * pv_h_7 + 1]), fma_f32x2_rn_noftz(make_float2(wr_1[8 * pv_h_7 + 1], wr_1[8 * pv_h_7 + 4 + 1]), make_float2(win_1[(u_5 % 4 + 2) % 4 * 8 + 2 * pv_h_7], win_1[(u_5 % 4 + 2) % 4 * 8 + 2 * pv_h_7 + 1]), mul_f32x2_noftz(make_float2(wr_1[8 * pv_h_7], wr_1[8 * pv_h_7 + 4]), make_float2(win_1[(u_5 % 4 + 1) % 4 * 8 + 2 * pv_h_7], win_1[(u_5 % 4 + 1) % 4 * 8 + 2 * pv_h_7 + 1]))))), make_float2(br_1[2 * pv_h_7], br_1[2 * pv_h_7 + 1]));
                                         float2 _f32x2_mul_b_89 = make_float2(-1.442695f, -1.442695f);
                                         float2 pv_e2_7;
                                         asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&pv_e2_7) : "l"(*(const unsigned long long*)&pv_p2_7), "l"(*(const unsigned long long*)&_f32x2_mul_b_89));
@@ -1392,7 +1391,7 @@ kernel_cake_causal_conv1d_det_train_149ca6f53934ba630033(__nv_bfloat16* __restri
                                         float2 _f32x2_mul_b_94 = fma_f32x2_rn_noftz(pv_p2_7, sub_f32x2_noftz(make_float2(1.0f, 1.0f), pv_sg2_7), make_float2(1.0f, 1.0f));
                                         float2 pv_g2_7;
                                         asm("mul.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&pv_g2_7) : "l"(*(const unsigned long long*)&pv_sg2_7), "l"(*(const unsigned long long*)&_f32x2_mul_b_94));
-                                        float2 pv_d2_7 = fma_f32x2_rn_noftz(make_float2(dyf_1[0 + 2 * pv_h_7], dyf_1[0 + 2 * pv_h_7 + 1]), pv_g2_7, make_float2(wr_1[32], wr_1[33]));
+                                        float2 pv_d2_7 = fma_f32x2_rn_noftz(make_float2(dyf_1[2 * pv_h_7], dyf_1[2 * pv_h_7 + 1]), pv_g2_7, make_float2(wr_1[32], wr_1[33]));
                                         dp_1[2 * pv_h_7] = pv_d2_7.x;
                                         dp_1[2 * pv_h_7 + 1] = pv_d2_7.y;
                                         #pragma unroll

@@ -59,8 +59,13 @@ counters that every launch leaves zero
 (:func:`cake_causal_conv1d_train_backward_workspace` returns it zeroed; size
 depends on ``C`` and the route, not on ``S``; never share one between two
 backward launches that may run at once, e.g. on two streams); when omitted
-the package keeps one zeroed buffer per (device, current stream), or a fresh
-one inside a CUDA Graph capture.  The forward workspace (zeroed int32
+the package keeps one zeroed buffer per (device, current stream), or inside
+a CUDA Graph capture one zeroed buffer per capture and stream, shared by its
+backward calls on that stream: the capture records one fill node for it, and
+another for a larger buffer when a call needs more bytes.  That buffer stays
+alive after its graph is freed, until a later capture on that stream replaces
+it.  With capture id 0 (also when ``cuda.bindings`` is not importable) each
+captured backward call allocates and zeroes a buffer of its own.  The forward workspace (zeroed int32
 token-chunk counters) has the same size and rules in both packages.
 
 The backward entry points and the backward workspace helpers take the

@@ -30,6 +30,9 @@ from .weights import (
 )
 
 if TYPE_CHECKING:
+    from ..mxfp4_mxfp4_bf16_cutedsl.config import (
+        Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
+    )
     from ......tensors import MoEEpTensors
     from ......kernel_src.sm107.next_cutedsl_megamoe.shim.block_scaled import (
         Sm107BlockScaledSymmBuffer,
@@ -41,7 +44,8 @@ if TYPE_CHECKING:
 
 def _resolve_gate_up_clamp(
     config: Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig
-    | Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
+    | Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig
+    | Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
 ) -> float | None:
     if config.gate_up_clamp is not None:
         return config.gate_up_clamp
@@ -59,7 +63,8 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
     def __init__(
         self,
         config: Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig
-        | Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
+        | Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig
+        | Sm107_Mxfp4_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
     ) -> None:
         super().__init__(config)
         self._kernel_config = config

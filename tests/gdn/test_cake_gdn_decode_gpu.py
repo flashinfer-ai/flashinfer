@@ -966,9 +966,10 @@ def _launch_bf16_serving(
     )
 
 
-# B 1 / 31: small band (mid4 on sm_107a); 32 / 34: the wave-fit range (tilev32_x2 on
-# sm_107a); 35: the large body on every architecture.
-@pytest.mark.parametrize("batch_size", [1, 31, 32, 34, 35])
+# B 1 / 20: small band (mid4 on sm_107a); 21 / 31: the upper small band (the TMA-state
+# hqsplit_tma3 body on sm_107a, the small body elsewhere); 32 .. 64: the large band (the
+# TMA-state hqsplit_tma3 body on sm_107a, the large body elsewhere).
+@pytest.mark.parametrize("batch_size", [1, 20, 21, 31, 32, 34, 35, 37, 64])
 def test_exported_decode_matches_torch_on_caller_stream(batch_size: int) -> None:
     tensors = _make_inputs(batch_size)
     initial_state = tensors["state"].clone()
@@ -1012,6 +1013,146 @@ def test_exported_decode_is_cuda_graph_safe() -> None:
     graph.replay()
     stream.synchronize()
 
+    torch.testing.assert_close(
+        tensors["out"].float(), expected_out.float(), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(tensors["state"], expected_state, atol=1e-3, rtol=1e-3)
+
+
+def _require_tma_state_route(batch_size: int):
+    route, entry = _load(batch_size)
+    record = cake_gdn._kernel_record(route.variant_name)
+    if record["tma_abi"] != "grid_constant":
+        pytest.skip(f"{_arch()} runs no TMA-state nontranspose record")
+    return route, entry
+
+
+def test_tma_state_decode_graph_replays_the_state_each_capture_saw() -> None:
+    # The TMA-state body takes the state as a by-value tensor map encoded per call: a graph
+    # captured on one state tensor replays on that tensor, a second capture on another state
+    # tensor replays on its own, and neither replay touches the other tensor.
+    batch_size = 64
+    _require_tma_state_route(batch_size)
+    _, entry = _load(batch_size)
+    tensors = _make_inputs(batch_size)
+    initial = tensors["state"].clone()
+    other = (torch.randn_like(initial) * 0.01).contiguous()
+    other_initial = other.clone()
+    expected_out, expected_state = _reference(tensors, initial)
+    _, expected_other = _reference(tensors, other_initial)
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        _launch(entry, tensors, batch_size)
+        _launch(entry, tensors, batch_size, state=other)
+    stream.synchronize()
+    tensors["state"].copy_(initial)
+    other.copy_(other_initial)
+    first, second = torch.cuda.CUDAGraph(), torch.cuda.CUDAGraph()
+    with torch.cuda.graph(first, stream=stream):
+        _launch(entry, tensors, batch_size)
+    with torch.cuda.graph(second, stream=stream):
+        _launch(entry, tensors, batch_size, state=other)
+    first.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(
+        tensors["out"].float(), expected_out.float(), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(tensors["state"], expected_state, atol=1e-3, rtol=1e-3)
+    assert torch.equal(other, other_initial)
+    after_first = tensors["state"].clone()
+    second.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(other, expected_other, atol=1e-3, rtol=1e-3)
+    assert torch.equal(tensors["state"], after_first)
+
+
+def test_tma_state_decode_refuses_a_misaligned_state_before_launch() -> None:
+    # The tensor map needs a 16-byte aligned base address: a contiguous state view at a
+    # 4-byte offset is refused by the host shim, the state is left untouched and the
+    # stream stays usable.
+    batch_size = 64
+    _require_tma_state_route(batch_size)
+    _, entry = _load(batch_size)
+    tensors = _make_inputs(batch_size)
+    numel = tensors["state"].numel()
+    flat = torch.zeros(numel + 4, device=tensors["state"].device, dtype=torch.float32)
+    misaligned = flat[1 : 1 + numel].view_as(tensors["state"])
+    misaligned.copy_(tensors["state"])
+    assert misaligned.is_contiguous() and misaligned.data_ptr() % 16 != 0
+    before = misaligned.clone()
+    with pytest.raises(ValueError, match="16-byte aligned"):
+        _launch(entry, tensors, batch_size, state=misaligned)
+    torch.cuda.synchronize()
+    assert torch.equal(misaligned, before)
+    initial = tensors["state"].clone()
+    expected_out, expected_state = _reference(tensors, initial)
+    _launch(entry, tensors, batch_size)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(tensors["state"], expected_state, atol=1e-3, rtol=1e-3)
+
+
+# B 21: formerly the mid4_rc_kq128 twin; B 32: formerly the tilev32_x2 twin; B 64:
+# formerly the hqsplit twin.
+@pytest.mark.parametrize("backend", ["cake_gdn", "auto"])
+@pytest.mark.parametrize("batch_size", [21, 32, 64])
+def test_public_decode_refuses_a_misaligned_state_and_runs_an_aligned_one_on_tma(
+    batch_size: int, backend: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # No sm_107a record from 21 rows on runs a state whose base is not 16-byte aligned: the
+    # pointer twins it replaces move the state with 16-byte vector loads and stores (a
+    # misaligned-address fault), and the TMA-state record needs an aligned tensor-map
+    # base.  Through the public API the misaligned call is refused before launch with
+    # the state untouched; the same call on an aligned state runs the TMA-state record
+    # and matches a direct launch of that record bit for bit.
+    route, entry = _require_tma_state_route(batch_size)
+    selected: list[str] = []
+    select = cake_gdn.select_cake_gdn_decode_variant
+
+    def spy(**kwargs):
+        chosen = select(**kwargs)
+        selected.append(chosen.variant_name)
+        return chosen
+
+    monkeypatch.setattr(cake_gdn, "select_cake_gdn_decode_variant", spy)
+    tensors = _make_inputs(batch_size)
+    initial = tensors["state"].clone()
+    numel = initial.numel()
+
+    def call(state: torch.Tensor) -> None:
+        public_nontranspose_decode(
+            q=tensors["q"],
+            k=tensors["k"],
+            v=tensors["v"],
+            state=state,
+            A_log=tensors["A_log"],
+            a=tensors["a"],
+            dt_bias=tensors["dt_bias"],
+            b=tensors["b"],
+            output=tensors["out"],
+            backend=backend,
+        )
+
+    for offset in (1, 2, 3):
+        flat = torch.zeros(numel + 4, device=initial.device, dtype=torch.float32)
+        misaligned = flat[offset : offset + numel].view_as(initial)
+        misaligned.copy_(initial)
+        assert misaligned.is_contiguous() and misaligned.data_ptr() % 16 != 0
+        with pytest.raises(ValueError, match="16-byte aligned"):
+            call(misaligned)
+        torch.cuda.synchronize()
+        assert torch.equal(misaligned, initial)
+    assert selected == [route.variant_name] * 3
+
+    direct = {"out": tensors["out"].clone(), "state": initial.clone()}
+    _launch(entry, {**tensors, "out": direct["out"]}, batch_size, state=direct["state"])
+    tensors["out"].zero_()
+    call(tensors["state"])
+    torch.cuda.synchronize()
+    assert selected[-1] == route.variant_name
+    assert cake_gdn._kernel_record(route.variant_name)["tma_abi"] == "grid_constant"
+    assert torch.equal(tensors["out"], direct["out"])
+    assert torch.equal(tensors["state"], direct["state"])
+    expected_out, expected_state = _reference(tensors, initial)
     torch.testing.assert_close(
         tensors["out"].float(), expected_out.float(), atol=1e-2, rtol=1e-2
     )
@@ -1550,7 +1691,7 @@ def test_public_cake_gdn_fp32_mtp_verify_is_cuda_graph_safe():
     )
 
 
-@pytest.mark.parametrize("batch_size", (1, 32))
+@pytest.mark.parametrize("batch_size", (1, 24, 32))
 def test_public_cake_gdn_fp32_nontranspose_t1_matches_independent_recurrence_on_stream(
     batch_size,
 ):

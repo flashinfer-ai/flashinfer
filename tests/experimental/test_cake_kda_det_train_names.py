@@ -20,9 +20,9 @@ The single-rank entry points live in ``flashinfer.cake_kda_det_train`` and the p
 the single-rank names of ``flashinfer.kda_train``, the backend names of ``cake_backend`` and of the package, and
 every name of the compatibility package ``flashinfer.experimental.cake_kda_train``, whose submodules are the det
 package's module objects and whose ``__all__`` (so its star import) is the list before the move.  The previous names
-stay out of the det ``__all__``.  The manifests name the det package; the 65 single-rank programs are
-``cake_kda_det_train_<digest>`` libraries.  Importing a facade or either package loads no KCP host module (checked
-in a fresh interpreter by module file).
+stay out of the det ``__all__``.  The manifests name the det package; the 78 single-rank programs (65 of the g
+gate, 8 of the raw gate, 5 of the Q/K L2 norm fallback) are ``cake_kda_det_train_<digest>`` libraries.  Importing a facade or either package loads
+no KCP host module (checked in a fresh interpreter by module file).
 """
 
 from __future__ import annotations
@@ -176,7 +176,9 @@ def test_manifests_name_the_det_package_and_libraries() -> None:
     if test_only.is_file():
         assert json.loads(test_only.read_text())["package"] == NEW_PACKAGE
     single = {record["library"] for record in cake_jit.MODULES.values()}
-    assert len(single) == 65
+    # 65 g-gate, 8 raw-gate, 5 Q/K L2 norm fallback and 15 fused Q/K L2 norm programs (8 g-gate, fwd_intra v37
+    # on sm_103a among them, and 7 raw-gate)
+    assert len(single) == 93
     for library in single:
         assert re.fullmatch(r"cake_kda_det_train_[0-9a-f]{20}", library), library
     for name, record in cake_jit.MODULES.items():

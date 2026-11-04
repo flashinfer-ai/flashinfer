@@ -660,6 +660,7 @@ def gen_all_modules(
     jit_specs.append(gen_spdlog_module())
     has_bgmv_moe = sm_capabilities.get("bgmv_moe", False)
     has_sm80 = sm_capabilities.get("sm80", False)
+    has_sm89 = sm_capabilities.get("sm89", False)
     has_sm90 = sm_capabilities.get("sm90", False)
     has_sm100 = sm_capabilities.get("sm100", False)
     has_blackwell_msa_sm100a = sm_capabilities.get("blackwell_msa_sm100a", False)
@@ -698,6 +699,9 @@ def gen_all_modules(
     )
     has_cake_megamoe_topk_reduce_sm103a = sm_capabilities.get(
         "cake_megamoe_topk_reduce_sm103a", False
+    )
+    has_cake_megamoe_topk_reduce_sm107a = sm_capabilities.get(
+        "cake_megamoe_topk_reduce_sm107a", False
     )
     has_cake_selective_state_update_sm100a = sm_capabilities.get(
         "cake_selective_state_update_sm100a", False
@@ -947,6 +951,8 @@ def gen_all_modules(
             jit_specs.append(gen_cake_megamoe_topk_reduce_module("sm_100a"))
         if has_cake_megamoe_topk_reduce_sm103a:
             jit_specs.append(gen_cake_megamoe_topk_reduce_module("sm_103a"))
+        if has_cake_megamoe_topk_reduce_sm107a:
+            jit_specs.append(gen_cake_megamoe_topk_reduce_module("sm_107a"))
         # Cake selective state update: every program instantiation a route of the architecture selects
         # (the four-CTA residency schedule of the paired row-major program has an sm_100a band only).
         if has_cake_selective_state_update_sm100a:
@@ -1080,10 +1086,20 @@ def gen_all_modules(
             gen_pcie_ipc_comm_module,
             gen_trtllm_comm_module,
             gen_trtllm_mnnvl_comm_module,
+            gen_ulysses_lowp_module,
+            gen_ulysses_lowp_sm90_module,
             gen_vllm_comm_module,
         )
 
         jit_specs.append(gen_nvlink_two_sided_alltoall_module())
+        if has_sm89 or has_sm120:
+            # One fat binary covers SM89 and SM120; register it only once.
+            jit_specs.append(gen_ulysses_lowp_module())
+        if has_sm90:
+            # The SM90 grid (16/128) lives in its own translation unit pinned to
+            # -gencode sm_90a, so it needs its own prebuild; without this every
+            # Hopper caller JIT-compiles ulysses_lowp_sm90.cu on first use.
+            jit_specs.append(gen_ulysses_lowp_sm90_module())
         if (
             has_sm90
             or has_sm100
@@ -1155,7 +1171,7 @@ def gen_all_modules(
             gen_sampling_module(),
             gen_topk_module(),
         ]
-        if has_sm100 or has_sm103:
+        if has_sm100 or has_sm103 or has_sm107:
             jit_specs.append(gen_blackwell_softmax_module())
         # Cake radix sampling: one fatbin over every 9.x-12.x target (clusters + DSM only).
         if any(
@@ -1520,6 +1536,8 @@ def detect_sm_capabilities():
             for major, _ in compilation_context.TARGET_CUDA_ARCHS
         ),
         "sm80": has_any_sm8x and cuda_version >= Version("11.0"),
+        # The Lowp SM89/SM120 fat binary also emits sm_120a (CUDA >= 12.8).
+        "sm89": has_sm("compute_89", "12.8"),
         "sm90": has_sm("compute_90", "12.3"),
         "sm100": has_sm("compute_100", "12.8"),
         "sm100a_exact": (10, "0a") in compilation_context.TARGET_CUDA_ARCHS
@@ -1588,6 +1606,10 @@ def detect_sm_capabilities():
         "cake_megamoe_topk_reduce_sm103a": (
             (10, "3a") in compilation_context.TARGET_CUDA_ARCHS
             and cuda_version >= Version("12.9")
+        ),
+        "cake_megamoe_topk_reduce_sm107a": (
+            (10, "7a") in compilation_context.TARGET_CUDA_ARCHS
+            and cuda_version >= Version("13.0")
         ),
         "cake_selective_state_update_sm100a": (
             (10, "0a") in compilation_context.TARGET_CUDA_ARCHS

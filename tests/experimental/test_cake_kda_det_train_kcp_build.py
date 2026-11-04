@@ -94,8 +94,9 @@ PLANS = {
     "kcp_dhu_tape_full": DHU_PLAN,
 }
 # The identity rule: ``cake_kda_det_train_<20 hex of sha256("<source module>\\n<sorted JSON of the build keywords>")>``,
-# then ``_kcp`` for a program only the context-parallel route runs (every one but the two chunk stages).  The
-# digest hashes the source module path the program shipped under, so the digests are those of the previous names.
+# then ``_kcp`` for a program only the context-parallel route runs (every one but the single-rank ``dav`` stage).
+# The digest hashes the source module path the program shipped under, so the digests are those of the previous names
+# (``kcp_fwd_o``'s KCP module is new: its path is its own).
 _W = "sm100_sm103_sm107"
 IDENTITIES = {
     "kcp_fwdh_offset": (
@@ -134,7 +135,7 @@ IDENTITIES = {
         f"tart.kda_chunk_kcp_affine_merge.{_W}.kda_chunk_kcp_affine_merge_fp32_v1",
         {"cols_per_cta": 16},
     ),
-    "kcp_fwd_o": (f"tart.kda_chunk_fwd_o.{_W}.kda_chunk_train_fwd_o_v1", {}),
+    "kcp_fwd_o": (f"tart.kda_chunk_kcp_fwd_o.{_W}.kda_chunk_det_fwd_o_v1_kcp", {}),
     "kcp_dav": (f"tart.kda_chunk_bwd_dav.{_W}.kda_chunk_train_bwd_dav_v1", {}),
     "kcp_transfer_walk_three_mma": (
         f"tart.kda_chunk_kcp_transfer_walk.{_W}.kda_chunk_kcp_transfer_walk_v1",
@@ -163,8 +164,9 @@ IDENTITIES = {
 }
 
 
-# The two chunk stages the route runs at the rank's shape: det programs without the ``_kcp`` suffix.
-CHUNK_STAGES = ("kcp_fwd_o", "kcp_dav")
+# The chunk stage the route runs at the rank's shape with the single-rank kernel: a det program without the ``_kcp``
+# suffix (``kcp_fwd_o`` runs the KCP output program).
+CHUNK_STAGES = ("kcp_dav",)
 
 
 def _records() -> dict[str, dict]:
@@ -292,13 +294,20 @@ def test_selection_and_grids() -> None:
     )
     with pytest.raises(ValueError):
         kcp_jit.launch_grid("kcp_fwdh_offset", n_walk=0, num_heads=4)
-    # the chunk stages: persistent CTAs bounded by the SMs, one CTA per chunk pair and head
+    # the chunk stages: one CTA per (chunk, head) tile whatever the SM count, one CTA per chunk pair and head
     assert kcp_jit.launch_grid(
         "kcp_fwd_o", num_chunks_pad=10, num_heads=3, sm_count=152
     ) == (30, 1, 1)
     assert kcp_jit.launch_grid(
         "kcp_fwd_o", num_chunks_pad=400, num_heads=4, sm_count=152
-    ) == (152, 1, 1)
+    ) == (1600, 1, 1)
+    assert kcp_jit.launch_grid("kcp_fwd_o", num_chunks_pad=268, num_heads=64) == (
+        17152,
+        1,
+        1,
+    )
+    with pytest.raises(ValueError):
+        kcp_jit.launch_grid("kcp_fwd_o", num_chunks_pad=0, num_heads=4, sm_count=152)
     assert kcp_jit.launch_grid("kcp_dav", num_chunks_pad=10, num_heads=3) == (5, 3, 1)
     with pytest.raises(ValueError):
         kcp_jit.launch_grid("kcp_dav", num_chunks_pad=9, num_heads=3)

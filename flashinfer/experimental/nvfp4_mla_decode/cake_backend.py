@@ -16,8 +16,11 @@ limitations under the License.
 
 from __future__ import annotations
 
+import ctypes
 import math
-from dataclasses import dataclass, replace
+from array import array
+from dataclasses import dataclass, field, replace
+from itertools import chain
 from typing import Optional, Sequence
 
 import torch
@@ -75,6 +78,11 @@ BALANCED_MIN_KV = 8192  # auto schedule: balanced partition from this KV length 
 QK_AHEAD_RECORD = "decode_qk_ahead"
 QK_AHEAD_MIN_UNIT_TILES = 512  # pipeline tiles of every unit
 QK_AHEAD_MIN_PIECE_TILES = 257  # pipeline tiles of the longest piece of every unit
+# (unit tiles, piece tiles) in place of the two above, keyed by the clusters the
+# device requests (``num_sms // CLUSTER_PAIR``, not the plan's unit count, which
+# the partition may lower): on a 148-SM part the program pays off from shorter
+# ranges.
+QK_AHEAD_MIN_TILES_BY_CLUSTERS = {74: (330, 165)}
 # The short-row program reads its unit range in the kernel setup and frees its
 # tensor memory once the last epilogue has read it; it pays off when every
 # cluster streams a short range.
@@ -117,6 +125,19 @@ REVERSED_PIECE_TARGETS = frozenset({("sm_100a", 76), ("sm_103a", 76)})
 # from its top loads, which pays off for rows of more than two splits.
 REDUCE_GENERAL_RECORD = "reduce_general"
 REDUCE_GENERAL_MIN_SPLITS = 3  # KV splits of the plan's most split row
+# The combine program without the per-row split-count load: every row it runs
+# takes two splits, so it reads only the partials the decode just wrote. On an
+# (architecture, cluster count) of ``REDUCE_TWO_SPLITS_TARGETS`` it runs a plan
+# of two splits per row that a short-row decode program runs, when the rows
+# of two splits form one contiguous range of query rows; it is launched over
+# that range alone (``split_row_range``), with its row pointers offset to the
+# range's first row. The cluster count is the one the plan requests, ``num_sms
+# // CLUSTER_PAIR``: 74 on B200, 76 on GB200.
+REDUCE_TWO_SPLITS_RECORD = "reduce_two_splits"
+REDUCE_TWO_SPLITS_TARGETS = frozenset({("sm_100a", 74), ("sm_100a", 76)})
+SHORT_DECODE_RECORDS = frozenset(
+    {SHORT_RECORD, SHORT_EPI_RECORD, SHORT_SPEC_RECORD, SHORT_EPI_SPEC_RECORD}
+)
 WORKSPACE_ALIGNMENT = 256
 
 # Keyword names the two stages are bound with (arg plans refer to these names).
@@ -590,7 +611,7 @@ def build_work_plan(
     if (
         plan.schedule == "balanced"
         and (arch, num_sms // CLUSTER_PAIR) in REVERSED_PIECE_TARGETS
-        and select_decode_record(plan, arch) in LONG_DECODE_RECORDS
+        and select_decode_record(plan, arch, num_sms) in LONG_DECODE_RECORDS
     ):
         plan = _reverse_unit_pieces(plan)
     return plan
@@ -602,7 +623,9 @@ def _delivered(name: str, arch: str) -> bool:
     return record is not None and arch in record["arches"]
 
 
-def select_decode_record(plan: WorkPlan, arch: str) -> str:
+def select_decode_record(
+    plan: WorkPlan, arch: str, num_sms: Optional[int] = None
+) -> str:
     """Registry record of the decode program that runs ``plan`` on ``arch``.
 
     A pure host function of the plan, fixed at prepare time, so a captured
@@ -611,7 +634,9 @@ def select_decode_record(plan: WorkPlan, arch: str) -> str:
     ``QK_AHEAD_RECORD`` (the same kernel with the QK MMAs issued two tiles
     ahead of PV, delivered for SM100 only) runs a balanced plan when every
     unit holds at least ``QK_AHEAD_MIN_UNIT_TILES`` pipeline tiles with a
-    piece of at least ``QK_AHEAD_MIN_PIECE_TILES``; ``XV_RECORD`` (the
+    piece of at least ``QK_AHEAD_MIN_PIECE_TILES`` (on a device of ``num_sms``
+    SMs, the pair ``QK_AHEAD_MIN_TILES_BY_CLUSTERS`` names for its
+    ``num_sms // CLUSTER_PAIR`` clusters); ``XV_RECORD`` (the
     decode with its row-pair max exchange gated by a vote, delivered for
     SM103 only) runs a plan of either schedule when every unit holds at least
     ``XV_MIN_STEADY_TILES`` pipeline tiles past ``XV_WARMUP_TILES`` tiles of
@@ -631,14 +656,15 @@ def select_decode_record(plan: WorkPlan, arch: str) -> str:
         [it[4] - it[3] for it in plan.items[first:last:V_HALVES]]
         for first, last in zip(plan.unit_first, plan.unit_first[1:], strict=False)
     ]
+    min_unit, min_piece = QK_AHEAD_MIN_UNIT_TILES, QK_AHEAD_MIN_PIECE_TILES
+    if num_sms is not None:
+        min_unit, min_piece = QK_AHEAD_MIN_TILES_BY_CLUSTERS.get(
+            num_sms // CLUSTER_PAIR, (min_unit, min_piece)
+        )
     if (
         _delivered(QK_AHEAD_RECORD, arch)
         and plan.schedule == "balanced"
-        and all(
-            sum(lens) >= QK_AHEAD_MIN_UNIT_TILES
-            and max(lens) >= QK_AHEAD_MIN_PIECE_TILES
-            for lens in units
-        )
+        and all(sum(lens) >= min_unit and max(lens) >= min_piece for lens in units)
     ):
         return QK_AHEAD_RECORD
     if _delivered(XV_RECORD, arch) and all(
@@ -667,20 +693,55 @@ def select_decode_record(plan: WorkPlan, arch: str) -> str:
     return "decode"
 
 
-def select_reduce_record(plan: WorkPlan, arch: str) -> str:
+def split_row_range(row_splits: Sequence[int]) -> Optional[tuple]:
+    """``(first, count)`` of the query rows of more than one split (``row_splits``,
+    ``token_splits``) when they form one contiguous range, else ``None``."""
+    rows = [row for row, splits in enumerate(row_splits) if splits > 1]
+    if not rows or rows[-1] - rows[0] + 1 != len(rows):
+        return None
+    return rows[0], len(rows)
+
+
+def select_reduce_record(
+    plan: WorkPlan,
+    arch: str,
+    *,
+    num_sms: Optional[int] = None,
+    row_splits: Optional[Sequence[int]] = None,
+    decode_record: Optional[str] = None,
+) -> str:
     """Registry record of the combine program that runs ``plan`` on ``arch``.
 
     A pure host function of the plan, fixed at prepare time (the combine runs
     only when the plan splits a row). ``REDUCE_GENERAL_RECORD`` runs a plan
     whose most split row has at least ``REDUCE_GENERAL_MIN_SPLITS`` KV splits
-    when the registry delivers it for ``arch``; every other plan runs
-    ``"reduce"``. The combine programs' outputs are bitwise identical.
+    when the registry delivers it for ``arch``; ``REDUCE_TWO_SPLITS_RECORD``
+    runs a plan of two splits per row that a program of
+    ``SHORT_DECODE_RECORDS`` runs (``select_decode_record``) when the registry
+    delivers it for ``arch``, ``(arch, num_sms // CLUSTER_PAIR)`` is in
+    ``REDUCE_TWO_SPLITS_TARGETS`` and the rows of two splits (``row_splits``,
+    one count per query row) form one contiguous range (``split_row_range``);
+    every other plan runs ``"reduce"``. The combine programs' outputs are
+    bitwise identical. ``decode_record`` is the plan's
+    ``select_decode_record(plan, arch, num_sms)`` when the caller holds it
+    (``prepare``), so it is not selected a second time.
     """
     if (
         _delivered(REDUCE_GENERAL_RECORD, arch)
         and plan.max_splits >= REDUCE_GENERAL_MIN_SPLITS
     ):
         return REDUCE_GENERAL_RECORD
+    if (
+        _delivered(REDUCE_TWO_SPLITS_RECORD, arch)
+        and plan.max_splits == 2
+        and num_sms is not None
+        and row_splits is not None
+        and (arch, num_sms // CLUSTER_PAIR) in REDUCE_TWO_SPLITS_TARGETS
+        and (decode_record or select_decode_record(plan, arch, num_sms))
+        in SHORT_DECODE_RECORDS
+        and split_row_range(row_splits) is not None
+    ):
+        return REDUCE_TWO_SPLITS_RECORD
     return "reduce"
 
 
@@ -703,13 +764,13 @@ def _plan_table_words(
     end = layout["q_indptr"][0] + layout["q_indptr"][1]
     words = [0] * ((end - base) // 4)
     for name, values in (
-        ("work_table", [v for item in plan.items for v in item]),
+        ("work_table", chain.from_iterable(plan.items)),
         ("unit_first", plan.unit_first),
         ("row_splits", row_splits),
         ("q_indptr", q_indptr),
     ):
         offset, nbytes = layout[name]
-        values = [int(v) for v in values]
+        values = list(map(int, values))
         if len(values) * 4 != nbytes:
             raise ValueError(f"{name}: {len(values)} words for a {nbytes}-byte region")
         words[(offset - base) // 4 : (offset - base) // 4 + len(values)] = values
@@ -872,9 +933,30 @@ def max_nvfp4_mla_decode_workspace_size(
     )
 
 
+# array typecode of a 32-bit C integer (the table words).
+_INT32_CODE = next(code for code in ("i", "l") if array(code).itemsize == 4)
+
+
+def _table_region(span: torch.Tensor, layout: dict, name: str) -> torch.Tensor:
+    """Int32 region ``name`` of the plan-table span (``work_table`` through
+    ``q_indptr``, viewed as int32 from ``layout["work_table"][0]``), 1-D."""
+    offset, nbytes = layout[name]
+    first = (offset - layout["work_table"][0]) // 4
+    return span[first : first + nbytes // 4]
+
+
+def _as_u8(tensor: torch.Tensor) -> torch.Tensor:
+    """``tensor`` viewed as uint8 (itself when it already is)."""
+    return tensor if tensor.dtype is torch.uint8 else tensor.view(torch.uint8)
+
+
 def _carve(flat: torch.Tensor, layout: dict, name: str, dtype, shape):
     offset, nbytes = layout[name]
-    return flat[offset : offset + nbytes].view(dtype).view(shape)
+    region = flat[offset : offset + nbytes].view(dtype)
+    # A one-dimensional region already has its shape (no second view).
+    if len(shape) == 1 and region.shape[0] == shape[0]:
+        return region
+    return region.view(shape)
 
 
 def host_tables(
@@ -888,7 +970,12 @@ def host_tables(
     ``workspace[layout["work_table"][0] : q_indptr_end]``.
     """
     words = _plan_table_words(plan, layout, q_indptr=q_indptr, row_splits=row_splits)
-    return torch.tensor(words, dtype=torch.int32, pin_memory=True)
+    # array packs the words as int32 without torch.tensor's per-element type
+    # inference; one memmove copies them into the pinned image.
+    packed = array(_INT32_CODE, words)
+    image = torch.empty((len(packed),), dtype=torch.int32, pin_memory=True)
+    ctypes.memmove(image.data_ptr(), packed.buffer_info()[0], len(packed) * 4)
+    return image
 
 
 # ---------------------------------------------------------------------------
@@ -934,17 +1021,40 @@ class NVFP4MLADecodeRunner:
     reduce_entry: object
     reduce_arguments: tuple
     host_tables: Optional[torch.Tensor] = None
+    # The launch form of the arguments above, packed once by
+    # bind_decode_payload: (entry, arguments) per program, and the result.
+    launches: tuple = field(default=(), repr=False, compare=False)
+    result: object = field(default=None, repr=False, compare=False)
 
     def launch(self):
         # Tensor maps are encoded by the host binding and passed by value; the
         # split-KV combine runs only when the plan has more than one split.
-        with tvm_ffi.use_torch_stream():
-            self.main_entry(*self.main_arguments)
-            if self.reduce_entry is not None:
-                self.reduce_entry(*self.reduce_arguments)
-        return (self.out, self.lse) if self.return_lse else self.out
+        # Each call's first CUDA tensor stays a torch.Tensor: tvm-ffi runs the
+        # call on the current torch stream of its device, as FlashInfer's
+        # other kernels do; the other tensors were converted once at bind.
+        for entry, arguments in self.launches:
+            entry(*arguments)
+        return self.result
 
     __call__ = launch
+
+
+def _launch_form(arguments: tuple) -> tuple:
+    """``arguments`` with every tensor but the first CUDA one converted once
+    to a ``tvm_ffi.Tensor`` view of the same memory (no per-launch DLPack
+    exchange); the first CUDA tensor stays a ``torch.Tensor`` and carries
+    the launch stream."""
+    packed, carrier = [], False
+    for argument in arguments:
+        if isinstance(argument, torch.Tensor):
+            if carrier or not argument.is_cuda:
+                argument = tvm_ffi.from_dlpack(argument)
+            else:
+                carrier = True
+        packed.append(argument)
+    if not carrier:
+        raise ValueError("a launch needs a CUDA tensor argument")
+    return tuple(packed)
 
 
 def generated_program_available(device: torch.device) -> bool:
@@ -1025,6 +1135,11 @@ def bind_decode_payload(
         reduce_program = combine["library"]
         reduce_entry = getattr(load(reduce_record, arch), combine["ffi_entry"])
         reduce_arguments = launch_args(combine, reduce_kwargs, reduce_kwargs["grid"])
+    launches: tuple[tuple[object, tuple], ...] = (
+        (main_entry, _launch_form(main_arguments)),
+    )
+    if reduce_entry is not None:
+        launches += ((reduce_entry, _launch_form(reduce_arguments)),)
     return NVFP4MLADecodeRunner(
         arch,
         main_program,
@@ -1040,6 +1155,8 @@ def bind_decode_payload(
         reduce_entry,
         reduce_arguments,
         host_tables,
+        launches,
+        (out, lse) if return_lse else out,
     )
 
 
@@ -1166,7 +1283,8 @@ def prepare_nvfp4_batch_decode_with_kv_cache_mla(
     tensors = [query, query_scale, kv_cache, kv_scale, block_tables, seq_lens]
     tensors += [t for t in (sinks, out, lse, workspace_buffer) if t is not None]
     device = query.device
-    if not all(t.is_cuda and t.device == device for t in tensors):
+    # Every tensor on query's device, and that device a CUDA device.
+    if not query.is_cuda or not all(t.device == device for t in tensors):
         raise ValueError("Expected all tensors on one CUDA device")
     # The kernels address block_tables rows as ``b * max_pages + p``, the output
     # rows as ``row * 512`` and read the Q / KV rows through tensor maps whose
@@ -1193,20 +1311,23 @@ def prepare_nvfp4_batch_decode_with_kv_cache_mla(
             f"every request needs q_len ({q_len}) <= seq_len <= max_pages * {PAGE_SIZE}"
         )
     total_q = batch * q_len
+    num_sms = _device_sm_count(device_index)
     plan = build_work_plan(
         kv_lens,
         num_heads=num_heads,
-        num_sms=_device_sm_count(device_index),
+        num_sms=num_sms,
         q_len=q_len,
         enable_sink=sinks is not None,
         schedule=schedule,
         tiles_per_split=tiles_per_split,
         arch=arch,
     )
-    decode_record = select_decode_record(plan, arch)
-    reduce_record = select_reduce_record(plan, arch)
+    decode_record = select_decode_record(plan, arch, num_sms)
     layout = workspace_layout(plan, batch=batch, num_heads=num_heads, q_len=q_len)
-    flat = workspace_buffer.view(-1).view(torch.uint8)
+    # A one-dimensional uint8 workspace is already the flat byte view.
+    flat = workspace_buffer
+    if flat.dtype is not torch.uint8 or flat.dim() != 1:
+        flat = flat.view(-1).view(torch.uint8)
     if flat.numel() < layout["total"]:
         raise ValueError(
             f"workspace_buffer needs {layout['total']} bytes for this batch "
@@ -1229,12 +1350,16 @@ def prepare_nvfp4_batch_decode_with_kv_cache_mla(
     o_shape, lse_shape = partial_shapes(plan, total_q=total_q, num_heads=num_heads)
     partial_o = _carve(flat, layout, "partial_o", torch.bfloat16, o_shape)
     partial_lse = _carve(flat, layout, "partial_lse", torch.float32, lse_shape)
-    work_table = _carve(
-        flat, layout, "work_table", torch.int32, (plan.num_items, ITEM_FIELDS)
+    # The int32 plan tables are adjacent: one int32 view of their span carves
+    # them and takes the single upload below.
+    table_base = layout["work_table"][0]
+    table_end = layout["q_indptr"][0] + layout["q_indptr"][1]
+    table_span = flat[table_base:table_end].view(torch.int32)
+    work_table = _table_region(table_span, layout, "work_table").view(
+        plan.num_items, ITEM_FIELDS
     )
-    unit_first = _carve(flat, layout, "unit_first", torch.int32, (plan.num_units + 1,))
-    row_splits = _carve(flat, layout, "row_splits", torch.int32, (total_q,))
-    q_indptr = _carve(flat, layout, "q_indptr", torch.int32, (batch + 1,))
+    unit_first = _table_region(table_span, layout, "unit_first")
+    q_indptr = _table_region(table_span, layout, "q_indptr")
     sink_buffer = _carve(flat, layout, "sinks", torch.float32, (num_heads,))
     # The partial regions are not initialized: single-split items keep
     # FLAG_DIRECT_OUT (their CTAs write final O / LSE directly and the combine
@@ -1249,13 +1374,17 @@ def prepare_nvfp4_batch_decode_with_kv_cache_mla(
         )
     else:
         row_splits_host = [1] * total_q
+    reduce_record = select_reduce_record(
+        plan,
+        arch,
+        num_sms=num_sms,
+        row_splits=row_splits_host,
+        decode_record=decode_record,
+    )
     tables = host_tables(
         plan, layout, q_indptr=q_indptr_host, row_splits=row_splits_host
     )
-    table_base = layout["work_table"][0]
-    flat[table_base : table_base + tables.numel() * 4].view(torch.int32).copy_(
-        tables, non_blocking=True
-    )
+    table_span.copy_(tables, non_blocking=True)
     if sinks is None:
         sink_buffer.zero_()
     else:
@@ -1263,9 +1392,9 @@ def prepare_nvfp4_batch_decode_with_kv_cache_mla(
 
     main_kwargs = dict(
         Q=query.view(total_q * num_heads, ROW_BYTES),
-        QS=query_scale.view(torch.uint8).view(total_q * num_heads, SF_ROW_BYTES),
+        QS=_as_u8(query_scale).view(total_q * num_heads, SF_ROW_BYTES),
         KV=kv_cache.view(num_pages * PAGE_SIZE, ROW_BYTES),
-        KVS=kv_scale.view(torch.uint8).view(num_pages * PAGE_SIZE, SF_ROW_BYTES),
+        KVS=_as_u8(kv_scale).view(num_pages * PAGE_SIZE, SF_ROW_BYTES),
         # Bulk-tensor-store maps of the epilogue: O and the split-major partials
         # viewed as [rows, 512] BF16 (the single-split dummy is already 2-D).
         OT=out.view(rows_total, HEAD_DIM),
@@ -1292,18 +1421,28 @@ def prepare_nvfp4_batch_decode_with_kv_cache_mla(
     )
     reduce_kwargs = None
     if max_splits > 1:
+        # The two-split combine runs the contiguous range of split rows alone:
+        # one CTA row per range row, every per-row pointer offset to the
+        # range's first row; total_q stays the full count (the split stride).
+        # Every other combine runs all total_q rows. select_reduce_record
+        # picked it only for a contiguous range (split_row_range) of rows of
+        # two splits, so the range is the first such row and their count.
+        # The combine's row_splits is carved here, from its first row on (the
+        # decode does not take it).
+        first, rows = 0, total_q
+        if reduce_record == REDUCE_TWO_SPLITS_RECORD:
+            first, rows = row_splits_host.index(2), row_splits_host.count(2)
+        splits_first = (layout["row_splits"][0] - table_base) // 4 + first
         reduce_kwargs = dict(
-            o=out,
-            lse=lse,
-            partial_o=partial_o,
-            partial_lse=partial_lse,
-            row_splits=row_splits,
+            o=out[first:] if first else out,
+            lse=lse[first:] if first else lse,
+            partial_o=main_kwargs["PO"][first * num_heads :] if first else partial_o,
+            partial_lse=partial_lse[first:] if first else partial_lse,
+            row_splits=table_span[splits_first : splits_first + total_q - first],
             total_q=total_q,
             num_heads=num_heads,
             max_splits=max_splits,
-            grid=launch_grid(
-                MODULES[reduce_record], total_q=total_q, num_heads=num_heads
-            ),
+            grid=launch_grid(MODULES[reduce_record], total_q=rows, num_heads=num_heads),
         )
     assert tuple(main_kwargs) == MAIN_KWARGS
     assert reduce_kwargs is None or tuple(reduce_kwargs) == REDUCE_KWARGS

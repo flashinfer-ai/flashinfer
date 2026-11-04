@@ -71,7 +71,7 @@ namespace CAKE_PROGRAM_SHIM {
 using namespace cake_host_shim_common;
 using tvm::ffi::TensorView;
 
-void Run(TensorView arg_A, TensorView arg_B, TensorView arg_OUT32, TensorView arg_OUT16, TensorView arg_out, TensorView arg_out32, TensorView arg_ws, TensorView arg_counters, int64_t arg_M, int64_t arg_N, int64_t arg_m_tiles, int64_t arg_n_tiles, int64_t arg_group_m, int64_t arg_promo_code, int64_t arg_k_iters, int64_t arg_ldo, int64_t arg_out_l, int64_t arg_num_cluster_tiles, int64_t arg_num_l, int64_t arg_num_full, int64_t arg_iters_per_unit, int64_t arg_sk_iters, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
+void Run(TensorView arg_A, TensorView arg_B, TensorView arg_OUT32, TensorView arg_OUT16, TensorView arg_out, TensorView arg_out32, TensorView arg_ws, TensorView arg_counters, int64_t arg_M, int64_t arg_N, int64_t arg_m_tiles, int64_t arg_n_tiles, int64_t arg_group_m, int64_t arg_promo_code, int64_t arg_k_iters, int64_t arg_ldo, int64_t arg_out_l, int64_t arg_num_cluster_tiles, int64_t arg_num_l, int64_t arg_num_full, int64_t arg_iters_per_unit, int64_t arg_sk_iters, int64_t enable_pdl, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
   DLDevice dev = arg_A.device();
   tvm::ffi::CUDADeviceGuard device_guard(dev.device_id);
   {
@@ -190,7 +190,7 @@ void Run(TensorView arg_A, TensorView arg_B, TensorView arg_OUT32, TensorView ar
   dim3 block(320u, 1u, 1u);
 
   // Launch attributes of this kernel; the launch itself is the export's shared CakeLaunchDirect.
-  cudaLaunchAttribute attrs[2]{};
+  cudaLaunchAttribute attrs[3]{};
   int n = 0;
   attrs[n].id = cudaLaunchAttributeClusterDimension;
   attrs[n].val.clusterDim.x = 2u;
@@ -200,6 +200,11 @@ void Run(TensorView arg_A, TensorView arg_B, TensorView arg_OUT32, TensorView ar
   attrs[n].id = cudaLaunchAttributeClusterSchedulingPolicyPreference;
   attrs[n].val.clusterSchedulingPolicyPreference = cudaClusterSchedulingPolicySpread;
   ++n;
+  if (enable_pdl) {
+    attrs[n].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[n].val.programmaticStreamSerializationAllowed = 1;
+    ++n;
+  }
   CakeLaunchDirect(reinterpret_cast<const void*>(CAKE_PROGRAM_KERNEL), CAKE_STRINGIZE(CAKE_PROGRAM_KERNEL), grid, block, CAKE_CAT(CAKE_SMEM_TOTAL, u), stream, kargs, attrs, n);
 }
 

@@ -108,6 +108,7 @@ from .cake_policy import (
     ProgramChoice,
     finalize_grid,
     select_program,
+    ticket_static_path,
 )
 
 NUM_HEADS = 32
@@ -594,6 +595,7 @@ def plan_dsa_indexer_det_topk(
         finalize_threads=finalize_threads,
         max_seqlen_k=max_seqlen_k,
         outputs_aligned=bool(outputs_aligned),
+        scan_keys=PROGRAM_KEYS.get(arch, {}),
     )
 
 
@@ -618,21 +620,31 @@ def dsa_indexer_det_workspace_size(
     ``T x n_split x top_k x entry_bytes`` when the dispatch splits the key
     ranges.  The dispatch, and with it the bound, depends on ``T``, ``Tkv``,
     ``S``, ``ratio`` and ``top_k``; prepare a call's buffer for its own geometry
-    (or for the largest bound over the geometries it will serve).
+    (or for the largest bound over the geometries it will serve).  The bound
+    covers both sampling modes: where the record's ``l6_solo_rule``,
+    ``l6_solo_unsampled_max_queries``, ``split_wave_scope`` or ``wide_pair_snake_only`` gives a call with the
+    sampled first threshold off (``sample_tiles_max=0``) another unit
+    geometry, pair or split than the sampled default, the larger of the two
+    plans.
     """
-    choice = plan_dsa_indexer_det_topk(
-        num_queries,
-        num_keys,
-        num_segments,
-        top_k=top_k,
-        ratio=ratio,
-        device=device,
-        arch=arch,
-        grid_ctas=grid_ctas,
-        num_sms=num_sms,
-        candidate_multiplier=candidate_multiplier,
+    return max(
+        int(
+            plan_dsa_indexer_det_topk(
+                num_queries,
+                num_keys,
+                num_segments,
+                top_k=top_k,
+                ratio=ratio,
+                device=device,
+                arch=arch,
+                grid_ctas=grid_ctas,
+                num_sms=num_sms,
+                candidate_multiplier=candidate_multiplier,
+                sample_tiles_max=sample_tiles_max,
+            ).workspace_bytes
+        )
+        for sample_tiles_max in (None, 0)
     )
-    return int(choice.workspace_bytes)
 
 
 # ---------------------------------------------------------------------------
@@ -746,11 +758,16 @@ class DSAIndexerDetRunner:
     # the buffer may be written between two runs by another runner of a different geometry
     # (its candidate region covers this tail) or by any other kernel the caller lends it to,
     # so ``run()`` zeroes the tail before every launch sequence, on the current stream; a
-    # graph capturing it carries that memset node.  A ``run()`` that raised while launching
-    # may have left the word non-zero: it marks the tail dirty and the next ``run()`` zeroes
-    # it first.
+    # graph capturing it carries that memset node.  Static calls (``_tail_static``): where the
+    # shape alone bounds the work units by the launched grid (``ticket_static_path``), every
+    # scan launch takes the static fast path, which gives each CTA its unit by index and never
+    # reads or writes the ticket word, so neither prepare nor a run zeroes the tail (no
+    # memset on either workspace kind).  A ``run()`` that raised while launching may have
+    # left the word non-zero: it marks the tail dirty and the next ``run()`` zeroes it
+    # first (static or not).
     ticket_tail: Optional[torch.Tensor] = field(default=None, repr=False)
     _tail_shared: bool = field(default=False, repr=False)
+    _tail_static: bool = field(default=False, repr=False)
     _tail_dirty: bool = field(default=False, repr=False)
 
     @property
@@ -774,8 +791,18 @@ class DSAIndexerDetRunner:
         return self.choice.top_k
 
     def run(self) -> tuple[torch.Tensor, torch.Tensor]:
+        return self._run(fresh_tail=False)
+
+    def _run(self, *, fresh_tail: bool) -> tuple[torch.Tensor, torch.Tensor]:
+        """``fresh_tail``: the caller knows the shared tail is still as ``prepare`` zeroed it (the eager entry runs a
+        runner it just prepared, on the same stream, with nothing launched in between), so the memset of a
+        caller-owned workspace is skipped (as on a static call, whose scan never touches the word); a dirty tail is
+        restored either way."""
         with _ffi_stream_context(self.device_index):
-            if self.ticket_tail is not None and (self._tail_dirty or self._tail_shared):
+            if self.ticket_tail is not None and (
+                self._tail_dirty
+                or (self._tail_shared and not fresh_tail and not self._tail_static)
+            ):
                 # caller-owned workspace: others may have written the tail since the last run;
                 # or a previous run raised while launching.  Restore the ticket word before the scan.
                 self.ticket_tail.zero_()
@@ -1015,11 +1042,16 @@ def prepare_dsa_indexer_det_topk(
     # memset, a run adds none.  Caller-owned ``workspace_buffer``: the buffer may be written
     # between runs by others (another runner's candidate region, any kernel it is lent to),
     # so the runner zeroes the tail again before every run (see ``DSAIndexerDetRunner.ticket_tail``).
-    # sm_107a: no tail view, nothing zeroed.
+    # A static call (``ticket_static_path``: the shape bounds the work units by the launched
+    # grid, so every scan launch takes the static fast path and never touches the word) is
+    # zeroed neither here nor per run.  sm_107a: no tail view, nothing zeroed.
     ticket_tail = None
+    tail_static = False
     if launches and arch in TICKET_TAIL_ARCHES:
         ticket_tail = flat[workspace_bytes - TICKET_TAIL_BYTES : workspace_bytes]
-        ticket_tail.zero_()
+        tail_static = ticket_static_path(choice)
+        if not tail_static:
+            ticket_tail.zero_()
     return DSAIndexerDetRunner(
         arch=arch,
         abi=abi,
@@ -1035,6 +1067,7 @@ def prepare_dsa_indexer_det_topk(
         grid=grid,
         ticket_tail=ticket_tail,
         _tail_shared=caller_owned_workspace and ticket_tail is not None,
+        _tail_static=tail_static,
     )
 
 
@@ -1068,7 +1101,10 @@ def dsa_indexer_det_topk(
     See :func:`prepare_dsa_indexer_det_topk` for the arguments.  The call allocates
     the outputs (unless given) and the workspace (unless given) through the
     caching allocator and performs no host synchronization, so it may be
-    captured into a CUDA graph like any allocation-free launch sequence.
+    captured into a CUDA graph like any allocation-free launch sequence.  With
+    a caller-owned ``workspace_buffer`` the ticket tail is zeroed once per
+    call: ``prepare`` zeroes it on the current stream, and the run that follows
+    on the same stream, with nothing launched in between, does not repeat it.
     """
     runner = prepare_dsa_indexer_det_topk(
         q,
@@ -1094,7 +1130,8 @@ def dsa_indexer_det_topk(
         finalize_threads=finalize_threads,
         backend=backend,
     )
-    return runner.run()
+    # prepare's last device action was the tail memset on this stream: the runner's per-run memset would repeat it
+    return runner._run(fresh_tail=True)
 
 
 __all__ = [
