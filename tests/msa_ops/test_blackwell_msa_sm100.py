@@ -2056,7 +2056,9 @@ def test_union_decode_carriers_created_on_one_stream_serve_another():
 # Uniform FP8 prefill is served on one measured box (one request of one query
 # token over 64 Q heads and 4 KV heads, paged causal, a one-page table); the
 # calls just outside it -- two requests, two query tokens, a two-page table,
-# GQA 8 -- raise as every FP8-Q prefill call did before.
+# GQA 8, non-causal, an explicit ``q_offset`` (the derived value, passed), flat
+# K/V -- raise as every FP8-Q prefill call did before: the same exception type
+# and the same text.
 @pytest.mark.parametrize(
     "change",
     [
@@ -2064,8 +2066,19 @@ def test_union_decode_carriers_created_on_one_stream_serve_another():
         {"q_lens": [2], "kv_lens": [97]},
         {"kv_lens": [200]},
         {"num_kv_heads": 8},
+        {"causal": False},
+        {"q_offset": [96]},
+        {"kv_layout": "flat_varlen"},
     ],
-    ids=["batch2", "seqlen-q2", "page-width2", "gqa8"],
+    ids=[
+        "batch2",
+        "seqlen-q2",
+        "page-width2",
+        "gqa8",
+        "noncausal",
+        "explicit-q-offset",
+        "flat",
+    ],
 )
 def test_uniform_fp8_prefill_outside_its_box_is_declined(change):
     device = _require_supported_gpu()
@@ -2087,11 +2100,12 @@ def test_uniform_fp8_prefill_outside_its_box_is_declined(change):
     inputs = _make_attention_inputs({**case, **change}, device)
     with pytest.raises(
         NotImplementedError,
-        match="uniform FP8 Q/K/V is supported only by sparse decode",
-    ):
+        match="^uniform FP8 Q/K/V is supported only by sparse decode$",
+    ) as declined:
         _invoke_attention(
             inputs, None, msa_sparse_attention, msa_sparse_decode_attention
         )
+    assert declined.type is NotImplementedError
 
 
 # Inside the box the program converts the E4M3 Q to BF16 in its Q ingress (an
