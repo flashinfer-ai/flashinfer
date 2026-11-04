@@ -117,10 +117,13 @@ Host design (the input layout rules are the deterministic package's):
   blocks: from 976 rows per SM on sm_100a and sm_103a (800 on sm_107a) the
   mid forward (6 CTAs per SM, at most 2 blocks of 16 rows each), from 2400
   (1740 on sm_107a) the long forward (3 CTAs per SM, at most 6 blocks of 32
-  rows each).  On sm_100a and sm_103a the mid forward's thread 0 also warms
-  in L2, with one bulk prefetch a tensor where x and z hold their rows packed,
-  the CTA's next block and the first block of the CTA one wave later.  The
-  backward launches ``cake_jit.backward_ctas`` CTAs, ``G = min(row blocks,
+  rows each).  The mid forward's thread 0 also warms in L2, with one bulk
+  prefetch a tensor where x and z hold their rows packed, the CTA's next block
+  and the first block of the CTA one wave later; from 3000 rows per SM on
+  sm_103a and from 1740 on sm_107a (its whole range there) the long
+  forward's thread 0 also warms the CTA's next block the same way.  The
+  backward launches
+  ``cake_jit.backward_ctas`` CTAs, ``G = min(row blocks,
   ctas_per_sm * SMs)``: 256-thread CTAs of 16-row blocks with
   ``ctas_per_sm = 4`` (one wave); on sm_100a and sm_103a from 1280 rows per
   SM the same CTAs, whose thread 0 warms the next block of packed rows in L2

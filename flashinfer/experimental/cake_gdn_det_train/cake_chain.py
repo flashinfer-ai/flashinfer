@@ -1607,8 +1607,8 @@ def _wait_entry(device_index: int):
 # The forward WY stage: on an architecture of ``WY_TC2_ARCHS`` every ``wy_tc`` launch (the forward, both sequence
 # groups of the P form and the backward's recompute) runs ``wy_tc2`` instead, the same per-element chains, grid and
 # outputs (so the same bits) with a 64-column TMEM accumulator and packed shared-memory operands, so five CTAs fit
-# on an SM where ``wy_tc`` fits four.  On sm_107a the stage runs ``wy_tc``.
-WY_TC2_ARCHS = ("sm_100a", "sm_103a")
+# on an SM where ``wy_tc`` fits four.
+WY_TC2_ARCHS = ("sm_100a", "sm_103a", "sm_107a")
 
 
 def wy_stage(arch: str) -> str:

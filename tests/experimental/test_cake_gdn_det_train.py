@@ -381,7 +381,7 @@ def test_registry_records_are_well_formed() -> None:
         libraries.add(rec["library"])
     # one program per record: a kernel swap renames exactly the records it touches; the two shared libraries are the
     # sm_107a scan of the split pass 2's pair, which is the sm_100a / sm_103a dhu_tc2_wavefront program, and the
-    # sm_107a wy_tc2, which is that architecture's wy_tc program
+    # sm_107a wy_tc2, which is the sm_100a / sm_103a wy_tc2 program
     wavefront = cake_jit.MODULES["dhu_tc2_wavefront"]
     assert wavefront["arches"] == ["sm_100a", "sm_103a"]
     shared = cake_jit.MODULES["dhu_tc2_wavefront_split_sm_107a"]
@@ -398,18 +398,18 @@ def test_registry_records_are_well_formed() -> None:
     )
     assert wy2["arches"] == ["sm_100a", "sm_103a"] and wy2_107["arches"] == ["sm_107a"]
     assert (
-        wy2_107["library"] == wy["library"] != wy2["library"]
+        wy2_107["library"] == wy2["library"] != wy["library"]
         and "sm_107a" in wy["arches"]
     )
     assert len(libraries) == len(cake_jit.MODULES) - 2
 
 
 def test_the_wy_stage_follows_the_architecture() -> None:
-    assert cake_chain.WY_TC2_ARCHS == ("sm_100a", "sm_103a")
+    assert cake_chain.WY_TC2_ARCHS == ("sm_100a", "sm_103a", "sm_107a")
     assert {arch: cake_chain.wy_stage(arch) for arch in ARCHES} == {
         "sm_100a": "wy_tc2",
         "sm_103a": "wy_tc2",
-        "sm_107a": "wy_tc",
+        "sm_107a": "wy_tc2",
     }
     assert cake_chain.LAUNCH_ARGS["wy_tc2"] == cake_chain.LAUNCH_ARGS["wy_tc"]
     assert (
@@ -1684,8 +1684,8 @@ def test_prep_forms_agree_bitwise(route, beta_dtype, device, monkeypatch) -> Non
 def test_the_wy_stage_of_the_device_gives_the_wy_tc_bits(
     save_state, device, monkeypatch
 ) -> None:
-    # every forward WY launch (and the backward's recompute) runs the device's stage, wy_tc2 on sm_100a / sm_103a;
-    # wy_tc in its place gives the same bits
+    # every forward WY launch (and the backward's recompute) runs the device's stage, wy_tc2; wy_tc in its place
+    # gives the same bits
     seq_lens = (300, 77, 640, 17)
     inputs = _inputs(seq_lens, (2, 6), torch.bfloat16, device, seed=29)
     wy = cake_chain.wy_stage(cake_backend.device_arch(torch.cuda.current_device()))

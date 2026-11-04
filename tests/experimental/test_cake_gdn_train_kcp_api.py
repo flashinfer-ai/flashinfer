@@ -198,22 +198,21 @@ def test_enumerated_fields(field, values) -> None:
             make_options(**{field: bad})
 
 
-def test_reuse_recompute_tapes_defaults_to_auto_never_captured() -> None:
+def test_reuse_recompute_tapes_defaults_to_auto_in_both_graph_modes() -> None:
     """The checkpoint-aware light backward is a keyword-only switch -- ``"auto"`` (the shipped default: the tapes are
-    kept only when the node closes the checkpointed region), ``True`` (always) or ``False`` (the replay form); under
-    ``graph="replay"`` the default resolves to ``False`` -- part of the options key (so of the CUDA-graph key), typed,
-    and refused with ``graph="replay"`` (a captured graph bakes the arena addresses of its tapes; the kept tapes are
-    fresh tensors handed from the recompute forward to the backward)."""
+    kept only when the node closes the checkpointed region), ``True`` (always) or ``False`` (the replay form) -- part
+    of the options key (so of the CUDA-graph key) and typed; ``graph="replay"`` has the same default and accepts every
+    value (the kept tapes are then the workspace arena's own: ``cake_kcp._kept_stale``)."""
     assert "reuse_recompute_tapes" in opt.OPTION_NAMES
     # the shipped default is this one constant (and this line) -- every other test names the state it exercises
     assert opt.REUSE_RECOMPUTE_TAPES_DEFAULT == "auto"
     assert make_options().reuse_recompute_tapes == opt.REUSE_RECOMPUTE_TAPES_DEFAULT
-    # None = the shipped default; under graph="replay" (the one mode that excludes the kept tapes) it is False
+    # None = the shipped default, under graph="replay" too
     assert make_options(reuse_recompute_tapes=None).reuse_recompute_tapes == "auto"
-    assert make_options(graph="replay").reuse_recompute_tapes is False
+    assert make_options(graph="replay").reuse_recompute_tapes == "auto"
     both = make_options(reuse_recompute_tapes=None, graph="replay")
-    assert both.reuse_recompute_tapes is False
-    assert OptionsKcp(graph="replay").reuse_recompute_tapes is False
+    assert both.reuse_recompute_tapes == "auto"
+    assert OptionsKcp(graph="replay").reuse_recompute_tapes == "auto"
     assert make_options(graph="replay").key() != make_options().key()
     on = make_options(reuse_recompute_tapes=True)
     off = make_options(reuse_recompute_tapes=False)
@@ -223,10 +222,9 @@ def test_reuse_recompute_tapes_defaults_to_auto_never_captured() -> None:
     assert from_instance.reuse_recompute_tapes is True
     with pytest.raises(TypeError):
         make_options(reuse_recompute_tapes=1)
-    with pytest.raises(ValueError, match="graph"):
-        make_options(reuse_recompute_tapes=True, graph="replay")
-    with pytest.raises(ValueError, match="graph"):
-        make_options(reuse_recompute_tapes="auto", graph="replay")
+    for value in (True, False, "auto"):
+        o = make_options(reuse_recompute_tapes=value, graph="replay")
+        assert o.reuse_recompute_tapes == value and o.graph == "replay"
     # the other modes accept the switch (it has no effect there: documented as a no-op)
     for extra in (
         {"boundary_mode": "replay"},
@@ -248,7 +246,7 @@ def test_recompute_output_is_a_two_value_keyword_switch_defaulting_to_auto() -> 
     """``recompute_output`` -- whether the recompute of a checkpointed forward launches its dead output program -- is a
     keyword-only field of the options (so part of the CUDA-graph key), ``"auto"`` by default (the frame-proof skip),
     ``"always"`` the unconditional launch; anything else is refused.  It is independent of the kept-tape switch and
-    of the graph mode (a captured graph never skips, the option value stays ``"auto"``)."""
+    of the graph mode (under ``graph="replay"`` the recompute's decision is part of its CUDA-graph key)."""
     assert "recompute_output" in opt.OPTION_NAMES
     assert opt.RECOMPUTE_OUTPUTS == ("auto", "always")
     assert opt.RECOMPUTE_OUTPUT_DEFAULT == "auto"
@@ -334,6 +332,24 @@ def test_walk_pair_knob_defaults_to_auto() -> None:
     assert len(keys) == 3
     with pytest.raises(TypeError):
         make_options(walk_pair=1)  # a test knob, never a public option
+
+
+@pytest.mark.parametrize("knob", ("fused_o", "fused_o_tape"))
+def test_output_walk_knobs_default_to_the_shipped_walks(knob: str) -> None:
+    """``fused_o`` (the light forward's output walk) and ``fused_o_tape`` (the ``save_mode="full"`` forward's
+    tape-and-output walk) are private levers: 1 (shipped) or 0 (the split tape walk and #5), part of the options key
+    (a captured graph of one form never replays for the other), never public options."""
+    assert opt.TEST_KNOBS[knob] == (0, 1)
+    assert opt.TEST_KNOB_DEFAULTS[knob] == 1
+    assert make_options().knob(knob) == 1
+    assert make_options(test_knobs={knob: 0}).knob(knob) == 0
+    for bad in (2, -1, True, False, None, "1"):
+        with pytest.raises(ValueError):
+            make_options(test_knobs={knob: bad})
+    keys = {make_options(test_knobs={knob: v}).key() for v in (0, 1)}
+    assert len(keys) == 2
+    with pytest.raises(TypeError):
+        make_options(**{knob: 0})  # a test knob, never a public option
 
 
 @pytest.mark.parametrize(
@@ -1336,6 +1352,86 @@ def test_facade_under_torch_deterministic_mode_takes_the_twin_and_warns_once(
         calls["chunk_gdn_kcp"](deterministic=None)
 
 
+def test_facade_maps_the_replay_auto_tape_option_onto_the_deterministic_default(
+    monkeypatch, torch_deterministic
+) -> None:
+    """``OptionsKcp(graph="replay")`` (``reuse_recompute_tapes`` defaults to ``"auto"``) on the deterministic route --
+    the default ``deterministic=True``, and ``deterministic=False`` under ``torch.use_deterministic_algorithms(True)``
+    -- reaches the twin with ``reuse_recompute_tapes=None`` on every compute entry, which the twin's ``make_options``
+    resolves to its own default (``False`` under replay) and accepts; so does ``OptionsKcp()`` (``graph="off"``) with
+    ``graph="replay"`` as the call's keyword (``chunk_gdn_kcp``) or knob (the two explicit entries), which the twin
+    applies on top of the mapping; an explicit ``True`` passes on and the twin refuses it; under ``graph="off"`` the
+    ``None`` resolves to the twin's ``"auto"``; the non-deterministic route gets the instance."""
+    facade = importlib.import_module(FACADE)
+    det_opt = importlib.import_module(f"{DET_PACKAGE}.cake_options")
+    seen = _route_recorders(monkeypatch)
+    # no fallback warning in this test
+    monkeypatch.setattr(facade, "_DET_FALLBACK_WARNED", True)
+    t = torch.zeros(1)
+    calls = {
+        "chunk_gdn_kcp": lambda **m: facade.chunk_gdn_kcp(t, t, t, t, t, object(), **m),
+        "chunk_gdn_fwd_kcp": lambda **m: facade.chunk_gdn_fwd_kcp(
+            t, t, t, t, t, object(), **m
+        ),
+        "chunk_gdn_bwd_kcp": lambda **m: facade.chunk_gdn_bwd_kcp(
+            t, t, t, t, t, object(), t, **m
+        ),
+    }
+    replay = OptionsKcp(graph="replay")
+    assert replay.reuse_recompute_tapes == "auto"
+    explicit = OptionsKcp(graph="replay", reuse_recompute_tapes=True)
+    off = OptionsKcp(graph="off")
+    for deterministic_mode in (False, True):
+        torch.use_deterministic_algorithms(deterministic_mode)
+        routes = (
+            ({"deterministic": False},)
+            if deterministic_mode
+            else ({}, {"deterministic": True})
+        )
+        for entry, call in calls.items():
+            for kw in routes:
+                seen.clear()
+                assert call(options=replay, **kw).startswith("det:"), (entry, kw)
+                got = seen[-1][1]["options"]
+                assert isinstance(got, dict) and got["graph"] == "replay", (entry, got)
+                assert got["reuse_recompute_tapes"] is None, (entry, kw, got)
+                assert det_opt.make_options(got).reuse_recompute_tapes is False
+                call(options=explicit, **kw)
+                got = seen[-1][1]["options"]
+                assert got["reuse_recompute_tapes"] is True, (entry, got)
+                with pytest.raises(ValueError, match="needs graph='off'"):
+                    det_opt.make_options(got)
+                call(options=off, **kw)
+                got = seen[-1][1]["options"]
+                assert got["graph"] == "off", (entry, got)
+                assert got["reuse_recompute_tapes"] is None, (entry, got)
+                assert det_opt.make_options(got).reuse_recompute_tapes == "auto"
+                # the instance says graph="off", the call's keyword / knob says "replay"
+                seen.clear()
+                assert call(options=OptionsKcp(), graph="replay", **kw).startswith(
+                    "det:"
+                ), (entry, kw)
+                got, sent = seen[-1][1]["options"], seen[-1][1]
+                assert sent.get("graph") == "replay", (entry, kw, sent)
+                assert got["graph"] == "off", (entry, got)
+                assert got["reuse_recompute_tapes"] is None, (entry, kw, got)
+                assert (
+                    det_opt.make_options(got, graph="replay").reuse_recompute_tapes
+                    is False
+                ), (entry, kw)
+                call(
+                    options=OptionsKcp(reuse_recompute_tapes=True), graph="replay", **kw
+                )
+                got = seen[-1][1]["options"]
+                assert got["reuse_recompute_tapes"] is True, (entry, got)
+                with pytest.raises(ValueError, match="needs graph='off'"):
+                    det_opt.make_options(got, graph="replay")
+    torch.use_deterministic_algorithms(False)
+    for entry, call in calls.items():
+        assert call(options=replay, deterministic=False) == f"nondet:{entry}"
+        assert seen[-1][1]["options"] is replay
+
+
 def test_facade_default_route_returns_the_twins_objects() -> None:
     """Without the recorders: the facade's default route builds the twin's partition / context
     (``PartitionDetKcp`` / ``ContextDetKcp``), ``deterministic=False`` this package's; both describe the same plan
@@ -1626,6 +1722,7 @@ def test_program_vocabulary_is_the_design_list() -> None:
         "kcp_fwdh_offset",
         "kcp_fwdh_tape",
         "kcp_fwdh_out",
+        "kcp_fwdh_out_tape",
         "kcp_transfer_walk",
         "kcp_affine_merge",
         "fwd_o",
@@ -1650,10 +1747,11 @@ def test_program_vocabulary_is_the_design_list() -> None:
     assert (
         kcp.TART_MODULE_OF["kcp_affine_merge"] == "kda_chunk_kcp_affine_merge_fp32_v1"
     )  # reused verbatim
-    # the output walk is this package's own program: a det-neutral module that no deterministic twin ships
+    # the output walks are this package's own programs: det-neutral modules that no deterministic twin ships
     assert kcp.TART_MODULE_OF["kcp_fwdh_out"] == "gdn_chunk_fwdh_out_v1_kcp"
+    assert kcp.TART_MODULE_OF["kcp_fwdh_out_tape"] == "gdn_chunk_fwdh_out_tape_v1_kcp"
     for name, module in kcp.TART_MODULE_OF.items():
-        if name not in ("kcp_affine_merge", "kcp_fwdh_out"):
+        if name not in ("kcp_affine_merge", "kcp_fwdh_out", "kcp_fwdh_out_tape"):
             # the other programs' kernel modules are, so far, the deterministic family's (provenance stems; a lever
             # that replaces a program updates this line)
             assert module.startswith("gdn_chunk_det_"), (name, module)
@@ -1683,6 +1781,7 @@ def test_program_vocabulary_is_the_design_list() -> None:
     for prog in (
         "kcp_fwdh_offset",
         "kcp_fwdh_out",
+        "kcp_fwdh_out_tape",
         "kcp_transfer_walk",
         "kcp_dhu_offset",
     ):
@@ -1712,6 +1811,13 @@ def test_program_vocabulary_is_the_design_list() -> None:
     assert {"q", "aqk", "qscale", "o", "h0", "h0_index"} <= set(fused)
     assert not {"h_tape", "v_new", "out", "out_index", "ticket"} & set(fused)
     assert set(fused) - {"q", "aqk", "qscale", "o"} <= set(
+        kcp.PROGRAM_ARGS["kcp_fwdh_tape"]
+    )
+    # the tape-and-output walk: the output walk's arguments and the tape walk's h / v_new tapes, no final-state pool
+    fused_tape = kcp.PROGRAM_ARGS["kcp_fwdh_out_tape"]
+    assert set(fused_tape) == set(fused) | {"h_tape", "v_new"}
+    assert not {"out", "out_index", "ticket"} & set(fused_tape)
+    assert set(fused_tape) - {"q", "aqk", "qscale", "o"} <= set(
         kcp.PROGRAM_ARGS["kcp_fwdh_tape"]
     )
     assert (
@@ -1781,7 +1887,12 @@ def test_fwdh_form_rule_follows_the_chain_clause() -> None:
     vh = 128; the test knob ``fwdh_vh`` forces a form (the two forms are within the same accuracy budget; the
     fake-backend suite checks it)."""
     kcp = _mod("cake_kcp")
-    assert kcp.FWDH_PROGRAMS == ("kcp_fwdh_offset", "kcp_fwdh_tape", "kcp_fwdh_out")
+    assert kcp.FWDH_PROGRAMS == (
+        "kcp_fwdh_offset",
+        "kcp_fwdh_tape",
+        "kcp_fwdh_out",
+        "kcp_fwdh_out_tape",
+    )
     assert kcp.fwdh_vh(3, 48, 152) == 64  # 144 head-CTAs <= 152 SMs (GB300)
     assert kcp.fwdh_vh(4, 48, 152) == 128  # 192 > 152, no chain clause
     assert kcp.fwdh_vh(4, 48, 152, fits=True) == 64
@@ -2083,6 +2194,7 @@ def test_host_tables_build_on_the_cpu_for_every_rank(row) -> None:
             "kcp_fwdh_offset",
             "kcp_fwdh_tape",
             "kcp_fwdh_out",
+            "kcp_fwdh_out_tape",
             "kcp_transfer_walk",
             "kcp_affine_merge",
             "fwd_o",
