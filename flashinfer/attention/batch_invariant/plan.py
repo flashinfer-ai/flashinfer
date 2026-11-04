@@ -16,7 +16,7 @@ Positions are bottom-right causal: token ``i`` of request ``b`` (``0 <= i < q_le
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Sequence
+from typing import List, Optional, Sequence
 
 from .spec import TILE_KEYS, chunk_len
 
@@ -102,6 +102,9 @@ class Plan:
     tokens_per_tile: int = 128
     g: int = 1
     ws_row: int = WS_ROW  # fp32 per partial row (``ws_row(D)``)
+    num_launch: Optional[int] = (
+        None  # the paired placement's launch count (pairs of units), else None
+    )
 
     @property
     def num_units(self) -> int:

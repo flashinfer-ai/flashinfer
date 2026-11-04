@@ -110,7 +110,6 @@ class AttentionKernel:
             q2,
             ragged,
         )
-        self.st = None
 
     # ------------------------------------------------------------------ host (trace time)
     @cute.jit

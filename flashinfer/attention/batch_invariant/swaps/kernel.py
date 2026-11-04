@@ -65,7 +65,6 @@ class SwapsKernel:
 
     def __init__(self, D: int, g: int, page: int, n_pad: int, ragged: bool = False):
         self.D, self.g, self.page, self.n_pad, self.ragged = D, g, page, n_pad, ragged
-        self.st = None
 
     @cute.jit
     def __call__(

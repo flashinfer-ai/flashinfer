@@ -68,8 +68,8 @@ class BatchInvariantAttention:
         self.kv_layout = kv_layout
         self.device = float_workspace_buffer.device
         self.workspace = float_workspace_buffer
-        self._planned = None
-        self._config = None
+        self._planned: Optional[engine._Planned] = None
+        self._config: Optional[engine.AttnConfig] = None
         self._kv_indptr: Optional[torch.Tensor] = None
         self._kv_indices: Optional[torch.Tensor] = None
         self._sm_scale: Optional[float] = None

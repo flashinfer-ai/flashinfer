@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Optional
+from typing import Dict, List, Optional
 
 import torch
 
@@ -153,7 +153,7 @@ def pair_units(desc: list) -> list:
         F_TILE_LO,
     )
 
-    buckets = {}
+    buckets: Dict[tuple, List[list]] = {}
     for d in desc:
         buckets.setdefault(
             (d[F_REQ], d[F_KVHEAD], d[F_CHUNK_LO], d[F_CHUNK_HI], d[F_MODE]), []
@@ -257,6 +257,7 @@ class _Planned:
     ):
         self.plan, self.desc, self.groups, self.ws = plan, desc, groups, ws
         self.scratch = scratch  # the per-CTA O_m scratch (D = 256)
+        self.ragged = False  # the packed-token KV layout (set by plan_attention)
         self.fixup_groups = (
             fixup_groups if fixup_groups is not None else groups
         )  # the groups the fixup kernel folds (the FMHA body folds the others in-kernel)
