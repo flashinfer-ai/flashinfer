@@ -1241,9 +1241,13 @@ def prepare_fp4_operands(
             if a.device.index is not None
             else torch.cuda.current_device()
         )
-        if key not in _ONES:
-            _ONES[key] = torch.ones(1, dtype=torch.float32, device=a.device)
-        alpha = _ONES[key]
+        if key in _ONES:
+            alpha = _ONES[key]
+        elif torch.cuda.is_current_stream_capturing():
+            # under graph capture the fill runs only on replay: a cached copy made here would read 0 eagerly
+            alpha = torch.ones(1, dtype=torch.float32, device=a.device)
+        else:
+            alpha = _ONES[key] = torch.ones(1, dtype=torch.float32, device=a.device)
     else:
         if not isinstance(alpha, torch.Tensor) or alpha.dtype != torch.float32:
             raise unsupported(
@@ -1314,7 +1318,10 @@ def mm_fp4_batch_invariant(
     weight, the 1-D swizzled scale buffers of :func:`flashinfer.nvfp4_quantize` / :func:`flashinfer.mxfp4_quantize`,
     ``alpha`` the caller's 1-element fp32 tensor (one ``mul.rn``, once, after the whole fold), ``block_size`` 16 (NVFP4) /
     32 (MXFP4), ``out_dtype`` bf16 / fp16 (fp32 exposes the fp32 chain input for tests). ``config``, ``chunks`` and
-    ``workspace`` as in :func:`mm_bf16_batch_invariant`; ``in_fmt`` forces the class (tests)."""
+    ``workspace`` as in :func:`mm_bf16_batch_invariant`; ``in_fmt`` forces the class (tests). K is a multiple of 32; where
+    it is not a multiple of the class's step (64, or 128 on SM107) the last step is partial: its padded values are TMA zero
+    fill, its scales are read from the scale buffers' padding, so those bytes must be finite (the quantizers write zeros;
+    a NaN or Inf there poisons the row)."""
     if block_size != (16 if use_nvfp4 else 32):
         raise unsupported(
             CLASS_FP4,

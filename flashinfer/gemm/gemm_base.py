@@ -9845,7 +9845,7 @@ def _heuristic_func_mm_fp4(
     ] = "cudnn",
     use_nvfp4: bool = True,
     enable_pdl: bool = True,  # unused
-    batch_invariant: bool = False,  # unused
+    batch_invariant: bool = False,
 ):
     r"""
     Heuristic function for mm_fp4 backend selection. Routes to either cudnn or cutlass.
@@ -9866,6 +9866,9 @@ def _heuristic_func_mm_fp4(
     backend has one too, but it is explicit opt-in only (``backend="cake"``) and
     never auto-selected.
     """
+    if batch_invariant:
+        # the batch-invariant class runs in place of the backends: their availability does not decide the call
+        return ["batch_invariant"]
     if _is_per_token_alpha(alpha):
         return [c for c in ("cute-dsl",) if c in suitable_backends]
 

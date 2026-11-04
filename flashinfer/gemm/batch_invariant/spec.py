@@ -195,19 +195,21 @@ def identity_note(in_fmt: str) -> str:
     if in_fmt in NVFP4_FMTS:
         # the zero-filled e2m1 values and e4m3 scales are +0: every padded product is +0 and the step adds nothing
         return (
-            f"MMA{mk}(D, A=0, SFA=0, B=0, SFB=0) == D: the zero-filled K remainder (TMA zero fill of the operands and of their "
-            "e4m3 scales) adds products that are all +0; every configuration issues the same padded steps (the inner radix is "
-            "fixed), so this corner cannot separate two configurations (R3); the fingerprint hashes the raw K so a padded and "
-            "an unpadded K are distinct specifications"
+            f"MMA{mk}(D, A=0, SFA=s, B=0, SFB=s) == D for finite s: the K remainder's values are TMA zero fill (+0), its scales "
+            "the scale buffers' padding bytes (the quantizers write zeros: e4m3 +0; the contract requires finite bytes), so "
+            "every padded product is +0 and the step adds nothing; every configuration issues the same padded steps (the inner "
+            "radix is fixed), so this corner cannot separate two configurations (R3); the fingerprint hashes the raw K so a "
+            "padded and an unpadded K are distinct specifications"
         )
     if in_fmt in BLOCK_SCALED:
         # UE8M0 has no zero: the zero-filled scale byte 0x00 is 2^-127, a finite positive power of two; the zero-filled values
         # are +0, so every padded product is (+0 * 2^-127) * (+0 * 2^-127) = +0 and the step adds nothing
         return (
-            f"MMA{mk}(D, A=0, SFA=2^-127, B=0, SFB=2^-127) == D: the zero-filled K remainder (TMA zero fill of the operands and "
-            "of their UE8M0 scales, whose byte 0x00 is the finite 2^-127) adds products that are all +0; every configuration "
-            "issues the same padded steps (the inner radix is fixed), so this corner cannot separate two configurations (R3); "
-            "the fingerprint hashes the raw K so a padded and an unpadded K are distinct specifications"
+            f"MMA{mk}(D, A=0, SFA=s, B=0, SFB=s) == D for finite s: the K remainder's values are TMA zero fill (+0), its scales "
+            "the scale buffers' padding bytes (the quantizers write zeros: UE8M0 0x00 is the finite 2^-127; the contract "
+            "requires finite bytes), so every padded product is +0 and the step adds nothing; every configuration issues the "
+            "same padded steps (the inner radix is fixed), so this corner cannot separate two configurations (R3); the "
+            "fingerprint hashes the raw K so a padded and an unpadded K are distinct specifications"
         )
     return (
         f"MMA{mk}(D, 0, 0) == D: the zero-filled K remainder (whole padded steps of the last K-block, TMA zero fill of "

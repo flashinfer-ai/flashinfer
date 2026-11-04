@@ -423,6 +423,18 @@ def test_tactic_encoding_round_trips():
     }
 
 
+def test_flag_bypasses_the_operator_backend_selection():
+    """Under ``batch_invariant=True`` the operator's auto-backend heuristic yields a non-empty list whatever the backends'
+    availability: the flag path runs the class, so a missing FP4 backend never turns into a backend error."""
+    from flashinfer.gemm.gemm_base import _heuristic_func_mm_fp4
+
+    a = torch.zeros(4, 64, dtype=torch.uint8)
+    b = torch.zeros(128, 64, dtype=torch.uint8).t()
+    sf = torch.zeros(1024, dtype=torch.uint8)
+    assert _heuristic_func_mm_fp4([], a, b, sf, sf, batch_invariant=True)
+    assert _heuristic_func_mm_fp4([], a, b, sf, sf, use_nvfp4=False, batch_invariant=True)
+
+
 def test_unsupported_device_raises_before_any_kernel():
     a = torch.zeros(4, 64, dtype=torch.uint8)
     w = torch.zeros(128, 64, dtype=torch.uint8).t()
@@ -530,8 +542,27 @@ def test_alpha_chain_is_one_mul_rn_then_one_cvt_rn(M, N, K, nv):
 
 @needs_device
 @both_formats
+@pytest.mark.parametrize("K", [96, 4128])
+def test_partial_last_step_reads_finite_scale_padding(K, nv):
+    """K a multiple of 32 but not of the class's step: the last step is partial, its values TMA zero fill and its scales
+    the scale buffers' padding bytes (zero here, as the quantizers write them), so the fold equals the exact product; the
+    swizzled buffers of the 128x4 layout hold those padding blocks."""
+    M, N = 37, 256
+    a, sfa, ra = adv_fp4(M, K, 141, nv, span=2)
+    b, sfb, rb = weight(N, K, 142, nv, span=2)
+    alpha = alpha_of(0.5)
+    out = bi_mm(a, b, sfa, sfb, alpha, nv)
+    assert torch.isfinite(out.float()).all()
+    assert norm_rel_err(out, a, ra, b.t(), rb, alpha, nv) <= 2.0**-8
+    f32 = direct(a, b, sfa, sfb, alpha, nv, out_dtype=torch.float32)
+    assert torch.equal(bits(f32.to(torch.bfloat16)), bits(out))
+
+@needs_device
+@both_formats
 @pytest.mark.parametrize("M,N,K", [(300, 4096, 4096), (37, 128, 8192), (8, 4096, 4096)])
 def test_determinism_and_graph_replay(M, N, K, nv):
+    from flashinfer.gemm.batch_invariant import api
+
     a, sfa, _ = adv_fp4(M, K, 21, nv)
     b, sfb, _ = weight(N, K, 22, nv)
     alpha = alpha_of(0.7)
@@ -554,6 +585,27 @@ def test_determinism_and_graph_replay(M, N, K, nv):
         g.replay()
         torch.cuda.synchronize()
         assert torch.equal(bits(out), ref)
+    # alpha = None (1.0) captured first: the ones-tensor made under capture is not the cached one (its fill would only
+    # run on replay), so an eager call before the first replay is right, and the replay is too
+    ref1 = bits(bi_mm(a, b, sfa, sfb, alpha_of(1.0), nv)).clone()
+    saved = dict(api._ONES)
+    api._ONES.clear()
+    try:
+        out1 = torch.empty(M, N, dtype=torch.bfloat16, device="cuda")
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            g1 = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g1):
+                bi_mm(a, b, sfa, sfb, None, nv, out=out1)
+        torch.cuda.current_stream().wait_stream(s)
+        assert torch.equal(bits(bi_mm(a, b, sfa, sfb, None, nv)), ref1)  # eager, before any replay
+        out1.zero_()
+        g1.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(bits(out1), ref1)
+    finally:
+        api._ONES.clear()
+        api._ONES.update(saved)
 
 
 @needs_device
