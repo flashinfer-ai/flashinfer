@@ -2733,17 +2733,35 @@ def _spawn_entry(
             dist.destroy_process_group()
 
 
+# _free_port releases the port it finds before rank 0's rendezvous store binds it, so another socket of the node can
+# take it in between: rank 0 then fails in init_process_group with EADDRINUSE before the row runs.  Such a start is
+# retried on a fresh port, at most this many times in all.
+RENDEZVOUS_TRIES = 3
+
+
+def _rendezvous_port_taken(err: BaseException) -> bool:
+    """Whether a spawned start failed because rank 0's rendezvous port was taken (``EADDRINUSE`` from its store)."""
+    return "EADDRINUSE" in str(err)
+
+
 def _spawn_row(obj, backend: str, kind: str) -> None:
-    """``obj`` (a row or a poison pair) on ``obj.W`` spawned ranks of this node; rank 0's report decides."""
+    """``obj`` (a row or a poison pair) on ``obj.W`` spawned ranks of this node; rank 0's report decides.  A start
+    whose rendezvous port was taken is retried on a fresh port (:data:`RENDEZVOUS_TRIES`)."""
     with tempfile.TemporaryDirectory(prefix="cake_gdn_train_kcp_dist_") as tmp:
         result_dir = os.environ.get("KCP_TEST_RESULT_DIR") or tmp
-        mp.start_processes(
-            _spawn_entry,
-            args=(obj.W, obj, _free_port(), result_dir, backend, kind),
-            nprocs=obj.W,
-            join=True,
-            start_method="spawn",
-        )
+        for attempt in range(RENDEZVOUS_TRIES):
+            try:
+                mp.start_processes(
+                    _spawn_entry,
+                    args=(obj.W, obj, _free_port(), result_dir, backend, kind),
+                    nprocs=obj.W,
+                    join=True,
+                    start_method="spawn",
+                )
+                break
+            except mp.ProcessRaisedException as err:
+                if attempt + 1 == RENDEZVOUS_TRIES or not _rendezvous_port_taken(err):
+                    raise
         with open(os.path.join(result_dir, _report_file(obj, kind))) as fh:
             report = json.load(fh)
     assert report["pass"], json.dumps(
@@ -2986,6 +3004,54 @@ def test_poisoned_workspace_pairs(pair: PoisonPair, slurm) -> None:
         return
     _skip_unless_runnable(pair.W, backend)
     _spawn_row(pair, backend, "poison")
+
+
+def _fake_starts(monkeypatch, tmp_path, row: Row, failures: list[str]) -> list[int]:
+    """Replace the spawned start with one that raises ``failures`` in turn (a rank's error text) and then writes rank
+    0's passing report; returns the rendezvous port of every start."""
+    ports: list[int] = []
+    free = iter(range(41000, 41100))
+    monkeypatch.setattr(sys.modules[__name__], "_free_port", lambda: next(free))
+    monkeypatch.setenv("KCP_TEST_RESULT_DIR", str(tmp_path))
+
+    def start(fn, *, args, nprocs, join, start_method) -> None:
+        ports.append(args[2])
+        if len(ports) <= len(failures):
+            raise mp.ProcessRaisedException(failures[len(ports) - 1], 0, 0)
+        (tmp_path / _report_file(row, "full")).write_text(json.dumps({"pass": True}))
+
+    monkeypatch.setattr(mp, "start_processes", start)
+    return ports
+
+
+TAKEN = (
+    "DistNetworkError: The server socket has failed to listen on any local network address. port: 48409, "
+    "useIpv6: false, code: -98, name: EADDRINUSE, message: address already in use"
+)
+
+
+def test_spawned_start_retries_a_taken_rendezvous_port(monkeypatch, tmp_path) -> None:
+    """A start whose rank 0 finds its rendezvous port taken (EADDRINUSE) runs again on a fresh port.  CPU-only."""
+    row = Row("Zz", (1,), (2, 6), 2, "contiguous")
+    ports = _fake_starts(monkeypatch, tmp_path, row, [TAKEN])
+    _spawn_row(row, "fake", "full")
+    assert ports == [41000, 41001]
+
+
+def test_spawned_start_does_not_retry_other_failures(monkeypatch, tmp_path) -> None:
+    """Any other rank failure is raised at once, and a port taken on every try is raised after
+    :data:`RENDEZVOUS_TRIES` starts.  CPU-only."""
+    row = Row("Zz", (1,), (2, 6), 2, "contiguous")
+    ports = _fake_starts(
+        monkeypatch, tmp_path, row, ["AssertionError: rank 0: out differs"]
+    )
+    with pytest.raises(mp.ProcessRaisedException, match="out differs"):
+        _spawn_row(row, "fake", "full")
+    assert ports == [41000]
+    ports = _fake_starts(monkeypatch, tmp_path, row, [TAKEN] * RENDEZVOUS_TRIES)
+    with pytest.raises(mp.ProcessRaisedException, match="EADDRINUSE"):
+        _spawn_row(row, "fake", "full")
+    assert len(ports) == RENDEZVOUS_TRIES
 
 
 def test_accuracy_budget_cells_cover_the_accuracy_rows() -> None:
