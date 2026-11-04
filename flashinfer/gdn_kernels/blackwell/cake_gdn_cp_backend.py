@@ -271,20 +271,28 @@ def _default_physical_chunk_len(
 
 # The sm_107a row-split fixup builds, by parallel-state count: (logical kernel,
 # row CTAs per state, CTAs per SM the grid must fit in, minimum CP chunks per
-# sequence).  A build gives each CTA 3, 5 or 10 state rows instead of 4 (43,
-# 26 or 13 row CTAs per state); every element keeps its FMA chain, so the
-# outputs are bitwise those of the 4-row builds.
+# sequence).  A build gives each CTA 3, 5, 7, 8 or 10 state rows instead of 4
+# (43, 26, 19, 16 or 13 row CTAs per state); every element keeps its FMA
+# chain, so the outputs are bitwise those of the 4-row builds.
 _SM107_ROW_SPLIT_FIXUPS = {
     4: ("state_fixup_simt_row3_sb2", 43, 1, 6),
     8: ("state_fixup_simt_row3_sb2", 43, 2, 1),
+    14: ("state_fixup_simt_row5_mb3", 26, 2, 1),
     16: ("state_fixup_simt_row5_mb3", 26, 2, 1),
+    22: ("state_fixup_simt_row7_sb2_mb3", 19, 2, 1),
+    24: ("state_fixup_simt_row8_sb2_mb3", 16, 2, 1),
+    26: ("state_fixup_simt_row8_mb3", 16, 2, 1),
     32: ("state_fixup_simt_row10_sb2", 13, 2, 1),
+    36: ("state_fixup_simt_row8_sb2_mb3", 16, 3, 1),
 }
 _FIXUP_ROW_CTAS = {
     "state_fixup_simt_row3_sb2": 43,
     "state_fixup_simt_row4": 32,
     "state_fixup_simt_row4_mb3": 32,
     "state_fixup_simt_row5_mb3": 26,
+    "state_fixup_simt_row7_sb2_mb3": 19,
+    "state_fixup_simt_row8_mb3": 16,
+    "state_fixup_simt_row8_sb2_mb3": 16,
     "state_fixup_simt_row10_sb2": 13,
     "state_fixup_utcmma64": 2,
     "state_fixup_utcmma128": 1,
@@ -300,8 +308,8 @@ def _choose_sm107_fixup_kind(
 ) -> str:
     """The sm_107a SIMT fixup build.
 
-    Over sequences of one length with 4, 8, 16 or 32 parallel states, a
-    row-split build (``_SM107_ROW_SPLIT_FIXUPS``) when its grid fits the
+    Over sequences of one length with a parallel-state count of
+    ``_SM107_ROW_SPLIT_FIXUPS``, its row-split build when its grid fits the
     listed CTAs per SM and each sequence has at least the listed CP chunks:
     its grid fills the SMs evenly where the 32 row CTAs per state do not.
 
