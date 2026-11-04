@@ -218,10 +218,12 @@ this package runs.
   `torch.utils.checkpoint`) and architecture.  On `sm_107a` `dA_log` and
   `ddt_bias` are bitwise too (the same programs run in the same order).  On
   `sm_100a` / `sm_103a` they are the `R1c` FP64 sums rounded once to FP32:
-  the FP64 additions arrive in no fixed order, so they can differ by one
-  FP32 ulp from run to run and from the deterministic package; their error
-  against the FP64 reference stays within the deterministic package's plus
-  the FP64 sum's own error.
+  the FP64 additions arrive in no fixed order, so they can differ from run
+  to run and from the deterministic package: from run to run by one FP32 ulp
+  at most while the FP64 sum's order error stays below half an FP32 ulp of
+  the result (only per-chunk terms that nearly cancel exceed it), and their
+  error against the FP64 reference stays within the deterministic package's
+  plus the FP64 sum's own error.
 
 ## Checkpoint hand-off
 

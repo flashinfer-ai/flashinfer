@@ -52,7 +52,11 @@ backend are experimental: no compatibility guarantee.
   deterministic-algorithms alert, on every rank before any exchange.
 * A partition, a context and the byte queries hold no mode: they describe the
   same plan in both packages, and a context of either package serves the calls
-  of both (each package keeps its own launch tables on it).  The autograd node
+  of both (each package keeps its own launch tables on it).  The workspace
+  query of a raw gate mode backward on `sm_100a` / `sm_103a` here also counts
+  the local arena's FP64 parameter-gradient accumulators (`param_acc`, 2 KiB
+  per head; 16 KiB per head on `sm_100a` from 32 heads), which the
+  deterministic package does not hold.  The autograd node
   records its forward's mode and its backward runs it; a saved set is read by
   the backward of the package that wrote it (`SavedKcp` here, the other
   package's set raises `ValueError`), and a workspace (`WorkspaceKcp`) serves
@@ -65,7 +69,7 @@ backend are experimental: no compatibility guarantee.
   gradient are bitwise those of the deterministic package.  On `sm_107a` the
   per-rank parameter partial sums are bitwise too; on `sm_100a` / `sm_103a`
   they come from the `R1c` pairs (an unordered FP64 sum rounded once to FP32)
-  and can differ by one FP32 ulp from run to run.  The in-kernel q / k
+  and can differ by about one FP32 ulp from run to run (below).  The in-kernel q / k
   L2 norm (`use_qk_l2norm_in_kernel=True`, #7817) is not available here: the
   entry points, `kda_workspace_bytes_kcp` and `kda_saved_bytes_kcp` raise
   `ValueError` for it, naming `deterministic=True`.  Its off value
@@ -514,9 +518,12 @@ dA_log, ddt_bias = reduce_gate_param_grads_kcp(ctx, dA_log_r, ddt_bias_r, **nd) 
   on the route.  Every output and `draw` are bitwise those of
   `chunk_kda_det_bwd_kcp` on the same rank, and so are the parameter partial
   sums on `sm_107a`.  On `sm_100a` / `sm_103a` the FP64 additions arrive in no
-  fixed order, so the partial sums can differ by one FP32 ulp from run to run
-  and from the deterministic route (their error against the FP64 reference
-  stays within the deterministic route's plus the FP64 sum's own error).  Such
+  fixed order, so the partial sums can differ from run to run and from the
+  deterministic route: from run to run by one FP32 ulp at most while the FP64
+  sum's order error stays below half an FP32 ulp of the result (only per-chunk
+  terms that nearly cancel exceed it), and their error against the FP64
+  reference stays within the deterministic route's plus the FP64 sum's own
+  error.  Such
   a backward raises torch's
   non-determinism alert under `torch.use_deterministic_algorithms(True)`
   (`RuntimeError`; a `UserWarning` with `warn_only=True`) on every rank before
@@ -526,7 +533,7 @@ dA_log, ddt_bias = reduce_gate_param_grads_kcp(ctx, dA_log_r, ddt_bias_r, **nd) 
   its own tokens, reduced on the rank.  On `sm_107a` the order is fixed by its
   local chunks: bitwise repeatable, the same under every exchange, schedule,
   graph replay and recompute.  On the `R1c` rows the unordered FP64 sum makes
-  each partial sum vary from run to run by up to one FP32 ulp of itself.  The
+  each partial sum vary from run to run by about one FP32 ulp of itself.  The
   full gradient is their sum over `ctx.group`; a
   training framework sums them as it sums the gradients of any parameter
   replicated across the context-parallel ranks.  An NCCL all-reduce gives
@@ -537,7 +544,7 @@ dA_log, ddt_bias = reduce_gate_param_grads_kcp(ctx, dA_log_r, ddt_bias_r, **nd) 
   bits everywhere, and the same bits as the deterministic package's
   `reduce_gate_param_grads_det_kcp` from the same partials).  On the `R1c`
   rows the partials vary from run to run, so that sum does too: by a few FP32
-  ulps that grow with the world size `W` (each partial by up to one ulp, each
+  ulps that grow with the world size `W` (each partial by about one ulp, each
   of the `W - 1` additions rounding either way).
 * The mode is fixed per workspace (`WorkspaceKcp(use_gate_in_kernel=True)`:
   its local arena is the replay arena planned in raw mode, whose backward

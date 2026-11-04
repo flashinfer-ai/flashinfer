@@ -25,7 +25,10 @@ launches a kernel; the module imports ``dataclasses``, ``os``, ``torch`` and
 Numerical mode.  This is the plan of the non-deterministic KCP package
 (``deterministic=False``), a copy of the deterministic package's plan
 (``flashinfer.experimental.cake_kda_det_train_kcp``): the same partitions, the
-same tables, collectives, segment plan and byte counts.  A partition, a context
+same tables, collectives, segment plan and byte counts, but for the workspace
+query of a raw gate mode backward on ``sm_100a`` / ``sm_103a``, which adds the
+local arena's FP64 parameter-gradient accumulators (``param_acc``, through
+``cake_backend.workspace_bytes``).  A partition, a context
 and the byte queries hold no mode; the mode is a keyword of the entry points
 (:mod:`.cake_kcp`).  The local arena and table rules the byte queries read are
 those of the non-deterministic single-rank package

@@ -34,8 +34,9 @@ gradient (``dqkg``) no longer forms the ``q * dq`` term of the gate gradient
 ``dg`` and no longer reads ``q``; the GLM intra program that follows adds the
 term from the FP32 ``dq`` it already holds.  The two programs are selected
 together on every row (:func:`_plan` refuses a plan where they are not), and
-every other row runs the deterministic pair.  The schedule has a fixed order
-and no atomic adds: repeated calls give bitwise the same results, and ``dq``,
+every other row runs the deterministic pair.  In the ``"g"`` mode (the
+default) the schedule has a fixed order and no atomic adds: repeated calls give
+bitwise the same results, and ``dq``,
 ``dk``, ``dv`` and ``dbeta`` are bitwise the deterministic package's.  ``dg``
 differs from the deterministic package's by FP32 rounding only.  The saved set
 has the deterministic package's format (the forward programs are the same).
@@ -44,8 +45,10 @@ there ``out`` and every gradient but ``dA_log`` / ``ddt_bias`` are bitwise the
 deterministic package's, and on ``sm_107a`` those two are bitwise too.  On
 ``sm_100a`` / ``sm_103a`` the raw backward reduces ``dA_log`` / ``ddt_bias``
 with the ``R1c`` pairs (:data:`cake_jit.R1C_PAIRS`): an unordered FP64 sum,
-rounded once to FP32, so the two can differ by one FP32 ulp from run to run and
-from the deterministic package; that backward alone raises PyTorch's
+rounded once to FP32, so the two can differ from run to run and from the
+deterministic package (from run to run by one FP32 ulp at most while the FP64
+sum's order error stays below half an FP32 ulp of the result; only per-chunk
+terms that nearly cancel exceed it); that backward alone raises PyTorch's
 non-determinism alert under ``torch.use_deterministic_algorithms(True)``
 (:func:`_alert_nondeterministic`).
 
@@ -176,8 +179,8 @@ still runs for ``w``).
 Repeated calls on the same inputs give bitwise the same outputs: the kernels
 reduce in a fixed order and use no atomic adds, except the ``R1c`` GLM intra
 programs of the raw gate mode on ``sm_100a`` / ``sm_103a``, whose FP64 adds into
-``param_acc`` arrive in no fixed order (``dA_log`` / ``ddt_bias`` within one
-FP32 ulp; every other output bitwise).  The checkpoint replay
+``param_acc`` arrive in no fixed order (``dA_log`` / ``ddt_bias`` within about
+one FP32 ulp, see above; every other output bitwise).  The checkpoint replay
 (``saved=None``) and a saved-set backward can select different pairs on some
 rows (:data:`cake_jit.S1_RECORDS`); their ``dg`` then differ by FP32 rounding,
 and every other gradient is bitwise the same.
@@ -339,7 +342,8 @@ class KdaArena:
     fused gradient, GLM intra and, on ``sm_100a``, the gate epilogue) once per range of ``ceil(NC_pad / B)`` chunks
     on offset views of the whole-sequence buffers, with the per-pass buffers (``dq_f, dk_f, dg_f, db_f, dAkk, dAqk``
     and, where the gate epilogue launches, ``dg_int, db_int``) sized for one range: the same kernels on the same bytes (bitwise the same gradients), ``B - 1`` more launches
-    per tail stage.  The arena bytes: :func:`workspace_bytes` / :func:`memory_report` with ``arena=``; the floor
+    per tail stage (``dA_log`` / ``ddt_bias`` of an ``R1c`` row aside: the same FP64 terms added in another
+    unordered order).  The arena bytes: :func:`workspace_bytes` / :func:`memory_report` with ``arena=``; the floor
     from four passes on is 2820 B per internal token-head (plus three state blocks on the segmented route), against
     4488 at head (passes above four buy nothing).
 
@@ -349,7 +353,8 @@ class KdaArena:
     the same kernels on the same token rows (every program reaches the tokens through the absolute ``chunk_bos``
     offsets of its group's tables), the records, the segments per document and the saved set pinned to the whole
     problem's, so the results are bitwise the whole problem's, except that an exactly-zero entry of ``u`` / ``w``
-    in a chunk whose pair partner changed (the paired WY programs accumulate ``0 * partner``) may change sign.
+    in a chunk whose pair partner changed (the paired WY programs accumulate ``0 * partner``) may change sign, and
+    that ``dA_log`` / ``ddt_bias`` of an ``R1c`` row are the same FP64 terms added in another unordered order.
     The calls then take ``doc_lengths``, the documents' token counts as host integers (the host reads no tensor).
     With ``tail_passes = B`` the arena is sized for the largest group (or the bound of every group) at ``B``
     passes, and each group runs its tail in the fewest passes ``b`` up to ``B`` whose lean layout at its own
@@ -4052,7 +4057,8 @@ def _tail_passes(
     one-entry count of the range's real chunks (``num_seqs = 0`` makes the fused gradient read that entry as its item
     bound), the lean layout's per-pass buffers as they are (sized for one range) and the token tensors whole (every
     kernel reaches them through the absolute ``chunk_bos``); the grids are the plan's rules at the range's chunk
-    count.  The same kernels address the same bytes as in one pass, so the gradients are bitwise the same.
+    count.  The same kernels address the same bytes as in one pass, so the gradients are bitwise the same, but for
+    ``dA_log`` / ``ddt_bias`` of an ``R1c`` row (the same FP64 terms added in another unordered order).
     ``nc_vec`` is the real chunk count of every range where the host has it (a batched call's groups: from
     ``doc_lengths``, :class:`_Packing`), else formed on the device."""
     p = ws.plan
@@ -4905,7 +4911,8 @@ def chunk_kda_bwd(
     recomputed in its view (``light``, ``replay``: the replay runs group by group on a workspace that is not lean),
     and on a lean workspace its tail in the fewest passes, up to the option's, whose layout fits the arena
     (:func:`_group_tail_passes`) with their chunk counts from the host.  The gradients are bitwise the whole
-    problem's (:class:`KdaArena` on the sign of exact zeros).
+    problem's (:class:`KdaArena` on the sign of exact zeros), but for ``dA_log`` / ``ddt_bias`` of an ``R1c`` row:
+    the same FP64 terms added in another unordered order.
 
     ``deterministic`` must be ``False`` (:func:`_require_deterministic_false`).  The pair of the fused gradient
     and the GLM intra program follows the path: the checkpoint replay and a saved-set backward can take different
@@ -4927,7 +4934,7 @@ def chunk_kda_bwd(
     into the workspace's accumulators :attr:`KdaWorkspace.param_acc` (every group and tail range into the same
     sums) and one cast launch after the last group / range sums the replicas in ascending order, rounds once to
     ``dA_log`` / ``ddt_bias`` and zeroes the accumulators.  The FP64 additions arrive in no fixed order, so
-    ``dA_log`` / ``ddt_bias`` can differ by one FP32 ulp from run to run and from the deterministic package (their
+    ``dA_log`` / ``ddt_bias`` can differ by about one FP32 ulp from run to run and from the deterministic package (their
     error against the FP64 reference stays within the deterministic package's plus the FP64 sum's own error); the
     other five results are bitwise the deterministic package's.  That backward raises PyTorch's non-determinism
     alert under ``torch.use_deterministic_algorithms(True)`` (``RuntimeError``; a ``UserWarning`` with

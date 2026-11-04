@@ -35,14 +35,19 @@ paths :data:`LOCAL_PATH_FWD` / :data:`LOCAL_PATH_BWD`: the forward runs copies
 of the deterministic programs, and on the rows of that package's
 ``cake_jit.S1_RECORDS`` the backward's fused gradient leaves the ``q * dq`` term
 of ``dg`` to the GLM intra program that follows it (the pair is selected
-together per rank; its plan refuses a mixed pair).  The schedule has a fixed
-order and no atomic adds: at the same topology repeated calls are bitwise
-equal, saved-mode and checkpoint-replay backwards run the same programs and
-are bitwise equal, and ``out``, ``dq``, ``dk``, ``dv`` and ``dbeta`` are
-bitwise those of the deterministic package; ``dg`` differs from it by FP32
-rounding on the ``S1`` rows.  No path launches an unordered reduction, so no
-entry raises torch's deterministic-algorithms alert.  The context holds no
-mode; a saved set is read by the backward of this package only.
+together per rank; its plan refuses a mixed pair).  In the ``"g"`` mode (the
+default) the schedule has a fixed order and no atomic adds: at the same
+topology repeated calls are bitwise equal, saved-mode and checkpoint-replay
+backwards run the same programs and are bitwise equal, and ``out``, ``dq``,
+``dk``, ``dv`` and ``dbeta`` are bitwise those of the deterministic package;
+``dg`` differs from it by FP32 rounding on the ``S1`` rows.  The one unordered
+reduction is the raw gate mode's parameter-gradient reduce on ``sm_100a`` /
+``sm_103a`` (the ``R1c`` pairs, "Raw gate mode" below): its FP64 additions
+arrive in no fixed order, so a rank's ``dA_log`` / ``ddt_bias`` can differ from
+run to run, and only that backward raises torch's deterministic-algorithms
+alert (on every rank, before any exchange; eagerly and on a graph replay).
+Every other output of the raw mode stays bitwise.  The context holds no mode;
+a saved set is read by the backward of this package only.
 
 Every rank holds its own token fragments (``[T_r, H, 128]`` operands, local
 ``cu_seqlens`` with one sequence per fragment) and only recurrent-state
@@ -71,7 +76,9 @@ CUDA-graph replay (adopted in an earlier revision; keyword
 :func:`chunk_kda_bwd_kcp`, shipped default ``GRAPH_DEFAULT = "off"``): the
 first call of a validity key runs eagerly, the second is captured into a
 ``torch.cuda.CUDAGraph`` and every later call of the key replays it -- the same
-launches and collectives, bitwise the eager result.  The key is the call's
+launches and collectives, bitwise the eager result (but for the ``R1c``
+parameter partial sums of a raw backward on ``sm_100a`` / ``sm_103a``, an
+unordered FP64 sum at every replay too).  The key is the call's
 kind, its ContextKcp / workspace / backend objects, every option and the
 shape / stride / dtype / data pointer of every operand and saved tensor: a
 framework gets the replay only with pointer-stable operands and the same
@@ -263,13 +270,15 @@ so every output and the raw gate's gradient are bitwise those of the
 deterministic package's raw KCP route; on ``sm_107a`` the per-rank partial sums
 are bitwise too.  On ``sm_100a`` / ``sm_103a`` the FP64 additions of the ``R1c``
 pair arrive in no fixed order, so a rank's ``dA_log`` / ``ddt_bias`` can differ
-by one FP32 ulp from run to run (and from the deterministic route); such a
+from run to run (and from the deterministic route): by one FP32 ulp at most
+while the FP64 sum's order error stays below half an FP32 ulp of the result
+(only per-chunk terms that nearly cancel exceed it); such a
 backward raises PyTorch's non-determinism alert under
 ``torch.use_deterministic_algorithms(True)`` on every rank before any
 exchange.  :func:`reduce_gate_param_grads_kcp` still fixes the cross-rank
 order: every rank gets the same bits from the same partials (which then vary
 from run to run, so the sum does too, by a few FP32 ulps that grow with the
-world size: each partial by up to one ulp, each addition rounding either way).
+world size: each partial by about one ulp, each addition rounding either way).
 The checkpoint hand-off does not engage in raw mode (:func:`chunk_kda_kcp`).
 
 
@@ -3377,10 +3386,12 @@ class WorkspaceKcp:
     :func:`cake_kcp_plan.local_scratch_table_bytes`), and the arena is replaced only by a pack that does not fit.
     A forward never replaces a backward arena with a forward-only one.  :meth:`reserve` sizes the workspace for a
     list of contexts up front, so the calls of those packs allocate nothing and every pointer stays put
-    (``kda_workspace_bytes_kcp([ctx, ...], H=H)`` predicts its ``bytes``).  No content crosses calls, so the results are
-    bitwise those of one workspace per pack.  The workspace keeps no context alive.  It records the stream of its
-    last call; a call on another stream first orders that stream's queued work before its own (one
-    ``wait_stream``, never a host wait) and marks the workspace's live storages as used on its stream (one
+    (``kda_workspace_bytes_kcp([ctx, ...], H=H)`` predicts its ``bytes``).  No content crosses calls but the ``R1c``
+    accumulators of a raw backward, which every backward leaves zero (or marked, to be zeroed by the next one), so the
+    results are bitwise those of one workspace per pack, but for the ``R1c`` parameter partial sums of a raw backward
+    on ``sm_100a`` / ``sm_103a`` (an unordered FP64 sum in either case).  The workspace keeps no context alive.  It
+    records the stream of its last call; a call on another stream first orders that stream's queued work before its
+    own (one ``wait_stream``, never a host wait) and marks the workspace's live storages as used on its stream (one
     ``record_stream`` each, :meth:`_order_stream`), so a pool or arena a later call replaces, or the storage of a
     dropped workspace, goes back to the caching allocator only after the queued work of every stream that used it;
     calls on one stream do neither.  ``allocate=False`` with a context allocates nothing until the first call
@@ -5531,7 +5542,8 @@ def _backward(call: CallKcp, saved: SavedKcp | None) -> None:
 # every option; scale; the save flags; and the shape / stride / dtype / data pointer of every operand and saved
 # tensor) runs eagerly.  The second call is captured into a ``torch.cuda.CUDAGraph`` (nothing runs during a capture)
 # and the graph is replayed once; every later call of the key replays it: the same kernels and collectives with the
-# same arguments in the same order (bitwise the eager result) with no host work between them.  Any other key runs
+# same arguments in the same order (bitwise the eager result, but for the R1c parameter partial sums of a raw backward
+# on sm_100a / sm_103a: an unordered FP64 sum at every replay) with no host work between them.  Any other key runs
 # eagerly (silent fallback) and starts its own entry; ``exchange="ring"``, ``debug_sequence`` and a call without a
 # caller-owned workspace are never captured.  A replayed call returns the graph's static tensors (detached, so every
 # call hands autograd fresh objects): the next replay of the same key overwrites them, so a framework must keep its
@@ -6222,10 +6234,10 @@ def chunk_kda_bwd_kcp(
     mode runs the deterministic package's raw records but for the parameter-gradient reduce: every output and the
     raw gate's gradient are bitwise those of ``chunk_kda_det_bwd_kcp`` on the same rank, and so are the parameter
     partial sums on ``sm_107a``.  On ``sm_100a`` / ``sm_103a`` the local stages reduce them with an ``R1c`` pair (an
-    unordered FP64 sum rounded once to FP32), so they can differ by one FP32 ulp from run to run and from the
-    deterministic route; under ``torch.use_deterministic_algorithms(True)`` such a call raises ``RuntimeError`` (a
-    ``UserWarning`` with ``warn_only=True``) on every rank before it allocates, exchanges or launches anything (the
-    decision reads the architecture and ``H`` alone)."""
+    unordered FP64 sum rounded once to FP32), so they can differ by about one FP32 ulp from run to run and from the
+    deterministic route (module docstring); under ``torch.use_deterministic_algorithms(True)`` such a call raises
+    ``RuntimeError`` (a ``UserWarning`` with ``warn_only=True``) on every rank before it allocates, exchanges or
+    launches anything (the decision reads the architecture and ``H`` alone)."""
     _require_deterministic_false(deterministic, "chunk_kda_bwd_kcp")
     if saved is not None and not isinstance(saved, SavedKcp):
         # the deterministic package's saved set (SavedDetKcp) has the same members; its backward reads it, this one
@@ -7295,8 +7307,8 @@ def chunk_kda_kcp(
     (BF16), ``beta``, ``A_log`` and ``dt_bias`` (FP32).  The parameter gradients of a rank are its partial sums
     (the gradients through its own tokens); sum them over ``ctx.group`` as for any parameter replicated across the
     context-parallel ranks, or with :func:`reduce_gate_param_grads_kcp` for a sum in a fixed rank order, bitwise
-    reproducible from the same partials (on ``sm_100a`` / ``sm_103a`` the partials themselves can differ by one FP32
-    ulp from run to run: :func:`chunk_kda_bwd_kcp`).  A recompute handle's entry records the gate mode and
+    reproducible from the same partials (on ``sm_100a`` / ``sm_103a`` the partials themselves can differ by about one
+    FP32 ulp from run to run: :func:`chunk_kda_bwd_kcp`).  A recompute handle's entry records the gate mode and
     ``lower_bound``: a recompute in another mode never binds it.  The
     checkpoint hand-off below does not engage in raw gate mode (its tape set is verified on the explicit gate only):
     the call keeps the light set under every ``checkpoint_handoff`` value, records no decision and counts nothing.
@@ -7413,9 +7425,9 @@ def reduce_gate_param_grads_kcp(
     ``sm_107a`` depend only on the rank's tokens and the partition (not on the exchange, schedule, graph replay or
     recompute).  The deterministic package's ``reduce_gate_param_grads_det_kcp`` is the same algorithm: from the
     same partials the two give the same bits.  On the ``R1c`` rows (``sm_100a`` / ``sm_103a``) each rank's partials
-    can differ by one FP32 ulp from run to run (their reduce on the rank is an unordered FP64 sum); the cross-rank
+    can differ by about one FP32 ulp from run to run (their reduce on the rank is an unordered FP64 sum); the cross-rank
     order stays fixed here, so every rank still gets the same bits from the partials of one run, and the sums can
-    differ from run to run by a few FP32 ulps that grow with ``W`` (each partial by up to one ulp, each of the
+    differ from run to run by a few FP32 ulps that grow with ``W`` (each partial by about one ulp, each of the
     ``W - 1`` additions rounding either way).  An NCCL all-reduce of the partials gives the same sum up to FP32
     rounding but does not fix its summation order (it varies with the algorithm, the topology and the message
     size): use this helper when the sum must be bitwise reproducible from the partials.  Returns fresh ``(dA_log,
