@@ -56,9 +56,11 @@ from . import cake_build
 # Every scan program takes ``TicketWord`` (a 16-byte block) right before it; a
 # program's record lists in ``ticket_arg_arches`` the architectures on which it
 # draws its work units from that block instead of the workspace's ticket tail.
+# Every scan program takes ``K_scale`` (per-key FP32 scales) right before
+# ``TicketWord``; only an FP8 form reads it, and every program here is BF16.
 ARCHES = ("sm_100a", "sm_103a", "sm_107a")
 STAGES: list[str] = ["scan", "merge", "finalize", "finalize_rank"]
-ABI: str = "dsa_indexer_v4"
+ABI: str = "dsa_indexer_v5"
 NUMERICS: dict[str, str] = {"zero_sign_policy": "positive_accumulator"}
 FFI_ENTRY: str = "run"
 ARG_PLANS: dict[str, list[list[str]]] = {
@@ -85,6 +87,7 @@ ARG_PLANS: dict[str, list[list[str]]] = {
         ["parameter", "grid_ctas"],
         ["parameter", "softmax_scale"],
         ["parameter", "n_split"],
+        ["buffer", "K_scale"],
         ["buffer", "TicketWord"],
         ["zero", "zero_region"],
         ["grid", "grid_x"],

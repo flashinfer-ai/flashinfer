@@ -4397,8 +4397,9 @@ def test_ticket_arg_arches_name_exactly_the_drawing_programs_of_their_architectu
                 arch
             )  # every drawing program reads it, no static one does
     assert cake_jit.ARG_PLANS["scan"][-5] == ["buffer", "TicketWord"]
+    assert cake_jit.ARG_PLANS["scan"][-6] == ["buffer", "K_scale"]
     assert all(
-        ["buffer", "TicketWord"] not in plan
+        ["buffer", "TicketWord"] not in plan and ["buffer", "K_scale"] not in plan
         for role, plan in cake_jit.ARG_PLANS.items()
         if role != "scan"
     )
@@ -4513,13 +4514,16 @@ class _EagerCall:
 
 def test_offsets_placeholder_is_one_never_written_tensor_per_device():
     """A call without ``q_causal_offsets`` passes the device's offsets placeholder (one int64 element, ``has_offsets``
-    = 0): the same tensor for every runner and eager call of the device, never written by any launch."""
+    = 0), and every call the device's ``K_scale`` placeholder (one float32 element, read by no BF16 program): the
+    same tensors for every runner and eager call of the device, never written by any launch."""
     _require_program()
     device = torch.device("cuda", torch.cuda.current_device())
     holder = cake_backend._offsets_placeholder(device.index)
     assert holder is cake_backend._offsets_placeholder(device.index)
     assert holder.dtype == torch.int64 and holder.numel() == 1
     assert holder.device == device
+    scales = cake_backend._unread_placeholder(device.index, torch.float32)
+    assert scales.dtype == torch.float32 and scales.numel() == 1
     before = holder.clone()
     for n, (seg_q, seg_k, top_k) in enumerate(_EAGER_GEOMETRIES):
         inputs = ref.make_random_inputs(
@@ -4528,6 +4532,7 @@ def test_offsets_placeholder_is_one_never_written_tensor_per_device():
         assert inputs.q_causal_offsets is None
         runner = _prepare(inputs)
         assert runner.tensors["q_offsets"] is holder
+        assert runner.tensors["K_scale"] is scales
         expected = _cloned(runner())
         for _ in range(2):
             assert ref.same_bits(runner(), expected)
@@ -4573,7 +4578,7 @@ def test_eager_entry_graph_capture_holds_only_the_runner_launches(
     expected = _cloned(call())  # loads the programs and makes the device's placeholders
     kept = cake_backend._offsets_placeholder(device.index)
     if first_use == "in_capture":
-        monkeypatch.setattr(cake_backend, "_OFFSETS_PLACEHOLDERS", {})
+        monkeypatch.setattr(cake_backend, "_UNREAD_PLACEHOLDERS", {})
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -4582,7 +4587,7 @@ def test_eager_entry_graph_capture_holds_only_the_runner_launches(
     if first_use == "in_capture":
         assert runner.tensors["q_offsets"] is not kept
         # made during the capture: not kept
-        assert cake_backend._OFFSETS_PLACEHOLDERS == {}
+        assert cake_backend._UNREAD_PLACEHOLDERS == {}
     else:
         assert runner.tensors["q_offsets"] is kept
     ops = _device_ops(graph.replay, tmp_path, f"graph_{first_use}")
