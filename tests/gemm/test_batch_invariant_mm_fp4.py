@@ -432,7 +432,9 @@ def test_flag_bypasses_the_operator_backend_selection():
     b = torch.zeros(128, 64, dtype=torch.uint8).t()
     sf = torch.zeros(1024, dtype=torch.uint8)
     assert _heuristic_func_mm_fp4([], a, b, sf, sf, batch_invariant=True)
-    assert _heuristic_func_mm_fp4([], a, b, sf, sf, use_nvfp4=False, batch_invariant=True)
+    assert _heuristic_func_mm_fp4(
+        [], a, b, sf, sf, use_nvfp4=False, batch_invariant=True
+    )
 
 
 def test_unsupported_device_raises_before_any_kernel():
@@ -557,6 +559,7 @@ def test_partial_last_step_reads_finite_scale_padding(K, nv):
     f32 = direct(a, b, sfa, sfb, alpha, nv, out_dtype=torch.float32)
     assert torch.equal(bits(f32.to(torch.bfloat16)), bits(out))
 
+
 @needs_device
 @both_formats
 @pytest.mark.parametrize("M,N,K", [(300, 4096, 4096), (37, 128, 8192), (8, 4096, 4096)])
@@ -598,7 +601,9 @@ def test_determinism_and_graph_replay(M, N, K, nv):
             with torch.cuda.graph(g1):
                 bi_mm(a, b, sfa, sfb, None, nv, out=out1)
         torch.cuda.current_stream().wait_stream(s)
-        assert torch.equal(bits(bi_mm(a, b, sfa, sfb, None, nv)), ref1)  # eager, before any replay
+        assert torch.equal(
+            bits(bi_mm(a, b, sfa, sfb, None, nv)), ref1
+        )  # eager, before any replay
         out1.zero_()
         g1.replay()
         torch.cuda.synchronize()

@@ -307,7 +307,9 @@ def test_in_cluster_split_is_not_a_placement_beyond_the_grid_z_limit():
             for k in enumerate_space(64, N, K, chunks=C, b_major="k", in_fmt=fmt)
             if k.cluster_k == C
         )
-        small = (MAX_GRID_Z // -(-N // ck.tile_n)) * ck.tile_m  # the largest M whose tile count fits
+        small = (
+            MAX_GRID_Z // -(-N // ck.tile_n)
+        ) * ck.tile_m  # the largest M whose tile count fits
         assert can_implement(ck, small, N, K, "k", C, fmt)
         assert not can_implement(ck, small + ck.tile_m, N, K, "k", C, fmt)
         for M in (2_000_000, 2_200_000):
