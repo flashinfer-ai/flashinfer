@@ -31,9 +31,11 @@ its errors, its autograd node), ``deterministic=False`` the standalone backend
   ``torch.use_deterministic_algorithms(True)`` (with ``warn_only=True``: a
   warning and the deterministic package), the alert of a ``False`` autograd
   node whose backward runs after the mode was enabled, the workspace reset of
-  both modes, and the backend's standalone form (no import of another
+  both modes, the backend's standalone form (no import of another
   flashinfer package; a copy under another name imports with flashinfer
-  blocked);
+  blocked), and the strides the backend passes for one-head and other inputs
+  (a single head's stride as 128, so packed one-head rows pass the kernels'
+  packed-rows test);
 * on a device: the default is bitwise the deterministic package;
   ``deterministic=False`` launches only the backend's modules, and on the
   backend suite's accuracy matrix and paths (accumulation,
@@ -41,7 +43,10 @@ its errors, its autograd node), ``deterministic=False`` the standalone backend
   across shapes, two streams, a side stream, CUDA Graph replays, autograd and
   non-reentrant checkpointing) its ``y``, ``dx`` and ``dz`` are the
   deterministic package's bits and its ``dw`` lies within the weight-gradient
-  budget of the deterministic ``dw``, on every repeat.
+  budget of the deterministic ``dw``, on every repeat; so are they for
+  one-head inputs of several layouts past the start of each module that warms
+  packed rows in L2, which launch with the packed-rows test passing exactly
+  when their rows follow one another.
 
 The numerical contract of the non-deterministic kernels against the FP64
 reference is ``test_cake_rmsnorm_silu_gate_train.py``'s; its data generators,
@@ -1482,3 +1487,183 @@ def test_backward_around_the_short_threshold_matches_the_deterministic_package(
         want = short
     assert loader.module_for_rows(arch, role, rows, sms) == want
     assert launched == [want] * (suite.REPEATS + 1), launched
+
+
+# --------------------------------------------------------------------------- one head: packed rows
+
+
+def _packed(strides: dict) -> bool:
+    """The kernels' packed-rows test over the strides of one launch: every
+    input's head stride is 128 and its token stride ``heads * 128``.  The mid
+    and the extra-long forward and, on sm_100a and sm_103a, the long backward
+    warm row blocks in L2 with a bulk prefetch only when it holds."""
+    heads = int(strides["heads"])
+    inputs = [k[: -len("_head")] for k in strides if k.endswith("_head")]
+    return bool(inputs) and all(
+        strides[f"{n}_head"] == D and strides[f"{n}_tok"] == heads * D for n in inputs
+    )
+
+
+def _spy_strides(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, dict]]:
+    """``(module, {"heads", "<input>_tok", "<input>_head"})`` of every launch."""
+    launched: list[tuple[str, dict]] = []
+    run_module = loader.run_module
+
+    def spy(name, values, *, rows, device_index):
+        strides = {
+            k: int(v)
+            for k, v in values.items()
+            if k == "heads" or k.endswith(("_tok", "_head"))
+        }
+        launched.append((name, strides))
+        return run_module(name, values, rows=rows, device_index=device_index)
+
+    monkeypatch.setattr(loader, "run_module", spy)
+    return launched
+
+
+# One-head layouts of a [rows, 128] input: (passes the packed-rows test, read
+# in place).  ``three_d`` [rows, 1, 128], ``flat`` [rows, 128], ``transposed``
+# the transpose of [1, rows, 128] (token stride 128, head stride rows * 128),
+# ``first_of_two`` the first head of [rows, 2, 128] (token stride 256: rows
+# that do not follow one another), ``misaligned`` [rows, 128] at a storage
+# offset of 8 elements (copied once by the host).
+ONE_HEAD_LAYOUTS = {
+    "three_d": (True, True),
+    "flat": (True, True),
+    "transposed": (True, True),
+    "first_of_two": (False, True),
+    "misaligned": (True, False),
+}
+
+
+def _one_head(base: torch.Tensor, layout: str) -> torch.Tensor:
+    """``base`` ([rows, 128]) as a one-head input of ``layout``."""
+    rows = base.shape[0]
+    if layout == "three_d":
+        return base.clone().view(rows, 1, D)
+    if layout == "flat":
+        return base.clone()
+    if layout == "transposed":
+        return base.clone().view(1, rows, D).transpose(0, 1)
+    if layout == "first_of_two":
+        wide = torch.zeros(rows, 2, D, dtype=base.dtype, device=base.device)
+        wide[:, 0] = base
+        return wide[:, :1]
+    if layout == "misaligned":
+        buf = torch.zeros(rows * D + 8, dtype=base.dtype, device=base.device)
+        out = buf[8:].view(rows, D)
+        out.copy_(base)
+        return out
+    raise ValueError(layout)
+
+
+@pytest.mark.parametrize("layout", list(ONE_HEAD_LAYOUTS))
+def test_one_head_input_passes_the_packed_rows_test_when_its_rows_follow_one_another(
+    layout,
+) -> None:
+    """Without a device: a one-head input's head stride is passed as 128 (it is
+    never dereferenced), so the kernels see packed rows exactly when its token
+    stride is 128 (or the host copied it), as for ``[T, H, 128]`` inputs."""
+    base = torch.randn(7, D).bfloat16()
+    t = _one_head(base, layout)
+    view, tok, head = backend._kernel_view(t, "x", shape=t.shape, device=t.device)
+    packed, in_place = ONE_HEAD_LAYOUTS[layout]
+    assert head == D
+    assert tok == (2 * D if layout == "first_of_two" else D)
+    assert _packed({"heads": 1, "x_tok": tok, "x_head": head}) == packed
+    assert (view.data_ptr() == t.data_ptr()) == in_place
+    assert torch.equal(view.reshape(-1, D), base)
+
+
+@pytest.mark.parametrize(
+    "shape,strides,want",
+    [
+        pytest.param((1, 1, D), None, (0, D), id="1x1"),
+        pytest.param((1, D), None, (0, D), id="1-flat"),
+        pytest.param((D,), None, (0, D), id="one-row"),
+        pytest.param((1, 2, D), None, (0, D), id="1x2"),
+        pytest.param((5, 2, D), None, (2 * D, D), id="5x2"),
+        pytest.param((5, 3, D), None, (3 * D, D), id="5x3"),
+        pytest.param((5, 2, D), (4 * D, D, 1), (4 * D, D), id="5x2-projection"),
+        pytest.param((5, 2, D), (D, 5 * D, 1), (D, 5 * D), id="5x2-head_major"),
+    ],
+)
+def test_kernel_view_strides(shape, strides, want) -> None:
+    """Without a device: a single token's stride is passed as 0, a single
+    head's as 128, any other dimension's as it is."""
+    if strides is None:
+        t = torch.zeros(shape, dtype=torch.bfloat16)
+    else:
+        t = torch.empty_strided(shape, strides, dtype=torch.bfloat16)
+    _, tok, head = backend._kernel_view(t, "x", shape=t.shape, device=t.device)
+    assert (tok, head) == want
+
+
+# The modules that warm packed rows in L2, by role: the one-head inputs take
+# one row past each one's start.
+ONE_HEAD_ROUTES = [
+    pytest.param("fwd", "fwd_mid", id="fwd_mid"),
+    pytest.param("fwd", "fwd_xlong", id="fwd_xlong"),
+    pytest.param("bwd_bf16", "bwd_bf16_long", id="bwd_bf16_long"),
+    pytest.param("bwd_f32", "bwd_f32_long", id="bwd_f32_long"),
+]
+
+
+@requires_device
+@pytest.mark.parametrize("role,tier", ONE_HEAD_ROUTES)
+def test_one_head_inputs_match_the_flat_rows_and_the_deterministic_package(
+    role, tier, determinism_setting, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One row past the start of the mid and the extra-long forward and of the
+    long backward: a one-head input of every layout (``ONE_HEAD_LAYOUTS``)
+    launches ``module_for_rows``' module with head stride 128, passes the
+    packed-rows test exactly when its rows follow one another (or the host
+    copied it), and returns the deterministic package's ``y``, ``dx`` and
+    ``dz`` bits and a ``dw`` within the budget of the deterministic ``dw`` on
+    every repeat, with the workspace zero after every call."""
+    arch = loader.device_arch(torch.cuda.current_device())
+    name = loader.ROUTES[arch].get(tier)
+    if name is None:
+        pytest.skip(f"{arch} routes no {tier} module")
+    sms = _sm_count()
+    rows = loader.min_rows_per_sm(name, arch) * sms + 1
+    assert loader.module_for_rows(arch, role, rows, sms) == name
+    x0, z0, w, dy0 = suite.make(rows, 1, layout="flat", seed=25)
+    dw_dtype = torch.float32 if role == "bwd_f32" else torch.bfloat16
+
+    def out():
+        return torch.empty(D, dtype=dw_dtype, device=x0.device)
+
+    if role == "fwd":
+        y_d = det_forward(x0, z0, w, EPS)
+    else:
+        dx_d, dz_d, dw_d = det_backward(dy0, x0, z0, w, EPS, grad_weight=out())
+        mag = suite.magnitudes(dy0, x0, z0, EPS)
+        ws = nd_workspace(rows, x0.device)
+    launched = _spy_strides(monkeypatch)
+    for layout, (packed, _) in ONE_HEAD_LAYOUTS.items():
+        x, z, dy = (_one_head(t, layout) for t in (x0, z0, dy0))
+        launched.clear()
+        if role == "fwd":
+            y = nd_forward(x, z, w, EPS)
+            assert torch.equal(y.reshape(rows, D), y_d), (layout, "y")
+            calls = 1
+        else:
+            for _ in range(suite.REPEATS):
+                dx, dz, dw = nd_backward(
+                    dy, x, z, w, EPS, grad_weight=out(), workspace=ws
+                )
+                assert torch.equal(dx.reshape(rows, D), dx_d), (layout, "dx")
+                assert torch.equal(dz.reshape(rows, D), dz_d), (layout, "dz")
+                suite.assert_dw_within(
+                    dw, dw_d, mag, what=f"{layout}: dw vs the deterministic package"
+                )
+                assert not bool(ws.any()), (layout, "the workspace is not zero")
+            calls = suite.REPEATS
+        assert [n for n, _ in launched] == [name] * calls, (layout, launched)
+        for _, strides in launched:
+            assert strides["heads"] == 1, (layout, strides)
+            heads = [v for k, v in strides.items() if k.endswith("_head")]
+            assert heads and all(v == D for v in heads), (layout, strides)
+            assert _packed(strides) == packed, (layout, strides)

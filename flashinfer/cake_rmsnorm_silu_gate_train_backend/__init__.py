@@ -118,7 +118,9 @@ Host design (the input layout rules are the deterministic package's):
   mid forward (6 CTAs per SM, at most 2 blocks of 16 rows each), from 2400
   (1740 on sm_107a) the long forward (3 CTAs per SM, at most 6 blocks of 32
   rows each).  The mid forward's thread 0 also warms in L2, with one bulk
-  prefetch a tensor where x and z hold their rows packed, the CTA's next block
+  prefetch a tensor where x and z hold their rows packed (head stride 128 and
+  token stride ``H * 128``, which a ``[T, 1, 128]`` or ``[T, 128]`` input
+  whose rows follow one another meets: see ``_kernel_view``), the CTA's next block
   and the first block of the CTA one wave later; from 3000 rows per SM on
   sm_103a and from 1740 on sm_107a (its whole range there) the long
   forward's thread 0 also warms the CTA's next block the same way.  The
@@ -305,7 +307,11 @@ def _kernel_view(
     The tensor is viewed as ``[T, H, 128]``; it is read in place when its last
     stride is 1, its storage offset and both strides are multiples of 16
     elements (32 bytes) and its storage is 32-byte aligned, else copied once.
-    A stride of a size-1 dimension is never dereferenced and is passed as 0.
+    A stride of a size-1 dimension is never dereferenced: a single token's
+    stride is passed as 0 and a single head's as 128, the stride of rows that
+    follow one another, so a ``[T, 1, 128]`` or ``[T, 128]`` input whose token
+    stride is 128 passes the kernels' packed-rows test (head stride 128 and
+    token stride ``H * 128``) as a ``[T, H, 128]`` input with packed rows does.
     """
 
     if not isinstance(tensor, torch.Tensor):
@@ -326,7 +332,7 @@ def _kernel_view(
         view = None
     if view is not None:
         tok = int(view.stride(0)) if tokens > 1 else 0
-        head = int(view.stride(1)) if heads > 1 else 0
+        head = int(view.stride(1)) if heads > 1 else HEAD_DIM
         if (
             view.stride(2) == 1
             and _aligned(tok)
@@ -340,7 +346,7 @@ def _kernel_view(
     return (
         copy,
         heads * HEAD_DIM if tokens > 1 else 0,
-        HEAD_DIM if heads > 1 else 0,
+        HEAD_DIM,
     )
 
 
