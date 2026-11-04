@@ -47,49 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 512
-#define TMEM_ACC_H_OFFSET 0
-#define TMEM_ACC_VP_OFFSET 128
-#define TMEM_ACC_QH_OFFSET 256
-#define TMEM_ACC_AV_OFFSET 384
-#define NUM_RING_STAGES 2
-#define NUM_ONE_STAGES 1
-#define SMEM_W_PANEL_OFF 1024
-#define SMEM_W_PANEL_STAGE_BYTES 8192
-#define SMEM_W_PANEL_STRIDE 8192
-#define SMEM_KG_PANEL_OFF 33792
-#define SMEM_KG_PANEL_STAGE_BYTES 8192
-#define SMEM_KG_PANEL_STRIDE 8192
-#define SMEM_W_OP_OFF 1024
-#define SMEM_W_OP_STAGE_BYTES 16384
-#define SMEM_W_OP_STRIDE 16384
-#define SMEM_KG_MN_OFF 33792
-#define SMEM_KG_MN_STAGE_BYTES 16384
-#define SMEM_KG_MN_STRIDE 16384
-#define SMEM_HS_OFF 66560
-#define SMEM_HS_STAGE_BYTES 32768
-#define SMEM_HS_STRIDE 32768
-#define SMEM_HS_MN_OFF 66560
-#define SMEM_HS_MN_STAGE_BYTES 32768
-#define SMEM_HS_MN_STRIDE 32768
-#define SMEM_BV_OFF 99328
-#define SMEM_BV_STAGE_BYTES 16384
-#define SMEM_BV_STRIDE 16384
-#define SMEM_BV_MN_OFF 99328
-#define SMEM_BV_MN_STAGE_BYTES 16384
-#define SMEM_BV_MN_STRIDE 16384
-#define SMEM_QG_PANEL_OFF 115712
-#define SMEM_QG_PANEL_STAGE_BYTES 8192
-#define SMEM_QG_PANEL_STRIDE 8192
-#define SMEM_QG_OP_OFF 115712
-#define SMEM_QG_OP_STAGE_BYTES 16384
-#define SMEM_QG_OP_STRIDE 16384
-#define SMEM_AQK_OP_OFF 132096
-#define SMEM_AQK_OP_STAGE_BYTES 8192
-#define SMEM_AQK_OP_STRIDE 8192
-#define SMEM_TOTAL 140288
-#define THREADS 320
 #define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
@@ -263,7 +220,7 @@ kernel_cake_kda_det_train_8ab0929b8154c90b5eff(const __grid_constant__ CUtensorM
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     __nv_bfloat16* w_panel = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
     const int w_panel_addr = smem + 1024;
     __nv_bfloat16* kg_panel = reinterpret_cast<__nv_bfloat16*>(smem_raw + 33792);
@@ -287,8 +244,7 @@ kernel_cake_kda_det_train_8ab0929b8154c90b5eff(const __grid_constant__ CUtensorM
     __nv_bfloat16* aqk_op = reinterpret_cast<__nv_bfloat16*>(smem_raw + 132096);
     const int aqk_op_addr = smem + 132096;
 
-    // Mbarrier init (15 pipeline groups, 0 ordered-sequence groups, 17 barriers)
-    // Mbarriers at smem_raw[0..136)
+    // Mbarrier init (17 barriers at smem_raw[0..136))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -345,13 +301,11 @@ kernel_cake_kda_det_train_8ab0929b8154c90b5eff(const __grid_constant__ CUtensorM
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
-
-    // Kernel post-init ops
-    const int tmem_acc_h = taddr;
-    const int tmem_acc_vp = taddr + 128;
-    const int tmem_acc_qh = taddr + 256;
-    const int tmem_acc_av = taddr + 384;
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_acc_h = taddr;
+    const unsigned int tmem_acc_vp = taddr + 128;
+    const unsigned int tmem_acc_qh = taddr + 256;
+    const unsigned int tmem_acc_av = taddr + 384;
 
     // ---- Role: compute ----
     if (warp <= 3) {
@@ -393,43 +347,43 @@ kernel_cake_kda_det_train_8ab0929b8154c90b5eff(const __grid_constant__ CUtensorM
             float init_row[16];
             if (walk == 1) {
                 #pragma unroll
-                for (int j_1 = 0; j_1 < 16; j_1++) {
-                    init_row[j_1] = ((k_row == j_1) ? 1.0f : 0.0f);
+                for (int j_0 = 0; j_0 < 16; j_0++) {
+                    init_row[j_0] = ((k_row == j_0) ? 1.0f : 0.0f);
                 }
                 tmem_st_x16_f32(taddr + (unsigned int)h_row_base, init_row);
                 #pragma unroll
-                for (int j_0 = 0; j_0 < 16; j_0++) {
-                    init_row[j_0] = ((k_row == 16 + j_0) ? 1.0f : 0.0f);
+                for (int j_2 = 0; j_2 < 16; j_2++) {
+                    init_row[j_2] = ((k_row == 16 + j_2) ? 1.0f : 0.0f);
                 }
                 tmem_st_x16_f32(taddr + (unsigned int)h_row_base + 16, init_row);
                 #pragma unroll
-                for (int j_2 = 0; j_2 < 16; j_2++) {
-                    init_row[j_2] = ((k_row == 32 + j_2) ? 1.0f : 0.0f);
+                for (int j_3 = 0; j_3 < 16; j_3++) {
+                    init_row[j_3] = ((k_row == 32 + j_3) ? 1.0f : 0.0f);
                 }
                 tmem_st_x16_f32(taddr + (unsigned int)h_row_base + 32, init_row);
                 #pragma unroll
-                for (int j_3 = 0; j_3 < 16; j_3++) {
-                    init_row[j_3] = ((k_row == 48 + j_3) ? 1.0f : 0.0f);
+                for (int j_4 = 0; j_4 < 16; j_4++) {
+                    init_row[j_4] = ((k_row == 48 + j_4) ? 1.0f : 0.0f);
                 }
                 tmem_st_x16_f32(taddr + (unsigned int)h_row_base + 48, init_row);
                 #pragma unroll
-                for (int j_4 = 0; j_4 < 16; j_4++) {
-                    init_row[j_4] = ((k_row == 64 + j_4) ? 1.0f : 0.0f);
+                for (int j_5 = 0; j_5 < 16; j_5++) {
+                    init_row[j_5] = ((k_row == 64 + j_5) ? 1.0f : 0.0f);
                 }
                 tmem_st_x16_f32(taddr + (unsigned int)h_row_base + 64, init_row);
                 #pragma unroll
-                for (int j_5 = 0; j_5 < 16; j_5++) {
-                    init_row[j_5] = ((k_row == 80 + j_5) ? 1.0f : 0.0f);
+                for (int j_6 = 0; j_6 < 16; j_6++) {
+                    init_row[j_6] = ((k_row == 80 + j_6) ? 1.0f : 0.0f);
                 }
                 tmem_st_x16_f32(taddr + (unsigned int)h_row_base + 80, init_row);
                 #pragma unroll
-                for (int j_6 = 0; j_6 < 16; j_6++) {
-                    init_row[j_6] = ((k_row == 96 + j_6) ? 1.0f : 0.0f);
+                for (int j_7 = 0; j_7 < 16; j_7++) {
+                    init_row[j_7] = ((k_row == 96 + j_7) ? 1.0f : 0.0f);
                 }
                 tmem_st_x16_f32(taddr + (unsigned int)h_row_base + 96, init_row);
                 #pragma unroll
-                for (int j_7 = 0; j_7 < 16; j_7++) {
-                    init_row[j_7] = ((k_row == 112 + j_7) ? 1.0f : 0.0f);
+                for (int j_8 = 0; j_8 < 16; j_8++) {
+                    init_row[j_8] = ((k_row == 112 + j_8) ? 1.0f : 0.0f);
                 }
                 tmem_st_x16_f32(taddr + (unsigned int)h_row_base + 112, init_row);
             } else if (use_h0 == 1) {
@@ -820,8 +774,8 @@ kernel_cake_kda_det_train_8ab0929b8154c90b5eff(const __grid_constant__ CUtensorM
                 }
                 float bvv[16];
                 #pragma unroll
-                for (int j_8 = 0; j_8 < 16; j_8++) {
-                    bvv[j_8] = _unpack_bf16_0[j_8] - _tmem_load_24[j_8];
+                for (int j_1 = 0; j_1 < 16; j_1++) {
+                    bvv[j_1] = _unpack_bf16_0[j_1] - _tmem_load_24[j_1];
                 }
                 unsigned int bvv_bf16[8];
                 #pragma unroll

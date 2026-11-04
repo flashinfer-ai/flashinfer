@@ -737,10 +737,13 @@ def format_sota(result: dict, head: str, phases: Sequence[str], kind: str) -> li
             for name, entry in arms.items()
         )
         best = result["best_sota"].get(key)
+        # No ratio when the non-deterministic mode has no time for the phase (it failed in a timing round).
+        ratio = result["speedup_vs_sota"].get(key)
         tail = (
             "best -"
             if best is None
-            else f"best {best['arm']} {best['us']:9.2f} -> sota/nondet {result['speedup_vs_sota'][key]:5.3f}x"
+            else f"best {best['arm']} {best['us']:9.2f} -> sota/nondet "
+            + ("-" if ratio is None else f"{ratio:5.3f}x")
         )
         lines.append(f"{head} {phase:4s} sota {kind} | {cells} | {tail}")
     lines.extend(f"{head} sota {describe(entry)}" for entry in arms.values())

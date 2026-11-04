@@ -28,16 +28,29 @@ initial / final state with its gradients (also through empty sequences), the pre
 contracts: two runs, the two table routes on one plan, a split plan's pass 2 on ``dhu_tc2`` after the fused pre-scan
 against ``dv_local`` and the register one, the fused tail of a value-head group of three against the unfused one with
 either finalize, the longest-first dispatch order against the caller's (and its
-tables without a device), two streams against one (and the groups' rule without a device, caller-stream allocations
-between and during two-stream calls, a CUDA graph capture and one side stream per caller stream), the launches on the
+tables without a device), two streams against one (the adjoint scan of serial plans beside the fused tail of a
+value-head group of two and the ``dhu_tc2`` pass 2 of split plans beside that of three, the other two pairings on one
+stream; and the groups' rule without a device, caller-stream allocations between and during two-stream calls, a CUDA
+graph capture and one side stream per caller stream), the launches on the
 caller's stream (one and two streams) and from cached entries, the two preps, ``q`` / ``k`` off the tensor maps' 16-byte
 alignment (the plain prep), and an equal-length batch against the same sequences packed; and the input contract: every
 rejected input raises before the first launch, a host tensor at the low-level entries reaches the binding's device
-check, and the device route does not synchronize.  The training-loop contracts: the head pairs (16, 48), (8, 24),
-(4, 12), (16, 32) and (8, 16) on their fused tails, gradients accumulated into a nonzero ``.grad``, strided views of
-packed and head-major operands (and a strided output gradient) against the contiguous call, a non-reentrant
-``torch.utils.checkpoint`` that retains no bytes, all bitwise, and the forward and backward beside a resident
-side-stream kernel (a time ratio declared before the run).
+check, and the device route does not synchronize.  The wavefront pair (``dhu_tc2_wavefront`` / ``tail_g2_bf16_wavefront``,
+the split pass 2 of more CTAs than SMs on ``dhu_tc2_wavefront_split``): its chunk order and its rule per architecture
+(and the scan it picks) without a device; on a device the pair against the separate launches with the adjoint
+workspaces poisoned (serial, with an empty sequence, a split pass 2, and one of more CTAs than SMs on
+``dhu_tc2_wavefront_split``), repeated calls, the shipped rule on
+the device's architecture (serial plans, and split pass 2s below and above the split side's work floor), the rows the
+rule leaves alone launching exactly what the rule turned off launches, a CUDA graph capture (the separate launches),
+accumulated gradients, strided views and a checkpointed call.  The
+training-loop contracts: the head pairs (16, 48), (8, 24),
+(4, 12), (16, 32) and (8, 16) on their fused tails (the groups of three also with the split pass 2 on two streams
+and the serial adjoint scan on one),
+gradients accumulated into a nonzero ``.grad`` (one and two streams), strided views of packed and head-major operands
+(and a strided output gradient) against the contiguous call, a non-reentrant ``torch.utils.checkpoint`` that retains no
+bytes (one and two streams), all bitwise, and the forward and backward beside a resident side-stream kernel (a time
+ratio declared before the run; also the split pass 2 on the device's own SM count: two streams beside ``tail_g3``,
+one beside ``tail_g2``).
 
 The suite names its package once, through the shared alias helper, and imports nothing else from flashinfer: a build
 that vendors the package under another import path runs it unchanged after pointing the ``PACKAGES`` entry at its
@@ -317,7 +330,13 @@ def _preps(stages) -> set[str]:
 
 
 # the fused tails' cluster sizes: one CTA per value head of a key head
-FUSED_TAIL_STAGES = {"tail_g2": 2, "tail_g2_bf16": 2, "tail_g3": 3, "tail_g3_bf16": 3}
+FUSED_TAIL_STAGES = {
+    "tail_g2": 2,
+    "tail_g2_bf16": 2,
+    "tail_g2_bf16_wavefront": 2,
+    "tail_g3": 3,
+    "tail_g3_bf16": 3,
+}
 
 
 def test_former_names_are_aliases_of_the_det_names() -> None:
@@ -335,7 +354,7 @@ def test_former_names_are_aliases_of_the_det_names() -> None:
 
 
 def test_registry_records_are_well_formed() -> None:
-    assert len(cake_jit.STAGES) == 32 and len(set(cake_jit.STAGES)) == 32
+    assert len(cake_jit.STAGES) == 36 and len(set(cake_jit.STAGES)) == 36
     assert set(cake_chain.LAUNCH_ARGS) == set(cake_jit.STAGES)
     for arch in ARCHES:
         for stage in cake_jit.STAGES:
@@ -360,8 +379,42 @@ def test_registry_records_are_well_formed() -> None:
         params = cake_backend.parameters(name)
         assert sorted(params) == sorted(cake_chain.LAUNCH_ARGS[rec["stage"]]), name
         libraries.add(rec["library"])
-    # one program per record: a kernel swap renames exactly the records it touches
-    assert len(libraries) == len(cake_jit.MODULES)
+    # one program per record: a kernel swap renames exactly the records it touches; the two shared libraries are the
+    # sm_107a scan of the split pass 2's pair, which is the sm_100a / sm_103a dhu_tc2_wavefront program, and the
+    # sm_107a wy_tc2, which is that architecture's wy_tc program
+    wavefront = cake_jit.MODULES["dhu_tc2_wavefront"]
+    assert wavefront["arches"] == ["sm_100a", "sm_103a"]
+    shared = cake_jit.MODULES["dhu_tc2_wavefront_split_sm_107a"]
+    assert shared["arches"] == ["sm_107a"]
+    assert shared["library"] == wavefront["library"]
+    split = cake_jit.MODULES["dhu_tc2_wavefront_split"]
+    assert split["arches"] == ["sm_100a", "sm_103a"]
+    # the sm_107a scan of the pair: a program of its own (the release in batches of eight chunks)
+    eight = cake_jit.MODULES["dhu_tc2_wavefront_sm_107a"]
+    assert eight["stage"] == "dhu_tc2_wavefront" and eight["arches"] == ["sm_107a"]
+    assert len({wavefront["library"], split["library"], eight["library"]}) == 3
+    wy, wy2, wy2_107 = (
+        cake_jit.MODULES[name] for name in ("wy_tc", "wy_tc2", "wy_tc2_sm_107a")
+    )
+    assert wy2["arches"] == ["sm_100a", "sm_103a"] and wy2_107["arches"] == ["sm_107a"]
+    assert (
+        wy2_107["library"] == wy["library"] != wy2["library"]
+        and "sm_107a" in wy["arches"]
+    )
+    assert len(libraries) == len(cake_jit.MODULES) - 2
+
+
+def test_the_wy_stage_follows_the_architecture() -> None:
+    assert cake_chain.WY_TC2_ARCHS == ("sm_100a", "sm_103a")
+    assert {arch: cake_chain.wy_stage(arch) for arch in ARCHES} == {
+        "sm_100a": "wy_tc2",
+        "sm_103a": "wy_tc2",
+        "sm_107a": "wy_tc",
+    }
+    assert cake_chain.LAUNCH_ARGS["wy_tc2"] == cake_chain.LAUNCH_ARGS["wy_tc"]
+    assert (
+        cake_jit.MODULES["wy_tc2"]["arg_plan"] == cake_jit.MODULES["wy_tc"]["arg_plan"]
+    )
 
 
 def test_scan_records_carry_the_planner_constants() -> None:
@@ -667,12 +720,20 @@ def test_two_stream_split_rule() -> None:
     assert split(5, 4, 8) == 4  # 8 and 16 CTAs both fill their rounds: the larger group
 
 
-# The two-stream groups of the campaign rows, (forward group A, adjoint group A) in sequences: the forward's group A
-# is the partial round, the adjoint's the full rounds.  The other rows run one stream (one sequence or one round).
+# The two-stream groups of the campaign rows, (forward group A, adjoint group A) in sequences (``None``: one stream):
+# the forward's group A is the partial round, the adjoint's the full rounds.  On the 216 SMs of R200 the split adjoint
+# plans of r03 and r08 group their segments (adjoint group A in segments; their forward runs one stream).  The other
+# rows run one stream (one sequence or one round).
 STREAM_ROWS = {
     "sm_100a": {"r05": (7, 9), "r06": (6, 9), "r09": (7, 9)},
     "sm_103a": {"r05": (7, 9), "r06": (6, 9), "r09": (2, 14)},
-    "sm_107a": {"r05": (3, 13), "r06": (2, 13), "r09": (3, 13)},
+    "sm_107a": {
+        "r03": (None, 13),
+        "r05": (3, 13),
+        "r06": (2, 13),
+        "r08": (None, 6),
+        "r09": (3, 13),
+    },
 }
 
 
@@ -691,16 +752,65 @@ def test_two_stream_groups_on_the_campaign_rows(arch, monkeypatch) -> None:
                 seq_lens, "cpu", scan_plans=plans, lpt=lpt
             )
             fwd, bwd = cake_chain.sequence_groups(meta, num_v_heads, props[0])
-            if expected is None:
-                assert fwd is None and bwd is None, (row, fwd, bwd)
-                continue
-            assert fwd is not None and bwd is not None, (row, plans)
-            assert (fwd.split, bwd.split) == expected, (row, lpt, fwd, bwd)
+            got = (
+                None if fwd is None else fwd.split,
+                None if bwd is None else bwd.split,
+            )
+            assert got == (expected or (None, None)), (row, lpt, fwd, bwd, plans)
             starts = meta.seq_chunk_start.tolist()
-            assert (
-                fwd.split_chunk == starts[fwd.split]
-                and bwd.split_chunk == starts[bwd.split]
-            ), (row, lpt)
+            seg_starts = meta.bwd_segments.seg_chunk_start.tolist()
+            assert fwd is None or fwd.split_chunk == starts[fwd.split], (row, lpt)
+            assert bwd is None or bwd.split_chunk == seg_starts[bwd.split], (row, lpt)
+
+
+# The adjoint groups of the split (64, 1) rows, adjoint group A in segments (``None``: one stream, one round or whole
+# rounds); every such row runs its pass 2 on dhu_tc2 (SDT_SELECTED), so the rows of a value-head group of three
+# (issue, P3, P1: tail_g3) run the two-stream form; beside tail_g2 the adjoint keeps one stream.
+SPLIT_STREAM_ROWS = {
+    "sm_100a": {"r02": 9, "r04": 9, "issue": 24, "P3": 24, "P1": 24},
+    "sm_103a": {"r02": 9, "r10": 4, "issue": 25, "P3": 25, "P1": 25},
+    "sm_107a": {"r03": 13, "r08": 6},
+}
+
+
+@pytest.mark.parametrize("arch", sorted(RULE_DEVICES))
+def test_split_pass2_groups_on_the_split_rows(arch, monkeypatch) -> None:
+    props, _r01_tc = RULE_DEVICES[arch]
+    monkeypatch.setattr(cake_chain, "_device_props", lambda _index: props)
+    monkeypatch.setattr(cake_backend, "device_arch", lambda _index: arch)
+    grouped = set()
+    for row, seq_lens, num_v_heads in SDT_ROWS:
+        plans = cake_chain.scan_plans(
+            sum(seq_lens), len(seq_lens), num_v_heads, 0, seq_lens
+        )
+        for lpt in (True, False):
+            meta = cake_chain.build_chunk_meta(
+                seq_lens, "cpu", scan_plans=plans, lpt=lpt
+            )
+            segs = meta.bwd_segments
+            if segs.num_segments <= meta.num_seqs:
+                continue  # a serial adjoint plan (the campaign-row test above)
+            fwd, bwd = cake_chain.sequence_groups(meta, num_v_heads, props[0])
+            assert fwd is None, (row, fwd)
+            k = cake_chain.two_stream_split(segs.num_segments, num_v_heads, props[0])
+            assert (None if bwd is None else bwd.split) == k, (row, lpt, bwd, k)
+            if bwd is not None:
+                seg_starts = segs.seg_chunk_start.tolist()
+                assert bwd.split_chunk == seg_starts[k], (row, lpt, bwd)
+                assert 0 < bwd.split_chunk < meta.num_chunks
+                grouped.add(row)
+    assert grouped == set(SPLIT_STREAM_ROWS[arch]), grouped
+    for row, seq_lens, num_v_heads in SDT_ROWS:
+        if row in SPLIT_STREAM_ROWS[arch]:
+            plans = cake_chain.scan_plans(
+                sum(seq_lens), len(seq_lens), num_v_heads, 0, seq_lens
+            )
+            meta = cake_chain.build_chunk_meta(seq_lens, "cpu", scan_plans=plans)
+            _fwd, bwd = cake_chain.sequence_groups(meta, num_v_heads, props[0])
+            assert bwd is not None and bwd.split == SPLIT_STREAM_ROWS[arch][row], (
+                row,
+                bwd,
+            )
 
 
 def test_sequence_groups_partition_a_serial_table() -> None:
@@ -726,12 +836,36 @@ def test_sequence_groups_partition_a_serial_table() -> None:
                     groups,
                 )
                 assert 0 < groups.split_chunk < meta.num_chunks
-    # a split plan, a forward walk and the device route run one stream
+    # a split plan: its forward (a walk) runs one stream; its adjoint groups the table's segments by the same rule,
+    # group A the first k segments (the chunks before segment k)
     split_plans = (cake_chain.ScanPlan((32, 2), 4), cake_chain.ScanPlan((64, 1), 4))
+    for lpt in (True, False):
+        meta = cake_chain.build_chunk_meta(
+            (2000, 300, 77), "cpu", scan_plans=split_plans, lpt=lpt
+        )
+        assert (meta.fwd_segments.walk is not None) is lpt
+        segs = meta.bwd_segments
+        seg_starts = segs.seg_chunk_start.tolist()
+        assert segs.num_segments == 11 > meta.num_seqs
+        grouped = 0
+        for sm_count in range(2, segs.num_segments * num_v_heads + 1):
+            k = cake_chain.two_stream_split(segs.num_segments, num_v_heads, sm_count)
+            fwd, bwd = cake_chain.sequence_groups(meta, num_v_heads, sm_count)
+            assert fwd is None, (sm_count, fwd)
+            if k is None:
+                assert bwd is None, (sm_count, bwd)
+                continue
+            grouped += 1
+            assert bwd is not None and (bwd.split, bwd.split_chunk) == (
+                k,
+                seg_starts[k],
+            ), (sm_count, bwd)
+            assert 0 < bwd.split_chunk < meta.num_chunks
+        assert grouped > 0
+    # 40 CTAs fill 8 rounds of 5 SMs: one stream
     meta = cake_chain.build_chunk_meta(
         (2000, 300), "cpu", scan_plans=split_plans, lpt=True
     )
-    assert meta.fwd_segments.walk is not None
     assert cake_chain.sequence_groups(meta, num_v_heads, 5) == (None, None)
     serial_meta = cake_chain.build_chunk_meta((2000, 300), "cpu", scan_plans=serial)
     # 8 CTAs on 5 SMs split; without a layout on the host they do not
@@ -1104,6 +1238,39 @@ STREAM_CASES = {(2, 4): 6, (2, 6): 7}
 STREAM_LAYOUT = (300, 77, 640, 1000)  # every group boundary falls after a partial chunk
 # serial plans on dhu_tc2: both directions can group
 STREAM_PINS = {"segment_chunks": 0, "dhu_scan": "tc"}
+# split (64, 1) plans with the dhu_tc2 pass 2: the adjoint groups its segments (24 + 2 + 10 chunks in segments of 4 =
+# 10 segments; HV 4: 40 CTAs on 6 SMs, adjoint A = 9 segments; HV 6: 60 CTAs on 7 SMs, A = 7); the forward runs one
+# stream
+SPLIT_STREAM_CASES = {(2, 4): 6, (2, 6): 7}
+SPLIT_STREAM_LAYOUT = (1500, 77, 640)
+SPLIT_STREAM_PINS = {"scan_config": (64, 1), "segment_chunks": 4, "dhu_scan": "tc"}
+# (layout, heads, SMs the planner sees, pins, the side stream's launches per call)
+TWO_STREAM_FORMS = {
+    "serial-g2": (
+        STREAM_LAYOUT,
+        (2, 4),
+        6,
+        STREAM_PINS,
+        ["wy_tc", "fwd_ho", "dhu_tc2"],
+    ),
+    "split-g3": (SPLIT_STREAM_LAYOUT, (2, 6), 7, SPLIT_STREAM_PINS, ["dhu_tc2"]),
+}
+
+
+def _on_device(stages: list[str]) -> list[str]:
+    """``stages`` with ``wy_tc`` as this device's forward WY stage (:func:`cake_chain.wy_stage`)."""
+    wy = cake_chain.wy_stage(cake_backend.device_arch(torch.cuda.current_device()))
+    return [wy if stage == "wy_tc" else stage for stage in stages]
+
+
+def _adjoint_two_streams(form: str, heads: tuple[int, int]) -> bool:
+    """Whether the adjoint ``dhu_tc2`` runs as two groups on a grouped table on this device: a serial plan beside
+    ``tail_g2`` (beside ``tail_g3`` too on the architectures of ``TWO_STREAM_SERIAL_G3_ARCHS``), the pass 2 of a split
+    plan beside ``tail_g3``; the other pairings keep the adjoint on the caller's stream."""
+    arch = cake_backend.device_arch(torch.cuda.current_device())
+    serial = (2, 3) if arch in cake_chain.TWO_STREAM_SERIAL_G3_ARCHS else (2,)
+    group = heads[1] // heads[0]
+    return (form == "serial" and group in serial) or (form, group) == ("split", 3)
 
 
 @pytest.mark.parametrize("save_state", [True, False], ids=["saved", "recompute"])
@@ -1135,10 +1302,10 @@ def test_two_streams_match_one_stream(
         runs.append(_run(inputs, seq_lens, initial_state=h0, output_final_state=True, dht=dht, streams=streams,
                          lpt=lpt, save_state=save_state, **STREAM_PINS))  # fmt: skip
         side = [stage for stage, stream in launches[start:] if stream != main]
-        # the side stream: wy_tc and fwd_ho of the forward's group A, dhu_tc2 of the adjoint's group B (the fused
-        # tail of a value-head group of two only)
-        expected = ["wy_tc", "fwd_ho"] + (
-            ["dhu_tc2"] if heads[1] == 2 * heads[0] else []
+        # the side stream: wy_tc and fwd_ho of the forward's group A, dhu_tc2 of the adjoint's group B beside the
+        # fused tail of group A (beside tail_g3 off TWO_STREAM_SERIAL_G3_ARCHS one launch on the caller's stream)
+        expected = _on_device(["wy_tc", "fwd_ho"]) + (
+            ["dhu_tc2"] if _adjoint_two_streams("serial", heads) else []
         )
         assert side == (expected if streams == 2 else []), (streams, launches[start:])
     _assert_bitwise(runs[0], runs[1], names)
@@ -1146,6 +1313,76 @@ def test_two_streams_match_one_stream(
     if lpt and save_state:
         ref = _reference(inputs, seq_lens, initial_state=h0, dht=dht)
         _assert_close_to_reference(runs[0], ref, names)
+
+
+@pytest.mark.parametrize(
+    "beta_dtype", [torch.bfloat16, torch.float32], ids=["bf16beta", "fp32beta"]
+)
+@pytest.mark.parametrize("lpt", [True, False], ids=["lpt", "caller-order"])
+@pytest.mark.parametrize("heads", sorted(SPLIT_STREAM_CASES), ids=["g2", "g3"])
+def test_split_pass2_two_streams_match_one_stream(
+    heads, lpt, beta_dtype, device, monkeypatch
+) -> None:
+    # a split (64, 1) plan's dhu_tc2 pass 2 beside tail_g3 as two groups of segments (the caller's stream: group A,
+    # then the fused tail of its chunks; the side stream: group B, joined before the tail of B), beside tail_g2 the
+    # one-stream launches of streams=1, against one stream and against the register pass 2: the same bits on every
+    # output, with an initial state and a final-state gradient
+    seq_lens = SPLIT_STREAM_LAYOUT
+    _small_device(monkeypatch, device, SPLIT_STREAM_CASES[heads])
+    arch = cake_backend.device_arch(cake_chain._device_index(device))
+    inputs = _inputs(seq_lens, heads, beta_dtype, device, seed=131)
+    gen = torch.Generator().manual_seed(137)
+    h0 = (
+        0.1 * torch.randn(len(seq_lens), heads[1], HEAD_DIM, HEAD_DIM, generator=gen)
+    ).to(device)
+    dht = torch.randn(len(seq_lens), heads[1], HEAD_DIM, HEAD_DIM, generator=gen).to(
+        device
+    )
+    main = torch.cuda.current_stream(device).cuda_stream
+    launches = _record_streams(monkeypatch)
+    names = OUTPUT_NAMES + ("final_state", "dh0")
+    tail = f"tail_g{heads[1] // heads[0]}" + (
+        "_bf16" if beta_dtype == torch.bfloat16 else ""
+    )
+    grouped = _adjoint_two_streams("split", heads)
+    runs, stage_lists = {}, {}
+    for form, pins in (
+        ("two", {"streams": 2}),
+        ("one", {"streams": 1}),
+        ("reg", {"streams": 2, "dhu_scan": "reg"}),
+    ):
+        start = len(launches)
+        runs[form] = _run(inputs, seq_lens, initial_state=h0, output_final_state=True, dht=dht, lpt=lpt,
+                          **{**SPLIT_STREAM_PINS, **pins})  # fmt: skip
+        # beside tail_g2_bf16 the tcgen05 pass 2 of more CTAs than the SMs the planner sees runs as the wavefront pair
+        # on the architectures of the rule's split side on a call of enough tokens x value heads (the same launches
+        # in another form, the tail on the side stream); this layout stays below the work floor
+        pair = (
+            form != "reg"
+            and tail == "tail_g2_bf16"
+            and arch in cake_chain.WAVEFRONT_SPLIT_ARCHS
+            and sum(seq_lens) * heads[1] >= cake_chain.WAVEFRONT_SPLIT_MIN_TOKEN_HEADS
+        )
+        stages = stage_lists[form] = [
+            stage.removesuffix("_wavefront") for stage, _stream in launches[start:]
+        ]
+        side = [stage for stage, stream in launches[start:] if stream != main]
+        assert "stitch" in stages, stages
+        if form == "two" and grouped:
+            assert side == ["dhu_tc2"], launches[start:]
+            assert stages.count("dhu_tc2") == 2 and stages.count(tail) == 2, stages
+        else:
+            want_side = ["tail_g2_bf16_wavefront"] if pair else []
+            assert side == want_side, launches[start:]
+            assert stages.count(tail) == 1, stages
+            assert stages.count("dhu_tc2") == (0 if form == "reg" else 1), stages
+    if not grouped:
+        assert stage_lists["two"] == stage_lists["one"], stage_lists
+    _assert_bitwise(runs["two"], runs["one"], names)
+    _assert_bitwise(runs["two"], runs["reg"], names)
+    if lpt and beta_dtype == torch.bfloat16:
+        ref = _reference(inputs, seq_lens, initial_state=h0, dht=dht)
+        _assert_close_to_reference(runs["two"], ref, names)
 
 
 @pytest.mark.parametrize(
@@ -1173,7 +1410,10 @@ def test_split_pass2_on_dhu_tc2_matches_the_register_pass2(
         start = len(launches)
         runs[scan] = _run(inputs, seq_lens, initial_state=h0, output_final_state=True, dht=dht, scan_config=(64, 1),
                           segment_chunks=6, dhu_scan=scan)  # fmt: skip
-        stages = [stage for stage, _stream in launches[start:]]
+        # the wavefront pair (g2, BF16 beta) is the pass 2 and the tail in another form
+        stages = [
+            stage.removesuffix("_wavefront") for stage, _stream in launches[start:]
+        ]
         assert "stitch" in stages, stages
         # the tc form: the fused pre-scan computes the dv_local tiles it reads, no dv_local stage
         want = (
@@ -1232,14 +1472,15 @@ def test_group_of_three_tail_matches_the_unfused_tail(
     _assert_bitwise(runs[""], runs["finalize_mlp"], names)
 
 
-def test_two_streams_survive_interleaved_allocations(device, monkeypatch) -> None:
+@pytest.mark.parametrize("form", sorted(TWO_STREAM_FORMS))
+def test_two_streams_survive_interleaved_allocations(form, device, monkeypatch) -> None:
     # the caller's stream allocates, writes and frees between two-stream calls (pooled and fresh workspaces) and,
     # after every side-stream launch, while the side stream works: memory released before the join would be
     # overwritten with NaN on the caller's stream
-    seq_lens, heads = STREAM_LAYOUT, (2, 4)
-    _small_device(monkeypatch, device, STREAM_CASES[heads])
+    seq_lens, heads, sm_count, pins, side_per_call = TWO_STREAM_FORMS[form]
+    _small_device(monkeypatch, device, sm_count)
     inputs = _inputs(seq_lens, heads, torch.bfloat16, device, seed=73)
-    one = _run(inputs, seq_lens, streams=1, **STREAM_PINS)
+    one = _run(inputs, seq_lens, streams=1, **pins)
     gen = torch.Generator().manual_seed(79)
     main = torch.cuda.current_stream(device)
     launch = cake_backend.launch_stage
@@ -1264,17 +1505,18 @@ def test_two_streams_survive_interleaved_allocations(device, monkeypatch) -> Non
             )
             for _ in range(3)
         ]
-        got = _run(inputs, seq_lens, streams=2, host_cache=i % 2 == 0, **STREAM_PINS)
+        got = _run(inputs, seq_lens, streams=2, host_cache=i % 2 == 0, **pins)
         del junk
         _assert_bitwise(got, one, OUTPUT_NAMES)
-    assert side_launches == ["wy_tc", "fwd_ho", "dhu_tc2"] * 16, side_launches
+    assert side_launches == _on_device(side_per_call) * 16, side_launches
 
 
-def test_two_streams_under_cuda_graph_capture(device, monkeypatch) -> None:
-    seq_lens, heads = STREAM_LAYOUT, (2, 4)
-    _small_device(monkeypatch, device, STREAM_CASES[heads])
+@pytest.mark.parametrize("form", sorted(TWO_STREAM_FORMS))
+def test_two_streams_under_cuda_graph_capture(form, device, monkeypatch) -> None:
+    seq_lens, heads, sm_count, pins, side_per_call = TWO_STREAM_FORMS[form]
+    _small_device(monkeypatch, device, sm_count)
     inputs = _inputs(seq_lens, heads, torch.bfloat16, device, seed=83)
-    eager = _run(inputs, seq_lens, streams=1, **STREAM_PINS)
+    eager = _run(inputs, seq_lens, streams=1, **pins)
     leaves = {
         name: inputs[name].detach().clone().requires_grad_(True)
         for name in ("q", "k", "v", "g", "beta")
@@ -1289,7 +1531,7 @@ def test_two_streams_under_cuda_graph_capture(device, monkeypatch) -> None:
         o, _ = chunk_gated_delta_rule_det(leaves["q"], leaves["k"], leaves["v"], leaves["g"], leaves["beta"],
                                       scale=1.0 / math.sqrt(HEAD_DIM), cu_seqlens=cu_seqlens,
                                       cu_seqlens_cpu=cu_seqlens_cpu, use_qk_l2norm_in_kernel=True, streams=2,
-                                      **STREAM_PINS)  # fmt: skip
+                                      **pins)  # fmt: skip
         (o.float() * inputs["do"].float()).sum().backward()
         return o
 
@@ -1305,9 +1547,13 @@ def test_two_streams_under_cuda_graph_capture(device, monkeypatch) -> None:
     with torch.cuda.graph(graph):
         o = step()
     captured = list(launches)
-    # the capture forked the side stream: two streams, the side one for wy_tc, fwd_ho and dhu_tc2
+    # the capture forked the side stream: two streams, the side one for the form's side launches
     streams = {stream for _stage, stream in captured}
     assert len(streams) == 2, captured
+    # the capture stream: the call's first launch (the prep) runs on the caller's stream
+    main = captured[0][1]
+    side = [stage for stage, stream in captured if stream != main]
+    assert side == _on_device(side_per_call), captured
     for _ in range(2):
         graph.replay()
     torch.cuda.synchronize()
@@ -1351,19 +1597,20 @@ def test_launches_resolve_once_and_reuse_their_entries(device, monkeypatch) -> N
         )
 
 
+@pytest.mark.parametrize("form", sorted(TWO_STREAM_FORMS))
 @pytest.mark.parametrize("streams", [1, 2])
-def test_launches_run_on_the_callers_stream(streams, device, monkeypatch) -> None:
+def test_launches_run_on_the_callers_stream(streams, form, device, monkeypatch) -> None:
     # The caller's stream sleeps, then rewrites q (before the forward) and do (before the backward).  A launch on any
     # other stream would run during the sleep and read the old q / do; the outputs must be those of the new ones.
-    seq_lens, heads = STREAM_LAYOUT, (2, 4)
-    _small_device(monkeypatch, device, STREAM_CASES[heads])
+    seq_lens, heads, sm_count, pins, _side = TWO_STREAM_FORMS[form]
+    _small_device(monkeypatch, device, sm_count)
     old = _inputs(seq_lens, heads, torch.bfloat16, device, seed=103)
     new = _inputs(seq_lens, heads, torch.bfloat16, device, seed=107)
     want = _run(
         {**old, "q": new["q"], "do": new["do"]},
         seq_lens,
         streams=streams,
-        **STREAM_PINS,
+        **pins,
     )
     cu = _cu(seq_lens)
     caller = torch.cuda.Stream(device=device)
@@ -1381,7 +1628,7 @@ def test_launches_run_on_the_callers_stream(streams, device, monkeypatch) -> Non
                                       scale=1.0 / math.sqrt(HEAD_DIM),
                                       cu_seqlens=torch.tensor(cu, dtype=torch.int64, device=device),
                                       cu_seqlens_cpu=torch.tensor(cu, dtype=torch.int64), use_qk_l2norm_in_kernel=True,
-                                      streams=streams, **STREAM_PINS)  # fmt: skip
+                                      streams=streams, **pins)  # fmt: skip
         torch.cuda._sleep(200_000_000)
         do.copy_(new["do"])
         o.backward(do)
@@ -1433,6 +1680,27 @@ def test_prep_forms_agree_bitwise(route, beta_dtype, device, monkeypatch) -> Non
     _assert_bitwise(tma, plain, OUTPUT_NAMES)
 
 
+@pytest.mark.parametrize("save_state", [True, False], ids=["saved", "recompute"])
+def test_the_wy_stage_of_the_device_gives_the_wy_tc_bits(
+    save_state, device, monkeypatch
+) -> None:
+    # every forward WY launch (and the backward's recompute) runs the device's stage, wy_tc2 on sm_100a / sm_103a;
+    # wy_tc in its place gives the same bits
+    seq_lens = (300, 77, 640, 17)
+    inputs = _inputs(seq_lens, (2, 6), torch.bfloat16, device, seed=29)
+    wy = cake_chain.wy_stage(cake_backend.device_arch(torch.cuda.current_device()))
+    stages = _record_launches(monkeypatch)
+    ruled = _run(inputs, seq_lens, save_state=save_state)
+    launched = [stage for stage in stages if stage.startswith("wy_tc")]
+    assert launched and set(launched) == {wy}, stages
+    stages.clear()
+    monkeypatch.setattr(cake_chain, "wy_stage", lambda arch: "wy_tc")
+    plain = _run(inputs, seq_lens, save_state=save_state)
+    replaced = [stage for stage in stages if stage.startswith("wy_tc")]
+    assert replaced == ["wy_tc"] * len(launched), stages
+    _assert_bitwise(ruled, plain, OUTPUT_NAMES)
+
+
 def test_unaligned_qk_take_the_plain_prep(device, monkeypatch) -> None:
     # q / k as contiguous views 8 bytes past a 16-byte boundary: the tensor maps of prep_tma need 16-byte aligned
     # addresses, the plain prep's 4-element loads 8; a prep_tma pin still runs the plain prep, with the same bits.
@@ -1466,6 +1734,374 @@ def test_equal_length_batch_matches_the_packed_layout(preps, device) -> None:
     for name in OUTPUT_NAMES:
         packed[name] = packed[name].reshape(batched[name].shape)
     _assert_bitwise(batched, packed, OUTPUT_NAMES)
+
+
+# --------------------------------------------------------------------------- the wavefront pair
+
+WAVEFRONT_PAIR = ("dhu_tc2_wavefront", "tail_g2_bf16_wavefront")
+# the split pass 2 of more CTAs than SMs: the pair's scan with the elected release
+WAVEFRONT_SPLIT_PAIR = ("dhu_tc2_wavefront_split", "tail_g2_bf16_wavefront")
+WAVEFRONT_STAGES = set(WAVEFRONT_PAIR) | set(WAVEFRONT_SPLIT_PAIR)
+# a serial plan with the adjoint scan on dhu_tc2
+WAVEFRONT_PINS = {"segment_chunks": 0, "dhu_scan": "tc"}
+
+
+def _wavefront_rule(monkeypatch, *, off: bool = False) -> None:
+    """The pair's rule for every value-head count on every architecture (``off``: on none), with fresh layout caches
+    (the table's side of the rule is decided when a table is planned)."""
+    monkeypatch.setattr(cake_chain, "WAVEFRONT_ARCHS", () if off else ARCHES)
+    monkeypatch.setattr(cake_chain, "WAVEFRONT_MIN_V_HEADS", {})
+    monkeypatch.setattr(cake_chain, "_META_FRONT", {})
+
+
+def _record_calls(monkeypatch) -> list[tuple]:
+    """(stage, grid, arguments) of every launch from here on; a tensor argument as (shape, stride, dtype)."""
+    calls: list[tuple] = []
+    launch = cake_backend.launch_stage
+
+    def recording(stage, grid, values, **kwargs):
+        calls.append((stage, tuple(grid), tuple((tuple(v.shape), v.stride(), v.dtype) if isinstance(v, torch.Tensor)
+                                               else v for v in values)))  # fmt: skip
+        return launch(stage, grid, values, **kwargs)
+
+    monkeypatch.setattr(cake_backend, "launch_stage", recording)
+    return calls
+
+
+def test_wavefront_order_follows_the_scan() -> None:
+    # step k: the k-th chunk from the end of every segment that has one, segments in table order
+    assert cake_chain.wavefront_order([0, 3, 4, 7]) == [2, 3, 6, 1, 5, 0, 4]
+    assert cake_chain.wavefront_order([0, 0, 2, 2]) == [1, 0]
+    assert cake_chain.wavefront_order([0]) == []
+    # the host-built order equals the order of the table's own adjoint segments (longest first, split, empty sequences)
+    for seq_lens, plans, lpt in (
+        ((300, 77, 640, 1000), (cake_chain.ScanPlan((32, 2), 0), cake_chain.ScanPlan((64, 1), 0)), True),
+        ((300, 0, 1000, 77), (cake_chain.ScanPlan((32, 2), 0), cake_chain.ScanPlan((64, 1), 0)), True),
+        ((1500, 77, 640), (cake_chain.ScanPlan((32, 2), 0), cake_chain.ScanPlan((64, 1), 4)), True),
+        ((1500, 77, 640), (cake_chain.ScanPlan((32, 2), 0), cake_chain.ScanPlan((64, 1), 4)), False),
+    ):  # fmt: skip
+        meta = cake_chain.build_chunk_meta(seq_lens, "cpu", scan_plans=plans, lpt=lpt)
+        segs = meta.bwd_segments
+        got = cake_chain._wavefront_walk(meta.seq_lens, meta.order, segs.segment_len)
+        assert got == cake_chain.wavefront_order(segs.seg_chunk_start.tolist()), (
+            seq_lens,
+            lpt,
+        )
+        assert sorted(got) == list(range(meta.num_chunks))
+
+
+# (sequences, HV, adjoint segment chunks) -> whether the table's side of the rule holds on (sm_100a 148 SMs, sm_103a
+# 152, sm_107a 212 / 216): 2 x segments x HV <= SMs, and on sm_100a HV >= 32 (scan dhu_tc2_wavefront); on sm_100a and
+# sm_103a also a split adjoint plan of more than SMs pass-2 CTAs (segments x HV) at any HV with tokens x HV >= 3 x 2^17
+# (scan dhu_tc2_wavefront_split); on sm_107a only the first side (not in WAVEFRONT_SPLIT_ARCHS)
+WAVEFRONT_TABLE_ROWS = {
+    "r01_4x4096_hv16": ((4096,) * 4, 16, 0, (False, True, True, True)),
+    "r07_1x16384_hv16": ((16384,), 16, 0, (False, True, True, True)),
+    "r10_1x16384_hv32": ((16384,), 32, 0, (True, True, True, True)),
+    "r03_8x4096_hv16": ((4096,) * 8, 16, 0, (False, False, False, False)),
+    "3x4096_hv32": ((4096,) * 3, 32, 0, (False, False, True, True)),
+    # split: 13 segments x HV 16 = 208 pass-2 CTAs, 30100 tokens x 16 = 481600 (above the work floor)
+    "r04_7x4.3k_hv16_split46": ((4199, 2781, 4282, 4448, 4723, 5804, 3863), 16, 46, (True, True, False, False)),
+    # split: 19 x 16 = 304 CTAs (the sm_103a plan of the same layout)
+    "r04_7x4.3k_hv16_split31": ((4199, 2781, 4282, 4448, 4723, 5804, 3863), 16, 31, (True, True, False, False)),
+    # split: 13 x 16 = 208 CTAs, 12750 tokens x 16 = 204000 (below the work floor: host-bound)
+    "r02_3x4.25k_hv16_split17": ((5406, 3448, 3896), 16, 17, (False, False, False, False)),
+    # split: 12 x 32 = 384 CTAs at the work floor (12288 x 32) and one chunk below it (12224 x 32)
+    "1x12288_hv32_split16": ((12288,), 32, 16, (True, True, False, False)),
+    "1x12224_hv32_split16": ((12224,), 32, 16, (False, False, False, False)),
+    # split: 4 x 16 = 64 CTAs (sm_100a: below the SMs and HV < 32)
+    "1x16384_hv16_split64": ((16384,), 16, 64, (False, True, True, True)),
+    # split: 8 x 32 = 256 CTAs
+    "1x16384_hv32_split32": ((16384,), 32, 32, (True, True, False, False)),
+    # split: 7 x 32 = 224 CTAs (the sm_103a plan of r10)
+    "r10_1x16384_hv32_split37": ((16384,), 32, 37, (True, True, False, False)),
+    # split: 2 x 32 = 64 CTAs, at most half of every device's SMs
+    "1x16384_hv32_split128": ((16384,), 32, 128, (True, True, True, True)),
+}  # fmt: skip
+WAVEFRONT_DEVICES = (
+    ("sm_100a", 148),
+    ("sm_103a", 152),
+    ("sm_107a", 212),
+    ("sm_107a", 216),
+)
+
+
+@pytest.mark.parametrize("row", sorted(WAVEFRONT_TABLE_ROWS))
+def test_wavefront_rule_per_architecture(row, monkeypatch) -> None:
+    assert cake_chain.WAVEFRONT_ARCHS == ("sm_100a", "sm_103a", "sm_107a")
+    assert cake_chain.WAVEFRONT_MIN_V_HEADS == {"sm_100a": 32}
+    assert cake_chain.WAVEFRONT_SPLIT_ARCHS == ("sm_100a", "sm_103a")
+    assert cake_chain.WAVEFRONT_SPLIT_MIN_TOKEN_HEADS == 393216
+    assert cake_chain.wavefront_engaged(4, 8, 148)
+    assert not cake_chain.wavefront_engaged(10, 8, 148)
+    assert not cake_chain.wavefront_engaged(38, 2, 148)
+    assert cake_chain.wavefront_engaged(3, 32, 212)
+    assert not cake_chain.wavefront_engaged(4, 32, 216)
+    assert cake_chain.wavefront_split_engaged(13, 16, 148, 30100)
+    assert cake_chain.wavefront_split_engaged(12, 32, 148, 12288)
+    assert not cake_chain.wavefront_split_engaged(12, 32, 148, 12287)
+    assert not cake_chain.wavefront_split_engaged(13, 16, 148, 12750)
+    assert cake_chain.wavefront_split_engaged(7, 32, 152, 16384)
+    assert cake_chain.wavefront_split_engaged(19, 16, 152, 30100)
+    assert not cake_chain.wavefront_split_engaged(4, 32, 152, 16384)
+    assert not cake_chain.wavefront_split_engaged(37, 4, 148, 1 << 20)
+    assert not cake_chain.wavefront_split_engaged(4, 16, 148, 1 << 20)
+    seq_lens, num_v_heads, segment_chunks, want = WAVEFRONT_TABLE_ROWS[row]
+    plans = (
+        cake_chain.ScanPlan((32, 2), 0),
+        cake_chain.ScanPlan((64, 1), segment_chunks),
+    )
+    meta = cake_chain.build_chunk_meta(seq_lens, "cpu", scan_plans=plans, lpt=True)
+    got = []
+    for arch, sm_count in WAVEFRONT_DEVICES:
+        monkeypatch.setattr(cake_backend, "device_arch", lambda _index, arch=arch: arch)
+        monkeypatch.setattr(
+            cake_chain, "_device_props", lambda _index, n=sm_count: (n, 232448, 10)
+        )
+        scan = cake_chain._wavefront_table(meta, num_v_heads, 0)
+        got.append(scan is not None)
+        # the split side (more pass-2 CTAs than SMs) runs the elected-release scan, the occupancy side the other
+        rounds = meta.bwd_segments.num_segments * num_v_heads > sm_count
+        assert scan in (
+            None,
+            "dhu_tc2_wavefront_split" if rounds else "dhu_tc2_wavefront",
+        ), (row, arch, scan)
+        # the device route has no host layout: never
+        device_meta = dataclasses.replace(meta, seq_lens=None)
+        assert cake_chain._wavefront_table(device_meta, num_v_heads, 0) is None
+    assert tuple(got) == want, (row, got)
+
+
+def _poison_adjoint_workspaces(device) -> int:
+    """NaN into every pooled ``dh`` / ``dv2`` workspace of the caller's stream (a tail tile read before the scan
+    stores it would carry it into the gradients); returns the buffers poisoned."""
+    table = cake_chain._POOLED.table(cake_chain._device_index(device))
+    count = 0
+    for role in ("b_dh", "b_dv2"):
+        for buffer in table.get(role, {}).values():
+            buffer.fill_(float("nan"))
+            count += 1
+    return count
+
+
+# (layout, pins, heads, scan): a serial plan on dhu_tc2 (also with an empty sequence) and a split (64, 1) plan with its
+# pass 2 on dhu_tc2, value-head group of two, BF16 beta: 4 / 4 / 10 segments x HV 4 take at most half of any exported
+# device (dhu_tc2_wavefront); a split pass 2 of 50 segments x HV 32 = 1600 CTAs over 12477 tokens (more CTAs than
+# SMs, above the work floor: dhu_tc2_wavefront_split, on the architectures of WAVEFRONT_SPLIT_ARCHS)
+WAVEFRONT_ROWS = {
+    "serial": ((300, 77, 640, 1000), WAVEFRONT_PINS, (2, 4), "dhu_tc2_wavefront"),
+    "serial-empty": ((300, 0, 1000, 77), WAVEFRONT_PINS, (2, 4), "dhu_tc2_wavefront"),
+    "split": ((1500, 77, 640), {"scan_config": (64, 1), "segment_chunks": 4, "dhu_scan": "tc"}, (2, 4),
+              "dhu_tc2_wavefront"),
+    "split-rounds": ((6000, 77, 6400), {"scan_config": (64, 1), "segment_chunks": 4, "dhu_scan": "tc"}, (16, 32),
+                     "dhu_tc2_wavefront_split"),
+}  # fmt: skip
+
+
+@pytest.mark.parametrize("row", sorted(WAVEFRONT_ROWS))
+def test_wavefront_pair_matches_the_plain_launches(row, device, monkeypatch) -> None:
+    # the pair against the separate dhu_tc2 / tail_g2_bf16 launches, with the initial state, its gradient, the final
+    # state and its gradient: bitwise, also with dh / dv2 poisoned between calls; the tail on the side stream
+    seq_lens, pins, heads, scan = WAVEFRONT_ROWS[row]
+    arch = cake_backend.device_arch(cake_chain._device_index(device))
+    if (
+        scan == "dhu_tc2_wavefront_split"
+        and arch not in cake_chain.WAVEFRONT_SPLIT_ARCHS
+    ):
+        pytest.skip(f"the split side of the rule does not run on {arch}")
+    inputs = _inputs(seq_lens, heads, torch.bfloat16, device, seed=401)
+    gen = torch.Generator().manual_seed(409)
+    h0 = (
+        0.1 * torch.randn(len(seq_lens), heads[1], HEAD_DIM, HEAD_DIM, generator=gen)
+    ).to(device)
+    dht = torch.randn(len(seq_lens), heads[1], HEAD_DIM, HEAD_DIM, generator=gen).to(
+        device
+    )
+    names = OUTPUT_NAMES + ("final_state", "dh0")
+    kwargs = dict(initial_state=h0, output_final_state=True, dht=dht, **pins)
+    _wavefront_rule(monkeypatch, off=True)
+    stages = _record_launches(monkeypatch)
+    plain = _run(inputs, seq_lens, **kwargs)
+    assert not WAVEFRONT_STAGES & set(stages) and "dhu_tc2" in stages, stages
+    _wavefront_rule(monkeypatch)
+    main = torch.cuda.current_stream(device).cuda_stream
+    launches = _record_streams(monkeypatch)
+    for poison in (False, True):
+        if poison:
+            assert _poison_adjoint_workspaces(device) >= 2
+        start = len(launches)
+        got = _run(inputs, seq_lens, **kwargs)
+        mine = [s for s, _ in launches[start:]]
+        assert mine.count(scan) == 1 and mine.count("tail_g2_bf16_wavefront") == 1, mine
+        assert not (
+            {"dhu_tc2", "tail_g2_bf16"}
+            | WAVEFRONT_STAGES - {scan, "tail_g2_bf16_wavefront"}
+        ) & set(mine), mine
+        side = [s for s, stream in launches[start:] if stream != main]
+        assert side == ["tail_g2_bf16_wavefront"], launches[start:]
+        _assert_bitwise(got, plain, names)
+
+
+def test_wavefront_pair_repeats_bitwise(device, monkeypatch) -> None:
+    seq_lens, pins, heads, _scan = WAVEFRONT_ROWS["serial"]
+    inputs = _inputs(seq_lens, heads, torch.bfloat16, device, seed=419)
+    _wavefront_rule(monkeypatch, off=True)
+    want = _run(inputs, seq_lens, **pins)
+    _wavefront_rule(monkeypatch)
+    stages = _record_launches(monkeypatch)
+    for _ in range(20):
+        _assert_bitwise(_run(inputs, seq_lens, **pins), want, OUTPUT_NAMES)
+    assert stages.count("tail_g2_bf16_wavefront") == 20, stages
+
+
+# (layout, heads, pins, architectures that engage): the shipped rule on the device's architecture.  A serial plan on
+# dhu_tc2: HV 4 engages on sm_103a, not on sm_100a (HV < 32); HV 32 over two sequences (128 scan CTAs) engages on
+# sm_100a and sm_103a.  A split (64, 1) plan with its pass 2 on dhu_tc2 (24 + 2 + 10 chunks in segments of 4 = 10
+# segments): HV 4 (40 CTAs, below the SMs) engages on sm_103a only; HV 32 (320 CTAs, more than the SMs) nowhere, as
+# 2217 tokens x 32 stay below the split side's work floor; over 94 + 2 + 100 chunks (50 segments, 1600 CTAs; 12477
+# tokens x 32, above the floor) on sm_100a and sm_103a, on dhu_tc2_wavefront_split.  sm_107a (208 to 216 SMs) engages
+# every scan of at most half its SMs (HV 4 and HV 32 serial, HV 4 split) and no split pass 2 of more CTAs than SMs
+WAVEFRONT_SPLIT_PINS = {"scan_config": (64, 1), "segment_chunks": 4, "dhu_scan": "tc"}
+WAVEFRONT_DEFAULT_ROWS = {
+    "hv4": ((300, 77, 640), (2, 4), WAVEFRONT_PINS, ("sm_103a", "sm_107a"), WAVEFRONT_PAIR),
+    "hv32": ((300, 640), (16, 32), WAVEFRONT_PINS, ("sm_100a", "sm_103a", "sm_107a"), WAVEFRONT_PAIR),
+    "split-hv4": ((1500, 77, 640), (2, 4), WAVEFRONT_SPLIT_PINS, ("sm_103a", "sm_107a"), WAVEFRONT_PAIR),
+    "split-hv32-small": ((1500, 77, 640), (16, 32), WAVEFRONT_SPLIT_PINS, (), WAVEFRONT_PAIR),
+    "split-hv32": ((6000, 77, 6400), (16, 32), WAVEFRONT_SPLIT_PINS, ("sm_100a", "sm_103a"), WAVEFRONT_SPLIT_PAIR),
+}  # fmt: skip
+
+
+@pytest.mark.parametrize("row", sorted(WAVEFRONT_DEFAULT_ROWS))
+def test_wavefront_shipped_rule_on_the_device(row, device, monkeypatch) -> None:
+    # engaged: the pair replaces the separate launches with the same bits; not engaged: exactly the launches (stages,
+    # grids, argument shapes, strides and scalars) of the rule turned off
+    seq_lens, heads, pins, arches, pair = WAVEFRONT_DEFAULT_ROWS[row]
+    arch = cake_backend.device_arch(cake_chain._device_index(device))
+    engaged = arch in arches
+    monkeypatch.setattr(cake_chain, "_META_FRONT", {})
+    inputs = _inputs(seq_lens, heads, torch.bfloat16, device, seed=433)
+    calls = _record_calls(monkeypatch)
+    got = _run(inputs, seq_lens, **pins)
+    n = len(calls)
+    stages = {c[0] for c in calls[:n]}
+    assert (set(pair) <= stages) is engaged, (arch, row)
+    assert not (WAVEFRONT_STAGES - set(pair)) & stages, (arch, row)
+    _wavefront_rule(monkeypatch, off=True)
+    off = _run(inputs, seq_lens, **pins)
+    assert not WAVEFRONT_STAGES & {c[0] for c in calls[n:]}
+    if not engaged:
+        assert calls[:n] == calls[n:], (arch, row)
+    _assert_bitwise(got, off, OUTPUT_NAMES)
+
+
+# rows the wavefront rule keeps on the separate launches although every architecture and value-head count is allowed:
+# FP32 beta (tail_g2), a value-head group of three (tail_g3), the register adjoint scan, the device route, and a scan
+# above half the SMs (the planner on 10 SMs)
+WAVEFRONT_OFF_ROWS = {
+    "fp32beta": ((300, 77, 640, 1000), (2, 4), torch.float32, "host", WAVEFRONT_PINS, None),
+    "g3": ((300, 77, 640, 1000), (2, 6), torch.bfloat16, "host", WAVEFRONT_PINS, None),
+    "reg": ((300, 77, 640, 1000), (2, 4), torch.bfloat16, "host", {"segment_chunks": 0, "dhu_scan": "reg"}, None),
+    "device": ((300, 77, 640, 1000), (2, 4), torch.bfloat16, "device", WAVEFRONT_PINS, None),
+    "half-sms": ((300, 77, 640, 1000), (2, 4), torch.bfloat16, "host", {**WAVEFRONT_PINS, "streams": 1}, 10),
+}  # fmt: skip
+
+
+@pytest.mark.parametrize("row", sorted(WAVEFRONT_OFF_ROWS))
+def test_wavefront_rule_keeps_the_other_launches(row, device, monkeypatch) -> None:
+    # where the rule does not engage, the call launches exactly what it launches with the rule turned off: the same
+    # stages, grids and argument shapes, strides and scalars, and the same bits
+    seq_lens, heads, beta_dtype, route, pins, sm_count = WAVEFRONT_OFF_ROWS[row]
+    if sm_count is not None:
+        _small_device(monkeypatch, device, sm_count)
+    inputs = _inputs(seq_lens, heads, beta_dtype, device, seed=421)
+    _wavefront_rule(monkeypatch)
+    calls = _record_calls(monkeypatch)
+    default = _run(inputs, seq_lens, route=route, **pins)
+    n = len(calls)
+    _wavefront_rule(monkeypatch, off=True)
+    off = _run(inputs, seq_lens, route=route, **pins)
+    assert calls[:n] == calls[n:], row
+    assert not WAVEFRONT_STAGES & {c[0] for c in calls}, row
+    _assert_bitwise(default, off, OUTPUT_NAMES)
+
+
+def test_wavefront_pair_under_cuda_graph_capture(device, monkeypatch) -> None:
+    # a graph does not order its branches: the capture records the separate launches; its replays equal the eager
+    # calls (which run the pair) bitwise
+    seq_lens, pins, heads, _scan = WAVEFRONT_ROWS["serial"]
+    inputs = _inputs(seq_lens, heads, torch.bfloat16, device, seed=431)
+    _wavefront_rule(monkeypatch)
+    stages = _record_launches(monkeypatch)
+    eager = _run(inputs, seq_lens, **pins)
+    assert set(WAVEFRONT_PAIR) <= set(stages), stages
+    leaves = {
+        name: inputs[name].detach().clone().requires_grad_(True)
+        for name in ("q", "k", "v", "g", "beta")
+    }
+    cu = _cu(seq_lens)
+    cu_seqlens = torch.tensor(cu, dtype=torch.int64, device=device)
+    cu_seqlens_cpu = torch.tensor(cu, dtype=torch.int64)
+
+    def step():
+        for leaf in leaves.values():
+            leaf.grad = None
+        o, _ = chunk_gated_delta_rule_det(leaves["q"], leaves["k"], leaves["v"], leaves["g"], leaves["beta"],
+                                          scale=1.0 / math.sqrt(HEAD_DIM), cu_seqlens=cu_seqlens,
+                                          cu_seqlens_cpu=cu_seqlens_cpu, use_qk_l2norm_in_kernel=True,
+                                          **pins)  # fmt: skip
+        (o.float() * inputs["do"].float()).sum().backward()
+        return o
+
+    warmup = torch.cuda.Stream(device=device)
+    warmup.wait_stream(torch.cuda.current_stream(device))
+    with torch.cuda.stream(warmup):
+        for _ in range(2):
+            step()
+    torch.cuda.current_stream(device).wait_stream(warmup)
+    start = len(stages)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        o = step()
+    captured = stages[start:]
+    assert not WAVEFRONT_STAGES & set(captured), captured
+    assert {"dhu_tc2", "tail_g2_bf16"} <= set(captured), captured
+    for _ in range(3):
+        graph.replay()
+        torch.cuda.synchronize()
+        got = {
+            "o": o,
+            **{"d" + name: leaves[name].grad for name in ("q", "k", "v", "g", "beta")},
+        }
+        _assert_bitwise(got, eager, OUTPUT_NAMES)
+
+
+def test_wavefront_gradients_accumulate_into_a_nonzero_grad(
+    device, monkeypatch
+) -> None:
+    _wavefront_rule(monkeypatch)
+    stages = _record_launches(monkeypatch)
+    _check_accumulation(
+        (300, 77, 640), (2, 4), device, pins=WAVEFRONT_PINS, fresh_pins=WAVEFRONT_PINS
+    )
+    assert stages.count("tail_g2_bf16_wavefront") == 3, stages
+
+
+def test_wavefront_strided_views_match_the_contiguous_call(device, monkeypatch) -> None:
+    # head-major q / k / v / g / beta views (BF16 beta) and a strided output gradient through the pair: the contiguous
+    # call's bits
+    seq_lens = (300, 77, 640)
+    inputs = _inputs(seq_lens, (2, 4), torch.bfloat16, device, seed=437)
+    _wavefront_rule(monkeypatch)
+    stages = _record_launches(monkeypatch)
+    want = _run(inputs, seq_lens, **WAVEFRONT_PINS)
+    views, grads = _strided_leaves(inputs, "head-major")
+    o, _ = _call(views, seq_lens, device, **WAVEFRONT_PINS)
+    do = torch.cat([inputs["do"], torch.zeros_like(inputs["do"])], -1)[..., :HEAD_DIM]
+    torch.autograd.backward(o, do)
+    torch.cuda.synchronize()
+    got = {"o": o.detach(), **grads()}
+    _assert_bitwise(got, want, OUTPUT_NAMES)
+    assert stages.count("tail_g2_bf16_wavefront") == 2, stages
 
 
 # --------------------------------------------------------------------------- input contract
@@ -1684,7 +2320,10 @@ def test_head_pairs_dispatch_the_fused_tail(pair, device, monkeypatch) -> None:
     stages = _record_launches(monkeypatch)
     got = _run(inputs, PAIR_LAYOUT)
     tail = f"tail_g{group}" + ("_bf16" if beta_dtype == torch.bfloat16 else "")
-    assert tail in stages and "dqkwg" not in stages, stages
+    # HV = 2 H with BF16 beta may run the tail as the wavefront pair's
+    assert (
+        tail in stages or tail + "_wavefront" in stages
+    ) and "dqkwg" not in stages, stages
     assert not any(stage.startswith(("wy_bwd", "finalize")) for stage in stages), stages
     _assert_close_to_reference(got, _reference(inputs, PAIR_LAYOUT), OUTPUT_NAMES)
     _assert_bitwise(got, _run(inputs, PAIR_LAYOUT), OUTPUT_NAMES)
@@ -1694,6 +2333,46 @@ def test_head_pairs_dispatch_the_fused_tail(pair, device, monkeypatch) -> None:
             unfused = _run(inputs, PAIR_LAYOUT, finalize=fin)
             assert fin in stages[start:] and tail not in stages[start:], stages[start:]
             _assert_bitwise(got, unfused, OUTPUT_NAMES)
+
+
+@pytest.mark.parametrize("form", ["serial", "split"])
+@pytest.mark.parametrize(
+    "pair", HEAD_PAIRS[:3], ids=[f"h{h}-hv{hv}" for (h, hv), _dtype in HEAD_PAIRS[:3]]
+)
+def test_head_pairs_run_the_two_stream_tail(pair, form, device, monkeypatch) -> None:
+    # HV = 3 H with the planner on few SMs: the pass 2 of a split plan on dhu_tc2 runs as two groups, the side stream
+    # scanning group B while the caller's stream runs tail_g3 of group A; a serial tcgen05 adjoint scan, grouped on the
+    # table, does the same on the architectures of TWO_STREAM_SERIAL_G3_ARCHS and elsewhere keeps one launch on the
+    # caller's stream; the outputs pass the FP64 gate and equal the one-stream call bitwise
+    heads, beta_dtype = pair
+    num_v_heads = heads[1]
+    if form == "serial":
+        # 3 sequences: 2 HV CTAs fill a round of 2 HV + 2 SMs, so adjoint group A = 2 sequences
+        pins, sm_count = dict(STREAM_PINS), 2 * num_v_heads + 2
+    else:
+        # 1 + 3 + 5 chunks in segments of 2 = 6 segments: 4 HV CTAs leave 1 of 4 HV + 1 SMs idle, so A = 4 segments
+        pins = {"scan_config": (64, 1), "segment_chunks": 2, "dhu_scan": "tc"}
+        sm_count = 4 * num_v_heads + 1
+    _small_device(monkeypatch, device, sm_count)
+    inputs = _inputs(PAIR_LAYOUT, heads, beta_dtype, device, seed=239)
+    main = torch.cuda.current_stream(device).cuda_stream
+    launches = _record_streams(monkeypatch)
+    tail = "tail_g3" + ("_bf16" if beta_dtype == torch.bfloat16 else "")
+    two = _run(inputs, PAIR_LAYOUT, streams=2, **pins)
+    stages = [stage for stage, _stream in launches]
+    side = [stage for stage, stream in launches if stream != main]
+    if _adjoint_two_streams(form, heads):
+        assert side.count("dhu_tc2") == 1 and tail not in side, launches
+        assert stages.count("dhu_tc2") == 2 and stages.count(tail) == 2, stages
+    else:
+        assert "dhu_tc2" not in side and tail not in side, launches
+        assert stages.count("dhu_tc2") == 1 and stages.count(tail) == 1, stages
+    assert "dqkwg" not in stages, stages
+    start = len(launches)
+    one = _run(inputs, PAIR_LAYOUT, streams=1, **pins)
+    assert all(stream == main for _stage, stream in launches[start:]), launches[start:]
+    _assert_bitwise(two, one, OUTPUT_NAMES)
+    _assert_close_to_reference(two, _reference(inputs, PAIR_LAYOUT), OUTPUT_NAMES)
 
 
 def _call(leaves, seq_lens, device, *, route="host", initial_state=None, output_final_state=False, **pins):  # fmt: skip
@@ -1713,7 +2392,44 @@ def test_gradients_accumulate_into_a_nonzero_grad(heads, route, device) -> None:
     # autograd adds the package's gradients into an existing .grad (prior + fresh in the leaf's dtype, the
     # initial-state gradient included): after one call every leaf holds exactly prior + fresh, after a second
     # prior + fresh + fresh, where fresh is the gradient of the same call into empty .grad
-    seq_lens = (300, 77, 640)
+    _check_accumulation((300, 77, 640), heads, device, route=route)
+
+
+@pytest.mark.parametrize("form", ["serial", "split"])
+@pytest.mark.parametrize("heads", [(2, 4), (2, 6)], ids=["g2", "g3"])
+def test_two_stream_gradients_accumulate_into_a_nonzero_grad(
+    heads, form, device, monkeypatch
+) -> None:
+    # grouped tables under autograd accumulation (the adjoint on two streams: serial beside tail_g2, split pass 2
+    # beside tail_g3; the other two pairings on one): prior + fresh, then + fresh again, where fresh is the one-stream
+    # gradient of the same call (the side stream joins the caller's stream before the gradients reach .grad)
+    if form == "serial":
+        seq_lens, sm_count, pins = STREAM_LAYOUT, STREAM_CASES[heads], STREAM_PINS
+    else:
+        seq_lens, sm_count, pins = (
+            SPLIT_STREAM_LAYOUT,
+            SPLIT_STREAM_CASES[heads],
+            SPLIT_STREAM_PINS,
+        )
+    _small_device(monkeypatch, device, sm_count)
+    main = torch.cuda.current_stream(device).cuda_stream
+    launches = _record_streams(monkeypatch)
+    _check_accumulation(
+        seq_lens,
+        heads,
+        device,
+        fresh_pins={**pins, "streams": 1},
+        pins={**pins, "streams": 2},
+    )
+    side = [stage for stage, stream in launches if stream != main]
+    # one per accumulated call where the adjoint runs two streams
+    assert side.count("dhu_tc2") == (2 if _adjoint_two_streams(form, heads) else 0), (
+        launches
+    )
+
+
+def _check_accumulation(seq_lens, heads, device, *, route="host", fresh_pins=None, pins=None) -> None:  # fmt: skip
+    fresh_pins, pins = fresh_pins or {}, pins or {}
     inputs = _inputs(seq_lens, heads, torch.bfloat16, device, seed=231)
     gen = torch.Generator().manual_seed(233)
     h0 = (
@@ -1722,7 +2438,7 @@ def test_gradients_accumulate_into_a_nonzero_grad(heads, route, device) -> None:
     dht = torch.randn(len(seq_lens), heads[1], HEAD_DIM, HEAD_DIM, generator=gen).to(
         device
     )
-    fresh = _run(inputs, seq_lens, route=route, initial_state=h0, output_final_state=True, dht=dht)  # fmt: skip
+    fresh = _run(inputs, seq_lens, route=route, initial_state=h0, output_final_state=True, dht=dht, **fresh_pins)  # fmt: skip
     names = GRAD_NAMES + ("dh0",)
     leaves = {
         name: inputs[name].detach().clone().requires_grad_(True)
@@ -1738,7 +2454,8 @@ def test_gradients_accumulate_into_a_nonzero_grad(heads, route, device) -> None:
         leaf.grad = prior[grad_name[name]].clone()
 
     def step() -> dict:
-        o, final = _call(leaves, seq_lens, device, route=route, initial_state=leaves["h0"], output_final_state=True)  # fmt: skip
+        o, final = _call(leaves, seq_lens, device, route=route, initial_state=leaves["h0"], output_final_state=True,
+                         **pins)  # fmt: skip
         ((o.float() * inputs["do"].float()).sum() + (final * dht).sum()).backward()
         torch.cuda.synchronize()
         return {grad_name[name]: leaf.grad.clone() for name, leaf in leaves.items()}
@@ -1820,13 +2537,27 @@ def _allocator_bytes(device) -> tuple[int, int]:
     )
 
 
+@pytest.mark.parametrize("form", ["one", "serial", "split", "wavefront"])
 @pytest.mark.parametrize("heads", [(2, 4), (2, 6)], ids=["g2", "g3"])
-def test_checkpoint_matches_and_retains_no_bytes(heads, device) -> None:
-    # non-reentrant torch.utils.checkpoint (host table route): the outputs and gradients equal the plain call's
-    # bitwise, and a checkpointed forward keeps nothing on the device beyond its output (#7039)
-    seq_lens = (300, 77, 640)
+def test_checkpoint_matches_and_retains_no_bytes(
+    heads, form, device, monkeypatch
+) -> None:
+    # non-reentrant torch.utils.checkpoint (host table route): the outputs and gradients equal the plain (one-stream)
+    # call's bitwise, and a checkpointed forward keeps nothing on the device beyond its output (#7039); "serial" /
+    # "split" run grouped tables (the planner on few SMs; the adjoint on two streams where _adjoint_two_streams)
+    seq_lens, pins = (300, 77, 640), {}
+    if form == "serial":
+        seq_lens, pins = STREAM_LAYOUT, STREAM_PINS
+        _small_device(monkeypatch, device, STREAM_CASES[heads])
+    elif form == "split":
+        seq_lens, pins = SPLIT_STREAM_LAYOUT, SPLIT_STREAM_PINS
+        _small_device(monkeypatch, device, SPLIT_STREAM_CASES[heads])
+    elif form == "wavefront":
+        # the wavefront pair on the side stream (g2; g3 keeps the separate launches)
+        _wavefront_rule(monkeypatch)
+        pins = dict(WAVEFRONT_PINS)
     inputs = _inputs(seq_lens, heads, torch.bfloat16, device, seed=229)
-    eager = _run(inputs, seq_lens)
+    eager = _run(inputs, seq_lens, streams=1, **pins)
     leaves = {
         n: inputs[n].detach().clone().requires_grad_(True)
         for n in ("q", "k", "v", "g", "beta")
@@ -1838,7 +2569,7 @@ def test_checkpoint_matches_and_retains_no_bytes(heads, device) -> None:
 
     def layer(q, k, v, g, beta):
         o, _ = chunk_gated_delta_rule_det(q, k, v, g, beta, scale=1.0 / math.sqrt(HEAD_DIM), cu_seqlens=cu_seqlens,
-                                          cu_seqlens_cpu=cu_seqlens_cpu, use_qk_l2norm_in_kernel=True)  # fmt: skip
+                                          cu_seqlens_cpu=cu_seqlens_cpu, use_qk_l2norm_in_kernel=True, **pins)  # fmt: skip
         return o
 
     def step():
@@ -1850,6 +2581,8 @@ def test_checkpoint_matches_and_retains_no_bytes(heads, device) -> None:
         (step().float() * inputs["do"].float()).sum().backward()
     for leaf in leaves.values():
         leaf.grad = None
+    main = torch.cuda.current_stream(device).cuda_stream
+    launches = _record_streams(monkeypatch)
     gc.collect()
     torch.cuda.synchronize()
     requested, blocks = _allocator_bytes(device)
@@ -1868,31 +2601,54 @@ def test_checkpoint_matches_and_retains_no_bytes(heads, device) -> None:
     torch.cuda.synchronize()
     got = {"o": o.detach(), **{"d" + n: leaves[n].grad for n in ("q", "k", "v", "g", "beta")}}  # fmt: skip
     _assert_bitwise(got, eager, OUTPUT_NAMES)
+    side = [stage for stage, stream in launches if stream != main]
+    assert ("dhu_tc2" in side) is _adjoint_two_streams(form, heads), launches
+    if form == "wavefront":
+        assert ("tail_g2_bf16_wavefront" in side) is (heads == (2, 4)), launches
 
 
 # #7038 / #7548 form: a one-thread sleep kernel resident on a side stream for the whole call; the gate is declared
 # before the run (a stage that waited for every SM, or a whole-device launch, would stretch the call to the sleep).
 # The caller's stream sleeps first, so the host has enqueued the whole call before its first launch runs: the events
 # time the device work, not the launch overhead.  The g2 / g3 rows run the package's own two-stream groups; the
-# split row a segment-parallel plan (pre-scan, stitch and pass 2).
+# split row a segment-parallel plan (pre-scan, stitch and pass 2); the "-2s" rows a split plan with the dhu_tc2 pass 2
+# grouped on the device's own SM count (64 segments: HV 4 or 6 CTAs per segment leave the last round of every SM count
+# from 148 to 216 partly idle): two groups beside tail_g3, one launch on the caller's stream beside tail_g2.
 SIDE_STREAM_RATIO_MAX = 1.3
 SIDE_STREAM_ITERS = 9
+SPLIT_2S_PINS = {"scan_config": (64, 1), "segment_chunks": 4, "dhu_scan": "tc"}
 SIDE_STREAM_ROWS = (
     ("g2", (4096,) * 4, (2, 4), {}),
     ("g3", (4096,) * 4, (2, 6), {}),
     ("split-g2", (16384,), (2, 4), {"scan_config": (64, 1), "segment_chunks": 16}),
+    ("split-g2-2s", (16384,), (2, 4), SPLIT_2S_PINS),
+    ("split-g3-2s", (16384,), (2, 6), SPLIT_2S_PINS),
 )  # fmt: skip
 
 
 @pytest.mark.parametrize("row", SIDE_STREAM_ROWS, ids=[r[0] for r in SIDE_STREAM_ROWS])
-def test_forward_backward_beside_a_resident_side_stream_kernel(row, device) -> None:
-    _id, seq_lens, heads, pins = row
+def test_forward_backward_beside_a_resident_side_stream_kernel(row, device, monkeypatch) -> None:  # fmt: skip
+    row_id, seq_lens, heads, pins = row
     inputs = _inputs(seq_lens, heads, torch.bfloat16, device, seed=287)
     leaves = {
         n: inputs[n].detach().clone().requires_grad_(True)
         for n in ("q", "k", "v", "g", "beta")
     }
-    want = _run(inputs, seq_lens, **pins)
+    want = _run(inputs, seq_lens, streams=1, **pins)
+    if row_id.endswith("-2s"):
+        main = torch.cuda.current_stream(device).cuda_stream
+        launches = _record_streams(monkeypatch)
+        _assert_bitwise(_run(inputs, seq_lens, **pins), want, OUTPUT_NAMES)
+        side_stages = [stage for stage, stream in launches if stream != main]
+        grouped = _adjoint_two_streams("split", heads)
+        # beside tail_g2_bf16 the pass 2 of more CTAs than SMs (64 x 4 = 256) may run as the wavefront pair (the
+        # rule's split side, on dhu_tc2_wavefront_split), its tail on the side stream
+        pair = set(WAVEFRONT_SPLIT_PAIR) <= {stage for stage, _stream in launches}
+        assert not (grouped and pair), launches
+        assert side_stages == (
+            ["dhu_tc2"] if grouped else ["tail_g2_bf16_wavefront"] if pair else []
+        ), launches
+        monkeypatch.undo()
 
     def step() -> None:
         for leaf in leaves.values():

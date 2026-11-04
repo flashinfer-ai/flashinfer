@@ -13,8 +13,9 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Cake four-stream mHC training forward / backward (hidden 4096, 4 streams;
-SM100 / SM103 / SM107) with a selectable numerical mode.  The function, the
+Cake four-stream mHC training forward / backward (4 streams; hidden 4096 on
+SM100 / SM103 / SM107, and 5120 / 7168 on SM100 / SM103, for both values of
+``deterministic``) with a selectable numerical mode.  The function, the
 tensor contracts, the workspaces and the autograd wiring are those of
 :mod:`flashinfer.cake_mhc_det_train` (documented there).
 
@@ -32,11 +33,16 @@ and :func:`route_key` (the same in both packages):
   the ``dfn`` sum of every (column slab, token chunk) unit into ``dfn`` with
   FP32 reductions and folds ``dscale`` / ``dbase`` in the same grid.  Only the
   summation order of ``dfn`` varies from run to run: each element lies within
-  ``P`` FP32 roundings of the fixed-order sum (``P <= 32`` token chunks), and
-  the FP32 reduction flushes subnormal addends and results to zero.  ``dX``,
-  ``dscale`` and ``dbase`` are bitwise the deterministic values, and so are the
+  ``P`` FP32 roundings of the fixed-order sum of its per-chunk partials
+  (``P <= 32`` token chunks; the chunk sizes are the host rule's per token
+  count and device, so the low-order bits can also differ from the
+  deterministic ``dfn``), and the FP32 reduction flushes subnormal addends and
+  results to zero.  ``dX`` is bitwise the deterministic value, and so are the
   forward, the statistics replay and ``backward_prepare`` (copies of the
-  deterministic programs).
+  deterministic programs).  ``dscale`` and ``dbase`` are bitwise the
+  deterministic package's per-CTA reduction, which is its result except at
+  hidden 4096 above 14927 tokens on sm_100a and sm_103a: there it sums them
+  over 8-token group rows, so their low-order bits can differ.
 * With ``torch.use_deterministic_algorithms(True)``, ``deterministic=False``
   runs the deterministic package and warns once per process
   (``UserWarning``).  The non-deterministic package itself never falls back:
@@ -50,9 +56,10 @@ and :func:`route_key` (the same in both packages):
 
 Workspaces: the forward workspace has one layout in both packages.  The
 non-deterministic backward workspace is the deterministic one at the same
-offsets without the per-chunk FP32 ``dfn`` partials (``P x 24 x 16384 x 4``
-bytes), so a ``deterministic=True`` backward workspace serves both modes and a
-``deterministic=False`` one serves the non-deterministic backward only.  When
+offsets without the per-chunk FP32 ``dfn`` partials (``P x 24 x 4H x 4``
+bytes at hidden size ``H``), so a ``deterministic=True`` backward workspace
+serves both modes at its hidden size and a ``deterministic=False`` one serves
+the non-deterministic backward only.  When
 torch's deterministic algorithms turn a ``deterministic=False`` call with a
 caller-owned backward workspace too small for the deterministic layout into
 the deterministic backward, that call runs on a private zero-initialised
@@ -64,14 +71,14 @@ capture).  The outputs of either package feed the other's entry points (the
 records are the same bits).
 
 Default workspaces (``workspace=None``): each package keeps one buffer per
-device and power-of-two token-count bucket, shared by every stream and every
-graph replay on that device; calls that can run concurrently on different
-streams pass caller-owned workspaces.  The non-deterministic package creates no
-default buffer while the current stream of the buffer's device is capturing a
-CUDA graph (``ValueError``): warm up with the same ``deterministic`` value and
-token count before the capture.  A companion is allocated zeroed outside any
-capture and every completed launch leaves its
-ticket words at zero, so it needs no reset;
+device, hidden size and power-of-two token-count bucket, shared by every stream
+and every graph replay on that device; calls that can run concurrently on
+different streams pass caller-owned workspaces.  The non-deterministic package
+creates no default buffer while the current stream of the buffer's device is
+capturing a CUDA graph (``ValueError``): warm up with the same
+``deterministic`` value, token count and hidden size before the capture.  A
+companion is allocated zeroed outside any capture and every completed launch
+leaves its ticket words at zero, so it needs no reset;
 :func:`cake_mhc_train_reset_workspace` zeroes the buffer it is given.
 
 Name map (the deterministic names are unchanged and always deterministic)::
@@ -113,7 +120,8 @@ Usage::
     U, handle = cake_mhc_train_prepare(X, fn, scale, base, deterministic=False)
     Y = cake_mhc_train_finish(X, branch(U), handle)          # backward: atomic dfn
 
-    ws_b = cake_mhc_train_backward_workspace(T, X.device, deterministic=False)
+    ws_b = cake_mhc_train_backward_workspace(
+        T, X.device, hidden=X.shape[2], deterministic=False)
     dX, dfn, dscale, dbase = cake_mhc_train_backward_finish(
         X, dY, dU, B, fn, scale, base, stats, grad_stats,
         workspace=ws_b, deterministic=False)
@@ -197,16 +205,18 @@ def _fallback_backward_workspace(workspace: Any, X: Any, entry: str) -> Any:
 
     ``None`` stays ``None`` (the deterministic package's default buffer, as
     for any deterministic call).  A workspace that holds the deterministic
-    layout for ``X``'s token count passes unchanged, and so does anything that
-    is not a valid ``deterministic=False`` workspace for that token count (a
-    non-tensor, another device, dtype, rank or alignment, too few bytes, or an
-    ``X`` the deterministic checks refuse): the deterministic package's checks
-    refuse it in their own order, so an invalid workspace is never replaced.  A
-    valid ``deterministic=False`` workspace too small for the deterministic
-    layout runs on the companion of that workspace (see :data:`_COMPANIONS`): a
-    zero-initialised buffer of the deterministic size of the token-count bucket,
-    allocated on first need and reused by every later fallback on it.  Inside a
-    CUDA graph capture a missing companion is a ``ValueError``.
+    layout for ``X``'s token count and hidden size ``X.shape[2]`` passes
+    unchanged, and so does anything that is not a valid ``deterministic=False``
+    workspace for them (a non-tensor, another device, dtype, rank or alignment,
+    too few bytes, or an ``X`` the deterministic checks refuse, such as a hidden
+    size the device's architecture does not route): the deterministic package's
+    checks refuse it in their own order, so an invalid workspace is never
+    replaced.  A valid ``deterministic=False`` workspace too small for the
+    deterministic layout runs on the companion of that workspace (see
+    :data:`_COMPANIONS`): a zero-initialised buffer of the deterministic size of
+    the token-count bucket at that hidden size, allocated on first need and
+    reused by every later fallback it is large enough for.  Inside a CUDA graph
+    capture a missing companion is a ``ValueError``.
     """
 
     if type(workspace) is not torch.Tensor:
@@ -216,7 +226,7 @@ def _fallback_backward_workspace(workspace: Any, X: Any, entry: str) -> Any:
         and X.is_cuda
         and X.dtype == torch.bfloat16
         and X.ndim == 3
-        and tuple(X.shape[1:]) == (_det_jit.STREAMS, _det_jit.HIDDEN)
+        and X.shape[1] == _det_jit.STREAMS
         and X.shape[0] > 0
     ):
         return workspace
@@ -230,14 +240,15 @@ def _fallback_backward_workspace(workspace: Any, X: Any, entry: str) -> Any:
         return workspace
     index = X.get_device()
     arch = _det_jit.arch_for_capability(torch.cuda.get_device_capability(index))
-    if arch is None:
+    hidden = int(X.shape[2])
+    if arch is None or hidden not in _det_jit.supported_hidden_sizes(arch):
         return workspace
     rows = int(X.shape[0])
     sm_count = _det_jit.sm_count(index)
-    det_need = _det_jit.workspace_bytes("bwd", rows, sm_count, arch)
+    det_need = _det_jit.workspace_bytes("bwd", rows, sm_count, arch, hidden)
     if workspace.numel() >= det_need:
         return workspace
-    if workspace.numel() < _nd_jit.workspace_bytes("bwd", rows, sm_count, arch):
+    if workspace.numel() < _nd_jit.workspace_bytes("bwd", rows, sm_count, arch, hidden):
         return workspace
     key = id(workspace)
     found = _COMPANIONS.get(key)
@@ -251,14 +262,16 @@ def _fallback_backward_workspace(workspace: Any, X: Any, entry: str) -> Any:
         raise ValueError(
             f"{entry}(deterministic=False) runs the deterministic backward because torch's deterministic "
             "algorithms are enabled, and the caller-owned backward workspace is too small for its layout "
-            f"({workspace.numel()} bytes; T={rows} needs {det_need}); no companion buffer can be allocated "
-            "during a CUDA graph capture: pass a workspace of "
-            "cake_mhc_train_backward_workspace_bytes(T, device, deterministic=True) bytes (it serves both "
-            "modes), or run the call once before the capture"
+            f"({workspace.numel()} bytes; T={rows} at hidden={hidden} needs {det_need}); no companion buffer "
+            "can be allocated during a CUDA graph capture: pass a workspace of "
+            f"cake_mhc_train_backward_workspace_bytes(T, device, hidden={hidden}, deterministic=True) bytes "
+            "(it serves both modes), or run the call once before the capture"
         )
     bucket = 1 << (rows - 1).bit_length()
     companion = torch.zeros(
-        _det.cake_mhc_det_train_backward_workspace_bytes(bucket, workspace.device),
+        _det.cake_mhc_det_train_backward_workspace_bytes(
+            bucket, workspace.device, hidden=hidden
+        ),
         dtype=torch.uint8,
         device=workspace.device,
     )
@@ -288,59 +301,88 @@ def is_cake_mhc_train_supported(
 
 @flashinfer_experimental_api(feature=_FEATURE)
 def cake_mhc_train_forward_workspace_bytes(
-    T: int, device: torch.device, *, deterministic: bool = True
+    T: int,
+    device: torch.device,
+    *,
+    hidden: int = _det_jit.HIDDEN,
+    deterministic: bool = True,
 ) -> int:
     """Bytes of the caller-owned forward workspace for up to ``T`` tokens on ``device``.
 
     The forward workspace has one layout for ``deterministic=True`` and ``deterministic=False`` (see
-    :func:`~flashinfer.cake_mhc_det_train.cake_mhc_det_train_forward_workspace_bytes`).
+    :func:`~flashinfer.cake_mhc_det_train.cake_mhc_det_train_forward_workspace_bytes`).  ``hidden`` is the
+    hidden size of the calls the buffer serves, in both modes: 4096, 5120 or 7168 on SM100 / SM103, 4096 on
+    SM107 (any other value raises ``ValueError``).
     """
 
     if _deterministic(deterministic, "cake_mhc_train_forward_workspace_bytes"):
-        return _det.cake_mhc_det_train_forward_workspace_bytes(T, device)
-    return _nd.cake_mhc_train_forward_workspace_bytes(T, device, deterministic=False)
+        return _det.cake_mhc_det_train_forward_workspace_bytes(T, device, hidden=hidden)
+    return _nd.cake_mhc_train_forward_workspace_bytes(
+        T, device, hidden=hidden, deterministic=False
+    )
 
 
 @flashinfer_experimental_api(feature=_FEATURE)
 def cake_mhc_train_backward_workspace_bytes(
-    T: int, device: torch.device, *, deterministic: bool = True
+    T: int,
+    device: torch.device,
+    *,
+    hidden: int = _det_jit.HIDDEN,
+    deterministic: bool = True,
 ) -> int:
     """Bytes of the caller-owned backward workspace for up to ``T`` tokens on ``device``.
 
     ``deterministic=True``: the deterministic package's workspace, which serves
     both backwards.  ``deterministic=False``: the non-deterministic backward's,
     the same regions at the same offsets without the per-chunk FP32 ``dfn``
-    partials (``P x 24 x 16384 x 4`` bytes, ``P <= 32``).  The size is the
-    maximum over every token count up to ``T``; ``T == 0`` needs no workspace.
+    partials (``P x 24 x 4H x 4`` bytes at hidden size ``H``, ``P <= 32``).  The
+    size is the maximum over every token count up to ``T``; ``T == 0`` needs no
+    workspace.  ``hidden`` as in :func:`cake_mhc_train_forward_workspace_bytes`.
     """
 
     if _deterministic(deterministic, "cake_mhc_train_backward_workspace_bytes"):
-        return _det.cake_mhc_det_train_backward_workspace_bytes(T, device)
-    return _nd.cake_mhc_train_backward_workspace_bytes(T, device, deterministic=False)
+        return _det.cake_mhc_det_train_backward_workspace_bytes(
+            T, device, hidden=hidden
+        )
+    return _nd.cake_mhc_train_backward_workspace_bytes(
+        T, device, hidden=hidden, deterministic=False
+    )
 
 
 @flashinfer_experimental_api(feature=_FEATURE)
 def cake_mhc_train_forward_workspace(
-    T: int, device: torch.device, *, deterministic: bool = True
+    T: int,
+    device: torch.device,
+    *,
+    hidden: int = _det_jit.HIDDEN,
+    deterministic: bool = True,
 ) -> torch.Tensor:
     """Allocate a zero-initialized forward workspace for ``deterministic=True`` or ``deterministic=False`` (one layout;
     see :func:`cake_mhc_train_forward_workspace_bytes`)."""
 
     if _deterministic(deterministic, "cake_mhc_train_forward_workspace"):
-        return _det.cake_mhc_det_train_forward_workspace(T, device)
-    return _nd.cake_mhc_train_forward_workspace(T, device, deterministic=False)
+        return _det.cake_mhc_det_train_forward_workspace(T, device, hidden=hidden)
+    return _nd.cake_mhc_train_forward_workspace(
+        T, device, hidden=hidden, deterministic=False
+    )
 
 
 @flashinfer_experimental_api(feature=_FEATURE)
 def cake_mhc_train_backward_workspace(
-    T: int, device: torch.device, *, deterministic: bool = True
+    T: int,
+    device: torch.device,
+    *,
+    hidden: int = _det_jit.HIDDEN,
+    deterministic: bool = True,
 ) -> torch.Tensor:
     """Allocate a zero-initialized backward workspace of the ``deterministic`` mode's layout (see
     :func:`cake_mhc_train_backward_workspace_bytes`)."""
 
     if _deterministic(deterministic, "cake_mhc_train_backward_workspace"):
-        return _det.cake_mhc_det_train_backward_workspace(T, device)
-    return _nd.cake_mhc_train_backward_workspace(T, device, deterministic=False)
+        return _det.cake_mhc_det_train_backward_workspace(T, device, hidden=hidden)
+    return _nd.cake_mhc_train_backward_workspace(
+        T, device, hidden=hidden, deterministic=False
+    )
 
 
 @flashinfer_experimental_api(feature=_FEATURE)
@@ -529,9 +571,14 @@ def cake_mhc_train_backward_finish(
         :func:`~flashinfer.cake_mhc_det_train.cake_mhc_det_train_backward_finish`.
         ``False``: the non-deterministic backward (``dfn`` summed with FP32
         reductions in a run-to-run varying order, each element within
-        ``P <= 32`` FP32 roundings of the fixed-order sum; ``dX``, ``dscale``,
-        ``dbase`` bitwise the deterministic values; ``accumulate=True`` adds onto
-        the caller's values the same way).  Under
+        ``P <= 32`` FP32 roundings of the fixed-order sum of its per-chunk
+        partials; the chunk sizes are the host rule's per token count and
+        device, so the low-order bits can also differ from the deterministic
+        ``dfn``; ``dX`` bitwise the deterministic value; ``dscale``, ``dbase``
+        bitwise the deterministic per-CTA reduction, whose low-order bits can
+        differ from the deterministic result at hidden 4096 above 14927 tokens
+        on sm_100a and sm_103a (group rows there); ``accumulate=True`` adds
+        onto the caller's values the same way).  Under
         ``torch.use_deterministic_algorithms(True)`` a ``False`` call runs the
         deterministic backward (one warning per process); a caller workspace
         too small for its layout is then replaced by a private companion buffer

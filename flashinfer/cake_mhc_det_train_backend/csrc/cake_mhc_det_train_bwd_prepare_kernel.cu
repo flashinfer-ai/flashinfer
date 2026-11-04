@@ -47,15 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
-#define SMEM_PARTIALS_OFF 0
-#define SMEM_PARTIALS_STAGE_BYTES 1280
-#define SMEM_PARTIALS_STRIDE 1280
-#define SMEM_TOTAL 1280
-#define THREADS 256
-#define LAUNCH_BOUNDS_THREADS 256
-#define LAUNCH_BOUNDS_MIN_BLOCKS 2
 #define LAUNCH_MIN_BLOCKS 2
 
 #include <math_constants.h>
@@ -90,7 +81,7 @@ __device__ __forceinline__ float2 cake_bf16x2_to_f32x2(__nv_bfloat162 v) {
 
 extern "C" {
 
-__global__ __launch_bounds__(LAUNCH_BOUNDS_THREADS, LAUNCH_BOUNDS_MIN_BLOCKS) void
+__global__ __launch_bounds__(256, LAUNCH_MIN_BLOCKS) void
 kernel_cake_mhc_det_train_bwd_prepare(__nv_bfloat16* __restrict__ dy, __nv_bfloat16* __restrict__ b, __nv_bfloat16* __restrict__ x, float* __restrict__ stats, __nv_bfloat16* __restrict__ db, float* __restrict__ gstats, int T)
 {
     const int tid = threadIdx.x;
@@ -111,7 +102,7 @@ kernel_cake_mhc_det_train_bwd_prepare(__nv_bfloat16* __restrict__ dy, __nv_bfloa
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     float* partials = reinterpret_cast<float*>(smem_raw + 0);
     const int partials_addr = smem + 0;
 

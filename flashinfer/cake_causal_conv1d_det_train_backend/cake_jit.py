@@ -123,10 +123,14 @@ hashes it so the split programs replaced the cooperative ones under new names);
 the default route's fallback is built with ``vec=8, copy="tma2d",
 stage_pair=True`` (eight channels, 16-byte vectors, per thread; 2-D TMA row
 copies; each eight-token copy stage consumed as two four-token halves, the
-dweight fold buffer in the stage ring) on sm_100a and sm_103a and with
+dweight fold buffer in the stage ring) on sm_100a and sm_103a, where for
+264 <= C < 512 its build with ``straddle_rows=True`` runs instead (the
+channel counts of one channel tile whose vectors are no multiple of 32: one
+bulk copy per sub-tile and stage of each sub-tile's contiguous rows instead
+of a copy loop per warp; ``dx`` and ``dweight`` bitwise the fallback's), and with
 ``min_blocks=2`` (two CTAs per SM) beside those on sm_107a, where for
 256 <= C < 512 from S = 262144 tokens the build of ``vec=8, min_blocks=2``
-(four-token copy stages, no ``stage_pair``) runs instead, and the backwards
+(four-token copy stages, no ``stage_pair``) runs instead, and the other backwards
 the ``channels_at_least`` rules select, builds of ``vec=8, copy="tma2d",
 stage_tokens=8, min_blocks=2`` (eight-token stages, two CTAs per SM): as is
 on sm_100a from C = 512 and on sm_103a from 768, with ``fold_overlap=True,
@@ -2157,6 +2161,173 @@ MODULES: dict[str, dict[str, Any]] = {
             "taps": 5,
         },
     },
+    # Rendered by the exporter from the family adapter's scaffold: the backward
+    # with vec 8, copy tma2d, stage_pair, straddle_rows
+    # (3 CTAs per SM); it runs when C >= select_rule.channels[arch] and no
+    # routed record of a higher threshold admits C; below every threshold the
+    # fallback record (no select_rule) runs.
+    "cake_causal_conv1d_det_train_8f872e5b653a26ab365d": {
+        "arches": [
+            "sm_100a",
+            "sm_103a",
+        ],
+        "arg_plan": [
+            ["buffer", "x"],
+            ["buffer", "w"],
+            ["buffer", "cu"],
+            ["buffer", "dy"],
+            ["buffer", "dx"],
+            ["buffer", "partial"],
+            ["parameter", "S"],
+            ["parameter", "C"],
+            ["parameter", "num_docs"],
+            ["parameter", "search_steps"],
+            ["parameter", "ct_vec"],
+            ["parameter", "n_sub"],
+            ["parameter", "n_ch_tiles"],
+            ["buffer", "x_map"],
+            ["buffer", "dy_map"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "cooperative": False,
+            "ctas_per_sm": 3,
+            "geometry": {
+                "threads": 128,
+                "vec": 8,
+            },
+            "grid_mult": {
+                "sm_100a": 1,
+                "sm_103a": 1,
+            },
+            "kind": "occupancy",
+        },
+        "kernel": "cake_causal_conv1d_det_train_8f872e5b653a26ab365d",
+        "kernel_symbol": "kernel_cake_causal_conv1d_det_train_8f872e5b653a26ab365d",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 66560,
+            "use_pdl": False,
+        },
+        "library": "cake_causal_conv1d_det_train_8f872e5b653a26ab365d",
+        "logical": {
+            "C": "C",
+            "S": "S",
+            "ct_vec": "ct_vec",
+            "cu": "cu",
+            "dx": "dx",
+            "dy": "dy",
+            "dy_map": "dy",
+            "n_ch_tiles": "n_ch_tiles",
+            "n_sub": "n_sub",
+            "num_docs": "num_docs",
+            "partial": "partial",
+            "search_steps": "search_steps",
+            "w": "w",
+            "x": "x",
+            "x_map": "x",
+        },
+        "reduce": "cake_causal_conv1d_det_train_86b5ecfbd90aca4b52e5",
+        "role": "bwd",
+        "select_rule": {
+            "channels": {
+                "sm_100a": 264,
+                "sm_103a": 264,
+            },
+            "kind": "channels_at_least",
+        },
+        "workspace_rule": {
+            "kind": "partial_rows",
+            "taps": 4,
+        },
+    },
+    # Rendered by the exporter from the family adapter's scaffold: the backward
+    # with vec 8, min_blocks 2, copy tma2d, stage_pair, straddle_rows
+    # (2 CTAs per SM); it runs when C >= select_rule.channels[arch] and no
+    # routed record of a higher threshold admits C; below every threshold the
+    # fallback record (no select_rule) runs.
+    "cake_causal_conv1d_det_train_50aa818e2b2338fb34a4": {
+        "arches": [
+            "sm_107a",
+        ],
+        "arg_plan": [
+            ["buffer", "x"],
+            ["buffer", "w"],
+            ["buffer", "cu"],
+            ["buffer", "dy"],
+            ["buffer", "dx"],
+            ["buffer", "partial"],
+            ["parameter", "S"],
+            ["parameter", "C"],
+            ["parameter", "num_docs"],
+            ["parameter", "search_steps"],
+            ["parameter", "ct_vec"],
+            ["parameter", "n_sub"],
+            ["parameter", "n_ch_tiles"],
+            ["buffer", "x_map"],
+            ["buffer", "dy_map"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {
+            "cooperative": False,
+            "ctas_per_sm": 2,
+            "geometry": {
+                "threads": 128,
+                "vec": 8,
+            },
+            "grid_mult": {
+                "sm_107a": 1,
+            },
+            "kind": "occupancy",
+        },
+        "kernel": "cake_causal_conv1d_det_train_50aa818e2b2338fb34a4",
+        "kernel_symbol": "kernel_cake_causal_conv1d_det_train_50aa818e2b2338fb34a4",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 66560,
+            "use_pdl": False,
+        },
+        "library": "cake_causal_conv1d_det_train_50aa818e2b2338fb34a4",
+        "logical": {
+            "C": "C",
+            "S": "S",
+            "ct_vec": "ct_vec",
+            "cu": "cu",
+            "dx": "dx",
+            "dy": "dy",
+            "dy_map": "dy",
+            "n_ch_tiles": "n_ch_tiles",
+            "n_sub": "n_sub",
+            "num_docs": "num_docs",
+            "partial": "partial",
+            "search_steps": "search_steps",
+            "w": "w",
+            "x": "x",
+            "x_map": "x",
+        },
+        "reduce": "cake_causal_conv1d_det_train_86b5ecfbd90aca4b52e5",
+        "role": "bwd",
+        "select_rule": {
+            "channels": {
+                "sm_107a": 264,
+            },
+            "kind": "channels_at_least",
+        },
+        "workspace_rule": {
+            "kind": "partial_rows",
+            "taps": 4,
+        },
+    },
     # The reduce program every backward route shares: the second launch of a
     # backward call.  Launched programmatically dependent on the main program
     # (``use_pdl``: the binding sets the programmatic-stream-serialization
@@ -2436,6 +2607,7 @@ ROUTES: dict[str, dict[str, list[str]]] = {
         "bwd": [
             "cake_causal_conv1d_det_train_9bfa65707a49df6a48ce",
             "cake_causal_conv1d_det_train_37e428406a0cc4a8ca1b",
+            "cake_causal_conv1d_det_train_8f872e5b653a26ab365d",
         ],
         "bwd_bias": [
             "cake_causal_conv1d_det_train_2d91e5f926238453c78c",
@@ -2468,6 +2640,7 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_causal_conv1d_det_train_9bfa65707a49df6a48ce",
             "cake_causal_conv1d_det_train_37e428406a0cc4a8ca1b",
             "cake_causal_conv1d_det_train_d46036aa2bc5f90bb0f6",
+            "cake_causal_conv1d_det_train_8f872e5b653a26ab365d",
         ],
         "bwd_bias": [
             "cake_causal_conv1d_det_train_2d91e5f926238453c78c",
@@ -2502,6 +2675,7 @@ ROUTES: dict[str, dict[str, list[str]]] = {
             "cake_causal_conv1d_det_train_d46036aa2bc5f90bb0f6",
             "cake_causal_conv1d_det_train_aeff6106e2822f313a0c",
             "cake_causal_conv1d_det_train_9a07bcaa0223632640ee",
+            "cake_causal_conv1d_det_train_50aa818e2b2338fb34a4",
         ],
         "bwd_bias": [
             "cake_causal_conv1d_det_train_cc7a117aee9c7ae829c4",
@@ -2928,6 +3102,20 @@ def _ceil_div(numerator: int, denominator: int) -> int:
 # The roles whose programs plan their channel tiles with :func:`channel_split`
 # (a reduce program runs on its backward record's plan): each has its own rule.
 SPLIT_ROLES = ("fwd", "bwd")
+# The routes whose single-tile rows run 32-vector tiles (``ct_vec`` 32, four
+# token sub-tiles, the last tile partial) instead of one tile of ``cv = C /
+# vec`` vectors, per role, at 128 threads (:func:`_narrow_tile`): the backward
+# at 64 < cv <= 96 (C = 520 to 768, three tiles) and cv = 28 (C = 224), the
+# forward at 72 <= cv <= 96 (C = 576 to 768).  One tile of cv vectors leaves
+# 128 - cv lanes of every CTA idle over the whole token axis; the programs are
+# unchanged.  The backward's four-tile rows (96 < cv < 128) keep one tile
+# (their ``dweight`` error against FP64 is lowest there), and so do the
+# ``_fp32g`` and ``_dt`` backward routes.
+NARROW_TILE_ROUTES: dict[str, tuple[str, ...]] = {
+    "fwd": ("fwd", "fwd_bias"),
+    "bwd": ("bwd", "bwd_bias"),
+}
+NARROW_TILE_THREADS = 128
 
 
 def channel_split(
@@ -2936,8 +3124,9 @@ def channel_split(
     geometry: dict[str, int],
     role: str | None = None,
     legacy: bool = False,
+    route: str | None = None,
 ) -> tuple[int, int, int]:
-    """``(ct_vec, n_sub, n_ch_tiles)`` of ``C`` channels under a record's build geometry and role.
+    """``(ct_vec, n_sub, n_ch_tiles)`` of ``C`` channels under a record's build geometry, role and route.
 
     ``ct_vec`` channel vectors per channel tile (one thread each), ``n_sub =
     threads // ct_vec`` token sub-tiles per CTA and ``n_ch_tiles = ceil(C / vec
@@ -2967,16 +3156,35 @@ def channel_split(
     from ``ct_vec`` on the device and are measured under this rule).  Each
     role's rule is kept in sync with its copies (the kernel generator of
     that role and the test plan of that kind).
+
+    ``route`` is the launch's route (one of :data:`KINDS` of the role; the
+    host passes its record's).  On a route of :data:`NARROW_TILE_ROUTES` the
+    single-tile rows of the role's narrow set run 32-vector tiles, ``(32,
+    threads // 32, ceil(cv / 32))``: the backward's C = 224 and 520 to 768,
+    the forward's C = 576 to 768, so C = 640 runs (32, 4, 3) instead of (80,
+    1, 1).  ``y`` and ``dx`` keep their bits; ``dweight`` and ``dbias`` sum in
+    the narrow plan's fixed order (bitwise reproducible).  Without a route,
+    and on every other route, the single tile stays.
     """
 
     return _channel_split(
-        int(C), int(geometry["vec"]), int(geometry["threads"]), role, bool(legacy)
+        int(C),
+        int(geometry["vec"]),
+        int(geometry["threads"]),
+        role,
+        bool(legacy),
+        route,
     )
 
 
 @functools.lru_cache(maxsize=4096)
 def _channel_split(
-    C: int, vec: int, threads: int, role: str | None, legacy: bool
+    C: int,
+    vec: int,
+    threads: int,
+    role: str | None,
+    legacy: bool,
+    route: str | None = None,
 ) -> tuple[int, int, int]:
     """:func:`channel_split` of plain arguments, memoized: a model's channel
     counts are few, so every call after a channel count's first reuses its
@@ -2986,11 +3194,21 @@ def _channel_split(
         raise ValueError(
             f"role must be one of {SPLIT_ROLES} (or legacy=True), got {role!r}"
         )
+    if route is not None and (
+        route not in KINDS or role is None or route_role(route) != role
+    ):
+        raise ValueError(f"route={route!r} is not a route of role {role!r}")
     if C <= 0 or C % vec:
         raise ValueError(f"C={C} must be a positive multiple of {vec}")
     channel_vectors = C // vec
     if legacy or channel_vectors <= threads:
         ct_vec = min(channel_vectors, threads)
+        if (
+            not legacy
+            and route in NARROW_TILE_ROUTES[role]
+            and _narrow_tile(channel_vectors, threads, role)
+        ):
+            ct_vec = 32
     else:
         candidates = [
             width
@@ -3030,6 +3248,16 @@ def _fallback_split(channel_vectors: int, threads: int, role: str) -> int:
     )
 
 
+def _narrow_tile(channel_vectors: int, threads: int, role: str) -> bool:
+    """Whether a single-tile row of ``role`` runs 32-vector tiles on its narrow routes."""
+
+    if threads != NARROW_TILE_THREADS:
+        return False
+    if role == "bwd":
+        return 64 < channel_vectors <= 96 or channel_vectors == 28
+    return 72 <= channel_vectors <= 96
+
+
 def _lane_use(channel_vectors: int, width: int, threads: int) -> float:
     """The busy share of a CTA's lanes over ``ceil(channel_vectors / width)`` tiles of ``width``."""
 
@@ -3048,18 +3276,20 @@ def plan(
     geometry: dict[str, int],
     role: str | None = None,
     legacy: bool = False,
+    route: str | None = None,
 ) -> dict[str, int]:
-    """The kernel's launch scalars for one problem under a record's build geometry and role.
+    """The kernel's launch scalars for one problem under a record's build geometry, role and route.
 
     ``geometry`` is ``record["grid_rule"]["geometry"]``: ``threads`` per CTA
     and ``vec`` BF16 channels per thread; ``role`` is ``record["role"]``
     (``"fwd"`` or ``"bwd"``).  The scalars are ``S``, ``C``, ``num_docs``,
-    :func:`channel_split`'s ``ct_vec`` / ``n_sub`` / ``n_ch_tiles`` (``role``
-    and ``legacy`` are passed on) and ``search_steps``, the number of halvings
-    of the device-side binary search over ``cu_seqlens`` (``max(1, ceil(log2
-    num_docs))``).  Every value is a pure function of ``(S, C, num_docs)``, the
-    geometry and the role: the host never reads ``cu_seqlens``, and the kernel
-    derives its token ranges from ``S`` and the grid.  The ``flags`` scalar of
+    :func:`channel_split`'s ``ct_vec`` / ``n_sub`` / ``n_ch_tiles`` (``role``,
+    ``legacy`` and ``route`` are passed on) and ``search_steps``, the number
+    of halvings of the device-side binary search over ``cu_seqlens``
+    (``max(1, ceil(log2 num_docs))``).  Every value is a pure function of
+    ``(S, C, num_docs)``, the geometry, the role and the route: the host
+    never reads ``cu_seqlens``, and the kernel derives its token ranges from
+    ``S`` and the grid.  The ``flags`` scalar of
     the ``dtype_flags`` programs is not a plan value: the host derives it from
     the tensors of the call.
     """
@@ -3068,7 +3298,7 @@ def plan(
     if S < 0 or num_docs < 0:
         raise ValueError(f"S and num_docs must be non-negative, got {(S, num_docs)}")
     ct_vec, n_sub, n_ch_tiles = channel_split(
-        C, geometry=geometry, role=role, legacy=legacy
+        C, geometry=geometry, role=role, legacy=legacy, route=route
     )
     return {
         "S": S,
@@ -3236,6 +3466,19 @@ def row_may_trim(
     )
 
 
+def _plan_route(record: dict[str, Any], arch: str) -> str | None:
+    """The route :func:`channel_split` plans ``record`` on.
+
+    Its :func:`record_route`, or ``None`` for a record no route of
+    ``ROUTES[arch]`` lists (a KCP program keeps the route-free rule).
+    """
+
+    try:
+        return record_route(record, arch)
+    except ValueError:
+        return None
+
+
 def record_route(record: dict[str, Any], arch: str) -> str:
     """The route of ``ROUTES[arch]`` that lists ``record`` (``ValueError`` if none)."""
 
@@ -3295,8 +3538,9 @@ def launch_grid(
             co_resident = int(rule["ctas_per_sm"]) * sm_count(device_index)
             factor = grid_mult(record, arch)
             if row_may_trim(record, arch, co_resident, factor, int(C), int(S)):
+                route = record_route(record, arch)
                 ct_vec, _, n_ch_tiles = channel_split(
-                    C, geometry=rule["geometry"], role=record["role"]
+                    C, geometry=rule["geometry"], role=record["role"], route=route
                 )
                 grid_x = main_grid(
                     co_resident,
@@ -3306,7 +3550,7 @@ def launch_grid(
                     n_ch_tiles=n_ch_tiles,
                     S=int(S),
                     ct_vec=ct_vec,
-                    route=record_route(record, arch),
+                    route=route,
                 )
     elif kind == "channels_per_cta":
         if C is None:
@@ -3357,13 +3601,17 @@ def workspace_layout(
     n_ch_tiles)`` for the device's launch grid (``grid_mult x ctas_per_sm x SM
     count``: the bytes grow with the record's ``grid_mult``); it depends on
     ``C`` and the device only, so one buffer serves every token count.  The
+    rows follow the plan of the record's route (:func:`channel_split`).  The
     kernel fully writes the rows its reduce program sums, so nothing is zeroed
     between launches or CUDA Graph replays.
     """
 
     grid_x = launch_grid(record, device_index=device_index)[0]
     _, _, n_ch_tiles = channel_split(
-        C, geometry=record["grid_rule"]["geometry"], role=record["role"]
+        C,
+        geometry=record["grid_rule"]["geometry"],
+        role=record["role"],
+        route=_plan_route(record, device_arch(device_index)),
     )
     rows = partial_rows(grid_x, n_ch_tiles)
     return {
@@ -3421,7 +3669,10 @@ def forward_workspace_words(arch: str, C: int) -> int:
             if record["workspace_rule"] is None:
                 continue
             _, _, n_ch_tiles = channel_split(
-                C, geometry=record["grid_rule"]["geometry"], role=record["role"]
+                C,
+                geometry=record["grid_rule"]["geometry"],
+                role=record["role"],
+                route=kind,
             )
             words = max(words, counter_words(record, n_ch_tiles))
     return words

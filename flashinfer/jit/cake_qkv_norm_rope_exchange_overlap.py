@@ -27,7 +27,9 @@ every architecture, ``producer_bn<bn>[_pair][_<variant>]`` for the producer of
 a tile width (``_pair``: the 2-CTA pair tile; ``<variant>``: a producer build
 other than the baseline -- ``ow256`` wide operand loads, ``bulk_ow256`` wide
 operand loads with bulk row stores, ``bulk`` bulk row stores alone -- the
-baseline build has no suffix), and -- where the architecture's default launch
+baseline build has no suffix; a trailing ``xb`` names the cross-destination-band
+build of the bn256 pair tile, whose two heads store to their own destinations),
+and -- where the architecture's default launch
 path folds the cross-rank rendezvous into the producer
 (``FOLD_BARRIER_DEFAULT_BY_ARCH``) --
 ``producer_bn<bn>[_pair][_<variant>]_fold<phase>`` for the producer builds that
@@ -488,6 +490,45 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "block": [384, 1, 1],
         "cluster": [1, 1, 1],
+    },
+    "cake_qkv_norm_rope_exchange_overlap_3b76fd35f4dd5c6d8bc8": {
+        "sources": [
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_3b76fd35f4dd5c6d8bc8_kernel.cu",
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_3b76fd35f4dd5c6d8bc8_binding.cu",
+        ],
+        "arches": ["sm_103a"],
+        "compile_flags": ["--fmad=false"],
+        "args": [
+            "A",
+            "B",
+            "cos_sin",
+            "q_scale",
+            "k_scale",
+            "tiles",
+            "dst_ptrs",
+            "ready_ptrs",
+            "counters",
+            "num_tiles",
+            "M",
+            "K",
+            "S_local",
+            "head_stride",
+            "batch_stride",
+            "slot_elem_offset",
+            "pad_base",
+            "num_words",
+            "rank",
+            "world",
+            "ready_target",
+            "pg_world",
+            "pg_rank",
+            "pg_flags",
+            "grid_x",
+            "grid_y",
+            "grid_z",
+        ],
+        "block": [224, 1, 1],
+        "cluster": [2, 1, 1],
     },
     "cake_qkv_norm_rope_exchange_overlap_4054da4210fed46e7645": {
         "sources": [
@@ -1309,6 +1350,45 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         "block": [192, 1, 1],
         "cluster": [2, 1, 1],
     },
+    "cake_qkv_norm_rope_exchange_overlap_c5b0f509e67b3d8b1a16": {
+        "sources": [
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_c5b0f509e67b3d8b1a16_kernel.cu",
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_c5b0f509e67b3d8b1a16_binding.cu",
+        ],
+        "arches": ["sm_103a"],
+        "compile_flags": ["--fmad=false"],
+        "args": [
+            "A",
+            "B",
+            "cos_sin",
+            "q_scale",
+            "k_scale",
+            "tiles",
+            "dst_ptrs",
+            "ready_ptrs",
+            "counters",
+            "num_tiles",
+            "M",
+            "K",
+            "S_local",
+            "head_stride",
+            "batch_stride",
+            "slot_elem_offset",
+            "pad_base",
+            "num_words",
+            "rank",
+            "world",
+            "ready_target",
+            "pg_world",
+            "pg_rank",
+            "pg_flags",
+            "grid_x",
+            "grid_y",
+            "grid_z",
+        ],
+        "block": [224, 1, 1],
+        "cluster": [2, 1, 1],
+    },
     "cake_qkv_norm_rope_exchange_overlap_c7cccaf9e086af62f948": {
         "sources": [
             "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_c7cccaf9e086af62f948_kernel.cu",
@@ -1422,6 +1502,42 @@ PROGRAMS: dict[str, dict[str, Any]] = {
         ],
         "block": [192, 1, 1],
         "cluster": [1, 1, 1],
+    },
+    "cake_qkv_norm_rope_exchange_overlap_e6b1334e7928f84b478e": {
+        "sources": [
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_e6b1334e7928f84b478e_kernel.cu",
+            "csrc/cake_qkv_norm_rope_exchange_overlap/cake_qkv_norm_rope_exchange_overlap_e6b1334e7928f84b478e_binding.cu",
+        ],
+        "arches": ["sm_103a"],
+        "compile_flags": ["--fmad=false"],
+        "args": [
+            "A",
+            "B",
+            "cos_sin",
+            "q_scale",
+            "k_scale",
+            "tiles",
+            "dst_ptrs",
+            "ready_ptrs",
+            "counters",
+            "num_tiles",
+            "M",
+            "K",
+            "S_local",
+            "head_stride",
+            "batch_stride",
+            "slot_elem_offset",
+            "pad_base",
+            "num_words",
+            "rank",
+            "world",
+            "ready_target",
+            "grid_x",
+            "grid_y",
+            "grid_z",
+        ],
+        "block": [192, 1, 1],
+        "cluster": [2, 1, 1],
     },
     "cake_qkv_norm_rope_exchange_overlap_e75374f0daa1274b01f2": {
         "sources": [
@@ -1733,6 +1849,9 @@ ROUTES: dict[str, dict[str, str]] = {
         "producer_bn256_pair_ow256": "cake_qkv_norm_rope_exchange_overlap_c320e77573b04a75ecd2",
         "producer_bn256_pair_ow256_fold0": "cake_qkv_norm_rope_exchange_overlap_4054da4210fed46e7645",
         "producer_bn256_pair_ow256_fold1": "cake_qkv_norm_rope_exchange_overlap_2005b8b40b1a4ee10ef9",
+        "producer_bn256_pair_ow256_xb": "cake_qkv_norm_rope_exchange_overlap_e6b1334e7928f84b478e",
+        "producer_bn256_pair_ow256_xb_fold0": "cake_qkv_norm_rope_exchange_overlap_c5b0f509e67b3d8b1a16",
+        "producer_bn256_pair_ow256_xb_fold1": "cake_qkv_norm_rope_exchange_overlap_3b76fd35f4dd5c6d8bc8",
         "wait": "cake_qkv_norm_rope_exchange_overlap_b1d866d329f2f38fa312",
     },
     "sm_107a": {
@@ -1768,6 +1887,11 @@ PRODUCER_VARIANT_OPERAND_LOAD_WIDTH: dict[str, int] = {
     "bulk_ow256": 256,
     "bulk": 128,
 }
+# Cross-destination-band builds: ``<variant>_xb`` (``xb`` for the baseline build) is the ``XBAND_BLOCK_N`` pair
+# producer of build ``<variant>`` whose tiles span two destination bands (each head stores to its own destination,
+# ten-field tile table).  Not a selectable build of its own: the plan selects it per row.
+XBAND_SUFFIX = "xb"
+XBAND_BLOCK_N = 256
 
 SOURCE_PACKAGE = "cake_qkv_norm_rope_exchange_overlap"
 ARCH_FLAGS: dict[str, list[str]] = {
@@ -1883,18 +2007,50 @@ def default_producer_variant(arch: str, world_size: int) -> str:
         ) from None
 
 
+def xband_variant(variant: str = SHIPPED_VARIANT) -> str:
+    """The cross-destination-band build of producer build ``variant``: ``<variant>_xb`` (``xb`` for the baseline
+    build).  Its tiles are ``XBAND_BLOCK_N`` pair tiles whose two heads carry their own destination and slot base."""
+
+    if _check_variant(variant) and is_xband_variant(variant):
+        raise ValueError(f"{variant!r} is already a cross-destination-band build")
+    return f"{variant}_{XBAND_SUFFIX}" if variant else XBAND_SUFFIX
+
+
+def is_xband_variant(variant: str) -> bool:
+    """Whether ``variant`` names a cross-destination-band build (``xb`` / ``<variant>_xb``)."""
+
+    return variant == XBAND_SUFFIX or str(variant).endswith(f"_{XBAND_SUFFIX}")
+
+
+def base_variant(variant: str) -> str:
+    """The producer build a cross-destination-band build extends (``variant`` itself for any other build)."""
+
+    if variant == XBAND_SUFFIX:
+        return SHIPPED_VARIANT
+    if str(variant).endswith(f"_{XBAND_SUFFIX}"):
+        return str(variant)[: -len(XBAND_SUFFIX) - 1]
+    return variant
+
+
 def _check_variant(variant: str) -> str:
-    if variant not in PRODUCER_VARIANTS:
+    if base_variant(variant) not in PRODUCER_VARIANTS:
         raise ValueError(
-            f"producer build variant must be one of {PRODUCER_VARIANTS}, got {variant!r}"
+            f"producer build variant must be one of {PRODUCER_VARIANTS}, optionally with the "
+            f"cross-destination-band suffix _{XBAND_SUFFIX}, got {variant!r}"
         )
     return variant
 
 
 def producer_key(block_n: int, pair: bool, variant: str = SHIPPED_VARIANT) -> str:
-    """Route key of a producer build: ``producer_bn<bn>[_pair][_<variant>]``."""
+    """Route key of a producer build: ``producer_bn<bn>[_pair][_<variant>]``.  A cross-destination-band build
+    (:func:`xband_variant`) exists for the ``XBAND_BLOCK_N`` pair tile only."""
 
     suffix = f"_{variant}" if _check_variant(variant) else ""
+    if is_xband_variant(variant) and (int(block_n) != XBAND_BLOCK_N or not pair):
+        raise ValueError(
+            f"the cross-destination-band build {variant!r} is a block_n={XBAND_BLOCK_N} pair producer, got "
+            f"block_n={block_n} pair={pair}"
+        )
     return f"producer_bn{int(block_n)}{'_pair' if pair else ''}{suffix}"
 
 
@@ -1992,6 +2148,18 @@ def fold_producers_delivered(arch: str) -> bool:
     """Whether ``arch`` delivers any folded producer (the ``fold_barrier=True`` launch path is selectable)."""
 
     return any("_fold" in key for key in ROUTES.get(arch, {}))
+
+
+def has_xband_producer(
+    arch: str, variant: str = SHIPPED_VARIANT, *, fold: bool = False
+) -> bool:
+    """Whether the cross-destination-band build of producer build ``variant`` is delivered on ``arch`` (``fold``:
+    both rendezvous phases of its folded producer as well)."""
+
+    xb = xband_variant(variant)
+    return has_producer(arch, XBAND_BLOCK_N, True, xb) and (
+        not fold or has_fold_producer(arch, XBAND_BLOCK_N, True, xb)
+    )
 
 
 def delivered_producer_variants(arch: str, block_n: int, pair: bool) -> tuple[str, ...]:
@@ -2113,10 +2281,13 @@ __all__ = [
     "STAGE_KEYS",
     "SUPPORTED_WORLD_SIZES",
     "SUPPORTED_WORLD_SIZES_BY_ARCH",
+    "XBAND_BLOCK_N",
+    "XBAND_SUFFIX",
     "DeviceFacts",
     "ProducerKey",
     "barrier_flag_words",
     "barrier_program",
+    "base_variant",
     "default_fold_barrier",
     "default_producer_variant",
     "delivered_producer_variants",
@@ -2126,6 +2297,8 @@ __all__ = [
     "fold_producers_delivered",
     "has_fold_producer",
     "has_producer",
+    "has_xband_producer",
+    "is_xband_variant",
     "load",
     "parse_producer_key",
     "producer_key",
@@ -2134,4 +2307,5 @@ __all__ = [
     "spec",
     "supported_world_sizes",
     "wait_program",
+    "xband_variant",
 ]

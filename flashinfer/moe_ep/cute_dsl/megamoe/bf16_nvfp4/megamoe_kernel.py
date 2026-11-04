@@ -1592,6 +1592,7 @@ class Sm100W4A16MegaMoEKernel:
                     "transform_decode_nvfp4_to_bf16",
                     (work.phase << 16) | work.expert_idx,
                 )
+                # MegaMoE consumes every padded MMA K column in the last stage.
                 if work.phase == cutlass.Int32(BlockPhase.Linear1):
                     raw_state, transform_state = self.mixed_fc1._transform_tile(
                         raw_pipe,
@@ -1599,7 +1600,8 @@ class Sm100W4A16MegaMoEKernel:
                         raw_state,
                         transform_state,
                         *parts_fc1,
-                        cutlass.Int32(self._fc1_k_tiles),
+                        self._fc1_k_tiles * self.mma_tiler[2],
+                        transform_group_idx,
                     )
                 else:
                     raw_state, transform_state = self.mixed_fc2._transform_tile(
@@ -1608,7 +1610,8 @@ class Sm100W4A16MegaMoEKernel:
                         raw_state,
                         transform_state,
                         *parts_fc2,
-                        cutlass.Int32(self._fc2_k_tiles),
+                        self._fc2_k_tiles * self.mma_tiler[2],
+                        transform_group_idx,
                     )
                 iket.range_pop()
                 iket.range_push("transform_wait_sched_record")

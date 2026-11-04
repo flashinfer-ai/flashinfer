@@ -19,9 +19,11 @@ Within each det namespace (the ``flashinfer.cake_rmsnorm_silu_gate_det_train`` f
 every compatibility name is the same object as its det name and stays out of ``__all__``.  The names before the
 det rename at the ``flashinfer`` top level, the module ``flashinfer.cake_rmsnorm_silu_gate_train`` and the package
 ``flashinfer.cake_rmsnorm_silu_gate_train_backend`` are the package with the deterministic default and the opt-in
-non-deterministic weight gradient: their own objects and modules, with the pre-rename ``__all__``, whose default
-calls run the det package (``test_cake_rmsnorm_silu_gate_train_api.py`` holds the bits).  Both module paths are
-also attributes of the ``flashinfer`` package after a plain ``import flashinfer`` (checked in fresh interpreters).
+non-deterministic weight gradient: their own objects and modules, with the pre-rename ``__all__`` plus the
+workspace reset; the module's default calls run the det package, and the standalone backend package takes
+``deterministic=False`` only (``test_cake_rmsnorm_silu_gate_train_api.py`` holds the dispatch and the bits).  Both
+module paths are also attributes of the ``flashinfer`` package after a plain ``import flashinfer`` (checked in fresh
+interpreters).
 """
 
 from __future__ import annotations
@@ -111,13 +113,27 @@ def test_det_entry_points_are_the_decorated_defs() -> None:
     assert getattr(facade, old).__name__ == new
 
 
-# The ``__all__`` of the legacy facade and backend package: the names before the det rename.
-LEGACY_ALL = sorted(["ARCHES", "SUPPORTED_COMPUTE_CAPABILITIES", *NAMES])
-# The legacy facade's own ``flashinfer_api`` wrappers; its other names are the backend package's objects.
+# The ``__all__`` of the legacy facade and backend package: the names before the det rename and the workspace
+# reset of the non-deterministic backward.
+LEGACY_ALL = sorted(
+    [
+        "ARCHES",
+        "SUPPORTED_COMPUTE_CAPABILITIES",
+        "cake_rmsnorm_silu_gate_train_reset_workspace",
+        *NAMES,
+    ]
+)
+# The legacy facade's own entry points (``flashinfer_api`` wrappers and the autograd function; they dispatch on
+# ``deterministic``); its other names are the backend package's objects.
 LEGACY_FACADE_DEFS = (
+    "CakeRMSNormSiLUGateFunction",
     "cake_rmsnorm_silu_gate",
     "cake_rmsnorm_silu_gate_train_backward",
+    "cake_rmsnorm_silu_gate_train_backward_workspace",
+    "cake_rmsnorm_silu_gate_train_backward_workspace_bytes",
     "cake_rmsnorm_silu_gate_train_forward",
+    "cake_rmsnorm_silu_gate_train_reset_workspace",
+    "is_cake_rmsnorm_silu_gate_train_supported",
 )
 
 
@@ -147,12 +163,20 @@ def test_old_package_submodule_is_its_own_module(submodule: str) -> None:
 def test_old_package_is_self_contained() -> None:
     assert sorted(legacy_backend.__all__) == LEGACY_ALL
     assert not hasattr(legacy_backend, "cake_rmsnorm_silu_gate_det_train_forward")
-    # its own registry: the det forward program renamed and the one-kernel backward in both dw dtypes
+    # its own registry: the det forward program renamed, the one-kernel backward in both dw dtypes
+    # and the long-input modules
     loader = legacy_backend.cake_jit
     assert loader.MODULES and all(
         name.startswith("cake_rmsnorm_silu_gate_train_") for name in loader.MODULES
     )
-    assert {record["role"] for record in loader.MODULES.values()} == set(loader.ROLES)
+    roles = {record["role"] for record in loader.MODULES.values()}
+    assert roles == (
+        set(loader.ROLES)
+        | set(loader.XLONG_ROLES)
+        | set(loader.LONG_ROLES)
+        | set(loader.MID_ROLES)
+        | set(loader.SHORT_ROLES)
+    )
     old_dir = Path(legacy_backend.__file__).parent
     files = {p.name for p in old_dir.iterdir() if p.name != "__pycache__"}
     assert {

@@ -47,15 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define SMEM_RED_OFF 1024
-#define SMEM_RED_STAGE_BYTES 16384
-#define SMEM_RED_STRIDE 16384
-#define SMEM_STAGE_BUF_OFF 17408
-#define SMEM_STAGE_BUF_STAGE_BYTES 65536
-#define SMEM_STAGE_BUF_STRIDE 65536
-#define SMEM_TOTAL 82944
-#define THREADS 128
 #define LAUNCH_MIN_BLOCKS 2
 
 #include <math_constants.h>
@@ -1368,6 +1359,7 @@ kernel_cake_causal_conv1d_train_012b6319a0cc717911b9(__nv_bfloat16* __restrict__
         red[tid * 32 + i_5] = acc[i_5];
     }
     __syncthreads();
+#if __CUDA_ARCH__ == 1000
     int c0_0 = (ct * ct_vec + v) * 8;
     if (sub == 0 && c0_0 < C) {
         float tot[32];
@@ -1385,10 +1377,59 @@ kernel_cake_causal_conv1d_train_012b6319a0cc717911b9(__nv_bfloat16* __restrict__
         #pragma unroll
         for (int j_6 = 0; j_6 < 8; j_6++) {
             asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<uint64_t>(&dw_acc[(c0_0 + j_6) * 4])), "f"(tot[j_6 * 4]), "f"(tot[j_6 * 4 + 1]), "f"(tot[j_6 * 4 + 2]), "f"(tot[j_6 * 4 + 3]) : "memory");
+#elif __CUDA_ARCH__ == 1030
+    int cb0 = ct * ct_vec * 8;
+    #pragma unroll 1
+    for (int q = tid; q < ct_vec * 8; q += 128) {
+        if (sub <= n_sub && cb0 + q < C) {
+            int vq = q >> 3;
+            int jq = q & 7;
+            float t4[4];
+            float u4[4];
+            const void* _smem_load_ptr_88 = reinterpret_cast<const void*>(red + (vq * 32 + jq * 4));
+            uint32_t _smem_load_addr_88 = static_cast<uint32_t>(__cvta_generic_to_shared(_smem_load_ptr_88));
+            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                : "=r"(*reinterpret_cast<uint32_t*>(&t4[0])), "=r"(*reinterpret_cast<uint32_t*>(&t4[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&t4[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&t4[(0) + 3]))
+                : "r"(_smem_load_addr_88));
+            #pragma unroll 1
+            for (int s_1 = 1; s_1 < n_sub; s_1++) {
+                int rq = s_1 * ct_vec + vq;
+                const void* _smem_load_ptr_89 = reinterpret_cast<const void*>(red + (rq * 32 + jq * 4));
+                uint32_t _smem_load_addr_89 = static_cast<uint32_t>(__cvta_generic_to_shared(_smem_load_ptr_89));
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                    : "=r"(*reinterpret_cast<uint32_t*>(&u4[0])), "=r"(*reinterpret_cast<uint32_t*>(&u4[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&u4[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&u4[(0) + 3]))
+                    : "r"(_smem_load_addr_89));
+                #pragma unroll
+                for (int k_2 = 0; k_2 < 4; k_2++) {
+                    t4[k_2] = t4[k_2] + u4[k_2];
+                }
+            }
+            asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<uint64_t>(&dw_acc[(cb0 + q) * 4])), "f"(t4[0]), "f"(t4[1]), "f"(t4[2]), "f"(t4[3]) : "memory");
+#else
+    int cb0 = ct * ct_vec * 8;
+    #pragma unroll 1
+    for (int q = tid; q < ct_vec * 8; q += 128) {
+        if (sub <= n_sub && cb0 + q < C) {
+            int vq = q >> 3;
+            int jq = q & 7;
+            float t4[4];
+            #pragma unroll
+            for (int k_2 = 0; k_2 < 4; k_2++) {
+                t4[k_2] = red[vq * 32 + jq * 4 + k_2];
+            }
+            #pragma unroll 1
+            for (int s_1 = 1; s_1 < n_sub; s_1++) {
+                int rq = s_1 * ct_vec + vq;
+                #pragma unroll
+                for (int k_3 = 0; k_3 < 4; k_3++) {
+                    t4[k_3] = t4[k_3] + red[rq * 32 + jq * 4 + k_3];
+                }
+            }
+            asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<uint64_t>(&dw_acc[(cb0 + q) * 4])), "f"(t4[0]), "f"(t4[1]), "f"(t4[2]), "f"(t4[3]) : "memory");
+#endif
         }
     }
     asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
-    __threadfence();
     __syncthreads();
     if (tid == 0) {
         uint32_t done;
@@ -1403,39 +1444,80 @@ kernel_cake_causal_conv1d_train_012b6319a0cc717911b9(__nv_bfloat16* __restrict__
     __syncthreads();
     float last = red[0];
     if (last != 0.0f) {
-        __threadfence();
         int ch0 = ct * ct_vec * 8;
-        float a4[4];
-        float tb_2[1];
+        int lim = ((C) < (ch0 + ct_vec * 8) ? (C) : (ch0 + ct_vec * 8));
         float z4[4];
         #pragma unroll
         for (int e = 0; e < 4; e++) {
             z4[e] = 0.0f;
         }
+        float a[16];
+        float tb_2[4];
         #pragma unroll 1
-        for (int c = ch0 + tid; c < ch0 + ct_vec * 8; c += 128) {
-            if (c < C) {
-                long long c64_2 = (long long)c;
-                {
-                    float4 _v4 = *reinterpret_cast<const float4*>(dw_acc + c64_2 * 4);
-                    a4[0 + 0] = _v4.x;
-                    a4[0 + 1] = _v4.y;
-                    a4[0 + 2] = _v4.z;
-                    a4[0 + 3] = _v4.w;
-                }
-                {
-                    float4 _v4 = make_float4(z4[0 + 0], z4[0 + 1], z4[0 + 2], z4[0 + 3]);
-                    *reinterpret_cast<float4*>(dw_acc + c64_2 * 4) = _v4;
-                }
-                if ((flags & 2) != 0) {
-                    #pragma unroll
-                    for (int e_1 = 0; e_1 < 4; e_1++) {
-                        *(reinterpret_cast<__nv_bfloat16*>(reinterpret_cast<__nv_bfloat16*>(dw)) + (c64_2 * 4 + (long long)e_1)) = (__nv_bfloat16)a4[e_1];
-                    }
-                } else {
+#if __CUDA_ARCH__ == 1000
+        for (int c0_1 = ch0 + tid; c0_1 < ch0 + ct_vec * 8; c0_1 += 512) {
+#else
+        for (int c0_0 = ch0 + tid; c0_0 < ch0 + ct_vec * 8; c0_0 += 512) {
+#endif
+            #pragma unroll
+#if __CUDA_ARCH__ == 1000
+            for (int j_7 = 0; j_7 < 4; j_7++) {
+                int cl = c0_1 + 128 * j_7;
+#else
+            for (int j_6 = 0; j_6 < 4; j_6++) {
+                int cl = c0_0 + 128 * j_6;
+#endif
+                if (cl < lim) {
+                    long long cl64 = (long long)cl;
                     {
-                        float4 _v4 = make_float4(a4[0 + 0], a4[0 + 1], a4[0 + 2], a4[0 + 3]);
-                        *reinterpret_cast<float4*>(reinterpret_cast<float*>(dw) + c64_2 * 4) = _v4;
+                        float4 _v4 = *reinterpret_cast<const float4*>(dw_acc + cl64 * 4);
+#if __CUDA_ARCH__ == 1000
+                        a[4 * j_7 + 0] = _v4.x;
+                        a[4 * j_7 + 1] = _v4.y;
+                        a[4 * j_7 + 2] = _v4.z;
+                        a[4 * j_7 + 3] = _v4.w;
+#else
+                        a[4 * j_6 + 0] = _v4.x;
+                        a[4 * j_6 + 1] = _v4.y;
+                        a[4 * j_6 + 2] = _v4.z;
+                        a[4 * j_6 + 3] = _v4.w;
+#endif
+                    }
+                }
+            }
+            #pragma unroll
+#if __CUDA_ARCH__ == 1000
+            for (int j_8 = 0; j_8 < 4; j_8++) {
+                int c = c0_1 + 128 * j_8;
+#else
+            for (int j_7 = 0; j_7 < 4; j_7++) {
+                int c = c0_0 + 128 * j_7;
+#endif
+                if (c < lim) {
+                    long long c64_2 = (long long)c;
+                    long long bi = (long long)C * 4 + c64_2;
+                    {
+                        float4 _v4 = make_float4(z4[0 + 0], z4[0 + 1], z4[0 + 2], z4[0 + 3]);
+                        *reinterpret_cast<float4*>(dw_acc + c64_2 * 4) = _v4;
+                    }
+                    if ((flags & 2) != 0) {
+                        #pragma unroll
+                        for (int e_1 = 0; e_1 < 4; e_1++) {
+#if __CUDA_ARCH__ == 1000
+                            *(reinterpret_cast<__nv_bfloat16*>(reinterpret_cast<__nv_bfloat16*>(dw)) + (c64_2 * 4 + (long long)e_1)) = (__nv_bfloat16)a[4 * j_8 + e_1];
+#else
+                            *(reinterpret_cast<__nv_bfloat16*>(reinterpret_cast<__nv_bfloat16*>(dw)) + (c64_2 * 4 + (long long)e_1)) = (__nv_bfloat16)a[4 * j_7 + e_1];
+#endif
+                        }
+                    } else {
+                        {
+#if __CUDA_ARCH__ == 1000
+                            float4 _v4 = make_float4(a[4 * j_8 + 0], a[4 * j_8 + 1], a[4 * j_8 + 2], a[4 * j_8 + 3]);
+#else
+                            float4 _v4 = make_float4(a[4 * j_7 + 0], a[4 * j_7 + 1], a[4 * j_7 + 2], a[4 * j_7 + 3]);
+#endif
+                            *reinterpret_cast<float4*>(reinterpret_cast<float*>(dw) + c64_2 * 4) = _v4;
+                        }
                     }
                 }
             }
