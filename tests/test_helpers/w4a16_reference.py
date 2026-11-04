@@ -550,7 +550,7 @@ def assert_w4a16_bits(actual, expected):
     )
 
 
-def canonical_split_w4a16_weights(tensors, gated):
+def canonical_split_w4a16_weights(tensors, gated, swap_ab=False):
     """Decode split's packed layout without its production dequantizer.
 
     Preserve the actual E2M1 codes and E4M3 scales; only undo the scale layout
@@ -566,13 +566,20 @@ def canonical_split_w4a16_weights(tensors, gated):
             tensors[f"{name}_weight_sf"], rows, 2 * packed_k, experts
         )
         if name == "w1" and gated:
-            # Split stores [up64,gate64,...]; the oracle consumes
-            # canonical [all_gate,all_up], including matching scales.
-            assert rows % 128 == 0
+            # Split stores interleaved [up, gate] groups; the oracle consumes
+            # canonical [all_gate, all_up], including matching scales.
+            group_size = 16 if swap_ab else 64
+            assert rows % (2 * group_size) == 0
 
             def gate_first(value):
                 return (
-                    value.reshape(experts, rows // 128, 2, 64, value.shape[-1])
+                    value.reshape(
+                        experts,
+                        rows // (2 * group_size),
+                        2,
+                        group_size,
+                        value.shape[-1],
+                    )
                     .transpose(1, 2)
                     .flip(1)
                     .reshape_as(value)
@@ -599,6 +606,7 @@ def split_w4a16_reference_from_tensors(
     token_selected_experts=None,
     token_final_scales=None,
     wrong_formula=False,
+    swap_ab=False,
 ):
     """Adapt split test tensors to the shared deterministic W4A16 oracle.
 
@@ -653,7 +661,9 @@ def split_w4a16_reference_from_tensors(
     }
     return w4a16_reference(
         problem,
-        canonical_split_w4a16_weights(tensors, activation not in ("relu2", "relu")),
+        canonical_split_w4a16_weights(
+            tensors, activation not in ("relu2", "relu"), swap_ab=swap_ab
+        ),
         fc1_alpha=tensors["w1_alpha"],
         fc2_alpha=tensors["w2_alpha"],
         local_expert_offset=local_expert_offset,

@@ -47,12 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define THREADS 256
-#define ROWS_PER_CTA 8
-#define GROUP_THREADS 32
-#define LAUNCH_BOUNDS_THREADS 256
-
 #include <math_constants.h>
 
 
@@ -70,7 +64,7 @@ __device__ __forceinline__ float2 cake_bf16x2_to_f32x2(__nv_bfloat162 v) {
 
 extern "C" {
 
-__global__ __launch_bounds__(LAUNCH_BOUNDS_THREADS) void
+__global__ __launch_bounds__(256) void
 kernel_cake_rmsnorm_train_7da36ff557bb2bac8d89(__nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ u, float* __restrict__ w, __nv_bfloat16* __restrict__ y, __nv_bfloat16* __restrict__ h_new, float* __restrict__ r, int T, float eps, long long x_stride_p0, long long u_stride_p0)
 {
     const int tid = threadIdx.x;
@@ -85,14 +79,14 @@ kernel_cake_rmsnorm_train_7da36ff557bb2bac8d89(__nv_bfloat16* __restrict__ x, __
 
     // === Task calls (declaration order) ===
     int warp_0 = warp;
-    int group = tid / GROUP_THREADS;
-    int gtid = tid - group * GROUP_THREADS;
+    int group = tid / 32;
+    int gtid = tid - group * 32;
     float h_f = 512.0f;
     int it = 0;
-    int stride = num_bids * ROWS_PER_CTA;
+    int stride = num_bids * 8;
     unsigned int cur[8];
     unsigned int nxt[8];
-    int first = bid * ROWS_PER_CTA + group;
+    int first = bid * 8 + group;
     #pragma unroll
     for (int i = 0; i < 8; i++) {
         cur[i] = 0;
@@ -102,7 +96,7 @@ kernel_cake_rmsnorm_train_7da36ff557bb2bac8d89(__nv_bfloat16* __restrict__ x, __
         #pragma unroll
         for (int v = 0; v < 2; v++) {
             {
-                const uint4* _vptr_0 = reinterpret_cast<const uint4*>(x + (fbase + (long long)(gtid * 8 + v * (GROUP_THREADS * 8))) + 0);
+                const uint4* _vptr_0 = reinterpret_cast<const uint4*>(x + (fbase + (long long)(gtid * 8 + v * (32 * 8))) + 0);
                 uint4* _vdst_0 = reinterpret_cast<uint4*>(&cur[v * 4]);
                 #pragma unroll
                 for (int _blk = 0; _blk < 1; _blk++) {
@@ -113,7 +107,7 @@ kernel_cake_rmsnorm_train_7da36ff557bb2bac8d89(__nv_bfloat16* __restrict__ x, __
         }
     }
     #pragma unroll 1
-    for (int row0 = bid * ROWS_PER_CTA; row0 < T; row0 += num_bids * ROWS_PER_CTA) {
+    for (int row0 = bid * 8; row0 < T; row0 += num_bids * 8) {
         int row = row0 + group;
         int nrow = row + stride;
         if (nrow < T) {
@@ -121,7 +115,7 @@ kernel_cake_rmsnorm_train_7da36ff557bb2bac8d89(__nv_bfloat16* __restrict__ x, __
             #pragma unroll
             for (int v_1 = 0; v_1 < 2; v_1++) {
                 {
-                    const uint4* _vptr_1 = reinterpret_cast<const uint4*>(x + (nbase + (long long)(gtid * 8 + v_1 * (GROUP_THREADS * 8))) + 0);
+                    const uint4* _vptr_1 = reinterpret_cast<const uint4*>(x + (nbase + (long long)(gtid * 8 + v_1 * (32 * 8))) + 0);
                     uint4* _vdst_1 = reinterpret_cast<uint4*>(&nxt[v_1 * 4]);
                     #pragma unroll
                     for (int _blk = 0; _blk < 1; _blk++) {
@@ -174,7 +168,7 @@ kernel_cake_rmsnorm_train_7da36ff557bb2bac8d89(__nv_bfloat16* __restrict__ x, __
                     unsigned _ldv8_5_6;
                     unsigned _ldv8_5_7;
                     asm volatile("ld.global.nc.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                        : "=r"(_ldv8_5_0), "=r"(_ldv8_5_1), "=r"(_ldv8_5_2), "=r"(_ldv8_5_3), "=r"(_ldv8_5_4), "=r"(_ldv8_5_5), "=r"(_ldv8_5_6), "=r"(_ldv8_5_7) : "l"((const void*)(w + (gtid * 8 + v_2 * (GROUP_THREADS * 8)) + (0))) : "memory");
+                        : "=r"(_ldv8_5_0), "=r"(_ldv8_5_1), "=r"(_ldv8_5_2), "=r"(_ldv8_5_3), "=r"(_ldv8_5_4), "=r"(_ldv8_5_5), "=r"(_ldv8_5_6), "=r"(_ldv8_5_7) : "l"((const void*)(w + (gtid * 8 + v_2 * (32 * 8)) + (0))) : "memory");
                     wf[0 + 0] = __uint_as_float(_ldv8_5_0);
                     wf[0 + 1] = __uint_as_float(_ldv8_5_1);
                     wf[0 + 2] = __uint_as_float(_ldv8_5_2);
@@ -212,7 +206,7 @@ kernel_cake_rmsnorm_train_7da36ff557bb2bac8d89(__nv_bfloat16* __restrict__ x, __
                     __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(out[_lp*2 + 6], out[_lp*2+1 + 6]));
                     _packed_0[_lp + 3] = *(uint32_t*)&_bf2;
                 }
-                reinterpret_cast<int4*>(y + (obase + (long long)(gtid * 8 + v_2 * (GROUP_THREADS * 8))))[0] = reinterpret_cast<int4*>(_packed_0)[0];
+                reinterpret_cast<int4*>(y + (obase + (long long)(gtid * 8 + v_2 * (32 * 8))))[0] = reinterpret_cast<int4*>(_packed_0)[0];
             }
         }
         #pragma unroll
