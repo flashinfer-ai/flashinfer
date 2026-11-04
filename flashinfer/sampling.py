@@ -1054,8 +1054,9 @@ def sampling_from_logits(
         If indices is not provided, the i-th output will be sampled from the i-th row of logits
         and output dtype defaults to ``torch.int32``.
     deterministic: bool
-        Since the sampling doesn't use cub's BlockScan, it is deterministic. We keep this
-        argument for compatibility with other sampling functions.
+        No-op: this kernel has no prefix scan and is always bitwise reproducible for a
+        fixed seed. Kept for signature parity with the other samplers, where the flag
+        selects the deterministic prefix scan.
     generator: Optional[torch.Generator]
         A random number generator for the operation.
     check_nan: bool
@@ -1147,7 +1148,9 @@ def sampling_from_probs(
         If indices is not provided, the i-th output will be sampled from the i-th row of probs
         and output dtype defaults to ``torch.int32``.
     deterministic: bool
-        Whether to use deterministic kernel implementation, default is ``True``.
+        If True, the kernel uses an order-independent prefix scan instead of
+        ``cub::BlockScan``, so repeated calls with identical inputs and seed are bitwise
+        equal. Default is ``True``.
     generator: Optional[torch.Generator]
         A random number generator for the operation.
     check_nan: bool
@@ -1260,6 +1263,9 @@ def top_p_sampling_from_probs(
         Either a float or a tensor of shape ``(batch_size,)``, representing the threshold for top-p sampling.
         If a float, the same threshold is used for all requests.
         If a tensor, each request has its own threshold.
+        A candidate is accepted when the mass of the tokens strictly greater than it is below
+        ``top_p``, so tokens tied at the boundary value are all admissible, the same keep-ties
+        rule as :func:`top_p_renorm_probs`.
     indices: Optional[torch.Tensor]
         Optional indices tensor of shape ``(batch_size,)``, dtype ``torch.int32`` or ``torch.int64``
         that maps each output to a row in probs. The output tensor will have the same dtype as indices.
@@ -1268,7 +1274,9 @@ def top_p_sampling_from_probs(
         If indices is not provided, the i-th output will be sampled from the i-th row of probs
         and output dtype defaults to ``torch.int32``.
     deterministic: bool
-        Whether to use deterministic kernel implementation, default is ``True``.
+        If True, the kernel uses an order-independent prefix scan instead of
+        ``cub::BlockScan``, so repeated calls with identical inputs and seed are bitwise
+        equal. Default is ``True``.
     generator: Optional[torch.Generator]
         A random number generator for the operation.
     check_nan: bool
@@ -1390,6 +1398,9 @@ def top_k_sampling_from_probs(
         Either a scalar or a tensor of shape ``(batch_size,)``, representing the threshold for top-k sampling.
         If a scalar, the same threshold is used for all requests.
         If a tensor, each request has its own threshold.
+        A candidate is accepted when fewer than ``top_k`` tokens are strictly greater than it, so
+        tokens tied with the k-th largest are all admissible, the same keep-ties rule as
+        :func:`top_k_renorm_probs`.
     indices: Optional[torch.Tensor]
         Optional indices tensor of shape ``(batch_size,)``, dtype ``torch.int32`` or ``torch.int64``
         that maps each output to a row in probs. The output tensor will have the same dtype as indices.
@@ -1398,7 +1409,9 @@ def top_k_sampling_from_probs(
         If indices is not provided, the i-th output will be sampled from the i-th row of probs
         and output dtype defaults to ``torch.int32``.
     deterministic: bool
-        Whether to use deterministic kernel implementation, default is ``True``.
+        If True, the kernel uses an order-independent prefix scan instead of
+        ``cub::BlockScan``, so repeated calls with identical inputs and seed are bitwise
+        equal. Default is ``True``.
     generator: Optional[torch.Generator]
         A random number generator for the operation.
     check_nan: bool
@@ -1529,7 +1542,9 @@ def min_p_sampling_from_probs(
         If indices is not provided, the i-th output will be sampled from the i-th row of probs
         and output dtype defaults to ``torch.int32``.
     deterministic: bool
-        Whether to use deterministic kernel implementation, default is ``True``.
+        If True, the kernel uses an order-independent prefix scan instead of
+        ``cub::BlockScan``, so repeated calls with identical inputs and seed are bitwise
+        equal. Default is ``True``.
     generator: Optional[torch.Generator]
         A random number generator for the operation.
     check_nan: bool
@@ -1761,6 +1776,11 @@ def top_k_top_p_sampling_from_logits(
         Either a scalar or a tensor of shape ``(batch_size,)``, representing the threshold for top-p sampling.
         If a scalar, the same threshold is used for all requests.
         If a tensor, each request has its own threshold.
+        Both filters keep ties at the boundary (every token ``>=`` the k-th largest, every token
+        whose strictly-greater mass is below ``top_p``), as :func:`top_k_renorm_probs` and
+        :func:`top_p_renorm_probs` do, with one exception: the ``"top_k_first"`` fast path
+        (no ``indices``, ``top_k_max <= 256``, ``num_classes >= 65536``) selects exactly ``k``
+        tokens with a radix top-k whose choice among tied boundary tokens follows thread order.
     indices: Optional[torch.Tensor]
         Optional indices tensor of shape ``(batch_size,)``, dtype ``torch.int32`` or ``torch.int64``
         that maps each output to a row in probs. The output tensor will have the same dtype as indices.
@@ -1773,7 +1793,9 @@ def top_k_top_p_sampling_from_logits(
         If ``"top_k_first"``, we first apply top-k filter, then apply top-p sampling on the top-k results.
         If ``"joint"``, we apply top-k and top-p filter simultaneously in each round. Default is ``"top_k_first"``.
     deterministic: bool
-        Whether to use deterministic kernel implementation, default is ``True``.
+        If True, the kernel uses an order-independent prefix scan instead of
+        ``cub::BlockScan``, so repeated calls with identical inputs and seed are bitwise
+        equal. Default is ``True``.
     generator: Optional[torch.Generator]
         A random number generator for the operation.
     check_nan: bool
@@ -1937,6 +1959,11 @@ def top_k_top_p_sampling_from_probs(
         Either a scalar or a tensor of shape ``(batch_size,)``, representing the threshold for top-p sampling.
         If a scalar, the same threshold is used for all requests.
         If a tensor, each request has its own threshold.
+        Both filters keep ties at the boundary (every token ``>=`` the k-th largest, every token
+        whose strictly-greater mass is below ``top_p``), as :func:`top_k_renorm_probs` and
+        :func:`top_p_renorm_probs` do, with one exception: the ``"top_k_first"`` fast path
+        (no ``indices``, ``top_k_max <= 256``, ``num_classes >= 65536``) selects exactly ``k``
+        tokens with a radix top-k whose choice among tied boundary tokens follows thread order.
     indices: Optional[torch.Tensor]
         Optional indices tensor of shape ``(batch_size,)``, dtype ``torch.int32`` or ``torch.int64``
         that maps each output to a row in probs. The output tensor will have the same dtype as indices.
@@ -1949,7 +1976,9 @@ def top_k_top_p_sampling_from_probs(
         If ``"top_k_first"``, we first apply top-k filter, then apply top-p sampling on the top-k results.
         If ``"joint"``, we apply top-k and top-p filter simultaneously in each round. Default is ``"top_k_first"``.
     deterministic: bool
-        Whether to use deterministic kernel implementation, default is ``True``.
+        If True, the kernel uses an order-independent prefix scan instead of
+        ``cub::BlockScan``, so repeated calls with identical inputs and seed are bitwise
+        equal. Default is ``True``.
     generator: Optional[torch.Generator]
         A random number generator for the operation.
     check_nan: bool
@@ -2098,8 +2127,9 @@ def top_p_renorm_probs(
         re-normalizing probabilities, should be in ``(0, 1)``.
         If a scalar, the same threshold is used for all requests.
         If a tensor, each request has its own threshold.
-        We mask out the probabilities less than `threshold` where the cumulative sum
-        of ``probs[probs >= threshold]`` is `top_p`, and renormalize the probabilities.
+        A token is kept when the cumulative mass of the tokens strictly greater than it is
+        below ``top_p``; the rest are set to zero and the kept tokens are renormalized.
+        Ties at the boundary are kept: every token equal to the threshold value survives.
     is_deterministic: bool
         If True, build the threshold histogram with fixed-point integer atomics so the
         kept set and the output are bitwise reproducible across invocations; with False
@@ -2192,6 +2222,8 @@ def top_k_renorm_probs(
         If a scalar, the same threshold is used for all requests.
         If a tensor, each request has its own threshold.
         We keep the top-k probabilities, set the rest to zero, and renormalize the probabilities.
+        Ties at the boundary are kept: every token whose probability is ``>=`` the k-th largest
+        survives, so a row can keep more than ``top_k`` tokens.
     is_deterministic: bool
         If True, accumulate the renormalization sum with order-independent
         fixed-point integer atomics so results are bitwise reproducible across
@@ -2274,6 +2306,8 @@ def top_k_mask_logits(
         If a scalar, the same threshold is used for all requests.
         If a tensor, each request has its own threshold.
         We keep the top-k logits, set the rest to negative infinity.
+        Ties at the boundary are kept: every logit ``>=`` the k-th largest survives, so a row
+        can keep more than ``top_k`` logits.
 
     Returns
     -------
@@ -2364,7 +2398,9 @@ def chain_speculative_sampling(
         Shape: ``(batch_size)``
         If specified, the number of emitted token number will be added to this tensor inplace. Default is ``None``.
     deterministic: bool
-        Whether to use deterministic kernel implementation, default is ``True``.
+        If True, the kernel uses an order-independent prefix scan instead of
+        ``cub::BlockScan``, so repeated calls with identical inputs and seed are bitwise
+        equal. Default is ``True``.
     generator: Optional[torch.Generator]
         A random number generator for the operation.
     seed: Optional[Union[int, torch.Tensor]]

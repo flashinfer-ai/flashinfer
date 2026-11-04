@@ -16,6 +16,15 @@ Kernels for LLM sampling.
    The output row index still feeds the Philox subsequence. Per-row seeds do not
    make sampling invariant to batch position, even with the same seed and offset.
 
+.. _sampling-ties-and-determinism:
+
+Boundary ties and determinism
+-----------------------------
+
+Every filter in this module keeps ties at its boundary. Top-k (:func:`~flashinfer.sampling.top_k_renorm_probs`, :func:`~flashinfer.sampling.top_k_mask_logits`, :func:`~flashinfer.sampling.top_k_sampling_from_probs`) keeps every token whose value is ``>=`` the k-th largest, so a row with ties at the k-th value keeps more than ``k`` tokens. Top-p (:func:`~flashinfer.sampling.top_p_renorm_probs`, :func:`~flashinfer.sampling.top_p_sampling_from_probs`) keeps every token whose strictly-greater cumulative mass is below ``top_p``, so tokens equal to the threshold value are all kept. The joint samplers (:func:`~flashinfer.sampling.top_k_top_p_sampling_from_logits`, :func:`~flashinfer.sampling.top_k_top_p_sampling_from_probs`) follow the same rule, with one documented exception: their ``"top_k_first"`` fast path (no ``indices``, ``top_k_max <= 256``, ``num_classes >= 65536``) selects exactly ``k`` tokens with a radix top-k whose choice among tied boundary tokens follows thread order.
+
+The ``deterministic`` flag of the samplers selects an order-independent prefix scan in the sampling kernel; it defaults to ``True`` and is a no-op on :func:`~flashinfer.sampling.sampling_from_logits`, which has no scan. The ``is_deterministic`` flag of the renorm ops replaces float atomics with fixed-point integer atomics. :func:`~flashinfer.sampling.top_k_renorm_probs` defaults to ``True`` (the cost is below measurement noise); :func:`~flashinfer.sampling.top_p_renorm_probs` defaults to ``False`` because its deterministic histogram costs 1.25x to 1.61x at batch sizes of 128 and above, and with the default the kept set itself can change between calls when ``top_p`` lies within rounding of a cumulative-mass boundary.
+
 .. seealso::
 
   For efficient Top-K selection (without sampling), see :ref:`apitopk` which provides
