@@ -131,8 +131,8 @@ SWAPS_MAX_ROWS = 8  # units of at most this many live rows take the Swaps-AB ker
 SWAPS_DIMS = (64, 128, 256)  # head dims the Swaps-AB kernel implements
 
 
-Q2_MIN_UNITS_PER_SM = 4  # the paired placement halves the unit count: below ~4 units per SM the lost parallelism outweighs the overlap
-# (Rubin D = 64 prefill, 2026-11-03: 0.85-0.98x below, 1.11-1.25x above); a placement rule, the bits are the same
+Q2_MIN_UNITS_PER_SM = 4  # the paired placement halves the unit count: below this many units per SM the lost parallelism
+# outweighs the overlap of the two softmax warpgroups, so smaller batches take the one-warpgroup body (a placement rule: same bits)
 
 
 def pair_units(desc: list) -> list:
