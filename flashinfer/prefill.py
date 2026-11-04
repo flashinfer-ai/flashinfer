@@ -2735,11 +2735,10 @@ def _blackwell_ragged_auto_upgrade(
     on FA2. The walk tests *capability*, so the order decides the winner
     wherever both candidates are eligible.
 
-    Both candidates' run paths receive only ``causal`` and the scales, so any
-    request for RoPE, a custom mask, a sliding window, a logits soft cap, the
-    multi-item-scoring pointers or attention sinks stashed on the wrapper
-    (vLLM's ``_sinks``) disqualifies every upgrade: selecting one would
-    silently drop the feature.
+    RoPE, custom masks, a logits soft cap and multi-item-scoring pointers
+    disqualify every upgrade. Sliding windows and attention sinks stashed on
+    the wrapper (vLLM's ``_sinks``) are supported by the cuDNN graph path, but
+    disqualify CUTLASS, whose run path receives only ``causal`` and the scales.
 
     ``cudnn`` is chosen only when the installed cuDNN can consume the caller's
     token-unit indptrs directly (``batch_offsets_units="tokens"``: they serve as
@@ -2753,24 +2752,32 @@ def _blackwell_ragged_auto_upgrade(
     ``auto`` routes past them instead of failing (``cudnn_indptr_is_int32`` and
     ``cutlass_work_items`` both exist for that reason).
     """
+    # Universal disqualifiers: no backend in the walk implements these, so an
+    # upgrade would silently drop the feature.
     if (
         kv_layout != "NHD"
         or q_data_type != kv_data_type
         or pos_encoding_mode != PosEncodingMode.NONE.value
         or has_custom_mask
-        or window_left >= 0
         or logits_soft_cap != 0.0
         or has_multi_item_scoring
-        or has_sinks
     ):
         return None
+    # Sliding window and attention sinks are per-backend: cuDNN builds both into
+    # its SDPA graph (diagonal_band_left_bound / sink_token), while the CUTLASS
+    # run path receives only `causal` and the scales and would ignore them.
+    needs_window_or_sinks = window_left >= 0 or has_sinks
     for backend in _blackwell_ragged_auto_order(head_dim_qk, head_dim_vo):
         if backend == "cudnn":
             if (
                 is_sm100a_supported(device)
-                # fp16 / bf16 only: the cuDNN run branch below takes the caller's
-                # tensors as they are, and the wrapper's fp8 handling (scales,
-                # descale tensors) lives on the paths after it.
+                # fp16 / bf16 only. cuDNN itself does fp8 (`sdpa_fp8`), and the
+                # wrapper's cuDNN branch now normalises scalar scales so an fp8
+                # call reaches it intact -- but `auto` still stays away: the fp8
+                # output is not yet validated against a reference here, and the
+                # fp8 graph has been observed taking minutes to compile at
+                # production shapes, which is not something to hand a caller who
+                # only asked for "auto". Explicit `backend="cudnn"` works.
                 and q_data_type in (torch.float16, torch.bfloat16)
                 and _cudnn_supports_direct_seqlens(q_data_type)
                 and (head_dim_qk, head_dim_vo) in _CUDNN_RAGGED_AUTO_HEAD_DIMS
@@ -2789,6 +2796,8 @@ def _blackwell_ragged_auto_upgrade(
                 and not single_token_gqa_with_empty_rows
             ):
                 return backend
+        elif backend == "cutlass" and needs_window_or_sinks:
+            continue
         elif backend == "cutlass":
             if (
                 (is_sm100a_supported(device) or is_sm110a_supported(device))
@@ -5492,9 +5501,11 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             ``fmha_v2`` for large-sequence MHA on SM120, and on SM100a ``cudnn`` (when the
             installed cuDNN can consume token-unit indptrs directly, see
             :func:`~flashinfer.cudnn.prefill._cudnn_supports_direct_seqlens`) or else
-            ``cutlass`` on SM100a/SM110a, for the head dims those kernels serve, when no
-            sliding window, logits soft cap, custom mask or multi-item-scoring pointer is in
-            play -- neither path accepts those, so ``auto`` stays on ``fa2`` for them.
+            ``cutlass`` on SM100a/SM110a, for the head dims those kernels serve.
+            Sliding windows and attention sinks are supported by the eligible ``cudnn``
+            path, but exclude ``cutlass``. RoPE, logits soft caps, custom masks and
+            multi-item-scoring pointers exclude both upgrades, so ``auto`` stays on
+            ``fa2`` for them.
             Otherwise ``fa2``.
             The ``cudnn`` backend takes ``qo_indptr``/``kv_indptr`` in the same **token**
             units as every other backend, whether selected explicitly or via ``auto``.
@@ -6482,16 +6493,21 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 self._seq_lens_q, self._seq_lens_kv = self._cudnn_mask_buffers
 
         if self._backend == "cudnn":
+            if not _CUDNN_GRAPH_AVAILABLE and (
+                window_left >= 0 or getattr(self, "_sinks", None) is not None
+            ):
+                raise NotImplementedError(
+                    "sliding windows and attention sinks require the cuDNN graph backend"
+                )
             if (
                 pos_encoding_mode != "NONE"
-                or window_left != -1
                 or logits_soft_cap != 0
                 or self._custom_mask_buf is not None
                 or prefix_len_ptr is not None
             ):
                 raise NotImplementedError(
-                    "cuDNN ragged prefill supports only causal or full attention without "
-                    "position encoding, window_left, logits_soft_cap or custom masks"
+                    "cuDNN ragged prefill does not support position encoding, "
+                    "logits_soft_cap or custom masks"
                 )
             # The graph's padded dims default to the indptr diffs computed
             # above, and cuDNN reads cu_seq_lens as int32. Done once here so
@@ -6849,6 +6865,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             and lse_layout == "HN"
             and _CUDNN_NATIVE_HN_SUPPORTED
             and self._backend == "cudnn"
+            and window_left < 0
+            and getattr(self, "_sinks", None) is None
             and self._cudnn_plan is not None
             and self._cudnn_plan.metadata.causal == self._causal
             # Head-major Stats places tokens through the ragged offset; a plan
@@ -7164,12 +7182,6 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 raise NotImplementedError(
                     "cuDNN ragged prefill backend requires kv_layout='NHD'"
                 )
-            if getattr(self, "_sinks", None) is not None:
-                raise NotImplementedError(
-                    "attention sinks were set on the wrapper (_sinks) but the "
-                    "cuDNN ragged prefill backend does not consume them; plan() "
-                    "again (auto routes past cuDNN when sinks are set) or use fa2"
-                )
             if return_lse and self._cudnn_lse_unservable:
                 raise NotImplementedError(
                     "cuDNN < 9.27 mis-stores the ragged LSE for single-token "
@@ -7192,6 +7204,10 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             if (
                 plan is not None
                 and plan.metadata.causal == self._causal
+                # The prepared plan has no window or sink inputs. Build the
+                # requested feature graph through the public path below.
+                and window_left < 0
+                and getattr(self, "_sinks", None) is None
                 and q_scale is None
                 and k_scale is None
                 and v_scale is None
@@ -7264,6 +7280,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     out=out,
                     lse=lse,
                     o_data_type=out_dtype,
+                    window_left=(window_left if window_left >= 0 else None),
+                    sinks=getattr(self, "_sinks", None),
                 )
 
             # base already handled inside cudnn_batch_prefill_with_kv_cache

@@ -2882,6 +2882,115 @@ def test_fp8_h128_uniform_launch_takes_the_k64_sibling_at_its_floor(
     ]
 
 
+# (sparse_topk, compressed_page_size) of a topk4x, a topk128x and a SWA-only item.
+_SHORT_QUERY_ITEMS = {"topk4x": (1152, 64), "topk128x": (1152, 2), "swa": (128, 64)}
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("arch", [None, "sm_100a", "sm_103a", "sm_107a"])
+def test_sm107a_short_query_decode_keeps_the_uniform_route(arch):
+    """On SM107, FP8 H128 launches of at least 160 rows keep the uniform-gather
+    route (its K=64 sibling runs them) when their requests hold one query row
+    (at most 2 from 256 rows), or on topk4x items at most 4 (at most 8 from 256
+    rows); fewer rows, longer requests and the other architectures take the
+    lane-gather route from 128 rows."""
+    assert cake._FP8_PERSISTENT_SHORT_QUERY_UNIFORM == {
+        "sm_107a": ((160, 1, False), (256, 2, False), (160, 4, True), (256, 8, True))
+    }
+    for item, tokens, max_q_len, sm107_uniform in (
+        ("topk4x", 127, 8, True),
+        ("topk4x", 128, 1, False),
+        ("topk4x", 159, 4, False),
+        ("topk4x", 160, 1, True),
+        ("topk4x", 160, 4, True),
+        ("topk4x", 160, 5, False),
+        ("topk4x", 255, 8, False),
+        ("topk4x", 256, 8, True),
+        ("topk4x", 4096, 8, True),
+        ("topk4x", 4096, 9, False),
+        ("topk4x", 514, 257, False),
+        ("topk4x", 255, 2, True),
+        ("topk128x", 127, 4, True),
+        ("topk128x", 159, 1, False),
+        ("topk128x", 160, 1, True),
+        ("topk128x", 1024, 1, True),
+        ("topk128x", 255, 2, False),
+        ("topk128x", 256, 2, True),
+        ("topk128x", 1024, 3, False),
+        ("topk128x", 1024, 4, False),
+        ("swa", 160, 1, True),
+        ("swa", 160, 2, False),
+        ("swa", 4096, 2, True),
+        ("swa", 384, 4, False),
+    ):
+        sparse_topk, page_size = _SHORT_QUERY_ITEMS[item]
+        uniform = tokens < 128 or (arch == "sm_107a" and sm107_uniform)
+        expected = (
+            "fp8_h128_prefill_source_persistent_uniform"
+            if uniform
+            else "fp8_h128_prefill_source_persistent"
+        )
+        assert (
+            _route(
+                dtype=torch.float8_e4m3fn,
+                num_heads=128,
+                batch_size=max(1, tokens // max_q_len),
+                max_q_len=max_q_len,
+                ragged=True,
+                sparse_topk=sparse_topk,
+                compressed_page_size=page_size,
+                num_query_tokens=tokens,
+                sm_count=_SM_COUNT,
+                arch=arch,
+            )
+            == expected
+        ), (item, tokens, max_q_len)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize("tokens", [160, 1024])
+def test_sm107a_short_query_decode_runs_the_k64_sibling(tokens):
+    """The short-query launches the uniform route keeps on SM107 run its K=64
+    sibling over the same grid and partials, and need the workspace the
+    lane-gather route needs on the other architectures."""
+    route = "fp8_h128_prefill_source_persistent_uniform"
+    L = _RecordingLauncher(
+        "sm_107a",
+        num_query_tokens=tokens,
+        num_heads=128,
+        sparse_topk=1152,
+        max_q_len=4,
+        enable_pdl=True,
+    )
+    cake._dispatch_route(route, L)
+    assert L.calls == [
+        (
+            f"{route}_k64",
+            {"grid": (tokens * 2, 1, 1), "total_work_items": tokens, **L.partials(1)},
+        )
+    ]
+    shape = dict(
+        dtype=torch.float8_e4m3fn,
+        num_heads=128,
+        num_query_tokens=tokens,
+        sm_count=_SM_COUNT,
+        sparse_topk=1152,
+        compressed_page_size=64,
+        max_q_len=4,
+        batch_size=tokens // 4,
+        ragged=False,
+    )
+    short = cake.cake_dsv4_workspace_requirement(**shape, arch="sm_107a")
+    lane = cake.cake_dsv4_workspace_requirement(**shape, arch="sm_103a")
+    assert short.route == route
+    assert lane.route == "fp8_h128_prefill_source_persistent"
+    assert (short.single_launch_bytes, short.minimum_bytes, short.num_splits) == (
+        lane.single_launch_bytes,
+        lane.minimum_bytes,
+        lane.num_splits,
+    )
+
+
 # --------------------------------------------------------------------------- CAKE-957 / CAKE-939: query layout, route plan, row tiling
 _QUERY_LAYOUT_PLAN = (
     ("buffer", "seq_lens"),
@@ -3163,6 +3272,7 @@ def test_workspace_requirement_is_exact_per_route():
         max_q_len=1,
         batch_size=1024,
         ragged=False,
+        arch="sm_103a",
     )
     assert fp8.route == "fp8_h128_prefill_source_persistent" and fp8.num_splits == 1
     assert fp8.single_launch_bytes == cake._PARTIAL_OFFSET + 1024 * 128 * 4
