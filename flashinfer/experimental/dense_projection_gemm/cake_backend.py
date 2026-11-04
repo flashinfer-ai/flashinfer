@@ -48,10 +48,10 @@ Every entry point takes the keyword-only argument ``deterministic: bool = True``
     zeroed on the launch's stream first).  A forward partition gives every element at most two partials,
     ``0 + a + b == 0 + b + a``, so a forward recomputed under activation checkpointing gives the same logits and the
     same top-k;
-  - the K2 input gradient in the token windows of its rows in :data:`ROUTER_RULES` (:func:`router_simt`): an
-    exact-FP32 program on the CUDA cores, one FFMA per product of the FP32 operands read in place and every element of
-    ``out`` stored once (other bits than the deterministic program's BF16x3 emulation); every other row and token
-    count runs the deterministic program (one split).
+  - the K2 input gradient in the token windows of its rows in the router tables (:func:`router_rules`,
+    :func:`router_simt`): an exact-FP32 program on the CUDA cores, one FFMA per product of the FP32 operands read in
+    place and every element of ``out`` stored once (other bits than the deterministic program's BF16x3 emulation);
+    every other row and token count runs the deterministic program (one split).
 
   Every other operation -- the K1 forward and input gradient, the BF16x3 split -- runs the deterministic programs in
   both modes: it has no cross-CTA reduction to relax.  On the convenience path a call of ``deterministic=False`` that
@@ -1105,8 +1105,7 @@ class _VerdictTable(dict):
 #: entry was not measured: all of them run the deterministic program, and so does every window but a ``"waves"`` one on
 #: a device whose SM count is not the measured one, :data:`ROUTER_SM_COUNT`, unless :data:`ROUTER_RULES_BY_SM` has a
 #: table for that SM count.  A SIMT window comes first and may overlap the windows after it: on a device where the
-#: table's windows do not hold, the token count takes the next window that holds it (the ``"waves"`` window of hidden
-#: 5120 below 129 tokens, as before the SIMT windows).
+#: table's windows do not hold, the token count takes the next window that holds it.
 # fmt: off
 ROUTER_RULES: dict[
     tuple[str, str, int, int], Optional[Union[str, int, tuple[tuple[int, int, Union[str, int]], ...]]]
@@ -1116,54 +1115,43 @@ ROUTER_RULES: dict[
     ("sm_100a", "kk", 4096, 256): None, ("sm_100a", "kk", 5120, 256): None, ("sm_100a", "kk", 6144, 256): None,
     ("sm_103a", "kk", 4096, 256): None, ("sm_103a", "kk", 5120, 256): None, ("sm_103a", "kk", 6144, 256): None,
     ("sm_107a", "kk", 4096, 256): None, ("sm_107a", "kk", 5120, 256): None, ("sm_107a", "kk", 6144, 256): None,
-    # the weight gradient, measured on 152-SM GB200 (sm_100a) / GB300 (sm_103a) and 216-SM R200 (sm_107a) parts.
-    # Few tokens on sm_100a: the SIMT program (measured at 64, 128, 192, 224 and 256 tokens, alone, in the backward
-    # pass and in the checkpointed step), the 128 x 64 tile from 1 to 224 tokens at hidden 4096 (128 CTAs of 256
-    # threads, one wave on 152 SMs; at 256 tokens it was 6 to 12 % slower than the deterministic plan in CUDA graphs
-    # next to a resident kernel holding 32 SMs, which leaves 120 SMs for its 128 CTAs), the 64 x 64 tile from 1 to 256
-    # tokens at hidden 5120 and 6144 (320 and 384 CTAs of 128 threads; the 128 x 64 tile gives 160 and 192 CTAs
-    # there, more than one per SM, and was 20 to 26 % slower alone).
-    # Hidden 5120: "waves" at few tokens (faster than the deterministic plan at 64 and 128 tokens, and on sm_103a at
-    # 192; more than 3 % slower than it next to a resident kernel at every measured count from 224 to 10240 tokens;
-    # on 152-SM sm_100a parts the SIMT window before it takes these token counts),
-    # then the head/tail program with one head unit per CTA pair over half of the steps and three tail units per pair
-    # ("H0.5x3", 76 head and 228 tail units on 152 SMs; windows measured at 10240 and 12288 (sm_100a), 16172, 16231,
-    # 16384 and 32768 tokens; more than 3 % slower next to a resident kernel at 8192 tokens on sm_100a, at 10240 and
-    # 12288 on sm_103a; a later sm_103a measurement passed at 10240 on two parts, between misses at 8192 and 12288, so
-    # 10240 was not added).
-    # Hidden 4096 on sm_100a: 44 head units, one per CTA pair left next to a kernel holding 32 SMs, each a pair's
-    # whole share of the steps, then five tail units per pair ("H1x5p44"; measured at 10240, 12288, 16172, 16231 and
-    # 16384 tokens; more than 3 % slower next to a resident kernel at 8192 tokens and, launched before it, at 32768).
-    # Hidden 4096 on sm_103a: "H1x4p44" (44 head units, then four tail units per CTA pair) from 20480 to 49152 tokens
-    # (measured at 20480, 24576, 32768 and 49152 tokens, each on four or five parts); up to 7 % slower than the
-    # deterministic plan next to a resident kernel at 8192 to 16384 tokens, and at 65536 the checkpointed step (two
-    # forwards and the backward pass) was up to 1.4 % slower.  Hidden 6144 on sm_103a: "H1x5p44" from 16172 to 20480
-    # tokens (measured at 16172, 16231, 16384 and 20480 tokens, each on four parts); up to 7.8 % slower next to a
-    # resident kernel at 8192 to 12288 tokens, the backward pass (input and weight gradient) no faster at 24576 and up
-    # to 2.3 % slower at 32768.  Hidden 6144 on sm_100a keeps the deterministic plan above its SIMT window: no
-    # partition was faster in every run in CUDA graphs.
+    # the weight gradient, measured on 152-SM GB200 (sm_100a) / GB300 (sm_103a) and 216-SM R200 (sm_107a) parts.  A
+    # window also keeps the FP64 error of the plan the row takes without it: for every seed (10 seeds per token count,
+    # at the first, the last and inner token counts of the window) a relative Frobenius error against FP64 of the
+    # exact operands, worst of 20 runs, at most 1.02 times that plan's.
+    # Hidden 5120 on sm_100a / sm_103a: "waves" at few tokens (faster than the deterministic plan at 64 and 128 tokens,
+    # and on sm_103a at 192; more than 3 % slower than it next to a resident kernel at every measured count from 224
+    # to 10240 tokens), on sm_103a up to 160 tokens: from 161 tokens (six K blocks, more (tile, K block) steps than
+    # units) its error was 1.026 to 1.040 times the deterministic plan's.
+    # Faster than the deterministic plan but with more error, so these rows run the deterministic plan: the SIMT
+    # program on 152-SM sm_100a parts (hidden 4096 from 1 to 224 tokens, hidden 5120 and 6144 from 1 to 256: 2.23 to
+    # 2.54 times the error of the plan without the window at 113 to 256 tokens, the FP32 products of each slice summed
+    # in one FFMA chain along the tokens); the head/tail program at hidden 4096 on sm_100a ("H1x5p44", 10240 to 16384
+    # tokens: 1.18 to 1.20 times) and on sm_103a ("H1x4p44", 20480 to 49152 tokens: 1.20 to 1.29 times), hidden 5120
+    # ("H0.5x3", sm_100a 10240 to 32768 tokens: up to 1.027 times at 10240 and 16384; sm_103a 16172 to 32768 tokens:
+    # up to 1.021 times at 24576) and hidden 6144 on sm_103a ("H1x5p44", 16172 to 20480 tokens: 1.35 to 1.40 times).
     # sm_107a: hidden 5120 "H0.5x4" (four tail units, 108 head and 432 tail units on 216 SMs; measured on two parts at
     # 16172, 16231 and 16384 tokens); hidden 4096 and 6144 keep the deterministic plan: at 4096 "H0.5x4" was up to
     # 7 % slower than that plan when a kernel holding 16 SMs on another stream started during it (the kernel takes SMs
     # the head spans wait for), at 6144 it left the backward pass no faster
-    ("sm_100a", "nn_t", 4096, 256): ((1, 224, "simt_n128m64s2"), (10240, 16384, "H1x5p44")),
-    ("sm_100a", "nn_t", 5120, 256): ((1, 256, "simt_n64m64s2"), (1, 128, "waves"), (10240, 32768, "H0.5x3")),
-    ("sm_100a", "nn_t", 6144, 256): ((1, 256, "simt_n64m64s2"),),
-    ("sm_103a", "nn_t", 4096, 256): ((20480, 49152, "H1x4p44"),),
-    ("sm_103a", "nn_t", 5120, 256): ((1, 192, "waves"), (16172, 32768, "H0.5x3")),
-    ("sm_103a", "nn_t", 6144, 256): ((16172, 20480, "H1x5p44"),),
+    ("sm_100a", "nn_t", 4096, 256): None,
+    ("sm_100a", "nn_t", 5120, 256): ((1, 128, "waves"),),
+    ("sm_100a", "nn_t", 6144, 256): None,
+    ("sm_103a", "nn_t", 4096, 256): None,
+    ("sm_103a", "nn_t", 5120, 256): ((1, 160, "waves"),),
+    ("sm_103a", "nn_t", 6144, 256): None,
     ("sm_107a", "nn_t", 4096, 256): None,
     ("sm_107a", "nn_t", 5120, 256): ((16172, 16384, "H0.5x4"),),
     ("sm_107a", "nn_t", 6144, 256): None,
     # the input gradient, measured on 152-SM GB200 (sm_100a) parts at 1, 17, 32, 64, 96 and 128 tokens at hidden 4096
-    # and 5120 and at 1, 17, 32 and 64 tokens at hidden 6144 (outside the windows: at 192 tokens, at 224 and 256 at
-    # hidden 4096 and at 128 at hidden 6144): the SIMT program with the 32 x 64 tile in four slices (128 threads, one
-    # CTA per 32 tokens and 64 hidden columns) up to 128 tokens at hidden 4096 and 5120 and up to 64 at hidden 6144;
-    # next to a resident kernel it was more than 3 % slower than the deterministic program from 192 tokens (from 128 at
-    # hidden 6144).  sm_103a and 216-SM sm_107a parts keep the deterministic program (not measured)
-    ("sm_100a", "kn", 4096, 256): ((1, 128, "simt_n64m32s4"),),
-    ("sm_100a", "kn", 5120, 256): ((1, 128, "simt_n64m32s4"),),
-    ("sm_100a", "kn", 6144, 256): ((1, 64, "simt_n64m32s4"),),
+    # and 5120 and at 1, 17, 32 and 64 tokens at hidden 6144: the SIMT program with the 32 x 64 tile in four slices was
+    # faster than the deterministic program up to 128 tokens at hidden 4096 and 5120 and up to 64 at hidden 6144, but
+    # its relative Frobenius error against FP64 was 1.66 to 2.07 times the deterministic program's (10 seeds per token
+    # count; the FP32 products of each slice summed in one FFMA chain), so these rows run the deterministic
+    # program.  sm_103a and 216-SM sm_107a parts keep the deterministic program (not measured)
+    ("sm_100a", "kn", 4096, 256): None,
+    ("sm_100a", "kn", 5120, 256): None,
+    ("sm_100a", "kn", 6144, 256): None,
 })
 # fmt: on
 #: The SM count the verdicts of :data:`ROUTER_RULES` were measured on, per architecture (152-SM GB200 / GB300, 216-SM
@@ -1181,16 +1169,14 @@ ROUTER_SM_COUNT: dict[str, int] = {"sm_100a": 152, "sm_103a": 152, "sm_107a": 21
 #: ``router_fp32_gemm_atomic_nn_t_ht_c3_nreg`` it was up to 9.2 % slower than the deterministic plan next to a resident
 #: kernel).  Hidden 4096 keeps the deterministic plan on both SM counts (on 212 SMs "H0.5x4" with the tensor-memory
 #: program was up to 6.2 % slower next to a resident kernel), as do hidden 6144 on 208 SMs and the forward, as on
-#: 216 SMs.  On 212 SMs every hidden size takes the SIMT program with the 128 x 64 tile, from 1 to 256 tokens at
-#: hidden 4096 and 5120 and from 1 to 192 tokens at hidden 6144 (measured at 64, 128, 192 and 256 tokens on 212-SM
-#: R200 parts; 128, 160 and 192 CTAs of 256 threads, one wave; at hidden 6144 and 256 tokens it was up to 12 % slower
-#: than the deterministic plan next to a resident kernel holding 32 SMs, which leaves 180 SMs for its 192 CTAs).
-#: A part's table may also hold rows :data:`ROUTER_RULES` has no entry for, measured on that SM count only: on 212 SMs
-#: the input gradient takes the SIMT program with the 32 x 64 tile in eight slices up to 64 tokens and the 64 x 64
-#: tile in four slices from 65 to 128 tokens at hidden 4096 and 5120 (256 threads each; measured on 212-SM R200 parts
-#: at 1, 17, 32, 64, 96 and 128 tokens at hidden 4096 and 5120 and at 1, 17, 32 and 64 tokens at hidden 6144, and at
-#: 192 tokens: from 192 tokens, from 128 at hidden 6144, more than 3 % slower than the deterministic program next to a
-#: resident kernel), up to 64 tokens at hidden 6144.
+#: 216 SMs.  The "H0.5x4" windows of 212 SMs keep the FP64 error rule of :data:`ROUTER_RULES` (0.94 to 0.98 times the
+#: deterministic plan's error at 16172, 16231 and 16384 tokens).  A part's table may also hold rows
+#: :data:`ROUTER_RULES` has no entry for, measured on that SM count only.  Faster than the deterministic plan but with
+#: more error, so these rows run the deterministic plan on 212 SMs: the weight gradient's SIMT program with the
+#: 128 x 64 tile (hidden 4096 and 5120 from 1 to 256 tokens, hidden 6144 from 1 to 192: 1.99 to 2.66 times the
+#: deterministic plan's error at 97 to 256 tokens) and the input gradient's SIMT programs (the 32 x 64 tile in eight
+#: slices up to 64 tokens and, at hidden 4096 and 5120, the 64 x 64 tile in four slices from 65 to 128 tokens: 1.30 to
+#: 1.86 times the deterministic program's error).
 # fmt: off
 ROUTER_RULES_BY_SM: dict[
     tuple[str, int],
@@ -1204,12 +1190,12 @@ ROUTER_RULES_BY_SM: dict[
     }),
     ("sm_107a", 212): _VerdictTable({
         ("sm_107a", "kk", 4096, 256): None, ("sm_107a", "kk", 5120, 256): None, ("sm_107a", "kk", 6144, 256): None,
-        ("sm_107a", "nn_t", 4096, 256): ((1, 256, "simt_n128m64s2"),),
-        ("sm_107a", "nn_t", 5120, 256): ((1, 256, "simt_n128m64s2"), (16172, 16384, "H0.5x4")),
-        ("sm_107a", "nn_t", 6144, 256): ((1, 192, "simt_n128m64s2"), (16172, 16384, "H0.5x4")),
-        ("sm_107a", "kn", 4096, 256): ((1, 64, "simt_n64m32s8"), (65, 128, "simt_n64m64s4")),
-        ("sm_107a", "kn", 5120, 256): ((1, 64, "simt_n64m32s8"), (65, 128, "simt_n64m64s4")),
-        ("sm_107a", "kn", 6144, 256): ((1, 64, "simt_n64m32s8"),),
+        ("sm_107a", "nn_t", 4096, 256): None,
+        ("sm_107a", "nn_t", 5120, 256): ((16172, 16384, "H0.5x4"),),
+        ("sm_107a", "nn_t", 6144, 256): ((16172, 16384, "H0.5x4"),),
+        ("sm_107a", "kn", 4096, 256): None,
+        ("sm_107a", "kn", 5120, 256): None,
+        ("sm_107a", "kn", 6144, 256): None,
     }),
 })
 # fmt: on
@@ -1219,8 +1205,9 @@ ROUTER_HEAD_TAIL_SUFFIX = "_ht_c3_nreg"
 #: The weight gradient's head/tail program of an architecture that runs another one than
 #: ``router_fp32_gemm_atomic_nn_t`` + :data:`ROUTER_HEAD_TAIL_SUFFIX`: on ``sm_103a``, the head/tail program with the
 #: BF16 parts of ``A`` in tensor memory (the same products, accumulators, partition and part segments; two TMEM chunk
-#: buffers, six slots of raw ``A`` tiles and six of ``B`` parts in shared memory).  ``sm_103a`` takes a head/tail
-#: partition only in the windows of :data:`ROUTER_RULES` on 152 SMs, where it was measured.
+#: buffers, six slots of raw ``A`` tiles and six of ``B`` parts in shared memory).  No window of :data:`ROUTER_RULES`
+#: gives ``sm_103a`` a head/tail partition (its windows on 152 SMs missed the accuracy rule there); a forced
+#: head/tail spec runs this program.
 ROUTER_HEAD_TAIL_TEMPLATES: dict[str, str] = {
     "sm_103a": "router_fp32_gemm_ts_r6p6_atomic_nn_t_ht_c2_nreg",
 }
