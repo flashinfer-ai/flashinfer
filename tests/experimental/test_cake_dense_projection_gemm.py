@@ -3838,6 +3838,7 @@ def _cpu_k1_launches(monkeypatch, arch="sm_103a"):
         cake_backend, "load_cake_dense_projection_gemm_module", lambda name, a: module
     )
     monkeypatch.setattr(cake_backend, "_ATOMIC_ARENAS", {})
+    monkeypatch.setattr(cake_backend, "_K1_STREAM_CONTEXTS", {})
     for cache in ("_K1_ATOMIC_CACHE", "_K1_DET_CACHE"):
         monkeypatch.setattr(cake_backend, cache, type(getattr(cake_backend, cache))())
     return module.entry
@@ -4090,6 +4091,83 @@ def test_k1_convenience_calls_cache_their_bindings(monkeypatch):
     ((_, atomic),) = cake_backend._K1_ATOMIC_CACHE.items()
     assert atomic.plan is not None and atomic.plan.splits == 2 and atomic.k1 is not None
     assert atomic.det_plan is None and atomic.arena is not None
+
+
+def test_k1_entry_points_go_from_their_key_to_the_bound_launch(monkeypatch):
+    """Once a key is bound, the K1 entry points with ``deterministic=False`` launch it straight from the key
+    (``_k1_cached_launch``): neither ``_det_k1`` nor ``_atomic_k1`` runs, and the launch gets the arguments their
+    launch of the key gets. An ``out`` of the same geometry is the same key and launches into itself; another geometry
+    is another key and takes the planning path. Each thread makes the stream context of a (device, stream) once and
+    reuses it."""
+    entry_fn = _cpu_k1_launches(monkeypatch, "sm_103a")
+    monkeypatch.setattr(cake_backend, "_k1_index", lambda *views: 0)
+    made = []
+
+    def stream_context(index, raw=None):
+        made.append((threading.get_ident(), index, raw))
+        return contextlib.nullcontext()
+
+    monkeypatch.setattr(det_backend, "_ffi_stream_context", stream_context)
+    bf16, T = torch.bfloat16, 1000
+    X, W, G = (
+        torch.empty(T, 4096, dtype=bf16),
+        torch.empty(128, 4096, dtype=bf16),
+        torch.empty(T, 128, dtype=bf16),
+    )
+    out_f, out_d, out_w = (
+        torch.empty(T, 128, dtype=bf16),
+        torch.empty(T, 4096, dtype=bf16),
+        torch.empty(128, 4096),
+    )
+
+    def calls():
+        assert (
+            cake_backend.projection_forward(X, W, out_f, deterministic=False) is out_f
+        )
+        assert cake_backend.projection_dgrad(G, W, out_d, deterministic=False) is out_d
+        assert cake_backend.projection_wgrad(G, X, out_w, deterministic=False) is out_w
+
+    def spelled(args):
+        return [
+            (a.data_ptr(), tuple(a.shape), a.stride(), a.dtype)
+            if isinstance(a, torch.Tensor)
+            else a
+            for a in args
+        ]
+
+    # the first round plans and grows the arena; the second takes the planning path's cached launches
+    calls()
+    cached_launch = cake_backend._k1_cached_launch
+    monkeypatch.setattr(cake_backend, "_k1_cached_launch", lambda *args: False)
+    entry_fn.calls.clear()
+    calls()
+    planned = [spelled(args) for args, _ in entry_fn.calls]
+    assert len(planned) == 3 and len(made) == 1
+
+    def planning_path(*args, **kwargs):
+        raise AssertionError("planning path")
+
+    monkeypatch.setattr(cake_backend, "_k1_cached_launch", cached_launch)
+    monkeypatch.setattr(cake_backend, "_det_k1", planning_path)
+    monkeypatch.setattr(cake_backend, "_atomic_k1", planning_path)
+    entry_fn.calls.clear()
+    calls()
+    assert [spelled(args) for args, _ in entry_fn.calls] == planned
+    assert len(made) == 1
+    other = torch.empty_like(out_f)
+    assert cake_backend.projection_forward(X, W, other, deterministic=False) is other
+    (args, _) = entry_fn.calls[-1]
+    pointers = {a.data_ptr() for a in args if isinstance(a, torch.Tensor)}
+    assert other.data_ptr() in pointers and out_f.data_ptr() not in pointers
+    with pytest.raises(AssertionError, match="planning path"):
+        cake_backend.projection_forward(X[:999], W, out_f[:999], deterministic=False)
+    # another thread makes its own context of the same (device, stream)
+    entry_fn.calls.clear()
+    worker = threading.Thread(target=calls)
+    worker.start()
+    worker.join()
+    assert len(entry_fn.calls) == 3 and len(made) == 2 and made[0][0] != made[1][0]
+    assert made[0][1:] == made[1][1:] == (0, 0)
 
 
 def test_k1_sm107a_wide_fp32_rows_bind_per_token_count(monkeypatch):
