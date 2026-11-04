@@ -336,6 +336,24 @@ def test_walk_pair_knob_defaults_to_auto() -> None:
         make_options(walk_pair=1)  # a test knob, never a public option
 
 
+@pytest.mark.parametrize("knob", ("fused_o", "fused_o_tape"))
+def test_output_walk_knobs_default_to_the_shipped_walks(knob: str) -> None:
+    """``fused_o`` (the light forward's output walk) and ``fused_o_tape`` (the ``save_mode="full"`` forward's
+    tape-and-output walk) are private levers: 1 (shipped) or 0 (the split tape walk and #5), part of the options key
+    (a captured graph of one form never replays for the other), never public options."""
+    assert opt.TEST_KNOBS[knob] == (0, 1)
+    assert opt.TEST_KNOB_DEFAULTS[knob] == 1
+    assert make_options().knob(knob) == 1
+    assert make_options(test_knobs={knob: 0}).knob(knob) == 0
+    for bad in (2, -1, True, False, None, "1"):
+        with pytest.raises(ValueError):
+            make_options(test_knobs={knob: bad})
+    keys = {make_options(test_knobs={knob: v}).key() for v in (0, 1)}
+    assert len(keys) == 2
+    with pytest.raises(TypeError):
+        make_options(**{knob: 0})  # a test knob, never a public option
+
+
 @pytest.mark.parametrize(
     "knob, layout, world, capability, on",
     [
@@ -1626,6 +1644,7 @@ def test_program_vocabulary_is_the_design_list() -> None:
         "kcp_fwdh_offset",
         "kcp_fwdh_tape",
         "kcp_fwdh_out",
+        "kcp_fwdh_out_tape",
         "kcp_transfer_walk",
         "kcp_affine_merge",
         "fwd_o",
@@ -1650,10 +1669,11 @@ def test_program_vocabulary_is_the_design_list() -> None:
     assert (
         kcp.TART_MODULE_OF["kcp_affine_merge"] == "kda_chunk_kcp_affine_merge_fp32_v1"
     )  # reused verbatim
-    # the output walk is this package's own program: a det-neutral module that no deterministic twin ships
+    # the output walks are this package's own programs: det-neutral modules that no deterministic twin ships
     assert kcp.TART_MODULE_OF["kcp_fwdh_out"] == "gdn_chunk_fwdh_out_v1_kcp"
+    assert kcp.TART_MODULE_OF["kcp_fwdh_out_tape"] == "gdn_chunk_fwdh_out_tape_v1_kcp"
     for name, module in kcp.TART_MODULE_OF.items():
-        if name not in ("kcp_affine_merge", "kcp_fwdh_out"):
+        if name not in ("kcp_affine_merge", "kcp_fwdh_out", "kcp_fwdh_out_tape"):
             # the other programs' kernel modules are, so far, the deterministic family's (provenance stems; a lever
             # that replaces a program updates this line)
             assert module.startswith("gdn_chunk_det_"), (name, module)
@@ -1683,6 +1703,7 @@ def test_program_vocabulary_is_the_design_list() -> None:
     for prog in (
         "kcp_fwdh_offset",
         "kcp_fwdh_out",
+        "kcp_fwdh_out_tape",
         "kcp_transfer_walk",
         "kcp_dhu_offset",
     ):
@@ -1712,6 +1733,13 @@ def test_program_vocabulary_is_the_design_list() -> None:
     assert {"q", "aqk", "qscale", "o", "h0", "h0_index"} <= set(fused)
     assert not {"h_tape", "v_new", "out", "out_index", "ticket"} & set(fused)
     assert set(fused) - {"q", "aqk", "qscale", "o"} <= set(
+        kcp.PROGRAM_ARGS["kcp_fwdh_tape"]
+    )
+    # the tape-and-output walk: the output walk's arguments and the tape walk's h / v_new tapes, no final-state pool
+    fused_tape = kcp.PROGRAM_ARGS["kcp_fwdh_out_tape"]
+    assert set(fused_tape) == set(fused) | {"h_tape", "v_new"}
+    assert not {"out", "out_index", "ticket"} & set(fused_tape)
+    assert set(fused_tape) - {"q", "aqk", "qscale", "o"} <= set(
         kcp.PROGRAM_ARGS["kcp_fwdh_tape"]
     )
     assert (
@@ -1781,7 +1809,12 @@ def test_fwdh_form_rule_follows_the_chain_clause() -> None:
     vh = 128; the test knob ``fwdh_vh`` forces a form (the two forms are within the same accuracy budget; the
     fake-backend suite checks it)."""
     kcp = _mod("cake_kcp")
-    assert kcp.FWDH_PROGRAMS == ("kcp_fwdh_offset", "kcp_fwdh_tape", "kcp_fwdh_out")
+    assert kcp.FWDH_PROGRAMS == (
+        "kcp_fwdh_offset",
+        "kcp_fwdh_tape",
+        "kcp_fwdh_out",
+        "kcp_fwdh_out_tape",
+    )
     assert kcp.fwdh_vh(3, 48, 152) == 64  # 144 head-CTAs <= 152 SMs (GB300)
     assert kcp.fwdh_vh(4, 48, 152) == 128  # 192 > 152, no chain clause
     assert kcp.fwdh_vh(4, 48, 152, fits=True) == 64
@@ -2083,6 +2116,7 @@ def test_host_tables_build_on_the_cpu_for_every_rank(row) -> None:
             "kcp_fwdh_offset",
             "kcp_fwdh_tape",
             "kcp_fwdh_out",
+            "kcp_fwdh_out_tape",
             "kcp_transfer_walk",
             "kcp_affine_merge",
             "fwd_o",
