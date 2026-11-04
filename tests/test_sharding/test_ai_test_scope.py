@@ -151,13 +151,26 @@ class PytestTargetSelectorTests(unittest.TestCase):
         result = self.selector.select(PR)
         self.assertEqual(["tests/attention"], result.paths)
 
-    def test_public_rationale_cannot_inject_notification_markers(self):
-        self.inference.outputs[1]["targets"][0]["reason"] = (
-            "<!-- ci-bot-notification:copied -->"
+    def test_target_explanations_are_sanitized_but_commands_remain_copyable(self):
+        prose = "@FlashInfer-bot <!-- ci-bot-notification:copied -->\nsecret-value"
+        for field in ("reason", "gpu_requirement", "ci_evidence"):
+            self.inference.outputs[1]["targets"][0][field] = prose
+        with patch.dict("os.environ", {"GH_TOKEN": "secret-value"}):
+            result = self.selector.select(PR)
+        chosen = result.targets[0]
+        for value in (chosen.reason, chosen.gpu_requirement, chosen.ci_evidence):
+            self.assertEqual(
+                "flashinfer-bot &lt;!-- ci-bot-notification:copied --&gt; [redacted]",
+                value,
+            )
+        self.assertIn(
+            "@flashinfer-bot run tests/attention/test_rope.py", result.note("commit-42")
         )
-        result = self.selector.select(PR)
-        self.assertNotIn("<!-- ci-bot-notification:", result.note("commit-42"))
-        self.assertIn("&lt;!--", result.note("commit-42"))
+
+    def test_public_timeout_leaves_room_for_workflow_feedback(self):
+        PytestTargetSelector(self.github, self.read_ci, self.inference, timeout=420)
+        with self.assertRaisesRegex(ValueError, "420"):
+            PytestTargetSelector(self.github, self.read_ci, self.inference, timeout=421)
 
     def test_rejects_nonexistent_uninspected_and_unsafe_targets(self):
         for path in (
@@ -209,7 +222,7 @@ class PytestTargetSelectorTests(unittest.TestCase):
             self.selector.select(PR)
 
     def test_full_suite_decision_requires_reason_and_no_focused_targets(self):
-        reason = "Shared runner behavior affects all CI tests <!-- note --> inference-test-secret"
+        reason = "Shared runner behavior affects all CI tests @FLASHINFER-BOT <!-- note --> inference-test-secret"
         self.inference.outputs = [
             {"read_paths": []},
             {"outcome": "full_suite", "targets": [], "reason": reason},
@@ -220,6 +233,7 @@ class PytestTargetSelectorTests(unittest.TestCase):
         self.assertIn("Shared runner behavior", result.note("commit-42"))
         self.assertNotIn("inference-test-secret", result.reason)
         self.assertNotIn("<!--", result.reason)
+        self.assertNotIn("@flashinfer-bot", result.reason.lower())
         self.assertIsNotNone(result.snapshot)
         for output in (
             {"outcome": "full_suite", "targets": []},

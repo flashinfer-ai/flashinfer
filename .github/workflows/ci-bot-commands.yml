@@ -27,6 +27,7 @@ jobs:
     # authoritative match and every handler step is gated on its output.
     if: |
       github.event.issue.pull_request &&
+      github.event.comment.user.login != 'flashinfer-bot' &&
       contains(github.event.comment.body, '@flashinfer-bot')
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -56,7 +57,7 @@ jobs:
           fi
 
           ROLE_ERROR="$RUNNER_TEMP/role-error"
-          if ! ROLE=$(gh api \
+          if ! ROLE=$(timeout --kill-after=5s 15s gh api \
             -H "Accept: application/vnd.github+json" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
             "/repos/${REPO}/collaborators/${ACTOR}/permission" \
@@ -81,7 +82,7 @@ jobs:
           esac
 
           # List team members and check if commenter is in the list
-          MEMBERS=$(gh api \
+          MEMBERS=$(timeout --kill-after=5s 15s gh api \
             -H "Accept: application/vnd.github+json" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
             --paginate \
@@ -177,6 +178,8 @@ jobs:
         run: |
           # Run only the trusted default-branch helper. It reads PR objects through the
           # API and an isolated merge; selection never executes PR code.
+          # Bound GitHub operations so a stalled request leaves time for feedback.
+          bounded_gh() { timeout --kill-after=5s 15s gh "$@"; }
           SCOPE_RESULT="$RUNNER_TEMP/ci-bot-scope.json"
           SCOPE_NOTE="$RUNNER_TEMP/ci-bot-scope.md"
           reject() {
@@ -185,15 +188,18 @@ jobs:
             elif [ ! -s "$SCOPE_NOTE" ]; then
               printf '%s\n' 'No CI pipeline was started because test targets could not be selected or validated. Review and specify paths with `run tests/<dir-or-file>` or use `run all` for the full suite.' > "$SCOPE_NOTE"
             fi
-            gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body-file "$SCOPE_NOTE" \
+            bounded_gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body-file "$SCOPE_NOTE" \
               || echo "warning: could not post rejection note"
-            gh api -X POST "/repos/$GITHUB_REPOSITORY/issues/comments/$COMMENT_ID/reactions" \
+            bounded_gh api -X POST "/repos/$GITHUB_REPOSITORY/issues/comments/$COMMENT_ID/reactions" \
               -f content=confused > /dev/null || echo "warning: could not react"
             echo "Scope rejected; run-ci not applied."
             exit 0
           }
 
-          if ! GH_TOKEN="$STATUS_TOKEN" python3 scripts/pr_checks/ai_test_scope.py \
+          # Includes the initial PR lookup and cleanup around the 420-second
+          # selection cap; leave time within the ten-minute job for feedback.
+          if ! timeout --kill-after=5s 450s env GH_TOKEN="$STATUS_TOKEN" \
+              python3 scripts/pr_checks/ai_test_scope.py \
               --repo "$GITHUB_REPOSITORY" --pr "$PR_NUMBER" \
               --command-file "$RUNNER_TEMP/ci-bot-run-command.txt" \
               --output "$SCOPE_RESULT" --note "$SCOPE_NOTE"; then
@@ -203,8 +209,9 @@ jobs:
           HEAD_SHA=$(jq -er '.head_sha' "$SCOPE_RESULT")
           MODE=$(jq -er '.mode' "$SCOPE_RESULT")
           if [ "$MODE" = advisory ]; then
-            gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body-file "$SCOPE_NOTE"
-            gh api -X POST "/repos/$GITHUB_REPOSITORY/issues/comments/$COMMENT_ID/reactions" \
+            bounded_gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body-file "$SCOPE_NOTE" \
+              || reject "The AI recommendation could not be posted. No CI pipeline was started; retry the command."
+            bounded_gh api -X POST "/repos/$GITHUB_REPOSITORY/issues/comments/$COMMENT_ID/reactions" \
               -f content='+1' > /dev/null || echo "warning: could not react"
             echo "AI recommendation posted; no CI pipeline was started."
             exit 0
@@ -244,14 +251,14 @@ jobs:
 
           # Clear every previous trailing chunk. Failure must not resurrect stale targets
           # or replace a requested scope with a full run, so publication is fail-closed.
-          if ! PREV_MAX=$(GH_TOKEN="$STATUS_TOKEN" gh api \
+          if ! PREV_MAX=$(GH_TOKEN="$STATUS_TOKEN" bounded_gh api \
               "/repos/$GITHUB_REPOSITORY/commits/$HEAD_SHA/status" \
               --jq '[.statuses[].context | select(test("^ci/test-scope-[0-9]+$"))
                 | sub("^ci/test-scope-"; "") | tonumber] | max // 0'); then
             reject "No CI pipeline was started: the previous scope could not be read. Retry the command."
           fi
           publish_status() {
-            GH_TOKEN="$STATUS_TOKEN" gh api -X POST "/repos/$GITHUB_REPOSITORY/statuses/$HEAD_SHA" \
+            GH_TOKEN="$STATUS_TOKEN" bounded_gh api -X POST "/repos/$GITHUB_REPOSITORY/statuses/$HEAD_SHA" \
               -f state=success -f context="$1" -f description="$2" \
               -f target_url="$COMMENT_URL" > /dev/null
           }
@@ -269,13 +276,15 @@ jobs:
           publish_status "ci/test-snapshot" "$SNAPSHOT_DESC" \
             || reject "No CI pipeline was started: the merge snapshot could not be published. Retry the command."
 
-          CURRENT_SHA=$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid -q .headRefOid)
+          if ! CURRENT_SHA=$(bounded_gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid -q .headRefOid); then
+            reject "No CI pipeline was started: the current PR head could not be verified. Retry the command."
+          fi
           if [ "$CURRENT_SHA" != "$HEAD_SHA" ]; then
             reject "The PR changed while its test scope was prepared. No CI pipeline was started; retry the command."
           fi
           if [ "$MODE" = automatic ]; then
-            if ! BASE_REF=$(gh api --method GET "/repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq '.base.ref | @uri') \
-                || ! CURRENT_BASE=$(gh api --method GET "/repos/$GITHUB_REPOSITORY/git/ref/heads/$BASE_REF" --jq .object.sha); then
+            if ! BASE_REF=$(bounded_gh api --method GET "/repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq '.base.ref | @uri') \
+                || ! CURRENT_BASE=$(bounded_gh api --method GET "/repos/$GITHUB_REPOSITORY/git/ref/heads/$BASE_REF" --jq .object.sha); then
               reject "No CI pipeline was started: the current base branch could not be verified. Retry the command."
             fi
             read -r SELECTED_BASE SELECTED_MERGE SELECTED_TREE SELECTED_SCOPE <<< "$SNAPSHOT_DESC"
@@ -283,17 +292,21 @@ jobs:
               reject "The PR base changed while its test scope was prepared. No CI pipeline was started; retry the command."
             fi
           fi
-          HAS_RUN_CI=$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
-            --json labels -q "[.labels[].name] | index(\"$RUN_LABEL\") != null")
-          if [ "$HAS_RUN_CI" = true ]; then
-            gh pr edit "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --remove-label "$RUN_LABEL"
+          if ! HAS_RUN_CI=$(bounded_gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" \
+              --json labels -q "[.labels[].name] | index(\"$RUN_LABEL\") != null"); then
+            reject "No CI pipeline was started: the current CI label could not be read. Retry the command."
           fi
-          gh pr edit "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --add-label "$RUN_LABEL"
+          if [ "$HAS_RUN_CI" = true ]; then
+            bounded_gh pr edit "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --remove-label "$RUN_LABEL" \
+              || reject "No new CI pipeline was started: the previous CI label could not be removed. Retry the command."
+          fi
+          bounded_gh pr edit "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --add-label "$RUN_LABEL" \
+            || reject "The CI label request failed; check the PR's runs before retrying the command."
           if [ "$MODE" = automatic ]; then
-            gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body-file "$SCOPE_NOTE" \
+            bounded_gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --body-file "$SCOPE_NOTE" \
               || echo "warning: could not post the selected-target explanation"
           fi
-          gh api -X POST "/repos/$GITHUB_REPOSITORY/issues/comments/$COMMENT_ID/reactions" \
+          bounded_gh api -X POST "/repos/$GITHUB_REPOSITORY/issues/comments/$COMMENT_ID/reactions" \
             -f content='+1' > /dev/null || echo "warning: could not react"
           echo "CI started with $MODE scope on $HEAD_SHA"
 

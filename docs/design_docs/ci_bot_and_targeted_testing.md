@@ -116,6 +116,10 @@ be merged and exercised directly.
 **The handler uses the first unfenced command line.** Quoted replies, code fences,
 inline code and mentions embedded in prose do not issue commands. This also keeps
 the inline example command in an AI recommendation from starting another run.
+The job guard excludes comments by `flashinfer-bot`, the account used by
+`FLASHINFER_BOT_TOKEN`, before checkout and permission checks. Keep that guard in
+sync if the posting account changes. Generated replies retain copyable commands;
+model explanations and validation errors remove bot mentions without regard to case.
 
 **A narrowed run is not a full run.** The GPU lanes change name and the summary states the
 scope, but the required check reports success either way. Green on a narrowed run means
@@ -127,6 +131,8 @@ Bare `run` asks NVIDIA Inference Hub for a recommendation using the current targ
 branch merged with the pinned PR head. The trusted selector reads that isolated
 tree, inspected test bodies, and current CI routing; it never imports, collects or
 executes PR code. Source hooks and external Git configuration are disabled.
+Recommendations are available through authorized comments on PRs; opening or
+updating a PR alone does not request an AI recommendation.
 
 The two model calls request evidence files, then a structured decision:
 `selected` (up to ten focused targets), `full_suite`, `no_pytest_change`, or
@@ -156,3 +162,10 @@ preparation. An advancing base after a run still requires a new CI request.
 The inference key is an Actions secret available only to the authorized command
 step. Model and endpoint are repository variables; explicit commands need no
 inference key. See CONTRIBUTING.md for names and defaults.
+
+The public selector accepts at most 420 seconds. Its helper has a 450-second
+outer limit, including the initial lookup and cleanup. GitHub CLI calls are
+bounded to 15 seconds each, with a five-second forced-termination grace period.
+A helper timeout follows the rejection path before publishing statuses or
+applying a CI label. Feedback still depends on GitHub availability and the runner
+remaining alive within the ten-minute job limit.

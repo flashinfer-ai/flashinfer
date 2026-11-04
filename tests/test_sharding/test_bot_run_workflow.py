@@ -241,7 +241,12 @@ if '--body-file' in args:
 with open(os.environ['CALL_LOG'], 'a') as output:
     output.write(json.dumps(args) + '\n')
 if args[:2] == ['pr', 'view']:
+    if os.getenv('HEAD_READ_FAIL') and 'headRefOid' in args: sys.exit(124)
+    if os.getenv('LABEL_READ_FAIL') and 'labels' in args: sys.exit(124)
     print(('head-B' if os.getenv('HEAD_MOVED') else 'head-A') if 'headRefOid' in args else 'true')
+elif args[:2] == ['pr', 'edit']:
+    if os.getenv('LABEL_REMOVE_FAIL') and '--remove-label' in args: sys.exit(124)
+    if os.getenv('LABEL_ADD_FAIL') and '--add-label' in args: sys.exit(124)
 elif args[:1] == ['api'] and any('/pulls/' in arg for arg in args):
     print('main')
 elif args[:1] == ['api'] and any('/git/ref/' in arg for arg in args):
@@ -259,6 +264,9 @@ args = sys.argv[1:]
 def arg(name): return args[args.index(name) + 1]
 command = Path(arg('--command-file')).read_text()
 Path(os.environ['SEEN_COMMAND']).write_text(command)
+if os.getenv('SELECT_TIMEOUT'):
+    import time
+    time.sleep(10)
 if os.getenv('SELECT_FAIL'):
     if os.getenv('FAIL_NOTE'): Path(arg('--note')).write_text(os.environ['FAIL_NOTE'])
     sys.exit(1)
@@ -348,7 +356,12 @@ class BotWorkflowTests(unittest.TestCase):
                 self.assertEqual("command=unknown\n", output.read_text())
                 self.assertFalse((directory / "ci-bot-run-command.txt").exists())
 
-    def run_workflow(self, command="@flashinfer-bot run", **settings):
+    def run_workflow(
+        self,
+        command="@flashinfer-bot run",
+        helper_timeout=None,
+        **settings,
+    ):
         with tempfile.TemporaryDirectory() as directory:
             directory = Path(directory)
             for name, content in [("gh", FAKE_GH), ("python3", FAKE_PYTHON)]:
@@ -381,8 +394,11 @@ class BotWorkflowTests(unittest.TestCase):
                 text=True,
             )
             self.assertEqual(0, parsed.returncode, parsed.stderr)
+            handler = step("Handle @flashinfer-bot run")
+            if helper_timeout is not None:
+                handler = handler.replace("450s", helper_timeout)
             body = subprocess.run(
-                ["bash", "-euo", "pipefail", "-c", step("Handle @flashinfer-bot run")],
+                ["bash", "-euo", "pipefail", "-c", handler],
                 env=env,
                 capture_output=True,
                 text=True,
@@ -451,11 +467,28 @@ class BotWorkflowTests(unittest.TestCase):
             "SNAPSHOT_FAIL",
             "BAD_SNAPSHOT",
             "AUTOMATIC_PATHS",
+            "HEAD_READ_FAIL",
+            "LABEL_READ_FAIL",
+            "LABEL_REMOVE_FAIL",
         ):
             with self.subTest(setting=setting):
                 calls, _ = self.run_workflow(**{setting: "1"})
                 self.assertFalse(any("--add-label" in args for args in calls))
                 self.assertTrue(any("content=confused" in args for args in calls))
+
+    def test_helper_timeout_posts_rejection_without_starting_ci(self):
+        calls, _ = self.run_workflow(helper_timeout="1s", SELECT_TIMEOUT="1")
+        self.assertFalse(any("--add-label" in args for args in calls))
+        self.assertFalse(any("/statuses/" in arg for args in calls for arg in args))
+        self.assertTrue(any("content=confused" in args for args in calls))
+        comment = next(args for args in calls if args[:2] == ["pr", "comment"])
+        self.assertTrue(any("No CI pipeline was started" in arg for arg in comment))
+
+    def test_failed_label_request_reports_uncertainty_instead_of_claiming_no_run(self):
+        calls, _ = self.run_workflow(LABEL_ADD_FAIL="1")
+        comment = next(args for args in calls if args[:2] == ["pr", "comment"])
+        self.assertTrue(any("check the PR's runs" in arg for arg in comment))
+        self.assertTrue(any("content=confused" in args for args in calls))
 
     def test_rejection_preserves_helper_feedback_and_has_a_fallback(self):
         for note in ("Rejected: pytest ::selectors are not supported.", ""):
@@ -480,6 +513,8 @@ class BotWorkflowTests(unittest.TestCase):
         self.assertTrue(any("--add-label" in args for args in calls))
 
     def test_key_is_only_exposed_to_the_authorized_run_step(self):
+        job_guard = WORKFLOW_TEXT.split("    if: |\n", 1)[1].split("    runs-on:", 1)[0]
+        self.assertIn("github.event.comment.user.login != 'flashinfer-bot'", job_guard)
         handler = step_block("Handle @flashinfer-bot run")
         self.assertIn("authorized == 'true'", handler)
         self.assertIn("INFERENCE_API_KEY: ${{ secrets.INFERENCE_API_KEY }}", handler)

@@ -102,6 +102,13 @@ def _redact_credentials(text, secrets=()):
     return text
 
 
+def _public_prose(text, secrets=(), limit=500):
+    """Sanitize untrusted explanations without changing generated command examples."""
+    text = _redact_credentials(text, secrets)
+    text = re.sub(r"@flashinfer-bot", "flashinfer-bot", text, flags=re.I)
+    return html.escape(" ".join(text.split()), quote=False)[:limit]
+
+
 class TargetSelectionError(Exception):
     """No automatic run is safe; an explicit maintainer scope is required."""
 
@@ -450,8 +457,8 @@ class PytestTargetSelector:
             if timeout is not None
             else float(os.getenv("CI_BOT_TARGET_TIMEOUT_SECONDS") or "240")
         )
-        if not 0 < self.timeout <= 1800:
-            raise ValueError("CI_BOT_TARGET_TIMEOUT_SECONDS must be between 0 and 1800")
+        if not 0 < self.timeout <= 420:
+            raise ValueError("CI_BOT_TARGET_TIMEOUT_SECONDS must be between 0 and 420")
 
     def select(self, pr):
         if not self.inference.api_key:
@@ -623,6 +630,12 @@ class PytestTargetSelector:
                 continue
             inspect(path)
         result = infer(SELECTION_PROMPT)
+        secrets = (
+            os.getenv("GH_TOKEN"),
+            os.getenv("GITHUB_TOKEN"),
+            os.getenv("INFERENCE_API_KEY"),
+            self.inference.api_key,
+        )
         outcome, raw = result.get("outcome"), result.get("targets")
         if outcome not in (
             "selected",
@@ -637,16 +650,7 @@ class PytestTargetSelector:
             reason = result.get("reason")
             if not isinstance(reason, str) or not reason.strip():
                 raise TargetSelectionError("AI decision is missing its explanation")
-            reason = _redact_credentials(
-                reason,
-                (
-                    os.getenv("GH_TOKEN"),
-                    os.getenv("INFERENCE_API_KEY"),
-                    self.inference.api_key,
-                ),
-            )
-            reason = re.sub(r"@flashinfer-bot", "flashinfer-bot", reason, flags=re.I)
-            reason = html.escape(" ".join(reason.split()), quote=False)[:500]
+            reason = _public_prose(reason, secrets)
             return TargetSelection([], outcome, snapshot, reason)
         if not 1 <= len(raw) <= MAX_TARGETS:
             raise TargetSelectionError("AI must select between one and ten targets")
@@ -681,14 +685,7 @@ class PytestTargetSelector:
                         "AI target is missing applicability or CI execution evidence"
                     )
                 # Reasons are public prose, never HTML/comments or notification markers.
-                fields.append(
-                    html.escape(
-                        " ".join(value.split()).replace(
-                            "@flashinfer-bot", "flashinfer-bot"
-                        ),
-                        quote=False,
-                    )[:500]
-                )
+                fields.append(_public_prose(value, secrets))
             if normalized not in [target.path for target in targets]:
                 targets.append(PytestTarget(normalized, *fields))
         # A directory already covers its descendant files; preserve rationale order.
@@ -791,11 +788,11 @@ def main(argv=None):
         # Collapse whitespace and suppress mentions so supplied paths cannot add
         # command lines or trigger another bot workflow. Model/API errors stay private.
         if isinstance(error, ManualScopeError):
-            detail = _redact_credentials(
-                str(error), (os.getenv("GH_TOKEN"), os.getenv("INFERENCE_API_KEY"))
+            detail = _public_prose(
+                str(error),
+                (os.getenv("GH_TOKEN"), os.getenv("INFERENCE_API_KEY")),
+                limit=1000,
             )
-            detail = re.sub(r"@flashinfer-bot", "flashinfer-bot", detail, flags=re.I)
-            detail = html.escape(" ".join(detail.split())[:1000], quote=False)
             note = f"No CI pipeline was started: not a valid test scope -- {detail}. "
         else:
             note = "No CI pipeline was started because the requested test scope could not be prepared. "

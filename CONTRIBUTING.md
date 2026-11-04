@@ -175,8 +175,9 @@ Actions secret entitled to the selected NVIDIA Inference Hub model. Optional
 Actions variables are `INFERENCE_BASE_URL` (default
 `https://inference-api.nvidia.com/v1`), `CI_BOT_TARGET_MODEL` (default
 `us/aws/anthropic/eccn-claude-opus-5`), and
-`CI_BOT_TARGET_TIMEOUT_SECONDS` (default `240`, maximum `1800`; the command job
-also has a ten-minute timeout). Explicit paths and `run all` need no AI key.
+`CI_BOT_TARGET_TIMEOUT_SECONDS` (default `240`, maximum `420`). The public
+command job has a ten-minute limit; the internal daemon's timeout is independent.
+Explicit paths and `run all` need no AI key.
 The selector uses Git, Python's standard library and two bounded JSON model calls,
 matching the Inference Hub integration used by the cuDNN frontend triage job.
 Only the authorized command step receives the inference key. The endpoint must be
