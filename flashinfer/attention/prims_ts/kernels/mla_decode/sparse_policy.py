@@ -672,7 +672,12 @@ def resolve_sparse_mla_profile(
         keep = heads > 16
         d512_nvfp4 = kv_cache_format == "nvfp4" and rope_dim == 0
         min_split_tiles = 1 if d512_nvfp4 else 2
-        split_limit = min(capacity // 128 // min_split_tiles, max(1, sm_count // rows))
+        tiles = capacity // 128
+        split_limit = min(tiles // min_split_tiles, max(1, sm_count // rows))
+        if not keep:
+            # Every Swap-AB split needs a second tile for its steady-state loop:
+            # fewer splits than tiles (H16 top-k 512 takes two, not four).
+            split_limit = min(split_limit, tiles - 1)
         splits = 1 if persistent else 1 << (split_limit.bit_length() - 1)
         if (
             d512_nvfp4
@@ -732,13 +737,27 @@ def resolve_sparse_mla_profile(
             or (kv_cache_format == "nvfp4" and rope_dim == 0 and capacity >= 512)
         )
     ):
+
+        def wave_splits(work):
+            """Largest power-of-two KV split that keeps ``work`` CTAs per split in one wave."""
+            split_limit = min(capacity // 128, max(1, sm_count // work))
+            return 1 << (split_limit.bit_length() - 1)
+
         if (
             heads == 64
             or (heads == 128 and kv_cache_format == "fp8" and rows * 4 < sm_count)
             # D512 NVFP4 H128: two whole-tile M64 heads repeat the conversion
             # twice instead of four V partitions (GB300 top-k 512, 4 rows:
-            # 27.8 -> 13.3 us; 64 rows: 20.9 -> 17.5 us).
-            or (heads == 128 and kv_cache_format == "nvfp4" and rope_dim == 0)
+            # 27.8 -> 13.3 us; 64 rows: 20.9 -> 17.5 us). Above 16 tiles per
+            # split the repeated conversion dominates and the 2CTA split wins
+            # (GB300 48 rows, top-k 2048 + 128: 44.2 -> 41.1 us; 64 rows, top-k
+            # 4096: 65.7 -> 59.5 us).
+            or (
+                heads == 128
+                and kv_cache_format == "nvfp4"
+                and rope_dim == 0
+                and capacity // 128 <= 16 * wave_splits(rows * 2)
+            )
             # D576 NVFP4 H128 below 16 rows: two whole-tile M64 heads beat the
             # 2CTA split (GB300 top-k 2048, H96 B1 Sq8: 27.3 -> 16.8 us).
             or (heads == 128 and rope_dim == 64 and rows < 16)
@@ -754,18 +773,17 @@ def resolve_sparse_mla_profile(
             # us). Nine single-tile splits do not beat eight for top-k 1024
             # (H64 B1: 13.2 -> 14.4 us), so longer lists keep powers of two.
             work = rows * ceil(heads / 64)
-            split_limit = min(capacity // 128, max(1, sm_count // work))
-            wave_splits = 1 << (split_limit.bit_length() - 1)
+            splits = wave_splits(work)
             if (
                 kv_cache_format == "nvfp4"
                 and rope_dim == 0
                 and capacity // 128 <= 8
                 and capacity // 128 * work <= sm_count
             ):
-                wave_splits = capacity // 128
+                splits = capacity // 128
             profile = SparseMlaProfile(
                 family="keep",
-                split_kv=wave_splits,
+                split_kv=splits,
                 gather_issue_warps=8,
                 reuse_kv=True,
                 reuse_kv_stages=10,

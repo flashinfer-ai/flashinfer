@@ -1446,6 +1446,8 @@ def make_tensor_fp8_cache(pages, page_size):
         (64, 2, 129, 129),
         (128, 8, 513, 129),
         (64, 16, 2049, 129),
+        # Swap-AB keeps two tiles per split at a power-of-two tile count.
+        (16, 1, 512, 0),
         # Persistent D512 grids select the two-slot raw record ring.
         (64, 96, 1024, 0),
         (64, 80, 1024, 129),
