@@ -71,8 +71,14 @@ Public fields (defaults are the shipped behaviour)::
                                             "always" = the unconditional launch
     backend         "kernels" | "fake"      the exported programs, or the torch emulation of the same ABI (tests)
     segments        None | int              requested segments per fragment (P); must equal the context's plan
+    use_qk_l2norm_in_kernel  False | True   per-token L2 norm of every 128-channel Q / K head inside the recurrence
+                                            programs (q_hat = bf16(q * r), r = 1 / sqrt(sum q^2 + 1e-6), FTZ off; the
+                                            FLA keyword of chunk_gated_delta_rule): q / k stay the raw operands, the
+                                            saved set gains the FP32 r of q and k ([2, T_r, H_qk]) and the gradient is
+                                            the exact derivative at the stored point; the backward needs the same value
     test_knobs      None | dict             private levers (schedule, fused_walks, cols_rule, debug_sequence,
-                                            record_states, p_rule, fwdh_vh, dhu_vh) and the names of the test-only values above;
+                                            record_states, record_qk, p_rule, fwdh_vh, dhu_vh, walk_pair, fused_o) and the names of the
+                                            test-only values above;
                                             keyword argument only, never an environment variable
 """
 
@@ -116,6 +122,7 @@ RECOMPUTE_OUTPUT_DEFAULT = "auto"  # the recompute's dead output program is skip
 BACKENDS = ("kernels", "fake")
 BACKEND_DEFAULT = "kernels"
 MAX_SEGMENTS = 64
+USE_QK_L2NORM_DEFAULT = False  # the in-kernel Q / K L2 norm is opt-in (FLA's use_qk_l2norm_in_kernel keyword)
 # Private levers of record (test knobs, keyword-only): schedule of the launch sequences, the fused tape walks, the merge
 # column rule, the collective issue-order assertion, the state copies for the oracles, the plan's P rule (checked
 # against the context) and the names of the test-only build records (a test-only ``precision_mode`` /
@@ -138,11 +145,22 @@ TEST_KNOBS: dict[str, tuple[Any, ...] | None] = {
     "fwdh_vh": (
         64,
         128,
-    ),  # force the #2 form (K1 L8A_DECISION rule otherwise: 64 iff n_walk * HV <= sm_count)
+    ),  # force the #2 form (rule otherwise: cake_kcp.fwdh_vh)
     "dhu_vh": (
         64,
         128,
-    ),  # force the #7 form (rule otherwise: 64 iff n_walk * HV * 2 <= 4 * sm_count)
+    ),  # force the #7 form (rule otherwise: cake_kcp.dhu_vh)
+    "record_qk": (
+        False,
+        True,
+    ),  # use_qk_l2norm_in_kernel: keep qn / kn / rstd copies (and regen rstd == saved) in LAST_CALL for the oracles
+    # 1 = the summaries' offset walk (#2 offset / FP32-class #3) runs on a side stream concurrently with the #3 transfer
+    # walk (fork / join with CUDA events; same launches, arguments and outputs); 0 = one stream; None (shipped) = auto:
+    # on for zigzag partitions of <= 8 ranks on sm_100a / sm_103a (cake_kcp._walk_pair_enabled)
+    "walk_pair": (None, 0, 1),
+    # 1 (shipped) = a forward whose h / v_new tapes have no reader runs the output walk kcp_fwdh_out (#2 with #5 folded
+    # in, no tape written) wherever the registry ships its records (cake_kcp._fuse_o); 0 = the tape walk, then #5
+    "fused_o": (0, 1),
 }
 TEST_KNOB_DEFAULTS: dict[str, Any] = {
     "schedule": SCHEDULE_DEFAULT,
@@ -154,6 +172,9 @@ TEST_KNOB_DEFAULTS: dict[str, Any] = {
     "precision_mode": PRECISION_MODE_DEFAULT,
     "fwdh_vh": None,
     "dhu_vh": None,
+    "record_qk": False,
+    "walk_pair": None,
+    "fused_o": 1,
 }
 
 
@@ -183,7 +204,7 @@ class OptionsKcp:
     """The keyword-only options of ``chunk_gdn_kcp`` / ``chunk_gdn_fwd_kcp`` / ``chunk_gdn_bwd_kcp`` (module docstring).
 
     :meth:`check` validates the field values and the cross-field rules (ring needs ``save_transfer=False``;
-    ``reuse_recompute_tapes`` needs ``graph="off"``; a
+    ``reuse_recompute_tapes`` needs ``graph="off"``; ``use_qk_l2norm_in_kernel`` a bool; a
     test-only ``precision_mode`` / ``transfer_walk`` needs the same value in ``test_knobs``; a known ``save_mode`` /
     ``boundary_mode`` / ``offset_class`` / ``graph`` / ``layout`` / ``group_reduce`` / ``recompute_output`` /
     ``backend``; ``test_knobs``
@@ -206,6 +227,7 @@ class OptionsKcp:
     recompute_output: str = RECOMPUTE_OUTPUT_DEFAULT
     backend: str = BACKEND_DEFAULT
     segments: int | None = None
+    use_qk_l2norm_in_kernel: bool = USE_QK_L2NORM_DEFAULT
     test_knobs: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
@@ -294,6 +316,10 @@ class OptionsKcp:
                 raise ValueError(
                     f"segments must be in [1, {MAX_SEGMENTS}], got {self.segments}"
                 )
+        if not isinstance(self.use_qk_l2norm_in_kernel, bool):
+            raise TypeError(
+                f"use_qk_l2norm_in_kernel must be a bool, got {type(self.use_qk_l2norm_in_kernel).__name__}"
+            )
         if self.test_knobs is not None:
             if not isinstance(self.test_knobs, dict):
                 raise TypeError(
@@ -413,6 +439,7 @@ __all__ = [
     "TRANSFER_WALKS",
     "TRANSFER_WALKS_UNBUILT",
     "TRANSFER_WALK_DEFAULT",
+    "USE_QK_L2NORM_DEFAULT",
     "OptionsKcp",
     "make_options",
     "validate_heads",

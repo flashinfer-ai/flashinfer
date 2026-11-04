@@ -47,29 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 96
-#define TMEM_ACC_BIG_OFFSET 0
-#define NUM_TMA_PIPE_STAGES 4
-#define NUM_CHUNK_PIPE_STAGES 2
-#define NUM_UNIT_PIPE_STAGES 1
-#define SMEM_A_S_OFF 1024
-#define SMEM_A_S_STAGE_BYTES 16384
-#define SMEM_A_S_STRIDE 28672
-#define SMEM_B1_S_OFF 17408
-#define SMEM_B1_S_STAGE_BYTES 4096
-#define SMEM_B1_S_STRIDE 28672
-#define SMEM_B2_S_OFF 21504
-#define SMEM_B2_S_STAGE_BYTES 4096
-#define SMEM_B2_S_STRIDE 28672
-#define SMEM_B3_S_OFF 25600
-#define SMEM_B3_S_STAGE_BYTES 4096
-#define SMEM_B3_S_STRIDE 28672
-#define SMEM_B01_S_OFF 17408
-#define SMEM_B01_S_STAGE_BYTES 8192
-#define SMEM_B01_S_STRIDE 28672
-#define SMEM_TOTAL 115712
-#define THREADS 192
 #define LAUNCH_MIN_BLOCKS 2
 
 #include <math_constants.h>
@@ -204,7 +181,7 @@ kernel_cake_mhc_det_train_fwd_map__nsx_g2_ol2l__h5120(const __grid_constant__ CU
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     __nv_bfloat16* a_s = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
     const int a_s_addr = smem + 1024;
     __nv_bfloat16* b1_s = reinterpret_cast<__nv_bfloat16*>(smem_raw + 17408);
@@ -216,8 +193,7 @@ kernel_cake_mhc_det_train_fwd_map__nsx_g2_ol2l__h5120(const __grid_constant__ CU
     __nv_bfloat16* b01_s = reinterpret_cast<__nv_bfloat16*>(smem_raw + 17408);
     const int b01_s_addr = smem + 17408;
 
-    // Mbarrier init (6 pipeline groups, 0 ordered-sequence groups, 14 barriers)
-    // Mbarriers at smem_raw[0..112)
+    // Mbarrier init (14 barriers at smem_raw[0..112))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -263,10 +239,8 @@ kernel_cake_mhc_det_train_fwd_map__nsx_g2_ol2l__h5120(const __grid_constant__ CU
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
-
-    // Kernel post-init ops
-    const int tmem_acc_big = taddr;
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_acc_big = taddr;
 
     // ---- Role: load ----
     if (warp == 0) {

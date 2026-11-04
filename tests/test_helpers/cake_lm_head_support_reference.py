@@ -52,7 +52,7 @@ OUTPUTS = ("packed", "selected", "kl")
 TAU_FORMS = ("none", "scalar", "constant", "hetero")
 SUPPORT_KINDS = ("ind", "shr", "heavy", "full")
 # Accuracy gates against the FP64 oracle: at most 1.05x the error of B0 on the same inputs plus a floor
-# per metric (the values of tests/experimental/test_cake_lm_head_loss.py, logp-scale floors for KL).
+# per metric (the values of tests/experimental/test_cake_lm_head_det_loss.py, logp-scale floors for KL).
 GATE_MARGIN = 1.05
 GATE_TINY = dict(
     packed_max_abs=1e-5,

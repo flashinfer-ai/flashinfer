@@ -34,7 +34,7 @@
 #define CAKE_BINDING_THREADS 512
 #endif
 #ifndef CAKE_BINDING_SMEM
-#define CAKE_BINDING_SMEM 40960
+#define CAKE_BINDING_SMEM 18560
 #endif
 
 extern "C" __global__ void CAKE_KERNEL_SYMBOL(int* __restrict__ Indices, float* __restrict__ Scores, int top_k, int key_bits);

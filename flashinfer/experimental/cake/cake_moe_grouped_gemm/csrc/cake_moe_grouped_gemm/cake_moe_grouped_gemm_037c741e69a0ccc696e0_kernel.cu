@@ -5389,10 +5389,60 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                             }
                         }
                         if (whole_te == 0) {
-                            asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[er_part_t + er_col_a])), "f"(_er_tload[0]), "f"(_er_tload[1]), "f"(_er_tload[2]), "f"(_er_tload[3]) : "memory");
-                            asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[er_part_t + er_col_a + 4])), "f"(_er_tload[4]), "f"(_er_tload[5]), "f"(_er_tload[6]), "f"(_er_tload[7]) : "memory");
-                            asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[er_part_t + er_col_a + 8])), "f"(_er_tload[8]), "f"(_er_tload[9]), "f"(_er_tload[10]), "f"(_er_tload[11]) : "memory");
-                            asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[er_part_t + er_col_a + 12])), "f"(_er_tload[12]), "f"(_er_tload[13]), "f"(_er_tload[14]), "f"(_er_tload[15]) : "memory");
+                            int tr_odd = lane & 1;
+                            int tr_at = er_part_t + er_col_a + tr_odd * (4 - TILE_K);
+                            float tr_lo_0 = _er_tload[0];
+                            float tr_hi_0 = _er_tload[4];
+                            float tr_send_0 = ((tr_odd == 0) ? tr_hi_0 : tr_lo_0);
+                            float tr_got_0 = __shfl_xor_sync(0xFFFFFFFF, tr_send_0, 1);
+                            _er_tload[0] = ((tr_odd == 0) ? tr_lo_0 : tr_got_0);
+                            _er_tload[4] = ((tr_odd == 0) ? tr_got_0 : tr_hi_0);
+                            float tr_lo_1 = _er_tload[1];
+                            float tr_hi_1 = _er_tload[5];
+                            float tr_send_1 = ((tr_odd == 0) ? tr_hi_1 : tr_lo_1);
+                            float tr_got_1 = __shfl_xor_sync(0xFFFFFFFF, tr_send_1, 1);
+                            _er_tload[1] = ((tr_odd == 0) ? tr_lo_1 : tr_got_1);
+                            _er_tload[5] = ((tr_odd == 0) ? tr_got_1 : tr_hi_1);
+                            float tr_lo_2 = _er_tload[2];
+                            float tr_hi_2 = _er_tload[6];
+                            float tr_send_2 = ((tr_odd == 0) ? tr_hi_2 : tr_lo_2);
+                            float tr_got_2 = __shfl_xor_sync(0xFFFFFFFF, tr_send_2, 1);
+                            _er_tload[2] = ((tr_odd == 0) ? tr_lo_2 : tr_got_2);
+                            _er_tload[6] = ((tr_odd == 0) ? tr_got_2 : tr_hi_2);
+                            float tr_lo_3 = _er_tload[3];
+                            float tr_hi_3 = _er_tload[7];
+                            float tr_send_3 = ((tr_odd == 0) ? tr_hi_3 : tr_lo_3);
+                            float tr_got_3 = __shfl_xor_sync(0xFFFFFFFF, tr_send_3, 1);
+                            _er_tload[3] = ((tr_odd == 0) ? tr_lo_3 : tr_got_3);
+                            _er_tload[7] = ((tr_odd == 0) ? tr_got_3 : tr_hi_3);
+                            asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[tr_at])), "f"(_er_tload[0]), "f"(_er_tload[1]), "f"(_er_tload[2]), "f"(_er_tload[3]), "l"(0x14F0000000000000ULL) : "memory");
+                            asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[tr_at + TILE_K])), "f"(_er_tload[4]), "f"(_er_tload[5]), "f"(_er_tload[6]), "f"(_er_tload[7]), "l"(0x14F0000000000000ULL) : "memory");
+                            float tr_lo_4 = _er_tload[8];
+                            float tr_hi_4 = _er_tload[12];
+                            float tr_send_4 = ((tr_odd == 0) ? tr_hi_4 : tr_lo_4);
+                            float tr_got_4 = __shfl_xor_sync(0xFFFFFFFF, tr_send_4, 1);
+                            _er_tload[8] = ((tr_odd == 0) ? tr_lo_4 : tr_got_4);
+                            _er_tload[12] = ((tr_odd == 0) ? tr_got_4 : tr_hi_4);
+                            float tr_lo_5 = _er_tload[9];
+                            float tr_hi_5 = _er_tload[13];
+                            float tr_send_5 = ((tr_odd == 0) ? tr_hi_5 : tr_lo_5);
+                            float tr_got_5 = __shfl_xor_sync(0xFFFFFFFF, tr_send_5, 1);
+                            _er_tload[9] = ((tr_odd == 0) ? tr_lo_5 : tr_got_5);
+                            _er_tload[13] = ((tr_odd == 0) ? tr_got_5 : tr_hi_5);
+                            float tr_lo_6 = _er_tload[10];
+                            float tr_hi_6 = _er_tload[14];
+                            float tr_send_6 = ((tr_odd == 0) ? tr_hi_6 : tr_lo_6);
+                            float tr_got_6 = __shfl_xor_sync(0xFFFFFFFF, tr_send_6, 1);
+                            _er_tload[10] = ((tr_odd == 0) ? tr_lo_6 : tr_got_6);
+                            _er_tload[14] = ((tr_odd == 0) ? tr_got_6 : tr_hi_6);
+                            float tr_lo_7 = _er_tload[11];
+                            float tr_hi_7 = _er_tload[15];
+                            float tr_send_7 = ((tr_odd == 0) ? tr_hi_7 : tr_lo_7);
+                            float tr_got_7 = __shfl_xor_sync(0xFFFFFFFF, tr_send_7, 1);
+                            _er_tload[11] = ((tr_odd == 0) ? tr_lo_7 : tr_got_7);
+                            _er_tload[15] = ((tr_odd == 0) ? tr_got_7 : tr_hi_7);
+                            asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[tr_at + 8])), "f"(_er_tload[8]), "f"(_er_tload[9]), "f"(_er_tload[10]), "f"(_er_tload[11]), "l"(0x14F0000000000000ULL) : "memory");
+                            asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[tr_at + 8 + TILE_K])), "f"(_er_tload[12]), "f"(_er_tload[13]), "f"(_er_tload[14]), "f"(_er_tload[15]), "l"(0x14F0000000000000ULL) : "memory");
                         }
                         tmem_ld_x16(&_er_tload[0], er_rowt + (er_col_a + 16));
                         asm volatile("tcgen05.wait::ld.sync.aligned;");
@@ -5464,10 +5514,60 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                             }
                         }
                         if (whole_te == 0) {
-                            asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[er_part_t + (er_col_a + 16)])), "f"(_er_tload[0]), "f"(_er_tload[1]), "f"(_er_tload[2]), "f"(_er_tload[3]) : "memory");
-                            asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[er_part_t + (er_col_a + 16) + 4])), "f"(_er_tload[4]), "f"(_er_tload[5]), "f"(_er_tload[6]), "f"(_er_tload[7]) : "memory");
-                            asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[er_part_t + (er_col_a + 16) + 8])), "f"(_er_tload[8]), "f"(_er_tload[9]), "f"(_er_tload[10]), "f"(_er_tload[11]) : "memory");
-                            asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[er_part_t + (er_col_a + 16) + 12])), "f"(_er_tload[12]), "f"(_er_tload[13]), "f"(_er_tload[14]), "f"(_er_tload[15]) : "memory");
+                            int tr_odd_1 = lane & 1;
+                            int tr_at_1 = er_part_t + (er_col_a + 16) + tr_odd_1 * (4 - TILE_K);
+                            float tr_lo_8 = _er_tload[0];
+                            float tr_hi_8 = _er_tload[4];
+                            float tr_send_8 = ((tr_odd_1 == 0) ? tr_hi_8 : tr_lo_8);
+                            float tr_got_8 = __shfl_xor_sync(0xFFFFFFFF, tr_send_8, 1);
+                            _er_tload[0] = ((tr_odd_1 == 0) ? tr_lo_8 : tr_got_8);
+                            _er_tload[4] = ((tr_odd_1 == 0) ? tr_got_8 : tr_hi_8);
+                            float tr_lo_9 = _er_tload[1];
+                            float tr_hi_9 = _er_tload[5];
+                            float tr_send_9 = ((tr_odd_1 == 0) ? tr_hi_9 : tr_lo_9);
+                            float tr_got_9 = __shfl_xor_sync(0xFFFFFFFF, tr_send_9, 1);
+                            _er_tload[1] = ((tr_odd_1 == 0) ? tr_lo_9 : tr_got_9);
+                            _er_tload[5] = ((tr_odd_1 == 0) ? tr_got_9 : tr_hi_9);
+                            float tr_lo_10 = _er_tload[2];
+                            float tr_hi_10 = _er_tload[6];
+                            float tr_send_10 = ((tr_odd_1 == 0) ? tr_hi_10 : tr_lo_10);
+                            float tr_got_10 = __shfl_xor_sync(0xFFFFFFFF, tr_send_10, 1);
+                            _er_tload[2] = ((tr_odd_1 == 0) ? tr_lo_10 : tr_got_10);
+                            _er_tload[6] = ((tr_odd_1 == 0) ? tr_got_10 : tr_hi_10);
+                            float tr_lo_11 = _er_tload[3];
+                            float tr_hi_11 = _er_tload[7];
+                            float tr_send_11 = ((tr_odd_1 == 0) ? tr_hi_11 : tr_lo_11);
+                            float tr_got_11 = __shfl_xor_sync(0xFFFFFFFF, tr_send_11, 1);
+                            _er_tload[3] = ((tr_odd_1 == 0) ? tr_lo_11 : tr_got_11);
+                            _er_tload[7] = ((tr_odd_1 == 0) ? tr_got_11 : tr_hi_11);
+                            asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[tr_at_1])), "f"(_er_tload[0]), "f"(_er_tload[1]), "f"(_er_tload[2]), "f"(_er_tload[3]), "l"(0x14F0000000000000ULL) : "memory");
+                            asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[tr_at_1 + TILE_K])), "f"(_er_tload[4]), "f"(_er_tload[5]), "f"(_er_tload[6]), "f"(_er_tload[7]), "l"(0x14F0000000000000ULL) : "memory");
+                            float tr_lo_12 = _er_tload[8];
+                            float tr_hi_12 = _er_tload[12];
+                            float tr_send_12 = ((tr_odd_1 == 0) ? tr_hi_12 : tr_lo_12);
+                            float tr_got_12 = __shfl_xor_sync(0xFFFFFFFF, tr_send_12, 1);
+                            _er_tload[8] = ((tr_odd_1 == 0) ? tr_lo_12 : tr_got_12);
+                            _er_tload[12] = ((tr_odd_1 == 0) ? tr_got_12 : tr_hi_12);
+                            float tr_lo_13 = _er_tload[9];
+                            float tr_hi_13 = _er_tload[13];
+                            float tr_send_13 = ((tr_odd_1 == 0) ? tr_hi_13 : tr_lo_13);
+                            float tr_got_13 = __shfl_xor_sync(0xFFFFFFFF, tr_send_13, 1);
+                            _er_tload[9] = ((tr_odd_1 == 0) ? tr_lo_13 : tr_got_13);
+                            _er_tload[13] = ((tr_odd_1 == 0) ? tr_got_13 : tr_hi_13);
+                            float tr_lo_14 = _er_tload[10];
+                            float tr_hi_14 = _er_tload[14];
+                            float tr_send_14 = ((tr_odd_1 == 0) ? tr_hi_14 : tr_lo_14);
+                            float tr_got_14 = __shfl_xor_sync(0xFFFFFFFF, tr_send_14, 1);
+                            _er_tload[10] = ((tr_odd_1 == 0) ? tr_lo_14 : tr_got_14);
+                            _er_tload[14] = ((tr_odd_1 == 0) ? tr_got_14 : tr_hi_14);
+                            float tr_lo_15 = _er_tload[11];
+                            float tr_hi_15 = _er_tload[15];
+                            float tr_send_15 = ((tr_odd_1 == 0) ? tr_hi_15 : tr_lo_15);
+                            float tr_got_15 = __shfl_xor_sync(0xFFFFFFFF, tr_send_15, 1);
+                            _er_tload[11] = ((tr_odd_1 == 0) ? tr_lo_15 : tr_got_15);
+                            _er_tload[15] = ((tr_odd_1 == 0) ? tr_got_15 : tr_hi_15);
+                            asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[tr_at_1 + 8])), "f"(_er_tload[8]), "f"(_er_tload[9]), "f"(_er_tload[10]), "f"(_er_tload[11]), "l"(0x14F0000000000000ULL) : "memory");
+                            asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[tr_at_1 + 8 + TILE_K])), "f"(_er_tload[12]), "f"(_er_tload[13]), "f"(_er_tload[14]), "f"(_er_tload[15]), "l"(0x14F0000000000000ULL) : "memory");
                         }
                         tmem_ld_x16(&_er_tload[0], er_rowt + (er_col_a + 32));
                         asm volatile("tcgen05.wait::ld.sync.aligned;");
@@ -5539,10 +5639,60 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                             }
                         }
                         if (whole_te == 0) {
-                            asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[er_part_t + (er_col_a + 32)])), "f"(_er_tload[0]), "f"(_er_tload[1]), "f"(_er_tload[2]), "f"(_er_tload[3]) : "memory");
-                            asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[er_part_t + (er_col_a + 32) + 4])), "f"(_er_tload[4]), "f"(_er_tload[5]), "f"(_er_tload[6]), "f"(_er_tload[7]) : "memory");
-                            asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[er_part_t + (er_col_a + 32) + 8])), "f"(_er_tload[8]), "f"(_er_tload[9]), "f"(_er_tload[10]), "f"(_er_tload[11]) : "memory");
-                            asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[er_part_t + (er_col_a + 32) + 12])), "f"(_er_tload[12]), "f"(_er_tload[13]), "f"(_er_tload[14]), "f"(_er_tload[15]) : "memory");
+                            int tr_odd_2 = lane & 1;
+                            int tr_at_2 = er_part_t + (er_col_a + 32) + tr_odd_2 * (4 - TILE_K);
+                            float tr_lo_16 = _er_tload[0];
+                            float tr_hi_16 = _er_tload[4];
+                            float tr_send_16 = ((tr_odd_2 == 0) ? tr_hi_16 : tr_lo_16);
+                            float tr_got_16 = __shfl_xor_sync(0xFFFFFFFF, tr_send_16, 1);
+                            _er_tload[0] = ((tr_odd_2 == 0) ? tr_lo_16 : tr_got_16);
+                            _er_tload[4] = ((tr_odd_2 == 0) ? tr_got_16 : tr_hi_16);
+                            float tr_lo_17 = _er_tload[1];
+                            float tr_hi_17 = _er_tload[5];
+                            float tr_send_17 = ((tr_odd_2 == 0) ? tr_hi_17 : tr_lo_17);
+                            float tr_got_17 = __shfl_xor_sync(0xFFFFFFFF, tr_send_17, 1);
+                            _er_tload[1] = ((tr_odd_2 == 0) ? tr_lo_17 : tr_got_17);
+                            _er_tload[5] = ((tr_odd_2 == 0) ? tr_got_17 : tr_hi_17);
+                            float tr_lo_18 = _er_tload[2];
+                            float tr_hi_18 = _er_tload[6];
+                            float tr_send_18 = ((tr_odd_2 == 0) ? tr_hi_18 : tr_lo_18);
+                            float tr_got_18 = __shfl_xor_sync(0xFFFFFFFF, tr_send_18, 1);
+                            _er_tload[2] = ((tr_odd_2 == 0) ? tr_lo_18 : tr_got_18);
+                            _er_tload[6] = ((tr_odd_2 == 0) ? tr_got_18 : tr_hi_18);
+                            float tr_lo_19 = _er_tload[3];
+                            float tr_hi_19 = _er_tload[7];
+                            float tr_send_19 = ((tr_odd_2 == 0) ? tr_hi_19 : tr_lo_19);
+                            float tr_got_19 = __shfl_xor_sync(0xFFFFFFFF, tr_send_19, 1);
+                            _er_tload[3] = ((tr_odd_2 == 0) ? tr_lo_19 : tr_got_19);
+                            _er_tload[7] = ((tr_odd_2 == 0) ? tr_got_19 : tr_hi_19);
+                            asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[tr_at_2])), "f"(_er_tload[0]), "f"(_er_tload[1]), "f"(_er_tload[2]), "f"(_er_tload[3]), "l"(0x14F0000000000000ULL) : "memory");
+                            asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[tr_at_2 + TILE_K])), "f"(_er_tload[4]), "f"(_er_tload[5]), "f"(_er_tload[6]), "f"(_er_tload[7]), "l"(0x14F0000000000000ULL) : "memory");
+                            float tr_lo_20 = _er_tload[8];
+                            float tr_hi_20 = _er_tload[12];
+                            float tr_send_20 = ((tr_odd_2 == 0) ? tr_hi_20 : tr_lo_20);
+                            float tr_got_20 = __shfl_xor_sync(0xFFFFFFFF, tr_send_20, 1);
+                            _er_tload[8] = ((tr_odd_2 == 0) ? tr_lo_20 : tr_got_20);
+                            _er_tload[12] = ((tr_odd_2 == 0) ? tr_got_20 : tr_hi_20);
+                            float tr_lo_21 = _er_tload[9];
+                            float tr_hi_21 = _er_tload[13];
+                            float tr_send_21 = ((tr_odd_2 == 0) ? tr_hi_21 : tr_lo_21);
+                            float tr_got_21 = __shfl_xor_sync(0xFFFFFFFF, tr_send_21, 1);
+                            _er_tload[9] = ((tr_odd_2 == 0) ? tr_lo_21 : tr_got_21);
+                            _er_tload[13] = ((tr_odd_2 == 0) ? tr_got_21 : tr_hi_21);
+                            float tr_lo_22 = _er_tload[10];
+                            float tr_hi_22 = _er_tload[14];
+                            float tr_send_22 = ((tr_odd_2 == 0) ? tr_hi_22 : tr_lo_22);
+                            float tr_got_22 = __shfl_xor_sync(0xFFFFFFFF, tr_send_22, 1);
+                            _er_tload[10] = ((tr_odd_2 == 0) ? tr_lo_22 : tr_got_22);
+                            _er_tload[14] = ((tr_odd_2 == 0) ? tr_got_22 : tr_hi_22);
+                            float tr_lo_23 = _er_tload[11];
+                            float tr_hi_23 = _er_tload[15];
+                            float tr_send_23 = ((tr_odd_2 == 0) ? tr_hi_23 : tr_lo_23);
+                            float tr_got_23 = __shfl_xor_sync(0xFFFFFFFF, tr_send_23, 1);
+                            _er_tload[11] = ((tr_odd_2 == 0) ? tr_lo_23 : tr_got_23);
+                            _er_tload[15] = ((tr_odd_2 == 0) ? tr_got_23 : tr_hi_23);
+                            asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[tr_at_2 + 8])), "f"(_er_tload[8]), "f"(_er_tload[9]), "f"(_er_tload[10]), "f"(_er_tload[11]), "l"(0x14F0000000000000ULL) : "memory");
+                            asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[tr_at_2 + 8 + TILE_K])), "f"(_er_tload[12]), "f"(_er_tload[13]), "f"(_er_tload[14]), "f"(_er_tload[15]), "l"(0x14F0000000000000ULL) : "memory");
                         }
                         tmem_ld_x16(&_er_tload[0], er_rowt + (er_col_a + 48));
                         asm volatile("tcgen05.wait::ld.sync.aligned;");
@@ -5614,10 +5764,60 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                             }
                         }
                         if (whole_te == 0) {
-                            asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[er_part_t + (er_col_a + 48)])), "f"(_er_tload[0]), "f"(_er_tload[1]), "f"(_er_tload[2]), "f"(_er_tload[3]) : "memory");
-                            asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[er_part_t + (er_col_a + 48) + 4])), "f"(_er_tload[4]), "f"(_er_tload[5]), "f"(_er_tload[6]), "f"(_er_tload[7]) : "memory");
-                            asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[er_part_t + (er_col_a + 48) + 8])), "f"(_er_tload[8]), "f"(_er_tload[9]), "f"(_er_tload[10]), "f"(_er_tload[11]) : "memory");
-                            asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[er_part_t + (er_col_a + 48) + 12])), "f"(_er_tload[12]), "f"(_er_tload[13]), "f"(_er_tload[14]), "f"(_er_tload[15]) : "memory");
+                            int tr_odd_3 = lane & 1;
+                            int tr_at_3 = er_part_t + (er_col_a + 48) + tr_odd_3 * (4 - TILE_K);
+                            float tr_lo_24 = _er_tload[0];
+                            float tr_hi_24 = _er_tload[4];
+                            float tr_send_24 = ((tr_odd_3 == 0) ? tr_hi_24 : tr_lo_24);
+                            float tr_got_24 = __shfl_xor_sync(0xFFFFFFFF, tr_send_24, 1);
+                            _er_tload[0] = ((tr_odd_3 == 0) ? tr_lo_24 : tr_got_24);
+                            _er_tload[4] = ((tr_odd_3 == 0) ? tr_got_24 : tr_hi_24);
+                            float tr_lo_25 = _er_tload[1];
+                            float tr_hi_25 = _er_tload[5];
+                            float tr_send_25 = ((tr_odd_3 == 0) ? tr_hi_25 : tr_lo_25);
+                            float tr_got_25 = __shfl_xor_sync(0xFFFFFFFF, tr_send_25, 1);
+                            _er_tload[1] = ((tr_odd_3 == 0) ? tr_lo_25 : tr_got_25);
+                            _er_tload[5] = ((tr_odd_3 == 0) ? tr_got_25 : tr_hi_25);
+                            float tr_lo_26 = _er_tload[2];
+                            float tr_hi_26 = _er_tload[6];
+                            float tr_send_26 = ((tr_odd_3 == 0) ? tr_hi_26 : tr_lo_26);
+                            float tr_got_26 = __shfl_xor_sync(0xFFFFFFFF, tr_send_26, 1);
+                            _er_tload[2] = ((tr_odd_3 == 0) ? tr_lo_26 : tr_got_26);
+                            _er_tload[6] = ((tr_odd_3 == 0) ? tr_got_26 : tr_hi_26);
+                            float tr_lo_27 = _er_tload[3];
+                            float tr_hi_27 = _er_tload[7];
+                            float tr_send_27 = ((tr_odd_3 == 0) ? tr_hi_27 : tr_lo_27);
+                            float tr_got_27 = __shfl_xor_sync(0xFFFFFFFF, tr_send_27, 1);
+                            _er_tload[3] = ((tr_odd_3 == 0) ? tr_lo_27 : tr_got_27);
+                            _er_tload[7] = ((tr_odd_3 == 0) ? tr_got_27 : tr_hi_27);
+                            asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[tr_at_3])), "f"(_er_tload[0]), "f"(_er_tload[1]), "f"(_er_tload[2]), "f"(_er_tload[3]), "l"(0x14F0000000000000ULL) : "memory");
+                            asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[tr_at_3 + TILE_K])), "f"(_er_tload[4]), "f"(_er_tload[5]), "f"(_er_tload[6]), "f"(_er_tload[7]), "l"(0x14F0000000000000ULL) : "memory");
+                            float tr_lo_28 = _er_tload[8];
+                            float tr_hi_28 = _er_tload[12];
+                            float tr_send_28 = ((tr_odd_3 == 0) ? tr_hi_28 : tr_lo_28);
+                            float tr_got_28 = __shfl_xor_sync(0xFFFFFFFF, tr_send_28, 1);
+                            _er_tload[8] = ((tr_odd_3 == 0) ? tr_lo_28 : tr_got_28);
+                            _er_tload[12] = ((tr_odd_3 == 0) ? tr_got_28 : tr_hi_28);
+                            float tr_lo_29 = _er_tload[9];
+                            float tr_hi_29 = _er_tload[13];
+                            float tr_send_29 = ((tr_odd_3 == 0) ? tr_hi_29 : tr_lo_29);
+                            float tr_got_29 = __shfl_xor_sync(0xFFFFFFFF, tr_send_29, 1);
+                            _er_tload[9] = ((tr_odd_3 == 0) ? tr_lo_29 : tr_got_29);
+                            _er_tload[13] = ((tr_odd_3 == 0) ? tr_got_29 : tr_hi_29);
+                            float tr_lo_30 = _er_tload[10];
+                            float tr_hi_30 = _er_tload[14];
+                            float tr_send_30 = ((tr_odd_3 == 0) ? tr_hi_30 : tr_lo_30);
+                            float tr_got_30 = __shfl_xor_sync(0xFFFFFFFF, tr_send_30, 1);
+                            _er_tload[10] = ((tr_odd_3 == 0) ? tr_lo_30 : tr_got_30);
+                            _er_tload[14] = ((tr_odd_3 == 0) ? tr_got_30 : tr_hi_30);
+                            float tr_lo_31 = _er_tload[11];
+                            float tr_hi_31 = _er_tload[15];
+                            float tr_send_31 = ((tr_odd_3 == 0) ? tr_hi_31 : tr_lo_31);
+                            float tr_got_31 = __shfl_xor_sync(0xFFFFFFFF, tr_send_31, 1);
+                            _er_tload[11] = ((tr_odd_3 == 0) ? tr_lo_31 : tr_got_31);
+                            _er_tload[15] = ((tr_odd_3 == 0) ? tr_got_31 : tr_hi_31);
+                            asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[tr_at_3 + 8])), "f"(_er_tload[8]), "f"(_er_tload[9]), "f"(_er_tload[10]), "f"(_er_tload[11]), "l"(0x14F0000000000000ULL) : "memory");
+                            asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[tr_at_3 + 8 + TILE_K])), "f"(_er_tload[12]), "f"(_er_tload[13]), "f"(_er_tload[14]), "f"(_er_tload[15]), "l"(0x14F0000000000000ULL) : "memory");
                         }
                         tmem_ld_x16(&_er_tload[0], er_rowt + (er_col_a + 64));
                         asm volatile("tcgen05.wait::ld.sync.aligned;");
@@ -5689,10 +5889,60 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                             }
                         }
                         if (whole_te == 0) {
-                            asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[er_part_t + (er_col_a + 64)])), "f"(_er_tload[0]), "f"(_er_tload[1]), "f"(_er_tload[2]), "f"(_er_tload[3]) : "memory");
-                            asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[er_part_t + (er_col_a + 64) + 4])), "f"(_er_tload[4]), "f"(_er_tload[5]), "f"(_er_tload[6]), "f"(_er_tload[7]) : "memory");
-                            asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[er_part_t + (er_col_a + 64) + 8])), "f"(_er_tload[8]), "f"(_er_tload[9]), "f"(_er_tload[10]), "f"(_er_tload[11]) : "memory");
-                            asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[er_part_t + (er_col_a + 64) + 12])), "f"(_er_tload[12]), "f"(_er_tload[13]), "f"(_er_tload[14]), "f"(_er_tload[15]) : "memory");
+                            int tr_odd_4 = lane & 1;
+                            int tr_at_4 = er_part_t + (er_col_a + 64) + tr_odd_4 * (4 - TILE_K);
+                            float tr_lo_32 = _er_tload[0];
+                            float tr_hi_32 = _er_tload[4];
+                            float tr_send_32 = ((tr_odd_4 == 0) ? tr_hi_32 : tr_lo_32);
+                            float tr_got_32 = __shfl_xor_sync(0xFFFFFFFF, tr_send_32, 1);
+                            _er_tload[0] = ((tr_odd_4 == 0) ? tr_lo_32 : tr_got_32);
+                            _er_tload[4] = ((tr_odd_4 == 0) ? tr_got_32 : tr_hi_32);
+                            float tr_lo_33 = _er_tload[1];
+                            float tr_hi_33 = _er_tload[5];
+                            float tr_send_33 = ((tr_odd_4 == 0) ? tr_hi_33 : tr_lo_33);
+                            float tr_got_33 = __shfl_xor_sync(0xFFFFFFFF, tr_send_33, 1);
+                            _er_tload[1] = ((tr_odd_4 == 0) ? tr_lo_33 : tr_got_33);
+                            _er_tload[5] = ((tr_odd_4 == 0) ? tr_got_33 : tr_hi_33);
+                            float tr_lo_34 = _er_tload[2];
+                            float tr_hi_34 = _er_tload[6];
+                            float tr_send_34 = ((tr_odd_4 == 0) ? tr_hi_34 : tr_lo_34);
+                            float tr_got_34 = __shfl_xor_sync(0xFFFFFFFF, tr_send_34, 1);
+                            _er_tload[2] = ((tr_odd_4 == 0) ? tr_lo_34 : tr_got_34);
+                            _er_tload[6] = ((tr_odd_4 == 0) ? tr_got_34 : tr_hi_34);
+                            float tr_lo_35 = _er_tload[3];
+                            float tr_hi_35 = _er_tload[7];
+                            float tr_send_35 = ((tr_odd_4 == 0) ? tr_hi_35 : tr_lo_35);
+                            float tr_got_35 = __shfl_xor_sync(0xFFFFFFFF, tr_send_35, 1);
+                            _er_tload[3] = ((tr_odd_4 == 0) ? tr_lo_35 : tr_got_35);
+                            _er_tload[7] = ((tr_odd_4 == 0) ? tr_got_35 : tr_hi_35);
+                            asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[tr_at_4])), "f"(_er_tload[0]), "f"(_er_tload[1]), "f"(_er_tload[2]), "f"(_er_tload[3]), "l"(0x14F0000000000000ULL) : "memory");
+                            asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[tr_at_4 + TILE_K])), "f"(_er_tload[4]), "f"(_er_tload[5]), "f"(_er_tload[6]), "f"(_er_tload[7]), "l"(0x14F0000000000000ULL) : "memory");
+                            float tr_lo_36 = _er_tload[8];
+                            float tr_hi_36 = _er_tload[12];
+                            float tr_send_36 = ((tr_odd_4 == 0) ? tr_hi_36 : tr_lo_36);
+                            float tr_got_36 = __shfl_xor_sync(0xFFFFFFFF, tr_send_36, 1);
+                            _er_tload[8] = ((tr_odd_4 == 0) ? tr_lo_36 : tr_got_36);
+                            _er_tload[12] = ((tr_odd_4 == 0) ? tr_got_36 : tr_hi_36);
+                            float tr_lo_37 = _er_tload[9];
+                            float tr_hi_37 = _er_tload[13];
+                            float tr_send_37 = ((tr_odd_4 == 0) ? tr_hi_37 : tr_lo_37);
+                            float tr_got_37 = __shfl_xor_sync(0xFFFFFFFF, tr_send_37, 1);
+                            _er_tload[9] = ((tr_odd_4 == 0) ? tr_lo_37 : tr_got_37);
+                            _er_tload[13] = ((tr_odd_4 == 0) ? tr_got_37 : tr_hi_37);
+                            float tr_lo_38 = _er_tload[10];
+                            float tr_hi_38 = _er_tload[14];
+                            float tr_send_38 = ((tr_odd_4 == 0) ? tr_hi_38 : tr_lo_38);
+                            float tr_got_38 = __shfl_xor_sync(0xFFFFFFFF, tr_send_38, 1);
+                            _er_tload[10] = ((tr_odd_4 == 0) ? tr_lo_38 : tr_got_38);
+                            _er_tload[14] = ((tr_odd_4 == 0) ? tr_got_38 : tr_hi_38);
+                            float tr_lo_39 = _er_tload[11];
+                            float tr_hi_39 = _er_tload[15];
+                            float tr_send_39 = ((tr_odd_4 == 0) ? tr_hi_39 : tr_lo_39);
+                            float tr_got_39 = __shfl_xor_sync(0xFFFFFFFF, tr_send_39, 1);
+                            _er_tload[11] = ((tr_odd_4 == 0) ? tr_lo_39 : tr_got_39);
+                            _er_tload[15] = ((tr_odd_4 == 0) ? tr_got_39 : tr_hi_39);
+                            asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[tr_at_4 + 8])), "f"(_er_tload[8]), "f"(_er_tload[9]), "f"(_er_tload[10]), "f"(_er_tload[11]), "l"(0x14F0000000000000ULL) : "memory");
+                            asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[tr_at_4 + 8 + TILE_K])), "f"(_er_tload[12]), "f"(_er_tload[13]), "f"(_er_tload[14]), "f"(_er_tload[15]), "l"(0x14F0000000000000ULL) : "memory");
                         }
                         tmem_ld_x16(&_er_tload[0], er_rowt + (er_col_a + 80));
                         asm volatile("tcgen05.wait::ld.sync.aligned;");
@@ -5764,10 +6014,60 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                             }
                         }
                         if (whole_te == 0) {
-                            asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[er_part_t + (er_col_a + 80)])), "f"(_er_tload[0]), "f"(_er_tload[1]), "f"(_er_tload[2]), "f"(_er_tload[3]) : "memory");
-                            asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[er_part_t + (er_col_a + 80) + 4])), "f"(_er_tload[4]), "f"(_er_tload[5]), "f"(_er_tload[6]), "f"(_er_tload[7]) : "memory");
-                            asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[er_part_t + (er_col_a + 80) + 8])), "f"(_er_tload[8]), "f"(_er_tload[9]), "f"(_er_tload[10]), "f"(_er_tload[11]) : "memory");
-                            asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[er_part_t + (er_col_a + 80) + 12])), "f"(_er_tload[12]), "f"(_er_tload[13]), "f"(_er_tload[14]), "f"(_er_tload[15]) : "memory");
+                            int tr_odd_5 = lane & 1;
+                            int tr_at_5 = er_part_t + (er_col_a + 80) + tr_odd_5 * (4 - TILE_K);
+                            float tr_lo_40 = _er_tload[0];
+                            float tr_hi_40 = _er_tload[4];
+                            float tr_send_40 = ((tr_odd_5 == 0) ? tr_hi_40 : tr_lo_40);
+                            float tr_got_40 = __shfl_xor_sync(0xFFFFFFFF, tr_send_40, 1);
+                            _er_tload[0] = ((tr_odd_5 == 0) ? tr_lo_40 : tr_got_40);
+                            _er_tload[4] = ((tr_odd_5 == 0) ? tr_got_40 : tr_hi_40);
+                            float tr_lo_41 = _er_tload[1];
+                            float tr_hi_41 = _er_tload[5];
+                            float tr_send_41 = ((tr_odd_5 == 0) ? tr_hi_41 : tr_lo_41);
+                            float tr_got_41 = __shfl_xor_sync(0xFFFFFFFF, tr_send_41, 1);
+                            _er_tload[1] = ((tr_odd_5 == 0) ? tr_lo_41 : tr_got_41);
+                            _er_tload[5] = ((tr_odd_5 == 0) ? tr_got_41 : tr_hi_41);
+                            float tr_lo_42 = _er_tload[2];
+                            float tr_hi_42 = _er_tload[6];
+                            float tr_send_42 = ((tr_odd_5 == 0) ? tr_hi_42 : tr_lo_42);
+                            float tr_got_42 = __shfl_xor_sync(0xFFFFFFFF, tr_send_42, 1);
+                            _er_tload[2] = ((tr_odd_5 == 0) ? tr_lo_42 : tr_got_42);
+                            _er_tload[6] = ((tr_odd_5 == 0) ? tr_got_42 : tr_hi_42);
+                            float tr_lo_43 = _er_tload[3];
+                            float tr_hi_43 = _er_tload[7];
+                            float tr_send_43 = ((tr_odd_5 == 0) ? tr_hi_43 : tr_lo_43);
+                            float tr_got_43 = __shfl_xor_sync(0xFFFFFFFF, tr_send_43, 1);
+                            _er_tload[3] = ((tr_odd_5 == 0) ? tr_lo_43 : tr_got_43);
+                            _er_tload[7] = ((tr_odd_5 == 0) ? tr_got_43 : tr_hi_43);
+                            asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[tr_at_5])), "f"(_er_tload[0]), "f"(_er_tload[1]), "f"(_er_tload[2]), "f"(_er_tload[3]), "l"(0x14F0000000000000ULL) : "memory");
+                            asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[tr_at_5 + TILE_K])), "f"(_er_tload[4]), "f"(_er_tload[5]), "f"(_er_tload[6]), "f"(_er_tload[7]), "l"(0x14F0000000000000ULL) : "memory");
+                            float tr_lo_44 = _er_tload[8];
+                            float tr_hi_44 = _er_tload[12];
+                            float tr_send_44 = ((tr_odd_5 == 0) ? tr_hi_44 : tr_lo_44);
+                            float tr_got_44 = __shfl_xor_sync(0xFFFFFFFF, tr_send_44, 1);
+                            _er_tload[8] = ((tr_odd_5 == 0) ? tr_lo_44 : tr_got_44);
+                            _er_tload[12] = ((tr_odd_5 == 0) ? tr_got_44 : tr_hi_44);
+                            float tr_lo_45 = _er_tload[9];
+                            float tr_hi_45 = _er_tload[13];
+                            float tr_send_45 = ((tr_odd_5 == 0) ? tr_hi_45 : tr_lo_45);
+                            float tr_got_45 = __shfl_xor_sync(0xFFFFFFFF, tr_send_45, 1);
+                            _er_tload[9] = ((tr_odd_5 == 0) ? tr_lo_45 : tr_got_45);
+                            _er_tload[13] = ((tr_odd_5 == 0) ? tr_got_45 : tr_hi_45);
+                            float tr_lo_46 = _er_tload[10];
+                            float tr_hi_46 = _er_tload[14];
+                            float tr_send_46 = ((tr_odd_5 == 0) ? tr_hi_46 : tr_lo_46);
+                            float tr_got_46 = __shfl_xor_sync(0xFFFFFFFF, tr_send_46, 1);
+                            _er_tload[10] = ((tr_odd_5 == 0) ? tr_lo_46 : tr_got_46);
+                            _er_tload[14] = ((tr_odd_5 == 0) ? tr_got_46 : tr_hi_46);
+                            float tr_lo_47 = _er_tload[11];
+                            float tr_hi_47 = _er_tload[15];
+                            float tr_send_47 = ((tr_odd_5 == 0) ? tr_hi_47 : tr_lo_47);
+                            float tr_got_47 = __shfl_xor_sync(0xFFFFFFFF, tr_send_47, 1);
+                            _er_tload[11] = ((tr_odd_5 == 0) ? tr_lo_47 : tr_got_47);
+                            _er_tload[15] = ((tr_odd_5 == 0) ? tr_got_47 : tr_hi_47);
+                            asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[tr_at_5 + 8])), "f"(_er_tload[8]), "f"(_er_tload[9]), "f"(_er_tload[10]), "f"(_er_tload[11]), "l"(0x14F0000000000000ULL) : "memory");
+                            asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[tr_at_5 + 8 + TILE_K])), "f"(_er_tload[12]), "f"(_er_tload[13]), "f"(_er_tload[14]), "f"(_er_tload[15]), "l"(0x14F0000000000000ULL) : "memory");
                         }
                         tmem_ld_x16(&_er_tload[0], er_rowt + (er_col_a + 96));
                         asm volatile("tcgen05.wait::ld.sync.aligned;");
@@ -5839,10 +6139,60 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                             }
                         }
                         if (whole_te == 0) {
-                            asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[er_part_t + (er_col_a + 96)])), "f"(_er_tload[0]), "f"(_er_tload[1]), "f"(_er_tload[2]), "f"(_er_tload[3]) : "memory");
-                            asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[er_part_t + (er_col_a + 96) + 4])), "f"(_er_tload[4]), "f"(_er_tload[5]), "f"(_er_tload[6]), "f"(_er_tload[7]) : "memory");
-                            asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[er_part_t + (er_col_a + 96) + 8])), "f"(_er_tload[8]), "f"(_er_tload[9]), "f"(_er_tload[10]), "f"(_er_tload[11]) : "memory");
-                            asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[er_part_t + (er_col_a + 96) + 12])), "f"(_er_tload[12]), "f"(_er_tload[13]), "f"(_er_tload[14]), "f"(_er_tload[15]) : "memory");
+                            int tr_odd_6 = lane & 1;
+                            int tr_at_6 = er_part_t + (er_col_a + 96) + tr_odd_6 * (4 - TILE_K);
+                            float tr_lo_48 = _er_tload[0];
+                            float tr_hi_48 = _er_tload[4];
+                            float tr_send_48 = ((tr_odd_6 == 0) ? tr_hi_48 : tr_lo_48);
+                            float tr_got_48 = __shfl_xor_sync(0xFFFFFFFF, tr_send_48, 1);
+                            _er_tload[0] = ((tr_odd_6 == 0) ? tr_lo_48 : tr_got_48);
+                            _er_tload[4] = ((tr_odd_6 == 0) ? tr_got_48 : tr_hi_48);
+                            float tr_lo_49 = _er_tload[1];
+                            float tr_hi_49 = _er_tload[5];
+                            float tr_send_49 = ((tr_odd_6 == 0) ? tr_hi_49 : tr_lo_49);
+                            float tr_got_49 = __shfl_xor_sync(0xFFFFFFFF, tr_send_49, 1);
+                            _er_tload[1] = ((tr_odd_6 == 0) ? tr_lo_49 : tr_got_49);
+                            _er_tload[5] = ((tr_odd_6 == 0) ? tr_got_49 : tr_hi_49);
+                            float tr_lo_50 = _er_tload[2];
+                            float tr_hi_50 = _er_tload[6];
+                            float tr_send_50 = ((tr_odd_6 == 0) ? tr_hi_50 : tr_lo_50);
+                            float tr_got_50 = __shfl_xor_sync(0xFFFFFFFF, tr_send_50, 1);
+                            _er_tload[2] = ((tr_odd_6 == 0) ? tr_lo_50 : tr_got_50);
+                            _er_tload[6] = ((tr_odd_6 == 0) ? tr_got_50 : tr_hi_50);
+                            float tr_lo_51 = _er_tload[3];
+                            float tr_hi_51 = _er_tload[7];
+                            float tr_send_51 = ((tr_odd_6 == 0) ? tr_hi_51 : tr_lo_51);
+                            float tr_got_51 = __shfl_xor_sync(0xFFFFFFFF, tr_send_51, 1);
+                            _er_tload[3] = ((tr_odd_6 == 0) ? tr_lo_51 : tr_got_51);
+                            _er_tload[7] = ((tr_odd_6 == 0) ? tr_got_51 : tr_hi_51);
+                            asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[tr_at_6])), "f"(_er_tload[0]), "f"(_er_tload[1]), "f"(_er_tload[2]), "f"(_er_tload[3]), "l"(0x14F0000000000000ULL) : "memory");
+                            asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[tr_at_6 + TILE_K])), "f"(_er_tload[4]), "f"(_er_tload[5]), "f"(_er_tload[6]), "f"(_er_tload[7]), "l"(0x14F0000000000000ULL) : "memory");
+                            float tr_lo_52 = _er_tload[8];
+                            float tr_hi_52 = _er_tload[12];
+                            float tr_send_52 = ((tr_odd_6 == 0) ? tr_hi_52 : tr_lo_52);
+                            float tr_got_52 = __shfl_xor_sync(0xFFFFFFFF, tr_send_52, 1);
+                            _er_tload[8] = ((tr_odd_6 == 0) ? tr_lo_52 : tr_got_52);
+                            _er_tload[12] = ((tr_odd_6 == 0) ? tr_got_52 : tr_hi_52);
+                            float tr_lo_53 = _er_tload[9];
+                            float tr_hi_53 = _er_tload[13];
+                            float tr_send_53 = ((tr_odd_6 == 0) ? tr_hi_53 : tr_lo_53);
+                            float tr_got_53 = __shfl_xor_sync(0xFFFFFFFF, tr_send_53, 1);
+                            _er_tload[9] = ((tr_odd_6 == 0) ? tr_lo_53 : tr_got_53);
+                            _er_tload[13] = ((tr_odd_6 == 0) ? tr_got_53 : tr_hi_53);
+                            float tr_lo_54 = _er_tload[10];
+                            float tr_hi_54 = _er_tload[14];
+                            float tr_send_54 = ((tr_odd_6 == 0) ? tr_hi_54 : tr_lo_54);
+                            float tr_got_54 = __shfl_xor_sync(0xFFFFFFFF, tr_send_54, 1);
+                            _er_tload[10] = ((tr_odd_6 == 0) ? tr_lo_54 : tr_got_54);
+                            _er_tload[14] = ((tr_odd_6 == 0) ? tr_got_54 : tr_hi_54);
+                            float tr_lo_55 = _er_tload[11];
+                            float tr_hi_55 = _er_tload[15];
+                            float tr_send_55 = ((tr_odd_6 == 0) ? tr_hi_55 : tr_lo_55);
+                            float tr_got_55 = __shfl_xor_sync(0xFFFFFFFF, tr_send_55, 1);
+                            _er_tload[11] = ((tr_odd_6 == 0) ? tr_lo_55 : tr_got_55);
+                            _er_tload[15] = ((tr_odd_6 == 0) ? tr_got_55 : tr_hi_55);
+                            asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[tr_at_6 + 8])), "f"(_er_tload[8]), "f"(_er_tload[9]), "f"(_er_tload[10]), "f"(_er_tload[11]), "l"(0x14F0000000000000ULL) : "memory");
+                            asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[tr_at_6 + 8 + TILE_K])), "f"(_er_tload[12]), "f"(_er_tload[13]), "f"(_er_tload[14]), "f"(_er_tload[15]), "l"(0x14F0000000000000ULL) : "memory");
                         }
                         tmem_ld_x16(&_er_tload[0], er_rowt + (er_col_a + 112));
                         asm volatile("tcgen05.wait::ld.sync.aligned;");
@@ -5914,10 +6264,60 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                             }
                         }
                         if (whole_te == 0) {
-                            asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[er_part_t + (er_col_a + 112)])), "f"(_er_tload[0]), "f"(_er_tload[1]), "f"(_er_tload[2]), "f"(_er_tload[3]) : "memory");
-                            asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[er_part_t + (er_col_a + 112) + 4])), "f"(_er_tload[4]), "f"(_er_tload[5]), "f"(_er_tload[6]), "f"(_er_tload[7]) : "memory");
-                            asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[er_part_t + (er_col_a + 112) + 8])), "f"(_er_tload[8]), "f"(_er_tload[9]), "f"(_er_tload[10]), "f"(_er_tload[11]) : "memory");
-                            asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[er_part_t + (er_col_a + 112) + 12])), "f"(_er_tload[12]), "f"(_er_tload[13]), "f"(_er_tload[14]), "f"(_er_tload[15]) : "memory");
+                            int tr_odd_7 = lane & 1;
+                            int tr_at_7 = er_part_t + (er_col_a + 112) + tr_odd_7 * (4 - TILE_K);
+                            float tr_lo_56 = _er_tload[0];
+                            float tr_hi_56 = _er_tload[4];
+                            float tr_send_56 = ((tr_odd_7 == 0) ? tr_hi_56 : tr_lo_56);
+                            float tr_got_56 = __shfl_xor_sync(0xFFFFFFFF, tr_send_56, 1);
+                            _er_tload[0] = ((tr_odd_7 == 0) ? tr_lo_56 : tr_got_56);
+                            _er_tload[4] = ((tr_odd_7 == 0) ? tr_got_56 : tr_hi_56);
+                            float tr_lo_57 = _er_tload[1];
+                            float tr_hi_57 = _er_tload[5];
+                            float tr_send_57 = ((tr_odd_7 == 0) ? tr_hi_57 : tr_lo_57);
+                            float tr_got_57 = __shfl_xor_sync(0xFFFFFFFF, tr_send_57, 1);
+                            _er_tload[1] = ((tr_odd_7 == 0) ? tr_lo_57 : tr_got_57);
+                            _er_tload[5] = ((tr_odd_7 == 0) ? tr_got_57 : tr_hi_57);
+                            float tr_lo_58 = _er_tload[2];
+                            float tr_hi_58 = _er_tload[6];
+                            float tr_send_58 = ((tr_odd_7 == 0) ? tr_hi_58 : tr_lo_58);
+                            float tr_got_58 = __shfl_xor_sync(0xFFFFFFFF, tr_send_58, 1);
+                            _er_tload[2] = ((tr_odd_7 == 0) ? tr_lo_58 : tr_got_58);
+                            _er_tload[6] = ((tr_odd_7 == 0) ? tr_got_58 : tr_hi_58);
+                            float tr_lo_59 = _er_tload[3];
+                            float tr_hi_59 = _er_tload[7];
+                            float tr_send_59 = ((tr_odd_7 == 0) ? tr_hi_59 : tr_lo_59);
+                            float tr_got_59 = __shfl_xor_sync(0xFFFFFFFF, tr_send_59, 1);
+                            _er_tload[3] = ((tr_odd_7 == 0) ? tr_lo_59 : tr_got_59);
+                            _er_tload[7] = ((tr_odd_7 == 0) ? tr_got_59 : tr_hi_59);
+                            asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[tr_at_7])), "f"(_er_tload[0]), "f"(_er_tload[1]), "f"(_er_tload[2]), "f"(_er_tload[3]), "l"(0x14F0000000000000ULL) : "memory");
+                            asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[tr_at_7 + TILE_K])), "f"(_er_tload[4]), "f"(_er_tload[5]), "f"(_er_tload[6]), "f"(_er_tload[7]), "l"(0x14F0000000000000ULL) : "memory");
+                            float tr_lo_60 = _er_tload[8];
+                            float tr_hi_60 = _er_tload[12];
+                            float tr_send_60 = ((tr_odd_7 == 0) ? tr_hi_60 : tr_lo_60);
+                            float tr_got_60 = __shfl_xor_sync(0xFFFFFFFF, tr_send_60, 1);
+                            _er_tload[8] = ((tr_odd_7 == 0) ? tr_lo_60 : tr_got_60);
+                            _er_tload[12] = ((tr_odd_7 == 0) ? tr_got_60 : tr_hi_60);
+                            float tr_lo_61 = _er_tload[9];
+                            float tr_hi_61 = _er_tload[13];
+                            float tr_send_61 = ((tr_odd_7 == 0) ? tr_hi_61 : tr_lo_61);
+                            float tr_got_61 = __shfl_xor_sync(0xFFFFFFFF, tr_send_61, 1);
+                            _er_tload[9] = ((tr_odd_7 == 0) ? tr_lo_61 : tr_got_61);
+                            _er_tload[13] = ((tr_odd_7 == 0) ? tr_got_61 : tr_hi_61);
+                            float tr_lo_62 = _er_tload[10];
+                            float tr_hi_62 = _er_tload[14];
+                            float tr_send_62 = ((tr_odd_7 == 0) ? tr_hi_62 : tr_lo_62);
+                            float tr_got_62 = __shfl_xor_sync(0xFFFFFFFF, tr_send_62, 1);
+                            _er_tload[10] = ((tr_odd_7 == 0) ? tr_lo_62 : tr_got_62);
+                            _er_tload[14] = ((tr_odd_7 == 0) ? tr_got_62 : tr_hi_62);
+                            float tr_lo_63 = _er_tload[11];
+                            float tr_hi_63 = _er_tload[15];
+                            float tr_send_63 = ((tr_odd_7 == 0) ? tr_hi_63 : tr_lo_63);
+                            float tr_got_63 = __shfl_xor_sync(0xFFFFFFFF, tr_send_63, 1);
+                            _er_tload[11] = ((tr_odd_7 == 0) ? tr_lo_63 : tr_got_63);
+                            _er_tload[15] = ((tr_odd_7 == 0) ? tr_got_63 : tr_hi_63);
+                            asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[tr_at_7 + 8])), "f"(_er_tload[8]), "f"(_er_tload[9]), "f"(_er_tload[10]), "f"(_er_tload[11]), "l"(0x14F0000000000000ULL) : "memory");
+                            asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[tr_at_7 + 8 + TILE_K])), "f"(_er_tload[12]), "f"(_er_tload[13]), "f"(_er_tload[14]), "f"(_er_tload[15]), "l"(0x14F0000000000000ULL) : "memory");
                         }
                         if (elect_sync()) {
                             asm volatile("tcgen05.fence::before_thread_sync;");
@@ -5995,10 +6395,60 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                             }
                         }
                         if (whole_te == 0) {
-                            asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[er_part_t + er_col_b])), "f"(_er_tload[0]), "f"(_er_tload[1]), "f"(_er_tload[2]), "f"(_er_tload[3]) : "memory");
-                            asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[er_part_t + er_col_b + 4])), "f"(_er_tload[4]), "f"(_er_tload[5]), "f"(_er_tload[6]), "f"(_er_tload[7]) : "memory");
-                            asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[er_part_t + er_col_b + 8])), "f"(_er_tload[8]), "f"(_er_tload[9]), "f"(_er_tload[10]), "f"(_er_tload[11]) : "memory");
-                            asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[er_part_t + er_col_b + 12])), "f"(_er_tload[12]), "f"(_er_tload[13]), "f"(_er_tload[14]), "f"(_er_tload[15]) : "memory");
+                            int tr_odd_8 = lane & 1;
+                            int tr_at_8 = er_part_t + er_col_b + tr_odd_8 * (4 - TILE_K);
+                            float tr_lo_64 = _er_tload[0];
+                            float tr_hi_64 = _er_tload[4];
+                            float tr_send_64 = ((tr_odd_8 == 0) ? tr_hi_64 : tr_lo_64);
+                            float tr_got_64 = __shfl_xor_sync(0xFFFFFFFF, tr_send_64, 1);
+                            _er_tload[0] = ((tr_odd_8 == 0) ? tr_lo_64 : tr_got_64);
+                            _er_tload[4] = ((tr_odd_8 == 0) ? tr_got_64 : tr_hi_64);
+                            float tr_lo_65 = _er_tload[1];
+                            float tr_hi_65 = _er_tload[5];
+                            float tr_send_65 = ((tr_odd_8 == 0) ? tr_hi_65 : tr_lo_65);
+                            float tr_got_65 = __shfl_xor_sync(0xFFFFFFFF, tr_send_65, 1);
+                            _er_tload[1] = ((tr_odd_8 == 0) ? tr_lo_65 : tr_got_65);
+                            _er_tload[5] = ((tr_odd_8 == 0) ? tr_got_65 : tr_hi_65);
+                            float tr_lo_66 = _er_tload[2];
+                            float tr_hi_66 = _er_tload[6];
+                            float tr_send_66 = ((tr_odd_8 == 0) ? tr_hi_66 : tr_lo_66);
+                            float tr_got_66 = __shfl_xor_sync(0xFFFFFFFF, tr_send_66, 1);
+                            _er_tload[2] = ((tr_odd_8 == 0) ? tr_lo_66 : tr_got_66);
+                            _er_tload[6] = ((tr_odd_8 == 0) ? tr_got_66 : tr_hi_66);
+                            float tr_lo_67 = _er_tload[3];
+                            float tr_hi_67 = _er_tload[7];
+                            float tr_send_67 = ((tr_odd_8 == 0) ? tr_hi_67 : tr_lo_67);
+                            float tr_got_67 = __shfl_xor_sync(0xFFFFFFFF, tr_send_67, 1);
+                            _er_tload[3] = ((tr_odd_8 == 0) ? tr_lo_67 : tr_got_67);
+                            _er_tload[7] = ((tr_odd_8 == 0) ? tr_got_67 : tr_hi_67);
+                            asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[tr_at_8])), "f"(_er_tload[0]), "f"(_er_tload[1]), "f"(_er_tload[2]), "f"(_er_tload[3]), "l"(0x14F0000000000000ULL) : "memory");
+                            asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[tr_at_8 + TILE_K])), "f"(_er_tload[4]), "f"(_er_tload[5]), "f"(_er_tload[6]), "f"(_er_tload[7]), "l"(0x14F0000000000000ULL) : "memory");
+                            float tr_lo_68 = _er_tload[8];
+                            float tr_hi_68 = _er_tload[12];
+                            float tr_send_68 = ((tr_odd_8 == 0) ? tr_hi_68 : tr_lo_68);
+                            float tr_got_68 = __shfl_xor_sync(0xFFFFFFFF, tr_send_68, 1);
+                            _er_tload[8] = ((tr_odd_8 == 0) ? tr_lo_68 : tr_got_68);
+                            _er_tload[12] = ((tr_odd_8 == 0) ? tr_got_68 : tr_hi_68);
+                            float tr_lo_69 = _er_tload[9];
+                            float tr_hi_69 = _er_tload[13];
+                            float tr_send_69 = ((tr_odd_8 == 0) ? tr_hi_69 : tr_lo_69);
+                            float tr_got_69 = __shfl_xor_sync(0xFFFFFFFF, tr_send_69, 1);
+                            _er_tload[9] = ((tr_odd_8 == 0) ? tr_lo_69 : tr_got_69);
+                            _er_tload[13] = ((tr_odd_8 == 0) ? tr_got_69 : tr_hi_69);
+                            float tr_lo_70 = _er_tload[10];
+                            float tr_hi_70 = _er_tload[14];
+                            float tr_send_70 = ((tr_odd_8 == 0) ? tr_hi_70 : tr_lo_70);
+                            float tr_got_70 = __shfl_xor_sync(0xFFFFFFFF, tr_send_70, 1);
+                            _er_tload[10] = ((tr_odd_8 == 0) ? tr_lo_70 : tr_got_70);
+                            _er_tload[14] = ((tr_odd_8 == 0) ? tr_got_70 : tr_hi_70);
+                            float tr_lo_71 = _er_tload[11];
+                            float tr_hi_71 = _er_tload[15];
+                            float tr_send_71 = ((tr_odd_8 == 0) ? tr_hi_71 : tr_lo_71);
+                            float tr_got_71 = __shfl_xor_sync(0xFFFFFFFF, tr_send_71, 1);
+                            _er_tload[11] = ((tr_odd_8 == 0) ? tr_lo_71 : tr_got_71);
+                            _er_tload[15] = ((tr_odd_8 == 0) ? tr_got_71 : tr_hi_71);
+                            asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[tr_at_8 + 8])), "f"(_er_tload[8]), "f"(_er_tload[9]), "f"(_er_tload[10]), "f"(_er_tload[11]), "l"(0x14F0000000000000ULL) : "memory");
+                            asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[tr_at_8 + 8 + TILE_K])), "f"(_er_tload[12]), "f"(_er_tload[13]), "f"(_er_tload[14]), "f"(_er_tload[15]), "l"(0x14F0000000000000ULL) : "memory");
                         }
                         tmem_ld_x16(&_er_tload[0], er_rowt + (er_col_b + 16));
                         asm volatile("tcgen05.wait::ld.sync.aligned;");
@@ -6070,10 +6520,60 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                             }
                         }
                         if (whole_te == 0) {
-                            asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[er_part_t + (er_col_b + 16)])), "f"(_er_tload[0]), "f"(_er_tload[1]), "f"(_er_tload[2]), "f"(_er_tload[3]) : "memory");
-                            asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[er_part_t + (er_col_b + 16) + 4])), "f"(_er_tload[4]), "f"(_er_tload[5]), "f"(_er_tload[6]), "f"(_er_tload[7]) : "memory");
-                            asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[er_part_t + (er_col_b + 16) + 8])), "f"(_er_tload[8]), "f"(_er_tload[9]), "f"(_er_tload[10]), "f"(_er_tload[11]) : "memory");
-                            asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[er_part_t + (er_col_b + 16) + 12])), "f"(_er_tload[12]), "f"(_er_tload[13]), "f"(_er_tload[14]), "f"(_er_tload[15]) : "memory");
+                            int tr_odd_9 = lane & 1;
+                            int tr_at_9 = er_part_t + (er_col_b + 16) + tr_odd_9 * (4 - TILE_K);
+                            float tr_lo_72 = _er_tload[0];
+                            float tr_hi_72 = _er_tload[4];
+                            float tr_send_72 = ((tr_odd_9 == 0) ? tr_hi_72 : tr_lo_72);
+                            float tr_got_72 = __shfl_xor_sync(0xFFFFFFFF, tr_send_72, 1);
+                            _er_tload[0] = ((tr_odd_9 == 0) ? tr_lo_72 : tr_got_72);
+                            _er_tload[4] = ((tr_odd_9 == 0) ? tr_got_72 : tr_hi_72);
+                            float tr_lo_73 = _er_tload[1];
+                            float tr_hi_73 = _er_tload[5];
+                            float tr_send_73 = ((tr_odd_9 == 0) ? tr_hi_73 : tr_lo_73);
+                            float tr_got_73 = __shfl_xor_sync(0xFFFFFFFF, tr_send_73, 1);
+                            _er_tload[1] = ((tr_odd_9 == 0) ? tr_lo_73 : tr_got_73);
+                            _er_tload[5] = ((tr_odd_9 == 0) ? tr_got_73 : tr_hi_73);
+                            float tr_lo_74 = _er_tload[2];
+                            float tr_hi_74 = _er_tload[6];
+                            float tr_send_74 = ((tr_odd_9 == 0) ? tr_hi_74 : tr_lo_74);
+                            float tr_got_74 = __shfl_xor_sync(0xFFFFFFFF, tr_send_74, 1);
+                            _er_tload[2] = ((tr_odd_9 == 0) ? tr_lo_74 : tr_got_74);
+                            _er_tload[6] = ((tr_odd_9 == 0) ? tr_got_74 : tr_hi_74);
+                            float tr_lo_75 = _er_tload[3];
+                            float tr_hi_75 = _er_tload[7];
+                            float tr_send_75 = ((tr_odd_9 == 0) ? tr_hi_75 : tr_lo_75);
+                            float tr_got_75 = __shfl_xor_sync(0xFFFFFFFF, tr_send_75, 1);
+                            _er_tload[3] = ((tr_odd_9 == 0) ? tr_lo_75 : tr_got_75);
+                            _er_tload[7] = ((tr_odd_9 == 0) ? tr_got_75 : tr_hi_75);
+                            asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[tr_at_9])), "f"(_er_tload[0]), "f"(_er_tload[1]), "f"(_er_tload[2]), "f"(_er_tload[3]), "l"(0x14F0000000000000ULL) : "memory");
+                            asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[tr_at_9 + TILE_K])), "f"(_er_tload[4]), "f"(_er_tload[5]), "f"(_er_tload[6]), "f"(_er_tload[7]), "l"(0x14F0000000000000ULL) : "memory");
+                            float tr_lo_76 = _er_tload[8];
+                            float tr_hi_76 = _er_tload[12];
+                            float tr_send_76 = ((tr_odd_9 == 0) ? tr_hi_76 : tr_lo_76);
+                            float tr_got_76 = __shfl_xor_sync(0xFFFFFFFF, tr_send_76, 1);
+                            _er_tload[8] = ((tr_odd_9 == 0) ? tr_lo_76 : tr_got_76);
+                            _er_tload[12] = ((tr_odd_9 == 0) ? tr_got_76 : tr_hi_76);
+                            float tr_lo_77 = _er_tload[9];
+                            float tr_hi_77 = _er_tload[13];
+                            float tr_send_77 = ((tr_odd_9 == 0) ? tr_hi_77 : tr_lo_77);
+                            float tr_got_77 = __shfl_xor_sync(0xFFFFFFFF, tr_send_77, 1);
+                            _er_tload[9] = ((tr_odd_9 == 0) ? tr_lo_77 : tr_got_77);
+                            _er_tload[13] = ((tr_odd_9 == 0) ? tr_got_77 : tr_hi_77);
+                            float tr_lo_78 = _er_tload[10];
+                            float tr_hi_78 = _er_tload[14];
+                            float tr_send_78 = ((tr_odd_9 == 0) ? tr_hi_78 : tr_lo_78);
+                            float tr_got_78 = __shfl_xor_sync(0xFFFFFFFF, tr_send_78, 1);
+                            _er_tload[10] = ((tr_odd_9 == 0) ? tr_lo_78 : tr_got_78);
+                            _er_tload[14] = ((tr_odd_9 == 0) ? tr_got_78 : tr_hi_78);
+                            float tr_lo_79 = _er_tload[11];
+                            float tr_hi_79 = _er_tload[15];
+                            float tr_send_79 = ((tr_odd_9 == 0) ? tr_hi_79 : tr_lo_79);
+                            float tr_got_79 = __shfl_xor_sync(0xFFFFFFFF, tr_send_79, 1);
+                            _er_tload[11] = ((tr_odd_9 == 0) ? tr_lo_79 : tr_got_79);
+                            _er_tload[15] = ((tr_odd_9 == 0) ? tr_got_79 : tr_hi_79);
+                            asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[tr_at_9 + 8])), "f"(_er_tload[8]), "f"(_er_tload[9]), "f"(_er_tload[10]), "f"(_er_tload[11]), "l"(0x14F0000000000000ULL) : "memory");
+                            asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[tr_at_9 + 8 + TILE_K])), "f"(_er_tload[12]), "f"(_er_tload[13]), "f"(_er_tload[14]), "f"(_er_tload[15]), "l"(0x14F0000000000000ULL) : "memory");
                         }
                         tmem_ld_x16(&_er_tload[0], er_rowt + (er_col_b + 32));
                         asm volatile("tcgen05.wait::ld.sync.aligned;");
@@ -6145,10 +6645,60 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                             }
                         }
                         if (whole_te == 0) {
-                            asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[er_part_t + (er_col_b + 32)])), "f"(_er_tload[0]), "f"(_er_tload[1]), "f"(_er_tload[2]), "f"(_er_tload[3]) : "memory");
-                            asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[er_part_t + (er_col_b + 32) + 4])), "f"(_er_tload[4]), "f"(_er_tload[5]), "f"(_er_tload[6]), "f"(_er_tload[7]) : "memory");
-                            asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[er_part_t + (er_col_b + 32) + 8])), "f"(_er_tload[8]), "f"(_er_tload[9]), "f"(_er_tload[10]), "f"(_er_tload[11]) : "memory");
-                            asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[er_part_t + (er_col_b + 32) + 12])), "f"(_er_tload[12]), "f"(_er_tload[13]), "f"(_er_tload[14]), "f"(_er_tload[15]) : "memory");
+                            int tr_odd_10 = lane & 1;
+                            int tr_at_10 = er_part_t + (er_col_b + 32) + tr_odd_10 * (4 - TILE_K);
+                            float tr_lo_80 = _er_tload[0];
+                            float tr_hi_80 = _er_tload[4];
+                            float tr_send_80 = ((tr_odd_10 == 0) ? tr_hi_80 : tr_lo_80);
+                            float tr_got_80 = __shfl_xor_sync(0xFFFFFFFF, tr_send_80, 1);
+                            _er_tload[0] = ((tr_odd_10 == 0) ? tr_lo_80 : tr_got_80);
+                            _er_tload[4] = ((tr_odd_10 == 0) ? tr_got_80 : tr_hi_80);
+                            float tr_lo_81 = _er_tload[1];
+                            float tr_hi_81 = _er_tload[5];
+                            float tr_send_81 = ((tr_odd_10 == 0) ? tr_hi_81 : tr_lo_81);
+                            float tr_got_81 = __shfl_xor_sync(0xFFFFFFFF, tr_send_81, 1);
+                            _er_tload[1] = ((tr_odd_10 == 0) ? tr_lo_81 : tr_got_81);
+                            _er_tload[5] = ((tr_odd_10 == 0) ? tr_got_81 : tr_hi_81);
+                            float tr_lo_82 = _er_tload[2];
+                            float tr_hi_82 = _er_tload[6];
+                            float tr_send_82 = ((tr_odd_10 == 0) ? tr_hi_82 : tr_lo_82);
+                            float tr_got_82 = __shfl_xor_sync(0xFFFFFFFF, tr_send_82, 1);
+                            _er_tload[2] = ((tr_odd_10 == 0) ? tr_lo_82 : tr_got_82);
+                            _er_tload[6] = ((tr_odd_10 == 0) ? tr_got_82 : tr_hi_82);
+                            float tr_lo_83 = _er_tload[3];
+                            float tr_hi_83 = _er_tload[7];
+                            float tr_send_83 = ((tr_odd_10 == 0) ? tr_hi_83 : tr_lo_83);
+                            float tr_got_83 = __shfl_xor_sync(0xFFFFFFFF, tr_send_83, 1);
+                            _er_tload[3] = ((tr_odd_10 == 0) ? tr_lo_83 : tr_got_83);
+                            _er_tload[7] = ((tr_odd_10 == 0) ? tr_got_83 : tr_hi_83);
+                            asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[tr_at_10])), "f"(_er_tload[0]), "f"(_er_tload[1]), "f"(_er_tload[2]), "f"(_er_tload[3]), "l"(0x14F0000000000000ULL) : "memory");
+                            asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[tr_at_10 + TILE_K])), "f"(_er_tload[4]), "f"(_er_tload[5]), "f"(_er_tload[6]), "f"(_er_tload[7]), "l"(0x14F0000000000000ULL) : "memory");
+                            float tr_lo_84 = _er_tload[8];
+                            float tr_hi_84 = _er_tload[12];
+                            float tr_send_84 = ((tr_odd_10 == 0) ? tr_hi_84 : tr_lo_84);
+                            float tr_got_84 = __shfl_xor_sync(0xFFFFFFFF, tr_send_84, 1);
+                            _er_tload[8] = ((tr_odd_10 == 0) ? tr_lo_84 : tr_got_84);
+                            _er_tload[12] = ((tr_odd_10 == 0) ? tr_got_84 : tr_hi_84);
+                            float tr_lo_85 = _er_tload[9];
+                            float tr_hi_85 = _er_tload[13];
+                            float tr_send_85 = ((tr_odd_10 == 0) ? tr_hi_85 : tr_lo_85);
+                            float tr_got_85 = __shfl_xor_sync(0xFFFFFFFF, tr_send_85, 1);
+                            _er_tload[9] = ((tr_odd_10 == 0) ? tr_lo_85 : tr_got_85);
+                            _er_tload[13] = ((tr_odd_10 == 0) ? tr_got_85 : tr_hi_85);
+                            float tr_lo_86 = _er_tload[10];
+                            float tr_hi_86 = _er_tload[14];
+                            float tr_send_86 = ((tr_odd_10 == 0) ? tr_hi_86 : tr_lo_86);
+                            float tr_got_86 = __shfl_xor_sync(0xFFFFFFFF, tr_send_86, 1);
+                            _er_tload[10] = ((tr_odd_10 == 0) ? tr_lo_86 : tr_got_86);
+                            _er_tload[14] = ((tr_odd_10 == 0) ? tr_got_86 : tr_hi_86);
+                            float tr_lo_87 = _er_tload[11];
+                            float tr_hi_87 = _er_tload[15];
+                            float tr_send_87 = ((tr_odd_10 == 0) ? tr_hi_87 : tr_lo_87);
+                            float tr_got_87 = __shfl_xor_sync(0xFFFFFFFF, tr_send_87, 1);
+                            _er_tload[11] = ((tr_odd_10 == 0) ? tr_lo_87 : tr_got_87);
+                            _er_tload[15] = ((tr_odd_10 == 0) ? tr_got_87 : tr_hi_87);
+                            asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[tr_at_10 + 8])), "f"(_er_tload[8]), "f"(_er_tload[9]), "f"(_er_tload[10]), "f"(_er_tload[11]), "l"(0x14F0000000000000ULL) : "memory");
+                            asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[tr_at_10 + 8 + TILE_K])), "f"(_er_tload[12]), "f"(_er_tload[13]), "f"(_er_tload[14]), "f"(_er_tload[15]), "l"(0x14F0000000000000ULL) : "memory");
                         }
                         tmem_ld_x16(&_er_tload[0], er_rowt + (er_col_b + 48));
                         asm volatile("tcgen05.wait::ld.sync.aligned;");
@@ -6220,10 +6770,60 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                             }
                         }
                         if (whole_te == 0) {
-                            asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[er_part_t + (er_col_b + 48)])), "f"(_er_tload[0]), "f"(_er_tload[1]), "f"(_er_tload[2]), "f"(_er_tload[3]) : "memory");
-                            asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[er_part_t + (er_col_b + 48) + 4])), "f"(_er_tload[4]), "f"(_er_tload[5]), "f"(_er_tload[6]), "f"(_er_tload[7]) : "memory");
-                            asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[er_part_t + (er_col_b + 48) + 8])), "f"(_er_tload[8]), "f"(_er_tload[9]), "f"(_er_tload[10]), "f"(_er_tload[11]) : "memory");
-                            asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[er_part_t + (er_col_b + 48) + 12])), "f"(_er_tload[12]), "f"(_er_tload[13]), "f"(_er_tload[14]), "f"(_er_tload[15]) : "memory");
+                            int tr_odd_11 = lane & 1;
+                            int tr_at_11 = er_part_t + (er_col_b + 48) + tr_odd_11 * (4 - TILE_K);
+                            float tr_lo_88 = _er_tload[0];
+                            float tr_hi_88 = _er_tload[4];
+                            float tr_send_88 = ((tr_odd_11 == 0) ? tr_hi_88 : tr_lo_88);
+                            float tr_got_88 = __shfl_xor_sync(0xFFFFFFFF, tr_send_88, 1);
+                            _er_tload[0] = ((tr_odd_11 == 0) ? tr_lo_88 : tr_got_88);
+                            _er_tload[4] = ((tr_odd_11 == 0) ? tr_got_88 : tr_hi_88);
+                            float tr_lo_89 = _er_tload[1];
+                            float tr_hi_89 = _er_tload[5];
+                            float tr_send_89 = ((tr_odd_11 == 0) ? tr_hi_89 : tr_lo_89);
+                            float tr_got_89 = __shfl_xor_sync(0xFFFFFFFF, tr_send_89, 1);
+                            _er_tload[1] = ((tr_odd_11 == 0) ? tr_lo_89 : tr_got_89);
+                            _er_tload[5] = ((tr_odd_11 == 0) ? tr_got_89 : tr_hi_89);
+                            float tr_lo_90 = _er_tload[2];
+                            float tr_hi_90 = _er_tload[6];
+                            float tr_send_90 = ((tr_odd_11 == 0) ? tr_hi_90 : tr_lo_90);
+                            float tr_got_90 = __shfl_xor_sync(0xFFFFFFFF, tr_send_90, 1);
+                            _er_tload[2] = ((tr_odd_11 == 0) ? tr_lo_90 : tr_got_90);
+                            _er_tload[6] = ((tr_odd_11 == 0) ? tr_got_90 : tr_hi_90);
+                            float tr_lo_91 = _er_tload[3];
+                            float tr_hi_91 = _er_tload[7];
+                            float tr_send_91 = ((tr_odd_11 == 0) ? tr_hi_91 : tr_lo_91);
+                            float tr_got_91 = __shfl_xor_sync(0xFFFFFFFF, tr_send_91, 1);
+                            _er_tload[3] = ((tr_odd_11 == 0) ? tr_lo_91 : tr_got_91);
+                            _er_tload[7] = ((tr_odd_11 == 0) ? tr_got_91 : tr_hi_91);
+                            asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[tr_at_11])), "f"(_er_tload[0]), "f"(_er_tload[1]), "f"(_er_tload[2]), "f"(_er_tload[3]), "l"(0x14F0000000000000ULL) : "memory");
+                            asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[tr_at_11 + TILE_K])), "f"(_er_tload[4]), "f"(_er_tload[5]), "f"(_er_tload[6]), "f"(_er_tload[7]), "l"(0x14F0000000000000ULL) : "memory");
+                            float tr_lo_92 = _er_tload[8];
+                            float tr_hi_92 = _er_tload[12];
+                            float tr_send_92 = ((tr_odd_11 == 0) ? tr_hi_92 : tr_lo_92);
+                            float tr_got_92 = __shfl_xor_sync(0xFFFFFFFF, tr_send_92, 1);
+                            _er_tload[8] = ((tr_odd_11 == 0) ? tr_lo_92 : tr_got_92);
+                            _er_tload[12] = ((tr_odd_11 == 0) ? tr_got_92 : tr_hi_92);
+                            float tr_lo_93 = _er_tload[9];
+                            float tr_hi_93 = _er_tload[13];
+                            float tr_send_93 = ((tr_odd_11 == 0) ? tr_hi_93 : tr_lo_93);
+                            float tr_got_93 = __shfl_xor_sync(0xFFFFFFFF, tr_send_93, 1);
+                            _er_tload[9] = ((tr_odd_11 == 0) ? tr_lo_93 : tr_got_93);
+                            _er_tload[13] = ((tr_odd_11 == 0) ? tr_got_93 : tr_hi_93);
+                            float tr_lo_94 = _er_tload[10];
+                            float tr_hi_94 = _er_tload[14];
+                            float tr_send_94 = ((tr_odd_11 == 0) ? tr_hi_94 : tr_lo_94);
+                            float tr_got_94 = __shfl_xor_sync(0xFFFFFFFF, tr_send_94, 1);
+                            _er_tload[10] = ((tr_odd_11 == 0) ? tr_lo_94 : tr_got_94);
+                            _er_tload[14] = ((tr_odd_11 == 0) ? tr_got_94 : tr_hi_94);
+                            float tr_lo_95 = _er_tload[11];
+                            float tr_hi_95 = _er_tload[15];
+                            float tr_send_95 = ((tr_odd_11 == 0) ? tr_hi_95 : tr_lo_95);
+                            float tr_got_95 = __shfl_xor_sync(0xFFFFFFFF, tr_send_95, 1);
+                            _er_tload[11] = ((tr_odd_11 == 0) ? tr_lo_95 : tr_got_95);
+                            _er_tload[15] = ((tr_odd_11 == 0) ? tr_got_95 : tr_hi_95);
+                            asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[tr_at_11 + 8])), "f"(_er_tload[8]), "f"(_er_tload[9]), "f"(_er_tload[10]), "f"(_er_tload[11]), "l"(0x14F0000000000000ULL) : "memory");
+                            asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[tr_at_11 + 8 + TILE_K])), "f"(_er_tload[12]), "f"(_er_tload[13]), "f"(_er_tload[14]), "f"(_er_tload[15]), "l"(0x14F0000000000000ULL) : "memory");
                         }
                         tmem_ld_x16(&_er_tload[0], er_rowt + (er_col_b + 64));
                         asm volatile("tcgen05.wait::ld.sync.aligned;");
@@ -6295,10 +6895,60 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                             }
                         }
                         if (whole_te == 0) {
-                            asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[er_part_t + (er_col_b + 64)])), "f"(_er_tload[0]), "f"(_er_tload[1]), "f"(_er_tload[2]), "f"(_er_tload[3]) : "memory");
-                            asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[er_part_t + (er_col_b + 64) + 4])), "f"(_er_tload[4]), "f"(_er_tload[5]), "f"(_er_tload[6]), "f"(_er_tload[7]) : "memory");
-                            asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[er_part_t + (er_col_b + 64) + 8])), "f"(_er_tload[8]), "f"(_er_tload[9]), "f"(_er_tload[10]), "f"(_er_tload[11]) : "memory");
-                            asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[er_part_t + (er_col_b + 64) + 12])), "f"(_er_tload[12]), "f"(_er_tload[13]), "f"(_er_tload[14]), "f"(_er_tload[15]) : "memory");
+                            int tr_odd_12 = lane & 1;
+                            int tr_at_12 = er_part_t + (er_col_b + 64) + tr_odd_12 * (4 - TILE_K);
+                            float tr_lo_96 = _er_tload[0];
+                            float tr_hi_96 = _er_tload[4];
+                            float tr_send_96 = ((tr_odd_12 == 0) ? tr_hi_96 : tr_lo_96);
+                            float tr_got_96 = __shfl_xor_sync(0xFFFFFFFF, tr_send_96, 1);
+                            _er_tload[0] = ((tr_odd_12 == 0) ? tr_lo_96 : tr_got_96);
+                            _er_tload[4] = ((tr_odd_12 == 0) ? tr_got_96 : tr_hi_96);
+                            float tr_lo_97 = _er_tload[1];
+                            float tr_hi_97 = _er_tload[5];
+                            float tr_send_97 = ((tr_odd_12 == 0) ? tr_hi_97 : tr_lo_97);
+                            float tr_got_97 = __shfl_xor_sync(0xFFFFFFFF, tr_send_97, 1);
+                            _er_tload[1] = ((tr_odd_12 == 0) ? tr_lo_97 : tr_got_97);
+                            _er_tload[5] = ((tr_odd_12 == 0) ? tr_got_97 : tr_hi_97);
+                            float tr_lo_98 = _er_tload[2];
+                            float tr_hi_98 = _er_tload[6];
+                            float tr_send_98 = ((tr_odd_12 == 0) ? tr_hi_98 : tr_lo_98);
+                            float tr_got_98 = __shfl_xor_sync(0xFFFFFFFF, tr_send_98, 1);
+                            _er_tload[2] = ((tr_odd_12 == 0) ? tr_lo_98 : tr_got_98);
+                            _er_tload[6] = ((tr_odd_12 == 0) ? tr_got_98 : tr_hi_98);
+                            float tr_lo_99 = _er_tload[3];
+                            float tr_hi_99 = _er_tload[7];
+                            float tr_send_99 = ((tr_odd_12 == 0) ? tr_hi_99 : tr_lo_99);
+                            float tr_got_99 = __shfl_xor_sync(0xFFFFFFFF, tr_send_99, 1);
+                            _er_tload[3] = ((tr_odd_12 == 0) ? tr_lo_99 : tr_got_99);
+                            _er_tload[7] = ((tr_odd_12 == 0) ? tr_got_99 : tr_hi_99);
+                            asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[tr_at_12])), "f"(_er_tload[0]), "f"(_er_tload[1]), "f"(_er_tload[2]), "f"(_er_tload[3]), "l"(0x14F0000000000000ULL) : "memory");
+                            asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[tr_at_12 + TILE_K])), "f"(_er_tload[4]), "f"(_er_tload[5]), "f"(_er_tload[6]), "f"(_er_tload[7]), "l"(0x14F0000000000000ULL) : "memory");
+                            float tr_lo_100 = _er_tload[8];
+                            float tr_hi_100 = _er_tload[12];
+                            float tr_send_100 = ((tr_odd_12 == 0) ? tr_hi_100 : tr_lo_100);
+                            float tr_got_100 = __shfl_xor_sync(0xFFFFFFFF, tr_send_100, 1);
+                            _er_tload[8] = ((tr_odd_12 == 0) ? tr_lo_100 : tr_got_100);
+                            _er_tload[12] = ((tr_odd_12 == 0) ? tr_got_100 : tr_hi_100);
+                            float tr_lo_101 = _er_tload[9];
+                            float tr_hi_101 = _er_tload[13];
+                            float tr_send_101 = ((tr_odd_12 == 0) ? tr_hi_101 : tr_lo_101);
+                            float tr_got_101 = __shfl_xor_sync(0xFFFFFFFF, tr_send_101, 1);
+                            _er_tload[9] = ((tr_odd_12 == 0) ? tr_lo_101 : tr_got_101);
+                            _er_tload[13] = ((tr_odd_12 == 0) ? tr_got_101 : tr_hi_101);
+                            float tr_lo_102 = _er_tload[10];
+                            float tr_hi_102 = _er_tload[14];
+                            float tr_send_102 = ((tr_odd_12 == 0) ? tr_hi_102 : tr_lo_102);
+                            float tr_got_102 = __shfl_xor_sync(0xFFFFFFFF, tr_send_102, 1);
+                            _er_tload[10] = ((tr_odd_12 == 0) ? tr_lo_102 : tr_got_102);
+                            _er_tload[14] = ((tr_odd_12 == 0) ? tr_got_102 : tr_hi_102);
+                            float tr_lo_103 = _er_tload[11];
+                            float tr_hi_103 = _er_tload[15];
+                            float tr_send_103 = ((tr_odd_12 == 0) ? tr_hi_103 : tr_lo_103);
+                            float tr_got_103 = __shfl_xor_sync(0xFFFFFFFF, tr_send_103, 1);
+                            _er_tload[11] = ((tr_odd_12 == 0) ? tr_lo_103 : tr_got_103);
+                            _er_tload[15] = ((tr_odd_12 == 0) ? tr_got_103 : tr_hi_103);
+                            asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[tr_at_12 + 8])), "f"(_er_tload[8]), "f"(_er_tload[9]), "f"(_er_tload[10]), "f"(_er_tload[11]), "l"(0x14F0000000000000ULL) : "memory");
+                            asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[tr_at_12 + 8 + TILE_K])), "f"(_er_tload[12]), "f"(_er_tload[13]), "f"(_er_tload[14]), "f"(_er_tload[15]), "l"(0x14F0000000000000ULL) : "memory");
                         }
                         tmem_ld_x16(&_er_tload[0], er_rowt + (er_col_b + 80));
                         asm volatile("tcgen05.wait::ld.sync.aligned;");
@@ -6370,10 +7020,60 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                             }
                         }
                         if (whole_te == 0) {
-                            asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[er_part_t + (er_col_b + 80)])), "f"(_er_tload[0]), "f"(_er_tload[1]), "f"(_er_tload[2]), "f"(_er_tload[3]) : "memory");
-                            asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[er_part_t + (er_col_b + 80) + 4])), "f"(_er_tload[4]), "f"(_er_tload[5]), "f"(_er_tload[6]), "f"(_er_tload[7]) : "memory");
-                            asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[er_part_t + (er_col_b + 80) + 8])), "f"(_er_tload[8]), "f"(_er_tload[9]), "f"(_er_tload[10]), "f"(_er_tload[11]) : "memory");
-                            asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[er_part_t + (er_col_b + 80) + 12])), "f"(_er_tload[12]), "f"(_er_tload[13]), "f"(_er_tload[14]), "f"(_er_tload[15]) : "memory");
+                            int tr_odd_13 = lane & 1;
+                            int tr_at_13 = er_part_t + (er_col_b + 80) + tr_odd_13 * (4 - TILE_K);
+                            float tr_lo_104 = _er_tload[0];
+                            float tr_hi_104 = _er_tload[4];
+                            float tr_send_104 = ((tr_odd_13 == 0) ? tr_hi_104 : tr_lo_104);
+                            float tr_got_104 = __shfl_xor_sync(0xFFFFFFFF, tr_send_104, 1);
+                            _er_tload[0] = ((tr_odd_13 == 0) ? tr_lo_104 : tr_got_104);
+                            _er_tload[4] = ((tr_odd_13 == 0) ? tr_got_104 : tr_hi_104);
+                            float tr_lo_105 = _er_tload[1];
+                            float tr_hi_105 = _er_tload[5];
+                            float tr_send_105 = ((tr_odd_13 == 0) ? tr_hi_105 : tr_lo_105);
+                            float tr_got_105 = __shfl_xor_sync(0xFFFFFFFF, tr_send_105, 1);
+                            _er_tload[1] = ((tr_odd_13 == 0) ? tr_lo_105 : tr_got_105);
+                            _er_tload[5] = ((tr_odd_13 == 0) ? tr_got_105 : tr_hi_105);
+                            float tr_lo_106 = _er_tload[2];
+                            float tr_hi_106 = _er_tload[6];
+                            float tr_send_106 = ((tr_odd_13 == 0) ? tr_hi_106 : tr_lo_106);
+                            float tr_got_106 = __shfl_xor_sync(0xFFFFFFFF, tr_send_106, 1);
+                            _er_tload[2] = ((tr_odd_13 == 0) ? tr_lo_106 : tr_got_106);
+                            _er_tload[6] = ((tr_odd_13 == 0) ? tr_got_106 : tr_hi_106);
+                            float tr_lo_107 = _er_tload[3];
+                            float tr_hi_107 = _er_tload[7];
+                            float tr_send_107 = ((tr_odd_13 == 0) ? tr_hi_107 : tr_lo_107);
+                            float tr_got_107 = __shfl_xor_sync(0xFFFFFFFF, tr_send_107, 1);
+                            _er_tload[3] = ((tr_odd_13 == 0) ? tr_lo_107 : tr_got_107);
+                            _er_tload[7] = ((tr_odd_13 == 0) ? tr_got_107 : tr_hi_107);
+                            asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[tr_at_13])), "f"(_er_tload[0]), "f"(_er_tload[1]), "f"(_er_tload[2]), "f"(_er_tload[3]), "l"(0x14F0000000000000ULL) : "memory");
+                            asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[tr_at_13 + TILE_K])), "f"(_er_tload[4]), "f"(_er_tload[5]), "f"(_er_tload[6]), "f"(_er_tload[7]), "l"(0x14F0000000000000ULL) : "memory");
+                            float tr_lo_108 = _er_tload[8];
+                            float tr_hi_108 = _er_tload[12];
+                            float tr_send_108 = ((tr_odd_13 == 0) ? tr_hi_108 : tr_lo_108);
+                            float tr_got_108 = __shfl_xor_sync(0xFFFFFFFF, tr_send_108, 1);
+                            _er_tload[8] = ((tr_odd_13 == 0) ? tr_lo_108 : tr_got_108);
+                            _er_tload[12] = ((tr_odd_13 == 0) ? tr_got_108 : tr_hi_108);
+                            float tr_lo_109 = _er_tload[9];
+                            float tr_hi_109 = _er_tload[13];
+                            float tr_send_109 = ((tr_odd_13 == 0) ? tr_hi_109 : tr_lo_109);
+                            float tr_got_109 = __shfl_xor_sync(0xFFFFFFFF, tr_send_109, 1);
+                            _er_tload[9] = ((tr_odd_13 == 0) ? tr_lo_109 : tr_got_109);
+                            _er_tload[13] = ((tr_odd_13 == 0) ? tr_got_109 : tr_hi_109);
+                            float tr_lo_110 = _er_tload[10];
+                            float tr_hi_110 = _er_tload[14];
+                            float tr_send_110 = ((tr_odd_13 == 0) ? tr_hi_110 : tr_lo_110);
+                            float tr_got_110 = __shfl_xor_sync(0xFFFFFFFF, tr_send_110, 1);
+                            _er_tload[10] = ((tr_odd_13 == 0) ? tr_lo_110 : tr_got_110);
+                            _er_tload[14] = ((tr_odd_13 == 0) ? tr_got_110 : tr_hi_110);
+                            float tr_lo_111 = _er_tload[11];
+                            float tr_hi_111 = _er_tload[15];
+                            float tr_send_111 = ((tr_odd_13 == 0) ? tr_hi_111 : tr_lo_111);
+                            float tr_got_111 = __shfl_xor_sync(0xFFFFFFFF, tr_send_111, 1);
+                            _er_tload[11] = ((tr_odd_13 == 0) ? tr_lo_111 : tr_got_111);
+                            _er_tload[15] = ((tr_odd_13 == 0) ? tr_got_111 : tr_hi_111);
+                            asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[tr_at_13 + 8])), "f"(_er_tload[8]), "f"(_er_tload[9]), "f"(_er_tload[10]), "f"(_er_tload[11]), "l"(0x14F0000000000000ULL) : "memory");
+                            asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[tr_at_13 + 8 + TILE_K])), "f"(_er_tload[12]), "f"(_er_tload[13]), "f"(_er_tload[14]), "f"(_er_tload[15]), "l"(0x14F0000000000000ULL) : "memory");
                         }
                         tmem_ld_x16(&_er_tload[0], er_rowt + (er_col_b + 96));
                         asm volatile("tcgen05.wait::ld.sync.aligned;");
@@ -6445,10 +7145,60 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                             }
                         }
                         if (whole_te == 0) {
-                            asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[er_part_t + (er_col_b + 96)])), "f"(_er_tload[0]), "f"(_er_tload[1]), "f"(_er_tload[2]), "f"(_er_tload[3]) : "memory");
-                            asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[er_part_t + (er_col_b + 96) + 4])), "f"(_er_tload[4]), "f"(_er_tload[5]), "f"(_er_tload[6]), "f"(_er_tload[7]) : "memory");
-                            asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[er_part_t + (er_col_b + 96) + 8])), "f"(_er_tload[8]), "f"(_er_tload[9]), "f"(_er_tload[10]), "f"(_er_tload[11]) : "memory");
-                            asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[er_part_t + (er_col_b + 96) + 12])), "f"(_er_tload[12]), "f"(_er_tload[13]), "f"(_er_tload[14]), "f"(_er_tload[15]) : "memory");
+                            int tr_odd_14 = lane & 1;
+                            int tr_at_14 = er_part_t + (er_col_b + 96) + tr_odd_14 * (4 - TILE_K);
+                            float tr_lo_112 = _er_tload[0];
+                            float tr_hi_112 = _er_tload[4];
+                            float tr_send_112 = ((tr_odd_14 == 0) ? tr_hi_112 : tr_lo_112);
+                            float tr_got_112 = __shfl_xor_sync(0xFFFFFFFF, tr_send_112, 1);
+                            _er_tload[0] = ((tr_odd_14 == 0) ? tr_lo_112 : tr_got_112);
+                            _er_tload[4] = ((tr_odd_14 == 0) ? tr_got_112 : tr_hi_112);
+                            float tr_lo_113 = _er_tload[1];
+                            float tr_hi_113 = _er_tload[5];
+                            float tr_send_113 = ((tr_odd_14 == 0) ? tr_hi_113 : tr_lo_113);
+                            float tr_got_113 = __shfl_xor_sync(0xFFFFFFFF, tr_send_113, 1);
+                            _er_tload[1] = ((tr_odd_14 == 0) ? tr_lo_113 : tr_got_113);
+                            _er_tload[5] = ((tr_odd_14 == 0) ? tr_got_113 : tr_hi_113);
+                            float tr_lo_114 = _er_tload[2];
+                            float tr_hi_114 = _er_tload[6];
+                            float tr_send_114 = ((tr_odd_14 == 0) ? tr_hi_114 : tr_lo_114);
+                            float tr_got_114 = __shfl_xor_sync(0xFFFFFFFF, tr_send_114, 1);
+                            _er_tload[2] = ((tr_odd_14 == 0) ? tr_lo_114 : tr_got_114);
+                            _er_tload[6] = ((tr_odd_14 == 0) ? tr_got_114 : tr_hi_114);
+                            float tr_lo_115 = _er_tload[3];
+                            float tr_hi_115 = _er_tload[7];
+                            float tr_send_115 = ((tr_odd_14 == 0) ? tr_hi_115 : tr_lo_115);
+                            float tr_got_115 = __shfl_xor_sync(0xFFFFFFFF, tr_send_115, 1);
+                            _er_tload[3] = ((tr_odd_14 == 0) ? tr_lo_115 : tr_got_115);
+                            _er_tload[7] = ((tr_odd_14 == 0) ? tr_got_115 : tr_hi_115);
+                            asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[tr_at_14])), "f"(_er_tload[0]), "f"(_er_tload[1]), "f"(_er_tload[2]), "f"(_er_tload[3]), "l"(0x14F0000000000000ULL) : "memory");
+                            asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[tr_at_14 + TILE_K])), "f"(_er_tload[4]), "f"(_er_tload[5]), "f"(_er_tload[6]), "f"(_er_tload[7]), "l"(0x14F0000000000000ULL) : "memory");
+                            float tr_lo_116 = _er_tload[8];
+                            float tr_hi_116 = _er_tload[12];
+                            float tr_send_116 = ((tr_odd_14 == 0) ? tr_hi_116 : tr_lo_116);
+                            float tr_got_116 = __shfl_xor_sync(0xFFFFFFFF, tr_send_116, 1);
+                            _er_tload[8] = ((tr_odd_14 == 0) ? tr_lo_116 : tr_got_116);
+                            _er_tload[12] = ((tr_odd_14 == 0) ? tr_got_116 : tr_hi_116);
+                            float tr_lo_117 = _er_tload[9];
+                            float tr_hi_117 = _er_tload[13];
+                            float tr_send_117 = ((tr_odd_14 == 0) ? tr_hi_117 : tr_lo_117);
+                            float tr_got_117 = __shfl_xor_sync(0xFFFFFFFF, tr_send_117, 1);
+                            _er_tload[9] = ((tr_odd_14 == 0) ? tr_lo_117 : tr_got_117);
+                            _er_tload[13] = ((tr_odd_14 == 0) ? tr_got_117 : tr_hi_117);
+                            float tr_lo_118 = _er_tload[10];
+                            float tr_hi_118 = _er_tload[14];
+                            float tr_send_118 = ((tr_odd_14 == 0) ? tr_hi_118 : tr_lo_118);
+                            float tr_got_118 = __shfl_xor_sync(0xFFFFFFFF, tr_send_118, 1);
+                            _er_tload[10] = ((tr_odd_14 == 0) ? tr_lo_118 : tr_got_118);
+                            _er_tload[14] = ((tr_odd_14 == 0) ? tr_got_118 : tr_hi_118);
+                            float tr_lo_119 = _er_tload[11];
+                            float tr_hi_119 = _er_tload[15];
+                            float tr_send_119 = ((tr_odd_14 == 0) ? tr_hi_119 : tr_lo_119);
+                            float tr_got_119 = __shfl_xor_sync(0xFFFFFFFF, tr_send_119, 1);
+                            _er_tload[11] = ((tr_odd_14 == 0) ? tr_lo_119 : tr_got_119);
+                            _er_tload[15] = ((tr_odd_14 == 0) ? tr_got_119 : tr_hi_119);
+                            asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[tr_at_14 + 8])), "f"(_er_tload[8]), "f"(_er_tload[9]), "f"(_er_tload[10]), "f"(_er_tload[11]), "l"(0x14F0000000000000ULL) : "memory");
+                            asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[tr_at_14 + 8 + TILE_K])), "f"(_er_tload[12]), "f"(_er_tload[13]), "f"(_er_tload[14]), "f"(_er_tload[15]), "l"(0x14F0000000000000ULL) : "memory");
                         }
                         tmem_ld_x16(&_er_tload[0], er_rowt + (er_col_b + 112));
                         asm volatile("tcgen05.wait::ld.sync.aligned;");
@@ -6520,10 +7270,60 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                             }
                         }
                         if (whole_te == 0) {
-                            asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[er_part_t + (er_col_b + 112)])), "f"(_er_tload[0]), "f"(_er_tload[1]), "f"(_er_tload[2]), "f"(_er_tload[3]) : "memory");
-                            asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[er_part_t + (er_col_b + 112) + 4])), "f"(_er_tload[4]), "f"(_er_tload[5]), "f"(_er_tload[6]), "f"(_er_tload[7]) : "memory");
-                            asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[er_part_t + (er_col_b + 112) + 8])), "f"(_er_tload[8]), "f"(_er_tload[9]), "f"(_er_tload[10]), "f"(_er_tload[11]) : "memory");
-                            asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[er_part_t + (er_col_b + 112) + 12])), "f"(_er_tload[12]), "f"(_er_tload[13]), "f"(_er_tload[14]), "f"(_er_tload[15]) : "memory");
+                            int tr_odd_15 = lane & 1;
+                            int tr_at_15 = er_part_t + (er_col_b + 112) + tr_odd_15 * (4 - TILE_K);
+                            float tr_lo_120 = _er_tload[0];
+                            float tr_hi_120 = _er_tload[4];
+                            float tr_send_120 = ((tr_odd_15 == 0) ? tr_hi_120 : tr_lo_120);
+                            float tr_got_120 = __shfl_xor_sync(0xFFFFFFFF, tr_send_120, 1);
+                            _er_tload[0] = ((tr_odd_15 == 0) ? tr_lo_120 : tr_got_120);
+                            _er_tload[4] = ((tr_odd_15 == 0) ? tr_got_120 : tr_hi_120);
+                            float tr_lo_121 = _er_tload[1];
+                            float tr_hi_121 = _er_tload[5];
+                            float tr_send_121 = ((tr_odd_15 == 0) ? tr_hi_121 : tr_lo_121);
+                            float tr_got_121 = __shfl_xor_sync(0xFFFFFFFF, tr_send_121, 1);
+                            _er_tload[1] = ((tr_odd_15 == 0) ? tr_lo_121 : tr_got_121);
+                            _er_tload[5] = ((tr_odd_15 == 0) ? tr_got_121 : tr_hi_121);
+                            float tr_lo_122 = _er_tload[2];
+                            float tr_hi_122 = _er_tload[6];
+                            float tr_send_122 = ((tr_odd_15 == 0) ? tr_hi_122 : tr_lo_122);
+                            float tr_got_122 = __shfl_xor_sync(0xFFFFFFFF, tr_send_122, 1);
+                            _er_tload[2] = ((tr_odd_15 == 0) ? tr_lo_122 : tr_got_122);
+                            _er_tload[6] = ((tr_odd_15 == 0) ? tr_got_122 : tr_hi_122);
+                            float tr_lo_123 = _er_tload[3];
+                            float tr_hi_123 = _er_tload[7];
+                            float tr_send_123 = ((tr_odd_15 == 0) ? tr_hi_123 : tr_lo_123);
+                            float tr_got_123 = __shfl_xor_sync(0xFFFFFFFF, tr_send_123, 1);
+                            _er_tload[3] = ((tr_odd_15 == 0) ? tr_lo_123 : tr_got_123);
+                            _er_tload[7] = ((tr_odd_15 == 0) ? tr_got_123 : tr_hi_123);
+                            asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[tr_at_15])), "f"(_er_tload[0]), "f"(_er_tload[1]), "f"(_er_tload[2]), "f"(_er_tload[3]), "l"(0x14F0000000000000ULL) : "memory");
+                            asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[tr_at_15 + TILE_K])), "f"(_er_tload[4]), "f"(_er_tload[5]), "f"(_er_tload[6]), "f"(_er_tload[7]), "l"(0x14F0000000000000ULL) : "memory");
+                            float tr_lo_124 = _er_tload[8];
+                            float tr_hi_124 = _er_tload[12];
+                            float tr_send_124 = ((tr_odd_15 == 0) ? tr_hi_124 : tr_lo_124);
+                            float tr_got_124 = __shfl_xor_sync(0xFFFFFFFF, tr_send_124, 1);
+                            _er_tload[8] = ((tr_odd_15 == 0) ? tr_lo_124 : tr_got_124);
+                            _er_tload[12] = ((tr_odd_15 == 0) ? tr_got_124 : tr_hi_124);
+                            float tr_lo_125 = _er_tload[9];
+                            float tr_hi_125 = _er_tload[13];
+                            float tr_send_125 = ((tr_odd_15 == 0) ? tr_hi_125 : tr_lo_125);
+                            float tr_got_125 = __shfl_xor_sync(0xFFFFFFFF, tr_send_125, 1);
+                            _er_tload[9] = ((tr_odd_15 == 0) ? tr_lo_125 : tr_got_125);
+                            _er_tload[13] = ((tr_odd_15 == 0) ? tr_got_125 : tr_hi_125);
+                            float tr_lo_126 = _er_tload[10];
+                            float tr_hi_126 = _er_tload[14];
+                            float tr_send_126 = ((tr_odd_15 == 0) ? tr_hi_126 : tr_lo_126);
+                            float tr_got_126 = __shfl_xor_sync(0xFFFFFFFF, tr_send_126, 1);
+                            _er_tload[10] = ((tr_odd_15 == 0) ? tr_lo_126 : tr_got_126);
+                            _er_tload[14] = ((tr_odd_15 == 0) ? tr_got_126 : tr_hi_126);
+                            float tr_lo_127 = _er_tload[11];
+                            float tr_hi_127 = _er_tload[15];
+                            float tr_send_127 = ((tr_odd_15 == 0) ? tr_hi_127 : tr_lo_127);
+                            float tr_got_127 = __shfl_xor_sync(0xFFFFFFFF, tr_send_127, 1);
+                            _er_tload[11] = ((tr_odd_15 == 0) ? tr_lo_127 : tr_got_127);
+                            _er_tload[15] = ((tr_odd_15 == 0) ? tr_got_127 : tr_hi_127);
+                            asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[tr_at_15 + 8])), "f"(_er_tload[8]), "f"(_er_tload[9]), "f"(_er_tload[10]), "f"(_er_tload[11]), "l"(0x14F0000000000000ULL) : "memory");
+                            asm volatile("red.global.add.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(reinterpret_cast<uint64_t>(&tail_sums[tr_at_15 + 8 + TILE_K])), "f"(_er_tload[12]), "f"(_er_tload[13]), "f"(_er_tload[14]), "f"(_er_tload[15]), "l"(0x14F0000000000000ULL) : "memory");
                         }
                         if (elect_sync()) {
                             asm volatile("tcgen05.fence::before_thread_sync;");
@@ -6550,25 +7350,26 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                             if (tl_seen == (unsigned int)(tl_count - 1)) {
                                 __syncwarp();
                                 asm volatile("fence.acquire.gpu;" ::: "memory");
-                                int tl_part = slot_te * (CLUSTER_M * TILE_K) + (cta_rank * BLOCK_M + epi_tid) * TILE_K;
-                                int tl_out = (int)e_uet * stride_e + row_nt * ldc + col0t;
-                                float _fin[16];
-                                float _clr[4];
-                                _clr[0] = 0.0f;
-                                _clr[1] = 0.0f;
-                                _clr[2] = 0.0f;
-                                _clr[3] = 0.0f;
+                                int tl_part = slot_te * (CLUSTER_M * TILE_K) + (cta_rank * BLOCK_M + epi_warp * 32) * TILE_K;
+                                int tl_out = (int)e_uet * stride_e + (row_nt - lane) * ldc + col0t;
+                                int tf_col = 4 * lane;
+                                float _rf[64];
+                                float _rz[4];
+                                _rz[0] = 0.0f;
+                                _rz[1] = 0.0f;
+                                _rz[2] = 0.0f;
+                                _rz[3] = 0.0f;
                                 {
                                     unsigned _v4_33_0;
                                     unsigned _v4_33_1;
                                     unsigned _v4_33_2;
                                     unsigned _v4_33_3;
                                     asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-                                        : "=r"(_v4_33_0), "=r"(_v4_33_1), "=r"(_v4_33_2), "=r"(_v4_33_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128) + (0))) : "memory");
-                                    _fin[0 + 0] = __uint_as_float(_v4_33_0);
-                                    _fin[0 + 1] = __uint_as_float(_v4_33_1);
-                                    _fin[0 + 2] = __uint_as_float(_v4_33_2);
-                                    _fin[0 + 3] = __uint_as_float(_v4_33_3);
+                                        : "=r"(_v4_33_0), "=r"(_v4_33_1), "=r"(_v4_33_2), "=r"(_v4_33_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + tf_col) + (0))) : "memory");
+                                    _rf[0 + 0] = __uint_as_float(_v4_33_0);
+                                    _rf[0 + 1] = __uint_as_float(_v4_33_1);
+                                    _rf[0 + 2] = __uint_as_float(_v4_33_2);
+                                    _rf[0 + 3] = __uint_as_float(_v4_33_3);
                                 }
                                 {
                                     unsigned _v4_34_0;
@@ -6576,11 +7377,11 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                                     unsigned _v4_34_2;
                                     unsigned _v4_34_3;
                                     asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-                                        : "=r"(_v4_34_0), "=r"(_v4_34_1), "=r"(_v4_34_2), "=r"(_v4_34_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 4) + (0))) : "memory");
-                                    _fin[4 + 0] = __uint_as_float(_v4_34_0);
-                                    _fin[4 + 1] = __uint_as_float(_v4_34_1);
-                                    _fin[4 + 2] = __uint_as_float(_v4_34_2);
-                                    _fin[4 + 3] = __uint_as_float(_v4_34_3);
+                                        : "=r"(_v4_34_0), "=r"(_v4_34_1), "=r"(_v4_34_2), "=r"(_v4_34_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + TILE_K + tf_col) + (0))) : "memory");
+                                    _rf[4 + 0] = __uint_as_float(_v4_34_0);
+                                    _rf[4 + 1] = __uint_as_float(_v4_34_1);
+                                    _rf[4 + 2] = __uint_as_float(_v4_34_2);
+                                    _rf[4 + 3] = __uint_as_float(_v4_34_3);
                                 }
                                 {
                                     unsigned _v4_35_0;
@@ -6588,11 +7389,11 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                                     unsigned _v4_35_2;
                                     unsigned _v4_35_3;
                                     asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-                                        : "=r"(_v4_35_0), "=r"(_v4_35_1), "=r"(_v4_35_2), "=r"(_v4_35_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 8) + (0))) : "memory");
-                                    _fin[8 + 0] = __uint_as_float(_v4_35_0);
-                                    _fin[8 + 1] = __uint_as_float(_v4_35_1);
-                                    _fin[8 + 2] = __uint_as_float(_v4_35_2);
-                                    _fin[8 + 3] = __uint_as_float(_v4_35_3);
+                                        : "=r"(_v4_35_0), "=r"(_v4_35_1), "=r"(_v4_35_2), "=r"(_v4_35_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 2 * TILE_K + tf_col) + (0))) : "memory");
+                                    _rf[8 + 0] = __uint_as_float(_v4_35_0);
+                                    _rf[8 + 1] = __uint_as_float(_v4_35_1);
+                                    _rf[8 + 2] = __uint_as_float(_v4_35_2);
+                                    _rf[8 + 3] = __uint_as_float(_v4_35_3);
                                 }
                                 {
                                     unsigned _v4_36_0;
@@ -6600,133 +7401,35 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                                     unsigned _v4_36_2;
                                     unsigned _v4_36_3;
                                     asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-                                        : "=r"(_v4_36_0), "=r"(_v4_36_1), "=r"(_v4_36_2), "=r"(_v4_36_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 12) + (0))) : "memory");
-                                    _fin[12 + 0] = __uint_as_float(_v4_36_0);
-                                    _fin[12 + 1] = __uint_as_float(_v4_36_1);
-                                    _fin[12 + 2] = __uint_as_float(_v4_36_2);
-                                    _fin[12 + 3] = __uint_as_float(_v4_36_3);
+                                        : "=r"(_v4_36_0), "=r"(_v4_36_1), "=r"(_v4_36_2), "=r"(_v4_36_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 3 * TILE_K + tf_col) + (0))) : "memory");
+                                    _rf[12 + 0] = __uint_as_float(_v4_36_0);
+                                    _rf[12 + 1] = __uint_as_float(_v4_36_1);
+                                    _rf[12 + 2] = __uint_as_float(_v4_36_2);
+                                    _rf[12 + 3] = __uint_as_float(_v4_36_3);
                                 }
                                 {
-                                    float4 _v4 = make_float4(_clr[0 + 0], _clr[0 + 1], _clr[0 + 2], _clr[0 + 3]);
-                                    *reinterpret_cast<float4*>((tail_sums + (tl_part + epi_half * 128)) + 0) = _v4;
-                                }
-                                {
-                                    float4 _v4 = make_float4(_clr[0 + 0], _clr[0 + 1], _clr[0 + 2], _clr[0 + 3]);
-                                    *reinterpret_cast<float4*>((tail_sums + (tl_part + epi_half * 128 + 4)) + 0) = _v4;
-                                }
-                                {
-                                    float4 _v4 = make_float4(_clr[0 + 0], _clr[0 + 1], _clr[0 + 2], _clr[0 + 3]);
-                                    *reinterpret_cast<float4*>((tail_sums + (tl_part + epi_half * 128 + 8)) + 0) = _v4;
-                                }
-                                {
-                                    float4 _v4 = make_float4(_clr[0 + 0], _clr[0 + 1], _clr[0 + 2], _clr[0 + 3]);
-                                    *reinterpret_cast<float4*>((tail_sums + (tl_part + epi_half * 128 + 12)) + 0) = _v4;
-                                }
-#if CAKE_WGRAD_OUT == 32
-                                {
-                                    float4 _v4 = make_float4(_fin[0 + 0], _fin[0 + 1], _fin[0 + 2], _fin[0 + 3]);
-                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128)) + 0) = _v4;
-#else
-                                unsigned int _fin_p[8];
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin[_lp*2 + 0], _fin[_lp*2+1 + 0]));
-                                    _fin_p[_lp] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin[_lp*2 + 2], _fin[_lp*2+1 + 2]));
-                                    _fin_p[_lp + 1] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin[_lp*2 + 4], _fin[_lp*2+1 + 4]));
-                                    _fin_p[_lp + 2] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin[_lp*2 + 6], _fin[_lp*2+1 + 6]));
-                                    _fin_p[_lp + 3] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin[_lp*2 + 8], _fin[_lp*2+1 + 8]));
-                                    _fin_p[_lp + 4] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin[_lp*2 + 10], _fin[_lp*2+1 + 10]));
-                                    _fin_p[_lp + 5] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin[_lp*2 + 12], _fin[_lp*2+1 + 12]));
-                                    _fin_p[_lp + 6] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin[_lp*2 + 14], _fin[_lp*2+1 + 14]));
-                                    _fin_p[_lp + 7] = *(uint32_t*)&_bf2;
-#endif  // CAKE_WGRAD_OUT
-                                }
-                                {
-#if CAKE_WGRAD_OUT == 32
-                                    float4 _v4 = make_float4(_fin[4 + 0], _fin[4 + 1], _fin[4 + 2], _fin[4 + 3]);
-                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 4)) + 0) = _v4;
-                                }
-                                {
-                                    float4 _v4 = make_float4(_fin[8 + 0], _fin[8 + 1], _fin[8 + 2], _fin[8 + 3]);
-                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 8)) + 0) = _v4;
-                                }
-                                {
-                                    float4 _v4 = make_float4(_fin[12 + 0], _fin[12 + 1], _fin[12 + 2], _fin[12 + 3]);
-                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 12)) + 0) = _v4;
-#else
-                                    const unsigned* _raw_stv8_37 = reinterpret_cast<const unsigned*>(_fin_p);
-                                    asm volatile(
-                                        "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                                        :: "l"((void*)(C + (tl_out + epi_half * 128))), "r"(_raw_stv8_37[0]), "r"(_raw_stv8_37[1]), "r"(_raw_stv8_37[2]), "r"(_raw_stv8_37[3]), "r"(_raw_stv8_37[4]), "r"(_raw_stv8_37[5]), "r"(_raw_stv8_37[6]), "r"(_raw_stv8_37[7]) : "memory");
-#endif  // CAKE_WGRAD_OUT
-                                }
-                                float _fin_0[16];
-                                float _clr_0[4];
-                                _clr_0[0] = 0.0f;
-                                _clr_0[1] = 0.0f;
-                                _clr_0[2] = 0.0f;
-                                _clr_0[3] = 0.0f;
-                                {
-#if CAKE_WGRAD_OUT == 32
                                     unsigned _v4_37_0;
                                     unsigned _v4_37_1;
                                     unsigned _v4_37_2;
                                     unsigned _v4_37_3;
                                     asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-                                        : "=r"(_v4_37_0), "=r"(_v4_37_1), "=r"(_v4_37_2), "=r"(_v4_37_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 16) + (0))) : "memory");
-                                    _fin_0[0 + 0] = __uint_as_float(_v4_37_0);
-                                    _fin_0[0 + 1] = __uint_as_float(_v4_37_1);
-                                    _fin_0[0 + 2] = __uint_as_float(_v4_37_2);
-                                    _fin_0[0 + 3] = __uint_as_float(_v4_37_3);
+                                        : "=r"(_v4_37_0), "=r"(_v4_37_1), "=r"(_v4_37_2), "=r"(_v4_37_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 4 * TILE_K + tf_col) + (0))) : "memory");
+                                    _rf[16 + 0] = __uint_as_float(_v4_37_0);
+                                    _rf[16 + 1] = __uint_as_float(_v4_37_1);
+                                    _rf[16 + 2] = __uint_as_float(_v4_37_2);
+                                    _rf[16 + 3] = __uint_as_float(_v4_37_3);
                                 }
                                 {
-#endif  // CAKE_WGRAD_OUT == 32
                                     unsigned _v4_38_0;
                                     unsigned _v4_38_1;
                                     unsigned _v4_38_2;
                                     unsigned _v4_38_3;
                                     asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-#if CAKE_WGRAD_OUT == 32
-                                        : "=r"(_v4_38_0), "=r"(_v4_38_1), "=r"(_v4_38_2), "=r"(_v4_38_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 16 + 4) + (0))) : "memory");
-                                    _fin_0[4 + 0] = __uint_as_float(_v4_38_0);
-                                    _fin_0[4 + 1] = __uint_as_float(_v4_38_1);
-                                    _fin_0[4 + 2] = __uint_as_float(_v4_38_2);
-                                    _fin_0[4 + 3] = __uint_as_float(_v4_38_3);
-#else
-                                        : "=r"(_v4_38_0), "=r"(_v4_38_1), "=r"(_v4_38_2), "=r"(_v4_38_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 16) + (0))) : "memory");
-                                    _fin_0[0 + 0] = __uint_as_float(_v4_38_0);
-                                    _fin_0[0 + 1] = __uint_as_float(_v4_38_1);
-                                    _fin_0[0 + 2] = __uint_as_float(_v4_38_2);
-                                    _fin_0[0 + 3] = __uint_as_float(_v4_38_3);
-#endif  // CAKE_WGRAD_OUT
+                                        : "=r"(_v4_38_0), "=r"(_v4_38_1), "=r"(_v4_38_2), "=r"(_v4_38_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 5 * TILE_K + tf_col) + (0))) : "memory");
+                                    _rf[20 + 0] = __uint_as_float(_v4_38_0);
+                                    _rf[20 + 1] = __uint_as_float(_v4_38_1);
+                                    _rf[20 + 2] = __uint_as_float(_v4_38_2);
+                                    _rf[20 + 3] = __uint_as_float(_v4_38_3);
                                 }
                                 {
                                     unsigned _v4_39_0;
@@ -6734,19 +7437,11 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                                     unsigned _v4_39_2;
                                     unsigned _v4_39_3;
                                     asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-#if CAKE_WGRAD_OUT == 32
-                                        : "=r"(_v4_39_0), "=r"(_v4_39_1), "=r"(_v4_39_2), "=r"(_v4_39_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 16 + 8) + (0))) : "memory");
-                                    _fin_0[8 + 0] = __uint_as_float(_v4_39_0);
-                                    _fin_0[8 + 1] = __uint_as_float(_v4_39_1);
-                                    _fin_0[8 + 2] = __uint_as_float(_v4_39_2);
-                                    _fin_0[8 + 3] = __uint_as_float(_v4_39_3);
-#else
-                                        : "=r"(_v4_39_0), "=r"(_v4_39_1), "=r"(_v4_39_2), "=r"(_v4_39_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 16 + 4) + (0))) : "memory");
-                                    _fin_0[4 + 0] = __uint_as_float(_v4_39_0);
-                                    _fin_0[4 + 1] = __uint_as_float(_v4_39_1);
-                                    _fin_0[4 + 2] = __uint_as_float(_v4_39_2);
-                                    _fin_0[4 + 3] = __uint_as_float(_v4_39_3);
-#endif  // CAKE_WGRAD_OUT
+                                        : "=r"(_v4_39_0), "=r"(_v4_39_1), "=r"(_v4_39_2), "=r"(_v4_39_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 6 * TILE_K + tf_col) + (0))) : "memory");
+                                    _rf[24 + 0] = __uint_as_float(_v4_39_0);
+                                    _rf[24 + 1] = __uint_as_float(_v4_39_1);
+                                    _rf[24 + 2] = __uint_as_float(_v4_39_2);
+                                    _rf[24 + 3] = __uint_as_float(_v4_39_3);
                                 }
                                 {
                                     unsigned _v4_40_0;
@@ -6754,18 +7449,11 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                                     unsigned _v4_40_2;
                                     unsigned _v4_40_3;
                                     asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-#if CAKE_WGRAD_OUT == 32
-                                        : "=r"(_v4_40_0), "=r"(_v4_40_1), "=r"(_v4_40_2), "=r"(_v4_40_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 16 + 12) + (0))) : "memory");
-                                    _fin_0[12 + 0] = __uint_as_float(_v4_40_0);
-                                    _fin_0[12 + 1] = __uint_as_float(_v4_40_1);
-                                    _fin_0[12 + 2] = __uint_as_float(_v4_40_2);
-                                    _fin_0[12 + 3] = __uint_as_float(_v4_40_3);
-#else
-                                        : "=r"(_v4_40_0), "=r"(_v4_40_1), "=r"(_v4_40_2), "=r"(_v4_40_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 16 + 8) + (0))) : "memory");
-                                    _fin_0[8 + 0] = __uint_as_float(_v4_40_0);
-                                    _fin_0[8 + 1] = __uint_as_float(_v4_40_1);
-                                    _fin_0[8 + 2] = __uint_as_float(_v4_40_2);
-                                    _fin_0[8 + 3] = __uint_as_float(_v4_40_3);
+                                        : "=r"(_v4_40_0), "=r"(_v4_40_1), "=r"(_v4_40_2), "=r"(_v4_40_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 7 * TILE_K + tf_col) + (0))) : "memory");
+                                    _rf[28 + 0] = __uint_as_float(_v4_40_0);
+                                    _rf[28 + 1] = __uint_as_float(_v4_40_1);
+                                    _rf[28 + 2] = __uint_as_float(_v4_40_2);
+                                    _rf[28 + 3] = __uint_as_float(_v4_40_3);
                                 }
                                 {
                                     unsigned _v4_41_0;
@@ -6773,113 +7461,11 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                                     unsigned _v4_41_2;
                                     unsigned _v4_41_3;
                                     asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-                                        : "=r"(_v4_41_0), "=r"(_v4_41_1), "=r"(_v4_41_2), "=r"(_v4_41_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 16 + 12) + (0))) : "memory");
-                                    _fin_0[12 + 0] = __uint_as_float(_v4_41_0);
-                                    _fin_0[12 + 1] = __uint_as_float(_v4_41_1);
-                                    _fin_0[12 + 2] = __uint_as_float(_v4_41_2);
-                                    _fin_0[12 + 3] = __uint_as_float(_v4_41_3);
-#endif  // CAKE_WGRAD_OUT
-                                }
-                                {
-                                    float4 _v4 = make_float4(_clr_0[0 + 0], _clr_0[0 + 1], _clr_0[0 + 2], _clr_0[0 + 3]);
-                                    *reinterpret_cast<float4*>((tail_sums + (tl_part + epi_half * 128 + 16)) + 0) = _v4;
-                                }
-                                {
-                                    float4 _v4 = make_float4(_clr_0[0 + 0], _clr_0[0 + 1], _clr_0[0 + 2], _clr_0[0 + 3]);
-                                    *reinterpret_cast<float4*>((tail_sums + (tl_part + epi_half * 128 + 16 + 4)) + 0) = _v4;
-                                }
-                                {
-                                    float4 _v4 = make_float4(_clr_0[0 + 0], _clr_0[0 + 1], _clr_0[0 + 2], _clr_0[0 + 3]);
-                                    *reinterpret_cast<float4*>((tail_sums + (tl_part + epi_half * 128 + 16 + 8)) + 0) = _v4;
-                                }
-                                {
-                                    float4 _v4 = make_float4(_clr_0[0 + 0], _clr_0[0 + 1], _clr_0[0 + 2], _clr_0[0 + 3]);
-                                    *reinterpret_cast<float4*>((tail_sums + (tl_part + epi_half * 128 + 16 + 12)) + 0) = _v4;
-                                }
-#if CAKE_WGRAD_OUT == 32
-                                {
-                                    float4 _v4 = make_float4(_fin_0[0 + 0], _fin_0[0 + 1], _fin_0[0 + 2], _fin_0[0 + 3]);
-                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 16)) + 0) = _v4;
-#else
-                                unsigned int _fin_p_0[8];
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_0[_lp*2 + 0], _fin_0[_lp*2+1 + 0]));
-                                    _fin_p_0[_lp] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_0[_lp*2 + 2], _fin_0[_lp*2+1 + 2]));
-                                    _fin_p_0[_lp + 1] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_0[_lp*2 + 4], _fin_0[_lp*2+1 + 4]));
-                                    _fin_p_0[_lp + 2] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_0[_lp*2 + 6], _fin_0[_lp*2+1 + 6]));
-                                    _fin_p_0[_lp + 3] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_0[_lp*2 + 8], _fin_0[_lp*2+1 + 8]));
-                                    _fin_p_0[_lp + 4] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_0[_lp*2 + 10], _fin_0[_lp*2+1 + 10]));
-                                    _fin_p_0[_lp + 5] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_0[_lp*2 + 12], _fin_0[_lp*2+1 + 12]));
-                                    _fin_p_0[_lp + 6] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_0[_lp*2 + 14], _fin_0[_lp*2+1 + 14]));
-                                    _fin_p_0[_lp + 7] = *(uint32_t*)&_bf2;
-#endif  // CAKE_WGRAD_OUT
-                                }
-                                {
-#if CAKE_WGRAD_OUT == 32
-                                    float4 _v4 = make_float4(_fin_0[4 + 0], _fin_0[4 + 1], _fin_0[4 + 2], _fin_0[4 + 3]);
-                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 16 + 4)) + 0) = _v4;
-                                }
-                                {
-                                    float4 _v4 = make_float4(_fin_0[8 + 0], _fin_0[8 + 1], _fin_0[8 + 2], _fin_0[8 + 3]);
-                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 16 + 8)) + 0) = _v4;
-                                }
-                                {
-                                    float4 _v4 = make_float4(_fin_0[12 + 0], _fin_0[12 + 1], _fin_0[12 + 2], _fin_0[12 + 3]);
-                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 16 + 12)) + 0) = _v4;
-#else
-                                    const unsigned* _raw_stv8_42 = reinterpret_cast<const unsigned*>(_fin_p_0);
-                                    asm volatile(
-                                        "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                                        :: "l"((void*)(C + (tl_out + epi_half * 128 + 16))), "r"(_raw_stv8_42[0]), "r"(_raw_stv8_42[1]), "r"(_raw_stv8_42[2]), "r"(_raw_stv8_42[3]), "r"(_raw_stv8_42[4]), "r"(_raw_stv8_42[5]), "r"(_raw_stv8_42[6]), "r"(_raw_stv8_42[7]) : "memory");
-#endif  // CAKE_WGRAD_OUT
-                                }
-                                float _fin_1[16];
-                                float _clr_1[4];
-                                _clr_1[0] = 0.0f;
-                                _clr_1[1] = 0.0f;
-                                _clr_1[2] = 0.0f;
-                                _clr_1[3] = 0.0f;
-                                {
-#if CAKE_WGRAD_OUT == 32
-                                    unsigned _v4_41_0;
-                                    unsigned _v4_41_1;
-                                    unsigned _v4_41_2;
-                                    unsigned _v4_41_3;
-                                    asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-                                        : "=r"(_v4_41_0), "=r"(_v4_41_1), "=r"(_v4_41_2), "=r"(_v4_41_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 32) + (0))) : "memory");
-                                    _fin_1[0 + 0] = __uint_as_float(_v4_41_0);
-                                    _fin_1[0 + 1] = __uint_as_float(_v4_41_1);
-                                    _fin_1[0 + 2] = __uint_as_float(_v4_41_2);
-                                    _fin_1[0 + 3] = __uint_as_float(_v4_41_3);
+                                        : "=r"(_v4_41_0), "=r"(_v4_41_1), "=r"(_v4_41_2), "=r"(_v4_41_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 8 * TILE_K + tf_col) + (0))) : "memory");
+                                    _rf[32 + 0] = __uint_as_float(_v4_41_0);
+                                    _rf[32 + 1] = __uint_as_float(_v4_41_1);
+                                    _rf[32 + 2] = __uint_as_float(_v4_41_2);
+                                    _rf[32 + 3] = __uint_as_float(_v4_41_3);
                                 }
                                 {
                                     unsigned _v4_42_0;
@@ -6887,32 +7473,23 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                                     unsigned _v4_42_2;
                                     unsigned _v4_42_3;
                                     asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-                                        : "=r"(_v4_42_0), "=r"(_v4_42_1), "=r"(_v4_42_2), "=r"(_v4_42_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 32 + 4) + (0))) : "memory");
-                                    _fin_1[4 + 0] = __uint_as_float(_v4_42_0);
-                                    _fin_1[4 + 1] = __uint_as_float(_v4_42_1);
-                                    _fin_1[4 + 2] = __uint_as_float(_v4_42_2);
-                                    _fin_1[4 + 3] = __uint_as_float(_v4_42_3);
+                                        : "=r"(_v4_42_0), "=r"(_v4_42_1), "=r"(_v4_42_2), "=r"(_v4_42_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 9 * TILE_K + tf_col) + (0))) : "memory");
+                                    _rf[36 + 0] = __uint_as_float(_v4_42_0);
+                                    _rf[36 + 1] = __uint_as_float(_v4_42_1);
+                                    _rf[36 + 2] = __uint_as_float(_v4_42_2);
+                                    _rf[36 + 3] = __uint_as_float(_v4_42_3);
                                 }
                                 {
-#endif  // CAKE_WGRAD_OUT == 32
                                     unsigned _v4_43_0;
                                     unsigned _v4_43_1;
                                     unsigned _v4_43_2;
                                     unsigned _v4_43_3;
                                     asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-#if CAKE_WGRAD_OUT == 32
-                                        : "=r"(_v4_43_0), "=r"(_v4_43_1), "=r"(_v4_43_2), "=r"(_v4_43_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 32 + 8) + (0))) : "memory");
-                                    _fin_1[8 + 0] = __uint_as_float(_v4_43_0);
-                                    _fin_1[8 + 1] = __uint_as_float(_v4_43_1);
-                                    _fin_1[8 + 2] = __uint_as_float(_v4_43_2);
-                                    _fin_1[8 + 3] = __uint_as_float(_v4_43_3);
-#else
-                                        : "=r"(_v4_43_0), "=r"(_v4_43_1), "=r"(_v4_43_2), "=r"(_v4_43_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 32) + (0))) : "memory");
-                                    _fin_1[0 + 0] = __uint_as_float(_v4_43_0);
-                                    _fin_1[0 + 1] = __uint_as_float(_v4_43_1);
-                                    _fin_1[0 + 2] = __uint_as_float(_v4_43_2);
-                                    _fin_1[0 + 3] = __uint_as_float(_v4_43_3);
-#endif  // CAKE_WGRAD_OUT
+                                        : "=r"(_v4_43_0), "=r"(_v4_43_1), "=r"(_v4_43_2), "=r"(_v4_43_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 10 * TILE_K + tf_col) + (0))) : "memory");
+                                    _rf[40 + 0] = __uint_as_float(_v4_43_0);
+                                    _rf[40 + 1] = __uint_as_float(_v4_43_1);
+                                    _rf[40 + 2] = __uint_as_float(_v4_43_2);
+                                    _rf[40 + 3] = __uint_as_float(_v4_43_3);
                                 }
                                 {
                                     unsigned _v4_44_0;
@@ -6920,18 +7497,11 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                                     unsigned _v4_44_2;
                                     unsigned _v4_44_3;
                                     asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-#if CAKE_WGRAD_OUT == 32
-                                        : "=r"(_v4_44_0), "=r"(_v4_44_1), "=r"(_v4_44_2), "=r"(_v4_44_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 32 + 12) + (0))) : "memory");
-                                    _fin_1[12 + 0] = __uint_as_float(_v4_44_0);
-                                    _fin_1[12 + 1] = __uint_as_float(_v4_44_1);
-                                    _fin_1[12 + 2] = __uint_as_float(_v4_44_2);
-                                    _fin_1[12 + 3] = __uint_as_float(_v4_44_3);
-#else
-                                        : "=r"(_v4_44_0), "=r"(_v4_44_1), "=r"(_v4_44_2), "=r"(_v4_44_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 32 + 4) + (0))) : "memory");
-                                    _fin_1[4 + 0] = __uint_as_float(_v4_44_0);
-                                    _fin_1[4 + 1] = __uint_as_float(_v4_44_1);
-                                    _fin_1[4 + 2] = __uint_as_float(_v4_44_2);
-                                    _fin_1[4 + 3] = __uint_as_float(_v4_44_3);
+                                        : "=r"(_v4_44_0), "=r"(_v4_44_1), "=r"(_v4_44_2), "=r"(_v4_44_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 11 * TILE_K + tf_col) + (0))) : "memory");
+                                    _rf[44 + 0] = __uint_as_float(_v4_44_0);
+                                    _rf[44 + 1] = __uint_as_float(_v4_44_1);
+                                    _rf[44 + 2] = __uint_as_float(_v4_44_2);
+                                    _rf[44 + 3] = __uint_as_float(_v4_44_3);
                                 }
                                 {
                                     unsigned _v4_45_0;
@@ -6939,11 +7509,11 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                                     unsigned _v4_45_2;
                                     unsigned _v4_45_3;
                                     asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-                                        : "=r"(_v4_45_0), "=r"(_v4_45_1), "=r"(_v4_45_2), "=r"(_v4_45_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 32 + 8) + (0))) : "memory");
-                                    _fin_1[8 + 0] = __uint_as_float(_v4_45_0);
-                                    _fin_1[8 + 1] = __uint_as_float(_v4_45_1);
-                                    _fin_1[8 + 2] = __uint_as_float(_v4_45_2);
-                                    _fin_1[8 + 3] = __uint_as_float(_v4_45_3);
+                                        : "=r"(_v4_45_0), "=r"(_v4_45_1), "=r"(_v4_45_2), "=r"(_v4_45_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 12 * TILE_K + tf_col) + (0))) : "memory");
+                                    _rf[48 + 0] = __uint_as_float(_v4_45_0);
+                                    _rf[48 + 1] = __uint_as_float(_v4_45_1);
+                                    _rf[48 + 2] = __uint_as_float(_v4_45_2);
+                                    _rf[48 + 3] = __uint_as_float(_v4_45_3);
                                 }
                                 {
                                     unsigned _v4_46_0;
@@ -6951,125 +7521,11 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                                     unsigned _v4_46_2;
                                     unsigned _v4_46_3;
                                     asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-                                        : "=r"(_v4_46_0), "=r"(_v4_46_1), "=r"(_v4_46_2), "=r"(_v4_46_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 32 + 12) + (0))) : "memory");
-                                    _fin_1[12 + 0] = __uint_as_float(_v4_46_0);
-                                    _fin_1[12 + 1] = __uint_as_float(_v4_46_1);
-                                    _fin_1[12 + 2] = __uint_as_float(_v4_46_2);
-                                    _fin_1[12 + 3] = __uint_as_float(_v4_46_3);
-#endif  // CAKE_WGRAD_OUT
-                                }
-                                {
-                                    float4 _v4 = make_float4(_clr_1[0 + 0], _clr_1[0 + 1], _clr_1[0 + 2], _clr_1[0 + 3]);
-                                    *reinterpret_cast<float4*>((tail_sums + (tl_part + epi_half * 128 + 32)) + 0) = _v4;
-                                }
-                                {
-                                    float4 _v4 = make_float4(_clr_1[0 + 0], _clr_1[0 + 1], _clr_1[0 + 2], _clr_1[0 + 3]);
-                                    *reinterpret_cast<float4*>((tail_sums + (tl_part + epi_half * 128 + 32 + 4)) + 0) = _v4;
-                                }
-                                {
-                                    float4 _v4 = make_float4(_clr_1[0 + 0], _clr_1[0 + 1], _clr_1[0 + 2], _clr_1[0 + 3]);
-                                    *reinterpret_cast<float4*>((tail_sums + (tl_part + epi_half * 128 + 32 + 8)) + 0) = _v4;
-                                }
-                                {
-                                    float4 _v4 = make_float4(_clr_1[0 + 0], _clr_1[0 + 1], _clr_1[0 + 2], _clr_1[0 + 3]);
-                                    *reinterpret_cast<float4*>((tail_sums + (tl_part + epi_half * 128 + 32 + 12)) + 0) = _v4;
-                                }
-#if CAKE_WGRAD_OUT == 32
-                                {
-                                    float4 _v4 = make_float4(_fin_1[0 + 0], _fin_1[0 + 1], _fin_1[0 + 2], _fin_1[0 + 3]);
-                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 32)) + 0) = _v4;
-#else
-                                unsigned int _fin_p_1[8];
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_1[_lp*2 + 0], _fin_1[_lp*2+1 + 0]));
-                                    _fin_p_1[_lp] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_1[_lp*2 + 2], _fin_1[_lp*2+1 + 2]));
-                                    _fin_p_1[_lp + 1] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_1[_lp*2 + 4], _fin_1[_lp*2+1 + 4]));
-                                    _fin_p_1[_lp + 2] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_1[_lp*2 + 6], _fin_1[_lp*2+1 + 6]));
-                                    _fin_p_1[_lp + 3] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_1[_lp*2 + 8], _fin_1[_lp*2+1 + 8]));
-                                    _fin_p_1[_lp + 4] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_1[_lp*2 + 10], _fin_1[_lp*2+1 + 10]));
-                                    _fin_p_1[_lp + 5] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_1[_lp*2 + 12], _fin_1[_lp*2+1 + 12]));
-                                    _fin_p_1[_lp + 6] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_1[_lp*2 + 14], _fin_1[_lp*2+1 + 14]));
-                                    _fin_p_1[_lp + 7] = *(uint32_t*)&_bf2;
-#endif  // CAKE_WGRAD_OUT
-                                }
-                                {
-#if CAKE_WGRAD_OUT == 32
-                                    float4 _v4 = make_float4(_fin_1[4 + 0], _fin_1[4 + 1], _fin_1[4 + 2], _fin_1[4 + 3]);
-                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 32 + 4)) + 0) = _v4;
-                                }
-                                {
-                                    float4 _v4 = make_float4(_fin_1[8 + 0], _fin_1[8 + 1], _fin_1[8 + 2], _fin_1[8 + 3]);
-                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 32 + 8)) + 0) = _v4;
-                                }
-                                {
-                                    float4 _v4 = make_float4(_fin_1[12 + 0], _fin_1[12 + 1], _fin_1[12 + 2], _fin_1[12 + 3]);
-                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 32 + 12)) + 0) = _v4;
-#else
-                                    const unsigned* _raw_stv8_47 = reinterpret_cast<const unsigned*>(_fin_p_1);
-                                    asm volatile(
-                                        "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                                        :: "l"((void*)(C + (tl_out + epi_half * 128 + 32))), "r"(_raw_stv8_47[0]), "r"(_raw_stv8_47[1]), "r"(_raw_stv8_47[2]), "r"(_raw_stv8_47[3]), "r"(_raw_stv8_47[4]), "r"(_raw_stv8_47[5]), "r"(_raw_stv8_47[6]), "r"(_raw_stv8_47[7]) : "memory");
-#endif  // CAKE_WGRAD_OUT
-                                }
-                                float _fin_2[16];
-                                float _clr_2[4];
-                                _clr_2[0] = 0.0f;
-                                _clr_2[1] = 0.0f;
-                                _clr_2[2] = 0.0f;
-                                _clr_2[3] = 0.0f;
-                                {
-#if CAKE_WGRAD_OUT == 32
-                                    unsigned _v4_45_0;
-                                    unsigned _v4_45_1;
-                                    unsigned _v4_45_2;
-                                    unsigned _v4_45_3;
-                                    asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-                                        : "=r"(_v4_45_0), "=r"(_v4_45_1), "=r"(_v4_45_2), "=r"(_v4_45_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 48) + (0))) : "memory");
-                                    _fin_2[0 + 0] = __uint_as_float(_v4_45_0);
-                                    _fin_2[0 + 1] = __uint_as_float(_v4_45_1);
-                                    _fin_2[0 + 2] = __uint_as_float(_v4_45_2);
-                                    _fin_2[0 + 3] = __uint_as_float(_v4_45_3);
-                                }
-                                {
-                                    unsigned _v4_46_0;
-                                    unsigned _v4_46_1;
-                                    unsigned _v4_46_2;
-                                    unsigned _v4_46_3;
-                                    asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-                                        : "=r"(_v4_46_0), "=r"(_v4_46_1), "=r"(_v4_46_2), "=r"(_v4_46_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 48 + 4) + (0))) : "memory");
-                                    _fin_2[4 + 0] = __uint_as_float(_v4_46_0);
-                                    _fin_2[4 + 1] = __uint_as_float(_v4_46_1);
-                                    _fin_2[4 + 2] = __uint_as_float(_v4_46_2);
-                                    _fin_2[4 + 3] = __uint_as_float(_v4_46_3);
+                                        : "=r"(_v4_46_0), "=r"(_v4_46_1), "=r"(_v4_46_2), "=r"(_v4_46_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 13 * TILE_K + tf_col) + (0))) : "memory");
+                                    _rf[52 + 0] = __uint_as_float(_v4_46_0);
+                                    _rf[52 + 1] = __uint_as_float(_v4_46_1);
+                                    _rf[52 + 2] = __uint_as_float(_v4_46_2);
+                                    _rf[52 + 3] = __uint_as_float(_v4_46_3);
                                 }
                                 {
                                     unsigned _v4_47_0;
@@ -7077,43 +7533,326 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                                     unsigned _v4_47_2;
                                     unsigned _v4_47_3;
                                     asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-                                        : "=r"(_v4_47_0), "=r"(_v4_47_1), "=r"(_v4_47_2), "=r"(_v4_47_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 48 + 8) + (0))) : "memory");
-                                    _fin_2[8 + 0] = __uint_as_float(_v4_47_0);
-                                    _fin_2[8 + 1] = __uint_as_float(_v4_47_1);
-                                    _fin_2[8 + 2] = __uint_as_float(_v4_47_2);
-                                    _fin_2[8 + 3] = __uint_as_float(_v4_47_3);
+                                        : "=r"(_v4_47_0), "=r"(_v4_47_1), "=r"(_v4_47_2), "=r"(_v4_47_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 14 * TILE_K + tf_col) + (0))) : "memory");
+                                    _rf[56 + 0] = __uint_as_float(_v4_47_0);
+                                    _rf[56 + 1] = __uint_as_float(_v4_47_1);
+                                    _rf[56 + 2] = __uint_as_float(_v4_47_2);
+                                    _rf[56 + 3] = __uint_as_float(_v4_47_3);
                                 }
                                 {
-#endif  // CAKE_WGRAD_OUT == 32
                                     unsigned _v4_48_0;
                                     unsigned _v4_48_1;
                                     unsigned _v4_48_2;
                                     unsigned _v4_48_3;
                                     asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-#if CAKE_WGRAD_OUT == 32
-                                        : "=r"(_v4_48_0), "=r"(_v4_48_1), "=r"(_v4_48_2), "=r"(_v4_48_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 48 + 12) + (0))) : "memory");
-                                    _fin_2[12 + 0] = __uint_as_float(_v4_48_0);
-                                    _fin_2[12 + 1] = __uint_as_float(_v4_48_1);
-                                    _fin_2[12 + 2] = __uint_as_float(_v4_48_2);
-                                    _fin_2[12 + 3] = __uint_as_float(_v4_48_3);
-#else
-                                        : "=r"(_v4_48_0), "=r"(_v4_48_1), "=r"(_v4_48_2), "=r"(_v4_48_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 48) + (0))) : "memory");
-                                    _fin_2[0 + 0] = __uint_as_float(_v4_48_0);
-                                    _fin_2[0 + 1] = __uint_as_float(_v4_48_1);
-                                    _fin_2[0 + 2] = __uint_as_float(_v4_48_2);
-                                    _fin_2[0 + 3] = __uint_as_float(_v4_48_3);
+                                        : "=r"(_v4_48_0), "=r"(_v4_48_1), "=r"(_v4_48_2), "=r"(_v4_48_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 15 * TILE_K + tf_col) + (0))) : "memory");
+                                    _rf[60 + 0] = __uint_as_float(_v4_48_0);
+                                    _rf[60 + 1] = __uint_as_float(_v4_48_1);
+                                    _rf[60 + 2] = __uint_as_float(_v4_48_2);
+                                    _rf[60 + 3] = __uint_as_float(_v4_48_3);
                                 }
+                                asm volatile("st.global.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(tail_sums + (tl_part + epi_half * 128 + tf_col)), "f"(_rz[(0) + 0]), "f"(_rz[(0) + 1]), "f"(_rz[(0) + 2]), "f"(_rz[(0) + 3]), "l"(0x12F0000000000000ULL) : "memory");
+                                asm volatile("st.global.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(tail_sums + (tl_part + epi_half * 128 + TILE_K + tf_col)), "f"(_rz[(0) + 0]), "f"(_rz[(0) + 1]), "f"(_rz[(0) + 2]), "f"(_rz[(0) + 3]), "l"(0x12F0000000000000ULL) : "memory");
+                                asm volatile("st.global.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(tail_sums + (tl_part + epi_half * 128 + 2 * TILE_K + tf_col)), "f"(_rz[(0) + 0]), "f"(_rz[(0) + 1]), "f"(_rz[(0) + 2]), "f"(_rz[(0) + 3]), "l"(0x12F0000000000000ULL) : "memory");
+                                asm volatile("st.global.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(tail_sums + (tl_part + epi_half * 128 + 3 * TILE_K + tf_col)), "f"(_rz[(0) + 0]), "f"(_rz[(0) + 1]), "f"(_rz[(0) + 2]), "f"(_rz[(0) + 3]), "l"(0x12F0000000000000ULL) : "memory");
+                                asm volatile("st.global.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(tail_sums + (tl_part + epi_half * 128 + 4 * TILE_K + tf_col)), "f"(_rz[(0) + 0]), "f"(_rz[(0) + 1]), "f"(_rz[(0) + 2]), "f"(_rz[(0) + 3]), "l"(0x12F0000000000000ULL) : "memory");
+                                asm volatile("st.global.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(tail_sums + (tl_part + epi_half * 128 + 5 * TILE_K + tf_col)), "f"(_rz[(0) + 0]), "f"(_rz[(0) + 1]), "f"(_rz[(0) + 2]), "f"(_rz[(0) + 3]), "l"(0x12F0000000000000ULL) : "memory");
+                                asm volatile("st.global.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(tail_sums + (tl_part + epi_half * 128 + 6 * TILE_K + tf_col)), "f"(_rz[(0) + 0]), "f"(_rz[(0) + 1]), "f"(_rz[(0) + 2]), "f"(_rz[(0) + 3]), "l"(0x12F0000000000000ULL) : "memory");
+                                asm volatile("st.global.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(tail_sums + (tl_part + epi_half * 128 + 7 * TILE_K + tf_col)), "f"(_rz[(0) + 0]), "f"(_rz[(0) + 1]), "f"(_rz[(0) + 2]), "f"(_rz[(0) + 3]), "l"(0x12F0000000000000ULL) : "memory");
+                                asm volatile("st.global.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(tail_sums + (tl_part + epi_half * 128 + 8 * TILE_K + tf_col)), "f"(_rz[(0) + 0]), "f"(_rz[(0) + 1]), "f"(_rz[(0) + 2]), "f"(_rz[(0) + 3]), "l"(0x12F0000000000000ULL) : "memory");
+                                asm volatile("st.global.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(tail_sums + (tl_part + epi_half * 128 + 9 * TILE_K + tf_col)), "f"(_rz[(0) + 0]), "f"(_rz[(0) + 1]), "f"(_rz[(0) + 2]), "f"(_rz[(0) + 3]), "l"(0x12F0000000000000ULL) : "memory");
+                                asm volatile("st.global.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(tail_sums + (tl_part + epi_half * 128 + 10 * TILE_K + tf_col)), "f"(_rz[(0) + 0]), "f"(_rz[(0) + 1]), "f"(_rz[(0) + 2]), "f"(_rz[(0) + 3]), "l"(0x12F0000000000000ULL) : "memory");
+                                asm volatile("st.global.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(tail_sums + (tl_part + epi_half * 128 + 11 * TILE_K + tf_col)), "f"(_rz[(0) + 0]), "f"(_rz[(0) + 1]), "f"(_rz[(0) + 2]), "f"(_rz[(0) + 3]), "l"(0x12F0000000000000ULL) : "memory");
+                                asm volatile("st.global.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(tail_sums + (tl_part + epi_half * 128 + 12 * TILE_K + tf_col)), "f"(_rz[(0) + 0]), "f"(_rz[(0) + 1]), "f"(_rz[(0) + 2]), "f"(_rz[(0) + 3]), "l"(0x12F0000000000000ULL) : "memory");
+                                asm volatile("st.global.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(tail_sums + (tl_part + epi_half * 128 + 13 * TILE_K + tf_col)), "f"(_rz[(0) + 0]), "f"(_rz[(0) + 1]), "f"(_rz[(0) + 2]), "f"(_rz[(0) + 3]), "l"(0x12F0000000000000ULL) : "memory");
+                                asm volatile("st.global.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(tail_sums + (tl_part + epi_half * 128 + 14 * TILE_K + tf_col)), "f"(_rz[(0) + 0]), "f"(_rz[(0) + 1]), "f"(_rz[(0) + 2]), "f"(_rz[(0) + 3]), "l"(0x12F0000000000000ULL) : "memory");
+                                asm volatile("st.global.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(tail_sums + (tl_part + epi_half * 128 + 15 * TILE_K + tf_col)), "f"(_rz[(0) + 0]), "f"(_rz[(0) + 1]), "f"(_rz[(0) + 2]), "f"(_rz[(0) + 3]), "l"(0x12F0000000000000ULL) : "memory");
+#if CAKE_WGRAD_OUT == 32
+                                {
+                                    float4 _v4 = make_float4(_rf[0 + 0], _rf[0 + 1], _rf[0 + 2], _rf[0 + 3]);
+                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + tf_col)) + 0) = _v4;
+#else
+                                unsigned int _rp_0[2];
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf[_lp*2 + 0], _rf[_lp*2+1 + 0]));
+                                    _rp_0[_lp] = *(uint32_t*)&_bf2;
+#endif  // CAKE_WGRAD_OUT
+                                }
+#if CAKE_WGRAD_OUT == 32
+                                {
+                                    float4 _v4 = make_float4(_rf[4 + 0], _rf[4 + 1], _rf[4 + 2], _rf[4 + 3]);
+                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + ldc + tf_col)) + 0) = _v4;
+#else
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf[_lp*2 + 2], _rf[_lp*2+1 + 2]));
+                                    _rp_0[_lp + 1] = *(uint32_t*)&_bf2;
+#endif  // CAKE_WGRAD_OUT
+                                }
+#if CAKE_WGRAD_OUT == 32
+                                {
+                                    float4 _v4 = make_float4(_rf[8 + 0], _rf[8 + 1], _rf[8 + 2], _rf[8 + 3]);
+                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 2 * ldc + tf_col)) + 0) = _v4;
+#else
+                                reinterpret_cast<int2*>(C + (tl_out + epi_half * 128 + tf_col))[0] = reinterpret_cast<int2*>(_rp_0)[0];
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf[_lp*2 + 4], _rf[_lp*2+1 + 4]));
+                                    _rp_0[_lp] = *(uint32_t*)&_bf2;
+#endif  // CAKE_WGRAD_OUT
+                                }
+#if CAKE_WGRAD_OUT == 32
+                                {
+                                    float4 _v4 = make_float4(_rf[12 + 0], _rf[12 + 1], _rf[12 + 2], _rf[12 + 3]);
+                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 3 * ldc + tf_col)) + 0) = _v4;
+#else
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf[_lp*2 + 6], _rf[_lp*2+1 + 6]));
+                                    _rp_0[_lp + 1] = *(uint32_t*)&_bf2;
+#endif  // CAKE_WGRAD_OUT
+                                }
+#if CAKE_WGRAD_OUT == 32
+                                {
+                                    float4 _v4 = make_float4(_rf[16 + 0], _rf[16 + 1], _rf[16 + 2], _rf[16 + 3]);
+                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 4 * ldc + tf_col)) + 0) = _v4;
+#else
+                                reinterpret_cast<int2*>(C + (tl_out + epi_half * 128 + ldc + tf_col))[0] = reinterpret_cast<int2*>(_rp_0)[0];
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf[_lp*2 + 8], _rf[_lp*2+1 + 8]));
+                                    _rp_0[_lp] = *(uint32_t*)&_bf2;
+#endif  // CAKE_WGRAD_OUT
+                                }
+#if CAKE_WGRAD_OUT == 32
+                                {
+                                    float4 _v4 = make_float4(_rf[20 + 0], _rf[20 + 1], _rf[20 + 2], _rf[20 + 3]);
+                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 5 * ldc + tf_col)) + 0) = _v4;
+#else
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf[_lp*2 + 10], _rf[_lp*2+1 + 10]));
+                                    _rp_0[_lp + 1] = *(uint32_t*)&_bf2;
+#endif  // CAKE_WGRAD_OUT
+                                }
+#if CAKE_WGRAD_OUT == 32
+                                {
+                                    float4 _v4 = make_float4(_rf[24 + 0], _rf[24 + 1], _rf[24 + 2], _rf[24 + 3]);
+                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 6 * ldc + tf_col)) + 0) = _v4;
+#else
+                                reinterpret_cast<int2*>(C + (tl_out + epi_half * 128 + 2 * ldc + tf_col))[0] = reinterpret_cast<int2*>(_rp_0)[0];
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf[_lp*2 + 12], _rf[_lp*2+1 + 12]));
+                                    _rp_0[_lp] = *(uint32_t*)&_bf2;
+#endif  // CAKE_WGRAD_OUT
+                                }
+#if CAKE_WGRAD_OUT == 32
+                                {
+                                    float4 _v4 = make_float4(_rf[28 + 0], _rf[28 + 1], _rf[28 + 2], _rf[28 + 3]);
+                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 7 * ldc + tf_col)) + 0) = _v4;
+#else
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf[_lp*2 + 14], _rf[_lp*2+1 + 14]));
+                                    _rp_0[_lp + 1] = *(uint32_t*)&_bf2;
+#endif  // CAKE_WGRAD_OUT
+                                }
+#if CAKE_WGRAD_OUT == 32
+                                {
+                                    float4 _v4 = make_float4(_rf[32 + 0], _rf[32 + 1], _rf[32 + 2], _rf[32 + 3]);
+                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 8 * ldc + tf_col)) + 0) = _v4;
+#else
+                                reinterpret_cast<int2*>(C + (tl_out + epi_half * 128 + 3 * ldc + tf_col))[0] = reinterpret_cast<int2*>(_rp_0)[0];
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf[_lp*2 + 16], _rf[_lp*2+1 + 16]));
+                                    _rp_0[_lp] = *(uint32_t*)&_bf2;
+#endif  // CAKE_WGRAD_OUT
+                                }
+#if CAKE_WGRAD_OUT == 32
+                                {
+                                    float4 _v4 = make_float4(_rf[36 + 0], _rf[36 + 1], _rf[36 + 2], _rf[36 + 3]);
+                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 9 * ldc + tf_col)) + 0) = _v4;
+#else
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf[_lp*2 + 18], _rf[_lp*2+1 + 18]));
+                                    _rp_0[_lp + 1] = *(uint32_t*)&_bf2;
+#endif  // CAKE_WGRAD_OUT
+                                }
+#if CAKE_WGRAD_OUT == 32
+                                {
+                                    float4 _v4 = make_float4(_rf[40 + 0], _rf[40 + 1], _rf[40 + 2], _rf[40 + 3]);
+                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 10 * ldc + tf_col)) + 0) = _v4;
+#else
+                                reinterpret_cast<int2*>(C + (tl_out + epi_half * 128 + 4 * ldc + tf_col))[0] = reinterpret_cast<int2*>(_rp_0)[0];
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf[_lp*2 + 20], _rf[_lp*2+1 + 20]));
+                                    _rp_0[_lp] = *(uint32_t*)&_bf2;
+#endif  // CAKE_WGRAD_OUT
+                                }
+#if CAKE_WGRAD_OUT == 32
+                                {
+                                    float4 _v4 = make_float4(_rf[44 + 0], _rf[44 + 1], _rf[44 + 2], _rf[44 + 3]);
+                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 11 * ldc + tf_col)) + 0) = _v4;
+#else
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf[_lp*2 + 22], _rf[_lp*2+1 + 22]));
+                                    _rp_0[_lp + 1] = *(uint32_t*)&_bf2;
+#endif  // CAKE_WGRAD_OUT
+                                }
+#if CAKE_WGRAD_OUT == 32
+                                {
+                                    float4 _v4 = make_float4(_rf[48 + 0], _rf[48 + 1], _rf[48 + 2], _rf[48 + 3]);
+                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 12 * ldc + tf_col)) + 0) = _v4;
+#else
+                                reinterpret_cast<int2*>(C + (tl_out + epi_half * 128 + 5 * ldc + tf_col))[0] = reinterpret_cast<int2*>(_rp_0)[0];
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf[_lp*2 + 24], _rf[_lp*2+1 + 24]));
+                                    _rp_0[_lp] = *(uint32_t*)&_bf2;
+#endif  // CAKE_WGRAD_OUT
+                                }
+#if CAKE_WGRAD_OUT == 32
+                                {
+                                    float4 _v4 = make_float4(_rf[52 + 0], _rf[52 + 1], _rf[52 + 2], _rf[52 + 3]);
+                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 13 * ldc + tf_col)) + 0) = _v4;
+#else
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf[_lp*2 + 26], _rf[_lp*2+1 + 26]));
+                                    _rp_0[_lp + 1] = *(uint32_t*)&_bf2;
+#endif  // CAKE_WGRAD_OUT
+                                }
+#if CAKE_WGRAD_OUT == 32
+                                {
+                                    float4 _v4 = make_float4(_rf[56 + 0], _rf[56 + 1], _rf[56 + 2], _rf[56 + 3]);
+                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 14 * ldc + tf_col)) + 0) = _v4;
+#else
+                                reinterpret_cast<int2*>(C + (tl_out + epi_half * 128 + 6 * ldc + tf_col))[0] = reinterpret_cast<int2*>(_rp_0)[0];
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf[_lp*2 + 28], _rf[_lp*2+1 + 28]));
+                                    _rp_0[_lp] = *(uint32_t*)&_bf2;
+#endif  // CAKE_WGRAD_OUT
+                                }
+#if CAKE_WGRAD_OUT == 32
+                                {
+                                    float4 _v4 = make_float4(_rf[60 + 0], _rf[60 + 1], _rf[60 + 2], _rf[60 + 3]);
+                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 15 * ldc + tf_col)) + 0) = _v4;
+#else
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf[_lp*2 + 30], _rf[_lp*2+1 + 30]));
+                                    _rp_0[_lp + 1] = *(uint32_t*)&_bf2;
+#endif  // CAKE_WGRAD_OUT
+                                }
+#if CAKE_WGRAD_OUT == 16
+                                reinterpret_cast<int2*>(C + (tl_out + epi_half * 128 + 7 * ldc + tf_col))[0] = reinterpret_cast<int2*>(_rp_0)[0];
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf[_lp*2 + 32], _rf[_lp*2+1 + 32]));
+                                    _rp_0[_lp] = *(uint32_t*)&_bf2;
+                                }
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf[_lp*2 + 34], _rf[_lp*2+1 + 34]));
+                                    _rp_0[_lp + 1] = *(uint32_t*)&_bf2;
+                                }
+                                reinterpret_cast<int2*>(C + (tl_out + epi_half * 128 + 8 * ldc + tf_col))[0] = reinterpret_cast<int2*>(_rp_0)[0];
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf[_lp*2 + 36], _rf[_lp*2+1 + 36]));
+                                    _rp_0[_lp] = *(uint32_t*)&_bf2;
+                                }
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf[_lp*2 + 38], _rf[_lp*2+1 + 38]));
+                                    _rp_0[_lp + 1] = *(uint32_t*)&_bf2;
+                                }
+                                reinterpret_cast<int2*>(C + (tl_out + epi_half * 128 + 9 * ldc + tf_col))[0] = reinterpret_cast<int2*>(_rp_0)[0];
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf[_lp*2 + 40], _rf[_lp*2+1 + 40]));
+                                    _rp_0[_lp] = *(uint32_t*)&_bf2;
+                                }
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf[_lp*2 + 42], _rf[_lp*2+1 + 42]));
+                                    _rp_0[_lp + 1] = *(uint32_t*)&_bf2;
+                                }
+                                reinterpret_cast<int2*>(C + (tl_out + epi_half * 128 + 10 * ldc + tf_col))[0] = reinterpret_cast<int2*>(_rp_0)[0];
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf[_lp*2 + 44], _rf[_lp*2+1 + 44]));
+                                    _rp_0[_lp] = *(uint32_t*)&_bf2;
+                                }
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf[_lp*2 + 46], _rf[_lp*2+1 + 46]));
+                                    _rp_0[_lp + 1] = *(uint32_t*)&_bf2;
+                                }
+                                reinterpret_cast<int2*>(C + (tl_out + epi_half * 128 + 11 * ldc + tf_col))[0] = reinterpret_cast<int2*>(_rp_0)[0];
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf[_lp*2 + 48], _rf[_lp*2+1 + 48]));
+                                    _rp_0[_lp] = *(uint32_t*)&_bf2;
+                                }
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf[_lp*2 + 50], _rf[_lp*2+1 + 50]));
+                                    _rp_0[_lp + 1] = *(uint32_t*)&_bf2;
+                                }
+                                reinterpret_cast<int2*>(C + (tl_out + epi_half * 128 + 12 * ldc + tf_col))[0] = reinterpret_cast<int2*>(_rp_0)[0];
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf[_lp*2 + 52], _rf[_lp*2+1 + 52]));
+                                    _rp_0[_lp] = *(uint32_t*)&_bf2;
+                                }
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf[_lp*2 + 54], _rf[_lp*2+1 + 54]));
+                                    _rp_0[_lp + 1] = *(uint32_t*)&_bf2;
+                                }
+                                reinterpret_cast<int2*>(C + (tl_out + epi_half * 128 + 13 * ldc + tf_col))[0] = reinterpret_cast<int2*>(_rp_0)[0];
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf[_lp*2 + 56], _rf[_lp*2+1 + 56]));
+                                    _rp_0[_lp] = *(uint32_t*)&_bf2;
+                                }
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf[_lp*2 + 58], _rf[_lp*2+1 + 58]));
+                                    _rp_0[_lp + 1] = *(uint32_t*)&_bf2;
+                                }
+                                reinterpret_cast<int2*>(C + (tl_out + epi_half * 128 + 14 * ldc + tf_col))[0] = reinterpret_cast<int2*>(_rp_0)[0];
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf[_lp*2 + 60], _rf[_lp*2+1 + 60]));
+                                    _rp_0[_lp] = *(uint32_t*)&_bf2;
+                                }
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf[_lp*2 + 62], _rf[_lp*2+1 + 62]));
+                                    _rp_0[_lp + 1] = *(uint32_t*)&_bf2;
+                                }
+                                reinterpret_cast<int2*>(C + (tl_out + epi_half * 128 + 15 * ldc + tf_col))[0] = reinterpret_cast<int2*>(_rp_0)[0];
+#endif  // CAKE_WGRAD_OUT == 16
                                 {
                                     unsigned _v4_49_0;
                                     unsigned _v4_49_1;
                                     unsigned _v4_49_2;
                                     unsigned _v4_49_3;
                                     asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-                                        : "=r"(_v4_49_0), "=r"(_v4_49_1), "=r"(_v4_49_2), "=r"(_v4_49_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 48 + 4) + (0))) : "memory");
-                                    _fin_2[4 + 0] = __uint_as_float(_v4_49_0);
-                                    _fin_2[4 + 1] = __uint_as_float(_v4_49_1);
-                                    _fin_2[4 + 2] = __uint_as_float(_v4_49_2);
-                                    _fin_2[4 + 3] = __uint_as_float(_v4_49_3);
+                                        : "=r"(_v4_49_0), "=r"(_v4_49_1), "=r"(_v4_49_2), "=r"(_v4_49_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 16 * TILE_K + tf_col) + (0))) : "memory");
+                                    _rf[0 + 0] = __uint_as_float(_v4_49_0);
+                                    _rf[0 + 1] = __uint_as_float(_v4_49_1);
+                                    _rf[0 + 2] = __uint_as_float(_v4_49_2);
+                                    _rf[0 + 3] = __uint_as_float(_v4_49_3);
                                 }
                                 {
                                     unsigned _v4_50_0;
@@ -7121,11 +7860,11 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                                     unsigned _v4_50_2;
                                     unsigned _v4_50_3;
                                     asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-                                        : "=r"(_v4_50_0), "=r"(_v4_50_1), "=r"(_v4_50_2), "=r"(_v4_50_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 48 + 8) + (0))) : "memory");
-                                    _fin_2[8 + 0] = __uint_as_float(_v4_50_0);
-                                    _fin_2[8 + 1] = __uint_as_float(_v4_50_1);
-                                    _fin_2[8 + 2] = __uint_as_float(_v4_50_2);
-                                    _fin_2[8 + 3] = __uint_as_float(_v4_50_3);
+                                        : "=r"(_v4_50_0), "=r"(_v4_50_1), "=r"(_v4_50_2), "=r"(_v4_50_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 17 * TILE_K + tf_col) + (0))) : "memory");
+                                    _rf[4 + 0] = __uint_as_float(_v4_50_0);
+                                    _rf[4 + 1] = __uint_as_float(_v4_50_1);
+                                    _rf[4 + 2] = __uint_as_float(_v4_50_2);
+                                    _rf[4 + 3] = __uint_as_float(_v4_50_3);
                                 }
                                 {
                                     unsigned _v4_51_0;
@@ -7133,2447 +7872,1432 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap A, const __grid_constant
                                     unsigned _v4_51_2;
                                     unsigned _v4_51_3;
                                     asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-                                        : "=r"(_v4_51_0), "=r"(_v4_51_1), "=r"(_v4_51_2), "=r"(_v4_51_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 48 + 12) + (0))) : "memory");
-                                    _fin_2[12 + 0] = __uint_as_float(_v4_51_0);
-                                    _fin_2[12 + 1] = __uint_as_float(_v4_51_1);
-                                    _fin_2[12 + 2] = __uint_as_float(_v4_51_2);
-                                    _fin_2[12 + 3] = __uint_as_float(_v4_51_3);
-#endif  // CAKE_WGRAD_OUT
+                                        : "=r"(_v4_51_0), "=r"(_v4_51_1), "=r"(_v4_51_2), "=r"(_v4_51_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 18 * TILE_K + tf_col) + (0))) : "memory");
+                                    _rf[8 + 0] = __uint_as_float(_v4_51_0);
+                                    _rf[8 + 1] = __uint_as_float(_v4_51_1);
+                                    _rf[8 + 2] = __uint_as_float(_v4_51_2);
+                                    _rf[8 + 3] = __uint_as_float(_v4_51_3);
                                 }
                                 {
-                                    float4 _v4 = make_float4(_clr_2[0 + 0], _clr_2[0 + 1], _clr_2[0 + 2], _clr_2[0 + 3]);
-                                    *reinterpret_cast<float4*>((tail_sums + (tl_part + epi_half * 128 + 48)) + 0) = _v4;
-                                }
-                                {
-                                    float4 _v4 = make_float4(_clr_2[0 + 0], _clr_2[0 + 1], _clr_2[0 + 2], _clr_2[0 + 3]);
-                                    *reinterpret_cast<float4*>((tail_sums + (tl_part + epi_half * 128 + 48 + 4)) + 0) = _v4;
-                                }
-                                {
-                                    float4 _v4 = make_float4(_clr_2[0 + 0], _clr_2[0 + 1], _clr_2[0 + 2], _clr_2[0 + 3]);
-                                    *reinterpret_cast<float4*>((tail_sums + (tl_part + epi_half * 128 + 48 + 8)) + 0) = _v4;
-                                }
-                                {
-                                    float4 _v4 = make_float4(_clr_2[0 + 0], _clr_2[0 + 1], _clr_2[0 + 2], _clr_2[0 + 3]);
-                                    *reinterpret_cast<float4*>((tail_sums + (tl_part + epi_half * 128 + 48 + 12)) + 0) = _v4;
-                                }
-#if CAKE_WGRAD_OUT == 32
-                                {
-                                    float4 _v4 = make_float4(_fin_2[0 + 0], _fin_2[0 + 1], _fin_2[0 + 2], _fin_2[0 + 3]);
-                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 48)) + 0) = _v4;
-#else
-                                unsigned int _fin_p_2[8];
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_2[_lp*2 + 0], _fin_2[_lp*2+1 + 0]));
-                                    _fin_p_2[_lp] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_2[_lp*2 + 2], _fin_2[_lp*2+1 + 2]));
-                                    _fin_p_2[_lp + 1] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_2[_lp*2 + 4], _fin_2[_lp*2+1 + 4]));
-                                    _fin_p_2[_lp + 2] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_2[_lp*2 + 6], _fin_2[_lp*2+1 + 6]));
-                                    _fin_p_2[_lp + 3] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_2[_lp*2 + 8], _fin_2[_lp*2+1 + 8]));
-                                    _fin_p_2[_lp + 4] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_2[_lp*2 + 10], _fin_2[_lp*2+1 + 10]));
-                                    _fin_p_2[_lp + 5] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_2[_lp*2 + 12], _fin_2[_lp*2+1 + 12]));
-                                    _fin_p_2[_lp + 6] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_2[_lp*2 + 14], _fin_2[_lp*2+1 + 14]));
-                                    _fin_p_2[_lp + 7] = *(uint32_t*)&_bf2;
-#endif  // CAKE_WGRAD_OUT
-                                }
-                                {
-#if CAKE_WGRAD_OUT == 32
-                                    float4 _v4 = make_float4(_fin_2[4 + 0], _fin_2[4 + 1], _fin_2[4 + 2], _fin_2[4 + 3]);
-                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 48 + 4)) + 0) = _v4;
-                                }
-                                {
-                                    float4 _v4 = make_float4(_fin_2[8 + 0], _fin_2[8 + 1], _fin_2[8 + 2], _fin_2[8 + 3]);
-                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 48 + 8)) + 0) = _v4;
-                                }
-                                {
-                                    float4 _v4 = make_float4(_fin_2[12 + 0], _fin_2[12 + 1], _fin_2[12 + 2], _fin_2[12 + 3]);
-                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 48 + 12)) + 0) = _v4;
-#else
-                                    const unsigned* _raw_stv8_52 = reinterpret_cast<const unsigned*>(_fin_p_2);
-                                    asm volatile(
-                                        "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                                        :: "l"((void*)(C + (tl_out + epi_half * 128 + 48))), "r"(_raw_stv8_52[0]), "r"(_raw_stv8_52[1]), "r"(_raw_stv8_52[2]), "r"(_raw_stv8_52[3]), "r"(_raw_stv8_52[4]), "r"(_raw_stv8_52[5]), "r"(_raw_stv8_52[6]), "r"(_raw_stv8_52[7]) : "memory");
-#endif  // CAKE_WGRAD_OUT
-                                }
-                                float _fin_3[16];
-                                float _clr_3[4];
-                                _clr_3[0] = 0.0f;
-                                _clr_3[1] = 0.0f;
-                                _clr_3[2] = 0.0f;
-                                _clr_3[3] = 0.0f;
-                                {
-#if CAKE_WGRAD_OUT == 32
-                                    unsigned _v4_49_0;
-                                    unsigned _v4_49_1;
-                                    unsigned _v4_49_2;
-                                    unsigned _v4_49_3;
-#else
-                                    unsigned _v4_53_0;
-                                    unsigned _v4_53_1;
-                                    unsigned _v4_53_2;
-                                    unsigned _v4_53_3;
-#endif  // CAKE_WGRAD_OUT
-                                    asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-#if CAKE_WGRAD_OUT == 32
-                                        : "=r"(_v4_49_0), "=r"(_v4_49_1), "=r"(_v4_49_2), "=r"(_v4_49_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 64) + (0))) : "memory");
-                                    _fin_3[0 + 0] = __uint_as_float(_v4_49_0);
-                                    _fin_3[0 + 1] = __uint_as_float(_v4_49_1);
-                                    _fin_3[0 + 2] = __uint_as_float(_v4_49_2);
-                                    _fin_3[0 + 3] = __uint_as_float(_v4_49_3);
-#else
-                                        : "=r"(_v4_53_0), "=r"(_v4_53_1), "=r"(_v4_53_2), "=r"(_v4_53_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 64) + (0))) : "memory");
-                                    _fin_3[0 + 0] = __uint_as_float(_v4_53_0);
-                                    _fin_3[0 + 1] = __uint_as_float(_v4_53_1);
-                                    _fin_3[0 + 2] = __uint_as_float(_v4_53_2);
-                                    _fin_3[0 + 3] = __uint_as_float(_v4_53_3);
-#endif  // CAKE_WGRAD_OUT
-                                }
-                                {
-#if CAKE_WGRAD_OUT == 32
-                                    unsigned _v4_50_0;
-                                    unsigned _v4_50_1;
-                                    unsigned _v4_50_2;
-                                    unsigned _v4_50_3;
-#else
-                                    unsigned _v4_54_0;
-                                    unsigned _v4_54_1;
-                                    unsigned _v4_54_2;
-                                    unsigned _v4_54_3;
-#endif  // CAKE_WGRAD_OUT
-                                    asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-#if CAKE_WGRAD_OUT == 32
-                                        : "=r"(_v4_50_0), "=r"(_v4_50_1), "=r"(_v4_50_2), "=r"(_v4_50_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 64 + 4) + (0))) : "memory");
-                                    _fin_3[4 + 0] = __uint_as_float(_v4_50_0);
-                                    _fin_3[4 + 1] = __uint_as_float(_v4_50_1);
-                                    _fin_3[4 + 2] = __uint_as_float(_v4_50_2);
-                                    _fin_3[4 + 3] = __uint_as_float(_v4_50_3);
-#else
-                                        : "=r"(_v4_54_0), "=r"(_v4_54_1), "=r"(_v4_54_2), "=r"(_v4_54_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 64 + 4) + (0))) : "memory");
-                                    _fin_3[4 + 0] = __uint_as_float(_v4_54_0);
-                                    _fin_3[4 + 1] = __uint_as_float(_v4_54_1);
-                                    _fin_3[4 + 2] = __uint_as_float(_v4_54_2);
-                                    _fin_3[4 + 3] = __uint_as_float(_v4_54_3);
-#endif  // CAKE_WGRAD_OUT
-                                }
-                                {
-#if CAKE_WGRAD_OUT == 32
-                                    unsigned _v4_51_0;
-                                    unsigned _v4_51_1;
-                                    unsigned _v4_51_2;
-                                    unsigned _v4_51_3;
-#else
-                                    unsigned _v4_55_0;
-                                    unsigned _v4_55_1;
-                                    unsigned _v4_55_2;
-                                    unsigned _v4_55_3;
-#endif  // CAKE_WGRAD_OUT
-                                    asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-#if CAKE_WGRAD_OUT == 32
-                                        : "=r"(_v4_51_0), "=r"(_v4_51_1), "=r"(_v4_51_2), "=r"(_v4_51_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 64 + 8) + (0))) : "memory");
-                                    _fin_3[8 + 0] = __uint_as_float(_v4_51_0);
-                                    _fin_3[8 + 1] = __uint_as_float(_v4_51_1);
-                                    _fin_3[8 + 2] = __uint_as_float(_v4_51_2);
-                                    _fin_3[8 + 3] = __uint_as_float(_v4_51_3);
-#else
-                                        : "=r"(_v4_55_0), "=r"(_v4_55_1), "=r"(_v4_55_2), "=r"(_v4_55_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 64 + 8) + (0))) : "memory");
-                                    _fin_3[8 + 0] = __uint_as_float(_v4_55_0);
-                                    _fin_3[8 + 1] = __uint_as_float(_v4_55_1);
-                                    _fin_3[8 + 2] = __uint_as_float(_v4_55_2);
-                                    _fin_3[8 + 3] = __uint_as_float(_v4_55_3);
-#endif  // CAKE_WGRAD_OUT
-                                }
-                                {
-#if CAKE_WGRAD_OUT == 32
                                     unsigned _v4_52_0;
                                     unsigned _v4_52_1;
                                     unsigned _v4_52_2;
                                     unsigned _v4_52_3;
-#else
-                                    unsigned _v4_56_0;
-                                    unsigned _v4_56_1;
-                                    unsigned _v4_56_2;
-                                    unsigned _v4_56_3;
-#endif  // CAKE_WGRAD_OUT
                                     asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-#if CAKE_WGRAD_OUT == 32
-                                        : "=r"(_v4_52_0), "=r"(_v4_52_1), "=r"(_v4_52_2), "=r"(_v4_52_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 64 + 12) + (0))) : "memory");
-                                    _fin_3[12 + 0] = __uint_as_float(_v4_52_0);
-                                    _fin_3[12 + 1] = __uint_as_float(_v4_52_1);
-                                    _fin_3[12 + 2] = __uint_as_float(_v4_52_2);
-                                    _fin_3[12 + 3] = __uint_as_float(_v4_52_3);
-#else
-                                        : "=r"(_v4_56_0), "=r"(_v4_56_1), "=r"(_v4_56_2), "=r"(_v4_56_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 64 + 12) + (0))) : "memory");
-                                    _fin_3[12 + 0] = __uint_as_float(_v4_56_0);
-                                    _fin_3[12 + 1] = __uint_as_float(_v4_56_1);
-                                    _fin_3[12 + 2] = __uint_as_float(_v4_56_2);
-                                    _fin_3[12 + 3] = __uint_as_float(_v4_56_3);
-#endif  // CAKE_WGRAD_OUT
+                                        : "=r"(_v4_52_0), "=r"(_v4_52_1), "=r"(_v4_52_2), "=r"(_v4_52_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 19 * TILE_K + tf_col) + (0))) : "memory");
+                                    _rf[12 + 0] = __uint_as_float(_v4_52_0);
+                                    _rf[12 + 1] = __uint_as_float(_v4_52_1);
+                                    _rf[12 + 2] = __uint_as_float(_v4_52_2);
+                                    _rf[12 + 3] = __uint_as_float(_v4_52_3);
                                 }
                                 {
-                                    float4 _v4 = make_float4(_clr_3[0 + 0], _clr_3[0 + 1], _clr_3[0 + 2], _clr_3[0 + 3]);
-                                    *reinterpret_cast<float4*>((tail_sums + (tl_part + epi_half * 128 + 64)) + 0) = _v4;
-                                }
-                                {
-                                    float4 _v4 = make_float4(_clr_3[0 + 0], _clr_3[0 + 1], _clr_3[0 + 2], _clr_3[0 + 3]);
-                                    *reinterpret_cast<float4*>((tail_sums + (tl_part + epi_half * 128 + 64 + 4)) + 0) = _v4;
-                                }
-                                {
-                                    float4 _v4 = make_float4(_clr_3[0 + 0], _clr_3[0 + 1], _clr_3[0 + 2], _clr_3[0 + 3]);
-                                    *reinterpret_cast<float4*>((tail_sums + (tl_part + epi_half * 128 + 64 + 8)) + 0) = _v4;
-                                }
-                                {
-                                    float4 _v4 = make_float4(_clr_3[0 + 0], _clr_3[0 + 1], _clr_3[0 + 2], _clr_3[0 + 3]);
-                                    *reinterpret_cast<float4*>((tail_sums + (tl_part + epi_half * 128 + 64 + 12)) + 0) = _v4;
-                                }
-#if CAKE_WGRAD_OUT == 32
-                                {
-                                    float4 _v4 = make_float4(_fin_3[0 + 0], _fin_3[0 + 1], _fin_3[0 + 2], _fin_3[0 + 3]);
-                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 64)) + 0) = _v4;
-#else
-                                unsigned int _fin_p_3[8];
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_3[_lp*2 + 0], _fin_3[_lp*2+1 + 0]));
-                                    _fin_p_3[_lp] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_3[_lp*2 + 2], _fin_3[_lp*2+1 + 2]));
-                                    _fin_p_3[_lp + 1] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_3[_lp*2 + 4], _fin_3[_lp*2+1 + 4]));
-                                    _fin_p_3[_lp + 2] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_3[_lp*2 + 6], _fin_3[_lp*2+1 + 6]));
-                                    _fin_p_3[_lp + 3] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_3[_lp*2 + 8], _fin_3[_lp*2+1 + 8]));
-                                    _fin_p_3[_lp + 4] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_3[_lp*2 + 10], _fin_3[_lp*2+1 + 10]));
-                                    _fin_p_3[_lp + 5] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_3[_lp*2 + 12], _fin_3[_lp*2+1 + 12]));
-                                    _fin_p_3[_lp + 6] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_3[_lp*2 + 14], _fin_3[_lp*2+1 + 14]));
-                                    _fin_p_3[_lp + 7] = *(uint32_t*)&_bf2;
-#endif  // CAKE_WGRAD_OUT
-                                }
-                                {
-#if CAKE_WGRAD_OUT == 32
-                                    float4 _v4 = make_float4(_fin_3[4 + 0], _fin_3[4 + 1], _fin_3[4 + 2], _fin_3[4 + 3]);
-                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 64 + 4)) + 0) = _v4;
-                                }
-                                {
-                                    float4 _v4 = make_float4(_fin_3[8 + 0], _fin_3[8 + 1], _fin_3[8 + 2], _fin_3[8 + 3]);
-                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 64 + 8)) + 0) = _v4;
-                                }
-                                {
-                                    float4 _v4 = make_float4(_fin_3[12 + 0], _fin_3[12 + 1], _fin_3[12 + 2], _fin_3[12 + 3]);
-                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 64 + 12)) + 0) = _v4;
-#else
-                                    const unsigned* _raw_stv8_57 = reinterpret_cast<const unsigned*>(_fin_p_3);
-                                    asm volatile(
-                                        "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                                        :: "l"((void*)(C + (tl_out + epi_half * 128 + 64))), "r"(_raw_stv8_57[0]), "r"(_raw_stv8_57[1]), "r"(_raw_stv8_57[2]), "r"(_raw_stv8_57[3]), "r"(_raw_stv8_57[4]), "r"(_raw_stv8_57[5]), "r"(_raw_stv8_57[6]), "r"(_raw_stv8_57[7]) : "memory");
-#endif  // CAKE_WGRAD_OUT
-                                }
-                                float _fin_4[16];
-                                float _clr_4[4];
-                                _clr_4[0] = 0.0f;
-                                _clr_4[1] = 0.0f;
-                                _clr_4[2] = 0.0f;
-                                _clr_4[3] = 0.0f;
-                                {
-#if CAKE_WGRAD_OUT == 32
                                     unsigned _v4_53_0;
                                     unsigned _v4_53_1;
                                     unsigned _v4_53_2;
                                     unsigned _v4_53_3;
-#else
-                                    unsigned _v4_58_0;
-                                    unsigned _v4_58_1;
-                                    unsigned _v4_58_2;
-                                    unsigned _v4_58_3;
-#endif  // CAKE_WGRAD_OUT
                                     asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-#if CAKE_WGRAD_OUT == 32
-                                        : "=r"(_v4_53_0), "=r"(_v4_53_1), "=r"(_v4_53_2), "=r"(_v4_53_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 80) + (0))) : "memory");
-                                    _fin_4[0 + 0] = __uint_as_float(_v4_53_0);
-                                    _fin_4[0 + 1] = __uint_as_float(_v4_53_1);
-                                    _fin_4[0 + 2] = __uint_as_float(_v4_53_2);
-                                    _fin_4[0 + 3] = __uint_as_float(_v4_53_3);
-#else
-                                        : "=r"(_v4_58_0), "=r"(_v4_58_1), "=r"(_v4_58_2), "=r"(_v4_58_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 80) + (0))) : "memory");
-                                    _fin_4[0 + 0] = __uint_as_float(_v4_58_0);
-                                    _fin_4[0 + 1] = __uint_as_float(_v4_58_1);
-                                    _fin_4[0 + 2] = __uint_as_float(_v4_58_2);
-                                    _fin_4[0 + 3] = __uint_as_float(_v4_58_3);
-#endif  // CAKE_WGRAD_OUT
+                                        : "=r"(_v4_53_0), "=r"(_v4_53_1), "=r"(_v4_53_2), "=r"(_v4_53_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 20 * TILE_K + tf_col) + (0))) : "memory");
+                                    _rf[16 + 0] = __uint_as_float(_v4_53_0);
+                                    _rf[16 + 1] = __uint_as_float(_v4_53_1);
+                                    _rf[16 + 2] = __uint_as_float(_v4_53_2);
+                                    _rf[16 + 3] = __uint_as_float(_v4_53_3);
                                 }
                                 {
-#if CAKE_WGRAD_OUT == 32
                                     unsigned _v4_54_0;
                                     unsigned _v4_54_1;
                                     unsigned _v4_54_2;
                                     unsigned _v4_54_3;
-#else
-                                    unsigned _v4_59_0;
-                                    unsigned _v4_59_1;
-                                    unsigned _v4_59_2;
-                                    unsigned _v4_59_3;
-#endif  // CAKE_WGRAD_OUT
                                     asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-#if CAKE_WGRAD_OUT == 32
-                                        : "=r"(_v4_54_0), "=r"(_v4_54_1), "=r"(_v4_54_2), "=r"(_v4_54_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 80 + 4) + (0))) : "memory");
-                                    _fin_4[4 + 0] = __uint_as_float(_v4_54_0);
-                                    _fin_4[4 + 1] = __uint_as_float(_v4_54_1);
-                                    _fin_4[4 + 2] = __uint_as_float(_v4_54_2);
-                                    _fin_4[4 + 3] = __uint_as_float(_v4_54_3);
-#else
-                                        : "=r"(_v4_59_0), "=r"(_v4_59_1), "=r"(_v4_59_2), "=r"(_v4_59_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 80 + 4) + (0))) : "memory");
-                                    _fin_4[4 + 0] = __uint_as_float(_v4_59_0);
-                                    _fin_4[4 + 1] = __uint_as_float(_v4_59_1);
-                                    _fin_4[4 + 2] = __uint_as_float(_v4_59_2);
-                                    _fin_4[4 + 3] = __uint_as_float(_v4_59_3);
-#endif  // CAKE_WGRAD_OUT
+                                        : "=r"(_v4_54_0), "=r"(_v4_54_1), "=r"(_v4_54_2), "=r"(_v4_54_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 21 * TILE_K + tf_col) + (0))) : "memory");
+                                    _rf[20 + 0] = __uint_as_float(_v4_54_0);
+                                    _rf[20 + 1] = __uint_as_float(_v4_54_1);
+                                    _rf[20 + 2] = __uint_as_float(_v4_54_2);
+                                    _rf[20 + 3] = __uint_as_float(_v4_54_3);
                                 }
                                 {
-#if CAKE_WGRAD_OUT == 32
                                     unsigned _v4_55_0;
                                     unsigned _v4_55_1;
                                     unsigned _v4_55_2;
                                     unsigned _v4_55_3;
-#else
-                                    unsigned _v4_60_0;
-                                    unsigned _v4_60_1;
-                                    unsigned _v4_60_2;
-                                    unsigned _v4_60_3;
-#endif  // CAKE_WGRAD_OUT
                                     asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-#if CAKE_WGRAD_OUT == 32
-                                        : "=r"(_v4_55_0), "=r"(_v4_55_1), "=r"(_v4_55_2), "=r"(_v4_55_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 80 + 8) + (0))) : "memory");
-                                    _fin_4[8 + 0] = __uint_as_float(_v4_55_0);
-                                    _fin_4[8 + 1] = __uint_as_float(_v4_55_1);
-                                    _fin_4[8 + 2] = __uint_as_float(_v4_55_2);
-                                    _fin_4[8 + 3] = __uint_as_float(_v4_55_3);
-#else
-                                        : "=r"(_v4_60_0), "=r"(_v4_60_1), "=r"(_v4_60_2), "=r"(_v4_60_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 80 + 8) + (0))) : "memory");
-                                    _fin_4[8 + 0] = __uint_as_float(_v4_60_0);
-                                    _fin_4[8 + 1] = __uint_as_float(_v4_60_1);
-                                    _fin_4[8 + 2] = __uint_as_float(_v4_60_2);
-                                    _fin_4[8 + 3] = __uint_as_float(_v4_60_3);
-#endif  // CAKE_WGRAD_OUT
+                                        : "=r"(_v4_55_0), "=r"(_v4_55_1), "=r"(_v4_55_2), "=r"(_v4_55_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 22 * TILE_K + tf_col) + (0))) : "memory");
+                                    _rf[24 + 0] = __uint_as_float(_v4_55_0);
+                                    _rf[24 + 1] = __uint_as_float(_v4_55_1);
+                                    _rf[24 + 2] = __uint_as_float(_v4_55_2);
+                                    _rf[24 + 3] = __uint_as_float(_v4_55_3);
                                 }
                                 {
-#if CAKE_WGRAD_OUT == 32
                                     unsigned _v4_56_0;
                                     unsigned _v4_56_1;
                                     unsigned _v4_56_2;
                                     unsigned _v4_56_3;
-#else
-                                    unsigned _v4_61_0;
-                                    unsigned _v4_61_1;
-                                    unsigned _v4_61_2;
-                                    unsigned _v4_61_3;
-#endif  // CAKE_WGRAD_OUT
                                     asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-#if CAKE_WGRAD_OUT == 32
-                                        : "=r"(_v4_56_0), "=r"(_v4_56_1), "=r"(_v4_56_2), "=r"(_v4_56_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 80 + 12) + (0))) : "memory");
-                                    _fin_4[12 + 0] = __uint_as_float(_v4_56_0);
-                                    _fin_4[12 + 1] = __uint_as_float(_v4_56_1);
-                                    _fin_4[12 + 2] = __uint_as_float(_v4_56_2);
-                                    _fin_4[12 + 3] = __uint_as_float(_v4_56_3);
-#else
-                                        : "=r"(_v4_61_0), "=r"(_v4_61_1), "=r"(_v4_61_2), "=r"(_v4_61_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 80 + 12) + (0))) : "memory");
-                                    _fin_4[12 + 0] = __uint_as_float(_v4_61_0);
-                                    _fin_4[12 + 1] = __uint_as_float(_v4_61_1);
-                                    _fin_4[12 + 2] = __uint_as_float(_v4_61_2);
-                                    _fin_4[12 + 3] = __uint_as_float(_v4_61_3);
-#endif  // CAKE_WGRAD_OUT
+                                        : "=r"(_v4_56_0), "=r"(_v4_56_1), "=r"(_v4_56_2), "=r"(_v4_56_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 23 * TILE_K + tf_col) + (0))) : "memory");
+                                    _rf[28 + 0] = __uint_as_float(_v4_56_0);
+                                    _rf[28 + 1] = __uint_as_float(_v4_56_1);
+                                    _rf[28 + 2] = __uint_as_float(_v4_56_2);
+                                    _rf[28 + 3] = __uint_as_float(_v4_56_3);
                                 }
                                 {
-                                    float4 _v4 = make_float4(_clr_4[0 + 0], _clr_4[0 + 1], _clr_4[0 + 2], _clr_4[0 + 3]);
-                                    *reinterpret_cast<float4*>((tail_sums + (tl_part + epi_half * 128 + 80)) + 0) = _v4;
-                                }
-                                {
-                                    float4 _v4 = make_float4(_clr_4[0 + 0], _clr_4[0 + 1], _clr_4[0 + 2], _clr_4[0 + 3]);
-                                    *reinterpret_cast<float4*>((tail_sums + (tl_part + epi_half * 128 + 80 + 4)) + 0) = _v4;
-                                }
-                                {
-                                    float4 _v4 = make_float4(_clr_4[0 + 0], _clr_4[0 + 1], _clr_4[0 + 2], _clr_4[0 + 3]);
-                                    *reinterpret_cast<float4*>((tail_sums + (tl_part + epi_half * 128 + 80 + 8)) + 0) = _v4;
-                                }
-                                {
-                                    float4 _v4 = make_float4(_clr_4[0 + 0], _clr_4[0 + 1], _clr_4[0 + 2], _clr_4[0 + 3]);
-                                    *reinterpret_cast<float4*>((tail_sums + (tl_part + epi_half * 128 + 80 + 12)) + 0) = _v4;
-                                }
-#if CAKE_WGRAD_OUT == 32
-                                {
-                                    float4 _v4 = make_float4(_fin_4[0 + 0], _fin_4[0 + 1], _fin_4[0 + 2], _fin_4[0 + 3]);
-                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 80)) + 0) = _v4;
-#else
-                                unsigned int _fin_p_4[8];
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_4[_lp*2 + 0], _fin_4[_lp*2+1 + 0]));
-                                    _fin_p_4[_lp] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_4[_lp*2 + 2], _fin_4[_lp*2+1 + 2]));
-                                    _fin_p_4[_lp + 1] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_4[_lp*2 + 4], _fin_4[_lp*2+1 + 4]));
-                                    _fin_p_4[_lp + 2] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_4[_lp*2 + 6], _fin_4[_lp*2+1 + 6]));
-                                    _fin_p_4[_lp + 3] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_4[_lp*2 + 8], _fin_4[_lp*2+1 + 8]));
-                                    _fin_p_4[_lp + 4] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_4[_lp*2 + 10], _fin_4[_lp*2+1 + 10]));
-                                    _fin_p_4[_lp + 5] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_4[_lp*2 + 12], _fin_4[_lp*2+1 + 12]));
-                                    _fin_p_4[_lp + 6] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_4[_lp*2 + 14], _fin_4[_lp*2+1 + 14]));
-                                    _fin_p_4[_lp + 7] = *(uint32_t*)&_bf2;
-#endif  // CAKE_WGRAD_OUT
-                                }
-                                {
-#if CAKE_WGRAD_OUT == 32
-                                    float4 _v4 = make_float4(_fin_4[4 + 0], _fin_4[4 + 1], _fin_4[4 + 2], _fin_4[4 + 3]);
-                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 80 + 4)) + 0) = _v4;
-                                }
-                                {
-                                    float4 _v4 = make_float4(_fin_4[8 + 0], _fin_4[8 + 1], _fin_4[8 + 2], _fin_4[8 + 3]);
-                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 80 + 8)) + 0) = _v4;
-                                }
-                                {
-                                    float4 _v4 = make_float4(_fin_4[12 + 0], _fin_4[12 + 1], _fin_4[12 + 2], _fin_4[12 + 3]);
-                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 80 + 12)) + 0) = _v4;
-#else
-                                    const unsigned* _raw_stv8_62 = reinterpret_cast<const unsigned*>(_fin_p_4);
-                                    asm volatile(
-                                        "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                                        :: "l"((void*)(C + (tl_out + epi_half * 128 + 80))), "r"(_raw_stv8_62[0]), "r"(_raw_stv8_62[1]), "r"(_raw_stv8_62[2]), "r"(_raw_stv8_62[3]), "r"(_raw_stv8_62[4]), "r"(_raw_stv8_62[5]), "r"(_raw_stv8_62[6]), "r"(_raw_stv8_62[7]) : "memory");
-#endif  // CAKE_WGRAD_OUT
-                                }
-                                float _fin_5[16];
-                                float _clr_5[4];
-                                _clr_5[0] = 0.0f;
-                                _clr_5[1] = 0.0f;
-                                _clr_5[2] = 0.0f;
-                                _clr_5[3] = 0.0f;
-                                {
-#if CAKE_WGRAD_OUT == 32
                                     unsigned _v4_57_0;
                                     unsigned _v4_57_1;
                                     unsigned _v4_57_2;
                                     unsigned _v4_57_3;
-#else
-                                    unsigned _v4_63_0;
-                                    unsigned _v4_63_1;
-                                    unsigned _v4_63_2;
-                                    unsigned _v4_63_3;
-#endif  // CAKE_WGRAD_OUT
                                     asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-#if CAKE_WGRAD_OUT == 32
-                                        : "=r"(_v4_57_0), "=r"(_v4_57_1), "=r"(_v4_57_2), "=r"(_v4_57_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 96) + (0))) : "memory");
-                                    _fin_5[0 + 0] = __uint_as_float(_v4_57_0);
-                                    _fin_5[0 + 1] = __uint_as_float(_v4_57_1);
-                                    _fin_5[0 + 2] = __uint_as_float(_v4_57_2);
-                                    _fin_5[0 + 3] = __uint_as_float(_v4_57_3);
-#else
-                                        : "=r"(_v4_63_0), "=r"(_v4_63_1), "=r"(_v4_63_2), "=r"(_v4_63_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 96) + (0))) : "memory");
-                                    _fin_5[0 + 0] = __uint_as_float(_v4_63_0);
-                                    _fin_5[0 + 1] = __uint_as_float(_v4_63_1);
-                                    _fin_5[0 + 2] = __uint_as_float(_v4_63_2);
-                                    _fin_5[0 + 3] = __uint_as_float(_v4_63_3);
-#endif  // CAKE_WGRAD_OUT
+                                        : "=r"(_v4_57_0), "=r"(_v4_57_1), "=r"(_v4_57_2), "=r"(_v4_57_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 24 * TILE_K + tf_col) + (0))) : "memory");
+                                    _rf[32 + 0] = __uint_as_float(_v4_57_0);
+                                    _rf[32 + 1] = __uint_as_float(_v4_57_1);
+                                    _rf[32 + 2] = __uint_as_float(_v4_57_2);
+                                    _rf[32 + 3] = __uint_as_float(_v4_57_3);
                                 }
                                 {
-#if CAKE_WGRAD_OUT == 32
                                     unsigned _v4_58_0;
                                     unsigned _v4_58_1;
                                     unsigned _v4_58_2;
                                     unsigned _v4_58_3;
-#else
-                                    unsigned _v4_64_0;
-                                    unsigned _v4_64_1;
-                                    unsigned _v4_64_2;
-                                    unsigned _v4_64_3;
-#endif  // CAKE_WGRAD_OUT
                                     asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-#if CAKE_WGRAD_OUT == 32
-                                        : "=r"(_v4_58_0), "=r"(_v4_58_1), "=r"(_v4_58_2), "=r"(_v4_58_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 96 + 4) + (0))) : "memory");
-                                    _fin_5[4 + 0] = __uint_as_float(_v4_58_0);
-                                    _fin_5[4 + 1] = __uint_as_float(_v4_58_1);
-                                    _fin_5[4 + 2] = __uint_as_float(_v4_58_2);
-                                    _fin_5[4 + 3] = __uint_as_float(_v4_58_3);
-#else
-                                        : "=r"(_v4_64_0), "=r"(_v4_64_1), "=r"(_v4_64_2), "=r"(_v4_64_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 96 + 4) + (0))) : "memory");
-                                    _fin_5[4 + 0] = __uint_as_float(_v4_64_0);
-                                    _fin_5[4 + 1] = __uint_as_float(_v4_64_1);
-                                    _fin_5[4 + 2] = __uint_as_float(_v4_64_2);
-                                    _fin_5[4 + 3] = __uint_as_float(_v4_64_3);
-#endif  // CAKE_WGRAD_OUT
+                                        : "=r"(_v4_58_0), "=r"(_v4_58_1), "=r"(_v4_58_2), "=r"(_v4_58_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 25 * TILE_K + tf_col) + (0))) : "memory");
+                                    _rf[36 + 0] = __uint_as_float(_v4_58_0);
+                                    _rf[36 + 1] = __uint_as_float(_v4_58_1);
+                                    _rf[36 + 2] = __uint_as_float(_v4_58_2);
+                                    _rf[36 + 3] = __uint_as_float(_v4_58_3);
                                 }
                                 {
-#if CAKE_WGRAD_OUT == 32
                                     unsigned _v4_59_0;
                                     unsigned _v4_59_1;
                                     unsigned _v4_59_2;
                                     unsigned _v4_59_3;
-#else
-                                    unsigned _v4_65_0;
-                                    unsigned _v4_65_1;
-                                    unsigned _v4_65_2;
-                                    unsigned _v4_65_3;
-#endif  // CAKE_WGRAD_OUT
                                     asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-#if CAKE_WGRAD_OUT == 32
-                                        : "=r"(_v4_59_0), "=r"(_v4_59_1), "=r"(_v4_59_2), "=r"(_v4_59_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 96 + 8) + (0))) : "memory");
-                                    _fin_5[8 + 0] = __uint_as_float(_v4_59_0);
-                                    _fin_5[8 + 1] = __uint_as_float(_v4_59_1);
-                                    _fin_5[8 + 2] = __uint_as_float(_v4_59_2);
-                                    _fin_5[8 + 3] = __uint_as_float(_v4_59_3);
-#else
-                                        : "=r"(_v4_65_0), "=r"(_v4_65_1), "=r"(_v4_65_2), "=r"(_v4_65_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 96 + 8) + (0))) : "memory");
-                                    _fin_5[8 + 0] = __uint_as_float(_v4_65_0);
-                                    _fin_5[8 + 1] = __uint_as_float(_v4_65_1);
-                                    _fin_5[8 + 2] = __uint_as_float(_v4_65_2);
-                                    _fin_5[8 + 3] = __uint_as_float(_v4_65_3);
-#endif  // CAKE_WGRAD_OUT
+                                        : "=r"(_v4_59_0), "=r"(_v4_59_1), "=r"(_v4_59_2), "=r"(_v4_59_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 26 * TILE_K + tf_col) + (0))) : "memory");
+                                    _rf[40 + 0] = __uint_as_float(_v4_59_0);
+                                    _rf[40 + 1] = __uint_as_float(_v4_59_1);
+                                    _rf[40 + 2] = __uint_as_float(_v4_59_2);
+                                    _rf[40 + 3] = __uint_as_float(_v4_59_3);
                                 }
                                 {
-#if CAKE_WGRAD_OUT == 32
                                     unsigned _v4_60_0;
                                     unsigned _v4_60_1;
                                     unsigned _v4_60_2;
                                     unsigned _v4_60_3;
-#else
-                                    unsigned _v4_66_0;
-                                    unsigned _v4_66_1;
-                                    unsigned _v4_66_2;
-                                    unsigned _v4_66_3;
-#endif  // CAKE_WGRAD_OUT
                                     asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-#if CAKE_WGRAD_OUT == 32
-                                        : "=r"(_v4_60_0), "=r"(_v4_60_1), "=r"(_v4_60_2), "=r"(_v4_60_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 96 + 12) + (0))) : "memory");
-                                    _fin_5[12 + 0] = __uint_as_float(_v4_60_0);
-                                    _fin_5[12 + 1] = __uint_as_float(_v4_60_1);
-                                    _fin_5[12 + 2] = __uint_as_float(_v4_60_2);
-                                    _fin_5[12 + 3] = __uint_as_float(_v4_60_3);
-#else
-                                        : "=r"(_v4_66_0), "=r"(_v4_66_1), "=r"(_v4_66_2), "=r"(_v4_66_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 96 + 12) + (0))) : "memory");
-                                    _fin_5[12 + 0] = __uint_as_float(_v4_66_0);
-                                    _fin_5[12 + 1] = __uint_as_float(_v4_66_1);
-                                    _fin_5[12 + 2] = __uint_as_float(_v4_66_2);
-                                    _fin_5[12 + 3] = __uint_as_float(_v4_66_3);
-#endif  // CAKE_WGRAD_OUT
+                                        : "=r"(_v4_60_0), "=r"(_v4_60_1), "=r"(_v4_60_2), "=r"(_v4_60_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 27 * TILE_K + tf_col) + (0))) : "memory");
+                                    _rf[44 + 0] = __uint_as_float(_v4_60_0);
+                                    _rf[44 + 1] = __uint_as_float(_v4_60_1);
+                                    _rf[44 + 2] = __uint_as_float(_v4_60_2);
+                                    _rf[44 + 3] = __uint_as_float(_v4_60_3);
                                 }
                                 {
-                                    float4 _v4 = make_float4(_clr_5[0 + 0], _clr_5[0 + 1], _clr_5[0 + 2], _clr_5[0 + 3]);
-                                    *reinterpret_cast<float4*>((tail_sums + (tl_part + epi_half * 128 + 96)) + 0) = _v4;
-                                }
-                                {
-                                    float4 _v4 = make_float4(_clr_5[0 + 0], _clr_5[0 + 1], _clr_5[0 + 2], _clr_5[0 + 3]);
-                                    *reinterpret_cast<float4*>((tail_sums + (tl_part + epi_half * 128 + 96 + 4)) + 0) = _v4;
-                                }
-                                {
-                                    float4 _v4 = make_float4(_clr_5[0 + 0], _clr_5[0 + 1], _clr_5[0 + 2], _clr_5[0 + 3]);
-                                    *reinterpret_cast<float4*>((tail_sums + (tl_part + epi_half * 128 + 96 + 8)) + 0) = _v4;
-                                }
-                                {
-                                    float4 _v4 = make_float4(_clr_5[0 + 0], _clr_5[0 + 1], _clr_5[0 + 2], _clr_5[0 + 3]);
-                                    *reinterpret_cast<float4*>((tail_sums + (tl_part + epi_half * 128 + 96 + 12)) + 0) = _v4;
-                                }
-#if CAKE_WGRAD_OUT == 32
-                                {
-                                    float4 _v4 = make_float4(_fin_5[0 + 0], _fin_5[0 + 1], _fin_5[0 + 2], _fin_5[0 + 3]);
-                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 96)) + 0) = _v4;
-#else
-                                unsigned int _fin_p_5[8];
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_5[_lp*2 + 0], _fin_5[_lp*2+1 + 0]));
-                                    _fin_p_5[_lp] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_5[_lp*2 + 2], _fin_5[_lp*2+1 + 2]));
-                                    _fin_p_5[_lp + 1] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_5[_lp*2 + 4], _fin_5[_lp*2+1 + 4]));
-                                    _fin_p_5[_lp + 2] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_5[_lp*2 + 6], _fin_5[_lp*2+1 + 6]));
-                                    _fin_p_5[_lp + 3] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_5[_lp*2 + 8], _fin_5[_lp*2+1 + 8]));
-                                    _fin_p_5[_lp + 4] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_5[_lp*2 + 10], _fin_5[_lp*2+1 + 10]));
-                                    _fin_p_5[_lp + 5] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_5[_lp*2 + 12], _fin_5[_lp*2+1 + 12]));
-                                    _fin_p_5[_lp + 6] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_5[_lp*2 + 14], _fin_5[_lp*2+1 + 14]));
-                                    _fin_p_5[_lp + 7] = *(uint32_t*)&_bf2;
-#endif  // CAKE_WGRAD_OUT
-                                }
-                                {
-#if CAKE_WGRAD_OUT == 32
-                                    float4 _v4 = make_float4(_fin_5[4 + 0], _fin_5[4 + 1], _fin_5[4 + 2], _fin_5[4 + 3]);
-                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 96 + 4)) + 0) = _v4;
-                                }
-                                {
-                                    float4 _v4 = make_float4(_fin_5[8 + 0], _fin_5[8 + 1], _fin_5[8 + 2], _fin_5[8 + 3]);
-                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 96 + 8)) + 0) = _v4;
-                                }
-                                {
-                                    float4 _v4 = make_float4(_fin_5[12 + 0], _fin_5[12 + 1], _fin_5[12 + 2], _fin_5[12 + 3]);
-                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 96 + 12)) + 0) = _v4;
-#else
-                                    const unsigned* _raw_stv8_67 = reinterpret_cast<const unsigned*>(_fin_p_5);
-                                    asm volatile(
-                                        "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                                        :: "l"((void*)(C + (tl_out + epi_half * 128 + 96))), "r"(_raw_stv8_67[0]), "r"(_raw_stv8_67[1]), "r"(_raw_stv8_67[2]), "r"(_raw_stv8_67[3]), "r"(_raw_stv8_67[4]), "r"(_raw_stv8_67[5]), "r"(_raw_stv8_67[6]), "r"(_raw_stv8_67[7]) : "memory");
-#endif  // CAKE_WGRAD_OUT
-                                }
-                                float _fin_6[16];
-                                float _clr_6[4];
-                                _clr_6[0] = 0.0f;
-                                _clr_6[1] = 0.0f;
-                                _clr_6[2] = 0.0f;
-                                _clr_6[3] = 0.0f;
-                                {
-#if CAKE_WGRAD_OUT == 32
                                     unsigned _v4_61_0;
                                     unsigned _v4_61_1;
                                     unsigned _v4_61_2;
                                     unsigned _v4_61_3;
-#else
-                                    unsigned _v4_68_0;
-                                    unsigned _v4_68_1;
-                                    unsigned _v4_68_2;
-                                    unsigned _v4_68_3;
-#endif  // CAKE_WGRAD_OUT
                                     asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-#if CAKE_WGRAD_OUT == 32
-                                        : "=r"(_v4_61_0), "=r"(_v4_61_1), "=r"(_v4_61_2), "=r"(_v4_61_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 112) + (0))) : "memory");
-                                    _fin_6[0 + 0] = __uint_as_float(_v4_61_0);
-                                    _fin_6[0 + 1] = __uint_as_float(_v4_61_1);
-                                    _fin_6[0 + 2] = __uint_as_float(_v4_61_2);
-                                    _fin_6[0 + 3] = __uint_as_float(_v4_61_3);
-#else
-                                        : "=r"(_v4_68_0), "=r"(_v4_68_1), "=r"(_v4_68_2), "=r"(_v4_68_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 112) + (0))) : "memory");
-                                    _fin_6[0 + 0] = __uint_as_float(_v4_68_0);
-                                    _fin_6[0 + 1] = __uint_as_float(_v4_68_1);
-                                    _fin_6[0 + 2] = __uint_as_float(_v4_68_2);
-                                    _fin_6[0 + 3] = __uint_as_float(_v4_68_3);
-#endif  // CAKE_WGRAD_OUT
+                                        : "=r"(_v4_61_0), "=r"(_v4_61_1), "=r"(_v4_61_2), "=r"(_v4_61_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 28 * TILE_K + tf_col) + (0))) : "memory");
+                                    _rf[48 + 0] = __uint_as_float(_v4_61_0);
+                                    _rf[48 + 1] = __uint_as_float(_v4_61_1);
+                                    _rf[48 + 2] = __uint_as_float(_v4_61_2);
+                                    _rf[48 + 3] = __uint_as_float(_v4_61_3);
                                 }
                                 {
-#if CAKE_WGRAD_OUT == 32
                                     unsigned _v4_62_0;
                                     unsigned _v4_62_1;
                                     unsigned _v4_62_2;
                                     unsigned _v4_62_3;
-#else
-                                    unsigned _v4_69_0;
-                                    unsigned _v4_69_1;
-                                    unsigned _v4_69_2;
-                                    unsigned _v4_69_3;
-#endif  // CAKE_WGRAD_OUT
                                     asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-#if CAKE_WGRAD_OUT == 32
-                                        : "=r"(_v4_62_0), "=r"(_v4_62_1), "=r"(_v4_62_2), "=r"(_v4_62_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 112 + 4) + (0))) : "memory");
-                                    _fin_6[4 + 0] = __uint_as_float(_v4_62_0);
-                                    _fin_6[4 + 1] = __uint_as_float(_v4_62_1);
-                                    _fin_6[4 + 2] = __uint_as_float(_v4_62_2);
-                                    _fin_6[4 + 3] = __uint_as_float(_v4_62_3);
-#else
-                                        : "=r"(_v4_69_0), "=r"(_v4_69_1), "=r"(_v4_69_2), "=r"(_v4_69_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 112 + 4) + (0))) : "memory");
-                                    _fin_6[4 + 0] = __uint_as_float(_v4_69_0);
-                                    _fin_6[4 + 1] = __uint_as_float(_v4_69_1);
-                                    _fin_6[4 + 2] = __uint_as_float(_v4_69_2);
-                                    _fin_6[4 + 3] = __uint_as_float(_v4_69_3);
-#endif  // CAKE_WGRAD_OUT
+                                        : "=r"(_v4_62_0), "=r"(_v4_62_1), "=r"(_v4_62_2), "=r"(_v4_62_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 29 * TILE_K + tf_col) + (0))) : "memory");
+                                    _rf[52 + 0] = __uint_as_float(_v4_62_0);
+                                    _rf[52 + 1] = __uint_as_float(_v4_62_1);
+                                    _rf[52 + 2] = __uint_as_float(_v4_62_2);
+                                    _rf[52 + 3] = __uint_as_float(_v4_62_3);
                                 }
                                 {
-#if CAKE_WGRAD_OUT == 32
                                     unsigned _v4_63_0;
                                     unsigned _v4_63_1;
                                     unsigned _v4_63_2;
                                     unsigned _v4_63_3;
-#else
-                                    unsigned _v4_70_0;
-                                    unsigned _v4_70_1;
-                                    unsigned _v4_70_2;
-                                    unsigned _v4_70_3;
-#endif  // CAKE_WGRAD_OUT
                                     asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-#if CAKE_WGRAD_OUT == 32
-                                        : "=r"(_v4_63_0), "=r"(_v4_63_1), "=r"(_v4_63_2), "=r"(_v4_63_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 112 + 8) + (0))) : "memory");
-                                    _fin_6[8 + 0] = __uint_as_float(_v4_63_0);
-                                    _fin_6[8 + 1] = __uint_as_float(_v4_63_1);
-                                    _fin_6[8 + 2] = __uint_as_float(_v4_63_2);
-                                    _fin_6[8 + 3] = __uint_as_float(_v4_63_3);
-#else
-                                        : "=r"(_v4_70_0), "=r"(_v4_70_1), "=r"(_v4_70_2), "=r"(_v4_70_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 112 + 8) + (0))) : "memory");
-                                    _fin_6[8 + 0] = __uint_as_float(_v4_70_0);
-                                    _fin_6[8 + 1] = __uint_as_float(_v4_70_1);
-                                    _fin_6[8 + 2] = __uint_as_float(_v4_70_2);
-                                    _fin_6[8 + 3] = __uint_as_float(_v4_70_3);
-#endif  // CAKE_WGRAD_OUT
+                                        : "=r"(_v4_63_0), "=r"(_v4_63_1), "=r"(_v4_63_2), "=r"(_v4_63_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 30 * TILE_K + tf_col) + (0))) : "memory");
+                                    _rf[56 + 0] = __uint_as_float(_v4_63_0);
+                                    _rf[56 + 1] = __uint_as_float(_v4_63_1);
+                                    _rf[56 + 2] = __uint_as_float(_v4_63_2);
+                                    _rf[56 + 3] = __uint_as_float(_v4_63_3);
                                 }
                                 {
-#if CAKE_WGRAD_OUT == 32
                                     unsigned _v4_64_0;
                                     unsigned _v4_64_1;
                                     unsigned _v4_64_2;
                                     unsigned _v4_64_3;
-#else
-                                    unsigned _v4_71_0;
-                                    unsigned _v4_71_1;
-                                    unsigned _v4_71_2;
-                                    unsigned _v4_71_3;
-#endif  // CAKE_WGRAD_OUT
                                     asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
+                                        : "=r"(_v4_64_0), "=r"(_v4_64_1), "=r"(_v4_64_2), "=r"(_v4_64_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 31 * TILE_K + tf_col) + (0))) : "memory");
+                                    _rf[60 + 0] = __uint_as_float(_v4_64_0);
+                                    _rf[60 + 1] = __uint_as_float(_v4_64_1);
+                                    _rf[60 + 2] = __uint_as_float(_v4_64_2);
+                                    _rf[60 + 3] = __uint_as_float(_v4_64_3);
+                                }
+                                asm volatile("st.global.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(tail_sums + (tl_part + epi_half * 128 + 16 * TILE_K + tf_col)), "f"(_rz[(0) + 0]), "f"(_rz[(0) + 1]), "f"(_rz[(0) + 2]), "f"(_rz[(0) + 3]), "l"(0x12F0000000000000ULL) : "memory");
+                                asm volatile("st.global.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(tail_sums + (tl_part + epi_half * 128 + 17 * TILE_K + tf_col)), "f"(_rz[(0) + 0]), "f"(_rz[(0) + 1]), "f"(_rz[(0) + 2]), "f"(_rz[(0) + 3]), "l"(0x12F0000000000000ULL) : "memory");
+                                asm volatile("st.global.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(tail_sums + (tl_part + epi_half * 128 + 18 * TILE_K + tf_col)), "f"(_rz[(0) + 0]), "f"(_rz[(0) + 1]), "f"(_rz[(0) + 2]), "f"(_rz[(0) + 3]), "l"(0x12F0000000000000ULL) : "memory");
+                                asm volatile("st.global.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(tail_sums + (tl_part + epi_half * 128 + 19 * TILE_K + tf_col)), "f"(_rz[(0) + 0]), "f"(_rz[(0) + 1]), "f"(_rz[(0) + 2]), "f"(_rz[(0) + 3]), "l"(0x12F0000000000000ULL) : "memory");
+                                asm volatile("st.global.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(tail_sums + (tl_part + epi_half * 128 + 20 * TILE_K + tf_col)), "f"(_rz[(0) + 0]), "f"(_rz[(0) + 1]), "f"(_rz[(0) + 2]), "f"(_rz[(0) + 3]), "l"(0x12F0000000000000ULL) : "memory");
+                                asm volatile("st.global.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(tail_sums + (tl_part + epi_half * 128 + 21 * TILE_K + tf_col)), "f"(_rz[(0) + 0]), "f"(_rz[(0) + 1]), "f"(_rz[(0) + 2]), "f"(_rz[(0) + 3]), "l"(0x12F0000000000000ULL) : "memory");
+                                asm volatile("st.global.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(tail_sums + (tl_part + epi_half * 128 + 22 * TILE_K + tf_col)), "f"(_rz[(0) + 0]), "f"(_rz[(0) + 1]), "f"(_rz[(0) + 2]), "f"(_rz[(0) + 3]), "l"(0x12F0000000000000ULL) : "memory");
+                                asm volatile("st.global.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(tail_sums + (tl_part + epi_half * 128 + 23 * TILE_K + tf_col)), "f"(_rz[(0) + 0]), "f"(_rz[(0) + 1]), "f"(_rz[(0) + 2]), "f"(_rz[(0) + 3]), "l"(0x12F0000000000000ULL) : "memory");
+                                asm volatile("st.global.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(tail_sums + (tl_part + epi_half * 128 + 24 * TILE_K + tf_col)), "f"(_rz[(0) + 0]), "f"(_rz[(0) + 1]), "f"(_rz[(0) + 2]), "f"(_rz[(0) + 3]), "l"(0x12F0000000000000ULL) : "memory");
+                                asm volatile("st.global.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(tail_sums + (tl_part + epi_half * 128 + 25 * TILE_K + tf_col)), "f"(_rz[(0) + 0]), "f"(_rz[(0) + 1]), "f"(_rz[(0) + 2]), "f"(_rz[(0) + 3]), "l"(0x12F0000000000000ULL) : "memory");
+                                asm volatile("st.global.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(tail_sums + (tl_part + epi_half * 128 + 26 * TILE_K + tf_col)), "f"(_rz[(0) + 0]), "f"(_rz[(0) + 1]), "f"(_rz[(0) + 2]), "f"(_rz[(0) + 3]), "l"(0x12F0000000000000ULL) : "memory");
+                                asm volatile("st.global.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(tail_sums + (tl_part + epi_half * 128 + 27 * TILE_K + tf_col)), "f"(_rz[(0) + 0]), "f"(_rz[(0) + 1]), "f"(_rz[(0) + 2]), "f"(_rz[(0) + 3]), "l"(0x12F0000000000000ULL) : "memory");
+                                asm volatile("st.global.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(tail_sums + (tl_part + epi_half * 128 + 28 * TILE_K + tf_col)), "f"(_rz[(0) + 0]), "f"(_rz[(0) + 1]), "f"(_rz[(0) + 2]), "f"(_rz[(0) + 3]), "l"(0x12F0000000000000ULL) : "memory");
+                                asm volatile("st.global.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(tail_sums + (tl_part + epi_half * 128 + 29 * TILE_K + tf_col)), "f"(_rz[(0) + 0]), "f"(_rz[(0) + 1]), "f"(_rz[(0) + 2]), "f"(_rz[(0) + 3]), "l"(0x12F0000000000000ULL) : "memory");
+                                asm volatile("st.global.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(tail_sums + (tl_part + epi_half * 128 + 30 * TILE_K + tf_col)), "f"(_rz[(0) + 0]), "f"(_rz[(0) + 1]), "f"(_rz[(0) + 2]), "f"(_rz[(0) + 3]), "l"(0x12F0000000000000ULL) : "memory");
+                                asm volatile("st.global.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(tail_sums + (tl_part + epi_half * 128 + 31 * TILE_K + tf_col)), "f"(_rz[(0) + 0]), "f"(_rz[(0) + 1]), "f"(_rz[(0) + 2]), "f"(_rz[(0) + 3]), "l"(0x12F0000000000000ULL) : "memory");
 #if CAKE_WGRAD_OUT == 32
-                                        : "=r"(_v4_64_0), "=r"(_v4_64_1), "=r"(_v4_64_2), "=r"(_v4_64_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 112 + 12) + (0))) : "memory");
-                                    _fin_6[12 + 0] = __uint_as_float(_v4_64_0);
-                                    _fin_6[12 + 1] = __uint_as_float(_v4_64_1);
-                                    _fin_6[12 + 2] = __uint_as_float(_v4_64_2);
-                                    _fin_6[12 + 3] = __uint_as_float(_v4_64_3);
+                                {
+                                    float4 _v4 = make_float4(_rf[0 + 0], _rf[0 + 1], _rf[0 + 2], _rf[0 + 3]);
+                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 16 * ldc + tf_col)) + 0) = _v4;
 #else
-                                        : "=r"(_v4_71_0), "=r"(_v4_71_1), "=r"(_v4_71_2), "=r"(_v4_71_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 112 + 12) + (0))) : "memory");
-                                    _fin_6[12 + 0] = __uint_as_float(_v4_71_0);
-                                    _fin_6[12 + 1] = __uint_as_float(_v4_71_1);
-                                    _fin_6[12 + 2] = __uint_as_float(_v4_71_2);
-                                    _fin_6[12 + 3] = __uint_as_float(_v4_71_3);
+                                unsigned int _rp_1[2];
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf[_lp*2 + 0], _rf[_lp*2+1 + 0]));
+                                    _rp_1[_lp] = *(uint32_t*)&_bf2;
 #endif  // CAKE_WGRAD_OUT
                                 }
-                                {
-                                    float4 _v4 = make_float4(_clr_6[0 + 0], _clr_6[0 + 1], _clr_6[0 + 2], _clr_6[0 + 3]);
-                                    *reinterpret_cast<float4*>((tail_sums + (tl_part + epi_half * 128 + 112)) + 0) = _v4;
-                                }
-                                {
-                                    float4 _v4 = make_float4(_clr_6[0 + 0], _clr_6[0 + 1], _clr_6[0 + 2], _clr_6[0 + 3]);
-                                    *reinterpret_cast<float4*>((tail_sums + (tl_part + epi_half * 128 + 112 + 4)) + 0) = _v4;
-                                }
-                                {
-                                    float4 _v4 = make_float4(_clr_6[0 + 0], _clr_6[0 + 1], _clr_6[0 + 2], _clr_6[0 + 3]);
-                                    *reinterpret_cast<float4*>((tail_sums + (tl_part + epi_half * 128 + 112 + 8)) + 0) = _v4;
-                                }
-                                {
-                                    float4 _v4 = make_float4(_clr_6[0 + 0], _clr_6[0 + 1], _clr_6[0 + 2], _clr_6[0 + 3]);
-                                    *reinterpret_cast<float4*>((tail_sums + (tl_part + epi_half * 128 + 112 + 12)) + 0) = _v4;
-                                }
 #if CAKE_WGRAD_OUT == 32
                                 {
-                                    float4 _v4 = make_float4(_fin_6[0 + 0], _fin_6[0 + 1], _fin_6[0 + 2], _fin_6[0 + 3]);
-                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 112)) + 0) = _v4;
+                                    float4 _v4 = make_float4(_rf[4 + 0], _rf[4 + 1], _rf[4 + 2], _rf[4 + 3]);
+                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 17 * ldc + tf_col)) + 0) = _v4;
 #else
-                                unsigned int _fin_p_6[8];
                                 #pragma unroll
                                 for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_6[_lp*2 + 0], _fin_6[_lp*2+1 + 0]));
-                                    _fin_p_6[_lp] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_6[_lp*2 + 2], _fin_6[_lp*2+1 + 2]));
-                                    _fin_p_6[_lp + 1] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_6[_lp*2 + 4], _fin_6[_lp*2+1 + 4]));
-                                    _fin_p_6[_lp + 2] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_6[_lp*2 + 6], _fin_6[_lp*2+1 + 6]));
-                                    _fin_p_6[_lp + 3] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_6[_lp*2 + 8], _fin_6[_lp*2+1 + 8]));
-                                    _fin_p_6[_lp + 4] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_6[_lp*2 + 10], _fin_6[_lp*2+1 + 10]));
-                                    _fin_p_6[_lp + 5] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_6[_lp*2 + 12], _fin_6[_lp*2+1 + 12]));
-                                    _fin_p_6[_lp + 6] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_6[_lp*2 + 14], _fin_6[_lp*2+1 + 14]));
-                                    _fin_p_6[_lp + 7] = *(uint32_t*)&_bf2;
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf[_lp*2 + 2], _rf[_lp*2+1 + 2]));
+                                    _rp_1[_lp + 1] = *(uint32_t*)&_bf2;
 #endif  // CAKE_WGRAD_OUT
                                 }
-                                {
 #if CAKE_WGRAD_OUT == 32
-                                    float4 _v4 = make_float4(_fin_6[4 + 0], _fin_6[4 + 1], _fin_6[4 + 2], _fin_6[4 + 3]);
-                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 112 + 4)) + 0) = _v4;
-                                }
                                 {
-                                    float4 _v4 = make_float4(_fin_6[8 + 0], _fin_6[8 + 1], _fin_6[8 + 2], _fin_6[8 + 3]);
-                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 112 + 8)) + 0) = _v4;
-                                }
-                                {
-                                    float4 _v4 = make_float4(_fin_6[12 + 0], _fin_6[12 + 1], _fin_6[12 + 2], _fin_6[12 + 3]);
-                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 112 + 12)) + 0) = _v4;
+                                    float4 _v4 = make_float4(_rf[8 + 0], _rf[8 + 1], _rf[8 + 2], _rf[8 + 3]);
+                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 18 * ldc + tf_col)) + 0) = _v4;
 #else
-                                    const unsigned* _raw_stv8_72 = reinterpret_cast<const unsigned*>(_fin_p_6);
-                                    asm volatile(
-                                        "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                                        :: "l"((void*)(C + (tl_out + epi_half * 128 + 112))), "r"(_raw_stv8_72[0]), "r"(_raw_stv8_72[1]), "r"(_raw_stv8_72[2]), "r"(_raw_stv8_72[3]), "r"(_raw_stv8_72[4]), "r"(_raw_stv8_72[5]), "r"(_raw_stv8_72[6]), "r"(_raw_stv8_72[7]) : "memory");
+                                reinterpret_cast<int2*>(C + (tl_out + epi_half * 128 + 16 * ldc + tf_col))[0] = reinterpret_cast<int2*>(_rp_1)[0];
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf[_lp*2 + 4], _rf[_lp*2+1 + 4]));
+                                    _rp_1[_lp] = *(uint32_t*)&_bf2;
 #endif  // CAKE_WGRAD_OUT
                                 }
-                                float _fin_7[16];
-                                float _clr_7[4];
-                                _clr_7[0] = 0.0f;
-                                _clr_7[1] = 0.0f;
-                                _clr_7[2] = 0.0f;
-                                _clr_7[3] = 0.0f;
-                                {
 #if CAKE_WGRAD_OUT == 32
+                                {
+                                    float4 _v4 = make_float4(_rf[12 + 0], _rf[12 + 1], _rf[12 + 2], _rf[12 + 3]);
+                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 19 * ldc + tf_col)) + 0) = _v4;
+#else
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf[_lp*2 + 6], _rf[_lp*2+1 + 6]));
+                                    _rp_1[_lp + 1] = *(uint32_t*)&_bf2;
+#endif  // CAKE_WGRAD_OUT
+                                }
+#if CAKE_WGRAD_OUT == 32
+                                {
+                                    float4 _v4 = make_float4(_rf[16 + 0], _rf[16 + 1], _rf[16 + 2], _rf[16 + 3]);
+                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 20 * ldc + tf_col)) + 0) = _v4;
+#else
+                                reinterpret_cast<int2*>(C + (tl_out + epi_half * 128 + 17 * ldc + tf_col))[0] = reinterpret_cast<int2*>(_rp_1)[0];
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf[_lp*2 + 8], _rf[_lp*2+1 + 8]));
+                                    _rp_1[_lp] = *(uint32_t*)&_bf2;
+#endif  // CAKE_WGRAD_OUT
+                                }
+#if CAKE_WGRAD_OUT == 32
+                                {
+                                    float4 _v4 = make_float4(_rf[20 + 0], _rf[20 + 1], _rf[20 + 2], _rf[20 + 3]);
+                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 21 * ldc + tf_col)) + 0) = _v4;
+#else
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf[_lp*2 + 10], _rf[_lp*2+1 + 10]));
+                                    _rp_1[_lp + 1] = *(uint32_t*)&_bf2;
+#endif  // CAKE_WGRAD_OUT
+                                }
+#if CAKE_WGRAD_OUT == 32
+                                {
+                                    float4 _v4 = make_float4(_rf[24 + 0], _rf[24 + 1], _rf[24 + 2], _rf[24 + 3]);
+                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 22 * ldc + tf_col)) + 0) = _v4;
+#else
+                                reinterpret_cast<int2*>(C + (tl_out + epi_half * 128 + 18 * ldc + tf_col))[0] = reinterpret_cast<int2*>(_rp_1)[0];
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf[_lp*2 + 12], _rf[_lp*2+1 + 12]));
+                                    _rp_1[_lp] = *(uint32_t*)&_bf2;
+#endif  // CAKE_WGRAD_OUT
+                                }
+#if CAKE_WGRAD_OUT == 32
+                                {
+                                    float4 _v4 = make_float4(_rf[28 + 0], _rf[28 + 1], _rf[28 + 2], _rf[28 + 3]);
+                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 23 * ldc + tf_col)) + 0) = _v4;
+#else
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf[_lp*2 + 14], _rf[_lp*2+1 + 14]));
+                                    _rp_1[_lp + 1] = *(uint32_t*)&_bf2;
+#endif  // CAKE_WGRAD_OUT
+                                }
+#if CAKE_WGRAD_OUT == 32
+                                {
+                                    float4 _v4 = make_float4(_rf[32 + 0], _rf[32 + 1], _rf[32 + 2], _rf[32 + 3]);
+                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 24 * ldc + tf_col)) + 0) = _v4;
+#else
+                                reinterpret_cast<int2*>(C + (tl_out + epi_half * 128 + 19 * ldc + tf_col))[0] = reinterpret_cast<int2*>(_rp_1)[0];
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf[_lp*2 + 16], _rf[_lp*2+1 + 16]));
+                                    _rp_1[_lp] = *(uint32_t*)&_bf2;
+#endif  // CAKE_WGRAD_OUT
+                                }
+#if CAKE_WGRAD_OUT == 32
+                                {
+                                    float4 _v4 = make_float4(_rf[36 + 0], _rf[36 + 1], _rf[36 + 2], _rf[36 + 3]);
+                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 25 * ldc + tf_col)) + 0) = _v4;
+#else
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf[_lp*2 + 18], _rf[_lp*2+1 + 18]));
+                                    _rp_1[_lp + 1] = *(uint32_t*)&_bf2;
+#endif  // CAKE_WGRAD_OUT
+                                }
+#if CAKE_WGRAD_OUT == 32
+                                {
+                                    float4 _v4 = make_float4(_rf[40 + 0], _rf[40 + 1], _rf[40 + 2], _rf[40 + 3]);
+                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 26 * ldc + tf_col)) + 0) = _v4;
+#else
+                                reinterpret_cast<int2*>(C + (tl_out + epi_half * 128 + 20 * ldc + tf_col))[0] = reinterpret_cast<int2*>(_rp_1)[0];
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf[_lp*2 + 20], _rf[_lp*2+1 + 20]));
+                                    _rp_1[_lp] = *(uint32_t*)&_bf2;
+#endif  // CAKE_WGRAD_OUT
+                                }
+#if CAKE_WGRAD_OUT == 32
+                                {
+                                    float4 _v4 = make_float4(_rf[44 + 0], _rf[44 + 1], _rf[44 + 2], _rf[44 + 3]);
+                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 27 * ldc + tf_col)) + 0) = _v4;
+#else
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf[_lp*2 + 22], _rf[_lp*2+1 + 22]));
+                                    _rp_1[_lp + 1] = *(uint32_t*)&_bf2;
+#endif  // CAKE_WGRAD_OUT
+                                }
+#if CAKE_WGRAD_OUT == 32
+                                {
+                                    float4 _v4 = make_float4(_rf[48 + 0], _rf[48 + 1], _rf[48 + 2], _rf[48 + 3]);
+                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 28 * ldc + tf_col)) + 0) = _v4;
+#else
+                                reinterpret_cast<int2*>(C + (tl_out + epi_half * 128 + 21 * ldc + tf_col))[0] = reinterpret_cast<int2*>(_rp_1)[0];
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf[_lp*2 + 24], _rf[_lp*2+1 + 24]));
+                                    _rp_1[_lp] = *(uint32_t*)&_bf2;
+#endif  // CAKE_WGRAD_OUT
+                                }
+#if CAKE_WGRAD_OUT == 32
+                                {
+                                    float4 _v4 = make_float4(_rf[52 + 0], _rf[52 + 1], _rf[52 + 2], _rf[52 + 3]);
+                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 29 * ldc + tf_col)) + 0) = _v4;
+#else
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf[_lp*2 + 26], _rf[_lp*2+1 + 26]));
+                                    _rp_1[_lp + 1] = *(uint32_t*)&_bf2;
+#endif  // CAKE_WGRAD_OUT
+                                }
+#if CAKE_WGRAD_OUT == 32
+                                {
+                                    float4 _v4 = make_float4(_rf[56 + 0], _rf[56 + 1], _rf[56 + 2], _rf[56 + 3]);
+                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 30 * ldc + tf_col)) + 0) = _v4;
+#else
+                                reinterpret_cast<int2*>(C + (tl_out + epi_half * 128 + 22 * ldc + tf_col))[0] = reinterpret_cast<int2*>(_rp_1)[0];
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf[_lp*2 + 28], _rf[_lp*2+1 + 28]));
+                                    _rp_1[_lp] = *(uint32_t*)&_bf2;
+#endif  // CAKE_WGRAD_OUT
+                                }
+#if CAKE_WGRAD_OUT == 32
+                                {
+                                    float4 _v4 = make_float4(_rf[60 + 0], _rf[60 + 1], _rf[60 + 2], _rf[60 + 3]);
+                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 31 * ldc + tf_col)) + 0) = _v4;
+#else
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf[_lp*2 + 30], _rf[_lp*2+1 + 30]));
+                                    _rp_1[_lp + 1] = *(uint32_t*)&_bf2;
+#endif  // CAKE_WGRAD_OUT
+                                }
+#if CAKE_WGRAD_OUT == 16
+                                reinterpret_cast<int2*>(C + (tl_out + epi_half * 128 + 23 * ldc + tf_col))[0] = reinterpret_cast<int2*>(_rp_1)[0];
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf[_lp*2 + 32], _rf[_lp*2+1 + 32]));
+                                    _rp_1[_lp] = *(uint32_t*)&_bf2;
+                                }
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf[_lp*2 + 34], _rf[_lp*2+1 + 34]));
+                                    _rp_1[_lp + 1] = *(uint32_t*)&_bf2;
+                                }
+                                reinterpret_cast<int2*>(C + (tl_out + epi_half * 128 + 24 * ldc + tf_col))[0] = reinterpret_cast<int2*>(_rp_1)[0];
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf[_lp*2 + 36], _rf[_lp*2+1 + 36]));
+                                    _rp_1[_lp] = *(uint32_t*)&_bf2;
+                                }
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf[_lp*2 + 38], _rf[_lp*2+1 + 38]));
+                                    _rp_1[_lp + 1] = *(uint32_t*)&_bf2;
+                                }
+                                reinterpret_cast<int2*>(C + (tl_out + epi_half * 128 + 25 * ldc + tf_col))[0] = reinterpret_cast<int2*>(_rp_1)[0];
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf[_lp*2 + 40], _rf[_lp*2+1 + 40]));
+                                    _rp_1[_lp] = *(uint32_t*)&_bf2;
+                                }
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf[_lp*2 + 42], _rf[_lp*2+1 + 42]));
+                                    _rp_1[_lp + 1] = *(uint32_t*)&_bf2;
+                                }
+                                reinterpret_cast<int2*>(C + (tl_out + epi_half * 128 + 26 * ldc + tf_col))[0] = reinterpret_cast<int2*>(_rp_1)[0];
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf[_lp*2 + 44], _rf[_lp*2+1 + 44]));
+                                    _rp_1[_lp] = *(uint32_t*)&_bf2;
+                                }
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf[_lp*2 + 46], _rf[_lp*2+1 + 46]));
+                                    _rp_1[_lp + 1] = *(uint32_t*)&_bf2;
+                                }
+                                reinterpret_cast<int2*>(C + (tl_out + epi_half * 128 + 27 * ldc + tf_col))[0] = reinterpret_cast<int2*>(_rp_1)[0];
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf[_lp*2 + 48], _rf[_lp*2+1 + 48]));
+                                    _rp_1[_lp] = *(uint32_t*)&_bf2;
+                                }
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf[_lp*2 + 50], _rf[_lp*2+1 + 50]));
+                                    _rp_1[_lp + 1] = *(uint32_t*)&_bf2;
+                                }
+                                reinterpret_cast<int2*>(C + (tl_out + epi_half * 128 + 28 * ldc + tf_col))[0] = reinterpret_cast<int2*>(_rp_1)[0];
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf[_lp*2 + 52], _rf[_lp*2+1 + 52]));
+                                    _rp_1[_lp] = *(uint32_t*)&_bf2;
+                                }
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf[_lp*2 + 54], _rf[_lp*2+1 + 54]));
+                                    _rp_1[_lp + 1] = *(uint32_t*)&_bf2;
+                                }
+                                reinterpret_cast<int2*>(C + (tl_out + epi_half * 128 + 29 * ldc + tf_col))[0] = reinterpret_cast<int2*>(_rp_1)[0];
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf[_lp*2 + 56], _rf[_lp*2+1 + 56]));
+                                    _rp_1[_lp] = *(uint32_t*)&_bf2;
+                                }
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf[_lp*2 + 58], _rf[_lp*2+1 + 58]));
+                                    _rp_1[_lp + 1] = *(uint32_t*)&_bf2;
+                                }
+                                reinterpret_cast<int2*>(C + (tl_out + epi_half * 128 + 30 * ldc + tf_col))[0] = reinterpret_cast<int2*>(_rp_1)[0];
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf[_lp*2 + 60], _rf[_lp*2+1 + 60]));
+                                    _rp_1[_lp] = *(uint32_t*)&_bf2;
+                                }
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf[_lp*2 + 62], _rf[_lp*2+1 + 62]));
+                                    _rp_1[_lp + 1] = *(uint32_t*)&_bf2;
+                                }
+                                reinterpret_cast<int2*>(C + (tl_out + epi_half * 128 + 31 * ldc + tf_col))[0] = reinterpret_cast<int2*>(_rp_1)[0];
+#endif  // CAKE_WGRAD_OUT == 16
+                                int tf_col_0 = 4 * lane;
+                                float _rf_0[64];
+                                float _rz_0[4];
+                                _rz_0[0] = 0.0f;
+                                _rz_0[1] = 0.0f;
+                                _rz_0[2] = 0.0f;
+                                _rz_0[3] = 0.0f;
+                                {
                                     unsigned _v4_65_0;
                                     unsigned _v4_65_1;
                                     unsigned _v4_65_2;
                                     unsigned _v4_65_3;
-#else
-                                    unsigned _v4_73_0;
-                                    unsigned _v4_73_1;
-                                    unsigned _v4_73_2;
-                                    unsigned _v4_73_3;
-#endif  // CAKE_WGRAD_OUT
                                     asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-#if CAKE_WGRAD_OUT == 32
-                                        : "=r"(_v4_65_0), "=r"(_v4_65_1), "=r"(_v4_65_2), "=r"(_v4_65_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256) + (0))) : "memory");
-                                    _fin_7[0 + 0] = __uint_as_float(_v4_65_0);
-                                    _fin_7[0 + 1] = __uint_as_float(_v4_65_1);
-                                    _fin_7[0 + 2] = __uint_as_float(_v4_65_2);
-                                    _fin_7[0 + 3] = __uint_as_float(_v4_65_3);
-#else
-                                        : "=r"(_v4_73_0), "=r"(_v4_73_1), "=r"(_v4_73_2), "=r"(_v4_73_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256) + (0))) : "memory");
-                                    _fin_7[0 + 0] = __uint_as_float(_v4_73_0);
-                                    _fin_7[0 + 1] = __uint_as_float(_v4_73_1);
-                                    _fin_7[0 + 2] = __uint_as_float(_v4_73_2);
-                                    _fin_7[0 + 3] = __uint_as_float(_v4_73_3);
-#endif  // CAKE_WGRAD_OUT
+                                        : "=r"(_v4_65_0), "=r"(_v4_65_1), "=r"(_v4_65_2), "=r"(_v4_65_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + tf_col_0) + (0))) : "memory");
+                                    _rf_0[0 + 0] = __uint_as_float(_v4_65_0);
+                                    _rf_0[0 + 1] = __uint_as_float(_v4_65_1);
+                                    _rf_0[0 + 2] = __uint_as_float(_v4_65_2);
+                                    _rf_0[0 + 3] = __uint_as_float(_v4_65_3);
                                 }
                                 {
-#if CAKE_WGRAD_OUT == 32
                                     unsigned _v4_66_0;
                                     unsigned _v4_66_1;
                                     unsigned _v4_66_2;
                                     unsigned _v4_66_3;
-#else
-                                    unsigned _v4_74_0;
-                                    unsigned _v4_74_1;
-                                    unsigned _v4_74_2;
-                                    unsigned _v4_74_3;
-#endif  // CAKE_WGRAD_OUT
                                     asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-#if CAKE_WGRAD_OUT == 32
-                                        : "=r"(_v4_66_0), "=r"(_v4_66_1), "=r"(_v4_66_2), "=r"(_v4_66_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 4) + (0))) : "memory");
-                                    _fin_7[4 + 0] = __uint_as_float(_v4_66_0);
-                                    _fin_7[4 + 1] = __uint_as_float(_v4_66_1);
-                                    _fin_7[4 + 2] = __uint_as_float(_v4_66_2);
-                                    _fin_7[4 + 3] = __uint_as_float(_v4_66_3);
-#else
-                                        : "=r"(_v4_74_0), "=r"(_v4_74_1), "=r"(_v4_74_2), "=r"(_v4_74_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 4) + (0))) : "memory");
-                                    _fin_7[4 + 0] = __uint_as_float(_v4_74_0);
-                                    _fin_7[4 + 1] = __uint_as_float(_v4_74_1);
-                                    _fin_7[4 + 2] = __uint_as_float(_v4_74_2);
-                                    _fin_7[4 + 3] = __uint_as_float(_v4_74_3);
-#endif  // CAKE_WGRAD_OUT
+                                        : "=r"(_v4_66_0), "=r"(_v4_66_1), "=r"(_v4_66_2), "=r"(_v4_66_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + TILE_K + tf_col_0) + (0))) : "memory");
+                                    _rf_0[4 + 0] = __uint_as_float(_v4_66_0);
+                                    _rf_0[4 + 1] = __uint_as_float(_v4_66_1);
+                                    _rf_0[4 + 2] = __uint_as_float(_v4_66_2);
+                                    _rf_0[4 + 3] = __uint_as_float(_v4_66_3);
                                 }
                                 {
-#if CAKE_WGRAD_OUT == 32
                                     unsigned _v4_67_0;
                                     unsigned _v4_67_1;
                                     unsigned _v4_67_2;
                                     unsigned _v4_67_3;
-#else
-                                    unsigned _v4_75_0;
-                                    unsigned _v4_75_1;
-                                    unsigned _v4_75_2;
-                                    unsigned _v4_75_3;
-#endif  // CAKE_WGRAD_OUT
                                     asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-#if CAKE_WGRAD_OUT == 32
-                                        : "=r"(_v4_67_0), "=r"(_v4_67_1), "=r"(_v4_67_2), "=r"(_v4_67_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 8) + (0))) : "memory");
-                                    _fin_7[8 + 0] = __uint_as_float(_v4_67_0);
-                                    _fin_7[8 + 1] = __uint_as_float(_v4_67_1);
-                                    _fin_7[8 + 2] = __uint_as_float(_v4_67_2);
-                                    _fin_7[8 + 3] = __uint_as_float(_v4_67_3);
-#else
-                                        : "=r"(_v4_75_0), "=r"(_v4_75_1), "=r"(_v4_75_2), "=r"(_v4_75_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 8) + (0))) : "memory");
-                                    _fin_7[8 + 0] = __uint_as_float(_v4_75_0);
-                                    _fin_7[8 + 1] = __uint_as_float(_v4_75_1);
-                                    _fin_7[8 + 2] = __uint_as_float(_v4_75_2);
-                                    _fin_7[8 + 3] = __uint_as_float(_v4_75_3);
-#endif  // CAKE_WGRAD_OUT
+                                        : "=r"(_v4_67_0), "=r"(_v4_67_1), "=r"(_v4_67_2), "=r"(_v4_67_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 2 * TILE_K + tf_col_0) + (0))) : "memory");
+                                    _rf_0[8 + 0] = __uint_as_float(_v4_67_0);
+                                    _rf_0[8 + 1] = __uint_as_float(_v4_67_1);
+                                    _rf_0[8 + 2] = __uint_as_float(_v4_67_2);
+                                    _rf_0[8 + 3] = __uint_as_float(_v4_67_3);
                                 }
                                 {
-#if CAKE_WGRAD_OUT == 32
                                     unsigned _v4_68_0;
                                     unsigned _v4_68_1;
                                     unsigned _v4_68_2;
                                     unsigned _v4_68_3;
-#else
-                                    unsigned _v4_76_0;
-                                    unsigned _v4_76_1;
-                                    unsigned _v4_76_2;
-                                    unsigned _v4_76_3;
-#endif  // CAKE_WGRAD_OUT
                                     asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-#if CAKE_WGRAD_OUT == 32
-                                        : "=r"(_v4_68_0), "=r"(_v4_68_1), "=r"(_v4_68_2), "=r"(_v4_68_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 12) + (0))) : "memory");
-                                    _fin_7[12 + 0] = __uint_as_float(_v4_68_0);
-                                    _fin_7[12 + 1] = __uint_as_float(_v4_68_1);
-                                    _fin_7[12 + 2] = __uint_as_float(_v4_68_2);
-                                    _fin_7[12 + 3] = __uint_as_float(_v4_68_3);
-#else
-                                        : "=r"(_v4_76_0), "=r"(_v4_76_1), "=r"(_v4_76_2), "=r"(_v4_76_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 12) + (0))) : "memory");
-                                    _fin_7[12 + 0] = __uint_as_float(_v4_76_0);
-                                    _fin_7[12 + 1] = __uint_as_float(_v4_76_1);
-                                    _fin_7[12 + 2] = __uint_as_float(_v4_76_2);
-                                    _fin_7[12 + 3] = __uint_as_float(_v4_76_3);
-#endif  // CAKE_WGRAD_OUT
+                                        : "=r"(_v4_68_0), "=r"(_v4_68_1), "=r"(_v4_68_2), "=r"(_v4_68_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 3 * TILE_K + tf_col_0) + (0))) : "memory");
+                                    _rf_0[12 + 0] = __uint_as_float(_v4_68_0);
+                                    _rf_0[12 + 1] = __uint_as_float(_v4_68_1);
+                                    _rf_0[12 + 2] = __uint_as_float(_v4_68_2);
+                                    _rf_0[12 + 3] = __uint_as_float(_v4_68_3);
                                 }
                                 {
-                                    float4 _v4 = make_float4(_clr_7[0 + 0], _clr_7[0 + 1], _clr_7[0 + 2], _clr_7[0 + 3]);
-                                    *reinterpret_cast<float4*>((tail_sums + (tl_part + epi_half * 128 + 256)) + 0) = _v4;
-                                }
-                                {
-                                    float4 _v4 = make_float4(_clr_7[0 + 0], _clr_7[0 + 1], _clr_7[0 + 2], _clr_7[0 + 3]);
-                                    *reinterpret_cast<float4*>((tail_sums + (tl_part + epi_half * 128 + 256 + 4)) + 0) = _v4;
-                                }
-                                {
-                                    float4 _v4 = make_float4(_clr_7[0 + 0], _clr_7[0 + 1], _clr_7[0 + 2], _clr_7[0 + 3]);
-                                    *reinterpret_cast<float4*>((tail_sums + (tl_part + epi_half * 128 + 256 + 8)) + 0) = _v4;
-                                }
-                                {
-                                    float4 _v4 = make_float4(_clr_7[0 + 0], _clr_7[0 + 1], _clr_7[0 + 2], _clr_7[0 + 3]);
-                                    *reinterpret_cast<float4*>((tail_sums + (tl_part + epi_half * 128 + 256 + 12)) + 0) = _v4;
-                                }
-#if CAKE_WGRAD_OUT == 32
-                                {
-                                    float4 _v4 = make_float4(_fin_7[0 + 0], _fin_7[0 + 1], _fin_7[0 + 2], _fin_7[0 + 3]);
-                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 256)) + 0) = _v4;
-#else
-                                unsigned int _fin_p_7[8];
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_7[_lp*2 + 0], _fin_7[_lp*2+1 + 0]));
-                                    _fin_p_7[_lp] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_7[_lp*2 + 2], _fin_7[_lp*2+1 + 2]));
-                                    _fin_p_7[_lp + 1] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_7[_lp*2 + 4], _fin_7[_lp*2+1 + 4]));
-                                    _fin_p_7[_lp + 2] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_7[_lp*2 + 6], _fin_7[_lp*2+1 + 6]));
-                                    _fin_p_7[_lp + 3] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_7[_lp*2 + 8], _fin_7[_lp*2+1 + 8]));
-                                    _fin_p_7[_lp + 4] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_7[_lp*2 + 10], _fin_7[_lp*2+1 + 10]));
-                                    _fin_p_7[_lp + 5] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_7[_lp*2 + 12], _fin_7[_lp*2+1 + 12]));
-                                    _fin_p_7[_lp + 6] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_7[_lp*2 + 14], _fin_7[_lp*2+1 + 14]));
-                                    _fin_p_7[_lp + 7] = *(uint32_t*)&_bf2;
-#endif  // CAKE_WGRAD_OUT
-                                }
-                                {
-#if CAKE_WGRAD_OUT == 32
-                                    float4 _v4 = make_float4(_fin_7[4 + 0], _fin_7[4 + 1], _fin_7[4 + 2], _fin_7[4 + 3]);
-                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 256 + 4)) + 0) = _v4;
-                                }
-                                {
-                                    float4 _v4 = make_float4(_fin_7[8 + 0], _fin_7[8 + 1], _fin_7[8 + 2], _fin_7[8 + 3]);
-                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 256 + 8)) + 0) = _v4;
-                                }
-                                {
-                                    float4 _v4 = make_float4(_fin_7[12 + 0], _fin_7[12 + 1], _fin_7[12 + 2], _fin_7[12 + 3]);
-                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 256 + 12)) + 0) = _v4;
-#else
-                                    const unsigned* _raw_stv8_77 = reinterpret_cast<const unsigned*>(_fin_p_7);
-                                    asm volatile(
-                                        "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                                        :: "l"((void*)(C + (tl_out + epi_half * 128 + 256))), "r"(_raw_stv8_77[0]), "r"(_raw_stv8_77[1]), "r"(_raw_stv8_77[2]), "r"(_raw_stv8_77[3]), "r"(_raw_stv8_77[4]), "r"(_raw_stv8_77[5]), "r"(_raw_stv8_77[6]), "r"(_raw_stv8_77[7]) : "memory");
-#endif  // CAKE_WGRAD_OUT
-                                }
-                                float _fin_8[16];
-                                float _clr_8[4];
-                                _clr_8[0] = 0.0f;
-                                _clr_8[1] = 0.0f;
-                                _clr_8[2] = 0.0f;
-                                _clr_8[3] = 0.0f;
-                                {
-#if CAKE_WGRAD_OUT == 32
                                     unsigned _v4_69_0;
                                     unsigned _v4_69_1;
                                     unsigned _v4_69_2;
                                     unsigned _v4_69_3;
-#else
-                                    unsigned _v4_78_0;
-                                    unsigned _v4_78_1;
-                                    unsigned _v4_78_2;
-                                    unsigned _v4_78_3;
-#endif  // CAKE_WGRAD_OUT
                                     asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-#if CAKE_WGRAD_OUT == 32
-                                        : "=r"(_v4_69_0), "=r"(_v4_69_1), "=r"(_v4_69_2), "=r"(_v4_69_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 16) + (0))) : "memory");
-                                    _fin_8[0 + 0] = __uint_as_float(_v4_69_0);
-                                    _fin_8[0 + 1] = __uint_as_float(_v4_69_1);
-                                    _fin_8[0 + 2] = __uint_as_float(_v4_69_2);
-                                    _fin_8[0 + 3] = __uint_as_float(_v4_69_3);
-#else
-                                        : "=r"(_v4_78_0), "=r"(_v4_78_1), "=r"(_v4_78_2), "=r"(_v4_78_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 16) + (0))) : "memory");
-                                    _fin_8[0 + 0] = __uint_as_float(_v4_78_0);
-                                    _fin_8[0 + 1] = __uint_as_float(_v4_78_1);
-                                    _fin_8[0 + 2] = __uint_as_float(_v4_78_2);
-                                    _fin_8[0 + 3] = __uint_as_float(_v4_78_3);
-#endif  // CAKE_WGRAD_OUT
+                                        : "=r"(_v4_69_0), "=r"(_v4_69_1), "=r"(_v4_69_2), "=r"(_v4_69_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 4 * TILE_K + tf_col_0) + (0))) : "memory");
+                                    _rf_0[16 + 0] = __uint_as_float(_v4_69_0);
+                                    _rf_0[16 + 1] = __uint_as_float(_v4_69_1);
+                                    _rf_0[16 + 2] = __uint_as_float(_v4_69_2);
+                                    _rf_0[16 + 3] = __uint_as_float(_v4_69_3);
                                 }
                                 {
-#if CAKE_WGRAD_OUT == 32
                                     unsigned _v4_70_0;
                                     unsigned _v4_70_1;
                                     unsigned _v4_70_2;
                                     unsigned _v4_70_3;
-#else
-                                    unsigned _v4_79_0;
-                                    unsigned _v4_79_1;
-                                    unsigned _v4_79_2;
-                                    unsigned _v4_79_3;
-#endif  // CAKE_WGRAD_OUT
                                     asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-#if CAKE_WGRAD_OUT == 32
-                                        : "=r"(_v4_70_0), "=r"(_v4_70_1), "=r"(_v4_70_2), "=r"(_v4_70_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 16 + 4) + (0))) : "memory");
-                                    _fin_8[4 + 0] = __uint_as_float(_v4_70_0);
-                                    _fin_8[4 + 1] = __uint_as_float(_v4_70_1);
-                                    _fin_8[4 + 2] = __uint_as_float(_v4_70_2);
-                                    _fin_8[4 + 3] = __uint_as_float(_v4_70_3);
-#else
-                                        : "=r"(_v4_79_0), "=r"(_v4_79_1), "=r"(_v4_79_2), "=r"(_v4_79_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 16 + 4) + (0))) : "memory");
-                                    _fin_8[4 + 0] = __uint_as_float(_v4_79_0);
-                                    _fin_8[4 + 1] = __uint_as_float(_v4_79_1);
-                                    _fin_8[4 + 2] = __uint_as_float(_v4_79_2);
-                                    _fin_8[4 + 3] = __uint_as_float(_v4_79_3);
-#endif  // CAKE_WGRAD_OUT
+                                        : "=r"(_v4_70_0), "=r"(_v4_70_1), "=r"(_v4_70_2), "=r"(_v4_70_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 5 * TILE_K + tf_col_0) + (0))) : "memory");
+                                    _rf_0[20 + 0] = __uint_as_float(_v4_70_0);
+                                    _rf_0[20 + 1] = __uint_as_float(_v4_70_1);
+                                    _rf_0[20 + 2] = __uint_as_float(_v4_70_2);
+                                    _rf_0[20 + 3] = __uint_as_float(_v4_70_3);
                                 }
                                 {
-#if CAKE_WGRAD_OUT == 32
                                     unsigned _v4_71_0;
                                     unsigned _v4_71_1;
                                     unsigned _v4_71_2;
                                     unsigned _v4_71_3;
-#else
-                                    unsigned _v4_80_0;
-                                    unsigned _v4_80_1;
-                                    unsigned _v4_80_2;
-                                    unsigned _v4_80_3;
-#endif  // CAKE_WGRAD_OUT
                                     asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-#if CAKE_WGRAD_OUT == 32
-                                        : "=r"(_v4_71_0), "=r"(_v4_71_1), "=r"(_v4_71_2), "=r"(_v4_71_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 16 + 8) + (0))) : "memory");
-                                    _fin_8[8 + 0] = __uint_as_float(_v4_71_0);
-                                    _fin_8[8 + 1] = __uint_as_float(_v4_71_1);
-                                    _fin_8[8 + 2] = __uint_as_float(_v4_71_2);
-                                    _fin_8[8 + 3] = __uint_as_float(_v4_71_3);
-#else
-                                        : "=r"(_v4_80_0), "=r"(_v4_80_1), "=r"(_v4_80_2), "=r"(_v4_80_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 16 + 8) + (0))) : "memory");
-                                    _fin_8[8 + 0] = __uint_as_float(_v4_80_0);
-                                    _fin_8[8 + 1] = __uint_as_float(_v4_80_1);
-                                    _fin_8[8 + 2] = __uint_as_float(_v4_80_2);
-                                    _fin_8[8 + 3] = __uint_as_float(_v4_80_3);
-#endif  // CAKE_WGRAD_OUT
+                                        : "=r"(_v4_71_0), "=r"(_v4_71_1), "=r"(_v4_71_2), "=r"(_v4_71_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 6 * TILE_K + tf_col_0) + (0))) : "memory");
+                                    _rf_0[24 + 0] = __uint_as_float(_v4_71_0);
+                                    _rf_0[24 + 1] = __uint_as_float(_v4_71_1);
+                                    _rf_0[24 + 2] = __uint_as_float(_v4_71_2);
+                                    _rf_0[24 + 3] = __uint_as_float(_v4_71_3);
                                 }
                                 {
-#if CAKE_WGRAD_OUT == 32
                                     unsigned _v4_72_0;
                                     unsigned _v4_72_1;
                                     unsigned _v4_72_2;
                                     unsigned _v4_72_3;
-#else
-                                    unsigned _v4_81_0;
-                                    unsigned _v4_81_1;
-                                    unsigned _v4_81_2;
-                                    unsigned _v4_81_3;
-#endif  // CAKE_WGRAD_OUT
                                     asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-#if CAKE_WGRAD_OUT == 32
-                                        : "=r"(_v4_72_0), "=r"(_v4_72_1), "=r"(_v4_72_2), "=r"(_v4_72_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 16 + 12) + (0))) : "memory");
-                                    _fin_8[12 + 0] = __uint_as_float(_v4_72_0);
-                                    _fin_8[12 + 1] = __uint_as_float(_v4_72_1);
-                                    _fin_8[12 + 2] = __uint_as_float(_v4_72_2);
-                                    _fin_8[12 + 3] = __uint_as_float(_v4_72_3);
-#else
-                                        : "=r"(_v4_81_0), "=r"(_v4_81_1), "=r"(_v4_81_2), "=r"(_v4_81_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 16 + 12) + (0))) : "memory");
-                                    _fin_8[12 + 0] = __uint_as_float(_v4_81_0);
-                                    _fin_8[12 + 1] = __uint_as_float(_v4_81_1);
-                                    _fin_8[12 + 2] = __uint_as_float(_v4_81_2);
-                                    _fin_8[12 + 3] = __uint_as_float(_v4_81_3);
-#endif  // CAKE_WGRAD_OUT
+                                        : "=r"(_v4_72_0), "=r"(_v4_72_1), "=r"(_v4_72_2), "=r"(_v4_72_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 7 * TILE_K + tf_col_0) + (0))) : "memory");
+                                    _rf_0[28 + 0] = __uint_as_float(_v4_72_0);
+                                    _rf_0[28 + 1] = __uint_as_float(_v4_72_1);
+                                    _rf_0[28 + 2] = __uint_as_float(_v4_72_2);
+                                    _rf_0[28 + 3] = __uint_as_float(_v4_72_3);
                                 }
                                 {
-                                    float4 _v4 = make_float4(_clr_8[0 + 0], _clr_8[0 + 1], _clr_8[0 + 2], _clr_8[0 + 3]);
-                                    *reinterpret_cast<float4*>((tail_sums + (tl_part + epi_half * 128 + 256 + 16)) + 0) = _v4;
-                                }
-                                {
-                                    float4 _v4 = make_float4(_clr_8[0 + 0], _clr_8[0 + 1], _clr_8[0 + 2], _clr_8[0 + 3]);
-                                    *reinterpret_cast<float4*>((tail_sums + (tl_part + epi_half * 128 + 256 + 16 + 4)) + 0) = _v4;
-                                }
-                                {
-                                    float4 _v4 = make_float4(_clr_8[0 + 0], _clr_8[0 + 1], _clr_8[0 + 2], _clr_8[0 + 3]);
-                                    *reinterpret_cast<float4*>((tail_sums + (tl_part + epi_half * 128 + 256 + 16 + 8)) + 0) = _v4;
-                                }
-                                {
-                                    float4 _v4 = make_float4(_clr_8[0 + 0], _clr_8[0 + 1], _clr_8[0 + 2], _clr_8[0 + 3]);
-                                    *reinterpret_cast<float4*>((tail_sums + (tl_part + epi_half * 128 + 256 + 16 + 12)) + 0) = _v4;
-                                }
-#if CAKE_WGRAD_OUT == 32
-                                {
-                                    float4 _v4 = make_float4(_fin_8[0 + 0], _fin_8[0 + 1], _fin_8[0 + 2], _fin_8[0 + 3]);
-                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 256 + 16)) + 0) = _v4;
-#else
-                                unsigned int _fin_p_8[8];
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_8[_lp*2 + 0], _fin_8[_lp*2+1 + 0]));
-                                    _fin_p_8[_lp] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_8[_lp*2 + 2], _fin_8[_lp*2+1 + 2]));
-                                    _fin_p_8[_lp + 1] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_8[_lp*2 + 4], _fin_8[_lp*2+1 + 4]));
-                                    _fin_p_8[_lp + 2] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_8[_lp*2 + 6], _fin_8[_lp*2+1 + 6]));
-                                    _fin_p_8[_lp + 3] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_8[_lp*2 + 8], _fin_8[_lp*2+1 + 8]));
-                                    _fin_p_8[_lp + 4] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_8[_lp*2 + 10], _fin_8[_lp*2+1 + 10]));
-                                    _fin_p_8[_lp + 5] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_8[_lp*2 + 12], _fin_8[_lp*2+1 + 12]));
-                                    _fin_p_8[_lp + 6] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_8[_lp*2 + 14], _fin_8[_lp*2+1 + 14]));
-                                    _fin_p_8[_lp + 7] = *(uint32_t*)&_bf2;
-#endif  // CAKE_WGRAD_OUT
-                                }
-                                {
-#if CAKE_WGRAD_OUT == 32
-                                    float4 _v4 = make_float4(_fin_8[4 + 0], _fin_8[4 + 1], _fin_8[4 + 2], _fin_8[4 + 3]);
-                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 256 + 16 + 4)) + 0) = _v4;
-                                }
-                                {
-                                    float4 _v4 = make_float4(_fin_8[8 + 0], _fin_8[8 + 1], _fin_8[8 + 2], _fin_8[8 + 3]);
-                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 256 + 16 + 8)) + 0) = _v4;
-                                }
-                                {
-                                    float4 _v4 = make_float4(_fin_8[12 + 0], _fin_8[12 + 1], _fin_8[12 + 2], _fin_8[12 + 3]);
-                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 256 + 16 + 12)) + 0) = _v4;
-#else
-                                    const unsigned* _raw_stv8_82 = reinterpret_cast<const unsigned*>(_fin_p_8);
-                                    asm volatile(
-                                        "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                                        :: "l"((void*)(C + (tl_out + epi_half * 128 + 256 + 16))), "r"(_raw_stv8_82[0]), "r"(_raw_stv8_82[1]), "r"(_raw_stv8_82[2]), "r"(_raw_stv8_82[3]), "r"(_raw_stv8_82[4]), "r"(_raw_stv8_82[5]), "r"(_raw_stv8_82[6]), "r"(_raw_stv8_82[7]) : "memory");
-#endif  // CAKE_WGRAD_OUT
-                                }
-                                float _fin_9[16];
-                                float _clr_9[4];
-                                _clr_9[0] = 0.0f;
-                                _clr_9[1] = 0.0f;
-                                _clr_9[2] = 0.0f;
-                                _clr_9[3] = 0.0f;
-                                {
-#if CAKE_WGRAD_OUT == 32
                                     unsigned _v4_73_0;
                                     unsigned _v4_73_1;
                                     unsigned _v4_73_2;
                                     unsigned _v4_73_3;
-#else
-                                    unsigned _v4_83_0;
-                                    unsigned _v4_83_1;
-                                    unsigned _v4_83_2;
-                                    unsigned _v4_83_3;
-#endif  // CAKE_WGRAD_OUT
                                     asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-#if CAKE_WGRAD_OUT == 32
-                                        : "=r"(_v4_73_0), "=r"(_v4_73_1), "=r"(_v4_73_2), "=r"(_v4_73_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 32) + (0))) : "memory");
-                                    _fin_9[0 + 0] = __uint_as_float(_v4_73_0);
-                                    _fin_9[0 + 1] = __uint_as_float(_v4_73_1);
-                                    _fin_9[0 + 2] = __uint_as_float(_v4_73_2);
-                                    _fin_9[0 + 3] = __uint_as_float(_v4_73_3);
-#else
-                                        : "=r"(_v4_83_0), "=r"(_v4_83_1), "=r"(_v4_83_2), "=r"(_v4_83_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 32) + (0))) : "memory");
-                                    _fin_9[0 + 0] = __uint_as_float(_v4_83_0);
-                                    _fin_9[0 + 1] = __uint_as_float(_v4_83_1);
-                                    _fin_9[0 + 2] = __uint_as_float(_v4_83_2);
-                                    _fin_9[0 + 3] = __uint_as_float(_v4_83_3);
-#endif  // CAKE_WGRAD_OUT
+                                        : "=r"(_v4_73_0), "=r"(_v4_73_1), "=r"(_v4_73_2), "=r"(_v4_73_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 8 * TILE_K + tf_col_0) + (0))) : "memory");
+                                    _rf_0[32 + 0] = __uint_as_float(_v4_73_0);
+                                    _rf_0[32 + 1] = __uint_as_float(_v4_73_1);
+                                    _rf_0[32 + 2] = __uint_as_float(_v4_73_2);
+                                    _rf_0[32 + 3] = __uint_as_float(_v4_73_3);
                                 }
                                 {
-#if CAKE_WGRAD_OUT == 32
                                     unsigned _v4_74_0;
                                     unsigned _v4_74_1;
                                     unsigned _v4_74_2;
                                     unsigned _v4_74_3;
-#else
-                                    unsigned _v4_84_0;
-                                    unsigned _v4_84_1;
-                                    unsigned _v4_84_2;
-                                    unsigned _v4_84_3;
-#endif  // CAKE_WGRAD_OUT
                                     asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-#if CAKE_WGRAD_OUT == 32
-                                        : "=r"(_v4_74_0), "=r"(_v4_74_1), "=r"(_v4_74_2), "=r"(_v4_74_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 32 + 4) + (0))) : "memory");
-                                    _fin_9[4 + 0] = __uint_as_float(_v4_74_0);
-                                    _fin_9[4 + 1] = __uint_as_float(_v4_74_1);
-                                    _fin_9[4 + 2] = __uint_as_float(_v4_74_2);
-                                    _fin_9[4 + 3] = __uint_as_float(_v4_74_3);
-#else
-                                        : "=r"(_v4_84_0), "=r"(_v4_84_1), "=r"(_v4_84_2), "=r"(_v4_84_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 32 + 4) + (0))) : "memory");
-                                    _fin_9[4 + 0] = __uint_as_float(_v4_84_0);
-                                    _fin_9[4 + 1] = __uint_as_float(_v4_84_1);
-                                    _fin_9[4 + 2] = __uint_as_float(_v4_84_2);
-                                    _fin_9[4 + 3] = __uint_as_float(_v4_84_3);
-#endif  // CAKE_WGRAD_OUT
+                                        : "=r"(_v4_74_0), "=r"(_v4_74_1), "=r"(_v4_74_2), "=r"(_v4_74_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 9 * TILE_K + tf_col_0) + (0))) : "memory");
+                                    _rf_0[36 + 0] = __uint_as_float(_v4_74_0);
+                                    _rf_0[36 + 1] = __uint_as_float(_v4_74_1);
+                                    _rf_0[36 + 2] = __uint_as_float(_v4_74_2);
+                                    _rf_0[36 + 3] = __uint_as_float(_v4_74_3);
                                 }
                                 {
-#if CAKE_WGRAD_OUT == 32
                                     unsigned _v4_75_0;
                                     unsigned _v4_75_1;
                                     unsigned _v4_75_2;
                                     unsigned _v4_75_3;
-#else
-                                    unsigned _v4_85_0;
-                                    unsigned _v4_85_1;
-                                    unsigned _v4_85_2;
-                                    unsigned _v4_85_3;
-#endif  // CAKE_WGRAD_OUT
                                     asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-#if CAKE_WGRAD_OUT == 32
-                                        : "=r"(_v4_75_0), "=r"(_v4_75_1), "=r"(_v4_75_2), "=r"(_v4_75_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 32 + 8) + (0))) : "memory");
-                                    _fin_9[8 + 0] = __uint_as_float(_v4_75_0);
-                                    _fin_9[8 + 1] = __uint_as_float(_v4_75_1);
-                                    _fin_9[8 + 2] = __uint_as_float(_v4_75_2);
-                                    _fin_9[8 + 3] = __uint_as_float(_v4_75_3);
-#else
-                                        : "=r"(_v4_85_0), "=r"(_v4_85_1), "=r"(_v4_85_2), "=r"(_v4_85_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 32 + 8) + (0))) : "memory");
-                                    _fin_9[8 + 0] = __uint_as_float(_v4_85_0);
-                                    _fin_9[8 + 1] = __uint_as_float(_v4_85_1);
-                                    _fin_9[8 + 2] = __uint_as_float(_v4_85_2);
-                                    _fin_9[8 + 3] = __uint_as_float(_v4_85_3);
-#endif  // CAKE_WGRAD_OUT
+                                        : "=r"(_v4_75_0), "=r"(_v4_75_1), "=r"(_v4_75_2), "=r"(_v4_75_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 10 * TILE_K + tf_col_0) + (0))) : "memory");
+                                    _rf_0[40 + 0] = __uint_as_float(_v4_75_0);
+                                    _rf_0[40 + 1] = __uint_as_float(_v4_75_1);
+                                    _rf_0[40 + 2] = __uint_as_float(_v4_75_2);
+                                    _rf_0[40 + 3] = __uint_as_float(_v4_75_3);
                                 }
                                 {
-#if CAKE_WGRAD_OUT == 32
                                     unsigned _v4_76_0;
                                     unsigned _v4_76_1;
                                     unsigned _v4_76_2;
                                     unsigned _v4_76_3;
-#else
-                                    unsigned _v4_86_0;
-                                    unsigned _v4_86_1;
-                                    unsigned _v4_86_2;
-                                    unsigned _v4_86_3;
-#endif  // CAKE_WGRAD_OUT
                                     asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-#if CAKE_WGRAD_OUT == 32
-                                        : "=r"(_v4_76_0), "=r"(_v4_76_1), "=r"(_v4_76_2), "=r"(_v4_76_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 32 + 12) + (0))) : "memory");
-                                    _fin_9[12 + 0] = __uint_as_float(_v4_76_0);
-                                    _fin_9[12 + 1] = __uint_as_float(_v4_76_1);
-                                    _fin_9[12 + 2] = __uint_as_float(_v4_76_2);
-                                    _fin_9[12 + 3] = __uint_as_float(_v4_76_3);
-#else
-                                        : "=r"(_v4_86_0), "=r"(_v4_86_1), "=r"(_v4_86_2), "=r"(_v4_86_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 32 + 12) + (0))) : "memory");
-                                    _fin_9[12 + 0] = __uint_as_float(_v4_86_0);
-                                    _fin_9[12 + 1] = __uint_as_float(_v4_86_1);
-                                    _fin_9[12 + 2] = __uint_as_float(_v4_86_2);
-                                    _fin_9[12 + 3] = __uint_as_float(_v4_86_3);
-#endif  // CAKE_WGRAD_OUT
+                                        : "=r"(_v4_76_0), "=r"(_v4_76_1), "=r"(_v4_76_2), "=r"(_v4_76_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 11 * TILE_K + tf_col_0) + (0))) : "memory");
+                                    _rf_0[44 + 0] = __uint_as_float(_v4_76_0);
+                                    _rf_0[44 + 1] = __uint_as_float(_v4_76_1);
+                                    _rf_0[44 + 2] = __uint_as_float(_v4_76_2);
+                                    _rf_0[44 + 3] = __uint_as_float(_v4_76_3);
                                 }
                                 {
-                                    float4 _v4 = make_float4(_clr_9[0 + 0], _clr_9[0 + 1], _clr_9[0 + 2], _clr_9[0 + 3]);
-                                    *reinterpret_cast<float4*>((tail_sums + (tl_part + epi_half * 128 + 256 + 32)) + 0) = _v4;
-                                }
-                                {
-                                    float4 _v4 = make_float4(_clr_9[0 + 0], _clr_9[0 + 1], _clr_9[0 + 2], _clr_9[0 + 3]);
-                                    *reinterpret_cast<float4*>((tail_sums + (tl_part + epi_half * 128 + 256 + 32 + 4)) + 0) = _v4;
-                                }
-                                {
-                                    float4 _v4 = make_float4(_clr_9[0 + 0], _clr_9[0 + 1], _clr_9[0 + 2], _clr_9[0 + 3]);
-                                    *reinterpret_cast<float4*>((tail_sums + (tl_part + epi_half * 128 + 256 + 32 + 8)) + 0) = _v4;
-                                }
-                                {
-                                    float4 _v4 = make_float4(_clr_9[0 + 0], _clr_9[0 + 1], _clr_9[0 + 2], _clr_9[0 + 3]);
-                                    *reinterpret_cast<float4*>((tail_sums + (tl_part + epi_half * 128 + 256 + 32 + 12)) + 0) = _v4;
-                                }
-#if CAKE_WGRAD_OUT == 32
-                                {
-                                    float4 _v4 = make_float4(_fin_9[0 + 0], _fin_9[0 + 1], _fin_9[0 + 2], _fin_9[0 + 3]);
-                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 256 + 32)) + 0) = _v4;
-#else
-                                unsigned int _fin_p_9[8];
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_9[_lp*2 + 0], _fin_9[_lp*2+1 + 0]));
-                                    _fin_p_9[_lp] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_9[_lp*2 + 2], _fin_9[_lp*2+1 + 2]));
-                                    _fin_p_9[_lp + 1] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_9[_lp*2 + 4], _fin_9[_lp*2+1 + 4]));
-                                    _fin_p_9[_lp + 2] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_9[_lp*2 + 6], _fin_9[_lp*2+1 + 6]));
-                                    _fin_p_9[_lp + 3] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_9[_lp*2 + 8], _fin_9[_lp*2+1 + 8]));
-                                    _fin_p_9[_lp + 4] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_9[_lp*2 + 10], _fin_9[_lp*2+1 + 10]));
-                                    _fin_p_9[_lp + 5] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_9[_lp*2 + 12], _fin_9[_lp*2+1 + 12]));
-                                    _fin_p_9[_lp + 6] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_9[_lp*2 + 14], _fin_9[_lp*2+1 + 14]));
-                                    _fin_p_9[_lp + 7] = *(uint32_t*)&_bf2;
-#endif  // CAKE_WGRAD_OUT
-                                }
-                                {
-#if CAKE_WGRAD_OUT == 32
-                                    float4 _v4 = make_float4(_fin_9[4 + 0], _fin_9[4 + 1], _fin_9[4 + 2], _fin_9[4 + 3]);
-                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 256 + 32 + 4)) + 0) = _v4;
-                                }
-                                {
-                                    float4 _v4 = make_float4(_fin_9[8 + 0], _fin_9[8 + 1], _fin_9[8 + 2], _fin_9[8 + 3]);
-                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 256 + 32 + 8)) + 0) = _v4;
-                                }
-                                {
-                                    float4 _v4 = make_float4(_fin_9[12 + 0], _fin_9[12 + 1], _fin_9[12 + 2], _fin_9[12 + 3]);
-                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 256 + 32 + 12)) + 0) = _v4;
-#else
-                                    const unsigned* _raw_stv8_87 = reinterpret_cast<const unsigned*>(_fin_p_9);
-                                    asm volatile(
-                                        "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                                        :: "l"((void*)(C + (tl_out + epi_half * 128 + 256 + 32))), "r"(_raw_stv8_87[0]), "r"(_raw_stv8_87[1]), "r"(_raw_stv8_87[2]), "r"(_raw_stv8_87[3]), "r"(_raw_stv8_87[4]), "r"(_raw_stv8_87[5]), "r"(_raw_stv8_87[6]), "r"(_raw_stv8_87[7]) : "memory");
-#endif  // CAKE_WGRAD_OUT
-                                }
-                                float _fin_10[16];
-                                float _clr_10[4];
-                                _clr_10[0] = 0.0f;
-                                _clr_10[1] = 0.0f;
-                                _clr_10[2] = 0.0f;
-                                _clr_10[3] = 0.0f;
-                                {
-#if CAKE_WGRAD_OUT == 32
                                     unsigned _v4_77_0;
                                     unsigned _v4_77_1;
                                     unsigned _v4_77_2;
                                     unsigned _v4_77_3;
-#else
-                                    unsigned _v4_88_0;
-                                    unsigned _v4_88_1;
-                                    unsigned _v4_88_2;
-                                    unsigned _v4_88_3;
-#endif  // CAKE_WGRAD_OUT
                                     asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-#if CAKE_WGRAD_OUT == 32
-                                        : "=r"(_v4_77_0), "=r"(_v4_77_1), "=r"(_v4_77_2), "=r"(_v4_77_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 48) + (0))) : "memory");
-                                    _fin_10[0 + 0] = __uint_as_float(_v4_77_0);
-                                    _fin_10[0 + 1] = __uint_as_float(_v4_77_1);
-                                    _fin_10[0 + 2] = __uint_as_float(_v4_77_2);
-                                    _fin_10[0 + 3] = __uint_as_float(_v4_77_3);
-#else
-                                        : "=r"(_v4_88_0), "=r"(_v4_88_1), "=r"(_v4_88_2), "=r"(_v4_88_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 48) + (0))) : "memory");
-                                    _fin_10[0 + 0] = __uint_as_float(_v4_88_0);
-                                    _fin_10[0 + 1] = __uint_as_float(_v4_88_1);
-                                    _fin_10[0 + 2] = __uint_as_float(_v4_88_2);
-                                    _fin_10[0 + 3] = __uint_as_float(_v4_88_3);
-#endif  // CAKE_WGRAD_OUT
+                                        : "=r"(_v4_77_0), "=r"(_v4_77_1), "=r"(_v4_77_2), "=r"(_v4_77_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 12 * TILE_K + tf_col_0) + (0))) : "memory");
+                                    _rf_0[48 + 0] = __uint_as_float(_v4_77_0);
+                                    _rf_0[48 + 1] = __uint_as_float(_v4_77_1);
+                                    _rf_0[48 + 2] = __uint_as_float(_v4_77_2);
+                                    _rf_0[48 + 3] = __uint_as_float(_v4_77_3);
                                 }
                                 {
-#if CAKE_WGRAD_OUT == 32
                                     unsigned _v4_78_0;
                                     unsigned _v4_78_1;
                                     unsigned _v4_78_2;
                                     unsigned _v4_78_3;
-#else
-                                    unsigned _v4_89_0;
-                                    unsigned _v4_89_1;
-                                    unsigned _v4_89_2;
-                                    unsigned _v4_89_3;
-#endif  // CAKE_WGRAD_OUT
                                     asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-#if CAKE_WGRAD_OUT == 32
-                                        : "=r"(_v4_78_0), "=r"(_v4_78_1), "=r"(_v4_78_2), "=r"(_v4_78_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 48 + 4) + (0))) : "memory");
-                                    _fin_10[4 + 0] = __uint_as_float(_v4_78_0);
-                                    _fin_10[4 + 1] = __uint_as_float(_v4_78_1);
-                                    _fin_10[4 + 2] = __uint_as_float(_v4_78_2);
-                                    _fin_10[4 + 3] = __uint_as_float(_v4_78_3);
-#else
-                                        : "=r"(_v4_89_0), "=r"(_v4_89_1), "=r"(_v4_89_2), "=r"(_v4_89_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 48 + 4) + (0))) : "memory");
-                                    _fin_10[4 + 0] = __uint_as_float(_v4_89_0);
-                                    _fin_10[4 + 1] = __uint_as_float(_v4_89_1);
-                                    _fin_10[4 + 2] = __uint_as_float(_v4_89_2);
-                                    _fin_10[4 + 3] = __uint_as_float(_v4_89_3);
-#endif  // CAKE_WGRAD_OUT
+                                        : "=r"(_v4_78_0), "=r"(_v4_78_1), "=r"(_v4_78_2), "=r"(_v4_78_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 13 * TILE_K + tf_col_0) + (0))) : "memory");
+                                    _rf_0[52 + 0] = __uint_as_float(_v4_78_0);
+                                    _rf_0[52 + 1] = __uint_as_float(_v4_78_1);
+                                    _rf_0[52 + 2] = __uint_as_float(_v4_78_2);
+                                    _rf_0[52 + 3] = __uint_as_float(_v4_78_3);
                                 }
                                 {
-#if CAKE_WGRAD_OUT == 32
                                     unsigned _v4_79_0;
                                     unsigned _v4_79_1;
                                     unsigned _v4_79_2;
                                     unsigned _v4_79_3;
-#else
-                                    unsigned _v4_90_0;
-                                    unsigned _v4_90_1;
-                                    unsigned _v4_90_2;
-                                    unsigned _v4_90_3;
-#endif  // CAKE_WGRAD_OUT
                                     asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-#if CAKE_WGRAD_OUT == 32
-                                        : "=r"(_v4_79_0), "=r"(_v4_79_1), "=r"(_v4_79_2), "=r"(_v4_79_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 48 + 8) + (0))) : "memory");
-                                    _fin_10[8 + 0] = __uint_as_float(_v4_79_0);
-                                    _fin_10[8 + 1] = __uint_as_float(_v4_79_1);
-                                    _fin_10[8 + 2] = __uint_as_float(_v4_79_2);
-                                    _fin_10[8 + 3] = __uint_as_float(_v4_79_3);
-#else
-                                        : "=r"(_v4_90_0), "=r"(_v4_90_1), "=r"(_v4_90_2), "=r"(_v4_90_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 48 + 8) + (0))) : "memory");
-                                    _fin_10[8 + 0] = __uint_as_float(_v4_90_0);
-                                    _fin_10[8 + 1] = __uint_as_float(_v4_90_1);
-                                    _fin_10[8 + 2] = __uint_as_float(_v4_90_2);
-                                    _fin_10[8 + 3] = __uint_as_float(_v4_90_3);
-#endif  // CAKE_WGRAD_OUT
+                                        : "=r"(_v4_79_0), "=r"(_v4_79_1), "=r"(_v4_79_2), "=r"(_v4_79_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 14 * TILE_K + tf_col_0) + (0))) : "memory");
+                                    _rf_0[56 + 0] = __uint_as_float(_v4_79_0);
+                                    _rf_0[56 + 1] = __uint_as_float(_v4_79_1);
+                                    _rf_0[56 + 2] = __uint_as_float(_v4_79_2);
+                                    _rf_0[56 + 3] = __uint_as_float(_v4_79_3);
                                 }
                                 {
-#if CAKE_WGRAD_OUT == 32
                                     unsigned _v4_80_0;
                                     unsigned _v4_80_1;
                                     unsigned _v4_80_2;
                                     unsigned _v4_80_3;
-#else
-                                    unsigned _v4_91_0;
-                                    unsigned _v4_91_1;
-                                    unsigned _v4_91_2;
-                                    unsigned _v4_91_3;
-#endif  // CAKE_WGRAD_OUT
                                     asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
+                                        : "=r"(_v4_80_0), "=r"(_v4_80_1), "=r"(_v4_80_2), "=r"(_v4_80_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 15 * TILE_K + tf_col_0) + (0))) : "memory");
+                                    _rf_0[60 + 0] = __uint_as_float(_v4_80_0);
+                                    _rf_0[60 + 1] = __uint_as_float(_v4_80_1);
+                                    _rf_0[60 + 2] = __uint_as_float(_v4_80_2);
+                                    _rf_0[60 + 3] = __uint_as_float(_v4_80_3);
+                                }
+                                asm volatile("st.global.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(tail_sums + (tl_part + epi_half * 128 + 256 + tf_col_0)), "f"(_rz_0[(0) + 0]), "f"(_rz_0[(0) + 1]), "f"(_rz_0[(0) + 2]), "f"(_rz_0[(0) + 3]), "l"(0x12F0000000000000ULL) : "memory");
+                                asm volatile("st.global.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(tail_sums + (tl_part + epi_half * 128 + 256 + TILE_K + tf_col_0)), "f"(_rz_0[(0) + 0]), "f"(_rz_0[(0) + 1]), "f"(_rz_0[(0) + 2]), "f"(_rz_0[(0) + 3]), "l"(0x12F0000000000000ULL) : "memory");
+                                asm volatile("st.global.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(tail_sums + (tl_part + epi_half * 128 + 256 + 2 * TILE_K + tf_col_0)), "f"(_rz_0[(0) + 0]), "f"(_rz_0[(0) + 1]), "f"(_rz_0[(0) + 2]), "f"(_rz_0[(0) + 3]), "l"(0x12F0000000000000ULL) : "memory");
+                                asm volatile("st.global.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(tail_sums + (tl_part + epi_half * 128 + 256 + 3 * TILE_K + tf_col_0)), "f"(_rz_0[(0) + 0]), "f"(_rz_0[(0) + 1]), "f"(_rz_0[(0) + 2]), "f"(_rz_0[(0) + 3]), "l"(0x12F0000000000000ULL) : "memory");
+                                asm volatile("st.global.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(tail_sums + (tl_part + epi_half * 128 + 256 + 4 * TILE_K + tf_col_0)), "f"(_rz_0[(0) + 0]), "f"(_rz_0[(0) + 1]), "f"(_rz_0[(0) + 2]), "f"(_rz_0[(0) + 3]), "l"(0x12F0000000000000ULL) : "memory");
+                                asm volatile("st.global.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(tail_sums + (tl_part + epi_half * 128 + 256 + 5 * TILE_K + tf_col_0)), "f"(_rz_0[(0) + 0]), "f"(_rz_0[(0) + 1]), "f"(_rz_0[(0) + 2]), "f"(_rz_0[(0) + 3]), "l"(0x12F0000000000000ULL) : "memory");
+                                asm volatile("st.global.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(tail_sums + (tl_part + epi_half * 128 + 256 + 6 * TILE_K + tf_col_0)), "f"(_rz_0[(0) + 0]), "f"(_rz_0[(0) + 1]), "f"(_rz_0[(0) + 2]), "f"(_rz_0[(0) + 3]), "l"(0x12F0000000000000ULL) : "memory");
+                                asm volatile("st.global.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(tail_sums + (tl_part + epi_half * 128 + 256 + 7 * TILE_K + tf_col_0)), "f"(_rz_0[(0) + 0]), "f"(_rz_0[(0) + 1]), "f"(_rz_0[(0) + 2]), "f"(_rz_0[(0) + 3]), "l"(0x12F0000000000000ULL) : "memory");
+                                asm volatile("st.global.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(tail_sums + (tl_part + epi_half * 128 + 256 + 8 * TILE_K + tf_col_0)), "f"(_rz_0[(0) + 0]), "f"(_rz_0[(0) + 1]), "f"(_rz_0[(0) + 2]), "f"(_rz_0[(0) + 3]), "l"(0x12F0000000000000ULL) : "memory");
+                                asm volatile("st.global.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(tail_sums + (tl_part + epi_half * 128 + 256 + 9 * TILE_K + tf_col_0)), "f"(_rz_0[(0) + 0]), "f"(_rz_0[(0) + 1]), "f"(_rz_0[(0) + 2]), "f"(_rz_0[(0) + 3]), "l"(0x12F0000000000000ULL) : "memory");
+                                asm volatile("st.global.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(tail_sums + (tl_part + epi_half * 128 + 256 + 10 * TILE_K + tf_col_0)), "f"(_rz_0[(0) + 0]), "f"(_rz_0[(0) + 1]), "f"(_rz_0[(0) + 2]), "f"(_rz_0[(0) + 3]), "l"(0x12F0000000000000ULL) : "memory");
+                                asm volatile("st.global.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(tail_sums + (tl_part + epi_half * 128 + 256 + 11 * TILE_K + tf_col_0)), "f"(_rz_0[(0) + 0]), "f"(_rz_0[(0) + 1]), "f"(_rz_0[(0) + 2]), "f"(_rz_0[(0) + 3]), "l"(0x12F0000000000000ULL) : "memory");
+                                asm volatile("st.global.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(tail_sums + (tl_part + epi_half * 128 + 256 + 12 * TILE_K + tf_col_0)), "f"(_rz_0[(0) + 0]), "f"(_rz_0[(0) + 1]), "f"(_rz_0[(0) + 2]), "f"(_rz_0[(0) + 3]), "l"(0x12F0000000000000ULL) : "memory");
+                                asm volatile("st.global.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(tail_sums + (tl_part + epi_half * 128 + 256 + 13 * TILE_K + tf_col_0)), "f"(_rz_0[(0) + 0]), "f"(_rz_0[(0) + 1]), "f"(_rz_0[(0) + 2]), "f"(_rz_0[(0) + 3]), "l"(0x12F0000000000000ULL) : "memory");
+                                asm volatile("st.global.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(tail_sums + (tl_part + epi_half * 128 + 256 + 14 * TILE_K + tf_col_0)), "f"(_rz_0[(0) + 0]), "f"(_rz_0[(0) + 1]), "f"(_rz_0[(0) + 2]), "f"(_rz_0[(0) + 3]), "l"(0x12F0000000000000ULL) : "memory");
+                                asm volatile("st.global.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(tail_sums + (tl_part + epi_half * 128 + 256 + 15 * TILE_K + tf_col_0)), "f"(_rz_0[(0) + 0]), "f"(_rz_0[(0) + 1]), "f"(_rz_0[(0) + 2]), "f"(_rz_0[(0) + 3]), "l"(0x12F0000000000000ULL) : "memory");
 #if CAKE_WGRAD_OUT == 32
-                                        : "=r"(_v4_80_0), "=r"(_v4_80_1), "=r"(_v4_80_2), "=r"(_v4_80_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 48 + 12) + (0))) : "memory");
-                                    _fin_10[12 + 0] = __uint_as_float(_v4_80_0);
-                                    _fin_10[12 + 1] = __uint_as_float(_v4_80_1);
-                                    _fin_10[12 + 2] = __uint_as_float(_v4_80_2);
-                                    _fin_10[12 + 3] = __uint_as_float(_v4_80_3);
+                                {
+                                    float4 _v4 = make_float4(_rf_0[0 + 0], _rf_0[0 + 1], _rf_0[0 + 2], _rf_0[0 + 3]);
+                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 256 + tf_col_0)) + 0) = _v4;
 #else
-                                        : "=r"(_v4_91_0), "=r"(_v4_91_1), "=r"(_v4_91_2), "=r"(_v4_91_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 48 + 12) + (0))) : "memory");
-                                    _fin_10[12 + 0] = __uint_as_float(_v4_91_0);
-                                    _fin_10[12 + 1] = __uint_as_float(_v4_91_1);
-                                    _fin_10[12 + 2] = __uint_as_float(_v4_91_2);
-                                    _fin_10[12 + 3] = __uint_as_float(_v4_91_3);
+                                unsigned int _rp_2[2];
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf_0[_lp*2 + 0], _rf_0[_lp*2+1 + 0]));
+                                    _rp_2[_lp] = *(uint32_t*)&_bf2;
 #endif  // CAKE_WGRAD_OUT
                                 }
-                                {
-                                    float4 _v4 = make_float4(_clr_10[0 + 0], _clr_10[0 + 1], _clr_10[0 + 2], _clr_10[0 + 3]);
-                                    *reinterpret_cast<float4*>((tail_sums + (tl_part + epi_half * 128 + 256 + 48)) + 0) = _v4;
-                                }
-                                {
-                                    float4 _v4 = make_float4(_clr_10[0 + 0], _clr_10[0 + 1], _clr_10[0 + 2], _clr_10[0 + 3]);
-                                    *reinterpret_cast<float4*>((tail_sums + (tl_part + epi_half * 128 + 256 + 48 + 4)) + 0) = _v4;
-                                }
-                                {
-                                    float4 _v4 = make_float4(_clr_10[0 + 0], _clr_10[0 + 1], _clr_10[0 + 2], _clr_10[0 + 3]);
-                                    *reinterpret_cast<float4*>((tail_sums + (tl_part + epi_half * 128 + 256 + 48 + 8)) + 0) = _v4;
-                                }
-                                {
-                                    float4 _v4 = make_float4(_clr_10[0 + 0], _clr_10[0 + 1], _clr_10[0 + 2], _clr_10[0 + 3]);
-                                    *reinterpret_cast<float4*>((tail_sums + (tl_part + epi_half * 128 + 256 + 48 + 12)) + 0) = _v4;
-                                }
 #if CAKE_WGRAD_OUT == 32
                                 {
-                                    float4 _v4 = make_float4(_fin_10[0 + 0], _fin_10[0 + 1], _fin_10[0 + 2], _fin_10[0 + 3]);
-                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 256 + 48)) + 0) = _v4;
+                                    float4 _v4 = make_float4(_rf_0[4 + 0], _rf_0[4 + 1], _rf_0[4 + 2], _rf_0[4 + 3]);
+                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 256 + ldc + tf_col_0)) + 0) = _v4;
 #else
-                                unsigned int _fin_p_10[8];
                                 #pragma unroll
                                 for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_10[_lp*2 + 0], _fin_10[_lp*2+1 + 0]));
-                                    _fin_p_10[_lp] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_10[_lp*2 + 2], _fin_10[_lp*2+1 + 2]));
-                                    _fin_p_10[_lp + 1] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_10[_lp*2 + 4], _fin_10[_lp*2+1 + 4]));
-                                    _fin_p_10[_lp + 2] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_10[_lp*2 + 6], _fin_10[_lp*2+1 + 6]));
-                                    _fin_p_10[_lp + 3] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_10[_lp*2 + 8], _fin_10[_lp*2+1 + 8]));
-                                    _fin_p_10[_lp + 4] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_10[_lp*2 + 10], _fin_10[_lp*2+1 + 10]));
-                                    _fin_p_10[_lp + 5] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_10[_lp*2 + 12], _fin_10[_lp*2+1 + 12]));
-                                    _fin_p_10[_lp + 6] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_10[_lp*2 + 14], _fin_10[_lp*2+1 + 14]));
-                                    _fin_p_10[_lp + 7] = *(uint32_t*)&_bf2;
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf_0[_lp*2 + 2], _rf_0[_lp*2+1 + 2]));
+                                    _rp_2[_lp + 1] = *(uint32_t*)&_bf2;
 #endif  // CAKE_WGRAD_OUT
                                 }
-                                {
 #if CAKE_WGRAD_OUT == 32
-                                    float4 _v4 = make_float4(_fin_10[4 + 0], _fin_10[4 + 1], _fin_10[4 + 2], _fin_10[4 + 3]);
-                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 256 + 48 + 4)) + 0) = _v4;
-                                }
                                 {
-                                    float4 _v4 = make_float4(_fin_10[8 + 0], _fin_10[8 + 1], _fin_10[8 + 2], _fin_10[8 + 3]);
-                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 256 + 48 + 8)) + 0) = _v4;
-                                }
-                                {
-                                    float4 _v4 = make_float4(_fin_10[12 + 0], _fin_10[12 + 1], _fin_10[12 + 2], _fin_10[12 + 3]);
-                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 256 + 48 + 12)) + 0) = _v4;
+                                    float4 _v4 = make_float4(_rf_0[8 + 0], _rf_0[8 + 1], _rf_0[8 + 2], _rf_0[8 + 3]);
+                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 256 + 2 * ldc + tf_col_0)) + 0) = _v4;
 #else
-                                    const unsigned* _raw_stv8_92 = reinterpret_cast<const unsigned*>(_fin_p_10);
-                                    asm volatile(
-                                        "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                                        :: "l"((void*)(C + (tl_out + epi_half * 128 + 256 + 48))), "r"(_raw_stv8_92[0]), "r"(_raw_stv8_92[1]), "r"(_raw_stv8_92[2]), "r"(_raw_stv8_92[3]), "r"(_raw_stv8_92[4]), "r"(_raw_stv8_92[5]), "r"(_raw_stv8_92[6]), "r"(_raw_stv8_92[7]) : "memory");
+                                reinterpret_cast<int2*>(C + (tl_out + epi_half * 128 + 256 + tf_col_0))[0] = reinterpret_cast<int2*>(_rp_2)[0];
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf_0[_lp*2 + 4], _rf_0[_lp*2+1 + 4]));
+                                    _rp_2[_lp] = *(uint32_t*)&_bf2;
 #endif  // CAKE_WGRAD_OUT
                                 }
-                                float _fin_11[16];
-                                float _clr_11[4];
-                                _clr_11[0] = 0.0f;
-                                _clr_11[1] = 0.0f;
-                                _clr_11[2] = 0.0f;
-                                _clr_11[3] = 0.0f;
-                                {
 #if CAKE_WGRAD_OUT == 32
+                                {
+                                    float4 _v4 = make_float4(_rf_0[12 + 0], _rf_0[12 + 1], _rf_0[12 + 2], _rf_0[12 + 3]);
+                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 256 + 3 * ldc + tf_col_0)) + 0) = _v4;
+#else
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf_0[_lp*2 + 6], _rf_0[_lp*2+1 + 6]));
+                                    _rp_2[_lp + 1] = *(uint32_t*)&_bf2;
+#endif  // CAKE_WGRAD_OUT
+                                }
+#if CAKE_WGRAD_OUT == 32
+                                {
+                                    float4 _v4 = make_float4(_rf_0[16 + 0], _rf_0[16 + 1], _rf_0[16 + 2], _rf_0[16 + 3]);
+                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 256 + 4 * ldc + tf_col_0)) + 0) = _v4;
+#else
+                                reinterpret_cast<int2*>(C + (tl_out + epi_half * 128 + 256 + ldc + tf_col_0))[0] = reinterpret_cast<int2*>(_rp_2)[0];
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf_0[_lp*2 + 8], _rf_0[_lp*2+1 + 8]));
+                                    _rp_2[_lp] = *(uint32_t*)&_bf2;
+#endif  // CAKE_WGRAD_OUT
+                                }
+#if CAKE_WGRAD_OUT == 32
+                                {
+                                    float4 _v4 = make_float4(_rf_0[20 + 0], _rf_0[20 + 1], _rf_0[20 + 2], _rf_0[20 + 3]);
+                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 256 + 5 * ldc + tf_col_0)) + 0) = _v4;
+#else
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf_0[_lp*2 + 10], _rf_0[_lp*2+1 + 10]));
+                                    _rp_2[_lp + 1] = *(uint32_t*)&_bf2;
+#endif  // CAKE_WGRAD_OUT
+                                }
+#if CAKE_WGRAD_OUT == 32
+                                {
+                                    float4 _v4 = make_float4(_rf_0[24 + 0], _rf_0[24 + 1], _rf_0[24 + 2], _rf_0[24 + 3]);
+                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 256 + 6 * ldc + tf_col_0)) + 0) = _v4;
+#else
+                                reinterpret_cast<int2*>(C + (tl_out + epi_half * 128 + 256 + 2 * ldc + tf_col_0))[0] = reinterpret_cast<int2*>(_rp_2)[0];
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf_0[_lp*2 + 12], _rf_0[_lp*2+1 + 12]));
+                                    _rp_2[_lp] = *(uint32_t*)&_bf2;
+#endif  // CAKE_WGRAD_OUT
+                                }
+#if CAKE_WGRAD_OUT == 32
+                                {
+                                    float4 _v4 = make_float4(_rf_0[28 + 0], _rf_0[28 + 1], _rf_0[28 + 2], _rf_0[28 + 3]);
+                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 256 + 7 * ldc + tf_col_0)) + 0) = _v4;
+#else
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf_0[_lp*2 + 14], _rf_0[_lp*2+1 + 14]));
+                                    _rp_2[_lp + 1] = *(uint32_t*)&_bf2;
+#endif  // CAKE_WGRAD_OUT
+                                }
+#if CAKE_WGRAD_OUT == 32
+                                {
+                                    float4 _v4 = make_float4(_rf_0[32 + 0], _rf_0[32 + 1], _rf_0[32 + 2], _rf_0[32 + 3]);
+                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 256 + 8 * ldc + tf_col_0)) + 0) = _v4;
+#else
+                                reinterpret_cast<int2*>(C + (tl_out + epi_half * 128 + 256 + 3 * ldc + tf_col_0))[0] = reinterpret_cast<int2*>(_rp_2)[0];
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf_0[_lp*2 + 16], _rf_0[_lp*2+1 + 16]));
+                                    _rp_2[_lp] = *(uint32_t*)&_bf2;
+#endif  // CAKE_WGRAD_OUT
+                                }
+#if CAKE_WGRAD_OUT == 32
+                                {
+                                    float4 _v4 = make_float4(_rf_0[36 + 0], _rf_0[36 + 1], _rf_0[36 + 2], _rf_0[36 + 3]);
+                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 256 + 9 * ldc + tf_col_0)) + 0) = _v4;
+#else
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf_0[_lp*2 + 18], _rf_0[_lp*2+1 + 18]));
+                                    _rp_2[_lp + 1] = *(uint32_t*)&_bf2;
+#endif  // CAKE_WGRAD_OUT
+                                }
+#if CAKE_WGRAD_OUT == 32
+                                {
+                                    float4 _v4 = make_float4(_rf_0[40 + 0], _rf_0[40 + 1], _rf_0[40 + 2], _rf_0[40 + 3]);
+                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 256 + 10 * ldc + tf_col_0)) + 0) = _v4;
+#else
+                                reinterpret_cast<int2*>(C + (tl_out + epi_half * 128 + 256 + 4 * ldc + tf_col_0))[0] = reinterpret_cast<int2*>(_rp_2)[0];
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf_0[_lp*2 + 20], _rf_0[_lp*2+1 + 20]));
+                                    _rp_2[_lp] = *(uint32_t*)&_bf2;
+#endif  // CAKE_WGRAD_OUT
+                                }
+#if CAKE_WGRAD_OUT == 32
+                                {
+                                    float4 _v4 = make_float4(_rf_0[44 + 0], _rf_0[44 + 1], _rf_0[44 + 2], _rf_0[44 + 3]);
+                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 256 + 11 * ldc + tf_col_0)) + 0) = _v4;
+#else
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf_0[_lp*2 + 22], _rf_0[_lp*2+1 + 22]));
+                                    _rp_2[_lp + 1] = *(uint32_t*)&_bf2;
+#endif  // CAKE_WGRAD_OUT
+                                }
+#if CAKE_WGRAD_OUT == 32
+                                {
+                                    float4 _v4 = make_float4(_rf_0[48 + 0], _rf_0[48 + 1], _rf_0[48 + 2], _rf_0[48 + 3]);
+                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 256 + 12 * ldc + tf_col_0)) + 0) = _v4;
+#else
+                                reinterpret_cast<int2*>(C + (tl_out + epi_half * 128 + 256 + 5 * ldc + tf_col_0))[0] = reinterpret_cast<int2*>(_rp_2)[0];
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf_0[_lp*2 + 24], _rf_0[_lp*2+1 + 24]));
+                                    _rp_2[_lp] = *(uint32_t*)&_bf2;
+#endif  // CAKE_WGRAD_OUT
+                                }
+#if CAKE_WGRAD_OUT == 32
+                                {
+                                    float4 _v4 = make_float4(_rf_0[52 + 0], _rf_0[52 + 1], _rf_0[52 + 2], _rf_0[52 + 3]);
+                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 256 + 13 * ldc + tf_col_0)) + 0) = _v4;
+#else
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf_0[_lp*2 + 26], _rf_0[_lp*2+1 + 26]));
+                                    _rp_2[_lp + 1] = *(uint32_t*)&_bf2;
+#endif  // CAKE_WGRAD_OUT
+                                }
+#if CAKE_WGRAD_OUT == 32
+                                {
+                                    float4 _v4 = make_float4(_rf_0[56 + 0], _rf_0[56 + 1], _rf_0[56 + 2], _rf_0[56 + 3]);
+                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 256 + 14 * ldc + tf_col_0)) + 0) = _v4;
+#else
+                                reinterpret_cast<int2*>(C + (tl_out + epi_half * 128 + 256 + 6 * ldc + tf_col_0))[0] = reinterpret_cast<int2*>(_rp_2)[0];
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf_0[_lp*2 + 28], _rf_0[_lp*2+1 + 28]));
+                                    _rp_2[_lp] = *(uint32_t*)&_bf2;
+#endif  // CAKE_WGRAD_OUT
+                                }
+#if CAKE_WGRAD_OUT == 32
+                                {
+                                    float4 _v4 = make_float4(_rf_0[60 + 0], _rf_0[60 + 1], _rf_0[60 + 2], _rf_0[60 + 3]);
+                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 256 + 15 * ldc + tf_col_0)) + 0) = _v4;
+#else
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf_0[_lp*2 + 30], _rf_0[_lp*2+1 + 30]));
+                                    _rp_2[_lp + 1] = *(uint32_t*)&_bf2;
+#endif  // CAKE_WGRAD_OUT
+                                }
+#if CAKE_WGRAD_OUT == 16
+                                reinterpret_cast<int2*>(C + (tl_out + epi_half * 128 + 256 + 7 * ldc + tf_col_0))[0] = reinterpret_cast<int2*>(_rp_2)[0];
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf_0[_lp*2 + 32], _rf_0[_lp*2+1 + 32]));
+                                    _rp_2[_lp] = *(uint32_t*)&_bf2;
+                                }
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf_0[_lp*2 + 34], _rf_0[_lp*2+1 + 34]));
+                                    _rp_2[_lp + 1] = *(uint32_t*)&_bf2;
+                                }
+                                reinterpret_cast<int2*>(C + (tl_out + epi_half * 128 + 256 + 8 * ldc + tf_col_0))[0] = reinterpret_cast<int2*>(_rp_2)[0];
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf_0[_lp*2 + 36], _rf_0[_lp*2+1 + 36]));
+                                    _rp_2[_lp] = *(uint32_t*)&_bf2;
+                                }
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf_0[_lp*2 + 38], _rf_0[_lp*2+1 + 38]));
+                                    _rp_2[_lp + 1] = *(uint32_t*)&_bf2;
+                                }
+                                reinterpret_cast<int2*>(C + (tl_out + epi_half * 128 + 256 + 9 * ldc + tf_col_0))[0] = reinterpret_cast<int2*>(_rp_2)[0];
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf_0[_lp*2 + 40], _rf_0[_lp*2+1 + 40]));
+                                    _rp_2[_lp] = *(uint32_t*)&_bf2;
+                                }
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf_0[_lp*2 + 42], _rf_0[_lp*2+1 + 42]));
+                                    _rp_2[_lp + 1] = *(uint32_t*)&_bf2;
+                                }
+                                reinterpret_cast<int2*>(C + (tl_out + epi_half * 128 + 256 + 10 * ldc + tf_col_0))[0] = reinterpret_cast<int2*>(_rp_2)[0];
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf_0[_lp*2 + 44], _rf_0[_lp*2+1 + 44]));
+                                    _rp_2[_lp] = *(uint32_t*)&_bf2;
+                                }
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf_0[_lp*2 + 46], _rf_0[_lp*2+1 + 46]));
+                                    _rp_2[_lp + 1] = *(uint32_t*)&_bf2;
+                                }
+                                reinterpret_cast<int2*>(C + (tl_out + epi_half * 128 + 256 + 11 * ldc + tf_col_0))[0] = reinterpret_cast<int2*>(_rp_2)[0];
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf_0[_lp*2 + 48], _rf_0[_lp*2+1 + 48]));
+                                    _rp_2[_lp] = *(uint32_t*)&_bf2;
+                                }
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf_0[_lp*2 + 50], _rf_0[_lp*2+1 + 50]));
+                                    _rp_2[_lp + 1] = *(uint32_t*)&_bf2;
+                                }
+                                reinterpret_cast<int2*>(C + (tl_out + epi_half * 128 + 256 + 12 * ldc + tf_col_0))[0] = reinterpret_cast<int2*>(_rp_2)[0];
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf_0[_lp*2 + 52], _rf_0[_lp*2+1 + 52]));
+                                    _rp_2[_lp] = *(uint32_t*)&_bf2;
+                                }
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf_0[_lp*2 + 54], _rf_0[_lp*2+1 + 54]));
+                                    _rp_2[_lp + 1] = *(uint32_t*)&_bf2;
+                                }
+                                reinterpret_cast<int2*>(C + (tl_out + epi_half * 128 + 256 + 13 * ldc + tf_col_0))[0] = reinterpret_cast<int2*>(_rp_2)[0];
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf_0[_lp*2 + 56], _rf_0[_lp*2+1 + 56]));
+                                    _rp_2[_lp] = *(uint32_t*)&_bf2;
+                                }
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf_0[_lp*2 + 58], _rf_0[_lp*2+1 + 58]));
+                                    _rp_2[_lp + 1] = *(uint32_t*)&_bf2;
+                                }
+                                reinterpret_cast<int2*>(C + (tl_out + epi_half * 128 + 256 + 14 * ldc + tf_col_0))[0] = reinterpret_cast<int2*>(_rp_2)[0];
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf_0[_lp*2 + 60], _rf_0[_lp*2+1 + 60]));
+                                    _rp_2[_lp] = *(uint32_t*)&_bf2;
+                                }
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf_0[_lp*2 + 62], _rf_0[_lp*2+1 + 62]));
+                                    _rp_2[_lp + 1] = *(uint32_t*)&_bf2;
+                                }
+                                reinterpret_cast<int2*>(C + (tl_out + epi_half * 128 + 256 + 15 * ldc + tf_col_0))[0] = reinterpret_cast<int2*>(_rp_2)[0];
+#endif  // CAKE_WGRAD_OUT == 16
+                                {
                                     unsigned _v4_81_0;
                                     unsigned _v4_81_1;
                                     unsigned _v4_81_2;
                                     unsigned _v4_81_3;
-#else
-                                    unsigned _v4_93_0;
-                                    unsigned _v4_93_1;
-                                    unsigned _v4_93_2;
-                                    unsigned _v4_93_3;
-#endif  // CAKE_WGRAD_OUT
                                     asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-#if CAKE_WGRAD_OUT == 32
-                                        : "=r"(_v4_81_0), "=r"(_v4_81_1), "=r"(_v4_81_2), "=r"(_v4_81_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 64) + (0))) : "memory");
-                                    _fin_11[0 + 0] = __uint_as_float(_v4_81_0);
-                                    _fin_11[0 + 1] = __uint_as_float(_v4_81_1);
-                                    _fin_11[0 + 2] = __uint_as_float(_v4_81_2);
-                                    _fin_11[0 + 3] = __uint_as_float(_v4_81_3);
-#else
-                                        : "=r"(_v4_93_0), "=r"(_v4_93_1), "=r"(_v4_93_2), "=r"(_v4_93_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 64) + (0))) : "memory");
-                                    _fin_11[0 + 0] = __uint_as_float(_v4_93_0);
-                                    _fin_11[0 + 1] = __uint_as_float(_v4_93_1);
-                                    _fin_11[0 + 2] = __uint_as_float(_v4_93_2);
-                                    _fin_11[0 + 3] = __uint_as_float(_v4_93_3);
-#endif  // CAKE_WGRAD_OUT
+                                        : "=r"(_v4_81_0), "=r"(_v4_81_1), "=r"(_v4_81_2), "=r"(_v4_81_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 16 * TILE_K + tf_col_0) + (0))) : "memory");
+                                    _rf_0[0 + 0] = __uint_as_float(_v4_81_0);
+                                    _rf_0[0 + 1] = __uint_as_float(_v4_81_1);
+                                    _rf_0[0 + 2] = __uint_as_float(_v4_81_2);
+                                    _rf_0[0 + 3] = __uint_as_float(_v4_81_3);
                                 }
                                 {
-#if CAKE_WGRAD_OUT == 32
                                     unsigned _v4_82_0;
                                     unsigned _v4_82_1;
                                     unsigned _v4_82_2;
                                     unsigned _v4_82_3;
-#else
-                                    unsigned _v4_94_0;
-                                    unsigned _v4_94_1;
-                                    unsigned _v4_94_2;
-                                    unsigned _v4_94_3;
-#endif  // CAKE_WGRAD_OUT
                                     asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-#if CAKE_WGRAD_OUT == 32
-                                        : "=r"(_v4_82_0), "=r"(_v4_82_1), "=r"(_v4_82_2), "=r"(_v4_82_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 64 + 4) + (0))) : "memory");
-                                    _fin_11[4 + 0] = __uint_as_float(_v4_82_0);
-                                    _fin_11[4 + 1] = __uint_as_float(_v4_82_1);
-                                    _fin_11[4 + 2] = __uint_as_float(_v4_82_2);
-                                    _fin_11[4 + 3] = __uint_as_float(_v4_82_3);
-#else
-                                        : "=r"(_v4_94_0), "=r"(_v4_94_1), "=r"(_v4_94_2), "=r"(_v4_94_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 64 + 4) + (0))) : "memory");
-                                    _fin_11[4 + 0] = __uint_as_float(_v4_94_0);
-                                    _fin_11[4 + 1] = __uint_as_float(_v4_94_1);
-                                    _fin_11[4 + 2] = __uint_as_float(_v4_94_2);
-                                    _fin_11[4 + 3] = __uint_as_float(_v4_94_3);
-#endif  // CAKE_WGRAD_OUT
+                                        : "=r"(_v4_82_0), "=r"(_v4_82_1), "=r"(_v4_82_2), "=r"(_v4_82_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 17 * TILE_K + tf_col_0) + (0))) : "memory");
+                                    _rf_0[4 + 0] = __uint_as_float(_v4_82_0);
+                                    _rf_0[4 + 1] = __uint_as_float(_v4_82_1);
+                                    _rf_0[4 + 2] = __uint_as_float(_v4_82_2);
+                                    _rf_0[4 + 3] = __uint_as_float(_v4_82_3);
                                 }
                                 {
-#if CAKE_WGRAD_OUT == 32
                                     unsigned _v4_83_0;
                                     unsigned _v4_83_1;
                                     unsigned _v4_83_2;
                                     unsigned _v4_83_3;
-#else
-                                    unsigned _v4_95_0;
-                                    unsigned _v4_95_1;
-                                    unsigned _v4_95_2;
-                                    unsigned _v4_95_3;
-#endif  // CAKE_WGRAD_OUT
                                     asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-#if CAKE_WGRAD_OUT == 32
-                                        : "=r"(_v4_83_0), "=r"(_v4_83_1), "=r"(_v4_83_2), "=r"(_v4_83_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 64 + 8) + (0))) : "memory");
-                                    _fin_11[8 + 0] = __uint_as_float(_v4_83_0);
-                                    _fin_11[8 + 1] = __uint_as_float(_v4_83_1);
-                                    _fin_11[8 + 2] = __uint_as_float(_v4_83_2);
-                                    _fin_11[8 + 3] = __uint_as_float(_v4_83_3);
-#else
-                                        : "=r"(_v4_95_0), "=r"(_v4_95_1), "=r"(_v4_95_2), "=r"(_v4_95_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 64 + 8) + (0))) : "memory");
-                                    _fin_11[8 + 0] = __uint_as_float(_v4_95_0);
-                                    _fin_11[8 + 1] = __uint_as_float(_v4_95_1);
-                                    _fin_11[8 + 2] = __uint_as_float(_v4_95_2);
-                                    _fin_11[8 + 3] = __uint_as_float(_v4_95_3);
-#endif  // CAKE_WGRAD_OUT
+                                        : "=r"(_v4_83_0), "=r"(_v4_83_1), "=r"(_v4_83_2), "=r"(_v4_83_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 18 * TILE_K + tf_col_0) + (0))) : "memory");
+                                    _rf_0[8 + 0] = __uint_as_float(_v4_83_0);
+                                    _rf_0[8 + 1] = __uint_as_float(_v4_83_1);
+                                    _rf_0[8 + 2] = __uint_as_float(_v4_83_2);
+                                    _rf_0[8 + 3] = __uint_as_float(_v4_83_3);
                                 }
                                 {
-#if CAKE_WGRAD_OUT == 32
                                     unsigned _v4_84_0;
                                     unsigned _v4_84_1;
                                     unsigned _v4_84_2;
                                     unsigned _v4_84_3;
-#else
-                                    unsigned _v4_96_0;
-                                    unsigned _v4_96_1;
-                                    unsigned _v4_96_2;
-                                    unsigned _v4_96_3;
-#endif  // CAKE_WGRAD_OUT
                                     asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-#if CAKE_WGRAD_OUT == 32
-                                        : "=r"(_v4_84_0), "=r"(_v4_84_1), "=r"(_v4_84_2), "=r"(_v4_84_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 64 + 12) + (0))) : "memory");
-                                    _fin_11[12 + 0] = __uint_as_float(_v4_84_0);
-                                    _fin_11[12 + 1] = __uint_as_float(_v4_84_1);
-                                    _fin_11[12 + 2] = __uint_as_float(_v4_84_2);
-                                    _fin_11[12 + 3] = __uint_as_float(_v4_84_3);
-#else
-                                        : "=r"(_v4_96_0), "=r"(_v4_96_1), "=r"(_v4_96_2), "=r"(_v4_96_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 64 + 12) + (0))) : "memory");
-                                    _fin_11[12 + 0] = __uint_as_float(_v4_96_0);
-                                    _fin_11[12 + 1] = __uint_as_float(_v4_96_1);
-                                    _fin_11[12 + 2] = __uint_as_float(_v4_96_2);
-                                    _fin_11[12 + 3] = __uint_as_float(_v4_96_3);
-#endif  // CAKE_WGRAD_OUT
+                                        : "=r"(_v4_84_0), "=r"(_v4_84_1), "=r"(_v4_84_2), "=r"(_v4_84_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 19 * TILE_K + tf_col_0) + (0))) : "memory");
+                                    _rf_0[12 + 0] = __uint_as_float(_v4_84_0);
+                                    _rf_0[12 + 1] = __uint_as_float(_v4_84_1);
+                                    _rf_0[12 + 2] = __uint_as_float(_v4_84_2);
+                                    _rf_0[12 + 3] = __uint_as_float(_v4_84_3);
                                 }
                                 {
-                                    float4 _v4 = make_float4(_clr_11[0 + 0], _clr_11[0 + 1], _clr_11[0 + 2], _clr_11[0 + 3]);
-                                    *reinterpret_cast<float4*>((tail_sums + (tl_part + epi_half * 128 + 256 + 64)) + 0) = _v4;
-                                }
-                                {
-                                    float4 _v4 = make_float4(_clr_11[0 + 0], _clr_11[0 + 1], _clr_11[0 + 2], _clr_11[0 + 3]);
-                                    *reinterpret_cast<float4*>((tail_sums + (tl_part + epi_half * 128 + 256 + 64 + 4)) + 0) = _v4;
-                                }
-                                {
-                                    float4 _v4 = make_float4(_clr_11[0 + 0], _clr_11[0 + 1], _clr_11[0 + 2], _clr_11[0 + 3]);
-                                    *reinterpret_cast<float4*>((tail_sums + (tl_part + epi_half * 128 + 256 + 64 + 8)) + 0) = _v4;
-                                }
-                                {
-                                    float4 _v4 = make_float4(_clr_11[0 + 0], _clr_11[0 + 1], _clr_11[0 + 2], _clr_11[0 + 3]);
-                                    *reinterpret_cast<float4*>((tail_sums + (tl_part + epi_half * 128 + 256 + 64 + 12)) + 0) = _v4;
-                                }
-#if CAKE_WGRAD_OUT == 32
-                                {
-                                    float4 _v4 = make_float4(_fin_11[0 + 0], _fin_11[0 + 1], _fin_11[0 + 2], _fin_11[0 + 3]);
-                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 256 + 64)) + 0) = _v4;
-#else
-                                unsigned int _fin_p_11[8];
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_11[_lp*2 + 0], _fin_11[_lp*2+1 + 0]));
-                                    _fin_p_11[_lp] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_11[_lp*2 + 2], _fin_11[_lp*2+1 + 2]));
-                                    _fin_p_11[_lp + 1] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_11[_lp*2 + 4], _fin_11[_lp*2+1 + 4]));
-                                    _fin_p_11[_lp + 2] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_11[_lp*2 + 6], _fin_11[_lp*2+1 + 6]));
-                                    _fin_p_11[_lp + 3] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_11[_lp*2 + 8], _fin_11[_lp*2+1 + 8]));
-                                    _fin_p_11[_lp + 4] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_11[_lp*2 + 10], _fin_11[_lp*2+1 + 10]));
-                                    _fin_p_11[_lp + 5] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_11[_lp*2 + 12], _fin_11[_lp*2+1 + 12]));
-                                    _fin_p_11[_lp + 6] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_11[_lp*2 + 14], _fin_11[_lp*2+1 + 14]));
-                                    _fin_p_11[_lp + 7] = *(uint32_t*)&_bf2;
-#endif  // CAKE_WGRAD_OUT
-                                }
-                                {
-#if CAKE_WGRAD_OUT == 32
-                                    float4 _v4 = make_float4(_fin_11[4 + 0], _fin_11[4 + 1], _fin_11[4 + 2], _fin_11[4 + 3]);
-                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 256 + 64 + 4)) + 0) = _v4;
-                                }
-                                {
-                                    float4 _v4 = make_float4(_fin_11[8 + 0], _fin_11[8 + 1], _fin_11[8 + 2], _fin_11[8 + 3]);
-                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 256 + 64 + 8)) + 0) = _v4;
-                                }
-                                {
-                                    float4 _v4 = make_float4(_fin_11[12 + 0], _fin_11[12 + 1], _fin_11[12 + 2], _fin_11[12 + 3]);
-                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 256 + 64 + 12)) + 0) = _v4;
-#else
-                                    const unsigned* _raw_stv8_97 = reinterpret_cast<const unsigned*>(_fin_p_11);
-                                    asm volatile(
-                                        "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                                        :: "l"((void*)(C + (tl_out + epi_half * 128 + 256 + 64))), "r"(_raw_stv8_97[0]), "r"(_raw_stv8_97[1]), "r"(_raw_stv8_97[2]), "r"(_raw_stv8_97[3]), "r"(_raw_stv8_97[4]), "r"(_raw_stv8_97[5]), "r"(_raw_stv8_97[6]), "r"(_raw_stv8_97[7]) : "memory");
-#endif  // CAKE_WGRAD_OUT
-                                }
-                                float _fin_12[16];
-                                float _clr_12[4];
-                                _clr_12[0] = 0.0f;
-                                _clr_12[1] = 0.0f;
-                                _clr_12[2] = 0.0f;
-                                _clr_12[3] = 0.0f;
-                                {
-#if CAKE_WGRAD_OUT == 32
                                     unsigned _v4_85_0;
                                     unsigned _v4_85_1;
                                     unsigned _v4_85_2;
                                     unsigned _v4_85_3;
-#else
-                                    unsigned _v4_98_0;
-                                    unsigned _v4_98_1;
-                                    unsigned _v4_98_2;
-                                    unsigned _v4_98_3;
-#endif  // CAKE_WGRAD_OUT
                                     asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-#if CAKE_WGRAD_OUT == 32
-                                        : "=r"(_v4_85_0), "=r"(_v4_85_1), "=r"(_v4_85_2), "=r"(_v4_85_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 80) + (0))) : "memory");
-                                    _fin_12[0 + 0] = __uint_as_float(_v4_85_0);
-                                    _fin_12[0 + 1] = __uint_as_float(_v4_85_1);
-                                    _fin_12[0 + 2] = __uint_as_float(_v4_85_2);
-                                    _fin_12[0 + 3] = __uint_as_float(_v4_85_3);
-#else
-                                        : "=r"(_v4_98_0), "=r"(_v4_98_1), "=r"(_v4_98_2), "=r"(_v4_98_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 80) + (0))) : "memory");
-                                    _fin_12[0 + 0] = __uint_as_float(_v4_98_0);
-                                    _fin_12[0 + 1] = __uint_as_float(_v4_98_1);
-                                    _fin_12[0 + 2] = __uint_as_float(_v4_98_2);
-                                    _fin_12[0 + 3] = __uint_as_float(_v4_98_3);
-#endif  // CAKE_WGRAD_OUT
+                                        : "=r"(_v4_85_0), "=r"(_v4_85_1), "=r"(_v4_85_2), "=r"(_v4_85_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 20 * TILE_K + tf_col_0) + (0))) : "memory");
+                                    _rf_0[16 + 0] = __uint_as_float(_v4_85_0);
+                                    _rf_0[16 + 1] = __uint_as_float(_v4_85_1);
+                                    _rf_0[16 + 2] = __uint_as_float(_v4_85_2);
+                                    _rf_0[16 + 3] = __uint_as_float(_v4_85_3);
                                 }
                                 {
-#if CAKE_WGRAD_OUT == 32
                                     unsigned _v4_86_0;
                                     unsigned _v4_86_1;
                                     unsigned _v4_86_2;
                                     unsigned _v4_86_3;
-#else
-                                    unsigned _v4_99_0;
-                                    unsigned _v4_99_1;
-                                    unsigned _v4_99_2;
-                                    unsigned _v4_99_3;
-#endif  // CAKE_WGRAD_OUT
                                     asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-#if CAKE_WGRAD_OUT == 32
-                                        : "=r"(_v4_86_0), "=r"(_v4_86_1), "=r"(_v4_86_2), "=r"(_v4_86_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 80 + 4) + (0))) : "memory");
-                                    _fin_12[4 + 0] = __uint_as_float(_v4_86_0);
-                                    _fin_12[4 + 1] = __uint_as_float(_v4_86_1);
-                                    _fin_12[4 + 2] = __uint_as_float(_v4_86_2);
-                                    _fin_12[4 + 3] = __uint_as_float(_v4_86_3);
-#else
-                                        : "=r"(_v4_99_0), "=r"(_v4_99_1), "=r"(_v4_99_2), "=r"(_v4_99_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 80 + 4) + (0))) : "memory");
-                                    _fin_12[4 + 0] = __uint_as_float(_v4_99_0);
-                                    _fin_12[4 + 1] = __uint_as_float(_v4_99_1);
-                                    _fin_12[4 + 2] = __uint_as_float(_v4_99_2);
-                                    _fin_12[4 + 3] = __uint_as_float(_v4_99_3);
-#endif  // CAKE_WGRAD_OUT
+                                        : "=r"(_v4_86_0), "=r"(_v4_86_1), "=r"(_v4_86_2), "=r"(_v4_86_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 21 * TILE_K + tf_col_0) + (0))) : "memory");
+                                    _rf_0[20 + 0] = __uint_as_float(_v4_86_0);
+                                    _rf_0[20 + 1] = __uint_as_float(_v4_86_1);
+                                    _rf_0[20 + 2] = __uint_as_float(_v4_86_2);
+                                    _rf_0[20 + 3] = __uint_as_float(_v4_86_3);
                                 }
                                 {
-#if CAKE_WGRAD_OUT == 32
                                     unsigned _v4_87_0;
                                     unsigned _v4_87_1;
                                     unsigned _v4_87_2;
                                     unsigned _v4_87_3;
-#else
-                                    unsigned _v4_100_0;
-                                    unsigned _v4_100_1;
-                                    unsigned _v4_100_2;
-                                    unsigned _v4_100_3;
-#endif  // CAKE_WGRAD_OUT
                                     asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-#if CAKE_WGRAD_OUT == 32
-                                        : "=r"(_v4_87_0), "=r"(_v4_87_1), "=r"(_v4_87_2), "=r"(_v4_87_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 80 + 8) + (0))) : "memory");
-                                    _fin_12[8 + 0] = __uint_as_float(_v4_87_0);
-                                    _fin_12[8 + 1] = __uint_as_float(_v4_87_1);
-                                    _fin_12[8 + 2] = __uint_as_float(_v4_87_2);
-                                    _fin_12[8 + 3] = __uint_as_float(_v4_87_3);
-#else
-                                        : "=r"(_v4_100_0), "=r"(_v4_100_1), "=r"(_v4_100_2), "=r"(_v4_100_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 80 + 8) + (0))) : "memory");
-                                    _fin_12[8 + 0] = __uint_as_float(_v4_100_0);
-                                    _fin_12[8 + 1] = __uint_as_float(_v4_100_1);
-                                    _fin_12[8 + 2] = __uint_as_float(_v4_100_2);
-                                    _fin_12[8 + 3] = __uint_as_float(_v4_100_3);
-#endif  // CAKE_WGRAD_OUT
+                                        : "=r"(_v4_87_0), "=r"(_v4_87_1), "=r"(_v4_87_2), "=r"(_v4_87_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 22 * TILE_K + tf_col_0) + (0))) : "memory");
+                                    _rf_0[24 + 0] = __uint_as_float(_v4_87_0);
+                                    _rf_0[24 + 1] = __uint_as_float(_v4_87_1);
+                                    _rf_0[24 + 2] = __uint_as_float(_v4_87_2);
+                                    _rf_0[24 + 3] = __uint_as_float(_v4_87_3);
                                 }
                                 {
-#if CAKE_WGRAD_OUT == 32
                                     unsigned _v4_88_0;
                                     unsigned _v4_88_1;
                                     unsigned _v4_88_2;
                                     unsigned _v4_88_3;
-#else
-                                    unsigned _v4_101_0;
-                                    unsigned _v4_101_1;
-                                    unsigned _v4_101_2;
-                                    unsigned _v4_101_3;
-#endif  // CAKE_WGRAD_OUT
                                     asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-#if CAKE_WGRAD_OUT == 32
-                                        : "=r"(_v4_88_0), "=r"(_v4_88_1), "=r"(_v4_88_2), "=r"(_v4_88_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 80 + 12) + (0))) : "memory");
-                                    _fin_12[12 + 0] = __uint_as_float(_v4_88_0);
-                                    _fin_12[12 + 1] = __uint_as_float(_v4_88_1);
-                                    _fin_12[12 + 2] = __uint_as_float(_v4_88_2);
-                                    _fin_12[12 + 3] = __uint_as_float(_v4_88_3);
-#else
-                                        : "=r"(_v4_101_0), "=r"(_v4_101_1), "=r"(_v4_101_2), "=r"(_v4_101_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 80 + 12) + (0))) : "memory");
-                                    _fin_12[12 + 0] = __uint_as_float(_v4_101_0);
-                                    _fin_12[12 + 1] = __uint_as_float(_v4_101_1);
-                                    _fin_12[12 + 2] = __uint_as_float(_v4_101_2);
-                                    _fin_12[12 + 3] = __uint_as_float(_v4_101_3);
-#endif  // CAKE_WGRAD_OUT
+                                        : "=r"(_v4_88_0), "=r"(_v4_88_1), "=r"(_v4_88_2), "=r"(_v4_88_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 23 * TILE_K + tf_col_0) + (0))) : "memory");
+                                    _rf_0[28 + 0] = __uint_as_float(_v4_88_0);
+                                    _rf_0[28 + 1] = __uint_as_float(_v4_88_1);
+                                    _rf_0[28 + 2] = __uint_as_float(_v4_88_2);
+                                    _rf_0[28 + 3] = __uint_as_float(_v4_88_3);
                                 }
                                 {
-                                    float4 _v4 = make_float4(_clr_12[0 + 0], _clr_12[0 + 1], _clr_12[0 + 2], _clr_12[0 + 3]);
-                                    *reinterpret_cast<float4*>((tail_sums + (tl_part + epi_half * 128 + 256 + 80)) + 0) = _v4;
-                                }
-                                {
-                                    float4 _v4 = make_float4(_clr_12[0 + 0], _clr_12[0 + 1], _clr_12[0 + 2], _clr_12[0 + 3]);
-                                    *reinterpret_cast<float4*>((tail_sums + (tl_part + epi_half * 128 + 256 + 80 + 4)) + 0) = _v4;
-                                }
-                                {
-                                    float4 _v4 = make_float4(_clr_12[0 + 0], _clr_12[0 + 1], _clr_12[0 + 2], _clr_12[0 + 3]);
-                                    *reinterpret_cast<float4*>((tail_sums + (tl_part + epi_half * 128 + 256 + 80 + 8)) + 0) = _v4;
-                                }
-                                {
-                                    float4 _v4 = make_float4(_clr_12[0 + 0], _clr_12[0 + 1], _clr_12[0 + 2], _clr_12[0 + 3]);
-                                    *reinterpret_cast<float4*>((tail_sums + (tl_part + epi_half * 128 + 256 + 80 + 12)) + 0) = _v4;
-                                }
-#if CAKE_WGRAD_OUT == 32
-                                {
-                                    float4 _v4 = make_float4(_fin_12[0 + 0], _fin_12[0 + 1], _fin_12[0 + 2], _fin_12[0 + 3]);
-                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 256 + 80)) + 0) = _v4;
-#else
-                                unsigned int _fin_p_12[8];
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_12[_lp*2 + 0], _fin_12[_lp*2+1 + 0]));
-                                    _fin_p_12[_lp] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_12[_lp*2 + 2], _fin_12[_lp*2+1 + 2]));
-                                    _fin_p_12[_lp + 1] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_12[_lp*2 + 4], _fin_12[_lp*2+1 + 4]));
-                                    _fin_p_12[_lp + 2] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_12[_lp*2 + 6], _fin_12[_lp*2+1 + 6]));
-                                    _fin_p_12[_lp + 3] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_12[_lp*2 + 8], _fin_12[_lp*2+1 + 8]));
-                                    _fin_p_12[_lp + 4] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_12[_lp*2 + 10], _fin_12[_lp*2+1 + 10]));
-                                    _fin_p_12[_lp + 5] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_12[_lp*2 + 12], _fin_12[_lp*2+1 + 12]));
-                                    _fin_p_12[_lp + 6] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_12[_lp*2 + 14], _fin_12[_lp*2+1 + 14]));
-                                    _fin_p_12[_lp + 7] = *(uint32_t*)&_bf2;
-#endif  // CAKE_WGRAD_OUT
-                                }
-                                {
-#if CAKE_WGRAD_OUT == 32
-                                    float4 _v4 = make_float4(_fin_12[4 + 0], _fin_12[4 + 1], _fin_12[4 + 2], _fin_12[4 + 3]);
-                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 256 + 80 + 4)) + 0) = _v4;
-                                }
-                                {
-                                    float4 _v4 = make_float4(_fin_12[8 + 0], _fin_12[8 + 1], _fin_12[8 + 2], _fin_12[8 + 3]);
-                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 256 + 80 + 8)) + 0) = _v4;
-                                }
-                                {
-                                    float4 _v4 = make_float4(_fin_12[12 + 0], _fin_12[12 + 1], _fin_12[12 + 2], _fin_12[12 + 3]);
-                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 256 + 80 + 12)) + 0) = _v4;
-#else
-                                    const unsigned* _raw_stv8_102 = reinterpret_cast<const unsigned*>(_fin_p_12);
-                                    asm volatile(
-                                        "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                                        :: "l"((void*)(C + (tl_out + epi_half * 128 + 256 + 80))), "r"(_raw_stv8_102[0]), "r"(_raw_stv8_102[1]), "r"(_raw_stv8_102[2]), "r"(_raw_stv8_102[3]), "r"(_raw_stv8_102[4]), "r"(_raw_stv8_102[5]), "r"(_raw_stv8_102[6]), "r"(_raw_stv8_102[7]) : "memory");
-#endif  // CAKE_WGRAD_OUT
-                                }
-                                float _fin_13[16];
-                                float _clr_13[4];
-                                _clr_13[0] = 0.0f;
-                                _clr_13[1] = 0.0f;
-                                _clr_13[2] = 0.0f;
-                                _clr_13[3] = 0.0f;
-                                {
-#if CAKE_WGRAD_OUT == 32
                                     unsigned _v4_89_0;
                                     unsigned _v4_89_1;
                                     unsigned _v4_89_2;
                                     unsigned _v4_89_3;
-#else
-                                    unsigned _v4_103_0;
-                                    unsigned _v4_103_1;
-                                    unsigned _v4_103_2;
-                                    unsigned _v4_103_3;
-#endif  // CAKE_WGRAD_OUT
                                     asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-#if CAKE_WGRAD_OUT == 32
-                                        : "=r"(_v4_89_0), "=r"(_v4_89_1), "=r"(_v4_89_2), "=r"(_v4_89_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 96) + (0))) : "memory");
-                                    _fin_13[0 + 0] = __uint_as_float(_v4_89_0);
-                                    _fin_13[0 + 1] = __uint_as_float(_v4_89_1);
-                                    _fin_13[0 + 2] = __uint_as_float(_v4_89_2);
-                                    _fin_13[0 + 3] = __uint_as_float(_v4_89_3);
-#else
-                                        : "=r"(_v4_103_0), "=r"(_v4_103_1), "=r"(_v4_103_2), "=r"(_v4_103_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 96) + (0))) : "memory");
-                                    _fin_13[0 + 0] = __uint_as_float(_v4_103_0);
-                                    _fin_13[0 + 1] = __uint_as_float(_v4_103_1);
-                                    _fin_13[0 + 2] = __uint_as_float(_v4_103_2);
-                                    _fin_13[0 + 3] = __uint_as_float(_v4_103_3);
-#endif  // CAKE_WGRAD_OUT
+                                        : "=r"(_v4_89_0), "=r"(_v4_89_1), "=r"(_v4_89_2), "=r"(_v4_89_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 24 * TILE_K + tf_col_0) + (0))) : "memory");
+                                    _rf_0[32 + 0] = __uint_as_float(_v4_89_0);
+                                    _rf_0[32 + 1] = __uint_as_float(_v4_89_1);
+                                    _rf_0[32 + 2] = __uint_as_float(_v4_89_2);
+                                    _rf_0[32 + 3] = __uint_as_float(_v4_89_3);
                                 }
                                 {
-#if CAKE_WGRAD_OUT == 32
                                     unsigned _v4_90_0;
                                     unsigned _v4_90_1;
                                     unsigned _v4_90_2;
                                     unsigned _v4_90_3;
-#else
-                                    unsigned _v4_104_0;
-                                    unsigned _v4_104_1;
-                                    unsigned _v4_104_2;
-                                    unsigned _v4_104_3;
-#endif  // CAKE_WGRAD_OUT
                                     asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-#if CAKE_WGRAD_OUT == 32
-                                        : "=r"(_v4_90_0), "=r"(_v4_90_1), "=r"(_v4_90_2), "=r"(_v4_90_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 96 + 4) + (0))) : "memory");
-                                    _fin_13[4 + 0] = __uint_as_float(_v4_90_0);
-                                    _fin_13[4 + 1] = __uint_as_float(_v4_90_1);
-                                    _fin_13[4 + 2] = __uint_as_float(_v4_90_2);
-                                    _fin_13[4 + 3] = __uint_as_float(_v4_90_3);
-#else
-                                        : "=r"(_v4_104_0), "=r"(_v4_104_1), "=r"(_v4_104_2), "=r"(_v4_104_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 96 + 4) + (0))) : "memory");
-                                    _fin_13[4 + 0] = __uint_as_float(_v4_104_0);
-                                    _fin_13[4 + 1] = __uint_as_float(_v4_104_1);
-                                    _fin_13[4 + 2] = __uint_as_float(_v4_104_2);
-                                    _fin_13[4 + 3] = __uint_as_float(_v4_104_3);
-#endif  // CAKE_WGRAD_OUT
+                                        : "=r"(_v4_90_0), "=r"(_v4_90_1), "=r"(_v4_90_2), "=r"(_v4_90_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 25 * TILE_K + tf_col_0) + (0))) : "memory");
+                                    _rf_0[36 + 0] = __uint_as_float(_v4_90_0);
+                                    _rf_0[36 + 1] = __uint_as_float(_v4_90_1);
+                                    _rf_0[36 + 2] = __uint_as_float(_v4_90_2);
+                                    _rf_0[36 + 3] = __uint_as_float(_v4_90_3);
                                 }
                                 {
-#if CAKE_WGRAD_OUT == 32
                                     unsigned _v4_91_0;
                                     unsigned _v4_91_1;
                                     unsigned _v4_91_2;
                                     unsigned _v4_91_3;
-#else
-                                    unsigned _v4_105_0;
-                                    unsigned _v4_105_1;
-                                    unsigned _v4_105_2;
-                                    unsigned _v4_105_3;
-#endif  // CAKE_WGRAD_OUT
                                     asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-#if CAKE_WGRAD_OUT == 32
-                                        : "=r"(_v4_91_0), "=r"(_v4_91_1), "=r"(_v4_91_2), "=r"(_v4_91_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 96 + 8) + (0))) : "memory");
-                                    _fin_13[8 + 0] = __uint_as_float(_v4_91_0);
-                                    _fin_13[8 + 1] = __uint_as_float(_v4_91_1);
-                                    _fin_13[8 + 2] = __uint_as_float(_v4_91_2);
-                                    _fin_13[8 + 3] = __uint_as_float(_v4_91_3);
-#else
-                                        : "=r"(_v4_105_0), "=r"(_v4_105_1), "=r"(_v4_105_2), "=r"(_v4_105_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 96 + 8) + (0))) : "memory");
-                                    _fin_13[8 + 0] = __uint_as_float(_v4_105_0);
-                                    _fin_13[8 + 1] = __uint_as_float(_v4_105_1);
-                                    _fin_13[8 + 2] = __uint_as_float(_v4_105_2);
-                                    _fin_13[8 + 3] = __uint_as_float(_v4_105_3);
-#endif  // CAKE_WGRAD_OUT
+                                        : "=r"(_v4_91_0), "=r"(_v4_91_1), "=r"(_v4_91_2), "=r"(_v4_91_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 26 * TILE_K + tf_col_0) + (0))) : "memory");
+                                    _rf_0[40 + 0] = __uint_as_float(_v4_91_0);
+                                    _rf_0[40 + 1] = __uint_as_float(_v4_91_1);
+                                    _rf_0[40 + 2] = __uint_as_float(_v4_91_2);
+                                    _rf_0[40 + 3] = __uint_as_float(_v4_91_3);
                                 }
                                 {
-#if CAKE_WGRAD_OUT == 32
                                     unsigned _v4_92_0;
                                     unsigned _v4_92_1;
                                     unsigned _v4_92_2;
                                     unsigned _v4_92_3;
-#else
-                                    unsigned _v4_106_0;
-                                    unsigned _v4_106_1;
-                                    unsigned _v4_106_2;
-                                    unsigned _v4_106_3;
-#endif  // CAKE_WGRAD_OUT
                                     asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-#if CAKE_WGRAD_OUT == 32
-                                        : "=r"(_v4_92_0), "=r"(_v4_92_1), "=r"(_v4_92_2), "=r"(_v4_92_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 96 + 12) + (0))) : "memory");
-                                    _fin_13[12 + 0] = __uint_as_float(_v4_92_0);
-                                    _fin_13[12 + 1] = __uint_as_float(_v4_92_1);
-                                    _fin_13[12 + 2] = __uint_as_float(_v4_92_2);
-                                    _fin_13[12 + 3] = __uint_as_float(_v4_92_3);
-#else
-                                        : "=r"(_v4_106_0), "=r"(_v4_106_1), "=r"(_v4_106_2), "=r"(_v4_106_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 96 + 12) + (0))) : "memory");
-                                    _fin_13[12 + 0] = __uint_as_float(_v4_106_0);
-                                    _fin_13[12 + 1] = __uint_as_float(_v4_106_1);
-                                    _fin_13[12 + 2] = __uint_as_float(_v4_106_2);
-                                    _fin_13[12 + 3] = __uint_as_float(_v4_106_3);
-#endif  // CAKE_WGRAD_OUT
+                                        : "=r"(_v4_92_0), "=r"(_v4_92_1), "=r"(_v4_92_2), "=r"(_v4_92_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 27 * TILE_K + tf_col_0) + (0))) : "memory");
+                                    _rf_0[44 + 0] = __uint_as_float(_v4_92_0);
+                                    _rf_0[44 + 1] = __uint_as_float(_v4_92_1);
+                                    _rf_0[44 + 2] = __uint_as_float(_v4_92_2);
+                                    _rf_0[44 + 3] = __uint_as_float(_v4_92_3);
                                 }
                                 {
-                                    float4 _v4 = make_float4(_clr_13[0 + 0], _clr_13[0 + 1], _clr_13[0 + 2], _clr_13[0 + 3]);
-                                    *reinterpret_cast<float4*>((tail_sums + (tl_part + epi_half * 128 + 256 + 96)) + 0) = _v4;
-                                }
-                                {
-                                    float4 _v4 = make_float4(_clr_13[0 + 0], _clr_13[0 + 1], _clr_13[0 + 2], _clr_13[0 + 3]);
-                                    *reinterpret_cast<float4*>((tail_sums + (tl_part + epi_half * 128 + 256 + 96 + 4)) + 0) = _v4;
-                                }
-                                {
-                                    float4 _v4 = make_float4(_clr_13[0 + 0], _clr_13[0 + 1], _clr_13[0 + 2], _clr_13[0 + 3]);
-                                    *reinterpret_cast<float4*>((tail_sums + (tl_part + epi_half * 128 + 256 + 96 + 8)) + 0) = _v4;
-                                }
-                                {
-                                    float4 _v4 = make_float4(_clr_13[0 + 0], _clr_13[0 + 1], _clr_13[0 + 2], _clr_13[0 + 3]);
-                                    *reinterpret_cast<float4*>((tail_sums + (tl_part + epi_half * 128 + 256 + 96 + 12)) + 0) = _v4;
-                                }
-#if CAKE_WGRAD_OUT == 32
-                                {
-                                    float4 _v4 = make_float4(_fin_13[0 + 0], _fin_13[0 + 1], _fin_13[0 + 2], _fin_13[0 + 3]);
-                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 256 + 96)) + 0) = _v4;
-#else
-                                unsigned int _fin_p_13[8];
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_13[_lp*2 + 0], _fin_13[_lp*2+1 + 0]));
-                                    _fin_p_13[_lp] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_13[_lp*2 + 2], _fin_13[_lp*2+1 + 2]));
-                                    _fin_p_13[_lp + 1] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_13[_lp*2 + 4], _fin_13[_lp*2+1 + 4]));
-                                    _fin_p_13[_lp + 2] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_13[_lp*2 + 6], _fin_13[_lp*2+1 + 6]));
-                                    _fin_p_13[_lp + 3] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_13[_lp*2 + 8], _fin_13[_lp*2+1 + 8]));
-                                    _fin_p_13[_lp + 4] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_13[_lp*2 + 10], _fin_13[_lp*2+1 + 10]));
-                                    _fin_p_13[_lp + 5] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_13[_lp*2 + 12], _fin_13[_lp*2+1 + 12]));
-                                    _fin_p_13[_lp + 6] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_13[_lp*2 + 14], _fin_13[_lp*2+1 + 14]));
-                                    _fin_p_13[_lp + 7] = *(uint32_t*)&_bf2;
-#endif  // CAKE_WGRAD_OUT
-                                }
-                                {
-#if CAKE_WGRAD_OUT == 32
-                                    float4 _v4 = make_float4(_fin_13[4 + 0], _fin_13[4 + 1], _fin_13[4 + 2], _fin_13[4 + 3]);
-                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 256 + 96 + 4)) + 0) = _v4;
-                                }
-                                {
-                                    float4 _v4 = make_float4(_fin_13[8 + 0], _fin_13[8 + 1], _fin_13[8 + 2], _fin_13[8 + 3]);
-                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 256 + 96 + 8)) + 0) = _v4;
-                                }
-                                {
-                                    float4 _v4 = make_float4(_fin_13[12 + 0], _fin_13[12 + 1], _fin_13[12 + 2], _fin_13[12 + 3]);
-                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 256 + 96 + 12)) + 0) = _v4;
-#else
-                                    const unsigned* _raw_stv8_107 = reinterpret_cast<const unsigned*>(_fin_p_13);
-                                    asm volatile(
-                                        "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                                        :: "l"((void*)(C + (tl_out + epi_half * 128 + 256 + 96))), "r"(_raw_stv8_107[0]), "r"(_raw_stv8_107[1]), "r"(_raw_stv8_107[2]), "r"(_raw_stv8_107[3]), "r"(_raw_stv8_107[4]), "r"(_raw_stv8_107[5]), "r"(_raw_stv8_107[6]), "r"(_raw_stv8_107[7]) : "memory");
-#endif  // CAKE_WGRAD_OUT
-                                }
-                                float _fin_14[16];
-                                float _clr_14[4];
-                                _clr_14[0] = 0.0f;
-                                _clr_14[1] = 0.0f;
-                                _clr_14[2] = 0.0f;
-                                _clr_14[3] = 0.0f;
-                                {
-#if CAKE_WGRAD_OUT == 32
                                     unsigned _v4_93_0;
                                     unsigned _v4_93_1;
                                     unsigned _v4_93_2;
                                     unsigned _v4_93_3;
-#else
-                                    unsigned _v4_108_0;
-                                    unsigned _v4_108_1;
-                                    unsigned _v4_108_2;
-                                    unsigned _v4_108_3;
-#endif  // CAKE_WGRAD_OUT
                                     asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-#if CAKE_WGRAD_OUT == 32
-                                        : "=r"(_v4_93_0), "=r"(_v4_93_1), "=r"(_v4_93_2), "=r"(_v4_93_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 112) + (0))) : "memory");
-                                    _fin_14[0 + 0] = __uint_as_float(_v4_93_0);
-                                    _fin_14[0 + 1] = __uint_as_float(_v4_93_1);
-                                    _fin_14[0 + 2] = __uint_as_float(_v4_93_2);
-                                    _fin_14[0 + 3] = __uint_as_float(_v4_93_3);
-#else
-                                        : "=r"(_v4_108_0), "=r"(_v4_108_1), "=r"(_v4_108_2), "=r"(_v4_108_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 112) + (0))) : "memory");
-                                    _fin_14[0 + 0] = __uint_as_float(_v4_108_0);
-                                    _fin_14[0 + 1] = __uint_as_float(_v4_108_1);
-                                    _fin_14[0 + 2] = __uint_as_float(_v4_108_2);
-                                    _fin_14[0 + 3] = __uint_as_float(_v4_108_3);
-#endif  // CAKE_WGRAD_OUT
+                                        : "=r"(_v4_93_0), "=r"(_v4_93_1), "=r"(_v4_93_2), "=r"(_v4_93_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 28 * TILE_K + tf_col_0) + (0))) : "memory");
+                                    _rf_0[48 + 0] = __uint_as_float(_v4_93_0);
+                                    _rf_0[48 + 1] = __uint_as_float(_v4_93_1);
+                                    _rf_0[48 + 2] = __uint_as_float(_v4_93_2);
+                                    _rf_0[48 + 3] = __uint_as_float(_v4_93_3);
                                 }
                                 {
-#if CAKE_WGRAD_OUT == 32
                                     unsigned _v4_94_0;
                                     unsigned _v4_94_1;
                                     unsigned _v4_94_2;
                                     unsigned _v4_94_3;
-#else
-                                    unsigned _v4_109_0;
-                                    unsigned _v4_109_1;
-                                    unsigned _v4_109_2;
-                                    unsigned _v4_109_3;
-#endif  // CAKE_WGRAD_OUT
                                     asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-#if CAKE_WGRAD_OUT == 32
-                                        : "=r"(_v4_94_0), "=r"(_v4_94_1), "=r"(_v4_94_2), "=r"(_v4_94_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 112 + 4) + (0))) : "memory");
-                                    _fin_14[4 + 0] = __uint_as_float(_v4_94_0);
-                                    _fin_14[4 + 1] = __uint_as_float(_v4_94_1);
-                                    _fin_14[4 + 2] = __uint_as_float(_v4_94_2);
-                                    _fin_14[4 + 3] = __uint_as_float(_v4_94_3);
-#else
-                                        : "=r"(_v4_109_0), "=r"(_v4_109_1), "=r"(_v4_109_2), "=r"(_v4_109_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 112 + 4) + (0))) : "memory");
-                                    _fin_14[4 + 0] = __uint_as_float(_v4_109_0);
-                                    _fin_14[4 + 1] = __uint_as_float(_v4_109_1);
-                                    _fin_14[4 + 2] = __uint_as_float(_v4_109_2);
-                                    _fin_14[4 + 3] = __uint_as_float(_v4_109_3);
-#endif  // CAKE_WGRAD_OUT
+                                        : "=r"(_v4_94_0), "=r"(_v4_94_1), "=r"(_v4_94_2), "=r"(_v4_94_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 29 * TILE_K + tf_col_0) + (0))) : "memory");
+                                    _rf_0[52 + 0] = __uint_as_float(_v4_94_0);
+                                    _rf_0[52 + 1] = __uint_as_float(_v4_94_1);
+                                    _rf_0[52 + 2] = __uint_as_float(_v4_94_2);
+                                    _rf_0[52 + 3] = __uint_as_float(_v4_94_3);
                                 }
                                 {
-#if CAKE_WGRAD_OUT == 32
                                     unsigned _v4_95_0;
                                     unsigned _v4_95_1;
                                     unsigned _v4_95_2;
                                     unsigned _v4_95_3;
-#else
-                                    unsigned _v4_110_0;
-                                    unsigned _v4_110_1;
-                                    unsigned _v4_110_2;
-                                    unsigned _v4_110_3;
-#endif  // CAKE_WGRAD_OUT
                                     asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-#if CAKE_WGRAD_OUT == 32
-                                        : "=r"(_v4_95_0), "=r"(_v4_95_1), "=r"(_v4_95_2), "=r"(_v4_95_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 112 + 8) + (0))) : "memory");
-                                    _fin_14[8 + 0] = __uint_as_float(_v4_95_0);
-                                    _fin_14[8 + 1] = __uint_as_float(_v4_95_1);
-                                    _fin_14[8 + 2] = __uint_as_float(_v4_95_2);
-                                    _fin_14[8 + 3] = __uint_as_float(_v4_95_3);
-#else
-                                        : "=r"(_v4_110_0), "=r"(_v4_110_1), "=r"(_v4_110_2), "=r"(_v4_110_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 112 + 8) + (0))) : "memory");
-                                    _fin_14[8 + 0] = __uint_as_float(_v4_110_0);
-                                    _fin_14[8 + 1] = __uint_as_float(_v4_110_1);
-                                    _fin_14[8 + 2] = __uint_as_float(_v4_110_2);
-                                    _fin_14[8 + 3] = __uint_as_float(_v4_110_3);
-#endif  // CAKE_WGRAD_OUT
+                                        : "=r"(_v4_95_0), "=r"(_v4_95_1), "=r"(_v4_95_2), "=r"(_v4_95_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 30 * TILE_K + tf_col_0) + (0))) : "memory");
+                                    _rf_0[56 + 0] = __uint_as_float(_v4_95_0);
+                                    _rf_0[56 + 1] = __uint_as_float(_v4_95_1);
+                                    _rf_0[56 + 2] = __uint_as_float(_v4_95_2);
+                                    _rf_0[56 + 3] = __uint_as_float(_v4_95_3);
                                 }
                                 {
-#if CAKE_WGRAD_OUT == 32
                                     unsigned _v4_96_0;
                                     unsigned _v4_96_1;
                                     unsigned _v4_96_2;
                                     unsigned _v4_96_3;
-#else
-                                    unsigned _v4_111_0;
-                                    unsigned _v4_111_1;
-                                    unsigned _v4_111_2;
-                                    unsigned _v4_111_3;
-#endif  // CAKE_WGRAD_OUT
                                     asm volatile("ld.global.cg.v4.b32 {%0, %1, %2, %3}, [%4];"
-#if CAKE_WGRAD_OUT == 32
-                                        : "=r"(_v4_96_0), "=r"(_v4_96_1), "=r"(_v4_96_2), "=r"(_v4_96_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 112 + 12) + (0))) : "memory");
-                                    _fin_14[12 + 0] = __uint_as_float(_v4_96_0);
-                                    _fin_14[12 + 1] = __uint_as_float(_v4_96_1);
-                                    _fin_14[12 + 2] = __uint_as_float(_v4_96_2);
-                                    _fin_14[12 + 3] = __uint_as_float(_v4_96_3);
-#else
-                                        : "=r"(_v4_111_0), "=r"(_v4_111_1), "=r"(_v4_111_2), "=r"(_v4_111_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 112 + 12) + (0))) : "memory");
-                                    _fin_14[12 + 0] = __uint_as_float(_v4_111_0);
-                                    _fin_14[12 + 1] = __uint_as_float(_v4_111_1);
-                                    _fin_14[12 + 2] = __uint_as_float(_v4_111_2);
-                                    _fin_14[12 + 3] = __uint_as_float(_v4_111_3);
-#endif  // CAKE_WGRAD_OUT
+                                        : "=r"(_v4_96_0), "=r"(_v4_96_1), "=r"(_v4_96_2), "=r"(_v4_96_3) : "l"((const void*)(tail_sums + (tl_part + epi_half * 128 + 256 + 31 * TILE_K + tf_col_0) + (0))) : "memory");
+                                    _rf_0[60 + 0] = __uint_as_float(_v4_96_0);
+                                    _rf_0[60 + 1] = __uint_as_float(_v4_96_1);
+                                    _rf_0[60 + 2] = __uint_as_float(_v4_96_2);
+                                    _rf_0[60 + 3] = __uint_as_float(_v4_96_3);
                                 }
-                                {
-                                    float4 _v4 = make_float4(_clr_14[0 + 0], _clr_14[0 + 1], _clr_14[0 + 2], _clr_14[0 + 3]);
-                                    *reinterpret_cast<float4*>((tail_sums + (tl_part + epi_half * 128 + 256 + 112)) + 0) = _v4;
-                                }
-                                {
-                                    float4 _v4 = make_float4(_clr_14[0 + 0], _clr_14[0 + 1], _clr_14[0 + 2], _clr_14[0 + 3]);
-                                    *reinterpret_cast<float4*>((tail_sums + (tl_part + epi_half * 128 + 256 + 112 + 4)) + 0) = _v4;
-                                }
-                                {
-                                    float4 _v4 = make_float4(_clr_14[0 + 0], _clr_14[0 + 1], _clr_14[0 + 2], _clr_14[0 + 3]);
-                                    *reinterpret_cast<float4*>((tail_sums + (tl_part + epi_half * 128 + 256 + 112 + 8)) + 0) = _v4;
-                                }
-                                {
-                                    float4 _v4 = make_float4(_clr_14[0 + 0], _clr_14[0 + 1], _clr_14[0 + 2], _clr_14[0 + 3]);
-                                    *reinterpret_cast<float4*>((tail_sums + (tl_part + epi_half * 128 + 256 + 112 + 12)) + 0) = _v4;
-                                }
+                                asm volatile("st.global.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(tail_sums + (tl_part + epi_half * 128 + 256 + 16 * TILE_K + tf_col_0)), "f"(_rz_0[(0) + 0]), "f"(_rz_0[(0) + 1]), "f"(_rz_0[(0) + 2]), "f"(_rz_0[(0) + 3]), "l"(0x12F0000000000000ULL) : "memory");
+                                asm volatile("st.global.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(tail_sums + (tl_part + epi_half * 128 + 256 + 17 * TILE_K + tf_col_0)), "f"(_rz_0[(0) + 0]), "f"(_rz_0[(0) + 1]), "f"(_rz_0[(0) + 2]), "f"(_rz_0[(0) + 3]), "l"(0x12F0000000000000ULL) : "memory");
+                                asm volatile("st.global.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(tail_sums + (tl_part + epi_half * 128 + 256 + 18 * TILE_K + tf_col_0)), "f"(_rz_0[(0) + 0]), "f"(_rz_0[(0) + 1]), "f"(_rz_0[(0) + 2]), "f"(_rz_0[(0) + 3]), "l"(0x12F0000000000000ULL) : "memory");
+                                asm volatile("st.global.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(tail_sums + (tl_part + epi_half * 128 + 256 + 19 * TILE_K + tf_col_0)), "f"(_rz_0[(0) + 0]), "f"(_rz_0[(0) + 1]), "f"(_rz_0[(0) + 2]), "f"(_rz_0[(0) + 3]), "l"(0x12F0000000000000ULL) : "memory");
+                                asm volatile("st.global.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(tail_sums + (tl_part + epi_half * 128 + 256 + 20 * TILE_K + tf_col_0)), "f"(_rz_0[(0) + 0]), "f"(_rz_0[(0) + 1]), "f"(_rz_0[(0) + 2]), "f"(_rz_0[(0) + 3]), "l"(0x12F0000000000000ULL) : "memory");
+                                asm volatile("st.global.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(tail_sums + (tl_part + epi_half * 128 + 256 + 21 * TILE_K + tf_col_0)), "f"(_rz_0[(0) + 0]), "f"(_rz_0[(0) + 1]), "f"(_rz_0[(0) + 2]), "f"(_rz_0[(0) + 3]), "l"(0x12F0000000000000ULL) : "memory");
+                                asm volatile("st.global.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(tail_sums + (tl_part + epi_half * 128 + 256 + 22 * TILE_K + tf_col_0)), "f"(_rz_0[(0) + 0]), "f"(_rz_0[(0) + 1]), "f"(_rz_0[(0) + 2]), "f"(_rz_0[(0) + 3]), "l"(0x12F0000000000000ULL) : "memory");
+                                asm volatile("st.global.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(tail_sums + (tl_part + epi_half * 128 + 256 + 23 * TILE_K + tf_col_0)), "f"(_rz_0[(0) + 0]), "f"(_rz_0[(0) + 1]), "f"(_rz_0[(0) + 2]), "f"(_rz_0[(0) + 3]), "l"(0x12F0000000000000ULL) : "memory");
+                                asm volatile("st.global.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(tail_sums + (tl_part + epi_half * 128 + 256 + 24 * TILE_K + tf_col_0)), "f"(_rz_0[(0) + 0]), "f"(_rz_0[(0) + 1]), "f"(_rz_0[(0) + 2]), "f"(_rz_0[(0) + 3]), "l"(0x12F0000000000000ULL) : "memory");
+                                asm volatile("st.global.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(tail_sums + (tl_part + epi_half * 128 + 256 + 25 * TILE_K + tf_col_0)), "f"(_rz_0[(0) + 0]), "f"(_rz_0[(0) + 1]), "f"(_rz_0[(0) + 2]), "f"(_rz_0[(0) + 3]), "l"(0x12F0000000000000ULL) : "memory");
+                                asm volatile("st.global.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(tail_sums + (tl_part + epi_half * 128 + 256 + 26 * TILE_K + tf_col_0)), "f"(_rz_0[(0) + 0]), "f"(_rz_0[(0) + 1]), "f"(_rz_0[(0) + 2]), "f"(_rz_0[(0) + 3]), "l"(0x12F0000000000000ULL) : "memory");
+                                asm volatile("st.global.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(tail_sums + (tl_part + epi_half * 128 + 256 + 27 * TILE_K + tf_col_0)), "f"(_rz_0[(0) + 0]), "f"(_rz_0[(0) + 1]), "f"(_rz_0[(0) + 2]), "f"(_rz_0[(0) + 3]), "l"(0x12F0000000000000ULL) : "memory");
+                                asm volatile("st.global.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(tail_sums + (tl_part + epi_half * 128 + 256 + 28 * TILE_K + tf_col_0)), "f"(_rz_0[(0) + 0]), "f"(_rz_0[(0) + 1]), "f"(_rz_0[(0) + 2]), "f"(_rz_0[(0) + 3]), "l"(0x12F0000000000000ULL) : "memory");
+                                asm volatile("st.global.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(tail_sums + (tl_part + epi_half * 128 + 256 + 29 * TILE_K + tf_col_0)), "f"(_rz_0[(0) + 0]), "f"(_rz_0[(0) + 1]), "f"(_rz_0[(0) + 2]), "f"(_rz_0[(0) + 3]), "l"(0x12F0000000000000ULL) : "memory");
+                                asm volatile("st.global.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(tail_sums + (tl_part + epi_half * 128 + 256 + 30 * TILE_K + tf_col_0)), "f"(_rz_0[(0) + 0]), "f"(_rz_0[(0) + 1]), "f"(_rz_0[(0) + 2]), "f"(_rz_0[(0) + 3]), "l"(0x12F0000000000000ULL) : "memory");
+                                asm volatile("st.global.L2::cache_hint.v4.f32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(tail_sums + (tl_part + epi_half * 128 + 256 + 31 * TILE_K + tf_col_0)), "f"(_rz_0[(0) + 0]), "f"(_rz_0[(0) + 1]), "f"(_rz_0[(0) + 2]), "f"(_rz_0[(0) + 3]), "l"(0x12F0000000000000ULL) : "memory");
 #if CAKE_WGRAD_OUT == 32
                                 {
-                                    float4 _v4 = make_float4(_fin_14[0 + 0], _fin_14[0 + 1], _fin_14[0 + 2], _fin_14[0 + 3]);
-                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 256 + 112)) + 0) = _v4;
+                                    float4 _v4 = make_float4(_rf_0[0 + 0], _rf_0[0 + 1], _rf_0[0 + 2], _rf_0[0 + 3]);
+                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 256 + 16 * ldc + tf_col_0)) + 0) = _v4;
 #else
-                                unsigned int _fin_p_14[8];
+                                unsigned int _rp_3[2];
                                 #pragma unroll
                                 for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_14[_lp*2 + 0], _fin_14[_lp*2+1 + 0]));
-                                    _fin_p_14[_lp] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_14[_lp*2 + 2], _fin_14[_lp*2+1 + 2]));
-                                    _fin_p_14[_lp + 1] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_14[_lp*2 + 4], _fin_14[_lp*2+1 + 4]));
-                                    _fin_p_14[_lp + 2] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_14[_lp*2 + 6], _fin_14[_lp*2+1 + 6]));
-                                    _fin_p_14[_lp + 3] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_14[_lp*2 + 8], _fin_14[_lp*2+1 + 8]));
-                                    _fin_p_14[_lp + 4] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_14[_lp*2 + 10], _fin_14[_lp*2+1 + 10]));
-                                    _fin_p_14[_lp + 5] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_14[_lp*2 + 12], _fin_14[_lp*2+1 + 12]));
-                                    _fin_p_14[_lp + 6] = *(uint32_t*)&_bf2;
-                                }
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_fin_14[_lp*2 + 14], _fin_14[_lp*2+1 + 14]));
-                                    _fin_p_14[_lp + 7] = *(uint32_t*)&_bf2;
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf_0[_lp*2 + 0], _rf_0[_lp*2+1 + 0]));
+                                    _rp_3[_lp] = *(uint32_t*)&_bf2;
 #endif  // CAKE_WGRAD_OUT
                                 }
-                                {
 #if CAKE_WGRAD_OUT == 32
-                                    float4 _v4 = make_float4(_fin_14[4 + 0], _fin_14[4 + 1], _fin_14[4 + 2], _fin_14[4 + 3]);
-                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 256 + 112 + 4)) + 0) = _v4;
-                                }
                                 {
-                                    float4 _v4 = make_float4(_fin_14[8 + 0], _fin_14[8 + 1], _fin_14[8 + 2], _fin_14[8 + 3]);
-                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 256 + 112 + 8)) + 0) = _v4;
-                                }
-                                {
-                                    float4 _v4 = make_float4(_fin_14[12 + 0], _fin_14[12 + 1], _fin_14[12 + 2], _fin_14[12 + 3]);
-                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 256 + 112 + 12)) + 0) = _v4;
+                                    float4 _v4 = make_float4(_rf_0[4 + 0], _rf_0[4 + 1], _rf_0[4 + 2], _rf_0[4 + 3]);
+                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 256 + 17 * ldc + tf_col_0)) + 0) = _v4;
 #else
-                                    const unsigned* _raw_stv8_112 = reinterpret_cast<const unsigned*>(_fin_p_14);
-                                    asm volatile(
-                                        "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
-                                        :: "l"((void*)(C + (tl_out + epi_half * 128 + 256 + 112))), "r"(_raw_stv8_112[0]), "r"(_raw_stv8_112[1]), "r"(_raw_stv8_112[2]), "r"(_raw_stv8_112[3]), "r"(_raw_stv8_112[4]), "r"(_raw_stv8_112[5]), "r"(_raw_stv8_112[6]), "r"(_raw_stv8_112[7]) : "memory");
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf_0[_lp*2 + 2], _rf_0[_lp*2+1 + 2]));
+                                    _rp_3[_lp + 1] = *(uint32_t*)&_bf2;
 #endif  // CAKE_WGRAD_OUT
                                 }
+#if CAKE_WGRAD_OUT == 32
+                                {
+                                    float4 _v4 = make_float4(_rf_0[8 + 0], _rf_0[8 + 1], _rf_0[8 + 2], _rf_0[8 + 3]);
+                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 256 + 18 * ldc + tf_col_0)) + 0) = _v4;
+#else
+                                reinterpret_cast<int2*>(C + (tl_out + epi_half * 128 + 256 + 16 * ldc + tf_col_0))[0] = reinterpret_cast<int2*>(_rp_3)[0];
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf_0[_lp*2 + 4], _rf_0[_lp*2+1 + 4]));
+                                    _rp_3[_lp] = *(uint32_t*)&_bf2;
+#endif  // CAKE_WGRAD_OUT
+                                }
+#if CAKE_WGRAD_OUT == 32
+                                {
+                                    float4 _v4 = make_float4(_rf_0[12 + 0], _rf_0[12 + 1], _rf_0[12 + 2], _rf_0[12 + 3]);
+                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 256 + 19 * ldc + tf_col_0)) + 0) = _v4;
+#else
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf_0[_lp*2 + 6], _rf_0[_lp*2+1 + 6]));
+                                    _rp_3[_lp + 1] = *(uint32_t*)&_bf2;
+#endif  // CAKE_WGRAD_OUT
+                                }
+#if CAKE_WGRAD_OUT == 32
+                                {
+                                    float4 _v4 = make_float4(_rf_0[16 + 0], _rf_0[16 + 1], _rf_0[16 + 2], _rf_0[16 + 3]);
+                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 256 + 20 * ldc + tf_col_0)) + 0) = _v4;
+#else
+                                reinterpret_cast<int2*>(C + (tl_out + epi_half * 128 + 256 + 17 * ldc + tf_col_0))[0] = reinterpret_cast<int2*>(_rp_3)[0];
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf_0[_lp*2 + 8], _rf_0[_lp*2+1 + 8]));
+                                    _rp_3[_lp] = *(uint32_t*)&_bf2;
+#endif  // CAKE_WGRAD_OUT
+                                }
+#if CAKE_WGRAD_OUT == 32
+                                {
+                                    float4 _v4 = make_float4(_rf_0[20 + 0], _rf_0[20 + 1], _rf_0[20 + 2], _rf_0[20 + 3]);
+                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 256 + 21 * ldc + tf_col_0)) + 0) = _v4;
+#else
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf_0[_lp*2 + 10], _rf_0[_lp*2+1 + 10]));
+                                    _rp_3[_lp + 1] = *(uint32_t*)&_bf2;
+#endif  // CAKE_WGRAD_OUT
+                                }
+#if CAKE_WGRAD_OUT == 32
+                                {
+                                    float4 _v4 = make_float4(_rf_0[24 + 0], _rf_0[24 + 1], _rf_0[24 + 2], _rf_0[24 + 3]);
+                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 256 + 22 * ldc + tf_col_0)) + 0) = _v4;
+#else
+                                reinterpret_cast<int2*>(C + (tl_out + epi_half * 128 + 256 + 18 * ldc + tf_col_0))[0] = reinterpret_cast<int2*>(_rp_3)[0];
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf_0[_lp*2 + 12], _rf_0[_lp*2+1 + 12]));
+                                    _rp_3[_lp] = *(uint32_t*)&_bf2;
+#endif  // CAKE_WGRAD_OUT
+                                }
+#if CAKE_WGRAD_OUT == 32
+                                {
+                                    float4 _v4 = make_float4(_rf_0[28 + 0], _rf_0[28 + 1], _rf_0[28 + 2], _rf_0[28 + 3]);
+                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 256 + 23 * ldc + tf_col_0)) + 0) = _v4;
+#else
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf_0[_lp*2 + 14], _rf_0[_lp*2+1 + 14]));
+                                    _rp_3[_lp + 1] = *(uint32_t*)&_bf2;
+#endif  // CAKE_WGRAD_OUT
+                                }
+#if CAKE_WGRAD_OUT == 32
+                                {
+                                    float4 _v4 = make_float4(_rf_0[32 + 0], _rf_0[32 + 1], _rf_0[32 + 2], _rf_0[32 + 3]);
+                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 256 + 24 * ldc + tf_col_0)) + 0) = _v4;
+#else
+                                reinterpret_cast<int2*>(C + (tl_out + epi_half * 128 + 256 + 19 * ldc + tf_col_0))[0] = reinterpret_cast<int2*>(_rp_3)[0];
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf_0[_lp*2 + 16], _rf_0[_lp*2+1 + 16]));
+                                    _rp_3[_lp] = *(uint32_t*)&_bf2;
+#endif  // CAKE_WGRAD_OUT
+                                }
+#if CAKE_WGRAD_OUT == 32
+                                {
+                                    float4 _v4 = make_float4(_rf_0[36 + 0], _rf_0[36 + 1], _rf_0[36 + 2], _rf_0[36 + 3]);
+                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 256 + 25 * ldc + tf_col_0)) + 0) = _v4;
+#else
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf_0[_lp*2 + 18], _rf_0[_lp*2+1 + 18]));
+                                    _rp_3[_lp + 1] = *(uint32_t*)&_bf2;
+#endif  // CAKE_WGRAD_OUT
+                                }
+#if CAKE_WGRAD_OUT == 32
+                                {
+                                    float4 _v4 = make_float4(_rf_0[40 + 0], _rf_0[40 + 1], _rf_0[40 + 2], _rf_0[40 + 3]);
+                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 256 + 26 * ldc + tf_col_0)) + 0) = _v4;
+#else
+                                reinterpret_cast<int2*>(C + (tl_out + epi_half * 128 + 256 + 20 * ldc + tf_col_0))[0] = reinterpret_cast<int2*>(_rp_3)[0];
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf_0[_lp*2 + 20], _rf_0[_lp*2+1 + 20]));
+                                    _rp_3[_lp] = *(uint32_t*)&_bf2;
+#endif  // CAKE_WGRAD_OUT
+                                }
+#if CAKE_WGRAD_OUT == 32
+                                {
+                                    float4 _v4 = make_float4(_rf_0[44 + 0], _rf_0[44 + 1], _rf_0[44 + 2], _rf_0[44 + 3]);
+                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 256 + 27 * ldc + tf_col_0)) + 0) = _v4;
+#else
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf_0[_lp*2 + 22], _rf_0[_lp*2+1 + 22]));
+                                    _rp_3[_lp + 1] = *(uint32_t*)&_bf2;
+#endif  // CAKE_WGRAD_OUT
+                                }
+#if CAKE_WGRAD_OUT == 32
+                                {
+                                    float4 _v4 = make_float4(_rf_0[48 + 0], _rf_0[48 + 1], _rf_0[48 + 2], _rf_0[48 + 3]);
+                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 256 + 28 * ldc + tf_col_0)) + 0) = _v4;
+#else
+                                reinterpret_cast<int2*>(C + (tl_out + epi_half * 128 + 256 + 21 * ldc + tf_col_0))[0] = reinterpret_cast<int2*>(_rp_3)[0];
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf_0[_lp*2 + 24], _rf_0[_lp*2+1 + 24]));
+                                    _rp_3[_lp] = *(uint32_t*)&_bf2;
+#endif  // CAKE_WGRAD_OUT
+                                }
+#if CAKE_WGRAD_OUT == 32
+                                {
+                                    float4 _v4 = make_float4(_rf_0[52 + 0], _rf_0[52 + 1], _rf_0[52 + 2], _rf_0[52 + 3]);
+                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 256 + 29 * ldc + tf_col_0)) + 0) = _v4;
+#else
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf_0[_lp*2 + 26], _rf_0[_lp*2+1 + 26]));
+                                    _rp_3[_lp + 1] = *(uint32_t*)&_bf2;
+#endif  // CAKE_WGRAD_OUT
+                                }
+#if CAKE_WGRAD_OUT == 32
+                                {
+                                    float4 _v4 = make_float4(_rf_0[56 + 0], _rf_0[56 + 1], _rf_0[56 + 2], _rf_0[56 + 3]);
+                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 256 + 30 * ldc + tf_col_0)) + 0) = _v4;
+#else
+                                reinterpret_cast<int2*>(C + (tl_out + epi_half * 128 + 256 + 22 * ldc + tf_col_0))[0] = reinterpret_cast<int2*>(_rp_3)[0];
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf_0[_lp*2 + 28], _rf_0[_lp*2+1 + 28]));
+                                    _rp_3[_lp] = *(uint32_t*)&_bf2;
+#endif  // CAKE_WGRAD_OUT
+                                }
+#if CAKE_WGRAD_OUT == 32
+                                {
+                                    float4 _v4 = make_float4(_rf_0[60 + 0], _rf_0[60 + 1], _rf_0[60 + 2], _rf_0[60 + 3]);
+                                    *reinterpret_cast<float4*>((C + (tl_out + epi_half * 128 + 256 + 31 * ldc + tf_col_0)) + 0) = _v4;
+#else
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf_0[_lp*2 + 30], _rf_0[_lp*2+1 + 30]));
+                                    _rp_3[_lp + 1] = *(uint32_t*)&_bf2;
+#endif  // CAKE_WGRAD_OUT
+                                }
+#if CAKE_WGRAD_OUT == 16
+                                reinterpret_cast<int2*>(C + (tl_out + epi_half * 128 + 256 + 23 * ldc + tf_col_0))[0] = reinterpret_cast<int2*>(_rp_3)[0];
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf_0[_lp*2 + 32], _rf_0[_lp*2+1 + 32]));
+                                    _rp_3[_lp] = *(uint32_t*)&_bf2;
+                                }
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf_0[_lp*2 + 34], _rf_0[_lp*2+1 + 34]));
+                                    _rp_3[_lp + 1] = *(uint32_t*)&_bf2;
+                                }
+                                reinterpret_cast<int2*>(C + (tl_out + epi_half * 128 + 256 + 24 * ldc + tf_col_0))[0] = reinterpret_cast<int2*>(_rp_3)[0];
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf_0[_lp*2 + 36], _rf_0[_lp*2+1 + 36]));
+                                    _rp_3[_lp] = *(uint32_t*)&_bf2;
+                                }
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf_0[_lp*2 + 38], _rf_0[_lp*2+1 + 38]));
+                                    _rp_3[_lp + 1] = *(uint32_t*)&_bf2;
+                                }
+                                reinterpret_cast<int2*>(C + (tl_out + epi_half * 128 + 256 + 25 * ldc + tf_col_0))[0] = reinterpret_cast<int2*>(_rp_3)[0];
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf_0[_lp*2 + 40], _rf_0[_lp*2+1 + 40]));
+                                    _rp_3[_lp] = *(uint32_t*)&_bf2;
+                                }
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf_0[_lp*2 + 42], _rf_0[_lp*2+1 + 42]));
+                                    _rp_3[_lp + 1] = *(uint32_t*)&_bf2;
+                                }
+                                reinterpret_cast<int2*>(C + (tl_out + epi_half * 128 + 256 + 26 * ldc + tf_col_0))[0] = reinterpret_cast<int2*>(_rp_3)[0];
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf_0[_lp*2 + 44], _rf_0[_lp*2+1 + 44]));
+                                    _rp_3[_lp] = *(uint32_t*)&_bf2;
+                                }
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf_0[_lp*2 + 46], _rf_0[_lp*2+1 + 46]));
+                                    _rp_3[_lp + 1] = *(uint32_t*)&_bf2;
+                                }
+                                reinterpret_cast<int2*>(C + (tl_out + epi_half * 128 + 256 + 27 * ldc + tf_col_0))[0] = reinterpret_cast<int2*>(_rp_3)[0];
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf_0[_lp*2 + 48], _rf_0[_lp*2+1 + 48]));
+                                    _rp_3[_lp] = *(uint32_t*)&_bf2;
+                                }
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf_0[_lp*2 + 50], _rf_0[_lp*2+1 + 50]));
+                                    _rp_3[_lp + 1] = *(uint32_t*)&_bf2;
+                                }
+                                reinterpret_cast<int2*>(C + (tl_out + epi_half * 128 + 256 + 28 * ldc + tf_col_0))[0] = reinterpret_cast<int2*>(_rp_3)[0];
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf_0[_lp*2 + 52], _rf_0[_lp*2+1 + 52]));
+                                    _rp_3[_lp] = *(uint32_t*)&_bf2;
+                                }
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf_0[_lp*2 + 54], _rf_0[_lp*2+1 + 54]));
+                                    _rp_3[_lp + 1] = *(uint32_t*)&_bf2;
+                                }
+                                reinterpret_cast<int2*>(C + (tl_out + epi_half * 128 + 256 + 29 * ldc + tf_col_0))[0] = reinterpret_cast<int2*>(_rp_3)[0];
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf_0[_lp*2 + 56], _rf_0[_lp*2+1 + 56]));
+                                    _rp_3[_lp] = *(uint32_t*)&_bf2;
+                                }
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf_0[_lp*2 + 58], _rf_0[_lp*2+1 + 58]));
+                                    _rp_3[_lp + 1] = *(uint32_t*)&_bf2;
+                                }
+                                reinterpret_cast<int2*>(C + (tl_out + epi_half * 128 + 256 + 30 * ldc + tf_col_0))[0] = reinterpret_cast<int2*>(_rp_3)[0];
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf_0[_lp*2 + 60], _rf_0[_lp*2+1 + 60]));
+                                    _rp_3[_lp] = *(uint32_t*)&_bf2;
+                                }
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __nv_bfloat162 _bf2 = __float22bfloat162_rn(make_float2(_rf_0[_lp*2 + 62], _rf_0[_lp*2+1 + 62]));
+                                    _rp_3[_lp + 1] = *(uint32_t*)&_bf2;
+                                }
+                                reinterpret_cast<int2*>(C + (tl_out + epi_half * 128 + 256 + 31 * ldc + tf_col_0))[0] = reinterpret_cast<int2*>(_rp_3)[0];
+#endif  // CAKE_WGRAD_OUT == 16
                             }
                         }
                     }

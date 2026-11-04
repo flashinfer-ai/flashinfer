@@ -8,11 +8,13 @@ import torch
 
 
 def _data_dtype(kind: str) -> torch.dtype:
+    if kind == "mxfp4":
+        return getattr(torch, "float4_e2m1fn_x2", torch.uint8)
     if kind in ("mxfp8_e4m3", "mxfp4_mxfp8"):
         return torch.float8_e4m3fn
     if kind == "mxfp8_e5m2":
         return torch.float8_e5m2
-    raise ValueError(f"unsupported MXFP8 activation kind {kind!r}")
+    raise ValueError(f"unsupported MX activation kind {kind!r}")
 
 
 def stage_mega_moe_inputs(
@@ -28,13 +30,14 @@ def stage_mega_moe_inputs(
     num_experts: int | None = None,
     workspace=None,
 ) -> int:
-    """bf16 ``hidden_states`` -> MXFP8 activation + E8M0 block scales.
+    """bf16 ``hidden_states`` -> MXFP4 or MXFP8 with per-32 E8M0 scales.
 
     Returns the staged token count. Unsupported layouts use Torch staging.
     """
     from ......kernel_src.sm107.next_cutedsl_megamoe import (
         Mxfp8BlockSize,
         ceil_div,
+        quantize_mxfp4_block32,
         quantize_mxfp8_block32,
     )
 
@@ -103,7 +106,11 @@ def stage_mega_moe_inputs(
         )
         return num_tokens
 
-    q, sf = quantize_mxfp8_block32(hidden_states.to(torch.float32), _data_dtype(kind))
+    q, sf = (
+        quantize_mxfp4_block32(hidden_states.to(torch.float32))
+        if kind == "mxfp4"
+        else quantize_mxfp8_block32(hidden_states.to(torch.float32), _data_dtype(kind))
+    )
 
     hidden_sf_cols = ceil_div(hidden, Mxfp8BlockSize)
     if x_sf.shape[1] < hidden_sf_cols:

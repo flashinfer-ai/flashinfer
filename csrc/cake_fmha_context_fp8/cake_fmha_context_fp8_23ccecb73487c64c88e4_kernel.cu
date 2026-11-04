@@ -76,6 +76,12 @@ static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 byte
 #define SMEM_WORK_ID_SLOT_OFF 86400
 #define SMEM_WORK_ID_SLOT_STAGE_BYTES 4
 #define SMEM_WORK_ID_SLOT_STRIDE 4
+#if __CUDA_ARCH__ == 1030
+#define SMEM_ENTRY_SCRATCH_OFF 86416
+#define SMEM_ENTRY_SCRATCH_STAGE_BYTES 32
+#define SMEM_ENTRY_SCRATCH_STRIDE 32
+#else
+#endif
 #define SMEM_TOTAL 86528
 #define BLOCK_M 128
 #define BLOCK_N 128
@@ -398,6 +404,8 @@ kernel_cake_fmha_context_fp8_23ccecb73487c64c88e4(const __grid_constant__ CUtens
     unsigned int* work_id_slot = reinterpret_cast<unsigned int*>(smem_raw + 86400);
     const int work_id_slot_addr = smem + 86400;
 #if __CUDA_ARCH__ == 1030
+    int* entry_scratch = reinterpret_cast<int*>(smem_raw + 86416);
+    const int entry_scratch_addr = smem + 86416;
     unsigned int pre_tiles = ((uint32_t)(num_m_blocks.divisor)) * (unsigned int)total_bh;
     if ((unsigned int)num_ctas <= pre_tiles) {
         if (warp == 13) {
@@ -422,6 +430,28 @@ kernel_cake_fmha_context_fp8_23ccecb73487c64c88e4(const __grid_constant__ CUtens
                 asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(seq_lens_kv + rq_b_idx)));
                 asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(cu_seq_lens_q + rq_b_idx)));
                 asm volatile("prefetch.global.L2 [%0];" :: "l"((uint64_t)(cu_seq_lens_q + (rq_b_idx + 1))));
+                int pre_row = rq_b_idx * (unsigned int)page_row_stride;
+                asm volatile("cp.async.ca.shared::cta.global [%0], [%1], 4;"
+                    :: "r"(entry_scratch_addr + 0), "l"(seq_lens_kv + rq_b_idx));
+                asm volatile("cp.async.ca.shared::cta.global [%0], [%1], 4;"
+                    :: "r"(entry_scratch_addr + 4), "l"(cu_seq_lens_q + rq_b_idx));
+                asm volatile("cp.async.ca.shared::cta.global [%0], [%1], 4;"
+                    :: "r"(entry_scratch_addr + 8), "l"(cu_seq_lens_q + (rq_b_idx + 1)));
+                asm volatile(
+                    "{\n\t"
+                    ".reg .pred p;\n\t"
+                    "setp.ne.b32 p, %0, 0;\n\t"
+                    "@p cp.async.ca.shared::cta.global [%1], [%2], 4;\n\t"
+                    "}"
+                    :: "r"((page_row_stride > 0) ? 1 : 0), "r"(entry_scratch_addr + 12), "l"(page_table_k + pre_row));
+                asm volatile(
+                    "{\n\t"
+                    ".reg .pred p;\n\t"
+                    "setp.ne.b32 p, %0, 0;\n\t"
+                    "@p cp.async.ca.shared::cta.global [%1], [%2], 4;\n\t"
+                    "}"
+                    :: "r"((page_row_stride > 0) ? 1 : 0), "r"(entry_scratch_addr + 16), "l"(page_table_v + pre_row));
+                asm volatile("cp.async.commit_group;");
             }
         }
     }
@@ -3459,6 +3489,10 @@ kernel_cake_fmha_context_fp8_23ccecb73487c64c88e4(const __grid_constant__ CUtens
                     if (po_stage == 6) { po_stage = 0; _phase_page_empty ^= 1; }
                 }
             }
+#if __CUDA_ARCH__ == 1030
+            asm volatile("cp.async.wait_group 0;");
+#else
+#endif
         }
     }
     // ---- Role: scheduler ----

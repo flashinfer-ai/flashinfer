@@ -47,8 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define THREADS 128
 #define LAUNCH_MIN_BLOCKS 10
 
 #include <math_constants.h>
@@ -91,7 +89,7 @@ kernel_cake_mhc_det_train_fwd_coef__qe_mb10__h5120(float* __restrict__ spart, fl
     #pragma unroll
     for (int j = 0; j < 2; j++) {
         tokr[j] = bid * 8 + (2 * warp_1 + j);
-        tcr[j] = (long long)(((tokr[j] < T) ? tokr[j] : T - 1));
+        tcr[j] = (long long)((tokr[j] < T) ? tokr[j] : T - 1);
         s_acc[j] = 0.0f;
     }
     float qe[2];

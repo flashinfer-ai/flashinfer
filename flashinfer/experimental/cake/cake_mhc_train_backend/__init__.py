@@ -841,13 +841,13 @@ def _route_plan(
     sinkhorn_iters: int = SINKHORN_ITERS,
 ) -> tuple[_Launch, ...]:
     """The launches of one route for ``rows`` tokens of hidden size ``hidden`` on
-    ``device_index`` along ``path`` (one of ``cake_jit.PDL_PATHS``: it fixes the
-    per-call PDL argument of the records whose binding takes one,
-    :func:`cake_jit.enable_pdl`).  A ``sinkhorn_iters`` other than the count of
-    record selects the run-time-count records; the count itself is a launch
-    value, so one plan serves every such count.  A route that exports no
-    run-time-count program raises ``NotImplementedError`` for such a count
-    (``cake_jit.selected_modules``)."""
+    ``device_index`` along ``path`` (one of ``cake_jit.PDL_PATHS``: with the
+    device's SM count it fixes the per-call PDL argument of the records whose
+    binding takes one, :func:`cake_jit.enable_pdl`).  A ``sinkhorn_iters`` other
+    than the count of record selects the run-time-count records; the count
+    itself is a launch value, so one plan serves every such count.  A route that
+    exports no run-time-count program raises ``NotImplementedError`` for such a
+    count (``cake_jit.selected_modules``)."""
 
     run_time = int(sinkhorn_iters) != SINKHORN_ITERS
     key = (arch, kind, rows, hidden, device_index, path, run_time)
@@ -877,7 +877,9 @@ def _route_plan(
                     template.append(grid_values[arg_key])
                     continue
                 if arg_kind == "launch":
-                    template.append(_loader.enable_pdl(name, rows, arch, path))
+                    template.append(
+                        _loader.enable_pdl(name, rows, arch, path, sm_count=sm_count)
+                    )
                     continue
                 logical_name = logical[arg_key]
                 if logical_name in fixed:
@@ -1917,7 +1919,8 @@ def _backward_finish(
     slab = _loader.slab_plan(rows, sm, arch, hidden=hidden)
     # The atomic fn split writes the transposed operand layout and, without
     # accumulate, zeroes dfn.  The column-slab pass (the dynr record over the
-    # one-size chunks or the lpt record over the host rule's two-size chunks)
+    # one-size chunks or the lpt record over the host rule's two-size chunks,
+    # or their slab-fastest _os copies where bwd_slab_order names "slab")
     # describes the ``[T, 4, H]`` tensors as ``[T, 4H]``, reads the first
     # ``T`` rows of the padded ``dz'`` record, draws its work units from the
     # workspace's self-resetting ticket word, adds into dfn and folds dscale /

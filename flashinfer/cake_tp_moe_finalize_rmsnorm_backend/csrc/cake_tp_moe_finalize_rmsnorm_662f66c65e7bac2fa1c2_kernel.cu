@@ -47,15 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define SMEM_WARP_TAB_OFF 0
-#define SMEM_WARP_TAB_STAGE_BYTES 1024
-#define SMEM_WARP_TAB_STRIDE 1024
-#define SMEM_STG_OFF 2048
-#define SMEM_STG_STAGE_BYTES 65536
-#define SMEM_STG_STRIDE 65536
-#define SMEM_TOTAL 67584
-#define THREADS 512
 #define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
@@ -104,7 +95,7 @@ kernel_cake_tp_moe_finalize_rmsnorm_662f66c65e7bac2fa1c2(__nv_bfloat16* __restri
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     float* warp_tab = reinterpret_cast<float*>(smem_raw + 0);
     const int warp_tab_addr = smem + 0;
     unsigned int* stg = reinterpret_cast<unsigned int*>(smem_raw + 2048);
@@ -187,7 +178,7 @@ kernel_cake_tp_moe_finalize_rmsnorm_662f66c65e7bac2fa1c2(__nv_bfloat16* __restri
             long long dst = push_gen_elems * (long long)gb + push_cta + rank64 * 4096;
             int idx8[8];
             {
-                const int4* _ivptr_1 = reinterpret_cast<const int4*>(idx + (tok * 8) + 0);
+                const int4* _ivptr_1 = reinterpret_cast<const int4*>(idx + tok * 8 + 0);
                 int4 _ivld_1;
                 _ivld_1 = *_ivptr_1;
                 idx8[0 + 0] = _ivld_1.x;
@@ -756,7 +747,7 @@ kernel_cake_tp_moe_finalize_rmsnorm_662f66c65e7bac2fa1c2(__nv_bfloat16* __restri
             if (weights_fp32 != 0) {
                 float _vec_load_1[4];
                 {
-                    float4 _v4 = *reinterpret_cast<const float4*>(reinterpret_cast<float*>(expert_weights + (tok_r * 8)) + 0);
+                    float4 _v4 = *reinterpret_cast<const float4*>(reinterpret_cast<float*>(expert_weights + tok_r * 8) + 0);
                     _vec_load_1[0 + 0] = _v4.x;
                     _vec_load_1[0 + 1] = _v4.y;
                     _vec_load_1[0 + 2] = _v4.z;
@@ -781,7 +772,7 @@ kernel_cake_tp_moe_finalize_rmsnorm_662f66c65e7bac2fa1c2(__nv_bfloat16* __restri
             } else {
                 unsigned int _vec_load_3[4];
                 {
-                    uint4 _uv4_53 = *reinterpret_cast<const uint4*>(expert_weights + (tok_r * 4) + 0);
+                    uint4 _uv4_53 = *reinterpret_cast<const uint4*>(expert_weights + tok_r * 4 + 0);
                     _vec_load_3[0 + 0] = _uv4_53.x;
                     _vec_load_3[0 + 1] = _uv4_53.y;
                     _vec_load_3[0 + 2] = _uv4_53.z;

@@ -47,34 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
-#define SMEM_STAGE_BUF_OFF 1024
-#define SMEM_STAGE_BUF_STAGE_BYTES 131072
-#define SMEM_STAGE_BUF_STRIDE 131072
-#define SMEM_ROW_FOLD_OFF 1024
-#define SMEM_ROW_FOLD_STAGE_BYTES 32768
-#define SMEM_ROW_FOLD_STRIDE 32768
-#define SMEM_RED_FOLD_OFF 33792
-#define SMEM_RED_FOLD_STAGE_BYTES 8192
-#define SMEM_RED_FOLD_STRIDE 8192
-#define SMEM_DOT_SLOTS_OFF 132096
-#define SMEM_DOT_SLOTS_STAGE_BYTES 128
-#define SMEM_DOT_SLOTS_STRIDE 128
-#define SMEM_PART_SM_OFF 132224
-#define SMEM_PART_SM_STAGE_BYTES 16
-#define SMEM_PART_SM_STRIDE 16
-#define SMEM_DESC_OFF 165120
-#define SMEM_DESC_STAGE_BYTES 72
-#define SMEM_DESC_STRIDE 72
-#define SMEM_RTAB_OFF 165248
-#define SMEM_RTAB_STAGE_BYTES 128
-#define SMEM_RTAB_STRIDE 128
-#define SMEM_FOLD_SM_OFF 132352
-#define SMEM_FOLD_SM_STAGE_BYTES 32768
-#define SMEM_FOLD_SM_STRIDE 32768
-#define SMEM_TOTAL 165376
-#define THREADS 512
 #define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
@@ -341,12 +313,13 @@ kernel_cake_rmsnorm_det_train_d41a514f5210e9adc39f(__nv_bfloat16* __restrict__ g
     int c0 = nd[0];
     int cb = nd[1];
     int ce = nd[2];
-    int ps[2];
+    int ps[3];
     ps[0] = nd[1];
     ps[1] = nd[2];
     int desc_n = 0;
     #pragma unroll
     for (int s = 0; s < 4; s++) {
+        ps[2] = 0;
         if (ps[0] < ps[1]) {
             int first_2 = ps[0];
             int rows_k = ((ps[1] - first_2) < (2) ? (ps[1] - first_2) : (2));
@@ -375,8 +348,8 @@ kernel_cake_rmsnorm_det_train_d41a514f5210e9adc39f(__nv_bfloat16* __restrict__ g
                 }
             }
             ps[0] = ps[0] + 2;
+            ps[2] = (int)(ps[0] >= ps[1]);
             if (ps[0] >= ps[1]) {
-                desc_n += 1;
                 if (tid == 0) {
                     int cid = (int)claim[0];
                     int nr_2 = rtab[31];
@@ -402,7 +375,7 @@ kernel_cake_rmsnorm_det_train_d41a514f5210e9adc39f(__nv_bfloat16* __restrict__ g
                         int _min_8 = ((rng[0] + stages_1 * 2) < (T) ? (rng[0] + stages_1 * 2) : (T));
                         rng[1] = _min_8;
                     }
-                    int entry_1_1 = desc_n % 6;
+                    int entry_1_1 = (desc_n + 1) % 6;
                     int word_2 = entry_1_1 * 3;
                     desc[word_2] = cid;
                     desc[word_2 + 1] = rng[0];
@@ -422,8 +395,8 @@ kernel_cake_rmsnorm_det_train_d41a514f5210e9adc39f(__nv_bfloat16* __restrict__ g
                         }
                     }
                 }
-                int entry_0 = desc_n % 6;
-                int _parity_dbar = (int)((unsigned int)desc_n / 6 % 2);
+                int entry_0 = (desc_n + 1) % 6;
+                int _parity_dbar = (int)((unsigned int)(desc_n + 1) / 6 % 2);
                 mbarrier_wait(dbar_addr + (entry_0) * 8, _parity_dbar);
                 int word_1_1 = entry_0 * 3;
                 int w0_2 = desc[word_1_1];
@@ -442,6 +415,8 @@ kernel_cake_rmsnorm_det_train_d41a514f5210e9adc39f(__nv_bfloat16* __restrict__ g
                 ps[1] = nd[2];
             }
         }
+        int desc_step = ps[2];
+        desc_n += desc_step;
     }
     float wf[16];
     #pragma unroll
@@ -562,6 +537,7 @@ kernel_cake_rmsnorm_det_train_d41a514f5210e9adc39f(__nv_bfloat16* __restrict__ g
                 dot_slots[par + warp] = dot;
             }
             __syncthreads();
+            ps[2] = 0;
             if (ps[0] < ps[1]) {
                 int first_3 = ps[0];
                 int rows_k_1 = ((ps[1] - first_3) < (2) ? (ps[1] - first_3) : (2));
@@ -590,8 +566,8 @@ kernel_cake_rmsnorm_det_train_d41a514f5210e9adc39f(__nv_bfloat16* __restrict__ g
                     }
                 }
                 ps[0] = ps[0] + 2;
+                ps[2] = (int)(ps[0] >= ps[1]);
                 if (ps[0] >= ps[1]) {
-                    desc_n += 1;
                     if (tid == 0) {
                         int cid_1 = (int)claim[0];
                         int nr_3 = rtab[31];
@@ -617,7 +593,7 @@ kernel_cake_rmsnorm_det_train_d41a514f5210e9adc39f(__nv_bfloat16* __restrict__ g
                             int _min_20 = ((rng[0] + stages_2 * 2) < (T) ? (rng[0] + stages_2 * 2) : (T));
                             rng[1] = _min_20;
                         }
-                        int entry_1_2 = desc_n % 6;
+                        int entry_1_2 = (desc_n + 1) % 6;
                         int word_2_1 = entry_1_2 * 3;
                         desc[word_2_1] = cid_1;
                         desc[word_2_1 + 1] = rng[0];
@@ -637,8 +613,8 @@ kernel_cake_rmsnorm_det_train_d41a514f5210e9adc39f(__nv_bfloat16* __restrict__ g
                             }
                         }
                     }
-                    int entry_0_2 = desc_n % 6;
-                    int _parity_dbar_2 = (int)((unsigned int)desc_n / 6 % 2);
+                    int entry_0_2 = (desc_n + 1) % 6;
+                    int _parity_dbar_2 = (int)((unsigned int)(desc_n + 1) / 6 % 2);
                     mbarrier_wait(dbar_addr + (entry_0_2) * 8, _parity_dbar_2);
                     int word_1_2 = entry_0_2 * 3;
                     int w0_2_1 = desc[word_1_2];
@@ -657,6 +633,8 @@ kernel_cake_rmsnorm_det_train_d41a514f5210e9adc39f(__nv_bfloat16* __restrict__ g
                     ps[1] = nd[2];
                 }
             }
+            int desc_step_1 = ps[2];
+            desc_n += desc_step_1;
             float tot = 0.0f;
             #pragma unroll
             for (int kk = 0; kk < 8; kk++) {

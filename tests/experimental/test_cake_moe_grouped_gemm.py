@@ -319,13 +319,19 @@ def _wgrad_plan(sizes, n, k, arch, sm_count, out_dtype=torch.bfloat16):
 def _split_tail_shape(device, sizes, ks):
     """``(N, K)`` over ``ks`` (and ``N`` up to 48 column blocks) whose weight-gradient plan
     on ``device`` takes the 512-wide k tile and splits its unordered tail
-    (``tail_splits > 1``); None when no candidate does."""
+    (``tail_splits > 1``), with the ``[E, N, K]`` output within the kernel's 32-bit
+    element addressing (``int32_elems``: which candidates split depends on the SM count);
+    None when no candidate does."""
     arch, sms = _arch(device), cb.sm_count(device)
+    span = int(HOST_PLAN_CONSTANTS["int32_elems"])
     for k in ks:
         for blocks in range(1, 49):
-            _stage, plan = _wgrad_plan(sizes, 256 * blocks, k, arch, sms)
+            n = 256 * blocks
+            if len(sizes) * n * k > span:
+                break
+            _stage, plan = _wgrad_plan(sizes, n, k, arch, sms)
             if plan["unordered_tail"] and plan["tail_splits"] > 1:
-                return 256 * blocks, k
+                return n, k
     return None
 
 

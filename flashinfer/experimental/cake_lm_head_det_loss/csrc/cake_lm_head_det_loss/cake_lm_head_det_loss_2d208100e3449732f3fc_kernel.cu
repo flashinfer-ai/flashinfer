@@ -450,8 +450,13 @@ kernel_cake_lm_head_det_loss_2d208100e3449732f3fc(const __grid_constant__ CUtens
                         mbarrier_wait(full_addr + (slot_1) * 8, _phase_full);
                         asm volatile("tcgen05.fence::after_thread_sync;");
                         int first = ((kb_1 == 0) ? 1 : 0);
+#if __CUDA_ARCH__ == 1070
+                        int _smem_desc_lo_0 = (((smem_a_addr) >> 4) & 0x7FFF) + (slot_1) * 2048;
+                        int _smem_desc_lo_1 = (((smem_b_addr) >> 4) & 0x7FFF) + (slot_1) * 2048;
+#else
                         int _smem_desc_lo_0 = (((smem_a_addr) >> 4) & 0x3FFF) + (slot_1) * 2048;
                         int _smem_desc_lo_1 = (((smem_b_addr) >> 4) & 0x3FFF) + (slot_1) * 2048;
+#endif
                         asm volatile(
                     "{\n\t"
                     ".reg .pred p0, p1;\n\t"

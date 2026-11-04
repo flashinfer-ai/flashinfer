@@ -40,7 +40,8 @@ live in the routed package; this module forwards every keyword.  Every switch
 is a keyword argument; no environment variable is read.
 
 Operands of one rank (its ``T_r`` local tokens in fragment order): ``q, k``
-BF16 ``[1, T_r, H_qk, 128]`` (L2-normalized by the caller), ``v`` BF16
+BF16 ``[1, T_r, H_qk, 128]`` (L2-normalized by the caller, or raw with
+``use_qk_l2norm_in_kernel=True`` on either route), ``v`` BF16
 ``[1, T_r, HV, 128]`` with ``HV % H_qk == 0`` (production ``(16, 48)``),
 ``g`` FP32 ``[1, T_r, HV]`` (the natural-log decay, preactivated, no clamp),
 ``beta`` FP32 ``[1, T_r, HV]`` (through the sigmoid).  Strided packed-QKV
@@ -72,6 +73,7 @@ with this module's ``ctx``.
 from __future__ import annotations
 
 import dataclasses
+import functools
 import warnings
 from typing import Any, Optional
 
@@ -85,12 +87,15 @@ _FEATURE = "Cake context-parallel packed GDN chunked training (SM100/SM103/SM107
 DEFAULT_SCALE = 128**-0.5
 
 
+# The routed modules are imported on first use and cached: a call does not repeat the import.
+@functools.cache
 def _pkg():
     from .experimental import cake_gdn_train_kcp  # noqa: PLC0415 - the backend package, imported on first use
 
     return cake_gdn_train_kcp
 
 
+@functools.cache
 def _det():
     from . import cake_gdn_det_train_kcp  # noqa: PLC0415 - the deterministic route, imported on first use
 
@@ -126,7 +131,8 @@ def _deterministic(deterministic: bool, entry: str) -> bool:
 
 def _options_for(det: bool, options: Any) -> Any:
     """``options`` for the routed package: an options instance of the other route becomes the mapping of its fields
-    (the routed package validates it); a mapping, ``None`` or the routed package's own instance pass through."""
+    (the routed package validates it); a mapping, ``None`` or the routed package's own instance pass through.  Both
+    routes take every field, ``use_qk_l2norm_in_kernel`` included."""
     if options is None or isinstance(options, dict):
         return options
     own = _det().OptionsDetKcp if det else _pkg().OptionsKcp
@@ -456,6 +462,17 @@ def chunk_gdn_kcp(
     halo rows go under the key ``"conv"``); a layer with separate Q / K / V convolutions uses one handle per
     convolution call, and this call shares one of them.  Needs ``boundary_mode="saved"`` and ``graph="off"``; implies ``save_transfer=False``.  A forward
     outside the backward that finds an entry raises (a handle reused across micro-steps).
+
+    ``q`` / ``k`` / ``v`` that are head views of one packed ``[..., T, (2 H_qk + HV) * 128]`` row (the convolution's
+    output) get the full backward speed as the views of
+    ``flashinfer.experimental.cake_gdn_train_kcp.packed_qkv_views_kcp`` or
+    ``flashinfer.cake_gdn_det_train_kcp.packed_qkv_views_det_kcp``: both helpers' split nodes pass a packed gradient
+    row on without a copy.  The non-deterministic package writes that row only for the outputs of either helper, the
+    deterministic one whenever the operands' pointers and strides are those of one row.  Plain ``split`` / ``view``
+    views of the row give the same results, but torch's split backward concatenates ``dq`` / ``dk`` / ``dv`` into a
+    new row: on the non-deterministic route, about 0.2 ms (6-7 %) more backward per call at ``(16, 48)`` and 32,768
+    tokens on B200 and GB300 and 0.17 ms (7-8 %) on R200, with the in-kernel norm off or on
+    (``flashinfer/experimental/cake_gdn_train_kcp/README.md``, "Packed Q/K/V").
 
     ``deterministic`` (default ``True``) selects the route (see the module docstring); the checkpoint recompute of a
     forward runs the forward's route as long as the torch deterministic-algorithms setting does not change in between.

@@ -73,7 +73,8 @@ and world size unless ``FLASHINFER_QKV_EXCHANGE_SHAPE_GATES`` overrides it --
 ``auto``, ``off`` or ``gate=value,...`` with ``0`` = never and ``all`` = every row
 for the small-row word gate; rank-uniform, checked collectively): a call with
 ``batch * s_local <= words_capacity_small_m`` rows publishes one readiness word
-per destination (``num_words = 1``; every call on SM90 with 8 ranks); a call
+per destination (``num_words = 1``; every call on SM90 with 8 ranks and on
+SM107); a call
 with ``batch * s_local >= reserved_sms_large_m`` rows runs the persistent
 producer grid over every SM (``reserved_sms = 0`` instead of
 ``plans.RESERVED_SMS``); a call with ``batch * s_local >= per_dest_large_m`` rows
@@ -88,8 +89,9 @@ no delivered Blackwell route ships it today, so the opt-in refuses at
 construction when a 256-column call can reach the gate (``max_tokens >= N``),
 naming the gate; SM90 builds no pair tile and refuses the gate).  SM100 / SM103
 ship ``4096`` / off / ``16384`` / off; SM90 ships ``4096`` / ``16384`` / off /
-off, with the word gate on every row (``all``) for an 8-rank group; the
-pair-tile gate ships nowhere.  The first three
+off, with the word gate on every row (``all``) for an 8-rank group; SM107 ships
+the word gate on every row (``all``) for its 2- and 4-rank groups and nothing
+else; the pair-tile gate ships nowhere.  The first three
 gates change the host plan only -- never the tile table or the stored bits; the
 pair-tile gate changes the producer program and the tile table (no lockstep
 pads) of the rows it selects; no gate changes the stored bits -- and

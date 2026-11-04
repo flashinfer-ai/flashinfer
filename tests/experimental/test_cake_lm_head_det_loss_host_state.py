@@ -565,3 +565,122 @@ def test_device_constant_cells_of_two_threads_first_calls_are_one(monkeypatch):
     assert cells["grad_scale"].tolist() == [1.0]
     assert cells["unit_scale"].tolist() == [1.0]
     assert cells["f32_dummy"].tolist() == [0.0] * 16
+
+
+def _require_temperature_forms():
+    _require_hidden_count()
+    name, _ = cake_backend.record_for(CUDA)
+    stages = cake_jit.registered_stages_with_temperature(name)
+    missing = [s for s in cake_backend.TEMPERATURE_STAGES if s not in stages]
+    if missing:
+        pytest.skip(f"the registered program has no temperature forms {missing}")
+
+
+def _logprob_temperature_step(inp, chunk):
+    X = inp.X.detach().requires_grad_(True)
+    W = inp.W.detach().requires_grad_(True)
+    logp = public.chunked_lm_head_det_logprob(
+        X, W, inp.labels, chunk_size=chunk, temperature=inp.temperature
+    )
+    logp.backward(inp.dlogp)
+    return dict(logp=logp.detach(), dX=X.grad, dW=W.grad)
+
+
+@pytest.mark.parametrize(
+    "T, chunk", [(4097, 4096), (1000, 256)]
+)  # the host count (two chunks), the hidden count (four chunks)
+def test_device_logprob_temperature_steps_hit_one_backward_binding(weight, T, chunk):
+    """Training steps of the log-probability entry with a per-token temperature reuse one forward and one backward
+    binding (the temperature path keys ``lse`` and ``dlogp`` by layout, as the path without one): no step after the
+    first misses, every step allocates the same number of blocks, and the bits are the uncached call's."""
+    _require_temperature_forms()
+    inp = make_inputs(T, seed=SEED + T, device=CUDA, W=weight, temperature="hetero")
+    cache = cake_backend.BINDING_CACHE
+    cache.clear()
+    out = _logprob_temperature_step(inp, chunk)  # binds (misses once per direction)
+    out = _logprob_temperature_step(inp, chunk)
+    torch.cuda.synchronize()
+    misses, allocations = cache.misses, []
+    for _ in range(6):
+        before = torch.cuda.memory_stats()["allocation.all.allocated"]
+        out = _logprob_temperature_step(inp, chunk)
+        torch.cuda.synchronize()
+        allocations.append(
+            torch.cuda.memory_stats()["allocation.all.allocated"] - before
+        )
+    assert cache.misses == misses, (cache.misses - misses, allocations)
+    assert len(set(allocations)) == 1, allocations
+    was = cache.enabled
+    cache.enabled = False
+    try:
+        fresh = _logprob_temperature_step(inp, chunk)
+    finally:
+        cache.enabled = was
+    for key, value in fresh.items():
+        assert torch.equal(_bits(out[key]), _bits(value)), key
+
+
+def test_device_temperature_concurrent_threads(weight, monkeypatch):
+    """Log-probability steps with a per-token temperature and ignored rows on two threads, each on its own stream
+    (four chunks: the hidden count with the temperature's device-count form and the dW side stream run).  The first
+    thread's call waits between its count's copy and its read until the second thread's whole step returned.  Both
+    give the single-thread bits (one shared count cell would hand the first call the second's count)."""
+    _require_temperature_forms()
+    C, T = 256, 1000
+    inputs = {
+        name: make_inputs(
+            T,
+            seed=seed,
+            device=CUDA,
+            W=weight,
+            ignore_frac=ignore,
+            temperature="hetero",
+        )
+        for name, seed, ignore in (
+            ("first", SEED + 15, 0.05),
+            ("second", SEED + 16, 0.40),
+        )
+    }
+    counts = {name: int(i.labels.ge(0).sum()) for name, i in inputs.items()}
+    assert counts["second"] < counts["first"]  # the other count never indexes past
+    ref = {
+        name: {
+            k: _bits(v).clone() for k, v in _logprob_temperature_step(inp, C).items()
+        }
+        for name, inp in inputs.items()
+    }
+    torch.cuda.synchronize()
+    begun, read = threading.Barrier(2), threading.Barrier(2)
+    finish = cake_backend._HiddenCount.finish
+    paused = []
+
+    def finish_after_the_other_step(self):
+        if threading.current_thread().name == "first" and not paused:
+            paused.append(True)
+            begun.wait(_TIMEOUT_S)
+            read.wait(_TIMEOUT_S)
+        return finish(self)
+
+    monkeypatch.setattr(
+        cake_backend._HiddenCount, "finish", finish_after_the_other_step
+    )
+    got = {}
+
+    def first():
+        got["first"] = _logprob_temperature_step(inputs["first"], C)
+
+    def second():
+        begun.wait(_TIMEOUT_S)
+        got["second"] = _logprob_temperature_step(inputs["second"], C)
+        torch.cuda.current_stream().synchronize()
+        read.wait(_TIMEOUT_S)
+
+    _run_threads(first, second)
+    assert paused == [True]
+    wrong = [
+        (name, key)
+        for name in ref
+        for key in ref[name]
+        if not torch.equal(_bits(got[name][key]), ref[name][key])
+    ]
+    assert not wrong, wrong

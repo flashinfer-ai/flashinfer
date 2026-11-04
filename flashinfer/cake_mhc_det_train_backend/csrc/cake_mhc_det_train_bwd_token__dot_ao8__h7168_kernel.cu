@@ -47,24 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define SMEM_DPRE_PART_OFF 1024
-#define SMEM_DPRE_PART_STAGE_BYTES 2048
-#define SMEM_DPRE_PART_STRIDE 2048
-#define SMEM_FOLD_OFF 3072
-#define SMEM_FOLD_STAGE_BYTES 4096
-#define SMEM_FOLD_STRIDE 4096
-#define SMEM_GSUM_OFF 7168
-#define SMEM_GSUM_STAGE_BYTES 128
-#define SMEM_GSUM_STRIDE 128
-#define SMEM_HIST_POOL_OFF 8192
-#define SMEM_HIST_POOL_STAGE_BYTES 128
-#define SMEM_HIST_POOL_STRIDE 128
-#define SMEM_RING_OFF 9216
-#define SMEM_RING_STAGE_BYTES 143360
-#define SMEM_RING_STRIDE 143360
-#define SMEM_TOTAL 152576
-#define THREADS 256
 #define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
@@ -153,7 +135,7 @@ kernel_cake_mhc_det_train_bwd_token__dot_ao8__h7168(__nv_bfloat16* __restrict__ 
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     float* dpre_part = reinterpret_cast<float*>(smem_raw + 1024);
     const int dpre_part_addr = smem + 1024;
     float* fold = reinterpret_cast<float*>(smem_raw + 3072);
@@ -165,8 +147,7 @@ kernel_cake_mhc_det_train_bwd_token__dot_ao8__h7168(__nv_bfloat16* __restrict__ 
     uint8_t* ring = reinterpret_cast<uint8_t*>(smem_raw + 9216);
     const int ring_addr = smem + 9216;
 
-    // Mbarrier init (1 pipeline groups, 0 ordered-sequence groups, 16 barriers)
-    // Mbarriers at smem_raw[0..128)
+    // Mbarrier init (16 barriers at smem_raw[0..128))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();

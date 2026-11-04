@@ -34,49 +34,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 40
-#define TMEM_ACCUM_OFFSET 0
-#define TMEM_SCALE_A_OFFSET 32
-#define TMEM_SCALE_B_OFFSET 36
-#define NUM_PIPE_STAGES 11
-#define NUM_ACCUM_PIPE_STAGES 2
-#define NUM_TASK_PIPE_STAGES 4
-#define SMEM_COMBINE_SMEM_OFF 0
-#define SMEM_COMBINE_SMEM_STAGE_BYTES 143360
-#define SMEM_COMBINE_SMEM_STRIDE 143360
-#define SMEM_SMEM_HIST_OFF 0
-#define SMEM_SMEM_HIST_STAGE_BYTES 1536
-#define SMEM_SMEM_HIST_STRIDE 1536
-#define SMEM_SMEM_DST_ROW_OFF 2048
-#define SMEM_SMEM_DST_ROW_STAGE_BYTES 16
-#define SMEM_SMEM_DST_ROW_STRIDE 16
-#define SMEM_SMEM_ERO_OFF 2064
-#define SMEM_SMEM_ERO_STAGE_BYTES 1536
-#define SMEM_SMEM_ERO_STRIDE 1536
-#define SMEM_SMEM_OUTPUT_OFF 22528
-#define SMEM_SMEM_OUTPUT_STAGE_BYTES 4096
-#define SMEM_SMEM_OUTPUT_STRIDE 4096
-#define SMEM_SMEM_A_OFF 26624
-#define SMEM_SMEM_A_STAGE_BYTES 1024
-#define SMEM_SMEM_A_STRIDE 1024
-#define SMEM_SMEM_B_OFF 37888
-#define SMEM_SMEM_B_STAGE_BYTES 16384
-#define SMEM_SMEM_B_STRIDE 16384
-#define SMEM_SMEM_SFA_OFF 218112
-#define SMEM_SMEM_SFA_STAGE_BYTES 512
-#define SMEM_SMEM_SFA_STRIDE 512
-#define SMEM_SMEM_SFB_OFF 223744
-#define SMEM_SMEM_SFB_STAGE_BYTES 512
-#define SMEM_SMEM_SFB_STRIDE 512
-#define SMEM_AMAX_REDUCTION_OFF 229376
-#define SMEM_AMAX_REDUCTION_STAGE_BYTES 256
-#define SMEM_AMAX_REDUCTION_STRIDE 256
-#define SMEM_TASK_INFOS_OFF 229632
-#define SMEM_TASK_INFOS_STAGE_BYTES 128
-#define SMEM_TASK_INFOS_STRIDE 128
-#define SMEM_TOTAL 230528
-#define THREADS 512
 #define NUM_CTAS 152
 #define LAUNCH_MIN_BLOCKS 1
 
@@ -317,12 +274,12 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t16_sm103a(int* __restrict__ 
 
     const int mbar_base = smem + 229760;
     #define full_addr (mbar_base + 0)
-    #define empty_addr (mbar_base + 88)
-    #define tmem_full_addr (mbar_base + 176)
-    #define tmem_empty_addr (mbar_base + 192)
-    #define task_full_addr (mbar_base + 208)
-    #define task_empty_addr (mbar_base + 240)
-    #define combine_barriers_addr (mbar_base + 272)
+    #define empty_addr (mbar_base + 96)
+    #define tmem_full_addr (mbar_base + 192)
+    #define tmem_empty_addr (mbar_base + 208)
+    #define task_full_addr (mbar_base + 224)
+    #define task_empty_addr (mbar_base + 256)
+    #define combine_barriers_addr (mbar_base + 288)
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
@@ -333,7 +290,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t16_sm103a(int* __restrict__ 
     int cta_rank;
     asm volatile("mov.b32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
 
-    // Kernel setup ops
+    // Prologue
     uint8_t* combine_smem = reinterpret_cast<uint8_t*>(smem_raw + 0);
     const int combine_smem_addr = smem + 0;
     int* smem_hist = reinterpret_cast<int*>(smem_raw + 0);
@@ -342,20 +299,22 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t16_sm103a(int* __restrict__ 
     const int smem_dst_row_addr = smem + 2048;
     int* smem_ero = reinterpret_cast<int*>(smem_raw + 2064);
     const int smem_ero_addr = smem + 2064;
-    uint8_t* smem_output = reinterpret_cast<uint8_t*>(smem_raw + 22528);
-    const int smem_output_addr = smem + 22528;
-    uint8_t* smem_a = reinterpret_cast<uint8_t*>(smem_raw + 26624);
-    const int smem_a_addr = smem + 26624;
-    uint8_t* smem_b = reinterpret_cast<uint8_t*>(smem_raw + 37888);
-    const int smem_b_addr = smem + 37888;
-    unsigned int* smem_sfa = reinterpret_cast<unsigned int*>(smem_raw + 218112);
-    const int smem_sfa_addr = smem + 218112;
-    unsigned int* smem_sfb = reinterpret_cast<unsigned int*>(smem_raw + 223744);
-    const int smem_sfb_addr = smem + 223744;
+    uint8_t* smem_output = reinterpret_cast<uint8_t*>(smem_raw + 4096);
+    const int smem_output_addr = smem + 4096;
+    uint8_t* smem_a = reinterpret_cast<uint8_t*>(smem_raw + 8192);
+    const int smem_a_addr = smem + 8192;
+    uint8_t* smem_b = reinterpret_cast<uint8_t*>(smem_raw + 20480);
+    const int smem_b_addr = smem + 20480;
+    unsigned int* smem_sfa = reinterpret_cast<unsigned int*>(smem_raw + 217088);
+    const int smem_sfa_addr = smem + 217088;
+    unsigned int* smem_sfb = reinterpret_cast<unsigned int*>(smem_raw + 223232);
+    const int smem_sfb_addr = smem + 223232;
     float* amax_reduction = reinterpret_cast<float*>(smem_raw + 229376);
     const int amax_reduction_addr = smem + 229376;
     unsigned int* task_infos = reinterpret_cast<unsigned int*>(smem_raw + 229632);
     const int task_infos_addr = smem + 229632;
+
+    // Kernel setup ops
     asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     if (warp == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&A))) : "memory"); }
     if (warp == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&B1))) : "memory"); }
@@ -373,14 +332,13 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t16_sm103a(int* __restrict__ 
     asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
     asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
 
-    // Mbarrier init (7 pipeline groups, 0 ordered-sequence groups, 82 barriers)
-    // Mbarriers at smem_raw[229760..230416)
+    // Mbarrier init (84 barriers at smem_raw[229760..230432))
 
     if (warp == 2) {
         uint32_t leader = elect_sync();
         if (leader) {
             // --- pipeline 'pipe' ---
-            // full: 11 barriers, init_count=4
+            // full: 12 barriers, init_count=4
             mbarrier_init(smem + 229760, 4);
             mbarrier_init(smem + 229768, 4);
             mbarrier_init(smem + 229776, 4);
@@ -392,8 +350,8 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t16_sm103a(int* __restrict__ 
             mbarrier_init(smem + 229824, 4);
             mbarrier_init(smem + 229832, 4);
             mbarrier_init(smem + 229840, 4);
-            // empty: 11 barriers, init_count=1
-            mbarrier_init(smem + 229848, 1);
+            mbarrier_init(smem + 229848, 4);
+            // empty: 12 barriers, init_count=1
             mbarrier_init(smem + 229856, 1);
             mbarrier_init(smem + 229864, 1);
             mbarrier_init(smem + 229872, 1);
@@ -404,27 +362,27 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t16_sm103a(int* __restrict__ 
             mbarrier_init(smem + 229912, 1);
             mbarrier_init(smem + 229920, 1);
             mbarrier_init(smem + 229928, 1);
-            // --- pipeline 'accum_pipe' ---
-            // tmem_full: 2 barriers, init_count=1
             mbarrier_init(smem + 229936, 1);
             mbarrier_init(smem + 229944, 1);
+            // --- pipeline 'accum_pipe' ---
+            // tmem_full: 2 barriers, init_count=1
+            mbarrier_init(smem + 229952, 1);
+            mbarrier_init(smem + 229960, 1);
             // tmem_empty: 2 barriers, init_count=512
-            mbarrier_init(smem + 229952, 512);
-            mbarrier_init(smem + 229960, 512);
+            mbarrier_init(smem + 229968, 512);
+            mbarrier_init(smem + 229976, 512);
             // --- pipeline 'task_pipe' ---
             // task_full: 4 barriers, init_count=1
-            mbarrier_init(smem + 229968, 1);
-            mbarrier_init(smem + 229976, 1);
             mbarrier_init(smem + 229984, 1);
             mbarrier_init(smem + 229992, 1);
+            mbarrier_init(smem + 230000, 1);
+            mbarrier_init(smem + 230008, 1);
             // task_empty: 4 barriers, init_count=512
-            mbarrier_init(smem + 230000, 512);
-            mbarrier_init(smem + 230008, 512);
             mbarrier_init(smem + 230016, 512);
             mbarrier_init(smem + 230024, 512);
+            mbarrier_init(smem + 230032, 512);
+            mbarrier_init(smem + 230040, 512);
             // combine_barriers: 48 barriers, init_count=1
-            mbarrier_init(smem + 230032, 1);
-            mbarrier_init(smem + 230040, 1);
             mbarrier_init(smem + 230048, 1);
             mbarrier_init(smem + 230056, 1);
             mbarrier_init(smem + 230064, 1);
@@ -471,6 +429,8 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t16_sm103a(int* __restrict__ 
             mbarrier_init(smem + 230392, 1);
             mbarrier_init(smem + 230400, 1);
             mbarrier_init(smem + 230408, 1);
+            mbarrier_init(smem + 230416, 1);
+            mbarrier_init(smem + 230424, 1);
             asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         }
     }
@@ -478,9 +438,9 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t16_sm103a(int* __restrict__ 
     __syncwarp();
 
     // TMEM alloc (64 columns, 40 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 230416);
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 230432);
     if (warp == 3) {
-        int _tmem_hold = smem + 230416;
+        int _tmem_hold = smem + 230432;
         asm volatile("tcgen05.alloc.cta_group::2.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(64) : "memory");
         __syncwarp();
     }
@@ -490,12 +450,10 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t16_sm103a(int* __restrict__ 
     asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
-
-    // Kernel post-init ops
-    const int tmem_accum = taddr;
-    const int tmem_scale_a = taddr + 32;
-    const int tmem_scale_b = taddr + 36;
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_accum = taddr;
+    const unsigned int tmem_scale_a = taddr + 32;
+    const unsigned int tmem_scale_b = taddr + 36;
 
     // ---- Role: dispatch ----
     if (warp <= 3) {
@@ -965,7 +923,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t16_sm103a(int* __restrict__ 
                         }
                         __syncwarp();
                         a_stage += 1;
-                        if (a_stage == 11) { a_stage = 0; _phase_empty ^= 1; }
+                        if (a_stage == 12) { a_stage = 0; _phase_empty ^= 1; }
                     }
                 }
                 group_ready = 0;
@@ -1066,7 +1024,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t16_sm103a(int* __restrict__ 
                         }
                         __syncwarp();
                         b_stage += 1;
-                        if (b_stage == 11) { b_stage = 0; _phase_empty_1 ^= 1; }
+                        if (b_stage == 12) { b_stage = 0; _phase_empty_1 ^= 1; }
                     }
                 }
             }
@@ -1178,7 +1136,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t16_sm103a(int* __restrict__ 
                             }
                             __syncwarp();
                             mma_stage += 1;
-                            if (mma_stage == 11) { mma_stage = 0; _phase_full ^= 1; }
+                            if (mma_stage == 12) { mma_stage = 0; _phase_full ^= 1; }
                         }
                         completed_tasks += 1;
                         accum_cursor += 1;
@@ -1318,7 +1276,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t16_sm103a(int* __restrict__ 
                     num_blocks += (counts[11] + 16 - 1) / 16;
                 }
                 unsigned int total;
-                asm volatile("redux.sync.add.u32 %0, %1, 0xffffffff;" : "=r"(total) : "r"(num_blocks));
+                asm volatile("redux.sync.add.u32 %0, %1, 0xFFFFFFFF;" : "=r"(total) : "r"(num_blocks));
                 unsigned int waves = (total * 3 + (unsigned int)NUM_CTAS / 2 - 1) / ((unsigned int)NUM_CTAS / 2);
                 unsigned int interleave_waves = 2;
                 state[0] = total;
