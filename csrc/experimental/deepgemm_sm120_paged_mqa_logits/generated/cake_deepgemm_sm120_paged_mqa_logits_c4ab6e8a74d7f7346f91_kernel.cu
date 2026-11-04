@@ -49,29 +49,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define NUM_Q_PIPE_STAGES 1
-#define NUM_KV_PIPE_STAGES 4
-#define SMEM_SMEM_Q_OFF 1024
-#define SMEM_SMEM_Q_STAGE_BYTES 20480
-#define SMEM_SMEM_Q_STRIDE 20480
-#define SMEM_SMEM_W_OFF 21504
-#define SMEM_SMEM_W_STAGE_BYTES 640
-#define SMEM_SMEM_W_STRIDE 1024
-#define SMEM_SMEM_KV_G0_OFF 22528
-#define SMEM_SMEM_KV_G0_STAGE_BYTES 8192
-#define SMEM_SMEM_KV_G0_STRIDE 8192
-#define SMEM_SMEM_KV_G1_OFF 55296
-#define SMEM_SMEM_KV_G1_STAGE_BYTES 8192
-#define SMEM_SMEM_KV_G1_STRIDE 8192
-#define SMEM_SMEM_SC_G0_OFF 88064
-#define SMEM_SMEM_SC_G0_STAGE_BYTES 256
-#define SMEM_SMEM_SC_G0_STRIDE 1024
-#define SMEM_SMEM_SC_G1_OFF 92160
-#define SMEM_SMEM_SC_G1_STAGE_BYTES 256
-#define SMEM_SMEM_SC_G1_STRIDE 1024
-#define SMEM_TOTAL 96256
-#define THREADS 384
 #define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
@@ -169,7 +146,7 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_c4ab6e8a74d7f7346f91(const __grid_co
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     uint8_t* smem_q = reinterpret_cast<uint8_t*>(smem_raw + 1024);
     const int smem_q_addr = smem + 1024;
     float* smem_w = reinterpret_cast<float*>(smem_raw + 21504);
@@ -183,8 +160,7 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_c4ab6e8a74d7f7346f91(const __grid_co
     float* smem_sc_g1 = reinterpret_cast<float*>(smem_raw + 92160);
     const int smem_sc_g1_addr = smem + 92160;
 
-    // Mbarrier init (6 pipeline groups, 0 ordered-sequence groups, 18 barriers)
-    // Mbarriers at smem_raw[0..144)
+    // Mbarrier init (18 barriers at smem_raw[0..144))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
