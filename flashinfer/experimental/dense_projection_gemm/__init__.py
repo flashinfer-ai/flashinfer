@@ -15,10 +15,26 @@ limitations under the License.
 """
 
 # Experimental Cake backend: the GLM-5.2 dense projection GEMMs for training
-# (BF16 operands, FP32 accumulation, BF16 or FP32 output, strided views, ragged
-# token counts, batched head projections) and the FP32 router-gate GEMM through
-# split-BF16x3 tensor-core emulation, on SM100 / SM103 / SM107
-# (flashinfer-ai/flashinfer#5677).  Host planning, argument-plan binding, the
-# prepared allocation-free launches, the eager entry points, JIT registration
-# and the generated sources live in this package; there is no core entry point
-# yet (importing this package is the explicit opt-in).
+# and the FP32 router-gate GEMM on SM100 / SM103 / SM107 with an explicit
+# numerical mode (flashinfer-ai/flashinfer#5677).  Every entry point of
+# ``cake_backend`` takes the keyword-only ``deterministic: bool = True``: the
+# default calls the deterministic package
+# (``flashinfer.experimental.dense_projection_det_gemm``: the same programs and
+# the same bits as before this package existed); ``deterministic=False`` selects
+# the programs of this package, which add split-K partials in the order they
+# finish.  Importing this package imports nothing: ``cake_backend``,
+# ``cake_jit`` and ``cake_build`` load on first attribute access.
+
+__all__ = ["cake_backend", "cake_build", "cake_jit"]
+
+
+def __getattr__(name: str):
+    if name in __all__:
+        import importlib
+
+        return importlib.import_module(f"{__name__}.{name}")
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def __dir__() -> list[str]:
+    return sorted({*globals(), *__all__})

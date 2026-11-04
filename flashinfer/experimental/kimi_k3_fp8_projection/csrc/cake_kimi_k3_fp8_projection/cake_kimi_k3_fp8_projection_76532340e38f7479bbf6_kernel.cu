@@ -48,7 +48,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 }
 
 #define CAKE_INF CUDART_INF_F
-#define NUM_MAIN_STAGES 1
 #define THREADS 128
 #define QUANT_UNITS 2
 #define SF_TILE_BYTES 512
@@ -167,14 +166,14 @@ kernel_cake_kimi_k3_fp8_projection_76532340e38f7479bbf6(__nv_bfloat16* __restric
         for (int _lr = 1; _lr < 8; _lr++) {
             absmax = max_noftz(absmax, mags[_lr]);
         }
-        float o1 = __shfl_xor_sync(0xFFFFFFFF, absmax, 1);
-        absmax = fmaxf(absmax, o1);
-        float o2 = __shfl_xor_sync(0xFFFFFFFF, absmax, 2);
-        absmax = fmaxf(absmax, o2);
-        float o4 = __shfl_xor_sync(0xFFFFFFFF, absmax, 4);
-        absmax = fmaxf(absmax, o4);
-        float o8 = __shfl_xor_sync(0xFFFFFFFF, absmax, 8);
-        absmax = fmaxf(absmax, o8);
+        float other_0 = __shfl_xor_sync(0xFFFFFFFF, absmax, 1);
+        absmax = fmaxf(absmax, other_0);
+        float other_1 = __shfl_xor_sync(0xFFFFFFFF, absmax, 2);
+        absmax = fmaxf(absmax, other_1);
+        float other_2 = __shfl_xor_sync(0xFFFFFFFF, absmax, 4);
+        absmax = fmaxf(absmax, other_2);
+        float other_3 = __shfl_xor_sync(0xFFFFFFFF, absmax, 8);
+        absmax = fmaxf(absmax, other_3);
         absmax = fmaxf(absmax, 1e-04f);
         float scale = absmax / 448.0f;
         unsigned int scale_bits = __as_u32(scale);

@@ -13,12 +13,12 @@
 # limitations under the License.
 """Generated programs of the BF16 paged decode of the cake_fmha module (head dim 128,
 16-token HND pages, eight query heads per KV head): the stream-K 128-request program,
-the four-request program with 4-CTA clusters and the 256-request attention-sink program,
-each with host scales and with FP32 device scales, shipped for sm_100a and sm_103a. The
-host module ``flashinfer.cake_fmha`` selects the program from the batch, the head
-counts, the page size, the sink, the scale form and the maximum sequence length of a
-launch, computes the grid and launches it; other shapes keep the module's other decode
-routes.
+the four-request program with 4-CTA clusters, the 256-request attention-sink program and
+the length-aware twin of the stream-K program (a caller's opt-in), each with host scales
+and with FP32 device scales, shipped for sm_100a and sm_103a. The host module
+``flashinfer.cake_fmha`` selects the program from the batch, the head counts, the page
+size, the sink, the scale form and the maximum sequence length of a launch, computes the
+grid and launches it; other shapes keep the module's other decode routes.
 
 Generated file: every value below is derived from the exported sources and checked
 against them; do not edit.
@@ -30,12 +30,12 @@ from . import cake_program
 from .core import JitSpec
 
 DEC_B128 = cake_program.CakeProgram(
-    name="cake_fmha_decode_bf16_4a8ccd779ab91c5d2cb5",
+    name="cake_fmha_decode_bf16_bc385ebf14604aab347e",
     operator_dir="cake_fmha_decode_bf16",
-    kernel="kernel_cake_fmha_decode_bf16_4a8ccd779ab91c5d2cb5",
+    kernel="kernel_cake_fmha_decode_bf16_bc385ebf14604aab347e",
     sources=(
-        "cake_fmha_decode_bf16_4a8ccd779ab91c5d2cb5_kernel.cu",
-        "cake_fmha_decode_bf16_4a8ccd779ab91c5d2cb5_binding.cu",
+        "cake_fmha_decode_bf16_bc385ebf14604aab347e_kernel.cu",
+        "cake_fmha_decode_bf16_bc385ebf14604aab347e_binding.cu",
     ),
     targets=("sm_100a", "sm_103a"),
     compile_options=(
@@ -89,12 +89,12 @@ DEC_B128 = cake_program.CakeProgram(
 )
 
 DEC_B128_DS = cake_program.CakeProgram(
-    name="cake_fmha_decode_bf16_4771b35b3b41de52fc15",
+    name="cake_fmha_decode_bf16_0e44456c4d63adb24711",
     operator_dir="cake_fmha_decode_bf16",
-    kernel="kernel_cake_fmha_decode_bf16_4771b35b3b41de52fc15",
+    kernel="kernel_cake_fmha_decode_bf16_0e44456c4d63adb24711",
     sources=(
-        "cake_fmha_decode_bf16_4771b35b3b41de52fc15_kernel.cu",
-        "cake_fmha_decode_bf16_4771b35b3b41de52fc15_binding.cu",
+        "cake_fmha_decode_bf16_0e44456c4d63adb24711_kernel.cu",
+        "cake_fmha_decode_bf16_0e44456c4d63adb24711_binding.cu",
     ),
     targets=("sm_100a", "sm_103a"),
     compile_options=(
@@ -367,6 +367,124 @@ DEC_SINK_DS = cake_program.CakeProgram(
     needs_device_linking=False,
 )
 
+DEC_B128_LA = cake_program.CakeProgram(
+    name="cake_fmha_decode_bf16_c64d254f01952ec24d95",
+    operator_dir="cake_fmha_decode_bf16",
+    kernel="kernel_cake_fmha_decode_bf16_c64d254f01952ec24d95",
+    sources=(
+        "cake_fmha_decode_bf16_c64d254f01952ec24d95_kernel.cu",
+        "cake_fmha_decode_bf16_c64d254f01952ec24d95_binding.cu",
+    ),
+    targets=("sm_100a", "sm_103a"),
+    compile_options=(
+        ("sm_100a", ("--use_fast_math", "--fmad=true")),
+        ("sm_103a", ("--use_fast_math", "--fmad=true")),
+    ),
+    args=(
+        "Qt",
+        "K",
+        "V",
+        "O_ptr",
+        "LSE_ptr",
+        "page_table",
+        "causal_seqlens_kv_global",
+        "scale_log2_ptr",
+        "bmm2_ptr",
+        "sinks_ptr",
+        "split_counter",
+        "split_ws",
+        "max_pages_per_seq",
+        "max_local_seq_len",
+        "softmax_scale_log2",
+        "window_left",
+        "num_q_heads",
+        "num_kv_heads",
+        "batch_size",
+        "grid_x",
+        "grid_y",
+        "grid_z",
+    ),
+    tensors=(
+        "Qt",
+        "K",
+        "V",
+        "O_ptr",
+        "LSE_ptr",
+        "page_table",
+        "causal_seqlens_kv_global",
+        "scale_log2_ptr",
+        "bmm2_ptr",
+        "sinks_ptr",
+        "split_counter",
+        "split_ws",
+    ),
+    block=(512, 1, 1),
+    cluster=(1, 1, 1),
+    dynamic_smem_bytes=210944,
+    use_pdl=False,
+    cooperative=False,
+    needs_device_linking=False,
+)
+
+DEC_B128_LA_DS = cake_program.CakeProgram(
+    name="cake_fmha_decode_bf16_fdf3768a052c6ca9cd83",
+    operator_dir="cake_fmha_decode_bf16",
+    kernel="kernel_cake_fmha_decode_bf16_fdf3768a052c6ca9cd83",
+    sources=(
+        "cake_fmha_decode_bf16_fdf3768a052c6ca9cd83_kernel.cu",
+        "cake_fmha_decode_bf16_fdf3768a052c6ca9cd83_binding.cu",
+    ),
+    targets=("sm_100a", "sm_103a"),
+    compile_options=(
+        ("sm_100a", ("--use_fast_math", "--fmad=true")),
+        ("sm_103a", ("--use_fast_math", "--fmad=true")),
+    ),
+    args=(
+        "Qt",
+        "K",
+        "V",
+        "O_ptr",
+        "LSE_ptr",
+        "page_table",
+        "causal_seqlens_kv_global",
+        "scale_log2_ptr",
+        "bmm2_ptr",
+        "sinks_ptr",
+        "split_counter",
+        "split_ws",
+        "max_pages_per_seq",
+        "max_local_seq_len",
+        "softmax_scale_log2",
+        "window_left",
+        "num_q_heads",
+        "num_kv_heads",
+        "batch_size",
+        "grid_x",
+        "grid_y",
+        "grid_z",
+    ),
+    tensors=(
+        "Qt",
+        "K",
+        "V",
+        "O_ptr",
+        "LSE_ptr",
+        "page_table",
+        "causal_seqlens_kv_global",
+        "scale_log2_ptr",
+        "bmm2_ptr",
+        "sinks_ptr",
+        "split_counter",
+        "split_ws",
+    ),
+    block=(512, 1, 1),
+    cluster=(1, 1, 1),
+    dynamic_smem_bytes=210944,
+    use_pdl=False,
+    cooperative=False,
+    needs_device_linking=False,
+)
+
 PROGRAMS: tuple[cake_program.CakeProgram, ...] = (
     DEC_B128,
     DEC_B128_DS,
@@ -374,6 +492,8 @@ PROGRAMS: tuple[cake_program.CakeProgram, ...] = (
     DEC_B4C4_DS,
     DEC_SINK,
     DEC_SINK_DS,
+    DEC_B128_LA,
+    DEC_B128_LA_DS,
 )
 
 
@@ -389,6 +509,8 @@ __all__ = [
     "DEC_B4C4_DS",
     "DEC_SINK",
     "DEC_SINK_DS",
+    "DEC_B128_LA",
+    "DEC_B128_LA_DS",
     "PROGRAMS",
     "aot_specs",
 ]

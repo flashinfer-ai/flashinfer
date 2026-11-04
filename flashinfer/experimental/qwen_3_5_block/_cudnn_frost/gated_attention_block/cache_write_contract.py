@@ -21,6 +21,17 @@ DEFAULT_POOL = 4
 """Tokens per compressed block -- the QSA compress ratio (``indexer_compress_ratio``; ``QsaSpec.block_size``'s pinned value).  The ONE
 definition: ``kernels/qsa_compress.py`` and ``kernels/qsa_prepare.py`` import it (DSL-free here, so a declaration can read it)."""
 
+INDEX_COMPRESS_ROUNDINGS = ("single", "hf")
+INDEX_COMPRESS_ROUNDING_DEFAULT = "single"
+"""The rounding points of the indexer's two compress chains -- the pool-4 compressed KEY and the pool-1 indexer QUERY, at every
+writer (the prefill form ``frost_qsa_compress``, the chunk / decode step form ``frost_qsa_compress_step``, the fused prepare launch's
+query and compress arms).  ``"single"`` (the default, the reference): fp32 through the mean, the RMSNorm and the RoPE, one rounding
+at the store (under the e4m3 cache the e4m3 cast of that bf16 row).  ``"hf"``: the HF / vLLM-prepare dtype flow -- the pooled key
+rounded to the io dtype before its norm, the normed row (query and key, all dims) rounded before its rotation, the rotation's three
+operations each rounded, the store exact -- the same ROUNDING POINTS as a vLLM-written cache row, not its bits (the fp32 reduction
+orders differ).  The attention's own Q / K norm + RoPE is not governed by it.  Defined DSL-free here (the block's declaration
+validates against the tuple; Rule 7); the kernels import it."""
+
 
 def check_pool(pool: torch.Tensor, name: str, *, h: int, page_size: int, d: int, dtype, device=None) -> None:
     """One pool against the kernel's contract, typed and naming the operand (no device read): a 4-D ``[P, H, page_size, D]``
@@ -77,7 +88,13 @@ class QsaPrepareIndexArms(NamedTuple):
     compressed-key cache through their block tables with the positions from ``kv_lens`` (needs ``compress``);
     ``ring_slots`` -- the ring WRITE rows from the stack's own slot mapping (needs ``paged``; the slots share the
     artifact's slot dtype); ``rope_table`` -- the Q / K and indexer-query rotations read from the position-indexed
-    ``cos_pos`` / ``sin_pos`` at ``pos0 + j`` instead of per-token rows (needs ``compress`` and a rotation)."""
+    ``cos_pos`` / ``sin_pos`` at ``pos0 + j`` instead of per-token rows (needs ``compress`` and a rotation).
+
+    Appended (2026-10-29): ``rounding`` -- one of :data:`INDEX_COMPRESS_ROUNDINGS`, the rounding points of the query arm and the
+    compress arm (``"single"`` = today's fp32 chain with one rounding at the store; ``"hf"`` = the HF / vLLM-prepare dtype flow,
+    the docstring of the constant).  A compile key like every other field (it rides into the prepare artifact's key through the
+    record's tuple); the unfused twins take the same value through ``compile_qsa_compress(rounding=)`` /
+    ``compile_qsa_compress_step(rounding=)`` and stay bitwise the fused launch under either."""
 
     heads: int
     head_dim: int
@@ -89,6 +106,7 @@ class QsaPrepareIndexArms(NamedTuple):
     paged: bool = False
     ring_slots: bool = False
     rope_table: bool = False
+    rounding: str = INDEX_COMPRESS_ROUNDING_DEFAULT
 
     @property
     def raw(self) -> bool:

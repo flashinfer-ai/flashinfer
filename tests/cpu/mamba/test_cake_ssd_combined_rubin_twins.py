@@ -442,7 +442,10 @@ def test_source_unit_cluster_variant_matches_its_definition():
         ("bf16", 8, 384, 128, "triple", "exactpre_bf16_varlen"),
         ("f32", 8, 384, 128, "triple", "exactpre_f32_varlen"),
         # one-launch calls (seq_idx triple): tablefirst below 128 CTAs,
-        # tableroles from it on
+        # tableroles from it on (the single-sequence calls among them run the
+        # fused batched program with the seq_idx check CTA,
+        # :func:`single_sequence_batched_variant`; their twin is judged with
+        # that rule off)
         ("bf16", 1, 128, 8, "triple", "exactone_bf16_varlen_tablefirst"),
         ("bf16", 1, 127, 8, "triple", "exactone_bf16_varlen_tablefirst"),
         ("bf16", 1, 128, 32, "triple", "exactone_bf16_varlen_tablefirst"),
@@ -475,6 +478,9 @@ def test_source_rubin_varlen_calls_take_the_twin_by_the_rule(
             **kwargs,
         )
 
+    if num_seqs == 1 and form == "triple":
+        assert run() == f"exactfused_{state}_batched_chk"
+        monkeypatch.setattr(module, "single_sequence_batched_variant", lambda **_: None)
     monkeypatch.setattr(module, "_UNIT_CLUSTER_RULES", {})
     try:
         off = run()

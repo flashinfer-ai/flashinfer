@@ -56,8 +56,10 @@ from ._inputs_helper import CuteDslMoEInputsHelper
 from .blackwell.moe_w4a16 import launch_w4a16_moe
 from .blackwell.moe_w4a16_kernel import Sm100W4A16GroupedGemmKernel
 from .moe_utils import (
+    W4A16_CUTE_DSL_MOE_ACTIVATION_TYPES,
     normalize_cute_dsl_moe_activation_type,
     rubin_moe_cluster_covers_one_tile,
+    validate_cute_dsl_moe_clamped_relu2_config,
     validate_cute_dsl_moe_situ_config,
 )
 
@@ -490,6 +492,11 @@ class CuteDslFusedMoERunner(TunableRunner):
         localized_memset_stream: Optional stream used to overlap output zeroing.
         situ_beta: When set with ActivationType.Swiglu, use the SiTU gate.
         situ_linear_beta: Optional SiTU tanh clamp for the up branch.
+        clamped_relu2_limit: One-element float32 CUDA tensor holding the
+            ActivationType.ClampedRelu2 limit (required with it, rejected
+            otherwise). Kept as a runner attribute like the other activation
+            parameters and read by the kernel at runtime, so its value is not
+            part of the cache key; the activation type is.
 
     Also supports Rubin (SM107): tactic format is architecture-dependent —
     see _extract_tactic_params.
@@ -511,6 +518,7 @@ class CuteDslFusedMoERunner(TunableRunner):
         swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
         situ_beta: Optional[float] = None,
         situ_linear_beta: Optional[float] = None,
+        clamped_relu2_limit: Optional[torch.Tensor] = None,
         use_per_token_activation: bool = False,
         quant_mode: str = "w4a4",
         use_cuda_graph: bool = False,
@@ -518,8 +526,10 @@ class CuteDslFusedMoERunner(TunableRunner):
         localized_streams: Optional[list] = None,
         localized_sm_count: Optional[int] = None,
         localized_memset_stream: Optional[torch.cuda.Stream] = None,
+        swap_ab: bool = False,
     ):
         activation_type, gated = normalize_cute_dsl_moe_activation_type(activation_type)
+        validate_cute_dsl_moe_clamped_relu2_config(activation_type, clamped_relu2_limit)
         validate_cute_dsl_moe_situ_config(activation_type, situ_beta, situ_linear_beta)
         quant_mode = quant_mode.lower()
         if quant_mode not in ("w4a4", "w4a8", "mxfp8"):
@@ -545,8 +555,10 @@ class CuteDslFusedMoERunner(TunableRunner):
         self.swiglu_limit = swiglu_limit
         self.situ_beta = situ_beta
         self.situ_linear_beta = situ_linear_beta
+        self.clamped_relu2_limit = clamped_relu2_limit
         self.use_per_token_activation = use_per_token_activation
         self.quant_mode = quant_mode
+        self.swap_ab = swap_ab
         self.use_cuda_graph = use_cuda_graph
         self.localized_weights = localized_weights
         self.localized_streams = localized_streams
@@ -714,6 +726,7 @@ class CuteDslFusedMoERunner(TunableRunner):
                 self.use_cuda_graph,
                 self._localization_signature(),
             )
+            + (("swap_ab",) if self.swap_ab else ())
         )
 
     def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
@@ -731,6 +744,8 @@ class CuteDslFusedMoERunner(TunableRunner):
             self.output_dtype,
             self.enable_pdl,
         )
+        if self.swap_ab:
+            extras += ("swap_ab",)
         if self.use_cuda_graph:
             extras += ("cuda_graph",)
         return extras + self._localization_signature()
@@ -754,6 +769,11 @@ class CuteDslFusedMoERunner(TunableRunner):
         can_implement methods using the actual problem dimensions from inputs.
         Supports both Blackwell and Rubin architectures.
         """
+        if self.swap_ab:
+            from .blackwell.moe_swap_ab_tuner import get_valid_swap_ab_tactics
+
+            return get_valid_swap_ab_tactics(self, inputs)
+
         import cutlass
         from ...cute_dsl.utils import torch_to_cutlass_dtype
         from .moe_utils import get_max_num_permuted_tokens
@@ -812,11 +832,11 @@ class CuteDslFusedMoERunner(TunableRunner):
 
             if _is_rubin_tactic(tactic):
                 # The Rubin (SM107) gather kernel implements SwiGLU (and its
-                # SiTU variant) plus Relu2, but not GeGLU-tanh; skip Rubin
-                # tactics for the unimplemented activation.
-                if (
-                    ActivationType(int(self.activation_type))
-                    == ActivationType.GegluTanh
+                # SiTU variant) plus Relu2, but not GeGLU-tanh or ClampedRelu2;
+                # skip Rubin tactics for the unimplemented activations.
+                if ActivationType(int(self.activation_type)) in (
+                    ActivationType.GegluTanh,
+                    ActivationType.ClampedRelu2,
                 ):
                     return False
 
@@ -980,21 +1000,41 @@ class CuteDslFusedMoERunner(TunableRunner):
                  w1_weight, w1_weight_sf, w1_alpha, fc2_input_scale,
                  w2_weight, w2_weight_sf, w2_alpha, per_token_scale (optional),
                  moe_output (optional)]
-            tactic: Tactic tuple (tile_size, gemm1_tactic, gemm2_tactic) or None for default.
+            tactic: Tactic tuple (tile_size, gemm1_tactic, gemm2_tactic), with
+                k_steps_pair and use_clc appended for swap-AB, or None for default.
             do_preparation: If True, perform one-time setup (not used).
             **kwargs: Additional keyword arguments passed to forward_impl.
 
         Returns:
             Output tensor from the MoE computation.
         """
-        if tactic is None or tactic == -1:
-            tactic = (
-                DEFAULT_BLACKWELL_MOE_TACTIC
-                if self.quant_mode in ("w4a8", "mxfp8")
-                else _get_default_tactic()
+        if self.swap_ab:
+            from .blackwell.moe_swap_ab_tuner import (
+                DEFAULT_SWAP_AB_MOE_TACTIC,
+                canonicalize_swap_ab_tactic,
             )
-        elif self.quant_mode in ("w4a8", "mxfp8"):
-            tactic = canonicalize_w4a8_tactic(tactic)
+
+            if tactic is None or tactic == -1:
+                tactic = DEFAULT_SWAP_AB_MOE_TACTIC
+            tile_size, gemm1, gemm2, k_steps, use_clc = canonicalize_swap_ab_tactic(
+                tactic
+            )
+            kwargs.update(
+                gemm1_k_steps=k_steps[0],
+                gemm2_k_steps=k_steps[1],
+                gemm1_use_clc_scheduler=use_clc,
+                gemm2_use_clc_scheduler=use_clc,
+            )
+            tactic = (tile_size, gemm1, gemm2)
+        else:
+            if tactic is None or tactic == -1:
+                tactic = (
+                    DEFAULT_BLACKWELL_MOE_TACTIC
+                    if self.quant_mode in ("w4a8", "mxfp8")
+                    else _get_default_tactic()
+                )
+            elif self.quant_mode in ("w4a8", "mxfp8"):
+                tactic = canonicalize_w4a8_tactic(tactic)
 
         params = _extract_tactic_params(tactic)
 
@@ -1068,6 +1108,8 @@ class CuteDslFusedMoERunner(TunableRunner):
             swiglu_limit=self.swiglu_limit,
             situ_beta=self.situ_beta,
             situ_linear_beta=self.situ_linear_beta,
+            clamped_relu2_limit=self.clamped_relu2_limit,
+            swap_ab=self.swap_ab,
             **kwargs,
         )
 
@@ -1142,8 +1184,11 @@ class CuteDslFusedMoEW4A16Runner(TunableRunner):
         swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
         situ_beta: Optional[float] = None,
         situ_linear_beta: Optional[float] = None,
+        swap_ab: bool = False,
     ):
-        activation_type, _ = normalize_cute_dsl_moe_activation_type(activation_type)
+        activation_type, _ = normalize_cute_dsl_moe_activation_type(
+            activation_type, W4A16_CUTE_DSL_MOE_ACTIVATION_TYPES, backend="W4A16"
+        )
         validate_cute_dsl_moe_situ_config(activation_type, situ_beta, situ_linear_beta)
         if output_dtype != torch.bfloat16:
             raise ValueError("W4A16 only supports BF16 output")
@@ -1160,6 +1205,7 @@ class CuteDslFusedMoEW4A16Runner(TunableRunner):
         self.swiglu_limit = swiglu_limit
         self.situ_beta = situ_beta
         self.situ_linear_beta = situ_linear_beta
+        self.swap_ab = swap_ab
         # Match production EP routing density while retaining seeded load
         # variance around route-tile boundaries.
         self.tuning_config = TuningConfig(
@@ -1230,6 +1276,7 @@ class CuteDslFusedMoEW4A16Runner(TunableRunner):
                 self.situ_beta,
                 self.situ_linear_beta,
             )
+            + (("swap_ab",) if self.swap_ab else ())
         )
 
     def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
@@ -1246,7 +1293,7 @@ class CuteDslFusedMoEW4A16Runner(TunableRunner):
             self.swiglu_limit,
             self.situ_beta,
             self.situ_linear_beta,
-        )
+        ) + (("swap_ab",) if self.swap_ab else ())
 
     def get_valid_tactics(  # type: ignore[override]
         self,
@@ -1360,6 +1407,7 @@ class CuteDslFusedMoEW4A16Runner(TunableRunner):
             situ_beta=self.situ_beta,
             situ_linear_beta=self.situ_linear_beta,
             tactic=None if tactic is None or tactic == -1 else tactic,
+            swap_ab=self.swap_ab,
         )
 
 

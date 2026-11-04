@@ -22,11 +22,14 @@ from flashinfer.attention.prims_ts import (
     batch_sparse_mla_decode_with_paged_kv_cache,
     get_prims_ts_sparse_mla_decode_workspace_size,
 )
+from flashinfer.cute_dsl.utils import is_cute_dsl_arch_supported
+from flashinfer.utils import get_compute_capability
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available()
-    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
-    reason="Requires SM100/SM103",
+    or get_compute_capability(torch.device("cuda")) not in ((10, 0), (10, 3), (10, 7))
+    or not is_cute_dsl_arch_supported(*get_compute_capability(torch.device("cuda"))),
+    reason="Requires SM100/SM103/SM107 and a CuTe DSL that can target it",
 )
 
 
@@ -685,6 +688,13 @@ def test_rope_quant_plan_options():
         pytest.param(0, 2, 8, 2049, True, False, True, id="small-head-long-kv-reuse"),
         pytest.param(1, 0, 64, 513, True, False, True, id="multiwave-prefill"),
         pytest.param(0, 4, 128, 2049, True, False, True, id="multiwave-decode"),
+        pytest.param(0, 1, 128, 1025, True, False, True, id="two-cta-wave"),
+        # Mid-grid H64 rows on one padded 2CTA cluster per row.
+        pytest.param(32, 1, 64, 513, True, False, True, id="h64-two-cta-mid"),
+        pytest.param(16, 4, 64, 1025, True, False, False, id="h64-two-cta-mid-holes"),
+        # Long-Q wave grids stage the BF16 output through SMEM/TMA stores.
+        pytest.param(1, 0, 128, 1025, True, False, True, id="two-cta-wave-prefill"),
+        pytest.param(1, 0, 128, 513, True, False, False, id="two-cta-wave-holes"),
         # Short lists (capacity 256 and 384) with enough rows for the H128 2CTA tile.
         pytest.param(0, 1, 128, 64, True, False, True, id="short-two-cta-decode"),
         pytest.param(1, 0, 128, 64, True, False, True, id="short-two-cta-prefill"),
@@ -1293,7 +1303,21 @@ def test_softmax_rescale_threshold_log2_rejected(dtype, threshold):
     "heads,precision,rows,topk",
     [(h, "nvfp4", 160, 513) for h in (8, 12, 16, 32, 64, 128)]
     + [(16, "nvfp4", 4, 2049), (32, "nvfp4", 32, 513)]
-    + [(h, p, 160, 513) for h in (64, 128) for p in ("fp8", "bf16")],
+    + [(h, p, 160, 513) for h in (64, 128) for p in ("fp8", "bf16")]
+    # D576 FP8 head counts between qualified schedules run the next count's
+    # Q tile with masked rows: H24 persistent M64 and short-list split (its
+    # cluster schedule falls back to the raw count), H48 split M64, and H96
+    # split M64 pairs and persistent 2CTA.
+    + [
+        (24, "fp8", 4, 513),
+        (24, "fp8", 160, 2048),
+        (48, "nvfp4", 4, 2048),
+        (96, "nvfp4", 4, 2048),
+        (96, "fp8", 160, 2048),
+    ]
+    # Long-list H12/H16 decode grids from a quarter wave up: split, just past
+    # one wave and persistent eight-issuer Swap-AB on 148-212 SM devices.
+    + [(12, "fp8", 64, 2048), (12, "fp8", 160, 2048), (16, "fp8", 320, 2048)],
 )
 def test_d576_sparse_graph(heads, precision, rows, topk, prefix=False):
     """Native352 cache mapping, tails, holes and live graph inputs on both families."""
@@ -1422,6 +1446,13 @@ def make_tensor_fp8_cache(pages, page_size):
         (64, 2, 129, 129),
         (128, 8, 513, 129),
         (64, 16, 2049, 129),
+        # Swap-AB keeps two tiles per split at a power-of-two tile count.
+        (16, 1, 512, 0),
+        # Persistent D512 grids select the two-slot raw record ring.
+        (64, 96, 1024, 0),
+        (64, 80, 1024, 129),
+        (16, 128, 1024, 129),
+        (32, 96, 2048, 0),
     ],
 )
 def test_d512_nvfp4_sources_graph(

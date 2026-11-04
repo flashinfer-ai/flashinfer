@@ -1034,13 +1034,12 @@ DECODE_TABLE_OVERRIDES: dict[str, dict[str, dict[str, Any]]] = {
         "5,28,2048": {"route": "gemm", "gemm_bn": 192, "gemm_bk": 128, "gemm_cs": 2},
         "12,1,512": {
             "route": "decode",
-            "tok": 64,
+            "tok": 32,
             "split": 1,
-            "fused": False,
-            "persist": False,
-            "qlanes": 16,
-            "stages": 2,
-            "qwarps": 8,
+            "fused": True,
+            "persist": True,
+            "resident": True,
+            "tstore": True,
         },
         "12,1,2048": {"route": "gemm", "gemm_bn": 192, "gemm_bk": 128, "gemm_gs": 1},
         "12,28,512": {
@@ -1319,6 +1318,40 @@ DECODE_TABLE_M_RANGES: dict[
             ),
         ),
         "50,28,4096": ((3329, 3584, {"route": "gemm", "gemm_bk": 128}),),
+        "56,6,2048": (
+            (
+                1281,
+                1536,
+                {"route": "gemm", "gemm_bk": 128, "gemm_gs": 1, "gemm_tns": 1},
+            ),
+            (
+                1793,
+                2048,
+                {"route": "gemm", "gemm_bk": 128, "gemm_gs": 1, "gemm_tns": 1},
+            ),
+        ),
+        "56,6,4096": (
+            (
+                2049,
+                2304,
+                {"route": "gemm", "gemm_bk": 128, "gemm_gs": 1, "gemm_tns": 1},
+            ),
+            (
+                2561,
+                2816,
+                {"route": "gemm", "gemm_bk": 128, "gemm_gs": 1, "gemm_tns": 1},
+            ),
+            (
+                3329,
+                3584,
+                {"route": "gemm", "gemm_bk": 128, "gemm_gs": 1, "gemm_tns": 1},
+            ),
+            (
+                3841,
+                4096,
+                {"route": "gemm", "gemm_bk": 128, "gemm_gs": 1, "gemm_tns": 1},
+            ),
+        ),
         "192,2,2048": (
             (
                 1281,

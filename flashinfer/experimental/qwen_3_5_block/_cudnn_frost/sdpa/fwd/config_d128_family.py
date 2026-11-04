@@ -618,11 +618,12 @@ def validate_swizzles(cfg, flavor: str) -> None:
     )
 
 
-def validate_smem(cfg, flavor: str, *, arch: D128FamilyArch, qo_alias: bool, sf_bytes: int = 0, bias_bytes: int = 0) -> None:
+def validate_smem(cfg, flavor: str, *, arch: D128FamilyArch, qo_alias: bool, sf_bytes: int = 0, bias_bytes: int = 0, kv_copy_bytes: int = 0) -> None:
     """``sf_bytes``: the block-scale kernel's scale-factor slabs (0 on the f16 /
     per-tensor flavors); ``bias_bytes``: the resident bias row-block of the f16 d128-file
     tiles (0 without the bias); both named in the message so a reader sees every term.  ``arch``: the budget
-    (``smem_usable_bytes`` / ``smem_fixed_overhead``) and the name the message prints."""
+    (``smem_usable_bytes`` / ``smem_fixed_overhead``) and the name the message prints.
+    ``kv_copy_bytes`` counts the raw FP8 slab separately from the converted K/V rings."""
     gate_bpe = cfg.GATE_BPE if getattr(cfg, "EPILOGUE_GATE", 0) else 0
     gate_kib = (cfg.TILES_Q * cfg.TILE_M * cfg.TILE_O * gate_bpe) // 1024
     used = (
@@ -641,6 +642,7 @@ def validate_smem(cfg, flavor: str, *, arch: D128FamilyArch, qo_alias: bool, sf_
             sf_bytes=sf_bytes,
         )
         + bias_bytes
+        + kv_copy_bytes
         + arch.smem_fixed_overhead
     )
     if used > arch.smem_usable_bytes:
@@ -648,6 +650,8 @@ def validate_smem(cfg, flavor: str, *, arch: D128FamilyArch, qo_alias: bool, sf_
         sf_term = (
             f" + {sf_bytes // 1024} KiB MXFP8 scale-factor slabs (Q 1 | K {cfg.STAGES_KV}x1 | P 1 (512 B padded) | V {cfg.STAGES_KV}x1)" if sf_bytes else ""
         )
+        if kv_copy_bytes:
+            gate_term += f" + {kv_copy_bytes // 1024} KiB raw FP8 KV staging slab"
         if bias_bytes:
             _streamed = getattr(cfg, "BIAS_MODE", 0) in BIAS_STREAMED_MODES
             gate_term += (
