@@ -24,6 +24,9 @@ from flashinfer.fused_moe.backends.cudnn_frost import (
 from flashinfer.fused_moe.backends.cudnn_frost.bf16 import (
     moe as bf16_moe,
 )
+from flashinfer.fused_moe.backends.cudnn_frost.cache import (
+    require_graph_resource_retention,
+)
 from flashinfer.fused_moe.backends.cudnn_frost.activations import (
     ACTIVATIONS,
     activation_name,
@@ -47,6 +50,7 @@ from flashinfer.fused_moe.backends.cudnn_frost.manifest import (
 )
 from flashinfer.fused_moe import (
     BackendOptions,
+    CudnnFrostBf16Config,
     CutlassBf16Config,
     ExecutionConfig,
     ExpertConfig,
@@ -72,6 +76,21 @@ frost_gpu = pytest.mark.skipif(
     not torch.cuda.is_available()
     or torch.cuda.get_device_capability() not in ((10, 7), (12, 0)),
     reason="packaged cuDNN Frost sources target SM107a and SM120a",
+)
+
+
+def _graph_retention_reason():
+    try:
+        require_graph_resource_retention()
+    except NotImplementedError as exc:
+        return str(exc)
+    return None
+
+
+# MoE runners decline admission on PyTorch without CUDAGraph.retain_object (< 2.14).
+_GRAPH_RETENTION_REASON = _graph_retention_reason()
+graph_retention = pytest.mark.skipif(
+    _GRAPH_RETENTION_REASON is not None, reason=str(_GRAPH_RETENTION_REASON)
 )
 BF16_SHORTLIST_GEOMETRIES = {
     (12, 7168, 3072, 1),
@@ -148,6 +167,7 @@ def _bf16_moe_reference(act, weights, activation=None):
     return expanded.sum(dim=1).bfloat16()
 
 
+@graph_retention
 @frost_gpu
 @pytest.mark.parametrize("name", [name for name in ACTIVATIONS if name != "swiglu"])
 @pytest.mark.parametrize("tokens,topk", [(17, 1), (129, 4)])
@@ -231,6 +251,7 @@ def test_bf16_activation_artifact_pools_are_disjoint(
         shared_fc2 = fc2_ids
 
 
+@graph_retention
 @frost_gpu
 @pytest.mark.parametrize("topk", [1, 2, 4])
 def test_bf16_all_compound_tactics_full_moe_graph_and_dynamic_routing(
@@ -286,6 +307,7 @@ def test_bf16_all_compound_tactics_full_moe_graph_and_dynamic_routing(
     torch.cuda.current_stream().wait_stream(stream)
 
 
+@graph_retention
 @frost_gpu
 def test_bf16_interleaved_packs_do_not_exchange_weights_and_reject_stale_tactics():
     runner = bf16_moe.CudnnFrostBf16MoeRunner(bf16_config(), "cuda")
@@ -315,6 +337,7 @@ def test_bf16_interleaved_packs_do_not_exchange_weights_and_reject_stale_tactics
         runner.pack_inputs(a, wa)
 
 
+@graph_retention
 @frost_gpu
 @pytest.mark.parametrize(
     "experts,hidden,intermediate",
@@ -506,6 +529,7 @@ def test_bf16_layer_adds_independent_candidate_and_separates_winner_cache(monkey
     assert not layer._winners
 
 
+@graph_retention
 @frost_gpu
 @pytest.mark.parametrize(
     "experts,hidden,intermediate",
@@ -521,7 +545,13 @@ def test_bf16_original_layer_api_can_execute_winning_cudnn_frost_and_replay(
     act, weights = bf16_packs(
         tokens=4096, experts=experts, hidden=hidden, intermediate=intermediate
     )
-    layer = MoELayer(bf16_config(experts=experts, intermediate=intermediate))
+    # Frost is a candidate only when the config lists it.
+    layer = MoELayer(
+        replace(
+            bf16_config(experts=experts, intermediate=intermediate),
+            backend=BackendOptions((CutlassBf16Config(), CudnnFrostBf16Config())),
+        )
+    )
     visited = []
 
     def select(act, weights, runners):
@@ -1338,6 +1368,64 @@ def test_bf16_fma_tactic_is_limited_to_sm107(monkeypatch):
         for geometry in ((1, 7168, 3072, 12, 2), (4, 2048, 1408, 64, 6)):
             tactic = bf16_moe._fma_tactic(*geometry, SwiGLU(), device)
             assert (tactic is not None) == expected
+
+
+@pytest.mark.parametrize("family", ["bf16", "mxfp8", "nvfp4"])
+def test_fma_shared_source_identity(family):
+    """Legacy source verification must cover the relocated device bodies."""
+    adapter = importlib.import_module(
+        f"flashinfer.fused_moe.backends.cudnn_frost.{family}.fma"
+    )
+    assert len(adapter.source_digest()) == 64
+    requirements = dict(adapter._requirements())
+    for name in adapter._KERNELS:
+        path = adapter._DEVICE_ROOT / name
+        assert path in requirements
+        assert requirements[path] == hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+@graph_retention
+@frost_gpu
+@pytest.mark.parametrize("tokens", [1, 4])
+@pytest.mark.parametrize("name", ["swiglu", "situ", "relu2"])
+def test_legacy_bf16_fma_shared_pipeline(tokens, name):
+    if torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("legacy FMA admission is SM107 only")
+    torch.manual_seed(813)
+    activation = ACTIVATIONS[name]()
+    cfg = replace(
+        bf16_config(topk=6, experts=64, intermediate=1408), activation=activation
+    )
+    act, weights = bf16_packs(
+        tokens=tokens, topk=6, experts=64, hidden=2048, intermediate=1408
+    )
+    view = weights.get_view("cutlass_bf16")
+    if not activation.is_gated:
+        view["fc1_expert_weights"] = view["fc1_expert_weights"][:, :1408].contiguous()
+    if name == "situ":
+        act.hidden_states_q.mul_(8)
+        view["fc1_expert_weights"].mul_(16)
+    runner = bf16_moe.CudnnFrostBf16MoeRunner(cfg, "cuda")
+    runner.check_support()
+    runner.build()
+    inputs = runner.pack_inputs(act, weights)
+    tactics = [v for v in runner.get_valid_tactics(inputs, None) if "fma" in str(v[0])]
+    assert len(tactics) == 1
+    output = runner.forward(inputs, tactics[0])
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        runner.forward(inputs, tactics[0])
+    for _step in range(3):
+        act.topk_ids.copy_((act.topk_ids + 13) % 64)
+        act.topk_weights.mul_(0.5)
+        act.hidden_states_q.mul_(0.5)
+        output.fill_(float("nan"))
+        graph.replay()
+        reference = _bf16_moe_reference(act, weights, activation)
+        assert torch.isfinite(output).all() and reference.float().norm() > 0
+        assert (
+            output.float() - reference.float()
+        ).norm() / reference.float().norm() < 0.01
 
 
 def test_bf16_shortlist_survives_autotuner_plain_tensor_profiles(
@@ -2307,6 +2395,7 @@ def _pick_stage_pair(pool):
     return first, second
 
 
+@graph_retention
 @frost_gpu
 @pytest.mark.parametrize("name", ACTIVATIONS)
 @pytest.mark.parametrize("swizzled", [False, True])
@@ -2314,6 +2403,25 @@ def _pick_stage_pair(pool):
 def test_mxfp8_moe_full_pipeline_and_graph(name, swizzled, monkeypatch, fc1_output):
     _assert_mxfp8_moe_full_pipeline_and_graph(
         name, swizzled, monkeypatch, fc1_output=fc1_output
+    )
+
+
+@graph_retention
+@frost_gpu
+@pytest.mark.parametrize("zero_scale_routes", [False, True])
+@pytest.mark.parametrize("mixed", [False, True])
+@pytest.mark.parametrize("tokens", [1, 4])
+def test_legacy_mx_fma_shared_pipeline(mixed, tokens, zero_scale_routes, monkeypatch):
+    if torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("legacy FMA admission is SM107 only")
+    _assert_mxfp8_moe_full_pipeline_and_graph(
+        "swiglu",
+        False,
+        monkeypatch,
+        mixed=mixed,
+        geometry=(tokens, 2048, 1408, 64, 6),
+        require_fma=True,
+        zero_scale_routes=zero_scale_routes,
     )
 
 
@@ -2325,6 +2433,7 @@ def _assert_mxfp8_moe_full_pipeline_and_graph(
     fc1_output="bf16",
     geometry=(17, 256, 256, 4, 2),
     require_fma=False,
+    zero_scale_routes=False,
 ):
     from flashinfer.fused_moe import (
         CutlassMxfp8Config,
@@ -2386,6 +2495,13 @@ def _assert_mxfp8_moe_full_pipeline_and_graph(
         torch.tensor([1.5, -0.75, 0.0, 0.5], device="cuda").repeat(e // 4)
     )
     ids = torch.randint(0, e // 2, (t, k), device="cuda", dtype=torch.int32)
+    # Even experts have a zero FC1 or FC2 input scale. Preserve zero-scale
+    # routes while keeping a nonzero reference, including for a single token.
+    if zero_scale_routes:
+        ids.zero_()
+        ids[0, 0] = 1
+    else:
+        ids[0] = torch.arange(k, device=ids.device, dtype=ids.dtype)
     scores = torch.rand(t, k, device="cuda")
     scores /= scores.sum(-1, keepdim=True)
     act = MoEActivationPack(xq, xsf, ids, scores)
@@ -2513,6 +2629,7 @@ def _assert_mxfp8_moe_full_pipeline_and_graph(
     assert (out.float() - reference.float()).norm() / reference.float().norm() < 0.02
 
 
+@graph_retention
 @frost_gpu
 def test_mxfp8_moe_inference_mode_preparation_and_graph(monkeypatch):
     with torch.inference_mode():
@@ -2996,12 +3113,18 @@ def _nvfp4_moe_reference(act, weights, activation, swizzled=False):
     return expanded.sum(dim=1).bfloat16()
 
 
+@graph_retention
 @frost_gpu
 @pytest.mark.parametrize("name", ACTIVATIONS)
 @pytest.mark.parametrize("swizzled", [False, True])
 @pytest.mark.parametrize("fc1_output", ["bf16", "fp4_stg", "fp4_tma"])
 def test_nvfp4_moe_full_pipeline_and_dynamic_graph(
-    name, swizzled, fc1_output, monkeypatch, geometry=(17, 256, 256, 4, 2)
+    name,
+    swizzled,
+    fc1_output,
+    monkeypatch,
+    geometry=(17, 256, 256, 4, 2),
+    require_fma=False,
 ):
     from flashinfer.fused_moe.backends.cudnn_frost.nvfp4 import (
         moe,
@@ -3090,7 +3213,9 @@ def test_nvfp4_moe_full_pipeline_and_dynamic_graph(
     runner.build()
     inputs = runner.pack_inputs(act, weights)
     tactics = runner.get_valid_tactics(inputs, None)
-    assert len(tactics) == 4
+    assert len(tactics) == 4 + int(require_fma)
+    if require_fma:
+        assert "fma" in tactics[-1][0]
     assert inputs[6] is view["fc1_weight_block_scale"]
     assert runner.get_valid_tactics(list(inputs), None) == tactics
 
@@ -3132,8 +3257,14 @@ def test_nvfp4_moe_full_pipeline_and_dynamic_graph(
         with torch.cuda.graph(graph):
             runner.forward(list(inputs), tactic, launch_state=inputs.launch_state)
         ids.fill_(e - 1)
-        ids[::3] = -1
-        ids[1::3] = e
+        if t == 1:
+            # Retain one valid slot so the T1 replay reference is nonzero.
+            ids[0, 1] = -1
+            if k > 2:
+                ids[0, 2] = e
+        else:
+            ids[::3] = -1
+            ids[1::3] = e
         scores.mul_(0.5)
         xq.bitwise_xor_(0x88)
         xsf.view(torch.uint8).add_(1)
@@ -3150,6 +3281,23 @@ def test_nvfp4_moe_full_pipeline_and_dynamic_graph(
         runner.forward(list(inputs))
 
 
+@graph_retention
+@frost_gpu
+@pytest.mark.parametrize("tokens", [1, 4])
+def test_legacy_nvfp4_fma_shared_pipeline(tokens, monkeypatch):
+    if torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("legacy FMA admission is SM107 only")
+    test_nvfp4_moe_full_pipeline_and_dynamic_graph(
+        "swiglu",
+        False,
+        "bf16",
+        monkeypatch,
+        geometry=(tokens, 2048, 1408, 64, 6),
+        require_fma=True,
+    )
+
+
+@graph_retention
 @frost_gpu
 @pytest.mark.parametrize("store", ["stg", "tma"])
 def test_nvfp4_moe_inference_mode_preparation_and_graph(store, monkeypatch):
@@ -3162,6 +3310,7 @@ def test_nvfp4_moe_inference_mode_preparation_and_graph(store, monkeypatch):
         )
 
 
+@graph_retention
 @frost_gpu
 @pytest.mark.parametrize("tokens", [1, 17, 129])
 @pytest.mark.parametrize("mixed", [False, True])
@@ -3311,6 +3460,7 @@ def test_mxfp8_fused_quantization_preserves_bf16_intermediate(
             ).norm() / reference.float().norm() < 0.02
 
 
+@graph_retention
 @frost_gpu
 @pytest.mark.parametrize("tokens", [1, 17, 129])
 @pytest.mark.parametrize("store", ["stg", "tma"])
@@ -3613,6 +3763,7 @@ def test_mxfp8_mxfp4_grouped_kernel_extremes_and_graph(
     )
 
 
+@graph_retention
 @frost_gpu
 @pytest.mark.parametrize("name", ACTIVATIONS)
 @pytest.mark.parametrize("swizzled", [False, True])
@@ -3625,6 +3776,7 @@ def test_mxfp8_mxfp4_moe_full_pipeline_and_dynamic_graph(
     )
 
 
+@graph_retention
 @frost_gpu
 def test_mxfp8_mxfp4_moe_inference_mode_preparation_and_graph(monkeypatch):
     with torch.inference_mode():
@@ -3985,9 +4137,9 @@ def test_frost_layer_bounds_token_bucket_winners_and_refreshes_lru(monkeypatch):
 @pytest.mark.parametrize(
     "dtype",
     [
-        pytest.param("bf16", marks=frost_gpu),
+        pytest.param("bf16", marks=[frost_gpu, graph_retention]),
         *(
-            pytest.param(dtype, marks=frost_gpu)
+            pytest.param(dtype, marks=[frost_gpu, graph_retention])
             for dtype in ("mxfp8", "nvfp4", "mxfp8_mxfp4")
         ),
     ],

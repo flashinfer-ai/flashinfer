@@ -76,19 +76,17 @@ class NVLinkTwoSidedAlltoAll(MoEEpCommunication):
         import torch
 
         from ......comm.mnnvl import MnnvlMemory
-        from ......comm.trtllm_alltoall import (
-            get_moe_commworkspace_size_per_rank,
-            get_moe_prepare_workspace_size_per_rank,
+        from .kernels import (
+            comm_workspace_size_per_rank,
+            prepare_workspace_size_per_rank,
         )
 
         key = (self.ep_rank, self.ep_size)
         workspaces = self._WORKSPACES.get(key)
         if workspaces is None:
-            memory = MnnvlMemory(
-                mapping, get_moe_commworkspace_size_per_rank(self.ep_size)
-            )
+            memory = MnnvlMemory(mapping, comm_workspace_size_per_rank(self.ep_size))
             prepare_memory = MnnvlMemory(
-                mapping, get_moe_prepare_workspace_size_per_rank(self.ep_size)
+                mapping, prepare_workspace_size_per_rank(self.ep_size)
             )
             workspaces = {
                 "memory": memory,
@@ -113,11 +111,11 @@ class NVLinkTwoSidedAlltoAll(MoEEpCommunication):
         """Move the rows of ``x`` selected by the send indices to the receive
         indices of ``output`` on the peer ranks; rows nobody sends to keep
         their contents."""
-        from ......comm.trtllm_alltoall import moe_comm
+        from .kernels import alltoallv
 
         if x.dim() != 2:
             raise ValueError(f"expected a 2D tensor, got shape {tuple(x.shape)}")
-        moe_comm(
+        alltoallv(
             x,
             send_cumsum,
             send_indices,
@@ -137,27 +135,20 @@ class NVLinkTwoSidedAlltoAll(MoEEpCommunication):
         topk_weights: "torch.Tensor | None" = None,
         *,
         hidden_states_scale: "torch.Tensor | None" = None,
-        max_tokens_per_rank: Optional[int] = None,
+        runtime_max_tokens_per_rank: Optional[int] = None,
         eplb_local_stats: "torch.Tensor | None" = None,
     ) -> MoEEpDispatchResult:
         import torch
 
-        from ......comm.trtllm_alltoall import moe_prepare
+        from .kernels import prepare
 
         if self._workspace is None:
             raise RuntimeError("NVLinkTwoSidedAlltoAll has been destroyed")
         if self._state is not None:
             raise RuntimeError("dispatch called twice without an intervening combine")
-        tokens_per_rank = (
-            self.params.max_tokens_per_rank
-            if max_tokens_per_rank is None
-            else max_tokens_per_rank
+        tokens_per_rank = self._resolve_runtime_max_tokens_per_rank(
+            runtime_max_tokens_per_rank
         )
-        if not 0 < tokens_per_rank <= self.params.max_tokens_per_rank:
-            raise ValueError(
-                f"max_tokens_per_rank={tokens_per_rank} must be in "
-                f"(0, {self.params.max_tokens_per_rank}]"
-            )
         if topk_ids.dtype != torch.int32:
             topk_ids = topk_ids.to(torch.int32)
         if topk_weights is not None and topk_weights.dtype != torch.float32:
@@ -173,7 +164,7 @@ class NVLinkTwoSidedAlltoAll(MoEEpCommunication):
             recv_indices,
             backward_recv_indices,
             gathered_stats,
-        ) = moe_prepare(
+        ) = prepare(
             topk_ids,
             topk_weights,
             eplb_local_stats,

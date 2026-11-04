@@ -19,9 +19,9 @@ from ..fused_moe.utils import (
     get_hybrid_num_tokens_buckets,
     map_to_hybrid_bucket_uncapped,
 )
-from ..utils import _get_cache_buf, get_compute_capability, get_device_sm_count
+from ..utils import _get_stream_cache_buf, get_compute_capability, get_device_sm_count
 from .gemm_base import _check_cute_dsl_availability
-from .gemm_bf16_fp4 import _unswizzle_sf_128x4
+from .gemm_bf16_fp4 import _cute_dsl_uses_sm100_layout, _unswizzle_sf_128x4
 
 _BF16_FP4_ALPHA_ONE_CACHE: dict = {}
 
@@ -453,7 +453,7 @@ def _prepare_cute_dsl(
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """Dispatch weight preparation to the architecture-specific DSL kernel."""
     major, minor = get_compute_capability(b.device)
-    if (major, minor) in ((10, 0), (10, 3), (10, 7)):
+    if _cute_dsl_uses_sm100_layout(major, minor):
         return _prepare_cute_dsl_sm100(b, b_descale, alpha, block_size)
     elif major == 12:
         return _prepare_cute_dsl_sm12x(b, b_descale, alpha, block_size)
@@ -1096,13 +1096,13 @@ def _cute_dsl_bf16_fp4_runner(enable_pdl: bool = True) -> TunableRunner:
                     splits, a.dtype, out_dtype, enable_pdl=enable_pdl
                 )
                 if splits > 1:
-                    partial = _get_cache_buf(
+                    partial = _get_stream_cache_buf(
                         "mm_bf16_fp4_split_k_partial",
                         splits * m * n * 4,
                         a.device,
                     ).view(torch.float32)
                 else:
-                    partial = _get_cache_buf(
+                    partial = _get_stream_cache_buf(
                         "mm_bf16_fp4_split_k_partial_dummy", 16, a.device
                     ).view(torch.float32)
                 compiled(a, b, b_sf_u8, out, partial, alpha_for_launch)
@@ -1144,13 +1144,13 @@ def _cute_dsl_bf16_fp4_runner(enable_pdl: bool = True) -> TunableRunner:
                     )
                 # The compiled call launches the reduce kernel as well, so
                 # ``out`` is final on return.
-                partial = _get_cache_buf(
+                partial = _get_stream_cache_buf(
                     "mm_bf16_fp4_split_k_partial",
                     k_splits * m * n * 4,
                     a.device,
                 ).view(torch.float32)
             else:
-                partial = _get_cache_buf(
+                partial = _get_stream_cache_buf(
                     "mm_bf16_fp4_split_k_partial_dummy", 16, a.device
                 ).view(torch.float32)
             compiled(a, b, b_sf_u8, out, partial, alpha_for_launch)
@@ -1177,7 +1177,7 @@ def _compute_cute_dsl(
     ``(K // block_size, N)`` uint8 SF in S0E5M3 format (reformatted from FP8-E4M3
     by :func:`_e4m3_to_s0e5m3`) returned by :func:`_prepare_cute_dsl`.
     """
-    if get_compute_capability(a.device) in ((10, 0), (10, 3), (10, 7)):
+    if _cute_dsl_uses_sm100_layout(*get_compute_capability(a.device)):
         return _compute_cute_dsl_sm100(
             a,
             b,

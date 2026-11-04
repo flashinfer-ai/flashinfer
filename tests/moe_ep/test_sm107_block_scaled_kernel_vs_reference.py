@@ -128,7 +128,9 @@ def test_layer_situ_prequantized_weights_and_scaling(
             )
         )
     kwargs = dict(
-        intermediate_size=p["intermediate"], top_k=p["top_k"], apply_topk_in_fc1=early
+        intermediate_size=p["intermediate"],
+        top_k=p["top_k"],
+        apply_routing_weights_before_fc2=early,
     )
     if situ:
         kwargs.update(activation="situ", situ_beta=1.25, situ_linear_beta=0.75)
@@ -303,8 +305,14 @@ def test_shim_config_validation():
         cfg_cls(**{**kwargs, "num_total_experts": 7, "world_size": 2})
     with pytest.raises(ValueError, match="multiple of"):
         cfg_cls(**{**kwargs, "hidden": 500})
-    with pytest.raises(ValueError, match="apply_topk_at_fc1"):
-        cfg_cls(**{**kwargs, "reduce_topk_in_kernel": True, "apply_topk_at_fc1": False})
+    with pytest.raises(ValueError, match="apply_routing_weights_before_fc2"):
+        cfg_cls(
+            **{
+                **kwargs,
+                "reduce_topk_in_kernel": True,
+                "apply_routing_weights_before_fc2": False,
+            }
+        )
     with pytest.raises(ValueError, match="tile K"):
         cfg_cls(**{**kwargs, "mma_tiler_mnk": (256, 128, 512)})
     with pytest.raises(ValueError, match="N=256"):
@@ -373,9 +381,9 @@ def test_shim_config_validation():
 
 @pytest.mark.arch_rubin
 @pytest.mark.parametrize("quant_kind", QUANT_KINDS)
-@pytest.mark.parametrize("apply_topk_at_fc1", [True, False])
+@pytest.mark.parametrize("apply_routing_weights_before_fc2", [True, False])
 def test_sm107_block_scaled_kernel_matches_torch_reference(
-    monkeypatch, quant_kind, apply_topk_at_fc1
+    monkeypatch, quant_kind, apply_routing_weights_before_fc2
 ):
     """Fused kernel vs pure-torch oracle over identical staged payloads."""
     # monkeypatch (not os.environ): restored after the test, so it cannot
@@ -410,7 +418,7 @@ def test_sm107_block_scaled_kernel_matches_torch_reference(
         0,
         1,
         quant_kind=quant_kind,
-        apply_topk_at_fc1=apply_topk_at_fc1,
+        apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
     )
     try:
         stage_kwargs = {} if quant_kind == "nvfp4" else {"kind": quant_kind}
@@ -449,7 +457,7 @@ def test_sm107_block_scaled_kernel_matches_torch_reference(
             quant_kind=quant_kind,
             local_expert_offset=0,
             gate_up_clamp=None,
-            apply_topk_at_fc1=apply_topk_at_fc1,
+            apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
             num_tokens=p["num_tokens"],
         )[: p["num_tokens"]]
 
@@ -459,7 +467,9 @@ def test_sm107_block_scaled_kernel_matches_torch_reference(
         rel_l2 = (yk - yr).norm() / yr.norm().clamp_min(1e-6)
         max_abs = (yk - yr).abs().max().item()
         print(
-            f"[sm107 oracle] kind={quant_kind} apply_topk_at_fc1={apply_topk_at_fc1} "
+            f"[sm107 oracle] kind={quant_kind} "
+            f"apply_routing_weights_before_fc2="
+            f"{apply_routing_weights_before_fc2} "
             f"rel_l2={rel_l2.item():.5f} max|d|={max_abs:.5f} "
             f"amax={yr.abs().max().item():.3f}"
         )
@@ -624,7 +634,7 @@ def test_sm107_block_scaled_kernel_perf_winner_config(monkeypatch, quant_kind):
             quant_kind=quant_kind,
             local_expert_offset=0,
             gate_up_clamp=None,
-            apply_topk_at_fc1=True,
+            apply_routing_weights_before_fc2=True,
             num_tokens=p["num_tokens"],
         )[: p["num_tokens"]]
 

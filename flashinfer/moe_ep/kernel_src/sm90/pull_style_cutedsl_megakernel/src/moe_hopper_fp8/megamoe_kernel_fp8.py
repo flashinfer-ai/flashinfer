@@ -1384,10 +1384,11 @@ class Sm90MegaMoESwapABMxfp4Fp8Kernel(
             fc1_ready_mode=mxfp4_fc1_ready_mode,
         )
         # Keep the qualified MXFP4 dispatch storage and output ABI when the
-        # shared FP8 constructor gains new optional layouts.
-        for name in ("compact_pull_buffer", "generate_c"):
-            if kwargs.setdefault(name, False) is not False:
-                raise ValueError(f"MXFP4 currently requires {name}=False")
+        # shared FP8 constructor gains new optional layouts. The compact pull
+        # buffer (one dispatch slot per active warp) is opt-in.
+        kwargs.setdefault("compact_pull_buffer", False)
+        if kwargs.setdefault("generate_c", False) is not False:
+            raise ValueError("MXFP4 currently requires generate_c=False")
         self._mxfp4_fc2_tail_n8 = mxfp4_fc2_tail_n8
         self._mxfp4_fc1_ready_mode = mxfp4_fc1_ready_mode
         # The workspace layout is built by the Mega constructor. No device

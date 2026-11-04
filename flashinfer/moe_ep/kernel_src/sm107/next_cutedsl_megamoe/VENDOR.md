@@ -51,7 +51,7 @@ export manifest/log and file hashes with the integration evidence.
 ## Scope of this drop
 
 The generic inference entry point is `RubinInferenceMegaMoE`
-(`BlockScaledSwapAbMegaMoeKernel`). FlashInfer's NVFP4, MXFP8 E4M3/E5M2, and MXFP4-weight/MXFP8-activation
+(`BlockScaledSwapAbMegaMoeKernel`). FlashInfer's NVFP4, MXFP4, MXFP8 E4M3/E5M2, and MXFP4-weight/MXFP8-activation
 backends expose SwiGLU and SiTU with BF16 output. BF16 combine supports separate
 and in-kernel reduction; `combine_dtype="nvfp4"` and `combine_dtype="mxfp8"`
 require separate reduction. They accept canonical prequantized weights; NVFP4
@@ -71,7 +71,7 @@ coverage. The shim rejects that combination before allocation or compilation,
 and `is_valid_sm107` excludes it from the geometry-specific tuning set. EP1
 phase-interleave and the inherited N128/N256 admission remain unchanged.
 Other N64 combinations remain rejected. Combine remains BF16.
-Tile K is 256 for NVFP4 activations and 128 for MXFP8 activations.
+Tile K is 256 for NVFP4/MXFP4 activations and 128 for MXFP8 activations.
 SiTU requires both beta parameters, matching the exported kernel.
 
 `combine_dtype="nvfp4"` selects the existing quantized FC2 return path.
@@ -128,10 +128,10 @@ silently dropped by a fresh export. Paths below are relative to `src/sources/`.
 | `helpers/ptx_helpers.py` | Counted, unaligned CTA barrier helper for the actual participating warps. |
 | `kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_mainloop.py` | Use that barrier for the Generic MMA/accumulator TMEM allocation rendezvous. |
 | `kernel_src/rubin/inference/mega/block_scaled_swap_ab_fc12_mainloop_gen_specialized.py` | N64 SFB/TMEM parity, valid-row TMA-gather extent and transaction accounting, and two gather warps for CGA4. |
-| `kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel.py` | Pass routing IDs to separate BF16 reduction, advertise masked-slot handling, and configure small-prefix CTA0 reset ownership. |
+| `kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel.py` | Pass routing IDs to separate BF16, NVFP4, and MXFP8 reductions, advertise masked-slot handling, and configure small-prefix CTA0 reset ownership. |
 | `kernel_src/rubin/inference/mega/block_scaled_swap_ab_mega_moe_kernel_gen_specialized.py` | Propagate masked reduction and admitted N64 geometry; support a one-row allocation in the gather descriptor, explicit router/all-role quiescence before reset, and small-prefix CTA0 reset ownership. |
 | `kernel_src/rubin/inference/mega/token_comm_gen_specialized.py` | Bound route metadata by the live extent, fence rewritten shared indices before async bulk publication, reuse the acquired extent in the sort body, skip invalid histogram/scatter work, and reuse the existing expert prefix for scale-factor offsets. |
-| `kernel_src/rubin/inference/mega/topk_reduce.py` | Predicate BF16 combine loads by routing validity, yielding exact zero for rows with no valid routes. |
+| `kernel_src/rubin/inference/mega/topk_reduce.py` | Predicate BF16, NVFP4, and MXFP8 combine loads by routing validity, yielding exact zero for rows with no valid routes. |
 | `communication/nvlink_domain/token_comm.py` | Skip invalid-route histogram/scatter work, protect partial dump reads, fence generic shared-memory writes before async bulk size publication, and let CTA0 reset prefixes up to 16 KiB without a second grid join. |
 
 The Generic router shortcut is retained with an async-proxy publication fence
@@ -163,14 +163,41 @@ are outside the reset prefix. GenPhase's reset bound depends on both top-k and
 local expert count; large-prefix constructor checks must stay within its
 1024-token capacity limit. EP16 construction is a layout test, not EP16 execution.
 
+One more FlashInfer-owned kernel fix, pending upstream (the pinned commit and
+upstream `main` up to `413da003` have the same code):
+
+- `src/sources/kernel_src/schedulers/fc12_scheduler.py`,
+  `PhaseInterleavedFc12Scheduler._wait_for_fc1_prologue_claims`: the
+  phase-interleave scheduler no longer sets `fc1_exhausted` from its CTA-local
+  peek of the global FC1 work-ID counter. Every CTA of a cluster runs the claim
+  state machine itself and interprets the leader's broadcast work ID against
+  its own stream choice, so that state must only change on cluster-uniform
+  inputs. When the runtime FC1 stream is shorter than the static FC1 watermark
+  (tiny per-rank work, e.g. DP dummy batches), the last terminal FC1 claims of
+  other clusters can push the counter across the watermark between the peeks
+  of two CTAs of one cluster (late-starting clusters make this likely). The
+  CTAs then disagreed on `fc1_exhausted`, mapped the next broadcast ID to
+  different phases, and the cluster deadlocked (CTAs leaving the claim loop
+  while the leader keeps claiming, or 2-CTA MMA / multicast pairs on different
+  tiles): one rank 2 CTAs short of the tail grid sync, its peers waiting in
+  the NVLink drain barrier. The peek now only shortens this CTA's wait; FC1
+  exhaustion is learned from a claimed ID like any other stream end, at the
+  cost of at most one extra terminal FC1 claim per cluster. Re-apply this fix
+  when the drop is re-exported until upstream carries it.
+
+The NVFP4 and MXFP8 reducers also accept route IDs and skip masked slots before
+loading payloads, scales or scores. The standard kernel advertises masked-slot
+handling for all separate reducers. These quantized-reduction changes are not
+part of the pinned upstream snapshot.
+
 FlashInfer-owned `shim/block_scaled.py` admits the geometries listed above and
-omits BF16 masked-slot preclear only when the kernel advertises masked reduction.
-Quantized combine and in-kernel reduction retain their existing clearing rules.
+omits combine-slot preclear when the kernel advertises masked reduction.
+In-kernel reduction retains its accumulation reset.
 This shim change is outside the exported payload. The local patch inventory
 above is separate from the historical upstream qualification evidence; run the
 registered strict single/multirank suites when updating or rebasing these patches.
 All remaining exported implementation files retain the pinned export, apart
-from the previously documented comment.
+from the previously documented comment and the scheduler fix above.
 
 ## Related trees
 

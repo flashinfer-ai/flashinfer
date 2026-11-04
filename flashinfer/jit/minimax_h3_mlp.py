@@ -74,9 +74,10 @@ def gen_minimax_h3_mlp_module(target: MiniMaxH3MlpTarget) -> JitSpec:
     SwiGLU + FC2 + indexed gate + residual; BF16, MXFP8 and NVFP4 variants) on one exact
     Blackwell target.
 
-    The module exposes ``minimax_h3_mlp``, ``minimax_h3_mlp_mxfp8`` and
-    ``minimax_h3_mlp_nvfp4``.  The device code is tcgen05 + TMEM + 2-CTA MMA and does not
-    compile for SM90 or SM120.
+    The module exposes ``minimax_h3_mlp``, ``minimax_h3_mlp_mxfp8``,
+    ``minimax_h3_mlp_mxfp8_w448`` (the MXFP8 operator on the 256x448 FC1 tile) and
+    ``minimax_h3_mlp_nvfp4``; each takes its launch grids from the caller.  The device code
+    is tcgen05 + TMEM + 2-CTA MMA and does not compile for SM90 or SM120.
     """
 
     if target not in _TARGETS:
@@ -88,7 +89,7 @@ def gen_minimax_h3_mlp_module(target: MiniMaxH3MlpTarget) -> JitSpec:
     # precise build the Cake runtime compiles; FlashInfer's default -use_fast_math (ftz, approximate
     # division / sqrt) would make this module differ from that build by one BF16 ulp on rare elements.
     return gen_jit_spec(
-        f"minimax_h3_mlp_{target}_v1",
+        f"minimax_h3_mlp_{target}_v3",
         [source],
         extra_cuda_cflags=list(_TARGETS[target][1]),
         use_fast_math=False,

@@ -24,7 +24,7 @@ import torch
 
 from ...jit.moe_utils import gen_moe_utils_module
 from ...tllm_enums import ActivationType, is_gated_activation, normalize_activation_type
-from ...utils import get_compute_capability
+from ...utils import check_shape_dtype_device, get_compute_capability
 
 
 def _get_cuda_stream_ptr() -> int:
@@ -56,17 +56,35 @@ SUPPORTED_CUTE_DSL_MOE_ACTIVATION_TYPES = (
     ActivationType.Swiglu,
     ActivationType.GegluTanh,
     ActivationType.Relu2,
+    ActivationType.ClampedRelu2,
 )
+
+# The SM90 and W4A16 epilogues have no ClampedRelu2 variant.
+SM90_CUTE_DSL_MOE_ACTIVATION_TYPES = (
+    ActivationType.Swiglu,
+    ActivationType.GegluTanh,
+    ActivationType.Relu2,
+)
+W4A16_CUTE_DSL_MOE_ACTIVATION_TYPES = SM90_CUTE_DSL_MOE_ACTIVATION_TYPES
 
 
 def normalize_cute_dsl_moe_activation_type(
     activation_type: Union[int, ActivationType],
+    supported: Tuple[ActivationType, ...] = SUPPORTED_CUTE_DSL_MOE_ACTIVATION_TYPES,
+    backend: Optional[str] = None,
 ) -> Tuple[ActivationType, bool]:
+    """Normalize ``activation_type`` and return it with its gatedness.
+
+    ``supported`` narrows the accepted activations for a backend that
+    implements only a subset; ``backend`` names it in the error message.
+    """
     activation_type = normalize_activation_type(activation_type)
-    if activation_type not in SUPPORTED_CUTE_DSL_MOE_ACTIVATION_TYPES:
-        expected = " or ".join(repr(t) for t in SUPPORTED_CUTE_DSL_MOE_ACTIVATION_TYPES)
+    if activation_type not in supported:
+        expected = " or ".join(repr(t) for t in supported)
+        where = f" for {backend}" if backend else ""
         raise ValueError(
-            f"Unsupported activation_type {activation_type!r}; expected {expected}"
+            f"Unsupported activation_type {activation_type!r}{where}; "
+            f"expected {expected}"
         )
     return activation_type, is_gated_activation(activation_type)
 
@@ -104,6 +122,65 @@ def validate_cute_dsl_moe_situ_config(
     ):
         raise ValueError(
             "situ_linear_beta must be positive and finite in fp32 when set"
+        )
+
+
+def rubin_moe_cluster_covers_one_tile(
+    tile_size: int,
+    mma_tiler: Tuple[int, int, int],
+    mma_inst_shape: Tuple[int, int, int],
+    cluster_shape_mn: Tuple[int, int],
+) -> bool:
+    """Return whether a Rubin (SM107) MoE GEMM tactic maps one cluster to one
+    ``moe_sort`` routing tile along M.
+
+    ``moe_sort`` writes one metadata entry (expert index, M limit) per
+    ``tile_size``-row routing tile, for ``[0, num_non_exiting_tiles)`` only;
+    both Rubin GEMMs bound their metadata reads by that count. A CTA's routing
+    tile is its M tile coordinate divided by ``atom_cta_m``, the MMA CTA
+    group size along M (2 for the 2-CTA ``mma_inst_shape[0] == 256`` MMA,
+    else 1). With ``mma_tiler[0] == tile_size`` and ``cluster_shape_mn[0] ==
+    atom_cta_m`` every CTA of a cluster resolves to the same routing tile, so
+    the CTAs agree on whether the tile is valid and reach the cluster barrier
+    together: no rounding of the tile count and no initialization of the
+    metadata past the active prefix is needed. A cluster spanning several
+    routing tiles (``cluster_shape_mn[0] > atom_cta_m``) would need both, and
+    is not supported. Cluster N only multicasts A/SFA among CTAs of the same
+    routing tile and does not affect this property.
+    """
+    atom_cta_m = 2 if mma_inst_shape[0] == 256 else 1
+    return mma_tiler[0] == tile_size and cluster_shape_mn[0] == atom_cta_m
+
+
+def validate_cute_dsl_moe_clamped_relu2_config(
+    activation_type: ActivationType,
+    clamped_relu2_limit: Optional[torch.Tensor],
+    device: Optional[torch.device] = None,
+) -> None:
+    """Validate the ClampedRelu2 limit: a (1,) float32 tensor, as in
+    ``cutlass_fused_moe``, required with ClampedRelu2 and rejected otherwise."""
+    if activation_type == ActivationType.ClampedRelu2:
+        if clamped_relu2_limit is None:
+            raise ValueError(
+                "ActivationType.ClampedRelu2 requires a one-element "
+                "clamped_relu2_limit tensor"
+            )
+        if clamped_relu2_limit.ndim != 1 or clamped_relu2_limit.numel() != 1:
+            raise ValueError(
+                "ActivationType.ClampedRelu2 requires model-wide "
+                "clamped_relu2_limit with shape (1,), got "
+                f"{tuple(clamped_relu2_limit.shape)}"
+            )
+        check_shape_dtype_device(
+            clamped_relu2_limit,
+            (1,),
+            torch.float32,
+            device,
+            "ClampedRelu2 clamped_relu2_limit",
+        )
+    elif clamped_relu2_limit is not None:
+        raise ValueError(
+            "clamped_relu2_limit is supported only with ActivationType.ClampedRelu2"
         )
 
 
@@ -684,8 +761,11 @@ def moe_sort(
     #
     # Entries outside the active prefix are intentionally uninitialized.
     # Routing writes [0, num_non_exiting_tiles), and both GEMMs consume exactly
-    # that count. Rubin multi-CTA tactics, which would require rounded/padded
-    # metadata entries, are rejected before moe_sort.
+    # that count. This also holds for Rubin 2-CTA and cluster_shape_n > 1
+    # tactics, whose clusters cover exactly one routing tile; tactics with a
+    # cluster spanning several routing tiles, which would require
+    # rounded/padded metadata entries, are rejected before moe_sort (see
+    # rubin_moe_cluster_covers_one_tile).
     if out_tile_idx_to_expert_idx is not None:
         tile_idx_to_expert_idx = out_tile_idx_to_expert_idx
     else:

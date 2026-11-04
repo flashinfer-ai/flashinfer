@@ -20,6 +20,9 @@ from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe import (
 from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim.correctness import (
     sampled_reference,
 )
+from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe.shim.tuning_state import (
+    AutoTuningState,
+)
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA required; any supported Torch GPU"
@@ -72,7 +75,7 @@ def test_sampled_oracle_matches_full_raw_scale_oracle(kind):
         quant_kind=kind,
         local_expert_offset=0,
         gate_up_clamp=None,
-        apply_topk_at_fc1=True,
+        apply_routing_weights_before_fc2=True,
     )
     torch.testing.assert_close(expected, full[indices], rtol=0.01, atol=0.001)
 
@@ -194,6 +197,8 @@ def test_real_dlpack_binding_is_safe_in_a_new_capture_stream(kind):
     ws._compiled = lambda **kwargs: ws.output_activation.fill_(3)
     # The dummy kernel does not use peer mapping, which imports Rubin-only code.
     ws._peer_mapper = lambda: None
+    # __init__ creates this since #6535; launch() marks it under stream capture.
+    ws._tuning_state = AutoTuningState()
     weights = preprocess_block_scaled_weights(
         torch.randn(4, 128, 128, device="cuda").bfloat16(),
         torch.randn(4, 128, 64, device="cuda").bfloat16(),

@@ -15,8 +15,8 @@
 AdaLN + FC1 + SwiGLU + FC2 + indexed gate + residual in three launches.
 
 Reference = the segmented chain built from FlashInfer's own pieces: ``minimax_h3_fc1_swiglu*``
-for ``y`` (the fused kernels reuse that FC1 GEMM core; the standalone MXFP8 operator's GEMM tile
-and weight scale layout differ, see ``prepare_minimax_h3_fc1_swiglu_weight_mxfp8``), FlashInfer's ``mxfp8_quantize`` /
+for ``y`` (the fused kernels reuse that FC1 GEMM core; the MXFP8 operator runs either the standalone
+operator's 256x448 tile on its weight scale layout or a 256x256 tile, see ``MXFP8_FC1_LAYOUTS``), FlashInfer's ``mxfp8_quantize`` /
 ``nvfp4_quantize`` of that ``y`` for the quantized variants, an FP32 ``torch`` FC2 GEMM (TF32
 disabled) rounded to BF16, the indexed gate product rounded to BF16 and the residual sum rounded
 to BF16.
@@ -118,6 +118,8 @@ MAX_FASTMATH_ROW_FLOOR = 4
 # One row, one partial pair of 128-row tiles (129 -> 2 tiles, 257 -> 3 tiles padded to 4) and the
 # production token count of one rank at sequence-parallel degree 8.  On a 148-SM / 160-SM part the
 # FC2 tail split-K is active for M = 1, 129 and 4824 (21 / 21 / 399 pair tiles) and off for 257.
+# The persistent NVFP4 norm launches ceil(M / 8) CTAs for M = 1, 129 and 257 and one CTA per SM
+# for 4824.
 M_VALUES = [1, 129, 257, 4824]
 # Engine modulation projection: the three tables are the shift_mlp / scale_mlp / gate_mlp column
 # chunks (3 / 4 / 5) of a [rows, 6 * 5376] buffer with rows = 3 x unique timesteps (3 or 6 in the
@@ -125,6 +127,10 @@ M_VALUES = [1, 129, 257, 4824]
 ENGINE_TABLE_CHUNKS = 6
 ENGINE_SHIFT_CHUNK, ENGINE_SCALE_CHUNK, ENGINE_GATE_CHUNK = 3, 4, 5
 ENGINE_TABLE_ROWS = [3, 6, 12]
+# The MXFP8 operator's two FC1 weight scale layouts: the FC1 + SwiGLU operator's 112-row sub-tiles
+# (prepare_minimax_h3_fc1_swiglu_weight_mxfp8, the 256x448 FC1 GEMM tile) and the 128-row tiles
+# (prepare_minimax_h3_fc1_weight_mxfp8, the 256x256 tile).
+MXFP8_FC1_LAYOUTS = ["fc1_swiglu", "mlp"]
 _E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 
 
@@ -651,9 +657,12 @@ def run_bf16_case(
     return stats
 
 
-def run_mxfp8_case(rows: int, model, prepared, device) -> Dict[str, float]:
+def run_mxfp8_case(
+    rows: int, model, prepared, device, fc1_layout: str = "fc1_swiglu"
+) -> Dict[str, float]:
     x, idx, residual = make_inputs(rows, device, table_rows=_table_rows(model))
     w1_q, w1_tiles, w2_q, w2_tiles, w2_deq, w1_deq, w1_fc1_tiles = prepared
+    mlp_w1_tiles = w1_fc1_tiles if fc1_layout == "fc1_swiglu" else w1_tiles
     # FlashInfer's own FC1 operator: its y and its quantized a (same norm arithmetic as the MLP's);
     # its 256x448 MXFP8 GEMM streams the 112-row weight scale sub-tiles, not the MLP's 128-row tiles.
     a_fi_q = torch.empty(
@@ -685,7 +694,7 @@ def run_mxfp8_case(rows: int, model, prepared, device) -> Dict[str, float]:
     out = minimax_h3_mlp_mxfp8(
         *_norm_args(model, x, idx),
         w1_q,
-        w1_tiles,
+        mlp_w1_tiles,
         w2_q,
         w2_tiles,
         model["gate"],
@@ -696,7 +705,7 @@ def run_mxfp8_case(rows: int, model, prepared, device) -> Dict[str, float]:
         workspace_y_sf=workspace_y_sf,
     )
     torch.cuda.synchronize()
-    what = f"mxfp8 M={rows}"
+    what = f"mxfp8 {fc1_layout} M={rows}"
     valid_rows = _valid_rows(idx, _table_rows(model))
     a_same = _bf16_activation_from_operator(model, x, idx, residual, device)
     assert not bool(a_same[~valid_rows].view(torch.int16).any()), (
@@ -1036,9 +1045,52 @@ def test_minimax_h3_mlp_bf16(rows, model, device):
 
 
 @requires_blackwell
+@pytest.mark.parametrize("fc1_layout", MXFP8_FC1_LAYOUTS)
 @pytest.mark.parametrize("rows", M_VALUES)
-def test_minimax_h3_mlp_mxfp8(rows, model, prepared_mxfp8, device):
-    run_mxfp8_case(rows, model, prepared_mxfp8, device)
+def test_minimax_h3_mlp_mxfp8(rows, fc1_layout, model, prepared_mxfp8, device):
+    run_mxfp8_case(rows, model, prepared_mxfp8, device, fc1_layout)
+
+
+@requires_blackwell
+@pytest.mark.parametrize("rows", M_VALUES)
+def test_minimax_h3_mlp_mxfp8_fc1_layouts_agree(rows, model, prepared_mxfp8, device):
+    """The two FC1 GEMMs accumulate every output element in the same K order and quantize ``y``
+    with the same recipe: the quantized ``a`` and ``y`` workspaces and the output are bitwise
+    equal for the two weight scale layouts."""
+    x, idx, residual = make_inputs(rows, device, table_rows=_table_rows(model))
+    w1_q, w1_tiles, w2_q, w2_tiles, _w2_deq, _w1_deq, w1_fc1_tiles = prepared_mxfp8
+    results = []
+    for tiles in (w1_fc1_tiles, w1_tiles):
+        workspaces = {
+            "workspace_a_q": torch.empty(
+                (rows, MINIMAX_H3_HIDDEN), dtype=torch.float8_e4m3fn, device=device
+            ),
+            "workspace_a_sf": torch.zeros(
+                (mxfp8_a_scale_workspace_bytes(rows),), dtype=torch.uint8, device=device
+            ),
+            "workspace_y_q": torch.empty(
+                (rows, MINIMAX_H3_FFN), dtype=torch.float8_e4m3fn, device=device
+            ),
+            "workspace_y_sf": torch.zeros(
+                (mxfp8_y_scale_workspace_bytes(rows),), dtype=torch.uint8, device=device
+            ),
+        }
+        out = minimax_h3_mlp_mxfp8(
+            *_norm_args(model, x, idx),
+            w1_q,
+            tiles,
+            w2_q,
+            w2_tiles,
+            model["gate"],
+            residual,
+            **workspaces,
+        )
+        results.append({"out": out, **workspaces})
+    torch.cuda.synchronize()
+    for name, value in results[0].items():
+        assert torch.equal(
+            value.view(torch.uint8), results[1][name].view(torch.uint8)
+        ), f"mxfp8 M={rows}: {name} differs between the two FC1 weight scale layouts"
 
 
 @requires_blackwell
@@ -1057,8 +1109,10 @@ def test_minimax_h3_mlp_bf16_engine_tables(table_rows, model, device):
 
 
 @requires_blackwell
-def test_minimax_h3_mlp_mxfp8_engine_tables(model, prepared_mxfp8, device):
-    run_mxfp8_case(257, make_engine_model(model, 6, device), prepared_mxfp8, device)
+@pytest.mark.parametrize("fc1_layout", MXFP8_FC1_LAYOUTS)
+def test_minimax_h3_mlp_mxfp8_engine_tables(fc1_layout, model, prepared_mxfp8, device):
+    engine = make_engine_model(model, 6, device)
+    run_mxfp8_case(257, engine, prepared_mxfp8, device, fc1_layout)
 
 
 @requires_blackwell
@@ -1124,9 +1178,9 @@ def test_minimax_h3_mlp_invalid_index_rows_pass_residual(table_rows, model, devi
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_minimax_h3_mlp_mxfp8_rejects_fc1_swiglu_layout_scale_tiles(model, device):
-    """Tiles prepared for the standalone FC1 operator (112-row sub-tiles, 128 * 42 * 1024 bytes)
-    fail this operator's exact-size check with a message naming the right prepare (no launch)."""
+def test_minimax_h3_mlp_mxfp8_rejects_unknown_fc1_scale_tile_size(model, device):
+    """FC1 weight scale tiles of neither layout fail the exact-size check with a message naming
+    both prepare functions (no launch)."""
     x, idx, residual = make_inputs(8, device)
     w1_q = torch.zeros(
         (MINIMAX_H3_FC1_ROWS, MINIMAX_H3_HIDDEN),
@@ -1136,24 +1190,27 @@ def test_minimax_h3_mlp_mxfp8_rejects_fc1_swiglu_layout_scale_tiles(model, devic
     w2_q = torch.zeros(
         (MINIMAX_H3_HIDDEN, MINIMAX_H3_FFN), dtype=torch.float8_e4m3fn, device=device
     )
-    fc1_swiglu_layout_tiles = torch.zeros(
-        MXFP8_FC1_SWIGLU_SCALE_TILE_BYTES, dtype=torch.uint8, device=device
-    )
     w2_tiles = torch.zeros(MXFP8_FC2_SCALE_TILE_BYTES, dtype=torch.uint8, device=device)
-    with pytest.raises(
-        ValueError,
-        match=r"fc1_scale_tiles must hold exactly 4816896 bytes .*"
-        r"prepare_minimax_h3_fc1_weight_mxfp8.*got 5505024",
+    for num_bytes in (
+        2 * MXFP8_FC1_SWIGLU_SCALE_TILE_BYTES,
+        MXFP8_FC1_SCALE_TILE_BYTES - 1024,
     ):
-        minimax_h3_mlp_mxfp8(
-            *_norm_args(model, x, idx),
-            w1_q,
-            fc1_swiglu_layout_tiles,
-            w2_q,
-            w2_tiles,
-            model["gate"],
-            residual,
-        )
+        tiles = torch.zeros(num_bytes, dtype=torch.uint8, device=device)
+        with pytest.raises(
+            ValueError,
+            match=r"fc1_scale_tiles must hold exactly 5505024 bytes .*"
+            r"prepare_minimax_h3_fc1_swiglu_weight_mxfp8.* or 4816896 bytes .*"
+            rf"prepare_minimax_h3_fc1_weight_mxfp8.*got {num_bytes}",
+        ):
+            minimax_h3_mlp_mxfp8(
+                *_norm_args(model, x, idx),
+                w1_q,
+                tiles,
+                w2_q,
+                w2_tiles,
+                model["gate"],
+                residual,
+            )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

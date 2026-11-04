@@ -443,9 +443,9 @@ def apply_rope_inplace(
     r"""Apply rotary embedding to a batch of queries/keys (stored as RaggedTensor) in place.
     cos/sin values are computed on the fly inside the kernel.
 
-    We use :attr:`indptr` to denote the start pointer of each segment in the batch, the i-th
-    segment the query of the i-th segment is ``q[indptr[i]:indptr[i+1]]`` and the key of the
-    i-th segment is ``k[indptr[i]:indptr[i+1]]``, the first element of :attr:`indptr` is always
+    We use :attr:`indptr` to denote the start pointer of each segment in the batch. The query
+    of the i-th segment is ``q[indptr[i]:indptr[i+1]]``, and its key is
+    ``k[indptr[i]:indptr[i+1]]``. The first element of :attr:`indptr` is always
     0 and the last element of :attr:`indptr` is the total number of queries/keys in the batch.
     Please see :ref:`Ragged Tensor tutorial <kv-layout>` for more details about the
     ragged tensor.
@@ -453,11 +453,10 @@ def apply_rope_inplace(
     Parameters
     ----------
     q : torch.Tensor
-        Query ragged tensor, shape: ``(nnz, num_q_heads, head_dim)`, where ``nnz`` is the last
-        element of ``indptr``.
+        Query ragged tensor, shape: ``(nnz, num_q_heads, head_dim)``, where
+        ``nnz`` is the number of query/key rows.
     k : torch.Tensor
-        Key ragged tensor, shape: ``(nnz, num_k_heads, head_dim)``, where ``nnz`` is the last
-        element of ``indptr``.
+        Key ragged tensor, shape: ``(nnz, num_k_heads, head_dim)``.
     indptr : torch.Tensor
         Indptr tensor, shape: ``(batch_size + 1)``.
     offsets : torch.Tensor
@@ -530,21 +529,17 @@ def apply_rope_pos_ids_inplace(
     r"""Apply rotary embedding to a batch of queries/keys (stored as RaggedTensor) in place.
     cos/sin values are computed on the fly inside the kernel.
 
-    We use :attr:`indptr` to denote the start pointer of each segment in the batch, the i-th
-    segment the query of the i-th segment is ``q[indptr[i]:indptr[i+1]]`` and the key of the
-    i-th segment is ``k[indptr[i]:indptr[i+1]]``, the first element of :attr:`indptr` is always
-    0 and the last element of :attr:`indptr` is the total number of queries/keys in the batch.
+    Each element of :attr:`pos_ids` gives the position of the corresponding query/key row.
     Please see :ref:`Ragged Tensor tutorial <kv-layout>` for more details about the
     ragged tensor.
 
     Parameters
     ----------
     q : torch.Tensor
-        Query ragged tensor, shape: ``(nnz, num_q_heads, head_dim)`, where ``nnz`` is the last
-        element of ``indptr``.
+        Query ragged tensor, shape: ``(nnz, num_q_heads, head_dim)``, where
+        ``nnz`` is the number of query/key rows.
     k : torch.Tensor
-        Key ragged tensor, shape: ``(nnz, num_k_heads, head_dim)``, where ``nnz`` is the last
-        element of ``indptr``.
+        Key ragged tensor, shape: ``(nnz, num_k_heads, head_dim)``.
     pos_ids : torch.Tensor
         Position indices, shape: ``(nnz)``.
     rotary_dim : Optional[int]
@@ -593,9 +588,9 @@ def apply_llama31_rope_inplace(
     r"""Apply Llama 3.1-style rotary embedding to a batch of queries/keys (stored as
     RaggedTensor) in place. cos/sin values are computed on the fly inside the kernel.
 
-    We use :attr:`indptr` to denote the start pointer of each segment in the batch, the i-th
-    segment the query of the i-th segment is ``q[indptr[i]:indptr[i+1]]`` and the key of the
-    i-th segment is ``k[indptr[i]:indptr[i+1]]``, the first element of :attr:`indptr` is always
+    We use :attr:`indptr` to denote the start pointer of each segment in the batch. The query
+    of the i-th segment is ``q[indptr[i]:indptr[i+1]]``, and its key is
+    ``k[indptr[i]:indptr[i+1]]``. The first element of :attr:`indptr` is always
     0 and the last element of :attr:`indptr` is the total number of queries/keys in the batch.
     Please see :ref:`Ragged Tensor tutorial <kv-layout>` for more details about the
     ragged tensor.
@@ -603,11 +598,10 @@ def apply_llama31_rope_inplace(
     Parameters
     ----------
     q : torch.Tensor
-        Query ragged tensor, shape: ``(nnz, num_q_heads, head_dim)``, where ``nnz`` is the last
-        element of ``indptr``.
+        Query ragged tensor, shape: ``(nnz, num_q_heads, head_dim)``, where
+        ``nnz`` is the number of query/key rows.
     k : torch.Tensor
-        Key ragged tensor, shape: ``(nnz, num_k_heads, head_dim)``, where ``nnz`` is the last
-        element of ``indptr``.
+        Key ragged tensor, shape: ``(nnz, num_k_heads, head_dim)``.
     indptr : torch.Tensor
         Indptr tensor, shape: ``(batch_size + 1)``.
     offsets : torch.Tensor
@@ -701,21 +695,17 @@ def apply_llama31_rope_pos_ids_inplace(
     r"""Apply Llama 3.1-style rotary embedding to a batch of queries/keys (stored as
     RaggedTensor) in place. cos/sin values are computed on the fly inside the kernel.
 
-    We use :attr:`indptr` to denote the start pointer of each segment in the batch, the i-th
-    segment the query of the i-th segment is ``q[indptr[i]:indptr[i+1]]`` and the key of the
-    i-th segment is ``k[indptr[i]:indptr[i+1]]``, the first element of :attr:`indptr` is always
-    0 and the last element of :attr:`indptr` is the total number of queries/keys in the batch.
+    Each element of :attr:`pos_ids` gives the position of the corresponding query/key row.
     Please see :ref:`Ragged Tensor tutorial <kv-layout>` for more details about the
     ragged tensor.
 
     Parameters
     ----------
     q : torch.Tensor
-        Query ragged tensor, shape: ``(nnz, num_q_heads, head_dim)``, where ``nnz`` is the last
-        element of ``indptr``.
+        Query ragged tensor, shape: ``(nnz, num_q_heads, head_dim)``, where
+        ``nnz`` is the number of query/key rows.
     k : torch.Tensor
-        Key ragged tensor, shape: ``(nnz, num_k_heads, head_dim)``, where ``nnz`` is the last
-        element of ``indptr``.
+        Key ragged tensor, shape: ``(nnz, num_k_heads, head_dim)``.
     pos_ids : torch.Tensor
         Position indices, shape: ``(nnz)``.
     rotary_dim : Optional[int]
@@ -778,9 +768,9 @@ def apply_rope(
     r"""Apply rotary embedding to a batch of queries/keys (stored as RaggedTensor).
     cos/sin values are computed on the fly inside the kernel.
 
-    We use :attr:`indptr` to denote the start pointer of each segment in the batch, the i-th
-    segment the query of the i-th segment is ``q[indptr[i]:indptr[i+1]]`` and the key of the
-    i-th segment is ``k[indptr[i]:indptr[i+1]]``, the first element of :attr:`indptr` is always
+    We use :attr:`indptr` to denote the start pointer of each segment in the batch. The query
+    of the i-th segment is ``q[indptr[i]:indptr[i+1]]``, and its key is
+    ``k[indptr[i]:indptr[i+1]]``. The first element of :attr:`indptr` is always
     0 and the last element of :attr:`indptr` is the total number of queries/keys in the batch.
     Please see :ref:`Ragged Tensor tutorial <kv-layout>` for more details about the
     ragged tensor.
@@ -788,11 +778,10 @@ def apply_rope(
     Parameters
     ----------
     q : torch.Tensor
-        Query ragged tensor, shape: ``(nnz, num_q_heads, head_dim)`, where ``nnz`` is the last
-        element of ``indptr``.
+        Query ragged tensor, shape: ``(nnz, num_q_heads, head_dim)``, where
+        ``nnz`` is the number of query/key rows.
     k : torch.Tensor
-        Key ragged tensor, shape: ``(nnz, num_k_heads, head_dim)``, where ``nnz`` is the last
-        element of ``indptr``.
+        Key ragged tensor, shape: ``(nnz, num_k_heads, head_dim)``.
     indptr : torch.Tensor
         Indptr tensor, shape: ``(batch_size + 1)``.
     offsets : torch.Tensor
@@ -888,23 +877,19 @@ def apply_rope_pos_ids(
     r"""Apply rotary embedding to a batch of queries/keys (stored as RaggedTensor).
     cos/sin values are computed on the fly inside the kernel.
 
-    We use :attr:`indptr` to denote the start pointer of each segment in the batch, the i-th
-    segment the query of the i-th segment is ``q[indptr[i]:indptr[i+1]]`` and the key of the
-    i-th segment is ``k[indptr[i]:indptr[i+1]]``, the first element of :attr:`indptr` is always
-    0 and the last element of :attr:`indptr` is the total number of queries/keys in the batch.
+    Each element of :attr:`pos_ids` gives the position of the corresponding query/key row.
     Please see :ref:`Ragged Tensor tutorial <kv-layout>` for more details about the
     ragged tensor.
 
     Parameters
     ----------
     q : torch.Tensor
-        Query ragged tensor, shape: ``(nnz, num_q_heads, head_dim)`, where ``nnz`` is the last
-        element of ``indptr``.
+        Query ragged tensor, shape: ``(nnz, num_q_heads, head_dim)``, where
+        ``nnz`` is the number of query/key rows.
     k : torch.Tensor
-        Key ragged tensor, shape: ``(nnz, num_k_heads, head_dim)``, where ``nnz`` is the last
-        element of ``indptr``.
+        Key ragged tensor, shape: ``(nnz, num_k_heads, head_dim)``.
     pos_ids : torch.Tensor
-        Position indices, shape: ``(batch_size + 1)``.
+        Position indices, shape: ``(nnz)``.
     rotary_dim : Optional[int]
         The dimensions to apply RoPE, if ``None``, we apply RoPE to the entire head dimension,
         otherwise, we apply RoPE to the first ``rotary_dim`` dimensions, default: ``None``.
@@ -961,9 +946,9 @@ def apply_llama31_rope(
     r"""Apply Llama 3.1-style rotary embedding to a batch of queries/keys (stored as
     RaggedTensor). cos/sin values are computed on the fly inside the kernel.
 
-    We use :attr:`indptr` to denote the start pointer of each segment in the batch, the i-th
-    segment the query of the i-th segment is ``q[indptr[i]:indptr[i+1]]`` and the key of the
-    i-th segment is ``k[indptr[i]:indptr[i+1]]``, the first element of :attr:`indptr` is always
+    We use :attr:`indptr` to denote the start pointer of each segment in the batch. The query
+    of the i-th segment is ``q[indptr[i]:indptr[i+1]]``, and its key is
+    ``k[indptr[i]:indptr[i+1]]``. The first element of :attr:`indptr` is always
     0 and the last element of :attr:`indptr` is the total number of queries/keys in the batch.
     Please see :ref:`Ragged Tensor tutorial <kv-layout>` for more details about the
     ragged tensor.
@@ -971,11 +956,10 @@ def apply_llama31_rope(
     Parameters
     ----------
     q : torch.Tensor
-        Query ragged tensor, shape: ``(nnz, num_q_heads, head_dim)``, where ``nnz`` is the last
-        element of ``indptr``.
+        Query ragged tensor, shape: ``(nnz, num_q_heads, head_dim)``, where
+        ``nnz`` is the number of query/key rows.
     k : torch.Tensor
-        Key ragged tensor, shape: ``(nnz, num_k_heads, head_dim)``, where ``nnz`` is the last
-        element of ``indptr``.
+        Key ragged tensor, shape: ``(nnz, num_k_heads, head_dim)``.
     indptr : torch.Tensor
         Indptr tensor, shape: ``(batch_size + 1)``.
     offsets : torch.Tensor
@@ -1083,21 +1067,17 @@ def apply_llama31_rope_pos_ids(
     r"""Apply Llama 3.1-style rotary embedding to a batch of queries/keys (stored as
     RaggedTensor). cos/sin values are computed on the fly inside the kernel.
 
-    We use :attr:`indptr` to denote the start pointer of each segment in the batch, the i-th
-    segment the query of the i-th segment is ``q[indptr[i]:indptr[i+1]]`` and the key of the
-    i-th segment is ``k[indptr[i]:indptr[i+1]]``, the first element of :attr:`indptr` is always
-    0 and the last element of :attr:`indptr` is the total number of queries/keys in the batch.
+    Each element of :attr:`pos_ids` gives the position of the corresponding query/key row.
     Please see :ref:`Ragged Tensor tutorial <kv-layout>` for more details about the
     ragged tensor.
 
     Parameters
     ----------
     q : torch.Tensor
-        Query ragged tensor, shape: ``(nnz, num_q_heads, head_dim)``, where ``nnz`` is the last
-        element of ``indptr``.
+        Query ragged tensor, shape: ``(nnz, num_q_heads, head_dim)``, where
+        ``nnz`` is the number of query/key rows.
     k : torch.Tensor
-        Key ragged tensor, shape: ``(nnz, num_k_heads, head_dim)``, where ``nnz`` is the last
-        element of ``indptr``.
+        Key ragged tensor, shape: ``(nnz, num_k_heads, head_dim)``.
     pos_ids : torch.Tensor
         Position indices, shape: ``(nnz)``.
     rotary_dim : Optional[int]
@@ -1617,7 +1597,9 @@ def rope_quantize_fp8_append_paged_kv_cache(
         For GQA/MHA: ``(k_cache, v_cache)`` where:
             - k_cache: ``(max_pages, page_size, num_kv_heads, head_dim)`` or
               ``(max_pages, num_kv_heads, page_size, head_dim)`` depending on layout, in FP8
-            - v_cache: same shape as k_cache, in FP8
+            - v_cache: same page size, head count and head dim as k_cache, in FP8; its
+              strides may differ from k_cache's, e.g. padded rows. Both caches are indexed
+              with the same ``kv_indices``, so each must hold every page listed there.
     kv_indices : torch.Tensor
         Page indices mapping, shape: ``(total_pages,)``. Typically ``torch.arange(total_pages)``.
     kv_indptr : torch.Tensor
@@ -1663,6 +1645,9 @@ def rope_quantize_fp8_append_paged_kv_cache(
     - The ``batch_indices`` and ``positions`` tensors are typically obtained from
       ``flashinfer.get_batch_indices_positions()``.
     - Cache tensors must already be allocated in the target FP8 dtype.
+    - ``rope_dim`` and ``no_rope_dim`` must be multiples of 16, and the rows of every input,
+      Q output and cache tensor must start on 16-byte boundaries (strides that are multiples
+      of 16 bytes); otherwise a ``ValueError`` is raised.
     """
     if cos_sin_cache.dtype != torch.float32:
         raise ValueError("cos_sin_cache should be float32")

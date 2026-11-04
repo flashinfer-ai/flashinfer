@@ -8,6 +8,8 @@ UNIT_TEST_RUN_STARTED_SECONDS=${SECONDS}
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RUNNER="${SCRIPT_DIR}/unit_test_runner.py"
+# shellcheck source=scripts/test_resource_monitor.sh
+source "${SCRIPT_DIR}/test_resource_monitor.sh"
 SUMMARY_PRINTED=false
 CURRENT_PHASE="preflight"
 LAST_ERROR_COMMAND=""
@@ -35,6 +37,7 @@ print_fallback_summary() {
     if [ "$#" -gt 0 ]; then
         shell_status=$1
     fi
+    stop_resource_monitor
     if [ "${SUMMARY_PRINTED}" = "true" ]; then
         return
     fi
@@ -119,6 +122,7 @@ main() {
     TEST_PATH="${runner_settings[1]}"
 
     export JUNIT_DIR SAMPLE_RATE SAMPLE_OFFSET TEST_PATH
+    start_resource_monitor
 
     if [ "$operation" = "plan" ]; then
         echo "🔍 DRY RUN MODE - collecting and writing a deterministic plan only"
@@ -143,7 +147,11 @@ main() {
         cuda_major=$(python -c \
             'import torch; v=torch.version.cuda; print(v.split(".")[0] if v else "0")' \
             2>/dev/null || echo 0)
-        if [[ "${TEST_PATH:-}" == *moe_ep* ]] && [ "${cuda_major}" -ge 13 ]; then
+        # Match tests/moe_ep as whole path components: file names such as
+        # tests/experimental/test_cake_mxfp8_megamoe_ep16.py contain "moe_ep"
+        # but do not use this stack.
+        if [[ " ${TEST_PATH:-} " == *[[:space:]/]tests/moe_ep[[:space:]/]* ]] \
+            && [ "${cuda_major}" -ge 13 ]; then
             FI_SRC="$(pwd)" bash docker/install/build_flashinfer_ep_pytorch.sh
             # The installer's exports do not reach this shell. Non-root jobs
             # need the wheel's NCCL library ahead of the image's system copy.

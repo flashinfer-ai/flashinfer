@@ -87,6 +87,16 @@ When a FlashInfer operation executes, the autotuner resolves the best
    environment variable is set and tuning mode is off).
 5. **Fallback tactic (−1)** — a safe default that every runner must implement.
 
+Outside tuning mode, a lookup whose bucket lies above every bucket tuned for
+the operation (same runners, cache-key extras and non-dynamic dimensions)
+repeats levels 1–4 at the largest tuned bucket before using the fallback, and
+logs this once at INFO.  The largest tuned bucket is taken from levels 1–3;
+bundled package configs (level 4) are not scanned for it.  This covers runtime
+sizes above the tuned range and tuning under ``autotune(tuning_buckets=...)``
+whose top bucket the operation's own bucket mapper never produces.  Lookups
+below or between tuned buckets still use the fallback, and replay coverage
+reports still count such a lookup as a miss.
+
 Notably, user-loaded file configs (level 2) are
 **always consulted, even during tuning mode**, so that already-tuned shapes
 from a cache file are never re-profiled.
@@ -427,6 +437,51 @@ with ``torchrun``), you could use separate output files per rank and merge them 
    ``rename()`` syscall.  This is atomic on all local filesystems and is
    expected to be atomic on most network filesystems (NFS, Lustre) per POSIX
    semantics.  FlashInfer's cubin caching also relies on this guarantee.
+
+Custom tuning protocols
+-----------------------
+
+Operations with their own tuning loop can implement ``TuningProtocol.run(context)``
+and call ``AutoTuner.get().choose_with_protocol(namespace, protocol)``. This works
+for single-device and distributed operations. AutoTuner holds its lock while
+calling the protocol, supplies the current controls, and updates statistics from
+the returned ``TuningResult``. The protocol owns candidate preparation,
+measurement, cache selection and result installation.
+
+The method always calls the protocol, including when tuning is disabled or the
+operation is in ``skip_ops``. A disabled protocol can select a cached result or
+use its fallback. When ``context.skipped`` is true, it must use the fallback
+without cache selection. ``force_tune=True`` requests a fresh search regardless
+of the ambient tuning mode or ``skip_ops``; the protocol must honor that flag.
+It does not enable disk persistence.
+
+``TuningContext`` provides ``lookup(key)``, ``records()`` and
+``publish(key, value)`` for namespaced JSON records. The protocol defines its
+keys and compatibility rules; ``records()`` returns a copy for lookups such as
+capacity fallback. Returning a ``TuningResult`` does not publish a record.
+``context.publish()`` keeps the record in memory and writes it to the active
+managed store when ambient tuning is enabled and the operation is not in
+``skip_ops``. ``force_tune`` does not override these write controls.
+With ``autotune_v2()``, that store is
+attached automatically and remains available after context exit.
+``persistent_cache=False`` keeps records in memory. Protocols must also honor
+``context.disk_cache_enabled`` for any compatibility-file I/O. Results use the
+same managed entries and atomic writer as runner tactics, with a tagged key
+identifying the protocol namespace and record. Each protocol defines its JSON
+payload; adding another protocol does not require a new cache format.
+
+Protocols must implement or reject ``context.measurement_policy`` and inherited
+graph replay counts, ``context.tuning_buckets`` and ``context.round_up``. They
+manage numerical checks, capture restrictions and
+allocation lifetime. Distributed protocols must coordinate collective execution
+and cache decisions, including which participants publish a shared result;
+AutoTuner provides no cross-process synchronization.
+
+``context.cache_identity`` changes when the active store, measurement policy or
+skip state changes, or when caches are cleared or reloaded. Use it to invalidate
+prepared selections. Protocol records are separate from v1 JSON import/export.
+Existing ``autotune()`` controls can be nested as specified by v2; they do not
+import or export protocol records.
 
 cuTile Autotuning
 -----------------

@@ -24,6 +24,8 @@ from typing import Optional, Sequence, Tuple
 
 import torch
 
+from flashinfer.moe_ep._compat import deprecated_aliases
+
 Mxfp8BlockSize = 32
 Nvfp4BlockSize = 16
 GateUpInterleave = 16  # fixed by the swap-AB gated-act epilogue (gate/up stripe)
@@ -301,7 +303,8 @@ def preprocess_block_scaled_weights(
     ):
         raise ValueError("canonical weight shapes must be [E, 2I, H] and [E, H, I].")
     intermediate_alignment = 4 * sf_vec if quant_kind == "mxfp4_mxfp8" else 2 * sf_vec
-    if hidden % (4 * sf_vec) or intermediate_size % intermediate_alignment:
+    hidden_alignment = 64 if quant_kind in ("mxfp8_e4m3", "mxfp8_e5m2") else 4 * sf_vec
+    if hidden % hidden_alignment or intermediate_size % intermediate_alignment:
         raise ValueError(
             "weight dimensions do not satisfy the block-scaled scale-vector alignment."
         )
@@ -389,7 +392,8 @@ def preprocess_prequantized_block_scaled_weights(
     if experts <= 0 or hidden_size <= 0 or intermediate_size <= 0:
         raise ValueError("expert count, hidden, and intermediate must be positive.")
     intermediate_alignment = 4 * sf_vec if quant_kind == "mxfp4_mxfp8" else 2 * sf_vec
-    if hidden_size % (4 * sf_vec) or intermediate_size % intermediate_alignment:
+    hidden_alignment = 64 if quant_kind in ("mxfp8_e4m3", "mxfp8_e5m2") else 4 * sf_vec
+    if hidden_size % hidden_alignment or intermediate_size % intermediate_alignment:
         raise ValueError(
             "weight dimensions do not satisfy the block-scaled scale-vector alignment."
         )
@@ -508,6 +512,7 @@ def round_trip_combine(tensor: torch.Tensor, combine_dtype: str) -> torch.Tensor
     raise ValueError(f"unsupported combine_dtype {combine_dtype!r}")
 
 
+@deprecated_aliases(apply_topk_at_fc1="apply_routing_weights_before_fc2")
 def compute_megamoe_reference_block_scaled(
     x_data: torch.Tensor,
     x_sf: torch.Tensor,
@@ -521,7 +526,7 @@ def compute_megamoe_reference_block_scaled(
     quant_kind: str,
     local_expert_offset: int,
     gate_up_clamp: Optional[float],
-    apply_topk_at_fc1: bool,
+    apply_routing_weights_before_fc2: bool,
     num_tokens: Optional[int] = None,
     weight_scales_are_swizzled: bool = False,
     combine_dtype: str = "bf16",
@@ -531,6 +536,9 @@ def compute_megamoe_reference_block_scaled(
     fc1_alpha: Optional[torch.Tensor] = None,
     fc2_alpha: Optional[torch.Tensor] = None,
     fc1_norm_const: Optional[torch.Tensor] = None,
+    swiglu_alpha: Optional[float] = None,
+    swiglu_beta: Optional[float] = None,
+    fc1_activation_per_token_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Pure-torch single-rank oracle for the Blackwell block-scaled kernel.
 
@@ -545,8 +553,10 @@ def compute_megamoe_reference_block_scaled(
     ``(E, 2I, hidden/vec)``; ``fc2_weight_k_major (E, hidden, I[packed])`` with
     raw SF ``(E, hidden, I/vec)``.
     """
-    if (situ_beta is None) != (situ_linear_beta is None):
-        raise ValueError("SiTU requires both beta parameters.")
+    if situ_beta is None and situ_linear_beta is not None:
+        raise ValueError("situ_linear_beta requires situ_beta.")
+    if (swiglu_alpha is None) != (swiglu_beta is None):
+        raise ValueError("swiglu_alpha and swiglu_beta must be set together.")
     device = topk_idx.device
     tokens = x_data.shape[0] if num_tokens is None else num_tokens
     num_local_experts, fc1_out, _ = fc1_weight_k_major.shape
@@ -572,6 +582,8 @@ def compute_megamoe_reference_block_scaled(
         fc1 = x[src_t] @ w1.transpose(0, 1)  # (v, 2I): (pair, {gate,up}, 16)
         if fc1_alpha is not None:
             fc1 = fc1 * fc1_alpha[local_e]
+        if fc1_activation_per_token_scale is not None:
+            fc1 *= fc1_activation_per_token_scale[src_t, None]
         pairs = fc1.view(-1, intermediate // GateUpInterleave, 2, GateUpInterleave)
         gate, up = pairs[:, :, 0, :], pairs[:, :, 1, :]
         if gate_up_clamp is not None:
@@ -579,11 +591,16 @@ def compute_megamoe_reference_block_scaled(
             up = up.clamp(min=-gate_up_clamp, max=gate_up_clamp)
         if situ_beta is not None:
             gate = situ_beta * torch.tanh(gate / situ_beta) * torch.sigmoid(gate)
-            up = situ_linear_beta * torch.tanh(up / situ_linear_beta)
+            if situ_linear_beta is not None:
+                up = situ_linear_beta * torch.tanh(up / situ_linear_beta)
             act = (up * gate).reshape(-1, intermediate)
         else:
-            act = (up * (gate * torch.sigmoid(gate))).reshape(-1, intermediate)
-        if apply_topk_at_fc1:
+            alpha = 1.0 if swiglu_alpha is None else swiglu_alpha
+            beta = 0.0 if swiglu_beta is None else swiglu_beta
+            act = ((up + beta) * gate * torch.sigmoid(alpha * gate)).reshape(
+                -1, intermediate
+            )
+        if apply_routing_weights_before_fc2:
             act = act * topk_weights[src_t, src_k].to(torch.float32).unsqueeze(-1)
         # In-kernel FC2-input requantization (the FC1->FC2 wire format).
         norm_const = 1.0 if fc1_norm_const is None else fc1_norm_const[local_e]
@@ -599,7 +616,7 @@ def compute_megamoe_reference_block_scaled(
         if fc2_alpha is not None:
             term = term * fc2_alpha[local_e]
         term = round_trip_combine(term, combine_dtype)
-        if not apply_topk_at_fc1:
+        if not apply_routing_weights_before_fc2:
             term = term * topk_weights[src_t, src_k].to(torch.float32).unsqueeze(-1)
         output.index_add_(0, src_t, term)
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 
 import torch
 
@@ -20,6 +21,12 @@ def make_workspace_config(
     tuning = {name: getattr(k, name) for name in KNOB_KEYS if hasattr(k, name)}
     tuning["reduce_topk_in_kernel"] = k.in_kernel_fc2_reduce
     tuning.update(overrides)
+    if k.max_sm_count is not None:
+        # An SM budget (e.g. to leave SMs to a concurrent shared-expert MLP on a
+        # side stream) needs a uniform cluster launch: the mixed-CGA fallback
+        # occupancy is resolved from the hardware probe, so cached / heuristic
+        # knobs that name a fallback cluster are launched uniformly instead.
+        tuning["fallback_cluster_shape_mn"] = None
     for name in (
         "mma_tiler_mnk",
         "cluster_shape_mn",
@@ -44,7 +51,7 @@ def make_workspace_config(
             activation=k.activation,
             situ_beta=k.situ_beta,
             situ_linear_beta=k.situ_linear_beta,
-            apply_topk_at_fc1=k.apply_topk_in_fc1,
+            apply_routing_weights_before_fc2=k.apply_routing_weights_before_fc2,
             max_sm_count=k.max_sm_count,
             **tuning,
         )
@@ -67,7 +74,7 @@ def validate_input_norm_const(value, *, name="input_norm_const") -> None:
 
 
 def validate_nvfp4_scalars(values, *, num_local_experts, device) -> None:
-    """Check local-expert FP32 vectors without host reads or graph breaks."""
+    """Validate FP32 expert vectors, allowing strided inputs for the copy path."""
     for name, value in values.items():
         if value is None:
             continue
@@ -75,10 +82,9 @@ def validate_nvfp4_scalars(values, *, num_local_experts, device) -> None:
             not isinstance(value, torch.Tensor)
             or value.shape != (num_local_experts,)
             or value.dtype != torch.float32
-            or not value.is_contiguous()
         ):
             raise MoEEpConfigError(
-                f"{name} must be a contiguous float32 vector of {num_local_experts} local experts"
+                f"{name} must be a float32 vector of {num_local_experts} local experts"
             )
         if not value.is_cuda or value.device != device:
             raise MoEEpConfigError(
@@ -106,8 +112,8 @@ def validate_forward_metadata(
         raise MoEEpConfigError("hidden_states must be 2D [num_tokens, hidden]")
     tokens, cols = hidden_states.shape
     hidden = fleet_params.token_hidden_size
-    fp4 = quant_kind == "nvfp4"
-    if quant_kind not in ("nvfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8"):
+    fp4 = quant_kind in ("nvfp4", "mxfp4")
+    if quant_kind not in ("nvfp4", "mxfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8"):
         raise MoEEpConfigError(f"unsupported quant_kind {quant_kind!r}")
     expected_cols = hidden // 2 if fp4 and not quantize_input else hidden
     if tokens > fleet_params.max_tokens_per_rank or cols != expected_cols:
@@ -143,7 +149,7 @@ def validate_forward_metadata(
             raise MoEEpConfigError(
                 "MoEEpTensors.scales is required when quantize_input=False"
             )
-        sf_cols = hidden // (16 if fp4 else 32)
+        sf_cols = hidden // (16 if quant_kind == "nvfp4" else 32)
         padded_cols = (sf_cols + 3) // 4 * 4
         if (
             scales.ndim != 2
@@ -153,7 +159,9 @@ def validate_forward_metadata(
             raise MoEEpConfigError(
                 f"scales must have {tokens} rows and {sf_cols}..{padded_cols} columns"
             )
-        expected_sf = torch.float8_e4m3fn if fp4 else torch.float8_e8m0fnu
+        expected_sf = (
+            torch.float8_e4m3fn if quant_kind == "nvfp4" else torch.float8_e8m0fnu
+        )
         if scales.dtype not in (expected_sf, torch.uint8):
             raise MoEEpConfigError(
                 f"scales must have dtype {expected_sf} or uint8 containing its raw bytes"
@@ -169,21 +177,38 @@ def validate_forward_metadata(
         raise MoEEpConfigError("SM107 inputs must be on the current CUDA device")
 
 
-def validate_routing_values(topk_ids, topk_weights, num_experts: int) -> None:
-    """Device assertions run before dispatch, including during graph replay.
+def validate_routing_values(
+    topk_ids, topk_weights, num_experts: int, *, workspace=None
+) -> None:
+    """Check routing values when FLASHINFER_SM107_MEGA_CHECK_ROUTES=1.
 
     Duplicate valid routes violate the router's workspace capacity proof.
-    -1 is a masked slot; all other IDs must be in range. A failed CUDA
-    assertion invalidates that worker's CUDA context, as with invalid indices
-    in other CUDA indexing operations.
+    -1 is a masked slot whose score is ignored; all other IDs must be in range
+    and have finite scores. A failed CUDA assertion invalidates that worker's
+    CUDA context, as with invalid indices in other CUDA indexing operations.
     """
+    if os.environ.get("FLASHINFER_SM107_MEGA_CHECK_ROUTES", "0") == "0":
+        return
+    if (
+        topk_ids.is_cuda
+        and topk_ids.is_contiguous()
+        and topk_weights.is_contiguous()
+        and topk_ids.shape[1] <= 32
+        and topk_weights.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        and os.environ.get("FLASHINFER_SM107_FUSED_ROUTE_CHECK", "1") != "0"
+    ):
+        from .routing_validation import check_routing
+
+        check_routing(topk_ids, topk_weights, num_experts, workspace)
+        return
     ordered = topk_ids.sort(dim=1).values
     unique = (ordered[:, 1:] != ordered[:, :-1]) | (ordered[:, 1:] == -1)
     valid = ((topk_ids >= -1) & (topk_ids < num_experts)).all()
-    valid = valid & unique.all() & torch.isfinite(topk_weights).all()
+    finite = ((topk_ids == -1) | torch.isfinite(topk_weights)).all()
+    valid = valid & unique.all() & finite
     torch._assert_async(
         valid,
-        "SM107 routes require unique expert IDs in [0, E), or -1, and finite scores",
+        "SM107 routes require unique expert IDs in [0, E), or -1, and finite scores for valid routes",
     )
 
 

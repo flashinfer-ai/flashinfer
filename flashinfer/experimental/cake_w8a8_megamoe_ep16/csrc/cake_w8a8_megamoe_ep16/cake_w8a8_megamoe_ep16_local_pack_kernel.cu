@@ -60,9 +60,10 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define THREADS 256
 
 #include <math_constants.h>
+
 extern "C" {
 
-__global__ __launch_bounds__(THREADS) void kernel_cake_w8a8_megamoe_ep16_local_pack(
+__global__ __launch_bounds__(256) void kernel_cake_w8a8_megamoe_ep16_local_pack(
     float* __restrict__ recv_weights, int* __restrict__ expert_counts, int* __restrict__ route_map,
     int* __restrict__ inverse_rows, int* __restrict__ overflow, uint8_t* __restrict__ quantized,
     uint8_t* __restrict__ scales_cp, unsigned int* __restrict__ push_generation,

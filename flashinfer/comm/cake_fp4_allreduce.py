@@ -23,8 +23,9 @@ rank-order sum of the quantised partials and bitwise identical on every rank.
 World size 2 runs a one-shot exchange; world size 4 a two-shot exchange whose
 owner ranks (``row % 4``) reduce, re-encode and all-gather, in one of three
 phase-B schedules chosen per call from the rows each CTA owns.  The
-``rmsnorm`` family (world size 2) fuses the one-shot exchange with the
-residual add and a Gemma RMSNorm: ``z = sum + residual`` in float32,
+``rmsnorm`` family fuses the exchange (world size 2: the one-shot; world
+size 4: the two-shot, bfloat16 input and output) with the residual add and an
+RMSNorm (Gemma's with ``weight_bias = 1``): ``z = sum + residual`` in float32,
 ``residual_out = bf16(z)``, ``rinv = rsqrt(mean(z^2) + eps)`` from the float32
 sum of squares, ``y = bf16(z) * rinv * (weight_bias + weight)`` written as
 bfloat16 or quantised to NVFP4 / MXFP8 in the layouts of ``fp4_quantize`` /
@@ -42,11 +43,11 @@ Usage protocol::
     # 3. Destroy collectively after the last launch completed
     workspace.destroy()
 
-Requirements: two or four ranks (two for ``rmsnorm``) on one node with CUDA
+Requirements: two or four ranks on one node with CUDA
 IPC peer access, SM100 (B200), SM103 (B300) or SM107 devices with the same SM count
 that are build targets of this process (``FLASHINFER_CUDA_ARCH_LIST`` when
 set, else the visible devices), hidden size 6144, contiguous tensors on the
-workspace device and ``rows <= capacity`` (a multiple of 4 for world size 4).
+workspace device and ``1 <= rows <= capacity`` (any row count).
 A call allocates nothing when every output buffer is given and performs no
 host synchronisation, so it can be captured into a CUDA graph.
 """
@@ -71,6 +72,7 @@ from ..jit.cake_fp4_allreduce import (
     device_facts,
     evaluate_linear_form,
     get_cake_fp4_allreduce_module,
+    grid_max,
     program_for,
     program_record,
     target_arch,
@@ -236,10 +238,6 @@ def _check_capacity(capacity: int, family: str, world_size: int) -> int:
     return capacity
 
 
-def _row_multiple(world_size: int) -> int:
-    return int(LIMITS["tp4_row_multiple"]) if int(world_size) == 4 else 1
-
-
 def _as_int32(word: int) -> int:
     return word - (1 << 32) if word >= (1 << 31) else word
 
@@ -261,14 +259,17 @@ class CakeFp4AllReduceWorkspace:
 
     Every rank of ``group`` constructs one instance with the same ``family``,
     ``input_format`` and ``capacity``.  ``family`` is ``"allreduce"`` (world
-    size 2 or 4; the sum of the partials) or ``"rmsnorm"`` (world size 2; the
-    sum fused with the residual add and the RMSNorm, any output format per
-    call); ``input_format`` is ``"bf16"`` (activations) or ``"nvfp4"``
+    size 2 or 4; the sum of the partials) or ``"rmsnorm"`` (the sum fused with
+    the residual add and the RMSNorm: world size 2 with any output format per
+    call, world size 4 with bfloat16 input and output); ``input_format`` is ``"bf16"`` (activations) or ``"nvfp4"``
     (pre-quantised records).  ``capacity`` is the largest row count a call may
     carry (at most 103000 for world size 4).  The receive windows are shared
     through CUDA IPC, armed with their Lamport sentinels and published in the
-    peer window table; the call-state words start at zero.  The CTA count of
-    every launch is the SM count of the device and must agree on every rank.
+    peer window table; the control window (the registry's control words: one
+    four-word call-state slot per CTA) starts at zero.  The CTA count of every
+    launch is the SM count of the device, at most the grid bound of the
+    workspace's programs (the CTAs their control window provisions for), and
+    must agree on every rank.
     Construction loads (and on first use compiles) every program this
     workspace can launch for the device's exact target.  ``destroy()``
     releases the shared windows and is collective as well.
@@ -295,28 +296,23 @@ class CakeFp4AllReduceWorkspace:
         self.family = family
         self.input_format = input_format
         self.capacity = _check_capacity(capacity, family, self.world_size)
-        self.row_multiple = _row_multiple(self.world_size)
         device = torch.device(torch.cuda.current_device() if device is None else device)
         if device.type != "cuda":
             raise ValueError(f"the workspace needs a CUDA device, got {device}")
         index = torch.cuda.current_device() if device.index is None else device.index
         self.device = torch.device("cuda", index)
         self.target = target_arch(index)
-        grid = device_facts(index).sm_count
-        if (family, self.world_size) == ("allreduce", 2) and grid > int(
-            LIMITS["tp2_oneshot_grid_max"]
-        ):
-            raise ValueError(
-                "the world-size-2 all-reduce holds call state for at most "
-                f"{LIMITS['tp2_oneshot_grid_max']} CTAs, the device has {grid} SMs"
-            )
-        self.grid = int(grid)
         self.plan = cake_fp4_allreduce_window_plan(
             family, self.world_size, input_format, self.capacity
         )
         self.programs = workspace_programs(
             family, self.world_size, input_format, self.target
         )
+        # Every CTA owns a four-word call-state slot of the control window, so
+        # the programs bound the CTA count (``grid_max``, the same on every
+        # path: one-shot, two-shot and fused norm); the launch uses the
+        # device's SM count up to that bound.
+        self.grid = min(int(device_facts(index).sm_count), grid_max(self.programs))
         self._modules = {
             program: get_cake_fp4_allreduce_module(program, self.target)
             for program in self.programs
@@ -334,7 +330,8 @@ class CakeFp4AllReduceWorkspace:
         if any(value != self.grid for value in grids):
             raise RuntimeError(
                 "the Cake NVFP4-transport all-reduce needs the same CTA count "
-                f"(SM count) on every rank, got {grids}"
+                f"(the SM count within the programs' grid bound) on every rank, "
+                f"got {grids}"
             )
         self._shared: dict[str, list[int]] = {}
         self._views: list[torch.Tensor] = []
@@ -431,11 +428,6 @@ def _check_workspace(
 def _check_rows(rows: int, workspace: CakeFp4AllReduceWorkspace) -> None:
     if rows < 1 or rows > workspace.capacity:
         raise ValueError(f"rows must be in [1, {workspace.capacity}], got {rows}")
-    if rows % workspace.row_multiple:
-        raise ValueError(
-            f"world size {workspace.world_size} needs rows to be a multiple of "
-            f"{workspace.row_multiple}, got {rows}"
-        )
 
 
 def _check_activation(
@@ -566,8 +558,7 @@ def cake_fp4_allreduce(
     ----------
     x : torch.Tensor
         Contiguous bfloat16 ``[rows, 6144]`` partial of this rank; ``rows`` is
-        at most ``workspace.capacity``, a multiple of 4 for world size 4, and
-        the same on every rank of the call.
+        at most ``workspace.capacity`` and the same on every rank of the call.
     workspace : CakeFp4AllReduceWorkspace
         The collective workspace of the group (family ``"allreduce"``, input
         format ``"bf16"``).

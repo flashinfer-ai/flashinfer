@@ -164,45 +164,5 @@ __global__ __launch_bounds__(kThreads, 1) void kernel_cake_deepseek_routing_sing
         // defined(__CUDA_ARCH_FAMILY_SPECIFIC__))
 }
 
-// One explicit instantiation per original kernel (schedule x score/bias dtype pair).
-template __global__ void kernel_cake_deepseek_routing_single<float, float, 128>(
-    float*, float*, float*, int*, uint8_t*, int, int, int, int, int, float, int);
-template __global__ void kernel_cake_deepseek_routing_single<float, float, 384>(
-    float*, float*, float*, int*, uint8_t*, int, int, int, int, int, float, int);
-template __global__ void kernel_cake_deepseek_routing_single<float, __half, 128>(
-    float*, __half*, float*, int*, uint8_t*, int, int, int, int, int, float, int);
-template __global__ void kernel_cake_deepseek_routing_single<float, __half, 384>(
-    float*, __half*, float*, int*, uint8_t*, int, int, int, int, int, float, int);
-template __global__ void kernel_cake_deepseek_routing_single<float, __nv_bfloat16, 128>(
-    float*, __nv_bfloat16*, float*, int*, uint8_t*, int, int, int, int, int, float, int);
-template __global__ void kernel_cake_deepseek_routing_single<float, __nv_bfloat16, 384>(
-    float*, __nv_bfloat16*, float*, int*, uint8_t*, int, int, int, int, int, float, int);
-template __global__ void kernel_cake_deepseek_routing_single<__half, float, 128>(
-    __half*, float*, __half*, int*, uint8_t*, int, int, int, int, int, float, int);
-template __global__ void kernel_cake_deepseek_routing_single<__half, float, 384>(
-    __half*, float*, __half*, int*, uint8_t*, int, int, int, int, int, float, int);
-template __global__ void kernel_cake_deepseek_routing_single<__half, __half, 128>(
-    __half*, __half*, __half*, int*, uint8_t*, int, int, int, int, int, float, int);
-template __global__ void kernel_cake_deepseek_routing_single<__half, __half, 384>(
-    __half*, __half*, __half*, int*, uint8_t*, int, int, int, int, int, float, int);
-template __global__ void kernel_cake_deepseek_routing_single<__half, __nv_bfloat16, 128>(
-    __half*, __nv_bfloat16*, __half*, int*, uint8_t*, int, int, int, int, int, float, int);
-template __global__ void kernel_cake_deepseek_routing_single<__half, __nv_bfloat16, 384>(
-    __half*, __nv_bfloat16*, __half*, int*, uint8_t*, int, int, int, int, int, float, int);
-template __global__ void kernel_cake_deepseek_routing_single<__nv_bfloat16, float, 128>(
-    __nv_bfloat16*, float*, __nv_bfloat16*, int*, uint8_t*, int, int, int, int, int, float, int);
-template __global__ void kernel_cake_deepseek_routing_single<__nv_bfloat16, float, 384>(
-    __nv_bfloat16*, float*, __nv_bfloat16*, int*, uint8_t*, int, int, int, int, int, float, int);
-template __global__ void kernel_cake_deepseek_routing_single<__nv_bfloat16, __half, 128>(
-    __nv_bfloat16*, __half*, __nv_bfloat16*, int*, uint8_t*, int, int, int, int, int, float, int);
-template __global__ void kernel_cake_deepseek_routing_single<__nv_bfloat16, __half, 384>(
-    __nv_bfloat16*, __half*, __nv_bfloat16*, int*, uint8_t*, int, int, int, int, int, float, int);
-template __global__ void kernel_cake_deepseek_routing_single<__nv_bfloat16, __nv_bfloat16, 128>(
-    __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*, int*, uint8_t*, int, int, int, int, int, float,
-    int);
-template __global__ void kernel_cake_deepseek_routing_single<__nv_bfloat16, __nv_bfloat16, 384>(
-    __nv_bfloat16*, __nv_bfloat16*, __nv_bfloat16*, int*, uint8_t*, int, int, int, int, int, float,
-    int);
-
 #undef CAKE_INF
 }  // namespace cake_deepseek_routing_sm107a_single

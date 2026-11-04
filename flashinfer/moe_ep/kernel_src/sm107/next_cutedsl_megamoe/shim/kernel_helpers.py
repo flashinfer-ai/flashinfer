@@ -24,6 +24,8 @@ from typing import Optional, Sequence, Tuple
 
 import torch
 
+from flashinfer.moe_ep._compat import deprecated_aliases
+
 Mxfp8BlockSize = 32
 Nvfp4BlockSize = 16
 GateUpInterleave = 16  # fixed by the swap-AB gated-act epilogue (gate/up stripe)
@@ -278,7 +280,7 @@ def preprocess_block_scaled_weights(
     if quant_kind == "nvfp4":
         data_dtype = getattr(torch, "float4_e2m1fn_x2", torch.uint8)
         sf_dtype, sf_vec, packing = torch.float8_e4m3fn, Nvfp4BlockSize, 2
-    elif quant_kind == "mxfp4_mxfp8":
+    elif quant_kind in ("mxfp4", "mxfp4_mxfp8"):
         data_dtype = getattr(torch, "float4_e2m1fn_x2", torch.uint8)
         sf_dtype, sf_vec, packing = torch.float8_e8m0fnu, Mxfp8BlockSize, 2
     elif quant_kind in ("mxfp8_e4m3", "mxfp8_e5m2"):
@@ -300,7 +302,9 @@ def preprocess_block_scaled_weights(
         intermediate_size,
     ):
         raise ValueError("canonical weight shapes must be [E, 2I, H] and [E, H, I].")
-    intermediate_alignment = 4 * sf_vec if quant_kind == "mxfp4_mxfp8" else 2 * sf_vec
+    intermediate_alignment = (
+        4 * sf_vec if quant_kind in ("mxfp4", "mxfp4_mxfp8") else 2 * sf_vec
+    )
     if hidden % (4 * sf_vec) or intermediate_size % intermediate_alignment:
         raise ValueError(
             "weight dimensions do not satisfy the SM107 scale-vector alignment."
@@ -336,7 +340,7 @@ def preprocess_block_scaled_weights(
                 block = source[begin:end].to(torch.float32).contiguous()
                 if quant_kind == "nvfp4":
                     q, sf = quantize_nvfp4_block16(block)
-                elif quant_kind == "mxfp4_mxfp8":
+                elif quant_kind in ("mxfp4", "mxfp4_mxfp8"):
                     q, sf = quantize_mxfp4_block32(block)
                 else:
                     q, sf = quantize_mxfp8_block32(block, data_dtype)
@@ -371,7 +375,7 @@ def preprocess_prequantized_block_scaled_weights(
         data_dtype = getattr(torch, "float4_e2m1fn_x2", torch.uint8)
         sf_dtype, sf_vec, packing = torch.float8_e4m3fn, Nvfp4BlockSize, 2
         allowed_data = (data_dtype, torch.uint8)
-    elif quant_kind == "mxfp4_mxfp8":
+    elif quant_kind in ("mxfp4", "mxfp4_mxfp8"):
         data_dtype = getattr(torch, "float4_e2m1fn_x2", torch.uint8)
         sf_dtype, sf_vec, packing = torch.float8_e8m0fnu, Mxfp8BlockSize, 2
         allowed_data = (data_dtype, torch.uint8)
@@ -388,7 +392,9 @@ def preprocess_prequantized_block_scaled_weights(
     experts = w13.shape[0]
     if experts <= 0 or hidden_size <= 0 or intermediate_size <= 0:
         raise ValueError("expert count, hidden, and intermediate must be positive.")
-    intermediate_alignment = 4 * sf_vec if quant_kind == "mxfp4_mxfp8" else 2 * sf_vec
+    intermediate_alignment = (
+        4 * sf_vec if quant_kind in ("mxfp4", "mxfp4_mxfp8") else 2 * sf_vec
+    )
     if hidden_size % (4 * sf_vec) or intermediate_size % intermediate_alignment:
         raise ValueError(
             "weight dimensions do not satisfy the SM107 scale-vector alignment."
@@ -454,9 +460,9 @@ def _dequant_activation(
     hidden: int,
 ) -> torch.Tensor:
     """Staged activation payload + raw per-token SF plane -> fp32 (tokens, hidden)."""
-    if quant_kind == "nvfp4":
+    if quant_kind in ("nvfp4", "mxfp4"):
         data = unpack_fp4_to_f32(x_data[:num_tokens])[:, :hidden]
-        vec = Nvfp4BlockSize
+        vec = Nvfp4BlockSize if quant_kind == "nvfp4" else Mxfp8BlockSize
     else:
         data = x_data[:num_tokens, :hidden].to(torch.float32)
         vec = Mxfp8BlockSize
@@ -468,7 +474,7 @@ def _dequant_weight_k_major(
     quant_kind: str, weight: torch.Tensor, sf_raw: torch.Tensor
 ) -> torch.Tensor:
     """K-major weight (N, K[packed]) + raw SF (N, K/vec) -> fp32 (N, K)."""
-    if quant_kind in ("nvfp4", "mxfp4_mxfp8"):
+    if quant_kind in ("nvfp4", "mxfp4", "mxfp4_mxfp8"):
         data = unpack_fp4_to_f32(weight)
         vec = Nvfp4BlockSize if quant_kind == "nvfp4" else Mxfp8BlockSize
     else:
@@ -483,6 +489,8 @@ def _quantize_fc2_wire(
     """Emulate the in-kernel FC1->FC2 wire quantization for one expert."""
     if quant_kind == "nvfp4":
         return quantize_nvfp4_block16(act, norm_const)
+    if quant_kind == "mxfp4":
+        return quantize_mxfp4_block32(act)
     data_dtype = (
         torch.float8_e5m2 if quant_kind == "mxfp8_e5m2" else torch.float8_e4m3fn
     )
@@ -508,6 +516,7 @@ def round_trip_combine(tensor: torch.Tensor, combine_dtype: str) -> torch.Tensor
     raise ValueError(f"unsupported combine_dtype {combine_dtype!r}")
 
 
+@deprecated_aliases(apply_topk_at_fc1="apply_routing_weights_before_fc2")
 def compute_megamoe_reference_sm107_block_scaled(
     x_data: torch.Tensor,
     x_sf: torch.Tensor,
@@ -521,7 +530,7 @@ def compute_megamoe_reference_sm107_block_scaled(
     quant_kind: str,
     local_expert_offset: int,
     gate_up_clamp: Optional[float],
-    apply_topk_at_fc1: bool,
+    apply_routing_weights_before_fc2: bool,
     num_tokens: Optional[int] = None,
     weight_scales_are_swizzled: bool = False,
     combine_dtype: str = "bf16",
@@ -583,13 +592,13 @@ def compute_megamoe_reference_sm107_block_scaled(
             act = (up * gate).reshape(-1, intermediate)
         else:
             act = (up * (gate * torch.sigmoid(gate))).reshape(-1, intermediate)
-        if apply_topk_at_fc1:
+        if apply_routing_weights_before_fc2:
             act = act * topk_weights[src_t, src_k].to(torch.float32).unsqueeze(-1)
         # In-kernel FC2-input requantization (the FC1->FC2 wire format).
         norm_const = 1.0 if fc1_norm_const is None else fc1_norm_const[local_e]
         act_q, act_sf = _quantize_fc2_wire(quant_kind, act, norm_const)
         vec = Nvfp4BlockSize if quant_kind == "nvfp4" else Mxfp8BlockSize
-        if quant_kind == "nvfp4":
+        if quant_kind in ("nvfp4", "mxfp4"):
             act = unpack_fp4_to_f32(act_q)
         else:
             act = act_q.to(torch.float32)
@@ -599,7 +608,7 @@ def compute_megamoe_reference_sm107_block_scaled(
         if fc2_alpha is not None:
             term = term * fc2_alpha[local_e]
         term = round_trip_combine(term, combine_dtype)
-        if not apply_topk_at_fc1:
+        if not apply_routing_weights_before_fc2:
             term = term * topk_weights[src_t, src_k].to(torch.float32).unsqueeze(-1)
         output.index_add_(0, src_t, term)
 

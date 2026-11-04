@@ -78,11 +78,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_EPI_STAGING_STAGE_BYTES 8192
 #define SMEM_EPI_STAGING_STRIDE 8192
 #define SMEM_TOTAL 181248
-#define BLOCK_M 128
-#define BLOCK_N 32
-#define BLOCK_K 128
-#define NUM_STAGES 8
-#define num_tiles grid_m
 
 #include <math_constants.h>
 
@@ -214,16 +209,16 @@ __global__ __launch_bounds__(192) void kernel_cake_w8a8_megamoe_ep16_fc2(
   const int cta_rank = 0;
 
   // Kernel setup ops
-  uint8_t* smem_a = reinterpret_cast<uint8_t*>(smem_raw + SMEM_SMEM_A_OFF);
-  const int smem_a_addr = smem + SMEM_SMEM_A_OFF;
-  uint8_t* smem_b = reinterpret_cast<uint8_t*>(smem_raw + SMEM_SMEM_B_OFF);
-  const int smem_b_addr = smem + SMEM_SMEM_B_OFF;
-  uint8_t* smem_sfa_cp = reinterpret_cast<uint8_t*>(smem_raw + SMEM_SMEM_SFA_CP_OFF);
-  const int smem_sfa_cp_addr = smem + SMEM_SMEM_SFA_CP_OFF;
-  uint8_t* smem_sfb_cp = reinterpret_cast<uint8_t*>(smem_raw + SMEM_SMEM_SFB_CP_OFF);
-  const int smem_sfb_cp_addr = smem + SMEM_SMEM_SFB_CP_OFF;
-  __nv_bfloat16* epi_staging = reinterpret_cast<__nv_bfloat16*>(smem_raw + SMEM_EPI_STAGING_OFF);
-  const int epi_staging_addr = smem + SMEM_EPI_STAGING_OFF;
+  uint8_t* smem_a = reinterpret_cast<uint8_t*>(smem_raw + 1024);
+  const int smem_a_addr = smem + 1024;
+  uint8_t* smem_b = reinterpret_cast<uint8_t*>(smem_raw + 17408);
+  const int smem_b_addr = smem + 17408;
+  uint8_t* smem_sfa_cp = reinterpret_cast<uint8_t*>(smem_raw + 21504);
+  const int smem_sfa_cp_addr = smem + 21504;
+  uint8_t* smem_sfb_cp = reinterpret_cast<uint8_t*>(smem_raw + 22016);
+  const int smem_sfb_cp_addr = smem + 22016;
+  __nv_bfloat16* epi_staging = reinterpret_cast<__nv_bfloat16*>(smem_raw + 173056);
+  const int epi_staging_addr = smem + 173056;
 
   // Mbarrier init (4 pipeline groups, 0 ordered-sequence groups, 18 barriers)
   // Mbarriers at smem_raw[0..144)
@@ -292,7 +287,7 @@ __global__ __launch_bounds__(192) void kernel_cake_w8a8_megamoe_ep16_fc2(
       const int epi_tid = epi_warp * 32 + lane;
       unsigned int _phase_mainloop_done = 0;
 #pragma unroll 1
-      for (unsigned int tile_idx = bid; tile_idx < num_tiles; tile_idx += num_bids) {
+      for (unsigned int tile_idx = bid; tile_idx < grid_m; tile_idx += num_bids) {
         int batch_idx = tile_expert[tile_idx];
         int off_m = tile_m_local[tile_idx];
         int expert_row_base = expert_row_offsets[batch_idx];
@@ -302,7 +297,7 @@ __global__ __launch_bounds__(192) void kernel_cake_w8a8_megamoe_ep16_fc2(
         int ready_tile = 0;
         unsigned int* ready_base = reinterpret_cast<unsigned int*>(C);
 #pragma unroll 1
-        for (int n_chunk = 0; n_chunk < BLOCK_N / 8; n_chunk++) {
+        for (int n_chunk = 0; n_chunk < 4; n_chunk++) {
           int row = epi_warp * 32;
           int col = n_chunk * 8;
           float _tmem_load_0[8];
@@ -311,8 +306,8 @@ __global__ __launch_bounds__(192) void kernel_cake_w8a8_megamoe_ep16_fc2(
 #pragma unroll
           for (int j = 0; j < 8; j++) {
             int expert_row = n_chunk * 8 + j;
-            __nv_bfloat16 _cvt_bf16_0 = __float2bfloat16(_tmem_load_0[j]);
-            epi_staging[expert_row * BLOCK_M + epi_tid] = _cvt_bf16_0;
+            __nv_bfloat16 _cvt_bf16_0 = (__nv_bfloat16)_tmem_load_0[j];
+            epi_staging[expert_row * 128 + epi_tid] = _cvt_bf16_0;
           }
         }
         asm volatile("tcgen05.fence::before_thread_sync;");
@@ -324,10 +319,10 @@ __global__ __launch_bounds__(192) void kernel_cake_w8a8_megamoe_ep16_fc2(
         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
         asm volatile("barrier.sync 15, 128;" ::: "memory");
 #pragma unroll
-        for (int copy_iter = 0; copy_iter < BLOCK_N / 8; copy_iter++) {
+        for (int copy_iter = 0; copy_iter < 4; copy_iter++) {
           int copy_linear = epi_tid + copy_iter * 128;
-          int expert_row_1 = copy_linear / (BLOCK_M / 8);
-          int hidden_chunk = copy_linear % (BLOCK_M / 8);
+          int expert_row_1 = copy_linear / 16;
+          int hidden_chunk = copy_linear % 16;
           unsigned int packed[4];
           asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                        : "=r"(*reinterpret_cast<uint32_t*>(&packed[0])),
@@ -335,7 +330,7 @@ __global__ __launch_bounds__(192) void kernel_cake_w8a8_megamoe_ep16_fc2(
                          "=r"(*reinterpret_cast<uint32_t*>(&packed[(0) + 2])),
                          "=r"(*reinterpret_cast<uint32_t*>(&packed[(0) + 3]))
                        : "r"(epi_staging_addr +
-                             (unsigned int)((expert_row_1 * BLOCK_M + hidden_chunk * 8) * 2)));
+                             (unsigned int)((expert_row_1 * 128 + hidden_chunk * 8) * 2)));
           int route = route_map[expert_row_base + expert_row_1];
           if (route >= 0) {
             int source_rank = route / routes_per_rank;
@@ -360,8 +355,7 @@ __global__ __launch_bounds__(192) void kernel_cake_w8a8_megamoe_ep16_fc2(
                        : "=r"(_atomic_old_0)
                        : "l"(&completion_words[1]), "r"(static_cast<uint32_t>(1))
                        : "memory");
-          unsigned int arrived = _atomic_old_0;
-          int arrived_count = (int)arrived + 1;
+          int arrived_count = (int)_atomic_old_0 + 1;
           if (arrived_count == num_bids) {
             completion_words[1] = 0;
             last_arriver = 1;
@@ -377,7 +371,7 @@ __global__ __launch_bounds__(192) void kernel_cake_w8a8_megamoe_ep16_fc2(
             unsigned int* peer_words =
                 reinterpret_cast<unsigned int*>(fc2_completion_peers.ptrs[destination]);
             asm volatile("red.release.sys.global.add.u32 [%0], %1;" ::"l"(
-                             (reinterpret_cast<unsigned int*>(peer_words) + (0))),
+                             reinterpret_cast<unsigned int*>(peer_words)),
                          "r"(static_cast<unsigned int>(1))
                          : "memory");
           }
@@ -393,7 +387,7 @@ __global__ __launch_bounds__(192) void kernel_cake_w8a8_megamoe_ep16_fc2(
       unsigned int _phase_epilogue_done = 1;
       unsigned int _phase_tma_full = 0;
 #pragma unroll 1
-      for (unsigned int tile_idx_1 = bid; tile_idx_1 < num_tiles; tile_idx_1 += num_bids) {
+      for (unsigned int tile_idx_1 = bid; tile_idx_1 < grid_m; tile_idx_1 += num_bids) {
         mbarrier_wait(epilogue_done_addr + (mma_epi_stage) * 8, _phase_epilogue_done);
 #pragma unroll 1
         for (int iter_k = 0; iter_k < K_tiles; iter_k++) {
@@ -463,19 +457,31 @@ __global__ __launch_bounds__(192) void kernel_cake_w8a8_megamoe_ep16_fc2(
       unsigned int load_stage = 0;
       unsigned int pf_first_tile = bid;
       if (elect_sync()) {
-        if (bid < num_tiles) {
+        if (bid < grid_m) {
           int pf_batch_idx = tile_expert[bid];
           int pf_off_m = tile_m_local[bid];
 #pragma unroll
           for (int pf_k = 0; pf_k < 8; pf_k++) {
             if (pf_k < K_tiles) {
               mbarrier_arrive_expect_tx(tma_full_addr + (pf_k) * 8, 21504);
-              tma_4d_gmem2smem(smem_a_addr + (unsigned int)(pf_k * 21504), (&A), 0, 0, pf_k,
-                               pf_batch_idx * (N / BLOCK_M) + pf_off_m / BLOCK_M,
-                               tma_full_addr + (pf_k) * 8);
-              int pf_sfa_tile = pf_off_m / BLOCK_M * K_tiles + pf_k;
-              tma_4d_gmem2smem(smem_sfa_cp_addr + (unsigned int)(pf_k * 21504), (&SFA), 0, 0,
-                               pf_sfa_tile, pf_batch_idx, tma_full_addr + (pf_k) * 8);
+              asm volatile(
+                  "cp.async.bulk.tensor.4d.shared::cta.global.mbarrier::complete_tx::bytes.L2::"
+                  "cache_hint"
+                  " [%0], [%1, {%2, %3, %4, %5}], [%6], %7;" ::"r"(smem_a_addr +
+                                                                   (unsigned int)(pf_k * 21504)),
+                  "l"((&A)), "r"(0), "r"(0), "r"(pf_k),
+                  "r"(pf_batch_idx * (N / 128) + pf_off_m / 128), "r"(tma_full_addr + (pf_k) * 8),
+                  "l"(0x12F0000000000000ULL)
+                  : "memory");
+              int pf_sfa_tile = pf_off_m / 128 * K_tiles + pf_k;
+              asm volatile(
+                  "cp.async.bulk.tensor.4d.shared::cta.global.mbarrier::complete_tx::bytes.L2::"
+                  "cache_hint"
+                  " [%0], [%1, {%2, %3, %4, %5}], [%6], %7;" ::"r"(smem_sfa_cp_addr +
+                                                                   (unsigned int)(pf_k * 21504)),
+                  "l"((&SFA)), "r"(0), "r"(0), "r"(pf_sfa_tile), "r"(pf_batch_idx),
+                  "r"(tma_full_addr + (pf_k) * 8), "l"(0x12F0000000000000ULL)
+                  : "memory");
             }
           }
         }
@@ -484,8 +490,8 @@ __global__ __launch_bounds__(192) void kernel_cake_w8a8_megamoe_ep16_fc2(
       unsigned int _phase_mma_done = 1;
       if (elect_sync()) {
 #pragma unroll 1
-        for (unsigned int tile_idx_2 = bid; tile_idx_2 < num_tiles; tile_idx_2 += num_bids) {
-          if (num_bids + (int)tile_idx_2 >= num_tiles) {
+        for (unsigned int tile_idx_2 = bid; tile_idx_2 < grid_m; tile_idx_2 += num_bids) {
+          if (num_bids + (int)tile_idx_2 >= grid_m) {
             asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
           }
           int batch_idx_1 = tile_expert[tile_idx_2];
@@ -500,12 +506,24 @@ __global__ __launch_bounds__(192) void kernel_cake_w8a8_megamoe_ep16_fc2(
               }
             }
             if (pf_issued == 0) {
-              tma_4d_gmem2smem(smem_a_addr + load_stage * 21504, (&A), 0, 0, iter_k_1,
-                               batch_idx_1 * (N / BLOCK_M) + off_m_1 / BLOCK_M,
-                               tma_full_addr + (load_stage) * 8);
-              int pdl_sfa_tile = off_m_1 / BLOCK_M * K_tiles + iter_k_1;
-              tma_4d_gmem2smem(smem_sfa_cp_addr + load_stage * 21504, (&SFA), 0, 0, pdl_sfa_tile,
-                               batch_idx_1, tma_full_addr + (load_stage) * 8);
+              asm volatile(
+                  "cp.async.bulk.tensor.4d.shared::cta.global.mbarrier::complete_tx::bytes.L2::"
+                  "cache_hint"
+                  " [%0], [%1, {%2, %3, %4, %5}], [%6], %7;" ::"r"(smem_a_addr +
+                                                                   load_stage * 21504),
+                  "l"((&A)), "r"(0), "r"(0), "r"(iter_k_1),
+                  "r"(batch_idx_1 * (N / 128) + off_m_1 / 128),
+                  "r"(tma_full_addr + (load_stage) * 8), "l"(0x12F0000000000000ULL)
+                  : "memory");
+              int pdl_sfa_tile = off_m_1 / 128 * K_tiles + iter_k_1;
+              asm volatile(
+                  "cp.async.bulk.tensor.4d.shared::cta.global.mbarrier::complete_tx::bytes.L2::"
+                  "cache_hint"
+                  " [%0], [%1, {%2, %3, %4, %5}], [%6], %7;" ::"r"(smem_sfa_cp_addr +
+                                                                   load_stage * 21504),
+                  "l"((&SFA)), "r"(0), "r"(0), "r"(pdl_sfa_tile), "r"(batch_idx_1),
+                  "r"(tma_full_addr + (load_stage) * 8), "l"(0x12F0000000000000ULL)
+                  : "memory");
             }
             tma_4d_gmem2smem(smem_b_addr + load_stage * 21504, (&B), 0, 0, iter_k_1, batch_idx_1,
                              tma_full_addr + (load_stage) * 8);
@@ -526,6 +544,7 @@ __global__ __launch_bounds__(192) void kernel_cake_w8a8_megamoe_ep16_fc2(
   }
 
   // Cleanup
+  asm volatile("tcgen05.fence::before_thread_sync;" ::: "memory");
   __syncthreads();  // barrier before TMEM dealloc
 
   if (warp == 0) {

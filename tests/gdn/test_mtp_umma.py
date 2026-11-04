@@ -735,8 +735,8 @@ def test_stochastic_rounding_matches_reference_bits(T, mode, hpc):
         ctl = noise_of(seed + 1, r)
         up, down = normal & (step == 1), normal & (step == -1)
         n_diff += int(up.sum() + down.sum())
-        n_bad += int(((noise <= 4096) & up).sum() + ((noise >= 4096) & down).sum())
-        n_bad_ctl += int(((ctl <= 4096) & up).sum() + ((ctl >= 4096) & down).sum())
+        n_bad += int(((noise < 4096) & up).sum() + ((noise >= 4096) & down).sum())
+        n_bad_ctl += int(((ctl < 4096) & up).sum() + ((ctl >= 4096) & down).sum())
     total = sum(HV * V * K for hist_r in hist if hist_r >= fm)
     assert abs(n_diff / total - 0.25) < 0.05, n_diff / total  # E[min(f, 1 - f)] = 1/4
     assert n_bad == 0, (

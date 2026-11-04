@@ -632,6 +632,34 @@ def test_moe_ep_sm90_pull_mxfp4_mega_multirank_raw_oracle_and_workspace_reuse(
     _run_raw_oracle(routing_pattern)
 
 
+@pytest.mark.gpu_2
+@pytest.mark.arch_hopper
+@pytest.mark.parametrize("tail_pairs", (False, True), ids=("folded", "folded-tail"))
+def test_moe_ep_sm90_pull_mxfp4_m256_n64_k128_independent_oracle(
+    monkeypatch, tail_pairs
+):
+    """Folded K128 candidates match raw math across full and partial N64 tiles."""
+    import sys
+
+    module = sys.modules[__name__]
+    monkeypatch.setattr(module, "HIDDEN", 2560)
+    monkeypatch.setattr(module, "INTERMEDIATE", 640)
+    # EP2 routes 64/65 rows per expert, crossing an N64 tile boundary.
+    monkeypatch.setattr(module, "TOKENS_PER_RANK", 129)
+    tactic = dict(
+        _fused_tactic(),
+        mma_tiler_mnk=(256, 64, 128),
+        cluster_shape_mnk=(1, 2, 1) if tail_pairs else (1, 1, 1),
+        group_hint=132 if tail_pairs else 330,
+        num_sched_stages=1,
+        load_balance_mode="atomic_counter",
+        fc1_store_offload=False,
+        fc1_early_done_publish=True,
+        tail_split_pairs=tail_pairs,
+    )
+    _run_raw_oracle("cross_rank", tactic=tactic)
+
+
 @pytest.mark.gpu_4
 @pytest.mark.arch_hopper
 @pytest.mark.parametrize(

@@ -20,9 +20,9 @@ import torch
 
 from .api_logging import flashinfer_experimental_api
 
-# Thin experimental entry points; the workspace, route selection (one-shot /
-# two-shot K1, fused K23 / K3-ESS / persistent tail, grouped / pinned poll
-# schedule), launch binding and JIT registration live in
+# Thin experimental entry points; the workspace, route selection (one-launch
+# program / one-shot / two-shot K1, K3-ESS / reduce / persistent tail, grouped /
+# pinned poll schedule), launch binding and JIT registration live in
 # flashinfer.experimental.kimi_k3_tp12_tail.
 
 _FEATURE = "Kimi-K3 TP12 fused LatentMoE tail"
@@ -54,6 +54,19 @@ def create_kimi_k3_tp12_tail_workspace(
     for up to ``max_tokens`` tokens plus the normalised-latent and
     up-projection slice buffers of this rank.  Reuse the workspace for every
     call of the layer and ``destroy()`` it before the process group.
+
+    The workspace is collective state, like an NCCL communicator: the calls
+    that share it run one at a time and in the same order on every rank, and
+    a call from another stream than the previous one waits for it (outside
+    CUDA Graph capture; concurrent graph replays and several host threads
+    must not share a workspace).  For ``M <= 8`` a call is one cooperative
+    grid of ``M + 80`` CTAs (``M + 64`` on ranks 8-11) that must be resident
+    at once on every rank: under a green context or MPS partition with fewer
+    SMs (88 covers every ``M <= 8``) the launch raises instead of spinning.
+    Do not overlap two ``M <= 8`` calls, or one and another cooperative
+    peer-waiting kernel, on one GPU, even with separate workspaces.  Every
+    rank must be able to run the call: a co-runner that never frees those
+    SMs stalls the whole group.
 
     Parameters
     ----------
@@ -104,18 +117,20 @@ def prepare_kimi_k3_tp12_tail(
         latent = KimiRMSNorm(sum_r routed_partial_r)                  [M, 3584]  (eps 1e-5)
         out    = BF16(latent @ up_weight.T + sum_r shared_partial_r)  [M, 7168]
 
-    in two generated launches per rank, with cuBLAS between them for ``M > 4``:
-    a Lamport all-reduce of ``routed_partial`` fused with the norm (one-shot
-    for ``M <= 16``, two-shot above; below 256 tokens it also scatters this
-    rank's columns of ``shared_partial`` to their owner ranks), the
-    up-projection of this rank's contiguous 640- or 512-row slice of
-    ``up_weight`` (``7168 = 8 x 640 + 4 x 512``; fused into the tail kernel for
-    ``M <= 4``, cuBLAS above), and the tail: the owner reduce of the
+    in one generated launch per rank for ``M <= 8`` and two above, with cuBLAS
+    between them: a Lamport all-reduce of ``routed_partial`` fused with the
+    norm (one-shot for ``M <= 16``, two-shot above; below 961 tokens it also
+    scatters this rank's columns of ``shared_partial`` to their owner ranks),
+    the up-projection of this rank's contiguous 640- or 512-row slice of
+    ``up_weight`` (``7168 = 8 x 640 + 4 x 512``; fused into the tail for
+    ``M <= 8``, cuBLAS above), and the tail: the owner reduce of the
     ``shared_partial`` columns fused with the add of the slice, one BF16
     rounding and the multicast all-gather of ``out`` (one CTA per eight output
-    columns for ``M <= 4``, one CTA per token below 256 tokens, a persistent
-    token pipeline above).  ``out`` is bitwise identical on every rank.
-    Every rank must prepare and launch the same ``M``.
+    columns for ``M <= 8``, in the same grid as the all-reduce's one CTA per
+    token; one CTA per token below 320 tokens, a persistent grid that reduces
+    and gathers from 320 to 960 tokens, a persistent token pipeline above).
+    ``out`` is bitwise identical on every rank.  Every rank must prepare and
+    launch the same ``M``.
 
     Parameters
     ----------
@@ -138,10 +153,11 @@ def prepare_kimi_k3_tp12_tail(
     Returns
     -------
     KimiK3Tp12TailRunner
-        Calling it launches the two generated kernels (and cuBLAS for ``M > 4``)
-        on the current stream with no CUDA allocation or host synchronization
-        and returns ``out``.  CUDA Graph capture of the runner is supported;
-        prepare outside capture.
+        Calling it launches the generated kernels (one for ``M <= 8``; two and
+        cuBLAS above) on the current stream with no CUDA allocation or host
+        synchronization and returns ``out``; a launch from another stream than
+        the previous launch on the workspace first waits for it.  CUDA Graph
+        capture of the runner is supported; prepare outside capture.
     """
     return _backend(backend).prepare_kimi_k3_tp12_tail(
         routed_partial, shared_partial, norm_weight, up_weight, out, workspace=workspace

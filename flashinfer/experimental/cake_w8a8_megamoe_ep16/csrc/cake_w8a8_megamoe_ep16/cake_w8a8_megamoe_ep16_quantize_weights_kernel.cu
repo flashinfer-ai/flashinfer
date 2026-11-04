@@ -92,7 +92,7 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
 
 extern "C" {
 
-__global__ __launch_bounds__(THREADS) void kernel_cake_w8a8_megamoe_ep16_quantize_weights(
+__global__ __launch_bounds__(256) void kernel_cake_w8a8_megamoe_ep16_quantize_weights(
     __nv_bfloat16* __restrict__ source, uint8_t* __restrict__ quantized,
     uint8_t* __restrict__ scales_cp, int experts, int rows, int columns, int gate_width,
     int interleave_gate_up, int scale_tile_n256_k128, int ktile_major_rows) {
