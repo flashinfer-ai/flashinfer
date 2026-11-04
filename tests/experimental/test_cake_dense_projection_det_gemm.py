@@ -3180,12 +3180,12 @@ def test_round33_rules_plan_like_the_cake_launcher(T):
     # the 17408 x 5120 weight gradients: test_gb_t_exact_wgrad_rules_plan_their_programs); their round 3 adds
     # 2 sm_100a and 2 sm_103a keys (the indexer_q weight gradient: test_gb_t_exact_sks_wgrad_rules_plan_their_programs);
     # their round 4 adds 2 sm_100a keys (the 5120 -> 17408 input gradient:
-    # test_gb_t_exact_rules_plan_their_programs); their round 5 adds 1 sm_100a key (the 12288 -> 4096
+    # test_gb_t_exact_rules_plan_their_programs); their round 5 adds 2 sm_100a keys (the 12288 -> 4096
     # forward: test_gb_t_exact_rules_plan_their_programs);
     # the 4096 -> 1024 fp32 weight gradient adds one sm_107a T-exact key at T 16384 (the T 16231 key's rule:
     # test_sm107a_t16384_wgrad_key_plans_the_t16231_rule)
-    assert len(ROW_RULES) == 109 + 79 + 86 + 1 + 6 + 26 + 34 + 16 + 10 + 4 + 2 + 1 + 1
-    assert sum(k[0] == "sm_100a" for k in ROW_RULES) == 51 + 79 + 8 + 4 + 2 + 2 + 1
+    assert len(ROW_RULES) == 109 + 79 + 86 + 1 + 6 + 26 + 34 + 16 + 10 + 4 + 2 + 2 + 1
+    assert sum(k[0] == "sm_100a" for k in ROW_RULES) == 51 + 79 + 8 + 4 + 2 + 2 + 2
     assert sum(k[0] == "sm_107a" for k in ROW_RULES) == 58 + 6 + 26 + 34 + 1
     assert sum(k[0] == "sm_103a" for k in ROW_RULES) == 86 + 1 + 8 + 6 + 2
     assert ARCH_RULE_DEFAULTS == {
@@ -6676,7 +6676,7 @@ MEASURED_SHAPE_ROWS = (
     (('sm_100a', False, False, False, False, False, 4096, 2048, None), 16231, 152, 'dense_proj_det_gemm_kk_n256_ht_cg_pro15'),
     (('sm_100a', False, False, False, False, False, 4096, 4096, None), 16231, 152, 'dense_proj_det_gemm_kk_n256_ht_cg_pro15'),
     (('sm_100a', False, False, False, False, False, 4096, 4096, None), 16384, 152, 'dense_proj_det_gemm_kk_n256_ht_cg_pro15'),
-    (('sm_100a', False, False, False, False, False, 4096, 12288, None), 16231, 152, 'dense_proj_det_gemm_kk_n256_m256_ov_ht_cg_pro7'),
+    (('sm_100a', False, False, False, False, False, 4096, 12288, 16231), 16231, 152, 'dense_proj_det_gemm_kk_n256_m256_ov_ht_tma1_cg_pro7'),
     (('sm_100a', False, False, False, False, False, 4096, 12288, 16384), 16384, 152, 'dense_proj_det_gemm_kk_n256_m256_ov_ht_tma1_cg_pro7'),
     (('sm_100a', False, False, False, False, False, 5120, 5120, None), 16231, 152, 'dense_proj_det_gemm_kk_n256_cg_pro15'),
     (('sm_100a', False, False, False, False, False, 5120, 5120, None), 16384, 152, 'dense_proj_det_gemm_kk_n256_cg_pro15'),
@@ -8256,7 +8256,7 @@ GB_T_EXACT_ROWS = {
         "dense_proj_det_gemm_kn_n256_m256_ov_ht_tma1_cg_pro7",
     ),
     ("sm_100a", False, 4096, 12288): (
-        (16384,),
+        (16231, 16384),
         "dense_proj_det_gemm_kk_n256_m256_ov_ht_tma1_cg_pro7",
     ),
 }
