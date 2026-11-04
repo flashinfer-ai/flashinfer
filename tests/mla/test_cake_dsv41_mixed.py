@@ -747,6 +747,9 @@ def test_public_api_enable_pdl_gate(monkeypatch) -> None:
     )
     _public_api_call("cake")
     assert calls[-1]["enable_pdl"] is False
+    monkeypatch.setattr(mla_core, "device_support_pdl", lambda device: True)
+    _public_api_call("cake")
+    assert calls[-1]["enable_pdl"] is True
     _public_api_call("cake", enable_pdl=True)
     assert calls[-1]["enable_pdl"] is True
     _public_api_call("cake", enable_pdl=False)
