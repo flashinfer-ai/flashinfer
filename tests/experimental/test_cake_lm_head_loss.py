@@ -7894,8 +7894,8 @@ def test_device_zero_dlogp_short_last_chunk_cast_bits_without_zero_rows(
 def test_device_zero_dlogp_generic_floor_is_one_row_above_a_chunk(
     glm_weight, monkeypatch
 ):
-    """The default floor is one row above a default 4096-row chunk: a backward of 4096 valid rows runs without the skip,
-    one of 4097 valid rows runs it (the zero rows' ``dX`` zeros either way)."""
+    """The generic floor (``ZERO_DLOGP_MIN_ROWS_DEFAULT``) is one row above a default 4096-row chunk: a backward of 4096
+    valid rows runs without the skip, one of 4097 valid rows runs it (the zero rows' ``dX`` zeros either way)."""
     _require_zero_dlogp_skip()
     assert (
         cake_backend.ZERO_DLOGP_MIN_ROWS_DEFAULT
