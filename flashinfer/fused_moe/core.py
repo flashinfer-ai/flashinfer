@@ -592,8 +592,8 @@ def reorder_rows_for_gated_act_gemm(x: torch.Tensor) -> torch.Tensor:
 
     The input holds the two FC1 halves stacked as ``[X1; X2]``: rows
     ``[0, M // 2)`` are ``X1`` (the linear/up half) and rows ``[M // 2, M)`` are
-    ``X2`` (the gate half), the order every ``trtllm_*_moe`` entry point
-    documents for ``gemm1_weights``.  The output alternates one row of each
+    ``X2`` (the gate half), the order the ``trtllm_*_moe`` entry points expect
+    for ``gemm1_weights``.  The output alternates one row of each
     half, ``[X1[0], X2[0], X1[1], X2[1], ...]``; :func:`deinterleave_gated_rows`
     with ``block=1`` undoes it.
 
@@ -642,7 +642,9 @@ def deinterleave_gated_rows(x: torch.Tensor, block: int) -> torch.Tensor:
     Returns
     -------
     torch.Tensor
-        Row-permuted contiguous copy of ``x`` with shape equal to ``x.shape``.
+        Row-permuted contiguous tensor with shape equal to ``x.shape``; a copy
+        unless ``x.shape[0] == 2 * block``, where ``x`` is already ``[A; B]``
+        and a view of it is returned.
     """
     if block < 1:
         raise ValueError(f"block must be >= 1, got {block}")
