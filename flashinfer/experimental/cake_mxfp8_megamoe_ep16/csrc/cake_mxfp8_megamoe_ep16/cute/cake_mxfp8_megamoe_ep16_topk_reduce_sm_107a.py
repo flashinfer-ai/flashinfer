@@ -263,32 +263,26 @@ def kernel_cake_mxfp8_megamoe_ep16_topk_reduce_sm_107a(route_terms_bf16: cute.Po
                 cutlass.yield_out([cutlass.Int32(0)])
             pending = _while_storage_3
             words = _while_storage_4
-        arrival = cute.make_rmem_tensor((4,), cutlass.Uint32)
-        for word_2 in cutlass.range_constexpr(0, 4, 1):
-            arrival[word_2] = cutlass.Uint32(4294967295)
-        for route_slot_2 in cutlass.range_constexpr(0, 8, 1):
-            _gmem_store_bits_5 = cutlass.Vector.from_elements([cutlass.Uint32(arrival[0]), cutlass.Uint32(arrival[1]), cutlass.Uint32(arrival[2]), cutlass.Uint32(arrival[3])], cutlass.Uint32)
-            prims.store_ext(_gmem_store_bits_5.ir_value(), route_words + (route_slot_2 * 1536))
         accum = cute.make_rmem_tensor((8,), cutlass.Float32)
-        for word_3 in cutlass.range_constexpr(0, 4, 1):
-            accum[(word_3 * 2)] = cutlass.Float32(cutlass.Uint32((words[word_3] << 16)).bitcast(cutlass.Float32))
-            accum[((word_3 * 2) + 1)] = cutlass.Float32(cutlass.Uint32((words[word_3] & 4294901760)).bitcast(cutlass.Float32))
-        for route_slot_3 in cutlass.range_constexpr(1, 8, 1):
-            for word_4 in cutlass.range_constexpr(0, 4, 1):
-                term_word = cutlass.Uint32(words[((route_slot_3 * 4) + word_4)])
-                accum[(word_4 * 2)] = cutlass.Float32((accum[(word_4 * 2)] + cutlass.Uint32((term_word << 16)).bitcast(cutlass.Float32)))
-                accum[((word_4 * 2) + 1)] = cutlass.Float32((accum[((word_4 * 2) + 1)] + cutlass.Uint32((term_word & 4294901760)).bitcast(cutlass.Float32)))
+        for word_2 in cutlass.range_constexpr(0, 4, 1):
+            accum[(word_2 * 2)] = cutlass.Float32(cutlass.Uint32((words[word_2] << 16)).bitcast(cutlass.Float32))
+            accum[((word_2 * 2) + 1)] = cutlass.Float32(cutlass.Uint32((words[word_2] & 4294901760)).bitcast(cutlass.Float32))
+        for route_slot_2 in cutlass.range_constexpr(1, 8, 1):
+            for word_3 in cutlass.range_constexpr(0, 4, 1):
+                term_word = cutlass.Uint32(words[((route_slot_2 * 4) + word_3)])
+                accum[(word_3 * 2)] = cutlass.Float32((accum[(word_3 * 2)] + cutlass.Uint32((term_word << 16)).bitcast(cutlass.Float32)))
+                accum[((word_3 * 2) + 1)] = cutlass.Float32((accum[((word_3 * 2) + 1)] + cutlass.Uint32((term_word & 4294901760)).bitcast(cutlass.Float32)))
         _packed_0 = cute.make_rmem_tensor((4,), cutlass.Uint32)
-        _bf16_pack_6 = prims.cvt_packfloat_f32(accum[1], accum[0], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
-        _packed_0[0] = cutlass.Uint32(_bf16_pack_6)
-        _bf16_pack_7 = prims.cvt_packfloat_f32(accum[3], accum[2], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
-        _packed_0[1] = cutlass.Uint32(_bf16_pack_7)
-        _bf16_pack_8 = prims.cvt_packfloat_f32(accum[5], accum[4], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
-        _packed_0[2] = cutlass.Uint32(_bf16_pack_8)
-        _bf16_pack_9 = prims.cvt_packfloat_f32(accum[7], accum[6], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
-        _packed_0[3] = cutlass.Uint32(_bf16_pack_9)
-        _gmem_store_bits_10 = cutlass.Vector.from_elements([cutlass.Uint32(_packed_0[0]), cutlass.Uint32(_packed_0[1]), cutlass.Uint32(_packed_0[2]), cutlass.Uint32(_packed_0[3])], cutlass.Uint32)
-        prims.store_ext(_gmem_store_bits_10.ir_value(), cute.recast_ptr(output_bf16 + ((cutlass.Uint64(token) * 3072) + cutlass.Uint64(column)), dtype=cutlass.Uint32))
+        _bf16_pack_5 = prims.cvt_packfloat_f32(accum[1], accum[0], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
+        _packed_0[0] = cutlass.Uint32(_bf16_pack_5)
+        _bf16_pack_6 = prims.cvt_packfloat_f32(accum[3], accum[2], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
+        _packed_0[1] = cutlass.Uint32(_bf16_pack_6)
+        _bf16_pack_7 = prims.cvt_packfloat_f32(accum[5], accum[4], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
+        _packed_0[2] = cutlass.Uint32(_bf16_pack_7)
+        _bf16_pack_8 = prims.cvt_packfloat_f32(accum[7], accum[6], 0, prims.CVTPackFloat.BF16X2, rnd=prims.FPRoundingMode.RN)
+        _packed_0[3] = cutlass.Uint32(_bf16_pack_8)
+        _gmem_store_bits_9 = cutlass.Vector.from_elements([cutlass.Uint32(_packed_0[0]), cutlass.Uint32(_packed_0[1]), cutlass.Uint32(_packed_0[2]), cutlass.Uint32(_packed_0[3])], cutlass.Uint32)
+        prims.store_ext(_gmem_store_bits_9.ir_value(), cute.recast_ptr(output_bf16 + ((cutlass.Uint64(token) * 3072) + cutlass.Uint64(column)), dtype=cutlass.Uint32))
 
 @cute.jit
 def launch_cake_mxfp8_megamoe_ep16_topk_reduce_sm_107a(route_terms_bf16: cute.Tensor, output_bf16: cute.Tensor, tokens_per_rank: cutlass.Int32, grid_x: cutlass.Int32, grid_y: cutlass.Int32, grid_z: cutlass.Int32, stream: cuda.CUstream):

@@ -503,27 +503,27 @@ def kernel_cake_mxfp8_megamoe_ep16_fused_sm_107a(fc1_weight_e4m3: cutlass.GridCo
         _source_hidden_bf16 = _forward_storage_24
         _source_topk_ids_i64 = _forward_storage_25
         push_owners = _forward_storage_26
-        if (launch_epoch == 0):
-            arrival = cute.make_rmem_tensor((8,), cutlass.Uint32)
-            arrival[0] = cutlass.Uint32(4294967295)
-            arrival[1] = cutlass.Uint32(4294967295)
-            arrival[2] = cutlass.Uint32(4294967295)
-            arrival[3] = cutlass.Uint32(4294967295)
-            arrival[4] = cutlass.Uint32(4294967295)
-            arrival[5] = cutlass.Uint32(4294967295)
-            arrival[6] = cutlass.Uint32(4294967295)
-            arrival[7] = cutlass.Uint32(4294967295)
-            _forward_storage_46 = _route_terms_bf16
-            _forward_storage_47 = arrival
-            _forward_loop_43 = cutlass.while_generate([cutlass.Int32((linear_thread * 16))], lambda _forward_condition_44: _forward_condition_44 < cutlass.Int32(((tokens_per_rank * 8) * 3072)))
-            _forward_loop_43.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
-            with _forward_loop_43 as _forward_values_45:
-                arrival_word = _forward_values_45[0]
-                _gmem_store_bits_48 = cutlass.Vector.from_elements([cutlass.Uint32(arrival[0]), cutlass.Uint32(arrival[1]), cutlass.Uint32(arrival[2]), cutlass.Uint32(arrival[3]), cutlass.Uint32(arrival[4]), cutlass.Uint32(arrival[5]), cutlass.Uint32(arrival[6]), cutlass.Uint32(arrival[7])], cutlass.Uint32)
-                prims.store_ext(_gmem_store_bits_48.ir_value(), cute.recast_ptr(cute.recast_ptr(route_terms_bf16, dtype=cutlass.BFloat16) + arrival_word, dtype=cutlass.Uint32))
-                cutlass.yield_out([cutlass.Int32(arrival_word + ((thread_stride * 16)))])
-            _route_terms_bf16 = _forward_storage_46
-            arrival = _forward_storage_47
+        arrival = cute.make_rmem_tensor((8,), cutlass.Uint32)
+        arrival[0] = cutlass.Uint32(4294967295)
+        arrival[1] = cutlass.Uint32(4294967295)
+        arrival[2] = cutlass.Uint32(4294967295)
+        arrival[3] = cutlass.Uint32(4294967295)
+        arrival[4] = cutlass.Uint32(4294967295)
+        arrival[5] = cutlass.Uint32(4294967295)
+        arrival[6] = cutlass.Uint32(4294967295)
+        arrival[7] = cutlass.Uint32(4294967295)
+        arm_thread = cutlass.Int32(((((num_bids - 1) - bid) * 384) + tid))
+        _forward_storage_46 = _route_terms_bf16
+        _forward_storage_47 = arrival
+        _forward_loop_43 = cutlass.while_generate([cutlass.Int32((arm_thread * 16))], lambda _forward_condition_44: _forward_condition_44 < cutlass.Int32(((tokens_per_rank * 8) * 3072)))
+        _forward_loop_43.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
+        with _forward_loop_43 as _forward_values_45:
+            arrival_word = _forward_values_45[0]
+            _gmem_store_bits_48 = cutlass.Vector.from_elements([cutlass.Uint32(arrival[0]), cutlass.Uint32(arrival[1]), cutlass.Uint32(arrival[2]), cutlass.Uint32(arrival[3]), cutlass.Uint32(arrival[4]), cutlass.Uint32(arrival[5]), cutlass.Uint32(arrival[6]), cutlass.Uint32(arrival[7])], cutlass.Uint32)
+            prims.store_ext(_gmem_store_bits_48.ir_value(), cute.recast_ptr(cute.recast_ptr(route_terms_bf16, dtype=cutlass.BFloat16) + arrival_word, dtype=cutlass.Uint32))
+            cutlass.yield_out([cutlass.Int32(arrival_word + ((thread_stride * 16)))])
+        _route_terms_bf16 = _forward_storage_46
+        arrival = _forward_storage_47
         prims.barrier_cta_sync(12, thread_count=384)
         if (warp == 0):
             if prims.elect_sync():
@@ -1565,27 +1565,27 @@ def kernel_cake_mxfp8_megamoe_ep16_fused_sm_107a(fc1_weight_e4m3: cutlass.GridCo
         _source_hidden_bf16 = _forward_storage_204
         _source_topk_ids_i64 = _forward_storage_205
         push_owners_1 = _forward_storage_206
-        if (launch_epoch == 0):
-            arrival_1 = cute.make_rmem_tensor((8,), cutlass.Uint32)
-            arrival_1[0] = cutlass.Uint32(4294967295)
-            arrival_1[1] = cutlass.Uint32(4294967295)
-            arrival_1[2] = cutlass.Uint32(4294967295)
-            arrival_1[3] = cutlass.Uint32(4294967295)
-            arrival_1[4] = cutlass.Uint32(4294967295)
-            arrival_1[5] = cutlass.Uint32(4294967295)
-            arrival_1[6] = cutlass.Uint32(4294967295)
-            arrival_1[7] = cutlass.Uint32(4294967295)
-            _forward_storage_226 = _route_terms_bf16
-            _forward_storage_227 = arrival_1
-            _forward_loop_223 = cutlass.while_generate([cutlass.Int32((linear_thread_1 * 16))], lambda _forward_condition_224: _forward_condition_224 < cutlass.Int32(((tokens_per_rank * 8) * 3072)))
-            _forward_loop_223.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
-            with _forward_loop_223 as _forward_values_225:
-                arrival_word_1 = _forward_values_225[0]
-                _gmem_store_bits_228 = cutlass.Vector.from_elements([cutlass.Uint32(arrival_1[0]), cutlass.Uint32(arrival_1[1]), cutlass.Uint32(arrival_1[2]), cutlass.Uint32(arrival_1[3]), cutlass.Uint32(arrival_1[4]), cutlass.Uint32(arrival_1[5]), cutlass.Uint32(arrival_1[6]), cutlass.Uint32(arrival_1[7])], cutlass.Uint32)
-                prims.store_ext(_gmem_store_bits_228.ir_value(), cute.recast_ptr(cute.recast_ptr(route_terms_bf16, dtype=cutlass.BFloat16) + arrival_word_1, dtype=cutlass.Uint32))
-                cutlass.yield_out([cutlass.Int32(arrival_word_1 + ((thread_stride_1 * 16)))])
-            _route_terms_bf16 = _forward_storage_226
-            arrival_1 = _forward_storage_227
+        arrival_1 = cute.make_rmem_tensor((8,), cutlass.Uint32)
+        arrival_1[0] = cutlass.Uint32(4294967295)
+        arrival_1[1] = cutlass.Uint32(4294967295)
+        arrival_1[2] = cutlass.Uint32(4294967295)
+        arrival_1[3] = cutlass.Uint32(4294967295)
+        arrival_1[4] = cutlass.Uint32(4294967295)
+        arrival_1[5] = cutlass.Uint32(4294967295)
+        arrival_1[6] = cutlass.Uint32(4294967295)
+        arrival_1[7] = cutlass.Uint32(4294967295)
+        arm_thread_1 = cutlass.Int32(((((num_bids - 1) - bid) * 384) + tid))
+        _forward_storage_226 = _route_terms_bf16
+        _forward_storage_227 = arrival_1
+        _forward_loop_223 = cutlass.while_generate([cutlass.Int32((arm_thread_1 * 16))], lambda _forward_condition_224: _forward_condition_224 < cutlass.Int32(((tokens_per_rank * 8) * 3072)))
+        _forward_loop_223.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
+        with _forward_loop_223 as _forward_values_225:
+            arrival_word_1 = _forward_values_225[0]
+            _gmem_store_bits_228 = cutlass.Vector.from_elements([cutlass.Uint32(arrival_1[0]), cutlass.Uint32(arrival_1[1]), cutlass.Uint32(arrival_1[2]), cutlass.Uint32(arrival_1[3]), cutlass.Uint32(arrival_1[4]), cutlass.Uint32(arrival_1[5]), cutlass.Uint32(arrival_1[6]), cutlass.Uint32(arrival_1[7])], cutlass.Uint32)
+            prims.store_ext(_gmem_store_bits_228.ir_value(), cute.recast_ptr(cute.recast_ptr(route_terms_bf16, dtype=cutlass.BFloat16) + arrival_word_1, dtype=cutlass.Uint32))
+            cutlass.yield_out([cutlass.Int32(arrival_word_1 + ((thread_stride_1 * 16)))])
+        _route_terms_bf16 = _forward_storage_226
+        arrival_1 = _forward_storage_227
         prims.barrier_cta_sync(12, thread_count=384)
         if (warp == 0):
             if prims.elect_sync():
@@ -2058,27 +2058,27 @@ def kernel_cake_mxfp8_megamoe_ep16_fused_sm_107a(fc1_weight_e4m3: cutlass.GridCo
         _source_hidden_bf16 = _forward_storage_300
         _source_topk_ids_i64 = _forward_storage_301
         push_owners_2 = _forward_storage_302
-        if (launch_epoch == 0):
-            arrival_2 = cute.make_rmem_tensor((8,), cutlass.Uint32)
-            arrival_2[0] = cutlass.Uint32(4294967295)
-            arrival_2[1] = cutlass.Uint32(4294967295)
-            arrival_2[2] = cutlass.Uint32(4294967295)
-            arrival_2[3] = cutlass.Uint32(4294967295)
-            arrival_2[4] = cutlass.Uint32(4294967295)
-            arrival_2[5] = cutlass.Uint32(4294967295)
-            arrival_2[6] = cutlass.Uint32(4294967295)
-            arrival_2[7] = cutlass.Uint32(4294967295)
-            _forward_storage_322 = _route_terms_bf16
-            _forward_storage_323 = arrival_2
-            _forward_loop_319 = cutlass.while_generate([cutlass.Int32((linear_thread_2 * 16))], lambda _forward_condition_320: _forward_condition_320 < cutlass.Int32(((tokens_per_rank * 8) * 3072)))
-            _forward_loop_319.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
-            with _forward_loop_319 as _forward_values_321:
-                arrival_word_2 = _forward_values_321[0]
-                _gmem_store_bits_324 = cutlass.Vector.from_elements([cutlass.Uint32(arrival_2[0]), cutlass.Uint32(arrival_2[1]), cutlass.Uint32(arrival_2[2]), cutlass.Uint32(arrival_2[3]), cutlass.Uint32(arrival_2[4]), cutlass.Uint32(arrival_2[5]), cutlass.Uint32(arrival_2[6]), cutlass.Uint32(arrival_2[7])], cutlass.Uint32)
-                prims.store_ext(_gmem_store_bits_324.ir_value(), cute.recast_ptr(cute.recast_ptr(route_terms_bf16, dtype=cutlass.BFloat16) + arrival_word_2, dtype=cutlass.Uint32))
-                cutlass.yield_out([cutlass.Int32(arrival_word_2 + ((thread_stride_2 * 16)))])
-            _route_terms_bf16 = _forward_storage_322
-            arrival_2 = _forward_storage_323
+        arrival_2 = cute.make_rmem_tensor((8,), cutlass.Uint32)
+        arrival_2[0] = cutlass.Uint32(4294967295)
+        arrival_2[1] = cutlass.Uint32(4294967295)
+        arrival_2[2] = cutlass.Uint32(4294967295)
+        arrival_2[3] = cutlass.Uint32(4294967295)
+        arrival_2[4] = cutlass.Uint32(4294967295)
+        arrival_2[5] = cutlass.Uint32(4294967295)
+        arrival_2[6] = cutlass.Uint32(4294967295)
+        arrival_2[7] = cutlass.Uint32(4294967295)
+        arm_thread_2 = cutlass.Int32(((((num_bids - 1) - bid) * 384) + tid))
+        _forward_storage_322 = _route_terms_bf16
+        _forward_storage_323 = arrival_2
+        _forward_loop_319 = cutlass.while_generate([cutlass.Int32((arm_thread_2 * 16))], lambda _forward_condition_320: _forward_condition_320 < cutlass.Int32(((tokens_per_rank * 8) * 3072)))
+        _forward_loop_319.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
+        with _forward_loop_319 as _forward_values_321:
+            arrival_word_2 = _forward_values_321[0]
+            _gmem_store_bits_324 = cutlass.Vector.from_elements([cutlass.Uint32(arrival_2[0]), cutlass.Uint32(arrival_2[1]), cutlass.Uint32(arrival_2[2]), cutlass.Uint32(arrival_2[3]), cutlass.Uint32(arrival_2[4]), cutlass.Uint32(arrival_2[5]), cutlass.Uint32(arrival_2[6]), cutlass.Uint32(arrival_2[7])], cutlass.Uint32)
+            prims.store_ext(_gmem_store_bits_324.ir_value(), cute.recast_ptr(cute.recast_ptr(route_terms_bf16, dtype=cutlass.BFloat16) + arrival_word_2, dtype=cutlass.Uint32))
+            cutlass.yield_out([cutlass.Int32(arrival_word_2 + ((thread_stride_2 * 16)))])
+        _route_terms_bf16 = _forward_storage_322
+        arrival_2 = _forward_storage_323
         prims.barrier_cta_sync(12, thread_count=384)
         if (warp == 0):
             if prims.elect_sync():
@@ -2456,27 +2456,27 @@ def kernel_cake_mxfp8_megamoe_ep16_fused_sm_107a(fc1_weight_e4m3: cutlass.GridCo
         _source_hidden_bf16 = _forward_storage_390
         _source_topk_ids_i64 = _forward_storage_391
         push_owners_3 = _forward_storage_392
-        if (launch_epoch == 0):
-            arrival_3 = cute.make_rmem_tensor((8,), cutlass.Uint32)
-            arrival_3[0] = cutlass.Uint32(4294967295)
-            arrival_3[1] = cutlass.Uint32(4294967295)
-            arrival_3[2] = cutlass.Uint32(4294967295)
-            arrival_3[3] = cutlass.Uint32(4294967295)
-            arrival_3[4] = cutlass.Uint32(4294967295)
-            arrival_3[5] = cutlass.Uint32(4294967295)
-            arrival_3[6] = cutlass.Uint32(4294967295)
-            arrival_3[7] = cutlass.Uint32(4294967295)
-            _forward_storage_412 = _route_terms_bf16
-            _forward_storage_413 = arrival_3
-            _forward_loop_409 = cutlass.while_generate([cutlass.Int32((linear_thread_3 * 16))], lambda _forward_condition_410: _forward_condition_410 < cutlass.Int32(((tokens_per_rank * 8) * 3072)))
-            _forward_loop_409.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
-            with _forward_loop_409 as _forward_values_411:
-                arrival_word_3 = _forward_values_411[0]
-                _gmem_store_bits_414 = cutlass.Vector.from_elements([cutlass.Uint32(arrival_3[0]), cutlass.Uint32(arrival_3[1]), cutlass.Uint32(arrival_3[2]), cutlass.Uint32(arrival_3[3]), cutlass.Uint32(arrival_3[4]), cutlass.Uint32(arrival_3[5]), cutlass.Uint32(arrival_3[6]), cutlass.Uint32(arrival_3[7])], cutlass.Uint32)
-                prims.store_ext(_gmem_store_bits_414.ir_value(), cute.recast_ptr(cute.recast_ptr(route_terms_bf16, dtype=cutlass.BFloat16) + arrival_word_3, dtype=cutlass.Uint32))
-                cutlass.yield_out([cutlass.Int32(arrival_word_3 + ((thread_stride_3 * 16)))])
-            _route_terms_bf16 = _forward_storage_412
-            arrival_3 = _forward_storage_413
+        arrival_3 = cute.make_rmem_tensor((8,), cutlass.Uint32)
+        arrival_3[0] = cutlass.Uint32(4294967295)
+        arrival_3[1] = cutlass.Uint32(4294967295)
+        arrival_3[2] = cutlass.Uint32(4294967295)
+        arrival_3[3] = cutlass.Uint32(4294967295)
+        arrival_3[4] = cutlass.Uint32(4294967295)
+        arrival_3[5] = cutlass.Uint32(4294967295)
+        arrival_3[6] = cutlass.Uint32(4294967295)
+        arrival_3[7] = cutlass.Uint32(4294967295)
+        arm_thread_3 = cutlass.Int32(((((num_bids - 1) - bid) * 384) + tid))
+        _forward_storage_412 = _route_terms_bf16
+        _forward_storage_413 = arrival_3
+        _forward_loop_409 = cutlass.while_generate([cutlass.Int32((arm_thread_3 * 16))], lambda _forward_condition_410: _forward_condition_410 < cutlass.Int32(((tokens_per_rank * 8) * 3072)))
+        _forward_loop_409.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
+        with _forward_loop_409 as _forward_values_411:
+            arrival_word_3 = _forward_values_411[0]
+            _gmem_store_bits_414 = cutlass.Vector.from_elements([cutlass.Uint32(arrival_3[0]), cutlass.Uint32(arrival_3[1]), cutlass.Uint32(arrival_3[2]), cutlass.Uint32(arrival_3[3]), cutlass.Uint32(arrival_3[4]), cutlass.Uint32(arrival_3[5]), cutlass.Uint32(arrival_3[6]), cutlass.Uint32(arrival_3[7])], cutlass.Uint32)
+            prims.store_ext(_gmem_store_bits_414.ir_value(), cute.recast_ptr(cute.recast_ptr(route_terms_bf16, dtype=cutlass.BFloat16) + arrival_word_3, dtype=cutlass.Uint32))
+            cutlass.yield_out([cutlass.Int32(arrival_word_3 + ((thread_stride_3 * 16)))])
+        _route_terms_bf16 = _forward_storage_412
+        arrival_3 = _forward_storage_413
         prims.barrier_cta_sync(12, thread_count=384)
         if (warp == 0):
             if prims.elect_sync():
@@ -2848,27 +2848,27 @@ def kernel_cake_mxfp8_megamoe_ep16_fused_sm_107a(fc1_weight_e4m3: cutlass.GridCo
         _source_hidden_bf16 = _forward_storage_486
         _source_topk_ids_i64 = _forward_storage_487
         push_owners_4 = _forward_storage_488
-        if (launch_epoch == 0):
-            arrival_4 = cute.make_rmem_tensor((8,), cutlass.Uint32)
-            arrival_4[0] = cutlass.Uint32(4294967295)
-            arrival_4[1] = cutlass.Uint32(4294967295)
-            arrival_4[2] = cutlass.Uint32(4294967295)
-            arrival_4[3] = cutlass.Uint32(4294967295)
-            arrival_4[4] = cutlass.Uint32(4294967295)
-            arrival_4[5] = cutlass.Uint32(4294967295)
-            arrival_4[6] = cutlass.Uint32(4294967295)
-            arrival_4[7] = cutlass.Uint32(4294967295)
-            _forward_storage_508 = _route_terms_bf16
-            _forward_storage_509 = arrival_4
-            _forward_loop_505 = cutlass.while_generate([cutlass.Int32((linear_thread_4 * 16))], lambda _forward_condition_506: _forward_condition_506 < cutlass.Int32(((tokens_per_rank * 8) * 3072)))
-            _forward_loop_505.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
-            with _forward_loop_505 as _forward_values_507:
-                arrival_word_4 = _forward_values_507[0]
-                _gmem_store_bits_510 = cutlass.Vector.from_elements([cutlass.Uint32(arrival_4[0]), cutlass.Uint32(arrival_4[1]), cutlass.Uint32(arrival_4[2]), cutlass.Uint32(arrival_4[3]), cutlass.Uint32(arrival_4[4]), cutlass.Uint32(arrival_4[5]), cutlass.Uint32(arrival_4[6]), cutlass.Uint32(arrival_4[7])], cutlass.Uint32)
-                prims.store_ext(_gmem_store_bits_510.ir_value(), cute.recast_ptr(cute.recast_ptr(route_terms_bf16, dtype=cutlass.BFloat16) + arrival_word_4, dtype=cutlass.Uint32))
-                cutlass.yield_out([cutlass.Int32(arrival_word_4 + ((thread_stride_4 * 16)))])
-            _route_terms_bf16 = _forward_storage_508
-            arrival_4 = _forward_storage_509
+        arrival_4 = cute.make_rmem_tensor((8,), cutlass.Uint32)
+        arrival_4[0] = cutlass.Uint32(4294967295)
+        arrival_4[1] = cutlass.Uint32(4294967295)
+        arrival_4[2] = cutlass.Uint32(4294967295)
+        arrival_4[3] = cutlass.Uint32(4294967295)
+        arrival_4[4] = cutlass.Uint32(4294967295)
+        arrival_4[5] = cutlass.Uint32(4294967295)
+        arrival_4[6] = cutlass.Uint32(4294967295)
+        arrival_4[7] = cutlass.Uint32(4294967295)
+        arm_thread_4 = cutlass.Int32(((((num_bids - 1) - bid) * 384) + tid))
+        _forward_storage_508 = _route_terms_bf16
+        _forward_storage_509 = arrival_4
+        _forward_loop_505 = cutlass.while_generate([cutlass.Int32((arm_thread_4 * 16))], lambda _forward_condition_506: _forward_condition_506 < cutlass.Int32(((tokens_per_rank * 8) * 3072)))
+        _forward_loop_505.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
+        with _forward_loop_505 as _forward_values_507:
+            arrival_word_4 = _forward_values_507[0]
+            _gmem_store_bits_510 = cutlass.Vector.from_elements([cutlass.Uint32(arrival_4[0]), cutlass.Uint32(arrival_4[1]), cutlass.Uint32(arrival_4[2]), cutlass.Uint32(arrival_4[3]), cutlass.Uint32(arrival_4[4]), cutlass.Uint32(arrival_4[5]), cutlass.Uint32(arrival_4[6]), cutlass.Uint32(arrival_4[7])], cutlass.Uint32)
+            prims.store_ext(_gmem_store_bits_510.ir_value(), cute.recast_ptr(cute.recast_ptr(route_terms_bf16, dtype=cutlass.BFloat16) + arrival_word_4, dtype=cutlass.Uint32))
+            cutlass.yield_out([cutlass.Int32(arrival_word_4 + ((thread_stride_4 * 16)))])
+        _route_terms_bf16 = _forward_storage_508
+        arrival_4 = _forward_storage_509
         prims.barrier_cta_sync(12, thread_count=384)
         if (warp == 0):
             if prims.elect_sync():
@@ -3158,27 +3158,27 @@ def kernel_cake_mxfp8_megamoe_ep16_fused_sm_107a(fc1_weight_e4m3: cutlass.GridCo
         _source_hidden_bf16 = _forward_storage_572
         _source_topk_ids_i64 = _forward_storage_573
         push_owners_5 = _forward_storage_574
-        if (launch_epoch == 0):
-            arrival_5 = cute.make_rmem_tensor((8,), cutlass.Uint32)
-            arrival_5[0] = cutlass.Uint32(4294967295)
-            arrival_5[1] = cutlass.Uint32(4294967295)
-            arrival_5[2] = cutlass.Uint32(4294967295)
-            arrival_5[3] = cutlass.Uint32(4294967295)
-            arrival_5[4] = cutlass.Uint32(4294967295)
-            arrival_5[5] = cutlass.Uint32(4294967295)
-            arrival_5[6] = cutlass.Uint32(4294967295)
-            arrival_5[7] = cutlass.Uint32(4294967295)
-            _forward_storage_594 = _route_terms_bf16
-            _forward_storage_595 = arrival_5
-            _forward_loop_591 = cutlass.while_generate([cutlass.Int32((linear_thread_5 * 16))], lambda _forward_condition_592: _forward_condition_592 < cutlass.Int32(((tokens_per_rank * 8) * 3072)))
-            _forward_loop_591.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
-            with _forward_loop_591 as _forward_values_593:
-                arrival_word_5 = _forward_values_593[0]
-                _gmem_store_bits_596 = cutlass.Vector.from_elements([cutlass.Uint32(arrival_5[0]), cutlass.Uint32(arrival_5[1]), cutlass.Uint32(arrival_5[2]), cutlass.Uint32(arrival_5[3]), cutlass.Uint32(arrival_5[4]), cutlass.Uint32(arrival_5[5]), cutlass.Uint32(arrival_5[6]), cutlass.Uint32(arrival_5[7])], cutlass.Uint32)
-                prims.store_ext(_gmem_store_bits_596.ir_value(), cute.recast_ptr(cute.recast_ptr(route_terms_bf16, dtype=cutlass.BFloat16) + arrival_word_5, dtype=cutlass.Uint32))
-                cutlass.yield_out([cutlass.Int32(arrival_word_5 + ((thread_stride_5 * 16)))])
-            _route_terms_bf16 = _forward_storage_594
-            arrival_5 = _forward_storage_595
+        arrival_5 = cute.make_rmem_tensor((8,), cutlass.Uint32)
+        arrival_5[0] = cutlass.Uint32(4294967295)
+        arrival_5[1] = cutlass.Uint32(4294967295)
+        arrival_5[2] = cutlass.Uint32(4294967295)
+        arrival_5[3] = cutlass.Uint32(4294967295)
+        arrival_5[4] = cutlass.Uint32(4294967295)
+        arrival_5[5] = cutlass.Uint32(4294967295)
+        arrival_5[6] = cutlass.Uint32(4294967295)
+        arrival_5[7] = cutlass.Uint32(4294967295)
+        arm_thread_5 = cutlass.Int32(((((num_bids - 1) - bid) * 384) + tid))
+        _forward_storage_594 = _route_terms_bf16
+        _forward_storage_595 = arrival_5
+        _forward_loop_591 = cutlass.while_generate([cutlass.Int32((arm_thread_5 * 16))], lambda _forward_condition_592: _forward_condition_592 < cutlass.Int32(((tokens_per_rank * 8) * 3072)))
+        _forward_loop_591.while_op.attributes["loop_annotation"] = cutlass.LoopUnroll(count=1)
+        with _forward_loop_591 as _forward_values_593:
+            arrival_word_5 = _forward_values_593[0]
+            _gmem_store_bits_596 = cutlass.Vector.from_elements([cutlass.Uint32(arrival_5[0]), cutlass.Uint32(arrival_5[1]), cutlass.Uint32(arrival_5[2]), cutlass.Uint32(arrival_5[3]), cutlass.Uint32(arrival_5[4]), cutlass.Uint32(arrival_5[5]), cutlass.Uint32(arrival_5[6]), cutlass.Uint32(arrival_5[7])], cutlass.Uint32)
+            prims.store_ext(_gmem_store_bits_596.ir_value(), cute.recast_ptr(cute.recast_ptr(route_terms_bf16, dtype=cutlass.BFloat16) + arrival_word_5, dtype=cutlass.Uint32))
+            cutlass.yield_out([cutlass.Int32(arrival_word_5 + ((thread_stride_5 * 16)))])
+        _route_terms_bf16 = _forward_storage_594
+        arrival_5 = _forward_storage_595
         prims.barrier_cta_sync(12, thread_count=384)
         if (warp == 0):
             if prims.elect_sync():
