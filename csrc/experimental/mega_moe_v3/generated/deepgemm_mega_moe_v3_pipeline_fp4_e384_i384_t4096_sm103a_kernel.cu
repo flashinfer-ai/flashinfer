@@ -755,8 +755,8 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t4096_sm103a(int* __restrict_
                     {
                         void* _cpbulk_dst_8 = reinterpret_cast<void*>(pool_fp8 + dst_u32_off);
                         asm volatile(
-                            "cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
-                            :: "l"(_cpbulk_dst_8), "r"(send_buffer_addr + (unsigned int)(disp_warp * 5120)), "r"((uint32_t)(5120))
+                            "cp.async.bulk.global.shared::cta.bulk_group.L2::cache_hint [%0], [%1], %2, %3;"
+                            :: "l"(_cpbulk_dst_8), "r"(send_buffer_addr + (unsigned int)(disp_warp * 5120)), "r"((uint32_t)(5120)), "l"(0x14F0000000000000ULL)
                             : "memory");
                     }
                     asm volatile("cp.async.bulk.commit_group;");
@@ -2213,7 +2213,7 @@ kernel_deepgemm_mega_moe_v3_pipeline_fp4_e384_i384_t4096_sm103a(int* __restrict_
                                 : "=r"(*reinterpret_cast<uint32_t*>(&packed[0])), "=r"(*reinterpret_cast<uint32_t*>(&packed[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&packed[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&packed[(0) + 3]))
                                 : "r"(read_address));
                             unsigned long long dst_index = (unsigned long long)(pool_m + row_3) * 2560 + (unsigned long long)(n_offset_1 / 2) + (unsigned long long)(lane % 16 * 4);
-                            reinterpret_cast<int4*>(PublicExpertOutput + dst_index)[0] = reinterpret_cast<int4*>(packed)[0];
+                            asm volatile("st.global.L2::cache_hint.v4.b32 [%0], {%1, %2, %3, %4}, %5;" :: "l"(PublicExpertOutput + dst_index), "r"(packed[(0) + 0]), "r"(packed[(0) + 1]), "r"(packed[(0) + 2]), "r"(packed[(0) + 3]), "l"(0x14F0000000000000ULL) : "memory");
                         }
                     }
                     asm volatile("barrier.sync 2, 256;" ::: "memory");
