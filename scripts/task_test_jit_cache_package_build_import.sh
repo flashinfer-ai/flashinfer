@@ -188,6 +188,34 @@ run_with_aot_memory_monitor "pip_install_flashinfer_editable" \
 }
 echo "✓ Flashinfer package installed successfully"
 
+# Fail fast on providers whose spec list names CUDA targets the provider cannot
+# carry. The release validation rejects these after the whole build (see
+# verify_jit_cache_provider_architectures.py below); this finds them from the
+# generated specs alone, in minutes instead of after hours of compiling. One process
+# per provider: the target list is fixed when flashinfer is first imported.
+echo ""
+echo "========================================"
+echo "Linting provider spec CUDA targets"
+echo "========================================"
+: "${AOT_SPEC_LINT_CONCURRENCY:=3}"
+if ! [[ "${AOT_SPEC_LINT_CONCURRENCY}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: AOT_SPEC_LINT_CONCURRENCY must be a positive integer, got '${AOT_SPEC_LINT_CONCURRENCY}'"
+    exit 1
+fi
+lint_provider_specs() {
+    local provider_architecture=$1
+    python3 "${SCRIPT_DIR}/check_jit_spec_gencodes.py" \
+        --provider "${provider_architecture}" 2>&1 \
+        | sed -u "s/^/[${provider_architecture}] /"
+}
+SPEC_LINT_STARTED_AT=${SECONDS}
+run_bounded_parallel "${AOT_SPEC_LINT_CONCURRENCY}" lint_provider_specs \
+    "${PROVIDER_ARCHITECTURE_LIST[@]}" || {
+    echo "ERROR: A provider spec lists CUDA targets the provider cannot carry"
+    exit 1
+}
+echo "✓ Provider spec CUDA targets linted in $(( SECONDS - SPEC_LINT_STARTED_AT )) s"
+
 # Set up sccache for compiler caching with S3 backend.
 # Uses read-write mode when AWS credentials are available (nightly/release builds),
 # otherwise falls back to read-only anonymous access to the public cache bucket.
@@ -281,6 +309,18 @@ run_bounded_parallel "${AOT_PROVIDER_CONCURRENCY}" build_provider_wheel \
     exit 1
 }
 echo "Provider wheels built in $(( SECONDS - PROVIDER_BUILD_STARTED_AT )) s"
+
+# The same inspection the release and nightly builds apply to every provider
+# wheel: cuobjdump must find no SASS for another architecture and no PTX.
+CUOBJDUMP=$(command -v cuobjdump || echo /usr/local/cuda/bin/cuobjdump)
+run_with_aot_memory_monitor "verify_provider_wheel_architectures" \
+    python3 "${SCRIPT_DIR}/verify_jit_cache_provider_architectures.py" \
+    --wheelhouse "${WHEELHOUSE}" \
+    --version "$(tr -d '[:space:]' < version.txt)+${CUDA_LABEL}" \
+    --cuobjdump "${CUOBJDUMP}" || {
+    echo "ERROR: A provider wheel contains CUDA targets or PTX it must not"
+    exit 1
+}
 
 rm -rf flashinfer-jit-cache/dist flashinfer-jit-cache/build \
     flashinfer-jit-cache/*.egg-info
