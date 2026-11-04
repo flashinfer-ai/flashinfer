@@ -20,6 +20,7 @@ from flashinfer.gemm.cake_grouped_fp8_gemm import (
     BS_N256_RUN32_ROUTE,
     BS_N256_S16_ROUTE,
     BS_ROUTES,
+    BS_STORE16_ARCHS,
     BS_STORE16_ROUTES,
     BS_SWAP_BM64_ROUTE,
     BS_SWAP_C1_ROUTE,
@@ -52,6 +53,7 @@ from flashinfer.gemm.cake_grouped_fp8_gemm import (
     DEEPK_CG2_RECURRENCE_ROUTE,
     DEEPK_N256_ROUTE,
     EXPERT_ALIGNED_MAX_GROUPS,
+    FP32_SCALE_ARCHS,
     K128_ROUTE,
     K384_ROUTE,
     WSEG_MAX_M,
@@ -76,24 +78,45 @@ from flashinfer.gemm.cake_grouped_fp8_gemm import (
 from flashinfer.jit.gemm.cake_grouped_fp8_gemm import (
     PROGRAMS,
     ROUTES,
+    SM107A_ROUTES,
     SUPPORTED_COMPUTE_CAPABILITIES,
     device_arch,
+    route_program,
 )
 
 ATOL = RTOL = 3e-2
 
+# The tests that run on an architecture outside FP32_SCALE_ARCHS (SM107a): it
+# ships the non-swapped block-scaled programs alone.
+BLOCK_SCALED_ONLY_TESTS = frozenset(
+    {
+        "test_block_scaled_packed_scales_match_reference",
+        "test_block_scaled_accepts_block_rows_weight_scales",
+        "test_block_scaled_launch_rebinds_token_operands_and_captures",
+        "test_block_scaled_rejects_invalid_inputs",
+        "test_block_scaled_only_arch_routes_name_registered_programs",
+        "test_block_scaled_only_arch_rejects_float32_scales",
+    }
+)
+
 
 @pytest.fixture(autouse=True)
-def _require_generated_program():
+def _require_generated_program(request):
     if not torch.cuda.is_available():
         pytest.skip("requires CUDA")
     device = torch.device("cuda")
     if torch.cuda.get_device_capability(device) not in SUPPORTED_COMPUTE_CAPABILITIES:
         pytest.skip(
-            "generated contiguous grouped FP8 GEMM programs target SM100a and SM103a"
+            "generated contiguous grouped FP8 GEMM programs target SM100a, SM103a and SM107a"
         )
     if not is_group_gemm_fp8_nt_groupwise_contiguous_prepared_available(device):
         pytest.skip("no generated contiguous grouped FP8 GEMM program is registered")
+    arch = device_arch(torch.cuda.current_device())
+    if (
+        arch not in FP32_SCALE_ARCHS
+        and request.node.originalname not in BLOCK_SCALED_ONLY_TESTS
+    ):
+        pytest.skip(f"{arch} ships the non-swapped block-scaled programs only")
 
 
 def _make_inputs(group_counts, n, k, *, seed, device, arbitrary_scales=False):
@@ -1029,8 +1052,12 @@ def test_block_scaled_packed_scales_match_reference(group_counts, n, k, alignmen
                 BS_SWAP_RP32_ROUTE,
             )
         ) == (alignment % 128 != 0)
-    assert (prepared.route in BS_STORE16_ROUTES.values()) == bs_store16(
-        int(m_indices.numel()), alignment=alignment, num_groups=len(group_counts)
+    arch = device_arch(torch.cuda.current_device())
+    assert (prepared.route in BS_STORE16_ROUTES.values()) == (
+        arch in BS_STORE16_ARCHS
+        and bs_store16(
+            int(m_indices.numel()), alignment=alignment, num_groups=len(group_counts)
+        )
     )
     prepared.launch()
     torch.cuda.synchronize()
@@ -2190,6 +2217,54 @@ def test_block_scaled_rejects_invalid_inputs():
             b_packed,
             m_indices,
             out=storage[1 : 1 + int(m_indices.numel()) * 256].view(-1, 256),
+        )
+
+
+def test_block_scaled_only_arch_routes_name_registered_programs():
+    """On SM107a every block-scaled launch plan names one of its four registered programs."""
+    for route in (
+        BS_N128_ROUTE,
+        BS_N256_ROUTE,
+        BS_N128_RUN32_ROUTE,
+        BS_N256_RUN32_ROUTE,
+    ):
+        assert route_program("sm_107a", route) == SM107A_ROUTES[route]
+        assert "sm_107a" in PROGRAMS[SM107A_ROUTES[route]]["arches"]
+    for route in (*BS_STORE16_ROUTES.values(), *BS_SWAP_ROUTES, K128_ROUTE):
+        with pytest.raises(NotImplementedError, match="sm_107a"):
+            route_program("sm_107a", route)
+    planned = set()
+    for m in (128, 256, 1024, 4096, 16384, 65536):
+        for n in (256, 512, 1024, 4096, 7168):
+            for k in (128, 512, 2048, 7168):
+                for alignment in (32, 64, 128):
+                    for sm_count in (148, 212, 216):
+                        route, _ = launch_plan(
+                            m,
+                            n,
+                            k,
+                            sm_count=sm_count,
+                            scalar_output=False,
+                            block_scaled=True,
+                            alignment=alignment,
+                            num_groups=8,
+                            arch="sm_107a",
+                        )
+                        planned.add(route)
+    assert planned == set(SM107A_ROUTES)
+
+
+def test_block_scaled_only_arch_rejects_float32_scales():
+    """Float32 scales have no program outside FP32_SCALE_ARCHS: preparation raises."""
+    device = torch.device("cuda")
+    if device_arch(torch.cuda.current_device()) in FP32_SCALE_ARCHS:
+        pytest.skip("the device runs the FP32-scale programs")
+    a, b, a_scale, b_scale, m_indices = _make_inputs(
+        [128, 64], 256, 512, seed=4764, device=device
+    )
+    with pytest.raises(NotImplementedError, match="float32 scales"):
+        prepare_group_gemm_fp8_nt_groupwise_contiguous(
+            a, b, a_scale, b_scale, m_indices
         )
 
 
