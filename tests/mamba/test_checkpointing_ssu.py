@@ -5589,82 +5589,87 @@ def test_checkpointing_ssu_noncontig(state_dtype, varlen, two_kernel, tracker_st
     ring_start_nc, pt_test = _strided_trackers(ring_start, prev_tokens, tracker_stride)
     assert ring_start_nc.stride(0) == pt_test.stride(0) == tracker_stride
 
-    checkpointing_ssu(
-        state_test,
-        x_cache_nc,
-        B_cache_nc,
-        dt_cache_nc,
-        ring_start_nc,
-        pt_test,
-        x=x_nc,
-        dt=dt_nc,
-        B=B_nc,
-        C=C_nc,
-        out=out_nc,
-        z=z_nc,
-        state_scale=state_scale_test,
-        cu_seqlens=cu_seqlens,
-        max_seqlen=npredicted if varlen else None,
-        **common_static,
-        **(
-            _two_kernel_scratch(batch, nheads, npredicted, max_window, dtype, device)
-            if two_kernel
-            else {}
-        ),
-    )
-
-    # ── Compare ──
-    # Output: same data layout (only outer-dim padding differs); .contiguous()
-    # the non-contig view to get the same layout as the reference.
-    torch.testing.assert_close(
-        out_nc.contiguous(),
-        out_ref,
-        rtol=0,
-        atol=0,
-        msg=f"output mismatch under non-contig (varlen={varlen})",
-    )
-
-    if is_quantized:
-        torch.testing.assert_close(
-            _dequantize_state(state_test, state_scale_test),
-            _dequantize_state(state_ref, state_scale_ref),
-            rtol=0,
-            atol=0,
-            msg=f"state (dequant) mismatch (varlen={varlen})",
-        )
-    else:
-        torch.testing.assert_close(
+    try:
+        checkpointing_ssu(
             state_test,
-            state_ref,
-            rtol=0,
-            atol=0,
-            msg=f"state mismatch (varlen={varlen})",
+            x_cache_nc,
+            B_cache_nc,
+            dt_cache_nc,
+            ring_start_nc,
+            pt_test,
+            x=x_nc,
+            dt=dt_nc,
+            B=B_nc,
+            C=C_nc,
+            out=out_nc,
+            z=z_nc,
+            state_scale=state_scale_test,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=npredicted if varlen else None,
+            **common_static,
+            **(
+                _two_kernel_scratch(
+                    batch, nheads, npredicted, max_window, dtype, device
+                )
+                if two_kernel
+                else {}
+            ),
         )
 
-    torch.testing.assert_close(
-        x_cache_nc.contiguous(),
-        x_ref,
-        rtol=0,
-        atol=0,
-        msg=f"x_cache mismatch (varlen={varlen})",
-    )
-    torch.testing.assert_close(
-        B_cache_nc.contiguous(),
-        B_ref,
-        rtol=0,
-        atol=0,
-        msg=f"B_cache mismatch (varlen={varlen})",
-    )
-    torch.testing.assert_close(
-        dt_cache_nc.contiguous(),
-        dt_ref,
-        rtol=0,
-        atol=0,
-        msg=f"dt_cache mismatch (varlen={varlen})",
-    )
-    # The large-stride buffer is ~9 GiB: release it instead of keeping it cached.
-    del ring_start_nc, pt_test
-    torch.cuda.empty_cache()
+        # ── Compare ──
+        # Output: same data layout (only outer-dim padding differs); .contiguous()
+        # the non-contig view to get the same layout as the reference.
+        torch.testing.assert_close(
+            out_nc.contiguous(),
+            out_ref,
+            rtol=0,
+            atol=0,
+            msg=f"output mismatch under non-contig (varlen={varlen})",
+        )
+
+        if is_quantized:
+            torch.testing.assert_close(
+                _dequantize_state(state_test, state_scale_test),
+                _dequantize_state(state_ref, state_scale_ref),
+                rtol=0,
+                atol=0,
+                msg=f"state (dequant) mismatch (varlen={varlen})",
+            )
+        else:
+            torch.testing.assert_close(
+                state_test,
+                state_ref,
+                rtol=0,
+                atol=0,
+                msg=f"state mismatch (varlen={varlen})",
+            )
+
+        torch.testing.assert_close(
+            x_cache_nc.contiguous(),
+            x_ref,
+            rtol=0,
+            atol=0,
+            msg=f"x_cache mismatch (varlen={varlen})",
+        )
+        torch.testing.assert_close(
+            B_cache_nc.contiguous(),
+            B_ref,
+            rtol=0,
+            atol=0,
+            msg=f"B_cache mismatch (varlen={varlen})",
+        )
+        torch.testing.assert_close(
+            dt_cache_nc.contiguous(),
+            dt_ref,
+            rtol=0,
+            atol=0,
+            msg=f"dt_cache mismatch (varlen={varlen})",
+        )
+    finally:
+        # The large-stride buffer is ~9 GiB: release it even when a comparison
+        # fails, so later large-stride cases still pass the free-memory check.
+        del ring_start_nc, pt_test
+        torch.cuda.empty_cache()
 
 
 # ────────────────────────────────────────────────────────────────────────────
