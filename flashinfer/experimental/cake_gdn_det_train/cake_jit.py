@@ -395,15 +395,15 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "ffi_entry": "run",
-        "kernel_symbol": "kernel_cake_gdn_det_train_fffbca00fed25d191c1b",
+        "kernel_symbol": "kernel_cake_gdn_det_train_969371cd5760127281dd",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
             "cooperative": False,
-            "dynamic_smem_bytes": 53632,
+            "dynamic_smem_bytes": 41600,
             "use_pdl": False,
         },
-        "library": "cake_gdn_det_train_fffbca00fed25d191c1b",
+        "library": "cake_gdn_det_train_969371cd5760127281dd",
         "stage": "wy_tc2",
     },
     "fwd_h_r32k2": {
