@@ -51,8 +51,8 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 
 extern "C" {
 
-__global__ __launch_bounds__(32) void
-kernel_cake_msa_icp_indexer_a77d085731244b7ddd2e(int* __restrict__ recv, int* __restrict__ num_valid_pages, int* __restrict__ output, int* __restrict__ errors, int* __restrict__ expected, int recv_stride_src, int recv_stride_h, int recv_stride_t, int out_stride_t, int out_stride_h, int capacity, int* __restrict__ token_count, int world, int tagged, int prefill, int init_blocks, int local_blocks, int spin_limit)
+__global__ __launch_bounds__(128) void
+kernel_cake_msa_icp_indexer_355225d90e36323a16b7(int* __restrict__ recv, int* __restrict__ num_valid_pages, int* __restrict__ output, int* __restrict__ errors, int* __restrict__ expected, int recv_stride_src, int recv_stride_h, int recv_stride_t, int out_stride_t, int out_stride_h, int capacity, int num_tokens, int world, int tagged, int prefill, int init_blocks, int local_blocks, int spin_limit)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -76,19 +76,15 @@ kernel_cake_msa_icp_indexer_a77d085731244b7ddd2e(int* __restrict__ recv, int* __
     unsigned int* ranked = reinterpret_cast<unsigned int*>(smem_raw + 0);
     const int ranked_addr = smem + 0;
 
-    // Kernel post-init ops
-    asm volatile("griddepcontrol.wait;" ::: "memory");
-
     // === Task calls (declaration order) ===
     int lane_1 = (int)lane;
-    int t = (int)blockIdx.x + (int)warp;
+    int t = (int)blockIdx.x * 4 + (int)warp;
     int h = (int)blockIdx.y;
     int mode = ((tagged != 0) ? 2 : 1);
     if (mode == 2) {
         asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     }
-    int n_tok = *token_count;
-    if (t < n_tok) {
+    if (t < num_tokens) {
         if (world == 2) {
             long long row = (long long)h * (long long)recv_stride_h + (long long)t * (long long)recv_stride_t;
             unsigned int gen = 0;
@@ -102,7 +98,7 @@ kernel_cake_msa_icp_indexer_a77d085731244b7ddd2e(int* __restrict__ recv, int* __
             unsigned int sb[1];
             int ib[1];
             int nv = 0;
-            int early = 1;
+            int early = (int)(mode != 1);
             if (early != 0) {
                 nv = num_valid_pages[t];
             }
@@ -517,7 +513,7 @@ kernel_cake_msa_icp_indexer_a77d085731244b7ddd2e(int* __restrict__ recv, int* __
             unsigned int sb_1[2];
             int ib_1[2];
             int nv_1 = 0;
-            int early_1 = 1;
+            int early_1 = (int)(mode != 1);
             if (early_1 != 0) {
                 nv_1 = num_valid_pages[t];
             }
@@ -1482,6 +1478,7 @@ kernel_cake_msa_icp_indexer_a77d085731244b7ddd2e(int* __restrict__ recv, int* __
             }
         }
     }
+    asm volatile("griddepcontrol.wait;" ::: "memory");
 }
 
 } // extern "C"
