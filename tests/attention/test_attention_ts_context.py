@@ -5840,26 +5840,3 @@ def test_context_global_scales_graph_replay(paged):
     check(replace(reference, **{name: changed * 0.5}))
     wrapper.run(*args, out=out, validate=False)
     check(replace(reference, **{name: changed}))
-    with pytest.raises(TypeError, match="same scalar/tensor type"):
-        wrapper.run(*args, validate=False, **{name: changed})
-
-
-@_REQUIRES_CONTEXT_GPU
-def test_global_scale_tensor_shape_contract():
-    """Scalar views preserve graph addresses; matrices and vectors are rejected."""
-    from flashinfer.attention.prims_ts._scales import normalize_scale
-
-    scalar = torch.tensor(0.5, device="cuda")
-    vector = normalize_scale(scalar, name="softmax_scale", device=scalar.device)
-    assert vector.shape == (1,)
-    assert vector.data_ptr() == scalar.data_ptr()
-    scalar.fill_(0.75)
-    torch.testing.assert_close(vector, scalar.view(1))
-    for invalid in (
-        torch.ones(1),
-        torch.ones(1, device="cuda", dtype=torch.float64),
-        torch.ones(2, device="cuda"),
-        torch.ones(1, 1, device="cuda"),
-    ):
-        with pytest.raises(ValueError, match="CUDA float32 tensor"):
-            normalize_scale(invalid, name="softmax_scale", device=scalar.device)

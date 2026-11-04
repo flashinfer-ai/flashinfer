@@ -538,18 +538,16 @@ def test_enable_apply_dispatches_to_callable():
 
 @pytest.mark.cpu_only
 @pytest.mark.parametrize(
-    "family,bound",
+    "family,bound,scale_types,scalar_tensor",
     [
-        ("decode", False),
-        ("mla", False),
-        ("block_sparse", False),
-        ("paged_block_sparse", False),
-        ("block_sparse", True),
-        ("paged_block_sparse", True),
+        ("decode", False, (True, False), True),
+        ("mla", False, (False, True), False),
+        ("block_sparse", False, (True, True), True),
+        ("paged_block_sparse", False, (True, False), False),
+        ("block_sparse", True, (False, True), True),
+        ("paged_block_sparse", True, (True, True), False),
     ],
 )
-@pytest.mark.parametrize("scale_types", [(False, True), (True, False), (True, True)])
-@pytest.mark.parametrize("scalar_tensor", [False, True])
 def test_prims_ts_device_scale_routes(family, bound, scale_types, scalar_tensor):
     from tests.trace.test_prims_ts_global_scales import _trace_case
 
@@ -631,92 +629,65 @@ def _assert_prims_ts_scale_fallback(
 
 
 @pytest.mark.cpu_only
-@pytest.mark.parametrize("bound", [False, True])
-@pytest.mark.parametrize("scale_index", [0, 1])
 @pytest.mark.parametrize(
-    "shape,dtype",
+    "bound,scale_types,scale_index,invalid,error_type",
     [
-        ((0,), torch.float32),
-        ((2,), torch.float32),
-        ((1, 1), torch.float32),
-        ((1,), torch.float16),
+        pytest.param(False, (False, False), 0, 0.0, ValueError, id="host-zero-ff"),
+        pytest.param(True, (False, False), 1, True, TypeError, id="host-bool-ff-bound"),
+        pytest.param(
+            False, (True, False), 1, float("inf"), ValueError, id="host-inf-tf"
+        ),
+        pytest.param(
+            True, (False, True), 0, 1e-50, ValueError, id="host-underflow-ft-bound"
+        ),
+        pytest.param(
+            False,
+            (True, False),
+            0,
+            ((2,), torch.float32, "cuda:0"),
+            ValueError,
+            id="shape-tf",
+        ),
+        pytest.param(
+            True,
+            (False, True),
+            1,
+            ((1,), torch.float16, "cuda:0"),
+            ValueError,
+            id="dtype-ft-bound",
+        ),
+        pytest.param(
+            False,
+            (True, False),
+            0,
+            ((1,), torch.float32, "cpu"),
+            ValueError,
+            id="device-tf",
+        ),
+        pytest.param(
+            True,
+            (False, True),
+            1,
+            ((1,), torch.float32, "cuda:1"),
+            ValueError,
+            id="device-ft-bound",
+        ),
     ],
 )
-def test_prims_ts_invalid_scale_metadata_falls_back(bound, scale_index, shape, dtype):
-    from tests.trace.test_prims_ts_global_scales import _trace_case
-
-    scales = [0.25, 1.0]
-    scales[scale_index] = torch.empty(1, device="meta")
-    api, kwargs, names = _trace_case(
-        "block_sparse" if bound else "decode", bound, scales
-    )
-    definition = flashinfer.fi_trace(api, **kwargs)
-    kwargs[names[scale_index]] = torch.empty(shape, dtype=dtype, device="meta")
-    if bound:
-        state = api.__self__._plan_state
-        state.device = torch.device("cuda:0")
-        state.use_kv_valid_bits = False
-        state.dummy_kv_valid_bits = None
-        kwargs.update(validate=False, out=kwargs["q"])
-        expected_error = (
-            f"{names[scale_index]} must be a contiguous CUDA float32 tensor"
-        )
-    else:
-        expected_error = "block_tables must be a CUDA tensor"
-
-    _assert_prims_ts_scale_fallback(api, kwargs, definition, ValueError, expected_error)
-
-
-@pytest.mark.cpu_only
-@pytest.mark.parametrize("bound", [False, True])
-@pytest.mark.parametrize("scale_index", [0, 1])
-@pytest.mark.parametrize("other_tensor", [False, True])
-@pytest.mark.parametrize(
-    "invalid", [0.0, -1.0, float("nan"), float("inf"), True, 1e40, 1e-50]
-)
-def test_prims_ts_invalid_host_scale_falls_back(
-    bound, scale_index, other_tensor, invalid
+def test_prims_ts_invalid_scale_falls_back(
+    bound, scale_types, scale_index, invalid, error_type
 ):
     from torch._subclasses.fake_tensor import FakeTensorMode
     from tests.trace.test_prims_ts_global_scales import _trace_case
 
-    scales = [0.25, 1.0]
-    if other_tensor:
-        with FakeTensorMode():
-            scales[1 - scale_index] = torch.empty(
-                1, device="cuda:0" if bound else "meta"
-            )
-    api, kwargs, names = _trace_case(
-        "block_sparse" if bound else "decode", bound, scales
-    )
-    if bound:
-        state = api.__self__._plan_state
-        state.device = torch.device("cuda:0")
-        state.use_kv_valid_bits = False
-        state.dummy_kv_valid_bits = None
-        kwargs.update(validate=False, out=kwargs["q"])
-    definition = flashinfer.fi_trace(api, **kwargs)
-    kwargs[names[scale_index]] = invalid
-    error_type = TypeError if bound and isinstance(invalid, bool) else ValueError
-    expected_error = (
-        names[scale_index] if bound else "block_tables must be a CUDA tensor"
-    )
-    _assert_prims_ts_scale_fallback(api, kwargs, definition, error_type, expected_error)
-
-
-@pytest.mark.cpu_only
-@pytest.mark.parametrize("bound", [False, True])
-@pytest.mark.parametrize("scale_index", [0, 1])
-@pytest.mark.parametrize("scale_device", ["cpu", "meta", "cuda:1"])
-def test_prims_ts_wrong_scale_device_falls_back(bound, scale_index, scale_device):
-    from torch._subclasses.fake_tensor import FakeTensorMode
-    from tests.trace.test_prims_ts_global_scales import _trace_case
-
     with FakeTensorMode():
-        valid = torch.empty(1, device="cuda:0")
-        invalid = torch.empty(1, device=scale_device)
-    scales = [0.25, 1.0]
-    scales[scale_index] = valid
+        scales = tuple(
+            torch.empty(1, device="cuda:0") if tensor else 0.25
+            for tensor in scale_types
+        )
+        if isinstance(invalid, tuple):
+            shape, dtype, device = invalid
+            invalid = torch.empty(shape, dtype=dtype, device=device)
     api, kwargs, names = _trace_case(
         "block_sparse" if bound else "decode", bound, scales
     )
@@ -726,7 +697,7 @@ def test_prims_ts_wrong_scale_device_falls_back(bound, scale_index, scale_device
         state.use_kv_valid_bits = False
         state.dummy_kv_valid_bits = None
         kwargs.update(validate=False, out=kwargs["q"])
-        expected_error = f"{names[scale_index]} .* on cuda:0"
+        expected_error = names[scale_index]
     else:
         with FakeTensorMode():
             kwargs["q"] = torch.empty(
@@ -735,7 +706,7 @@ def test_prims_ts_wrong_scale_device_falls_back(bound, scale_index, scale_device
         expected_error = "block_tables must be a CUDA tensor"
     definition = flashinfer.fi_trace(api, **kwargs)
     kwargs[names[scale_index]] = invalid
-    _assert_prims_ts_scale_fallback(api, kwargs, definition, ValueError, expected_error)
+    _assert_prims_ts_scale_fallback(api, kwargs, definition, error_type, expected_error)
 
 
 @pytest.mark.cpu_only

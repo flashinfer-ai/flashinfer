@@ -3798,29 +3798,41 @@ def test_attention_ts_mla_decode_2cta_runtime_small_split_reduction(seq_len_q, k
 def test_dense_mla_global_scales_graph_replay(family):
     from tests.test_helpers.pdl import late_store
 
-    case = _make_mla_case(
-        batch_size=4 if family == "1cta" else 8,
-        num_qo_heads=16 if family == "1cta" else 128,
-        max_kv_len=4097 if family == "1cta" else 2048,
-        qkv_dtype=_FP8,
-        seq_len_q=1,
-        seed=32144,
+    case = replace(
+        _make_mla_case(
+            batch_size=4 if family == "1cta" else 8,
+            num_qo_heads=16 if family == "1cta" else 128,
+            max_kv_len=4097 if family == "1cta" else 2048,
+            qkv_dtype=_FP8,
+            seq_len_q=1,
+            seed=32144,
+        ),
+        output_scale=0.75,
     )
     offsets = None
     if family == "2cta":
         case, offsets = _pack_mla_case(case, [1] * 8)
-    scale = torch.tensor(case.softmax_scale, device="cuda")
+    sm_scale = (
+        torch.tensor(case.softmax_scale, device="cuda")
+        if family == "1cta"
+        else case.softmax_scale
+    )
+    output_scale = torch.tensor(case.output_scale, device="cuda")
+    name = "softmax_scale" if family == "1cta" else "output_scale"
+    scale = sm_scale if family == "1cta" else output_scale
     wrapper = _plan_case(
         case,
         qo_indptr=offsets,
         max_q_len=1,
-        softmax_scale=scale,
-        output_scale=case.output_scale,
+        softmax_scale=sm_scale,
+        output_scale=output_scale,
     )
     policy = _policy_dict(wrapper)
     assert policy["kernel"] == (
         "throughput_latency_1cta" if family == "1cta" else "throughput_2cta"
     )
+    assert int(policy["split_kv"]) > 1
+    assert not policy["use_persistent_scheduler"]
     out = torch.empty(
         (*case.query.shape[:-1], 512), device="cuda", dtype=torch.bfloat16
     )
@@ -3838,15 +3850,15 @@ def test_dense_mla_global_scales_graph_replay(family):
 
     run()
     _assert_case_correct(out, case, policy, qo_indptr=offsets)
-    changed = replace(case, softmax_scale=case.softmax_scale * 1.5)
-    # A producer may release the consumer before its scale store completes.
-    late_store(scale, changed.softmax_scale)
+    changed_value = getattr(case, name) * 1.5
+    changed = replace(case, **{name: changed_value})
+    late_store(scale, changed_value)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        late_store(scale, changed.softmax_scale)
+        late_store(scale, changed_value)
         run()
     for _ in range(2):
-        scale.fill_(case.softmax_scale)
+        scale.fill_(getattr(case, name))
         graph.replay()
         _assert_case_correct(out, changed, policy, qo_indptr=offsets)

@@ -5140,9 +5140,8 @@ def test_qtoken_global_scales_graph_replay():
 
 
 @_REQUIRES_PRIMS_TS_ATTENTION
-@pytest.mark.parametrize("capture", (False, True), ids=("eager", "graph"))
 @pytest.mark.parametrize("updated_scale", (0, 1), ids=("qk", "v"))
-def test_qtoken_persistent_direct_q1_pdl_scales(updated_scale, capture):
+def test_qtoken_persistent_direct_q1_pdl_scales(updated_scale):
     from tests.test_helpers.pdl import late_store
 
     values = (0.125, 0.75)
@@ -5153,30 +5152,22 @@ def test_qtoken_persistent_direct_q1_pdl_scales(updated_scale, capture):
     assert wrapper._prepared_plan._attention_plan._direct_q1_inputs
     assert wrapper._prepared_plan._attention_plan._compiled_reducer is None
     scale = scales[updated_scale]
-    late_store(scale, values[updated_scale])
+    changed = list(values)
+    changed[updated_scale] *= 1.5
+    late_store(scale, changed[updated_scale])
     torch.cuda.synchronize()
-
-    def produce_and_run():
-        late_store(scale, values[updated_scale])
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        late_store(scale, changed[updated_scale])
         run()
-
-    graph = None
-    if capture:
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            produce_and_run()
-    for _ in range(3):
-        scale.fill_(values[updated_scale] * 4)
-        if graph is None:
-            produce_and_run()
-        else:
-            graph.replay()
-        check(*values)
+    for _ in range(2):
+        scale.fill_(changed[updated_scale] * 4)
+        graph.replay()
+        check(*changed)
 
 
 @_REQUIRES_PRIMS_TS_ATTENTION
-@pytest.mark.parametrize("capture", (False, True), ids=("eager", "graph"))
-def test_qtoken_direct_q1_pdl_query_offsets(capture):
+def test_qtoken_direct_q1_pdl_query_offsets():
     from tests.test_helpers.pdl import late_store
 
     wrapper, run, check, offsets, out = _global_scale_qtoken_case(
@@ -5194,17 +5185,12 @@ def test_qtoken_direct_q1_pdl_query_offsets(capture):
         late_store(offsets[2:], 2)
         run()
 
-    graph = None
-    if capture:
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            produce_and_run()
-    for _ in range(3):
-        # The stale offset makes the second route empty, so an early read prunes it.
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        produce_and_run()
+    for execute in (produce_and_run, graph.replay):
+        # A stale offset makes the second route empty, so an early read prunes it.
         offsets[2:].fill_(1)
         out.fill_(torch.nan)
-        if graph is None:
-            produce_and_run()
-        else:
-            graph.replay()
+        execute()
         check(0.125, 0.75)

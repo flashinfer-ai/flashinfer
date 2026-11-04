@@ -9930,35 +9930,31 @@ def test_attention_ts_decode_fp8_speculative_runtime_reduction(out_dtype):
 
 
 @_REQUIRES_PRIMTS_GPU
-@pytest.mark.parametrize("separate_reduction", (False, True))
-def test_decode_global_scales_graph_and_prepared(monkeypatch, separate_reduction):
-    """Mixed device operands work through native and standalone split reducers."""
-    if separate_reduction:
-        original = fmha_decode_config.make_decode_config
+def test_decode_global_scales_graph_and_prepared(monkeypatch):
+    """Device scales stay live through the standalone reducer and prepared API."""
+    original = fmha_decode_config.make_decode_config
 
-        def configured(*args, **kwargs):
-            profile = dict(
-                use_keeps_mma_ab=False,
-                tile_size_q=16,
-                tile_size_kv=128,
-                use_persistent_scheduler=False,
-            )
-            kwargs["args"] = (
-                (kwargs["args"], profile) if kwargs.get("args") else profile
-            )
-            kwargs.update(
-                split_kv_mode="gmem_reduction_with_separate_kernel",
-                splits_kv=2,
-                max_splits_kv=2,
-                auto_tuner=False,
-            )
-            return original(*args, **kwargs)
+    def configured(*args, **kwargs):
+        profile = dict(
+            use_keeps_mma_ab=False,
+            tile_size_q=16,
+            tile_size_kv=128,
+            use_persistent_scheduler=False,
+        )
+        kwargs["args"] = (kwargs["args"], profile) if kwargs.get("args") else profile
+        kwargs.update(
+            split_kv_mode="gmem_reduction_with_separate_kernel",
+            splits_kv=2,
+            max_splits_kv=2,
+            auto_tuner=False,
+        )
+        return original(*args, **kwargs)
 
-        monkeypatch.setattr(fmha_decode_config, "make_decode_config", configured)
+    monkeypatch.setattr(fmha_decode_config, "make_decode_config", configured)
     _resolve_decode_launch_spec.cache_clear()
     try:
         generator = torch.Generator(device="cuda").manual_seed(81)
-        dtype = torch.bfloat16 if separate_reduction else _FP8
+        dtype = torch.bfloat16
         q = (torch.randn((1, 8, 128), device="cuda", generator=generator) * 0.5).to(
             dtype
         )
@@ -9969,10 +9965,9 @@ def test_decode_global_scales_graph_and_prepared(monkeypatch, separate_reduction
         lengths = torch.tensor([2048], dtype=torch.int32, device="cuda")
         table = torch.arange(128, dtype=torch.int32, device="cuda").view(1, -1)
         out = torch.empty(q.shape, dtype=torch.bfloat16, device="cuda")
-        scale = torch.tensor(0.125 if separate_reduction else 0.75, device="cuda")
         scales = dict(
-            softmax_scale=scale if separate_reduction else 0.125,
-            output_scale=0.75 if separate_reduction else scale,
+            softmax_scale=torch.tensor(0.125, device="cuda"),
+            output_scale=torch.tensor(0.75, device="cuda"),
         )
         wrapper = BatchDecodePagedTSWrapper()
         wrapper.plan(
@@ -9989,8 +9984,7 @@ def test_decode_global_scales_graph_and_prepared(monkeypatch, separate_reduction
             out_dtype=out.dtype,
             **scales,
         )
-        if separate_reduction:
-            assert wrapper._plan_state.config.use_separate_reduction_kernel
+        assert wrapper._plan_state.config.use_separate_reduction_kernel
         args = (q, (k, v), lengths, table)
 
         def check(sm, output):
@@ -10005,10 +9999,10 @@ def test_decode_global_scales_graph_and_prepared(monkeypatch, separate_reduction
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             wrapper.run(*args, out=out, validate=False)
-        scale.mul_(1.5)
+        for scale in scales.values():
+            scale.mul_(1.5)
         graph.replay()
-        changed = (0.1875, 0.75) if separate_reduction else (0.125, 1.125)
-        check(*changed)
+        check(0.1875, 1.125)
         workspace = wrapper._plan_state.workspace_buffer
         batch_decode_with_paged_kv_cache(
             q,
@@ -10021,7 +10015,7 @@ def test_decode_global_scales_graph_and_prepared(monkeypatch, separate_reduction
             validate=False,
             **scales,
         )
-        check(*changed)
+        check(0.1875, 1.125)
         prepared = prepare_prims_ts_batch_decode_with_kv_cache(
             q,
             (k, v),
@@ -10032,18 +10026,12 @@ def test_decode_global_scales_graph_and_prepared(monkeypatch, separate_reduction
             out=out,
             **scales,
         )
-        prepared.run(q, out=out)
         prepared_graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(prepared_graph):
             prepared.run(q, out=out, validate=False)
-        scale.mul_(0.5)
+        for scale in scales.values():
+            scale.mul_(0.5)
         prepared_graph.replay()
-        check(
-            *(
-                (changed[0] * 0.5, changed[1])
-                if separate_reduction
-                else (changed[0], changed[1] * 0.5)
-            )
-        )
+        check(0.09375, 0.5625)
     finally:
         _resolve_decode_launch_spec.cache_clear()

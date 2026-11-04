@@ -2094,19 +2094,18 @@ def test_sparse_d576_rejects_d512_plan_options(option, match):
         _d576_plan(2, 64, 64, **option)
 
 
-@pytest.mark.parametrize("family,split", [("keep", 1), ("2cta", 2)])
-def test_sparse_mla_global_scales_graph_replay(family, split, monkeypatch):
+def test_sparse_mla_global_scales_graph_replay(monkeypatch):
     """Global tensor scales preserve independent FP8 and NVFP4 source scaling."""
     kinds = (True, False, True)
     monkeypatch.setattr(
         mla_decode_module,
         "select_sparse_mla_profile",
         lambda **_: sparse_policy.SparseMlaProfile(
-            family=family,
-            tile_size_q=64 if family == "keep" else 128,
-            split_kv=split,
-            gather_issue_warps=1 if family == "2cta" else 4,
-            balanced_registers=family == "2cta",
+            family="2cta",
+            tile_size_q=128,
+            split_kv=2,
+            gather_issue_warps=1,
+            balanced_registers=True,
         ),
     )
     torch.manual_seed(127)

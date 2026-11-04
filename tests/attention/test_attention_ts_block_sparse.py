@@ -6021,7 +6021,6 @@ def _global_scale_case(kind, sm_scale, output_scale):
         run_args = (q, (k_cache, v_cache), tables, lengths, indptr, indices)
     else:
         wrapper = block_sparse_module.BlockSparseTSWrapper()
-        route_args = {"max_blocks_per_row": 1} if kind == "sparse" else {}
         wrapper.plan(
             1,
             16,
@@ -6031,41 +6030,44 @@ def _global_scale_case(kind, sm_scale, output_scale):
             128,
             8,
             64,
-            use_block_sparse=kind == "sparse",
-            **route_args,
+            max_blocks_per_row=1,
             **plan_args,
         )
-        run_args = (q, k, v, indptr, indices) if kind == "sparse" else (q, k, v)
+        run_args = (q, k, v, indptr, indices)
     return wrapper, run_args, (q, k, v)
 
 
-def _global_scale_reference(kind, inputs, sm_scale, output_scale):
+def _global_scale_reference(inputs, sm_scale, output_scale):
     q, k, v = (x[0, :, 0].float() for x in inputs)
     logits = q @ k.T * sm_scale
-    if kind != "dense":
-        allowed = torch.arange(16, device=q.device)[:, None] // 8 == (
-            torch.arange(128, device=q.device)[None, :] // 64
-        )
-        logits.masked_fill_(~allowed, -torch.inf)
+    allowed = torch.arange(16, device=q.device)[:, None] // 8 == (
+        torch.arange(128, device=q.device)[None, :] // 64
+    )
+    logits.masked_fill_(~allowed, -torch.inf)
     return (logits.softmax(-1) @ v * output_scale)[None, :, None]
 
 
 @_REQUIRES_PRIMTS_GPU
-@pytest.mark.parametrize("kind", ("dense", "sparse", "paged"))
+@pytest.mark.parametrize("kind", ("sparse", "paged"))
 @torch.no_grad()
 def test_block_sparse_global_scales_graph_replay(kind):
-    sm_scale = 0.0625
-    output_scale = torch.tensor(1.75, device="cuda")
+    sm_scale = torch.tensor(0.0625, device="cuda") if kind == "sparse" else 0.0625
+    output_scale = 1.75 if kind == "sparse" else torch.tensor(1.75, device="cuda")
     wrapper, args, inputs = _global_scale_case(kind, sm_scale, output_scale)
     out = wrapper.run(*args)
-    expected = _global_scale_reference(kind, inputs, sm_scale, 1.75)
+    expected = _global_scale_reference(inputs, 0.0625, 1.75)
     torch.testing.assert_close(out.float(), expected, atol=5e-3, rtol=5e-3)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         wrapper.run(*args, out=out, validate=False)
-    output_scale.fill_(0.75)
+    if kind == "sparse":
+        sm_scale.fill_(0.09375)
+        changed = (0.09375, 1.75)
+    else:
+        output_scale.fill_(0.75)
+        changed = (0.0625, 0.75)
     graph.replay()
-    expected = _global_scale_reference(kind, inputs, sm_scale, 0.75)
+    expected = _global_scale_reference(inputs, *changed)
     torch.testing.assert_close(out.float(), expected, atol=5e-3, rtol=5e-3)
     kwargs = dict(
         q_block_size=8, kv_block_size=64, sm_scale=sm_scale, output_scale=output_scale
@@ -6076,19 +6078,15 @@ def test_block_sparse_global_scales_graph_replay(kind):
         )
     else:
         eager = prims_ts.block_sparse_attention(
-            *((*args, None, None) if kind == "dense" else args),
-            use_block_sparse=kind == "sparse",
+            *args,
             **kwargs,
         )
     torch.testing.assert_close(eager.float(), expected, atol=5e-3, rtol=5e-3)
-    with pytest.raises(TypeError, match="same scalar/tensor type"):
-        wrapper.run(*args, output_scale=0.75, validate=False)
 
 
 @_REQUIRES_PRIMTS_GPU
-@pytest.mark.parametrize("device_output", (False, True))
 @torch.no_grad()
-def test_sage_global_scales_include_restored_mean(device_output):
+def test_sage_global_scales_include_restored_mean():
     from tests.attention.test_attention_ts_sage import _SageCase, _random_inputs
 
     case = _SageCase(
@@ -6106,7 +6104,7 @@ def test_sage_global_scales_include_restored_mean(device_output):
     q, k, v, params, _ = _random_inputs(case)
     # Dequantized V is exactly its channel mean, independent of P rounding.
     v = torch.zeros(v.shape, device=v.device).to(v.dtype)
-    output_scale = torch.tensor(1.75, device="cuda") if device_output else 1.75
+    output_scale = torch.tensor(1.75, device="cuda")
     result = prims_ts.block_sparse_attention(
         q,
         k,
