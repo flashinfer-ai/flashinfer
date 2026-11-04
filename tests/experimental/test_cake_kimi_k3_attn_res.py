@@ -2269,6 +2269,56 @@ def test_round_35_cells_take_their_programs():
                 assert key in KERNELS[arch], (arch, key)
 
 
+# Round 36: two cells run the ``_clc`` build of the program they ran before, built with the CLC
+# lookahead (``_cla``: the producer requests a trip's successor at the start of the trip) and, on
+# GB300, with an L2 prefetch of the first token's rows at kernel entry (``_fpf``), on one CTA per
+# token at both PDL modes: (arch, SM count, M, K) -> (key, grid).
+_ROUND_36_CELLS = {
+    ("sm_100a", 148, 12288, 5): (
+        "persistent:k5_nc4_d3_f110000000000000_clc_cla",
+        12288,
+    ),
+    ("sm_103a", 152, 384, 2): (
+        "persistent:k2_nc3_d2_f011010000000000_fm_crfnone_clc_cla_fpf",
+        384,
+    ),
+}
+
+
+def test_round_36_cells_take_their_programs():
+    """Round 36: each ``_ROUND_36_CELLS`` cell runs its ``_clc_cla`` (B200 (12288, 5)) or
+    ``_clc_cla_fpf`` (GB300 (384, 2)) program at both PDL modes, registered and without a
+    fallback, on one CTA per token with the persistent thread count.  Its schedule label is the
+    label of the program without ``_clc`` plus ``_clc_token_queue``, ``_clc_lookahead`` and, for an
+    ``_fpf`` key, ``_first_chunk_prefetch_l2``."""
+    for (arch, sm_count, M, K), (key, grid_x) in sorted(_ROUND_36_CELLS.items()):
+        fpf = key.endswith("_clc_cla_fpf")
+        assert fpf or key.endswith("_clc_cla"), key
+        static = key.removesuffix("_fpf").removesuffix("_cla").removesuffix("_clc")
+        for pdl in (False, True):
+            plan = plan_route(arch, sm_count, M, K, pdl)
+            assert (plan.kind, plan.kernel_key) == ("persistent", key), (
+                arch,
+                sm_count,
+                M,
+                K,
+                pdl,
+                plan,
+            )
+            assert plan.grid_x == grid_x == M, plan
+            assert plan.threads == cb.PERSISTENT_THREADS, plan
+            assert plan.fallback_from is None, plan
+            label = cb._persistent_plan_for_key(
+                arch, sm_count, M, K, pdl, static
+            ).schedule_id
+            label += "_clc_token_queue_clc_lookahead"
+            label += "_first_chunk_prefetch_l2" if fpf else ""
+            assert plan.schedule_id == label, plan
+            assert plan.route_id.endswith(f".pdl{int(pdl)}.clc_token_queue"), plan
+            if MODULES:
+                assert MODULES[KERNELS[arch][key]]["kernel_key"] == key, (arch, key)
+
+
 def test_a_registered_fallback_never_resolves_to_a_clc_program(monkeypatch):
     """A ``_clc`` program covers every token only on its cell's grid of ``M`` CTAs, so the
     registered-variant fallback never resolves to one: an unregistered ``_clc`` cell resolves to
@@ -2852,7 +2902,8 @@ def test_registry_records_reference_the_build_manifest():
         )
         fast_math = bool(
             re.search(
-                r"_fm(_crfnone)?(_crheld)?(_rcp)?(_write)?(_cta2)?(_clc)?$",
+                r"_fm(_crfnone)?(_crheld)?(_rcp)?(_write)?(_cta2)?"
+                r"(_clc(_cla)?(_fpf)?)?$",
                 record["kernel_key"],
             )
         )

@@ -2228,43 +2228,6 @@ __device__ __forceinline__ void flashinfer_blackwell_softmax_cached_cluster_c8_t
     const int chunk_room = chunk_end - chunk_begin;
     float cache[64];
     float tile_max[8];
-    __syncthreads();
-    if (warp == 0) {
-        if (elect_sync()) {
-            int tile_begin = chunk_begin + 8192;
-            if (tile_begin < chunk_end) {
-                int _max_1 = ((chunk_end - tile_begin) > (0) ? (chunk_end - tile_begin) : (0));
-                int _min_0 = ((_max_1) < (2048) ? (_max_1) : (2048));
-                int nbytes = _min_0 * 4;
-                mbarrier_arrive_expect_tx(landed_addr, nbytes);
-                cp_async_bulk_gmem2smem(tiles_addr, reinterpret_cast<const uint8_t*>(x + (row_base + (unsigned long long)tile_begin)), nbytes, landed_addr);
-            }
-            int tile_begin_0 = chunk_begin + 10240;
-            if (tile_begin_0 < chunk_end) {
-                int _max_3 = ((chunk_end - tile_begin_0) > (0) ? (chunk_end - tile_begin_0) : (0));
-                int _min_2 = ((_max_3) < (2048) ? (_max_3) : (2048));
-                int nbytes_1 = _min_2 * 4;
-                mbarrier_arrive_expect_tx(landed_addr + 8, nbytes_1);
-                cp_async_bulk_gmem2smem(tiles_addr + 8192, reinterpret_cast<const uint8_t*>(x + (row_base + (unsigned long long)tile_begin_0)), nbytes_1, landed_addr + 8);
-            }
-            int tile_begin_1 = chunk_begin + 12288;
-            if (tile_begin_1 < chunk_end) {
-                int _max_5 = ((chunk_end - tile_begin_1) > (0) ? (chunk_end - tile_begin_1) : (0));
-                int _min_4 = ((_max_5) < (2048) ? (_max_5) : (2048));
-                int nbytes_2 = _min_4 * 4;
-                mbarrier_arrive_expect_tx(landed_addr + 16, nbytes_2);
-                cp_async_bulk_gmem2smem(tiles_addr + 16384, reinterpret_cast<const uint8_t*>(x + (row_base + (unsigned long long)tile_begin_1)), nbytes_2, landed_addr + 16);
-            }
-            int tile_begin_2 = chunk_begin + 14336;
-            if (tile_begin_2 < chunk_end) {
-                int _max_7 = ((chunk_end - tile_begin_2) > (0) ? (chunk_end - tile_begin_2) : (0));
-                int _min_6 = ((_max_7) < (2048) ? (_max_7) : (2048));
-                int nbytes_3 = _min_6 * 4;
-                mbarrier_arrive_expect_tx(landed_addr + 24, nbytes_3);
-                cp_async_bulk_gmem2smem(tiles_addr + 24576, reinterpret_cast<const uint8_t*>(x + (row_base + (unsigned long long)tile_begin_2)), nbytes_3, landed_addr + 24);
-            }
-        }
-    }
     #pragma unroll
     for (int tile = 0; tile < 4; tile++) {
         if (thread_elem < chunk_room - tile * 2048) {
@@ -2303,6 +2266,43 @@ __device__ __forceinline__ void flashinfer_blackwell_softmax_cached_cluster_c8_t
             #pragma unroll
             for (int j = 0; j < 8; j++) {
                 cache[tile * 8 + j] = _vec_load_0[j];
+            }
+        }
+    }
+    __syncthreads();
+    if (warp == 0) {
+        if (elect_sync()) {
+            int tile_begin = chunk_begin + 8192;
+            if (tile_begin < chunk_end) {
+                int _max_1 = ((chunk_end - tile_begin) > (0) ? (chunk_end - tile_begin) : (0));
+                int _min_0 = ((_max_1) < (2048) ? (_max_1) : (2048));
+                int nbytes = _min_0 * 4;
+                mbarrier_arrive_expect_tx(landed_addr, nbytes);
+                cp_async_bulk_gmem2smem(tiles_addr, reinterpret_cast<const uint8_t*>(x + (row_base + (unsigned long long)tile_begin)), nbytes, landed_addr);
+            }
+            int tile_begin_0 = chunk_begin + 10240;
+            if (tile_begin_0 < chunk_end) {
+                int _max_3 = ((chunk_end - tile_begin_0) > (0) ? (chunk_end - tile_begin_0) : (0));
+                int _min_2 = ((_max_3) < (2048) ? (_max_3) : (2048));
+                int nbytes_1 = _min_2 * 4;
+                mbarrier_arrive_expect_tx(landed_addr + 8, nbytes_1);
+                cp_async_bulk_gmem2smem(tiles_addr + 8192, reinterpret_cast<const uint8_t*>(x + (row_base + (unsigned long long)tile_begin_0)), nbytes_1, landed_addr + 8);
+            }
+            int tile_begin_1 = chunk_begin + 12288;
+            if (tile_begin_1 < chunk_end) {
+                int _max_5 = ((chunk_end - tile_begin_1) > (0) ? (chunk_end - tile_begin_1) : (0));
+                int _min_4 = ((_max_5) < (2048) ? (_max_5) : (2048));
+                int nbytes_2 = _min_4 * 4;
+                mbarrier_arrive_expect_tx(landed_addr + 16, nbytes_2);
+                cp_async_bulk_gmem2smem(tiles_addr + 16384, reinterpret_cast<const uint8_t*>(x + (row_base + (unsigned long long)tile_begin_1)), nbytes_2, landed_addr + 16);
+            }
+            int tile_begin_2 = chunk_begin + 14336;
+            if (tile_begin_2 < chunk_end) {
+                int _max_7 = ((chunk_end - tile_begin_2) > (0) ? (chunk_end - tile_begin_2) : (0));
+                int _min_6 = ((_max_7) < (2048) ? (_max_7) : (2048));
+                int nbytes_3 = _min_6 * 4;
+                mbarrier_arrive_expect_tx(landed_addr + 24, nbytes_3);
+                cp_async_bulk_gmem2smem(tiles_addr + 24576, reinterpret_cast<const uint8_t*>(x + (row_base + (unsigned long long)tile_begin_2)), nbytes_3, landed_addr + 24);
             }
         }
     }
@@ -2885,43 +2885,6 @@ __device__ __forceinline__ void flashinfer_blackwell_softmax_cached_cluster_c16_
     const int chunk_room = chunk_end - chunk_begin;
     float cache[64];
     float tile_max[8];
-    __syncthreads();
-    if (warp == 0) {
-        if (elect_sync()) {
-            int tile_begin = chunk_begin + 8192;
-            if (tile_begin < chunk_end) {
-                int _max_1 = ((chunk_end - tile_begin) > (0) ? (chunk_end - tile_begin) : (0));
-                int _min_0 = ((_max_1) < (2048) ? (_max_1) : (2048));
-                int nbytes = _min_0 * 4;
-                mbarrier_arrive_expect_tx(landed_addr, nbytes);
-                cp_async_bulk_gmem2smem(tiles_addr, reinterpret_cast<const uint8_t*>(x + (row_base + (unsigned long long)tile_begin)), nbytes, landed_addr);
-            }
-            int tile_begin_0 = chunk_begin + 10240;
-            if (tile_begin_0 < chunk_end) {
-                int _max_3 = ((chunk_end - tile_begin_0) > (0) ? (chunk_end - tile_begin_0) : (0));
-                int _min_2 = ((_max_3) < (2048) ? (_max_3) : (2048));
-                int nbytes_1 = _min_2 * 4;
-                mbarrier_arrive_expect_tx(landed_addr + 8, nbytes_1);
-                cp_async_bulk_gmem2smem(tiles_addr + 8192, reinterpret_cast<const uint8_t*>(x + (row_base + (unsigned long long)tile_begin_0)), nbytes_1, landed_addr + 8);
-            }
-            int tile_begin_1 = chunk_begin + 12288;
-            if (tile_begin_1 < chunk_end) {
-                int _max_5 = ((chunk_end - tile_begin_1) > (0) ? (chunk_end - tile_begin_1) : (0));
-                int _min_4 = ((_max_5) < (2048) ? (_max_5) : (2048));
-                int nbytes_2 = _min_4 * 4;
-                mbarrier_arrive_expect_tx(landed_addr + 16, nbytes_2);
-                cp_async_bulk_gmem2smem(tiles_addr + 16384, reinterpret_cast<const uint8_t*>(x + (row_base + (unsigned long long)tile_begin_1)), nbytes_2, landed_addr + 16);
-            }
-            int tile_begin_2 = chunk_begin + 14336;
-            if (tile_begin_2 < chunk_end) {
-                int _max_7 = ((chunk_end - tile_begin_2) > (0) ? (chunk_end - tile_begin_2) : (0));
-                int _min_6 = ((_max_7) < (2048) ? (_max_7) : (2048));
-                int nbytes_3 = _min_6 * 4;
-                mbarrier_arrive_expect_tx(landed_addr + 24, nbytes_3);
-                cp_async_bulk_gmem2smem(tiles_addr + 24576, reinterpret_cast<const uint8_t*>(x + (row_base + (unsigned long long)tile_begin_2)), nbytes_3, landed_addr + 24);
-            }
-        }
-    }
     #pragma unroll
     for (int tile = 0; tile < 4; tile++) {
         if (thread_elem < chunk_room - tile * 2048) {
@@ -2960,6 +2923,43 @@ __device__ __forceinline__ void flashinfer_blackwell_softmax_cached_cluster_c16_
             #pragma unroll
             for (int j = 0; j < 8; j++) {
                 cache[tile * 8 + j] = _vec_load_0[j];
+            }
+        }
+    }
+    __syncthreads();
+    if (warp == 0) {
+        if (elect_sync()) {
+            int tile_begin = chunk_begin + 8192;
+            if (tile_begin < chunk_end) {
+                int _max_1 = ((chunk_end - tile_begin) > (0) ? (chunk_end - tile_begin) : (0));
+                int _min_0 = ((_max_1) < (2048) ? (_max_1) : (2048));
+                int nbytes = _min_0 * 4;
+                mbarrier_arrive_expect_tx(landed_addr, nbytes);
+                cp_async_bulk_gmem2smem(tiles_addr, reinterpret_cast<const uint8_t*>(x + (row_base + (unsigned long long)tile_begin)), nbytes, landed_addr);
+            }
+            int tile_begin_0 = chunk_begin + 10240;
+            if (tile_begin_0 < chunk_end) {
+                int _max_3 = ((chunk_end - tile_begin_0) > (0) ? (chunk_end - tile_begin_0) : (0));
+                int _min_2 = ((_max_3) < (2048) ? (_max_3) : (2048));
+                int nbytes_1 = _min_2 * 4;
+                mbarrier_arrive_expect_tx(landed_addr + 8, nbytes_1);
+                cp_async_bulk_gmem2smem(tiles_addr + 8192, reinterpret_cast<const uint8_t*>(x + (row_base + (unsigned long long)tile_begin_0)), nbytes_1, landed_addr + 8);
+            }
+            int tile_begin_1 = chunk_begin + 12288;
+            if (tile_begin_1 < chunk_end) {
+                int _max_5 = ((chunk_end - tile_begin_1) > (0) ? (chunk_end - tile_begin_1) : (0));
+                int _min_4 = ((_max_5) < (2048) ? (_max_5) : (2048));
+                int nbytes_2 = _min_4 * 4;
+                mbarrier_arrive_expect_tx(landed_addr + 16, nbytes_2);
+                cp_async_bulk_gmem2smem(tiles_addr + 16384, reinterpret_cast<const uint8_t*>(x + (row_base + (unsigned long long)tile_begin_1)), nbytes_2, landed_addr + 16);
+            }
+            int tile_begin_2 = chunk_begin + 14336;
+            if (tile_begin_2 < chunk_end) {
+                int _max_7 = ((chunk_end - tile_begin_2) > (0) ? (chunk_end - tile_begin_2) : (0));
+                int _min_6 = ((_max_7) < (2048) ? (_max_7) : (2048));
+                int nbytes_3 = _min_6 * 4;
+                mbarrier_arrive_expect_tx(landed_addr + 24, nbytes_3);
+                cp_async_bulk_gmem2smem(tiles_addr + 24576, reinterpret_cast<const uint8_t*>(x + (row_base + (unsigned long long)tile_begin_2)), nbytes_3, landed_addr + 24);
             }
         }
     }

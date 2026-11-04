@@ -1389,7 +1389,8 @@ class Backend:
 
 
 def _public_args(args: dict[str, Any]) -> dict[str, Any]:
-    return {k: v for k, v in args.items() if not k.startswith("_")}
+    """``args`` without its private keys (a leading ``_``; ``k[:1]`` is ``k.startswith("_")`` without a method call)."""
+    return {k: v for k, v in args.items() if k[:1] != "_"}
 
 
 def _registry() -> Any | None:
@@ -1401,16 +1402,41 @@ def _registry() -> Any | None:
     return cake_jit
 
 
+# The registry answers of l2n_records_shipped / fused_o_shipped, derived once per registry identity: they are read on
+# every call and launch, and the registry is the package's generated record table (data, never changed at run time).
+# The key is the registry module, its record table and its records_of_program function (a registry or a table put in
+# their place -- a test's stand-in -- is another key); the entry holds the keyed objects, so their ids stay theirs.
+_REGISTRY_ANSWERS: dict[tuple, tuple[bool, tuple]] = {}
+
+
+def _registry_answer(question: tuple, jit: Any, derive: Callable[[], bool]) -> bool:
+    modules = getattr(jit, "MODULES", None)
+    lookup = getattr(jit, "records_of_program", None)
+    try:
+        size = len(modules)
+    except TypeError:  # no record table: nothing to key on, derived per call
+        return derive()
+    key = (*question, id(jit), id(modules), size, id(lookup))
+    hit = _REGISTRY_ANSWERS.get(key)
+    if hit is None:
+        hit = _REGISTRY_ANSWERS[key] = (bool(derive()), (jit, modules, lookup))
+    return hit[0]
+
+
 def l2n_records_shipped() -> bool:
     """Whether the registry ships a record of every in-kernel Q / K L2 norm program (:data:`L2N_PROGRAMS`): the
     kernel backend runs ``use_qk_l2norm_in_kernel=True`` only then; the fake backend emulates them either way."""
     jit = _registry()
     if jit is None:
         return False
-    try:
-        return all(jit.records_of_program(p) for p in L2N_PROGRAMS)
-    except ValueError:  # a registry that does not know the programs
-        return False
+
+    def derive() -> bool:
+        try:
+            return all(jit.records_of_program(p) for p in L2N_PROGRAMS)
+        except ValueError:  # a registry that does not know the programs
+            return False
+
+    return _registry_answer(("l2n",), jit, derive)
 
 
 def fused_o_shipped(arch: str | None = None) -> bool:
@@ -1420,16 +1446,20 @@ def fused_o_shipped(arch: str | None = None) -> bool:
     jit = _registry()
     if jit is None:
         return False
-    try:
-        names = jit.records_of_program("kcp_fwdh_out")
-    except ValueError:  # a registry that does not know the program
-        return False
-    forms = {
-        int(jit.MODULES[n].get("grid_rule", {}).get("ctas_per_head", 1))
-        for n in names
-        if arch is None or arch in jit.MODULES[n].get("arches", ())
-    }
-    return forms >= {1, 2}
+
+    def derive() -> bool:
+        try:
+            names = jit.records_of_program("kcp_fwdh_out")
+        except ValueError:  # a registry that does not know the program
+            return False
+        forms = {
+            int(jit.MODULES[n].get("grid_rule", {}).get("ctas_per_head", 1))
+            for n in names
+            if arch is None or arch in jit.MODULES[n].get("arches", ())
+        }
+        return forms >= {1, 2}
+
+    return _registry_answer(("fused_o", arch), jit, derive)
 
 
 def resolve_launch(
@@ -1548,22 +1578,29 @@ def _launch_key(name: str, args: dict[str, Any], cols_per_cta: int) -> tuple:
     merge's ``cols_per_cta`` from these scalars alone and reads nothing from the launch's tensors: an input added to
     :func:`resolve_launch` (a new grid-rule argument, for example) must be added to this key as well."""
     grid_args = args.get("_grid_args")
+    get = args.get
     return (
         name,
-        args.get("_precision_mode"),
-        args.get("_transfer_walk"),
+        get("_precision_mode"),
+        get("_transfer_walk"),
         tuple(grid_args.items()) if grid_args else None,
-        args.get("_sm_count"),
-        args.get("_fwdh_vh"),
-        args.get("_dhu_vh"),
-        args.get("_vh64_fits"),
-        args.get("_dhu_long_chain"),
-        args.get("_arch"),
-        args.get("ncols"),
-        args.get("cols_per_cta"),
-        args.get("_grid"),
+        *map(get, _LAUNCH_KEY_ARGS),
         int(cols_per_cta),
     )
+
+
+# the launch key's arguments after the grid rule's (in key order): see _launch_key
+_LAUNCH_KEY_ARGS = (
+    "_sm_count",
+    "_fwdh_vh",
+    "_dhu_vh",
+    "_vh64_fits",
+    "_dhu_long_chain",
+    "_arch",
+    "ncols",
+    "cols_per_cta",
+    "_grid",
+)
 
 
 def _resolve_cached(
@@ -1676,8 +1713,9 @@ class KernelBackend(Backend):
         )
 
     def launch_scope(self, call: CallKcp) -> Any:
-        """The launch glue's stream scope (``cake_backend.launch_scope``: one ``tvm_ffi.use_torch_stream()`` context
-        for the body's launches instead of one per launch); ``None`` when the glue has no scope."""
+        """The launch glue's stream scope (``cake_backend.launch_scope``: one stream binding -- the stream
+        ``tvm_ffi.use_torch_stream()`` binds -- for the body's launches instead of one per launch); ``None`` when the
+        glue has no scope."""
         scope = getattr(self.launcher(), "launch_scope", None)
         return None if scope is None else scope()
 
@@ -2765,6 +2803,22 @@ def _call_tickets(
     if hit is None:
         hit = caches[key] = (_ticket_slots(device), {})
     return hit
+
+
+def _chunk_tokens(ctx: Any, chunk_len: Sequence[int]) -> int:
+    """The tokens the context's chunk table ``chunk_len`` covers (its sum; the in-kernel L2 norm's coverage check).
+    A context's table is an immutable tuple: its sum is derived once and kept in the context's cache with the table
+    it was taken over (a context without a cache, or a table of another type, sums per call)."""
+    caches = getattr(ctx, "_caches", None)
+    if not isinstance(caches, dict) or type(chunk_len) is not tuple:
+        return sum(int(n) for n in chunk_len)
+    hit = caches.get(("kcp_chunk_tokens",))
+    if hit is None or hit[0] is not chunk_len:
+        hit = caches[("kcp_chunk_tokens",)] = (
+            chunk_len,
+            sum(int(n) for n in chunk_len),
+        )
+    return hit[1]
 
 
 def _context_tables(
@@ -5212,10 +5266,12 @@ def _prepare(
     if opts.use_qk_l2norm_in_kernel:
         # #1_l2n writes qn / kn / r for the tokens of the real chunks only: they must cover [0, T_r) (metadata)
         chunk_len = getattr(ctx, "chunk_len", None)
-        if chunk_len is not None and sum(int(n) for n in chunk_len) != int(T):
-            raise ValueError(
-                f"use_qk_l2norm_in_kernel: the context's chunks cover {sum(int(n) for n in chunk_len)} of {T} tokens"
-            )
+        if chunk_len is not None:
+            covered = _chunk_tokens(ctx, chunk_len)
+            if covered != int(T):
+                raise ValueError(
+                    f"use_qk_l2norm_in_kernel: the context's chunks cover {covered} of {T} tokens"
+                )
     if opts.exchange == "ring":
         validate_ring(ctx.n_d_max)
     device = torch.device(ctx.device)
@@ -6177,24 +6233,38 @@ class ChunkGDNFunctionKcp(torch.autograd.Function):
         return dq, dk, dv, dg, dbeta, None, None, None, None, None, None, None
 
 
-# chunk_gdn_kcp's validated options per keyword set (no ``options`` object): an OptionsKcp built and checked once per
-# distinct keyword values (with their types, so ``1`` never stands in for ``True``) and shared by the calls -- never
-# handed to the caller, never mutated by the package (a recompute handle's form is a dataclasses.replace copy).
+# chunk_gdn_kcp's validated options per keyword set (no ``options`` object, or an ``options`` dict): an OptionsKcp
+# built and checked once per distinct keyword values -- and dict entries, taken by value at each call -- (with their
+# types, so ``1`` never stands in for ``True``) and shared by the calls -- never handed to the caller, never mutated by
+# the package (a recompute handle's form is a dataclasses.replace copy).  An OptionsKcp instance is checked per call.
 _KEYWORD_OPTIONS: dict[tuple, OptionsKcp] = {}
 KEYWORD_OPTIONS_MAX = 64
+_DICT_OPTIONS = "options"  # the leading mark of a key with an options dict (the keyword-only keys start otherwise)
 
 
-def _keyword_options(over: dict[str, Any], knobs: dict[str, Any]) -> OptionsKcp:
+def _keyword_options(
+    over: dict[str, Any],
+    knobs: dict[str, Any],
+    options: dict[str, Any] | None = None,
+) -> OptionsKcp:
     try:
+        key: tuple[Any, ...]
         key = tuple((k, type(v), v) for k, v in sorted(over.items())) + (
             None,
             *((k, type(v), v) for k, v in sorted(knobs.items())),
         )
+        if options is not None:
+            key = (
+                _DICT_OPTIONS,
+                *((k, type(v), v) for k, v in sorted(options.items())),
+                None,
+                *key,
+            )
         opts = _KEYWORD_OPTIONS.get(key)
-    except TypeError:  # an unhashable value (a test_knobs dict): validated per call
-        return make_options(None, **over, **knobs)
+    except TypeError:  # an unhashable value (a test_knobs dict) or a key that is no str: validated per call
+        return make_options(options, **over, **knobs)
     if opts is None:
-        opts = make_options(None, **over, **knobs)
+        opts = make_options(options, **over, **knobs)
         if len(_KEYWORD_OPTIONS) >= KEYWORD_OPTIONS_MAX:
             _KEYWORD_OPTIONS.clear()
         _KEYWORD_OPTIONS[key] = opts
@@ -6355,9 +6425,9 @@ def chunk_gdn_kcp(
             "recompute_handle keeps the incoming states only: it needs save_transfer=False"
         )
     opts = (
-        make_options(options, **over, **knobs)
-        if options is not None
-        else _keyword_options(over, knobs)
+        _keyword_options(over, knobs, options)
+        if options is None or type(options) is dict
+        else make_options(options, **over, **knobs)
     )
     if recompute_handle is not None:
         if opts.boundary_mode != "saved" or opts.graph != "off":
