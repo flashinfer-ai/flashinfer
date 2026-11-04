@@ -923,6 +923,56 @@ CASES = [
         ),
         id="prefill-flat-bf16-gqa16-kmaj-fused-q13",
     ),
+    pytest.param(
+        _attention_case(
+            "sparse_prefill",
+            q_dtype=_FP8,
+            kv_dtype=_FP8,
+            kv_layout="paged",
+            q_lens=[1],
+            kv_lens=[97],
+            num_q_heads=64,
+            num_kv_heads=4,
+            topk=16,
+            causal=True,
+            seed=83,
+        ),
+        id="prefill-paged-fp8q-q1-box",
+    ),
+    pytest.param(
+        _attention_case(
+            "sparse_prefill",
+            q_dtype=_FP8,
+            kv_dtype=_FP8,
+            kv_layout="paged",
+            q_lens=[1],
+            kv_lens=[128],
+            num_q_heads=64,
+            num_kv_heads=4,
+            topk=16,
+            causal=True,
+            seed=85,
+            use_workspace=False,
+        ),
+        id="prefill-paged-fp8q-q1-box-no-workspace",
+    ),
+    pytest.param(
+        _attention_case(
+            "sparse_prefill",
+            q_dtype=_FP8,
+            kv_dtype=_FP8,
+            kv_layout="paged",
+            q_lens=[1],
+            kv_lens=[1],
+            num_q_heads=64,
+            num_kv_heads=4,
+            topk=16,
+            causal=True,
+            seed=87,
+            cuda_graph=True,
+        ),
+        id="prefill-paged-fp8q-q1-kv1-box-graph",
+    ),
 ]
 
 
@@ -956,7 +1006,7 @@ def _dtype(name: str) -> torch.dtype:
 
 
 def _output_dtype(q: torch.Tensor) -> torch.dtype:
-    """Uniform FP8 Q/K/V decode returns BF16; every other route returns q's dtype."""
+    """Uniform FP8 Q/K/V calls (decode, prefill) return BF16; other routes q's dtype."""
     return torch.bfloat16 if q.dtype == torch.float8_e4m3fn else q.dtype
 
 
@@ -2001,3 +2051,44 @@ def test_union_decode_carriers_created_on_one_stream_serve_another():
     for actual in (created, reused):
         torch.testing.assert_close(actual[0], expected[0], atol=0.01, rtol=0.01)
         _assert_lse_close(actual[1], expected[1])
+
+
+# Uniform FP8 prefill is served on one measured box (one request of one query
+# token over 64 Q heads and 4 KV heads, paged causal, a one-page table); the
+# calls just outside it -- two requests, two query tokens, a two-page table,
+# GQA 8 -- raise as every FP8-Q prefill call did before.
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"q_lens": [1, 1], "kv_lens": [97, 97]},
+        {"q_lens": [2], "kv_lens": [97]},
+        {"kv_lens": [200]},
+        {"num_kv_heads": 8},
+    ],
+    ids=["batch2", "seqlen-q2", "page-width2", "gqa8"],
+)
+def test_uniform_fp8_prefill_outside_its_box_is_declined(change):
+    device = _require_supported_gpu()
+    from flashinfer.msa_ops import msa_sparse_attention, msa_sparse_decode_attention
+
+    case = _attention_case(
+        "sparse_prefill",
+        q_dtype=_FP8,
+        kv_dtype=_FP8,
+        kv_layout="paged",
+        q_lens=[1],
+        kv_lens=[97],
+        num_q_heads=64,
+        num_kv_heads=4,
+        topk=16,
+        causal=True,
+        seed=89,
+    )
+    inputs = _make_attention_inputs({**case, **change}, device)
+    with pytest.raises(
+        NotImplementedError,
+        match="uniform FP8 Q/K/V is supported only by sparse decode",
+    ):
+        _invoke_attention(
+            inputs, None, msa_sparse_attention, msa_sparse_decode_attention
+        )
