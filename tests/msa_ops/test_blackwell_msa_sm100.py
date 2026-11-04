@@ -1872,25 +1872,28 @@ def test_union_decode_graph_replay_is_the_eager_call_bitwise():
     )
 
     inputs = _union_inputs(device, batch=128, seed=173)
+    # A workspace that took part in a capture is not reused eagerly: the eager
+    # calls compared against the replay run on a workspace of their own.
     workspace = MSASparseAttentionWorkspace(device=device)
-    run = lambda: _invoke_attention(  # noqa: E731
-        inputs, workspace, None, msa_sparse_decode_attention
+    eager_workspace = MSASparseAttentionWorkspace(device=device)
+    run = lambda ws: _invoke_attention(  # noqa: E731
+        inputs, ws, None, msa_sparse_decode_attention
     )
     stream = torch.cuda.Stream(device=device)
     stream.wait_stream(torch.cuda.current_stream(device))
     with torch.cuda.stream(stream):
         for _ in range(3):
-            run()
+            run(workspace)
     stream.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
-        captured = run()
+        captured = run(workspace)
     for scale in (1.0, 0.5):
         inputs["q"].mul_(scale)
         with torch.cuda.stream(stream):
             graph.replay()
             replayed = tuple(t.clone() for t in captured)
-            eager = tuple(t.clone() for t in run())
+            eager = tuple(t.clone() for t in run(eager_workspace))
         stream.synchronize()
         _assert_bitwise(replayed, eager)
         expected = _reference_attention(inputs)
