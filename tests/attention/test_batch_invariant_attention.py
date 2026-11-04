@@ -444,6 +444,123 @@ def _repack(p: Problem) -> Problem:
 
 
 @needs_device
+@pytest.mark.parametrize("D", [64, 128, 256])
+def test_chunked_prefill_equals_full(D):
+    """R4 for incremental prefill: a request prefilled in two chunks (the second over the first's cached keys) gives, token for
+    token, the bits of the one-shot prefill -- a token's output depends on its position and the keys below it alone, not on how the
+    prefill was cut. Two requests cut at different points (one cut inside a 512-key chunk, one at a tile boundary), paged and ragged."""
+    kv = [1700, 1000]
+    cut = [700, 512]
+    full = Problem(kv, kv, 32, 8, D, 16, seed=12)
+    out_full = bits(run_paged_prefill(full))
+    assert torch.equal(out_full, bits(run_ragged_prefill(full)))
+    rows = [slice(int(full.qo_indptr[i]), int(full.qo_indptr[i + 1])) for i in range(2)]
+    kv_off = [int(full.kv_indptr_rag[i]) for i in range(2)]
+    # chunk 1: the first `cut` tokens of each request, over their own keys only
+    c1 = Problem(cut, cut, 32, 8, D, 16, seed=13)
+    c1.q = torch.cat([full.q[rows[i]][: cut[i]] for i in range(2)]).contiguous()
+    c1.k_rag = torch.cat(
+        [full.k_rag[kv_off[i] : kv_off[i] + cut[i]] for i in range(2)]
+    ).contiguous()
+    c1.v_rag = torch.cat(
+        [full.v_rag[kv_off[i] : kv_off[i] + cut[i]] for i in range(2)]
+    ).contiguous()
+    c1 = _repack(c1)
+    # chunk 2: the remaining tokens of each request, over ALL its keys (the first `cut` are the cache)
+    c2 = Problem([kv[i] - cut[i] for i in range(2)], kv, 32, 8, D, 16, seed=14)
+    c2.q = torch.cat([full.q[rows[i]][cut[i] :] for i in range(2)]).contiguous()
+    c2.k_rag, c2.v_rag = full.k_rag.clone(), full.v_rag.clone()
+    c2 = _repack(c2)
+    for prob, part in ((c1, 0), (c2, 1)):
+        out_p = bits(run_paged_prefill(prob))
+        out_r = bits(run_ragged_prefill(prob))
+        off = 0
+        for i in range(2):
+            n = cut[i] if part == 0 else kv[i] - cut[i]
+            ref = (
+                out_full[rows[i]][: cut[i]]
+                if part == 0
+                else out_full[rows[i]][cut[i] :]
+            )
+            assert torch.equal(out_p[off : off + n], ref), (D, part, i, "paged")
+            assert torch.equal(out_r[off : off + n], ref), (D, part, i, "ragged")
+            off += n
+
+
+@needs_device
+@pytest.mark.parametrize("D", [64, 128, 256])
+def test_multi_token_decode_equals_prefill(D):
+    """R4 for speculative / multi-token decode: the decode wrapper with ``q_len_per_req = 4`` gives, for the last four tokens of every
+    request, the bits of the prefill rows."""
+    q_len = 4
+    pr = Problem([256, 33, 1024, 7], [1500, 2500, 1024, 4096], 32, 8, D, 16, seed=15)
+    pre = bits(run_paged_prefill(pr))
+    last4 = torch.cat(
+        [
+            torch.arange(
+                int(pr.qo_indptr[i + 1]) - q_len,
+                int(pr.qo_indptr[i + 1]),
+                device=pr.device,
+            )
+            for i in range(4)
+        ]
+    )
+    q = pr.q[last4].contiguous()
+    w = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        workspace(pr.device), "NHD", batch_invariant=True
+    )
+    w.plan(
+        pr.kv_indptr,
+        pr.kv_indices,
+        pr.kv_last,
+        pr.Hq,
+        pr.Hkv,
+        pr.D,
+        pr.page,
+        q_data_type=torch.bfloat16,
+        kv_data_type=torch.bfloat16,
+        q_len_per_req=q_len,
+    )
+    dec = bits(w.run(q, pr.cache("NHD")))
+    assert torch.equal(dec, pre[last4])
+
+
+@needs_device
+@pytest.mark.parametrize("D", [64, 128, 256])
+def test_head_subset_invariance(D):
+    """R2 across heads: running a subset of the KV heads (whole GQA groups, with their query heads) gives, head for head, the bits of
+    the run over all heads -- a head's output depends on its own q / K / V alone, never on how many heads share the launch. Prefill
+    (paged and ragged) and decode; a four-group subset and a single group."""
+    Hq, Hkv = 32, 8
+    g = Hq // Hkv
+    pr = Problem([300, 1, 1000, 64], [700, 2500, 2500, 3000], Hq, Hkv, D, 16, seed=16)
+    full_pre = bits(run_paged_prefill(pr))
+    full_dec, last = run_decode(pr)
+    full_dec = bits(full_dec)
+    for kv_sel in ([1, 3, 4, 6], [5]):
+        q_sel = [j * g + r for j in kv_sel for r in range(g)]
+        sub = Problem(
+            pr.q_lens, pr.kv_lens, len(q_sel), len(kv_sel), D, 16, seed=17
+        )  # another pool and page table
+        sub.q = pr.q[:, q_sel].contiguous()
+        sub.k_rag = pr.k_rag[:, kv_sel].contiguous()
+        sub.v_rag = pr.v_rag[:, kv_sel].contiguous()
+        sub = _repack(sub)
+        assert torch.equal(bits(run_paged_prefill(sub)), full_pre[:, q_sel]), (
+            D,
+            kv_sel,
+            "paged prefill",
+        )
+        assert torch.equal(bits(run_ragged_prefill(sub)), full_pre[:, q_sel]), (
+            D,
+            kv_sel,
+            "ragged prefill",
+        )
+        dec, _ = run_decode(sub)
+        assert torch.equal(bits(dec), full_dec[:, q_sel]), (D, kv_sel, "decode")
+
+
+@needs_device
 def test_sm_count_and_grid_do_not_change_bits():
     """R3: the planner's unit kind depends on the SM count and the launch's persistent grid; neither reaches the bits."""
     from flashinfer.attention.batch_invariant import engine
