@@ -472,7 +472,7 @@ _PERSISTENT_FLAG_PWA = 1
 _PERSISTENT_FLAG_PREFIX_BF16_ADD = 2
 _PERSISTENT_FLAG_PREFIX_ROUND_ONCE = 3
 _PERSISTENT_FLAG_REGISTER_CARRY_ONLY = 4
-# ``persistent:k<K>_nc<nc>_d<depth>_f<15 bits>[_fm][_crfnone][_crheld][_rcp][_write][_cta2][_clc]``:
+# ``persistent:k<K>_nc<nc>_d<depth>_f<15 bits>[_fm][_crfnone][_crheld][_rcp][_write][_cta2][_clc[_cla][_fpf]]``:
 # ``_fm`` is the fast-math twin, ``_crfnone`` (round 3) the fence-authored twin -- the same program built
 # with ``consumed_release_fence_mode="none"`` (the kernel states its own tcgen05 fences), a
 # registered program of its own whose schedule label ends in ``_authored_fences`` --, ``_crheld``
@@ -491,11 +491,15 @@ _PERSISTENT_FLAG_REGISTER_CARRY_ONLY = 4
 # ``_fm`` / ``_crfnone`` / ``_crheld`` / ``_rcp`` / ``_write`` / ``_cta2`` lines and never
 # resolves to a ``_clc`` program: on any grid but its cell's ``M`` CTAs it would leave tokens
 # unwritten or schedule tokens beyond ``M``.  A snapshot-write cell may name a ``_clc`` key (round
-# 29): its write variant keeps the grammar's order, ``..._write_clc`` (``_write_key``).
+# 29): its write variant keeps the grammar's order, ``..._write_clc`` (``_write_key``).  ``_cla`` and
+# ``_fpf`` (round 36) follow ``_clc`` only: the ``_clc`` program built with the CLC lookahead (the
+# producer requests a trip's successor at the start of the trip) and with an L2 prefetch of the
+# first token's rows at kernel entry; the per-token work, the output and the grid are the ``_clc``
+# program's, and the schedule label adds ``_clc_lookahead`` / ``_first_chunk_prefetch_l2``.
 _PERSISTENT_KEY = re.compile(
     r"^persistent:k(?P<K>\d+)_nc(?P<nc>\d+)_d(?P<depth>\d+)_f(?P<bits>[01]+)"
     r"(?P<fm>_fm)?(?P<crfnone>_crfnone)?(?P<crheld>_crheld)?(?P<rcp>_rcp)?(?P<write>_write)?"
-    r"(?P<cta2>_cta2)?(?P<clc>_clc)?$"
+    r"(?P<cta2>_cta2)?(?:(?P<clc>_clc)(?P<cla>_cla)?(?P<fpf>_fpf)?)?$"
 )
 #: The grid policy of a ``_clc`` program (one CTA per token) and its schedule label's suffix.
 _CLC_GRID_POLICY = "clc_token_queue"
@@ -975,7 +979,8 @@ def _persistent_plan_for_key(
     of its fields (what ``_persistent_plan_exact`` derives for a legacy cell; a ``_crfnone`` key
     labels its schedule ``_authored_fences``, a ``_crheld`` key ``_held_release``, a ``_rcp`` key
     ``_packed_register_carry``, a ``_cta2`` key ``_two_ctas_per_sm``, a ``_clc`` key
-    ``_clc_token_queue``)."""
+    ``_clc_token_queue``, then a ``_cla`` key ``_clc_lookahead`` and a ``_fpf`` key
+    ``_first_chunk_prefetch_l2``)."""
     match = _PERSISTENT_KEY.match(key)
     if match is None or int(match["K"]) != K or match["write"]:
         raise ValueError(
@@ -1002,6 +1007,10 @@ def _persistent_plan_for_key(
         schedule_id += "_two_ctas_per_sm"
     if match["clc"]:
         schedule_id += f"_{_CLC_GRID_POLICY}"
+    if match["cla"]:
+        schedule_id += "_clc_lookahead"
+    if match["fpf"]:
+        schedule_id += "_first_chunk_prefetch_l2"
     wait_policy = "deferred_wait_st" if _wait_policy(arch) else "control_wait_st"
     route_id = f"{schedule_id}.{arch}.{wait_policy}.k{K}.delta1.write0.norm1.pdl{int(use_pdl)}.{grid_policy}"
     return RoutePlan(
