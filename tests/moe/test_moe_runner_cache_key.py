@@ -12,16 +12,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
+import os
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from flashinfer.fused_moe import (
     BackendOptions,
     CuteDslConfig,
     CuteDslRunner,
+    ExecutionConfig,
     ExpertConfig,
+    MoEActivationPack,
     MoEConfig,
+    MoELayer,
+    MoEWeightPack,
     QuantConfig,
     QuantFormat,
     RoutingConfig,
@@ -114,3 +123,155 @@ def test_moe_runner_hash_keeps_local_expert_offset(runner_cls, backend_cfg, quan
 
     assert hash(rank0) != hash(rank1)
     assert hash(rank0) == hash(same)
+
+
+_HIDDEN = 256
+_INTERMEDIATE = 256
+_NUM_EXPERTS = 16
+_TOP_K = 2
+_TOKENS = 64
+_FP8_BLOCK = QuantConfig(
+    weight=QuantFormat.DeepSeekFp8, activation=QuantFormat.DeepSeekFp8
+)
+
+
+def _trtllm_fp8_block_supported() -> bool:
+    from flashinfer.fused_moe.api import _TRTLLM_ROUTED_FP8_ARCHS
+    from flashinfer.utils import get_compute_capability
+
+    if not torch.cuda.is_available():
+        return False
+    major, minor = get_compute_capability(torch.device("cuda"))
+    return major * 10 + minor in _TRTLLM_ROUTED_FP8_ARCHS
+
+
+def _trtllm_fp8_block_layer(local_expert_offset: int, local_num_experts: int):
+    device = torch.device("cuda")
+    gen = torch.Generator(device=device).manual_seed(7920)
+    bf16 = dict(device=device, dtype=torch.bfloat16, generator=gen)
+    x = torch.randn(_TOKENS, _HIDDEN, **bf16)
+    w1 = torch.randn(local_num_experts, 2 * _INTERMEDIATE, _HIDDEN, **bf16) * 0.02
+    w2 = torch.randn(local_num_experts, _HIDDEN, _INTERMEDIATE, **bf16) * 0.02
+    ids = torch.randint(
+        local_expert_offset,
+        local_expert_offset + local_num_experts,
+        (_TOKENS, _TOP_K),
+        device=device,
+        dtype=torch.int32,
+        generator=gen,
+    )
+    route_weights = torch.softmax(
+        torch.randn(_TOKENS, _TOP_K, device=device, generator=gen), dim=-1
+    )
+    x_q, x_scale = TrtllmFp8BlockConfig.prepare_activations(x, quant=_FP8_BLOCK)
+    view = TrtllmFp8BlockConfig.prepare_weights(
+        w1,
+        w2,
+        quant=_FP8_BLOCK,
+        num_local_experts=local_num_experts,
+        hidden_size=_HIDDEN,
+        intermediate_size=_INTERMEDIATE,
+        activation=SwiGLU(),
+        device=device,
+    )
+    weights = MoEWeightPack()
+    weights.prepare_for("trtllm_fp8_block", view)
+    config = MoEConfig(
+        routing=RoutingConfig(num_experts=_NUM_EXPERTS, top_k=_TOP_K),
+        quant=_FP8_BLOCK,
+        experts=ExpertConfig(
+            intermediate_size=_INTERMEDIATE,
+            local_expert_offset=local_expert_offset,
+            local_num_experts=local_num_experts,
+        ),
+        activation=SwiGLU(),
+        backend=BackendOptions(candidates=(TrtllmFp8BlockConfig(),)),
+        execution=ExecutionConfig(tune_max_num_tokens=_TOKENS),
+    )
+    act = MoEActivationPack(
+        hidden_states_q=x_q,
+        hidden_states_scale=x_scale,
+        topk_ids=ids,
+        topk_weights=route_weights,
+    )
+    return MoELayer(config), act, weights
+
+
+def _cross_process_worker(cache: str, local_expert_offset: int, local_num_experts: int):
+    """Tune one layer against ``cache`` and report how many tactics were measured."""
+    from flashinfer.autotuner import AutoTuner, autotune
+
+    measured = 0
+
+    def counting(method):
+        def wrapped(self, *args, **kwargs):
+            nonlocal measured
+            measured += 1
+            return method(self, *args, **kwargs)
+
+        return wrapped
+
+    for name in ("_profile_single_kernel", "_profile_single_kernel_cupti"):
+        setattr(AutoTuner, name, counting(getattr(AutoTuner, name)))
+
+    layer, act, weights = _trtllm_fp8_block_layer(
+        local_expert_offset, local_num_experts
+    )
+    with autotune(True, cache=cache):
+        out = layer(act, weights)
+    torch.cuda.synchronize()
+    print(
+        "RESULT "
+        + json.dumps({"measured": measured, "finite": bool(out.isfinite().all())})
+    )
+
+
+def _run_worker(cache, local_expert_offset: int, local_num_experts: int) -> dict:
+    proc = subprocess.run(
+        [
+            sys.executable,
+            os.path.abspath(__file__),
+            str(cache),
+            str(local_expert_offset),
+            str(local_num_experts),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=1800,
+    )
+    assert proc.returncode == 0, proc.stderr[-4000:]
+    result = [line for line in proc.stdout.splitlines() if line.startswith("RESULT ")]
+    assert result, proc.stdout[-2000:]
+    return json.loads(result[-1][len("RESULT ") :])
+
+
+def _persisted_entries(cache) -> dict:
+    configs = json.loads(cache.read_text())
+    return {k: v for k, v in configs.items() if not k.startswith("_")}
+
+
+@pytest.mark.skipif(
+    not _trtllm_fp8_block_supported(),
+    reason="TRT-LLM block-FP8 MoE requires an arch in _TRTLLM_ROUTED_FP8_ARCHS",
+)
+def test_moe_runner_persisted_cache_hits_across_processes_and_ranks(tmp_path):
+    """A warm restart on another EP rank loads the persisted tactic instead of re-tuning (#6082)."""
+    cache = tmp_path / "autotune_cache.json"
+
+    rank0 = _run_worker(cache, local_expert_offset=0, local_num_experts=8)
+    assert rank0["measured"] > 0 and rank0["finite"]
+    tuned = _persisted_entries(cache)
+    assert any("moe_trtllm_fp8_block" in key for key in tuned), tuned
+
+    rank1 = _run_worker(cache, local_expert_offset=8, local_num_experts=8)
+    assert rank1["measured"] == 0 and rank1["finite"]
+    assert _persisted_entries(cache) == tuned
+
+    # A configuration that is not rank-derived still gets its own entry.
+    other = _run_worker(cache, local_expert_offset=0, local_num_experts=16)
+    assert other["measured"] > 0
+    assert set(_persisted_entries(cache)) > set(tuned)
+
+
+if __name__ == "__main__":
+    _cross_process_worker(sys.argv[1], int(sys.argv[2]), int(sys.argv[3]))
