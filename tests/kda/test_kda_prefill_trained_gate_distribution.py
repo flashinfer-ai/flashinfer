@@ -795,3 +795,63 @@ def test_bt16_indexed_fp32_state_matches_fp64_recurrence(monkeypatch):
     assert launches == [True]
     _check("output", out, expected_out)
     _check("final_state", pool[indices.long()], expected_final)
+
+
+# The hand-written ``bt16_prepare_beta_tma`` body serves the dense wavefront
+# (one fixed-layout sequence, 60-64 heads with whole 8-head beta boxes, at least
+# 4096 tokens) when the generated selector misses.  The route policy sends that
+# H64 shape to the one-wave M64 split, so the route is forced to BT16 here, and
+# the generated selector is made to miss as in the ``static`` cases above.
+BT16_BETA_TMA_CASES = [
+    pytest.param(slow_decay_inputs, 4417, id="slow_decay_h64_t4096"),
+    pytest.param(trained_gate_inputs, 4418, id="trained_h64_t4096"),
+]
+
+
+@pytest.mark.parametrize(("make_inputs", "seed"), BT16_BETA_TMA_CASES)
+def test_bt16_prepare_beta_tma_dense_wavefront_matches_fp64_recurrence(
+    make_inputs, seed, monkeypatch
+):
+    inp = make_inputs(lengths=(4096,), heads=64, seed=seed)
+    expected_out, expected_final = fp64_reference(inp)
+    launches = []
+    get_module = kda_prefill_api._get_flash_kda_prefill_module
+
+    def record_module(variant, target):
+        launches.append(variant)
+        return get_module(variant, target)
+
+    def miss_generated_selector(**kwargs):
+        launches.append("generated")
+        raise _GeneratedFlashKDASelectorNotFoundError("hand-written BT16 kernels")
+
+    monkeypatch.setattr(
+        kda_prefill_api,
+        "select_bf16_schedule_route",
+        lambda **kwargs: kda_prefill_api._FLASH_KDA_ROUTE_BT16_M64,
+    )
+    monkeypatch.setattr(
+        kda_prefill_api, "_run_generated_bt16_prepare_chain", miss_generated_selector
+    )
+    monkeypatch.setattr(kda_prefill_api, "_get_flash_kda_prefill_module", record_module)
+    out, final_state = recurrent_kda(
+        q=inp["q"],
+        k=inp["k"],
+        v=inp["v"],
+        g=inp["g"],
+        beta=inp["beta"],
+        A_log=inp["A_log"],
+        dt_bias=inp["dt_bias"],
+        scale=None,
+        initial_state=inp["state"].bfloat16(),
+        output_final_state=True,
+        use_qk_l2norm_in_kernel=True,
+        use_gate_in_kernel=True,
+        lower_bound=LOWER_BOUND,
+        beta_is_logit=True,
+        backend="cake",
+    )
+    torch.cuda.synchronize()
+    assert launches == ["generated", "bt16_prepare_beta_tma", "bt16_chain_m64_s9"]
+    _check("output", out, expected_out)
+    _check("final_state", final_state, expected_final)
