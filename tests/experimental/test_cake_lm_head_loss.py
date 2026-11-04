@@ -6936,16 +6936,16 @@ def test_zero_dlogp_floor_switch():
 
 def test_zero_dlogp_floor_per_architecture(monkeypatch):
     """The skip's default floor is per architecture: ``zero_dlogp_min_rows(index)`` reads the device's architecture
-    once per device index and returns its floor in ``ZERO_DLOGP_MIN_ROWS_BY_ARCH`` (sm_100a and sm_103a: 1946 valid
-    rows), the generic ``ZERO_DLOGP_MIN_ROWS_DEFAULT`` (4097) for any other architecture and without a device.  An
-    override of ``set_zero_dlogp_min_rows`` (an integer or ``None``) applies to every device; the setter returns
-    ``ZERO_DLOGP_MIN_ROWS_ARCH_DEFAULT`` when no override was set and takes it back, so every returned value passed back
-    restores the previous state exactly."""
+    once per device index and returns its floor in ``ZERO_DLOGP_MIN_ROWS_BY_ARCH`` (sm_100a: 1946 valid rows,
+    sm_103a: 3891), the generic ``ZERO_DLOGP_MIN_ROWS_DEFAULT`` (4097) for any other architecture and without a
+    device.  An override of ``set_zero_dlogp_min_rows`` (an integer or ``None``) applies to every device; the setter
+    returns ``ZERO_DLOGP_MIN_ROWS_ARCH_DEFAULT`` when no override was set and takes it back, so every returned value
+    passed back restores the previous state exactly."""
     sentinel = cake_backend.ZERO_DLOGP_MIN_ROWS_ARCH_DEFAULT
     assert cake_backend.ZERO_DLOGP_MIN_ROWS_DEFAULT == 4097
     assert cake_backend.ZERO_DLOGP_MIN_ROWS_BY_ARCH == {
         "sm_100a": 1946,
-        "sm_103a": 1946,
+        "sm_103a": 3891,
     }
     assert repr(sentinel) == "ZERO_DLOGP_MIN_ROWS_ARCH_DEFAULT"
     archs = {0: "sm_100a", 1: "sm_103a", 2: "sm_107a", 3: None}
@@ -6958,7 +6958,7 @@ def test_zero_dlogp_floor_per_architecture(monkeypatch):
     monkeypatch.setattr(cake_backend, "arch_for", arch_for)
     monkeypatch.setattr(cake_backend, "_ZERO_DLOGP_ARCH", {})
     monkeypatch.setattr(cake_backend, "_ZERO_DLOGP_MIN_ROWS", {"rows": sentinel})
-    defaults = {0: 1946, 1: 1946, 2: 4097, 3: 4097}
+    defaults = {0: 1946, 1: 3891, 2: 4097, 3: 4097}
 
     def floors():
         return {index: cake_backend.zero_dlogp_min_rows(index) for index in archs}
@@ -7536,8 +7536,8 @@ def test_device_binding_scratch_slots_cover_every_launch(glm_weight, T, case):
     the loss entry's forward all four.  Every launch and host step of a binding's forward / backward sequence finds
     every value it binds when only that sequence's scratch slots are present, and the remembered calls give the first
     call's bits.  The log-probability cases set the zero-gradient row skip's floor: ``logprob_skip`` runs it (``0``),
-    ``logprob`` and ``logprob_tau`` run the shipped backward (``None``) on every architecture -- on sm_100a / sm_103a
-    the default floor (1946 valid rows) would put both sizes on the skip."""
+    ``logprob`` and ``logprob_tau`` run the shipped backward (``None``) on every architecture -- on sm_100a the
+    default floor (1946 valid rows) would put both sizes on the skip."""
     _require_program(entry="loss" if case.startswith("loss") else "logprob")
     objective = "policy" if case == "loss_policy" else "ce"
     inp = _device_inputs(T, objective, W=glm_weight)
@@ -7600,8 +7600,8 @@ def test_device_binding_scratch_slots_cover_every_launch(glm_weight, T, case):
 
 def test_device_zero_dlogp_default_floor_per_architecture(glm_weight, monkeypatch):
     """Without an override a one-chunk log-probability backward runs the skip from this device's default floor on
-    (``zero_dlogp_min_rows(index)``: 1946 valid rows on sm_100a / sm_103a, else 4097): a backward of one row fewer runs
-    without it (the zero rows' ``dX`` zeros either way)."""
+    (``zero_dlogp_min_rows(index)``: 1946 valid rows on sm_100a, 3891 on sm_103a, else 4097): a backward of one row
+    fewer runs without it (the zero rows' ``dX`` zeros either way)."""
     _require_zero_dlogp_skip()
     index = torch.cuda.current_device()
     _module_name, record = cake_backend.record_for(CUDA)

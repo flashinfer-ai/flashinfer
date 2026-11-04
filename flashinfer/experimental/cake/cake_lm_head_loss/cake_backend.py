@@ -2931,13 +2931,14 @@ def set_zero_weight_min_rows(rows: int) -> int:
 # architecture without a floor of its own (:data:`ZERO_DLOGP_MIN_ROWS_BY_ARCH`).
 ZERO_DLOGP_MIN_ROWS_DEFAULT: Optional[int] = DEFAULT_CHUNK_SIZE + 1
 # Per-architecture default floors (valid rows); an architecture not listed uses :data:`ZERO_DLOGP_MIN_ROWS_DEFAULT`.
-# On B200 (sm_100a) and GB300 (sm_103a) a one-chunk call repays the partition's host time from 1946 valid rows on
-# (T = 2048 with 5 % ignored rows): with no zero-gradient row the backward, the step and the checkpointed step read
-# inside the A/A band against the call without the skip at 1946 and 3891 valid rows (plain and temperature
-# log-probability, cooled and after an idle gap), and with 16.6 % zero-gradient rows the step is 3.2 % to 10.9 % faster
-# (the CI above the band) at 1946 and 3891 valid rows.  At 1100 valid rows GB300 reads slower than the deterministic
-# package with no zero-gradient row, so the floor stays above it.  sm_107a keeps the generic floor until measured.
-ZERO_DLOGP_MIN_ROWS_BY_ARCH: dict[str, int] = {"sm_100a": 1946, "sm_103a": 1946}
+# On B200 (sm_100a) a one-chunk call repays the partition's host time from 1946 valid rows on (T = 2048 with 5 %
+# ignored rows): with no zero-gradient row no backward, step or checkpointed step of 1946 or 3891 valid rows reads
+# slower than the call without the skip (plain and temperature log-probability, cooled and after an idle gap), and
+# with 16.6 % zero-gradient rows the step is 3.2 % to 10.9 % faster (the CI above the band) at 1946 and 3891 valid
+# rows on B200 and GB300.  On GB300 (sm_103a) the temperature backward of 1946 valid rows with no zero-gradient row
+# reads 1.6 % slower than the call without the skip (the CI below the band on each of two clusters) and nothing
+# reads slower at 3891 valid rows (T = 4096), so its floor is 3891.  sm_107a keeps the generic floor until measured.
+ZERO_DLOGP_MIN_ROWS_BY_ARCH: dict[str, int] = {"sm_100a": 1946, "sm_103a": 3891}
 
 
 class _ArchDefaultFloor:
