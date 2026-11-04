@@ -636,7 +636,7 @@ def test_nvfp4_gin_public_prestaged_inputs():
 
 
 @pytest.mark.parametrize("capturing", [False, True], ids=["eager", "capture"])
-@pytest.mark.parametrize("failure", ["overflow", "mismatch"])
+@pytest.mark.parametrize("failure", ["overflow", "mismatch", "unsupported"])
 def test_nvfp4_gin_compile_bucket_collective_rejection(capturing, failure):
     from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.gin import (
         GinPreflightError,
@@ -654,13 +654,21 @@ def test_nvfp4_gin_compile_bucket_collective_rejection(capturing, failure):
         )
     expected = layer.forward(inputs).clone()
     torch.cuda.synchronize()
-    bucket = 16 if failure == "overflow" else (None if bootstrap.rank == 0 else 32)
+    bucket = (
+        16
+        if failure == "overflow"
+        else (32 if failure == "unsupported" or bootstrap.rank != 0 else None)
+    )
     graph = torch.cuda.CUDAGraph()
     context = torch.cuda.graph(graph) if capturing else nullcontext()
-    match = "live token count" if failure == "overflow" else "configuration differs"
+    match = {
+        "overflow": "live token count",
+        "mismatch": "configuration differs",
+        "unsupported": "does not support compile token buckets",
+    }[failure]
     with pytest.raises(GinPreflightError, match=match), context:
         layer.stage_inputs(inputs, compile_tokens_per_rank=bucket)
-    layer.stage_inputs(inputs, compile_tokens_per_rank=32)
+    layer.stage_inputs(inputs)
     actual = layer.compute_staged(output=torch.empty_like(expected))
     torch.cuda.synchronize()
     assert torch.equal(actual, expected)

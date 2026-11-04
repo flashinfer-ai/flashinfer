@@ -358,6 +358,11 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
                 raise ValueError(
                     "compile_tokens_per_rank cannot be smaller than the live token count"
                 )
+            if compile_tokens_per_rank is not None:
+                raise ValueError(
+                    "GIN does not support compile token buckets; use the default "
+                    "fixed workspace capacity (compile_tokens_per_rank=None)."
+                )
             if capturing and not self._thunk_states:
                 raise ValueError(
                     "GIN capture requires warmup on all ranks before capture."
