@@ -3379,8 +3379,8 @@ def test_router_sm_103a_head_tail_windows(monkeypatch):
     """The sm_103a weight gradient (256 experts) on 152 SMs runs the deterministic program at hidden 4096 and 6144 (the
     head/tail windows missed the accuracy rule).  With those windows forced (:data:`FAILED_ROUTER_WINDOWS`): hidden
     4096 runs "H1x4p44" (44 head and 304 tail units) at 20480 to 49152 tokens and hidden 6144 "H1x5p44" (44 head and
-    380 tail units) at 16172 to 20480 tokens; the deterministic program one token outside, on 148-SM parts (no router
-    table of their own) and one SM more or fewer than 152."""
+    380 tail units) at 16172 to 20480 tokens; the deterministic program one token outside, on 148-SM parts (their own
+    table holds no head/tail window) and one SM more or fewer than 152."""
 
     def part(sms, hidden, T):
         return cake_backend.router_partition(
@@ -3408,7 +3408,13 @@ def test_router_sm_103a_head_tail_windows(monkeypatch):
         )
     for hidden, T in ((4096, 20479), (4096, 49153), (6144, 16171), (6144, 20481)):
         assert part(152, hidden, T) is None, (hidden, T)
-    assert ("sm_103a", 148) not in cake_backend.ROUTER_RULES_BY_SM
+    assert not [
+        spec
+        for rule in cake_backend.ROUTER_RULES_BY_SM[("sm_103a", 148)].values()
+        if isinstance(rule, tuple)
+        for *_, spec in rule
+        if str(spec).startswith("H")
+    ]
     for sms in (148, 151, 153):
         for hidden, T in ((4096, 20480), (4096, 49152), (6144, 16172), (6144, 20480)):
             assert part(sms, hidden, T) is None, (sms, hidden, T)
@@ -5396,6 +5402,22 @@ def test_k2_key_is_the_convenience_key(splits):
         ) == det_backend.convenience_key(3, 77, ("k2", splits), A, B, out)
 
 
+def _drop_simt_windows(monkeypatch, arch: str, hidden: int) -> None:
+    """Drop the compensated SIMT windows of ``arch``'s 256-expert weight-gradient row at ``hidden`` from
+    :data:`ROUTER_RULES` (the 152-SM verdicts): a token count they held takes the next window that holds it
+    (``"waves"`` at hidden 5120 from 1 to 128 tokens on ``sm_100a``, to 160 on ``sm_103a``)."""
+    key = (arch, "nn_t", hidden, 256)
+    monkeypatch.setitem(
+        cake_backend.ROUTER_RULES,
+        key,
+        tuple(
+            window
+            for window in cake_backend.ROUTER_RULES[key]
+            if not str(window[2]).startswith("simt_")
+        ),
+    )
+
+
 def _same_arguments(got: list, want: list) -> None:
     assert len(got) == len(want)
     for i, (g, w) in enumerate(zip(got, want, strict=True)):
@@ -5427,6 +5449,9 @@ def test_k2_bound_arguments_are_the_ordered_arguments(monkeypatch, case):
         )
     elif case == "fwd_two_splits":
         splits = 2
+    else:
+        # "waves", with the compensated SIMT window of the same token counts in front of it dropped
+        _drop_simt_windows(monkeypatch, arch, H)
     X, W = torch.empty(T, H), torch.empty(256, H)
     G = (
         torch.empty(T, 256 + 16)[:, :256]
@@ -5526,7 +5551,8 @@ def _cpu_k2_launches(monkeypatch, arch="sm_103a"):
 
 # A router entry point's call on a 152-SM sm_103a part: (op, T, hidden, splits, padded out, padded G, whether it runs
 # this package's program -- else the deterministic program through this package's binding); the head/tail case runs
-# with the "H0.5x3" window that missed the accuracy rule forced (FAILED_ROUTER_WINDOWS)
+# with the "H0.5x3" window that missed the accuracy rule forced (FAILED_ROUTER_WINDOWS), the "waves" cases with the
+# compensated SIMT window in front of "waves" dropped (_drop_simt_windows)
 # fmt: off
 ROUTER_ENTRY_CASES = {
     "fwd": ("fwd", 64, 5120, None, False, False, False),
@@ -5580,6 +5606,8 @@ def test_router_entry_points_launch_their_paths_launches(monkeypatch, case):
         monkeypatch.setitem(
             cake_backend.ROUTER_RULES, (*key, 256), FAILED_ROUTER_WINDOWS[key]
         )
+    elif case in ("wgrad_waves", "wgrad_torch_chain"):
+        _drop_simt_windows(monkeypatch, "sm_103a", 5120)
     call, out = _router_entry_call(case)
     with monkeypatch.context() as m:
         m.setattr(cake_backend, "_k2_entry", lambda *args: None)
