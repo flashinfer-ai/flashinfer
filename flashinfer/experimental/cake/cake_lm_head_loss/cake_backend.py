@@ -2941,12 +2941,22 @@ ZERO_DLOGP_MIN_ROWS_BY_ARCH: dict[str, int] = {"sm_100a": 1946, "sm_103a": 1946}
 
 
 class _ArchDefaultFloor:
-    """The type of :data:`ZERO_DLOGP_MIN_ROWS_ARCH_DEFAULT`."""
+    """The type of :data:`ZERO_DLOGP_MIN_ROWS_ARCH_DEFAULT`, one object per process: a copy, a deep copy and a pickle
+    round trip give that object back, and :func:`set_zero_dlogp_min_rows` stores it for any value of this type."""
 
     __slots__ = ()
 
     def __repr__(self) -> str:
         return "ZERO_DLOGP_MIN_ROWS_ARCH_DEFAULT"
+
+    def __reduce__(self) -> str:
+        return "ZERO_DLOGP_MIN_ROWS_ARCH_DEFAULT"
+
+    def __copy__(self) -> "_ArchDefaultFloor":
+        return ZERO_DLOGP_MIN_ROWS_ARCH_DEFAULT
+
+    def __deepcopy__(self, memo: dict) -> "_ArchDefaultFloor":
+        return ZERO_DLOGP_MIN_ROWS_ARCH_DEFAULT
 
 
 # The floor setting "no override" (:func:`set_zero_dlogp_min_rows`): each device uses its architecture's default floor.
@@ -2980,9 +2990,9 @@ def set_zero_dlogp_min_rows(
 ) -> Union[Optional[int], _ArchDefaultFloor]:
     """Set the smallest log-probability backward (rows of its chunk loop) that runs the zero-gradient row skip on every
     architecture for the following calls of this process (``0``: every eligible call; ``None``: never;
-    :data:`ZERO_DLOGP_MIN_ROWS_ARCH_DEFAULT`: no override, each architecture's default floor) and return the previous
-    setting, which passed back restores it exactly.  Read once per call; the binding key holds whether a call runs
-    it."""
+    :data:`ZERO_DLOGP_MIN_ROWS_ARCH_DEFAULT`: no override, each architecture's default floor; any value of its type, a
+    copy or an unpickled one included, stores that object) and return the previous setting, which passed back restores
+    it exactly.  Read once per call; the binding key holds whether a call runs it."""
     if (
         rows is not None
         and not isinstance(rows, _ArchDefaultFloor)
@@ -2993,9 +3003,12 @@ def set_zero_dlogp_min_rows(
             f"got {rows!r}"
         )
     previous = _ZERO_DLOGP_MIN_ROWS["rows"]
-    _ZERO_DLOGP_MIN_ROWS["rows"] = (
-        rows if rows is None or isinstance(rows, _ArchDefaultFloor) else int(rows)
-    )
+    if rows is None:
+        _ZERO_DLOGP_MIN_ROWS["rows"] = None
+    elif isinstance(rows, _ArchDefaultFloor):
+        _ZERO_DLOGP_MIN_ROWS["rows"] = ZERO_DLOGP_MIN_ROWS_ARCH_DEFAULT
+    else:
+        _ZERO_DLOGP_MIN_ROWS["rows"] = int(rows)
     return previous
 
 

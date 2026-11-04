@@ -33,6 +33,7 @@ rendered programs.
 
 import ast
 import contextlib
+import copy
 import dataclasses
 import functools
 import gc
@@ -40,6 +41,7 @@ import inspect
 import json
 import math
 import os
+import pickle
 import re
 import subprocess
 import sys
@@ -6981,6 +6983,31 @@ def test_zero_dlogp_floor_per_architecture(monkeypatch):
     assert floors() == defaults
     assert cake_backend.set_zero_dlogp_min_rows(sentinel) is sentinel
     assert sorted(resolved) == [0, 1, 2, 3]
+
+
+def test_zero_dlogp_floor_sentinel_survives_copy_and_pickle(monkeypatch):
+    """``ZERO_DLOGP_MIN_ROWS_ARCH_DEFAULT`` is one object per process: ``copy.copy``, ``copy.deepcopy`` (also inside a
+    container) and a pickle round trip give that object back, and ``set_zero_dlogp_min_rows`` stores it for any value
+    of its type, so a previous setting the caller copied or unpickled restores the per-architecture default floor (the
+    backward's ``rows < floor`` compare never sees another object of the type)."""
+    sentinel = cake_backend.ZERO_DLOGP_MIN_ROWS_ARCH_DEFAULT
+    assert copy.copy(sentinel) is sentinel
+    assert copy.deepcopy(sentinel) is sentinel
+    assert copy.deepcopy({"floor": [sentinel]})["floor"][0] is sentinel
+    assert pickle.loads(pickle.dumps(sentinel)) is sentinel
+    stray = object.__new__(type(sentinel))
+    assert stray is not sentinel
+    assert copy.copy(stray) is sentinel and copy.deepcopy(stray) is sentinel
+    monkeypatch.setattr(cake_backend, "arch_for", lambda device=None: "sm_100a")
+    monkeypatch.setattr(cake_backend, "_ZERO_DLOGP_ARCH", {})
+    monkeypatch.setattr(cake_backend, "_ZERO_DLOGP_MIN_ROWS", {"rows": 0})
+    copies = (stray, copy.deepcopy(sentinel), pickle.loads(pickle.dumps(sentinel)))
+    for value in copies:
+        assert cake_backend.set_zero_dlogp_min_rows(value) == 0
+        assert cake_backend._ZERO_DLOGP_MIN_ROWS["rows"] is sentinel
+        assert cake_backend.zero_dlogp_min_rows(0) == 1946
+        assert cake_backend.zero_dlogp_min_rows() == 4097
+        assert cake_backend.set_zero_dlogp_min_rows(0) is sentinel
 
 
 def test_dlogp_rows_takes_a_ready_gradient_as_is():
