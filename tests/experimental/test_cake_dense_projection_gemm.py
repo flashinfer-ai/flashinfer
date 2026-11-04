@@ -2330,7 +2330,7 @@ ROUTER_WGRAD_WINDOWS_BY_SM = {
     ("sm_107a", 208, 5120): ((16172, 16384, "H0.5x4"),),
     ("sm_107a", 212, 4096): ((1, 256, "simt_n128m64s2"),),
     ("sm_107a", 212, 5120): ((1, 256, "simt_n128m64s2"), (16172, 16384, "H0.5x4")),
-    ("sm_107a", 212, 6144): ((1, 192, "simt_n128m64s2"), (16172, 16384, "H0.5x4")),
+    ("sm_107a", 212, 6144): ((1, 224, "simt_n128m64s2"), (16172, 16384, "H0.5x4")),
 }
 
 
@@ -4151,7 +4151,7 @@ def test_k2_memo_is_the_planners_check(monkeypatch):
     assert runs(geometry, 1) and runs(geometry, 0)
     own = cake_backend.ROUTER_RULES_BY_SM[("sm_107a", 212)]
     key = ("sm_107a", "nn_t", 6144, 256)
-    # the 212-SM hidden-6144 windows (SIMT to 192 tokens, head/tail 16172 to 16384 tokens)
+    # the 212-SM hidden-6144 windows (SIMT to 224 tokens, head/tail 16172 to 16384 tokens)
     shipped = own[key]
     monkeypatch.setitem(own, key, ((1, 1024, "pairs"),))
     assert not runs(geometry, 1) and runs(geometry, 0) and runs(geometry, 2)
