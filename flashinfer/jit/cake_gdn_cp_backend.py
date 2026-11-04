@@ -1113,6 +1113,30 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
     },
+    "cake_gdn_cp_e9de542fcf2b6bb924c5": {
+        "sources": [
+            "gdn/gdn_cp/cake_gdn_cp_e9de542fcf2b6bb924c5_kernel.cu",
+            "gdn/gdn_cp/cake_gdn_cp_e9de542fcf2b6bb924c5_binding.cu",
+        ],
+        "ffi_entry": "run",
+        "arg_plan": [
+            ["buffer", "local_transfer"],
+            ["buffer", "local_state"],
+            ["buffer", "initial_state"],
+            ["buffer", "initial_state_workspace"],
+            ["buffer", "fixed_state"],
+            ["buffer", "output_state"],
+            ["buffer", "cu_seqlens"],
+            ["parameter", "chunk_len"],
+            ["parameter", "total_cp_chunks"],
+            ["parameter", "num_seqs"],
+            ["parameter", "num_heads"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "arches": ["sm_107a"],
+    },
     "cake_gdn_cp_f297019c7bec02dd6183": {
         "sources": [
             "gdn/gdn_cp/cake_gdn_cp_f297019c7bec02dd6183_kernel.cu",
@@ -1268,6 +1292,7 @@ KERNELS: dict[str, Any] = {
         "normalized_final_state_bf16": "cake_gdn_cp_29c857ce26576248b1c8",
         "qk_norm": "cake_gdn_cp_58df50f20a8e6a75e788",
         "qk_norm_bf16": "cake_gdn_cp_c2f66f9e7a1e3b12cabd",
+        "state_fixup_simt_row10_mb3": "cake_gdn_cp_e9de542fcf2b6bb924c5",
         "state_fixup_simt_row10_sb2": "cake_gdn_cp_a29235b4bc34406101eb",
         "state_fixup_simt_row3_sb2": "cake_gdn_cp_a552ff0f6d798b5453ab",
         "state_fixup_simt_row4": "cake_gdn_cp_24af0c6f4359b2acf3c1",

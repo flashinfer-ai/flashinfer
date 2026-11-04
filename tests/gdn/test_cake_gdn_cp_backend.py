@@ -497,6 +497,7 @@ _ROW_SPLIT_CTAS = {
     "state_fixup_simt_row8_sb2_mb3": 16,
     "state_fixup_simt_row8_mb3": 16,
     "state_fixup_simt_row10_sb2": 13,
+    "state_fixup_simt_row10_mb3": 13,
 }
 
 
@@ -506,10 +507,11 @@ _ROW_SPLIT_CTAS = {
         # More than 2 CTAs per SM over sequences of one length: 3 CTAs per SM.
         ((1024,) * 8, 8, 212, "state_fixup_simt_row4_mb3"),
         ((16384,), 15, 216, "state_fixup_simt_row4_mb3"),
-        # 16 and 26 states whose row split does not fit its CTAs per SM.
+        # 16, 26 and 48 states whose row split does not fit its CTAs per SM.
         ((16384,), 16, 200, "state_fixup_simt_row4_mb3"),
         ((16384,), 26, 200, "state_fixup_simt_row4_mb3"),
-        # Sequences of one length with 4, 8, 14, 16, 22, 24, 26, 32 or 36
+        ((16384,), 48, 200, "state_fixup_simt_row4_mb3"),
+        # Sequences of one length with 4, 8, 14, 16, 22, 24, 26, 32, 36 or 48
         # states: the row-split builds (4 states from 6 CP chunks per sequence
         # on).
         ((16384,), 4, 212, "state_fixup_simt_row3_sb2"),
@@ -531,8 +533,8 @@ _ROW_SPLIT_CTAS = {
         ((8192, 8192), 13, 216, "state_fixup_simt_row8_mb3"),
         ((8192,) * 3, 12, 212, "state_fixup_simt_row8_sb2_mb3"),
         ((16384,), 36, 216, "state_fixup_simt_row8_sb2_mb3"),
-        # 48 states keep the 3-CTA build.
-        ((16384,), 48, 212, "state_fixup_simt_row4_mb3"),
+        ((16384,), 48, 212, "state_fixup_simt_row10_mb3"),
+        ((65536,), 48, 216, "state_fixup_simt_row10_mb3"),
         # At most 2 CTAs per SM: the default build.
         ((16384,), 6, 212, "state_fixup_simt_row4"),
         ((16384,), 8, 160, "state_fixup_simt_row4"),
@@ -649,6 +651,8 @@ def test_sm107_row_split_fixups_share_the_shipped_abi(
         ("state_fixup_simt_row8_sb2_mb3", 3, (1000, 1, 2000, 0, 640), 256),
         ("state_fixup_simt_row8_mb3", 26, (3072,), 1024),
         ("state_fixup_simt_row8_mb3", 13, (6144, 2048), 1024),
+        ("state_fixup_simt_row10_mb3", 48, (8192,), 1024),
+        ("state_fixup_simt_row10_mb3", 2, (128, 128, 129), 128),
     ],
 )
 def test_sm107_row_split_fixups_match_the_four_row_build_bitwise(

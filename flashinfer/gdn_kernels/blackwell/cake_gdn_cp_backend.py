@@ -284,6 +284,7 @@ _SM107_ROW_SPLIT_FIXUPS = {
     26: ("state_fixup_simt_row8_mb3", 16, 2, 1),
     32: ("state_fixup_simt_row10_sb2", 13, 2, 1),
     36: ("state_fixup_simt_row8_sb2_mb3", 16, 3, 1),
+    48: ("state_fixup_simt_row10_mb3", 13, 3, 1),
 }
 _FIXUP_ROW_CTAS = {
     "state_fixup_simt_row3_sb2": 43,
@@ -293,6 +294,7 @@ _FIXUP_ROW_CTAS = {
     "state_fixup_simt_row7_sb2_mb3": 19,
     "state_fixup_simt_row8_mb3": 16,
     "state_fixup_simt_row8_sb2_mb3": 16,
+    "state_fixup_simt_row10_mb3": 13,
     "state_fixup_simt_row10_sb2": 13,
     "state_fixup_utcmma64": 2,
     "state_fixup_utcmma128": 1,
