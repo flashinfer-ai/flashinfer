@@ -58,8 +58,8 @@ collectives, the merge chain tables, the segment plan ``P`` / ``NSEG`` and the
 segment table) is derived on demand by ``ctx.heads(HV)`` and cached.
 
 Segment plan rule.  ``kcp_plan_row(row_tables(part), HV, sm_count)`` (the legacy
-``"row_cost"`` rule, selectable; the shipped default ``"row_cost_lpt"`` below starts from
-its plan) picks the segments per fragment ``P`` of every rank (``NSEG =
+``"row_cost"`` rule, selectable; the row rule ``"row_cost_lpt"`` below starts from its plan
+and the shipped default ``"small_one"`` from that) picks the segments per fragment ``P`` of every rank (``NSEG =
 n_frag * P``) from every rank's fragment table: it starts from the per-rank
 ``"wave_fill1"`` program (below) and switches the whole row to the ``"occ"`` or the
 ``"one"`` program when the crossing-aware cost model says that program is cheaper
@@ -87,7 +87,13 @@ through the keyword-only ``p_rule`` argument of :func:`build_context_det_kcp` (a
 knob of the options object, never a default) for the A/B record.  ``"row_cost_lpt"``
 (selectable the same way) is the row rule whose wave-regime ranks take the argmin of
 the crossing-aware cost over their real fragment table, capped at the smallest ``P``
-within ``ROW_COST_LPT_MARGIN_PCT`` of the optimum (``lpt_rank_P``).  Every rule is a
+within ``ROW_COST_LPT_MARGIN_PCT`` of the optimum (``lpt_rank_P``).  ``"fill_down"``,
+``"small_one"`` (the shipped default) and ``"fill_small"`` (selectable) start from the
+``"row_cost_lpt"`` vector and only lower a rank's ``P``: ``"fill_down"`` gives every rank below
+the chain cap the smaller of its ``P`` and its one-wave fill ``floor(SM / (n_frag HV))``,
+``"small_one"`` runs ``P = 1`` on every rank when ``HV <= SMALL_ONE_HV_MAX = 12`` and no fragment
+exceeds ``SMALL_ONE_NC_MAX = 160`` chunks, ``"fill_small"`` is ``"small_one"`` on those rows and
+``"fill_down"`` on every other row.  Every rule is a
 pure function of (the fragment tables, HV, SM count), identical on every rank.
 
 Exchange layouts (one ``all_to_all_single`` per direction; ``s`` = one FP32
@@ -130,20 +136,23 @@ P_RULES = (
     "one",
     "row_cost",
     "row_cost_lpt",
+    "fill_down",
+    "small_one",
+    "fill_small",
 )  # P rules.  Per-rank rules (kcp_plan): "wave_fill1" = "wave" + the one-wave
 # fill on one-fragment ranks below the chain cap (the shipped default before "row_cost"); "wave" = the earlier rule (lever
 # L-C); "occ" = the design note §7.2 rule; "wave_fill" = the fill on every rank with n_frag <= 3 (implemented, not adopted);
 # "chain_min" = the fewest segments that keep every walk chain within MAX_CHAIN_STEPS (P = P_chain: one tape walk per
 # fragment below the cap, no offset / transfer / merge work beyond the chain cap's minimum); "one" = P = 1 on every rank
 # (one walk chain per fragment regardless of its length -- it ignores the chain cap).
-# Row rule (kcp_plan_row; "row_cost" = the selectable legacy rule, the shipped default "row_cost_lpt" starts from
-# its plan): "row_cost" costs the three per-rank programs {"wave_fill1", "occ", "one"}
+# Row rule (kcp_plan_row; "row_cost" = the selectable legacy rule, "row_cost_lpt" starts from its plan and the shipped
+# default "small_one" from that): "row_cost" costs the three per-rank programs {"wave_fill1", "occ", "one"}
 # over EVERY rank's fragment table with the crossing-aware LPT model (ROW_COST_*) and keeps "wave_fill1" unless "occ" or
 # "one" applied to the whole row is cheaper by at least its margin ROW_COST_MARGIN_PCT[policy] ("occ" 2 %, "one" 0 %:
 # the simpler program takes a model tie).  The per-rank rules stay selectable through
 # the keyword-only ``p_rule`` argument (options-object test knob) for the A/B record.  Every rule is a pure function of
 # (the fragment tables, HV, SM count), identical on every rank, so G3 holds under any of them.
-P_RULE_DEFAULT = "row_cost_lpt"
+P_RULE_DEFAULT = "small_one"
 ROW_COST_BASE = "wave_fill1"  # the per-rank program the row rule starts from
 ROW_COST_POLICIES = ("occ", "one")  # the whole-row alternatives it may switch to
 ROW_COST_COMPOSE_K = 2  # compose-term multiplier: the merge launches measured about twice the one-step compose model
@@ -165,7 +174,17 @@ ROW_COST_MARGIN_PCT = {"occ": 2, "one": 0}
 # (otherwise the whole row keeps that vector bitwise).  An unsegmented rank (delivered P = 1: no compose chain, the 64-wide
 # fwdh / dhu kernels) never enters the LPT replacement and keeps P = 1 -- the walk-step model does not carry the per-segment
 # work the first products add.  Selectable through `p_rule`; P_RULE_DEFAULT names the shipped rule.
-ROW_RULES = ("row_cost", "row_cost_lpt")
+ROW_RULES = ("row_cost", "row_cost_lpt", "fill_down", "small_one", "fill_small")
+# Row rules on top of "row_cost_lpt" ("small_one" is the shipped default; "fill_down" and "fill_small" are opt-in through
+# `p_rule`): each starts from the "row_cost_lpt" vector and never raises a rank's P.  "fill_down": every rank BELOW THE CHAIN CAP (0 < NC_max_frag < WAVE_MIN_NC_MAX_FRAG)
+# takes the smaller of its "row_cost_lpt" P and its one-wave fill P (the "wave_fill" program, floor(SM / (n_frag HV)) on a
+# rank with n_frag <= WAVE_N_FRAG_MAX), so a two-fragment rank drops to the one-wave P without the fill's raises; ranks
+# above the cap keep their P (lowering them lengthens the slowest walk).  "small_one": at HV <= SMALL_ONE_HV_MAX, when no
+# fragment of any rank exceeds SMALL_ONE_NC_MAX chunks, every rank runs P = 1 (no segment merges, compose chain or staging
+# planes); every other row keeps "row_cost_lpt".  "fill_small": "small_one" on its rows, "fill_down" on every other row.
+# Like every rule, each is a pure function of (every rank's fragment table, HV, SM count), identical on every rank.
+SMALL_ONE_HV_MAX = 12
+SMALL_ONE_NC_MAX = 160
 ROW_COST_LPT_MARGIN_PCT = ROW_COST_MARGIN_PCT["occ"]
 # The row gate's margin, calibrated on the measured GB300 rows of record (per-row ABBA of the rule against the "row_cost"
 # plan at B1 and B3): the smallest value on a 0.5 % grid such that every measured row whose modelled slowest-rank walk-step
@@ -969,7 +988,7 @@ def kcp_plan_row(
     P_bal: int = P_BAL_INACTIVE,
     p_rule: str = "row_cost",
 ) -> tuple[KcpSegmentPlan, ...]:
-    """The ``"row_cost"`` rule (selectable legacy rule; the shipped default ``"row_cost_lpt"`` starts from its plan):
+    """The ``"row_cost"`` rule (selectable legacy rule; ``"row_cost_lpt"`` starts from its plan):
     one :class:`KcpSegmentPlan` per rank from EVERY rank's fragment
     table (:func:`row_tables`), ``HV`` and the SM count.  The base program is :data:`ROW_COST_BASE` (``"wave_fill1"``)
     applied per rank; each alternative of :data:`ROW_COST_POLICIES` (``"occ"``, ``"one"``) applied to the whole row is
@@ -992,13 +1011,50 @@ def kcp_plan_row(
     (100 - margin) * steps(row_cost)``; otherwise the whole row keeps that vector bitwise).  An unsegmented rank (delivered
     ``P = 1``: no compose chain, the 64-wide fwdh / dhu kernels) never enters the LPT replacement and keeps ``P = 1``.
     Where the two rules differ the changed ranks compose through a different number of segment products (not bitwise
-    against ``"row_cost"``)."""
+    against ``"row_cost"``).
+
+    ``p_rule="small_one"`` (the shipped default) / ``"fill_down"`` / ``"fill_small"`` (opt-in) start from the ``"row_cost_lpt"`` vector and
+    never raise a rank's ``P``: ``"fill_down"`` gives every rank below the chain cap (``0 < NC_max_frag <
+    WAVE_MIN_NC_MAX_FRAG``) ``min(P, kcp_plan(..., p_rule="wave_fill").P)`` and keeps every other rank; ``"small_one"``
+    gives every rank ``P = 1`` when ``HV <= SMALL_ONE_HV_MAX`` and no fragment of any rank exceeds
+    ``SMALL_ONE_NC_MAX`` chunks, else the ``"row_cost_lpt"`` vector; ``"fill_small"`` is ``"small_one"`` on those rows
+    and ``"fill_down"`` elsewhere.  The returned plans report the rule and ``NSEG = n_frag * P``."""
     HV, sm_count = int(HV), int(sm_count)
     if p_rule not in ROW_RULES:
         raise ValueError(
             f"kcp_plan_row: p_rule must be one of {ROW_RULES} (the row rules), got {p_rule!r}"
         )
     tables = tuple(tuple((int(nc), bool(x)) for nc, x in table) for table in tables)
+    if p_rule in ("fill_down", "small_one", "fill_small"):
+        shipped = kcp_plan_row(tables, HV, sm_count, P_bal=P_bal, p_rule="row_cost_lpt")
+        one = HV <= SMALL_ONE_HV_MAX and all(
+            nc <= SMALL_ONE_NC_MAX for table in tables for nc, _ in table
+        )
+        if p_rule == "small_one" or (p_rule == "fill_small" and one):
+            return tuple(
+                dataclasses.replace(
+                    seg,
+                    P=1 if one else seg.P,
+                    NSEG=seg.n_frag * (1 if one else seg.P),
+                    p_rule=p_rule,
+                )
+                for seg in shipped
+            )
+        out = []
+        for seg, table in zip(shipped, tables, strict=True):
+            nc_max = max((nc for nc, _ in table), default=0)
+            P_new = seg.P
+            if 0 < nc_max < WAVE_MIN_NC_MAX_FRAG:  # below the chain cap only
+                fill = kcp_plan(
+                    len(table), nc_max, HV, sm_count, P_bal=P_bal, p_rule="wave_fill"
+                )
+                P_new = min(seg.P, fill.P)
+            out.append(
+                dataclasses.replace(
+                    seg, P=P_new, NSEG=seg.n_frag * P_new, p_rule=p_rule
+                )
+            )
+        return tuple(out)
 
     def program(rule: str) -> tuple[KcpSegmentPlan, ...]:
         return tuple(
@@ -2172,13 +2228,14 @@ def build_context_det_kcp(
     CUDA device's multiprocessor count; ``1`` on a non-CUDA device = no occupancy pressure, ``P = P_chain``).
     Out-of-range problems are rejected here, before any launch: ``n_frag > 65536`` (the layout table's document
     search), int32 overflows of the kernels' offsets (``heads(HV)``).  ``p_rule`` (keyword-only; a test knob of the
-    options object) selects the plan's ``P`` rule for this context (:data:`P_RULE_DEFAULT` = ``"row_cost_lpt"``;
+    options object) selects the plan's ``P`` rule for this context (:data:`P_RULE_DEFAULT` = ``"small_one"``;
     ``"row_cost"`` = the selectable legacy row rule of :func:`kcp_plan_row`; ``"wave_fill1"`` = its base program and
     the former default, ``"wave"`` = the
     earlier rule, ``"occ"`` = the occupancy rule, ``"wave_fill"`` = the unadopted fill on every rank with at most
     three fragments, ``"chain_min"`` / ``"one"`` = the minimal-segment programs, ``"row_cost_lpt"`` = the row rule with
-    the per-rank LPT argmin on the wave-regime ranks, all kept for the A/B record); the public API never selects a rule
-    other than the default.
+    the per-rank LPT argmin on the wave-regime ranks, ``"small_one"`` (the default) / ``"fill_down"`` / ``"fill_small"`` =
+    the row rules that lower ``"row_cost_lpt"``'s ``P`` (:func:`kcp_plan_row`), all kept for the A/B record); the public API
+    never selects a rule other than the default.
     """
     if not isinstance(part, PartitionDetKcp):
         raise TypeError(

@@ -38,11 +38,13 @@
 // Integration replaces the generated integer typedefs and the unused
 // tensor-map and bf16/fp8 declarations with <stdint.h>, keeps the
 // generated helpers once and each variant's macros around its kernel,
-// and adds sm_103a-only PDL device control (bit 2 of parameter_kind) and
-// a CUDA <12.9 2x128-bit fallback for the 256-bit inline-PTX accesses.
+// and adds sm_103a and sm_107a PDL device control (bit 2 of parameter_kind; an ordered per-row
+// temperature load after the wait) and a CUDA <12.9 2x128-bit fallback for the 256-bit inline-PTX
+// accesses.
 
 // clang-format off
 #include <stdint.h>
+#include <flashinfer/cake_blackwell_softmax_pdl.cuh>
 
 #include <math_constants.h>
 
@@ -183,7 +185,7 @@ kernel_flashinfer_blackwell_softmax_cached_cluster_persistent_c8_t8(float* __res
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
     const int lane = tid % 32;
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1030
+#if FLASHINFER_CAKE_SOFTMAX_DEVICE_PDL
     const bool enable_pdl = (parameter_kind & 4) != 0;
     parameter_kind &= 3;
     if (enable_pdl) {
@@ -341,7 +343,7 @@ kernel_flashinfer_blackwell_softmax_cached_cluster_persistent_c8_t8(float* __res
     float run_max = -CUDART_INF_F;
     float run_sum = 0.0f;
     if (trips > 0) {
-        float temperature = ((parameter_kind == 2) ? parameter[cluster] : scalar_temperature);
+        float temperature = ((parameter_kind == 2) ? cake_softmax_ld_ordered(parameter + (cluster)) : scalar_temperature);
         int second = cluster + clusters;
         tile_max[0] = -CUDART_INF_F;
         int tile_begin_7 = chunk_begin;
@@ -889,7 +891,7 @@ kernel_flashinfer_blackwell_softmax_cached_cluster_persistent_c8_t8(float* __res
         int following = row + clusters;
         int after = following + clusters;
         int _min_44 = ((following) < (rows - 1) ? (following) : (rows - 1));
-        float temperature_1 = ((parameter_kind == 2) ? parameter[_min_44] : scalar_temperature);
+        float temperature_1 = ((parameter_kind == 2) ? cake_softmax_ld_ordered(parameter + (_min_44)) : scalar_temperature);
         float inv_temperature_1 = 1.0f / temperature_1;
         run_max = -CUDART_INF_F;
         run_sum = 0.0f;
@@ -1646,7 +1648,7 @@ kernel_flashinfer_blackwell_softmax_cached_cluster_persistent_c8_t8(float* __res
             }
         }
     }
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1030
+#if FLASHINFER_CAKE_SOFTMAX_DEVICE_PDL
     if (enable_pdl) {
         asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     }
@@ -1693,7 +1695,7 @@ kernel_flashinfer_blackwell_softmax_cached_cluster_persistent_c16_t8(float* __re
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
     const int lane = tid % 32;
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1030
+#if FLASHINFER_CAKE_SOFTMAX_DEVICE_PDL
     const bool enable_pdl = (parameter_kind & 4) != 0;
     parameter_kind &= 3;
     if (enable_pdl) {
@@ -1851,7 +1853,7 @@ kernel_flashinfer_blackwell_softmax_cached_cluster_persistent_c16_t8(float* __re
     float run_max = -CUDART_INF_F;
     float run_sum = 0.0f;
     if (trips > 0) {
-        float temperature = ((parameter_kind == 2) ? parameter[cluster] : scalar_temperature);
+        float temperature = ((parameter_kind == 2) ? cake_softmax_ld_ordered(parameter + (cluster)) : scalar_temperature);
         int second = cluster + clusters;
         tile_max[0] = -CUDART_INF_F;
         int tile_begin_7 = chunk_begin;
@@ -2399,7 +2401,7 @@ kernel_flashinfer_blackwell_softmax_cached_cluster_persistent_c16_t8(float* __re
         int following = row + clusters;
         int after = following + clusters;
         int _min_44 = ((following) < (rows - 1) ? (following) : (rows - 1));
-        float temperature_1 = ((parameter_kind == 2) ? parameter[_min_44] : scalar_temperature);
+        float temperature_1 = ((parameter_kind == 2) ? cake_softmax_ld_ordered(parameter + (_min_44)) : scalar_temperature);
         float inv_temperature_1 = 1.0f / temperature_1;
         run_max = -CUDART_INF_F;
         run_sum = 0.0f;
@@ -3156,7 +3158,7 @@ kernel_flashinfer_blackwell_softmax_cached_cluster_persistent_c16_t8(float* __re
             }
         }
     }
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1030
+#if FLASHINFER_CAKE_SOFTMAX_DEVICE_PDL
     if (enable_pdl) {
         asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     }
@@ -3169,7 +3171,7 @@ kernel_flashinfer_blackwell_softmax_cached_cluster_persistent_c16_t8(float* __re
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
     const int lane = tid % 32;
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1030
+#if FLASHINFER_CAKE_SOFTMAX_DEVICE_PDL
     const bool enable_pdl = (parameter_kind & 4) != 0;
     parameter_kind &= 3;
     if (enable_pdl) {
@@ -3328,7 +3330,7 @@ kernel_flashinfer_blackwell_softmax_cached_cluster_persistent_c16_t8(float* __re
         float run_max = -CUDART_INF_F;
         float run_sum = 0.0f;
         if (trips > 0) {
-            float temperature = ((parameter_kind == 2) ? parameter[cluster] : scalar_temperature);
+            float temperature = ((parameter_kind == 2) ? cake_softmax_ld_ordered(parameter + (cluster)) : scalar_temperature);
             int second = cluster + clusters;
             tile_max[0] = -CUDART_INF_F;
             int tile_begin_7 = chunk_begin;
@@ -3876,7 +3878,7 @@ kernel_flashinfer_blackwell_softmax_cached_cluster_persistent_c16_t8(float* __re
             int following = row + clusters;
             int after = following + clusters;
             int _min_44 = ((following) < (rows - 1) ? (following) : (rows - 1));
-            float temperature_1 = ((parameter_kind == 2) ? parameter[_min_44] : scalar_temperature);
+            float temperature_1 = ((parameter_kind == 2) ? cake_softmax_ld_ordered(parameter + (_min_44)) : scalar_temperature);
             float inv_temperature_1 = 1.0f / temperature_1;
             run_max = -CUDART_INF_F;
             run_sum = 0.0f;
@@ -4638,7 +4640,7 @@ kernel_flashinfer_blackwell_softmax_cached_cluster_persistent_c16_t8(float* __re
         float run_max_1_shift = -CUDART_INF_F;
         float run_sum_1 = 0.0f;
         if (trips > 0) {
-            float temperature_2 = ((parameter_kind == 2) ? parameter[cluster] : scalar_temperature);
+            float temperature_2 = ((parameter_kind == 2) ? cake_softmax_ld_ordered(parameter + (cluster)) : scalar_temperature);
             float inv_temperature_2 = 1.0f / temperature_2;
             int second_1 = cluster + clusters;
             tile_max[0] = -CUDART_INF_F;
@@ -5148,7 +5150,7 @@ kernel_flashinfer_blackwell_softmax_cached_cluster_persistent_c16_t8(float* __re
             int following_1 = row_1 + clusters;
             int after_1 = following_1 + clusters;
             int _min_113 = ((following_1) < (rows - 1) ? (following_1) : (rows - 1));
-            float temperature_3 = ((parameter_kind == 2) ? parameter[_min_113] : scalar_temperature);
+            float temperature_3 = ((parameter_kind == 2) ? cake_softmax_ld_ordered(parameter + (_min_113)) : scalar_temperature);
             float inv_temperature_3 = 1.0f / temperature_3;
             run_max_1 = -CUDART_INF_F;
             run_max_1_shift = -CUDART_INF_F;
@@ -5869,7 +5871,7 @@ kernel_flashinfer_blackwell_softmax_cached_cluster_persistent_c16_t8(float* __re
             }
         }
     }
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1030
+#if FLASHINFER_CAKE_SOFTMAX_DEVICE_PDL
     if (enable_pdl) {
         asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     }

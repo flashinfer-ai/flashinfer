@@ -46,16 +46,35 @@ backend are experimental: no compatibility guarantee.
   checkpoint-replay backwards run the same programs (bitwise equal, as in the
   deterministic package).  `out`, `dq`, `dk`, `dv` and `dbeta` are bitwise the
   deterministic package's; `dg` differs from it by FP32 rounding on the `S1`
-  rows (the same FP64-referenced accuracy budget).  No path launches an
-  unordered reduction, so no entry raises torch's deterministic-algorithms
-  alert.
+  rows (the same FP64-referenced accuracy budget).  The one unordered
+  reduction is the raw gate mode's parameter-gradient reduce on `sm_100a` /
+  `sm_103a` (below): only that backward raises torch's
+  deterministic-algorithms alert, on every rank before any exchange.
 * A partition, a context and the byte queries hold no mode: they describe the
   same plan in both packages, and a context of either package serves the calls
-  of both (each package keeps its own launch tables on it).  The autograd node
+  of both (each package keeps its own launch tables on it).  The workspace
+  query of a raw gate mode backward on `sm_100a` / `sm_103a` here also counts
+  the local arena's FP64 parameter-gradient accumulators (`param_acc`, 2 KiB
+  per head; 16 KiB per head on `sm_100a` from 32 heads), which the
+  deterministic package does not hold.  The autograd node
   records its forward's mode and its backward runs it; a saved set is read by
   the backward of the package that wrote it (`SavedKcp` here, the other
   package's set raises `ValueError`), and a workspace (`WorkspaceKcp`) serves
   this package only.
+* The raw gate mode (`use_gate_in_kernel=True` with `A_log`, `dt_bias` and
+  `lower_bound`, FlashInfer #7816) runs on this package too ("Raw gate mode"
+  below): the rank's local stages take the single-rank package's raw records,
+  the deterministic programs on every row (no `S1` row runs in this mode) but
+  for the parameter-gradient reduce, so every output and the raw gate's
+  gradient are bitwise those of the deterministic package.  On `sm_107a` the
+  per-rank parameter partial sums are bitwise too; on `sm_100a` / `sm_103a`
+  they come from the `R1c` pairs (an unordered FP64 sum rounded once to FP32)
+  and can differ by about one FP32 ulp from run to run (below).  The in-kernel q / k
+  L2 norm (`use_qk_l2norm_in_kernel=True`, #7817) is not available here: the
+  entry points, `kda_workspace_bytes_kcp` and `kda_saved_bytes_kcp` raise
+  `ValueError` for it, naming `deterministic=True`.  Its off value
+  (`use_qk_l2norm_in_kernel=False`) is accepted, so a call that spells it out
+  runs unchanged.
 
 ### Names
 
@@ -69,6 +88,7 @@ backend are experimental: no compatibility guarantee.
 | `kda_det_workspace_bytes_kcp` | `kda_workspace_bytes_kcp` |
 | `kda_det_saved_bytes_kcp` | `kda_saved_bytes_kcp` |
 | `kda_det_comm_bytes_kcp` | `kda_comm_bytes_kcp` |
+| `reduce_gate_param_grads_det_kcp` | `reduce_gate_param_grads_kcp` |
 | `RecomputeHandleDetKcp` | `RecomputeHandleKcp` |
 | `WorkspaceDetKcp` | `WorkspaceKcp` |
 | `SavedDetKcp` | `SavedKcp` |
@@ -267,8 +287,10 @@ and conv halo entry points call it on every call). A thread other than the
 compute thread must pass `stream=` (the current stream is per thread). Copies
 are refused under CUDA-graph capture (`graph="replay"` runs the first call of
 a key eagerly). Not covered: `workspace=None` calls allocate their pools per
-call (a caching-allocator miss can call `cudaMalloc`, an out-of-memory retry
-synchronizes; reuse a workspace under memory pressure), the debug paths
+call, all but the read-only identity tile, which the first such call on a
+device builds once and the later ones share (a caching-allocator miss can
+call `cudaMalloc`, an out-of-memory retry synchronizes; reuse a workspace
+under memory pressure), the debug paths
 (`spec3_probe`, `debug_sequence`) and `TORCH_NCCL_BLOCKING_WAIT=1`. The
 previous copies stay reachable for A/B records through the context test knobs
 `upload="blocking"` and `table_cache="workspace"` (the latter only with the
@@ -348,6 +370,93 @@ nesting level -- a mismatch hangs or corrupts data, and no rank checks the
 others.  The phase comes from `torch._C._current_graph_task_id()`; a torch
 without it refuses the handle.
 
+Checkpoint hand-off (`chunk_kda_kcp(..., checkpoint_handoff="auto" | "on" |
+"off")`): under `torch.utils.checkpoint` the forward keeps its tape set --
+the `h` tape, `v_new`, `w` and the internal `Aqk` / `Akk` rows its own
+launches write -- in the saved set, and the backward reads it instead of
+re-running the intra program, WY, the K1 tape walk and, at `P > 1`, the
+offset re-walk and the carry merges.  Non-reentrant checkpoint keeps the set
+in both passes (the original forward's goes at its return); reentrant
+checkpoint runs its first pass under no_grad, so only its recompute keeps
+one.  The forward's launch list and every collective are unchanged.  On the
+devices of `KCP_HANDOFF_VERIFIED` the outputs and gradients are bitwise those
+of `"off"` (the hand-off rows of
+`tests/experimental/test_cake_kda_train_kcp_handoff.py`); `"on"` on another
+device has no such evidence.
+
+`"auto"` (the default) engages where `cake_kcp_plan.kcp_handoff_auto_refusal`
+admits the call, `"on"` wherever the call supports it, `"off"` never:
+
+```text
+(architecture, SM count, toolkit) in KCP_HANDOFF_VERIFIED
+    = (sm_100a, 148, 13.4) B200, (sm_103a, 148, 13.4) B300,
+      (sm_103a, 152, 13.4) GB300, (sm_107a, 212, 13.4) R200
+and H in KCP_HANDOFF_HEADS = {4, 8, 16, 32, 64}
+and H * (total packed tokens // world size) >= KCP_HANDOFF_MIN_HEAD_TOKENS = 393216
+```
+
+The rule comes from the `ckpt` step (time with the hand-off off / on) at
+261392 packed tokens in 4 documents, BF16, head dim 128.  On the rows the rule
+admits, measured with `"auto"` on this version on all four keys with the
+outputs and gradients bitwise those of `"off"`: H4 at CP2 (H * T / W = 522784)
+1.058-1.106; H16 and H64 1.073-1.147 (and 1.034 on one B200 CP8 H16 row whose
+timing drifted 5.20 %, over the benchmark's 2 % limit); H8 and H32, which stay
+in `KCP_HANDOFF_HEADS` on this evidence, 1.041-1.146.  Per key, H8: B200
+1.093-1.128, B300 1.082-1.122, GB300 1.041-1.124, R200 1.078-1.124; H32: B200
+1.117-1.146, B300 1.118-1.139, GB300 1.129-1.137, R200 1.127-1.134.  The H4
+rows the rule refuses were measured with `"on"` forced on the hand-off's first
+version: H4 at CP4 (261392) 1.033-1.043 on B200, 1.011-1.030 on B300 and
+1.025-1.034 on R200 but 0.978-0.989 on GB300; H4 at CP8 (130696) 0.985-1.002
+on B200 and 0.979-1.010 on B300.  That run measured every H4 row at CP2 and
+every H16 and H64 row 5 % or more faster.  H8 at CP8 (261392) is refused as
+`"work"` on the 8-GPU parts.  The bound admits every measured row that gains
+5 % or more and refuses every measured loss.  A new device, toolkit or head
+count needs these rows and the hand-off rows before it enters
+`KCP_HANDOFF_VERIFIED` or `KCP_HANDOFF_HEADS`.  H, the batch's total and the
+world size are the same on every rank, so the ranks of a group of one device
+kind decide alike; a rank that decides otherwise (a rank without tokens never
+keeps a set) still runs the same collectives, because the launches the
+hand-off skips are rank-local.
+
+Memory: the set costs `kda_handoff_bytes_kcp(ctx, H=...)` =
+`NC_pad * H * 32768 + R * H * 768` bytes (1280 B per internal token-head) on
+each rank and lives from the recompute to the end of the node's backward
+(non-reentrant: also inside the original forward call).  An engaged call
+raises the checkpoint peak by at most that much: the saved set grows by
+`kda_saved_bytes_kcp(..., checkpoint_handoff=True) - kda_saved_bytes_kcp(...)`,
+the tape set less the carry plane at `P > 1`.  Measured with `"on"` forced on
+the hand-off's first version: +152 MiB per rank at CP8 H4 to +10196 MiB at CP2
+H64 (T = 261392); with `"auto"` on this version, +625.5 MiB at CP8 H16
+to +10196 MiB at CP2 H64.
+`kda_saved_bytes_kcp(..., checkpoint_handoff=True)` is the saved set of an
+engaged call (no carry plane; the flag is the decision, a `bool`, not the
+mode); the facade `flashinfer.cake_kda_train_kcp`
+exports `kda_saved_bytes_kcp(..., checkpoint_handoff=...)`,
+`kda_handoff_bytes_kcp` (`0` with `deterministic=True`) and
+`kcp_handoff_stats()` (the forwards that kept a set, the backwards that read
+one and the refused requests by reason).  To opt out, pass
+`checkpoint_handoff="off"`; the deterministic package has no hand-off and
+`deterministic=True` ignores the keyword.
+
+The call keeps the light set outside a checkpoint pass, with
+`graph="replay"`, `spec3_probe`, `boundary_mode="replay"`, inside a
+CUDA-graph capture, under `torch.compile` tracing and under a Python
+dispatch mode (a selective-checkpoint policy).  A non-reentrant checkpoint
+decides once per call.  A request the call's own arguments refuse
+(`boundary_mode`, `graph`, `spec3_probe`, a tensor off CUDA and, under
+`"auto"`, the head count, the batch's total and the world size) is refused
+alike in both passes, which pass the same arguments, and records nothing.
+Under `"auto"` that refusal also reads `KCP_HANDOFF_HEADS` and
+`KCP_HANDOFF_MIN_HEAD_TOKENS` at call time: neither may change between a
+checkpointed forward and its backward (change them only between steps), or
+one pass can refuse a call the other admits and the recorded decisions shift.
+For every other call the original forward reads these states, the backend
+and the device key and records its decision on the checkpoint frame, and
+the recompute replays it in call order without reading its own state, so
+both passes save the same tensors (torch raises `CheckpointError` otherwise)
+even when a capture, `torch.compile` or a dispatch mode is active in one
+pass only.  It combines with a recompute handle.
+
 One halo exchange for a layer's q / k / v convolutions:
 `cake_causal_conv1d_kcp_multi((xq, xk, xv), (wq, wk, wv), ctx)` returns the
 three outputs bitwise equal to three `cake_causal_conv1d_kcp` calls (outputs,
@@ -371,6 +480,97 @@ out = torch.utils.checkpoint.checkpoint(layer, xq, xk, xv, g, beta, RecomputeHan
 Per layer the halo collectives drop from 3 / 3 / 3 (original forward /
 recompute / backward, without handles) or 3 / 0 / 3 (with handles) to 1 / 1 / 1
 or 1 / 0 / 1.
+
+Raw gate mode on the KCP route (issue #7816): the three KDA entry points take
+the single-rank keywords `use_gate_in_kernel=True, A_log=, dt_bias=,
+lower_bound=` with the same operand rules (`g` is the rank's raw BF16 gate,
+any view under the stride rule of the single-rank package's raw gate mode,
+never copied; `A_log` / `dt_bias` are the full parameters, the same tensors
+on every rank).
+
+```python
+from flashinfer.cake_kda_train_kcp import WorkspaceKcp, reduce_gate_param_grads_kcp
+
+nd = dict(deterministic=False)
+ws = WorkspaceKcp(use_gate_in_kernel=True)                        # the workspace's mode, fixed
+gate = dict(use_gate_in_kernel=True, A_log=A_log, dt_bias=dt_bias, lower_bound=-5.0)
+out_local, saved = chunk_kda_fwd_kcp(q_local, k_local, v_local, raw_local, beta_local, ctx,
+                                     workspace=ws, **gate, **nd)
+dq, dk, dv, dbeta, draw, dA_log_r, ddt_bias_r = chunk_kda_bwd_kcp(
+    q_local, k_local, v_local, raw_local, beta_local, ctx, dout_local, saved=saved, workspace=ws,
+    **gate, **nd)
+dA_log, ddt_bias = reduce_gate_param_grads_kcp(ctx, dA_log_r, ddt_bias_r, **nd)   # optional, see below
+```
+
+* The local stages run the raw records of the rank's plan
+  (`cake_backend.plan(..., gate="raw")` of the single-rank package: copies of
+  the deterministic raw programs but for the parameter-gradient reduce; the
+  intra and prep programs activate the gate, the raw GLM intra program writes
+  `draw`; no gate epilogue, no `S1` pair).  On `sm_107a` `glm_intra_raw` also
+  writes the per-chunk partials and one `param_finalize` launch reduces them
+  in a fixed order.  On `sm_100a` / `sm_103a` the `R1c` GLM intra program
+  (`glm_intra_v20c`, on `sm_100a` from 32 heads `glm_intra_v20c_r8`) adds
+  them in FP64 into the local arena's accumulators `param_acc` and its cast
+  rounds them once and zeroes the accumulators.
+  The `gk` rows the K1 / K2 / K3 walks read are the explicit path's bits for
+  the same activated gate, so every KCP program, collective and exchanged
+  byte is the explicit path's; no full-size FP32 gate or gate gradient exists
+  on the route.  Every output and `draw` are bitwise those of
+  `chunk_kda_det_bwd_kcp` on the same rank, and so are the parameter partial
+  sums on `sm_107a`.  On `sm_100a` / `sm_103a` the FP64 additions arrive in no
+  fixed order, so the partial sums can differ from run to run and from the
+  deterministic route: from run to run by one FP32 ulp at most while the FP64
+  sum's order error stays below half an FP32 ulp of the result (only per-chunk
+  terms that nearly cancel exceed it), and their error against the FP64
+  reference stays within the deterministic route's plus the FP64 sum's own
+  error.  Such
+  a backward raises torch's
+  non-determinism alert under `torch.use_deterministic_algorithms(True)`
+  (`RuntimeError`; a `UserWarning` with `warn_only=True`) on every rank before
+  it allocates, exchanges or launches anything: the decision reads the
+  architecture and `H` alone, so a rank without tokens alerts too.
+* `dA_log` / `ddt_bias` of a rank are its partial sums: the gradients through
+  its own tokens, reduced on the rank.  On `sm_107a` the order is fixed by its
+  local chunks: bitwise repeatable, the same under every exchange, schedule,
+  graph replay and recompute.  On the `R1c` rows the unordered FP64 sum makes
+  each partial sum vary from run to run by about one FP32 ulp of itself.  The
+  full gradient is their sum over `ctx.group`; a
+  training framework sums them as it sums the gradients of any parameter
+  replicated across the context-parallel ranks.  An NCCL all-reduce gives
+  that sum to FP32 rounding but does not fix its summation order, so it is
+  not bitwise reproducible; `reduce_gate_param_grads_kcp(ctx, dA_log,
+  ddt_bias)` is, from the same partials: one `all_gather_into_tensor` of the
+  `H + 128 H` values, then an FP32 sum in rank order on every rank (the same
+  bits everywhere, and the same bits as the deterministic package's
+  `reduce_gate_param_grads_det_kcp` from the same partials).  On the `R1c`
+  rows the partials vary from run to run, so that sum does too: by a few FP32
+  ulps that grow with the world size `W` (each partial by about one ulp, each
+  of the `W - 1` additions rounding either way).
+* The mode is fixed per workspace (`WorkspaceKcp(use_gate_in_kernel=True)`:
+  its local arena is the replay arena planned in raw mode, whose backward
+  layouts carry no gate epilogue buffers; the KCP pools do not change;
+  `local_arena="lean"` is refused in raw mode), recorded in the saved set
+  (`SavedKcp.gate`, `.lower_bound`) and in a recompute handle's fingerprint;
+  a call in the other mode, a backward with another `lower_bound` and a
+  recompute of another mode are refused with `ValueError`.
+  `kda_workspace_bytes_kcp(ctx, H=..., use_gate_in_kernel=True)` sizes it
+  (the `R1c` accumulators included: 2 KiB per head with one replica, 16 KiB
+  per head with 8);
+  `kda_saved_bytes_kcp` and `kda_comm_bytes_kcp` do not depend on the mode.
+* The `R1c` accumulators are one buffer of the local arena, shared by its
+  plan views.  A pack of more heads than the buffer holds grows it before its
+  backward and drops the cached graphs of the arena, whose launches add into
+  the old buffer; `reserve` sizes it for its contexts, and `bytes` counts it
+  once.  A backward that stops between the GLM intra launches and the cast
+  leaves sums in it; the next backward, or a `graph="replay"` replay, zeroes
+  the whole buffer first.
+* The checkpoint hand-off does not engage in raw mode (its tape set is
+  verified on the explicit gate only): a raw call keeps the light set under
+  every `checkpoint_handoff` value and records no decision.
+* The backward allocates the raw gate's BF16 gradient, on `sm_107a` the
+  partials (two FP32 `[NC_pad, H, 128, 2]` buffers of the rank's chunks, for
+  the duration of the call) and the two parameter gradients; a rank without
+  tokens returns zero parameter gradients.
 
 The segment plan splits every fragment into `P` segments: above the 256-chunk
 chain cap the equal-segment wave rule on ranks with at most three fragments,
@@ -445,6 +645,14 @@ registries and manifests, no device needed),
 the comparison against the deterministic package),
 `tests/experimental/test_cake_kda_train_kcp_api.py` (the public entry
 points, the mode keyword, the names and the import isolation),
+`tests/experimental/test_cake_kda_train_kcp_handoff.py` (the checkpoint
+hand-off: multi-GPU rows bitwise against `"off"`, the admission rule, the
+once-per-call decision, the byte queries),
+`tests/experimental/test_cake_kda_train_kcp_raw_gate.py` (the raw gate mode:
+the keywords, the workspace and its byte query, the saved set, the reduction
+helper, the local stages' records; multi-GPU rows against the single-rank raw
+path, the FP64 reference and, bitwise, the deterministic package's raw KCP
+route),
 `_fsdp_walk.py`, `_shared_ws.py` and `_upload.py`; benchmark
 `benchmarks/bench_cake_kda_train_kcp.py` (`torchrun`, one process per
 rank; the deterministic and the non-deterministic package interleaved).

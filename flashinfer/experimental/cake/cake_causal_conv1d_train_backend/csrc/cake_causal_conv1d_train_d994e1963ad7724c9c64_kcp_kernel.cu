@@ -47,15 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define SMEM_RED_OFF 1024
-#define SMEM_RED_STAGE_BYTES 16384
-#define SMEM_RED_STRIDE 16384
-#define SMEM_STAGE_BUF_OFF 17408
-#define SMEM_STAGE_BUF_STAGE_BYTES 32768
-#define SMEM_STAGE_BUF_STRIDE 32768
-#define SMEM_TOTAL 50176
-#define THREADS 128
 #define LAUNCH_MIN_BLOCKS 3
 
 #include <math_constants.h>
@@ -1676,7 +1667,6 @@ kernel_cake_causal_conv1d_train_d994e1963ad7724c9c64_kcp(__nv_bfloat16* __restri
             }
         }
     }
-    __threadfence();
     __syncthreads();
     if (tid == 0) {
         uint32_t done;
@@ -1691,7 +1681,6 @@ kernel_cake_causal_conv1d_train_d994e1963ad7724c9c64_kcp(__nv_bfloat16* __restri
     __syncthreads();
     float last = red[0];
     if (last != 0.0f) {
-        __threadfence();
         int ch0 = ct * ct_vec * 8;
         float a4[4];
         float z4[4];

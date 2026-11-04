@@ -659,6 +659,7 @@ def gen_all_modules(
     jit_specs.append(gen_spdlog_module())
     has_bgmv_moe = sm_capabilities.get("bgmv_moe", False)
     has_sm80 = sm_capabilities.get("sm80", False)
+    has_sm89 = sm_capabilities.get("sm89", False)
     has_sm90 = sm_capabilities.get("sm90", False)
     has_sm100 = sm_capabilities.get("sm100", False)
     has_blackwell_msa_sm100a = sm_capabilities.get("blackwell_msa_sm100a", False)
@@ -1084,10 +1085,20 @@ def gen_all_modules(
             gen_pcie_ipc_comm_module,
             gen_trtllm_comm_module,
             gen_trtllm_mnnvl_comm_module,
+            gen_ulysses_lowp_module,
+            gen_ulysses_lowp_sm90_module,
             gen_vllm_comm_module,
         )
 
         jit_specs.append(gen_nvlink_two_sided_alltoall_module())
+        if has_sm89 or has_sm120:
+            # One module emits the requested SM89/SM120 targets; register it once.
+            jit_specs.append(gen_ulysses_lowp_module())
+        if has_sm90:
+            # The SM90 grid (16/128) lives in its own translation unit pinned to
+            # -gencode sm_90a, so it needs its own prebuild; without this every
+            # Hopper caller JIT-compiles ulysses_lowp_sm90.cu on first use.
+            jit_specs.append(gen_ulysses_lowp_sm90_module())
         if (
             has_sm90
             or has_sm100
@@ -1159,7 +1170,7 @@ def gen_all_modules(
             gen_sampling_module(),
             gen_topk_module(),
         ]
-        if has_sm100 or has_sm103:
+        if has_sm100 or has_sm103 or has_sm107:
             jit_specs.append(gen_blackwell_softmax_module())
         # Cake radix sampling: one fatbin over every 9.x-12.x target (clusters + DSM only).
         if any(
@@ -1519,6 +1530,8 @@ def detect_sm_capabilities():
             for major, _ in compilation_context.TARGET_CUDA_ARCHS
         ),
         "sm80": has_any_sm8x and cuda_version >= Version("11.0"),
+        # Keep the existing CUDA >= 12.8 floor for Lowp AOT builds.
+        "sm89": has_sm("compute_89", "12.8"),
         "sm90": has_sm("compute_90", "12.3"),
         "sm100": has_sm("compute_100", "12.8"),
         "sm100a_exact": (10, "0a") in compilation_context.TARGET_CUDA_ARCHS

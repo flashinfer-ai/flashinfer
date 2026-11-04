@@ -251,8 +251,14 @@ def _launch(case, **public_kwargs):
 def _public_route(case):
     """The frozen route the public adapter resolves for ``case`` on the live arch."""
 
+    return cake_gdn.select_cake_gdn_prefill_variant(**_public_route_kwargs(case))
+
+
+def _public_route_kwargs(case):
+    """The resolver arguments of ``_public_route`` (no host lengths)."""
+
     major, minor = torch.cuda.get_device_capability(case["q"].device)
-    return cake_gdn.select_cake_gdn_prefill_variant(
+    return dict(
         arch=cake_gdn.arch_for_compute_capability(major, minor),
         io_dtype={torch.bfloat16: "bfloat16", torch.float16: "float16"}[
             case["q"].dtype
@@ -702,6 +708,68 @@ def test_public_cake_gdn_prefill_fp32_state_short_tiles_match_independent_recurr
     torch.testing.assert_close(
         state.float(), expected_state.float(), atol=1e-2, rtol=1e-2
     )
+
+
+def test_public_cake_gdn_prefill_sm107a_ragged_dvsplit_route_matches_independent_recurrence(
+    monkeypatch,
+):
+    # A ragged FP32-state batch over the DV-split tile budget (2 * 16 * 16 = 512 half
+    # tiles on 212 SMs) whose critical path is its long first sequence: with
+    # ``cu_seqlens_cpu`` sm_107a runs the DV-split body with one CTA per half tile (a
+    # grid above the SM count); without it, the full-DV body on the grid rule's grid.
+    # Both match the reference recurrence and repeat bitwise.
+    major, minor = torch.cuda.get_device_capability()
+    if cake_gdn.arch_for_compute_capability(major, minor) != "sm_107a":
+        pytest.skip("the ragged DV-split route is sm_107a only")
+    seq_lens = (4096, 2048, 1024, 512, 256, 128, 64, 32, 16, 8, 4, 2, 1, 1, 1, 1)
+    case = _make_case(seq_lens=seq_lens, num_q_heads=8, num_k_heads=8, num_v_heads=16)
+    initial_state = case["initial_state"].clone()
+    expected_out, expected_state, _ = _reference(case, initial_state)
+    unrouted = _public_route(case)
+    assert unrouted.route_id == "flashinfer.gdn_prefill.noncp.full_dv"
+    assert unrouted.one_cta_per_tile is False
+    routed = cake_gdn.select_cake_gdn_prefill_variant(
+        **_public_route_kwargs(case), host_seq_lens=seq_lens
+    )
+    assert routed.route_id == "flashinfer.gdn_prefill.noncp.dvsplit"
+    assert routed.one_cta_per_tile is True
+    assert "_dvsplit_initial_sm107a_l7_vec2_" in routed.variant_name
+    # The launched grid, observed where the launch sizes its per-CTA workspace.
+    grids = []
+    workspace = prefill_mod._cake_gdn_tensormap_workspace
+
+    def recording(device_index, stream, grid_x):
+        grids.append(grid_x)
+        return workspace(device_index, stream, grid_x)
+
+    monkeypatch.setattr(prefill_mod, "_cake_gdn_tensormap_workspace", recording)
+    sm_count = torch.cuda.get_device_properties(case["q"].device).multi_processor_count
+    full_dv_tiles = len(seq_lens) * 16
+    full_dv_grid = cake_gdn._cake_gdn_prefill_grid_x(
+        full_dv_tiles, sm_count, False, sum(seq_lens)
+    )
+    assert full_dv_grid <= sm_count < 2 * full_dv_tiles
+    for host_copy, expected_grid in (
+        ({"cu_seqlens_cpu": _host_cu_seqlens(seq_lens)}, 2 * full_dv_tiles),
+        ({}, full_dv_grid),
+    ):
+        runs = []
+        grids.clear()
+        for _ in range(2):
+            case["output"].fill_(float("nan"))
+            case["output_state"].copy_(initial_state)
+            out, state = _launch(case, **host_copy)
+            torch.cuda.synchronize()
+            runs.append((out.clone(), state.clone()))
+        torch.testing.assert_close(
+            runs[0][0].float(), expected_out.float(), atol=1e-2, rtol=1e-2
+        )
+        torch.testing.assert_close(
+            runs[0][1].float(), expected_state.float(), atol=1e-2, rtol=1e-2
+        )
+        assert torch.equal(runs[0][0], runs[1][0])
+        assert torch.equal(runs[0][1], runs[1][1])
+        assert grids == [expected_grid, expected_grid]
 
 
 def _carry_segment(case, start, stop, initial_state):
@@ -2152,6 +2220,471 @@ def test_public_cake_gdn_prefill_repeated_calls_allocate_no_device_memory(
         torch.testing.assert_close(
             case["state_checkpoints"].float(),
             expected_checkpoints.float(),
+            atol=1e-2,
+            rtol=1e-2,
+        )
+
+
+# --------------------------------------------------------------------------- SM107 native BF16 Cake CP
+
+
+def _require_sm107a():
+    if torch.cuda.get_device_capability() != (10, 7):
+        pytest.skip("the native BF16 Cake CP programs under test are sm_107a's")
+
+
+def _cp_programs(*names):
+    from flashinfer.jit import cake_gdn_cp_backend as cp_jit
+
+    return {name: f"kernel_{cp_jit.program_for(name, 'sm_107a')}" for name in names}
+
+
+def _unit_gate_case(case):
+    """The case with absent gates spelled as the ones they stand for (reference only)."""
+
+    total = sum(case["seq_lens"])
+    heads = max(case["num_q_heads"], case["num_v_heads"])
+    ones = torch.ones((total, heads), dtype=torch.float32, device=case["q"].device)
+    return {**case, "g": ones, "beta": ones}
+
+
+# (Hq, Hv, sequence length): one sequence of each measured head geometry of the
+# band (Hsab <= 8 from 4096 tokens, Hsab <= 32 from 8192 tokens), on the
+# full-block program (length a multiple of 128: ``use_cp="auto"``) and the
+# tail-safe generic one (other lengths: outside the band, ``use_cp=True``).
+_SM107_BF16_CP_ROWS = (
+    (4, 8, 4096),
+    (2, 4, 4097),
+    (2, 8, 4160),
+    (8, 16, 8192),
+    (4, 16, 8256),
+    (8, 32, 8192),
+)
+
+
+@pytest.mark.parametrize(("num_q_heads", "num_v_heads", "seqlen"), _SM107_BF16_CP_ROWS)
+def test_public_cake_gdn_cp_sm107a_bf16_single_sequence_matches_independent_recurrence(
+    monkeypatch, num_q_heads, num_v_heads, seqlen
+):
+    """``backend="cake_gdn"``: one BF16 sequence with FP32 state and int32
+    prefix sums in the band (``use_cp="auto"``) or with a tail (``use_cp=True``)
+    runs the native sm_107a CP programs (cu32 Stage 1 for the int32 prefix sums)
+    and matches the FP32 recurrence.  The band does not admit int64 prefix sums:
+    ``use_cp="auto"`` fails closed for them, and ``use_cp=True`` runs the plain
+    Stage 1 and gives the same bits."""
+
+    _require_sm107a()
+    case = _make_case(
+        seq_lens=(seqlen,), num_q_heads=num_q_heads, num_v_heads=num_v_heads
+    )
+    initial_state = case["initial_state"].clone()
+    expected_out, expected_state, _ = _reference(case, initial_state)
+    routed = []
+    original = prefill_mod._chunk_gated_delta_rule_gdn_cp_sm100
+    monkeypatch.setattr(
+        prefill_mod,
+        "_chunk_gated_delta_rule_gdn_cp_sm100",
+        lambda *a, **kw: (routed.append(True), original(*a, **kw))[1],
+    )
+
+    def launch(cu_seqlens, use_cp=True if seqlen % 128 else "auto"):
+        case["output"].fill_(float("nan"))
+        case["output_state"].fill_(float("nan"))
+        return chunk_gated_delta_rule(
+            q=case["q"],
+            k=case["k"],
+            v=case["v"],
+            g=case["g"],
+            beta=case["beta"],
+            scale=case["scale"],
+            initial_state=case["initial_state"],
+            output_final_state=True,
+            cu_seqlens=cu_seqlens,
+            use_qk_l2norm_in_kernel=False,
+            output=case["output"],
+            output_state=case["output_state"],
+            use_cp=use_cp,
+            backend="cake_gdn",
+        )
+
+    generic = seqlen % 128 != 0
+    stage4 = "cp_prefill_generic_bf16" if generic else "cp_prefill_bf16"
+    programs = _cp_programs(
+        stage4, "mn_precompute_bf16", "t_precompute_bf16_cu32", "t_precompute_bf16"
+    )
+    names = cake_profiler.cuda_kernel_names(lambda: launch(case["cu_seqlens"]))
+    assert routed, "the band routes the call to Cake CP"
+    for key in (stage4, "mn_precompute_bf16", "t_precompute_bf16_cu32"):
+        assert any(programs[key] in name for name in names), (key, names)
+    assert not any(programs["t_precompute_bf16"] in name for name in names), names
+    torch.cuda.synchronize()
+    assert torch.equal(case["initial_state"], initial_state)
+    out32, state32 = case["output"].clone(), case["output_state"].clone()
+    torch.testing.assert_close(
+        out32.float(), expected_out.float(), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(
+        state32.float(), expected_state.float(), atol=1e-2, rtol=1e-2
+    )
+    # Bitwise run to run, and int64 prefix sums (plain Stage 1) give the same bits.
+    launch(case["cu_seqlens"])
+    torch.cuda.synchronize()
+    assert torch.equal(case["output"], out32) and torch.equal(
+        case["output_state"], state32
+    )
+    cu64 = case["cu_seqlens"].to(torch.int64)
+    if not generic:
+        # int64 prefix sums are outside the band: ``use_cp="auto"`` keeps
+        # failing closed and never reaches Cake CP.
+        routed.clear()
+        with pytest.raises(cake_gdn.CakeGDNUnsupportedError):
+            launch(cu64)
+        assert not routed, "int64 cu_seqlens must not enter the band"
+    names64 = cake_profiler.cuda_kernel_names(lambda: launch(cu64, use_cp=True))
+    assert any(programs["t_precompute_bf16"] in name for name in names64), names64
+    torch.cuda.synchronize()
+    assert torch.equal(case["output"], out32) and torch.equal(
+        case["output_state"], state32
+    )
+
+
+@pytest.mark.parametrize("output_final_state", (True, False))
+def test_public_cake_gdn_cp_sm107a_bf16_absent_alpha_matches_independent_recurrence(
+    output_final_state,
+):
+    """``use_cp=True`` without gates: the native BF16 CP programs plus the output
+    recurrence and (when requested) the final-state recurrence, both the shipped
+    sm_107a normalized-final-state program."""
+
+    _require_sm107a()
+    case = _make_case(seq_lens=(4096,), num_q_heads=4, num_v_heads=8, gates=False)
+    initial_state = case["initial_state"].clone()
+    expected_out, expected_state, _ = _reference(_unit_gate_case(case), initial_state)
+    programs = _cp_programs("normalized_final_state_bf16")
+
+    def launch():
+        case["output"].fill_(float("nan"))
+        case["output_state"].copy_(initial_state)
+        return chunk_gated_delta_rule(
+            q=case["q"],
+            k=case["k"],
+            v=case["v"],
+            g=None,
+            beta=None,
+            scale=case["scale"],
+            initial_state=case["initial_state"],
+            output_final_state=output_final_state,
+            cu_seqlens=case["cu_seqlens"],
+            use_qk_l2norm_in_kernel=False,
+            output=case["output"],
+            output_state=case["output_state"] if output_final_state else None,
+            use_cp=True,
+            backend="cake_gdn",
+        )
+
+    names = cake_profiler.cuda_kernel_names(launch)
+    torch.cuda.synchronize()
+    assert any(programs["normalized_final_state_bf16"] in n for n in names), names
+    torch.testing.assert_close(
+        case["output"].float(), expected_out.float(), atol=1e-2, rtol=1e-2
+    )
+    if output_final_state:
+        torch.testing.assert_close(
+            case["output_state"].float(),
+            expected_state.float(),
+            atol=1e-2,
+            rtol=1e-2,
+        )
+
+
+@pytest.mark.parametrize("seqlen", (4096, 4097))
+def test_cake_gdn_cp_sm107a_bf16_in_kernel_l2norm_matches_independent_recurrence(
+    seqlen,
+):
+    """The CP backend with ``use_qk_l2norm_in_kernel=True`` and gates: the native
+    BF16 CP programs and the normalized final-state program on sm_107a."""
+
+    from flashinfer.gdn_kernels.blackwell import cake_gdn_cp_backend as gdn_cp
+
+    _require_sm107a()
+    case = _make_case(seq_lens=(seqlen,), num_q_heads=4, num_v_heads=8)
+    initial_state = case["initial_state"].clone()
+    # The case's Q/K are caller-normalized, so the in-kernel norm leaves the
+    # reference recurrence unchanged up to rounding.
+    expected_out, expected_state, _ = _reference(case, initial_state)
+    programs = _cp_programs("normalized_final_state_bf16")
+
+    def launch():
+        case["output"].fill_(float("nan"))
+        case["output_state"].fill_(float("nan"))
+        gdn_cp.chunk_gated_delta_rule_gdn_cp_sm100(
+            case["output"],
+            case["output_state"],
+            case["q"],
+            case["k"],
+            case["v"],
+            case["g"],
+            case["beta"],
+            case["cu_seqlens"],
+            case["scale"],
+            initial_state=case["initial_state"],
+            state_indices=None,
+            output_final_state=True,
+            use_qk_l2norm_in_kernel=True,
+        )
+
+    names = cake_profiler.cuda_kernel_names(launch)
+    torch.cuda.synchronize()
+    assert any(programs["normalized_final_state_bf16"] in n for n in names), names
+    torch.testing.assert_close(
+        case["output"].float(), expected_out.float(), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(
+        case["output_state"].float(), expected_state.float(), atol=1e-2, rtol=1e-2
+    )
+
+
+def test_public_cake_gdn_cp_sm107a_bf16_two_sequences_fail_closed():
+    """Two BF16 sequences with FP32 state in the band stay failing closed."""
+
+    _require_sm107a()
+    case = _make_case(seq_lens=(4096, 4096), num_q_heads=2, num_v_heads=4)
+    with pytest.raises(cake_gdn.CakeGDNUnsupportedError):
+        chunk_gated_delta_rule(
+            q=case["q"],
+            k=case["k"],
+            v=case["v"],
+            g=case["g"],
+            beta=case["beta"],
+            scale=case["scale"],
+            initial_state=case["initial_state"],
+            output_final_state=True,
+            cu_seqlens=case["cu_seqlens"],
+            use_qk_l2norm_in_kernel=False,
+            output=case["output"],
+            output_state=case["output_state"],
+            use_cp="auto",
+            backend="cake_gdn",
+        )
+
+
+# Explicit ``use_cp=True`` requests reach the native sm_107a BF16 CP programs
+# outside the ``auto`` band: (label, case keyword arguments, call options).
+_SM107_BF16_EXPLICIT_CP_CASES = (
+    ("multi_sequence", dict(seq_lens=(1000, 64, 3000)), {}),
+    ("zero_length_sequences", dict(seq_lens=(0, 300, 0, 129)), {}),
+    ("equal_heads", dict(seq_lens=(1000,), num_q_heads=8, num_v_heads=8), {}),
+    (
+        "gqa",
+        dict(seq_lens=(700, 333), num_q_heads=8, num_k_heads=2, num_v_heads=2),
+        {},
+    ),
+    ("indexed_in_place", dict(seq_lens=(257, 512), indexed=True), {}),
+    (
+        "indexed_gqa_bf16_state",
+        dict(
+            seq_lens=(64, 129),
+            indexed=True,
+            num_q_heads=4,
+            num_k_heads=1,
+            num_v_heads=1,
+            state_dtype=torch.bfloat16,
+        ),
+        {},
+    ),
+    ("fp16_state", dict(seq_lens=(513, 4096), state_dtype=torch.float16), {}),
+    ("bf16_state", dict(seq_lens=(513, 4096), state_dtype=torch.bfloat16), {}),
+    ("no_initial_state", dict(seq_lens=(640, 99)), {"initial_state": None}),
+    ("no_final_state", dict(seq_lens=(640, 99)), {"output_final_state": False}),
+    ("checkpoints", dict(seq_lens=(256, 384), checkpoint_every=128), {}),
+)
+
+
+def _fp32_reference(case, initial_state):
+    """``_reference`` with an FP32 recurrence state for a low-precision state pool."""
+
+    if case["state_dtype"] == torch.float32:
+        return _reference(case, initial_state)
+    widened = {
+        **case,
+        "state_dtype": torch.float32,
+        "output_state": case["output_state"].float(),
+        "state_checkpoints": case["state_checkpoints"].float(),
+    }
+    return _reference(widened, None if initial_state is None else initial_state.float())
+
+
+def _explicit_cp_launch(case, initial_state, *, output_final_state, cu_seqlens=None):
+    """One explicit Cake CP call; resets the outputs (and an in-place pool)."""
+
+    case["output"].fill_(float("nan"))
+    if case["initial_state"] is not None and initial_state is not None:
+        case["initial_state"].copy_(initial_state)
+    if case["output_state"] is not case["initial_state"]:
+        case["output_state"].fill_(float("nan"))
+    if case["checkpoint_every"]:
+        case["state_checkpoints"].fill_(float("nan"))
+    return chunk_gated_delta_rule(
+        q=case["q"],
+        k=case["k"],
+        v=case["v"],
+        g=case["g"],
+        beta=case["beta"],
+        scale=case["scale"],
+        initial_state=case["initial_state"],
+        output_final_state=output_final_state,
+        cu_seqlens=case["cu_seqlens"] if cu_seqlens is None else cu_seqlens,
+        use_qk_l2norm_in_kernel=False,
+        output=case["output"],
+        output_state=case["output_state"] if output_final_state else None,
+        state_checkpoints=(
+            case["state_checkpoints"] if case["checkpoint_every"] else None
+        ),
+        checkpoint_cu_starts=(
+            case["checkpoint_cu_starts"] if case["checkpoint_every"] else None
+        ),
+        checkpoint_every_n_tokens=case["checkpoint_every"],
+        state_indices=case["state_indices"],
+        max_seqlen=max(case["seq_lens"]),
+        use_cp=True,
+        backend="cake_gdn",
+    )
+
+
+@pytest.mark.parametrize(
+    ("label", "case_kwargs", "options"),
+    _SM107_BF16_EXPLICIT_CP_CASES,
+    ids=[case[0] for case in _SM107_BF16_EXPLICIT_CP_CASES],
+)
+def test_public_cake_gdn_cp_sm107a_bf16_explicit_paths_match_independent_recurrence(
+    monkeypatch, label, case_kwargs, options
+):
+    """Explicit ``use_cp=True`` BF16 calls on sm_107a (several sequences,
+    zero-length sequences, equal heads, GQA, indexed and in-place state pools,
+    FP16/BF16 state, no initial state, no final state, checkpoints) run the
+    native BF16 CP programs without a state repair recurrence and match the
+    FP32 recurrence; a second call gives the same bits."""
+
+    _require_sm107a()
+    case = _make_case(**case_kwargs)
+    if "initial_state" in options:
+        case["initial_state"] = None
+        case["output_state"] = torch.zeros_like(case["output_state"])
+    output_final_state = options.get("output_final_state", True)
+    initial_state = (
+        None if case["initial_state"] is None else case["initial_state"].clone()
+    )
+    expected_out, expected_state, expected_checkpoints = _fp32_reference(
+        case, initial_state
+    )
+    routed = []
+    original = prefill_mod._chunk_gated_delta_rule_gdn_cp_sm100
+    monkeypatch.setattr(
+        prefill_mod,
+        "_chunk_gated_delta_rule_gdn_cp_sm100",
+        lambda *a, **kw: (routed.append(True), original(*a, **kw))[1],
+    )
+    programs = _cp_programs(
+        "cp_prefill_bf16",
+        "cp_prefill_generic_bf16",
+        "mn_precompute_bf16",
+        "normalized_final_state_bf16",
+    )
+
+    def launch():
+        return _explicit_cp_launch(
+            case, initial_state, output_final_state=output_final_state
+        )
+
+    names = cake_profiler.cuda_kernel_names(launch)
+    torch.cuda.synchronize()
+    assert routed, label
+    if sum(case["seq_lens"]):
+        assert any(programs["mn_precompute_bf16"] in name for name in names), names
+        assert any(
+            programs["cp_prefill_bf16"] in name
+            or programs["cp_prefill_generic_bf16"] in name
+            for name in names
+        ), names
+    # Gates are present and Q/K are caller-normalized: no recurrence runs.
+    assert not any(programs["normalized_final_state_bf16"] in name for name in names), (
+        names
+    )
+    torch.testing.assert_close(
+        case["output"].float(), expected_out.float(), atol=1e-2, rtol=1e-2
+    )
+    if output_final_state:
+        torch.testing.assert_close(
+            case["output_state"].float(),
+            expected_state.float(),
+            atol=1e-2,
+            rtol=1e-2,
+        )
+    if case["checkpoint_every"]:
+        torch.testing.assert_close(
+            case["state_checkpoints"].float(),
+            expected_checkpoints.float(),
+            atol=1e-2,
+            rtol=1e-2,
+        )
+    first = (
+        case["output"].clone(),
+        case["output_state"].clone(),
+        case["state_checkpoints"].clone(),
+    )
+    launch()
+    torch.cuda.synchronize()
+    assert torch.equal(case["output"], first[0])
+    if output_final_state:
+        assert torch.equal(case["output_state"], first[1])
+    if case["checkpoint_every"]:
+        assert torch.equal(case["state_checkpoints"], first[2])
+
+
+def test_public_cake_gdn_cp_sm107a_bf16_cuda_graph_follows_rewritten_boundaries():
+    """A captured explicit BF16 Cake CP call on sm_107a replays with rewritten
+    device sequence boundaries and matches the FP32 recurrence each time."""
+
+    _require_sm107a()
+    layouts = ((1024, 1024), (512, 1536))
+    case = _make_case(seq_lens=layouts[0])
+    initial_state = case["initial_state"].clone()
+    references = []
+    for seq_lens in layouts:
+        bounds = torch.tensor(
+            [0, *itertools.accumulate(seq_lens)], dtype=torch.int32, device="cuda"
+        )
+        layout_case = {**case, "seq_lens": seq_lens, "cu_seqlens": bounds}
+        expected_out, expected_state, _ = _reference(layout_case, initial_state)
+        references.append((bounds, expected_out, expected_state))
+    cu_seqlens = references[0][0].clone()
+    case["seq_lens"] = (1536,)  # the max_seqlen hint covers both layouts
+
+    def invoke():
+        return _explicit_cp_launch(
+            case, initial_state, output_final_state=True, cu_seqlens=cu_seqlens
+        )
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        invoke()
+    stream.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        invoke()
+    for index in (0, 1, 0):
+        bounds, expected_out, expected_state = references[index]
+        with torch.cuda.stream(stream):
+            cu_seqlens.copy_(bounds)
+            graph.replay()
+        stream.synchronize()
+        torch.testing.assert_close(
+            case["output"].float(), expected_out.float(), atol=1e-2, rtol=1e-2
+        )
+        torch.testing.assert_close(
+            case["output_state"].float(),
+            expected_state.float(),
             atol=1e-2,
             rtol=1e-2,
         )

@@ -47,19 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 384
-#define TMEM_ST_OFFSET 0
-#define NUM_M_PIPE_STAGES 3
-#define NUM_STEP_PIPE_STAGES 3
-#define SMEM_M_K_OFF 1024
-#define SMEM_M_K_STAGE_BYTES 65536
-#define SMEM_M_K_STRIDE 65536
-#define SMEM_M_MN_OFF 1024
-#define SMEM_M_MN_STAGE_BYTES 65536
-#define SMEM_M_MN_STRIDE 65536
-#define SMEM_TOTAL 197632
-#define THREADS 576
 #define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
@@ -172,14 +159,13 @@ kernel_cake_kda_train_184d5ccfffea932ff1d8(const __grid_constant__ CUtensorMap m
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     float* m_k = reinterpret_cast<float*>(smem_raw + 1024);
     const int m_k_addr = smem + 1024;
     float* m_mn = reinterpret_cast<float*>(smem_raw + 1024);
     const int m_mn_addr = smem + 1024;
 
-    // Mbarrier init (5 pipeline groups, 0 ordered-sequence groups, 15 barriers)
-    // Mbarriers at smem_raw[0..120)
+    // Mbarrier init (15 barriers at smem_raw[0..120))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -224,10 +210,8 @@ kernel_cake_kda_train_184d5ccfffea932ff1d8(const __grid_constant__ CUtensorMap m
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
-
-    // Kernel post-init ops
-    const int tmem_st = taddr;
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_st = taddr;
 
     // ---- Role: readout ----
     if (warp <= 7) {
@@ -323,7 +307,7 @@ kernel_cake_kda_train_184d5ccfffea932ff1d8(const __grid_constant__ CUtensorMap m
                     *(reinterpret_cast<float*>(h_out) + (o_base + (long long)(k_1 * 128))) = _tmem_load_0[k_1];
                 }
                 asm volatile("tcgen05.fence::before_thread_sync;");
-                mbarrier_arrive(h_read_addr + (cur) * 8);
+                mbarrier_arrive(h_read_addr + ((int)((unsigned int)step % 3)) * 8);
             }
             asm volatile("tcgen05.fence::before_thread_sync;");
             asm volatile("barrier.sync 1, 512;" ::: "memory");
@@ -448,7 +432,7 @@ kernel_cake_kda_train_184d5ccfffea932ff1d8(const __grid_constant__ CUtensorMap m
                     :: "r"(taddr + (unsigned int)row_base_1 + (unsigned int)(tgt * 128 + kcol_1)), "r"(*reinterpret_cast<const uint32_t*>(&bcol[0])), "r"(*reinterpret_cast<const uint32_t*>(&bcol[1])), "r"(*reinterpret_cast<const uint32_t*>(&bcol[2])), "r"(*reinterpret_cast<const uint32_t*>(&bcol[3])), "r"(*reinterpret_cast<const uint32_t*>(&bcol[4])), "r"(*reinterpret_cast<const uint32_t*>(&bcol[5])), "r"(*reinterpret_cast<const uint32_t*>(&bcol[6])), "r"(*reinterpret_cast<const uint32_t*>(&bcol[7])), "r"(*reinterpret_cast<const uint32_t*>(&bcol[8])), "r"(*reinterpret_cast<const uint32_t*>(&bcol[9])), "r"(*reinterpret_cast<const uint32_t*>(&bcol[10])), "r"(*reinterpret_cast<const uint32_t*>(&bcol[11])), "r"(*reinterpret_cast<const uint32_t*>(&bcol[12])), "r"(*reinterpret_cast<const uint32_t*>(&bcol[13])), "r"(*reinterpret_cast<const uint32_t*>(&bcol[14])), "r"(*reinterpret_cast<const uint32_t*>(&bcol[15])), "r"(*reinterpret_cast<const uint32_t*>(&bcol[16])), "r"(*reinterpret_cast<const uint32_t*>(&bcol[17])), "r"(*reinterpret_cast<const uint32_t*>(&bcol[18])), "r"(*reinterpret_cast<const uint32_t*>(&bcol[19])), "r"(*reinterpret_cast<const uint32_t*>(&bcol[20])), "r"(*reinterpret_cast<const uint32_t*>(&bcol[21])), "r"(*reinterpret_cast<const uint32_t*>(&bcol[22])), "r"(*reinterpret_cast<const uint32_t*>(&bcol[23])), "r"(*reinterpret_cast<const uint32_t*>(&bcol[24])), "r"(*reinterpret_cast<const uint32_t*>(&bcol[25])), "r"(*reinterpret_cast<const uint32_t*>(&bcol[26])), "r"(*reinterpret_cast<const uint32_t*>(&bcol[27])), "r"(*reinterpret_cast<const uint32_t*>(&bcol[28])), "r"(*reinterpret_cast<const uint32_t*>(&bcol[29])), "r"(*reinterpret_cast<const uint32_t*>(&bcol[30])), "r"(*reinterpret_cast<const uint32_t*>(&bcol[31])));
                 asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                 asm volatile("tcgen05.fence::before_thread_sync;");
-                mbarrier_arrive(s_ready_addr + (nxt_stage) * 8);
+                mbarrier_arrive(s_ready_addr + ((int)((unsigned int)(step_1 + 1) % 3)) * 8);
                 if (steps_1 > step_1 + 2) {
                     int s_3 = step_1 + 2;
                     if (reverse == 1) {
@@ -695,7 +679,7 @@ kernel_cake_kda_train_184d5ccfffea932ff1d8(const __grid_constant__ CUtensorMap m
                     "}\n"
                     :: "r"((tmem_st + (nxt_1 * 128))), "r"(_smem_desc_lo_1), "r"(tmem_st + cur_1 * 128), "r"(1) : "memory");
                     }
-                    tcgen05_commit(mma_done_addr + (cur_1) * 8);
+                    tcgen05_commit(mma_done_addr + ((int)((unsigned int)step_3 % 3)) * 8);
                     tcgen05_commit(m_empty_addr + (ms_1) * 8);
                     ms_1 += 1;
                     if (ms_1 == 3) { ms_1 = 0; _phase_m_full ^= 1; }

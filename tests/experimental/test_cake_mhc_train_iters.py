@@ -172,13 +172,15 @@ def _parts(T: int, hidden: int = HIDDEN) -> int:
 
 
 def _lpt_runs(T: int, hidden: int = HIDDEN) -> bool:
-    """Whether the column slab runs its two-size ``lpt`` record of ``hidden`` at ``T`` on this device (at hidden 5120
-    and 7168 only where the size's table calibrates the architecture)."""
-    return loader.bwd_slab_atomic_program(T, _sm_count(), _arch(), hidden) == "lpt"
+    """Whether the column slab runs a two-size record of ``hidden`` (``lpt`` or its slab-fastest copy ``lpt_os``) at
+    ``T`` on this device (at hidden 5120 and 7168 only where the size's table calibrates the architecture)."""
+    program = loader.bwd_slab_atomic_program(T, _sm_count(), _arch(), hidden)
+    return program.startswith("lpt")
 
 
 def _slab_parts(T: int, hidden: int = HIDDEN) -> int:
-    """The chunk count the column slab launches: ``slab_plan``'s ``lpt_parts`` under ``lpt``, else :func:`_parts`."""
+    """The chunk count the column slab launches: ``slab_plan``'s ``lpt_parts`` under ``lpt`` / ``lpt_os``, else
+    :func:`_parts`."""
     if not _lpt_runs(T, hidden):
         return _parts(T, hidden)
     parts = loader.slab_plan(T, _sm_count(), _arch(), hidden)["lpt_parts"]
@@ -188,8 +190,8 @@ def _slab_parts(T: int, hidden: int = HIDDEN) -> int:
 
 def _dfn_factor(T: int, hidden: int = HIDDEN) -> float:
     """F of the dfn bound F u (|carried| + ABS_SLACK sum_t |dz'_t| |x_t|) at T (``test_cake_mhc_train.py``'s
-    ``_dfn_factor``, which derives it): 2 P where the column slab runs dynr (both sides sum the same per-chunk
-    partials), 2 max(P, P_k7) + 10 where it runs lpt (the partials are another partition's)."""
+    ``_dfn_factor``, which derives it): 2 P where the column slab runs dynr or dynr_os (both sides sum the same
+    per-chunk partials), 2 max(P, P_k7) + 10 where it runs lpt or lpt_os (the partials are another partition's)."""
     if not _lpt_runs(T, hidden):
         return 2.0 * _parts(T, hidden)
     return 2.0 * max(_slab_parts(T, hidden), _parts(T, hidden)) + 10.0

@@ -47,123 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 512
-#define TMEM_ACC_DQ_OFFSET 0
-#define TMEM_ACC_DK_OFFSET 128
-#define TMEM_ACC_DW_OFFSET 256
-#define TMEM_ACC_DA_OFFSET 384
-#define TMEM_ACC_DVB_OFFSET 0
-#define TMEM_ACC_DKGB_OFFSET 128
-#define TMEM_ACC_DA1_OFFSET 256
-#define TMEM_ACC_DA2_OFFSET 320
-#define TMEM_ACC_DAQ_OFFSET 448
-#define NUM_ONE_STAGES 1
-#define NUM_WORK_STAGES 4
-#define SMEM_SMEM_V0_OFF 1024
-#define SMEM_SMEM_V0_STAGE_BYTES 16384
-#define SMEM_SMEM_V0_STRIDE 57344
-#define SMEM_SMEM_V0_0_OFF 17408
-#define SMEM_SMEM_V0_0_STAGE_BYTES 16384
-#define SMEM_SMEM_V0_0_STRIDE 57344
-#define SMEM_SMEM_V0_1_OFF 33792
-#define SMEM_SMEM_V0_1_STAGE_BYTES 16384
-#define SMEM_SMEM_V0_1_STRIDE 57344
-#define SMEM_SMEM_V3_OFF 1024
-#define SMEM_SMEM_V3_STAGE_BYTES 16384
-#define SMEM_SMEM_V3_STRIDE 57344
-#define SMEM_SMEM_V3_0_OFF 17408
-#define SMEM_SMEM_V3_0_STAGE_BYTES 16384
-#define SMEM_SMEM_V3_0_STRIDE 57344
-#define SMEM_SMEM_V3_1_OFF 33792
-#define SMEM_SMEM_V3_1_STAGE_BYTES 16384
-#define SMEM_SMEM_V3_1_STRIDE 57344
-#define SMEM_DV2_MN_OFF 33792
-#define SMEM_DV2_MN_STAGE_BYTES 16384
-#define SMEM_DV2_MN_STRIDE 57344
-#define SMEM_AKK_K_OFF 50176
-#define SMEM_AKK_K_STAGE_BYTES 8192
-#define SMEM_AKK_K_STRIDE 57344
-#define SMEM_AKK_MN_OFF 50176
-#define SMEM_AKK_MN_STAGE_BYTES 8192
-#define SMEM_AKK_MN_STRIDE 57344
-#define SMEM_DAB_K_OFF 58368
-#define SMEM_DAB_K_STAGE_BYTES 8192
-#define SMEM_DAB_K_STRIDE 8192
-#define SMEM_DA1B_MN_OFF 66560
-#define SMEM_DA1B_MN_STAGE_BYTES 8192
-#define SMEM_DA1B_MN_STRIDE 8192
-#define SMEM_DA1B_W_OFF 66560
-#define SMEM_DA1B_W_STAGE_BYTES 8192
-#define SMEM_DA1B_W_STRIDE 8192
-#define SMEM_RING_F32_OFF 1024
-#define SMEM_RING_F32_STAGE_BYTES 57344
-#define SMEM_RING_F32_STRIDE 57344
-#define SMEM_V_P_OFF 58368
-#define SMEM_V_P_STAGE_BYTES 8192
-#define SMEM_V_P_STRIDE 8192
-#define SMEM_V_K_OFF 58368
-#define SMEM_V_K_STAGE_BYTES 16384
-#define SMEM_V_K_STRIDE 16384
-#define SMEM_H_P_OFF 74752
-#define SMEM_H_P_STAGE_BYTES 16384
-#define SMEM_H_P_STRIDE 16384
-#define SMEM_DH_P_OFF 107520
-#define SMEM_DH_P_STAGE_BYTES 16384
-#define SMEM_DH_P_STRIDE 16384
-#define SMEM_H_K_OFF 74752
-#define SMEM_H_K_STAGE_BYTES 32768
-#define SMEM_H_K_STRIDE 32768
-#define SMEM_DH_K_OFF 107520
-#define SMEM_DH_K_STAGE_BYTES 32768
-#define SMEM_DH_K_STRIDE 32768
-#define SMEM_DWB_K_OFF 140288
-#define SMEM_DWB_K_STAGE_BYTES 16384
-#define SMEM_DWB_K_STRIDE 16384
-#define SMEM_DWB_MN_OFF 140288
-#define SMEM_DWB_MN_STAGE_BYTES 16384
-#define SMEM_DWB_MN_STRIDE 16384
-#define SMEM_KGB_K_OFF 156672
-#define SMEM_KGB_K_STAGE_BYTES 16384
-#define SMEM_KGB_K_STRIDE 16384
-#define SMEM_GK_P_OFF 173056
-#define SMEM_GK_P_STAGE_BYTES 8192
-#define SMEM_GK_P_STRIDE 8192
-#define SMEM_GK_S_OFF 173056
-#define SMEM_GK_S_STAGE_BYTES 32768
-#define SMEM_GK_S_STRIDE 32768
-#define SMEM_K_P_OFF 205824
-#define SMEM_K_P_STAGE_BYTES 8192
-#define SMEM_K_P_STRIDE 8192
-#define SMEM_K_S_OFF 205824
-#define SMEM_K_S_STAGE_BYTES 16384
-#define SMEM_K_S_STRIDE 16384
-#define SMEM_Q_P_OFF 74752
-#define SMEM_Q_P_STAGE_BYTES 8192
-#define SMEM_Q_P_STRIDE 8192
-#define SMEM_Q_S_OFF 74752
-#define SMEM_Q_S_STAGE_BYTES 16384
-#define SMEM_Q_S_STRIDE 16384
-#define SMEM_BETA_S_OFF 223744
-#define SMEM_BETA_S_STAGE_BYTES 512
-#define SMEM_BETA_S_STRIDE 512
-#define SMEM_REC_S_OFF 224256
-#define SMEM_REC_S_STAGE_BYTES 16
-#define SMEM_REC_S_STRIDE 16
-#define SMEM_WORK_RESP_OFF 224272
-#define SMEM_WORK_RESP_STAGE_BYTES 16
-#define SMEM_WORK_RESP_STRIDE 16
-#define SMEM_NXT_S_OFF 224336
-#define SMEM_NXT_S_STAGE_BYTES 16
-#define SMEM_NXT_S_STRIDE 16
-#define SMEM_DGK_S_OFF 222208
-#define SMEM_DGK_S_STAGE_BYTES 512
-#define SMEM_DGK_S_STRIDE 512
-#define SMEM_DBP_S_OFF 222720
-#define SMEM_DBP_S_STAGE_BYTES 1024
-#define SMEM_DBP_S_STRIDE 1024
-#define SMEM_TOTAL 224384
-#define THREADS 320
 #define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
@@ -321,7 +204,7 @@ kernel_cake_kda_train_f6a70fb0288a508f2828(const __grid_constant__ CUtensorMap d
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     __nv_bfloat16* smem_v0 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
     const int smem_v0_addr = smem + 1024;
     __nv_bfloat16* smem_v0_0 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 17408);
@@ -391,8 +274,7 @@ kernel_cake_kda_train_f6a70fb0288a508f2828(const __grid_constant__ CUtensorMap d
     float* dbp_s = reinterpret_cast<float*>(smem_raw + 222720);
     const int dbp_s_addr = smem + 222720;
 
-    // Mbarrier init (22 pipeline groups, 0 ordered-sequence groups, 28 barriers)
-    // Mbarriers at smem_raw[0..224)
+    // Mbarrier init (28 barriers at smem_raw[0..224))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -467,18 +349,16 @@ kernel_cake_kda_train_f6a70fb0288a508f2828(const __grid_constant__ CUtensorMap d
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
-
-    // Kernel post-init ops
-    const int tmem_acc_dq = taddr;
-    const int tmem_acc_dk = taddr + 128;
-    const int tmem_acc_dw = taddr + 256;
-    const int tmem_acc_da = taddr + 384;
-    const int tmem_acc_dvb = taddr;
-    const int tmem_acc_dkgb = taddr + 128;
-    const int tmem_acc_da1 = taddr + 256;
-    const int tmem_acc_da2 = taddr + 320;
-    const int tmem_acc_daq = taddr + 448;
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_acc_dq = taddr;
+    const unsigned int tmem_acc_dk = taddr + 128;
+    const unsigned int tmem_acc_dw = taddr + 256;
+    const unsigned int tmem_acc_da = taddr + 384;
+    const unsigned int tmem_acc_dvb = taddr;
+    const unsigned int tmem_acc_dkgb = taddr + 128;
+    const unsigned int tmem_acc_da1 = taddr + 256;
+    const unsigned int tmem_acc_da2 = taddr + 320;
+    const unsigned int tmem_acc_daq = taddr + 448;
 
     // ---- Role: compute ----
     if (warp <= 7) {
@@ -547,7 +427,7 @@ kernel_cake_kda_train_f6a70fb0288a508f2828(const __grid_constant__ CUtensorMap d
                 int bbase = (it_i & 1) * 64;
                 float beta_t = beta_s[t_row + bbase];
                 int cbos = rec_s[(it_i & 1) * 2];
-                __nv_bfloat16* dv_item = dv_out + ((long long)(cbos * num_heads + head_1) * 128);
+                __nv_bfloat16* dv_item = dv_out + (long long)(cbos * num_heads + head_1) * 128;
                 int clen = rec_s[(it_i & 1) * 2 + 1];
                 float dgk_inter = 0.0f;
                 mbarrier_wait(h_full_addr, _phase_h_full_0);
@@ -587,6 +467,7 @@ kernel_cake_kda_train_f6a70fb0288a508f2828(const __grid_constant__ CUtensorMap d
                     }
                     dgk_s[hk] = dgk_inter;
                 }
+                asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 mbarrier_arrive(hd_read_done_addr);
                 mbarrier_wait(a_ready_addr, _phase_a_ready_0);
                 _phase_a_ready_0 ^= 1;
@@ -1019,11 +900,11 @@ kernel_cake_kda_train_f6a70fb0288a508f2828(const __grid_constant__ CUtensorMap d
                         : "=r"(*reinterpret_cast<uint32_t*>(&kraw2[q_12 * 4])), "=r"(*reinterpret_cast<uint32_t*>(&kraw2[(q_12 * 4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&kraw2[(q_12 * 4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&kraw2[(q_12 * 4) + 3]))
                         : "r"((k_s_addr + (unsigned int)((col0 + q_12 * 8) / 64 * 8192 + t_row * 128 + (col0 + q_12 * 8) % 64 * 2 ^ ((col0 + q_12 * 8) / 64 * 8192 + t_row * 128 + (col0 + q_12 * 8) % 64 * 2 >> 7 & 7) << 4))));
                 }
-                float unpack_bf16_1[16];
+                float unpack_bf16_3[16];
                 #pragma unroll
                 for (int _pair = 0; _pair < 8; _pair++) {
-                    (&unpack_bf16_1[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(kraw2[_pair]) << 16);
-                    (&unpack_bf16_1[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(kraw2[_pair]) & 0xffff0000u);
+                    (&unpack_bf16_3[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(kraw2[_pair]) << 16);
+                    (&unpack_bf16_3[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(kraw2[_pair]) & 0xffff0000u);
                 }
                 unsigned int qraw2[8];
                 unsigned int vraw2[8];
@@ -1036,11 +917,11 @@ kernel_cake_kda_train_f6a70fb0288a508f2828(const __grid_constant__ CUtensorMap d
                         : "=r"(*reinterpret_cast<uint32_t*>(&vraw2[q_13 * 4])), "=r"(*reinterpret_cast<uint32_t*>(&vraw2[(q_13 * 4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&vraw2[(q_13 * 4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&vraw2[(q_13 * 4) + 3]))
                         : "r"((v_k_addr + (unsigned int)((col0 + q_13 * 8) / 64 * 8192 + t_row * 128 + (col0 + q_13 * 8) % 64 * 2 ^ ((col0 + q_13 * 8) / 64 * 8192 + t_row * 128 + (col0 + q_13 * 8) % 64 * 2 >> 7 & 7) << 4))));
                 }
-                float unpack_bf16_1_0[16];
+                float unpack_bf16_1[16];
                 #pragma unroll
                 for (int _pair = 0; _pair < 8; _pair++) {
-                    (&unpack_bf16_1_0[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(qraw2[_pair]) << 16);
-                    (&unpack_bf16_1_0[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(qraw2[_pair]) & 0xffff0000u);
+                    (&unpack_bf16_1[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(qraw2[_pair]) << 16);
+                    (&unpack_bf16_1[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(qraw2[_pair]) & 0xffff0000u);
                 }
                 float unpack_bf16_2[16];
                 #pragma unroll
@@ -1063,8 +944,8 @@ kernel_cake_kda_train_f6a70fb0288a508f2828(const __grid_constant__ CUtensorMap d
                     e_g2[j_7] = _exp2_11;
                     float _exp2_12 = approx_exp2(gkv2[j_7 + 1]);
                     e_g2[j_7 + 1] = _exp2_12;
-                    kgf2[0] = unpack_bf16_1[j_7] * e_g2[j_7];
-                    kgf2[1] = unpack_bf16_1[j_7 + 1] * e_g2[j_7 + 1];
+                    kgf2[0] = unpack_bf16_3[j_7] * e_g2[j_7];
+                    kgf2[1] = unpack_bf16_3[j_7 + 1] * e_g2[j_7 + 1];
                     dvo0[j_7] = tmem_load_3[j_7] * beta_t;
                     dvo0[j_7 + 1] = tmem_load_3[j_7 + 1] * beta_t;
                     #pragma unroll
@@ -1072,7 +953,7 @@ kernel_cake_kda_train_f6a70fb0288a508f2828(const __grid_constant__ CUtensorMap d
                         float kgf = kgf2[jj_2];
                         db_acc0 = __fmaf_rn(tmem_load_3[j_7 + jj_2], unpack_bf16_2[j_7 + jj_2], db_acc0);
                         db_acc0 = __fmaf_rn(tmem_load_1_1[j_7 + jj_2], kgf, db_acc0);
-                        float dgj = __fmaf_rn(kgf * tmem_load_1_1[j_7 + jj_2], beta_t, __fmaf_rn(unpack_bf16_1_0[j_7 + jj_2], dqc0[j_7 + jj_2], -(unpack_bf16_1[j_7 + jj_2] * dk2[j_7 + jj_2])));
+                        float dgj = __fmaf_rn(kgf * tmem_load_1_1[j_7 + jj_2], beta_t, __fmaf_rn(unpack_bf16_1[j_7 + jj_2], dqc0[j_7 + jj_2], -(unpack_bf16_3[j_7 + jj_2] * dk2[j_7 + jj_2])));
                         if (t_row == 63) {
                             dgj = dgj + dgk_s[col0 + j_7 + jj_2];
                         }
@@ -1223,11 +1104,11 @@ kernel_cake_kda_train_f6a70fb0288a508f2828(const __grid_constant__ CUtensorMap d
                         : "=r"(*reinterpret_cast<uint32_t*>(&kraw2_0[q_16 * 4])), "=r"(*reinterpret_cast<uint32_t*>(&kraw2_0[(q_16 * 4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&kraw2_0[(q_16 * 4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&kraw2_0[(q_16 * 4) + 3]))
                         : "r"((k_s_addr + (unsigned int)((col1 + q_16 * 8) / 64 * 8192 + t_row * 128 + (col1 + q_16 * 8) % 64 * 2 ^ ((col1 + q_16 * 8) / 64 * 8192 + t_row * 128 + (col1 + q_16 * 8) % 64 * 2 >> 7 & 7) << 4))));
                 }
-                float unpack_bf16_3[16];
+                float unpack_bf16_4[16];
                 #pragma unroll
                 for (int _pair = 0; _pair < 8; _pair++) {
-                    (&unpack_bf16_3[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(kraw2_0[_pair]) << 16);
-                    (&unpack_bf16_3[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(kraw2_0[_pair]) & 0xffff0000u);
+                    (&unpack_bf16_4[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(kraw2_0[_pair]) << 16);
+                    (&unpack_bf16_4[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(kraw2_0[_pair]) & 0xffff0000u);
                 }
                 unsigned int qraw2_0[8];
                 unsigned int vraw2_0[8];
@@ -1240,11 +1121,11 @@ kernel_cake_kda_train_f6a70fb0288a508f2828(const __grid_constant__ CUtensorMap d
                         : "=r"(*reinterpret_cast<uint32_t*>(&vraw2_0[q_17 * 4])), "=r"(*reinterpret_cast<uint32_t*>(&vraw2_0[(q_17 * 4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&vraw2_0[(q_17 * 4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&vraw2_0[(q_17 * 4) + 3]))
                         : "r"((v_k_addr + (unsigned int)((col1 + q_17 * 8) / 64 * 8192 + t_row * 128 + (col1 + q_17 * 8) % 64 * 2 ^ ((col1 + q_17 * 8) / 64 * 8192 + t_row * 128 + (col1 + q_17 * 8) % 64 * 2 >> 7 & 7) << 4))));
                 }
-                float unpack_bf16_1_1[16];
+                float unpack_bf16_1_0[16];
                 #pragma unroll
                 for (int _pair = 0; _pair < 8; _pair++) {
-                    (&unpack_bf16_1_1[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(qraw2_0[_pair]) << 16);
-                    (&unpack_bf16_1_1[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(qraw2_0[_pair]) & 0xffff0000u);
+                    (&unpack_bf16_1_0[_pair * 2])[0] = __uint_as_float(static_cast<uint32_t>(qraw2_0[_pair]) << 16);
+                    (&unpack_bf16_1_0[_pair * 2])[1] = __uint_as_float(static_cast<uint32_t>(qraw2_0[_pair]) & 0xffff0000u);
                 }
                 float unpack_bf16_2_0[16];
                 #pragma unroll
@@ -1267,8 +1148,8 @@ kernel_cake_kda_train_f6a70fb0288a508f2828(const __grid_constant__ CUtensorMap d
                     e_g2_0[j_8] = _exp2_18;
                     float _exp2_19 = approx_exp2(gkv2_0[j_8 + 1]);
                     e_g2_0[j_8 + 1] = _exp2_19;
-                    kgf2_0[0] = unpack_bf16_3[j_8] * e_g2_0[j_8];
-                    kgf2_0[1] = unpack_bf16_3[j_8 + 1] * e_g2_0[j_8 + 1];
+                    kgf2_0[0] = unpack_bf16_4[j_8] * e_g2_0[j_8];
+                    kgf2_0[1] = unpack_bf16_4[j_8 + 1] * e_g2_0[j_8 + 1];
                     dvo1[j_8] = tmem_load_4[j_8] * beta_t;
                     dvo1[j_8 + 1] = tmem_load_4[j_8 + 1] * beta_t;
                     #pragma unroll
@@ -1276,7 +1157,7 @@ kernel_cake_kda_train_f6a70fb0288a508f2828(const __grid_constant__ CUtensorMap d
                         float kgf_1 = kgf2_0[jj_5];
                         db_acc1 = __fmaf_rn(tmem_load_4[j_8 + jj_5], unpack_bf16_2_0[j_8 + jj_5], db_acc1);
                         db_acc1 = __fmaf_rn(tmem_load_1_2[j_8 + jj_5], kgf_1, db_acc1);
-                        float dgj_1 = __fmaf_rn(kgf_1 * tmem_load_1_2[j_8 + jj_5], beta_t, __fmaf_rn(unpack_bf16_1_1[j_8 + jj_5], dqc1[j_8 + jj_5], -(unpack_bf16_3[j_8 + jj_5] * dk2_0[j_8 + jj_5])));
+                        float dgj_1 = __fmaf_rn(kgf_1 * tmem_load_1_2[j_8 + jj_5], beta_t, __fmaf_rn(unpack_bf16_1_0[j_8 + jj_5], dqc1[j_8 + jj_5], -(unpack_bf16_4[j_8 + jj_5] * dk2_0[j_8 + jj_5])));
                         if (t_row == 63) {
                             dgj_1 = dgj_1 + dgk_s[col1 + j_8 + jj_5];
                         }
@@ -1284,6 +1165,7 @@ kernel_cake_kda_train_f6a70fb0288a508f2828(const __grid_constant__ CUtensorMap d
                         dkf1[j_8 + jj_5] = __fmaf_rn(tmem_load_1_2[j_8 + jj_5] * e_g2_0[j_8 + jj_5], beta_t, dk2_0[j_8 + jj_5]);
                     }
                 }
+                asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                 asm volatile("tcgen05.fence::before_thread_sync;");
                 mbarrier_arrive(hd_empty_addr);
                 if (nxt_c < (unsigned int)num_items_c) {

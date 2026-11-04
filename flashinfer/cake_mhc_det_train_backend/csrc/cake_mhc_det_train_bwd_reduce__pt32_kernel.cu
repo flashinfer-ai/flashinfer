@@ -47,22 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define SMEM_SSTAGE_U_OFF 0
-#define SMEM_SSTAGE_U_STAGE_BYTES 2048
-#define SMEM_SSTAGE_U_STRIDE 2048
-#define SMEM_SSTAGE_F_OFF 0
-#define SMEM_SSTAGE_F_STAGE_BYTES 2048
-#define SMEM_SSTAGE_F_STRIDE 2048
-#define SMEM_SPARTS_OFF 2048
-#define SMEM_SPARTS_STAGE_BYTES 256
-#define SMEM_SPARTS_STRIDE 256
-#define SMEM_SCR_OFF 2304
-#define SMEM_SCR_STAGE_BYTES 16
-#define SMEM_SCR_STRIDE 16
-#define SMEM_TOTAL 2432
-#define THREADS 32
-
 #include <math_constants.h>
 
 
@@ -110,7 +94,7 @@ kernel_cake_mhc_det_train_bwd_reduce__pt32(float* __restrict__ dfn_part, float* 
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     unsigned int* sstage_u = reinterpret_cast<unsigned int*>(smem_raw + 0);
     const int sstage_u_addr = smem + 0;
     float* sstage_f = reinterpret_cast<float*>(smem_raw + 0);
@@ -277,13 +261,13 @@ kernel_cake_mhc_det_train_bwd_reduce__pt32(float* __restrict__ dfn_part, float* 
                 part = part + reinterpret_cast<double*>(wp_s_3)[0];
             }
             int _warp_redux_7;
-            asm volatile("redux.sync.max.s32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_7) : "r"(emax));
+            asm volatile("redux.sync.max.s32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_7) : "r"(emax));
             emax = _warp_redux_7;
             int _warp_redux_8;
-            asm volatile("redux.sync.max.s32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_8) : "r"(negl));
+            asm volatile("redux.sync.max.s32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_8) : "r"(negl));
             negl = _warp_redux_8;
             int _warp_redux_9;
-            asm volatile("redux.sync.max.s32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_9) : "r"(bad));
+            asm volatile("redux.sync.max.s32 %0, %1, 0xFFFFFFFF;" : "=r"(_warp_redux_9) : "r"(bad));
             bad = _warp_redux_9;
             if (lane_1 == 0) {
                 scr[wrp * 4] = emax;

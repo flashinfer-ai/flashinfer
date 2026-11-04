@@ -28,6 +28,8 @@ PACKAGES: dict[str, str] = {
     "cake_dsa_indexer_det": "flashinfer.experimental.cake_dsa_indexer_det",
     "cake_dsa_indexer": "flashinfer.experimental.cake_dsa_indexer",
     "cake_lm_head_det_loss": "flashinfer.experimental.cake_lm_head_det_loss",
+    # the non-deterministic package (deterministic=False); its key carries the namespace
+    "cake.cake_lm_head_loss": "flashinfer.experimental.cake.cake_lm_head_loss",
     "dense_projection_det_gemm": "flashinfer.experimental.dense_projection_det_gemm",
     "dense_projection_gemm": "flashinfer.experimental.dense_projection_gemm",
     "cake_moe_grouped_det_gemm": "flashinfer.experimental.cake_moe_grouped_det_gemm",
@@ -52,6 +54,7 @@ PACKAGES: dict[str, str] = {
     "cake_nvfp4_svdquant_gemm": "flashinfer.cake_nvfp4_svdquant_gemm_backend",
     "cake_fused_qk_rope_fp8_append": "flashinfer.cake_fused_qk_rope_fp8_append_backend",
     "nvfp4_attention": "flashinfer.experimental.nvfp4_attention",
+    "cake_nvfp4_ptilemax_attention": "flashinfer.experimental.cake_nvfp4_ptilemax_attention",
     "cake_vsa_sm90": "flashinfer.cake_vsa_sm90_backend",
     "cake_gdp": "flashinfer.cake_gdp_backend",
     "deepgemm_fp8_gemm": "flashinfer.experimental.deepgemm_fp8_gemm",

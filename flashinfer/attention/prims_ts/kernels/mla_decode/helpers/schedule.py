@@ -151,9 +151,16 @@ def staged_kv_load(
     smem_page_offsets=None,
     cached_page_ids=None,
     whole_kv=False,
+    pre_acquire_label=None,
 ):
-    """Issue all K/V producer stages for one logical K or V tile."""
+    """Issue all K/V producer stages for one logical K or V tile.
+
+    ``pre_acquire_label`` names optional auxiliary producer work that runs
+    after the page offsets are consumed but before the first KV acquire.
+    """
     cached_page_ids = page_offsets_consume(smem_page_offsets, cached_page_ids)
+    if pre_acquire_label is not None:
+        getattr(smem_kv, pre_acquire_label)(cached_page_ids=cached_page_ids)
     for stage_idx in range(1 if whole_kv else head_dim_stages):
         smem_kv.acquire()
         getattr(smem_kv, producer_label)(

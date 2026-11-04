@@ -12964,7 +12964,7 @@
           "architectures": [
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_d48ff4b056112bb361ba_76070ae09d3b.cu"
+          "path": "cuda/cake_gdn_d48ff4b056112bb361ba_f68eb7571366.cu"
         }
       ],
       "specializations": {
@@ -13003,7 +13003,7 @@
           "architectures": [
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_d48ff4b056112bb361ba_76070ae09d3b.cu"
+          "path": "cuda/cake_gdn_d48ff4b056112bb361ba_f68eb7571366.cu"
         }
       ],
       "specializations": {
@@ -13042,7 +13042,7 @@
           "architectures": [
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_d48ff4b056112bb361ba_76070ae09d3b.cu"
+          "path": "cuda/cake_gdn_d48ff4b056112bb361ba_f68eb7571366.cu"
         }
       ],
       "specializations": {
@@ -13081,7 +13081,7 @@
           "architectures": [
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_d48ff4b056112bb361ba_76070ae09d3b.cu"
+          "path": "cuda/cake_gdn_d48ff4b056112bb361ba_f68eb7571366.cu"
         }
       ],
       "specializations": {
@@ -13120,7 +13120,7 @@
           "architectures": [
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_d48ff4b056112bb361ba_76070ae09d3b.cu"
+          "path": "cuda/cake_gdn_d48ff4b056112bb361ba_f68eb7571366.cu"
         }
       ],
       "specializations": {
@@ -13159,7 +13159,7 @@
           "architectures": [
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_d48ff4b056112bb361ba_76070ae09d3b.cu"
+          "path": "cuda/cake_gdn_d48ff4b056112bb361ba_f68eb7571366.cu"
         }
       ],
       "specializations": {
@@ -13198,7 +13198,7 @@
           "architectures": [
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_d48ff4b056112bb361ba_76070ae09d3b.cu"
+          "path": "cuda/cake_gdn_d48ff4b056112bb361ba_f68eb7571366.cu"
         }
       ],
       "specializations": {
@@ -13237,7 +13237,7 @@
           "architectures": [
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_bb43956e2bec6dae2d72_54a98265da81.cu"
+          "path": "cuda/cake_gdn_bb43956e2bec6dae2d72_1906012ca80e.cu"
         }
       ],
       "specializations": {
@@ -13276,7 +13276,7 @@
           "architectures": [
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_bb43956e2bec6dae2d72_54a98265da81.cu"
+          "path": "cuda/cake_gdn_bb43956e2bec6dae2d72_1906012ca80e.cu"
         }
       ],
       "specializations": {
@@ -13315,7 +13315,7 @@
           "architectures": [
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_bb43956e2bec6dae2d72_54a98265da81.cu"
+          "path": "cuda/cake_gdn_bb43956e2bec6dae2d72_1906012ca80e.cu"
         }
       ],
       "specializations": {
@@ -13354,7 +13354,7 @@
           "architectures": [
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_bb43956e2bec6dae2d72_54a98265da81.cu"
+          "path": "cuda/cake_gdn_bb43956e2bec6dae2d72_1906012ca80e.cu"
         }
       ],
       "specializations": {
@@ -13393,7 +13393,7 @@
           "architectures": [
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_bb43956e2bec6dae2d72_54a98265da81.cu"
+          "path": "cuda/cake_gdn_bb43956e2bec6dae2d72_1906012ca80e.cu"
         }
       ],
       "specializations": {
@@ -13432,7 +13432,7 @@
           "architectures": [
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_bb43956e2bec6dae2d72_54a98265da81.cu"
+          "path": "cuda/cake_gdn_bb43956e2bec6dae2d72_1906012ca80e.cu"
         }
       ],
       "specializations": {
@@ -13471,7 +13471,7 @@
           "architectures": [
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_bb43956e2bec6dae2d72_54a98265da81.cu"
+          "path": "cuda/cake_gdn_bb43956e2bec6dae2d72_1906012ca80e.cu"
         }
       ],
       "specializations": {
@@ -13510,7 +13510,7 @@
           "architectures": [
             "sm_107a"
           ],
-          "path": "cuda/cake_gdn_bb43956e2bec6dae2d72_54a98265da81.cu"
+          "path": "cuda/cake_gdn_bb43956e2bec6dae2d72_1906012ca80e.cu"
         }
       ],
       "specializations": {
@@ -13677,6 +13677,597 @@
         "USE_INITIAL_STATE": 0,
         "USE_STATE_INDICES": 0
       }
+    },
+    {
+      "host_binding": {
+        "cuda_symbol": "kernel_gdn_decode_pretranspose_splitv8_tilev32_ord_outlate_ld_grp",
+        "module_ident": "gdn_decode_pretranspose_splitv8_tilev32_ord_outlate_ld_grp_04793e6008",
+        "params": {
+          "CTAS_PER_BATCH_ROW": 128,
+          "DYNAMIC_SMEM_BYTES": 17280
+        },
+        "shim_namespace": "dbbaa1b07334e3c5",
+        "template": "host/templates/decode_fp32_indexed.cc.in"
+      },
+      "name": "decode_gdn_decode_pretranspose_splitv8_tilev32_ord_outlate_ld_grp_ec0b1c1735c5",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_decode_pretranspose_splitv8_tilev32_ord_outlate_ld_grp_f7781ad990a9.cu"
+        }
+      ],
+      "specializations": {
+        "H": 16,
+        "HV": 32,
+        "SCALE": 0.08838834764831845
+      }
+    },
+    {
+      "host_binding": {
+        "cuda_symbol": "kernel_gdn_decode_pretranspose_splitv8_tilev32_ord_outlate_ld_grp",
+        "module_ident": "gdn_decode_pretranspose_splitv8_tilev32_ord_outlate_ld_grp_ca3dfda0a0",
+        "params": {
+          "CTAS_PER_BATCH_ROW": 128,
+          "DYNAMIC_SMEM_BYTES": 17280
+        },
+        "shim_namespace": "799f222d6e62048d",
+        "template": "host/templates/decode_fp32_indexed.cc.in"
+      },
+      "name": "decode_gdn_decode_pretranspose_splitv8_tilev32_ord_outlate_ld_grp_501ee6e7263b",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_decode_pretranspose_splitv8_tilev32_ord_outlate_ld_grp_f7781ad990a9.cu"
+        }
+      ],
+      "specializations": {
+        "H": 16,
+        "HV": 32,
+        "SCALE": 1.0
+      }
+    },
+    {
+      "host_binding": {
+        "cuda_symbol": "kernel_gdn_decode_nontranspose_fp32_t1_mid4_rc_kq128",
+        "module_ident": "gdn_decode_nontranspose_fp32_t1_mid4_rc_kq128_69271e2282",
+        "params": {
+          "BLOCK_THREADS": 256,
+          "CTAS_PER_BATCH_ROW": 32,
+          "DYNAMIC_SMEM_BYTES": 19840,
+          "H": 4,
+          "HV": 8,
+          "HV_MINUS_1": 7
+        },
+        "shim_namespace": "540be5d136aa3f9b",
+        "template": "host/templates/decode_fp32_t1_small.cc.in"
+      },
+      "name": "decode_gdn_decode_nontranspose_fp32_t1_mid4_rc_kq128_072d234b385b",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_decode_nontranspose_fp32_t1_mid4_rc_kq128_d48819df1dd2.cu"
+        }
+      ],
+      "specializations": {
+        "H": 4,
+        "HV": 8,
+        "SCALE": 0.08838834764831845
+      }
+    },
+    {
+      "host_binding": {
+        "cuda_symbol": "kernel_gdn_decode_nontranspose_fp32_t1_mid4_rc_kq128",
+        "module_ident": "gdn_decode_nontranspose_fp32_t1_mid4_rc_kq128_3b02ca856b",
+        "params": {
+          "BLOCK_THREADS": 256,
+          "CTAS_PER_BATCH_ROW": 128,
+          "DYNAMIC_SMEM_BYTES": 19840,
+          "H": 16,
+          "HV": 32,
+          "HV_MINUS_1": 31
+        },
+        "shim_namespace": "cbc5091d40a25816",
+        "template": "host/templates/decode_fp32_t1_small.cc.in"
+      },
+      "name": "decode_gdn_decode_nontranspose_fp32_t1_mid4_rc_kq128_ef7b34f51a51",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_decode_nontranspose_fp32_t1_mid4_rc_kq128_d48819df1dd2.cu"
+        }
+      ],
+      "specializations": {
+        "H": 16,
+        "HV": 32,
+        "SCALE": 1.0
+      }
+    },
+    {
+      "host_binding": {
+        "cuda_symbol": "kernel_gdn_decode_nontranspose_fp32_t1_mid4_rc_kq128",
+        "module_ident": "gdn_decode_nontranspose_fp32_t1_mid4_rc_kq128_1e83b42538",
+        "params": {
+          "BLOCK_THREADS": 256,
+          "CTAS_PER_BATCH_ROW": 128,
+          "DYNAMIC_SMEM_BYTES": 19840,
+          "H": 16,
+          "HV": 32,
+          "HV_MINUS_1": 31
+        },
+        "shim_namespace": "4bdb7a7e2d28cb0e",
+        "template": "host/templates/decode_fp32_t1_small.cc.in"
+      },
+      "name": "decode_gdn_decode_nontranspose_fp32_t1_mid4_rc_kq128_e10f8cd5a0a7",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_decode_nontranspose_fp32_t1_mid4_rc_kq128_d48819df1dd2.cu"
+        }
+      ],
+      "specializations": {
+        "H": 16,
+        "HV": 32,
+        "SCALE": 0.08838834764831845
+      }
+    },
+    {
+      "host_binding": {
+        "cuda_symbol": "kernel_gdn_decode_pretranspose_mtp_t2_inline_tile8_bb_tok_loads_hoist",
+        "module_ident": "gdn_decode_pretranspose_mtp_t2_inline_tile8_bb_tok_loads_hoist_163c6a762e",
+        "params": {},
+        "shim_namespace": "1a765c6c3fa70791",
+        "template": "host/templates/decode_fp32_mtp.cc.in"
+      },
+      "name": "decode_gdn_decode_pretranspose_mtp_t2_inline_tile8_bb_tok_loads_hoist_9e1355f6bee7",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_decode_pretranspose_mtp_t2_inline_tile8_bb_tok_loads_hoist_2a7a7dc62f6e.cu"
+        }
+      ],
+      "specializations": {
+        "H": 16,
+        "HV": 32,
+        "INTERMEDIATE_BATCH_STRIDE": 1048576,
+        "INTERMEDIATE_TOKEN_STRIDE": 524288,
+        "SCALE": 0.08838834764831845,
+        "STRIDED_INPUTS": 1
+      }
+    },
+    {
+      "host_binding": {
+        "cuda_symbol": "kernel_gdn_decode_pretranspose_t4_bf16state_tile16_vpre_es_pro_hqx",
+        "module_ident": "gdn_decode_pretranspose_t4_bf16state_tile16_vpre_es_pro_hqx_b4a971fa3a",
+        "params": {},
+        "shim_namespace": "0628209a33cfd470",
+        "template": "host/templates/decode_bf16_mtp_cached_args_statevqkab.cc.in"
+      },
+      "name": "decode_gdn_decode_pretranspose_t4_bf16state_tile16_vpre_es_pro_hqx_8a6f1e8b53fb",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_decode_pretranspose_t4_bf16state_tile16_vpre_es_pro_hqx_6419ef2338b0.cu"
+        }
+      ],
+      "specializations": {
+        "H": 4,
+        "HV": 8,
+        "INTERMEDIATE_BATCH_STRIDE": 524288,
+        "INTERMEDIATE_TOKEN_STRIDE": 131072,
+        "SCALE": 0.08838834764831845,
+        "STRIDED_INPUTS": 1
+      }
+    },
+    {
+      "host_binding": {
+        "cuda_symbol": "kernel_gdn_decode_pretranspose_t4_bf16state_tile16_vpre_es_pro_hqx_t7",
+        "module_ident": "gdn_decode_pretranspose_t4_bf16state_tile16_vpre_es_pro_hqx_ac4f579102",
+        "params": {
+          "T": 7,
+          "T_MINUS_1": 6
+        },
+        "shim_namespace": "283de70c02ed2e23",
+        "template": "host/templates/decode_bf16_mtp_cached_gen2_args_statevqkab.cc.in"
+      },
+      "name": "decode_gdn_decode_pretranspose_t4_bf16state_tile16_vpre_es_pro_hqx_780a2002bf5b",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_decode_pretranspose_t4_bf16state_tile16_vpre_es_pro_hqx_t7_bbb43350370c.cu"
+        }
+      ],
+      "specializations": {
+        "H": 8,
+        "HV": 16,
+        "INTERMEDIATE_BATCH_STRIDE": 1835008,
+        "INTERMEDIATE_TOKEN_STRIDE": 262144,
+        "SCALE": 0.08838834764831845,
+        "STRIDED_INPUTS": 1,
+        "T_STEPS": 7
+      }
+    },
+    {
+      "host_binding": {
+        "cuda_symbol": "kernel_gdn_decode_pretranspose_t4_bf16state_tile16_vpre_es_pro_hqx_t8",
+        "module_ident": "gdn_decode_pretranspose_t4_bf16state_tile16_vpre_es_pro_hqx_c802d4e396",
+        "params": {
+          "T": 8,
+          "T_MINUS_1": 7
+        },
+        "shim_namespace": "57396bf8965ace16",
+        "template": "host/templates/decode_bf16_mtp_cached_gen2_args_statevqkab.cc.in"
+      },
+      "name": "decode_gdn_decode_pretranspose_t4_bf16state_tile16_vpre_es_pro_hqx_3105b33c7219",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_decode_pretranspose_t4_bf16state_tile16_vpre_es_pro_hqx_t8_0c32e5d98d48.cu"
+        }
+      ],
+      "specializations": {
+        "H": 8,
+        "HV": 16,
+        "INTERMEDIATE_BATCH_STRIDE": 2097152,
+        "INTERMEDIATE_TOKEN_STRIDE": 262144,
+        "SCALE": 0.08838834764831845,
+        "STRIDED_INPUTS": 1,
+        "T_STEPS": 8
+      }
+    },
+    {
+      "host_binding": {
+        "cuda_symbol": "kernel_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre_xchg_pro_w64",
+        "module_ident": "gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre_xchg_pro_w64_145ef59b34",
+        "params": {
+          "CTAS_PER_BATCH_ROW": 128,
+          "DYNAMIC_SMEM_BYTES": 16512,
+          "H": 16,
+          "HV": 64,
+          "HV_MINUS_1": 63,
+          "STATE_SLOT_STRIDE": 1048576,
+          "T": 2,
+          "T_MINUS_1": 1
+        },
+        "shim_namespace": "9179b7222de1ca89",
+        "template": "host/templates/decode_bf16_mtp.cc.in"
+      },
+      "name": "decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre_xchg_pro_w64_8760c210222f",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre_xchg_pro_w64_6047de934e31.cu"
+        }
+      ],
+      "specializations": {
+        "CACHE_INTERMEDIATE_STATES": 0,
+        "H": 16,
+        "HV": 64,
+        "INTERMEDIATE_BATCH_STRIDE": 16384,
+        "INTERMEDIATE_TOKEN_STRIDE": 16384,
+        "SCALE": 0.08838834764831845,
+        "STRIDED_INPUTS": 1,
+        "TILE_V_WIDE": 64,
+        "T_STEPS": 2,
+        "UPDATE_STATE": 1
+      }
+    },
+    {
+      "host_binding": {
+        "cuda_symbol": "kernel_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre_xchg_pro_w32_t4",
+        "module_ident": "gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre_xchg_pro_w32_b1fa04ae1f",
+        "params": {
+          "CTAS_PER_BATCH_ROW": 128,
+          "DYNAMIC_SMEM_BYTES": 16512,
+          "H": 16,
+          "HV": 32,
+          "HV_MINUS_1": 31,
+          "INTERMEDIATE_TOKENS": 4,
+          "STATE_SLOT_STRIDE": 524288,
+          "T": 4,
+          "T_MINUS_1": 3
+        },
+        "shim_namespace": "fe4d76e52e94f1ec",
+        "template": "host/templates/decode_bf16_mtp_cached_args_stateqkabv.cc.in"
+      },
+      "name": "decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre_xchg_pro_w32_8046c0057268",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre_xchg_pro_w32_t4_a0cd23894f6f.cu"
+        }
+      ],
+      "specializations": {
+        "CACHE_INTERMEDIATE_STATES": 1,
+        "H": 16,
+        "HV": 32,
+        "INTERMEDIATE_BATCH_STRIDE": 2097152,
+        "INTERMEDIATE_TOKEN_STRIDE": 524288,
+        "SCALE": 0.08838834764831845,
+        "STRIDED_INPUTS": 1,
+        "TILE_V_WIDE": 32,
+        "T_STEPS": 4,
+        "UPDATE_STATE": 0
+      }
+    },
+    {
+      "host_binding": {
+        "cuda_symbol": "kernel_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre_xchg_pro_w32_t7",
+        "module_ident": "gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre_xchg_pro_w32_d0f496ec78",
+        "params": {
+          "CTAS_PER_BATCH_ROW": 128,
+          "DYNAMIC_SMEM_BYTES": 16512,
+          "H": 16,
+          "HV": 32,
+          "HV_MINUS_1": 31,
+          "STATE_SLOT_STRIDE": 524288,
+          "T": 7,
+          "T_MINUS_1": 6
+        },
+        "shim_namespace": "2fdb6e5e03dc00d8",
+        "template": "host/templates/decode_bf16_mtp_cached_gen2_args_stateqkabv.cc.in"
+      },
+      "name": "decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre_xchg_pro_w32_ab605ce25c48",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre_xchg_pro_w32_t7_429be9779318.cu"
+        }
+      ],
+      "specializations": {
+        "CACHE_INTERMEDIATE_STATES": 1,
+        "H": 16,
+        "HV": 32,
+        "INTERMEDIATE_BATCH_STRIDE": 3670016,
+        "INTERMEDIATE_TOKEN_STRIDE": 524288,
+        "SCALE": 0.08838834764831845,
+        "STRIDED_INPUTS": 1,
+        "TILE_V_WIDE": 32,
+        "T_STEPS": 7,
+        "UPDATE_STATE": 0
+      }
+    },
+    {
+      "host_binding": {
+        "cuda_symbol": "kernel_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre_xchg_pro_w32_t7",
+        "module_ident": "gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre_xchg_pro_w32_70a9da5869",
+        "params": {
+          "CTAS_PER_BATCH_ROW": 64,
+          "DYNAMIC_SMEM_BYTES": 16512,
+          "H": 8,
+          "HV": 16,
+          "HV_MINUS_1": 15,
+          "STATE_SLOT_STRIDE": 262144,
+          "T": 7,
+          "T_MINUS_1": 6
+        },
+        "shim_namespace": "d87bd04ffb84bc87",
+        "template": "host/templates/decode_bf16_mtp_cached_gen2_args_stateqkabv.cc.in"
+      },
+      "name": "decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre_xchg_pro_w32_ea7a3d0d68fd",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre_xchg_pro_w32_t7_429be9779318.cu"
+        }
+      ],
+      "specializations": {
+        "CACHE_INTERMEDIATE_STATES": 1,
+        "H": 8,
+        "HV": 16,
+        "INTERMEDIATE_BATCH_STRIDE": 1835008,
+        "INTERMEDIATE_TOKEN_STRIDE": 262144,
+        "SCALE": 0.08838834764831845,
+        "STRIDED_INPUTS": 1,
+        "TILE_V_WIDE": 32,
+        "T_STEPS": 7,
+        "UPDATE_STATE": 0
+      }
+    },
+    {
+      "host_binding": {
+        "cuda_symbol": "kernel_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre_xchg_pro_qpre_t3",
+        "module_ident": "gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre_xchg_pro_qpre_3bfec02cdf",
+        "params": {
+          "CTAS_PER_BATCH_ROW": 128,
+          "DYNAMIC_SMEM_BYTES": 24704,
+          "H": 16,
+          "HV": 64,
+          "HV_MINUS_1": 63,
+          "INTERMEDIATE_TOKENS": 3,
+          "STATE_SLOT_STRIDE": 1048576,
+          "T": 3,
+          "T_MINUS_1": 2
+        },
+        "shim_namespace": "968b9849e1787362",
+        "template": "host/templates/decode_bf16_mtp_cached_args_stateqkabv.cc.in"
+      },
+      "name": "decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre_xchg_pro_qpre_67265210ea1b",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre_xchg_pro_qpre_t3_97aff99a59cf.cu"
+        }
+      ],
+      "specializations": {
+        "CACHE_INTERMEDIATE_STATES": 1,
+        "H": 16,
+        "HV": 64,
+        "INTERMEDIATE_BATCH_STRIDE": 3145728,
+        "INTERMEDIATE_TOKEN_STRIDE": 1048576,
+        "SCALE": 0.08838834764831845,
+        "STRIDED_INPUTS": 1,
+        "TILE_V_WIDE": 64,
+        "T_STEPS": 3,
+        "UPDATE_STATE": 0
+      }
+    },
+    {
+      "host_binding": {
+        "cuda_symbol": "kernel_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre_xchg_pro_qpre_t4",
+        "module_ident": "gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre_xchg_pro_qpre_c6ef72005f",
+        "params": {
+          "CTAS_PER_BATCH_ROW": 128,
+          "DYNAMIC_SMEM_BYTES": 24704,
+          "H": 16,
+          "HV": 64,
+          "HV_MINUS_1": 63,
+          "INTERMEDIATE_TOKENS": 4,
+          "STATE_SLOT_STRIDE": 1048576,
+          "T": 4,
+          "T_MINUS_1": 3
+        },
+        "shim_namespace": "13936112bf61ab23",
+        "template": "host/templates/decode_bf16_mtp_cached_args_stateqkabv.cc.in"
+      },
+      "name": "decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre_xchg_pro_qpre_0d8bf08a4320",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre_xchg_pro_qpre_t4_8f5785caad43.cu"
+        }
+      ],
+      "specializations": {
+        "CACHE_INTERMEDIATE_STATES": 1,
+        "H": 16,
+        "HV": 64,
+        "INTERMEDIATE_BATCH_STRIDE": 4194304,
+        "INTERMEDIATE_TOKEN_STRIDE": 1048576,
+        "SCALE": 0.08838834764831845,
+        "STRIDED_INPUTS": 1,
+        "TILE_V_WIDE": 64,
+        "T_STEPS": 4,
+        "UPDATE_STATE": 0
+      }
+    },
+    {
+      "host_binding": {
+        "cuda_symbol": "kernel_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre_xchg_pro_qpre_t4",
+        "module_ident": "gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre_xchg_pro_qpre_4ce9bd7a19",
+        "params": {
+          "CTAS_PER_BATCH_ROW": 128,
+          "DYNAMIC_SMEM_BYTES": 24704,
+          "H": 16,
+          "HV": 64,
+          "HV_MINUS_1": 63,
+          "INTERMEDIATE_TOKENS": 5,
+          "STATE_SLOT_STRIDE": 1048576,
+          "T": 4,
+          "T_MINUS_1": 3
+        },
+        "shim_namespace": "0f7ea9f5b3759d71",
+        "template": "host/templates/decode_bf16_mtp_cached_args_stateqkabv.cc.in"
+      },
+      "name": "decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre_xchg_pro_qpre_40934e896c8a",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_vpre_xchg_pro_qpre_t4_8f5785caad43.cu"
+        }
+      ],
+      "specializations": {
+        "CACHE_INTERMEDIATE_STATES": 1,
+        "H": 16,
+        "HV": 64,
+        "INTERMEDIATE_BATCH_STRIDE": 5242880,
+        "INTERMEDIATE_TOKEN_STRIDE": 1048576,
+        "SCALE": 0.08838834764831845,
+        "STRIDED_INPUTS": 1,
+        "TILE_V_WIDE": 64,
+        "T_STEPS": 4,
+        "UPDATE_STATE": 0
+      }
+    },
+    {
+      "host_binding": {
+        "cuda_symbol": "kernel_gdn_decode_nontranspose_fp32_t1_hqsplit_tma3",
+        "module_ident": "gdn_decode_nontranspose_fp32_t1_hqsplit_tma3_1e00a2fb6b",
+        "params": {
+          "CTAS_PER_BATCH_ROW": 32,
+          "DYNAMIC_SMEM_BYTES": 51328,
+          "H": 16,
+          "HV": 32,
+          "HV_MINUS_1": 31
+        },
+        "shim_namespace": "8eb8c2ae7952e520",
+        "template": "host/templates/decode_fp32_t1_tma_state.cc.in"
+      },
+      "name": "decode_gdn_decode_nontranspose_fp32_t1_hqsplit_tma3_1cb5777c16ae",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_decode_nontranspose_fp32_t1_hqsplit_tma3_262a56fae786.cu"
+        }
+      ],
+      "specializations": {
+        "H": 16,
+        "HV": 32,
+        "SCALE": 0.08838834764831845
+      },
+      "tma_abi": "grid_constant"
+    },
+    {
+      "host_binding": {
+        "cuda_symbol": "kernel_gdn_decode_nontranspose_fp32_t1_hqsplit_tma3",
+        "module_ident": "gdn_decode_nontranspose_fp32_t1_hqsplit_tma3_9130432fee",
+        "params": {
+          "CTAS_PER_BATCH_ROW": 32,
+          "DYNAMIC_SMEM_BYTES": 51328,
+          "H": 16,
+          "HV": 32,
+          "HV_MINUS_1": 31
+        },
+        "shim_namespace": "e4e5506d7761d628",
+        "template": "host/templates/decode_fp32_t1_tma_state.cc.in"
+      },
+      "name": "decode_gdn_decode_nontranspose_fp32_t1_hqsplit_tma3_45d75d2d4a46",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_107a"
+          ],
+          "path": "cuda/cake_gdn_decode_nontranspose_fp32_t1_hqsplit_tma3_262a56fae786.cu"
+        }
+      ],
+      "specializations": {
+        "H": 16,
+        "HV": 32,
+        "SCALE": 1.0
+      },
+      "tma_abi": "grid_constant"
     }
   ]
 }

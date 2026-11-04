@@ -47,63 +47,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
     return result;
 }
 
-#define CAKE_INF CUDART_INF_F
-#define TMEM_NCOLS 192
-#define TMEM_ACC_DH_OFFSET 0
-#define TMEM_ACC_DV_OFFSET 64
-#define TMEM_ACC_P_OFFSET 128
-#define NUM_KG_PIPE_STAGES 1
-#define NUM_QG_PIPE_STAGES 1
-#define NUM_AD_PIPE_STAGES 2
-#define NUM_W_PIPE_STAGES 1
-#define NUM_ONE_STAGES 1
-#define SMEM_KG_PANEL_OFF 1024
-#define SMEM_KG_PANEL_STAGE_BYTES 8192
-#define SMEM_KG_PANEL_STRIDE 8192
-#define SMEM_QG_PANEL_OFF 17408
-#define SMEM_QG_PANEL_STAGE_BYTES 8192
-#define SMEM_QG_PANEL_STRIDE 8192
-#define SMEM_W_PANEL_OFF 33792
-#define SMEM_W_PANEL_STAGE_BYTES 8192
-#define SMEM_W_PANEL_STRIDE 8192
-#define SMEM_AQK_PANEL_OFF 50176
-#define SMEM_AQK_PANEL_STAGE_BYTES 8192
-#define SMEM_AQK_PANEL_STRIDE 16384
-#define SMEM_DO_PANEL_OFF 58368
-#define SMEM_DO_PANEL_STAGE_BYTES 8192
-#define SMEM_DO_PANEL_STRIDE 16384
-#define SMEM_KG_OP_OFF 1024
-#define SMEM_KG_OP_STAGE_BYTES 16384
-#define SMEM_KG_OP_STRIDE 16384
-#define SMEM_QG_MN_OFF 17408
-#define SMEM_QG_MN_STAGE_BYTES 16384
-#define SMEM_QG_MN_STRIDE 16384
-#define SMEM_W_MN_OFF 33792
-#define SMEM_W_MN_STAGE_BYTES 16384
-#define SMEM_W_MN_STRIDE 16384
-#define SMEM_W_KOP_OFF 33792
-#define SMEM_W_KOP_STAGE_BYTES 16384
-#define SMEM_W_KOP_STRIDE 16384
-#define SMEM_AQK_MN_OFF 50176
-#define SMEM_AQK_MN_STAGE_BYTES 8192
-#define SMEM_AQK_MN_STRIDE 16384
-#define SMEM_DO_MN_OFF 58368
-#define SMEM_DO_MN_STAGE_BYTES 8192
-#define SMEM_DO_MN_STRIDE 16384
-#define SMEM_DHS_OFF 82944
-#define SMEM_DHS_STAGE_BYTES 16384
-#define SMEM_DHS_STRIDE 16384
-#define SMEM_DHS_MN_OFF 82944
-#define SMEM_DHS_MN_STAGE_BYTES 16384
-#define SMEM_DHS_MN_STRIDE 16384
-#define SMEM_BDV_OFF 99328
-#define SMEM_BDV_STAGE_BYTES 8192
-#define SMEM_BDV_STRIDE 8192
-#define SMEM_BDV_MN_OFF 99328
-#define SMEM_BDV_MN_STAGE_BYTES 8192
-#define SMEM_BDV_MN_STRIDE 8192
-#define SMEM_TOTAL 107520
-#define THREADS 192
 #define LAUNCH_MIN_BLOCKS 1
 
 #include <math_constants.h>
@@ -261,7 +204,7 @@ kernel_cake_kda_train_036e1c7e1dfc95a88aae(const __grid_constant__ CUtensorMap k
 
     const int cta_rank = 0;
 
-    // Kernel setup ops
+    // Prologue
     __nv_bfloat16* kg_panel = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
     const int kg_panel_addr = smem + 1024;
     __nv_bfloat16* qg_panel = reinterpret_cast<__nv_bfloat16*>(smem_raw + 17408);
@@ -293,8 +236,7 @@ kernel_cake_kda_train_036e1c7e1dfc95a88aae(const __grid_constant__ CUtensorMap k
     __nv_bfloat16* bdv_mn = reinterpret_cast<__nv_bfloat16*>(smem_raw + 99328);
     const int bdv_mn_addr = smem + 99328;
 
-    // Mbarrier init (12 pipeline groups, 0 ordered-sequence groups, 14 barriers)
-    // Mbarriers at smem_raw[0..112)
+    // Mbarrier init (14 barriers at smem_raw[0..112))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -348,12 +290,10 @@ kernel_cake_kda_train_036e1c7e1dfc95a88aae(const __grid_constant__ CUtensorMap k
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
-
-    // Kernel post-init ops
-    const int tmem_acc_dh = taddr;
-    const int tmem_acc_dv = taddr + 64;
-    const int tmem_acc_p = taddr + 128;
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_acc_dh = taddr;
+    const unsigned int tmem_acc_dv = taddr + 64;
+    const unsigned int tmem_acc_p = taddr + 128;
 
     // ---- Role: compute ----
     if (warp <= 3) {
@@ -896,15 +836,15 @@ kernel_cake_kda_train_036e1c7e1dfc95a88aae(const __grid_constant__ CUtensorMap k
                     for (int q_6 = 0; q_6 < 2; q_6++) {
                         asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((dhs_addr + (unsigned int)(q_6 * 8 / 64 * 16384 + k_row * 128 + q_6 * 8 % 64 * 2 ^ (q_6 * 8 / 64 * 16384 + k_row * 128 + q_6 * 8 % 64 * 2 >> 7 & 7) << 4))), "r"(upd_bf16_3[q_6 * 4]), "r"(upd_bf16_3[q_6 * 4 + 1]), "r"(upd_bf16_3[q_6 * 4 + 2]), "r"(upd_bf16_3[q_6 * 4 + 3]) : "memory");
                     }
-                    float _tmem_load_4[16];
-                    tmem_ld_x16(&_tmem_load_4[0], taddr + (unsigned int)m128_row_base + 16);
+                    float _tmem_load_4_0[16];
+                    tmem_ld_x16(&_tmem_load_4_0[0], taddr + (unsigned int)m128_row_base + 16);
                     asm volatile("tcgen05.wait::ld.sync.aligned;");
-                    float _tmem_load_5[16];
-                    tmem_ld_x16(&_tmem_load_5[0], taddr + 128 + (unsigned int)m128_row_base + 16);
+                    float _tmem_load_5_0[16];
+                    tmem_ld_x16(&_tmem_load_5_0[0], taddr + 128 + (unsigned int)m128_row_base + 16);
                     asm volatile("tcgen05.wait::ld.sync.aligned;");
                     #pragma unroll
-                    for (int j_7 = 0; j_7 < 16; j_7++) {
-                        upd[16 + j_7] = __fmaf_rn(_tmem_load_5[j_7], scale, _tmem_load_4[j_7]);
+                    for (int j_0 = 0; j_0 < 16; j_0++) {
+                        upd[16 + j_0] = __fmaf_rn(_tmem_load_5_0[j_0], scale, _tmem_load_4_0[j_0]);
                     }
                     unsigned int packed_2_1[8];
                     #pragma unroll
@@ -963,15 +903,15 @@ kernel_cake_kda_train_036e1c7e1dfc95a88aae(const __grid_constant__ CUtensorMap k
                     for (int q_7 = 0; q_7 < 2; q_7++) {
                         asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((dhs_addr + (unsigned int)((16 + q_7 * 8) / 64 * 16384 + k_row * 128 + (16 + q_7 * 8) % 64 * 2 ^ ((16 + q_7 * 8) / 64 * 16384 + k_row * 128 + (16 + q_7 * 8) % 64 * 2 >> 7 & 7) << 4))), "r"(upd_bf16_2_1[q_7 * 4]), "r"(upd_bf16_2_1[q_7 * 4 + 1]), "r"(upd_bf16_2_1[q_7 * 4 + 2]), "r"(upd_bf16_2_1[q_7 * 4 + 3]) : "memory");
                     }
-                    float _tmem_load_6[16];
-                    tmem_ld_x16(&_tmem_load_6[0], taddr + (unsigned int)m128_row_base + 32);
+                    float _tmem_load_4_1[16];
+                    tmem_ld_x16(&_tmem_load_4_1[0], taddr + (unsigned int)m128_row_base + 32);
                     asm volatile("tcgen05.wait::ld.sync.aligned;");
-                    float _tmem_load_7[16];
-                    tmem_ld_x16(&_tmem_load_7[0], taddr + 128 + (unsigned int)m128_row_base + 32);
+                    float _tmem_load_5_1[16];
+                    tmem_ld_x16(&_tmem_load_5_1[0], taddr + 128 + (unsigned int)m128_row_base + 32);
                     asm volatile("tcgen05.wait::ld.sync.aligned;");
                     #pragma unroll
-                    for (int j_8 = 0; j_8 < 16; j_8++) {
-                        upd[32 + j_8] = __fmaf_rn(_tmem_load_7[j_8], scale, _tmem_load_6[j_8]);
+                    for (int j_1_1 = 0; j_1_1 < 16; j_1_1++) {
+                        upd[32 + j_1_1] = __fmaf_rn(_tmem_load_5_1[j_1_1], scale, _tmem_load_4_1[j_1_1]);
                     }
                     unsigned int packed_3[8];
                     #pragma unroll
@@ -1030,15 +970,15 @@ kernel_cake_kda_train_036e1c7e1dfc95a88aae(const __grid_constant__ CUtensorMap k
                     for (int q_8 = 0; q_8 < 2; q_8++) {
                         asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"((dhs_addr + (unsigned int)((32 + q_8 * 8) / 64 * 16384 + k_row * 128 + (32 + q_8 * 8) % 64 * 2 ^ ((32 + q_8 * 8) / 64 * 16384 + k_row * 128 + (32 + q_8 * 8) % 64 * 2 >> 7 & 7) << 4))), "r"(upd_bf16_3_1[q_8 * 4]), "r"(upd_bf16_3_1[q_8 * 4 + 1]), "r"(upd_bf16_3_1[q_8 * 4 + 2]), "r"(upd_bf16_3_1[q_8 * 4 + 3]) : "memory");
                     }
-                    float _tmem_load_8[16];
-                    tmem_ld_x16(&_tmem_load_8[0], taddr + (unsigned int)m128_row_base + 48);
+                    float _tmem_load_4_2[16];
+                    tmem_ld_x16(&_tmem_load_4_2[0], taddr + (unsigned int)m128_row_base + 48);
                     asm volatile("tcgen05.wait::ld.sync.aligned;");
-                    float _tmem_load_9[16];
-                    tmem_ld_x16(&_tmem_load_9[0], taddr + 128 + (unsigned int)m128_row_base + 48);
+                    float _tmem_load_5_2[16];
+                    tmem_ld_x16(&_tmem_load_5_2[0], taddr + 128 + (unsigned int)m128_row_base + 48);
                     asm volatile("tcgen05.wait::ld.sync.aligned;");
                     #pragma unroll
-                    for (int j_9 = 0; j_9 < 16; j_9++) {
-                        upd[48 + j_9] = __fmaf_rn(_tmem_load_9[j_9], scale, _tmem_load_8[j_9]);
+                    for (int j_2_1 = 0; j_2_1 < 16; j_2_1++) {
+                        upd[48 + j_2_1] = __fmaf_rn(_tmem_load_5_2[j_2_1], scale, _tmem_load_4_2[j_2_1]);
                     }
                     unsigned int packed_4[8];
                     #pragma unroll
@@ -1102,26 +1042,26 @@ kernel_cake_kda_train_036e1c7e1dfc95a88aae(const __grid_constant__ CUtensorMap k
                     mbarrier_arrive(dhs_ready_addr);
                     float sc_1[16];
                     #pragma unroll
-                    for (int j_10 = 0; j_10 < 16; j_10++) {
-                        sc_1[j_10] = upd[j_10] * decay;
+                    for (int j_7 = 0; j_7 < 16; j_7++) {
+                        sc_1[j_7] = upd[j_7] * decay;
                     }
                     tmem_st_x16_f32(taddr + (unsigned int)m128_row_base, sc_1);
                     float sc_3_1[16];
                     #pragma unroll
-                    for (int j_11 = 0; j_11 < 16; j_11++) {
-                        sc_3_1[j_11] = upd[16 + j_11] * decay;
+                    for (int j_8 = 0; j_8 < 16; j_8++) {
+                        sc_3_1[j_8] = upd[16 + j_8] * decay;
                     }
                     tmem_st_x16_f32(taddr + (unsigned int)m128_row_base + 16, sc_3_1);
                     float sc_4_1[16];
                     #pragma unroll
-                    for (int j_12 = 0; j_12 < 16; j_12++) {
-                        sc_4_1[j_12] = upd[32 + j_12] * decay;
+                    for (int j_9 = 0; j_9 < 16; j_9++) {
+                        sc_4_1[j_9] = upd[32 + j_9] * decay;
                     }
                     tmem_st_x16_f32(taddr + (unsigned int)m128_row_base + 32, sc_4_1);
                     float sc_5_1[16];
                     #pragma unroll
-                    for (int j_13 = 0; j_13 < 16; j_13++) {
-                        sc_5_1[j_13] = upd[48 + j_13] * decay;
+                    for (int j_10 = 0; j_10 < 16; j_10++) {
+                        sc_5_1[j_10] = upd[48 + j_10] * decay;
                     }
                     tmem_st_x16_f32(taddr + (unsigned int)m128_row_base + 48, sc_5_1);
                 }

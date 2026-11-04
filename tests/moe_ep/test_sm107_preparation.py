@@ -236,7 +236,9 @@ def test_routing_check_reuses_kernel_across_row_counts(
             graph.reset()
 
 
-@pytest.mark.parametrize("kind", ["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8"])
+@pytest.mark.parametrize(
+    "kind", ["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4", "mxfp4_mxfp8"]
+)
 @pytest.mark.parametrize("prequantized", [False, True])
 @pytest.mark.parametrize("fused", ["0", "1"])
 @pytest.mark.parametrize("score_dtype", [torch.float16, torch.bfloat16, torch.float32])
@@ -381,7 +383,7 @@ def test_route_staging_rebinds_and_replays(
             graph.reset()
 
 
-@pytest.mark.parametrize("kind", ["mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8"])
+@pytest.mark.parametrize("kind", ["mxfp8_e4m3", "mxfp8_e5m2", "mxfp4", "mxfp4_mxfp8"])
 @pytest.mark.parametrize("hidden,topk", [(512, 6), (2880, 6), (7168, 6), (512, 129)])
 @pytest.mark.parametrize("id_dtype", [torch.int32, torch.int64])
 def test_mxfp8_fused_staging_matches_torch(monkeypatch, kind, hidden, topk, id_dtype):
@@ -395,7 +397,12 @@ def test_mxfp8_fused_staging_matches_torch(monkeypatch, kind, hidden, topk, id_d
 
     def buffers():
         return (
-            torch.empty(capacity, hidden, device="cuda", dtype=_data_dtype(kind)),
+            torch.empty(
+                capacity,
+                hidden // (2 if kind == "mxfp4" else 1),
+                device="cuda",
+                dtype=_data_dtype(kind),
+            ),
             torch.empty(
                 capacity,
                 (hidden // 32 + 3) // 4 * 4,
@@ -425,12 +432,17 @@ def test_mxfp8_fused_staging_matches_torch(monkeypatch, kind, hidden, topk, id_d
             )
         torch.cuda.synchronize()
         for index in (0, 1):
-            torch.testing.assert_close(
-                actual[index][:live].view(torch.uint8),
-                expected[index][:live].view(torch.uint8),
-                rtol=0,
-                atol=0,
-            )
+            a, b = actual[index][:live], expected[index][:live]
+            if kind == "mxfp4" and index == 0 and live:
+                from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe import (
+                    unpack_fp4_to_f32,
+                )
+
+                # FP4 has two zero encodings; both carry the same value.
+                a, b = unpack_fp4_to_f32(a), unpack_fp4_to_f32(b)
+            else:
+                a, b = a.view(torch.uint8), b.view(torch.uint8)
+            torch.testing.assert_close(a, b, rtol=0, atol=0)
         assert torch.equal(actual[2], expected[2])
         for out in (actual, expected):
             torch.testing.assert_close(
@@ -438,7 +450,7 @@ def test_mxfp8_fused_staging_matches_torch(monkeypatch, kind, hidden, topk, id_d
             )
 
 
-@pytest.mark.parametrize("kind", ["mxfp8_e4m3", "mxfp8_e5m2"])
+@pytest.mark.parametrize("kind", ["mxfp4", "mxfp8_e4m3", "mxfp8_e5m2"])
 def test_mxfp8_fused_staging_finite_bf16(monkeypatch, kind):
     from flashinfer.moe_ep.backends.mega.kernel.sm107.mxfp8_mxfp8_bf16_cutedsl.staging import (
         _data_dtype,
@@ -454,7 +466,12 @@ def test_mxfp8_fused_staging_finite_bf16(monkeypatch, kind):
     x = x.nan_to_num(nan=0, posinf=0, neginf=0).reshape(128, 512)
     ids = torch.arange(8, device="cuda", dtype=torch.int32).repeat(128, 1)
     scores = torch.full((128, 8), 0.125, device="cuda")
-    q = torch.empty_like(x, dtype=_data_dtype(kind))
+    q = torch.empty(
+        128,
+        512 // (2 if kind == "mxfp4" else 1),
+        device="cuda",
+        dtype=_data_dtype(kind),
+    )
     sf = torch.empty(128, 16, device="cuda", dtype=torch.float8_e8m0fnu)
     stage_mega_moe_inputs(
         x,
@@ -466,10 +483,21 @@ def test_mxfp8_fused_staging_finite_bf16(monkeypatch, kind):
         torch.empty_like(scores),
         kind=kind,
     )
-    expected_q, expected_sf = quantize_mxfp8_block32(x.float(), _data_dtype(kind))
-    torch.testing.assert_close(
-        q.view(torch.uint8), expected_q.view(torch.uint8), rtol=0, atol=0
-    )
+    if kind == "mxfp4":
+        from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe import (
+            quantize_mxfp4_block32,
+            unpack_fp4_to_f32,
+        )
+
+        expected_q, expected_sf = quantize_mxfp4_block32(x.float())
+        torch.testing.assert_close(
+            unpack_fp4_to_f32(q), unpack_fp4_to_f32(expected_q), rtol=0, atol=0
+        )
+    else:
+        expected_q, expected_sf = quantize_mxfp8_block32(x.float(), _data_dtype(kind))
+        torch.testing.assert_close(
+            q.view(torch.uint8), expected_q.view(torch.uint8), rtol=0, atol=0
+        )
     torch.testing.assert_close(
         sf.view(torch.uint8), expected_sf.view(torch.uint8), rtol=0, atol=0
     )
@@ -584,7 +612,9 @@ def test_shared_staging_keeps_default_score_policy(id_dtype):
     assert torch.isposinf(scores[:, 2]).all() and torch.isneginf(scores[:, 3]).all()
 
 
-@pytest.mark.parametrize("kind", ["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8"])
+@pytest.mark.parametrize(
+    "kind", ["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4", "mxfp4_mxfp8"]
+)
 @pytest.mark.parametrize("tail_fused", ["0", "1"])
 @pytest.mark.parametrize("capacity", [129, 4096])
 def test_quantized_staging_graph_masks_dirty_tail(
@@ -612,7 +642,12 @@ def test_quantized_staging_graph_masks_dirty_tail(
         _buffers(capacity, hidden, topk, torch.int32)
         if kind == "nvfp4"
         else (
-            torch.empty(capacity, hidden, device="cuda", dtype=_data_dtype(kind)),
+            torch.empty(
+                capacity,
+                hidden // (2 if kind == "mxfp4" else 1),
+                device="cuda",
+                dtype=_data_dtype(kind),
+            ),
             torch.empty(
                 capacity, hidden // 32, device="cuda", dtype=torch.float8_e8m0fnu
             ),

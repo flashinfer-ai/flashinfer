@@ -236,7 +236,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(512, LAUNCH_MIN_BLOCKS) __cluster_dims__(2,1,1) void
-kernel_cake_dsa_indexer_det_topk_7d1b556b2aedea7f5249(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap W, int* __restrict__ cu_seqlens_q, int* __restrict__ cu_seqlens_k, long long* __restrict__ q_offsets, int* __restrict__ Indices, float* __restrict__ Scores, long long* __restrict__ Cand, int num_segments, int top_k, int ratio, int has_offsets, int cand_cap, int first_cap, int sample_tiles_max, int sample_shift_permille, int far_sample, int check_period, int grid_ctas, float softmax_scale, int n_split)
+kernel_cake_dsa_indexer_det_topk_7d1b556b2aedea7f5249(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap W, int* __restrict__ cu_seqlens_q, int* __restrict__ cu_seqlens_k, long long* __restrict__ q_offsets, int* __restrict__ Indices, float* __restrict__ Scores, long long* __restrict__ Cand, int num_segments, int top_k, int ratio, int has_offsets, int cand_cap, int first_cap, int sample_tiles_max, int sample_shift_permille, int far_sample, int check_period, int grid_ctas, float softmax_scale, int n_split, unsigned int* __restrict__ TicketWord)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -260,6 +260,7 @@ kernel_cake_dsa_indexer_det_topk_7d1b556b2aedea7f5249(const __grid_constant__ CU
     #define umma_empty_addr (mbar_base + 96)
     #define verdict_bar_addr (mbar_base + 112)
     #define peer_bar_addr (mbar_base + 120)
+    #define verdict_ack_addr (mbar_base + 128)
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
@@ -291,8 +292,8 @@ kernel_cake_dsa_indexer_det_topk_7d1b556b2aedea7f5249(const __grid_constant__ CU
     if (warp == 12) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&K))) : "memory"); }
     if (warp == 12) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&W))) : "memory"); }
 
-    // Mbarrier init (8 pipeline groups, 0 ordered-sequence groups, 16 barriers)
-    // Mbarriers at smem_raw[0..128)
+    // Mbarrier init (9 pipeline groups, 0 ordered-sequence groups, 17 barriers)
+    // Mbarriers at smem_raw[0..136)
 
     if (warp == 13) {
         uint32_t leader = elect_sync();
@@ -326,6 +327,9 @@ kernel_cake_dsa_indexer_det_topk_7d1b556b2aedea7f5249(const __grid_constant__ CU
             // --- pipeline 'peer_pipe' ---
             // peer_bar: 1 barriers, init_count=1
             mbarrier_init(smem + 120, 1);
+            // --- pipeline 'verdict_pipe' ---
+            // verdict_ack: 1 barriers, init_count=2
+            mbarrier_init(smem + 128, 2);
             asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         }
     }
@@ -333,9 +337,9 @@ kernel_cake_dsa_indexer_det_topk_7d1b556b2aedea7f5249(const __grid_constant__ CU
     __syncwarp();
 
     // TMEM alloc (512 columns, 384 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 128);
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 136);
     if (warp == 14) {
-        int _tmem_hold = smem + 128;
+        int _tmem_hold = smem + 136;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(512) : "memory");
         __syncwarp();
     }
@@ -358,6 +362,7 @@ kernel_cake_dsa_indexer_det_topk_7d1b556b2aedea7f5249(const __grid_constant__ CU
         asm volatile("setmaxnreg.dec.sync.aligned.u32 56;");
         { // load_q_main
             unsigned int _phase_q_empty = 1;
+            unsigned int _phase_verdict_ack = 1;
             unsigned int _phase_verdict_bar = 0;
             if (elect_sync()) {
                 int unit_base_q = 0;
@@ -386,6 +391,10 @@ kernel_cake_dsa_indexer_det_topk_7d1b556b2aedea7f5249(const __grid_constant__ CU
                                 mbarrier_wait(q_empty_addr, _phase_q_empty);
                                 tma_3d_gmem2smem(smem_q_addr + 0 * 49152, (&Q), 0, (q0 + blk * 6) * 32, 0, q_full_addr);
                                 tma_2d_gmem2smem(smem_w_addr + 0 * 768, (&W), 0, q0 + blk * 6, q_full_addr);
+                                if (attempt == 0) {
+                                    mbarrier_wait(verdict_ack_addr, _phase_verdict_ack);
+                                    _phase_verdict_ack ^= 1;
+                                }
                                 mbarrier_arrive_expect_tx(q_full_addr, 49920);
                                 _phase_q_empty ^= 1;
                                 if (attempt == 0) {
@@ -505,7 +514,9 @@ kernel_cake_dsa_indexer_det_topk_7d1b556b2aedea7f5249(const __grid_constant__ CU
                                 if (attempt_1 == 0) {
                                     mbarrier_wait(verdict_bar_addr, _phase_verdict_bar_1);
                                     _phase_verdict_bar_1 ^= 1;
-                                    if (s_pfail[1] == 0) {
+                                    int pword_k = s_pfail[1];
+                                    mbarrier_arrive(verdict_ack_addr);
+                                    if (pword_k == 0) {
                                         break;
                                     }
                                 }
@@ -660,6 +671,9 @@ kernel_cake_dsa_indexer_det_topk_7d1b556b2aedea7f5249(const __grid_constant__ CU
                                     vread_m = (int)_shared_weak_0;
                                 }
                                 int vword_m = __shfl_sync(0xFFFFFFFF, vread_m, 0);
+                                if (lane == 0) {
+                                    mbarrier_arrive(verdict_ack_addr);
+                                }
                                 if (vword_m == 0) {
                                     break;
                                 }

@@ -1481,14 +1481,25 @@ def _token_tile_scratch(device):
     return scratch
 
 
-def _token_tile_down_z(m, top_k):
-    """K-panel slices per output tile for the token-tile down kernel (measured on GB300).
+def _token_tile_down_z(m, top_k, device):
+    """K-panel slices per output tile for the token-tile down kernel.
 
-    z=6 wins only in the 4096-token band (M4096: 128.4 vs 135.7 us); the 1000-,
-    2048- and 8192-token rows are fastest at z=1.
+    The down kernel runs one persistent CTA per SM over ``tiles * z`` items of
+    ``K / 128 / z`` output panels: a larger z shortens the last wave and adds
+    per-item work. z=6 wins in the 4096-token band (M4096 on GB300: 128.4 vs
+    135.7 us). On sm_100 (B200), above 49152 pairs and up to five waves of full
+    128-row tiles (``5 * 128`` pairs per SM) z=3 wins (M8192: 216 vs 232 us);
+    past that the last wave is a small share and z=1 is fastest, as it is at
+    1000 and 2048 tokens. On sm_103 (GB300) the routed tiles of M8192 nearly
+    fill four waves, so z=3 only adds work there and the band keeps z=1.
     """
     pairs = m * top_k
-    return 6 if 16384 < pairs <= 49152 else 1
+    if pairs <= 49152:
+        return 6 if pairs > 16384 else 1
+    props = torch.cuda.get_device_properties(device)
+    if (props.major, props.minor) != (10, 0):
+        return 1
+    return 3 if pairs <= 5 * 128 * props.multi_processor_count else 1
 
 
 def _alphamoe_token_tile_routed(
@@ -1576,7 +1587,7 @@ def _alphamoe_token_tile_routed(
         top_k,
         routed_scaling_factor,
         pairs >= e * _TOKEN_TILE_ROWS,
-        _token_tile_down_z(m, top_k),
+        _token_tile_down_z(m, top_k, device),
         accumulate,
     )
 

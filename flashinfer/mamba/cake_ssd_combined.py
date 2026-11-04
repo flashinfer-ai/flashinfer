@@ -1914,6 +1914,47 @@ def fused_no_z_extended(
     )
 
 
+# sm_107a (R200, 212 SMs): batched calls without ``z``, of a state dtype
+# listed here, with ``min_items``..``max_items`` (sequence, head) items of
+# ``min_chunks``..``max_chunks`` chunks (bounds inclusive), with or without
+# initial states, take the fused program (``exactfused_<state>_batched``,
+# one launch, no preprocess stage) where the chunk-parallel, fused and
+# fused-extension rules left them on the two-kernel form.  Outputs and
+# final states are bitwise those of the two-kernel program (measured on
+# R200 over 9 shapes of the window, two nodes: 1.012-1.102x).  Calls with
+# ``z`` and other state dtypes keep their program.
+_FUSED_MULTI_CHUNK_WINDOWS = {(10, 7): (768, 1024, 4, 4)}
+_FUSED_MULTI_CHUNK_STATE_DTYPES = {(10, 7): frozenset({torch.bfloat16, torch.float32})}
+
+
+def fused_batched_multi_chunk_selected(
+    *,
+    capability: Optional[Tuple[int, int]],
+    nheads: int,
+    num_sequences: int,
+    nchunks: int,
+    has_z: bool,
+    state_dtype: torch.dtype,
+) -> bool:
+    """Whether a batched call the chunk-parallel, fused and fused-extension
+    rules left on the two-kernel form takes the fused program: on a
+    ``capability`` of ``_FUSED_MULTI_CHUNK_WINDOWS``, without ``z``, with a
+    ``_FUSED_MULTI_CHUNK_STATE_DTYPES`` state and ``num_sequences x nheads``
+    items of ``nchunks`` chunks inside the window."""
+
+    if capability is None or has_z:
+        return False
+    key = (int(capability[0]), int(capability[1]))
+    window = _FUSED_MULTI_CHUNK_WINDOWS.get(key)
+    if window is None or state_dtype not in _FUSED_MULTI_CHUNK_STATE_DTYPES.get(
+        key, ()
+    ):
+        return False
+    min_items, max_items, min_chunks, max_chunks = window
+    items = max(int(num_sequences), 1) * int(nheads)
+    return min_items <= items <= max_items and min_chunks <= int(nchunks) <= max_chunks
+
+
 # sm_107a (R200, 212 SMs): batched calls without ``z`` and without initial
 # states, of a state dtype listed here, with ``min_items``..``max_items``
 # (sequence, head) items of ``min_chunks``..``max_chunks`` chunks (bounds
@@ -2201,6 +2242,83 @@ def single_sequence_batched_variant(
         nchunks=nchunks,
     )
     return "zpfchk" if zpf else "chk"
+
+
+# sm_107a (R200, 212 SMs): a single-sequence packed-varlen call (batch 1)
+# in the seq_idx triple form whose table the segment preprocess derives
+# (runner-owned, or published into the caller's ``seq_chunk_cumsum``),
+# with the canonical segmentation (one chunk-128 segment per chunk) and
+# whose batched ``[1, T]`` view lies outside the fused window keeps that
+# preprocess and runs the two-kernel batched main kernel
+# (``exactpre_<state>_batched``) on the view in place of its varlen main
+# kernel (``exactpre_<state>_varlen`` or ``_unit``): the segments are the
+# view's chunks, so the batched kernel reads the tables the preprocess
+# published.  Outputs and final states of a valid call are bitwise those
+# of the varlen program, and the status word is the unchanged
+# preprocess's (measured on R200 over 18 shapes, two nodes:
+# 1.046-1.177x).
+# Only calls of the varlen ring schedule with fewer heads than SMs,
+# without checkpoint outputs and with a bf16 / f32 state are routed; the
+# cu_seqlens form, caller tables the preprocess does not rewrite and the
+# chunk-parallel, pair, wrap, claim and initial-state bulk programs keep
+# their program.
+_SINGLE_SEQUENCE_TWO_KERNEL_CAPABILITIES = frozenset({(10, 7)})
+_SINGLE_SEQUENCE_TWO_KERNEL_STATE_DTYPES = frozenset({torch.bfloat16, torch.float32})
+
+
+def single_sequence_two_kernel_batched(
+    *,
+    capability: Optional[Tuple[int, int]],
+    mode_varlen: bool,
+    from_cu_seqlens: bool,
+    caller_cumsum: bool,
+    batch: int,
+    num_sequences: int,
+    num_segments: int,
+    nchunks: int,
+    checkpoint_state_count: int,
+    state_dtype: torch.dtype,
+    nheads: int,
+    sm_count: int,
+    workspace_program: str,
+) -> bool:
+    """Whether a single-sequence varlen call runs the two-kernel batched
+    main kernel (``exactpre_<state>_batched``) on its ``[1, T]`` view after
+    its unchanged segment preprocess, on a
+    ``_SINGLE_SEQUENCE_TWO_KERNEL_CAPABILITIES`` device: batch 1, one
+    sequence, the seq_idx triple form whose table the preprocess derives
+    (not ``from_cu_seqlens``, not ``caller_cumsum``), ``num_segments``
+    equal to ``nchunks``, no checkpoint outputs, a
+    ``_SINGLE_SEQUENCE_TWO_KERNEL_STATE_DTYPES`` state, fewer heads than
+    SMs, a ``workspace_program`` of the ``exactpre`` ring schedule (variant
+    ``""`` or ``"unit"``) and a batched view of ``nchunks`` chunks
+    outside the fused window (:func:`fused_selected`)."""
+
+    if capability is None or (
+        (int(capability[0]), int(capability[1]))
+        not in _SINGLE_SEQUENCE_TWO_KERNEL_CAPABILITIES
+    ):
+        return False
+    if not mode_varlen or from_cu_seqlens or caller_cumsum:
+        return False
+    if int(batch) != 1 or int(num_sequences) != 1:
+        return False
+    if int(num_segments) != int(nchunks) or int(checkpoint_state_count) != 0:
+        return False
+    if state_dtype not in _SINGLE_SEQUENCE_TWO_KERNEL_STATE_DTYPES:
+        return False
+    if int(nheads) >= int(sm_count):
+        return False
+    program = _PROGRAMS[workspace_program]
+    if program.family != "exactpre" or program.variant not in ("", "unit"):
+        return False
+    return not fused_selected(
+        nheads=nheads,
+        num_sequences=1,
+        nchunks=nchunks,
+        mode_varlen=False,
+        total_tokens=int(nchunks) * _CHUNK_SIZE,
+    )
 
 
 # sm_107a: the one-launch ring programs (``exactone_<state>_varlen``) in
@@ -3517,6 +3635,23 @@ class CakeSSDCombined:
             )
         ):
             fused = True
+        # sm_107a: batched multi-chunk calls without z of the
+        # ``fused_batched_multi_chunk_selected`` window take the fused program.
+        if (
+            not fused
+            and not chunk_parallel
+            and not self.has_varlen
+            and not self.has_z
+            and fused_batched_multi_chunk_selected(
+                capability=capability,
+                nheads=self.nheads,
+                num_sequences=num_sequences,
+                nchunks=nchunks,
+                has_z=self.has_z,
+                state_dtype=self.state_dtype,
+            )
+        ):
+            fused = True
         # The two-kernel pair program (``tail_selected``) is judged after the
         # fused route and before the ring / noring choice; its route and the
         # retained ``exact`` family are disjoint (16 chunks per item imply
@@ -3984,9 +4119,10 @@ class CakeSSDCombined:
         )
         self.last_program_name = plan.program_name
         if not capturing and plan.workspace["program"] != plan.program_name:
-            # The seq_idx check program replaced the shape's own program for
-            # this call without checkpoint outputs: load (build) the shape's
-            # program too, so a run of the shape with them builds nothing.
+            # The seq_idx check program or the batched view's two-kernel
+            # program replaced the shape's own program for this call without
+            # checkpoint outputs: load (build) the shape's program too, so a
+            # run of the shape with them builds nothing.
             _load_generated_program(plan.workspace["program"], plan.arch)
         if capturing:
             # The graph replays into exactly these addresses: pin the
@@ -4107,10 +4243,11 @@ class CakeSSDCombined:
         )
         _load_generated_program(plan.program_name, plan.arch)
         if plan.workspace["program"] != plan.program_name:
-            # The seq_idx check program replaced the shape's own program for
-            # this call without checkpoint outputs; a run of the shape with
-            # them launches the shape's program: load it too, so that run
-            # builds and loads nothing.
+            # The seq_idx check program or the batched view's two-kernel
+            # program replaced the shape's own program for this call without
+            # checkpoint outputs; a run of the shape with them launches the
+            # shape's program: load it too, so that run builds and loads
+            # nothing.
             _load_generated_program(plan.workspace["program"], plan.arch)
         # Only a successful preparation freezes the family choice and pins
         # the workspace: a failed allocation or build leaves no trace.
@@ -4495,6 +4632,27 @@ class CakeSSDCombined:
             chunk_parallel_mode=key.chunk_parallel_mode,
         )
         check_variant = single_sequence_batched_variant(**check_rule)
+        # sm_107a: a single-sequence triple call outside the fused window of
+        # its [1, T] view runs the batched two-kernel main kernel on that
+        # view after its unchanged segment preprocess
+        # (``single_sequence_two_kernel_batched``, asked when the check rule
+        # names no variant); ``batched_view`` marks the swap.
+        batched_view = False
+        view_rule: dict[str, Any] = dict(
+            capability=_ARCH_CAPABILITIES[arch],
+            mode_varlen=mode_varlen,
+            from_cu_seqlens=from_cu_seqlens,
+            caller_cumsum=caller_cumsum,
+            batch=batch,
+            num_sequences=num_sequences,
+            num_segments=num_segments,
+            nchunks=nchunks,
+            checkpoint_state_count=checkpoint_state_count,
+            state_dtype=self.state_dtype,
+            nheads=self.nheads,
+            sm_count=sm_count,
+            workspace_program=program_name,
+        )
         if check_variant is not None:
             check_name = _program_name(
                 "exactfused", self.state_dtype, False, check_variant
@@ -4517,21 +4675,37 @@ class CakeSSDCombined:
                     if self.seq_idx_dtype == torch.int64
                     else _TABLE_IN_KERNEL_I32
                 )
+        elif single_sequence_two_kernel_batched(**view_rule):
+            view_name = _program_name("exactpre", self.state_dtype, False)
+            # As for the check program: a captured call whose batched program
+            # has not been launched in this process keeps the shape's
+            # launched program (bitwise the same outputs, final states and
+            # status word).
+            if not (
+                capturing
+                and (view_name, arch) not in _LOADED_PROGRAMS
+                and (program_name, arch) in _LOADED_PROGRAMS
+            ):
+                program_name = view_name
+                batched_view = True
         program = _PROGRAMS[program_name]
         if capturing and (program_name, arch) not in _LOADED_PROGRAMS:
             # Loading (possibly building) the program is host work a graph
             # cannot record, and the host shim resolves its kernel handles
             # on the first launch.
             advice = "run the shape eagerly once before capturing it"
-            if (
-                checkpoint_state_count
-                and single_sequence_batched_variant(
+            if checkpoint_state_count and (
+                single_sequence_batched_variant(
                     **dict(check_rule, checkpoint_state_count=0)
                 )
                 is not None
+                or single_sequence_two_kernel_batched(
+                    **dict(view_rule, checkpoint_state_count=0)
+                )
             ):
                 # The call shape without checkpoint outputs runs the seq_idx
-                # check program, so warming it up launched only that one.
+                # check program or the batched view's two-kernel program, so
+                # warming it up launched only that one.
                 advice = (
                     "checkpoint outputs select a different program for this "
                     "call: run the call eagerly once with checkpoint outputs "
@@ -4887,6 +5061,11 @@ class CakeSSDCombined:
             # sequence); the check CTA reads the caller's triple in this form.
             main_values["mode_varlen"] = 0
             main_values["metadata_from_cu_seqlens"] = check_form
+        if batched_view:
+            # The batched geometry of the [1, T] view over the tables the
+            # segment preprocess published: one logical chunk per chunk.
+            main_values["mode_varlen"] = 0
+            main_values["num_logical_chunks"] = nchunks
         if program.family in ("chunkpar", "chunkpar3"):
             # Neither chunk-parallel signature (``_MAIN_ARGS_CHUNKPAR``,
             # ``_MAIN_ARGS_CHUNKPAR3``) has a fused input: bind exactly the

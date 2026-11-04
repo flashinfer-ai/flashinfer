@@ -786,21 +786,7 @@ kernel_cake_gdn_det_train_4bf560a7ea389e92d5f1_kcp(const __grid_constant__ CUten
                     wide_1[7] = __uint_as_float(words_1[3] & mask_hi);
                     asm volatile("st.shared.v4.f32 [%0], {%1,%2,%3,%4};" :: "r"((wf_addr + fs * 32768 + (unsigned int)(col_2 / 32 * 8192 + w_row * 128 + col_2 % 32 * 4 ^ (col_2 / 32 * 8192 + w_row * 128 + col_2 % 32 * 4 >> 7 & 7) << 4))), "f"(wide_1[0]), "f"(wide_1[1]), "f"(wide_1[2]), "f"(wide_1[3]) : "memory");
                     asm volatile("st.shared.v4.f32 [%0], {%1,%2,%3,%4};" :: "r"((wf_addr + fs * 32768 + (unsigned int)((col_2 + 4) / 32 * 8192 + w_row * 128 + (col_2 + 4) % 32 * 4 ^ ((col_2 + 4) / 32 * 8192 + w_row * 128 + (col_2 + 4) % 32 * 4 >> 7 & 7) << 4))), "f"(wide_1[4]), "f"(wide_1[5]), "f"(wide_1[6]), "f"(wide_1[7]) : "memory");
-                    int col_3 = w_col + (chu * 4 + 2) * 8;
-                    asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                        : "=r"(*reinterpret_cast<uint32_t*>(&words_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&words_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words_1[(0) + 3]))
-                        : "r"((w_land_addr + ls * 16384 + (unsigned int)(col_3 / 64 * 8192 + w_row * 128 + col_3 % 64 * 2 ^ (col_3 / 64 * 8192 + w_row * 128 + col_3 % 64 * 2 >> 7 & 7) << 4))));
-                    wide_1[0] = __uint_as_float(words_1[0] << 16);
-                    wide_1[1] = __uint_as_float(words_1[0] & mask_hi);
-                    wide_1[2] = __uint_as_float(words_1[1] << 16);
-                    wide_1[3] = __uint_as_float(words_1[1] & mask_hi);
-                    wide_1[4] = __uint_as_float(words_1[2] << 16);
-                    wide_1[5] = __uint_as_float(words_1[2] & mask_hi);
-                    wide_1[6] = __uint_as_float(words_1[3] << 16);
-                    wide_1[7] = __uint_as_float(words_1[3] & mask_hi);
-                    asm volatile("st.shared.v4.f32 [%0], {%1,%2,%3,%4};" :: "r"((wf_addr + fs * 32768 + (unsigned int)(col_3 / 32 * 8192 + w_row * 128 + col_3 % 32 * 4 ^ (col_3 / 32 * 8192 + w_row * 128 + col_3 % 32 * 4 >> 7 & 7) << 4))), "f"(wide_1[0]), "f"(wide_1[1]), "f"(wide_1[2]), "f"(wide_1[3]) : "memory");
-                    asm volatile("st.shared.v4.f32 [%0], {%1,%2,%3,%4};" :: "r"((wf_addr + fs * 32768 + (unsigned int)((col_3 + 4) / 32 * 8192 + w_row * 128 + (col_3 + 4) % 32 * 4 ^ ((col_3 + 4) / 32 * 8192 + w_row * 128 + (col_3 + 4) % 32 * 4 >> 7 & 7) << 4))), "f"(wide_1[4]), "f"(wide_1[5]), "f"(wide_1[6]), "f"(wide_1[7]) : "memory");
-                    int col_4 = w_col + (chu * 4 + 3) * 8;
+                    int col_4 = w_col + (chu * 4 + 2) * 8;
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&words_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&words_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words_1[(0) + 3]))
                         : "r"((w_land_addr + ls * 16384 + (unsigned int)(col_4 / 64 * 8192 + w_row * 128 + col_4 % 64 * 2 ^ (col_4 / 64 * 8192 + w_row * 128 + col_4 % 64 * 2 >> 7 & 7) << 4))));
@@ -814,6 +800,20 @@ kernel_cake_gdn_det_train_4bf560a7ea389e92d5f1_kcp(const __grid_constant__ CUten
                     wide_1[7] = __uint_as_float(words_1[3] & mask_hi);
                     asm volatile("st.shared.v4.f32 [%0], {%1,%2,%3,%4};" :: "r"((wf_addr + fs * 32768 + (unsigned int)(col_4 / 32 * 8192 + w_row * 128 + col_4 % 32 * 4 ^ (col_4 / 32 * 8192 + w_row * 128 + col_4 % 32 * 4 >> 7 & 7) << 4))), "f"(wide_1[0]), "f"(wide_1[1]), "f"(wide_1[2]), "f"(wide_1[3]) : "memory");
                     asm volatile("st.shared.v4.f32 [%0], {%1,%2,%3,%4};" :: "r"((wf_addr + fs * 32768 + (unsigned int)((col_4 + 4) / 32 * 8192 + w_row * 128 + (col_4 + 4) % 32 * 4 ^ ((col_4 + 4) / 32 * 8192 + w_row * 128 + (col_4 + 4) % 32 * 4 >> 7 & 7) << 4))), "f"(wide_1[4]), "f"(wide_1[5]), "f"(wide_1[6]), "f"(wide_1[7]) : "memory");
+                    int col_5 = w_col + (chu * 4 + 3) * 8;
+                    asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                        : "=r"(*reinterpret_cast<uint32_t*>(&words_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&words_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words_1[(0) + 3]))
+                        : "r"((w_land_addr + ls * 16384 + (unsigned int)(col_5 / 64 * 8192 + w_row * 128 + col_5 % 64 * 2 ^ (col_5 / 64 * 8192 + w_row * 128 + col_5 % 64 * 2 >> 7 & 7) << 4))));
+                    wide_1[0] = __uint_as_float(words_1[0] << 16);
+                    wide_1[1] = __uint_as_float(words_1[0] & mask_hi);
+                    wide_1[2] = __uint_as_float(words_1[1] << 16);
+                    wide_1[3] = __uint_as_float(words_1[1] & mask_hi);
+                    wide_1[4] = __uint_as_float(words_1[2] << 16);
+                    wide_1[5] = __uint_as_float(words_1[2] & mask_hi);
+                    wide_1[6] = __uint_as_float(words_1[3] << 16);
+                    wide_1[7] = __uint_as_float(words_1[3] & mask_hi);
+                    asm volatile("st.shared.v4.f32 [%0], {%1,%2,%3,%4};" :: "r"((wf_addr + fs * 32768 + (unsigned int)(col_5 / 32 * 8192 + w_row * 128 + col_5 % 32 * 4 ^ (col_5 / 32 * 8192 + w_row * 128 + col_5 % 32 * 4 >> 7 & 7) << 4))), "f"(wide_1[0]), "f"(wide_1[1]), "f"(wide_1[2]), "f"(wide_1[3]) : "memory");
+                    asm volatile("st.shared.v4.f32 [%0], {%1,%2,%3,%4};" :: "r"((wf_addr + fs * 32768 + (unsigned int)((col_5 + 4) / 32 * 8192 + w_row * 128 + (col_5 + 4) % 32 * 4 ^ ((col_5 + 4) / 32 * 8192 + w_row * 128 + (col_5 + 4) % 32 * 4 >> 7 & 7) << 4))), "f"(wide_1[4]), "f"(wide_1[5]), "f"(wide_1[6]), "f"(wide_1[7]) : "memory");
                     int krow_1_4 = k_row0 + chu * 4 * 8;
                     asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                         : "=r"(*reinterpret_cast<uint32_t*>(&words_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&words_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&words_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&words_1[(0) + 3]))

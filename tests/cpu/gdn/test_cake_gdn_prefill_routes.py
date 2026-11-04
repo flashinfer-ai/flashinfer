@@ -215,3 +215,79 @@ def test_sm107a_fp32_state_gate_stream_twin_per_head_split(
         **{**common, "total_seq_len": num_seqs * 2048, "max_seq_len": 2048},
     )
     assert long.variant_name == base["name"]
+
+
+_MIXED16 = (8192, 4096, 2048, 1024, 512, 256, 128, 64, 32, 16, 8, 4, 2, 1, 1, 1)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("num_q_heads", "num_v_heads", "full_dv", "dvsplit"),
+    (
+        # Qwen3-Next / Qwen3.5 TP2/TP4/TP8 FP32-state splits on the ragged 16-sequence batch
+        # (one 8192-token sequence first): with ``cu_seqlens_cpu`` the batch runs the
+        # DV-split body of its key, one CTA per half tile.
+        (8, 16, "f16a8d42d552", "5d5e7cd3bb78"),
+        (4, 8, "f11f48fee0a6", "aa51e505aec0"),
+        (8, 32, "73606292b9c9", "9d051157bbf3"),
+        (4, 16, "df3cde37e265", "d04755b8fc11"),
+        (2, 8, "a4094b019dd7", "def1226b2f12"),
+    ),
+)
+def test_sm107a_fp32_state_ragged_batch_takes_the_dvsplit_body_with_host_lengths(
+    num_q_heads, num_v_heads, full_dv, dvsplit
+):
+    common = dict(
+        arch="sm_107a",
+        io_dtype="bfloat16",
+        state_dtype="float32",
+        num_seqs=len(_MIXED16),
+        total_seq_len=sum(_MIXED16),
+        max_seq_len=max(_MIXED16),
+        num_q_heads=num_q_heads,
+        num_k_heads=num_q_heads,
+        num_v_heads=num_v_heads,
+        use_initial_state=True,
+        store_final_state=True,
+        checkpoint_every_n_tokens=0,
+        use_state_indices=False,
+        gates_present=True,
+    )
+    base = cake_gdn.select_cake_gdn_prefill_variant(**common)
+    assert base.route_id == "flashinfer.gdn_prefill.noncp.full_dv"
+    assert base.variant_name == _INITIAL_SM107A + full_dv
+    assert base.one_cta_per_tile is False
+    routed = cake_gdn.select_cake_gdn_prefill_variant(**common, host_seq_lens=_MIXED16)
+    assert routed.route_id == "flashinfer.gdn_prefill.noncp.dvsplit"
+    assert routed.variant_name == (
+        "prefill_flashinfer_blackwell_gdn_prefill_dvsplit_initial_sm107a_l7_vec2_"
+        + dvsplit
+    )
+    assert routed.metadata_i64
+    assert routed.one_cta_per_tile is True
+
+
+@pytest.mark.cpu_only
+def test_sm107a_fp32_state_ragged_batch_under_the_tile_budget_keeps_its_grid():
+    # Hq2/Hv4: 2 * 16 * 4 = 128 half tiles fit the 212 SMs, DV-split already.
+    common = dict(
+        arch="sm_107a",
+        io_dtype="bfloat16",
+        state_dtype="float32",
+        num_seqs=len(_MIXED16),
+        total_seq_len=sum(_MIXED16),
+        max_seq_len=max(_MIXED16),
+        num_q_heads=2,
+        num_k_heads=2,
+        num_v_heads=4,
+        use_initial_state=True,
+        store_final_state=True,
+        checkpoint_every_n_tokens=0,
+        use_state_indices=False,
+        gates_present=True,
+    )
+    routed = cake_gdn.select_cake_gdn_prefill_variant(**common, host_seq_lens=_MIXED16)
+    assert routed == cake_gdn.select_cake_gdn_prefill_variant(**common)
+    assert routed.route_id == "flashinfer.gdn_prefill.noncp.dvsplit"
+    assert routed.variant_name.endswith("e5e48bfdef0b")
+    assert routed.one_cta_per_tile is False

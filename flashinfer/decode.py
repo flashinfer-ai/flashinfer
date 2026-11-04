@@ -4314,6 +4314,7 @@ def trtllm_batch_decode_with_kv_cache(
     request_order: Optional[torch.Tensor] = None,
     request_order_plan: Optional[Any] = None,
     sparse_top_k: int = 0,
+    length_aware_schedule: bool = False,
 ) -> Union[
     torch.Tensor, FP4Tensor, Tuple[Union[torch.Tensor, FP4Tensor], torch.Tensor]
 ]:
@@ -4556,6 +4557,15 @@ def trtllm_batch_decode_with_kv_cache(
         65535. A sliding window, attention sinks and head dim 512 (MLA's, see
         :func:`trtllm_batch_decode_with_kv_cache_mla`) are not supported. ``0``
         (default) disables it.
+
+    length_aware_schedule : bool = False
+        ``cake`` backend: run the length-aware stream-K program where one serves
+        the call (BF16 Q/KV/O, head dimension 128, 16-token HND pages, 128
+        requests of one query token, 32 query heads over 4 KV heads).  It sizes
+        each request's work by its own ``seq_lens`` entry instead of
+        ``max_seq_len``, which helps a batch whose lengths differ widely; a
+        batch of equal lengths gives the default program's output.  Other calls
+        and backends ignore it.  ``False`` (default) keeps the default program.
 
     Returns
     -------
@@ -5090,11 +5100,15 @@ def trtllm_batch_decode_with_kv_cache(
         if backend == "cake":
             from .cake_fmha import (
                 CakeFmhaAlignedDecodeModule,
+                CakeFmhaAlignedHd256DecodeModule,
                 CakeFmhaAlignedHd64DecodeModule,
+                CakeFmhaAlignedMtpQ32DecodeModule,
                 CakeFmhaDecodeProgramModule,
                 _resolve_cake_fmha_decode_module,
                 _run_cake_fmha_aligned_decode,
+                _run_cake_fmha_aligned_hd256_decode,
                 _run_cake_fmha_aligned_hd64_decode,
+                _run_cake_fmha_aligned_mtp_q32_decode,
                 _run_cake_fmha_decode_program,
                 select_cake_fmha_decode_route,
             )
@@ -5133,6 +5147,7 @@ def trtllm_batch_decode_with_kv_cache(
                 lse=lse,
                 multi_ctas_kv_counter_buffer=multi_ctas_kv_counter_buffer,
                 enable_pdl=enable_pdl,
+                length_aware_schedule=length_aware_schedule,
             )
             cake_module, optimized_loaded = _resolve_cake_fmha_decode_module(
                 query.device, cake_route
@@ -5162,6 +5177,45 @@ def trtllm_batch_decode_with_kv_cache(
                 # so ``out`` is the whole result; it needs no workspace or
                 # counter buffer and ignores enable_pdl.
                 _run_cake_fmha_aligned_hd64_decode(
+                    cake_module,
+                    query=query,
+                    key_cache=k_cache,
+                    value_cache=v_cache,
+                    out=out,
+                    block_tables=block_tables,
+                    seq_lens=seq_lens,
+                    bmm1_scale=bmm1_scale,
+                )
+                return out
+            if isinstance(cake_module, CakeFmhaAlignedHd256DecodeModule):
+                # Aligned hd256 q1 decode: one of the generated grouped programs
+                # (the persistent program, or a cluster of 2 / 4 CTAs per
+                # (request, KV head) tile) launched with the kernel's host
+                # parameters positionally plus the grid.  The route admits only
+                # BF16 output in the query dtype without LSE, so ``out`` is the
+                # whole result; it needs no workspace or counter buffer and
+                # ignores enable_pdl.
+                _run_cake_fmha_aligned_hd256_decode(
+                    cake_module,
+                    query=query,
+                    key_cache=k_cache,
+                    value_cache=v_cache,
+                    out=out,
+                    block_tables=block_tables,
+                    seq_lens=seq_lens,
+                    bmm1_scale=bmm1_scale,
+                )
+                return out
+            if isinstance(cake_module, CakeFmhaAlignedMtpQ32DecodeModule):
+                # Aligned speculative decode (1 to 4 query tokens per request):
+                # the generated grouped program (a cluster of 2 CTAs per
+                # (request, KV head) tile, whose 32-row query tile holds every
+                # token of the KV head's query heads) launched with the kernel's
+                # host parameters positionally plus the grid.  The route admits
+                # only BF16 output in the query dtype without LSE, so ``out`` is
+                # the whole result; it needs no workspace or counter buffer and
+                # ignores enable_pdl.
+                _run_cake_fmha_aligned_mtp_q32_decode(
                     cake_module,
                     query=query,
                     key_cache=k_cache,

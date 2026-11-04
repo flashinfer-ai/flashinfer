@@ -31,7 +31,8 @@ three-warpgroup rule from ``wide_first_rule[0]`` mean unit tiles on, the
 CTA pair serves the unit geometries of ``pair_units`` only and the key-range
 split those of ``split_units`` only (the units whose split program the
 architecture registers).  ``l6_solo_rule`` may prefer the three-warpgroup unit
-without a CTA pair on calls that do not split (``select_program``, which takes
+without a CTA pair on calls that do not split, and ``l6_solo_unsampled_max_queries``
+the unpaired form of a CTA-pair l6 plan on short calls with the sampled first threshold off (``select_program``, which takes
 the registered scan keys so that it never picks an unregistered program;
 without them the preference stays off).  A record may also
 replace the sampled rank shift from a ``top_k`` of ``sample_shift_rule[0]`` on
@@ -76,10 +77,13 @@ POLICY_FIELDS = (
     "split_max",  # most key-range splits per unit
     "split_min_range_tiles",  # a split's key range is at least this many tiles
     "split_wave_rule",  # [min mean unit tiles, min CTA-efficiency gain] for a two-way split, or None
+    "split_wave_scope",  # [unit geometries, max segments, sampled calls only] the two-way split of split_wave_rule is limited to, or None (every call)
     "split_units",  # unit geometries ("l6", "narrow", "wide") whose split program the architecture registers; any other unit never splits
     "pair_rule",  # [min mean unit tiles, max mean unit tiles, min top_k] of the CTA-pair program, or None
     "pair_units",  # unit geometries ("l6", "narrow", "wide") whose CTA-pair program the architecture registers; the pair rule applies to these units only
     "l6_solo_rule",  # [max mean unit tiles, min segments] of the unpaired three-warpgroup preference on sampled calls, or None (no preference); see select_program
+    "l6_solo_unsampled_max_queries",  # with the sampled first threshold off, a call of at most this many queries planned on the CTA-pair l6 unit runs it unpaired (other units keep their plan), or None (sampling off follows l6_solo_rule); see l6_solo_for
+    "wide_pair_snake_only",  # a sampled call pairs the wide unit only when it walks the snake order (else the unpaired wide program)
     "snake_default",  # snake unit order when no rule applies
     "snake_rule",  # [program kinds, min mean tiles, min mean tiles (ratio > 1), min unit-cost spread], or None
     "tile_unroll_default",  # tile-loop unroll when no rule applies
@@ -96,6 +100,7 @@ POLICY_FIELDS = (
     "sample_class_rule",  # [tiny-unit sample tiles, shift permille] for the wide-unit programs (shift only) and the tiny dispatch class (tiles and shift), or None; explicit knobs override it
     "sample_shift_rule",  # [min top_k, shift permille] replacing sample_shift_permille from that top_k on, or None (the default shift on every call); an explicit sample_shift_permille knob overrides both
     "lsf_programs",  # the architecture ships the longest-first segment order copy (scan key suffix :lsf) of every scan program; the host runs it on packed calls whose key segments differ in length (#7549)
+    "static_scan_kinds",  # physical scan kinds whose programs keep the static unit enumeration on a ticket architecture: they never touch the ticket tail, so the host gives their runners none
     "far_sample",  # 1: the sampled first threshold of the ascending-tile-order programs ranks the far sample tiles only (the tile nearest the diagonal left out); 0: every sample tile
     "check_period_max",  # cap on the default selection-trigger check period (tiles)
     "check_period_knob_max",  # cap on an explicit check period (tiles)
@@ -140,7 +145,8 @@ MERGE_KEY = "merge"
 # ``sample_shift_rule`` shift.  Every value gives the same bits; the shift only sets how conservative the sampled first
 # threshold is.
 SAMPLE_SHIFT_PERMILLE_BOUNDS = (-1000, 10000)
-# Global unit tickets (every sm_100a / sm_103a scan program): the CTAs draw every
+# Global unit tickets (every scan program but the kinds of a record's
+# ``static_scan_kinds``, on ``cake_jit.TICKET_TAIL_ARCHES``): the CTAs draw every
 # work unit from the low u32 word of the first int64 behind the candidate buffers
 # (and behind the split staging), the first of a tail every plan's workspace
 # carries: 16 int64 for the ticket word, then the longest-first segment order the
@@ -148,8 +154,40 @@ SAMPLE_SHIFT_PERMILLE_BOUNDS = (-1000, 10000)
 # Every completed scan launch leaves the word at 0; the host (``cake_backend``)
 # zeroes the tail once at prepare on a backend-owned workspace and before every
 # run on a caller-owned ``workspace_buffer``, which others may write between
-# runs.  sm_107a leaves the tail unused.
+# runs -- except where the call always takes the static fast path
+# (``ticket_static_path``: the scan never touches the word) or runs a program of
+# ``static_scan_kinds``.  A scan program whose registry record lists the
+# architecture in ``ticket_arg_arches`` draws from its ``TicketWord`` block
+# instead and never reads this tail (the eager entry hands it the tail's first
+# 16 bytes); every plan still carries the tail, so the size does not depend on
+# the program.
 TICKET_TAIL_BYTES = 8 * (16 + 1024)
+
+
+def ticket_units_bound(choice: "ProgramChoice") -> int:
+    """An upper bound, from the call's shape alone, on the work units ``n_total`` a ticket scan launch of ``choice``
+    enumerates.  The kernel counts ``n_total`` from ``cu_seqlens_q`` on the device: ``ceil(l_s / block_q)`` blocks per
+    segment, times ``n_split`` on a split plan, ``ceil(blocks / 2)`` per segment on a CTA pair.  For any segment
+    lengths ``l_s >= 0`` with ``sum l_s <= T``, ``sum ceil(l_s / bq) <= floor((T + S (bq - 1)) / bq)`` and
+    ``sum ceil(b_s / 2) <= floor((sum b_s + S) / 2)``; the bound reads no tensor, so a caller that rewrites the
+    boundaries in place cannot move a call across it."""
+    bq = int(choice.block_q)
+    blocks = (int(choice.num_queries) + int(choice.num_segments) * (bq - 1)) // bq
+    if choice.split:
+        return blocks * int(choice.n_split)
+    if choice.pair:
+        return (blocks + int(choice.num_segments)) // 2
+    return blocks
+
+
+def ticket_static_path(choice: "ProgramChoice") -> bool:
+    """True when every launch of ``choice`` takes the ticket scan's static fast path: ``n_total <= G`` (``G`` = the
+    launched grid, half of it on a CTA pair), where the kernel gives every CTA / cluster at most one unit by its index
+    and never reads or writes the ticket word (no draw, no publish).  Decided by ``ticket_units_bound``."""
+    agents = int(choice.grid_ctas) // 2 if choice.pair else int(choice.grid_ctas)
+    return ticket_units_bound(choice) <= agents
+
+
 # sample_class_rule's tiny-class part applies to packed calls of short query segments only (#7549)
 CLASS_RULE_MIN_SEGMENTS = 2
 CLASS_RULE_MAX_QUERIES_PER_SEGMENT = 4096
@@ -163,6 +201,7 @@ _INT = ("tile_keys", "block_q_narrow", "block_q_wide", "block_q_l6", "candidate_
         "finalize_threads_small", "finalize_top_k_small", "finalize_threads", "rank_top_k_min",
         "rank_slab_window_max", "rank_bulk_align_bytes", "rank_persist_max_k", "rank_persist_ctas_per_sm")  # fmt: skip
 _BOOL = (
+    "wide_pair_snake_only",
     "snake_default",
     "lsf_programs",
     "finalize_fit",
@@ -180,6 +219,7 @@ _NUMBER = (
     "sample_dispatch_tiny_tiles_max",
 )
 _OPTIONAL_INT = (
+    "l6_solo_unsampled_max_queries",
     "cand_cap_floor",
     "cand_cap_floor_unsampled",
     "cand_cap_ceiling",
@@ -192,6 +232,7 @@ _OPTIONAL_RULE = (
     "l6_rule",
     "wide_first_rule",
     "split_wave_rule",
+    "split_wave_scope",
     "pair_rule",
     "l6_solo_rule",
     "snake_rule",
@@ -242,10 +283,13 @@ class DispatchPolicy:
     split_max: int
     split_min_range_tiles: int
     split_wave_rule: Optional[list]
+    split_wave_scope: Optional[list]
     split_units: list
     pair_rule: Optional[list]
     pair_units: list
     l6_solo_rule: Optional[list]
+    l6_solo_unsampled_max_queries: Optional[int]
+    wide_pair_snake_only: bool
     snake_default: bool
     snake_rule: Optional[list]
     tile_unroll_default: int
@@ -262,6 +306,7 @@ class DispatchPolicy:
     sample_shift_rule: Optional[list]
     sample_class_rule: Optional[list]
     lsf_programs: bool
+    static_scan_kinds: list
     far_sample: int
     check_period_max: int
     check_period_knob_max: int
@@ -359,6 +404,20 @@ class DispatchPolicy:
             raise ValueError(
                 f"policy['split_units'] must be an ascending list of unit geometries {UNITS}, got {split_units!r}"
             )
+        scope = raw["split_wave_scope"]
+        if scope is not None and (
+            len(scope) != 3
+            or not isinstance(scope[0], (list, tuple))
+            or not scope[0]
+            or not all(isinstance(u, str) and u in UNITS for u in scope[0])
+            or list(scope[0]) != sorted(set(scope[0]))
+            or not _is_int(scope[1])
+            or scope[1] < 1
+            or not isinstance(scope[2], bool)
+        ):
+            raise ValueError(
+                f"policy['split_wave_scope'] must be [ascending unit geometries {UNITS}, max segments >= 1, sampled only (bool)] or None, got {scope!r}"
+            )
         solo = raw["l6_solo_rule"]
         if solo is not None and (
             len(solo) != 2
@@ -369,6 +428,11 @@ class DispatchPolicy:
         ):
             raise ValueError(
                 f"policy['l6_solo_rule'] must be [max mean unit tiles >= 0, min segments >= 1] or None, got {solo!r}"
+            )
+        solo_queries = raw["l6_solo_unsampled_max_queries"]
+        if solo_queries is not None and solo_queries < 1:
+            raise ValueError(
+                f"policy['l6_solo_unsampled_max_queries'] must be an integer >= 1 or None, got {solo_queries!r}"
             )
         shift_lo, shift_hi = SAMPLE_SHIFT_PERMILLE_BOUNDS
         shift_rule = raw["sample_shift_rule"]
@@ -487,6 +551,15 @@ class DispatchPolicy:
                     f"policy[{ceiling_name!r}] must be a positive slot count at or above policy[{floor_name!r}]"
                     f"{' and the floor of policy[' + repr(rule_name) + ']' if rule_name else ''}, got {ceiling!r}"
                 )
+        static_kinds = raw["static_scan_kinds"]
+        if (
+            not isinstance(static_kinds, (list, tuple))
+            or not all(isinstance(k, str) and k in PHYSICAL_KINDS for k in static_kinds)
+            or list(static_kinds) != sorted(set(static_kinds))
+        ):
+            raise ValueError(
+                f"policy['static_scan_kinds'] must be an ascending list of physical scan kinds {PHYSICAL_KINDS}, got {static_kinds!r}"
+            )
         fit_kinds = raw["sample_fit_kinds"]
         if (
             not isinstance(fit_kinds, (list, tuple))
@@ -542,6 +615,7 @@ class DispatchPolicy:
         ]
         values["rank_t16_slots"] = [int(v) for v in values["rank_t16_slots"]]
         values["sample_fit_kinds"] = [str(k) for k in values["sample_fit_kinds"]]
+        values["static_scan_kinds"] = [str(k) for k in values["static_scan_kinds"]]
         values["pair_units"] = [str(u) for u in values["pair_units"]]
         values["split_units"] = [str(u) for u in values["split_units"]]
         values["check_period_kind_overrides"] = {
@@ -758,13 +832,14 @@ class DispatchPolicy:
         ratio: int,
         grid: int,
         block_q: int,
+        sampled: bool = True,
     ) -> int:
         """Key-range splits per unit of the unit ``block_q``: the split rule (``split_rule_for``) for a unit of
         ``split_units``; 1 for any other unit, whose split program the architecture does not register."""
         if self.unit_name(block_q) not in self.split_units:
             return 1
         return self.split_rule_for(
-            num_queries, num_keys, num_segments, ratio, grid, block_q
+            num_queries, num_keys, num_segments, ratio, grid, block_q, sampled
         )
 
     def split_rule_for(
@@ -775,9 +850,12 @@ class DispatchPolicy:
         ratio: int,
         grid: int,
         block_q: int,
+        sampled: bool = True,
     ) -> int:
         """The split rule alone (no registration guard): ``min(grid // units, mean tiles // split_min_range_tiles,
-        split_max)``, at least 1, and the two-way wave split of ``split_wave_rule`` where that gives 1."""
+        split_max)``, at least 1, and the two-way wave split of ``split_wave_rule`` where that gives 1 -- inside
+        ``split_wave_scope`` only (its unit geometries, calls of at most its segment count, and with its third item the
+        sampled calls only: ``sampled`` says whether the call's sampled first threshold is on)."""
         units = max(1, -(-int(num_queries) // int(block_q)))
         mean_tiles = self._mean_unit_tiles_floor(
             num_queries, num_keys, num_segments, ratio
@@ -791,6 +869,13 @@ class DispatchPolicy:
             ),
         )
         rule = self.split_wave_rule
+        scope = self.split_wave_scope
+        if scope is not None and (
+            self.unit_name(block_q) not in scope[0]
+            or int(num_segments) > int(scope[1])
+            or (scope[2] and not sampled)
+        ):
+            rule = None
         if (
             n == 1
             and rule is not None
@@ -837,16 +922,22 @@ class DispatchPolicy:
         num_segments: int,
         ratio: int,
         sampled: bool,
+        pair_l6: bool = False,
     ) -> bool:
-        """The ``l6_solo_rule`` preference for the three-warpgroup unit without a CTA pair: every call with the sampled
-        first threshold off (``sampled`` False), and a sampled call with at least ``rule[1]`` segments or at most
-        ``rule[0]`` mean unit tiles; never without a rule.  ``select_program`` applies it only to a call whose plan does
-        not split, whose l6 unit would not split either, and where the architecture registers the program it picks."""
+        """The preference for the three-warpgroup unit without a CTA pair.  A call with the sampled first threshold off
+        (``sampled`` False): where the record sets ``l6_solo_unsampled_max_queries``, only a call planned on the CTA-pair
+        l6 unit (``pair_l6``) of at most that many queries; else every such call where the record sets ``l6_solo_rule``.
+        A sampled call: at least ``l6_solo_rule[1]`` segments or at most ``l6_solo_rule[0]`` mean unit tiles.  Never
+        without either field.  ``select_program`` applies it only to a call whose plan does not split, whose l6 unit would
+        not split either, and where the architecture registers the program it picks."""
         rule = self.l6_solo_rule
+        if not sampled:
+            cap = self.l6_solo_unsampled_max_queries
+            if cap is not None:
+                return pair_l6 and int(num_queries) <= int(cap)
+            return rule is not None
         if rule is None:
             return False
-        if not sampled:
-            return True
         return int(num_segments) >= int(rule[1]) or self.mean_unit_tiles(
             num_queries, num_keys, num_segments, ratio
         ) <= float(rule[0])
@@ -1286,8 +1377,11 @@ def select_program(
     ``outputs_aligned`` (default True: the backend's own allocations) tells the bulk rule whether the output addresses meet
     ``rank_bulk_align_bytes`` -- caller-owned unaligned views run the plain twin program, same results.
     ``scan_keys`` (the scan program keys the architecture registers, ``PROGRAM_KEYS[arch]``; None: no registry, the
-    preference stays off) bounds the ``l6_solo_rule`` preference: it replaces the unit and pair choice of a call that does not
-    split with the unpaired l6 unit only where that unit would not split and its program key is registered.
+    preference stays off) bounds the unpaired-l6 preference (``l6_solo_rule``, ``l6_solo_unsampled_max_queries``): it replaces the unit and pair choice of a call that does not
+    split with the unpaired l6 unit only where that unit would not split and its program key is registered.  A record's
+    ``wide_pair_snake_only`` (sampled calls) drops the CTA pair of a wide unit that would not walk the snake order where the
+    unpaired wide program is in ``scan_keys`` (without a registry it stays off, as the l6 preference); ``split_wave_scope``
+    limits the two-way wave split.
     """
     T, Tkv, S, r, K = (
         int(num_queries),
@@ -1318,7 +1412,7 @@ def select_program(
         else int(candidate_multiplier)
     )
     block_q = policy.unit_block_q_for(T, Tkv, S, r, grid, K)
-    n_split = policy.n_split_for(T, Tkv, S, r, grid, block_q)
+    n_split = policy.n_split_for(T, Tkv, S, r, grid, block_q, sampled=tiles > 0)
     split = n_split > 1
     pair = (not split) and policy.pair_for(T, Tkv, S, r, grid, K, block_q)
     # lever LSF (#7549): the longest-first segment order pays off only where the segments differ, so the copy that
@@ -1330,14 +1424,43 @@ def select_program(
         and not (max_seqlen_k is not None and Tkv == S * int(max_seqlen_k))
     )
     cap = policy.candidate_capacity(K, mult)
-    # l6_solo_rule: a call that does not split takes the l6 unit without a CTA pair where the rule prefers it (sampling
-    # off, or a sampled call of several segments or short units), the l6 unit would not split either (the split rule
+    # wide_pair_snake_only: a sampled call keeps the CTA pair of the wide unit only where the pair walks the snake order;
+    # elsewhere it runs the unpaired wide program (same unit, no split) when that program is in ``scan_keys`` (no registry: off)
+    if (
+        pair
+        and tiles > 0
+        and policy.wide_pair_snake_only
+        and block_q == policy.block_q_wide
+        and not policy.snake_for(
+            policy.program_kind(block_q, False, True), T, Tkv, S, r
+        )
+    ):
+        wide_snake = policy.snake_for("wide", T, Tkv, S, r)
+        wide_key = scan_key(
+            physical_kind("wide", "wide"),
+            policy.tile_unroll_for("wide", K, wide_snake, block_q),
+            wide_snake,
+            policy.sample_fit_for(T, Tkv, S, r, cap, physical_kind("wide", "wide")),
+            lsf,
+        )
+        if scan_keys is not None and wide_key in scan_keys:
+            pair = False
+    # l6_solo_rule / l6_solo_unsampled_max_queries: a call that does not split takes the l6 unit without a CTA pair where
+    # ``l6_solo_for`` prefers it (sampling off: every call, or with the query bound a CTA-pair l6 plan of at most that many
+    # queries; sampled: several segments or short units), the l6 unit would not split either (the split rule
     # alone, before the registration guard of ``n_split_for``) and the program it picks is in ``scan_keys``; else the plan above
     if (
         not split
         and (block_q, pair) != (policy.block_q_l6, False)
-        and policy.l6_solo_for(T, Tkv, S, r, sampled=tiles > 0)
-        and policy.split_rule_for(T, Tkv, S, r, grid, policy.block_q_l6) == 1
+        and policy.l6_solo_for(
+            T,
+            Tkv,
+            S,
+            r,
+            sampled=tiles > 0,
+            pair_l6=(block_q, pair) == (policy.block_q_l6, True),
+        )
+        and policy.split_rule_for(T, Tkv, S, r, grid, policy.block_q_l6, tiles > 0) == 1
     ):
         solo_snake = policy.snake_for("l6", T, Tkv, S, r)
         solo_key = scan_key(
@@ -1481,4 +1604,6 @@ __all__ = [
     "scan_key",
     "select_program",
     "stage_slug",
+    "ticket_static_path",
+    "ticket_units_bound",
 ]

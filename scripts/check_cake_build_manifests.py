@@ -278,6 +278,17 @@ def refs_lm_head_det_loss(package_dir: Path, loader: str) -> set[str]:
     }
 
 
+def refs_lm_head_loss(package_dir: Path, loader: str) -> set[str]:
+    """The non-deterministic package ``flashinfer.experimental.cake.cake_lm_head_loss``: the registry shape of
+    :func:`refs_lm_head_det_loss`; the stage's library stem is ``cake_lm_head_loss_<unit>``."""
+    registry = module_literals(package_dir / loader)["_REGISTRY"]
+    return {
+        f"cake_lm_head_loss_{row[0]}_{compact['arch']}"
+        for compact in registry.values()
+        for row in compact["stages"].values()
+    }
+
+
 def refs_moe_grouped_det_gemm(package_dir: Path, loader: str) -> set[str]:
     """Route stages bind a program and its compile-line specializations; the build is
     ``<library><tag>_<arch>`` for every architecture the route and the program share."""
@@ -352,11 +363,12 @@ class Package:
 
 
 # dsa_train, kda_det_train (and its non-deterministic counterpart cake.cake_kda_train), dsa_indexer, the rmsnorm, the mhc training, the causal conv1d, the ulysses, the NVFP4 SVDQuant GEMM, the Sage
-# block-sparse attention, the fused QK RoPE append (BF16 / FP8), the experimental NVFP4 attention, the SM90 VSA,
-# the Kimi-K3 AttnRes, the experimental FP8 1D1D GEMM (deepgemm_fp8_gemm) and the experimental batched FP8 projection (deepgemm_batched_gemm) backends are read with the generic walker (a mapping carrying ``library`` under an ``arches`` /
+# block-sparse attention, the fused QK RoPE append (BF16 / FP8), the experimental NVFP4 attention (and its per-tile-max
+# variant cake_nvfp4_ptilemax_attention), the SM90 VSA,
+# the Kimi-K3 AttnRes, the experimental FP8 1D1D GEMM (deepgemm_fp8_gemm), the experimental batched FP8 projection (deepgemm_batched_gemm) and the experimental Mega Gate (deepgemm_mega_gate) backends are read with the generic walker (a mapping carrying ``library`` under an ``arches`` /
 # ``arch`` scope).  Their exporters' registry shapes fit it: a record carries ``arches`` and either ``library`` itself
 # (dsa_indexer PROGRAMS, rmsnorm, mhc, causal conv1d, ulysses, svdquant, Sage block-sparse attention, fused QK RoPE append,
-# nvfp4_attention, vsa_sm90, Kimi-K3 AttnRes, deepgemm_fp8_gemm and deepgemm_batched_gemm MODULES) or per-stage sub-records carrying ``library`` (dsa_train).
+# nvfp4_attention, cake_nvfp4_ptilemax_attention, vsa_sm90, Kimi-K3 AttnRes, deepgemm_fp8_gemm, deepgemm_batched_gemm and deepgemm_mega_gate MODULES) or per-stage sub-records carrying ``library`` (dsa_train).
 PACKAGES: tuple[Package, ...] = (
     Package(
         "flashinfer.cake_rmsnorm_det_train_backend",
@@ -515,6 +527,12 @@ PACKAGES: tuple[Package, ...] = (
         refs_lm_head_det_loss,
     ),
     Package(
+        "flashinfer.experimental.cake.cake_lm_head_loss",
+        "flashinfer/experimental/cake/cake_lm_head_loss",
+        "cake_jit.py",
+        refs_lm_head_loss,
+    ),
+    Package(
         "flashinfer.experimental.cake_mok_bf16",
         "flashinfer/experimental/cake_mok_bf16",
         "sources.json",
@@ -565,6 +583,12 @@ PACKAGES: tuple[Package, ...] = (
         refs_generic,
     ),
     Package(
+        "flashinfer.experimental.cake_nvfp4_ptilemax_attention",
+        "flashinfer/experimental/cake_nvfp4_ptilemax_attention",
+        "cake_jit.py",
+        refs_generic,
+    ),
+    Package(
         "flashinfer.experimental.cake_kimi_k3_attn_res",
         "flashinfer/experimental/cake_kimi_k3_attn_res",
         "cake_jit.py",
@@ -573,6 +597,12 @@ PACKAGES: tuple[Package, ...] = (
     Package(
         "flashinfer.experimental.deepgemm_batched_gemm",
         "flashinfer/experimental/deepgemm_batched_gemm",
+        "cake_jit.py",
+        refs_generic,
+    ),
+    Package(
+        "flashinfer.experimental.deepgemm_mega_gate",
+        "flashinfer/experimental/deepgemm_mega_gate",
         "cake_jit.py",
         refs_generic,
     ),

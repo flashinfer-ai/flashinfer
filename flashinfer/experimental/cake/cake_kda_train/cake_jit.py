@@ -17,8 +17,10 @@ Registry and loader glue of the Cake packed KDA chunked training kernels
 (SM100 / SM103 / SM107), the ``deterministic=False`` package: the registry of
 ``flashinfer.experimental.cake_kda_det_train`` with the records of its fused
 gradient and GLM intra stages re-routed to the ``S1`` pairs on the rows below
-(the other records, their programs and their rules are the deterministic
-package's under this package's library prefix).
+in g mode and raw mode's parameter-gradient reduce re-routed to the ``R1c``
+pairs on ``sm_100a`` / ``sm_103a`` (the other records, their programs and their
+rules, and raw mode's, are the deterministic package's under this package's
+library prefix).
 
 Every record of ``MODULES`` is one mechanically exported program: a CUDA
 device translation unit plus a tvm-ffi binding, compiled once per
@@ -47,8 +49,11 @@ Two records may share one library (``fwdh_v3`` and ``fwdh_p3``: the segmented
 recurrence's first pass and its unfused third pass are launches of one kernel
 with different grids and flags; ``wy_bwd`` and ``wy_fwd_rows``: the backward's
 WY program on the saved ``Akk`` token rows, which the saving forward launches
-too on its overlap rows and its paired serial rows); every other library has
-one record.  Four records
+too on its overlap rows and its paired serial rows; the fused gradient's g-class
+records ``dqkg`` / ``dqkg_int`` / ``dqkg_davq`` / ``dqkg_int_davq`` and their raw
+class twins ``dqkg_raw`` / ``dqkg_int_raw`` / ``dqkg_davq_raw`` /
+``dqkg_int_davq_raw``, one program each pair); every other library has one
+record.  Four records
 launch with the programmatic-stream-serialization attribute
 (``launch["use_pdl"]``: ``fwdh_p3_o_ov`` / ``fwdh_p3_o_ov_id`` and their
 token-row twins ``fwdh_p3_o_ov_rows`` / ``fwdh_p3_o_ov_id_rows``, the pass 2 of
@@ -156,18 +161,60 @@ pair ``dqkg`` / ``dqkg_int`` with ``glm_intra`` / ``glm_intra_v14`` /
                                                         H >= 16: deterministic pair
     sm_107a    S1 (dqkg_davq_v24, from 16 heads its     S1 (dqkg_int_davq_v24, from 16 heads its
                _nohint form; glm_intra_v23)             _nohint form; glm_intra_v23)
+    raw mode   deterministic fused gradient (the dqkg raw class) on every
+               architecture, path and row; sm_100a / sm_103a: glm_intra_v20c
+               (sm_100a from 32 heads glm_intra_v20c_r8) and its cast,
+               sm_107a: glm_intra_raw and param_finalize
 
 The ``sm_107a`` ``S1`` rows are provisional.  Returning them to the
 deterministic pair takes: removing ``dqkg_davq_nohint_v24``,
 ``dqkg_int_davq_nohint_v24`` and ``glm_intra_v23`` and the ``sm_107a`` clause
 and architecture of ``dqkg_davq_v24`` / ``dqkg_int_davq_v24``; restoring the
 deterministic package's ``dqkg_davq_nohint`` / ``dqkg_int_davq_nohint`` records
-and the ``sm_107a`` rows up to 8 heads and the ``sm_107a`` architecture of
-``dqkg_davq`` / ``dqkg_int_davq``; and the rule ``arch_in sm_107a`` of
-``glm_intra_v18``.  The deterministic copies are the deterministic package's
-programs (the same builds) on its architectures, except ``dqkg_davq`` and
-``dqkg_int_davq``: they ship only where their rules launch them, ``sm_100a``
-(the saved-set rows up to 8 heads) and ``sm_103a`` (the replay from 16 heads).
+and the ``sm_107a`` rows up to 8 heads of ``dqkg_davq`` / ``dqkg_int_davq``; and
+the rule ``arch_in sm_107a`` of ``glm_intra_v18``.  The deterministic copies are
+the deterministic package's programs (the same builds) on its architectures.
+
+The gate-dependent stages (``GATE_STAGES``) carry two classes of records, a
+record's ``gate`` naming its class: ``"g"`` (``"g"`` too when the key is
+absent: the activated FP32 gate ``g`` the caller passes) and ``"raw"`` (FLA's
+``use_gate_in_kernel``: the BF16 raw gate ``g_raw`` with ``A_log`` /
+``dt_bias`` / ``lower_bound``).  :func:`records_of_stage` and
+:func:`select_record` read the class of the call's ``gate`` for those stages
+alone; every other stage's records carry no ``gate`` and serve both modes, so
+raw mode selects exactly the record g mode selects there.  The raw class is the
+deterministic package's, record for record, but for the parameter-gradient
+reduce: ``fwd_intra_raw`` /
+``fwd_intra_v14_raw``, the four forms of the backward prep
+(``bwd_prep_g8_raw``, ``_replay_raw``, ``_noqg_raw``, ``_noqg_nokb_raw``),
+``glm_intra_raw`` (writing ``dg_raw`` and the per-chunk partials ``dA_part`` /
+``db_part``; no gate epilogue) and ``param_finalize`` (``dA_log`` /
+``ddt_bias`` from those partials, in a fixed order), the last two on ``sm_107a``
+alone.  On ``sm_100a`` / ``sm_103a`` the parameter gradients take the ``R1c``
+pairs (:data:`R1C_PAIRS`): ``glm_intra_v20c`` is the program of
+``glm_intra_raw`` up to each chunk's merged ``(hi, lo)`` pairs, which it adds in
+FP64 into the accumulators ``param_acc`` (``[stripes, H, 2, 128]``, chunk ``c``
+into replica ``c mod stripes``) instead of writing the partials, and
+``param_finalize_cast`` sums the replicas in a fixed order, rounds once to
+``dA_log`` / ``ddt_bias`` and zeroes the accumulators.  ``glm_intra_v20c_r8`` /
+``param_finalize_cast_r8`` are the same pair with 8 replicas
+(:data:`R1C_STRIPES`), selected on ``sm_100a`` from 32 heads; ``sm_103a`` takes
+one replica on every row.  The FP64 additions arrive in no fixed order, so
+``dA_log`` / ``ddt_bias`` can differ by one FP32 ulp from run to run (and from
+the deterministic package) on those rows; every other output is the
+deterministic raw mode's bit for bit.  A GLM intra record of :data:`R1C_PAIRS`
+must be followed by its cast and ``glm_intra_raw`` by ``param_finalize``: a
+mixed pair reads partials or accumulators nothing wrote.  ``glm_intra_raw``
+and ``glm_intra_v20c`` add no ``q * dq`` term, so the fused gradient is a
+gate stage here: its raw class (``dqkg_raw``, ``dqkg_int_raw``,
+``dqkg_davq_raw``, ``dqkg_int_davq_raw``, ``dqkg_davq_nohint_raw``,
+``dqkg_int_davq_nohint_raw``) is the deterministic package's ``dqkg`` records
+with their rules, and the ``S1`` records are of the g class alone.  A raw-class
+fused gradient record shares its program with the g-class record of the same
+build where one ships (so ``dqkg_davq`` / ``dqkg_int_davq`` ship on the three
+architectures, though their g rules launch them on ``sm_100a`` / ``sm_103a``
+alone).  ``gate_epilogue`` has no raw record and ``param_finalize`` no g
+record: both are optional.
 
 The checkpoint hand-off's intra twins (:data:`HANDOFF_TWINS`): ``fwd_intra_v19``
 and ``fwd_intra_v20`` are the programs of ``fwd_intra_v14`` and ``fwd_intra``
@@ -259,6 +306,7 @@ STAGES_BWD = (
     "dqkg",
     "glm_intra",
     "gate_epilogue",
+    "param_finalize",
 )
 STAGES = (
     "table",
@@ -275,13 +323,15 @@ STAGES = (
     "dqkg",
     "glm_intra",
     "gate_epilogue",
+    "param_finalize",
 )
 # The stages some routes or paths do not launch: :func:`select_record` returns
 # ``None`` for them when no record admits the problem (``table`` on the forward
 # and the replay of the segmented route up to 256 documents, where the intra
 # program writes the tables; the segmented route's own stages on the serial
 # route; ``wy_fwd`` / ``wy`` / ``fwdh`` / ``dav`` where a fused program or the
-# saved set replaces them; ``gate_epilogue`` where the GLM intra program fuses it).
+# saved set replaces them; ``gate_epilogue`` where the GLM intra program fuses it and
+# in raw mode; ``param_finalize`` in g mode).
 OPTIONAL_STAGES = (
     "table",
     "seg_table",
@@ -292,7 +342,19 @@ OPTIONAL_STAGES = (
     "fwdh",
     "dav",
     "gate_epilogue",
+    "param_finalize",
 )
+# The stages whose records are filtered by the call's gate mode (a record's
+# ``gate``: ``"g"``, the default when the key is absent, or ``"raw"``); the
+# selection rules, the single-record rules and ``OPTIONAL_STAGES`` hold per
+# (stage, gate) class there.  Every other stage serves both modes.  ``dqkg`` is
+# one: the S1 records serve the activated gate alone, and raw mode runs the
+# deterministic fused gradient on every row (``glm_intra_raw`` adds no
+# ``q * dq`` term).
+GATE_STAGES = frozenset(
+    {"fwd_intra", "bwd_prep", "dqkg", "glm_intra", "gate_epilogue", "param_finalize"}
+)
+GATES = ("g", "raw")
 
 # The segmented route (the ``route_in`` rules read the route
 # :func:`segment_plan` derives from these constants): with at most
@@ -355,7 +417,20 @@ CARRY_FLAG_WORDS_PER_CTA = 3
 # from and ``flags`` its words viewed as the release flags.  The
 # backward's fused gradient and GLM intra kernel read ``q`` / ``k`` / ``v`` on
 # the token rows (no chunk-layout copies); ``num_pairs`` is the chunk-pair
-# count ``num_chunks_pad / 2`` the persistent pair kernels walk.
+# count ``num_chunks_pad / 2`` the persistent pair kernels walk.  Raw gate mode
+# adds the BF16 raw gate ``g_raw`` (``[S, H, 128]``, any view with unit
+# innermost stride and 16-byte multiple outer strides) and its gradient
+# ``dg_raw`` (contiguous BF16), the gate parameters ``A_log`` (FP32 ``[H]``) and
+# ``dt_bias`` (FP32 ``[H * 128]``), the GLM intra stage's per-chunk FP32
+# ``(hi, lo)`` partials ``dA_part`` / ``db_part`` (``[NC_pad, H, 128, 2]``) and
+# the parameter gradients ``dA_log`` / ``ddt_bias`` ``param_finalize`` writes;
+# ``part2`` is that stage's FP32 per-segment scratch (``[H, seg_cap, 128, 4]``,
+# every slot it reads written by the same launch) and ``ticket`` its u32
+# per-head arrival counter (``[H]``, zero before the launch and left zero).
+# The R1c records (``sm_100a`` / ``sm_103a``) take ``param_acc`` in place of the
+# partials: the FP64 accumulators ``[stripes, H, 2, 128]`` (``R1C_STRIPES``)
+# ``glm_intra_v20c`` adds every chunk's terms into, zero before the launch, and
+# the cast rounds to ``dA_log`` / ``ddt_bias`` and leaves zero (``+0``).
 LOGICAL_TENSORS = (
     "q",
     "k",
@@ -416,6 +491,17 @@ LOGICAL_TENSORS = (
     "carry_out_tiles",
     "eye",
     "flags",
+    "g_raw",
+    "dg_raw",
+    "A_log",
+    "dt_bias",
+    "dA_part",
+    "db_part",
+    "dA_log",
+    "ddt_bias",
+    "part2",
+    "ticket",
+    "param_acc",
 )
 # ``segments`` is the per-document segment count ``seg_table`` expands;
 # ``seg_arg`` the walk programs' segment scalar (``segments``, or
@@ -423,7 +509,10 @@ LOGICAL_TENSORS = (
 # ``write_prep`` the forward intra program's switch for the GLM prep's outputs
 # (1 on the forward, 0 on the replay, whose prep writes them); ``epoch`` the
 # release-flag epoch of the carry || pass-2 pair and of the two-level carry;
-# ``gsize`` the two-level carry's segment group size (:func:`carry_choice`).
+# ``gsize`` the two-level carry's segment group size (:func:`carry_choice`);
+# ``lower_bound`` the raw gate's FP32 lower bound and ``g_raw_row_stride`` /
+# ``g_raw_head_stride`` ``g_raw``'s token and head strides in elements (i64);
+# ``seg_cap`` ``part2``'s segment extent (``param_finalize``'s grid ``y``).
 LOGICAL_SCALARS = (
     "num_seqs",
     "num_chunks_pad",
@@ -445,6 +534,10 @@ LOGICAL_SCALARS = (
     "write_ht",
     "epoch",
     "gsize",
+    "lower_bound",
+    "g_raw_row_stride",
+    "g_raw_head_stride",
+    "seg_cap",
 )
 
 # Filled mechanically by the exporter (the derived leaves ``kernel_symbol``, ``launch``, ``arg_plan``,
@@ -554,7 +647,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "chunk_blocks", "per_cta": 256},
-        "kernel_symbol": "kernel_cake_kda_train_9f69ca35a631ae5e1b4c",
+        "kernel_symbol": "kernel_cake_kda_train_19a25d3d4ec3afd6354e",
         "launch": {
             "block": (256, 1, 1),
             "cluster": (1, 1, 1),
@@ -562,7 +655,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 5376,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_9f69ca35a631ae5e1b4c",
+        "library": "cake_kda_train_19a25d3d4ec3afd6354e",
         "logical": {
             "chunk_bos": "chunk_bos",
             "chunk_len": "chunk_len",
@@ -601,7 +694,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "fixed", "ctas": [1, 1, 1]},
-        "kernel_symbol": "kernel_cake_kda_train_fd4c92787fcc18446b14",
+        "kernel_symbol": "kernel_cake_kda_train_1cf34765c0945c104046",
         "launch": {
             "block": (256, 1, 1),
             "cluster": (1, 1, 1),
@@ -609,7 +702,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 3200,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_fd4c92787fcc18446b14",
+        "library": "cake_kda_train_1cf34765c0945c104046",
         "logical": {
             "num_seqs": "num_seqs",
             "proportional": "proportional",
@@ -693,10 +786,22 @@ MODULES: dict[str, dict[str, Any]] = {
             "write_prep": "write_prep",
         },
         "select_rule": {
-            "kind": "any_of",
+            "kind": "all_of",
             "rules": [
-                {"kind": "route_in", "routes": ["serial"]},
-                {"kind": "docs_above", "min": 256},
+                {
+                    "kind": "any_of",
+                    "rules": [
+                        {"kind": "route_in", "routes": ["serial"]},
+                        {"kind": "docs_above", "min": 256},
+                    ],
+                },
+                {
+                    "kind": "any_of",
+                    "rules": [
+                        {"kind": "l2n_in", "modes": ["off", "fallback"]},
+                        {"kind": "path_in", "paths": ["replay"]},
+                    ],
+                },
             ],
         },
         "stage": "fwd_intra",
@@ -740,7 +845,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "chunks", "x_factor": 1},
-        "kernel_symbol": "kernel_cake_kda_train_94c7d1cc6c908d53e8c1",
+        "kernel_symbol": "kernel_cake_kda_train_3162ed758e5ddfb97c17",
         "launch": {
             "block": (256, 1, 1),
             "cluster": (1, 1, 1),
@@ -748,7 +853,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 76160,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_94c7d1cc6c908d53e8c1",
+        "library": "cake_kda_train_3162ed758e5ddfb97c17",
         "logical": {
             "akk_ext": "akk_ext",
             "akk_int": "akk_int",
@@ -829,7 +934,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "chunks", "x_factor": 1},
-        "kernel_symbol": "kernel_cake_kda_train_f3c938ed124d4a384e53",
+        "kernel_symbol": "kernel_cake_kda_train_fc369dcf6d01dd9a7417",
         "launch": {
             "block": (256, 1, 1),
             "cluster": (1, 1, 1),
@@ -837,7 +942,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 76160,
             "use_pdl": False,
         },
-        "library": "cake_kda_train_f3c938ed124d4a384e53",
+        "library": "cake_kda_train_fc369dcf6d01dd9a7417",
         "logical": {
             "akk_ext": "akk_ext",
             "akk_int": "akk_int",
@@ -943,6 +1048,194 @@ MODULES: dict[str, dict[str, Any]] = {
         "select_rule": {"kind": "path_in", "paths": []},
         "stage": "fwd_intra",
         "variant": "v20",
+    },
+    "fwd_intra_raw": {
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+        "arg_plan": [
+            ["buffer", "q"],
+            ["buffer", "k"],
+            ["buffer", "g_raw"],
+            ["buffer", "beta"],
+            ["buffer", "chunk_bos"],
+            ["buffer", "chunk_len"],
+            ["buffer", "aqk_ext"],
+            ["buffer", "akk_ext"],
+            ["buffer", "aqk_int"],
+            ["buffer", "akk_int"],
+            ["parameter", "num_heads"],
+            ["parameter", "num_qk_heads"],
+            ["parameter", "group"],
+            ["parameter", "write_ext"],
+            ["parameter", "write_int"],
+            ["parameter", "scale"],
+            ["buffer", "gk_out"],
+            ["buffer", "kb_out"],
+            ["buffer", "kg_out"],
+            ["buffer", "qg_out"],
+            ["buffer", "v_new"],
+            ["parameter", "write_prep"],
+            ["buffer", "A_log"],
+            ["buffer", "dt_bias"],
+            ["parameter", "lower_bound"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "gate": "raw",
+        "grid_rule": {"kind": "chunks", "x_factor": 1},
+        "kernel_symbol": "kernel_cake_kda_train_ea5200a088abb13be8eb",
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 76160,
+            "use_pdl": False,
+        },
+        "library": "cake_kda_train_ea5200a088abb13be8eb",
+        "logical": {
+            "A_log": "A_log",
+            "akk_ext": "akk_ext",
+            "akk_int": "akk_int",
+            "aqk_ext": "aqk_ext",
+            "aqk_int": "aqk_int",
+            "beta": "beta",
+            "chunk_bos": "chunk_bos",
+            "chunk_len": "chunk_len",
+            "dt_bias": "dt_bias",
+            "g_raw": "g_raw",
+            "gk_out": "gk",
+            "group": "group",
+            "k": "k",
+            "kb_out": "kb",
+            "kg_out": "kg",
+            "lower_bound": "lower_bound",
+            "num_heads": "num_heads",
+            "num_qk_heads": "num_heads",
+            "q": "q",
+            "qg_out": "qg",
+            "scale": "scale",
+            "v_new": "v_new",
+            "write_ext": "write_ext",
+            "write_int": "write_int",
+            "write_prep": "write_prep",
+        },
+        "select_rule": {
+            "kind": "all_of",
+            "rules": [
+                {
+                    "kind": "any_of",
+                    "rules": [
+                        {"kind": "route_in", "routes": ["serial"]},
+                        {"kind": "docs_above", "min": 256},
+                    ],
+                },
+                {
+                    "kind": "any_of",
+                    "rules": [
+                        {"kind": "l2n_in", "modes": ["off", "fallback"]},
+                        {"kind": "path_in", "paths": ["replay"]},
+                    ],
+                },
+            ],
+        },
+        "stage": "fwd_intra",
+        "variant": "raw",
+    },
+    "fwd_intra_v14_raw": {
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+        "arg_plan": [
+            ["buffer", "q"],
+            ["buffer", "k"],
+            ["buffer", "g_raw"],
+            ["buffer", "beta"],
+            ["buffer", "cu_seqlens"],
+            ["parameter", "num_seqs"],
+            ["buffer", "aqk_ext"],
+            ["buffer", "akk_ext"],
+            ["buffer", "aqk_int"],
+            ["buffer", "akk_int"],
+            ["parameter", "num_heads"],
+            ["parameter", "num_qk_heads"],
+            ["parameter", "group"],
+            ["parameter", "write_ext"],
+            ["parameter", "write_int"],
+            ["parameter", "scale"],
+            ["buffer", "gk_out"],
+            ["buffer", "kb_out"],
+            ["buffer", "kg_out"],
+            ["buffer", "qg_out"],
+            ["buffer", "v_new"],
+            ["parameter", "write_prep"],
+            ["buffer", "chunk_bos"],
+            ["buffer", "chunk_len"],
+            ["buffer", "seq_chunk_start"],
+            ["buffer", "seq_order"],
+            ["parameter", "segments"],
+            ["parameter", "proportional"],
+            ["buffer", "seg_table"],
+            ["buffer", "A_log"],
+            ["buffer", "dt_bias"],
+            ["parameter", "lower_bound"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "gate": "raw",
+        "grid_rule": {"kind": "chunks", "x_factor": 1},
+        "kernel_symbol": "kernel_cake_kda_train_4a4e1d210f065174ae1f",
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 76160,
+            "use_pdl": False,
+        },
+        "library": "cake_kda_train_4a4e1d210f065174ae1f",
+        "logical": {
+            "A_log": "A_log",
+            "akk_ext": "akk_ext",
+            "akk_int": "akk_int",
+            "aqk_ext": "aqk_ext",
+            "aqk_int": "aqk_int",
+            "beta": "beta",
+            "chunk_bos": "chunk_bos",
+            "chunk_len": "chunk_len",
+            "cu_seqlens": "cu_seqlens",
+            "dt_bias": "dt_bias",
+            "g_raw": "g_raw",
+            "gk_out": "gk",
+            "group": "group",
+            "k": "k",
+            "kb_out": "kb",
+            "kg_out": "kg",
+            "lower_bound": "lower_bound",
+            "num_heads": "num_heads",
+            "num_qk_heads": "num_heads",
+            "num_seqs": "num_seqs",
+            "proportional": "proportional",
+            "q": "q",
+            "qg_out": "qg",
+            "scale": "scale",
+            "seg_table": "seg_table",
+            "segments": "segments",
+            "seq_chunk_start": "seq_chunk_start",
+            "seq_order": "seq_order",
+            "v_new": "v_new",
+            "write_ext": "write_ext",
+            "write_int": "write_int",
+            "write_prep": "write_prep",
+        },
+        "select_rule": {
+            "kind": "all_of",
+            "rules": [
+                {"kind": "route_in", "routes": ["seg"]},
+                {"kind": "docs_at_most", "max": 256},
+            ],
+        },
+        "stage": "fwd_intra",
+        "variant": "v14_raw",
     },
     "wy_fwd": {
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
@@ -3298,7 +3591,25 @@ MODULES: dict[str, dict[str, Any]] = {
             "qg_out": "qg",
             "v_new": "v_new",
         },
-        "select_rule": {"kind": "path_in", "paths": ["replay"]},
+        "select_rule": {
+            "kind": "all_of",
+            "rules": [
+                {"kind": "path_in", "paths": ["replay"]},
+                {
+                    "kind": "any_of",
+                    "rules": [
+                        {"kind": "l2n_in", "modes": ["off", "fallback"]},
+                        {
+                            "kind": "all_of",
+                            "rules": [
+                                {"kind": "route_in", "routes": ["seg"]},
+                                {"kind": "docs_at_most", "max": 256},
+                            ],
+                        },
+                    ],
+                },
+            ],
+        },
         "stage": "bwd_prep",
         "variant": "g8_replay",
     },
@@ -3474,6 +3785,357 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "stage": "bwd_prep",
         "variant": "g8_noqg_nokb",
+    },
+    "bwd_prep_g8_raw": {
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+        "arg_plan": [
+            ["buffer", "g_raw"],
+            ["buffer", "A_log"],
+            ["buffer", "dt_bias"],
+            ["buffer", "q"],
+            ["buffer", "k"],
+            ["buffer", "beta"],
+            ["buffer", "chunk_bos"],
+            ["buffer", "chunk_len"],
+            ["buffer", "gk_out"],
+            ["buffer", "kb_out"],
+            ["buffer", "qg_out"],
+            ["buffer", "kg_out"],
+            ["buffer", "beta_int"],
+            ["buffer", "v_new"],
+            ["buffer", "dv2"],
+            ["parameter", "num_qk_heads"],
+            ["parameter", "num_heads"],
+            ["parameter", "group"],
+            ["parameter", "lower_bound"],
+            ["parameter", "g_raw_row_stride"],
+            ["parameter", "g_raw_head_stride"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "gate": "raw",
+        "grid_rule": {"kind": "chunks", "x_factor": 1},
+        "kernel_symbol": "kernel_cake_kda_train_ae64693c9399bbbeed85",
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 36864,
+            "use_pdl": False,
+        },
+        "library": "cake_kda_train_ae64693c9399bbbeed85",
+        "logical": {
+            "A_log": "A_log",
+            "beta": "beta",
+            "beta_int": "beta_int",
+            "chunk_bos": "chunk_bos",
+            "chunk_len": "chunk_len",
+            "dt_bias": "dt_bias",
+            "dv2": "dv2",
+            "g_raw": "g_raw",
+            "g_raw_head_stride": "g_raw_head_stride",
+            "g_raw_row_stride": "g_raw_row_stride",
+            "gk_out": "gk",
+            "group": "group",
+            "k": "k",
+            "kb_out": "kb",
+            "kg_out": "kg",
+            "lower_bound": "lower_bound",
+            "num_heads": "num_heads",
+            "num_qk_heads": "num_heads",
+            "q": "q",
+            "qg_out": "qg",
+            "v_new": "v_new",
+        },
+        "select_rule": {"kind": "path_in", "paths": ["tape"]},
+        "stage": "bwd_prep",
+        "variant": "g8_raw",
+    },
+    "bwd_prep_g8_replay_raw": {
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+        "arg_plan": [
+            ["buffer", "g_raw"],
+            ["buffer", "A_log"],
+            ["buffer", "dt_bias"],
+            ["buffer", "q"],
+            ["buffer", "k"],
+            ["buffer", "beta"],
+            ["buffer", "do"],
+            ["buffer", "chunk_bos"],
+            ["buffer", "chunk_len"],
+            ["buffer", "gk_out"],
+            ["buffer", "kb_out"],
+            ["buffer", "qg_out"],
+            ["buffer", "kg_out"],
+            ["buffer", "do_int"],
+            ["buffer", "beta_int"],
+            ["buffer", "v_new"],
+            ["buffer", "dv2"],
+            ["parameter", "num_qk_heads"],
+            ["parameter", "num_heads"],
+            ["parameter", "group"],
+            ["parameter", "lower_bound"],
+            ["parameter", "g_raw_row_stride"],
+            ["parameter", "g_raw_head_stride"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "gate": "raw",
+        "grid_rule": {"kind": "chunks", "x_factor": 1},
+        "kernel_symbol": "kernel_cake_kda_train_2967f0b64b43ffc5d99c",
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 36864,
+            "use_pdl": False,
+        },
+        "library": "cake_kda_train_2967f0b64b43ffc5d99c",
+        "logical": {
+            "A_log": "A_log",
+            "beta": "beta",
+            "beta_int": "beta_int",
+            "chunk_bos": "chunk_bos",
+            "chunk_len": "chunk_len",
+            "do": "dout",
+            "do_int": "do_int",
+            "dt_bias": "dt_bias",
+            "dv2": "dv2",
+            "g_raw": "g_raw",
+            "g_raw_head_stride": "g_raw_head_stride",
+            "g_raw_row_stride": "g_raw_row_stride",
+            "gk_out": "gk",
+            "group": "group",
+            "k": "k",
+            "kb_out": "kb",
+            "kg_out": "kg",
+            "lower_bound": "lower_bound",
+            "num_heads": "num_heads",
+            "num_qk_heads": "num_heads",
+            "q": "q",
+            "qg_out": "qg",
+            "v_new": "v_new",
+        },
+        "select_rule": {
+            "kind": "all_of",
+            "rules": [
+                {"kind": "path_in", "paths": ["replay"]},
+                {
+                    "kind": "any_of",
+                    "rules": [
+                        {"kind": "l2n_in", "modes": ["off", "fallback"]},
+                        {
+                            "kind": "all_of",
+                            "rules": [
+                                {"kind": "route_in", "routes": ["seg"]},
+                                {"kind": "docs_at_most", "max": 256},
+                            ],
+                        },
+                    ],
+                },
+            ],
+        },
+        "stage": "bwd_prep",
+        "variant": "g8_replay_raw",
+    },
+    "bwd_prep_g8_noqg_raw": {
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+        "arg_plan": [
+            ["buffer", "g_raw"],
+            ["buffer", "A_log"],
+            ["buffer", "dt_bias"],
+            ["buffer", "k"],
+            ["buffer", "beta"],
+            ["buffer", "chunk_bos"],
+            ["buffer", "chunk_len"],
+            ["buffer", "gk_out"],
+            ["buffer", "kb_out"],
+            ["buffer", "kg_out"],
+            ["buffer", "beta_int"],
+            ["buffer", "v_new"],
+            ["buffer", "dv2"],
+            ["parameter", "num_qk_heads"],
+            ["parameter", "num_heads"],
+            ["parameter", "group"],
+            ["parameter", "lower_bound"],
+            ["parameter", "g_raw_row_stride"],
+            ["parameter", "g_raw_head_stride"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "gate": "raw",
+        "grid_rule": {"kind": "chunks", "x_factor": 1},
+        "kernel_symbol": "kernel_cake_kda_train_56f330993b31a0e3a88d",
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 36864,
+            "use_pdl": False,
+        },
+        "library": "cake_kda_train_56f330993b31a0e3a88d",
+        "logical": {
+            "A_log": "A_log",
+            "beta": "beta",
+            "beta_int": "beta_int",
+            "chunk_bos": "chunk_bos",
+            "chunk_len": "chunk_len",
+            "dt_bias": "dt_bias",
+            "dv2": "dv2",
+            "g_raw": "g_raw",
+            "g_raw_head_stride": "g_raw_head_stride",
+            "g_raw_row_stride": "g_raw_row_stride",
+            "gk_out": "gk",
+            "group": "group",
+            "k": "k",
+            "kb_out": "kb",
+            "kg_out": "kg",
+            "lower_bound": "lower_bound",
+            "num_heads": "num_heads",
+            "num_qk_heads": "num_heads",
+            "v_new": "v_new",
+        },
+        "select_rule": {
+            "kind": "all_of",
+            "rules": [
+                {"kind": "path_in", "paths": ["light", "light_states"]},
+                {
+                    "kind": "any_of",
+                    "rules": [
+                        {"kind": "path_in", "paths": ["light_states"]},
+                        {"kind": "route_in", "routes": ["seg"]},
+                        {"kind": "heads_below", "max": 16},
+                        {"kind": "heads_above", "min": 16},
+                        {"kind": "slots_above", "slices": 4, "ctas_per_sm": 4},
+                        {"kind": "arch_in", "arches": ["sm_103a", "sm_107a"]},
+                    ],
+                },
+                {
+                    "kind": "any_of",
+                    "rules": [
+                        {"kind": "route_in", "routes": ["serial"]},
+                        {"kind": "heads_below", "max": 16},
+                        {"kind": "heads_above", "min": 16},
+                        {"kind": "chains_at_most", "max": 32},
+                        {"kind": "arch_in", "arches": ["sm_100a"]},
+                    ],
+                },
+            ],
+        },
+        "stage": "bwd_prep",
+        "variant": "g8_noqg_raw",
+    },
+    "bwd_prep_g8_noqg_nokb_raw": {
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+        "arg_plan": [
+            ["buffer", "g_raw"],
+            ["buffer", "A_log"],
+            ["buffer", "dt_bias"],
+            ["buffer", "k"],
+            ["buffer", "beta"],
+            ["buffer", "chunk_bos"],
+            ["buffer", "chunk_len"],
+            ["buffer", "gk_out"],
+            ["buffer", "kg_out"],
+            ["buffer", "beta_int"],
+            ["buffer", "v_new"],
+            ["buffer", "dv2"],
+            ["parameter", "num_qk_heads"],
+            ["parameter", "num_heads"],
+            ["parameter", "group"],
+            ["parameter", "lower_bound"],
+            ["parameter", "g_raw_row_stride"],
+            ["parameter", "g_raw_head_stride"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "gate": "raw",
+        "grid_rule": {"kind": "chunks", "x_factor": 1},
+        "kernel_symbol": "kernel_cake_kda_train_3c62638b8848d67f5f20",
+        "launch": {
+            "block": (256, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 36864,
+            "use_pdl": False,
+        },
+        "library": "cake_kda_train_3c62638b8848d67f5f20",
+        "logical": {
+            "A_log": "A_log",
+            "beta": "beta",
+            "beta_int": "beta_int",
+            "chunk_bos": "chunk_bos",
+            "chunk_len": "chunk_len",
+            "dt_bias": "dt_bias",
+            "dv2": "dv2",
+            "g_raw": "g_raw",
+            "g_raw_head_stride": "g_raw_head_stride",
+            "g_raw_row_stride": "g_raw_row_stride",
+            "gk_out": "gk",
+            "group": "group",
+            "k": "k",
+            "kg_out": "kg",
+            "lower_bound": "lower_bound",
+            "num_heads": "num_heads",
+            "num_qk_heads": "num_heads",
+            "v_new": "v_new",
+        },
+        "select_rule": {
+            "kind": "all_of",
+            "rules": [
+                {"kind": "path_in", "paths": ["light", "light_states"]},
+                {
+                    "kind": "any_of",
+                    "rules": [
+                        {
+                            "kind": "all_of",
+                            "rules": [
+                                {"kind": "path_in", "paths": ["light"]},
+                                {"kind": "route_in", "routes": ["serial"]},
+                                {
+                                    "kind": "all_of",
+                                    "rules": [
+                                        {"kind": "heads_at_least", "min": 16},
+                                        {"kind": "heads_at_most", "max": 16},
+                                    ],
+                                },
+                                {
+                                    "kind": "slots_at_most",
+                                    "slices": 4,
+                                    "ctas_per_sm": 4,
+                                },
+                                {"kind": "arch_in", "arches": ["sm_100a"]},
+                            ],
+                        },
+                        {
+                            "kind": "all_of",
+                            "rules": [
+                                {"kind": "route_in", "routes": ["seg"]},
+                                {
+                                    "kind": "all_of",
+                                    "rules": [
+                                        {"kind": "heads_at_least", "min": 16},
+                                        {"kind": "heads_at_most", "max": 16},
+                                    ],
+                                },
+                                {"kind": "chains_above", "min": 32},
+                                {"kind": "arch_in", "arches": ["sm_103a", "sm_107a"]},
+                            ],
+                        },
+                    ],
+                },
+            ],
+        },
+        "stage": "bwd_prep",
+        "variant": "g8_noqg_nokb_raw",
     },
     "dav_serial": {
         "arches": ["sm_100a", "sm_103a", "sm_107a"],
@@ -5204,7 +5866,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "variant": "int",
     },
     "dqkg_davq": {
-        "arches": ["sm_100a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
             ["buffer", "do_tma"],
             ["buffer", "vn_tma"],
@@ -5283,7 +5945,7 @@ MODULES: dict[str, dict[str, Any]] = {
         "variant": "davq",
     },
     "dqkg_int_davq": {
-        "arches": ["sm_103a"],
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
         "arg_plan": [
             ["buffer", "do_tma"],
             ["buffer", "vn_tma"],
@@ -5728,6 +6390,558 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "stage": "dqkg",
         "variant": "int_davq_nohint_v24",
+    },
+    "dqkg_raw": {
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+        "arg_plan": [
+            ["buffer", "do_tma"],
+            ["buffer", "vn_tma"],
+            ["buffer", "dv2_tma"],
+            ["buffer", "v_tma"],
+            ["buffer", "h_tma"],
+            ["buffer", "dh_tma"],
+            ["buffer", "akk_tma"],
+            ["buffer", "gk_tma"],
+            ["buffer", "k_tma"],
+            ["buffer", "q_tma"],
+            ["buffer", "beta"],
+            ["buffer", "dq_out"],
+            ["buffer", "dk_out"],
+            ["buffer", "dg_out"],
+            ["buffer", "db_out"],
+            ["buffer", "dAkk_out"],
+            ["buffer", "dv_out"],
+            ["parameter", "num_heads"],
+            ["buffer", "seq_chunk_start"],
+            ["parameter", "num_seqs"],
+            ["buffer", "chunk_bos"],
+            ["buffer", "chunk_len"],
+            ["parameter", "scale"],
+            ["buffer", "dAqk_out"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "gate": "raw",
+        "grid_rule": {"kind": "chunk_items"},
+        "kernel_symbol": "kernel_cake_kda_train_ac974e171d56fc3ce10b",
+        "launch": {
+            "block": (576, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 224384,
+            "use_pdl": False,
+        },
+        "library": "cake_kda_train_ac974e171d56fc3ce10b",
+        "logical": {
+            "akk_tma": "akk_src",
+            "beta": "beta_int",
+            "chunk_bos": "chunk_bos",
+            "chunk_len": "chunk_len",
+            "dAkk_out": "dAkk",
+            "dAqk_out": "dAqk",
+            "db_out": "db_f",
+            "dg_out": "dg_f",
+            "dh_tma": "dh2d",
+            "dk_out": "dk_f",
+            "do_tma": "dout",
+            "dq_out": "dq_f",
+            "dv2_tma": "dv2",
+            "dv_out": "dv",
+            "gk_tma": "gk",
+            "h_tma": "h2d",
+            "k_tma": "k",
+            "num_heads": "num_heads",
+            "num_seqs": "num_seqs",
+            "q_tma": "q",
+            "scale": "scale",
+            "seq_chunk_start": "seq_chunk_start",
+            "v_tma": "v",
+            "vn_tma": "v_new",
+        },
+        "select_rule": {
+            "kind": "all_of",
+            "rules": [
+                {"kind": "path_in", "paths": ["light", "light_states", "tape"]},
+                {"kind": "route_in", "routes": ["serial"]},
+                {"kind": "heads_below", "max": 16},
+            ],
+        },
+        "stage": "dqkg",
+        "variant": "raw",
+    },
+    "dqkg_int_raw": {
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+        "arg_plan": [
+            ["buffer", "do_tma"],
+            ["buffer", "vn_tma"],
+            ["buffer", "dv2_tma"],
+            ["buffer", "v_tma"],
+            ["buffer", "h_tma"],
+            ["buffer", "dh_tma"],
+            ["buffer", "akk_tma"],
+            ["buffer", "gk_tma"],
+            ["buffer", "k_tma"],
+            ["buffer", "q_tma"],
+            ["buffer", "beta"],
+            ["buffer", "dq_out"],
+            ["buffer", "dk_out"],
+            ["buffer", "dg_out"],
+            ["buffer", "db_out"],
+            ["buffer", "dAkk_out"],
+            ["buffer", "dv_out"],
+            ["parameter", "num_heads"],
+            ["buffer", "seq_chunk_start"],
+            ["parameter", "num_seqs"],
+            ["buffer", "chunk_bos"],
+            ["buffer", "chunk_len"],
+            ["parameter", "scale"],
+            ["buffer", "dAqk_out"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "gate": "raw",
+        "grid_rule": {"kind": "chunk_items"},
+        "kernel_symbol": "kernel_cake_kda_train_058a68a5b4d89c53be4b",
+        "launch": {
+            "block": (576, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 224384,
+            "use_pdl": False,
+        },
+        "library": "cake_kda_train_058a68a5b4d89c53be4b",
+        "logical": {
+            "akk_tma": "akk_int",
+            "beta": "beta_int",
+            "chunk_bos": "chunk_bos",
+            "chunk_len": "chunk_len",
+            "dAkk_out": "dAkk",
+            "dAqk_out": "dAqk",
+            "db_out": "db_f",
+            "dg_out": "dg_f",
+            "dh_tma": "dh2d",
+            "dk_out": "dk_f",
+            "do_tma": "do_int",
+            "dq_out": "dq_f",
+            "dv2_tma": "dv2",
+            "dv_out": "dv",
+            "gk_tma": "gk",
+            "h_tma": "h2d",
+            "k_tma": "k",
+            "num_heads": "num_heads",
+            "num_seqs": "num_seqs",
+            "q_tma": "q",
+            "scale": "scale",
+            "seq_chunk_start": "seq_chunk_start",
+            "v_tma": "v",
+            "vn_tma": "v_new",
+        },
+        "select_rule": {
+            "kind": "all_of",
+            "rules": [
+                {"kind": "path_in", "paths": ["replay"]},
+                {"kind": "route_in", "routes": ["serial"]},
+                {"kind": "heads_below", "max": 16},
+            ],
+        },
+        "stage": "dqkg",
+        "variant": "int_raw",
+    },
+    "dqkg_davq_raw": {
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+        "arg_plan": [
+            ["buffer", "do_tma"],
+            ["buffer", "vn_tma"],
+            ["buffer", "dv2_tma"],
+            ["buffer", "v_tma"],
+            ["buffer", "h_tma"],
+            ["buffer", "dh_tma"],
+            ["buffer", "akk_tma"],
+            ["buffer", "gk_tma"],
+            ["buffer", "k_tma"],
+            ["buffer", "q_tma"],
+            ["buffer", "beta"],
+            ["buffer", "dq_out"],
+            ["buffer", "dk_out"],
+            ["buffer", "dg_out"],
+            ["buffer", "db_out"],
+            ["buffer", "dAkk_out"],
+            ["buffer", "dv_out"],
+            ["parameter", "num_heads"],
+            ["buffer", "seq_chunk_start"],
+            ["parameter", "num_seqs"],
+            ["buffer", "chunk_bos"],
+            ["buffer", "chunk_len"],
+            ["parameter", "scale"],
+            ["buffer", "dAqk_out"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "gate": "raw",
+        "grid_rule": {"kind": "chunk_items"},
+        "kernel_symbol": "kernel_cake_kda_train_f6a70fb0288a508f2828",
+        "launch": {
+            "block": (320, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 224384,
+            "use_pdl": False,
+        },
+        "library": "cake_kda_train_f6a70fb0288a508f2828",
+        "logical": {
+            "akk_tma": "akk_src",
+            "beta": "beta_int",
+            "chunk_bos": "chunk_bos",
+            "chunk_len": "chunk_len",
+            "dAkk_out": "dAkk",
+            "dAqk_out": "dAqk",
+            "db_out": "db_f",
+            "dg_out": "dg_f",
+            "dh_tma": "dh2d",
+            "dk_out": "dk_f",
+            "do_tma": "dout",
+            "dq_out": "dq_f",
+            "dv2_tma": "dv2",
+            "dv_out": "dv",
+            "gk_tma": "gk",
+            "h_tma": "h2d",
+            "k_tma": "k",
+            "num_heads": "num_heads",
+            "num_seqs": "num_seqs",
+            "q_tma": "q",
+            "scale": "scale",
+            "seq_chunk_start": "seq_chunk_start",
+            "v_tma": "v",
+            "vn_tma": "v_new",
+        },
+        "select_rule": {
+            "kind": "all_of",
+            "rules": [
+                {"kind": "path_in", "paths": ["light", "light_states", "tape"]},
+                {
+                    "kind": "any_of",
+                    "rules": [
+                        {
+                            "kind": "all_of",
+                            "rules": [
+                                {"kind": "route_in", "routes": ["serial"]},
+                                {"kind": "heads_at_least", "min": 16},
+                                {
+                                    "kind": "any_of",
+                                    "rules": [
+                                        {
+                                            "kind": "arch_in",
+                                            "arches": ["sm_100a", "sm_103a"],
+                                        },
+                                        {"kind": "heads_below", "max": 16},
+                                    ],
+                                },
+                            ],
+                        },
+                        {
+                            "kind": "all_of",
+                            "rules": [
+                                {"kind": "route_in", "routes": ["seg"]},
+                                {
+                                    "kind": "any_of",
+                                    "rules": [
+                                        {
+                                            "kind": "arch_in",
+                                            "arches": ["sm_100a", "sm_103a"],
+                                        },
+                                        {"kind": "heads_below", "max": 16},
+                                    ],
+                                },
+                            ],
+                        },
+                    ],
+                },
+            ],
+        },
+        "stage": "dqkg",
+        "variant": "davq_raw",
+    },
+    "dqkg_int_davq_raw": {
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+        "arg_plan": [
+            ["buffer", "do_tma"],
+            ["buffer", "vn_tma"],
+            ["buffer", "dv2_tma"],
+            ["buffer", "v_tma"],
+            ["buffer", "h_tma"],
+            ["buffer", "dh_tma"],
+            ["buffer", "akk_tma"],
+            ["buffer", "gk_tma"],
+            ["buffer", "k_tma"],
+            ["buffer", "q_tma"],
+            ["buffer", "beta"],
+            ["buffer", "dq_out"],
+            ["buffer", "dk_out"],
+            ["buffer", "dg_out"],
+            ["buffer", "db_out"],
+            ["buffer", "dAkk_out"],
+            ["buffer", "dv_out"],
+            ["parameter", "num_heads"],
+            ["buffer", "seq_chunk_start"],
+            ["parameter", "num_seqs"],
+            ["buffer", "chunk_bos"],
+            ["buffer", "chunk_len"],
+            ["parameter", "scale"],
+            ["buffer", "dAqk_out"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "gate": "raw",
+        "grid_rule": {"kind": "chunk_items"},
+        "kernel_symbol": "kernel_cake_kda_train_1f9c46f98f4290ee26df",
+        "launch": {
+            "block": (320, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 224384,
+            "use_pdl": False,
+        },
+        "library": "cake_kda_train_1f9c46f98f4290ee26df",
+        "logical": {
+            "akk_tma": "akk_int",
+            "beta": "beta_int",
+            "chunk_bos": "chunk_bos",
+            "chunk_len": "chunk_len",
+            "dAkk_out": "dAkk",
+            "dAqk_out": "dAqk",
+            "db_out": "db_f",
+            "dg_out": "dg_f",
+            "dh_tma": "dh2d",
+            "dk_out": "dk_f",
+            "do_tma": "do_int",
+            "dq_out": "dq_f",
+            "dv2_tma": "dv2",
+            "dv_out": "dv",
+            "gk_tma": "gk",
+            "h_tma": "h2d",
+            "k_tma": "k",
+            "num_heads": "num_heads",
+            "num_seqs": "num_seqs",
+            "q_tma": "q",
+            "scale": "scale",
+            "seq_chunk_start": "seq_chunk_start",
+            "v_tma": "v",
+            "vn_tma": "v_new",
+        },
+        "select_rule": {
+            "kind": "all_of",
+            "rules": [
+                {"kind": "path_in", "paths": ["replay"]},
+                {
+                    "kind": "any_of",
+                    "rules": [
+                        {
+                            "kind": "all_of",
+                            "rules": [
+                                {"kind": "route_in", "routes": ["serial"]},
+                                {"kind": "heads_at_least", "min": 16},
+                                {
+                                    "kind": "any_of",
+                                    "rules": [
+                                        {
+                                            "kind": "arch_in",
+                                            "arches": ["sm_100a", "sm_103a"],
+                                        },
+                                        {"kind": "heads_below", "max": 16},
+                                    ],
+                                },
+                            ],
+                        },
+                        {
+                            "kind": "all_of",
+                            "rules": [
+                                {"kind": "route_in", "routes": ["seg"]},
+                                {
+                                    "kind": "any_of",
+                                    "rules": [
+                                        {
+                                            "kind": "arch_in",
+                                            "arches": ["sm_100a", "sm_103a"],
+                                        },
+                                        {"kind": "heads_below", "max": 16},
+                                    ],
+                                },
+                            ],
+                        },
+                    ],
+                },
+            ],
+        },
+        "stage": "dqkg",
+        "variant": "int_davq_raw",
+    },
+    "dqkg_davq_nohint_raw": {
+        "arches": ["sm_107a"],
+        "arg_plan": [
+            ["buffer", "do_tma"],
+            ["buffer", "vn_tma"],
+            ["buffer", "dv2_tma"],
+            ["buffer", "v_tma"],
+            ["buffer", "h_tma"],
+            ["buffer", "dh_tma"],
+            ["buffer", "akk_tma"],
+            ["buffer", "gk_tma"],
+            ["buffer", "k_tma"],
+            ["buffer", "q_tma"],
+            ["buffer", "beta"],
+            ["buffer", "dq_out"],
+            ["buffer", "dk_out"],
+            ["buffer", "dg_out"],
+            ["buffer", "db_out"],
+            ["buffer", "dAkk_out"],
+            ["buffer", "dv_out"],
+            ["parameter", "num_heads"],
+            ["buffer", "seq_chunk_start"],
+            ["parameter", "num_seqs"],
+            ["buffer", "chunk_bos"],
+            ["buffer", "chunk_len"],
+            ["parameter", "scale"],
+            ["buffer", "dAqk_out"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "gate": "raw",
+        "grid_rule": {"kind": "chunk_items"},
+        "kernel_symbol": "kernel_cake_kda_train_1a0df5d531918da7561e",
+        "launch": {
+            "block": (320, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 224384,
+            "use_pdl": False,
+        },
+        "library": "cake_kda_train_1a0df5d531918da7561e",
+        "logical": {
+            "akk_tma": "akk_src",
+            "beta": "beta_int",
+            "chunk_bos": "chunk_bos",
+            "chunk_len": "chunk_len",
+            "dAkk_out": "dAkk",
+            "dAqk_out": "dAqk",
+            "db_out": "db_f",
+            "dg_out": "dg_f",
+            "dh_tma": "dh2d",
+            "dk_out": "dk_f",
+            "do_tma": "dout",
+            "dq_out": "dq_f",
+            "dv2_tma": "dv2",
+            "dv_out": "dv",
+            "gk_tma": "gk",
+            "h_tma": "h2d",
+            "k_tma": "k",
+            "num_heads": "num_heads",
+            "num_seqs": "num_seqs",
+            "q_tma": "q",
+            "scale": "scale",
+            "seq_chunk_start": "seq_chunk_start",
+            "v_tma": "v",
+            "vn_tma": "v_new",
+        },
+        "select_rule": {
+            "kind": "all_of",
+            "rules": [
+                {"kind": "path_in", "paths": ["light", "light_states", "tape"]},
+                {"kind": "arch_in", "arches": ["sm_107a"]},
+                {"kind": "heads_at_least", "min": 16},
+            ],
+        },
+        "stage": "dqkg",
+        "variant": "davq_nohint_raw",
+    },
+    "dqkg_int_davq_nohint_raw": {
+        "arches": ["sm_107a"],
+        "arg_plan": [
+            ["buffer", "do_tma"],
+            ["buffer", "vn_tma"],
+            ["buffer", "dv2_tma"],
+            ["buffer", "v_tma"],
+            ["buffer", "h_tma"],
+            ["buffer", "dh_tma"],
+            ["buffer", "akk_tma"],
+            ["buffer", "gk_tma"],
+            ["buffer", "k_tma"],
+            ["buffer", "q_tma"],
+            ["buffer", "beta"],
+            ["buffer", "dq_out"],
+            ["buffer", "dk_out"],
+            ["buffer", "dg_out"],
+            ["buffer", "db_out"],
+            ["buffer", "dAkk_out"],
+            ["buffer", "dv_out"],
+            ["parameter", "num_heads"],
+            ["buffer", "seq_chunk_start"],
+            ["parameter", "num_seqs"],
+            ["buffer", "chunk_bos"],
+            ["buffer", "chunk_len"],
+            ["parameter", "scale"],
+            ["buffer", "dAqk_out"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "gate": "raw",
+        "grid_rule": {"kind": "chunk_items"},
+        "kernel_symbol": "kernel_cake_kda_train_3b9b3f9a495f04bc83e4",
+        "launch": {
+            "block": (320, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 224384,
+            "use_pdl": False,
+        },
+        "library": "cake_kda_train_3b9b3f9a495f04bc83e4",
+        "logical": {
+            "akk_tma": "akk_int",
+            "beta": "beta_int",
+            "chunk_bos": "chunk_bos",
+            "chunk_len": "chunk_len",
+            "dAkk_out": "dAkk",
+            "dAqk_out": "dAqk",
+            "db_out": "db_f",
+            "dg_out": "dg_f",
+            "dh_tma": "dh2d",
+            "dk_out": "dk_f",
+            "do_tma": "do_int",
+            "dq_out": "dq_f",
+            "dv2_tma": "dv2",
+            "dv_out": "dv",
+            "gk_tma": "gk",
+            "h_tma": "h2d",
+            "k_tma": "k",
+            "num_heads": "num_heads",
+            "num_seqs": "num_seqs",
+            "q_tma": "q",
+            "scale": "scale",
+            "seq_chunk_start": "seq_chunk_start",
+            "v_tma": "v",
+            "vn_tma": "v_new",
+        },
+        "select_rule": {
+            "kind": "all_of",
+            "rules": [
+                {"kind": "path_in", "paths": ["replay"]},
+                {"kind": "arch_in", "arches": ["sm_107a"]},
+                {"kind": "heads_at_least", "min": 16},
+            ],
+        },
+        "stage": "dqkg",
+        "variant": "int_davq_nohint_raw",
     },
     "glm_intra": {
         "arches": ["sm_100a"],
@@ -6273,6 +7487,275 @@ MODULES: dict[str, dict[str, Any]] = {
         "stage": "glm_intra",
         "variant": "v23",
     },
+    "glm_intra_raw": {
+        "arches": ["sm_107a"],
+        "arg_plan": [
+            ["buffer", "dAqk"],
+            ["buffer", "dAkk"],
+            ["buffer", "gk"],
+            ["buffer", "k_e"],
+            ["buffer", "q_e"],
+            ["buffer", "dq_f_t"],
+            ["buffer", "dk_f_t"],
+            ["buffer", "dg_f_t"],
+            ["buffer", "beta"],
+            ["buffer", "dq_f"],
+            ["buffer", "dk_f"],
+            ["buffer", "dg_f"],
+            ["buffer", "db_f"],
+            ["buffer", "chunk_bos"],
+            ["buffer", "chunk_len"],
+            ["buffer", "g_raw"],
+            ["buffer", "A_log"],
+            ["buffer", "dt_bias"],
+            ["buffer", "dq_ext"],
+            ["buffer", "dk_ext"],
+            ["buffer", "dg_raw"],
+            ["buffer", "dbeta_ext"],
+            ["buffer", "dA_part"],
+            ["buffer", "db_part"],
+            ["parameter", "num_heads"],
+            ["parameter", "num_qk_heads"],
+            ["parameter", "group"],
+            ["parameter", "lower_bound"],
+            ["parameter", "g_raw_row_stride"],
+            ["parameter", "g_raw_head_stride"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "gate": "raw",
+        "grid_rule": {"kind": "chunks", "x_factor": 1},
+        "kernel_symbol": "kernel_cake_kda_train_ea14e16d1fc71364ba03",
+        "launch": {
+            "block": (288, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 115200,
+            "use_pdl": False,
+        },
+        "library": "cake_kda_train_ea14e16d1fc71364ba03",
+        "logical": {
+            "A_log": "A_log",
+            "beta": "beta_int",
+            "chunk_bos": "chunk_bos",
+            "chunk_len": "chunk_len",
+            "dA_part": "dA_part",
+            "dAkk": "dAkk",
+            "dAqk": "dAqk",
+            "db_f": "db_f",
+            "db_part": "db_part",
+            "dbeta_ext": "dbeta",
+            "dg_f": "dg_f",
+            "dg_f_t": "dg_f",
+            "dg_raw": "dg_raw",
+            "dk_ext": "dk",
+            "dk_f": "dk_f",
+            "dk_f_t": "dk_f",
+            "dq_ext": "dq",
+            "dq_f": "dq_f",
+            "dq_f_t": "dq_f",
+            "dt_bias": "dt_bias",
+            "g_raw": "g_raw",
+            "g_raw_head_stride": "g_raw_head_stride",
+            "g_raw_row_stride": "g_raw_row_stride",
+            "gk": "gk",
+            "group": "group",
+            "k_e": "k",
+            "lower_bound": "lower_bound",
+            "num_heads": "num_heads",
+            "num_qk_heads": "num_heads",
+            "q_e": "q",
+        },
+        "select_rule": {"kind": "arch_in", "arches": ["sm_107a"]},
+        "stage": "glm_intra",
+        "variant": "raw",
+    },
+    "glm_intra_v20c": {
+        "arches": ["sm_100a", "sm_103a"],
+        "arg_plan": [
+            ["buffer", "dAqk"],
+            ["buffer", "dAkk"],
+            ["buffer", "gk"],
+            ["buffer", "k_e"],
+            ["buffer", "q_e"],
+            ["buffer", "dq_f_t"],
+            ["buffer", "dk_f_t"],
+            ["buffer", "dg_f_t"],
+            ["buffer", "beta"],
+            ["buffer", "dq_f"],
+            ["buffer", "dk_f"],
+            ["buffer", "dg_f"],
+            ["buffer", "db_f"],
+            ["buffer", "chunk_bos"],
+            ["buffer", "chunk_len"],
+            ["buffer", "g_raw"],
+            ["buffer", "A_log"],
+            ["buffer", "dt_bias"],
+            ["buffer", "dq_ext"],
+            ["buffer", "dk_ext"],
+            ["buffer", "dg_raw"],
+            ["buffer", "dbeta_ext"],
+            ["buffer", "param_acc"],
+            ["parameter", "num_heads"],
+            ["parameter", "num_qk_heads"],
+            ["parameter", "group"],
+            ["parameter", "lower_bound"],
+            ["parameter", "g_raw_row_stride"],
+            ["parameter", "g_raw_head_stride"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "gate": "raw",
+        "grid_rule": {"kind": "chunks", "x_factor": 1},
+        "kernel_symbol": "kernel_cake_kda_train_87b73f813c841159bf43",
+        "launch": {
+            "block": (288, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 115200,
+            "use_pdl": False,
+        },
+        "library": "cake_kda_train_87b73f813c841159bf43",
+        "logical": {
+            "A_log": "A_log",
+            "beta": "beta_int",
+            "chunk_bos": "chunk_bos",
+            "chunk_len": "chunk_len",
+            "dAkk": "dAkk",
+            "dAqk": "dAqk",
+            "db_f": "db_f",
+            "dbeta_ext": "dbeta",
+            "dg_f": "dg_f",
+            "dg_f_t": "dg_f",
+            "dg_raw": "dg_raw",
+            "dk_ext": "dk",
+            "dk_f": "dk_f",
+            "dk_f_t": "dk_f",
+            "dq_ext": "dq",
+            "dq_f": "dq_f",
+            "dq_f_t": "dq_f",
+            "dt_bias": "dt_bias",
+            "g_raw": "g_raw",
+            "g_raw_head_stride": "g_raw_head_stride",
+            "g_raw_row_stride": "g_raw_row_stride",
+            "gk": "gk",
+            "group": "group",
+            "k_e": "k",
+            "lower_bound": "lower_bound",
+            "num_heads": "num_heads",
+            "num_qk_heads": "num_heads",
+            "param_acc": "param_acc",
+            "q_e": "q",
+        },
+        "select_rule": {
+            "kind": "any_of",
+            "rules": [
+                {"kind": "arch_in", "arches": ["sm_103a"]},
+                {
+                    "kind": "all_of",
+                    "rules": [
+                        {"kind": "arch_in", "arches": ["sm_100a"]},
+                        {"kind": "heads_below", "max": 32},
+                    ],
+                },
+            ],
+        },
+        "stage": "glm_intra",
+        "variant": "v20c",
+    },
+    "glm_intra_v20c_r8": {
+        "arches": ["sm_100a"],
+        "arg_plan": [
+            ["buffer", "dAqk"],
+            ["buffer", "dAkk"],
+            ["buffer", "gk"],
+            ["buffer", "k_e"],
+            ["buffer", "q_e"],
+            ["buffer", "dq_f_t"],
+            ["buffer", "dk_f_t"],
+            ["buffer", "dg_f_t"],
+            ["buffer", "beta"],
+            ["buffer", "dq_f"],
+            ["buffer", "dk_f"],
+            ["buffer", "dg_f"],
+            ["buffer", "db_f"],
+            ["buffer", "chunk_bos"],
+            ["buffer", "chunk_len"],
+            ["buffer", "g_raw"],
+            ["buffer", "A_log"],
+            ["buffer", "dt_bias"],
+            ["buffer", "dq_ext"],
+            ["buffer", "dk_ext"],
+            ["buffer", "dg_raw"],
+            ["buffer", "dbeta_ext"],
+            ["buffer", "param_acc"],
+            ["parameter", "num_heads"],
+            ["parameter", "num_qk_heads"],
+            ["parameter", "group"],
+            ["parameter", "lower_bound"],
+            ["parameter", "g_raw_row_stride"],
+            ["parameter", "g_raw_head_stride"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "gate": "raw",
+        "grid_rule": {"kind": "chunks", "x_factor": 1},
+        "kernel_symbol": "kernel_cake_kda_train_31fa936f5468b5749a33",
+        "launch": {
+            "block": (288, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 115200,
+            "use_pdl": False,
+        },
+        "library": "cake_kda_train_31fa936f5468b5749a33",
+        "logical": {
+            "A_log": "A_log",
+            "beta": "beta_int",
+            "chunk_bos": "chunk_bos",
+            "chunk_len": "chunk_len",
+            "dAkk": "dAkk",
+            "dAqk": "dAqk",
+            "db_f": "db_f",
+            "dbeta_ext": "dbeta",
+            "dg_f": "dg_f",
+            "dg_f_t": "dg_f",
+            "dg_raw": "dg_raw",
+            "dk_ext": "dk",
+            "dk_f": "dk_f",
+            "dk_f_t": "dk_f",
+            "dq_ext": "dq",
+            "dq_f": "dq_f",
+            "dq_f_t": "dq_f",
+            "dt_bias": "dt_bias",
+            "g_raw": "g_raw",
+            "g_raw_head_stride": "g_raw_head_stride",
+            "g_raw_row_stride": "g_raw_row_stride",
+            "gk": "gk",
+            "group": "group",
+            "k_e": "k",
+            "lower_bound": "lower_bound",
+            "num_heads": "num_heads",
+            "num_qk_heads": "num_heads",
+            "param_acc": "param_acc",
+            "q_e": "q",
+        },
+        "select_rule": {
+            "kind": "all_of",
+            "rules": [
+                {"kind": "arch_in", "arches": ["sm_100a"]},
+                {"kind": "heads_at_least", "min": 32},
+            ],
+        },
+        "stage": "glm_intra",
+        "variant": "v20c_r8",
+    },
     "gate_epilogue": {
         "arches": ["sm_100a"],
         "arg_plan": [
@@ -6288,6 +7771,7 @@ MODULES: dict[str, dict[str, Any]] = {
             ["grid", "grid_z"],
         ],
         "ffi_entry": "run",
+        "gate": "g",
         "grid_rule": {"kind": "chunks", "x_factor": 1},
         "kernel_symbol": "kernel_cake_kda_train_47a9c058e6d6c78c166d",
         "launch": {
@@ -6311,6 +7795,162 @@ MODULES: dict[str, dict[str, Any]] = {
         "stage": "gate_epilogue",
         "variant": None,
     },
+    "param_finalize": {
+        "arches": ["sm_107a"],
+        "arg_plan": [
+            ["buffer", "dA_part"],
+            ["buffer", "db_part"],
+            ["buffer", "seq_chunk_start"],
+            ["parameter", "num_seqs"],
+            ["buffer", "part2"],
+            ["parameter", "seg_cap"],
+            ["buffer", "ticket"],
+            ["buffer", "dA_log"],
+            ["buffer", "ddt_bias"],
+            ["parameter", "num_heads"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "gate": "raw",
+        "grid_rule": {"kind": "head_chunk_blocks", "per_cta": 128},
+        "kernel_symbol": "kernel_cake_kda_train_9788763cb8ed232f13b4",
+        "launch": {
+            "block": (1024, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 16512,
+            "use_pdl": False,
+        },
+        "library": "cake_kda_train_9788763cb8ed232f13b4",
+        "logical": {
+            "dA_log": "dA_log",
+            "dA_part": "dA_part",
+            "db_part": "db_part",
+            "ddt_bias": "ddt_bias",
+            "num_heads": "num_heads",
+            "num_seqs": "num_seqs",
+            "part2": "part2",
+            "seg_cap": "seg_cap",
+            "seq_chunk_start": "seq_chunk_start",
+            "ticket": "ticket",
+        },
+        "select_rule": {
+            "kind": "all_of",
+            "rules": [
+                {
+                    "kind": "path_in",
+                    "paths": ["light", "light_states", "tape", "replay"],
+                },
+                {"kind": "arch_in", "arches": ["sm_107a"]},
+            ],
+        },
+        "stage": "param_finalize",
+        "variant": None,
+    },
+    "param_finalize_cast": {
+        "arches": ["sm_100a", "sm_103a"],
+        "arg_plan": [
+            ["buffer", "param_acc"],
+            ["buffer", "dA_log"],
+            ["buffer", "ddt_bias"],
+            ["parameter", "num_heads"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "gate": "raw",
+        "grid_rule": {"kind": "heads"},
+        "kernel_symbol": "kernel_cake_kda_train_ee7092e42aef1607a922",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 128,
+            "use_pdl": False,
+        },
+        "library": "cake_kda_train_ee7092e42aef1607a922",
+        "logical": {
+            "dA_log": "dA_log",
+            "ddt_bias": "ddt_bias",
+            "num_heads": "num_heads",
+            "param_acc": "param_acc",
+        },
+        "select_rule": {
+            "kind": "all_of",
+            "rules": [
+                {
+                    "kind": "path_in",
+                    "paths": ["light", "light_states", "tape", "replay"],
+                },
+                {
+                    "kind": "any_of",
+                    "rules": [
+                        {"kind": "arch_in", "arches": ["sm_103a"]},
+                        {
+                            "kind": "all_of",
+                            "rules": [
+                                {"kind": "arch_in", "arches": ["sm_100a"]},
+                                {"kind": "heads_below", "max": 32},
+                            ],
+                        },
+                    ],
+                },
+            ],
+        },
+        "stage": "param_finalize",
+        "variant": "cast",
+    },
+    "param_finalize_cast_r8": {
+        "arches": ["sm_100a"],
+        "arg_plan": [
+            ["buffer", "param_acc"],
+            ["buffer", "dA_log"],
+            ["buffer", "ddt_bias"],
+            ["parameter", "num_heads"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "gate": "raw",
+        "grid_rule": {"kind": "heads"},
+        "kernel_symbol": "kernel_cake_kda_train_cf36cd1c50c40e4ffa1d",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 128,
+            "use_pdl": False,
+        },
+        "library": "cake_kda_train_cf36cd1c50c40e4ffa1d",
+        "logical": {
+            "dA_log": "dA_log",
+            "ddt_bias": "ddt_bias",
+            "num_heads": "num_heads",
+            "param_acc": "param_acc",
+        },
+        "select_rule": {
+            "kind": "all_of",
+            "rules": [
+                {
+                    "kind": "path_in",
+                    "paths": ["light", "light_states", "tape", "replay"],
+                },
+                {
+                    "kind": "all_of",
+                    "rules": [
+                        {"kind": "arch_in", "arches": ["sm_100a"]},
+                        {"kind": "heads_at_least", "min": 32},
+                    ],
+                },
+            ],
+        },
+        "stage": "param_finalize",
+        "variant": "cast_r8",
+    },
 }
 # The S1 records: the fused gradient records without the q * dq term of dg and the GLM intra records that add it.
 # On every path the plan's dqkg and glm_intra records are both in this tuple or both outside it
@@ -6329,6 +7969,16 @@ S1_RECORDS = (
 # twin (``path_in`` with no path); the hand-off's recompute launches it in place of the intra record its plan
 # selects, on that record's grid, and the backward that takes the record launches no prep.
 HANDOFF_TWINS = {"fwd_intra": "fwd_intra_v20", "fwd_intra_v14": "fwd_intra_v19"}
+# The R1c pairs of the raw gate, GLM intra record -> its cast: the GLM intra program adds the parameter-gradient terms
+# in FP64 into ``param_acc`` and the cast rounds them to ``dA_log`` / ``ddt_bias`` and zeroes them.  On every backward
+# path of a raw plan the glm_intra and param_finalize records pair this way or are ``glm_intra_raw`` and
+# ``param_finalize`` (cake_backend._check_pairs).  ``R1C_STRIPES`` is each GLM intra record's replica count, the
+# leading extent of ``param_acc``.
+R1C_PAIRS = {
+    "glm_intra_v20c": "param_finalize_cast",
+    "glm_intra_v20c_r8": "param_finalize_cast_r8",
+}
+R1C_STRIPES = {"glm_intra_v20c": 1, "glm_intra_v20c_r8": 8}
 # The tape path's w-only WY twin, WY record -> twin: the same program without the u half (no v / beta operands, no u
 # output), which the tape backward never reads (it takes v_new from the tape).  No rule selects a twin; the tape
 # backward launches it in place of the WY record its plan selects, on that record's grid, where the backend's rule
@@ -6339,12 +7989,21 @@ CHUNK = 64
 HEAD_DIM = 128
 
 
-def records_of_stage(stage: str) -> tuple[str, ...]:
+def records_of_stage(stage: str, gate: str = "g") -> tuple[str, ...]:
     """The record names of ``stage`` in registry order (the ``otherwise`` record
-    last, so a scan picks a positive rule before the fallback)."""
+    last, so a scan picks a positive rule before the fallback): for a stage of
+    ``GATE_STAGES`` those of the ``gate`` class (a record's ``gate``, ``"g"``
+    when absent), for every other stage the same records in both modes."""
     if stage not in STAGES:
         raise ValueError(f"unknown stage {stage!r}; the stages are {STAGES}")
-    names = [name for name, rec in MODULES.items() if rec["stage"] == stage]
+    if gate not in GATES:
+        raise ValueError(f"gate {gate!r} is not one of {GATES}")
+    names = [
+        name
+        for name, rec in MODULES.items()
+        if rec["stage"] == stage
+        and (stage not in GATE_STAGES or rec.get("gate", "g") == gate)
+    ]
     names.sort(key=lambda name: MODULES[name]["select_rule"]["kind"] == "otherwise")
     return tuple(names)
 
@@ -6434,6 +8093,9 @@ def _admits(
         return arch in rule["arches"]
     if kind == "path_in":
         return path in rule["paths"]
+    if kind == "l2n_in":
+        # this package refuses use_qk_l2norm_in_kernel=True at every entry: its l2n is always "off"
+        return "off" in rule["modes"]
     raise ValueError(f"unknown Cake KDA training selection rule: {kind!r}")
 
 
@@ -6574,9 +8236,13 @@ def select_record(
     sm_count: int,
     arch: str,
     path: str,
+    gate: str = "g",
 ) -> str | None:
     """The one record of ``stage`` the host scalars select (``None`` for an
-    optional stage no record of which admits the problem).
+    optional stage no record of which admits the problem), among the records
+    of the call's ``gate`` class for a stage of ``GATE_STAGES``
+    (:func:`records_of_stage`; every other stage selects the same record in
+    both modes).
 
     ``ctas = num_chunks_pad * num_heads`` is the chunk-shaped CTA count the
     preparation stages switch on (``ctas_at_least`` / ``ctas_below`` /
@@ -6596,8 +8262,8 @@ def select_record(
     ``path_in`` the call's path (``PATHS``); ``all_of`` conjoins rules and
     ``any_of`` disjoins them; ``otherwise`` is the fallback of its stage and
     ``always`` the rule of a single-program stage.  Exactly one record admits
-    every problem (none, for an optional stage the path or route does not
-    launch), or the registry is inconsistent.
+    every problem (none, for an optional stage the path, route or gate mode
+    does not launch), or the registry is inconsistent.
     """
     if arch not in ARCHES:
         raise ValueError(f"arch {arch!r} is not one of {ARCHES}")
@@ -6619,20 +8285,20 @@ def select_record(
 
     admitted = [
         name
-        for name in records_of_stage(stage)
+        for name in records_of_stage(stage, gate)
         if MODULES[name]["select_rule"]["kind"] != "otherwise" and admits(name)
     ]
     if len(admitted) > 1:
         raise ValueError(
             f"stage {stage!r}: records {admitted} all admit num_chunks_pad="
             f"{num_chunks_pad}, num_seqs={num_seqs}, num_heads={num_heads}, "
-            f"sm_count={sm_count}, arch={arch}, path={path}"
+            f"sm_count={sm_count}, arch={arch}, path={path}, gate={gate}"
         )
     if admitted:
         return admitted[0]
     fallback = [
         name
-        for name in records_of_stage(stage)
+        for name in records_of_stage(stage, gate)
         if MODULES[name]["select_rule"]["kind"] == "otherwise"
     ]
     if not fallback and stage in OPTIONAL_STAGES:
@@ -6641,7 +8307,8 @@ def select_record(
         raise ValueError(
             f"stage {stage!r}: no record admits num_chunks_pad={num_chunks_pad}, "
             f"num_seqs={num_seqs}, num_heads={num_heads}, sm_count={sm_count}, "
-            f"arch={arch}, path={path} and the stage has {len(fallback)} fallback "
+            f"arch={arch}, path={path}, gate={gate} and the stage has "
+            f"{len(fallback)} fallback "
             "records"
         )
     return fallback[0]
@@ -6698,7 +8365,11 @@ def launch_grid(
     num_heads, 1, 1)`` (CTAs per segment and head: two for the forward's first
     pass, the offset walk and the transfer walk, two for the few-chain adjoint
     recurrence's value-column slices, else one; ``num_segments`` is the
-    segmented route's :func:`segment_plan` count, at least one).
+    segmented route's :func:`segment_plan` count, at least one);
+    ``head_chunk_blocks`` launches ``(num_heads, ceil(num_chunks_pad /
+    per_cta), 1)``, at least one block (``param_finalize``: one CTA per head
+    and segment of ``per_cta`` chunks; the grid's ``y`` is its ``seg_cap``);
+    ``heads`` launches ``(num_heads, 1, 1)`` (the R1c cast: one CTA per head).
     """
     rule = MODULES[name]["grid_rule"]
     kind = rule["kind"]
@@ -6747,6 +8418,10 @@ def launch_grid(
                 "route (it needs at least one segment)"
             )
         return (int(rule["passes"][launch]) * int(num_segments) * h, 1, 1)
+    if kind == "head_chunk_blocks":
+        return (h, max(1, -(-nc // int(rule["per_cta"]))), 1)
+    if kind == "heads":
+        return (h, 1, 1)
     raise ValueError(f"unknown Cake KDA training grid rule: {kind!r}")
 
 
@@ -6825,6 +8500,49 @@ def _argument_plan(name: str) -> tuple[tuple[str | None, int], ...]:
     return tuple(plan)
 
 
+@functools.cache
+def _ffi_entry(name: str, device_index: int) -> Any:
+    """The FFI entry of record ``name`` loaded for CUDA device
+    ``device_index``'s architecture (:func:`load`), looked up once."""
+    module = load(name, device_arch(device_index))
+    return getattr(module, MODULES[name]["ffi_entry"])
+
+
+@functools.cache
+def _raw_stream_getter() -> Any:
+    """``torch._C._cuda_getCurrentRawStream``: the handle of a device's
+    current torch stream as an integer, without constructing a ``Stream``
+    object; or the ``torch.cuda`` form on a torch build without it."""
+    import torch
+
+    getter = getattr(torch._C, "_cuda_getCurrentRawStream", None)
+    if getter is not None:
+        return getter
+
+    def fallback(device_index: int) -> int:
+        return torch.cuda.current_stream(device_index).cuda_stream
+
+    return fallback
+
+
+_FFI_DEVICES: dict[int, Any] = {}
+
+
+def _stream_context() -> Any:
+    """The tvm-ffi environment-stream context of torch's current stream on
+    the current CUDA device (a CUDA graph's capture stream during capture),
+    the stream ``tvm_ffi.use_torch_stream()`` enters, without building a
+    ``torch.cuda.Stream`` and parsing a device string on every launch (the
+    FFI device is kept per index)."""
+    import torch
+
+    index = torch.cuda.current_device()
+    device = _FFI_DEVICES.get(index)
+    if device is None:
+        device = _FFI_DEVICES[index] = tvm_ffi.device(f"cuda:{index}")
+    return tvm_ffi.use_raw_stream(device, _raw_stream_getter()(index))
+
+
 def run_module(
     name: str,
     values: dict[str, Any],
@@ -6839,7 +8557,6 @@ def run_module(
     vocabulary and ``grid`` is the plan's launch grid (:func:`launch_grid`).
     The kernel runs on the current torch stream of the device.
     """
-    record = MODULES[name]
     args = []
     for logical_name, axis in _argument_plan(name):
         if logical_name is None:
@@ -6851,9 +8568,9 @@ def run_module(
                 raise ValueError(
                     f"record {name} needs logical argument {logical_name!r}"
                 ) from None
-    module = load(name, device_arch(device_index))
-    with tvm_ffi.use_torch_stream():
-        getattr(module, record["ffi_entry"])(*args)
+    entry = _ffi_entry(name, device_index)
+    with _stream_context():
+        entry(*args)
 
 
 __all__ = [
@@ -6861,6 +8578,8 @@ __all__ = [
     "ARCH_BY_CAPABILITY",
     "CARRY_FLAG_WORDS_PER_CTA",
     "CHUNK",
+    "GATES",
+    "GATE_STAGES",
     "HANDOFF_TWINS",
     "HEAD_DIM",
     "LOGICAL_SCALARS",

@@ -41,6 +41,11 @@ grid, ``dx`` stays bitwise the deterministic default's, the gradients stay withi
 deterministic default, the workspace (the same size at every multiple) reads back zero after every launch, under
 CUDA Graph capture / replay and through the autograd entry (plain and checkpointed).
 
+The narrower channel tiles of ``TILE_OVERRIDES``: one row per architecture (``OVERRIDE_CASES``) launches the row's
+tiles, on a caller-owned workspace of the public size and on the package's, with ``dx`` bitwise the deterministic
+package's, the gradients within budget of the reference and of the deterministic package, and the workspace zero
+after the call.
+
 This suite names its package once, through ``tests.test_helpers.cake_package`` (key
 ``cake.cake_causal_conv1d_train``), and the deterministic package for the parity checks through the same table;
 a vendored build without the deterministic package skips those checks.  Every test skips until the exporter has
@@ -116,6 +121,12 @@ REPEAT_CASES = (
     (4097, 1160, (1000, 0, 3, 3094)),
 )
 PRECISION_CASES = ((250340, 512, "perf"), (250340, 1280, "perf"))
+# One row of ``TILE_OVERRIDES`` per architecture (route, S, C): the backward runs its narrower channel tiles there.
+OVERRIDE_CASES = {
+    "sm_100a": ("bwd_bias_fp32g", 62585, 2048),
+    "sm_103a": ("bwd", 62585, 1536),
+    "sm_107a": ("bwd_dt", 62585, 768),
+}
 # Wide channel counts on every route: C = 4096 (four documents, one empty) and C = 10240 (a packed q / k / v
 # projection width), at small S.
 WIDE_CASES = ((4097, 4096, (1000, 0, 3, 3094)), (2048, 10240, "perf"))
@@ -885,6 +896,79 @@ def test_repeated_launches_worst_case(case, kind, record_property) -> None:
     )
 
 
+@pytest.mark.parametrize("own_workspace", (True, False), ids=("own-ws", "pkg-ws"))
+def test_tile_override_row(own_workspace, monkeypatch, record_property) -> None:
+    """The architecture's ``OVERRIDE_CASES`` row of ``TILE_OVERRIDES`` launches the row's narrower channel tiles
+    (``ct_vec``, ``threads // ct_vec`` sub-tiles, ``ceil(C / vec / ct_vec)`` tiles) on a caller-owned workspace of
+    the public size, or the package's: ``dx`` within budget of the reference and bitwise the deterministic package's
+    (when importable), ``dweight`` / ``dbias`` within the route's budget of the reference and of the deterministic
+    package, the workspace zero after the call."""
+
+    arch, device = _arch(), _device()
+    kind, S, C = OVERRIDE_CASES[arch]
+    _require_route(kind)
+    ct_vec = loader.tile_override(arch, kind, C, S)
+    assert ct_vec is not None, f"{arch} {kind} C={C} S={S} is no TILE_OVERRIDES row"
+    (name,) = loader.selected_modules(arch, kind, C=C, S=S)
+    geometry = loader.MODULES[name]["grid_rule"]["geometry"]
+    wanted = {
+        "ct_vec": ct_vec,
+        "n_sub": geometry["threads"] // ct_vec,
+        "n_ch_tiles": -(-(C // geometry["vec"]) // ct_vec),
+    }
+    assert wanted != dict(
+        zip(
+            ("ct_vec", "n_sub", "n_ch_tiles"),
+            loader.channel_split(C, geometry=geometry, role="bwd"),
+            strict=True,
+        )
+    ), "the row must differ from the default split"
+    seen = []
+    launch = pkg.run_module
+
+    def record_launch(name, values, *, device_index, grid=None):
+        seen.append((name, {key: int(values[key]) for key in wanted}))
+        return launch(name, values, device_index=device_index, grid=grid)
+
+    monkeypatch.setattr(pkg, "run_module", record_launch)
+    label = f"{arch} {kind} S={S} C={C} ct_vec={ct_vec}"
+    x, w, cu, dy, b, policy = _route_inputs(S, C, "perf", kind, key=9)
+    workspace = (
+        pkg.cake_causal_conv1d_train_backward_workspace(
+            S, C, device, deterministic=False
+        )
+        if own_workspace
+        else None
+    )
+    dx, dw, db = _backward(x, w, cu, dy, b, policy, workspace=workspace)
+    assert seen == [(name, wanted)], f"{label}: launched {seen}"
+    worst_dw, worst_db = _check_grads(
+        dx, dw, db, reference_backward(x, w, cu, dy, b=b, policy=policy),
+        policy=policy, label=label,
+    )  # fmt: skip
+    held = workspace if own_workspace else _stream_workspace(device)
+    assert held is not None and int(torch.count_nonzero(held)) == 0, label
+    record_property("override_ct_vec", ct_vec)
+    record_property("worst_dweight_ratio_to_budget", worst_dw)
+    record_property("worst_dbias_ratio_to_budget", worst_db)
+    det = _det_or_none()
+    if det is None:
+        return
+    dx_d, dw_d, db_d = _det_backward(det, x, w, cu, dy, b, policy)
+    assert torch.equal(dx, dx_d), f"dx differs from the deterministic package ({label})"
+    for got, ref, what in ((dw, dw_d, "dweight"), (db, db_d, "dbias")):
+        if got is None:
+            continue
+        atol, rtol = _grad_tolerance(policy, got.dtype)
+        _assert_within(
+            got.float(),
+            ref.float(),
+            atol=atol,
+            rtol=rtol,
+            label=f"{what} vs det {label}",
+        )
+
+
 @pytest.mark.parametrize("kind", tuple(ROUTE_SETTINGS))
 @pytest.mark.parametrize("case", GRID_MULT_CASES, ids=_case_id)
 def test_bwd_grid_mult_keeps_dx_and_the_budgets(case, kind, record_property) -> None:
@@ -1447,7 +1531,14 @@ def test_backward_is_one_launch_with_zeroed_accumulators(monkeypatch) -> None:
         assert name == loader.selected_modules(arch, kind, C=C, S=S)[0]
         record = loader.MODULES[name]
         assert "reduce" not in record and record["launch"]["cooperative"] is False
-        assert grid == loader.launch_grid(record, device_index=device.index, C=C, S=S)
+        assert grid == pkg._one_sm_trim(
+            record,
+            values["n_ch_tiles"],
+            loader.launch_grid(record, device_index=device.index, C=C, S=S),
+            device_index=device.index,
+            arch=arch,
+            bwd_grid_mult=1,
+        )
         assert grid[0] >= values["n_ch_tiles"]
         layout = loader.accumulator_layout(record, C, values["n_ch_tiles"])
         acc_dtype = torch.float64 if "fp32g" in kind else torch.float32
@@ -1475,10 +1566,12 @@ def test_bwd_grid_mult_launches_that_many_times_the_untrimmed_grid(
     device = _device()
     arch = _arch()
     launched = []
+    tiles = []
     run_module = pkg.run_module
 
     def record_launch(name, values, *, device_index, grid=None):
         launched.append((name, grid))
+        tiles.append(values["n_ch_tiles"])
         return run_module(name, values, device_index=device_index, grid=grid)
 
     monkeypatch.setattr(pkg, "run_module", record_launch)
@@ -1493,13 +1586,99 @@ def test_bwd_grid_mult_launches_that_many_times_the_untrimmed_grid(
         untrimmed = loader.launch_grid(record, device_index=device.index)
         for mult in pkg.BWD_GRID_MULTS:
             launched.clear()
+            tiles.clear()
             _backward(x, w, cu, dy, b, policy, bwd_grid_mult=mult)
             expected = (
-                loader.launch_grid(record, device_index=device.index, C=C, S=S)
+                pkg._one_sm_trim(
+                    record,
+                    tiles[0],
+                    loader.launch_grid(record, device_index=device.index, C=C, S=S),
+                    device_index=device.index,
+                    arch=arch,
+                    bwd_grid_mult=1,
+                )
                 if mult == 1
                 else (untrimmed[0] * mult, 1, 1)
             )
             assert launched == [(name, expected)], (kind, S, C, mult, launched)
+
+
+@pytest.mark.parametrize("kind", tuple(ROUTE_SETTINGS))
+def test_backward_grid_gives_up_one_sm_when_the_last_rank_is_partial(
+    kind, monkeypatch
+) -> None:
+    """FlashInfer issue #8365: on the ``bwd`` and ``bwd_fp32g`` routes a default-grid backward launches ``ctas_per_sm
+    x SM count`` CTAs less ``ctas_per_sm`` when the last channel-tile rank of that grid holds at least
+    ``ctas_per_sm`` CTAs (so a kernel on another stream that keeps one SM's shared memory leaves the launch one
+    wave), else the whole grid; the other backward routes launch ``launch_grid``'s grid.  The trimmed launch's
+    ``dx`` is bitwise the whole grid's, both gradients are within budget of the reference and the workspace reads
+    back zero."""
+
+    _require_route(kind)
+    device = _device()
+    arch = _arch()
+    sms = torch.cuda.get_device_properties(device).multi_processor_count
+    S, docs = 4097, (1000, 0, 3, 3094)
+    launched = []
+    run_module = pkg.run_module
+
+    def record_launch(name, values, *, device_index, grid=None):
+        launched.append(grid)
+        return run_module(name, values, device_index=device_index, grid=grid)
+
+    monkeypatch.setattr(pkg, "run_module", record_launch)
+    rows = {}
+    for C in range(1024, 16385, 1024):
+        name = loader.selected_modules(arch, kind, C=C, S=S)[0]
+        record = loader.MODULES[name]
+        rule = record["grid_rule"]
+        k = int(rule["ctas_per_sm"])
+        full = loader.grid_mult(record, arch) * k * sms
+        n = loader.plan(
+            S,
+            C,
+            len(docs),
+            geometry=rule["geometry"],
+            role=record["role"],
+            arch=arch,
+            route=loader.record_route(record, arch),
+        )["n_ch_tiles"]
+        trims = (
+            rule["kind"] == "occupancy"
+            and loader.grid_mult(record, arch) == 1
+            and full % n >= k
+        )
+        rows.setdefault(trims, (C, full, k))
+    assert set(rows) == {True, False}, rows
+    for trims, (C, full, k) in sorted(rows.items()):
+        x, w, cu, dy, b, policy = _route_inputs(S, C, docs, kind, key=41)
+        refs = reference_backward(x, w, cu, dy, b=b, policy=policy)
+        launched.clear()
+        dx, dw, db = _backward(x, w, cu, dy, b, policy)
+        torch.cuda.synchronize(device)
+        cut = trims and kind in ("bwd", "bwd_fp32g")
+        assert launched == [(full - k if cut else full, 1, 1)], (kind, C, launched)
+        _check_grads(dx, dw, db, refs, policy=policy, label=f"{kind} C={C}")
+        held = _stream_workspace(device)
+        assert held is None or int(torch.count_nonzero(held)) == 0, (kind, C)
+        if cut:
+            with monkeypatch.context() as m:
+                m.setattr(pkg, "_one_sm_trim", lambda record, n, grid, **kw: grid)
+                pkg.plan_cache_clear()
+                launched.clear()
+                dx_full, dw_full, db_full = _backward(x, w, cu, dy, b, policy)
+                torch.cuda.synchronize(device)
+            pkg.plan_cache_clear()
+            assert launched == [(full, 1, 1)], (kind, C, launched)
+            assert torch.equal(dx, dx_full), (kind, C)
+            _check_grads(
+                dx_full,
+                dw_full,
+                db_full,
+                refs,
+                policy=policy,
+                label=f"{kind} C={C} whole grid",
+            )
 
 
 @pytest.mark.parametrize("kind", ("bwd_fp32g", "bwd_bias_fp32g"))

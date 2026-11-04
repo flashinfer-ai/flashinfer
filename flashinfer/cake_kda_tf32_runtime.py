@@ -102,7 +102,7 @@ def _build_kda_module(factory, *args, **kwargs):
 # windows reuse the same variable-shape direct-M128 identity. Remaining regions
 # retain the source-derived compatibility fallback.
 import heapq
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import cache
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -120,6 +120,19 @@ BF16_N16_M128_CHUNK = 16
 # part: BF16_WORK_BIN_TURNOVER_MAX_TASK_CHUNKS_GB300 on a 152-SM sm_103a.
 BF16_WORK_BIN_TURNOVER_MAX_TASK_CHUNKS = 8
 BF16_WORK_BIN_TURNOVER_MAX_TASK_CHUNKS_GB300 = 16
+# The work-bin turnover launches that take their module's short-task turnover
+# build where the loader names one (``_RENDERED_WORK_BIN_TURN_SHORT_ROUTES``,
+# see _work_bin_turn_short_program): at most this many 32-token chunks in the
+# longest task and at least this many tasks per SM.  That build stores each
+# task's final state with per-warp TMA boxes; on sm_100a it spills more in the
+# chunk loop than the stock store and binds a tensor map of the final state on
+# every call, which pays only where the bins turn their state over every few
+# chunks and the launch has many such tasks per SM.  Measured on a 148-SM
+# sm_100a: 64-token tasks at 768 and 1024 tasks gain; 256 tasks of 64 tokens
+# and launches of up to 255-token tasks do not.  Every other turnover launch
+# keeps the turnover build (the stock store there).
+BF16_WORK_BIN_TURNOVER_SHORT_TASK_CHUNKS = 2
+BF16_WORK_BIN_TURNOVER_SHORT_MIN_TASKS_PER_SM = 4
 # Fixed cost of one (sequence, head) task, in 32-token chunks, outside its chunk
 # loop: a CTA of the one-task-per-CTA body pays it for every task, a bin of the
 # turnover build hides it beside the previous task's chunks.  An unbounded
@@ -242,6 +255,36 @@ WORK_BIN_MIX_SPAN_ARCHES = ("sm_103a",)
 WORK_BIN_MIX_MAX_GIVE = 8
 WORK_BIN_MIX_SLOTS = 8
 WORK_BIN_MIX_SLOT_ELEMENTS = 16384
+# The bin-mix launches that take their module's long-task bin-mix build where
+# the loader names one (``_RENDERED_WORK_BIN_MIX_LONG_ROUTES``, see
+# _work_bin_mix_long_program): more than this many 32-token chunks in the
+# longest task.  That build stores each task's final state with per-warp TMA
+# boxes and binds a tensor map of the final state on every call.  Measured on
+# a 148-SM sm_100a: bin-mix launches whose longest task has 87 to 256 tokens
+# gain with it; launches of tasks of at most 64 tokens do not (one launch of
+# 16 sequences of 1 to 64 tokens at 12 heads ran 0.5 % slower).  Every other
+# bin-mix launch keeps the bin-mix build (the stock store there).
+BF16_WORK_BIN_MIX_LONG_TASK_CHUNKS = 2
+# Helper-pool build of the bin-mix build (``_RENDERED_WORK_BIN_POOL_ROUTES``):
+# every bin holding one long task is an owner that gives its last ``give``
+# chunks, and a helper bin serves up to WORK_BIN_POOL_MAX_PIECES owners, one
+# piece each, back to back after its own tasks, through the bin-mix ring.  The
+# rule admits launches of WORK_BIN_POOL_LONG and WORK_BIN_POOL_SHORT token
+# sequences only, a long one present, with more tasks than SMs, every long
+# task alone in its turnover bin and at most WORK_BIN_POOL_MAX_PIECES owners
+# per helper; give = min(WORK_BIN_POOL_MAX_GIVE, WORK_BIN_MIX_SLOTS, long
+# chunks - 1).  Owners go in bin order to the helper with the least projected
+# load.  The plan holds the bin-mix words (four per bin), then
+# WORK_BIN_POOL_MAGIC, then four words per bin for a helper's second piece.
+# Measured on B200 (148 SMs) and GB300 (152 SMs) with 8 x (1024 + 64) tokens
+# and 12 heads: 0.921 to 0.923 of the launch time without the pool.
+WORK_BIN_POOL_MAGIC = 0x58313223
+# Architectures whose admitted launches take the helper-pool build.
+WORK_BIN_POOL_ARCHES = ("sm_100a", "sm_103a")
+WORK_BIN_POOL_LONG = 1024
+WORK_BIN_POOL_SHORT = 64
+WORK_BIN_POOL_MAX_GIVE = 8
+WORK_BIN_POOL_MAX_PIECES = 2
 # Architectures whose one-wave BF16 grid sweep selected the M64 value split over
 # every direct M128 tile (see _should_use_bf16_one_wave_dvsplit).
 BF16_ONE_WAVE_DVSPLIT_ARCHES = ("sm_100a", "sm_103a")
@@ -943,8 +986,11 @@ def _ffi_arguments_reusing(owner, site, arguments) -> tuple:
     other argument of a rebuilt record is the same tensor object at the same
     address as in the record it replaces.  Such a tensor reuses its previous
     tvm-ffi export (same data pointer, shape, strides and dtype); only the
-    tensors that moved go through :func:`_ffi_arguments` again.  ``owner``
-    keeps the last export of each record ``site`` until that site is rebuilt.
+    tensors that moved go through :func:`_ffi_arguments` again.  A moved
+    tensor bound again at the next position (``out`` / ``out_tma``, the FP32
+    final state and its tensor map) takes the export of that position.
+    ``owner`` keeps the last export of each record ``site`` until that site is
+    rebuilt.
     """
     import torch
 
@@ -952,7 +998,8 @@ def _ffi_arguments_reusing(owner, site, arguments) -> tuple:
     previous = memo.get(site, ())
     exported = list(arguments)
     kept: list = [None] * len(exported)
-    fresh = []
+    fresh: list[tuple[int, Any, int]] = []
+    repeats: list[int] = []
     for position, value in enumerate(exported):
         if not isinstance(value, torch.Tensor):
             continue
@@ -961,6 +1008,8 @@ def _ffi_arguments_reusing(owner, site, arguments) -> tuple:
         if prior is not None and prior[0] is value and prior[1] == pointer:
             exported[position] = prior[2]
             kept[position] = prior
+        elif fresh and fresh[-1][0] == position - 1 and fresh[-1][1] is value:
+            repeats.append(position)
         else:
             fresh.append((position, value, pointer))
     if fresh:
@@ -968,17 +1017,25 @@ def _ffi_arguments_reusing(owner, site, arguments) -> tuple:
         for (position, value, pointer), ffi_value in zip(fresh, converted, strict=True):
             exported[position] = ffi_value
             kept[position] = (value, pointer, ffi_value)
+        for position in repeats:
+            exported[position] = exported[position - 1]
+            kept[position] = kept[position - 1]
     memo[site] = tuple(kept)
     return tuple(exported)
 
 
-def _prepared_kernel_record(module, grid, bindings) -> tuple:
-    """(native entry, positional arguments) of one ``PreparedKernel.launch``."""
+def _prepared_kernel_record(module, grid, bindings, export: bool = True) -> tuple:
+    """(native entry, positional arguments) of one ``PreparedKernel.launch``.
+
+    With ``export`` the tensors are tvm-ffi exports (:func:`_ffi_arguments_reusing`);
+    without it they are the bound torch tensors, which the call converts.
+    """
     if not module._ready:
         raise RuntimeError("TMA descriptors must be initialized during preparation")
-    return module._call, _ffi_arguments_reusing(
-        module, None, module._arguments(grid, bindings)
-    )
+    arguments = module._arguments(grid, bindings)
+    if not export:
+        return module._call, tuple(arguments)
+    return module._call, _ffi_arguments_reusing(module, None, arguments)
 
 
 def _run_launch_records(records) -> None:
@@ -1472,6 +1529,174 @@ def _work_bin_mix_program(program, gpu_arch: str):
         if turnover == program and module in mix:
             return mix[module]
     return None
+
+
+def _work_bin_pool_program(program, gpu_arch: str):
+    """The ``_RENDERED_WORK_BIN_POOL_ROUTES`` build beside the work-bin turnover
+    build ``program`` (``_RENDERED_WORK_BIN_TURN_ROUTES``), or ``None``; always
+    ``None`` on an architecture outside ``WORK_BIN_POOL_ARCHES``."""
+    if program is None or gpu_arch not in WORK_BIN_POOL_ARCHES:
+        return None
+    pool = getattr(_kda_registry, "_RENDERED_WORK_BIN_POOL_ROUTES", {}).get(
+        gpu_arch, {}
+    )
+    if not pool:
+        return None
+    turn = _kda_registry._RENDERED_WORK_BIN_TURN_ROUTES.get(gpu_arch, {})
+    for module, turnover in turn.items():
+        if turnover == program and module in pool:
+            return pool[module]
+    return None
+
+
+def _work_bin_turn_short_scope(seq_lens, num_heads: int, sm_count: int) -> bool:
+    """Whether a work-bin turnover launch of ``seq_lens`` at ``num_heads``
+    heads on ``sm_count`` SMs takes the short-task turnover build: at least
+    ``BF16_WORK_BIN_TURNOVER_SHORT_MIN_TASKS_PER_SM`` tasks per SM and at most
+    ``BF16_WORK_BIN_TURNOVER_SHORT_TASK_CHUNKS`` chunks in its longest task."""
+    tasks = len(seq_lens) * num_heads
+    if tasks < BF16_WORK_BIN_TURNOVER_SHORT_MIN_TASKS_PER_SM * sm_count:
+        return False
+    return max(seq_lens) <= BF16_WORK_BIN_TURNOVER_SHORT_TASK_CHUNKS * BF16_M128_CHUNK
+
+
+def _work_bin_turn_short_program(
+    program, gpu_arch: str, seq_lens, num_heads: int, sm_count: int
+):
+    """The ``_RENDERED_WORK_BIN_TURN_SHORT_ROUTES`` build beside the work-bin
+    turnover build ``program`` (``_RENDERED_WORK_BIN_TURN_ROUTES``) for a launch
+    of ``seq_lens`` at ``num_heads`` heads on ``sm_count`` SMs, or ``None``:
+    ``None`` on an architecture whose table is empty (no further work) and for
+    a launch outside _work_bin_turn_short_scope."""
+    if program is None:
+        return None
+    short = getattr(_kda_registry, "_RENDERED_WORK_BIN_TURN_SHORT_ROUTES", {}).get(
+        gpu_arch, {}
+    )
+    if not short or not _work_bin_turn_short_scope(seq_lens, num_heads, sm_count):
+        return None
+    turn = _kda_registry._RENDERED_WORK_BIN_TURN_ROUTES.get(gpu_arch, {})
+    for module, turnover in turn.items():
+        if turnover == program and module in short:
+            return short[module]
+    return None
+
+
+def _work_bin_mix_long_program(program, gpu_arch: str, seq_lens):
+    """The ``_RENDERED_WORK_BIN_MIX_LONG_ROUTES`` build beside the bin-mix
+    build ``program`` (``_RENDERED_WORK_BIN_MIX_ROUTES``) for a bin-mix launch
+    of ``seq_lens``, or ``None``: ``None`` on an architecture whose table is
+    empty (no further work) and for a launch whose longest task has at most
+    ``BF16_WORK_BIN_MIX_LONG_TASK_CHUNKS`` chunks."""
+    if program is None:
+        return None
+    routes = getattr(_kda_registry, "_RENDERED_WORK_BIN_MIX_LONG_ROUTES", {}).get(
+        gpu_arch, {}
+    )
+    if not routes:
+        return None
+    if max(seq_lens) <= BF16_WORK_BIN_MIX_LONG_TASK_CHUNKS * BF16_M128_CHUNK:
+        return None
+    mix = _kda_registry._RENDERED_WORK_BIN_MIX_ROUTES.get(gpu_arch, {})
+    for module, mixed in mix.items():
+        if mixed == program and module in routes:
+            return routes[module]
+    return None
+
+
+@cache
+def _work_bin_pool_plan(
+    table: tuple[int, ...],
+    num_bins: int,
+    seq_lens: tuple[int, ...],
+    num_heads: int,
+    sm_count: int,
+) -> Optional[tuple[int, ...]]:
+    """The helper-pool plan words of a turnover work-bin table, or ``None`` to
+    keep the turnover or bin-mix build (the rule above
+    ``WORK_BIN_POOL_MAGIC``).  Owner words ``(g, tf, 0, 0)``; a helper's
+    first piece ``(-g, owner, helper chunks, tf)`` in the bin-mix words, its
+    second piece ``(-g, owner, helper chunks + g, tf)`` in the extension words
+    after the magic."""
+    if (
+        num_bins < 2
+        or not seq_lens
+        or len(table) != num_bins + 1 + len(seq_lens) * num_heads
+        or WORK_BIN_POOL_LONG not in seq_lens
+        or any(
+            length not in (WORK_BIN_POOL_LONG, WORK_BIN_POOL_SHORT)
+            for length in seq_lens
+        )
+        or len(seq_lens) * num_heads <= sm_count
+    ):
+        return None
+    chunks = [(length + BF16_M128_CHUNK - 1) // BF16_M128_CHUNK for length in seq_lens]
+    tasks = [table[table[index] : table[index + 1]] for index in range(num_bins)]
+    loads = [
+        sum(chunks[task // num_heads] for task in bin_tasks) for bin_tasks in tasks
+    ]
+    longest = max(chunks)
+    owners = [
+        index
+        for index, bin_tasks in enumerate(tasks)
+        if any(chunks[task // num_heads] == longest for task in bin_tasks)
+    ]
+    if any(len(tasks[owner]) != 1 for owner in owners):
+        return None
+    owner_set = set(owners)
+    helpers = [index for index in range(num_bins) if index not in owner_set]
+    give = min(WORK_BIN_POOL_MAX_GIVE, WORK_BIN_MIX_SLOTS, longest - 1)
+    if give < 1 or not helpers or len(owners) > WORK_BIN_POOL_MAX_PIECES * len(helpers):
+        return None
+    projected = {helper: loads[helper] for helper in helpers}
+    pieces: dict[int, list[int]] = {helper: [] for helper in helpers}
+    for owner in owners:
+        helper = min(
+            (h for h in helpers if len(pieces[h]) < WORK_BIN_POOL_MAX_PIECES),
+            key=lambda h: (projected[h], h),
+        )
+        pieces[helper].append(owner)
+        projected[helper] += give
+    words = [0] * (4 * num_bins)
+    extension = [0] * (4 * num_bins)
+    for owner in owners:
+        words[4 * owner : 4 * owner + 4] = [give, loads[owner] - give, 0, 0]
+    for helper in helpers:
+        base = loads[helper]
+        for index, owner in enumerate(pieces[helper]):
+            quad = [-give, owner, base, loads[owner] - give]
+            (words if index == 0 else extension)[4 * helper : 4 * helper + 4] = quad
+            base += give
+    return (*words, WORK_BIN_POOL_MAGIC, *extension)
+
+
+def _use_pool_work_bins(
+    seq_lens: tuple[int, ...], *, num_heads: int, sm_count: int, gpu_arch: str
+) -> bool:
+    """Whether the helper-pool rule admits the turnover work-bin table of an
+    unbounded direct M128 N32 launch on a part that ships a pool build."""
+    if gpu_arch not in WORK_BIN_POOL_ARCHES or not getattr(
+        _kda_registry, "_RENDERED_WORK_BIN_POOL_ROUTES", {}
+    ).get(gpu_arch):
+        return False
+    seq_lens = tuple(seq_lens)
+    if (
+        not seq_lens
+        or WORK_BIN_POOL_LONG not in seq_lens
+        or len(seq_lens) * num_heads <= sm_count
+    ):
+        return False
+    table, num_bins = _make_direct_work_bins(
+        seq_lens,
+        num_heads=num_heads,
+        worker_count=sm_count,
+        chunk_tokens=BF16_M128_CHUNK,
+        task_cost=BF16_WORK_BIN_TURNOVER_TASK_COST,
+    )
+    return (
+        _work_bin_pool_plan(tuple(table), num_bins, seq_lens, num_heads, sm_count)
+        is not None
+    )
 
 
 @cache
@@ -2533,6 +2758,24 @@ def _direct_work_bin_route(
     bounded turnover of rule 1 needs it true, so each launch takes at most one
     rule.
     """
+    # An unbounded direct M128 N32 launch whose turnover bin table the
+    # helper-pool rule admits takes the turnover work bins and the turnover
+    # build (the plan site then launches the module's helper-pool build).
+    if (
+        route == BF16_ROUTE_DIRECT_M128
+        and (not tf32_direct)
+        and (not n32_ft_slab)
+        and gate_kind == KDAGateKind.UNBOUNDED_SOFTPLUS
+        and _use_pool_work_bins(
+            seq_lens, num_heads=num_heads, sm_count=sm_count, gpu_arch=gpu_arch
+        )
+    ):
+        return _DirectWorkBinRoute(
+            work_bins=True,
+            turnover_bins_only=True,
+            turnover=True,
+            task_cost=BF16_WORK_BIN_TURNOVER_TASK_COST,
+        )
     direct_n16 = route == BF16_ROUTE_DIRECT_M128_N16
     strict = (
         route in {BF16_ROUTE_DIRECT_M128, BF16_ROUTE_DIRECT_M128_N16}
@@ -4136,6 +4379,17 @@ class FlashKDABlackwellBF16FusedLaunch:
                     ),
                     device=q.device,
                 )
+                # The owner/helper part of a mixed-length split takes its fixed
+                # helper count whatever its shortest sequence is.
+                forced_helpers = getattr(self, "_forced_m64_owner_helpers", 0)
+                if forced_helpers:
+                    m64_owner_helpers = min(
+                        forced_helpers,
+                        M64_OWNER_HELPER_MAX_HELPERS,
+                        _m64_cooperative_capacity(q.device) // total_tasks - 2,
+                    )
+                    if m64_owner_helpers < 1:
+                        m64_owner_helpers = 0
             m64_factory = partial(
                 _m64_pair_share_factory if pair_share else _factory,
                 "compiled_bf16_fused_m64",
@@ -4198,6 +4452,7 @@ class FlashKDABlackwellBF16FusedLaunch:
         self.ir = self.module.schedule
         num_work_bins = 0
         bin_mix_plan = None
+        turn_short_program = None
         if getattr(self.module, "work_bins", False):
             # A body built with work bins reads its bin table through seq_order
             # and runs one CTA per bin.
@@ -4233,6 +4488,50 @@ class FlashKDABlackwellBF16FusedLaunch:
                     seq_lens,
                     num_heads,
                     gpu_arch in WORK_BIN_MIX_SPAN_ARCHES,
+                )
+            # A turnover launch whose bins the helper-pool rule admits takes
+            # the module's helper-pool build instead: its plan words follow the
+            # table the same way and it runs the same bins on the same grid.
+            bin_pool_program = (
+                _work_bin_pool_program(getattr(self.module, "name", None), gpu_arch)
+                if bin_mix_program is not None
+                else None
+            )
+            bin_pool_plan = (
+                _work_bin_pool_plan(
+                    tuple(work_bin_table), num_work_bins, seq_lens, num_heads, sm_count
+                )
+                if bin_pool_program is not None
+                else None
+            )
+            if bin_pool_plan is not None:
+                bin_mix_program = bin_pool_program
+                bin_mix_plan = bin_pool_plan
+            elif bin_mix_plan is not None:
+                # A bin-mix launch whose longest task is longer than
+                # BF16_WORK_BIN_MIX_LONG_TASK_CHUNKS chunks takes the module's
+                # long-task bin-mix build where the loader names one: the same
+                # bins, plan words and bits with the per-warp TMA final-state
+                # store.
+                bin_mix_program = (
+                    _work_bin_mix_long_program(bin_mix_program, gpu_arch, seq_lens)
+                    or bin_mix_program
+                )
+            # A turnover launch of short tasks with many tasks per SM that
+            # takes neither build takes the module's short-task turnover build
+            # where the loader names one: the same bins, table and bits with
+            # the per-warp TMA final-state store.
+            if (
+                bin_mix_plan is None
+                and uses_default_fused_m128
+                and not use_direct_m128_n16
+            ):
+                turn_short_program = _work_bin_turn_short_program(
+                    getattr(self.module, "name", None),
+                    gpu_arch,
+                    seq_lens,
+                    num_heads,
+                    sm_count,
                 )
             work_bin_upload = _upload_int32_batch(
                 q.device,
@@ -4323,6 +4622,15 @@ class FlashKDABlackwellBF16FusedLaunch:
                 _kda_registry._RENDERED_WORK_BIN_TURN_ROUTES.get(gpu_arch, {}).values()
             ):
                 self.schedule += "_turnover"
+            if turn_short_program is not None:
+                turn_short_module = _kda_registry.PreparedKernel(
+                    turn_short_program, gpu_arch
+                )
+                self._qkv_carrier_names[id(turn_short_module)] = (
+                    self._qkv_carrier_names.get(id(self.module), ())
+                )
+                self.module = turn_short_module
+                self.ir = turn_short_module.schedule
             if bin_mix_plan is not None:
                 # The bin-mix build runs the same bins on the same grid; a
                 # refused cooperative launch takes the turnover program
@@ -4477,6 +4785,22 @@ class FlashKDABlackwellBF16FusedLaunch:
                 initial_state_f32=initial_state_f32_pointer,
                 final_state_f32=final_state_f32_pointer,
             )
+            # A program built with final_state_warp_tma (or the turnover program
+            # a bin-mix launch falls back to) stores the final state through a
+            # tensor map of the caller's [N_or_pool, H, 128, 128] FP32 final
+            # state; without a final state the map covers one unused panel.
+            if _takes_final_state_tma(self.module) or (
+                self.work_bin_mix and _takes_final_state_tma(bin_mix_fallback[0])
+            ):
+                self.args["final_state_f32_tma"] = (
+                    final_state
+                    if final_state is not None
+                    else torch.empty(
+                        (1, 1, HEAD_DIM, HEAD_DIM),
+                        dtype=torch.float32,
+                        device=q.device,
+                    )
+                )
         if self.work_bin_mix:
             # The give ring (chunk_state) and its ready words (zero_workspace):
             # the owner zeroes each word it takes, so the program leaves every
@@ -4717,8 +5041,11 @@ class FlashKDABlackwellBF16FusedLaunch:
         self.module.prepare(grid=self.grid, **self.args)
         self._descriptors_stale = False
 
-    def _build_launch_records(self) -> list:
-        """The staging copies and kernel launches of one launch(), in order."""
+    def _build_launch_records(self, export: bool = True) -> list:
+        """The staging copies and kernel launches of one launch(), in order.
+
+        ``export`` as in :func:`_prepared_kernel_record`.
+        """
         records = [
             (destination.copy_, (source,))
             for destination, source in self._token_storage_refreshes
@@ -4728,19 +5055,19 @@ class FlashKDABlackwellBF16FusedLaunch:
         if self.prepare_module is not None:
             records.append(
                 _prepared_kernel_record(
-                    self.prepare_module, self.prepare_grid, self.prepare_args
+                    self.prepare_module, self.prepare_grid, self.prepare_args, export
                 )
             )
         records.append(
-            self._m64_owner_helper_record()
+            self._m64_owner_helper_record(export)
             if self.m64_owner_helpers
-            else self._work_bin_mix_record()
+            else self._work_bin_mix_record(export)
             if self.work_bin_mix
-            else _prepared_kernel_record(self.module, self.grid, self.args)
+            else _prepared_kernel_record(self.module, self.grid, self.args, export)
         )
         return records
 
-    def _m64_owner_helper_record(self) -> tuple:
+    def _m64_owner_helper_record(self, export: bool = True) -> tuple:
         """The launch record of the M64 owner/helper build.
 
         The driver can refuse the cooperative grid although the capacity probe
@@ -4749,7 +5076,9 @@ class FlashKDABlackwellBF16FusedLaunch:
         have taken (_fall_back_from_m64_owner_helper) and launches that instead;
         a refused launch leaves the words untouched.
         """
-        call, arguments = _prepared_kernel_record(self.module, self.grid, self.args)
+        call, arguments = _prepared_kernel_record(
+            self.module, self.grid, self.args, export
+        )
 
         def launch(*packed):
             if self.m64_owner_helpers:
@@ -4787,7 +5116,7 @@ class FlashKDABlackwellBF16FusedLaunch:
                 schedule,
             )
 
-    def _work_bin_mix_record(self) -> tuple:
+    def _work_bin_mix_record(self, export: bool = True) -> tuple:
         """The launch record of the bin-mix build.
 
         A helper bin's chunks reach their owner through the ring while both
@@ -4796,7 +5125,9 @@ class FlashKDABlackwellBF16FusedLaunch:
         (_fall_back_from_work_bin_mix) and launches that instead; a refused
         launch leaves the ring words untouched.
         """
-        call, arguments = _prepared_kernel_record(self.module, self.grid, self.args)
+        call, arguments = _prepared_kernel_record(
+            self.module, self.grid, self.args, export
+        )
 
         def launch(*packed):
             if self.work_bin_mix:
@@ -4842,6 +5173,22 @@ class FlashKDABlackwellBF16FusedLaunch:
             self._prepare_descriptors_in_stream()
         records = self._launch_records
         if records is None:
+            if "_launch_records" not in self.__dict__:
+                # The first launch of a binding (a new plan, or a plan-cache
+                # rebind) passes the bound torch tensors: the call converts
+                # them for less host time than exporting each moved tensor
+                # ahead of it.  The instance-level None marks that launch; a
+                # second launch of the same binding builds the exported
+                # record and reuses it until the next rebind.  The exports
+                # kept for the previous binding are dropped here, so a
+                # binding launched only once does not keep its predecessor's
+                # tensors alive.
+                for owner in (self.prepare_module, self.module):
+                    if owner is not None:
+                        owner.__dict__.pop("_ffi_export_memo", None)
+                self._launch_records = None
+                _run_launch_records(self._build_launch_records(export=False))
+                return
             records = self._launch_records = tuple(self._build_launch_records())
         _run_launch_records(records)
 
@@ -5290,6 +5637,48 @@ def _affine_window_row_starts(
     return seq_ids, local_rows
 
 
+def _affine_window_table(
+    num_parts, first_parts, part_seq_ids, part_local_rows, merge_final_positions
+):
+    """The gathered-index main body's window table: four int64 per window.
+
+    Window ``w``: the sequence whose caller state index is its pool slot (-1:
+    the window starts no sequence), the row-table entry and the rows before the
+    window that make its checkpoint row start (with rows in place the caller's
+    entry of its sequence and its local rows; otherwise the main windows' own
+    row offsets, entry ``w``), and the position of its sequence's final pool
+    offset on the merging route (-1 elsewhere).
+    """
+    table = [[-1, w, 0, -1] for w in range(num_parts)]
+    if part_seq_ids is not None:
+        for w in range(num_parts):
+            table[w][1] = part_seq_ids[w]
+            table[w][2] = part_local_rows[w]
+    for seq, window in enumerate(first_parts):
+        table[window][0] = seq
+        if merge_final_positions is not None:
+            table[window][3] = merge_final_positions[seq]
+    return [value for row in table for value in row]
+
+
+# Arguments a launch binds itself for the generated programs whose plans name
+# them (no shipped module plan does): the tensor map of the caller's FP32
+# final state that a program built with final_state_warp_tma stores through.
+RUNTIME_BOUND_ARGS = (("tma_buffer", "final_state_f32_tma"),)
+
+
+def _takes_final_state_tma(module) -> bool:
+    """``module`` stores the FP32 final state through ``final_state_f32_tma``."""
+    plan = getattr(module, "_arg_plan", ())
+    return any(name == RUNTIME_BOUND_ARGS[0][1] for _kind, name in plan)
+
+
+def _gathers_window_indices(launch) -> bool:
+    """``launch``'s body reads the window indices from caller tensors (``window_table``)."""
+    plan = getattr(getattr(launch, "module", None), "_arg_plan", ())
+    return any(name == "window_table" for _kind, name in plan)
+
+
 class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
     """PR #4779 split-sequence affine prefix over direct-M128 windows.
 
@@ -5621,6 +6010,13 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
             host_i64["merge_final_positions"] = [
                 end - 2 if end >= 2 else num_parts - 1 for end in part_offsets[1:]
             ]
+        host_i64["window_table"] = _affine_window_table(
+            num_parts,
+            host_i64["first_parts"],
+            host_i64.get("part_seq_ids"),
+            host_i64.get("part_local_rows"),
+            host_i64.get("merge_final_positions"),
+        )
         uploaded_i32 = _upload_int_batch(q.device, host_i32, torch.int32)
         uploaded_i64 = _upload_int_batch(q.device, host_i64, torch.int64)
         if self._correction_merge:
@@ -5803,6 +6199,37 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
             state_slot_stride=initial_state.stride(0),
             use_state_indices=1,
         )
+        # A gathered-index main body reads each window's pool slot and row
+        # start from the caller's state indices and row table through the
+        # window table, and publishes the row starts and merge offsets the
+        # later passes read: the composite then launches no index gather
+        # (the chain route without the merging correction keeps it for the
+        # epilogue's int64 indices).
+        self._gathered_indices = _gathers_window_indices(self._main)
+        self._index_gather_launched = not (
+            self._gathered_indices and (self._apply_route or self._correction_merge)
+        )
+        if self._gathered_indices:
+            rows_in_place = state_checkpoints is not None and self._checkpoint_in_place
+            published = torch.empty((num_parts,), dtype=torch.int64, device=q.device)
+            self._main.args.update(
+                state_indices_addr=state_indices.data_ptr(),
+                state_indices_i64=int(state_indices.dtype == torch.int64),
+                window_table=uploaded_i64["window_table"],
+                gathered_row_starts=self._part_row_starts
+                if rows_in_place
+                else published,
+                gathered_final_offsets=self._merge_final_offsets
+                if self._correction_merge
+                else published,
+                final_slot_stride=int(final_state.stride(0)),
+            )
+            if rows_in_place:
+                self._main.args["checkpoint_cu_starts_addr"] = (
+                    self._checkpoint_start.data_ptr()
+                )
+            self._main.__dict__.pop("_launch_records", None)
+            self.schedule += "_gathered_indices"
         self._main.args["initial_state_f32"] = self._initial_pool_pointer
         if self._chain_map_fold:
             # The map-fold build writes every tail window's BF16 map state
@@ -6216,7 +6643,10 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
         )
         if map_first:
             add(self._map_records())
-        if self._correction_merge:
+        if not self._index_gather_launched:
+            # The gathered-index main body reads the caller's indices itself.
+            pass
+        elif self._correction_merge:
             # The index gather also places each sequence's pool offset at the
             # correction window that ends it.
             add(
@@ -7029,6 +7459,12 @@ class _RebindView:
     shape: tuple[int, ...]
     stride: tuple[int, ...]
     dtype: Any
+    # Keys of the same container bound to the same tensor object as ``key``
+    # (``q`` / ``q_tma``, an in-place pool's ``initial_state_f32`` /
+    # ``final_state_f32``): re-pointed with ``key``'s view.
+    aliases: tuple = ()
+    # ``key`` or an alias is a TMA descriptor source (``*_tma``).
+    described: bool = False
 
 
 @dataclass(frozen=True)
@@ -7082,7 +7518,14 @@ class RebindPlan:
 # Split-sequence affine composites hold three prepared part launches plus a
 # few caller-aliasing attributes of their own; their containers are addressed
 # as "<sub launch>.<container>" so one rebind plan covers the whole DAG.
-AFFINE_SUB_LAUNCHES = ("_main", "_map", "_correction")
+AFFINE_SUB_LAUNCHES = (
+    "_main",
+    "_map",
+    "_correction",
+    "_part3",
+    "_part4",
+    "_part5",
+)  # _part3.._part5: the extra parts of a mixed-length split
 # Parts whose plan-cache rebinds may be applied after the first chain kernel.
 AFFINE_DEFERRED_PARTS = ("_map", "_correction")
 AFFINE_REBIND_ATTRIBUTES = (
@@ -7100,6 +7543,11 @@ AFFINE_REBIND_ATTRIBUTES = (
 # checkpoint buffer (``rows_tma``).  When a plan-cache rebind moves one of
 # them the composite must re-encode those descriptors before its next launch.
 APPLY_ROUTE_DESCRIPTOR_ATTRIBUTES = ("_out_tail", "_checkpoint_output")
+
+
+def _rebind_argument_container(container_name: str) -> bool:
+    """A launch's argument dict (``args`` / ``prepare_args``, of a part too)."""
+    return container_name.rsplit(".", 1)[-1] in ("args", "prepare_args")
 
 
 def _rebind_owner(impl, container_name: str):
@@ -7189,11 +7637,26 @@ def capture_rebind_plan(impl, inputs: dict) -> RebindPlan:
 
     views: list[_RebindView] = []
     addresses: list[_RebindAddress] = []
+    # (container, id of the bound tensor) -> index of its view spec; the
+    # container's argument dict holds every value, so ids stay unique here.
+    primaries: dict[tuple[str, int], int] = {}
     for container_name, container in _rebind_containers(impl).items():
         for key, value in container.items():
             if isinstance(value, torch.Tensor):
                 hit = classify(value)
                 if hit is not None:
+                    described = isinstance(key, str) and key.endswith("_tma")
+                    primary = primaries.get((container_name, id(value)))
+                    if primary is not None:
+                        spec = views[primary]
+                        views[primary] = replace(
+                            spec,
+                            aliases=spec.aliases + (key,),
+                            described=spec.described or described,
+                        )
+                        continue
+                    if _rebind_argument_container(container_name):
+                        primaries[(container_name, id(value))] = len(views)
                     views.append(
                         _RebindView(
                             container_name,
@@ -7203,6 +7666,7 @@ def capture_rebind_plan(impl, inputs: dict) -> RebindPlan:
                             tuple(value.shape),
                             tuple(value.stride()),
                             value.dtype,
+                            described=described,
                         )
                     )
             elif (
@@ -7318,11 +7782,7 @@ def rebind_prepared_launch(
             sub._keepalive = owned + new_inputs
     if later_views or later_addresses or deferred_owned:
         for spec in later_views:
-            if (
-                isinstance(spec.key, str)
-                and spec.key.endswith("_tma")
-                and (changed is None or spec.input_name in changed)
-            ):
+            if spec.described and (changed is None or spec.input_name in changed):
                 tma_moved = True
         impl._deferred_rebind = (
             tuple(later_views),
@@ -7406,7 +7866,7 @@ def _apply_rebind_specs(
         touched.add(spec.container)
         container = containers[spec.container]
         replacement = view_for(spec)
-        if isinstance(spec.key, str) and spec.key.endswith("_tma"):
+        if spec.described:
             # With ``changed`` the moved inputs are known; otherwise compare
             # the recorded pointer with the previous binding.
             moved = (
@@ -7437,6 +7897,8 @@ def _apply_rebind_specs(
                     tma_moved = True
                     impl._apply_descriptors_stale = True
         container[spec.key] = replacement
+        for alias in spec.aliases:
+            container[alias] = replacement
     for address in address_specs:
         touched.add(address.container)
         containers[address.container][address.key] = (
@@ -7464,6 +7926,325 @@ def _apply_rebind_specs(
         # whose parts moved does not re-encode the untouched parts.
         owner._descriptors_stale = True
     return tma_moved
+
+
+# Mixed-length M64 split: a launch whose sequences mix long (>= MIXLEN_LONG_MIN
+# tokens) and short ones runs the long sequences as an owner/helper part and
+# the short ones as plain M64 parts, instead of one M64 value-split launch.
+MIXLEN_LONG_MIN = 1024
+MIXLEN_ARCHES = frozenset({"sm_100a", "sm_103a"})
+MIXLEN_HELPERS = 2
+_MIXLEN_PART_NAMES = ("_main", "_map", "_correction", "_part3", "_part4", "_part5")
+
+
+class _MixLenM64Launch(FlashKDABlackwellFP32M64Launch):
+    """A short-sequence part: the M64 FP32-state value split (plain or pair-share build by its own rule)."""
+
+    _forced_m64_owner_helpers = 0
+
+
+class _MixLenOwnerHelperLaunch(FlashKDABlackwellFP32M64Launch):
+    """A long-sequence part: the M64 owner/helper build with MIXLEN_HELPERS helpers per task."""
+
+    _forced_m64_owner_helpers = MIXLEN_HELPERS
+
+
+class _MixLenSplitLaunch:
+    """The parts of one mixed-length launch; side-stream parts co-run between a fork and a join."""
+
+    _descriptors_stale = False
+    _use_output_projection = False
+    _apply_route = False
+    _main = None
+    _map = None
+    _correction = None
+    _part3 = None
+    _part4 = None
+    _part5 = None
+
+    def __init__(self, parts, device, mode):
+        import torch
+
+        self._layout = []
+        sides = sorted({side for _, side, _ in parts if side})
+        for name, (launch, side, seqs) in zip(_MIXLEN_PART_NAMES, parts, strict=False):
+            setattr(self, name, launch)
+            self._layout.append((name, side, seqs))
+        self._launch_device = device
+        self._streams = {side: torch.cuda.Stream(device=device) for side in sides}
+        self._fork = torch.cuda.Event() if sides else None
+        self._join = {side: torch.cuda.Event() for side in sides}
+        self.split_mode = mode
+        first = getattr(self, self._layout[0][0])
+        self.route = first.route
+        self.gate_kind = first.gate_kind
+        self.gpu_arch = first.gpu_arch
+        self.sm_count = first.sm_count
+
+    @property
+    def schedule(self) -> str:
+        """The split's part programs, read from each part's current schedule.
+
+        A part that falls back from a refused cooperative launch switches its
+        own ``schedule``; reading it here keeps the composite name current.
+        """
+        return (
+            f"mixlen_{self.split_mode}["
+            + "+".join(
+                f"{getattr(self, name).schedule}@{seqs[0]}-{seqs[1]}{'/s%d' % side if side else ''}"
+                for name, side, seqs in self._layout
+            )
+            + "]"
+        )
+
+    def __getattr__(self, name):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return getattr(self.__dict__["_main"], name)
+
+    def launch(self) -> None:
+        import torch
+
+        import tvm_ffi
+
+        flush_deferred_rebind(self)
+        stale = self._descriptors_stale
+        self._descriptors_stale = False
+        device = self._launch_device
+        # Settle every part (descriptors, launch records) on the caller stream
+        # before the fork, so no host work is left between the part launches.
+        staged = []
+        with _ffi_stream_context(device):
+            for name, side, _ in self._layout:
+                part = getattr(self, name)
+                if stale:
+                    part._descriptors_stale = True
+                if part._descriptors_stale:
+                    part._prepare_descriptors_in_stream()
+                records = part._launch_records
+                if records is None:
+                    records = part._launch_records = tuple(part._build_launch_records())
+                torch_ops = bool(getattr(part, "_token_storage_refreshes", ())) or (
+                    getattr(part, "_beta_tma_valid", None) is not None
+                )
+                staged.append((side, records, torch_ops))
+        current = torch.cuda.current_stream(device)
+        if self._fork is not None:
+            self._fork.record(current)
+        index = (
+            device.index if device.index is not None else torch.cuda.current_device()
+        )
+        ffi_device = _TVM_DEVICES.get(index)
+        if ffi_device is None:
+            ffi_device = _TVM_DEVICES[index] = tvm_ffi.device(f"cuda:{index}")
+        raw = getattr(tvm_ffi, "use_raw_stream", None)
+        # Launch the staged records of every part back to back.
+        for side, records, torch_ops in staged:
+            if side:
+                stream = self._streams[side]
+                stream.wait_event(self._fork)
+                if torch_ops or raw is None:
+                    with torch.cuda.stream(stream), _ffi_stream_context(device):
+                        _run_launch_records(records)
+                else:
+                    with raw(ffi_device, stream.cuda_stream):
+                        _run_launch_records(records)
+                self._join[side].record(stream)
+            else:
+                with _ffi_stream_context(device):
+                    _run_launch_records(records)
+        for side in sorted(self._join):
+            current.wait_event(self._join[side])
+
+    def close(self) -> None:
+        for name, _, _ in self._layout:
+            getattr(self, name).close()
+
+
+def _mixlen_split(stock, args, kwargs):
+    """The mixed-length split of a launch whose plan is ``stock``, or ``None`` (keep ``stock``)."""
+    import torch
+
+    if getattr(stock, "gpu_arch", None) not in MIXLEN_ARCHES:
+        return None  # other arches keep the stock impl object
+    if type(stock) is not FlashKDABlackwellFP32FusedM128Launch:
+        return None
+    schedule = str(getattr(stock, "schedule", ""))
+    if not schedule.startswith("fused_m64_independent_dvsplit_fp32_state") or getattr(
+        stock, "m64_owner_helpers", 0
+    ):
+        return None
+    if len(args) != 10:
+        return None
+    allowed = {
+        "initial_state",
+        "final_state",
+        "cu_seqlens",
+        "sequence_lengths",
+        "state_indices",
+        "state_checkpoints",
+        "checkpoint_cu_starts",
+        "checkpoint_every_n_tokens",
+        "compute_dtype",
+    }
+    if set(kwargs) - allowed or kwargs.get("compute_dtype", "bf16") != "bf16":
+        return None
+    q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound = args
+    cu_seqlens = kwargs.get("cu_seqlens")
+    lengths = kwargs.get("sequence_lengths")
+    if cu_seqlens is None or lengths is None or q.ndim != 4 or q.shape[0] != 1:
+        return None
+    if q.device.type != "cuda":
+        return None  # meta / CPU tensors (route-only planning) keep the stock plan
+    if torch.cuda.is_current_stream_capturing():
+        return None  # the plan-time cu_seqlens check below synchronizes
+    lengths = tuple(int(n) for n in lengths)
+    longs = [n >= MIXLEN_LONG_MIN for n in lengths]
+    if not any(longs) or all(longs):
+        return None
+    offsets = [0]
+    for n in lengths:
+        offsets.append(offsets[-1] + n)
+    if [int(x) for x in cu_seqlens.tolist()] != offsets:
+        return None
+    every = int(kwargs.get("checkpoint_every_n_tokens", 0) or 0)
+    state_checkpoints = kwargs.get("state_checkpoints")
+    checkpoint_cu_starts = kwargs.get("checkpoint_cu_starts")
+    ckpt_offsets = None
+    if state_checkpoints is not None:
+        ckpt_offsets = [0]
+        for n in lengths:
+            ckpt_offsets.append(ckpt_offsets[-1] + (n + every - 1) // every)
+        if [int(x) for x in checkpoint_cu_starts.tolist()] != ckpt_offsets:
+            return None
+    num_heads = int(q.shape[2])
+    device = q.device
+    capacity = _m64_cooperative_capacity(device)
+    num_seqs = len(lengths)
+    first = longs.index(True)
+    last = num_seqs - 1 - longs[::-1].index(True)
+    rng_fits = (last - first + 1) * num_heads * (2 + MIXLEN_HELPERS) <= capacity
+    runs = []  # maximal runs of equal class: (i0, i1, long)
+    i = 0
+    while i < num_seqs:
+        j = i
+        while j + 1 < num_seqs and longs[j + 1] == longs[i]:
+            j += 1
+        runs.append((i, j, longs[i]))
+        i = j + 1
+    cc_fits = (
+        sum(
+            (i1 - i0 + 1) * num_heads * (2 + MIXLEN_HELPERS)
+            for i0, i1, is_long in runs
+            if is_long
+        )
+        <= capacity
+    )
+    # "rng": one owner/helper part over the first..last long sequence, then the
+    # short head / tail parts, all on the caller stream.  "cc": one side-stream
+    # owner/helper part per run of long sequences, short runs on the caller stream.
+    if rng_fits:
+        mode = "rng"
+        plan = []
+        if first > 0:
+            plan.append((0, first - 1, False, 0))
+        plan.append((first, last, True, 0))
+        if last < num_seqs - 1:
+            plan.append((last + 1, num_seqs - 1, False, 0))
+        # owner/helper part first, the short tails after it
+        plan.sort(key=lambda part: not part[2])
+    elif cc_fits:
+        mode = "cc"
+        plan = []
+        side = 0
+        for i0, i1, is_long in runs:
+            if is_long:
+                side += 1
+                plan.append((i0, i1, True, side))
+        for i0, i1, is_long in runs:
+            if not is_long:
+                plan.append((i0, i1, False, 0))
+    else:
+        return None
+    if len(plan) > len(_MIXLEN_PART_NAMES):
+        return None
+    initial_state = kwargs.get("initial_state")
+    final_state = kwargs.get("final_state")
+    state_indices = kwargs.get("state_indices")
+    in_place = initial_state is final_state
+    parts = []
+    try:
+        for i0, i1, is_long, side in plan:
+            s, e = offsets[i0], offsets[i1 + 1]
+            sub_lengths = lengths[i0 : i1 + 1]
+            sub_offsets = [x - s for x in offsets[i0 : i1 + 2]]
+            sub_kwargs = dict(
+                cu_seqlens=torch.tensor(
+                    sub_offsets, dtype=cu_seqlens.dtype, device=device
+                ),
+                sequence_lengths=sub_lengths,
+                checkpoint_every_n_tokens=kwargs.get("checkpoint_every_n_tokens", 0),
+                compute_dtype="bf16",
+            )
+            if state_indices is not None:
+                sub_kwargs.update(
+                    initial_state=initial_state,
+                    final_state=final_state,
+                    state_indices=state_indices[i0 : i1 + 1],
+                )
+            else:
+                sub_initial = (
+                    None if initial_state is None else initial_state[i0 : i1 + 1]
+                )
+                sub_final = (
+                    sub_initial
+                    if in_place
+                    else (None if final_state is None else final_state[i0 : i1 + 1])
+                )
+                sub_kwargs.update(
+                    initial_state=sub_initial, final_state=sub_final, state_indices=None
+                )
+            if state_checkpoints is not None:
+                c0, c1 = ckpt_offsets[i0], ckpt_offsets[i1 + 1]
+                sub_kwargs.update(
+                    state_checkpoints=state_checkpoints[c0:c1],
+                    checkpoint_cu_starts=torch.tensor(
+                        [x - c0 for x in ckpt_offsets[i0 : i1 + 2]],
+                        dtype=checkpoint_cu_starts.dtype,
+                        device=device,
+                    ),
+                )
+            else:
+                sub_kwargs.update(state_checkpoints=None, checkpoint_cu_starts=None)
+            sub_args = (
+                q[:, s:e],
+                k[:, s:e],
+                v[:, s:e],
+                g[:, s:e],
+                beta[:, s:e],
+                scale,
+                out[:, s:e],
+                A_log,
+                dt_bias,
+                lower_bound,
+            )
+            cls = _MixLenOwnerHelperLaunch if is_long else _MixLenM64Launch
+            part = cls(*sub_args, **sub_kwargs)
+            parts.append((part, side, (i0, i1)))
+            if is_long and part.m64_owner_helpers < 2:
+                raise RuntimeError("owner/helper part did not take two helpers")
+    except Exception as error:  # noqa: BLE001 - any refusal keeps the stock plan
+        for part, _, _ in parts:
+            part.close()
+        from flashinfer.jit.core import logger
+
+        logger.warning(
+            "mixed-length split refused (%s: %s); stock plan kept",
+            type(error).__name__,
+            error,
+        )
+        return None
+    return _MixLenSplitLaunch(parts, device, mode)
 
 
 class FlashKDABlackwellLaunch:
@@ -7515,6 +8296,10 @@ class FlashKDABlackwellLaunch:
         else:
             impl = FlashKDABlackwellBF16FusedLaunch
         self._impl = impl(*args, **kwargs)
+        split = _mixlen_split(self._impl, args, kwargs)
+        if split is not None:
+            self._impl.close()
+            self._impl = split
 
     def __getattr__(self, name):
         return getattr(self._impl, name)

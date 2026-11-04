@@ -22,7 +22,9 @@ form of ``test_cake_mhc_det_train_workspace.py``.  Every case runs at each
 hidden size the device's architecture routes, its buffers sized with
 ``hidden=``; a size it does not route is skipped.
 
-The non-deterministic backward workspace is the deterministic layout without
+The non-deterministic backward workspace is the deterministic per-CTA layout
+(its parameter region the per-CTA partials ``[chunks, 32]``, never the group
+rows the deterministic package lays out inside its ``BWD_ROW_BANDS``) without
 its per-chunk ``dfn`` partials; its first region is the ticket word the
 column-slab pass draws its work units from with a self-resetting ``atom.inc``
 (a word that is not zero at launch makes the launch skip units or end away
@@ -35,9 +37,12 @@ overwritten with 0xFF (no call may depend on what an earlier call left there).
 Every call is compared with the same call on fresh zeroed exact-size
 workspaces and with the deterministic package
 (``flashinfer.cake_mhc_det_train_backend``) on the same inputs: every output but
-``dfn`` bitwise; ``dfn`` within ``2 P u sum_t |dz'_t| |x_t|`` per element
-(``P`` the chunk count of the column-slab pass, ``u = 2^-24``, ``dz'`` the FP64
-reference's).  On one buffer reused over realistic token-count sequences:
+``dfn`` bitwise (``dscale`` / ``dbase`` against the deterministic per-CTA
+reduction where the deterministic backward runs its group-row forms, which this
+package does not copy: :func:`_det_reduction`); ``dfn`` within ``2 P u sum_t
+|dz'_t| |x_t|`` per element (``P`` the chunk count of the column-slab pass,
+``u = 2^-24``, ``dz'`` the FP64 reference's).  On one buffer reused over
+realistic token-count sequences:
 
 * every call finds the ticket words of its layout zero and leaves them zero;
 * a CUDA Graph captured at a smaller token count on the large buffers, its
@@ -64,6 +69,7 @@ reference's).  On one buffer reused over realistic token-count sequences:
 
 from __future__ import annotations
 
+import contextlib
 import gc
 import json
 import math
@@ -195,13 +201,15 @@ def _parts(T: int, hidden: int = HIDDEN) -> int:
 
 
 def _lpt_runs(T: int, hidden: int = HIDDEN) -> bool:
-    """Whether the column slab runs its two-size ``lpt`` record of ``hidden`` at ``T`` on this device (at hidden 5120
-    and 7168 only where the size's table calibrates the architecture)."""
-    return loader.bwd_slab_atomic_program(T, _sm_count(), _arch(), hidden) == "lpt"
+    """Whether the column slab runs a two-size record of ``hidden`` (``lpt`` or its slab-fastest copy ``lpt_os``) at
+    ``T`` on this device (at hidden 5120 and 7168 only where the size's table calibrates the architecture)."""
+    program = loader.bwd_slab_atomic_program(T, _sm_count(), _arch(), hidden)
+    return program.startswith("lpt")
 
 
 def _slab_parts(T: int, hidden: int = HIDDEN) -> int:
-    """The chunk count the column slab launches: ``slab_plan``'s ``lpt_parts`` under ``lpt``, else :func:`_parts`."""
+    """The chunk count the column slab launches: ``slab_plan``'s ``lpt_parts`` under ``lpt`` / ``lpt_os``, else
+    :func:`_parts`."""
     if not _lpt_runs(T, hidden):
         return _parts(T, hidden)
     parts = loader.slab_plan(T, _sm_count(), _arch(), hidden)["lpt_parts"]
@@ -211,8 +219,8 @@ def _slab_parts(T: int, hidden: int = HIDDEN) -> int:
 
 def _dfn_factor(T: int, hidden: int = HIDDEN) -> float:
     """F of the dfn bound F u (|carried| + ABS_SLACK sum_t |dz'_t| |x_t|) at T (``test_cake_mhc_train.py``'s
-    ``_dfn_factor``, which derives it): 2 P where the column slab runs dynr (both sides sum the same per-chunk
-    partials), 2 max(P, P_k7) + 10 where it runs lpt (the partials are another partition's)."""
+    ``_dfn_factor``, which derives it): 2 P where the column slab runs dynr or dynr_os (both sides sum the same
+    per-chunk partials), 2 max(P, P_k7) + 10 where it runs lpt or lpt_os (the partials are another partition's)."""
     if not _lpt_runs(T, hidden):
         return 2.0 * _parts(T, hidden)
     return 2.0 * max(_slab_parts(T, hidden), _parts(T, hidden)) + 10.0
@@ -399,10 +407,53 @@ def _fresh(T: int, hidden: int = HIDDEN) -> dict:
 
 
 def _deterministic(T: int, hidden: int = HIDDEN) -> dict:
-    """The outputs of the deterministic package on its default workspaces."""
-    out = _snapshot(_step(_inputs(T, hidden), None, None, deterministic=True))
+    """The outputs of the deterministic package on its default workspaces (``dscale`` / ``dbase`` of its per-CTA
+    reduction where it runs its group-row forms: :func:`_det_reduction`)."""
+    i = _inputs(T, hidden)
+    out = _snapshot(_step(i, None, None, deterministic=True))
+    out.update(_det_reduction(i, {"stats": out["stats"], "gstats": out["gstats"]}))
     torch.cuda.synchronize()
     return out
+
+
+def _clear_det_caches() -> None:
+    """Drop the deterministic package's cached host plans, workspace envelopes, layouts and route plans (each binds
+    the token-owner and reduction forms and the parameter region of its token count)."""
+    det_loader.host_plan.cache_clear()
+    det_loader.workspace_bytes_upto.cache_clear()
+    det._LAYOUTS.clear()
+    det._PLANS.clear()
+    det._FAST_ROUTES.clear()
+
+
+@contextlib.contextmanager
+def _det_per_cta():
+    """The deterministic package with its group-row forms off (``cake_jit.bwd_group_rows`` False at every call): the
+    per-CTA token owner and workspace layout this package copies, and the per-CTA reduction whose ``dscale`` /
+    ``dbase`` its column slab reproduces.  Its caches are dropped on entry and on exit, also when the body fails
+    (:func:`_clear_det_caches`)."""
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(det_loader, "bwd_group_rows", lambda *_args, **_kwargs: False)
+        _clear_det_caches()
+        try:
+            yield
+        finally:
+            patch.undo()
+            _clear_det_caches()
+
+
+def _det_reduction(i: dict, prep: dict) -> dict:
+    """Where the deterministic backward runs its group-row forms at the inputs' token count and hidden size on this
+    device (``cake_jit.bwd_group_rows``: ``BWD_ROW_BANDS``, which this package does not copy), the ``dscale`` and
+    ``dbase`` of its per-CTA run (:func:`_det_per_cta`, on a workspace of the per-CTA sizing); elsewhere nothing (its
+    own outputs are that reduction's)."""
+    T, hidden = i["X"].shape[0], i["X"].shape[2]
+    if not det_loader.bwd_group_rows(T, _sm_count(), _arch(), hidden):
+        return {}
+    with _det_per_cta():
+        ws = det.cake_mhc_det_train_backward_workspace(T, _device(), hidden=hidden)
+        out = _backward(det.cake_mhc_det_train_backward_finish, i, prep, workspace=ws)
+    return {k: out[k] for k in ("dscale", "dbase")}
 
 
 def _poison_workspace(ws: torch.Tensor) -> None:
@@ -888,7 +939,9 @@ def _nd_backward(i: dict, prep: dict, **kwargs) -> dict:
 
 
 def _det_backward(i: dict, prep: dict) -> dict:
-    return _backward(det.cake_mhc_det_train_backward_finish, i, prep)
+    out = _backward(det.cake_mhc_det_train_backward_finish, i, prep)
+    out.update(_det_reduction(i, prep))
+    return out
 
 
 def _poisoned_outputs(T: int, hidden: int = HIDDEN) -> dict:
@@ -946,16 +999,17 @@ def test_one_workspace_serves_a_ragged_token_sequence(hidden: int) -> None:
 
 
 def test_workspace_sizes_and_which_sizing_serves_which_backward(hidden: int) -> None:
-    """At the hidden size ``H`` of the case, the non-deterministic backward workspace is the deterministic layout
-    without its last region, the per-chunk ``dfn`` partials (``P x 24 x 4H`` FP32): the same regions at the same
-    offsets; its public size is the envelope over every token count up to ``T``, below the deterministic package's;
-    the forward workspace is the deterministic one.  A workspace of the deterministic sizing serves the
-    non-deterministic backward; one of the non-deterministic sizing is refused by the deterministic backward (and by a
-    larger token count)."""
+    """At the hidden size ``H`` of the case, the non-deterministic backward workspace is the deterministic per-CTA
+    layout (:func:`_det_per_cta`: the parameter region ``[chunks, 32]`` at every token count) without its last region,
+    the per-chunk ``dfn`` partials (``P x 24 x 4H`` FP32): the same regions at the same offsets; its public size is
+    the envelope over every token count up to ``T``, below the deterministic package's; the forward workspace is the
+    deterministic one.  A workspace of the deterministic sizing serves the non-deterministic backward; one of the
+    non-deterministic sizing is refused by the deterministic backward (and by a larger token count)."""
     dev, sm, arch = _device(), _sm_count(), _arch()
     for T in (1, 7, 63, 64, 65, 129, 257, 1000, 2049, 4096, 8192, 16263, 32768, 65536):
         ndl = loader.workspace_regions("bwd", T, sm, arch, hidden)
-        dtl = det_loader.workspace_regions("bwd", T, sm, arch, hidden)
+        with _det_per_cta():
+            dtl = det_loader.workspace_regions("bwd", T, sm, arch, hidden)
         assert list(dtl["regions"])[-1] == "dfn_part", T
         part = dtl["regions"]["dfn_part"]
         assert list(ndl["regions"]) == list(dtl["regions"])[:-1], T
@@ -965,6 +1019,10 @@ def test_workspace_sizes_and_which_sizing_serves_which_backward(hidden: int) -> 
         assert (
             ndl["regions"]["ticket"]["bytes"] == TICKET_BYTES == 4 * loader.TICKET_WORDS
         )
+        assert ndl["regions"]["param_partial"]["shape"] == (
+            loader.host_plan(T, sm, arch, hidden)["chunks"],
+            loader.PARAM_COLS,
+        ), T
         assert part["bytes"] == _parts(T, hidden) * MAPPING_ROWS * STREAMS * hidden * 4
         assert ndl["total_bytes"] == dtl["total_bytes"] - _round256(part["bytes"]), T
         nd_bytes = pkg.cake_mhc_train_backward_workspace_bytes(
