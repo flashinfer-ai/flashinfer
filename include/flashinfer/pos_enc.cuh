@@ -1240,6 +1240,9 @@ __global__ void RopeQuantizeAppendPagedKVCacheKernel(
     }
   }
 #if (__CUDACC_VER_MAJOR__ >= 12 && defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+  // Warps with no rows (small nnz) reach this right away, and the first thread to execute it
+  // triggers the whole CTA. Wait for every thread so dependents launch only after the CTA is done.
+  __syncthreads();
   asm volatile("griddepcontrol.launch_dependents;");
 #endif
 }
