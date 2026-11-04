@@ -141,6 +141,11 @@ GPU_ROWS = [
     ("tp8", "in_proj_qkvgfab", 3584, 0),
     ("tp1", "kv_b", 1024, 0),
     ("tp1", "kv_b", 1281, 0),
+    # Round 12 H: tp8:o_proj rows inside the sm_100a ranges of 56,6,2048 and 56,6,4096 that take the tail N split form
+    # of the 256-wide grid-stride program (``gemm_tstore_k128_gs_tns``, lever TNS); on sm_103a each row resolves to
+    # that table's own form.
+    ("tp8", "o_proj", 1536, 0),
+    ("tp8", "o_proj", 2304, 0),
 ]
 
 
@@ -713,8 +718,12 @@ def test_view_bn_range_keeps_its_staged_and_register_views(monkeypatch):
 _RECORD_K128 = {"route": "gemm", "gemm_bk": 128}
 _RSKF = {"route": "gemm", "gemm_bk": 128, "gemm_skf": 1, "gemm_rstaged_skf": 1}
 _ARS = {"route": "gemm", "gemm_bk": 128, "gemm_gs": 1, "gemm_ars": 1}
+_GS = {"route": "gemm", "gemm_bk": 128, "gemm_gs": 1}
+_TNS = {"route": "gemm", "gemm_bk": 128, "gemm_gs": 1, "gemm_tns": 1}
 # Round 12 batch 4: ``(cell, M, sm_100a entry)`` on both sides of every in-bucket range edge (M 1280 / 1281,
-# 3328 / 3329, 3584 / 3585) and at the bucket edges of each segment.
+# 3328 / 3329, 3584 / 3585) and at the bucket edges of each segment.  Round 12 H (lever TNS): the 56,6,2048 and
+# 56,6,4096 edges (M 1280 / 1281, 1536 / 1537, 1792 / 1793, 2048 / 2049, 2304 / 2305, 2560 / 2561, 2816 / 2817,
+# 3328 / 3329, 3584 / 3585, 3840 / 3841) and the bucket edges 1025 and 4096.
 _M_RANGE_EDGES = (
     ("50,28,2048", 1025, _RECORD_K128),
     ("50,28,2048", 1280, _RECORD_K128),
@@ -730,6 +739,28 @@ _M_RANGE_EDGES = (
     ("192,2,2048", 1280, _RECORD_K128),
     ("192,2,2048", 1281, _ARS),
     ("192,2,2048", 2048, _ARS),
+    ("56,6,2048", 1025, _GS),
+    ("56,6,2048", 1280, _GS),
+    ("56,6,2048", 1281, _TNS),
+    ("56,6,2048", 1536, _TNS),
+    ("56,6,2048", 1537, _GS),
+    ("56,6,2048", 1792, _GS),
+    ("56,6,2048", 1793, _TNS),
+    ("56,6,2048", 2048, _TNS),
+    ("56,6,4096", 2049, _TNS),
+    ("56,6,4096", 2304, _TNS),
+    ("56,6,4096", 2305, _RECORD_K128),
+    ("56,6,4096", 2560, _RECORD_K128),
+    ("56,6,4096", 2561, _TNS),
+    ("56,6,4096", 2816, _TNS),
+    ("56,6,4096", 2817, _RECORD_K128),
+    ("56,6,4096", 3328, _RECORD_K128),
+    ("56,6,4096", 3329, _TNS),
+    ("56,6,4096", 3584, _TNS),
+    ("56,6,4096", 3585, _RECORD_K128),
+    ("56,6,4096", 3840, _RECORD_K128),
+    ("56,6,4096", 3841, _TNS),
+    ("56,6,4096", 4096, _TNS),
 )
 # Round 12 E: the sm_103a edges ``(cell, M, entry)``, ``None`` for the cell's own entry: lever RSKF on
 # 50,28,2048 rows M 1537..2048 (k = ceil(M / 256) of 7 and 8), lever ARS on 192,2,16384 rows M 4097..12288 and 16384;
@@ -749,6 +780,10 @@ _M_RANGE_EDGES_SM103 = (
     ("192,2,16384", 12289, None),
     ("192,2,16384", 16383, None),
     ("192,2,16384", 16384, _ARS),
+    ("56,6,2048", 1281, None),
+    ("56,6,2048", 2048, None),
+    ("56,6,4096", 2049, None),
+    ("56,6,4096", 4096, None),
 )
 # the GEMM programs batch 4 adds to the sm_100a plan (levers RPF, RSKF, ARS)
 _BATCH4_KEYS = {
@@ -756,6 +791,8 @@ _BATCH4_KEYS = {
     "gemm_rstaged_k128_skf",
     "gemm_tstore_k128_gs_ars",
 }
+# the GEMM program round 12 H adds to the sm_100a plan (lever TNS)
+_TNS_KEYS = {"gemm_tstore_k128_gs_tns"}
 
 
 @pytest.mark.parametrize("arch", ARCHES)
@@ -765,7 +802,10 @@ def test_m_ranges_route_both_sides_of_each_edge(monkeypatch, arch):
     the staged-register fix-up stream-K program (lever RSKF) on M 1281..2048 and on the 4096 bucket outside 3329..3584, and
     tp1:kv_b takes the A-resident grid-stride program (lever ARS) on M 1281..2048.  sm_103a (round 12 E): RSKF on M
     1537..2048, ARS on the 16384 bucket's M 4097..12288 and 16384; round 12 F: VIEW-BN on 96,28,512 rows M 497..512
-    (``test_view_bn_range_keeps_its_staged_and_register_views``).  Each row on both sides of each edge
+    (``test_view_bn_range_keeps_its_staged_and_register_views``).  Round 12 H (lever TNS): sm_100a tp8:o_proj takes the
+    tail N split form of the 256-wide grid-stride program on the 56,6,2048 rows M 1281..1536 and 1793..2048 and the
+    56,6,4096 rows M 2049..2304, 2561..2816, 3329..3584 and 3841..4096 (its quantization launch unchanged); the other
+    rows keep the cells' programs.  Each row on both sides of each edge
     resolves to its entry and launches that entry's program; with the batch-4 programs unregistered the rows fall back to
     the record's programs.  The registry is stubbed, so the host rules are checked whether or not this checkout registers
     the programs."""
@@ -778,6 +818,8 @@ def test_m_ranges_route_both_sides_of_each_edge(monkeypatch, arch):
         "sm_100a": {
             "50,28,2048": ((1281, 2048),),
             "50,28,4096": ((3329, 3584),),
+            "56,6,2048": ((1281, 1536), (1793, 2048)),
+            "56,6,4096": ((2049, 2304), (2561, 2816), (3329, 3584), (3841, 4096)),
             "192,2,2048": ((1281, 2048),),
         },
         "sm_103a": {
@@ -805,8 +847,20 @@ def test_m_ranges_route_both_sides_of_each_edge(monkeypatch, arch):
     kv_b = _family_weight("tp1", "kv_b")
     assert (in_proj.n_tiles128, in_proj.num_k_iters) == (50, 28)
     assert (kv_b.n_tiles128, kv_b.num_k_iters) == (192, 2)
+    o_proj = _family_weight("tp8", "o_proj")
+    assert (o_proj.n_tiles128, o_proj.num_k_iters) == (56, 6)
     # tp8:in_proj_qkvgfab: 6284 columns (6284 % 8 == 4), so every view of the family is staged-register
     staged = dict(gemm_tma_store=False, gemm_reg_staged=True)
+
+    def cell_plan(M):
+        # the row's plan under its cell's own entry (no in-bucket M ranges)
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(cb, "decode_table_m_ranges", lambda arch: {})
+            cb.cell_m_ranges.cache_clear()
+            try:
+                return cb.route_plan(o_proj, M, arch, SM_COUNT, None)
+            finally:
+                cb.cell_m_ranges.cache_clear()
 
     def check(registered):
         for cell, M, entry in edges:
@@ -838,6 +892,38 @@ def test_m_ranges_route_both_sides_of_each_edge(monkeypatch, arch):
                 else:
                     assert plan.gemm_skf is None
                     assert plan.grids[-1] == cb._gemm_grid(m_tiles, plan.gemm_n_tiles)
+            elif cell.startswith("56,"):
+                # tp8:o_proj: 7168 columns -- the TMA-store view takes the tail N split grid-stride program inside the
+                # ranges (the plain grid-stride program when it is not registered) and the cell's program outside them,
+                # the staged view the record's
+                plan = cb.route_plan(o_proj, M, arch, SM_COUNT, None)
+                if arch == "sm_103a":
+                    assert not plan.kernels[-1].endswith("_tns"), (M, plan.kernels)
+                    assert not plan.gemm_gs
+                    continue
+                gs = entry is _TNS or entry is _GS
+                expected = (
+                    ("gemm_tstore_k128_gs_tns" if registered else "gemm_tstore_k128_gs")
+                    if entry is _TNS
+                    else "gemm_tstore_k128_gs"
+                    if gs
+                    else "gemm_tstore_k128"
+                )
+                assert plan.kernels[-1] == expected, (cell, M, plan.kernels)
+                assert plan.gemm_bn == 256 and plan.gemm_n_tiles == 28
+                assert plan.gemm_bk == 128 and plan.gemm_skf is None
+                assert plan.gemm_gs == gs
+                pairs = min(m_tiles // 2 * 28, SM_COUNT // 2)
+                assert plan.gemm_gs_pairs == (pairs if gs else 0)
+                assert plan.grids[-1] == (
+                    2 * pairs if gs else cb._gemm_grid(m_tiles, 28)
+                )
+                if entry is _TNS:
+                    # the same launch and quantization program as the cell's grid-stride / record row
+                    assert pairs == 74 and plan.grids[-1] == 148
+                    assert plan.kernels[:-1] == cell_plan(M).kernels[:-1], M
+                rplan = cb.route_plan(o_proj, M, arch, SM_COUNT, None, **staged)
+                assert rplan.kernels[-1] == "gemm_rstaged_k128" and not rplan.gemm_gs
             else:
                 # tp1:kv_b: 24576 columns -- the TMA-store view takes the grid-stride forms, the staged view the record's
                 plan = cb.route_plan(kv_b, M, arch, SM_COUNT, None)
@@ -863,7 +949,9 @@ def test_m_ranges_route_both_sides_of_each_edge(monkeypatch, arch):
     check(True)
     # the batch-4 programs unregistered: the rows fall back at the same geometry onto the record's programs
     monkeypatch.setattr(
-        cb, "route_available", lambda arch, keys: not set(keys) & _BATCH4_KEYS
+        cb,
+        "route_available",
+        lambda arch, keys: not set(keys) & (_BATCH4_KEYS | _TNS_KEYS),
     )
     check(False)
 
@@ -1150,6 +1238,79 @@ def test_sk_bindings_carry_no_split_scalars(monkeypatch):
     )
     with pytest.raises(ValueError, match="stream-K partial area"):
         cb._sk_launch_kwargs(skf, sf[:64], device)
+
+
+def test_tns_entry_rules_and_required_keys(monkeypatch):
+    """Round 12 H (lever TNS): the table key ``gemm_tns`` (0 / 1) names the tail N split form of the plain 256-wide
+    ``_gs`` program on sm_100a and is refused elsewhere on both the plan and the launch; the row segments of the two
+    tp8:o_proj cells it refines; ``required_kernel_keys`` holds ``gemm_tstore_k128_gs_tns`` on sm_100a only, beside the
+    plain grid-stride and record programs the cells' other segments keep."""
+    assert cb._entry_gemm_tns(_TNS) and not cb._entry_gemm_tns(_GS)
+    assert not cb._entry_gemm_tns({"gemm_tns": 0})
+    with pytest.raises(ValueError, match="gemm_tns must be 0 or 1"):
+        cb._entry_gemm_tns({"gemm_tns": 2})
+    assert cb.gemm_tns_cell_conflicts(_TNS, "sm_100a") == []
+    assert cb.gemm_tns_cell_conflicts(_TNS, "sm_103a") == ["arch"]
+    assert cb.gemm_tns_cell_conflicts(None, "sm_100a") == ["gemm_gs"]
+    assert cb.gemm_tns_cell_conflicts({**_TNS, "gemm_bn": 192}, "sm_100a") == [
+        "gemm_bn"
+    ]
+    assert cb.gemm_tns_cell_conflicts({**_TNS, "gemm_ars": 1}, "sm_100a") == [
+        "gemm_ars"
+    ]
+    assert cb.gemm_tns_cell_conflicts({**_TNS, "gemm_gm": 64}, "sm_100a") == ["gemm_gm"]
+    assert cb.gemm_tns_cell_conflicts({"gemm_bn": 224, "gemm_gm": 64}, "sm_103a") == [
+        "gemm_gs",
+        "gemm_bn",
+        "gemm_gm",
+        "arch",
+    ]
+    # row segments: each range with its two edges, then the cell's entry on the rest of the bucket
+    table = decode_table("sm_100a")
+    assert table["56,6,2048"] == _GS and table["56,6,4096"] == _RECORD_K128
+    assert cb._cell_segments("sm_100a", "56,6,2048", table["56,6,2048"]) == (
+        (_TNS, (1281, 1536)),
+        (_TNS, (1793, 2048)),
+        (_GS, (1025, 1280)),
+        (_GS, (1537, 1792)),
+    )
+    assert cb._cell_segments("sm_100a", "56,6,4096", table["56,6,4096"]) == (
+        (_TNS, (2049, 2304)),
+        (_TNS, (2561, 2816)),
+        (_TNS, (3329, 3584)),
+        (_TNS, (3841, 4096)),
+        (_RECORD_K128, (2305, 2560)),
+        (_RECORD_K128, (2817, 3328)),
+        (_RECORD_K128, (3585, 3840)),
+    )
+    required = {arch: set(required_kernel_keys(arch, SM_COUNT)) for arch in ARCHES}
+    assert required["sm_100a"] >= _TNS_KEYS
+    assert required["sm_100a"] >= {"gemm_tstore_k128_gs", "gemm_tstore_k128"}
+    assert not any(key.endswith("_tns") for key in required["sm_103a"])
+    # a gemm_tns cell that is not the 256-wide _gs program on sm_100a is refused on the plan and on the launch
+    real_table = cb.decode_table
+    o_proj = _family_weight("tp8", "o_proj")
+    monkeypatch.setattr(cb, "route_available", lambda arch, keys: True)
+    monkeypatch.setattr(cb, "kernel_program", lambda arch, key: (key, ()))
+    for arch, entry, conflict in (
+        ("sm_100a", {**_TNS, "gemm_bn": 192}, r"\['gemm_bn'\]"),
+        ("sm_103a", dict(_TNS), r"\['arch'\]"),
+    ):
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(
+                cb,
+                "decode_table",
+                lambda a, entry=entry: {**real_table(a), "56,6,16384": entry},
+            )
+            with pytest.raises(
+                ValueError, match=f"carries gemm_tns together with {conflict}"
+            ):
+                cb.route_plan(o_proj, 8192, arch, SM_COUNT, None)
+            with pytest.raises(
+                ValueError,
+                match=f"56,6,16384 carries gemm_tns together with {conflict}",
+            ):
+                required_kernel_keys(arch, SM_COUNT)
 
 
 def test_padding_and_k_sets():
@@ -2884,6 +3045,17 @@ def test_projection_matches_reference(tp, module, M, stride_pad):
             if gs_pairs and cb._gs_eligible(stem)
             else ""
         )
+        # Round 12 H (lever TNS): a ``gemm_tns`` row's grid-stride launch takes the tail N split ``_gs_tns`` program
+        # of the 256-wide form when it is registered (the same launch).
+        if (
+            slot == "_gs"
+            and bn == 256
+            and cb._entry_gemm_tns(gentry)
+            and cb.route_available(
+                plan.arch, (cb.gemm_kernel_key(stem + "_gs_tns", gpf),)
+            )
+        ):
+            slot = "_gs_tns"
         # Round 12 (lever ARS): a ``gemm_ars`` cell's grid-stride rows launch the A-resident ``_gs_ars`` program
         # of the 256-wide form when it is registered (the same launch).
         if (
@@ -2964,7 +3136,7 @@ def test_projection_matches_reference(tp, module, M, stride_pad):
         launched = expected_key.split("_pf")[0]
         assert plan.gemm_pdlb == launched.endswith("_pdlb")
         assert plan.gemm_static == launched.endswith("_st")
-        assert plan.gemm_gs == launched.endswith(("_gs", "_gs_ars"))
+        assert plan.gemm_gs == launched.endswith(("_gs", "_gs_ars", "_gs_tns"))
         assert plan.gemm_gm == (64 if "_g64" in launched else cb.GEMM_GROUP_M)
         assert (plan.gemm_bn, plan.gemm_n_tiles, plan.gemm_bk) == (
             bn,

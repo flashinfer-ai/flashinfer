@@ -62,7 +62,7 @@ assert q.Qwen38BlockWrapper.is_experimental is True and q.Qwen38BlockWrapper.pla
 import torch
 g = q.Qwen38BlockGeometry(d_model=2560, num_qo_heads=24, num_kv_heads=2)
 sup = q.qwen_3_8_block_support(torch.device("cpu"), g)
-assert sup.served is False and sup.source.commit.startswith("4c8e24355")
+assert sup.served is False and sup.source.commit.startswith("6b21be0e0")
 # the probe on a CPU host reads no vendored tree and imports no kernel module (FlashInfer's own cute_dsl availability probe may load the
 # DSL's Python frontend: the Qwen 3.5 package's rule, not this package's)
 assert not any(k.startswith("flashinfer.experimental.qwen_3_5_block._cudnn_frost") for k in sys.modules), "the probe on CPU reads no vendored tree"
@@ -87,7 +87,8 @@ assert not mods, mods
 assert support.INDEX_HEAD_DIM == 128 and support.INDEX_QUERY_ROWS_MAX == 64 and support.INDEX_STATE_ROWS_EXTRA == 3
 assert support.INDEX_TOP_K_RANGE == (4, 512, 4) and support.PAGE_SIZES == (16, 32, 64, 128) and support.DECODE_CAPTURE_ROWS_MAX == 128
 assert support.FORMS == ("prefill", "extend", "decode") and support.INDEX_EXTEND_RING_ROWS_MIN == 3 and support.INDEX_COMPRESS_ROUNDINGS == ("single", "hf")
-assert support.INDEX_SELECT_FORMS == ("auto", "decode", "extend") and support.INDEX_EXTEND_SELECT_BUDGET_BYTES == 512 << 20 and support.EXTEND_ROWS_MAX == 128
+assert support.INDEX_SELECT_FORMS == ("auto", "decode", "extend") and support.INDEX_EXTEND_SELECT_BUDGET_BYTES == 512 << 20
+assert not hasattr(support, "EXTEND_ROWS_MAX") and not hasattr(support, "EXTEND_ROWS_KEY")  # the 128-row bound of the previous pin is retired
 print("OK")
 """
     )
@@ -128,6 +129,18 @@ e = Fwd(mk(1, 128, DM), *w[:3], mk(1, 128, ROPE), mk(1, 128, ROPE), w[3], mk(1, 
         index_select_form="extend")
 assert e.indexer_extend and e.index_select_form_resolved == "extend" and e.fuse_prepare is False and e._indexer_extend.n_windows == 1
 assert e._cache_write.index_ring and e._cache_write.index_ring_cap == 4 and e._indexer_extend.launches_per_execute() == 6
+# the same form PAST 128 rows (the 6b21be0e0 pin): the band slab resolves the GEMM engine's own baseline tile through the driver's large-M
+# rule on the host (no device: the catalog's CPU fallback SM count), so the slab stage is flagged capture-safe at declaration -- the
+# JIT-only route, never the graph route the vendored root refuses
+kc40, vc40 = torch.zeros(40, HKV, P, D, dtype=DT), torch.zeros(40, HKV, P, D, dtype=DT)
+e5 = Fwd(mk(1, 512, DM), *w[:3], mk(1, 512, ROPE), mk(1, 512, ROPE), w[3], mk(1, 512, DM), g, paged_kv_page_size=P, kv_source="paged",
+         sample_k_cache=kc40, sample_v_cache=vc40, sample_block_table=torch.zeros(1, 40, dtype=torch.int32), fuse_norm_rope=False, fuse_gate=True,
+         sample_index_kv_cache=torch.zeros(40, P // 4, 1, DI, dtype=DT), sample_index_state_cache=torch.zeros(2, 4, 1, DI, dtype=DT),
+         sample_index_state_block_table=torch.zeros(1, 1, dtype=torch.int32), index_state_slot_mapping_present=True, rope_position_tables_only=False,
+         index_select_form="extend")
+assert e5.indexer_extend and e5._proj.m == 512 and e5._proj.resolves_a_jit_tile() is True and e5._proj.capture_safe is True and e5._out_proj.capture_safe is True
+from flashinfer.experimental.qwen_3_5_block._cudnn_frost.gated_attention_block.kernels.proj_gemm import large_m_tile_config, small_m_tile_config
+assert small_m_tile_config(512, g.n_qkvg, DM, dtype=DT) is None and large_m_tile_config(512, g.n_qkvg, DM, dtype=DT) is not None
 env = Fwd.serving_envelope(g, DT, torch.device("cpu"), device_cc=(10, 7))
 d = env.decode
 assert d.index_select_forms == support.INDEX_SELECT_FORMS and d.index_extend_ring_rows_min == support.INDEX_EXTEND_RING_ROWS_MIN
@@ -154,8 +167,9 @@ print("OK")
 def test_the_closure_modules_the_decode_route_added_import_without_cudnn():
     """Every module the 3.8 routes added to the shared vendored tree (the block-sparse core and its lean second body, the paged indexer
     kernels and their DSL-free hosts; since the 4c8e24355 pin the extend step's two kernels and the DSA indexer scorer + top-k subtree it
-    scores through) imports with the ``cudnn`` package blocked and no GPU; the lazily imported paths outside the closure (the e4m3 pool's
-    upcast arm, the DSA subtree's backward packages) are named and stay out."""
+    scores through; since the 6b21be0e0 pin the GEMM engine's layout helper) imports with the ``cudnn`` package blocked and no GPU; the
+    lazily imported paths outside the closure (the e4m3 pool's upcast arm, the DSA subtree's backward packages, the GEMM graph-route planner
+    the projection driver's large-M rule does NOT import) are named and stay out."""
     pytest.importorskip("cutlass")
     out = _run_isolated(
         _BLOCK_CUDNN
@@ -174,8 +188,11 @@ added = ("sdpa.fwd.sparse_gqa_sm107", "sdpa.fwd.kernels.sm107.sparse_d256_f16", 
          "gated_attention_block.kernels.qsa_kbar_gather", "gated_attention_block.kernels.qsa_canonical_list",
          "deepseek_sparse_attention", "deepseek_sparse_attention.indexer_forward", "deepseek_sparse_attention.indexer_forward._support",
          "deepseek_sparse_attention.indexer_top_k", "deepseek_sparse_attention.utils.runtime", "deepseek_sparse_attention.score_recompute",
-         # two SDPA host modules the changed adapters import at this pin
-         "sdpa.layout", "sdpa.native_sm80")
+         # two SDPA host modules the changed adapters import since the 4c8e24355 pin
+         "sdpa.layout", "sdpa.native_sm80",
+         # the 6b21be0e0 pin: the GEMM engine's layout helper (a module-level dependency of its graph analyzer and recipe) and the tile
+         # catalog that now publishes the planner envelope the projection driver's large-M rule reads (the band slab past 128 rows)
+         "gemm.frost.layouts", "gemm.frost.tile_config", "gated_attention_block.kernels.proj_gemm")
 failed, declined = [], []
 for name in added:
     try:
@@ -192,7 +209,7 @@ m = importlib.import_module(root + "sdpa.fwd.sparse_gqa_sm107")
 # the bare `import cudnn` of this module was rewritten to the vendored root: its data_type enum is the shim's
 assert m.cudnn.__name__ == root[:-1] and m.cudnn.data_type.BFLOAT16 == 10, (m.cudnn.__name__,)
 for absent in ("gated_attention_block.kernels.qsa_kv_upcast", "deepseek_sparse_attention.indexer_backward", "deepseek_sparse_attention.sparse_attention_backward",
-               "deepseek_sparse_attention.sparse_attention_forward", "deepseek_sparse_attention.training"):
+               "deepseek_sparse_attention.sparse_attention_forward", "deepseek_sparse_attention.training", "gemm.frost.planning"):
     try:
         importlib.import_module(root + absent)
     except ModuleNotFoundError:

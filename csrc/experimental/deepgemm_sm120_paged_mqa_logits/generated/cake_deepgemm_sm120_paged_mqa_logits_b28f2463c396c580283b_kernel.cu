@@ -1543,7 +1543,7 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_b28f2463c396c580283b(const __grid_co
                     int s_lo = ((b_cq == b_sq) ? b_skv : 0);
                     int s_hi = b_ekv;
                     if (b_cq != b_eq) {
-                        s_hi = (context_lens[b_cq * 1 + 1 - 1] + 64 - 1) / 64;
+                        s_hi = (context_lens[b_cq + 1 - 1] + 64 - 1) / 64;
                     }
                     int s_steps = (s_hi - s_lo + 2 - 1) / 2;
                     b_ckv = s_lo;
@@ -1607,7 +1607,7 @@ kernel_cake_deepgemm_sm120_paged_mqa_logits_b28f2463c396c580283b(const __grid_co
                             int n_lo = ((b_cq == b_sq) ? b_skv : 0);
                             int n_hi = b_ekv;
                             if (b_cq != b_eq) {
-                                n_hi = (context_lens[b_cq * 1 + 1 - 1] + 64 - 1) / 64;
+                                n_hi = (context_lens[b_cq + 1 - 1] + 64 - 1) / 64;
                             }
                             int n_steps = (n_hi - n_lo + 2 - 1) / 2;
                             b_ckv = n_lo;

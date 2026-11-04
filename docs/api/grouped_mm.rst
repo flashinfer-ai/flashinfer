@@ -12,7 +12,7 @@ experts via an ``m_indptr`` cumulative-count tensor.
 The dense-style ``grouped_mm_*`` functions in this module mirror the ``flashinfer.gemm.mm_*``
 APIs and currently dispatch to the cuDNN MoE backend by default.  ``grouped_mm_bf16`` also
 accepts ``backend="cake"``, the experimental generated ragged BF16 backend for
-SM100 / SM103 / SM107 (:ref:`apicake_moe_grouped_gemm`), which reads ``m_indptr``
+SM100 / SM103 / SM107 (:ref:`apicake_moe_grouped_det_gemm`), which reads ``m_indptr``
 on the device and needs no padding.
 
 BF16 / FP16

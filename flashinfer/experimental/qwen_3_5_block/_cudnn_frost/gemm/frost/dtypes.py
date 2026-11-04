@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 
-"""Shared dtype conversion tables for the GEMM engine (single source of truth)."""
+"""Shared dtype conversion helpers for the GEMM engine."""
 
 from __future__ import annotations
 

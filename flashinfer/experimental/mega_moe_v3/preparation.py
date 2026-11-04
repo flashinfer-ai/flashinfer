@@ -34,7 +34,9 @@ INTERMEDIATE_ALIGN = 128
 SF_GRAN = 32
 # Scale of the padded weight groups: float 1.0 packs to the UE8M0 byte 127.
 # The padded weights are zero, so any finite scale gives exact zero products;
-# 1.0 keeps the padded scale words away from the denormal exponents.
+# 1.0 keeps the padded scale words away from the denormal exponents. On the
+# routes of ``SFB1_VIEW_ROUTES`` a 128-row block of padded W1 rows only is
+# left out of the SFB1 map (``sfb1_launch_view``) and reads as zero words.
 PAD_SCALE = 1.0
 PIPELINE_KEY_FIELDS = (
     "num_tokens",
@@ -389,6 +391,46 @@ def w1_launch_view(b1, logical_intermediate: int, expert_map: bool):
     if not expert_map:
         return b1.reshape(-1, b1.shape[-1])
     return b1[:, : 2 * logical_intermediate]
+
+
+# The routes whose SFB1 map leaves the padded blocks out, as ``(num_sms,
+# num_experts, num_global_experts, physical, logical)`` intermediate widths:
+# the 152-SM (sm_103a) E384 tensor-parallel rank routes, the only routes this
+# map was validated on. Every other route binds the whole tensor.
+SFB1_VIEW_ROUTES = frozenset({(152, 384, 384, 640, 576), (152, 384, 384, 384, 288)})
+
+
+def sfb1_launch_view(
+    sfb1,
+    logical_intermediate: int,
+    *,
+    num_sms: int,
+    num_experts: int,
+    num_global_experts: int,
+):
+    """``SFB1`` (the ``[E * K / 128, 2 * I_phys]`` gate / up scale words in
+    the source-schedule row order) as the program's two-dimensional TMA map
+    takes it.
+
+    On a route of ``SFB1_VIEW_ROUTES`` the row extent ends with the last
+    128-row block that holds a logical gate / up row (a strided view, no
+    copy), so a block of padded rows only is TMA zero fill instead of words
+    read from memory. Its weights are zero too, so the zero scale words
+    (UE8M0 2^-127) still give exact zero products. A block that mixes logical
+    and padded rows stays whole: the scale permutation spreads its padded rows
+    over the block. Every other route takes the whole tensor.
+    """
+    route = (
+        int(num_sms),
+        int(num_experts),
+        int(num_global_experts),
+        sfb1.shape[-1] // 2,
+        int(logical_intermediate),
+    )
+    if route not in SFB1_VIEW_ROUTES:
+        return sfb1
+    rows = -(-2 * logical_intermediate // BLOCK_N) * BLOCK_N
+    return sfb1[:, :rows]
 
 
 def _control_arena_mode():
@@ -791,6 +833,13 @@ def prepare_pipeline_bindings(inputs, num_sms, *, route_metadata=None):
         )
     launch_kwargs["B2"] = launch_kwargs["B2"].reshape(-1, launch_kwargs["B2"].shape[-1])
     launch_kwargs["B1"] = w1_launch_view(launch_kwargs["B1"], logical_I, w1_expert_map)
+    launch_kwargs["SFB1"] = sfb1_launch_view(
+        launch_kwargs["SFB1"],
+        logical_I,
+        num_sms=num_sms,
+        num_experts=E,
+        num_global_experts=global_experts,
+    )
     source_rows = source_blocks * 128
     source_sf1 = torch.zeros((H // 128, source_rows), dtype=torch.uint32, device="cuda")
     source_sf2 = torch.zeros((I // 128, source_rows), dtype=torch.uint32, device="cuda")

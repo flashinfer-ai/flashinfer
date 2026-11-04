@@ -3812,6 +3812,7 @@ _STRUCTURED_OPS = {
         attrs=("permutation",),
         outputs=("OUT_0",),
         infer={"OUT_0": lambda n: ([n.inputs["input"].dim[i] for i in n.params["permutation"]] if n.inputs["input"].dim else None)},
+        dtype_like={"OUT_0": "input"},  # transpose preserves values, including their storage dtype
     ),
     "concatenate": dict(
         node_type=NodeType.CONCATENATE,

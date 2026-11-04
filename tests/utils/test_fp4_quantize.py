@@ -1053,6 +1053,62 @@ def test_nvfp4_quantize_te_reference(
     torch.testing.assert_close(scale_out, expected_scale, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("shape", [(128, 64), (1024, 512)])
+@pytest.mark.parametrize("scale_offset", [-1, 0, 1], ids=["below", "midpoint", "above"])
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+@torch.inference_mode()
+def test_nvfp4_quantize_zero_scale_boundary(
+    dtype: torch.dtype,
+    shape: tuple[int, int],
+    scale_offset: int,
+    device: str,
+    set_nvfp4_quant_env,
+) -> None:
+    """Preserve the E4M3 zero midpoint in ordinary and TMA quantization paths."""
+    if not _is_fp4_supported(torch.device(device)):
+        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+    set_nvfp4_quant_env(disable_quant_fast_math=False)
+
+    m, n = shape
+    x = torch.tensor([6.0, -6.0, 0.0, -0.0], dtype=dtype, device=device).repeat(
+        m, n // 4
+    )
+    # With block AMAX 6, the pre-conversion scale equals global_scale. E4M3
+    # rounds 2**-10 to even zero; its next FP32 neighbor must remain nonzero.
+    global_scale = torch.tensor([2**-10], dtype=torch.float32, device=device)
+    if scale_offset:
+        global_scale = torch.nextafter(
+            global_scale, torch.full_like(global_scale, scale_offset * torch.inf)
+        )
+    q_ref, scale_ref = ref_fp4_quant(x, global_scale, 16)
+    scale_ref = scale_ref.to(torch.float8_e4m3fn)
+    torch.testing.assert_close(
+        scale_ref.view(torch.uint8),
+        torch.full_like(scale_ref, int(scale_offset > 0), dtype=torch.uint8),
+        rtol=0,
+        atol=0,
+    )
+    expected_q = pack_fp4_values(q_ref)
+    expected_scale = _te_ref_scale_bytes_for_layout(scale_ref, SfLayout.layout_128x4)
+
+    quantized, scales = nvfp4_quantize(
+        x, global_scale, backend="cuda", nvfp4_4over6=None
+    )
+    torch.testing.assert_close(quantized, expected_q, rtol=0, atol=0)
+    torch.testing.assert_close(scales, expected_scale, rtol=0, atol=0)
+
+    batched_quantized, batched_scales = nvfp4_batched_quantize(
+        x.unsqueeze(0).repeat(2, 1, 1), global_scale, nvfp4_4over6=None
+    )
+    torch.testing.assert_close(
+        batched_quantized, expected_q.unsqueeze(0).repeat(2, 1, 1), rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        batched_scales, expected_scale.reshape(1, -1).repeat(2, 1), rtol=0, atol=0
+    )
+
+
 @pytest.mark.parametrize("backend", NVFP4_BACKENDS)
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("shape", NVFP4_SHAPES)
@@ -1951,6 +2007,98 @@ def test_nvfp4_quantize_fp8_backend_parity(
     assert scale_match_pct > 95.0, (
         f"FP8 scale factors should match >95%, got {scale_match_pct:.1f}% "
         f"(layout={sf_layout.name})"
+    )
+
+
+# FP8 input with m >= 1024 takes the TMA kernel only when n is a multiple of its
+# 1024-column chunk; odd multiples of 512 must fall back to the non-TMA kernel.
+NVFP4_FP8_TMA_SHAPES = [
+    (1024, 512),
+    (1024, 1024),
+    (1024, 1536),
+    (4096, 512),
+    (4096, 1536),
+    (4096, 2048),
+    (1100, 1024),  # m not a multiple of 128
+    (1025, 1024),  # last row tile holds a single row
+    (1024, 3072),  # odd number of column chunks
+]
+NON_TMA_ROWS = 512
+
+
+@pytest.mark.parametrize("shape", NVFP4_FP8_TMA_SHAPES)
+@pytest.mark.parametrize("sf_layout", NVFP4_SF_LAYOUTS)
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+@torch.inference_mode()
+def test_nvfp4_quantize_fp8_tma_matches_non_tma(
+    shape: tuple[int, int],
+    sf_layout: SfLayout,
+    device: str,
+) -> None:
+    if not _is_fp4_supported(torch.device(device)):
+        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+
+    torch.set_default_device(device)
+    torch.manual_seed(42)
+
+    m, n = shape
+    x_fp8 = torch.randn((m, n)).to(torch.float8_e4m3fn)
+    tensor_amax = torch.abs(x_fp8.float()).max().to(torch.float32)
+    global_scale = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / tensor_amax
+
+    def quantize(x):
+        return nvfp4_quantize(x, global_scale, sfLayout=sf_layout, backend="cuda")
+
+    quant, scale = quantize(x_fp8)
+
+    # Row blocks of 512 stay on the non-TMA kernel, and every SF layout keeps
+    # 512-row blocks contiguous, so concatenating them rebuilds the full result.
+    blocks = [quantize(x_fp8[i : i + NON_TMA_ROWS]) for i in range(0, m, NON_TMA_ROWS)]
+    quant_ref = torch.cat([q for q, _ in blocks])
+    scale_ref = torch.cat([s.flatten() for _, s in blocks])
+
+    torch.testing.assert_close(
+        quant.view(torch.uint8), quant_ref.view(torch.uint8), rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        scale.flatten().view(torch.uint8), scale_ref.view(torch.uint8), rtol=0, atol=0
+    )
+
+
+@pytest.mark.parametrize("batch_shape", [(3, 1024, 1024), (2, 1100, 2048)])
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+@torch.inference_mode()
+def test_nvfp4_batched_quantize_fp8_tma_matches_non_tma(
+    batch_shape: tuple[int, int, int],
+    device: str,
+) -> None:
+    if not _is_fp4_supported(torch.device(device)):
+        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+
+    torch.set_default_device(device)
+    torch.manual_seed(42)
+
+    b, m, n = batch_shape
+    x_fp8 = torch.randn(batch_shape).to(torch.float8_e4m3fn)
+    tensor_amax = torch.abs(x_fp8.float()).max().to(torch.float32)
+    global_scale = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / tensor_amax
+
+    quant, scale = nvfp4_batched_quantize(x_fp8, global_scale)
+
+    blocks = [
+        nvfp4_batched_quantize(
+            x_fp8[:, i : i + NON_TMA_ROWS].contiguous(), global_scale
+        )
+        for i in range(0, m, NON_TMA_ROWS)
+    ]
+    quant_ref = torch.cat([q for q, _ in blocks], dim=1)
+    scale_ref = torch.cat([s.view(b, -1) for _, s in blocks], dim=1)
+
+    torch.testing.assert_close(
+        quant.view(torch.uint8), quant_ref.view(torch.uint8), rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        scale.view(b, -1).view(torch.uint8), scale_ref.view(torch.uint8), rtol=0, atol=0
     )
 
 

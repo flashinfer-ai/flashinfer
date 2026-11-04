@@ -26,7 +26,10 @@ query-row envelope), ``index_state_slot_mapping_present=True``, per-token ``cos`
 sequence behind a cached prefix; declared FIVE ways so every lazily imported module of that route is traced (the chunk compress, the dense kbar
 gather, the DSA compact-logits scorer + radix top-k the step scores through, the canonical-order kernel, the cache-write ring arm): the bf16
 cache behind a long prefix (a residue-2 chunk start), the ``P = 0`` prefill + a dead sequence under ``"auto"``, the e4m3 cache (the scorer's
-MXFP8 arm), the ``"hf"`` rounding attribute, and two select windows at a lowered ``QSA_EXTEND_SELECT_BUDGET_BYTES``.
+MXFP8 arm), the ``"hf"`` rounding attribute, and two select windows at a lowered ``QSA_EXTEND_SELECT_BUDGET_BYTES``; since the cuDNN Frontend
+6b21be0e0 pin FOUR more declarations PAST 128 rows (a T 512 prefill chunk, a T 2048 chunk behind a 2048-token prefix, B 4 x T 512 with a
+dead sequence, the e4m3 cache at T 512): the indexer band's slab takes the GEMM engine's own baseline tile there (the projection driver's
+large-M rule) on the JIT-only route, so these cells must record NO ``create_handle`` / ``backend_graph`` seam and a capture-safe slab stage.
 
 The JSON holds: the ordered module list with files + sizes, the import edges (importer -> imported) restricted to the
 ``cudnn`` package, every third-party top-level package touched, the data files opened under the package, the extension
@@ -346,6 +349,22 @@ def run_stages(name, blk, exec_args, exec_kwargs, out):
                 rec["out_finite"] = bool(torch.isfinite(out.float()).all().item())
             rec["stages"][st] = {"ok": True, "s": round(time.time() - t, 3)}
             log(f"{st}: ok in {time.time() - t:.2f}s")
+            if st == "compile":
+                # the two projection stages' route after compile (the 6b21be0e0 pin: the band slab past 128 rows resolves the GEMM engine's
+                # own baseline tile on the JIT-only route, capture-safe; "heuristic (graph engine)" would be the graph route)
+                facts = {}
+                for nm in ("_proj", "_out_proj"):
+                    stage = getattr(blk, nm, None)
+                    plan = getattr(stage, "_plan", None)
+                    if stage is not None:
+                        facts[nm] = {
+                            "capture_safe": bool(getattr(stage, "capture_safe", False)),
+                            "tile": str(getattr(plan, "tile_config_name", None)),
+                            "route": str(getattr(plan, "route", None)),
+                            "m": int(getattr(stage, "m", 0)),
+                        }
+                rec["proj_facts"] = facts
+                log(f"proj facts: {facts}")
         except Exception as exc:  # noqa: BLE001
             rec["stages"][st] = {
                 "ok": False,
@@ -982,7 +1001,7 @@ def form_extend_qsa(
 forms = {"prefill": form_prefill, "extend": form_extend, "decode": form_decode}
 # the Qwen 3.8 EXTEND route (the 4c8e24355 re-vendor): five declarations of the in-block indexer's EXTEND step over the pools (all executed on a
 # device) -- the lazily imported modules of this route (the two kernels of the step, the DSA scorer + top-k package it scores through) enter the
-# closure only through these traces
+# closure only through these traces; the 6b21be0e0 re-vendor appends four declarations past 128 rows (the large-M JIT route of the band slab)
 EXTEND_QSA_FORMS = {
     # T 128 behind a 6146-token prefix (the chunk starts at residue 2 of the block grid: the straddling block reads two ring rows), vLLM's cap 4
     "extend_qsa_b1_t128_p6146_bf16": form_extend_qsa(
@@ -1003,6 +1022,21 @@ EXTEND_QSA_FORMS = {
     # two select windows at a lowered budget (40 rows per window over B 4 x T 20 = 80 rows): the window loop, cap 8
     "extend_qsa_two_windows_b4_t20": form_extend_qsa(
         batch=4, s_q=20, prefixes=[40, None, 17, 64], cap=8, budget_rows=40
+    ),
+    # PAST 128 rows (the 6b21be0e0 pin): the band slab's projection takes the GEMM engine's own baseline tile on the JIT-only route (the
+    # driver's large-M rule) -- a T 512 prefill chunk, the T 2048 chunk behind a 2048-token prefix (the real prefill chunk), B 4 x T 512
+    # (2048 rows) with a dead sequence and mixed prefixes, the e4m3 cache at T 512; each must compile capture-safe with no cuDNN handle
+    "extend_qsa_b1_t512_p0_bf16": form_extend_qsa(
+        batch=1, s_q=512, prefixes=[0], cap=4
+    ),
+    "extend_qsa_b1_t2048_p2048_bf16": form_extend_qsa(
+        batch=1, s_q=2048, prefixes=[2048], cap=4
+    ),
+    "extend_qsa_b4_t512_mixed_bf16": form_extend_qsa(
+        batch=4, s_q=512, prefixes=[300, None, 2048, 17], cap=4
+    ),
+    "extend_qsa_b1_t512_p301_e4m3": form_extend_qsa(
+        batch=1, s_q=512, prefixes=[301], cap=4, cache_dtype=torch.float8_e4m3fn
     ),
 }
 # the Qwen 3.8 decode route, four declarations (one per input-contract arm the serving stacks take; all four executed on a device)

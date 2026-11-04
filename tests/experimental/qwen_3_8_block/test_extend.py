@@ -13,12 +13,18 @@ one- and two-row chunks that complete a block or carry the tail alone; the e4m3 
 Then: a chunked prefill ``[125, 2, 1, 45, 128]`` of a 301-token prompt with the caches STARTING EMPTY (``prefill`` for the first chunk,
 ``extend`` for the rest; every chunk's own writes prime the next) followed by three carried decode steps with a rejected draft re-stepped
 -- after every chunk and step the oracle holds and the cache's complete blocks are bitwise the from-scratch compress of the accepted
-stream; the typed declines at plan time (the five vendored ``indexer_extend_*`` rows by text, the 128-row bound, the chunk bound, a page
-off the powers of two, the e4m3 pool, the body vocabulary) and at run time; CUDA-graph capture after ONE eager warm-up on the capture
-stream under ``set_sync_debug_mode("error")``, replayed bitwise and over a new chunk; the launch census by kernel NAME (the chunk
-compress, the gather, the canonical kernel, two cache writes; + 2 per further select window at a lowered budget); the workspace query
-honest for the extend buckets and three runs allocating nothing; ``"prefill"`` == ``"extend"`` (equal declarations but the form, bitwise
-runs on the same inputs)."""
+stream; the typed declines at plan time (the five vendored ``indexer_extend_*`` rows by text, the chunk bound, a page off the powers of
+two, the e4m3 pool, the body vocabulary) and at run time; CUDA-graph capture after ONE eager warm-up on the capture stream under
+``set_sync_debug_mode("error")``, replayed bitwise and over a new chunk; the launch census by kernel NAME (the chunk compress, the gather,
+the canonical kernel, two cache writes; + 2 per further select window at a lowered budget); the workspace query honest for the extend
+buckets and three runs allocating nothing; ``"prefill"`` == ``"extend"`` (equal declarations but the form, bitwise runs on the same inputs).
+PAST 128 ROWS (the cuDNN Frontend 6b21be0e0 re-vendor: the indexer band's slab takes the GEMM engine's own baseline tile on the same
+JIT-only route, so the 128-row bound of the previous pin is retired): the ladder's ``T 512`` prefill chunk, ``T 2048`` prefill chunk (the
+real prefill chunk), ``T 512`` behind a 2048-token prefix, batch 4 x ``T 512`` with a dead entry, the e4m3 cache at ``T 512`` -- each
+against the same two-stage oracle, the cache rows bitwise, two runs bitwise, the slab stage's tile the large-M rule's name and both
+projections capture-safe; capture after one warm-up at ``T 512``; the launch census at ``T 512``.  ONE run holds at most 65,535 rows at
+this pin (the vendored indexer's query compress launches with the run's row count as a CUDA grid dimension): batch 32 x ``T 2048`` is the
+typed decline through the public entry -- at ``prepare`` and at the workspace query, on both forms -- before any vendored code (host only)."""
 
 import pytest
 import torch
@@ -164,9 +170,29 @@ def _check_declaration(plan, case, form):
     assert d["index_cache_dtype"] == plan.index_cache_dtype == case.cache_dtype
     assert d["n_blocks_max"] == case.block_table.shape[1] * (case.page_size // 4)
     assert d["proj_capture_safe"] is True and d["out_proj_capture_safe"] is True, (
-        "under the 128-row bound both projections ride the JIT-only route (the vendored block's own reading)"
+        "both projections ride the JIT-only route at every row count (the vendored block's own reading)"
     )
     assert d["capture_safe_rows"] is True
+    # the slab stage's tile is the resolver's own name on this device: the small-M route's swap-AB tile up to 128 rows, the GEMM engine's
+    # baseline pick through the large-M rule past them (the 6b21be0e0 pin) -- never the graph route's "heuristic (graph engine)"
+    from flashinfer.experimental.qwen_3_5_block._cudnn_frost.gated_attention_block.kernels.proj_gemm import (
+        large_m_tile_config,
+        small_m_tile_config,
+    )
+
+    g = case.geometry38
+    rows = case.b * case.q_len
+    if rows > 128:
+        expect = large_m_tile_config(rows, g.n_qkvg, g.d_model, dtype=torch.bfloat16)
+        assert expect is not None and "swapAB" not in expect, expect
+    else:
+        expect = small_m_tile_config(rows, g.n_qkvg, g.d_model, dtype=torch.bfloat16)
+        assert expect is not None and "swapAB" in expect, expect
+    assert d["proj_tile"] == expect and d["proj_tile"] != "heuristic (graph engine)", (
+        rows,
+        d["proj_tile"],
+        expect,
+    )
 
 
 def _two_runs_bitwise(plan, case, label):
@@ -216,6 +242,20 @@ LADDER = [
         dict(index_compress_rounding="hf"),
         (8295,),
         100,
+        16,
+        4,
+        "extend",
+    ),
+    # PAST 128 ROWS (the 6b21be0e0 pin: the band slab's projection takes the GEMM engine's own baseline tile on the JIT-only route)
+    ("T512-P0-prefill-p16-cap4", {}, (512,), 512, 16, 4, "prefill"),
+    ("T2048-P0-prefill-p16-cap4", {}, (2048,), 2048, 16, 4, "prefill"),
+    ("T512-P2048-res0-p16-cap4", {}, (2560,), 512, 16, 4, "extend"),
+    ("B4-T512-mixed-dead-p16-cap4", {}, (812, 0, 2560, 529), 512, 16, 4, "extend"),
+    (
+        "T512-P301-e4m3-cache",
+        dict(index_cache_dtype=torch.float8_e4m3fn),
+        (813,),
+        512,
         16,
         4,
         "extend",
@@ -503,10 +543,12 @@ def test_chunked_prefill_then_carried_decode_steps_are_one_chain():
 
 
 def test_plan_time_declines_are_typed_and_named(monkeypatch):
-    """The extend / prefill forms' typed declines at plan time: the light gates BEFORE any vendored code (the 128-row bound, a page off the
-    powers of two, the e4m3 pool, the body vocabulary, the chunk bound), then the vendored rows raised with the envelope's own text
+    """The extend / prefill forms' typed declines at plan time: the light gates BEFORE any vendored code (a page off the powers of two, the
+    e4m3 pool, the body vocabulary, the chunk bound), then the vendored rows raised with the envelope's own text
     (``indexer_extend_ring_slots`` / ``indexer_extend_rope_tables_only`` / ``indexer_extend_fuse_prepare`` on an explicit flag; the ring
-    floor ``cap >= 3`` -- a cap-2 ring --; ``use_pdl=True`` under the indexer)."""
+    floor ``cap >= 3`` -- a cap-2 ring --; ``use_pdl=True`` under the indexer).  No projection rows bound since the 6b21be0e0 pin: 129 rows at
+    batch 1 and 130 at batch 2 pass the light gates, and the vendored resolver names the large-M tile for the band slab there (the
+    launch-grid bound of one run is the next cell's)."""
     from flashinfer.experimental.qwen_3_8_block import api as impl
     from flashinfer.qwen_3_8_block import qwen_3_8_block_support
 
@@ -554,11 +596,19 @@ def test_plan_time_declines_are_typed_and_named(monkeypatch):
             AssertionError("the vendored tree was reached by a light-gate decline")
         ),
     )
+    from flashinfer.experimental.qwen_3_5_block._cudnn_frost.gated_attention_block.kernels.proj_gemm import (
+        large_m_tile_config,
+    )
+
     for form in ("extend", "prefill"):
-        with pytest.raises(NotImplementedError, match="129 rows per run exceed 128"):
-            _plan(case, g, form, q_len_per_req=129)
-        with pytest.raises(NotImplementedError, match="130 rows per run exceed 128"):
-            _plan(case, g, form, batch_size=2, q_len_per_req=65)
+        impl._light_extend_gates(
+            g, form, 16, None, None, None, "auto", batch_size=1, q_len_per_req=130
+        )  # no projection rows bound (the launch-grid bound of one run: the next cell)
+        for rows in (129, 130, 512, 2048):
+            assert (
+                large_m_tile_config(rows, g.n_qkvg, g.d_model, dtype=torch.bfloat16)
+                is not None
+            ), rows
         with pytest.raises(NotImplementedError, match="page_size must be one of"):
             _plan(case, g, form, page_size=48)
         with pytest.raises(NotImplementedError, match="e4m3 pool"):
@@ -567,6 +617,66 @@ def test_plan_time_declines_are_typed_and_named(monkeypatch):
             _plan(case, g, form, sparse_tile_form="fast")
         with pytest.raises(TypeError, match="ring_slots must be None"):
             _plan(case, g, form, ring_slots=1)
+
+
+def test_plan_time_decline_past_the_launch_grid_bound_is_typed_before_any_vendored_code(
+    monkeypatch,
+):
+    """ONE extend / prefill run holds at most ``EXTEND_ROWS_GRID_MAX`` = 65,535 rows at this pin (the vendored indexer's query compress
+    launches with the run's row count as a CUDA grid dimension): batch 32 x ``T`` 2048 = 65,536 rows is the typed ``NotImplementedError``
+    naming the bound, the rows and the remedy through the public entry -- at ``prepare`` and at the workspace query, on both forms -- BEFORE
+    any vendored code (host only: nothing declared, nothing compiled, the block table sample never read); 65,535 rows pass the light gate.
+    The probe publishes the row (``indexer_extend_grid_rows``) on every record (the decode step shares the launch; its own cell is in
+    the decode module) and reports the bound."""
+    from flashinfer.experimental.qwen_3_8_block import api as impl
+    from flashinfer.experimental.qwen_3_8_block import support
+    from flashinfer.qwen_3_8_block import (
+        qwen_3_8_block_support,
+        qwen_3_8_block_workspace_size,
+    )
+
+    g = _geometry()
+    sup = qwen_3_8_block_support(torch.device("cuda", 0), g)
+    grid = support.EXTEND_GRID_ROWS_KEY
+    assert sup.extend_rows_grid_max == support.EXTEND_ROWS_GRID_MAX == 65535
+    assert grid in sup.extend.declines and grid in sup.prefill.declines
+    assert grid in sup.decode.declines and "65535" in sup.extend.declines[grid]
+    monkeypatch.setattr(
+        impl,
+        "_frost_block",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("the vendored tree was reached past the launch-grid bound")
+        ),
+    )
+    case = Qsa38ExtendCase(g, (300,), 16, page_size=16, seed=143, cap=4)
+    for form in ("extend", "prefill"):
+        with pytest.raises(NotImplementedError, match="65535") as info:
+            _plan(case, g, form, batch_size=32, q_len_per_req=2048)
+        msg = str(info.value)
+        assert msg.startswith(f"qwen_3_8_block ({form}):"), msg
+        assert (
+            "= 65536 rows" in msg
+            and "several uniform chunks" in msg
+            and "smaller batch" in msg
+        ), msg
+        with pytest.raises(NotImplementedError, match="65535") as info:
+            qwen_3_8_block_workspace_size(
+                form,
+                geometry=g,
+                device="cuda",
+                page_size=16,
+                batch_size=32,
+                q_len_per_req=2048,
+                max_pages=128,
+            )
+        assert str(info.value).startswith(f"qwen_3_8_block ({form}):"), str(info.value)
+        # the bound met with equality passes the light gate on both axes (the chunk bound against the table's reach speaks later)
+        impl._light_extend_gates(
+            g, form, 16, None, None, None, "auto", batch_size=1, q_len_per_req=65535
+        )
+        impl._light_extend_gates(
+            g, form, 16, None, None, None, "auto", batch_size=65535, q_len_per_req=1
+        )
 
 
 def test_run_time_declines_are_typed_and_named():
@@ -862,6 +972,67 @@ def test_capture_after_one_warm_up_replays_bitwise_and_takes_a_new_chunk():
         graph.reset()
 
 
+def test_capture_after_one_warm_up_past_128_rows_replays_bitwise():
+    """The extend form PAST 128 rows (B 1 x T 512 behind a 2048-token prefix: the band slab on the GEMM engine's baseline tile, the 6b21be0e0
+    pin) is capture-safe like the chunks below the previous bound: after ONE eager warm-up on the capture stream the capture under
+    ``set_sync_debug_mode("error")`` launches nothing (no cuDNN handle, no backend plan on the slab's route), and the replay is BITWISE the
+    eager run (``out``, the list, the cache, the ring) and passes the oracle."""
+    g = _geometry()
+    case = Qsa38ExtendCase(g, (2560,), 512, page_size=16, seed=165, cap=4)
+    case.prime()
+    plan = _plan(case, g)
+    _check_declaration(plan, case, "extend")
+    assert plan.declaration["rows"] * plan.declaration["batch_size"] == 512 > 128
+    t = case.b * case.q_len
+    out = torch.full((t, g.d_model), float("nan"), dtype=torch.bfloat16, device="cuda")
+    ids = torch.full((t, g.top_k), -7, dtype=torch.int32, device="cuda")
+    args = dict(
+        case.extend_args(),
+        out=out,
+        block_ids_out=ids,
+        block_lens_out=case.block_lens_out,
+    )
+    w = (case.hidden_states, case.rope_cos, case.rope_sin, case.weights38, case.w_o)
+    case.snapshot()
+    stream = torch.cuda.Stream()
+    torch.cuda.synchronize()
+    with torch.cuda.stream(stream):  # the eager warm-up ON the capture stream
+        plan.run(*w, **args)
+    torch.cuda.synchronize()
+    eager_out, eager_ids = out.clone(), ids.clone()
+    eager_cache, eager_ring = (
+        bits(case.index_kv_cache).clone(),
+        bits(case.index_state_cache).clone(),
+    )
+    case.restore()
+    out.fill_(float("nan"))
+    ids.fill_(-7)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph, stream=stream):
+            prev = torch.cuda.get_sync_debug_mode()
+            torch.cuda.set_sync_debug_mode("error")
+            try:
+                plan.run(*w, **args)
+            finally:
+                torch.cuda.set_sync_debug_mode(prev)
+        torch.cuda.synchronize()
+        assert torch.isnan(out).all() and (ids == -7).all(), "the capture launched work"
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(out, eager_out) and torch.equal(ids, eager_ids), (
+            "the replay differs from the eager run"
+        )
+        assert torch.equal(bits(case.index_kv_cache), eager_cache) and torch.equal(
+            bits(case.index_state_cache), eager_ring
+        )
+        case.block_ids_out.copy_(ids)
+        case.check_out_from_list(out, ids, label="replay past 128 rows")
+    finally:
+        graph.reset()
+
+
 def _kernel_names(plan, case):
     case.reset_outputs()
     torch.cuda.synchronize()
@@ -971,6 +1142,51 @@ def test_launch_census_by_kernel_name_matches_the_declaration():
     assert (
         len(names_two) == len(names) + 2 == two.declaration["launches_per_execute"]
     ), (len(names_two), len(names))
+
+
+def test_launch_census_past_128_rows_matches_the_declaration():
+    """The CUDA kernels one chunk launches PAST 128 rows (B 1 x T 512 behind a 2048-token prefix): the same indexer launches as below the
+    previous bound (the pool-1 query compress and the chunk compress, the gather, the canonical kernel, two cache writes; no paged scorer /
+    decode top-k / fused prepare), no memset / memcpy, the slab on the FROST route (no library GEMM), the count == the declaration's
+    ``launches_per_execute``."""
+    g = _geometry()
+    case = Qsa38ExtendCase(g, (2560,), 512, page_size=16, seed=175, cap=4)
+    case.prime()
+    plan = _plan(case, g)
+    assert plan.declaration["rows"] == 512 and plan.declaration["n_windows"] == 1
+    case.snapshot()
+    _run(plan, case)  # the warm-up: the constants' upload
+    case.restore()
+    names = _kernel_names(plan, case)
+    if not names:
+        pytest.skip(
+            "torch.profiler recorded no CUDA event (CUPTI unavailable on this node)"
+        )
+    has = lambda ns, tok: sum(tok in n for n in ns)  # noqa: E731
+    memops = [n for n in names if "memset" in n.lower() or "memcpy" in n.lower()]
+    assert not memops, f"memset / memcpy on the execute path: {memops}"
+    assert len(names) == plan.declaration["launches_per_execute"], (
+        len(names),
+        plan.declaration["launches_per_execute"],
+        names,
+    )
+    assert (
+        has(names, "frost_qsa_compress_step") == 1
+        and has(names, "frost_qsa_compress") == 2
+    ), names
+    assert (
+        has(names, "qsa_kbar_gather") == 1
+        and has(names, "qsa_canonical_list") == 1
+        and has(names, "frost_cache_write") == 2
+    ), names
+    assert (
+        has(names, "qsa_score_paged") == 0
+        and has(names, "qsa_topk_decode") == 0
+        and has(names, "frost_qsa_prepare") == 0
+    ), names
+    assert not any("nvjet" in n.lower() or "cublas" in n.lower() for n in names), (
+        "the slab left the FROST route"
+    )
 
 
 def test_workspace_query_is_honest_and_runs_allocate_nothing():

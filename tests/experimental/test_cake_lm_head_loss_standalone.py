@@ -13,19 +13,22 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Standalone-import tests of the Cake chunked LM-head + loss package.
+Standalone-import tests of the non-deterministic Cake chunked LM-head + loss package.
 
-A copy of ``flashinfer/experimental/cake_lm_head_loss`` must import and reach
+A copy of ``flashinfer/experimental/cake/cake_lm_head_loss`` must import and reach
 its host-side checks on its own: under another top-level name, in a
 ``python -I`` subprocess with ``flashinfer`` blocked (the form of a vendoring
 gate, ``scripts/check_cake_build_manifests.py --vendored-gate``).  The package
-imports only itself, ``torch`` and ``tvm_ffi``; the experimental marking and
+imports only itself, ``torch`` and ``tvm_ffi`` (#6553 rule 1: nothing of the
+deterministic package or the rest of FlashInfer); the experimental marking and
 the environment switches belong to the public entry points
 ``flashinfer.chunked_lm_head.chunked_lm_head_loss`` /
-``chunked_lm_head_logprob`` (covered by ``test_cake_lm_head_loss_api.py``), so
-a direct call of the package emits no warning, and the only ``flashinfer``
-import is the JIT fallback of ``cake_build.py``.  Two tests, CPU-only: no GPU,
-no generated program and no JIT build is needed, so both run on every lane.
+``chunked_lm_head_logprob`` with ``deterministic=False`` (covered by
+``test_cake_lm_head_loss_api.py``), so a direct call of the package emits no
+warning, and the only ``flashinfer`` import is the JIT fallback of
+``cake_build.py``.  The prebuilt path: a builder's ``aot/<library>.so`` is the
+library the loader serves first.  CPU-only: no GPU, no generated program and no
+JIT build is needed.
 """
 
 from __future__ import annotations
@@ -43,7 +46,7 @@ import torch
 
 tvm_ffi = pytest.importorskip("tvm_ffi")  # the package's load path imports it
 
-import flashinfer.experimental.cake_lm_head_loss as pkg
+import flashinfer.experimental.cake.cake_lm_head_loss as pkg
 
 PACKAGE_DIR = Path(pkg.__file__).resolve().parent
 VENDORED_NAME = "vendored_lm_head_loss"  # the copy's top-level name in the subprocess
@@ -127,6 +130,9 @@ assert {
     "backward_logprob",
     "chunked_lm_head_loss",
     "chunked_lm_head_logprob",
+    "forward_logprob_temperature",
+    "backward_logprob_temperature",
+    "chunked_lm_head_logprob_temperature",
 }.issubset(public), sorted(public)
 assert isinstance(cake_jit.MODULES, dict) and cake_jit.STAGES  # registry loaded
 
@@ -141,31 +147,43 @@ def f32(*shape):
 
 T, H, V = 4, 256, 256  # H and V multiples of 256: the geometry checks pass
 labels = torch.zeros(T, dtype=torch.int64)
+ND = dict(deterministic=False)  # the package's only mode
 # Host-side rejections on CPU tensors, each raised by the shape / dtype / option
 # validation before any device query, program bind or launch:
 calls = [
+    # the mode: every entry refuses anything but deterministic=False (here the default True)
+    lambda: cb.forward_loss(bf16(T, H), bf16(V, H), labels, loss_div=1.0),
+    lambda: cb.chunked_lm_head_logprob(bf16(T, H), bf16(V, H), labels),
     # the loss forward: X must be BF16 (validate_lm_head_inputs)
-    lambda: cb.forward_loss(f32(T, H), bf16(V, H), labels, loss_div=1.0),
+    lambda: cb.forward_loss(f32(T, H), bf16(V, H), labels, loss_div=1.0, **ND),
     # the log-probability forward: labels must be int64
-    lambda: cb.forward_logprob(bf16(T, H), bf16(V, H), labels.to(torch.int32)),
+    lambda: cb.forward_logprob(bf16(T, H), bf16(V, H), labels.to(torch.int32), **ND),
     # the prepared runner: the cake backend takes CUDA tensors only
-    lambda: cb.prepare_lm_head_loss(bf16(T, H), bf16(V, H), labels, loss_div=1.0),
+    lambda: cb.prepare_lm_head_loss(bf16(T, H), bf16(V, H), labels, loss_div=1.0, **ND),
     # the autograd entry: grad_weight_dtype must equal W.dtype
     lambda: cb.chunked_lm_head_loss(
-        bf16(T, H), bf16(V, H), labels, loss_div=1.0, grad_weight_dtype=torch.float32
+        bf16(T, H), bf16(V, H), labels, loss_div=1.0, grad_weight_dtype=torch.float32, **ND
     ),
     # the loss backward: a compacted accumulator needs num_rows
     lambda: cb.backward_loss(f32(2, H), None, row_index=torch.tensor([0, 2])),
     # the output cast: the accumulator must be FP32
     lambda: cb.scale_cast(bf16(8), None, torch.float32),
     # the opt-in autograd entry: memory_mode is "fast" or "budget"
-    lambda: opt_in.chunked_lm_head_loss(bf16(T, H), bf16(V, H), labels, loss_div=1.0, memory_mode="slow"),
+    lambda: opt_in.chunked_lm_head_loss(bf16(T, H), bf16(V, H), labels, loss_div=1.0, memory_mode="slow", **ND),
     # the opt-in loss forward: the caller's valid-row count lies in [0, T]
-    lambda: opt_in.forward_loss(bf16(T, H), bf16(V, H), labels, loss_div=1.0, num_valid_rows=T + 1),
+    lambda: opt_in.forward_loss(bf16(T, H), bf16(V, H), labels, loss_div=1.0, num_valid_rows=T + 1, **ND),
     # the budget rule: rows <= num_rows
     lambda: opt_in.memory_plan("loss", num_rows=T, rows=T + 1, hidden=H, vocab=V, chunk=T),
     # preload needs a CUDA device
     lambda: opt_in.preload("cpu"),
+    # the temperature entry refuses anything but deterministic=False (here the default True)
+    lambda: cb.chunked_lm_head_logprob_temperature(bf16(T, H), bf16(V, H), labels, temperature=0.7),
+    # the log-probability forward: a temperature must be positive and finite
+    lambda: cb.forward_logprob_temperature(bf16(T, H), bf16(V, H), labels, backend="reference", temperature=0.0, **ND),
+    # the autograd entry: a per-token temperature is an FP32 [T] tensor
+    lambda: cb.chunked_lm_head_logprob_temperature(
+        bf16(T, H), bf16(V, H), labels, backend="reference", temperature=torch.ones(T + 1), **ND
+    ),
 ]
 
 with warnings.catch_warnings(record=True) as rec:
@@ -195,9 +213,9 @@ def test_vendored_copy_imports_with_flashinfer_blocked(tmp_path):
     """A copy of the package under another top-level name imports in a ``python -I``
     subprocess with ``flashinfer`` blocked (meta-path finder plus
     ``sys.modules["flashinfer"] = None``), resolves the backend's public names and
-    the loader's ``__all__``, raises the host-side ``ValueError`` of ten entry
-    points on CPU operands without emitting a warning of any kind, and loads no
-    ``flashinfer`` module."""
+    the loader's ``__all__``, raises the host-side ``ValueError`` of fifteen entry
+    point calls on CPU operands (the mode and temperature checks among them) without
+    emitting a warning of any kind, and loads no ``flashinfer`` module."""
     root = tmp_path / "site"
     shutil.copytree(
         PACKAGE_DIR,
@@ -271,3 +289,44 @@ def test_package_names_flashinfer_only_in_the_jit_fallback():
     assert {name: len(lines) for name, lines in guards.items()} == {
         "cake_build.py": 1
     }, guards
+
+
+# ---------------------------------------------------------------------------
+# The prebuilt path and the shared loader
+# ---------------------------------------------------------------------------
+
+
+def test_the_loader_and_header_are_the_deterministic_packages_bytes():
+    """``cake_build.py`` (and, once rendered, ``csrc/cake_ffi_checks.h``) are the shared ``cake-build/1`` files, byte
+    for byte the deterministic package's (read from the repository, not imported)."""
+    det = PACKAGE_DIR.parents[1] / "cake_lm_head_det_loss"
+    assert (PACKAGE_DIR / "cake_build.py").read_bytes() == (
+        det / "cake_build.py"
+    ).read_bytes()
+    header = PACKAGE_DIR / "csrc" / "cake_ffi_checks.h"
+    if header.is_file():
+        assert header.read_bytes() == (det / "csrc" / "cake_ffi_checks.h").read_bytes()
+
+
+def test_the_prebuilt_library_is_served_first():
+    """Every library a registry record names is a ``build.json`` entry whose prebuilt file is
+    ``aot/<library>.so`` next to the package; the loader serves that file when it exists (before the JIT)."""
+    if not (PACKAGE_DIR / "build.json").is_file():
+        pytest.skip(
+            "the package's programs are not rendered in this checkout (no build.json)"
+        )
+    import flashinfer.experimental.cake.cake_lm_head_loss.cake_build as cake_build
+    import flashinfer.experimental.cake.cake_lm_head_loss.cake_jit as cake_jit
+
+    names = set()
+    for name in cake_jit.MODULES:
+        for stage in cake_jit.registered_stages(name):
+            library = cake_jit.library_name(name, stage)
+            names.add(library)
+            assert (
+                cake_build.prebuilt_path(library)
+                == PACKAGE_DIR / "aot" / f"{library}.so"
+            )
+            assert library.startswith("cake_lm_head_loss_"), library
+    assert names and names <= set(cake_build.libraries_by_name())
+    assert (PACKAGE_DIR / ".gitignore").read_text().splitlines()[-1] == "aot/"

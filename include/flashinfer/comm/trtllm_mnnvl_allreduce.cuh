@@ -286,9 +286,11 @@ __device__ struct __attribute__((aligned(32))) LamportFlags {
   __device__ void ctaArrive() {
     if constexpr (UseCGA) {
       cg::cluster_group cluster = cg::this_cluster();
+      // Every thread waits: the RMSNorm reduction that follows writes peer CTAs' shared
+      // memory, which is only valid once all CTAs of the cluster are running.
       __cluster_barrier_arrive();
+      __cluster_barrier_wait();
       if (cluster.block_rank() == 0 && threadIdx.x < 32) {
-        __cluster_barrier_wait();
         arriveCounter(threadIdx.x);
       }
       return;
