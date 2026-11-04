@@ -266,7 +266,7 @@ the previous value; an entry call reads them once):
 | `cake_backend.set_dx_slice_policy` | `"det"` | the dX slice rule (see "Kernel structure of one token chunk"); part of every binding key |
 | `cake_backend.set_dx_red_min_rows` | `0` | a chunk of fewer rows keeps one K slice (the plain store); part of every binding key |
 | `cake_backend.set_zero_weight_min_rows` | `4096` | a call of fewer rows `T` keeps its zero-weight rows in the chunk loop (see "Zero-weight policy rows") |
-| `cake_backend.set_zero_dlogp_min_rows` | `4097` | a log-probability backward of fewer valid rows runs without the zero-gradient row skip; `None` turns the skip off (see "Zero-gradient rows of the log-probability backward"); part of the backward binding key |
+| `cake_backend.set_zero_dlogp_min_rows` | per architecture: `1946` on sm_100a, `3891` on sm_103a, `4097` elsewhere (sm_107a included) | a log-probability backward of fewer valid rows runs without the zero-gradient row skip; an integer or `None` (the skip off) applies to every architecture; with no override set the setter returns `ZERO_DLOGP_MIN_ROWS_ARCH_DEFAULT`, which passed back restores the per-architecture default (see "Zero-gradient rows of the log-probability backward"); part of the backward binding key |
 | `cake_backend.set_zero_dlogp_temperature_dz_counted` | `True` | under the zero-gradient row skip a call with a temperature runs the counted temperature form of the dz arm (`gemm_logits_dz_dcnt_tau`); `False` runs the uncounted one over every row (the same outputs); part of the backward binding key |
 | `cake_backend.set_gradient_placement` | `"auto"` | where the loss entries (`chunked_lm_head_loss` of both modules, every form) run the dX / dW GEMMs. `"auto"`: a call no backward can follow (grad mode off, or neither `X` nor `W` trainable) computes the loss (and `logp`) only; inside a non-reentrant `torch.utils.checkpoint` (its own saved-tensor hooks innermost) the checkpointed forward computes the loss only and saves its inputs, and the recomputation in the backward runs the fused forward and hands the gradient accumulators to the checkpointed call's backward, so a checkpointed step forms them once and keeps no FP32 accumulator from the forward to the backward (paired per checkpoint frame and graph by call order and checked against the inputs' metadata and the call's options; without a handed result the backward runs the fused forward itself, with a `RuntimeWarning`); other hooks innermost (CPU offload), torch's deterministic algorithms, or a torch whose checkpoint lacks those hooks keep the fused forward. Under selective activation checkpointing (`context_fn` of `create_selective_checkpoint_contexts`, whose recomputation replays the checkpointed forward's operators by position) every entry of this package -- the loss, log-probability (default, budget, kept logits, with a temperature) and candidate-support entries -- runs its forward with all active torch dispatch modes popped, the checkpoint's and any user mode on the stack (a `FlopCounterMode` does not see the entry's operators; a tracing mode such as `FakeTensorMode` or a `torch.compile` trace gets real launches on fake inputs and fails loudly), and behaves as in a plain non-reentrant checkpoint; the per-device constant cells and the calling thread's count cells and `arange` constant are formed outside active dispatch modes. `"forward"`: every call with a trainable input forms the gradients in its forward (the previous behavior). The same kernels on the same operands either way: the same loss, `logp` and dW bits, and dX up to the order of its unordered K-slice reduction (the same bits with one dX slice) |
 | `cake_backend.set_dx_fill_side_stream` | `False` | `True`: a remembered binding issues the `-0.0` fill of `dX_acc` on the calling thread's fill stream (its own allocator pool, joined before the first dX GEMM), so it runs beside the queued chunk-0 logits GEMM; not under CUDA graph capture, not in the prepared runner; `True` keeps up to `T * H * 4` bytes more reserved in the fill stream's pool |
@@ -368,9 +368,15 @@ it handles these rows on the device, without a host synchronization:
   (the autograd entries), with the dz arm (`logprob_dz`) and, when it forms
   `dX`, the fused dX finalize, on a record that registers the `_dcnt` forms
   and the partition kernel, and of at least
-  `cake_backend.zero_dlogp_min_rows()` valid rows (default 4097, one row
-  above a default 4096-row chunk: a one-chunk backward is too short to repay
-  the partition launch; `set_zero_dlogp_min_rows`; `None` = never).  The
+  `cake_backend.zero_dlogp_min_rows(device)` valid rows, the floor of the
+  call's CUDA device index: the override of `set_zero_dlogp_min_rows` when
+  one is set (an integer, or `None` = never, on every architecture), else the
+  architecture's default floor -- `ZERO_DLOGP_MIN_ROWS_BY_ARCH` (the table
+  below), and `ZERO_DLOGP_MIN_ROWS_DEFAULT` = 4097 (one row above a default
+  4096-row chunk) elsewhere, sm_107a included.  With no override set the setter
+  returns `ZERO_DLOGP_MIN_ROWS_ARCH_DEFAULT`; passing it back (or a copy or
+  an unpickled copy of it) restores the per-architecture default, and
+  `zero_dlogp_min_rows()` without a device returns 4097.  The
   call's plan decides: under the skip the last chunk's bf16 fused cast runs
   its counted form -- the counted TMA-epilogue form
   (`gemm_dw_cast_bf16_tma_dcnt`) where the plan without the skip takes the
@@ -386,6 +392,26 @@ makes `dW` NaN without the skip (`0 * inf`); with the skip it still does when
 the row falls within the 63 rows after a chunk's live rows (the weight-gradient
 GEMM's last 64-row K step), and not elsewhere.  Its `dX` row is an exact zero
 either way.
+
+Default floors (`ZERO_DLOGP_MIN_ROWS_BY_ARCH`, valid rows of one call):
+
+| architecture | floor | chosen from |
+| --- | --- | --- |
+| sm_100a (B200) | 1946 (T = 2048 with 5 % ignored rows) | timing on B200 at 1946 and 3891 valid rows |
+| sm_103a (GB300) | 3891 (T = 4096 with 5 % ignored rows) | timing on GB300 at 1946 and 3891 valid rows |
+| any other (sm_107a included) | 4097 (`ZERO_DLOGP_MIN_ROWS_DEFAULT`) | not timed below one default chunk |
+
+The per-architecture floors put one-chunk backwards from the floor (1946 valid
+rows on sm_100a, 3891 on sm_103a) to 4096 valid rows on the skip, which the
+generic 4097 floor keeps off it.  On those calls: the `dW` bits can differ
+from the call without the skip (the new row order; within the accuracy
+budgets, the same bits run to run); a
+non-finite `X` row of a zero-gradient row makes `dW` NaN only within the
+63-row window above, as for the skip at 4097 rows and more; and the call holds
+the partition's int32 outputs (12 bytes per valid row plus 4 per row of T,
+about 31 KB at T = 2048 with 1946 valid rows) for the whole backward, so its peak
+memory is that much higher than without the skip.
+`set_zero_dlogp_min_rows(4097)` keeps every architecture at the generic floor.
 
 Not applied: `compact_rows=False`, a backward that recounts its valid rows,
 the kept-logits entry, `memory_mode="budget"`, the prepared runner and the

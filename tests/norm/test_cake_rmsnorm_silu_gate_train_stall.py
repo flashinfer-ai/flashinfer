@@ -705,10 +705,13 @@ def _persistent_forward_tokens(role: str, edge: str) -> tuple[int, int, float]:
     step = int(rule["ctas_per_sm"]) * rows_per_block
     blocks_per_slot = -(-loader.min_rows_per_sm(name, arch) // step)
     # the "last" edge: the most below the next tier's start where the
-    # architecture routes one (the mid forward below the long one, on sm_103a
-    # the long forward below the extra-long one), else four times "first"
-    upper = {"fwd_mid": "fwd_long", "fwd_long": "fwd_xlong"}.get(role)
-    if edge == "last" and upper in routes:
+    # architecture routes one (the mid forward below the long one, or on
+    # sm_107a, which routes no long forward, below the extra-long one; on
+    # sm_103a the long forward below the extra-long one), else four times
+    # "first"
+    uppers = {"fwd_mid": ("fwd_long", "fwd_xlong"), "fwd_long": ("fwd_xlong",)}
+    upper = next((u for u in uppers.get(role, ()) if u in routes), None)
+    if edge == "last" and upper is not None:
         upper_start = loader.min_rows_per_sm(routes[upper], arch)
         blocks_per_slot = (upper_start - 1) // step
     elif edge == "last":

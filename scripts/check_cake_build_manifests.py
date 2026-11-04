@@ -363,11 +363,12 @@ class Package:
 
 
 # dsa_train, kda_det_train (and its non-deterministic counterpart cake.cake_kda_train), dsa_indexer, the rmsnorm, the mhc training, the causal conv1d, the ulysses, the NVFP4 SVDQuant GEMM, the Sage
-# block-sparse attention, the fused QK RoPE append (BF16 / FP8), the experimental NVFP4 attention, the SM90 VSA,
+# block-sparse attention, the fused QK RoPE append (BF16 / FP8), the experimental NVFP4 attention (and its per-tile-max
+# variant cake_nvfp4_ptilemax_attention), the SM90 VSA,
 # the Kimi-K3 AttnRes, the experimental FP8 1D1D GEMM (deepgemm_fp8_gemm), the experimental batched FP8 projection (deepgemm_batched_gemm) and the experimental Mega Gate (deepgemm_mega_gate) backends are read with the generic walker (a mapping carrying ``library`` under an ``arches`` /
 # ``arch`` scope).  Their exporters' registry shapes fit it: a record carries ``arches`` and either ``library`` itself
 # (dsa_indexer PROGRAMS, rmsnorm, mhc, causal conv1d, ulysses, svdquant, Sage block-sparse attention, fused QK RoPE append,
-# nvfp4_attention, vsa_sm90, Kimi-K3 AttnRes, deepgemm_fp8_gemm, deepgemm_batched_gemm and deepgemm_mega_gate MODULES) or per-stage sub-records carrying ``library`` (dsa_train).
+# nvfp4_attention, cake_nvfp4_ptilemax_attention, vsa_sm90, Kimi-K3 AttnRes, deepgemm_fp8_gemm, deepgemm_batched_gemm and deepgemm_mega_gate MODULES) or per-stage sub-records carrying ``library`` (dsa_train).
 PACKAGES: tuple[Package, ...] = (
     Package(
         "flashinfer.cake_rmsnorm_det_train_backend",
@@ -578,6 +579,12 @@ PACKAGES: tuple[Package, ...] = (
     Package(
         "flashinfer.experimental.nvfp4_attention",
         "flashinfer/experimental/nvfp4_attention",
+        "cake_jit.py",
+        refs_generic,
+    ),
+    Package(
+        "flashinfer.experimental.cake_nvfp4_ptilemax_attention",
+        "flashinfer/experimental/cake_nvfp4_ptilemax_attention",
         "cake_jit.py",
         refs_generic,
     ),
