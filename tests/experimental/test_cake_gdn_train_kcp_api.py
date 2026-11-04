@@ -20,7 +20,8 @@ the other route; no context, partition or options field holds the mode), the nam
 the twin's objects; this package copies none of them and no public name carries a mode), the package hygiene rules
 (no environment variable, no ``cake_kda_train`` import, standalone: no import of another FlashInfer package, its twin
 included, and no library name of the twin) and the host tables built on the CPU for the correctness rows'
-partitions.  No kernel runs here: the compute entries run on the fake backend (the CPU emulation).
+partitions.  No kernel runs here: the compute entries run on the fake backend (the CPU emulation), directly or
+through ``KernelBackend`` with a stub launch glue (the architecture the kernel backend passes to the #7 walks).
 """
 
 from __future__ import annotations
@@ -1798,7 +1799,9 @@ def test_walk_forms_agree_across_forward_recompute_and_handle(
     from a :class:`RecomputeHandleKcp` launch the same form of every #2 and #7 walk program.  The rank of
     :func:`test_forward_walk_form_follows_the_plan_chains` (HV 6, one segment per document): at 20 SMs the chain
     clause takes the ``_vh64`` record of the forward walks, at 12 SMs vh = 128; the fake backend has no
-    architecture, so #7 takes vh = 64.  Each path logs the records of every recorded call (``_record``)."""
+    architecture, so #7 takes vh = 64 (the #7 forms per architecture across the three paths:
+    :func:`test_dhu_forms_agree_across_forward_recompute_and_handle_on_each_architecture`).  Each path logs the
+    records of every recorded call (``_record``)."""
     kcp, plan = _mod("cake_kcp"), _mod("cake_kcp_plan")
     cu = _cu((24 * 64, 16 * 64, 14 * 64, 10 * 64))
     ops = _mode_ops(cu, (2, 6))
@@ -2413,6 +2416,257 @@ def test_dhu_long_chain_flag_follows_the_plan_chains(monkeypatch, longest) -> No
     out.backward(ops["dout"])
     assert seen and all(isinstance(x, bool) for x in seen)
     assert any(seen) is (longest == 24), seen
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# the architecture the kernel backend passes to the #7 walks (KernelBackend.run on a stub launch glue, no kernel)
+
+# One contiguous rank of six documents of 8 / 4 / 4 / 4 / 4 / 4 chunks at HV 6 on 18 SMs (36 slots), run with
+# ``segments=2``: twelve segments, two of 4 chunks and ten of 2.  The #7 walks of this rank visit all twelve, so
+# their two-wave rule takes vh = 128 (2 * 12 * 6 = 144 > 4 * 18); with ``DHU_LONG_CHAIN_MIN_CHUNKS`` lowered to 4
+# they are long-chain walks (LPT over the 36 slots: the one-CTA grid ends at 6, the two-CTA grid at 10).
+ARCH_CHUNKS = (8, 4, 4, 4, 4, 4)
+ARCH_HEADS = (2, 6)
+ARCH_SM = 18
+ARCH_LONG_CHAIN_MIN = 4
+
+
+class _ArchGlue:
+    """A stub launch glue of :class:`KernelBackend` (its ``launcher``): ``device_arch`` answers ``arch`` for every
+    device index; ``run_module`` logs each launch's ``(record, grid)`` and runs the record on the fake backend's
+    emulation (the same logical arguments), so a real plan runs through ``KernelBackend.run`` on the CPU."""
+
+    def __init__(self, arch: str) -> None:
+        self.arch = arch
+        self.launches: list[tuple[str, tuple[int, ...]]] = []
+        self._fake = _mod("cake_fake_backend")
+
+    def device_arch(self, device_index: int) -> str:
+        return self.arch
+
+    def run_module(self, record, values, *, grid, device_index, module=None) -> None:
+        self.launches.append((str(record), tuple(int(x) for x in grid)))
+        self._fake.run_module(record, values, grid=grid, device_index=None)
+
+
+def _arch_backend(monkeypatch, arch: str) -> tuple[_ArchGlue, list]:
+    """Install ``KernelBackend(launcher=_ArchGlue(arch))`` as the ``"kernels"`` backend for one test and log, in
+    launch order (one entry per ``run_module`` call), the program and the ``_arch`` / ``_dhu_long_chain`` /
+    ``_grid_args`` that ``KernelBackend.run`` resolves each launch with.  A CPU context has no device index, so
+    ``torch.cuda.current_device`` answers 0 (the glue ignores the index)."""
+    kcp = _mod("cake_kcp")
+    glue = _ArchGlue(arch)
+    monkeypatch.setitem(kcp._BACKENDS, "kernels", kcp.KernelBackend(launcher=glue))
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    resolved: list = []
+    real = kcp._resolve_cached
+
+    def resolving(name, args, **kw):
+        resolved.append(
+            (
+                name,
+                args.get("_arch"),
+                args.get("_dhu_long_chain"),
+                dict(args.get("_grid_args") or {}),
+            )
+        )
+        return real(name, args, **kw)
+
+    monkeypatch.setattr(kcp, "_resolve_cached", resolving)
+    return glue, resolved
+
+
+def _dhu_launches(glue: _ArchGlue, resolved: list) -> list[dict]:
+    """The #7 launches of a run in launch order: program, record, grid and the scalars ``KernelBackend.run``
+    resolved them with (``_arch``, ``_dhu_long_chain``, ``n_walk``)."""
+    kcp = _mod("cake_kcp")
+    assert len(glue.launches) == len(resolved) > 0
+    return [
+        {
+            "program": name,
+            "record": record,
+            "grid": grid,
+            "arch": arch,
+            "long_chain": long_chain,
+            "n_walk": int(grid_args["n_walk"]),
+        }
+        for (record, grid), (name, arch, long_chain, grid_args) in zip(
+            glue.launches, resolved, strict=True
+        )
+        if name in kcp.DHU_PROGRAMS
+    ]
+
+
+def _dhu_rule_vh(
+    arch: str, tape: bool, n_walk: int, num_heads: int, sm_count: int, long_chain: bool
+) -> int:
+    """The #7 form of one launch as the rule text states it (restated here, not read from :func:`dhu_vh`): the
+    two-wave rule (vh = 64 iff ``2 * n_walk * HV <= 4 * sm_count``) for the tape walk on ``sm_107a`` and for a
+    long-chain walk of either form on ``sm_100a``; vh = 64 for every other launch."""
+    two_wave = 64 if 2 * n_walk * num_heads <= 4 * sm_count else 128
+    if (tape and arch == "sm_107a") or (long_chain and arch == "sm_100a"):
+        return two_wave
+    return 64
+
+
+def _arch_case(monkeypatch, long_chain: bool):
+    """The context and operands of the :data:`ARCH_CHUNKS` rank (``DHU_LONG_CHAIN_MIN_CHUNKS`` lowered to
+    :data:`ARCH_LONG_CHAIN_MIN` when ``long_chain``), after checking the plan's #7 chains."""
+    kcp, plan = _mod("cake_kcp"), _mod("cake_kcp_plan")
+    if long_chain:
+        monkeypatch.setattr(kcp, "DHU_LONG_CHAIN_MIN_CHUNKS", ARCH_LONG_CHAIN_MIN)
+    cu = _cu(tuple(n * 64 for n in ARCH_CHUNKS))
+    ctx = plan.build_context_kcp(
+        plan.partition_kcp(cu, 1, "contiguous"), None, 0, "cpu", sm_count=ARCH_SM
+    )
+    HV = ARCH_HEADS[1]
+    tb = kcp._Tables(ctx, HV, P=2)
+    assert sorted(tb._walk_chains(tb.walk_all)) == [(2, 10), (4, 2)]
+    assert tb.walk_long_chain(tb.walk_all, ARCH_SM) is long_chain
+    return ctx, _mode_ops(cu, ARCH_HEADS)
+
+
+@pytest.mark.parametrize("long_chain", [False, True])
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
+def test_kernel_backend_passes_the_device_architecture_to_the_dhu_walks(
+    monkeypatch, arch, long_chain
+) -> None:
+    """``KernelBackend.run`` is the only producer of the ``_arch`` the #7 width rule reads (:func:`dhu_vh`; the fake
+    backend has none).  A real plan (the :data:`ARCH_CHUNKS` rank, forward and backward with ``segments=2``) runs
+    through it with a stub launch glue whose ``device_arch`` answers ``arch`` (:func:`_arch_backend`).  Every #7
+    launch receives that architecture, and its record is the form the rule text gives (:func:`_dhu_rule_vh`) on
+    the grid of that form.  On this plan: ``sm_100a`` and ``sm_103a`` launch vh = 64 everywhere; ``sm_107a`` keeps
+    the two-wave rule for the tape walk (vh = 128 here) and vh = 64 for the offset walk; with the long-chain
+    threshold lowered, ``sm_100a`` takes the two-wave rule (vh = 128) for the offset and the tape walk while
+    ``sm_103a`` stays vh = 64 and ``sm_107a`` keeps its forms.  The persistent launches receive the same
+    architecture in their grid arguments."""
+    kcp = _mod("cake_kcp")
+    ctx, ops = _arch_case(monkeypatch, long_chain)
+    glue, resolved = _arch_backend(monkeypatch, arch)
+    HV = ARCH_HEADS[1]
+    leaves = [
+        ops[n].detach().clone().requires_grad_(True)
+        for n in ("q", "k", "v", "g", "beta")
+    ]
+    out = kcp.chunk_gdn_kcp(
+        *leaves, ctx, backend="kernels", segments=2, deterministic=False
+    )
+    out.backward(ops["dout"])
+    launches = _dhu_launches(glue, resolved)
+    assert {x["program"] for x in launches} == set(kcp.DHU_PROGRAMS), launches
+    for x in launches:
+        tape = x["program"] == "kcp_dhu_tape"
+        vh = 64 if x["record"].endswith(kcp.VH64_SUFFIX) else 128
+        assert x["arch"] == arch, x
+        assert x["grid"] == (x["n_walk"] * HV * (2 if vh == 64 else 1), 1, 1), x
+        assert vh == _dhu_rule_vh(
+            arch, tape, x["n_walk"], HV, ARCH_SM, x["long_chain"]
+        ), (arch, x)
+    # the plan reaches every clause: each #7 program has launches whose two-wave rule is vh = 128, and a long-chain
+    # one among them exactly where the threshold is lowered
+    for prog in kcp.DHU_PROGRAMS:
+        wide = [
+            x
+            for x in launches
+            if x["program"] == prog and 2 * x["n_walk"] * HV > 4 * ARCH_SM
+        ]
+        assert wide and any(x["long_chain"] for x in wide) is long_chain, (
+            prog,
+            launches,
+        )
+    full = {x["program"] for x in launches if not x["record"].endswith(kcp.VH64_SUFFIX)}
+    want = {
+        "sm_100a": set(kcp.DHU_PROGRAMS) if long_chain else set(),
+        "sm_103a": set(),
+        "sm_107a": {"kcp_dhu_tape"},
+    }[arch]
+    assert full == want, (arch, long_chain, launches)
+    persistent = [ga for _n, _a, _l, ga in resolved if "sm_count" in ga]
+    assert persistent and all(ga["arch"] == arch for ga in persistent)
+
+
+@pytest.mark.parametrize(
+    ("arch", "want"),
+    [
+        ("sm_100a", {"kcp_dhu_offset", "kcp_dhu_tape"}),
+        ("sm_103a", set()),
+        ("sm_107a", {"kcp_dhu_tape"}),
+    ],
+)
+def test_dhu_forms_agree_across_forward_recompute_and_handle_on_each_architecture(
+    monkeypatch, arch, want
+) -> None:
+    """The #7 form of every launch reads host plan integers and the architecture ``KernelBackend.run`` passes, so
+    the backward after the forward, after torch's checkpoint recompute and after the recompute from a
+    :class:`RecomputeHandleKcp` launch the same #7 records on the same grids.  The :data:`ARCH_CHUNKS` rank with
+    ``segments=2`` and the long-chain threshold lowered, through the stub launch glue of
+    :func:`test_kernel_backend_passes_the_device_architecture_to_the_dhu_walks`: on ``sm_100a`` the long-chain
+    clause fires (the offset and the tape walk launch vh = 128); on ``sm_103a`` it does not (vh = 64), for the
+    same long-chain walks; ``sm_107a`` keeps the two-wave rule of the tape walk (vh = 128) and vh = 64 for the
+    offset walk.  ``want``: the #7 programs that launch vh = 128.  Each path logs the kinds of its recorded calls
+    (``_record``)."""
+    kcp = _mod("cake_kcp")
+    ctx, ops = _arch_case(monkeypatch, True)
+    glue, resolved = _arch_backend(monkeypatch, arch)
+    kinds: list = []
+    record = kcp._record
+
+    def recording(kind, call):
+        record(kind, call)
+        kinds.append(kind)
+
+    monkeypatch.setattr(kcp, "_record", recording)
+
+    def run(ckpt: bool, handle: bool) -> dict:
+        del kinds[:], glue.launches[:], resolved[:]
+        leaves = [
+            ops[n].detach().clone().requires_grad_(True)
+            for n in ("q", "k", "v", "g", "beta")
+        ]
+        hd = kcp.RecomputeHandleKcp() if handle else None
+
+        def fn(q, k, v, g, beta, h):
+            return kcp.chunk_gdn_kcp(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                ctx,
+                recompute_handle=h,
+                backend="kernels",
+                segments=2,
+                deterministic=False,
+            )
+
+        if ckpt:
+            from torch.utils.checkpoint import checkpoint
+
+            out = checkpoint(fn, *leaves, hd, use_reentrant=False)
+        else:
+            out = fn(*leaves, hd)
+        out.backward(ops["dout"])
+        return {"kinds": list(kinds), "dhu": _dhu_launches(glue, resolved)}
+
+    paths = {
+        "forward": run(False, False),
+        "recompute": run(True, False),
+        "handle": run(True, True),
+    }
+    for name in ("recompute", "handle"):
+        # a checkpointed path records the forward and torch's recompute of it
+        assert paths[name]["kinds"].count("fwd") == 2, (name, paths[name]["kinds"])
+    forms = {}
+    for name, p in paths.items():
+        dhu = p["dhu"]
+        assert {x["program"] for x in dhu} == set(kcp.DHU_PROGRAMS), (name, dhu)
+        assert all(x["arch"] == arch for x in dhu), (name, dhu)
+        assert any(x["long_chain"] for x in dhu), (name, dhu)
+        full = {x["program"] for x in dhu if not x["record"].endswith(kcp.VH64_SUFFIX)}
+        assert full == want, (name, dhu)
+        forms[name] = [(x["record"], x["grid"]) for x in dhu]
+    assert forms["recompute"] == forms["forward"], forms
+    assert forms["handle"] == forms["forward"], forms
 
 
 def test_workspace_holds_one_zeroed_ticket_slot_per_persistent_site() -> None:
