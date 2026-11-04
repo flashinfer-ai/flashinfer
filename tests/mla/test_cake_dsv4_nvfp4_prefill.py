@@ -15,9 +15,10 @@
 """Cake DeepSeek-V4 NVFP4 sparse-MLA prefill on SM100 / SM103.
 
 ``trtllm_batch_decode_sparse_mla_dsv4(..., backend="cake", kv_cache_format="nvfp4")``
-runs the NVFP4 prefill bodies from 128 metadata rows on: ``nvfp4_h64_prefill``
-(8 to 64 heads, one CTA per query token) and ``nvfp4_h128_prefill`` (128 heads,
-one two-CTA cluster per token). Every case checks the BF16 output and the
+runs the NVFP4 prefill bodies from 128 metadata rows on: the query-block bodies
+(16 / 32 heads on window-only rows, one item per block of 64 / H tokens), the
+per-token builds ``nvfp4_h64_*`` (8 to 64 heads) and ``nvfp4_h128_prefill`` (128
+heads, one two-CTA cluster per token). Every case checks the BF16 output and the
 base-2 LSE against an FP32 oracle over the dequantized NVFP4 pools and the
 query as the route packs it (the NVFP4 cache row format), with the kernel-error
 gate of the NVFP4 route (O ``atol=rtol=5e-2``, LSE ``atol=2e-2``).
@@ -99,6 +100,36 @@ def _selection(gen, rows: int, width: int, pool_tokens: int, lens_rule: str):
     return table, lens
 
 
+def _window_selection(
+    q_lens, width: int, pool_tokens: int, *, fresh: bool, drop_key: bool
+):
+    """Prefill sliding windows: request ``b`` holds pool rows ``[base_b, base_b + S_b)`` in KV
+    order and its query ``q`` attends over the ``width`` positions ending at ``S_b - q_len + q``,
+    oldest first, so a token's window is the previous one shifted by one key. ``fresh`` prefills
+    from KV position 0 (windows grow over a request's first ``width`` tokens, -1 past the
+    length); ``drop_key`` masks one key in every window that holds it (a -1 inside the span)."""
+    rows = sum(q_lens)
+    table = torch.full((rows, width), -1, dtype=torch.int32, device="cuda")
+    lens = torch.zeros((rows,), dtype=torch.int32, device="cuda")
+    base, row = 0, 0
+    for q_len in q_lens:
+        seq_len = q_len if fresh else q_len + 2 * width
+        assert base + seq_len <= pool_tokens
+        for q in range(q_len):
+            pos = seq_len - q_len + q
+            first = max(0, pos - width + 1)
+            keys = torch.arange(
+                base + first, base + pos + 1, device="cuda", dtype=torch.int32
+            )
+            table[row, : keys.numel()] = keys
+            lens[row] = keys.numel()
+            row += 1
+        base += seq_len
+    if drop_key:
+        table[table == base // 2] = -1
+    return table, lens
+
+
 def _case(
     *,
     heads: int,
@@ -112,11 +143,21 @@ def _case(
     lens_rule: str = "random",
     pool_pages: int = 48,
     seed: int = 0,
+    drop_key: bool = False,
 ):
     gen = torch.Generator(device="cuda").manual_seed(seed)
     rows = sum(q_lens)
     main_cache, main_rows = _pool(gen, pool_pages, page_size, layout, -0.05)
-    main_idx, main_lens = _selection(gen, rows, topk, main_rows.shape[0], lens_rule)
+    if lens_rule in ("window", "fresh_window"):
+        main_idx, main_lens = _window_selection(
+            q_lens,
+            topk,
+            main_rows.shape[0],
+            fresh=lens_rule == "fresh_window",
+            drop_key=drop_key,
+        )
+    else:
+        main_idx, main_lens = _selection(gen, rows, topk, main_rows.shape[0], lens_rule)
     extra_cache = extra_idx = extra_lens = extra_rows = None
     if extra_topk:
         extra_pages = max(pool_pages * page_size // extra_page_size, 2)
@@ -395,6 +436,170 @@ def test_nvfp4_prefill_graph_replay_is_bitwise(heads):
     torch.cuda.synchronize()
     assert torch.equal(out, eager)
     assert torch.equal(_lse(case), eager_lse)
+    _check(case, out)
+
+
+def _sm_count() -> int:
+    return torch.cuda.get_device_properties(torch.device("cuda")).multi_processor_count
+
+
+def _routed(monkeypatch):
+    """Record the prefill variant each call runs."""
+    calls = []
+    original = cake._nvfp4_prefill_route
+
+    def recording(**kwargs):
+        calls.append(original(**kwargs)[0])
+        return original(**kwargs)
+
+    monkeypatch.setattr(cake, "_nvfp4_prefill_route", recording)
+    return calls
+
+
+# One case per prefill build the route serves, on the build's own rows: sliding
+# windows (``window``) so the query-block bodies share their blocks, sequence
+# boundaries inside blocks, windows that grow from KV position 0 and a key masked
+# inside every window that holds it (each block that cannot share falls back to
+# per-token rows), and random tables (no block shares).
+_ROUTE_GRID = [
+    pytest.param(
+        dict(heads=16, topk=128, q_lens=(171, 341), lens_rule="window", pool_pages=32),
+        "nvfp4_qb_h16_breaks_prefill",
+        id="h16-window-512-breaks",
+    ),
+    pytest.param(
+        dict(heads=16, topk=128, q_lens=(130, 3, 300), lens_rule="fresh_window"),
+        "nvfp4_qb_h16_breaks_prefill",
+        id="h16-fresh-window-433-breaks",
+    ),
+    pytest.param(
+        dict(heads=16, topk=128, q_lens=(683, 1365), lens_rule="window", pool_pages=48),
+        "nvfp4_qb_h16_prefill",
+        id="h16-window-2048-qb",
+    ),
+    pytest.param(
+        dict(
+            heads=16,
+            topk=128,
+            q_lens=(600, 701),
+            lens_rule="window",
+            drop_key=True,
+            pool_pages=32,
+        ),
+        "nvfp4_qb_h16_prefill",
+        id="h16-window-1301-dropped-key-qb",
+    ),
+    pytest.param(
+        dict(heads=16, topk=128, q_lens=(300, 213), lens_rule="random"),
+        "nvfp4_qb_h16_breaks_prefill",
+        id="h16-random-513-breaks-fallback",
+    ),
+    pytest.param(
+        dict(heads=32, topk=128, q_lens=(171, 341), lens_rule="window", pool_pages=32),
+        "nvfp4_qb_h32_late_claim_prefill",
+        id="h32-window-512-late-claim",
+    ),
+    pytest.param(
+        dict(heads=32, topk=128, q_lens=(683, 1365), lens_rule="window", pool_pages=48),
+        "nvfp4_qb_h32_prefill",
+        id="h32-window-2048-qb",
+    ),
+    pytest.param(
+        dict(heads=32, topk=128, q_lens=(400, 213), lens_rule="fresh_window"),
+        "nvfp4_qb_h32_prefill",
+        id="h32-fresh-window-613-qb",
+    ),
+    pytest.param(
+        dict(heads=16, topk=128, q_lens=(43, 85), lens_rule="window"),
+        "nvfp4_h64_tmem_v_early_gather_prefill",
+        id="h16-window-128-tmem-v-early-gather",
+    ),
+    pytest.param(
+        dict(heads=32, topk=512, q_lens=(171, 341)),
+        "nvfp4_h64_tmem_v_prefill",
+        id="h32-k512-512-tmem-v",
+    ),
+    pytest.param(
+        dict(heads=16, topk=128, extra_topk=128, q_lens=(171, 341)),
+        "nvfp4_h64_tmem_v_prefill",
+        id="h16-dual-512-tmem-v",
+    ),
+    pytest.param(
+        dict(heads=64, topk=512, extra_topk=512, q_lens=(43, 85)),
+        "nvfp4_h64_early_gather_prefill",
+        id="h64-dual-128-early-gather",
+    ),
+    pytest.param(
+        dict(heads=64, topk=128, q_lens=(171, 341), lens_rule="window", pool_pages=32),
+        "nvfp4_h64_q_prefetch_prefill",
+        id="h64-window-512-q-prefetch",
+    ),
+    pytest.param(
+        dict(heads=64, topk=512, q_lens=(171, 341)),
+        "nvfp4_h64_o_boxes_prefill",
+        id="h64-k512-512-o-boxes",
+    ),
+    pytest.param(
+        dict(heads=128, topk=128, q_lens=(171, 341), lens_rule="window", pool_pages=32),
+        "nvfp4_h128_prefill",
+        id="h128-window-512",
+    ),
+]
+
+
+@pytest.mark.parametrize("spec, variant", _ROUTE_GRID)
+def test_nvfp4_prefill_route_builds_match_the_oracle(spec, variant, monkeypatch):
+    """Every prefill build on rows the route sends to it."""
+    _require_cake_arch()
+    if sum(spec["q_lens"]) > _sm_count() and variant.endswith("early_gather_prefill"):
+        pytest.skip("needs more SMs than query tokens")
+    if sum(spec["q_lens"]) <= _sm_count() and not variant.endswith(
+        ("early_gather_prefill", "h128_prefill")
+    ):
+        pytest.skip("needs more query tokens than SMs")
+    calls = _routed(monkeypatch)
+    case = _case(seed=11, **spec)
+    out = _run(case)
+    assert calls == [variant]
+    _check(case, out)
+
+
+@pytest.mark.parametrize("heads", [16, 32])
+def test_nvfp4_query_block_is_deterministic(heads):
+    """Repeated launches of a query-block body give the same bits."""
+    _require_cake_arch()
+    case = _case(
+        seed=12,
+        heads=heads,
+        topk=128,
+        q_lens=(171, 341),
+        lens_rule="window",
+        pool_pages=32,
+    )
+    first = _run(case).clone()
+    first_lse = _lse(case)
+    for _ in range(20):
+        assert torch.equal(_run(case), first)
+        assert torch.equal(_lse(case), first_lse)
+
+
+def test_nvfp4_query_block_takes_a_padded_index_pitch(monkeypatch):
+    """A window table on a row pitch above its width is read in place (no copy)."""
+    _require_cake_arch()
+    calls = _routed(monkeypatch)
+    case = _case(
+        seed=13,
+        heads=16,
+        topk=128,
+        q_lens=(683, 1365),
+        lens_rule="window",
+        pool_pages=48,
+    )
+    padded = torch.full((case["rows"], 160), -7, dtype=torch.int32, device="cuda")
+    padded[:, :128] = case["main_idx"]
+    case["main_idx"] = padded[:, :128]
+    out = _run(case)
+    assert calls == ["nvfp4_qb_h16_prefill"]
     _check(case, out)
 
 

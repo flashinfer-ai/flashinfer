@@ -140,11 +140,16 @@ workspace; the final base-2 LSE lives in an extra ``lse`` region appended
 after ``partial_lse`` (:func:`cake_dsv4_workspace_layout` ``with_lse=True``).
 
 From 128 metadata rows on, the route runs the NVFP4 prefill bodies instead
-(Cake ``flashinfer_blackwell_trtllm_sparse_mla_dsv4_nvfp4_{h64,h128}_prefill``):
-``nvfp4_h64_prefill`` (``H <= 64``, one CTA per query token, the heads
-duplicated on the two 64-row halves of a block-scaled M128 QK) and
-``nvfp4_h128_prefill`` (``H128``, one two-CTA cluster per token, 64 heads per
-CTA). They take the query in the cache's NVFP4 row format, so the host packs it
+(Cake ``cake_dsv4_nvfp4_query_block_prefill`` and
+``flashinfer_blackwell_trtllm_sparse_mla_dsv4_nvfp4_{h64,h128}_prefill``,
+chosen by :func:`_nvfp4_prefill_route`): the query-block bodies
+``nvfp4_qb_h{16,32}*`` (16 / 32 heads on window-only rows with more query
+tokens than SMs: one item per block of ``64 / H`` consecutive tokens, whose
+shifted windows are gathered and transformed once), the per-token builds
+``nvfp4_h64_*`` (``H <= 64``, one item per query token, the heads duplicated on
+the two 64-row halves of a block-scaled M128 QK) and ``nvfp4_h128_prefill``
+(``H128``, one two-CTA cluster per token, 64 heads per CTA). They take the
+query in the cache's NVFP4 row format, so the host packs it
 into the workspace with the NVFP4 cache pack kernel first (``packed_query``
 region, :func:`cake_dsv4_workspace_layout` ``with_prefill=True``), read the
 pools through 32-byte-pitch data-row and scale-row tensor maps, and write the
@@ -261,9 +266,43 @@ _NVFP4_MERGE_HEADS_PER_CTA = 16
 # runs one CTA (H <= 64) or one two-CTA cluster (H128) per query token over the
 # caller-packed NVFP4 query instead of the decode family (see the module docstring).
 _NVFP4_PREFILL_MIN_TOKENS = 128
-_NVFP4_VARIANT_H64_PREFILL = "nvfp4_h64_prefill"
+# The per-token body takes up to 64 heads, the two-CTA body 128. Its builds (``_nvfp4_prefill_route``):
+# ``tmem_v`` keeps V^T in TMEM (at most 32 heads); ``early_gather`` gathers a CTA's first item before
+# the index hand-off (one item per CTA: at most as many query tokens as SMs); ``o_boxes`` stores O
+# through TMA boxes; ``q_prefetch`` is ``o_boxes`` with the next item's query loaded ahead (window-only
+# rows).
+_NVFP4_VARIANT_H64_TMEM_V_PREFILL = "nvfp4_h64_tmem_v_prefill"
+_NVFP4_VARIANT_H64_TMEM_V_EARLY_GATHER_PREFILL = "nvfp4_h64_tmem_v_early_gather_prefill"
+_NVFP4_VARIANT_H64_EARLY_GATHER_PREFILL = "nvfp4_h64_early_gather_prefill"
+_NVFP4_VARIANT_H64_O_BOXES_PREFILL = "nvfp4_h64_o_boxes_prefill"
+_NVFP4_VARIANT_H64_Q_PREFETCH_PREFILL = "nvfp4_h64_q_prefetch_prefill"
 _NVFP4_VARIANT_H128_PREFILL = "nvfp4_h128_prefill"
+# Query-block bodies (16 / 32 heads, window-only rows: no extra table, a main table of at most 128
+# keys on a row stride of at least 128): one CTA item per block of 64 / H consecutive query tokens,
+# whose shifted windows are gathered and transformed once. ``breaks`` (16 heads) splits a block at a
+# sequence boundary through extra group items; ``late_claim`` (32 heads) holds back the next claim of
+# a CTA whose first block cannot share. Each serves the rows of at most the token count below.
+_NVFP4_VARIANT_QB_H16_PREFILL = "nvfp4_qb_h16_prefill"
+_NVFP4_VARIANT_QB_H16_BREAKS_PREFILL = "nvfp4_qb_h16_breaks_prefill"
+_NVFP4_VARIANT_QB_H32_PREFILL = "nvfp4_qb_h32_prefill"
+_NVFP4_VARIANT_QB_H32_LATE_CLAIM_PREFILL = "nvfp4_qb_h32_late_claim_prefill"
+_NVFP4_QB_BREAKS_MAX_TOKENS = 1024
+_NVFP4_QB_LATE_CLAIM_MAX_TOKENS = 512
+_NVFP4_QB_WINDOW = 128
+_NVFP4_PREFILL_VARIANTS = (
+    _NVFP4_VARIANT_QB_H16_PREFILL,
+    _NVFP4_VARIANT_QB_H16_BREAKS_PREFILL,
+    _NVFP4_VARIANT_QB_H32_PREFILL,
+    _NVFP4_VARIANT_QB_H32_LATE_CLAIM_PREFILL,
+    _NVFP4_VARIANT_H64_TMEM_V_PREFILL,
+    _NVFP4_VARIANT_H64_TMEM_V_EARLY_GATHER_PREFILL,
+    _NVFP4_VARIANT_H64_EARLY_GATHER_PREFILL,
+    _NVFP4_VARIANT_H64_O_BOXES_PREFILL,
+    _NVFP4_VARIANT_H64_Q_PREFETCH_PREFILL,
+    _NVFP4_VARIANT_H128_PREFILL,
+)
 _NVFP4_H64_PREFILL_MAX_HEADS = 64
+_NVFP4_TMEM_V_MAX_HEADS = 32
 _NVFP4_DATA_BYTES = 352  # E2M1 NoPE codes and BF16 RoPE dims of one NVFP4 row
 _NVFP4_SF_BYTES = 32  # the row's 28 E4M3 scales and 4 pad bytes
 _NVFP4_ROW_PITCH = 32  # pitch of the pool row views the prefill tensor maps read
@@ -2595,8 +2634,7 @@ _NVFP4_DECODE_VARIANTS = tuple(_NVFP4_MEMBER_VARIANTS.values())
 _NVFP4_VARIANTS = (
     *_NVFP4_DECODE_VARIANTS,
     _NVFP4_VARIANT_MERGE,
-    _NVFP4_VARIANT_H64_PREFILL,
-    _NVFP4_VARIANT_H128_PREFILL,
+    *_NVFP4_PREFILL_VARIANTS,
 )
 
 
@@ -3363,19 +3401,21 @@ def _nvfp4_prefill(
 ) -> None:
     """Launch one of the NVFP4 prefill bodies on ``num_query_tokens`` rows.
 
-    ``H <= 64`` runs the single-CTA ``nvfp4_h64_prefill`` body (one CTA per
-    query token), ``H128`` the two-CTA ``nvfp4_h128_prefill`` body (one cluster
-    per token). Both read the query packed to the NVFP4 row format in the
-    workspace (:func:`_nvfp4_pack_query`), the pools through 32-byte-pitch data
-    and scale row views, and write the final BF16 output and base-2 LSE
-    directly. A table without a caller length vector gets one filled in the
-    workspace (every entry the table width).
+    :func:`_nvfp4_prefill_route` picks the body and its build. Every body
+    reads the query packed to the NVFP4 row format in the workspace
+    (:func:`_nvfp4_pack_query`), the pools through 32-byte-pitch data and scale
+    row views, and writes the final BF16 output and base-2 LSE directly. A
+    table without a caller length vector gets one filled in the workspace
+    (every entry the table width).
     """
     num_query_tokens, num_heads = int(query_rows.shape[0]), int(query_rows.shape[1])
-    variant = (
-        _NVFP4_VARIANT_H64_PREFILL
-        if num_heads <= _NVFP4_H64_PREFILL_MAX_HEADS
-        else _NVFP4_VARIANT_H128_PREFILL
+    variant, grid_x = _nvfp4_prefill_route(
+        num_heads=num_heads,
+        num_query_tokens=num_query_tokens,
+        main_width=main_width,
+        extra_width=extra_width,
+        main_index_stride=int(main_indices.stride(0)),
+        sm_count=_device_sm_count(query_rows.device),
     )
     _require_nvfp4_variant(variant, arch=arch)
 
@@ -3429,8 +3469,8 @@ def _nvfp4_prefill(
         "compressed_KV_sf": extra_sf,
         "O": out_rows,
         "LSE": lse_out,
-        "swa_indices": main_indices,
-        "compressed_indices": extra_indices,
+        "swa_indices": _flat_index_rows(main_indices),
+        "compressed_indices": _flat_index_rows(extra_indices),
         "sparse_topk_lens": main_lens,
         "extra_topk_lens": extra_lens,
         "sinks": sink_tensor,
@@ -3457,8 +3497,80 @@ def _nvfp4_prefill(
         "compressed_width": extra_width,
     }
     launcher = _Launcher(arch=arch, workspace=workspace, raw=raw, values=values)
-    ctas = 1 if variant == _NVFP4_VARIANT_H64_PREFILL else 2
-    launcher.run(launcher.variant(variant, grid=(num_query_tokens * ctas, 1, 1)))
+    launcher.run(launcher.variant(variant, grid=(grid_x, 1, 1)))
+
+
+def _nvfp4_qb_group_ids(blocks: int) -> int:
+    """The group items the ``breaks`` build launches ahead of its ``blocks`` block items: one per 8
+    blocks, at most 16 (Cake ``group_ids``)."""
+    return min(_ceil_div(blocks, 8), 16)
+
+
+def _nvfp4_prefill_route(
+    *,
+    num_heads: int,
+    num_query_tokens: int,
+    main_width: int,
+    extra_width: int,
+    main_index_stride: int,
+    sm_count: int,
+) -> tuple[str, int]:
+    """The NVFP4 prefill variant of one call and its grid (CTAs along x).
+
+    * 128 heads: the two-CTA body, one cluster per query token.
+    * 16 / 32 heads on window-only rows (no extra table, a main table of at
+      most 128 keys on a row stride of at least 128) with more query tokens
+      than SMs: the query-block bodies, one item per block of 64 / H tokens.
+      16 heads take the ``breaks`` build up to 1024 tokens (plus its group
+      items), 32 heads the ``late_claim`` build up to 512 tokens, the default
+      build above. With at most as many tokens as SMs the blocks would leave
+      most SMs idle, and the per-token body is faster.
+    * Every other row of at most 32 heads: the per-token body's ``tmem_v``
+      build, with ``early_gather`` at most as many tokens as SMs.
+    * 33 to 64 heads: ``early_gather`` at most as many tokens as SMs, else
+      ``q_prefetch`` on window-only rows and ``o_boxes`` on rows with a
+      compressed selection or an extra table.
+    """
+    tokens = num_query_tokens
+    if num_heads > _NVFP4_H64_PREFILL_MAX_HEADS:
+        return _NVFP4_VARIANT_H128_PREFILL, 2 * tokens
+    window_only = extra_width == 0 and main_width <= _NVFP4_QB_WINDOW
+    one_item_per_cta = tokens <= sm_count
+    if num_heads <= _NVFP4_TMEM_V_MAX_HEADS:
+        if (
+            num_heads in (16, 32)
+            and window_only
+            and main_index_stride >= _NVFP4_QB_WINDOW
+            and not one_item_per_cta
+        ):
+            blocks = _ceil_div(tokens, 64 // num_heads)
+            if num_heads == 16:
+                if tokens <= _NVFP4_QB_BREAKS_MAX_TOKENS:
+                    return (
+                        _NVFP4_VARIANT_QB_H16_BREAKS_PREFILL,
+                        blocks + _nvfp4_qb_group_ids(blocks),
+                    )
+                return _NVFP4_VARIANT_QB_H16_PREFILL, blocks
+            if tokens <= _NVFP4_QB_LATE_CLAIM_MAX_TOKENS:
+                return _NVFP4_VARIANT_QB_H32_LATE_CLAIM_PREFILL, blocks
+            return _NVFP4_VARIANT_QB_H32_PREFILL, blocks
+        if one_item_per_cta:
+            return _NVFP4_VARIANT_H64_TMEM_V_EARLY_GATHER_PREFILL, tokens
+        return _NVFP4_VARIANT_H64_TMEM_V_PREFILL, tokens
+    if one_item_per_cta:
+        return _NVFP4_VARIANT_H64_EARLY_GATHER_PREFILL, tokens
+    if window_only:
+        return _NVFP4_VARIANT_H64_Q_PREFETCH_PREFILL, tokens
+    return _NVFP4_VARIANT_H64_O_BOXES_PREFILL, tokens
+
+
+def _flat_index_rows(table: torch.Tensor) -> torch.Tensor:
+    """A ``[rows, width]`` int32 table (unit column stride, any row stride) as the 1-D run of storage its
+    rows span: the prefill bodies read row ``t`` at ``t * index_stride`` themselves."""
+    rows, width = int(table.shape[0]), int(table.shape[1])
+    if table.is_contiguous():
+        return table
+    return table.as_strided(((rows - 1) * int(table.stride(0)) + width,), (1,))
 
 
 def _nvfp4_gather4_views(flat: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:

@@ -326,7 +326,7 @@ def test_nvfp4_variant_names():
         assert cake._nvfp4_variant_name(member) == f"nvfp4_decode_{member}"
     with pytest.raises(ValueError, match="unknown NVFP4 family member"):
         cake._nvfp4_variant_name("merge")
-    assert len(set(_NVFP4_VARIANTS)) == len(_NVFP4_VARIANTS) == 10
+    assert len(set(_NVFP4_VARIANTS)) == len(_NVFP4_VARIANTS) == 18
     for arch in ("sm_100a", "sm_103a"):
         assert set(_NVFP4_VARIANTS) <= set(_ARCH_REGISTRATIONS[arch]["variants"])
 
@@ -390,6 +390,61 @@ def test_workspace_layout_lse_region_is_opt_in():
     assert with_lse.lse[0] % 128 == 0
     assert with_lse.packed_query == (with_lse.total_bytes, 0)
     assert with_lse.prefill_lens == (with_lse.total_bytes, 0)
+
+
+@pytest.mark.parametrize(
+    "heads, tokens, main_width, extra_width, stride, expected",
+    [
+        # 16 heads, window-only: per-token at most #SMs tokens, breaks to 1024, then the block body.
+        (16, 128, 128, 0, 128, ("nvfp4_h64_tmem_v_early_gather_prefill", 128)),
+        (16, 148, 128, 0, 128, ("nvfp4_h64_tmem_v_early_gather_prefill", 148)),
+        (16, 512, 128, 0, 128, ("nvfp4_qb_h16_breaks_prefill", 128 + 16)),
+        (16, 1024, 128, 0, 128, ("nvfp4_qb_h16_breaks_prefill", 256 + 16)),
+        (16, 200, 128, 0, 128, ("nvfp4_qb_h16_breaks_prefill", 50 + 7)),
+        (16, 1025, 128, 0, 128, ("nvfp4_qb_h16_prefill", 257)),
+        (16, 8192, 128, 0, 128, ("nvfp4_qb_h16_prefill", 2048)),
+        # 32 heads, window-only: late_claim to 512, then the block body.
+        (32, 128, 128, 0, 128, ("nvfp4_h64_tmem_v_early_gather_prefill", 128)),
+        (32, 512, 128, 0, 128, ("nvfp4_qb_h32_late_claim_prefill", 256)),
+        (32, 513, 128, 0, 128, ("nvfp4_qb_h32_prefill", 257)),
+        (32, 2048, 128, 0, 128, ("nvfp4_qb_h32_prefill", 1024)),
+        # Rows the block bodies do not take: tmem_v, with early_gather at most #SMs tokens.
+        (16, 2048, 512, 0, 512, ("nvfp4_h64_tmem_v_prefill", 2048)),
+        (16, 2048, 128, 128, 128, ("nvfp4_h64_tmem_v_prefill", 2048)),
+        (32, 128, 512, 512, 512, ("nvfp4_h64_tmem_v_early_gather_prefill", 128)),
+        (16, 2048, 64, 0, 64, ("nvfp4_h64_tmem_v_prefill", 2048)),
+        (8, 2048, 128, 0, 128, ("nvfp4_h64_tmem_v_prefill", 2048)),
+        # 64 heads.
+        (64, 128, 512, 512, 512, ("nvfp4_h64_early_gather_prefill", 128)),
+        (64, 2048, 128, 0, 128, ("nvfp4_h64_q_prefetch_prefill", 2048)),
+        (64, 2048, 512, 0, 512, ("nvfp4_h64_o_boxes_prefill", 2048)),
+        (64, 2048, 128, 128, 128, ("nvfp4_h64_o_boxes_prefill", 2048)),
+        # 128 heads: one two-CTA cluster per token.
+        (128, 512, 128, 0, 128, ("nvfp4_h128_prefill", 1024)),
+    ],
+)
+def test_nvfp4_prefill_route(heads, tokens, main_width, extra_width, stride, expected):
+    assert (
+        cake._nvfp4_prefill_route(
+            num_heads=heads,
+            num_query_tokens=tokens,
+            main_width=main_width,
+            extra_width=extra_width,
+            main_index_stride=stride,
+            sm_count=148,
+        )
+        == expected
+    )
+    assert expected[0] in _NVFP4_VARIANTS
+
+
+def test_nvfp4_prefill_flat_index_rows_keep_the_storage():
+    table = torch.arange(6 * 160, dtype=torch.int32).reshape(6, 160)[:, :128]
+    flat = cake._flat_index_rows(table)
+    assert flat.data_ptr() == table.data_ptr()
+    assert flat.shape == (5 * 160 + 128,) and flat.is_contiguous()
+    dense = torch.zeros((6, 128), dtype=torch.int32)
+    assert cake._flat_index_rows(dense) is dense
 
 
 def test_workspace_layout_prefill_regions_are_opt_in():
