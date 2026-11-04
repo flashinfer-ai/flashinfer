@@ -2953,6 +2953,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         jit_kwargs: Optional[Dict[str, Any]] = None,
         variant_owns_mask: bool = False,
         max_total_num_rows: Optional[int] = None,
+        *,
+        batch_invariant: bool = False,
     ) -> None:
         r"""Constructor of :class:`BatchPrefillWithPagedKVCacheWrapper`.
 
@@ -3020,6 +3022,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
             The ``cute-dsl`` backend uses the CuTe DSL attention kernel for Blackwell (SM100+).
             ``cute-dsl-prims`` backend is a SM120-only FP8 attention backend implemented using
             CUTLASS primitives.
+        batch_invariant : bool
+            Keyword-only. ``True`` runs the batch-invariant attention class (``flashinfer.batch_invariant``: same bits for a token
+            whatever the batch, its neighbours, the configuration, the SM count, and whether it runs as prefill or decode) and
+            requires ``backend="auto"``. Inputs outside the class (dtypes other than bf16, head dims other than 64 / 128 / 256,
+            non-causal prefill, logits soft cap, custom masks, RoPE, scales, LSE output) raise
+            :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; nothing falls back.
 
         jit_args : Optional[List[Any]]
             If provided, the wrapper will use the provided arguments to create the JIT module,
@@ -3064,6 +3072,14 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 "variant_owns_mask is only supported on the fa2 backend: the "
                 "SM90 (fa3) batch prefill kernels return cudaErrorNotSupported "
                 "under MaskMode.CUSTOM."
+            )
+
+        self._batch_invariant = None
+        if batch_invariant:
+            from .attention.batch_invariant.wrappers import BatchInvariantAttention
+
+            self._batch_invariant = BatchInvariantAttention(
+                float_workspace_buffer, kv_layout, "prefill", backend, jit_args
             )
 
         self._cute_dsl_wrapper = None
@@ -3794,6 +3810,44 @@ class BatchPrefillWithPagedKVCacheWrapper:
         if o_data_type is None:
             o_data_type = q_data_type
         o_data_type = canonicalize_torch_dtype(o_data_type)
+        if self._batch_invariant is not None:
+            self._batch_invariant.plan(
+                qo_indptr=qo_indptr,
+                kv_indptr=paged_kv_indptr,
+                kv_indices=paged_kv_indices,
+                kv_last_page_len=paged_kv_last_page_len,
+                num_qo_heads=num_qo_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim_qk=head_dim_qk,
+                head_dim_vo=head_dim_vo,
+                page_size=page_size,
+                causal=causal,
+                window_left=window_left,
+                logits_soft_cap=logits_soft_cap,
+                pos_encoding_mode=pos_encoding_mode,
+                q_data_type=q_data_type,
+                kv_data_type=kv_data_type,
+                o_data_type=o_data_type,
+                sm_scale=sm_scale,
+                non_blocking=non_blocking,
+                custom_mask=custom_mask,
+                packed_custom_mask=packed_custom_mask,
+                use_fp16_qk_reduction=use_fp16_qk_reduction,
+                fixed_split_size=fixed_split_size,
+                disable_split_kv=disable_split_kv,
+                use_token_head_sf=use_token_head_sf,
+                rope_scale=rope_scale,
+                rope_theta=rope_theta,
+            )
+            qo_indptr_host = qo_indptr.to("cpu", non_blocking=False)
+            self._qo_indptr_last = int(qo_indptr_host[-1].item())
+            self._causal = causal
+            self._window_left = window_left
+            self._sm_scale = sm_scale
+            self._cached_q_data_type = q_data_type
+            self._cached_kv_data_type = kv_data_type
+            self._cached_o_data_type = o_data_type
+            return
 
         # Reject this during planning so an unsupported request cannot reach the
         # lower-level trtllm-gen launcher if wrapper setup changes later.
@@ -4815,6 +4869,21 @@ class BatchPrefillWithPagedKVCacheWrapper:
         if enable_pdl is None:
             enable_pdl = device_support_pdl(q.device)
         k_cache, v_cache = _unpack_paged_kv_cache(paged_kv_cache, self._kv_layout)
+        if self._batch_invariant is not None:
+            return self._batch_invariant.run(
+                q,
+                k_cache,
+                v_cache,
+                out=out,
+                return_lse=return_lse,
+                lse=lse,
+                window_left=window_left,
+                scales=(q_scale, k_scale, v_scale),
+                sinks=sinks,
+                kv_cache_sf=kv_cache_sf,
+                skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+                enable_pdl=enable_pdl,
+            )
         check_lse_base(lse_base)
         check_lse_layout(lse_layout)
         _check_cached_qkv_data_type(
@@ -5535,6 +5604,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         jit_args: Optional[List[Any]] = None,
         jit_kwargs: Optional[Dict[str, Any]] = None,
         variant_owns_mask: bool = False,
+        *,
+        batch_invariant: bool = False,
     ) -> None:
         r"""Constructor of :class:`BatchPrefillWithRaggedKVCacheWrapper`.
 
@@ -5598,6 +5669,12 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             ``cute-dsl-prims`` is an explicit SM120-only packed FP8 prefill backend.
             The ``cutile`` backend uses the pure cuda.tile Python prefill kernel (Blackwell,
             opt-in); it requires ``qo_indptr == kv_indptr`` (equal-length prefill).
+        batch_invariant : bool
+            Keyword-only. ``True`` runs the batch-invariant attention class (``flashinfer.batch_invariant``: same bits for a token
+            whatever the batch, its neighbours, the configuration, the SM count, and whether it runs as prefill or decode) and
+            requires ``backend="auto"``. Inputs outside the class (dtypes other than bf16, head dims other than 64 / 128 / 256,
+            non-causal prefill, logits soft cap, custom masks, RoPE, scales, LSE output) raise
+            :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; nothing falls back.
 
         jit_args : Optional[List[Any]]
             If provided, the wrapper will use the provided arguments to create the JIT module,
@@ -5656,6 +5733,14 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 "under MaskMode.CUSTOM."
             )
         self._variant_owns_mask = variant_owns_mask
+
+        self._batch_invariant = None
+        if batch_invariant:
+            from .attention.batch_invariant.wrappers import BatchInvariantAttention
+
+            self._batch_invariant = BatchInvariantAttention(
+                float_workspace_buffer, kv_layout, "ragged", backend, jit_args
+            )
 
         self._cute_dsl_wrapper = None
         self._prims_backend = None
@@ -6010,6 +6095,44 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 torch.bfloat16 if self._backend == "cute-dsl-rubin" else q_data_type
             )
         o_data_type = canonicalize_torch_dtype(o_data_type)
+        if self._batch_invariant is not None:
+            self._batch_invariant.plan(
+                qo_indptr=qo_indptr,
+                kv_indptr=kv_indptr,
+                kv_indices=None,
+                kv_last_page_len=None,
+                num_qo_heads=num_qo_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim_qk=head_dim_qk,
+                head_dim_vo=head_dim_vo,
+                page_size=1,
+                causal=causal,
+                window_left=window_left,
+                logits_soft_cap=logits_soft_cap,
+                pos_encoding_mode=pos_encoding_mode,
+                q_data_type=q_data_type,
+                kv_data_type=kv_data_type,
+                o_data_type=o_data_type,
+                sm_scale=sm_scale,
+                non_blocking=non_blocking,
+                custom_mask=custom_mask,
+                packed_custom_mask=packed_custom_mask,
+                use_fp16_qk_reduction=use_fp16_qk_reduction,
+                fixed_split_size=fixed_split_size,
+                disable_split_kv=disable_split_kv,
+                use_token_head_sf=use_token_head_sf,
+                rope_scale=rope_scale,
+                rope_theta=rope_theta,
+            )
+            qo_indptr_host = qo_indptr.to("cpu", non_blocking=False)
+            self._qo_indptr_last = int(qo_indptr_host[-1].item())
+            self._causal = causal
+            self._window_left = window_left
+            self._sm_scale = sm_scale
+            self._cached_q_data_type = q_data_type
+            self._cached_kv_data_type = kv_data_type
+            self._cached_o_data_type = o_data_type
+            return
         if head_dim_vo is None:
             head_dim_vo = head_dim_qk
         if fixed_split_size is None:
@@ -7018,6 +7141,21 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         """
         if enable_pdl is None:
             enable_pdl = device_support_pdl(q.device)
+        if self._batch_invariant is not None:
+            return self._batch_invariant.run(
+                q,
+                k,
+                v,
+                out=out,
+                return_lse=return_lse,
+                lse=lse,
+                window_left=None,
+                scales=(q_scale, k_scale, v_scale, o_scale),
+                sinks=getattr(self, "_sinks", None),
+                kv_cache_sf=kv_cache_sf,
+                skip_softmax_threshold_scale_factor=None,
+                enable_pdl=enable_pdl,
+            )
         check_lse_base(lse_base)
         check_lse_layout(lse_layout)
         _check_cached_qkv_data_type(

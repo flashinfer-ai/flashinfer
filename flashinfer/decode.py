@@ -1430,6 +1430,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
         backend: str = "auto",
         jit_args: Optional[List[Any]] = None,
         jit_kwargs: Optional[Dict[str, Any]] = None,
+        *,
+        batch_invariant: bool = False,
     ) -> None:
         r"""Constructor of :class:`BatchDecodeWithPagedKVCacheWrapper`.
 
@@ -1525,6 +1527,12 @@ class BatchDecodeWithPagedKVCacheWrapper:
             eligibility require a separate wrapper and graph capture. Eager
             warmups of such wrappers use their selected graph-mode route.
             ``workspace_size`` is unavailable for XQA-selected shapes.
+        batch_invariant : bool
+            Keyword-only. ``True`` runs the batch-invariant attention class (``flashinfer.batch_invariant``: same bits for a token
+            whatever the batch, its neighbours, the configuration, the SM count, and whether it runs as prefill or decode) and
+            requires ``backend="auto"``. Inputs outside the class (dtypes other than bf16, head dims other than 64 / 128 / 256,
+            non-causal prefill, logits soft cap, custom masks, RoPE, scales, LSE output) raise
+            :class:`flashinfer.batch_invariant.BatchInvariantUnsupportedError`; nothing falls back.
 
         jit_args : Optional[List[Any]]
             If provided, the wrapper will use the provided arguments to create the JIT module,
@@ -1645,6 +1653,14 @@ class BatchDecodeWithPagedKVCacheWrapper:
         self._requested_backend = backend
         self._cudnn_auto = False
         self._cudnn_auto_frozen: Optional[bool] = None
+
+        self._batch_invariant = None
+        if batch_invariant:
+            from .attention.batch_invariant.wrappers import BatchInvariantAttention
+
+            self._batch_invariant = BatchInvariantAttention(
+                float_workspace_buffer, kv_layout, "decode", backend, jit_args
+            )
 
         self._cute_dsl_wrapper = None
         if backend == "cute-dsl":
@@ -2316,6 +2332,46 @@ class BatchDecodeWithPagedKVCacheWrapper:
             self._float_workspace_buffer.numel()
             * self._float_workspace_buffer.element_size()
         )
+
+        if self._batch_invariant is not None:
+            self._batch_invariant.plan(
+                qo_indptr=None,
+                kv_indptr=indptr,
+                kv_indices=indices,
+                kv_last_page_len=last_page_len,
+                num_qo_heads=num_qo_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim_qk=head_dim,
+                head_dim_vo=None,
+                page_size=page_size,
+                causal=True,
+                window_left=window_left,
+                logits_soft_cap=logits_soft_cap,
+                pos_encoding_mode=pos_encoding_mode,
+                q_data_type=q_data_type if data_type is None else data_type,
+                kv_data_type=kv_data_type if data_type is None else data_type,
+                o_data_type=o_data_type,
+                sm_scale=sm_scale,
+                q_len_per_req=q_len_per_req,
+                non_blocking=non_blocking,
+                fixed_split_size=fixed_split_size,
+                disable_split_kv=disable_split_kv,
+                use_token_head_sf=use_token_head_sf,
+                rope_scale=rope_scale,
+                rope_theta=rope_theta,
+            )
+            if window_right != 0:
+                from .batch_invariant.support import unsupported
+
+                raise unsupported("attention.bf16", f"window_right {window_right}", "window_right 0 (causal)")
+            self._batch_size = len(indptr) - 1
+            self._num_qo_heads = num_qo_heads
+            self._num_kv_heads = num_kv_heads
+            self._cached_q_data_type = q_data_type
+            self._cached_kv_data_type = kv_data_type
+            self._window_left = window_left
+            self._q_len_per_req = q_len_per_req
+            return
 
         # Normalized: the planner and kernels read these as raw pointers (#5260).
         indptr = indptr.contiguous()
@@ -3273,6 +3329,21 @@ class BatchDecodeWithPagedKVCacheWrapper:
         if enable_pdl is None:
             enable_pdl = device_support_pdl(q.device)
         k_cache, v_cache = _unpack_paged_kv_cache(paged_kv_cache, self._kv_layout)
+        if self._batch_invariant is not None:
+            return self._batch_invariant.run(
+                q,
+                k_cache,
+                v_cache,
+                out=out,
+                return_lse=return_lse,
+                lse=lse,
+                window_left=window_left,
+                scales=(q_scale, k_scale, v_scale),
+                sinks=sinks,
+                kv_cache_sf=kv_cache_sf,
+                skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+                enable_pdl=enable_pdl,
+            )
 
         if getattr(self, "_use_token_head_sf", False):
             # FP8 token-head scale uses the standard KV layout (last dim == head_dim);
