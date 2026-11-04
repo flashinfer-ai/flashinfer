@@ -65,7 +65,8 @@ recompute of the forward reads it back: no collective, no summary walk over the 
 merge -- the light replay's launches (at ``P > 1`` its local segment walks and carry merges).
 
 Saved set (``boundary_mode="saved"``): ``S_in`` (fresh), the owner's c1
-receive tensor (``save_transfer=True``), ``M_seg`` (``P > 1``) and, with
+receive tensor (``save_transfer=True``), ``M_seg`` (``P > 1``, with
+``save_transfer`` or ``save_mode="full"``) and, with
 ``save_mode="full"``, the forward tapes (``h``, ``v_new``, ``w``, ``u``,
 ``Aqk``, ``Akk``, the gate rows); ``save_mode="light"`` (default) keeps the
 boundary tensors only and the backward re-runs #1 and the #2 tape walk from
@@ -484,25 +485,92 @@ DHU_PROGRAMS = ("kcp_dhu_offset", "kcp_dhu_tape")
 VH64_SUFFIX = "_vh64"
 
 
+# The architectures whose #7 tape walk takes the vh = 64 form at every load (measured faster per launch key there);
+# elsewhere (sm_107a) the tape walk keeps the two-wave rule of :func:`dhu_vh`.
+DHU_TAPE_VH64_ARCHES = ("sm_100a", "sm_103a")
+
+# The architectures where a long-chain #7 walk (:func:`walk_dhu_long_chain`: a segment of at least
+# ``DHU_LONG_CHAIN_MIN_CHUNKS`` chunks, and a two-CTA grid that ends later than the one-CTA grid) keeps the two-wave
+# rule of :func:`dhu_vh` for both forms (measured slower in the vh = 64 form there).
+DHU_LONG_CHAIN_ARCHES = ("sm_100a",)
+DHU_LONG_CHAIN_MIN_CHUNKS = 400
+
+
+def walk_vh64_fits(
+    chains: Sequence[tuple[int, int]], num_heads: int, sm_count: int
+) -> bool:
+    """Whether the two-CTA grid of a walk launch finishes within its longest chain: the LPT makespan
+    (:func:`cake_kcp_plan.lpt_makespan`) of ``2 * num_heads`` CTAs per segment over ``2 * sm_count`` slots (two
+    CTAs per SM) is at most the longest segment's chunk count.  ``chains`` = the launch's ``(chunks, count)``
+    multiset; plan integers only."""
+    chains = [(int(c), int(n)) for c, n in chains if int(c) > 0 and int(n) > 0]
+    if not chains or int(sm_count) <= 0:
+        return False
+    two = 2 * int(num_heads)
+    makespan = cake_kcp_plan.lpt_makespan(
+        [(c, two * n) for c, n in chains], 2 * int(sm_count)
+    )
+    return makespan <= max(c for c, _ in chains)
+
+
+def walk_dhu_long_chain(
+    chains: Sequence[tuple[int, int]], num_heads: int, sm_count: int
+) -> bool:
+    """Whether a #7 walk launch is a long-chain walk of :func:`dhu_vh`: its longest segment has at least
+    :data:`DHU_LONG_CHAIN_MIN_CHUNKS` chunks and the LPT makespan (:func:`cake_kcp_plan.lpt_makespan`) of its
+    two-CTA grid (``2 * num_heads`` CTAs per segment) over ``2 * sm_count`` slots is larger than the LPT makespan
+    of its one-CTA grid (``num_heads`` CTAs per segment) over the same slots.  ``chains`` = the launch's
+    ``(chunks, count)`` multiset; plan integers only."""
+    chains = [(int(c), int(n)) for c, n in chains if int(c) > 0 and int(n) > 0]
+    if not chains or int(sm_count) <= 0:
+        return False
+    if max(c for c, _ in chains) < DHU_LONG_CHAIN_MIN_CHUNKS:
+        return False
+    heads, slots = int(num_heads), 2 * int(sm_count)
+    two = cake_kcp_plan.lpt_makespan([(c, 2 * heads * n) for c, n in chains], slots)
+    one = cake_kcp_plan.lpt_makespan([(c, heads * n) for c, n in chains], slots)
+    return two > one
+
+
 def fwdh_vh(
-    n_walk: int, num_heads: int, sm_count: int, forced: int | None = None
+    n_walk: int,
+    num_heads: int,
+    sm_count: int,
+    forced: int | None = None,
+    fits: bool = False,
 ) -> int:
-    """The #2 form of one launch: ``64`` when ``n_walk * HV <= sm_count`` (the KCP one-wave regime), else ``128``;
-    ``forced`` (test knob ``fwdh_vh``) overrides the rule."""
+    """The #2 form of one launch: ``64`` when ``n_walk * HV <= sm_count`` (the KCP one-wave regime) or when ``fits``
+    (:func:`walk_vh64_fits` of the launch's chains: the two-CTA grid finishes within its longest chain), else
+    ``128``; ``forced`` (test knob ``fwdh_vh``) overrides the rule."""
     if forced is not None:
         return int(forced)
-    return 64 if int(n_walk) * int(num_heads) <= int(sm_count) else 128
+    return 64 if int(n_walk) * int(num_heads) <= int(sm_count) or fits else 128
 
 
 def dhu_vh(
-    n_walk: int, num_heads: int, sm_count: int, forced: int | None = None
+    n_walk: int,
+    num_heads: int,
+    sm_count: int,
+    forced: int | None = None,
+    *,
+    tape: bool = True,
+    arch: str | None = None,
+    long_chain: bool = False,
 ) -> int:
-    """The #7 form of one launch: ``64`` when the two-CTA grid ``n_walk * HV * 2`` fits two waves at two CTAs per
-    SM (``<= 4 * sm_count``; the half-width form measured never slower up to there), else ``128``; ``forced`` (test
-    knob ``dhu_vh``) overrides the rule."""
+    """The #7 form of one launch: ``64`` for the offset walk (``tape=False``) and for the tape walk on the
+    architectures of :data:`DHU_TAPE_VH64_ARCHES` (``arch`` ``None``, the fake backend, counts as one of them);
+    elsewhere the tape walk runs vh = 64 when its two-CTA grid ``n_walk * HV * 2`` fits two waves at two CTAs per
+    SM (``<= 4 * sm_count``), else ``128``.  On the architectures of :data:`DHU_LONG_CHAIN_ARCHES`, a long-chain
+    walk (``long_chain``: :func:`walk_dhu_long_chain` of the launch's chains) of either form takes that two-wave
+    rule too.  ``forced`` (test knob ``dhu_vh``) overrides the rule."""
     if forced is not None:
         return int(forced)
-    return 64 if int(n_walk) * int(num_heads) * 2 <= 4 * int(sm_count) else 128
+    two_wave = 64 if int(n_walk) * int(num_heads) * 2 <= 4 * int(sm_count) else 128
+    if long_chain and arch in DHU_LONG_CHAIN_ARCHES:
+        return two_wave
+    if not tape or arch is None or arch in DHU_TAPE_VH64_ARCHES:
+        return 64
+    return two_wave
 
 
 # The tape set (padded rows R = 64 * NC_pad; the frozen tape set of the design).
@@ -578,8 +646,30 @@ SAVED_BWD_DEAD_POOLS: tuple[str, ...] = ("c1_send", "c1_recv", "c2_send")
 RING_POOLS: tuple[str, ...] = ("ring_out", "ring_in")
 # The pools a call replaces with fresh (forward) or saved (backward) tensors under ``save_transfer``: the c1 receive
 # tensor and the ``M_seg^T`` staging plane are saved-set tensors, so the workspace pools of those names are dead for
-# that call and are not sized (``_prepare`` -> ``WorkspaceKcp.ensure(skip=...)``).
+# that call and are not sized (``_prepare`` -> ``WorkspaceKcp.ensure(skip=...)``).  ``save_mode="full"`` saves the
+# ``M_seg^T`` plane in either ``save_transfer`` form (:func:`_saves_m_seg`).
 SAVE_TRANSFER_FRESH_POOLS: tuple[str, ...] = ("c1_recv", "stage_m")
+# save_mode="full" without save_transfer: the saved M_seg^T plane only (its backward runs no transfer walk).
+_FULL_FRESH_POOLS: tuple[str, ...] = ("stage_m",)
+
+
+def _saves_m_seg(save_mode: str, save_transfer: bool, P: int) -> bool:
+    """Whether the saved set carries ``M_seg`` (the forward's ``M_seg^T`` staging plane): at ``P > 1`` under
+    ``save_transfer`` and under ``save_mode="full"``.  The backward's merges (``tmap_d_*``, ``tmap_m``,
+    ``dcarry_*``) read that plane; the light backward rebuilds it in its replay (transfer walk), the kept hand-off
+    carries the recompute forward's, and the ``"full"`` backward runs no transfer walk, so its saved set holds it."""
+    return int(P) > 1 and (bool(save_transfer) or save_mode == "full")
+
+
+def _fwd_fresh_pools(opts: OptionsKcp, save: bool) -> tuple[str, ...]:
+    """The pools a forward replaces with fresh saved-set tensors (not sized for the call)."""
+    if not save:
+        return ()
+    if opts.save_transfer:
+        return SAVE_TRANSFER_FRESH_POOLS
+    return _FULL_FRESH_POOLS if opts.save_mode == "full" else ()
+
+
 # The saved-set tensor bound under each per-call buffer name (``CallKcp.drop_bound`` forgets both at the last reader).
 SAVED_TENSOR_OF_BUFFER: dict[str, str] = {
     "S_in": "S_in",
@@ -1299,7 +1389,8 @@ class Backend:
 
 
 def _public_args(args: dict[str, Any]) -> dict[str, Any]:
-    return {k: v for k, v in args.items() if not k.startswith("_")}
+    """``args`` without its private keys (a leading ``_``; ``k[:1]`` is ``k.startswith("_")`` without a method call)."""
+    return {k: v for k, v in args.items() if k[:1] != "_"}
 
 
 def _registry() -> Any | None:
@@ -1311,16 +1402,41 @@ def _registry() -> Any | None:
     return cake_jit
 
 
+# The registry answers of l2n_records_shipped / fused_o_shipped, derived once per registry identity: they are read on
+# every call and launch, and the registry is the package's generated record table (data, never changed at run time).
+# The key is the registry module, its record table and its records_of_program function (a registry or a table put in
+# their place -- a test's stand-in -- is another key); the entry holds the keyed objects, so their ids stay theirs.
+_REGISTRY_ANSWERS: dict[tuple, tuple[bool, tuple]] = {}
+
+
+def _registry_answer(question: tuple, jit: Any, derive: Callable[[], bool]) -> bool:
+    modules = getattr(jit, "MODULES", None)
+    lookup = getattr(jit, "records_of_program", None)
+    try:
+        size = len(modules)
+    except TypeError:  # no record table: nothing to key on, derived per call
+        return derive()
+    key = (*question, id(jit), id(modules), size, id(lookup))
+    hit = _REGISTRY_ANSWERS.get(key)
+    if hit is None:
+        hit = _REGISTRY_ANSWERS[key] = (bool(derive()), (jit, modules, lookup))
+    return hit[0]
+
+
 def l2n_records_shipped() -> bool:
     """Whether the registry ships a record of every in-kernel Q / K L2 norm program (:data:`L2N_PROGRAMS`): the
     kernel backend runs ``use_qk_l2norm_in_kernel=True`` only then; the fake backend emulates them either way."""
     jit = _registry()
     if jit is None:
         return False
-    try:
-        return all(jit.records_of_program(p) for p in L2N_PROGRAMS)
-    except ValueError:  # a registry that does not know the programs
-        return False
+
+    def derive() -> bool:
+        try:
+            return all(jit.records_of_program(p) for p in L2N_PROGRAMS)
+        except ValueError:  # a registry that does not know the programs
+            return False
+
+    return _registry_answer(("l2n",), jit, derive)
 
 
 def fused_o_shipped(arch: str | None = None) -> bool:
@@ -1330,16 +1446,20 @@ def fused_o_shipped(arch: str | None = None) -> bool:
     jit = _registry()
     if jit is None:
         return False
-    try:
-        names = jit.records_of_program("kcp_fwdh_out")
-    except ValueError:  # a registry that does not know the program
-        return False
-    forms = {
-        int(jit.MODULES[n].get("grid_rule", {}).get("ctas_per_head", 1))
-        for n in names
-        if arch is None or arch in jit.MODULES[n].get("arches", ())
-    }
-    return forms >= {1, 2}
+
+    def derive() -> bool:
+        try:
+            names = jit.records_of_program("kcp_fwdh_out")
+        except ValueError:  # a registry that does not know the program
+            return False
+        forms = {
+            int(jit.MODULES[n].get("grid_rule", {}).get("ctas_per_head", 1))
+            for n in names
+            if arch is None or arch in jit.MODULES[n].get("arches", ())
+        }
+        return forms >= {1, 2}
+
+    return _registry_answer(("fused_o", arch), jit, derive)
 
 
 def resolve_launch(
@@ -1364,6 +1484,7 @@ def resolve_launch(
             grid_args.get("num_heads", 0),
             args.get("_sm_count", 0),
             args.get("_fwdh_vh"),
+            bool(args.get("_vh64_fits")),
         )
     elif name in DHU_PROGRAMS:
         vh = dhu_vh(
@@ -1371,6 +1492,9 @@ def resolve_launch(
             grid_args.get("num_heads", 0),
             args.get("_sm_count", 0),
             args.get("_dhu_vh"),
+            tape=name == "kcp_dhu_tape",
+            arch=args.get("_arch"),
+            long_chain=bool(args.get("_dhu_long_chain")),
         )
     call = args.get("_call")
     jit = _registry()
@@ -1454,19 +1578,29 @@ def _launch_key(name: str, args: dict[str, Any], cols_per_cta: int) -> tuple:
     merge's ``cols_per_cta`` from these scalars alone and reads nothing from the launch's tensors: an input added to
     :func:`resolve_launch` (a new grid-rule argument, for example) must be added to this key as well."""
     grid_args = args.get("_grid_args")
+    get = args.get
     return (
         name,
-        args.get("_precision_mode"),
-        args.get("_transfer_walk"),
+        get("_precision_mode"),
+        get("_transfer_walk"),
         tuple(grid_args.items()) if grid_args else None,
-        args.get("_sm_count"),
-        args.get("_fwdh_vh"),
-        args.get("_dhu_vh"),
-        args.get("ncols"),
-        args.get("cols_per_cta"),
-        args.get("_grid"),
+        *map(get, _LAUNCH_KEY_ARGS),
         int(cols_per_cta),
     )
+
+
+# the launch key's arguments after the grid rule's (in key order): see _launch_key
+_LAUNCH_KEY_ARGS = (
+    "_sm_count",
+    "_fwdh_vh",
+    "_dhu_vh",
+    "_vh64_fits",
+    "_dhu_long_chain",
+    "_arch",
+    "ncols",
+    "cols_per_cta",
+    "_grid",
+)
 
 
 def _resolve_cached(
@@ -1559,6 +1693,9 @@ class KernelBackend(Backend):
                 **args,
                 "_grid_args": {**grid_args, "arch": be.device_arch(device_index)},
             }
+        elif name in DHU_PROGRAMS:
+            # the #7 width rule reads the architecture (dhu_vh)
+            args = {**args, "_arch": be.device_arch(device_index)}
         record, values, grid, is_test = _resolve_cached(
             name, args, cols_per_cta=self.cols_per_cta
         )
@@ -1576,8 +1713,9 @@ class KernelBackend(Backend):
         )
 
     def launch_scope(self, call: CallKcp) -> Any:
-        """The launch glue's stream scope (``cake_backend.launch_scope``: one ``tvm_ffi.use_torch_stream()`` context
-        for the body's launches instead of one per launch); ``None`` when the glue has no scope."""
+        """The launch glue's stream scope (``cake_backend.launch_scope``: one stream binding -- the stream
+        ``tvm_ffi.use_torch_stream()`` binds -- for the body's launches instead of one per launch); ``None`` when the
+        glue has no scope."""
         scope = getattr(self.launcher(), "launch_scope", None)
         return None if scope is None else scope()
 
@@ -2454,6 +2592,36 @@ class _Tables:
             hit = self._memo_put(key, (len(values), self.dev("walk", values, device)))
         return hit
 
+    def walk_fits(self, walk: Sequence[int], sm_count: int) -> bool:
+        """:func:`walk_vh64_fits` of the walk list ``walk`` (its segments' chunk counts; keyed by its content like
+        :meth:`walk_table`)."""
+        key = ("fits", tuple(walk), int(sm_count))
+        hit = self.memo.get(key)
+        if hit is None:
+            hit = self._memo_put(
+                key, walk_vh64_fits(self._walk_chains(walk), self.H, sm_count)
+            )
+        return hit
+
+    def walk_long_chain(self, walk: Sequence[int], sm_count: int) -> bool:
+        """:func:`walk_dhu_long_chain` of the walk list ``walk`` (keyed by its content like :meth:`walk_fits`)."""
+        key = ("long_chain", tuple(walk), int(sm_count))
+        hit = self.memo.get(key)
+        if hit is None:
+            hit = self._memo_put(
+                key, walk_dhu_long_chain(self._walk_chains(walk), self.H, sm_count)
+            )
+        return hit
+
+    def _walk_chains(self, walk: Sequence[int]) -> list[tuple[int, int]]:
+        """The ``(chunks, count)`` multiset of the walk list's segments (host plan tuple ``seg_chunk_start``)."""
+        seg = self.hp.seg_chunk_start
+        chains: dict[int, int] = {}
+        for s in walk:
+            c = int(seg[int(s) + 1]) - int(seg[int(s)])
+            chains[c] = chains.get(c, 0) + 1
+        return list(chains.items())
+
     def neg_index(self, device: torch.device) -> torch.Tensor:
         """The zero block's ``[NSEG]`` index table (every entry ``-1``) on the device."""
         key = ("neg", device)
@@ -2637,6 +2805,22 @@ def _call_tickets(
     return hit
 
 
+def _chunk_tokens(ctx: Any, chunk_len: Sequence[int]) -> int:
+    """The tokens the context's chunk table ``chunk_len`` covers (its sum; the in-kernel L2 norm's coverage check).
+    A context's table is an immutable tuple: its sum is derived once and kept in the context's cache with the table
+    it was taken over (a context without a cache, or a table of another type, sums per call)."""
+    caches = getattr(ctx, "_caches", None)
+    if not isinstance(caches, dict) or type(chunk_len) is not tuple:
+        return sum(int(n) for n in chunk_len)
+    hit = caches.get(("kcp_chunk_tokens",))
+    if hit is None or hit[0] is not chunk_len:
+        hit = caches[("kcp_chunk_tokens",)] = (
+            chunk_len,
+            sum(int(n) for n in chunk_len),
+        )
+    return hit[1]
+
+
 def _context_tables(
     ctx: Any, HV: int, *, fused_walks: int = 1, P: int | None = None
 ) -> _Tables:
@@ -2660,7 +2844,8 @@ class WorkspaceKcp:
     (:data:`FWD_TAPES` / :data:`BWD_TAPES` of the padded geometry ``(R, NC_pad, HV)``, allocated on first use;
     ``dv_new`` is the ``dv_intra`` buffer, :data:`TAPE_ALIASES`).  The
     saved-set tensors (``S_in`` = the c2 output, the c1 receive tensor under ``save_transfer``, ``M_seg`` under
-    ``save_transfer`` at ``P > 1``, the forward tapes under ``save_mode="full"``) are never workspace slices: the
+    ``save_transfer`` or ``save_mode="full"`` at ``P > 1``, the forward tapes under ``save_mode="full"``) are never
+    workspace slices: the
     calls allocate them fresh.  The persistent programs' dynamic-ticket words live here too: one 128-byte u32 slot
     per launch site (:data:`TICKET_SITES`), zeroed once when the workspace is first sized, never released, never
     read by the host; every launch leaves its word at zero (the kernels' self-resetting ticket), so a captured graph
@@ -2720,11 +2905,11 @@ class WorkspaceKcp:
     ) -> _Tables:
         """Size the pools for ``(ctx, HV)`` and bind the tape geometry; returns the tables (``P``: the segments
         override of the plan).  ``skip``: pool names this call never touches (:func:`_prepare` passes the ring
-        pools under ``exchange="a2a"`` and the pools the call replaces with fresh / saved tensors, ``c1_recv`` and
-        ``stage_m`` under ``save_transfer``); a skipped pool is not allocated, a held one is left as it is, and a
-        later ``ensure()`` without the name sizes it.  ``skip_empty``: a pool of size 0 (e.g. the staging and carry
-        planes at ``P = 1``) is not allocated either -- :meth:`pool` makes the empty tensor if a call ever asks for
-        it.  A workspace built from ``(ctx, H_qk, HV)`` sizes every pool."""
+        pools under ``exchange="a2a"`` and the pools the call replaces with fresh / saved tensors, ``c1_recv`` under
+        ``save_transfer`` and ``stage_m`` when the saved set carries ``M_seg``); a skipped pool is not allocated, a
+        held one is left as it is, and a later ``ensure()`` without the name sizes it.  ``skip_empty``: a pool of
+        size 0 (e.g. the staging and carry planes at ``P = 1``) is not allocated either -- :meth:`pool` makes the
+        empty tensor if a call ever asks for it.  A workspace built from ``(ctx, H_qk, HV)`` sizes every pool."""
         device = (
             torch.device(device) if device is not None else torch.device(ctx.device)
         )
@@ -2871,11 +3056,11 @@ class WorkspaceKcp:
 @dataclasses.dataclass(frozen=True)
 class SavedKcp:
     """The saved context of one forward (``boundary_mode="saved"``): ``S_in`` (the fresh c2 output), the owner's c1
-    receive tensor (``save_transfer``), ``M_seg`` (``save_transfer`` at ``P > 1``), the saved tapes of the
-    ``save_mode`` (:func:`saved_tapes`: none in ``"light"``, every forward tape in ``"full"``) and the scalars of the
-    call.  With ``use_qk_l2norm_in_kernel`` (``qk_l2norm``) it also carries ``qk_rstd``, the FP32 ``r`` of q and k
-    ``[2, T_r, H_qk]`` (after the tapes in :meth:`tensors`; its presence follows ``meta()["qk_l2norm"]``, so
-    :meth:`flags` keeps its three entries).  Every
+    receive tensor (``save_transfer``), ``M_seg`` (``save_transfer`` or ``save_mode="full"`` at ``P > 1``), the saved
+    tapes of the ``save_mode`` (:func:`saved_tapes`: none in ``"light"``, every forward tape in ``"full"``) and the
+    scalars of the call.  With ``use_qk_l2norm_in_kernel`` (``qk_l2norm``) it also carries ``qk_rstd``, the FP32
+    ``r`` of q and k ``[2, T_r, H_qk]`` (after the tapes in :meth:`tensors`; its presence follows
+    ``meta()["qk_l2norm"]``, so :meth:`flags` keeps its three entries).  Every
     tensor is fresh per call and travels through ``save_for_backward`` only (#7039).  ``kept`` (never saved, never
     compared: not in ``tensors()`` / ``flags()`` / ``meta()``) is the recompute forward's tape hand-off of
     ``reuse_recompute_tapes`` on its way through the autograd Function's backward; ``None`` everywhere else."""
@@ -3364,13 +3549,22 @@ class CallKcp:
             )
         else:
             raise ValueError(f"{name} is not a walk program")
+        sm_count = int(getattr(self.ctx, "sm_count", 0) or 0)
+        fits = (
+            name in FWDH_PROGRAMS
+            and n_walk * self.HV > sm_count
+            and self.tb.walk_fits(walk, sm_count)
+        )  # the chain clause of fwdh_vh (only where the one-wave clause does not already pick vh = 64)
+        long_chain = name in DHU_PROGRAMS and self.tb.walk_long_chain(walk, sm_count)
         self.kernel(
             name,
             n_walk * self.HV,
             _grid_args={"n_walk": n_walk, "num_heads": self.HV},
-            _sm_count=int(getattr(self.ctx, "sm_count", 0) or 0),
+            _sm_count=sm_count,
             _fwdh_vh=self.opts.knob("fwdh_vh"),
             _dhu_vh=self.opts.knob("dhu_vh"),
+            _vh64_fits=fits,
+            _dhu_long_chain=long_chain,
             **args,
         )
 
@@ -4411,9 +4605,9 @@ def _forward(
 ) -> None:
     """The forward sequence.  ``fuse_o``: every tape-walk launch runs the output walk ``kcp_fwdh_out`` on its launch
     list instead (``o`` written in the walk, no ``h`` / ``v_new`` tape; :func:`_fuse_o`).  ``save``: the saved set is
-    kept (fresh ``S_in``; with ``save_transfer`` also the c1
-    receive tensor and ``M_seg``; with ``save_mode="full"`` fresh forward tapes); ``replay``: the forward of a
-    replay-mode backward (no ``fwd_o``, nothing kept); ``hand_off``: the forward tapes go to the backward of this
+    kept (fresh ``S_in``; with ``save_transfer`` also the c1 receive tensor; ``M_seg`` at ``P > 1`` with
+    ``save_transfer`` or ``save_mode="full"``; with ``save_mode="full"`` fresh forward tapes); ``replay``: the forward
+    of a replay-mode backward (no ``fwd_o``, nothing kept); ``hand_off``: the forward tapes go to the backward of this
     graph task (``reuse_recompute_tapes``): no tape is dropped and the tape walk takes the light replay's form
     (:func:`_replay_tape_walk`).  ``s_in``: the recompute of a forward that stored its incoming states in a recompute
     handle -- no collective, no summary walk over the crossing-out fragments, no merge of the owners: #1, at
@@ -4442,10 +4636,10 @@ def _forward(
     )
     keep = save and not replay
     keep_transfer = opts.save_transfer and keep
-    if keep_transfer and tb.P > 1:
+    if keep and _saves_m_seg(opts.save_mode, opts.save_transfer, tb.P):
         call.fresh(
             "stage_m"
-        )  # M_seg^T of the segmented fragments: the summaries write it
+        )  # M_seg^T of the segmented fragments: the summaries (or the recompute's transfer walk) write it
     if (
         keep
     ):  # the saved tapes are fresh per call (light: none; full: every forward tape)
@@ -5072,10 +5266,12 @@ def _prepare(
     if opts.use_qk_l2norm_in_kernel:
         # #1_l2n writes qn / kn / r for the tokens of the real chunks only: they must cover [0, T_r) (metadata)
         chunk_len = getattr(ctx, "chunk_len", None)
-        if chunk_len is not None and sum(int(n) for n in chunk_len) != int(T):
-            raise ValueError(
-                f"use_qk_l2norm_in_kernel: the context's chunks cover {sum(int(n) for n in chunk_len)} of {T} tokens"
-            )
+        if chunk_len is not None:
+            covered = _chunk_tokens(ctx, chunk_len)
+            if covered != int(T):
+                raise ValueError(
+                    f"use_qk_l2norm_in_kernel: the context's chunks cover {covered} of {T} tokens"
+                )
     if opts.exchange == "ring":
         validate_ring(ctx.n_d_max)
     device = torch.device(ctx.device)
@@ -5110,7 +5306,8 @@ def _prepare(
             if isinstance(caches, dict):
                 caches[done] = True
     # Dead pools are not allocated (R2-L1 1a): the ring pools under the a2a exchange and the pools the call binds
-    # fresh / saved tensors for (``c1_recv`` / ``stage_m`` under ``save_transfer``) never hold a byte of this call.
+    # fresh / saved tensors for (``c1_recv`` under ``save_transfer``, ``stage_m`` when the saved set carries ``M_seg``)
+    # never hold a byte of this call.
     skip = list(fresh_pools)
     if opts.exchange != "ring":
         skip += list(RING_POOLS)
@@ -5312,7 +5509,7 @@ def _fwd_entry(
         opts=opts,
         workspace=workspace,
         backward=False,
-        fresh_pools=SAVE_TRANSFER_FRESH_POOLS if (save and opts.save_transfer) else (),
+        fresh_pools=_fwd_fresh_pools(opts, save),
     )
     if entry is not None and entry.seen > 0 and entry.disabled is None:
         res = _graph_capture(
@@ -5342,9 +5539,7 @@ def _fwd_entry(
             opts=opts,
             workspace=workspace,
             backward=False,
-            fresh_pools=SAVE_TRANSFER_FRESH_POOLS
-            if (save and opts.save_transfer)
-            else (),
+            fresh_pools=_fwd_fresh_pools(opts, save),
         )
     s_in = None
     if boundary is not None:
@@ -5398,8 +5593,8 @@ def _fwd_entry(
 def _saved_count(call: CallKcp, save: bool) -> int:
     """What :class:`ChunkGDNFunctionKcp` saves for this forward: the five operands and the saved set's tensors
     (:meth:`SavedKcp.tensors`: ``S_in``; the c1 receive tensor under ``save_transfer``; ``M_seg`` under
-    ``save_transfer`` at ``P > 1``; the saved tapes of the ``save_mode`` when the rank holds tokens; ``qk_rstd`` with
-    ``use_qk_l2norm_in_kernel``) -- known before
+    ``save_transfer`` or ``save_mode="full"`` at ``P > 1``; the saved tapes of the ``save_mode`` when the rank holds
+    tokens; ``qk_rstd`` with ``use_qk_l2norm_in_kernel``) -- known before
     the forward runs, so the frame proof can decide a hand-off (``reuse_recompute_tapes="auto"``)."""
     if not save:
         return _SAVED_OPERANDS
@@ -5407,7 +5602,7 @@ def _saved_count(call: CallKcp, save: bool) -> int:
     n = (
         1
         + (1 if opts.save_transfer else 0)
-        + (1 if (opts.save_transfer and tb.P > 1) else 0)
+        + (1 if _saves_m_seg(opts.save_mode, opts.save_transfer, tb.P) else 0)
     )
     if call.T_r > 0:
         n += len(saved_tapes(opts.save_mode))
@@ -5529,14 +5724,17 @@ def _fwd_body(
 
 def _saved_set(call: CallKcp) -> SavedKcp:
     """The saved set of this forward (``boundary_mode="saved"``, ``kept=None``): the fresh ``S_in``, with
-    ``save_transfer`` the c1 receive tensor and ``M_seg`` (``P > 1``), the saved tapes of the ``save_mode`` (none in
-    ``"light"``), the scalars of the call.  Built before #5 so the forward knows what the Function saves."""
+    ``save_transfer`` the c1 receive tensor, ``M_seg`` (``P > 1``, also under ``save_mode="full"``), the saved tapes
+    of the ``save_mode`` (none in ``"light"``), the scalars of the call.  Built before #5 so the forward knows what
+    the Function saves."""
     tb, opts = call.tb, call.opts
     return SavedKcp(
         version=KCP_SAVED_VERSION,
         S_in=call.bufs["S_in"],
         c1_recv=call.bufs.get("c1_recv") if opts.save_transfer else None,
-        M_seg=call.bufs.get("stage_m") if (opts.save_transfer and tb.P > 1) else None,
+        M_seg=call.bufs.get("stage_m")
+        if _saves_m_seg(opts.save_mode, opts.save_transfer, tb.P)
+        else None,
         tapes=tuple(call.tapes[n] for n in saved_tapes(opts.save_mode))
         if call.T_r > 0
         else None,
@@ -5623,16 +5821,18 @@ def _check_saved(saved: SavedKcp, call: CallKcp) -> None:
             call.state_dtype,
             call.device,
         )
-        if tb.P > 1:
-            if saved.M_seg is None:
-                raise ValueError("saved: save_transfer at P > 1 needs M_seg")
-            _check(
-                saved.M_seg,
-                "saved.M_seg",
-                (tb.sizes["stage_m"],),
-                call.state_dtype,
-                call.device,
+    if _saves_m_seg(opts.save_mode, opts.save_transfer, tb.P):
+        if saved.M_seg is None:
+            raise ValueError(
+                'saved: save_transfer or save_mode="full" at P > 1 needs M_seg'
             )
+        _check(
+            saved.M_seg,
+            "saved.M_seg",
+            (tb.sizes["stage_m"],),
+            call.state_dtype,
+            call.device,
+        )
     if call.T_r > 0:
         names = saved_tapes(opts.save_mode)
         if saved.tapes is None or len(saved.tapes) != len(names):
@@ -6033,24 +6233,38 @@ class ChunkGDNFunctionKcp(torch.autograd.Function):
         return dq, dk, dv, dg, dbeta, None, None, None, None, None, None, None
 
 
-# chunk_gdn_kcp's validated options per keyword set (no ``options`` object): an OptionsKcp built and checked once per
-# distinct keyword values (with their types, so ``1`` never stands in for ``True``) and shared by the calls -- never
-# handed to the caller, never mutated by the package (a recompute handle's form is a dataclasses.replace copy).
+# chunk_gdn_kcp's validated options per keyword set (no ``options`` object, or an ``options`` dict): an OptionsKcp
+# built and checked once per distinct keyword values -- and dict entries, taken by value at each call -- (with their
+# types, so ``1`` never stands in for ``True``) and shared by the calls -- never handed to the caller, never mutated by
+# the package (a recompute handle's form is a dataclasses.replace copy).  An OptionsKcp instance is checked per call.
 _KEYWORD_OPTIONS: dict[tuple, OptionsKcp] = {}
 KEYWORD_OPTIONS_MAX = 64
+_DICT_OPTIONS = "options"  # the leading mark of a key with an options dict (the keyword-only keys start otherwise)
 
 
-def _keyword_options(over: dict[str, Any], knobs: dict[str, Any]) -> OptionsKcp:
+def _keyword_options(
+    over: dict[str, Any],
+    knobs: dict[str, Any],
+    options: dict[str, Any] | None = None,
+) -> OptionsKcp:
     try:
+        key: tuple[Any, ...]
         key = tuple((k, type(v), v) for k, v in sorted(over.items())) + (
             None,
             *((k, type(v), v) for k, v in sorted(knobs.items())),
         )
+        if options is not None:
+            key = (
+                _DICT_OPTIONS,
+                *((k, type(v), v) for k, v in sorted(options.items())),
+                None,
+                *key,
+            )
         opts = _KEYWORD_OPTIONS.get(key)
-    except TypeError:  # an unhashable value (a test_knobs dict): validated per call
-        return make_options(None, **over, **knobs)
+    except TypeError:  # an unhashable value (a test_knobs dict) or a key that is no str: validated per call
+        return make_options(options, **over, **knobs)
     if opts is None:
-        opts = make_options(None, **over, **knobs)
+        opts = make_options(options, **over, **knobs)
         if len(_KEYWORD_OPTIONS) >= KEYWORD_OPTIONS_MAX:
             _KEYWORD_OPTIONS.clear()
         _KEYWORD_OPTIONS[key] = opts
@@ -6211,9 +6425,9 @@ def chunk_gdn_kcp(
             "recompute_handle keeps the incoming states only: it needs save_transfer=False"
         )
     opts = (
-        make_options(options, **over, **knobs)
-        if options is not None
-        else _keyword_options(over, knobs)
+        _keyword_options(over, knobs, options)
+        if options is None or type(options) is dict
+        else make_options(options, **over, **knobs)
     )
     if recompute_handle is not None:
         if opts.boundary_mode != "saved" or opts.graph != "off":

@@ -1254,8 +1254,8 @@ def _saved_formula(ctx, H_qk, HV, save_mode, boundary_mode, save_transfer, C) ->
         total += ctx.n_in * s_pad
         if save_transfer:
             total += ctx.N_out * 2 * hp.Hg_pad_by_rank[ctx.rank] * gp.STATE_TILE_BYTES
-            if hp.P > 1:
-                total += (hp.P - 1) * ctx.n_frag * s
+        if (save_transfer or save_mode == "full") and hp.P > 1:
+            total += hp.P * ctx.n_frag * s
     if (
         save_mode == "full"
     ):  # every forward tape: h, v_new / w / u, Aqk / Akk, gamma, gcum / rowscale / qscale
@@ -2400,6 +2400,225 @@ def test_backward_forgets_its_own_saved_set_at_the_last_reader() -> None:
     assert "S_in" not in kcp.LAST_CALL["bwd"]["fresh_bytes"]
 
 
+@pytest.mark.parametrize(
+    "save_mode,save_transfer",
+    [("light", True), ("full", True), ("full", False)],
+    ids=["light-st", "full-st", "full-nost"],
+)
+@pytest.mark.parametrize("P", (2, 3))
+def test_saved_byte_query_counts_the_whole_m_seg_plane(
+    save_mode, save_transfer, P
+) -> None:
+    """The saved set keeps ``M_seg`` as the whole ``M_seg^T`` staging plane: ``[NSEG, HV]`` FP32 states with
+    ``NSEG = n_frag * P``, under ``save_transfer`` and under ``save_mode="full"``.  The byte query's ``M_seg`` term
+    (``P n_frag s``) equals the bytes of that saved tensor."""
+    kcp = _package("cake_kcp")
+    cu = [0, 100, 740, 817, 1817, 1946]
+    H_qk, HV = 2, 6
+    part = gp.partition_det_kcp(torch.tensor(cu, dtype=torch.int64), 1, "contiguous")
+    ctx = gp.build_context_det_kcp(part, None, 0, CPU)
+    ops = _inputs(cu, H_qk, HV)
+    _, saved = kcp.chunk_gdn_det_fwd_kcp(
+        ops["q"],
+        ops["k"],
+        ops["v"],
+        ops["g"],
+        ops["beta"],
+        ctx,
+        backend="fake",
+        segments=P,
+        save_mode=save_mode,
+        save_transfer=save_transfer,
+    )
+    assert saved is not None and saved.P == P and saved.M_seg is not None
+    plane = saved.M_seg.numel() * saved.M_seg.element_size()
+    assert plane == P * ctx.n_frag * HV * gp.STATE_TILE_BYTES
+    q = {
+        "H_qk": H_qk,
+        "HV": HV,
+        "save_mode": save_mode,
+        "save_transfer": save_transfer,
+        "P": P,
+    }
+    assert gb.gdn_det_saved_layout_kcp(ctx, **q)["M_seg"] == plane
+
+
+# README saved-set table row (by its item cell's start) -> the gdn_det_saved_layout_kcp terms it states
+README_SAVED_ROWS = {
+    "inputs ": (),
+    "`S_in`": ("S_in",),
+    "received summary pairs": ("c1_recv",),
+    "`M_seg`": ("M_seg",),
+    "convolution history rows": ("hist",),
+    "`gamma`, `gcum`, `Akk`": ("gamma", "gcum", "akk"),
+    "`rowscale`, `qscale`": ("rowscale", "qscale"),
+    "`h` tape, `v_new`, `w`, `u`, `Aqk`": ("h_tape", "v_new", "w", "u", "aqk"),
+    "`qk_rstd`": ("qk_rstd",),
+}
+
+
+def test_readme_saved_set_table_matches_the_saved_layout() -> None:
+    """The README's saved-set table states what ``gdn_det_saved_layout_kcp`` counts: every layout term sits in one
+    row; a ``yes`` column is a nonzero term on some rank (under ``save_transfer`` and without it, unless the row is
+    conditional on ``save_transfer=True``), a ``**no**`` column a zero term on every rank; the ``M_seg`` row's light
+    column holds under ``save_transfer=True`` only (two ranks, a crossing fragment, ``P = 2``, the in-kernel norm
+    on).  The per-token figures are the layout's bytes of the row per padded token row at ``HV = 48``."""
+    readme = pathlib.Path(gb.__file__).with_name("README.md").read_text()
+    lines = readme[
+        readme.index("### Saved set, replay and byte queries") :
+    ].splitlines()
+    head = lines.index(
+        '| item | `save_mode="full"` | `save_mode="light"` | bytes per rank |'
+    )
+    table = []
+    for line in lines[head + 2 :]:
+        if not line.startswith("|"):
+            break
+        table.append([c.strip() for c in line.strip().strip("|").split("|")])
+    rows = {}
+    for item, full_cell, light_cell, bytes_cell in table:
+        (prefix,) = [k for k in README_SAVED_ROWS if item.startswith(k)]
+        rows[prefix] = (item, {"full": full_cell, "light": light_cell}, bytes_cell)
+    assert set(rows) == set(README_SAVED_ROWS)
+    cu = [0, 100, 740, 817, 1817, 1946]
+    H_qk, HV = 2, 6
+    part = gp.partition_det_kcp(torch.tensor(cu, dtype=torch.int64), 2, "contiguous")
+    ctxs = [gp.build_context_det_kcp(part, None, r, CPU) for r in range(2)]
+    assert sum(c.n_in for c in ctxs) > 0  # a crossing fragment: S_in / hist terms exist
+
+    def terms(save_mode: str, save_transfer: bool) -> list[dict[str, int]]:
+        return [
+            gb.gdn_det_saved_layout_kcp(
+                c,
+                H_qk=H_qk,
+                HV=HV,
+                save_mode=save_mode,
+                save_transfer=save_transfer,
+                P=2,
+                use_qk_l2norm_in_kernel=True,
+            )
+            for c in ctxs
+        ]
+
+    keys = [k for ks in README_SAVED_ROWS.values() for k in ks]
+    assert sorted(keys) == sorted(terms("full", True)[0])  # each term in one row
+    for prefix, (item, cells, _) in rows.items():
+        st_only = "`save_transfer=True`" in item
+        for mode, cell in cells.items():
+            on, off = terms(mode, True), terms(mode, False)
+            for k in README_SAVED_ROWS[prefix]:
+                if cell == "yes":
+                    assert any(t[k] > 0 for t in on), (item, mode, k)
+                    assert any(t[k] > 0 for t in off) != st_only, (item, mode, k)
+                elif cell.startswith("**no**"):
+                    assert all(t[k] == 0 for t in on + off), (item, mode, k)
+                else:
+                    assert cell.startswith("`save_transfer=True` only"), (item, cell)
+                    assert any(t[k] > 0 for t in on), (item, mode, k)
+                    assert all(t[k] == 0 for t in off), (item, mode, k)
+    # the per-token figures: the layout's bytes per padded token row (R = 64 NC_pad rows) at (16, 48)
+    part = gp.partition_det_kcp(
+        torch.tensor([0, 4096], dtype=torch.int64), 1, "contiguous"
+    )
+    ctx = gp.build_context_det_kcp(part, None, 0, CPU)
+    assert 64 * ctx.NC_pad == ctx.R
+    lay = gb.gdn_det_saved_layout_kcp(ctx, H_qk=16, HV=48, save_mode="full", P=1)
+    n_per_token = 0
+    for prefix, (item, _, bytes_cell) in rows.items():
+        if bytes_cell.endswith("B per token"):
+            n_per_token += 1
+            row_bytes = sum(lay[k] for k in README_SAVED_ROWS[prefix])
+            assert row_bytes % ctx.R == 0, item
+            assert f"{row_bytes // ctx.R:,} B per token" in bytes_cell, (
+                item,
+                row_bytes,
+            )
+    assert n_per_token == 3
+
+
+def _nan_filled_allocations(monkeypatch, kcp) -> None:
+    """Fill every tensor the package allocates (``kcp._alloc``: workspace pools, tapes, fresh saved-set tensors) with
+    NaN bytes, so a read of a buffer no program of the call wrote shows up as a non-finite result."""
+    real_alloc = kcp._alloc
+
+    def nan_alloc(shape, dtype, device):
+        t = real_alloc(shape, dtype, device)
+        if t.numel():
+            t.view(-1).view(torch.uint8).fill_(0xFF)
+        return t
+
+    monkeypatch.setattr(kcp, "_alloc", nan_alloc)
+
+
+@pytest.mark.parametrize("use_qk_l2norm_in_kernel", (False, True))
+def test_full_backward_without_save_transfer_reads_no_unwritten_plane(
+    monkeypatch, use_qk_l2norm_in_kernel
+) -> None:
+    """``save_mode="full"`` with ``save_transfer=False`` at ``P > 1`` (also the only form of ``exchange="ring"``): the
+    backward's merges read the forward's ``M_seg^T`` plane (``stage_m``), which the full backward does not rebuild (no
+    transfer walk), so the saved set carries it as ``M_seg`` and the backward binds it.  Every tensor the package
+    allocates is filled with NaN bytes: an unwritten read shows up as a non-finite result.  The full form gives the
+    light form's bits on a ``None``, a fresh and a shared workspace (twice) and under a non-reentrant checkpoint; the
+    byte query counts ``M_seg``; a full saved set without it is refused."""
+    kcp = _package("cake_kcp")
+    _nan_filled_allocations(monkeypatch, kcp)
+    cu = [0, 100, 740, 817, 1817, 1946]
+    H_qk, HV = 2, 6
+    part = gp.partition_det_kcp(torch.tensor(cu, dtype=torch.int64), 1, "contiguous")
+    ctx = gp.build_context_det_kcp(part, None, 0, CPU)
+    ops = _inputs(cu, H_qk, HV)
+    base = {
+        "segments": 2,
+        "save_transfer": False,
+        "use_qk_l2norm_in_kernel": use_qk_l2norm_in_kernel,
+    }
+    args = (ops["q"], ops["k"], ops["v"], ops["g"], ops["beta"], ctx)
+    _, saved = kcp.chunk_gdn_det_fwd_kcp(
+        *args, backend="fake", save_mode="full", **base
+    )
+    assert saved is not None and saved.P == 2 and saved.c1_recv is None
+    assert saved.M_seg is not None and torch.isfinite(saved.M_seg).all()
+    m_seg_bytes = gb.gdn_det_saved_layout_kcp(
+        ctx,
+        H_qk=H_qk,
+        HV=HV,
+        save_mode="full",
+        save_transfer=False,
+        P=2,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+    )["M_seg"]
+    # the query counts the saved plane itself: NSEG = n_frag P states
+    assert m_seg_bytes == 2 * ctx.n_frag * HV * gp.STATE_TILE_BYTES
+    assert m_seg_bytes == saved.M_seg.numel() * saved.M_seg.element_size()
+    # an older full saved set without M_seg would read an unwritten plane: refused
+    with pytest.raises(ValueError, match="needs M_seg"):
+        kcp.chunk_gdn_det_bwd_kcp(
+            *args,
+            ops["dout"],
+            saved=dataclasses.replace(saved, M_seg=None),
+            backend="fake",
+            save_mode="full",
+            **base,
+        )
+    light = _ckpt_autograd(kcp, ctx, ops, ckpt=False, **base)
+    for n, t in light.items():
+        assert torch.isfinite(t.float()).all(), ("light", n)
+    shared = kcp.WorkspaceDetKcp()
+    arms = (
+        (None, False),
+        (kcp.WorkspaceDetKcp(), False),
+        (shared, False),
+        (shared, False),
+        (None, True),
+    )
+    for i, (ws, ckpt) in enumerate(arms):
+        full = _ckpt_autograd(
+            kcp, ctx, ops, ckpt=ckpt, workspace=ws, save_mode="full", **base
+        )
+        assert kcp.LAST_CALL["bwd"]["tapes_source"] == "saved", i
+        _assert_same(full, light, f"save_mode=full without save_transfer, arm {i}")
+
+
 def test_transpose_tiles_scratch_is_bitwise_the_temporary_form() -> None:
     """R2-L1 1a: the ``M_f -> M_f^T`` scatter with the gather in a caller scratch (the carry plane during the
     summaries) writes the same bytes as the fresh-temporary form and leaves the gathered tiles in the scratch."""
@@ -2433,9 +2652,11 @@ def test_transpose_tiles_scratch_is_bitwise_the_temporary_form() -> None:
 
 
 def test_workspace_layout_counts_one_staging_plane_under_save_transfer() -> None:
-    """R2-L1 1a: ``gdn_det_workspace_layout_kcp`` counts the ``stage_m`` plane only when the call sizes it (replay
-    boundary or ``save_transfer=False``); under the shipped saved + ``save_transfer`` form the saved ``M_seg^T``
-    stands in for it and the workspace holds ``stage_b`` alone (the ring pools are never workspace terms)."""
+    """R2-L1 1a: ``gdn_det_workspace_layout_kcp`` counts the ``stage_m`` plane only when the call sizes it (the replay
+    boundary, or the light saved form without ``save_transfer``); when the saved set carries ``M_seg`` -- the shipped
+    saved + ``save_transfer`` form and ``save_mode="full"`` with either ``save_transfer`` -- the saved ``M_seg^T``
+    stands in for it and the workspace holds ``stage_b`` alone (the ring pools are never workspace terms).  The full
+    form without ``save_transfer`` is also checked against the pools a call at ``P = 2`` actually sizes."""
     cu = torch.tensor([0, 100, 740, 817, 1817, 1946], dtype=torch.int64)
     part = gp.partition_det_kcp(cu, 2, "contiguous")
     H_qk, HV = 2, 6
@@ -2466,9 +2687,13 @@ def test_workspace_layout_counts_one_staging_plane_under_save_transfer() -> None
         two_b = gb.gdn_det_workspace_layout_kcp(
             ctx, H_qk=H_qk, HV=HV, save_transfer=False
         )
+        full_no_st = gb.gdn_det_workspace_layout_kcp(
+            ctx, H_qk=H_qk, HV=HV, save_mode="full", save_transfer=False
+        )
         assert one["fwd.staging"] == one["bwd.staging"] == plane
         assert two_a["fwd.staging"] == two_a["bwd.staging"] == 2 * plane
         assert two_b["fwd.staging"] == two_b["bwd.staging"] == 2 * plane
+        assert full_no_st["fwd.staging"] == full_no_st["bwd.staging"] == plane
         assert one["fwd.c1_recv"] == 0 and two_b["fwd.c1_recv"] > 0
         assert not any(k.endswith("ring_out") or k.endswith("ring_in") for k in one)
         assert (
@@ -2476,6 +2701,51 @@ def test_workspace_layout_counts_one_staging_plane_under_save_transfer() -> None
             == 0
         )
     assert seen_segmented  # the row has a segmented rank: the plane term was exercised
+    # save_mode="full" without save_transfer at a forced P = 2, against the pools the call sizes: the forward binds a
+    # fresh M_seg^T plane and the backward the saved one for stage_m, so both lifetimes size stage_b alone.  The
+    # context's own plan is P = 2 (the layout's staging term reads the plan's NSEG).
+    kcp = _package("cake_kcp")
+    cu2 = [0, 2000, 4096]
+    part2 = gp.partition_det_kcp(torch.tensor(cu2, dtype=torch.int64), 1, "contiguous")
+    ctx2 = gp.build_context_det_kcp(
+        part2, None, 0, CPU, 4, sm_count=16, p_rule="wave_fill1"
+    )
+    assert ctx2.heads(HV).P == 2
+    plane2 = ctx2.heads(HV).NSEG * HV * gp.STATE_TILE_BYTES
+    ops = _inputs(cu2, H_qk, HV)
+    held: dict[str, dict[str, int]] = {"fwd": {}, "bwd": {}}
+    phase = ["fwd"]
+
+    class Recording(kcp.FakeBackend):
+        def run(self, name, args):
+            pools = args["_call"].ws.pool_bytes
+            for pool in ("stage_b", "stage_m"):
+                if pool in pools:
+                    got = held[phase[0]]
+                    got[pool] = max(got.get(pool, 0), pools[pool])
+            super().run(name, args)
+
+    opts = dict(backend="fake", segments=2, save_mode="full", save_transfer=False)
+    args = (ops["q"], ops["k"], ops["v"], ops["g"], ops["beta"], ctx2)
+    previous = kcp._BACKENDS.get("fake")
+    kcp._BACKENDS["fake"] = Recording()
+    try:
+        _, saved = kcp.chunk_gdn_det_fwd_kcp(*args, **opts)
+        phase[0] = "bwd"
+        kcp.chunk_gdn_det_bwd_kcp(*args, ops["dout"], saved=saved, **opts)
+    finally:
+        if previous is None:
+            kcp._BACKENDS.pop("fake", None)
+        else:
+            kcp._BACKENDS["fake"] = previous
+    assert kcp.LAST_CALL["fwd"]["P"] == kcp.LAST_CALL["bwd"]["P"] == 2
+    assert saved is not None and saved.M_seg is not None
+    assert saved.M_seg.numel() * saved.M_seg.element_size() == plane2
+    assert held["fwd"] == held["bwd"] == {"stage_b": plane2}, held
+    full2 = gb.gdn_det_workspace_layout_kcp(
+        ctx2, H_qk=H_qk, HV=HV, save_mode="full", save_transfer=False, P=2
+    )
+    assert full2["fwd.staging"] == full2["bwd.staging"] == plane2
 
 
 def test_backward_allocates_the_gradients_right_before_dqkg() -> None:
@@ -3030,15 +3300,23 @@ def _frame_delta(kcp, skipped: int, launched: int) -> dict[str, int]:
     return {"skipped": 0, "launched": 0}
 
 
-def _dead_decision(kcp) -> str:
-    """What a recompute whose output is dead records on this build: ``skipped`` on a verified torch, else ``launched``."""
+def _auto_hand_off(kcp) -> bool:
+    """Whether the shipped ``reuse_recompute_tapes="auto"`` hands the recompute's tapes to the backward when the node
+    closes the segment: the frame proof is read on a verified torch only; elsewhere every recompute takes the replay
+    form (no hand-off, no kept entry)."""
+    return _verified_torch(kcp)
+
+
+def _dead_decision(kcp, hand_off: bool = True) -> str:
+    """What a recompute whose output is dead records on this build: ``skipped`` on a verified torch; elsewhere the
+    recompute launches #5, with or without the hand-off (``hand_off``), so ``launched``."""
     return "skipped" if _verified_torch(kcp) else "launched"
 
 
-def _fwd_o_after_recompute(kcp) -> list[bool]:
+def _fwd_o_after_recompute(kcp, hand_off: bool = True) -> list[bool]:
     """``fwd_o`` hand-off flags of one original forward and one recompute whose output is dead: the original's only on
-    a verified torch, the recompute's too elsewhere."""
-    return [False] if _verified_torch(kcp) else [False, True]
+    a verified torch, the recompute's too elsewhere (``hand_off``: whether that recompute hands its tapes off)."""
+    return [False] if _verified_torch(kcp) else [False, hand_off]
 
 
 def _skip_delta(kcp, before: dict[str, int]) -> dict[str, int]:
@@ -3059,11 +3337,14 @@ def test_recompute_output_skipped_once_when_the_node_closes_the_segment() -> Non
     skip does not rest on the kept tapes (the replay form skips too).  A later op of the segment that saves nothing
     (``.sum()``) keeps the skip: torch's early stop ends the recompute right after this node's tensors are re-saved,
     before that op runs.  On a torch build outside the verified set every recompute launches #5 instead (reason
-    ``torch_version``, counters untouched) and the same bitwise equalities hold."""
+    ``torch_version``, counters untouched): the shipped ``reuse_recompute_tapes="auto"`` takes the replay form
+    there, so the recompute hands nothing off, puts no kept entry and launches #5 as a plain forward; the same
+    bitwise equalities hold."""
     kcp, ctx, ops = _ckpt_setup()
     from torch.utils.checkpoint import checkpoint
 
-    fwd_o, decision = _fwd_o_after_recompute(kcp), _dead_decision(kcp)
+    hand = _auto_hand_off(kcp)
+    fwd_o, decision = _fwd_o_after_recompute(kcp, hand), _dead_decision(kcp, hand)
     reason, delta = _frame_reason(kcp, "dead"), _frame_delta(kcp, 1, 0)
 
     direct = _ckpt_autograd(kcp, ctx, ops, ckpt=False, segments=2)
@@ -3087,23 +3368,23 @@ def test_recompute_output_skipped_once_when_the_node_closes_the_segment() -> Non
         always = _ckpt_autograd(
             kcp, ctx, ops, ckpt=True, segments=2, recompute_output="always"
         )
-        assert _launches(seen, "fwd_prep") == [False, True]
-        assert _launches(seen, "fwd_o") == [False, True]
+        assert _launches(seen, "fwd_prep") == [False, hand]
+        assert _launches(seen, "fwd_o") == [False, hand]
         assert kcp.LAST_CALL["fwd"]["fwd_o"] == "launched"
         assert kcp.LAST_CALL["fwd"]["fwd_o_reason"] == "always"
         seen.clear()
         before, kept_before = dict(kcp.RECOMPUTE_OUTPUT_STATS), dict(kcp.KEPT_STATS)
         auto = _ckpt_autograd(kcp, ctx, ops, ckpt=True, segments=2)
-        assert _launches(seen, "fwd_prep") == [False, True]
+        assert _launches(seen, "fwd_prep") == [False, hand]
         assert _launches(seen, "fwd_o") == fwd_o
         assert kcp.LAST_CALL["fwd"]["fwd_o"] == decision
         assert kcp.LAST_CALL["fwd"]["fwd_o_reason"] == reason
         assert _skip_delta(kcp, before) == delta
         assert _stats_delta(kcp, kept_before) == {
-            "put": 1,
-            "take": 1,
+            "put": int(hand),
+            "take": int(hand),
             "miss": 0,
-            "released": 1,
+            "released": int(hand),
             "callback": 0,
             "evicted": 0,
         }
@@ -3137,6 +3418,7 @@ def test_recompute_output_skipped_once_when_the_node_closes_the_segment() -> Non
 # The recompute_output tests below pin reuse_recompute_tapes=True: they check the output program's gate under the
 # kept-tape form (the recompute launches #1 and hands the tapes off); the shipped default "auto" takes the replay form
 # in several of these scenarios (a later saver, a failed frame proof), which the reuse_recompute_tapes tests cover.
+# The untaken-node test runs the default "auto" (its hand-off holds on a verified torch only: _auto_hand_off).
 def test_recompute_output_launched_when_a_later_op_of_the_segment_saves_the_output() -> (
     None
 ):
@@ -3245,10 +3527,13 @@ def test_recompute_output_with_an_untaken_node_and_a_second_backward() -> None:
     """(a) The segment is recomputed for another saved tensor while the GDN node itself is not in the backward: the
     node is still the segment's last saver, so #5 is left out, and the kept-tape accounting is the shipped one (the
     untaken entry goes at the task's end).  (b) ``retain_graph`` and a second ``.backward()``: two recomputes, two
-    skips, two kept entries put and taken, gradients exactly twice the direct ones."""
+    skips, two kept entries put and taken, gradients exactly twice the direct ones.  Both parts run the shipped
+    ``reuse_recompute_tapes="auto"``: on a torch build outside the verified set it takes the replay form (no kept
+    entry is put, taken or dropped), the recompute launches #5 as a plain forward and the counters stay."""
     kcp, ctx, ops = _ckpt_setup()
     from torch.utils.checkpoint import checkpoint
 
+    hand = int(_auto_hand_off(kcp))  # kept entries per recompute
     leaves = _ckpt_leaves(ops)
     a = torch.randn(3, requires_grad=True)
 
@@ -3261,14 +3546,14 @@ def test_recompute_output_with_an_untaken_node_and_a_second_backward() -> None:
     before, kept_before = dict(kcp.RECOMPUTE_OUTPUT_STATS), dict(kcp.KEPT_STATS)
     b.sum().backward()
     assert a.grad is not None and all(lf.grad is None for lf in leaves)
-    assert kcp.LAST_CALL["fwd"]["fwd_o"] == _dead_decision(kcp)
+    assert kcp.LAST_CALL["fwd"]["fwd_o"] == _dead_decision(kcp, bool(hand))
     assert _skip_delta(kcp, before) == _frame_delta(kcp, 1, 0)
     assert _stats_delta(kcp, kept_before) == {
-        "put": 1,
+        "put": hand,
         "take": 0,
         "miss": 0,
         "released": 0,
-        "callback": 1,
+        "callback": hand,
         "evicted": 0,
     }
     assert kcp.kept_registry_size() == 0
@@ -3280,10 +3565,10 @@ def test_recompute_output_with_an_untaken_node_and_a_second_backward() -> None:
         assert torch.equal(twice[n], direct[n] + direct[n]), n
     assert _skip_delta(kcp, before) == _frame_delta(kcp, 2, 0)
     assert _stats_delta(kcp, kept_before) == {
-        "put": 2,
-        "take": 2,
+        "put": 2 * hand,
+        "take": 2 * hand,
         "miss": 0,
-        "released": 2,
+        "released": 2 * hand,
         "callback": 0,
         "evicted": 0,
     }
@@ -4056,17 +4341,34 @@ def _handle_autograd(
     }, modes
 
 
-@pytest.mark.parametrize("segments", [1, 2])
+@pytest.mark.parametrize(
+    "segments,save_mode", [(1, "light"), (2, "light"), (2, "full")]
+)
 @pytest.mark.parametrize("reuse", [True, False, "auto"])
 def test_recompute_handle_is_bitwise_the_checkpoint_and_the_direct_pass(
-    segments, reuse
+    monkeypatch, segments, save_mode, reuse
 ) -> None:
     """The original forward stores ``S_in`` ("capture"), torch's recompute reads it ("replay"): out and the five
     gradients are bitwise the plain checkpoint's and the direct pass's at the same options, at ``P = 1`` and
-    ``P = 2`` (the carries rebuilt locally), with and without the kept tapes."""
+    ``P = 2`` (the carries rebuilt locally), with and without the kept tapes.  ``save_mode="full"`` at ``P = 2``
+    (its backward runs no transfer walk and reads the saved ``M_seg^T`` plane) runs with every package allocation
+    filled with NaN bytes and gives the light direct pass's bits."""
     kcp, ctx, ops = _ckpt_setup()
-    base = dict(segments=segments, reuse_recompute_tapes=reuse)
+    if save_mode == "full":
+        _nan_filled_allocations(monkeypatch, kcp)
+    base = dict(segments=segments, reuse_recompute_tapes=reuse, save_mode=save_mode)
     direct = _ckpt_autograd(kcp, ctx, ops, ckpt=False, save_transfer=False, **base)
+    if save_mode == "full":
+        light = _ckpt_autograd(
+            kcp,
+            ctx,
+            ops,
+            ckpt=False,
+            save_transfer=False,
+            segments=segments,
+            reuse_recompute_tapes=reuse,
+        )
+        _assert_same(direct, light, "full direct vs light direct")
     plain, plain_modes = _handle_autograd(kcp, ctx, ops, handle=None, **base)
     handle = kcp.RecomputeHandleDetKcp()
     got, modes = _handle_autograd(kcp, ctx, ops, handle=handle, **base)

@@ -198,7 +198,7 @@ kernel_cake_lm_head_loss_41fae70f1613629d1b77(const __grid_constant__ CUtensorMa
     unsigned int cluster_size;
     asm volatile("mov.u32 %0, %%cluster_nctarank;" : "=r"(cluster_size));
 
-    // Kernel setup ops
+    // Prologue
     __nv_bfloat16* ring_k = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
     const int ring_k_addr = smem + 1024;
     __nv_bfloat16* ring_mn = reinterpret_cast<__nv_bfloat16*>(smem_raw + 17408);
@@ -207,6 +207,8 @@ kernel_cake_lm_head_loss_41fae70f1613629d1b77(const __grid_constant__ CUtensorMa
     const int smem_epi_addr = smem + 197632;
     unsigned int* clc_resp = reinterpret_cast<unsigned int*>(smem_raw + 230400);
     const int clc_resp_addr = smem + 230400;
+
+    // Kernel setup ops
     if (tid == 0) {
         #pragma unroll
         for (int st = 0; st < 6; st++) {
@@ -218,8 +220,7 @@ kernel_cake_lm_head_loss_41fae70f1613629d1b77(const __grid_constant__ CUtensorMa
         }
     }
 
-    // Mbarrier init (8 pipeline groups, 0 ordered-sequence groups, 24 barriers)
-    // Mbarriers at smem_raw[0..192)
+    // Mbarrier init (24 barriers at smem_raw[0..192))
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -273,10 +274,8 @@ kernel_cake_lm_head_loss_41fae70f1613629d1b77(const __grid_constant__ CUtensorMa
     __syncthreads();
     asm volatile("tcgen05.fence::after_thread_sync;" ::: "memory");
 
-    const int taddr = tmem_addr_storage[0];
-
-    // Kernel post-init ops
-    const int tmem_accum = taddr;
+    const unsigned int taddr = tmem_addr_storage[0];
+    const unsigned int tmem_accum = taddr;
 
     // ---- Role: load ----
     if (warp == 0) {
@@ -441,8 +440,13 @@ kernel_cake_lm_head_loss_41fae70f1613629d1b77(const __grid_constant__ CUtensorMa
                         mbarrier_wait(tma_full_addr + (mma_tma_stage) * 8, _phase_tma_full);
                         asm volatile("tcgen05.fence::after_thread_sync;");
                         int init_flag = ((mm_k == 0) ? 1 : 0);
+#if __CUDA_ARCH__ == 1070
+                        int mm_a_lo = (((ring_k_addr) >> 4) & 0x7FFF) + (mma_tma_stage) * 2048;
+                        int mm_b_lo = ((((ring_mn_addr) >> 4) & 0x7FFF) | 0x2000000) + (mma_tma_stage) * 2048;
+#else
                         int mm_a_lo = (((ring_k_addr) >> 4) & 0x3FFF) + (mma_tma_stage) * 2048;
                         int mm_b_lo = ((((ring_mn_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 2048;
+#endif
                         asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"

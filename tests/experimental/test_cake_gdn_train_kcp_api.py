@@ -20,7 +20,8 @@ the other route; no context, partition or options field holds the mode), the nam
 the twin's objects; this package copies none of them and no public name carries a mode), the package hygiene rules
 (no environment variable, no ``cake_kda_train`` import, standalone: no import of another FlashInfer package, its twin
 included, and no library name of the twin) and the host tables built on the CPU for the correctness rows'
-partitions.  No kernel runs here: the compute entries run on the fake backend (the CPU emulation).
+partitions.  No kernel runs here: the compute entries run on the fake backend (the CPU emulation), directly or
+through ``KernelBackend`` with a stub launch glue (the architecture the kernel backend passes to the #7 walks).
 """
 
 from __future__ import annotations
@@ -1720,16 +1721,30 @@ def test_program_args_are_the_registry_logical_names() -> None:
         jit.select_record("kcp_transfer_walk", transfer_walk="bf16x3")
 
 
-def test_fwdh_form_rule_follows_the_l8a_decision() -> None:
-    """#2 runs the vh = 64 form when ``n_walk * HV <= sm_count``, else vh = 128; the test knob
-    ``fwdh_vh`` forces a form (the two forms are within the same accuracy budget; the fake-backend suite checks it)."""
+def test_fwdh_form_rule_follows_the_chain_clause() -> None:
+    """#2 runs the vh = 64 form when ``n_walk * HV <= sm_count`` or when the launch's two-CTA grid finishes within
+    its longest chain (``walk_vh64_fits``: LPT of ``2 * HV`` CTAs per segment over ``2 * sm_count`` slots), else
+    vh = 128; the test knob ``fwdh_vh`` forces a form (the two forms are within the same accuracy budget; the
+    fake-backend suite checks it)."""
     kcp = _mod("cake_kcp")
     assert kcp.FWDH_PROGRAMS == ("kcp_fwdh_offset", "kcp_fwdh_tape", "kcp_fwdh_out")
     assert kcp.fwdh_vh(3, 48, 152) == 64  # 144 head-CTAs <= 152 SMs (GB300)
-    assert kcp.fwdh_vh(4, 48, 152) == 128  # 192 > 152
+    assert kcp.fwdh_vh(4, 48, 152) == 128  # 192 > 152, no chain clause
+    assert kcp.fwdh_vh(4, 48, 152, fits=True) == 64
     assert kcp.fwdh_vh(1, 48, 148) == 64
     assert kcp.fwdh_vh(6, 48, 152, forced=64) == 64
-    assert kcp.fwdh_vh(1, 48, 152, forced=128) == 128
+    assert kcp.fwdh_vh(1, 48, 152, forced=128, fits=True) == 128
+    # four segments of 1536 / 1024 / 896 / 640 chunks at HV 48 (the K3E CP1 rank): 384 two-CTA items on 296 slots
+    # (148 SMs) end at 1536 = the longest chain; on 128 slots they do not; one balanced segment kind fits only
+    # while its items fill one round
+    k3e = ((1536, 1), (1024, 1), (896, 1), (640, 1))
+    assert kcp.walk_vh64_fits(k3e, 48, 148)
+    assert not kcp.walk_vh64_fits(k3e, 48, 64)
+    assert kcp.walk_vh64_fits(((100, 3),), 48, 148)  # 288 items <= 296 slots
+    # 384 items: a second round of 100
+    assert not kcp.walk_vh64_fits(((100, 4),), 48, 148)
+    assert not kcp.walk_vh64_fits((), 48, 148)
+    assert not kcp.walk_vh64_fits(k3e, 48, 0)
     assert kcp.VH64_SUFFIX == "_vh64"
     try:
         jit = _mod("cake_jit")
@@ -1743,6 +1758,119 @@ def test_fwdh_form_rule_follows_the_l8a_decision() -> None:
             assert jit.launch_grid(
                 prog + kcp.VH64_SUFFIX, n_walk=3, num_heads=48, ctas_per_head=2
             ) == (288, 1, 1)
+
+
+def test_forward_walk_form_follows_the_plan_chains() -> None:
+    """Plan test of the #2 chain clause: one contiguous rank of four documents of 24 / 16 / 14 / 10 chunks at HV 6,
+    one segment per document.  ``n_walk * HV = 24`` exceeds both SM counts below, so the one-wave clause alone takes
+    vh = 128; at 20 SMs the 48 two-CTA items on 40 slots end at the longest chain (LPT makespan 24), so the forward's
+    tape / output walk launches the ``_vh64`` record; at 12 SMs (makespan 34) it stays vh = 128.  The fake backend
+    runs the forward the plan launches (the record list of ``LAST_CALL``)."""
+    kcp, plan = _mod("cake_kcp"), _mod("cake_kcp_plan")
+    cu = _cu((24 * 64, 16 * 64, 14 * 64, 10 * 64))
+    ops = _mode_ops(cu, (2, 6))
+    args = [ops[n] for n in ("q", "k", "v", "g", "beta")]
+    for sm, want in ((20, True), (12, False)):
+        ctx = plan.build_context_kcp(
+            plan.partition_kcp(cu, 1, "contiguous"), None, 0, "cpu", sm_count=sm
+        )
+        tb = kcp._Tables(ctx, 6, P=1)
+        assert len(tb.walk_live) == 4 and tb.walk_fits(tb.walk_live, sm) is want
+        assert kcp.fwdh_vh(4, 6, sm) == 128
+        kcp.chunk_gdn_fwd_kcp(
+            *args, ctx, backend="fake", deterministic=False, segments=1
+        )
+        walks = [
+            r
+            for r, _ in kcp.LAST_CALL["fwd"]["records"]
+            if r.startswith(("kcp_fwdh_tape", "kcp_fwdh_out"))
+        ]
+        assert walks and all(r.endswith(kcp.VH64_SUFFIX) is want for r in walks), (
+            sm,
+            walks,
+        )
+
+
+@pytest.mark.parametrize(("sm", "want"), [(20, True), (12, False)])
+def test_walk_forms_agree_across_forward_recompute_and_handle(
+    monkeypatch, sm, want
+) -> None:
+    """The width rules read host plan integers only, so the forward, torch's checkpoint recompute and the recompute
+    from a :class:`RecomputeHandleKcp` launch the same form of every #2 and #7 walk program.  The rank of
+    :func:`test_forward_walk_form_follows_the_plan_chains` (HV 6, one segment per document): at 20 SMs the chain
+    clause takes the ``_vh64`` record of the forward walks, at 12 SMs vh = 128; the fake backend has no
+    architecture, so #7 takes vh = 64 (the #7 forms per architecture across the three paths:
+    :func:`test_dhu_forms_agree_across_forward_recompute_and_handle_on_each_architecture`).  Each path logs the
+    records of every recorded call (``_record``)."""
+    kcp, plan = _mod("cake_kcp"), _mod("cake_kcp_plan")
+    cu = _cu((24 * 64, 16 * 64, 14 * 64, 10 * 64))
+    ops = _mode_ops(cu, (2, 6))
+    ctx = plan.build_context_kcp(
+        plan.partition_kcp(cu, 1, "contiguous"), None, 0, "cpu", sm_count=sm
+    )
+    log: list = []
+    record = kcp._record
+
+    def recording(kind, call):
+        record(kind, call)
+        log.append((kind, [r for r, _ in kcp.LAST_CALL[kind]["records"]]))
+
+    monkeypatch.setattr(kcp, "_record", recording)
+
+    def run(ckpt: bool, handle: bool) -> dict:
+        del log[:]
+        leaves = [
+            ops[n].detach().clone().requires_grad_(True)
+            for n in ("q", "k", "v", "g", "beta")
+        ]
+        hd = kcp.RecomputeHandleKcp() if handle else None
+
+        def fn(q, k, v, g, beta, h):
+            return kcp.chunk_gdn_kcp(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                ctx,
+                recompute_handle=h,
+                backend="fake",
+                segments=1,
+                deterministic=False,
+            )
+
+        if ckpt:
+            from torch.utils.checkpoint import checkpoint
+
+            out = checkpoint(fn, *leaves, hd, use_reentrant=False)
+        else:
+            out = fn(*leaves, hd)
+        out.backward(ops["dout"])
+        forms: dict = {}
+        for _kind, records in log:
+            for r in records:
+                base = r.removesuffix(kcp.VH64_SUFFIX)
+                if base in kcp.FWDH_PROGRAMS + kcp.DHU_PROGRAMS:
+                    forms.setdefault(base, set()).add(r.endswith(kcp.VH64_SUFFIX))
+        return {"kinds": [k for k, _ in log], "forms": forms}
+
+    paths = {
+        "forward": run(False, False),
+        "recompute": run(True, False),
+        "handle": run(True, True),
+    }
+    for name in ("recompute", "handle"):
+        # a checkpointed path records the forward and torch's recompute of it
+        assert paths[name]["kinds"].count("fwd") == 2, (name, paths[name]["kinds"])
+    for name, p in paths.items():
+        forms = p["forms"]
+        fwdh = [b for b in forms if b in kcp.FWDH_PROGRAMS]
+        dhu = [b for b in forms if b in kcp.DHU_PROGRAMS]
+        assert fwdh and dhu, (name, forms)
+        assert all(forms[b] == {want} for b in fwdh), (name, sm, forms)
+        assert all(forms[b] == {True} for b in dhu), (name, forms)
+    assert paths["recompute"]["forms"] == paths["forward"]["forms"]
+    assert paths["handle"]["forms"] == paths["forward"]["forms"]
 
 
 def test_tape_shapes_follow_the_frozen_set() -> None:
@@ -2114,23 +2242,29 @@ def test_graph_entry_key_ignores_the_arena_and_the_capture_pins_its_signature() 
     assert kcp.graph_cache_clear() == 3
 
 
-def test_dhu_form_rule_follows_the_two_wave_recommendation() -> None:
-    """#7 runs the vh = 64 two-CTA form when its grid ``n_walk * HV * 2`` fits two waves at two CTAs per SM
-    (``<= 4 * sm_count``), else vh = 128; the test knob ``dhu_vh`` forces a form (both forms within the same accuracy budget).
-    ``resolve_launch`` names the record the registry provides: the ``_vh64`` record where the registry ships it,
-    the full-head record with the grid ``n_walk * HV`` where it does not (no error either way)."""
+def test_dhu_form_rule_follows_the_architecture_recommendation() -> None:
+    """#7 runs the vh = 64 two-CTA form for the offset walk always and for the tape walk on ``sm_100a`` / ``sm_103a``
+    always (``arch`` ``None``, the fake backend, counts as one of them); on ``sm_107a`` the tape walk runs vh = 64 when
+    its grid ``n_walk * HV * 2`` fits two waves at two CTAs per SM (``<= 4 * sm_count``), else vh = 128; the test
+    knob ``dhu_vh`` forces a form (both forms within the same accuracy budget).  ``resolve_launch`` names the record
+    the registry provides: the ``_vh64`` record where the registry ships it, the full-head record with the grid
+    ``n_walk * HV`` where it does not (no error either way)."""
     kcp = _mod("cake_kcp")
     assert kcp.DHU_PROGRAMS == ("kcp_dhu_offset", "kcp_dhu_tape")
+    assert kcp.DHU_TAPE_VH64_ARCHES == ("sm_100a", "sm_103a")
+    for arch in (None, "sm_100a", "sm_103a"):
+        assert kcp.dhu_vh(96, 48, 152, arch=arch) == 64
+        assert kcp.dhu_vh(96, 48, 152, tape=False, arch=arch) == 64
+    r = "sm_107a"
+    # the offset walk: vh 64 everywhere
+    assert kcp.dhu_vh(96, 48, 212, tape=False, arch=r) == 64
     assert (
-        kcp.dhu_vh(8, 38, 152) == 64
+        kcp.dhu_vh(8, 38, 152, arch=r) == 64
     )  # 8 * 38 * 2 = 608 == 4 * 152: the boundary is vh 64
-    assert kcp.dhu_vh(8, 38, 151) == 128  # 608 > 604
-    assert (
-        kcp.dhu_vh(6, 48, 152) == 64
-    )  # 576 CTAs: two waves at two CTAs per SM (GB300)
-    assert kcp.dhu_vh(7, 48, 152) == 128  # 672 > 608
-    assert kcp.dhu_vh(1, 48, 148) == 64
-    assert kcp.dhu_vh(9, 48, 152, forced=64) == 64
+    assert kcp.dhu_vh(8, 38, 151, arch=r) == 128  # 608 > 604
+    assert kcp.dhu_vh(8, 48, 212, arch=r) == 64  # 768 <= 848
+    assert kcp.dhu_vh(9, 48, 212, arch=r) == 128  # 864 > 848
+    assert kcp.dhu_vh(9, 48, 212, forced=64, arch=r) == 64
     assert kcp.dhu_vh(1, 48, 152, forced=128) == 128
     try:
         jit = _mod("cake_jit")
@@ -2141,16 +2275,28 @@ def test_dhu_form_rule_follows_the_two_wave_recommendation() -> None:
         assert (
             jit.select_record(prog) == prog
         )  # the default selection stays the full-head record
-        for forced, n_walk in ((None, 3), (64, 9), (128, 3), (None, 7)):
+        for forced, n_walk, arch in (
+            (None, 3, None),
+            (64, 9, "sm_107a"),
+            (128, 3, None),
+            (None, 7, None),
+            (None, 7, "sm_107a"),
+        ):
             args = {
                 "_grid_args": {"n_walk": n_walk, "num_heads": 48},
                 "_sm_count": 152,
                 "_dhu_vh": forced,
+                "_arch": arch,
                 "_grid": n_walk * 48,
             }
             record, values, grid, is_test = kcp.resolve_launch(prog, dict(args))
             assert values == {} and not is_test
-            if kcp.dhu_vh(n_walk, 48, 152, forced) == 64 and ships_vh64:
+            vh = kcp.dhu_vh(
+                n_walk, 48, 152, forced, tape=prog == "kcp_dhu_tape", arch=arch
+            )
+            if (prog, n_walk, arch) == ("kcp_dhu_tape", 7, "sm_107a"):
+                assert vh == 128  # 672 > 608: the sm_107a two-wave rule
+            if vh == 64 and ships_vh64:
                 assert record == prog + kcp.VH64_SUFFIX, (prog, forced, n_walk)
                 assert grid == (n_walk * 48 * 2, 1, 1)
                 assert jit.launch_grid(record, n_walk=n_walk, num_heads=48) == grid
@@ -2164,6 +2310,363 @@ def test_dhu_form_rule_follows_the_two_wave_recommendation() -> None:
         for prog in kcp.DHU_PROGRAMS:
             assert jit.select_record(prog, ctas_per_head=2) == prog + kcp.VH64_SUFFIX
             assert jit.MODULES[prog + kcp.VH64_SUFFIX]["program"] == prog
+
+
+def test_dhu_long_chain_walk_takes_the_two_wave_rule_on_sm_100a() -> None:
+    """On ``sm_100a`` (:data:`DHU_LONG_CHAIN_ARCHES`) a #7 walk whose longest segment has at least
+    ``DHU_LONG_CHAIN_MIN_CHUNKS`` = 400 chunks and whose two-CTA grid ends later than its one-CTA grid (LPT over
+    ``2 * sm_count`` slots: :func:`walk_dhu_long_chain`) takes the two-wave rule (vh = 64 iff ``2 * n_walk * HV <= 4 *
+    sm_count``) for the offset and the tape walk.  ``sm_103a``, ``sm_107a`` and the fake backend (``arch`` ``None``)
+    keep their rules for the same walk."""
+    kcp = _mod("cake_kcp")
+    assert kcp.DHU_LONG_CHAIN_ARCHES == ("sm_100a",)
+    assert kcp.DHU_LONG_CHAIN_MIN_CHUNKS == 400
+    # one segment of L0 chunks and five of 140 at HV 48 on 148 SMs (296 slots): the one-CTA grid ends at L0 (48 long
+    # CTAs, 240 short ones one per slot); the two-CTA grid puts 480 short CTAs on the 200 other slots, three deep on
+    # 80 of them: 420 > L0 for L0 = 399 / 400, so only the 400-chunk segment reaches the clause
+    assert kcp.walk_dhu_long_chain(((400, 1), (140, 5)), 48, 148)
+    assert not kcp.walk_dhu_long_chain(((399, 1), (140, 5)), 48, 148)
+    # a long segment whose two-CTA grid still ends at it (three short CTAs deep = 300 < 500): not a long-chain walk
+    assert not kcp.walk_dhu_long_chain(((500, 1), (100, 5)), 48, 148)
+    assert not kcp.walk_dhu_long_chain((), 48, 148)
+    assert not kcp.walk_dhu_long_chain(((400, 1), (140, 5)), 48, 0)
+    # the twelve-segment #7 walk of a P1-shaped CP2 rank on 148 SMs: one-CTA LPT 536, two-CTA LPT 640
+    p1 = (
+        (536, 1),
+        (451, 1),
+        (147, 1),
+        (138, 1),
+        (126, 2),
+        (96, 1),
+        (90, 1),
+        (61, 1),
+        (59, 1),
+        (44, 1),
+        (43, 1),
+    )
+    assert kcp.walk_dhu_long_chain(p1, 48, 148)
+    for tape in (True, False):
+        # sm_100a: 2 * 12 * 48 = 1152 > 4 * 148 -> vh 128 for both forms; without the clause both are vh 64
+        assert (
+            kcp.dhu_vh(12, 48, 148, tape=tape, arch="sm_100a", long_chain=True) == 128
+        )
+        assert kcp.dhu_vh(12, 48, 148, tape=tape, arch="sm_100a") == 64
+        # the two-wave rule still takes vh 64 where the grid fits: 2 * 6 * 48 = 576 <= 592
+        assert kcp.dhu_vh(6, 48, 148, tape=tape, arch="sm_100a", long_chain=True) == 64
+        # forced knob wins
+        assert (
+            kcp.dhu_vh(12, 48, 148, 64, tape=tape, arch="sm_100a", long_chain=True)
+            == 64
+        )
+        # not on sm_103a or the fake backend
+        for arch in ("sm_103a", None):
+            assert kcp.dhu_vh(12, 48, 152, tape=tape, arch=arch, long_chain=True) == 64
+    # sm_107a keeps its rules: the offset walk stays vh 64; the tape walk keeps the two-wave rule it already has
+    assert kcp.dhu_vh(12, 48, 208, tape=False, arch="sm_107a", long_chain=True) == 64
+    assert kcp.dhu_vh(8, 48, 212, arch="sm_107a", long_chain=True) == 64  # 768 <= 848
+    assert kcp.dhu_vh(9, 48, 212, arch="sm_107a", long_chain=True) == 128  # 864 > 848
+    # resolve_launch reads the clause flag and the launch cache key carries it
+    for prog in kcp.DHU_PROGRAMS:
+        base = {
+            "_grid_args": {"n_walk": 12, "num_heads": 48},
+            "_sm_count": 148,
+            "_dhu_vh": None,
+            "_arch": "sm_100a",
+            "_grid": 12 * 48,
+        }
+        long_args = {**base, "_dhu_long_chain": True}
+        record, _values, grid, _is_test = kcp.resolve_launch(prog, dict(long_args))
+        assert record == prog and grid == (12 * 48, 1, 1), (prog, record, grid)
+        assert kcp._launch_key(prog, long_args, 8) != kcp._launch_key(prog, base, 8)
+
+
+@pytest.mark.parametrize("longest", [24, 23])
+def test_dhu_long_chain_flag_follows_the_plan_chains(monkeypatch, longest) -> None:
+    """Plan test of the #7 long-chain flag (the 400-chunk threshold lowered to 24 so the rank stays small): one
+    contiguous rank of six documents of ``longest`` / 10 / 10 / 10 / 10 / 10 chunks at HV 6 on 18 SMs (36 slots),
+    one segment per document.  The one-CTA grid ends at the longest segment (6 long CTAs, 30 short ones one per
+    slot); the two-CTA grid puts 60 short CTAs on the 24 other slots, three deep on 12 of them (30 > ``longest``).
+    So ``_Tables.walk_long_chain`` holds for 24 and not for 23, and the backward's #7 launches carry that flag to
+    :func:`dhu_vh` (the fake backend has no architecture, so the forms themselves stay vh 64)."""
+    kcp, plan = _mod("cake_kcp"), _mod("cake_kcp_plan")
+    monkeypatch.setattr(kcp, "DHU_LONG_CHAIN_MIN_CHUNKS", 24)
+    cu = _cu((longest * 64,) + (10 * 64,) * 5)
+    ops = _mode_ops(cu, (2, 6))
+    ctx = plan.build_context_kcp(
+        plan.partition_kcp(cu, 1, "contiguous"), None, 0, "cpu", sm_count=18
+    )
+    tb = kcp._Tables(ctx, 6, P=1)
+    assert sorted(tb._walk_chains(tb.walk_live)) == [(10, 5), (longest, 1)]
+    assert tb.walk_long_chain(tb.walk_live, 18) is (longest == 24)
+    seen: list = []
+    real = kcp.dhu_vh
+
+    def recording(*args, **kw):
+        seen.append(kw.get("long_chain"))
+        return real(*args, **kw)
+
+    monkeypatch.setattr(kcp, "dhu_vh", recording)
+    leaves = [
+        ops[n].detach().clone().requires_grad_(True)
+        for n in ("q", "k", "v", "g", "beta")
+    ]
+    out = kcp.chunk_gdn_kcp(
+        *leaves, ctx, backend="fake", segments=1, deterministic=False
+    )
+    out.backward(ops["dout"])
+    assert seen and all(isinstance(x, bool) for x in seen)
+    assert any(seen) is (longest == 24), seen
+
+
+# ----------------------------------------------------------------------------------------------------------------
+# the architecture the kernel backend passes to the #7 walks (KernelBackend.run on a stub launch glue, no kernel)
+
+# One contiguous rank of six documents of 8 / 4 / 4 / 4 / 4 / 4 chunks at HV 6 on 18 SMs (36 slots), run with
+# ``segments=2``: twelve segments, two of 4 chunks and ten of 2.  The #7 walks of this rank visit all twelve, so
+# their two-wave rule takes vh = 128 (2 * 12 * 6 = 144 > 4 * 18); with ``DHU_LONG_CHAIN_MIN_CHUNKS`` lowered to 4
+# they are long-chain walks (LPT over the 36 slots: the one-CTA grid ends at 6, the two-CTA grid at 10).
+ARCH_CHUNKS = (8, 4, 4, 4, 4, 4)
+ARCH_HEADS = (2, 6)
+ARCH_SM = 18
+ARCH_LONG_CHAIN_MIN = 4
+
+
+class _ArchGlue:
+    """A stub launch glue of :class:`KernelBackend` (its ``launcher``): ``device_arch`` answers ``arch`` for every
+    device index; ``run_module`` logs each launch's ``(record, grid)`` and runs the record on the fake backend's
+    emulation (the same logical arguments), so a real plan runs through ``KernelBackend.run`` on the CPU."""
+
+    def __init__(self, arch: str) -> None:
+        self.arch = arch
+        self.launches: list[tuple[str, tuple[int, ...]]] = []
+        self._fake = _mod("cake_fake_backend")
+
+    def device_arch(self, device_index: int) -> str:
+        return self.arch
+
+    def run_module(self, record, values, *, grid, device_index, module=None) -> None:
+        self.launches.append((str(record), tuple(int(x) for x in grid)))
+        self._fake.run_module(record, values, grid=grid, device_index=None)
+
+
+def _arch_backend(monkeypatch, arch: str) -> tuple[_ArchGlue, list]:
+    """Install ``KernelBackend(launcher=_ArchGlue(arch))`` as the ``"kernels"`` backend for one test and log, in
+    launch order (one entry per ``run_module`` call), the program and the ``_arch`` / ``_dhu_long_chain`` /
+    ``_grid_args`` that ``KernelBackend.run`` resolves each launch with.  A CPU context has no device index, so
+    ``torch.cuda.current_device`` answers 0 (the glue ignores the index)."""
+    kcp = _mod("cake_kcp")
+    glue = _ArchGlue(arch)
+    monkeypatch.setitem(kcp._BACKENDS, "kernels", kcp.KernelBackend(launcher=glue))
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    resolved: list = []
+    real = kcp._resolve_cached
+
+    def resolving(name, args, **kw):
+        resolved.append(
+            (
+                name,
+                args.get("_arch"),
+                args.get("_dhu_long_chain"),
+                dict(args.get("_grid_args") or {}),
+            )
+        )
+        return real(name, args, **kw)
+
+    monkeypatch.setattr(kcp, "_resolve_cached", resolving)
+    return glue, resolved
+
+
+def _dhu_launches(glue: _ArchGlue, resolved: list) -> list[dict]:
+    """The #7 launches of a run in launch order: program, record, grid and the scalars ``KernelBackend.run``
+    resolved them with (``_arch``, ``_dhu_long_chain``, ``n_walk``)."""
+    kcp = _mod("cake_kcp")
+    assert len(glue.launches) == len(resolved) > 0
+    return [
+        {
+            "program": name,
+            "record": record,
+            "grid": grid,
+            "arch": arch,
+            "long_chain": long_chain,
+            "n_walk": int(grid_args["n_walk"]),
+        }
+        for (record, grid), (name, arch, long_chain, grid_args) in zip(
+            glue.launches, resolved, strict=True
+        )
+        if name in kcp.DHU_PROGRAMS
+    ]
+
+
+def _dhu_rule_vh(
+    arch: str, tape: bool, n_walk: int, num_heads: int, sm_count: int, long_chain: bool
+) -> int:
+    """The #7 form of one launch as the rule text states it (restated here, not read from :func:`dhu_vh`): the
+    two-wave rule (vh = 64 iff ``2 * n_walk * HV <= 4 * sm_count``) for the tape walk on ``sm_107a`` and for a
+    long-chain walk of either form on ``sm_100a``; vh = 64 for every other launch."""
+    two_wave = 64 if 2 * n_walk * num_heads <= 4 * sm_count else 128
+    if (tape and arch == "sm_107a") or (long_chain and arch == "sm_100a"):
+        return two_wave
+    return 64
+
+
+def _arch_case(monkeypatch, long_chain: bool):
+    """The context and operands of the :data:`ARCH_CHUNKS` rank (``DHU_LONG_CHAIN_MIN_CHUNKS`` lowered to
+    :data:`ARCH_LONG_CHAIN_MIN` when ``long_chain``), after checking the plan's #7 chains."""
+    kcp, plan = _mod("cake_kcp"), _mod("cake_kcp_plan")
+    if long_chain:
+        monkeypatch.setattr(kcp, "DHU_LONG_CHAIN_MIN_CHUNKS", ARCH_LONG_CHAIN_MIN)
+    cu = _cu(tuple(n * 64 for n in ARCH_CHUNKS))
+    ctx = plan.build_context_kcp(
+        plan.partition_kcp(cu, 1, "contiguous"), None, 0, "cpu", sm_count=ARCH_SM
+    )
+    HV = ARCH_HEADS[1]
+    tb = kcp._Tables(ctx, HV, P=2)
+    assert sorted(tb._walk_chains(tb.walk_all)) == [(2, 10), (4, 2)]
+    assert tb.walk_long_chain(tb.walk_all, ARCH_SM) is long_chain
+    return ctx, _mode_ops(cu, ARCH_HEADS)
+
+
+@pytest.mark.parametrize("long_chain", [False, True])
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a"])
+def test_kernel_backend_passes_the_device_architecture_to_the_dhu_walks(
+    monkeypatch, arch, long_chain
+) -> None:
+    """``KernelBackend.run`` is the only producer of the ``_arch`` the #7 width rule reads (:func:`dhu_vh`; the fake
+    backend has none).  A real plan (the :data:`ARCH_CHUNKS` rank, forward and backward with ``segments=2``) runs
+    through it with a stub launch glue whose ``device_arch`` answers ``arch`` (:func:`_arch_backend`).  Every #7
+    launch receives that architecture, and its record is the form the rule text gives (:func:`_dhu_rule_vh`) on
+    the grid of that form.  On this plan: ``sm_100a`` and ``sm_103a`` launch vh = 64 everywhere; ``sm_107a`` keeps
+    the two-wave rule for the tape walk (vh = 128 here) and vh = 64 for the offset walk; with the long-chain
+    threshold lowered, ``sm_100a`` takes the two-wave rule (vh = 128) for the offset and the tape walk while
+    ``sm_103a`` stays vh = 64 and ``sm_107a`` keeps its forms.  The persistent launches receive the same
+    architecture in their grid arguments."""
+    kcp = _mod("cake_kcp")
+    ctx, ops = _arch_case(monkeypatch, long_chain)
+    glue, resolved = _arch_backend(monkeypatch, arch)
+    HV = ARCH_HEADS[1]
+    leaves = [
+        ops[n].detach().clone().requires_grad_(True)
+        for n in ("q", "k", "v", "g", "beta")
+    ]
+    out = kcp.chunk_gdn_kcp(
+        *leaves, ctx, backend="kernels", segments=2, deterministic=False
+    )
+    out.backward(ops["dout"])
+    launches = _dhu_launches(glue, resolved)
+    assert {x["program"] for x in launches} == set(kcp.DHU_PROGRAMS), launches
+    for x in launches:
+        tape = x["program"] == "kcp_dhu_tape"
+        vh = 64 if x["record"].endswith(kcp.VH64_SUFFIX) else 128
+        assert x["arch"] == arch, x
+        assert x["grid"] == (x["n_walk"] * HV * (2 if vh == 64 else 1), 1, 1), x
+        assert vh == _dhu_rule_vh(
+            arch, tape, x["n_walk"], HV, ARCH_SM, x["long_chain"]
+        ), (arch, x)
+    # the plan reaches every clause: each #7 program has launches whose two-wave rule is vh = 128, and a long-chain
+    # one among them exactly where the threshold is lowered
+    for prog in kcp.DHU_PROGRAMS:
+        wide = [
+            x
+            for x in launches
+            if x["program"] == prog and 2 * x["n_walk"] * HV > 4 * ARCH_SM
+        ]
+        assert wide and any(x["long_chain"] for x in wide) is long_chain, (
+            prog,
+            launches,
+        )
+    full = {x["program"] for x in launches if not x["record"].endswith(kcp.VH64_SUFFIX)}
+    want = {
+        "sm_100a": set(kcp.DHU_PROGRAMS) if long_chain else set(),
+        "sm_103a": set(),
+        "sm_107a": {"kcp_dhu_tape"},
+    }[arch]
+    assert full == want, (arch, long_chain, launches)
+    persistent = [ga for _n, _a, _l, ga in resolved if "sm_count" in ga]
+    assert persistent and all(ga["arch"] == arch for ga in persistent)
+
+
+@pytest.mark.parametrize(
+    ("arch", "want"),
+    [
+        ("sm_100a", {"kcp_dhu_offset", "kcp_dhu_tape"}),
+        ("sm_103a", set()),
+        ("sm_107a", {"kcp_dhu_tape"}),
+    ],
+)
+def test_dhu_forms_agree_across_forward_recompute_and_handle_on_each_architecture(
+    monkeypatch, arch, want
+) -> None:
+    """The #7 form of every launch reads host plan integers and the architecture ``KernelBackend.run`` passes, so
+    the backward after the forward, after torch's checkpoint recompute and after the recompute from a
+    :class:`RecomputeHandleKcp` launch the same #7 records on the same grids.  The :data:`ARCH_CHUNKS` rank with
+    ``segments=2`` and the long-chain threshold lowered, through the stub launch glue of
+    :func:`test_kernel_backend_passes_the_device_architecture_to_the_dhu_walks`: on ``sm_100a`` the long-chain
+    clause fires (the offset and the tape walk launch vh = 128); on ``sm_103a`` it does not (vh = 64), for the
+    same long-chain walks; ``sm_107a`` keeps the two-wave rule of the tape walk (vh = 128) and vh = 64 for the
+    offset walk.  ``want``: the #7 programs that launch vh = 128.  Each path logs the kinds of its recorded calls
+    (``_record``)."""
+    kcp = _mod("cake_kcp")
+    ctx, ops = _arch_case(monkeypatch, True)
+    glue, resolved = _arch_backend(monkeypatch, arch)
+    kinds: list = []
+    record = kcp._record
+
+    def recording(kind, call):
+        record(kind, call)
+        kinds.append(kind)
+
+    monkeypatch.setattr(kcp, "_record", recording)
+
+    def run(ckpt: bool, handle: bool) -> dict:
+        del kinds[:], glue.launches[:], resolved[:]
+        leaves = [
+            ops[n].detach().clone().requires_grad_(True)
+            for n in ("q", "k", "v", "g", "beta")
+        ]
+        hd = kcp.RecomputeHandleKcp() if handle else None
+
+        def fn(q, k, v, g, beta, h):
+            return kcp.chunk_gdn_kcp(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                ctx,
+                recompute_handle=h,
+                backend="kernels",
+                segments=2,
+                deterministic=False,
+            )
+
+        if ckpt:
+            from torch.utils.checkpoint import checkpoint
+
+            out = checkpoint(fn, *leaves, hd, use_reentrant=False)
+        else:
+            out = fn(*leaves, hd)
+        out.backward(ops["dout"])
+        return {"kinds": list(kinds), "dhu": _dhu_launches(glue, resolved)}
+
+    paths = {
+        "forward": run(False, False),
+        "recompute": run(True, False),
+        "handle": run(True, True),
+    }
+    for name in ("recompute", "handle"):
+        # a checkpointed path records the forward and torch's recompute of it
+        assert paths[name]["kinds"].count("fwd") == 2, (name, paths[name]["kinds"])
+    forms = {}
+    for name, p in paths.items():
+        dhu = p["dhu"]
+        assert {x["program"] for x in dhu} == set(kcp.DHU_PROGRAMS), (name, dhu)
+        assert all(x["arch"] == arch for x in dhu), (name, dhu)
+        assert any(x["long_chain"] for x in dhu), (name, dhu)
+        full = {x["program"] for x in dhu if not x["record"].endswith(kcp.VH64_SUFFIX)}
+        assert full == want, (name, dhu)
+        forms[name] = [(x["record"], x["grid"]) for x in dhu]
+    assert forms["recompute"] == forms["forward"], forms
+    assert forms["handle"] == forms["forward"], forms
 
 
 def test_workspace_holds_one_zeroed_ticket_slot_per_persistent_site() -> None:

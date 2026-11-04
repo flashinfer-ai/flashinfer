@@ -67,10 +67,11 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from tests.experimental.test_cake_kda_det_train_kcp_dist import (
-    _free_port,
+    _init_group,
     _local_slices,
     _partition,
     _programs_exported,
+    _rendezvous,
     _requested,
     _to_global,
 )
@@ -1924,15 +1925,19 @@ def test_l2n_kernel_path_raises_until_bound() -> None:
 REFUSAL_ROWS = [(2, "ragged:3000,0"), (4, "ragged:1200,0,900,900")]
 
 
-def _refusal_rank(rank: int, W: int, layout: str, port: int, out_dir: str) -> None:
+def _refusal_rank(
+    rank: int, W: int, layout: str, rdzv: str | None, out_dir: str
+) -> None:
     """One spawned rank of a CPU gloo group: the flag-on entries on this rank's operands, each run to its exception;
     then one all-gather of the outcomes (a rank that had entered a collective alone would hold this gather until
     the group's timeout); rank 0 writes them.  Once the existing backend serves the mode, one rank-independent
     reason stands in for the check (the rows test where the refusal fires, not the reason)."""
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = str(port)
     dist.init_process_group(
-        "gloo", rank=rank, world_size=W, timeout=datetime.timedelta(seconds=120)
+        "gloo",
+        init_method=rdzv,
+        rank=rank,
+        world_size=W,
+        timeout=datetime.timedelta(seconds=120),
     )
     try:
         part, _ = _partition((3000,), W, layout)
@@ -2014,7 +2019,7 @@ def test_l2n_refusal_is_rank_symmetric(W, layout) -> None:
     with tempfile.TemporaryDirectory(prefix="cake_kcp_l2n_refusal_") as tmp:
         mp.start_processes(
             _refusal_rank,
-            args=(W, layout, _free_port(), tmp),
+            args=(W, layout, _rendezvous(tmp), tmp),
             nprocs=W,
             join=True,
             start_method="spawn",
@@ -2498,7 +2503,8 @@ def _skip_unless_runnable(W: int, *, gate: str | None = "g") -> None:
         pytest.skip(f"{W} CUDA devices required, {torch.cuda.device_count()} visible")
     if not _programs_exported():
         pytest.skip("the KCP programs are not exported in the package's build.json yet")
-    if cake_jit.device_arch(torch.cuda.current_device()) not in cake_jit.ARCHES:
+    capability = torch.cuda.get_device_capability()
+    if cake_jit.arch_for_capability(capability) not in cake_jit.ARCHES:
         pytest.skip("the current device's architecture is not covered by the package")
 
 
@@ -2663,7 +2669,12 @@ def _gather(x: torch.Tensor, W: int) -> list:
 
 
 def _run_rank(
-    rank: int, W: int, row, port: int, result_dir: str | None, raw_gate: bool = False
+    rank: int,
+    W: int,
+    row,
+    rdzv: str | None,
+    result_dir: str | None,
+    raw_gate: bool = False,
 ) -> dict:
     """One rank: the flag-on KCP passes (both forms) and their bitwise flags, the saved rstd, the flag-off comparison of
     the collectives and stages, the retained bytes; gathered to rank 0 and compared with the single-rank flag-on path
@@ -2674,9 +2685,7 @@ def _run_rank(
     device = torch.device("cuda", rank % max(torch.cuda.device_count(), 1))
     torch.cuda.set_device(device)
     if W > 1 and not dist.is_initialized():
-        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-        os.environ.setdefault("MASTER_PORT", str(port))
-        dist.init_process_group("nccl", rank=rank, world_size=W, device_id=device)
+        _init_group(rank, W, device, rdzv)
     group = dist.group.WORLD if W > 1 else None
     part, cu = _partition(lengths, W, layout)
     ctx = cake_kcp_plan.build_context_det_kcp(part, group, rank, device)
@@ -2973,10 +2982,10 @@ def _run_rank(
 
 
 def _spawn_entry(
-    rank: int, W: int, row, port: int, result_dir: str, raw_gate: bool
+    rank: int, W: int, row, rdzv: str | None, result_dir: str, raw_gate: bool
 ) -> None:
     try:
-        report = _run_rank(rank, W, row, port, result_dir, raw_gate)
+        report = _run_rank(rank, W, row, rdzv, result_dir, raw_gate)
         if not report["pass"]:
             raise AssertionError(f"rank {rank}: {report}")
     finally:
@@ -2993,7 +3002,7 @@ def _drive(row, raw_gate: bool) -> None:
     if slurm and int(os.environ.get("SLURM_NTASKS", "1")) == W and W > 1:
         _skip_unless_runnable(1, gate=gate)
         report = _run_rank(
-            int(os.environ["SLURM_PROCID"]), W, row, int(os.environ.get("MASTER_PORT", "29500")),
+            int(os.environ["SLURM_PROCID"]), W, row, None,
             os.environ.get("KCP_TEST_RESULT_DIR"), raw_gate,
         )  # fmt: skip
         assert report["pass"], report
@@ -3001,7 +3010,7 @@ def _drive(row, raw_gate: bool) -> None:
     _skip_unless_runnable(W, gate=gate)
     if W == 1:
         report = _run_rank(
-            0, 1, row, 0, os.environ.get("KCP_TEST_RESULT_DIR"), raw_gate
+            0, 1, row, None, os.environ.get("KCP_TEST_RESULT_DIR"), raw_gate
         )
         assert report["pass"], report
         return
@@ -3009,7 +3018,7 @@ def _drive(row, raw_gate: bool) -> None:
         result_dir = os.environ.get("KCP_TEST_RESULT_DIR") or tmp
         mp.start_processes(
             _spawn_entry,
-            args=(W, row, _free_port(), result_dir, raw_gate),
+            args=(W, row, _rendezvous(tmp), result_dir, raw_gate),
             nprocs=W,
             join=True,
             start_method="spawn",

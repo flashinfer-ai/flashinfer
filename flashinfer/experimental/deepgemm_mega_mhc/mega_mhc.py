@@ -1630,6 +1630,73 @@ ROUTES: list[dict[str, Any]] = [
         "defines": {},
     },
     # The deterministic launches of this regime that the FP8 group-128 UE8M0
+    # weight-staging tail program serves on sm_107a, at the plain program's 16
+    # splits and grid (so the same outputs; its launch stages the RMSNorm weight
+    # in shared memory): those at the token counts of its "tokens" (inclusive
+    # ranges) on the devices whose SM count "num_sms" lists, alone.
+    {
+        "hidden": 4096,
+        "num_splits": "runtime",
+        "regime": "bf16",
+        "shifted": False,
+        "shared_sf": False,
+        "sf_layout": "fp8_group128",
+        "fp8_sf_ue8m0": True,
+        "deterministic": True,
+        "num_sms": [208],
+        "tokens": [[2048, 2496], [2944, 3328]],
+        "program": "cake_mega_mhc_5c5eaa3072b0d4f69ccd",
+        "defines": {},
+    },
+    {
+        "hidden": 4096,
+        "num_splits": "runtime",
+        "regime": "bf16",
+        "shifted": False,
+        "shared_sf": False,
+        "sf_layout": "fp8_group128",
+        "fp8_sf_ue8m0": True,
+        "deterministic": True,
+        "num_sms": [216],
+        "tokens": [[2048, 2560], [3008, 3456]],
+        "program": "cake_mega_mhc_5c5eaa3072b0d4f69ccd",
+        "defines": {},
+    },
+    # The deterministic launches of this regime that the FP8 group-128 UE8M0
+    # weight-staging tail program also serves on sm_107a below its earlier ranges
+    # (two task waves of the grid), at the plain program's 16 splits and grid (so
+    # the same outputs; its launch stages the RMSNorm weight in shared memory):
+    # those at the token counts of its "tokens" (inclusive ranges) on the devices
+    # whose SM count "num_sms" lists, alone.
+    {
+        "hidden": 4096,
+        "num_splits": "runtime",
+        "regime": "bf16",
+        "shifted": False,
+        "shared_sf": False,
+        "sf_layout": "fp8_group128",
+        "fp8_sf_ue8m0": True,
+        "deterministic": True,
+        "num_sms": [208],
+        "tokens": [[1472, 1664]],
+        "program": "cake_mega_mhc_5c5eaa3072b0d4f69ccd",
+        "defines": {},
+    },
+    {
+        "hidden": 4096,
+        "num_splits": "runtime",
+        "regime": "bf16",
+        "shifted": False,
+        "shared_sf": False,
+        "sf_layout": "fp8_group128",
+        "fp8_sf_ue8m0": True,
+        "deterministic": True,
+        "num_sms": [216],
+        "tokens": [[1536, 1728]],
+        "program": "cake_mega_mhc_5c5eaa3072b0d4f69ccd",
+        "defines": {},
+    },
+    # The deterministic launches of this regime that the FP8 group-128 UE8M0
     # tailpipe program serves on sm_107a (the same 16 splits and launch, so the
     # same outputs): those at the token counts of its "tokens" (inclusive ranges).
     {
@@ -1642,23 +1709,6 @@ ROUTES: list[dict[str, Any]] = [
         "fp8_sf_ue8m0": True,
         "deterministic": True,
         "tokens": [[1024, 3328]],
-        "program": "cake_mega_mhc_9823742e18a9ffa6515b",
-        "defines": {},
-    },
-    # The same deterministic launches that the same program serves on the
-    # devices whose SM count "num_sms" lists, alone: those at the token counts
-    # of its "tokens" (inclusive ranges).
-    {
-        "hidden": 4096,
-        "num_splits": "runtime",
-        "regime": "bf16",
-        "shifted": False,
-        "shared_sf": False,
-        "sf_layout": "fp8_group128",
-        "fp8_sf_ue8m0": True,
-        "deterministic": True,
-        "num_sms": [216],
-        "tokens": [[3329, 3456]],
         "program": "cake_mega_mhc_9823742e18a9ffa6515b",
         "defines": {},
     },
@@ -1723,6 +1773,74 @@ ROUTES: list[dict[str, Any]] = [
         "deterministic": False,
         "tokens": [[385, 832]],
         "program": "cake_mega_mhc_c74bb9bb0a67abd4c72a",
+        "defines": {},
+    },
+    # The launches of this regime outside the deterministic mode that the FP8
+    # group-128 UE8M0 weight-staging tail program serves on sm_107a, at the
+    # tailpipe program's 16 splits and grid (so the same outputs; its launch
+    # stages the RMSNorm weight in shared memory): those at the token counts of
+    # its "tokens" (inclusive ranges) on the devices whose SM count "num_sms"
+    # lists, alone.
+    {
+        "hidden": 4096,
+        "num_splits": "runtime",
+        "regime": "tailpipe",
+        "shifted": False,
+        "shared_sf": False,
+        "sf_layout": "fp8_group128",
+        "fp8_sf_ue8m0": True,
+        "deterministic": False,
+        "num_sms": [208],
+        "tokens": [[2944, 3328]],
+        "program": "cake_mega_mhc_5c5eaa3072b0d4f69ccd",
+        "defines": {},
+    },
+    {
+        "hidden": 4096,
+        "num_splits": "runtime",
+        "regime": "tailpipe",
+        "shifted": False,
+        "shared_sf": False,
+        "sf_layout": "fp8_group128",
+        "fp8_sf_ue8m0": True,
+        "deterministic": False,
+        "num_sms": [216],
+        "tokens": [[3008, 3456]],
+        "program": "cake_mega_mhc_5c5eaa3072b0d4f69ccd",
+        "defines": {},
+    },
+    # The launches of this regime outside the deterministic mode that the FP8
+    # group-128 UE8M0 weight-staging tail program also serves on sm_107a below its
+    # earlier ranges (two and three task waves of the grid), at the tailpipe
+    # program's split count and grid (so the same outputs; its launch stages the
+    # RMSNorm weight in shared memory): those at the token counts of its "tokens"
+    # (inclusive ranges) on the devices whose SM count "num_sms" lists, alone.
+    {
+        "hidden": 4096,
+        "num_splits": "runtime",
+        "regime": "tailpipe",
+        "shifted": False,
+        "shared_sf": False,
+        "sf_layout": "fp8_group128",
+        "fp8_sf_ue8m0": True,
+        "deterministic": False,
+        "num_sms": [208],
+        "tokens": [[1665, 2496]],
+        "program": "cake_mega_mhc_5c5eaa3072b0d4f69ccd",
+        "defines": {},
+    },
+    {
+        "hidden": 4096,
+        "num_splits": "runtime",
+        "regime": "tailpipe",
+        "shifted": False,
+        "shared_sf": False,
+        "sf_layout": "fp8_group128",
+        "fp8_sf_ue8m0": True,
+        "deterministic": False,
+        "num_sms": [216],
+        "tokens": [[1729, 2560]],
+        "program": "cake_mega_mhc_5c5eaa3072b0d4f69ccd",
         "defines": {},
     },
     {
@@ -1795,6 +1913,75 @@ ROUTES: list[dict[str, Any]] = [
         "num_sms": [216],
         "tokens": [[1057, 1104]],
         "program": "cake_mega_mhc_92ff09be7d50b8019d50",
+        "defines": {},
+    },
+    # The raw scale mode's deterministic launches of the plain FP8 group-128
+    # program's regime that the FP8 group-128 weight-staging tail program serves
+    # on sm_107a, at the plain program's 16 splits and grid (so the same outputs;
+    # its launch stages the RMSNorm weight in shared memory): those at the token
+    # counts of its "tokens" (inclusive ranges) on the devices whose SM count
+    # "num_sms" lists, alone.
+    {
+        "hidden": 4096,
+        "num_splits": "runtime",
+        "regime": "bf16",
+        "shifted": False,
+        "shared_sf": False,
+        "sf_layout": "fp8_group128",
+        "fp8_sf_ue8m0": False,
+        "deterministic": True,
+        "num_sms": [208],
+        "tokens": [[1984, 3328]],
+        "program": "cake_mega_mhc_892d774130f06423fd7c",
+        "defines": {},
+    },
+    {
+        "hidden": 4096,
+        "num_splits": "runtime",
+        "regime": "bf16",
+        "shifted": False,
+        "shared_sf": False,
+        "sf_layout": "fp8_group128",
+        "fp8_sf_ue8m0": False,
+        "deterministic": True,
+        "num_sms": [216],
+        "tokens": [[1984, 2560], [2880, 3456]],
+        "program": "cake_mega_mhc_892d774130f06423fd7c",
+        "defines": {},
+    },
+    # The raw scale mode's deterministic launches of the plain FP8 group-128
+    # program's regime that the FP8 group-128 weight-staging tail program also
+    # serves on sm_107a below its earlier ranges (two task waves of the grid), at
+    # the plain program's 16 splits and grid (so the same outputs; its launch
+    # stages the RMSNorm weight in shared memory): those at the token counts of
+    # its "tokens" (inclusive ranges) on the devices whose SM count "num_sms"
+    # lists, alone.
+    {
+        "hidden": 4096,
+        "num_splits": "runtime",
+        "regime": "bf16",
+        "shifted": False,
+        "shared_sf": False,
+        "sf_layout": "fp8_group128",
+        "fp8_sf_ue8m0": False,
+        "deterministic": True,
+        "num_sms": [208],
+        "tokens": [[1472, 1664]],
+        "program": "cake_mega_mhc_892d774130f06423fd7c",
+        "defines": {},
+    },
+    {
+        "hidden": 4096,
+        "num_splits": "runtime",
+        "regime": "bf16",
+        "shifted": False,
+        "shared_sf": False,
+        "sf_layout": "fp8_group128",
+        "fp8_sf_ue8m0": False,
+        "deterministic": True,
+        "num_sms": [216],
+        "tokens": [[1408, 1728]],
+        "program": "cake_mega_mhc_892d774130f06423fd7c",
         "defines": {},
     },
     # The raw scale mode's deterministic launches of the plain FP8 group-128
@@ -1901,7 +2088,52 @@ ROUTES: list[dict[str, Any]] = [
         "sf_layout": "nvfp4",
         "deterministic": True,
         "num_sms": [208],
-        "tokens": [[2048, 2048]],
+        "tokens": [[2048, 2048], [2112, 2496], [2944, 3328]],
+        "program": "cake_mega_mhc_12e5bcc41e7940e7d511",
+        "defines": {},
+    },
+    {
+        "hidden": 4096,
+        "num_splits": "runtime",
+        "regime": "bf16",
+        "shifted": False,
+        "shared_sf": False,
+        "sf_layout": "nvfp4",
+        "deterministic": True,
+        "num_sms": [216],
+        "tokens": [[3008, 3456]],
+        "program": "cake_mega_mhc_12e5bcc41e7940e7d511",
+        "defines": {},
+    },
+    # The deterministic launches of this regime that the NVFP4 weight-staging tail
+    # program also serves on sm_107a below its earlier ranges (two task waves of
+    # the grid), at the plain program's 16 splits and grid (so the same outputs;
+    # its launch stages the RMSNorm weight in shared memory): those at the token
+    # counts of its "tokens" (inclusive ranges) on the devices whose SM count
+    # "num_sms" lists, alone.
+    {
+        "hidden": 4096,
+        "num_splits": "runtime",
+        "regime": "bf16",
+        "shifted": False,
+        "shared_sf": False,
+        "sf_layout": "nvfp4",
+        "deterministic": True,
+        "num_sms": [208],
+        "tokens": [[1536, 1664]],
+        "program": "cake_mega_mhc_12e5bcc41e7940e7d511",
+        "defines": {},
+    },
+    {
+        "hidden": 4096,
+        "num_splits": "runtime",
+        "regime": "bf16",
+        "shifted": False,
+        "shared_sf": False,
+        "sf_layout": "nvfp4",
+        "deterministic": True,
+        "num_sms": [216],
+        "tokens": [[1536, 1728]],
         "program": "cake_mega_mhc_12e5bcc41e7940e7d511",
         "defines": {},
     },
@@ -1913,6 +2145,75 @@ ROUTES: list[dict[str, Any]] = [
         "shared_sf": False,
         "sf_layout": "nvfp4",
         "program": "cake_mega_mhc_1c61fed11caf93d1b762",
+        "defines": {},
+    },
+    # The raw scale mode's launches of this regime outside the deterministic mode
+    # that the FP8 group-128 weight-staging tail program serves on sm_107a, at the
+    # tailpipe program's 16 splits and grid (so the same outputs; its launch
+    # stages the RMSNorm weight in shared memory): those at the token counts of
+    # its "tokens" (inclusive ranges) on the devices whose SM count "num_sms"
+    # lists, alone.
+    {
+        "hidden": 4096,
+        "num_splits": "runtime",
+        "regime": "tailpipe",
+        "shifted": False,
+        "shared_sf": False,
+        "sf_layout": "fp8_group128",
+        "fp8_sf_ue8m0": False,
+        "deterministic": False,
+        "num_sms": [208],
+        "tokens": [[2816, 3328]],
+        "program": "cake_mega_mhc_892d774130f06423fd7c",
+        "defines": {},
+    },
+    {
+        "hidden": 4096,
+        "num_splits": "runtime",
+        "regime": "tailpipe",
+        "shifted": False,
+        "shared_sf": False,
+        "sf_layout": "fp8_group128",
+        "fp8_sf_ue8m0": False,
+        "deterministic": False,
+        "num_sms": [216],
+        "tokens": [[2880, 3456]],
+        "program": "cake_mega_mhc_892d774130f06423fd7c",
+        "defines": {},
+    },
+    # The raw scale mode's launches of this regime outside the deterministic mode
+    # that the FP8 group-128 weight-staging tail program also serves on sm_107a
+    # below its earlier ranges (two and three task waves of the grid), at the
+    # tailpipe program's split count and grid (so the same outputs; its launch
+    # stages the RMSNorm weight in shared memory): those at the token counts of
+    # its "tokens" (inclusive ranges) on the devices whose SM count "num_sms"
+    # lists, alone.
+    {
+        "hidden": 4096,
+        "num_splits": "runtime",
+        "regime": "tailpipe",
+        "shifted": False,
+        "shared_sf": False,
+        "sf_layout": "fp8_group128",
+        "fp8_sf_ue8m0": False,
+        "deterministic": False,
+        "num_sms": [208],
+        "tokens": [[1665, 2496]],
+        "program": "cake_mega_mhc_892d774130f06423fd7c",
+        "defines": {},
+    },
+    {
+        "hidden": 4096,
+        "num_splits": "runtime",
+        "regime": "tailpipe",
+        "shifted": False,
+        "shared_sf": False,
+        "sf_layout": "fp8_group128",
+        "fp8_sf_ue8m0": False,
+        "deterministic": False,
+        "num_sms": [216],
+        "tokens": [[2113, 2560]],
+        "program": "cake_mega_mhc_892d774130f06423fd7c",
         "defines": {},
     },
     {
@@ -1963,6 +2264,69 @@ ROUTES: list[dict[str, Any]] = [
         "deterministic": False,
         "tokens": [[833, 1008]],
         "program": "cake_mega_mhc_d5d1da31e8a83833d6da",
+        "defines": {},
+    },
+    # The launches of this regime outside the deterministic mode that the NVFP4
+    # weight-staging tail program serves on sm_107a, at the tailpipe program's 16
+    # splits and grid (so the same outputs; its launch stages the RMSNorm weight
+    # in shared memory): those at the token counts of its "tokens" (inclusive
+    # ranges) on the devices whose SM count "num_sms" lists, alone.
+    {
+        "hidden": 4096,
+        "num_splits": "runtime",
+        "regime": "tailpipe",
+        "shifted": False,
+        "shared_sf": False,
+        "sf_layout": "nvfp4",
+        "deterministic": False,
+        "num_sms": [208],
+        "tokens": [[2497, 3328]],
+        "program": "cake_mega_mhc_12e5bcc41e7940e7d511",
+        "defines": {},
+    },
+    {
+        "hidden": 4096,
+        "num_splits": "runtime",
+        "regime": "tailpipe",
+        "shifted": False,
+        "shared_sf": False,
+        "sf_layout": "nvfp4",
+        "deterministic": False,
+        "num_sms": [216],
+        "tokens": [[2561, 3456]],
+        "program": "cake_mega_mhc_12e5bcc41e7940e7d511",
+        "defines": {},
+    },
+    # The launches of this regime outside the deterministic mode that the NVFP4
+    # weight-staging tail program also serves on sm_107a below its earlier ranges
+    # (two and three task waves of the grid), at the tailpipe program's split
+    # count and grid (so the same outputs; its launch stages the RMSNorm weight in
+    # shared memory): those at the token counts of its "tokens" (inclusive ranges)
+    # on the devices whose SM count "num_sms" lists, alone.
+    {
+        "hidden": 4096,
+        "num_splits": "runtime",
+        "regime": "tailpipe",
+        "shifted": False,
+        "shared_sf": False,
+        "sf_layout": "nvfp4",
+        "deterministic": False,
+        "num_sms": [208],
+        "tokens": [[1665, 2496]],
+        "program": "cake_mega_mhc_12e5bcc41e7940e7d511",
+        "defines": {},
+    },
+    {
+        "hidden": 4096,
+        "num_splits": "runtime",
+        "regime": "tailpipe",
+        "shifted": False,
+        "shared_sf": False,
+        "sf_layout": "nvfp4",
+        "deterministic": False,
+        "num_sms": [216],
+        "tokens": [[2113, 2560]],
+        "program": "cake_mega_mhc_12e5bcc41e7940e7d511",
         "defines": {},
     },
     {

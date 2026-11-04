@@ -165,6 +165,11 @@ jobs:
           pip install build wheel
 
       - name: Build flashinfer-python wheel and sdist
+        env:
+          # Release wheels leave the experimental packages' generated kernel
+          # sources out so flashinfer-python stays under PyPI's 100 MB file limit
+          # (flashinfer-ai/flashinfer#7977); nightlies and source installs keep them.
+          FLASHINFER_WHEEL_EXCLUDE_EXPERIMENTAL_SOURCES: "1"
         run: |
           echo "Building flashinfer-python..."
           echo "Git commit: $(git rev-parse HEAD)"
