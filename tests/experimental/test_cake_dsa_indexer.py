@@ -109,6 +109,7 @@ _COMMON = dict(
     split_min_range_tiles=64,
     split_units=["l6", "narrow", "wide"],
     split_wave_scope=None,
+    split_fit_rule=None,
     l6_solo_rule=None,
     l6_solo_unsampled_max_queries=None,
     wide_pair_snake_only=False,
@@ -1849,6 +1850,32 @@ def test_l6_solo_unsampled_max_queries_on_sm_100a_and_sm_103a():
         assert moved, arch
 
 
+def test_split_fit_rule_takes_fitting_splits_in_whole_merge_chunks():
+    """sm_100a / sm_103a ``split_fit_rule`` [4096]: a split call whose mean unit keys fit ceil(keys / top_k) <= split_max
+    splits takes that count rounded up to whole 4096-entry merge chunks; a call that needs more keeps the floor rule,
+    and so does a call the floor rule does not split.  sm_107a has no fit rule."""
+    for arch in ("sm_100a", "sm_103a"):
+        p = policy_for(arch)
+        assert p.split_fit_rule == [4096], arch
+        # 4 queries x 22018 keys: floor rule 5, fit ceil(22016 / 2048) = 11 -> 12 (two splits per chunk)
+        assert p.split_rule_for(4, 22018, 1, 1, 152, p.block_q_l6, True) == 5
+        assert p.split_rule_for(4, 22018, 1, 1, 152, p.block_q_l6, True, 2048) == 12
+        assert p.split_rule_for(4, 30466, 1, 1, 152, p.block_q_l6, False, 2048) == 16
+        # 41986 keys need 21 splits > split_max: the floor rule's 10
+        assert p.split_rule_for(4, 41986, 1, 1, 152, p.block_q_l6, True, 2048) == 10
+        # top_k 4096: one split per chunk, ceil(22016 / 4096) = 6
+        assert p.split_rule_for(4, 22018, 1, 1, 152, p.block_q_l6, True, 4096) == 6
+        # the floor rule does not split 8192 keys: no fit split either
+        assert p.split_rule_for(1, 8192, 1, 1, 152, p.block_q_l6, True, 2048) == 1
+    assert policy_for("sm_107a").split_fit_rule is None
+    assert (
+        policy_for("sm_107a").split_rule_for(
+            4, 22018, 1, 1, 212, policy_for("sm_107a").block_q_l6, True, 2048
+        )
+        == 5
+    )
+
+
 def test_split_wave_scope_and_wide_pair_snake_only_on_sm_107a():
     """sm_107a's ``split_wave_scope`` [["narrow"], 1, True]: the two-way wave split of ``split_wave_rule`` stays on sampled
     single-segment calls of the narrow unit only (never with the sampled first threshold off, and never for the
@@ -2049,12 +2076,13 @@ def test_sample_fit_kinds_name_exactly_the_registered_sampled_fit_programs():
         )
         assert policy_for(arch).sample_fit_kinds == registered, arch
     # a split unit that fits a 32768-slot buffer keeps the plain split program; the gate, not the geometry, decides
+    # (12 splits: split_fit_rule gives each split at most top_k keys)
     p = policy_for("sm_103a")
     geometry = dict(
         num_queries=4, num_keys=22018, num_segments=1, ratio=1, top_k=2048, grid=148
     )
     c = select_program(p, candidate_multiplier=16, **geometry)
-    assert (c.scan_key, c.n_split, c.cand_cap) == ("scan:split_l6:u1:s0:f0", 5, 32768)
+    assert (c.scan_key, c.n_split, c.cand_cap) == ("scan:split_l6:u1:s0:f0", 12, 32768)
     assert c.physical_kind == "split_l6" and not c.sample_fit
     assert (
         select_program(p, **geometry).cand_cap == 32768
