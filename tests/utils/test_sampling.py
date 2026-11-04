@@ -2098,6 +2098,63 @@ def test_top_k_renorm_probs_deterministic(batch_size, vocab_size, k, dtype):
     torch.testing.assert_close(sums, torch.ones_like(sums), rtol=1e-2, atol=1e-2)
 
 
+def _boundary_tie_rows(rows, vocab_size, pad):
+    out = torch.full((len(rows), vocab_size), pad, dtype=torch.float32, device="cuda:0")
+    for i, row in enumerate(rows):
+        out[i, : len(row)] = torch.tensor(row, dtype=torch.float32, device="cuda:0")
+    return out
+
+
+def _kept_sets(mask):
+    return [set(torch.nonzero(row).flatten().tolist()) for row in mask]
+
+
+@pytest.mark.parametrize("vocab_size", [8, 32000, 152064])
+@pytest.mark.parametrize("is_deterministic", [False, True])
+def test_top_k_renorm_probs_keeps_boundary_ties(vocab_size, is_deterministic):
+    """Every token >= the k-th largest is kept, so ties at k survive together."""
+    rows = [[0.4, 0.3, 0.3], [0.25, 0.25, 0.25, 0.25], [0.5, 0.2, 0.2, 0.1]]
+    expected = [{0, 1, 2}, {0, 1, 2, 3}, {0, 1, 2}]
+    probs = _boundary_tie_rows(rows, vocab_size, 0.0)
+    for k in (2, torch.full((3,), 2, dtype=torch.int32, device="cuda:0")):
+        out = flashinfer.sampling.top_k_renorm_probs(
+            probs, k, is_deterministic=is_deterministic
+        )
+        assert _kept_sets(out > 0) == expected
+        assert torch.equal(out[0, 1], out[0, 2])
+        sums = out.sum(dim=-1)
+        torch.testing.assert_close(sums, torch.ones_like(sums), rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("vocab_size", [8, 32000, 152064])
+def test_top_k_mask_logits_keeps_boundary_ties(vocab_size):
+    """Every logit >= the k-th largest is kept, so ties at k survive together."""
+    rows = [[1.0, 0.5, 0.5], [2.0, 1.0, 1.0, 1.0], [3.0, 2.0, 2.0, 1.0]]
+    expected = [{0, 1, 2}, {0, 1, 2, 3}, {0, 1, 2}]
+    logits = _boundary_tie_rows(rows, vocab_size, -10.0)
+    for k in (2, torch.full((3,), 2, dtype=torch.int32, device="cuda:0")):
+        out = flashinfer.sampling.top_k_mask_logits(logits, k)
+        assert _kept_sets(torch.isfinite(out)) == expected
+        assert torch.equal(out[torch.isfinite(out)], logits[torch.isfinite(out)])
+
+
+@pytest.mark.parametrize("vocab_size", [8, 32000, 152064])
+@pytest.mark.parametrize("is_deterministic", [False, True])
+def test_top_p_renorm_probs_keeps_boundary_ties(vocab_size, is_deterministic):
+    """A token is kept when its strictly-greater mass is below top_p, so ties survive together."""
+    rows = [[0.4, 0.3, 0.3], [0.5, 0.2, 0.2, 0.1], [0.25, 0.25, 0.25, 0.25]]
+    top_p = torch.tensor([0.5, 0.6, 0.3], device="cuda:0")
+    expected = [{0, 1, 2}, {0, 1, 2}, {0, 1, 2, 3}]
+    probs = _boundary_tie_rows(rows, vocab_size, 0.0)
+    out = flashinfer.sampling.top_p_renorm_probs(
+        probs, top_p, is_deterministic=is_deterministic
+    )
+    assert _kept_sets(out > 0) == expected
+    assert torch.equal(out[0, 1], out[0, 2])
+    sums = out.sum(dim=-1)
+    torch.testing.assert_close(sums, torch.ones_like(sums), rtol=1e-5, atol=1e-5)
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 def test_top_k_renorm_probs_mixed_k_persistent_loop(dtype):
     """Test top_k_renorm_probs with mixed k values in persistent loop (multi-CTA mode).
