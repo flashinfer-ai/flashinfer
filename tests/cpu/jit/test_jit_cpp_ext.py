@@ -1,3 +1,4 @@
+import io
 import logging
 import subprocess
 from types import SimpleNamespace
@@ -823,14 +824,16 @@ def test_cgroup_available_memory_reads_v2_then_v1(tmp_path, files, expected):
 
 @pytest.mark.cpu_only
 def test_available_memory_reads_meminfo_in_bytes(monkeypatch):
-    try:
-        with open("/proc/meminfo") as f:
-            kb = next(int(ln.split()[1]) for ln in f if ln.startswith("MemAvailable:"))
-    except (OSError, StopIteration):
-        pytest.skip("needs /proc/meminfo with MemAvailable")
+    real_open = open
+
+    def fake_open(path, *args, **kwargs):
+        if path == "/proc/meminfo":
+            return io.StringIO("MemTotal: 8388608 kB\nMemAvailable: 4194304 kB\n")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(cpp_ext, "open", fake_open, raising=False)
     monkeypatch.setattr(cpp_ext, "_cgroup_available_memory_bytes", lambda: None)
-    # MemAvailable moves between the two reads; 1 GiB covers that.
-    assert abs(cpp_ext._available_host_memory_bytes() - kb * 1024) < 1 << 30
+    assert cpp_ext._available_host_memory_bytes() == 4 << 30
 
 
 @pytest.mark.cpu_only
