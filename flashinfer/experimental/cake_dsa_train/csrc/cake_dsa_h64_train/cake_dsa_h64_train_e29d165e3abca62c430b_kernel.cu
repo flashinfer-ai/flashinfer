@@ -123,9 +123,9 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap q_latent, const __grid_c
             // idx_full: 2 barriers, init_count=8
             mbarrier_init(smem + 32, 8);
             mbarrier_init(smem + 40, 8);
-            // idx_free: 2 barriers, init_count=16
-            mbarrier_init(smem + 48, 16);
-            mbarrier_init(smem + 56, 16);
+            // idx_free: 2 barriers, init_count=388
+            mbarrier_init(smem + 48, 388);
+            mbarrier_init(smem + 56, 388);
             // k_full: 1 barriers, init_count=4
             mbarrier_init(smem + 64, 4);
             // k_free: 1 barriers, init_count=1
@@ -391,9 +391,7 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap q_latent, const __grid_c
                 mbarrier_wait(idx_full_addr + (slot_1) * 8, _phase_slot_1);
                 unsigned int v0 = validity32[slot_1 * 80 + 64];
                 unsigned int v1 = validity32[slot_1 * 80 + 65];
-                if (lane_0 == 0) {
-                    mbarrier_arrive(idx_free_addr + (slot_1) * 8);
-                }
+                mbarrier_arrive(idx_free_addr + (slot_1) * 8);
                 int _parity_s_full = (int)((unsigned int)i_1 % 2);
                 mbarrier_wait(s_full_addr, _parity_s_full);
                 asm volatile("tcgen05.fence::after_thread_sync;");
@@ -1084,10 +1082,8 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap q_latent, const __grid_c
                 keys[5] = tile_idx[slot_2 * 80 + wg * 32 + 16 + 2 * (lane_0_1 % 4) + 1];
                 keys[6] = tile_idx[slot_2 * 80 + wg * 32 + 24 + 2 * (lane_0_1 % 4)];
                 keys[7] = tile_idx[slot_2 * 80 + wg * 32 + 24 + 2 * (lane_0_1 % 4) + 1];
-                if (lane_0_1 == 0) {
-                    mbarrier_arrive(idx_free_addr + (slot_2) * 8);
+                mbarrier_arrive(idx_free_addr + (slot_2) * 8);
 #if DKV_NATURAL == 1
-                }
                 int rows_1[8];
                 rows_1[0] = keys[0];
                 rows_1[1] = keys[1];
@@ -1122,8 +1118,8 @@ CAKE_PROGRAM_KERNEL(const __grid_constant__ CUtensorMap q_latent, const __grid_c
                     if (keys[7] >= 0) {
                         rows_1[7] = dkv_dst_map[(long long)keys[7]];
                     }
-#endif
                 }
+#endif
                 int _parity_dkv_a_full = (int)((unsigned int)i_2 % 2);
                 mbarrier_wait(dkv_a_full_addr, _parity_dkv_a_full);
                 asm volatile("tcgen05.fence::after_thread_sync;");
