@@ -2931,8 +2931,9 @@ def set_zero_weight_min_rows(rows: int) -> int:
 # architecture without a floor of its own (:data:`ZERO_DLOGP_MIN_ROWS_BY_ARCH`).
 ZERO_DLOGP_MIN_ROWS_DEFAULT: Optional[int] = DEFAULT_CHUNK_SIZE + 1
 # Per-architecture default floors (valid rows); an architecture not listed uses :data:`ZERO_DLOGP_MIN_ROWS_DEFAULT`.
-# Timed at head 6ab51864 (PyTorch 2.14.1+cu130, nvcc 13.4), plain and temperature log-probability, cooled and after
-# an idle gap, against the same head with the skip off: ratio = time without the skip / time with it, with its CI95.
+# Timed on FlashInfer PR #8687 at its commit 6ab51864 (PyTorch 2.14.1+cu130, nvcc 13.4), plain and temperature
+# log-probability, cooled and after an idle gap, against the same head with the skip off: ratio = time without the
+# skip / time with it, with its CI95.
 # B200 (sm_100a), floor 1946 valid rows (T = 2048 with 5 % ignored rows): with no zero-gradient row, of the backward,
 # step and checkpointed step of 1946 and 3891 valid rows none is slower under the timing rule (CI95 below
 # 1 - max(1 %, A/A)); the lowest point ratio is 0.984 [0.974, 0.996] (temperature backward, 1946 valid rows, cooled).
