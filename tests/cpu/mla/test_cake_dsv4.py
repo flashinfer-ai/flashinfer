@@ -2681,6 +2681,61 @@ def test_fp8_h64_decode_rows_take_the_m64_body_once_two_ctas_per_token_exceed_th
 
 
 @pytest.mark.cpu_only
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a", "sm_107a", None])
+@pytest.mark.parametrize(
+    "sparse_topk,page_size,sm107_first",
+    [
+        # (width, page size, first M64 token count on SM107 at 208 / 216 SMs)
+        (252, 2, (13, 13)),  # one complete tile: the M64 body at every count
+        (256, 2, (27, 28)),  # two tiles: 8 * tokens > sm_count
+        (260, 2, (53, 55)),  # three tiles: 4 * tokens > sm_count
+        (320, 64, (53, 55)),
+        (384, 2, (53, 55)),
+        (400, 2, (63, 65)),  # four tiles: 10 * tokens > 3 * sm_count
+        (512, 2, (63, 65)),
+        (516, 2, (105, 109)),  # five tiles and up: the half wave
+        (640, 64, (105, 109)),
+    ],
+)
+def test_fp8_h64_decode_rows_take_m64_before_the_half_wave_on_sm107(
+    arch, sparse_topk, page_size, sm107_first
+):
+    """On SM107 the FP8/H64 decode rows of two to four sparse tiles take the
+    M64 body before ``2 * tokens > sm_count``, by their tile count; other
+    widths and architectures keep the half-wave rule."""
+    m64 = cake._fp8_h64_m64_program(sparse_topk)
+    for sm_count, sm107 in zip((208, 216), sm107_first, strict=True):
+
+        def route(tokens):
+            return _route(
+                dtype=torch.float8_e4m3fn,
+                num_heads=64,
+                batch_size=tokens // 4 + 1,
+                max_q_len=4,
+                ragged=True,
+                sparse_topk=sparse_topk,
+                compressed_page_size=page_size,
+                num_query_tokens=tokens,
+                sm_count=sm_count,
+                arch=arch,
+            )
+
+        if sparse_topk < 256:
+            first = 13
+        elif arch == "sm_107a":
+            first = sm107
+        else:
+            first = sm_count // 2 + 1
+        below = "fp8_h128_prefill_source_persistent_uniform"
+        for tokens in range(13, first):
+            assert route(tokens) == below, (sm_count, tokens)
+        for tokens in range(first, sm_count // 2 + 2):
+            assert route(tokens) == m64, (sm_count, tokens)
+        if arch is not None:
+            assert m64 in _ARCH_REGISTRATIONS[arch]["variants"]
+
+
+@pytest.mark.cpu_only
 @pytest.mark.parametrize("num_query_tokens", [128, 256, 512])
 @pytest.mark.parametrize(
     "sparse_topk,page_size,expected",

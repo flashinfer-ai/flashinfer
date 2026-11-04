@@ -967,7 +967,21 @@ def _fp8_h64_uses_persistent_body(sparse_topk: int, num_query_tokens: int) -> bo
     return full_tiles >= 2
 
 
-def _fp8_h64_uses_m64_body(num_query_tokens: int, sm_count: int) -> bool:
+# SM107: the M64 body (K=64 QK) takes the FP8/H64 decode rows of two to four
+# sparse tiles before the half wave.  Per tile count ``ceil(sparse_topk / 128)``,
+# ``(num, den)``: the M64 body from ``den * tokens > num * sm_count`` on.
+_FP8_H64_M64_EARLY_WAVE = {
+    "sm_107a": {2: (1, 8), 3: (1, 4), 4: (3, 10)},
+}
+
+
+def _fp8_h64_uses_m64_body(
+    num_query_tokens: int,
+    sm_count: int,
+    *,
+    sparse_topk: Optional[int] = None,
+    arch: Optional[str] = None,
+) -> bool:
     """FP8/H64 decode rows (``max_q_len < 257``) whose two-CTA-per-token bodies
     no longer fit one wave.
 
@@ -977,8 +991,20 @@ def _fp8_h64_uses_m64_body(num_query_tokens: int, sm_count: int) -> bool:
     saves by running each token on one SM.  GB300 (152 SMs), q_len 4,
     DSv4-Flash widths: 84-120 tokens SWA-only 11.2-11.9 -> 7.0-7.5 us, topk4x
     640 14.2-15.9 -> 14.3-14.8 us; 128-512 tokens the M64 body led already.
+
+    On SM107 the M64 body wins earlier on the rows of two to four sparse tiles
+    (``_FP8_H64_M64_EARLY_WAVE``).  VR200 (208 and 216 SMs), q_len 1, 2 and 4,
+    persistent body -> M64 body over the rows each tile count adds: two tiles
+    5.79-7.79 -> 5.54-6.24 us, three tiles 7.33-8.76 -> 7.06-7.92 us, four
+    tiles 8.76-9.54 -> 8.23-9.09 us (0.99-1.25x).  Five tiles and up stay on
+    the persistent body below the half wave (M64 0.83-1.02x there).
     """
-    return 2 * num_query_tokens > sm_count
+    if 2 * num_query_tokens > sm_count:
+        return True
+    if sparse_topk is None:
+        return False
+    early = _FP8_H64_M64_EARLY_WAVE.get(arch, {}).get(_ceil_div(sparse_topk, _TILE_KV))
+    return early is not None and early[1] * num_query_tokens > early[0] * sm_count
 
 
 # Mirrors the Cake M64 seed's box_k_gather_for_width (TILE_KV = 128).  The M64
@@ -1231,7 +1257,9 @@ def _route(
             # B200 1.33-1.43x (one-partition producer 0.99-1.27x).
             return "fp8_h8_h16_source_exact"
         if num_heads == 64:
-            if _fp8_h64_uses_m64_body(num_query_tokens, sm_count):
+            if _fp8_h64_uses_m64_body(
+                num_query_tokens, sm_count, sparse_topk=sparse_topk, arch=arch
+            ):
                 # H64-specific single-CTA M64 persistent body (one CTA per
                 # token, unified 128-row KV stage, no V gathers).  Two exported
                 # programs, selected by the item width.
