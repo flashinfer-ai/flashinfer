@@ -212,8 +212,19 @@ The packed GDN training routes come in four combinations:
   bitwise those of the split form.  `save_mode="full"`,
   `boundary_mode="replay"`, a forward that hands its tapes to the kept-tape
   backward, a re-run that leaves #5 out and the backward's replayed forward
-  keep the split form.  The private lever `test_knobs={"fused_o": 0}` forces
-  the split form.
+  do not run it (the next item covers the full forward).
+  The private lever `test_knobs={"fused_o": 0}` forces the split form.
+* A forward with `save_mode="full"` that keeps its saved set and launches
+  the output program runs the tape-and-output walk `kcp_fwdh_out_tape`
+  (#2+5t under "Kernel structure") at each of its tape walks in place of
+  the #2 tape walk and #5: the walk writes the saved `h` / `v_new` tapes as
+  the tape walk does and each chunk's output as the output walk does.  The
+  output, the tapes, the saved set and the gradients are bitwise those of the
+  split form.  The workspace figures do not change; the output is allocated
+  at the first walk, while the forward's pools are still bound.  A full
+  forward without a saved set (`save_for_backward=False`), a re-run that
+  leaves #5 out and every light forward keep their form.  The private lever
+  `test_knobs={"fused_o_tape": 0}` forces the split form.
 * Host launch path: the record, grid and merge columns of a launch are
   resolved once per launch key and kept with the context's tables; each
   forward or backward body, eager or captured, binds the caller's current
@@ -268,7 +279,7 @@ eager calls too.
 | `segments` | **`None`**, an int | how many intra-rank segments a fragment is walked as (`P`): `None` takes the context's plan, an int overrides it within `[1, min(64, chunks of the rank's longest fragment)]` (the byte queries' `P=`). The plan (test knob `p_rule` names its policy) is a function of metadata and the SM count only. The shipped policy `fill_small_guard` starts from the deterministic twin's `row_cost_lpt` plan, which costs the three per-rank programs over every rank's fragment table with a crossing-aware model and switches the whole row away from the per-rank default only when an alternative is cheaper by at least its margin (2 % for the `occ` program; 0 % for the `one` program, which has no segment composition and takes a model tie), then lowers `P` as described under "Numerical mode" (faster schedule); the same topology gives the same `P` on every rank |
 | `offset_class` | **`"fla"`**, `"fp32"` | the class of the forward offset `B_f`: the walk from zero with the reference rounding points, or an FP32 walk (`B_f` only) |
 | `use_qk_l2norm_in_kernel` | **`False`**, `True` | the per-token L2 norm of every 128-channel Q / K head inside the programs (FLA's `use_qk_l2norm_in_kernel`; see "In-kernel Q / K L2 norm" below); a literal keyword of the three entry points as well |
-| `test_knobs` | **`None`** | names the test-only values a test selects (`precision_mode` 1 or 2) and private levers such as `fwdh_vh` (forces the #2 value width) and `fused_o` (`0` forces the split tape walk and #5); without it every test-only value is refused |
+| `test_knobs` | **`None`** | names the test-only values a test selects (`precision_mode` 1 or 2) and private levers such as `fwdh_vh` (forces the #2 value width), `fused_o` (`0` forces the split tape walk and #5 in a light forward) and `fused_o_tape` (`0` forces it in a `save_mode="full"` forward); without it every test-only value is refused |
 
 The validator refuses every test-only value not named in `test_knobs`,
 `exchange="ring"` without both of its conditions, `HV % H_qk != 0` and any
@@ -504,7 +515,7 @@ exactly in FP64).  Programs: `fwd_prep_l2n` (#1 that first writes `qn` /
 `kn` with the pullback before the one BF16 rounding; `group_reduce="host"`
 runs the unchanged #8 and the reference pullback on the host, per block of
 2048 tokens) and `qk_apply` (`qn = bf16(q * r)` from the saved `r`).  Every
-other reader (#2, #3, #5, #2+5, #7) is the unchanged program bound to `qn` / `kn`.
+other reader (#2, #3, #5, #2+5, #2+5t, #7) is the unchanged program bound to `qn` / `kn`.
 
 | path | `qn` / `kn` from | `r` the pullback reads | dropped |
 |---|---|---|---|
@@ -567,7 +578,7 @@ and the reference's own error.
 
 ## Kernel structure of one training step
 
-Nine new programs and one reused program compose a step (the affine merge is
+Ten new programs and one reused program compose a step (the affine merge is
 the KDA KCP package's gate-free program, rendered under this package's prefix
 with the `_kcp` suffix; its 20-hex digests equal that package's):
 
@@ -579,15 +590,17 @@ with the `_kcp` suffix; its 20-hex digests equal that package's):
 | 4 | `kcp_affine_merge` (`c8` / `c16`) | FP32 affine chains over state (`S = M S + B`) and map (compose) tiles; transposed for the adjoint |
 | 5 | `fwd_o` | the output from the `h` tape, `v_new` and `Aqk`; persistent, the tiles beyond the grid drawn in units from a ticket word |
 | 2+5 | `kcp_fwdh_out` (value width `vh` 128 or 64) | the output walk: #2's tape walk from `S_in` that writes each chunk's output from its `h` snapshot, its `v_new` operand, `q`, `Aqk` and `qscale` instead of the `h` / `v_new` tapes; the forward of a light, saved-boundary call that launches #5 runs it in place of the tape walk and #5 (see "Contract"); the `vh` 64 form (two CTAs per segment and head, the `_vh64` record) runs under the same rule as #2; bitwise the split form's output |
+| 2+5t | `kcp_fwdh_out_tape` (value width `vh` 128 or 64) | the tape-and-output walk: the output walk that also writes the `h` / `v_new` tapes as #2's tape walk does; the forward of a `save_mode="full"` call that keeps its saved set and launches #5 runs it in place of the tape walk and #5 (see "Contract"); the `vh` 64 form (the `_vh64` record) runs under the same rule as #2; bitwise the split form's output and tapes |
 | 6 | `bwd_prep` | `do_g`, `dv_intra`; persistent, the items beyond the grid drawn from a ticket word |
 | 7 | `kcp_dhu` (`offset` / `tape` forms, each at value width `vh` 128 or 64) | the adjoint state walk: the boundary adjoint from `dS_out`, the `dh` / `dv_new` tapes; the `vh` 64 form (two CTAs per segment and head, the `_vh64` records) writes bitwise-identical results and runs for the offset walk always, for the tape walk on `sm_100a` / `sm_103a` always and on `sm_107a` when `2 × n_walk × HV ≤ 4 × SM count`; on `sm_100a`, a walk whose longest segment has at least 400 chunks and whose two-CTA grid ends later than the one-CTA grid (LPT over two CTAs per SM) takes the `sm_107a` rule for both forms |
 | 8 | `bwd_dqkg` | `dq`, `dk` (grouped FP32 reduction), `dv`, the `dg` / `dbeta` partials; persistent, the (chunk, Q/K head) groups drawn from a ticket word |
 | 9 | `gate_epilogue` | the reverse cumulative sum of the `dg` partials and the `dbeta` finalize, FP32 fixed order |
 
 Tensor cores are used through `tcgen05` only; the FP32 chains and the gate
-epilogue run on CUDA cores.  Eighteen shipped libraries result (the two walk
-forms of #2 and of #7 and the output walk, each at two value widths, the two
-merge widths), each for `sm_100a`, `sm_103a` and `sm_107a`.
+epilogue run on CUDA cores.  Twenty shipped libraries result (the two walk
+forms of #2 and of #7, the output walk and the tape-and-output walk, each at
+two value widths, the two merge widths), each for `sm_100a`, `sm_103a` and
+`sm_107a`.
 
 The persistent programs (#5, #6, #8) launch no cooperative grid: a CTA that
 finishes its static tile draws the remaining work through an `atom.inc` on a
@@ -623,19 +636,21 @@ resident on a side stream therefore delays one CTA, not the whole grid.
   chain under the per-rank programs (the shipped row policy may walk a whole
   fragment as one chain when its cost model prefers that); a partition beyond
   a cap is refused at context build.
-* The output walk serves the light, saved-boundary forward only: under
-  `save_mode="full"` or `boundary_mode="replay"`, in a forward that hands its
-  tapes to the kept-tape backward and in the backward's replayed forward the
-  output program runs after the tape walk.
+* The output walk serves the light, saved-boundary forward, and the
+  tape-and-output walk the `save_mode="full"` forward with a saved set:
+  under `boundary_mode="replay"`, in a forward that hands its tapes to the
+  kept-tape backward, in a `save_mode="full"` forward without a saved set and
+  in the backward's replayed forward the output program runs after the tape
+  walk.
 * The causal-convolution halo backward is the conv package's program; its
   launch form is that package's.
 
 ## Status
 
 Experimental.  The kernels are the deterministic route's programs, rendered
-from the same Cake sources under this package's names, and the output walk
-`kcp_fwdh_out`, which has no deterministic twin; `build.json`'s
-`generator` block names the producing revision.  This package differs from
-its deterministic twin in the default segment plan (`fill_small_guard`, see
-"Numerical mode").  The tests are `tests/experimental/test_cake_gdn_train_kcp*.py`
+from the same Cake sources under this package's names, and the output walks
+`kcp_fwdh_out` and `kcp_fwdh_out_tape`, which have no deterministic twin;
+`build.json`'s `generator` block names the producing revision.  This package
+differs from its deterministic twin in the default segment plan
+(`fill_small_guard`, see "Numerical mode").  The tests are `tests/experimental/test_cake_gdn_train_kcp*.py`
 (API, single GPU and multi-GPU rows).

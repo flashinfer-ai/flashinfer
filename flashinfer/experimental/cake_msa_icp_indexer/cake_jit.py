@@ -64,8 +64,9 @@ PREFIX = "cake_msa_icp_indexer"
 # ``decode_plane`` -> ``select_publish`` -> merge (the modular chain), or
 # ``decode_topk`` -> ``topk16_publish`` -> merge (the fused chain).  A prefill
 # merge is ``merge_prefill``; a decode merge is ``merge_legacy`` (one token per
-# CTA) for legacy rows of at least 8 tokens, else ``merge`` (4 tokens per CTA),
-# from launch metadata only.  The fused prefill path replaces ``score`` and
+# CTA) for legacy rows of at least 8 tokens, ``merge_tagged`` (4 tokens per CTA,
+# polls its rows before it waits on its predecessor) for the facade's tagged
+# rows at world size 4, else ``merge`` (4 tokens per CTA), from launch metadata only.  The fused prefill path replaces ``score`` and
 # ``select_prefill`` with ``score_topk16`` (each (CTA, item) cell's sorted
 # Top16 lists in a caller pool) and ``prefill_list_carrier`` (the lists of a
 # row merged into the same carrier rows).  The ``_dc`` roles are the same
@@ -84,6 +85,7 @@ ROLES = (
     "merge",
     "merge_legacy",
     "merge_prefill",
+    "merge_tagged",
     "prefill_list_carrier",
     "select_prefill_dc",
     "select_publish_dc",
@@ -1279,7 +1281,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "tokens_per_cta_by_head", "rows": 4},
-        "kernel_symbol": "kernel_cake_msa_icp_indexer_49e1e0b15918872e4442",
+        "kernel_symbol": "kernel_cake_msa_icp_indexer_737107d7ed5474604a46",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -1287,7 +1289,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 1024,
             "use_pdl": "runtime",
         },
-        "library": "cake_msa_icp_indexer_49e1e0b15918872e4442",
+        "library": "cake_msa_icp_indexer_737107d7ed5474604a46",
         "logical": {
             "capacity": "capacity",
             "errors": "errors",
@@ -1568,7 +1570,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "tokens_per_cta_by_head", "rows": 1},
-        "kernel_symbol": "kernel_cake_msa_icp_indexer_c814d9c38454ed640f71",
+        "kernel_symbol": "kernel_cake_msa_icp_indexer_49afe8e48d6d4c7a491b",
         "launch": {
             "block": (32, 1, 1),
             "cluster": (1, 1, 1),
@@ -1576,7 +1578,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 256,
             "use_pdl": "runtime",
         },
-        "library": "cake_msa_icp_indexer_c814d9c38454ed640f71",
+        "library": "cake_msa_icp_indexer_49afe8e48d6d4c7a491b",
         "logical": {
             "capacity": "capacity",
             "errors": "errors",
@@ -1690,7 +1692,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "tokens_per_cta_by_head", "rows": 4},
-        "kernel_symbol": "kernel_cake_msa_icp_indexer_0bcc6f39f14b177ad30e",
+        "kernel_symbol": "kernel_cake_msa_icp_indexer_5a530c36a00b387eb420",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -1698,7 +1700,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 1024,
             "use_pdl": "runtime",
         },
-        "library": "cake_msa_icp_indexer_0bcc6f39f14b177ad30e",
+        "library": "cake_msa_icp_indexer_5a530c36a00b387eb420",
         "logical": {
             "capacity": "capacity",
             "errors": "errors",
@@ -2685,7 +2687,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "tokens_per_cta_by_head", "rows": 4},
-        "kernel_symbol": "kernel_cake_msa_icp_indexer_467b40c601c1e1ec7deb",
+        "kernel_symbol": "kernel_cake_msa_icp_indexer_acb67ff15feb6c4a78f5",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -2693,7 +2695,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 1024,
             "use_pdl": "runtime",
         },
-        "library": "cake_msa_icp_indexer_467b40c601c1e1ec7deb",
+        "library": "cake_msa_icp_indexer_acb67ff15feb6c4a78f5",
         "logical": {
             "capacity": "capacity",
             "errors": "errors",
@@ -2746,7 +2748,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "tokens_per_cta_by_head", "rows": 1},
-        "kernel_symbol": "kernel_cake_msa_icp_indexer_a77d085731244b7ddd2e",
+        "kernel_symbol": "kernel_cake_msa_icp_indexer_8554d267ca8b777778e9",
         "launch": {
             "block": (32, 1, 1),
             "cluster": (1, 1, 1),
@@ -2754,7 +2756,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 256,
             "use_pdl": "runtime",
         },
-        "library": "cake_msa_icp_indexer_a77d085731244b7ddd2e",
+        "library": "cake_msa_icp_indexer_8554d267ca8b777778e9",
         "logical": {
             "capacity": "capacity",
             "errors": "errors",
@@ -2807,7 +2809,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "ffi_entry": "run",
         "grid_rule": {"kind": "tokens_per_cta_by_head", "rows": 4},
-        "kernel_symbol": "kernel_cake_msa_icp_indexer_b0080cfc8b89affa9de1",
+        "kernel_symbol": "kernel_cake_msa_icp_indexer_d014e39562f783f4ee5d",
         "launch": {
             "block": (128, 1, 1),
             "cluster": (1, 1, 1),
@@ -2815,7 +2817,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "dynamic_smem_bytes": 1024,
             "use_pdl": "runtime",
         },
-        "library": "cake_msa_icp_indexer_b0080cfc8b89affa9de1",
+        "library": "cake_msa_icp_indexer_d014e39562f783f4ee5d",
         "logical": {
             "capacity": "capacity",
             "errors": "errors",
@@ -2838,6 +2840,67 @@ MODULES: dict[str, dict[str, Any]] = {
         },
         "page": None,
         "role": "merge_prefill_dc",
+        "rows": None,
+    },
+    "merge_tagged": {
+        "arches": ["sm_100a", "sm_103a", "sm_107a"],
+        "arg_plan": [
+            ["buffer", "recv"],
+            ["buffer", "num_valid_pages"],
+            ["buffer", "output"],
+            ["buffer", "errors"],
+            ["buffer", "expected"],
+            ["parameter", "recv_stride_src"],
+            ["parameter", "recv_stride_h"],
+            ["parameter", "recv_stride_t"],
+            ["parameter", "out_stride_t"],
+            ["parameter", "out_stride_h"],
+            ["parameter", "capacity"],
+            ["parameter", "num_tokens"],
+            ["parameter", "world"],
+            ["parameter", "tagged"],
+            ["parameter", "prefill"],
+            ["parameter", "init_blocks"],
+            ["parameter", "local_blocks"],
+            ["parameter", "spin_limit"],
+            ["launch", "enable_pdl"],
+            ["grid", "grid_x"],
+            ["grid", "grid_y"],
+            ["grid", "grid_z"],
+        ],
+        "ffi_entry": "run",
+        "grid_rule": {"kind": "tokens_per_cta_by_head", "rows": 4},
+        "kernel_symbol": "kernel_cake_msa_icp_indexer_355225d90e36323a16b7",
+        "launch": {
+            "block": (128, 1, 1),
+            "cluster": (1, 1, 1),
+            "cooperative": False,
+            "dynamic_smem_bytes": 1024,
+            "use_pdl": "runtime",
+        },
+        "library": "cake_msa_icp_indexer_355225d90e36323a16b7",
+        "logical": {
+            "capacity": "capacity",
+            "errors": "errors",
+            "expected": "expected",
+            "init_blocks": "init_blocks",
+            "local_blocks": "local_blocks",
+            "num_tokens": "num_tokens",
+            "num_valid_pages": "num_valid_pages",
+            "out_stride_h": "out_stride_h",
+            "out_stride_t": "out_stride_t",
+            "output": "output",
+            "prefill": "prefill",
+            "recv": "recv",
+            "recv_stride_h": "recv_stride_h",
+            "recv_stride_src": "recv_stride_src",
+            "recv_stride_t": "recv_stride_t",
+            "spin_limit": "spin_limit",
+            "tagged": "tagged",
+            "world": "world",
+        },
+        "page": None,
+        "role": "merge_tagged",
         "rows": None,
     },
 }
