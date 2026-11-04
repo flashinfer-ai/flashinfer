@@ -306,13 +306,15 @@ gdn_det_comm_bytes_kcp(ctx, *, H_qk, HV, C) -> {rank: {c1_send, c1_recv, c2_recv
     b1_send = s * n_in(r) * (1 if save_transfer else 2)
     c1_recv / b1_recv on an owner = 2 * s_owner * (fragments it owns)      halo = rows(r) * C * 2
 gdn_det_saved_bytes_kcp(ctx, *, H_qk, HV, save_mode, save_transfer=True, P=None) -> per rank (the table above)
-gdn_det_workspace_bytes_kcp(ctx, *, H_qk, HV, P=None, reuse_recompute_tapes=None) -> per rank: the most the caller-held
-    workspace binds in the forward (the fused form: #1, the pools + the eight tapes #1 writes; the split form, also
-    `forward_split` of the layout: the tape walk, the pools + the eight live tapes) or the backward (its phases: the
-    exchange, the adjoint tape walk, the end state); the default (`None`, i.e. `"auto"`) reports the replay form, the
-    bound of both forms, in which the ten forward tapes are workspace; `reuse_recompute_tapes=True` gives the kept-tape
-    figure, in which they are the recompute forward's hand-off tensors outside the workspace
-    (`gdn_det_workspace_layout_kcp` lists them as `bwd.kept_tapes` and the total as `backward_transient`)
+gdn_det_workspace_bytes_kcp(ctx, *, H_qk, HV, P=None, reuse_recompute_tapes=None, save_for_backward=True) -> per rank:
+    the most the caller-held workspace binds in the forward (the fused form: #1, the pools + the eight tapes #1 writes;
+    the split form, also `forward_split` of the layout: the tape walk, the pools + the eight live tapes) or the backward
+    (its phases: the exchange, the adjoint tape walk, the end state); the default (`None`, i.e. `"auto"`) reports the
+    replay form, the bound of both forms, in which the ten forward tapes are workspace; `reuse_recompute_tapes=True`
+    gives the kept-tape figure, in which they are the recompute forward's hand-off tensors outside the workspace
+    (`gdn_det_workspace_layout_kcp` lists them as `bwd.kept_tapes` and the total as `backward_transient`);
+    `save_for_backward=False` with `backward=False`: a `chunk_gdn_det_fwd_kcp` forward without a saved set, which binds
+    `c1_recv` / `stage_m` from the workspace and, with the norm, the arena `r` at #1 of the fused form (`fwd.qk_rstd`)
 ```
 
 `H_qk` enters the halo and strided-view terms; the exchange terms depend on

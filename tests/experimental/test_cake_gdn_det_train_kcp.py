@@ -4074,6 +4074,61 @@ def test_workspace_layout_follows_the_arena_lifetimes() -> None:
         )
 
 
+@pytest.mark.parametrize("segments", (1, 2))
+def test_workspace_layout_of_a_forward_without_a_saved_set(segments) -> None:
+    """A caller-held workspace and ``chunk_gdn_det_fwd_kcp`` with the norm: without a saved set
+    (``save_for_backward=False``) the fused forward's #1 binds the arena ``r`` (``fwd.qk_rstd``, ``8 T_r H_qk``) and the
+    workspace pools a saved set replaces (the ``stage_m`` plane at ``P > 1``).  The forward's peak is the ``forward`` of
+    ``gdn_det_workspace_layout_kcp(..., save_for_backward=False, backward=False)`` exactly (with ``fused_o=0`` its
+    ``forward_split``: ``r`` goes before the tape walk); the saved-set forward's peak is the default layout's, which the
+    keyword leaves unchanged."""
+    kcp, ctx, ops = _ckpt_setup()
+    gb = _package("cake_bytes")
+    H_qk, HV = 2, 6
+    leaves = [ops[n] for n in LEAVES]
+    o = dict(use_qk_l2norm_in_kernel=True)
+    default = gb.gdn_det_workspace_layout_kcp(ctx, H_qk=H_qk, HV=HV, P=segments, **o)
+    for save in (False, True):
+        layout = gb.gdn_det_workspace_layout_kcp(
+            ctx,
+            H_qk=H_qk,
+            HV=HV,
+            P=segments,
+            backward=save,
+            save_for_backward=save,
+            **o,
+        )
+        for fused in (1, 0):
+            ws = _PeakWorkspace(kcp)
+            _out, saved = kcp.chunk_gdn_det_fwd_kcp(
+                *leaves,
+                ctx,
+                workspace=ws,
+                backend="fake",
+                save_for_backward=save,
+                segments=segments,
+                test_knobs={"fused_o": fused},
+                **o,
+            )
+            assert (saved is not None) == save
+            assert kcp.LAST_CALL["fwd"]["fwd_o"] == ("fused" if fused else "launched")
+            assert kcp.LAST_CALL["fwd"]["P"] == segments
+            want = layout["forward"] if fused else layout["forward_split"]
+            assert ws.peak == want, (save, fused, ws.peak, want)
+            assert not {*kcp.QK_TAPES, kcp.QK_RSTD} & set(ws._tapes), sorted(ws._tapes)
+        assert layout["fwd.qk_rstd"] == (0 if save else 8 * ctx.T_r * H_qk), save
+    assert layout == default
+    # the replay boundary keeps no saved set either way; a saved boundary without one has no backward
+    replay = dict(boundary_mode="replay", P=segments, **o)
+    assert gb.gdn_det_workspace_layout_kcp(
+        ctx, H_qk=H_qk, HV=HV, save_for_backward=False, **replay
+    ) == gb.gdn_det_workspace_layout_kcp(ctx, H_qk=H_qk, HV=HV, **replay)
+    with pytest.raises(ValueError, match="backward=False"):
+        gb.gdn_det_workspace_layout_kcp(
+            ctx, H_qk=H_qk, HV=HV, save_for_backward=False, **o
+        )
+
+
 # --------------------------------------------------------------------------- issue #7074 (2): reuse_recompute_tapes="auto"
 # The recompute's tapes are kept only when the GDN node closes the checkpointed region (the frame proof); with a later saver the
 # kept set would live through that operation's backward and raise the region's peak by the full tape set, so "auto" replays there.
