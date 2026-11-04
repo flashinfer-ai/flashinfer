@@ -1741,7 +1741,7 @@ def test_router_units_policy(monkeypatch):
         "nn_t", arch="sm_103a", sm_count=152, M=6144, N=256, K=16231
     ) == (44 + 5 * 76, 22, round(24 * 508 * 44 / 76))
     assert cake_backend.ROUTER_RULES[("sm_100a", "nn_t", 4096, 256)] == (
-        (1, 256, "simt_n128m64s2"),
+        (1, 224, "simt_n128m64s2"),
         (10240, 16384, "H1x5p44"),
     )
     assert cake_backend.router_partition(
@@ -1901,7 +1901,7 @@ def test_router_units_policy(monkeypatch):
 # other token count runs the deterministic program.  A SIMT window comes first: where the table's windows do not
 # hold, the token count takes the next window that holds it
 ROUTER_WGRAD_WINDOWS = {
-    ("sm_100a", 4096): ((1, 256, "simt_n128m64s2"), (10240, 16384, "H1x5p44")),
+    ("sm_100a", 4096): ((1, 224, "simt_n128m64s2"), (10240, 16384, "H1x5p44")),
     ("sm_100a", 5120): (
         (1, 256, "simt_n64m64s2"),
         (1, 128, "waves"),
@@ -1920,7 +1920,7 @@ ROUTER_WGRAD_WINDOWS_BY_SM = {
     ("sm_107a", 208, 5120): ((16172, 16384, "H0.5x4"),),
     ("sm_107a", 212, 4096): ((1, 256, "simt_n128m64s2"),),
     ("sm_107a", 212, 5120): ((1, 256, "simt_n128m64s2"), (16172, 16384, "H0.5x4")),
-    ("sm_107a", 212, 6144): ((1, 256, "simt_n128m64s2"), (16172, 16384, "H0.5x4")),
+    ("sm_107a", 212, 6144): ((1, 192, "simt_n128m64s2"), (16172, 16384, "H0.5x4")),
 }
 
 
@@ -3790,7 +3790,7 @@ def test_k2_memo_is_the_planners_check(monkeypatch):
     assert runs(geometry, 1) and runs(geometry, 0)
     own = cake_backend.ROUTER_RULES_BY_SM[("sm_107a", 212)]
     key = ("sm_107a", "nn_t", 6144, 256)
-    # the 212-SM hidden-6144 windows (SIMT to 256 tokens, head/tail 16172 to 16384 tokens)
+    # the 212-SM hidden-6144 windows (SIMT to 192 tokens, head/tail 16172 to 16384 tokens)
     shipped = own[key]
     monkeypatch.setitem(own, key, ((1, 1024, "pairs"),))
     assert not runs(geometry, 1) and runs(geometry, 0) and runs(geometry, 2)
@@ -6378,7 +6378,7 @@ def test_gpu_router_deterministic_program_through_the_binding():
     rows' launches are carved again with the same bits; another stream binds an arena of its own; a binding the
     deterministic package refuses raises its error."""
     device, arch = _atomic_device_or_skip()
-    # no router verdict on any architecture from 257 to 16171 tokens (the SIMT windows end at 256 tokens)
+    # no router verdict on any architecture from 257 to 16171 tokens (the SIMT windows end at 256 tokens or before)
     hidden = 6144
     cake_backend.clear_convenience_caches()
 
