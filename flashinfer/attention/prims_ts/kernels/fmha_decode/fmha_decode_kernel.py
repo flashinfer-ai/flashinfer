@@ -1430,6 +1430,14 @@ def _build_decode_gen_schedule(
         tmem_softmax_global1.p_ref = smem_p1
         tmem_softmax_global1.tmem_s_ref = tmem_s1
 
+    # Compact runtime splits pack partials by the launch fanout.
+    partial_split_stride = None
+    if cfg.uses_compact_split_grid and requested_splits is not None:
+        partial_split_stride = (
+            requested_splits[0]
+            if isinstance(requested_splits, tuple)
+            else requested_splits
+        )
     tmem_corr0 = TmemCorrResource(
         inst_id=0,
         cfg=cfg,
@@ -1452,6 +1460,7 @@ def _build_decode_gen_schedule(
         q_token_offset=q_token_offset,
         seq_len_q=seq_len_q,
         active_splits_kv=active_splits_kv,
+        partial_split_stride=partial_split_stride,
         static_full_split_prefix=static_full_split_prefix,
         name="tmemCorr0",
         sage_v_scales_ref=sage_v_scales,
@@ -1483,6 +1492,7 @@ def _build_decode_gen_schedule(
             q_token_offset=q_token_offset,
             seq_len_q=seq_len_q,
             active_splits_kv=active_splits_kv,
+            partial_split_stride=partial_split_stride,
             static_full_split_prefix=static_full_split_prefix,
             name="tmemCorr1",
             sage_v_scales_ref=sage_v_scales,

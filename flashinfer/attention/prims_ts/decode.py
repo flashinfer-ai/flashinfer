@@ -110,6 +110,9 @@ class _DecodeLaunchSpec:
     policy: tuple[tuple[str, object], ...]
     scratch_shapes: tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...]]
     requested_splits: Optional[int] = None
+    # Split-counter entries reserved at the buffer tail (at least two device
+    # waves), so plans sharing one buffer keep counters at the same bytes.
+    scratch_reserve: int = 0
 
 
 @dataclass(frozen=True)
@@ -282,12 +285,14 @@ def _append_workspace_section(
     byte_end: int,
     shape: tuple[int, ...],
     dtype: torch.dtype,
+    reserve_elems: int = 0,
 ) -> tuple[_WorkspaceSection, int]:
     byte_offset = _align_up(byte_end)
     byte_size = math.prod(shape) * _dtype_itemsize(dtype)
+    reserved = max(byte_size, reserve_elems * _dtype_itemsize(dtype))
     return (
         _WorkspaceSection(byte_offset, byte_size, shape, dtype),
-        byte_offset + byte_size,
+        byte_offset + reserved,
     )
 
 
@@ -297,7 +302,13 @@ def _make_decode_workspace_layout(
     *,
     use_separate_reduction_kernel: bool,
     use_split_kv: bool = False,
+    scratch_reserve: int = 0,
 ) -> _DecodeWorkspaceLayout:
+    """Lay out partials first, then zero-at-rest state.
+
+    The state (Q offsets, sinks, ``scratch_reserve`` split counters) comes
+    last; binding anchors it to the buffer end (see ``_bind_decode_workspace``).
+    """
     partial_o_shape, partial_stats_shape, counter_shape = scratch_shapes
     partial_o_dtype = out_dtype
     if use_separate_reduction_kernel and out_dtype in (
@@ -315,11 +326,11 @@ def _make_decode_workspace_layout(
     partial_stats, byte_end = _append_workspace_section(
         byte_end, partial_stats_shape, torch.float32
     )
-    split_kv_counter, byte_end = _append_workspace_section(
-        byte_end, counter_shape, torch.int32
-    )
     cu_seqlens_q, byte_end = _append_workspace_section(byte_end, (1,), torch.int32)
     attention_sinks, byte_end = _append_workspace_section(byte_end, (1,), torch.float32)
+    split_kv_counter, byte_end = _append_workspace_section(
+        byte_end, counter_shape, torch.int32, scratch_reserve
+    )
     return _DecodeWorkspaceLayout(
         partial_o=partial_o,
         partial_stats=partial_stats,
@@ -370,16 +381,27 @@ def _workspace_section_view(
 def _bind_decode_workspace(
     workspace_buffer: torch.Tensor, layout: _DecodeWorkspaceLayout
 ) -> _DecodeWorkspaceViews:
+    # Anchor the zero-at-rest state (Q offsets, sinks, counters) to the buffer
+    # end so plans sharing one buffer keep it at the same bytes; partials stay
+    # at offset 0.
+    shift = max(
+        workspace_buffer.numel() * workspace_buffer.element_size() - layout.total_bytes,
+        0,
+    )
+    shift -= shift % _WORKSPACE_ALIGNMENT
+
+    def state_view(section: _WorkspaceSection) -> torch.Tensor:
+        return _workspace_section_view(
+            workspace_buffer,
+            replace(section, byte_offset=section.byte_offset + shift),
+        )
+
     return _DecodeWorkspaceViews(
         partial_o=_workspace_section_view(workspace_buffer, layout.partial_o),
         partial_stats=_workspace_section_view(workspace_buffer, layout.partial_stats),
-        split_kv_counter=_workspace_section_view(
-            workspace_buffer, layout.split_kv_counter
-        ),
-        cu_seqlens_q=_workspace_section_view(workspace_buffer, layout.cu_seqlens_q),
-        attention_sinks=_workspace_section_view(
-            workspace_buffer, layout.attention_sinks
-        ),
+        split_kv_counter=state_view(layout.split_kv_counter),
+        cu_seqlens_q=state_view(layout.cu_seqlens_q),
+        attention_sinks=state_view(layout.attention_sinks),
     )
 
 
@@ -1154,6 +1176,7 @@ def _decode_scratch_shapes(
     num_kv_heads: int,
     head_dim: int,
     seq_len_q: int,
+    requested_splits: Optional[int] = None,
 ):
     """Return split-workspace shapes for a static config and batch extent."""
 
@@ -1180,13 +1203,25 @@ def _decode_scratch_shapes(
         num_q_groups = cute.sym_int()
     else:
         num_q_groups = seq_len_q * geometry.head_ctas_per_token
-    partial_o_shape = (
-        batch_size,
-        num_kv_heads,
-        int(cfg.max_splits_kv),
-        head_ratio * seq_len_q,
-        head_dim,
-    )
+    if cfg.uses_compact_split_grid:
+        # Partials are packed by the launch fanout: slot (b * Hkv + h) *
+        # requested + split. The slot count is a runtime extent, so the
+        # compiled kernel does not depend on the plan's batch or fanout.
+        if requested_splits is None:
+            import cutlass.cute as cute
+
+            num_slots = cute.sym_int()
+        else:
+            num_slots = batch_size * num_kv_heads * int(requested_splits)
+        partial_o_shape = (num_slots, head_ratio * seq_len_q, head_dim)
+    else:
+        partial_o_shape = (
+            batch_size,
+            num_kv_heads,
+            int(cfg.max_splits_kv),
+            head_ratio * seq_len_q,
+            head_dim,
+        )
     partial_stats_shape = (
         partial_o_shape[:-1]
         if cfg.use_separate_reduction_kernel
@@ -1205,6 +1240,7 @@ def _decode_launch_spec_from_config(
     head_dim: int,
     seq_len_q: int,
     max_active_clusters: int,
+    requested_splits: Optional[int] = None,
 ) -> _DecodeLaunchSpec:
     """Derive policy and scratch geometry from one finalized FMHA config."""
 
@@ -1215,32 +1251,20 @@ def _decode_launch_spec_from_config(
         num_kv_heads=num_kv_heads,
         head_dim=head_dim,
         seq_len_q=seq_len_q,
+        requested_splits=requested_splits,
     )
+    # Every plan, split or not, reserves counters for two device-wide waves of
+    # logical Q CTAs, so plans sharing one buffer keep the same state bytes.
+    # Larger counts keep their exact size and cannot share a buffer.
+    scratch_reserve = max(2 * int(max_active_clusters), math.prod(scratch_shapes[2]))
 
     return _DecodeLaunchSpec(
         config=cfg,
         max_active_clusters=int(max_active_clusters),
         policy=_decode_policy_from_config(cfg),
         scratch_shapes=scratch_shapes,
+        scratch_reserve=scratch_reserve,
     )
-
-
-def _runtime_split_kv_capacity(requested_splits: int, sm_count: int) -> int:
-    """Prepared GMEM split capacity for a runtime split-KV fanout.
-
-    Ranges 1, 2-4, 5-8, 9-16, 17-32, 33-64, then sixteen-split ranges above 64,
-    clipped to the SM count (see "Runtime split-KV policy" in README.md). Every
-    fanout in a range shares one compiled topology, and the capacity is at most
-    twice the fanout, so per-plan scratch no longer scales with the SM count.
-    """
-
-    if requested_splits <= 1:
-        return 1
-    if requested_splits <= 64:
-        capacity = max(4, 1 << (requested_splits - 1).bit_length())
-    else:
-        capacity = -(-requested_splits // 16) * 16
-    return min(capacity, sm_count)
 
 
 # Share CPU policy selection across equivalent plans/layers.
@@ -1475,16 +1499,16 @@ def _resolve_decode_launch_spec(
     if cfg.use_split_kv and not use_q_token_kv_block_sparse_route:
         sm_count = get_device_sm_count(torch.device("cuda", device_index))
         requested_splits = min(requested_splits, sm_count)
-        # GMEM capacity is the prepared range of the runtime fanout, not the SM
-        # count: plans in one range share a compiled topology, and partial-O
-        # scratch stays proportional to the fanout the plan can request.
+        # GMEM capacity is a device bound, independent of the runtime fanout.
+        # It only bounds the fanout: compact partials are strided by the
+        # runtime fanout, so capacity does not size scratch.
         # Keep Q/batch fusion within CUDA's grid-Z limit; larger grids retain
         # the original exact-fanout launch. Cluster sizes remain resident topology.
         compact_grid = batch_size * q_ctas(cfg) <= 65535
         capacity = (
             requested_splits
             if cfg.use_cluster_smem_reduction or not compact_grid
-            else _runtime_split_kv_capacity(requested_splits, sm_count)
+            else sm_count
         )
         cfg = replace(
             cfg,
@@ -1501,8 +1525,14 @@ def _resolve_decode_launch_spec(
         head_dim=head_dim,
         seq_len_q=seq_len_q,
         max_active_clusters=int(max_active_clusters),
+        requested_splits=requested_splits if cfg.use_split_kv else None,
     )
-    # Report the runtime fanout separately from the prepared workspace capacity.
+    # Split plans stay below one wave of logical Q CTAs, so their counters fit
+    # the shared reserve. The sparse route binds its own exact slice.
+    assert use_q_token_kv_block_sparse_route or (
+        resolved.scratch_reserve == 2 * int(max_active_clusters)
+    ), "split counters exceed the shared workspace reserve"
+    # Report the runtime fanout separately from the SM-bound workspace capacity.
     policy = dict(resolved.policy)
     policy["splits_kv"] = requested_splits
     return replace(
@@ -2141,9 +2171,14 @@ def get_prims_ts_batch_decode_workspace_size(
     ``torch.int8`` or ``torch.uint8`` CUDA tensor and zero it before its first
     FMHA launch. Re-zero a reused buffer whenever any workspace-layout input,
     including ``batch_size``, changes because the internal section offsets can
-    move even when the compiled callable is reused. Fixed-Q launches use
-    ``seq_len_q``. Packed-Q launches provide ``qo_indptr`` and the explicit
-    static ``max_q_len`` bound used for workspace geometry and JIT policy.
+    move even when the compiled callable is reused. Alternatively, plans for one
+    device may share one buffer of at least the largest size returned for them:
+    zero the whole buffer once, bind the same full tensor to every plan (not
+    slices), and plan and launch them on one stream. PrimTS may use any byte
+    of the passed buffer: its zero-at-rest control state sits at the buffer
+    end, and launches leave it zero. Fixed-Q launches use ``seq_len_q``.
+    Packed-Q launches provide ``qo_indptr`` and the explicit static
+    ``max_q_len`` bound used for workspace geometry and JIT policy.
     ``max_kv_len`` must be no larger than ``2,147,483,392`` so the padded
     256-token K/V tile endpoint remains representable as signed Int32.
     ``storage_page_size`` defaults to the semantic ``page_size``. A larger
@@ -2872,6 +2907,7 @@ def _resolve_decode_workspace_layout(
         out_dtype,
         use_separate_reduction_kernel=spec.config.use_separate_reduction_kernel,
         use_split_kv=spec.config.use_split_kv,
+        scratch_reserve=spec.scratch_reserve,
     )
 
 
@@ -3749,6 +3785,7 @@ def _prepare_prims_ts_batch_decode_plan(
         out_dtype,
         use_separate_reduction_kernel=spec.config.use_separate_reduction_kernel,
         use_split_kv=spec.config.use_split_kv,
+        scratch_reserve=spec.scratch_reserve,
     )
     _validate_workspace_buffer(
         workspace_buffer,
@@ -4197,7 +4234,21 @@ class BatchDecodePagedTSWrapper:
             if fixed_uniform_kv and spec.requested_splits == cfg.splits_kv:
                 # The live bound equals this declared topology; partial activity
                 # is still derived from the owned lengths, as before runtime buckets.
-                spec = replace(spec, config=replace(cfg, runtime_split_kv=False))
+                # Static kernels use the capacity-strided layout; same bytes
+                # since requested == capacity.
+                static_cfg = replace(cfg, runtime_split_kv=False)
+                spec = replace(
+                    spec,
+                    config=static_cfg,
+                    scratch_shapes=_decode_scratch_shapes(
+                        static_cfg,
+                        batch_size=batch_size,
+                        num_qo_heads=num_qo_heads,
+                        num_kv_heads=num_kv_heads,
+                        head_dim=head_dim,
+                        seq_len_q=seq_len_q,
+                    ),
+                )
         compile_spec = _make_decode_compile_spec(
             spec,
             device_index=device_index,
@@ -4227,6 +4278,7 @@ class BatchDecodePagedTSWrapper:
             out_dtype,
             use_separate_reduction_kernel=(spec.config.use_separate_reduction_kernel),
             use_split_kv=spec.config.use_split_kv,
+            scratch_reserve=spec.scratch_reserve,
         )
         if workspace_buffer is None:
             initialize_workspace = True
