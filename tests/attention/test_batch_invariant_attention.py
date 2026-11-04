@@ -859,6 +859,100 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
             is_causal=False,
             **kw,
         )
+    # inputs the kernels would read out of bounds or mis-address: typed refusals at plan() / run()
+    with pytest.raises(
+        bi.BatchInvariantUnsupportedError
+    ):  # qo_indptr not starting at 0
+        w.plan(
+            pr.qo_indptr + 8,
+            pr.kv_indptr,
+            pr.kv_indices,
+            pr.kv_last,
+            32,
+            8,
+            128,
+            16,
+            causal=True,
+            **kw,
+        )
+    with pytest.raises(
+        bi.BatchInvariantUnsupportedError
+    ):  # kv_indices shorter than kv_indptr[-1]
+        w.plan(
+            pr.qo_indptr,
+            pr.kv_indptr,
+            pr.kv_indices[:-1],
+            pr.kv_last,
+            32,
+            8,
+            128,
+            16,
+            causal=True,
+            **kw,
+        )
+    with pytest.raises(
+        bi.BatchInvariantUnsupportedError
+    ):  # a scale that rounds to zero in binary32
+        w.plan(
+            pr.qo_indptr,
+            pr.kv_indptr,
+            pr.kv_indices,
+            pr.kv_last,
+            32,
+            8,
+            128,
+            16,
+            causal=True,
+            sm_scale=1e-46,
+            **kw,
+        )
+    w.plan(
+        pr.qo_indptr,
+        pr.kv_indptr,
+        pr.kv_indices,
+        pr.kv_last,
+        32,
+        8,
+        128,
+        16,
+        causal=True,
+        **kw,
+    )
+    k, v = pr.cache("NHD")
+    top = int(pr.kv_indices.max())
+    with pytest.raises(
+        bi.BatchInvariantUnsupportedError
+    ):  # a cache without the largest planned page
+        w.run(pr.q, (k[:top], v[:top]))
+    wide = torch.empty(k.shape[:-1] + (2 * 128,), dtype=k.dtype, device=k.device)[
+        ..., ::2
+    ]
+    with pytest.raises(
+        bi.BatchInvariantUnsupportedError
+    ):  # a non-unit stride along the head dim
+        w.run(pr.q, (wide, v))
+    with pytest.raises(bi.BatchInvariantUnsupportedError):  # out on another device
+        w.run(pr.q, (k, v), out=torch.empty(pr.q.shape, dtype=torch.bfloat16))
+    rag.plan(pr.qo_indptr, pr.kv_indptr_rag, 32, 8, 128, causal=True, **kw)
+    with pytest.raises(
+        bi.BatchInvariantUnsupportedError
+    ):  # fewer packed tokens than planned
+        rag.run(pr.q, pr.k_rag[:-1], pr.v_rag[:-1])
+    with pytest.raises(
+        ValueError
+    ):  # the functional API: fewer query rows than the plan
+        from flashinfer.attention.batch_invariant import engine
+
+        engine.run_attention(
+            w._batch_invariant._planned,
+            pr.q[:-1].contiguous(),
+            k,
+            v,
+            pr.kv_indptr,
+            pr.kv_indices,
+            1.0 / math.sqrt(128),
+        )
+    assert dec.resolved_backend == "batch_invariant"
     # page-table metadata on the CPU is staged to the device (as the other wrappers accept)
     ref = bits(run_paged_prefill(pr))
     w.plan(
@@ -888,6 +982,18 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
     plan_kw = dict(q_data_type=torch.bfloat16, kv_data_type=torch.bfloat16)
     dec.plan(big.kv_indptr, big.kv_indices, big.kv_last, 32, 8, 128, 16, **plan_kw)
     assert dec._batch_invariant._config.split_policy == "fused"
+    # workspace_size() reports the split plan's need: a buffer of exactly that size plans split units
+    need, _ = dec.workspace_size(
+        big.kv_indptr, big.kv_indices, big.kv_last, 32, 8, 128, 16, **plan_kw
+    )
+    assert need > tiny.numel()
+    exact = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+        torch.empty(need, dtype=torch.uint8, device=pr.device),
+        "NHD",
+        batch_invariant=True,
+    )
+    exact.plan(big.kv_indptr, big.kv_indices, big.kv_last, 32, 8, 128, 16, **plan_kw)
+    assert exact._batch_invariant._config.split_policy == "auto"
     dec.reset_workspace_buffer(
         ws, torch.empty(8 << 20, dtype=torch.uint8, device=pr.device)
     )
@@ -901,7 +1007,7 @@ def test_unsupported_inputs_raise_and_nothing_falls_back():
 @pytest.mark.skipif(
     torch.cuda.is_available()
     and torch.cuda.get_device_properties(0).total_memory < (60 << 30),
-    reason="needs ~12 GB of device memory",
+    reason="needs tens of GB of device memory (the large problems and their pools)",
 )
 def test_output_beyond_2_31_elements():
     """An output of more than 2^31 elements: the kernels' output and workspace offsets are 64-bit. R2 gives the check: the
@@ -940,3 +1046,59 @@ def test_output_beyond_2_31_elements():
     sub.kv_last = dec.kv_last[-tail:].contiguous()
     small, _ = run_decode(sub)
     assert torch.equal(bits(small), bits(out[-tail:]))
+    del out, dec
+    # the split path past 2^31: many short requests and one long-KV request whose split units write partials to the workspace and
+    # fold them in the fixup kernel or in-kernel; the long request alone gives the same bits (R2)
+    from dataclasses import replace
+
+    from flashinfer.attention.batch_invariant import engine
+
+    D = 256
+    n_short, long_kv = 2100, 65536
+    pr = Problem(
+        [ql] * n_short + [ql], [ql] * n_short + [long_kv], Hq, Hkv, D, 16, seed=16
+    )
+    ws = workspace(pr.device, mb=768)
+    alone = Problem([ql], [long_kv], Hq, Hkv, D, 16, seed=17)
+    alone.q = pr.q[-ql:].contiguous()
+    alone.k_nhd, alone.v_nhd = pr.k_nhd, pr.v_nhd
+    alone.kv_indices = pr.kv_indices[int(pr.kv_indptr[-2]) :].contiguous()
+    alone.kv_indptr = (pr.kv_indptr[-2:] - pr.kv_indptr[-2]).contiguous()
+    alone.kv_last = pr.kv_last[-1:].contiguous()
+    for merge in ("fixup", "inkernel"):
+        cfg = replace(engine.default_config(D=D), split_policy="split", merge=merge)
+        outs = []
+        for problem in (pr, alone):
+            planned = engine.plan_attention(
+                problem.qo_indptr,
+                problem.kv_indptr,
+                problem.kv_last,
+                Hq,
+                Hkv,
+                D,
+                16,
+                -1,
+                cfg,
+                ws,
+                pr.device,
+            )
+            outs.append(
+                engine.run_attention(
+                    planned,
+                    problem.q,
+                    problem.k_nhd,
+                    problem.v_nhd,
+                    problem.kv_indptr,
+                    problem.kv_indices,
+                    1.0 / math.sqrt(D),
+                    -1,
+                    "NHD",
+                    None,
+                    cfg,
+                )
+            )
+        big_out, alone_out = outs
+        assert big_out.numel() > 2**31
+        assert planned.plan.ws_rows > 0, merge
+        assert torch.equal(bits(big_out[-ql:]), bits(alone_out)), merge
+        del outs, big_out, alone_out

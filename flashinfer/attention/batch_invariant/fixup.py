@@ -1,3 +1,5 @@
+# Copyright (c) 2026 by FlashInfer team.
+# SPDX-License-Identifier: Apache-2.0
 """Split-KV fixup: fold the chunk partials of a row in chunk order with the spec's ``merge`` from the
 init state ``(-inf, +0, +0)`` and apply the epilogue (``cvt_bf16(add(mul(O, div(1, l)), +0))``): the
 ``chunk`` fold digit of the class, ONE implementation (``fold_row``) executed either by the fixup kernel
@@ -9,9 +11,8 @@ of fixed dims and the row only), so absent chunks (sliding window) are never mer
 
 Placement: the partials of ``PF`` consecutive chunks are loaded before their merges (the loads of
 chunk ``j + 1`` do not depend on the merge of chunk ``j``, so ``PF`` L2 round trips overlap instead of
-one per chunk: with ``C = 512`` a 32K row has 64 chunks and the one-load-per-merge chain was 25 us at
-B = 1, longer than the attention kernel itself; docs/attention_scoping.md section 7, 2026-10-28). The
-fold order and every operation are unchanged.
+one per chunk: with ``C = 512`` a 32K row has 64 chunks and the one-load-per-merge chain was longer than
+the attention kernel itself at B = 1). The fold order and every operation are unchanged.
 """
 
 from __future__ import annotations
@@ -42,13 +43,13 @@ from .spec import chunk_len
 VEC = 4
 THREADS = 128
 PF = 32  # chunks whose partials are loaded ahead of their merges in the fixup KERNEL (a placement: the merges stay in chunk order;
-# 32 since 2026-10-29: two load batches for a 64-chunk row -- the fixup node was 12-18 % of B = 1 decode at D = 256 (8.8.4);
+# 32: two load batches for a 64-chunk row -- the fixup node was a sizeable share of B = 1 decode at D = 256;
 # 192 registers of partials at 128 threads per block; the in-kernel fold uses 8 / 4 at the correction warpgroup's budget, blocks/correction.py)
 PDL = True  # the fixup kernel is launched with programmatic dependent launch: its blocks are scheduled while the attention kernel's
 # last CTAs drain (every working role of the attention kernel issues griddepcontrol.launch_dependents AFTER its unit
-# walk -- at the kernel start the resident blocks cost 10-22 % at multi-wave folds, 12.5.1) and griddepcontrol.wait
+# walk -- issued at the kernel start, the resident blocks slowed every multi-wave fold) and griddepcontrol.wait
 # before the first workspace read orders every partial row behind the whole attention grid (a placement: the second graph
-# node's launch gap overlaps the drain, +1-6 % at B = 1 / 8; docs/attention_scoping.md 12.2, 12.5.2)
+# node's launch gap overlaps the drain, measured faster at small batches)
 _NEG_INF = float("-inf")
 
 
@@ -86,7 +87,7 @@ def fold_row_state(
     count >= ``rows``) is lane-major: region ``(slot + (j - chunk_lo) * lane_rows) * WS``, element ``d``
     of row ``r`` at ``region + ((d // 4) * lane_rows + r) * 4 + d % 4`` with ``m, l`` at ``d = D, D + 1`` (``d0`` a multiple of 4, ``VEC`` = 4).
 
-    ``cells`` / ``grid`` (the MLA class, 2026-10-29; additive: the attention classes pass neither and keep the fixed ``C``
+    ``cells`` / ``grid`` (the MLA class; additive: the attention classes pass neither and keep the fixed ``C``
     arithmetic below, bit for bit): a device function ``cells(grid, lo, L) -> (j_lo, j_hi)`` giving the first and one-past-last
     chunk (cell) of the row's visible range on the class's absolute chunk grid ``grid``;
     the regions stay one per chunk index, so the fold below is unchanged.
@@ -137,7 +138,7 @@ def fold_row_state(
                     po[(i, e)] = mWs[base + d0 + e]
             else:
                 # the chunk's lane-major region (64-bit); (m, l) as one 8-byte load, the O granule as one 16-byte load: with six scalar loads per
-                # chunk the compiler kept only ~37 of a batch's 96 in flight and the rest were serialised (10 us for 16 chunks, 2026-10-28)
+                # chunk the compiler kept only part of a batch's loads in flight and serialised the rest
                 region = (slot + rg * lane_rows).to(Int64) * WS
                 ml = cute.assume(region + ((D // VEC) * lane_rows + r) * VEC, divby=4)
                 og = cute.assume(region + ((d0 // VEC) * lane_rows + r) * VEC, divby=4)

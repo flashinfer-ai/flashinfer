@@ -1,3 +1,5 @@
+# Copyright (c) 2026 by FlashInfer team.
+# SPDX-License-Identifier: Apache-2.0
 """TMA producer block (the load warp): Q once per unit (one box per 64-wide half, 2-stage buffer so the
 next unit's Q is prefetched), then the page boxes of K and of V of every tile of the unit into the smem
 ring, in the order the MMA warp consumes them: K one tile ahead of V (``K_0, K_1, V_0, K_2, V_1, ...``),

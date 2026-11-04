@@ -2835,47 +2835,6 @@ def _blackwell_ragged_auto_upgrade(
     return None
 
 
-def _check_batch_invariant_plan_args(
-    prefix_len_ptr,
-    token_pos_in_items_ptr,
-    token_pos_in_items_len,
-    max_item_len_ptr,
-    seq_lens,
-    seq_lens_q,
-    **offsets,
-) -> None:
-    """The prefill ``plan()`` arguments the batch-invariant class does not take: refused with the class's typed error before the
-    delegate plans (the class derives every length from ``qo_indptr`` and the KV indptr, and masks causally)."""
-    from .batch_invariant.support import unsupported
-
-    if (
-        prefix_len_ptr is not None
-        or token_pos_in_items_ptr is not None
-        or max_item_len_ptr is not None
-        or token_pos_in_items_len
-    ):
-        raise unsupported(
-            "attention.bf16",
-            "multi-item scoring (prefix_len_ptr / token_pos_in_items_ptr / max_item_len_ptr)",
-            "the causal mask with an optional sliding window",
-        )
-    if seq_lens is not None or seq_lens_q is not None:
-        raise unsupported(
-            "attention.bf16",
-            "seq_lens / seq_lens_q",
-            "the lengths of qo_indptr and the KV indptr",
-        )
-    for name, value in offsets.items():
-        if value is not None:
-            raise unsupported(
-                "attention.bf16",
-                name,
-                "the paged KV CSR triple"
-                if name == "block_tables"
-                else "the offsets of qo_indptr / kv_indptr",
-            )
-
-
 class BatchPrefillWithPagedKVCacheWrapper:
     r"""Wrapper class for prefill/append attention with a paged KV cache for a batch of
     requests.
@@ -3063,6 +3022,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
             The ``cute-dsl`` backend uses the CuTe DSL attention kernel for Blackwell (SM100+).
             ``cute-dsl-prims`` backend is a SM120-only FP8 attention backend implemented using
             CUTLASS primitives.
+
         batch_invariant : bool
             Keyword-only. ``True`` runs the batch-invariant attention class (``flashinfer.batch_invariant``: same bits for a token
             whatever the batch, its neighbours, the configuration, the SM count, and whether it runs as prefill or decode) and
@@ -3494,6 +3454,17 @@ class BatchPrefillWithPagedKVCacheWrapper:
         ... )
         >>> wrapper.plan(...)
         """
+        if self._batch_invariant is not None:
+            return self._batch_invariant.workspace_bytes(
+                qo_indptr,
+                paged_kv_indptr,
+                paged_kv_last_page_len,
+                num_qo_heads,
+                num_kv_heads,
+                head_dim_qk,
+                page_size,
+                window_left,
+            ), 0
         if self._backend == "cute-dsl-prims":
             qo_indptr_host = qo_indptr.to("cpu")
             if seq_lens is None:
@@ -3862,13 +3833,13 @@ class BatchPrefillWithPagedKVCacheWrapper:
             o_data_type = q_data_type
         o_data_type = canonicalize_torch_dtype(o_data_type)
         if self._batch_invariant is not None:
-            _check_batch_invariant_plan_args(
-                prefix_len_ptr,
-                token_pos_in_items_ptr,
-                token_pos_in_items_len,
-                max_item_len_ptr,
-                seq_lens,
-                seq_lens_q,
+            self._batch_invariant.refuse(
+                prefix_len_ptr=prefix_len_ptr,
+                token_pos_in_items_ptr=token_pos_in_items_ptr,
+                token_pos_in_items_len=token_pos_in_items_len,
+                max_item_len_ptr=max_item_len_ptr,
+                seq_lens=seq_lens,
+                seq_lens_q=seq_lens_q,
                 block_tables=block_tables,
             )
             self._batch_invariant.plan(
@@ -4939,7 +4910,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 out=out,
                 return_lse=return_lse,
                 lse=lse,
-                window_left=window_left,
+                window_left=self._window_left if window_left is None else window_left,
                 scales=(q_scale, k_scale, v_scale),
                 sinks=sinks,
                 kv_cache_sf=kv_cache_sf,
@@ -5731,6 +5702,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             ``cute-dsl-prims`` is an explicit SM120-only packed FP8 prefill backend.
             The ``cutile`` backend uses the pure cuda.tile Python prefill kernel (Blackwell,
             opt-in); it requires ``qo_indptr == kv_indptr`` (equal-length prefill).
+
         batch_invariant : bool
             Keyword-only. ``True`` runs the batch-invariant attention class (``flashinfer.batch_invariant``: same bits for a token
             whatever the batch, its neighbours, the configuration, the SM count, and whether it runs as prefill or decode) and
@@ -6168,13 +6140,13 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             )
         o_data_type = canonicalize_torch_dtype(o_data_type)
         if self._batch_invariant is not None:
-            _check_batch_invariant_plan_args(
-                prefix_len_ptr,
-                token_pos_in_items_ptr,
-                token_pos_in_items_len,
-                max_item_len_ptr,
-                seq_lens,
-                seq_lens_q,
+            self._batch_invariant.refuse(
+                prefix_len_ptr=prefix_len_ptr,
+                token_pos_in_items_ptr=token_pos_in_items_ptr,
+                token_pos_in_items_len=token_pos_in_items_len,
+                max_item_len_ptr=max_item_len_ptr,
+                seq_lens=seq_lens,
+                seq_lens_q=seq_lens_q,
                 v_indptr=v_indptr,
                 o_indptr=o_indptr,
             )

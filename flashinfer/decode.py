@@ -1527,6 +1527,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
             eligibility require a separate wrapper and graph capture. Eager
             warmups of such wrappers use their selected graph-mode route.
             ``workspace_size`` is unavailable for XQA-selected shapes.
+
         batch_invariant : bool
             Keyword-only. ``True`` runs the batch-invariant attention class (``flashinfer.batch_invariant``: same bits for a token
             whatever the batch, its neighbours, the configuration, the SM count, and whether it runs as prefill or decode) and
@@ -1769,8 +1770,11 @@ class BatchDecodeWithPagedKVCacheWrapper:
         otherwise, ``"fa2"`` for the CUDA-core decode kernel. An explicit backend
         reports itself; a tensor-core ``auto`` wrapper reports ``"auto"`` before its
         first :meth:`plan`. An auto-selected XQA MTP plan reports ``"xqa"``;
-        unsupported per-call options can still use the fallback.
+        unsupported per-call options can still use the fallback. A wrapper built with
+        ``batch_invariant=True`` reports ``"batch_invariant"``.
         """
+        if self._batch_invariant is not None:
+            return "batch_invariant"
         if getattr(self, "_use_xqa_mtp_decode", False):
             return "xqa"
         if self._cudnn_auto:
@@ -1917,6 +1921,18 @@ class BatchDecodeWithPagedKVCacheWrapper:
         ... )
         >>> wrapper.plan(...)
         """
+        if self._batch_invariant is not None:
+            return self._batch_invariant.workspace_bytes(
+                None,
+                indptr,
+                last_page_len,
+                num_qo_heads,
+                num_kv_heads,
+                head_dim,
+                page_size,
+                window_left,
+                q_len_per_req,
+            ), 0
         _check_workspace_buffer_alignment(
             self._float_workspace_buffer, "float_workspace_buffer"
         )
@@ -2344,28 +2360,15 @@ class BatchDecodeWithPagedKVCacheWrapper:
         )
 
         if self._batch_invariant is not None:
-            from .batch_invariant.support import unsupported
-
-            # the class's own checks run in the delegate; the arguments it does not take are refused here, before the plan
-            if window_right != 0:
-                raise unsupported(
-                    "attention.bf16",
-                    f"window_right {window_right}",
-                    "window_right 0 (causal)",
-                )
-            if seq_lens is not None:
-                raise unsupported(
-                    "attention.bf16",
-                    "seq_lens",
-                    "the KV lengths of the page table (indptr / last_page_len)",
-                )
-            if block_tables is not None:
-                raise unsupported(
-                    "attention.bf16", "block_tables", "the paged KV CSR triple"
-                )
+            # the class's own checks run in the delegate; the arguments it does not take are refused there, before the plan
+            self._batch_invariant.refuse(
+                window_right=window_right, seq_lens=seq_lens, block_tables=block_tables
+            )
             if is_causal is not None and is_causal != (q_len_per_req > 1):
+                from .batch_invariant.support import unsupported
+
                 raise unsupported(
-                    "attention.bf16",
+                    self._batch_invariant.CLASS,
                     f"is_causal={is_causal} with q_len_per_req={q_len_per_req}",
                     "the bottom-right causal mask (is_causal follows q_len_per_req > 1)",
                 )
@@ -2383,8 +2386,8 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 window_left=window_left,
                 logits_soft_cap=logits_soft_cap,
                 pos_encoding_mode=pos_encoding_mode,
-                q_data_type=q_data_type if data_type is None else data_type,
-                kv_data_type=kv_data_type if data_type is None else data_type,
+                q_data_type=q_data_type if q_data_type is not None else data_type,
+                kv_data_type=kv_data_type if kv_data_type is not None else data_type,
                 o_data_type=o_data_type,
                 sm_scale=sm_scale,
                 q_len_per_req=q_len_per_req,
@@ -3361,6 +3364,14 @@ class BatchDecodeWithPagedKVCacheWrapper:
             enable_pdl = device_support_pdl(q.device)
         k_cache, v_cache = _unpack_paged_kv_cache(paged_kv_cache, self._kv_layout)
         if self._batch_invariant is not None:
+            if q_len_per_req is not None:
+                warnings.warn(
+                    "Passing `q_len_per_req` to BatchDecodeWithPagedKVCacheWrapper.run() "
+                    "is deprecated; pass it to plan() instead. Scheduled for removal "
+                    "in a future release.",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
             if q_len_per_req is not None and q_len_per_req != self._q_len_per_req:
                 raise ValueError(
                     f"q_len_per_req={q_len_per_req} at run() but plan() used "
@@ -3373,7 +3384,7 @@ class BatchDecodeWithPagedKVCacheWrapper:
                 out=out,
                 return_lse=return_lse,
                 lse=lse,
-                window_left=window_left,
+                window_left=self._window_left if window_left is None else window_left,
                 scales=(q_scale, k_scale, v_scale),
                 sinks=sinks,
                 kv_cache_sf=kv_cache_sf,

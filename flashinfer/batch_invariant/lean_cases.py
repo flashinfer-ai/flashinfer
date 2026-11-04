@@ -850,6 +850,8 @@ def _render_bias(L: List[str]) -> None:
 def render() -> str:
     """The content of ``Cases.lean``."""
     L = [
+        "-- Copyright (c) 2026 by FlashInfer team.",
+        "-- SPDX-License-Identifier: Apache-2.0",
         "import BIKernels.GEMM",
         "import BIKernels.GEMMConfig",
         "import BIKernels.Export",

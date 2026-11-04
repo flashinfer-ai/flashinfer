@@ -38,6 +38,8 @@ class BatchInvariantAttention:
     """One instance per wrapper: ``kind`` is ``"decode"`` (paged KV, one or more query tokens per request), ``"prefill"`` (paged
     KV) or ``"ragged"`` (the K / V of every request packed along the token dimension)."""
 
+    CLASS = CLASS
+
     def __init__(
         self,
         float_workspace_buffer: torch.Tensor,
@@ -83,6 +85,8 @@ class BatchInvariantAttention:
         self._total_q = 0
         self._heads: Tuple[int, int, int] = (0, 0, 0)
         self._page = 1
+        self._max_page = -1  # the largest page index the plan references (paged kinds)
+        self._total_kv = 0  # the planned packed token count (ragged)
 
     def reset_workspace(self, float_workspace_buffer: torch.Tensor) -> None:
         """The wrappers' ``reset_workspace_buffer``: the next ``plan()`` sizes its split-KV partials in this buffer (the current plan
@@ -100,6 +104,76 @@ class BatchInvariantAttention:
                 "a 16-byte-aligned workspace",
             )
         self.workspace = float_workspace_buffer
+
+    #: The wrappers' ``plan()`` arguments the class does not take, with what the class takes instead: any of them set is refused.
+    _PLAN_ARGS_OUTSIDE_THE_CLASS = {
+        "window_right": "window_right 0 (the causal mask)",
+        "seq_lens": "the KV lengths of the page table (indptr / last_page_len) or of kv_indptr",
+        "seq_lens_q": "the query lengths of qo_indptr",
+        "block_tables": "the paged KV CSR triple",
+        "prefix_len_ptr": "the causal mask with an optional sliding window (no multi-item scoring)",
+        "token_pos_in_items_ptr": "the causal mask with an optional sliding window (no multi-item scoring)",
+        "token_pos_in_items_len": "the causal mask with an optional sliding window (no multi-item scoring)",
+        "max_item_len_ptr": "the causal mask with an optional sliding window (no multi-item scoring)",
+        "v_indptr": "the offsets of kv_indptr for V",
+        "o_indptr": "the offsets of qo_indptr for the output",
+    }
+
+    def refuse(self, **args) -> None:
+        """The wrappers call this with the ``plan()`` arguments the class does not take (``name=value``): a value that is set
+        (not ``None``, not ``0`` / ``False``) raises the class's typed error before anything is planned."""
+        for name, value in args.items():
+            if value is None or (isinstance(value, (int, bool)) and not value):
+                continue
+            raise unsupported(
+                CLASS,
+                name if isinstance(value, torch.Tensor) else f"{name}={value}",
+                self._PLAN_ARGS_OUTSIDE_THE_CLASS.get(name, "the class's own inputs"),
+            )
+
+    def workspace_bytes(
+        self,
+        qo_indptr: Optional[torch.Tensor],
+        kv_indptr: torch.Tensor,
+        kv_last_page_len: Optional[torch.Tensor],
+        num_qo_heads: int,
+        num_kv_heads: int,
+        head_dim: int,
+        page_size: int,
+        window_left: int = -1,
+        q_len_per_req: int = 1,
+    ) -> int:
+        """The wrappers' ``workspace_size``: the float workspace bytes the split-KV plan of this batch needs (0 when every unit is
+        fused; a smaller buffer makes ``plan()`` fall back to fused units, which cost parallelism, never bits)."""
+        D = int(head_dim)
+        if D not in HEAD_DIMS:
+            raise unsupported(CLASS, f"head_dim {D}", f"head dims {list(HEAD_DIMS)}")
+        kv_host = kv_indptr.to("cpu", non_blocking=False).to(torch.int64)
+        if self.kind == "decode":
+            qo_host = torch.arange(0, kv_host.numel(), dtype=torch.int64) * int(
+                q_len_per_req
+            )
+        else:
+            assert qo_indptr is not None
+            qo_host = qo_indptr.to("cpu", non_blocking=False).to(torch.int64)
+        last_host = (
+            kv_last_page_len.to("cpu", non_blocking=False).to(torch.int64)
+            if (self.kind != "ragged" and kv_last_page_len is not None)
+            else None
+        )
+        return engine.workspace_bytes(
+            qo_host,
+            kv_host,
+            last_host,
+            num_qo_heads,
+            num_kv_heads,
+            D,
+            1 if self.kind == "ragged" else page_size,
+            -1 if window_left is None else int(window_left),
+            engine.default_config(D=D),
+            self.device,
+            ragged=self.kind == "ragged",
+        )
 
     # ------------------------------------------------------------------ plan
     def plan(
@@ -223,14 +297,14 @@ class BatchInvariantAttention:
             ok = math.isfinite(float(sm_scale)) and float(sm_scale) > 0.0
             if ok:
                 try:
-                    scale_log2(float(sm_scale))
+                    ok = scale_log2(float(sm_scale)) != 0.0
                 except OverflowError:
                     ok = False
             if not ok:
                 raise unsupported(
                     CLASS,
                     f"sm_scale {sm_scale}",
-                    "a positive finite sm_scale whose log2 scale is a binary32 number",
+                    "a positive finite sm_scale whose log2 scale is a nonzero binary32 number",
                 )
         if self.kind == "decode":
             if q_len_per_req < 1:
@@ -257,7 +331,20 @@ class BatchInvariantAttention:
                 "one KV range per request",
             )
         kv_spans = kv_indptr_host[1:] - kv_indptr_host[:-1]  # tokens (ragged) or pages
+        if qo_host.numel() and int(qo_host[0]) != 0:
+            raise unsupported(
+                CLASS,
+                f"qo_indptr starting at {int(qo_host[0])}",
+                "qo_indptr[0] == 0 (the packed query rows start at row 0)",
+            )
+        if kv_indptr_host.numel() and int(kv_indptr_host[-1]) >= 2**31:
+            raise unsupported(
+                CLASS,
+                f"kv_indptr[-1] = {int(kv_indptr_host[-1])}",
+                "page-table offsets below 2^31 (the kernels read them as int32)",
+            )
         last_host = None
+        max_page = -1
         if self.kind == "ragged":
             kv_lens = kv_spans.tolist()
         else:
@@ -280,6 +367,21 @@ class BatchInvariantAttention:
                     "a kv_last_page_len outside 0..page_size",
                     f"last-page lengths in 0..{page_size}",
                 )
+            n_pages = int(kv_indptr_host[-1]) if kv_indptr_host.numel() else 0
+            if kv_indices.numel() < n_pages:
+                raise unsupported(
+                    CLASS,
+                    f"kv_indices of {kv_indices.numel()} entries for kv_indptr[-1] = {n_pages}",
+                    "one page index per referenced page",
+                )
+            if n_pages:
+                used = kv_indices[:n_pages]
+                lo, hi = int(used.min().item()), int(used.max().item())
+                if lo < 0:
+                    raise unsupported(
+                        CLASS, "a negative page index", "page indices in 0..num_pages-1"
+                    )
+                max_page = hi  # checked against the cache at run()
             # a request without pages has no keys, whatever its last-page entry (the planner's rule)
             kv_lens = torch.where(
                 kv_spans > 0, (kv_spans - 1) * page_size + last_host, 0
@@ -350,19 +452,24 @@ class BatchInvariantAttention:
                     f"a float workspace buffer of {self.workspace.numel() * self.workspace.element_size()} bytes",
                     f"at least {e.needed} bytes for this batch's split-KV partials",
                 ) from None
-        self._planned = planned
-        self._config = config
-        # the kernels read the page table on the device as int32 (CPU metadata, as the other wrappers accept, is staged here)
-        self._kv_indptr = kv_indptr.to(
+        # the kernels read the page table on the device as int32 (CPU metadata, as the other wrappers accept, is staged here);
+        # the plan is published only once everything it runs with exists
+        kv_indptr_dev = kv_indptr.to(
             device=self.device, dtype=torch.int32, non_blocking=non_blocking
         ).contiguous()
-        self._kv_indices = (
+        kv_indices_dev = (
             kv_indices.to(
                 device=self.device, dtype=torch.int32, non_blocking=non_blocking
             ).contiguous()
             if kv_indices is not None
             else torch.zeros(1, dtype=torch.int32, device=self.device)
         )
+        self._planned = planned
+        self._config = config
+        self._kv_indptr = kv_indptr_dev
+        self._kv_indices = kv_indices_dev
+        self._max_page = max_page
+        self._total_kv = int(kv_indptr_host[-1]) if kv_indptr_host.numel() else 0
         self._sm_scale = float(sm_scale) if sm_scale is not None else 1.0 / math.sqrt(D)
         self._window_left = int(window_left)
         self._total_q = int(qo_host[-1].item()) if qo_host.numel() else 0
@@ -460,14 +567,23 @@ class BatchInvariantAttention:
                     else (t.shape[0] == Hkv and t.shape[2] == D)
                 )
                 want = f"(total_kv, {Hkv}, {D})" if nhd else f"({Hkv}, total_kv, {D})"
+                if ok and (t.shape[0] if nhd else t.shape[1]) < self._total_kv:
+                    ok = False
+                    want += f" with at least the planned {self._total_kv} tokens"
             else:
                 inner = (self._page, Hkv, D) if nhd else (Hkv, self._page, D)
                 ok = t.dim() == 4 and tuple(t.shape[1:]) == inner
                 want = f"(num_pages, {', '.join(map(str, inner))})"
+                if ok and t.shape[0] <= self._max_page:
+                    ok = False
+                    want += f" with more than {self._max_page} pages (the largest planned page index)"
+            if ok and t.stride(-1) != 1:
+                ok = False
+                want += " with a unit stride along the head dim (the kernels are compiled for it)"
             if not ok:
                 raise unsupported(
                     CLASS,
-                    f"{name} of shape {tuple(t.shape)} at run()",
+                    f"{name} of shape {tuple(t.shape)} (strides {tuple(t.stride())}) at run()",
                     f"the planned {self.kv_layout} geometry {want}",
                 )
         if not q.is_contiguous():
@@ -477,12 +593,13 @@ class BatchInvariantAttention:
         elif (
             out.shape != q.shape
             or out.dtype != torch.bfloat16
+            or out.device != self.device
             or not out.is_contiguous()
         ):
             raise unsupported(
                 CLASS,
-                f"out {tuple(out.shape)} {out.dtype}",
-                f"a contiguous bf16 ({q.shape[0]}, {Hq}, {D}) output",
+                f"out {tuple(out.shape)} {out.dtype} on {out.device}",
+                f"a contiguous bf16 ({q.shape[0]}, {Hq}, {D}) output on {self.device}",
             )
         engine.run_attention(
             self._planned,

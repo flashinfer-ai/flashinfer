@@ -1,4 +1,6 @@
-"""Host-side operand block of the Swaps-AB decode body (docs/attention_scoping.md 12.3): the class's term for work units of at most 32
+# Copyright (c) 2026 by FlashInfer team.
+# SPDX-License-Identifier: Apache-2.0
+"""Host-side operand block of the Swaps-AB decode body: the class's term for work units of at most 32
 live rows (decode and spec-decode: ``g x q_len`` rows per (request, kv head, chunk range)) with the MMA roles swapped --
 
 * ``S^T = K Q^T``: A = the K tile (M = 128 keys, K-major, smem), B = the unit's Q rows (N = ``N_pad`` in {8, 16, 32}, K-major, smem), the

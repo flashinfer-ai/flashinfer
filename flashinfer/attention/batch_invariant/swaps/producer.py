@@ -1,3 +1,5 @@
+# Copyright (c) 2026 by FlashInfer team.
+# SPDX-License-Identifier: Apache-2.0
 """TMA producer block of the Swaps-AB body (the load warp): the unit's Q rows once per unit (one box of ``(64 d, g heads, tokens_box
 tokens)`` per 64-wide half of D into the ``n_pad x D`` B-operand stage; two stages, so the next unit's Q is prefetched), then the page boxes
 of K and of V of every tile into the ring in the MMA warp's order (K one tile ahead of V: ``K_0, K_1, V_0, K_2, V_1, ...``). At D = 256 a tile

@@ -207,7 +207,9 @@ def fingerprint(op: str, **dims) -> str:
     The attention wrappers take ``head_dim``: the tile and chunk grid, the online-softmax step and the chunk merge are
     functions of the head dim alone; the batch, the sequence lengths, the page size, the KV layout and the configuration
     do not enter it, and ``BatchPrefillWithPagedKVCacheWrapper``, ``BatchDecodeWithPagedKVCacheWrapper`` and
-    ``BatchPrefillWithRaggedKVCacheWrapper`` share the fingerprint (their outputs for one token are the same bits).
+    ``BatchPrefillWithRaggedKVCacheWrapper`` share the fingerprint (their outputs for one token are the same bits). The
+    sliding window (``window_left``) is a per-call input of the class, like the KV position: the receipt is the digest of the
+    class's no-window sample row and covers windowed calls too.
 
     >>> fingerprint("mm_bf16", N=4096, K=4096)  # doctest: +SKIP
     'gemm-bf16-kfold-...'

@@ -1,3 +1,5 @@
+# Copyright (c) 2026 by FlashInfer team.
+# SPDX-License-Identifier: Apache-2.0
 """The two MMA folds (the MMA warp), issued per instruction through ``canon.BlockedFold``:
 
 * ``S = Q K^T`` per tile: ``D/16`` K-steps ascending, ``ACCUMULATE`` off on the first (the GEMM's

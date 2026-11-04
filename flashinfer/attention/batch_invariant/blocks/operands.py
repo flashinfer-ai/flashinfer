@@ -1,10 +1,12 @@
+# Copyright (c) 2026 by FlashInfer team.
+# SPDX-License-Identifier: Apache-2.0
 """Host-side operand block of the attention kernel: everything that depends only on the static
 parameters (head dim ``D``, GQA group ``g``, page size ``P``, ring depth). None of it decides a
 numeric order; the numerically visible choices are the two MMA instruction variants (the A2
 surface: ``tcgen05.mma.cta_group::1.kind::f16 128x128x16`` for QK^T and ``128xDx16`` for PV, the
 latter with its A operand in TMEM).
 
-The budgets are functions of ``D`` (docs/attention_scoping.md sections 8 and 9): a Q stage and a KV ring slot
+The budgets are functions of ``D``: a Q stage and a KV ring slot
 are ``128 x D`` bf16 (16 / 32 / 64 KB at D = 64 / 128 / 256), so the ring takes up to ``512 / D`` slots (8 / 4 / 2:
 128 KB of K/V in flight, the same bytes at every D) next to ``q_stages(D)`` Q stages (2, or 1 at D = 256); TMEM holds
 ``S (128) | P (64) | O_c (D) | O_m (D)`` = 320 / 448 columns at D = 64 / 128, and at D = 256 ``S | P | O_c`` = 448 with
@@ -16,7 +18,7 @@ the MLIR context; the results are plain attributes the kernel reads as constants
 
 Shared memory tiles come from the library (``make_smem_layout_a/b``: the UMMA canonical SW128
 layouts); the producer addresses the same bytes through a second *view* in which a page slab of
-``P`` keys in one 64-wide half is a contiguous ``(P, 64)`` block (probed 2026-10-27: element
+``P`` keys in one 64-wide half is a contiguous ``(P, 64)`` block (element
 ``(key, d)`` of a K or V stage sits at ``(d % 64) + 64 key + 8192 (d // 64)``).
 """
 
@@ -70,7 +72,7 @@ def q_stages_for(D: int) -> int:
 om_in_tmem = _om_in_tmem  # the TMEM rule for the merged chunk state lives in plan.py (the planner reads it too); re-exported here
 OM_VEC = 4  # the O_m scratch layout (D = 256): element (row, d) of a CTA's 128 x D block at (d // 4) * 512 + row * 4 + d % 4 fp32 --
 # a warp's 32 lanes (rows) read / write 512 contiguous bytes per 16-byte-per-lane instruction (4 cache lines) instead of
-# 32 lines of a row-major block (docs/attention_scoping.md 8.8, lever 3: the merge is LSU-line bound, not latency bound)
+# 32 lines of a row-major block (the merge is LSU-line bound, not latency bound)
 
 
 def om_scratch_blocks(D: int) -> int:
@@ -79,7 +81,7 @@ def om_scratch_blocks(D: int) -> int:
 
 
 def tmem_plan_for(D: int) -> str:
-    """The TMEM plan of the body at head dim ``D`` (a placement; docs/attention_scoping.md 8.8):
+    """The TMEM plan of the body at head dim ``D`` (a placement):
 
     * ``"om"`` (D <= 128): ``S (T) | P (T/2) | O_c (D) | O_m (D)`` -- one S stage, one P stage, the merged chunk state in TMEM;
     * ``"s2"`` (D = 256): ``O_c (D) | S_0 (T) | S_1 (T)`` = 512 columns -- TWO S stages with each tile's ``P`` written over the first
@@ -160,8 +162,8 @@ class StaticPlan:
         self.n_q = 2 if q2 else 1  # Q tiles per unit
         assert 1 <= g <= Q_ROWS, g
         # any power-of-two page size: a page slab is one TMA box of min(page, slot_keys) keys; the SW128 swizzle is applied by the TMA from the
-        # smem address bits, so a slab of fewer than 8 keys (a sub-atom destination) lands where the MMA layout expects it (probed bit for
-        # bit against page 128 at every head dim, 2026-10-28; docs/attention_scoping.md section 11)
+        # smem address bits, so a slab of fewer than 8 keys (a sub-atom destination) lands where the MMA layout expects it (verified bit
+        # for bit against page 128 at every head dim)
         assert page >= 1 and (
             page <= TILE_KEYS and TILE_KEYS % page == 0 or page % TILE_KEYS == 0
         ), page
@@ -188,7 +190,7 @@ class StaticPlan:
         # warp holds the live rows, warp wq of warpgroup k takes slice 4k + wq of 4 n_wg key slices and the correction reads rows
         # 0..rep_rows-1 (g <= 32; 30 rows at g = 6, 24 at g = 12). The Q pipeline's transaction count is armed per unit with the
         # bytes its load pattern moves (rows_per_tile or 4 rep_rows rows): with the full-tile count the barrier never completed
-        # for g not dividing 128 (24 / 4 and 24 / 2 heads hung; found and fixed 2026-10-28 on branch op/attention-d64-d256)
+        # for g not dividing 128 (24 / 4 and 24 / 2 heads hung)
         self.rep_ok = g <= REP_ROWS
         self.tokens_rep = REP_ROWS // g if self.rep_ok else 1
         self.rep_rows = self.tokens_rep * g if self.rep_ok else 0
@@ -205,7 +207,7 @@ class StaticPlan:
         self.stats_slots = STATS_SLOTS_PP if q2 else STATS_SLOTS
         # ring slots: a whole KV tile (T keys) at D <= 128; HALF tiles (64 keys, 32 KB) at D = 256, so that the 128 KB ring holds
         # four slots instead of two and the producer runs further ahead (a placement: QK^T is then two N = 64 MMAs per tile and the
-        # PV releases its V slot per 4-step half; the per-element folds are unchanged, docs/attention_scoping.md 8.5)
+        # PV releases its V slot per 4-step half; the per-element folds are unchanged)
         self.slot_keys = SLOT_KEYS_256 if D == 256 else self.T
         self.slots_per_tile = self.T // self.slot_keys
         self.n_slots = (

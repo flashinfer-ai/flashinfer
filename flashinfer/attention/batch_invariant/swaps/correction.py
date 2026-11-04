@@ -1,3 +1,5 @@
+# Copyright (c) 2026 by FlashInfer team.
+# SPDX-License-Identifier: Apache-2.0
 """The correction warpgroup of the Swaps-AB body: thread ``t`` owns TMEM lane ``t``, i.e. dim ``t`` of every ``O^T`` slot (dims ``t`` and
 ``128 + t`` at D = 256; at D = 64 the 64 x n_pad accumulator's 16-lane layout, read through the library's partition), and -- for
 ``t < n_pad`` -- the statistics chain of row ``t`` (exactly the row body's thread-per-row chain: ``l = fma(l, alpha, r_t)`` with ``r_t`` the

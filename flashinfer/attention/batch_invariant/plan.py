@@ -1,5 +1,7 @@
+# Copyright (c) 2026 by FlashInfer team.
+# SPDX-License-Identifier: Apache-2.0
 """The host planner: FlashInfer-style request metadata -> work units for the kernel and fixup groups
-for the split-KV merge (docs/attention_scoping.md section 3).
+for the split-KV merge.
 
 A work unit is one CTA: (request, kv head, Q tile of ``tokens_per_tile`` tokens x ``g`` heads) and a
 chunk range that is either ALL present chunks of its rows (mode 0: the CTA folds the chunks in TMEM
@@ -43,22 +45,22 @@ DESC_FIELDS = 16
 # F_GROUP: the unit's split group (an index into Plan.groups) when the group's chunk fold runs IN-KERNEL (the unit that completes the
 # group folds it: blocks/correction.py), -1 otherwise (mode 0, or a group left to the fixup kernel)
 INKERNEL_MAX_ROWS = 32  # merge == "auto": groups of at most this many rows (every decode unit) and at most INKERNEL_MAX_CHUNKS chunks fold
-INKERNEL_MAX_CHUNKS = 2  # in-kernel (measured 2026-10-28: +5-7% at B = 8 x 1K, within noise at B = 1 x 1K); wider groups (prefill split
+INKERNEL_MAX_CHUNKS = 2  # in-kernel (measured faster for small decode batches, within noise at B = 1); wider groups (prefill split
 FUSE2_MIN_ROWS = 8  # D = 256 two-chunk rule (build_plan): fused decode-sized units only from this many live rows (g x q_len) per unit
 SWAPS_FUSE_MAX_CHUNKS = 4  # Swaps-body batches (small_swap): units of at most this many chunks stay FUSED when the batch has at least
-SWAPS_FUSE_MIN_UNITS = 48  # SWAPS_FUSE_MIN_UNITS of them (policy ABBA 2026-10-29, docs/attention_scoping.md 12.8: the split kind's second
-# ramp + fold cost more than 1-3 extra chunks of streaming -- fused 1.06-1.47x at B = 8 / 64 x 1K-2K, every D;
+SWAPS_FUSE_MIN_UNITS = 48  # SWAPS_FUSE_MIN_UNITS of them (the split kind's second
+# ramp + fold cost more than 1-3 extra chunks of streaming -- measured fused faster at B = 8 / 64 with short rows, every D;
 # at B = 1 (4-8 units) the split's parallelism wins from 2 chunks up and the batch stays below the unit floor)
 INKERNEL_MAX_CHUNKS_OF = {
     64: INKERNEL_MAX_CHUNKS,
     128: INKERNEL_MAX_CHUNKS,
     256: 0,
-}  # D = 256: the fixup kernel folds every group (search 2026-10-28
-# 23:30: the fixup placement 1.07-1.20x faster at B = 1 x 1K for 256-wide rows; the in-kernel fold is 64 threads per row there)
+}  # D = 256: the fixup kernel folds every group (the fixup placement measured faster at B = 1 for 256-wide rows;
+# the in-kernel fold is 64 threads per row there)
 # units: 128 rows x up to 8 chunks per last arriver) and longer chains take the fixup kernel: the fold runs in
 # the last arriver's correction warpgroup and stalls that CTA's MMA and softmax through the stats ring, and every
-# group waiting on a chunk of that CTA completes later -- -20% at B = 8 x 8K with 16-chunk groups, 2x the kernel
-# time at B = 8 x 32K with 64-chunk groups (docs/attention_scoping.md section 7); a fold by the idle warps is the
+# group waiting on a chunk of that CTA completes later -- a large slowdown with 16-chunk groups, and with 64-chunk groups
+# the fold alone took as long as the kernel; a fold by the idle warps is the
 # open item
 GROUP_FIELDS = 10
 # fixup group fields (int32)
@@ -156,9 +158,9 @@ def build_plan(
     """``split_policy``: ``"auto"`` splits every multi-chunk tile when the fused unit count would leave
     the machine underfilled (``< 2 x SM``) -- and, at head dims whose merged state is not in TMEM (D = 256), every multi-chunk
     tile of at most ``INKERNEL_MAX_ROWS`` rows (decode units) whatever the count: a fused decode unit there merges a 128 x 256 fp32
-    state through the global scratch at every chunk end, and the split kind measured 1.21x faster at B = 64 x 8K (docs/attention_scoping.md
-    11.4) -- except the TWO-chunk decode-sized units of at least ``FUSE2_MIN_ROWS`` live rows in a batch whose fused unit count exceeds
-    half the SM count, which stay fused (one in-kernel merge against two unit ramps and the fixup node; 11.4.3); ``"split"`` / ``"fused"``
+    state through the global scratch at every chunk end, and the split kind measured faster at long KV lengths
+    -- except the TWO-chunk decode-sized units of at least ``FUSE2_MIN_ROWS`` live rows in a batch whose fused unit count exceeds
+    half the SM count, which stay fused (one in-kernel merge against two unit ramps and the fixup node); ``"split"`` / ``"fused"``
     force one kind (R3: same bits).
     ``merge``: where a split group's chunk fold runs -- ``"auto"`` (in-kernel for groups of at most
     ``INKERNEL_MAX_ROWS`` rows, the fixup kernel otherwise), ``"fixup"`` (always the kernel), ``"inkernel"``
@@ -210,7 +212,7 @@ def build_plan(
     else:
         do_split = len(tiles) < 2 * sm_count
     # the merged chunk state's home decides the D = 256 rules below: the row body keeps it in a global scratch at D = 256, the Swaps-AB
-    # kernel (every unit of the batch <= 32 rows under small = "swap") in TMEM at every D -- those batches take the D = 128 rules (12.5)
+    # kernel (every unit of the batch <= 32 rows under small = "swap") in TMEM at every D -- those batches take the D = 128 rules
     swap_batch = (
         small_swap and bool(tiles) and all(t[3] * g <= swap_max_rows for t in tiles)
     )  # the batch takes the Swaps body (api.SWAPS_MAX_ROWS)
@@ -220,8 +222,8 @@ def build_plan(
     )  # D = 256: decode-sized multi-chunk units always split (see the docstring) ...
     # ... except two-chunk units of >= FUSE2_MIN_ROWS live rows when the fused units alone fill more than half the machine: there the split
     # kind pays two unit ramps and the fixup node (whose cost grows with the rows) against one in-kernel merge (a fixed 128 x D scratch pass
-    # whatever the live rows), measured fused 1.15-1.20x at 24/2 B = 64 / 256 x 1K and 0.81x at 8/8 B = 256 x 1K (one live row) -- D = 256,
-    # 2026-10-29, docs/attention_scoping.md 11.4.3; with fewer units the split kind's parallelism wins (B = 1: 1.2-2x). A placement (R3)
+    # whatever the live rows), measured fused faster with several live rows per unit and slower with one live row -- D = 256;
+    # with fewer units the split kind's parallelism wins (B = 1). A placement (R3)
     fuse_two_chunk = (
         split_policy == "auto" and not om_tmem and 2 * len(tiles) > sm_count
     )
@@ -229,7 +231,7 @@ def build_plan(
     plan = Plan(tokens_per_tile=tpt, g=g, ws_row=ws_row(D))
     swaps_fuse = (
         swap_batch and split_policy == "auto" and len(tiles) >= SWAPS_FUSE_MIN_UNITS
-    )  # the Swaps body's short-unit rule (12.8)
+    )  # the Swaps body's short-unit rule
     for b, h, tok0, ntok, clo, chi, tlo, thi, kv_len, q_len in tiles:
         rows = ntok * g
         two_chunk_fused = (

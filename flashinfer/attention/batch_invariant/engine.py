@@ -1,3 +1,5 @@
+# Copyright (c) 2026 by FlashInfer team.
+# SPDX-License-Identifier: Apache-2.0
 """FlashInfer-shaped entry points for the RL-ready paged attention (classes ``attn.bf16.d64`` / ``d128`` / ``d256``:
 one class per head dim, ``spec.HEAD_DIMS``).
 
@@ -60,11 +62,16 @@ def check_sm_scale(sm_scale: float) -> float:
             f"sm_scale {sm_scale}: the class takes a positive finite scale"
         )
     try:
-        return scale_log2(s)
+        c = scale_log2(s)
     except OverflowError:
         raise ValueError(
             f"sm_scale {sm_scale}: sm_scale * log2(e) is outside the binary32 range"
         ) from None
+    if c == 0.0:
+        raise ValueError(
+            f"sm_scale {sm_scale}: sm_scale * log2(e) rounds to zero in binary32"
+        )
+    return c
 
 
 def valid_kv_slots(D: int = 128) -> tuple:
@@ -89,8 +96,8 @@ class AttnConfig:
     # otherwise), "fixup" (always the kernel), "inkernel" (always the last arriver): plan.py, same bits
     small: str = "swap"  # the placement of a batch whose units all have <= SWAPS_MAX_ROWS (8) live rows (decode at g <= 8): "swap" = the
     # Swaps-AB kernel (``swaps``: keys on the MMA M dimension, the rows on N = 8 / 16 / 32, two
-    # softmax warpgroups on alternate tiles; the default since the ABBA of docs/attention_scoping.md 12.6.2:
-    # 1.02 / 1.09 / 1.04x of "rep" at D = 128 / 256 / 64), "rep" = the row body's replicated-row placement;
+    # softmax warpgroups on alternate tiles; the default: measured faster than "rep" at every D), "rep" = the row body's
+    # replicated-row placement;
     # mixed batches take the row body either way (same bits)
     q2: bool = False  # with softmax_wgs = 2: the paired placement -- two Q tiles per unit, warpgroup k owns Q tile k (whole rows), one
     # K / V stream for both; D = 64 (blocks/operands.py: S_A | S_B | O_c,A | O_m,A | O_c,B | O_m,B in TMEM)
@@ -140,10 +147,9 @@ def all_valid_configs(D: int = 128) -> list:
 
 
 SWAPS_MAX_ROWS = 8  # units of at most this many live rows take the Swaps-AB kernel under small = "swap": the 8-row
-# (n_pad = 8) kernel beats the row body 1.02-1.12x; the 16-row kernel (24/2 heads, g = 12) measured
-# 0.90-0.98x of it at every D (its per-row chains and 54 spills), so 9-32-row units keep the row
-# body's replicated placement (docs/attention_scoping.md 12.9; the 16 / 32-row kernels stay built
-# and IR-pinned as retired placements)
+# (n_pad = 8) kernel beats the row body; the 16-row kernel (24/2 heads, g = 12) measured slower than
+# the row body at every D (its per-row chains and register spills), so 9-32-row units keep the row
+# body's replicated placement (the 16 / 32-row kernels stay built and IR-pinned as retired placements)
 SWAPS_DIMS = (64, 128, 256)  # head dims the Swaps-AB kernel implements
 
 
@@ -209,9 +215,9 @@ DEFAULT_RING = {
     64: 4,
     128: 4,
     256: 2,
-}  # ring depth per head dim: D = 64 and 128 keep the measured 4 (the D = 64 ring-8 candidate of the
-# page-16 search was a noise-selected maximum: the same-GPU ABBA A/B gave 1.004x geomean, +-10 % by
-# regime -- docs/attention_scoping.md 9.1.2), D = 256 has only 2 (11.4)
+}  # ring depth per head dim: D = 64 and 128 keep 4 (the D = 64 ring-8 candidate of the
+# page-16 search was a noise-selected maximum: a same-GPU interleaved A/B found no difference beyond
+# the noise), D = 256 has only 2
 
 
 def default_config(D: int = 128):
@@ -277,6 +283,7 @@ class _Planned:
         # what the descriptor table was built for; run_attention refuses anything else (the table holds one unit per KV head
         # and per Q tile, the configuration decides pairing and the unit body)
         self.heads: Optional[tuple] = None  # (Hq, Hkv)
+        self.total_q: Optional[int] = None
         self.window_left: Optional[int] = None
         self.config: Optional[AttnConfig] = None
         self.fixup_groups = (
@@ -335,7 +342,7 @@ def plan_attention(
         small_swap=config.small == "swap" and D in SWAPS_DIMS,
         swap_max_rows=SWAPS_MAX_ROWS,
     )  # Swaps batches at D = 256 take the
-    # D = 128 rules (TMEM merges; 12.6)
+    # D = 128 rules (TMEM merges)
     desc = torch.tensor(
         plan.desc if plan.desc else [[0] * DESC_FIELDS],
         dtype=torch.int32,
@@ -359,7 +366,9 @@ def plan_attention(
         fx if fx else [[0] * GROUP_FIELDS], dtype=torch.int32, device=device
     )
     need = max(1, plan.ws_rows) * ws_row(D)
-    if workspace is None:
+    if (
+        workspace is None or plan.ws_rows == 0
+    ):  # no split group: no partials; a one-row placeholder
         ws = torch.empty(need, dtype=torch.float32, device=device)
     else:
         if workspace.numel() * workspace.element_size() < need * 4:
@@ -388,9 +397,55 @@ def plan_attention(
     )
     planned.ragged = ragged
     planned.heads = (int(Hq), int(Hkv))
+    planned.total_q = int(qo_indptr[-1]) if qo_indptr.numel() else 0
     planned.window_left = int(window_left)
     planned.config = config
     return planned
+
+
+def workspace_bytes(
+    qo_indptr: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_last_page_len: Optional[torch.Tensor],
+    Hq: int,
+    Hkv: int,
+    D: int,
+    page: int,
+    window_left: int = -1,
+    config: Optional[AttnConfig] = None,
+    device=None,
+    ragged: bool = False,
+) -> int:
+    """The float workspace bytes ``plan_attention`` needs for this batch's split-KV partials (0 when the plan has no split
+    group); the planner runs on the host, nothing is allocated."""
+    if ragged:
+        page = 1
+        kv_last_page_len = torch.ones(max(0, kv_indptr.numel() - 1), dtype=torch.int32)
+    assert kv_last_page_len is not None
+    check_supported(D, Hq, Hkv, page)
+    config = config or default_config(D=D)
+    device = device or qo_indptr.device
+    sm = (
+        torch.cuda.get_device_properties(device).multi_processor_count
+        if torch.device(device).type == "cuda"
+        else 204
+    )
+    plan = build_plan(
+        qo_indptr.cpu().tolist(),
+        kv_indptr.cpu().tolist(),
+        kv_last_page_len.cpu().tolist(),
+        Hq,
+        Hkv,
+        D,
+        page,
+        window_left,
+        config.split_policy,
+        sm,
+        merge=config.merge,
+        small_swap=config.small == "swap" and D in SWAPS_DIMS,
+        swap_max_rows=SWAPS_MAX_ROWS,
+    )
+    return plan.ws_rows * ws_row(D) * 4
 
 
 def run_attention(
@@ -440,6 +495,10 @@ def run_attention(
         kv_k, kv_v = (
             _kv_view(k_cache, kv_layout, Hkv, page, D),
             _kv_view(v_cache, kv_layout, Hkv, page, D),
+        )
+    if planned.total_q is not None and int(total_q) != planned.total_q:
+        raise ValueError(
+            f"{total_q} query rows at run_attention over a plan built for {planned.total_q} (the units write the planned rows)"
         )
     if planned.heads is not None and (int(Hq), int(Hkv)) != planned.heads:
         raise ValueError(

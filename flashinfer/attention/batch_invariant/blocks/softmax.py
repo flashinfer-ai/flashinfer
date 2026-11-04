@@ -1,3 +1,5 @@
+# Copyright (c) 2026 by FlashInfer team.
+# SPDX-License-Identifier: Apache-2.0
 """The softmax block: the spec's tile step on the engine's plans, executed by ``n_wg`` softmax warpgroups
 that all work on every tile and split its **keys**: warpgroup ``k`` holds keys ``[k T/n_wg, (k+1) T/n_wg)``
 of every row (the warps of the warpgroups share their TMEM lanes, so a row's keys are dealt out to
@@ -359,8 +361,8 @@ def unit_loop(
                 cute.arch.fence_view_async_tmem_store()
             if cutlass.const_expr(st.s_stages > 1):
                 # with two P stages the P acquire no longer serialises the warps on PV(n): warps 1..3 may not overwrite the exchange
-                # buffer with tile n + 1's slices before warp 0 has read tile n's (a WAR race seen as an intermittent bit mismatch,
-                # 2026-10-29). Placed after warp 0's store so that no register state lives across the barrier (145 spills otherwise)
+                # buffer with tile n + 1's slices before warp 0 has read tile n's (a WAR race seen as an intermittent bit mismatch).
+                # Placed after warp 0's store so that no register state lives across the barrier (register spills otherwise)
                 cute.arch.barrier(barrier_id=BAR_XCHG + k, number_of_threads=128)
         else:
             for i in cutlass.range_constexpr(kpt):

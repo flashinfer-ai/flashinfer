@@ -1,4 +1,6 @@
-"""The Swaps-AB attention kernel body (docs/attention_scoping.md 12.3): the class's term for work units of at most 32 live rows with the
+# Copyright (c) 2026 by FlashInfer team.
+# SPDX-License-Identifier: Apache-2.0
+"""The Swaps-AB attention kernel body: the class's term for work units of at most 32 live rows with the
 keys on the MMA M dimension. Scaffolding (smem, pipelines, TMEM) and the composition of the role blocks: TWO softmax warpgroups on alternate
 tiles (ping-pong; thread = key; warpgroup k takes the tiles of parity k and the running row maximum crosses between them through a one-entry
 hand-off per direction), the correction warpgroup (thread = dim lane, owning the row chains for ``t < n_pad``), the MMA warp, the load warp
@@ -283,10 +285,10 @@ class SwapsKernel:
         )  # (MMA, MMA_M, MMA_K, SLOT): one V slot as (dims x keys)
         tOrP = pv_thr_mma.make_fragment_B(sP)  # (MMA, MMA_N, MMA_K, STAGE): P^T
         pipeline_init_wait()
-        # programmatic dependent launch (12.5.2): every working role issues griddepcontrol.launch_dependents AFTER its unit walk, so
+        # programmatic dependent launch: every working role issues griddepcontrol.launch_dependents AFTER its unit walk, so
         # the fixup kernel's blocks are scheduled only when the grid's last CTAs drain (its griddepcontrol.wait still orders every
         # workspace read behind the whole grid). Issued at the kernel start, the blocks sat resident on the SMs of early-retired CTAs
-        # while the persistent walk still needed them: 10-22 % slower at every multi-wave fold (12.5.1).
+        # while the persistent walk still needed them: slower at every multi-wave fold.
 
         # ---- TMEM views (built after the allocation by every TMEM user)
         s_shape = qk_thr_mma.partition_shape_C((st.T, NP))

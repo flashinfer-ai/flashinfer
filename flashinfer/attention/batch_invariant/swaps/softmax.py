@@ -1,3 +1,5 @@
+# Copyright (c) 2026 by FlashInfer team.
+# SPDX-License-Identifier: Apache-2.0
 """The softmax block of the Swaps-AB body: the spec's tile step with the KEYS on the threads. Softmax thread ``t`` (= TMEM lane ``t``) owns
 key ``t`` of every tile and the ``n_pad`` scores ``S^T[t, n]`` of the unit's rows. Per tile a thread
 
@@ -5,7 +7,7 @@ key ``t`` of every tile and the ``n_pad`` scores ``S^T[t, n]`` of the unit's row
   tiles of live rows),
 * reduces the tile's row maximum over the 128 keys: the engine's ``rowmax`` plan under ``key: [(32, lane)]`` (five xor shuffles: the
   canonical pairwise tree over the warp's 32 adjacent keys) in every warp, then the four warp partials through smem in warp order --
-  the top two levels of the same 128-leaf tree (``tests/test_attention_cpu.py::test_warp_split_trees_are_the_canonical_tile_trees``);
+  the top two levels of the same 128-leaf tree;
 * forms ``m' = fmax(m, m_t)`` and ``alpha`` per row exactly as ``spec.alpha_term`` (every thread redundantly: the 128 threads hold identical
   ``m`` chains), hands ``alpha`` to the correction warpgroup at once (its ``O^T`` rescale overlaps the exponentials),
 * forms the probabilities ``p_n = EX2(fma(s_n, c, mul(m', nc)))`` of its key for every row (``fma2`` pairs of rows), reduces them over the
@@ -32,8 +34,8 @@ from ..blocks.operands import ACC_DTYPE, IN_DTYPE
 from .operands import BAR_SOFTMAX
 
 _NEG_INF = float("-inf")
-# to the shuffle fmax tree on subnormals, +-0, one NaN and all-NaN; probed on sm_100 /
-# sm_103 / sm_107, 2026-11-03, bench/probe_redux.py)
+# the warp-wide ``fmax`` reduction (``warp_redux_sync``) returns the same bits as the shuffle fmax tree, including on
+# subnormals, +-0, one NaN and all-NaN
 LANES = 32
 
 

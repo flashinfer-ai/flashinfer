@@ -1,3 +1,5 @@
+# Copyright (c) 2026 by FlashInfer team.
+# SPDX-License-Identifier: Apache-2.0
 """Compile wrapper for the Swaps-AB kernel: one TVM-FFI object per static tuple ``(D, g, page, n_pad)`` (plus a debug mode) with dynamic
 shapes, strides, page table, work units and scale; cache module ``batch_invariant_attention``. Operand views as the row body's (``engine.py``) minus the ``O_m`` scratch (the merged chunk state
 is in TMEM at every D here).

@@ -1,3 +1,5 @@
+# Copyright (c) 2026 by FlashInfer team.
+# SPDX-License-Identifier: Apache-2.0
 """Compile wrapper for the attention kernel: one TVM-FFI object per static tuple ``(D, g, page,
 kv_slots, n_wg, q2)`` with dynamic shapes, strides, page table, work units and scale; cache module ``batch_invariant_attention``.
 

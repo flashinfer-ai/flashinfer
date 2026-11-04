@@ -1,3 +1,5 @@
+# Copyright (c) 2026 by FlashInfer team.
+# SPDX-License-Identifier: Apache-2.0
 """The correction warpgroup block: one thread per Q row owns the TMEM accumulator of its row **and the
 row's statistics chain**. Per tile it receives from the softmax warpgroups ``alpha`` (early) and
 ``(m', r_0 .. r_{n_wg-1})`` (late: the tile maximum and the row-sum partials of the key slices) and

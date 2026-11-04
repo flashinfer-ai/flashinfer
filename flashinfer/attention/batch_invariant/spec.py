@@ -1,9 +1,9 @@
-"""Canonical dataflow of paged-KV attention: the class ``attn.bf16.d<D>`` (docs/attention_scoping.md
-section 2).
+# Copyright (c) 2026 by FlashInfer team.
+# SPDX-License-Identifier: Apache-2.0
+"""Canonical dataflow of paged-KV attention: the class ``attn.bf16.d<D>``.
 
 Everything numeric lives here once, parameterised by an ``fp`` backend (``TermAlgebra`` for the
-symbolic spec and the Lean coupling, ``CpuFP`` of ``cpu_model.py`` for the exact evaluation,
-``CuteF32`` inside the kernel). Per logical row ``(p, h)`` with visible keys ``[lo, L)``:
+symbolic spec and the Lean coupling, ``CuteF32`` inside the kernel). Per logical row ``(p, h)`` with visible keys ``[lo, L)``:
 
 * the score of key ``k`` is the GEMM's ``kfold`` over ``D`` (opaque ``MMA16`` K-steps, ascending);
 * a KV **tile** (``T`` keys at an absolute multiple of ``T``) is one step of a ``fold`` on the state
@@ -45,16 +45,16 @@ HEAD_DIMS = (
     64,
     128,
     256,
-)  # the classes attn.bf16.d64 / d128 / d256 (one class per (D, C(D)); docs/attention_scoping.md sections 2, 8, 9)
+)  # the classes attn.bf16.d64 / d128 / d256 (one class per (D, C(D)))
 NEG_INF = float("-inf")
 
 
-CHUNK_LEN = 512  # C: keys per chunk (4 tiles) -- the class constant since 2026-10-28 (C = 1024 before: a different class)
+CHUNK_LEN = 512  # C: keys per chunk (4 tiles) -- a class constant (another C would be a different class)
 CHUNK_LEN_OF = {
     64: CHUNK_LEN,
     128: CHUNK_LEN,
     256: CHUNK_LEN,
-}  # C(D): the chunk length per head dim (a class parameter per D; all 512 as of 2026-10-28)
+}  # C(D): the chunk length per head dim (a class parameter per D; all 512)
 
 
 def chunk_len(D: int, L: Optional[int] = None) -> int:
@@ -63,13 +63,13 @@ def chunk_len(D: int, L: Optional[int] = None) -> int:
     *new class* without changing call sites; the rule ignores it. Never a function of the
     batch, the request's total length, the SM count or the configuration.
 
-    ``C = 512`` (user decision 2026-10-28; ``1024`` until then): a B = 1 decode step has ``Hkv x ceil(L / C)``
+    ``C = 512`` (rather than ``1024``): a B = 1 decode step has ``Hkv x ceil(L / C)``
     work units, so halving ``C`` doubles its parallelism at the cost of one more chunk merge per 1024 keys
     (prefill) and twice the split workspace. Every output bit of the class changes with ``C``
     (``RLK.Attn.output_depends_on_C``); the fingerprint records it. ``C`` is a class parameter PER HEAD DIM
-    (``CHUNK_LEN_OF``): D = 64 and D = 256 take the same 512 (2026-10-28; the D = 256 body's merged chunk state
+    (``CHUNK_LEN_OF``): D = 64 and D = 256 take the same 512 (the D = 256 body's merged chunk state
     lives in a per-CTA global scratch because TMEM holds no second 256-column accumulator, which made a longer
-    C a candidate -- measured in docs/attention_scoping.md section 8 before the constant was kept)."""
+    C a candidate there; the common constant was kept)."""
     assert D in HEAD_DIMS, D
     return CHUNK_LEN_OF[D]
 
@@ -285,7 +285,7 @@ def merge(fp, a: State, b: State, c, nc) -> State:
 
 def output_elem(fp, st: State, out_fmt: str = "bf16"):
     """``cvt(add(mul(O, div(1, l)), +0))``: a correctly rounded reciprocal, one multiply, and an
-    ``add +0`` that makes the sign of an exact-zero accumulator unobservable (section 2.1)."""
+    ``add +0`` that makes the sign of an exact-zero accumulator unobservable."""
     inv = fp.div(fp.const(1.0), st.l)
     return fp.cvt_out(fp.add(fp.mul(st.o, inv), fp.const(0.0)), out_fmt)
 
@@ -376,10 +376,10 @@ class AttentionSpec:
 
 
 _FINGERPRINTS: Dict[tuple, str] = {}
-# the recorded fingerprint of the published class (D = 128, no window): C = 512 since 2026-10-28 (it was
-# attn-bf16-d128-3384db6839e66672 with C = 1024). tests/test_attention_cpu.py::test_fingerprints pins it.
+# the recorded fingerprint of the published class (D = 128, no window) at C = 512 (with C = 1024 it was
+# attn-bf16-d128-3384db6839e66672). ``tests/attention/test_batch_invariant_attention.py`` pins the three head dims' fingerprints.
 FINGERPRINT_D128 = "attn-bf16-d128-027b0379515b82e2"
-# the two classes of 2026-10-28 (branch op/attention-d64-d256): the same term with D as a parameter (D/16 MMA K-steps per
+# the D = 64 and D = 256 classes: the same term with D as a parameter (D/16 MMA K-steps per
 # score, a D-wide PV accumulator), C(D) = 512 for both; pinned by the same test
 FINGERPRINT_D64 = "attn-bf16-d64-9a05233ec9351b0d"
 FINGERPRINT_D256 = "attn-bf16-d256-b8cb59dab4eb6c0f"
@@ -389,7 +389,9 @@ FINGERPRINTS = {64: FINGERPRINT_D64, 128: FINGERPRINT_D128, 256: FINGERPRINT_D25
 def spec_fingerprint(D: int = 128, window_left: int = -1) -> str:
     """Identifier of the class: hashes the terms of output elements 0 and 1 of a row whose prefix
     spans one full chunk plus one tile (so the tile fold, the chunk merge with the init state, the
-    masking of the last tile and the epilogue are all inside), together with ``D``, ``T``, ``C``."""
+    masking of the last tile and the epilogue are all inside), together with ``D``, ``T``, ``C``. The window is a per-call
+    input of the class (like the KV position), not a class dimension: the public receipt (``flashinfer.batch_invariant.fingerprint``)
+    is the digest of the no-window sample row; ``window_left`` here only selects another sample row."""
     key = (D, window_left)
     if key not in _FINGERPRINTS:
         from ...batch_invariant.fp_interface.term import fingerprint

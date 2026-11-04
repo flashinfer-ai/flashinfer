@@ -1,3 +1,5 @@
+-- Copyright (c) 2026 by FlashInfer team.
+-- SPDX-License-Identifier: Apache-2.0
 import Lean
 import BIKernels
 /-! `lake exe axioms`: the enforced axiom policy of the library.
