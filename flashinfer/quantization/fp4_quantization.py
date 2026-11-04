@@ -146,7 +146,7 @@ def _pad_scale_factors(
 # E2M1 lookup table: 16 possible 4-bit values (index = 4-bit code, value = float)
 # Format: bit3=sign, bits2-0=magnitude (exponent+mantissa)
 _E2M1_VALUES = torch.tensor(
-    [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0, -0.5, -1, -1.5, -2, -3, -4, -6],
+    [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6],
     dtype=torch.float32,
 )
 _e2m1_values_cache: dict = {}
