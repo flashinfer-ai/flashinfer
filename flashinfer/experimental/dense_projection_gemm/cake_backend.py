@@ -699,8 +699,9 @@ K1_SPLIT_RANGE_OVERRIDES_BY_SM: dict[
 #: ((min_tokens, max_tokens, (block_n, num_splits)), ...)}`` (keys and values as in :data:`K1_SPLIT_RULES`): on a part
 #: of exactly ``sm_count`` SMs below the row's SM-count floor a token count from ``min_tokens`` to ``max_tokens`` with
 #: an even block count runs that range's program, except the token counts of :data:`K1_SPLIT_RULE_EXCLUDED_TOKENS` for
-#: the part.  A token count with an odd block count, and every other token count, part and row, keeps the routing of
-#: the tables above.  A range lies outside :data:`K1_SPLIT_RULES_BY_SM_TOKENS` and outside the row's ranges in
+#: the part and the token counts of the row's ranges in :data:`K1_CHAIN_RANGES_BY_SM` for the part, which come first.
+#: A token count with an odd block count, and every other token count, part and row, keeps the routing of the tables
+#: above.  A range lies outside :data:`K1_SPLIT_RULES_BY_SM_TOKENS` and outside the row's ranges in
 #: :data:`K1_SPLIT_RULES_BY_SM_TOKEN_RANGES` and :data:`K1_SPLIT_RANGE_OVERRIDES_BY_SM`.  On 212 SMs the FP32 rows
 #: ``4096 / 5120 -> 512 / 1024`` run two splits of their 212-SM tile width (128, 192 for ``4096 -> 1024``, 256 for
 #: ``5120 -> 1024``), each adding half of an output's K blocks.  From 1024 tokens up, at an even block count, their
@@ -741,21 +742,25 @@ K1_SPLIT_OVERRIDES_BY_SM: dict[
 #: exactly one SM count, ``(arch, sm_count) -> {key: ((min_tokens, max_tokens, (block_n, chains)), ...)}`` (keys as in
 #: :data:`K1_SPLIT_RULES`): a token count from ``min_tokens`` to ``max_tokens`` runs the program of that tile width at
 #: one split with that many chains (:func:`k1_chain_plan`) in place of the routing of the tables above, whose entries
-#: for these rows keep their one-chain program off these token counts on accuracy, except a token count that spans an
-#: even number of 64-element K blocks inside the row's ranges of :data:`K1_SPLIT_EVEN_BLOCK_RANGES_BY_SM` for the part,
-#: which keeps two splits.  The FP32 rows ``4096 / 5120 -> 512 / 1024``: from 961 tokens up their one-chain program
-#: adds an output's whole token reduction in one chain, about twice the deterministic program's FP64 error; three
-#: chains of a third of the K blocks each had an FP64 relative Frobenius error 0.31 to 0.73 times the deterministic
-#: program's on every seed (5 seeds on a 212-SM R200 part at 960, 961, 1024, 2048, 4096, 8192, 16172, 16231, 16384,
-#: 32768 and 40961 tokens, even and odd block counts; the error does not depend on the SM count) and ran within 5 % of
-#: the one-chain program.  Measured as the ranges of :data:`K1_SPLIT_RULES_BY_SM_TOKEN_RANGES` (the rule, the bound on
-#: the backward pass and the checkpointed step, and the construction of a range are that table's): on 212 SMs at 960,
-#: 4096, 16172, 16384, 32768 and 40961 tokens on four parts of one node; on 216 SMs at 960, 961, 1024, 2048, 4096,
-#: 8192, 16172, 16231, 16384, 32768 and 40961 tokens on one part.  Up to 960 tokens on 216 SMs the one-chain program
-#: keeps its :data:`K1_SPLIT_RULES` verdict (the deterministic program adds one chain there too).  ``4096 -> 512`` and
-#: ``5120 -> 512`` are not faster than the deterministic plan in every run at 16384 tokens on 212 SMs, nor are
-#: ``4096 -> 512`` and ``4096 -> 1024`` at 16231 and 16384 tokens on 216 SMs; on 216 SMs ``5120 -> 1024`` left the
-#: checkpointed step more than 1.3 % slower than the deterministic program at 32768 tokens.
+#: for these rows keep their one-chain program off these token counts on accuracy, and in place of the two splits of
+#: :data:`K1_SPLIT_EVEN_BLOCK_RANGES_BY_SM` at an even number of 64-element K blocks: at the even block counts of those
+#: ranges both programs were timed at on 212 SMs (1024 to 8192 and 32768 to 40960 tokens), three chains ran the weight
+#: gradient 7 to 52 % and the checkpointed step 2 to 21 % faster than two splits (medians, eager and graph), with an
+#: FP64 error below the deterministic program's, which two splits match bit for bit.  The FP32 rows
+#: ``4096 / 5120 -> 512 / 1024``: from 961 tokens up their one-chain program adds an output's whole token reduction in
+#: one chain, about twice the deterministic program's FP64 error; three chains of a third of the K blocks each had an
+#: FP64 relative Frobenius error 0.31 to 0.73 times the deterministic program's on every seed (5 seeds on a 212-SM R200
+#: part at 960, 961, 1024, 2048, 4096, 8192, 16172, 16231, 16384, 32768 and 40961 tokens, even and odd block counts; the
+#: error does not depend on the SM count) and ran within 5 % of the one-chain program.  Measured as the ranges of
+#: :data:`K1_SPLIT_RULES_BY_SM_TOKEN_RANGES` (the rule, the bound on the backward pass and the checkpointed step, and
+#: the construction of a range are that table's): on 212 SMs in two jobs on four parts of one node each, at 960, 4096,
+#: 16172, 16384, 32768 and 40961 tokens and at 960, 1024, 2048, 4096, 4097, 8192, 16172, 16384, 32768, 32769, 40960 and
+#: 40961 tokens; on 216 SMs at 960, 961, 1024, 2048, 4096, 8192, 16172, 16231, 16384, 32768 and 40961 tokens on one
+#: part.  Up to 960 tokens on 216 SMs the one-chain program keeps its :data:`K1_SPLIT_RULES` verdict (the deterministic
+#: program adds one chain there too).  ``4096 -> 512`` and ``5120 -> 512`` are not faster than the deterministic plan in
+#: every run at 16384 tokens on 212 SMs, nor are ``4096 -> 512`` and ``4096 -> 1024`` at 16231 and 16384 tokens on 216
+#: SMs; ``4096 -> 1024`` at 16384 tokens on 212 SMs (in one of the two jobs) and ``5120 -> 1024`` at 32768 tokens on 216
+#: SMs left the checkpointed step more than 1.3 % slower than the deterministic program.
 # fmt: off
 K1_CHAIN_RANGES_BY_SM: dict[
     tuple[str, int],
@@ -763,7 +768,7 @@ K1_CHAIN_RANGES_BY_SM: dict[
 ] = {
     ("sm_107a", 212): {
         ("sm_107a", 1, 4096, 512, "f32"): ((960, 16172, (128, 3)), (32768, 40961, (128, 3))),
-        ("sm_107a", 1, 4096, 1024, "f32"): ((960, 40961, (192, 3)),),
+        ("sm_107a", 1, 4096, 1024, "f32"): ((960, 16172, (192, 3)), (32768, 40961, (192, 3))),
         ("sm_107a", 1, 5120, 512, "f32"): ((960, 16172, (128, 3)), (32768, 40961, (128, 3))),
         ("sm_107a", 1, 5120, 1024, "f32"): ((960, 40961, (256, 3)),),
     },
@@ -801,15 +806,10 @@ def k1_chain_plan(
 ) -> Optional[tuple[int, int]]:
     """``(block_n, chains)`` of the one-split program of several accumulation chains the row runs at ``K`` on a device
     of exactly ``sm_count`` SMs (its range in :data:`K1_CHAIN_RANGES_BY_SM`), or ``None``: the row keeps the routing
-    of :func:`k1_plan`'s other tables -- outside those ranges, at a ``K`` that spans an even number of 64-element K
-    blocks inside the row's ranges of :data:`K1_SPLIT_EVEN_BLOCK_RANGES_BY_SM` for the part (two splits), or at a
-    ``K`` too short for the chains (:func:`k1_chains_fit`).  ``M``, ``N`` and ``K`` as in :func:`k1_plan`."""
+    of :func:`k1_plan`'s other tables -- outside those ranges, or at a ``K`` too short for the chains
+    (:func:`k1_chains_fit`).  ``M``, ``N`` and ``K`` as in :func:`k1_plan`."""
     key = (arch, int(L), int(M), int(N), "f32" if out_f32 else "bf16")
     part = (arch, int(sm_count))
-    if _ceil_div(K, K1_BLOCK_K) % 2 == 0:
-        for lo, hi, _ in K1_SPLIT_EVEN_BLOCK_RANGES_BY_SM.get(part, {}).get(key, ()):
-            if lo <= int(K) <= hi:
-                return None
     for lo, hi, (block_n, chains) in K1_CHAIN_RANGES_BY_SM.get(part, {}).get(key, ()):
         if lo <= int(K) <= hi:
             return (int(block_n), int(chains)) if k1_chains_fit(chains, K) else None
