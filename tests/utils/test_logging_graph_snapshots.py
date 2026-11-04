@@ -317,7 +317,7 @@ def test_graph_snapshot_fused_add_rmsnorm(cuda_device, snapshot_logging, dtype):
 
 
 def test_graph_snapshot_paged_decode_pipeline(cuda_device, snapshot_logging):
-    """Tiny real FA2 norm→paged-decode graphs agree with an undumped control."""
+    """Tiny real FA2 norm→decode dumps agree with eager and graph controls."""
     from flashinfer import BatchDecodeWithPagedKVCacheWrapper
     from flashinfer.norm import fused_add_rmsnorm
 
@@ -396,12 +396,22 @@ def test_graph_snapshot_paged_decode_pipeline(cuda_device, snapshot_logging):
 
     decode_call = _calls(root, "BatchDecodeWithPagedKVCacheWrapper.run")[-1]
     for index, scale in enumerate((1.0, 2.0), start=1):
+        eager_x = initial_x * scale
+        eager_r = initial_r * (3.0 - scale)
+        raw_norm(eager_x, eager_r, weight, enable_pdl=False)
+        eager_out = raw_run(
+            control_wrapper,
+            eager_x.view(2, 4, 128),
+            kv,
+            enable_pdl=False,
+        )
         for target in (x, control_x):
             target.copy_(initial_x * scale)
         for target in (residual, control_r):
             target.copy_(initial_r * (3.0 - scale))
         control_graph.replay()
         graph.replay()
+        torch.testing.assert_close(out, eager_out, rtol=1e-3, atol=1e-3)
         torch.testing.assert_close(out, control_out, rtol=1e-3, atol=1e-3)
         snapshot = decode_call / "graph_flushes" / f"flush_{index:04d}"
         metadata = _metadata(snapshot)
@@ -416,5 +426,5 @@ def test_graph_snapshot_paged_decode_pipeline(cuda_device, snapshot_logging):
         assert "execution_result" in replay, "Public decode method did not execute"
         assert replay["comparison_match"] is True
         torch.testing.assert_close(
-            replay["execution_result"], control_out, rtol=1e-3, atol=1e-3
+            replay["execution_result"], eager_out, rtol=1e-3, atol=1e-3
         )
