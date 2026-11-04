@@ -1208,12 +1208,6 @@ def fp4_quantize(
     nvfp4_4over6_config = _resolve_fp4_quantize_recipe(
         input, sf_vec_size, sf_use_ue8m0, nvfp4_4over6
     )
-    # The quantize kernel reads global_scale as float32 on input's device. Normalize
-    # so a bf16/fp16 or off-device scale isn't misread byte-wise / cross-device-read
-    # into corrupt scale factors. This is a no-op when already float32 on input.device.
-    if global_scale is not None:
-        global_scale = global_scale.to(device=input.device, dtype=torch.float32)
-
     if batch_invariant:
         if backend != "auto":
             raise ValueError(
@@ -1223,6 +1217,9 @@ def fp4_quantize(
         from ..batch_invariant.quantization.nvfp4_api import (
             fp4_quantize_batch_invariant,
         )
+
+        if global_scale is not None:
+            global_scale = global_scale.to(device=input.device, dtype=torch.float32)
 
         return fp4_quantize_batch_invariant(
             input,
@@ -1249,6 +1246,12 @@ def fp4_quantize(
 
     if backend in ("cuda", "cute-dsl"):
         _check_block_scale_quantization_support(input.device, "fp4_quantize")
+
+    # The quantize kernel reads global_scale as float32 on input's device. Normalize
+    # so a bf16/fp16 or off-device scale isn't misread byte-wise / cross-device-read
+    # into corrupt scale factors. This is a no-op when already float32 on input.device.
+    if global_scale is not None:
+        global_scale = global_scale.to(device=input.device, dtype=torch.float32)
 
     if backend == "cute-dsl":
         return _fp4_quantize_cute_dsl(
