@@ -54,7 +54,9 @@ it as two contiguous sequence groups (:func:`sequence_groups`), one on a
 high-priority side stream forked from the caller's stream and joined back
 before the stage returns: the forward's ``wy_tc`` and ``fwd_ho`` of the partial
 group overlap the full rounds of the other, and the adjoint ``dhu_tc2`` of the
-partial group overlaps the fused tail of the other.  On an architecture of
+partial group overlaps the fused tail of the other (:func:`adjoint_r_form`:
+beside a value-head group of two's tail, and beside ``tail_g3`` on the
+architectures of ``TWO_STREAM_SERIAL_G3_ARCHS``).  On an architecture of
 ``SPLIT_R_FORM`` the ``dhu_tc2`` pass 2 of a split adjoint plan beside
 ``tail_g3`` runs the same way over its segments (:func:`split_r_form`).
 
@@ -100,6 +102,7 @@ __all__ = [
     "PRESCAN_CONFIGS",
     "REG_SCAN_CONFIGS",
     "R_FORM_GROUPS",
+    "TWO_STREAM_SERIAL_G3_ARCHS",
     "CLUSTER_TAILS",
     "TAIL_DEFAULT",
     "TAIL_FORMS",
@@ -120,6 +123,7 @@ __all__ = [
     "SegmentTable",
     "StageSet",
     "StreamGroups",
+    "adjoint_r_form",
     "build_chunk_meta",
     "build_chunk_meta_from_cu_seqlens",
     "choose_scan_plan",
@@ -771,6 +775,28 @@ TAIL_DEFAULT = "tail"
 # The value-head groups whose adjoint dhu_tc2 scan runs as two sequence groups (two streams) feeding the fused tail
 # (the R form) where :func:`sequence_groups` splits it.
 R_FORM_GROUPS: tuple[int, ...] = (2,)
+# The architectures where a serial dhu_tc2 adjoint scan feeding ``tail_g3`` (a value-head group of three) also runs as
+# the R form: group B (the partial round) on the side stream beside the tail of group A; elsewhere one launch (the
+# deterministic package's rule).  Measured on the (2, 6) head pair over 64 x 4096 tokens (FP32 beta, one process per
+# GPU, both arm orders), fwd+bwd against one launch: 3.3489 -> 3.3169 ms on B200 (49 + 15 sequences, sustained
+# protocol) and 3.0008 -> 2.9691 ms on GB300 (25 + 39).
+TWO_STREAM_SERIAL_G3_ARCHS: tuple[str, ...] = ("sm_100a", "sm_103a")
+
+
+def adjoint_r_form(
+    arch: str, group: int, form: str, *, serial_tc: bool, split_tc: bool
+) -> bool:
+    """Whether a call's adjoint scan runs as its two groups (the R form) where :func:`sequence_groups` splits it:
+    the serial ``dhu_tc2`` scan (``serial_tc``) feeding a fused tail for a value-head group ``group`` of
+    ``R_FORM_GROUPS``, or feeding ``tail_g3`` on an architecture of ``TWO_STREAM_SERIAL_G3_ARCHS``; the ``dhu_tc2``
+    pass 2 of a split plan (``split_tc``) feeding ``tail_g3`` (its segments are grouped on an architecture of
+    ``SPLIT_R_FORM`` only).  ``form`` is the call's backward tail (:func:`tail_form`)."""
+    if serial_tc:
+        return form != "unfused" and (
+            group in R_FORM_GROUPS
+            or (form == "tail_g3" and arch in TWO_STREAM_SERIAL_G3_ARCHS)
+        )
+    return split_tc and form == "tail_g3"
 
 
 def tail_min_ctas(arch: str, group: int) -> int:
@@ -1753,9 +1779,12 @@ def chain_plan_pricing(
 # pricing does not credit the overlap with the tail), as a serial table that the two-stream rule groups keeps its form.
 # Measured on R200 (212 SMs, one process, sustained protocol): the backward of the (16, 48) head pair on this form of
 # its planner table (94-chunk segments, 6 segments, groups of 4 + 2) took 1.3261 ms in the deterministic package,
-# against 1.3454 ms on this package's tc-priced table (46-chunk segments, 13 segments, one stream).  The architectures
-# not listed run one stream there.
-SPLIT_R_FORM: tuple[str, ...] = ("sm_107a",)
+# against 1.3454 ms on this package's tc-priced table (46-chunk segments, 13 segments, one stream).  On B200 and GB300
+# (FP32 beta, one process per GPU, both arm orders) the (2, 6) head pair over six packed sequences (241,817 tokens)
+# took 2.8153 ms fwd+bwd on GB300 on this form (110-chunk segments, 37 segments, groups of 25 + 12) against 2.8271 ms
+# on the tc-priced table (49 segments, one stream), and 3.1311 against 3.1337 ms on B200 (groups of 24 + 13; sustained
+# protocol, within its noise).  The architectures not listed run one stream there.
+SPLIT_R_FORM: tuple[str, ...] = ("sm_100a", "sm_103a", "sm_107a")
 
 
 def _split_r_groups(arch: str, group: int | None, options: ChainOptions) -> bool:
@@ -2345,14 +2374,13 @@ def _backward(
     split_tc = not serial and (
         meta.bwd_tc or _sdt_selected(meta, segs, num_v_heads, index, options, arch)
     )
-    # two groups (R form): the tcgen05 serial scan feeding a fused tail, for the groups R_FORM_GROUPS names, and the
-    # dhu_tc2 pass 2 of a split plan feeding tail_g3 (its segments; grouped on an architecture of SPLIT_R_FORM only)
-    groups = (
-        meta.bwd_groups
-        if (use_tc and form != "unfused" and num_v_heads // num_heads in R_FORM_GROUPS)
-        or (split_tc and form == "tail_g3")
-        else None
+    # two groups (R form, :func:`adjoint_r_form`): the tcgen05 serial scan feeding a fused tail (a group of
+    # R_FORM_GROUPS; tail_g3 on TWO_STREAM_SERIAL_G3_ARCHS), and the dhu_tc2 pass 2 of a split plan feeding tail_g3 (its
+    # segments; grouped on an architecture of SPLIT_R_FORM only)
+    two_groups = adjoint_r_form(
+        arch, num_v_heads // num_heads, form, serial_tc=use_tc, split_tc=split_tc
     )
+    groups = meta.bwd_groups if two_groups else None
     if not (use_tc or split_tc):
         dv_local = workspaces.take(table, "b_dv_local", token_hv, v.dtype, device)
         _launch("dv_local", meta.num_chunks, num_v_heads, 1, qn, kn, do, g_cs, dv_local, meta.chunk_start,

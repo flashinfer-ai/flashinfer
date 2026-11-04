@@ -685,6 +685,71 @@ def test_two_stream_split_rule() -> None:
     assert split(5, 4, 8) == 4  # 8 and 16 CTAs both fill their rounds: the larger group
 
 
+# Whether a serial dhu_tc2 adjoint scan beside tail_g3 (a value-head group of three) runs as the R form, per
+# architecture: on B200 / B300 / GB300 (the deterministic package's rule), not on R200.
+SERIAL_G3_R_FORM = {"sm_100a": True, "sm_103a": True, "sm_107a": False}
+# The (2, 6) head pair over 64 x 4096 tokens: a serial table whose adjoint scan groups as (group A, group B) sequences,
+# per SM count (the deterministic package's groups)
+SERIAL_G3_GROUPS = {148: (49, 15), 152: (25, 39), 212: (35, 29), 216: (36, 28)}
+
+
+@pytest.mark.parametrize("arch", sorted(RULE_DEVICES))
+def test_adjoint_r_form_rule(arch) -> None:
+    rule = cake_chain.adjoint_r_form
+    # (group, tail, serial dhu_tc2 scan, split pass 2 on dhu_tc2) -> runs the two groups
+    cases = {
+        (2, "tail_g2", True, False): True,
+        (2, "tail", True, False): True,
+        (2, "unfused", True, False): False,
+        (3, "tail_g3", True, False): SERIAL_G3_R_FORM[arch],
+        (3, "tail", True, False): False,
+        (3, "unfused", True, False): False,
+        (1, "tail", True, False): False,
+        (4, "tail", True, False): False,
+        (3, "tail_g3", False, True): True,
+        (3, "tail", False, True): False,
+        (2, "tail_g2", False, True): False,
+        (3, "tail_g3", False, False): False,
+        (2, "tail_g2", False, False): False,
+    }
+    for (group, form, serial, split), want in cases.items():
+        got = rule(arch, group, form, serial_tc=serial, split_tc=split)
+        assert got is want, (arch, group, form, serial, split)
+
+
+@pytest.mark.parametrize(
+    "arch, sm_count",
+    [
+        ("sm_100a", 148),
+        ("sm_103a", 148),
+        ("sm_103a", 152),
+        ("sm_107a", 212),
+        ("sm_107a", 216),
+    ],
+    ids=["B200", "B300", "GB300", "R200-212", "R200-216"],
+)
+def test_serial_r_form_of_a_group_of_three(arch, sm_count, monkeypatch) -> None:
+    # the serial table of the (2, 6) head pair over 64 x 4096 tokens and its adjoint groups; the backward runs them
+    # beside tail_g3 where SERIAL_G3_R_FORM says so (one dhu_tc2 launch elsewhere)
+    monkeypatch.setattr(
+        cake_chain, "_device_props", lambda _index: (sm_count, 232448, 10)
+    )
+    monkeypatch.setattr(cake_backend, "device_arch", lambda _index: arch)
+    seq_lens, heads = (4096,) * 64, (2, 6)
+    plans, _bwd_tc = cake_chain.host_plans(seq_lens, heads[1], 0)
+    assert all(plan.segment_len <= 0 for plan in plans), plans
+    meta = cake_chain.build_chunk_meta(seq_lens, "cpu", scan_plans=plans, lpt=True)
+    _fwd, bwd = cake_chain.sequence_groups(meta, heads[1], sm_count)
+    assert bwd is not None
+    assert (bwd.split, len(seq_lens) - bwd.split) == SERIAL_G3_GROUPS[sm_count]
+    form = cake_chain.tail_form(*heads, arch=arch, num_chunks=meta.num_chunks)
+    assert form == "tail_g3"
+    assert (
+        cake_chain.adjoint_r_form(arch, 3, form, serial_tc=True, split_tc=False)
+        is SERIAL_G3_R_FORM[arch]
+    )
+
+
 # The two-stream groups of the campaign rows, (forward group A, adjoint group A) in sequences: the forward's group A
 # is the partial round, the adjoint's the full rounds.  The other rows run one stream (one sequence or one round).
 STREAM_ROWS = {
@@ -1144,6 +1209,8 @@ def test_two_streams_match_one_stream(
     heads, lpt, save_state, device, monkeypatch
 ) -> None:
     seq_lens = STREAM_LAYOUT
+    arch = cake_backend.device_arch(cake_chain._device_index(device))
+    g3_r_form = heads[1] == 3 * heads[0] and SERIAL_G3_R_FORM.get(arch, False)
     _small_device(monkeypatch, device, STREAM_CASES[heads])
     assert (
         cake_chain.two_stream_split(len(seq_lens), heads[1], STREAM_CASES[heads])
@@ -1166,10 +1233,10 @@ def test_two_streams_match_one_stream(
         runs.append(_run(inputs, seq_lens, initial_state=h0, output_final_state=True, dht=dht, streams=streams,
                          lpt=lpt, save_state=save_state, **STREAM_PINS))  # fmt: skip
         side = [stage for stage, stream in launches[start:] if stream != main]
-        # the side stream: wy_tc and fwd_ho of the forward's group A, dhu_tc2 of the adjoint's group B (the fused
-        # tail of a value-head group of two only)
+        # the side stream: wy_tc and fwd_ho of the forward's group A, dhu_tc2 of the adjoint's group B (beside the
+        # fused tail of a value-head group of two, and beside tail_g3 on the architectures of SERIAL_G3_R_FORM)
         expected = _on_device(["wy_tc", "fwd_ho"]) + (
-            ["dhu_tc2"] if heads[1] == 2 * heads[0] else []
+            ["dhu_tc2"] if heads[1] == 2 * heads[0] or g3_r_form else []
         )
         assert side == (expected if streams == 2 else []), (streams, launches[start:])
     _assert_within_budget(runs[0], runs[1], names)
@@ -1242,6 +1309,35 @@ def test_split_r_form_matches_one_stream(lpt, device, monkeypatch) -> None:
     assert [stage for stage, _ in launches[start:]].count("dhu_tc2") == 1
     for run in runs[1:] + [one]:
         _assert_same_bits(run, runs[0], names)
+
+
+# The bench rows of a value-head group of three that run the R form beside tail_g3 on B200 / B300 / GB300 (the (2, 6)
+# head pair): 64 x 4096 tokens on its serial table, and six packed sequences on the planner's split adjoint table that
+# SPLIT_R_FORM keeps.  The deterministic package runs the same tables and groups.
+G3_R_FORM_ROWS = {
+    "64x4096": (4096,) * 64,
+    "P1": (126565, 32714, 33696, 15081, 22979, 10782),
+}
+
+
+@pytest.mark.parametrize("row", sorted(G3_R_FORM_ROWS))
+def test_group_of_three_r_form_keeps_the_deterministic_bits(
+    row, device, monkeypatch
+) -> None:
+    arch = cake_backend.device_arch(cake_chain._device_index(device))
+    if not SERIAL_G3_R_FORM.get(arch, False):
+        pytest.skip(f"{arch} runs one dhu_tc2 launch on these rows")
+    seq_lens, heads = G3_R_FORM_ROWS[row], (2, 6)
+    inputs = _inputs(seq_lens, heads, torch.float32, device, seed=331)
+    main = torch.cuda.current_stream(device).cuda_stream
+    launches = _record_streams(monkeypatch)
+    got = _run(inputs, seq_lens)
+    side = [stage for stage, stream in launches if stream != main]
+    # the adjoint's group B on the side stream (the forward's two groups, if any, run wy_tc / fwd_ho there)
+    assert side.count("dhu_tc2") == 1, launches
+    assert [stage for stage, _ in launches].count("dhu_tc2") == 2, launches
+    _assert_same_bits(got, _run(inputs, seq_lens, det=True), OUTPUT_NAMES)
+    _assert_same_bits(_run(inputs, seq_lens), got, OUTPUT_NAMES)
 
 
 def test_two_streams_survive_interleaved_allocations(device, monkeypatch) -> None:
@@ -2621,10 +2717,27 @@ def test_chain_plan_rule_on_r200(sm_count, monkeypatch) -> None:
         ), pins
 
 
-# The split R form (SPLIT_R_FORM, sm_107a): the bench layouts of a value-head group of three whose planner adjoint
-# table it keeps, per R200 SM count -> (segment length, segments, adjoint group A in segments): the deterministic
-# package's table and groups.  B200, B300 and GB300 keep the tables of host_plans for every layout and group.
-SPLIT_R_ROWS = {212: {"A16": (94, 6, 4)}, 216: {}}
+# The split R form (SPLIT_R_FORM): the bench layouts of a value-head group of three whose planner adjoint table it
+# keeps, per (architecture, SM count) -> (segment length, segments, adjoint group A in segments): the deterministic
+# package's table and groups.  Every other layout and group keeps the tables of host_plans.
+_SPLIT_R_148 = {
+    "P1": (110, 37, 24),
+    "P3": (114, 36, 24),
+    "issue": (114, 36, 24),
+    "g3_4x4096_h8": (22, 12, 6),
+}
+SPLIT_R_ROWS = {
+    ("sm_100a", 148): _SPLIT_R_148,
+    ("sm_103a", 148): _SPLIT_R_148,
+    ("sm_103a", 152): {
+        "P1": (110, 37, 25),
+        "P3": (108, 38, 25),
+        "issue": (114, 36, 25),
+        "g3_4x4096_h8": (22, 12, 6),
+    },
+    ("sm_107a", 212): {"A16": (94, 6, 4)},
+    ("sm_107a", 216): {},
+}
 
 
 @pytest.mark.parametrize(
@@ -2681,7 +2794,7 @@ def test_split_r_form_rule(arch, sm_count, monkeypatch) -> None:
             # the groups only beside the split R form's tail (a pin to another tail keeps the tables of host_plans)
             assert not cake_chain._host_plans(seq_lens, num_v_heads, 0, cake_chain.make_options(tail="tail"),
                                               group=3)[2]  # fmt: skip
-    assert kept == SPLIT_R_ROWS.get(sm_count if arch == "sm_107a" else 0, {})
+    assert kept == SPLIT_R_ROWS[(arch, sm_count)]
     # plan pins (and a dhu_scan pin) keep the planner's tables
     for pins in ({"scan_config": (64, 1), "segment_chunks": 94}, {"dhu_scan": "tc"}):
         assert not cake_chain._host_plans(
